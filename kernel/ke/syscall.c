@@ -7572,20 +7572,95 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 		return -EFAULT;
 	}
 
-	/* Demand paging: pages of a lazy region that have not been touched
-	 * yet have no PTE for the loop below to fix — update the covering
-	 * region's prot so they fault in with the NEW protection.  Only a
-	 * full-region cover is honoured (partial-region prot splits are not
-	 * supported, same granularity policy as munmap). */
+	/* Keep the region records describing the protection the pages actually
+	 * have -- including when the range covers only PART of a region, which
+	 * has to SPLIT it.
+	 *
+	 * This used to honour a full-region cover only, leaving a partial
+	 * mprotect to change the page tables while the record kept the old
+	 * protection for the whole span.  Two things follow, and the second is
+	 * expensive:
+	 *
+	 *   - a lazy page in the changed part faults in with the RECORD's
+	 *     protection, undoing the mprotect;
+	 *   - the record still looks like its neighbours, so mappings that are
+	 *     no longer alike merge with each other.  A thread stack is exactly
+	 *     this shape -- one mmap of guard+stack, then mprotect(PROT_NONE)
+	 *     over the guard alone -- so every stack stayed one RW record and
+	 *     each new one coalesced onto the last.  The region count then
+	 *     stays flat while the mapped total climbs by a stack per thread,
+	 *     which reads as a leak and hides the guard page from the records
+	 *     entirely.
+	 *
+	 * Split into up to three: the part before the range keeps the old
+	 * protection, the covered part takes the new one, and any tail keeps
+	 * the old.  Out of slots, the region is left whole with its protection
+	 * unchanged -- the page tables below are still updated, which is the
+	 * same partial state as before, but it is now the rare failure case
+	 * rather than the normal path. */
 	{
 		task_t *mm = task_mm_owner(cur);
+		uint64_t end = addr + pages * PAGE_SIZE;
+
 		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
 			mmap_region_t *r = &mm->mmap_regions[i];
+			uint64_t r_end;
+
 			if (!r->in_use)
 				continue;
-			if (addr <= r->start &&
-			    addr + pages * PAGE_SIZE >= r->start + r->length)
+			r_end = r->start + r->length;
+			if (end <= r->start || addr >= r_end)
+				continue; /* no overlap */
+
+			if (addr <= r->start && end >= r_end) {
+				r->prot = prot; /* whole region */
+				continue;
+			}
+
+			/* Carve the tail off first, so `r' can then be trimmed
+			 * to the head and the middle handled by the next loop
+			 * iteration or by this one's own adjustment. */
+			if (end < r_end) {
+				size_t ridx = (size_t)(r - mm->mmap_regions);
+				mmap_region_t *tail =
+					mm_alloc_mmap_region(mm);
+
+				/* Claiming a slot can grow -- and move -- the
+				 * table, so the pointer is rebuilt. */
+				r = &mm->mmap_regions[ridx];
+				if (!tail)
+					continue;
+				*tail = *r;
+				tail->start = end;
+				tail->length = r_end - end;
+				tail->offset = r->offset + (end - r->start);
+				if (tail->file)
+					vfs_incref(tail->file);
+				tail->in_use = true;
+				r->length = end - r->start;
+				r_end = end;
+			}
+
+			if (addr > r->start) {
+				size_t ridx = (size_t)(r - mm->mmap_regions);
+				mmap_region_t *mid =
+					mm_alloc_mmap_region(mm);
+
+				r = &mm->mmap_regions[ridx];
+				if (!mid)
+					continue;
+				*mid = *r;
+				mid->start = addr;
+				mid->length = r_end - addr;
+				mid->offset = r->offset + (addr - r->start);
+				mid->prot = prot;
+				if (mid->file)
+					vfs_incref(mid->file);
+				mid->in_use = true;
+				r->length = addr - r->start;
+			} else {
 				r->prot = prot;
+			}
 		}
 	}
 
@@ -7729,6 +7804,95 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 // a1 = pointer to user-space procinfo_t array
 // a2 = max number of entries the array can hold
 // Returns: number of entries filled, or negative error
+/* SYS_GETPROCMAPS - report one process's address space.
+ *
+ * ps can only show a total, and a total cannot tell a table filling up with
+ * records from a few records that are growing, which are different faults with
+ * different fixes.  This hands out the region table itself plus the brk span,
+ * so the question "what exactly is growing" is answerable from userspace
+ * instead of by rebuilding the kernel with a printf in it.
+ *
+ * Reported for the PROCESS: the bookkeeping lives on the thread group leader
+ * (task_mm_owner), so asking about any thread answers for the address space it
+ * shares.
+ */
+static int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
+			       uint64_t buf_ptr, uint64_t max_count)
+{
+	procmapinfo_t kinfo;
+	procmap_t *kbuf = NULL;
+	size_t buf_size = 0;
+	uint64_t flags;
+	int count = 0;
+	int64_t ret;
+
+	if (!validate_user_ptr(info_ptr, sizeof(procmapinfo_t)))
+		return -EFAULT;
+	if (max_count > 65536)
+		max_count = 65536;
+	if (max_count) {
+		if (!validate_user_ptr(buf_ptr, max_count * sizeof(procmap_t)))
+			return -EFAULT;
+		buf_size = (size_t)max_count * sizeof(procmap_t);
+		kbuf = (procmap_t *)kalloc(buf_size);
+		if (!kbuf)
+			return -ENOMEM;
+		mm_memset(kbuf, 0, buf_size);
+	}
+	mm_memset(&kinfo, 0, sizeof(kinfo));
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
+		task_t *mm = t ? task_mm_owner(t) : NULL;
+
+		if (!t || !mm) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			if (kbuf)
+				kfree(kbuf);
+			return -ESRCH;
+		}
+		kinfo.pid = (int)t->id;
+		kinfo.tgid = t->tgid;
+		kinfo.brk_start = mm->brk_start;
+		kinfo.brk = mm->brk;
+		kinfo.mmap_base = mm->mmap_base;
+		kinfo.capacity = mm->mmap_capacity;
+
+		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+			mmap_region_t *r = &mm->mmap_regions[i];
+
+			if (!r->in_use)
+				continue;
+			kinfo.n_regions++;
+			kinfo.total_bytes += r->length;
+			if (kbuf && count < (int)max_count) {
+				kbuf[count].start = r->start;
+				kbuf[count].length = r->length;
+				kbuf[count].prot = r->prot;
+				kbuf[count].flags = r->flags;
+				kbuf[count].offset = r->offset;
+				kbuf[count].file_backed = r->file ? 1 : 0;
+				kbuf[count].lazy = r->lazy ? 1 : 0;
+				kbuf[count].device = r->device ? 1 : 0;
+				count++;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	ret = count;
+	if (copy_to_user((void *)info_ptr, &kinfo, sizeof(kinfo)) < 0)
+		ret = -EFAULT;
+	else if (kbuf && count &&
+		 copy_to_user((void *)buf_ptr, kbuf,
+			      (size_t)count * sizeof(procmap_t)) < 0)
+		ret = -EFAULT;
+	if (kbuf)
+		kfree(kbuf);
+	return ret;
+}
+
 static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 {
 	if (max_count == 0)
@@ -8962,6 +9126,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
 	case SYS_GETPROCINFO:
 		return sys_getprocinfo(a1, a2);
+
+	case SYS_GETPROCMAPS:
+		return sys_getprocmaps(a1, a2, a3, a4);
 
 	case SYS_MEMSTATS: {
 		if (!a1)

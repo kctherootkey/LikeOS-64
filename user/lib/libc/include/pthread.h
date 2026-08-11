@@ -99,6 +99,16 @@ typedef struct {
     volatile unsigned int seq;      // Sequence number (futex word)
     volatile int waiters;           // Number of waiters
     int pshared;                    // Process-shared attribute
+    /* Clock the deadline passed to pthread_cond_timedwait() is measured
+     * against, from pthread_condattr_setclock(); 0 (CLOCK_REALTIME) is the
+     * default POSIX requires.  It sits in what was padding, so the struct is
+     * the same size and layout as before and nothing has to be rebuilt.
+     *
+     * Honouring it matters more than it looks: a caller that selects
+     * CLOCK_MONOTONIC passes deadlines measured in time since boot, and
+     * comparing those against the wall clock puts every deadline decades in
+     * the past -- so every timed wait returns ETIMEDOUT immediately. */
+    int clock_id;
     pthread_mutex_t* mutex;         // Associated mutex (for broadcast)
 } pthread_cond_t;
 
@@ -154,7 +164,7 @@ typedef volatile int pthread_once_t;
 
 // Static initializers
 #define PTHREAD_MUTEX_INITIALIZER     { 0, 0, 0, PTHREAD_MUTEX_NORMAL, PTHREAD_MUTEX_STALLED, PTHREAD_PROCESS_PRIVATE, {0} }
-#define PTHREAD_COND_INITIALIZER      { 0, 0, PTHREAD_PROCESS_PRIVATE, 0 }
+#define PTHREAD_COND_INITIALIZER      { 0, 0, PTHREAD_PROCESS_PRIVATE, 0, 0 }
 #define PTHREAD_RWLOCK_INITIALIZER    { 0, 0, 0, 0, PTHREAD_PROCESS_PRIVATE }
 
 // Cancel state/type (stub values - cancellation not fully implemented)

@@ -22,6 +22,9 @@ extern int futex_wait(volatile int *uaddr, int val,
 		      const struct timespec *timeout);
 extern int __futex_wait_until(volatile int *uaddr, int val,
 			      const struct timespec *abstime);
+extern int __futex_wait_until_clock(volatile int *uaddr, int val,
+				    const struct timespec *abstime,
+				    int clock_id);
 extern int futex_wake(volatile int *uaddr, int count);
 
 // Futex requeue operation
@@ -115,8 +118,13 @@ int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr)
 
 	if (attr) {
 		cond->pshared = attr->pshared;
+		/* Carried onto the cond: the attr is the caller's and may be
+		 * destroyed straight after this, so the clock has to be copied
+		 * here or the wait has no way to know which one was asked for. */
+		cond->clock_id = attr->clock_id;
 	} else {
 		cond->pshared = PTHREAD_PROCESS_PRIVATE;
+		cond->clock_id = 0; /* CLOCK_REALTIME */
 	}
 
 	return 0;
@@ -198,7 +206,8 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
 		 * fall through to the loop condition, which re-checks the
 		 * sequence -- POSIX does not allow this function to report
 		 * either to its caller. */
-		int fret = __futex_wait_until((int *)&cond->seq, seq, abstime);
+		int fret = __futex_wait_until_clock((int *)&cond->seq, seq,
+						    abstime, cond->clock_id);
 		if (fret < 0 && errno == ETIMEDOUT) {
 			timeout_ret = ETIMEDOUT;
 			break;

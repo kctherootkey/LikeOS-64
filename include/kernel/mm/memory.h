@@ -272,6 +272,9 @@ void mm_destroy_address_space(uint64_t *pml4);
 void mm_switch_address_space(uint64_t *pml4);
 uint64_t *mm_get_current_address_space(void);
 bool mm_user_addr_mapped(uint64_t vaddr, size_t len);
+/* Translate a user address in a GIVEN address space; 0 if unmapped.  For the
+ * exit path, which may run on a CPU whose CR3 is somebody else's. */
+uint64_t mm_virt_to_phys_in(uint64_t *pml4, uint64_t vaddr);
 bool mm_map_user_stack(uint64_t *pml4, uint64_t stack_top, size_t stack_size);
 bool mm_map_user_page(uint64_t *pml4, uint64_t virtual_addr,
 		      uint64_t physical_addr, uint64_t flags);

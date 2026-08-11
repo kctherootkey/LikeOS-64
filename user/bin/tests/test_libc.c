@@ -5189,6 +5189,109 @@ static void *lc_rw_thread(void *arg)
 	return NULL;
 }
 
+/* pthread_key destructors, and the stack reclaim that hangs off them.
+ *
+ * The pattern the real libraries use: a thread registers a key whose
+ * destructor releases the thread itself.  The destructor runs on the exiting
+ * thread, detaches it, and pthread_exit then unmaps its own stack.  If key
+ * destructors silently never run, nothing detaches -- every thread stays
+ * joinable with nobody to join it, and its 2MB stack stays mapped for the life
+ * of the process.  That is how a file manager listing a directory grew by one
+ * stack per worker thread until it ran out of mmap regions, so this checks the
+ * destructor fires AND that the address space comes back.
+ */
+static pthread_key_t tsd_dtor_key;
+static volatile int tsd_dtor_calls;
+static volatile int tsd_dtor_saw_value;
+static volatile int tsd_dtor_wrong_value;
+
+static void tsd_dtor(void *value)
+{
+	if (value == (void *)0x1234)
+		tsd_dtor_saw_value = 1;
+	else
+		tsd_dtor_wrong_value = 1;
+
+	/* Release this thread from its own destructor, as the thread-pool
+	 * libraries do. */
+	pthread_detach(pthread_self());
+	__sync_fetch_and_add((int *)&tsd_dtor_calls, 1);
+}
+
+static void *tsd_dtor_thread(void *arg)
+{
+	(void)arg;
+	pthread_setspecific(tsd_dtor_key, (void *)0x1234);
+	return NULL;
+}
+
+/* Wait for `target` destructor runs, then a moment more: the counter is bumped
+ * inside the destructor, and the stack is not unmapped until pthread_exit
+ * finishes after it returns. */
+static int tsd_wait_for(int target)
+{
+	for (int i = 0; i < 2000 && tsd_dtor_calls < target; i++)
+		usleep(1000);
+	usleep(20000);
+	return tsd_dtor_calls >= target;
+}
+
+static void test_tsd_destructors(void)
+{
+	pthread_t t;
+	procmapinfo_t before, after;
+	int have_maps;
+	const int rounds = 64;
+	int created = 0;
+
+	printf("\n[TEST] pthread_key destructors and thread stack reclaim\n");
+
+	test_result("pthread_key_create accepts a destructor",
+		    pthread_key_create(&tsd_dtor_key, tsd_dtor) == 0);
+
+	tsd_dtor_calls = 0;
+	tsd_dtor_saw_value = 0;
+	tsd_dtor_wrong_value = 0;
+
+	if (pthread_create(&t, NULL, tsd_dtor_thread, NULL) != 0) {
+		test_result("thread for destructor test started", 0);
+		return;
+	}
+	test_result("key destructor runs when a thread exits", tsd_wait_for(1));
+	test_result("destructor is passed the value that was set",
+		    tsd_dtor_saw_value && !tsd_dtor_wrong_value);
+
+	/* Now the leak itself.  One thread at a time, so a stack that is
+	 * handed back can be reused by the next: the region count should stay
+	 * flat.  A destructor that never runs leaves 2 regions per thread
+	 * behind (the mapping plus its guard page), so 64 rounds would add
+	 * about 128 -- far outside the slack allowed here. */
+	have_maps = getprocmaps(getpid(), &before, NULL, 0) >= 0;
+
+	tsd_dtor_calls = 0;
+	for (int i = 0; i < rounds; i++) {
+		pthread_t th;
+
+		if (pthread_create(&th, NULL, tsd_dtor_thread, NULL) != 0)
+			break;
+		created++;
+		if (!tsd_wait_for(created))
+			break;
+	}
+
+	if (!have_maps || getprocmaps(getpid(), &after, NULL, 0) < 0) {
+		printf("  (getprocmaps unavailable; skipping the region check)\n");
+		return;
+	}
+
+	test_result("every thread ran its destructor", created == rounds &&
+		    tsd_dtor_calls == rounds);
+	printf("  regions %u -> %u over %d threads\n",
+	       before.n_regions, after.n_regions, created);
+	test_result("thread stacks are reclaimed, not leaked",
+		    after.n_regions <= before.n_regions + 8);
+}
+
 static void test_lock_contention(void)
 {
 	pthread_t th[LC_THREADS];
@@ -22054,6 +22157,7 @@ network_skip:;
 	test_timed_blocking();
 	test_timeout_accuracy();
 	test_fd_marker_syscalls();
+	test_tsd_destructors();
 	test_lock_contention();
 	test_orphan_reaping();
 	test_printf_conversions();

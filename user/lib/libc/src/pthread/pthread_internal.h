@@ -51,6 +51,20 @@ struct __pthread {
     size_t stack_size;              // Total size including guard
     size_t guard_size;              // Guard page size
     
+    /* Whoever CASes this 0 -> 1 owns freeing the stack, and nobody else may
+     * touch it.
+     *
+     * Without a single claim, pthread_exit() and pthread_detach() each decided
+     * independently and could BOTH decline: a detach arriving after
+     * pthread_exit() had already read detach_state as JOINABLE, but before the
+     * kernel cleared tid_futex, left the exit taking the joinable path (leave
+     * the stack for a joiner) and the detach taking its "not finished yet"
+     * path (leave it for the exit).  Since the detach is precisely the
+     * statement that nobody will ever join, the stack was then orphaned -- 2 MB
+     * plus a guard page per thread, for good.  A thread pool that detaches
+     * each worker as it finishes hits that window constantly. */
+    volatile int stack_claim;
+
     // Attributes (copied from pthread_attr_t at creation)
     int detach_state;
     cpu_set_t cpuset;
@@ -129,6 +143,7 @@ static inline struct __pthread* __pthread_self(void) {
 
 // TSD destructor caller (defined in pthread_tsd.c)
 extern void __pthread_tsd_run_destructors(void);
+extern volatile int __tsd_lock;
 
 // Destructors for this thread's `thread_local` objects, registered through
 // __cxa_thread_atexit_impl (defined in stdlib/cxa_atexit.c).  Distinct from the

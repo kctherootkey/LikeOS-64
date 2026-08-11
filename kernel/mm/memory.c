@@ -2185,6 +2185,12 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 		return false;
 	if (a->lazy != b->lazy || a->device != b->device)
 		return false;
+	/* Device mappings carry a physical base as well as a virtual one, and
+	 * two that abut in virtual space need not abut in physical space.
+	 * Merging those would leave one record claiming a physical run that
+	 * was never contiguous. */
+	if (a->device && a->device_phys + a->length != b->device_phys)
+		return false;
 	if (a->file != b->file)
 		return false;
 	/* Same file: the offsets have to run on without a break, or the two
@@ -2537,8 +2543,25 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 			 * real case, not a corner: leaving one record spanning
 			 * the hole would let a fault in the freed middle
 			 * silently materialise a fresh anonymous page. */
+			/* `region' is a pointer INTO the table, and claiming a
+			 * slot can grow the table -- which reallocates it and
+			 * frees the old array.  So the index is taken first and
+			 * the pointer rebuilt afterwards.
+			 *
+			 * Without that, every split that happened to be the
+			 * allocation which grew the table read and wrote freed
+			 * memory: `*tail = *region' copied from the old array
+			 * and `region->length' below wrote into it.  The
+			 * surviving record kept whatever the freed block
+			 * happened to hold, so a process's own map quietly
+			 * stopped describing its address space -- no fault, no
+			 * warning, just a program working from wrong records.
+			 * malloc trims the middle out of its mmapped chunks, so
+			 * this path runs constantly. */
+			size_t ridx = (size_t)(region - task->mmap_regions);
 			mmap_region_t *tail = mm_alloc_mmap_region(task);
 
+			region = &task->mmap_regions[ridx];
 			if (tail) {
 				*tail = *region;
 				tail->start = unmap_end;
@@ -3672,6 +3695,53 @@ uint64_t *mm_get_current_address_space(void)
 
 // Check whether every page covering [vaddr, vaddr+len) is present in the
 // current address space (CR3).  Returns true only if all pages are mapped.
+/* Translate a user virtual address in a SPECIFIC address space, returning the
+ * physical address or 0 if it is not mapped.
+ *
+ * Everything else that touches user memory works through the current CR3,
+ * which is fine while the caller is running in the address space it means.
+ * The exit path is not in that position: a thread can be torn down from a CPU
+ * whose CR3 belongs to somebody else, and there it needs to reach into the
+ * dying task's address space by its page table rather than by the register.
+ * The result is a physical address, so the caller writes through the direct
+ * map -- a kernel address, with no CR3 or SMAP involvement at all. */
+uint64_t mm_virt_to_phys_in(uint64_t *pml4, uint64_t vaddr)
+{
+	uint64_t pml4i = (vaddr >> 39) & 0x1FF;
+	uint64_t pdpti = (vaddr >> 30) & 0x1FF;
+	uint64_t pdi = (vaddr >> 21) & 0x1FF;
+	uint64_t pti = (vaddr >> 12) & 0x1FF;
+	uint64_t pml4e, pdpte, pde, pte;
+	uint64_t *pdpt, *pd, *pt;
+
+	if (!pml4)
+		return 0;
+
+	pml4e = pml4[pml4i];
+	if (!(pml4e & PAGE_PRESENT))
+		return 0;
+
+	pdpt = (uint64_t *)phys_to_virt(pml4e & PTE_ADDR_MASK);
+	pdpte = pdpt[pdpti];
+	if (!(pdpte & PAGE_PRESENT))
+		return 0;
+	if (pdpte & PAGE_SIZE_FLAG) /* 1 GB page */
+		return (pdpte & PTE_ADDR_MASK) + (vaddr & 0x3FFFFFFFULL);
+
+	pd = (uint64_t *)phys_to_virt(pdpte & PTE_ADDR_MASK);
+	pde = pd[pdi];
+	if (!(pde & PAGE_PRESENT))
+		return 0;
+	if (pde & PAGE_SIZE_FLAG) /* 2 MB page */
+		return (pde & PTE_ADDR_MASK) + (vaddr & 0x1FFFFFULL);
+
+	pt = (uint64_t *)phys_to_virt(pde & PTE_ADDR_MASK);
+	pte = pt[pti];
+	if (!(pte & PAGE_PRESENT))
+		return 0;
+	return (pte & PTE_ADDR_MASK) + (vaddr & 0xFFFULL);
+}
+
 bool mm_user_addr_mapped(uint64_t vaddr, size_t len)
 {
 	if (len == 0)

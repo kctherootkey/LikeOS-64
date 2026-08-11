@@ -26,7 +26,10 @@ static struct {
 } __tsd_keys[MAX_KEYS];
 
 // Spinlock for key allocation
-static volatile int __tsd_lock = 0;
+/* Not static: the fork hooks in pthread.c must take this across a fork and
+ * clear it in the child, or a fork racing a key create/delete inherits it
+ * locked and the child spins on the next pthread_key_create(). */
+volatile int __tsd_lock = 0;
 
 // Next key to try allocating (circular search)
 static unsigned int __tsd_next = 0;

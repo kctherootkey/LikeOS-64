@@ -307,7 +307,7 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
 	libdlbase.so libdlchain.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
-	netstress openssltest usbtest ext4test permbench fbtest
+	netstress openssltest usbtest ext4test permbench fbtest pmap
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -835,6 +835,13 @@ $(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) memstat
 	cp $(USER_DIR)/memstat $@
+
+# pmap: prints a process's region table and brk, and can watch them for
+# movement.  ps reports one VSZ total, which cannot separate a table filling
+# up from a few regions growing.
+$(BUILD_DIR)/pmap: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/pmap
+	cp $(USER_DIR)/tests/pmap $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/teststress: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1537,6 +1544,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/ext4test      $(EXT4_STAGING)/usr/local/bin/ext4test
 	cp $(BUILD_DIR)/permbench     $(EXT4_STAGING)/usr/local/bin/permbench
 	cp $(BUILD_DIR)/fbtest        $(EXT4_STAGING)/usr/local/bin/fbtest
+	cp $(BUILD_DIR)/pmap          $(EXT4_STAGING)/usr/local/bin/pmap
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh

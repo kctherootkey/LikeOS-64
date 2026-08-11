@@ -1176,6 +1176,17 @@ int reboot(int cmd)
 	return 0;
 }
 
+int getprocmaps(int pid, void *info, void *buf, int max)
+{
+	long ret = syscall4(SYS_GETPROCMAPS, (long)pid, (long)info, (long)buf,
+			    (long)max);
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	return (int)ret;
+}
+
 int getprocinfo(void *buf, int max_count)
 {
 	long ret = syscall2(SYS_GETPROCINFO, (long)buf, (long)max_count);

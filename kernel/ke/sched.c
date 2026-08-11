@@ -3367,11 +3367,35 @@ void sched_mark_task_exited(task_t *task, int status)
          * reports false in the cross-CPU case and we skip the write.
          * pthread_join still wakes via futex_wake_for_task below
          * (which uses the dying task's PML4 to compute the key). */
-		if (mm_user_addr_mapped((uint64_t)task->clear_child_tid,
-					sizeof(int))) {
+		uint64_t ctid = (uint64_t)task->clear_child_tid;
+
+		if (mm_user_addr_mapped(ctid, sizeof(int))) {
 			smap_disable();
-			*(volatile int *)task->clear_child_tid = 0;
+			*(volatile int *)ctid = 0;
 			smap_enable();
+		} else if (task->pml4 && (ctid & 3) == 0) {
+			/* Not in THIS CPU's address space, so reach the word
+			 * through the dying task's own page table and write it
+			 * via the direct map.
+			 *
+			 * Skipping it, which is what happened before, is not
+			 * harmless: this word is the thread's liveness flag.
+			 * pthread_detach() frees an already-exited thread's
+			 * stack only when it reads zero here, and pthread_join
+			 * waits on it.  Left non-zero, every thread that exits
+			 * on a CPU running somebody else's address space leaks
+			 * its whole stack -- 2 MB plus a guard page each.  Seen
+			 * as a file manager whose mapped total climbed by one
+			 * stack every couple of seconds while its thread count
+			 * never moved off four.
+			 *
+			 * The alignment test is what makes the single write
+			 * safe: a 4-byte aligned int cannot straddle two pages,
+			 * so one translation covers it. */
+			uint64_t phys = mm_virt_to_phys_in(task->pml4, ctid);
+
+			if (phys)
+				*(volatile int *)phys_to_virt(phys) = 0;
 		}
 
 		// Wake any threads waiting on this futex (pthread_join uses this).

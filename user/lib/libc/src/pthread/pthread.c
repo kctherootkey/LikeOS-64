@@ -81,11 +81,11 @@ static int __pthread_initialized = 0;
 static struct __pthread *__thread_list_head = NULL;
 static volatile int __thread_list_lock = 0;
 
-// TSD key management
-static void (*__tsd_destructors[PTHREAD_KEYS_MAX])(void *);
-static volatile int __tsd_key_used[PTHREAD_KEYS_MAX];
-static volatile int __tsd_next_key = 0;
-static volatile int __tsd_lock = 0;
+/* TSD key management lives in pthread_tsd.c.  The fork hooks below take the
+ * real lock from there -- this file used to declare a private one of the same
+ * name, so the lock that pthread_key_create() actually holds was never taken
+ * across a fork nor reset in the child, and a fork racing a key create left
+ * the child spinning on it forever. */
 
 // ============================================================================
 // INTERNAL HELPERS
@@ -456,30 +456,15 @@ static int __pthread_start(void *arg)
 	return 0;
 }
 
-// Call TSD destructors
-static void __call_tsd_destructors(struct __pthread *tcb)
-{
-// POSIX requires up to PTHREAD_DESTRUCTOR_ITERATIONS attempts
-#define PTHREAD_DESTRUCTOR_ITERATIONS 4
-
-	for (int iter = 0; iter < PTHREAD_DESTRUCTOR_ITERATIONS; iter++) {
-		int any_called = 0;
-
-		for (unsigned int key = 0; key < PTHREAD_KEYS_MAX; key++) {
-			void *value = tcb->tsd_values[key];
-			void (*destructor)(void *) = __tsd_destructors[key];
-
-			if (value && destructor && __tsd_key_used[key]) {
-				tcb->tsd_values[key] = NULL;
-				destructor(value);
-				any_called = 1;
-			}
-		}
-
-		if (!any_called)
-			break;
-	}
-}
+/* TSD destructors live in pthread_tsd.c, next to the key table they read.
+ *
+ * There was a second copy of this loop here, and pthread_exit called THAT
+ * one.  It walked a destructor table private to this file which nothing ever
+ * wrote -- pthread_key_create() registers into __tsd_keys[] over in
+ * pthread_tsd.c -- so it always found NULL and no key destructor had ever run.
+ * Anything that releases a resource from one leaked it for the life of the
+ * process; a thread-per-request library that detaches its thread from its own
+ * destructor never detached, so every one of its stacks stayed mapped. */
 
 // ============================================================================
 // PUBLIC API: THREAD CREATION AND MANAGEMENT
@@ -594,6 +579,10 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 	tcb->state = THREAD_STATE_RUNNING;
 	tcb->retval = NULL;
 	tcb->stack_base = stack_base;
+	/* Explicitly, because a cached stack brings the PREVIOUS thread's TCB
+	 * memory with it: the claim would arrive already taken and nothing would
+	 * ever free this stack again. */
+	tcb->stack_claim = 0;
 	tcb->stack_guard =
 		__get_tcb()->stack_guard; // inherit canary from creating thread
 	tcb->stack_size = total_size;
@@ -695,8 +684,8 @@ void pthread_exit(void *retval)
 	// reaped there is nothing left to run them against.
 	__libc_thread_finalize();
 
-	// Call TSD destructors
-	__call_tsd_destructors(tcb);
+	// Call TSD destructors (pthread_tsd.c, which owns the key table)
+	__pthread_tsd_run_destructors();
 
 	// Mark as exited (before exit so joiners see it)
 	tcb->state = THREAD_STATE_EXITED;
@@ -709,7 +698,8 @@ void pthread_exit(void *retval)
 	// which faulted (SIGSEGV in __zombie_stack_reap_locked).  __unmapself
 	// does munmap(stack)+exit() in raw asm using only registers, so no one
 	// else ever reads into a stack a thread is/was running on.
-	if (tcb->detach_state == PTHREAD_CREATE_DETACHED && tcb->stack_base) {
+	if (tcb->detach_state == PTHREAD_CREATE_DETACHED && tcb->stack_base &&
+	    __atomic_cas(&tcb->stack_claim, 0, 1) == 0) {
 		// Remove from thread list first (its links are in the TCB, which
 		// is inside the stack we are about to unmap).
 		__spin_lock(&__thread_list_lock);
@@ -823,7 +813,7 @@ int pthread_join(pthread_t thread, void **retval)
 	 * Sweep the list as well, so stacks left by earlier detached threads do
 	 * not wait for the next pthread_create either.
 	 */
-	if (stack_base) {
+	if (stack_base && __atomic_cas(&tcb->stack_claim, 0, 1) == 0) {
 		/* Keep it for the next thread rather than giving it back.  Safe
 		 * precisely because this thread is joined: the wait above saw
 		 * tid_futex reach 0, so nothing is executing on it any more.
@@ -863,7 +853,18 @@ int pthread_detach(pthread_t thread)
 	// Now that we own the DETACHED transition we must do it.
 	// Use tid_futex == 0 as the authoritative "kernel has finished with
 	// this thread" signal (CLONE_CHILD_CLEARTID writes 0 on exit).
-	if (tcb->tid_futex == 0 && tcb->stack_base) {
+	/* Reclaim the stack if this thread is finished OR on its way out.
+	 *
+	 * Testing tid_futex == 0 alone left a hole: between pthread_exit()
+	 * reading detach_state (still JOINABLE, so it leaves the stack for a
+	 * joiner) and the kernel clearing tid_futex, a detach arriving here saw
+	 * a non-zero futex and declined too.  Nobody joins a detached thread, so
+	 * the stack was orphaned.  THREAD_STATE_EXITED is set before that read,
+	 * so it covers the window; the claim below decides which side acts, and
+	 * the exit path checks the same claim before unmapping its own stack. */
+	if (tcb->stack_base &&
+	    (tcb->tid_futex == 0 || tcb->state == THREAD_STATE_EXITED) &&
+	    __atomic_cas(&tcb->stack_claim, 0, 1) == 0) {
 		__spin_lock(&__thread_list_lock);
 		tcb->prev->next = tcb->next;
 		tcb->next->prev = tcb->prev;
@@ -877,8 +878,17 @@ int pthread_detach(pthread_t thread)
 		 * finished with this thread (CLONE_CHILD_CLEARTID wrote 0 on
 		 * exit) and it is provably off its stack.  So the stack is safe
 		 * to free now: enqueue with alive == NULL (the reaper frees it
-		 * without ever dereferencing into the stack). */
-		__zombie_stack_add(tcb->stack_base, tcb->stack_size, NULL);
+		 * without ever dereferencing into the stack).
+		 *
+		 * If it has not finished yet, the gate is tid_futex so the
+		 * reaper waits for the kernel before unmapping.  Reading that
+		 * word means reading INTO the stack, which was unsafe while the
+		 * exit path could unmap it underneath -- the claim above is what
+		 * makes it safe, because the owner of the claim is the only one
+		 * that frees. */
+		__zombie_stack_add(tcb->stack_base, tcb->stack_size,
+				   tcb->tid_futex == 0 ? NULL :
+							 &tcb->tid_futex);
 	}
 
 	return 0;

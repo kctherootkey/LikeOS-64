@@ -247,6 +247,22 @@ typedef struct tcache_perthread_struct {
 static struct malloc_state main_arena;
 static mlock_t arena_list_lock;        /* global allocator lock: arena list,
                                           arena creation, one-time init */
+/* Set from MALLOC_TRIM_HEAPS at start-up.  Releasing whole heaps is new and
+ * touches the top chunk and the heap chain, so there is a way to turn it off
+ * without rebuilding: if a program starts behaving differently, running it
+ * once with MALLOC_TRIM_HEAPS=0 says whether this is the reason. */
+static int heap_trim_enabled = 1;
+
+/* Counts of whole heaps mapped for an arena and handed back again.
+ *
+ * Two attempts to verify heap release from the outside were wasted measuring
+ * address space, which moves for reasons that have nothing to do with heaps
+ * (the direct-map fallback returns chunks too).  These count the events
+ * themselves, so a test can state plainly whether the path ran at all --
+ * "created 0" means the exercise never reached it and proves nothing, which is
+ * exactly the mistake that was made twice. */
+volatile unsigned long __malloc_heaps_created;
+volatile unsigned long __malloc_heaps_released;
 static unsigned narenas = 0;
 static unsigned narenas_limit = 1;
 static struct malloc_state *next_to_use = NULL;
@@ -586,6 +602,7 @@ static struct malloc_state *arena_new(void)
     if (!h)
         return NULL;
 
+    __sync_fetch_and_add(&__malloc_heaps_created, 1);
     char *base = (char *)h + ((sizeof(heap_info) + MALLOC_ALIGN_MASK) & ~MALLOC_ALIGN_MASK);
     struct malloc_state *av = (struct malloc_state *)base;
     malloc_init_state(av);
@@ -709,6 +726,8 @@ static void malloc_init_once(void)
     mp_.mmap_threshold = env_size("MALLOC_MMAP_THRESHOLD_", DEFAULT_MMAP_THRESHOLD);
     mp_.no_dyn_threshold = getenv("MALLOC_MMAP_THRESHOLD_") != NULL;
     mp_.trim_threshold = env_size("MALLOC_TRIM_THRESHOLD_", DEFAULT_TRIM_THRESHOLD);
+    if (getenv("MALLOC_TRIM_HEAPS") && env_size("MALLOC_TRIM_HEAPS", 1) == 0)
+        heap_trim_enabled = 0;
     mp_.top_pad = env_size("MALLOC_TOP_PAD_", DEFAULT_TOP_PAD);
     mp_.n_mmaps_max = (int)env_size("MALLOC_MMAP_MAX_", DEFAULT_MMAP_MAX);
     mp_.perturb_byte = (int)(env_size("MALLOC_PERTURB_", 0) & 0xff);
@@ -850,6 +869,7 @@ static void *sysmalloc(struct malloc_state *av, size_t nb)
         if (h) {
             h->ar_ptr = av;
             h->prev = old_top ? heap_for_ptr(old_top) : NULL;
+            __sync_fetch_and_add(&__malloc_heaps_created, 1);
             av->system_mem += HEAP_MAX_SIZE;
             if (av->system_mem > av->max_system_mem)
                 av->max_system_mem = av->system_mem;
@@ -990,6 +1010,97 @@ static int heap_release_top(struct malloc_state *av, size_t pad, size_t min_rele
     if (h->dirty_top > rs)
         h->dirty_top = rs;
     return 1;
+}
+
+/* Hand a wholly-empty non-main heap back to the system.
+ *
+ * heap_release_top() above returns the PAGES of a heap's top chunk but keeps
+ * the mapping, deliberately.  Nothing released the mapping itself, so every
+ * heap an arena ever grew into stayed mapped for the life of the process: at
+ * HEAP_MAX_SIZE apiece the address space climbed without bound while the
+ * resident set stayed small, which is exactly the shape a program that
+ * allocates and frees in cycles produces.  This is the missing half.
+ *
+ * The walk back into the previous heap is the reference algorithm, and it
+ * depends on the two fenceposts fencepost_old_top() writes at the end of a
+ * heap when the arena moves on to a new one:
+ *
+ *   [ ... old top chunk ... ][ fencepost 2*SIZE_SZ ][ fencepost size 0 ]
+ *                                                   ^ heap end - 16
+ *
+ * So from the end of the previous heap, step back MINSIZE - 2*SIZE_SZ to land
+ * on the terminating fencepost, correct for any misalignment, step back once
+ * more to the 2*SIZE_SZ fencepost, and the chunk before THAT is what the top
+ * becomes again.  If the old top was freed when the fencepost went down its
+ * PREV_INUSE is clear, and the two consolidate backward.
+ *
+ * The loop repeats because the heap we fall back into may itself now be empty.
+ *
+ * The first heap of an arena has no predecessor and is kept: the arena has to
+ * have somewhere to allocate from.
+ */
+static int heap_trim(heap_info *heap, size_t pad)
+{
+    struct malloc_state *av = heap->ar_ptr;
+
+    if (!heap_trim_enabled)
+        return 0;
+    mchunkptr top_chunk = av->top, p;
+    heap_info *prev_heap;
+    long new_size, prev_off, misalign;
+    int freed = 0;
+
+    if (!av)
+        return 0;
+
+    /* Empty means the top chunk begins where this heap's payload begins --
+     * the same expression sysmalloc() used to place it. */
+    while (top_chunk ==
+           (mchunkptr)((char *)heap +
+                       ((sizeof(heap_info) + MALLOC_ALIGN_MASK) &
+                        ~MALLOC_ALIGN_MASK))) {
+        prev_heap = heap->prev;
+        if (!prev_heap)
+            break;
+
+        prev_off = (long)prev_heap->size - (long)(MINSIZE - 2 * SIZE_SZ);
+        p = chunk_at_offset(prev_heap, prev_off);
+        misalign = ((long)p) & MALLOC_ALIGN_MASK;
+        p = chunk_at_offset(prev_heap, prev_off - misalign);
+
+        /* Must be the terminating fencepost.  Anything else means the chain
+         * is not what this walk assumes, and unmapping on a guess would take
+         * live memory with it. */
+        if (p->mchunk_size != (size_t)(0 | PREV_INUSE))
+            break;
+
+        p = prev_chunk(p);
+        new_size = (long)chunksize(p) + (MINSIZE - 2 * SIZE_SZ) + misalign;
+        if (!prev_inuse(p))
+            new_size += (long)p->mchunk_prev_size;
+        if (new_size <= 0 || (size_t)new_size >= HEAP_MAX_SIZE)
+            break;
+
+        /* Keep it if what we would get back is not worth the unmap. */
+        if ((size_t)new_size + (HEAP_MAX_SIZE - prev_heap->size) <
+            pad + MINSIZE + PAGE_SIZE)
+            break;
+
+        av->system_mem -= heap->size;
+        munmap(heap, HEAP_MAX_SIZE);
+        __sync_fetch_and_add(&__malloc_heaps_released, 1);
+        heap = prev_heap;
+
+        if (!prev_inuse(p)) { /* consolidate backward */
+            p = prev_chunk(p);
+            unlink_chunk(av, p);
+        }
+        av->top = top_chunk = p;
+        set_head(top_chunk, (size_t)new_size | PREV_INUSE);
+        freed = 1;
+    }
+
+    return freed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1512,10 +1623,14 @@ static void _int_free(struct malloc_state *av, mchunkptr p, int have_lock)
         if (av->have_fastchunks)
             malloc_consolidate(av);
         if (av->top && chunksize(av->top) >= mp_.trim_threshold) {
-            if (av == &main_arena)
+            if (av == &main_arena) {
                 systrim(av, mp_.top_pad);
-            else
+            } else {
+                /* Release the whole heap first if it has emptied; whatever
+                 * heap the top ends up in then gets its pages trimmed. */
+                heap_trim(heap_for_ptr(av->top), mp_.top_pad);
                 heap_release_top(av, mp_.top_pad, mp_.trim_threshold);
+            }
         }
     }
 
@@ -1913,10 +2028,12 @@ int malloc_trim(size_t pad)
         mlock_lock(&av->mutex);
         if (av->have_fastchunks)
             malloc_consolidate(av);
-        if (av == &main_arena)
+        if (av == &main_arena) {
             released |= systrim(av, pad);
-        else
+        } else {
+            released |= heap_trim(heap_for_ptr(av->top), pad);
             released |= heap_release_top(av, pad, PAGE_SIZE);
+        }
         mlock_unlock(&av->mutex);
         av = av->next;
     } while (av != &main_arena);

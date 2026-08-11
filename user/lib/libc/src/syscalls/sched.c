@@ -190,6 +190,39 @@ int futex_wait(volatile int *uaddr, int val, const struct timespec *timeout)
  * `abstime' is against CLOCK_REALTIME, the clock POSIX names for all of these
  * interfaces.  NULL waits indefinitely, exactly as futex_wait(..., NULL) does.
  */
+int __futex_wait_until_clock(volatile int *uaddr, int val,
+			     const struct timespec *abstime, int clock_id)
+{
+	struct timespec now, rel;
+
+	if (!abstime)
+		return futex_wait(uaddr, val, NULL);
+
+	if (abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000L) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/* Against the clock the CALLER named.  Reading the wall clock for a
+	 * deadline measured since boot -- which is what CLOCK_MONOTONIC gives
+	 * -- makes the subtraction below hugely negative, so the wait expires
+	 * on the spot.  Every timed wait in a program that selects
+	 * CLOCK_MONOTONIC then returns ETIMEDOUT immediately. */
+	clock_gettime(clock_id, &now);
+	rel.tv_sec = abstime->tv_sec - now.tv_sec;
+	rel.tv_nsec = abstime->tv_nsec - now.tv_nsec;
+	if (rel.tv_nsec < 0) {
+		rel.tv_nsec += 1000000000L;
+		rel.tv_sec--;
+	}
+	if (rel.tv_sec < 0) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+
+	return futex_wait(uaddr, val, &rel);
+}
+
 int __futex_wait_until(volatile int *uaddr, int val,
 		       const struct timespec *abstime)
 {

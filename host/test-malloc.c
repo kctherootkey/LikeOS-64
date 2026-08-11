@@ -481,6 +481,285 @@ static void *worker(void *arg)
 	return NULL;
 }
 
+/* Drive an arena across more than one heap, then empty it.
+ *
+ * The stress loop above allocates too small a working set to make a
+ * non-main arena grow past its first heap, so it never reached the code that
+ * hands a wholly-empty heap back.  This does: it runs in a WORKER thread (the
+ * main arena grows by brk instead and takes a different path), allocates well
+ * past one heap's worth in pieces below the mmap threshold so every one comes
+ * from the heap rather than from a direct map, checks each block still holds
+ * its pattern, frees them all, and then allocates again -- which is what
+ * detects a heap that was unmapped while still in use, or a top chunk left
+ * pointing into a heap that is gone.
+ */
+/* Total mapped size of this process, in KB, from the host's own accounting.
+ * Used to show that emptying an arena actually returns its address space. */
+static size_t host_vsz_kb(void)
+{
+	FILE *f = fopen("/proc/self/statm", "r");
+	unsigned long pages = 0;
+
+	if (!f)
+		return 0;
+	if (fscanf(f, "%lu", &pages) != 1)
+		pages = 0;
+	fclose(f);
+	return (size_t)pages * ((size_t)sysconf(_SC_PAGESIZE) / 1024);
+}
+
+#define HEAPGROW_BLOCK   (64 * 1024)   /* under the 128 KB mmap threshold */
+#define HEAPGROW_TOTAL   (192UL * 1024 * 1024) /* several heaps' worth */
+#define HEAP_MAX_SIZE_KB (64UL * 1024)         /* one heap, in KB */
+#define HEAPGROW_COUNT   (HEAPGROW_TOTAL / HEAPGROW_BLOCK)
+
+static int g_heapgrow_fail;
+static pthread_barrier_t g_heapgrow_bar;
+static size_t g_vsz_peak, g_vsz_after;
+
+static void *heapgrow_worker(void *arg)
+{
+	(void)arg;
+	unsigned char **v = (unsigned char **)calloc(HEAPGROW_COUNT,
+						     sizeof(*v));
+	if (!v) {
+		pthread_barrier_wait(&g_heapgrow_bar);
+		return NULL;
+	}
+
+	/* Start together.  This is a concurrency exercise -- two threads
+	 * allocating and freeing hard at the same time -- not the heap-release
+	 * check; which arena a thread lands on is up to the scheduler, so it
+	 * cannot assert anything about heaps.  test_heap_release() does that. */
+	pthread_barrier_wait(&g_heapgrow_bar);
+
+	size_t got = 0;
+	for (size_t i = 0; i < HEAPGROW_COUNT; i++) {
+		v[i] = (unsigned char *)lk_malloc(HEAPGROW_BLOCK);
+		if (!v[i])
+			break; /* out of address space is not a failure here */
+		fill(v[i], HEAPGROW_BLOCK, (unsigned)i + 1);
+		got++;
+	}
+	for (size_t i = 0; i < got; i++)
+		if (!verify(v[i], HEAPGROW_BLOCK, (unsigned)i + 1)) {
+			printf("  heap-growth: block %zu MODIFIED before free\n", i);
+			g_heapgrow_fail = 1;
+		}
+
+	/* Peak, with everything live: measured once, by whichever thread the
+	 * barrier elects, after BOTH have finished allocating. */
+	if (pthread_barrier_wait(&g_heapgrow_bar) == PTHREAD_BARRIER_SERIAL_THREAD)
+		g_vsz_peak = host_vsz_kb();
+
+	/* Empty the arena: this is what makes whole heaps releasable. */
+	for (size_t i = 0; i < got; i++)
+		lk_free(v[i]);
+
+	if (pthread_barrier_wait(&g_heapgrow_bar) == PTHREAD_BARRIER_SERIAL_THREAD)
+		g_vsz_after = host_vsz_kb();
+
+	/* Allocate again through the same arena.  A heap unmapped while still
+	 * in use, or a top chunk left pointing into one that is gone, fails
+	 * here rather than silently. */
+	for (int round = 0; round < 3; round++) {
+		unsigned char *q[64];
+		for (int i = 0; i < 64; i++) {
+			q[i] = (unsigned char *)lk_malloc(HEAPGROW_BLOCK);
+			if (q[i])
+				fill(q[i], HEAPGROW_BLOCK,
+				     (unsigned)(0x5000 + i));
+		}
+		for (int i = 0; i < 64; i++) {
+			if (!q[i])
+				continue;
+			if (!verify(q[i], HEAPGROW_BLOCK,
+				    (unsigned)(0x5000 + i))) {
+				printf("  heap-growth: block MODIFIED after trim\n");
+				g_heapgrow_fail = 1;
+			}
+			lk_free(q[i]);
+		}
+	}
+
+	free(v);
+	return NULL;
+}
+
+static void test_heap_growth_and_release(void)
+{
+	pthread_t t[2];
+
+	printf("concurrent large alloc/free cycle... ");
+	fflush(stdout);
+
+	if (pthread_barrier_init(&g_heapgrow_bar, NULL, 2) != 0) {
+		printf("SKIP (no barrier)\n");
+		return;
+	}
+	for (int i = 0; i < 2; i++)
+		if (pthread_create(&t[i], NULL, heapgrow_worker, NULL) != 0) {
+			printf("SKIP (no thread)\n");
+			return;
+		}
+	for (int i = 0; i < 2; i++)
+		pthread_join(t[i], NULL);
+	pthread_barrier_destroy(&g_heapgrow_bar);
+
+	/* Address space is reported, not asserted on.  It moves whenever the
+	 * direct-map fallback in sysmalloc() returns a chunk, so it says
+	 * nothing about whole heaps: an earlier version of this case asserted
+	 * on it and passed with heap release disabled. */
+	printf("%s   (peak %zu KB -> %zu KB)\n",
+	       g_heapgrow_fail ? "FAIL" : "ok", g_vsz_peak, g_vsz_after);
+}
+
+/* Whole empty heaps are unmapped.
+ *
+ * Drive the arena directly instead of starting threads and hoping.  Only a
+ * non-main arena maps heaps -- the main arena moves the break -- and a thread
+ * is put on the main arena whenever its mutex happens to be free at its first
+ * allocation, which on most runs is both of them.  Taking the arena here makes
+ * the exercise deterministic, and the counters record the events themselves
+ * rather than inferring them from a size that other paths also move. */
+static void heap_release_case(const char *name, int reverse, long pin)
+{
+	unsigned long created0, released0, created, released;
+	struct malloc_state *av;
+	size_t nb = checked_request2size(HEAPGROW_BLOCK);
+	size_t got = 0;
+	int corrupt = 0;
+	void **v;
+
+	printf("%s... ", name);
+	fflush(stdout);
+
+	v = (void **)calloc(HEAPGROW_COUNT, sizeof(*v));
+	if (!v) {
+		printf("SKIP (no memory for the block table)\n");
+		return;
+	}
+
+	mlock_lock(&arena_list_lock);
+	av = arena_new();
+	mlock_unlock(&arena_list_lock);
+	if (!av) {
+		printf("SKIP (no room for a %lu MB heap)\n",
+		       (unsigned long)(HEAP_MAX_SIZE >> 20));
+		free(v);
+		return;
+	}
+
+	/* From here on, only this arena's heaps are counted: arena_new() has
+	 * already mapped the first one, and that one is never releasable --
+	 * the malloc_state lives inside it. */
+	created0 = __malloc_heaps_created;
+	released0 = __malloc_heaps_released;
+
+	for (size_t i = 0; i < HEAPGROW_COUNT; i++) {
+		mlock_lock(&av->mutex);
+		v[i] = _int_malloc(av, nb);
+		mlock_unlock(&av->mutex);
+		if (!v[i])
+			break;   /* out of address space is not a failure */
+		fill((unsigned char *)v[i], HEAPGROW_BLOCK, (unsigned)i + 1);
+		got++;
+	}
+	created = __malloc_heaps_created - created0;
+
+	for (size_t i = 0; i < got; i++)
+		if (!verify((unsigned char *)v[i], HEAPGROW_BLOCK,
+			    (unsigned)i + 1)) {
+			printf("  block %zu MODIFIED while live\n", i);
+			corrupt = 1;
+		}
+
+	/* `pin` keeps one block live, which pins the heap holding it: a real
+	 * program hardly ever empties an arena completely, and a release that
+	 * only worked when it did would be no use.  Nothing below the pinned
+	 * heap may be unmapped, and the pinned block itself must survive. */
+	if (reverse) {
+		for (size_t i = got; i-- > 0; )
+			if ((long)i != pin)
+				_int_free(av, mem2chunk(v[i]), 0);
+	} else {
+		for (size_t i = 0; i < got; i++)
+			if ((long)i != pin)
+				_int_free(av, mem2chunk(v[i]), 0);
+	}
+	released = __malloc_heaps_released - released0;
+
+	if (pin >= 0 && (size_t)pin < got &&
+	    !verify((unsigned char *)v[pin], HEAPGROW_BLOCK,
+		    (unsigned)pin + 1)) {
+		printf("  PINNED block %ld was unmapped or overwritten\n", pin);
+		corrupt = 1;
+	}
+
+	/* Reuse the arena afterwards.  A heap unmapped while still in use, or
+	 * a top chunk left pointing into one that is gone, faults here. */
+	for (int round = 0; round < 3 && !corrupt; round++) {
+		void *q[64];
+
+		for (int i = 0; i < 64; i++) {
+			mlock_lock(&av->mutex);
+			q[i] = _int_malloc(av, nb);
+			mlock_unlock(&av->mutex);
+			if (q[i])
+				fill((unsigned char *)q[i], HEAPGROW_BLOCK,
+				     (unsigned)(0x5000 + i));
+		}
+		for (int i = 0; i < 64; i++) {
+			if (!q[i])
+				continue;
+			if (!verify((unsigned char *)q[i], HEAPGROW_BLOCK,
+				    (unsigned)(0x5000 + i))) {
+				printf("  block MODIFIED after release\n");
+				corrupt = 1;
+			}
+			_int_free(av, mem2chunk(q[i]), 0);
+		}
+	}
+
+	free(v);
+
+	if (created == 0) {
+		printf("INCONCLUSIVE\n"
+		       "  %zu blocks fit in the arena's first heap, so it never\n"
+		       "  had to map another one and release was not reached\n",
+		       got);
+		g_heapgrow_fail = 1;
+		return;
+	}
+
+	/* With nothing pinned, every heap mapped for growth is empty once the
+	 * blocks are freed and every one of them should be gone.  With a block
+	 * pinned, release has to stop at the heap holding it -- so the bar is
+	 * that some space came back and nothing live was taken with it.  Which
+	 * heap the pin falls in depends on the sizes, so it is not a number
+	 * this can assert on.  The arena's own first heap is not counted and
+	 * is expected to stay: the malloc_state lives inside it. */
+	int ok = !corrupt && (pin < 0 ? released == created : released > 0);
+
+	printf("%s\n  %zu blocks: heaps mapped %lu, unmapped %lu%s\n",
+	       ok ? "ok" : "FAIL", got, created, released,
+	       pin >= 0 ? " (one block pinned)" : "");
+	if (released == 0)
+		printf("  heaps were emptied but none was handed back\n");
+	else if (pin < 0 && released < created)
+		printf("  %lu emptied heap(s) were kept\n", created - released);
+	if (!ok)
+		g_heapgrow_fail = 1;
+}
+
+static void test_heap_release(void)
+{
+	/* The clean case first: if this fails the others say nothing. */
+	heap_release_case("empty arena heaps are unmapped", 1, -1);
+	heap_release_case("  ...freed oldest-first", 0, -1);
+	heap_release_case("  ...with a block left live", 0, HEAPGROW_COUNT / 2);
+}
+
 int main(int argc, char **argv)
 {
 	int nthreads = argc > 1 ? atoi(argv[1]) : 2;
@@ -508,7 +787,11 @@ int main(int argc, char **argv)
 			report("block was MODIFIED (final sweep)", live[i].p,
 			       NULL);
 
-	printf("%ld allocations, %d failure%s\n", g_allocs, g_fail,
-	       g_fail == 1 ? "" : "s");
-	return g_fail ? 1 : 0;
+	test_heap_growth_and_release();
+	test_heap_release();
+
+	printf("%ld allocations, %d failure%s\n", g_allocs,
+	       g_fail + g_heapgrow_fail,
+	       (g_fail + g_heapgrow_fail) == 1 ? "" : "s");
+	return (g_fail + g_heapgrow_fail) ? 1 : 0;
 }

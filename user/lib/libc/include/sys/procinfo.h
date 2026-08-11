@@ -42,6 +42,41 @@ typedef struct procinfo {
     char    cwd[256];       /* Current working directory */
 } procinfo_t;
 
+
+/* Address-space report for one process (SYS_GETPROCMAPS).
+ *
+ * ps reports a single VSZ total, which cannot distinguish a region table
+ * filling up from a few regions growing -- different faults with different
+ * fixes.  These carry the region table itself. */
+typedef struct procmap {
+    uint64_t start;
+    uint64_t length;
+    uint64_t prot;
+    uint64_t flags;
+    uint64_t offset;
+    int      file_backed;
+    int      lazy;
+    int      device;
+    int      pad;
+} procmap_t;
+
+typedef struct procmapinfo {
+    int      pid;
+    int      tgid;
+    uint64_t brk_start;
+    uint64_t brk;
+    uint64_t mmap_base;
+    uint64_t total_bytes;   /* sum of in-use region lengths */
+    uint32_t n_regions;     /* in-use records */
+    uint32_t capacity;      /* records the table can hold */
+} procmapinfo_t;
+
+/* Report the address space of `pid`.  Fills *info always; fills up to `max`
+ * region records if buf is non-NULL.  Returns the number of records written,
+ * or -1 (errno set).  info->n_regions is the true count, which may exceed
+ * what was written. */
+int getprocmaps(int pid, procmapinfo_t *info, procmap_t *buf, int max);
+
 /* Retrieve information about all processes.
  * buf:       array of procinfo_t to fill
  * max_count: number of entries the array can hold
