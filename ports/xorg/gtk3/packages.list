@@ -115,5 +115,66 @@
 # tarball: it has no configure, so likeos-autogen.sh runs autogen.sh first.
 -         libetpan           1.10.1   https://github.com/dinhvh/libetpan/archive/refs/tags/%VERSION%.tar.gz
 
-# ---- the application ----------------------------------------------------
+# ---- the applications ---------------------------------------------------
 -         claws-mail         4.4.0    https://www.claws-mail.org/releases/claws-mail-%VERSION%.tar.xz
+
+# ---- Mousepad and what it edits with ------------------------------------
+# libxml2 is here rather than in the X manifest because nothing below GTK
+# wanted it: fontconfig parses its configuration with expat.  GtkSourceView
+# reads its syntax definitions and style schemes with libxml2's reader, so it
+# is the editor's dependency, not the font stack's.
+-         libxml2            2.15.3   https://download.gnome.org/sources/libxml2/2.15/libxml2-%VERSION%.tar.xz
+# The source-editing widget: syntax highlighting, bracket matching, line
+# numbers, undo -- Mousepad is a window and a menu bar around it.
+#
+# 4.8.4 is the newest release this can use, and newer is not better here: the
+# 5.x series is GTK4-only, and the toolkit below is GTK3.  4.8.4 is the last of
+# the 4.x line.
+-         gtksourceview      4.8.4    https://download.gnome.org/sources/gtksourceview/4.8/gtksourceview-%VERSION%.tar.xz
+-         mousepad           0.7.0    https://archive.xfce.org/src/apps/mousepad/0.7/mousepad-%VERSION%.tar.xz
+
+# ---- PCManFM and what a file manager needs to know ----------------------
+# A BUILD-host tool, like nsgenbind in the X manifest, and installed into
+# .hosttools rather than the sysroot.  The LXDE packages below merge
+# translations into their .desktop, .directory and .menu files with intltool,
+# and their configure REFUSES to continue without it -- it is not a
+# translation-only concern, since those merged files are what the desktop
+# entries themselves are made from.  Built here rather than required of the
+# build host: it is three Perl scripts and a configure, and asking every
+# machine that builds this tree to install a package first is a worse trade.
+-         intltool           0.51.0   https://deb.debian.org/debian/pool/main/i/intltool/intltool_%VERSION%.orig.tar.gz
+# What a file IS, in the only form GLib can answer the question from.
+# g_content_type_guess() -- which is how libfm decides a file's icon, its
+# description and what opens it -- reads the shared MIME database and has no
+# built-in table to fall back on.  Without this every file on the system is
+# application/octet-stream: one generic icon everywhere and no default
+# application for anything.  A git export, because the project publishes no
+# release tarballs; nothing in it is compiled here (see install_data).
+-         shared-mime-info   2.5.1    https://gitlab.freedesktop.org/xdg/shared-mime-info/-/archive/%VERSION%/shared-mime-info-%VERSION%.tar.gz
+# The application menu itself: the .menu file that says which categories exist
+# and in what order, and the directory entries that name them.  menu-cache
+# reads it; without one, the "Open With" dialog's application list is empty
+# even though the .desktop files are all present.
+-         lxmenu-data        0.1.7    https://github.com/lxde/lxmenu-data/archive/refs/tags/%VERSION%.tar.gz
+# libfm and menu-cache each need part of the other, so libfm is built twice
+# from two copies of one tarball rather than once in place:
+#
+#   libfm-extra   the XML parser and string helpers, and nothing else
+#                 (--with-extra-only).  menu-cache links it.
+#   menu-cache    the menu reader.
+#   libfm         the whole file-management library, which requires
+#                 menu-cache to be installed before it will configure.
+#
+# Two trees rather than two passes over one, because each build begins by
+# distcleaning the tree it is in: a second pass would erase the first one's
+# configuration while its stamp still said it was built.
+#
+# All four are tag exports rather than release tarballs -- the current LXDE
+# releases are published as tags and nothing else, which is why the last
+# tarball on SourceForge is several versions behind.  They therefore have no
+# configure script, and likeos-autogen.sh runs their autogen.sh first, exactly
+# as it does for libetpan above.
+-         libfm-extra        1.4.1    https://github.com/lxde/libfm/archive/refs/tags/%VERSION%.tar.gz
+-         menu-cache         1.1.1    https://github.com/lxde/menu-cache/archive/refs/tags/%VERSION%.tar.gz
+-         libfm              1.4.1    https://github.com/lxde/libfm/archive/refs/tags/%VERSION%.tar.gz
+-         pcmanfm            1.4.0    https://github.com/lxde/pcmanfm/archive/refs/tags/%VERSION%.tar.gz

@@ -1,0 +1,18 @@
+# A Type=Link shortcut, not a copy of the application's own desktop entry.
+#
+# PCManFM refuses to launch a plain .desktop file sitting in a folder without
+# asking first -- fm_file_info_is_executable_type() returns TRUE for any native,
+# readable application/x-desktop file, which routes it into the "this text file
+# seems to be an executable script" prompt.  The one case it exempts is a
+# SHORTCUT whose target lives under /usr/share/, which it treats as a safe
+# desktop entry path.  Type=Link is what sets that shortcut flag (a symbolic
+# link does not: libfm fills in ->target for one but never ->shortcut).
+#
+# URL is a plain absolute path rather than a file:// URI on purpose: libfm
+# resolves it with g_file_new_for_path(), which would take a URI as a relative
+# filename and never match the /usr/share/ prefix.
+[Desktop Entry]
+Type=Link
+Name=Web Browser
+Icon=web-browser
+URL=/usr/share/applications/netsurf.desktop

@@ -1180,6 +1180,71 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 			task_tty_printf(cur, "  (none recorded)\n");
 	}
 
+	/* Probable call chain, recovered by scanning the stack.
+	 *
+	 * A userspace crash arrives with no backtrace and often no way to build
+	 * one: the frame pointer is optimised away in every library worth
+	 * reading, and a tail call (GLib dispatches through one) leaves no
+	 * return address behind at all -- menu-cached faulted with RIP = 0 and
+	 * RBP = 0, which says only that something called through a null
+	 * pointer, not who.
+	 *
+	 * What does survive is that the stack still holds the return address of
+	 * every frame that got there by CALL.  So scan it for values landing
+	 * inside a mapped EXECUTABLE region and print each one the way RIP is
+	 * printed above -- as "this mapping, this far in".  That is the form
+	 * that can be turned back into a function:
+	 *
+	 *   1. find the library whose segment sizes match the mapping
+	 *   2. addr2line -f -e <that .so> <offset>
+	 *
+	 * Deliberately a heuristic: some hits are stale slots or function
+	 * pointers living in locals rather than live return addresses. It is
+	 * still the difference between a call chain and nothing at all. */
+	if (cur && (rsp >> 47) == 0 && (rsp & 7) == 0) {
+		int printed = 0;
+
+		task_tty_printf(
+			cur,
+			"\nProbable call chain (executable addresses found on the stack):\n");
+		for (int chunk = 0; chunk < 16 && printed < 24; chunk++) {
+			uint64_t at = rsp + (uint64_t)chunk * 128;
+			uint64_t q[16];
+
+			if (!mm_user_addr_mapped(at, sizeof(q)))
+				break;
+			smap_disable();
+			for (int i = 0; i < 16; i++)
+				q[i] = ((const uint64_t *)at)[i];
+			smap_enable();
+
+			for (int i = 0; i < 16 && printed < 24; i++) {
+				uint64_t v = q[i];
+
+				if ((v >> 47) != 0 || v < 0x1000)
+					continue;
+				for (int r = 0; r < TASK_MAX_MMAP; r++) {
+					mmap_region_t *reg =
+						&cur->mmap_regions[r];
+
+					if (!reg->in_use || !(reg->prot & 0x4))
+						continue;
+					if (v < reg->start ||
+					    v >= reg->start + reg->length)
+						continue;
+					task_tty_printf(
+						cur,
+						"  %016llx  = %016llx + 0x%llx\n",
+						v, reg->start, v - reg->start);
+					printed++;
+					break;
+				}
+			}
+		}
+		if (!printed)
+			task_tty_printf(cur, "  (none found)\n");
+	}
+
 	/* Page-table walk of the faulting address — gives the definitive
      * mapping state (present / writable / user / NX) for cr2.
      *
@@ -1415,11 +1480,24 @@ void exception_handler(uint64_t *regs)
 			 * and give that caller an mm_prefault_user_range()
 			 * before it takes its lock.
 			 */
+			/* Fires for a USER-mode fault too, which should be
+			 * impossible: user code runs with interrupts enabled,
+			 * so a frame claiming CPL 3 with IF clear means the
+			 * saved RFLAGS is not the interrupted context's.  That
+			 * matters as much as the kernel case -- it is why the
+			 * sti below is skipped, and demand paging then reads
+			 * from ext4 with interrupts off (the might_sleep()
+			 * reports at ext4_rwsem_read_lock, reached through
+			 * mm_demand_fault_locked -> vfs_read).  The mode is in
+			 * the message so the two cases are told apart. */
 			WARN_RATELIMIT(
-				!user_mode && !irqs_were_on,
-				"user address %llx faulted from kernel RIP %llx with interrupts disabled - that caller needs mm_prefault_user_range() before its lock",
+				!irqs_were_on,
+				"user address %llx faulted from %s RIP %llx with interrupts disabled (cs=%llx rflags=%llx) - a kernel caller needs mm_prefault_user_range() before its lock; a USER frame here means the saved RFLAGS is wrong",
 				(unsigned long long)cr2,
-				(unsigned long long)regs[REGS_RIP]);
+				user_mode ? "USER" : "kernel",
+				(unsigned long long)regs[REGS_RIP],
+				(unsigned long long)cs,
+				(unsigned long long)regs[REGS_RFLAGS]);
 
 			if (irqs_were_on)
 				__asm__ volatile("sti" ::: "memory");

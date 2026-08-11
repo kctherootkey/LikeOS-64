@@ -843,21 +843,12 @@ void signal_notify_jobctl(task_t *task, int signum, int stopped)
 	 * awake, or is already BLOCKED here and gets woken.  Without that,
 	 * WUNTRACED/WCONTINUED waits lose the wake and hang — the same trap as
 	 * the exit notification, and this one has no signal to fall back on
-	 * either. */
-	{
-		uint64_t wflags;
-		int wake;
-
-		spin_lock_irqsave(&g_wait_lock, &wflags);
-		wake = (parent->wait_channel == parent &&
-			parent->state == TASK_BLOCKED);
-		spin_unlock_irqrestore(&g_wait_lock, wflags);
-
-		if (wake && sched_claim_wake(parent, TASK_BLOCKED)) {
-			parent->wait_channel = NULL;
-			sched_enqueue_ready(parent);
-		}
-	}
+	 * either.
+	 *
+	 * Every thread of the parent process: children hang off the group
+	 * leader and any thread of the group may reap them, so the sleeper is
+	 * often not the task recorded as the parent. */
+	sched_wake_wait_sleepers(parent);
 }
 
 // Deliver pending signals to a task (called before returning to userspace)

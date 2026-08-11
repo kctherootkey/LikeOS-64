@@ -1,0 +1,120 @@
+MOUSEPAD(1)                      User Commands                     MOUSEPAD(1)
+
+NAME
+       mousepad - simple text editor
+
+SYNOPSIS
+       mousepad [OPTION...] [FILE...]
+
+DESCRIPTION
+       Mousepad  is  a  text editor for quickly editing text files: an editor,
+       not a development environment and not a plugin host.  It is the graphi-
+       cal counterpart of nano(1) on this system, and opens from the file man-
+       ager for any file whose type is text.
+
+       The editing area is a GtkSourceView widget, which is where most of what
+       the program can do comes from: syntax highlighting for  some  170  lan-
+       guages  chosen  from  the Document -> Filetype menu or guessed from the
+       file's name and contents, line numbers, automatic indentation,  bracket
+       matching, a whitespace display, and unlimited undo.
+
+       Documents  open as tabs in one window.  A tab can be dragged out into a
+       window of its own or dropped onto another window, and Document -> Split
+       View shows one document twice so that two places in a long file can  be
+       edited at once.
+
+       Text  is  read and written in the encoding named by --encoding; without
+       one Mousepad reads UTF-8 and falls back to the locale's encoding, open-
+       ing a dialog when a file is neither.  Line  endings  are  preserved  as
+       found and can be changed from Document -> Line Ending.
+
+       Search  and  replace covers the open document or every open document at
+       once, with plain text, whole-word or regular-expression  matching,  and
+       an incremental search bar bound to Ctrl+F.
+
+OPTIONS
+       -e ENCODING, --encoding=ENCODING
+              Open the files that follow in ENCODING.  With an empty argument,
+              open the encoding dialog for each file instead.
+
+       --list-encodings
+              Print  the  encodings this build accepts as an argument to --en-
+              coding, and exit.
+
+       -l LINE, --line=LINE
+              Put the cursor on line LINE.  A positive number counts from  the
+              top of the file, a negative one from the bottom.
+
+       -c COLUMN, --column=COLUMN
+              Put  the  cursor in column COLUMN.  Zero or more counts from the
+              start of the line, a negative number from its end.
+
+       --preferences
+              Open the preferences dialog rather than a document window.
+
+       --disable-server
+              Do not become, or talk to, the primary instance: this invocation
+              gets its own process and its own windows.  Without it, a  second
+              mousepad hands its file names to the one already running and ex-
+              its, so that every document shares one window.
+
+       -q, --quit
+              Ask  a  running  Mousepad to close.  Unsaved documents are still
+              asked about.
+
+       -v, --version
+              Print the version and exit.
+
+       The usual GTK options (--display, --class, --name, and  the  rest)  are
+       accepted as well; see --help-all for the whole list.
+
+FILES
+       ~/.config/Mousepad/settings.conf
+              Every  preference  the  program  remembers -- window size, font,
+              word wrap, tab width, the  toolbar  and  statusbar,  the  colour
+              scheme.
+
+              This  file  is  particular  to this system.  Mousepad stores its
+              settings through GSettings, which normally writes them into  the
+              dconf  database  over  a  session  bus,  and there is neither on
+              LikeOS.  It is therefore built with the keyfile  backend,  which
+              is upstream's option for exactly that situation and which writes
+              this plain, editable file instead.
+
+       /usr/share/glib-2.0/schemas/
+              The  compiled  schema  describing those settings.  Mousepad will
+              not start without it.
+
+       /usr/share/gtksourceview-4/language-specs/
+              The syntax definitions, one XML file per language, and where  to
+              add a language that is not there.
+
+       /usr/share/gtksourceview-4/styles/
+              The colour schemes offered under View -> Color Scheme.
+
+       /usr/lib/mousepad/plugins/
+              Where  plugin  modules  are loaded from.  None is built for this
+              image.
+
+ENVIRONMENT
+       GSETTINGS_BACKEND
+              Overrides the settings backend described under  FILES.   Setting
+              it to memory makes a session's changes deliberately temporary.
+
+EXAMPLES
+       Open a file with the cursor on its last line:
+
+              mousepad -l -1 /var/log/messages
+
+       Open a file that is not UTF-8:
+
+              mousepad --encoding=ISO-8859-15 notes.txt
+
+SEE ALSO
+       nano(1), pcmanfm(1)
+
+AUTHOR
+       Mousepad is part of the Xfce project.  This manual page was written for
+       the LikeOS port.
+
+Mousepad 0.7.0                    August 2026                      MOUSEPAD(1)

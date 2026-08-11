@@ -1,0 +1,22 @@
+--- a/autogen.sh
++++ b/autogen.sh
+@@ -29,12 +29,15 @@
+ 
+ test -d m4 || mkdir m4
+ 
+-if gtkdocize --copy; then
++if gtkdocize --copy 2>/dev/null; then
+     echo "Files needed by gtk-doc are generated."
+ else
+-    echo "You need gtk-doc to build this package."
+-    echo "http://www.gtk.org/gtk-doc/"
+-    exit 1
++    # No gtk-doc on the build host, and none wanted: see the libfm patch of
++    # this name for the whole reasoning.  configure.ac here already guards
++    # GTK_DOC_CHECK itself, so all that is missing is the file
++    # docs/reference/libmenu-cache/Makefile.am `include's -- and an empty one
++    # satisfies that include without defining any rules.
++    echo "EXTRA_DIST =" > gtk-doc.make
+ fi
+ 
+ set -x

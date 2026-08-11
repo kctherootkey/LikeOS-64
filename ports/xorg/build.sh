@@ -294,6 +294,60 @@ pkg_opts() {
 		echo "--with-openssl --with-gnutls --without-sasl \
 		      --disable-db --disable-dependency-tracking"
 		;;
+	libxml2)
+		# GtkSourceView reads its syntax definitions with the tree and
+		# reader APIs; nothing here wants the rest.  Python needs an
+		# interpreter on the target, lzma a compression library that is
+		# not ported, and modules the dynamic-extension machinery for
+		# XSLT plugins.  zlib IS ported, so compressed documents work.
+		echo "--without-python --without-lzma --without-modules \
+		      --with-zlib --without-debug"
+		;;
+	libfm-extra | libfm)
+		# The same tarball twice; the difference is the first option.
+		#
+		# --with-extra-only builds libfm-extra alone -- the XML parser
+		# and string helpers menu-cache links -- and nothing that needs
+		# menu-cache, which is what breaks the circle between them.
+		# See the manifest.
+		#
+		# Off in both halves:
+		#   udisks   a system service reached over a session bus, for
+		#            mounting removable media.  Neither exists here, and
+		#            GIO's own mount monitoring covers what does.
+		#   exif     libexif, for reading a JPEG's embedded thumbnail
+		#            instead of scaling the image.  Not ported; the
+		#            thumbnails are produced through gdk-pixbuf either
+		#            way, just without that shortcut.
+		#   gtk-doc  the reference manual, as everywhere else.
+		#   demo     libfm's own toy file manager, which exists to
+		#            exercise the library.  PCManFM is the real one.
+		#   old-actions
+		#            the SUPERSEDED implementation of custom file-menu
+		#            actions, written in Vala.  The feature is not lost
+		#            with it: 1.4 carries a C implementation
+		#            (src/base/fm-action.c) that is built
+		#            unconditionally, and the menu module that shows
+		#            those actions uses that one.  What the option
+		#            controls is whether the old Vala copy is compiled
+		#            as well -- and a tag export ships the .vala
+		#            sources without the generated C a release tarball
+		#            would have, so keeping it would mean a Vala
+		#            compiler in the build-host requirements for code
+		#            that duplicates code already built.
+		opts="--disable-udisks --disable-exif --disable-gtk-doc \
+		      --disable-demo --disable-old-actions"
+		case "$1" in
+		libfm-extra) echo "$opts --with-extra-only" ;;
+		*) echo "$opts --with-gtk=3" ;;
+		esac
+		;;
+	pcmanfm)
+		# GTK3, to match the libfm-gtk3 built above: libfm installs one
+		# library per toolkit version and pcmanfm has to ask for the
+		# same one, or its configure finds no libfm-gtk at all.
+		echo "--with-gtk=3"
+		;;
 	claws-mail)
 		# Off: everything needing a desktop session bus, a system
 		# service or a toolchain this system does not have.  --disable-svg
@@ -528,6 +582,41 @@ meson_opts() {
 		# backend is not built.
 		echo "-Dglx=yes -Degl=no -Dx11=true -Dtests=false -Ddocs=false"
 		;;
+	gtksourceview)
+		# The editing widget.  gir and vapi generate bindings for
+		# language runtimes this system does not have, and both need a
+		# generator that would have to RUN here while being built for
+		# the target.  The Glade catalog describes the widget to an
+		# interface designer, which is a development-machine program.
+		echo "-Dgir=false -Dvapi=false -Dgtk_doc=false \
+		      -Dinstall_tests=false -Dglade_catalog=false"
+		;;
+	mousepad)
+		# GtkSourceView 4 explicitly rather than by detection: the
+		# fallback is version 3, which is not built here, and `auto`
+		# would silently take it if the 4 lookup ever failed.
+		#
+		# Off: polkit (a privileged helper reached over a system bus,
+		# for editing root-owned files), gspell (a second spell-checking
+		# stack beside the Enchant one already built, and one Mousepad
+		# only uses through a plugin), the shortcuts editor (it needs
+		# libxfce4ui, i.e. the rest of the Xfce desktop) and the test
+		# plugin, which is for Mousepad's own developers.
+		#
+		# keyfile-settings is ON, and it is what makes the program
+		# remember anything.  GSettings normally writes through dconf,
+		# which is a daemon reached over a session bus -- neither is
+		# ported -- and with no dconf GLib falls back to the memory
+		# backend: every setting works for the length of one run and is
+		# gone at the next start, with one warning on stderr that
+		# nobody running under X ever sees.  This option is upstream's
+		# answer for exactly that situation: the settings go to
+		# ~/.config/Mousepad/settings.conf through GLib's keyfile
+		# backend instead.
+		echo "-Dgtksourceview4=enabled -Dpolkit=disabled \
+		      -Dgspell-plugin=disabled -Dshortcuts-plugin=disabled \
+		      -Dtest-plugin=disabled -Dkeyfile-settings=true"
+		;;
 	gtk)
 		echo "-Dx11_backend=true -Dwayland_backend=false \
 		      -Dbroadway_backend=false -Dprint_backends=file \
@@ -705,6 +794,20 @@ post_install() {
 		# the next package's configure then cannot find xpm.
 		make install-pkgconfigDATA DESTDIR="$SYSROOT" || return 1
 		;;
+	mousepad)
+		# Mousepad publishes no manual page at all -- upstream documents
+		# the program through its Help menu -- so the port carries one,
+		# written from the program's own option table.  Installed into
+		# the sysroot's man1 here so that the repository's gtk3-manpages
+		# target renders it exactly like the pages that did come from a
+		# source tree, rather than needing a case of its own.  This is
+		# what the xnedit arm below does with pod2man, one step shorter.
+		if [ -f "$here/gtk3/man/mousepad.1" ]; then
+			mkdir -p "$SYSROOT/usr/share/man/man1" || return 1
+			cp -f "$here/gtk3/man/mousepad.1" \
+				"$SYSROOT/usr/share/man/man1/mousepad.1" || return 1
+		fi
+		;;
 	xnedit)
 		# Its own install target ships only the binaries, an icon and a
 		# .desktop file -- no manual page, because the page is generated
@@ -788,6 +891,21 @@ is_dataonly() {
 	case "$1" in
 	dejavu-fonts-ttf) return 0 ;;
 	hunspell-en_US) return 0 ;;
+	shared-mime-info) return 0 ;;
+	esac
+	return 1
+}
+
+# Packages built for the BUILD machine, into $HOSTTOOLS rather than the
+# sysroot: tools the packages ABOVE them run during their own build.
+#
+# nsgenbind is the same idea handled inline in the netsurf arm; this is the
+# general form.  What comes out must never be a candidate for the image -- it
+# is compiled for this machine -- so the prefix is $HOSTTOOLS and the cross
+# wrappers are not used at all.
+is_hosttool() {
+	case "$1" in
+	intltool) return 0 ;;
 	esac
 	return 1
 }
@@ -817,6 +935,49 @@ install_data() {
 					return 1
 			done
 		done
+		;;
+	shared-mime-info)
+		# The MIME database, which is data and stays data: nothing in
+		# this package is compiled for the target.
+		#
+		# What ships is the XML source and the binary form the readers
+		# actually use.  Two programs read it here, both through the
+		# same code: GLib's g_content_type_guess(), which is how libfm
+		# decides an icon, a description and a default application, and
+		# GTK's own file chooser.  Neither has a built-in table --
+		# without this database every file is application/octet-stream.
+		#
+		# The binary form is produced by update-mime-database, which
+		# scans the XML and writes mime.cache, globs2, magic and the
+		# rest beside it.  Run from the BUILD host: the output is
+		# ordinary data with no architecture to it (the format fixes its
+		# own byte order), and a copy compiled for the target could not
+		# be run by the thing that needs it, exactly as with
+		# glib-compile-schemas.
+		#
+		# The untranslated XML is used deliberately.  Upstream merges
+		# 90-odd languages of <comment> into it with itstool; this image
+		# has one locale, and the merge would add 6MB of comments no
+		# code path can select.
+		mkdir -p "$SYSROOT/usr/share/mime/packages" || return 1
+		cp -f data/freedesktop.org.xml.in \
+			"$SYSROOT/usr/share/mime/packages/freedesktop.org.xml" ||
+			return 1
+
+		if ! command -v update-mime-database >/dev/null 2>&1; then
+			echo "install_data: no update-mime-database on the build host." >&2
+			echo "  It writes the binary form every reader of this" >&2
+			echo "  database uses; without it the XML alone does" >&2
+			echo "  nothing.  Install it with:  make deps" >&2
+			return 1
+		fi
+		# Exits non-zero on any malformed entry, which is what makes it
+		# worth checking: a half-written cache reads as an empty one.
+		update-mime-database "$SYSROOT/usr/share/mime" || return 1
+		[ -s "$SYSROOT/usr/share/mime/mime.cache" ] || {
+			echo "install_data: mime.cache was not produced" >&2
+			return 1
+		}
 		;;
 	hunspell-en_US)
 		# /usr/share/hunspell is not a choice: Enchant's hunspell
@@ -1160,6 +1321,17 @@ build_one() {
 				make install DESTDIR="$SYSROOT" &&
 				post_install "$name"
 		) >"$log" 2>&1
+	elif is_hosttool "$name"; then
+		# For THIS machine: the host compiler, the host's own headers,
+		# and no cross wrappers anywhere near it.
+		(
+			cd "$dir" || exit 1
+			[ -f Makefile ] && make distclean >/dev/null 2>&1
+			./configure --prefix="$HOSTTOOLS" &&
+				make -j"$(nproc)" &&
+				make install &&
+				post_install "$name"
+		) >"$log" 2>&1
 	elif is_dataonly "$name"; then
 		(
 			cd "$dir" || exit 1
@@ -1256,6 +1428,22 @@ build_one() {
 			if ! keeps_generated_sources "$name"; then
 				[ -f Makefile ] && make distclean >/dev/null 2>&1
 			fi
+			# $HOSTTOOLS/bin ahead of the rest, as in the meson arm:
+			# it is where the tools built FOR THIS MACHINE live, and a
+			# package that runs one during its own build has to find
+			# that copy rather than a target binary or nothing at all.
+			# intltool is why this is here -- the LXDE packages'
+			# configure stops outright when intltool-update is not on
+			# the path, and their Makefiles then run it again to build
+			# the .desktop and .menu files themselves.
+			#
+			# Exported for the whole subshell rather than prefixed to
+			# the configure line: the build below has to see it too,
+			# and it is a function call, which is not a command a
+			# variable assignment can be prefixed to portably.
+			PATH="$HOSTTOOLS/bin:$PATH"
+			export PATH
+
 			env $(pkg_env "$name") \
 				"$here/toolchain/likeos-autogen.sh" $(pkg_opts "$name") &&
 				host_tools "$name" &&

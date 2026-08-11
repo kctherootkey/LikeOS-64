@@ -1,0 +1,45 @@
+--- a/mousepad/mousepad-application.c
++++ b/mousepad/mousepad-application.c
+@@ -1664,9 +1664,41 @@
+   windows = g_list_copy (gtk_application_get_windows (data));
+   for (window = windows; window != NULL; window = window->next)
+     {
++      guint rc_before, rc_after;
++      gboolean closed;
++
+       close = g_action_map_lookup_action (G_ACTION_MAP (window->data), "file.close-window");
++      if (close == NULL)
++        continue;
++
++      /* Hold a reference across the activation.
++       *
++       * Activating "file.close-window" closes the last document, which runs
++       * mousepad_window_notebook_removed() and destroys the window -- and the
++       * window IS the GActionMap that owns this action, so the action's last
++       * reference goes with it.  Reading its state afterwards, as the line
++       * below does, then touches freed memory: on an allocator that stores an
++       * obfuscated free-list pointer in the first word of a freed chunk, the
++       * inlined type check in g_action_get_state() reads that word as the
++       * object's class pointer and faults on a non-canonical address.
++       *
++       * The g_message() reports the reference count either side of the
++       * activation, so this is also the measurement: "2 -> 1" means the action
++       * map really did drop its reference during the activate and only ours
++       * kept the object alive -- i.e. without this reference the read below is
++       * a use-after-free.  Any other result means the object was NOT freed
++       * here and the fault has another cause. */
++      g_object_ref (close);
++      rc_before = ((GObject *) close)->ref_count;
+       g_action_activate (close, NULL);
+-      if (!mousepad_action_get_state_int32_boolean (close))
++      rc_after = ((GObject *) close)->ref_count;
++      g_message ("mousepad quit: action %p refcount %u -> %u across activate",
++                 (void *) close, rc_before, rc_after);
++
++      closed = mousepad_action_get_state_int32_boolean (close);
++      g_object_unref (close);
++
++      if (!closed)
+         {
+           /* unblock session handler and save session */
+           mousepad_history_session_set_quitting (FALSE);

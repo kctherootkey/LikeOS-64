@@ -4936,6 +4936,15 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		 *   pid == -1 any child
 		 *   pid == 0  any child in the caller's process group
 		 *   pid < -1  any child in process group -pid */
+		/* Under g_wait_lock: the list is edited from other CPUs (a
+		 * child exiting, a dying ancestor reparenting a whole list into
+		 * ours) and walking it unlocked both reads half-spliced links
+		 * and can miss the very child we are about to sleep for.  Only
+		 * the walk is inside -- the copy_to_user()s below must not run
+		 * with a spinlock held. */
+		uint64_t scan_flags;
+
+		spin_lock_irqsave(&g_wait_lock, &scan_flags);
 		for (task_t *c = owner->first_child; c; c = c->next_sibling) {
 			if (pid > 0 && c->id != (uint32_t)pid)
 				continue;
@@ -4955,6 +4964,8 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 			    !continued)
 				continued = c;
 		}
+		spin_unlock_irqrestore(&g_wait_lock, scan_flags);
+
 		if (!matched_any)
 			return -ECHILD;
 
@@ -6613,14 +6624,52 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 		// Add to parent's thread group
 		thread_group_add(cur->group_leader, child);
 		child->exit_signal = 0; // Threads don't send exit signal
-		child->parent =
-			cur->parent; // Same parent as thread group leader
+		/* A thread is nobody's child: the PROCESS is, and the process
+		 * is the group leader.
+		 *
+		 * This used to copy cur->parent, which gave every thread a
+		 * pointer to a task it was never linked under -- nothing ever
+		 * added it to that parent's child list.  Two things follow, and
+		 * both are fatal:
+		 *
+		 *   - sched_reparent_children() repoints children by walking
+		 *     the child LIST, so it never saw these.  When the parent
+		 *     was freed, every thread of every child process was left
+		 *     holding a dangling pointer to it.
+		 *   - sched_remove_task() then did
+		 *     sched_remove_child(task->parent, task) on the way out,
+		 *     which walks that parent's sibling list looking for a
+		 *     thread that was never on it -- straight through the freed
+		 *     task's poison.  RAX = 0xfeedfacefeedface in
+		 *     sched_remove_child, under a spinlock with interrupts off,
+		 *     so the processor wedges holding the lock and the whole
+		 *     machine halts.  Seen on every session teardown, where
+		 *     parents die while other processes still have live threads.
+		 *
+		 * NULL is the honest value.  Anything that wants the process's
+		 * parent asks the group leader (see sched_get_ppid). */
+		child->parent = NULL;
 	} else {
-		// New process (new thread group)
+		/* New process (new thread group).
+		 *
+		 * The child belongs to the forking PROCESS, not to the thread
+		 * that happened to call fork().  Hanging it off `cur' put a
+		 * child forked by a worker thread on that thread's own child
+		 * list, while sys_waitpid() looks for children on the thread
+		 * group LEADER's list -- so nothing in the process could ever
+		 * wait for it: waitpid() answered ECHILD and the child stayed a
+		 * zombie for good.  It also made getppid() in the child report
+		 * the forking thread's tid instead of the parent's pid.
+		 *
+		 * Any threaded program that spawns from a worker thread hits
+		 * this, which is most of them -- GLib's g_spawn family forks
+		 * and then waits for the intermediate child. */
+		task_t *proc = cur->group_leader ? cur->group_leader : cur;
+
 		thread_group_init(child);
 		child->exit_signal = SIGCHLD;
-		child->parent = cur;
-		sched_add_child(cur, child);
+		child->parent = proc;
+		sched_add_child(proc, child);
 	}
 
 	// Handle CLONE_SETTLS
@@ -7076,7 +7125,12 @@ static int64_t sys_get_robust_list(uint64_t pid, uint64_t head_ptr,
 
 	// Permission check: can only get own robust list or if privileged
 	task_t *cur = sched_current();
-	if (target != cur && target->parent != cur) {
+	/* Through the target's PROCESS: a thread's own ->parent is NULL, so
+	 * comparing it directly would refuse a parent asking about a thread of
+	 * its own child -- which this used to allow. */
+	task_t *tproc = target->group_leader ? target->group_leader : target;
+
+	if (target != cur && tproc->parent != cur) {
 		return -EPERM;
 	}
 
@@ -7716,7 +7770,7 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 
 		procinfo_t *p = &kbuf[count];
 		p->pid = t->id;
-		p->ppid = t->parent ? t->parent->id : 0;
+		p->ppid = sched_get_ppid(t);
 		p->tgid = t->tgid;
 		p->pgid = t->pgid;
 		p->sid = t->sid;
@@ -7913,6 +7967,44 @@ static int64_t sys_klogctl(uint64_t type, uint64_t bufp, uint64_t len)
 }
 
 // Helper: extract socket index from a process fd (via fd_table marker)
+/* Hand an accepted peer address back to userspace.
+ *
+ * addrlen is IN/OUT and both halves matter: on the way in it states how big
+ * the caller's buffer is, and NOTHING may be written past it; on the way out it
+ * reports the address's true size, which may be larger -- that is how a caller
+ * learns the answer was truncated.
+ *
+ * The accept arms used to ignore the incoming value entirely and copy a whole
+ * sizeof(struct sockaddr_un) -- 110 bytes -- into whatever the caller passed.
+ * `struct sockaddr' is 16, and passing one is completely ordinary:
+ * menu-cached does exactly that, so every client connection wrote 94 bytes
+ * past a stack buffer.  It flattened the saved registers and return addresses
+ * below it and the function returned into the wreckage, which showed up as
+ * SIGSEGV at RIP 0 with no call frame to walk.  validate_user_ptr() cannot
+ * catch it: the stack beyond the buffer is perfectly writable memory, it just
+ * belongs to somebody else. */
+static void sock_put_peer_addr(uint64_t uaddr, uint64_t ulenp,
+			       const void *kaddr, socklen_t kaddrlen)
+{
+	socklen_t ulen = 0;
+
+	if (!uaddr || !ulenp)
+		return;
+	if (!validate_user_ptr(ulenp, sizeof(socklen_t)))
+		return;
+	if (copy_from_user(&ulen, (const void *)ulenp, sizeof(socklen_t)) < 0)
+		return;
+
+	if (ulen > 0) {
+		socklen_t n = (kaddrlen < ulen) ? kaddrlen : ulen;
+
+		if (n && validate_user_ptr(uaddr, n))
+			copy_to_user((void *)uaddr, kaddr, n);
+	}
+	/* The real length, not the truncated one. */
+	copy_to_user((void *)ulenp, &kaddrlen, sizeof(socklen_t));
+}
+
 static int sock_idx_from_fd(uint64_t fd)
 {
 	task_t *cur = sched_current();
@@ -9010,16 +9102,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				unix_close(new_ufd);
 				return newfd;
 			}
-			if (a2 && a3) {
-				if (validate_user_ptr(
-					    a2, sizeof(struct sockaddr_un)))
-					copy_to_user(
-						(void *)a2, &kaddr,
-						sizeof(struct sockaddr_un));
-				if (validate_user_ptr(a3, sizeof(socklen_t)))
-					copy_to_user((void *)a3, &kaddrlen,
-						     sizeof(socklen_t));
-			}
+			sock_put_peer_addr(a2, a3, &kaddr, kaddrlen);
 			return newfd;
 		}
 		int idx = sock_idx_from_fd(a1);
@@ -9044,16 +9127,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				sock_close(new_sock_idx);
 				return newfd;
 			}
-			if (a2 && a3) {
-				if (validate_user_ptr(
-					    a2, sizeof(struct sockaddr_in)))
-					copy_to_user(
-						(void *)a2, &kaddr,
-						sizeof(struct sockaddr_in));
-				if (validate_user_ptr(a3, sizeof(socklen_t)))
-					copy_to_user((void *)a3, &kaddrlen,
-						     sizeof(socklen_t));
-			}
+			sock_put_peer_addr(a2, a3, &kaddr, kaddrlen);
 			return newfd;
 		}
 	}
@@ -9184,9 +9258,22 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_SETSOCKOPT: {
-		int idx = sock_idx_from_fd(a1);
-		if (idx < 0)
-			return idx;
+		/* AF_UNIX first, as in every other socket arm.  Going straight
+		 * to sock_idx_from_fd() answered -ENOTSOCK for every option on
+		 * every local socket, and a caller cannot read that as "option
+		 * unsupported" -- it says the descriptor is not a socket, so
+		 * the sensible reaction is to abandon it.  PCManFM sets
+		 * SO_REUSEADDR on its single-instance socket and bails out of
+		 * the same expression as its bind(), which made it exit with
+		 * status 1 and no message instead of opening a window. */
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		int idx = 0;
+
+		if (!ufd) {
+			idx = sock_idx_from_fd(a1);
+			if (idx < 0)
+				return idx;
+		}
 		socklen_t koptlen = (socklen_t)a5;
 		uint8_t koptbuf[256] = { 0 };
 		if (koptlen > 0) {
@@ -9202,15 +9289,27 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			if (copy_rc < 0)
 				return copy_rc;
 		}
+		if (ufd)
+			return unix_setsockopt(ufd, (int)a2, (int)a3,
+					       koptlen > 0 ?
+						       (const void *)koptbuf :
+						       NULL,
+					       koptlen);
 		return sock_setsockopt(
 			idx, (int)a2, (int)a3,
 			koptlen > 0 ? (const void *)koptbuf : NULL, koptlen);
 	}
 
 	case SYS_GETSOCKOPT: {
-		int idx = sock_idx_from_fd(a1);
-		if (idx < 0)
-			return idx;
+		/* AF_UNIX first — see SYS_SETSOCKOPT above. */
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		int idx = 0;
+
+		if (!ufd) {
+			idx = sock_idx_from_fd(a1);
+			if (idx < 0)
+				return idx;
+		}
 		socklen_t koptlen = 0;
 		uint8_t koptbuf[256] = { 0 };
 		if (a5 && validate_user_ptr(a5, sizeof(socklen_t)))
@@ -9224,9 +9323,14 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			if (koptlen > sizeof(koptbuf))
 				koptlen = sizeof(koptbuf);
 		}
-		int ret = sock_getsockopt(idx, (int)a2, (int)a3,
-					  koptlen > 0 ? (void *)koptbuf : NULL,
-					  &koptlen);
+		int ret = ufd ? unix_getsockopt(ufd, (int)a2, (int)a3,
+						koptlen > 0 ? (void *)koptbuf :
+							      NULL,
+						&koptlen) :
+				sock_getsockopt(idx, (int)a2, (int)a3,
+						koptlen > 0 ? (void *)koptbuf :
+							      NULL,
+						&koptlen);
 		if (ret == 0 && a4 && koptlen > 0)
 			copy_to_user((void *)a4, koptbuf, koptlen);
 		if (ret == 0 && a5 && validate_user_ptr(a5, sizeof(socklen_t)))
@@ -9469,16 +9573,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			if ((int)a4 & SOCK_CLOEXEC)
 				task_set_fd_flags(cur, (unsigned)newfd,
 						  FD_CLOEXEC);
-			if (a2 && a3) {
-				if (validate_user_ptr(
-					    a2, sizeof(struct sockaddr_un)))
-					copy_to_user(
-						(void *)a2, &kaddr,
-						sizeof(struct sockaddr_un));
-				if (validate_user_ptr(a3, sizeof(socklen_t)))
-					copy_to_user((void *)a3, &kaddrlen,
-						     sizeof(socklen_t));
-			}
+			sock_put_peer_addr(a2, a3, &kaddr, kaddrlen);
 			return newfd;
 		}
 		int idx = sock_idx_from_fd(a1);
@@ -9506,16 +9601,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			if ((int)a4 & SOCK_CLOEXEC)
 				task_set_fd_flags(cur, (unsigned)newfd,
 						  FD_CLOEXEC);
-			if (a2 && a3) {
-				if (validate_user_ptr(
-					    a2, sizeof(struct sockaddr_in)))
-					copy_to_user(
-						(void *)a2, &kaddr,
-						sizeof(struct sockaddr_in));
-				if (validate_user_ptr(a3, sizeof(socklen_t)))
-					copy_to_user((void *)a3, &kaddrlen,
-						     sizeof(socklen_t));
-			}
+			sock_put_peer_addr(a2, a3, &kaddr, kaddrlen);
 			return newfd;
 		}
 	}

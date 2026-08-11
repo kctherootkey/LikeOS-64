@@ -1596,6 +1596,123 @@ int unix_shutdown(unix_socket_t *us, int how)
 }
 
 // ============================================================================
+// unix_setsockopt / unix_getsockopt - socket options on a UNIX socket
+// ============================================================================
+/* AF_UNIX sockets answer SOL_SOCKET options too, and until this existed the
+ * syscall layer sent every getsockopt/setsockopt on one straight to the
+ * INTERNET socket table, where the descriptor is not a socket at all: the
+ * answer to any option on any UNIX socket was -ENOTSOCK.
+ *
+ * That is not the harmless "option not supported" a program tests for.  A
+ * caller that treats setsockopt failing as fatal never reaches the call after
+ * it -- PCManFM sets SO_REUSEADDR on its single-instance socket and gives up
+ * on the bind() in the same expression, so it exited with status 1, silently,
+ * before opening a window.
+ *
+ * The options below are the ones that mean something here.  SO_REUSEADDR and
+ * friends are accepted and ignored, which is also what a conventional Unix
+ * does with them on this address family: a UNIX socket's name is a filesystem
+ * entry, and unlink() -- not a socket option -- is what makes it reusable.
+ * Anything genuinely not implemented gets -ENOPROTOOPT, the error that says
+ * "not this option" rather than "not a socket"; a program can tell the two
+ * apart and only the second one is a reason to give up on the socket.
+ *
+ * Note that SO_RCVTIMEO/SO_SNDTIMEO are refused rather than accepted: the
+ * blocking paths here park without a deadline, so accepting them would promise
+ * a timeout that never fires -- a program that relies on one to bound a read
+ * would hang instead of failing at the call it made. */
+int unix_setsockopt(unix_socket_t *us, int level, int optname,
+		    const void *optval, socklen_t optlen)
+{
+	if (!us)
+		return -EBADF;
+	if (level != SOL_SOCKET)
+		return -ENOPROTOOPT;
+
+	switch (optname) {
+	case SO_REUSEADDR:
+	case SO_REUSEPORT:
+	case SO_KEEPALIVE:
+	case SO_BROADCAST:
+	case SO_OOBINLINE:
+	case SO_LINGER:
+		/* Meaningless on a local socket; accepted so that setting them
+		 * is not mistaken for the socket being unusable. */
+		return 0;
+
+	case SO_SNDBUF:
+	case SO_RCVBUF:
+		/* Advisory.  The ring is sized by the socket layer and is not
+		 * resized on request, but the request itself is legal. */
+		if (!optval || optlen < (socklen_t)sizeof(int))
+			return -EINVAL;
+		return 0;
+
+	default:
+		return -ENOPROTOOPT;
+	}
+}
+
+int unix_getsockopt(unix_socket_t *us, int level, int optname, void *optval,
+		    socklen_t *optlen)
+{
+	int val;
+
+	if (!us)
+		return -EBADF;
+	if (!optval || !optlen)
+		return -EFAULT;
+	if (level != SOL_SOCKET)
+		return -ENOPROTOOPT;
+	/* Checked before the switch, not after: SO_ERROR below consumes the
+	 * pending error, and a call that cannot deliver it must not clear it. */
+	if (*optlen < (socklen_t)sizeof(int))
+		return -EINVAL;
+
+	switch (optname) {
+	case SO_TYPE:
+		val = us->type;
+		break;
+
+	case SO_ERROR: {
+		/* Read-and-clear, as POSIX requires: the pending error is
+		 * reported once.  This is how a program that connected in
+		 * non-blocking mode learns whether it succeeded. */
+		uint64_t flags;
+		spin_lock_irqsave(&us->lock, &flags);
+		val = us->error;
+		us->error = 0;
+		spin_unlock_irqrestore(&us->lock, flags);
+		break;
+	}
+
+	case SO_SNDBUF:
+	case SO_RCVBUF:
+		/* The real ring size when one has been allocated; a socket that
+		 * has not carried data yet reports the size it would get. */
+		val = us->bufsz ? us->bufsz : UNIX_RING_SIZE;
+		break;
+
+	case SO_REUSEADDR:
+	case SO_REUSEPORT:
+	case SO_KEEPALIVE:
+	case SO_BROADCAST:
+	case SO_OOBINLINE:
+		/* Accepted by unix_setsockopt but not retained: they do
+		 * nothing, so they always read back off. */
+		val = 0;
+		break;
+
+	default:
+		return -ENOPROTOOPT;
+	}
+
+	*(int *)optval = val;
+	*optlen = (socklen_t)sizeof(int);
+	return 0;
+}
+
+// ============================================================================
 // unix_poll - Poll a UNIX socket for events
 // ============================================================================
 /* Report what this socket can do right now.

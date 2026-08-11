@@ -596,6 +596,30 @@ typedef struct task {
 	struct task *
 		thread_group_prev; // Previous thread in thread group (for O(1) removal)
 	volatile int nr_threads; // Thread count in group (only valid in leader)
+	/* Lifetime of the leader's task_t, as opposed to the leader's life.
+	 *
+	 * Every thread carries a bare `group_leader' pointer that is never
+	 * cleared, and the exit path follows it long after the thread has been
+	 * marked exited (task_close_open_files walks the LEADER's mmap table).
+	 * nr_threads cannot protect that pointer: it counts threads that have
+	 * not exited yet, and it reaches zero while the last thread is still
+	 * inside its own teardown.  The parent's waitpid() only looks at
+	 * has_exited, so it could reap and kfree the leader in exactly that
+	 * window -- the thread then read the heap's free poison out of the
+	 * leader's mmap table and dereferenced 0xdeadbeefdeadbeef.
+	 *
+	 * group_ref counts the live thread task_t STRUCTURES pointing here
+	 * (the leader itself is not counted).  It is raised in
+	 * thread_group_add and dropped in sched_remove_task just before the
+	 * thread's kfree, so it spans the whole exit, not just the running
+	 * life.  sched_remove_task refuses to destroy a leader while it is
+	 * non-zero; the last thread out re-queues the leader for reaping.
+	 * Both sides run under g_task_list_lock. */
+	volatile int group_ref;
+	/* Set when a leader's destruction was postponed because group_ref was
+	 * still non-zero.  Tells the last thread to hand the leader back to
+	 * dead_thread_queue() instead of leaking it. */
+	volatile bool destroy_deferred;
 	volatile int group_exit_code; // Exit code for exit_group()
 	volatile bool group_exiting; // Set when exit_group() is called
 
@@ -804,9 +828,15 @@ task_t *sched_find_task_by_id_locked(
 	uint32_t pid); // Find task by PID (caller holds g_task_list_lock)
 task_t *sched_task_by_canary(
 	uint64_t canary); // Crash diagnostic: lock-free, __stack_chk_fail only
+/* Parent/child list edits.  The list is protected by g_wait_lock, which
+ * sys_waitpid() also holds while walking it -- an unlocked edit both corrupts
+ * the list and lets a waiter miss the exit it was about to sleep through.
+ * The _locked forms are for callers that already hold it. */
 void sched_add_child(task_t *parent, task_t *child); // Add child to parent
+void sched_add_child_locked(task_t *parent, task_t *child);
 void sched_remove_child(task_t *parent,
 			task_t *child); // Remove child from parent
+void sched_remove_child_locked(task_t *parent, task_t *child);
 /* Tell a task's parent it has finished (wake waitpid, send SIGCHLD, or reap it
  * when the parent ignores SIGCHLD).  Idempotent. */
 void sched_notify_parent_of_exit(task_t *task);
@@ -862,6 +892,11 @@ void thread_group_remove(task_t *thread);
  * poison -- non-NULL, non-canonical, and fatal to touch with the task-list
  * lock held and interrupts off. */
 bool task_ptr_ok(const task_t *t); // Remove thread from group
+/* Wake every thread of `proc`'s thread group that is parked in waitpid().
+ * A wait belongs to the PROCESS -- children hang off the group leader and any
+ * thread may reap them -- so a notifier that wakes only the task it recorded as
+ * the parent leaves a waiting worker thread asleep for good. */
+void sched_wake_wait_sleepers(task_t *proc);
 int thread_group_count(task_t *task); // Get number of threads in group
 void thread_group_signal_all(task_t *task,
 			     int sig); // Signal all threads in group

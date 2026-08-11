@@ -326,6 +326,18 @@ static void task_close_open_files(task_t *task)
 	{
 		task_t *owner = task->group_leader ? task->group_leader : task;
 
+		/* leader->group_ref is what keeps this pointer alive across the
+		 * whole teardown; the check is belt and braces, so that a
+		 * lifetime bug elsewhere leaks the table's file references
+		 * instead of faulting on the free poison with a non-canonical
+		 * address (which is unrecoverable, not a killable fault). */
+		if (!task_ptr_ok(owner)) {
+			WARN_ON_ONCE(1);
+			kprintf("BUG: pid %d group_leader is unusable (%p) - mmap file refs leaked\n",
+				task->id, (void *)owner);
+			return;
+		}
+
 		if (owner->nr_threads != 0)
 			return;
 
@@ -1246,6 +1258,8 @@ static void task_init_common(task_t *t)
 	t->thread_group_next = t; // Circular list of one
 	t->thread_group_prev = t;
 	t->nr_threads = 1;
+	t->group_ref = 0;
+	t->destroy_deferred = false;
 	t->group_exit_code = 0;
 	t->group_exiting = false;
 	t->exit_signal = SIGCHLD; // Default for processes
@@ -2098,7 +2112,31 @@ task_t *sched_find_task_by_id_locked(uint32_t id)
 	return NULL;
 }
 
-void sched_add_child(task_t *parent, task_t *child)
+/* Parent/child lists are protected by g_wait_lock.
+ *
+ * They used to be maintained with no lock whatsoever, while sys_waitpid() read
+ * them under g_wait_lock -- so the reader was serialised against nothing.  Two
+ * failures came out of that, and a session teardown (the window manager exiting
+ * and every client dying at once) produces both:
+ *
+ *  - Splices raced each other.  `child->next_sibling = parent->first_child;
+ *    parent->first_child = child;' on two CPUs at once loses one update, and a
+ *    concurrent unlink can re-publish a node that the other CPU has just taken
+ *    out and is about to kfree().  init's list then held a freed task_t, and
+ *    the walk below faulted on the page poison: RAX = 0xfeedfacefeedface in
+ *    sched_remove_child, non-canonical, so a GPF that takes the machine down
+ *    rather than one process.
+ *
+ *  - waitpid() missed exits.  Its pre-sleep re-check walks this list to decide
+ *    whether to park; walking it while another CPU re-links it can miss the
+ *    child that has just exited.  The parent then parks with the wake already
+ *    delivered and nothing left to deliver another: a waitpid sleeper arms no
+ *    timeout and SIGCHLD's default action is ignore, so it sleeps for good.
+ *    Seen as PCManFM parked in sys_waitpid forever after spawning menu-cached,
+ *    with menu-cached up and running.
+ *
+ * The _locked forms are for callers already holding g_wait_lock. */
+void sched_add_child_locked(task_t *parent, task_t *child)
 {
 	if (!parent || !child)
 		return;
@@ -2107,10 +2145,34 @@ void sched_add_child(task_t *parent, task_t *child)
 	parent->first_child = child;
 }
 
-void sched_remove_child(task_t *parent, task_t *child)
+void sched_add_child(task_t *parent, task_t *child)
+{
+	uint64_t flags;
+
+	if (!parent || !child)
+		return;
+	spin_lock_irqsave(&g_wait_lock, &flags);
+	sched_add_child_locked(parent, child);
+	spin_unlock_irqrestore(&g_wait_lock, flags);
+}
+
+void sched_remove_child_locked(task_t *parent, task_t *child)
 {
 	if (!parent || !child || child->parent != parent)
 		return;
+	/* The walk below runs under g_wait_lock with interrupts off, where a
+	 * fault cannot be recovered from: the processor wedges still holding
+	 * the lock and takes the machine with it, rather than one process
+	 * dying.  So a parent pointer that is no longer a plausible task is
+	 * dropped here instead of being followed.  Reaching this means some
+	 * lifetime is wrong elsewhere -- say so, and leak the link. */
+	if (!task_ptr_ok(parent)) {
+		WARN_ON_ONCE(1);
+		kprintf("BUG: pid %d has an unusable parent (%p) - link leaked\n",
+			child->id, (void *)parent);
+		child->parent = NULL;
+		return;
+	}
 	if (parent->first_child == child) {
 		parent->first_child = child->next_sibling;
 	} else {
@@ -2124,6 +2186,18 @@ void sched_remove_child(task_t *parent, task_t *child)
 	child->next_sibling = NULL;
 }
 
+void sched_remove_child(task_t *parent, task_t *child)
+{
+	uint64_t flags;
+
+	if (!parent || !child)
+		return;
+	spin_lock_irqsave(&g_wait_lock, &flags);
+	sched_remove_child_locked(parent, child);
+	spin_unlock_irqrestore(&g_wait_lock, flags);
+}
+
+#define REPARENT_ZOMBIE_MAX 64
 void sched_reparent_children(task_t *task)
 {
 	if (!task)
@@ -2154,6 +2228,16 @@ void sched_reparent_children(task_t *task)
 	if (!reaper || reaper == task || reaper->state == TASK_ZOMBIE)
 		reaper = &g_bootstrap_task;
 
+	/* Under g_wait_lock, like every other edit to these lists -- this one
+	 * splices a whole list into the reaper's and is what a mass teardown
+	 * runs on several CPUs at once.  The zombies are collected rather than
+	 * queued here, so dead_thread_queue()'s lock is never taken inside
+	 * g_wait_lock. */
+	task_t *zombies[REPARENT_ZOMBIE_MAX];
+	int nz = 0;
+	uint64_t flags;
+
+	spin_lock_irqsave(&g_wait_lock, &flags);
 	task_t *child = task->first_child;
 	while (child) {
 		task_t *nxt = child->next_sibling;
@@ -2161,7 +2245,11 @@ void sched_reparent_children(task_t *task)
 		if (child->state == TASK_ZOMBIE) {
 			child->parent = reaper; /* keep the field consistent */
 			child->next_sibling = NULL;
-			dead_thread_queue(child);
+			if (nz < REPARENT_ZOMBIE_MAX)
+				zombies[nz++] = child;
+			/* Over the batch size the zombie simply stays where it
+			 * is: it is off this list and off the reaper's, so it
+			 * leaks rather than being freed twice. */
 		} else {
 			child->parent = reaper;
 			child->next_sibling = reaper->first_child;
@@ -2170,6 +2258,10 @@ void sched_reparent_children(task_t *task)
 		child = nxt;
 	}
 	task->first_child = NULL;
+	spin_unlock_irqrestore(&g_wait_lock, flags);
+
+	for (int i = 0; i < nz; i++)
+		dead_thread_queue(zombies[i]);
 }
 
 /* ============================================================================
@@ -2270,6 +2362,38 @@ void sched_remove_task(task_t *task)
 		return;
 	if (is_idle_task(task))
 		return;
+
+	/* A thread group leader outlives its own exit: its threads keep bare
+	 * pointers to it and follow them all the way through their teardown
+	 * (task_close_open_files releases the file references pinned by the
+	 * LEADER's mmap table).  waitpid() reaps a zombie on has_exited alone,
+	 * so without this the parent frees the leader while the last thread is
+	 * still walking it -- the thread then read the freed block's poison as
+	 * a vfs_file_t and faulted on 0xdeadbeefdeadbeef.
+	 *
+	 * Postpone; the thread that drops the last group_ref below puts the
+	 * leader back on the dead queue.  Nothing has been torn down at this
+	 * point, so the leader is left completely intact -- it must be, since
+	 * those threads are about to read it.
+	 *
+	 * Under g_dead_thread_lock, not the task-list lock: this decision and
+	 * the ref drop that reverses it have to be indivisible with respect to
+	 * the queue they hand the leader through, or both sides can conclude
+	 * they own it -- one frees it while the other is still queuing it. */
+	{
+		uint64_t gflags;
+		spin_lock_irqsave(&g_dead_thread_lock, &gflags);
+		if (task->group_leader == task && task->group_ref > 0) {
+			task->destroy_deferred = true;
+			/* Re-arm the queue guard: this task_t is NOT being
+			 * destroyed after all, so the last thread out must be
+			 * able to queue it again. */
+			task->on_dead_queue = false;
+			spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
+			return;
+		}
+		spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
+	}
 
 	// SMP SAFETY: If the task is currently executing on another CPU, we must
 	// wait for it to stop before freeing its resources (especially kernel stack).
@@ -2394,6 +2518,51 @@ void sched_remove_task(task_t *task)
 	if (task->kernel_stack_base && task->privilege == TASK_USER) {
 		mm_free_guarded_kstack(task->kernel_stack_base,
 				       KERNEL_STACK_SIZE);
+	}
+
+	/* Release this thread's hold on its leader's task_t.  Done HERE, at the
+	 * last possible moment, because everything above may still follow
+	 * task->group_leader (the deferred fd close does).  If we are the last
+	 * structure referring to a leader whose destruction was postponed, put
+	 * it back on the dead queue -- the next scheduling tail frees it for
+	 * real, this time finding group_ref at zero.
+	 *
+	 * The leader cannot be freed underneath this: the only path that frees
+	 * one consults group_ref under this same lock, and ours is still
+	 * counted until the decrement below.
+	 *
+	 * The queuing is done inline rather than through dead_thread_queue()
+	 * because it must happen under the SAME acquisition as the decrement.
+	 * Released in between, the postponing side could re-enter, find
+	 * group_ref already at zero, and destroy the leader while this call was
+	 * still on its way to queuing it. */
+	{
+		task_t *ldr = task->group_leader;
+
+		if (ldr && ldr != task && task_ptr_ok(ldr)) {
+			uint64_t gflags;
+			spin_lock_irqsave(&g_dead_thread_lock, &gflags);
+			if (ldr->group_ref > 0 && --ldr->group_ref == 0 &&
+			    ldr->destroy_deferred) {
+				ldr->destroy_deferred = false;
+				if (ldr->on_dead_queue) {
+					/* Already held by a reap pass that has
+					 * yet to call sched_remove_task on it.
+					 * That call now finds group_ref at zero
+					 * and destroys it; queuing it a second
+					 * time here would destroy it twice. */
+				} else if (g_dead_thread_count <
+					   DEAD_THREAD_MAX) {
+					g_dead_threads[g_dead_thread_count++] =
+						ldr;
+					ldr->on_dead_queue = true;
+				} else {
+					kprintf("WARN: dead_thread_queue overflow (leader pid %d leaked)\n",
+						ldr->id);
+				}
+			}
+			spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
+		}
 	}
 
 	kfree(task);
@@ -2668,9 +2837,17 @@ task_t *sched_fork_current(void)
 
 uint32_t sched_get_ppid(task_t *task)
 {
-	if (!task || !task->parent)
+	/* Through the group leader: parenthood belongs to the PROCESS, and a
+	 * thread's own ->parent is NULL (see the CLONE_THREAD branch of
+	 * sys_clone).  Asking a thread directly used to answer 0. */
+	task_t *proc;
+
+	if (!task)
 		return 0;
-	return task->parent->id;
+	proc = task->group_leader ? task->group_leader : task;
+	if (!task_ptr_ok(proc) || !proc->parent)
+		return 0;
+	return proc->parent->id;
 }
 
 void sched_reap_zombies(task_t *parent)
@@ -2972,6 +3149,56 @@ void sched_kill_thread_group(task_t *task, int exit_code)
 		sched_signal_task(targets[i], SIGKILL);
 }
 
+/* Wake every thread of `proc`'s process that is parked in waitpid().
+ *
+ * The park is `wait_channel == self` (see sys_waitpid), so each thread is its
+ * own channel and there is no one object to wake through.  The ring is
+ * collected under the task-list lock and the wakes are issued outside both
+ * locks: sched_wake_task() takes runqueue locks, and its claim CAS makes a
+ * redundant wake a no-op. */
+#define WAIT_WAKE_MAX 64
+void sched_wake_wait_sleepers(task_t *proc)
+{
+	task_t *leader;
+	task_t *cand[WAIT_WAKE_MAX];
+	int n = 0;
+	uint64_t flags;
+
+	if (!task_ptr_ok(proc))
+		return;
+	leader = proc->group_leader ? proc->group_leader : proc;
+	if (!task_ptr_ok(leader))
+		return;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		task_t *t = leader;
+		int guard = 0;
+
+		do {
+			if (n < WAIT_WAKE_MAX)
+				cand[n++] = t;
+			t = t->thread_group_next;
+			if (!task_ptr_ok(t) || ++guard > WAIT_WAKE_MAX)
+				break;
+		} while (t != leader);
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	for (int i = 0; i < n; i++) {
+		int wake;
+		uint64_t wflags;
+
+		spin_lock_irqsave(&g_wait_lock, &wflags);
+		wake = (cand[i]->state == TASK_BLOCKED &&
+			cand[i]->wait_channel == cand[i]);
+		spin_unlock_irqrestore(&g_wait_lock, wflags);
+
+		if (wake)
+			sched_wake_task(cand[i]);
+	}
+}
+
 void sched_notify_parent_of_exit(task_t *task)
 {
 	if (!task || task->exit_signal == 0)
@@ -3002,14 +3229,11 @@ void sched_notify_parent_of_exit(task_t *task)
 			 * routes it to dead_thread_queue at the next switch,
 			 * which is the only safe place to free it. */
 			uint64_t wflags;
-			int wake;
 
 			spin_lock_irqsave(&g_wait_lock, &wflags);
-			sched_remove_child(parent, task);
+			sched_remove_child_locked(parent, task);
 			task->parent = &g_bootstrap_task;
 			task->exit_signal = 0;
-			wake = (parent->state == TASK_BLOCKED &&
-				parent->wait_channel == parent);
 			spin_unlock_irqrestore(&g_wait_lock, wflags);
 
 			/* A parent that ignores SIGCHLD *and* calls waitpid()
@@ -3018,9 +3242,9 @@ void sched_notify_parent_of_exit(task_t *task)
 			 * ECHILD, and we have just taken away the last thing it
 			 * could have been waiting for.  Leaving it asleep here
 			 * hangs it forever — the reaping it is waiting for has
-			 * already happened. */
-			if (wake)
-				sched_wake_task(parent);
+			 * already happened.  Any thread of it may be the one
+			 * waiting, so this goes through the whole group. */
+			sched_wake_wait_sleepers(parent);
 			return;
 		}
 	}
@@ -3031,19 +3255,16 @@ void sched_notify_parent_of_exit(task_t *task)
 	 * moment either sees our has_exited (set before we got here) and stays
 	 * awake, or is already marked BLOCKED when we look.  The wake goes
 	 * outside the lock: sched_wake_task() enqueues, which takes runqueue
-	 * locks, and the claim CAS inside it makes a redundant wake a no-op. */
-	{
-		uint64_t wflags;
-		int wake;
-
-		spin_lock_irqsave(&g_wait_lock, &wflags);
-		wake = (parent->state == TASK_BLOCKED &&
-			parent->wait_channel == parent);
-		spin_unlock_irqrestore(&g_wait_lock, wflags);
-
-		if (wake)
-			sched_wake_task(parent);
-	}
+	 * locks, and the claim CAS inside it makes a redundant wake a no-op.
+	 *
+	 * EVERY thread of the parent process, not just the task recorded as our
+	 * parent.  A wait belongs to the process: children hang off the group
+	 * leader and sys_waitpid() lets any thread of the group reap them, so
+	 * the sleeper is very often not the leader -- and waking only the
+	 * leader left that thread parked with nothing to wake it, for good.
+	 * Waking all of them is safe: a woken thread that finds no reportable
+	 * child simply parks again. */
+	sched_wake_wait_sleepers(parent);
 
 	/* ...and signal one that instead polls and relies on a SIGCHLD handler.
 	 * Both are needed; see the note at the other call site. */
@@ -3696,7 +3917,7 @@ void sched_dump_tasks(struct tty *tty)
 	     t = t->next) {
 		snaps[nsnaps].id = t->id;
 		snaps[nsnaps].tgid = t->tgid;
-		snaps[nsnaps].ppid = t->parent ? t->parent->id : 0;
+		snaps[nsnaps].ppid = sched_get_ppid(t);
 		snaps[nsnaps].on_cpu = t->on_cpu;
 		snaps[nsnaps].on_rq = t->on_rq;
 		snaps[nsnaps].nr_threads =
@@ -4318,6 +4539,8 @@ void thread_group_init(task_t *leader)
 	leader->thread_group_next = leader; // Circular list: points to self
 	leader->thread_group_prev = leader;
 	leader->nr_threads = 1;
+	leader->group_ref = 0;
+	leader->destroy_deferred = false;
 	leader->exit_signal = SIGCHLD; // Process exit sends SIGCHLD to parent
 	leader->group_exiting = false;
 	leader->group_exit_code = 0;
@@ -4332,6 +4555,12 @@ void thread_group_add(task_t *leader, task_t *thread)
 	// Thread inherits leader's tgid
 	thread->tgid = leader->tgid;
 	thread->group_leader = leader;
+	/* A new thread's task_t is memcpy'd from the caller's, so it arrives
+	 * carrying the caller's group bookkeeping.  A thread holds no group
+	 * references of its own and is never a leader, so clear both rather
+	 * than leave a leader's counters on a non-leader. */
+	thread->group_ref = 0;
+	thread->destroy_deferred = false;
 	thread->exit_signal = 0; // Threads don't send signals on exit
 	thread->group_exiting = false;
 
@@ -4344,6 +4573,9 @@ void thread_group_add(task_t *leader, task_t *thread)
 	leader->thread_group_next->thread_group_prev = thread;
 	leader->thread_group_next = thread;
 	leader->nr_threads++;
+	/* The structure reference, held until this thread's task_t is freed —
+	 * see the group_ref comment in struct task. */
+	leader->group_ref++;
 
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
 }
@@ -4388,9 +4620,11 @@ void thread_group_remove(task_t *thread)
 	 * The freed-leader problem it was trying to solve is a LIFETIME
 	 * problem: the leader's task_t must not be freed while any thread
 	 * still refers to it.  Repointing the references away is not a fix for
-	 * that, and it breaks the exit protocol.  task_ptr_ok() in the ring
-	 * walks keeps a stale pointer from taking the machine down until the
-	 * lifetime is fixed properly. */
+	 * that, and it breaks the exit protocol.  That lifetime is now held by
+	 * leader->group_ref (see struct task and sched_remove_task): the
+	 * structure survives until the last thread's task_t is freed, which is
+	 * why nr_threads may safely fall to zero here while threads are still
+	 * mid-teardown and still reading the leader. */
 
 	// Clear thread's group links
 	thread->thread_group_next = thread;

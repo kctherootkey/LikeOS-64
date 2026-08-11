@@ -317,8 +317,10 @@ ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat tests
 # edit not working.
 RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	res/etc/skel/.profile res/etc/skel/.bashrc \
+	$(wildcard res/etc/skel/Desktop/*.desktop) \
 	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
 	$(wildcard res/etc/ssl/certs/*) $(wildcard res/xorg/*) \
+	$(wildcard res/xorg/applications/*) \
 	$(wildcard res/xorg/gtk3/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh
@@ -348,13 +350,20 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 # nothing to stage, produced an image with no Claws Mail and said nothing.  It
 # only appeared to work after `make clean`, which keeps the sysroot and so
 # leaves the parse-time test looking at the PREVIOUS build's output.
-GTK3_CLAWS = $(BUILD_DIR)/xorg-sysroot/usr/bin/claws-mail
+#
+# The file it names is the LAST program the manifest builds, which is what
+# makes its presence mean "the whole stack".  That used to be Claws Mail and is
+# now PCManFM: everything Claws needs is built before it, and PCManFM adds
+# GtkSourceView, libxml2, Mousepad, the MIME database and libfm on top -- so a
+# sentinel left at claws-mail would have gone on being satisfied by a port that
+# stopped halfway through the new packages.
+GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/pcmanfm
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
-	$(GTK3_CLAWS) \
+	$(GTK3_SENTINEL) \
 	$(GTK3_TESTCXX) \
 	$(RES_PREREQS)
 
@@ -1398,7 +1407,7 @@ ports-gtk3: ports-xorg | $(BUILD_DIR)
 # merely needing the same port: the two are independent entries in the image's
 # prerequisite list, so under -j make is free to start this one first, and it
 # would then fail on a libstdc++ that was still being built.
-$(BUILD_DIR)/testcxx: user/bin/tests/testcxx.cpp $(GTK3_CLAWS) | $(BUILD_DIR)
+$(BUILD_DIR)/testcxx: user/bin/tests/testcxx.cpp $(GTK3_SENTINEL) | $(BUILD_DIR)
 	@test -f $(XORG_SYSROOT)/usr/lib/libstdc++.so || { \
 		echo "ERROR: no libstdc++ in $(XORG_SYSROOT)."; \
 		echo "  The C++ runtime is built by the GTK3 port:"; \
@@ -1426,15 +1435,15 @@ $(XORG_SYSROOT)/usr/bin/Xorg: ports-xorg | $(BUILD_DIR)
 		exit 1; \
 	}
 
-# The same sentinel for the GTK3 stack.  Claws Mail is the last package its
-# manifest builds and links against nearly everything below it, so its presence
-# means the whole stack -- GLib, GTK, Cairo, Pango, the C++ runtime, libetpan --
-# is installed in the sysroot.
+# The same sentinel for the GTK3 stack.  PCManFM is the last package its
+# manifest builds and sits on top of nearly everything below it, so its presence
+# means the whole stack -- GLib, GTK, Cairo, Pango, the C++ runtime, libetpan,
+# GtkSourceView, libfm and menu-cache -- is installed in the sysroot.
 #
 # Checks rather than assumes, for the reason given above: without a recipe that
 # verifies its own target, a rule reports success for a file that was never
 # created and the missing program is not noticed until the image is booted.
-$(GTK3_CLAWS): ports-gtk3 | $(BUILD_DIR)
+$(GTK3_SENTINEL): ports-gtk3 | $(BUILD_DIR)
 	@test -x $@ || { \
 		echo "ERROR: $@ is missing after building the GTK3 port."; \
 		echo "  The per-package stamps in ports/xorg/gtk3/.stamps say"; \
@@ -1604,6 +1613,18 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	mkdir -p $(EXT4_STAGING)/etc/skel
 	cp res/etc/skel/.profile $(EXT4_STAGING)/etc/skel/.profile
 	cp res/etc/skel/.bashrc  $(EXT4_STAGING)/etc/skel/.bashrc
+	# Desktop shortcuts.  Into /etc/skel/Desktop so every new account gets
+	# them (adduser copies the skeleton recursively), and into /root/Desktop
+	# as well because root already exists and is never created by adduser.
+	# They are .desktop launchers for programs this image actually installs;
+	# each Icon= name resolves to a PNG in the staged Adwaita/hicolor themes,
+	# which matters because there is no librsvg here and the SVG variants
+	# would not render.
+	mkdir -p $(EXT4_STAGING)/etc/skel/Desktop $(EXT4_STAGING)/root/Desktop
+	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/etc/skel/Desktop/
+	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/root/Desktop/
+	chmod 0644 $(EXT4_STAGING)/etc/skel/Desktop/*.desktop \
+	           $(EXT4_STAGING)/root/Desktop/*.desktop
 	chmod 0700 $(EXT4_STAGING)/root
 	# X11 puts its per-display listening socket at /tmp/.X11-unix/X<n>.  The
 	# directory must exist before the server binds, and carries the same
@@ -2007,9 +2028,16 @@ xorg-manpages:
 #
 # Most of them have no page at all: fontconfig and GLib are built with their
 # documentation off, since it needs a toolchain whose output nothing here
-# reads.  Only claws-mail actually renders today; the rest are listed so that
-# adding one to the image adds its page without anyone having to remember.
-GTK3_MAN_PROGS = claws-mail gio gsettings gdbus gapplication \
+# reads.  claws-mail, pcmanfm, libfm-pref-apps, lxshortcut and mousepad render;
+# the rest are listed so that adding one to the image adds its page without
+# anyone having to remember.
+#
+# mousepad's page is the one that did not come from its own tarball -- upstream
+# ships none -- so the port supplies it (ports/xorg/gtk3/man/mousepad.1) and
+# the build driver installs it into the sysroot's man1.  From here it is
+# indistinguishable from the others, which is the point.
+GTK3_MAN_PROGS = claws-mail pcmanfm mousepad libfm-pref-apps lxshortcut \
+		 gio gsettings gdbus gapplication \
 		 fc-list fc-match fc-cache
 
 .PHONY: gtk3-manpages
@@ -2066,8 +2094,13 @@ deps:
 	# cmake is for ctwm, which is the one package here that uses neither
 	# autotools nor meson.  groff/man-db render the manual pages
 	# (maintenance target only, but the tools belong on the list).
+	# shared-mime-info supplies update-mime-database, which the GTK3 port
+	# runs on the BUILD host to turn the MIME database's XML into the binary
+	# form every reader of it actually opens -- the file manager's icons,
+	# descriptions and "open with" all come from it.  It is not a library
+	# dependency and nothing links against it; the port needs the program.
 	sudo apt install -y meson ninja-build libtool gperf xsltproc xfonts-utils \
-		bison flex cmake groff python3-pip || true
+		bison flex cmake groff python3-pip shared-mime-info || true
 	# GTK3 port build tooling.  g++ builds the target's libstdc++ and the two
 	# C++ packages above it (HarfBuzz, Enchant); gettext supplies the HOST's
 	# msgfmt, which every package with translations runs at build time;

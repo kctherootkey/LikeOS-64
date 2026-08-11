@@ -35,12 +35,33 @@ UseThreeDWMap
 # Without ClickToFocus, ctwm follows the pointer, so moving onto a second xterm
 # focused it silently and pressing a button changed nothing visible.
 #
-# The click is NOT eaten.  Both of these are handled in one place in
-# HandleButtonPress, which sets the focus, raises, and then calls
-# XAllowEvents(ReplayPointer) -- so the press still reaches the application and
-# a click that also selects text or presses a button behaves normally.
+# The click is NOT eaten.  This is handled in one place in HandleButtonPress,
+# which sets the focus and then calls XAllowEvents(ReplayPointer) -- so the
+# press still reaches the application and a click that also selects text or
+# presses a button behaves normally.
+#
+# RaiseOnClick is deliberately NOT set, and that is not a style choice.
+#
+# ctwm does not recognise PCManFM's desktop as a desktop window: f.identify
+# reports `OnTopPriority = 0' for it, which is the NORMAL plane (a window ctwm
+# had typed as _NET_WM_WINDOW_TYPE_DESKTOP would report -8, since
+# EwmhGetInitPriority gives it EWMH_PRI_DESKTOP).  With RaiseOnClick on, a
+# window in the normal plane comes to the front when clicked -- and the desktop
+# is full-screen, so clicking the background put it over every other window.
+# That is what made "all the ctwm controls disappear", and it is also why a
+# click aimed at a file-manager window afterwards landed on the desktop instead
+# and opened the root menu.
+#
+# Raising is still available where it belongs: button 1 on a title bar is
+# f.function "move-or-raise", and button 2 there is f.raiselower.
+#
+# The underlying question -- why ctwm does not see the DESKTOP type when
+# PCManFM does set it in fm_desktop_constructor -- is still open.  To settle it,
+# run `xprop' and click the desktop background: if _NET_WM_WINDOW_TYPE is
+# _NET_WM_WINDOW_TYPE_DESKTOP then the fault is in ctwm's reading of it, and if
+# the property is absent it is GTK's or PCManFM's.  Once that is fixed the
+# desktop sits in the -8 plane and RaiseOnClick could come back.
 ClickToFocus
-RaiseOnClick
 
 #
 # Minimise into the taskbar instead of onto the desktop.
@@ -283,21 +304,37 @@ Function "move-or-iconify" { f.move f.deltastop f.iconify }
 # Set some useful bindings.  Sort of uwm-ish, sort of simple-button-ish
 #
 #
-# Root menu, MS-Windows style: RIGHT button opens it, it then stays open
-# until an entry is clicked or a click lands outside it.
+# Root menu: the LEFT button over the background opens it.
 #
-# StayUpMenus is what makes it stay: without it a ctwm menu is press-drag-
-# release, so the menu vanishes the instant the button comes up and an entry
-# can only be chosen by releasing over it.  With it, a press-and-release that
-# does not select simply leaves the menu posted, and the next click either
-# activates the entry under the pointer or dismisses the menu.  Either button
-# can do that activating click -- ctwm's release handler acts on the entry the
-# pointer is over, whichever button opened the menu.
+# That takes a patch on PCManFM's side to work at all.  A window manager only
+# hears about root-window clicks by selecting ButtonPressMask ON the root -- it
+# does not grab them -- and PCManFM's desktop covers the root completely, so
+# every click on the background stops there and never reaches ctwm.  PCManFM
+# already hands button 3 back when show_wm_menu is set; the port patch
+# 0001-give-the-window-manager-button-1-on-the-blank-desktop does the same for
+# button 1, so this binding fires again.
+#
+# Only the PRESS is forwarded, never the release.  ctwm posts the menu on the
+# press and grabs the pointer for it, so a forwarded release would land on the
+# menu it had just posted and pick whatever entry sat under the cursor -- which
+# is how a desktop click used to select "Restart ctwm" and strip the session.
+#
+# Button 3 stays PCManFM's (show_wm_menu=0), so the desktop keeps its own
+# context menu.  Alt+F1 and Alt+F2 reach the same two menus from the keyboard,
+# which is the way back if the desktop is not running or has died.
+#
+# StayUpMenus is what makes a posted menu stay: without it a ctwm menu is
+# press-drag-release, so it would vanish the instant the button came up.  With
+# it, a press that does not select simply leaves the menu posted, and the next
+# click either activates the entry under the pointer or dismisses it.
 #
 StayUpMenus
 
-Button3 =	: root		: f.menu "defops"
+Button1 =	: root		: f.menu "defops"
 Button2 =	: root		: f.menu "windowops"
+
+"F1" = m	: all		: f.menu "defops"
+"F2" = m	: all		: f.menu "windowops"
 
 Button1 = m	: window|icon	: f.function "move-or-lower"
 Button2 = m	: window|icon	: f.iconify
@@ -334,16 +371,24 @@ menu "defops"
 {
     "LikeOS"		f.title
     "Xterm"		!"xterm&"
-    "Clock"		!"xclock -digital -strftime %H:%M:%S &"
-    "Load"		!"xload -update 2 &"
-    "Calculator"	!"xcalc &"
-    "Editor"		!"xnedit &"
-    "Web browser"	!"netsurf &"
+    "Explorer"		!"pcmanfm &"
+    "Editor"		!"mousepad &"
+    "Xnedit"	!"xnedit &"
     "Mail"		!"claws-mail &"
+    "Browser"	!"netsurf &"
+    "Calculator"	!"xcalc &"
     ""			f.separator
     "Restart ctwm"	f.restart
     "Exit session"	f.quit
 }
+
+#
+# PCManFM's desktop is started by xinitrc, not from here.  It draws the home
+# folder, the trash and any mounted volume on the background, and it owns the
+# right button over that background -- which is why the root menu above is on
+# the left one.  A desktop is part of the session, not something to be switched
+# on from a menu after the fact.
+#
 
 menu "windowops" {
     "Windows"		f.title

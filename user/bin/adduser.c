@@ -198,10 +198,24 @@ static int add_member(const char *group, const char *user)
 	return 0;
 }
 
-/* Copy the regular files in /etc/skel into a new home directory. */
-static void seed_home(const char *home, uid_t uid, gid_t gid)
+/* Copy a skeleton directory into a new home directory, recursively.
+ *
+ * Recursively, and testing what each entry IS, because the skeleton is no
+ * longer flat: /etc/skel/Desktop holds the launchers a new account starts with.
+ * The flat version opened every entry with O_RDONLY and copied it byte by byte
+ * -- and open() on a DIRECTORY succeeds, so it created a regular file named
+ * `Desktop' in the new home and then read nothing into it.  That is worse than
+ * skipping the directory: an ordinary file sitting where the desktop folder
+ * belongs cannot be turned into one later without deleting it first.
+ *
+ * Modes are carried over from the skeleton rather than fixed at 0644, so an
+ * executable launcher stays executable.  Symlinks and device nodes are skipped:
+ * a home directory seeded from a skeleton has no business containing either,
+ * and following a symlink here would copy whatever it happened to point at.
+ */
+static void seed_dir(const char *from, const char *to, uid_t uid, gid_t gid)
 {
-	DIR *d = opendir(DEF_SKEL);
+	DIR *d = opendir(from);
 	if (!d)
 		return;
 	struct dirent *de;
@@ -209,12 +223,29 @@ static void seed_home(const char *home, uid_t uid, gid_t gid)
 		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
 			continue;
 		char src[512], dst[512];
-		snprintf(src, sizeof(src), "%s/%s", DEF_SKEL, de->d_name);
-		snprintf(dst, sizeof(dst), "%s/%s", home, de->d_name);
+		struct stat st;
+
+		snprintf(src, sizeof(src), "%s/%s", from, de->d_name);
+		snprintf(dst, sizeof(dst), "%s/%s", to, de->d_name);
+		if (lstat(src, &st) != 0)
+			continue;
+
+		if (S_ISDIR(st.st_mode)) {
+			if (mkdir(dst, st.st_mode & 07777) != 0 &&
+			    errno != EEXIST)
+				continue;
+			chown(dst, uid, gid);
+			seed_dir(src, dst, uid, gid);
+			continue;
+		}
+		if (!S_ISREG(st.st_mode))
+			continue;
+
 		int in = open(src, O_RDONLY);
 		if (in < 0)
 			continue;
-		int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC,
+			       st.st_mode & 07777);
 		if (out < 0) {
 			close(in);
 			continue;
@@ -228,6 +259,12 @@ static void seed_home(const char *home, uid_t uid, gid_t gid)
 		chown(dst, uid, gid);
 	}
 	closedir(d);
+}
+
+/* Copy /etc/skel into a new home directory. */
+static void seed_home(const char *home, uid_t uid, gid_t gid)
+{
+	seed_dir(DEF_SKEL, home, uid, gid);
 }
 
 static int run_passwd(const char *user)

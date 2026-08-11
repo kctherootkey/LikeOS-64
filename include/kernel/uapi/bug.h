@@ -180,12 +180,16 @@ static inline int irqs_disabled(void)
 // Catches blocking operations called from atomic context (IRQs disabled).
 // ============================================================================
 #ifdef DEBUG
-#define might_sleep()                                                              \
-	do {                                                                       \
-		if (unlikely(irqs_disabled()))                                     \
-			kprintf("WARNING: might_sleep() called with IRQs disabled" \
-				" at %s:%d %s()\n",                                \
-				__FILE__, __LINE__, __func__);                     \
+/* Defined in ke/stack_guard.c: prints the warning AND the caller chain that
+ * reached the sleeping primitive, which is the only part that identifies the
+ * offender.  Declared here rather than in sched.h to keep bug.h free-standing. */
+extern void bug_report_atomic_sleep(const char *file, int line,
+				    const char *func);
+#define might_sleep()                                                        \
+	do {                                                                 \
+		if (unlikely(irqs_disabled()))                               \
+			bug_report_atomic_sleep(__FILE__, __LINE__,          \
+						__func__);                   \
 	} while (0)
 #else
 #define might_sleep() \

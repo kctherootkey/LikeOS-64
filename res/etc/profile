@@ -22,6 +22,36 @@ export EDITOR=nano
 # is treated as a byte per character and comes out mangled.
 [ -n "$LANG" ] || export LANG=en_US.UTF-8
 
+# Where programs put per-user sockets and other things that must not survive a
+# reboot.  On systems with a session manager this is /run/user/<uid>, created
+# and cleaned up at login; there is none here, so it is created on first login
+# and named after the user so two of them cannot collide.
+#
+# It is not decoration.  A program that asks for it and does not get one falls
+# back to ~/.cache -- which is a reasonable guess and is NOT created for it, so
+# the fallback fails at the first bind(): menu-cache puts the socket the file
+# manager talks to its menu server over exactly there.  0700 because the
+# sockets in it are the user's own.
+if [ -n "$HOME" ] && [ -z "$XDG_RUNTIME_DIR" ]; then
+	XDG_RUNTIME_DIR=/tmp/runtime-$(id -un 2>/dev/null || echo user)
+	export XDG_RUNTIME_DIR
+	mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null && chmod 0700 "$XDG_RUNTIME_DIR"
+fi
+
+# Where GSettings keeps settings.
+#
+# GSettings is how every GTK program on this image stores its preferences, and
+# it writes them through whichever backend GLib finds.  The one it prefers is
+# dconf -- a daemon reached over a session bus, and neither is ported -- and
+# what it falls back to is the MEMORY backend: preferences then work perfectly
+# until the program exits and are gone the next time it starts, with a single
+# line on stderr that nobody running under X ever sees.
+#
+# "keyfile" is GLib's own answer for a system without dconf.  It writes plain
+# text to ~/.config/glib-2.0/settings/keyfile, which survives a reboot and can
+# be read and edited with an editor.
+[ -n "$GSETTINGS_BACKEND" ] || export GSETTINGS_BACKEND=keyfile
+
 umask 022
 
 # Interactive shells also get the system-wide interactive configuration.

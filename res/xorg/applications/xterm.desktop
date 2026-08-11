@@ -1,0 +1,19 @@
+[Desktop Entry]
+# Desktop entry for xterm, written for this image; the xterm port installs
+# none of its own.
+#
+# Two things read it.  The applications menu is one.  The other is libfm: its
+# terminals.list names `xterm.desktop' as the entry for xterm, and that is how
+# "Open Terminal" and "Run in terminal" find the program rather than guessing
+# at a command line.
+Type=Application
+Version=1.0
+Name=XTerm
+GenericName=Terminal
+Comment=Use the command line
+Exec=xterm
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;

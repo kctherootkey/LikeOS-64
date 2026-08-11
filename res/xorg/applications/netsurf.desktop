@@ -1,0 +1,22 @@
+[Desktop Entry]
+# Desktop entry for the NetSurf port, written for this image.
+#
+# NetSurf's own build installs no .desktop file -- the framebuffer frontend
+# this port builds is meant to be started from a shell -- and until there was a
+# file manager nothing needed one.  Now three things do: the applications menu
+# is built from this directory, "Open With" lists what it finds here, and a
+# double-clicked .html file is opened by whatever claims text/html.
+#
+# %u, not %f: NetSurf takes a URL, and GIO hands a local file over as a file://
+# one, which it understands.
+Type=Application
+Version=1.0
+Name=NetSurf
+GenericName=Web Browser
+Comment=Browse the web
+Exec=netsurf %u
+Icon=web-browser
+Terminal=false
+StartupNotify=false
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;text/xml;image/png;image/jpeg;image/gif;image/bmp;x-scheme-handler/http;x-scheme-handler/https;

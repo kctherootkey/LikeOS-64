@@ -102,6 +102,21 @@ stage_lib libenchant-2
 stage_lib libhunspell-1.7
 stage_lib libstartup-notification-1
 
+# Mousepad: the editing widget and the XML parser it reads its syntax
+# definitions with.  libmousepad is the program itself -- the binary in
+# /usr/bin is a main() and nothing else, with every line of the editor in this
+# library beside it.
+stage_lib libxml2
+stage_lib libgtksourceview-4
+stage_lib libmousepad
+
+# PCManFM: the file-management library, its GTK half, the XML/string helpers
+# shared with menu-cache, and menu-cache itself.
+stage_lib libfm
+stage_lib libfm-gtk3
+stage_lib libfm-extra
+stage_lib libmenu-cache
+
 # ---------------------------------------------------------------------------
 # Programs.
 # ---------------------------------------------------------------------------
@@ -109,6 +124,17 @@ if [ -f "$SYSROOT/usr/bin/claws-mail" ]; then
 	cp "$SYSROOT/usr/bin/claws-mail" "$DEST/usr/bin/claws-mail"
 	staged=$((staged + 1))
 fi
+
+# The file manager, the editor, and the two small programs libfm installs
+# beside itself: libfm-pref-apps sets which application opens which kind of
+# file, and lxshortcut edits a .desktop entry -- both are reachable from
+# PCManFM's own menus, so leaving either out turns a menu item into nothing
+# happening.
+for b in pcmanfm mousepad libfm-pref-apps lxshortcut; do
+	[ -f "$SYSROOT/usr/bin/$b" ] || continue
+	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
+	staged=$((staged + 1))
+done
 
 # The GLib and fontconfig command-line tools.  Small, and each answers a
 # question that is otherwise unanswerable on a running system: what settings a
@@ -125,6 +151,58 @@ done
 if [ -f "$root/build/testcxx" ]; then
 	cp "$root/build/testcxx" "$DEST/usr/local/bin/testcxx"
 	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Programs that other programs RUN, by a path compiled into the caller.
+#
+# None of these is ever typed at a prompt, and each one's absence is a feature
+# that silently does not work -- or worse:
+#
+#   menu-cached        the menu server.  libmenu-cache forks it the first time
+#                      anything asks for the application menu, and it does not
+#                      cope with it being missing: the call is
+#                      g_error("failed to find menu-cached"), and g_error
+#                      ABORTS.  So a PCManFM on an image without this does not
+#                      show an empty menu, it dies opening one.
+#   menu-cache-gen     what menu-cached runs in turn to parse the .menu file
+#                      and the .desktop files it names.
+#   gio-launch-desktop GLib's own launcher.  Every "open this file with that
+#                      application" in the system goes through it --
+#                      g_desktop_app_info_launch_uris() spawns this rather
+#                      than the target program directly, so that the child is
+#                      reparented away from the caller.
+#
+# The paths are the ones compiled in (MENUCACHE_LIBEXECDIR, GLib's LIBEXECDIR),
+# so these keep the layout they were built with rather than moving to /usr/bin.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/libexec" ]; then
+	for h in menu-cache/menu-cached menu-cache/menu-cache-gen \
+		gio-launch-desktop; do
+		[ -f "$SYSROOT/usr/libexec/$h" ] || continue
+		mkdir -p "$DEST/usr/libexec/$(dirname "$h")"
+		cp "$SYSROOT/usr/libexec/$h" "$DEST/usr/libexec/$h"
+		staged=$((staged + 1))
+	done
+fi
+
+# ---------------------------------------------------------------------------
+# libfm's modules.
+#
+# dlopen'd from /usr/lib/libfm/modules, and not optional decoration: this is
+# where several of the file manager's visible features actually live --
+# vfs-menu is the applications menu as a browsable folder, vfs-search is the
+# search results view, gtk-menu-trash the trash entries in a file's context
+# menu, gtk-menu-actions the custom actions, and the two fileprop modules the
+# extra Properties pages for .desktop files and shortcuts.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/lib/libfm/modules" ]; then
+	mkdir -p "$DEST/usr/lib/libfm/modules"
+	for m in "$SYSROOT"/usr/lib/libfm/modules/*.so; do
+		[ -e "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/libfm/modules/"
+		staged=$((staged + 1))
+	done
 fi
 
 # ---------------------------------------------------------------------------
@@ -258,6 +336,150 @@ if [ -d "$SYSROOT/usr/share/themes" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# What a file IS: the shared MIME database.
+#
+# Both the XML source and the binary forms produced from it, because they are
+# read by different things -- GLib's g_content_type_guess() (and so every icon,
+# description and default application in the file manager) reads mime.cache and
+# the glob/magic tables, while the XML is what anyone regenerating the database
+# would start from.  Copied whole: it is 2MB and picking through it would mean
+# knowing which of the eleven files each reader opens.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/share/mime" ]; then
+	mkdir -p "$DEST/usr/share"
+	cp -a "$SYSROOT/usr/share/mime" "$DEST/usr/share/"
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# What can OPEN it: the desktop entries.
+#
+# One file per installed application, and the only place the system records
+# that a program exists, what it is called, which icon it uses and which MIME
+# types it handles.  Everything user-visible about "open with" is built from
+# this directory: the Open With list, the default application for a type, the
+# applications menu, and the entries PCManFM's desktop shows.
+#
+# Not staged before this port, because until there was a file manager nothing
+# read them.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/share/applications" ]; then
+	mkdir -p "$DEST/usr/share/applications"
+	cp "$SYSROOT"/usr/share/applications/*.desktop \
+		"$DEST/usr/share/applications/" 2>/dev/null || true
+	staged=$((staged + 1))
+fi
+
+# The index of that directory, WITHOUT which none of it has any effect.
+#
+# GLib does not read the MimeType= lines of the desktop files when it is asked
+# what can open a file -- it reads mimeinfo.cache, which its own source
+# describes as "just a cached copy of what we would find in the MimeTypes=
+# lines of all of the desktop files".  With no cache the answer is nothing:
+# double-clicking a text file offers no application and the Open With list is
+# empty, with every desktop file present and correct.
+#
+# Generated here rather than by update-desktop-database, which is a build-host
+# program this tree would otherwise have to require.  The format is one line
+# per MIME type naming the desktop files that claim it, and the output of this
+# is compared against that tool's byte for byte in the repository's own
+# checks.  Only Type=Application entries count, which is what the tool does.
+if [ -d "$DEST/usr/share/applications" ]; then
+	(
+		cd "$DEST/usr/share/applications" || exit 0
+		set -- *.desktop
+		[ "$1" = '*.desktop' ] && exit 0
+
+		# One awk per file and a sort between the halves, rather than
+		# one clever pass: ENDFILE and asorti are gawk's, and the awk
+		# on the next machine to build this may be mawk.
+		for f in *.desktop; do
+			awk -v fn="$f" '
+			/^\[/ { entry = ($0 == "[Desktop Entry]"); next }
+			!entry { next }
+			/^Type[ \t]*=/ {
+				sub(/^Type[ \t]*=[ \t]*/, ""); type = $0; next
+			}
+			/^MimeType[ \t]*=/ {
+				sub(/^MimeType[ \t]*=[ \t]*/, ""); mime = $0; next
+			}
+			END {
+				if (type != "Application" || mime == "") exit
+				n = split(mime, t, ";")
+				for (i = 1; i <= n; i++)
+					if (t[i] != "") print t[i], fn
+			}' "$f"
+		done | LC_ALL=C sort -u | awk '
+			BEGIN { print "[MIME Cache]" }
+			{
+				if ($1 != cur) {
+					if (cur != "") printf "\n"
+					cur = $1
+					printf "%s=", cur
+				}
+				printf "%s;", $2
+			}
+			END { if (cur != "") printf "\n" }' > mimeinfo.cache
+	)
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# How they are ARRANGED: the menu layout and the category names.
+#
+# The .menu file is an XML description of which categories exist and in what
+# order; the .directory files give each category its display name and icon.
+# menu-cache reads the first and menu-cache-gen resolves the second.  With
+# neither, the application list is not merely unsorted -- it is empty, because
+# there is no menu to walk.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/share/desktop-directories" ]; then
+	mkdir -p "$DEST/usr/share/desktop-directories"
+	cp "$SYSROOT"/usr/share/desktop-directories/*.directory \
+		"$DEST/usr/share/desktop-directories/" 2>/dev/null || true
+	staged=$((staged + 1))
+fi
+if [ -d "$SYSROOT/etc/xdg/menus" ]; then
+	mkdir -p "$DEST/etc/xdg/menus"
+	cp "$SYSROOT"/etc/xdg/menus/*.menu "$DEST/etc/xdg/menus/" 2>/dev/null || true
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Each program's own resources.
+#
+#   libfm/       the GtkBuilder .ui files for every dialog libfm opens, the
+#                images it draws its own placeholders from, and the two lists
+#                that tell it how to run an archiver and how to run a terminal.
+#   pcmanfm/     the same for PCManFM's windows.
+#   gtksourceview-4/  the syntax definitions and colour schemes -- 172 language
+#                files, and the reason Mousepad can highlight anything.
+#
+# All three are looked for under the compiled-in datadir, so they keep their
+# names; a GTK program whose .ui file is missing fails when the menu item that
+# opens that dialog is clicked, not at start-up.
+# ---------------------------------------------------------------------------
+for d in libfm pcmanfm gtksourceview-4; do
+	[ -d "$SYSROOT/usr/share/$d" ] || continue
+	mkdir -p "$DEST/usr/share"
+	cp -a "$SYSROOT/usr/share/$d" "$DEST/usr/share/"
+	staged=$((staged + 1))
+done
+
+# ---------------------------------------------------------------------------
+# Their system-wide defaults, from the sysroot rather than this repository:
+# these are upstream's own files and there is nothing about this system to
+# change in them.  The two that DO need changing are copied over them further
+# down (see the res/xorg section below).
+# ---------------------------------------------------------------------------
+for c in libfm/libfm.conf pcmanfm/default/pcmanfm.conf; do
+	[ -f "$SYSROOT/etc/xdg/$c" ] || continue
+	mkdir -p "$DEST/etc/xdg/$(dirname "$c")"
+	cp "$SYSROOT/etc/xdg/$c" "$DEST/etc/xdg/$c"
+	staged=$((staged + 1))
+done
+
+# ---------------------------------------------------------------------------
 # Configuration, from this repository rather than from the build.
 # ---------------------------------------------------------------------------
 if [ -f "$root/res/xorg/gtk3/settings.ini" ]; then
@@ -267,6 +489,19 @@ fi
 if [ -f "$root/res/xorg/gtk3/local.conf" ]; then
 	mkdir -p "$DEST/etc/fonts"
 	cp "$root/res/xorg/gtk3/local.conf" "$DEST/etc/fonts/local.conf"
+fi
+
+# The file manager's two configuration files, over the upstream copies staged
+# further up: which terminal to run and what colour the desktop is are answers
+# about THIS system, and the files say so in their own comments.
+if [ -f "$root/res/xorg/gtk3/libfm.conf" ]; then
+	mkdir -p "$DEST/etc/xdg/libfm"
+	cp "$root/res/xorg/gtk3/libfm.conf" "$DEST/etc/xdg/libfm/libfm.conf"
+fi
+if [ -f "$root/res/xorg/gtk3/pcmanfm.conf" ]; then
+	mkdir -p "$DEST/etc/xdg/pcmanfm/default"
+	cp "$root/res/xorg/gtk3/pcmanfm.conf" \
+		"$DEST/etc/xdg/pcmanfm/default/pcmanfm.conf"
 fi
 
 # Claws Mail's skeleton configuration.
@@ -294,7 +529,8 @@ fi
 # ---------------------------------------------------------------------------
 if [ "${NO_STRIP:-0}" != "1" ] && [ "$staged" -gt 0 ]; then
 	find "$DEST/lib" "$DEST/usr/bin" "$DEST/usr/local/bin" \
-		"$DEST/usr/lib/gtk-3.0" "$DEST/usr/lib/enchant-2" -type f \
+		"$DEST/usr/lib/gtk-3.0" "$DEST/usr/lib/enchant-2" \
+		"$DEST/usr/lib/libfm" "$DEST/usr/libexec" -type f \
 		\( -name '*.so*' -o -perm -u+x \) \
 		-exec strip --strip-debug {} + 2>/dev/null || true
 fi

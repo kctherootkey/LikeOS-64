@@ -1,0 +1,150 @@
+.\" mousepad.1 - manual page for Mousepad, written for the LikeOS port.
+.\"
+.\" Mousepad publishes no manual page of its own: upstream documents the
+.\" program through its own Help menu and its .desktop entry, which is a
+.\" reasonable choice for a desktop that always has a browser to hand and a
+.\" poor one here, where `man' is how anything is looked up.  So this page is
+.\" written rather than rendered, from the program's own option table
+.\" (mousepad/mousepad-application.c), its settings schema and its appdata
+.\" description -- nothing here is invented.
+.\"
+.\" It is installed into the port sysroot's man1 by the build driver's
+.\" post_install(), so the repository's gtk3-manpages target renders it into
+.\" res/man alongside every page that DID come from a source tree, and the
+.\" image build ships it like any other.
+.TH MOUSEPAD 1 "August 2026" "Mousepad 0.7.0" "User Commands"
+.SH NAME
+mousepad \- simple text editor
+.SH SYNOPSIS
+.B mousepad
+.RI [ OPTION "...] [" FILE "...]"
+.SH DESCRIPTION
+.B Mousepad
+is a text editor for quickly editing text files: an editor, not a development
+environment and not a plugin host.  It is the graphical counterpart of
+.BR nano (1)
+on this system, and opens from the file manager for any file whose type is
+text.
+.PP
+The editing area is a GtkSourceView widget, which is where most of what the
+program can do comes from: syntax highlighting for some 170 languages chosen
+from the
+.B Document \(-> Filetype
+menu or guessed from the file's name and contents, line numbers, automatic
+indentation, bracket matching, a whitespace display, and unlimited undo.
+.PP
+Documents open as tabs in one window.  A tab can be dragged out into a window
+of its own or dropped onto another window, and
+.B Document \(-> Split View
+shows one document twice so that two places in a long file can be edited at
+once.
+.PP
+Text is read and written in the encoding named by
+.BR \-\-encoding ;
+without one Mousepad reads UTF-8 and falls back to the locale's encoding,
+opening a dialog when a file is neither.  Line endings are preserved as found
+and can be changed from
+.BR "Document \(-> Line Ending" .
+.PP
+Search and replace covers the open document or every open document at once,
+with plain text, whole-word or regular-expression matching, and an incremental
+search bar bound to
+.BR Ctrl+F .
+.SH OPTIONS
+.TP
+.BI \-e " ENCODING" "\fR, \fP" \-\-encoding= ENCODING
+Open the files that follow in
+.IR ENCODING .
+With an empty argument, open the encoding dialog for each file instead.
+.TP
+.B \-\-list\-encodings
+Print the encodings this build accepts as an argument to
+.BR \-\-encoding ,
+and exit.
+.TP
+.BI \-l " LINE" "\fR, \fP" \-\-line= LINE
+Put the cursor on line
+.IR LINE .
+A positive number counts from the top of the file, a negative one from the
+bottom.
+.TP
+.BI \-c " COLUMN" "\fR, \fP" \-\-column= COLUMN
+Put the cursor in column
+.IR COLUMN .
+Zero or more counts from the start of the line, a negative number from its end.
+.TP
+.B \-\-preferences
+Open the preferences dialog rather than a document window.
+.TP
+.B \-\-disable\-server
+Do not become, or talk to, the primary instance: this invocation gets its own
+process and its own windows.  Without it, a second
+.B mousepad
+hands its file names to the one already running and exits, so that every
+document shares one window.
+.TP
+.BR \-q ", " \-\-quit
+Ask a running Mousepad to close.  Unsaved documents are still asked about.
+.TP
+.BR \-v ", " \-\-version
+Print the version and exit.
+.PP
+The usual GTK options
+.RB ( \-\-display ,
+.BR \-\-class ,
+.BR \-\-name ,
+and the rest) are accepted as well; see
+.B \-\-help\-all
+for the whole list.
+.SH FILES
+.TP
+.I ~/.config/Mousepad/settings.conf
+Every preference the program remembers \(em window size, font, word wrap, tab
+width, the toolbar and statusbar, the colour scheme.
+.IP
+This file is particular to this system.  Mousepad stores its settings through
+GSettings, which normally writes them into the dconf database over a session
+bus, and there is neither on LikeOS.  It is therefore built with the keyfile
+backend, which is upstream's option for exactly that situation and which writes
+this plain, editable file instead.
+.TP
+.I /usr/share/glib-2.0/schemas/
+The compiled schema describing those settings.  Mousepad will not start without
+it.
+.TP
+.I /usr/share/gtksourceview-4/language-specs/
+The syntax definitions, one XML file per language, and where to add a language
+that is not there.
+.TP
+.I /usr/share/gtksourceview-4/styles/
+The colour schemes offered under
+.BR "View \(-> Color Scheme" .
+.TP
+.I /usr/lib/mousepad/plugins/
+Where plugin modules are loaded from.  None is built for this image.
+.SH ENVIRONMENT
+.TP
+.B GSETTINGS_BACKEND
+Overrides the settings backend described under
+.IR FILES .
+Setting it to
+.B memory
+makes a session's changes deliberately temporary.
+.SH EXAMPLES
+Open a file with the cursor on its last line:
+.PP
+.RS
+.B mousepad \-l \-1 /var/log/messages
+.RE
+.PP
+Open a file that is not UTF-8:
+.PP
+.RS
+.B mousepad \-\-encoding=ISO\-8859\-15 notes.txt
+.RE
+.SH SEE ALSO
+.BR nano (1),
+.BR pcmanfm (1)
+.SH AUTHOR
+Mousepad is part of the Xfce project.  This manual page was written for the
+LikeOS port.

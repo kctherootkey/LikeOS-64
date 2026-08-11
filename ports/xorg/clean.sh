@@ -58,6 +58,11 @@ for d in "$port"/*/; do
 	[ -d "$d" ] || continue
 	case "$(basename "$d")" in
 	toolchain | patches | .stamps | .logs) continue ;;
+	# man/ holds manual pages the port WRITES, for programs that publish
+	# none of their own (Mousepad).  Like patches/ it is ours and no tarball
+	# can put it back -- and losing it is quiet: the next build simply
+	# produces an image with one page missing.
+	man) continue ;;
 	esac
 	[ -f "$d/packages.list" ] && continue
 	rm -rf "$d"

@@ -1,0 +1,62 @@
+--- a/autogen.sh
++++ b/autogen.sh
+@@ -30,16 +30,30 @@
+ 
+ GTKDOCIZE=`which gtkdocize`
+ 
+-if test "x${GTKDOCIZE}" = x; then
+-    echo "You need gtk-doc to build this package."
+-    echo "http://www.gtk.org/gtk-doc/"
+-    exit 1
+-fi
+-
+ test -d m4 || mkdir m4
+ set -ex
+ 
+-gtkdocize --copy
++if test "x${GTKDOCIZE}" != x; then
++    gtkdocize --copy
++else
++    # No gtk-doc on the build host, and none wanted here: what it produces is
++    # the API reference a developer reads in a browser, and this port builds
++    # the documentation of no package -- every one of them is configured with
++    # --disable-gtk-doc or the equivalent.  Refusing to generate a build system
++    # over it stops the port at a package it could otherwise build.
++    #
++    # One file still has to exist.  docs/reference/libfm/Makefile.am pulls in
++    # the rules with `include', not `-include', so automake fails on the
++    # missing file rather than skipping it -- and that file is the one gtkdocize
++    # copies.  An empty one satisfies the include and defines no rules; the
++    # documentation directory is kept out of SUBDIRS by the ENABLE_GTK_DOC
++    # conditional, which configure.ac defines as false when the gtk-doc macros
++    # are not installed.
++    #
++    # This is what the sibling package menu-cache already does in its own
++    # autogen.sh, without the exit.
++    echo "EXTRA_DIST =" > gtk-doc.make
++fi
+ ${ACLOCAL:-aclocal$AM_VERSION} ${ACLOCAL_ARG}
+ ${AUTOHEADER:-autoheader$AC_VERSION} --force
+ AUTOMAKE=$AUTOMAKE libtoolize -c --automake --force
+--- a/configure.ac
++++ b/configure.ac
+@@ -230,7 +230,19 @@
+ ])])])])
+ 
+ #check for gtk-doc
++dnl Guarded the way menu-cache's own configure.ac guards the same call.  With
++dnl no gtk-doc installed the macro is undefined, and an unexpanded
++dnl GTK_DOC_CHECK reaches the generated configure as a shell command that does
++dnl not exist -- so configure runs, prints "GTK_DOC_CHECK: command not found"
++dnl among its output, and carries on having defined nothing.  The conditional
++dnl it would have defined is read by Makefile.am here and under docs/, and
++dnl automake stops without it.  False is the right value: it is what leaves the
++dnl documentation out of SUBDIRS.
++m4_ifdef([GTK_DOC_CHECK], [
+ GTK_DOC_CHECK([1.14],[--flavour no-tmpl])
++],[
++AM_CONDITIONAL([ENABLE_GTK_DOC], false)
++])
+ 
+ AC_ARG_ENABLE(demo,
+     [AC_HELP_STRING([--enable-demo],

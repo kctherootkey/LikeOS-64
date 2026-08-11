@@ -1,0 +1,60 @@
+# Which application opens which kind of file, installed as
+# /usr/share/applications/mimeapps.list.
+#
+# mimeinfo.cache, generated beside this file at image-build time, says which
+# applications CAN open a type -- every one that claims it.  This file says
+# which one is chosen when the user does not pick, and it is why
+# double-clicking a file opens something instead of a chooser dialog.
+#
+# A user's own ~/.config/mimeapps.list overrides this entirely, and PCManFM
+# writes to that file when "Open With..." is used with "Set as default"
+# ticked.  Nothing here is a choice the user is held to.
+#
+# The names are desktop-entry file names in this same directory, so a program
+# is only worth naming here if its .desktop file is installed.
+
+[Default Applications]
+# Folders open in the file manager, including the one PCManFM opens for its
+# own "Open in New Window".
+inode/directory=pcmanfm.desktop
+
+# Text of every kind goes to Mousepad -- it is the graphical editor on this
+# image, and text/plain is the type most files that are not something else
+# resolve to.  The subtypes are listed because a source file is not text/plain:
+# the shared MIME database gives it its own type (text/x-csrc and the rest),
+# which does not inherit a default from its parent.
+text/plain=org.xfce.mousepad.desktop
+text/x-csrc=org.xfce.mousepad.desktop
+text/x-chdr=org.xfce.mousepad.desktop
+text/x-c++src=org.xfce.mousepad.desktop
+text/x-c++hdr=org.xfce.mousepad.desktop
+text/x-makefile=org.xfce.mousepad.desktop
+text/x-python=org.xfce.mousepad.desktop
+text/x-shellscript=org.xfce.mousepad.desktop
+text/x-diff=org.xfce.mousepad.desktop
+text/x-log=org.xfce.mousepad.desktop
+text/markdown=org.xfce.mousepad.desktop
+text/csv=org.xfce.mousepad.desktop
+application/json=org.xfce.mousepad.desktop
+application/x-shellscript=org.xfce.mousepad.desktop
+application/xml=org.xfce.mousepad.desktop
+text/xml=org.xfce.mousepad.desktop
+
+# Web pages and the image formats NetSurf can display go to the browser, which
+# is also the only program on this image that can show a picture at all.
+text/html=netsurf.desktop
+application/xhtml+xml=netsurf.desktop
+image/png=netsurf.desktop
+image/jpeg=netsurf.desktop
+image/gif=netsurf.desktop
+image/bmp=netsurf.desktop
+x-scheme-handler/http=netsurf.desktop
+x-scheme-handler/https=netsurf.desktop
+
+# Mail: a mailbox file, and the mailto: links every other program produces.
+application/mbox=claws-mail.desktop
+message/rfc822=claws-mail.desktop
+x-scheme-handler/mailto=claws-mail.desktop
+
+# A .desktop file is a launcher, and editing one is what lxshortcut does.
+application/x-desktop=lxshortcut.desktop

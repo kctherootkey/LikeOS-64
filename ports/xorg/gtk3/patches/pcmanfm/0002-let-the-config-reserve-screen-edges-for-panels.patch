@@ -1,0 +1,96 @@
+diff -Naur orig/src/app-config.c new/src/app-config.c
+--- orig/src/app-config.c	2026-08-11 15:00:05.608604638 +0200
++++ new/src/app-config.c	2026-08-11 15:00:32.160103702 +0200
+@@ -644,6 +644,10 @@
+     cfg->folder = g_key_file_get_string(kf, group, "folder", NULL);
+ 
+     fm_key_file_get_bool(kf, group, "show_wm_menu", &cfg->show_wm_menu);
++    fm_key_file_get_int(kf, group, "reserve_top", &cfg->reserve_top);
++    fm_key_file_get_int(kf, group, "reserve_bottom", &cfg->reserve_bottom);
++    fm_key_file_get_int(kf, group, "reserve_left", &cfg->reserve_left);
++    fm_key_file_get_int(kf, group, "reserve_right", &cfg->reserve_right);
+     _parse_sort(kf, group, &cfg->desktop_sort_type, &cfg->desktop_sort_by);
+ #if FM_CHECK_VERSION(1, 2, 0)
+     fm_key_file_get_bool(kf, group, "show_documents", &cfg->show_documents);
+@@ -1064,6 +1068,10 @@
+     if(cfg->folder)
+         g_string_append_printf(buf, "folder=%s\n", cfg->folder);
+     g_string_append_printf(buf, "show_wm_menu=%d\n", cfg->show_wm_menu);
++    g_string_append_printf(buf, "reserve_top=%d\n", cfg->reserve_top);
++    g_string_append_printf(buf, "reserve_bottom=%d\n", cfg->reserve_bottom);
++    g_string_append_printf(buf, "reserve_left=%d\n", cfg->reserve_left);
++    g_string_append_printf(buf, "reserve_right=%d\n", cfg->reserve_right);
+     _save_sort(buf, cfg->desktop_sort_type, cfg->desktop_sort_by);
+ #if FM_CHECK_VERSION(1, 2, 0)
+     g_string_append_printf(buf, "show_documents=%d\n", cfg->show_documents);
+diff -Naur orig/src/app-config.h new/src/app-config.h
+--- orig/src/app-config.h	2026-08-11 15:00:05.599039241 +0200
++++ new/src/app-config.h	2026-08-11 15:00:32.159592102 +0200
+@@ -81,6 +81,15 @@
+     char* desktop_font;
+     char *folder; /* NULL if default, empty if no icons, else path */
+     gboolean show_wm_menu;
++    /* Screen edges to keep the icons clear of, in pixels.
++     *
++     * A panel is supposed to publish _NET_WM_STRUT so the window manager can
++     * narrow _NET_WORKAREA, which is what update_working_area() reads.  Plain X
++     * clients parked at a screen edge -- a clock, a load graph, twm-style icon
++     * managers -- set no strut at all, so the work area stays the whole screen
++     * and the first row of icons ends up underneath them.  These say, in the
++     * config, what the missing strut would have said. */
++    int reserve_top, reserve_bottom, reserve_left, reserve_right;
+ #if FM_CHECK_VERSION(1, 0, 2)
+     FmSortMode desktop_sort_type;
+     FmFolderModelCol desktop_sort_by;
+diff -Naur orig/src/desktop.c new/src/desktop.c
+--- orig/src/desktop.c	2026-08-11 15:00:05.618984057 +0200
++++ new/src/desktop.c	2026-08-11 15:00:32.161265154 +0200
+@@ -518,6 +518,10 @@
+     dst->wallpapers_configured = src->wallpapers_configured;
+     dst->wallpaper_common = src->wallpaper_common;
+     dst->show_wm_menu = src->show_wm_menu;
++    dst->reserve_top = src->reserve_top;
++    dst->reserve_bottom = src->reserve_bottom;
++    dst->reserve_left = src->reserve_left;
++    dst->reserve_right = src->reserve_right;
+     dst->configured = TRUE;
+     dst->changed = FALSE;
+     dst->desktop_bg = src->desktop_bg;
+@@ -2593,6 +2597,37 @@
+     XFree(prop);
+ _out:
+ #endif
++    /* Take off the edges the config reserves.
++     *
++     * Applied HERE, to the work area, rather than to xmargin/ymargin: the
++     * margins are symmetric and would waste the opposite edge as well, while
++     * this is exactly the shape _NET_WORKAREA would have had if the programs
++     * sitting on the edge had published a strut.  Everything downstream --
++     * layout_items(), the drag clamping, "arrange icons" -- already works from
++     * the work area, so nothing else has to know. */
++    {
++        FmDesktopConfig *dc = &desktop->conf;
++        int cut;
++
++        cut = MAX(0, dc->reserve_left);
++        if(cut > 0 && cut < desktop->working_area.width)
++        {
++            desktop->working_area.x += cut;
++            desktop->working_area.width -= cut;
++        }
++        cut = MAX(0, dc->reserve_top);
++        if(cut > 0 && cut < desktop->working_area.height)
++        {
++            desktop->working_area.y += cut;
++            desktop->working_area.height -= cut;
++        }
++        cut = MAX(0, dc->reserve_right);
++        if(cut > 0 && cut < desktop->working_area.width)
++            desktop->working_area.width -= cut;
++        cut = MAX(0, dc->reserve_bottom);
++        if(cut > 0 && cut < desktop->working_area.height)
++            desktop->working_area.height -= cut;
++    }
+     queue_layout_items(desktop);
+     return;
+ }

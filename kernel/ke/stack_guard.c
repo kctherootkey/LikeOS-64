@@ -1,6 +1,7 @@
 // LikeOS-64 Stack Canary Support — kernel smash reporter
 
 #include <kernel/io/console.h>
+#include <kernel/mm/memory.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>
@@ -23,9 +24,30 @@ static void __attribute__((no_stack_protector)) _ksc_trace(uint64_t rbp,
 	kprintf("  [<%016llx>]\n", rip);
 	int depth = 0;
 	while (_ksc_is_kern(rbp) && depth < 16) {
-		uint64_t *f = (uint64_t *)rbp;
-		uint64_t ret = f[1]; /* [rbp+8] = return address */
-		uint64_t up = f[0]; /* [rbp+0] = saved RBP     */
+		uint64_t *f;
+		uint64_t ret, up;
+
+		/* The frame has to be READABLE before it is read.
+		 *
+		 * A frame chain that runs to the top of a kernel stack leaves
+		 * the last rbp one word below the guard page, so reading
+		 * [rbp+8] faults -- and a fault HERE cannot be recovered from:
+		 * this runs from the oops path and from __stack_chk_fail, so
+		 * the second fault comes back as "recursive entry on CPU 0 --
+		 * halting" and takes the machine down instead of printing a
+		 * trace.  A might_sleep() report from softirq context
+		 * (net_rx_softirq -> tcp_rx -> slab_free -> the page-batch
+		 * free) did exactly that: a DEBUG warning became a halt.
+		 *
+		 * mm_user_addr_mapped() is not user-only -- it walks the
+		 * current CR3 by index and answers for any address, kernel
+		 * ones included.  Read-only and lock-free, which is what a
+		 * crash path needs. */
+		if ((rbp & 7) || !mm_user_addr_mapped(rbp, 16))
+			break;
+		f = (uint64_t *)rbp;
+		ret = f[1]; /* [rbp+8] = return address */
+		up = f[0]; /* [rbp+0] = saved RBP     */
 		if (!ret || !_ksc_is_kern(ret))
 			break;
 		kprintf("  [<%016llx>]\n", ret);
@@ -64,6 +86,39 @@ static const char *__attribute__((no_stack_protector)) _ksc_pattern(uint64_t c)
 	if (c == 0)
 		return "zero write (memset or string terminator)";
 	return NULL;
+}
+
+/* ---- might_sleep() reporter ----
+ *
+ * might_sleep() fires deep inside whatever sleeping primitive was reached, and
+ * that name is never the useful one: every filesystem semaphore looks the same
+ * from there, and the question is always which entry point took a spinlock (or
+ * arrived from an interrupt) and then called into the filesystem.  So report
+ * the caller chain as well, in the same form as the oops "Call Trace", to be
+ * resolved with
+ *   addr2line -f -e build/kernel.elf <addr> ...
+ * (build with NO_STRIP=1 to keep the symbols).  Rate-limited: a path that does
+ * this once normally does it on every iteration of a loop. */
+void __attribute__((no_stack_protector))
+bug_report_atomic_sleep(const char *file, int line, const char *func)
+{
+	static int count = 0;
+	if (count >= 10)
+		return;
+	count++;
+
+	uint64_t rbp;
+	__asm__ volatile("mov %%rbp, %0" : "=r"(rbp));
+
+	task_t *cur = read_gs_base_msr() ? sched_current() : NULL;
+
+	kprintf("WARNING: might_sleep() called with IRQs disabled at %s:%d %s()"
+		" [%s pid=%d]\n",
+		file, line, func, cur ? (cur->comm[0] ? cur->comm : "(anon)") : "(no task)",
+		cur ? cur->id : -1);
+	_ksc_trace(rbp, (uint64_t)__builtin_return_address(0));
+	if (count == 10)
+		kprintf("WARNING: further might_sleep() reports suppressed\n");
 }
 
 /* ---- main handler ---- */

@@ -114,9 +114,25 @@ XCURSOR_THEME=LikeOS
 XCURSOR_SIZE=32
 export XCURSOR_THEME XCURSOR_SIZE
 
-# No terminal is started here on purpose.  Use "New xterm" on the root menu
-# (button 1 on the background) to open one.  Starting clients from this script
-# only obscures which of them failed and why.
+# No terminal is started here on purpose.  Use "Xterm" on the window manager's
+# menu, which is Alt+F1 -- the menus are on keys rather than mouse buttons
+# because the desktop below owns all three buttons (see system.ctwmrc).
+# Starting clients from this script only obscures which of them failed and why.
+
+# The desktop: icons on the background, drawn by PCManFM.
+#
+# Started here rather than from a menu entry, because it is part of what the
+# session IS -- a desktop that has to be switched on by hand after every login
+# is not a desktop.  It takes the root window over, so the background becomes a
+# PCManFM window showing the home folder, the trash and any mounted volume, and
+# all three buttons over it belong to PCManFM.  ctwm's own menus move to Alt+F1
+# and Alt+F2 to make room (see system.ctwmrc).
+#
+# Backgrounded and started BEFORE the window manager so that ctwm is already
+# there to manage its window: PCManFM marks it _NET_WM_WINDOW_TYPE_DESKTOP and
+# ctwm gives that type the bottom of the stacking order, which is what keeps it
+# behind every other window instead of covering them.
+pcmanfm --desktop &
 
 # The window manager runs in the FOREGROUND, which is the conventional
 # arrangement for twm and its relatives: "Exit" on the root menu then ends the

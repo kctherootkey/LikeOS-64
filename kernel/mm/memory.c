@@ -1041,12 +1041,28 @@ void mm_free_physical_pages_batch(const uint64_t *phys, unsigned n)
 	BUG_ON(n > MM_FREE_BATCH_MAX);
 
 #if DEBUG
-	/* The poison pass below deliberately runs with the lock dropped, so a
-	 * caller already in atomic context would defeat the point.  Only a
-	 * constraint in debug builds -- without the poison there is nothing
-	 * between the two halves and the release is safe from anywhere. */
-	might_sleep();
-	{
+	/* The poison pass below deliberately runs with the lock dropped.
+	 *
+	 * This used to assert might_sleep(), which was wrong twice over: this
+	 * function does not sleep -- the release pass takes mm_phys_lock and
+	 * nothing else -- and the assertion fired on a path that is perfectly
+	 * legal, the network RX softirq freeing a receive buffer
+	 * (net_rx_softirq -> tcp_rx -> tcp_grow_rx_buf -> slab_free ->
+	 * mm_free_contiguous_pages).  It reported a sleep that never happens.
+	 *
+	 * What IS wrong in atomic context is the poison itself.  A caller with
+	 * interrupts already off gets them back off from
+	 * spin_unlock_irqrestore(), so the pass below becomes a memset of up to
+	 * MM_FREE_BATCH_MAX pages -- 256 KB -- with interrupts disabled, on the
+	 * hot receive path, once per batch.  Moving it inside the lock would
+	 * only make the same window a locked one.
+	 *
+	 * So skip the poison there and keep the release, which is what the
+	 * caller actually asked for.  The cost is that use-after-free on pages
+	 * freed from interrupt context is not caught by the poison; the double
+	 * -free and refcount checks in the release pass still apply, and they
+	 * are the ones that matter. */
+	if (!irqs_disabled()) {
 		uint64_t poison = 0; /* bit i: phys[i] is ours to poison */
 
 		/* Decide what to poison with the lock held, then poison with it

@@ -126,6 +126,12 @@
 !/ports/xorg/gtk3/
 /ports/xorg/gtk3/*/
 !/ports/xorg/gtk3/patches/
+#     And man/, for the same reason as patches/: it holds a manual page this
+#     port WRITES rather than renders, because Mousepad publishes none of its
+#     own.  It cannot be recovered from any tarball, and without this line the
+#     `*/` rule above would drop it -- the build would then quietly produce an
+#     image whose only missing piece is one manual page.
+!/ports/xorg/gtk3/man/
 #     Not listed, therefore tracked, and all required to build from a clone:
 #     packages.list (the manifest), fetch/unpack/build/stage/clean.sh, and
 #     checksums.sha256 (records which upstream bytes a build used).

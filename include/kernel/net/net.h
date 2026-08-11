@@ -1532,6 +1532,15 @@ int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags);
 int unix_close(unix_socket_t *us);
 int unix_socketpair(int type, unix_socket_t *sv[2]);
 int unix_shutdown(unix_socket_t *us, int how);
+/* SOL_SOCKET options on a local socket.  Options that do nothing here are
+ * accepted (and read back as off) rather than refused, because callers treat a
+ * failing setsockopt as the socket being unusable; genuinely unimplemented
+ * options return -ENOPROTOOPT.  optval/optlen are KERNEL pointers -- the
+ * syscall layer copies to and from userspace. */
+int unix_setsockopt(unix_socket_t *us, int level, int optname,
+		    const void *optval, socklen_t optlen);
+int unix_getsockopt(unix_socket_t *us, int level, int optname, void *optval,
+		    socklen_t *optlen);
 
 int unix_poll(unix_socket_t *us, short events);
 /* Take one more DESCRIPTOR reference on an already-referenced socket: what

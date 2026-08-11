@@ -56,6 +56,16 @@
 #include <dirent.h>
 #include <strings.h>
 #include <libgen.h>
+/* The BSD spellings, included ALONGSIDE the standard ones above on purpose.
+ * That is the arrangement that breaks if one of these headers declares
+ * anything itself instead of redirecting: a second declaration of open() or a
+ * second definition of O_RDONLY would be a compile error right here, in a file
+ * that already includes <fcntl.h>.  See test_gtk3_libc_additions(). */
+#include <sys/errno.h>
+#include <sys/fcntl.h>
+#include <sys/signal.h>
+#include <sys/termios.h>
+#include <sys/unistd.h>
 #include <setjmp.h>
 #include <utime.h>
 #include <sys/xattr.h>
@@ -3439,6 +3449,125 @@ static int vdprintf_helper(int fd, const char *fmt, ...)
 	r = vdprintf(fd, fmt, ap);
 	va_end(ap);
 	return r;
+}
+
+/*
+ * The pieces of libc the GTK3 desktop ports turned out to need.
+ *
+ * The companion of test_xorg_libc_additions() and test_bash_libc_additions()
+ * above, and found the same way: by porting a program and watching where it
+ * stopped.  Here that program was menu-cache -- the server PCManFM asks for
+ * the application menu -- which opens with <sys/fcntl.h>.
+ *
+ * That header, and the four beside it, are the older BSD spellings of headers
+ * POSIX later moved to the top level.  Every general-purpose libc still ships
+ * them, because software that was written when they were the spelling is
+ * software that still builds today, and a program using one is not doing
+ * anything unusual.  Each is one line: it includes the real header.  Which is
+ * exactly what makes them worth a test -- the failure mode is not "missing",
+ * it is "present and declaring things a second time", and that only shows up
+ * where both spellings meet in one translation unit.  This file is that place;
+ * see its include block.
+ *
+ * What is checked here is that a program can USE them: the constants have the
+ * values the real headers give them, and the functions they declare are the
+ * ones that actually run.
+ */
+static void test_gtk3_libc_additions(void)
+{
+	printf("\n[TEST] libc additions for the GTK3 desktop (BSD header spellings)\n");
+
+	/* --- <sys/fcntl.h>: what menu-cache includes ------------------- */
+	{
+		const char *path = "/tmp/sysfcntl_t";
+		int fd, fl;
+
+		/* O_* here reach this call through <sys/fcntl.h> as much as
+		 * through <fcntl.h>; the point is that there is one set of
+		 * them and it works. */
+		fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+		test_result("sys/fcntl.h: open with O_CREAT|O_WRONLY", fd >= 0);
+		if (fd >= 0) {
+			fl = fcntl(fd, F_GETFL);
+			test_result("sys/fcntl.h: F_GETFL reports the access mode",
+				    fl >= 0 && (fl & O_ACCMODE) == O_WRONLY);
+
+			test_result("sys/fcntl.h: F_SETFD/F_GETFD round-trip",
+				    fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 &&
+					    (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+			close(fd);
+		}
+		unlink(path);
+	}
+
+	/* --- <sys/errno.h> --------------------------------------------- */
+	{
+		int fd;
+
+		errno = 0;
+		fd = open("/tmp/no/such/directory/at/all", O_RDONLY);
+		test_result("sys/errno.h: errno and ENOENT are the real ones",
+			    fd < 0 && errno == ENOENT);
+		if (fd >= 0)
+			close(fd);
+
+		/* strerror() must know the constant, which it only does if
+		 * both spellings agree about its value. */
+		test_result("sys/errno.h: strerror(ENOENT) is a real message",
+			    strerror(ENOENT) != NULL &&
+				    strlen(strerror(ENOENT)) > 0);
+	}
+
+	/* --- <sys/signal.h> -------------------------------------------- */
+	{
+		struct sigaction sa, old;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = SIG_IGN;
+		sigemptyset(&sa.sa_mask);
+
+		test_result("sys/signal.h: sigaction installs a disposition",
+			    sigaction(SIGUSR2, &sa, &old) == 0);
+		/* Delivered to ourselves and ignored: if SIGUSR2 had a
+		 * different value on either side of the two headers, this
+		 * would either terminate the test program or fail outright. */
+		test_result("sys/signal.h: raise() of an ignored signal returns",
+			    raise(SIGUSR2) == 0);
+		sigaction(SIGUSR2, &old, NULL);
+	}
+
+	/* --- <sys/termios.h> ------------------------------------------- */
+	{
+		int p[2];
+		struct termios t;
+
+		test_result("sys/termios.h: pipe for the negative case",
+			    pipe(p) == 0);
+		errno = 0;
+		/* A pipe is not a terminal, and saying so is the whole
+		 * contract: every program that decides whether it is
+		 * interactive does it with this call. */
+		test_result("sys/termios.h: tcgetattr on a pipe fails ENOTTY",
+			    tcgetattr(p[0], &t) < 0 && errno == ENOTTY);
+		test_result("sys/termios.h: isatty agrees with it",
+			    isatty(p[0]) == 0);
+		close(p[0]);
+		close(p[1]);
+	}
+
+	/* --- <sys/unistd.h> -------------------------------------------- */
+	{
+		long omax = sysconf(_SC_OPEN_MAX);
+
+		/* menu-cached daemonises by closing every descriptor from 3 to
+		 * this number.  A negative answer would leave descriptors open
+		 * across the fork; an absurd one would spend the daemon's
+		 * start-up in a close() loop. */
+		test_result("sys/unistd.h: sysconf(_SC_OPEN_MAX) is usable",
+			    omax > 3 && omax <= 65536);
+		test_result("sys/unistd.h: sysconf(_SC_PAGESIZE) is 4096",
+			    sysconf(_SC_PAGESIZE) == 4096);
+	}
 }
 
 static void test_dprintf(void)
@@ -8205,6 +8334,161 @@ int main(int argc, char **argv)
 	}
 
 	// ========================================
+	// Test: accept() must honour the caller's addrlen
+	// ========================================
+	printf("\n[TEST] accept() respects the caller's buffer size\n");
+	{
+		/* accept()'s addrlen is IN/OUT: on the way in it says how big
+		 * the caller's buffer is, and nothing may be written past it.
+		 * The kernel used to ignore that and copy a whole
+		 * sizeof(struct sockaddr_un) -- 110 bytes -- into whatever was
+		 * passed.  A `struct sockaddr' is 16, and passing one is
+		 * ordinary: menu-cached does, so every client connection wrote
+		 * 94 bytes past a stack buffer and the function it was called
+		 * from returned into the wreckage.
+		 *
+		 * The guard array is the test: it sits immediately after the
+		 * address, and accept() must not touch it. */
+		struct {
+			struct sockaddr addr;
+			unsigned char guard[128];
+		} b;
+		char spath[] = "/tmp/likeos_accept_len";
+		int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+		unlink(spath);
+		if (sfd >= 0) {
+			struct sockaddr_un sa;
+
+			memset(&sa, 0, sizeof(sa));
+			sa.sun_family = AF_UNIX;
+			strcpy(sa.sun_path, spath);
+			if (bind(sfd, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
+			    listen(sfd, 1) == 0) {
+				pid_t cp;
+
+				fflush(stdout);
+				cp = fork();
+				if (cp == 0) {
+					int cfd = socket(AF_UNIX, SOCK_STREAM,
+							 0);
+					int r = -1;
+					if (cfd >= 0) {
+						r = connect(cfd,
+							    (struct sockaddr *)
+								    &sa,
+							    sizeof(sa));
+						close(cfd);
+					}
+					_exit(r == 0 ? 0 : 1);
+				} else if (cp > 0) {
+					socklen_t alen;
+					int afd, st = 0;
+
+					memset(&b, 0xA5, sizeof(b));
+					alen = sizeof(b.addr); /* 16 */
+					afd = accept(sfd,
+						     (struct sockaddr *)&b.addr,
+						     &alen);
+					waitpid(cp, &st, 0);
+					test_result("accept() with a 16-byte buffer",
+						    afd >= 0);
+
+					/* Not one byte past the declared size. */
+					{
+						int clean = 1;
+						for (size_t i = 0;
+						     i < sizeof(b.guard); i++)
+							if (b.guard[i] != 0xA5)
+								clean = 0;
+						test_result("...writes nothing past addrlen",
+							    clean);
+					}
+					/* The address's REAL size, which here is
+					 * SMALLER than the buffer: the client
+					 * never bound, and an unnamed peer is
+					 * reported family-only, exactly as a
+					 * conventional Unix does.  Asserting
+					 * the exact value is what catches the
+					 * old behaviour, which answered a flat
+					 * sizeof(struct sockaddr_un). */
+					test_result("...and reports the true address length",
+						    alen == (socklen_t)sizeof(
+								    sa_family_t));
+					if (afd >= 0)
+						close(afd);
+				}
+			} else {
+				test_fail("bind/listen for the accept-length test");
+			}
+			close(sfd);
+			unlink(spath);
+		} else {
+			test_fail("socket(AF_UNIX) for the accept-length test");
+		}
+	}
+
+	// ========================================
+	// Test: socket options on an AF_UNIX socket
+	// ========================================
+	printf("\n[TEST] AF_UNIX socket options\n");
+	{
+		/* setsockopt/getsockopt used to resolve the descriptor through
+		 * the INTERNET socket table only, so every option on every
+		 * local socket answered ENOTSOCK -- "that is not a socket",
+		 * which a caller reads as the descriptor being unusable rather
+		 * than the option being unsupported.  PCManFM sets SO_REUSEADDR
+		 * on its single-instance socket and abandons the bind() in the
+		 * same expression, so it exited with status 1 before opening a
+		 * window.  The distinction matters more than the option does:
+		 * anything unimplemented must say ENOPROTOOPT. */
+		int sv[2];
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+			int one = 1, val = 0;
+			socklen_t vlen = sizeof(val);
+
+			errno = 0;
+			test_result("setsockopt(SO_REUSEADDR) on AF_UNIX",
+				    setsockopt(sv[0], SOL_SOCKET, SO_REUSEADDR,
+					       &one, sizeof(one)) == 0);
+
+			test_result("getsockopt(SO_TYPE) reports SOCK_STREAM",
+				    getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &val,
+					       &vlen) == 0 &&
+					    val == SOCK_STREAM);
+
+			vlen = sizeof(val);
+			val = -1;
+			test_result("getsockopt(SO_ERROR) reports no error",
+				    getsockopt(sv[0], SOL_SOCKET, SO_ERROR,
+					       &val, &vlen) == 0 &&
+					    val == 0);
+
+			vlen = sizeof(val);
+			val = 0;
+			test_result("getsockopt(SO_RCVBUF) reports a size",
+				    getsockopt(sv[0], SOL_SOCKET, SO_RCVBUF,
+					       &val, &vlen) == 0 &&
+					    val > 0);
+
+			/* An option this family does not implement must be
+			 * refused as an OPTION, never as a bad descriptor. */
+			vlen = sizeof(val);
+			errno = 0;
+			test_result("an unsupported option gives ENOPROTOOPT",
+				    getsockopt(sv[0], SOL_SOCKET, 0x7fff, &val,
+					       &vlen) == -1 &&
+					    errno == ENOPROTOOPT);
+
+			close(sv[0]);
+			close(sv[1]);
+		} else {
+			test_fail("socketpair(AF_UNIX) for the sockopt test");
+		}
+	}
+
+	// ========================================
 	// Test: strncpy / strncat write bounds
 	// ========================================
 	printf("\n[TEST] strncpy/strncat bounds\n");
@@ -12677,6 +12961,7 @@ int main(int argc, char **argv)
 	test_sysv_shm();
 	test_tls();
 	test_xorg_libc_additions();
+	test_gtk3_libc_additions();
 	test_dprintf();
 	test_bash_libc_additions();
 	test_unicode();

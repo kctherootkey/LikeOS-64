@@ -37,9 +37,24 @@ export CC CXX PKG_CONFIG
 
 # util-macros installs its m4 into the sysroot; without this every package's
 # configure dies on an undefined XORG_MACROS_VERSION.
-ACLOCAL_PATH="$SYSROOT/usr/share/aclocal"
+#
+# The port's own build-host tools carry macros too, and they have to be found
+# the same way: intltool installs intltool.m4 beside itself in .hosttools,
+# because it is built there rather than into the system.  A package whose
+# configure.ac calls IT_PROG_INTLTOOL and cannot find that file does not fail
+# at aclocal -- the unexpanded macro name is copied into `configure', where it
+# becomes a shell syntax error a thousand lines from anything that mentions
+# intltool:
+#
+#     ./configure: line 14377: syntax error near unexpected token `0.40.0'
+#     ./configure: line 14377: `IT_PROG_INTLTOOL(0.40.0)'
+#
+# Harmless where nothing needs it: aclocal ignores a directory that holds no
+# macro a package asked for.
+HOSTTOOLS="$TOOLCHAIN/../.hosttools"
+ACLOCAL_PATH="$SYSROOT/usr/share/aclocal:$HOSTTOOLS/share/aclocal"
 export ACLOCAL_PATH
-ACLOCAL="aclocal -I $SYSROOT/usr/share/aclocal"
+ACLOCAL="aclocal -I $SYSROOT/usr/share/aclocal -I $HOSTTOOLS/share/aclocal"
 export ACLOCAL
 
 # Answers to probes that cannot run a target binary.  Seeded rather than
