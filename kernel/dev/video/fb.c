@@ -212,6 +212,14 @@ void sse_copy_aligned(void *dst, const void *src, size_t bytes)
 	size_t sse_bytes = bytes & ~15; // Round down to 16-byte boundary
 	size_t remaining = bytes - sse_bytes;
 
+	/* Borrowing the SSE registers: they belong to whatever task this
+	 * interrupted, and are only written back to its save area at the next
+	 * context switch -- so without this the blit rewrote a running
+	 * program's floating-point state, and the corrupted values were the
+	 * ones saved.  Preemption inside the bracket is safe; see
+	 * kernel_fpu_begin(). */
+	kernel_fpu_begin();
+
 	__asm__ volatile("1:\n\t"
 			 "movdqa (%0), %%xmm0\n\t"
 			 "movdqa %%xmm0, (%1)\n\t"
@@ -222,6 +230,8 @@ void sse_copy_aligned(void *dst, const void *src, size_t bytes)
 			 : "+r"(src), "+r"(dst), "+r"(sse_bytes)
 			 :
 			 : "memory", "xmm0");
+
+	kernel_fpu_end();
 
 	// Copy remaining bytes
 	if (remaining) {
@@ -245,6 +255,14 @@ void sse_copy_unaligned(void *dst, const void *src, size_t bytes)
 	size_t sse_bytes = bytes & ~15; // Round down to 16-byte boundary
 	size_t remaining = bytes - sse_bytes;
 
+	/* Borrowing the SSE registers: they belong to whatever task this
+	 * interrupted, and are only written back to its save area at the next
+	 * context switch -- so without this the blit rewrote a running
+	 * program's floating-point state, and the corrupted values were the
+	 * ones saved.  Preemption inside the bracket is safe; see
+	 * kernel_fpu_begin(). */
+	kernel_fpu_begin();
+
 	__asm__ volatile("1:\n\t"
 			 "movdqu (%0), %%xmm0\n\t"
 			 "movdqu %%xmm0, (%1)\n\t"
@@ -255,6 +273,8 @@ void sse_copy_unaligned(void *dst, const void *src, size_t bytes)
 			 : "+r"(src), "+r"(dst), "+r"(sse_bytes)
 			 :
 			 : "memory", "xmm0");
+
+	kernel_fpu_end();
 
 	// Copy remaining bytes
 	if (remaining) {
@@ -290,6 +310,14 @@ void sse_copy_nt(void *dst, const void *src, size_t bytes)
 	s += align_off;
 	bytes -= align_off;
 
+
+	/* Borrowing the SSE registers: they belong to whatever task this
+	 * interrupted, and are only written back to its save area at the next
+	 * context switch -- so without this the blit rewrote a running
+	 * program's floating-point state, and the corrupted values were the
+	 * ones saved.  Preemption inside the bracket is safe; see
+	 * kernel_fpu_begin(). */
+	kernel_fpu_begin();
 	// Main NT copy: 64 bytes per iteration (4 x movntdq) for WC buffer filling
 	size_t bulk = bytes & ~63;
 	if (bulk > 0) {
@@ -336,6 +364,8 @@ void sse_copy_nt(void *dst, const void *src, size_t bytes)
 		s += mid16;
 		d += mid16;
 	}
+
+	kernel_fpu_end();
 
 	// Trailing bytes (< 16)
 	size_t tail = mid & 15;

@@ -6417,6 +6417,14 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// Initialize child from parent
 	mm_memcpy(child, cur, sizeof(task_t));
 
+	/* Per-task state the copy must not leave pointing at the parent, for
+	 * EVERY kind of clone -- a thread needs its own FPU register file just
+	 * as much as a forked process does: the registers belong to the
+	 * execution context, not to the address space it shares. */
+	child->in_exit_teardown = false;
+	child->in_exit_path = false;
+	task_fpu_fork(child, cur);
+
 	/* The copy above duplicated the POINTER to the parent's region table,
 	 * not the table.  A CLONE_VM thread gets an empty one of its own --
 	 * its bookkeeping is owner-routed to the group leader and it must hold

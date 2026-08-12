@@ -1131,9 +1131,60 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 		unsigned long lba = 0;
 		int mergeable = 0;
 
+		/* A page that has been invalidated is not written back.
+		 *
+		 * PC_PAGE_DEAD means pagecache_invalidate_file() wanted this
+		 * page gone and could not have it, because it was locked --
+		 * held by this writeback, or by a writer -- so it marked it and
+		 * left the freeing to whoever unlocks it.  What invalidates a
+		 * file is truncate, unlink, O_TRUNC or a rename over it, and
+		 * ext4 then releases the blocks: by the time the page gets
+		 * here its contents belong to a length the file no longer has,
+		 * or to no file at all.
+		 *
+		 * Storing it would be wrong -- the blocks are gone, and if the
+		 * allocator has handed them to another file, writing there
+		 * would corrupt it.  Asking where it goes is equally pointless
+		 * and is what produced "dirty page ... has no block behind it"
+		 * on every truncated file: a warning about the system working
+		 * as intended.  The dirty flag is not a claim on the data once
+		 * the file has disowned it.
+		 *
+		 * Unlocking is what frees it (pc_page_unlock), which is the
+		 * whole point of the deferral. */
+		if (p && (p->flags & PC_PAGE_DEAD)) {
+			pc_page_unlock(p);
+			p = 0;
+		}
+
 		if (p) {
 			unsigned long blk =
 				pc_walk_chain(sb, p->cluster_id, p->page_index);
+
+			if (blk == 0) {
+				/* The walk did not reach it.  Before treating
+				 * that as "there is no block", ask the
+				 * filesystem to map the page directly, if it
+				 * can.
+				 *
+				 * The two are not the same question.  A walk
+				 * has to know where the file ends and takes
+				 * that from the recorded size, so it stops
+				 * short whenever the size lags the allocation
+				 * -- and it is reached through a cached chain,
+				 * which is one more thing that can fail to
+				 * describe a block that exists.  The map
+				 * consults the allocation itself, which is
+				 * what the write path checked before it let
+				 * the page be dirtied.
+				 *
+				 * Trusting the weaker answer here is not a
+				 * missed optimisation: the page is dirty, so
+				 * the choice is between storing it and losing
+				 * it while pinning its memory for ever. */
+				blk = vfs_sb_map_block(sb, p->cluster_id,
+						       p->page_index);
+			}
 
 			if (blk == 0 || blk >= eoc ||
 			    (reserved_meta && blk == reserved_meta)) {
@@ -1155,7 +1206,7 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 				 * decimal form of a tagged id is unreadable. */
 				WARN_RATELIMIT(
 					1,
-					"pagecache: dirty page (file %lu = 0x%lx, page %lu, blk %lu, flags 0x%x) has no block behind it - cannot be stored",
+					"pagecache: dirty page (file %lu = 0x%lx, page %lu, blk %lu, flags 0x%x) has no block behind it, and the filesystem cannot map one either - cannot be stored",
 					p->cluster_id, p->cluster_id,
 					p->page_index, blk,
 					(unsigned)p->flags);

@@ -128,11 +128,12 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
 
 	while (1) {
 		int state = rwlock->state;
+		int writers = rwlock->waiters_writers;
 
 		// Can acquire read lock if:
 		// - Not write-locked
 		// - No waiting writers (writer preference)
-		if (state >= 0 && rwlock->waiters_writers == 0) {
+		if (state >= 0 && writers == 0) {
 			if (__atomic_cas(&rwlock->state, state, state + 1) ==
 			    state) {
 				return 0;
@@ -140,11 +141,28 @@ int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
 			continue; // CAS failed, retry
 		}
 
-		// Need to wait
+		// Need to wait -- on the word the decision was actually made
+		// on, which is not always the state.
+		//
+		// A futex only re-checks the address it is given, and that
+		// check is the entire defence against sleeping on a condition
+		// that stopped being true.  Waiting on the state while
+		// deferring to a WAITING WRITER (state >= 0, writers != 0)
+		// leaves that defence checking the wrong word: the writer can
+		// take the lock and give it back before this thread reaches
+		// futex_wait, which puts the state back to exactly the value
+		// being waited for, so the check passes and the thread sleeps
+		// on a FREE lock.  Only an unlock wakes it, and the unlock has
+		// already happened -- with the other threads finished there is
+		// no next one.  That is a permanent hang, and it is what the
+		// rwlock exclusion test hit: every thread done but two, both
+		// parked on an unheld lock.
 		__atomic_add(&rwlock->waiters_readers, 1);
 
-		// Wait on the state variable
-		futex_wait(&rwlock->state, state, NULL);
+		if (state < 0)
+			futex_wait(&rwlock->state, state, NULL);
+		else
+			futex_wait(&rwlock->waiters_writers, writers, NULL);
 
 		__atomic_sub(&rwlock->waiters_readers, 1);
 	}
@@ -177,8 +195,9 @@ int pthread_rwlock_timedrdlock(pthread_rwlock_t *rwlock,
 
 	while (1) {
 		int state = rwlock->state;
+		int writers = rwlock->waiters_writers;
 
-		if (state >= 0 && rwlock->waiters_writers == 0) {
+		if (state >= 0 && writers == 0) {
 			if (__atomic_cas(&rwlock->state, state, state + 1) ==
 			    state) {
 				return 0;
@@ -188,7 +207,15 @@ int pthread_rwlock_timedrdlock(pthread_rwlock_t *rwlock,
 
 		__atomic_add(&rwlock->waiters_readers, 1);
 
-		int ret = futex_wait(&rwlock->state, state, abstime);
+		/* Same choice of word as pthread_rwlock_rdlock, and for the
+		 * same reason -- a deadline only bounds the damage, it does
+		 * not make waiting on the wrong one correct. */
+		int ret;
+		if (state < 0)
+			ret = futex_wait(&rwlock->state, state, abstime);
+		else
+			ret = futex_wait(&rwlock->waiters_writers, writers,
+					 abstime);
 
 		__atomic_sub(&rwlock->waiters_readers, 1);
 
@@ -218,6 +245,14 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
 			    RWLOCK_UNLOCKED) {
 				rwlock->writer_tid = tid;
 				__atomic_sub(&rwlock->waiters_writers, 1);
+				/* Readers defer to a waiting writer by
+				 * sleeping on this count, so it cannot change
+				 * silently.  The wake is not wasted work: the
+				 * lock is write-held at this point, so a woken
+				 * reader goes straight back to sleep -- on the
+				 * state, where the unlock will find it. */
+				futex_wake(&rwlock->waiters_writers,
+					   0x7FFFFFFF);
 				return 0;
 			}
 			continue;
@@ -263,6 +298,14 @@ int pthread_rwlock_timedwrlock(pthread_rwlock_t *rwlock,
 			    RWLOCK_UNLOCKED) {
 				rwlock->writer_tid = tid;
 				__atomic_sub(&rwlock->waiters_writers, 1);
+				/* Readers defer to a waiting writer by
+				 * sleeping on this count, so it cannot change
+				 * silently.  The wake is not wasted work: the
+				 * lock is write-held at this point, so a woken
+				 * reader goes straight back to sleep -- on the
+				 * state, where the unlock will find it. */
+				futex_wake(&rwlock->waiters_writers,
+					   0x7FFFFFFF);
 				return 0;
 			}
 			continue;
@@ -272,6 +315,10 @@ int pthread_rwlock_timedwrlock(pthread_rwlock_t *rwlock,
 
 		if (ret < 0 && errno == ETIMEDOUT) {
 			__atomic_sub(&rwlock->waiters_writers, 1);
+			/* Giving up is also a change to the count readers are
+			 * deferring to -- and here it can be the LAST writer,
+			 * leaving readers asleep with nothing to release. */
+			futex_wake(&rwlock->waiters_writers, 0x7FFFFFFF);
 			return ETIMEDOUT;
 		}
 	}

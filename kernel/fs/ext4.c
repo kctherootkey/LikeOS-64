@@ -2022,6 +2022,33 @@ static unsigned long ext4_sb_next_block(vfs_superblock_t *sb, unsigned long bid)
 	return EXT4_BID_ENC(ino, lidx + 1);
 }
 
+/* Map block N of a file directly.  ext4 block ids are positional -- block N of
+ * inode I is EXT4_BID_ENC(I, N) -- so there is nothing to walk; the only
+ * question is whether the block exists, and the extent tree answers it.
+ *
+ * This is deliberately NOT the size test that ext4_sb_next_block ends a chain
+ * on.  The size is a second opinion about how much of the file is real, and
+ * when it disagrees with the extent tree the extent tree is right: the write
+ * path accepts a page for caching only after ext4_block_map says the block is
+ * there, so a page that exists and is dirty has an extent behind it whatever
+ * the recorded length happens to say at the moment writeback asks. */
+static unsigned long ext4_sb_map_block(vfs_superblock_t *sb,
+				       unsigned long chain_id,
+				       unsigned long block_index)
+{
+	ext4_fs_t *fs = (ext4_fs_t *)sb->fs_private;
+	if (!fs || !EXT4_BID_IS(chain_id))
+		return 0;
+	unsigned long ino = EXT4_BID_INO(chain_id);
+	if (ino == 0 || ino > fs->inodes_count)
+		return 0;
+	/* A hole reads as zeroes and has no block to store into; block_to_lba
+	 * makes the same call on the same value. */
+	if (ext4_block_map(fs, ino, block_index) == 0)
+		return 0;
+	return EXT4_BID_ENC(ino, block_index);
+}
+
 static void ext4_sb_lock_io(vfs_superblock_t *sb)
 {
 	(void)sb;
@@ -2114,9 +2141,42 @@ static int ext4_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 		 * the shorter length AND discard the pending record in the
 		 * same step, so the difference would not be recoverable. */
 		if (!ext4_di_pending(ino)) {
-			in.i_size_lo = (uint32_t)inode->size;
-			if ((in.i_mode & S_IFMT) == S_IFREG)
-				in.i_size_high = (uint32_t)(inode->size >> 32);
+			/* ... and even then, only FORWARDS.
+			 *
+			 * ext4_di_pending() is not a reliable guard on its own:
+			 * ext4_di_record() fails when its table is full, and the
+			 * write path then stores the inode instead and leaves
+			 * nothing pending -- so a growing file can arrive here
+			 * with the generic copy still holding a length from
+			 * before the write.  Persisting it shrinks the file to
+			 * something it stopped being.
+			 *
+			 * The read above is the better value in that case: it
+			 * comes from the inode with any pending record already
+			 * applied.  A shrink that is real -- truncate -- gets to
+			 * the device through ext4_truncate_impl, which stores the
+			 * inode itself and clears the pending record, so the
+			 * value read here is ALREADY the short one and there is
+			 * nothing for this path to shorten.  Every remaining
+			 * backwards step is therefore a stale copy, and taking it
+			 * costs the tail of the file: the size is what
+			 * ext4_sb_next_block derives the block chain's length
+			 * from, so the pages past the reverted end can no longer
+			 * be mapped, and writeback drops them with "dirty page
+			 * ... has no block behind it". */
+			uint64_t on_inode = ext4_inode_size(&in);
+			if ((uint64_t)inode->size >= on_inode) {
+				in.i_size_lo = (uint32_t)inode->size;
+				if ((in.i_mode & S_IFMT) == S_IFREG)
+					in.i_size_high =
+						(uint32_t)(inode->size >> 32);
+			} else {
+				WARN_RATELIMIT(
+					1,
+					"ext4: ino %lu size revert refused %lu -> %lu (stale generic-cache copy)",
+					ino, (unsigned long)on_inode,
+					(unsigned long)inode->size);
+			}
 		}
 		ext4_inode_cache_flush();
 		ext4_write_inode_struct(fs, ino, &in);
@@ -2133,6 +2193,7 @@ static const vfs_sb_ops_t ext4_sb_ops = {
 	.block_to_lba = ext4_sb_block_to_lba,
 	.end_of_chain_marker = ext4_sb_end_of_chain,
 	.next_block = ext4_sb_next_block,
+	.map_block = ext4_sb_map_block,
 	.write_inode = ext4_sb_write_inode,
 	.lock_io = ext4_sb_lock_io,
 	.unlock_io = ext4_sb_unlock_io,
@@ -2626,6 +2687,11 @@ static int ext4_open_impl(const char *path, int flags, unsigned cmode,
 	/* O_TRUNC on an existing regular file: discard its data. */
 	if ((flags & O_TRUNC) && (mode & S_IFMT) == S_IFREG &&
 	    ext4_inode_size(&in) > 0 && !ext4_is_ro()) {
+		/* Cache first, blocks second -- same ordering rule as
+		 * ext4_truncate_impl(), and for the same reason: a dirty page
+		 * left pointing at a freed block is either unstorable for ever
+		 * or written into whatever owns that block next. */
+		pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
 		ext4_free_blocks_from(fs, ino, &in, 0);
 		in.i_size_lo = 0;
 		in.i_size_high = 0;
@@ -6521,9 +6587,26 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	 * the pending change back before handing it over, so open(), stat()
 	 * and the writeback path all see the size the file actually has, not
 	 * the one the device last heard about.  If there is no room to record
-	 * it, it is stored the old way -- slower, never wrong. */
-	if (allocated_blocks ||
-	    !ext4_di_record(ef->ino, newsize, in.i_mtime, in.i_ctime)) {
+	 * it, it is stored the old way -- slower, never wrong.
+	 *
+	 * The record is made even when the inode is also stored below, and
+	 * that is not redundant.  ext4_sb_write_inode -- the generic sync path
+	 * -- takes the size from the per-open-handle copy in the generic inode
+	 * cache UNLESS ext4_di_pending() says this path has something better,
+	 * and that copy is exactly the one its own comment warns "two handles
+	 * on the same file can move backwards between them".  Recording only
+	 * in the non-allocating case left the guard false for every write that
+	 * GREW a file: a sync landing between the allocation and the next
+	 * update of that handle wrote the shorter length back over the one
+	 * this write computed.  The file then claims fewer blocks than it
+	 * owns, and since ext4_sb_next_block derives the chain length from the
+	 * size, the pages past the reverted end have nothing to map to --
+	 * writeback finds no block, warns ("dirty page ... has no block behind
+	 * it"), leaves them dirty and therefore unreclaimable, and the tail of
+	 * the file never reaches the device. */
+	int size_recorded =
+		ext4_di_record(ef->ino, newsize, in.i_mtime, in.i_ctime);
+	if (allocated_blocks || !size_recorded) {
 		ext4_write_inode_struct(fs, ef->ino, &in);
 		/* Publish the copy that actually reached the device, not the
 		 * one on the way there: ext4_write_inode_struct may adjust the
@@ -6768,6 +6851,24 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 	if (size < cur) {
 		unsigned long from =
 			(size + fs->block_size - 1) / fs->block_size;
+
+		/* Drop the cached pages BEFORE the blocks under them go away.
+		 *
+		 * The invalidation used to come twenty lines further down, past
+		 * two inode writes, which left a window in which the file's
+		 * dirty pages referred to blocks the allocator had already
+		 * taken back.  A writeback landing there has two ways to be
+		 * wrong and took both: for a page whose block is gone it finds
+		 * nothing to store, warns, and leaves the page dirty -- so it
+		 * is never reclaimable and the warning repeats for the life of
+		 * the boot ("dirty page ... has no block behind it") -- and for
+		 * one whose block has since been handed to another file, it
+		 * writes this file's bytes into that one.
+		 *
+		 * Nothing is lost by moving it: this path discards the whole
+		 * file's cache either way, only now it does so while the blocks
+		 * still belong to the file. */
+		pagecache_invalidate_file(EXT4_BID_ENC(ef->ino, 0));
 		ext4_free_blocks_from(fs, ef->ino, &in, from);
 	}
 	in.i_size_lo = (uint32_t)size;
@@ -6826,6 +6927,10 @@ static int ext4_unlink_impl(const char *path)
 	if (cin.i_links_count > 0)
 		cin.i_links_count--;
 	if (cin.i_links_count == 0) {
+		/* Cache before blocks -- see ext4_truncate_impl().  An unlinked
+		 * file can still have dirty pages: a writer that closed without
+		 * fsync, or a reader still holding it open. */
+		pagecache_invalidate_file(EXT4_BID_ENC(child, 0));
 		ext4_free_blocks_from(fs, child, &cin, 0);
 		cin.i_dtime = (uint32_t)timer_get_epoch();
 		cin.i_size_lo = 0;
@@ -7160,6 +7265,8 @@ static int ext4_rmdir_impl(const char *path)
 
 	if (ext4_dir_del(fs, parent, name, nl, 0, 0) != ST_OK)
 		return ST_NOT_FOUND;
+	/* Cache before blocks -- see ext4_truncate_impl(). */
+	pagecache_invalidate_file(EXT4_BID_ENC(child, 0));
 	ext4_free_blocks_from(fs, child, &cin, 0);
 	cin.i_links_count = 0;
 	cin.i_size_lo = 0;
@@ -7220,6 +7327,10 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 		if (din.i_links_count > 0)
 			din.i_links_count--;
 		if (din.i_links_count == 0) {
+			/* Cache before blocks -- see ext4_truncate_impl().
+			 * The file being replaced is an ordinary one and may
+			 * well have dirty pages of its own. */
+			pagecache_invalidate_file(EXT4_BID_ENC(dst, 0));
 			ext4_free_blocks_from(fs, dst, &din, 0);
 			din.i_size_lo = 0;
 			din.i_dtime = (uint32_t)timer_get_epoch();

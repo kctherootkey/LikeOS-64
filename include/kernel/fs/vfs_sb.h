@@ -68,6 +68,25 @@ typedef struct vfs_sb_ops {
 	unsigned long (*next_block)(vfs_superblock_t *sb,
 				    unsigned long cur_block);
 
+	/* Map a file's Nth block directly, without walking to it.  OPTIONAL:
+     * null for a filesystem whose blocks can only be reached in order.
+     *
+     * next_block() describes a CHAIN, which is what a FAT is; a filesystem
+     * with a block map (ext4's extent tree) can answer for block N straight
+     * out, and the two answers are not always the same.  A walk has to decide
+     * where the file ends, and it does that from the recorded size -- so a
+     * size that lags the allocation ends the walk short of blocks the file
+     * demonstrably owns.  The map has no such second opinion.
+     *
+     * That matters for writeback, which must not conclude "no block" from a
+     * cache or a length when the filesystem itself can still map the page:
+     * the page is DIRTY, so the alternative to storing it is losing it and
+     * pinning its memory for ever.  Returns a block_id, or 0 if the block
+     * genuinely has nothing behind it (a hole, or past the end).  Called with
+     * lock_map() held shared. */
+	unsigned long (*map_block)(vfs_superblock_t *sb, unsigned long chain_id,
+				   unsigned long block_index);
+
 	/* Persist a dirty inode's metadata to disk.  The driver translates the
      * generic ic_inode_t fields (size, etc.) plus its own fs_private data
      * back into the on-disk inode/dirent layout.  Takes lock_io() as needed
@@ -138,6 +157,17 @@ static inline unsigned long vfs_sb_next_block(vfs_superblock_t *sb,
 					      unsigned long cur)
 {
 	return sb->ops->next_block(sb, cur);
+}
+
+/* 0 when the filesystem cannot map a block directly -- indistinguishable, to
+ * the caller, from "there is no such block", which is the safe reading. */
+static inline unsigned long vfs_sb_map_block(vfs_superblock_t *sb,
+					     unsigned long chain_id,
+					     unsigned long block_index)
+{
+	if (!sb || !sb->ops || !sb->ops->map_block)
+		return 0;
+	return sb->ops->map_block(sb, chain_id, block_index);
 }
 
 static inline int vfs_sb_write_inode(vfs_superblock_t *sb, struct ic_inode *ino)

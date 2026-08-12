@@ -126,7 +126,16 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 
 # Compiler flags for kernel
 BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
+# The kernel runs on the CURRENT task's FPU register file, and that file only
+# reaches the task's save area at the next context switch -- so one
+# compiler-generated XMM move in kernel code silently rewrites a running
+# program's floating-point state, and the corrupted values are what get saved.
+# Interrupt entry already saves XMM0-15, but the syscall path does not, so
+# codegen is kept integer-only here.  fb.c is the one deliberate exception (see
+# its per-file flags below): it uses SSE for the framebuffer blits and brackets
+# them with kernel_fpu_begin()/kernel_fpu_end().
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+			-mno-sse -mno-sse2 -mno-mmx -mno-80387 \
 			-fstack-protector-strong -mstack-protector-guard=tls \
 			-mstack-protector-guard-reg=gs -mstack-protector-guard-offset=104 \
 			-mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
@@ -398,6 +407,12 @@ $(BUILD_DIR)/unicode.o: $(KERNEL_DIR)/io/unicode.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/cursor.o: $(KERNEL_DIR)/io/cursor.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The one file allowed to touch the FPU registers: its SSE blits are the reason
+# the framebuffer keeps up.  Every one of them is wrapped in
+# kernel_fpu_begin()/kernel_fpu_end(), which parks the interrupted task's
+# register file before borrowing it.
+$(BUILD_DIR)/fb.o: KERNEL_CFLAGS += -msse -msse2 -mmmx
 
 $(BUILD_DIR)/fb.o: $(KERNEL_DIR)/dev/video/fb.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@

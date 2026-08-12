@@ -659,6 +659,51 @@ typedef struct task {
 	 * reachable again.  Nothing else can finish the walk on its behalf, so
 	 * while this is set the task stays runnable. */
 	volatile bool in_exit_teardown;
+
+	/* Set the instant the task is declared exited, cleared only when it
+	 * reaches the park loop -- i.e. while it is still EXECUTING its own
+	 * exit path: waking waiters, returning through sys_exit, releasing its
+	 * address space.
+	 *
+	 * has_exited and TASK_ZOMBIE are both set at the TOP of that path, and
+	 * the scheduler read them as "finished" from that instant: the requeue
+	 * path dropped the task for has_exited and every pick site skipped it
+	 * for TASK_ZOMBIE.  A timer tick anywhere in the window therefore
+	 * retired it for good, mid-sched_wake_wait_sleepers(): a zombie that
+	 * had never finished waking its parent, and a parent that waited in
+	 * waitpid() for ever.
+	 *
+	 * waitpid() finds children by has_exited, not by the state, so the task
+	 * may run as READY here without being hidden from the parent -- and
+	 * sched_remove_task() refuses to destroy it while this is set, so being
+	 * reapable mid-exit cannot free the stack it is running on. */
+	volatile bool in_exit_path;
+
+	/* x87/SSE register file, saved and restored across context switches.
+	 *
+	 * Nothing did that before: FXSAVE/FXRSTOR appeared nowhere in the
+	 * kernel, only OSFXSR being set in CR4.  So every task shared one set
+	 * of FPU registers, and a task preempted mid-computation resumed with
+	 * whatever the other task had left in them.  It shows up as a
+	 * DETERMINISTIC arithmetic test failing once in a few hundred runs --
+	 * a long-double round trip, say, where the value changed under the
+	 * program rather than the code being wrong.
+	 *
+	 * FXSAVE needs 16-byte alignment and task_t comes from kalloc, so the
+	 * area is oversized and the aligned start is computed once at init.
+	 * `fpu_state` must be RECOMPUTED for a forked child: the wholesale
+	 * task copy duplicates the pointer, which would leave the child saving
+	 * its registers into its parent's task_t. */
+	uint8_t fpu_area[512 + 16];
+	uint8_t *fpu_state;
+
+	/* Non-zero while `fpu_state` holds the authoritative copy and the
+	 * registers in the CPU are scratch -- set by kernel_fpu_begin().  The
+	 * context switch consults it: saving on top of it would replace the
+	 * task's real values with whatever the kernel left in the registers. */
+	volatile int fpu_saved;
+	/* Nesting depth of kernel_fpu_begin(). */
+	volatile int fpu_kdepth;
 	/* Set when a leader's destruction was postponed because group_ref was
 	 * still non-zero.  Tells the last thread to hand the leader back to
 	 * dead_thread_queue() instead of leaking it. */
@@ -791,6 +836,23 @@ int sched_has_user_tasks(void); // Check if any user tasks are running
 #endif
 
 #if MM_LEAK_INSTRUMENTATION
+/* Give a forked child its own copy of the parent's FPU state. */
+void task_fpu_fork(task_t *child, task_t *parent);
+
+/* Borrow the FPU/SSE registers for kernel code.
+ *
+ * The kernel runs on the CURRENT task's register file, and that file is only
+ * written back to the task's save area at the next context switch -- so a
+ * kernel SSE routine (the framebuffer blits) silently rewrites whatever
+ * floating-point values the interrupted program had live, and the corrupted
+ * values are what get saved.  Bracket any kernel use of these registers.
+ *
+ * Preemption inside the bracket is safe: begin() pushes the task's registers
+ * to its save area and marks it authoritative, so the context switch leaves
+ * that copy alone instead of overwriting it with the kernel's scratch. */
+void kernel_fpu_begin(void);
+void kernel_fpu_end(void);
+
 void sched_dump_task_leaks(void);
 #else
 static inline void sched_dump_task_leaks(void)

@@ -35,6 +35,83 @@
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t **old_sp, uint64_t *new_sp);
 
+/* Point `fpu_state` at the 16-byte-aligned start of the task's own area and
+ * put the register file into the state a fresh thread expects: FXSAVE's
+ * default control word, and every SSE exception masked.  A zeroed area would
+ * mean FCW = 0 and MXCSR = 0, i.e. an invalid control word and every SSE
+ * exception UNMASKED -- the first inexact result would trap. */
+static void task_fpu_init(task_t *t)
+{
+	t->fpu_state = (uint8_t *)(((uintptr_t)t->fpu_area + 15) & ~(uintptr_t)15);
+	t->fpu_saved = 0;
+	t->fpu_kdepth = 0;
+	mm_memset(t->fpu_state, 0, 512);
+	*(uint16_t *)(t->fpu_state + 0) = 0x037F;  /* FCW */
+	*(uint32_t *)(t->fpu_state + 24) = 0x1F80; /* MXCSR */
+}
+
+static inline void task_fpu_save(task_t *t)
+{
+	/* Not while a kernel_fpu_begin() section owns the registers: the save
+	 * area already holds this task's real values and the CPU holds the
+	 * kernel's scratch. */
+	if (t && t->fpu_state && !t->fpu_saved)
+		__asm__ volatile("fxsave (%0)" : : "r"(t->fpu_state) : "memory");
+}
+
+void kernel_fpu_begin(void)
+{
+	task_t *t = sched_current();
+
+	if (!t || !t->fpu_state)
+		return;
+	if (t->fpu_kdepth++ == 0) {
+		__asm__ volatile("fxsave (%0)" : : "r"(t->fpu_state) : "memory");
+		t->fpu_saved = 1;
+	}
+}
+
+void kernel_fpu_end(void)
+{
+	task_t *t = sched_current();
+
+	if (!t || !t->fpu_state || t->fpu_kdepth == 0)
+		return;
+	if (--t->fpu_kdepth == 0) {
+		__asm__ volatile("fxrstor (%0)" : : "r"(t->fpu_state) : "memory");
+		t->fpu_saved = 0;
+	}
+}
+
+/* Give `child` its own copy of `parent`'s live FPU state.
+ *
+ * The wholesale task copy in both fork paths duplicates the POINTER, which
+ * would leave the child saving its registers into its parent's task_t -- so it
+ * is re-aimed at the child's own area here.  The parent's registers are pushed
+ * out first because the live values are in the CPU, not in memory. */
+void task_fpu_fork(task_t *child, task_t *parent)
+{
+	if (!child || !parent)
+		return;
+	child->fpu_state = (uint8_t *)(((uintptr_t)child->fpu_area + 15) &
+				       ~(uintptr_t)15);
+	child->fpu_saved = 0;
+	child->fpu_kdepth = 0;
+	/* Push the parent's live registers out first -- unless a
+	 * kernel_fpu_begin() section already did, in which case the CPU holds
+	 * kernel scratch and the save area is the good copy. */
+	if (!parent->fpu_saved)
+		__asm__ volatile("fxsave (%0)" : : "r"(parent->fpu_state)
+				 : "memory");
+	mm_memcpy(child->fpu_state, parent->fpu_state, 512);
+}
+
+static inline void task_fpu_restore(task_t *t)
+{
+	if (t && t->fpu_state)
+		__asm__ volatile("fxrstor (%0)" : : "r"(t->fpu_state) : "memory");
+}
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
@@ -1235,9 +1312,12 @@ static task_t *rq_requeue_current_locked(percpu_t *cpu, task_t *cur)
 	BUG_ON(cpu == NULL);
 	BUG_ON(cur == NULL);
 
-	/* Still freeing its own address space: it MUST run again, whatever its
-	 * exit state says.  See task->in_exit_teardown. */
-	if (cur->in_exit_teardown) {
+	/* Still inside its own exit path: it MUST run again, whatever its exit
+	 * state says.  READY rather than left as ZOMBIE because rq_enqueue
+	 * refuses anything else -- and waitpid() looks at has_exited, not the
+	 * state, so the parent can still find it.  sched_exit_park() puts the
+	 * state back once the task is genuinely finished. */
+	if (cur->in_exit_path || cur->in_exit_teardown) {
 		if (cur->on_rq || is_idle_task(cur))
 			return NULL;
 		cur->state = TASK_READY;
@@ -1350,6 +1430,8 @@ static void task_init_common(task_t *t)
 	t->group_ref = 0;
 	t->dead_next = NULL;
 	t->in_exit_teardown = false;
+	t->in_exit_path = false;
+	task_fpu_init(t);
 	t->destroy_deferred = false;
 	t->group_exit_code = 0;
 	t->group_exiting = false;
@@ -1704,7 +1786,8 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	// returned immediately, which left zombie/exited tasks stuck as
 	// current_task because the only alternative (e.g. bootstrap, sp=0)
 	// was always rejected.
-	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
+	if (next->sp == 0 ||
+	    (next->state == TASK_ZOMBIE && !next->in_exit_path)) {
 		WARN_ON(next->state == TASK_ZOMBIE &&
 			!is_idle_task(next)); /* zombie dequeued onto CPU */
 		/* Never put a DYING task back on the queue.
@@ -1808,7 +1891,12 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	// If there is already an unprocessed deferred_zombie (e.g. because
 	// fork_child_return skipped the post-switch check), queue it now
 	// to prevent overwriting and leaking it.
-	if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0) {
+	/* Not while it is still executing its exit path: it is a ZOMBIE from the
+	 * first line of that path, but handing it to the reaper here would queue
+	 * a task that still has work to do.  The next switch-away after it parks
+	 * queues it, which is the same place minus the race. */
+	if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0 &&
+	    !prev->in_exit_path) {
 		if (this_cpu()->deferred_zombie) {
 			dead_thread_queue(this_cpu()->deferred_zombie);
 		}
@@ -1832,6 +1920,9 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
+	/* Hand the FPU over with the rest of the context. */
+	task_fpu_save(prev);
+	task_fpu_restore(next);
 	ctx_switch_asm(&prev->sp, next_sp);
 
 	// Resumed on the new task's stack.  Process the deferred zombie BEFORE
@@ -1863,7 +1954,16 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	// an unrecoverable kernel-mode #PF.  Re-enter the scheduler; with
 	// state==ZOMBIE we will be skipped and another task picked.
 	task_t *me = this_cpu()->current_task;
-	if (me && (me->has_exited || me->state == TASK_ZOMBIE)) {
+	/* ...unless it is still EXECUTING that exit path.  This park exists for
+	 * a task that has nothing left to do, and it relies on TASK_ZOMBIE
+	 * making the task unpickable -- which stops being true while
+	 * in_exit_path is set, precisely so the task can finish exiting.  Park
+	 * it here and two things go wrong: it never returns to the exit path it
+	 * was in the middle of, and the loop re-picks the very task it just
+	 * parked, so sched_schedule() calls itself until the kernel stack runs
+	 * into its guard page (#DF with CR2 one word below RSP). */
+	if (me && (me->has_exited || me->state == TASK_ZOMBIE) &&
+	    !me->in_exit_path) {
 		for (;;) {
 			sched_schedule(); /* should never return */
 			/* Interrupts ON across the halt.  A CPU halted with IF
@@ -1930,7 +2030,8 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	}
 
 	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
-	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
+	if (next->sp == 0 ||
+	    (next->state == TASK_ZOMBIE && !next->in_exit_path)) {
 		if (!is_idle_task(next) &&
 		    (next->in_exit_teardown ||
 		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
@@ -1991,7 +2092,12 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 
 	// Save zombie pointer BEFORE the switch.
 	// Flush any leftover deferred_zombie first (see sched_schedule comment).
-	if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0) {
+	/* Not while it is still executing its exit path: it is a ZOMBIE from the
+	 * first line of that path, but handing it to the reaper here would queue
+	 * a task that still has work to do.  The next switch-away after it parks
+	 * queues it, which is the same place minus the race. */
+	if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0 &&
+	    !prev->in_exit_path) {
 		if (this_cpu()->deferred_zombie) {
 			dead_thread_queue(this_cpu()->deferred_zombie);
 		}
@@ -2004,6 +2110,9 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
+	/* Hand the FPU over with the rest of the context. */
+	task_fpu_save(prev);
+	task_fpu_restore(next);
 	ctx_switch_asm(&prev->sp, next_sp);
 
 	// Resumed on the new task's stack.  Process the deferred zombie BEFORE
@@ -2073,6 +2182,7 @@ static void task_trampoline(void)
 	if (cur) {
 		cur->state = TASK_ZOMBIE;
 		cur->has_exited = true;
+		cur->in_exit_path = true;
 	}
 	/* Shared park: releases anything this task still owns, and halts with
 	 * interrupts enabled.  The bare `hlt` this replaces could stop the CPU
@@ -2491,6 +2601,13 @@ __attribute__((noreturn)) void sched_exit_park(void)
 
 	exit_mm_self(me);
 
+	/* Genuinely finished: restore the state the exit path borrowed and let
+	 * the scheduler retire it.  Nothing of this task's own runs again. */
+	if (me) {
+		me->state = TASK_ZOMBIE;
+		me->in_exit_path = false;
+	}
+
 	for (;;) {
 		sched_schedule(); /* should not return */
 		__asm__ volatile("sti; hlt");
@@ -2549,7 +2666,7 @@ void sched_remove_task(task_t *task)
 	 * finish, because in_exit_teardown also keeps the scheduler handing it
 	 * the CPU.  on_dead_queue stays set (it is never cleared), so this
 	 * requeues without letting anything else queue it twice. */
-	if (task->in_exit_teardown) {
+	if (task->in_exit_path || task->in_exit_teardown) {
 		uint64_t tflags;
 
 		spin_lock_irqsave(&g_dead_thread_lock, &tflags);
@@ -2961,6 +3078,8 @@ task_t *sched_fork_current(void)
 	child->mm = NULL; // We're using legacy pml4 field
 	/* Never inherited: the parent is executing fork, not exiting. */
 	child->in_exit_teardown = false;
+	child->in_exit_path = false;
+	task_fpu_fork(child, cur);
 	child->files = NULL; // We're using legacy fd_table
 	child->sighand = NULL; // We're using legacy signals.action
 
@@ -3705,6 +3824,8 @@ void sched_mark_task_exited(task_t *task, int status)
 	// Signal to waitpid and other observers that exit processing is complete.
 	task->has_exited = true;
 	task->state = TASK_ZOMBIE;
+	/* Still executing the rest of this path -- see task->in_exit_path. */
+	task->in_exit_path = true;
 	// NOTE: Do NOT set task->sp = 0 here! The task might still be running
 	// on another CPU and will crash when trying to save context. The zombie
 	// state check in scheduler functions prevents it from being scheduled.
@@ -4346,7 +4467,8 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	}
 
 	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
-	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
+	if (next->sp == 0 ||
+	    (next->state == TASK_ZOMBIE && !next->in_exit_path)) {
 		if (!is_idle_task(next) &&
 		    (next->in_exit_teardown ||
 		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
@@ -4408,7 +4530,12 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	// CRITICAL SMP FIX: Save zombie pointer in per-CPU data BEFORE the switch.
 	// Do NOT queue yet — we are still on prev's kernel stack.
 	// Flush any leftover deferred_zombie first (see sched_schedule comment).
-	if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0) {
+	/* Not while it is still executing its exit path: it is a ZOMBIE from the
+	 * first line of that path, but handing it to the reaper here would queue
+	 * a task that still has work to do.  The next switch-away after it parks
+	 * queues it, which is the same place minus the race. */
+	if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0 &&
+	    !prev->in_exit_path) {
 		if (this_cpu()->deferred_zombie) {
 			dead_thread_queue(this_cpu()->deferred_zombie);
 		}
@@ -4421,6 +4548,9 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
+	/* Hand the FPU over with the rest of the context. */
+	task_fpu_save(prev);
+	task_fpu_restore(next);
 	ctx_switch_asm(&prev->sp, next_sp);
 
 	// Resumed from timer preemption. IF is left at 0 — the interrupt

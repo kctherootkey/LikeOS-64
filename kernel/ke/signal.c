@@ -586,6 +586,38 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	cpu->syscall_saved_user_rip =
 		handler; // captured before SA_RESETHAND reset above
 
+	/* Republish the WHOLE return context, not just the two fields this
+	 * function changes.
+	 *
+	 * syscall.asm's .signal_return path builds the handler's context out of
+	 * per-CPU slots -- RFLAGS into R11 for sysret, and the callee-saved
+	 * registers.  Those slots were written by syscall_entry on whichever
+	 * CPU the call arrived on, and the syscall body then ran with
+	 * interrupts ENABLED: any other task's syscall on that CPU overwrites
+	 * them, and a task that migrated reads the slots of a CPU that knows
+	 * nothing about it.  Only RSP and RIP were being refreshed here, so the
+	 * handler was entered with whatever RFLAGS and callee-saved registers
+	 * happened to be lying in the slot.
+	 *
+	 * When that stale RFLAGS was zero -- a CPU that had not served a
+	 * syscall yet -- the handler ran with IF CLEAR, because sysret takes
+	 * RFLAGS from R11 verbatim.  User code with interrupts disabled cannot
+	 * be preempted and takes every fault with IRQs off, which is the
+	 * "USER RIP ... with interrupts disabled (rflags=10002)" report and the
+	 * might_sleep() storm behind it: 0x10002 is exactly RF (set by the CPU
+	 * on the fault) plus the mandatory bit, i.e. a zero RFLAGS.
+	 *
+	 * task->syscall_* is the trustworthy copy: syscall_handler_inner
+	 * snapshots the per-CPU values into it BEFORE enabling interrupts. */
+	cpu->syscall_saved_user_rflags =
+		user_rflags_sanitize(task->syscall_rflags);
+	cpu->syscall_saved_user_rbp = task->syscall_rbp;
+	cpu->syscall_saved_user_rbx = task->syscall_rbx;
+	cpu->syscall_saved_user_r12 = task->syscall_r12;
+	cpu->syscall_saved_user_r13 = task->syscall_r13;
+	cpu->syscall_saved_user_r14 = task->syscall_r14;
+	cpu->syscall_saved_user_r15 = task->syscall_r15;
+
 	// Set signal pending flag - this tells syscall.asm to use signal return path
 	// The value is the signal number which will be loaded into RDI
 	// NOTE: Interrupts remain disabled until after sysret in syscall.asm
@@ -850,13 +882,26 @@ int signal_restore_frame(task_t *task)
  * the stopped child). */
 void signal_notify_jobctl(task_t *task, int signum, int stopped)
 {
-	if (stopped) {
+	/* Record this event WITHOUT erasing the other one.
+	 *
+	 * These are two independent pending reports, and waitpid() clears each
+	 * as it delivers it -- so clearing the opposite one here does not tidy
+	 * up, it destroys an event nobody has seen yet.
+	 *
+	 * A continue is announced TWICE: eagerly by the killer in
+	 * sched_signal_task(), and again by the target when it processes the
+	 * pending SIGCONT.  That second announcement can land after a LATER
+	 * stop has already been recorded -- the target's SIG_DFL_CONT case is
+	 * guarded by `state == TASK_STOPPED`, which a SIGTSTP arriving in
+	 * between has just made true again -- and it then wiped the fresh
+	 * SIGTSTP out of jc_stop_signo.  waitpid(WUNTRACED) had nothing to
+	 * report for a child that really had stopped: the
+	 * "SIGTSTP stop reported via WUNTRACED" case, roughly one run in a
+	 * hundred. */
+	if (stopped)
 		task->jc_stop_signo = signum;
-		task->jc_continued = 0;
-	} else {
+	else
 		task->jc_continued = 1;
-		task->jc_stop_signo = 0;
-	}
 	task_t *parent = task->parent;
 	if (!parent || parent->has_exited)
 		return;
