@@ -2670,13 +2670,31 @@ task_t *sched_fork_current(void)
 
 	/* The copy above duplicated the POINTER to the parent's region table,
 	 * not the table.  Give the child its own with the parent's contents --
-	 * otherwise the two share one allocation and both free it. */
-	if (!mm_regions_clone(child, cur)) {
+	 * otherwise the two share one allocation and both free it.
+	 *
+	 * Take it from the OWNER: a CLONE_VM thread holds an empty table by
+	 * design (its lookups route to the group leader), so forking from one
+	 * copied nothing and the child died on its first lazy page. */
+	task_t *mm_src = task_mm_owner(cur);
+
+	if (!mm_regions_clone(child, mm_src)) {
 		mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
 		mm_destroy_address_space(child_pml4);
 		kfree(child);
 		return NULL;
 	}
+
+	/* The rest of the leader-only address-space state, from the same
+	 * place: a thread's own copies are stale by design, and the child is
+	 * about to become an owner in its own right. */
+	child->brk_start = mm_src->brk_start;
+	child->brk = mm_src->brk;
+	child->mmap_base = mm_src->mmap_base;
+
+	/* Fresh address space, fresh lock -- the copy took the parent's, which
+	 * another thread in the group may have held at that instant. */
+	mm_rwsem_init(&child->mmap_lock, "mmap_lock");
+	child->mm_rdepth = 0;
 
 	/* Fresh kernel-stack canary: the wholesale copy above duplicated the
 	 * parent's.  The child's kernel context is only the hand-built

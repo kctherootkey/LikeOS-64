@@ -6422,13 +6422,40 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * its bookkeeping is owner-routed to the group leader and it must hold
 	 * no references of its own -- while a fork child gets a copy of the
 	 * parent's.  Sharing the pointer would have the two free one
-	 * allocation twice. */
+	 * allocation twice.
+	 *
+	 * Clone from the OWNER, not from the calling thread.  Because a
+	 * CLONE_VM thread keeps an empty table on purpose, forking FROM one
+	 * copied nothing: the child came up with no regions at all and died on
+	 * its first write to a lazy page, with no region to explain the
+	 * address.  Only a threaded program could hit it -- forking from a
+	 * single-threaded one, the caller IS the owner. */
+	task_t *mm_src = task_mm_owner(cur);
+
 	if (share_vm ? !mm_regions_init(child) :
-		       !mm_regions_clone(child, cur)) {
+		       !mm_regions_clone(child, mm_src)) {
 		mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
 		kfree(child);
 		return -ENOMEM;
 	}
+
+	/* The rest of the leader-only address-space state, for the same reason
+	 * and from the same place.  A thread's own copies of these are stale by
+	 * design; a fork child becomes its own owner and must start from the
+	 * values that were actually in use. */
+	if (!share_vm) {
+		child->brk_start = mm_src->brk_start;
+		child->brk = mm_src->brk;
+		child->mmap_base = mm_src->mmap_base;
+	}
+
+	/* A fresh address space needs a fresh lock.  The wholesale copy took
+	 * the parent's, which another thread in the group may have been
+	 * holding at that instant -- inherited locked, it would wedge the
+	 * child on its first fault.  (A thread's own copy is never used, so
+	 * resetting it unconditionally costs nothing.) */
+	mm_rwsem_init(&child->mmap_lock, "mmap_lock");
+	child->mm_rdepth = 0;
 
 	/* Fresh kernel-stack canary — same rationale as sched_fork_current:
 	 * the wholesale copy duplicated the parent's canary; the child's only

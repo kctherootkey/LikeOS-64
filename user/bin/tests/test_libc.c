@@ -5236,6 +5236,106 @@ static int tsd_wait_for(int target)
 	return tsd_dtor_calls >= target;
 }
 
+/* fork() from a NON-MAIN thread, then fault a page the parent never touched.
+ *
+ * The address-space bookkeeping -- region table, brk, mmap_base -- lives on the
+ * thread-group leader, and a thread deliberately keeps an EMPTY region table of
+ * its own because its lookups are routed to the leader.  fork() used to copy
+ * that state from the CALLING task, so forking from a thread handed the child
+ * no regions at all: its first write to a lazy page found nothing to explain
+ * the address and it died with SIGSEGV before it could exec.  A single-threaded
+ * fork never showed it, because there the caller IS the leader.
+ *
+ * That is why the file manager could not start its menu daemon: the fork came
+ * from a worker thread, so the child died every time.
+ */
+#define FORKPAGE_LEN (256 * 1024)
+
+static void *forkpage_region;
+static volatile int forkpage_status = -1;
+
+static void *forkpage_worker(void *arg)
+{
+	pid_t pid;
+	int status = 0;
+	(void)arg;
+
+	pid = fork();
+	if (pid == 0) {
+		/* Child: only syscalls from here on -- the other threads are
+		 * gone and their locks are not ours to take.  Write across a
+		 * mapping the parent made but never touched, so every page has
+		 * to be demand-faulted through the inherited region table. */
+		volatile char *p = (volatile char *)forkpage_region;
+		size_t i;
+
+		for (i = 0; i < FORKPAGE_LEN; i += 4096)
+			p[i] = (char)(i >> 12);
+		for (i = 0; i < FORKPAGE_LEN; i += 4096)
+			if (p[i] != (char)(i >> 12))
+				_exit(3);
+
+		/* And a fresh mapping of its own, which exercises the child's
+		 * region table for insertions rather than inheritance. */
+		{
+			char *q = mmap(NULL, FORKPAGE_LEN,
+				       PROT_READ | PROT_WRITE,
+				       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (q == MAP_FAILED)
+				_exit(4);
+			for (i = 0; i < FORKPAGE_LEN; i += 4096)
+				q[i] = 1;
+		}
+		_exit(0);
+	}
+	if (pid < 0)
+		return NULL;
+
+	if (waitpid(pid, &status, 0) == pid)
+		forkpage_status = status;
+	return NULL;
+}
+
+static void test_fork_from_thread(void)
+{
+	pthread_t t;
+	int status;
+
+	printf("\n[TEST] fork() from a thread inherits the address space\n");
+
+	/* Mapped by the MAIN thread and deliberately left untouched: the pages
+	 * exist only as a region until somebody writes to them. */
+	forkpage_region = mmap(NULL, FORKPAGE_LEN, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (forkpage_region == MAP_FAILED) {
+		test_result("mapped a region for the fork test", 0);
+		return;
+	}
+
+	forkpage_status = -1;
+	if (pthread_create(&t, NULL, forkpage_worker, NULL) != 0) {
+		test_result("thread for the fork test started", 0);
+		return;
+	}
+	pthread_join(t, NULL);
+
+	status = forkpage_status;
+	if (status < 0) {
+		test_result("child of a thread's fork was reaped", 0);
+		return;
+	}
+	if (WIFSIGNALED(status))
+		printf("  child was killed by signal %d\n", WTERMSIG(status));
+	else if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+		printf("  child exited %d (2=map 3=readback 4=child mmap)\n",
+		       WEXITSTATUS(status));
+
+	test_result("child survives faulting a lazy page",
+		    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	munmap(forkpage_region, FORKPAGE_LEN);
+}
+
 static void test_tsd_destructors(void)
 {
 	pthread_t t;
@@ -22158,6 +22258,7 @@ network_skip:;
 	test_timeout_accuracy();
 	test_fd_marker_syscalls();
 	test_tsd_destructors();
+	test_fork_from_thread();
 	test_lock_contention();
 	test_orphan_reaping();
 	test_printf_conversions();
