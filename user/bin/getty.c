@@ -63,11 +63,34 @@ int main(int argc, char *argv[])
 	/* New session so we can claim the terminal as our controlling tty. */
 	setsid();
 
-	fd = open(tty, O_RDWR);
+	/* Open the terminal, retrying briefly.
+	 *
+	 * This used to fall back to "whatever stdin already is" -- but init
+	 * points its children's stdio at /dev/null before spawning us, so the
+	 * fallback handed the user a login session whose terminal was
+	 * /dev/null.  Reads and writes there quietly succeed, so the prompt
+	 * and the shell looked normal; anything that actually needs a terminal
+	 * did not.  isatty() is false on /dev/null, so tcgetattr() fails and a
+	 * terminal multiplexer reports "open terminal failed: not a terminal"
+	 * -- for a session that never had one.
+	 *
+	 * A getty without its terminal cannot do its job, so retry (the device
+	 * may simply not be ready yet this early) and, failing that, exit and
+	 * let init respawn us rather than run a session that only looks right.
+	 */
+	for (int try = 0; try < 50; try++) {
+		fd = open(tty, O_RDWR);
+		if (fd >= 0)
+			break;
+		usleep(100000); /* 100ms; 5s total */
+	}
 	if (fd < 0) {
-		/* Fall back to whatever stdin already is. */
-		fd = 0;
-	} else {
+		/* stderr is /dev/null here, so this is for a serial console. */
+		fprintf(stderr, "getty: cannot open %s: %s\n", tty,
+			strerror(errno));
+		return 1;
+	}
+	{
 		ioctl(fd, TIOCSCTTY, 0);
 		dup2(fd, 0);
 		dup2(fd, 1);

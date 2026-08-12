@@ -162,9 +162,15 @@ static uint64_t g_loadavg_last_tick = 0;
 // because the thread is still running on its own kernel stack.  Instead, after
 // every context switch we check if the previous task was a zombie thread and
 // free it — by that point we've switched to a different stack and it's safe.
-#define DEAD_THREAD_MAX 64
-static task_t *g_dead_threads[DEAD_THREAD_MAX];
-static volatile int g_dead_thread_count = 0;
+#if MM_LEAK_INSTRUMENTATION
+/* Tasks the kernel gave up on rather than risk corruption.  Counted because
+ * every one of them keeps a whole address space alive, and the warning that
+ * accompanies it scrolls off a busy console long before anyone looks. */
+static volatile unsigned long g_leak_still_running;
+#endif
+
+static task_t *g_dead_head; /* intrusive LIFO, linked by task->dead_next */
+static volatile int g_dead_thread_count = 0; /* fast-path hint + diagnostics */
 static spinlock_t g_dead_thread_lock = SPINLOCK_INIT("dead_threads");
 
 // Bootstrap and BSP idle tasks (statically allocated)
@@ -408,18 +414,17 @@ static void dead_thread_queue(task_t *task)
 		spin_unlock_irqrestore(&g_dead_thread_lock, flags);
 		return;
 	}
-	if (g_dead_thread_count < DEAD_THREAD_MAX) {
-		g_dead_threads[g_dead_thread_count++] = task;
-		task->on_dead_queue = true;
-	} else {
-		// Overflow – shouldn't happen unless many threads exit simultaneously.
-		// Drop on the floor; leak is better than corruption.
-		WARN_ON_ONCE(
-			g_dead_thread_count >=
-			DEAD_THREAD_MAX); /* dead_thread_queue overflow: too many threads exiting simultaneously */
-		kprintf("WARN: dead_thread_queue overflow (pid %d dropped)\n",
-			task->id);
-	}
+	/* The list is threaded through the tasks themselves, so there is no
+	 * capacity to exceed.  This was a 64-entry array that DROPPED anything
+	 * past the end -- and a dropped task never reached sched_remove_task,
+	 * so it never dropped its leader's group_ref, so that leader stayed
+	 * "destroy_deferred" with its entire address space intact for the rest
+	 * of the boot.  Two stress runs exiting threads in parallel overflowed
+	 * it steadily; the memory went out in whole processes at a time. */
+	task->dead_next = g_dead_head;
+	g_dead_head = task;
+	g_dead_thread_count++;
+	task->on_dead_queue = true;
 	spin_unlock_irqrestore(&g_dead_thread_lock, flags);
 }
 
@@ -443,6 +448,46 @@ void sched_defer_reap(task_t *child)
 	dead_thread_queue(child);
 }
 
+#if MM_LEAK_INSTRUMENTATION
+/* What is holding address spaces that should be gone.
+ *
+ * A leader whose destruction is postponed keeps EVERYTHING -- its address
+ * space, its stacks, its page tables -- until the last thread releases its
+ * group_ref.  If a thread never reaches destruction that wait never ends, and
+ * the memory is unreachable but never freed.  Nothing distinguishes that from
+ * a healthy idle system except these numbers.
+ */
+void sched_dump_task_leaks(void)
+{
+	unsigned long tasks = 0, zombies = 0, deferred = 0, deferred_refs = 0;
+	unsigned long exited = 0;
+	uint64_t flags;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		tasks++;
+		if (t->state == TASK_ZOMBIE)
+			zombies++;
+		if (t->has_exited)
+			exited++;
+		if (t->destroy_deferred) {
+			deferred++;
+			deferred_refs += (unsigned long)t->group_ref;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	kprintf("=== task teardown ===\n");
+	kprintf("  tasks on the list: %lu (%lu zombie, %lu exited)\n", tasks,
+		zombies, exited);
+	kprintf("  leaders waiting on threads (destroy_deferred): %lu, holding %lu group refs\n",
+		deferred, deferred_refs);
+	kprintf("  tasks abandoned as still-running: %lu\n",
+		g_leak_still_running);
+	kprintf("  dead-task queue depth: %d\n", g_dead_thread_count);
+}
+#endif /* MM_LEAK_INSTRUMENTATION */
+
 // Reap all dead threads.  Called AFTER ctx_switch_asm when we are safely on a
 // different kernel stack and can free the previous thread's stack.
 static void dead_thread_reap(void)
@@ -450,14 +495,12 @@ static void dead_thread_reap(void)
 	if (g_dead_thread_count == 0)
 		return; // Fast path – no lock needed
 
-	task_t *batch[DEAD_THREAD_MAX];
-	int count;
+	task_t *list;
 
 	uint64_t flags;
 	spin_lock_irqsave(&g_dead_thread_lock, &flags);
-	count = g_dead_thread_count;
-	for (int i = 0; i < count; i++) {
-		batch[i] = g_dead_threads[i];
+	list = g_dead_head;
+	g_dead_head = NULL;
 		/* on_dead_queue stays TRUE for the whole destruction.  It used
          * to be cleared here, which reopened the exact double-free the
          * flag exists to prevent: between this unlock and the kfree in
@@ -472,11 +515,16 @@ static void dead_thread_reap(void)
          * pthread teststress).  Destruction is guaranteed from here, so
          * every later queue attempt must be a no-op; the flag is never
          * cleared again — the task_t is about to cease to exist. */
-	}
 	g_dead_thread_count = 0;
 	spin_unlock_irqrestore(&g_dead_thread_lock, flags);
 
-	for (int i = 0; i < count; i++) {
+	while (list) {
+		task_t *dead = list;
+
+		/* Read the link BEFORE destruction: sched_remove_task frees the
+		 * task_t this points into. */
+		list = dead->dead_next;
+		dead->dead_next = NULL;
 		/* If sched_mark_task_exited had to defer fd-closing because it
          * was called from IRQ context (signal_deliver_irq dispatching
          * SIG_DFL_TERM from the timer ISR — pagecache_flush_file would
@@ -485,7 +533,7 @@ static void dead_thread_reap(void)
          * paths in sched_schedule / sched_run_ready / sched_preempt
          * after ctx_switch_asm, when we're back on a normal task's
          * stack with IRQs enabled — sleeping is legal here. */
-		if (batch[i]) {
+		if (dead) {
 			/* If the task was killed while holding a filesystem-private
              * sleeping lock (e.g. SIGINT on curl while it was sleeping
              * inside fat32_write_impl, waiting on a USB MSD completion —
@@ -496,14 +544,14 @@ static void dead_thread_reap(void)
              * the next fat32_close → pagecache_flush_file blocks forever
              * and every subsequent FS op (including execve reading
              * /bin/<cmd>) hangs. */
-			vfs_release_locks_for_task(batch[i]->id);
+			vfs_release_locks_for_task(dead->id);
 
-			if (batch[i]->fds_pending_close) {
-				batch[i]->fds_pending_close = false;
-				task_close_open_files(batch[i]);
+			if (dead->fds_pending_close) {
+				dead->fds_pending_close = false;
+				task_close_open_files(dead);
 			}
 		}
-		sched_remove_task(batch[i]);
+		sched_remove_task(dead);
 	}
 }
 
@@ -896,6 +944,31 @@ static int rq_try_unlink_locked(percpu_t *cpu, task_t *task)
 
 // Remove a specific task from any run queue it might be on.
 // Acquires the appropriate CPU's runqueue_lock.
+/* Unlink `task` from every run queue, whatever on_rq claims.
+ *
+ * rq_remove() trusts on_rq and returns immediately when it is clear -- fine for
+ * the ordinary paths, wrong for destruction.  A CPU that has just dequeued a
+ * task has already cleared on_rq while still holding the pointer, and may put
+ * it back (see the sp == 0 refusal).  Freeing on the strength of on_rq alone
+ * therefore freed a task that was, or was about to be, linked.  Destruction
+ * pays the full scan instead: it happens once per task and it is the only
+ * moment where being wrong is unrecoverable. */
+static void rq_remove_force(task_t *task)
+{
+	if (!task)
+		return;
+	for (uint32_t i = 0; i < MAX_CPUS; i++) {
+		percpu_t *p = percpu_get(i);
+		uint64_t flags;
+
+		if (!p)
+			continue;
+		spin_lock_irqsave(&p->runqueue_lock, &flags);
+		(void)rq_try_unlink_locked(p, task);
+		spin_unlock_irqrestore(&p->runqueue_lock, flags);
+	}
+}
+
 static void rq_remove(task_t *task)
 {
 	if (!task->on_rq)
@@ -1162,6 +1235,18 @@ static task_t *rq_requeue_current_locked(percpu_t *cpu, task_t *cur)
 	BUG_ON(cpu == NULL);
 	BUG_ON(cur == NULL);
 
+	/* Still freeing its own address space: it MUST run again, whatever its
+	 * exit state says.  See task->in_exit_teardown. */
+	if (cur->in_exit_teardown) {
+		if (cur->on_rq || is_idle_task(cur))
+			return NULL;
+		cur->state = TASK_READY;
+		if (cur->on_cpu == cpu->cpu_id) {
+			rq_enqueue_locked(cpu, cur);
+			return NULL;
+		}
+		return cur;
+	}
 	if (cur->has_exited || is_idle_task(cur) || cur->on_rq)
 		return NULL;
 	if (cur->state != TASK_READY && cur->state != TASK_RUNNING)
@@ -1263,6 +1348,8 @@ static void task_init_common(task_t *t)
 	t->thread_group_prev = t;
 	t->nr_threads = 1;
 	t->group_ref = 0;
+	t->dead_next = NULL;
+	t->in_exit_teardown = false;
 	t->destroy_deferred = false;
 	t->group_exit_code = 0;
 	t->group_exiting = false;
@@ -1620,7 +1707,30 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
 		WARN_ON(next->state == TASK_ZOMBIE &&
 			!is_idle_task(next)); /* zombie dequeued onto CPU */
-		if (!is_idle_task(next) && next->state != TASK_ZOMBIE) {
+		/* Never put a DYING task back on the queue.
+		 *
+		 * This path dequeues a task, finds it committed to another CPU
+		 * (sp == 0) and re-queues it so its owner can finish.  But
+		 * dequeuing cleared on_rq, and sched_remove_task only unlinks
+		 * `if (task->on_rq)` -- so a destruction landing in that window
+		 * skipped the unlink, freed the task_t, and this line then
+		 * linked the freed, poisoned struct back into the run queue.
+		 * The next switch to it loaded the poison into CR3:
+		 *   set_cr3(0xfeedface...) -> #GP in mm_switch_address_space.
+		 * It is also what leaves a queue holding something that can
+		 * never be resumed -- the "pid N stuck unrunnable (sp=0)"
+		 * report, printed against a task_t that no longer exists.
+		 *
+		 * Only `on_dead_queue` may be refused: that task has been handed
+		 * to the reaper and will never run again.  A task that has
+		 * merely set has_exited is NOT finished -- it still has to run
+		 * sched_notify_parent_of_exit and reach the scheduling tail.
+		 * Refusing those stranded them mid-exit: a leader sat ZOMBIE
+		 * with nr_threads 0 and its parent blocked in waitpid for
+		 * ever. */
+		if (!is_idle_task(next) &&
+		    (next->in_exit_teardown ||
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
 		}
@@ -1821,7 +1931,9 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 
 	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
 	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
-		if (!is_idle_task(next) && next->state != TASK_ZOMBIE) {
+		if (!is_idle_task(next) &&
+		    (next->in_exit_teardown ||
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
 		}
@@ -2323,10 +2435,35 @@ void exit_mm_self(task_t *task)
 	 * while the walk below frees the rest. */
 	mm_switch_address_space(g_kernel_pml4);
 
-	if (mm)
+	/* From here to the end of the walk the scheduler must keep handing
+	 * this task the CPU, or the teardown stops half-done. */
+	task->in_exit_teardown = true;
+
+	if (mm) {
+		/* The shared record owns ONE address space.  This task's own
+		 * root is normally the same tables -- but if it is not, this is
+		 * the last reference to them in existence: both fields were
+		 * cleared above, so nothing downstream (not even
+		 * sched_remove_task, which makes the same check) can ever see
+		 * it again.  Dropping it here silently loses the whole address
+		 * space: its pages, its stacks and its page tables. */
+		uint64_t *shared = mm->pml4;
+
+		MM_LEAK_INC(g_as_destroy_exit_self);
+		MM_LEAK_INC(g_as_exit_self_mm);
 		mm_struct_put(mm);
-	else
+		if (pml4 && pml4 != shared) {
+			WARN(1, "task %d: pml4 %p is not the mm_struct's %p - freeing it here or it is lost",
+			     task->id, (void *)pml4, (void *)shared);
+			mm_destroy_address_space(pml4);
+		}
+	} else {
+		MM_LEAK_INC(g_as_destroy_exit_self);
+		MM_LEAK_INC(g_as_exit_self_own);
 		mm_destroy_address_space(pml4);
+	}
+
+	task->in_exit_teardown = false;
 }
 
 /*
@@ -2399,6 +2536,30 @@ void sched_remove_task(task_t *task)
 		spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
 	}
 
+	/* Still inside its own address-space teardown.
+	 *
+	 * The "is it running" test below only asks whether the task is
+	 * current_task on some CPU -- and a task PREEMPTED in the middle of
+	 * mm_destroy_address_space() is not: it sits on a run queue waiting to
+	 * finish the walk.  Freeing it here takes its kernel stack out from
+	 * under that walk and abandons whatever it had not yet released, which
+	 * is the same leak as before, just through a narrower window.
+	 *
+	 * Put it back on the dead list instead; the walk is guaranteed to
+	 * finish, because in_exit_teardown also keeps the scheduler handing it
+	 * the CPU.  on_dead_queue stays set (it is never cleared), so this
+	 * requeues without letting anything else queue it twice. */
+	if (task->in_exit_teardown) {
+		uint64_t tflags;
+
+		spin_lock_irqsave(&g_dead_thread_lock, &tflags);
+		task->dead_next = g_dead_head;
+		g_dead_head = task;
+		g_dead_thread_count++;
+		spin_unlock_irqrestore(&g_dead_thread_lock, tflags);
+		return;
+	}
+
 	// SMP SAFETY: If the task is currently executing on another CPU, we must
 	// wait for it to stop before freeing its resources (especially kernel stack).
 	// This can happen when killing a task that's running on a different CPU.
@@ -2438,6 +2599,7 @@ void sched_remove_task(task_t *task)
 		}
 
 		if (retries >= max_retries) {
+			MM_LEAK_INC(g_leak_still_running);
 			kprintf("sched_remove_task: WARNING: task %d still running after %d retries\n",
 				task->id, max_retries);
 			// SAFETY: Do NOT proceed with destruction!  The task's PML4 may
@@ -2456,9 +2618,10 @@ void sched_remove_task(task_t *task)
 	// Reparent children to init
 	sched_reparent_children(task);
 
-	// Remove from per-CPU run queue
-	if (task->on_rq)
-		rq_remove(task);
+	/* Remove from every per-CPU run queue.  Unconditional on purpose --
+	 * see rq_remove_force(): on_rq is a hint that a concurrent dequeue can
+	 * have cleared while the task is still reachable. */
+	rq_remove_force(task);
 
 	/* If sched_mark_task_exited deferred fd-closing because it was called
      * from IRQ context (signal_deliver_irq dispatching SIG_DFL_TERM from
@@ -2505,13 +2668,30 @@ void sched_remove_task(task_t *task)
 	// The spin-wait above guarantees the task is no longer running on any
 	// CPU, so no CR3 register still references this PML4.
 	if (task->mm) {
+		/* The shared record owns ONE address space.  If this task's own
+		 * root is a different one, dropping the pointer here is the
+		 * last chance anybody had to free it -- and this branch used to
+		 * drop it unconditionally, on the assumption that ->pml4 and
+		 * ->mm->pml4 always name the same tables.  Where they did not,
+		 * a whole address space -- its pages, its stacks, its page
+		 * tables -- was left with nothing pointing at it and no way to
+		 * reach it.  Assert the assumption rather than trust it. */
+		uint64_t *own = task->pml4;
+		uint64_t *shared = task->mm->pml4;
+
 		mm_struct_put(task->mm);
 		task->mm = NULL;
-		task->pml4 = NULL; // PML4 was owned by mm_struct
+		task->pml4 = NULL; // the shared record owned `shared`
+		if (own && own != shared) {
+			WARN(1, "task %d: pml4 %p was not the mm_struct's %p - freeing it here or it is lost",
+			     task->id, (void *)own, (void *)shared);
+			mm_destroy_address_space(own);
+		}
 	}
 
 	// Destroy address space (legacy path — tasks without mm_struct)
 	if (task->pml4) {
+		MM_LEAK_INC(g_as_destroy_remove_task);
 		mm_destroy_address_space(task->pml4);
 		task->pml4 = NULL;
 	}
@@ -2555,14 +2735,15 @@ void sched_remove_task(task_t *task)
 					 * That call now finds group_ref at zero
 					 * and destroys it; queuing it a second
 					 * time here would destroy it twice. */
-				} else if (g_dead_thread_count <
-					   DEAD_THREAD_MAX) {
-					g_dead_threads[g_dead_thread_count++] =
-						ldr;
-					ldr->on_dead_queue = true;
 				} else {
-					kprintf("WARN: dead_thread_queue overflow (leader pid %d leaked)\n",
-						ldr->id);
+					/* Same list, same reason it can no
+					 * longer overflow: dropping a leader
+					 * here leaked its whole address
+					 * space. */
+					ldr->dead_next = g_dead_head;
+					g_dead_head = ldr;
+					g_dead_thread_count++;
+					ldr->on_dead_queue = true;
 				}
 			}
 			spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
@@ -2778,6 +2959,8 @@ task_t *sched_fork_current(void)
 
 	// Shared structures: fork creates independent copies
 	child->mm = NULL; // We're using legacy pml4 field
+	/* Never inherited: the parent is executing fork, not exiting. */
+	child->in_exit_teardown = false;
 	child->files = NULL; // We're using legacy fd_table
 	child->sighand = NULL; // We're using legacy signals.action
 
@@ -4164,7 +4347,9 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 
 	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
 	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
-		if (!is_idle_task(next) && next->state != TASK_ZOMBIE) {
+		if (!is_idle_task(next) &&
+		    (next->in_exit_teardown ||
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
 		}
@@ -4725,6 +4910,7 @@ mm_struct_t *mm_struct_create(uint64_t *pml4)
 	if (!mm)
 		return NULL;
 
+	MM_LEAK_INC(g_mm_created);
 	mm->pml4 = pml4;
 	mm->refcount = 1;
 	spinlock_init(&mm->lock, "mm");
@@ -4826,6 +5012,7 @@ void mm_struct_put(mm_struct_t *mm)
 		if (mm->mmap_regions) {
 			kfree(mm->mmap_regions);
 		}
+		MM_LEAK_INC(g_mm_freed);
 		kfree(mm);
 	}
 }

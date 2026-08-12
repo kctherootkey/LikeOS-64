@@ -130,11 +130,44 @@ static inline uint64_t page_to_index(uint64_t phys_addr);
 #define HEAP_MAGIC_HEADER 0xABCDEF12
 
 // Memory management state
+/* ==========================================================================
+ * Leak-hunt instrumentation (DEBUG builds only)
+ *
+ * Records which call site allocated each physical page, and tracks every live
+ * address space by its creator, so "memory is disappearing" can be answered
+ * with a name instead of a guess.  It found the exit-teardown leak after four
+ * wrong guesses had been made without it.
+ *
+ * Costs, and why it is not on by default: 4 bytes of RAM per physical page for
+ * the owner table (~4 MB on a 4 GB machine), a 64 KB registry, and a lock
+ * acquisition on every address-space create and destroy.
+ *
+ * Build with `make DEBUG=1` and read it with `memstat -o`.
+ * ========================================================================== */
+#ifndef MM_LEAK_INSTRUMENTATION
+#define MM_LEAK_INSTRUMENTATION DEBUG
+#endif
+
 static struct {
 	// Physical memory management
 	uint32_t *physical_bitmap; // Bitmap for physical pages
-	uint64_t total_pages; // Total number of pages
+	uint64_t total_pages; // Pages SPANNED by the managed range (incl. holes)
 	uint64_t free_pages; // Number of free pages
+	/* Pages of real RAM under management, i.e. the span above minus the
+	 * holes in it.  Physical memory is not one run: firmware leaves a PCI
+	 * hole below 4 GB and continues RAM above it, so the span is far bigger
+	 * than the RAM in it and is the wrong thing to report or subtract
+	 * from. */
+	uint64_t usable_pages;
+	/* Who allocated each page: the low 32 bits of the return address of the
+	 * mm_allocate_physical_page() caller.  Pure diagnostics -- when memory
+	 * drains and every process is gone, the only useful question is which
+	 * code path is still holding it, and guessing at that has a poor record.
+	 * 4 bytes per page, ~0.1% of RAM. */
+#if MM_LEAK_INSTRUMENTATION
+	uint32_t *page_owner;
+	uint64_t owner_array_size;
+#endif
 	uint64_t bitmap_size; // Size of bitmap in bytes
 	uint64_t memory_start; // Start of manageable memory
 	uint64_t memory_end; // End of manageable memory
@@ -159,6 +192,28 @@ static struct {
 	// Statistics
 	memory_stats_t stats; // Memory statistics
 } mm_state = { 0 };
+
+#if MM_LEAK_INSTRUMENTATION
+#define LEAK_INC(v) __sync_fetch_and_add(&(v), 1)
+#define LEAK_ADD(v, n) __sync_fetch_and_add(&(v), (unsigned long)(n))
+#define PAGE_OWNER_SET(pg, ra)                                   \
+	do {                                                     \
+		if (mm_state.page_owner)                         \
+			mm_state.page_owner[pg] = (uint32_t)(uintptr_t)(ra); \
+	} while (0)
+#define AS_TRACK_ADD(phys, creator) as_track_add((phys), (creator))
+#define AS_TRACK_DEL(phys) as_track_del(phys)
+#define AS_TRACK_RETAG(phys, creator) as_track_retag((phys), (creator))
+#else
+#define LEAK_INC(v) do { } while (0)
+#define LEAK_ADD(v, n) do { } while (0)
+#define PAGE_OWNER_SET(pg, ra) do { } while (0)
+#define AS_TRACK_ADD(phys, creator) do { } while (0)
+#define AS_TRACK_DEL(phys) do { } while (0)
+#define AS_TRACK_RETAG(phys, creator) do { } while (0)
+#endif
+
+
 
 // UEFI memory map storage - saved from boot_info for later use
 static memory_map_info_t g_uefi_memory_map = { 0 };
@@ -481,6 +536,7 @@ static void mark_usable_uefi_regions(void)
 		// Fallback: mark all as free (old behavior)
 		mm_memset(mm_state.physical_bitmap, 0, mm_state.bitmap_size);
 		mm_state.free_pages = mm_state.total_pages;
+		mm_state.usable_pages = mm_state.total_pages;
 		return;
 	}
 
@@ -537,8 +593,15 @@ static void mark_usable_uefi_regions(void)
 		}
 	}
 
-	kprintf("  Marked %lu pages as free from UEFI usable regions\n",
-		pages_marked_free);
+	/* Everything just marked free IS the RAM in the managed range; the rest
+	 * of the span is holes.  Reservations below take pages back out of
+	 * free_pages without changing this, which is what makes "used" mean
+	 * "RAM in use" rather than "RAM in use plus the size of the PCI hole". */
+	mm_state.usable_pages = pages_marked_free;
+
+	kprintf("  Marked %lu pages as free from UEFI usable regions (%lu MB of real RAM in a %lu MB span)\n",
+		pages_marked_free, (pages_marked_free * PAGE_SIZE) / (1024 * 1024),
+		((mm_state.memory_end - mm_state.memory_start)) / (1024 * 1024));
 }
 
 static void reserve_uefi_memory_regions(void)
@@ -620,13 +683,24 @@ void mm_initialize_from_boot_info(boot_info_t *boot_info)
 		g_direct_map_limit = boot_info->direct_map_bytes;
 
 	// Copy the memory map to our static storage
-	g_uefi_memory_map.entry_count = boot_info->mem_info.entry_count;
+	/* Clamp the COUNT to what is actually copied.  It used to record the
+	 * firmware's full count while the loop below stopped at
+	 * MAX_MEMORY_MAP_ENTRIES, so every consumer walked past the copied
+	 * entries into uninitialised storage and treated whatever was there as
+	 * real regions -- reserving RAM that exists or freeing RAM that does
+	 * not, depending on the garbage. */
+	uint32_t n_entries = boot_info->mem_info.entry_count;
+
+	if (n_entries > MAX_MEMORY_MAP_ENTRIES) {
+		kprintf("WARNING: UEFI memory map has %u entries, only %u fit - the rest are IGNORED\n",
+			n_entries, (uint32_t)MAX_MEMORY_MAP_ENTRIES);
+		n_entries = MAX_MEMORY_MAP_ENTRIES;
+	}
+	g_uefi_memory_map.entry_count = n_entries;
 	g_uefi_memory_map.descriptor_size = boot_info->mem_info.descriptor_size;
 	g_uefi_memory_map.total_memory = boot_info->mem_info.total_memory;
 
-	for (uint32_t i = 0;
-	     i < boot_info->mem_info.entry_count && i < MAX_MEMORY_MAP_ENTRIES;
-	     i++) {
+	for (uint32_t i = 0; i < n_entries; i++) {
 		g_uefi_memory_map.entries[i] = boot_info->mem_info.entries[i];
 	}
 
@@ -758,7 +832,34 @@ void mm_initialize_physical_memory(uint64_t memory_size)
 	// bootloader sized to actual RAM (see detect_physmap_size()).  On matching
 	// bootloader+kernel this clamp never fires; it remains as a safety net (and
 	// for a legacy bootloader that reports no extent, defaulting to 16 GB).
-	mm_state.memory_end = memory_size;
+	/* End at the highest usable physical ADDRESS in the firmware map, not
+	 * at the total number of bytes of RAM.
+	 *
+	 * Those are only the same if RAM starts at 0 and runs without a break,
+	 * which no real firmware does.  It puts a PCI hole below 4 GB and
+	 * continues RAM above it, so using the byte count did BOTH wrong things
+	 * at once: the range covered ~1 GB of hole, which is not RAM and so can
+	 * never be marked free -- it was counted as "used" for the life of the
+	 * boot -- while the real RAM above 4 GB fell outside the range and was
+	 * ignored completely.  A 4 GB machine ran on about 3 GB and reported a
+	 * gigabyte in use before userspace started. */
+	uint64_t highest_usable_end = 0;
+
+	for (uint32_t i = 0; i < g_uefi_memory_map.entry_count; i++) {
+		memory_map_entry_t *e = &g_uefi_memory_map.entries[i];
+		uint64_t end;
+
+		if (!mm_is_usable_memory_type(e->type))
+			continue;
+		end = e->physical_start + e->number_of_pages * PAGE_SIZE;
+		if (end > highest_usable_end)
+			highest_usable_end = end;
+	}
+
+	/* With no map to consult there is nothing better than the old guess. */
+	mm_state.memory_end = (highest_usable_end > mm_state.memory_start) ?
+				      highest_usable_end :
+				      memory_size;
 	if (mm_state.memory_end > g_direct_map_limit) {
 		kprintf("  NOTE: Limiting managed memory to %lu MB (direct map limit)\n",
 			g_direct_map_limit / (1024 * 1024));
@@ -882,6 +983,47 @@ void mm_initialize_physical_memory(uint64_t memory_size)
 			mm_memset(mm_state.page_refcounts, 0,
 				  mm_state.refcount_array_size);
 
+#if MM_LEAK_INSTRUMENTATION
+			/* Same trick again for the owner table. */
+			mm_state.owner_array_size =
+				mm_state.total_pages * sizeof(uint32_t);
+			{
+				uint64_t owner_pages =
+					(mm_state.owner_array_size +
+					 PAGE_SIZE - 1) / PAGE_SIZE;
+				uint64_t ostart = (uint64_t)-1, olen = 0;
+
+				for (uint64_t q = 0; q < mm_state.total_pages;
+				     q++) {
+					if (!is_page_allocated(q)) {
+						if (olen == 0)
+							ostart = q;
+						olen++;
+						if (olen == owner_pages)
+							break;
+					} else {
+						olen = 0;
+					}
+				}
+				if (olen < owner_pages) {
+					kprintf("  NOTE: no room for the page-owner table; allocation attribution is off\n");
+					mm_state.page_owner = NULL;
+				} else {
+					for (uint64_t i = 0; i < owner_pages;
+					     i++) {
+						set_page_bit(ostart + i);
+						mm_state.free_pages--;
+					}
+					mm_state.page_owner =
+						(uint32_t *)phys_to_virt(
+							mm_state.memory_start +
+							ostart * PAGE_SIZE);
+					mm_memset(mm_state.page_owner, 0,
+						  mm_state.owner_array_size);
+				}
+			}
+#endif
+
 			kprintf("  Page refcounts at: %p (phys 0x%lx, %lu contiguous pages)\n",
 				mm_state.page_refcounts, first_phys,
 				refcount_pages);
@@ -911,6 +1053,7 @@ uint64_t mm_allocate_physical_page(void)
 
 	set_page_bit(page);
 	mm_state.free_pages--;
+	PAGE_OWNER_SET(page, __builtin_return_address(0));
 
 	uint64_t phys = mm_state.memory_start + (page * PAGE_SIZE);
 	WARN_ON(phys &
@@ -1218,11 +1361,42 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 	// global lock.  Two passes cover the wrap-around.
 	static uint64_t next_fit_hint;
 	uint64_t limit = mm_state.total_pages - page_count;
-	if (next_fit_hint > limit)
+
+	/* Prefer memory a 32-bit device can address.
+	 *
+	 * Contiguous runs are what drivers program into device descriptors, and
+	 * several NICs here (rtl8139, pcnet32, tulip) carry 32-bit addresses
+	 * only.  Every caller was written when the managed range stopped below
+	 * 4 GB, so all of this memory WAS low; now that the range reaches the
+	 * RAM above the PCI hole, keep serving these from below 4 GB.  The
+	 * fallback pass covers the whole range so a kalloc() cannot fail while
+	 * high memory sits free -- and says so, because that is the point at
+	 * which a 32-bit device would be handed an address it cannot reach. */
+	uint64_t dma_limit = limit;
+
+	if (mm_state.memory_start < 0x100000000ULL) {
+		uint64_t low = (0x100000000ULL - mm_state.memory_start) /
+			       PAGE_SIZE;
+		if (low > page_count && low - page_count < dma_limit)
+			dma_limit = low - page_count;
+	}
+	if (next_fit_hint > dma_limit)
 		next_fit_hint = 0;
-	for (int pass = 0; pass < 2; pass++) {
+	for (int pass = 0; pass < 3; pass++) {
 		uint64_t begin = pass ? 0 : next_fit_hint;
-		uint64_t end = pass ? next_fit_hint : limit + 1;
+		uint64_t end = pass ? next_fit_hint : dma_limit + 1;
+
+		if (pass == 2) {
+			/* Nothing below 4 GB left. */
+			if (dma_limit == limit)
+				break;
+			WARN_RATELIMIT(
+				1,
+				"contiguous allocation of %lu pages served from above 4 GB - a 32-bit DMA device cannot address this",
+				(unsigned long)page_count);
+			begin = dma_limit + 1;
+			end = limit + 1;
+		}
 		for (uint64_t start_page = begin; start_page < end;
 		     start_page++) {
 			bool found = true;
@@ -1241,6 +1415,8 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 				for (size_t i = 0; i < page_count; i++) {
 					set_page_bit(start_page + i);
 					mm_state.free_pages--;
+					PAGE_OWNER_SET(start_page + i,
+						       __builtin_return_address(0));
 					/* Each frame carries the caller's one
 					 * reference, exactly as the single-page
 					 * allocator does — the run is released
@@ -1986,6 +2162,25 @@ void mm_regions_free(task_t *task)
 {
 	if (!task || !task->mmap_regions)
 		return;
+
+	/* Drop what the records still hold.
+	 *
+	 * Every other path that retires a region closes its file first --
+	 * munmap does, exec does -- but this one, the path EVERY exiting
+	 * process takes, only freed the array.  So a process that died with a
+	 * file-backed mapping still open (every shared library, and every
+	 * shmat) leaked that reference permanently: the vfs_file was never
+	 * closed, and for a shm object that reference is exactly what keeps its
+	 * pages alive.  Memory stayed used with no process left to own it, and
+	 * no amount of waiting gave it back. */
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
+		mmap_region_t *r = &task->mmap_regions[i];
+
+		if (r->in_use && r->file) {
+			vfs_close(r->file);
+			r->file = NULL;
+		}
+	}
 	kfree(task->mmap_regions);
 	task->mmap_regions = NULL;
 	task->mmap_capacity = 0;
@@ -3198,7 +3393,94 @@ void kfree_dma(void *ptr)
 
 /* Bytes filesystem drivers hold in reclaimable block/metadata buffers
  * (see mm_buffercache_account in memory.h). */
+
 static volatile int64_t g_buffercache_bytes;
+
+/* How much work the address-space teardown actually does.  If address spaces
+ * are destroyed but memory does not come back, the question is whether the
+ * walk never saw the pages or saw them and could not release them. */
+#if MM_LEAK_INSTRUMENTATION
+/* Live address spaces, by creator.
+ *
+ * Every path that makes one has been read and they all destroy on failure and
+ * on exit, yet more are created than destroyed.  Rather than keep guessing at
+ * which caller drops one, record the caller of each LIVE address space and let
+ * the ones that are still here name themselves. */
+#define AS_TRACK_MAX 4096
+static struct {
+	uint64_t pml4_phys;
+	uint32_t creator;
+} g_as_track[AS_TRACK_MAX];
+static volatile unsigned long g_as_track_live;
+static volatile unsigned long g_as_track_overflow;
+static spinlock_t g_as_track_lock = SPINLOCK_INIT("as_track");
+
+static void as_track_add(uint64_t pml4_phys, uint32_t creator)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&g_as_track_lock, &f);
+	for (unsigned i = 0; i < AS_TRACK_MAX; i++) {
+		if (g_as_track[i].pml4_phys == 0) {
+			g_as_track[i].pml4_phys = pml4_phys;
+			g_as_track[i].creator = creator;
+			g_as_track_live++;
+			spin_unlock_irqrestore(&g_as_track_lock, f);
+			return;
+		}
+	}
+	g_as_track_overflow++;
+	spin_unlock_irqrestore(&g_as_track_lock, f);
+}
+
+/* Re-blame an entry on the caller that really wanted the address space.
+ * mm_create_user_address_space() only ever sees mm_clone_address_space() as its
+ * caller, which does not say which fork path asked for it. */
+static void as_track_retag(uint64_t pml4_phys, uint32_t creator)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&g_as_track_lock, &f);
+	for (unsigned i = 0; i < AS_TRACK_MAX; i++)
+		if (g_as_track[i].pml4_phys == pml4_phys) {
+			g_as_track[i].creator = creator;
+			break;
+		}
+	spin_unlock_irqrestore(&g_as_track_lock, f);
+}
+
+static void as_track_del(uint64_t pml4_phys)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&g_as_track_lock, &f);
+	for (unsigned i = 0; i < AS_TRACK_MAX; i++) {
+		if (g_as_track[i].pml4_phys == pml4_phys) {
+			g_as_track[i].pml4_phys = 0;
+			g_as_track[i].creator = 0;
+			g_as_track_live--;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_as_track_lock, f);
+}
+
+/* Which of the three teardown routes actually ran.  Only three places destroy
+ * an address space; if fewer run than were created, this says which. */
+volatile unsigned long g_as_destroy_exit_self;
+volatile unsigned long g_as_exit_self_own;   /* mm == NULL: destroys outright */
+volatile unsigned long g_as_exit_self_mm;    /* mm != NULL: only the last one */
+volatile unsigned long g_mm_created;
+volatile unsigned long g_mm_freed;
+#endif /* MM_LEAK_INSTRUMENTATION */
+volatile unsigned long g_as_destroy_remove_task;
+volatile unsigned long g_as_destroy_exec;
+
+static volatile unsigned long g_create_calls;
+#if MM_LEAK_INSTRUMENTATION
+static volatile unsigned long g_destroy_calls;
+static volatile unsigned long g_destroy_pages_seen;
+#endif
 
 void mm_buffercache_account(long delta)
 {
@@ -3212,12 +3494,179 @@ uint64_t mm_buffercache_bytes(void)
 }
 
 // Get memory statistics
+#if MM_LEAK_INSTRUMENTATION
+/* Report which call sites are holding physical memory.
+ *
+ * "Used" as a single number cannot distinguish a cache doing its job from a
+ * path that allocates and never frees, and when the machine is idle with every
+ * process gone the only useful question is which code still owns the pages.
+ * Each allocation records its caller; this counts the live pages by caller and
+ * prints the worst offenders.
+ *
+ * Resolve the addresses with:
+ *   rm build/kernel.elf && make NO_STRIP=1
+ *   addr2line -f -e build/kernel.elf 0xffffffff8xxxxxxx
+ */
+void mm_dump_page_owners(void)
+{
+#define OWNER_SLOTS 48
+	struct {
+		uint32_t site;
+		uint64_t pages;
+	} top[OWNER_SLOTS];
+	unsigned used = 0, i;
+	uint64_t untracked = 0, other = 0, total = 0;
+	uint64_t flags;
+
+	if (!mm_state.page_owner) {
+		kprintf("page owners: not tracked on this boot\n");
+		return;
+	}
+
+	spin_lock_irqsave(&mm_phys_lock, &flags);
+	for (uint64_t pg = 0; pg < mm_state.total_pages; pg++) {
+		uint32_t site;
+
+		if (!is_page_allocated(pg))
+			continue;
+		total++;
+		site = mm_state.page_owner[pg];
+		if (!site) {
+			untracked++; /* reserved at boot, never allocated */
+			continue;
+		}
+		for (i = 0; i < used; i++) {
+			if (top[i].site == site) {
+				top[i].pages++;
+				break;
+			}
+		}
+		if (i == used) {
+			if (used < OWNER_SLOTS) {
+				top[used].site = site;
+				top[used].pages = 1;
+				used++;
+			} else {
+				other++;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&mm_phys_lock, flags);
+
+	/* Selection sort: at most OWNER_SLOTS entries, and this runs once. */
+	for (i = 0; i < used; i++) {
+		unsigned best = i, j;
+
+		for (j = i + 1; j < used; j++)
+			if (top[j].pages > top[best].pages)
+				best = j;
+		if (best != i) {
+			uint32_t ts = top[i].site;
+			uint64_t tp = top[i].pages;
+
+			top[i] = top[best];
+			top[best].site = ts;
+			top[best].pages = tp;
+		}
+	}
+
+	kprintf("\n=== page owners (%lu pages allocated, %lu MB) ===\n", total,
+		(total * PAGE_SIZE) / (1024 * 1024));
+	for (i = 0; i < used; i++) {
+		if (top[i].pages < 16)
+			continue; /* noise */
+		kprintf("  0xffffffff%08x  %8lu pages  %6lu MB\n", top[i].site,
+			top[i].pages,
+			(top[i].pages * PAGE_SIZE) / (1024 * 1024));
+	}
+	kprintf("  boot-reserved/untracked: %lu pages (%lu MB)\n", untracked,
+		(untracked * PAGE_SIZE) / (1024 * 1024));
+
+	/* How many references the live pages carry.
+	 *
+	 * A page still allocated when nothing maps it is either one nobody
+	 * released (refcount 1, a free that never ran) or one somebody
+	 * referenced twice and released once (refcount >= 2, a reference that
+	 * was never given back).  Those are different bugs in different code,
+	 * and the count says which without guessing. */
+	if (mm_state.page_refcounts) {
+		uint64_t rc[5] = { 0, 0, 0, 0, 0 };
+
+		spin_lock_irqsave(&mm_phys_lock, &flags);
+		for (uint64_t pg = 0; pg < mm_state.total_pages; pg++) {
+			uint16_t c;
+
+			if (!is_page_allocated(pg) || !mm_state.page_owner[pg])
+				continue;
+			c = mm_state.page_refcounts[pg];
+			rc[c < 4 ? c : 4]++;
+		}
+		spin_unlock_irqrestore(&mm_phys_lock, flags);
+		kprintf("  refcounts of tracked live pages: 0:%lu 1:%lu 2:%lu 3:%lu 4+:%lu\n",
+			rc[0], rc[1], rc[2], rc[3], rc[4]);
+	}
+	{
+		struct {
+			uint32_t site;
+			unsigned long n;
+		} by[8];
+		unsigned used = 0;
+		uint64_t f;
+
+		spin_lock_irqsave(&g_as_track_lock, &f);
+		for (unsigned i = 0; i < AS_TRACK_MAX; i++) {
+			unsigned k;
+
+			if (!g_as_track[i].pml4_phys)
+				continue;
+			for (k = 0; k < used; k++)
+				if (by[k].site == g_as_track[i].creator) {
+					by[k].n++;
+					break;
+				}
+			if (k == used && used < 8) {
+				by[used].site = g_as_track[i].creator;
+				by[used].n = 1;
+				used++;
+			}
+		}
+		spin_unlock_irqrestore(&g_as_track_lock, f);
+			kprintf("  mm_structs: %lu created, %lu freed (%ld still referenced)\n",
+			g_mm_created, g_mm_freed,
+			(long)g_mm_created - (long)g_mm_freed);
+		kprintf("  exit_mm_self: %lu own-pml4, %lu via mm_struct\n",
+			g_as_exit_self_own, g_as_exit_self_mm);
+		kprintf("  teardown routes: exit_mm_self=%lu remove_task=%lu exec=%lu\n",
+			g_as_destroy_exit_self, g_as_destroy_remove_task,
+			g_as_destroy_exec);
+	kprintf("  live address spaces: %lu (%lu untracked past the table)\n",
+			g_as_track_live, g_as_track_overflow);
+		for (unsigned i = 0; i < used; i++)
+			kprintf("    created at 0xffffffff%08x: %lu still alive\n",
+				by[i].site, by[i].n);
+	}
+	kprintf("  address spaces: %lu created, %lu destroyed (%ld never torn down), %lu pages released\n",
+		g_create_calls, g_destroy_calls,
+		(long)g_create_calls - (long)g_destroy_calls,
+		g_destroy_pages_seen);
+	if (other)
+		kprintf("  (%lu more call sites than the table holds)\n", other);
+	kprintf("Resolve with: addr2line -f -e build/kernel.elf <addr>  (build NO_STRIP=1)\n");
+#undef OWNER_SLOTS
+}
+#endif /* MM_LEAK_INSTRUMENTATION */
+
 void mm_get_memory_stats(memory_stats_t *stats)
 {
-	stats->total_memory = mm_state.memory_end - mm_state.memory_start;
+	/* Report RAM, not the address span it lives in.  Subtracting free from
+	 * the span counted every hole as used and buried the real figure. */
+	uint64_t ram_pages = mm_state.usable_pages ? mm_state.usable_pages :
+						     mm_state.total_pages;
+
+	stats->total_memory = ram_pages * PAGE_SIZE;
 	stats->free_memory = mm_state.free_pages * PAGE_SIZE;
 	stats->used_memory = stats->total_memory - stats->free_memory;
-	stats->total_pages = mm_state.total_pages;
+	stats->total_pages = ram_pages;
 	stats->free_pages = mm_state.free_pages;
 	stats->used_pages = stats->total_pages - stats->free_pages;
 	stats->heap_allocated = mm_state.heap_used;
@@ -3498,6 +3947,11 @@ uint64_t *mm_create_user_address_space(void)
 	// User space mappings (PML4[0-255]) start empty
 	// They will be filled in by mm_map_user_page() when loading ELF, etc.
 
+	/* Counted here, not on entry: a creation that failed is not an address
+	 * space anyone has to destroy, and counting it made the
+	 * created-vs-destroyed comparison read as a leak. */
+	LEAK_INC(g_create_calls);
+	AS_TRACK_ADD(pml4_phys, (uint32_t)(uintptr_t)__builtin_return_address(0));
 	return new_pml4;
 }
 
@@ -3658,9 +4112,19 @@ void mm_destroy_address_space(uint64_t *pml4)
 	mm_put_pages_batch(batch, nbatch);
 	nbatch = 0;
 
+	/* Untrack BEFORE the page goes back to the pool.  Freed first, another
+	 * CPU can be handed the same physical page for a new address space and
+	 * add its own entry for it -- and then this del would remove THAT one,
+	 * leaving this dead entry behind for ever.  The table would report a
+	 * leak that is only its own bookkeeping. */
+	AS_TRACK_DEL(pml4_phys);
+
 	// Free the PML4 itself
 	free_pt_page(pml4_phys);
 	pt_freed++;
+
+	LEAK_INC(g_destroy_calls);
+	LEAK_ADD(g_destroy_pages_seen, pages_freed);
 
 	// Suppress unused variable warnings (used for debugging)
 	(void)pages_freed;
@@ -4384,6 +4848,8 @@ uint64_t *mm_clone_address_space(uint64_t *src_pml4)
 	if (!new_pml4) {
 		return NULL;
 	}
+	AS_TRACK_RETAG(virt_to_phys(new_pml4),
+		       (uint32_t)(uintptr_t)__builtin_return_address(0));
 
 	// CRITICAL: Disable interrupts only for the narrow window where we
 	// atomically mark each source PTE as COW and increment its refcount.
@@ -4584,6 +5050,8 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 	if (!new_pml4) {
 		return NULL;
 	}
+	AS_TRACK_RETAG(virt_to_phys(new_pml4),
+		       (uint32_t)(uintptr_t)__builtin_return_address(0));
 
 	// CRITICAL: Disable interrupts only for the narrow per-PTE window where
 	// we atomically mark a source PTE as COW and increment its refcount.

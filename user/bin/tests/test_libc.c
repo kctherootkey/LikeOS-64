@@ -361,6 +361,60 @@ static void __test_result_impl(const char *name, int condition,
 				   __LINE__, errno);                   \
 	} while (0)
 
+/* A path under /tmp that belongs to THIS test run.
+ *
+ * teststress runs several copies of this suite at once, so a fixed name is a
+ * name two runs fight over.  The record-lock case failed outright that way --
+ * the second run's whole-file F_SETLK was refused, correctly -- and any case
+ * that creates, truncates or unlinks a shared name can pull the file out from
+ * under the other run and produce failures that look like kernel bugs.
+ *
+ * The pid is captured ONCE, on the first call, rather than read per call: a
+ * forked child asking for the same name must get the SAME path as its parent,
+ * and several cases here depend on precisely that (the lock test opens the
+ * parent's file from the child to contend with it).
+ *
+ * Each name gets its own permanent buffer, so a pointer kept across other
+ * calls stays valid.
+ */
+static const char *tmpp(const char *name)
+{
+	static struct {
+		const char *key;
+		char path[96];
+	} slots[32];
+	static unsigned used;
+	static int pid;
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	const char *ret;
+	unsigned i;
+
+	pthread_mutex_lock(&lock);
+	if (!pid)
+		pid = (int)getpid();
+	for (i = 0; i < used; i++) {
+		if (strcmp(slots[i].key, name) == 0) {
+			pthread_mutex_unlock(&lock);
+			return slots[i].path;
+		}
+	}
+	if (used == sizeof(slots) / sizeof(slots[0])) {
+		/* Out of slots: fall back to a shared name rather than lie
+		 * about it, and say so -- a collision under teststress is
+		 * exactly what this exists to prevent. */
+		printf("  NOTE: tmpp() table full, \"%s\" is not unique\n", name);
+		pthread_mutex_unlock(&lock);
+		return name;
+	}
+	slots[used].key = name;
+	snprintf(slots[used].path, sizeof(slots[used].path), "/tmp/%d_%s", pid,
+		 name);
+	ret = slots[used].path;
+	used++;
+	pthread_mutex_unlock(&lock);
+	return ret;
+}
+
 /* Descriptors 0, 1 and 2 are ordinary descriptors: they can be closed, and the
  * numbers then freed are the lowest available ones, so the next open() or dup()
  * gets them back.  That is how a program hands itself a terminal --
@@ -2764,8 +2818,17 @@ static void test_dup_redirected_stdio(void)
  */
 static void test_shm(void)
 {
-	const char *nm = "/tl_shm_test";
+	/* Per-process name.  shm objects live in ONE global namespace, so a
+	 * fixed name is shared by every copy of this suite running at once --
+	 * and the unlink below, which exists to clear a previous run's
+	 * leftovers, would delete the object another live run is using.  Both
+	 * then fail: one loses its O_EXCL create, the other finds its name
+	 * already gone at "shm_unlink removes the name". */
+	char nmbuf[64];
+	const char *nm = nmbuf;
 	const size_t sz = 8192;
+
+	snprintf(nmbuf, sizeof(nmbuf), "/tl_shm_test.%d", (int)getpid());
 
 	printf("\n[TEST] POSIX shared memory (shm_open/ftruncate/mmap)\n");
 
@@ -2978,7 +3041,12 @@ static void test_sysv_shm(void)
 
 	/* A keyed segment: a second shmget with the same key finds it. */
 	{
-		int k = 0x4C494B45; /* an arbitrary well-known key */
+		/* Per-process key: SysV keys are one global namespace, so a
+		 * fixed one is shared by every copy of this suite running at
+		 * once -- and the mode test elsewhere IPC_RMIDs whatever it
+		 * finds under this key, which would destroy another live run's
+		 * segment out from under it. */
+		int k = 0x4C494B45 ^ (int)getpid();
 		int a = shmget(k, sz, IPC_CREAT | 0600);
 		int b = shmget(k, sz, 0);
 		test_result("a keyed segment is found again by key",
@@ -3122,7 +3190,7 @@ static void test_xorg_libc_additions(void)
 
 	/* --- scandir: how the X server enumerates its module directory --- */
 	{
-		const char *dir = "/tmp/scandir_t";
+		const char *dir = tmpp("scandir_t");
 		struct dirent **nl = NULL;
 		int n;
 
@@ -3174,7 +3242,7 @@ static void test_xorg_libc_additions(void)
 
 		errno = 0;
 		test_result("scandir on a missing directory fails",
-			    scandir("/tmp/no_such_dir_xyz", &nl, NULL, NULL) ==
+			    scandir(tmpp("no_such_dir_xyz"), &nl, NULL, NULL) ==
 				    -1);
 
 		for (int i = 0; i < 12; i++) {
@@ -3193,7 +3261,7 @@ static void test_xorg_libc_additions(void)
 	/* --- a large directory: libXfont2 reads font dirs this way, and the
 	 * DIR buffer is only 1 KB, so this crosses many getdents64 refills --- */
 	{
-		const char *dir = "/tmp/bigdir_t";
+		const char *dir = tmpp("bigdir_t");
 		DIR *dp;
 		int count = 0, dup_seen = 0;
 		char seen[200] = { 0 };
@@ -3327,7 +3395,7 @@ static void test_xorg_libc_additions(void)
 		}
 	}
 	{
-		const char *p = "/tmp/trunc_t";
+		const char *p = tmpp("trunc_t");
 		int fd = open(p, O_CREAT | O_WRONLY, 0644);
 		struct stat st;
 		if (fd >= 0) {
@@ -3342,7 +3410,7 @@ static void test_xorg_libc_additions(void)
 				    st.st_size == 100);
 		errno = 0;
 		test_result("truncate on a missing path fails",
-			    truncate("/tmp/no_such_file_xyz", 0) == -1);
+			    truncate(tmpp("no_such_file_xyz"), 0) == -1);
 		unlink(p);
 	}
 	test_result("getpriority reports the default priority",
@@ -3479,7 +3547,7 @@ static void test_gtk3_libc_additions(void)
 
 	/* --- <sys/fcntl.h>: what menu-cache includes ------------------- */
 	{
-		const char *path = "/tmp/sysfcntl_t";
+		const char *path = tmpp("sysfcntl_t");
 		int fd, fl;
 
 		/* O_* here reach this call through <sys/fcntl.h> as much as
@@ -3505,7 +3573,7 @@ static void test_gtk3_libc_additions(void)
 		int fd;
 
 		errno = 0;
-		fd = open("/tmp/no/such/directory/at/all", O_RDONLY);
+		fd = open(tmpp("no/such/directory/at/all"), O_RDONLY);
 		test_result("sys/errno.h: errno and ENOENT are the real ones",
 			    fd < 0 && errno == ENOENT);
 		if (fd >= 0)
@@ -3660,7 +3728,7 @@ static void test_bash_libc_additions(void)
 	/* mkfifo: honestly unsupported -> ENOSYS (not a silent success) */
 	errno = 0;
 	test_result("mkfifo -> ENOSYS",
-		    mkfifo("/tmp/nofifo", 0644) == -1 && errno == ENOSYS);
+		    mkfifo(tmpp("nofifo"), 0644) == -1 && errno == ENOSYS);
 
 	/* wide-char helpers used by ported code */
 	wchar_t wbuf[8];
@@ -6960,25 +7028,29 @@ int main(int argc, char **argv)
 			test_result("pclose reaps child (exit 0)",
 				    st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 		}
-		FILE *pw = popen("cat > /tmp/popen_w_test", "w");
+		char pwcmd[160];
+
+		snprintf(pwcmd, sizeof(pwcmd), "cat > %s",
+			 tmpp("popen_w_test"));
+		FILE *pw = popen(pwcmd, "w");
 		test_result("popen(w) returns a stream", pw != NULL);
 		if (pw) {
 			fputs("to-child\n", pw);
 			pclose(pw);
-			FILE *rb = fopen("/tmp/popen_w_test", "r");
+			FILE *rb = fopen(tmpp("popen_w_test"), "r");
 			char b[32] = { 0 };
 			if (rb) { fgets(b, sizeof(b), rb); fclose(rb); }
 			test_result("popen(w) delivered stdin to child",
 				    strncmp(b, "to-child", 8) == 0);
-			unlink("/tmp/popen_w_test");
+			unlink(tmpp("popen_w_test"));
 		}
 	}
 
 	printf("\n[TEST] fscanf (stream formatted input)\n");
 	{
-		FILE *f = fopen("/tmp/fscanf_test", "w");
+		FILE *f = fopen(tmpp("fscanf_test"), "w");
 		if (f) { fputs("42 hello 3.5 0xff ab:cd\n", f); fclose(f); }
-		f = fopen("/tmp/fscanf_test", "r");
+		f = fopen(tmpp("fscanf_test"), "r");
 		int n = -1; char word[16] = { 0 }; float fl = 0; unsigned hx = 0;
 		int a = 0, b = 0;
 		int got = 0;
@@ -6992,7 +7064,7 @@ int main(int argc, char **argv)
 		test_result("fscanf %f", fl > 3.4f && fl < 3.6f);
 		test_result("fscanf %x", hx == 0xff);
 		test_result("fscanf literal + fields", a == 0xab && b == 0xcd);
-		unlink("/tmp/fscanf_test");
+		unlink(tmpp("fscanf_test"));
 	}
 
 	printf("\n[TEST] statvfs\n");
@@ -7489,8 +7561,19 @@ int main(int argc, char **argv)
 	// ========================================
 	printf("\n[TEST] fcntl record locks\n");
 	{
-		char lpath[] = "/tmp/likeos_lock_test";
-		int lfd = open(lpath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+		/* Per-process path.  This case is ABOUT contention between
+		 * processes, so it has to own its file: on a fixed path a
+		 * second copy of this suite running at the same time takes the
+		 * whole-file write lock first and every assertion below fails
+		 * -- correctly, since F_SETLK is supposed to refuse.  The
+		 * contention being tested is with the child forked below, not
+		 * with another test run. */
+		char lpath[64];
+		int lfd;
+
+		snprintf(lpath, sizeof(lpath), "/tmp/likeos_lock_test.%d",
+			 (int)getpid());
+		lfd = open(lpath, O_RDWR | O_CREAT | O_TRUNC, 0600);
 		if (lfd < 0) {
 			test_fail("open() for the lock test file");
 		} else {
@@ -7894,8 +7977,8 @@ int main(int argc, char **argv)
 	{
 		struct stat mst;
 		mode_t oldmask = umask(0);
-		char mpath[] = "/tmp/likeos_mode_test";
-		char dpath[] = "/tmp/likeos_mode_dir";
+		const char *mpath = tmpp("likeos_mode_test");
+		const char *dpath = tmpp("likeos_mode_dir");
 
 		unlink(mpath);
 		rmdir(dpath);
@@ -8109,7 +8192,7 @@ int main(int argc, char **argv)
 	// ========================================
 	printf("\n[TEST] unlinkat\n");
 	{
-		char ubase[] = "/tmp/likeos_unlinkat";
+		const char *ubase = tmpp("likeos_unlinkat");
 		char ufile[128], udir[128];
 		int dfd;
 
@@ -8165,7 +8248,7 @@ int main(int argc, char **argv)
 
 		errno = 0;
 		test_result("unlinkat on a missing name is ENOENT",
-			    unlinkat(AT_FDCWD, "/tmp/likeos_no_such_file_xyz",
+			    unlinkat(AT_FDCWD, tmpp("likeos_no_such_file_xyz"),
 				     0) == -1 &&
 				    errno == ENOENT);
 
@@ -8301,7 +8384,9 @@ int main(int argc, char **argv)
 		 * for a non-owner.  Root would be let through, so again the
 		 * check runs in a child. */
 		{
-			key_t k = (key_t)0x4c494b45; /* "LIKE" */
+			/* Same per-process key as test_sysv_shm(); see the
+			 * note there. */
+			key_t k = (key_t)(0x4c494b45 ^ (int)getpid());
 			int kid = shmget(k, 0, 0);
 			if (kid >= 0)
 				shmctl(kid, IPC_RMID, NULL);
@@ -8369,9 +8454,12 @@ int main(int argc, char **argv)
 			int sfd;
 			struct stat sst;
 
-			shm_unlink("/likeos_perm_test");
-			sfd = shm_open("/likeos_perm_test",
-				       O_RDWR | O_CREAT | O_EXCL, 0644);
+			char pnm[64];
+
+			snprintf(pnm, sizeof(pnm), "/likeos_perm_test.%d",
+				 (int)getpid());
+			shm_unlink(pnm);
+			sfd = shm_open(pnm, O_RDWR | O_CREAT | O_EXCL, 0644);
 			test_result("shm_open creates the object", sfd >= 0);
 			if (sfd >= 0) {
 				test_result("...with the mode that was asked for",
@@ -8385,7 +8473,7 @@ int main(int argc, char **argv)
 						    fstat(sfd, &sst) == 0 &&
 							    sst.st_size == 8192);
 				close(sfd);
-				shm_unlink("/likeos_perm_test");
+				shm_unlink(pnm);
 			}
 			umask(om);
 		}
@@ -8471,7 +8559,7 @@ int main(int argc, char **argv)
 		 * writable -- and since connecting requires write permission on
 		 * the node, that granted every user access to every service.
 		 * It now follows the umask like any other created name. */
-		char spath[] = "/tmp/likeos_uds_perm";
+		const char *spath = tmpp("likeos_uds_perm");
 		mode_t om = umask(022);
 		int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
 
@@ -8556,7 +8644,7 @@ int main(int argc, char **argv)
 			struct sockaddr addr;
 			unsigned char guard[128];
 		} b;
-		char spath[] = "/tmp/likeos_accept_len";
+		const char *spath = tmpp("likeos_accept_len");
 		int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
 
 		unlink(spath);
@@ -9038,7 +9126,7 @@ int main(int argc, char **argv)
 		/* fgetpos/fsetpos: ISO C's position save/restore.  Added
 		 * because libpng would not compile without fpos_t. */
 		{
-			char fpath[] = "/tmp/likeos_fpos_test";
+			const char *fpath = tmpp("likeos_fpos_test");
 			FILE *f = fopen(fpath, "w+");
 			if (f) {
 				fpos_t p1, p2;

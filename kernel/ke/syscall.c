@@ -6521,6 +6521,11 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			if (!cur->mm) {
 				mm_free_guarded_kstack(k_stack_mem,
 						       KERNEL_STACK_SIZE);
+				/* The child already owns a region table (and, past the
+				 * clone, references on every file-backed region);
+				 * abandoning it here without this leaked that
+				 * allocation on every failed fork. */
+				mm_regions_free(child);
 				kfree(child);
 				return -ENOMEM;
 			}
@@ -6546,11 +6551,14 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 		mm_write_unlock(&mm_owner->mmap_lock);
 		if (!child_pml4) {
 			mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
+			mm_regions_free(child);
 			kfree(child);
 			return -ENOMEM;
 		}
 		child->pml4 = child_pml4;
 		child->mm = NULL; // Use legacy fields
+		/* Never inherited: the parent is executing fork, not exiting. */
+		child->in_exit_teardown = false;
 	}
 
 	// Handle CLONE_FILES (share file descriptors)
@@ -6576,6 +6584,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 				}
 				mm_free_guarded_kstack(k_stack_mem,
 						       KERNEL_STACK_SIZE);
+				mm_regions_free(child);
 				kfree(child);
 				return -ENOMEM;
 			}
@@ -6645,6 +6654,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 				}
 				mm_free_guarded_kstack(k_stack_mem,
 						       KERNEL_STACK_SIZE);
+				mm_regions_free(child);
 				kfree(child);
 				return -ENOMEM;
 			}
@@ -8568,9 +8578,38 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 					 * fd_dup_entry, including its race
 					 * against a sibling thread closing the
 					 * same descriptor between the two. */
-					void *entry = fd_dup_entry_at(cur, sfd);
-					if (!entry)
-						continue;
+					void *entry;
+
+					/* A standard descriptor still attached
+					 * to the terminal has NO vfs_file
+					 * behind it -- the console is
+					 * represented by an empty slot -- so
+					 * fd_dup_entry_at() finds nothing to
+					 * reference and this used to `continue`,
+					 * silently sending no descriptor at all
+					 * while reporting success.  A terminal
+					 * multiplexer hands its stdin to its
+					 * server over exactly this socket, so
+					 * the server was left with no terminal
+					 * and answered "open terminal failed:
+					 * not a terminal".
+					 *
+					 * dup() already encodes this case as the
+					 * marker value, the pending-fd queue
+					 * documents stdio markers as one of the
+					 * things it carries, and
+					 * fd_release_entry() knows not to
+					 * release one.  The sender was the only
+					 * place that did not take part. */
+					if (task_fd_is_console(cur, sfd)) {
+						entry = (void *)(uintptr_t)(sfd +
+									    1);
+					} else {
+						entry = fd_dup_entry_at(cur,
+									sfd);
+						if (!entry)
+							continue;
+					}
 					(void)unix_send_fd(us, entry);
 				}
 			}
@@ -9164,6 +9203,14 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		mm_get_memory_stats(&stats);
 		if (copy_to_user((void *)a1, &stats, sizeof(stats)) != 0)
 			return -EFAULT;
+		/* a2: also print who owns the allocated pages, to the kernel
+		 * log.  It goes there rather than to the caller because it is
+		 * a variable-length report meant to be read next to the rest
+		 * of the boot output. */
+		if (a2) {
+			mm_dump_page_owners();
+			sched_dump_task_leaks();
+		}
 		return 0;
 	}
 

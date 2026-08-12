@@ -412,6 +412,30 @@ int signal_dequeue(task_t *task, kernel_sigset_t *mask, siginfo_t *info)
 
 // Setup a signal frame on the user stack
 // Returns 0 on success, -1 on failure
+/* RFLAGS the kernel is willing to give user mode.
+ *
+ * Everything that returns to user mode goes through this.  Two reasons:
+ *
+ * IF is FORCED ON.  A user thread resumed with interrupts disabled cannot be
+ * preempted and takes every fault with IRQs off -- so a page fault on a
+ * demand-paged text page then read from ext4 with interrupts disabled, which
+ * is the "might_sleep() called with IRQs disabled" storm, and the
+ * "USER RIP ... with interrupts disabled ... the saved RFLAGS is wrong"
+ * warning that precedes it.  The saved RFLAGS was not wrong; it was obeyed.
+ *
+ * And the source of it is reachable from user code: sigreturn(2) restores
+ * RFLAGS from the signal frame on the USER stack, which the process can edit.
+ * Unfiltered, that let any program clear its own IF -- pinning a CPU with
+ * interrupts off -- or set IOPL and NT.  Only the flags a program may set for
+ * itself survive; the rest come from here.
+ */
+#define USER_RFLAGS_KEEP                                                  	(0x1UL /*CF*/ | 0x2UL /*reserved, must be 1*/ | 0x4UL /*PF*/ |     	 0x10UL /*AF*/ | 0x40UL /*ZF*/ | 0x80UL /*SF*/ | 0x100UL /*TF*/ | 	 0x400UL /*DF*/ | 0x800UL /*OF*/ | 0x200000UL /*ID*/)
+
+static inline uint64_t user_rflags_sanitize(uint64_t f)
+{
+	return (f & USER_RFLAGS_KEEP) | 0x202UL; /* bit 1 + IF */
+}
+
 int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 		       struct k_sigaction *act)
 {
@@ -694,7 +718,10 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	// Also update task's saved syscall values so sigreturn works correctly
 	task->syscall_rsp = frame_addr;
 	task->syscall_rip = handler; // captured before SA_RESETHAND reset above
-	task->syscall_rflags = user_rflags;
+	/* Same rule as the frame above: this is the task's record of what user
+	 * mode was running with, and it is what a later signal delivery hands
+	 * back. */
+	task->syscall_rflags = user_rflags_sanitize(user_rflags);
 	task->syscall_rbp = frame->rbp;
 	task->syscall_rbx = frame->rbx;
 	task->syscall_r12 = frame->r12;
@@ -707,6 +734,11 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	// via iretq, execution goes to the signal handler with correct state.
 	frame->rip = handler; // captured before SA_RESETHAND reset above
 	frame->rsp = frame_addr; // Signal frame on user stack
+	/* The handler is user code and must run like it: interrupts on, and
+	 * none of the flags the interrupted context had that user mode may not
+	 * choose.  This frame is IRETQ'd to directly, so what is here is what
+	 * the handler runs with. */
+	frame->rflags = user_rflags_sanitize(frame->rflags);
 	frame->rdi = (uint64_t)sig; // First argument: signal number
 	// CS, SS, RFLAGS stay the same (user mode, same flags)
 
@@ -745,7 +777,8 @@ int signal_restore_frame(task_t *task)
 	// Update task's saved values first (safe without cli)
 	task->syscall_rip = kframe.rip;
 	task->syscall_rsp = kframe.rsp;
-	task->syscall_rflags = kframe.rflags;
+	/* kframe came off the user's own stack -- see user_rflags_sanitize(). */
+	task->syscall_rflags = user_rflags_sanitize(kframe.rflags);
 	task->syscall_rbp = kframe.rbp;
 	task->syscall_rbx = kframe.rbx;
 	task->syscall_r12 = kframe.r12;
@@ -773,7 +806,7 @@ int signal_restore_frame(task_t *task)
 	percpu_t *cpu = this_cpu();
 	cpu->syscall_saved_user_rip = kframe.rip;
 	cpu->syscall_user_rsp = kframe.rsp;
-	cpu->syscall_saved_user_rflags = kframe.rflags;
+	cpu->syscall_saved_user_rflags = user_rflags_sanitize(kframe.rflags);
 	cpu->syscall_saved_user_rbp = kframe.rbp;
 	cpu->syscall_saved_user_rbx = kframe.rbx;
 	cpu->syscall_saved_user_r12 = kframe.r12;

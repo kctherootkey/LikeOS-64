@@ -637,6 +637,28 @@ typedef struct task {
 	 * non-zero; the last thread out re-queues the leader for reaping.
 	 * Both sides run under g_task_list_lock. */
 	volatile int group_ref;
+	/* Link for the dead-task queue.  The queue used to be a fixed array,
+	 * and overflowing it DROPPED the task -- which never ran its
+	 * destruction, so it never released its leader's group_ref, and that
+	 * leader's whole address space was postponed for ever.  A dead task is
+	 * off every other list, so it can carry the link itself and the queue
+	 * cannot overflow. */
+	struct task *dead_next;
+
+	/* Set while the task is inside exit_mm_self(), i.e. executing its own
+	 * address-space teardown.
+	 *
+	 * has_exited is set long before that teardown runs, and the scheduler
+	 * refuses to requeue an exited task -- correctly, for one that has
+	 * finished.  But mm_destroy_address_space() is deliberately
+	 * preemptible: it walks 256 PML4 entries and frees thousands of pages
+	 * in batches, dropping the allocator lock between them so interrupts
+	 * can be serviced.  A timer tick anywhere in that walk therefore
+	 * switched the task away for good, and everything it had not reached
+	 * yet -- pages, stacks, page tables -- was never freed and never
+	 * reachable again.  Nothing else can finish the walk on its behalf, so
+	 * while this is set the task stays runnable. */
+	volatile bool in_exit_teardown;
 	/* Set when a leader's destruction was postponed because group_ref was
 	 * still non-zero.  Tells the last thread to hand the leader back to
 	 * dead_thread_queue() instead of leaking it. */
@@ -758,6 +780,24 @@ int sched_has_user_tasks(void); // Check if any user tasks are running
  * Threads share the leader's address space, so all VM bookkeeping must be
  * read and written through the group leader — a thread's own task_t copy
  * of these fields is stale. */
+/* Report what is still holding address spaces (diagnostics, DEBUG only).
+ *
+ * The switch is defined here as well as in mm/memory.h -- both are idempotent
+ * -- because this header is often included first, and evaluating the test
+ * before the definition exists would silently pick the stub in a DEBUG build
+ * and collide with the real definition. */
+#ifndef MM_LEAK_INSTRUMENTATION
+#define MM_LEAK_INSTRUMENTATION DEBUG
+#endif
+
+#if MM_LEAK_INSTRUMENTATION
+void sched_dump_task_leaks(void);
+#else
+static inline void sched_dump_task_leaks(void)
+{
+}
+#endif
+
 static inline task_t *task_mm_owner(task_t *t)
 {
 	return (t && t->group_leader) ? t->group_leader : t;

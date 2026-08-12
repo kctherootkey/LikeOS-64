@@ -990,8 +990,10 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		smp_tlb_shootdown_mm_sync(virt_to_phys(old));
 	else if (smp_is_enabled())
 		smp_tlb_shootdown_sync();
-	if (old)
+	if (old) {
+		MM_LEAK_INC(g_as_destroy_exec);
 		mm_destroy_address_space(old);
+	}
 
 	*out_stack_ptr = sp;
 	return entry;

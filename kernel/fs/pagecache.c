@@ -224,6 +224,31 @@ static void pc_page_free(pc_page_t *pg)
 	kfree(pg);
 }
 
+/* Release a page that was held for I/O, freeing it if it died meanwhile.
+ *
+ * A page can be detached from the cache while somebody holds it -- its file was
+ * truncated or unlinked -- and the invalidation cannot free the frame out from
+ * under the holder.  So it takes the page off the hash, the LRU and the dirty
+ * list, marks it PC_PAGE_DEAD, and leaves the frame to whoever lets go.  That
+ * makes EVERY unlock site responsible for it.
+ *
+ * pagecache_write_done() and pc_wb_retire() honoured that; the writeback batch
+ * paths and their error exits did not -- they cleared the bit and walked away.
+ * The page was then on no list, owned by nobody and pointed to by nothing: it
+ * could never be found, reused or freed.  Under a load that creates and
+ * deletes files continuously (a test suite in a loop, say) that is a permanent
+ * drain of physical memory which no amount of idling gives back, and it does
+ * not show up as cache because the page has already been discounted.
+ */
+static void pc_page_unlock(pc_page_t *p)
+{
+	if (!p)
+		return;
+	p->flags &= ~PC_PAGE_LOCKED;
+	if (p->flags & PC_PAGE_DEAD)
+		pc_page_free(p);
+}
+
 // ============================================================================
 // Walk cluster chain to get the cluster at page_index
 // ============================================================================
@@ -525,7 +550,7 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 				spin_unlock_irqrestore(&pc_dirty_lock, df);
 				__sync_fetch_and_add(&pc_stat_writebacks, 1);
 			}
-			pg->flags &= ~PC_PAGE_LOCKED;
+			pc_page_unlock(pg);
 
 			spin_lock_irqsave(&pc_lru_lock, &lru_flags);
 			// If flush succeeded, the page is now clean and can be
@@ -1134,14 +1159,14 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 					p->cluster_id, p->cluster_id,
 					p->page_index, blk,
 					(unsigned)p->flags);
-				p->flags &= ~PC_PAGE_LOCKED;
+				pc_page_unlock(p);
 				p = 0;
 			} else {
 				lba = vfs_sb_block_to_lba(sb, blk);
 				/* LBA 0 is the boot block, used as the sentinel
 				 * for a hole -- never file data. */
 				if (lba == 0) {
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					p = 0;
 				}
 			}
@@ -1179,7 +1204,7 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 				} else {
 					/* Still dirty: it did not reach the
 					 * device, and forgetting that loses it. */
-					run[k]->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(run[k]);
 				}
 			}
 			nrun = 0;
@@ -1294,12 +1319,11 @@ void pagecache_write_end(pc_page_t *page)
 	 * removed, so there is nothing to publish and nobody to publish it to.
 	 * We are the last reference; the frame goes back here. */
 	if (page->flags & PC_PAGE_DEAD) {
-		page->flags &= ~PC_PAGE_LOCKED;
-		pc_page_free(page);
+		pc_page_unlock(page); /* frees it */
 		return;
 	}
 	pagecache_mark_dirty(page);
-	page->flags &= ~PC_PAGE_LOCKED;
+	pc_page_unlock(page);
 }
 
 /* Release a page taken for writing WITHOUT publishing it: the write failed and
@@ -1308,12 +1332,7 @@ void pagecache_write_abort(pc_page_t *page)
 {
 	if (!page)
 		return;
-	if (page->flags & PC_PAGE_DEAD) {
-		page->flags &= ~PC_PAGE_LOCKED;
-		pc_page_free(page);
-		return;
-	}
-	page->flags &= ~PC_PAGE_LOCKED;
+	pc_page_unlock(page);
 }
 
 /*
@@ -1365,7 +1384,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 		vfs_superblock_t *sb = g_root_sb;
 		if (!sb) {
 			for (int i = 0; i < batch_count; i++)
-				batch[i]->flags &= ~PC_PAGE_LOCKED;
+				pc_page_unlock(batch[i]);
 			break;
 		}
 		vfs_sb_lock_io(sb);
@@ -1375,7 +1394,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 			/* Block sizes that do not match a page keep the
 			 * per-file path; this set walk is for the common one. */
 			for (int i = 0; i < batch_count; i++)
-				batch[i]->flags &= ~PC_PAGE_LOCKED;
+				pc_page_unlock(batch[i]);
 			vfs_sb_unlock_io(sb);
 			for (unsigned i = 0; i < nids; i++)
 				wrote += pagecache_flush_file(ids[i]);
@@ -1430,7 +1449,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 		vfs_superblock_t *sb = g_root_sb;
 		if (!sb) {
 			for (int i = 0; i < batch_count; i++)
-				batch[i]->flags &= ~PC_PAGE_LOCKED;
+				pc_page_unlock(batch[i]);
 			break;
 		}
 		const block_device_t *bdev = vfs_sb_bdev(sb);
@@ -1466,7 +1485,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 				unsigned long disk_block = pc_walk_chain(
 					sb, p->cluster_id, block_index);
 				if (disk_block == 0 || disk_block >= eoc) {
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					continue;
 				}
 				/* Guard against the FS-reserved metadata block (FAT32 root
@@ -1478,7 +1497,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 						"inode_id=%lu page_idx=%lu bi=%lu\n",
 						p->cluster_id, p->page_index,
 						block_index);
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					continue;
 				}
 
@@ -1489,7 +1508,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 				 * page there (it is the superblock, and a hole
 				 * needs allocation we do not do); leave dirty. */
 				if (lba == 0) {
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					continue;
 				}
 				if (bs == PAGE_SIZE) {
@@ -1546,6 +1565,10 @@ int pagecache_flush_file(unsigned long cluster_id)
 			spin_lock_irqsave(&pc_dirty_lock, &flags);
 			dirty_list_remove(p);
 			spin_unlock_irqrestore(&pc_dirty_lock, flags);
+			/* Detached while we were writing it back: off every
+			 * list now, so this is the last reference. */
+			if (p->flags & PC_PAGE_DEAD)
+				pc_page_free(p);
 		}
 		vfs_sb_unlock_io(sb);
 
@@ -1635,7 +1658,7 @@ static int pagecache_flush_all_batch(void)
 		vfs_superblock_t *sb = g_root_sb;
 		if (!sb) {
 			for (int i = 0; i < batch_count; i++)
-				batch[i]->flags &= ~PC_PAGE_LOCKED;
+				pc_page_unlock(batch[i]);
 			break;
 		}
 		const block_device_t *bdev = vfs_sb_bdev(sb);
@@ -1671,7 +1694,7 @@ static int pagecache_flush_all_batch(void)
 				unsigned long disk_block = pc_walk_chain(
 					sb, p->cluster_id, block_index);
 				if (disk_block == 0 || disk_block >= eoc) {
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					continue;
 				}
 				if (reserved_meta &&
@@ -1680,7 +1703,7 @@ static int pagecache_flush_all_batch(void)
 						"inode_id=%lu page_idx=%lu bi=%lu\n",
 						p->cluster_id, p->page_index,
 						block_index);
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					continue;
 				}
 
@@ -1689,7 +1712,7 @@ static int pagecache_flush_all_batch(void)
 				/* lba 0 marks a hole: never persist a dirty page
 				 * there (superblock; needs allocation). */
 				if (lba == 0) {
-					p->flags &= ~PC_PAGE_LOCKED;
+					pc_page_unlock(p);
 					continue;
 				}
 				if (bs == PAGE_SIZE) {
@@ -1747,6 +1770,10 @@ static int pagecache_flush_all_batch(void)
 			spin_lock_irqsave(&pc_dirty_lock, &df);
 			dirty_list_remove(p);
 			spin_unlock_irqrestore(&pc_dirty_lock, df);
+			/* Detached while we were writing it back: off every
+			 * list now, so this is the last reference. */
+			if (p->flags & PC_PAGE_DEAD)
+				pc_page_free(p);
 		}
 		vfs_sb_unlock_io(sb);
 	} while (0);

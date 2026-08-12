@@ -427,6 +427,30 @@ void mm_print_memory_stats(void);
 void mm_print_heap_stats(void);
 bool mm_validate_heap(void);
 uint64_t mm_get_free_pages(void);
+/* Print which call sites hold the allocated pages (diagnostics). */
+/* Leak-hunt instrumentation, DEBUG builds only -- see the block comment in
+ * kernel/mm/memory.c.  When it is off the counters do not exist and every use
+ * below compiles to nothing, so no call site needs its own #ifdef. */
+#ifndef MM_LEAK_INSTRUMENTATION
+#define MM_LEAK_INSTRUMENTATION DEBUG
+#endif
+
+#if MM_LEAK_INSTRUMENTATION
+void mm_dump_page_owners(void);
+extern volatile unsigned long g_as_destroy_exit_self;
+extern volatile unsigned long g_as_exit_self_own;
+extern volatile unsigned long g_as_exit_self_mm;
+extern volatile unsigned long g_mm_created;
+extern volatile unsigned long g_mm_freed;
+extern volatile unsigned long g_as_destroy_remove_task;
+extern volatile unsigned long g_as_destroy_exec;
+#define MM_LEAK_INC(v) __sync_fetch_and_add(&(v), 1)
+#else
+static inline void mm_dump_page_owners(void)
+{
+}
+#define MM_LEAK_INC(v) do { } while (0)
+#endif
 
 // Page table management
 uint64_t *mm_get_page_table(uint64_t virtual_addr, bool create);

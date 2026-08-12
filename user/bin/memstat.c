@@ -23,20 +23,30 @@ typedef struct {
 	uint64_t pagecache_pages;
 } memory_stats_t;
 
-static long syscall1(long num, long a1)
+static long syscall2(long num, long a1, long a2)
 {
 	long ret;
 	__asm__ volatile("syscall"
 			 : "=a"(ret)
-			 : "a"(num), "D"(a1)
+			 : "a"(num), "D"(a1), "S"(a2)
 			 : "rcx", "r11", "memory");
 	return ret;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	/* -o also asks the kernel to print which call sites hold the allocated
+	 * pages, and what is still holding address spaces.  That report goes to
+	 * the kernel log (dmesg / serial), because it is the only place a
+	 * variable-length answer belongs.
+	 *
+	 * It only exists in a kernel built with DEBUG=1: the tracking costs 4
+	 * bytes per physical page and a lock on every address-space create and
+	 * destroy, so it is compiled out of ordinary builds.  On one of those
+	 * the flag is accepted and simply produces nothing. */
+	int owners = (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'o');
 	memory_stats_t stats = { 0 };
-	long ret = syscall1(SYS_MEMSTATS, (long)&stats);
+	long ret = syscall2(SYS_MEMSTATS, (long)&stats, owners);
 	if (ret < 0) {
 		fprintf(stderr, "memstat: failed (%ld)\n", ret);
 		return 1;
@@ -77,5 +87,8 @@ int main(void)
 	printf("  Free:      %llu KB\n",
 	       (unsigned long long)(stats.heap_free / 1024));
 	printf("========================\n");
+	if (owners)
+		printf("(page-owner report written to the kernel log: dmesg;\n"
+		       " nothing there means this kernel was not built with DEBUG=1)\n");
 	return 0;
 }

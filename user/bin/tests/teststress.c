@@ -68,8 +68,16 @@ static int try_exec(char *argv[])
 			path_buf[j++] = *p++;
 		path_buf[j] = '\0';
 
-		// Try this path
-		execve(path_buf, argv, NULL);
+		/* Pass our own environment down, the way a shell does.
+		 *
+		 * This used to pass NULL, which does not mean "inherit" -- it
+		 * means the child starts with an EMPTY environment.  Every test
+		 * run from here therefore saw no TERM, no HOME, no PATH, and
+		 * behaved differently under stress than when run directly;
+		 * test_libc's "environ is populated at startup" failed for
+		 * exactly that reason, correctly reporting an environment this
+		 * harness had thrown away. */
+		execve(path_buf, argv, environ);
 	}
 	return -1; // All failed
 }
