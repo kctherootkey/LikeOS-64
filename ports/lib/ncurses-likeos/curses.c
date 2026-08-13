@@ -1538,8 +1538,25 @@ static int _match_escape(void)
         return '\033';
     }
 
-    /* Unrecognized sequence - push back all bytes except ESC */
-    for (int i = seq_len - 1; i >= 1; i--)
+    /* Unrecognized sequence: hand the ESC back to the caller and return the
+     * rest of the bytes to the input stream, IN THE ORDER THEY ARRIVED.
+     *
+     * This loop used to count DOWN, which is what you write when ungetch()
+     * pushes onto the front of a stack -- push last-to-first and they come
+     * back first-to-last.  ungetch() here is a queue: it appends at the tail
+     * and getch() takes from the head (see below).  Pushing in reverse into a
+     * queue hands the caller the sequence backwards.
+     *
+     * "\033[200~" came out as "\033~002[", which is not a corruption anyone
+     * would guess at from the symptom.  An application parsing escape
+     * sequences sees ESC followed by a byte that cannot continue one, which
+     * by every convention means the user pressed Escape and then that key --
+     * so a bracketed paste arrived as Meta-tilde followed by the marker's
+     * digits as literal text.  Every sequence this function fails to
+     * recognise was affected; it only became visible when something started
+     * sending one whose bytes were individually printable.
+     */
+    for (int i = 1; i < seq_len; i++)
         ungetch((unsigned char)seq[i]);
     return '\033';
 }

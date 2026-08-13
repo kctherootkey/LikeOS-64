@@ -49,7 +49,7 @@ PROGRAMS = hello ls cat cmp pwd stat progerr memstat uname nproc shutdown powero
 
 # Test programs (sources live in user/bin/tests/, built as tests/<name>)
 # test_libc has a custom rule (needs libpam+libcrypt for the auth tests).
-TESTS = test_syscalls testmem teststress netstress openssltest usbtest ext4test fbtest pmap
+TESTS = test_syscalls testmem teststress netstress openssltest usbtest ext4test fbtest pmap ttydump
 TEST_BINS = $(addprefix tests/,$(TESTS))
 
 all: $(PROGRAMS) $(TEST_BINS) tests/test_libc login passwd su addgroup delgroup reboot halt

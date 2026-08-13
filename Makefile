@@ -322,7 +322,7 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
 	libdlbase.so libdlchain.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
-	netstress openssltest usbtest ext4test permbench fbtest pmap
+	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -864,6 +864,14 @@ $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/pmap: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/pmap
 	cp $(USER_DIR)/tests/pmap $@
+	$(STRIP) --strip-unneeded $@
+
+# ttydump: shows what the terminal actually sends, and in which reads.  Every
+# other reader on this image is canonical-mode, which hides any sequence that
+# does not end in a newline; this one sets its own raw mode.
+$(BUILD_DIR)/ttydump: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/ttydump
+	cp $(USER_DIR)/tests/ttydump $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/teststress: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1567,6 +1575,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/permbench     $(EXT4_STAGING)/usr/local/bin/permbench
 	cp $(BUILD_DIR)/fbtest        $(EXT4_STAGING)/usr/local/bin/fbtest
 	cp $(BUILD_DIR)/pmap          $(EXT4_STAGING)/usr/local/bin/pmap
+	cp $(BUILD_DIR)/ttydump       $(EXT4_STAGING)/usr/local/bin/ttydump
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh
@@ -1653,6 +1662,22 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	mkdir -p $(EXT4_STAGING)/etc/skel/Desktop $(EXT4_STAGING)/root/Desktop
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/etc/skel/Desktop/
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/root/Desktop/
+	# The icons appear in modification-time order, oldest first: PCManFM's
+	# desktop defaults to sorting by mtime (desktop_sort_by, app-config.c),
+	# not by name.  cp gives every file the same timestamp, so the tie broke
+	# on name and the order was alphabetical -- which put a newly added
+	# Calculator at the very top.  Stamping them one second apart in the
+	# order below is what actually decides the layout, so it is written here
+	# rather than left to fall out of the filenames.
+	i=0; for f in pcmanfm xterm mousepad xnedit netsurf claws-mail xcalc; do \
+		for d in $(EXT4_STAGING)/etc/skel/Desktop \
+		         $(EXT4_STAGING)/root/Desktop; do \
+			[ -f "$$d/$$f.desktop" ] && \
+				touch -d "2026-01-01 00:00:$$i UTC" \
+				      "$$d/$$f.desktop"; \
+		done; \
+		i=$$((i+1)); \
+	done; true
 	chmod 0644 $(EXT4_STAGING)/etc/skel/Desktop/*.desktop \
 	           $(EXT4_STAGING)/root/Desktop/*.desktop
 	chmod 0700 $(EXT4_STAGING)/root

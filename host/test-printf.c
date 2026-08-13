@@ -171,6 +171,15 @@ int main(void)
 		SWEEP("%zu", "%zu", (size_t)lls[i]);
 		SWEEP("%zd", "%zd", (ssize_t)lls[i]);
 		SWEEP("%020lld", "%020lld", lls[i]);
+		/* Thousands grouping.  This is the C locale, where the
+		 * grouping is "none" and the flag must therefore change
+		 * nothing -- but it still has to be RECOGNISED.  Falling out
+		 * of the flag loop on it made the rest of the conversion
+		 * literal text, which is how a file manager's properties
+		 * window came to report a size of 'llu bytes. */
+		SWEEP("%'llu", "%'llu", (unsigned long long)lls[i]);
+		SWEEP("%'d", "%'d", (int)lls[i]);
+		SWEEP("%'-12ld", "%'-12ld", (long)lls[i]);
 	}
 
 	/* ---- strings and chars ---- */

@@ -1,0 +1,20 @@
+[Desktop Entry]
+# Desktop entry for xcalc, written for this image; the xcalc port installs
+# none of its own (the X.Org apps predate the desktop-entry spec and ship
+# only an app-defaults file).
+#
+# Icon: accessories-calculator resolves to a PNG in the staged Adwaita and
+# hicolor themes.  There is no librsvg on the image, so an icon name that
+# only has an SVG behind it renders as nothing at all -- checked before
+# being written here, the same as every other launcher on this image.
+Type=Application
+Version=1.0
+Name=Calculator
+GenericName=Calculator
+Comment=Perform calculations
+Exec=xcalc
+Icon=accessories-calculator
+Terminal=false
+StartupNotify=false
+Categories=Utility;Calculator;
+Keywords=calculation;arithmetic;maths;

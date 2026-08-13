@@ -16,6 +16,11 @@
  *   pmap <pid>              one snapshot, every region listed
  *   pmap -s <pid>           summary only
  *   pmap -w [-n SEC] <pid>  watch, printing deltas
+ *
+ * Only your own processes: the report says where another process keeps its
+ * code, its stacks and its heap, so the kernel hands it out only to the user
+ * that owns the process (and to root, who may look at any of them).  A pid
+ * belonging to someone else answers "Operation not permitted".
  */
 
 #include <stdio.h>

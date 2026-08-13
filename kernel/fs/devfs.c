@@ -675,7 +675,8 @@ long devfs_write(vfs_file_t *f, const void *buf, long bytes)
 	}
 	if (df->type == DEVFS_TYPE_PTY_MASTER) {
 		WARN_ON(df->pty_id < 0);
-		return tty_pty_master_write(df->pty_id, buf, bytes);
+		return tty_pty_master_write(df->pty_id, buf, bytes,
+					    (f->flags & O_NONBLOCK) ? 1 : 0);
 	}
 	if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
 		// Writing to /dev/random mixes data into the entropy pool and can

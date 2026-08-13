@@ -7845,6 +7845,39 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 	}
 }
 
+/* May the caller read another process's private state — the layout of its
+ * address space?
+ *
+ * Deliberately stricter than the kill(2) rule in signal_permission(): sending
+ * a signal only needs ONE of the sender's uids to match one of the target's,
+ * but this hands out the address of every mapping another process owns, which
+ * is exactly what an attacker wants and what address-space randomisation
+ * exists to withhold.  So it follows the conventional ptrace read rule
+ * instead: the caller's effective uid must match ALL of the target's uids,
+ * real, effective and saved.  A program the user started but which changed
+ * identity through a setuid exec is therefore opaque to them, which is the
+ * point of the rule — its address space is no longer theirs to read.
+ *
+ * Privileged callers (capable()) may read any process, and kernel context is
+ * privileged by definition.  Returns 0 to allow or -EPERM to deny.
+ */
+static int proc_read_permission(const task_t *target)
+{
+	task_t *cur = sched_current();
+
+	if (!target)
+		return -ESRCH;
+	if (!cur)
+		return 0; /* kernel context */
+	if (capable())
+		return 0;
+	if (cur->cred.euid == target->cred.uid &&
+	    cur->cred.euid == target->cred.euid &&
+	    cur->cred.euid == target->cred.suid)
+		return 0;
+	return -EPERM;
+}
+
 // SYS_GETPROCINFO - retrieve info about all processes
 // a1 = pointer to user-space procinfo_t array
 // a2 = max number of entries the array can hold
@@ -7860,6 +7893,11 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
  * Reported for the PROCESS: the bookkeeping lives on the thread group leader
  * (task_mm_owner), so asking about any thread answers for the address space it
  * shares.
+ *
+ * Restricted to processes the caller owns (proc_read_permission); root sees
+ * every process.  The report is a map of where another process keeps its code,
+ * its stacks and its heap, so it is not something one user may take from
+ * another.
  */
 static int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 			       uint64_t buf_ptr, uint64_t max_count)
@@ -7890,12 +7928,22 @@ static int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 	{
 		task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
 		task_t *mm = t ? task_mm_owner(t) : NULL;
+		int perm;
 
 		if (!t || !mm) {
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			if (kbuf)
 				kfree(kbuf);
 			return -ESRCH;
+		}
+		/* Checked against the task named, not the mm owner: they share
+		 * an address space, but the caller asked about this pid. */
+		perm = proc_read_permission(t);
+		if (perm != 0) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			if (kbuf)
+				kfree(kbuf);
+			return perm;
 		}
 		kinfo.pid = (int)t->id;
 		kinfo.tgid = t->tgid;
@@ -8709,9 +8757,13 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
      * This keeps fds aligned with the imsg frame the sender attached them to. */
 	int deliver_fd_now = 0;
 	uint64_t fd_off = 0;
+	/* Where this call starts reading.  Captured before anything is
+	 * received, because the pending-fd question has to be asked again
+	 * afterwards against this same position -- see below. */
+	uint64_t start_br = us->bytes_read;
 	int has_fd = (unix_peek_fd_offset(us, &fd_off) == 0);
 	if (has_fd) {
-		uint64_t br = us->bytes_read;
+		uint64_t br = start_br;
 		if (br < fd_off) {
 			size_t cap = (size_t)(fd_off - br);
 			if (total > cap)
@@ -8774,6 +8826,37 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 			break; /* ring drained */
 	}
 	got = (int)off;
+
+	/* Ask again, now that the data is in hand.
+	 *
+	 * The question "is a descriptor queued for this point in the stream"
+	 * was answered above, BEFORE the receive -- and the receive blocks.  A
+	 * reader that arrives at an empty socket and waits there is answered
+	 * "no descriptor pending" while the sender has not sent anything yet;
+	 * the sender then queues the descriptor and writes the byte that goes
+	 * with it, the reader wakes and returns that byte, and the answer from
+	 * before it slept is the one that decides the call.  The byte arrives
+	 * with no control message attached.
+	 *
+	 * That is a race on which side gets there first, so it fails only
+	 * sometimes.  It is what a login over ssh runs into: the monitor
+	 * process passes the terminal it just allocated across this socket,
+	 * one descriptor with one byte of payload, and the session's half of
+	 * the handshake reaches the socket first about as often as not.  It
+	 * reads the byte, finds no header on it, gives up -- and the monitor's
+	 * own send then fails with a broken pipe because the reader is already
+	 * gone.  Which of the two errors gets reported depends on the timing;
+	 * the cause is the same either way.
+	 *
+	 * Re-asking against start_br -- where this call began reading, not
+	 * where it ended -- is what makes the answer belong to the bytes being
+	 * returned.  A descriptor queued at or before that point accompanies
+	 * data this call has already handed over, so it is due now; one queued
+	 * after it belongs to a later frame and must wait, exactly as the
+	 * clamp above arranges when the answer was known in time. */
+	if (!deliver_fd_now && got > 0 &&
+	    unix_peek_fd_offset(us, &fd_off) == 0 && fd_off <= start_br)
+		deliver_fd_now = 1;
 
 	/* Deliver one pending fd via SCM_RIGHTS, but only at the correct
      * byte boundary. */
@@ -9208,13 +9291,25 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		if (!a1)
 			return -EFAULT;
 		memory_stats_t stats;
-		mm_get_memory_stats(&stats);
-		if (copy_to_user((void *)a1, &stats, sizeof(stats)) != 0)
-			return -EFAULT;
 		/* a2: also print who owns the allocated pages, to the kernel
 		 * log.  It goes there rather than to the caller because it is
 		 * a variable-length report meant to be read next to the rest
-		 * of the boot output. */
+		 * of the boot output.
+		 *
+		 * Privileged, and checked before anything is reported: the
+		 * page-owner report names the call sites and the address
+		 * spaces of every process on the machine, and it lands in the
+		 * kernel log, which is itself root-only to read (sys_klogctl).
+		 * Handing an unprivileged caller the ability to write to it
+		 * would also let anyone push the log's older contents out of
+		 * the ring.  The plain statistics above stay open to everyone
+		 * -- they are a system-wide total, the same thing free(1)
+		 * prints. */
+		if (a2 && !capable())
+			return -EPERM;
+		mm_get_memory_stats(&stats);
+		if (copy_to_user((void *)a1, &stats, sizeof(stats)) != 0)
+			return -EFAULT;
 		if (a2) {
 			mm_dump_page_owners();
 			sched_dump_task_leaks();

@@ -134,7 +134,8 @@ void tty_pty_slave_set_vf(int id, void *vf); // diagnostic (pty dump)
 void tty_dump_ptys(tty_t *out); // Ctrl+N diagnostic dump
 int tty_pty_is_allocated(int id);
 long tty_pty_master_read(int id, void *buf, long count, int nonblock);
-long tty_pty_master_write(int id, const void *buf, long count);
+long tty_pty_master_write(int id, const void *buf, long count,
+			  int nonblock);
 int tty_pty_master_close(int id);
 int tty_pty_master_poll(int id, int events);
 int tty_pty_slave_close(int id);

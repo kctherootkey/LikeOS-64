@@ -291,29 +291,37 @@ Function "move-or-iconify" { f.move f.deltastop f.iconify }
 # Set some useful bindings.  Sort of uwm-ish, sort of simple-button-ish
 #
 #
-# Root menu: the LEFT button over the background opens it.
+# Root menus: Alt+F1 and Alt+F2 from the keyboard, and the Button1/Button2
+# root bindings below for when the desktop is not running.
 #
-# That takes a patch on PCManFM's side to work at all.  A window manager only
-# hears about root-window clicks by selecting ButtonPressMask ON the root -- it
-# does not grab them -- and PCManFM's desktop covers the root completely, so
-# every click on the background stops there and never reaches ctwm.  PCManFM
-# already hands button 3 back when show_wm_menu is set; the port patch
-# 0001-give-the-window-manager-button-1-on-the-blank-desktop does the same for
-# button 1, so this binding fires again.
+# The mouse route over the background is deliberately NOT wired up while the
+# desktop runs, and the reason is worth writing down because it looks like
+# something that ought to work.  A window manager only hears about root-window
+# clicks by selecting ButtonPressMask ON the root -- it does not grab them --
+# and PCManFM's desktop covers the root completely, so a click on the
+# background stops at PCManFM and the bindings below never fire.  PCManFM can
+# be patched to hand the click back (that is what show_wm_menu does for button
+# 3), and that patch existed here for button 1.  It was removed.
 #
-# Only the PRESS is forwarded, never the release.  ctwm posts the menu on the
-# press and grabs the pointer for it, so a forwarded release would land on the
-# menu it had just posted and pick whatever entry sat under the cursor -- which
-# is how a desktop click used to select "Restart ctwm" and strip the session.
+# What it cost: with StayUpMenus, a press that does not select an entry leaves
+# the menu POSTED, and ctwm returns from HandleButtonRelease before it reaches
+# its own XUngrabPointer -- so it keeps the pointer grab it took to post the
+# menu.  Every click after that goes to ctwm rather than to the window under
+# the cursor, and the first one is spent dismissing the menu.  Clicking the
+# desktop and then clicking a file-manager window did nothing until the window
+# was clicked a second time.  That is ctwm behaving as designed for a stay-up
+# menu; it is only intolerable because button 1 on the desktop is a button
+# people press without meaning to open anything.
 #
-# Button 3 stays PCManFM's (show_wm_menu=0), so the desktop keeps its own
-# context menu.  Alt+F1 and Alt+F2 reach the same two menus from the keyboard,
-# which is the way back if the desktop is not running or has died.
+# So button 1 on the blank desktop is PCManFM's again, which is upstream's own
+# behaviour: rubber-band selection.  Button 3 stays PCManFM's as well
+# (show_wm_menu=0), so the desktop keeps its own context menu.
 #
 # StayUpMenus is what makes a posted menu stay: without it a ctwm menu is
 # press-drag-release, so it would vanish the instant the button came up.  With
 # it, a press that does not select simply leaves the menu posted, and the next
-# click either activates the entry under the pointer or dismisses it.
+# click either activates the entry under the pointer or dismisses it.  That is
+# what you want from Alt+F1, where the menu is asked for deliberately.
 #
 StayUpMenus
 
@@ -355,9 +363,13 @@ NoBorder
 }
 
 
+# Dead while the desktop is running -- it covers the root, so these never
+# fire -- and kept for the session where it is not (a bare startx, or after
+# the desktop has died), which is exactly when a way into the menus matters.
 Button1 =	: root		: f.menu "defops"
 Button2 =	: root		: f.menu "windowops"
 
+# The route that always works, desktop or no desktop.
 "F1" = m	: all		: f.menu "defops"
 "F2" = m	: all		: f.menu "windowops"
 

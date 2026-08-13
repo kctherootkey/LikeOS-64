@@ -303,12 +303,36 @@ void read_keys_from(WINDOW *frame)
 	/* Restore blocking-input mode. */
 	nodelay(frame, FALSE);
 
-#ifdef DEBUG
-	fprintf(stderr, "\nSequence of hex codes:");
-	for (size_t i = 0; i < waiting_codes; i++)
-		fprintf(stderr, " %3x", key_buffer[i]);
-	fprintf(stderr, "\n");
-#endif
+	/* Dump the burst when NANO_KEYDUMP is set in the environment.
+	 *
+	 * Upstream's own debug block, made reachable without a debug build.
+	 * It is the only view of what this parser actually RECEIVES, which is
+	 * a different thing from what the terminal sent: ncurses sits in
+	 * between and does its own sequence matching first, so a paste that
+	 * arrives at the terminal driver whole and in one read can still
+	 * reach here in pieces, or with part of it already eaten.  The
+	 * difference between those two views is where a paste that is
+	 * demonstrably intact on the wire still comes out wrong.
+	 *
+	 * Off unless asked for -- one getenv on the first call, nothing in
+	 * the read path after that.  Writes to stderr, so redirect it:
+	 * the screen belongs to the editor.
+	 *
+	 *     NANO_KEYDUMP=1 nano 2>/tmp/keys.log
+	 */
+	{
+		static int keydump = -1;
+
+		if (keydump < 0)
+			keydump = (getenv("NANO_KEYDUMP") != NULL);
+		if (keydump) {
+			fprintf(stderr, "keys[%zu]:", waiting_codes);
+			for (size_t i = 0; i < waiting_codes; i++)
+				fprintf(stderr, " %02x", key_buffer[i]);
+			fprintf(stderr, "\n");
+			fflush(stderr);
+		}
+	}
 }
 
 /* Return the number of key codes waiting in the keystroke buffer. */

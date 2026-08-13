@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <errno.h>
 
 #define SYS_MEMSTATS 300
 
@@ -43,10 +44,19 @@ int main(int argc, char **argv)
 	 * It only exists in a kernel built with DEBUG=1: the tracking costs 4
 	 * bytes per physical page and a lock on every address-space create and
 	 * destroy, so it is compiled out of ordinary builds.  On one of those
-	 * the flag is accepted and simply produces nothing. */
+	 * the flag is accepted and simply produces nothing.
+	 *
+	 * It is also root-only: the report names every process's address space
+	 * and it is written to the kernel log, which only root may read.  The
+	 * statistics without it are open to anyone. */
 	int owners = (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'o');
 	memory_stats_t stats = { 0 };
 	long ret = syscall2(SYS_MEMSTATS, (long)&stats, owners);
+	if (ret == -EPERM) {
+		fprintf(stderr,
+			"memstat: -o: permission denied (must be root)\n");
+		return 1;
+	}
 	if (ret < 0) {
 		fprintf(stderr, "memstat: failed (%ld)\n", ret);
 		return 1;

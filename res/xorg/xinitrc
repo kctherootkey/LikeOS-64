@@ -134,6 +134,16 @@ export XCURSOR_THEME XCURSOR_SIZE
 # behind every other window instead of covering them.
 pcmanfm --desktop &
 
+# The window manager's pid, recorded so the desktop menu can reach it.
+#
+# exec does not change the pid, so $$ here IS what ctwm will be running as a
+# line further down.  That is the whole reason this can be written in advance:
+# ctwm advertises no window a client could ask to restart or quit -- it sets
+# _NET_SUPPORTING_WM_CHECK but no _NET_WM_PID -- and it restarts on SIGHUP and
+# shuts down on SIGTERM, so a pid is all a menu entry needs.  Written before
+# the exec rather than after, because there is no after.
+echo $$ > "$HOME/.ctwm.pid"
+
 # The window manager runs in the FOREGROUND, which is the conventional
 # arrangement for twm and its relatives: "Exit" on the root menu then ends the
 # session and stops the server, rather than merely removing the decorations.

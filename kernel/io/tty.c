@@ -86,6 +86,9 @@ typedef struct pty {
 	uint32_t m_count;
 	spinlock_t lock;
 	task_t *master_read_waiters;
+	/* Channel id (address only, no list) for a master parked in
+	 * tty_pty_master_write waiting for room in the slave's input queue. */
+	task_t *slave_write_waiters;
 	int master_open;
 	int slave_open;
 	void *slave_vf; // diagnostic: slave's vfs_file (refcount visibility)
@@ -134,10 +137,23 @@ static void tty_enqueue_read(tty_t *tty, char c)
 	spin_lock_irqsave(&tty_lock, &flags);
 
 	if (tty->read_count >= sizeof(tty->read_buf)) {
+		/* Say WHICH queue overflowed and what was thrown away.
+		 *
+		 * "input dropped" on its own cannot be acted on: the console
+		 * and every pty share this path, and a full console queue
+		 * that nobody is reading is ordinary, while a full pty queue
+		 * means a program's input is being corrupted.  Those want
+		 * opposite reactions and the message could not tell them
+		 * apart.  The byte is printed because a dropped escape
+		 * sequence is what the damage looks like from userspace --
+		 * losing 0x1b or '[' out of the middle of one turns a paste
+		 * into an unbound-key error. */
 		WARN_RATELIMIT(
 			1,
-			"tty_enqueue_read: input dropped (read_buf full, count=%u)",
-			tty->read_count);
+			"tty input dropped on %s%d: queue full (%u bytes), byte 0x%02x",
+			tty->is_pty ? "pts/" : "console",
+			tty->is_pty && tty->priv ? ((pty_t *)tty->priv)->id : 0,
+			tty->read_count, (unsigned char)c);
 		spin_unlock_irqrestore(&tty_lock, flags);
 		return;
 	}
@@ -160,6 +176,38 @@ void tty_enqueue_read_locked(tty_t *tty, char c)
 	tty->read_buf[tty->read_tail] = c;
 	tty->read_tail = (tty->read_tail + 1) % sizeof(tty->read_buf);
 	tty->read_count++;
+}
+
+/* Is there room in the input queue for one more character?
+ *
+ * Not always one byte's worth: in canonical mode the line sits in canon_buf
+ * until a newline commits the whole of it at once, so the character that ends
+ * a line needs room for the line.  canon_buf is a quarter of read_buf, so the
+ * requirement is always satisfiable once the queue drains.
+ *
+ * Callers that park on the answer must re-check it under tty_lock, hence the
+ * locked form.
+ */
+static int tty_input_has_room_locked(const tty_t *tty)
+{
+	uint32_t space = (uint32_t)sizeof(tty->read_buf) - tty->read_count;
+	uint32_t need = (tty->term.c_lflag & ICANON) ?
+				(uint32_t)tty->canon_len + 1 :
+				1;
+
+	lockdep_assert_held(&tty_lock);
+	return space >= need;
+}
+
+static int tty_input_has_room(const tty_t *tty)
+{
+	uint64_t flags;
+	int room;
+
+	spin_lock_irqsave(&tty_lock, &flags);
+	room = tty_input_has_room_locked(tty);
+	spin_unlock_irqrestore(&tty_lock, flags);
+	return room;
 }
 
 static int tty_dequeue_read(tty_t *tty, char *out)
@@ -564,16 +612,39 @@ void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta)
 	tty_wake_readers(&tty->read_waiters);
 }
 
-void tty_input_char(tty_t *tty, char c, int ctrl)
+/* Feed one character through the line discipline.  Returns non-zero when the
+ * character made input available to a reader -- i.e. when a wake is owed.
+ *
+ * Split out so a bulk producer can deliver a whole write and wake ONCE at the
+ * end of it.  Waking per character does not merely cost wakeups, it chops the
+ * write up on the way out: a reader parked on an empty queue is woken by the
+ * first byte, runs, takes that byte, finds nothing behind it and returns --
+ * while the rest of the same write is still being pushed in behind it.
+ *
+ * Measured, not surmised.  A terminal on the far end of an ssh session sends
+ * a bracketed paste as one 16-byte write; dumping the raw reads on the slave
+ * side showed that write arriving as sixteen one-byte reads, and the
+ * terminal's own cursor-position report fragmenting the same way, with the
+ * occasional whole-burst read on the runs where the reader had not yet parked.
+ *
+ * That is fatal to anything parsing escape sequences.  A sequence is only
+ * recognisable while its bytes are together: an editor that reads a lone ESC
+ * with nothing behind it has to conclude the user pressed Escape, because
+ * that is what a lone ESC means.  The bytes that follow are then taken as
+ * individual keys -- the paste's framing markers turn into unbound-key errors
+ * and the text they were supposed to frame is mangled.  Nothing the reader
+ * can do fixes this; one write has to arrive as one read.
+ */
+static int tty_input_char_core(tty_t *tty, char c, int ctrl)
 {
 	BUG_ON(tty == NULL);
 	if (!tty || c == 0) {
-		return;
+		return 0;
 	}
 	// Exclusive keyboard grab: hardware input bypasses the console tty
 	// entirely (the grabbing display server reads /dev/input/event0).
 	if (!tty->is_pty && evdev_kbd_grabbed()) {
-		return;
+		return 0;
 	}
 
 	if (ctrl && c >= 'A' && c <= 'Z') {
@@ -599,7 +670,7 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 			// Clear any pending canonical input
 			tty->canon_len = 0;
 			tty_signal_pgrp(tty, SIGINT);
-			return;
+			return 0;
 		}
 		if (c == tty->term.c_cc[VQUIT]) {
 			// Echo ^\\ if ECHO is set
@@ -610,7 +681,7 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 			}
 			tty->canon_len = 0;
 			tty_signal_pgrp(tty, SIGQUIT);
-			return;
+			return 0;
 		}
 		if (c == tty->term.c_cc[VSUSP]) {
 			// Echo ^Z if ECHO is set
@@ -621,7 +692,7 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 			}
 			tty->canon_len = 0;
 			tty_signal_pgrp(tty, SIGTSTP);
-			return;
+			return 0;
 		}
 	}
 
@@ -636,7 +707,7 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 					tty->output(tty, '\b');
 				}
 			}
-			return;
+			return 0;
 		}
 		if (c == tty->term.c_cc[VKILL]) {
 			while (tty->canon_len > 0) {
@@ -647,20 +718,18 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 					tty->output(tty, '\b');
 				}
 			}
-			return;
+			return 0;
 		}
 		if (c == tty->term.c_cc[VEOF]) {
 			if (tty->canon_len == 0) {
 				tty->eof_pending = 1;
-				tty_wake_readers(&tty->read_waiters);
-				return;
+				return 1;
 			}
 			for (uint16_t i = 0; i < tty->canon_len; ++i) {
 				tty_enqueue_read(tty, tty->canon_buf[i]);
 			}
 			tty->canon_len = 0;
-			tty_wake_readers(&tty->read_waiters);
-			return;
+			return 1;
 		}
 		if (tty->canon_len < sizeof(tty->canon_buf)) {
 			tty->canon_buf[tty->canon_len++] = c;
@@ -677,9 +746,9 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 				tty_enqueue_read(tty, tty->canon_buf[i]);
 			}
 			tty->canon_len = 0;
-			tty_wake_readers(&tty->read_waiters);
+			return 1;
 		}
-		return;
+		return 0;
 	}
 
 	tty_enqueue_read(tty, c);
@@ -690,7 +759,15 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 		}
 		tty->output(tty, c);
 	}
-	tty_wake_readers(&tty->read_waiters);
+	return 1;
+}
+
+/* One character, delivered and announced.  For single-character producers
+ * (the keyboard interrupt); bulk producers use the core and wake once. */
+void tty_input_char(tty_t *tty, char c, int ctrl)
+{
+	if (tty_input_char_core(tty, c, ctrl))
+		tty_wake_readers(&tty->read_waiters);
 }
 
 /* Background process group access check (POSIX job control).  When a
@@ -717,7 +794,24 @@ static long tty_bg_pgrp_check(tty_t *tty, int sig)
 	return -EINTR;
 }
 
+static long tty_read_inner(tty_t *tty, void *buf, long count, int nonblock);
+
+/* Read from the terminal, then release whoever is waiting for the room.
+ *
+ * A master parked in tty_pty_master_write is waiting on exactly this: the
+ * queue it filled being drained.  Woken once per read rather than per byte in
+ * tty_dequeue_read -- waking walks the task list, and a byte at a time would
+ * make every keystroke pay for it. */
 long tty_read(tty_t *tty, void *buf, long count, int nonblock)
+{
+	long ret = tty_read_inner(tty, buf, count, nonblock);
+
+	if (ret > 0 && tty && tty->is_pty && !tty->is_master && tty->priv)
+		tty_wake_readers(&((pty_t *)tty->priv)->slave_write_waiters);
+	return ret;
+}
+
+static long tty_read_inner(tty_t *tty, void *buf, long count, int nonblock)
 {
 	if (!tty || !buf || count <= 0) {
 		return 0;
@@ -1269,9 +1363,32 @@ long tty_pty_master_read(int id, void *buf, long count, int nonblock)
 	return read;
 }
 
-long tty_pty_master_write(int id, const void *buf, long count)
+/* Feed bytes from the master side into the slave's input queue.
+ *
+ * Waits for room rather than discarding.  tty_enqueue_read drops on a full
+ * queue, so anything arriving faster than the slave reads it was thrown away
+ * while write() reported the whole count as delivered -- and the loss landed
+ * wherever the queue happened to fill, which for a paste means in the middle
+ * of its framing markers.  An editor that sees the tail of one without its
+ * head reports the remains as an unbound key and mangles the text.
+ *
+ * That is not a rare condition, it is the normal one for a paste of any size.
+ * The queue holds 1024 bytes; a terminal sends a paste as fast as the link
+ * carries it, and a program that inserts and redraws as it reads is slower
+ * than that by a wide margin.  Dumping the raw reads showed over 512 bytes
+ * standing in the queue at once for a twenty-line paste, against a reader
+ * doing nothing but printing -- an editor does far more per byte.
+ *
+ * Blocking is the conventional behaviour for a master whose slave is not
+ * keeping up, and it is what makes the write honest: the count returned is
+ * the count delivered.  Partial progress returns short rather than sleeping,
+ * so a caller with other work to do gets control back.
+ */
+long tty_pty_master_write(int id, const void *buf, long count, int nonblock)
 {
 	pty_t *pty = tty_get_pty(id);
+	task_t *cur = sched_current();
+
 	if (!pty || !buf || count <= 0) {
 		return -EINVAL;
 	}
@@ -1280,14 +1397,76 @@ long tty_pty_master_write(int id, const void *buf, long count)
      * need an approximately-current pointer for the dump hotkeys. */
 	__atomic_store_n(&g_active_tty, &pty->slave, __ATOMIC_RELAXED);
 	const char *in = (const char *)buf;
-	for (long i = 0; i < count; ++i) {
+	int wake = 0;
+	long i = 0;
+
+	/* Deliver the whole write, THEN wake once.
+	 *
+	 * One write is one burst of input and has to arrive as one read.  See
+	 * tty_input_char_core for what waking per character did to it, and for
+	 * the measurements. */
+	while (i < count) {
+		char c;
+
+		if (!tty_input_has_room(&pty->slave)) {
+			uint64_t f;
+
+			/* Hand back what landed and let the caller retry the
+			 * rest, rather than sleeping on it. */
+			if (i > 0)
+				break;
+			if (nonblock)
+				return -EAGAIN;
+			/* Nobody left to drain it: the line is down. */
+			if (!pty->slave_open)
+				return -EIO;
+			if (cur && signal_pending(cur))
+				return -EINTR;
+			if (!cur)
+				break; /* no task context: cannot wait */
+
+			/* Park against the reader.  Un-parking is a CAS, not a
+			 * store: a reader that claimed us in the window has
+			 * already moved us to READY and is enqueueing us, and
+			 * writing RUNNING over that claim makes its enqueue
+			 * refuse the task.  On a lost CAS, fall through and
+			 * schedule as a READY current -- the queue entry brings
+			 * us straight back. */
+			cur->wait_channel = (void *)&pty->slave_write_waiters;
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			cur->state = TASK_BLOCKED;
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			spin_lock_irqsave(&tty_lock, &f);
+			if (tty_input_has_room_locked(&pty->slave)) {
+				task_state_t expected = TASK_BLOCKED;
+
+				if (__atomic_compare_exchange_n(
+					    &cur->state, &expected, TASK_RUNNING,
+					    false, __ATOMIC_ACQ_REL,
+					    __ATOMIC_ACQUIRE)) {
+					cur->wait_channel = NULL;
+					spin_unlock_irqrestore(&tty_lock, f);
+					continue;
+				}
+			}
+			spin_unlock_irqrestore(&tty_lock, f);
+			sched_schedule();
+			cur->wait_channel = NULL;
+			if (signal_pending(cur))
+				return i > 0 ? i : -EINTR;
+			continue;
+		}
+
 		// SMAP-aware read from user buffer
 		smap_disable();
-		char c = in[i];
+		c = in[i];
 		smap_enable();
-		tty_input_char(&pty->slave, c, 0);
+		wake |= tty_input_char_core(&pty->slave, c, 0);
+		i++;
 	}
-	return count;
+	if (wake)
+		tty_wake_readers(&pty->slave.read_waiters);
+	return i;
 }
 
 int tty_pty_master_close(int id)
@@ -1340,6 +1519,10 @@ int tty_pty_slave_close(int id)
      * POLLHUP.  Without this, the last shell `exit` leaves tmux's I/O
      * loop blocked indefinitely. */
 	tty_wake_readers(&pty->master_read_waiters);
+	/* And any task waiting for room in the input queue: with the slave
+	 * gone nothing will ever drain it, so the wait must end in EIO
+	 * rather than never. */
+	tty_wake_readers(&pty->slave_write_waiters);
 	if (!pty->master_open) {
 		pty->id = -1;
 	}
@@ -1362,7 +1545,12 @@ int tty_pty_master_poll(int id, int events)
 	spin_unlock_irqrestore(&pty->lock, flags);
 	if ((events & (POLLIN | POLLRDNORM)) && count > 0)
 		rev |= POLLIN | POLLRDNORM;
-	if (events & (POLLOUT | POLLWRNORM))
+	/* Writable only while the slave's input queue has room.  Reporting
+	 * it unconditionally sends a caller that multiplexes with select()
+	 * straight into a write that can only return EAGAIN, and round the
+	 * loop again -- a spin, not a wait. */
+	if ((events & (POLLOUT | POLLWRNORM)) &&
+	    (!slave_open || tty_input_has_room(&pty->slave)))
 		rev |= POLLOUT | POLLWRNORM;
 	if (!slave_open && count == 0)
 		rev |= POLLHUP;

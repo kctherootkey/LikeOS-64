@@ -926,6 +926,21 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			} else if (*format == '#') {
 				fl_hash = 1;
 				format++;
+			} else if (*format == '\'') {
+				/* Group the digits of a decimal conversion by
+				 * the locale's thousands separator.  Accepted
+				 * and ignored: this is the C locale, whose
+				 * grouping is "none", so the correct output is
+				 * the ungrouped number.
+				 *
+				 * Ignoring it is not the same as not knowing
+				 * it.  An unrecognised character here ended
+				 * the flag loop, and the conversion that
+				 * followed was not one -- so "%'llu" printed
+				 * the literal text 'llu, which is what a file
+				 * manager's properties window showed instead
+				 * of a byte count. */
+				format++;
 			} else
 				break;
 		}

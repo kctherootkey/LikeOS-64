@@ -1,0 +1,96 @@
+Put the window manager's session commands on the desktop menu.
+
+The desktop covers the root window, so the window manager's own root-button
+menus never see a click, and its two session commands -- restart, and quit,
+which ends the session because the manager runs in the foreground of the
+startup script -- have no route from the mouse at all.  Alt+F1 reaches them
+from the keyboard; this puts them on the menu the desktop does own.
+
+By signal rather than by asking over the X connection: this manager restarts
+on SIGHUP and shuts down on SIGTERM, and it advertises no window a client
+could address -- it sets _NET_SUPPORTING_WM_CHECK but no _NET_WM_PID, so
+there is nothing on the connection to talk to.  The startup script records
+the pid instead, before it execs the manager (exec keeps the pid, which is
+what makes a file written beforehand correct).
+
+The entries land in the CustomCommonOps placeholder, which is the last
+extension point libfm's folder-view menu offers: below "Desktop
+Preferences", above the separator and "Properties" that close the menu.
+There is no placeholder after those, so this is as close to the bottom as
+the menu can be extended without rewriting libfm's own definition.
+
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -34,6 +34,7 @@
+ #include <gdk/gdkkeysyms.h>
+ #include <X11/Xlib.h>
+ #include <X11/Xatom.h>
++#include <signal.h>
+ #include <math.h>
+ 
+ #include <cairo-xlib.h>
+@@ -148,6 +149,43 @@
+ static void on_disable(GtkAction* act, gpointer user_data);
+ #endif
+ 
++/* Signal the window manager, whose pid the startup script left behind.
++ *
++ * A missing or stale file does nothing at all, deliberately.  The file is
++ * only there when the session was started the normal way, and a pid that has
++ * since been recycled onto some other process must not be signalled: the
++ * manager runs in the foreground of the startup script, so it is a process
++ * group leader, and getpgid() answering with the pid itself is as much
++ * confirmation that it is still the same process as is available here.  It
++ * also answers ESRCH for a pid that no longer exists, which is what makes a
++ * stale file harmless rather than dangerous.
++ */
++static void desktop_signal_wm(int sig)
++{
++    char *path = g_build_filename(g_get_home_dir(), ".ctwm.pid", NULL);
++    char *buf = NULL;
++
++    if(g_file_get_contents(path, &buf, NULL, NULL))
++    {
++        pid_t pid = (pid_t)strtol(buf, NULL, 10);
++
++        if(pid > 1 && getpgid(pid) == pid)
++            kill(pid, sig);
++        g_free(buf);
++    }
++    g_free(path);
++}
++
++static void on_wm_restart(GtkAction* act, gpointer user_data)
++{
++    desktop_signal_wm(SIGHUP);
++}
++
++static void on_wm_quit(GtkAction* act, gpointer user_data)
++{
++    desktop_signal_wm(SIGTERM);
++}
++
+ /* insert GtkUIManager XML definitions */
+ #include "desktop-ui.c"
+ 
+--- a/src/desktop-ui.c
++++ b/src/desktop-ui.c
+@@ -27,12 +27,17 @@
+ "<popup>"
+   "<placeholder name='CustomCommonOps'>"
+     "<menuitem action='DeskPref'/>"
++    "<separator/>"
++    "<menuitem action='WMRestart'/>"
++    "<menuitem action='WMQuit'/>"
+   "</placeholder>"
+ "</popup>";
+ 
+ static const GtkActionEntry desktop_actions[]=
+ {
+-    {"DeskPref", GTK_STOCK_PROPERTIES, N_("Desktop Preferences"), "", NULL, G_CALLBACK(fm_desktop_preference)}
++    {"DeskPref", GTK_STOCK_PROPERTIES, N_("Desktop Preferences"), "", NULL, G_CALLBACK(fm_desktop_preference)},
++    {"WMRestart", GTK_STOCK_REFRESH, N_("Restart ctwm"), "", NULL, G_CALLBACK(on_wm_restart)},
++    {"WMQuit", GTK_STOCK_QUIT, N_("Exit ctwm"), "", NULL, G_CALLBACK(on_wm_quit)}
+ };
+ 
+ /* FmFileMenu extension for single folder */
