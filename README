@@ -300,12 +300,17 @@ Screen resolution
 ~~~~~~~~~~~~~~~~~
 The preferred resolution is chosen at build time:
 
-  make SCREEN_SIZE=large       1920x1200 preferred
+  make                         1920x1200 preferred (the default)
                                (falls back to 1920x1080, 1280x800, 1280x768,
                                1152x864, 1024x768)
 
-  make                         1280x800 preferred
+  make SCREEN_SIZE=medium      1280x800 preferred
                                (falls back to 1280x768, 1024x768)
+
+Both ends of that list are a preference rather than a demand, which is why the
+larger one is the default: the fallback chain reaches down to 1024x768, so
+asking for a mode the display cannot do costs nothing, while asking for the
+smaller one on a display that can do better caps it there.
 
 Both the bootloader and the kernel's SVGA driver use the same table, so the
 setting applies whether the mode comes from UEFI or from a mode set later.
@@ -316,7 +321,7 @@ Other useful targets:
   make usb-write USB_DEVICE=/dev/sdX
   make qemu-realusb USB_DEVICE=/dev/sdb
 
-  make SCREEN_SIZE=large       higher preferred resolution (see above)
+  make SCREEN_SIZE=medium      lower preferred resolution (see above)
   make help                    every target and build variable
 
 Booting a real USB stick in a virtual machine

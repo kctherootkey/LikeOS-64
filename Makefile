@@ -93,16 +93,22 @@ else
   QEMU_USB_HID =
 endif
 
-# Screen size: pass SCREEN_SIZE=large for 1920x1200 preferred resolution,
-# SCREEN_SIZE=medium (or unset) for 1280x800 preferred resolution.
+# Screen size: 1920x1200 preferred resolution by DEFAULT; pass
+# SCREEN_SIZE=medium for 1280x800.
 # The kernel gets the same define so the SVGA driver's boot-time best-fit
 # mode selection uses the identical preferred-resolution table.
-ifeq ($(SCREEN_SIZE),large)
-  UEFI_SCREEN_CFLAGS = -DSCREEN_LARGE
-  KERNEL_SCREEN_CFLAGS = -DSCREEN_LARGE
-else
+#
+# Large is the default because both ends of the mode list are a preference
+# rather than a demand: the bootloader walks the fallback chain down to
+# 1024x768, so asking for 1920x1200 on a display that cannot do it costs
+# nothing, while asking for 1280x800 on one that can caps it there.  It also
+# matches the shipped wallpaper, which is 1920x1200.
+ifeq ($(SCREEN_SIZE),medium)
   UEFI_SCREEN_CFLAGS =
   KERNEL_SCREEN_CFLAGS =
+else
+  UEFI_SCREEN_CFLAGS = -DSCREEN_LARGE
+  KERNEL_SCREEN_CFLAGS = -DSCREEN_LARGE
 endif
 
 # All QEMU run targets use the VMware SVGA II display adapter so the vmsvga2
@@ -325,6 +331,7 @@ ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat tests
 # config that never reached the running system, which looks identical to the
 # edit not working.
 RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
+	res/LikeOS.png \
 	res/etc/skel/.profile res/etc/skel/.bashrc \
 	$(wildcard res/etc/skel/Desktop/*.desktop) \
 	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
@@ -2220,8 +2227,8 @@ help:
 	@echo "  USB_HID=1         - Add USB keyboard and mouse to QEMU xHCI controller"
 	@echo "  EXT4_MB=N         - Force the ext4 root partition size in MB (default: auto-size to content)"
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
-	@echo "  SCREEN_SIZE=large - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
-	@echo "  SCREEN_SIZE=medium or unset - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
+	@echo "  SCREEN_SIZE=large or unset - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
+	@echo "  SCREEN_SIZE=medium - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
 	@echo "  LIKEOS_VERSION=x.y.z - Override the version in the boot banner and uname (default: $(LIKEOS_VERSION))"
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
 	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."

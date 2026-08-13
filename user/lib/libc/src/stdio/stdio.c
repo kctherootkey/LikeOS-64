@@ -146,7 +146,21 @@ FILE *fopen(const char *pathname, const char *mode)
 		return NULL;
 	}
 
-	int fd = open(pathname, flags);
+	/* 0666, and it MUST be passed.
+	 *
+	 * "w" and "a" set O_CREAT above, and open() is variadic: it reads the
+	 * creation mode with va_arg() whenever O_CREAT is present.  Calling it
+	 * with two arguments therefore did not mean "no mode", it meant open()
+	 * read whatever happened to be in the third argument register -- a
+	 * different value per call site, the same value every time for any one
+	 * of them.  Every file this system ever created through stdio got that
+	 * junk as its permissions: Claws Mail's IMAP cache came out as
+	 * -------x, which its own reader could not open again.
+	 *
+	 * 0666 is what POSIX specifies for fopen(); the kernel subtracts the
+	 * caller's umask (creat_mode()), so this lands as 0644 under the usual
+	 * 022 rather than being world-writable. */
+	int fd = open(pathname, flags, 0666);
 	if (fd < 0) {
 		return NULL;
 	}
@@ -561,7 +575,10 @@ FILE *freopen(const char *pathname, const char *mode, FILE *stream)
 		return NULL;
 	}
 
-	int fd = open(pathname, flags);
+	/* 0666 for the same reason fopen() passes it -- see the comment there.
+	 * O_CREAT without a mode argument makes open() read a garbage
+	 * register. */
+	int fd = open(pathname, flags, 0666);
 	if (fd < 0)
 		return NULL;
 

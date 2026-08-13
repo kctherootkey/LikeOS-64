@@ -6865,10 +6865,15 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 		 * one whose block has since been handed to another file, it
 		 * writes this file's bytes into that one.
 		 *
-		 * Nothing is lost by moving it: this path discards the whole
-		 * file's cache either way, only now it does so while the blocks
-		 * still belong to the file. */
-		pagecache_invalidate_file(EXT4_BID_ENC(ef->ino, 0));
+		 * Only the pages AT OR PAST the new end are dropped.  The ones
+		 * below it are the part of the file that SURVIVES the truncate,
+		 * and for a writer that has not synced they are the only copy
+		 * of it -- discarding them loses data the caller never asked to
+		 * lose.  They are stored first, while the blocks under them
+		 * still belong to this file, so the store cannot land in
+		 * another file's blocks. */
+		pagecache_invalidate_range(EXT4_BID_ENC(ef->ino, 0), size);
+		pagecache_flush_file(EXT4_BID_ENC(ef->ino, 0));
 		ext4_free_blocks_from(fs, ef->ino, &in, from);
 	}
 	in.i_size_lo = (uint32_t)size;
@@ -6889,7 +6894,26 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 		ef->pos = size;
 	if (ef->inode)
 		icache_update_size((ic_inode_t *)ef->inode, size);
-	pagecache_invalidate_file(EXT4_BID_ENC(ef->ino, 0));
+	/* NOTHING is invalidated here, and nothing may be.
+	 *
+	 * This used to drop the file's whole page cache on EVERY truncate,
+	 * including the ones that free no blocks at all -- and
+	 * pagecache_invalidate_file() is a DISCARD: it takes each page off the
+	 * dirty list and frees the frame without storing it.
+	 *
+	 * ftruncate(fd, size) with size equal to the length just written is a
+	 * routine end-of-transfer step rather than an odd one -- scp(1) ends
+	 * every incoming file with it -- and it threw the entire transfer away.
+	 * The inode kept the new size and the extents kept the new blocks, but
+	 * the bytes never left memory, so reading the file back returned
+	 * whatever the previous owner of those blocks had left in them: a
+	 * freshly copied file came out the right length and full of some other
+	 * file's contents.
+	 *
+	 * The shrink path above drops exactly the pages whose blocks it frees,
+	 * at the point where doing so is correct, so there is nothing left for
+	 * this to invalidate.  A truncate that grows the file, or leaves the
+	 * length alone, has no stale page to drop in the first place. */
 	icache_chain_invalidate(EXT4_BID_ENC(ef->ino, 0));
 	ext4_flush_meta(fs);
 	return st == ST_OK ? ST_OK : ST_IO;

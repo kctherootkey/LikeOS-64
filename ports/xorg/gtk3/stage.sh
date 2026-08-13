@@ -504,6 +504,21 @@ if [ -f "$root/res/xorg/gtk3/pcmanfm.conf" ]; then
 		"$DEST/etc/xdg/pcmanfm/default/pcmanfm.conf"
 fi
 
+# The desktop wallpaper the file above names.
+#
+# Staged here rather than with the other res/ files in the top-level Makefile
+# because PCManFM is what draws it: on an image built without the GTK3 port
+# there is no desktop to put a wallpaper on, and this whole script is skipped.
+#
+# 0644 and owned by root like every other shipped data file -- the desktop
+# reads it as the logged-in user.
+if [ -f "$root/res/LikeOS.png" ]; then
+	mkdir -p "$DEST/usr/share/wallpapers"
+	cp "$root/res/LikeOS.png" "$DEST/usr/share/wallpapers/LikeOS.png"
+	chmod 0644 "$DEST/usr/share/wallpapers/LikeOS.png"
+	staged=$((staged + 1))
+fi
+
 # Claws Mail's skeleton configuration.
 #
 # Copied to ~/.claws-mail on a user's first run (copy_dir of SYSCONFDIR/skel/
