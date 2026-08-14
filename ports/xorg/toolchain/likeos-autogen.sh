@@ -51,10 +51,22 @@ export CC CXX PKG_CONFIG
 #
 # Harmless where nothing needs it: aclocal ignores a directory that holds no
 # macro a package asked for.
+#
+# It does NOT ignore a directory that is not there.  `aclocal -I' on a missing
+# directory is a hard error ("couldn't open directory ...") on automake 1.16,
+# which is what Ubuntu 22.04 ships, while later automake only warns -- so a
+# tree that builds on one machine dies at the first autoreconf on another.
+# $HOSTTOOLS/share/aclocal exists only once a build-host package that installs
+# m4 has been built (intltool is the only one, and only the GTK stack pulls it
+# in), so -I is passed for a directory only when it is really there.  Naming it
+# in ACLOCAL_PATH regardless is safe: that variable tolerates missing entries.
 HOSTTOOLS="$TOOLCHAIN/../.hosttools"
 ACLOCAL_PATH="$SYSROOT/usr/share/aclocal:$HOSTTOOLS/share/aclocal"
 export ACLOCAL_PATH
-ACLOCAL="aclocal -I $SYSROOT/usr/share/aclocal -I $HOSTTOOLS/share/aclocal"
+ACLOCAL="aclocal"
+for dir in "$SYSROOT/usr/share/aclocal" "$HOSTTOOLS/share/aclocal"; do
+	[ -d "$dir" ] && ACLOCAL="$ACLOCAL -I $dir"
+done
 export ACLOCAL
 
 # Answers to probes that cannot run a target binary.  Seeded rather than

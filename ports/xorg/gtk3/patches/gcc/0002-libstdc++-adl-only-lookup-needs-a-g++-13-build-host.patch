@@ -1,0 +1,51 @@
+--- a/libstdc++-v3/include/std/system_error
++++ b/libstdc++-v3/include/std/system_error
+@@ -203,6 +203,30 @@
+   void make_error_condition() = delete;
+ }
+ 
++// The block-scope using-declarations that name the two functions above exist
++// so that the calls following them find make_error_code/make_error_condition
++// by argument-dependent lookup alone.  [basic.lookup.argdep] keeps ADL in
++// effect when the name was introduced by a using-declaration, but g++ before
++// 13 suppresses it as though the declaration were an ordinary block-scope one,
++// and the call then resolves to the deleted overload:
++//
++//   error: use of deleted function 'void std::__adl_only::make_error_code()'
++//
++// This library is compiled -- and every C++ package in the port with it -- by
++// the BUILD machine's g++ (see ports/xorg/toolchain/likeos-c++), not by the
++// cross compiler this tree also produces, so the host's version decides.
++// Ubuntu 22.04 ships 11.4 and hits this; 24.04 ships 13 and does not.
++//
++// Leaving the using-declaration out restores what libstdc++ 12 and earlier
++// did: ordinary lookup finds the overloads declared in namespace std as well.
++// That admits a call this pattern was added to reject, which matters only to a
++// program that defines its own make_error_code -- not to anything built here.
++#if __GNUC__ >= 13 && !defined(__clang__)
++# define _GLIBCXX_ADL_ONLY(_Fn) using __adl_only::_Fn;
++#else
++# define _GLIBCXX_ADL_ONLY(_Fn)
++#endif
++
+   /** Class error_code
+    *
+    * This class is a value type storing an integer error number and a
+@@ -238,7 +262,7 @@
+ 	     typename = _Check<_ErrorCodeEnum>>
+       error_code(_ErrorCodeEnum __e) noexcept
+       {
+-	using __adl_only::make_error_code;
++	_GLIBCXX_ADL_ONLY(make_error_code)
+ 	*this = make_error_code(__e);
+       }
+ 
+@@ -371,7 +395,7 @@
+ 	     typename = _Check<_ErrorConditionEnum>>
+       error_condition(_ErrorConditionEnum __e) noexcept
+       {
+-	using __adl_only::make_error_condition;
++	_GLIBCXX_ADL_ONLY(make_error_condition)
+ 	*this = make_error_condition(__e);
+       }
+ 

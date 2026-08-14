@@ -50,10 +50,16 @@ export LIKEOS_SYSROOT="$SYSROOT"
 # three cannot get out of step with each other.
 HOSTTOOLS="$here/.hosttools"
 
+# $HOSTTOOLS/share/aclocal is made here rather than left to whichever
+# build-host package first installs an m4 file: likeos-autogen.sh points
+# aclocal at it, and automake 1.16 (Ubuntu 22.04) treats an -I on a directory
+# that does not exist as a fatal error rather than a warning.  Made
+# unconditionally so the search path is the same whether or not the GTK stack
+# -- the only thing that builds intltool -- is part of this build.
 mkdir -p "$stamps" "$logs" \
 	"$SYSROOT/usr/include" "$SYSROOT/usr/lib/pkgconfig" \
 	"$SYSROOT/usr/share/aclocal" "$SYSROOT/usr/share/pkgconfig" \
-	"$SYSROOT/usr/bin"
+	"$SYSROOT/usr/bin" "$HOSTTOOLS/share/aclocal"
 
 # Descriptions for things LikeOS satisfies natively, so a package's dependency
 # check succeeds for the right reason instead of being switched off.

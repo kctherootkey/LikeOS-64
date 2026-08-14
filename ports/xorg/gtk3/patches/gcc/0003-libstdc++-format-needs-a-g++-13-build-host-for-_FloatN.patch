@@ -1,0 +1,87 @@
+--- a/libstdc++-v3/include/std/format
++++ b/libstdc++-v3/include/std/format
+@@ -1236,6 +1236,31 @@
+   // support for _Float128, rather than formatting it as another type.
+ #undef _GLIBCXX_FORMAT_F128
+ 
++// Whether _Float32, _Float64 and _Float128 are types the compiler compiling
++// THIS header knows about.
++//
++// The __FLTn_DIG__ macros below do not answer that question on their own.
++// They describe the target's floating-point formats and are predefined
++// whatever the language, but the types themselves reached the C++ front end
++// only in g++ 13 -- before that they exist in C alone, and every guard here
++// that tests __FLTn_DIG__ and then names _Float32 is a compile error:
++//
++//   error: '_Float32' was not declared in this scope
++//
++// This library is compiled -- and every C++ package in the port with it -- by
++// the BUILD machine's g++ (see ports/xorg/toolchain/likeos-c++), not by the
++// cross compiler this tree also produces, so the host's version decides.
++// Ubuntu 22.04 ships 11.4 and hits this; 24.04 ships 13 and does not.
++//
++// Only <format> needs this.  Everywhere else in libstdc++ the extended
++// floating-point types sit behind __STDCPP_FLOATn_T__, which a compiler that
++// does not have them never defines.
++#if __GNUC__ >= 13 && !defined(__clang__)
++# define _GLIBCXX_HAVE_FLOATN_TYPES 1
++#else
++# define _GLIBCXX_HAVE_FLOATN_TYPES 0
++#endif
++
+ #ifdef _GLIBCXX_LONG_DOUBLE_ALT128_COMPAT
+ 
+   // Format 128-bit floating-point types using __ieee128.
+@@ -1276,7 +1301,8 @@
+   using __float128_t = long double;
+ # define _GLIBCXX_FORMAT_F128 1
+ 
+-#elif __FLT128_DIG__ && defined(_GLIBCXX_HAVE_FLOAT128_MATH)
++#elif _GLIBCXX_HAVE_FLOATN_TYPES && __FLT128_DIG__ \
++      && defined(_GLIBCXX_HAVE_FLOAT128_MATH)
+ 
+   // Format 128-bit floating-point types using _Float128.
+   using __float128_t = _Float128;
+@@ -2975,7 +3001,7 @@
+ 
+ 	  // TODO bfloat16 and float16
+ 
+-#ifdef __FLT32_DIG__
++#if _GLIBCXX_HAVE_FLOATN_TYPES && defined __FLT32_DIG__
+ 	  else if constexpr (is_same_v<_Td, _Float32>)
+ # ifdef _GLIBCXX_FLOAT_IS_IEEE_BINARY32
+ 	    return type_identity<float>();
+@@ -2983,7 +3009,7 @@
+ 	    return type_identity<_Float32>();
+ # endif
+ #endif
+-#ifdef __FLT64_DIG__
++#if _GLIBCXX_HAVE_FLOATN_TYPES && defined __FLT64_DIG__
+ 	  else if constexpr (is_same_v<_Td, _Float64>)
+ # ifdef _GLIBCXX_DOUBLE_IS_IEEE_BINARY64
+ 	    return type_identity<double>();
+@@ -2992,7 +3018,7 @@
+ # endif
+ #endif
+ #if _GLIBCXX_FORMAT_F128
+-# if __FLT128_DIG__
++# if _GLIBCXX_HAVE_FLOATN_TYPES && __FLT128_DIG__
+ 	  else if constexpr (is_same_v<_Td, _Float128>)
+ 	    return type_identity<__format::__float128_t>();
+ # endif
+@@ -3072,11 +3098,13 @@
+ 
+ 	  // N.B. some of these types will never actually be used here,
+ 	  // because they get normalized to a standard floating-point type.
+-#if defined __FLT32_DIG__ && ! _GLIBCXX_FLOAT_IS_IEEE_BINARY32
++#if _GLIBCXX_HAVE_FLOATN_TYPES && defined __FLT32_DIG__ \
++    && ! _GLIBCXX_FLOAT_IS_IEEE_BINARY32
+ 	  else if constexpr (is_same_v<_Tp, _Float32>)
+ 	    return _Arg_f32;
+ #endif
+-#if defined __FLT64_DIG__ && ! _GLIBCXX_DOUBLE_IS_IEEE_BINARY64
++#if _GLIBCXX_HAVE_FLOATN_TYPES && defined __FLT64_DIG__ \
++    && ! _GLIBCXX_DOUBLE_IS_IEEE_BINARY64
+ 	  else if constexpr (is_same_v<_Tp, _Float64>)
+ 	    return _Arg_f64;
+ #endif

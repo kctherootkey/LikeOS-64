@@ -148,6 +148,12 @@
 /user/bin/tests/*
 !/user/bin/tests/*.c
 !/user/bin/tests/*.h
+#     testcxx.cpp is the only C++ source in the tree, and this line is the
+#     reason it went missing: without it the file was ignored, never committed,
+#     and existed only on the machine it was written on.  Every other machine
+#     got a Makefile that names it as a prerequisite and no file to satisfy it:
+#     "No rule to make target 'user/bin/tests/testcxx.cpp'".
+!/user/bin/tests/*.cpp
 #     Shell-script tests (testbash.sh, scripttest.sh) are sources too -- they
 #     are run on the target, not built, so nothing else would re-include them.
 !/user/bin/tests/*.sh
