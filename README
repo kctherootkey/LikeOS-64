@@ -302,7 +302,7 @@ The preferred resolution is chosen at build time:
 
   make                         1920x1200 preferred (the default)
                                (falls back to 1920x1080, 1280x800, 1280x768,
-                               1152x864, 1024x768)
+                               1024x768)
 
   make SCREEN_SIZE=medium      1280x800 preferred
                                (falls back to 1280x768, 1024x768)
@@ -315,6 +315,28 @@ smaller one on a display that can do better caps it there.
 Both the bootloader and the kernel's SVGA driver use the same table, so the
 setting applies whether the mode comes from UEFI or from a mode set later.
 
+A virtual machine, though, advertises the modes its emulated adapter can scan
+out rather than the ones the host's panel can show: on a 1920x1080 notebook,
+VirtualBox, VMware and QEMU all offer 1920x1200, a default build takes it, and
+the guest ends up on a screen the host has to shrink -- which is what makes
+full-screen mode awkward.  Put a ceiling on the list to say what the display
+really is:
+
+  make MAX_SCREEN_SIZE=1920x1080
+
+Anything above the ceiling is skipped, so the mode chosen is the largest one
+that the SCREEN_SIZE list offers and the ceiling allows -- 1920x1080 here,
+never 1920x1200.  The ceiling need not name a mode from the list: with
+MAX_SCREEN_SIZE=1600x900 the default build settles on 1280x800.  It combines
+with SCREEN_SIZE, applies to the bootloader and the SVGA driver alike, and
+unset means no ceiling, which is the historical behaviour.
+
+Below 1024x768 nothing in either list is selectable; the build warns and the
+firmware's own default is kept.
+
+Changing either setting rebuilds the bootloader and the SVGA driver on the next
+make -- no clean needed.
+
 Other useful targets:
 
   make distclean
@@ -322,6 +344,7 @@ Other useful targets:
   make qemu-realusb USB_DEVICE=/dev/sdb
 
   make SCREEN_SIZE=medium      lower preferred resolution (see above)
+  make MAX_SCREEN_SIZE=1920x1080   cap the resolution (see above)
   make help                    every target and build variable
 
 Booting a real USB stick in a virtual machine

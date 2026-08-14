@@ -58,6 +58,19 @@ typedef struct {
     uint32_t bytes_per_pixel;
 } framebuffer_info_t;
 
+// Build-time ceiling on the preferred-resolution search (make MAX_SCREEN_SIZE=WxH).
+// Entries of the preferred table larger than this are never considered, so a
+// build for a 1920x1080 panel does not land on 1920x1200 just because the
+// firmware -- a virtual machine's in particular -- happens to offer it.  Unset
+// means no ceiling; the kernel's SVGA driver applies the same two limits to the
+// same table (kernel/dev/video/vmsvga2.c).
+#ifndef SCREEN_MAX_WIDTH
+#define SCREEN_MAX_WIDTH  0xFFFFFFFFU
+#endif
+#ifndef SCREEN_MAX_HEIGHT
+#define SCREEN_MAX_HEIGHT 0xFFFFFFFFU
+#endif
+
 // UEFI memory map entry (matching EFI_MEMORY_DESCRIPTOR)
 typedef struct {
     uint32_t type;
@@ -1270,31 +1283,47 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         
         Print(L"Enumerating %d GOP modes for preferred resolution...\r\n", gop->Mode->MaxMode);
         serial_puts("GOP modes:\n");
-        
-        // Search for preferred resolutions in priority order
+
+        // Log every mode once.  This is a pass of its own rather than a rider on
+        // the first preference, so the log stays complete when the resolution
+        // ceiling skips the leading entries of the table.
+        for (UINT32 mode = 0; mode < gop->Mode->MaxMode; mode++) {
+            EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode_info;
+            UINTN mode_info_size;
+
+            status = uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &mode_info_size, &mode_info);
+            if (EFI_ERROR(status)) continue;
+
+            serial_puts("  mode "); serial_putdec(mode);
+            serial_puts(": "); serial_putdec(mode_info->HorizontalResolution);
+            serial_putc('x'); serial_putdec(mode_info->VerticalResolution);
+            serial_puts(" fmt="); serial_putdec(mode_info->PixelFormat);
+            if (mode_info->PixelFormat == 2) { // PixelBitMask
+                serial_puts(" R="); serial_puthex(mode_info->PixelInformation.RedMask);
+                serial_puts(" G="); serial_puthex(mode_info->PixelInformation.GreenMask);
+                serial_puts(" B="); serial_puthex(mode_info->PixelInformation.BlueMask);
+                serial_puts(" X="); serial_puthex(mode_info->PixelInformation.ReservedMask);
+            }
+            serial_putc('\n');
+        }
+
+        // Search for preferred resolutions in priority order, skipping the ones
+        // the build-time ceiling (MAX_SCREEN_SIZE) rules out
         for (UINTN pref = 0; pref < num_preferred && !found_preferred; pref++) {
+            if (preferred[pref].width > SCREEN_MAX_WIDTH ||
+                preferred[pref].height > SCREEN_MAX_HEIGHT) {
+                serial_puts("  skipping "); serial_putdec(preferred[pref].width);
+                serial_putc('x'); serial_putdec(preferred[pref].height);
+                serial_puts(": above MAX_SCREEN_SIZE\n");
+                continue;
+            }
             for (UINT32 mode = 0; mode < gop->Mode->MaxMode; mode++) {
                 EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode_info;
                 UINTN mode_info_size;
-                
+
                 status = uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &mode_info_size, &mode_info);
                 if (EFI_ERROR(status)) continue;
-                
-                // Log each mode on the first preferred pass so we see everything once
-                if (pref == 0) {
-                    serial_puts("  mode "); serial_putdec(mode);
-                    serial_puts(": "); serial_putdec(mode_info->HorizontalResolution);
-                    serial_putc('x'); serial_putdec(mode_info->VerticalResolution);
-                    serial_puts(" fmt="); serial_putdec(mode_info->PixelFormat);
-                    if (mode_info->PixelFormat == 2) { // PixelBitMask
-                        serial_puts(" R="); serial_puthex(mode_info->PixelInformation.RedMask);
-                        serial_puts(" G="); serial_puthex(mode_info->PixelInformation.GreenMask);
-                        serial_puts(" B="); serial_puthex(mode_info->PixelInformation.BlueMask);
-                        serial_puts(" X="); serial_puthex(mode_info->PixelInformation.ReservedMask);
-                    }
-                    serial_putc('\n');
-                }
-                
+
                 // Only consider 32-bit pixel formats (BGR, RGB, or bitmask-based 32bpp).
                 // Some firmware (e.g. VMware SVGA) exposes higher resolutions only via
                 // PixelBitMask with ReservedMask=0, so the channel masks need not cover

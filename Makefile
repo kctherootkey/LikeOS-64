@@ -104,12 +104,40 @@ endif
 # nothing, while asking for 1280x800 on one that can caps it there.  It also
 # matches the shipped wallpaper, which is 1920x1200.
 ifeq ($(SCREEN_SIZE),medium)
-  UEFI_SCREEN_CFLAGS =
-  KERNEL_SCREEN_CFLAGS =
+  SCREEN_PREF_CFLAGS =
 else
-  UEFI_SCREEN_CFLAGS = -DSCREEN_LARGE
-  KERNEL_SCREEN_CFLAGS = -DSCREEN_LARGE
+  SCREEN_PREF_CFLAGS = -DSCREEN_LARGE
 endif
+
+# Maximum screen size: pass MAX_SCREEN_SIZE=WIDTHxHEIGHT (for example
+# MAX_SCREEN_SIZE=1920x1080) to put a ceiling on that table.  Entries above the
+# ceiling are skipped, so the chosen mode is the largest one that both the
+# SCREEN_SIZE list offers and the ceiling allows -- 1920x1080 rather than
+# 1920x1200 for that example.  Unset means no ceiling (the previous behaviour).
+#
+# This exists because a virtual machine advertises the modes its emulated
+# adapter can scan out, not the ones the host's panel can show: on a 1920x1080
+# notebook, VirtualBox, VMware and QEMU all offer 1920x1200 and a default build
+# takes it, leaving a guest screen the host has to shrink to fit -- which is
+# exactly what full-screen mode then cannot do cleanly.
+ifdef MAX_SCREEN_SIZE
+  MAX_SCREEN_W := $(word 1,$(subst x, ,$(subst X,x,$(strip $(MAX_SCREEN_SIZE)))))
+  MAX_SCREEN_H := $(word 2,$(subst x, ,$(subst X,x,$(strip $(MAX_SCREEN_SIZE)))))
+  ifneq ($(shell printf '%s' '$(strip $(MAX_SCREEN_SIZE))' | grep -Eqi '^[0-9]+x[0-9]+$$' && echo ok),ok)
+    $(error MAX_SCREEN_SIZE must be WIDTHxHEIGHT, e.g. MAX_SCREEN_SIZE=1920x1080)
+  endif
+  # Below the smallest entry of either table nothing is selectable, and the
+  # firmware default -- which may well be larger -- is what you get instead.
+  ifneq ($(shell test $(MAX_SCREEN_W) -ge 1024 && test $(MAX_SCREEN_H) -ge 768 && echo ok),ok)
+    $(warning MAX_SCREEN_SIZE=$(MAX_SCREEN_SIZE) is below 1024x768, the smallest preferred mode: no mode will be selected and the firmware default is kept)
+  endif
+  SCREEN_MAX_CFLAGS = -DSCREEN_MAX_WIDTH=$(MAX_SCREEN_W)U -DSCREEN_MAX_HEIGHT=$(MAX_SCREEN_H)U
+else
+  SCREEN_MAX_CFLAGS =
+endif
+
+UEFI_SCREEN_CFLAGS = $(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)
+KERNEL_SCREEN_CFLAGS = $(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)
 
 # All QEMU run targets use the VMware SVGA II display adapter so the vmsvga2
 # kernel driver is exercised; the GOP framebuffer remains the fallback path.
@@ -390,6 +418,20 @@ all: $(GPT_DISK)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
+# SCREEN_SIZE and MAX_SCREEN_SIZE are baked into the bootloader and the SVGA
+# driver at compile time, and no source file changes when they do -- so make
+# would happily keep yesterday's objects and boot the old resolution.  This
+# stamp holds the current screen flags and is rewritten only when they differ,
+# which rebuilds exactly the two objects that read them, without a full clean.
+SCREEN_STAMP = $(BUILD_DIR)/.screen_flags
+
+$(SCREEN_STAMP): FORCE | $(BUILD_DIR)
+	@echo '$(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)' | cmp -s - $@ || \
+		echo '$(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)' > $@
+
+FORCE:
+.PHONY: FORCE
+
 # Compile kernel source files
 $(BUILD_DIR)/init.o: $(KERNEL_DIR)/ke/init.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -424,7 +466,7 @@ $(BUILD_DIR)/fb.o: KERNEL_CFLAGS += -msse -msse2 -mmmx
 $(BUILD_DIR)/fb.o: $(KERNEL_DIR)/dev/video/fb.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmsvga2.o: $(KERNEL_DIR)/dev/video/vmsvga2.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmsvga2.o: $(KERNEL_DIR)/dev/video/vmsvga2.c $(SCREEN_STAMP) | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fbdev.o: $(KERNEL_DIR)/dev/video/fbdev.c | $(BUILD_DIR)
@@ -1500,7 +1542,7 @@ endif
 	@echo "LikeOS-64 ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
-$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S | $(BUILD_DIR)
+$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S $(SCREEN_STAMP) | $(BUILD_DIR)
 	@echo "Building UEFI bootloader..."
 	# Compile bootloader C code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/bootloader.c -o $(BUILD_DIR)/bootloader.o
@@ -2252,8 +2294,9 @@ help:
 	@echo "  USB_HID=1         - Add USB keyboard and mouse to QEMU xHCI controller"
 	@echo "  EXT4_MB=N         - Force the ext4 root partition size in MB (default: auto-size to content)"
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
-	@echo "  SCREEN_SIZE=large or unset - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
+	@echo "  SCREEN_SIZE=large or unset - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768)"
 	@echo "  SCREEN_SIZE=medium - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
+	@echo "  MAX_SCREEN_SIZE=WxH - Ceiling on the above list, e.g. MAX_SCREEN_SIZE=1920x1080 picks 1920x1080 instead of 1920x1200 (default: no ceiling)"
 	@echo "  LIKEOS_VERSION=x.y.z - Override the version in the boot banner and uname (default: $(LIKEOS_VERSION))"
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
 	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."

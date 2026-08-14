@@ -2287,6 +2287,19 @@ int vmsvga2_init(void)
 	return 0;
 }
 
+// Build-time ceiling on the preferred-resolution search (make MAX_SCREEN_SIZE=WxH).
+// The device's reported maximum is what the emulated adapter can scan out, not
+// what the panel behind it can show, so a virtual machine on a 1920x1080
+// notebook happily offers 1920x1200 and the guest ends up on a screen the host
+// then has to shrink.  This is the second bound: unset means no ceiling, and
+// the bootloader applies the same one to the same table (boot/bootloader.c).
+#ifndef SCREEN_MAX_WIDTH
+#define SCREEN_MAX_WIDTH  0xFFFFFFFFU
+#endif
+#ifndef SCREEN_MAX_HEIGHT
+#define SCREEN_MAX_HEIGHT 0xFFFFFFFFU
+#endif
+
 // Boot-time best-fit mode selection.  Uses the same preferred-resolution
 // table (and SCREEN_LARGE build define) as the bootloader's GOP mode
 // selection, bounded by the device's maximum geometry and VRAM.  Takes over
@@ -2317,7 +2330,9 @@ void vmsvga2_setup_boot_mode(void)
 	for (i = 0; i < sizeof(preferred) / sizeof(preferred[0]); i++) {
 		uint64_t need = (uint64_t)preferred[i].width *
 				preferred[i].height * 4;
-		if (preferred[i].width <= g_svga.max_width &&
+		if (preferred[i].width <= SCREEN_MAX_WIDTH &&
+		    preferred[i].height <= SCREEN_MAX_HEIGHT &&
+		    preferred[i].width <= g_svga.max_width &&
 		    preferred[i].height <= g_svga.max_height &&
 		    need <= g_svga.vram_size) {
 			w = preferred[i].width;
@@ -2326,7 +2341,9 @@ void vmsvga2_setup_boot_mode(void)
 		}
 	}
 	if (w == 0) {
-		// None of the preferred modes fit (tiny VRAM): last resort.
+		// Nothing in the table fits (tiny VRAM, or a ceiling below every
+		// entry): last resort, and small enough that the ceiling is not
+		// worth honouring at the price of having no display at all.
 		w = 640;
 		h = 480;
 		if (w > g_svga.max_width || h > g_svga.max_height ||
