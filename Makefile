@@ -42,7 +42,7 @@ endif
 CODENAME = blessed kitty
 
 # Version string: override on command line with LIKEOS_VERSION=x.y.z
-LIKEOS_VERSION ?= 0.2.4-HEAD
+LIKEOS_VERSION ?= 0.2.5-HEAD
 
 # Tools
 GCC = gcc

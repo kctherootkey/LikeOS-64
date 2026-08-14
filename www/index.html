@@ -226,12 +226,12 @@
   <div class="release-block">
     Current development release:
     <p>
-      <span class="release-name">LikeOS 0.2.4-HEAD</span>
+      <span class="release-name">LikeOS 0.2.5-HEAD</span>
     </p>
   </div>
 
   <p>
-    Version 0.2.4 has these key features:
+    Version 0.2.5 has these key features:
   </p>
   <ul>
     <li>64-bit long mode kernel with higher-half mapping.</li>
@@ -250,7 +250,8 @@
     <li>Dentry cache, inode cache, and page cache with read-ahead and CLOCK-style eviction.</li>
     <li><b>Multi-user login</b>: init, getty and login with PAM and yescrypt, users and
         groups, and file permissions enforced in the VFS.</li>
-    <li>POSIX threads, System V and POSIX shared memory, poll/select/epoll, and PTYs.</li>
+    <li>POSIX threads, System V and POSIX shared memory, poll/select/epoll, and PTYs,
+        with per-task x87/SSE state carried across context switches.</li>
     <li><b>UTF-8 throughout</b>: the console decodes it and addresses glyphs by code point,
         and the C library implements the full multibyte and wide-character interface.</li>
     <li>xHCI USB 3.0 stack and USB mass storage driver.</li>
@@ -267,6 +268,12 @@
     <li><b>An X.Org desktop</b>: the X server on the framebuffer with the ctwm window
         manager, <b>xterm</b>, the <b>NetSurf</b> web browser, the <b>XNEdit</b> editor,
         xcalc, xclock and xload.</li>
+    <li><b>GTK3</b>: GTK 3.24 and the stack under it &mdash; GLib, Cairo, Pango, HarfBuzz,
+        gdk-pixbuf and libepoxy &mdash; with the Adwaita icon theme, the DejaVu fonts and
+        the shared MIME database.</li>
+    <li><b>GTK3 applications</b>: <b>PCManFM</b>, which draws the desktop and manages
+        files, the <b>Claws Mail</b> client speaking IMAP, POP3 and SMTP over TLS, and
+        the <b>Mousepad</b> text editor.</li>
     <li>Real hardware support on Lenovo and Dell notebooks, VMware, VirtualBox, and QEMU.</li>
   </ul>
 
@@ -279,19 +286,37 @@
          href="screenshots/LikeOS-64%20bootstrapper-2026-07-30-12-54-19.png">
         <img src="screenshots/LikeOS-64%20bootstrapper-2026-07-30-12-54-19.png"
              width="1920" height="1200" loading="lazy"
-             alt="The LikeOS-64 X.Org desktop: ctwm with a desktop bar, an xterm and other clients">
-        <span class="caption">The X.Org desktop &mdash; click for full size</span>
+             alt="The LikeOS-64 X.Org desktop: ctwm with a desktop bar, xterm, XNEdit and nano">
+        <span class="caption">LikeOS 0.2.4-HEAD running X.Org, ctwm, xterm, XNEdit, bash and nano
+          &mdash; click for full size</span>
       </a>
       <a class="shot" target="_blank" rel="noopener"
          href="screenshots/LikeOS-64%20bootstrapper-2026-07-31-17-05-17.png">
         <img src="screenshots/LikeOS-64%20bootstrapper-2026-07-31-17-05-17.png"
              width="1920" height="1200" loading="lazy"
-             alt="LikeOS-64 running the NetSurf web browser and further X clients">
-        <span class="caption">Applications running under X &mdash; click for full size</span>
+             alt="LikeOS-64 running the NetSurf web browser and an SSH session to a remote Ubuntu system">
+        <span class="caption">LikeOS 0.2.4-HEAD running the NetSurf browser and logged in to a
+          remote Ubuntu system over SSH &mdash; click for full size</span>
+      </a>
+      <a class="shot" target="_blank" rel="noopener"
+         href="screenshots/LikeOS-64%20bootstrapper-2026-08-13-17-33-40.png">
+        <img src="screenshots/LikeOS-64%20bootstrapper-2026-08-13-17-33-40.png"
+             width="1920" height="1200" loading="lazy"
+             alt="LikeOS-64 running GTK3: the PCManFM desktop and file manager, and the Mousepad editor">
+        <span class="caption">LikeOS 0.2.5-HEAD has GTK3 ported &mdash; here the PCManFM desktop
+          and file manager, and the Mousepad editor &mdash; click for full size</span>
+      </a>
+      <a class="shot" target="_blank" rel="noopener"
+         href="screenshots/LikeOS-64%20bootstrapper-2026-08-13-18-08-44.png">
+        <img src="screenshots/LikeOS-64%20bootstrapper-2026-08-13-18-08-44.png"
+             width="1920" height="1200" loading="lazy"
+             alt="LikeOS-64 running the Claws Mail client, connected to an IMAP inbox">
+        <span class="caption">LikeOS 0.2.5-HEAD running Claws Mail as an ordinary user, sending
+          mail and connected to the author's IMAP inbox &mdash; click for full size</span>
       </a>
     </div>
     <p class="shots-note">
-      Shown at 1920&times;1200, which is what <tt>make SCREEN_SIZE=large</tt> asks for.
+      Shown at 1920&times;1200, which is what a default build asks the firmware for.
     </p>
   </div>
 
@@ -300,18 +325,32 @@
   <!-- Trying it -->
   <p>
     <b>Trying it.</b> At the login prompt, log in as <b>root</b> with the password
-    <b>toor</b>, then type <b>startx</b> to bring up the X.Org desktop. Button&nbsp;1 on
-    the desktop background opens the root menu &mdash; xterm, xcalc, XNEdit, NetSurf
-    &mdash; and &ldquo;Exit session&rdquo; returns to the console. Any user can run
-    <tt>startx</tt>: the X server is installed setuid root and gives root up as soon as
-    it has opened the framebuffer and the input devices, so no group membership is
-    needed.
+    <b>toor</b>, create an ordinary account with <tt>adduser</tt>, and type
+    <b>startx</b> to bring up the desktop. PCManFM draws the wallpaper, the icons and
+    the launchers in <tt>~/Desktop</tt>, so all three mouse buttons over the background
+    belong to it; the window manager's menus are on <b>Alt+F1</b> (Xterm, Explorer,
+    Editor, Xnedit, Mail, Browser, Calculator, and &ldquo;Exit session&rdquo; to return
+    to the console) and <b>Alt+F2</b>. Any user can run <tt>startx</tt>: the X server is
+    installed setuid root and gives root up as soon as it has opened the framebuffer and
+    the input devices, so no group membership is needed.
   </p>
 
   <p>
-    Building with <tt>make SCREEN_SIZE=large</tt> asks for a 1920&times;1200 screen
-    instead of the default 1280&times;800, falling back through the usual modes if the
-    display cannot do it.
+    <b>Building.</b> Ubuntu is currently required as the build host &mdash; building has
+    been tested with Ubuntu 24.04.3 LTS (Noble Numbat). Install the dependencies with
+    <tt>sudo apt-get update</tt> and <tt>sudo make deps</tt>, then write a USB stick with
+    <tt>make usb-write USB_DEVICE=/dev/sdb</tt> and boot it, on real hardware or by
+    pointing VMware or VirtualBox at the USB device. The QEMU targets, <tt>make qemu</tt>
+    and <tt>make qemu-usb</tt>, are legacy.
+  </p>
+
+  <p>
+    A default build asks for a 1920&times;1200 screen and falls back through the usual
+    modes if the display cannot do it. <tt>make SCREEN_SIZE=medium</tt> prefers
+    1280&times;800 instead, and <tt>make MAX_SCREEN_SIZE=1920x1080</tt> puts a ceiling on
+    the list. The ceiling is what a virtual machine on a 1920&times;1080 notebook needs:
+    it advertises 1920&times;1200 whatever the host's panel can actually show, and a
+    build with no ceiling takes it.
   </p>
 
   <hr>
@@ -331,7 +370,7 @@
     bash as the interactive shell. The system boots via UEFI from an ext4 root filesystem,
     runs on (some) real hardware as well as virtual machines (QEMU, VMware, VirtualBox),
     and includes a rich set of core utilities, a C library with dynamic linking support,
-    TCP/IP networking with OpenSSH, and an X.Org desktop.
+    TCP/IP networking with OpenSSH, and an X.Org desktop running GTK3 applications.
   </p>
 
   <p>
@@ -368,7 +407,7 @@
   </p>
 
   <p class="footer-updated">
-    This page last updated <b>August 3<sup>rd</sup>, 2026</b>.
+    This page last updated <b>August 14<sup>th</sup>, 2026</b>.
   </p>
 
   <hr>

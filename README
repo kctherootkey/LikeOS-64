@@ -4,7 +4,7 @@ LikeOS-64
 A modern 64-bit operating system built from scratch, featuring a Unix-like
 userland with process management, syscalls, multitasking, SMP support, a
 multi-user login, bash as the shell, an ext4 root filesystem, TCP/IP
-networking with OpenSSH, and an X.Org desktop.
+networking with OpenSSH, and an X.Org desktop running GTK3 applications.
 
 Current state
 -------------
@@ -14,9 +14,9 @@ Current state
 - VMware support: USB 3.1 boot.
 - VirtualBox support: xHCI (USB 3) and VMSVGA graphics.
 - UEFI boot is required.
-- Linux bootstrapper support: boot from a Linux USB host and launch LikeOS in
-  embedded QEMU. Note: not strictly required -- the supported targets are VMs
-  and real hardware, both of which run LikeOS independently of Linux.
+- GTK 3.24 is ported, and with it a desktop: PCManFM draws the desktop and
+  manages files, Claws Mail reads and sends mail over IMAP and SMTP, and
+  Mousepad edits text.
 
 Overview
 --------
@@ -33,8 +33,11 @@ LikeOS-64 is a Unix-like operating system demonstrating modern OS development:
 - Multi-user: login with PAM and yescrypt, users, groups, and DAC permission
   enforcement in the VFS.
 - Networking: TCP/IP stack with BSD-style sockets and multiple NIC drivers.
-- Graphics: X.Org server on the framebuffer, with a window manager, a terminal,
-  a text editor and a web browser.
+- Graphics: X.Org server on the framebuffer, with a window manager, a desktop
+  with icons and a wallpaper, a terminal, text editors, a web browser, a file
+  manager and a mail client.
+- GTK3: the GTK 3.24 stack (GLib, Cairo, Pango, HarfBuzz, gdk-pixbuf) runs on
+  it, which is what the file manager, the mail client and the editor are.
 - Unicode: UTF-8 end to end -- console, C library, terminal emulator and X.
 - Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, I2C-HID (unfinished),
   PCI, APIC, ACPI, and VMware SVGA II.
@@ -53,6 +56,10 @@ Core OS
 - 64-bit long mode kernel and higher-half mapping.
 - UEFI boot path with framebuffer and memory map handoff.
 - Interrupt and exception handling with IDT and PIC/APIC integration.
+- Per-task x87/SSE register state, saved and restored across context switches;
+  the kernel's own SSE use (the framebuffer blits) is bracketed by
+  kernel_fpu_begin/end, and kernel code is otherwise compiled without SSE.
+- CPU power management: HWP/EPP performance hints, set per core at bring-up.
 
 SMP (Symmetric Multi-Processing)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -95,6 +102,9 @@ Memory management
   populated on first touch rather than at exec time, so a large program starts
   without faulting in what it never reads.
 - Copy-on-write fork, mmap/munmap/mprotect, and guard-paged stacks.
+- A per-process mapping table that grows on demand, so a program with thousands
+  of mappings (a GTK application with its fonts, icons and libraries) is not
+  held to a fixed limit.
 - System V and POSIX shared memory (used by X clients through MIT-SHM).
 
 Users, login and permissions
@@ -117,6 +127,10 @@ Graphics and input
 - /dev/fb0 (fbdev) and /dev/input/event* (evdev), which is what the X server
   drives.
 - PS/2 keyboard and mouse, USB HID, and I2C-HID touchpads.
+- A desktop: PCManFM paints the wallpaper and the icons on the root window,
+  and new accounts get launchers in ~/Desktop from /etc/skel.
+- Build-time preferred resolution, with a ceiling for displays that are
+  smaller than the modes a virtual machine advertises (see "Screen resolution").
 
 Unicode
 ~~~~~~~
@@ -168,10 +182,18 @@ Security and hardening
 - Stack canaries (stack-smashing protection) in kernel and userland.
 - User/kernel address-space separation and ring 3 isolation.
 - Page-level memory protections.
+- SMEP and SMAP where the CPU has them, so a stray kernel dereference into
+  user memory faults instead of succeeding quietly.
+- RELRO honoured by the dynamic linker: the GOT is made read-only once the
+  relocations are done.
 
 Reliability and diagnostics
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 - Proper crashlog printing for both kernel and user faults.
+- A userspace crash report names the faulting mapping and the offset into it,
+  and recovers a probable call chain by scanning the stack for return
+  addresses -- so a fault in a stripped shared library can still be resolved
+  to a function with addr2line.
 - In-kernel assertion framework: BUG_ON, WARN_ON, WARN_ON_ONCE,
   VM_BUG_ON/VM_WARN_ON, and BUILD_BUG_ON.
 - Non-fatal warnings continue execution; fatal bugs print a full crash dump.
@@ -184,11 +206,16 @@ Included commands (selection):
   arrays and arithmetic, all of it.
 - Core navigation: ls, pwd, cd behavior in shell.
 - File tools: cat, cp, mv, rm, mkdir, rmdir, touch, stat, file, find, ln,
-  chmod, readlink.
+  chmod, readlink, cmp.
 - Text tools: grep, sed, expr, wc, sort, uniq, cut, tr, head, tail, more, less,
   strings, hexdump, nano.
-- System tools: uname, uptime, date, time, ps, top, df, du, free, dmesg.
+- System tools: uname, uptime, date, time, ps, top, df, du, free, dmesg, nproc.
 - Process tools: kill, sleep.
+- Diagnostics: memstat (system memory accounting and a per-process breakdown),
+  pmap (one process's address space, with a watch mode that reports what
+  changed), and kdump (the kernel's TCP, AF_UNIX, PTY and task tables, root
+  only).  memstat and pmap report your own processes; root sees every one.
+  ps shows what a blocked task is waiting on (WCHAN).
 - Environment tools: env, which, echo, printf.
 - Power tools: shutdown, poweroff, reboot, halt.
 - Network tools: ifconfig, route, arp, ping, traceroute, netstat, dhclient,
@@ -196,7 +223,8 @@ Included commands (selection):
 - Account tools: id, whoami, groups, su, passwd, adduser, addgroup, deluser,
   delgroup.
 - Other utilities: clear, man, tty, yes, true, false.
-- Test programs: test_syscalls, test_libc, testmem, teststress, progerr.
+- Test programs: test_syscalls, test_libc, testmem, teststress, netstress,
+  ext4test, openssltest, pmap, progerr.
 
 Ported applications
 ~~~~~~~~~~~~~~~~~~~
@@ -221,12 +249,12 @@ Network and crypto:
 - netcat (OpenBSD): networking utility.
 - libevent, zlib, nghttp2: supporting libraries.
 
-X Window System (ports/xorg, ~70 packages):
+X Window System (ports/xorg, 79 packages):
 
 - X.Org server 21.1 on the framebuffer, with the evdev input driver and the
   fbdev video driver.  Installed setuid root and drops privileges as soon as
   its devices are open, so no user needs the video or input groups.
-- ctwm: window manager, with a desktop bar and root menu.
+- ctwm: window manager, with a desktop bar and keyboard-driven root menus.
 - xterm: terminal emulator (UTF-8, 256 colour).
 - NetSurf: web browser, with its own layout and rendering engine.
 - XNEdit: Motif text editor.
@@ -234,18 +262,40 @@ X Window System (ports/xorg, ~70 packages):
 - Toolkits and libraries: libX11, libXt, libXaw, libXft, Motif, freetype,
   fontconfig, pixman, libpng, libjpeg, xkbcomp and xkeyboard-config.
 
+GTK3 (ports/xorg/gtk3, 38 packages):
+
+- GTK 3.24 and the stack under it: GLib/GObject/GIO, Cairo, Pango, HarfBuzz,
+  FriBidi, gdk-pixbuf, ATK, libepoxy, GtkSourceView, libxml2 and PCRE2.
+- Its data files too, because a toolkit without them draws nothing: the
+  Adwaita and hicolor icon themes, the DejaVu fonts, and the shared MIME
+  database that gives the file manager its icons and its "open with".
+- libstdc++ from GCC 13.3, built for the target: HarfBuzz and Enchant are C++,
+  and the rest of the system is C.
+- PCManFM 1.4: the file manager, and the desktop itself (libfm, menu-cache,
+  lxmenu-data).
+- Claws Mail 4.4: mail client, speaking IMAP, POP3 and SMTP over TLS
+  (libetpan, GnuTLS, nettle, libtasn1), with spell checking through Enchant
+  and Hunspell.
+- Mousepad 0.7: GTK text editor.
+
 Build
 -----
 
-Prerequisites (Ubuntu/Debian):
+Ubuntu is currently required as the build host.  Building has been tested with
+Ubuntu 24.04.3 LTS (Noble Numbat).  Other distributions are likely to need work
+on the dependency list and on the host tools the ports drive.
 
-  sudo apt update
-  sudo apt install gcc nasm xorriso mtools dosfstools ovmf gnu-efi-dev \
-                   debootstrap parted gdisk qemu-utils grub-efi-amd64-bin rsync
+Prerequisites:
 
-Or:
+  sudo apt-get update
+  sudo make deps
 
-  make deps
+make deps is the requirement -- do not install the packages by hand.  Besides
+the compiler and the image tools it installs what the X.Org and GTK3 ports need
+on the host (meson, ninja, cmake, gettext, xfonts-utils, shared-mime-info and
+the rest), and where the distribution's version is too old to build a package
+it puts a current one in a virtual environment inside the port's own directory
+rather than on the system.
 
 Build all:
 
@@ -265,11 +315,18 @@ Main build outputs:
 Run
 ---
 
-QEMU:
+Write a USB stick, and boot it -- on real hardware, or by pointing VMware or
+VirtualBox at the USB device:
 
-  make distclean
-  make qemu          # plain boot from the ext4 GPT disk
-  make qemu-usb      # same, plus SLIRP networking (sudo)
+  make usb-write USB_DEVICE=/dev/sdb
+
+That is the way to build and flash a drive: it builds the image if it is not
+current, writes it to the stick, and grows the ext4 root to the drive's full
+capacity.  Check the device name first (lsblk); the target is erased.
+
+The QEMU targets, make qemu and make qemu-usb, are legacy.  They still boot the
+same image and are useful for a quick look at the console, but the supported
+way to run LikeOS is from a written stick.
 
 Logging in
 ~~~~~~~~~~
@@ -279,7 +336,9 @@ At the login prompt, log in as
   password: toor
 
 Change it with passwd, and create an ordinary account with adduser -- the
-system is multi-user and file permissions are enforced, so you not always want to be root.
+system is multi-user and file permissions are enforced, so you do not always
+want to be root.  An ordinary account is also what the desktop is meant to be
+used from: adduser creates the home directory with the desktop launchers in it.
 
 Starting the graphical desktop
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -288,13 +347,19 @@ From the shell, run
   startx
 
 That brings up the X.Org server with the ctwm window manager, a clock and a
-load graph in the desktop bar.  Button 1 on the desktop background opens the
-root menu: xterm, xcalc, XNEdit, NetSurf, and "Exit session" to come back to
-the console.
+load graph in the desktop bar, and PCManFM drawing the desktop: the wallpaper,
+the icons on it, and the launchers in ~/Desktop.
+
+All three mouse buttons over the desktop belong to PCManFM, so the window
+manager's menus are on the keyboard: Alt+F1 opens the root menu -- Xterm,
+Explorer, Editor, Xnedit, Mail, Browser, Calculator, and "Exit session" to come
+back to the console -- and Alt+F2 the window operations menu.
 
 Any user can run startx -- the server is installed setuid root and gives root
 up as soon as it has opened the framebuffer and the input devices, so no group
-membership is needed.
+membership is needed.  The GTK applications expect to be run that way rather
+than as root: Claws Mail keeps its mailboxes and account settings in the user's
+home directory.
 
 Screen resolution
 ~~~~~~~~~~~~~~~~~
@@ -339,13 +404,13 @@ make -- no clean needed.
 
 Other useful targets:
 
-  make distclean
-  make usb-write USB_DEVICE=/dev/sdX
-  make qemu-realusb USB_DEVICE=/dev/sdb
+  make usb-write USB_DEVICE=/dev/sdX      build and flash a USB drive
+  make qemu-realusb USB_DEVICE=/dev/sdb   boot a written stick in QEMU
+  make distclean                          clean everything, ports included
 
-  make SCREEN_SIZE=medium      lower preferred resolution (see above)
-  make MAX_SCREEN_SIZE=1920x1080   cap the resolution (see above)
-  make help                    every target and build variable
+  make SCREEN_SIZE=medium                 lower preferred resolution (see above)
+  make MAX_SCREEN_SIZE=1920x1080          cap the resolution (see above)
+  make help                               every target and build variable
 
 Booting a real USB stick in a virtual machine
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -384,12 +449,6 @@ configuration is known to work:
 LikeOS then boots from the stick.  Log in as root with the password toor and
 run startx.
 
-Linux USB host mode (not really needed, for historic reasons):
-
-  make distclean
-  make linux-usb
-  make linux-usb-write USB_DEVICE=/dev/sdX
-
 Project structure
 -----------------
 
@@ -399,9 +458,12 @@ Project structure
 - user/bin/: user programs (core utilities and tests).
 - user/lib/libc/: C library and runtime pieces.
 - user/lib/rtld/: dynamic linker.
-- res/: files staged into the image (fonts, /etc, X configuration).
-- host/: build-host tools (Linux USB builder, table generators, tests).
-- ports/: third-party ports, including ports/xorg for the X Window System.
+- res/: files staged into the image (fonts, wallpaper, /etc, X and GTK
+  configuration, the desktop launchers in /etc/skel).
+- host/: build-host tools (table generators and the libc test programs, which
+  run on the build machine as well as on LikeOS).
+- ports/: third-party ports -- ports/xorg for the X Window System and
+  ports/xorg/gtk3 for GTK3 and the applications on it.
 
 Implementation status
 ---------------------
@@ -418,18 +480,20 @@ Completed:
 - xHCI USB stack and USB mass storage.
 - TCP/IP networking stack, sockets, and multiple NIC drivers.
 - POSIX threads, shared memory, poll/select/epoll.
+- Per-task FPU state across context switches.
 - UTF-8 and Unicode throughout the console, the C library and X.
 - X.Org server on the framebuffer, with ctwm, xterm, NetSurf and XNEdit.
+- GTK3, and a desktop on it: PCManFM, Claws Mail and Mousepad.
 - Stack canaries and crashlog/assertion (BUG_ON/WARN_ON) infrastructure.
 - Framebuffer console optimizations and a VMware SVGA II driver.
 - Userland libc, dynamic linker, and the core utilities set.
-- Ports: bash, OpenSSH, OpenSSL, curl, tmux, nano, netcat, and X.Org.
+- Ports: bash, OpenSSH, OpenSSL, curl, tmux, nano, netcat, X.Org and GTK3.
 
 Planned/future work:
 - More drivers (AHCI/NVMe, more GPUs).
 - Expanded POSIX coverage.
 - Package management.
-- GTK3 port
+- Mounting removable media.
 
 Contributing
 ------------
