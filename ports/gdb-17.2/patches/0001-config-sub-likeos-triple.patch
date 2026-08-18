@@ -1,0 +1,37 @@
+Teach the bundled config.sub about the likeos OS triple.
+
+Without this every configure script in the tree rejects
+--host=x86_64-unknown-likeos as an invalid system before it probes anything,
+so no other patch here can matter.
+
+There are TWO copies of config.sub that get consulted -- the top-level one and
+readline's, the latter when the bundled readline configures itself.  Patching
+only the first fails partway through configure with the same rejection from a
+different directory, which reads like an unrelated problem.
+
+The two files are different vintages and want different shapes: the top-level
+one keeps an alphabetical list one entry per line, readline's an older packed
+list.  Each entry sits beside the other small non-mainstream systems that
+maintain themselves there.
+
+--- a/config.sub
++++ b/config.sub
+@@ -2027,6 +2027,7 @@
+ 	| its* \
+ 	| l4re* \
+ 	| libertybsd* \
++	| likeos* \
+ 	| lites* \
+ 	| lnews* \
+ 	| luna* \
+--- a/readline/readline/support/config.sub
++++ b/readline/readline/support/config.sub
+@@ -1739,7 +1739,7 @@
+ 	     | ekkobsd* | freebsd* | riscix* | lynxos* | os400* \
+ 	     | bosx* | nextstep* | cxux* | aout* | elf* | oabi* \
+ 	     | ptx* | coff* | ecoff* | winnt* | domain* | vsta* \
+-	     | udi* | lites* | ieee* | go32* | aux* | hcos* \
++	     | udi* | lites* | ieee* | go32* | aux* | hcos* | likeos* \
+ 	     | chorusrdb* | cegcc* | glidix* | serenity* \
+ 	     | cygwin* | msys* | pe* | moss* | proelf* | rtems* \
+ 	     | midipix* | mingw32* | mingw64* | mint* \

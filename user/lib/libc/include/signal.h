@@ -42,6 +42,27 @@ typedef unsigned long sigset_t;
 #define SIGUSR1  10
 #define SIGSEGV  11
 #define SIGUSR2  12
+
+/* si_code values for the synchronous fault signals.
+ *
+ * A debugger reads these: they are the difference between "it crashed" and
+ * "it wrote to an address that is not mapped".  gdb surfaces them through
+ * $_siginfo and in the message it prints when the inferior stops. */
+#define SEGV_MAPERR 1 /* address not mapped */
+#define SEGV_ACCERR 2 /* mapped, but the access was not permitted */
+#define ILL_ILLOPC 1 /* illegal opcode */
+#define ILL_ILLOPN 2 /* illegal operand */
+#define ILL_PRVOPC 5 /* privileged opcode */
+#define FPE_INTDIV 1 /* integer divide by zero */
+#define FPE_INTOVF 2 /* integer overflow */
+#define FPE_FLTDIV 3 /* floating-point divide by zero */
+#define FPE_FLTINV 7 /* invalid floating-point operation */
+#define BUS_ADRALN 1 /* invalid address alignment */
+#define BUS_ADRERR 2 /* non-existent physical address */
+#define TRAP_BRKPT 1 /* process breakpoint */
+#define TRAP_TRACE 2 /* process trace trap */
+#define TRAP_HWBKPT 4 /* hardware breakpoint or watchpoint */
+
 #define SIGPIPE  13
 #define SIGALRM  14
 #define SIGTERM  15
@@ -111,22 +132,82 @@ typedef unsigned long sigset_t;
 #define TIMER_ABSTIME 1
 
 // siginfo_t structure
+/*
+ * siginfo_t -- the description that comes with a signal.
+ *
+ * THE LAYOUT IS AN ABI CONTRACT WITH THE KERNEL, which fills one of these in
+ * and copies it verbatim: into the signal frame for an SA_SIGINFO handler, and
+ * out through PTRACE_GETSIGINFO for a debugger.  Nothing negotiates a size or
+ * a field position, so this declaration has to be byte-identical to the
+ * kernel's (include/kernel/ke/signal.h) or every field past the third is read
+ * from the wrong offset.
+ *
+ * It was NOT identical: this used to be a flat struct of 120 bytes with
+ * si_addr at offset 24, against the kernel's 128 with si_addr at 16.  A
+ * handler asking a SIGSEGV where it faulted got whatever happened to sit at
+ * offset 24, and PTRACE_GETSIGINFO overran its caller's buffer by 8 bytes --
+ * seen as a stack-protector abort with a zeroed canary.
+ *
+ * The union is what keeps the size fixed at 128 bytes while letting each
+ * signal describe itself: only one arm is meaningful for any given signal, and
+ * which one is decided by si_signo and si_code.  The accessor macros below are
+ * how it is normally read, so `si.si_addr' works without naming the arm.
+ */
 typedef struct {
-    int      si_signo;
-    int      si_errno;
-    int      si_code;
-    int      _pad0;
-    pid_t    si_pid;
-    uid_t    si_uid;
-    void*    si_addr;
-    int      si_status;
-    long     si_band;
+    int si_signo;               /* signal number */
+    int si_errno;               /* errno value, if any */
+    int si_code;                /* what KIND of event -- SEGV_MAPERR etc. */
+    int _pad0;
     union {
-        int     si_value_int;
-        void*   si_value_ptr;
-    } si_value;
-    int      _pad[16];
+        int _pad[28];           /* fixes the total at 128 bytes */
+
+        struct {                /* kill(), raise() */
+            int      si_pid;
+            unsigned si_uid;
+        } _kill;
+
+        struct {                /* POSIX timers */
+            int   si_tid;
+            int   si_overrun;
+            int   si_int;
+            void *si_ptr;
+        } _timer;
+
+        struct {                /* SIGCHLD */
+            int      si_pid;
+            unsigned si_uid;
+            int      si_status;
+            long     si_utime;
+            long     si_stime;
+        } _sigchld;
+
+        struct {                /* SIGILL, SIGFPE, SIGSEGV, SIGBUS */
+            void  *si_addr;     /* the address that faulted */
+            short  si_addr_lsb;
+            short  _pad1;
+        } _sigfault;
+
+        struct {                /* SIGPOLL */
+            long si_band;
+            int  si_fd;
+        } _sigpoll;
+    } _sifields;
 } siginfo_t;
+
+/* Read the union without naming the arm, as every other system spells it. */
+#define si_pid     _sifields._kill.si_pid
+#define si_uid     _sifields._kill.si_uid
+#define si_timerid _sifields._timer.si_tid
+#define si_overrun _sifields._timer.si_overrun
+#define si_int     _sifields._timer.si_int
+#define si_ptr     _sifields._timer.si_ptr
+#define si_status  _sifields._sigchld.si_status
+#define si_utime   _sifields._sigchld.si_utime
+#define si_stime   _sifields._sigchld.si_stime
+#define si_addr    _sifields._sigfault.si_addr
+#define si_addr_lsb _sifields._sigfault.si_addr_lsb
+#define si_band    _sifields._sigpoll.si_band
+#define si_fd      _sifields._sigpoll.si_fd
 
 // union sigval
 typedef union {

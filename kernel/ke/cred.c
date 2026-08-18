@@ -376,3 +376,87 @@ int capable(void)
 	 * through here means a future capability set slots in at one place. */
 	return current_euid() == 0;
 }
+
+/* ---- Cross-process access control ----------------------------------------- */
+
+/* One thread's credentials against the caller's, for the given mode.  Split
+ * out so the group walk in task_may_access() applies exactly the same rule to
+ * every member without duplicating it. */
+static int cred_may_access_one(const cred_t *c, const cred_t *t, int mode)
+{
+	/* The caller's EFFECTIVE uid must match all three of the target's, so a
+	 * process that changed identity through a setuid exec is opaque to the
+	 * user who started it -- its state is no longer theirs. */
+	if (!(c->euid == t->uid && c->euid == t->euid && c->euid == t->suid))
+		return -EPERM;
+
+	/* Reading a map is one thing; taking over execution is another, so
+	 * attaching demands the same three-way match on the GROUP ids too.  A
+	 * setgid binary's secrets are worth exactly as much as a setuid one's,
+	 * and checking uids alone would hand every one of them over. */
+	if (mode == ACCESS_ATTACH &&
+	    !(c->egid == t->gid && c->egid == t->egid && c->egid == t->sgid))
+		return -EPERM;
+
+	return 0;
+}
+
+int task_may_access(const task_t *target, int mode)
+{
+	task_t *cur = sched_current();
+
+	if (!target)
+		return -ESRCH;
+	if (!cur)
+		return 0; /* kernel context is privileged by definition */
+	if (capable())
+		return 0; /* root may observe and control anything */
+
+	/* Taking control of a process whose privileges were raised by a set-id
+	 * exec is refused outright for the unprivileged caller.  The id
+	 * comparison below would already refuse it in the normal case, but a
+	 * binary that dropped back to the invoking user still holds whatever
+	 * it read while it was privileged, and its memory is what an attacker
+	 * is after. */
+	if (mode == ACCESS_ATTACH && !task_dumpable((task_t *)target))
+		return -EPERM;
+
+	/* Evaluated against EVERY thread of the target's group, strictest
+	 * answer winning.  Credentials here are per-task, not per-thread-group
+	 * (see cred.h), so two threads of one process can hold different ids
+	 * indefinitely -- and they share one address space.  Checking only the
+	 * thread that was named would let a caller reach a privileged thread's
+	 * memory by picking whichever sibling happened to be weakest. */
+	const task_t *leader = target->group_leader ? target->group_leader :
+						      target;
+
+	if (!task_ptr_ok(leader)) {
+		/* A ring we cannot trust is not a ring we can clear anyone
+		 * against.  Deny rather than guess. */
+		WARN_ON_ONCE(1);
+		return -EPERM;
+	}
+
+	const task_t *t = leader;
+	int guard = 0;
+
+	do {
+		if (cred_may_access_one(&cur->cred, &t->cred, mode) != 0)
+			return -EPERM;
+
+		t = t->thread_group_next;
+
+		/* Bounded exactly as the thread-group kill walk is, and for the
+		 * same reason: this runs under g_task_list_lock with interrupts
+		 * off, where following a broken ring faults unrecoverably and
+		 * wedges the machine still holding the lock.  Deny on a ring we
+		 * cannot walk -- whatever broke it is a separate defect that
+		 * must not become an access-control bypass. */
+		if (!task_ptr_ok(t) || ++guard > TASK_GROUP_KILL_MAX * 4) {
+			WARN_ON_ONCE(1);
+			return -EPERM;
+		}
+	} while (t != leader);
+
+	return 0;
+}

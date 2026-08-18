@@ -4636,6 +4636,151 @@ bool mm_handle_cow_fault(uint64_t fault_addr)
 	return ret;
 }
 
+bool mm_make_writable_in(uint64_t *pml4, uint64_t vaddr)
+{
+	uint64_t page_addr = vaddr & ~0xFFFULL;
+
+	if (!pml4)
+		return false;
+
+	uint64_t *pte = mm_get_page_table_from_pml4(pml4, page_addr, false);
+
+	if (!pte || !(*pte & PAGE_PRESENT))
+		return false;
+
+	/* Already writable.  A writable mapping is never a shared read-only
+	 * one here, so there is nothing to unshare. */
+	if (*pte & PAGE_WRITABLE)
+		return true;
+
+	/* Not writable, for one of two reasons, and they are handled the same
+	 * way: it is copy-on-write from a fork, or it is a read-only mapping
+	 * such as program text.  Text is the case that matters for a debugger
+	 * -- planting a breakpoint means writing into code, which is mapped
+	 * read-only precisely because nothing normally writes to it -- and it
+	 * carries no copy-on-write marker, so keying off that marker refused
+	 * every breakpoint with a bad-address error.
+	 *
+	 * What actually has to be decided is whether anyone ELSE would see the
+	 * write, and the reference count answers that on its own: one holder
+	 * means the page is already private and only its permission is in the
+	 * way, more than one means it must be copied first.  The marker only
+	 * ever said "expect the count to be greater than one". */
+	uint64_t old_phys = *pte & PTE_ADDR_MASK;
+	uint64_t page_idx = page_to_index(old_phys);
+
+	/* Outside the refcounted range: copy unconditionally.  Making it
+	 * writable in place would leave both sharers on one page, which is the
+	 * exact corruption this exists to prevent. */
+	if (page_idx == (uint64_t)-1) {
+		uint64_t new_phys = mm_allocate_physical_page();
+		uint64_t uflags;
+
+		if (!new_phys)
+			return false;
+
+		mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys),
+			  PAGE_SIZE);
+
+		spin_lock_irqsave(&mm_refcount_lock, &uflags);
+		if ((*pte & PAGE_WRITABLE) ||
+		    (*pte & PTE_ADDR_MASK) != old_phys) {
+			spin_unlock_irqrestore(&mm_refcount_lock, uflags);
+			mm_free_physical_page(new_phys);
+			return true; /* somebody else resolved it */
+		}
+		uint64_t f = ((*pte & 0xFFF) & ~PAGE_COW) | PAGE_WRITABLE;
+
+		*pte = (*pte & PAGE_NO_EXECUTE) | new_phys | f;
+		spin_unlock_irqrestore(&mm_refcount_lock, uflags);
+		goto invalidate;
+	}
+
+	uint64_t irq_flags;
+
+	spin_lock_irqsave(&mm_refcount_lock, &irq_flags);
+
+	/* Re-checked under the lock: another CPU may have made it writable
+	 * while this one was getting here.  Asked as "is it writable yet",
+	 * not "is it still marked copy-on-write" -- a read-only text page
+	 * never carried that marker, and testing for it would report success
+	 * having changed nothing. */
+	if (*pte & PAGE_WRITABLE) {
+		spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+		return true;
+	}
+
+	/* Sole owner: take it rather than duplicate it, exactly as the fault
+	 * path does.  A tracee that forked long ago and has since touched most
+	 * of its pages is the common case. */
+	if (mm_get_page_refcount(old_phys) == 1) {
+		*pte = (*pte & ~(uint64_t)PAGE_COW) | PAGE_WRITABLE;
+		spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+		goto invalidate;
+	}
+
+	/* Shared.  Pin the source so it cannot be released while it is being
+	 * copied -- the other sharer could exit at any moment. */
+	mm_get_page(old_phys);
+	spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+
+	uint64_t new_phys = mm_allocate_physical_page();
+
+	if (!new_phys) {
+		mm_put_page(old_phys);
+		return false;
+	}
+	mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
+
+	spin_lock_irqsave(&mm_refcount_lock, &irq_flags);
+	if ((*pte & PAGE_WRITABLE) || (*pte & PTE_ADDR_MASK) != old_phys) {
+		/* Lost a race with the target resolving it itself.  Its copy is
+		 * the live one; discard ours rather than overwrite whatever has
+		 * been written into it since. */
+		spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+		mm_free_physical_page(new_phys);
+		mm_put_page(old_phys);
+		return true;
+	}
+	{
+		uint64_t f = ((*pte & 0xFFF) & ~PAGE_COW) | PAGE_WRITABLE;
+
+		*pte = (*pte & PAGE_NO_EXECUTE) | new_phys | f;
+	}
+	spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+
+	mm_put_page(old_phys); /* the pin; the mapping's own ref goes below */
+
+	/* Release this mapping's reference to the old page through the gather:
+	 * a sibling thread of the target may still be running and still
+	 * translating this address to old_phys, and handing the page back
+	 * before it has been told otherwise puts poisoned memory under a live
+	 * reader. */
+	{
+		struct mm_tlb_gather g;
+
+		mm_tlb_gather_init(&g, pml4);
+		mm_tlb_gather_page(&g, old_phys);
+		mm_tlb_gather_flush(&g);
+	}
+	return true;
+
+invalidate:
+	/* The entry changed without any page being released, so there is
+	 * nothing for the gather to carry -- and it does nothing when handed an
+	 * empty batch.  The invalidation is still required: a sibling thread of
+	 * the target may be running right now with the old read-only
+	 * translation cached, and it would keep using it.
+	 *
+	 * Shoot down the whole address space rather than the one page: this is
+	 * the primitive that exists for "this pml4 changed", it asks which CPUs
+	 * actually have it loaded, and it is not on any hot path. */
+	if (sched_is_smp())
+		smp_tlb_shootdown_mm_sync(virt_to_phys(pml4));
+	mm_flush_tlb(page_addr); /* and this CPU, which the above skips */
+	return true;
+}
+
 // ============================================================================
 // Demand paging — lazy region materialisation
 // ============================================================================
@@ -4675,14 +4820,26 @@ static void pagein_unlock(vfs_file_t *file)
 /* Body of the demand fault, run with the address-space semaphore held for
  * reading by the wrapper below.  The region table it consults and the page
  * tables it installs into are exactly what that lock protects. */
-static int mm_demand_fault_locked(uint64_t fault_addr, int from_kernel_mode)
+/* Materialise one lazily-mapped page of `mm'.
+ *
+ * Takes the address space explicitly rather than deriving it from the running
+ * task, because it is also used to populate a page of a process that is NOT
+ * running: a debugger reading or planting a breakpoint in a tracee that has
+ * been stopped since before its text was ever touched.  Nothing else about the
+ * work differs -- the region table consulted and the page tables installed
+ * into were already `mm''s and never the CPU's current ones.
+ *
+ * The caller holds mm's address-space semaphore (either mode; the install
+ * itself is serialised by g_lazy_map_lock, which is why the ordinary fault
+ * path can do this holding only a read lock).  Sleeps: it may read from the
+ * backing file. */
+static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
+			      int from_kernel_mode)
 {
 	if (fault_addr >= 0x0000800000000000ULL)
 		return 0;
-	task_t *cur = sched_current();
-	if (!cur || cur->privilege != TASK_USER || !cur->pml4)
+	if (!mm || !mm->pml4)
 		return 0;
-	task_t *mm = task_mm_owner(cur);
 	uint64_t page = fault_addr & ~0xFFFULL;
 
 	uint64_t map_flags = 0;
@@ -4799,6 +4956,18 @@ static int mm_demand_fault_locked(uint64_t fault_addr, int from_kernel_mode)
 	return 1;
 }
 
+/* The running task's own lazy fault: resolve which address space that is, then
+ * do the same work. */
+static int mm_demand_fault_locked(uint64_t fault_addr, int from_kernel_mode)
+{
+	task_t *cur = sched_current();
+
+	if (!cur || cur->privilege != TASK_USER || !cur->pml4)
+		return 0;
+	return mm_demand_fault_mm(task_mm_owner(cur), fault_addr,
+				  from_kernel_mode);
+}
+
 int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 {
 	task_t *cur = sched_current();
@@ -4808,6 +4977,24 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 
 	mm_fault_unlock(mm, locked);
 	return ret;
+}
+
+bool mm_populate_in(task_t *mm, uint64_t vaddr)
+{
+	uint64_t page = vaddr & ~0xFFFULL;
+
+	if (!mm || !mm->pml4)
+		return false;
+
+	/* Already there is success: this is asked before every cross-process
+	 * read or write, and the overwhelmingly common case is a page that has
+	 * been resident for a long time. */
+	uint64_t *pte = mm_get_page_table_from_pml4(mm->pml4, page, false);
+
+	if (pte && (*pte & PAGE_PRESENT))
+		return true;
+
+	return mm_demand_fault_mm(mm, page, 1) != 0;
 }
 
 void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write)

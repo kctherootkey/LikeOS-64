@@ -30,6 +30,7 @@ global syscall_entry
 %define PERCPU_SAVED_USER_R9        152
 %define PERCPU_SAVED_USER_R10       160
 %define PERCPU_SAVED_USER_R11       168
+%define PERCPU_SYSCALL_FRAME        176  ; percpu_t::syscall_user_frame
 ; Selectors for the IRETQ frame, matching the ones sched.c builds for a new
 ; task (CS 0x23, SS 0x1B).
 %define USER_CS_SEL                 0x23
@@ -138,6 +139,14 @@ syscall_entry:
     ; Use RBP as frame pointer to remember where our saved registers are
     ; This way we can find them even after sched_yield context switches
     mov rbp, rsp                               ; RBP = top of our saved register area
+
+    ; Publish that frame so C can read the user's ARGUMENT registers, which
+    ; nothing else preserves: the per-CPU slots above keep only what a syscall
+    ; or a signal return needs.  A debugger inspecting a tracee stopped inside
+    ; a syscall has to see rdi/rsi/rdx/r8/r9/r10, and they live only here.
+    ; Consumed by syscall_handler while interrupts are still off, because this
+    ; slot belongs to the CPU and not to the task.
+    mov [gs:PERCPU_SYSCALL_FRAME], rbp
 
     and rsp, ~0xF
     ; Pass the user's 6th syscall argument (original r9, saved at [rbp+40] per

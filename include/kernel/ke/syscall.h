@@ -255,6 +255,40 @@ typedef struct procmapinfo {
  * costs a region record every time. */
 #define SYS_MADVISE 406
 
+/* ptrace(2) — observe and control another process.  (request, pid, addr, data)
+ *
+ * The single most privilege-sensitive call in the kernel: it hands the caller
+ * another process's memory and registers outright.  Every request re-checks
+ * task_may_access(target, ACCESS_ATTACH) rather than trusting a decision made
+ * at attach time, because a tracee can change identity while it is traced.
+ * The request numbers and register layout are this system's own; see
+ * user/lib/libc/include/sys/ptrace.h for the interface contract. */
+#define SYS_PTRACE 408
+
+/* Trace options (PTRACE_SETOPTIONS): which extra events stop the tracee.
+ * Mirrored in user/lib/libc/include/sys/ptrace.h. */
+#define PTRACE_O_TRACEFORK 0x0001
+#define PTRACE_O_TRACEVFORK 0x0002
+#define PTRACE_O_TRACECLONE 0x0004
+#define PTRACE_O_TRACEEXEC 0x0008
+#define PTRACE_O_TRACEEXIT 0x0010
+#define PTRACE_O_EXITKILL 0x0020
+
+/* Why a tracee stopped.  Reported in the high bits of the wait status so a
+ * tracer can tell an event stop from a plain signal-delivery stop.  Mirrored
+ * in user/lib/libc/include/sys/ptrace.h. */
+#define PTRACE_EVENT_FORK 1
+#define PTRACE_EVENT_VFORK 2
+#define PTRACE_EVENT_CLONE 3
+#define PTRACE_EVENT_EXEC 4
+#define PTRACE_EVENT_EXIT 5
+/* Entry and exit are reported as distinct events rather than left for the
+ * tracer to infer by counting stops.  Counting is what a debugger has to do on
+ * systems that report both the same way, and it desynchronises the moment a
+ * stop is missed -- after which every syscall is reported backwards. */
+#define PTRACE_EVENT_SYSCALL_ENTRY 6
+#define PTRACE_EVENT_SYSCALL_EXIT 7
+
 #define MADV_NORMAL 0
 #define MADV_RANDOM 1
 #define MADV_SEQUENTIAL 2

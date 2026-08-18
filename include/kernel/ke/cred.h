@@ -99,4 +99,28 @@ int current_is_root(void); /* 1 if effective uid 0 */
  * Returns non-zero if the caller is permitted the privileged action. */
 int capable(void);
 
+/* ---- Cross-process access control ------------------------------------------
+ * The strict counterpart to signal_permission().  That one is the permissive
+ * kill(2) rule -- ONE of the sender's ids need match one of the target's,
+ * because perturbing a process the user owns is their business.  This is the
+ * rule for operations that hand out or take over another process's PRIVATE
+ * state: the layout of its address space, its environment, its registers.
+ *
+ * ACCESS_READ   observe another process's private state (maps, environ, ...).
+ * ACCESS_ATTACH take control of it: read/write its memory and registers.
+ *               Stricter -- see task_may_access(). */
+#define ACCESS_READ 0
+#define ACCESS_ATTACH 1
+
+struct task;
+
+/* May the caller access `target` in the given mode?  Returns 0 to allow,
+ * -ESRCH if there is no target, or -EPERM to deny.  Root and kernel context
+ * are allowed unconditionally.
+ *
+ * The caller MUST hold g_task_list_lock: the answer is computed by walking
+ * the target's whole thread group, and those task_t structures are kept alive
+ * only by that lock. */
+int task_may_access(const struct task *target, int mode);
+
 #endif /* LIKEOS_CRED_H */

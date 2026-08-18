@@ -1,0 +1,113 @@
+Recognise LikeOS as a host, a target and a BFD flavour.
+
+Five files, all wiring rather than logic.
+
+gdb/configure.host names the host, which is what selects the native block in
+configure.nat.  gdb 17 has no config/<cpu>/*.mh files at all -- that mechanism
+is gone -- so configure.nat is the whole of native configuration.
+
+gdb/configure.nat asks for gdb's OWN generic ptrace target, inf-ptrace.o,
+rather than a native module written for this system: LikeOS's ptrace(2) takes
+the same requests with the same arguments, deliberately, including the register
+requests carrying their buffer in the third argument because that is what this
+code already sends.  Only the register LAYOUT is local, and amd64-nat.o plus
+likeos-nat.o supply it.
+
+gdb/configure.tgt pulls in solib-svr4.o, which matters more than its size
+suggests: it reads the dynamic loader's r_debug/link_map list and is therefore
+the only way this target learns that shared libraries exist.  Without it gdb
+sees the executable and nothing else.
+
+bfd/config.bfd joins the generic ELF64 arm.  LikeOS binaries are plain ELF with
+no OS-specific note handling or vectors, which is exactly what that arm is for.
+
+gdbsupport/osabi.def adds the OS ABI itself.  Its third field is a regexp
+matched against the target triple, and that is how the ABI is recognised here:
+these binaries are ordinary ELF with ELFOSABI_NONE, so there is nothing inside
+them to sniff.
+
+--- a/gdb/configure.host
++++ b/gdb/configure.host
+@@ -179,6 +179,7 @@
+ x86_64-*-netbsd* | x86_64-*-knetbsd*-gnu)
+ 			gdb_host=nbsd64 ;;
+ x86_64-*-openbsd*)	gdb_host=obsd64 ;;
++x86_64-*-likeos*)	gdb_host=likeos64 ;;
+ x86_64-*-mingw*)        gdb_host=mingw64
+ 			gdb_host_obs=mingw-hdep.o
+ 			;;
+
+--- a/gdb/configure.nat
++++ b/gdb/configure.nat
+@@ -74,6 +74,27 @@
+     obsd*)
+ 	NATDEPFILES='fork-child.o nat/fork-inferior.o inf-ptrace.o'
+ 	;;
++    likeos*)
++	# LikeOS drives its tracees through gdb's own generic ptrace target.
++	# Its ptrace(2) takes the same requests with the same arguments, so
++	# inf-ptrace.c needs no adaptation; only the register layout is local,
++	# and that lives in likeos-nat.c.
++	NATDEPFILES='fork-child.o nat/fork-inferior.o inf-ptrace.o'
++	case ${gdb_host_cpu} in
++	    i386)
++		# amd64-nat.o carries the register-map machinery the offset
++		# table in likeos-nat.c plugs into.
++		#
++		# x86-nat.o and nat/x86-dregs.o are the hardware watchpoint
++		# layer: between them they own the four debug address
++		# registers, the assembly of DR7, and every target method a
++		# watchpoint needs.  likeos-nat.c supplies only the five
++		# accessors that move one register in or out.
++		NATDEPFILES="${NATDEPFILES} amd64-nat.o likeos-nat.o \
++			x86-nat.o nat/x86-dregs.o"
++		;;
++	esac
++	;;
+     cygwin*)
+ 	NATDEPFILES='x86-nat.o nat/x86-dregs.o windows-nat.o nat/windows-nat.o'
+ 	;;
+
+--- a/gdb/configure.tgt
++++ b/gdb/configure.tgt
+@@ -719,6 +719,16 @@
+ x86_64-*-elf*)
+ 	gdb_target_obs="${i386_tobjs}"
+ 	;;
++x86_64-*-likeos*)
++	# Target: LikeOS/amd64.
++	#
++	# solib-svr4 is what reads the loader's r_debug/link_map list, which is
++	# the only way this target learns where shared libraries are; without it
++	# gdb sees the executable alone.  svr4-tls-tdep gives it __thread
++	# variables from the same source.
++	gdb_target_obs="${i386_tobjs} amd64-tdep.o arch/amd64.o \
++			likeos-tdep.o solib-svr4.o svr4-tls-tdep.o"
++	;;
+ x86_64-*-linux*)
+ 	# Target: GNU/Linux x86-64
+ 	gdb_target_obs="amd64-linux-tdep.o ${i386_tobjs}  \
+
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -666,7 +666,8 @@
+     targ_selvecs="i386_elf32_vec iamcu_elf32_vec"
+     want64=true
+     ;;
+-  x86_64-*-elf* | x86_64-*-rtems* | x86_64-*-fuchsia | x86_64-*-genode*)
++  x86_64-*-elf* | x86_64-*-rtems* | x86_64-*-fuchsia | x86_64-*-genode* | \
++  x86_64-*-likeos*)
+     targ_defvec=x86_64_elf64_vec
+     targ_selvecs="i386_elf32_vec iamcu_elf32_vec x86_64_elf32_vec"
+     case "${targ}" in
+
+--- a/gdbsupport/osabi.def
++++ b/gdbsupport/osabi.def
+@@ -41,6 +41,7 @@
+ GDB_OSABI_DEF (FREEBSD, "FreeBSD", nullptr)
+ GDB_OSABI_DEF (NETBSD, "NetBSD", nullptr)
+ GDB_OSABI_DEF (OPENBSD, "OpenBSD", nullptr)
++GDB_OSABI_DEF (LIKEOS, "LikeOS", "likeos")
+ GDB_OSABI_DEF (WINCE, "WindowsCE", nullptr)
+ GDB_OSABI_DEF (GO32, "DJGPP", nullptr)
+ GDB_OSABI_DEF (CYGWIN, "Cygwin", nullptr)

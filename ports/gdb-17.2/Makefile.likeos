@@ -1,0 +1,75 @@
+# Makefile.likeos — build gdb 17.2 for LikeOS-64.
+#
+# The tarball is unpacked and patched by unpack.sh, configured by
+# likeos-configure.sh, and then built with the configure-generated Makefile in
+# build/.  Two stamps record how far that has got, so touching a patch
+# re-unpacks and reconfigures while touching nothing rebuilds only what changed.
+#
+# Output: build/gdb/gdb
+#
+# gdbserver is NOT built here.  It configures as a separate target and needs its
+# own low-level module; the native debugger is the thing worth having first, and
+# it is what the ptrace work in the kernel was for.
+
+SRC_STAMP := .likeos-unpacked
+STAMP     := .likeos-configured
+
+PATCHES := $(wildcard patches/*.patch)
+
+# The cross tools likeos-configure.sh links; gdb's recursive makes look them up
+# by target-prefixed name.
+TOOLBIN := $(CURDIR)/toolbin
+
+.PHONY: all unpack configure clean distclean
+
+all: $(STAMP)
+	PATH="$(TOOLBIN):$$PATH" $(MAKE) -C build all-gdb
+
+# Re-unpack whenever the tarball or any patch changes.  --force because src/
+# exists by then and unpack.sh will not overwrite it silently.
+$(SRC_STAMP): gdb-17.2.tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(STAMP): $(SRC_STAMP) likeos-configure.sh
+	$(SHELL) ./likeos-configure.sh
+	@touch $@
+
+unpack: $(SRC_STAMP)
+
+# Say that src/ already matches the patches, without redoing anything.
+#
+# The dependency above is the right way round for the normal flow: a patch is
+# edited, so the tree has to be unpacked again and the patch re-applied.  It is
+# the WRONG way round for the other flow -- editing src/ directly and then
+# regenerating the patch FROM it, which is how the LikeOS files in patch 0003
+# are actually maintained.  There the patch is a derivative of src/, so it is
+# always newer, and every build then threw the tree away and rebuilt gdb from
+# scratch: twenty minutes to recompile 2,000 files because one of them changed.
+#
+# Only valid once the patches have been VERIFIED to reproduce src/ byte for
+# byte:
+#
+#   tar xf gdb-17.2.tar.gz -C /tmp/check && ... apply patches ...
+#   diff -r --brief /tmp/check/gdb-17.2 src
+#
+# Without that check this target is a lie that survives until the next
+# re-unpack silently discards work.
+.PHONY: restamp
+restamp:
+	@touch $(SRC_STAMP) $(STAMP)
+	@echo "  stamp src/ matches patches/ (not verified here -- see comment)"
+
+configure:
+	$(SHELL) ./likeos-configure.sh
+	@touch $(STAMP)
+
+clean:
+	-PATH="$(TOOLBIN):$$PATH" $(MAKE) -C build clean 2>/dev/null || true
+
+# distclean returns the directory to what git tracks: the tarball, the patches
+# and the port's own scripts.  build/, src/ and toolbin/ are all generated, and
+# everything in them is reproducible from the two things that stay.
+distclean:
+	rm -rf build src toolbin
+	rm -f $(STAMP) $(SRC_STAMP)

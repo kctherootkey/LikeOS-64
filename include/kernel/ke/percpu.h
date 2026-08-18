@@ -69,6 +69,22 @@ struct percpu {
 	uint64_t syscall_saved_user_r10; // GS:160
 	uint64_t syscall_saved_user_r11; // GS:168
 
+	/* Where syscall_entry parked the user's register set on the kernel
+	 * stack, i.e. its RBP frame pointer.  GS:176.
+	 *
+	 * The slots above hold only what a syscall RETURN needs (the ABI lets a
+	 * syscall clobber the rest) plus what a SIGNAL return needs, and the
+	 * latter are written at delivery, not at entry.  So neither describes
+	 * the argument registers of a syscall currently in progress -- and
+	 * those are exactly what a debugger inspecting a stopped tracee, or
+	 * reporting a syscall entry, has to show.  They are on the kernel stack
+	 * the whole time; this is the pointer to them.
+	 *
+	 * Per-CPU and therefore only valid until this CPU runs something else,
+	 * which is why syscall_handler copies through it into the task while
+	 * interrupts are still off. */
+	uint64_t syscall_user_frame; // GS:176
+
 	// CPU identification
 	uint32_t cpu_id; // Logical CPU index (0 = BSP)
 	uint32_t apic_id; // LAPIC APIC ID
@@ -199,6 +215,8 @@ _Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r9) == 152,
 	       "percpu: syscall_saved_user_r9 must be at GS:152");
 _Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r10) == 160,
 	       "percpu: syscall_saved_user_r10 must be at GS:160");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_user_frame) == 176,
+	       "percpu: syscall_user_frame must be at offset 176");
 _Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r11) == 168,
 	       "percpu: syscall_saved_user_r11 must be at GS:168");
 

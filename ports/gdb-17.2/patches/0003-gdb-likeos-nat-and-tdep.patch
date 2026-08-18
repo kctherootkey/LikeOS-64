@@ -1,0 +1,1292 @@
+Add the LikeOS native and target-dependent modules.
+
+Two new files, both small, because almost everything a debugger needs on this
+system is already in gdb.
+
+gdb/likeos-nat.c is the native side.  Attach, detach, resume, step, wait, read
+and write memory, kill -- inf-ptrace.c does all of it unchanged, since LikeOS's
+ptrace(2) speaks the same requests with the same arguments.  What is genuinely
+local is the shape of the register block, so that is all this file holds: a
+table saying where each register gdb knows about sits inside `struct
+ptrace_regs', and the two methods that move a block in and out.  Both register
+orders are written out in the comment rather than left to be counted off,
+because an off-by-one there does not crash -- it silently reports one register's
+value under another's name.  The floating-point block needs no translation at
+all: the kernel reports an FXSAVE image and amd64_supply_fxsave expects one.
+
+gdb/likeos-tdep.c registers the OS ABI, and its one real line points the
+architecture at solib-svr4.  The loader fills in DT_DEBUG and maintains the
+link_map chain, calling _dl_debug_state before and after each change so a
+debugger can tell a finished list from one mid-edit; that is the protocol
+solib-svr4 implements, so naming it is the whole of the work.
+
+Both use INIT_GDB_FILE rather than a hand-written _initialize_ function.  That
+is not a style preference: gdb builds its table of initialisers by grepping the
+sources for that macro (see make-init-c), so a plain _initialize_likeos_tdep
+would compile, link, and never be called -- leaving the registration undone and
+shared libraries invisible, with nothing to indicate why.
+
+Two things this file carries beyond the register table, both learned from a
+first run on the machine:
+
+  - xfer_partial serves TARGET_OBJECT_AUXV out of the new PTRACE_GETAUXV.  This
+    is what makes breakpoints land.  Executables here are position-independent,
+    and without the auxiliary vector gdb has no way to learn the bias one was
+    loaded at: `break main' resolved to its link-time 0x590, the breakpoint
+    could not be written because nothing is mapped there, and every run ended
+    in "Cannot access memory at address 0x590".  solib-svr4 takes AT_ENTRY from
+    this vector, subtracts e_entry from the file on disk, and relocates the
+    symbol table by the difference.  A system with a per-process filesystem
+    publishes the same bytes as a file and needs no code for it; this one asks
+    the kernel directly.
+
+  - The register offset table runs to %gs_base rather than stopping at %gs.
+    The table is indexed by gdb's own register number and %fs_base is number
+    153, so the entire x87/SSE/AVX/AVX512 file has to be spelled out as absent
+    in between.  Stopping short left both segment bases reported as
+    "<unavailable>", and %fs_base is where a thread's TLS block lives, so
+    thread-local variables were unreachable.  A static_assert ties the table's
+    length to AMD64_GSBASE_REGNUM, because getting that run of -1 wrong does
+    not fail loudly -- it slides the last two entries onto some other
+    register's offset.
+
+likeos-tdep.c registers an OS ABI *sniffer* as well as a handler, and without
+the sniffer the handler is dead code.  LikeOS binaries are plain ELF -- EI_OSABI
+is ELFOSABI_NONE and there is no OS note -- so gdb's generic sniffer finds no ABI
+tag and reports GDB_OSABI_UNKNOWN.  An unknown OS ABI means likeos_init_abi is
+never called and everything it sets up silently does not happen: no solib ops,
+so no shared library list, and no relocation of a position-independent
+executable.  That is what left `break main' resolving to its link-time 0x590,
+every frame printing as "?? ()", and the register fetch working perfectly well
+all the while -- the native side is registered unconditionally, the target side
+is gated on the OS ABI.  Claiming every unmarked ELF is safe in a gdb configured
+for this target alone; systems that stamp their binaries are still matched
+first, since their EI_OSABI is not ELFOSABI_NONE.
+
+likeos_init_abi calls amd64_init_abi before anything else, which every other
+amd64 OS handler in the tree also does and which is not a formality: it installs
+the frame unwinders, the calling convention, the register set and the breakpoint
+kind.  Registering the OS ABI without it made the debugger worse than having no
+OS ABI at all -- gdb had been falling back to a default amd64 architecture that
+carried all of those, and claiming the ABI replaced that fallback with a handler
+that only set solib ops.  The result did not look like a missing initialiser:
+registers still printed, because the native target reads those itself, and the
+program still ran, but the first frame gdb unwound ended the session with
+"frame-unwind.c:231: internal-error: frame_unwind_find_by_frame failed" and
+breakpoints quietly failed to land.
+
+likeos-nat.c also enumerates the inferior's THREADS, through PT_GETNUMLWPS and
+PT_GETLWPLIST.  A thread on this system is a task in its own right -- its own
+registers, its own stop, its own id -- so ptrace already works on one once its
+id is known; knowing the SET is the only thing a debugger cannot work out for
+itself, since a thread is invisible from outside the process.  Without this gdb
+reports a single thread, which for a program that does its work on several
+means one stack out of five and a fault on any other thread attributed to the
+wrong one.  update_thread_list prunes and re-adds on every stop, because a
+thread can both appear and exit between two of them; the first thread reported
+renames the existing inferior ptid rather than being added beside it, or the
+process shows up twice.
+
+Naming threads means overriding wait() as well, and the two halves are not
+separable.  Once the thread list holds (process, thread) ptids, everything
+handed to gdb must carry both: a stop reported as (process, 0) matches no
+thread, gdb looks for the inferior that owns it, finds none, and dies in
+set_current_inferior on `inf != NULL'.  The reference targets do this from the
+other side -- FreeBSD's wait_1 takes the process id wait() gave it and asks
+PT_LWPINFO which LWP stopped -- whereas this kernel reports the TASK that
+stopped, so the thread half arrives for free and the process half is the
+inferior being waited on.
+
+The rest of what a native target owes gdb is here too, and the pieces are not
+separable from each other:
+
+  - wait() reports (process, thread).  Once the thread list holds such ptids,
+    everything handed to gdb must carry both halves, or a stop matches no
+    thread and set_current_inferior dies on `inf != NULL'.  FreeBSD does this
+    from the other side, asking PT_LWPINFO which LWP stopped; this kernel
+    reports the TASK that stopped, so the thread half arrives for free.
+  - resume() resumes the PROCESS unless a single thread was named or the
+    request is a step.  The kernel parks every thread when one stops, so
+    releasing only the named thread would leave the siblings parked with
+    nothing left to release them.  A step stays aimed at one thread, because
+    letting the others run during it lands the step somewhere unrelated.
+  - The event stops are decoded: fork, vfork, clone, exec and thread exit all
+    arrive as SIGTRAP and are indistinguishable from a breakpoint without
+    asking for the event code (PTRACE_GETEVENT) and the pid that goes with it
+    (PTRACE_GETEVENTMSG).  The clone and exit stops are consumed here rather
+    than reported: they exist so a thread can be added the moment it is born
+    and dropped the moment it dies, which is what makes `info threads' current
+    between stops instead of only at them.
+  - sharing_input_terminal() in posix-hdep.c answers with the session id.  It
+    returned "unknown" here, and the caller turns that into "assume yes", so
+    attaching to a process on another terminal handed the foreground group of
+    GDB's OWN terminal to a group living somewhere else -- ^C then went there
+    instead of to GDB, and `gdb -p <an xterm>' delivered SIGINT to the whole X
+    session.  A process in a different session cannot have this terminal as its
+    controlling terminal, which is the case that matters and the one thing that
+    can be answered without a per-process filesystem.
+  - pass_signal() in inflow.c names the inferior through the INFERIOR.  It used
+    inferior_ptid, which the wait path deliberately clears before calling the
+    target (do_target_wait_1 starts with switch_to_inferior_no_thread), so ^C
+    ran `kill (0, SIGINT)' -- every process in GDB's OWN process group, not the
+    program.  Only targets that block in the wait install this handler, which is
+    why it survives upstream: it shows as ^C working for a program GDB started
+    and doing nothing for one GDB attached to.
+  - attach() asks for those events too.  post_startup_inferior is reached only
+    from create_inferior, so a process gdb ATTACHED to was traced with no
+    options at all -- no thread announced, no thread reported gone, an exec
+    swapping the program out in silence.
+  - $_siginfo, through TARGET_OBJECT_SIGNAL_INFO and PTRACE_GETSIGINFO: si_code
+    and si_addr are the difference between "SIGSEGV" and "wrote to 0x1".
+
+diff -urN a/gdb/likeos-nat.c b/gdb/likeos-nat.c
+diff -urN a/gdb/inflow.c b/gdb/inflow.c
+--- a/gdb/inflow.c
++++ b/gdb/inflow.c
+@@ -899,7 +899,30 @@
+ pass_signal (int signo)
+ {
+ #ifndef _WIN32
+-  kill (inferior_ptid.pid (), SIGINT);
++  /* Name the inferior through the INFERIOR, not through inferior_ptid.
++
++     This handler is installed around the blocking wait, and the wait path
++     clears inferior_ptid before calling the target: do_target_wait_1 begins
++     with switch_to_inferior_no_thread, whose whole purpose is to make sure
++     nothing in the wait code relies on inferior_ptid.  So by the time ^C
++     arrives it is null_ptid, and `kill (0, SIGINT)' does not mean "the
++     inferior" -- POSIX defines it as every process in the CALLER's process
++     group, which is GDB.  ^C then never reached the program at all; it went
++     back into this handler.
++
++     Only targets that block in the wait see it, which is why it survives: the
++     async targets interrupt through target_interrupt() and never install this
++     handler.  It shows up as ^C working for a program GDB started (that one
++     shares GDB's terminal, so the tty delivers SIGINT to it directly and
++     set_sigint_trap installs nothing) and doing nothing at all for a program
++     GDB attached to.  */
++  inferior *inf = current_inferior ();
++  int pid = (inferior_ptid != null_ptid
++	     ? inferior_ptid.pid ()
++	     : (inf != nullptr ? inf->pid : 0));
++
++  if (pid > 0)
++    kill (pid, SIGINT);
+ #endif
+ }
+ 
+diff -urN a/gdb/likeos-nat.c b/gdb/likeos-nat.c
+--- a/gdb/likeos-nat.c
++++ b/gdb/likeos-nat.c
+@@ -0,0 +1,940 @@
++/* Native-dependent code for LikeOS/amd64.
++
++   This file is part of GDB.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++/* Everything a debugger does to a process on this system -- attach, detach,
++   resume, step, wait, read and write memory, kill -- is what inf-ptrace.c
++   already does, because LikeOS's ptrace(2) takes the same requests with the
++   same arguments.  That is deliberate on the kernel's side and it is why this
++   file is short.
++
++   What is genuinely local is the shape of the register block, so that is all
++   that is here: a table saying where each register gdb knows about sits inside
++   `struct ptrace_regs', and the two methods that move a block in and out.  */
++
++#include "defs.h"
++#include "inferior.h"
++#include "regcache.h"
++#include "target.h"
++#include "amd64-tdep.h"
++#include "amd64-nat.h"
++#include "inf-ptrace.h"
++#include "x86-nat.h"
++#include "nat/x86-dregs.h"
++#include "gdbthread.h"
++#include "inferior.h"
++#include "observable.h"
++#include "gdbcore.h"
++#include "progspace.h"
++
++#include <sys/ptrace.h>
++
++/* Where each register lives in `struct ptrace_regs' (<sys/ptrace.h>), indexed
++   by gdb's own amd64 register numbering.
++
++   The kernel's block is ordered the way the interrupt frame it is built from is
++   ordered, which is nothing like gdb's order, so this table is the whole of the
++   translation between them.  Both orders are spelled out below rather than left
++   to be counted off, because an off-by-one here is not a crash -- it is a
++   debugger that quietly reports one register's value under another's name.
++
++   struct ptrace_regs, in slots of 8 bytes:
++
++      0 r15   1 r14   2 r13   3 r12   4 rbp   5 rbx   6 r11   7 r10
++      8 r9    9 r8   10 rax  11 rcx  12 rdx  13 rsi  14 rdi  15 rip
++     16 cs   17 rflags 18 rsp 19 ss  20 fs_base 21 gs_base
++
++   -1 means the register is not in this block.  The segment registers other
++   than %cs and %ss have no meaning to a 64-bit process here and the kernel does
++   not report them, so they are marked absent rather than reported as zero --
++   gdb prints "<unavailable>", which is true, instead of a plausible lie.  */
++
++static int likeos_r_reg_offset[] =
++{
++  10 * 8,			/* %rax */
++  5 * 8,			/* %rbx */
++  11 * 8,			/* %rcx */
++  12 * 8,			/* %rdx */
++  13 * 8,			/* %rsi */
++  14 * 8,			/* %rdi */
++  4 * 8,			/* %rbp */
++  18 * 8,			/* %rsp */
++  9 * 8,			/* %r8 */
++  8 * 8,			/* %r9 */
++  7 * 8,			/* %r10 */
++  6 * 8,			/* %r11 */
++  3 * 8,			/* %r12 */
++  2 * 8,			/* %r13 */
++  1 * 8,			/* %r14 */
++  0 * 8,			/* %r15 */
++  15 * 8,			/* %rip */
++  17 * 8,			/* %eflags */
++  16 * 8,			/* %cs */
++  19 * 8,			/* %ss */
++  -1,				/* %ds */
++  -1,				/* %es */
++  -1,				/* %fs */
++  -1,				/* %gs */
++
++  /* Everything from here to %fs_base is entered as absent, and the run of
++     them is load-bearing rather than decorative.
++
++     This table is indexed by GDB's own register number, and %fs_base is
++     number 153 -- the whole x87, SSE, AVX, MPX and AVX512 file sits between
++     it and %gs.  The floating-point registers among those are real and are
++     read separately, by fetch_registers with PT_GETFPREGS; the rest this
++     machine does not report.  Either way none of them comes out of the
++     block this table describes, so all of them are -1 here.
++
++     Getting the length wrong would not crash: it would slide %fs_base and
++     %gs_base onto some other register's offset, and the debugger would
++     print one register's contents under another's name, confidently.  The
++     run below is the same length and in the same order as the reference
++     table in amd64-linux-tdep.c, which is the authority on this numbering.  */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %st0 ... %st7 */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %fctrl ... %fop */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %xmm0 ... %xmm7 */
++  -1, -1, -1, -1, -1, -1, -1, -1, -1,	/* %xmm8 ... %xmm15, %mxcsr */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %ymm0h ... %ymm7h */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %ymm8h ... %ymm15h */
++  -1, -1, -1, -1,			/* MPX BND0 ... BND3 */
++  -1, -1,				/* MPX BNDCFGU, BNDSTATUS */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %xmm16 ... %xmm31 (AVX512) */
++  -1, -1, -1, -1, -1, -1, -1, -1,
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %ymm16h ... %ymm31h (AVX512) */
++  -1, -1, -1, -1, -1, -1, -1, -1,
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %k0 ... %k7 (AVX512) */
++  -1, -1, -1, -1, -1, -1, -1, -1,	/* %zmm0h ... %zmm31h (AVX512) */
++  -1, -1, -1, -1, -1, -1, -1, -1,
++  -1, -1, -1, -1, -1, -1, -1, -1,
++  -1, -1, -1, -1, -1, -1, -1, -1,
++  -1,					/* %pkru */
++  -1,					/* CET %pl3_ssp */
++
++  /* End of the hardware registers.  These two the kernel does report, and
++     they are worth having: %fs_base is where a thread's TLS block lives, so
++     without it a debugger cannot find thread-local variables at all.  */
++  20 * 8,			/* %fs_base */
++  21 * 8			/* %gs_base */
++};
++
++/* 24 named registers, then 129 that come from somewhere else or not at all,
++   puts %fs_base at 153 and %gs_base at 154.  If this fails, the run of -1
++   above has drifted and every register past it is being read from the wrong
++   offset.  */
++static_assert (ARRAY_SIZE (likeos_r_reg_offset) == AMD64_GSBASE_REGNUM + 1,
++	       "register offset table must be indexed by amd64 regnum");
++
++/* The register requests take their buffer in the THIRD argument and ignore the
++   fourth.  That is the same convention inf-ptrace.c uses for everything else,
++   so there is one calling shape here and not two.  */
++
++/* Hardware watchpoints, through the debug registers.
++
++   x86_nat_target supplies every target method a watchpoint needs -- insert,
++   remove, stopped_by_watchpoint, region_ok_for_hw_watchpoint and the rest --
++   on top of nat/x86-dregs.c, which owns the allocation of the four address
++   registers and the assembly of DR7.  All it wants from a particular system is
++   five functions that move one register in or out, which is what this section
++   provides.  Writing any of that by hand would be reimplementing shared code
++   that is already correct.
++
++   The kernel reports all eight registers at once, indexed as the hardware
++   numbers them, so a read is one request and a write is read-modify-write.  */
++
++static struct ptrace_dbregs
++likeos_dr_fetch (ptid_t ptid)
++{
++  struct ptrace_dbregs dbregs;
++
++  if (ptrace (PT_GETDBREGS, get_ptrace_pid (ptid), &dbregs, 0) == -1)
++    perror_with_name (_("Couldn't read debug registers"));
++
++  return dbregs;
++}
++
++static void
++likeos_dr_store (const struct ptrace_dbregs *dbregs)
++{
++  /* Written to every thread in the process, not just the one that happens to
++     be current: a watchpoint is on an address in an address space they all
++     share, and one that only trapped on the thread that set it would miss the
++     write it was armed for.  */
++  for (thread_info *thread : current_inferior ()->non_exited_threads ())
++    if (ptrace (PT_SETDBREGS, get_ptrace_pid (thread->ptid),
++		(void *) dbregs, 0) == -1)
++      perror_with_name (_("Couldn't write debug registers"));
++}
++
++static unsigned long
++likeos_dr_get (ptid_t ptid, int regnum)
++{
++  struct ptrace_dbregs dbregs = likeos_dr_fetch (ptid);
++
++  return dbregs.dr[regnum];
++}
++
++static void
++likeos_dr_set (int regnum, unsigned long value)
++{
++  struct ptrace_dbregs dbregs = likeos_dr_fetch (inferior_ptid);
++
++  dbregs.dr[regnum] = value;
++  likeos_dr_store (&dbregs);
++}
++
++static void
++likeos_dr_set_control (unsigned long control)
++{
++  likeos_dr_set (DR_CONTROL, control);
++}
++
++static void
++likeos_dr_set_addr (int regnum, CORE_ADDR addr)
++{
++  gdb_assert (regnum >= 0 && regnum <= DR_LASTADDR - DR_FIRSTADDR);
++  likeos_dr_set (DR_FIRSTADDR + regnum, (unsigned long) addr);
++}
++
++static CORE_ADDR
++likeos_dr_get_addr (int regnum)
++{
++  return likeos_dr_get (inferior_ptid, DR_FIRSTADDR + regnum);
++}
++
++static unsigned long
++likeos_dr_get_status (void)
++{
++  return likeos_dr_get (inferior_ptid, DR_STATUS);
++}
++
++static unsigned long
++likeos_dr_get_control (void)
++{
++  return likeos_dr_get (inferior_ptid, DR_CONTROL);
++}
++
++class likeos_nat_target final : public x86_nat_target<inf_ptrace_target>
++{
++public:
++  void fetch_registers (struct regcache *, int) override;
++  void store_registers (struct regcache *, int) override;
++
++  void attach (const char *, int) override;
++  void resume (ptid_t, int, enum gdb_signal) override;
++  void follow_fork (inferior *, ptid_t, target_waitkind, bool, bool) override;
++  const char *pid_to_exec_file (int pid) override;
++  ptid_t wait (ptid_t, struct target_waitstatus *, target_wait_flags) override;
++  void update_thread_list () override;
++  bool thread_alive (ptid_t ptid) override;
++  std::string pid_to_str (ptid_t) override;
++
++  enum target_xfer_status xfer_partial (enum target_object object,
++					const char *annex,
++					gdb_byte *readbuf,
++					const gdb_byte *writebuf,
++					ULONGEST offset, ULONGEST len,
++					ULONGEST *xfered_len) override;
++
++protected:
++  /* Ask for the events this target decodes in wait().
++
++     TRACECLONE is what makes a new thread announce itself the moment it is
++     created, rather than being noticed later when something else happens to
++     stop the process.  TRACEEXIT is the other half of the same story: a thread
++     is not its debugger's child, so nothing else ever reports its death, and
++     without this a thread that had gone stayed in `info threads' until the
++     next time the whole process happened to stop.  wait() consumes both kinds
++     of stop itself -- see there -- so neither reaches the user as a trap.  */
++  static void set_trace_options (int pid)
++  {
++    ptrace (PTRACE_SETOPTIONS, pid, nullptr,
++	    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE
++	    | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT);
++  }
++
++  void post_startup_inferior (ptid_t ptid) override
++  {
++    set_trace_options (ptid.pid ());
++  }
++
++};
++
++static likeos_nat_target the_likeos_nat_target;
++
++void
++likeos_nat_target::fetch_registers (struct regcache *regcache, int regnum)
++{
++  struct gdbarch *gdbarch = regcache->arch ();
++  pid_t pid = get_ptrace_pid (regcache->ptid ());
++
++  if (regnum == -1 || amd64_native_gregset_supplies_p (gdbarch, regnum))
++    {
++      struct ptrace_regs regs;
++
++      if (ptrace (PT_GETREGS, pid, &regs, 0) == -1)
++	perror_with_name (_("Couldn't get registers"));
++
++      amd64_supply_native_gregset (regcache, &regs, -1);
++
++      if (regnum != -1)
++	return;
++    }
++
++  if (regnum == -1 || !amd64_native_gregset_supplies_p (gdbarch, regnum))
++    {
++      /* The floating-point block needs no translation at all: the kernel
++	 reports it as an FXSAVE image, which is exactly what this expects.  */
++      struct ptrace_fpregs fpregs;
++
++      if (ptrace (PT_GETFPREGS, pid, &fpregs, 0) == -1)
++	perror_with_name (_("Couldn't get floating point status"));
++
++      amd64_supply_fxsave (regcache, -1, &fpregs);
++    }
++}
++
++void
++likeos_nat_target::store_registers (struct regcache *regcache, int regnum)
++{
++  struct gdbarch *gdbarch = regcache->arch ();
++  pid_t pid = get_ptrace_pid (regcache->ptid ());
++
++  if (regnum == -1 || amd64_native_gregset_supplies_p (gdbarch, regnum))
++    {
++      struct ptrace_regs regs;
++
++      /* Read before writing: a single register may be being changed, and the
++	 rest of the block has to go back unaltered.  */
++      if (ptrace (PT_GETREGS, pid, &regs, 0) == -1)
++	perror_with_name (_("Couldn't get registers"));
++
++      amd64_collect_native_gregset (regcache, &regs, regnum);
++
++      if (ptrace (PT_SETREGS, pid, &regs, 0) == -1)
++	perror_with_name (_("Couldn't write registers"));
++
++      if (regnum != -1)
++	return;
++    }
++
++  if (regnum == -1 || !amd64_native_gregset_supplies_p (gdbarch, regnum))
++    {
++      struct ptrace_fpregs fpregs;
++
++      if (ptrace (PT_GETFPREGS, pid, &fpregs, 0) == -1)
++	perror_with_name (_("Couldn't get floating point status"));
++
++      amd64_collect_fxsave (regcache, regnum, &fpregs);
++
++      if (ptrace (PT_SETFPREGS, pid, &fpregs, 0) == -1)
++	perror_with_name (_("Couldn't write floating point status"));
++    }
++}
++
++/* Let go of a forked child that this session is not going to debug.
++
++   The kernel parks the child at its own fork event so a debugger can attach to
++   it before its first instruction -- that is what following a fork is for.
++   Following the PARENT therefore leaves a process stopped with nobody who will
++   ever release it, and releasing it is this method's job: infrun.c prints
++   "[Detaching after fork from child ...]" and does the bookkeeping, but the
++   comment above its call to target_follow_fork is explicit that the target is
++   "responsible for detaching from CHILD_PTID".
++
++   Without it the child never ran.  Every shell command is a fork, so a shell
++   under the debugger accepted a command and then waited for a child that was
++   never going to start; xterm's `run' forked its shell and sat in the
++   handshake read for ever.  Neither looked like a fork problem from outside.
++
++   Every native target that reports fork events carries this method for the
++   same reason -- see obsd-nat.c and fbsd-nat.c, which are the same three lines,
++   and linux-nat.c, which adds only the single-step-before-detach workaround for
++   a kernel bug that is not ours.  The base class does the child-inferior half
++   (pushing the target, adding its thread) and nothing else.  */
++
++void
++likeos_nat_target::follow_fork (inferior *child_inf, ptid_t child_ptid,
++				target_waitkind fork_kind, bool follow_child,
++				bool detach_fork)
++{
++  inf_ptrace_target::follow_fork (child_inf, child_ptid, fork_kind,
++				  follow_child, detach_fork);
++
++  if (!follow_child && detach_fork)
++    {
++      /* Breakpoints have already been removed from the child by infrun.c.  */
++      if (ptrace (PT_DETACH, child_ptid.pid (), nullptr, 0) == -1)
++	perror_with_name (("ptrace (PT_DETACH)"));
++    }
++}
++
++/* Resume the PROCESS, not just the thread gdb happened to name.
++
++   Every thread of a traced process stops together -- the kernel parks the
++   siblings when any one of them stops -- so a resume has to release them
++   together too, or the ones that were parked silently stay parked with
++   nothing left to release them: they carry no event, so no wait reports them
++   and no later resume is aimed at them.
++
++   Stepping is the exception, and deliberately: `stepi' means advance THIS
++   thread by one instruction, and letting the others run while it does would
++   make the step land somewhere unrelated to the program state being examined.
++   The kernel's resume releases the group, so a single-step is aimed at the one
++   thread and the rest are left where they are.  */
++
++/* Which process does a reported task belong to?
++
++   Every stop the kernel reports names a TASK, and a task is not necessarily a
++   thread of the process being debugged.  A traced process that forks has its
++   CHILD stopped too, and that child is a separate process; so does anything
++   else this tracer happens to have picked up.  Labelling such an id as a thread
++   of the inferior invents a thread that does not exist -- gdb announces it
++   ("[New LWP 43 of process 31]"), finds it missing at the next list refresh,
++   buries it, and then dies on the stop that was reported against it:
++   `internal-error: get_thread_regcache: Assertion `thread->state !=
++   THREAD_EXITED' failed'.  Running any command from a shell being debugged did
++   exactly that, because a shell runs commands by forking.
++
++   Answered by asking the kernel for the thread list, which is built from the
++   process's own thread-group ring, so a forked child is not in it.  */
++
++static bool
++likeos_lwp_of_process (pid_t pid, pid_t tid)
++{
++  if (tid == pid)
++    return true;
++
++  int nlwps = ptrace (PT_GETNUMLWPS, pid, nullptr, 0);
++
++  if (nlwps <= 0)
++    return false;
++
++  gdb::unique_xmalloc_ptr<unsigned int[]> lwps (XCNEWVEC (unsigned int, nlwps));
++
++  nlwps = ptrace (PT_GETLWPLIST, pid, lwps.get (), (long) nlwps);
++  for (int i = 0; i < nlwps; i++)
++    if (lwps[i] == (unsigned int) tid)
++      return true;
++
++  return false;
++}
++
++/* The executable a process is running.
++
++   This is what makes attaching useful.  gdb asks for it right after an attach
++   and reads symbols from whatever comes back; a target that cannot answer
++   leaves `current_program_space->exec_bfd ()' NULL, and the whole
++   attach-without-a-file path -- post_create_inferior, solib_add,
++   elf_locate_base -- is then walked with no executable at all.  That path
++   crashed gdb outright here, while `gdb /bin/bash -p N' worked perfectly: the
++   difference was only ever this method.
++
++   Systems with a per-process filesystem read /proc/PID/exe; this one asks the
++   kernel directly.  The buffer is static because the interface returns a
++   borrowed pointer, which is what every other target does with it.  */
++
++/* Why the last pid_to_exec_file call came back empty: the errno if the request
++   itself failed, and 0 if it succeeded but the process has no executable
++   recorded.  Kept because those are very different problems and the difference
++   is invisible from the NULL that both produce.  */
++static int likeos_exec_file_errno;
++
++const char *
++likeos_nat_target::pid_to_exec_file (int pid)
++{
++  static char path[512];
++
++  errno = 0;
++  long n = ptrace (PT_GETEXECPATH, pid, path, (long) sizeof (path));
++
++  /* Zero is a real answer -- a task that has not exec'd has no executable --
++     and so is a failure; both mean "cannot tell you", which is what NULL says
++     to the caller.  */
++  if (n <= 0)
++    {
++      likeos_exec_file_errno = (n < 0 ? errno : 0);
++      return nullptr;
++    }
++
++  likeos_exec_file_errno = 0;
++  return path;
++}
++
++/* Attach to a process that is already running.
++
++   The generic attach does everything except ask for the events -- it is
++   post_startup_inferior() that does that, and gdb calls it only from
++   create_inferior().  So a process gdb ATTACHED to was traced with no options
++   set at all: no thread it went on to create was announced, no thread that
++   died was reported, and an exec replaced the program under the debugger's
++   feet in silence.  The same request belongs here, for the same reason it
++   belongs there.  */
++
++void
++likeos_nat_target::attach (const char *args, int from_tty)
++{
++  inf_ptrace_target::attach (args, from_tty);
++
++  inferior *inf = current_inferior ();
++
++  if (inf == nullptr || inf->pid == 0)
++    return;
++
++  set_trace_options (inf->pid);
++
++  /* Find the executable HERE, while there is still an attach to attribute a
++     failure to.
++
++     gdb does this itself, but only much later -- from setup_inferior, after the
++     initial stop has been collected and the whole of post_create_inferior has
++     run.  Everything in between is walked with `exec_bfd' NULL, which upstream
++     hardly ever sees: on systems with a per-process filesystem the executable
++     is always available, so "attach to a process whose program is unknown" is
++     a path almost nothing exercises.  Doing the lookup now means an attach with
++     a pid is the same session as an attach with a filename from the first
++     moment, rather than the same session eventually.
++
++     It is also the honest place to report the failure.  exec_file_locate_attach
++     warns when it cannot find the program, and that warning now lands directly
++     under "Attaching to process N" where it belongs; the errno is added here
++     because gdb's message cannot know it.  */
++  if (current_program_space != nullptr
++      && current_program_space->exec_filename () == nullptr)
++    {
++      if (pid_to_exec_file (inf->pid) == nullptr
++	  && likeos_exec_file_errno != 0)
++	warning (_("cannot read the executable path of process %d: %s"),
++		 inf->pid, safe_strerror (likeos_exec_file_errno));
++
++      exec_file_locate_attach (inf->pid, 1, from_tty);
++    }
++}
++
++void
++likeos_nat_target::resume (ptid_t ptid, int step, enum gdb_signal signo)
++{
++  /* A step names one thread; anything else means the whole process.  */
++  if (step || ptid.lwp_p ())
++    {
++      inf_ptrace_target::resume (ptid, step, signo);
++      return;
++    }
++
++  inf_ptrace_target::resume (ptid_t (inferior_ptid.pid ()), step, signo);
++}
++
++/* Report WHICH THREAD stopped, not just which process.
++
++   This is the other half of naming threads, and it is not optional: once the
++   thread list holds (process, thread) ptids, everything gdb is handed has to
++   carry both halves.  A stop reported as (process, 0) matches no thread, so
++   gdb looks for the inferior that owns it, finds none, and dies in
++   set_current_inferior with `inf != NULL'.  That is what ^C did with the
++   thread list added and this missing.
++
++   The reference targets do the same thing from the other side: FreeBSD's
++   wait_1 takes the process id that wait() gave it and asks PT_LWPINFO which
++   LWP the stop belongs to.  Here the kernel reports the TASK that stopped --
++   every thread is a task with its own id -- so the thread half arrives for
++   free and the process half is the inferior being waited on.  */
++
++ptid_t
++likeos_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
++			 target_wait_flags target_options)
++{
++again:
++  ptid_t wptid = inf_ptrace_target::wait (ptid, ourstatus, target_options);
++
++  if (ourstatus->kind () != TARGET_WAITKIND_STOPPED)
++    return wptid;
++
++  /* What came back is a task id.  For a single-threaded process it is also
++     the process id; for a thread it is not, and using it as one would name a
++     process that does not exist.  */
++  int tid = wptid.pid ();
++  inferior *inf = current_inferior ();
++  int pid = (inf != nullptr && inf->pid != 0) ? inf->pid : tid;
++
++  /* And for a task that is not part of this process at all, neither reading
++     applies -- see likeos_lwp_of_process.
++
++     The forked child of a traced process is stopped as well as its parent, and
++     that stop is not this inferior's to report: gdb hears about the fork from
++     the PARENT's event and detaches the child from there, which releases it.
++     Dropping the child's stop here is what keeps a shell usable under the
++     debugger -- every command it runs is a fork.
++
++     (A consequence worth knowing: `set follow-fork-mode child' cannot work
++     through this path, because the child's stop has already been consumed by
++     the wait that delivered it here.  Following the parent, which is the
++     default, is what this handles.)  */
++  if (!likeos_lwp_of_process (pid, tid))
++    goto again;
++
++  wptid = ptid_t (pid, tid);
++
++  /* A thread gdb has not met yet.  Adding it here means a stop is never
++     reported against a thread the rest of gdb does not know, which is the
++     invariant the assertion above enforces.
++
++     A thread it has met and BURIED is the other half of that invariant, and it
++     is not hypothetical: gdb keeps an exited thread_info in the list for as
++     long as anything still refers to it, so the lookup succeeds and the stop
++     goes up attached to a THREAD_EXITED thread -- straight into the assertion
++     in get_thread_regcache.  There is nothing useful to do with such a stop:
++     the thread is going, and the debugger has already been told so.  Let it
++     go and wait for something that belongs to a thread that exists.  */
++  {
++    thread_info *known = this->find_thread (wptid);
++
++    if (known != nullptr && known->state == THREAD_EXITED)
++      {
++	(void) ptrace (PT_CONTINUE, tid, nullptr, 0);
++	goto again;
++      }
++
++    if (known == nullptr)
++      {
++	if (in_thread_list (this, ptid_t (pid)))
++	  thread_change_ptid (this, ptid_t (pid), wptid);
++	else
++	  add_thread (this, wptid);
++      }
++  }
++
++  /* WHY it stopped, when the stop is an event rather than a signal.
++
++     All of these arrive as SIGTRAP, so without asking they are
++     indistinguishable from a breakpoint: a fork looks like a trap in the
++     parent, a new thread looks like a trap in whichever thread created it,
++     and an exec looks like a trap at an address that no longer means
++     anything.  The event code says which; PTRACE_GETEVENTMSG carries the pid
++     that goes with it.  */
++  if (ourstatus->sig () == GDB_SIGNAL_TRAP)
++    {
++      int event = ptrace (PT_GETEVENT, tid, nullptr, 0);
++      unsigned long msg = 0;
++
++      /* The event's value comes back through DATA, not ADDR.
++
++	 GETEVENTMSG is the one request on this system whose pointer argument is
++	 DATA -- see the note in <sys/ptrace.h>: everything else takes its
++	 buffer in ADDR, and this one follows the older convention every ptrace
++	 interface uses for it.  Passing it in ADDR does not fail loudly; the
++	 kernel simply finds a null pointer in DATA, refuses it, and MSG is left
++	 at zero.  Every event that is only actionable together with its value
++	 then quietly did nothing:
++
++	   - a new thread was never announced, because add_thread is guarded by
++	     `msg != 0'.  The clone stop was still consumed, so the thread only
++	     appeared at the next full list refresh -- which is why threads
++	     showed up when the user pressed ^C and not when they were created.
++	   - a fork was reported to gdb as a bare SIGTRAP inside fork() instead
++	     of as a fork, so gdb never followed it and never detached the
++	     child.  The child stayed parked in its own fork stop with nothing
++	     left to release it, and the parent's wait() for it never returned:
++	     running any command from a shell under the debugger hung.  */
++      if (event > 0)
++	ptrace (PT_GETEVENTMSG, tid, nullptr, (long) &msg);
++
++      switch (event)
++	{
++	case PTRACE_EVENT_FORK:
++	  /* Only the PARENT's report carries the child's pid; the child's own
++	     report carries zero and is the stop gdb collects after it decides
++	     to follow.  */
++	  if (msg != 0)
++	    ourstatus->set_forked (ptid_t ((int) msg, (int) msg));
++	  break;
++
++	case PTRACE_EVENT_VFORK:
++	  if (msg != 0)
++	    ourstatus->set_vforked (ptid_t ((int) msg, (int) msg));
++	  break;
++
++	case PTRACE_EVENT_CLONE:
++	  /* A new thread of this same process.
++	     
++	     This stop belongs to the target, not to the user: it exists so the
++	     new thread can be registered before it runs.  Reporting it upwards
++	     surfaces as `received signal SIGTRAP' inside clone() -- one per
++	     thread, before the program has drawn anything.  So the thread is
++	     added, the creating thread is resumed, and we go back to waiting
++	     for something that is actually worth stopping for.  Registering it
++	     HERE rather than at the next list refresh is what makes gdb
++	     announce it when it is born.  */
++	  if (msg != 0)
++	    {
++	      ptid_t new_thread = ptid_t (pid, (long) msg);
++
++	      if (!in_thread_list (this, new_thread))
++		add_thread (this, new_thread);
++	    }
++
++	  /* The whole process was stopped for this; let all of it go.
++
++	     A failure here is not reported upwards.  This stop was never the
++	     user's -- returning it surfaces as `received signal SIGTRAP' inside
++	     clone(), which is the very thing consuming it here avoids.  Go back
++	     to waiting; the stop has been collected, so it cannot be handed out
++	     twice.  */
++	  (void) ptrace (PT_CONTINUE, tid, nullptr, 0);
++	  goto again;
++
++	case PTRACE_EVENT_EXIT:
++	  /* A thread is about to die, and is stopped so it can be said so
++	     while it still exists.
++
++	     Like the clone stop, this belongs to the target rather than to the
++	     user: reported upwards it would surface as `received signal
++	     SIGTRAP' every time a worker thread finished.  So the thread is
++	     dropped from the list -- which is what prints `[LWP n exited]',
++	     at the moment it happens rather than at the next breakpoint --
++	     and we go back to waiting.
++
++	     The process's own main thread is left alone.  Its death is the
++	     death of the inferior, which arrives as an ordinary exit status
++	     and is gdb's to report; deleting it here would take the thread
++	     that everything else is still holding.  */
++	  /* Resumed BEFORE the thread is dropped, and the result ignored.
++	     Once it is out of the list there is no thread left to attribute
++	     anything to, so nothing from here on may be returned upwards --
++	     including a failure.  Doing it the other way round handed gdb a
++	     stop belonging to a thread it had just buried, and gdb does not
++	     survive that: `internal-error: get_thread_regcache: Assertion
++	     `thread->state != THREAD_EXITED' failed'.  */
++	  (void) ptrace (PT_CONTINUE, tid, nullptr, 0);
++
++	  if (tid != pid)
++	    {
++	      thread_info *dying = this->find_thread (wptid);
++
++	      if (dying != nullptr && dying->state != THREAD_EXITED)
++		delete_thread (dying);
++	    }
++
++	  goto again;
++
++	case PTRACE_EVENT_EXEC:
++	  {
++	    /* The NEW program's path, which gdb opens to read symbols from.
++
++	       This was reported as the empty string, because until
++	       pid_to_exec_file existed there was nothing to report.  gdb took
++	       it at face value: "process N is executing new program: " with
++	       nothing after it, then "warning: : No such file or directory",
++	       and an inferior with no symbols at all after every exec.  */
++	    const char *execd = pid_to_exec_file (tid);
++
++	    ourstatus->set_execd (make_unique_xstrdup (execd != nullptr
++						      ? execd : ""));
++	  }
++	  break;
++
++	default:
++	  break;
++	}
++    }
++
++  return wptid;
++}
++
++/* Threads.
++
++   A thread on this system is a task in its own right: it has its own
++   registers, its own stop, and its own id, and ptrace already works on it once
++   its id is known.  Knowing the set is the only thing a debugger cannot work
++   out for itself, because a thread is invisible from outside the process --
++   hence the two requests below, which are the conventional pair: ask how many,
++   then ask for that many.
++
++   Without this gdb shows one thread.  For a program that does its work on
++   several -- which is most programs with a user interface -- that means one
++   stack out of five, and a fault on any other thread reported against the
++   wrong one.  */
++
++static void
++likeos_add_threads (likeos_nat_target *target, pid_t pid)
++{
++  int nlwps = ptrace (PT_GETNUMLWPS, pid, nullptr, 0);
++
++  if (nlwps <= 0)
++    return;
++
++  gdb::unique_xmalloc_ptr<unsigned int[]> lwps (XCNEWVEC (unsigned int, nlwps));
++
++  nlwps = ptrace (PT_GETLWPLIST, pid, lwps.get (), (long) nlwps);
++  if (nlwps <= 0)
++    return;
++
++  for (int i = 0; i < nlwps; i++)
++    {
++      ptid_t ptid = ptid_t (pid, lwps[i]);
++
++      if (!in_thread_list (target, ptid))
++	{
++	  /* The first thread reported is the one gdb already knows as the
++	     inferior itself; give that existing thread its lwp id rather than
++	     adding a duplicate, or the process appears twice.  */
++	  if (in_thread_list (target, ptid_t (pid)))
++	    thread_change_ptid (target, ptid_t (pid), ptid);
++	  else
++	    add_thread (target, ptid);
++	}
++    }
++}
++
++void
++likeos_nat_target::update_thread_list ()
++{
++  /* Drop the ones that have gone, then add the ones that have appeared.  A
++     thread can do both between two stops, so neither half is optional.  */
++  prune_threads ();
++  likeos_add_threads (this, inferior_ptid.pid ());
++}
++
++bool
++likeos_nat_target::thread_alive (ptid_t ptid)
++{
++  pid_t pid = ptid.pid ();
++  int nlwps = ptrace (PT_GETNUMLWPS, pid, nullptr, 0);
++
++  if (nlwps <= 0)
++    return false;
++
++  gdb::unique_xmalloc_ptr<unsigned int[]> lwps (XCNEWVEC (unsigned int, nlwps));
++
++  nlwps = ptrace (PT_GETLWPLIST, pid, lwps.get (), (long) nlwps);
++  if (nlwps <= 0)
++    return false;
++
++  unsigned int want = (unsigned int) (ptid.lwp () != 0 ? ptid.lwp ()
++						       : ptid.pid ());
++  for (int i = 0; i < nlwps; i++)
++    if (lwps[i] == want)
++      return true;
++
++  return false;
++}
++
++std::string
++likeos_nat_target::pid_to_str (ptid_t ptid)
++{
++  if (ptid.lwp () != 0)
++    return string_printf ("LWP %ld of process %d", ptid.lwp (), ptid.pid ());
++
++  return normal_pid_to_str (ptid);
++}
++
++/* Hand out the inferior's auxiliary vector.
++
++   This is what tells GDB where a position-independent executable actually
++   landed.  Without it every address it reports for the main program is the
++   link-time one: `break main' resolves to a small offset like 0x590, the
++   breakpoint cannot be written because nothing is mapped there, and the
++   session is useless even though the process is running perfectly well.
++   solib-svr4 reads AT_ENTRY out of this vector, subtracts the e_entry in the
++   file on disk, and relocates the symbol table by the difference.
++
++   Systems with a per-process filesystem serve the same bytes from a file and
++   need no code here; this one asks the kernel for them directly.  */
++
++enum target_xfer_status
++likeos_nat_target::xfer_partial (enum target_object object,
++				 const char *annex, gdb_byte *readbuf,
++				 const gdb_byte *writebuf,
++				 ULONGEST offset, ULONGEST len,
++				 ULONGEST *xfered_len)
++{
++  /* $_siginfo -- WHY the inferior stopped, not just which signal.
++
++     si_code and si_addr are the difference between "SIGSEGV" and "wrote to
++     0x1, which is not mapped".  The kernel keeps them for the signal a tracee
++     is stopped for; PTRACE_GETSIGINFO is how they are asked for.  */
++  if (object == TARGET_OBJECT_SIGNAL_INFO
++      && readbuf != nullptr && writebuf == nullptr)
++    {
++      siginfo_t siginfo;
++
++      if (offset >= sizeof (siginfo))
++	return TARGET_XFER_EOF;
++
++      if (ptrace (PT_GETSIGINFO, get_ptrace_pid (inferior_ptid),
++		  &siginfo, 0) == -1)
++	return TARGET_XFER_E_IO;
++
++      ULONGEST avail = sizeof (siginfo) - offset;
++      if (len > avail)
++	len = avail;
++
++      memcpy (readbuf, (gdb_byte *) &siginfo + offset, len);
++      *xfered_len = len;
++      return TARGET_XFER_OK;
++    }
++
++  if (object == TARGET_OBJECT_AUXV
++      && readbuf != nullptr && writebuf == nullptr)
++    {
++      /* Fetched whole and then sliced, because the request is for a window
++	 of a block the kernel only reports in full.  It is a few dozen
++	 bytes -- a handful of 16-byte entries -- so there is nothing to be
++	 gained by being cleverer about it.  */
++      gdb_byte buf[512];
++      long n = ptrace (PT_GETAUXV, get_ptrace_pid (inferior_ptid),
++		       buf, (long) sizeof (buf));
++
++      if (n < 0)
++	return TARGET_XFER_E_IO;
++
++      /* Zero is not a failure: a process stopped at PTRACE_TRACEME has not
++	 exec'd yet and genuinely has no vector.  */
++      if ((ULONGEST) n <= offset)
++	return TARGET_XFER_EOF;
++
++      ULONGEST avail = (ULONGEST) n - offset;
++      if (len > avail)
++	len = avail;
++
++      memcpy (readbuf, buf + offset, len);
++      *xfered_len = len;
++      return TARGET_XFER_OK;
++    }
++
++  return x86_nat_target<inf_ptrace_target>::xfer_partial (object, annex,
++							 readbuf, writebuf,
++							 offset, len,
++							 xfered_len);
++}
++
++INIT_GDB_FILE (likeos_nat)
++{
++  amd64_native_gregset64_reg_offset = likeos_r_reg_offset;
++  amd64_native_gregset64_num_regs = ARRAY_SIZE (likeos_r_reg_offset);
++
++  /* Hand nat/x86-dregs.c the five accessors it needs.  Registered before the
++     target so that a watchpoint set at any point afterwards has somewhere to
++     go; without these the shared layer has no way to reach the hardware and
++     quietly reports that no watchpoint could be inserted.  */
++  x86_dr_low.set_control = likeos_dr_set_control;
++  x86_dr_low.set_addr = likeos_dr_set_addr;
++  x86_dr_low.get_addr = likeos_dr_get_addr;
++  x86_dr_low.get_status = likeos_dr_get_status;
++  x86_dr_low.get_control = likeos_dr_get_control;
++  x86_set_debug_register_length (sizeof (unsigned long));
++
++  add_inf_child_target (&the_likeos_nat_target);
++}
+diff -urN a/gdb/likeos-tdep.c b/gdb/likeos-tdep.c
+--- a/gdb/likeos-tdep.c
++++ b/gdb/likeos-tdep.c
+@@ -0,0 +1,121 @@
++/* Target-dependent code for LikeOS/amd64.
++
++   This file is part of GDB.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++/* LikeOS is a plain ELF system: its binaries carry no OS-identifying note, its
++   signals are numbered conventionally, and its dynamic loader publishes the
++   usual SVR4 rendezvous.  So almost nothing is needed here -- the value of this
++   file is the one registration below, without which GDB would never look for
++   shared libraries at all and would see the executable alone.  */
++
++#include "defs.h"
++#include "osabi.h"
++#include "solib-svr4.h"
++#include "gdbarch.h"
++#include "elf-bfd.h"
++#include "amd64-tdep.h"
++#include "gdbsupport/x86-xstate.h"
++
++static void
++likeos_init_abi (struct gdbarch_info info, struct gdbarch *gdbarch)
++{
++  /* Build the amd64 architecture first.  This is not optional and it is not
++     a formality: it installs the frame unwinders, the calling convention, the
++     register set and the breakpoint kind, and an OS handler that skips it
++     leaves a gdbarch with none of them.
++
++     What that looks like from the outside is worth writing down, because it
++     does not look like a missing initialiser.  Registers still print, because
++     the native target reads those itself.  The program still runs.  But the
++     first frame gdb tries to unwind ends the session with
++
++       frame-unwind.c:231: internal-error: frame_unwind_find_by_frame failed
++
++     and breakpoints quietly fail to land.  Before this file claimed the OS ABI,
++     gdb fell back to a default amd64 architecture that had all of the above --
++     so registering the OS ABI without doing this made the debugger worse, not
++     better.
++
++     SSE rather than AVX because the kernel reports an FXSAVE image and nothing
++     larger; true asks for the segment-base registers, which is what makes
++     %fs_base -- and so thread-local storage -- reachable.  */
++  amd64_init_abi (info, gdbarch,
++		  amd64_target_description (X86_XSTATE_SSE_MASK, true));
++
++  /* Teach this architecture where the loaded-object list is.
++
++     LikeOS's loader fills in DT_DEBUG with the address of its r_debug and
++     maintains the link_map chain hanging off it, calling _dl_debug_state before
++     and after every change so a debugger stopped there can tell a finished list
++     from one mid-edit.  That is exactly the protocol solib-svr4 implements, so
++     pointing at it is the whole of the work.
++
++     LP64 because the link_map fields are 64-bit; the ILP32 variant describes
++     the same structures with 32-bit members.  */
++  set_solib_svr4_ops (gdbarch, make_svr4_lp64_solib_ops);
++}
++
++/* INIT_GDB_FILE, not a bare _initialize_ function: gdb builds its table of
++   initialisers by grepping the sources for this macro (see make-init-c), so a
++   hand-written _initialize_likeos_tdep would compile, link, and never be
++   called -- leaving the registration below silently undone and shared
++   libraries invisible.  */
++/* Recognise a LikeOS binary.
++
++   There is nothing in one to recognise, which is the whole difficulty.  These
++   are plain ELF files: EI_OSABI is ELFOSABI_NONE and there is no OS note, so
++   gdb's generic sniffer looks for an ABI tag, finds none, and reports
++   GDB_OSABI_UNKNOWN.  An unknown OS ABI means the handler registered below is
++   never called, and everything it would have set up simply does not happen --
++   no solib ops, so no shared library list, and no relocation of a
++   position-independent executable, which is why `break main' resolved to its
++   link-time 0x590 and every frame printed as "?? ()".  Nothing reports an
++   error; the debugger just quietly knows nothing about the program.
++
++   Claiming every unmarked ELF file is safe here in a way it would not be in a
++   gdb that supports many systems: this one is configured for
++   x86_64-unknown-likeos alone, so a plain SYSV ELF that it is asked to debug
++   is a LikeOS binary.  Systems that stamp their binaries -- FreeBSD, NetBSD,
++   Solaris -- are still recognised first, because their EI_OSABI is not
++   ELFOSABI_NONE and the generic sniffer runs before this one.
++
++   The alternative would be to have our linker emit an OS note and sniff that,
++   which is tidier in principle and would mean rebuilding every binary on the
++   image to gain nothing this does not already give.  */
++
++static enum gdb_osabi
++likeos_osabi_sniffer (bfd *abfd)
++{
++  unsigned int elfosabi = elf_elfheader (abfd)->e_ident[EI_OSABI];
++
++  if (elfosabi == ELFOSABI_NONE)
++    return GDB_OSABI_LIKEOS;
++
++  return GDB_OSABI_UNKNOWN;
++}
++
++INIT_GDB_FILE (likeos_tdep)
++{
++  /* Without this the handler below is dead code: see the comment above.  */
++  gdbarch_register_osabi_sniffer (bfd_arch_i386, bfd_target_elf_flavour,
++				  likeos_osabi_sniffer);
++
++  /* Recognised from the target triple rather than from a note in the file:
++     LikeOS binaries are ordinary ELF with ELFOSABI_NONE, so there is nothing in
++     them to sniff.  The regexp in osabi.def is what does the matching.  */
++  gdbarch_register_osabi (bfd_arch_i386, bfd_mach_x86_64, GDB_OSABI_LIKEOS,
++			  likeos_init_abi);
++}
+diff -urN a/gdb/posix-hdep.c b/gdb/posix-hdep.c
+--- a/gdb/posix-hdep.c
++++ b/gdb/posix-hdep.c
+@@ -21,6 +21,7 @@
+ #include "gdbsupport/gdb_select.h"
+ #include "inferior.h"
+ #include <signal.h>
++#include <unistd.h>
+ 
+ /* Wrapper for select.  Nothing special needed on POSIX platforms.  */
+ 
+@@ -52,6 +53,34 @@
+ 
+   xsnprintf (buf, sizeof (buf), "/proc/%d/fd/0", pid);
+   return is_gdb_terminal (buf);
++#elif defined (__LIKEOS__)
++  /* LikeOS has no per-process filesystem to stat the inferior's stdin
++     through, but it does not need one to answer the case that matters: a
++     process in a DIFFERENT SESSION cannot have this terminal as its
++     controlling terminal, because a session is exactly the set of processes
++     that share one.
++
++     Returning "unknown" here -- which is what this did, and what the caller
++     turns into "assume yes" -- is not harmless.  The caller hands GDB's
++     terminal to the inferior's process group, so attaching to a process on
++     another terminal made the foreground group of GDB's OWN terminal a group
++     that lives somewhere else.  ^C then went to that group instead of to GDB:
++     `gdb -p <an xterm>' typed in one terminal delivered SIGINT to every
++     client of the X session, and the window manager shut itself down.
++
++     Same session is still answered as TRUE rather than by looking closer.
++     They may genuinely share the terminal, and assuming they do is the old
++     behaviour -- this narrows a wrong answer to an unknown one, it does not
++     claim to be exact.  */
++  {
++    pid_t inferior_sid = getsid (pid);
++    pid_t gdb_sid = getsid (0);
++
++    if (inferior_sid == -1 || gdb_sid == -1)
++      return TRIBOOL_UNKNOWN;
++
++    return inferior_sid == gdb_sid ? TRIBOOL_TRUE : TRIBOOL_FALSE;
++  }
+ #else
+   return TRIBOOL_UNKNOWN;
+ #endif

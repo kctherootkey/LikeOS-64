@@ -2951,13 +2951,55 @@ static int64_t sys_getpgid(uint64_t pid)
 //
 // The remaining fields stay zero because nothing counts them yet: there is no
 // per-task page-fault or resident-set accounting to report.
+/*
+ * struct rusage, in the layout every other Unix uses on x86-64 and exactly as
+ * userspace declares it in <sys/wait.h>: two timevals then fourteen longs.
+ *
+ * THE FIELDS AND THE SIZE HERE ARE AN ABI CONTRACT WITH THAT HEADER, because
+ * neither getrusage(2) nor wait4(2) carries a length -- the kernel copies a
+ * fixed-size structure and the two declarations have to agree exactly.  They
+ * did not: this was 144 bytes of `ru_pad' against a header declaring 72, and
+ * sys_getrusage copied its own sizeof() to the caller, so every getrusage()
+ * wrote 72 bytes PAST the end of the caller's structure.
+ *
+ * That is a kernel buffer overflow into userspace, and it is as bad as it
+ * sounds.  It survived so long because the damage lands on whatever the caller
+ * keeps after the structure: harmless padding in one program, a saved return
+ * address in the next.  gdb was the second kind -- get_run_time() puts its
+ * rusage in an 88-byte frame with the return address just past it, so the
+ * overflow replaced that return address with a zeroed pad word and the process
+ * jumped to 0 on return, with no instruction bytes at RIP and nothing on the
+ * stack to say where it came from.
+ *
+ * The named fields the kernel does not account for yet are reported as zero.
+ * They are declared rather than padded so this and the header can be read
+ * against each other.
+ */
 struct k_rusage_compat {
 	int64_t ru_utime_sec;
 	int64_t ru_utime_usec;
 	int64_t ru_stime_sec;
 	int64_t ru_stime_usec;
-	int64_t ru_pad[14];
+	int64_t ru_maxrss;
+	int64_t ru_ixrss;
+	int64_t ru_idrss;
+	int64_t ru_isrss;
+	int64_t ru_minflt;
+	int64_t ru_majflt;
+	int64_t ru_nswap;
+	int64_t ru_inblock;
+	int64_t ru_oublock;
+	int64_t ru_msgsnd;
+	int64_t ru_msgrcv;
+	int64_t ru_nsignals;
+	int64_t ru_nvcsw;
+	int64_t ru_nivcsw;
 };
+
+/* If this fires, <sys/wait.h> and the struct above have drifted apart, and
+ * whichever of them is larger is writing over the other one's memory. */
+_Static_assert(sizeof(struct k_rusage_compat) == 144,
+	       "struct rusage size must match user/lib/libc/include/sys/wait.h");
 
 // Ticks -> seconds and microseconds, at whatever rate the timer is running.
 static void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec)
@@ -4783,6 +4825,40 @@ static int64_t sys_pipe(uint64_t pipefd_ptr)
 __attribute__((noreturn)) static void sys_exit(uint64_t status)
 {
 	task_t *cur = sched_current();
+
+	/* Stop for the tracer BEFORE dying, if it asked.
+	 *
+	 * A thread is the one thing a debugger cannot notice on its own.  Its
+	 * creation is announced (PTRACE_EVENT_CLONE); its death was not, and
+	 * nothing else reports it either -- a thread is not its tracer's child,
+	 * so no waitpid ever names it, and the tracer's thread list only
+	 * refreshes when the process next stops.  A program whose threads come
+	 * and go therefore showed a list of threads that had been alive at some
+	 * point, with the dead ones only disappearing at the next breakpoint or
+	 * ^C.
+	 *
+	 * The stop is here, at the top of _exit, because this is the last point
+	 * at which the thread still exists: registers readable, memory mapped,
+	 * id valid.  Its exit status travels as the event's value, which is
+	 * what PTRACE_GETEVENTMSG returns.  The tracer resumes it with
+	 * PTRACE_CONT and it dies below.
+	 *
+	 * Opt-in like every other event, and this one matters: a tracer that
+	 * does not ask must never be stopped for, or a thread would park here
+	 * with nobody to release it.  A tracer that dies while it is parked
+	 * detaches it, which resumes it (see task_ptrace_detach). */
+	if (cur && cur->tracer_pid != 0 &&
+	    (cur->ptrace_options & PTRACE_O_TRACEEXIT)) {
+		/* Set BEFORE the stop, not after.  The flag is what stops
+		 * anything else being reported for this task, and the window it
+		 * has to cover starts the moment the tracer can see the event
+		 * -- the tracer resumes us from inside task_ptrace_stop, and
+		 * from then on we are a thread it has already dropped. */
+		cur->ptrace_exiting = 1;
+		task_ptrace_stop(cur, SIGTRAP, PTRACE_EVENT_EXIT,
+				 (unsigned long)(status & 0xFF));
+	}
+
 	if (cur) {
 		sched_mark_task_exited(cur, (int)status);
 	}
@@ -4898,11 +4974,47 @@ static int64_t sys_fork(void)
 	// after enqueue would be use-after-free.
 	int32_t child_pid = child->id;
 
-	sched_enqueue_ready(child);
+	/* Hand the child to the same tracer, if it asked for that.
+	 *
+	 * Done BEFORE the child is made runnable, so it cannot reach user code
+	 * untraced -- the whole point of following a fork is to be attached
+	 * before the child's first instruction, and a child that gets a head
+	 * start is a child whose early breakpoints are missed.  The child stops
+	 * itself at the next opportunity, in its own context.
+	 *
+	 * The tracer is recorded as the process, matching every other place a
+	 * tracer is named (see ptrace_lock_tracee). */
+	bool follow_child = (cur->tracer_pid != 0 &&
+			     (cur->ptrace_options & PTRACE_O_TRACEFORK));
+
+	if (follow_child) {
+		child->tracer_pid = cur->tracer_pid;
+		child->tracer_incarnation = cur->tracer_incarnation;
+		child->ptrace_options = cur->ptrace_options;
+
+		/* Parked instead of enqueued, so it cannot reach user code
+		 * before the tracer has seen it.  Following a fork exists to
+		 * let a debugger attach to the child BEFORE its first
+		 * instruction; a child given a head start is a child whose
+		 * early breakpoints are missed.  PTRACE_CONT on it is what
+		 * releases it, and that enqueues. */
+		task_ptrace_stop(child, SIGTRAP, PTRACE_EVENT_FORK, 0);
+	} else {
+		sched_enqueue_ready(child);
+	}
 
 	// Set need_resched so the parent yields at the next opportunity,
 	// giving the new child process a chance to start promptly.
 	cur->need_resched = 1;
+
+	/* And tell the tracer about the parent's side of the fork, carrying the
+	 * new pid for PTRACE_GETEVENTMSG -- otherwise a tracer has no way to
+	 * learn which process the child stop it is about to see belongs to.
+	 * `child' is deliberately not touched here: it may already have been
+	 * reaped, so only the saved pid is used. */
+	if (follow_child)
+		task_ptrace_stop(cur, SIGTRAP, PTRACE_EVENT_FORK,
+				 (unsigned long)child_pid);
 
 	// Parent returns child's PID (saved before enqueue to avoid use-after-free)
 	return child_pid;
@@ -4924,12 +5036,21 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 	 * belongs to the thread that actually called. */
 	task_t *owner = cur->group_leader ? cur->group_leader : cur;
 
-	if (!owner->first_child) {
+	/* A tracer waits for its tracees as well as for its children, and a
+	 * debugger's tracees are usually neither: it attaches to processes it
+	 * did not create.  So "no children" is only ECHILD if there are no
+	 * tracees either. */
+	if (!owner->first_child && !task_has_tracees(owner, pid))
 		return -ECHILD;
-	}
 
 	// Loop until we find a reportable child or get interrupted
 	while (1) {
+		/* Sampled BEFORE the scans below, so that any trace stop
+		 * recorded from here on is either found by them or shows up as
+		 * a changed counter at the point where sleeping is decided.
+		 * Sampling it later would leave the gap it exists to close. */
+		uint64_t trace_seq = owner->ptrace_notify_seq;
+
 		task_t *child = NULL; /* zombie to reap */
 		task_t *stopped = NULL; /* WUNTRACED: freshly stopped child */
 		task_t *continued = NULL; /* WCONTINUED: freshly continued */
@@ -4970,7 +5091,42 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		}
 		spin_unlock_irqrestore(&g_wait_lock, scan_flags);
 
-		if (!matched_any)
+		/* Trace stops, before the ECHILD decision: a tracer's tracees
+		 * are usually not its children, so `matched_any' says nothing
+		 * about them.  Reported ahead of a stopped CHILD because a
+		 * traced child produces both kinds of record and the tracer is
+		 * the one that has to see the trace stop -- consuming it as a
+		 * job-control stop would leave the tracee parked with its
+		 * tracer still waiting.
+		 *
+		 * Taken outside g_wait_lock: this takes the task-list lock, and
+		 * nesting the two would invent a lock order nothing else here
+		 * uses. */
+		{
+			int tstatus = 0;
+			int tpid = task_reap_trace_stop(owner, pid, &tstatus);
+
+			if (tpid) {
+				if (status_ptr &&
+				    validate_user_ptr(status_ptr, sizeof(int)))
+					copy_to_user((void *)status_ptr,
+						     &tstatus, sizeof(tstatus));
+				return tpid;
+			}
+		}
+
+		/* Does this caller have TRACEES to wait for?  Sampled here,
+		 * outside g_wait_lock, because task_has_tracees() takes the
+		 * task-list lock and the two are never nested -- and it is
+		 * needed twice: once for the ECHILD decision and once when
+		 * deciding to sleep.  Only asked when the child scan found
+		 * nothing, which is also the only case where it can change
+		 * either answer (a caller with a matching child has a child
+		 * list, so it is going to wait either way). */
+		bool has_tracees = matched_any ? false :
+						 task_has_tracees(owner, pid) != 0;
+
+		if (!matched_any && !has_tracees)
 			return -ECHILD;
 
 		/* Job-control events: report without reaping. */
@@ -5016,32 +5172,25 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 			}
 
 			/* Fill in resource usage from the child's accounting data */
-			if (rusage_ptr && validate_user_ptr(rusage_ptr, 56)) {
-				uint32_t freq = timer_get_frequency();
-				if (freq == 0)
-					freq = 100;
-				struct {
-					long ru_utime_sec;
-					long ru_utime_usec;
-					long ru_stime_sec;
-					long ru_stime_usec;
-					long ru_maxrss;
-					long ru_minflt;
-					long ru_majflt;
-				} ru;
-				ru.ru_utime_sec =
-					(long)(child->utime_ticks / freq);
-				ru.ru_utime_usec =
-					(long)((child->utime_ticks % freq) *
-					       (1000000 / freq));
-				ru.ru_stime_sec =
-					(long)(child->stime_ticks / freq);
-				ru.ru_stime_usec =
-					(long)((child->stime_ticks % freq) *
-					       (1000000 / freq));
-				ru.ru_maxrss = 0;
-				ru.ru_minflt = 0;
-				ru.ru_majflt = 0;
+			/* The same struct sys_getrusage reports, and the same
+			 * size: this wrote a 56-byte local of its own, which
+			 * left the caller's last two fields holding whatever
+			 * was in that memory beforehand.  Reporting stale
+			 * stack as a context-switch count is its own small
+			 * bug; sharing one definition is what stops the two
+			 * paths drifting again. */
+			if (rusage_ptr &&
+			    validate_user_ptr(rusage_ptr,
+					      sizeof(struct k_rusage_compat))) {
+				struct k_rusage_compat ru;
+				for (size_t i = 0; i < sizeof(ru); i++)
+					((uint8_t *)&ru)[i] = 0;
+				ticks_to_timeval(child->utime_ticks,
+						 &ru.ru_utime_sec,
+						 &ru.ru_utime_usec);
+				ticks_to_timeval(child->stime_ticks,
+						 &ru.ru_stime_sec,
+						 &ru.ru_stime_usec);
 				copy_to_user((void *)rusage_ptr, &ru,
 					     sizeof(ru));
 			}
@@ -5102,9 +5251,34 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 			zombie_check = zombie_check->next_sibling;
 		}
 
-		if (found_zombie || !owner->first_child) {
+		if (found_zombie || (!owner->first_child && !has_tracees)) {
 			/* Something to report, or nothing left to wait for:
-			 * either way the top of the loop decides, not us. */
+			 * either way the top of the loop decides, not us.
+			 *
+			 * `has_tracees' is what keeps a TRACER out of this arm.
+			 * A debugger that attached to a process it did not
+			 * create has no children at all, so "no child list"
+			 * described it perfectly and sent it back round the
+			 * loop -- for ever, at full speed, taking the task-list
+			 * lock with interrupts off twice per turn.  That is not
+			 * a slow debugger, it is a CPU pinned in the kernel
+			 * starving every other CPU that wants the same lock.
+			 * It has something to wait for; it belongs asleep. */
+			spin_unlock_irqrestore(&g_wait_lock, irq_flags);
+			continue;
+		}
+
+		/* Same re-check for tracees, via the notification counter.
+		 *
+		 * A trace stop recorded between the scan above and this point
+		 * would otherwise be slept through: task_ptrace_stop() records
+		 * the event and bumps the counter before waking the tracer, so
+		 * a tracer that has not yet marked itself BLOCKED gets a wake
+		 * that lands on a task which was not asleep, and nothing
+		 * re-sends it.  Comparing the counter catches exactly that
+		 * window -- and it is a single field read, so it does not need
+		 * the task-list lock inside this one. */
+		if (owner->ptrace_notify_seq != trace_seq) {
 			spin_unlock_irqrestore(&g_wait_lock, irq_flags);
 			continue;
 		}
@@ -5221,9 +5395,94 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	if (ret < 0)
 		goto out_err;
 
+	/* Work out the identity the new image will run with BEFORE the image is
+	 * replaced, because the auxv built during the replace has to report it
+	 * (AT_SECURE, AT_EUID -- see elf_setup_stack).  Reading the task from
+	 * in there instead described the CALLER, which is how AT_SECURE came to
+	 * be reported as 0 for every setuid exec: the transition below had not
+	 * happened yet.
+	 *
+	 * Nothing is committed here.  A failed exec has to leave the caller
+	 * exactly as it was, still running its old program, so the ids are only
+	 * applied once the replace has actually succeeded. */
+	cred_t newcred;
+	int have_newcred = 0;
+	int new_dumpable = 1;
+	{
+		task_t *cur = sched_current();
+		if (cur) {
+			uint32_t old_euid = cur->cred.euid;
+			uint32_t old_egid = cur->cred.egid;
+
+			newcred = cur->cred;
+			have_newcred = 1;
+
+			/* Set-user-ID / set-group-ID on exec (04000 / 02000).
+			 * The real IDs are unchanged; effective+saved+fs IDs
+			 * take the file's.  xst describes the FINAL binary, so
+			 * set-id bits on a #! script are ignored while the
+			 * interpreter's own still apply. */
+			if (have_xst) {
+				if (xst.st_mode & 04000) { /* S_ISUID */
+					newcred.euid = newcred.suid =
+						newcred.fsuid =
+							(uint32_t)xst.st_uid;
+				}
+				if (xst.st_mode & 02000) { /* S_ISGID */
+					newcred.egid = newcred.sgid =
+						newcred.fsgid =
+							(uint32_t)xst.st_gid;
+				}
+			}
+
+			/* A traced process does not gain privilege here.
+			 *
+			 * Its tracer already holds complete control of its
+			 * memory and registers, so letting the image raise the
+			 * ids would hand the tracer's owner everything the new
+			 * identity can reach -- attaching to a program that is
+			 * about to exec a set-id binary would otherwise be a
+			 * way to inherit that binary's privileges.
+			 *
+			 * The conventional rule degrades the exec rather than
+			 * refusing it: the program still runs, just as itself.
+			 * Refusing would break debugging anything that execs a
+			 * set-id helper, for no extra safety.  A privileged
+			 * tracer changes nothing -- it could assume the
+			 * identity anyway, so there is nothing to protect.
+			 *
+			 * Applied before the dumpable decision below so that
+			 * decision sees the ids the image will really run
+			 * with. */
+			if ((newcred.euid != old_euid ||
+			     newcred.egid != old_egid) &&
+			    task_traced_by_unprivileged(cur))
+				newcred = cur->cred;
+
+			/* An image that gained ids here can read what its new
+			 * identity reaches and its owner's could not, so it
+			 * stops being theirs to read or to trace.  Recorded at
+			 * exec and deliberately NOT recomputed afterwards: a
+			 * setuid-root program that drops all the way back with
+			 * setuid() ends up with ids identical to its owner's
+			 * while still holding whatever it read as root, and the
+			 * id comparison alone would hand that over.
+			 *
+			 * A process that was already non-dumpable stays that
+			 * way: exec'ing something ordinary does not unlearn
+			 * what the previous image was trusted with. */
+			if (newcred.euid != old_euid || newcred.egid != old_egid ||
+			    newcred.uid != newcred.euid ||
+			    newcred.gid != newcred.egid ||
+			    !task_dumpable(cur))
+				new_dumpable = 0;
+		}
+	}
+
 	uint64_t new_stack_ptr = 0;
 	uint64_t entry_point =
-		elf_exec_replace(kpath, kargv, kenvp, &new_stack_ptr);
+		elf_exec_replace(kpath, kargv, kenvp, &new_stack_ptr,
+				 have_newcred ? &newcred : NULL);
 
 	if (entry_point == 0) {
 		// exec failed, return error to caller
@@ -5241,19 +5500,109 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			signal_reset_on_exec(cur);
 	}
 
-	/* Set-user-ID / set-group-ID on a successful exec (04000 / 02000).
-     * The real IDs are unchanged; effective+saved+fs IDs take the file's. */
+	/* Commit the identity worked out before the replace.  Only now: the old
+	 * image is gone and no error can still be returned, so this is the
+	 * first point at which raising the ids cannot leave a process
+	 * privileged in a program it was not supposed to be running. */
 	{
 		task_t *cur = sched_current();
-		if (cur && have_xst) {
-			if (xst.st_mode & 04000) { /* S_ISUID */
-				cur->cred.euid = cur->cred.suid =
-					cur->cred.fsuid = (uint32_t)xst.st_uid;
-			}
-			if (xst.st_mode & 02000) { /* S_ISGID */
-				cur->cred.egid = cur->cred.sgid =
-					cur->cred.fsgid = (uint32_t)xst.st_gid;
-			}
+		if (cur && have_newcred) {
+			cur->cred = newcred;
+			task_set_dumpable(cur, new_dumpable);
+		}
+	}
+
+	/* Flags the new image starts with.
+	 *
+	 * Built here rather than taken from the current kernel flags with
+	 * pushfq: a fresh program should not inherit whatever the kernel
+	 * happened to be carrying, and one bit has to survive deliberately.
+	 * If a tracer single-stepped into this exec, the trap flag it set is
+	 * in the saved user flags, and this path does NOT return through the
+	 * syscall frame that normally carries it -- it builds its own IRET
+	 * frame below.  Dropping it here would silently turn a step into a
+	 * run, with the tracee never stopping again. */
+	uint64_t new_rflags = 0x202; /* reserved bit 1, IF */
+	{
+		task_t *c = sched_current();
+
+		if (c && (c->syscall_rflags & 0x100ULL))
+			new_rflags |= 0x100ULL; /* TF */
+	}
+
+	/* Stop for the tracer at the boundary between the two images.
+	 *
+	 * This is what makes the fork + PTRACE_TRACEME + execve sequence work:
+	 * the child stops the moment the new program is loaded and before a
+	 * single one of its instructions runs, which is the only point at which
+	 * a debugger can plant breakpoints in it before it starts.  Without it
+	 * the child would run to completion the instant it was resumed and
+	 * there would be nothing to debug.
+	 *
+	 * Delivered as SIGTRAP; the tracer sees a stop with PTRACE_EVENT_EXEC
+	 * and resumes with PTRACE_CONT once it is ready. */
+	{
+		task_t *cur = sched_current();
+
+		if (cur) {
+			/* The saved user context now describes the NEW image.
+			 *
+			 * Done for every exec, not just a traced one, because it
+			 * is simply true: the old image is gone, and anything
+			 * that reads this task's user registers -- signal
+			 * delivery builds its frame from them -- would otherwise
+			 * be describing a program that no longer exists.
+			 *
+			 * The syscall frame is dropped for the same reason, and
+			 * it matters more than it looks: execve does not return
+			 * through it.  It builds an IRET frame below and jumps.
+			 * Left in place it still held the address of the execve
+			 * call site in the OLD image, and because it takes
+			 * priority over these fields when registers are read, a
+			 * tracer at this stop was told the program starts at an
+			 * address that had just been unmapped -- which is
+			 * exactly as useful as it sounds. */
+			cur->syscall_frame = NULL;
+			/* execve has no exit stop to pair with its entry one --
+			 * it never returns -- so the in-progress marker would
+			 * stay set and swallow the NEXT syscall's entry stop,
+			 * after which every reported boundary is the wrong one. */
+			cur->ptrace_in_syscall = 0;
+			/* The watchpoints referred to addresses in an image
+			 * that is gone.  Keeping them would trap on whatever
+			 * the new image happens to put there, and if this exec
+			 * gained privilege they would be a window into a
+			 * program the tracer is no longer entitled to watch. */
+			task_debugreg_clear(cur);
+			cur->syscall_rip = entry_point;
+			cur->syscall_rsp = new_stack_ptr;
+			cur->syscall_rflags = new_rflags;
+			cur->syscall_rbp = 0;
+			cur->syscall_rbx = 0;
+			cur->syscall_rax = 0;
+			cur->syscall_r12 = 0;
+			cur->syscall_r13 = 0;
+			cur->syscall_r14 = 0;
+			cur->syscall_r15 = 0;
+			cur->syscall_rdi = 0;
+			cur->syscall_rsi = 0;
+			cur->syscall_rdx = 0;
+			cur->syscall_r8 = 0;
+			cur->syscall_r9 = 0;
+			cur->syscall_r10 = 0;
+			cur->syscall_regs_valid = 1;
+
+			if (cur->tracer_pid != 0)
+				task_ptrace_stop(cur, SIGTRAP,
+						 PTRACE_EVENT_EXEC, 0);
+
+			/* Re-read after the stop: a tracer may have moved the
+			 * entry point or the stack with SETREGS while we were
+			 * parked, and the jump below is the only thing that
+			 * consults them. */
+			entry_point = cur->syscall_rip;
+			new_stack_ptr = cur->syscall_rsp;
+			new_rflags = cur->syscall_rflags;
 		}
 	}
 
@@ -5261,6 +5610,29 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	{
 		task_t *cur = sched_current();
 		if (cur) {
+			/* The FILE, absolute, before anything reduces it to a
+			 * basename.  Resolved against the working directory
+			 * this exec started from, because a debugger that
+			 * attaches later has a different one and a relative
+			 * path would name a different file (or none) by then. */
+			{
+				char full[256];
+				const char *base = (cur->cwd[0] != 0) ?
+							   cur->cwd :
+							   "/";
+
+				if (normalize_path(base, kpath, full,
+						   sizeof(full)) == 0) {
+					int i;
+
+					for (i = 0; i < 255 && full[i]; i++)
+						cur->exe_path[i] = full[i];
+					cur->exe_path[i] = '\0';
+				} else {
+					cur->exe_path[0] = '\0';
+				}
+			}
+
 			const char *src = kpath;
 			// Use basename
 			const char *p = src;
@@ -5316,8 +5688,7 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 		// Set up IRET frame on current stack
 		"push $0x1B\n\t" // SS (user data segment)
 		"push %0\n\t" // RSP (new user stack)
-		"pushfq\n\t" // RFLAGS
-		"orq $0x200, (%%rsp)\n\t" // Enable interrupts in RFLAGS
+		"push %2\n\t" // RFLAGS (see new_rflags above)
 		"push $0x23\n\t" // CS (user code segment)
 		"push %1\n\t" // RIP (entry point)
 		// Clear registers for clean start
@@ -5338,7 +5709,7 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 		"xor %%r15, %%r15\n\t"
 		"iretq\n\t"
 		:
-		: "r"(new_stack_ptr), "r"(entry_point)
+		: "r"(new_stack_ptr), "r"(entry_point), "r"(new_rflags)
 		: "memory");
 
 	// Should never reach here
@@ -6425,6 +6796,69 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	child->in_exit_path = false;
 	task_fpu_fork(child, cur);
 
+	/* A new occupant of a pid, and not traced by whoever traces the parent.
+	 * Both for the same reasons as in sched_fork_current(): a stale tracer
+	 * link would park the new task in a stop nobody collects, and a reused
+	 * pid must be distinguishable from the task that held it before.
+	 * Tracing a new thread or child is opt-in (PTRACE_O_TRACECLONE /
+	 * TRACEFORK), never inherited by the copy. */
+	child->incarnation = task_next_incarnation();
+	child->tracer_pid = 0;
+	child->tracer_incarnation = 0;
+
+	/* A new THREAD of a traced process is traced too.
+	 *
+	 * A thread is not a separate program: it shares the address space, the
+	 * file descriptors and the identity of the process a debugger attached
+	 * to, and a debugger that cannot see it cannot debug that process --
+	 * it shows one stack for a program doing its work on five threads, and
+	 * a fault on any other thread arrives with nobody to report it to.
+	 *
+	 * So the tracer follows the thread group.  A forked CHILD is a
+	 * different matter and keeps the clearing above: it is its own
+	 * process, and tracing it is opt-in through PTRACE_O_TRACEFORK,
+	 * because a debugger that suddenly owned every descendant would stop
+	 * processes it never asked about.
+	 *
+	 * The clone flags are what distinguishes them: CLONE_THREAD means this
+	 * is another thread of the same process. */
+	child->ptrace_options = 0;
+	if ((flags & CLONE_THREAD) && cur->tracer_pid != 0) {
+		child->tracer_pid = cur->tracer_pid;
+		child->tracer_incarnation = cur->tracer_incarnation;
+
+		/* And it is traced on the same TERMS.
+		 *
+		 * The options say which events stop the tracee, and they are
+		 * asked for once, against the process, before any of its
+		 * threads exist.  Leaving them at zero here meant only the
+		 * thread the debugger had spoken to ever announced anything:
+		 * a thread created by the main thread was reported, and a
+		 * thread created by THAT thread was not, so a program whose
+		 * threads spawn their own workers -- which is most of them --
+		 * grew threads the debugger never heard about until something
+		 * else happened to stop the process.  Inherited here, so every
+		 * thread of a traced process reports what the tracer asked
+		 * for, whichever thread it was born from. */
+		child->ptrace_options = cur->ptrace_options;
+	}
+
+	child->ptrace_syscall_trace = 0;
+	child->ptrace_in_syscall = 0;
+	child->ptrace_stopped = 0;
+	child->ptrace_stop_signo = 0;
+	child->ptrace_event = 0;
+	child->ptrace_msg = 0;
+	child->ptrace_exiting = 0;
+	child->ptrace_notify_seq = 0;
+	/* The copy duplicated a pointer into the PARENT's kernel stack.  The
+	 * child has its own and returns through a different path entirely, so
+	 * that frame is not merely stale, it belongs to somebody else -- a
+	 * tracer writing registers through it would corrupt the parent's
+	 * in-progress syscall. */
+	child->syscall_frame = NULL;
+	child->syscall_regs_valid = 0;
+
 	/* The copy above duplicated the POINTER to the parent's region table,
 	 * not the table.  A CLONE_VM thread gets an empty one of its own --
 	 * its bookkeeping is owner-routed to the group leader and it must hold
@@ -6836,8 +7270,27 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// Once enqueued, another CPU might run and free the child before we read it.
 	int64_t child_pid = child->id;
 
+	/* Tell the tracer a thread appeared, if it asked.
+	 *
+	 * A debugger that is not told has to notice by polling the thread list,
+	 * so a thread that is created and does something interesting between
+	 * two stops is never announced -- and a breakpoint it hits before the
+	 * next refresh is reported against a thread nothing knows about.  The
+	 * new thread's id travels as the event's value, which is what
+	 * PTRACE_GETEVENTMSG returns.
+	 *
+	 * Reported before the thread is released, so a tracer that wants to set
+	 * something up on it can do so before it runs.  Opt-in, like every
+	 * other event: PTRACE_O_TRACECLONE. */
+	bool report_clone = (cur->tracer_pid != 0 &&
+			     (cur->ptrace_options & PTRACE_O_TRACECLONE));
+
 	// Enqueue child
 	sched_enqueue_ready(child);
+
+	if (report_clone)
+		task_ptrace_stop(cur, SIGTRAP, PTRACE_EVENT_CLONE,
+				 (unsigned long)child_pid);
 
 	// Set need_resched so the parent yields at the next opportunity,
 	// giving the newly created thread a chance to start promptly.
@@ -7297,18 +7750,10 @@ static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 		return -EFAULT;
 	}
 
-	task_t *target;
-	if (pid == 0) {
-		target = sched_current();
-	} else {
-		target = sched_find_task_by_id((uint32_t)pid);
-	}
-
-	if (!target) {
-		return -ESRCH;
-	}
-
-	// Read affinity mask from user
+	/* Read the mask BEFORE taking the task-list lock.  Touching user memory
+	 * under a spinlock with interrupts off can fault on a demand-paged page
+	 * and then wait, with interrupts disabled, for a completion that cannot
+	 * be delivered on this CPU. */
 	smap_disable();
 	uint64_t mask = *(uint64_t *)mask_ptr;
 	smap_enable();
@@ -7316,6 +7761,36 @@ static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 	// Validate: at least one CPU must be set
 	if (mask == 0) {
 		return -EINVAL;
+	}
+
+	/* Resolve, check and apply under the task-list lock.  sched_find_task_by_id
+	 * returns a bare pointer with the lock already dropped, so a target
+	 * resolved that way can be reaped before it is used -- and the
+	 * permission check below reads the target's credentials, which is
+	 * exactly the dereference that must not race a free. */
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+
+	task_t *target = (pid == 0) ? sched_current() :
+				      sched_find_task_by_id_locked((uint32_t)pid);
+
+	if (!target) {
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return -ESRCH;
+	}
+
+	/* Pinning a process to one CPU is a way to interfere with it, so it
+	 * takes the same right as sending it a signal: the caller must own it,
+	 * or be privileged.  This was previously unchecked, which let any user
+	 * confine any other user's processes -- root's included -- to a single
+	 * CPU.  The kill(2) rule rather than the stricter read rule is the
+	 * right one here: this perturbs the process, it does not read anything
+	 * private out of it.  Signal 0 is the probe form -- permission is the
+	 * question, nothing is delivered. */
+	int64_t perm = signal_target_check(target, 0);
+	if (perm != 0) {
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return perm;
 	}
 
 	// Store the full affinity mask (0 means all CPUs allowed)
@@ -7346,6 +7821,7 @@ static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 	if (!(mask & (1ULL << target->on_cpu)))
 		target->need_resched = 1;
 
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
 	return 0;
 }
 
@@ -7398,16 +7874,26 @@ static int64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy,
 {
 	(void)param_ptr;
 
-	task_t *target;
-	if (pid == 0) {
-		target = sched_current();
-	} else {
-		target = sched_find_task_by_id((uint32_t)pid);
-	}
+	/* Changing another process's scheduling takes the same right as
+	 * signalling it -- see sys_sched_setaffinity.  The policy change itself
+	 * is still a no-op below, but the gate belongs here now rather than
+	 * whenever it grows teeth: an unchecked pid argument is a hole waiting
+	 * for the implementation to arrive. */
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+
+	task_t *target = (pid == 0) ? sched_current() :
+				      sched_find_task_by_id_locked((uint32_t)pid);
 
 	if (!target) {
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
 		return -ESRCH;
 	}
+
+	int64_t perm = signal_target_check(target, 0);
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	if (perm != 0)
+		return perm;
 
 	// We only support SCHED_NORMAL for now
 	if (policy != SCHED_NORMAL && policy != SCHED_RR) {
@@ -7439,16 +7925,22 @@ static int64_t sys_sched_setparam(uint64_t pid, uint64_t param_ptr)
 {
 	(void)param_ptr;
 
-	task_t *target;
-	if (pid == 0) {
-		target = sched_current();
-	} else {
-		target = sched_find_task_by_id((uint32_t)pid);
-	}
+	/* Same gate as sys_sched_setscheduler, for the same reason. */
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+
+	task_t *target = (pid == 0) ? sched_current() :
+				      sched_find_task_by_id_locked((uint32_t)pid);
 
 	if (!target) {
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
 		return -ESRCH;
 	}
+
+	int64_t perm = signal_target_check(target, 0);
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	if (perm != 0)
+		return perm;
 
 	// Accept but ignore (we use fixed round-robin)
 	return 0;
@@ -7845,38 +8337,11 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 	}
 }
 
-/* May the caller read another process's private state — the layout of its
- * address space?
- *
- * Deliberately stricter than the kill(2) rule in signal_permission(): sending
- * a signal only needs ONE of the sender's uids to match one of the target's,
- * but this hands out the address of every mapping another process owns, which
- * is exactly what an attacker wants and what address-space randomisation
- * exists to withhold.  So it follows the conventional ptrace read rule
- * instead: the caller's effective uid must match ALL of the target's uids,
- * real, effective and saved.  A program the user started but which changed
- * identity through a setuid exec is therefore opaque to them, which is the
- * point of the rule — its address space is no longer theirs to read.
- *
- * Privileged callers (capable()) may read any process, and kernel context is
- * privileged by definition.  Returns 0 to allow or -EPERM to deny.
- */
-static int proc_read_permission(const task_t *target)
-{
-	task_t *cur = sched_current();
-
-	if (!target)
-		return -ESRCH;
-	if (!cur)
-		return 0; /* kernel context */
-	if (capable())
-		return 0;
-	if (cur->cred.euid == target->cred.uid &&
-	    cur->cred.euid == target->cred.euid &&
-	    cur->cred.euid == target->cred.suid)
-		return 0;
-	return -EPERM;
-}
+/* The rule that used to live here — may the caller read another process's
+ * private state — is now task_may_access(target, ACCESS_READ) in cred.c, so
+ * that ptrace and the /proc-equivalent syscalls below cannot drift apart, and
+ * so that it is applied to a target's whole thread group rather than to
+ * whichever thread the caller happened to name.  See cred.h. */
 
 // SYS_GETPROCINFO - retrieve info about all processes
 // a1 = pointer to user-space procinfo_t array
@@ -7894,11 +8359,1440 @@ static int proc_read_permission(const task_t *target)
  * (task_mm_owner), so asking about any thread answers for the address space it
  * shares.
  *
- * Restricted to processes the caller owns (proc_read_permission); root sees
- * every process.  The report is a map of where another process keeps its code,
- * its stacks and its heap, so it is not something one user may take from
+ * Restricted to processes the caller owns (task_may_access, ACCESS_READ); root
+ * sees every process.  The report is a map of where another process keeps its
+ * code, its stacks and its heap, so it is not something one user may take from
  * another.
  */
+/* ============================ ptrace(2) ==================================== */
+
+/* Request numbers.  Mirrored in user/lib/libc/include/sys/ptrace.h, which is
+ * also where the interface is documented; keep the two in step. */
+#define PT_TRACEME 0
+#define PT_PEEKTEXT 1
+#define PT_PEEKDATA 2
+#define PT_POKETEXT 3
+#define PT_POKEDATA 4
+#define PT_GETREGS 5
+#define PT_SETREGS 6
+#define PT_GETFPREGS 7
+#define PT_SETFPREGS 8
+#define PT_CONT 9
+#define PT_SINGLESTEP 10
+#define PT_SYSCALL 11
+#define PT_ATTACH 12
+#define PT_DETACH 13
+#define PT_KILL 14
+#define PT_PEEKUSER 15
+#define PT_POKEUSER 16
+#define PT_SETOPTIONS 17
+#define PT_GETEVENTMSG 18
+#define PT_GETAUXV 19
+#define PT_GETDBREGS 20
+#define PT_SETDBREGS 21
+#define PT_GETSIGINFO 22
+#define PT_GETNUMLWPS 23
+#define PT_GETLWPLIST 24
+#define PT_GETEVENT 25
+#define PT_GETEXECPATH 26
+
+/* Debug-register control word, bit by bit, because every one of them either
+ * has to be forced or has to be refused.  See ptrace_sanitize_dr7. */
+#define DR7_LOCAL_SLOT(n) (1ULL << ((n) * 2))
+#define DR7_GLOBAL_SLOT(n) (1ULL << ((n) * 2 + 1))
+#define DR7_ENABLE_MASK 0x000000FFULL /* L0,G0 .. L3,G3 */
+#define DR7_LE_GE_MASK 0x00000300ULL  /* bits 8,9: legacy, harmless */
+#define DR7_MBO 0x00000400ULL	      /* bit 10 reads as 1 */
+#define DR7_GD 0x00002000ULL	      /* bit 13: General Detect */
+#define DR7_RWLEN_SHIFT 16
+#define DR7_RWLEN_MASK 0xFFFF0000ULL /* RW/LEN, four bits per slot */
+
+/* RW field values.  10b is an I/O breakpoint, which needs CR4.DE and watches
+ * port space rather than memory; it is not offered. */
+#define DR_RW_EXEC 0x0
+#define DR_RW_WRITE 0x1
+#define DR_RW_IO 0x2
+#define DR_RW_RDWR 0x3
+
+#define PTRACE_O_ALL 0x003F
+
+/*
+ * Reduce a tracer-supplied DR7 to the bits this kernel is willing to honour.
+ *
+ * A debug register is not like the other registers a tracer can set.  The
+ * others describe the tracee; these describe what the PROCESSOR does, in
+ * whatever context it happens to be in, and two of the ways they can be set
+ * reach past the tracee entirely:
+ *
+ *   - GD (bit 13) makes any access to a debug register raise #DB.  The kernel
+ *     accesses them on every context switch involving a watchpoint, so a tracee
+ *     with GD set would fault the kernel, inside the handler, forever.  It is
+ *     cleared unconditionally.
+ *
+ *   - An address is compared against every access the CPU makes, including the
+ *     kernel's own while it is running on this task's behalf.  Kernel addresses
+ *     are refused in ptrace_set_dbregs for that reason; what stays here is the
+ *     control word.
+ *
+ * I/O breakpoints (RW=10b) are refused because they need CR4.DE and watch port
+ * space; an execute breakpoint is forced to LEN=0 because any other length is
+ * architecturally undefined.  A slot asking for something not allowed is
+ * disabled rather than corrected: a watchpoint that silently watches the wrong
+ * thing is worse than one the debugger can see did not take.
+ */
+static uint64_t ptrace_sanitize_dr7(uint64_t dr7)
+{
+	uint64_t out = (dr7 & (DR7_ENABLE_MASK | DR7_LE_GE_MASK)) | DR7_MBO;
+
+	for (int slot = 0; slot < 4; slot++) {
+		unsigned field = (unsigned)((dr7 >> (DR7_RWLEN_SHIFT +
+						     slot * 4)) & 0xF);
+		unsigned rw = field & 0x3;
+		unsigned len = (field >> 2) & 0x3;
+
+		if (!(out & (DR7_LOCAL_SLOT(slot) | DR7_GLOBAL_SLOT(slot))))
+			continue; /* Not enabled; its RW/LEN mean nothing. */
+
+		if (rw == DR_RW_IO) {
+			out &= ~(DR7_LOCAL_SLOT(slot) | DR7_GLOBAL_SLOT(slot));
+			continue;
+		}
+		if (rw == DR_RW_EXEC)
+			len = 0;
+
+		out |= ((uint64_t)(rw | (len << 2)))
+		       << (DR7_RWLEN_SHIFT + slot * 4);
+	}
+
+	/* GD, and every reserved bit, are absent by construction: `out' was
+	 * built from the fields above rather than masked out of the input. */
+	return out;
+}
+
+/* Resolve a tracee for a request from `cur', enforcing the whole access
+ * policy, and return it with g_task_list_lock HELD so the caller can act on it
+ * without the answer going stale.  *flags receives the saved interrupt state.
+ *
+ * On any refusal the lock is dropped and the errno returned through *err.
+ *
+ * Re-run for every request rather than trusting the attach.  A tracee can
+ * change identity while it is being traced -- it can exec, and it can call
+ * setuid if it holds a saved uid that allows it -- and a decision taken at
+ * attach time would still be saying yes long after the answer changed.  The
+ * check is a handful of integer comparisons; caching it buys nothing worth
+ * that hole. */
+static task_t *ptrace_lock_tracee(task_t *cur, uint64_t pid, uint64_t *flags,
+				  int64_t *err)
+{
+	/* The tracer is the PROCESS, not the thread that happened to make the
+	 * call.  A debugger is entitled to attach from one thread and drive the
+	 * tracee from another, and PTRACE_TRACEME records the parent -- which
+	 * is always a group leader -- so recording the calling thread here
+	 * instead would make those two disagree for a threaded tracer. */
+	task_t *tracer = cur->group_leader ? cur->group_leader : cur;
+
+	spin_lock_irqsave(&g_task_list_lock, flags);
+
+	task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
+	if (!t) {
+		spin_unlock_irqrestore(&g_task_list_lock, *flags);
+		*err = -ESRCH;
+		return NULL;
+	}
+
+	/* Only the process that actually attached may drive the tracee.
+	 * Without this any process passing the credential check could steer
+	 * somebody else's debugging session. */
+	if (t->tracer_pid != (int)tracer->id ||
+	    t->tracer_incarnation != tracer->incarnation) {
+		spin_unlock_irqrestore(&g_task_list_lock, *flags);
+		*err = -ESRCH;
+		return NULL;
+	}
+
+	int perm = task_may_access(t, ACCESS_ATTACH);
+	if (perm != 0) {
+		spin_unlock_irqrestore(&g_task_list_lock, *flags);
+		*err = perm;
+		return NULL;
+	}
+
+	return t;
+}
+
+/* The register set handed to and taken from userspace.  Mirrors
+ * `struct ptrace_regs' in user/lib/libc/include/sys/ptrace.h -- keep in step. */
+typedef struct {
+	uint64_t r15, r14, r13, r12;
+	uint64_t rbp, rbx;
+	uint64_t r11, r10, r9, r8;
+	uint64_t rax, rcx, rdx, rsi, rdi;
+	uint64_t rip, cs, rflags, rsp, ss;
+	uint64_t fs_base, gs_base;
+} ptrace_regs_t;
+
+/* The two declarations live in different builds and cannot be checked against
+ * each other directly, so both are pinned to the same size.  A field added to
+ * one and forgotten in the other then fails to compile instead of silently
+ * shifting every register a debugger reads. */
+_Static_assert(sizeof(ptrace_regs_t) == 22 * 8,
+	       "ptrace_regs_t must match struct ptrace_regs in sys/ptrace.h");
+
+/* Fill `out' with a stopped tracee's user registers.
+ *
+ * Where they live depends on how the tracee entered the kernel, and the two
+ * cases differ in how complete they are:
+ *
+ *   - Interrupted or trapped (a breakpoint, a fault, a timer preemption):
+ *     the whole set was pushed by the interrupt stub and preempt_frame points
+ *     at it.  Everything is exact.
+ *
+ *   - Inside a syscall: RCX and R11 no longer hold the user's values at all --
+ *     the SYSCALL instruction overwrites them with RIP and RFLAGS -- so they
+ *     are reported as what the hardware put there, which is what the user's
+ *     RIP and RFLAGS actually are.  The rest comes from the per-task snapshot
+ *     syscall_handler takes.
+ *
+ * Runs with g_task_list_lock held; only reads task fields. */
+static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
+{
+	mm_memset(out, 0, sizeof(*out));
+
+	const interrupt_frame_t *f = t->preempt_frame;
+
+	if (f) {
+		out->r15 = f->r15;
+		out->r14 = f->r14;
+		out->r13 = f->r13;
+		out->r12 = f->r12;
+		out->r11 = f->r11;
+		out->r10 = f->r10;
+		out->r9 = f->r9;
+		out->r8 = f->r8;
+		out->rbp = f->rbp;
+		out->rdi = f->rdi;
+		out->rsi = f->rsi;
+		out->rdx = f->rdx;
+		out->rcx = f->rcx;
+		out->rbx = f->rbx;
+		out->rax = f->rax;
+		out->rip = f->rip;
+		out->cs = f->cs;
+		out->rflags = f->rflags;
+		out->rsp = f->rsp;
+		out->ss = f->ss;
+	} else if (t->syscall_frame) {
+		/* Read from the live frame rather than the snapshot: it is what
+		 * the return path will actually restore from, so it is also
+		 * what a tracer must see if a write to it is to make sense. */
+		const syscall_user_frame_t *s = t->syscall_frame;
+
+		out->r15 = s->r15;
+		out->r14 = s->r14;
+		out->r13 = s->r13;
+		out->r12 = s->r12;
+		out->r10 = s->r10;
+		out->r9 = s->r9;
+		out->r8 = s->r8;
+		out->rbp = s->rbp;
+		out->rdi = s->rdi;
+		out->rsi = s->rsi;
+		out->rdx = s->rdx;
+		out->rbx = s->rbx;
+		out->rax = s->rax;
+		out->rip = s->rip;
+		out->rsp = s->rsp;
+		out->rflags = s->rflags;
+		/* Destroyed by the SYSCALL instruction itself; these are what
+		 * the hardware left in them. */
+		out->rcx = s->rip;
+		out->r11 = s->rflags;
+		out->cs = 0x23; /* user segments are fixed here */
+		out->ss = 0x1B;
+	} else {
+		/* Neither frame available -- the task is stopped somewhere with
+		 * no user context to report, so report the snapshot and say so
+		 * by leaving the rest zero. */
+		out->rip = t->syscall_rip;
+		out->rsp = t->syscall_rsp;
+		out->rflags = t->syscall_rflags;
+		out->rbp = t->syscall_rbp;
+		out->rbx = t->syscall_rbx;
+		out->rax = t->syscall_rax;
+		out->r12 = t->syscall_r12;
+		out->r13 = t->syscall_r13;
+		out->r14 = t->syscall_r14;
+		out->r15 = t->syscall_r15;
+		if (t->syscall_regs_valid) {
+			out->rdi = t->syscall_rdi;
+			out->rsi = t->syscall_rsi;
+			out->rdx = t->syscall_rdx;
+			out->r8 = t->syscall_r8;
+			out->r9 = t->syscall_r9;
+			out->r10 = t->syscall_r10;
+		}
+		out->rcx = t->syscall_rip;
+		out->r11 = t->syscall_rflags;
+		out->cs = 0x23;
+		out->ss = 0x1B;
+	}
+
+	out->fs_base = t->fs_base;
+}
+
+/* Write a tracee's user registers back.
+ *
+ * RFLAGS is filtered rather than taken as given: it is the one field here that
+ * can hand a process privilege it did not have.  Letting a tracer clear IF
+ * would return the tracee to userspace with interrupts disabled, and setting
+ * IOPL would grant port access -- neither is a debugger's to give, and both
+ * would be granted by a straight copy. */
+static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
+{
+	interrupt_frame_t *f = t->preempt_frame;
+
+	if (f) {
+		f->r15 = in->r15;
+		f->r14 = in->r14;
+		f->r13 = in->r13;
+		f->r12 = in->r12;
+		f->r11 = in->r11;
+		f->r10 = in->r10;
+		f->r9 = in->r9;
+		f->r8 = in->r8;
+		f->rbp = in->rbp;
+		f->rdi = in->rdi;
+		f->rsi = in->rsi;
+		f->rdx = in->rdx;
+		f->rcx = in->rcx;
+		f->rbx = in->rbx;
+		f->rax = in->rax;
+		f->rip = in->rip;
+		f->rsp = in->rsp;
+		f->rflags = user_rflags_sanitize(in->rflags);
+		/* CS/SS are deliberately not writable: a tracee that returns
+		 * through a segment selector of the tracer's choosing is a way
+		 * out of user mode, not a debugging feature. */
+	} else if (t->syscall_frame) {
+		/* Written into the live frame, because that is what the return
+		 * path restores from.  Writing the snapshot instead reads back
+		 * correctly and is then discarded on return -- the change
+		 * appears to have been made and simply does not happen. */
+		syscall_user_frame_t *s = t->syscall_frame;
+
+		s->r15 = in->r15;
+		s->r14 = in->r14;
+		s->r13 = in->r13;
+		s->r12 = in->r12;
+		s->r10 = in->r10;
+		s->r9 = in->r9;
+		s->r8 = in->r8;
+		s->rbp = in->rbp;
+		s->rdi = in->rdi;
+		s->rsi = in->rsi;
+		s->rdx = in->rdx;
+		s->rbx = in->rbx;
+		s->rax = in->rax;
+		s->rip = in->rip;
+		s->rsp = in->rsp;
+		s->rflags = user_rflags_sanitize(in->rflags);
+
+		/* Keep the snapshot consistent with it: signal delivery builds
+		 * its frame from these, so leaving them stale would resume a
+		 * handler at the old address. */
+		t->syscall_rip = s->rip;
+		t->syscall_rsp = s->rsp;
+		t->syscall_rflags = s->rflags;
+		t->syscall_rbp = s->rbp;
+		t->syscall_rbx = s->rbx;
+		t->syscall_rax = s->rax;
+		t->syscall_r12 = s->r12;
+		t->syscall_r13 = s->r13;
+		t->syscall_r14 = s->r14;
+		t->syscall_r15 = s->r15;
+	} else {
+		/* No frame: an exec stop.  The snapshot is not a stale copy
+		 * there, it is where the jump into the new image reads its
+		 * entry point, stack and flags from -- so writing it is how a
+		 * tracer redirects a program before its first instruction. */
+		t->syscall_rip = in->rip;
+		t->syscall_rsp = in->rsp;
+		t->syscall_rflags = user_rflags_sanitize(in->rflags);
+		t->syscall_rbp = in->rbp;
+		t->syscall_rbx = in->rbx;
+		t->syscall_rax = in->rax;
+		t->syscall_r12 = in->r12;
+		t->syscall_r13 = in->r13;
+		t->syscall_r14 = in->r14;
+		t->syscall_r15 = in->r15;
+		t->syscall_rdi = in->rdi;
+		t->syscall_rsi = in->rsi;
+		t->syscall_rdx = in->rdx;
+		t->syscall_r8 = in->r8;
+		t->syscall_r9 = in->r9;
+		t->syscall_r10 = in->r10;
+	}
+	return 0;
+}
+
+/* Set or clear the trap flag in whichever frame the tracee will resume from.
+ *
+ * With TF set the processor raises #DB after the next instruction, which is
+ * how single-stepping is done -- there is no other mechanism.  It has to be
+ * written where the resume actually reads RFLAGS from, which is the exception
+ * frame for a trapped tracee and the syscall frame for one stopped in a
+ * syscall; the per-task snapshot is not consulted by either return path.
+ *
+ * Runs with g_task_list_lock held. */
+static int64_t ptrace_set_tf(task_t *t, bool on)
+{
+	uint64_t *rflags = NULL;
+
+	if (t->preempt_frame)
+		rflags = &t->preempt_frame->rflags;
+	else if (t->syscall_frame)
+		rflags = &t->syscall_frame->rflags;
+
+	if (rflags) {
+		if (on)
+			*rflags |= 0x100ULL; /* TF */
+		else
+			*rflags &= ~0x100ULL;
+	}
+
+	/* The snapshot as well, and at an exec stop INSTEAD: there is no frame
+	 * there at all, because execve does not return through one -- it builds
+	 * an IRET frame and jumps, taking its flags from here.  So all three
+	 * resume paths are covered: an exception frame, a syscall frame, or the
+	 * jump into a freshly loaded image. */
+	if (on)
+		t->syscall_rflags |= 0x100ULL;
+	else
+		t->syscall_rflags &= ~0x100ULL;
+	return 0;
+}
+
+/* Move bytes to or from another process's memory.
+ *
+ * `mm' is the target's address-space owner (its thread-group leader) and the
+ * caller must hold mm->mmap_lock -- shared to read, EXCLUSIVE to write, since
+ * writing may have to break copy-on-write.  `kbuf' is kernel memory; user
+ * memory is never touched from in here, because this runs under a sleeping
+ * lock and a demand-paged fault would want to sleep again.
+ *
+ * Everything this refuses, and why:
+ *
+ *   - addresses outside the user range, and any length that carries the end
+ *     out of it.  validate_user_ptr() bounds only the start.
+ *   - an address with no region behind it: an unmapped hole reads as zero
+ *     through the page tables and would look like real memory.
+ *   - a region marked `device'.  Those are MMIO -- framebuffer aperture today,
+ *     any BAR later -- and a write there is not a write to memory at all, it
+ *     is driving hardware from another process's syscall.  Shared-memory
+ *     attachments carry the same flag and are excluded with them.
+ *   - a write to a region without PROT_WRITE.  Text is the interesting case:
+ *     a debugger DOES plant breakpoints in it, so this is the one place the
+ *     region's own protection is deliberately not the last word -- see the
+ *     PROT_EXEC allowance below.
+ *
+ * Translation is per page because one translation covers exactly one page; a
+ * request spanning a boundary is split rather than trusted to stay put.
+ */
+static int64_t ptrace_xfer_mem(task_t *mm, uint64_t addr, void *kbuf,
+			       size_t len, bool write)
+{
+	uint8_t *b = (uint8_t *)kbuf;
+	uint64_t end = addr + len;
+
+	if (len == 0)
+		return 0;
+	if (!validate_user_ptr(addr, len))
+		return -EFAULT;
+	/* Re-bound the END.  validate_user_ptr checks the start against the top
+	 * of the user half and checks that start+len does not wrap, but not
+	 * that the end is still below the top. */
+	if (end < addr || end > 0x7FFFFFFFFFFFULL)
+		return -EFAULT;
+	if (!mm->pml4 || mm->has_exited || mm->in_exit_teardown)
+		return -ESRCH;
+
+	while (len > 0) {
+		uint64_t page = addr & ~0xFFFULL;
+		size_t off = (size_t)(addr - page);
+		size_t n = PAGE_SIZE - off;
+
+		if (n > len)
+			n = len;
+
+		/* The PAGE TABLES are the authority on what is mapped here.
+		 *
+		 * A region record is not, and must not be treated as one: this
+		 * kernel creates them only for lazily-mapped ranges and for
+		 * mmap(), so an eagerly-loaded ELF segment has none and neither
+		 * does the stack.  Requiring a region refused most of a normal
+		 * process's memory -- every global it had already touched
+		 * included -- while reporting it as a bad address. */
+		/* Materialise the page first if it is only lazily mapped.
+		 *
+		 * A tracee stopped at its exec boundary has touched almost
+		 * nothing, and it cannot fault its own pages in while it is
+		 * stopped -- so without this, reading its code or planting a
+		 * breakpoint in it fails for the whole of the program a
+		 * debugger most wants to look at.  Its own regions decide what
+		 * may be materialised; an address with nothing mapped behind it
+		 * is still refused below. */
+		(void)mm_populate_in(mm, page);
+
+		uint64_t *pte =
+			mm_get_page_table_from_pml4(mm->pml4, page, false);
+
+		if (!pte || !(*pte & PAGE_PRESENT)) {
+			/* Nothing mapped at this address, and nothing the region
+			 * table would let us map there either.
+			 *
+			 * Reported quietly: a debugger probes addresses it is
+			 * not sure about -- that is how it discovers what is
+			 * mapped -- so a refusal here is ordinary, not a defect
+			 * worth a kernel warning. */
+			return -EFAULT;
+		}
+
+		/* Device memory is refused on the PTE flag rather than on the
+		 * region, because the flag is what actually marks it and it is
+		 * there whether or not a record exists.  A write would not be a
+		 * write to memory at all: it would be driving hardware from
+		 * another process's syscall. */
+		if (*pte & PAGE_DEVICE)
+			return -EACCES;
+
+		if (write) {
+			/* Where a region exists it carries the protection the
+			 * mapping was made with, which the page tables alone
+			 * cannot be read for -- a copy-on-write page is
+			 * read-only in the tables and still perfectly writable.
+			 * Text is allowed through deliberately: planting
+			 * breakpoints is the main reason to write to a tracee,
+			 * and text is never PROT_WRITE.  A read-only DATA
+			 * mapping stays refused, which is what keeps a write
+			 * out of a shared file-backed page.
+			 *
+			 * With no region the address belongs to the image or
+			 * the stack, both private to this process, and the COW
+			 * break below keeps it that way. */
+			mmap_region_t *r = mm_find_mmap_region(mm, addr);
+
+			if (r && !(r->prot & PROT_WRITE) &&
+			    !(r->prot & PROT_EXEC))
+				return -EACCES;
+
+			/* Make the page privately writable BEFORE writing.
+			 *
+			 * Two things are being dealt with at once: a page still
+			 * shared copy-on-write after a fork, where the write
+			 * would otherwise land in the sibling's memory too, and
+			 * a read-only mapping such as text, where it would not
+			 * land at all.  Text is the ordinary case for a
+			 * debugger -- a breakpoint is a write into code. */
+			if (!mm_make_writable_in(mm->pml4, page))
+				return -EFAULT;
+		}
+
+		uint64_t phys = mm_virt_to_phys_in(mm->pml4, addr);
+
+		if (!phys) {
+			/* Not materialised.  A lazily-mapped region has a
+			 * record but no page until something touches it, and
+			 * there is no way to fault one in on behalf of a task
+			 * that is not running, so this is reported rather than
+			 * guessed at. */
+			return -EFAULT;
+		}
+
+		void *kaddr = phys_to_virt(phys);
+
+		if (write)
+			mm_memcpy(kaddr, b, n);
+		else
+			mm_memcpy(b, kaddr, n);
+
+		addr += n;
+		b += n;
+		len -= n;
+	}
+	return 0;
+}
+
+/* Resolve a stopped tracee's address space for a memory transfer.
+ *
+ * Returns the mm owner with NO lock held, having verified under
+ * g_task_list_lock that it is still this caller's tracee, still permitted, and
+ * still has an address space.  The caller then takes mmap_lock -- which it
+ * cannot do while holding a spinlock with interrupts off, since that lock
+ * sleeps, which is the whole reason this is split in two.
+ *
+ * KNOWN LIMIT: nothing keeps the task_t itself alive across that gap.  There
+ * is no refcount on tasks here, so this carries the same exposure as every
+ * other cross-task operation in this kernel (sys_kill and the scheduler wakes
+ * included).  Closing it properly needs task lifetime to be refcounted; doing
+ * it locally without that would mean holding a spinlock across a sleeping
+ * lock, which deadlocks. */
+static task_t *ptrace_mem_target(task_t *cur, uint64_t pid, int64_t *err)
+{
+	uint64_t flags;
+	task_t *mm = NULL;
+
+	task_t *t = ptrace_lock_tracee(cur, pid, &flags, err);
+
+	if (!t)
+		return NULL;
+
+	if (!t->ptrace_stopped) {
+		/* Reading a running tracee gives a torn answer and writing one
+		 * races whatever it is doing.  Both are refused. */
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		*err = -ESRCH;
+		return NULL;
+	}
+
+	mm = task_mm_owner(t);
+	if (!mm || !mm->pml4) {
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		*err = -ESRCH;
+		return NULL;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	return mm;
+}
+
+/* Clear the trace-stop state of a tracee that is about to be resumed.  The
+ * caller does the waking; this only says the stop is over.  Runs with
+ * g_task_list_lock held. */
+static int64_t ptrace_resume(task_t *t)
+{
+	if (!t->ptrace_stopped)
+		return -ESRCH; /* not stopped: nothing to resume */
+
+	t->ptrace_stopped = 0;
+	t->ptrace_stop_signo = 0;
+	t->ptrace_event = 0;
+	t->ptrace_group_stop = 0;
+
+	/* The rest of the process goes too.  The siblings were parked by the
+	 * group stop and carry no event of their own, so nothing else would
+	 * ever release them: no waitpid reports them, and no PTRACE_CONT is
+	 * aimed at them. */
+	task_ptrace_group_resume(t);
+	return 0;
+}
+
+static int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
+			  uint64_t data)
+{
+	task_t *cur = sched_current();
+	uint64_t flags;
+	int64_t err = 0;
+
+	if (!cur)
+		return -EPERM;
+
+	/* The one request that is about the caller itself and names no target:
+	 * a process volunteering to be traced by its own parent.  No credential
+	 * check applies -- consenting to be traced is not an act against
+	 * anybody, and the parent could read this child's memory anyway. */
+	if (request == PT_TRACEME) {
+		int64_t r = 0;
+
+		/* ->parent is read under the lock along with the write: an
+		 * orphaned task is reparented from another context, so reading
+		 * it outside and writing inside could record a parent that is
+		 * no longer ours by the time it lands. */
+		spin_lock_irqsave(&g_task_list_lock, &flags);
+		{
+			task_t *parent = cur->parent;
+
+			if (cur->tracer_pid != 0)
+				r = -EPERM; /* already traced */
+			else if (!task_ptr_ok(parent) || parent->has_exited)
+				r = -ESRCH;
+			else {
+				cur->tracer_pid = (int)parent->id;
+				cur->tracer_incarnation = parent->incarnation;
+			}
+		}
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return r;
+	}
+
+	if (request == PT_ATTACH) {
+		spin_lock_irqsave(&g_task_list_lock, &flags);
+
+		task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
+		if (!t) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -ESRCH;
+		}
+		/* Tracing yourself, or a kernel thread, is not a thing that can
+		 * work: the first deadlocks on its own stop, the second has no
+		 * user context to stop in. */
+		if (t == cur || t->privilege == TASK_KERNEL) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -EPERM;
+		}
+		if (t->tracer_pid != 0) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -EBUSY; /* somebody is already tracing it */
+		}
+
+		/* The full attach rule: matching uid AND gid triples across the
+		 * target's whole thread group, and a refusal for a process
+		 * whose privileges came from a set-id exec.  Root bypasses. */
+		int perm = task_may_access(t, ACCESS_ATTACH);
+		if (perm != 0) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return perm;
+		}
+
+		/* Recorded as the PROCESS, matching PTRACE_TRACEME and what
+		 * ptrace_lock_tracee() checks against. */
+		task_t *tracer = cur->group_leader ? cur->group_leader : cur;
+
+		/* The whole thread group, not just the thread named.
+		 *
+		 * A debugger attaches to a PROCESS.  Tracing only the thread
+		 * whose id happened to be passed leaves the others running
+		 * untraced: their registers cannot be read, a fault on one is
+		 * reported to nobody, and `info threads' shows a single stack
+		 * for a program doing its work on several.  Every thread here
+		 * is a task with its own registers and its own stop, so tracing
+		 * all of them is what makes them debuggable.
+		 *
+		 * Walked with the same guard as the other group walks: a ring
+		 * that does not lead back to its leader must not be followed
+		 * into whatever it points at with interrupts off. */
+		{
+			task_t *leader = t->group_leader ? t->group_leader : t;
+			task_t *w = leader;
+			int guard = 0;
+
+			if (task_ptr_ok(leader)) {
+				do {
+					if (!w->has_exited &&
+					    w->privilege != TASK_KERNEL &&
+					    w->tracer_pid == 0) {
+						w->tracer_pid =
+							(int)tracer->id;
+						w->tracer_incarnation =
+							tracer->incarnation;
+					}
+					w = w->thread_group_next;
+					if (!task_ptr_ok(w) ||
+					    ++guard > TASK_GROUP_KILL_MAX * 4) {
+						WARN_ON_ONCE(1);
+						break;
+					}
+				} while (w != leader);
+			} else {
+				t->tracer_pid = (int)tracer->id;
+				t->tracer_incarnation = tracer->incarnation;
+			}
+		}
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		/* Stop it so the tracer has something to wait for, the way an
+		 * attach is expected to behave.  Delivered as a signal rather
+		 * than parked directly: the tracee has to reach its own context
+		 * to stop, and the stop redirect in the signal path is what
+		 * turns this into a trace stop. */
+		sched_signal_task(t, SIGSTOP);
+		return 0;
+	}
+
+	/* Everything else names a tracee this task is already tracing. */
+	task_t *t = ptrace_lock_tracee(cur, pid, &flags, &err);
+	if (!t)
+		return err;
+
+	int64_t ret = 0;
+
+	switch (request) {
+	case PT_DETACH: {
+		int signo = (int)data;
+
+		/* Same gate as PT_CONT: a signal requested here is still a
+		 * signal being sent, and must pass the check that applies to
+		 * sending one. */
+		if (signo != 0) {
+			int64_t perm = signal_target_check(t, signo);
+
+			if (perm != 0) {
+				spin_unlock_irqrestore(&g_task_list_lock,
+						       flags);
+				return perm;
+			}
+		}
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		/* Takes the lock itself, and enqueues, so it cannot run with
+		 * the task list held. */
+		task_ptrace_detach(t);
+		if (signo != 0)
+			sched_signal_task(t, signo);
+		return 0;
+	}
+
+	case PT_CONT: {
+		int signo = (int)data;
+
+		/* A signal asked for on resume goes through the same gate as
+		 * kill(2).  The tracer is asking for a signal to be sent, and
+		 * being a tracer is not a way around the check that applies to
+		 * sending one -- sched_signal_task() and signal_send() perform
+		 * no credential check of their own. */
+		if (signo != 0) {
+			int64_t perm = signal_target_check(t, signo);
+
+			if (perm != 0) {
+				spin_unlock_irqrestore(&g_task_list_lock,
+						       flags);
+				return perm;
+			}
+		}
+
+		/* A plain continue is not a syscall-traced one.  Clearing
+		 * this is what lets a tracer stop asking: it describes this
+		 * resume, not the trace as a whole. */
+		t->ptrace_syscall_trace = 0;
+		t->ptrace_in_syscall = 0;
+
+		/* Marked, not withheld: the signal is SENT below by the same
+		 * path that worked before signal-delivery-stop existed.  The
+		 * mark tells the delivery stop to let this one through, rather
+		 * than stopping to ask about the signal the tracer just asked
+		 * to deliver -- which would never terminate. */
+		if (signo != 0)
+			t->ptrace_signal_injected = 1;
+
+		ret = ptrace_resume(t);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (ret != 0)
+			return ret;
+
+		/* Queue the signal BEFORE making the tracee runnable.
+		 *
+		 * The other order is a race, and a losing one: the tracee wakes
+		 * on another CPU, comes out of its signal-delivery stop, looks
+		 * for a signal to act on and finds the queue still empty
+		 * because this call has not sent it yet.  It then carries on --
+		 * and if its next act is _exit(), the signal the tracer asked
+		 * to deliver is never delivered at all.  Sending first costs
+		 * nothing: a stopped task simply has the signal waiting when it
+		 * runs. */
+		if (signo != 0)
+			sched_signal_task(t, signo);
+		if (sched_claim_wake(t, TASK_STOPPED))
+			sched_enqueue_ready(t);
+		return 0;
+	}
+
+	case PT_KILL: {
+		/* Routed through the ordinary signal gate rather than killing
+		 * directly: sched_signal_task() and signal_send() apply no
+		 * credential check of their own, so a ptrace path that reached
+		 * for them straight would be a way to kill a process the caller
+		 * has no right to signal.  The check only reads credentials, so
+		 * it runs under the lock; the delivery must not. */
+		int64_t perm = signal_target_check(t, SIGKILL);
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (perm != 0)
+			return perm;
+		sched_signal_task(t, SIGKILL);
+		return 0;
+	}
+
+	case PT_SETOPTIONS: {
+		if (data & ~(uint64_t)PTRACE_O_ALL) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -EINVAL;
+		}
+
+		/* Set on the whole thread group, like the attach that named it.
+		 *
+		 * The options are asked for once, against the process, and a
+		 * debugger has no reason to name each thread -- so setting them
+		 * only on the thread whose id was passed left every OTHER
+		 * thread of an attached process reporting nothing: a thread it
+		 * created was never announced, a thread that died was never
+		 * reported.  New threads inherit these from their creator (see
+		 * sys_clone), so this is what makes the whole process, present
+		 * threads and future ones alike, trace on the terms asked for.
+		 *
+		 * Walked with the guard the other group walks use: a ring that
+		 * does not lead back to its leader must not be followed into
+		 * whatever it points at with interrupts off. */
+		task_t *leader = t->group_leader ? t->group_leader : t;
+		task_t *w = leader;
+		int guard = 0;
+
+		t->ptrace_options = (uint32_t)data;
+
+		if (task_ptr_ok(leader)) {
+			do {
+				/* Only the threads this caller actually traces.
+				 * tracer_pid is what says so, and it is the
+				 * same test every other request applies. */
+				if (!w->has_exited &&
+				    w->tracer_pid == t->tracer_pid &&
+				    w->tracer_incarnation ==
+					    t->tracer_incarnation)
+					w->ptrace_options = (uint32_t)data;
+				w = w->thread_group_next;
+				if (!task_ptr_ok(w) ||
+				    ++guard > TASK_GROUP_KILL_MAX * 4) {
+					WARN_ON_ONCE(1);
+					break;
+				}
+			} while (w != leader);
+		}
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return 0;
+	}
+
+	case PT_GETEVENTMSG: {
+		unsigned long msg = t->ptrace_msg;
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (!validate_user_ptr(data, sizeof(unsigned long)))
+			return -EFAULT;
+		if (copy_to_user((void *)data, &msg, sizeof(msg)) < 0)
+			return -EFAULT;
+		return 0;
+	}
+
+	/*
+	 * Copy out the tracee's auxiliary vector: ADDR is the tracer's buffer,
+	 * DATA its size, and the return value is the number of bytes copied.
+	 *
+	 * The block lives on the tracee's stack, so this is a cross-address-
+	 * space read and goes through the same hardened path as PEEKDATA
+	 * rather than touching the other process's pages directly.  Its
+	 * location is read under the task-list lock, which is dropped before
+	 * any of the work that can sleep.
+	 */
+	case PT_GETAUXV: {
+		uint64_t src = t->auxv_addr;
+		uint64_t srclen = t->auxv_len;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		/* Never exec'd, so there is no vector to report.  Not an
+		 * error: a tracee stopped at PTRACE_TRACEME before its exec is
+		 * a legitimate thing to ask about, and the honest answer is
+		 * that it has none yet. */
+		if (!src || !srclen)
+			return 0;
+
+		if (srclen > data)
+			srclen = data;
+		if (srclen == 0)
+			return 0;
+		if (!validate_user_ptr(addr, srclen))
+			return -EFAULT;
+
+		void *kbuf = kalloc(srclen);
+		if (!kbuf)
+			return -ENOMEM;
+
+		task_t *mm = ptrace_mem_target(cur, pid, &err);
+		if (!mm) {
+			kfree(kbuf);
+			return err;
+		}
+
+		mm_read_lock(&mm->mmap_lock);
+		ret = ptrace_xfer_mem(mm, src, kbuf, srclen, false);
+		mm_read_unlock(&mm->mmap_lock);
+		if (ret != 0) {
+			kfree(kbuf);
+			return ret;
+		}
+
+		if (copy_to_user((void *)addr, kbuf, srclen) < 0) {
+			kfree(kbuf);
+			return -EFAULT;
+		}
+		kfree(kbuf);
+		return (int64_t)srclen;
+	}
+
+	/* The register requests take their buffer in ADDR, not in DATA.
+	 *
+	 * That is the convention gdb's own generic ptrace target already
+	 * speaks, and matching it is what lets this system reuse
+	 * inf-ptrace.c and amd64-bsd-nat.c as they are rather than carry a
+	 * hand-written native module.  Every other request here was already
+	 * compatible -- a resume passes its signal in DATA and ignores ADDR,
+	 * exactly as gdb sends it -- so these four were the whole difference.
+	 */
+	case PT_GETREGS: {
+		ptrace_regs_t r;
+
+		if (!t->ptrace_stopped) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -ESRCH;
+		}
+		ptrace_read_regs(t, &r);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		if (!validate_user_ptr(addr, sizeof(r)))
+			return -EFAULT;
+		if (copy_to_user((void *)addr, &r, sizeof(r)) < 0)
+			return -EFAULT;
+		return 0;
+	}
+
+	case PT_SETREGS: {
+		ptrace_regs_t r;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (!validate_user_ptr(addr, sizeof(r)))
+			return -EFAULT;
+		if (copy_from_user(&r, (void *)addr, sizeof(r)) < 0)
+			return -EFAULT;
+
+		/* Re-resolve: the copy above may sleep on a demand-paged user
+		 * page, and the tracee's state can change while it does. */
+		t = ptrace_lock_tracee(cur, pid, &flags, &err);
+		if (!t)
+			return err;
+		if (!t->ptrace_stopped) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -ESRCH;
+		}
+		ret = ptrace_write_regs(t, &r);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return ret;
+	}
+
+	case PT_GETFPREGS:
+	case PT_SETFPREGS: {
+		/* The x87/SSE file already has a per-task home: the FXSAVE area
+		 * the context switch keeps.  Nothing new to save, only a copy
+		 * in or out of it. */
+		uint8_t *area = t->fpu_state;
+
+		if (!t->ptrace_stopped || !area) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -ESRCH;
+		}
+
+		uint8_t tmp[512];
+
+		if (request == PT_GETFPREGS) {
+			mm_memcpy(tmp, area, sizeof(tmp));
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			if (!validate_user_ptr(addr, sizeof(tmp)))
+				return -EFAULT;
+			if (copy_to_user((void *)addr, tmp, sizeof(tmp)) < 0)
+				return -EFAULT;
+			return 0;
+		}
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (!validate_user_ptr(addr, sizeof(tmp)))
+			return -EFAULT;
+		if (copy_from_user(tmp, (void *)addr, sizeof(tmp)) < 0)
+			return -EFAULT;
+
+		t = ptrace_lock_tracee(cur, pid, &flags, &err);
+		if (!t)
+			return err;
+		if (!t->ptrace_stopped || !t->fpu_state) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -ESRCH;
+		}
+		mm_memcpy(t->fpu_state, tmp, sizeof(tmp));
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return 0;
+	}
+
+	case PT_PEEKTEXT:
+	case PT_PEEKDATA: {
+		uint64_t word = 0;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		task_t *mm = ptrace_mem_target(cur, pid, &err);
+
+		if (!mm)
+			return err;
+
+		mm_read_lock(&mm->mmap_lock);
+		ret = ptrace_xfer_mem(mm, addr, &word, sizeof(word), false);
+		mm_read_unlock(&mm->mmap_lock);
+		if (ret != 0)
+			return ret;
+
+		/* The word is returned, not written through `data', so that a
+		 * PEEK costs one syscall.  See the note in the libc wrapper
+		 * about telling a read of -1 from a failure. */
+		return (int64_t)word;
+	}
+
+	case PT_POKETEXT:
+	case PT_POKEDATA: {
+		uint64_t word = data;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		task_t *mm = ptrace_mem_target(cur, pid, &err);
+
+		if (!mm)
+			return err;
+
+		/* Exclusive: a write may have to break copy-on-write, which
+		 * rewrites a page-table entry. */
+		mm_write_lock(&mm->mmap_lock);
+		ret = ptrace_xfer_mem(mm, addr, &word, sizeof(word), true);
+		mm_write_unlock(&mm->mmap_lock);
+		return ret;
+	}
+
+	case PT_SYSCALL: {
+		int signo = (int)data;
+
+		if (signo != 0) {
+			int64_t perm = signal_target_check(t, signo);
+
+			if (perm != 0) {
+				spin_unlock_irqrestore(&g_task_list_lock,
+						       flags);
+				return perm;
+			}
+		}
+
+		/* Run until the next syscall boundary.  Set per resume, not as
+		 * an option, so alternating PTRACE_SYSCALL and PTRACE_CONT does
+		 * what it says. */
+		t->ptrace_syscall_trace = 1;
+
+		/* Marked, not withheld: the signal is SENT below by the same
+		 * path that worked before signal-delivery-stop existed.  The
+		 * mark tells the delivery stop to let this one through, rather
+		 * than stopping to ask about the signal the tracer just asked
+		 * to deliver -- which would never terminate. */
+		if (signo != 0)
+			t->ptrace_signal_injected = 1;
+
+		ret = ptrace_resume(t);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (ret != 0)
+			return ret;
+
+		/* Queue the signal BEFORE making the tracee runnable.
+		 *
+		 * The other order is a race, and a losing one: the tracee wakes
+		 * on another CPU, comes out of its signal-delivery stop, looks
+		 * for a signal to act on and finds the queue still empty
+		 * because this call has not sent it yet.  It then carries on --
+		 * and if its next act is _exit(), the signal the tracer asked
+		 * to deliver is never delivered at all.  Sending first costs
+		 * nothing: a stopped task simply has the signal waiting when it
+		 * runs. */
+		if (signo != 0)
+			sched_signal_task(t, signo);
+		if (sched_claim_wake(t, TASK_STOPPED))
+			sched_enqueue_ready(t);
+		return 0;
+	}
+
+	case PT_SINGLESTEP: {
+		int signo = (int)data;
+
+		if (signo != 0) {
+			int64_t perm = signal_target_check(t, signo);
+
+			if (perm != 0) {
+				spin_unlock_irqrestore(&g_task_list_lock,
+						       flags);
+				return perm;
+			}
+		}
+
+		/* Arm the trap flag before releasing the stop: the processor
+		 * raises #DB after the next instruction, which the exception
+		 * handler turns back into a stop for this tracer. */
+		t->ptrace_syscall_trace = 0;
+		ret = ptrace_set_tf(t, true);
+		if (ret != 0) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return ret;
+		}
+
+		/* Marked, not withheld: the signal is SENT below by the same
+		 * path that worked before signal-delivery-stop existed.  The
+		 * mark tells the delivery stop to let this one through, rather
+		 * than stopping to ask about the signal the tracer just asked
+		 * to deliver -- which would never terminate. */
+		if (signo != 0)
+			t->ptrace_signal_injected = 1;
+
+		ret = ptrace_resume(t);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (ret != 0)
+			return ret;
+
+		/* Queue the signal BEFORE making the tracee runnable.
+		 *
+		 * The other order is a race, and a losing one: the tracee wakes
+		 * on another CPU, comes out of its signal-delivery stop, looks
+		 * for a signal to act on and finds the queue still empty
+		 * because this call has not sent it yet.  It then carries on --
+		 * and if its next act is _exit(), the signal the tracer asked
+		 * to deliver is never delivered at all.  Sending first costs
+		 * nothing: a stopped task simply has the signal waiting when it
+		 * runs. */
+		if (signo != 0)
+			sched_signal_task(t, signo);
+		if (sched_claim_wake(t, TASK_STOPPED))
+			sched_enqueue_ready(t);
+		return 0;
+	}
+
+	/* Syscall entry/exit stops and the debug registers arrive with the
+	 * phases that build them; refused outright rather than silently doing
+	 * nothing, so a debugger gets a straight answer instead of a tracee
+	 * that never stops. */
+	/*
+	 * The threads of the tracee's process.
+	 *
+	 * A debugger has to know they exist before it can do anything with
+	 * them: without this it sees one thread, reports one stack, and a
+	 * program that does its work on other threads looks idle.  The kernel
+	 * is the only thing that knows the set, since a thread is not visible
+	 * from outside the process.
+	 *
+	 * The two requests are the conventional pair: ask how many, then ask
+	 * for that many.  Both walk the group ring under the task-list lock,
+	 * with the guard the other group walks use -- a ring that does not lead
+	 * back to its leader would otherwise be followed into whatever it
+	 * points at, with interrupts off, where a fault takes the machine down
+	 * rather than the process.
+	 */
+	case PT_GETNUMLWPS: {
+		task_t *leader = t->group_leader ? t->group_leader : t;
+		int count = 0;
+
+		if (task_ptr_ok(leader)) {
+			task_t *w = leader;
+			int guard = 0;
+
+			do {
+				if (!w->has_exited)
+					count++;
+				w = w->thread_group_next;
+				if (!task_ptr_ok(w) ||
+				    ++guard > TASK_GROUP_KILL_MAX * 4) {
+					WARN_ON_ONCE(1);
+					break;
+				}
+			} while (w != leader);
+		}
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return count;
+	}
+
+	case PT_GETLWPLIST: {
+		/* ADDR is the buffer, DATA how many ids fit in it.  Returns how
+		 * many were written, which may be fewer than exist -- the
+		 * caller sized the buffer from GETNUMLWPS and threads can come
+		 * and go in between. */
+		uint32_t ids[TASK_GROUP_KILL_MAX];
+		task_t *leader = t->group_leader ? t->group_leader : t;
+		int count = 0;
+		uint64_t want = data;
+
+		if (task_ptr_ok(leader)) {
+			task_t *w = leader;
+			int guard = 0;
+
+			do {
+				if (!w->has_exited &&
+				    count < TASK_GROUP_KILL_MAX)
+					ids[count++] = (uint32_t)w->id;
+				w = w->thread_group_next;
+				if (!task_ptr_ok(w) ||
+				    ++guard > TASK_GROUP_KILL_MAX * 4) {
+					WARN_ON_ONCE(1);
+					break;
+				}
+			} while (w != leader);
+		}
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		if ((uint64_t)count > want)
+			count = (int)want;
+		if (count <= 0)
+			return 0;
+		if (!validate_user_ptr(addr, (uint64_t)count * sizeof(ids[0])))
+			return -EFAULT;
+		if (copy_to_user((void *)addr, ids,
+				 (size_t)count * sizeof(ids[0])) < 0)
+			return -EFAULT;
+		return count;
+	}
+
+	/*
+	 * Which EVENT the tracee is stopped for, if any.
+	 *
+	 * The stop already reports a signal, and for the event stops that
+	 * signal is SIGTRAP -- indistinguishable from a breakpoint unless the
+	 * event code is asked for.  A debugger needs the distinction to follow
+	 * a fork, to notice a new thread, or to know that an exec has replaced
+	 * the program it was debugging.
+	 *
+	 * The value that came with it (a new child's or thread's pid) is
+	 * PTRACE_GETEVENTMSG; this is the code that says what the value means.
+	 */
+	case PT_GETEVENT: {
+		int event = t->ptrace_event;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return event;
+	}
+
+	/*
+	 * The tracee's executable, as an absolute path.  ADDR is the buffer,
+	 * DATA its size; the return value is the length copied, not counting
+	 * the terminator.  Zero means the task has never exec'd (a kernel
+	 * thread, or a child stopped at PTRACE_TRACEME before its exec) --
+	 * which is an answer, not an error.
+	 *
+	 * A debugger that ATTACHED has no other way to find the binary.  `comm'
+	 * is a basename and argv[0] is whatever the program was called with --
+	 * a login shell's is "-bash", which opens nothing -- so without this a
+	 * `gdb -p' session has no symbols, cannot place a breakpoint by name,
+	 * and cannot relocate a position-independent image.  Systems with a
+	 * per-process filesystem publish the same string as /proc/PID/exe.
+	 */
+	case PT_GETEXECPATH: {
+		char path[256];
+		size_t len = 0;
+
+		while (len < sizeof(path) - 1 && t->exe_path[len]) {
+			path[len] = t->exe_path[len];
+			len++;
+		}
+		path[len] = '\0';
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		if (len == 0)
+			return 0;
+		/* The terminator has to fit too: a caller given a truncated
+		 * path with no NUL would read past its own buffer. */
+		if (data < (uint64_t)len + 1)
+			return -ERANGE;
+		if (!validate_user_ptr(addr, len + 1))
+			return -EFAULT;
+		if (copy_to_user((void *)addr, path, len + 1) < 0)
+			return -EFAULT;
+		return (int64_t)len;
+	}
+
+	case PT_GETSIGINFO: {
+		siginfo_t si = t->ptrace_siginfo;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		if (!validate_user_ptr(addr, sizeof(si)))
+			return -EFAULT;
+		if (copy_to_user((void *)addr, &si, sizeof(si)) < 0)
+			return -EFAULT;
+		return 0;
+	}
+
+	case PT_GETDBREGS: {
+		uint64_t dbr[8];
+
+		dbr[0] = t->dr_addr[0];
+		dbr[1] = t->dr_addr[1];
+		dbr[2] = t->dr_addr[2];
+		dbr[3] = t->dr_addr[3];
+		/* 4 and 5 alias 6 and 7 on the hardware; reported as zero
+		 * rather than aliased, so nothing reads them by accident. */
+		dbr[4] = 0;
+		dbr[5] = 0;
+		dbr[6] = t->dr_status;
+		dbr[7] = t->dr_control;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		if (!validate_user_ptr(addr, sizeof(dbr)))
+			return -EFAULT;
+		if (copy_to_user((void *)addr, dbr, sizeof(dbr)) < 0)
+			return -EFAULT;
+		return 0;
+	}
+
+	case PT_SETDBREGS: {
+		uint64_t dbr[8];
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+		if (!validate_user_ptr(addr, sizeof(dbr)))
+			return -EFAULT;
+		if (copy_from_user(dbr, (const void *)addr, sizeof(dbr)) < 0)
+			return -EFAULT;
+
+		/* A watchpoint address is compared against every access the
+		 * processor makes, the kernel's own included, so an address
+		 * outside this task's own user space is refused outright
+		 * rather than trimmed.  Trimming would arm a watchpoint on
+		 * something the tracer did not ask for. */
+		for (int i = 0; i < 4; i++) {
+			if (dbr[i] == 0)
+				continue;
+			if (!validate_user_ptr(dbr[i], 1))
+				return -EINVAL;
+		}
+
+		uint64_t dr7 = ptrace_sanitize_dr7(dbr[7]);
+
+		/* Re-resolve: the lock was dropped for the copies above, which
+		 * can sleep, and the tracee could have gone in the meantime.
+		 * The access check runs again with it, per the rule that
+		 * permission is never cached across a request. */
+		t = ptrace_lock_tracee(cur, pid, &flags, &err);
+		if (!t)
+			return err;
+
+		for (int i = 0; i < 4; i++)
+			t->dr_addr[i] = dbr[i];
+		t->dr_control = dr7;
+		/* DR6 is the hardware's to report, not the tracer's to set;
+		 * accepting a value would let a debugger fake which watchpoint
+		 * fired.  Writing any DR6 clears the stale status instead. */
+		t->dr_status = 0;
+		t->dr_active = (dr7 & DR7_ENABLE_MASK) ? 1 : 0;
+
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return 0;
+	}
+
+	case PT_PEEKUSER:
+	case PT_POKEUSER:
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return -ENOSYS;
+
+	default:
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return -EINVAL;
+	}
+}
+
 static int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 			       uint64_t buf_ptr, uint64_t max_count)
 {
@@ -7936,9 +9830,12 @@ static int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 				kfree(kbuf);
 			return -ESRCH;
 		}
-		/* Checked against the task named, not the mm owner: they share
-		 * an address space, but the caller asked about this pid. */
-		perm = proc_read_permission(t);
+		/* Evaluated across the whole thread group rather than the one
+		 * thread named.  What is being handed out is the layout of an
+		 * address space every thread of the group shares, so the
+		 * weakest thread must not be the way in -- credentials here are
+		 * per-task, so they can differ between siblings (see cred.h). */
+		perm = task_may_access(t, ACCESS_READ);
 		if (perm != 0) {
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			if (kbuf)
@@ -8038,6 +9935,23 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 			continue;
 		}
 
+		/* Two tiers of visibility.
+		 *
+		 * Everything a process listing needs -- pid, parentage, state,
+		 * the program name, sizes -- is world-readable, because ps
+		 * showing every user's processes is how a shared machine is
+		 * meant to work, and none of it is private.
+		 *
+		 * The command line, the environment, the working directory and
+		 * the kernel address a task is blocked at are NOT.  An
+		 * environment routinely carries passwords, tokens and session
+		 * keys; a command line carries arguments meant for one user;
+		 * wchan is a kernel text address, which is an oracle for the
+		 * kernel's layout.  Those follow the same rule as the address
+		 * space itself (sys_getprocmaps), so one user cannot take them
+		 * from another. */
+		int may_read = (task_may_access(t, ACCESS_READ) == 0);
+
 		procinfo_t *p = &kbuf[count];
 		p->pid = t->id;
 		p->ppid = sched_get_ppid(t);
@@ -8066,8 +9980,11 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 		p->utime_ticks = t->utime_ticks;
 		p->stime_ticks = t->stime_ticks;
 		/* Only meaningful while the task is actually asleep; a running
-		 * task's last blocking site would be a stale answer. */
-		p->wchan = (t->state == TASK_BLOCKED) ? t->wchan_rip : 0;
+		 * task's last blocking site would be a stale answer.  Withheld
+		 * from callers who may not read the process: it is a kernel
+		 * text address. */
+		p->wchan = (may_read && t->state == TASK_BLOCKED) ? t->wchan_rip :
+								    0;
 
 		// Real and effective credentials of the process.
 		p->uid = (int)t->cred.uid;
@@ -8079,22 +9996,41 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 		p->vsz = 0;
 		p->rss = 0;
 		if (t->privilege == TASK_USER) {
+			/* Read through the mm owner, not the thread.  The
+			 * bookkeeping lives on the thread-group leader and a
+			 * thread's own copy is left empty, so asking the thread
+			 * reported every non-leader as having no address space
+			 * at all -- which is also what sys_getprocmaps does,
+			 * and the two disagreed. */
+			task_t *mm = task_mm_owner(t);
+
 			// Estimate from brk and mmap
-			if (t->brk > t->brk_start)
-				p->vsz += (t->brk - t->brk_start);
+			if (mm->brk > mm->brk_start)
+				p->vsz += (mm->brk - mm->brk_start);
 			// User stack (assume 2MB)
 			p->vsz += 2 * 1024 * 1024;
 			// mmap regions
-			for (uint32_t i = 0; i < t->mmap_capacity; i++) {
-				if (t->mmap_regions[i].in_use)
-					p->vsz += t->mmap_regions[i].length;
+			for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+				if (mm->mmap_regions[i].in_use)
+					p->vsz += mm->mmap_regions[i].length;
 			}
 			/* RSS: the pages actually resident, counted from the
 			 * page tables -- not VSZ restated, which is what this
 			 * used to report.  A process that returns physical
 			 * memory but keeps its address space looked like an
-			 * unbounded leak under the old number. */
-			p->rss = mm_count_resident_pages(t->pml4);
+			 * unbounded leak under the old number.
+			 *
+			 * KNOWN COST: this walks the page tables with
+			 * g_task_list_lock held and interrupts off, for a time
+			 * proportional to the process's resident set.  Moving
+			 * it outside the lock needs something to keep the
+			 * address space alive once the lock is dropped, and no
+			 * such reference exists yet -- doing it without one
+			 * would trade a long lock hold for a use-after-free on
+			 * the page tables, which is worse.  Left here
+			 * deliberately until address-space lifetime is
+			 * refcounted. */
+			p->rss = mm_count_resident_pages(mm->pml4);
 		}
 
 		// Copy comm
@@ -8102,20 +10038,26 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 			p->comm[i] = t->comm[i];
 		p->comm[255] = '\0';
 
-		// Copy cmdline
-		for (int i = 0; i < 1023 && t->cmdline[i]; i++)
-			p->cmdline[i] = t->cmdline[i];
-		p->cmdline[1023] = '\0';
+		/* Copy cmdline / environ / cwd only for a caller entitled to
+		 * read this process.  Left as the empty string otherwise, which
+		 * is what ps already shows for a task that has none -- no new
+		 * failure mode, and nothing leaks by omission. */
+		if (may_read) {
+			// Copy cmdline
+			for (int i = 0; i < 1023 && t->cmdline[i]; i++)
+				p->cmdline[i] = t->cmdline[i];
+			p->cmdline[1023] = '\0';
 
-		// Copy environ
-		for (int i = 0; i < 2047 && t->environ[i]; i++)
-			p->environ[i] = t->environ[i];
-		p->environ[2047] = '\0';
+			// Copy environ
+			for (int i = 0; i < 2047 && t->environ[i]; i++)
+				p->environ[i] = t->environ[i];
+			p->environ[2047] = '\0';
 
-		// Copy cwd
-		for (int i = 0; i < 255 && t->cwd[i]; i++)
-			p->cwd[i] = t->cwd[i];
-		p->cwd[255] = '\0';
+			// Copy cwd
+			for (int i = 0; i < 255 && t->cwd[i]; i++)
+				p->cwd[i] = t->cwd[i];
+			p->cwd[255] = '\0';
+		}
 
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
 		count++;
@@ -9286,6 +11228,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
 	case SYS_GETPROCMAPS:
 		return sys_getprocmaps(a1, a2, a3, a4);
+
+	case SYS_PTRACE:
+		return sys_ptrace(a1, a2, a3, a4);
 
 	case SYS_MEMSTATS: {
 		if (!a1)
@@ -10515,12 +12460,82 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 		cur->syscall_r13 = cpu->syscall_saved_user_r13;
 		cur->syscall_r14 = cpu->syscall_saved_user_r14;
 		cur->syscall_r15 = cpu->syscall_saved_user_r15;
+
+		/* The argument registers, from the frame syscall_entry left on
+		 * the kernel stack.  Copied here for the same reason as
+		 * everything above: the per-CPU slot describes whoever entered
+		 * a syscall on this CPU last, and once interrupts come back on
+		 * that may no longer be this task.
+		 *
+		 * Nothing else preserves these -- a syscall is allowed to
+		 * clobber them -- so without this a tracee stopped inside a
+		 * syscall has no arguments to show and no way to say so. */
+		const syscall_user_frame_t *uf =
+			(const syscall_user_frame_t *)cpu->syscall_user_frame;
+
+		if (uf) {
+			cur->syscall_rdi = uf->rdi;
+			cur->syscall_rsi = uf->rsi;
+			cur->syscall_rdx = uf->rdx;
+			cur->syscall_r8 = uf->r8;
+			cur->syscall_r9 = uf->r9;
+			cur->syscall_r10 = uf->r10;
+			cur->syscall_regs_valid = 1;
+			/* Kept as well as copied: the values above can be read
+			 * back, but only the frame itself can be CHANGED in a
+			 * way the return path will honour. */
+			cur->syscall_frame = (syscall_user_frame_t *)uf;
+		} else {
+			cur->syscall_regs_valid = 0;
+			cur->syscall_frame = NULL;
+		}
 	}
 
 	// NOW enable interrupts - per-CPU values are safely copied to task struct
 	__asm__ volatile("sti" ::: "memory");
 
+	/* Syscall-entry stop.
+	 *
+	 * After the register snapshot above, so a tracer inspecting the stop
+	 * sees the call's arguments; and after interrupts are back on, because
+	 * stopping means scheduling away.  A tracer may change the arguments
+	 * here -- that is the point of stopping before the work is done -- so
+	 * the values actually passed to the handler are re-read afterwards. */
+	if (cur && cur->tracer_pid != 0 && cur->ptrace_syscall_trace &&
+	    !cur->ptrace_in_syscall) {
+		cur->ptrace_in_syscall = 1;
+		task_ptrace_stop(cur, SIGTRAP, PTRACE_EVENT_SYSCALL_ENTRY, num);
+
+		/* Re-read: SETREGS during the stop is how a tracer redirects or
+		 * rewrites a call, and it writes the frame these came from. */
+		if (cur->syscall_frame) {
+			num = cur->syscall_frame->rax;
+			a1 = cur->syscall_frame->rdi;
+			a2 = cur->syscall_frame->rsi;
+			a3 = cur->syscall_frame->rdx;
+			a4 = cur->syscall_frame->r10;
+			a5 = cur->syscall_frame->r8;
+			a6 = cur->syscall_frame->r9;
+		}
+	}
+
 	int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5, a6);
+
+	/* Syscall-exit stop, with the return value already in place so a tracer
+	 * can read it -- and change it, which is the only way to make a syscall
+	 * appear to have failed or succeeded differently than it did. */
+	if (cur && cur->tracer_pid != 0 && cur->ptrace_syscall_trace &&
+	    cur->ptrace_in_syscall && !cur->has_exited) {
+		cur->ptrace_in_syscall = 0;
+		cur->syscall_rax = (uint64_t)ret;
+		if (cur->syscall_frame)
+			cur->syscall_frame->rax = (uint64_t)ret;
+
+		task_ptrace_stop(cur, SIGTRAP, PTRACE_EVENT_SYSCALL_EXIT, num);
+
+		if (cur->syscall_frame)
+			ret = (int64_t)cur->syscall_frame->rax;
+	}
 
 	/* Release the socket this syscall held, if it resolved one.  Here
 	 * rather than in each arm: the arms return from many places, and a
@@ -10546,6 +12561,15 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 	//     next task and we'll never return to userspace.
 	if (num != SYS_EXIT && num != SYS_RT_SIGRETURN) {
 		cur = sched_current(); // Re-fetch in case of fork
+
+		/* Park here if the process is in a trace stop.  Checked
+		 * independently of signal_pending: a thread with nothing
+		 * pending still has to stop when its process does. */
+		if (cur && cur->privilege == TASK_USER && !cur->has_exited &&
+		    cur->state != TASK_ZOMBIE && cur->ptrace_group_stop)
+			task_ptrace_group_park(cur);
+
+		cur = sched_current();
 		if (cur && cur->privilege == TASK_USER && !cur->has_exited &&
 		    cur->state != TASK_ZOMBIE && signal_pending(cur)) {
 			// Save syscall return value so sigreturn can restore it
@@ -10601,5 +12625,13 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 		 * its address space back. */
 		sched_exit_park();
 	}
+
+	/* The frame is about to be popped off the kernel stack, so stop
+	 * pointing at it.  Left set, it would name whatever the next syscall
+	 * puts at those addresses -- and a tracer that read or wrote registers
+	 * through it would be reading, or corrupting, an unrelated frame. */
+	if (cur)
+		cur->syscall_frame = NULL;
+
 	return ret;
 }

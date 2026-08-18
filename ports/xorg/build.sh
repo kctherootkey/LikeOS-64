@@ -261,6 +261,14 @@ pkg_opts() {
 	# stopped a build, and only at `make install', after everything real had
 	# already compiled.
 	libtasn1) echo "--disable-doc --disable-gtk-doc" ;;
+	mpfr)
+		# GMP is named explicitly rather than left to the include path:
+		# MPFR's configure links a probe against it, and if it resolves
+		# gmp.h from the sysroot while the link picks up the BUILD host's
+		# library the probe passes and the resulting library is subtly
+		# the wrong one.  --disable-doc for the reason libtasn1 has it.
+		echo "--disable-doc --with-gmp=$SYSROOT/usr"
+		;;
 	gnutls)
 		# p11-kit is smart-card and PKCS#11 support: another library, a
 		# module directory and a daemon, for hardware nothing here can

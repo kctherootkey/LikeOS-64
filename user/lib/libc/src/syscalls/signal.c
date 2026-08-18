@@ -201,7 +201,10 @@ int sigqueue(pid_t pid, int sig, const sigval_t value)
 	info.si_signo = sig;
 	info.si_code = SI_QUEUE;
 	info.si_pid = getpid();
-	info.si_value.si_value_ptr = value.sival_ptr;
+	/* si_ptr, not a si_value member: siginfo_t carries the union the kernel
+	 * defines, and the pointer arm is reached through the accessor both
+	 * headers declare. */
+	info.si_ptr = value.sival_ptr;
 
 	long ret = syscall3(SYS_RT_SIGQUEUEINFO, pid, sig, (long)&info);
 	if (ret < 0) {

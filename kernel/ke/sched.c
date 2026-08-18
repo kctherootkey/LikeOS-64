@@ -59,6 +59,74 @@ static inline void task_fpu_save(task_t *t)
 		__asm__ volatile("fxsave (%0)" : : "r"(t->fpu_state) : "memory");
 }
 
+/* ---- Hardware debug registers ----------------------------------------- *
+ *
+ * DR0-DR3 hold watchpoint addresses, DR7 says which are enabled and what each
+ * one watches, DR6 records which fired.  They are part of a task's context in
+ * the same way the FPU is, and are handed over at the same three switch points.
+ *
+ * Every access is guarded by dr_active because these are not ordinary moves:
+ * reading or writing a debug register is microcoded and costs on the order of a
+ * hundred cycles, and the overwhelming majority of tasks never set a watchpoint
+ * at all.  A switch between two such tasks must not touch them.
+ */
+
+static inline void task_debugreg_load(const task_t *t)
+{
+	__asm__ volatile("mov %0, %%dr0" : : "r"(t->dr_addr[0]));
+	__asm__ volatile("mov %0, %%dr1" : : "r"(t->dr_addr[1]));
+	__asm__ volatile("mov %0, %%dr2" : : "r"(t->dr_addr[2]));
+	__asm__ volatile("mov %0, %%dr3" : : "r"(t->dr_addr[3]));
+	/* DR6 is cleared, not restored: it says what fired most recently, and
+	 * the stale bits of a task resuming would be read as a fresh hit.  The
+	 * value the debugger wants is already saved in t->dr_status. */
+	__asm__ volatile("mov %0, %%dr6" : : "r"(0UL));
+	/* DR7 last -- it is the enable, so nothing is armed until the
+	 * addresses are in place. */
+	__asm__ volatile("mov %0, %%dr7" : : "r"(t->dr_control));
+}
+
+static inline void task_debugreg_disable(void)
+{
+	__asm__ volatile("mov %0, %%dr7" : : "r"(0UL));
+}
+
+void task_debugreg_switch(task_t *prev, task_t *next)
+{
+	int prev_on = (prev && prev->dr_active);
+	int next_on = (next && next->dr_active);
+
+	if (!prev_on && !next_on)
+		return; /* The common case, and it must stay free. */
+
+	if (next_on)
+		task_debugreg_load(next);
+	else
+		task_debugreg_disable();
+}
+
+void task_debugreg_clear(task_t *t)
+{
+	if (!t)
+		return;
+
+	t->dr_addr[0] = 0;
+	t->dr_addr[1] = 0;
+	t->dr_addr[2] = 0;
+	t->dr_addr[3] = 0;
+	t->dr_status = 0;
+	t->dr_control = 0;
+
+	if (!t->dr_active)
+		return;
+	t->dr_active = 0;
+
+	/* If this is the task on this CPU right now, the hardware is still
+	 * armed and clearing the saved copy alone would leave it that way. */
+	if (t == sched_current())
+		task_debugreg_disable();
+}
+
 void kernel_fpu_begin(void)
 {
 	task_t *t = sched_current();
@@ -182,6 +250,21 @@ int sched_alloc_task_id(void)
 	int id = __sync_fetch_and_add(&g_next_id, 1);
 	WARN_ON_ONCE(id <= 0); /* pid counter wrapped: too many tasks created */
 	return id;
+}
+
+/* Incarnation numbers, for links that outlive the task they point at.
+ *
+ * A pid on its own is not a safe way to name a task across time: it identifies
+ * a slot, not an occupant.  Pairing it with one of these makes a stale
+ * reference detectable -- the pid still resolves, but to something whose
+ * incarnation does not match, which is a definite "gone" rather than a silent
+ * wrong answer.  64-bit and monotonic, so it does not wrap in any real
+ * runtime; unlike the pid counter there is nothing to reclaim. */
+static uint64_t g_next_incarnation = 1;
+
+uint64_t task_next_incarnation(void)
+{
+	return __sync_fetch_and_add(&g_next_incarnation, 1);
 }
 
 // The /sbin/init task (PID 1).  Recorded when init is spawned; used to protect
@@ -1404,6 +1487,30 @@ static void task_init_common(task_t *t)
 		cred_init_root(&t->cred); // privileged kernel context
 		t->umask = 0022;
 	}
+	/* Dumpable until an execve raises this task's privileges through a
+	 * set-id bit.  A fresh task has executed nothing, so nothing has. */
+	t->dumpable = 1;
+
+	/* Untraced, and stamped with an incarnation so a later tracer link to
+	 * this pid can tell this task from whatever reuses the number. */
+	t->tracer_pid = 0;
+	t->tracer_incarnation = 0;
+	t->ptrace_options = 0;
+	t->ptrace_syscall_trace = 0;
+	t->ptrace_in_syscall = 0;
+	t->ptrace_stopped = 0;
+	t->ptrace_stop_signo = 0;
+	t->ptrace_event = 0;
+	t->ptrace_msg = 0;
+	t->ptrace_exiting = 0;
+	t->ptrace_notify_seq = 0;
+	/* No executable yet: a task that has not exec'd has no path to report,
+	 * and an uninitialised one would be handed to a debugger as a filename
+	 * to open. */
+	t->exe_path[0] = '\0';
+	t->syscall_regs_valid = 0;
+	t->syscall_frame = NULL;
+	t->incarnation = task_next_incarnation();
 	for (int i = 0; i < TASK_MAX_FDS; i++)
 		t->fd_table[i] = NULL;
 	t->brk_start = 0;
@@ -1920,9 +2027,12 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
-	/* Hand the FPU over with the rest of the context. */
+	/* Hand the FPU and the debug registers over with the rest of the
+	 * context.  A watchpoint belongs to the program being debugged, not to
+	 * the core it happens to be on. */
 	task_fpu_save(prev);
 	task_fpu_restore(next);
+	task_debugreg_switch(prev, next);
 	ctx_switch_asm(&prev->sp, next_sp);
 
 	// Resumed on the new task's stack.  Process the deferred zombie BEFORE
@@ -2110,9 +2220,12 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
-	/* Hand the FPU over with the rest of the context. */
+	/* Hand the FPU and the debug registers over with the rest of the
+	 * context.  A watchpoint belongs to the program being debugged, not to
+	 * the core it happens to be on. */
 	task_fpu_save(prev);
 	task_fpu_restore(next);
+	task_debugreg_switch(prev, next);
 	ctx_switch_asm(&prev->sp, next_sp);
 
 	// Resumed on the new task's stack.  Process the deferred zombie BEFORE
@@ -2994,6 +3107,43 @@ task_t *sched_fork_current(void)
 	mm_rwsem_init(&child->mmap_lock, "mmap_lock");
 	child->mm_rdepth = 0;
 
+	/* A new task, and a new occupant of its pid: stamp it so a tracer link
+	 * naming the parent cannot be mistaken for one naming the child. */
+	child->incarnation = task_next_incarnation();
+
+	/* The child of a traced process is NOT itself traced.  The copy above
+	 * duplicated the parent's tracer link, which would have handed the
+	 * debugger a second tracee it never asked for and never stops for --
+	 * the child would park in a trace stop that nobody collects.  Tracing
+	 * a fork is opt-in (PTRACE_O_TRACEFORK) and is arranged deliberately by
+	 * whoever set the option, not inherited by accident. */
+	child->tracer_pid = 0;
+	child->tracer_incarnation = 0;
+	/* Nor the parent's watchpoints.  They are armed on behalf of a tracer
+	 * that does not know this child exists, and a debug register left set
+	 * here would trap a process nobody is watching -- a SIGTRAP whose
+	 * default action kills it. */
+	child->dr_addr[0] = 0;
+	child->dr_addr[1] = 0;
+	child->dr_addr[2] = 0;
+	child->dr_addr[3] = 0;
+	child->dr_status = 0;
+	child->dr_control = 0;
+	child->dr_active = 0;
+	child->ptrace_options = 0;
+	child->ptrace_syscall_trace = 0;
+	child->ptrace_in_syscall = 0;
+	child->ptrace_stopped = 0;
+	child->ptrace_stop_signo = 0;
+	child->ptrace_sig_delivery = 0;
+	child->ptrace_signal_injected = 0;
+	child->ptrace_event = 0;
+	child->ptrace_msg = 0;
+	child->ptrace_exiting = 0;
+	child->ptrace_notify_seq = 0;
+	child->syscall_regs_valid = 0;
+	child->syscall_frame = NULL;
+
 	/* Fresh kernel-stack canary: the wholesale copy above duplicated the
 	 * parent's.  The child's kernel context is only the hand-built
 	 * fork_child_return frame (no live C frames carry the old value), so
@@ -3535,6 +3685,556 @@ void sched_wake_wait_sleepers(task_t *proc)
 	}
 }
 
+/* ---- Tracing (ptrace) ------------------------------------------------------
+ *
+ * A tracee stores its tracer as (pid, incarnation) rather than as a pointer;
+ * see the fields in struct task.  Everything below resolves that pair afresh,
+ * which is what keeps a tracer that exited from being followed into freed
+ * memory -- and this is followed from the signal paths, where a fault cannot
+ * be recovered from. */
+
+task_t *task_tracer_locked(task_t *t)
+{
+	if (!t || t->tracer_pid == 0)
+		return NULL;
+
+	task_t *tracer = sched_find_task_by_id_locked((uint32_t)t->tracer_pid);
+
+	/* The pid resolving is not enough: it names a slot, and the task in it
+	 * may be a different one from the tracer that attached.  The
+	 * incarnation is what tells those apart. */
+	if (!tracer || tracer->incarnation != t->tracer_incarnation ||
+	    tracer->has_exited) {
+		/* Tracer is gone.  Drop the link so the tracee stops being
+		 * treated as traced -- otherwise it would keep stopping for a
+		 * tracer that will never collect the event, which is a hang
+		 * with no way out. */
+		t->tracer_pid = 0;
+		t->tracer_incarnation = 0;
+		return NULL;
+	}
+	return tracer;
+}
+
+bool task_traced_by_unprivileged(task_t *t)
+{
+	uint64_t flags;
+	bool unpriv = false;
+
+	if (!t || t->tracer_pid == 0)
+		return false;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		task_t *tracer = task_tracer_locked(t);
+		/* Privilege is the TRACER's, not the tracee's: the question is
+		 * whose hands the new identity would end up in. */
+		if (tracer && tracer->cred.euid != 0)
+			unpriv = true;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	return unpriv;
+}
+
+/*
+ * Park `t' in a signal-delivery-stop and return what the tracer decided.
+ *
+ * This is the hinge a debugger hangs on.  A signal that a traced process is
+ * about to act on stops it first and tells the tracer, which then chooses: pass
+ * the signal through, replace it with another, or drop it.  Without this step a
+ * SIGSEGV runs its default action and the process is gone before the debugger
+ * hears anything -- which is exactly what a debugger exists to prevent.
+ *
+ * SIGKILL is excluded because it cannot be stopped for, held, or refused by
+ * anything, a tracer included; that is what makes it the signal of last resort.
+ *
+ * The caller is parked here, so this belongs only where sleeping is allowed.
+ */
+/*
+ * Stop every OTHER thread of this task's process.
+ *
+ * A debugger stops a process, not a thread.  Leaving the siblings running
+ * means `continue' restarts one thread while the others never stopped, a
+ * backtrace of a sibling reads a stack that is moving under it, and a
+ * watchpoint armed on one thread's behalf trips on another's write with no
+ * stop to report it against.  Every other system stops the whole process here;
+ * some do it in the kernel and some in the debugger, and doing it in the
+ * kernel is both simpler and race-free.
+ *
+ * The siblings are marked rather than parked from here: a task can only be
+ * parked in its OWN context, at a point where it is safe to sleep.  The mark
+ * is acted on at each one's next return to user (task_ptrace_group_park), and
+ * they are woken so that they reach one promptly -- a thread blocked in a
+ * read() would otherwise keep the process "running" for as long as its peer
+ * stayed quiet.
+ *
+ * Only the thread that hit the event carries a stop signal, so waitpid reports
+ * the stop once rather than once per thread.
+ */
+void task_ptrace_group_stop_siblings(task_t *t)
+{
+	task_t *leader;
+	task_t *w;
+	int guard = 0;
+
+	if (!t || t->tracer_pid == 0)
+		return;
+
+	leader = t->group_leader ? t->group_leader : t;
+	if (!task_ptr_ok(leader))
+		return;
+
+	w = leader;
+	do {
+		if (w != t && !w->has_exited && w->privilege != TASK_KERNEL &&
+		    !w->ptrace_exiting && !w->ptrace_stopped) {
+			/* Stopped HERE, not asked to stop itself later.
+			 *
+			 * Marking a thread and waiting for it to park at its
+			 * next return to user does not work for the threads
+			 * that matter most: one blocked in futex_wait is woken,
+			 * finds no SIGNAL pending -- a group stop is not one --
+			 * and blocks again without ever reaching user mode.  It
+			 * never parks, so the debugger is told the process
+			 * stopped and then finds a live thread whose registers
+			 * it cannot read: "Couldn't get registers: No such
+			 * process" for a thread sitting plainly in the list.
+			 *
+			 * Stopping it in place is what SIGSTOP already does to
+			 * a task that is not the caller, a few lines above:
+			 * take it off its run queue and mark it stopped.  Its
+			 * registers are in the frame it entered the kernel
+			 * with, which is what PTRACE_GETREGS reads.
+			 *
+			 * ptrace_stop_signo stays 0: this thread has no event
+			 * of its own, so waitpid reports the stop once, for the
+			 * thread that caused it. */
+			w->ptrace_group_stop = 0;
+			w->ptrace_stopped = 1;
+			w->ptrace_stop_signo = 0;
+			if (w->on_rq)
+				rq_remove(w);
+			w->state = TASK_STOPPED;
+		}
+		w = w->thread_group_next;
+		if (!task_ptr_ok(w) || ++guard > TASK_GROUP_KILL_MAX * 4) {
+			WARN_ON_ONCE(1);
+			break;
+		}
+	} while (w != leader);
+}
+
+/*
+ * Release every thread of this task's process from a trace stop.
+ *
+ * The counterpart of the above: a resume applies to the process.  Resuming
+ * only the thread the debugger named would leave the rest parked with nothing
+ * to release them -- they carry no event, so no waitpid reports them and no
+ * PTRACE_CONT is ever aimed at them.
+ */
+void task_ptrace_group_resume(task_t *t)
+{
+	task_t *leader;
+	task_t *w;
+	int guard = 0;
+
+	if (!t)
+		return;
+
+	leader = t->group_leader ? t->group_leader : t;
+	if (!task_ptr_ok(leader))
+		return;
+
+	w = leader;
+	do {
+		if (w != t && !w->has_exited) {
+			w->ptrace_group_stop = 0;
+			if (w->ptrace_stopped && w->ptrace_stop_signo == 0) {
+				/* Parked silently by the group stop, so it has
+				 * no event of its own to collect: just let it
+				 * go.  A sibling holding a real event keeps it
+				 * -- the debugger has not been told yet. */
+				w->ptrace_stopped = 0;
+				if (sched_claim_wake(w, TASK_STOPPED))
+					sched_enqueue_ready(w);
+			}
+		}
+		w = w->thread_group_next;
+		if (!task_ptr_ok(w) || ++guard > TASK_GROUP_KILL_MAX * 4) {
+			WARN_ON_ONCE(1);
+			break;
+		}
+	} while (w != leader);
+}
+
+/*
+ * Park here if this task's process is in a trace stop.
+ *
+ * Called on the way back to user mode, which is the only place a task can be
+ * parked safely.  Silent: no event is recorded, so the debugger's waitpid
+ * still reports exactly one stop for the process -- the one that caused it.
+ */
+void task_ptrace_group_park(task_t *t)
+{
+	uint64_t flags;
+
+	if (!t || !t->ptrace_group_stop || t->tracer_pid == 0)
+		return;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	if (!t->ptrace_group_stop || t->tracer_pid == 0) {
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		return;
+	}
+	t->ptrace_group_stop = 0;
+	t->ptrace_stopped = 1;
+	t->ptrace_stop_signo = 0; /* nothing to report: not this thread's event */
+	if (t->on_rq)
+		rq_remove(t);
+	t->state = TASK_STOPPED;
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	if (t == sched_current())
+		sched_schedule();
+}
+
+int task_ptrace_signal_stop(task_t *t, int signo, const siginfo_t *info)
+{
+	if (!t || t->tracer_pid == 0 || signo <= 0)
+		return signo;
+	if (signo == SIGKILL)
+		return signo;
+
+	/* Already reported gone.  The tracer has dropped this thread; a stop
+	 * now would be attributed to something it no longer has. */
+	if (t->ptrace_exiting)
+		return signo;
+
+	/* A signal the tracer asked for itself goes straight through.
+	 *
+	 * This is the loop-breaker.  PTRACE_CONT's signal argument is sent as
+	 * an ordinary signal -- the same path that worked before any of this
+	 * existed -- so without this flag the tracee would arrive here holding
+	 * the very signal its tracer just asked to deliver, stop to ask about
+	 * it, be told to deliver it again, and never get anywhere. */
+	if (t->ptrace_signal_injected) {
+		t->ptrace_signal_injected = 0;
+		return signo;
+	}
+
+	/* Recorded before parking, so a tracer that reads it the moment it is
+	 * told about the stop sees this signal's siginfo and not the previous
+	 * one's. */
+	if (info)
+		mm_memcpy(&t->ptrace_siginfo, info, sizeof(t->ptrace_siginfo));
+
+	/* The process stops, not just this thread. */
+	task_ptrace_group_stop_siblings(t);
+
+	t->ptrace_sig_delivery = 1;
+	task_ptrace_stop(t, signo, 0, 0);
+	t->ptrace_sig_delivery = 0;
+
+
+	/* The signal that caused the stop is dropped.  A tracer that wanted it
+	 * delivered said so with PTRACE_CONT's signal argument, and that
+	 * arrives separately, queued afresh and marked as injected above --
+	 * which is why nothing needs to be carried back out of the stop. */
+	return 0;
+}
+
+void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
+{
+	uint64_t flags;
+	task_t *tracer_proc = NULL;
+
+	if (!t)
+		return;
+
+	/* Once the exit event has been reported this task is on its way out and
+	 * has nothing left to stop for -- see ptrace_exiting in struct task.
+	 * The exit event itself is what sets the flag, so it is the one event
+	 * allowed through. */
+	if (t->ptrace_exiting && event != PTRACE_EVENT_EXIT)
+		return;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		task_t *tracer = task_tracer_locked(t);
+		if (tracer) {
+			/* Recorded before the task is parked so a tracer that
+			 * is deciding whether to sleep right now either sees
+			 * the event and stays awake, or is already asleep and
+			 * gets the wake below -- the same ordering the exit and
+			 * job-control notifications rely on, and for the same
+			 * reason: neither has anything to fall back on if the
+			 * wake is lost. */
+			t->ptrace_stop_signo = signo;
+			t->ptrace_event = event;
+			t->ptrace_msg = msg;
+			t->ptrace_stopped = 1;
+			/* Bumped before the wake below, so a tracer that is
+			 * deciding whether to sleep sees that something
+			 * happened even if it has not marked itself blocked
+			 * yet.  See ptrace_notify_seq in struct task. */
+			tracer->ptrace_notify_seq++;
+			tracer_proc = tracer;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	if (!tracer_proc) {
+		/* Untraced, or the tracer vanished between the caller's check
+		 * and here.  Nothing to stop for. */
+		return;
+	}
+
+	/* Every trace stop stops the process, not just this thread -- a
+	 * breakpoint, a completed step and an exec event all mean "the program
+	 * has stopped" to a debugger.  Harmless when called twice: the mark is
+	 * only set on siblings that are still running. */
+	task_ptrace_group_stop_siblings(t);
+
+
+	/* Tell the tracer.  CLD_TRAPPED is what distinguishes this from the
+	 * job-control stop a shell would see. */
+	{
+		siginfo_t ci;
+		mm_memset(&ci, 0, sizeof(ci));
+		ci.si_signo = SIGCHLD;
+		ci.si_code = CLD_TRAPPED;
+		ci.si_pid = t->id;
+		ci.si_status = signo;
+		signal_send(tracer_proc, SIGCHLD, &ci);
+	}
+	sched_wake_wait_sleepers(tracer_proc);
+
+	/* Park.  TASK_STOPPED is the same state job control uses -- proven
+	 * machinery, and a tracee that is stopped is stopped regardless of who
+	 * stopped it.  ptrace_stopped is what says which kind of event this is,
+	 * so a tracer and a shell cannot consume each other's. */
+	if (t->on_rq)
+		rq_remove(t);
+	t->state = TASK_STOPPED;
+	if (t == sched_current())
+		sched_schedule();
+}
+
+void task_ptrace_detach(task_t *t)
+{
+	bool resume = false;
+
+	if (!t)
+		return;
+
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		t->tracer_pid = 0;
+		t->tracer_incarnation = 0;
+		t->ptrace_options = 0;
+		t->ptrace_syscall_trace = 0;
+		t->ptrace_in_syscall = 0;
+		t->ptrace_event = 0;
+		t->ptrace_msg = 0;
+		if (t->ptrace_stopped) {
+			t->ptrace_stopped = 0;
+			t->ptrace_stop_signo = 0;
+			resume = true;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	/* A tracee parked in a trace stop has nobody left to resume it, so
+	 * detaching has to.  Leaving it stopped would be a process that can
+	 * never run again and that no shell knows to continue. */
+	if (resume && sched_claim_wake(t, TASK_STOPPED))
+		sched_enqueue_ready(t);
+
+	/* And the REST of its process, unconditionally.
+	 *
+	 * Every trace stop stops the whole thread group, and the siblings are
+	 * parked silently -- no event, no stop signal -- so the only thing that
+	 * ever releases them is a resume aimed at the group.  A detach that
+	 * released just the thread it named left the others in TASK_STOPPED
+	 * with the tracer gone: threads that can never run again, in a process
+	 * that looks alive.  Seen directly in `ps' as a detached process with
+	 * one thread S and the next T.
+	 *
+	 * Done whether or not THIS thread was the one parked, because it is the
+	 * group's state that matters and the caller may have detached from any
+	 * member of it. */
+	task_ptrace_group_resume(t);
+}
+
+/*
+ * Tell a tracer that one of its tracees has died.
+ *
+ * The parent of a dying task is told by sched_notify_parent_of_exit(); a
+ * tracer that ATTACHED is not the parent, and nothing told it anything.  So a
+ * debugger waiting on a process it attached to slept through that process
+ * exiting: the event it was waiting for had happened, the task was a zombie
+ * on the list, and the wake went to somebody else.
+ *
+ * Skipped when the tracer IS the parent -- that is the fork+TRACEME case, and
+ * the parent notification already covers it; doing both would wake it twice
+ * for one death.
+ */
+static void task_ptrace_notify_tracer_of_exit(task_t *t)
+{
+	uint64_t flags;
+	task_t *tracer_proc = NULL;
+
+	if (!t || t->tracer_pid == 0)
+		return;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		task_t *tracer = task_tracer_locked(t);
+
+		if (tracer && tracer != t->parent) {
+			/* Bumped before the wake, exactly as a trace stop does
+			 * it and for the same reason: a tracer that has not yet
+			 * marked itself BLOCKED must still see that something
+			 * happened when it decides whether to sleep. */
+			tracer->ptrace_notify_seq++;
+			tracer_proc = tracer;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	if (!tracer_proc)
+		return;
+
+	{
+		siginfo_t ci;
+
+		mm_memset(&ci, 0, sizeof(ci));
+		ci.si_signo = SIGCHLD;
+		ci.si_code = t->term_sig != 0 ? CLD_KILLED : CLD_EXITED;
+		ci.si_pid = t->id;
+		ci.si_status = t->term_sig != 0 ? t->term_sig : t->exit_code;
+		signal_send(tracer_proc, SIGCHLD, &ci);
+	}
+	sched_wake_wait_sleepers(tracer_proc);
+}
+
+/* Does `tracer' have any tracee matching the selector?  A pure question: it
+ * consumes nothing.  waitpid needs it to tell "nothing ready yet" (sleep) from
+ * "nothing to wait for" (ECHILD), and answering that by attempting a reap
+ * would throw away the very event it was asking about. */
+static int task_tracee_matches(task_t *tracer, task_t *t, int64_t pid_sel)
+{
+	if (t->tracer_pid != (int)tracer->id ||
+	    t->tracer_incarnation != tracer->incarnation)
+		return 0;
+
+	/* Same pid selector waitpid() applies to children:
+	 *   > 0   that one    == 0  the caller's process group
+	 *   == -1 any         < -1  process group -pid            */
+	if (pid_sel > 0 && t->id != (uint32_t)pid_sel)
+		return 0;
+	if (pid_sel == 0 && t->pgid != tracer->pgid)
+		return 0;
+	if (pid_sel < -1 && t->pgid != (int)(-pid_sel))
+		return 0;
+	return 1;
+}
+
+int task_has_tracees(task_t *tracer, int64_t pid_sel)
+{
+	uint64_t flags;
+	int found = 0;
+
+	if (!tracer)
+		return 0;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		if (task_tracee_matches(tracer, t, pid_sel)) {
+			found = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	return found;
+}
+
+int task_reap_trace_stop(task_t *tracer, int64_t pid_sel, int *status)
+{
+	uint64_t flags;
+	int found_pid = 0;
+
+	if (!tracer)
+		return 0;
+
+	/* The whole job is done under the lock and only plain values come back
+	 * out.  Returning the task_t instead would hand the caller a pointer
+	 * whose target can be reaped before it is read -- the same trap
+	 * sched_find_task_by_id() sets, and there is no reason to set it
+	 * again here. */
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		if (!task_tracee_matches(tracer, t, pid_sel))
+			continue;
+
+		/* A tracee that has DIED, and is not this tracer's child.
+		 *
+		 * A debugger that ATTACHED is not the parent of what it traces,
+		 * so nothing on the child list ever describes it: the tracee
+		 * ran to completion and the tracer sat in waitpid for an event
+		 * that could not arrive, with no prompt, for ever.  Reported
+		 * here, in the conventional encoding, because this scan is the
+		 * only one that knows about tracees at all.
+		 *
+		 * NOT reaped -- the zombie belongs to the real parent and only
+		 * it may collect the status.  The trace link is dropped instead
+		 * so the death is reported exactly once and the tracer then
+		 * gets the honest ECHILD.
+		 *
+		 * A traced CHILD is skipped: the child-list scan owns that one
+		 * and actually reaps it, and reporting it from both places
+		 * would leave a zombie nobody collects. */
+		if (t->has_exited) {
+			if (t->parent == tracer)
+				continue;
+			if (status) {
+				if (t->term_sig != 0)
+					*status = t->term_sig & 0x7F;
+				else
+					*status = (t->exit_code & 0xFF) << 8;
+			}
+			t->tracer_pid = 0;
+			t->tracer_incarnation = 0;
+			found_pid = (int)t->id;
+			break;
+		}
+
+		if (!t->ptrace_stopped || t->ptrace_stop_signo == 0)
+			continue;
+
+		/* Conventional stopped encoding, with the event code in the
+		 * high bits so a tracer can tell a plain signal-delivery stop
+		 * from an exec/fork/exit event. */
+		if (status)
+			*status = ((t->ptrace_event & 0xFF) << 16) |
+				  ((t->ptrace_stop_signo & 0xFF) << 8) | 0x7F;
+
+		/* Cleared as it is collected, exactly like jc_stop_signo: the
+		 * event has been reported once and must not be reported twice.
+		 * ptrace_stopped stays set -- the tracee is still parked, and
+		 * only a resume request clears that. */
+		t->ptrace_stop_signo = 0;
+		found_pid = (int)t->id;
+		break;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	return found_pid;
+}
+
 void sched_notify_parent_of_exit(task_t *task)
 {
 	if (!task || task->exit_signal == 0)
@@ -3736,6 +4436,36 @@ void sched_mark_task_exited(task_t *task, int status)
 	// futex_wake calls and cause deadlocks.
 	futex_cleanup_task(task);
 
+	/* Release anything this task was tracing.
+	 *
+	 * A tracee parked in a trace stop is waiting for a resume that is now
+	 * never coming: it is off every run queue, and no shell knows to
+	 * continue it, so without this it is a process that can never run
+	 * again.  task_tracer_locked() clears a dead tracer's link lazily, but
+	 * that only helps a tracee that still runs -- a parked one never
+	 * reaches any code that would call it.
+	 *
+	 * Collected under the lock and detached outside it: task_ptrace_detach
+	 * takes the same lock, and it also enqueues, which must not happen with
+	 * the task list held. */
+	if (task->privilege == TASK_USER) {
+		task_t *tracees[TASK_GROUP_KILL_MAX];
+		int nt = 0;
+		uint64_t tflags;
+
+		spin_lock_irqsave(&g_task_list_lock, &tflags);
+		for (task_t *t = g_task_list_head; t; t = t->next) {
+			if (t->tracer_pid == (int)task->id &&
+			    t->tracer_incarnation == task->incarnation &&
+			    nt < TASK_GROUP_KILL_MAX)
+				tracees[nt++] = t;
+		}
+		spin_unlock_irqrestore(&g_task_list_lock, tflags);
+
+		for (int i = 0; i < nt; i++)
+			task_ptrace_detach(tracees[i]);
+	}
+
 	// Remove from thread group
 	thread_group_remove(task);
 
@@ -3867,6 +4597,17 @@ void sched_mark_task_exited(task_t *task, int status)
 	 * A thread-group LEADER whose threads have not all gone yet is not
 	 * finished, so should_notify_parent is false here; the last thread to
 	 * leave calls this for it. */
+	/* The TRACER first, when that is somebody other than the parent.
+	 *
+	 * Told unconditionally, not only when the parent is: a thread's death
+	 * is not a process exit and notifies no parent at all, but it is
+	 * exactly what a debugger is waiting to hear.
+	 *
+	 * Before the parent, because telling the parent can wake a waitpid()
+	 * that reaps this very task on another CPU -- and everything below
+	 * reads it. */
+	task_ptrace_notify_tracer_of_exit(task);
+
 	if (should_notify_parent)
 		sched_notify_parent_of_exit(task);
 }
@@ -3913,6 +4654,16 @@ void sched_signal_task(task_t *task, int sig)
 			// crash handler's abandoned frame): exit in place.
 			task->exit_code = 128 + sig;
 			task->term_sig = sig;
+			/* The whole process, not just this thread.  A fatal
+			 * signal ends a PROCESS; ending only the thread that
+			 * took it leaves a zombie leader with live threads
+			 * behind it, and a zombie leader whose nr_threads
+			 * never reaches zero is never reported to its parent
+			 * -- so the shell that started it waits for ever.
+			 * See the note in signal_select(), which is where the
+			 * same thing is done for a signal that arrives through
+			 * the delivery loop rather than through here. */
+			sched_kill_thread_group(task, 128 + sig);
 			sched_mark_task_exited(task, 128 + sig);
 			// On SMP, do NOT call sched_schedule() here - the exception handler will
 			// loop with 'sti; hlt' and the timer will safely preempt us. Calling
@@ -3962,6 +4713,21 @@ void sched_signal_task(task_t *task, int sig)
 	}
 
 	if (sig == SIGSTOP) {
+		/* A traced task stops for its TRACER, not for job control.
+		 *
+		 * Both end in TASK_STOPPED -- deliberately, because a stopped
+		 * task is stopped whoever stopped it, and the job-control path
+		 * is proven.  What differs is who is told and who may resume:
+		 * a trace stop reports through waitpid with CLD_TRAPPED to the
+		 * tracer and is released by PTRACE_CONT, a job-control stop
+		 * reports to the parent's shell and is released by SIGCONT.
+		 * Routing an attach's SIGSTOP into the job-control path instead
+		 * would leave the tracer waiting for an event that was handed
+		 * to somebody else. */
+		if (task->tracer_pid != 0) {
+			task_ptrace_stop(task, SIGSTOP, 0, 0);
+			return;
+		}
 		if (task->on_rq)
 			rq_remove(task);
 		task->state = TASK_STOPPED;
@@ -4024,11 +4790,43 @@ void sched_signal_task(task_t *task, int sig)
 	switch (def_action) {
 	case SIG_DFL_TERM:
 	case SIG_DFL_CORE:
+		/* A traced task does not die here.
+		 *
+		 * This branch is the fast path for a task signalling ITSELF --
+		 * raise(), abort(), kill(getpid(), ...) -- and it exits in
+		 * place without going anywhere near the delivery path.  For a
+		 * tracee that is the one thing that must not happen: a
+		 * debugger is entitled to see the signal and decide, and a
+		 * process that dies inside kill() is gone before its tracer
+		 * hears anything.  abort() under a debugger is the case that
+		 * matters, and it took this path.
+		 *
+		 * The signal is already queued (signal_send, above), so
+		 * leaving it alone is the whole fix: the task is running, so
+		 * its next return to user is immediate, and the delivery loop
+		 * there stops for the tracer first.  Signals from anywhere
+		 * else already queue and wake, and were never affected. */
+		if (task->tracer_pid != 0 && task == sched_current())
+			break;
+
 		if (task == sched_current()) {
 			// Own context at a safe delivery point: no kernel
 			// locks are held here, immediate exit is safe.
 			task->exit_code = 128 + sig;
 			task->term_sig = sig;
+			/* The whole process.  This is the path abort() and
+			 * raise() take -- kill(getpid(), SIGABRT) with the
+			 * default disposition -- and it was ending one thread
+			 * of the group.  A threaded program that aborted was
+			 * therefore not a program that died: its leader became
+			 * a zombie, its other threads went on sleeping in
+			 * whatever they were blocked in, and because the
+			 * leader is only reported to its parent once the last
+			 * thread has gone, the waitpid() that started it never
+			 * returned.  gdb did exactly this and took its own
+			 * terminal with it -- eight DWARF worker threads left
+			 * parked in futex_wait, no message, no prompt. */
+			sched_kill_thread_group(task, 128 + sig);
 			sched_mark_task_exited(task, 128 + sig);
 			// On SMP, let timer preemption switch us off this
 			// stack.  On single-CPU, schedule immediately.
@@ -4126,10 +4924,42 @@ static int pgrp_collect_targets(int pgid, task_t **out, int max)
 	spin_lock_irqsave(&g_task_list_lock, &flags);
 	int count = 0;
 	for (task_t *t = g_task_list_head; t && count < max; t = t->next) {
-		if (t->pgid == pgid && t->state != TASK_ZOMBIE &&
-		    t->privilege != TASK_KERNEL) {
-			out[count++] = t;
+		if (t->pgid != pgid || t->state == TASK_ZOMBIE ||
+		    t->privilege == TASK_KERNEL)
+			continue;
+
+		/* ONE task per process, not one per thread.
+		 *
+		 * Every thread of a process carries the same pgid, so taking
+		 * every match sent ^C to each thread separately: a program
+		 * with four threads got four SIGINTs, and under a debugger,
+		 * four stops in a row.  A signal sent to a process group is
+		 * delivered to each PROCESS once -- which thread handles it is
+		 * the kernel's business, and the leader is the one every other
+		 * part of this system already names.
+		 *
+		 * A thread group whose leader has exited but whose threads
+		 * live on still needs the signal, so the first surviving
+		 * member stands in for it. */
+		task_t *leader = t->group_leader ? t->group_leader : t;
+		int already = 0;
+
+		for (int i = 0; i < count; i++) {
+			task_t *o = out[i];
+			task_t *ol = o->group_leader ? o->group_leader : o;
+
+			if (ol == leader) {
+				already = 1;
+				break;
+			}
 		}
+		if (already)
+			continue;
+
+		out[count++] = (task_ptr_ok(leader) && !leader->has_exited &&
+				leader->state != TASK_ZOMBIE) ?
+				       leader :
+				       t;
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
 	return count;
@@ -4141,6 +4971,53 @@ static int pgrp_collect_targets(int pgid, task_t **out, int max)
  * the tty driver runs is not the sender, so a credential check here would be
  * meaningless as well as wrong.  A signal a user process asked for goes through
  * sched_signal_pgrp_checked() instead. */
+/*
+ * Does process group `pgid' belong to session `sid'?
+ *
+ * The question tcsetpgrp(3) has to ask.  A terminal's foreground group must be
+ * a group in the terminal's OWN session; pointing it at a group from another
+ * session hands the terminal to processes that cannot use it and takes it away
+ * from the ones that can -- Ctrl-C then goes to a program on a different
+ * terminal, and everything still on this one is a background job that stops
+ * the moment it reads.
+ *
+ * Three answers rather than two, deliberately.  A caller must be able to
+ * distinguish "wrong session" -- which is an error -- from "no such group",
+ * which this kernel cannot always tell apart from bookkeeping it has not
+ * finished (a group whose members have all exited, a session id not yet
+ * recorded).  Refusing on the second would break job control everywhere for
+ * the sake of a check that is only meant to catch the first.
+ *
+ *    1  the group exists and has a member in this session
+ *    0  no live member of that group was found at all
+ *   -1  the group exists, and every member of it is in another session
+ */
+int sched_pgrp_in_session(int pgid, int sid)
+{
+	uint64_t flags;
+	int found_any = 0;
+	int found_here = 0;
+
+	if (pgid <= 0 || sid <= 0)
+		return 0;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		if (t->has_exited || t->pgid != pgid)
+			continue;
+		found_any = 1;
+		if (t->sid == sid) {
+			found_here = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	if (found_here)
+		return 1;
+	return found_any ? -1 : 0;
+}
+
 void sched_signal_pgrp(int pgid, int sig)
 {
 	if (pgid <= 0)
@@ -4548,9 +5425,12 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
-	/* Hand the FPU over with the rest of the context. */
+	/* Hand the FPU and the debug registers over with the rest of the
+	 * context.  A watchpoint belongs to the program being debugged, not to
+	 * the core it happens to be on. */
 	task_fpu_save(prev);
 	task_fpu_restore(next);
+	task_debugreg_switch(prev, next);
 	ctx_switch_asm(&prev->sp, next_sp);
 
 	// Resumed from timer preemption. IF is left at 0 — the interrupt
@@ -5494,6 +6374,26 @@ uint32_t task_set_umask(task_t *t, uint32_t mask)
 	old = o->umask & 0777;
 	o->umask = mask & 0777;
 	return old;
+}
+
+/* Dumpability belongs to the PROCESS for the same reason the umask does, and
+ * one more: what it protects is the address space, and every thread of a
+ * process shares that.  A per-thread answer would let a caller pick the
+ * thread that says yes.  Resolved through the same leader lookup. */
+int task_dumpable(task_t *t)
+{
+	task_t *o = task_umask_owner(t);
+	/* Default to dumpable: a task with no leader yet is early boot, and
+	 * nothing has raised its privileges. */
+	return o ? (o->dumpable != 0) : 1;
+}
+
+void task_set_dumpable(task_t *t, int dumpable)
+{
+	task_t *o = task_umask_owner(t);
+
+	if (o)
+		o->dumpable = dumpable ? 1u : 0u;
 }
 
 void sched_get_loadavg(unsigned long loads[3])

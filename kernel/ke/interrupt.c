@@ -410,7 +410,25 @@ void idt_init()
 	idt_set_entry(0, (uint64_t)isr0, 0x08, 0x8E);
 	idt_set_entry(1, (uint64_t)isr1, 0x08, 0x8E);
 	idt_set_entry_ist(2, (uint64_t)isr2, 0x08, 0x8E, 2); // NMI -> IST2
-	idt_set_entry(3, (uint64_t)isr3, 0x08, 0x8E);
+	/* Breakpoint (int3) is reachable FROM USER MODE, so its gate is DPL 3
+	 * (0xEE) rather than DPL 0 like every other entry here.
+	 *
+	 * For a software interrupt the processor compares the gate's privilege
+	 * level against the caller's and raises a general-protection fault
+	 * instead of dispatching when the gate is more privileged.  With a DPL
+	 * of 0 a user-mode int3 therefore did not trap at all: it came through
+	 * as #GP, was reported as SIGSEGV, and killed the process -- which is
+	 * precisely what a planted breakpoint looks like when a debugger runs a
+	 * program into one, since a breakpoint IS an int3 written into user
+	 * code.  The hardware-raised debug exception (vector 1) is unaffected
+	 * by this: the check applies to software-initiated interrupts only,
+	 * which is why single-stepping worked while breakpoints did not.
+	 *
+	 * Nothing is given away by allowing it.  The handler still runs in the
+	 * kernel and the only outcome is a SIGTRAP delivered to the process
+	 * that executed the instruction, which is a thing it can already ask
+	 * for by other means. */
+	idt_set_entry(3, (uint64_t)isr3, 0x08, 0xEE);
 	idt_set_entry(4, (uint64_t)isr4, 0x08, 0x8E);
 	idt_set_entry(5, (uint64_t)isr5, 0x08, 0x8E);
 	idt_set_entry(6, (uint64_t)isr6, 0x08, 0x8E);
@@ -1392,8 +1410,47 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 	if (from_user) {
 		task_t *cur = sched_current();
 		if (cur && cur->privilege == TASK_USER) {
-			if (signal_pending(cur))
-				signal_deliver_irq(cur, (interrupt_frame_t *)regs);
+			/* Park if this task's process is in a trace stop.  A
+			 * thread with no signal pending still stops when its
+			 * process does, and this is the return to user, where
+			 * parking is safe. */
+			if (cur->ptrace_group_stop) {
+				int irqs_on = (regs[REGS_RFLAGS] & 0x200) != 0;
+
+				if (irqs_on)
+					__asm__ volatile("sti" ::: "memory");
+				task_ptrace_group_park(cur);
+				if (irqs_on)
+					__asm__ volatile("cli" ::: "memory");
+				cur = sched_current();
+			}
+			if (cur && signal_pending(cur)) {
+				/* Interrupts back on across delivery.
+				 *
+				 * A traced task PARKS in here, in the trace
+				 * stop, and parking with IF clear would leave
+				 * this CPU unable to ack a TLB shootdown for as
+				 * long as the debugger takes to look -- which
+				 * is to say, for ever.
+				 *
+				 * The same reasoning, and the same condition,
+				 * as the demand-paging and COW paths in
+				 * exception_handler: this is the return to
+				 * USER mode, so the interrupted context holds
+				 * no kernel locks and had interrupts on.  The
+				 * frame lives on this task's kernel stack and
+				 * stays intact across the stop, which is what
+				 * the trap-stop path already relies on. */
+				int irqs_were_on =
+					(regs[REGS_RFLAGS] & 0x200) != 0;
+
+				if (irqs_were_on)
+					__asm__ volatile("sti" ::: "memory");
+				signal_deliver_irq(cur,
+						   (interrupt_frame_t *)regs);
+				if (irqs_were_on)
+					__asm__ volatile("cli" ::: "memory");
+			}
 			/* Never IRET to user as a zombie.  The check sits OUTSIDE
 			 * the signal-pending branch on purpose: the task can also
 			 * have been marked exited with nothing left pending — a
@@ -1576,24 +1633,90 @@ void exception_handler(uint64_t *regs)
 			for (;;)
 				__asm__ volatile("sti; hlt");
 		}
+		/* A trap that belongs to a debugger rather than to the process.
+		 *
+		 * #BP is a planted breakpoint and #DB is a completed single
+		 * step or a hardware watchpoint -- both are how a tracer asked
+		 * to be told where its tracee is, not faults the tracee
+		 * committed.  Handled before anything else because the ordinary
+		 * path would do two wrong things with them: print a register
+		 * dump for every step, and deliver SIGTRAP to the tracee, whose
+		 * default action is to terminate it.  The signal is never
+		 * delivered to the tracee at all; the tracer is told instead.
+		 */
+		if (cur && cur->tracer_pid != 0 && (int_no == 1 || int_no == 3)) {
+			interrupt_frame_t *frame = (interrupt_frame_t *)regs;
+
+			/* Take DR6 before anything else can disturb it.
+			 *
+			 * It is the only record of WHICH watchpoint fired --
+			 * bits B0..B3 for the four address registers, BS for a
+			 * completed single step -- and a debugger asks for it
+			 * much later, once the tracee has stopped and it has
+			 * had a chance to look.  The hardware register cannot
+			 * carry it that far: it is sticky, so leaving it set
+			 * would make the next trap look like this one too, and
+			 * any context switch in between reloads it.  So the
+			 * value is saved for the tracer and the register is
+			 * cleared here. */
+			if (int_no == 1) {
+				uint64_t dr6;
+				__asm__ volatile("mov %%dr6, %0" : "=r"(dr6));
+				cur->dr_status = dr6;
+				__asm__ volatile("mov %0, %%dr6" : : "r"(0UL));
+			}
+
+			/* A completed step leaves TF set in the saved flags, so
+			 * resuming would step again forever.  One step was
+			 * asked for; clear it and let the tracer ask again. */
+			frame->rflags &= ~0x100ULL;
+
+			/* Publish the frame so the tracer's GETREGS reports
+			 * where the trap happened.  It lives on this task's
+			 * kernel stack, which stays intact for as long as the
+			 * task is parked inside this handler -- which is
+			 * exactly how long the stop lasts. */
+			cur->preempt_frame = frame;
+			task_ptrace_stop(cur, SIGTRAP, 0, 0);
+			cur->preempt_frame = NULL;
+			return;
+		}
+
 		int fault_sig;
 		const char *fault_name;
 		uint64_t fault_addr = 0;
+		/* si_code says WHICH kind of fault this was.  A debugger prints
+		 * it, and it is only knowable here. */
+		int fault_code = SI_KERNEL;
 		switch (int_no) {
 		case 14:
 			__asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
 			fault_sig = SIGSEGV;
 			fault_name = "SIGSEGV";
+			/* Bit 0 of the error code: 0 = nothing mapped there,
+			 * 1 = mapped but this access was not allowed. */
+			fault_code = (err_code & 0x1) ? SEGV_ACCERR :
+						       SEGV_MAPERR;
 			break;
 		case 6:
 			fault_sig = SIGILL;
 			fault_name = "SIGILL";
+			fault_code = ILL_ILLOPC;
 			break;
 		case 0:
 		case 4:
 			fault_sig = SIGFPE;
 			fault_name = "SIGFPE";
+			fault_code = FPE_INTDIV;
 			break;
+		/* #DB (1) is the debug exception: a completed single step, or a
+		 * hardware breakpoint or watchpoint firing.  It reached the
+		 * default arm below and was reported as SIGABRT, which is the
+		 * wrong signal for it and made single-stepping an untraced
+		 * process look like an abort.  #BP (3) is a breakpoint
+		 * instruction and #BR (5) a bound-range check; all three are
+		 * trap-class events, and SIGTRAP is what they mean. */
+		case 1:
 		case 3:
 		case 5:
 			fault_sig = SIGTRAP;
@@ -1606,12 +1729,56 @@ void exception_handler(uint64_t *regs)
 		case 17:
 			fault_sig = SIGBUS;
 			fault_name = "SIGBUS";
+			fault_code = BUS_ADRALN;
 			break;
 		default:
 			fault_sig = SIGABRT;
 			fault_name = "SIGABRT";
 			break;
 		}
+		if (cur && cur->tracer_pid != 0) {
+			/* Traced: queue the fault and return.  NOTHING is
+			 * decided here -- not the stop, not the kill, not the
+			 * report.
+			 *
+			 * The tracer has to be consulted, and this is the wrong
+			 * place to do it: an exception handler is not a context
+			 * a task can be parked in and released from safely.  A
+			 * trap stop gets away with it because it is only ever
+			 * entered for a trap the tracer asked for and is always
+			 * released by PTRACE_CONT; a FAULT stop can be released
+			 * by a SIGKILL instead, and then this path can neither
+			 * return (the instruction faults again) nor die
+			 * (nothing here delivers the pending signal).  An
+			 * earlier attempt did exactly that and stranded a
+			 * process spinning on a core.
+			 *
+			 * So the fault is queued and the return-to-user path
+			 * handles it, which is where every other signal is
+			 * handled and the one context where stopping is safe.
+			 * No crash report either: a fault the debugger is about
+			 * to be told about is not a crash. */
+			signal_force_fault(cur, fault_sig, fault_code,
+					   fault_addr);
+			/* Deliver it before going back.
+			 *
+			 * A bare `return' from here does NOT pass through
+			 * irqentry_exit -- the demand-paging and COW paths
+			 * above call it explicitly for exactly this reason.
+			 * Without it the queued signal sits there, the
+			 * faulting instruction runs again, and the fault
+			 * repeats until some unrelated timer interrupt happens
+			 * to land and delivers it from ITS return path.  That
+			 * is not a stop, it is a race that usually resolves;
+			 * the fault was observed firing three times before the
+			 * tracer heard about it once.
+			 *
+			 * No preemption (0): a fault can be taken with kernel
+			 * state that must not be rescheduled underneath it. */
+			irqentry_exit(regs, 0);
+			return;
+		}
+
 		report_userspace_crash(cur, regs, fault_sig, fault_name,
 				       fault_addr, (int)int_no);
 		sched_signal_task(cur, fault_sig);
@@ -1636,9 +1803,14 @@ void exception_handler(uint64_t *regs)
 				}
 				/* Undeliverable fault signal (blocked or
 				 * ignored): returning would re-execute the
-				 * faulting instruction forever.  Force-exit. */
+				 * faulting instruction forever.  Force-exit --
+				 * the whole process, because a fault is fatal
+				 * to the program and a zombie leader with live
+				 * threads behind it is never reported finished
+				 * to whoever is waiting for it. */
 				cur->exit_code = 128 + fault_sig;
 				cur->term_sig = fault_sig;
+				sched_kill_thread_group(cur, 128 + fault_sig);
 				sched_mark_task_exited(cur, 128 + fault_sig);
 			}
 		}

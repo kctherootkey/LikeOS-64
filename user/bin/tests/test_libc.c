@@ -33,6 +33,7 @@
 #include <float.h>
 #include <getopt.h>
 #include <sys/procinfo.h>
+#include <sys/ptrace.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
@@ -2554,6 +2555,1988 @@ static void test_ioctl_non_tty(void)
 				close(dupfd);
 			}
 		}
+	}
+}
+
+/* ---- Credential enforcement on cross-process introspection ----------------
+ *
+ * One user must not be able to read another's private state, nor interfere
+ * with their processes.  These check that from the outside: drop to an
+ * unprivileged uid in a child and confirm the kernel withholds what it should
+ * while still reporting enough for a process listing to work.
+ *
+ * Both have to start privileged in order to drop, so they report themselves
+ * skipped rather than failing when the suite is not run as root. */
+
+#define CRED_TEST_UID 65534 /* conventionally "nobody"; only needs to be != 0 */
+
+/* Findings the child reports back through its exit status. */
+#define CV_FOUND_TARGET 0x01 /* the root-owned process was listed at all   */
+#define CV_ENVIRON_HIDDEN 0x02
+#define CV_CMDLINE_HIDDEN 0x04
+#define CV_COMM_VISIBLE 0x08 /* ps-class fields still readable             */
+#define CV_SELF_VISIBLE 0x10 /* the child can still read its OWN entry      */
+
+static void test_cred_proc_visibility(void)
+{
+	printf("\n[TEST] getprocinfo credential gating\n");
+
+	if (geteuid() != 0) {
+		printf("  [SKIP] not root: cannot drop privilege to test denial\n");
+		return;
+	}
+
+	/* Root-owned, and holds a real environment and command line. */
+	pid_t target = getpid();
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("cred visibility: fork failed");
+		return;
+	}
+
+	if (pid == 0) {
+		int flags = 0;
+
+		if (setuid(CRED_TEST_UID) != 0)
+			_exit(0); /* parent reports the resulting failures */
+
+		int max = 128;
+		procinfo_t *buf = (procinfo_t *)malloc((size_t)max *
+						       sizeof(procinfo_t));
+		if (!buf)
+			_exit(0);
+
+		pid_t self = getpid();
+		int n = getprocinfo(buf, max);
+		for (int i = 0; i < n; i++) {
+			if (buf[i].pid == (int)target) {
+				flags |= CV_FOUND_TARGET;
+				if (buf[i].environ[0] == '\0')
+					flags |= CV_ENVIRON_HIDDEN;
+				if (buf[i].cmdline[0] == '\0')
+					flags |= CV_CMDLINE_HIDDEN;
+				if (buf[i].comm[0] != '\0')
+					flags |= CV_COMM_VISIBLE;
+			} else if (buf[i].pid == (int)self) {
+				/* Its own process stays fully readable. */
+				if (buf[i].comm[0] != '\0')
+					flags |= CV_SELF_VISIBLE;
+			}
+		}
+		free(buf);
+		_exit(flags);
+	}
+
+	int st = 0;
+	waitpid(pid, &st, 0);
+	int flags = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
+
+	test_result("another user's process is still listed (ps works)",
+		    (flags & CV_FOUND_TARGET) != 0);
+	test_result("another user's environ is withheld",
+		    (flags & CV_ENVIRON_HIDDEN) != 0);
+	test_result("another user's cmdline is withheld",
+		    (flags & CV_CMDLINE_HIDDEN) != 0);
+	test_result("ps-class fields (comm) remain readable by any user",
+		    (flags & CV_COMM_VISIBLE) != 0);
+	test_result("a process can still read its own entry",
+		    (flags & CV_SELF_VISIBLE) != 0);
+}
+
+static void test_cred_sched_control(void)
+{
+	printf("\n[TEST] scheduler control credential gating\n");
+
+	if (geteuid() != 0) {
+		printf("  [SKIP] not root: cannot drop privilege to test denial\n");
+		return;
+	}
+
+	pid_t target = getpid(); /* root-owned */
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("cred sched: fork failed");
+		return;
+	}
+
+	if (pid == 0) {
+		if (setuid(CRED_TEST_UID) != 0)
+			_exit(0);
+
+		cpu_set_t mask;
+		CPU_ZERO(&mask);
+		CPU_SET(0, &mask);
+
+		/* Another user's process: pinning it is interference, and must
+		 * be refused. */
+		errno = 0;
+		int r_other = sched_setaffinity(target, sizeof(mask), &mask);
+		int e_other = errno;
+
+		/* Its own: must still work. */
+		int r_self = sched_setaffinity(0, sizeof(mask), &mask);
+
+		int flags = 0;
+		if (r_other != 0 && e_other == EPERM)
+			flags |= 0x01;
+		if (r_self == 0)
+			flags |= 0x02;
+		_exit(flags);
+	}
+
+	int st = 0;
+	waitpid(pid, &st, 0);
+	int flags = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
+
+	test_result("cannot re-pin another user's process (EPERM)",
+		    (flags & 0x01) != 0);
+	test_result("can still set own affinity", (flags & 0x02) != 0);
+}
+
+/* ---- ptrace ---------------------------------------------------------------
+ *
+ * The fork + PTRACE_TRACEME + execve sequence is what a debugger's "run" is
+ * built on: the child asks to be traced, execs, and stops before the new
+ * program's first instruction so breakpoints can be planted.  If that stop
+ * does not happen the child simply runs to completion and there is nothing to
+ * debug, so it is worth testing directly rather than inferring from gdb. */
+/*
+ * getrusage()/wait4() must write exactly sizeof(struct rusage) and not a byte
+ * more.
+ *
+ * The kernel's own copy of this struct once carried 14 padding words, making it
+ * 144 bytes against the 72 the header declares, and sys_getrusage copied its
+ * own sizeof() to the caller.  Every getrusage() therefore wrote 72 bytes past
+ * the end of the caller's struct.  It went unnoticed for as long as it did
+ * because the damage lands on whatever the program happens to keep next to the
+ * struct: harmless padding in one program, a saved return address in the next.
+ * gdb was the second kind -- it returned to address 0.
+ *
+ * A canary immediately after the struct is what catches this: an overflow of
+ * any size, in either syscall, has to go through it.
+ */
+static void test_rusage_no_overflow(void)
+{
+	printf("\n[TEST] getrusage/wait4 do not overrun struct rusage\n");
+
+	/* Adjacent by declaration order is not guaranteed, so the two are put
+	 * in one struct where the layout IS defined. */
+	struct {
+		struct rusage ru;
+		unsigned long canary[8];
+	} probe;
+
+	static const unsigned long PATTERN = 0xA5A5C3C35A5A3C3CUL;
+
+	for (int i = 0; i < 8; i++)
+		probe.canary[i] = PATTERN;
+
+	int rc = getrusage(RUSAGE_SELF, &probe.ru);
+	test_result("getrusage(RUSAGE_SELF) succeeds", rc == 0);
+
+	int intact = 1;
+	for (int i = 0; i < 8; i++)
+		if (probe.canary[i] != PATTERN)
+			intact = 0;
+	test_result("getrusage does not write past struct rusage", intact);
+	if (!intact)
+		printf("  canary[0]=%#lx (expected %#lx) -- the kernel wrote "
+		       "past the end of the caller's struct\n",
+		       probe.canary[0], PATTERN);
+
+	/* Same check for wait4, which fills a rusage for the reaped child. */
+	for (int i = 0; i < 8; i++)
+		probe.canary[i] = PATTERN;
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("rusage: fork failed");
+		return;
+	}
+	if (pid == 0)
+		_exit(0);
+
+	int st = 0;
+	pid_t r = wait4(pid, &st, 0, &probe.ru);
+	test_result("wait4 reaps the child", r == pid);
+
+	intact = 1;
+	for (int i = 0; i < 8; i++)
+		if (probe.canary[i] != PATTERN)
+			intact = 0;
+	test_result("wait4 does not write past struct rusage", intact);
+
+	/* The tail of the struct must be written, not left as it was: a caller
+	 * reading ru_nvcsw is entitled to a value and not to whatever its own
+	 * stack held.  wait4 used to write only the first 56 bytes. */
+	test_result("wait4 fills the whole struct (ru_nvcsw defined)",
+		    probe.ru.ru_nvcsw == 0 || probe.ru.ru_nvcsw > 0);
+}
+
+/*
+ * PTRACE_GETAUXV: the tracee's auxiliary vector.
+ *
+ * A debugger needs this before it can do anything useful with a
+ * position-independent executable.  Every address in the symbol table is an
+ * offset until the load bias is known, and comparing AT_ENTRY here against
+ * e_entry in the file on disk is the only way to learn it -- finding the
+ * loader's rendezvous instead would mean reading the dynamic section, which
+ * already requires the bias.  With this missing, gdb resolved `main' to its
+ * link-time address and could not write a breakpoint there.
+ */
+/*
+ * Hardware watchpoints, via the debug registers.
+ *
+ * The processor compares every memory access against DR0..DR3 itself, so an
+ * armed watchpoint costs nothing while the program runs -- the alternative is
+ * single-stepping the whole program and re-reading the watched location after
+ * every instruction.
+ *
+ * The security half of this test matters as much as the functional half.  A
+ * debug register stops the CPU wherever the address matches, including inside
+ * the kernel, and DR7's GD bit stops it on any access to the debug registers at
+ * all -- which the kernel itself makes on every context switch involving a
+ * watchpoint, so a tracee holding GD would fault the kernel inside its own
+ * fault handler.  Neither is something a tracer may ask for.
+ */
+/* Written by the child in the watchpoint test.  A global, so the parent knows
+ * its address: fork copies the address space, so &g_wp_target names the same
+ * place in both. */
+static volatile int g_wp_target;
+
+static void test_ptrace_hwwatchpoint(void)
+{
+	printf("\n[TEST] ptrace hardware watchpoints (DR0-DR7)\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("hwwatch: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(43);
+	}
+
+	int st = 0;
+	pid_t r;
+	if (!(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st))) {
+		test_fail("hwwatch: child did not stop on exec");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	struct ptrace_dbregs db;
+
+	/* They start clear: a fresh image inherits no watchpoints. */
+	int rc = ptrace(PTRACE_GETDBREGS, pid, &db, 0);
+	test_result("GETDBREGS on a fresh image succeeds", rc == 0);
+	test_result("a fresh image has no watchpoints armed",
+		    rc == 0 && db.dr[7] == 0 && db.dr[0] == 0);
+
+	/* Arm a write watchpoint on a user address, four bytes wide.
+	 * DR7: L0 enabled (bit 0), RW0=01 (write), LEN0=11 (4 bytes). */
+	unsigned long watched = 0x400000; /* in the tracee's text mapping */
+	for (int i = 0; i < 8; i++)
+		db.dr[i] = 0;
+	db.dr[0] = watched;
+	db.dr[7] = (1UL << 0) | (0x1UL << 16) | (0x3UL << 18);
+	rc = ptrace(PTRACE_SETDBREGS, pid, &db, 0);
+	test_result("SETDBREGS arms a watchpoint", rc == 0);
+
+	struct ptrace_dbregs back;
+	rc = ptrace(PTRACE_GETDBREGS, pid, &back, 0);
+	test_result("the armed address reads back", rc == 0 &&
+						    back.dr[0] == watched);
+	test_result("the enable bit reads back", rc == 0 &&
+						 (back.dr[7] & 1UL));
+
+	/* Bit 10 of DR7 reads as one on this architecture. */
+	test_result("DR7 reserved bit 10 is set", rc == 0 &&
+						  (back.dr[7] & (1UL << 10)));
+
+	/* --- the refusals --- */
+
+	/* GD (bit 13) must never survive: with it set, the kernel's own access
+	 * to these registers during a context switch would fault. */
+	for (int i = 0; i < 8; i++)
+		db.dr[i] = 0;
+	db.dr[0] = watched;
+	db.dr[7] = (1UL << 0) | (1UL << 13);
+	ptrace(PTRACE_SETDBREGS, pid, &db, 0);
+	rc = ptrace(PTRACE_GETDBREGS, pid, &back, 0);
+	test_result("DR7 General Detect is refused",
+		    rc == 0 && !(back.dr[7] & (1UL << 13)));
+
+	/* A kernel address must be refused outright rather than trimmed: it
+	 * would trap the CPU on the kernel's own accesses. */
+	for (int i = 0; i < 8; i++)
+		db.dr[i] = 0;
+	db.dr[0] = 0xFFFF800000000000UL;
+	db.dr[7] = 1UL;
+	rc = ptrace(PTRACE_SETDBREGS, pid, &db, 0);
+	test_result("a kernel watchpoint address is refused", rc == -1);
+
+	/* I/O breakpoints (RW=10b) watch port space and need CR4.DE. */
+	for (int i = 0; i < 8; i++)
+		db.dr[i] = 0;
+	db.dr[0] = watched;
+	db.dr[7] = (1UL << 0) | (0x2UL << 16);
+	ptrace(PTRACE_SETDBREGS, pid, &db, 0);
+	rc = ptrace(PTRACE_GETDBREGS, pid, &back, 0);
+	test_result("an I/O breakpoint slot is disabled",
+		    rc == 0 && !(back.dr[7] & 1UL));
+
+	/* Watchpoints must not survive an exec: they name addresses in an
+	 * image that no longer exists. */
+	for (int i = 0; i < 8; i++)
+		db.dr[i] = 0;
+	db.dr[0] = watched;
+	db.dr[7] = (1UL << 0) | (0x1UL << 16) | (0x3UL << 18);
+	ptrace(PTRACE_SETDBREGS, pid, &db, 0);
+
+	ptrace(PTRACE_CONT, pid, NULL, 0);
+	waitpid(pid, &st, 0);
+	test_result("tracee ran to completion with a watchpoint armed",
+		    WIFEXITED(st) || WIFSIGNALED(st));
+
+	/* --- does a watchpoint actually FIRE? ---
+	 *
+	 * Everything above proves the debug registers are written, read back
+	 * and filtered.  None of it proves the processor ever traps, which is
+	 * the only reason the registers exist.  This arms a write watchpoint on
+	 * a real variable, lets the child write it, and requires the trap. */
+	pid = fork();
+	if (pid < 0) {
+		test_fail("hwwatch: fire fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		raise(SIGSTOP); /* let the parent arm it */
+		g_wp_target = 0x1234; /* the write that must trap */
+		_exit(3);
+	}
+
+	if (!(waitpid(pid, &st, 0) == pid && WIFSTOPPED(st))) {
+		test_fail("hwwatch: child did not stop for arming");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	for (int i = 0; i < 8; i++)
+		db.dr[i] = 0;
+	db.dr[0] = (unsigned long)&g_wp_target;
+	/* L0 enabled, RW0=01 (write), LEN0=11 (four bytes). */
+	db.dr[7] = (1UL << 0) | (0x1UL << 16) | (0x3UL << 18);
+	rc = ptrace(PTRACE_SETDBREGS, pid, &db, 0);
+	test_result("arm a write watchpoint on a real variable", rc == 0);
+
+	ptrace(PTRACE_CONT, pid, NULL, 0);
+	r = waitpid(pid, &st, 0);
+
+	test_result("the watchpoint fires: tracee stops",
+		    r == pid && WIFSTOPPED(st));
+	test_result("the watchpoint stop is reported as SIGTRAP",
+		    WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP);
+
+	/* DR6 says WHICH watchpoint matched -- bit 0 for the first address
+	 * register.  Without it a debugger with four armed cannot tell them
+	 * apart. */
+	if (WIFSTOPPED(st) &&
+	    ptrace(PTRACE_GETDBREGS, pid, &back, 0) == 0)
+		test_result("DR6 reports which watchpoint matched",
+			    (back.dr[6] & 0x1UL) != 0);
+	else
+		test_fail("hwwatch: GETDBREGS after the trap failed");
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+}
+
+/*
+ * Signal-delivery-stop: a traced task stops BEFORE a signal is acted on, and
+ * the tracer decides what happens to it.
+ *
+ * This is what makes ^C reach a debugger instead of killing the program under
+ * it, and what lets gdb examine a process that has just faulted rather than
+ * being handed its corpse.
+ *
+ * The signals are raised with the DEFAULT disposition explicitly restored:
+ * earlier tests in this program install a SIGUSR1 handler and fork inherits
+ * dispositions, so without the reset the signal runs that handler and the
+ * child carries on -- correct behaviour that once got mistaken for a kernel
+ * defect and cost four boot cycles to un-mistake.
+ */
+static void test_ptrace_signal_delivery_stop(void)
+{
+	printf("\n[TEST] ptrace signal-delivery-stop\n");
+
+	/* --- an ordinary signal, discarded by the tracer --- */
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("sigstop: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		signal(SIGUSR1, SIG_DFL);
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		kill(getpid(), SIGUSR1);
+		_exit(7);
+	}
+
+	int st = 0;
+	pid_t r = waitpid(pid, &st, 0);
+	test_result("tracee stops for a signal instead of taking it",
+		    r == pid && WIFSTOPPED(st));
+	test_result("the tracer is told which signal",
+		    WIFSTOPPED(st) && WSTOPSIG(st) == SIGUSR1);
+
+	ptrace(PTRACE_CONT, pid, NULL, 0);
+	r = waitpid(pid, &st, 0);
+	test_result("a discarded signal does not reach the tracee",
+		    r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 7);
+
+	/* --- the same signal, passed through --- */
+	pid = fork();
+	if (pid < 0) {
+		test_fail("sigstop: second fork failed");
+		return;
+	}
+	if (pid == 0) {
+		signal(SIGUSR1, SIG_DFL);
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		kill(getpid(), SIGUSR1);
+		_exit(7); /* not reached: the signal kills it */
+	}
+
+	r = waitpid(pid, &st, 0);
+	if (r == pid && WIFSTOPPED(st)) {
+		ptrace(PTRACE_CONT, pid, NULL, SIGUSR1);
+		r = waitpid(pid, &st, 0);
+		test_result("a passed-through signal reaches the tracee",
+			    r == pid && WIFSIGNALED(st) &&
+				    WTERMSIG(st) == SIGUSR1);
+	} else {
+		test_fail("sigstop: second child did not stop");
+	}
+
+	/* --- abort(): a self-signal with a default-fatal disposition ---
+	 *
+	 * A separate kernel path from a signal sent by another process, and one
+	 * that used to exit the task in place -- so a program calling abort()
+	 * under a debugger died without the debugger ever being told. */
+	pid = fork();
+	if (pid < 0) {
+		test_fail("sigstop: abort fork failed");
+		return;
+	}
+	if (pid == 0) {
+		signal(SIGABRT, SIG_DFL);
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		abort();
+		_exit(7); /* not reached */
+	}
+
+	r = waitpid(pid, &st, 0);
+	test_result("abort() under a tracer stops instead of dying",
+		    r == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGABRT);
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+
+	/* --- a fault: the case a debugger exists for --- */
+	pid = fork();
+	if (pid < 0) {
+		test_fail("sigstop: fault fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		*(volatile int *)1 = 1; /* write to a page that is not there */
+		_exit(9);		/* not reached */
+	}
+
+	r = waitpid(pid, &st, 0);
+	test_result("a faulting tracee stops instead of dying",
+		    r == pid && WIFSTOPPED(st));
+	test_result("the fault is reported as SIGSEGV",
+		    WIFSTOPPED(st) && WSTOPSIG(st) == SIGSEGV);
+
+	if (WIFSTOPPED(st)) {
+		struct ptrace_regs regs;
+		int rc = ptrace(PTRACE_GETREGS, pid, &regs, 0);
+		test_result("registers readable at a fault stop", rc == 0);
+		test_result("RIP points at the faulting instruction",
+			    rc == 0 && regs.rip != 0);
+
+		/* The siginfo is what turns "SIGSEGV" into "wrote to 0x1". */
+		siginfo_t si;
+		memset(&si, 0, sizeof(si));
+		rc = ptrace(PTRACE_GETSIGINFO, pid, &si, 0);
+		test_result("GETSIGINFO succeeds at a fault stop", rc == 0);
+		test_result("siginfo reports SIGSEGV", rc == 0 &&
+						       si.si_signo == SIGSEGV);
+		test_result("siginfo reports the faulting address",
+			    rc == 0 && (unsigned long)si.si_addr == 1UL);
+		test_result("siginfo says the address was not mapped",
+			    rc == 0 && si.si_code == SEGV_MAPERR);
+	}
+
+	/* A tracee released by SIGKILL rather than PTRACE_CONT must die, not
+	 * loop re-executing the faulting instruction.  This is the case that
+	 * stranded a process spinning on a core once. */
+	kill(pid, SIGKILL);
+	r = waitpid(pid, &st, 0);
+	test_result("a faulting tracee killed at its stop actually dies",
+		    r == pid && (WIFSIGNALED(st) || WIFEXITED(st)));
+}
+
+/*
+ * Threads under a tracer.
+ *
+ * A debugger attaches to a PROCESS: every thread must be traced, every thread
+ * must stop when one of them does, and a resume must release them all.  With
+ * any of those missing a debugger shows one stack for a program doing its work
+ * on several, or restarts one thread and leaves the rest parked for ever.
+ */
+static void *wp_thread_fn(void *arg)
+{
+	volatile int *stop = (volatile int *)arg;
+
+	while (!*stop)
+		sched_yield();
+	return NULL;
+}
+
+static void test_ptrace_threads(void)
+{
+	printf("\n[TEST] ptrace thread enumeration and group stop\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("threads: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		static volatile int stop_flag;
+		pthread_t th[3];
+
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+
+		for (int i = 0; i < 3; i++)
+			pthread_create(&th[i], NULL, wp_thread_fn,
+				       (void *)&stop_flag);
+
+		raise(SIGSTOP); /* the tracer looks at us here */
+
+		stop_flag = 1;
+		for (int i = 0; i < 3; i++)
+			pthread_join(th[i], NULL);
+		_exit(5);
+	}
+
+	int st = 0;
+	pid_t r = waitpid(pid, &st, 0);
+	if (!(r == pid && WIFSTOPPED(st))) {
+		test_fail("threads: child did not stop");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	int n = (int)ptrace(PTRACE_GETNUMLWPS, pid, NULL, 0);
+	test_result("GETNUMLWPS counts every thread", n >= 4);
+
+	unsigned int ids[16];
+	long got = ptrace(PTRACE_GETLWPLIST, pid, ids, (long)16);
+	test_result("GETLWPLIST returns that many ids", got == n || got == 16);
+
+	/* The ids must be real and distinct, and one of them is the process. */
+	int distinct = 1, saw_leader = 0;
+	for (long i = 0; i < got; i++) {
+		if (ids[i] == (unsigned)pid)
+			saw_leader = 1;
+		for (long j = i + 1; j < got; j++)
+			if (ids[i] == ids[j])
+				distinct = 0;
+	}
+	test_result("thread ids are distinct", distinct);
+	test_result("the process itself is among them", saw_leader);
+
+	/* Every thread is traced, so every thread's registers are readable --
+	 * this is what a debugger needs to show a second stack. */
+	int readable = 1;
+	for (long i = 0; i < got && i < 4; i++) {
+		struct ptrace_regs regs;
+
+		if (ptrace(PTRACE_GETREGS, (pid_t)ids[i], &regs, 0) != 0)
+			readable = 0;
+	}
+	test_result("every thread's registers are readable", readable);
+
+	ptrace(PTRACE_CONT, pid, NULL, 0);
+	r = waitpid(pid, &st, 0);
+	test_result("resuming releases the whole process",
+		    r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 5);
+}
+
+static void test_ptrace_getauxv(void)
+{
+	printf("\n[TEST] ptrace GETAUXV\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("getauxv: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(43);
+	}
+
+	int st = 0;
+	pid_t r = waitpid(pid, &st, 0);
+	if (!(r == pid && WIFSTOPPED(st))) {
+		test_fail("getauxv: child did not stop on exec");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	unsigned long buf[64];
+	long n = ptrace(PTRACE_GETAUXV, pid, buf, (long)sizeof(buf));
+	test_result("GETAUXV returns bytes", n > 0);
+
+	/* Walk the type/value pairs looking for the two that matter. */
+	unsigned long at_entry = 0, at_pagesz = 0, at_phdr = 0;
+	int terminated = 0;
+	if (n > 0) {
+		size_t pairs = (size_t)n / (2 * sizeof(unsigned long));
+		for (size_t i = 0; i < pairs; i++) {
+			unsigned long t = buf[i * 2], v = buf[i * 2 + 1];
+			if (t == 9)  /* AT_ENTRY */
+				at_entry = v;
+			else if (t == 6)  /* AT_PAGESZ */
+				at_pagesz = v;
+			else if (t == 3)  /* AT_PHDR */
+				at_phdr = v;
+			else if (t == 0)  /* AT_NULL */
+				terminated = 1;
+		}
+	}
+
+	test_result("auxv carries AT_ENTRY", at_entry != 0);
+	test_result("auxv carries AT_PHDR", at_phdr != 0);
+	test_result("auxv AT_PAGESZ is the page size", at_pagesz == 4096);
+	(void)terminated;
+
+	/* A short buffer must be truncated, not overrun -- the kernel is
+	 * copying into a buffer whose size only the caller knows. */
+	unsigned long small[4];
+	unsigned long guard = 0x5A5A5A5A5A5A5A5AUL;
+	long n2 = ptrace(PTRACE_GETAUXV, pid, small, (long)sizeof(small));
+	test_result("GETAUXV honours a short buffer",
+		    n2 >= 0 && (size_t)n2 <= sizeof(small));
+	(void)guard;
+
+	ptrace(PTRACE_CONT, pid, NULL, 0);
+	waitpid(pid, &st, 0);
+}
+
+static void test_ptrace_traceme_basic(void)
+{
+	printf("\n[TEST] ptrace TRACEME/exec/CONT\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace: fork failed");
+		return;
+	}
+
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42); /* parent sees the wrong stop and reports it */
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(43); /* exec failed */
+	}
+
+	/* Stop at the image boundary, before /bin/true has run. */
+	int st = 0;
+	pid_t r = waitpid(pid, &st, 0);
+	int stopped_on_exec = (r == pid && WIFSTOPPED(st) &&
+			       WSTOPSIG(st) == SIGTRAP);
+	test_result("traced child stops on exec with SIGTRAP", stopped_on_exec);
+
+	if (!stopped_on_exec) {
+		/* Nothing is parked, so nothing to resume; just reap whatever
+		 * state it is in rather than hanging the suite. */
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	test_result("stop reports the exec event",
+		    (st >> 16) == PTRACE_EVENT_EXEC);
+
+	/* Resuming must let it run to a normal exit. */
+	test_result("PTRACE_CONT on a stopped tracee succeeds",
+		    ptrace(PTRACE_CONT, pid, NULL, 0) == 0);
+
+	r = waitpid(pid, &st, 0);
+	test_result("resumed tracee runs to completion",
+		    r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* Attaching to a process, and detaching from it, without having created it --
+ * which is how a debugger reaches an already-running program. */
+static void test_ptrace_attach_detach(void)
+{
+	printf("\n[TEST] ptrace ATTACH/DETACH\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace attach: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		for (;;)
+			usleep(50000);
+	}
+	usleep(100000); /* let it reach the loop */
+
+	int attached = (ptrace(PTRACE_ATTACH, pid, NULL, 0) == 0);
+	test_result("PTRACE_ATTACH to own process succeeds", attached);
+
+	if (attached) {
+		int st = 0;
+		pid_t r = waitpid(pid, &st, 0);
+		test_result("attached process reports a stop",
+			    r == pid && WIFSTOPPED(st));
+
+		/* A second tracer must not be able to take it over. */
+		test_result("PTRACE_ATTACH to an already-traced process fails",
+			    ptrace(PTRACE_ATTACH, pid, NULL, 0) != 0);
+
+		test_result("PTRACE_DETACH succeeds",
+			    ptrace(PTRACE_DETACH, pid, NULL, 0) == 0);
+	}
+
+	kill(pid, SIGKILL);
+	int st = 0;
+	waitpid(pid, &st, 0);
+}
+
+/* The access rules.  These are the ones worth having: a debugger that cannot
+ * attach is an inconvenience, but a debugger that CAN attach to another user's
+ * process is a way to read their memory and run code as them. */
+static void test_ptrace_permission_denied(void)
+{
+	printf("\n[TEST] ptrace credential gating\n");
+
+	/* Tracing yourself cannot work -- it would deadlock on its own stop. */
+	errno = 0;
+	test_result("PTRACE_ATTACH to self is refused",
+		    ptrace(PTRACE_ATTACH, getpid(), NULL, 0) != 0);
+
+	/* Attaching to a pid that does not exist. */
+	errno = 0;
+	test_result("PTRACE_ATTACH to a nonexistent pid fails with ESRCH",
+		    ptrace(PTRACE_ATTACH, 999999, NULL, 0) != 0 &&
+			    errno == ESRCH);
+
+	/* Driving a process this task is not tracing. */
+	errno = 0;
+	test_result("PTRACE_CONT on a process we do not trace fails",
+		    ptrace(PTRACE_CONT, 1, NULL, 0) != 0);
+
+	if (geteuid() != 0) {
+		printf("  [SKIP] not root: cannot drop privilege to test cross-user denial\n");
+		return;
+	}
+
+	/* The real test: an unprivileged process must not attach to a
+	 * root-owned one.  Run in a child that drops to another uid, since the
+	 * suite itself needs to stay root. */
+	pid_t target = getpid(); /* root-owned */
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace perm: fork failed");
+		return;
+	}
+
+	if (pid == 0) {
+		if (setuid(CRED_TEST_UID) != 0)
+			_exit(0);
+
+		int flags = 0;
+
+		errno = 0;
+		if (ptrace(PTRACE_ATTACH, target, NULL, 0) != 0 &&
+		    errno == EPERM)
+			flags |= 0x01;
+
+		/* Its own child is still fair game -- the rule denies other
+		 * users, not tracing as such. */
+		pid_t own = fork();
+		if (own == 0) {
+			for (;;)
+				usleep(50000);
+		}
+		if (own > 0) {
+			usleep(100000);
+			if (ptrace(PTRACE_ATTACH, own, NULL, 0) == 0)
+				flags |= 0x02;
+			kill(own, SIGKILL);
+			int cst = 0;
+			waitpid(own, &cst, 0);
+		}
+		_exit(flags);
+	}
+
+	int st = 0;
+	waitpid(pid, &st, 0);
+	int flags = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
+
+	test_result("unprivileged process cannot attach to root's process "
+		    "(EPERM)",
+		    (flags & 0x01) != 0);
+	test_result("unprivileged process can still trace its own child",
+		    (flags & 0x02) != 0);
+}
+
+/* Lives in the suite's own data, so after a fork the parent and the child each
+ * have their own copy of the page it sits on -- initially the SAME physical
+ * page, shared copy-on-write.  That is what makes it a real test of writing to
+ * a tracee: the write has to land in the child's copy and nowhere else. */
+static volatile unsigned long g_ptrace_probe = 0xC0FFEEUL;
+
+static void test_ptrace_regs_and_mem(void)
+{
+	printf("\n[TEST] ptrace registers and memory\n");
+
+	unsigned long probe_addr = (unsigned long)&g_ptrace_probe;
+	int pfd[2];
+
+	if (pipe(pfd) != 0) {
+		test_fail("ptrace mem: pipe failed");
+		return;
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace mem: fork failed");
+		close(pfd[0]);
+		close(pfd[1]);
+		return;
+	}
+
+	if (pid == 0) {
+		close(pfd[0]);
+		/* Spin until the value changes underneath us, then report what
+		 * we saw.  Bounded so a failure is a failed test, not a hang. */
+		for (int i = 0; i < 400 && g_ptrace_probe == 0xC0FFEEUL; i++)
+			usleep(10000);
+		unsigned long seen = g_ptrace_probe;
+
+		write(pfd[1], &seen, sizeof(seen));
+		close(pfd[1]);
+		_exit(0);
+	}
+
+	close(pfd[1]);
+	usleep(100000); /* let the child reach its loop */
+
+	int attached = (ptrace(PTRACE_ATTACH, pid, NULL, 0) == 0);
+	test_result("attach for register/memory test", attached);
+	if (!attached) {
+		kill(pid, SIGKILL);
+		int st = 0;
+		waitpid(pid, &st, 0);
+		close(pfd[0]);
+		return;
+	}
+
+	int st = 0;
+	waitpid(pid, &st, 0);
+
+	/* --- registers --- */
+	struct ptrace_regs r;
+
+	memset(&r, 0, sizeof(r));
+	int got = (ptrace(PTRACE_GETREGS, pid, &r, 0) == 0);
+	test_result("GETREGS succeeds on a stopped tracee", got);
+	test_result("GETREGS reports a user-range RIP",
+		    got && r.rip > 0x1000UL && r.rip < 0x800000000000UL);
+	test_result("GETREGS reports a user-range RSP",
+		    got && r.rsp > 0x1000UL && r.rsp < 0x800000000000UL);
+
+	/* --- reading the tracee --- */
+	errno = 0;
+	long v = ptrace(PTRACE_PEEKDATA, pid, (void *)probe_addr, 0);
+
+	test_result("PEEKDATA reads the tracee's variable",
+		    errno == 0 && (unsigned long)v == 0xC0FFEEUL);
+
+	/* --- writing the tracee --- */
+	test_result("POKEDATA writes the tracee's variable",
+		    ptrace(PTRACE_POKEDATA, pid, (void *)probe_addr,
+			   0xBEEFUL) == 0);
+
+	errno = 0;
+	v = ptrace(PTRACE_PEEKDATA, pid, (void *)probe_addr, 0);
+	test_result("POKEDATA is visible on read-back",
+		    errno == 0 && (unsigned long)v == 0xBEEFUL);
+
+	/* The point of the whole test: the tracer shares that page with the
+	 * tracee copy-on-write, so a write that did not break the sharing
+	 * first would show up here too. */
+	test_result("tracer's own copy is untouched (COW broken correctly)",
+		    g_ptrace_probe == 0xC0FFEEUL);
+
+	/* --- refusals --- */
+	errno = 0;
+	ptrace(PTRACE_PEEKDATA, pid, (void *)0x10UL, 0);
+	test_result("PEEKDATA of a bad address fails", errno != 0);
+
+	errno = 0;
+	ptrace(PTRACE_POKEDATA, pid, (void *)0x10UL, 1);
+	test_result("POKEDATA to a bad address fails", errno != 0);
+
+	/* An address with no mapping behind it must read as a fault, not as
+	 * zeroes -- an unmapped hole translates to nothing and would otherwise
+	 * look like real memory full of zeros. */
+	errno = 0;
+	ptrace(PTRACE_PEEKDATA, pid, (void *)0x600000000000UL, 0);
+	test_result("PEEKDATA of an unmapped address fails", errno != 0);
+
+	test_result("DETACH after memory access",
+		    ptrace(PTRACE_DETACH, pid, NULL, 0) == 0);
+
+	unsigned long seen = 0;
+
+	if (read(pfd[0], &seen, sizeof(seen)) == (ssize_t)sizeof(seen))
+		test_result("tracee itself observes the poked value",
+			    seen == 0xBEEFUL);
+	else
+		test_fail("tracee did not report the poked value back");
+	close(pfd[0]);
+	waitpid(pid, &st, 0);
+}
+
+/* Stepping a tracee one instruction at a time.
+ *
+ * The child is stopped at its exec boundary, before the new program has run a
+ * single instruction, which is both a known starting point and the state a
+ * debugger's "start" leaves things in.  Each step must come back as a SIGTRAP
+ * stop with the instruction pointer somewhere else -- if the trap flag were
+ * lost the child would simply run to completion and the wait would report an
+ * exit instead. */
+static void test_ptrace_singlestep(void)
+{
+	printf("\n[TEST] ptrace single-step\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace singlestep: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(43);
+	}
+
+	int st = 0;
+	pid_t r = waitpid(pid, &st, 0);
+
+	if (!(r == pid && WIFSTOPPED(st))) {
+		test_fail("singlestep: child did not stop on exec");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	struct ptrace_regs r0, r1;
+
+	memset(&r0, 0, sizeof(r0));
+	test_result("GETREGS at the exec stop",
+		    ptrace(PTRACE_GETREGS, pid, &r0, 0) == 0);
+
+	int steps_ok = 1;
+	int moved = 0;
+	unsigned long prev = r0.rip;
+
+	for (int i = 0; i < 8 && steps_ok; i++) {
+		if (ptrace(PTRACE_SINGLESTEP, pid, NULL, 0) != 0) {
+			steps_ok = 0;
+			break;
+		}
+		st = 0;
+		r = waitpid(pid, &st, 0);
+		if (!(r == pid && WIFSTOPPED(st) &&
+		      WSTOPSIG(st) == SIGTRAP)) {
+			steps_ok = 0;
+			break;
+		}
+		memset(&r1, 0, sizeof(r1));
+		if (ptrace(PTRACE_GETREGS, pid, &r1, 0) != 0) {
+			steps_ok = 0;
+			break;
+		}
+		if (r1.rip != prev)
+			moved = 1;
+		prev = r1.rip;
+	}
+
+	test_result("each SINGLESTEP stops again with SIGTRAP", steps_ok);
+	test_result("stepping advances the instruction pointer", moved);
+
+	/* And a plain continue after stepping must run to the end rather than
+	 * keep trapping -- the trap flag has to have been cleared. */
+	if (ptrace(PTRACE_CONT, pid, NULL, 0) == 0) {
+		st = 0;
+		r = waitpid(pid, &st, 0);
+		test_result("CONT after stepping runs to exit",
+			    r == pid && WIFEXITED(st));
+	} else {
+		test_fail("singlestep: final CONT failed");
+	}
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+}
+
+/* A real software breakpoint: write the trap instruction into the tracee's
+ * own code, let it run into it, then put back what was there.  This is what
+ * every breakpoint in a debugger is underneath. */
+static void test_ptrace_swbreakpoint(void)
+{
+	printf("\n[TEST] ptrace software breakpoint\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace breakpoint: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(43);
+	}
+
+	int st = 0;
+	pid_t r = waitpid(pid, &st, 0);
+
+	if (!(r == pid && WIFSTOPPED(st))) {
+		test_fail("breakpoint: child did not stop on exec");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	/* Planted at the exec stop, with not one instruction executed yet.
+	 *
+	 * This is deliberately the hard case and the one that matters: it is
+	 * where a debugger sets its breakpoints, and at that moment the text
+	 * page has never been touched, so it is only lazily mapped.  The tracee
+	 * cannot fault it in itself -- it is stopped -- so the kernel has to
+	 * materialise it on the tracee's behalf.  Stepping first would make the
+	 * tracee do that work and would test something easier. */
+	struct ptrace_regs regs;
+
+	memset(&regs, 0, sizeof(regs));
+	if (ptrace(PTRACE_GETREGS, pid, &regs, 0) != 0) {
+		test_fail("breakpoint: GETREGS failed");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	/* Plant int3 where execution is about to resume.  Reading first is not
+	 * optional: the original byte has to go back before the program can
+	 * continue, and this is also what proves text is readable at all. */
+	unsigned long entry = regs.rip;
+
+	errno = 0;
+	long orig = ptrace(PTRACE_PEEKTEXT, pid, (void *)entry, 0);
+	int read_ok = (errno == 0);
+
+	test_result("PEEKTEXT reads the tracee's code", read_ok);
+
+	if (!read_ok) {
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	unsigned long trap = ((unsigned long)orig & ~0xFFUL) | 0xCCUL;
+
+	test_result("POKETEXT plants int3 in the tracee's code",
+		    ptrace(PTRACE_POKETEXT, pid, (void *)entry, (long)trap) == 0);
+
+	errno = 0;
+	long back = ptrace(PTRACE_PEEKTEXT, pid, (void *)entry, 0);
+
+	test_result("the planted int3 reads back",
+		    errno == 0 && ((unsigned long)back & 0xFF) == 0xCC);
+
+	/* Run into it. */
+	if (ptrace(PTRACE_CONT, pid, NULL, 0) == 0) {
+		st = 0;
+		r = waitpid(pid, &st, 0);
+		int hit = (r == pid && WIFSTOPPED(st) &&
+			   WSTOPSIG(st) == SIGTRAP);
+
+		test_result("tracee traps on the planted breakpoint", hit);
+
+		if (hit) {
+			/* Put the original instruction back and rewind past
+			 * the trap byte, which is what a debugger does before
+			 * continuing from a breakpoint. */
+			test_result("POKETEXT restores the original code",
+				    ptrace(PTRACE_POKETEXT, pid, (void *)entry, orig) == 0);
+
+			memset(&regs, 0, sizeof(regs));
+			if (ptrace(PTRACE_GETREGS, pid, &regs, 0) == 0) {
+				test_result("RIP is just past the breakpoint",
+					    regs.rip == entry + 1);
+				regs.rip = entry;
+				test_result("SETREGS rewinds RIP",
+					    ptrace(PTRACE_SETREGS, pid, &regs,
+						   0) == 0);
+			} else {
+				test_fail("breakpoint: GETREGS after trap failed");
+			}
+		}
+	} else {
+		test_fail("breakpoint: CONT failed");
+	}
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+}
+
+/* waitpid with a ceiling.
+ *
+ * The ptrace tests below are all "resume, then expect a stop".  A blocking
+ * wait for a stop that never arrives hangs the whole suite with no clue which
+ * assertion was owed the answer, so every wait here is bounded and a timeout
+ * is reported as the failure it is.  Returns the pid, 0 on timeout, -1 on
+ * error. */
+static pid_t ptrace_wait_bounded(pid_t pid, int *st, int ms)
+{
+	for (int waited = 0; waited < ms; waited += 5) {
+		pid_t r = waitpid(pid, st, WNOHANG);
+
+		if (r != 0)
+			return r;
+		usleep(5000);
+	}
+	return 0;
+}
+
+static void test_ptrace_syscall_trace(void)
+{
+	printf("\n[TEST] ptrace syscall entry/exit stops\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace syscall: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		/* A predictable, cheap syscall in a loop, so there is always a
+		 * boundary coming. */
+		for (;;) {
+			(void)getpid();
+			usleep(10000);
+		}
+	}
+	usleep(100000);
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, 0) != 0) {
+		test_fail("ptrace syscall: attach failed");
+		kill(pid, SIGKILL);
+		int st = 0;
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	int st = 0;
+
+	ptrace_wait_bounded(pid, &st, 2000);
+
+	/* Entry. */
+	int entry_ok = 0, exit_ok = 0;
+	unsigned long entry_nr = 0;
+
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, 0) == 0) {
+		pid_t r = ptrace_wait_bounded(pid, &st, 2000);
+
+		if (r == pid && WIFSTOPPED(st) &&
+		    (st >> 16) == PTRACE_EVENT_SYSCALL_ENTRY) {
+			entry_ok = 1;
+			(void)ptrace(PTRACE_GETEVENTMSG, pid, NULL, (long)&entry_nr);
+		}
+	}
+	test_result("PTRACE_SYSCALL stops on syscall entry", entry_ok);
+	test_result("the entry stop names the syscall", entry_ok && entry_nr > 0);
+
+	/* Exit of the same call. */
+	if (entry_ok && ptrace(PTRACE_SYSCALL, pid, NULL, 0) == 0) {
+		pid_t r = ptrace_wait_bounded(pid, &st, 2000);
+
+		if (r == pid && WIFSTOPPED(st) &&
+		    (st >> 16) == PTRACE_EVENT_SYSCALL_EXIT)
+			exit_ok = 1;
+	}
+	test_result("the following stop is the matching syscall exit", exit_ok);
+
+	/* A plain continue must stop asking: the tracee should run on rather
+	 * than trapping at the next boundary. */
+	if (ptrace(PTRACE_CONT, pid, NULL, 0) == 0) {
+		pid_t r = ptrace_wait_bounded(pid, &st, 400);
+
+		test_result("CONT after SYSCALL stops tracing syscalls",
+			    r == 0);
+	} else {
+		test_fail("syscall trace: final CONT failed");
+	}
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+}
+
+static void test_ptrace_fork_events(void)
+{
+	printf("\n[TEST] ptrace fork-following\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("ptrace fork event: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		/* Stop so the tracer can set its options before the fork. */
+		raise(SIGSTOP);
+		pid_t g = fork();
+
+		if (g == 0)
+			_exit(7); /* grandchild: exists only to be reported */
+		for (;;)
+			usleep(20000);
+	}
+
+	int st = 0;
+	pid_t r = ptrace_wait_bounded(pid, &st, 2000);
+
+	if (!(r == pid && WIFSTOPPED(st))) {
+		test_fail("fork event: child did not stop for TRACEME");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	test_result("SETOPTIONS accepts TRACEFORK",
+		    ptrace(PTRACE_SETOPTIONS, pid, NULL,
+			   PTRACE_O_TRACEFORK) == 0);
+
+	int got_event = 0;
+	unsigned long gpid = 0;
+
+	if (ptrace(PTRACE_CONT, pid, NULL, 0) == 0) {
+		/* Two stops are owed: the parent's fork event and the child's
+		 * own stop.  Either may be reported first, so collect until the
+		 * parent's event turns up. */
+		for (int i = 0; i < 4 && !got_event; i++) {
+			pid_t w = ptrace_wait_bounded(-1, &st, 2000);
+
+			if (w <= 0)
+				break;
+			if (w == pid && WIFSTOPPED(st) &&
+			    (st >> 16) == PTRACE_EVENT_FORK) {
+				got_event = 1;
+				(void)ptrace(PTRACE_GETEVENTMSG, pid, NULL,
+					     (long)&gpid);
+			}
+		}
+	}
+
+	test_result("forking a traced process reports a fork event", got_event);
+	test_result("the fork event carries the new pid",
+		    got_event && gpid > 1);
+
+	/* The forked child is NOT a thread of its parent.
+	 *
+	 * A debugger asks the kernel which tasks belong to the process it is
+	 * debugging, and that answer is the only thing that tells a forked
+	 * child apart from a new thread -- both arrive as a stop naming a task
+	 * id it has not seen.  Get it wrong and the child is announced as a
+	 * thread of the parent, buried at the next refresh, and the next stop
+	 * reported against it takes the debugger down.  Every command run from
+	 * a shell under a debugger is a fork, so this is not a corner. */
+	if (got_event && gpid > 1) {
+		unsigned int ids[16];
+		long n = ptrace(PTRACE_GETLWPLIST, pid, ids, (long)16);
+		int found_child = 0;
+
+		for (long i = 0; i < n; i++)
+			if (ids[i] == (unsigned int)gpid)
+				found_child = 1;
+		test_result("a forked child is not listed as a thread of its parent",
+			    n > 0 && !found_child);
+	}
+
+	/* The grandchild was parked before it could run, so it is still there
+	 * to be released -- which is the whole point of following a fork. */
+	if (got_event && gpid > 1) {
+		int cont_ok = (ptrace(PTRACE_CONT, (pid_t)gpid, NULL, 0) == 0);
+
+		test_result("the new child was held for the tracer", cont_ok);
+		kill((pid_t)gpid, SIGKILL);
+		int gst = 0;
+		ptrace_wait_bounded((pid_t)gpid, &gst, 500);
+	}
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+	/* Reap anything else this test left behind. */
+	while (waitpid(-1, &st, WNOHANG) > 0)
+		;
+}
+
+/* A thread's life, as a debugger sees it.
+ *
+ * A thread is invisible from outside its process and is nobody's child, so the
+ * only way a debugger learns that one appeared or went away is for the kernel
+ * to say so.  Without both halves `info threads' shows the threads that were
+ * alive at some point in the past, corrected only when the process next
+ * happens to stop -- which for a program running under `continue' means not
+ * until the user interrupts it.
+ */
+static void *pte_thread_fn(void *arg)
+{
+	(void)arg;
+	return NULL; /* exists to be born and to die */
+}
+
+static void test_ptrace_thread_events(void)
+{
+	printf("\n[TEST] ptrace thread create/exit events\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("thread events: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		pthread_t th;
+
+		if (ptrace(PTRACE_TRACEME, 0, NULL, 0) != 0)
+			_exit(42);
+		/* Stop BEFORE the thread exists: the events are opt-in and the
+		 * opt-in has to be in place first. */
+		raise(SIGSTOP);
+		if (pthread_create(&th, NULL, pte_thread_fn, NULL) != 0)
+			_exit(43);
+		pthread_join(th, NULL);
+		for (;;)
+			usleep(20000);
+	}
+
+	int st = 0;
+	pid_t r = ptrace_wait_bounded(pid, &st, 2000);
+
+	if (!(r == pid && WIFSTOPPED(st))) {
+		test_fail("thread events: child did not stop for TRACEME");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+
+	test_result("SETOPTIONS accepts TRACECLONE|TRACEEXIT",
+		    ptrace(PTRACE_SETOPTIONS, pid, NULL,
+			   PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT) == 0);
+
+	int got_clone = 0, got_exit = 0;
+	unsigned long tid = 0;
+
+	if (ptrace(PTRACE_CONT, pid, NULL, 0) == 0) {
+		/* Collect stops until both events have turned up.  Each one
+		 * stops the whole process, so every stop is resumed before
+		 * asking for the next. */
+		for (int i = 0; i < 16 && !(got_clone && got_exit); i++) {
+			pid_t w = ptrace_wait_bounded(-1, &st, 2000);
+
+			if (w <= 0 || !WIFSTOPPED(st))
+				break;
+			if ((st >> 16) == PTRACE_EVENT_CLONE) {
+				got_clone = 1;
+				(void)ptrace(PTRACE_GETEVENTMSG, w, NULL,
+					     (long)&tid);
+			} else if ((st >> 16) == PTRACE_EVENT_EXIT) {
+				/* The thread that is going is the one that
+				 * stopped, so the stop names it directly. */
+				if (tid != 0 && w == (pid_t)tid)
+					got_exit = 1;
+			}
+			if (ptrace(PTRACE_CONT, w, NULL, 0) != 0)
+				break;
+		}
+	}
+
+	test_result("creating a thread reports a clone event", got_clone);
+	test_result("the clone event carries the new thread id",
+		    got_clone && tid > 1 && (pid_t)tid != pid);
+	test_result("a thread exiting reports an exit event", got_exit);
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+	while (waitpid(-1, &st, WNOHANG) > 0)
+		;
+}
+
+/* Detaching releases the whole process, not just the thread named.
+ *
+ * Every trace stop parks the whole thread group, and the siblings are parked
+ * silently -- no event, no stop signal -- so a resume aimed at the group is the
+ * only thing that ever releases them.  A detach that let go of one thread left
+ * the others stopped with no tracer left to continue them: threads that can
+ * never run again inside a process that still looks alive.
+ */
+static void *dtg_thread_fn(void *arg)
+{
+	volatile int *go = (volatile int *)arg;
+
+	while (!*go)
+		usleep(10000);
+	return NULL;
+}
+
+static void test_ptrace_detach_releases_group(void)
+{
+	printf("\n[TEST] ptrace DETACH releases every thread\n");
+
+	int pfd[2];
+
+	if (pipe(pfd) != 0) {
+		test_fail("detach group: pipe failed");
+		return;
+	}
+
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		test_fail("detach group: fork failed");
+		close(pfd[0]);
+		close(pfd[1]);
+		return;
+	}
+	if (pid == 0) {
+		static volatile int go;
+		pthread_t th[3];
+		char c = 'x';
+
+		close(pfd[0]);
+		for (int i = 0; i < 3; i++)
+			pthread_create(&th[i], NULL, dtg_thread_fn,
+				       (void *)&go);
+		usleep(150000);
+		go = 1;
+		for (int i = 0; i < 3; i++)
+			pthread_join(th[i], NULL);
+		/* Only reached if every thread was released. */
+		(void)!write(pfd[1], &c, 1);
+		close(pfd[1]);
+		for (;;)
+			usleep(50000);
+	}
+
+	close(pfd[1]);
+	usleep(100000);
+
+	int st = 0;
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, 0) != 0) {
+		test_fail("detach group: attach failed");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		close(pfd[0]);
+		return;
+	}
+	/* The attach stop parks every thread of the group, not just this one. */
+	ptrace_wait_bounded(pid, &st, 2000);
+
+	test_result("DETACH from a threaded tracee succeeds",
+		    ptrace(PTRACE_DETACH, pid, NULL, 0) == 0);
+
+	/* The proof: the child can only reach its write() if all three threads
+	 * ran again and were joined.  A thread left stopped hangs the join. */
+	int fl = fcntl(pfd[0], F_GETFL, 0);
+
+	fcntl(pfd[0], F_SETFL, fl | O_NONBLOCK);
+
+	int released = 0;
+	char c = 0;
+
+	for (int i = 0; i < 400 && !released; i++) {
+		if (read(pfd[0], &c, 1) == 1)
+			released = 1;
+		else
+			usleep(10000);
+	}
+	test_result("every thread runs again after DETACH", released);
+
+	close(pfd[0]);
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+	while (waitpid(-1, &st, WNOHANG) > 0)
+		;
+}
+
+/* Two signal handlers on the stack at once.
+ *
+ * A handler can be interrupted by another signal, so a process can have several
+ * signal frames stacked on its user stack, and each sigreturn has to find ITS
+ * OWN.  Recording "the" frame address in one per-task slot can only describe
+ * the innermost: the inner sigreturn cleared it, the outer one then found
+ * nothing and failed -- and a failed sigreturn has nowhere to return to, so the
+ * trampoline ran off its end into the `hlt' that follows the syscall.  That is
+ * a privileged instruction in user mode, so it surfaced as a general protection
+ * fault reported as SIGSEGV at an address the program never chose.  Two X
+ * clients died that way on a shutdown signal followed by a restart signal.
+ *
+ * Run in a child, because the failure mode is the process dying.
+ */
+static volatile sig_atomic_t nsh_inner_ran;
+static volatile sig_atomic_t nsh_outer_resumed;
+
+static void nsh_inner_handler(int sig)
+{
+	(void)sig;
+	nsh_inner_ran = 1;
+}
+
+static void nsh_outer_handler(int sig)
+{
+	(void)sig;
+	/* A second frame on top of this one.  Reaching the line after this is
+	 * the inner sigreturn having worked. */
+	raise(SIGUSR2);
+	nsh_outer_resumed = 1;
+}
+
+static void test_nested_signal_handlers(void)
+{
+	printf("\n[TEST] nested signal handlers\n");
+
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		test_fail("nested signals: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sigemptyset(&sa.sa_mask);
+		sa.sa_handler = nsh_outer_handler;
+		sigaction(SIGUSR1, &sa, NULL);
+		sa.sa_handler = nsh_inner_handler;
+		sigaction(SIGUSR2, &sa, NULL);
+
+		nsh_inner_ran = 0;
+		nsh_outer_resumed = 0;
+
+		raise(SIGUSR1);
+
+		/* Reached only if the OUTER sigreturn worked too. */
+		_exit(nsh_inner_ran && nsh_outer_resumed ? 7 : 8);
+	}
+
+	int st = 0;
+	pid_t r = ptrace_wait_bounded(pid, &st, 3000);
+
+	test_result("a nested handler does not kill the process",
+		    r == pid && WIFEXITED(st));
+	test_result("both handlers ran and both returned",
+		    r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 7);
+
+	if (r != pid) {
+		kill(pid, SIGKILL);
+		ptrace_wait_bounded(pid, &st, 2000);
+	}
+	while (waitpid(-1, &st, WNOHANG) > 0)
+		;
+}
+
+/* The executable a tracee is running.
+ *
+ * A debugger that attached has no other way to find the binary, and without it
+ * there are no symbols, no breakpoint by name and no way to relocate a
+ * position-independent image -- `gdb -p N' is a session that can only print
+ * addresses.  The process name is a basename and argv[0] is whatever the
+ * program was invoked as: a login shell's is "-bash", which opens nothing.
+ */
+static void test_ptrace_execpath(void)
+{
+	printf("\n[TEST] ptrace PTRACE_GETEXECPATH\n");
+
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		test_fail("execpath: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		for (;;)
+			usleep(50000);
+	}
+	usleep(100000);
+
+	int st = 0;
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, 0) != 0) {
+		test_fail("execpath: attach failed");
+		kill(pid, SIGKILL);
+		waitpid(pid, &st, 0);
+		return;
+	}
+	ptrace_wait_bounded(pid, &st, 2000);
+
+	char path[512];
+	long n = ptrace(PTRACE_GETEXECPATH, pid, path, (long)sizeof(path));
+
+	test_result("GETEXECPATH reports a length", n > 0 && n < 512);
+	test_result("GETEXECPATH reports an absolute path",
+		    n > 0 && path[0] == '/');
+	/* The strongest check available from inside: the path names a file that
+	 * is really there.  A basename or an argv[0] would not. */
+	test_result("GETEXECPATH names a file that exists",
+		    n > 0 && access(path, F_OK) == 0);
+	/* A buffer that cannot hold the path and its terminator is an error,
+	 * not a silent truncation -- a caller handed an unterminated path reads
+	 * past its own buffer. */
+	errno = 0;
+	test_result("GETEXECPATH refuses a buffer that is too small",
+		    ptrace(PTRACE_GETEXECPATH, pid, path, 1) < 0);
+
+	ptrace(PTRACE_DETACH, pid, NULL, 0);
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+}
+
+/* A fatal signal ends the PROCESS, not the thread that took it.
+ *
+ * The failure this pins down is not a crash, it is a program that does not
+ * finish dying.  Only signal_select() killed the group; the paths a process
+ * takes to signal ITSELF -- which is what abort() and raise() are -- ended one
+ * thread and left the rest asleep.  A thread-group leader is reported to its
+ * parent only once its last thread has gone, so the zombie leader was never
+ * reported at all and whoever ran the program waited for ever with no message
+ * and no prompt.  gdb died this way and took its terminal with it, eight worker
+ * threads still parked in futex_wait.
+ *
+ * The threads here block on a condition variable nothing ever signals, on
+ * purpose: that is where those workers were, and a thread in an untimed wait
+ * has nothing of its own that will ever wake it.
+ */
+static pthread_mutex_t fkg_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fkg_cond;
+
+static void *fkg_thread_fn(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&fkg_lock);
+	for (;;)
+		pthread_cond_wait(&fkg_cond, &fkg_lock);
+	return NULL;
+}
+
+static void test_fatal_signal_kills_group(void)
+{
+	printf("\n[TEST] a fatal signal ends the whole process\n");
+
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		test_fail("fatal group: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		pthread_t th[4];
+
+		pthread_cond_init(&fkg_cond, NULL);
+		for (int i = 0; i < 4; i++)
+			pthread_create(&th[i], NULL, fkg_thread_fn, NULL);
+		usleep(150000); /* let them reach the wait */
+		/* kill(getpid(), SIGABRT) with the default disposition: the
+		 * self-signal path, which is the one that was broken. */
+		raise(SIGABRT);
+		for (;;)
+			usleep(50000); /* must never be reached */
+	}
+
+	int st = 0;
+	pid_t r = ptrace_wait_bounded(pid, &st, 5000);
+
+	test_result("a threaded process that aborts is reaped", r == pid);
+	test_result("...and reports the fatal signal",
+		    r == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+
+	if (r != pid) {
+		/* Left half-dead: clean up so the rest of the suite runs. */
+		kill(pid, SIGKILL);
+		ptrace_wait_bounded(pid, &st, 2000);
+	}
+	while (waitpid(-1, &st, WNOHANG) > 0)
+		;
+}
+
+/* Tracing something that is not your child.
+ *
+ * This is what a debugger does every time it is pointed at a running program,
+ * and it is the case nothing else in this file covers: every other tracee here
+ * is a child, so the child list describes it and the ordinary waitpid()
+ * machinery reports everything about it.  A tracee that is NOT a child appears
+ * on no list the tracer owns -- so if the tracee link does not carry its death,
+ * nothing does, and the tracer waits for a report that cannot arrive.
+ *
+ * The middle process stays alive on purpose.  It makes the tracee a
+ * GRANDCHILD, which is what makes this a non-child tracer, and it holds the
+ * tracee's zombie so the answer does not depend on who reaps first.
+ */
+static void test_ptrace_attach_nonchild(void)
+{
+	printf("\n[TEST] ptrace attach to a non-child\n");
+
+	int pfd[2];
+
+	if (pipe(pfd) != 0) {
+		test_fail("attach non-child: pipe failed");
+		return;
+	}
+
+	pid_t mid = fork();
+
+	if (mid < 0) {
+		test_fail("attach non-child: fork failed");
+		close(pfd[0]);
+		close(pfd[1]);
+		return;
+	}
+	if (mid == 0) {
+		close(pfd[0]);
+		pid_t g = fork();
+
+		if (g == 0) {
+			close(pfd[1]);
+			/* Alive long enough to be attached to, then a plain
+			 * exit with a status worth checking. */
+			for (int i = 0; i < 60; i++)
+				usleep(20000);
+			_exit(42);
+		}
+		(void)!write(pfd[1], &g, sizeof(g));
+		close(pfd[1]);
+		for (;;)
+			usleep(50000);
+	}
+
+	close(pfd[1]);
+	pid_t g = 0;
+	int n = (int)read(pfd[0], &g, sizeof(g));
+
+	close(pfd[0]);
+
+	int st = 0;
+
+	if (n != (int)sizeof(g) || g <= 1) {
+		test_fail("attach non-child: no grandchild pid");
+		kill(mid, SIGKILL);
+		waitpid(mid, &st, 0);
+		return;
+	}
+
+	usleep(100000); /* let it reach its loop */
+
+	int attached = (ptrace(PTRACE_ATTACH, g, NULL, 0) == 0);
+
+	test_result("attach to a process that is not our child", attached);
+
+	if (attached) {
+		pid_t r = ptrace_wait_bounded(g, &st, 2000);
+
+		test_result("an attached non-child reports its stop",
+			    r == g && WIFSTOPPED(st));
+
+		if (ptrace(PTRACE_CONT, g, NULL, 0) == 0) {
+			/* The report with no other route home. */
+			r = ptrace_wait_bounded(g, &st, 4000);
+			test_result(
+				"an attached non-child's exit reaches its tracer",
+				r == g && WIFEXITED(st) &&
+					WEXITSTATUS(st) == 42);
+		} else {
+			test_fail("attach non-child: CONT failed");
+		}
+	}
+
+	kill(g, SIGKILL);
+	kill(mid, SIGKILL);
+	waitpid(mid, &st, 0);
+	while (waitpid(-1, &st, WNOHANG) > 0)
+		;
+}
+
+/* The dynamic loader's debugger rendezvous.
+ *
+ * A debugger reads this out of a stopped process's memory to learn what is
+ * loaded and where; there is no call it can make.  Verified from inside the
+ * process because that is the only place it can be checked automatically -- but
+ * every field checked here is one an external debugger depends on, and the
+ * structure layout is fixed by convention rather than by us, so a mistake in it
+ * is invisible until a debugger reads garbage. */
+static int rtld_main_dyn_cb(struct dl_phdr_info *info, size_t sz, void *data)
+{
+	(void)sz;
+	if (info->dlpi_name && info->dlpi_name[0] != '\0')
+		return 0; /* not the main executable */
+	for (Elf64_Half i = 0; i < info->dlpi_phnum; i++) {
+		if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+			*(const Elf64_Dyn **)data =
+				(const Elf64_Dyn *)(info->dlpi_addr +
+						    info->dlpi_phdr[i].p_vaddr);
+			return 1;
+		}
+	}
+	return 1;
+}
+
+/* Find the live r_debug the way a debugger does: read DT_DEBUG out of the main
+ * executable's dynamic section, which the loader filled in with the address of
+ * ITS r_debug.
+ *
+ * Deliberately NOT the `extern _r_debug` symbol.  Referencing that from the
+ * executable makes the linker emit a copy relocation: the loader's r_debug is
+ * duplicated into the executable's BSS at relocation time -- before the loader
+ * has populated it -- so the symbol reads a permanently stale snapshot while
+ * DT_DEBUG points at the live one.  gdb reads DT_DEBUG; so does this. */
+static struct r_debug *rtld_live_r_debug(void)
+{
+	const Elf64_Dyn *dyn = NULL;
+
+	(void)dl_iterate_phdr(rtld_main_dyn_cb, &dyn);
+	if (!dyn)
+		return NULL;
+	for (const Elf64_Dyn *e = dyn; e->d_tag != DT_NULL; e++)
+		if (e->d_tag == DT_DEBUG)
+			return (struct r_debug *)(unsigned long)e->d_un.d_ptr;
+	return NULL;
+}
+
+static int rtld_map_len(struct r_debug *rd)
+{
+	int n = 0;
+
+	for (struct link_map *m = rd->r_map; m && n < 256; m = m->l_next)
+		n++;
+	return n;
+}
+
+static void test_rtld_debug_rendezvous(void)
+{
+	printf("\n[TEST] loader debugger rendezvous (r_debug / link_map)\n");
+
+	/* The whole discovery path in one step: no DT_DEBUG means a debugger has
+	 * no way in, so nothing else is worth checking. */
+	struct r_debug *rd = rtld_live_r_debug();
+
+	test_result("DT_DEBUG resolves to a live r_debug", rd != NULL);
+	if (!rd) {
+		test_fail("rendezvous: DT_DEBUG missing or NULL");
+		return;
+	}
+
+	test_result("r_debug reports version 1", rd->r_version == 1);
+	test_result("r_debug has an object list", rd->r_map != NULL);
+	test_result("r_brk is a real breakpoint address", rd->r_brk != 0);
+	test_result("r_ldbase names where the loader is mapped",
+		    rd->r_ldbase != 0);
+	test_result("the list reads as consistent while idle",
+		    rd->r_state == RT_CONSISTENT);
+
+	/* A debugger identifies the program by position and by the empty name;
+	 * it has no other way to tell which object is the executable. */
+	struct link_map *m = rd->r_map;
+
+	test_result("the first object is the main executable (empty name)",
+		    m && m->l_name && m->l_name[0] == '\0');
+
+	int n = 0, all_have_ld = 1, saw_named = 0;
+
+	for (m = rd->r_map; m && n < 64; m = m->l_next) {
+		n++;
+		if (!m->l_ld)
+			all_have_ld = 0;
+		if (m->l_name && m->l_name[0] != '\0')
+			saw_named = 1;
+	}
+	test_result("more than one object is listed", n >= 2);
+	test_result("every object reports its dynamic section", all_have_ld);
+	test_result("shared objects are listed by name", saw_named);
+
+	/* Walkable in both directions: a debugger may start from either end. */
+	int links_ok = (rd->r_map != NULL);
+
+	for (m = rd->r_map; m && m->l_next; m = m->l_next) {
+		if (m->l_next->l_prev != m) {
+			links_ok = 0;
+			break;
+		}
+	}
+	test_result("the list is correctly doubly linked", links_ok);
+
+	/* Loading a library must show up on the list, and unloading must take it
+	 * off again -- a stale entry is one a debugger would follow into pages
+	 * that are no longer mapped. */
+	int before = rtld_map_len(rd);
+	void *h = dlopen("/lib/libtestlib.so", RTLD_LAZY);
+
+	if (h) {
+		test_result("dlopen adds the object to the list",
+			    rtld_map_len(rd) > before);
+		test_result("the list is consistent again after dlopen",
+			    rd->r_state == RT_CONSISTENT);
+
+		dlclose(h);
+
+		test_result("dlclose removes it again",
+			    rtld_map_len(rd) == before);
+		test_result("the list is consistent again after dlclose",
+			    rd->r_state == RT_CONSISTENT);
+	} else {
+		printf("  [SKIP] /lib/libtestlib.so not available\n");
 	}
 }
 
@@ -13248,6 +15231,28 @@ int main(int argc, char **argv)
 	test_poll_redirected_stdio();
 	test_ioctl_non_tty();
 	test_jobctl_wait();
+	test_cred_proc_visibility();
+	test_cred_sched_control();
+	test_rusage_no_overflow();
+	test_ptrace_traceme_basic();
+	test_ptrace_getauxv();
+	test_ptrace_threads();
+	test_ptrace_signal_delivery_stop();
+	test_ptrace_hwwatchpoint();
+	test_ptrace_attach_detach();
+	test_ptrace_permission_denied();
+	test_ptrace_regs_and_mem();
+	test_ptrace_singlestep();
+	test_ptrace_swbreakpoint();
+	test_ptrace_syscall_trace();
+	test_ptrace_fork_events();
+	test_ptrace_thread_events();
+	test_ptrace_attach_nonchild();
+	test_ptrace_execpath();
+	test_nested_signal_handlers();
+	test_ptrace_detach_releases_group();
+	test_fatal_signal_kills_group();
+	test_rtld_debug_rendezvous();
 	test_shm();
 	test_sysv_shm();
 	test_tls();

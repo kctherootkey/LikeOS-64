@@ -133,6 +133,13 @@ typedef struct siginfo {
 } siginfo_t;
 
 // Accessor macros
+/* If this fires, siginfo_t here and in user/lib/libc/include/signal.h have
+ * drifted apart -- and the kernel copies this struct verbatim into a signal
+ * frame and out through PTRACE_GETSIGINFO, so whichever is larger writes over
+ * the other one's memory. */
+_Static_assert(sizeof(siginfo_t) == 128,
+	       "siginfo_t must match user/lib/libc/include/signal.h");
+
 #define si_pid _sifields._kill.si_pid
 #define si_uid _sifields._kill.si_uid
 #define si_timerid _sifields._timer.si_tid
@@ -155,6 +162,26 @@ typedef struct siginfo {
 #define SI_ASYNCIO -4 // Async I/O
 #define SI_SIGIO -5 // Signal I/O
 #define SI_TKILL -6 // tkill
+
+/* si_code values for the synchronous fault signals.
+ *
+ * A debugger reads these: they are the difference between "it crashed" and
+ * "it wrote to an address that is not mapped".  gdb surfaces them through
+ * $_siginfo and in the message it prints when the inferior stops. */
+#define SEGV_MAPERR 1 /* address not mapped */
+#define SEGV_ACCERR 2 /* mapped, but the access was not permitted */
+#define ILL_ILLOPC 1 /* illegal opcode */
+#define ILL_ILLOPN 2 /* illegal operand */
+#define ILL_PRVOPC 5 /* privileged opcode */
+#define FPE_INTDIV 1 /* integer divide by zero */
+#define FPE_INTOVF 2 /* integer overflow */
+#define FPE_FLTDIV 3 /* floating-point divide by zero */
+#define FPE_FLTINV 7 /* invalid floating-point operation */
+#define BUS_ADRALN 1 /* invalid address alignment */
+#define BUS_ADRERR 2 /* non-existent physical address */
+#define TRAP_BRKPT 1 /* process breakpoint */
+#define TRAP_TRACE 2 /* process trace trap */
+#define TRAP_HWBKPT 4 /* hardware breakpoint or watchpoint */
 
 // SIGCHLD si_code
 #define CLD_EXITED 1 // Child exited
@@ -438,7 +465,22 @@ typedef struct task_signal_state {
 	struct k_itimerval itimer_prof; // ITIMER_PROF
 	uint64_t alarm_ticks; // alarm() expiration tick
 	uint64_t
-		signal_frame_addr; // Address of current signal frame (for sigreturn)
+		/* How many signal frames this task currently has on its user
+		 * stack.  A COUNT, not an address: handlers nest, and one slot
+		 * holding "the" frame address could only ever describe the
+		 * innermost one.  The outer handler's sigreturn then found the
+		 * slot already cleared by the inner one and failed, and since
+		 * the sigreturn trampoline has nowhere to return to it fell
+		 * through to its own `hlt' -- a general protection fault in
+		 * user code, reported as SIGSEGV at an address that is not the
+		 * program's fault.  ctwm and pcmanfm both died that way on a
+		 * shutdown signal followed by a restart signal.
+		 *
+		 * The frame's ADDRESS comes from the user stack pointer at the
+		 * sigreturn call, which is where the frame demonstrably is; see
+		 * signal_restore_frame().  This count is only the guard that
+		 * says a sigreturn is happening inside a handler at all. */
+		signal_frame_depth;
 } task_signal_state_t;
 
 // Kernel POSIX timer
@@ -489,10 +531,43 @@ void signal_notify_jobctl(struct task *task, int signum, int stopped);
  * caller may signal anyone; otherwise the sender's real or effective uid must
  * match the target's real or saved-set uid (SIGCONT is also allowed within the
  * same session).  Returns 0 if permitted, or -EPERM. */
+/* RFLAGS the kernel is willing to give user mode.
+ *
+ * Everything that returns to user mode goes through this.  Two reasons:
+ *
+ * IF is FORCED ON.  A user thread resumed with interrupts disabled cannot be
+ * preempted and takes every fault with IRQs off -- so a page fault on a
+ * demand-paged text page then read from ext4 with interrupts disabled, which
+ * is the "might_sleep() called with IRQs disabled" storm, and the
+ * "USER RIP ... with interrupts disabled ... the saved RFLAGS is wrong"
+ * warning that precedes it.  The saved RFLAGS was not wrong; it was obeyed.
+ *
+ * And the source of it is reachable from user code: sigreturn(2) restores
+ * RFLAGS from the signal frame on the USER stack, which the process can edit.
+ * Unfiltered, that let any program clear its own IF -- pinning a CPU with
+ * interrupts off -- or set IOPL and NT.  Only the flags a program may set for
+ * itself survive; the rest come from here.
+ */
+#define USER_RFLAGS_KEEP                                                  	(0x1UL /*CF*/ | 0x2UL /*reserved, must be 1*/ | 0x4UL /*PF*/ |     	 0x10UL /*AF*/ | 0x40UL /*ZF*/ | 0x80UL /*SF*/ | 0x100UL /*TF*/ | 	 0x400UL /*DF*/ | 0x800UL /*OF*/ | 0x200000UL /*ID*/)
+
+static inline uint64_t user_rflags_sanitize(uint64_t f)
+{
+	return (f & USER_RFLAGS_KEEP) | 0x202UL; /* bit 1 + IF */
+}
+
 int signal_permission(struct task *target, int sig);
 int signal_pending(struct task *task);
 int signal_should_restart(struct task *task);
 int signal_dequeue(struct task *task, kernel_sigset_t *mask, siginfo_t *info);
+/* Queue a synchronous fault signal (SIGSEGV/SIGILL/SIGBUS/SIGFPE) with the
+ * si_code and si_addr a debugger needs, forcing the disposition back to default
+ * if the program blocked or ignored it -- a fault cannot be declined, since
+ * returning to the instruction that caused it just causes it again.
+ *
+ * Decides nothing else: no stop, no kill, no report.  The return-to-user path
+ * acts on it, which is the only context where a tracer can be consulted. */
+void signal_force_fault(struct task *task, int sig, int code, uint64_t addr);
+
 void signal_deliver(struct task *task);
 void signal_deliver_irq(struct task *task, struct interrupt_frame *frame);
 void signal_check_timers(struct task *task, uint64_t current_tick);

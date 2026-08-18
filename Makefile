@@ -49,6 +49,31 @@ GCC = gcc
 LD = ld
 OBJCOPY = objcopy
 STRIP = strip
+
+# Symbol retention for USERSPACE binaries, separate from the kernel's NO_STRIP.
+#
+# Every userspace program and library is stripped by default, which keeps the
+# image small but leaves a debugger with nothing to work from: no function
+# names, no line numbers, no way to place a breakpoint by anything but an
+# address.  Building with NO_STRIP_USER=1 keeps the symbol tables, and pairing
+# it with -g in the port's own flags keeps the DWARF too.
+#
+# Implied by DEBUG=1, for the same reason it implies the kernel's NO_STRIP: a
+# debug build that cannot be debugged is not one.
+#
+# One exemption: gdb itself is always stripped, because its own symbols cannot
+# help it debug anything else and they cost 148M.  See $(BUILD_DIR)/gdb.
+#
+# `true` rather than a conditional at all 100-odd call sites: it accepts and
+# ignores the arguments, so the recipes do not have to change shape.
+ifeq ($(DEBUG),1)
+  override NO_STRIP_USER := 1
+endif
+ifdef NO_STRIP_USER
+  USER_STRIP = true
+else
+  USER_STRIP = $(STRIP)
+endif
 DD = dd
 QEMU = qemu-system-x86_64
 XORRISO = xorriso
@@ -343,14 +368,16 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	sleep strings file grep wc head tail echo printf free uptime nproc dmesg which date time \
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
-	id whoami groups su passwd adduser addgroup deluser delgroup kdump
+	id whoami groups su passwd adduser addgroup deluser delgroup kdump \
+	gdb
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
 	libdlbase.so libdlchain.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
-	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump
+	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
+	cxxprobe
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -750,151 +777,151 @@ userland-libpam: userland-libc userland-libcrypt
 # Copy shared libraries to build directory
 $(BUILD_DIR)/ld-likeos.so: userland-rtld | $(BUILD_DIR)
 	cp user/lib/rtld/ld-likeos.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libc.so: userland-libc | $(BUILD_DIR)
 	cp user/lib/libc/libc.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libtestlib.so: userland-testlib | $(BUILD_DIR)
 	cp user/lib/testlib/libtestlib.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libdlbase.so: userland-dlchain | $(BUILD_DIR)
 	cp user/lib/dlchain/libdlbase.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libdlchain.so: userland-dlchain | $(BUILD_DIR)
 	cp user/lib/dlchain/libdlchain.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libcrypt.so: userland-libcrypt | $(BUILD_DIR)
 	cp user/lib/libcrypt/libcrypt.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libpam.so: userland-libpam | $(BUILD_DIR)
 	cp user/lib/libpam/libpam.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Build test programs using libc
 $(BUILD_DIR)/user_test.elf: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/test_syscalls
 	cp $(USER_DIR)/tests/test_syscalls $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/test_libc: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/test_libc
 	cp $(USER_DIR)/tests/test_libc $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ext4test: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/ext4test
 	cp $(USER_DIR)/tests/ext4test $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hello
 	cp $(USER_DIR)/hello $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Login stack: login authenticates via libpam/libcrypt; getty+init use libc only.
 $(BUILD_DIR)/login: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) login
 	cp $(USER_DIR)/login $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/getty: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) getty
 	cp $(USER_DIR)/getty $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/init: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) init
 	cp $(USER_DIR)/init $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Account/identity utilities.  id/whoami/groups/adduser/addgroup use libc only;
 # su and passwd link against libpam/libcrypt.
 $(BUILD_DIR)/id: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) id
 	cp $(USER_DIR)/id $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # /dev/fb0 exerciser (X.org fbdev-style ioctl+mmap sequence)
 $(BUILD_DIR)/fbtest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/fbtest
 	cp $(USER_DIR)/tests/fbtest $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/whoami: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) whoami
 	cp $(USER_DIR)/whoami $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/groups: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) groups
 	cp $(USER_DIR)/groups $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/adduser: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) adduser
 	cp $(USER_DIR)/adduser $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/addgroup: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) addgroup
 	cp $(USER_DIR)/addgroup $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/deluser: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) deluser
 	cp $(USER_DIR)/deluser $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/delgroup: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) delgroup
 	cp $(USER_DIR)/delgroup $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/su: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) su
 	cp $(USER_DIR)/su $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/passwd: userland-libc userland-rtld userland-libcrypt | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) passwd
 	cp $(USER_DIR)/passwd $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ls: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ls
 	cp $(USER_DIR)/ls $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cat
 	cp $(USER_DIR)/cat $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/pwd: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) pwd
 	cp $(USER_DIR)/pwd $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/stat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) stat
 	cp $(USER_DIR)/stat $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/progerr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) progerr
 	cp $(USER_DIR)/progerr $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/testmem
 	cp $(USER_DIR)/tests/testmem $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) memstat
@@ -906,7 +933,20 @@ $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/pmap: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/pmap
 	cp $(USER_DIR)/tests/pmap $@
-	$(STRIP) --strip-unneeded $@
+
+# cxxprobe: what a C++ MAIN EXECUTABLE needs from this system, step by step.
+#
+# Built the way gdb is -- likeos-c++, the X sysroot, and the compiler's own
+# default link -- and not the way everything in user/ is, because that is the
+# whole point: a program linked through user_dyn.lds comes out with neither a
+# DT_INIT_ARRAY nor symbol versioning, and gdb has both.  It prints a marker
+# around every step, so a crash names the feature that broke rather than
+# leaving an 11 MB binary and a null RIP to explain themselves.
+$(BUILD_DIR)/cxxprobe: user/tests/cxxprobe.cc userland-libc userland-rtld ports-gtk3 | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/build/xorg-sysroot \
+		ports/xorg/toolchain/likeos-c++ -O2 -o $@ $<
+	$(USER_STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # ttydump: shows what the terminal actually sends, and in which reads.  Every
 # other reader on this image is canonical-mode, which hides any sequence that
@@ -914,251 +954,251 @@ $(BUILD_DIR)/pmap: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/ttydump: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/ttydump
 	cp $(USER_DIR)/tests/ttydump $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/teststress: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/teststress
 	cp $(USER_DIR)/tests/teststress $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/netstress: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/netstress
 	cp $(USER_DIR)/tests/netstress $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/openssltest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/openssltest
 	cp $(USER_DIR)/tests/openssltest $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # openssltest is staged into the ext4 image via GPT_PREREQS (ROOT_USRLOCAL_BINS).
 
 $(BUILD_DIR)/usbtest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/usbtest
 	cp $(USER_DIR)/tests/usbtest $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # usbtest is staged into the ext4 image via GPT_PREREQS (ROOT_USRLOCAL_BINS).
 
 $(BUILD_DIR)/permbench: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) permbench
 	cp $(USER_DIR)/permbench $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uname: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uname
 	cp $(USER_DIR)/uname $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/shutdown: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) shutdown
 	cp $(USER_DIR)/shutdown $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/poweroff: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) poweroff
 	cp $(USER_DIR)/poweroff $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ps: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ps
 	cp $(USER_DIR)/ps $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cp: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cp
 	cp $(USER_DIR)/cp $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/mv: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) mv
 	cp $(USER_DIR)/mv $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/rm: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) rm
 	cp $(USER_DIR)/rm $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/mkdir: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) mkdir
 	cp $(USER_DIR)/mkdir $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ln: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ln
 	cp $(USER_DIR)/ln $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/chmod: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) chmod
 	cp $(USER_DIR)/chmod $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/readlink: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) readlink
 	cp $(USER_DIR)/readlink $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/rmdir: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) rmdir
 	cp $(USER_DIR)/rmdir $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/touch: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) touch
 	cp $(USER_DIR)/touch $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/more: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) more
 	cp $(USER_DIR)/more $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/less: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) less
 	cp $(USER_DIR)/less $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/clear: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) clear
 	cp $(USER_DIR)/clear $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/env: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) env
 	cp $(USER_DIR)/env $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/kill: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) kill
 	cp $(USER_DIR)/kill $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/find: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) find
 	cp $(USER_DIR)/find $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/df: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) df
 	cp $(USER_DIR)/df $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/du: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) du
 	cp $(USER_DIR)/du $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hexdump: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hexdump
 	cp $(USER_DIR)/hexdump $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cmp: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cmp
 	cp $(USER_DIR)/cmp $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/sleep: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sleep
 	cp $(USER_DIR)/sleep $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/strings: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) strings
 	cp $(USER_DIR)/strings $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/file: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) file
 	cp $(USER_DIR)/file $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/grep: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) grep
 	cp $(USER_DIR)/grep $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/wc: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) wc
 	cp $(USER_DIR)/wc $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/head: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) head
 	cp $(USER_DIR)/head $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/tail: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tail
 	cp $(USER_DIR)/tail $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/echo: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) echo
 	cp $(USER_DIR)/echo $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/printf: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) printf
 	cp $(USER_DIR)/printf $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/free: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) free
 	cp $(USER_DIR)/free $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uptime: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uptime
 	cp $(USER_DIR)/uptime $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/nproc: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) nproc
 	cp $(USER_DIR)/nproc $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/dmesg: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) dmesg
 	cp $(USER_DIR)/dmesg $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/kdump: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) kdump
 	cp $(USER_DIR)/kdump $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/which: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) which
 	cp $(USER_DIR)/which $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/date: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) date
 	cp $(USER_DIR)/date $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/time: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) time
 	cp $(USER_DIR)/time $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/sort: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sort
 	cp $(USER_DIR)/sort $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uniq: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uniq
 	cp $(USER_DIR)/uniq $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cut: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cut
 	cp $(USER_DIR)/cut $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Text and expression utilities that scripts assume exist.  sed and expr were
 # missing until startx needed them: it calls `tty` to find its terminal, `expr`
@@ -1167,107 +1207,107 @@ $(BUILD_DIR)/cut: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/sed: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sed
 	cp $(USER_DIR)/sed $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/expr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) expr
 	cp $(USER_DIR)/expr $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/tty: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tty
 	cp $(USER_DIR)/tty $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/tr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tr
 	cp $(USER_DIR)/tr $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/yes: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) yes
 	cp $(USER_DIR)/yes $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/true: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) true
 	cp $(USER_DIR)/true $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/false: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) false
 	cp $(USER_DIR)/false $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/top: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) top
 	cp $(USER_DIR)/top $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/man: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) man
 	cp $(USER_DIR)/man $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hostname: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hostname
 	cp $(USER_DIR)/hostname $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ping: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ping
 	cp $(USER_DIR)/ping $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ifconfig: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ifconfig
 	cp $(USER_DIR)/ifconfig $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/netstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) netstat
 	cp $(USER_DIR)/netstat $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/route: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) route
 	cp $(USER_DIR)/route $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/arp: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) arp
 	cp $(USER_DIR)/arp $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/traceroute: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) traceroute
 	cp $(USER_DIR)/traceroute $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/arping: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) arping
 	cp $(USER_DIR)/arping $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/dhclient: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) dhclient
 	cp $(USER_DIR)/dhclient $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/dig: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) dig
 	cp $(USER_DIR)/dig $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/nslookup: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) nslookup
 	cp $(USER_DIR)/nslookup $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/host: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) host
 	cp $(USER_DIR)/host $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/reboot: $(BUILD_DIR)/poweroff | $(BUILD_DIR)
 	cp $(BUILD_DIR)/poweroff $@
@@ -1282,7 +1322,7 @@ ports-ncurses: userland-libc
 
 $(BUILD_DIR)/ncurses.so: ports-ncurses | $(BUILD_DIR)
 	cp ports/lib/ncurses-likeos/ncurses.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Build GNU nano (ported to LikeOS)
 .PHONY: ports-nano
@@ -1291,7 +1331,7 @@ ports-nano: userland-libc userland-rtld ports-ncurses
 
 $(BUILD_DIR)/nano: ports-nano | $(BUILD_DIR)
 	cp ports/nano-8.3/nano $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # --- GNU bash ---------------------------------------------------------------
 .PHONY: ports-bash
@@ -1300,7 +1340,7 @@ ports-bash: userland-libc userland-rtld ports-ncurses
 
 $(BUILD_DIR)/bash: ports-bash | $(BUILD_DIR)
 	cp ports/bash-5.2.37/bash $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Build libevent (shared library used by tmux)
 .PHONY: ports-libevent
@@ -1309,7 +1349,7 @@ ports-libevent: userland-libc userland-rtld
 
 $(BUILD_DIR)/libevent.so: ports-libevent | $(BUILD_DIR)
 	cp ports/lib/libevent-2.1.12/libevent.so $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Build tmux (terminal multiplexer)
 .PHONY: ports-tmux
@@ -1318,6 +1358,42 @@ ports-tmux: userland-libc userland-rtld ports-ncurses ports-libevent
 
 $(BUILD_DIR)/tmux: ports-tmux | $(BUILD_DIR)
 	cp ports/tmux-3.6a/tmux $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# gdb.
+#
+# Depends on the GTK3 package set, which is what populates build/xorg-sysroot --
+# gdb is C++ and links libstdc++, gmp, mpfr, expat and zlib out of there.  That
+# is a heavier prerequisite than any other non-xorg port carries, and it is the
+# reason this rule names it rather than only the libc.
+#
+# It also names ncurses, and build/ncurses.so specifically, which is not
+# decoration.  gdb links curses for terminal capabilities even with the TUI
+# disabled, and it finds it through a libncurses.so symlink in the sysroot that
+# points at build/ncurses.so.  After `make clean' that file is gone and the
+# symlink dangles -- whereupon gdb's configure quietly stops finding the
+# system's curses and settles for the BUILD HOST's libtinfo instead, producing a
+# link full of undefined glibc references and no hint that a missing
+# prerequisite caused it.
+.PHONY: ports-gdb
+ports-gdb: userland-libc userland-rtld ports-ncurses $(BUILD_DIR)/ncurses.so ports-gtk3 | $(BUILD_DIR)
+	$(MAKE) -C ports/gdb-17.2 -f Makefile.likeos
+
+# $(STRIP), deliberately, where every other userspace binary uses $(USER_STRIP):
+# gdb is the one program on the image exempt from NO_STRIP_USER.
+#
+# NO_STRIP_USER exists so that a DEBUGGEE has function names for gdb to resolve.
+# gdb's own symbols do nothing for that -- a debugger reads its target's DWARF,
+# not its own -- and gdb builds with autoconf's default -g -O2, so keeping them
+# costs 148M: the binary is 159M unstripped against 10.4M stripped, and the root
+# filesystem is sized at 1.5x its contents, so a DEBUG=1 image grew to ~530M to
+# carry debug info nothing could use.  Distributions strip it and ship the debug
+# info separately for the same reason.
+#
+# The unstripped binary is not lost: it stays at ports/gdb-17.2/build/gdb/gdb,
+# which is what to point a debugger at to debug gdb itself.
+$(BUILD_DIR)/gdb: ports-gdb | $(BUILD_DIR)
+	cp ports/gdb-17.2/build/gdb/gdb $@
 	$(STRIP) --strip-unneeded $@
 
 # Build netcat (nc)
@@ -1327,7 +1403,7 @@ ports-netcat: userland-libc userland-rtld
 
 $(BUILD_DIR)/nc: ports-netcat | $(BUILD_DIR)
 	cp ports/netcat-OpenBSD/nc $@
-	$(STRIP) --strip-unneeded $@
+	$(USER_STRIP) --strip-unneeded $@
 
 # Build OpenSSL (libcrypto.so, libssl.so, openssl binary)
 .PHONY: ports-openssl
@@ -1395,7 +1471,7 @@ ports-openssh: userland-libc userland-rtld ports-openssl ports-zlib | $(BUILD_DI
 	mkdir -p $(BUILD_DIR)/openssh/bin $(BUILD_DIR)/openssh/etc
 	for b in $(OPENSSH_ALL); do \
 		cp $(OPENSSH_DIR)/$$b $(BUILD_DIR)/openssh/bin/$$b; \
-		$(STRIP) --strip-unneeded $(BUILD_DIR)/openssh/bin/$$b 2>/dev/null || true; \
+		$(USER_STRIP) --strip-unneeded $(BUILD_DIR)/openssh/bin/$$b 2>/dev/null || true; \
 	done
 	cp $(OPENSSH_DIR)/sshd_config $(OPENSSH_DIR)/ssh_config \
 	   $(OPENSSH_DIR)/moduli $(BUILD_DIR)/openssh/etc/
@@ -1618,6 +1694,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/fbtest        $(EXT4_STAGING)/usr/local/bin/fbtest
 	cp $(BUILD_DIR)/pmap          $(EXT4_STAGING)/usr/local/bin/pmap
 	cp $(BUILD_DIR)/ttydump       $(EXT4_STAGING)/usr/local/bin/ttydump
+	cp $(BUILD_DIR)/cxxprobe      $(EXT4_STAGING)/usr/local/bin/cxxprobe
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh
@@ -1997,6 +2074,12 @@ distclean: clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
 	$(MAKE) -C ports/openssh-10.4p1 -f Makefile.likeos distclean
 	rm -rf $(BUILD_DIR)/openssh
+	# gdb: distclean, not clean.  Its src/ is an unpacked, patched tarball and
+	# its build/ is a separate out-of-tree configure -- 940M between them, none
+	# of it tracked, all of it reproducible from the tarball and patches/ that
+	# stay.  The port's own `clean' only runs the configure-generated clean,
+	# which would leave both trees in place.
+	$(MAKE) -C ports/gdb-17.2 -f Makefile.likeos distclean
 	# X.Org: the source trees are unpacked tarballs rather than checked-in
 	# sources, so cleaning deletes them.  The tarballs themselves are kept --
 	# they ARE this port's sources, and re-downloading forty-seven of them
@@ -2013,6 +2096,16 @@ bash-manpage:
 	GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
 		ports/bash-5.2.37/doc/bash.1 | col -bx > res/man/bash.1
 	@echo "res/man/bash.1 regenerated ($$(wc -l < res/man/bash.1) lines)"
+
+# gdb's manual comes from its own source tree, like every other ported
+# program's.  Man 1 only: the debugger's full manual is Texinfo, which nothing
+# on the image can read, and this system's manual is a flat directory of
+# preformatted pages.  Requires ./unpack.sh in the port first.
+.PHONY: gdb-manpage
+gdb-manpage:
+	GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+		ports/gdb-17.2/src/gdb/doc/gdb.1 | col -bx > res/man/gdb.1
+	@echo "res/man/gdb.1 regenerated ($$(wc -l < res/man/gdb.1) lines)"
 
 # Regenerate the OpenSSH catman pages in res/man from the port's mdoc sources.
 # Like bash-manpage this is a maintenance target, not part of the build: the
@@ -2301,6 +2394,7 @@ help:
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
 	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."
 	@echo "  NO_STRIP=1        - Keep the kernel symbol table (do not strip kernel.elf) so a crash trace can be resolved to function names with nm/objdump (implied by DEBUG=1)."
+	@echo "  NO_STRIP_USER=1   - Keep symbol tables in USERSPACE programs and libraries, so gdb can resolve function names and set breakpoints by name rather than by address (implied by DEBUG=1).  gdb itself is always stripped: its own symbols cannot help it debug anything else and they cost 148M.  The unstripped binary stays at ports/gdb-17.2/build/gdb/gdb."
 	@echo ""
 	@echo "Subsystem Notes:"
 	@echo "  PS/2: Optional; modern hardware may lack controller (fallback to USB HID planned)."

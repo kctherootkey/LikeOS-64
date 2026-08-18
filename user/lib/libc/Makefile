@@ -27,7 +27,7 @@ ICONV_SRC = src/iconv/iconv.c
 LOCALE_SRC = src/locale/locale.c src/locale/multibyte.c src/locale/wctype.c \
              src/locale/wcwidth.c src/locale/wcstr.c src/locale/unicode.c
 EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c src/stdio/wstdio.c src/stdio/stdio_ext.c
-SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
+SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c src/syscalls/ptrace.c
 DLFCN_SRC = src/dl/dlfcn.c
 PWD_SRC = src/pwd/pwd.c src/pwd/grp.c src/pwd/shadow.c src/pwd/creds.c
 NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c src/net/resolv.c

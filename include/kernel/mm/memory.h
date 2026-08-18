@@ -282,6 +282,53 @@ bool mm_map_user_page(uint64_t *pml4, uint64_t virtual_addr,
 // Copy-on-Write support
 bool mm_mark_page_cow(uint64_t virtual_addr);
 bool mm_handle_cow_fault(uint64_t fault_addr);
+
+/* Declared here as well as further down: without it this prototype's
+ * `struct task' would be a fresh incomplete type scoped to the prototype
+ * itself, which then conflicts with the definition.  Repeating a forward
+ * declaration is harmless. */
+struct task;
+
+/* Materialise one lazily-mapped page of ANOTHER address space, if it is not
+ * resident already.
+ *
+ * A lazily-mapped range has a region record but no page until something
+ * touches it, and a process that has been stopped since before it ran has
+ * touched almost nothing.  Its own faults cannot help here -- it is not
+ * running -- so a debugger reading its code, or planting a breakpoint in it,
+ * would be refused for the whole of the program it most wants to look at.
+ * gdb sets breakpoints at exactly that moment, before the first instruction.
+ *
+ * Returns true when the page is resident afterwards (including when it already
+ * was), false when there is nothing mapped at that address to materialise.
+ *
+ * The caller holds `mm''s address-space semaphore; sleeps, because the page may
+ * have to be read from the backing file. */
+bool mm_populate_in(struct task *mm, uint64_t vaddr);
+
+
+/* Make one page of ANOTHER address space privately writable.
+ *
+ * mm_handle_cow_fault() resolves a page of the address space this CPU is
+ * running on, reached through CR3, and only one that is marked copy-on-write.
+ * This does the broader job for a page belonging to some other process, which
+ * is what writing into a stopped tracee needs.
+ *
+ * Two cases arrive here and are handled alike: a page still shared
+ * copy-on-write after a fork, and a read-only mapping such as program text.
+ * The second is the one a debugger depends on -- planting a breakpoint means
+ * writing into code -- and it carries no copy-on-write marker at all.  What
+ * decides between them is the reference count, not the marker: one holder
+ * means the page is already private and only its permission is in the way,
+ * more than one means it must be copied so the write cannot be seen by
+ * anybody else.
+ *
+ * Returns true when the page is private and writable afterwards -- including
+ * when it already was -- and false when it cannot be made so.
+ *
+ * The caller must hold the target's mmap_lock for writing, and must be in a
+ * context that can sleep. */
+bool mm_make_writable_in(uint64_t *pml4, uint64_t vaddr);
 uint64_t *mm_clone_address_space(uint64_t *src_pml4);
 
 // Clone with shared memory support (for MAP_SHARED regions)

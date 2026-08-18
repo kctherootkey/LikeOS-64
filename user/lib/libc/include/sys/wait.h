@@ -25,13 +25,38 @@ extern "C" {
 #define WSTOPSIG(status)     (((status) >> 8) & 0xff)
 #define WIFCONTINUED(status) ((status) == 0xffff)
 
-/* Resource usage (subset used by wait4/getrusage) */
+/*
+ * Resource usage, in the layout every other Unix uses on x86-64: two timevals
+ * followed by fourteen longs, 144 bytes in total.
+ *
+ * The field list is not a menu.  getrusage(2) and wait4(2) take no length
+ * argument, so there is no negotiation between the two sides -- the kernel
+ * copies a fixed-size structure and this declaration has to be byte-identical
+ * to the one it copies.  This used to declare seven fields, 72 bytes, against
+ * the kernel's 144, and every getrusage() wrote 72 bytes past the end of the
+ * caller's structure.  gdb's get_run_time() keeps its rusage in an 88-byte
+ * frame with the return address just past it, so the overflow replaced that
+ * return address with a zero and the process jumped to 0 on return.
+ *
+ * Fields the kernel does not account for yet are reported as zero.  They are
+ * declared anyway: dropping them is what caused the overflow, and software
+ * ported here refers to ru_inblock, ru_nsignals and the rest by name.
+ */
 struct rusage {
     struct timeval ru_utime;   /* user CPU time used */
     struct timeval ru_stime;   /* system CPU time used */
     long ru_maxrss;            /* maximum resident set size (KB) */
-    long ru_minflt;            /* page faults (soft) */
-    long ru_majflt;            /* page faults (hard) */
+    long ru_ixrss;             /* integral shared memory size */
+    long ru_idrss;             /* integral unshared data size */
+    long ru_isrss;             /* integral unshared stack size */
+    long ru_minflt;            /* page reclaims (soft page faults) */
+    long ru_majflt;            /* page faults (hard page faults) */
+    long ru_nswap;             /* swaps */
+    long ru_inblock;           /* block input operations */
+    long ru_oublock;           /* block output operations */
+    long ru_msgsnd;            /* IPC messages sent */
+    long ru_msgrcv;            /* IPC messages received */
+    long ru_nsignals;          /* signals received */
     long ru_nvcsw;             /* voluntary context switches */
     long ru_nivcsw;            /* involuntary context switches */
 };

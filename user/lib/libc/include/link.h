@@ -62,6 +62,60 @@ int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size,
                                     void *data),
                     void *data);
 
+/* ---- The debugger rendezvous ------------------------------------------------
+ *
+ * dl_iterate_phdr above answers "what is loaded" for code running INSIDE the
+ * process.  A debugger is outside it, stopped, and cannot call anything -- so it
+ * needs the same answer as plain data it can read out of the process's memory.
+ * That is what these are for, and the layout is not ours to choose: it is the
+ * long-standing SVR4 arrangement every ELF debugger already knows how to read,
+ * which is precisely why following it means not having to teach one.
+ *
+ * How a debugger finds it, with no cooperation from us:
+ *
+ *   1. read DT_DEBUG out of the executable's PT_DYNAMIC -- the loader stores
+ *      the address of _r_debug there;
+ *   2. walk r_map, a doubly-linked list with one link_map per loaded object,
+ *      each giving its load bias, its path, and its dynamic section;
+ *   3. set a breakpoint at r_brk, which the loader calls whenever that list is
+ *      about to change and again once it has, so the debugger can re-read the
+ *      list at a moment when it is consistent -- r_state says which of the two
+ *      it is looking at.
+ *
+ * Reading the list while it is mid-edit is the failure this protocol exists to
+ * prevent, so r_state must be honoured rather than assumed.
+ */
+struct link_map {
+    Elf64_Addr        l_addr;   /* load bias: add to a p_vaddr for runtime addr */
+    char             *l_name;   /* object path; "" for the main executable      */
+    Elf64_Dyn        *l_ld;     /* its PT_DYNAMIC                               */
+    struct link_map  *l_next;
+    struct link_map  *l_prev;
+};
+
+/* r_state: what the loader is in the middle of, read at an r_brk stop. */
+#define RT_CONSISTENT  0   /* the list is stable and safe to read */
+#define RT_ADD         1   /* an object is being added            */
+#define RT_DELETE      2   /* an object is being removed          */
+
+struct r_debug {
+    int               r_version;  /* 1 */
+    struct link_map  *r_map;      /* head of the loaded-object list */
+    Elf64_Addr        r_brk;      /* breakpoint here for load/unload notice */
+    int               r_state;    /* RT_* above */
+    Elf64_Addr        r_ldbase;   /* where the loader itself is mapped */
+};
+
+/* Exported by the dynamic loader.  A debugger normally reaches it through
+ * DT_DEBUG rather than by name, since it has to work on a process it did not
+ * link against; the symbol is here for code inside the process. */
+extern struct r_debug _r_debug;
+
+/* The loader calls this immediately before and immediately after it changes the
+ * object list.  It does nothing -- its only purpose is to be a stable address
+ * worth stopping at, which is why it must not be inlined or optimised away. */
+void _dl_debug_state(void);
+
 #ifdef __cplusplus
 }
 #endif

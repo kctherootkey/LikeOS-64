@@ -53,7 +53,7 @@ void signal_init_task(task_t *task)
 	sig->alarm_ticks = 0;
 
 	// Clear signal frame address
-	sig->signal_frame_addr = 0;
+	sig->signal_frame_depth = 0;
 }
 
 // Reset signal dispositions across execve.
@@ -80,7 +80,7 @@ void signal_reset_on_exec(task_t *task)
 	sig->altstack.ss_sp = NULL;
 	sig->altstack.ss_flags = SS_DISABLE;
 	sig->altstack.ss_size = 0;
-	sig->signal_frame_addr = 0;
+	sig->signal_frame_depth = 0;
 }
 
 // Copy signal handlers from parent to child during fork
@@ -122,7 +122,7 @@ void signal_fork_copy(task_t *child, task_t *parent)
 	csig->alarm_ticks = 0;
 
 	// Clear signal frame address
-	csig->signal_frame_addr = 0;
+	csig->signal_frame_depth = 0;
 }
 
 // Cleanup signal state when task exits
@@ -228,8 +228,29 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 	// Add to pending mask
 	sigaddset_k(&sigstate->pending, sig);
 
-	// Queue siginfo if provided and SA_SIGINFO is set
-	if (info && (act->sa_flags & SA_SIGINFO)) {
+	/* Keep the description, not just the number.
+	 *
+	 * SA_SIGINFO says whether the HANDLER is shown the detail; it does not
+	 * decide whether the kernel keeps it, and treating it as though it did
+	 * threw away the only copy of things nothing can reconstruct later:
+	 *
+	 *   - a synchronous fault's si_code and si_addr are knowable only at
+	 *     the fault.  Discarding them left signal_dequeue synthesising
+	 *     si_code = SI_USER and si_addr = 0, so a debugger asking where a
+	 *     SIGSEGV faulted was told "sent by kill(), address 0".
+	 *   - a traced task's tracer can ask about ANY signal with
+	 *     PTRACE_GETSIGINFO, whatever disposition the tracee has.
+	 *
+	 * Anything else keeps the old behaviour, so an ordinary process pays
+	 * no allocation for signals nobody will ask about. */
+	int keep_info = info && (act->sa_flags & SA_SIGINFO);
+
+	if (info && !keep_info &&
+	    (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL ||
+	     sig == SIGFPE || sig == SIGTRAP || task->tracer_pid != 0))
+		keep_info = 1;
+
+	if (keep_info) {
 		pending_signal_t *ps = alloc_pending_signal();
 		if (ps) {
 			ps->sig = sig;
@@ -412,30 +433,6 @@ int signal_dequeue(task_t *task, kernel_sigset_t *mask, siginfo_t *info)
 
 // Setup a signal frame on the user stack
 // Returns 0 on success, -1 on failure
-/* RFLAGS the kernel is willing to give user mode.
- *
- * Everything that returns to user mode goes through this.  Two reasons:
- *
- * IF is FORCED ON.  A user thread resumed with interrupts disabled cannot be
- * preempted and takes every fault with IRQs off -- so a page fault on a
- * demand-paged text page then read from ext4 with interrupts disabled, which
- * is the "might_sleep() called with IRQs disabled" storm, and the
- * "USER RIP ... with interrupts disabled ... the saved RFLAGS is wrong"
- * warning that precedes it.  The saved RFLAGS was not wrong; it was obeyed.
- *
- * And the source of it is reachable from user code: sigreturn(2) restores
- * RFLAGS from the signal frame on the USER stack, which the process can edit.
- * Unfiltered, that let any program clear its own IF -- pinning a CPU with
- * interrupts off -- or set IOPL and NT.  Only the flags a program may set for
- * itself survive; the rest come from here.
- */
-#define USER_RFLAGS_KEEP                                                  	(0x1UL /*CF*/ | 0x2UL /*reserved, must be 1*/ | 0x4UL /*PF*/ |     	 0x10UL /*AF*/ | 0x40UL /*ZF*/ | 0x80UL /*SF*/ | 0x100UL /*TF*/ | 	 0x400UL /*DF*/ | 0x800UL /*OF*/ | 0x200000UL /*ID*/)
-
-static inline uint64_t user_rflags_sanitize(uint64_t f)
-{
-	return (f & USER_RFLAGS_KEEP) | 0x202UL; /* bit 1 + IF */
-}
-
 int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 		       struct k_sigaction *act)
 {
@@ -568,7 +565,7 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	}
 
 	// Save frame address in task for sigreturn to find
-	task->signals.signal_frame_addr = frame_addr;
+	task->signals.signal_frame_depth++;
 
 	// Also update task's saved values
 	task->syscall_rsp = frame_addr;
@@ -745,7 +742,7 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	}
 
 	// Save frame address for sigreturn
-	task->signals.signal_frame_addr = frame_addr;
+	task->signals.signal_frame_depth++;
 
 	// Also update task's saved syscall values so sigreturn works correctly
 	task->syscall_rsp = frame_addr;
@@ -785,20 +782,39 @@ int signal_restore_frame(task_t *task)
 	if (!task)
 		return -1;
 
-	// Get the frame address that was saved when the frame was set up
-	uint64_t frame_addr = task->signals.signal_frame_addr;
-	WARN_ON_ONCE(frame_addr ==
-		     0); /* sigreturn with no prior signal delivery */
-
-	// Validate
-	if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
-		kprintf("signal_restore_frame: invalid frame addr 0x%lx\n",
-			frame_addr);
+	/* Is this task inside a handler at all? */
+	if (task->signals.signal_frame_depth == 0) {
+		WARN_ON_ONCE(1); /* sigreturn with no signal frame */
 		return -1;
 	}
 
-	// Clear the saved frame address
-	task->signals.signal_frame_addr = 0;
+	/* WHERE the frame is: the user stack says so.
+	 *
+	 * The handler was entered as though by a call, with RSP pointing at
+	 * pretcode -- the first field of the frame -- so its `ret' pops that
+	 * and lands in the trampoline with RSP exactly 8 past the frame.  That
+	 * is the frame this sigreturn belongs to, whether it is the first or
+	 * the fifth one nested on this stack.
+	 *
+	 * Reading it from a per-task slot instead could only ever name one
+	 * frame, so the inner handler's sigreturn cleared the outer's and the
+	 * outer one failed -- see signal_frame_depth in struct.
+	 *
+	 * The alignment is the cheap check that this really is a return from a
+	 * frame: setup places every frame at RSP % 16 == 8, so the trampoline
+	 * always calls with RSP % 16 == 0.  Everything read out of the frame
+	 * below is sanitised in any case, because it sits on the user's own
+	 * stack and the user may have written it. */
+	uint64_t frame_addr = task->syscall_rsp - 8;
+
+	if ((task->syscall_rsp & 0xF) != 0 || frame_addr < 0x10000 ||
+	    frame_addr >= 0x7FFFFFFFFFFF) {
+		kprintf("signal_restore_frame: bad frame at 0x%lx (rsp 0x%lx)\n",
+			frame_addr, task->syscall_rsp);
+		return -1;
+	}
+
+	task->signals.signal_frame_depth--;
 
 	// Read the frame from user space
 	signal_frame_t kframe;
@@ -930,6 +946,129 @@ void signal_notify_jobctl(task_t *task, int signum, int stopped)
 }
 
 // Deliver pending signals to a task (called before returning to userspace)
+/*
+ * Queue a synchronous fault signal (SIGSEGV/SIGILL/SIGBUS/SIGFPE/SIGTRAP).
+ *
+ * Two things make a fault different from a signal somebody sent, and both are
+ * handled here rather than at the delivery point:
+ *
+ *   - The disposition is FORCED back to default if the program has blocked or
+ *     ignored the signal.  A fault is not an event that can be declined: the
+ *     faulting instruction has not completed, so returning to it without
+ *     acting faults again, identically, for ever.  Resetting to SIG_DFL and
+ *     unblocking is what every other system does with a synchronous fault, and
+ *     it is what turns an unkillable spin into an ordinary crash.
+ *
+ *   - The siginfo carries si_code and si_addr.  A debugger reports these -- the
+ *     difference between "it crashed" and "it wrote to 0x1" -- so they are
+ *     filled in at the fault, the only place that knows them.
+ *
+ * The signal is left PENDING.  Nothing is decided here: no stop, no kill, no
+ * report.  The return-to-user path picks it up, which is the only context
+ * where a tracer can be consulted.
+ */
+void signal_force_fault(task_t *task, int sig, int code, uint64_t addr)
+{
+	siginfo_t info;
+
+	if (!task || sig <= 0 || sig >= NSIG)
+		return;
+
+	struct k_sigaction *act = &task->signals.action[sig];
+
+	if (act->sa_handler == SIG_IGN ||
+	    (act->sa_handler == SIG_DFL &&
+	     sig_default_action(sig) == SIG_DFL_IGN)) {
+		act->sa_handler = SIG_DFL;
+		act->sa_flags = 0;
+	}
+	sigdelset_k(&task->signals.blocked, sig);
+
+	mm_memset(&info, 0, sizeof(info));
+	info.si_signo = sig;
+	info.si_code = code;
+	info.si_addr = (void *)addr;
+
+	signal_send(task, sig, &info);
+}
+
+/*
+ * Choose what this task should do about its next pending signal, and do all of
+ * it except arranging a user handler's stack frame.
+ *
+ * Returns the signal whose handler the caller must now set up, or 0 when there
+ * is nothing left to arrange -- the queue is empty, or the signal was ignored,
+ * discarded by a tracer, or already acted on here (stopped, continued, killed).
+ *
+ * THE LOOP IS THE POINT.  A traced task stops so its tracer can choose, and the
+ * tracer may choose nothing at all; when that happens the next pending signal
+ * has to be examined rather than returning to user space.  Returning instead
+ * was the defect that made an earlier attempt at this strand a process: the
+ * tracee had been released from its stop by a SIGKILL, the suppressed fault
+ * sent it back to the faulting instruction, and the SIGKILL sat in the queue
+ * unlooked-at while the task faulted, stopped and resumed for ever.  Coming
+ * round the loop finds that SIGKILL and takes the ordinary fatal path.
+ *
+ * MAY SLEEP.  The stop parks the caller, so this is only callable from a
+ * return-to-user path with interrupts on and no locks held.
+ */
+static int signal_select(task_t *task, siginfo_t *info)
+{
+	task_signal_state_t *sig = &task->signals;
+
+	for (;;) {
+		int signum = signal_dequeue(task, NULL, info);
+
+		if (signum == 0)
+			return 0;
+
+		/* The tracer sees it first and says what should happen: this
+		 * signal, a different one, or none.  Untraced tasks get their
+		 * own signal back unchanged. */
+		signum = task_ptrace_signal_stop(task, signum, info);
+		if (signum == 0)
+			continue;
+
+		/* Re-read the disposition: the tracer may have substituted a
+		 * different signal, and a stop is long enough for the program
+		 * itself to be a different program (the tracer can write its
+		 * memory and registers while it is parked). */
+		struct k_sigaction *act = &sig->action[signum];
+
+		if (act->sa_handler == SIG_IGN)
+			continue;
+
+		if (act->sa_handler != SIG_DFL)
+			return signum; /* caller arranges the handler */
+
+		switch (sig_default_action(signum)) {
+		case SIG_DFL_TERM:
+		case SIG_DFL_CORE:
+			/* The whole process, not just this thread: a fatal
+			 * default action ends every thread of the group, or
+			 * abort() in one thread leaves the others running and
+			 * the program hangs instead of dying. */
+			task->term_sig = signum;
+			sched_kill_thread_group(task, 128 + signum);
+			sched_mark_task_exited(task, 128 + signum);
+			return 0;
+		case SIG_DFL_STOP:
+			task->state = TASK_STOPPED;
+			signal_notify_jobctl(task, signum, 1);
+			return 0;
+		case SIG_DFL_CONT:
+			if (task->state == TASK_STOPPED) {
+				task->state = TASK_READY;
+				signal_notify_jobctl(task, signum, 0);
+			}
+			continue;
+		case SIG_DFL_IGN:
+		default:
+			continue;
+		}
+	}
+}
+
 void signal_deliver(task_t *task)
 {
 	if (!task || task->privilege != TASK_USER)
@@ -937,56 +1076,22 @@ void signal_deliver(task_t *task)
 	WARN_ON(task->state ==
 		TASK_ZOMBIE); /* signal delivery to zombie task */
 
-	task_signal_state_t *sig = &task->signals;
 	siginfo_t info;
+	int signum = signal_select(task, &info);
 
-	int signum = signal_dequeue(task, NULL, &info);
 	if (signum == 0)
-		return;
+		return; /* nothing to arrange -- see signal_select */
 
-	struct k_sigaction *act = &sig->action[signum];
-
-	// Handle based on disposition
-	if (act->sa_handler == SIG_IGN) {
-		return; // Ignore
-	}
-
-	if (act->sa_handler == SIG_DFL) {
-		// Default action
-		int action = sig_default_action(signum);
-		switch (action) {
-		case SIG_DFL_TERM:
-		case SIG_DFL_CORE:
-			/* Terminate the PROCESS, not just this thread (core dump
-			 * not implemented).  A fatal default action ends every
-			 * thread of the group -- otherwise abort() from one
-			 * thread leaves the others running and the program
-			 * hangs instead of dying. */
-			task->term_sig = signum;
-			sched_kill_thread_group(task, 128 + signum);
-			sched_mark_task_exited(task, 128 + signum);
-			break;
-		case SIG_DFL_STOP:
-			task->state = TASK_STOPPED;
-			signal_notify_jobctl(task, signum, 1);
-			break;
-		case SIG_DFL_CONT:
-			if (task->state == TASK_STOPPED) {
-				task->state = TASK_READY;
-				signal_notify_jobctl(task, signum, 0);
-			}
-			break;
-		case SIG_DFL_IGN:
-			// Ignore
-			break;
-		}
-		return;
-	}
-
-	// User-defined handler - set up signal frame
-	if (signal_setup_frame(task, signum, &info, act) < 0) {
-		// Failed to set up frame - terminate with signal
+	/* User-defined handler: set up the signal frame. */
+	if (signal_setup_frame(task, signum, &info,
+			       &task->signals.action[signum]) < 0) {
+		/* Failed to set up the frame -- terminate with the signal.
+		 * The whole process, for the same reason as the fatal default
+		 * action above: a thread group whose leader is a zombie while
+		 * its threads still run is never reported finished to its
+		 * parent. */
 		task->term_sig = signum;
+		sched_kill_thread_group(task, 128 + signum);
 		sched_mark_task_exited(task, 128 + signum);
 	}
 }
@@ -1009,53 +1114,24 @@ void signal_deliver_irq(task_t *task, interrupt_frame_t *frame)
 	if (task->has_exited || task->state == TASK_ZOMBIE)
 		return;
 
-	task_signal_state_t *sig = &task->signals;
 	siginfo_t info;
+	int signum = signal_select(task, &info);
 
-	int signum = signal_dequeue(task, NULL, &info);
-	if (signum == 0)
-		return;
-
-	struct k_sigaction *act = &sig->action[signum];
-
-	// Handle based on disposition
-	if (act->sa_handler == SIG_IGN) {
-		return;
-	}
-
-	if (act->sa_handler == SIG_DFL) {
-		int action = sig_default_action(signum);
-		switch (action) {
-		case SIG_DFL_TERM:
-		case SIG_DFL_CORE:
-			/* Whole process, not just this thread -- see the note at
-			 * the other default-action site. */
-			task->term_sig = signum;
-			sched_kill_thread_group(task, 128 + signum);
-			sched_mark_task_exited(task, 128 + signum);
-			// Ensure sched_preempt runs after we return to irq_handler,
-			// even if the timer's remaining_ticks hasn't expired yet.
+	if (signum == 0) {
+		/* Nothing to arrange.  If signal_select ended the task, make
+		 * sure the return path reschedules rather than IRETing back
+		 * into a process that no longer exists. */
+		if (task->has_exited || task->state == TASK_ZOMBIE)
 			sched_set_need_resched(task);
-			break;
-		case SIG_DFL_STOP:
-			task->state = TASK_STOPPED;
-			signal_notify_jobctl(task, signum, 1);
-			break;
-		case SIG_DFL_CONT:
-			if (task->state == TASK_STOPPED) {
-				task->state = TASK_READY;
-				signal_notify_jobctl(task, signum, 0);
-			}
-			break;
-		case SIG_DFL_IGN:
-			break;
-		}
 		return;
 	}
 
 	// User-defined handler — modify the IRETQ frame
-	if (signal_setup_frame_irq(task, signum, &info, act, frame) < 0) {
+	if (signal_setup_frame_irq(task, signum, &info,
+				   &task->signals.action[signum], frame) < 0) {
+		/* The whole process: see signal_deliver(). */
 		task->term_sig = signum;
+		sched_kill_thread_group(task, 128 + signum);
 		sched_mark_task_exited(task, 128 + signum);
 	}
 }

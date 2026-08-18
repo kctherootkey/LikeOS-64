@@ -450,10 +450,18 @@ static size_t elf_strlen(const char *s)
 	return n;
 }
 
+/* `newcred' is the credential set the image being loaded will actually run
+ * with.  It is passed in rather than read from the current task because a
+ * set-id exec has not committed its transition yet at this point: the ids are
+ * only applied once the image has been replaced successfully, so that a failed
+ * exec cannot leave a process privileged in its old image.  Reading the task
+ * here would therefore describe the CALLER, not the program -- which is how
+ * AT_SECURE came to be reported as 0 for every setuid exec.  NULL means "no
+ * transition pending", i.e. the current task's credentials are the answer. */
 static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 				uint64_t stack_size, char *const argv[],
 				char *const envp[], elf_load_result_t *mr,
-				uint64_t interp_base)
+				uint64_t interp_base, const cred_t *newcred)
 {
 	BUG_ON(pml4 == NULL || mr == NULL);
 	if (!mm_map_user_stack(pml4, stack_top, stack_size))
@@ -506,10 +514,11 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 	 * loader's side. */
 	{
 		task_t *cur = sched_current();
-		uint32_t uid = cur ? cur->cred.uid : 0;
-		uint32_t euid = cur ? cur->cred.euid : 0;
-		uint32_t gid = cur ? cur->cred.gid : 0;
-		uint32_t egid = cur ? cur->cred.egid : 0;
+		const cred_t *cc = newcred ? newcred : (cur ? &cur->cred : NULL);
+		uint32_t uid = cc ? cc->uid : 0;
+		uint32_t euid = cc ? cc->euid : 0;
+		uint32_t gid = cc ? cc->gid : 0;
+		uint32_t egid = cc ? cc->egid : 0;
 
 		ax[ac].t = AT_UID;
 		ax[ac].v = uid;
@@ -588,6 +597,28 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 	for (int i = 0; i < envc; i++)
 		*sp++ = ev[i];
 	*sp++ = 0;
+	/* Remember where the auxiliary vector landed.
+	 *
+	 * A debugger needs it, and needs it before it can read anything else
+	 * usefully.  The executable is position-independent, so every address
+	 * in its symbol table is an offset until the debugger knows the bias it
+	 * was loaded at; the conventional way to learn that is to compare
+	 * AT_ENTRY here against e_entry in the file on disk.  Nothing else in
+	 * the process reveals it -- reading the dynamic section to find the
+	 * loader's rendezvous would already require knowing the bias.
+	 *
+	 * Recorded as an address and a length rather than copied: the block
+	 * belongs to the process, and ptrace hands it out from here. */
+	{
+		uint64_t auxv_va = sp_va + 8 + (uint64_t)(argc + 1) * 8 +
+				   (uint64_t)(envc + 1) * 8;
+		task_t *cur = sched_current();
+		if (cur) {
+			cur->auxv_addr = auxv_va;
+			cur->auxv_len = (uint64_t)ac * 16;
+		}
+	}
+
 	for (int i = 0; i < ac; i++) {
 		*sp++ = ax[i].t;
 		*sp++ = ax[i].v;
@@ -703,8 +734,11 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
                                                  * deeply-recursive parser/log paths) to overflow
                                                  * silently and SIGSEGV on the guard region. */
 
+	/* No set-id transition happens on this path -- it spawns a fresh task
+	 * rather than replacing an image -- so the current credentials are
+	 * already the ones the program will run with. */
 	uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP, USER_STACK_SIZE,
-				      argv, envp, &lr, ib);
+				      argv, envp, &lr, ib, NULL);
 	if (!sp) {
 		for (int b = 0; b < 2; b++)
 			if (lr.backing[b])
@@ -829,7 +863,8 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 // ============================================================================
 
 uint64_t elf_exec_replace(const char *path, char *const argv[],
-			  char *const envp[], uint64_t *out_stack_ptr)
+			  char *const envp[], uint64_t *out_stack_ptr,
+			  const cred_t *newcred)
 {
 	if (!path || !out_stack_ptr)
 		return 0;
@@ -883,7 +918,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 
 	uint64_t sp =
 		elf_setup_stack(pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC,
-				argv, envp, &lr, ib);
+				argv, envp, &lr, ib, newcred);
 	if (!sp) {
 		for (int b = 0; b < 2; b++)
 			if (lr.backing[b])

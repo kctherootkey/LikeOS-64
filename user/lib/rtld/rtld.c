@@ -113,6 +113,10 @@ typedef struct {
 #define DT_INIT 12
 #define DT_FINI 13
 #define DT_SONAME 14
+/* Reserved by the linker with a value of zero in every dynamic executable, for
+ * the loader to fill in with the address of its r_debug.  It is how a debugger
+ * finds the object list without knowing anything about this loader. */
+#define DT_DEBUG 21
 #define DT_PLTREL 20
 #define DT_JMPREL 23
 #define DT_BIND_NOW_TAG 24
@@ -266,6 +270,38 @@ static void rtld_die(const char *msg)
 /* Object names are at most a basename ("libXfont2.so.2"), so a small fixed
  * buffer is enough and keeps the loader allocation-free. */
 #define RTLD_NAME_MAX 96
+/* Long enough for the deepest path anything here is loaded from. */
+#define RTLD_PATH_MAX 256
+
+/* ---- The debugger rendezvous ------------------------------------------------
+ *
+ * Declared here to match user/lib/libc/include/link.h exactly; the loader
+ * cannot include it, being freestanding and carrying its own ELF types.  The
+ * LAYOUT is not ours to choose -- it is the SVR4 arrangement every ELF debugger
+ * already reads, which is the entire reason for adopting it rather than
+ * inventing something. Changing either copy without the other silently feeds a
+ * debugger the wrong fields.
+ *
+ * See link.h for how a debugger finds and walks this. */
+struct link_map {
+	Elf64_Addr l_addr; /* load bias */
+	char *l_name; /* object path; "" for the main executable */
+	Elf64_Dyn *l_ld; /* its PT_DYNAMIC */
+	struct link_map *l_next;
+	struct link_map *l_prev;
+};
+
+#define RT_CONSISTENT 0
+#define RT_ADD 1
+#define RT_DELETE 2
+
+struct r_debug {
+	int r_version;
+	struct link_map *r_map;
+	Elf64_Addr r_brk;
+	int r_state;
+	Elf64_Addr r_ldbase;
+};
 
 typedef struct dso {
 	/* Points at name_buf below, or at a string literal with static
@@ -275,6 +311,10 @@ typedef struct dso {
 	 * pages — which rtld_find_dso() then walks straight into. */
 	const char *name;
 	char name_buf[RTLD_NAME_MAX];
+	/* Where this object was loaded FROM, as an absolute path.  Published to
+	 * a debugger as link_map.l_name; see rtld_load_dso_from_file. */
+	const char *path;
+	char path_buf[RTLD_PATH_MAX];
 	uint64_t base;
 
 	const Elf64_Phdr *phdrs;
@@ -345,6 +385,14 @@ typedef struct dso {
 	/* For dlclose / munmap */
 	uint64_t map_base;
 	uint64_t map_size;
+
+	/* This object's node in the debugger's object list.
+	 *
+	 * Embedded rather than allocated so its address is stable for as long
+	 * as the slot is: a debugger reads this list out of the process's
+	 * memory while the process is stopped and cannot be asked to re-resolve
+	 * a pointer that moved.  Kept in step by rtld_link_map_add/remove. */
+	struct link_map lm;
 } dso_t;
 
 static dso_t g_dsos[MAX_DSOS];
@@ -403,6 +451,112 @@ static void rtld_set_error2(const char *what, const char *name)
 /* ================================================================== */
 /*  DSO helpers                                                       */
 /* ================================================================== */
+
+/* ---- The debugger rendezvous, continued ------------------------------------ */
+
+/* Found by a debugger through DT_DEBUG in the executable's dynamic section,
+ * which rtld_publish_r_debug() below points here. */
+struct r_debug _r_debug __attribute__((visibility("default"))) = {
+	.r_version = 1,
+	.r_map = NULL,
+	.r_brk = 0,
+	.r_state = RT_CONSISTENT,
+	.r_ldbase = 0,
+};
+
+/* The address a debugger breakpoints to be told the object list is changing.
+ *
+ * Empty on purpose: its whole value is being a fixed, named place to stop.
+ * `noinline` and `used` because an empty function with no callers worth keeping
+ * is exactly what a compiler removes -- and removing it removes the only way a
+ * debugger learns that a library was loaded. */
+void _dl_debug_state(void) __attribute__((visibility("default"), noinline,
+					  used));
+void _dl_debug_state(void)
+{
+	__asm__ volatile("" ::: "memory");
+}
+
+/* Announce that the list is about to change, and again once it has.
+ *
+ * Both calls matter.  A debugger stopped at the first sees RT_ADD/RT_DELETE and
+ * knows not to trust the list yet; stopped at the second it sees RT_CONSISTENT
+ * and reads it.  Reporting only the finished state would leave a debugger that
+ * stopped for some other reason mid-edit unable to tell that is what happened. */
+static void rtld_debug_state(int state)
+{
+	_r_debug.r_state = state;
+	_dl_debug_state();
+}
+
+/* Append `d` to the object list.  Order is load order, and the main executable
+ * must be first -- a debugger identifies it by position, having no other way to
+ * tell which of the objects is the program. */
+static void rtld_link_map_add(dso_t *d)
+{
+	struct link_map *m = &d->lm;
+
+	m->l_addr = (Elf64_Addr)d->base;
+	/* The main executable reports an empty name, as everything walking this
+	 * list expects; the loader knows the path but the convention does not
+	 * carry it. */
+	/* The PATH, not the soname: a debugger opens this string to read the
+	 * object's symbols.  The main executable reports an empty name, as
+	 * everything walking this list expects. */
+	m->l_name = d->is_main	       ? (char *)"" :
+		    d->path && d->path[0] ? (char *)d->path :
+					    (char *)d->name;
+	m->l_ld = (Elf64_Dyn *)d->dynamic;
+	m->l_next = NULL;
+	m->l_prev = NULL;
+
+	if (!_r_debug.r_map) {
+		_r_debug.r_map = m;
+		return;
+	}
+	struct link_map *last = _r_debug.r_map;
+
+	while (last->l_next)
+		last = last->l_next;
+	last->l_next = m;
+	m->l_prev = last;
+}
+
+static void rtld_link_map_remove(dso_t *d)
+{
+	struct link_map *m = &d->lm;
+
+	if (m->l_prev)
+		m->l_prev->l_next = m->l_next;
+	else if (_r_debug.r_map == m)
+		_r_debug.r_map = m->l_next;
+	if (m->l_next)
+		m->l_next->l_prev = m->l_prev;
+	m->l_next = NULL;
+	m->l_prev = NULL;
+}
+
+/* Store the address of _r_debug where a debugger looks for it: the DT_DEBUG
+ * entry of the MAIN executable's dynamic section, which the linker reserves
+ * with a value of zero for exactly this.
+ *
+ * Must run before PT_GNU_RELRO is applied -- the dynamic section is inside the
+ * region that gets made read-only, so afterwards this store would fault. */
+static void rtld_publish_r_debug(dso_t *main_dso, uint64_t interp_base)
+{
+	_r_debug.r_brk = (Elf64_Addr)(uint64_t)&_dl_debug_state;
+	_r_debug.r_ldbase = (Elf64_Addr)interp_base;
+
+	if (!main_dso || !main_dso->dynamic)
+		return;
+	for (Elf64_Dyn *e = (Elf64_Dyn *)main_dso->dynamic; e->d_tag != DT_NULL;
+	     e++) {
+		if (e->d_tag == DT_DEBUG) {
+			e->d_un.d_ptr = (Elf64_Addr)(uint64_t)&_r_debug;
+			break;
+		}
+	}
+}
 
 static dso_t *rtld_find_dso(const char *name)
 {
@@ -949,16 +1103,77 @@ uint64_t _dl_fixup(dso_t *d, uint64_t reloc_idx)
 
 extern void _dl_runtime_resolve(void) __attribute__((visibility("default")));
 
+/*
+ * Point PLT0 at the resolver.
+ *
+ * Done for EVERY object that has a PLT, eagerly bound ones included, and that
+ * is deliberately not redundant.  Nothing is supposed to reach PLT0 in a
+ * BIND_NOW object -- every slot was bound at load time -- but if anything ever
+ * does, the stub pushes GOT[1] and jumps through GOT[2], and those two words
+ * are zero unless somebody writes them.  A jump through a zero GOT[2] is the
+ * least informative failure this loader can produce: RIP=0, no instruction
+ * bytes to disassemble, and a stack whose top word is the zero just pushed.
+ * Armed, the very same path resolves the symbol correctly instead, or stops in
+ * _dl_fixup with a message naming the object and the symbol.
+ */
+static void rtld_arm_plt0(dso_t *d)
+{
+	if (!d->pltgot)
+		return;
+	d->pltgot[1] = (uint64_t)d;
+	d->pltgot[2] = (uint64_t)&_dl_runtime_resolve;
+}
+
+/*
+ * After eager binding, every jump slot must hold a real address.
+ *
+ * A slot left at zero does not announce itself: the symbol resolved, no error
+ * was printed, and the program runs normally until the first call through that
+ * slot.  Checking the slots while the object and its symbol names are still to
+ * hand turns that into a message that names the symbol, instead of a null jump
+ * somewhere far away with nothing left to identify it.
+ */
+static void rtld_verify_plt(dso_t *d)
+{
+	if (!d->jmprel || !d->jmprel_size || !d->symtab || !d->strtab)
+		return;
+
+	size_t n = d->jmprel_size / sizeof(Elf64_Rela);
+	for (size_t i = 0; i < n; i++) {
+		const Elf64_Rela *r = &d->jmprel[i];
+
+		if (ELF64_R_TYPE(r->r_info) != R_X86_64_JUMP_SLOT)
+			continue;
+		if (*(uint64_t *)(d->base + r->r_offset))
+			continue;
+
+		const Elf64_Sym *sym = &d->symtab[ELF64_R_SYM(r->r_info)];
+
+		/* Zero is the right answer for a weak symbol nobody defines;
+		 * the caller is required to test it before calling. */
+		if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+			continue;
+
+		rtld_write_str("ld-likeos.so: ");
+		rtld_write_str(d->name ? d->name : "?");
+		rtld_write_str(": jump slot left null after binding: ");
+		rtld_write_str(d->strtab + sym->st_name);
+		rtld_write_str("\n");
+	}
+}
+
 static void rtld_setup_pltgot(dso_t *d)
 {
 	if (!d->pltgot)
 		return;
 	if (d->bind_now) {
-		if (d->jmprel && d->jmprel_size)
+		if (d->jmprel && d->jmprel_size) {
 			rtld_apply_relocs(d, d->jmprel, d->jmprel_size);
+			rtld_verify_plt(d);
+		}
+		rtld_arm_plt0(d);
 	} else {
-		d->pltgot[1] = (uint64_t)d;
-		d->pltgot[2] = (uint64_t)&_dl_runtime_resolve;
+		rtld_arm_plt0(d);
 		/*
          * For lazy binding, each .got.plt entry initially holds a 0-based
          * file offset pointing back into the PLT stub (the push instruction).
@@ -1076,6 +1291,26 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 		}
 		d->name_buf[n] = '\0';
 		d->name = d->name_buf;
+
+		/* The PATH this was opened from, kept separately from the
+		 * soname, because a debugger needs to open the same file.
+		 *
+		 * l_name in the link_map is that path -- not the soname -- and
+		 * a debugger takes it literally: it opens the string to read
+		 * the library's symbols.  Publishing "libglib-2.0.so.0" gave it
+		 * nothing to open, so it reported "Could not load shared
+		 * library symbols" and every frame in that library printed as
+		 * `?? ()'.  The loader knows the path here and used to discard
+		 * it. */
+		n = 0;
+		if (path) {
+			while (path[n] && n < RTLD_PATH_MAX - 1) {
+				d->path_buf[n] = path[n];
+				n++;
+			}
+		}
+		d->path_buf[n] = '\0';
+		d->path = d->path_buf;
 	}
 	d->base = map - lo;
 	d->map_base = map;
@@ -1361,10 +1596,18 @@ static void rtld_relocate(dso_t *d)
 	if (d->rela && d->rela_size)
 		rtld_apply_relocs(d, d->rela, d->rela_size);
 	if (d->jmprel && d->jmprel_size) {
-		if (d->bind_now || d->is_main)
+		if (d->bind_now || d->is_main) {
 			rtld_apply_relocs(d, d->jmprel, d->jmprel_size);
-		else
+			rtld_verify_plt(d);
+			/* The main executable took this branch on `is_main'
+			 * alone and so never reached rtld_setup_pltgot, which
+			 * is the only other place PLT0 gets armed.  gdb is the
+			 * first executable here whose PLT is large enough to
+			 * make that matter. */
+			rtld_arm_plt0(d);
+		} else {
 			rtld_setup_pltgot(d);
+		}
 	}
 }
 
@@ -1504,6 +1747,24 @@ void *_rtld_dlopen(const char *filename, int flags)
 	rtld_init_tls();
 	for (int i = g_ndsos - 1; i >= 0; i--)
 		rtld_init_dso(&g_dsos[i]);
+
+	/* Tell a debugger the object list grew.
+	 *
+	 * Announced as RT_ADD first and RT_CONSISTENT after, with the list only
+	 * edited in between: a debugger stopped at either call can tell from
+	 * r_state whether what it is looking at is finished.  Everything newly
+	 * loaded is added, not just the object named -- a dlopen pulls in its
+	 * own dependencies, and a debugger that never heard about those cannot
+	 * resolve a symbol in one. */
+	rtld_debug_state(RT_ADD);
+	for (int i = 0; i < g_ndsos; i++) {
+		dso_t *d = &g_dsos[i];
+
+		/* Not already on the list, and not a dlclose'd empty slot. */
+		if ((d->name || d->symtab) && !d->lm.l_ld && d->dynamic)
+			rtld_link_map_add(d);
+	}
+	rtld_debug_state(RT_CONSISTENT);
 	return ld;
 }
 
@@ -1548,12 +1809,21 @@ int _rtld_dlclose(void *handle)
 	}
 	if (d->fini_fn)
 		d->fini_fn();
+	/* Off the debugger's list BEFORE the pages go away, and announced as
+	 * RT_DELETE while it happens.  A debugger that read the list after the
+	 * unmap but before the removal would follow l_ld into memory that is no
+	 * longer mapped -- the list has to stop describing the object strictly
+	 * before the object stops existing. */
+	rtld_debug_state(RT_DELETE);
+	rtld_link_map_remove(d);
+
 	if (d->map_base && d->map_size)
 		rtld_munmap((void *)d->map_base, d->map_size);
 	/* Zero the entire DSO entry so subsequent rtld_lookup_symbol iterations
      * skip it (symtab/strtab checks will be NULL) and stale pointers into
      * the now-unmapped library pages can never be dereferenced. */
 	rtld_memset(d, 0, sizeof(*d));
+	rtld_debug_state(RT_CONSISTENT);
 	/* Tells anything caching per-object data that its cache is now stale --
 	 * the pages this object occupied are unmapped, and an entry still
 	 * pointing into them is a fault waiting for the next lookup. */
@@ -1814,6 +2084,10 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 	/* ---- Register ourselves ---- */
 	dso_t *rtld = rtld_alloc_dso();
 	rtld->name = "ld-likeos.so";
+	/* And its path, for the same reason every other object has one: a
+	 * debugger opens l_name to read symbols, and the loader appears in
+	 * every backtrace that starts before main. */
+	rtld->path = "/lib/ld-likeos.so";
 	rtld->base = own_base;
 	rtld->dynamic = own_dyn;
 	rtld->relocated = 1;
@@ -1900,6 +2174,35 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 	/* ---- Relocate (dependencies first) ---- */
 	for (int i = g_ndsos - 1; i >= 0; i--)
 		rtld_relocate(&g_dsos[i]);
+
+	/* Publish the debugger rendezvous.
+	 *
+	 * BEFORE the RELRO lock-down below, and that ordering is the whole
+	 * reason it sits here: DT_DEBUG lives in the dynamic section, which is
+	 * inside the region about to be made read-only, so the store has to
+	 * happen while it is still writable.
+	 *
+	 * The object list is built in load order with the main executable
+	 * first, then announced once as consistent -- there is no debugger
+	 * attached yet to see the intermediate states of start-up, and a
+	 * program stopped at its entry point wants one complete answer. */
+	{
+		dso_t *m = NULL;
+
+		for (int i = 0; i < g_ndsos; i++)
+			if (g_dsos[i].is_main) {
+				m = &g_dsos[i];
+				break;
+			}
+		if (m)
+			rtld_link_map_add(m);
+		for (int i = 0; i < g_ndsos; i++)
+			if (!g_dsos[i].is_main &&
+			    (g_dsos[i].name || g_dsos[i].symtab))
+				rtld_link_map_add(&g_dsos[i]);
+		rtld_publish_r_debug(m, own_base);
+		rtld_debug_state(RT_CONSISTENT);
+	}
 
 	/* Relocation is done: lock down each object's RELRO region.  After all
 	 * of them, not inside the loop -- an object relocated earlier may still

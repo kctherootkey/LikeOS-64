@@ -97,6 +97,13 @@ stage_lib libgtk-3
 # Claws Mail's own dependencies: TLS, the mail protocols, spell checking, and
 # the protocol that tells the window manager an application is starting.
 for l in libgmp libnettle libhogweed libtasn1 libgnutls; do stage_lib "$l"; done
+
+# MPFR, for gdb.  Not a Claws dependency and not staged with the TLS chain
+# above for that reason -- it is here because this is the script that puts
+# sysroot libraries on the image, and gdb records a NEEDED on it.  Without this
+# gdb is copied onto the image and then refuses to start, naming a library
+# nothing else on the system uses.
+stage_lib libmpfr
 stage_lib libetpan
 stage_lib libenchant-2
 stage_lib libhunspell-1.7

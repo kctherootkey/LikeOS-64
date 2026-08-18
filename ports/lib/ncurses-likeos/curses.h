@@ -305,6 +305,12 @@ int mvwaddnstr(WINDOW *win, int y, int x, const char *str, int n);
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...);
 int wprintw(WINDOW *win, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
+/* Suppressible: these shadow ordinary identifiers.  `move' and `erase'
+ * collide with std::move and std::string::erase, so any C++ that includes
+ * this header and the standard library cannot compile with them defined.
+ * Real ncurses guards the same wrappers behind the same macro, and callers
+ * that want them off (gdb among them) already define it. */
+#ifndef NCURSES_NOMACROS
 /* stdscr convenience */
 #define addch(ch)           waddch(stdscr, (ch))
 #define addstr(str)         waddstr(stdscr, (str))
@@ -312,13 +318,16 @@ int wprintw(WINDOW *win, const char *fmt, ...) __attribute__((format(printf, 2, 
 #define mvaddch(y, x, ch)   mvwaddch(stdscr, (y), (x), (ch))
 #define mvaddstr(y, x, str) mvwaddstr(stdscr, (y), (x), (str))
 #define printw(...)          wprintw(stdscr, __VA_ARGS__)
+#endif
 
 /* ===== Input ===== */
 
 int wgetch(WINDOW *win);
 int ungetch(int ch);
 
+#ifndef NCURSES_NOMACROS
 #define getch() wgetch(stdscr)
+#endif
 
 /* ===== Refresh ===== */
 
@@ -328,14 +337,18 @@ int doupdate(void);
 int redrawwin(WINDOW *win);
 int wredrawln(WINDOW *win, int beg_line, int num_lines);
 
+#ifndef NCURSES_NOMACROS
 #define refresh() wrefresh(stdscr)
+#endif
 
 /* ===== Cursor / move ===== */
 
 int wmove(WINDOW *win, int y, int x);
 int curs_set(int visibility);
 
+#ifndef NCURSES_NOMACROS
 #define move(y, x) wmove(stdscr, (y), (x))
+#endif
 
 #define getyx(win, y, x)    do { (y) = (win)->_cury; (x) = (win)->_curx; } while(0)
 #define getbegyx(win, y, x) do { (y) = (win)->_begy; (x) = (win)->_begx; } while(0)
@@ -352,9 +365,11 @@ int werase(WINDOW *win);
 int wclrtoeol(WINDOW *win);
 int wclrtobot(WINDOW *win);
 
+#ifndef NCURSES_NOMACROS
 #define clear()    wclear(stdscr)
 #define erase()    werase(stdscr)
 #define clrtoeol() wclrtoeol(stdscr)
+#endif
 
 /* ===== Attributes ===== */
 
@@ -363,9 +378,11 @@ int wattroff(WINDOW *win, int attrs);
 int wattrset(WINDOW *win, int attrs);
 int wbkgdset(WINDOW *win, chtype ch);
 
+#ifndef NCURSES_NOMACROS
 #define attron(a)  wattron(stdscr, (a))
 #define attroff(a) wattroff(stdscr, (a))
 #define attrset(a) wattrset(stdscr, (a))
+#endif
 
 /* ===== Color ===== */
 
@@ -380,9 +397,11 @@ int scrollok(WINDOW *win, bool bf);
 int wscrl(WINDOW *win, int n);
 int wsetscrreg(WINDOW *win, int top, int bot);
 
+#ifndef NCURSES_NOMACROS
 #define scroll(win)      wscrl((win), 1)
 #define scrl(n)          wscrl(stdscr, (n))
 #define setscrreg(t, b)  wsetscrreg(stdscr, (t), (b))
+#endif
 
 /* ===== Options ===== */
 

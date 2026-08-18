@@ -1,0 +1,32 @@
+Patches applied to the pristine gdb-17.2 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order, so the leading
+number is the order.  Each one starts with a few lines of prose saying what it
+does and why, then the diff -- the explanation is the point of keeping them as
+separate files rather than editing src/ in place, which the next re-unpack
+would silently discard.
+
+Planned set (added in the gdb source-port phase, once the kernel ptrace ABI
+they are written against exists):
+
+  0001-config-sub-likeos-triple.patch
+        Teach the bundled config.sub about x86_64-*-likeos*.  There are two
+        copies in the tree (src/config.sub and
+        src/readline/readline/support/config.sub) and both are consulted.
+
+  0002-gdb-configure-host-tgt.patch
+        gdb/configure.host and gdb/configure.tgt entries selecting the native
+        target module and OS ABI for the new triple.
+
+  0003-gdb-likeos-nat.patch
+        gdb/likeos-nat.c -- the native target_ops: attach/detach, register
+        fetch/store, memory transfer, resume, wait, breakpoint and watchpoint
+        insertion.  Written against <sys/ptrace.h>; structurally modelled on
+        the BSD nat modules, which are the closest analog to a small
+        non-Linux Unix.
+
+  0004-gdb-likeos-tdep.patch
+        gdb/likeos-tdep.c -- OS ABI glue: signal numbering and siginfo layout.
+
+  0005-gdbserver-likeos-low.patch
+        gdbserver/likeos-low.cc -- the same primitives for the remote stub.

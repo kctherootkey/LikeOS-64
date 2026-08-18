@@ -3,6 +3,7 @@
 #define _KERNEL_ELF_H_
 
 #include <kernel/uapi/types.h>
+#include <kernel/ke/cred.h> /* cred_t (AT_SECURE / AT_*ID reporting) */
 
 // ELF Magic
 #define ELFMAG0 0x7F
@@ -401,7 +402,15 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 // Execute ELF file, replacing current task's memory (for execve semantics)
 // Returns: entry point address on success, 0 on failure
 // On success, *out_stack_ptr is set to the new user stack pointer
+//
+// `newcred' is the credential set the new image will run with, used to report
+// AT_SECURE and the AT_*ID auxv entries truthfully.  A set-id exec has not
+// committed its transition by the time the stack is built -- the ids are only
+// applied after the image has been replaced successfully, so a failed exec
+// cannot leave a process privileged in its old image -- so the caller passes
+// the pending credentials here.  NULL means no transition is pending.
 uint64_t elf_exec_replace(const char *path, char *const argv[],
-			  char *const envp[], uint64_t *out_stack_ptr);
+			  char *const envp[], uint64_t *out_stack_ptr,
+			  const cred_t *newcred);
 
 #endif // _KERNEL_ELF_H_

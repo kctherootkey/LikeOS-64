@@ -1153,6 +1153,31 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 			return -EPERM;
 		if (pgid < 0)
 			return -EINVAL;
+
+		/* And the group must be one of THIS SESSION's.
+		 *
+		 * POSIX requires the refusal and it is not a formality.  A
+		 * debugger attaching to a process on another terminal does
+		 * exactly this: gdb hands its own terminal's foreground group
+		 * to the group of the process it attached to, which lives in
+		 * the other terminal's session.  Allowed, it puts gdb itself in
+		 * the background of the terminal it is talking to -- Ctrl-C
+		 * from then on goes to the unrelated program on the OTHER
+		 * terminal, and gdb stops with SIGTTIN the moment it reads its
+		 * own prompt.  Both terminals are wedged by one ioctl.
+		 *
+		 * Refused only when the group is positively known to belong
+		 * somewhere else.  A group with no live member left, or a
+		 * terminal with no session recorded, is allowed through as
+		 * before: this exists to catch a caller naming another
+		 * session, not to make job control depend on bookkeeping being
+		 * complete.  Not exempted for root either -- the rule is about
+		 * which terminal a group can be the foreground of, and being
+		 * root does not put a process on a different terminal. */
+		if (pgid > 0 && tty->sid > 0 &&
+		    sched_pgrp_in_session(pgid, tty->sid) < 0)
+			return -EPERM;
+
 		tty->fg_pgid = pgid;
 		return 0;
 	}

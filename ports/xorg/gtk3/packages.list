@@ -94,6 +94,12 @@
 # built: GMP for the bignums, nettle for the ciphers, libtasn1 for the
 # certificate parsing.
 -         gmp                6.3.0    https://ftp.gnu.org/gnu/gmp/gmp-%VERSION%.tar.xz
+# MPFR sits here because it needs GMP and because gdb needs IT: gdb 17
+# requires MPFR outright (there is a --with-mpfr but no --without-mpfr) to do
+# target floating-point arithmetic at the debuggee's precision rather than the
+# host's.  Nothing in the GTK3 stack uses it; it is here because this is the
+# package set that populates the sysroot gdb links against.
+-         mpfr               4.2.1    https://ftp.gnu.org/gnu/mpfr/mpfr-%VERSION%.tar.xz
 -         nettle             3.10.2   https://ftp.gnu.org/gnu/nettle/nettle-%VERSION%.tar.gz
 -         libtasn1           4.21.0   https://ftp.gnu.org/gnu/libtasn1/libtasn1-%VERSION%.tar.gz
 -         gnutls             3.8.13   https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-%VERSION%.tar.xz
