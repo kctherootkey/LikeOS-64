@@ -11,6 +11,8 @@
 #include <kernel/fs/devfs.h>
 #include <kernel/dev/input/evdev.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/icache.h>
+#include <kernel/ke/uaccess.h>
 
 // ============================================================================
 // Epoll instance table
@@ -708,3 +710,318 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 					   seq_before);
 	}
 }
+
+
+// Helper: extract epoll index from a process fd
+static int epoll_idx_from_fd(uint64_t fd)
+{
+	task_t *cur = sched_current();
+	if (!cur || fd >= TASK_MAX_FDS)
+		return -EBADF;
+	void *entry = task_fds(cur)[fd];
+	if (!entry)
+		return -EBADF;
+	if (!IS_EPOLL_FD(entry))
+		return -EBADF;
+	return EPOLL_FD_IDX(entry);
+}
+
+
+// ---------------------------------------------------------------------------
+// Noinline helpers for syscalls with large stack-allocated buffers.
+// Keeping these out of syscall_handler_inner prevents the compiler from
+// reserving stack space for ALL local arrays at function entry, which was
+// blowing past the 8 KB kernel stack.
+// ---------------------------------------------------------------------------
+
+/* ppoll()/pselect() take a signal mask that must be installed for exactly the
+ * duration of the wait and restored afterwards.  Ignoring it broke the
+ * standard "block the signal, then let ppoll unblock it while waiting" idiom:
+ * the signal stayed blocked, signal_pending() correctly skipped it, the wait
+ * was never interrupted and the handler never ran.  sshd uses precisely that
+ * idiom for SIGCHLD, so exited sessions were left unreaped as zombies until
+ * some unrelated event happened to wake the listener.
+ *
+ * Returns 1 if a mask was installed (caller must restore `saved`), 0 if none
+ * was supplied, or a negative errno. */
+static int poll_sigmask_install(uint64_t umask_ptr, kernel_sigset_t *saved)
+{
+	task_t *cur = sched_current();
+	if (!cur || umask_ptr == 0)
+		return 0;
+	if (!validate_user_ptr(umask_ptr, sizeof(kernel_sigset_t)))
+		return -EFAULT;
+	kernel_sigset_t newset;
+	if (copy_from_user(&newset, (void *)umask_ptr,
+			   sizeof(kernel_sigset_t)) != 0)
+		return -EFAULT;
+	*saved = cur->signals.blocked;
+	/* Park the caller's mask for the deferred restore (see the field
+	 * comment in struct task): it must stay OFF until signal delivery has
+	 * had its chance, otherwise the signal the caller unblocked for the
+	 * wait is re-blocked before its handler can run. */
+	cur->sigmask_saved = *saved;
+	cur->sigmask_restore_pending = 1;
+	cur->signals.blocked = newset;
+	sig_strip_unblockable(&cur->signals.blocked);
+	return 1;
+}
+
+
+/* Put the caller's mask back if nothing else already did (i.e. no handler was
+ * set up, which would have handed the restore to sigreturn). */
+void poll_sigmask_restore_pending(task_t *cur)
+{
+	if (!cur || !cur->sigmask_restore_pending)
+		return;
+	cur->sigmask_restore_pending = 0;
+	cur->signals.blocked = cur->sigmask_saved;
+	sig_strip_unblockable(&cur->signals.blocked);
+}
+
+
+__attribute__((noinline)) int64_t
+sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+		   uint64_t a5)
+{
+	fd_set kr, kw, ke;
+	fd_set *rp = NULL, *wp = NULL, *ep = NULL;
+	if (a2 && validate_user_ptr(a2, sizeof(fd_set))) {
+		copy_from_user(&kr, (void *)a2, sizeof(fd_set));
+		rp = &kr;
+	}
+	if (a3 && validate_user_ptr(a3, sizeof(fd_set))) {
+		copy_from_user(&kw, (void *)a3, sizeof(fd_set));
+		wp = &kw;
+	}
+	if (a4 && validate_user_ptr(a4, sizeof(fd_set))) {
+		copy_from_user(&ke, (void *)a4, sizeof(fd_set));
+		ep = &ke;
+	}
+	uint64_t timeout_ticks = (uint64_t)-1;
+	if (a5 && validate_user_ptr(a5, 16)) {
+		uint64_t tv_sec = 0, tv_usec = 0;
+		copy_from_user(&tv_sec, (void *)a5, 8);
+		copy_from_user(&tv_usec, (void *)(a5 + 8), 8);
+		/* Converted at the measured tick rate.  This used to assume
+		 * 100Hz, so on a machine whose calibrated rate is ~200Hz every
+		 * select() timeout expired in half the requested time. */
+		timeout_ticks =
+			timer_us_to_ticks(tv_sec * 1000000ULL + tv_usec);
+		if (tv_sec == 0 && tv_usec == 0)
+			timeout_ticks = 0;
+	}
+	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+	if (rp && a2)
+		copy_to_user((void *)a2, rp, sizeof(fd_set));
+	if (wp && a3)
+		copy_to_user((void *)a3, wp, sizeof(fd_set));
+	if (ep && a4)
+		copy_to_user((void *)a4, ep, sizeof(fd_set));
+	return ret;
+}
+
+
+__attribute__((noinline)) int64_t
+sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+		     uint64_t a5, uint64_t a6)
+{
+	fd_set kr, kw, ke;
+	fd_set *rp = NULL, *wp = NULL, *ep = NULL;
+	if (a2 && validate_user_ptr(a2, sizeof(fd_set))) {
+		copy_from_user(&kr, (void *)a2, sizeof(fd_set));
+		rp = &kr;
+	}
+	if (a3 && validate_user_ptr(a3, sizeof(fd_set))) {
+		copy_from_user(&kw, (void *)a3, sizeof(fd_set));
+		wp = &kw;
+	}
+	if (a4 && validate_user_ptr(a4, sizeof(fd_set))) {
+		copy_from_user(&ke, (void *)a4, sizeof(fd_set));
+		ep = &ke;
+	}
+	uint64_t timeout_ticks = (uint64_t)-1;
+	if (a5 && validate_user_ptr(a5, 16)) {
+		uint64_t tv_sec = 0;
+		long tv_nsec = 0;
+		copy_from_user(&tv_sec, (void *)a5, 8);
+		copy_from_user(&tv_nsec, (void *)(a5 + 8), 8);
+		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
+		 * assumed a 10ms tick and truncated the remainder, so this
+		 * expired early on both counts. */
+		timeout_ticks = timer_ns_to_ticks(tv_sec * 1000000000ULL +
+						  (uint64_t)tv_nsec);
+		if (tv_sec == 0 && tv_nsec == 0)
+			timeout_ticks = 0;
+	}
+	kernel_sigset_t saved_mask;
+	int have_mask = poll_sigmask_install(a6, &saved_mask);
+	if (have_mask < 0)
+		return have_mask;
+	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+	/* Mask restored after signal delivery — see the ppoll wrapper. */
+	(void)saved_mask;
+	if (rp && a2)
+		copy_to_user((void *)a2, rp, sizeof(fd_set));
+	if (wp && a3)
+		copy_to_user((void *)a3, wp, sizeof(fd_set));
+	if (ep && a4)
+		copy_to_user((void *)a4, ep, sizeof(fd_set));
+	return ret;
+}
+
+
+__attribute__((noinline)) int64_t
+sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	int nfds = (int)a2;
+	if (nfds < 0 || nfds > 256)
+		return -EINVAL;
+	size_t sz = (size_t)nfds * sizeof(struct pollfd);
+	if (!validate_user_ptr(a1, sz))
+		return -EFAULT;
+	struct pollfd kfds[256];
+	copy_from_user(kfds, (void *)a1, sz);
+	int timeout_ms = (int)(int64_t)a3;
+	uint64_t timeout_ticks;
+	if (timeout_ms < 0)
+		timeout_ticks = (uint64_t)-1;
+	else if (timeout_ms == 0)
+		timeout_ticks = 0;
+	else
+		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
+		 * AND discarded the remainder, so this returned early twice
+		 * over -- a 200ms poll() came back in about 129ms. */
+		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
+	int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
+	copy_to_user((void *)a1, kfds, sz);
+	return ret;
+}
+
+
+__attribute__((noinline)) int64_t
+sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+	int nfds = (int)a2;
+	if (nfds < 0 || nfds > 256)
+		return -EINVAL;
+	size_t sz = (size_t)nfds * sizeof(struct pollfd);
+	if (!validate_user_ptr(a1, sz))
+		return -EFAULT;
+	struct pollfd kfds[256];
+	copy_from_user(kfds, (void *)a1, sz);
+	uint64_t timeout_ticks = (uint64_t)-1;
+	if (a3 && validate_user_ptr(a3, 16)) {
+		uint64_t tv_sec = 0;
+		long tv_nsec = 0;
+		copy_from_user(&tv_sec, (void *)a3, 8);
+		copy_from_user(&tv_nsec, (void *)(a3 + 8), 8);
+		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
+		 * assumed a 10ms tick and truncated the remainder, so this
+		 * expired early on both counts. */
+		timeout_ticks = timer_ns_to_ticks(tv_sec * 1000000000ULL +
+						  (uint64_t)tv_nsec);
+		if (tv_sec == 0 && tv_nsec == 0)
+			timeout_ticks = 0;
+	}
+	kernel_sigset_t saved_mask;
+	int have_mask = poll_sigmask_install(a4, &saved_mask);
+	if (have_mask < 0)
+		return have_mask;
+	int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
+	/* The mask stays installed on purpose; it is put back after signal
+	 * delivery (poll_sigmask_restore_pending). */
+	(void)saved_mask;
+	copy_to_user((void *)a1, kfds, sz);
+	return ret;
+}
+
+
+__attribute__((noinline)) int64_t
+sys_epoll_wait(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+	int ep_idx = epoll_idx_from_fd(a1);
+	if (ep_idx < 0)
+		return ep_idx;
+	int maxevents = (int)a3;
+	if (maxevents <= 0 || maxevents > 256)
+		return -EINVAL;
+	size_t sz = (size_t)maxevents * sizeof(struct epoll_event);
+	if (!validate_user_ptr(a2, sz))
+		return -EFAULT;
+	struct epoll_event kevs[256];
+	int timeout_ms = (int)(int64_t)a4;
+	uint64_t timeout_ticks;
+	if (timeout_ms < 0)
+		timeout_ticks = (uint64_t)-1;
+	else if (timeout_ms == 0)
+		timeout_ticks = 0;
+	else
+		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
+		 * AND discarded the remainder, so this returned early twice
+		 * over -- a 200ms poll() came back in about 129ms. */
+		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
+	int ret = epoll_wait_internal(ep_idx, kevs, maxevents, timeout_ticks);
+	if (ret > 0)
+		copy_to_user((void *)a2, kevs,
+			     (size_t)ret * sizeof(struct epoll_event));
+	return ret;
+}
+
+int64_t sys_epoll_create(void)
+{
+	int ep_idx = epoll_create_internal(0);
+	if (ep_idx < 0)
+		return ep_idx;
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+		if (task_fds(cur)[_fd] == NULL) {
+			task_fds(cur)[_fd] = MAKE_EPOLL_FD(ep_idx);
+			return _fd;
+		}
+	}
+	return -EMFILE;
+}
+
+int64_t sys_epoll_create1(uint64_t a1)
+{
+	int ep_idx = epoll_create_internal((int)a1);
+	if (ep_idx < 0)
+		return ep_idx;
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+		if (task_fds(cur)[_fd] == NULL) {
+			task_fds(cur)[_fd] = MAKE_EPOLL_FD(ep_idx);
+			/* EPOLL_CLOEXEC has to be RECORDED, not just
+			 * accepted.  An epoll set is private to the
+			 * process that built it, and every caller asks
+			 * for it -- letting the descriptor survive
+			 * exec() hands an unrelated program a handle
+			 * onto it, and the reference it drops on exit
+			 * is one the creator was still using. */
+			if ((int)a1 & EPOLL_CLOEXEC)
+				task_set_fd_flags(cur, (unsigned)_fd,
+						  FD_CLOEXEC);
+			return _fd;
+		}
+	}
+	return -EMFILE;
+}
+
+int64_t sys_epoll_ctl(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+	int ep_idx = epoll_idx_from_fd(a1);
+	if (ep_idx < 0)
+		return ep_idx;
+	struct epoll_event kev;
+	if (a4 && validate_user_ptr(a4, sizeof(struct epoll_event)))
+		copy_from_user(&kev, (void *)a4,
+			       sizeof(struct epoll_event));
+	return epoll_ctl_internal(ep_idx, (int)a2, (int)a3,
+				  a4 ? &kev : NULL);
+}
+

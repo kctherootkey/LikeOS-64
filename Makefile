@@ -285,6 +285,29 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/sched.o \
 			  $(BUILD_DIR)/syscall.o \
 			  $(BUILD_DIR)/syscall_c.o \
+			  $(BUILD_DIR)/uaccess.o \
+			  $(BUILD_DIR)/fs_read_write.o \
+			  $(BUILD_DIR)/fs_file.o \
+			  $(BUILD_DIR)/fs_namei.o \
+			  $(BUILD_DIR)/fs_open.o \
+			  $(BUILD_DIR)/fs_stat.o \
+			  $(BUILD_DIR)/fs_readdir.o \
+			  $(BUILD_DIR)/fs_xattr.o \
+			  $(BUILD_DIR)/fs_ioctl.o \
+			  $(BUILD_DIR)/fs_sync.o \
+			  $(BUILD_DIR)/mm_mmap.o \
+			  $(BUILD_DIR)/mm_mprotect.o \
+			  $(BUILD_DIR)/mm_madvise.o \
+			  $(BUILD_DIR)/ke_fork.o \
+			  $(BUILD_DIR)/ke_exit.o \
+			  $(BUILD_DIR)/ke_exec.o \
+			  $(BUILD_DIR)/ke_process.o \
+			  $(BUILD_DIR)/ke_time.o \
+			  $(BUILD_DIR)/ke_system.o \
+			  $(BUILD_DIR)/sched_syscalls.o \
+			  $(BUILD_DIR)/futex_syscalls.o \
+			  $(BUILD_DIR)/ke_ptrace.o \
+			  $(BUILD_DIR)/net_syscalls.o \
 			  $(BUILD_DIR)/elf_loader.o \
 			  $(BUILD_DIR)/script_loader.o \
 			  $(BUILD_DIR)/pipe.o \
@@ -696,6 +719,75 @@ $(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
 
 $(BUILD_DIR)/syscall_c.o: $(KERNEL_DIR)/ke/syscall.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/uaccess.o: $(KERNEL_DIR)/ke/uaccess.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_read_write.o: $(KERNEL_DIR)/fs/read_write.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_file.o: $(KERNEL_DIR)/fs/file.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_namei.o: $(KERNEL_DIR)/fs/namei.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_open.o: $(KERNEL_DIR)/fs/open.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_stat.o: $(KERNEL_DIR)/fs/stat.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_readdir.o: $(KERNEL_DIR)/fs/readdir.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_xattr.o: $(KERNEL_DIR)/fs/xattr.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_ioctl.o: $(KERNEL_DIR)/fs/ioctl.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_sync.o: $(KERNEL_DIR)/fs/sync.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mm_mmap.o: $(KERNEL_DIR)/mm/mmap.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mm_mprotect.o: $(KERNEL_DIR)/mm/mprotect.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mm_madvise.o: $(KERNEL_DIR)/mm/madvise.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_fork.o: $(KERNEL_DIR)/ke/fork.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_exit.o: $(KERNEL_DIR)/ke/exit.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_exec.o: $(KERNEL_DIR)/ke/exec.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_process.o: $(KERNEL_DIR)/ke/process.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_time.o: $(KERNEL_DIR)/ke/time.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_system.o: $(KERNEL_DIR)/ke/system.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/sched_syscalls.o: $(KERNEL_DIR)/ke/sched_syscalls.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/futex_syscalls.o: $(KERNEL_DIR)/ke/futex_syscalls.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ke_ptrace.o: $(KERNEL_DIR)/ke/ptrace.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/net_syscalls.o: $(KERNEL_DIR)/net/syscalls.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/elf_loader.o: $(KERNEL_DIR)/ke/elf_loader.c | $(BUILD_DIR)

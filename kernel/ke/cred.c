@@ -10,6 +10,8 @@
 #include <kernel/ke/syscall.h> /* EPERM, EACCES */
 #include <kernel/uapi/stat.h> /* S_ISDIR */
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/icache.h>
+#include <kernel/ke/uaccess.h>
 
 void cred_init_root(cred_t *c)
 {
@@ -460,3 +462,159 @@ int task_may_access(const task_t *target, int mode)
 
 	return 0;
 }
+
+
+/* Real credential syscalls.  Operate on the current task's embedded
+ * cred; the set*-id permission rules live in cred.c.  Enforcement of file
+ * permissions against these IDs is done by the perm_check and perm_traverse helpers above. */
+int64_t sys_getuid(void)
+{
+	task_t *c = sched_current();
+	return c ? (int64_t)c->cred.uid : 0;
+}
+
+int64_t sys_geteuid(void)
+{
+	task_t *c = sched_current();
+	return c ? (int64_t)c->cred.euid : 0;
+}
+
+int64_t sys_getgid(void)
+{
+	task_t *c = sched_current();
+	return c ? (int64_t)c->cred.gid : 0;
+}
+
+int64_t sys_getegid(void)
+{
+	task_t *c = sched_current();
+	return c ? (int64_t)c->cred.egid : 0;
+}
+
+
+int64_t sys_setuid(uint64_t uid)
+{
+	task_t *c = sched_current();
+	return c ? cred_setuid(&c->cred, (uint32_t)uid) : -EPERM;
+}
+
+int64_t sys_setgid(uint64_t gid)
+{
+	task_t *c = sched_current();
+	return c ? cred_setgid(&c->cred, (uint32_t)gid) : -EPERM;
+}
+
+int64_t sys_seteuid(uint64_t uid)
+{
+	task_t *c = sched_current();
+	return c ? cred_seteuid(&c->cred, (uint32_t)uid) : -EPERM;
+}
+
+int64_t sys_setegid(uint64_t gid)
+{
+	task_t *c = sched_current();
+	return c ? cred_setegid(&c->cred, (uint32_t)gid) : -EPERM;
+}
+
+
+int64_t sys_getgroups(uint64_t size, uint64_t list)
+{
+	task_t *c = sched_current();
+	uint32_t n = c ? c->cred.ngroups : 0;
+	if (size == 0)
+		return (int64_t)n; /* query count */
+	if (size < n)
+		return -EINVAL;
+	if (n == 0)
+		return 0;
+	if (!validate_user_ptr(list, sizeof(int) * (size_t)n))
+		return -EFAULT;
+	int tmp[NGROUPS_MAX];
+	for (uint32_t i = 0; i < n; i++)
+		tmp[i] = (int)c->cred.groups[i];
+	if (copy_to_user((void *)list, tmp, sizeof(int) * (size_t)n) < 0)
+		return -EFAULT;
+	return (int64_t)n;
+}
+
+
+int64_t sys_setgroups(uint64_t size, uint64_t list)
+{
+	task_t *c = sched_current();
+	if (!c)
+		return -EPERM;
+	if (c->cred.euid != 0)
+		return -EPERM; /* privileged only */
+	if (size > NGROUPS_MAX)
+		return -EINVAL;
+	if (size == 0) {
+		c->cred.ngroups = 0;
+		return 0;
+	}
+	if (!validate_user_ptr(list, sizeof(int) * (size_t)size))
+		return -EFAULT;
+	int tmp[NGROUPS_MAX];
+	if (copy_from_user(tmp, (const void *)list,
+			   sizeof(int) * (size_t)size) < 0)
+		return -EFAULT;
+	for (uint64_t i = 0; i < size; i++)
+		c->cred.groups[i] = (uint32_t)tmp[i];
+	c->cred.ngroups = (uint32_t)size;
+	return 0;
+}
+
+
+int64_t sys_setresuid(uint64_t ruid, uint64_t euid, uint64_t suid)
+{
+	task_t *c = sched_current();
+	return c ? cred_setresuid(&c->cred, (uint32_t)ruid, (uint32_t)euid,
+				  (uint32_t)suid) :
+		   -EPERM;
+}
+
+int64_t sys_setresgid(uint64_t rgid, uint64_t egid, uint64_t sgid)
+{
+	task_t *c = sched_current();
+	return c ? cred_setresgid(&c->cred, (uint32_t)rgid, (uint32_t)egid,
+				  (uint32_t)sgid) :
+		   -EPERM;
+}
+
+int64_t sys_getresuid(uint64_t ruid, uint64_t euid, uint64_t suid)
+{
+	task_t *c = sched_current();
+	if (!c)
+		return -EFAULT;
+	int vals[3] = { (int)c->cred.uid, (int)c->cred.euid,
+			(int)c->cred.suid };
+	uint64_t ptrs[3] = { ruid, euid, suid };
+	for (int i = 0; i < 3; i++) {
+		if (!ptrs[i])
+			continue;
+		if (!validate_user_ptr(ptrs[i], sizeof(int)))
+			return -EFAULT;
+		if (copy_to_user((void *)ptrs[i], &vals[i], sizeof(int)) < 0)
+			return -EFAULT;
+	}
+	return 0;
+}
+
+int64_t sys_getresgid(uint64_t rgid, uint64_t egid, uint64_t sgid)
+{
+	task_t *c = sched_current();
+	if (!c)
+		return -EFAULT;
+	int vals[3] = { (int)c->cred.gid, (int)c->cred.egid,
+			(int)c->cred.sgid };
+	uint64_t ptrs[3] = { rgid, egid, sgid };
+	for (int i = 0; i < 3; i++) {
+		if (!ptrs[i])
+			continue;
+		if (!validate_user_ptr(ptrs[i], sizeof(int)))
+			return -EFAULT;
+		if (copy_to_user((void *)ptrs[i], &vals[i], sizeof(int)) < 0)
+			return -EFAULT;
+	}
+	return 0;
+}
+

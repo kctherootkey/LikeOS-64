@@ -3,6 +3,10 @@
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/fs/icache.h>
+#include <kernel/ke/uaccess.h>
+#include <kernel/fs/file.h>
 
 bool pipe_is_end(const void *ptr)
 {
@@ -155,3 +159,63 @@ void pipe_close_end(pipe_end_t *end)
 
 	kfree(end);
 }
+
+
+// SYS_PIPE - create a pipe
+int64_t sys_pipe(uint64_t pipefd_ptr)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	if (!validate_user_ptr(pipefd_ptr, sizeof(int) * 2)) {
+		return -EFAULT;
+	}
+
+	pipe_t *pipe = pipe_create(4096);
+	if (!pipe) {
+		return -ENOMEM;
+	}
+
+	pipe_end_t *read_end = pipe_create_end(pipe, true);
+	if (!read_end) {
+		if (pipe->buffer) {
+			kfree(pipe->buffer);
+		}
+		kfree(pipe);
+		return -ENOMEM;
+	}
+
+	pipe_end_t *write_end = pipe_create_end(pipe, false);
+	if (!write_end) {
+		pipe_close_end(read_end);
+		return -ENOMEM;
+	}
+
+	/* Installing the read end also reserves its slot, so the write end
+	 * cannot land on the same number. */
+	int fd_read = fd_install(cur, (vfs_file_t *)read_end);
+	if (fd_read < 0) {
+		pipe_close_end(read_end);
+		pipe_close_end(write_end);
+		return fd_read;
+	}
+
+	int fd_write = fd_install(cur, (vfs_file_t *)write_end);
+	if (fd_write < 0) {
+		task_fds(cur)[fd_read] = NULL;
+		pipe_close_end(read_end);
+		pipe_close_end(write_end);
+		return fd_write;
+	}
+
+	// SMAP-aware write to user array
+	int *user_pipefd = (int *)pipefd_ptr;
+	smap_disable();
+	user_pipefd[0] = fd_read;
+	user_pipefd[1] = fd_write;
+	smap_enable();
+
+	return 0;
+}
+

@@ -8,6 +8,8 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/icache.h>
+#include <kernel/ke/uaccess.h>
 
 // NOTE: Signal delivery now uses per-CPU storage via percpu_t
 // The old global syscall_signal_pending is deprecated.
@@ -1365,3 +1367,522 @@ void signal_check_posix_timers(uint64_t current_tick)
 		}
 	}
 }
+
+
+
+static void kill_task(task_t *t, int sig)
+{
+	if (!t) {
+		return;
+	}
+	// Use sched_signal_task which properly handles SIGKILL/SIGSTOP
+	// and other signals with their default actions
+	sched_signal_task(t, sig);
+}
+
+
+int64_t sys_kill(uint64_t pid, uint64_t sig)
+{
+	if (sig > 64)
+		return -EINVAL;
+	task_t *self = sched_current();
+	if (!self)
+		return -EFAULT;
+	/* POSIX pid forms:
+	 *   pid  > 0   that process
+	 *   pid == 0   every process in the CALLER's process group
+	 *   pid <  -1  every process in process group -pid
+	 * pid 0 used to be refused as "the kernel idle task", but 0 is not a
+	 * pid here at all — it is the caller's own group.  A shell relies on
+	 * this: when it finds itself in the background it does kill(0, SIGTTIN)
+	 * to stop until it is moved to the foreground, and the EPERM made it
+	 * spin and then switch job control off entirely. */
+	if (pid == 0) {
+		if (self->pgid <= 0)
+			return -ESRCH;
+		/* Our own group always contains us and we may always signal
+		 * ourselves, so this cannot come back -EPERM; the check only
+		 * skips members belonging to another user, which a group can
+		 * acquire across a setuid exec. */
+		return sched_signal_pgrp_checked(self->pgid, (int)sig);
+	}
+	if ((int64_t)pid < -1) {
+		int64_t pgid = -(int64_t)pid;
+		if (pgid > 0x7fffffff)
+			return -ESRCH;
+		return sched_signal_pgrp_checked((int)pgid, (int)sig);
+	}
+	if ((int64_t)pid == -1) {
+		/* Broadcast: every process the caller may signal, except itself
+		 * and init.  Treating -1 as "process group 1" (which is what
+		 * negating it used to produce) signalled init's group instead
+		 * of everything, which is both wrong and dangerous. */
+		if (sig == 0)
+			return 0;
+		return sched_signal_all(self, (int)sig);
+	}
+	task_t *t = sched_find_task_by_id((uint32_t)pid);
+	if (!t)
+		return -ESRCH;
+	// Kernel tasks (idle, init, kernel threads) cannot be signalled
+	if (t->privilege == TASK_KERNEL)
+		return -EPERM;
+	/* Credential check: an unprivileged caller may only signal a process
+	 * with a matching uid (applies even to the sig==0 existence probe). */
+	int perr = signal_permission(t, (int)sig);
+	if (perr != 0)
+		return perr;
+	if (sig == 0)
+		return 0;
+	kill_task(t, (int)sig);
+	return 0;
+}
+
+
+// ============================================================================
+// Signal Syscalls
+// ============================================================================
+
+// SYS_RT_SIGACTION - set signal handler
+int64_t sys_rt_sigaction(uint64_t sig, uint64_t act_ptr,
+				uint64_t oldact_ptr, uint64_t sigsetsize)
+{
+	if (sigsetsize != sizeof(kernel_sigset_t)) {
+		return -EINVAL;
+	}
+	if (sig <= 0 || sig >= NSIG) {
+		return -EINVAL;
+	}
+	if (sig_kernel_only(sig)) {
+		return -EINVAL; // Can't change SIGKILL/SIGSTOP
+	}
+
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	struct k_sigaction *kact = &cur->signals.action[sig];
+
+	// Copy old action if requested
+	if (oldact_ptr) {
+		if (copy_to_user((void *)oldact_ptr, kact,
+				 sizeof(struct k_sigaction)) != 0) {
+			return -EFAULT;
+		}
+	}
+
+	// Set new action if provided
+	if (act_ptr) {
+		struct k_sigaction newact;
+		if (copy_from_user(&newact, (void *)act_ptr,
+				   sizeof(struct k_sigaction)) != 0) {
+			return -EFAULT;
+		}
+		/* sa_mask is applied to the blocked mask for the duration of the
+		 * handler.  Strip the unblockable signals here, at the point they
+		 * enter the kernel, so a filled sa_mask cannot make the task
+		 * unkillable while its handler runs. */
+		sig_strip_unblockable(&newact.sa_mask);
+		mm_memcpy(kact, &newact, sizeof(struct k_sigaction));
+	}
+
+	return 0;
+}
+
+
+// SYS_RT_SIGPROCMASK - change blocked signals
+int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr,
+				  uint64_t oldset_ptr, uint64_t sigsetsize)
+{
+	if (sigsetsize != sizeof(kernel_sigset_t)) {
+		return -EINVAL;
+	}
+
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	kernel_sigset_t *blocked = &cur->signals.blocked;
+
+	// Copy old mask if requested
+	if (oldset_ptr) {
+		if (copy_to_user((void *)oldset_ptr, blocked,
+				 sizeof(kernel_sigset_t)) != 0) {
+			return -EFAULT;
+		}
+	}
+
+	// Set new mask if provided
+	if (set_ptr) {
+		kernel_sigset_t newset;
+		if (copy_from_user(&newset, (void *)set_ptr,
+				   sizeof(kernel_sigset_t)) != 0) {
+			return -EFAULT;
+		}
+
+		switch (how) {
+		case SIG_BLOCK:
+			sigorset_k(blocked, blocked, &newset);
+			break;
+		case SIG_UNBLOCK:
+			signandset_k(blocked, blocked, &newset);
+			break;
+		case SIG_SETMASK:
+			*blocked = newset;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		// Can't block SIGKILL or SIGSTOP
+		sig_strip_unblockable(blocked);
+	}
+
+	return 0;
+}
+
+
+// SYS_RT_SIGPENDING - get pending signals
+int64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize)
+{
+	if (sigsetsize != sizeof(kernel_sigset_t)) {
+		return -EINVAL;
+	}
+
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	if (copy_to_user((void *)set_ptr, &cur->signals.pending,
+			 sizeof(kernel_sigset_t)) != 0) {
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+
+// SYS_RT_SIGTIMEDWAIT - wait for signal with timeout
+int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
+				   uint64_t timeout_ptr, uint64_t sigsetsize)
+{
+	if (sigsetsize != sizeof(kernel_sigset_t)) {
+		return -EINVAL;
+	}
+
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	kernel_sigset_t wait_set;
+	if (copy_from_user(&wait_set, (void *)set_ptr,
+			   sizeof(kernel_sigset_t)) != 0) {
+		return -EFAULT;
+	}
+
+	struct k_timespec timeout;
+	uint64_t deadline = 0;
+	if (timeout_ptr) {
+		if (copy_from_user(&timeout, (void *)timeout_ptr,
+				   sizeof(struct k_timespec)) != 0) {
+			return -EFAULT;
+		}
+		uint32_t freq = timer_get_frequency();
+		uint64_t ticks =
+			timeout.tv_sec * freq +
+			(uint64_t)timeout.tv_nsec * freq / 1000000000ULL;
+		deadline = timer_ticks() + ticks;
+	}
+
+	// Check if any signals in wait_set are already pending
+	while (1) {
+		for (int sig = 1; sig < NSIG; sig++) {
+			if (sigismember_k(&wait_set, sig) &&
+			    sigismember_k(&cur->signals.pending, sig)) {
+				// Found a signal
+				siginfo_t info;
+				signal_dequeue(cur, &wait_set, &info);
+
+				if (info_ptr) {
+					if (copy_to_user(
+						    (void *)info_ptr, &info,
+						    sizeof(siginfo_t)) != 0) {
+						return -EFAULT;
+					}
+				}
+				return sig;
+			}
+		}
+
+		// Check timeout
+		if (timeout_ptr && timer_ticks() >= deadline) {
+			return -EAGAIN;
+		}
+
+		// Block task and wait
+		cur->state = TASK_BLOCKED;
+		sched_schedule();
+
+		// Check if we should exit
+		if (cur->has_exited) {
+			return -EINTR;
+		}
+	}
+}
+
+
+/* Shared gate for the signal syscalls that reach a task straight from its id
+ * (rt_sigqueueinfo, tkill, tgkill).  Without it they bypass both guards
+ * sys_kill applies: kernel threads are not signallable at all, and an
+ * unprivileged caller may only signal a task whose credentials match
+ * (signal_permission()).  sig == 0 is the probe form, so the check runs for it
+ * too — that probe IS the permission answer. */
+int64_t signal_target_check(task_t *target, int sig)
+{
+	if (target->privilege == TASK_KERNEL)
+		return -EPERM;
+	return signal_permission(target, sig);
+}
+
+
+// SYS_RT_SIGQUEUEINFO - queue signal with info
+int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig,
+				   uint64_t info_ptr)
+{
+	if (sig <= 0 || sig >= NSIG) {
+		return -EINVAL;
+	}
+
+	task_t *target = sched_find_task_by_id((uint32_t)pid);
+	if (!target) {
+		return -ESRCH;
+	}
+
+	int64_t perr = signal_target_check(target, (int)sig);
+	if (perr != 0)
+		return perr;
+
+	siginfo_t info;
+	if (copy_from_user(&info, (void *)info_ptr, sizeof(siginfo_t)) != 0) {
+		return -EFAULT;
+	}
+
+	// Enforce that si_code indicates user-originated
+	info.si_code = SI_QUEUE;
+
+	return signal_send(target, (int)sig, &info);
+}
+
+
+// SYS_RT_SIGSUSPEND - suspend until signal
+int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize)
+{
+	if (sigsetsize != sizeof(kernel_sigset_t)) {
+		return -EINVAL;
+	}
+
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	kernel_sigset_t newmask;
+	if (copy_from_user(&newmask, (void *)mask_ptr,
+			   sizeof(kernel_sigset_t)) != 0) {
+		return -EFAULT;
+	}
+
+	// Save current mask and set new one
+	cur->signals.saved_mask = cur->signals.blocked;
+	cur->signals.blocked = newmask;
+	cur->signals.in_sigsuspend = 1;
+
+	// Can't block SIGKILL/SIGSTOP
+	sig_strip_unblockable(&cur->signals.blocked);
+
+	// Block until signal
+	cur->state = TASK_BLOCKED;
+
+	while (!signal_pending(cur)) {
+		sched_schedule();
+		if (cur->has_exited) {
+			cur->signals.in_sigsuspend = 0;
+			cur->signals.blocked = cur->signals.saved_mask;
+			return -EINTR;
+		}
+	}
+
+	// Restore mask
+	cur->signals.in_sigsuspend = 0;
+	cur->signals.blocked = cur->signals.saved_mask;
+
+	return -EINTR; // sigsuspend always returns EINTR
+}
+
+
+// SYS_RT_SIGRETURN - return from signal handler
+int64_t sys_rt_sigreturn(void)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	// Restore context from the signal frame
+	if (signal_restore_frame(cur) < 0) {
+		kprintf("sys_rt_sigreturn: failed to restore frame\n");
+		return -EFAULT;
+	}
+
+	// The return value will be ignored - we're restoring the original
+	// context which includes the original RAX value
+	return 0;
+}
+
+
+// SYS_SIGALTSTACK - set/get alternate signal stack
+int64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	// Copy old stack if requested
+	if (old_ss_ptr) {
+		if (copy_to_user((void *)old_ss_ptr, &cur->signals.altstack,
+				 sizeof(stack_t)) != 0) {
+			return -EFAULT;
+		}
+	}
+
+	// Set new stack if provided
+	if (ss_ptr) {
+		stack_t newss;
+		if (copy_from_user(&newss, (void *)ss_ptr, sizeof(stack_t)) !=
+		    0) {
+			return -EFAULT;
+		}
+
+		// Validate
+		if (!(newss.ss_flags & SS_DISABLE)) {
+			if (newss.ss_size < MINSIGSTKSZ) {
+				return -ENOMEM;
+			}
+		}
+
+		cur->signals.altstack = newss;
+	}
+
+	return 0;
+}
+
+
+// SYS_TKILL - send signal to specific thread
+int64_t sys_tkill(uint64_t tid, uint64_t sig)
+{
+	// sig == 0 is the existence/permission probe; only negatives are errors
+	if ((int64_t)tid <= 0 || (int64_t)sig < 0 || sig >= NSIG) {
+		return -EINVAL;
+	}
+
+	task_t *target = sched_find_task_by_id((uint32_t)tid);
+	if (!target) {
+		return -ESRCH;
+	}
+
+	int64_t perr = signal_target_check(target, (int)sig);
+	if (perr != 0)
+		return perr;
+
+	if (sig == 0) {
+		return 0;
+	}
+
+	task_t *self = sched_current();
+	siginfo_t info;
+	mm_memset(&info, 0, sizeof(info));
+	info.si_signo = (int)sig;
+	info.si_code = SI_TKILL;
+	// si_pid is the sending *process*, i.e. the sender's tgid, not its tid
+	info.si_pid = self ? self->tgid : 0;
+	info.si_uid = self ? self->cred.uid : 0;
+
+	return signal_send(target, (int)sig, &info);
+}
+
+
+// SYS_TGKILL - send signal to thread in specific thread group
+// This is the secure way to send signals to threads - validates that
+// the target thread belongs to the specified thread group.
+int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
+{
+	if ((int64_t)tgid <= 0 || (int64_t)tid <= 0) {
+		return -EINVAL;
+	}
+
+	if ((int64_t)sig < 0 || sig >= NSIG) {
+		return -EINVAL;
+	}
+
+	// Find the target thread
+	task_t *target = sched_find_task_by_id((uint32_t)tid);
+	if (!target) {
+		return -ESRCH;
+	}
+
+	// Validate that target belongs to the specified thread group
+	if (target->tgid != (int)tgid) {
+		return -ESRCH; // Thread not in specified group
+	}
+
+	int64_t perr = signal_target_check(target, (int)sig);
+	if (perr != 0)
+		return perr;
+
+	// sig == 0 is a permission check only
+	if (sig == 0) {
+		return 0;
+	}
+
+	task_t *self = sched_current();
+	// Build siginfo
+	siginfo_t info;
+	mm_memset(&info, 0, sizeof(info));
+	info.si_signo = (int)sig;
+	info.si_code = SI_TKILL;
+	info.si_pid = self ? self->tgid : 0;
+	info.si_uid = self ? self->cred.uid : 0;
+
+	return signal_send(target, (int)sig, &info);
+}
+
+
+// SYS_PAUSE - suspend until signal
+int64_t sys_pause(void)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+
+	// Block until any signal arrives
+	cur->state = TASK_BLOCKED;
+
+	while (!signal_pending(cur)) {
+		sched_schedule();
+		if (cur->has_exited) {
+			return -EINTR;
+		}
+	}
+
+	return -EINTR; // pause always returns EINTR
+}
+
+
+// SYS_SIGNALFD / SYS_SIGNALFD4 - create signalfd (simplified stub)
+int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags)
+{
+	(void)fd;
+	(void)mask_ptr;
+	(void)flags;
+	// signalfd is complex to implement fully - return ENOSYS for now
+	return -ENOSYS;
+}
+

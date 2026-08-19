@@ -593,4 +593,32 @@ void mm_free_guarded_kstack(void *stack_base, size_t usable_size);
 // Safe to call from any context after mm_init() has returned.
 void mm_mark_guard_page(uint64_t virt_addr);
 
+
+// SYS_BRK - set program break
+/* ---- address-space syscalls -------------------------------------------
+ *
+ * Every syscall that changes the SHAPE of the address space runs with the
+ * address-space semaphore held for writing, so it cannot race a page fault
+ * (which holds it for reading) on the same address space.  Threads share one
+ * page table, so without this an munmap and a fault on the same address ran
+ * concurrently by default.
+ *
+ * The bodies are written as *_locked() helpers with the ordinary many-return
+ * style, and the wrapper does the acquire/release exactly once -- adding an
+ * unlock to every return path is how one gets missed.
+ */
+#define RUN_WRITE_LOCKED(call)                       \
+	do {                                         \
+		task_t *__cur = sched_current();     \
+		task_t *__mm = task_mm_owner(__cur); \
+		int64_t __ret;                       \
+		if (!__mm)                           \
+			return -EFAULT;              \
+		mm_write_lock(&__mm->mmap_lock);     \
+		__ret = (call);                      \
+		mm_write_unlock(&__mm->mmap_lock);   \
+		return __ret;                        \
+	} while (0)
+
+
 #endif // _KERNEL_MEMORY_H_

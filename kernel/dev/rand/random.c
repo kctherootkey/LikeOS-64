@@ -11,6 +11,10 @@
 #include <kernel/io/console.h>
 #include <kernel/ke/sched.h> // spinlock_t
 #include <kernel/uapi/bug.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/mm/memory.h>
+#include <kernel/fs/icache.h>
+#include <kernel/ke/uaccess.h>
 
 // ============================================================================
 // ChaCha20 Core (RFC 7539)
@@ -488,3 +492,32 @@ apply_mask:
 		0xFF); /* generate_stack_canary: low byte must be zero (NULL-byte terminator protection) */
 	return canary;
 }
+
+int64_t sys_getrandom(uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	void *buf = (void *)a1;
+	size_t buflen = (size_t)a2;
+	/* flags: GRND_NONBLOCK=0x1, GRND_RANDOM=0x2, GRND_INSECURE=0x4 */
+	unsigned flags = (unsigned)a3;
+	if (buflen == 0)
+		return 0;
+	if (!validate_user_ptr((uint64_t)buf, buflen))
+		return -EFAULT;
+	/* GRND_RANDOM(0x2) = blocking pool; default = urandom (non-blocking) */
+	int blocking = (flags & 0x2) ? 1 : 0;
+	/* Use a kernel-side staging buffer to keep SMAP integrity */
+	uint8_t *kbuf = (uint8_t *)kalloc(buflen);
+	if (!kbuf)
+		return -ENOMEM;
+	int n = random_get_bytes(kbuf, buflen, blocking);
+	if (n < 0) {
+		kfree(kbuf);
+		return (blocking == 0) ? -EAGAIN : -EIO;
+	}
+	int cret = copy_to_user(buf, kbuf, (size_t)n);
+	kfree(kbuf);
+	if (cret < 0)
+		return cret;
+	return (int64_t)n;
+}
+

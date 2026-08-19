@@ -580,4 +580,9 @@ int signal_setup_frame_irq(struct task *task, int sig, siginfo_t *info,
 			   struct interrupt_frame *frame);
 int signal_restore_frame(struct task *task);
 
+
+/* Shared with the syscall layer split out of ke/syscall.c. */
+struct task;
+int64_t signal_target_check(struct task *target, int sig);
+
 #endif // _KERNEL_SIGNAL_H_

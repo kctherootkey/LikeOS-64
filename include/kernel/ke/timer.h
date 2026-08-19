@@ -57,4 +57,9 @@ static inline uint64_t timer_rdtsc(void)
 	return ((uint64_t)hi << 32) | lo;
 }
 
+
+/* Shared with the syscall layer split out of ke/syscall.c. */
+struct task;
+void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec);
+
 #endif // _KERNEL_TIMER_H_

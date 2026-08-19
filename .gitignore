@@ -158,3 +158,4 @@
 #     are run on the target, not built, so nothing else would re-include them.
 !/user/bin/tests/*.sh
 !/user/bin/tests/Makefile
+/tmp/

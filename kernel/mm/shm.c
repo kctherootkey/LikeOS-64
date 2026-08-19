@@ -20,6 +20,10 @@
 #include <kernel/ke/cred.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/icache.h>
+#include <kernel/ke/uaccess.h>
+#include <kernel/ke/syscalls.h>
+#include <kernel/fs/file.h>
 
 static shm_object_t g_shm[SHM_MAX_OBJECTS];
 static spinlock_t g_shm_lock;
@@ -441,3 +445,256 @@ shm_object_t *shm_sysv_get(int key, unsigned long size, int create, int excl,
 		*out_id = shm_id_of(o);
 	return o;
 }
+
+/* ================= System V shared memory ============================
+ *
+ * These sit on top of the same objects /dev/shm exposes, so a segment is a
+ * segment however it was created.  shmat() deliberately goes through the
+ * filesystem path rather than mapping the object directly: that reuses the
+ * region/vfs_file reference machinery, so detaching, exec and process exit all
+ * release the segment through paths that already work, instead of needing
+ * three new teardown hooks.
+ */
+/* SysV IPC permission check, the reference algorithm.
+ *
+ * `flag` carries the requested access in its low nine bits, as the shm* calls
+ * define it.  Those are collapsed to one rwx triple, and compared against the
+ * triple that applies to this caller -- owner, group, or other.  Root passes
+ * regardless, as CAP_IPC_OWNER does there.
+ *
+ * Without this, shmget() on an existing key handed out an id no matter who
+ * owned the segment or what its mode said.
+ */
+static int ipc_perm_ok(const shm_object_t *o, task_t *cur, unsigned int flag)
+{
+	unsigned int requested, granted;
+
+	if (!o || !cur)
+		return 0;
+	if (cred_is_root(&cur->cred))
+		return 1;
+
+	requested = ((flag >> 6) | (flag >> 3) | flag) & 0007;
+	granted = o->mode & 0777;
+
+	if (cur->cred.euid == o->uid)
+		granted >>= 6;
+	else if (cred_in_group(&cur->cred, o->gid))
+		granted >>= 3;
+
+	return (requested & ~granted & 0007) == 0;
+}
+
+
+/* May this caller administer the segment (IPC_RMID / IPC_SET)?
+ *
+ * Ownership, not mode: the reference requires the effective uid to match the
+ * segment's owner or creator, or the caller to be privileged.  Mode bits do
+ * NOT grant this -- a world-writable segment is still only its owner's to
+ * destroy. */
+static int ipc_owner_ok(const shm_object_t *o, task_t *cur)
+{
+	if (!o || !cur)
+		return 0;
+	return cred_is_root(&cur->cred) || cur->cred.euid == o->uid;
+}
+
+
+int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
+{
+	shm_object_t *o;
+	int id = -1;
+	int create = (shmflg & IPC_CREAT) != 0;
+	int excl = (shmflg & IPC_EXCL) != 0;
+
+	if (size > (unsigned long)SHM_MAX_PAGES * PAGE_SIZE)
+		return -EINVAL;
+
+	int existed = 0;
+	o = shm_sysv_get((int)key, size, create, excl,
+			 (unsigned)(shmflg & 0777), &id);
+	if (!o) {
+		if (excl && create)
+			return -EEXIST;
+		if (!create)
+			return -ENOENT;
+		return -ENOSPC;
+	}
+	/* The segment pre-existed if this caller did not just create it: a
+	 * fresh one is owned by the caller and always passes the check below,
+	 * so testing unconditionally is both correct and simpler. */
+	(void)existed;
+	if (!ipc_perm_ok(o, sched_current(), (unsigned)(shmflg & 0777))) {
+		shm_put(o);
+		return -EACCES;
+	}
+	/* An existing segment smaller than requested cannot satisfy the call. */
+	if (size && o->size < size) {
+		shm_put(o);
+		return -EINVAL;
+	}
+	shm_put(o); /* the id keeps it findable; no reference is held here */
+	return id;
+}
+
+
+int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg)
+{
+	shm_object_t *o = shm_by_id_get((int)shmid);
+	char name[SHM_NAME_MAX];
+	char path[SHM_NAME_MAX + 16];
+	unsigned long size;
+	int prot;
+	int64_t r;
+
+	if (!o)
+		return -EINVAL;
+	if (shm_name_of(o, name, sizeof(name)) != 0) {
+		/* Marked for removal: the name is gone, so it can no longer be
+		 * attached — existing attachments are unaffected. */
+		shm_put(o);
+		return -EINVAL;
+	}
+	size = o->size;
+	shm_put(o);
+	if (size == 0)
+		return -EINVAL;
+
+	{
+		static const char pfx[] = "/dev/shm/";
+		size_t i = 0, n = 0;
+		while (pfx[i])
+			path[n++] = pfx[i++];
+		i = 0;
+		while (name[i] && n < sizeof(path) - 1)
+			path[n++] = name[i++];
+		path[n] = '\0';
+	}
+
+	prot = PROT_READ | ((shmflg & SHM_RDONLY) ? 0 : PROT_WRITE);
+
+	/* Attaching needs read, and write unless SHM_RDONLY was asked for.
+	 * The vfs_open below enforces the same thing through the node's mode,
+	 * but only for the access it is opened with -- which is why the open
+	 * must match the request rather than always being O_RDWR. */
+	{
+		unsigned int want = (shmflg & SHM_RDONLY) ? 0444 : 0666;
+		shm_object_t *co = shm_by_id_get((int)shmid);
+		int ok = ipc_perm_ok(co, sched_current(), want);
+		if (co)
+			shm_put(co);
+		if (!ok)
+			return -EACCES;
+	}
+
+	/* Open the object and map it.  sys_mmap takes the descriptor route, so
+	 * install one, map through it, then drop it: the mapping keeps its own
+	 * reference on the file, exactly as an mmap after close would. */
+	{
+		vfs_file_t *f = NULL;
+		int fd;
+		/* Opened to match the requested access.  It was always O_RDWR,
+		 * so a legitimate read-only attach to a segment the caller may
+		 * only read was refused by the VFS permission check. */
+		int oflags = (shmflg & SHM_RDONLY) ? O_RDONLY : O_RDWR;
+		if (vfs_open(path, oflags, &f) != ST_OK || !f)
+			return -EINVAL;
+		fd = fd_install(sched_current(), f);
+		if (fd < 0) {
+			vfs_close(f);
+			return -EMFILE;
+		}
+		r = sys_mmap(shmaddr, size, (uint64_t)prot, MAP_SHARED,
+			     (uint64_t)fd, 0);
+		sys_close((uint64_t)fd);
+	}
+	return r;
+}
+
+
+int64_t sys_shmdt(uint64_t shmaddr)
+{
+	task_t *cur = sched_current();
+	mmap_region_t *region;
+
+	if (!cur || shmaddr == 0)
+		return -EINVAL;
+	cur = task_mm_owner(cur);
+	region = mm_find_mmap_region(cur, shmaddr);
+	/* Only the exact attach address detaches, as elsewhere. */
+	if (!region || region->start != shmaddr)
+		return -EINVAL;
+	return sys_munmap(shmaddr, region->length);
+}
+
+
+int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
+{
+	shm_object_t *o = shm_by_id_get((int)shmid);
+	char name[SHM_NAME_MAX];
+	int rc = 0;
+
+	if (!o)
+		return -EINVAL;
+
+	switch (cmd) {
+	case IPC_RMID:
+		/* Only the owner (or root) may destroy a segment.  There was no
+		 * check at all: segment ids are small integers and trivially
+		 * enumerated, so any user could tear down any other user's
+		 * shared memory -- including the segments the X server and its
+		 * clients share through MIT-SHM. */
+		if (!ipc_owner_ok(o, sched_current())) {
+			shm_put(o);
+			return -EPERM;
+		}
+		/* Mark for destruction: the name goes now, the memory when the
+		 * last attachment does.  Creating a segment and removing it
+		 * straight away is the normal idiom — it is what stops one
+		 * being left behind if the process dies. */
+		if (shm_name_of(o, name, sizeof(name)) == 0)
+			rc = shm_unlink_name(name);
+		else
+			rc = 0; /* already removed */
+		break;
+	case IPC_STAT: {
+		struct k_shmid_ds ds;
+		/* Reading the metadata needs read access to the segment. */
+		if (!ipc_perm_ok(o, sched_current(), 0444)) {
+			shm_put(o);
+			return -EACCES;
+		}
+		if (!buf || !validate_user_ptr(buf, sizeof(ds))) {
+			rc = -EFAULT;
+			break;
+		}
+		mm_memset(&ds, 0, sizeof(ds));
+		ds.shm_perm.uid = o->uid;
+		ds.shm_perm.gid = o->gid;
+		ds.shm_perm.cuid = o->uid;
+		ds.shm_perm.cgid = o->gid;
+		ds.shm_perm.mode = o->mode & 0777;
+		ds.shm_segsz = o->size;
+		ds.shm_nattch = (uint64_t)(o->refs > 0 ? o->refs - 1 : 0);
+		if (copy_to_user((void *)buf, &ds, sizeof(ds)) != 0)
+			rc = -EFAULT;
+		break;
+	}
+	case IPC_SET:
+		/* Nothing here is adjustable after creation, but the ownership
+		 * rule still applies: reporting success to a caller who may not
+		 * administer the segment would be misleading. */
+		if (!ipc_owner_ok(o, sched_current())) {
+			shm_put(o);
+			return -EPERM;
+		}
+		rc = 0;
+		break;
+	default:
+		rc = -EINVAL;
+		break;
+	}
+	shm_put(o);
+	return rc;
+}
+
