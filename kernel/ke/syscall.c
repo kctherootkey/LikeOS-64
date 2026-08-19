@@ -6,7 +6,6 @@
 #include <kernel/net/net.h>
 #include <kernel/ke/syscalls.h>
 
-
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				     uint64_t a3, uint64_t a4, uint64_t a5,
@@ -507,7 +506,6 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return -ENOSYS;
 	}
 }
-
 
 // Wrapper that handles signal delivery after syscall
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,

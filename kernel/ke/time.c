@@ -6,12 +6,10 @@
 #include <kernel/fs/icache.h>
 #include <kernel/ke/uaccess.h>
 
-
 typedef struct {
 	long tv_sec;
 	long tv_usec;
 } k_timeval_t;
-
 
 int64_t sys_time(uint64_t tloc)
 {
@@ -21,7 +19,6 @@ int64_t sys_time(uint64_t tloc)
 	}
 	return (int64_t)sec;
 }
-
 
 int64_t sys_gettimeofday(uint64_t tv, uint64_t tz)
 {
@@ -44,7 +41,6 @@ int64_t sys_gettimeofday(uint64_t tv, uint64_t tz)
 	return 0;
 }
 
-
 int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz)
 {
 	(void)tz;
@@ -60,7 +56,6 @@ int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz)
 	timer_set_time((uint64_t)kv.tv_sec);
 	return 0;
 }
-
 
 // Ticks -> seconds and microseconds, at whatever rate the timer is running.
 void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec)
@@ -82,7 +77,6 @@ extern int timer_gettime_internal(ktimer_t timerid,
 				  struct k_itimerspec *curr_value);
 extern int timer_getoverrun_internal(ktimer_t timerid);
 extern int timer_delete_internal(ktimer_t timerid);
-
 
 // SYS_ALARM - set alarm clock
 int64_t sys_alarm(uint64_t seconds)
@@ -112,10 +106,9 @@ int64_t sys_alarm(uint64_t seconds)
 	return (int64_t)old_remaining;
 }
 
-
 // SYS_SETITIMER - set interval timer
 int64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr,
-			     uint64_t old_value_ptr)
+		      uint64_t old_value_ptr)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -155,7 +148,6 @@ int64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr,
 	return 0;
 }
 
-
 // SYS_GETITIMER - get interval timer
 int64_t sys_getitimer(uint64_t which, uint64_t curr_value_ptr)
 {
@@ -186,10 +178,9 @@ int64_t sys_getitimer(uint64_t which, uint64_t curr_value_ptr)
 	return 0;
 }
 
-
 // SYS_TIMER_CREATE - create POSIX timer
 int64_t sys_timer_create(uint64_t clockid, uint64_t sevp_ptr,
-				uint64_t timerid_ptr)
+			 uint64_t timerid_ptr)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -221,10 +212,9 @@ int64_t sys_timer_create(uint64_t clockid, uint64_t sevp_ptr,
 	return 0;
 }
 
-
 // SYS_TIMER_SETTIME - set POSIX timer
 int64_t sys_timer_settime(uint64_t timerid, uint64_t flags,
-				 uint64_t new_value_ptr, uint64_t old_value_ptr)
+			  uint64_t new_value_ptr, uint64_t old_value_ptr)
 {
 	struct k_itimerspec new_value, old_value;
 
@@ -250,7 +240,6 @@ int64_t sys_timer_settime(uint64_t timerid, uint64_t flags,
 	return 0;
 }
 
-
 // SYS_TIMER_GETTIME - get POSIX timer
 int64_t sys_timer_gettime(uint64_t timerid, uint64_t curr_value_ptr)
 {
@@ -269,20 +258,17 @@ int64_t sys_timer_gettime(uint64_t timerid, uint64_t curr_value_ptr)
 	return 0;
 }
 
-
 // SYS_TIMER_GETOVERRUN - get timer overrun count
 int64_t sys_timer_getoverrun(uint64_t timerid)
 {
 	return timer_getoverrun_internal((ktimer_t)timerid);
 }
 
-
 // SYS_TIMER_DELETE - delete POSIX timer
 int64_t sys_timer_delete(uint64_t timerid)
 {
 	return timer_delete_internal((ktimer_t)timerid);
 }
-
 
 // SYS_NANOSLEEP - sleep with nanosecond precision
 // Uses timer-based wakeup: set wakeup_tick and block, timer IRQ wakes us
@@ -369,7 +355,6 @@ int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr)
 	return 0;
 }
 
-
 // SYS_CLOCK_GETTIME - get time from specified clock
 int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 {
@@ -427,7 +412,6 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 	return 0;
 }
 
-
 // SYS_CLOCK_GETRES - get clock resolution
 int64_t sys_clock_getres(uint64_t clk_id, uint64_t res_ptr)
 {
@@ -452,4 +436,3 @@ int64_t sys_clock_getres(uint64_t clk_id, uint64_t res_ptr)
 
 	return 0;
 }
-

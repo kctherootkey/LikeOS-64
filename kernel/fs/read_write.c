@@ -16,7 +16,6 @@
  * and only this releases it before its one-tick fallback expires. */
 extern void poll_notify_io_ready(void);
 
-
 // Pipe read/write helpers
 static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
 {
@@ -104,7 +103,6 @@ static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
 
 	return (int64_t)to_read;
 }
-
 
 static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 				    uint64_t count)
@@ -199,8 +197,6 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 	return (int64_t)to_write;
 }
 
-
-
 // SYS_READ - read from file descriptor
 int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
@@ -292,7 +288,6 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 
 	return vfs_read(file, (void *)buf, (long)count);
 }
-
 
 // SYS_WRITE - write to file descriptor
 
@@ -393,8 +388,6 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 	return wret;
 }
 
-
-
 int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 {
 	task_t *cur = sched_current();
@@ -431,7 +424,6 @@ int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 	return result;
 }
 
-
 // POSIX writev(2) / readv(2) - scatter/gather I/O implemented as a loop
 // over write(2) / read(2).  Per POSIX the implementation is allowed to
 // process the iovecs sequentially; the only invariant is partial-write
@@ -467,7 +459,6 @@ int64_t sys_writev(uint64_t fd, uint64_t iovp, uint64_t iovcnt)
 	return total;
 }
 
-
 int64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t iovcnt)
 {
 	if (iovcnt > 1024)
@@ -495,4 +486,3 @@ int64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t iovcnt)
 	}
 	return total;
 }
-

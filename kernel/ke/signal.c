@@ -1368,8 +1368,6 @@ void signal_check_posix_timers(uint64_t current_tick)
 	}
 }
 
-
-
 static void kill_task(task_t *t, int sig)
 {
 	if (!t) {
@@ -1379,7 +1377,6 @@ static void kill_task(task_t *t, int sig)
 	// and other signals with their default actions
 	sched_signal_task(t, sig);
 }
-
 
 int64_t sys_kill(uint64_t pid, uint64_t sig)
 {
@@ -1438,14 +1435,13 @@ int64_t sys_kill(uint64_t pid, uint64_t sig)
 	return 0;
 }
 
-
 // ============================================================================
 // Signal Syscalls
 // ============================================================================
 
 // SYS_RT_SIGACTION - set signal handler
 int64_t sys_rt_sigaction(uint64_t sig, uint64_t act_ptr,
-				uint64_t oldact_ptr, uint64_t sigsetsize)
+			 uint64_t oldact_ptr, uint64_t sigsetsize)
 {
 	if (sigsetsize != sizeof(kernel_sigset_t)) {
 		return -EINVAL;
@@ -1489,10 +1485,9 @@ int64_t sys_rt_sigaction(uint64_t sig, uint64_t act_ptr,
 	return 0;
 }
 
-
 // SYS_RT_SIGPROCMASK - change blocked signals
 int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr,
-				  uint64_t oldset_ptr, uint64_t sigsetsize)
+			   uint64_t oldset_ptr, uint64_t sigsetsize)
 {
 	if (sigsetsize != sizeof(kernel_sigset_t)) {
 		return -EINVAL;
@@ -1541,7 +1536,6 @@ int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr,
 	return 0;
 }
 
-
 // SYS_RT_SIGPENDING - get pending signals
 int64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize)
 {
@@ -1561,10 +1555,9 @@ int64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize)
 	return 0;
 }
 
-
 // SYS_RT_SIGTIMEDWAIT - wait for signal with timeout
 int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
-				   uint64_t timeout_ptr, uint64_t sigsetsize)
+			    uint64_t timeout_ptr, uint64_t sigsetsize)
 {
 	if (sigsetsize != sizeof(kernel_sigset_t)) {
 		return -EINVAL;
@@ -1630,7 +1623,6 @@ int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
 	}
 }
 
-
 /* Shared gate for the signal syscalls that reach a task straight from its id
  * (rt_sigqueueinfo, tkill, tgkill).  Without it they bypass both guards
  * sys_kill applies: kernel threads are not signallable at all, and an
@@ -1644,10 +1636,9 @@ int64_t signal_target_check(task_t *target, int sig)
 	return signal_permission(target, sig);
 }
 
-
 // SYS_RT_SIGQUEUEINFO - queue signal with info
 int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig,
-				   uint64_t info_ptr)
+			    uint64_t info_ptr)
 {
 	if (sig <= 0 || sig >= NSIG) {
 		return -EINVAL;
@@ -1672,7 +1663,6 @@ int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig,
 
 	return signal_send(target, (int)sig, &info);
 }
-
 
 // SYS_RT_SIGSUSPEND - suspend until signal
 int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize)
@@ -1718,7 +1708,6 @@ int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize)
 	return -EINTR; // sigsuspend always returns EINTR
 }
 
-
 // SYS_RT_SIGRETURN - return from signal handler
 int64_t sys_rt_sigreturn(void)
 {
@@ -1736,7 +1725,6 @@ int64_t sys_rt_sigreturn(void)
 	// context which includes the original RAX value
 	return 0;
 }
-
 
 // SYS_SIGALTSTACK - set/get alternate signal stack
 int64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr)
@@ -1774,7 +1762,6 @@ int64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr)
 	return 0;
 }
 
-
 // SYS_TKILL - send signal to specific thread
 int64_t sys_tkill(uint64_t tid, uint64_t sig)
 {
@@ -1807,7 +1794,6 @@ int64_t sys_tkill(uint64_t tid, uint64_t sig)
 
 	return signal_send(target, (int)sig, &info);
 }
-
 
 // SYS_TGKILL - send signal to thread in specific thread group
 // This is the secure way to send signals to threads - validates that
@@ -1854,7 +1840,6 @@ int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
 	return signal_send(target, (int)sig, &info);
 }
 
-
 // SYS_PAUSE - suspend until signal
 int64_t sys_pause(void)
 {
@@ -1875,7 +1860,6 @@ int64_t sys_pause(void)
 	return -EINTR; // pause always returns EINTR
 }
 
-
 // SYS_SIGNALFD / SYS_SIGNALFD4 - create signalfd (simplified stub)
 int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags)
 {
@@ -1885,4 +1869,3 @@ int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags)
 	// signalfd is complex to implement fully - return ENOSYS for now
 	return -ENOSYS;
 }
-

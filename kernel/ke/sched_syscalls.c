@@ -6,7 +6,6 @@
 #include <kernel/fs/icache.h>
 #include <kernel/ke/uaccess.h>
 
-
 // SYS_YIELD - yield CPU to other runnable tasks
 // Moves current task to back of run queue and immediately reschedules.
 // Returns 0 on success. In a preemptive kernel this is a hint to the
@@ -28,7 +27,6 @@ int64_t sys_yield(void)
 	return 0;
 }
 
-
 // Scheduling policies
 #define SCHED_NORMAL 0
 #define SCHED_FIFO 1
@@ -45,7 +43,7 @@ typedef struct {
 
 // SYS_SCHED_SETAFFINITY - bind thread to specific CPUs
 int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
-				     uint64_t mask_ptr)
+			      uint64_t mask_ptr)
 {
 	(void)cpusetsize;
 
@@ -128,10 +126,9 @@ int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 	return 0;
 }
 
-
 // SYS_SCHED_GETAFFINITY - get CPU affinity mask
 int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
-				     uint64_t mask_ptr)
+			      uint64_t mask_ptr)
 {
 	(void)cpusetsize;
 
@@ -167,7 +164,6 @@ int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
 	return sizeof(uint64_t);
 }
 
-
 // Scheduling parameters
 struct sched_param {
 	int sched_priority;
@@ -175,7 +171,7 @@ struct sched_param {
 
 // SYS_SCHED_SETSCHEDULER - set scheduling policy
 int64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy,
-				      uint64_t param_ptr)
+			       uint64_t param_ptr)
 {
 	(void)param_ptr;
 
@@ -208,7 +204,6 @@ int64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy,
 	return 0;
 }
 
-
 // SYS_SCHED_GETSCHEDULER - get scheduling policy
 int64_t sys_sched_getscheduler(uint64_t pid)
 {
@@ -225,7 +220,6 @@ int64_t sys_sched_getscheduler(uint64_t pid)
 
 	return SCHED_NORMAL; // We use round-robin by default
 }
-
 
 // SYS_SCHED_SETPARAM - set scheduling parameters
 int64_t sys_sched_setparam(uint64_t pid, uint64_t param_ptr)
@@ -252,7 +246,6 @@ int64_t sys_sched_setparam(uint64_t pid, uint64_t param_ptr)
 	// Accept but ignore (we use fixed round-robin)
 	return 0;
 }
-
 
 // SYS_SCHED_GETPARAM - get scheduling parameters
 int64_t sys_sched_getparam(uint64_t pid, uint64_t param_ptr)
@@ -281,7 +274,6 @@ int64_t sys_sched_getparam(uint64_t pid, uint64_t param_ptr)
 	return 0;
 }
 
-
 // SYS_SCHED_GET_PRIORITY_MAX - get max priority for policy
 int64_t sys_sched_get_priority_max(uint64_t policy)
 {
@@ -298,7 +290,6 @@ int64_t sys_sched_get_priority_max(uint64_t policy)
 	}
 }
 
-
 // SYS_SCHED_GET_PRIORITY_MIN - get min priority for policy
 int64_t sys_sched_get_priority_min(uint64_t policy)
 {
@@ -314,7 +305,6 @@ int64_t sys_sched_get_priority_min(uint64_t policy)
 		return -EINVAL;
 	}
 }
-
 
 // SYS_SCHED_RR_GET_INTERVAL - get round-robin time quantum
 int64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr)
@@ -343,4 +333,3 @@ int64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr)
 
 	return 0;
 }
-

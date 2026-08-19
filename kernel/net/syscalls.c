@@ -8,7 +8,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 
-
 // Helper: extract socket index from a process fd (via fd_table marker)
 /* Hand an accepted peer address back to userspace.
  *
@@ -48,7 +47,6 @@ static void sock_put_peer_addr(uint64_t uaddr, uint64_t ulenp,
 	copy_to_user((void *)ulenp, &kaddrlen, sizeof(socklen_t));
 }
 
-
 static int sock_idx_from_fd(uint64_t fd)
 {
 	task_t *cur = sched_current();
@@ -61,7 +59,6 @@ static int sock_idx_from_fd(uint64_t fd)
 		return -ENOTSOCK;
 	return SOCKET_FD_IDX(entry);
 }
-
 
 /* Resolve a descriptor to a UNIX socket, and hold the socket for the rest of
  * this syscall.
@@ -96,7 +93,6 @@ static unix_socket_t *unix_sock_from_fd(uint64_t fd)
 
 	return cur->syscall_unix_ref;
 }
-
 
 // ---------------------------------------------------------------------------
 // UNIX-domain sendmsg / recvmsg helpers.
@@ -249,7 +245,6 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 	}
 	return (int)sent_total;
 }
-
 
 __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 						     struct msghdr *kmsg)
@@ -1486,4 +1481,3 @@ int64_t sys_set_dns_server(uint64_t a1, uint64_t a2)
 	}
 	return updated > 0 ? 0 : -ENODEV;
 }
-

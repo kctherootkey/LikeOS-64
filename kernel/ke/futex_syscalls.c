@@ -7,7 +7,6 @@
 #include <kernel/fs/icache.h>
 #include <kernel/ke/uaccess.h>
 
-
 // Futex operations
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
@@ -26,7 +25,7 @@
 
 // SYS_FUTEX - fast userspace mutex operations (uses hash-bucket implementation)
 int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
-			 uint64_t timeout, uint64_t uaddr2, uint64_t val3)
+		  uint64_t timeout, uint64_t uaddr2, uint64_t val3)
 {
 	(void)val3; // Used for FUTEX_CMP_REQUEUE comparison value
 
@@ -148,7 +147,6 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 	}
 }
 
-
 // SYS_SET_ROBUST_LIST - set robust futex list head
 int64_t sys_set_robust_list(uint64_t head, uint64_t len)
 {
@@ -171,10 +169,9 @@ int64_t sys_set_robust_list(uint64_t head, uint64_t len)
 	return 0;
 }
 
-
 // SYS_GET_ROBUST_LIST - get robust futex list head
 int64_t sys_get_robust_list(uint64_t pid, uint64_t head_ptr,
-				   uint64_t len_ptr)
+			    uint64_t len_ptr)
 {
 	task_t *target;
 
@@ -210,4 +207,3 @@ int64_t sys_get_robust_list(uint64_t pid, uint64_t head_ptr,
 
 	return 0;
 }
-

@@ -16,7 +16,6 @@ bool validate_user_ptr(uint64_t ptr, size_t len)
 	return true;
 }
 
-
 // SMAP-aware copy from user space to kernel space
 // Returns 0 on success, -EFAULT on failure
 int copy_from_user(void *kernel_dst, const void *user_src, size_t len)
@@ -51,7 +50,6 @@ int copy_from_user(void *kernel_dst, const void *user_src, size_t len)
 	smap_enable();
 	return 0;
 }
-
 
 // SMAP-aware copy from kernel space to user space
 // Returns 0 on success, -EFAULT on failure
@@ -102,7 +100,6 @@ int copy_to_user(void *user_dst, const void *kernel_src, size_t len)
 	return 0;
 }
 
-
 // Safe string length (bounded) from user space (SMAP-aware)
 int user_strnlen(const char *user_str, size_t max_len, size_t *out_len)
 {
@@ -127,9 +124,8 @@ int user_strnlen(const char *user_str, size_t max_len, size_t *out_len)
 	return -EINVAL; // Too long
 }
 
-
 int copy_user_string(const char *user_str, size_t max_len,
-			    char **out_str, size_t *out_len)
+		     char **out_str, size_t *out_len)
 {
 	if (!user_str || !out_str) {
 		return -EFAULT;
@@ -159,7 +155,6 @@ int copy_user_string(const char *user_str, size_t max_len,
 	return 0;
 }
 
-
 // Helper: Copy user path string directly into fixed kernel buffer (no allocation)
 // Returns 0 on success, negative error on failure
 int copy_user_path(const char *user_path, char *kbuf, size_t kbuf_size)
@@ -180,7 +175,6 @@ int copy_user_path(const char *user_path, char *kbuf, size_t kbuf_size)
 	return 0;
 }
 
-
 void free_user_string_array(char **arr)
 {
 	if (!arr) {
@@ -192,10 +186,9 @@ void free_user_string_array(char **arr)
 	kfree(arr);
 }
 
-
 int copy_user_string_array(const char *const *user_arr, size_t max_count,
-				  size_t max_str_len, size_t max_total_bytes,
-				  char ***out_arr)
+			   size_t max_str_len, size_t max_total_bytes,
+			   char ***out_arr)
 {
 	if (!out_arr) {
 		return -EFAULT;
@@ -256,4 +249,3 @@ int copy_user_string_array(const char *const *user_arr, size_t max_count,
 	free_user_string_array(karr);
 	return -EINVAL; // Too many entries
 }
-

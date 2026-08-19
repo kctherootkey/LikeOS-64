@@ -6,7 +6,6 @@
 #include <kernel/ke/smp.h>
 #include <kernel/fs/icache.h>
 
-
 static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 {
 	task_t *cur = sched_current();
@@ -167,9 +166,7 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 	return 0;
 }
 
-
 int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 {
 	RUN_WRITE_LOCKED(sys_mprotect_locked(addr, len, prot));
 }
-

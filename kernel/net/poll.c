@@ -711,7 +711,6 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 	}
 }
 
-
 // Helper: extract epoll index from a process fd
 static int epoll_idx_from_fd(uint64_t fd)
 {
@@ -725,7 +724,6 @@ static int epoll_idx_from_fd(uint64_t fd)
 		return -EBADF;
 	return EPOLL_FD_IDX(entry);
 }
-
 
 // ---------------------------------------------------------------------------
 // Noinline helpers for syscalls with large stack-allocated buffers.
@@ -767,7 +765,6 @@ static int poll_sigmask_install(uint64_t umask_ptr, kernel_sigset_t *saved)
 	return 1;
 }
 
-
 /* Put the caller's mask back if nothing else already did (i.e. no handler was
  * set up, which would have handed the restore to sigreturn). */
 void poll_sigmask_restore_pending(task_t *cur)
@@ -779,10 +776,9 @@ void poll_sigmask_restore_pending(task_t *cur)
 	sig_strip_unblockable(&cur->signals.blocked);
 }
 
-
 __attribute__((noinline)) int64_t
 sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-		   uint64_t a5)
+	   uint64_t a5)
 {
 	fd_set kr, kw, ke;
 	fd_set *rp = NULL, *wp = NULL, *ep = NULL;
@@ -821,10 +817,9 @@ sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 	return ret;
 }
 
-
 __attribute__((noinline)) int64_t
 sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-		     uint64_t a5, uint64_t a6)
+	     uint64_t a5, uint64_t a6)
 {
 	fd_set kr, kw, ke;
 	fd_set *rp = NULL, *wp = NULL, *ep = NULL;
@@ -870,7 +865,6 @@ sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 	return ret;
 }
 
-
 __attribute__((noinline)) int64_t
 sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -897,7 +891,6 @@ sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
 	copy_to_user((void *)a1, kfds, sz);
 	return ret;
 }
-
 
 __attribute__((noinline)) int64_t
 sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
@@ -935,7 +928,6 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	copy_to_user((void *)a1, kfds, sz);
 	return ret;
 }
-
 
 __attribute__((noinline)) int64_t
 sys_epoll_wait(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
@@ -1024,4 +1016,3 @@ int64_t sys_epoll_ctl(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	return epoll_ctl_internal(ep_idx, (int)a2, (int)a3,
 				  a4 ? &kev : NULL);
 }
-

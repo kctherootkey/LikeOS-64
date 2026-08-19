@@ -8,7 +8,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 
-
 // DEPRECATED: These global externs are no longer used directly.
 // Syscall context is now stored per-CPU in percpu_t and copied to task->syscall_*.
 // Kept for backward compatibility but should not be referenced in new code.
@@ -149,7 +148,6 @@ int64_t sys_fork(void)
 	return child_pid;
 }
 
-
 // ============================================================================
 // SMP/THREADING SYSCALLS - FULL IMPLEMENTATION
 // ============================================================================
@@ -195,8 +193,8 @@ extern spinlock_t g_task_list_lock;
 // SYS_CLONE - create a new thread or process
 // Full implementation with all CLONE_* flags
 int64_t sys_clone(uint64_t flags, uint64_t child_stack,
-			 uint64_t parent_tidptr, uint64_t child_tidptr,
-			 uint64_t tls)
+		  uint64_t parent_tidptr, uint64_t child_tidptr,
+		  uint64_t tls)
 {
 	task_t *cur = sched_current();
 	if (!cur || cur->privilege != TASK_USER) {
@@ -758,7 +756,6 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	return child_pid;
 }
 
-
 // SYS_VFORK - create child that shares parent's memory until exec/exit
 int64_t sys_vfork(void)
 {
@@ -766,4 +763,3 @@ int64_t sys_vfork(void)
 	// True vfork semantics would suspend parent until child execs or exits
 	return sys_fork();
 }
-

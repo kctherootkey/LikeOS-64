@@ -8,7 +8,6 @@
 
 static int64_t sys_dup_from(uint64_t oldfd, int from);
 
-
 /* The descriptor table is SHARED between the threads of a process
  * (CLONE_FILES), so the lock below serialises slot bookkeeping across them.
  * A task that owns its table privately has no files_struct and needs none. */
@@ -18,13 +17,11 @@ void fds_lock(task_t *task, uint64_t *flags)
 		spin_lock_irqsave(&task->files->lock, flags);
 }
 
-
 void fds_unlock(task_t *task, uint64_t flags)
 {
 	if (task->files)
 		spin_unlock_irqrestore(&task->files->lock, flags);
 }
-
 
 /* Install `file` in the lowest free descriptor >= `from` and return it, or
  * -EMFILE (the caller still owns `file` then).  0/1/2 are eligible once the
@@ -63,12 +60,10 @@ int fd_install_from(task_t *task, vfs_file_t *file, int from)
 	return ret;
 }
 
-
 int fd_install(task_t *task, vfs_file_t *file)
 {
 	return fd_install_from(task, file, 0);
 }
-
 
 /* Take one more reference on whatever kind of thing `entry` is and return the
  * value to store in the new slot.  Console markers and epoll handles are not
@@ -103,7 +98,6 @@ vfs_file_t *fd_dup_entry(vfs_file_t *entry)
 	return vfs_dup(entry);
 }
 
-
 /* Drop the reference held by one descriptor slot.  Mirror of fd_dup_entry.
  *
  * Not static: a filesystem or socket object that has queued a descriptor of
@@ -136,7 +130,6 @@ void fd_release_entry(vfs_file_t *entry)
 	}
 	vfs_close(entry);
 }
-
 
 /* Read descriptor `fd` and take a reference on whatever it holds, with the
  * read and the reference-take in ONE locked region.
@@ -192,7 +185,6 @@ vfs_file_t *fd_dup_entry_at(task_t *cur, int fd)
 	return copy;
 }
 
-
 /* True for descriptors not backed by a real vfs_file_t: the stdio console dup
  * markers (1-3), pipe ends, epoll instances, and network / UNIX sockets.  These
  * carry no on-disk metadata, so fchmod/fchown/fsync are no-ops on them — and,
@@ -219,8 +211,6 @@ int fd_is_special(vfs_file_t *file)
 		return 1;
 	return 0;
 }
-
-
 
 int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
@@ -399,7 +389,6 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	return -EINVAL;
 }
 
-
 // SYS_DUP - duplicate file descriptor
 int64_t sys_dup(uint64_t oldfd)
 {
@@ -412,7 +401,6 @@ int64_t sys_dup(uint64_t oldfd)
 	 * to put x on a standard descriptor. */
 	return sys_dup_from(oldfd, 0);
 }
-
 
 /* dup(oldfd) onto the lowest free descriptor >= `from`.  Shared by SYS_DUP
  * and fcntl(F_DUPFD), which differ only in that floor. */
@@ -455,7 +443,6 @@ static int64_t sys_dup_from(uint64_t oldfd, int from)
 	}
 	return newfd;
 }
-
 
 // SYS_DUP2 - duplicate file descriptor to specific fd
 int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
@@ -521,7 +508,6 @@ int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	return newfd;
 }
 
-
 // SYS_DUP3 - duplicate file descriptor with flags
 int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
 {
@@ -536,4 +522,3 @@ int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
 	}
 	return r;
 }
-

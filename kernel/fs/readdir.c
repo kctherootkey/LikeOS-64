@@ -5,7 +5,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 
-
 int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count)
 {
 	task_t *cur = sched_current();
@@ -28,9 +27,7 @@ int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count)
 	return ret;
 }
 
-
 int64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count)
 {
 	return sys_getdents64(fd, dirp, count);
 }
-

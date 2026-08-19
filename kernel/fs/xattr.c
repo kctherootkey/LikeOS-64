@@ -7,7 +7,6 @@
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
 
-
 /* ===================================================================
  * Extended attributes (xattr).  The path ops take a trailing nofollow flag so
  * libc's l*-variants reuse the same syscall number.  Values/lists are bounced
@@ -41,7 +40,6 @@ static int xattr_has_prefix(const char *s, const char *pfx)
 	return 1;
 }
 
-
 /* Namespace policy for a non-root caller setting/removing xattr `name` on a file
  * owned by `owner_uid`.  The `system.` namespace (which holds the POSIX ACLs) is
  * owner-controlled, like chmod — write permission is not sufficient.  Returns:
@@ -57,12 +55,11 @@ static int xattr_ns_perm(task_t *cur, const char *name, uint32_t owner_uid)
 	return 1;
 }
 
-
 /* The syscall ABI here passes at most 5 args, so setxattr's nofollow is carried
  * in a private high bit of `flags` (libc's lsetxattr sets it). */
 #define XATTR_SYS_NOFOLLOW 0x40000000
 int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
-			    uint64_t size, uint64_t flags)
+		     uint64_t size, uint64_t flags)
 {
 	int nofollow = (flags & XATTR_SYS_NOFOLLOW) ? 1 : 0;
 	flags &= ~(uint64_t)XATTR_SYS_NOFOLLOW;
@@ -120,9 +117,8 @@ int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
 
-
 int64_t sys_getxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
-			    uint64_t size, uint64_t nofollow)
+		     uint64_t size, uint64_t nofollow)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -157,9 +153,8 @@ int64_t sys_getxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
 	return (r >= 0) ? r : vfs_status_to_errno(r);
 }
 
-
 int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size,
-			     uint64_t nofollow)
+		      uint64_t nofollow)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -190,9 +185,8 @@ int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size,
 	return (r >= 0) ? r : vfs_status_to_errno(r);
 }
 
-
 int64_t sys_removexattr(uint64_t u_path, uint64_t u_name,
-			       uint64_t nofollow)
+			uint64_t nofollow)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -225,9 +219,8 @@ int64_t sys_removexattr(uint64_t u_path, uint64_t u_name,
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
 
-
 int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
-			     uint64_t size, uint64_t flags)
+		      uint64_t size, uint64_t flags)
 {
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
@@ -272,9 +265,8 @@ int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
 
-
 int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
-			     uint64_t size)
+		      uint64_t size)
 {
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
@@ -302,7 +294,6 @@ int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 	return (r >= 0) ? r : vfs_status_to_errno(r);
 }
 
-
 int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 {
 	task_t *cur = sched_current();
@@ -324,7 +315,6 @@ int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 	kfree(kbuf);
 	return (r >= 0) ? r : vfs_status_to_errno(r);
 }
-
 
 int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 {
@@ -350,4 +340,3 @@ int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 	int r = vfs_fremovexattr(task_fds(cur)[fd], kname);
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
-

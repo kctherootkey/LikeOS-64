@@ -520,4 +520,3 @@ int64_t sys_getrandom(uint64_t a1, uint64_t a2, uint64_t a3)
 		return cret;
 	return (int64_t)n;
 }
-

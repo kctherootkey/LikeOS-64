@@ -593,7 +593,6 @@ void mm_free_guarded_kstack(void *stack_base, size_t usable_size);
 // Safe to call from any context after mm_init() has returned.
 void mm_mark_guard_page(uint64_t virt_addr);
 
-
 // SYS_BRK - set program break
 /* ---- address-space syscalls -------------------------------------------
  *
@@ -619,6 +618,5 @@ void mm_mark_guard_page(uint64_t virt_addr);
 		mm_write_unlock(&__mm->mmap_lock);   \
 		return __ret;                        \
 	} while (0)
-
 
 #endif // _KERNEL_MEMORY_H_

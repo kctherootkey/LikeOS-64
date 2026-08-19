@@ -5,7 +5,6 @@
 #include <kernel/fs/icache.h>
 #include <kernel/fs/file.h>
 
-
 int64_t sys_fsync(uint64_t fd)
 {
 	task_t *cur = sched_current();
@@ -23,11 +22,9 @@ int64_t sys_fsync(uint64_t fd)
 	return 0;
 }
 
-
 int64_t sys_sync(void)
 {
 	pagecache_sync();
 	vfs_sync(); /* flush fs metadata + clean the journal (no-op on FAT32) */
 	return 0;
 }
-

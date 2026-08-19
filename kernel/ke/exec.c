@@ -8,7 +8,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/namei.h>
 
-
 // SYS_EXECVE - execute a new program, replacing current process image
 // This is the POSIX-compliant version that replaces the current task
 /* Per-exec-level DAC screen: stat the target (also needed later for set-id
@@ -31,9 +30,8 @@ static int execve_check_exec(const char *kpath, struct kstat *xst,
 	return 0;
 }
 
-
 int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
-			  uint64_t envp_ptr)
+		   uint64_t envp_ptr)
 {
 	if (!validate_user_ptr(pathname, 1)) {
 		return -EFAULT;
@@ -436,4 +434,3 @@ out_err:
 	kfree(kpath);
 	return ret;
 }
-

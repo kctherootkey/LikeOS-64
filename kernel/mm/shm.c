@@ -485,7 +485,6 @@ static int ipc_perm_ok(const shm_object_t *o, task_t *cur, unsigned int flag)
 	return (requested & ~granted & 0007) == 0;
 }
 
-
 /* May this caller administer the segment (IPC_RMID / IPC_SET)?
  *
  * Ownership, not mode: the reference requires the effective uid to match the
@@ -498,7 +497,6 @@ static int ipc_owner_ok(const shm_object_t *o, task_t *cur)
 		return 0;
 	return cred_is_root(&cur->cred) || cur->cred.euid == o->uid;
 }
-
 
 int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 {
@@ -536,7 +534,6 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 	shm_put(o); /* the id keeps it findable; no reference is held here */
 	return id;
 }
-
 
 int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg)
 {
@@ -611,7 +608,6 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg)
 	return r;
 }
 
-
 int64_t sys_shmdt(uint64_t shmaddr)
 {
 	task_t *cur = sched_current();
@@ -626,7 +622,6 @@ int64_t sys_shmdt(uint64_t shmaddr)
 		return -EINVAL;
 	return sys_munmap(shmaddr, region->length);
 }
-
 
 int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
 {
@@ -697,4 +692,3 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
 	shm_put(o);
 	return rc;
 }
-

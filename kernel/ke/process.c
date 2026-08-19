@@ -8,7 +8,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/uapi/rusage.h>
 
-
 int64_t sys_setpgid(uint64_t pid, uint64_t pgid)
 {
 	task_t *cur = sched_current();
@@ -28,7 +27,6 @@ int64_t sys_setpgid(uint64_t pid, uint64_t pgid)
 	return 0;
 }
 
-
 int64_t sys_getpgrp(void)
 {
 	task_t *cur = sched_current();
@@ -36,7 +34,6 @@ int64_t sys_getpgrp(void)
 		return -EFAULT;
 	return cur->pgid;
 }
-
 
 int64_t sys_tcgetpgrp(uint64_t fd)
 {
@@ -64,7 +61,6 @@ int64_t sys_tcgetpgrp(uint64_t fd)
 	}
 	return tty->fg_pgid;
 }
-
 
 int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 {
@@ -94,7 +90,6 @@ int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 	return 0;
 }
 
-
 // POSIX setsid(2) - create a new session.
 // On success the calling process becomes session leader, gets a new
 // process group, and is detached from any controlling tty.  Returns
@@ -114,7 +109,6 @@ int64_t sys_setsid(void)
 	return cur->id;
 }
 
-
 // POSIX getsid(2) - return session ID of process pid (0 = self).
 int64_t sys_getsid(uint64_t pid)
 {
@@ -128,7 +122,6 @@ int64_t sys_getsid(uint64_t pid)
 		return -ESRCH;
 	return t->sid;
 }
-
 
 // POSIX getpgid(2) - return process-group ID of process pid (0 = self).
 int64_t sys_getpgid(uint64_t pid)
@@ -182,7 +175,6 @@ int64_t sys_getpgid(uint64_t pid)
  * against each other.
  */
 
-
 #define K_RUSAGE_SELF 0
 #define K_RUSAGE_CHILDREN (-1)
 
@@ -222,7 +214,6 @@ int64_t sys_getrusage(uint64_t who, uint64_t uptr)
 	return 0;
 }
 
-
 // SYS_GETPPID - get parent process ID
 int64_t sys_getppid(void)
 {
@@ -231,7 +222,6 @@ int64_t sys_getppid(void)
 		return 0;
 	return sched_get_ppid(cur);
 }
-
 
 // SYS_GETPID - get process ID (thread group ID)
 // With thread groups, getpid() returns the tgid (thread group leader's ID)
@@ -245,7 +235,6 @@ int64_t sys_getpid(void)
 	return cur->tgid;
 }
 
-
 // SYS_GETTID - get thread ID (unique per thread)
 int64_t sys_gettid(void)
 {
@@ -254,7 +243,6 @@ int64_t sys_gettid(void)
 		return -ESRCH;
 	return cur->id; // TID is always the unique task ID
 }
-
 
 // SYS_SET_TID_ADDRESS - set address for clear-on-exit notification
 int64_t sys_set_tid_address(uint64_t tidptr)
@@ -271,7 +259,6 @@ int64_t sys_set_tid_address(uint64_t tidptr)
 
 	return cur->id;
 }
-
 
 // arch_prctl codes
 #define ARCH_SET_GS 0x1001
@@ -340,4 +327,3 @@ int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
 		return -EINVAL;
 	}
 }
-

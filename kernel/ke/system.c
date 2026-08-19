@@ -12,7 +12,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/syscalls.h>
 
-
 // Minimal uname struct (kernel-side)
 typedef struct {
 	char sysname[65];
@@ -21,7 +20,6 @@ typedef struct {
 	char version[65];
 	char machine[65];
 } k_utsname_t;
-
 
 int64_t sys_gethostname(uint64_t name, uint64_t len)
 {
@@ -38,7 +36,6 @@ int64_t sys_gethostname(uint64_t name, uint64_t len)
 	}
 	return 0;
 }
-
 
 int64_t sys_uname(uint64_t buf)
 {
@@ -76,7 +73,6 @@ int64_t sys_uname(uint64_t buf)
 	return 0;
 }
 
-
 // reboot() magic numbers and commands
 #define LINUX_REBOOT_MAGIC1 0xfee1dead
 #define LINUX_REBOOT_MAGIC2 672274793 // 0x28121969
@@ -94,7 +90,7 @@ int64_t sys_uname(uint64_t buf)
 static int g_cad_enabled = 0; // Ctrl-Alt-Del behaviour
 
 int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
-			  uint64_t arg)
+		   uint64_t arg)
 {
 	// Validate magic numbers
 	if ((uint32_t)magic1 != LINUX_REBOOT_MAGIC1)
@@ -170,9 +166,8 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 	}
 }
 
-
 int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
-			       uint64_t buf_ptr, uint64_t max_count)
+			uint64_t buf_ptr, uint64_t max_count)
 {
 	procmapinfo_t kinfo;
 	procmap_t *kbuf = NULL;
@@ -260,7 +255,6 @@ int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 		kfree(kbuf);
 	return ret;
 }
-
 
 int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 {
@@ -452,7 +446,6 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 	return count;
 }
 
-
 // ============================================================================
 // SYS_SYSINFO - Return system information (memory, uptime, load averages)
 // ============================================================================
@@ -496,7 +489,6 @@ int64_t sys_sysinfo(uint64_t info_ptr)
 		return -EFAULT;
 	return 0;
 }
-
 
 // ============================================================================
 // SYS_KLOGCTL - Kernel ring buffer operations (for dmesg)
@@ -558,7 +550,6 @@ int64_t sys_klogctl(uint64_t type, uint64_t bufp, uint64_t len)
 		return -EINVAL;
 	}
 }
-
 
 /* SYS_DEBUG_DUMP: root-only.  Emit the same diagnostic tables as the Ctrl+N /
  * Ctrl+D debug hotkeys (TCP connection table, AF_UNIX socket table, PTY table,
@@ -630,4 +621,3 @@ int64_t sys_sethostname(uint64_t a1, uint64_t a2)
 	net_set_hostname(khost);
 	return 0;
 }
-

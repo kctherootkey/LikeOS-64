@@ -160,7 +160,6 @@ void pipe_close_end(pipe_end_t *end)
 	kfree(end);
 }
 
-
 // SYS_PIPE - create a pipe
 int64_t sys_pipe(uint64_t pipefd_ptr)
 {
@@ -218,4 +217,3 @@ int64_t sys_pipe(uint64_t pipefd_ptr)
 
 	return 0;
 }
-

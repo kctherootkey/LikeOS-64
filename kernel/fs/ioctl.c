@@ -8,7 +8,6 @@
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
 
-
 int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 {
 	task_t *cur = sched_current();
@@ -128,4 +127,3 @@ int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 
 	return devfs_ioctl(file, (unsigned long)req, (void *)argp, cur);
 }
-

@@ -5,7 +5,6 @@
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/icache.h>
 
-
 // SYS_MPROTECT - change memory protection
 /*
  * madvise(2).  MADV_DONTNEED releases the pages of a range and leaves the
@@ -47,9 +46,7 @@ static int64_t sys_madvise_locked(uint64_t addr, uint64_t length,
 	}
 }
 
-
 int64_t sys_madvise(uint64_t addr, uint64_t length, uint64_t advice)
 {
 	RUN_WRITE_LOCKED(sys_madvise_locked(addr, length, advice));
 }
-

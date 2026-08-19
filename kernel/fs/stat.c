@@ -11,8 +11,6 @@
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
 
-
-
 /* The text a /dev/fd/N symlink resolves to.  A descriptor carries no pathname
  * here, so anything that is not a named file gets the conventional
  * "kind:[id]" form and a regular file is identified by inode.  Returns the
@@ -71,7 +69,6 @@ static int fd_link_target(task_t *cur, int fd, char *out, size_t cap)
 	return n;
 }
 
-
 static int64_t sys_stat_common(const char *path, uint64_t stat_buf,
 			       int validate_path)
 {
@@ -110,7 +107,6 @@ static int64_t sys_stat_common(const char *path, uint64_t stat_buf,
 	return 0;
 }
 
-
 int64_t sys_stat(uint64_t pathname, uint64_t stat_buf)
 {
 	task_t *cur = sched_current();
@@ -134,7 +130,6 @@ int64_t sys_stat(uint64_t pathname, uint64_t stat_buf)
 		return ret;
 	return sys_stat_common(full, stat_buf, 0);
 }
-
 
 int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 {
@@ -200,7 +195,6 @@ int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 		return -EFAULT;
 	return 0;
 }
-
 
 int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 {
@@ -306,9 +300,8 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 	return copy_to_user((void *)stat_buf, &st, sizeof(st));
 }
 
-
 int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
-			   uint64_t flags)
+		    uint64_t flags)
 {
 	(void)flags;
 	task_t *cur = sched_current();
@@ -398,7 +391,7 @@ int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 
 // utimensat: set a path's modification time via the owning filesystem.
 int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
-			     uint64_t flags)
+		      uint64_t flags)
 {
 	(void)flags;
 
@@ -481,7 +474,6 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 	return 0;
 }
 
-
 // Userspace struct statfs layout (must match user/lib/libc/include/sys/vfs.h)
 typedef struct {
 	unsigned long f_type;
@@ -543,7 +535,6 @@ int64_t sys_statfs(uint64_t u_path, uint64_t u_buf)
 	return copy_to_user((void *)u_buf, &uinfo, sizeof(uinfo));
 }
 
-
 // fstatfs: get filesystem statistics for an open file descriptor
 int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
 {
@@ -585,4 +576,3 @@ int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
 
 	return copy_to_user((void *)u_buf, &uinfo, sizeof(uinfo));
 }
-

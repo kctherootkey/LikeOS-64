@@ -1737,7 +1737,6 @@ int arp_recv_reply(uint32_t target_ip, uint8_t mac_out[6],
 void net_set_hostname(const char *name);
 const char *net_get_hostname(void);
 
-
 /* Shared with the syscall layer split out of ke/syscall.c. */
 struct task;
 void poll_sigmask_restore_pending(struct task *cur);

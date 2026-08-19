@@ -30,6 +30,4 @@ struct k_rusage_compat {
 _Static_assert(sizeof(struct k_rusage_compat) == 144,
 	       "struct rusage size must match user/lib/libc/include/sys/wait.h");
 
-
-
 #endif /* _KERNEL_UAPI_RUSAGE_H */

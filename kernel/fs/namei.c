@@ -7,7 +7,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/namei.h>
 
-
 /*
  * Resolve a path against THIS task's working directory (and chroot), in place.
  *
@@ -42,7 +41,6 @@ int canon_task_path(char *path, size_t size)
 		return -ENAMETOOLONG;
 	return 0;
 }
-
 
 // Convert VFS status codes to negative errno values
 int vfs_status_to_errno(int st)
@@ -83,7 +81,6 @@ int vfs_status_to_errno(int st)
 	}
 }
 
-
 /* ---- Permission checks: thin adapters over the canonical VFS policy --------
  * The discretionary-access policy lives in the VFS now (vfs_permission and
  * friends — the one place every filesystem shares), so these are just adapters
@@ -96,23 +93,20 @@ static int perm_st_errno(int st)
 	return (st == ST_OK) ? 0 : vfs_status_to_errno(st);
 }
 
-
 /* Access check for a file whose stat is `st`, against the ACL then mode bits.
  * use_real selects the real vs effective/fs ids. */
 int perm_access(task_t *cur, const char *path, const struct kstat *st,
-		       int want, int use_real)
+		int want, int use_real)
 {
 	(void)cur; /* the VFS reads the current task's credentials itself */
 	return perm_st_errno(vfs_check_access(path, st, want, use_real));
 }
-
 
 /* Search (x) permission on every ancestor directory of `path` (effective ids). */
 int perm_traverse(const char *rawpath)
 {
 	return perm_st_errno(vfs_permission_traverse(rawpath));
 }
-
 
 /* Like perm_traverse but with an explicit real(1)/effective(0) id selection,
  * for access(2)/faccessat which screen the prefix with the real ids. */
@@ -121,13 +115,11 @@ int perm_traverse_cred(const char *rawpath, int use_real)
 	return perm_st_errno(vfs_access_traverse(rawpath, use_real));
 }
 
-
 /* Write+search on the PARENT directory of `path` (create/remove/rename). */
 static int perm_check_parent(const char *rawpath, int want)
 {
 	return perm_st_errno(vfs_permission_parent(rawpath, want));
 }
-
 
 /* Remove/rename gate: parent write+search plus the directory's sticky-bit rule.
  * The sticky-bit ownership check now lives in the VFS (vfs_permission_remove). */
@@ -135,7 +127,6 @@ static int perm_check_remove(const char *rawpath)
 {
 	return perm_st_errno(vfs_permission_remove(rawpath));
 }
-
 
 /* The set-user/-group-ID bits a successful modification (write/chown) by a
  * non-privileged caller must clear, to stop a set-id file outliving a change to
@@ -151,7 +142,6 @@ unsigned setid_strip_bits(uint32_t mode)
 		clr |= S_ISGID;
 	return clr;
 }
-
 
 /* Permission screen for /dev opens.  Devfs opens are dispatched directly to
  * devfs_open_for_task (they need the task context for /dev/tty), bypassing
@@ -180,7 +170,6 @@ int devfs_open_perm(task_t *cur, const char *path, uint64_t flags)
 	return perm_access(cur, path, &est, want, 0);
 }
 
-
 /* Drop the set-id bits from an open file after a content modification.  Caller
  * gates on non-root + success.  Runs at most once per INODE: the first call
  * evaluates the mode (one inode read) and clears any set-id bits, then marks
@@ -201,8 +190,6 @@ void strip_setid_file(vfs_file_t *file)
 	vfs_mark_setid_clean(file); /* mark AFTER fchmod's invalidation */
 }
 
-
-
 // SYS_OPEN - open a file
 /* The mode a create-style syscall should hand the filesystem: the requested
  * permission bits minus the caller's umask, which is what POSIX specifies.
@@ -212,7 +199,6 @@ unsigned int creat_mode(task_t *cur, uint64_t mode)
 {
 	return (unsigned int)mode & 0777 & ~task_umask(cur) & 0777;
 }
-
 
 int64_t sys_unlink(uint64_t pathname)
 {
@@ -239,7 +225,6 @@ int64_t sys_unlink(uint64_t pathname)
 		return -ENOENT;
 	return -EINVAL;
 }
-
 
 int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 {
@@ -279,7 +264,6 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 		return -ENOENT;
 	return -EINVAL;
 }
-
 
 int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 {
@@ -349,7 +333,6 @@ int64_t sys_rmdir(uint64_t pathname)
 	return -EINVAL;
 }
 
-
 /* unlinkat(dirfd, path, flags) -- remove a name relative to a directory fd.
  *
  * One syscall covering both unlink() and rmdir(), which is how POSIX defines
@@ -396,7 +379,6 @@ int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags)
 		return -EIO;
 	return -EINVAL;
 }
-
 
 int64_t sys_link(uint64_t oldpath, uint64_t newpath)
 {
@@ -452,9 +434,8 @@ int64_t sys_symlink(uint64_t target, uint64_t linkpath)
 	return vfs_status_to_errno(r);
 }
 
-
 int normalize_path(const char *base, const char *path, char *out,
-			  size_t out_size)
+		   size_t out_size)
 {
 	if (!path || !out || out_size < 2)
 		return -EINVAL;
@@ -556,7 +537,6 @@ int normalize_path(const char *base, const char *path, char *out,
 	return 0;
 }
 
-
 /* Prepend the task's chroot root to an already-canonical absolute path.
  * `abs` starts with '/', has no ".." (normalize_path guarantees both), so the
  * result stays inside the jail.  A no-op when the task is not chrooted. */
@@ -588,9 +568,8 @@ static int apply_chroot(task_t *cur, char *abs, size_t out_size)
 	return 0;
 }
 
-
 int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
-			 size_t out_size)
+		  size_t out_size)
 {
 	const char *base;
 
@@ -641,4 +620,3 @@ int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 		return r;
 	return apply_chroot(cur, out, out_size);
 }
-

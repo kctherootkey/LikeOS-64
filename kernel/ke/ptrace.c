@@ -7,7 +7,6 @@
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
 
-
 /* The rule that used to live here — may the caller read another process's
  * private state — is now task_may_access(target, ACCESS_READ) in cred.c, so
  * that ptrace and the /proc-equivalent syscalls below cannot drift apart, and
@@ -140,7 +139,6 @@ static uint64_t ptrace_sanitize_dr7(uint64_t dr7)
 	return out;
 }
 
-
 /* Resolve a tracee for a request from `cur', enforcing the whole access
  * policy, and return it with g_task_list_lock HELD so the caller can act on it
  * without the answer going stale.  *flags receives the saved interrupt state.
@@ -191,7 +189,6 @@ static task_t *ptrace_lock_tracee(task_t *cur, uint64_t pid, uint64_t *flags,
 
 	return t;
 }
-
 
 /* The register set handed to and taken from userspace.  Mirrors
  * `struct ptrace_regs' in user/lib/libc/include/sys/ptrace.h -- keep in step. */
@@ -330,7 +327,6 @@ static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
 	out->gs = t->useg_gs;
 }
 
-
 /* Write a tracee's user registers back.
  *
  * RFLAGS is filtered rather than taken as given: it is the one field here that
@@ -446,7 +442,6 @@ static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
 	return 0;
 }
 
-
 /* Set or clear the trap flag in whichever frame the tracee will resume from.
  *
  * With TF set the processor raises #DB after the next instruction, which is
@@ -483,7 +478,6 @@ static int64_t ptrace_set_tf(task_t *t, bool on)
 		t->syscall_rflags &= ~0x100ULL;
 	return 0;
 }
-
 
 /* Move bytes to or from another process's memory.
  *
@@ -635,7 +629,6 @@ static int64_t ptrace_xfer_mem(task_t *mm, uint64_t addr, void *kbuf,
 	return 0;
 }
 
-
 /* Resolve a stopped tracee's address space for a memory transfer.
  *
  * Returns the mm owner with NO lock held, having verified under
@@ -678,7 +671,6 @@ static task_t *ptrace_mem_target(task_t *cur, uint64_t pid, int64_t *err)
 	return mm;
 }
 
-
 /* Clear the trace-stop state of a tracee that is about to be resumed.  The
  * caller does the waking; this only says the stop is over.  Runs with
  * g_task_list_lock held. */
@@ -700,9 +692,8 @@ static int64_t ptrace_resume(task_t *t)
 	return 0;
 }
 
-
 int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
-			  uint64_t data)
+		   uint64_t data)
 {
 	task_t *cur = sched_current();
 	uint64_t flags;
@@ -1508,4 +1499,3 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		return -EINVAL;
 	}
 }
-

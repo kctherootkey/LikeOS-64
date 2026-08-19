@@ -8,7 +8,6 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/uapi/rusage.h>
 
-
 // SYS_EXIT - exit task
 __attribute__((noreturn)) void sys_exit(uint64_t status)
 {
@@ -68,11 +67,10 @@ __attribute__((noreturn)) void sys_exit(uint64_t status)
 	sched_exit_park();
 }
 
-
 // SYS_WAIT4/SYS_WAITPID - wait for child process
 // In a preemptive kernel, this BLOCKS until a child exits (unless WNOHANG)
 int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
-			   uint64_t rusage_ptr)
+		    uint64_t rusage_ptr)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -362,7 +360,6 @@ int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 	}
 }
 
-
 // SYS_EXIT_GROUP - terminate all threads in the process
 void sys_exit_group(uint64_t status)
 {
@@ -486,4 +483,3 @@ void sys_exit_group(uint64_t status)
 	 * and with IRQs off would wedge TLB shootdowns (see sys_exit). */
 	sched_exit_park();
 }
-

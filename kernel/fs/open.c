@@ -11,7 +11,6 @@
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
 
-
 int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 {
 	might_sleep();
@@ -95,10 +94,9 @@ int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 	return fd;
 }
 
-
 // SYS_OPENAT - open a file relative to dirfd
 int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
-			  uint64_t mode)
+		   uint64_t mode)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -174,7 +172,6 @@ int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		strip_setid_file(file);
 	return fd;
 }
-
 
 // SYS_CLOSE - close a file descriptor
 int64_t sys_close(uint64_t fd)
@@ -258,7 +255,6 @@ int64_t sys_close(uint64_t fd)
 	return 0;
 }
 
-
 int64_t sys_access(uint64_t pathname, uint64_t mode)
 {
 	task_t *cur = sched_current();
@@ -304,9 +300,8 @@ int64_t sys_access(uint64_t pathname, uint64_t mode)
 	return perm_access(cur, path, &st, want, 1);
 }
 
-
 int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
-			     uint64_t flags)
+		      uint64_t flags)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -364,7 +359,6 @@ int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 	return perm_access(cur, full, &st, want, (flags & AT_EACCESS) ? 0 : 1);
 }
 
-
 int64_t sys_chdir(uint64_t pathname)
 {
 	task_t *cur = sched_current();
@@ -413,7 +407,6 @@ int64_t sys_chdir(uint64_t pathname)
 	return 0;
 }
 
-
 /* SYS_CHROOT — confine the calling task (and its future children) to a
  * subtree.  Privileged operation.  The target is resolved through the normal
  * path machinery, so a chroot INSIDE an existing jail nests correctly, and the
@@ -421,7 +414,6 @@ int64_t sys_chdir(uint64_t pathname)
  * Enforcement happens in build_at_path/apply_chroot for every later textual
  * path; the caller is expected to chdir("/") afterwards, exactly as on other
  * Unix systems. */
-
 
 int64_t sys_chroot(uint64_t pathname)
 {
@@ -472,7 +464,6 @@ int64_t sys_chroot(uint64_t pathname)
 	return 0;
 }
 
-
 int64_t sys_getcwd(uint64_t buf, uint64_t size)
 {
 	task_t *cur = sched_current();
@@ -498,7 +489,6 @@ int64_t sys_getcwd(uint64_t buf, uint64_t size)
 	return (int64_t)buf;
 }
 
-
 int64_t sys_umask(uint64_t mask)
 {
 	task_t *cur = sched_current();
@@ -508,7 +498,6 @@ int64_t sys_umask(uint64_t mask)
 	 * of this process sees the change. */
 	return (int64_t)task_set_umask(cur, (uint32_t)mask);
 }
-
 
 int64_t sys_ftruncate(uint64_t fd, uint64_t length)
 {
@@ -671,4 +660,3 @@ int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)
 	}
 	return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
 }
-

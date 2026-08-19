@@ -463,7 +463,6 @@ int task_may_access(const task_t *target, int mode)
 	return 0;
 }
 
-
 /* Real credential syscalls.  Operate on the current task's embedded
  * cred; the set*-id permission rules live in cred.c.  Enforcement of file
  * permissions against these IDs is done by the perm_check and perm_traverse helpers above. */
@@ -491,7 +490,6 @@ int64_t sys_getegid(void)
 	return c ? (int64_t)c->cred.egid : 0;
 }
 
-
 int64_t sys_setuid(uint64_t uid)
 {
 	task_t *c = sched_current();
@@ -516,7 +514,6 @@ int64_t sys_setegid(uint64_t gid)
 	return c ? cred_setegid(&c->cred, (uint32_t)gid) : -EPERM;
 }
 
-
 int64_t sys_getgroups(uint64_t size, uint64_t list)
 {
 	task_t *c = sched_current();
@@ -536,7 +533,6 @@ int64_t sys_getgroups(uint64_t size, uint64_t list)
 		return -EFAULT;
 	return (int64_t)n;
 }
-
 
 int64_t sys_setgroups(uint64_t size, uint64_t list)
 {
@@ -562,7 +558,6 @@ int64_t sys_setgroups(uint64_t size, uint64_t list)
 	c->cred.ngroups = (uint32_t)size;
 	return 0;
 }
-
 
 int64_t sys_setresuid(uint64_t ruid, uint64_t euid, uint64_t suid)
 {
@@ -617,4 +612,3 @@ int64_t sys_getresgid(uint64_t rgid, uint64_t egid, uint64_t sgid)
 	}
 	return 0;
 }
-

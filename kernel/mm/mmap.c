@@ -10,11 +10,9 @@
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
 
-
 /* The mmap region table lives in the mm layer: mm_find_mmap_region(),
  * mm_alloc_mmap_region() and mm_unmap_range_and_regions() (kernel/mm/memory.c,
  * declared in kernel/mm/memory.h). */
-
 
 static int64_t sys_brk_locked(uint64_t new_brk)
 {
@@ -48,12 +46,10 @@ static int64_t sys_brk_locked(uint64_t new_brk)
 	return (int64_t)new_brk;
 }
 
-
 int64_t sys_brk(uint64_t new_brk)
 {
 	RUN_WRITE_LOCKED(sys_brk_locked(new_brk));
 }
-
 
 // SYS_MMAP - map memory
 static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
@@ -407,14 +403,12 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	return (int64_t)vaddr;
 }
 
-
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
-			uint64_t flags, uint64_t fd, uint64_t offset)
+		 uint64_t flags, uint64_t fd, uint64_t offset)
 {
 	RUN_WRITE_LOCKED(
 		sys_mmap_locked(addr, length, prot, flags, fd, offset));
 }
-
 
 // SYS_MUNMAP - unmap memory
 static int64_t sys_munmap_locked(uint64_t addr, uint64_t length)
@@ -438,9 +432,7 @@ static int64_t sys_munmap_locked(uint64_t addr, uint64_t length)
 	return mm_unmap_range_and_regions(cur, addr, length) ? 0 : -EINVAL;
 }
 
-
 int64_t sys_munmap(uint64_t addr, uint64_t length)
 {
 	RUN_WRITE_LOCKED(sys_munmap_locked(addr, length));
 }
-
