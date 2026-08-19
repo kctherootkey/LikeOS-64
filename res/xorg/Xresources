@@ -63,11 +63,10 @@ XTerm*saveLines:		2048
 XTerm*scrollTtyOutput:		false
 XTerm*scrollKey:		true
 
-! The clock's colours are NOT set here.  They were, and it stayed pale: xclock
-! names its resources under the instance "clock", and such a tight binding
-! outranks anything "XClock*..." can say from a resource file.  They are passed
-! as command-line options in xinitrc instead, which outrank every resource file.
-! Setting them here as well would only be a second place to have to remember.
+! The bar's clock and load monitor take no resources at all.  They are this
+! system's own GTK programs (datetime and load, in user/bin/shell), not X
+! clients, so they never consult this file: their colours are compiled in, set
+! to the same grey as the taskbar they sit beside.
 
 ! Motif posts its menus with the "arrow" cursor, which in the X cursor font is
 ! the arrow that leans up-RIGHT -- so the pointer flips direction the moment a
@@ -78,9 +77,8 @@ XTerm*scrollKey:		true
 
 ! The hand pointer comes from xcalc: its upstream app-defaults file sets
 !   XCalc*Cursor: hand2
-! which is the only hand cursor anywhere in the X tree here.  xclock sets no
-! cursor at all (its app-defaults contains just "XClock.input: false"), so its
-! window inherits the frame's left_ptr.
+! which is the only hand cursor anywhere in the X tree here.  Nothing else in
+! the tree sets a cursor, so every other window inherits the frame's left_ptr.
 !
 ! Overridden rather than edited: app-defaults files are installed exactly as
 ! their packages ship them, and this file outranks them.  Both classes are

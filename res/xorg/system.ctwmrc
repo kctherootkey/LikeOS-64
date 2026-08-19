@@ -14,7 +14,12 @@ ResizeFont	"-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
 MenuFont	"-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
 IconFont	"-adobe-helvetica-bold-r-normal--*-100-*-*-*-*-*-*"
 IconManagerFont	"-adobe-helvetica-bold-r-normal--*-100-*-*-*"
-ShowWorkSpaceManager			# start with workspace manager up
+# ShowWorkSpaceManager is deliberately absent.  The workspace switcher is the
+# four numbered buttons in taskbar(1), which drives ctwm through
+# _NET_CURRENT_DESKTOP; ctwm still owns the workspaces themselves (see the
+# WorkSpaces block below, which is what makes there be four of them and what
+# ctwm advertises as _NET_NUMBER_OF_DESKTOPS).  Without this keyword the
+# manager window is created but never mapped.
 UseThreeDMenus
 UseThreeDTitles
 UseThreeDIconManagers
@@ -77,9 +82,12 @@ RightTitleButton ":xpm:zoom"    = f.fullzoom
 RightTitleButton ":xpm:cross"   = f.delete
 
 #
-# Four workspaces.  With the four columns set below that is a single row, which
-# is what the bar's 52px height has room for -- eight would have wrapped to a
-# second row of 26px buttons.
+# Four workspaces.  taskbar(1) draws one numbered button per workspace in a
+# single row, so the count is what fits the bar rather than what fits a grid:
+# four 22-pixel buttons is a compact tray, and the panel would simply grow that
+# group if there were more.  ctwm still owns the workspaces themselves and
+# publishes the count as _NET_NUMBER_OF_DESKTOPS, which is where the panel
+# reads it -- change the number here and the panel follows.
 #
 # Fields per workspace, as ctwm's workspace_config.c documents them:
 #     "name" { button-bg  button-fg  map-bg  map-fg  [root-image] }
@@ -140,21 +148,18 @@ Cursors
 }
 
 ###########################################################
-# Top desktop bar
+# Desktop bar (bottom of the screen)
 ###########################################################
 
 #
-# Workspace manager (right side)
+# No workspace manager geometry.
 #
-# ONE number, not two: the grammar is "WorkSpaceManagerGeometry <geom>
-# <columns>" and there is no row argument -- rows come out of the workspace
-# count divided by the columns.  Four workspaces over four columns is therefore
-# a single row, each button 250/4 = 62px wide and the full 52px height.
-#
-# Anchored to the RIGHT edge with -0, so it stays in the corner whatever
-# resolution the framebuffer comes up at (this driver picks anything from
-# 1024x768 to 1920x1200).
-WorkSpaceManagerGeometry        "250x52-0+0" 4
+# ctwm's workspace manager is never mapped (ShowWorkSpaceManager is absent at
+# the top of this file), so a geometry for it would describe a window nobody
+# sees.  The switcher is the four numbered buttons at the right of taskbar(1),
+# which sends _NET_CURRENT_DESKTOP; the WorkSpaces block above still defines
+# the workspaces themselves and is what ctwm reports as
+# _NET_NUMBER_OF_DESKTOPS, which is where the taskbar learns there are four.
 
 # Leave the root window alone.  Without this ctwm repaints the desktop from the
 # current workspace's field 3 every time a workspace is mapped, which would tie
@@ -162,75 +167,52 @@ WorkSpaceManagerGeometry        "250x52-0+0" 4
 DontPaintRootWindow
 
 #
-# Icon manager (taskbar)
+# No icon manager.
 #
-# The number is COLUMNS, and it is what makes the bar horizontal: each entry is
-# width/columns wide and a new row starts only once a row is full
-# (PackIconManager in iconmgr.c).  At 1 every entry was full-width and they
-# stacked downward, which is the vertical strip this replaces.  Five columns of
-# 600/5 = 120px each is enough for a window name.
-ShowIconManager
-NoIconManagerFocus
+# ctwm's icon manager WAS the taskbar: a grid of one cell per window across the
+# top of the screen.  taskbar(1) replaces it, at the bottom of the screen -- a
+# GTK program that reads _NET_CLIENT_LIST and drives windows with the standard
+# client messages, so it needs nothing from ctwm but the EWMH properties ctwm
+# already publishes.
+#
+# NoIconManagers rather than IconManagerDontShow: the latter only hides entries,
+# leaving the manager window itself created, mapped and taking a strip of the
+# screen.  This stops it being built at all.
+NoIconManagers
 
 #
-# Geometry:
-# Width x Height + X + Y
+# Windows that are the panel rather than applications: undecorated, on every
+# workspace, and never given a task button.
 #
-# Left-anchored past the clock AND the load graph (0..60 clock, 64..164 xload,
-# so the bar starts at 168).  600 wide keeps it clear of the workspace manager's
-# 250 at the right edge on a 1024-wide screen.
+# taskbar(1) sets _NET_WM_WINDOW_TYPE_DOCK, which ctwm understands and stacks
+# accordingly, and _NET_WM_STATE_SKIP_TASKBAR, which the panel itself honours.
+# These lists are belt and braces for the two standalone widgets, which are no
+# longer started by xinitrc but can still be run by hand.
 #
-# Unlike the workspace manager this cannot stretch to the space available --
-# ctwm has no way to say "the rest of the row" -- so it is sized for the
-# narrowest mode; on a wider screen the gap before the workspace manager simply
-# grows.  Widen the 600 to suit.
-IconManagerGeometry             "600x52+168+0" 5
-
-#
-# Make it look like a panel: undecorated, and present on every workspace rather
-# than only the one it was opened on.
-#
-# AlwaysOnTop is deliberately NOT set for these.  It works -- but it also wins
-# against every window that overlaps the bar, and a new xterm placed under it
-# had its title bar hidden, leaving nothing to grab to move the window.  With
-# normal stacking new windows come up ABOVE the bar.
-#
-# To bring the bar back to the front: button 3 on the taskbar raises it (bound
-# below), and meta-button-3 raises any window, the workspace manager included.
+# AlwaysOnTop is deliberately NOT set.  It works -- but it also wins against
+# every window that overlaps the bar, and a new xterm placed under it had its
+# title bar hidden, leaving nothing to grab to move the window.  With normal
+# stacking new windows come up ABOVE the bar.
 #
 NoTitle
 {
-    "TWM Icon Manager"
-    "WorkSpaceManager"
-    "xclock"
-    "xload"
+    "taskbar"
+    "datetime"
+    "load"
 }
 
 NoBorder
 {
-    "TWM Icon Manager"
-    "WorkSpaceManager"
-    "xclock"
-    "xload"
+    "taskbar"
+    "datetime"
+    "load"
 }
 
 OccupyAll
 {
-    "TWM Icon Manager"
-    "WorkSpaceManager"
-    "xclock"
-    "xload"
-}
-
-#
-# Don't list the panel itself
-#
-IconManagerDontShow
-{
-    "TWM Icon Manager"
-    "WorkSpaceManager"
-    "xclock"
-    "xload"
+    "taskbar"
+    "datetime"
+    "load"
 }
 
 #
@@ -272,13 +254,13 @@ Color
     MapWindowForeground   "white"
 }
 
-# The IconManagerGeometry, IconManagerDontShow and NoTitle that upstream set here
-# now live in the "Top desktop bar" section above, with the panel's values (a wide
-# short bar at the top rather than a tall column on the right, and xclock listed
-# as well).  Removed rather than left in place: ctwm accepts either of them twice
-# without complaint -- the window lists would simply accumulate, and the second
-# geometry would silently win -- so a leftover copy here would be a trap for
-# whoever next changes the bar and cannot see why it has no effect.
+# The IconManagerGeometry, IconManagerDontShow and NoTitle that upstream set
+# here are gone: there is no icon manager any more (NoIconManagers above), and
+# the panel's own window lists live in the "Top desktop bar" section.  Removed
+# rather than left in place: ctwm accepts several of these without complaint --
+# the window lists would simply accumulate and the last geometry would silently
+# win -- so a leftover copy here would be a trap for whoever next changes the
+# bar and cannot see why it has no effect.
 #
 # Define some useful functions for motion-based actions.
 #

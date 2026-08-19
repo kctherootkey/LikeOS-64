@@ -41,68 +41,35 @@ fi
 # set in the Cursors block in system.ctwmrc.
 xsetroot -solid "#6f9c9c" -cursor_name left_ptr
 
-# Clock, top-left, as the first piece of the desktop bar.  Started BEFORE the
-# window manager so it is already mapped when ctwm takes over and applies the
-# NoTitle / NoBorder / OccupyAll rules that make the bar a panel rather than
-# three ordinary windows.
+# The desktop bar.
+#
+# taskbar(1) is this system's own program (user/bin/shell/taskbar.c): a
+# Windows 2000-style panel across the bottom of the screen holding the LikeOS
+# button, the load and memory tray, the task buttons, the four workspace
+# buttons and the clock.  It replaced three things that used to be started or
+# drawn separately -- xclock, xload, and ctwm's own icon manager and workspace
+# manager, both of which are switched off in system.ctwmrc.
 #
 # Backgrounded: only the LAST command in this script may run in the foreground,
 # because that one's lifetime is the session's.
 #
-# -strftime cuts the display down to the time alone.  A digital xclock otherwise
-# prints the full date as well, which is far wider than the slot the bar leaves
-# for it, and the text would simply be clipped.
+# Started BEFORE the window manager, like the widgets it replaced, so it is
+# already mapped when ctwm takes over and applies the NoTitle / NoBorder /
+# OccupyAll rules.  It does not need ctwm to be running first: everything it
+# shows comes from EWMH properties on the root window, and until ctwm sets them
+# the panel simply has an empty task list.  It picks them up from the
+# PropertyNotify that follows.
 #
-# 60x52 is the bar's own height, so the clock is the same height as the taskbar
-# and the workspace manager beside it.
+# No -geometry.  The panel sizes itself to the width of the monitor and pins
+# itself to the bottom, then publishes _NET_WM_STRUT_PARTIAL so ctwm narrows
+# _NET_WORKAREA and maximised windows stay clear of it.
 #
-# Colours on the COMMAND LINE, not in the resource file.  xclock names every one
-# of its own resources under the instance "clock" (*clock.analog, *clock.chime,
-# ...), and a tight ".clock" binding outranks the loose "XClock*background" a
-# resource file can offer -- which is why the clock stayed pale.  A command-line
-# option outranks every resource file, so this is the one place that cannot be
-# overridden.  #c6c6c6 is exactly IconManagerBackground, the taskbar's own fill,
-# so the clock and the bar it sits in stay the same colour.
-if [ -x /usr/bin/xclock ]; then
-	xclock -digital -strftime "%H:%M" \
-	       -background "#c6c6c6" -foreground black -borderwidth 0 \
-	       -geometry 60x52+0+0 &
-fi
-
-# Load-average graph, immediately right of the clock and before the taskbar
-# (which system.ctwmrc starts at +168 to leave room for both).
-#
-# Same colours as the rest of the bar, and for the same reason they are on the
-# command line rather than in Xresources: an option cannot be outranked by a
-# tighter resource binding.  -update 2 is a two-second sample; the default of 10
-# makes the graph look frozen.
-#
-# -scale is the number of divisions the graph is drawn against, and it decides
-# what "full height" MEANS.  xload plots the 1-minute load average -- the
-# number of runnable tasks -- and the default scale of 1 makes a full-height
-# graph mean ONE task runnable, i.e. one core busy.  On a multi-core machine
-# that reads alarmingly: an idle desktop with a load of 0.6 fills 60% of the
-# graph while the CPUs are 95% idle, because 0.6 of one core IS most of one
-# core -- it is just a small share of the machine.
-#
-# Scaling by the processor count makes full height mean "every core busy", so
-# the graph tracks what top reports.  Taken from nproc rather than hardcoded,
-# because this image boots on machines with different core counts.
-if [ -x /usr/bin/xload ]; then
-	_ncpu=1
-	# /bin, not /usr/bin: the X clients live in /usr/bin but the LikeOS
-	# tools are in /bin, and they are separate directories here.
-	if [ -x /bin/nproc ]; then
-		_ncpu=$(/bin/nproc 2>/dev/null) || _ncpu=1
-	fi
-	case "$_ncpu" in
-	''|*[!0-9]*) _ncpu=1 ;;
-	esac
-	[ "$_ncpu" -lt 1 ] && _ncpu=1
-	xload -update 2 -nolabel -scale "$_ncpu" \
-	      -background "#c6c6c6" -foreground black -borderwidth 0 \
-	      -geometry 100x52+64+0 &
-	unset _ncpu
+# datetime(1) and load(1) are NOT started here any more.  They still exist and
+# still work -- run either from a terminal -- but the panel draws both from the
+# same code (user/bin/shell/panel.c), so having them as separate windows as
+# well would only be the same readings twice.
+if [ -x /usr/bin/taskbar ]; then
+	taskbar &
 fi
 
 # Cursor theme.  Xcursor reads the resource file above for most clients, but a

@@ -158,4 +158,12 @@
 #     are run on the target, not built, so nothing else would re-include them.
 !/user/bin/tests/*.sh
 !/user/bin/tests/Makefile
+#     The desktop bar widgets (datetime.c, load.c) live in their own directory
+#     under user/bin, so they need the same re-include the tests do -- the
+#     "/user/bin/*" above hides a new subdirectory entirely, sources and all.
+#     This is the testcxx.cpp trap described just above, one directory over.
+!/user/bin/shell
+/user/bin/shell/*
+!/user/bin/shell/*.c
+!/user/bin/shell/*.h
 /tmp/

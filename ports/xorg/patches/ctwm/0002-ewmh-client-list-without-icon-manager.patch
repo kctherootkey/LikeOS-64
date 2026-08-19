@@ -1,0 +1,149 @@
+Publish _NET_CLIENT_LIST(_STACKING) even when there is no icon manager.
+
+EwmhAddClientWindow() decides whether a window belongs in _NET_CLIENT_LIST by
+asking whether it has an entry in the ICON MANAGER:
+
+	if(new_win->iconmanagerlist != NULL && ...)
+
+Its own comment says why -- "Look at new_win->iconmanagerlist as an
+optimization for !LookInList(Scr->IconMgrNoShow, ...)" -- and the shortcut is
+sound as long as an icon manager exists.  With NoIconManagers it does not:
+CreateIconManagers() and AllocateIconManager() both return early, no window
+ever gets an iconmanagerlist entry, and the property stays empty for the whole
+session.
+
+That ties a standard property to an unrelated piece of ctwm's own UI.  Any
+EWMH client that asks the window manager what windows exist -- a pager, a task
+switcher, an external panel -- is told "none", and nothing in the EWMH
+specification suggests the answer should depend on whether the window manager
+happens to be drawing a window list of its own.
+
+LikeOS hits this because its taskbar is a separate program (taskbar(1), which
+reads _NET_CLIENT_LIST and drives windows with the standard client messages)
+and ctwm's icon manager is switched off in system.ctwmrc.  The symptom is a
+taskbar that never shows a single window.
+
+Two changes, and the second is what makes the first safe.
+
+1. EwmhInClientList() answers the membership question, falling back to the
+   condition the shortcut stands in for when there is no icon manager to ask.
+   Where an icon manager does exist nothing changes.
+
+2. _NET_CLIENT_LIST_STACKING is DERIVED from _NET_CLIENT_LIST instead of
+   deciding membership over again.  The two builders cannot be kept in step by
+   giving them matching conditions, because they do not run at the same
+   moment: AddWindow() inserts into the OTP list -- which restacks, which
+   rebuilds the stacking property -- BEFORE HandleMapRequest() reaches the
+   EwmhAddClientWindow() call on the very next line.  For that window the two
+   answers are momentarily bound to differ, and ctwm says so on every map,
+   unmap, raise and lower:
+
+	Incorrect number of stacked windows: 4 (expected 3)
+
+   Upstream never sees it only because iconmanagerlist happens to be filled in
+   at a point that hides the window during that restack.  Deriving one list
+   from the other removes the race rather than re-timing it, and it matches
+   what EWMH says the two properties are: the same set of windows, ordered
+   differently.
+
+The delete side needs no change -- EwmhDeleteClientWindow() searches the list
+for the window rather than re-deriving whether it should have been in it, so
+it is already correct for windows added by either route.
+
+--- a/ewmh.c
++++ b/ewmh.c
+@@ -1692,20 +1692,39 @@
+ }
+ 
+ /*
++ * Does this window belong in _NET_CLIENT_LIST?
++ *
++ * The iconmanagerlist test is a shortcut for the IconMgrNoShow lookup, and it
++ * is only valid while there IS an icon manager to have an entry in.  Under
++ * NoIconManagers there is not, so every window failed it and the property was
++ * never written -- see the patch header.
++ */
++static bool EwmhInClientList(TwmWindow *win)
++{
++	if(win->iswspmgr || win->isiconmgr) {
++		return false;
++	}
++	if(win->iconmanagerlist != NULL) {
++		return true;
++	}
++#ifdef __LIKEOS__
++	if(Scr->NoIconManagers) {
++		return !LookInList(Scr->IconMgrNoShow, win->name, &win->class);
++	}
++#endif
++	return false;
++}
++
++/*
+  * Add a new window to _NET_CLIENT_LIST.
+  * Newer windows are always added at the end.
+- *
+- * Look at new_win->iconmanagerlist as an optimization for
+- * !LookInList(Scr->IconMgrNoShow, new_win->name, &new_win->class)).
+  */
+ void EwmhAddClientWindow(TwmWindow *new_win)
+ {
+ 	if(Scr->ewmh_CLIENT_LIST_size == 0) {
+ 		return;
+ 	}
+-	if(new_win->iconmanagerlist != NULL &&
+-	                !new_win->iswspmgr &&
+-	                !new_win->isiconmgr) {
++	if(EwmhInClientList(new_win)) {
+ 		Scr->ewmh_CLIENT_LIST_used++;
+ 		if(Scr->ewmh_CLIENT_LIST_used > Scr->ewmh_CLIENT_LIST_size) {
+ 			long *tp;
+@@ -1774,6 +1793,37 @@
+ }
+ 
+ /*
++ * Is this window already ON _NET_CLIENT_LIST?
++ *
++ * The stacking list is DERIVED from the client list rather than re-deciding
++ * membership for itself, and that is what keeps the two properties agreeing.
++ * EWMH defines _NET_CLIENT_LIST_STACKING as the same set as _NET_CLIENT_LIST
++ * in a different order, so deriving it is also the more faithful reading.
++ *
++ * Deciding independently is what the code used to do, and it cannot be made
++ * safe by matching the conditions up: AddWindow() puts a window into the OTP
++ * list -- which restacks, which rebuilds this property -- BEFORE
++ * HandleMapRequest() gets to the EwmhAddClientWindow() call on the next line.
++ * For that window the two answers are momentarily bound to differ, and ctwm
++ * reported it on every map, unmap, raise and lower:
++ *
++ *     Incorrect number of stacked windows: 4 (expected 3)
++ *
++ * A linear scan per window is O(n^2) over the whole walk, which for a screen's
++ * worth of windows is a few hundred comparisons on an event that already does
++ * a round trip to the server.
++ */
++static bool EwmhOnClientList(Window w)
++{
++	for(int i = 0; i < Scr->ewmh_CLIENT_LIST_used; i++) {
++		if((Window)Scr->ewmh_CLIENT_LIST[i] == w) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
+  * Similar to EwmhAddClientWindow() and EwmhDeleteClientWindow(),
+  * but the windows are in stacking order.
+  * Therefore we look at the OTPs, which are by definition in the correct order.
+@@ -1797,9 +1847,7 @@
+ 	for(twm_win = OtpBottomWin();
+ 	                twm_win != NULL;
+ 	                twm_win = OtpNextWinUp(twm_win)) {
+-		if(twm_win->iconmanagerlist != NULL &&
+-		                !twm_win->iswspmgr &&
+-		                !twm_win->isiconmgr) {
++		if(EwmhOnClientList(twm_win->w)) {
+ 			prop[i] = twm_win->w;
+ 			i++;
+ 			if(i > size) {

@@ -453,12 +453,15 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 # stopped halfway through the new packages.
 GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/pcmanfm
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
+# The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
+GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
 	$(GTK3_SENTINEL) \
 	$(GTK3_TESTCXX) \
+	$(GTK3_BAR_PROGS) \
 	$(RES_PREREQS)
 
 # Default target: build the single ext4 GPT USB disk.
@@ -1663,6 +1666,53 @@ ports-gtk3: ports-xorg | $(BUILD_DIR)
 	ports/xorg/gtk3/unpack.sh
 	ports/xorg/gtk3/build.sh
 
+# The desktop shell: the taskbar panel and the two widgets it shares its
+# drawing with.
+#
+# GTK3 programs, so they are built with the port's cross driver against the
+# X sysroot rather than with the userland compiler -- the same arrangement
+# testcxx uses below, and for the same reason: the libraries they link live in
+# the sysroot the GTK3 port installs into, and it does not exist until that
+# port has built.
+#
+# taskbar is the desktop bar: a Windows 2000-style panel that replaced ctwm's
+# icon manager and workspace manager, and that draws the clock and the load
+# monitor in its own tray rather than leaving them as separate windows.
+# datetime and load remain as standalone programs -- they share panel.c with
+# the panel, so the same code draws them either way -- but xinitrc no longer
+# starts them.
+#
+# Ordered after the GTK3 sentinel rather than merely needing the same port: the
+# two are independent entries in the image's prerequisite list, so under -j make
+# is free to start these first and they would fail on a GTK that was still
+# being built.
+# x11 as well as gtk+-3.0: the taskbar talks to the server directly for the
+# EWMH properties GDK does not wrap, so it needs Xlib's headers and -lX11.
+GTK3_BAR_CFLAGS = $(shell LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-pkg-config --cflags gtk+-3.0 x11 2>/dev/null)
+GTK3_BAR_LIBS = $(shell LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-pkg-config --libs gtk+-3.0 x11 2>/dev/null)
+
+# panel.c carries the drawing all three share, so each links its own copy --
+# there are three programs and no library, which for 380 lines is the simpler
+# arrangement.
+PANEL_SRC = user/bin/shell/panel.c user/bin/shell/panel.h
+
+$(BUILD_DIR)/datetime: user/bin/shell/datetime.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS)
+
+$(BUILD_DIR)/load: user/bin/shell/load.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS)
+
+$(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS)
+
 # The C++ runtime's own test program.
 #
 # Built with the port's C++ driver rather than the userland one, because it is
@@ -1790,6 +1840,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# /usr/bin/env so "#!/usr/bin/env <interp>" shebangs resolve (real copy;
 	# the exec path does not depend on symlink support)
 	cp $(BUILD_DIR)/env $(EXT4_STAGING)/usr/bin/env
+	# Desktop bar widgets -> /usr/bin, beside the X clients they replace
+	# (xclock and xload), which is also where xinitrc looks for them.
+	cp $(BUILD_DIR)/datetime $(EXT4_STAGING)/usr/bin/datetime
+	cp $(BUILD_DIR)/load     $(EXT4_STAGING)/usr/bin/load
+	cp $(BUILD_DIR)/taskbar  $(EXT4_STAGING)/usr/bin/taskbar
 	# Tests and demos -> /usr/local/bin (a few are renamed)
 	cp $(BUILD_DIR)/user_test.elf $(EXT4_STAGING)/usr/local/bin/tests
 	cp $(BUILD_DIR)/test_libc     $(EXT4_STAGING)/usr/local/bin/testlibc
