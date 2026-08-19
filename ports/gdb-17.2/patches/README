@@ -6,8 +6,7 @@ does and why, then the diff -- the explanation is the point of keeping them as
 separate files rather than editing src/ in place, which the next re-unpack
 would silently discard.
 
-Planned set (added in the gdb source-port phase, once the kernel ptrace ABI
-they are written against exists):
+The set, as built:
 
   0001-config-sub-likeos-triple.patch
         Teach the bundled config.sub about x86_64-*-likeos*.  There are two
@@ -18,15 +17,19 @@ they are written against exists):
         gdb/configure.host and gdb/configure.tgt entries selecting the native
         target module and OS ABI for the new triple.
 
-  0003-gdb-likeos-nat.patch
+  0003-gdb-likeos-nat-and-tdep.patch
         gdb/likeos-nat.c -- the native target_ops: attach/detach, register
-        fetch/store, memory transfer, resume, wait, breakpoint and watchpoint
-        insertion.  Written against <sys/ptrace.h>; structurally modelled on
-        the BSD nat modules, which are the closest analog to a small
-        non-Linux Unix.
+        fetch/store, memory transfer, resume, wait, thread enumeration,
+        breakpoint and watchpoint insertion.  Written against <sys/ptrace.h>;
+        structurally modelled on the BSD nat modules, which are the closest
+        analog to a small non-Linux Unix.
+        gdb/likeos-tdep.c -- OS ABI registration, which is what points the
+        architecture at solib-svr4 and relocates a position-independent
+        executable.
+        Two upstream files as well, both one-line-shaped fixes to paths that
+        this target is the first to travel: gdb/inflow.c and gdb/posix-hdep.c.
 
-  0004-gdb-likeos-tdep.patch
-        gdb/likeos-tdep.c -- OS ABI glue: signal numbering and siginfo layout.
-
-  0005-gdbserver-likeos-low.patch
-        gdbserver/likeos-low.cc -- the same primitives for the remote stub.
+  0004-gdbserver-likeos-low.patch
+        gdbserver/likeos-low.cc -- the same primitives for the remote stub,
+        plus the gdbserver/configure.srv entry that is what makes the tree
+        build gdbserver at all.

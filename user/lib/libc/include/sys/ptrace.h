@@ -230,7 +230,19 @@ struct ptrace_regs {
 	unsigned long r11, r10, r9, r8;
 	unsigned long rax, rcx, rdx, rsi, rdi;
 	unsigned long rip, cs, rflags, rsp, ss;
+	/* The FS and GS bases, which are per-task state the kernel keeps: FS's
+	 * is the thread pointer, and without it thread-local variables cannot
+	 * be located.  Both are writable through PTRACE_SETREGS, and both are
+	 * refused above the user half of the address space. */
 	unsigned long fs_base, gs_base;
+	/* The data-segment selectors, as the processor held them when the
+	 * tracee last entered the kernel.  Reported for completeness and read
+	 * only: in 64-bit mode a data selector selects nothing, the kernel does
+	 * not restore these on the way out, and a value accepted here would
+	 * therefore be one that never took effect.  Zero for a task that has
+	 * not been to user mode.  Appended after the bases so that adding them
+	 * did not move any register a debugger already reads. */
+	unsigned long ds, es, fs, gs;
 };
 
 /* Pinned to the same size as the kernel's copy of this layout, which lives in
@@ -238,10 +250,10 @@ struct ptrace_regs {
  * field to one and forgetting the other then fails to compile rather than
  * quietly shifting every register reported. */
 #ifdef __cplusplus
-static_assert(sizeof(struct ptrace_regs) == 22 * sizeof(unsigned long),
+static_assert(sizeof(struct ptrace_regs) == 26 * sizeof(unsigned long),
 	      "struct ptrace_regs layout must match the kernel's");
 #else
-_Static_assert(sizeof(struct ptrace_regs) == 22 * sizeof(unsigned long),
+_Static_assert(sizeof(struct ptrace_regs) == 26 * sizeof(unsigned long),
 	       "struct ptrace_regs layout must match the kernel's");
 #endif
 

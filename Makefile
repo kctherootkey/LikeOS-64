@@ -369,7 +369,7 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup kdump \
-	gdb
+	gdb gdbserver
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
@@ -1396,6 +1396,26 @@ $(BUILD_DIR)/gdb: ports-gdb | $(BUILD_DIR)
 	cp ports/gdb-17.2/build/gdb/gdb $@
 	$(STRIP) --strip-unneeded $@
 
+# gdbserver, from the same tree and stripped for the same reason.
+#
+# What it is FOR is debugging a LikeOS program from a debugger running
+# somewhere else: gdbserver holds the ptrace end here and speaks the remote
+# protocol over TCP or a serial line, so the symbols, the source and the 166M
+# of gdb stay on the developer's machine.
+#
+#   on LikeOS:   gdbserver :2345 /usr/local/bin/test_libc all
+#                gdbserver --attach :2345 <pid>
+#   elsewhere:   gdb <the same program>
+#                (gdb) target remote <likeos-ip>:2345
+#
+# The debugger at the other end has to know this system's OS ABI to relocate a
+# position-independent executable and to find shared libraries; a gdb built
+# from this port's own source with --target=x86_64-unknown-likeos does, and a
+# stock one gets most of the way with `set osabi GNU/Linux'.
+$(BUILD_DIR)/gdbserver: ports-gdb | $(BUILD_DIR)
+	cp ports/gdb-17.2/build/gdbserver/gdbserver $@
+	$(STRIP) --strip-unneeded $@
+
 # Build netcat (nc)
 .PHONY: ports-netcat
 ports-netcat: userland-libc userland-rtld
@@ -2106,6 +2126,10 @@ gdb-manpage:
 	GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
 		ports/gdb-17.2/src/gdb/doc/gdb.1 | col -bx > res/man/gdb.1
 	@echo "res/man/gdb.1 regenerated ($$(wc -l < res/man/gdb.1) lines)"
+	GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+		ports/gdb-17.2/src/gdb/doc/gdbserver.1 | col -bx \
+		> res/man/gdbserver.1
+	@echo "res/man/gdbserver.1 regenerated ($$(wc -l < res/man/gdbserver.1) lines)"
 
 # Regenerate the OpenSSH catman pages in res/man from the port's mdoc sources.
 # Like bash-manpage this is a maintenance target, not part of the build: the

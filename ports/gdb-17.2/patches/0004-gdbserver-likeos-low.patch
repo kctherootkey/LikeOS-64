@@ -1,0 +1,1582 @@
+Add gdbserver support: the LikeOS low-level module.
+
+gdbserver is the other half of a debugger.  It holds the ptrace end on the
+machine running the program and speaks gdb's remote protocol over a socket or a
+serial line, so the symbols, the source tree and the debugger itself stay
+somewhere else.  On this system that matters more than it does on a desktop:
+the native gdb is 11M stripped and carries 148M of its own DWARF unstripped,
+while this is 550K.
+
+Three files.
+
+gdbserver/configure.srv gets an x86_64-*-likeos* entry, and that entry is what
+turns gdbserver on at all: the TOP-LEVEL configure sources this file and drops
+gdbserver from the subdirectory list when it names no case for the host.  The
+object list is the smallest one that works -- the new module, gdbserver's own
+fork-child, gdb's shared fork-inferior and amd64 target-description builder,
+i387-fp for the FXSAVE image, and x86-low + nat/x86-dregs for the hardware
+watchpoint registers.
+
+gdbserver/Makefile.in lists the new source in SFILES.  Nothing is built from
+that list -- the objects come from configure.srv -- but it is what `make tags'
+and the distribution rules walk, and a file missing from it is a file that
+quietly is not there.
+
+gdbserver/likeos-low.cc is the module.  It is written against the same kernel
+interface as gdb/likeos-nat.c -- LikeOS's own ptrace(2) -- and reaches the same
+conclusions about it, because the kernel forces them:
+
+  - Registers are moved as whole blocks, because that is how PTRACE_GETREGS
+    reports them.  The translation table is keyed by register NAME and the
+    numbers are looked up once from the target description, rather than being
+    an array indexed by register number: a table in the wrong order compiles
+    perfectly and reports one register's value under another's name, whereas an
+    unknown name throws at start-up.
+
+  - The target description asks for the "segments" feature, where the NetBSD
+    equivalent does not.  That is %fs_base and %gs_base, and %fs_base is where
+    a thread's TLS block lives -- without it a thread-local variable cannot be
+    located, and on this system errno is one.
+
+  - wait() waits with -1 and not with the process id.  The kernel matches a
+    POSITIVE waitpid selector against the TASK id, so waiting for the process
+    would report only the thread group leader and every stop belonging to any
+    other thread would sit uncollected.
+
+  - What comes back from wait is a TASK id, which for a thread is not the
+    process id.  It is mapped to (process, thread) by asking which process owns
+    it; a task that belongs to none of them is released rather than reported,
+    because the forked child of a traced process is stopped along with its
+    parent and leaving it parked hangs the shell that forked it.
+
+  - The whole event decode is gated on PTRACE_SETOPTIONS having been issued.
+    Clone and exit stops are raised only when their option is set, but an EXEC
+    stop is raised for every exec by a traced task, because it is also the
+    PTRACE_TRACEME + execve bootstrap.  Reported as TARGET_WAITKIND_EXECD it
+    lands in startup_inferior, whose last status handle_status replays as the
+    answer to gdb's first `?' packet -- so gdb's first event of the session is
+    an exec, follow_exec sets the program space's solib ops, start_remote_1's
+    post_create_inferior sets them again, and gdb dies on
+    `Assertion `m_solib_ops == nullptr' failed'.  Until the options are set an
+    exec stop is gdbserver's own and is reported as the plain SIGTRAP that
+    startup_inferior counts.
+
+  - Clone and thread-exit stops are consumed here rather than reported.  They
+    exist so that a thread can be registered the moment it is born and dropped
+    the moment it dies; passed upwards they surface as `received signal
+    SIGTRAP' once per thread.
+
+  - The event value comes back through DATA, not ADDR.  PTRACE_GETEVENTMSG is
+    the one request on this system whose pointer argument is DATA, and getting
+    it the other way round does not fail loudly -- the kernel finds a null
+    pointer, refuses it, and the value is silently left at zero.
+
+  - A resume is aimed at the thread that STOPPED, not at the thread group
+    leader.  Every trace stop parks the whole group and any member's PT_CONT
+    releases all of it, but the kernel refuses to resume a task that is not
+    itself stopped -- so naming the leader fails outright once a leader has
+    exited while its threads run on.
+
+  - read_auxv is served from PTRACE_GETAUXV.  Executables here are
+    position-independent and this vector is the only way to learn the bias one
+    was loaded at; without it `break main' resolves to a link-time offset with
+    nothing mapped at it.
+
+  - pid_to_exec_file is served from PTRACE_GETEXECPATH, which is what makes
+    --attach useful: there is no per-process filesystem to read the program's
+    path out of, and neither the process name (a basename) nor argv[0] (which
+    for a login shell is "-bash") names a file that can be opened.
+
+Deliberately not implemented: fork and vfork events, which would oblige this
+module to detach the parked child and which nothing here needs to follow;
+syscall catching; tracepoints and the in-process agent; and
+qXfer:libraries-svr4, because gdb walks the loader's link map through ordinary
+memory reads when the target does not offer it.
+
+The debugger at the other end has to know this system's OS ABI to relocate a
+position-independent executable and to find shared libraries.  One built from
+this port's source with --target=x86_64-unknown-likeos does -- the OS ABI name
+gdbserver puts in its target description is the one patch 0002 registered -- and
+a stock gdb gets most of the way with `set osabi GNU/Linux'.
+
+diff -urN a/gdbserver/Makefile.in b/gdbserver/Makefile.in
+--- a/gdbserver/Makefile.in
++++ b/gdbserver/Makefile.in
+@@ -204,6 +204,7 @@
+ 	$(srcdir)/linux-sparc-low.cc \
+ 	$(srcdir)/linux-x86-low.cc \
+ 	$(srcdir)/linux-xtensa-low.cc \
++	$(srcdir)/likeos-low.cc \
+ 	$(srcdir)/mem-break.cc \
+ 	$(srcdir)/netbsd-aarch64-low.cc \
+ 	$(srcdir)/netbsd-amd64-low.cc \
+diff -urN a/gdbserver/configure.srv b/gdbserver/configure.srv
+--- a/gdbserver/configure.srv
++++ b/gdbserver/configure.srv
+@@ -409,6 +409,13 @@
+ 			srv_tgtobj="${srv_tgtobj} nat/windows-nat.o"
+ 			srv_tgtobj="${srv_tgtobj} arch/amd64.o arch/i386.o"
+ 			;;
++  x86_64-*-likeos*)	srv_regobj=""
++			srv_tgtobj="likeos-low.o fork-child.o"
++			srv_tgtobj="${srv_tgtobj} nat/fork-inferior.o"
++			srv_tgtobj="${srv_tgtobj} x86-low.o nat/x86-dregs.o"
++			srv_tgtobj="${srv_tgtobj} i387-fp.o"
++			srv_tgtobj="${srv_tgtobj} arch/amd64.o"
++			;;
+   x86_64-*-netbsd*)	srv_regobj=""
+ 			srv_tgtobj="netbsd-low.o netbsd-amd64-low.o fork-child.o"
+ 			srv_tgtobj="${srv_tgtobj} nat/fork-inferior.o"
+diff -urN a/gdbserver/likeos-low.cc b/gdbserver/likeos-low.cc
+--- a/gdbserver/likeos-low.cc
++++ b/gdbserver/likeos-low.cc
+@@ -0,0 +1,1449 @@
++/* Native support for LikeOS-64 in gdbserver.
++
++   Copyright (C) 2025-2026 Free Software Foundation, Inc.
++
++   This file is part of GDB.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++/* This is the same kernel interface gdb/likeos-nat.c is written against --
++   LikeOS's own ptrace(2), described in <sys/ptrace.h> -- reached through
++   gdbserver's target vector instead of gdb's.  The two files agree on every
++   decision that the kernel forces, and each of those is commented where it is
++   made rather than cross-referenced, because reading one should not require
++   the other.
++
++   LikeOS is amd64 only, so unlike the NetBSD and Linux ports there is no
++   architecture split: one file, one register layout, one target description.
++
++   What is NOT here, deliberately:
++
++     - Fork and vfork events.  gdbserver would then owe gdb a follow_fork, and
++       the child of a traced process is parked by the kernel until somebody
++       detaches from it; getting that wrong leaves a shell under the debugger
++       hanging on the first command it runs.  Without TRACEFORK the child is
++       never traced and simply runs, which is what "always follow the parent"
++       means and is all this port claims.  netbsd-low.cc makes the same choice.
++     - Syscall catching, tracepoints and the in-process agent.
++     - qXfer:libraries-svr4.  gdb reads the loader's link map through ordinary
++       memory reads when the target does not offer this, which works and is one
++       fewer thing to keep in step with the loader.  */
++
++#include "target.h"
++#include "regcache.h"
++#include "gdbthread.h"
++#include "tdesc.h"
++#include "i387-fp.h"
++#include "x86-low.h"
++#include "x86-tdesc.h"
++
++#include "arch/amd64.h"
++#include "nat/fork-inferior.h"
++#include "nat/x86-dregs.h"
++#include "gdbsupport/x86-xstate.h"
++#include "gdbsupport/osabi.h"
++#include "gdbsupport/eintr.h"
++#include "gdbsupport/gdb_wait.h"
++#include "gdbsupport/common-inferior.h"
++
++#include <sys/types.h>
++#include <sys/ptrace.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <signal.h>
++#include <unistd.h>
++#include <vector>
++
++/* Every process here has threads, and they are what the (pid, lwp) ptids this
++   target hands out are for.  Reported to remote-utils.cc so that stop replies
++   carry the thread they belong to.  */
++
++int using_threads = 1;
++
++/* ------------------------------------------------------------------------ */
++/* Registers                                                                 */
++/* ------------------------------------------------------------------------ */
++
++/* Where each register lives inside `struct ptrace_regs' (<sys/ptrace.h>),
++   named rather than numbered.
++
++   The kernel's block is ordered the way the interrupt frame it is built from
++   is ordered, which is nothing like the order of gdb's register numbering, so
++   this table is the whole of the translation.  It is keyed by NAME and the
++   numbers are looked up once from the target description, which is stronger
++   than an array indexed by register number: a table in the wrong order still
++   compiles and simply reports one register's value under another's name,
++   whereas a name that does not exist in the description throws at start-up.
++
++   struct ptrace_regs, in slots of 8 bytes:
++
++      0 r15   1 r14   2 r13   3 r12   4 rbp   5 rbx   6 r11   7 r10
++      8 r9    9 r8   10 rax  11 rcx  12 rdx  13 rsi  14 rdi  15 rip
++     16 cs   17 rflags 18 rsp 19 ss  20 fs_base 21 gs_base
++     22 ds   23 es   24 fs   25 gs
++
++   The four data-segment selectors are at the end because they were added to
++   the kernel's block after the rest; appending them left every register a
++   debugger already read where it was.  They are reported and not written --
++   the kernel does not restore them on the way back to user mode, so a value
++   accepted for one would be a value that never took effect.  CS and SS are
++   not written either, and for a stronger reason: a tracee returning through a
++   segment selector of the debugger's choosing is a way out of user mode.  */
++
++struct likeos_reg
++{
++  /* The register's name in the target description.  */
++  const char *name;
++
++  /* Its slot in `struct ptrace_regs', counted in 8-byte words.  */
++  int slot;
++
++  /* Whether PTRACE_SETREGS honours a write to it.  Reading is always
++     honoured; see above for why some of these are read-only.  */
++  bool writable;
++};
++
++static const struct likeos_reg likeos_gregs[] =
++{
++  { "rax",	10,	true },
++  { "rbx",	 5,	true },
++  { "rcx",	11,	true },
++  { "rdx",	12,	true },
++  { "rsi",	13,	true },
++  { "rdi",	14,	true },
++  { "rbp",	 4,	true },
++  { "rsp",	18,	true },
++  { "r8",	 9,	true },
++  { "r9",	 8,	true },
++  { "r10",	 7,	true },
++  { "r11",	 6,	true },
++  { "r12",	 3,	true },
++  { "r13",	 2,	true },
++  { "r14",	 1,	true },
++  { "r15",	 0,	true },
++  { "rip",	15,	true },
++  { "eflags",	17,	true },
++  { "cs",	16,	false },
++  { "ss",	19,	false },
++  { "ds",	22,	false },
++  { "es",	23,	false },
++  { "fs",	24,	false },
++  { "gs",	25,	false },
++  { "fs_base",	20,	true },
++  { "gs_base",	21,	true },
++};
++
++/* The register numbers the names above resolve to, filled in by
++   likeos_arch_setup.  A separate array rather than a mutable field in the
++   table so that the table itself stays constant data.  */
++
++static int likeos_greg_regnum[ARRAY_SIZE (likeos_gregs)];
++
++/* Read the whole general-purpose block of the task TID.  */
++
++static void
++likeos_fetch_gregs (pid_t tid, struct ptrace_regs *regs)
++{
++  if (ptrace (PT_GETREGS, tid, regs, 0) == -1)
++    perror_with_name ("Couldn't get registers");
++}
++
++/* ------------------------------------------------------------------------ */
++/* Hardware watchpoints                                                      */
++/* ------------------------------------------------------------------------ */
++
++/* nat/x86-dregs.c owns the allocation of the four address registers and the
++   assembly of DR7; all it wants from a particular system is five functions
++   that move one register in or out, and a per-process place to keep its
++   mirror of the hardware.  Writing any of that here would be reimplementing
++   shared code that is already correct.
++
++   The kernel reports all eight registers at once, indexed as the hardware
++   numbers them, so a read is one request and a write is read-modify-write.  */
++
++struct process_info_private
++{
++  /* nat/x86-dregs.c's view of this process's debug registers.  A watchpoint
++     is a property of the address space, so it belongs to the process and not
++     to any one of its threads -- which is also why arming one writes it to
++     every thread.  */
++  struct x86_debug_reg_state debug_reg_state;
++
++  /* Whether PTRACE_SETOPTIONS has been issued for this process yet, which on
++     this system is the same question as "is an exec stop an EVENT or is it the
++     bootstrap?"  See likeos_wants_trace_events.  */
++  bool trace_options_set = false;
++};
++
++/* nat/x86-dregs.c's mirror for the current process, or null if there is no
++   current process to have one.  Every caller checks: a Z-packet arrives with
++   whatever context the previous packet left, so "there is no process" is a
++   state to answer rather than one to assume away.  */
++
++static struct x86_debug_reg_state *
++likeos_debug_reg_state (void)
++{
++  process_info *proc = current_process ();
++
++  return (proc != nullptr && proc->priv != nullptr)
++	   ? &proc->priv->debug_reg_state
++	   : nullptr;
++}
++
++static struct ptrace_dbregs
++likeos_dr_fetch (pid_t tid)
++{
++  struct ptrace_dbregs dbregs;
++
++  if (tid == 0)
++    error ("no process selected for a debug-register access");
++
++  if (ptrace (PT_GETDBREGS, tid, &dbregs, 0) == -1)
++    perror_with_name ("Couldn't read debug registers");
++
++  return dbregs;
++}
++
++/* The task id to aim a THREAD-scoped request at -- registers, siginfo, a
++   single-step.  A thread is a task in its own right on this system, so the lwp
++   half of the ptid is the id whenever it is set.
++
++   Zero when there is no current thread, which is a state gdbserver puts itself
++   in deliberately rather than an error: see likeos_process_tid.  Callers
++   check.  */
++
++static pid_t
++likeos_current_tid (void)
++{
++  if (current_thread == nullptr)
++    return 0;
++
++  ptid_t ptid = current_thread->id;
++
++  return (pid_t) (ptid.lwp () != 0 ? ptid.lwp () : ptid.pid ());
++}
++
++/* The task id to aim a PROCESS-scoped request at -- memory, the debug
++   registers.  Both are properties of an address space, which every thread of a
++   process shares, so the thread group leader answers for all of them.
++
++   This is not interchangeable with likeos_current_tid, and using that one here
++   was a null dereference rather than a wrong answer.  gdbserver distinguishes
++   the two explicitly: gdb_read_memory calls set_desired_process(), whose
++   switch_to_process() sets the current process and CLEARS current_thread --
++
++     switch_to_process (process_info *proc)
++     { current_process_ = proc;  current_thread = nullptr; }
++
++   -- so a memory read arrives with no current thread BY DESIGN.  Reading
++   current_thread->id there faulted at offset 0x18, which is where ptid_t's lwp
++   sits, the moment gdb asked for its first byte of memory.  linux-low and
++   netbsd-low both answer memory from current_process()->pid.
++
++   Zero when there is no current process either; callers check.  */
++
++static pid_t
++likeos_process_tid (void)
++{
++  process_info *proc = current_process ();
++
++  return proc != nullptr ? (pid_t) proc->pid : 0;
++}
++
++static void
++likeos_dr_store (const struct ptrace_dbregs *dbregs)
++{
++  /* Written to every thread of the process, not just the current one: a
++     watchpoint is on an address in an address space they all share, and one
++     armed only on the thread that set it would miss the write it was armed
++     for.  */
++  process_info *proc = current_process ();
++
++  if (proc == nullptr)
++    error ("no process selected for a debug-register access");
++
++  proc->for_each_thread ([dbregs] (thread_info *thread)
++    {
++      ptid_t ptid = thread->id;
++      pid_t tid = (pid_t) (ptid.lwp () != 0 ? ptid.lwp () : ptid.pid ());
++
++      if (ptrace (PT_SETDBREGS, tid, (void *) dbregs, 0) == -1)
++	perror_with_name ("Couldn't write debug registers");
++    });
++}
++
++static void
++likeos_dr_set (int regnum, unsigned long value)
++{
++  struct ptrace_dbregs dbregs = likeos_dr_fetch (likeos_process_tid ());
++
++  dbregs.dr[regnum] = value;
++  likeos_dr_store (&dbregs);
++}
++
++static unsigned long
++likeos_dr_get (int regnum)
++{
++  struct ptrace_dbregs dbregs = likeos_dr_fetch (likeos_process_tid ());
++
++  return dbregs.dr[regnum];
++}
++
++static void
++likeos_dr_set_control (unsigned long control)
++{
++  likeos_dr_set (DR_CONTROL, control);
++}
++
++static void
++likeos_dr_set_addr (int regnum, CORE_ADDR addr)
++{
++  gdb_assert (regnum >= 0 && regnum <= DR_LASTADDR - DR_FIRSTADDR);
++  likeos_dr_set (DR_FIRSTADDR + regnum, (unsigned long) addr);
++}
++
++static CORE_ADDR
++likeos_dr_get_addr (int regnum)
++{
++  return likeos_dr_get (DR_FIRSTADDR + regnum);
++}
++
++static unsigned long
++likeos_dr_get_status (void)
++{
++  return likeos_dr_get (DR_STATUS);
++}
++
++static unsigned long
++likeos_dr_get_control (void)
++{
++  return likeos_dr_get (DR_CONTROL);
++}
++
++struct x86_dr_low_type x86_dr_low =
++  {
++    likeos_dr_set_control,
++    likeos_dr_set_addr,
++    likeos_dr_get_addr,
++    likeos_dr_get_status,
++    likeos_dr_get_control,
++    sizeof (unsigned long),
++  };
++
++/* ------------------------------------------------------------------------ */
++/* The target                                                                */
++/* ------------------------------------------------------------------------ */
++
++class likeos_process_target : public process_stratum_target
++{
++public:
++
++  int create_inferior (const char *program,
++		       const std::string &program_args) override;
++
++  void post_create_inferior () override;
++
++  int attach (unsigned long pid) override;
++
++  int kill (process_info *proc) override;
++
++  int detach (process_info *proc) override;
++
++  void mourn (process_info *proc) override;
++
++  void join (int pid) override;
++
++  bool thread_alive (ptid_t ptid) override;
++
++  void resume (thread_resume *resume_info, size_t n) override;
++
++  ptid_t wait (ptid_t ptid, target_waitstatus *status,
++	       target_wait_flags options) override;
++
++  void fetch_registers (regcache *regcache, int regno) override;
++
++  void store_registers (regcache *regcache, int regno) override;
++
++  int read_memory (CORE_ADDR memaddr, unsigned char *myaddr,
++		   int len) override;
++
++  int write_memory (CORE_ADDR memaddr, const unsigned char *myaddr,
++		    int len) override;
++
++  void request_interrupt () override;
++
++  bool supports_read_auxv () override;
++
++  int read_auxv (int pid, CORE_ADDR offset, unsigned char *myaddr,
++		 unsigned int len) override;
++
++  bool supports_hardware_single_step () override;
++
++  const gdb_byte *sw_breakpoint_from_kind (int kind, int *size) override;
++
++  bool supports_z_point_type (char z_type) override;
++
++  int insert_point (enum raw_bkpt_type type, CORE_ADDR addr,
++		    int size, struct raw_breakpoint *bp) override;
++
++  int remove_point (enum raw_bkpt_type type, CORE_ADDR addr,
++		    int size, struct raw_breakpoint *bp) override;
++
++  bool stopped_by_watchpoint () override;
++
++  CORE_ADDR stopped_data_address () override;
++
++  bool supports_qxfer_siginfo () override;
++
++  int qxfer_siginfo (const char *annex, unsigned char *readbuf,
++		     unsigned const char *writebuf, CORE_ADDR offset,
++		     int len) override;
++
++  bool supports_non_stop () override;
++
++  bool supports_multi_process () override;
++
++  bool supports_exec_events () override;
++
++  bool supports_disable_randomization () override;
++
++  bool supports_pid_to_exec_file () override;
++
++  const char *pid_to_exec_file (int pid) override;
++};
++
++/* Ask the kernel for the events this target decodes in wait().
++
++   TRACECLONE is what makes a new thread announce itself the moment it is
++   created rather than being noticed at the next stop; TRACEEXIT is the other
++   half of the same story, because a thread is not its debugger's child and
++   nothing else ever reports its death.  TRACEEXEC is how the program changing
++   underneath the debugger is noticed at all.  Both clone and exit stops are
++   consumed inside wait() -- see there -- so neither reaches gdb as a trap.  */
++
++static void
++likeos_set_trace_options (process_info *proc)
++{
++  ptrace (PTRACE_SETOPTIONS, proc->pid, nullptr,
++	  PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT);
++
++  if (proc->priv != nullptr)
++    proc->priv->trace_options_set = true;
++}
++
++/* Has this process been put under the event options above?
++
++   This gates the whole event decode in wait(), and the case it exists for is
++   the EXEC stop.  Clone and exit stops are raised by the kernel only when the
++   matching option is set, so before that they cannot happen at all -- but an
++   exec stop is raised for EVERY exec by a traced task, option or no option,
++   because it is also the PTRACE_TRACEME + execve bootstrap: the stop that lets
++   a debugger reach a program before its first instruction.
++
++   Reporting that bootstrap stop as TARGET_WAITKIND_EXECD is wrong, and wrong in
++   a way that surfaces a long way from here.  It happens inside
++   startup_inferior, before gdb has connected or asked for anything, and
++   startup_inferior records the last status it saw in cs.last_status -- which
++   handle_status then replays as the answer to gdb's very first `?' packet.  So
++   gdb's first event of the session was an exec.  It handles that in
++   follow_exec, which sets the program space's solib ops; start_remote_1 then
++   calls post_create_inferior, which sets them AGAIN; and program_space::
++   set_solib_ops asserts that they were unset:
++
++     progspace.h:252: internal-error: set_solib_ops:
++             Assertion `m_solib_ops == nullptr' failed.
++
++   No other stub reports an exec as its first event, which is why nothing
++   upstream trips over it.  Until the options are set, an exec stop is
++   gdbserver's own business and is reported as the plain SIGTRAP stop that
++   startup_inferior counts.  */
++
++static bool
++likeos_wants_trace_events (process_info *proc)
++{
++  return proc != nullptr && proc->priv != nullptr
++	 && proc->priv->trace_options_set;
++}
++
++/* Is TID a thread of the process PID?
++
++   Every stop the kernel reports names a TASK, and a task is not necessarily a
++   thread of the process being debugged: anything else this tracer has picked
++   up reports through the same waitpid.  Answered by asking the kernel for the
++   thread list, which is built from the process's own thread-group ring.  */
++
++static bool
++likeos_lwp_of_process (pid_t pid, pid_t tid)
++{
++  if (tid == pid)
++    return true;
++
++  int nlwps = ptrace (PT_GETNUMLWPS, pid, nullptr, 0);
++
++  if (nlwps <= 0)
++    return false;
++
++  std::vector<unsigned int> lwps (nlwps);
++
++  nlwps = ptrace (PT_GETLWPLIST, pid, lwps.data (), (long) nlwps);
++  for (int i = 0; i < nlwps; i++)
++    if (lwps[i] == (unsigned int) tid)
++      return true;
++
++  return false;
++}
++
++/* Bring PROC's thread list back into agreement with the kernel's.
++
++   A thread on this system is a task in its own right -- its own registers,
++   its own stop, its own id -- so ptrace already works on one once its id is
++   known.  Knowing the SET is the only thing a debugger cannot work out for
++   itself, because a thread is invisible from outside the process.
++
++   Both halves are needed and neither is optional.  Threads are added as they
++   are born, from the clone event, and dropped as they die, from the exit
++   event -- but a process gdbserver ATTACHED to was already multi-threaded
++   before either event could fire, and its other threads would otherwise stay
++   invisible until each happened to stop on its own account.
++
++   KEEP is the thread the caller is about to report a stop for; it is never
++   pruned even if the kernel no longer lists it, because removing the thread a
++   stop belongs to leaves the stop with nothing to attribute it to.  */
++
++static void
++likeos_update_threads (process_info *proc, ptid_t keep)
++{
++  pid_t pid = proc->pid;
++  int nlwps = ptrace (PT_GETNUMLWPS, pid, nullptr, 0);
++
++  if (nlwps <= 0)
++    return;
++
++  std::vector<unsigned int> lwps (nlwps);
++
++  nlwps = ptrace (PT_GETLWPLIST, pid, lwps.data (), (long) nlwps);
++  if (nlwps <= 0)
++    return;
++
++  lwps.resize (nlwps);
++
++  for (unsigned int lwp : lwps)
++    {
++      ptid_t ptid = ptid_t (pid, lwp);
++
++      if (proc->find_thread (ptid) == nullptr)
++	proc->add_thread (ptid, nullptr);
++    }
++
++  /* Removing from inside the walk is allowed: for_each_thread advances its
++     iterator before calling back, precisely so that this is safe.  */
++  proc->for_each_thread ([&] (thread_info *thread)
++    {
++      ptid_t ptid = thread->id;
++      unsigned int lwp = (unsigned int) (ptid.lwp () != 0 ? ptid.lwp ()
++					 : ptid.pid ());
++
++      if (ptid == keep)
++	return;
++
++      for (unsigned int live : lwps)
++	if (live == lwp)
++	  return;
++
++      proc->remove_thread (thread);
++    });
++}
++
++/* Build this process's target description.
++
++   `segments' is true where NetBSD's equivalent passes false, and that is the
++   point of it: it adds %fs_base and %gs_base, and %fs_base is where a thread's
++   TLS block lives.  Without it a debugger cannot find a thread-local variable
++   at all -- which on this system includes errno.  */
++
++static void
++likeos_arch_setup (process_info *proc)
++{
++  target_desc *tdesc
++    = amd64_create_target_description (X86_XSTATE_SSE_MASK, false, false,
++				       true);
++
++  init_target_desc (tdesc, amd64_expedite_regs, GDB_OSABI_LIKEOS);
++
++  for (size_t i = 0; i < ARRAY_SIZE (likeos_gregs); i++)
++    likeos_greg_regnum[i] = find_regno (tdesc, likeos_gregs[i].name);
++
++  proc->tdesc = tdesc;
++}
++
++/* Callback used by fork_inferior to start tracing the inferior.  */
++
++static void
++likeos_ptrace_fun ()
++{
++  /* Its own process group, so that a signal typed at gdbserver's terminal
++     does not go straight to the program as well.  */
++  if (setpgid (0, 0) < 0)
++    trace_start_error_with_name ("setpgid");
++
++  if (ptrace (PT_TRACE_ME, 0, nullptr, 0) < 0)
++    trace_start_error_with_name ("ptrace");
++
++  /* When gdbserver talks to gdb over its own stdin/stdout there is no room on
++     that connection for the program's output; send it to stderr and give the
++     program /dev/null to read.  */
++  if (remote_connection_is_stdio ())
++    {
++      if (close (0) < 0)
++	trace_start_error_with_name ("close");
++      if (open ("/dev/null", O_RDONLY) < 0)
++	trace_start_error_with_name ("open");
++      if (dup2 (2, 1) < 0)
++	trace_start_error_with_name ("dup2");
++      if (write (2, "stdin/stdout redirected\n",
++		 sizeof ("stdin/stdout redirected\n") - 1) < 0)
++	{
++	  /* Errors ignored.  */
++	}
++    }
++}
++
++int
++likeos_process_target::create_inferior (const char *program,
++					const std::string &program_args)
++{
++  pid_t pid = fork_inferior (program, program_args.c_str (),
++			     get_environ ()->envp (), likeos_ptrace_fun,
++			     nullptr, nullptr, nullptr, nullptr);
++
++  process_info *proc = add_process (pid, 0);
++
++  proc->priv = new process_info_private;
++  x86_low_init_dregs (&proc->priv->debug_reg_state);
++
++  post_fork_inferior (pid, program);
++
++  return pid;
++}
++
++void
++likeos_process_target::post_create_inferior ()
++{
++  process_info *proc = current_process ();
++
++  if (proc == nullptr)
++    return;
++
++  likeos_set_trace_options (proc);
++  likeos_arch_setup (proc);
++  likeos_update_threads (proc, current_thread != nullptr ? current_thread->id
++							 : null_ptid);
++}
++
++int
++likeos_process_target::attach (unsigned long pid)
++{
++  if (ptrace (PT_ATTACH, pid, nullptr, 0) != 0)
++    return -1;
++
++  process_info *proc = add_process (pid, 1);
++
++  proc->priv = new process_info_private;
++  x86_low_init_dregs (&proc->priv->debug_reg_state);
++
++  /* Whole-process, as PTRACE_ATTACH already is on this system: it takes the
++     thread group, because a debugger attaches to a PROCESS.  Asking for the
++     events here rather than leaving it to post_create_inferior -- which the
++     attach path never reaches -- is what stops an attached process being
++     traced with no options at all: no thread announced, no thread reported
++     gone, and an exec swapping the program out in silence.  */
++  likeos_set_trace_options (proc);
++
++  /* The leader, so that the wait the caller is about to do has a thread to
++     attribute its stop to.  The rest are added by likeos_update_threads at
++     that stop, which is the first moment the kernel's thread list can be
++     read and trusted -- until then the process is still running and any
++     answer is out of date before it is used.  */
++  ptid_t leader = ptid_t ((int) pid, (long) pid);
++
++  proc->add_thread (leader, nullptr);
++  switch_to_thread (proc->find_thread (leader));
++
++  likeos_arch_setup (proc);
++
++  return 0;
++}
++
++int
++likeos_process_target::kill (process_info *proc)
++{
++  pid_t pid = proc->pid;
++
++  if (ptrace (PT_KILL, pid, nullptr, 0) == -1)
++    return -1;
++
++  int status;
++
++  if (gdb::waitpid (pid, &status, 0) == -1)
++    return -1;
++
++  mourn (proc);
++  return 0;
++}
++
++int
++likeos_process_target::detach (process_info *proc)
++{
++  /* The kernel's detach releases the whole thread group: every trace stop
++     parks all of it, and the siblings are parked silently, so a detach that
++     let one thread go would leave the rest in TASK_STOPPED with no tracer
++     left to continue them.  */
++  ptrace (PT_DETACH, proc->pid, nullptr, 0);
++  mourn (proc);
++  return 0;
++}
++
++void
++likeos_process_target::mourn (struct process_info *proc)
++{
++  proc->for_each_thread ([proc] (thread_info *thread)
++    {
++      proc->remove_thread (thread);
++    });
++
++  delete proc->priv;
++  proc->priv = nullptr;
++
++  remove_process (proc);
++}
++
++void
++likeos_process_target::join (int pid)
++{
++  /* PT_DETACH is the whole of letting go here; there is nothing left to
++     wait for.  */
++}
++
++bool
++likeos_process_target::thread_alive (ptid_t ptid)
++{
++  pid_t tid = (pid_t) (ptid.lwp () != 0 ? ptid.lwp () : ptid.pid ());
++
++  return likeos_lwp_of_process (ptid.pid (), tid);
++}
++
++/* Resume, which on this system always means resume the whole process.
++
++   Every thread of a traced process stops together -- the kernel parks the
++   siblings when any one of them stops -- and its PT_CONT and PT_STEP both
++   release the whole group, whichever member they are aimed at.  A step
++   therefore differs only in which thread gets the trap flag; the others run
++   as well, because there is no mechanism here to hold them.
++
++   The request is aimed at the thread that STOPPED rather than at the thread
++   group leader, and that is not cosmetic: the kernel refuses to resume a task
++   that is not itself stopped, so naming the leader would fail outright for a
++   leader that had already exited while its threads ran on.  Any stopped
++   member releases the group, and the reporting thread is the one member known
++   to be stopped.  */
++
++void
++likeos_process_target::resume (thread_resume *resume_info, size_t n)
++{
++  ptid_t resume_ptid = resume_info[0].thread;
++  const int signal = resume_info[0].sig;
++
++  /* resume_stop is a request to STOP a thread, not to let it run.  Everything
++     is already stopped here -- a trace stop parks the whole group -- so there
++     is nothing to do, and doing the default thing instead would resume the
++     process gdb had just asked to hold still.  */
++  if (resume_info[0].kind == resume_stop)
++    return;
++
++  const bool step = resume_info[0].kind == resume_step;
++
++  /* Work out which TASK to aim the request at.
++
++     The lwp half of the ptid is a task id only when it is positive.  gdb also
++     uses it as a wildcard, and both spellings arrive here: minus_one_ptid is
++     "everything", (pid, 0) is "the process", and (pid, -1) -- which is what
++     `vCont;c:p<pid>.-1' decodes to and what gdb sends for an ordinary continue
++     once multiprocess is in play -- is "every thread of that process".  Passing
++     one of those to ptrace looks up a task numbered 0 or 0xFFFFFFFF, finds
++     nothing, and fails with ESRCH; gdbserver then reports "ptrace: No such
++     process", replies E01 to the continue, and the inferior is never resumed at
++     all, so gdb waits for a stop that cannot come.
++
++     A wildcard becomes the thread whose stop is being answered, or that
++     process's leader if only a process is selected.  Aiming at the reporting
++     thread rather than at the leader is deliberate: the kernel refuses to
++     resume a task that is not itself stopped, and any stopped member releases
++     the whole group.  */
++  if (resume_ptid == minus_one_ptid || resume_ptid.lwp () <= 0)
++    {
++      if (current_thread != nullptr)
++	resume_ptid = current_thread->id;
++      else
++	{
++	  process_info *proc = current_process ();
++
++	  if (proc == nullptr)
++	    return;
++	  resume_ptid = ptid_t (proc->pid, proc->pid);
++	}
++    }
++
++  const pid_t pid = resume_ptid.pid ();
++  const pid_t lwp = (pid_t) (resume_ptid.lwp () > 0 ? resume_ptid.lwp ()
++			     : pid);
++
++  regcache_invalidate_pid (pid);
++
++  errno = 0;
++  ptrace (step ? PT_STEP : PT_CONTINUE, lwp, (void *) 1, signal);
++  if (errno != 0)
++    perror_with_name ("ptrace");
++}
++
++/* Translate a wait(2) status into gdbserver's own.  */
++
++static void
++likeos_store_waitstatus (struct target_waitstatus *ourstatus, int hoststatus)
++{
++  if (WIFEXITED (hoststatus))
++    ourstatus->set_exited (WEXITSTATUS (hoststatus));
++  else if (!WIFSTOPPED (hoststatus))
++    ourstatus->set_signalled (gdb_signal_from_host (WTERMSIG (hoststatus)));
++  else
++    ourstatus->set_stopped (gdb_signal_from_host (WSTOPSIG (hoststatus)));
++}
++
++/* One turn of the wait loop: collect the next status and say which TASK it
++   belongs to.  Returns 0 if there was nothing to collect and WNOHANG was
++   asked for, and the task id otherwise.  */
++
++static pid_t
++likeos_waitpid (struct target_waitstatus *ourstatus,
++		target_wait_flags target_options)
++{
++  int status;
++  int options = (target_options & TARGET_WNOHANG) ? WNOHANG : 0;
++
++  /* Waited for with -1 rather than with the process id, and that is not a
++     shortcut: the kernel's waitpid matches a POSITIVE selector against the
++     TASK id, so waiting for the process would report only the thread group
++     leader and every stop belonging to any other thread would sit
++     uncollected.  gdb's native target reaches the same place by passing
++     minus_one_ptid down from infrun.  */
++  pid_t pid = gdb::waitpid (-1, &status, options);
++
++  if (pid == -1)
++    perror_with_name ("Child process unexpectedly missing");
++
++  if (pid == 0)
++    return 0;
++
++  likeos_store_waitstatus (ourstatus, status);
++  return pid;
++}
++
++ptid_t
++likeos_process_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
++			     target_wait_flags target_options)
++{
++  while (true)
++    {
++      pid_t tid = likeos_waitpid (ourstatus, target_options);
++
++      if (tid == 0)
++	{
++	  gdb_assert (target_options & TARGET_WNOHANG);
++	  ourstatus->set_ignore ();
++	  return null_ptid;
++	}
++
++      /* What came back is a TASK id.  For a single-threaded process it is
++	 also the process id; for a thread it is not, and treating it as one
++	 would name a process that does not exist.  */
++      process_info *proc = find_process_pid (tid);
++      pid_t pid = tid;
++
++      /* A thread already in the list is matched from the list rather than
++	 from the kernel, because the kernel's answer changes underneath this:
++	 a thread that has just died is no longer in its group's ring, and the
++	 status being collected here may well be its death.  */
++      if (proc == nullptr)
++	for (process_info &p : all_processes)
++	  if (p.find_thread (ptid_t (p.pid, tid)) != nullptr)
++	    {
++	      proc = &p;
++	      pid = p.pid;
++	      break;
++	    }
++
++      /* A thread this session has not met yet: ask the kernel whose it is.
++	 The list is built from the process's thread-group ring, so a forked
++	 child -- which is stopped along with its parent -- is not in it.  */
++      if (proc == nullptr)
++	for (process_info &p : all_processes)
++	  if (likeos_lwp_of_process (p.pid, tid))
++	    {
++	      proc = &p;
++	      pid = p.pid;
++	      break;
++	    }
++
++      if (proc == nullptr)
++	{
++	  /* A task that belongs to no inferior of this session.  Two things
++	     arrive here: the forked child of a traced process, which this port
++	     never follows and which must be released or the shell that forked
++	     it waits for a child that never starts; and the final exit status
++	     of a thread whose PTRACE_EVENT_EXIT was already handled, which has
++	     nothing left to report it against.  */
++	  if (ourstatus->kind () == TARGET_WAITKIND_STOPPED)
++	    (void) ptrace (PT_CONTINUE, tid, nullptr, 0);
++	  continue;
++	}
++
++      ptid_t wptid = ptid_t (pid, tid);
++
++      /* A whole process going away is reported against the process, not
++	 against one of its threads: the thread list is about to be torn down
++	 and the leader's id is what the rest of gdbserver holds.  */
++      if (ourstatus->kind () == TARGET_WAITKIND_EXITED
++	  || ourstatus->kind () == TARGET_WAITKIND_SIGNALLED)
++	return ptid_t (pid, pid);
++
++      if (proc->find_thread (wptid) == nullptr)
++	proc->add_thread (wptid, nullptr);
++
++      switch_to_thread (proc->find_thread (wptid));
++
++      /* Every stop parks the whole process, so this is the one moment at
++	 which the kernel's thread list can be read and trusted.  */
++      likeos_update_threads (proc, wptid);
++
++      /* WHY it stopped, when the stop is an event rather than a signal.
++
++	 All of these arrive as SIGTRAP, so without asking they are
++	 indistinguishable from a breakpoint: a new thread looks like a trap
++	 in whichever thread created it, and an exec looks like a trap at an
++	 address that no longer means anything.  */
++      if (ourstatus->kind () != TARGET_WAITKIND_STOPPED
++	  || ourstatus->sig () != GDB_SIGNAL_TRAP
++	  || !likeos_wants_trace_events (proc))
++	return wptid;
++
++      int event = ptrace (PT_GETEVENT, tid, nullptr, 0);
++      unsigned long msg = 0;
++
++      /* The event's value comes back through DATA, not ADDR.  GETEVENTMSG is
++	 the one request on this system whose pointer argument is DATA --
++	 <sys/ptrace.h> says so -- and passing it in ADDR does not fail
++	 loudly: the kernel finds a null pointer in DATA, refuses it, and MSG
++	 is left at zero.  Every event that is only actionable together with
++	 its value then quietly does nothing.  */
++      if (event > 0)
++	ptrace (PT_GETEVENTMSG, tid, nullptr, (long) &msg);
++
++      switch (event)
++	{
++	case PTRACE_EVENT_CLONE:
++	  /* A new thread of this same process.  The stop belongs to the
++	     target and not to the user: it exists so the thread can be
++	     registered before it runs, and reporting it upwards surfaces as
++	     `received signal SIGTRAP' inside clone(), one per thread.  */
++	  if (msg != 0)
++	    {
++	      ptid_t new_thread = ptid_t (pid, (long) msg);
++
++	      if (proc->find_thread (new_thread) == nullptr)
++		proc->add_thread (new_thread, nullptr);
++	    }
++
++	  (void) ptrace (PT_CONTINUE, tid, nullptr, 0);
++	  continue;
++
++	case PTRACE_EVENT_EXIT:
++	  /* A thread about to die, stopped so that it can be said so while it
++	     still exists.  Resumed BEFORE it is dropped, and the result
++	     ignored: once it is out of the list there is no thread left to
++	     attribute anything to, so nothing from here on may be returned
++	     upwards, a failure included.
++
++	     The process's own leader is left alone.  Its death is the death
++	     of the inferior, which arrives as an ordinary exit status.  */
++	  (void) ptrace (PT_CONTINUE, tid, nullptr, 0);
++
++	  if (tid != pid)
++	    {
++	      thread_info *dying = proc->find_thread (wptid);
++	      thread_info *leader = proc->find_thread (ptid_t (pid, pid));
++
++	      /* Off the dying thread first: current_thread must not be the one
++		 being removed, and the leader is the one thread of a process
++		 that is certainly still there.  */
++	      if (dying != nullptr && leader != nullptr)
++		{
++		  switch_to_thread (leader);
++		  proc->remove_thread (dying);
++		}
++	    }
++
++	  continue;
++
++	case PTRACE_EVENT_EXEC:
++	  {
++	    /* The NEW program's path, which gdb opens to read symbols from.
++	       An empty string here is taken at face value on the other end:
++	       "process N is executing new program: " with nothing after it,
++	       and an inferior with no symbols after every exec.  */
++	    const char *execd = pid_to_exec_file (tid);
++
++	    ourstatus->set_execd (make_unique_xstrdup (execd != nullptr
++						       ? execd : ""));
++	  }
++	  return wptid;
++
++	default:
++	  return wptid;
++	}
++    }
++}
++
++/* Registers are THREAD state, so these two use likeos_current_tid and not the
++   process: two threads stopped at different places have different values for
++   every one of them.  gdbserver only reaches here through a per-thread
++   regcache, so the current thread is always set -- checked rather than assumed
++   because the cost of being wrong is a null dereference.  */
++
++void
++likeos_process_target::fetch_registers (struct regcache *regcache, int regno)
++{
++  pid_t tid = likeos_current_tid ();
++  struct ptrace_regs regs;
++
++  if (tid == 0)
++    error ("no thread selected to read registers from");
++
++  /* The whole block, whichever register was asked for: it arrives in one
++     request, so fetching a single one would cost exactly the same.  */
++  likeos_fetch_gregs (tid, &regs);
++
++  const unsigned long *slots = (const unsigned long *) &regs;
++
++  for (size_t i = 0; i < ARRAY_SIZE (likeos_gregs); i++)
++    supply_register (regcache, likeos_greg_regnum[i],
++		     &slots[likeos_gregs[i].slot]);
++
++  /* The floating-point block needs no translation at all: the kernel reports
++     an FXSAVE image and this expects one.  */
++  struct ptrace_fpregs fpregs;
++
++  if (ptrace (PT_GETFPREGS, tid, &fpregs, 0) == -1)
++    perror_with_name ("Couldn't get floating point status");
++
++  i387_fxsave_to_cache (regcache, &fpregs);
++}
++
++void
++likeos_process_target::store_registers (struct regcache *regcache, int regno)
++{
++  pid_t tid = likeos_current_tid ();
++  struct ptrace_regs regs;
++
++  if (tid == 0)
++    error ("no thread selected to write registers to");
++
++  /* Read before writing: one register may be being changed, and the rest of
++     the block has to go back unaltered.  */
++  likeos_fetch_gregs (tid, &regs);
++
++  unsigned long *slots = (unsigned long *) &regs;
++
++  for (size_t i = 0; i < ARRAY_SIZE (likeos_gregs); i++)
++    if (likeos_gregs[i].writable)
++      collect_register (regcache, likeos_greg_regnum[i],
++			&slots[likeos_gregs[i].slot]);
++
++  if (ptrace (PT_SETREGS, tid, &regs, 0) == -1)
++    perror_with_name ("Couldn't write registers");
++
++  struct ptrace_fpregs fpregs;
++
++  if (ptrace (PT_GETFPREGS, tid, &fpregs, 0) == -1)
++    perror_with_name ("Couldn't get floating point status");
++
++  i387_cache_to_fxsave (regcache, &fpregs);
++
++  if (ptrace (PT_SETFPREGS, tid, &fpregs, 0) == -1)
++    perror_with_name ("Couldn't write floating point status");
++}
++
++/* Memory, a word at a time.
++
++   There is no bulk transfer request on this system, so the ends of the range
++   are handled by reading the words they fall in and taking or replacing the
++   part that is wanted -- a write that rounded outwards instead would put back
++   bytes the caller never asked to change.  */
++
++static const int likeos_word = (int) sizeof (long);
++
++int
++likeos_process_target::read_memory (CORE_ADDR memaddr, unsigned char *myaddr,
++				    int len)
++{
++  if (len <= 0)
++    return 0;
++
++  pid_t tid = likeos_process_tid ();
++
++  if (tid == 0)
++    return ESRCH;
++
++  CORE_ADDR start = memaddr & ~(CORE_ADDR) (likeos_word - 1);
++  CORE_ADDR end = ((memaddr + len + likeos_word - 1)
++		   & ~(CORE_ADDR) (likeos_word - 1));
++  int count = (int) ((end - start) / likeos_word);
++  std::vector<long> buf (count);
++
++  for (int i = 0; i < count; i++)
++    {
++      errno = 0;
++      buf[i] = ptrace (PT_READ_D, tid,
++		       (void *) (uintptr_t) (start + i * likeos_word), 0);
++      if (buf[i] == -1 && errno != 0)
++	return errno;
++    }
++
++  memcpy (myaddr, (char *) buf.data () + (memaddr - start), len);
++  return 0;
++}
++
++int
++likeos_process_target::write_memory (CORE_ADDR memaddr,
++				     const unsigned char *myaddr, int len)
++{
++  if (len <= 0)
++    return 0;
++
++  pid_t tid = likeos_process_tid ();
++
++  if (tid == 0)
++    return ESRCH;
++
++  CORE_ADDR start = memaddr & ~(CORE_ADDR) (likeos_word - 1);
++  CORE_ADDR end = ((memaddr + len + likeos_word - 1)
++		   & ~(CORE_ADDR) (likeos_word - 1));
++  int count = (int) ((end - start) / likeos_word);
++  std::vector<long> buf (count);
++
++  /* Only the first and last words can be partial, and only those have to be
++     read first; the ones in between are overwritten whole.  */
++  for (int i = 0; i < count; i++)
++    {
++      if (i != 0 && i != count - 1)
++	continue;
++
++      errno = 0;
++      buf[i] = ptrace (PT_READ_D, tid,
++		       (void *) (uintptr_t) (start + i * likeos_word), 0);
++      if (buf[i] == -1 && errno != 0)
++	return errno;
++    }
++
++  memcpy ((char *) buf.data () + (memaddr - start), myaddr, len);
++
++  for (int i = 0; i < count; i++)
++    if (ptrace (PT_WRITE_D, tid,
++		(void *) (uintptr_t) (start + i * likeos_word), buf[i]) == -1)
++      return errno;
++
++  return 0;
++}
++
++void
++likeos_process_target::request_interrupt ()
++{
++  thread_info *thread = get_first_thread ();
++
++  if (thread == nullptr)
++    return;
++
++  ::kill (thread->id.pid (), SIGINT);
++}
++
++bool
++likeos_process_target::supports_read_auxv ()
++{
++  return true;
++}
++
++/* Hand out the inferior's auxiliary vector.
++
++   This is what tells gdb where a position-independent executable actually
++   landed.  Without it every address reported for the main program is the
++   link-time one: `break main' resolves to a small offset, the breakpoint
++   cannot be written because nothing is mapped there, and the session is
++   useless even though the process is running perfectly well.  solib-svr4
++   reads AT_ENTRY out of this vector, subtracts the e_entry in the file on
++   disk, and relocates the symbol table by the difference.  */
++
++int
++likeos_process_target::read_auxv (int pid, CORE_ADDR offset,
++				  unsigned char *myaddr, unsigned int len)
++{
++  /* Fetched whole and then sliced, because the request is for a window of a
++     block the kernel only reports in full.  It is a few dozen bytes -- a
++     handful of 16-byte entries -- so there is nothing to be gained by being
++     cleverer.  */
++  unsigned char buf[512];
++  long n = ptrace (PT_GETAUXV, pid, buf, (long) sizeof (buf));
++
++  if (n < 0)
++    return -1;
++
++  /* Zero is not a failure: a process stopped at PTRACE_TRACEME has not
++     exec'd yet and genuinely has no vector.  */
++  if ((unsigned long) n <= offset)
++    return 0;
++
++  unsigned long avail = (unsigned long) n - offset;
++
++  if (len > avail)
++    len = avail;
++
++  memcpy (myaddr, buf + offset, len);
++  return len;
++}
++
++bool
++likeos_process_target::supports_hardware_single_step ()
++{
++  return true;
++}
++
++const gdb_byte *
++likeos_process_target::sw_breakpoint_from_kind (int kind, int *size)
++{
++  static gdb_byte brkpt[] = { 0xCC };
++
++  *size = sizeof (brkpt);
++  return brkpt;
++}
++
++bool
++likeos_process_target::supports_z_point_type (char z_type)
++{
++  switch (z_type)
++    {
++    case Z_PACKET_SW_BP:
++    case Z_PACKET_HW_BP:
++    case Z_PACKET_WRITE_WP:
++    case Z_PACKET_ACCESS_WP:
++      return true;
++    default:
++      /* A read-only watchpoint is missing on purpose: x86 debug registers
++	 have no "on read but not on write" condition, so claiming it would be
++	 claiming something the hardware cannot do.  */
++      return false;
++    }
++}
++
++int
++likeos_process_target::insert_point (enum raw_bkpt_type type, CORE_ADDR addr,
++				     int size, struct raw_breakpoint *bp)
++{
++  switch (type)
++    {
++    case raw_bkpt_type_sw:
++      return insert_memory_breakpoint (bp);
++
++    case raw_bkpt_type_hw:
++    case raw_bkpt_type_write_wp:
++    case raw_bkpt_type_access_wp:
++      {
++	enum target_hw_bp_type hw_type
++	  = raw_bkpt_type_to_target_hw_bp_type (type);
++	struct x86_debug_reg_state *state = likeos_debug_reg_state ();
++
++	if (state == nullptr)
++	  return 1;
++
++	return x86_dr_insert_watchpoint (state, hw_type, addr, size);
++      }
++
++    default:
++      return 1;
++    }
++}
++
++int
++likeos_process_target::remove_point (enum raw_bkpt_type type, CORE_ADDR addr,
++				     int size, struct raw_breakpoint *bp)
++{
++  switch (type)
++    {
++    case raw_bkpt_type_sw:
++      return remove_memory_breakpoint (bp);
++
++    case raw_bkpt_type_hw:
++    case raw_bkpt_type_write_wp:
++    case raw_bkpt_type_access_wp:
++      {
++	enum target_hw_bp_type hw_type
++	  = raw_bkpt_type_to_target_hw_bp_type (type);
++	struct x86_debug_reg_state *state = likeos_debug_reg_state ();
++
++	if (state == nullptr)
++	  return 1;
++
++	return x86_dr_remove_watchpoint (state, hw_type, addr, size);
++      }
++
++    default:
++      return 1;
++    }
++}
++
++bool
++likeos_process_target::stopped_by_watchpoint ()
++{
++  struct x86_debug_reg_state *state = likeos_debug_reg_state ();
++
++  return state != nullptr && x86_dr_stopped_by_watchpoint (state);
++}
++
++CORE_ADDR
++likeos_process_target::stopped_data_address ()
++{
++  struct x86_debug_reg_state *state = likeos_debug_reg_state ();
++  CORE_ADDR addr;
++
++  if (state != nullptr && x86_dr_stopped_data_address (state, &addr))
++    return addr;
++
++  return 0;
++}
++
++bool
++likeos_process_target::supports_qxfer_siginfo ()
++{
++  return true;
++}
++
++/* $_siginfo -- WHY the inferior stopped, not just which signal.  si_code and
++   si_addr are the difference between "SIGSEGV" and "wrote to 0x1, which is
++   not mapped".  */
++
++int
++likeos_process_target::qxfer_siginfo (const char *annex,
++				      unsigned char *readbuf,
++				      unsigned const char *writebuf,
++				      CORE_ADDR offset, int len)
++{
++  if (current_thread == nullptr)
++    return -1;
++
++  /* Read-only.  The kernel keeps this for the signal a tracee is stopped for
++     and rebuilds it at the next stop, so a write would be discarded rather
++     than honoured -- and answering "unsupported" is how a target says so.  */
++  if (writebuf != nullptr)
++    return -2;
++
++  pid_t tid = likeos_current_tid ();
++  siginfo_t siginfo;
++
++  if (tid == 0 || offset >= sizeof (siginfo))
++    return -1;
++
++  if (ptrace (PT_GETSIGINFO, tid, &siginfo, 0) == -1)
++    return -1;
++
++  unsigned long avail = sizeof (siginfo) - offset;
++
++  if ((unsigned long) len > avail)
++    len = avail;
++
++  memcpy (readbuf, (char *) &siginfo + offset, len);
++  return len;
++}
++
++bool
++likeos_process_target::supports_non_stop ()
++{
++  /* Every trace stop parks the whole thread group, so a thread cannot be
++     examined while its siblings run.  All-stop is what the kernel offers.  */
++  return false;
++}
++
++bool
++likeos_process_target::supports_multi_process ()
++{
++  return true;
++}
++
++bool
++likeos_process_target::supports_exec_events ()
++{
++  return true;
++}
++
++bool
++likeos_process_target::supports_disable_randomization ()
++{
++  return false;
++}
++
++bool
++likeos_process_target::supports_pid_to_exec_file ()
++{
++  return true;
++}
++
++/* The executable a process is running.
++
++   This is what makes attaching useful: gdb asks for it right after an attach
++   and reads symbols from whatever comes back.  The process name is only a
++   basename and argv[0] is whatever the program was invoked as -- a login
++   shell's is "-bash", which names no file at all -- so neither can stand in
++   for it.  Systems with a per-process filesystem read /proc/PID/exe; this one
++   asks the kernel.  */
++
++const char *
++likeos_process_target::pid_to_exec_file (int pid)
++{
++  static char path[512];
++
++  errno = 0;
++  long n = ptrace (PT_GETEXECPATH, pid, path, (long) sizeof (path));
++
++  /* Zero is a real answer -- a task that has not exec'd has no executable --
++     and so is a failure; both mean "cannot tell you".  */
++  if (n <= 0)
++    return nullptr;
++
++  return path;
++}
++
++/* The singleton target, and the only thing server.cc asks this file for.  */
++
++static likeos_process_target the_likeos_target;
++
++void
++initialize_low ()
++{
++  set_target_ops (&the_likeos_target);
++}

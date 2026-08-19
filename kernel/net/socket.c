@@ -769,15 +769,48 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 		if (s->tcp->state != TCP_STATE_ESTABLISHED)
 			return -EPIPE;
 
-		// tcp_send_data may return 0 when the inflight queue is full.  POSIX
-		// forbids returning 0 from send() with non-zero len (callers treat it
-		// as EOF), so block until at least one byte gets queued, or report
-		// EAGAIN for nonblocking sockets.
-		uint16_t to_send = len > 0xFFFF ? 0xFFFF : (uint16_t)len;
-		if (to_send == 0)
+		/* Send the WHOLE buffer before returning, not just the part
+		 * that happened to fit.
+		 *
+		 * tcp_send_data queues what the congestion window, the peer's
+		 * receive window and the inflight ring allow, and reports that
+		 * -- which for a large write is a fraction of it.  Returning
+		 * that count is legal for send(2), but it is not what a
+		 * BLOCKING socket does anywhere else, and a great deal of
+		 * software is written against the behaviour rather than the
+		 * standard: gdbserver's putpkt writes a packet with one
+		 * write() and treats any short count as a failure, so a
+		 * session died the moment gdb asked for anything larger than
+		 * the congestion window -- reported as "putpkt(write): No such
+		 * file or directory", the errno being stale because there was
+		 * no error, only a short write.
+		 *
+		 * The 64K clamp below is the same trap in a second form:
+		 * tcp_send_data takes a uint16_t, so a write larger than that
+		 * was ALWAYS short, however open the window was.  It is now a
+		 * chunk size rather than a limit.
+		 *
+		 * Three things end the loop early, and each returns the count
+		 * so far rather than an error, because bytes already queued
+		 * have been sent and the caller must be told so:
+		 *   - an error from TCP: reported on the next call, when there
+		 *     is nothing left to lose by reporting it;
+		 *   - a nonblocking socket with a full window: EAGAIN only if
+		 *     nothing at all went out;
+		 *   - a pending signal.  The old loop had no escape at all: a
+		 *     task whose peer stopped reading spun on
+		 *     sched_yield_in_kernel() for ever and could not even be
+		 *     killed. */
+		if (len == 0)
 			return 0;
 
-		for (;;) {
+		size_t total = 0;
+
+		while (total < len) {
+			size_t remain = len - total;
+			uint16_t to_send = remain > 0xFFFF ? 0xFFFF :
+							     (uint16_t)remain;
+
 			// Re-snapshot s->tcp under s->lock each iteration and take
 			// a reference on it, so a concurrent sock_close() (which
 			// detaches s->tcp and drops the socket reference) cannot
@@ -795,30 +828,41 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 			if (!conn || !connected) {
 				if (conn)
 					tcp_conn_release(conn);
-				return -ENOTCONN;
+				return total ? (int)total : -ENOTCONN;
 			}
 			if (conn->state != TCP_STATE_ESTABLISHED) {
 				tcp_conn_release(conn);
-				return -EPIPE;
+				return total ? (int)total : -EPIPE;
 			}
 
 			smap_disable();
-			int ret = tcp_send_data(conn, (const uint8_t *)buf,
-						to_send);
+			int ret = tcp_send_data(
+				conn, (const uint8_t *)buf + total, to_send);
 			smap_enable();
 			tcp_conn_release(conn);
 
 			if (ret < 0)
-				return ret;
-			if (ret > 0)
-				return ret;
+				return total ? (int)total : ret;
+			if (ret > 0) {
+				total += (size_t)ret;
+				continue;
+			}
 
+			/* Nothing fit: the window is closed or the inflight
+			 * ring is full. */
 			if (nonblock)
-				return -EAGAIN;
+				return total ? (int)total : -EAGAIN;
+
+			task_t *tx_cur = sched_current();
+
+			if (tx_cur && signal_pending(tx_cur))
+				return total ? (int)total : -EINTR;
 
 			loopback_process_pending();
 			sched_yield_in_kernel();
 		}
+
+		return (int)total;
 	}
 
 	// UDP send (connected)

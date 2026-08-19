@@ -5592,29 +5592,26 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			cur->syscall_r10 = 0;
 			cur->syscall_regs_valid = 1;
 
-			if (cur->tracer_pid != 0)
-				task_ptrace_stop(cur, SIGTRAP,
-						 PTRACE_EVENT_EXEC, 0);
-
-			/* Re-read after the stop: a tracer may have moved the
-			 * entry point or the stack with SETREGS while we were
-			 * parked, and the jump below is the only thing that
-			 * consults them. */
-			entry_point = cur->syscall_rip;
-			new_stack_ptr = cur->syscall_rsp;
-			new_rflags = cur->syscall_rflags;
-		}
-	}
-
-	// Set task comm from basename of path (or argv[0])
-	{
-		task_t *cur = sched_current();
-		if (cur) {
-			/* The FILE, absolute, before anything reduces it to a
-			 * basename.  Resolved against the working directory
-			 * this exec started from, because a debugger that
-			 * attaches later has a different one and a relative
-			 * path would name a different file (or none) by then. */
+			/* The executable path, BEFORE the stop below and not
+			 * after it.
+			 *
+			 * This is the same statement the register block above
+			 * makes -- the old image is gone -- and it has to be
+			 * made in the same place, because the stop is where a
+			 * debugger asks.  Set afterwards, PTRACE_GETEXECPATH at
+			 * an exec stop answered with the PREVIOUS program, and
+			 * a debugger took it at its word: gdb announced
+			 * "process N is executing new program: /bin/bash" for a
+			 * process about to execute something else entirely, then
+			 * loaded the wrong symbols for it.  Off by exactly one
+			 * exec, which is the hardest kind of wrong to notice --
+			 * the answer is always a real program that the process
+			 * really did run.
+			 *
+			 * Absolute, resolved against the working directory this
+			 * exec started from: a debugger that attaches later has
+			 * a different one, and a relative path would name a
+			 * different file (or none) by then. */
 			{
 				char full[256];
 				const char *base = (cur->cwd[0] != 0) ?
@@ -5633,6 +5630,27 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 				}
 			}
 
+			if (cur->tracer_pid != 0)
+				task_ptrace_stop(cur, SIGTRAP,
+						 PTRACE_EVENT_EXEC, 0);
+
+			/* Re-read after the stop: a tracer may have moved the
+			 * entry point or the stack with SETREGS while we were
+			 * parked, and the jump below is the only thing that
+			 * consults them. */
+			entry_point = cur->syscall_rip;
+			new_stack_ptr = cur->syscall_rsp;
+			new_rflags = cur->syscall_rflags;
+		}
+	}
+
+	// Set task comm from basename of path (or argv[0])
+	{
+		task_t *cur = sched_current();
+		if (cur) {
+			/* exe_path is NOT set here.  It is set above, before the
+			 * exec stop, because that is where a debugger reads it;
+			 * see the comment there. */
 			const char *src = kpath;
 			// Use basename
 			const char *p = src;
@@ -8529,13 +8547,14 @@ typedef struct {
 	uint64_t rax, rcx, rdx, rsi, rdi;
 	uint64_t rip, cs, rflags, rsp, ss;
 	uint64_t fs_base, gs_base;
+	uint64_t ds, es, fs, gs;
 } ptrace_regs_t;
 
 /* The two declarations live in different builds and cannot be checked against
  * each other directly, so both are pinned to the same size.  A field added to
  * one and forgotten in the other then fails to compile instead of silently
  * shifting every register a debugger reads. */
-_Static_assert(sizeof(ptrace_regs_t) == 22 * 8,
+_Static_assert(sizeof(ptrace_regs_t) == 26 * 8,
 	       "ptrace_regs_t must match struct ptrace_regs in sys/ptrace.h");
 
 /* Fill `out' with a stopped tracee's user registers.
@@ -8637,7 +8656,23 @@ static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
 		out->ss = 0x1B;
 	}
 
+	/* The segment BASES, which unlike the selectors are real per-task
+	 * state: FS's is where a thread's TLS block lives, and without it a
+	 * debugger cannot find a thread-local variable at all.  GS's is only
+	 * ever what the program asked for through arch_prctl -- the kernel
+	 * keeps %gs for its own per-CPU data and never installs it -- but that
+	 * is what a debugger wants to be told, and it used to be reported as
+	 * zero for every task because this line was missing. */
 	out->fs_base = t->fs_base;
+	out->gs_base = t->gs_base;
+
+	/* The data-segment SELECTORS, snapshotted on the way into the kernel.
+	 * Zero for a task that has never been to user mode, which is the true
+	 * answer for one that has no user context to report. */
+	out->ds = t->useg_ds;
+	out->es = t->useg_es;
+	out->fs = t->useg_fs;
+	out->gs = t->useg_gs;
 }
 
 /* Write a tracee's user registers back.
@@ -8732,6 +8767,26 @@ static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
 		t->syscall_r9 = in->r9;
 		t->syscall_r10 = in->r10;
 	}
+
+	/* The segment bases are task state rather than frame state, so they are
+	 * written the same way whichever frame the tracee stopped with.  FS's
+	 * is applied by the context switch when the tracee runs again.
+	 *
+	 * Refused above the user half for the reason ARCH_SET_FS refuses it:
+	 * an FS base in the kernel half turns every `mov %fs:0x28, %rax' in
+	 * libc into a fault at a kernel address.  That costs a tracer nothing
+	 * it did not already have -- it can already write any register and any
+	 * mapped byte -- and it keeps one way of setting the base from being
+	 * weaker than the other.
+	 *
+	 * The four data-segment SELECTORS are deliberately not written, for the
+	 * same reason CS and SS are not: nothing restores them on the way back
+	 * to user mode, so a value accepted here would be a value that never
+	 * took effect.  See the useg_* fields in <ke/sched.h>. */
+	if (in->fs_base == 0 || (in->fs_base >> 47) == 0)
+		task_set_fs_base(t, in->fs_base);
+	if (in->gs_base == 0 || (in->gs_base >> 47) == 0)
+		t->gs_base = in->gs_base;
 	return 0;
 }
 
@@ -12450,6 +12505,11 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 	cpu->current_syscall_nr = (int)num;
 
 	if (cur && cur->privilege == TASK_USER) {
+		/* The data-segment selectors, before anything else runs.  Only
+		 * a debugger asks for them, but the moment of entry is the only
+		 * moment at which they are still the program's. */
+		task_capture_user_segments(cur);
+
 		// Read from per-CPU storage (set by syscall_entry in assembly)
 		cur->syscall_rsp = cpu->syscall_user_rsp;
 		cur->syscall_rip = cpu->syscall_saved_user_rip;

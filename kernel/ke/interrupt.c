@@ -1490,6 +1490,12 @@ void exception_handler(uint64_t *regs)
 	uint64_t cs = regs[REGS_CS];
 	int user_mode = (cs & 0x3) == 0x3;
 
+	/* The user's data-segment selectors, while they are still the user's.
+	 * A trap or a fault is where a debugger's tracee most often stops, and
+	 * this is the last point before kernel code could disturb them. */
+	if (user_mode)
+		task_capture_user_segments(sched_current());
+
 	/* INT 2 (NMI): if this NMI is a diagnostic probe armed by another CPU
      * via smp_tlb_shootdown_sync's timeout path, record this CPU's state
      * and return.  Only real, un-armed NMIs fall through to the
@@ -1861,6 +1867,13 @@ void irq_handler(uint64_t *regs)
 	uint64_t int_no = regs[REGS_INTNO];
 	WARN_RATELIMIT(int_no >= 256, "irq_handler: bogus int_no=%lu", int_no);
 	uint8_t irq = (uint8_t)(int_no - 32);
+
+	/* Same as in exception_handler, and it has to be here rather than
+	 * beside the preemption check further down: the device branches below
+	 * return early, and a task preempted by the timer can just as easily be
+	 * one that a debugger group-stops a moment later. */
+	if ((regs[REGS_CS] & 0x3) == 0x3)
+		task_capture_user_segments(sched_current());
 
 	g_total_irq_count++;
 

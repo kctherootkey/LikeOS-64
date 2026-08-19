@@ -5,11 +5,13 @@
 # build/.  Two stamps record how far that has got, so touching a patch
 # re-unpacks and reconfigures while touching nothing rebuilds only what changed.
 #
-# Output: build/gdb/gdb
+# Output: build/gdb/gdb and build/gdbserver/gdbserver
 #
-# gdbserver is NOT built here.  It configures as a separate target and needs its
-# own low-level module; the native debugger is the thing worth having first, and
-# it is what the ptrace work in the kernel was for.
+# gdbserver is a second program built from the same tree, and whether the tree
+# builds it at all is decided by gdbserver/configure.srv: the TOP-LEVEL
+# configure sources that file and drops gdbserver from the subdirectory list if
+# it names no entry for the host.  So adding the entry (patch 0004) is what
+# turns it on, and this makefile only has to ask for the target.
 
 SRC_STAMP := .likeos-unpacked
 STAMP     := .likeos-configured
@@ -24,6 +26,7 @@ TOOLBIN := $(CURDIR)/toolbin
 
 all: $(STAMP)
 	PATH="$(TOOLBIN):$$PATH" $(MAKE) -C build all-gdb
+	PATH="$(TOOLBIN):$$PATH" $(MAKE) -C build all-gdbserver
 
 # Re-unpack whenever the tarball or any patch changes.  --force because src/
 # exists by then and unpack.sh will not overwrite it silently.

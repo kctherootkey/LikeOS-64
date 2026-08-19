@@ -3425,6 +3425,12 @@ static void test_ptrace_permission_denied(void)
  * a tracee: the write has to land in the child's copy and nowhere else. */
 static volatile unsigned long g_ptrace_probe = 0xC0FFEEUL;
 
+/* A GS base no part of the system would choose on its own, in the user half of
+ * the address space (arch_prctl refuses anything above it, for the same reason
+ * an FS base there would be refused).  The tracee sets it; the tracer reads it
+ * back out of PTRACE_GETREGS. */
+#define PTRACE_GSBASE_MAGIC 0x7EAD0000UL
+
 static void test_ptrace_regs_and_mem(void)
 {
 	printf("\n[TEST] ptrace registers and memory\n");
@@ -3447,6 +3453,13 @@ static void test_ptrace_regs_and_mem(void)
 
 	if (pid == 0) {
 		close(pfd[0]);
+		/* Ask for a GS base, so the tracer's GETREGS has something to
+		 * report that only this process could have chosen.  The kernel
+		 * keeps %gs for its own per-CPU data and never installs this,
+		 * but it records it -- and used to leave it out of GETREGS
+		 * entirely, which read as "every task has a zero GS base"
+		 * rather than as a missing field. */
+		arch_prctl(ARCH_SET_GS, PTRACE_GSBASE_MAGIC);
 		/* Spin until the value changes underneath us, then report what
 		 * we saw.  Bounded so a failure is a failed test, not a hang. */
 		for (int i = 0; i < 400 && g_ptrace_probe == 0xC0FFEEUL; i++)
@@ -3484,6 +3497,29 @@ static void test_ptrace_regs_and_mem(void)
 		    got && r.rip > 0x1000UL && r.rip < 0x800000000000UL);
 	test_result("GETREGS reports a user-range RSP",
 		    got && r.rsp > 0x1000UL && r.rsp < 0x800000000000UL);
+
+	/* --- segment state --- */
+
+	/* The thread pointer.  Every process here has one, because libc's
+	 * per-thread block -- errno, the stack canary -- lives at it. */
+	test_result("GETREGS reports a user-range FS base (the TLS block)",
+		    got && r.fs_base > 0x1000UL &&
+			    r.fs_base < 0x800000000000UL);
+
+	/* What the tracee asked for, read back from outside it. */
+	test_result("GETREGS reports the GS base the tracee set",
+		    got && r.gs_base == PTRACE_GSBASE_MAGIC);
+
+	/* The data-segment selectors.  A ring-0 selector here would mean the
+	 * capture happened somewhere other than the entry from user mode --
+	 * IRETQ to CPL 3 nulls any selector whose descriptor is more
+	 * privileged than the caller, so a program can only ever be running
+	 * with zero or a ring-3 selector in these. */
+	test_result("GETREGS reports no ring-0 data selector",
+		    got && (r.ds == 0 || (r.ds & 3) == 3) &&
+			    (r.es == 0 || (r.es & 3) == 3) &&
+			    (r.fs == 0 || (r.fs & 3) == 3) &&
+			    (r.gs == 0 || (r.gs & 3) == 3));
 
 	/* --- reading the tracee --- */
 	errno = 0;
@@ -4244,6 +4280,51 @@ static void test_ptrace_execpath(void)
 	ptrace(PTRACE_DETACH, pid, NULL, 0);
 	kill(pid, SIGKILL);
 	waitpid(pid, &st, 0);
+
+	/* At an EXEC STOP the path must name the program being exec'd TO.
+	 *
+	 * The exec stop exists so a debugger can act before the new program's
+	 * first instruction, and what it asks first is which program that is.
+	 * The kernel used to record exe_path AFTER raising the stop, so the
+	 * answer was the PREVIOUS image -- off by exactly one exec, which is
+	 * the hardest kind of wrong to notice, because it is always a real
+	 * program the process really did run.  gdb believed it: "process N is
+	 * executing new program: /bin/bash" for a process about to execute
+	 * something else, and the wrong symbols loaded to match.
+	 *
+	 * PTRACE_TRACEME then execve is the shortest way to stand at that stop:
+	 * the exec itself raises it, so the parent's first wait lands exactly
+	 * there.  /bin/true because it is the smallest program on the image
+	 * that is certainly present, and because its path cannot be confused
+	 * with this one. */
+	pid_t ep = fork();
+
+	if (ep < 0) {
+		test_fail("execpath: fork for the exec stop failed");
+		return;
+	}
+	if (ep == 0) {
+		ptrace(PTRACE_TRACEME, 0, NULL, 0);
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(127);
+	}
+
+	int est = 0;
+
+	if (ptrace_wait_bounded(ep, &est, 2000) <= 0) {
+		test_fail("execpath: the exec stop never arrived");
+	} else {
+		char epath[512];
+		long en = ptrace(PTRACE_GETEXECPATH, ep, epath,
+				 (long)sizeof(epath));
+
+		test_result(
+			"GETEXECPATH at an exec stop names the NEW program",
+			en > 0 && strcmp(epath, "/bin/true") == 0);
+	}
+
+	kill(ep, SIGKILL);
+	waitpid(ep, &est, 0);
 }
 
 /* A fatal signal ends the PROCESS, not the thread that took it.
@@ -21320,6 +21401,90 @@ network_section:
 			close(cli);
 			close(srv);
 		}
+	}
+
+	{
+		/* One blocking write() must send the WHOLE buffer -------------
+		 *
+		 * tcp_send_data queues only what the congestion window, the
+		 * peer's window and the inflight ring allow, and a send that
+		 * returned that count was a SHORT WRITE on a blocking socket.
+		 * POSIX permits it; almost nothing is written against it.
+		 * gdbserver's putpkt writes a packet with a single write() and
+		 * treats any short count as a fatal error, so a remote
+		 * debugging session died the moment gdb asked for anything
+		 * bigger than the window -- reported as "putpkt(write): No
+		 * such file or directory", the errno being stale because there
+		 * had been no error at all.
+		 *
+		 * 256K is chosen to clear two separate limits: it is far larger
+		 * than any congestion window this will have opened, and larger
+		 * than the 65535 that the uint16_t length taken by
+		 * tcp_send_data used to truncate every write to. */
+		const size_t big = 256 * 1024;
+		char *wbuf = malloc(big);
+		int srv = socket(AF_INET, SOCK_STREAM, 0);
+
+		if (wbuf != NULL && srv >= 0) {
+			int yes = 1;
+			setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes,
+				   sizeof(yes));
+			memset(wbuf, 'W', big);
+
+			uint16_t bw_port =
+				bind_to_ephemeral(srv, INADDR_LOOPBACK);
+			int ok = (bw_port != 0 && listen(srv, 1) == 0);
+
+			/* The reader is a separate process because the writer
+			 * blocks: nothing in this one could drain the socket
+			 * while a single write() is in progress. */
+			pid_t rd = ok ? fork() : -1;
+
+			if (rd == 0) {
+				close(srv);
+
+				struct sockaddr_in ra;
+				int c = socket(AF_INET, SOCK_STREAM, 0);
+
+				memset(&ra, 0, sizeof(ra));
+				ra.sin_family = AF_INET;
+				ra.sin_port = htons(bw_port);
+				ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+				if (c < 0 ||
+				    connect(c, (struct sockaddr *)&ra,
+					    sizeof(ra)) != 0)
+					_exit(1);
+
+				char rb[8192];
+				ssize_t n;
+
+				while ((n = read(c, rb, sizeof(rb))) > 0)
+					;
+				close(c);
+				_exit(0);
+			}
+
+			int as = (rd > 0) ? accept(srv, NULL, NULL) : -1;
+
+			test_result("tcp large write: reader connected",
+				    as >= 0);
+			if (as >= 0) {
+				ssize_t w = write(as, wbuf, big);
+
+				test_result(
+					"one blocking write() sends the whole buffer",
+					w == (ssize_t)big);
+				close(as);
+			}
+			if (rd > 0) {
+				int st = 0;
+
+				waitpid(rd, &st, 0);
+			}
+		}
+		if (srv >= 0)
+			close(srv);
+		free(wbuf);
 	}
 
 	{

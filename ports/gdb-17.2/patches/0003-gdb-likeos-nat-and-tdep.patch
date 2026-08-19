@@ -138,8 +138,14 @@ separable from each other:
     swapping the program out in silence.
   - $_siginfo, through TARGET_OBJECT_SIGNAL_INFO and PTRACE_GETSIGINFO: si_code
     and si_addr are the difference between "SIGSEGV" and "wrote to 0x1".
+  - %ds, %es, %fs and %gs are read from the register block instead of being
+    marked absent.  The kernel now reports them -- captured on entry from user
+    mode, since a stopped tracee's segment registers are not in the processor
+    any more -- so gdb can print them.  They are appended after the two segment
+    bases at the end of `struct ptrace_regs', which is why the four offsets are
+    22..25 rather than beside %cs and %ss: adding them there would have moved
+    every register after them.
 
-diff -urN a/gdb/likeos-nat.c b/gdb/likeos-nat.c
 diff -urN a/gdb/inflow.c b/gdb/inflow.c
 --- a/gdb/inflow.c
 +++ b/gdb/inflow.c
@@ -178,7 +184,7 @@ diff -urN a/gdb/inflow.c b/gdb/inflow.c
 diff -urN a/gdb/likeos-nat.c b/gdb/likeos-nat.c
 --- a/gdb/likeos-nat.c
 +++ b/gdb/likeos-nat.c
-@@ -0,0 +1,940 @@
+@@ -0,0 +1,947 @@
 +/* Native-dependent code for LikeOS/amd64.
 +
 +   This file is part of GDB.
@@ -237,11 +243,18 @@ diff -urN a/gdb/likeos-nat.c b/gdb/likeos-nat.c
 +      0 r15   1 r14   2 r13   3 r12   4 rbp   5 rbx   6 r11   7 r10
 +      8 r9    9 r8   10 rax  11 rcx  12 rdx  13 rsi  14 rdi  15 rip
 +     16 cs   17 rflags 18 rsp 19 ss  20 fs_base 21 gs_base
++     22 ds   23 es   24 fs   25 gs
 +
-+   -1 means the register is not in this block.  The segment registers other
-+   than %cs and %ss have no meaning to a 64-bit process here and the kernel does
-+   not report them, so they are marked absent rather than reported as zero --
-+   gdb prints "<unavailable>", which is true, instead of a plausible lie.  */
++   -1 means the register is not in this block.
++
++   The four data-segment selectors sit at the END of the kernel's block rather
++   than next to %cs and %ss, because they were added after it: appending them
++   left every register a debugger already read at the offset it already had.
++   They are read-only -- the kernel does not restore them on the way back to
++   user mode, so writing one would be accepting a value that never takes
++   effect -- but they are reported, because in 64-bit mode they are reliably
++   zero and "<unavailable>" for a register whose value is known is its own kind
++   of wrong answer.  */
 +
 +static int likeos_r_reg_offset[] =
 +{
@@ -265,10 +278,10 @@ diff -urN a/gdb/likeos-nat.c b/gdb/likeos-nat.c
 +  17 * 8,			/* %eflags */
 +  16 * 8,			/* %cs */
 +  19 * 8,			/* %ss */
-+  -1,				/* %ds */
-+  -1,				/* %es */
-+  -1,				/* %fs */
-+  -1,				/* %gs */
++  22 * 8,			/* %ds */
++  23 * 8,			/* %es */
++  24 * 8,			/* %fs */
++  25 * 8,			/* %gs */
 +
 +  /* Everything from here to %fs_base is entered as absent, and the run of
 +     them is load-bearing rather than decorative.

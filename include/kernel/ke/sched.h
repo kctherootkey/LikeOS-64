@@ -952,6 +952,34 @@ typedef struct task {
 	uint64_t fs_base; // FS segment base for user TLS
 	uint64_t gs_base; // GS segment base (usually not used by user)
 
+	/* The user's DATA-SEGMENT SELECTORS, as they were on the last entry
+	 * into the kernel from user mode.  A debugger asks for these; nothing
+	 * else in the system does.
+	 *
+	 * They are snapshotted rather than read live because by the time a
+	 * tracer looks, the tracee is parked and some other task owns the CPU
+	 * whose segment registers would be read.  They are snapshotted rather
+	 * than derived because the honest answer is whatever the processor
+	 * actually holds, and that is knowable only at the moment of entry.
+	 *
+	 * The kernel never loads DS/ES/FS/GS after gdt_flush() at boot, so what
+	 * is captured on entry IS what the program was running with.  In
+	 * practice that is zero for every one of them: IRETQ to a lower
+	 * privilege level nulls any of the four whose descriptor has DPL < CPL,
+	 * and the boot value 0x10 is a ring-0 descriptor -- so the first return
+	 * to user mode clears them and nothing ever sets them again.  SYSCALL
+	 * and SYSRET leave them alone.  That matches what every x86-64 system
+	 * reports, but it is measured here rather than assumed: a task that has
+	 * never been to user mode reports zeroes because it has nothing else to
+	 * report, not because zero was written in.
+	 *
+	 * Not restored on the way back out, and so not writable through
+	 * PTRACE_SETREGS -- same reason CS and SS are not.  In 64-bit mode a
+	 * data-segment selector selects nothing; FS and GS address through
+	 * their MSR bases, which ARE per-task state and are reported
+	 * separately as fs_base/gs_base. */
+	uint16_t useg_ds, useg_es, useg_fs, useg_gs;
+
 	// Robust futex support
 	struct robust_list_head *robust_list; // Robust futex list head
 	size_t robust_list_len; // Size of robust list head structure
@@ -1307,6 +1335,34 @@ void task_load_tls(task_t *task);
 
 // Check if FSGSBASE instructions are supported
 bool cpu_has_fsgsbase(void);
+
+/* Snapshot the user's data-segment selectors into `t'.
+ *
+ * Called from every point where the kernel is entered FROM USER MODE and
+ * nowhere else: the values are only the program's while nothing has run in
+ * between, and a kernel-mode entry would record the kernel's.  See the
+ * useg_* fields for why this is a snapshot and not a live read.
+ *
+ * Four register-to-register moves, on the syscall and interrupt entry paths.
+ * `mov %seg, r32' zero-extends, so no partial-register merge is involved and
+ * the cost is the four moves and four stores -- lost in the noise of an entry
+ * that has already spilled fifteen general registers. */
+static inline void task_capture_user_segments(task_t *t)
+{
+	unsigned int ds, es, fs, gs;
+
+	if (!t)
+		return;
+	__asm__ volatile("mov %%ds, %0\n\t"
+			 "mov %%es, %1\n\t"
+			 "mov %%fs, %2\n\t"
+			 "mov %%gs, %3"
+			 : "=r"(ds), "=r"(es), "=r"(fs), "=r"(gs));
+	t->useg_ds = (uint16_t)ds;
+	t->useg_es = (uint16_t)es;
+	t->useg_fs = (uint16_t)fs;
+	t->useg_gs = (uint16_t)gs;
+}
 
 // ============================================================================
 // INTERNAL FUNCTIONS (exported for syscall.c)
