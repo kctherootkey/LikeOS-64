@@ -614,6 +614,10 @@ int env_count(void)
  * static environment storage from the envp[] array that the kernel
  * placed on the stack.
  */
+/* The allocator reads its tunables from the environment, and until this
+ * function runs there is no environment to read -- see __malloc_env_ready(). */
+extern void __malloc_env_ready(void);
+
 void __libc_init_environ(char **envp)
 {
 	g_env_count = 0;
@@ -633,7 +637,9 @@ void __libc_init_environ(char **envp)
 		g_env_count++;
 	}
 	env_sync();
+	__malloc_env_ready();
 }
+
 
 static int normalize_path(const char *in, char *out, size_t out_size)
 {

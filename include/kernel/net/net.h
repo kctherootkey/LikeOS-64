@@ -6,6 +6,7 @@
 
 #include <kernel/uapi/types.h>
 #include <kernel/ke/sched.h> // spinlock_t
+#include <kernel/ke/waitq.h> // struct wait_queue_head, for the poll queues
 #include <kernel/uapi/bug.h> // refcount_t
 
 // ============================================================================
@@ -659,9 +660,25 @@ typedef struct __attribute__((packed)) {
 #define SO_OOBINLINE 10
 #define SO_LINGER 13
 #define SO_REUSEPORT 15
+#define SO_PEERCRED 17
 #define SO_RCVTIMEO 20
 #define SO_SNDTIMEO 21
 #define SO_BINDTODEVICE 25
+
+/* What SO_PEERCRED returns: who is on the other end of a UNIX socket.
+ *
+ * Recorded by the KERNEL when the connection was made, not supplied by either
+ * side, which is the whole value of it -- a peer cannot claim to be somebody
+ * else.  That is what makes it an authentication mechanism, and it is how
+ * D-Bus's EXTERNAL auth decides whether a client may talk to the bus.
+ *
+ * The three fields and their order are the ones every other system uses, so a
+ * program's own struct matches this one. */
+struct ucred {
+	int32_t pid;
+	uint32_t uid;
+	uint32_t gid;
+};
 
 // IP-level sockopts (SOL_IP)
 #define IP_TOS 1
@@ -841,6 +858,13 @@ typedef struct net_socket {
 	spinlock_t lock;
 	int active;
 	int ref_count;
+	/* Who is polling THIS socket.
+	 *
+	 * A readiness change wakes this queue and nothing else, so the cost of
+	 * an arriving segment is proportional to the number of tasks waiting
+	 * on this connection rather than to the number of tasks on the
+	 * machine.  See <kernel/ke/waitq.h> for what that replaced. */
+	struct wait_queue_head poll_wq;
 } net_socket_t;
 
 // ============================================================================
@@ -1512,6 +1536,25 @@ typedef struct unix_socket {
 	 * answer this question for one caller at a time; a reference count
 	 * answers it for all of them. */
 	refcount_t refcount;
+
+	/* Who is polling THIS socket -- see the note on net_socket_t's. */
+	struct wait_queue_head poll_wq;
+
+	/* Credentials, for SO_PEERCRED.
+	 *
+	 * `self' is whoever created this socket, refreshed at listen() and at
+	 * connect() -- the two moments a socket commits to a connection, and
+	 * the moments conventional Unix samples.  `peer' is a COPY of the other
+	 * end's `self', taken when the two were joined.
+	 *
+	 * A copy rather than a look through ->peer, and that is the point: the
+	 * peer process may have exited, and its socket may have been freed and
+	 * the slot reused, long before anybody asks who it was.  The answer has
+	 * to be the one that was true at connect time, and it has to still be
+	 * readable. */
+	struct ucred self_cred;
+	struct ucred peer_cred;
+	int has_peer_cred;
 } unix_socket_t;
 
 // UNIX domain socket API

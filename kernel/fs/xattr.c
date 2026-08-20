@@ -7,6 +7,11 @@
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
 
+static int64_t fsetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint64_t u_val, uint64_t size, uint64_t flags);
+static int64_t fgetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint64_t u_val, uint64_t size);
+static int64_t flistxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_list, uint64_t size);
+static int64_t fremovexattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name);
+
 /* ===================================================================
  * Extended attributes (xattr).  The path ops take a trailing nofollow flag so
  * libc's l*-variants reuse the same syscall number.  Values/lists are bounced
@@ -223,11 +228,26 @@ int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 		      uint64_t size, uint64_t flags)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
+	vfs_file_t *f;
+	int64_t ret;
+
+	if (!cur)
 		return -EBADF;
+	/* Held across the call: the VFS reads the inode behind it, and the
+	 * body has several ways of answering -- one hold, one release. */
+	f = fdget(cur, (int)fd);
+	if (!f)
+		return -EBADF;
+	ret = fsetxattr_held(cur, f, u_name, u_val, size, flags);
+	fdput(f);
+	return ret;
+}
+
+static int64_t fsetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint64_t u_val, uint64_t size, uint64_t flags)
+{
 	/* An extended attribute belongs to an inode; a marker has none, and
 	 * passing one to the VFS would dereference it. */
-	if (fd_is_special(task_fds(cur)[fd]))
+	if (fd_is_special(f))
 		return -EOPNOTSUPP;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
@@ -242,7 +262,7 @@ int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 			    kname,
 			    "system.")) { /* incl. POSIX ACLs: owner-only */
 			struct kstat st;
-			if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK &&
+			if (vfs_fstat(f, &st) == ST_OK &&
 			    (uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
 		}
@@ -259,7 +279,7 @@ int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 			return -EFAULT;
 		}
 	}
-	int r = vfs_fsetxattr(task_fds(cur)[fd], kname, kval, size, (int)flags);
+	int r = vfs_fsetxattr(f, kname, kval, size, (int)flags);
 	if (kval)
 		kfree(kval);
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
@@ -269,23 +289,38 @@ int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 		      uint64_t size)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
+	vfs_file_t *f;
+	int64_t ret;
+
+	if (!cur)
 		return -EBADF;
-	if (fd_is_special(task_fds(cur)[fd]))
+	/* Held across the call: the VFS reads the inode behind it, and the
+	 * body has several ways of answering -- one hold, one release. */
+	f = fdget(cur, (int)fd);
+	if (!f)
+		return -EBADF;
+	ret = fgetxattr_held(cur, f, u_name, u_val, size);
+	fdput(f);
+	return ret;
+}
+
+static int64_t fgetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint64_t u_val, uint64_t size)
+{
+	if (fd_is_special(f))
 		return -EOPNOTSUPP;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
 	if (c)
 		return c;
 	if (size == 0) {
-		int r = vfs_fgetxattr(task_fds(cur)[fd], kname, 0, 0);
+		int r = vfs_fgetxattr(f, kname, 0, 0);
 		return (r >= 0) ? r : vfs_status_to_errno(r);
 	}
 	unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
 	uint8_t *kbuf = (uint8_t *)kalloc(cap);
 	if (!kbuf)
 		return -ENOMEM;
-	int r = vfs_fgetxattr(task_fds(cur)[fd], kname, kbuf, cap);
+	int r = vfs_fgetxattr(f, kname, kbuf, cap);
 	if (r >= 0 && copy_to_user((void *)u_val, kbuf, r)) {
 		kfree(kbuf);
 		return -EFAULT;
@@ -297,17 +332,32 @@ int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
+	vfs_file_t *f;
+	int64_t ret;
+
+	if (!cur)
 		return -EBADF;
+	/* Held across the call: the VFS reads the inode behind it, and the
+	 * body has several ways of answering -- one hold, one release. */
+	f = fdget(cur, (int)fd);
+	if (!f)
+		return -EBADF;
+	ret = flistxattr_held(cur, f, u_list, size);
+	fdput(f);
+	return ret;
+}
+
+static int64_t flistxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_list, uint64_t size)
+{
 	if (size == 0) {
-		int r = vfs_flistxattr(task_fds(cur)[fd], 0, 0);
+		int r = vfs_flistxattr(f, 0, 0);
 		return (r >= 0) ? r : vfs_status_to_errno(r);
 	}
 	unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
 	char *kbuf = (char *)kalloc(cap);
 	if (!kbuf)
 		return -ENOMEM;
-	int r = vfs_flistxattr(task_fds(cur)[fd], kbuf, cap);
+	int r = vfs_flistxattr(f, kbuf, cap);
 	if (r >= 0 && copy_to_user((void *)u_list, kbuf, r)) {
 		kfree(kbuf);
 		return -EFAULT;
@@ -319,8 +369,23 @@ int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
+	vfs_file_t *f;
+	int64_t ret;
+
+	if (!cur)
 		return -EBADF;
+	/* Held across the call: the VFS reads the inode behind it, and the
+	 * body has several ways of answering -- one hold, one release. */
+	f = fdget(cur, (int)fd);
+	if (!f)
+		return -EBADF;
+	ret = fremovexattr_held(cur, f, u_name);
+	fdput(f);
+	return ret;
+}
+
+static int64_t fremovexattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name)
+{
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
 	if (c)
@@ -332,11 +397,11 @@ int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 			    kname,
 			    "system.")) { /* incl. POSIX ACLs: owner-only */
 			struct kstat st;
-			if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK &&
+			if (vfs_fstat(f, &st) == ST_OK &&
 			    (uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
 		}
 	}
-	int r = vfs_fremovexattr(task_fds(cur)[fd], kname);
+	int r = vfs_fremovexattr(f, kname);
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }

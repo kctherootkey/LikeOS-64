@@ -1,0 +1,26 @@
+menu.c: drop the include of a header that does not exist
+
+There is no src/fe-gtk/search.h in this tree and there has not been one for
+several releases.  The line survives because of how "..." includes are
+resolved: when the quoted form finds nothing beside the including file, the
+compiler falls back to the system include path -- and on a glibc system that
+path has a /usr/include/search.h, the POSIX tsearch/hsearch/lsearch header.
+So the build silently picks up an unrelated standard header, menu.c uses
+nothing whatsoever from it, and nobody notices.
+
+This libc has no <search.h>, so the fallback finds nothing and the compile
+stops.  Adding the header would be answering the wrong question: menu.c calls
+no search(3) function.  What it wanted from a file of this name -- the
+declarations of mg_search_handle_next() and mg_search_handle_previous() -- it
+already gets from maingui.h, which it includes four lines further up.
+
+--- a/src/fe-gtk/menu.c
++++ b/src/fe-gtk/menu.c
+@@ -56,7 +56,6 @@
+ #include "rawlog.h"
+ #include "palette.h"
+ #include "plugingui.h"
+-#include "search.h"
+ #include "textgui.h"
+ #include "urlgrab.h"
+ #include "userlistgui.h"

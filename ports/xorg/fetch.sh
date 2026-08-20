@@ -110,7 +110,7 @@ fetch_one() {
 	case "$deb" in
 	http://* | https://*)
 		url=$(printf '%s' "$deb" | sed "s|%VERSION%|$version|g")
-		ext=$(printf '%s' "$url" | sed -n 's|.*\(\.tar\.[a-z]*\)$|\1|p')
+		ext=$(printf '%s' "$url" | sed -n 's|.*\(\.tar\.[a-z0-9]*\)$|\1|p')
 		# .zip as well, for the SCOWL dictionary: without this the
 		# archive is saved under a .tar.gz name it is not, and unpack.sh
 		# cannot tell what it is holding.

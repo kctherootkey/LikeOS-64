@@ -421,6 +421,9 @@ void mm_dontneed_range(struct task *task, uint64_t addr, uint64_t length);
 bool mm_regions_init(struct task *task);
 void mm_regions_free(struct task *task);
 bool mm_regions_clone(struct task *dst, const struct task *src);
+/* Clone a region table AND take its file references as one locked step.  Use
+ * this from fork: see the definition for why the two cannot be separated. */
+bool mm_regions_clone_ref(struct task *dst, struct task *src);
 void mm_merge_mmap_regions(struct task *task);
 /* Coalesce one freshly installed region with the neighbours it abuts.  Call
  * after every successful mmap: without it the region table only ever grows,

@@ -1,0 +1,26 @@
+The pwrite fallback takes a pointer it does not write through
+
+_file_write() is declared with `const char *data' and hands that straight to
+pwrite().  The real pwrite(2) takes a const void*, so this is fine everywhere
+pwrite exists -- and this fallback, which is compiled only where it does not,
+declares its second parameter `char *'.  In C the mismatch is a warning; in
+C++, where this file is compiled, there is no implicit conversion that drops
+const and the build stops:
+
+  invalid conversion from 'const char*' to 'char*' [-fpermissive]
+
+The fallback only does lseek() and write(), neither of which writes through the
+pointer, so const is what it should have said in the first place.  _pread is
+left alone: it fills the buffer, so its `char *' is correct.
+
+--- a/src/vtestream-file.h
++++ b/src/vtestream-file.h
+@@ -146,7 +146,7 @@
+ #if !HAVE_PWRITE
+ #define pwrite _pwrite
+ static inline gsize
+-pwrite (int fd, char *data, gsize len, gsize offset)
++pwrite (int fd, const char *data, gsize len, gsize offset)
+ {
+ 	if (-1 == lseek (fd, offset, SEEK_SET))
+ 		return -1;

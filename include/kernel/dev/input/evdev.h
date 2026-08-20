@@ -11,6 +11,9 @@
 
 #include <kernel/uapi/types.h>
 
+/* Only a pointer to it is used here; the definition is in <kernel/ke/waitq.h>. */
+struct wait_queue_head;
+
 struct task;
 
 #define EVDEV_UNIT_KEYBOARD 0
@@ -25,6 +28,9 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
  * rather than the task, because the closer is not always the opener. */
 void evdev_release_grab_by_owner(int unit, void *owner);
 short evdev_poll(int unit, short events);
+/* That unit's poll wait queue, for poll()/select() to register on.  NULL when
+ * the unit number is out of range. */
+struct wait_queue_head *evdev_pollq(int unit);
 void evdev_release_grab_for(int unit, int64_t task_id); // close/exit hook
 
 // Producer interface (interrupt context safe)

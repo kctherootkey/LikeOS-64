@@ -1331,8 +1331,6 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 			}
 		}
 	}
-	task_tty_printf(cur, "\nSYSTEM ACTION:\n  process terminated\n");
-	task_tty_printf(cur, "========================================\n");
 }
 #endif /* CRASH_VERBOSE */
 
@@ -1410,6 +1408,32 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 	if (from_user) {
 		task_t *cur = sched_current();
 		if (cur && cur->privilege == TASK_USER) {
+			/* Publish the user frame for the duration of any stop
+			 * taken below, the same way the trap-stop path does.
+			 *
+			 * A tracer that stops here asks for the tracee's
+			 * registers, and ptrace_read_regs reports preempt_frame
+			 * when there is one.  There was not: a FAULT is queued
+			 * by exception_handler and delivered from here, not
+			 * from the handler, so by the time the tracee stopped
+			 * nothing pointed at the context that faulted.  The
+			 * fallback is the syscall-entry snapshot, which is a
+			 * real user context -- just the wrong one.  A debugger
+			 * was therefore told that every fault happened at the
+			 * return address of the last syscall the thread made,
+			 * with RCX and R11 synthesised to match, and the
+			 * faulting instruction never appeared anywhere.  A
+			 * crash in a program that had just called gettid()
+			 * reported gettid+28 -- a one-byte `ret' -- as SIGILL
+			 * on one run and SIGSEGV on the next, which no
+			 * processor does to a valid instruction.
+			 *
+			 * `regs' is this task's kernel-stack frame and stays
+			 * intact for as long as the task is parked in here,
+			 * which is exactly how long the stop lasts. */
+			task_t *frame_owner = cur;
+
+			frame_owner->preempt_frame = (interrupt_frame_t *)regs;
 			/* Park if this task's process is in a trace stop.  A
 			 * thread with no signal pending still stops when its
 			 * process does, and this is the return to user, where
@@ -1471,6 +1495,10 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 				 * pointers into it. */
 				sched_exit_park();
 			}
+
+			/* Stop over (or never taken); the frame is about to be
+			 * popped, so stop naming it. */
+			frame_owner->preempt_frame = NULL;
 		}
 	}
 

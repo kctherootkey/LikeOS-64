@@ -433,6 +433,27 @@ int signal_dequeue(task_t *task, kernel_sigset_t *mask, siginfo_t *info)
 	return 0;
 }
 
+/* Bytes below the interrupted RSP that a signal frame must not touch.
+ *
+ * The ABI reserves the 128 bytes below %rsp -- the red zone -- for the
+ * function that is running.  A leaf function may keep live data there without
+ * moving %rsp, because nothing else is allowed to write below it: the CPU
+ * pushes nothing on a syscall, and an interrupt switches to the kernel stack.
+ *
+ * A signal frame is the one thing that does write to the user stack, and it is
+ * placed while that function is mid-instruction.  Starting it at RSP therefore
+ * overwrites whatever the interrupted function had spilled there, and the
+ * damage only shows up after the handler returns and that function reads its
+ * own locals back -- as a wrong value, or a wild pointer, arbitrarily far from
+ * the signal that caused it.
+ *
+ * So skip the reserved area first and put the frame below it.  This applies to
+ * both delivery paths: the interrupt path preempts arbitrary user code, and a
+ * syscall issued inline from a leaf function leaves its red zone live too,
+ * since the syscall instruction pushes nothing.
+ */
+#define SIGFRAME_REDZONE 128
+
 // Setup a signal frame on the user stack
 // Returns 0 on success, -1 on failure
 int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
@@ -471,7 +492,8 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	 *
 	 * Hence: align down, then step back 8. */
 	uint64_t frame_addr =
-		((user_rsp - sizeof(signal_frame_t)) & ~0xFULL) - 8;
+		((user_rsp - SIGFRAME_REDZONE - sizeof(signal_frame_t)) &
+		 ~0xFULL) - 8;
 	WARN_ON((frame_addr & 0xF) !=
 		8); /* handler must be entered with RSP % 16 == 8 */
 
@@ -653,7 +675,8 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	/* Same alignment rule as signal_setup_frame(): the handler is entered
 	 * as though by a call, so RSP must be 8 (mod 16) there. */
 	uint64_t frame_addr =
-		((user_rsp - sizeof(signal_frame_t)) & ~0xFULL) - 8;
+		((user_rsp - SIGFRAME_REDZONE - sizeof(signal_frame_t)) &
+		 ~0xFULL) - 8;
 	WARN_ON((frame_addr & 0xF) != 8);
 
 	// Validate the stack address is in user space

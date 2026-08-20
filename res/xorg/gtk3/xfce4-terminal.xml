@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  System defaults for xfce4-terminal, installed as
+  /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml.
+
+  xfconfd reads every channel file it finds along XDG_CONFIG_DIRS and merges
+  them, the user's own copy last -- so these are DEFAULTS, not policy: anything
+  changed in the preferences dialog is written to
+  ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml and wins over
+  what is here.  That is why this is a config file rather than a patch to the
+  program's compiled-in defaults.
+
+  /etc/xdg is reachable without setting XDG_CONFIG_DIRS: libxfce4util builds
+  its default search path as "<sysconfdir>/xdg:<sysconfdir>/xfce4:/etc/xdg",
+  with that last entry a literal.
+-->
+<channel name="xfce4-terminal" version="1.0">
+
+  <!-- The font.
+
+       Upstream's default is "Monospace 12", which goes through fontconfig's
+       generic monospace alias.  Naming the face outright removes the
+       indirection, and 12 was too large for the window size below: 132
+       columns of DejaVu Sans Mono 12 is 1060 pixels wide, which does not fit
+       a 1024-pixel screen.
+
+       9 is what makes the two agree.  DejaVu Sans Mono advances 0.602 em per
+       character and stands 1.164 em to the line, so at 9pt on a 96 dpi screen
+       a cell is 7.2 x 14.0 pixels and the 132x43 grid below comes to about
+       954 x 601 -- close to the 792 x 559 that xterm's 6x13 font gives for
+       the same grid, and the largest size that still fits the smallest screen
+       this system will select. -->
+  <property name="font-name" type="string" value="DejaVu Sans Mono 9"/>
+
+  <!-- The window size, in CHARACTERS, matching XTerm*VT100.geometry in
+       res/xorg/Xresources so that both terminals on this desktop open the
+       same shape.  See the note there for why 132x43 rather than 80x24. -->
+  <property name="misc-default-geometry" type="string" value="132x43"/>
+
+</channel>

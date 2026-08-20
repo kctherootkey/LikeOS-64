@@ -25,6 +25,29 @@ extern "C" {
 #define WSTOPSIG(status)     (((status) >> 8) & 0xff)
 #define WIFCONTINUED(status) ((status) == 0xffff)
 
+/* Whether the terminating signal dumped core, and the bit that says so.
+ *
+ * Nothing here produces core files, so WCOREDUMP is always false -- but the
+ * macro has to EXIST, because a great deal of code writes
+ * WIFSIGNALED(s) && WCOREDUMP(s) unconditionally. */
+#define WCOREFLAG 0x80
+#define WCOREDUMP(status) ((status) & WCOREFLAG)
+
+/* Building a status word, rather than taking one apart.
+ *
+ * The inverses of the macros above, and the reason they are needed is that a
+ * wait status is an opaque int with no constructor: a program that runs a
+ * child some other way -- posix_spawn with its own reaping, a fork server, a
+ * terminal widget reporting why its child went away -- has an exit code and a
+ * signal number in hand and needs the encoded form that WIFEXITED and friends
+ * will read back.  Without these it has to open-code the shifts, which is how
+ * the encoding gets copied wrongly into a dozen programs.
+ *
+ * BSD-derived and present in every C library; not in POSIX, which describes
+ * only the decoding half. */
+#define W_EXITCODE(ret, sig) (((ret) << 8) | (sig))
+#define W_STOPCODE(sig) (((sig) << 8) | 0x7f)
+
 /*
  * Resource usage, in the layout every other Unix uses on x86-64: two timevals
  * followed by fourteen longs, 144 bytes in total.

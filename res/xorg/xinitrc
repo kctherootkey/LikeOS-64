@@ -23,23 +23,59 @@ if [ -x /usr/bin/setxkbmap ]; then
 	setxkbmap us
 fi
 
-# Desktop background: the CDE teal.
+# The session bus.
 #
-# This is the real desktop colour and it sticks, because system.ctwmrc sets
-# DontPaintRootWindow -- otherwise ctwm would repaint the root from the current
-# workspace's own colour the moment it mapped a workspace, and whatever was set
-# here would last only an instant.
+# One D-Bus daemon for the session, started here because it has to exist before
+# anything that wants it does.  xfce4-terminal is what wants it: its
+# preferences live in xfconf, which is a daemon holding the settings and a
+# client library talking to it, and the two find each other over this bus.
+# With no bus the terminal warns once on stderr and falls back to compiled-in
+# defaults -- it works, and nothing set in its preferences dialog survives
+# being closed.
 #
-# Set once, to the final colour, so there is no intermediate shade: the screen is
-# black until the server starts, then this, then the desktop.  (The default root
-# pattern is a black-and-white weave that dithers harshly on a framebuffer, so
-# something does have to replace it.)
-# -cursor_name is here for the same reason the colour is: the DESKTOP pointer
-# belongs to the root window, which ctwm never touches, so it keeps whatever the
-# server set -- and the server's default is X_cursor, the big X.  left_ptr is the
+# dbus-launch rather than dbus-daemon directly: it starts the daemon, prints
+# the address and pid as shell assignments, and the eval publishes them into
+# this script's environment, which every client started below then inherits.
+# --exit-with-session makes the daemon go away when this script does, so a
+# second startx does not find a stale socket from the first.
+#
+# Guarded on the binary and on the address not already being set: a user who
+# has arranged their own bus keeps it.  The machine id is written first because
+# dbus-daemon refuses to start without one, and nothing else on the image
+# creates it.
+if [ -x /usr/bin/dbus-launch ] && [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+	if [ ! -s /var/lib/dbus/machine-id ] && [ -x /usr/bin/dbus-uuidgen ]; then
+		mkdir -p /var/lib/dbus
+		dbus-uuidgen > /var/lib/dbus/machine-id 2>/dev/null
+	fi
+	eval "$(dbus-launch --sh-syntax --exit-with-session)"
+	export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+fi
+
+# Desktop background: black, and black is deliberate.
+#
+# Something has to replace the root window's default pattern -- a black-and-white
+# weave that dithers harshly on a framebuffer -- but whatever it is shows only
+# for the moment between the server starting and PCManFM drawing the wallpaper
+# over it.  A colour here therefore buys nothing and costs a visible flash:
+# the screen went black, then teal, then the wallpaper, and the teal in the
+# middle read as a fault rather than as a background.
+#
+# Black is what the screen already is when the server starts, so this changes
+# nothing visible and the only transition left is the one that matters, to the
+# wallpaper.  pcmanfm.conf's desktop_bg is black for the same reason and has to
+# stay in step with this.
+#
+# It sticks, because system.ctwmrc sets DontPaintRootWindow -- otherwise ctwm
+# would repaint the root from the current workspace's own colour the moment it
+# mapped a workspace, and whatever was set here would last only an instant.
+#
+# -cursor_name is here for a different reason: the DESKTOP pointer belongs to
+# the root window, which ctwm never touches, so it keeps whatever the server
+# set -- and the server's default is X_cursor, the big X.  left_ptr is the
 # plain arrow.  The pointers over windows, titles and menus are ctwm's, and are
 # set in the Cursors block in system.ctwmrc.
-xsetroot -solid "#6f9c9c" -cursor_name left_ptr
+xsetroot -solid "#000000" -cursor_name left_ptr
 
 # The desktop bar.
 #

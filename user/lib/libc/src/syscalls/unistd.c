@@ -744,9 +744,72 @@ int fcntl(int fd, int cmd, ...)
 	return (int)ret;
 }
 
-int ioctl(int fd, unsigned long request, void *argp)
+int daemon(int nochdir, int noclose)
 {
-	long ret = syscall3(SYS_IOCTL, fd, request, (long)argp);
+	int fd;
+
+	/* Fork and let the parent go.  Two things come of it: whoever started
+	 * us sees the process finish, and the child is guaranteed not to be a
+	 * process-group leader -- which setsid() below requires, since a
+	 * leader cannot leave the group it leads. */
+	switch (fork()) {
+	case -1:
+		return -1;
+	case 0:
+		break;
+	default:
+		/* _exit, not exit: the parent must not run atexit handlers or
+		 * flush stdio buffers that the child now also holds a copy of,
+		 * or every buffered byte is written twice. */
+		_exit(0);
+	}
+
+	/* A session of our own, with no controlling terminal.  This is what
+	 * "detached" actually means: no SIGHUP when the terminal goes away,
+	 * and no SIGINT from somebody else's Ctrl-C. */
+	if (setsid() == -1)
+		return -1;
+
+	if (!nochdir) {
+		/* Leave whatever directory we were started from.  A daemon
+		 * holding one open keeps its filesystem busy for as long as it
+		 * runs, which is how an unmountable filesystem happens. */
+		if (chdir("/") != 0)
+			return -1;
+	}
+
+	if (!noclose) {
+		fd = open("/dev/null", O_RDWR);
+		if (fd < 0)
+			return -1;
+		dup2(fd, STDIN_FILENO);
+		dup2(fd, STDOUT_FILENO);
+		dup2(fd, STDERR_FILENO);
+		/* Only if it is not already one of the three: closing it then
+		 * would close the descriptor just installed. */
+		if (fd > STDERR_FILENO)
+			close(fd);
+	}
+	return 0;
+}
+
+int ioctl(int fd, unsigned long request, ...)
+{
+	/* One argument is read unconditionally, even for the requests that
+	 * take none.  That is what every implementation of this does and it is
+	 * safe: on this ABI the value comes out of a register the caller has
+	 * either set or left alone, and a request that takes no argument never
+	 * looks at what was passed.  Reading it is how the ones that DO take
+	 * an argument get it, and the function cannot tell the two apart. */
+	va_list ap;
+	void *argp;
+	long ret;
+
+	va_start(ap, request);
+	argp = va_arg(ap, void *);
+	va_end(ap);
+
+	ret = syscall3(SYS_IOCTL, fd, request, (long)argp);
 	if (ret < 0) {
 		errno = -ret;
 		return -1;
@@ -1270,6 +1333,54 @@ long sysconf(int name)
 			return 1; /* never report 0: callers size arrays by this */
 		n = CPU_COUNT(&set);
 		return n > 0 ? n : 1;
+	}
+	case _SC_GETPW_R_SIZE_MAX:
+	case _SC_GETGR_R_SIZE_MAX:
+		/* A SUGGESTION, not a limit: the caller is expected to grow
+		 * its buffer on ERANGE.  1024 holds every entry this system's
+		 * /etc/passwd and /etc/group will realistically contain, so
+		 * the common case is one call. */
+		return 1024;
+	case _SC_ARG_MAX:
+		return ARG_MAX;
+	case _SC_CHILD_MAX:
+		/* No per-user process limit is enforced; the ceiling is the
+		 * kernel's task table, which this does not know.  -1 with
+		 * errno untouched is how the standard says to report a limit
+		 * that is indeterminate, as opposed to an unrecognised name. */
+		return -1;
+	case _SC_NGROUPS_MAX:
+		return NGROUPS_MAX;
+	case _SC_JOB_CONTROL:
+	case _SC_SAVED_IDS:
+		/* Both supported: setpgid/tcsetpgrp and the saved set-user-ID
+		 * are implemented. */
+		return 1;
+	case _SC_VERSION:
+		return 200809L;
+	case _SC_LINE_MAX:
+		return 2048;
+	case _SC_HOST_NAME_MAX:
+		return HOST_NAME_MAX;
+	case _SC_SYMLOOP_MAX:
+		return SYMLOOP_MAX;
+	case _SC_PHYS_PAGES:
+	case _SC_AVPHYS_PAGES: {
+		/* From sysinfo(), which is where the numbers actually live.
+		 * Reported in PAGES, which is what the name says, while
+		 * sysinfo reports bytes scaled by mem_unit. */
+		struct sysinfo si;
+
+		if (sysinfo(&si) != 0)
+			return -1;
+		{
+			unsigned long bytes = (name == _SC_PHYS_PAGES)
+						      ? si.totalram
+						      : si.freeram;
+
+			return (long)((bytes * (unsigned long)si.mem_unit) /
+				      4096UL);
+		}
 	}
 	default:
 		errno = EINVAL;

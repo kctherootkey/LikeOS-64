@@ -1,4 +1,5 @@
 // LikeOS-64 UNIX Domain Sockets
+#include <kernel/ke/waitq.h>
 #include <kernel/net/net.h>
 #include <kernel/mm/memory.h>
 #include <kernel/mm/slab.h>
@@ -8,15 +9,17 @@
 #include <kernel/io/tty.h> /* tty_printf for the Ctrl+N table dump */
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/vfs.h> /* vfs_permission_parent, MAY_* */
+#include <kernel/fs/file.h>
 
 /* Wake tasks blocked in select()/poll()/epoll_wait().
  *
  * A blocking read() or write() on a socket parks on the socket itself and is
  * released by sched_wake_channel() below.  A task multiplexing with select()
- * cannot park there -- it is waiting on many descriptors at once -- so it
- * parks on the poll layer's own channel, and only poll_notify_io_ready()
- * releases it.  Without this call such a task slept until the poll layer's
- * one-tick fallback expired: 10 ms per event at the 100 Hz tick.
+ * cannot park there -- it is waiting on many descriptors at once -- so it puts
+ * itself on the poll wait queue of every socket it asked about, and
+ * poll_notify_wq() on THIS socket is what releases it.  Without that call such
+ * a task slept until the poll layer's one-tick fallback expired: 10 ms per
+ * event at the 100 Hz tick.
  *
  * That is the cost of one X11 round trip, and an X client makes hundreds of
  * them while starting up -- the display server sits in select() on this
@@ -24,6 +27,7 @@
  * looked at.  It is why an Xlib program took seconds to appear while a
  * request-batching xcb one did not.
  */
+extern void poll_notify_wq(struct wait_queue_head *);
 extern void poll_notify_io_ready(void);
 
 /* Reference counting.  Defined together further down, next to the close path
@@ -315,6 +319,29 @@ static unix_socket_t *unix_find_by_name_locked(const char *name, int len)
 // ============================================================================
 // unix_create - Create a new UNIX domain socket
 // ============================================================================
+/* Fill in `c' from the calling process.
+ *
+ * The THREAD GROUP id, not the thread id: SO_PEERCRED names the process on the
+ * other end, and a peer that happens to have done its connect() from a worker
+ * thread is still the same process.  The credentials are the effective ones,
+ * which is what a permission decision on the far side would use. */
+static void unix_cred_of_current(struct ucred *c)
+{
+	task_t *cur = sched_current();
+
+	if (!cur) {
+		/* No task context: the kernel itself.  Reported as pid 0,
+		 * root, which is what it is. */
+		c->pid = 0;
+		c->uid = 0;
+		c->gid = 0;
+		return;
+	}
+	c->pid = cur->tgid ? cur->tgid : cur->id;
+	c->uid = cur->cred.euid;
+	c->gid = cur->cred.egid;
+}
+
 int unix_create(int type, unix_socket_t **out)
 {
 	might_sleep();
@@ -333,9 +360,14 @@ int unix_create(int type, unix_socket_t **out)
 	// Zero out the struct, then re-establish active=1 (claimed by alloc).
 	// The zeroing is done while we still hold unix_table_lock so that no
 	// other allocator/finder can observe the half-zeroed state.
+	/* The poll queue survives the slot being reused -- see
+	 * wq_head_init_once(). */
+	struct wait_queue_head saved_wq = us->poll_wq;
 	uint8_t *p = (uint8_t *)us;
+
 	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
 		p[i] = 0;
+	us->poll_wq = saved_wq;
 
 	us->active = 1;
 	us->type = type;
@@ -343,7 +375,9 @@ int unix_create(int type, unix_socket_t **out)
 	refcount_set(&us->refcount, 1);
 	us->magic = UNIX_SOCK_MAGIC;
 	us->id = s_unix_next_id++;
+	unix_cred_of_current(&us->self_cred);
 	spinlock_init(&us->lock, "unix_sock");
+	wq_head_init_once(&us->poll_wq, "unix-poll");
 
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 	*out = us;
@@ -391,7 +425,7 @@ int unix_bind(unix_socket_t *us, const struct sockaddr_un *addr,
 	 * directory — the same rule as creating a file there.  An abstract name
 	 * (leading NUL) has no filesystem presence and is exempt.  The check
 	 * runs before the table lock so it never holds a spinlock across the VFS
-	 * stat.  (Peer-credential passing / SO_PEERCRED is a follow-up.) */
+	 * stat. */
 	if (name[0] != '\0') {
 		int pr = vfs_permission_parent(pathbuf, MAY_WRITE | MAY_EXEC);
 		if (pr != ST_OK)
@@ -473,6 +507,10 @@ int unix_listen(unix_socket_t *us, int backlog)
 	spin_lock_irqsave(&us->lock, &flags);
 	us->listening = 1;
 	us->backlog = (backlog > 16) ? 16 : (backlog < 1 ? 1 : backlog);
+	/* Refreshed here as well as at creation: a server that drops
+	 * privileges between socket() and listen() should be reported as what
+	 * it became, not as what it was. */
+	unix_cred_of_current(&us->self_cred);
 	spin_unlock_irqrestore(&us->lock, flags);
 
 	return 0;
@@ -701,6 +739,22 @@ int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 		server->connected = 1;
 		us->connected = 1;
 
+		/* Exchange credentials, once, here.
+		 *
+		 * The client's own are refreshed first: connect() is the
+		 * moment it commits, and a process that dropped privileges
+		 * after socket() must be reported as what it is now.  The
+		 * server end inherits the LISTENER's, not the accepting
+		 * thread's -- the accepted socket did not exist when the
+		 * connection was made, and it is the listening process the
+		 * client reached. */
+		unix_cred_of_current(&us->self_cred);
+		server->self_cred = listener->self_cred;
+		us->peer_cred = listener->self_cred;
+		server->peer_cred = us->self_cred;
+		us->has_peer_cred = 1;
+		server->has_peer_cred = 1;
+
 		/* Each end's view of the other, recorded now and never chased
 		 * again -- getpeername() must keep answering after the far end
 		 * closes. */
@@ -759,9 +813,10 @@ int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 	spin_unlock_irqrestore(&listener->lock, flags);
 
 	/* A listener multiplexing with select() -- which is what a display
-	 * server does -- is waiting on the poll channel, not on this socket. */
+	 * server does -- is waiting on its own queue, not on this socket. */
 	sched_wake_channel(listener);
-	poll_notify_io_ready();
+	poll_notify_wq(&listener->poll_wq); /* now acceptable */
+	poll_notify_wq(&us->poll_wq); /* now connected, so writable */
 	unix_put(listener);
 	return 0;
 }
@@ -891,7 +946,7 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 			task_t *snd_cur = sched_current();
 
 			if (poll_pending) {
-				poll_notify_io_ready();
+				poll_notify_wq(&peer->poll_wq);
 				poll_pending = 0;
 			}
 
@@ -933,7 +988,7 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 	}
 
 	if (poll_pending)
-		poll_notify_io_ready();
+		poll_notify_wq(&peer->poll_wq);
 
 	/* Let go of the peer.  If its descriptors have gone in the meantime,
 	 * this is the last reference and the socket is destroyed here -- which
@@ -1079,8 +1134,26 @@ int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags)
 			break; /* ring drained */
 	}
 
-	if (poll_freed_space)
-		poll_notify_io_ready();
+	if (poll_freed_space) {
+		/* Space in THIS socket's ring is what makes the PEER writable,
+		 * so the peer's queue is the one to wake.  Read under the lock
+		 * and pinned across the wake: ->peer must never be chased
+		 * unlocked, because a slot that has been recycled is a
+		 * different socket by then. */
+		unix_socket_t *pw = NULL;
+		uint64_t pf;
+
+		spin_lock_irqsave(&us->lock, &pf);
+		if (us->peer) {
+			pw = us->peer;
+			unix_hold(pw);
+		}
+		spin_unlock_irqrestore(&us->lock, pf);
+		if (pw) {
+			poll_notify_wq(&pw->poll_wq);
+			unix_put(pw);
+		}
+	}
 
 	return received;
 }
@@ -1304,10 +1377,14 @@ static void unix_hangup_and_put(unix_socket_t *s)
 		sched_wake_channel(peer);
 		unix_put(peer); /* the reference s->peer held */
 	}
+	/* Before the puts below, not after: the last of them frees the socket,
+	 * and the queue being woken lives inside it. */
+	poll_notify_wq(&s->poll_wq);
+	if (peer)
+		poll_notify_wq(&peer->poll_wq);
 	if (drop_self)
 		unix_put(s); /* the reference peer->peer held on s */
 	unix_put(s); /* the caller's own */
-	poll_notify_io_ready();
 }
 
 void unix_sock_fdget(unix_socket_t *us)
@@ -1422,9 +1499,11 @@ int unix_close(unix_socket_t *us)
 	 * for good.  Done outside the locks, as everywhere else, because the
 	 * wake path takes scheduler locks. */
 	sched_wake_channel(us);
-	if (peer)
+	poll_notify_wq(&us->poll_wq);
+	if (peer) {
 		sched_wake_channel(peer);
-	poll_notify_io_ready();
+		poll_notify_wq(&peer->poll_wq);
+	}
 
 	/* Tell each abandoned client the connection is not coming, then let go
 	 * of the reference its queue entry held.  Outside the locks: waking
@@ -1436,7 +1515,7 @@ int unix_close(unix_socket_t *us)
 	for (int i = 0; i < n_orphans; i++)
 		unix_hangup_and_put(orphans[i]);
 	if (n_orphans)
-		poll_notify_io_ready();
+		poll_notify_wq(&us->poll_wq);
 
 	/* Stale sockets otherwise accumulate in /tmp and every later bind to
 	 * the same name fails with EADDRINUSE — which is exactly how a display
@@ -1486,9 +1565,12 @@ int unix_socketpair(int type, unix_socket_t *sv[2])
 	unix_socket_t *s1 = &unix_sockets[idx1];
 
 	// Initialize s0
+	struct wait_queue_head saved_s0_wq = s0->poll_wq;
 	uint8_t *p = (uint8_t *)s0;
+
 	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
 		p[i] = 0;
+	s0->poll_wq = saved_s0_wq; /* survives slot reuse */
 	s0->active = 1;
 	s0->type = type;
 	s0->connected = 1;
@@ -1497,11 +1579,15 @@ int unix_socketpair(int type, unix_socket_t *sv[2])
 	s0->magic = UNIX_SOCK_MAGIC;
 	s0->id = s_unix_next_id++;
 	spinlock_init(&s0->lock, "unix_sock");
+	wq_head_init_once(&s0->poll_wq, "unix-poll");
 
 	// Initialize s1
+	struct wait_queue_head saved_s1_wq = s1->poll_wq;
+
 	p = (uint8_t *)s1;
 	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
 		p[i] = 0;
+	s1->poll_wq = saved_s1_wq; /* survives slot reuse */
 	s1->active = 1;
 	s1->type = type;
 	s1->connected = 1;
@@ -1510,6 +1596,7 @@ int unix_socketpair(int type, unix_socket_t *sv[2])
 	s1->magic = UNIX_SOCK_MAGIC;
 	s1->id = s_unix_next_id++;
 	spinlock_init(&s1->lock, "unix_sock");
+	wq_head_init_once(&s1->poll_wq, "unix-poll");
 
 	// Link peers.  Each direction holds a reference, so closing one end
 	// cannot free it while the other still points at it.
@@ -1517,6 +1604,16 @@ int unix_socketpair(int type, unix_socket_t *sv[2])
 	s1->peer = s0;
 	unix_hold(s1); /* for s0->peer */
 	unix_hold(s0); /* for s1->peer */
+
+	/* Both ends belong to the process that made the pair, so each end's
+	 * peer is that same process -- which stays true after a fork hands one
+	 * end to a child, because the credentials were sampled here. */
+	unix_cred_of_current(&s0->self_cred);
+	s1->self_cred = s0->self_cred;
+	s0->peer_cred = s0->self_cred;
+	s1->peer_cred = s0->self_cred;
+	s0->has_peer_cred = 1;
+	s1->has_peer_cred = 1;
 	/* Both ends are connected, and both are unnamed -- a pair has no
 	 * pathname.  peer_valid still has to be set, or getpeername() on either
 	 * end would report ENOTCONN instead of the correct family-only answer. */
@@ -1565,7 +1662,7 @@ int unix_shutdown(unix_socket_t *us, int how)
 			peer->ready = 1;
 			spin_unlock_irqrestore(&peer->lock, flags);
 			sched_wake_channel(peer);
-			poll_notify_io_ready();
+			poll_notify_wq(&peer->poll_wq);
 			unix_put(peer);
 		}
 	}
@@ -1589,7 +1686,7 @@ int unix_shutdown(unix_socket_t *us, int how)
 		us->shut_rd = 1;
 		spin_unlock_irqrestore(&us->lock, flags);
 		sched_wake_channel(us);
-		poll_notify_io_ready();
+		poll_notify_wq(&us->poll_wq);
 	}
 
 	return 0;
@@ -1664,6 +1761,28 @@ int unix_getsockopt(unix_socket_t *us, int level, int optname, void *optval,
 		return -EFAULT;
 	if (level != SOL_SOCKET)
 		return -ENOPROTOOPT;
+	/* SO_PEERCRED is the one option here that does not return an int, so
+	 * it is answered before the int-shaped machinery below. */
+	if (optname == SO_PEERCRED) {
+		struct ucred c;
+		uint64_t cflags;
+
+		if (*optlen < (socklen_t)sizeof(struct ucred))
+			return -EINVAL;
+		spin_lock_irqsave(&us->lock, &cflags);
+		if (!us->has_peer_cred) {
+			spin_unlock_irqrestore(&us->lock, cflags);
+			/* Never connected: there is nobody to describe.  The
+			 * error conventional Unix gives for this. */
+			return -ENOTCONN;
+		}
+		c = us->peer_cred;
+		spin_unlock_irqrestore(&us->lock, cflags);
+		*(struct ucred *)optval = c;
+		*optlen = (socklen_t)sizeof(struct ucred);
+		return 0;
+	}
+
 	/* Checked before the switch, not after: SO_ERROR below consumes the
 	 * pending error, and a call that cannot deliver it must not clear it. */
 	if (*optlen < (socklen_t)sizeof(int))

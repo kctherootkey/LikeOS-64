@@ -13,6 +13,6 @@
 # filename and never match the /usr/share/ prefix.
 [Desktop Entry]
 Type=Link
-Name=Terminal
+Name=Xterm
 Icon=utilities-terminal
 URL=/usr/share/applications/xterm.desktop

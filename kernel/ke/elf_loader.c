@@ -2,6 +2,8 @@
 // Supports static (ET_EXEC) and dynamic/PIE (ET_DYN) executables.
 // When PT_INTERP is present, loads the dynamic linker (ld-likeos.so) and
 // passes control to it with an auxiliary vector on the stack.
+#include <kernel/mm/rwsem.h>
+#include <kernel/fs/file.h>
 #include <kernel/ke/elf.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
@@ -948,13 +950,39 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	cur->brk = lr.brk_start;
 	cur->user_stack_top = USER_STACK_TOP_EXEC;
 	/* Clear stale mmap_region slots inherited from parent via fork+exec,
-	 * releasing any file references pinned for demand paging. */
-	for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
-		if (cur->mmap_regions[i].in_use && cur->mmap_regions[i].file)
-			vfs_close(cur->mmap_regions[i].file);
-		cur->mmap_regions[i].file = NULL;
-		cur->mmap_regions[i].lazy = false;
-		cur->mmap_regions[i].in_use = false;
+	 * releasing any file references pinned for demand paging.
+	 *
+	 * Under the address-space lock, because munmap() releases exactly the
+	 * same references while holding it for writing.  Unlocked, the two
+	 * could each read the same file out of a slot and each release it:
+	 * one reference, dropped twice, and the file destroyed while other
+	 * mappings still named it.  That is the general protection fault this
+	 * loop was taking, with the allocator's poison where ->ops should be.
+	 *
+	 * Taking the reference OUT of the slot before releasing it also means
+	 * that whoever loses the race finds nothing left to release. */
+	{
+		task_t *mm_owner = task_mm_owner(cur);
+
+		mm_write_lock(&mm_owner->mmap_lock);
+		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
+			vfs_file_t *rf = NULL;
+
+			/* ONLY an in-use slot owns a reference.  A slot that is
+			 * not in use can still carry a stale file pointer --
+			 * mm_regions_clone() copies the whole table by value,
+			 * and fork's incref pass deliberately skips the slots
+			 * that are not in use -- so releasing on the pointer
+			 * alone drops references that were never taken. */
+			if (cur->mmap_regions[i].in_use)
+				rf = cur->mmap_regions[i].file;
+			cur->mmap_regions[i].file = NULL;
+			cur->mmap_regions[i].lazy = false;
+			cur->mmap_regions[i].in_use = false;
+			if (rf)
+				vfs_close(rf);
+		}
+		mm_write_unlock(&mm_owner->mmap_lock);
 	}
 	cur->mmap_base = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
 
@@ -982,39 +1010,34 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	 * down, and so on.  Closing everything >= 3 unconditionally broke all
 	 * of that - the child found the descriptor gone (EBADF). */
 	for (int i = 3; i < TASK_MAX_FDS; i++) {
+		vfs_file_t *entry;
+		uint64_t fdflags;
+
 		if (!(task_get_fd_flags(cur, (unsigned)i) & FD_CLOEXEC))
 			continue;
+		/* Take the descriptor OUT of the table under the table's lock,
+		 * then release it with the lock dropped -- the same order
+		 * close() uses, and for the same two reasons.  A sibling thread
+		 * closing the same descriptor must not also reach the release
+		 * (one reference, freed twice), and releasing can sleep, which
+		 * must never happen holding this lock.
+		 *
+		 * It matters here because exec does NOT stop the other threads
+		 * of the process first: they are still running, still using
+		 * their descriptors, and were racing this loop.
+		 *
+		 * fd_release_entry() knows what each kind of entry needs, so
+		 * the per-kind ladder that used to be written out here -- and
+		 * had to be kept in step with every other copy of it -- is gone.
+		 */
+		fds_lock(cur, &fdflags);
+		entry = task_fds(cur)[i];
+		task_fds(cur)[i] = NULL;
 		task_set_fd_flags(cur, (unsigned)i, 0);
-		if (task_fds(cur)[i]) {
-			uint64_t marker = (uint64_t)task_fds(cur)[i];
-			if (marker >= 1 && marker <= 3) {
-				task_fds(cur)[i] = NULL;
-			} else if (IS_SOCKET_FD(task_fds(cur)[i])) {
-				int idx = SOCKET_FD_IDX(task_fds(cur)[i]);
-				task_fds(cur)[i] = NULL;
-				sock_close(idx);
-			} else if (unix_sock_is(task_fds(cur)[i])) {
-				unix_socket_t *ufd =
-					(unix_socket_t *)task_fds(cur)[i];
-				task_fds(cur)[i] = NULL;
-				unix_close(ufd);
-			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
-				/* Release this descriptor's reference; the
-				 * instance stays alive for anyone else holding
-				 * one.  Closing it outright here destroyed the
-				 * epoll set of the process that forked us. */
-				int idx = EPOLL_FD_IDX(task_fds(cur)[i]);
+		fds_unlock(cur, fdflags);
 
-				task_fds(cur)[i] = NULL;
-				epoll_put(idx);
-			} else if (pipe_is_end(task_fds(cur)[i])) {
-				pipe_close_end((pipe_end_t *)task_fds(cur)[i]);
-				task_fds(cur)[i] = NULL;
-			} else {
-				vfs_close(task_fds(cur)[i]);
-				task_fds(cur)[i] = NULL;
-			}
-		}
+		if (entry)
+			fd_release_entry(entry);
 	}
 
 	mm_switch_address_space(pml4);

@@ -1,4 +1,5 @@
 // LikeOS-64 Pipe Implementation
+#include <kernel/ke/waitq.h>
 #include <kernel/ke/pipe.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
@@ -51,6 +52,7 @@ pipe_t *pipe_create(size_t size)
 		return NULL;
 	}
 
+	wq_head_init(&pipe->poll_wq, "pipe-poll");
 	pipe->size = size;
 	WARN_ON(pipe->size == 0); /* pipe buffer size is zero after create */
 	WARN_ON(pipe->buffer == NULL); /* pipe buffer is NULL after create */
@@ -80,6 +82,7 @@ pipe_end_t *pipe_create_end(pipe_t *pipe, bool is_read)
 	end->pad[0] = end->pad[1] = end->pad[2] = 0;
 	end->pipe = pipe;
 	end->flags = 0;
+	end->refcount = 1; /* the descriptor that will own it */
 
 	uint64_t flags;
 	spin_lock_irqsave(&pipe->lock, &flags);
@@ -104,6 +107,14 @@ pipe_end_t *pipe_dup_end(pipe_end_t *end)
 	return pipe_create_end(end->pipe, end->is_read != 0);
 }
 
+bool pipe_end_hold(pipe_end_t *end)
+{
+	if (!end || end->magic != PIPE_MAGIC)
+		return false;
+	__atomic_fetch_add(&end->refcount, 1, __ATOMIC_ACQ_REL);
+	return true;
+}
+
 void pipe_close_end(pipe_end_t *end)
 {
 	BUG_ON(end == NULL);
@@ -114,6 +125,13 @@ void pipe_close_end(pipe_end_t *end)
 				PIPE_MAGIC); /* close with bad magic: double-close or corruption */
 		return;
 	}
+
+	/* Only the last holder tears the end down.  Everything below -- the
+	 * reader/writer tally, the wake, the free -- is what the DESCRIPTOR
+	 * going away means, and it must not happen while an operation that
+	 * looked this end up is still running. */
+	if (__atomic_sub_fetch(&end->refcount, 1, __ATOMIC_ACQ_REL) > 0)
+		return;
 
 	// Invalidate magic BEFORE freeing to prevent double-close via stale pointer
 	end->magic = 0;
@@ -202,7 +220,13 @@ int64_t sys_pipe(uint64_t pipefd_ptr)
 
 	int fd_write = fd_install(cur, (vfs_file_t *)write_end);
 	if (fd_write < 0) {
+		/* Undo the first install under the table lock: the slot is
+		 * shared with every other thread of this process. */
+		uint64_t fdflags = 0;
+
+		fds_lock(cur, &fdflags);
 		task_fds(cur)[fd_read] = NULL;
+		fds_unlock(cur, fdflags);
 		pipe_close_end(read_end);
 		pipe_close_end(write_end);
 		return fd_write;

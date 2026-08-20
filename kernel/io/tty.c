@@ -1,4 +1,5 @@
 // LikeOS-64 TTY/PTY subsystem
+#include <kernel/ke/waitq.h>
 #include <kernel/io/tty.h>
 #include <kernel/io/vt.h>
 #include <kernel/io/console.h>
@@ -92,6 +93,11 @@ typedef struct pty {
 	int master_open;
 	int slave_open;
 	void *slave_vf; // diagnostic: slave's vfs_file (refcount visibility)
+	/* Who is polling the MASTER end.  The slave end has its own, in the
+	 * tty_t above -- the two directions become ready independently, and a
+	 * shared queue would wake a terminal emulator every time the shell it
+	 * runs read a keystroke. */
+	struct wait_queue_head poll_wq;
 } pty_t;
 
 static tty_t g_console_tty;
@@ -119,16 +125,22 @@ static tty_t *g_active_tty = NULL;
  * 'waiters' itself is no longer touched (kept as a parameter only so
  * existing call sites need no change).
  */
-static void tty_wake_readers(task_t **waiters)
+static void tty_wake_readers(task_t **waiters, struct wait_queue_head *pq)
 {
 	sched_wake_channel((void *)waiters);
-	/* Also wake any task sleeping in poll/select/epoll_wait so that it
-     * re-scans its fd set immediately instead of waiting for the next
-     * timer tick.  Without this, programs that multiplex stdin and a
-     * socket via poll() (e.g. nc, openssl) see up to one tick of lag
-     * per keystroke. */
-	extern void poll_notify_io_ready(void);
-	poll_notify_io_ready();
+	/* Also wake anything sleeping in poll/select/epoll_wait on THIS
+	 * endpoint, so it re-scans immediately instead of waiting for the next
+	 * timer tick.  Without it, programs that multiplex stdin and a socket
+	 * through poll() see up to one tick of lag per keystroke.
+	 *
+	 * `pq' names the endpoint because the two ends of a pty become ready
+	 * independently: bytes the shell writes make the MASTER readable, and
+	 * a keystroke the emulator forwards makes the SLAVE readable.  Waking
+	 * both -- or worse, every poller on the machine, which is what a
+	 * single shared channel did -- means a terminal emulator is woken
+	 * every time its own shell reads a character. */
+	extern void poll_notify_wq(struct wait_queue_head *);
+	poll_notify_wq(pq);
 }
 
 static void tty_enqueue_read(tty_t *tty, char c)
@@ -265,7 +277,7 @@ static long pty_master_enqueue_bulk(pty_t *pty, const char *buf, long len)
 		PTY_MASTER_BUF_SIZE); /* PTY master ring buffer overflow: m_count > buffer capacity */
 	spin_unlock_irqrestore(&pty->lock, flags);
 	if (to_copy > 0) {
-		tty_wake_readers(&pty->master_read_waiters);
+		tty_wake_readers(&pty->master_read_waiters, &pty->poll_wq);
 	}
 	return (long)to_copy;
 }
@@ -319,6 +331,7 @@ static void tty_set_default_termios(tty_t *tty)
 void tty_init(void)
 {
 	mm_memset(&g_console_tty, 0, sizeof(g_console_tty));
+	wq_head_init_once(&g_console_tty.poll_wq, "console-poll");
 	g_console_tty.id = 1; // 1-based so 0 means "no tty"
 	g_console_tty.is_pty = 0;
 	g_console_tty.is_master = 0;
@@ -401,7 +414,7 @@ static void tty_signal_pgrp(tty_t *tty, int sig)
 	}
 	sched_signal_pgrp(tty->fg_pgid, sig);
 	// Wake any blocked readers so they can see they've been signaled/killed
-	tty_wake_readers(&tty->read_waiters);
+	tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 }
 
 void tty_input_char_raw(tty_t *tty, char c)
@@ -412,7 +425,7 @@ void tty_input_char_raw(tty_t *tty, char c)
 	if (!tty->is_pty && evdev_kbd_grabbed())
 		return;
 	tty_enqueue_read(tty, c);
-	tty_wake_readers(&tty->read_waiters);
+	tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 }
 
 /* Helper: inject a string into the TTY read buffer (raw, no line discipline) */
@@ -558,7 +571,7 @@ void tty_mouse_report(int pixel_x, int pixel_y, uint8_t buttons,
 
 	/* Wake readers waiting for input */
 	if (pressed || released || (motion && tty->mouse_btn_event))
-		tty_wake_readers(&tty->read_waiters);
+		tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 }
 
 /*
@@ -609,7 +622,7 @@ void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta)
 	seq[pos++] = 'M';
 	seq[pos] = '\0';
 	tty_inject_string(tty, seq);
-	tty_wake_readers(&tty->read_waiters);
+	tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 }
 
 /* Feed one character through the line discipline.  Returns non-zero when the
@@ -767,7 +780,7 @@ static int tty_input_char_core(tty_t *tty, char c, int ctrl)
 void tty_input_char(tty_t *tty, char c, int ctrl)
 {
 	if (tty_input_char_core(tty, c, ctrl))
-		tty_wake_readers(&tty->read_waiters);
+		tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 }
 
 /* Background process group access check (POSIX job control).  When a
@@ -807,7 +820,8 @@ long tty_read(tty_t *tty, void *buf, long count, int nonblock)
 	long ret = tty_read_inner(tty, buf, count, nonblock);
 
 	if (ret > 0 && tty && tty->is_pty && !tty->is_master && tty->priv)
-		tty_wake_readers(&((pty_t *)tty->priv)->slave_write_waiters);
+		tty_wake_readers(&((pty_t *)tty->priv)->slave_write_waiters,
+				 &((pty_t *)tty->priv)->poll_wq);
 	return ret;
 }
 
@@ -1078,7 +1092,7 @@ long tty_write(tty_t *tty, const void *buf, long count)
          * sched_enqueue_ready may take scheduler locks and we hold
          * tty_lock with IRQs off. */
 		if (mirror_console && vt_consume_reply_pending()) {
-			tty_wake_readers(&tty->read_waiters);
+			tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 		}
 
 		// Rate-limited VRAM flush (~50fps) — skips if too recent
@@ -1240,8 +1254,20 @@ int tty_pty_allocate(int *out_id)
 	for (int i = 0; i < TTY_MAX_PTYS; ++i) {
 		if (g_ptys[i].id == -1) {
 			pty_t *pty = &g_ptys[i];
+			/* Both poll queues survive the slot being reused --
+			 * see wq_head_init_once(). */
+			struct wait_queue_head saved_mwq = pty->poll_wq;
+			struct wait_queue_head saved_swq = pty->slave.poll_wq;
+
 			mm_memset(pty, 0, sizeof(pty_t));
+			pty->poll_wq = saved_mwq;
+			pty->slave.poll_wq = saved_swq;
 			spinlock_init(&pty->lock, "pty");
+			/* Both directions get their own queue: the master's
+			 * here, the slave's on the tty below. */
+			wq_head_init_once(&pty->poll_wq, "pty-master-poll");
+			wq_head_init_once(&pty->slave.poll_wq,
+					  "pty-slave-poll");
 			pty->id = i;
 			pty->master_open = 1;
 			pty->slave_open = 0;
@@ -1363,18 +1389,41 @@ long tty_pty_master_read(int id, void *buf, long count, int nonblock)
 			break;
 		}
 
-		/* Slave end is closed and the master ring is empty: EOF. */
+		/* Slave end is closed and the master ring is empty: EOF.
+		 *
+		 * This is the ONLY condition that may return zero.  Zero from
+		 * read() means end of file, and for a pty master that means
+		 * the line is down -- every reader treats it as "the child is
+		 * gone" and tears the terminal down. */
 		if (!pty->slave_open) {
 			spin_unlock_irqrestore(&pty->lock, flags);
 			break;
 		}
 		if (nonblock) {
 			spin_unlock_irqrestore(&pty->lock, flags);
-			break;
+			/* POSIX: O_NONBLOCK with no data yet -> EAGAIN, not
+			 * EOF -- the same rule tty_read() above follows for
+			 * the slave side, and tty_pty_master_write() for
+			 * writes.  This path returned 0 instead, and 0 is a
+			 * lie: the slave is open and the child may simply not
+			 * have written anything yet.
+			 *
+			 * VTE opens the master O_NONBLOCK and reads it from a
+			 * timer, so its very first read happened before the
+			 * freshly exec'd shell had printed a prompt.  It read
+			 * the zero as end-of-file, released the pty, and the
+			 * close hung the line up -- SIGHUP to the shell it had
+			 * just started.  The terminal window never appeared,
+			 * and nothing anywhere reported an error, because as
+			 * far as every layer was concerned the child had
+			 * simply finished. */
+			return -EAGAIN;
 		}
 		if (!cur) {
 			spin_unlock_irqrestore(&pty->lock, flags);
-			break;
+			/* No task to park: this cannot wait either, and
+			 * reporting EOF would be the same lie. */
+			return -EAGAIN;
 		}
 		if (signal_pending(cur)) {
 			spin_unlock_irqrestore(&pty->lock, flags);
@@ -1490,7 +1539,7 @@ long tty_pty_master_write(int id, const void *buf, long count, int nonblock)
 		i++;
 	}
 	if (wake)
-		tty_wake_readers(&pty->slave.read_waiters);
+		tty_wake_readers(&pty->slave.read_waiters, &pty->slave.poll_wq);
 	return i;
 }
 
@@ -1510,7 +1559,7 @@ int tty_pty_master_close(int id)
 		 * orphans pinned to a dead pts. */
 		if (pty->slave.fg_pgid > 0)
 			sched_signal_pgrp(pty->slave.fg_pgid, SIGHUP);
-		tty_wake_readers(&pty->slave.read_waiters);
+		tty_wake_readers(&pty->slave.read_waiters, &pty->slave.poll_wq);
 	}
 	if (!pty->slave_open) {
 		pty->id = -1;
@@ -1543,15 +1592,22 @@ int tty_pty_slave_close(int id)
      * EOF (read returns 0) and the master fd's poll set transitions to
      * POLLHUP.  Without this, the last shell `exit` leaves tmux's I/O
      * loop blocked indefinitely. */
-	tty_wake_readers(&pty->master_read_waiters);
+	tty_wake_readers(&pty->master_read_waiters, &pty->poll_wq);
 	/* And any task waiting for room in the input queue: with the slave
 	 * gone nothing will ever drain it, so the wait must end in EIO
 	 * rather than never. */
-	tty_wake_readers(&pty->slave_write_waiters);
+	tty_wake_readers(&pty->slave_write_waiters, &pty->poll_wq);
 	if (!pty->master_open) {
 		pty->id = -1;
 	}
 	return 0;
+}
+
+struct wait_queue_head *tty_pty_master_pollq(int id)
+{
+	pty_t *pty = tty_get_pty(id);
+
+	return pty ? &pty->poll_wq : NULL;
 }
 
 /* Poll a pty master endpoint. Returns POLLIN when there are bytes

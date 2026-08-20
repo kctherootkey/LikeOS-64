@@ -21,7 +21,9 @@ static int fd_link_target(task_t *cur, int fd, char *out, size_t cap)
 		return -EBADF;
 	if (cap < 2)
 		return -EINVAL;
-	vfs_file_t *entry = task_fds(cur)[fd];
+	/* Held: the arms below read the socket's id, ask devfs for the path it
+	 * was opened under, and fstat it -- all dereferences. */
+	vfs_file_t *entry = fdget(cur, fd);
 	uint64_t marker = (uint64_t)entry;
 	int n;
 	/* 0/1/2 with an empty slot (and the explicit console markers dup'ed
@@ -66,6 +68,8 @@ static int fd_link_target(task_t *cur, int fd, char *out, size_t cap)
 		n = 0;
 	if ((size_t)n > cap - 1)
 		n = (int)cap - 1;
+	if (entry)
+		fdput(entry);
 	return n;
 }
 
@@ -198,6 +202,11 @@ int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 
 int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 {
+	/* One exit, so the descriptor's hold is released on every path.  The
+	 * arms that answer before any lookup leave `file' NULL and release
+	 * nothing. */
+	vfs_file_t *file = NULL;
+	int64_t ret;
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
@@ -224,12 +233,15 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 		st.st_rdev = ((uint64_t)5 << 8) | (fd & 0xff); /* tty major=5 */
 		st.st_size = 0;
 		// Security: Use SMAP-aware copy to user
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
-	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL) {
-		return -EBADF;
+	/* Held for the whole classification below, which dereferences it. */
+	file = fdget(cur, (int)fd);
+	if (!file) {
+		ret = -EBADF;
+		goto out;
 	}
-	vfs_file_t *file = task_fds(cur)[fd];
 
 	/* Classify the tagged fd-table MARKERS before anything dereferences
 	 * `file'.  A socket, an AF_UNIX socket, an epoll instance and a dup'ed
@@ -249,7 +261,8 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 					S_IROTH | S_IWOTH);
 		st.st_rdev = ((uint64_t)5 << 8) | (marker - 1);
 		st.st_size = 0;
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
 	if (IS_SOCKET_FD(file) || unix_sock_is(file)) {
 		st.st_mode = S_IFSOCK | (S_IRUSR | S_IWUSR);
@@ -261,7 +274,8 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 				    marker;
 		st.st_size = 0;
 		st.st_blksize = 4096;
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
 	if (IS_EPOLL_FD(file)) {
 		/* An anonymous inode: no type bits of its own, reported the way
@@ -270,7 +284,8 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 		st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR);
 		st.st_ino = marker;
 		st.st_size = 0;
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
 
 	if (pipe_is_end(file)) {
@@ -278,11 +293,13 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 					S_IROTH | S_IWOTH);
 		st.st_size = 0;
 		// Security: Use SMAP-aware copy to user
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
 	if (devfs_fstat(file, &st) == 0) {
 		// Security: Use SMAP-aware copy to user
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
 	/* Regular file: report the REAL inode metadata (mode/uid/gid/size/
 	 * times) from the filesystem.  fstat() used to hardcode 0644 root:root,
@@ -291,13 +308,20 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 	 * wrong mode even though stat() on the path reported the truth. */
 	if (vfs_fstat(file, &st) == ST_OK) {
 		// Security: Use SMAP-aware copy to user
-		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+		goto out;
 	}
 	/* Filesystem cannot report fd metadata: sane regular-file default. */
 	st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	st.st_size = vfs_size(file);
 	// Security: Use SMAP-aware copy to user
-	return copy_to_user((void *)stat_buf, &st, sizeof(st));
+	ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
+	goto out;
+
+out:
+	if (file)
+		fdput(file);
+	return ret;
 }
 
 int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
@@ -544,7 +568,7 @@ int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
 		return -EBADF;
 
 	task_t *cur = sched_current();
-	if (!cur || !task_fds(cur)[fd])
+	if (!cur)
 		return -EBADF;
 
 	/* Stats of the filesystem the descriptor's file lives on.  Descriptors not
@@ -552,9 +576,16 @@ int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
      * own, so report the root filesystem instead of dereferencing them. */
 	struct vfs_statfs vsf;
 	mm_memset(&vsf, 0, sizeof(vsf));
-	vfs_file_t *file = task_fds(cur)[fd];
-	int r = fd_is_special(file) ? vfs_statfs("/", &vsf) :
-				      vfs_fstatfs(file, &vsf);
+	vfs_file_t *file = fdget(cur, (int)fd);
+	int r;
+
+	if (!file)
+		return -EBADF;
+	r = fd_is_special(file) ? vfs_statfs("/", &vsf) :
+				  vfs_fstatfs(file, &vsf);
+	/* Nothing below touches the file, only the statistics copied out of
+	 * it, so the hold ends here. */
+	fdput(file);
 	if (r == ST_UNSUPPORTED)
 		return -ENOSYS;
 	if (r != ST_OK)

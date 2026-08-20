@@ -140,6 +140,25 @@ int mkostemps(char* templ, int suffixlen, int oflags);
 char* mktemp(char* templ);
 char* mkdtemp(char* templ);
 
+/* Pseudo-terminals.
+ *
+ * <stdlib.h> is where POSIX.1-2008 puts these -- an odd home for them, but the
+ * standard one, and it is where portable code and every configure script goes
+ * looking.  They are also visible through <unistd.h>, which is where this tree
+ * has always found them.
+ *
+ * posix_openpt() opens a new master and returns its descriptor; grantpt() sets
+ * the owner and permissions of the slave; unlockpt() releases it; ptsname()
+ * gives the slave's path (in a static buffer, so ptsname_r() for anything with
+ * threads).  <util.h> has openpty() and forkpty(), which are these four and a
+ * fork wrapped up.  ptsname_r() is not POSIX; it is the reentrant form
+ * everybody implements. */
+int posix_openpt(int flags);
+int grantpt(int fd);
+int unlockpt(int fd);
+char* ptsname(int fd);
+int   ptsname_r(int fd, char* buf, size_t buflen);
+
 /* System load averages over the last 1, 5 and 15 minutes.  Returns the number
  * of values actually stored (at most 3), or -1 on failure.  Declared here
  * because that is where both BSD and glibc put it. */

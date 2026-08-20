@@ -329,9 +329,20 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * address.  Only a threaded program could hit it -- forking from a
 	 * single-threaded one, the caller IS the owner. */
 	task_t *mm_src = task_mm_owner(cur);
+	bool got_regions;
 
-	if (share_vm ? !mm_regions_init(child) :
-		       !mm_regions_clone(child, mm_src)) {
+	if (share_vm) {
+		/* A CLONE_VM thread gets an empty table and takes no
+		 * references: its bookkeeping is owner-routed to the group
+		 * leader, and the leader-only release at exit would not
+		 * balance them. */
+		got_regions = mm_regions_init(child);
+	} else {
+		/* The copy and the references it implies are ONE locked step;
+		 * see mm_regions_clone_ref(). */
+		got_regions = mm_regions_clone_ref(child, mm_src);
+	}
+	if (!got_regions) {
 		mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
 		kfree(child);
 		return -ENOMEM;
@@ -360,20 +371,6 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * kernel context is the hand-built fork_child_return frame, so no live
 	 * frame carries the old value and regenerating is safe. */
 	child->stack_canary = generate_stack_canary();
-
-	/* Demand paging: a fork-like clone (no CLONE_VM) copies the region
-	 * table by value and is its own thread-group leader, so it needs its
-	 * own reference on every file-backed lazy region.  CLONE_VM threads
-	 * carry only a stale copy (bookkeeping is owner-routed to the group
-	 * leader) and must NOT take references — the leader-only release at
-	 * exit would not balance them. */
-	if (!share_vm) {
-		for (uint32_t i = 0; i < child->mmap_capacity; i++) {
-			if (child->mmap_regions[i].in_use &&
-			    child->mmap_regions[i].file)
-				vfs_incref(child->mmap_regions[i].file);
-		}
-	}
 
 	// Assign unique ID (atomic; no lock needed just for the counter)
 	uint64_t irq_flags;
@@ -510,28 +507,12 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			child->fd_flags[i] = 0;
 		}
 	} else {
-		// Clone file descriptors
+		/* A private table of the caller's descriptors, with a reference
+		 * taken for each.  See fd_table_clone(): the read and the
+		 * reference must be one locked step, and the pipe ends have to
+		 * be duplicated after the lock is dropped. */
 		child->files = NULL;
-		for (int i = 0; i < TASK_MAX_FDS; i++) {
-			vfs_file_t *src_fd = task_fds(cur)[i];
-			/* The child owns a PRIVATE table, so the flags have to
-			 * be copied out of whichever array is the caller's
-			 * effective one — the wholesale task copy duplicated
-			 * cur->fd_flags, which is the empty legacy array once
-			 * the caller became part of a thread group. */
-			child->fd_flags[i] =
-				task_get_fd_flags(cur, (unsigned)i);
-			/* Every descriptor KIND has to be duplicated the way its
-			 * own type demands.  This used to fall through to
-			 * vfs_dup() for anything that was not a console marker
-			 * or a pipe end — but a socket, unix-socket or epoll
-			 * descriptor is a small tagged integer, not a pointer,
-			 * so vfs_dup dereferenced it.  fd_dup_entry classifies
-			 * first (and takes the socket refcounts fork already
-			 * took). */
-			child->fd_table[i] =
-				src_fd ? fd_dup_entry(src_fd) : NULL;
-		}
+		fd_table_clone(child, cur);
 	}
 
 	// Handle CLONE_SIGHAND (share signal handlers)

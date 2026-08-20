@@ -2,7 +2,8 @@ CC = gcc
 AR = ar
 LD = ld
 DEBUG ?= 0
-CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
+CFLAGS = -Wall -Wextra -Werror=implicit-function-declaration \
+	-Werror=misleading-indentation -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -I./include
 ifeq ($(DEBUG),1)
 CFLAGS += -DSTACK_SMASH_DEBUG -DDEBUG=1
@@ -15,17 +16,18 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c src/string/fnmatch.c src/string/strnlen.c src/string/glob.c
-STDLIB_SRC = src/crt/initfini.c src/stdlib/stdlib.c src/stdlib/cxa_atexit.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c src/stdlib/getloadavg.c src/stdlib/assert.c
+STDLIB_SRC = src/crt/initfini.c src/stdlib/stdlib.c src/stdlib/cxa_atexit.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c src/stdlib/getloadavg.c src/stdlib/assert.c src/stdlib/search.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
-MATH_SRC = src/math/math.c
+MATH_SRC = src/math/math.c src/math/fenv.c
 REGEX_SRC = src/regex/regex.c
 ICONV_SRC = src/iconv/iconv.c
 # Locale and wide-character support.  unicode.c is generated -- see
 # host/gen-unicode-tables.py.
 LOCALE_SRC = src/locale/locale.c src/locale/multibyte.c src/locale/wctype.c \
-             src/locale/wcwidth.c src/locale/wcstr.c src/locale/unicode.c
+             src/locale/wcwidth.c src/locale/wcstr.c src/locale/unicode.c \
+             src/locale/uchar.c
 EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c src/stdio/wstdio.c src/stdio/stdio_ext.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c src/syscalls/ptrace.c
 DLFCN_SRC = src/dl/dlfcn.c

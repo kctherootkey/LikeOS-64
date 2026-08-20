@@ -1,0 +1,8 @@
+# A Type=Link shortcut, not a copy of the application's own desktop entry --
+# see xterm.desktop next to this file for why that distinction matters to
+# PCManFM.
+[Desktop Entry]
+Type=Link
+Name=Hexchat IRC Client
+Icon=io.github.Hexchat
+URL=/usr/share/applications/io.github.Hexchat.desktop

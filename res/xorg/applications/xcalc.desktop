@@ -9,8 +9,8 @@
 # being written here, the same as every other launcher on this image.
 Type=Application
 Version=1.0
-Name=Calculator
-GenericName=Calculator
+Name=X Calculator
+GenericName=X Calculator
 Comment=Perform calculations
 Exec=xcalc
 Icon=accessories-calculator

@@ -93,6 +93,25 @@ static void devpoll_thread(void *arg)
 __no_stack_protector void kernel_main(boot_info_t *boot_info)
 {
 	BUG_ON(boot_info == NULL);
+
+	/* Enforce CR0.WP on the boot processor before anything else runs.
+	 *
+	 * WP (bit 16) makes supervisor writes honour the read-only bit in a
+	 * PTE; with it clear, ring 0 writes straight through read-only user
+	 * mappings, and everything this kernel builds on them -- read-only
+	 * program text, fork's copy-on-write -- silently stops holding.  The
+	 * AP trampoline sets CR0 to 0x80010033 explicitly, WP included, but
+	 * the BSP inherits whatever the firmware left, so pin it here rather
+	 * than trust that every firmware agrees. */
+	{
+		uint64_t cr0;
+
+		__asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+		if (!(cr0 & (1ULL << 16)))
+			__asm__ volatile("mov %0, %%cr0" ::"r"(cr0 |
+							       (1ULL << 16)));
+	}
+
 	g_boot_info = boot_info;
 	console_init((framebuffer_info_t *)&boot_info->fb_info);
 	console_init_fb_optimization();

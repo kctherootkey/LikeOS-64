@@ -10,16 +10,19 @@ int64_t sys_fsync(uint64_t fd)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
-	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
+	vfs_file_t *file = fdget(cur, (int)fd);
+	int64_t ret = 0;
+
+	if (!file)
 		return -EBADF;
-	vfs_file_t *file = task_fds(cur)[fd];
-	if (fd_is_special(file))
-		return 0; /* nothing to flush */
-	/* Dispatch to the file's own filesystem; a filesystem with nothing to
-     * flush leaves the op NULL and fsync is a no-op. */
-	if (file->ops && file->ops->fsync)
-		return file->ops->fsync(file);
-	return 0;
+	if (!fd_is_special(file)) {
+		/* Dispatch to the file's own filesystem; a filesystem with
+		 * nothing to flush leaves the op NULL and fsync is a no-op. */
+		if (file->ops && file->ops->fsync)
+			ret = file->ops->fsync(file);
+	}
+	fdput(file);
+	return ret;
 }
 
 int64_t sys_sync(void)

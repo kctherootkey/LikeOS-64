@@ -4,7 +4,8 @@ CC      = gcc
 AS      = gcc
 LD      = ld
 
-CFLAGS  = -Wall -Wextra -O2 \
+CFLAGS  = -Wall -Wextra -Werror=implicit-function-declaration \
+	-Werror=misleading-indentation -O2 \
           -fPIC -fno-builtin -fstack-protector-strong \
           -nostdlib -nostdinc -ffreestanding \
           -mno-red-zone -mcmodel=small \

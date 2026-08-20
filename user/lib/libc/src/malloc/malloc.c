@@ -420,6 +420,7 @@ static void malloc_consolidate(struct malloc_state *av);
 static void *sysmalloc(struct malloc_state *av, size_t nb);
 static void tcache_maybe_init(void);
 static void malloc_init_once(void);
+static void malloc_read_tunables(void);
 
 /* Lower bound on a neighbouring chunk's size, for the sanity checks below.
  *
@@ -700,6 +701,55 @@ static size_t env_size(const char *name, size_t dflt)
     return (size_t)strtoul(s, NULL, 10);
 }
 
+static void malloc_read_tunables(void)
+{
+    /* Secure execution: a set-ID binary run by an ordinary user must not take
+     * allocator behaviour from the environment.  The caller controls the
+     * environment but not the credentials the program runs with, so any
+     * MALLOC_* variable would let them steer a privileged process's allocator
+     * from outside.  Everything then runs at its default; root's own
+     * invocations (real uid 0) keep the tunables, since the environment and
+     * the privilege already belong to the same person. */
+    if (getuid() != 0 &&
+        (getuid() != geteuid() || getgid() != getegid())) {
+        mp_.mmap_threshold = DEFAULT_MMAP_THRESHOLD;
+        mp_.no_dyn_threshold = 0;
+        mp_.trim_threshold = DEFAULT_TRIM_THRESHOLD;
+        mp_.top_pad = DEFAULT_TOP_PAD;
+        mp_.n_mmaps_max = (int)DEFAULT_MMAP_MAX;
+        mp_.perturb_byte = 0;
+        return;
+    }
+
+    mp_.mmap_threshold = env_size("MALLOC_MMAP_THRESHOLD_", DEFAULT_MMAP_THRESHOLD);
+    mp_.no_dyn_threshold = getenv("MALLOC_MMAP_THRESHOLD_") != NULL;
+    mp_.trim_threshold = env_size("MALLOC_TRIM_THRESHOLD_", DEFAULT_TRIM_THRESHOLD);
+    if (getenv("MALLOC_TRIM_HEAPS") && env_size("MALLOC_TRIM_HEAPS", 1) == 0)
+        heap_trim_enabled = 0;
+    mp_.top_pad = env_size("MALLOC_TOP_PAD_", DEFAULT_TOP_PAD);
+    mp_.n_mmaps_max = (int)env_size("MALLOC_MMAP_MAX_", DEFAULT_MMAP_MAX);
+    mp_.perturb_byte = (int)(env_size("MALLOC_PERTURB_", 0) & 0xff);
+}
+
+/* The environment arrives AFTER the first allocation, so the tunables have to
+ * be read twice.
+ *
+ * A dynamically linked program runs the constructors of every shared library
+ * before the start-up code populates the environment, and a library like GLib
+ * allocates in its constructors.  So the first malloc happens with nothing to
+ * read, and everything above came out at its default -- not just this mode:
+ * MALLOC_PERTURB_, MALLOC_ARENA_MAX and the thresholds were all silently
+ * inert in exactly the programs anyone would want to set them for, with no way
+ * to tell from the outside that they had been ignored.
+ *
+ * __libc_init_environ() calls this the moment the environment exists. */
+void __malloc_env_ready(void)
+{
+    if (!malloc_initialized)
+        return; /* nothing allocated yet -- init will read it in time */
+    malloc_read_tunables();
+}
+
 static void malloc_init_once(void)
 {
     mlock_lock(&arena_list_lock);
@@ -722,15 +772,7 @@ static void malloc_init_once(void)
     ptr_secret = (uintptr_t)r[0];
     tcache_entry_key = (uintptr_t)r[1] | 1;   /* never 0 */
 
-    /* Tunables */
-    mp_.mmap_threshold = env_size("MALLOC_MMAP_THRESHOLD_", DEFAULT_MMAP_THRESHOLD);
-    mp_.no_dyn_threshold = getenv("MALLOC_MMAP_THRESHOLD_") != NULL;
-    mp_.trim_threshold = env_size("MALLOC_TRIM_THRESHOLD_", DEFAULT_TRIM_THRESHOLD);
-    if (getenv("MALLOC_TRIM_HEAPS") && env_size("MALLOC_TRIM_HEAPS", 1) == 0)
-        heap_trim_enabled = 0;
-    mp_.top_pad = env_size("MALLOC_TOP_PAD_", DEFAULT_TOP_PAD);
-    mp_.n_mmaps_max = (int)env_size("MALLOC_MMAP_MAX_", DEFAULT_MMAP_MAX);
-    mp_.perturb_byte = (int)(env_size("MALLOC_PERTURB_", 0) & 0xff);
+    malloc_read_tunables();
 
     /* Arena limit: one per CPU, capped */
     cpu_set_t set;

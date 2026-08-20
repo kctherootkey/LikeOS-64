@@ -92,6 +92,11 @@ syscall_entry:
     mov [gs:PERCPU_SYSCALL_URSP], rsp
     ; Use per-CPU kernel stack (set by context switch on this CPU)
     mov rsp, [gs:PERCPU_SYSCALL_KRSP]
+    ; DF=0 for kernel C code.  SYSCALL clears only the RFLAGS bits named in
+    ; the FMASK MSR, and DF is not among them -- so a syscall issued while the
+    ; caller had DF=1 (mid-`std`, e.g. a backward memmove) would run the whole
+    ; kernel with backward string ops.  The user's DF returns via R11/sysret.
+    cld
 
     push qword [gs:PERCPU_SYSCALL_URSP]
     push r11

@@ -4,6 +4,7 @@
 
 #include <kernel/uapi/types.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/waitq.h> /* struct wait_queue_head, for the poll queue */
 
 // Termios-like types
 typedef unsigned int tcflag_t;
@@ -101,6 +102,9 @@ typedef struct tty {
 
 	void (*output)(struct tty *tty, char c);
 	void *priv; // pty linkage
+	/* Who is polling this terminal.  A readiness change wakes only these
+	 * tasks -- see <kernel/ke/waitq.h>. */
+	struct wait_queue_head poll_wq;
 } tty_t;
 
 void tty_init(void);
@@ -138,6 +142,9 @@ long tty_pty_master_write(int id, const void *buf, long count,
 			  int nonblock);
 int tty_pty_master_close(int id);
 int tty_pty_master_poll(int id, int events);
+/* The master end's poll wait queue, for poll()/select() to register on.
+ * NULL when `id' names no allocated pty. */
+struct wait_queue_head *tty_pty_master_pollq(int id);
 int tty_pty_slave_close(int id);
 
 #endif

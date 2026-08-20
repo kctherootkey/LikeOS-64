@@ -124,6 +124,37 @@ stage_lib libfm-gtk3
 stage_lib libfm-extra
 stage_lib libmenu-cache
 
+# GTK 2, for HexChat -- whose stable line is a GTK+ 2 program and has been for
+# its whole life.  Only the two toolkit libraries are new: everything below
+# them (GLib, Pango, Cairo, ATK, gdk-pixbuf) is shared with GTK 3 and is
+# already staged above.
+stage_lib libgtk-x11-2.0
+stage_lib libgdk-x11-2.0
+
+# xfce4-terminal, from the bottom up.
+#
+# VTE is the terminal emulator proper -- the escape-sequence parser, the screen
+# model, the selection and the scrollback -- and the three below it are its
+# own dependencies: lz4 compresses the scrollback in memory, simdutf validates
+# every byte arriving from the child, and fmt is the C++ formatting library
+# its code is written against.
+stage_lib liblz4
+stage_lib libsimdutf
+stage_lib libfmt
+stage_lib libvte-2.91
+
+# The Xfce libraries above VTE: helpers, the settings client, the shared
+# widgets, and the accelerator handling the terminal binds its keys with.
+stage_lib libxfce4util
+stage_lib libxfconf-0
+stage_lib libxfce4ui-2
+stage_lib libxfce4kbd-private-3
+
+# The session bus.  xfconf is a daemon and a client library that find each
+# other over it; with no bus the terminal warns once and forgets every
+# preference it is given.
+stage_lib libdbus-1
+
 # ---------------------------------------------------------------------------
 # Programs.
 # ---------------------------------------------------------------------------
@@ -138,6 +169,35 @@ fi
 # PCManFM's own menus, so leaving either out turns a menu item into nothing
 # happening.
 for b in pcmanfm mousepad libfm-pref-apps lxshortcut; do
+	[ -f "$SYSROOT/usr/bin/$b" ] || continue
+	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
+	staged=$((staged + 1))
+done
+
+# The three desktop applications this port exists for beside Claws: a
+# calculator, a terminal emulator and an IRC client.
+#
+# xfconf-query is the settings store's command-line face -- the only way to
+# read or set a preference without the dialog that owns it, and the first
+# thing to reach for when a setting does not stick.
+for b in galculator xfce4-terminal hexchat xfconf-query; do
+	[ -f "$SYSROOT/usr/bin/$b" ] || continue
+	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
+	staged=$((staged + 1))
+done
+
+# The session bus: the daemon, and the tools that start it and look inside it.
+#
+# dbus-launch is what xinitrc starts the bus with; dbus-run-session is the
+# same thing scoped to one command.  dbus-send and dbus-monitor are how a bus
+# problem is diagnosed from a shell -- without them a service that fails to
+# activate gives no way at all to ask why.  dbus-uuidgen writes the machine
+# id, which the daemon refuses to start without.
+#
+# NOT dbus-daemon-launch-helper: it is the setuid helper that starts SYSTEM
+# services as another user, and this image runs a session bus only.
+for b in dbus-daemon dbus-launch dbus-run-session dbus-send dbus-monitor \
+	dbus-uuidgen dbus-cleanup-sockets dbus-update-activation-environment; do
 	[ -f "$SYSROOT/usr/bin/$b" ] || continue
 	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 	staged=$((staged + 1))
@@ -191,6 +251,55 @@ if [ -d "$SYSROOT/usr/libexec" ]; then
 		cp "$SYSROOT/usr/libexec/$h" "$DEST/usr/libexec/$h"
 		staged=$((staged + 1))
 	done
+fi
+
+# The settings daemon, at the path its D-Bus service file names.
+#
+# Nothing on the image starts xfconfd.  The bus does, the first time anything
+# asks for org.xfce.Xfconf -- which is what xfce4-terminal does as it starts.
+# The path in org.xfce.Xfconf.service is absolute and compiled in, so this
+# keeps the layout it was built with rather than moving to /usr/bin.
+if [ -f "$SYSROOT/usr/lib/xfce4/xfconf/xfconfd" ]; then
+	mkdir -p "$DEST/usr/lib/xfce4/xfconf"
+	cp "$SYSROOT/usr/lib/xfce4/xfconf/xfconfd" \
+		"$DEST/usr/lib/xfce4/xfconf/xfconfd"
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# D-Bus: the configuration, and the services the bus can start.
+#
+# All three parts are needed and each one's absence is silent:
+#
+#   /etc/dbus-1/session.conf   what the daemon reads at startup.  Without it
+#                              dbus-daemon --session exits immediately.
+#   .../session.d              the drop-in directory session.conf includes;
+#                              an <includedir> that does not exist is an
+#                              error, so it is created even when empty.
+#   .../dbus-1/services        one file per activatable service, naming the
+#                              program to run.  org.xfce.Xfconf.service is
+#                              what makes the settings daemon appear.
+# ---------------------------------------------------------------------------
+if [ -f "$SYSROOT/etc/dbus-1/session.conf" ]; then
+	mkdir -p "$DEST/etc/dbus-1/session.d" "$DEST/etc/dbus-1/system.d"
+	cp "$SYSROOT/etc/dbus-1/session.conf" "$DEST/etc/dbus-1/session.conf"
+	[ -f "$SYSROOT/etc/dbus-1/system.conf" ] &&
+		cp "$SYSROOT/etc/dbus-1/system.conf" \
+			"$DEST/etc/dbus-1/system.conf"
+	staged=$((staged + 1))
+fi
+if [ -d "$SYSROOT/usr/share/dbus-1" ]; then
+	mkdir -p "$DEST/usr/share/dbus-1/services" \
+		"$DEST/usr/share/dbus-1/session.d"
+	for f in "$SYSROOT"/usr/share/dbus-1/services/*.service; do
+		[ -f "$f" ] || continue
+		cp "$f" "$DEST/usr/share/dbus-1/services/"
+	done
+	for f in "$SYSROOT"/usr/share/dbus-1/session.conf \
+		"$SYSROOT"/usr/share/dbus-1/system.conf; do
+		[ -f "$f" ] && cp "$f" "$DEST/usr/share/dbus-1/"
+	done
+	staged=$((staged + 1))
 fi
 
 # ---------------------------------------------------------------------------
@@ -359,6 +468,37 @@ if [ -d "$SYSROOT/usr/share/mime" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Data the three new applications read at run time.
+#
+# Each of these is a program that starts and then does nothing useful without
+# its own files:
+#
+#   galculator/ui       the whole interface.  Galculator builds its window
+#                       from GtkBuilder .ui files at startup rather than in
+#                       code; with the directory missing it exits with
+#                       "couldn't load ui file".
+#   xfce4/terminal      the colour schemes offered in the preferences dialog.
+#   hexchat/plugins     the two plugins built here -- checksum for DCC
+#                       transfers, fishlim for encrypted channels.  Loaded by
+#                       path at startup.
+# ---------------------------------------------------------------------------
+for d in galculator xfce4/terminal; do
+	[ -d "$SYSROOT/usr/share/$d" ] || continue
+	mkdir -p "$DEST/usr/share/$(dirname "$d")"
+	cp -a "$SYSROOT/usr/share/$d" "$DEST/usr/share/$(dirname "$d")/"
+	staged=$((staged + 1))
+done
+
+if [ -d "$SYSROOT/usr/lib/hexchat/plugins" ]; then
+	mkdir -p "$DEST/usr/lib/hexchat/plugins"
+	for m in "$SYSROOT"/usr/lib/hexchat/plugins/*.so; do
+		[ -f "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/hexchat/plugins/"
+	done
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
 # What can OPEN it: the desktop entries.
 #
 # One file per installed application, and the only place the system records
@@ -374,6 +514,44 @@ if [ -d "$SYSROOT/usr/share/applications" ]; then
 	mkdir -p "$DEST/usr/share/applications"
 	cp "$SYSROOT"/usr/share/applications/*.desktop \
 		"$DEST/usr/share/applications/" 2>/dev/null || true
+	staged=$((staged + 1))
+fi
+
+# Entries for programs this image does not install.
+#
+# libxfce4ui installs an "About Xfce" launcher along with the widget library
+# xfce4-terminal links.  The program behind it is a dialog describing the Xfce
+# desktop -- its version, its components, its licence -- and this is not an
+# Xfce desktop: the terminal is here, the desktop it came from is not.  Left
+# in, the applications menu offers to tell the user about a desktop
+# environment they are not running.
+#
+# Removed rather than not built: it comes out of the same `make install' as
+# the library, and a configure switch to leave it behind does not exist.
+rm -f "$DEST/usr/share/applications/xfce4-about.desktop"
+
+# Give the entries that came from a package the names this desktop uses.
+#
+# Has to run HERE: the entries written for this image are copied by the X.Org
+# port's staging script, the ones above come from the sysroot, and this is the
+# first moment both are in one directory.  See res/xorg/applications/renames
+# for why these three are renamed rather than replaced.
+#
+# Only the unlocalised Name= is touched, and only the first one -- a .desktop
+# file can hold several groups (Desktop Action blocks each have their own
+# Name), and rewriting all of them would rename the actions too.
+renames="$root/res/xorg/applications/renames"
+if [ -f "$renames" ] && [ -d "$DEST/usr/share/applications" ]; then
+	while read -r df newname; do
+		case "$df" in '' | '#'*) continue ;; esac
+		[ -n "$newname" ] || continue
+		target="$DEST/usr/share/applications/$df"
+		[ -f "$target" ] || continue
+		awk -v want="$newname" '
+			!done && /^Name[ \t]*=/ { print "Name=" want; done = 1; next }
+			{ print }
+		' "$target" >"$target.new" && mv "$target.new" "$target"
+	done <"$renames"
 	staged=$((staged + 1))
 fi
 
@@ -509,6 +687,19 @@ if [ -f "$root/res/xorg/gtk3/pcmanfm.conf" ]; then
 	mkdir -p "$DEST/etc/xdg/pcmanfm/default"
 	cp "$root/res/xorg/gtk3/pcmanfm.conf" \
 		"$DEST/etc/xdg/pcmanfm/default/pcmanfm.conf"
+fi
+
+# System defaults for the terminal.
+#
+# xfconfd merges every channel file along XDG_CONFIG_DIRS with the user's own
+# last, so this sets the defaults without taking the preferences dialog away:
+# anything changed there is written under ~/.config and wins.  /etc/xdg is the
+# last entry of libxfce4util's built-in search path, so no environment
+# variable has to be set for it to be found.
+if [ -f "$root/res/xorg/gtk3/xfce4-terminal.xml" ]; then
+	mkdir -p "$DEST/etc/xdg/xfce4/xfconf/xfce-perchannel-xml"
+	cp "$root/res/xorg/gtk3/xfce4-terminal.xml" \
+		"$DEST/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml"
 fi
 
 # The desktop wallpaper the file above names.

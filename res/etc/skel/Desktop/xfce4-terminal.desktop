@@ -1,0 +1,8 @@
+# A Type=Link shortcut, not a copy of the application's own desktop entry --
+# see xterm.desktop next to this file for why that distinction matters to
+# PCManFM.
+[Desktop Entry]
+Type=Link
+Name=Terminal
+Icon=org.xfce.terminal
+URL=/usr/share/applications/xfce4-terminal.desktop

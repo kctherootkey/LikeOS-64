@@ -1,0 +1,54 @@
+Ask this system for its descriptor limit, so fdwalk has a range to walk
+
+getrlimit_NOFILE_max() is written as a list of systems whose getrlimit() is
+known to be async-signal-safe -- Linux, glibc, the BSDs, Apple -- and returns
+RLIM_INFINITY for anything not on the list.  fdwalk() then treats infinity as
+"cannot close infinitely many descriptors" and gives up:
+
+        errno = ENFILE;
+        return -1;
+
+which surfaces, several layers up, as
+
+        Failed to execute child process "bash":
+        Failed to fdwalk: Too many open files in system
+
+Nothing is out of files.  ENFILE is a stand-in for "I do not know how many
+descriptors there could be", and every attempt to start a shell fails with it
+-- so the terminal opens, immediately puts up that dialog, and closes.
+
+LikeOS is added to the arm that simply asks getrlimit(), for the reason that
+arm exists: this libc's getrlimit is a thin wrapper around a single syscall
+that takes no lock and allocates nothing, so calling it between fork and exec
+is safe.  It reports RLIMIT_NOFILE as OPEN_MAX -- the real, bounded size of
+the descriptor table -- so the walk terminates.
+
+--- a/src/missing.cc
++++ b/src/missing.cc
+@@ -107,21 +107,23 @@
+ }
+ #endif /* __linux__ */
+ 
+-#ifdef __GLIBC__
++#if defined(__GLIBC__) || defined(__LIKEOS__)
+ {
+         struct rlimit rlim;
+ 
+         /* Use getrlimit() function provided by the system if it is known to be
+          * async-signal safe.
+          *
+-         * According to the glibc manual, getrlimit is AS-safe.
++         * According to the glibc manual, getrlimit is AS-safe.  On LikeOS it
++         * is a wrapper around one syscall that takes no lock and allocates
++         * nothing, which is the property being relied on here.
+          */
+         if (getrlimit(RLIMIT_NOFILE, &rlim) == 0)
+                 return rlim.rlim_max;
+ }
+ 
+         /* fallback */
+-#endif /* __GLIBC__ */
++#endif /* __GLIBC__ || __LIKEOS__ */
+ 
+ #endif /* HAVE_SYS_RESOURCE_H */
+ 

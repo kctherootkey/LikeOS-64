@@ -308,28 +308,146 @@ double acos(double x)
 	return atan2(sqrt(1.0 - x * x), x);
 }
 
+/* sinh and tanh, through expm1 rather than exp.
+ *
+ * Both are differences of two exponentials that approach each other as the
+ * argument approaches zero, and writing them that way destroys the answer:
+ * sinh(x) as (e^x - e^-x)/2 subtracts 1.0000000001 from 0.9999999999 and keeps
+ * whatever survives, which for x = 1e-10 is eight correct digits out of
+ * sixteen.  The error is in the SUBTRACTION, so no amount of accuracy in exp()
+ * helps -- the digits are gone before it returns.
+ *
+ * expm1(x) computes e^x - 1 without ever forming e^x, so the small quantity
+ * stays small and keeps its precision.  Rewriting each function in terms of
+ * t = e^|x| - 1 is then exact algebra:
+ *
+ *   sinh = (t*t + 2t) / (2(t+1))     tanh = (e^2a - 1) / (e^2a + 1)
+ *
+ * and each is given in the two forms below because they round differently --
+ * which of the two is used is the only thing the |x| < 1 test decides.
+ *
+ * Both take |x| and put the sign back at the end: they are odd functions, and
+ * a branch on the sign is a second thing that can be wrong.
+ */
 double sinh(double x)
 {
-	double e = exp(x);
-	return (e - 1.0 / e) * 0.5;
+	double a = fabs(x);
+	double t;
+
+	/* Above this, e^-a has underflowed relative to e^a and sinh IS
+	 * e^a / 2.  exp() overflows a little beyond it, which is correct:
+	 * so does sinh. */
+	if (a > 22.0)
+		return copysign(0.5 * exp(a), x);
+
+	t = expm1(a);
+	if (a < 1.0)
+		return copysign(0.5 * (2.0 * t - t * t / (t + 1.0)), x);
+	return copysign(0.5 * (t + t / (t + 1.0)), x);
 }
 
 double cosh(double x)
 {
-	double e = exp(x);
+	/* No cancellation here -- cosh is a SUM of the same two exponentials,
+	 * and near zero both are near 1 and add to 2 without losing anything.
+	 * So the direct form is the right one. */
+	double e = exp(fabs(x));
+
 	return (e + 1.0 / e) * 0.5;
 }
 
 double tanh(double x)
 {
-	double e;
-	/* Saturate early: exp(2x) overflows long before tanh stops being +-1. */
-	if (x > 20.0)
-		return 1.0;
-	if (x < -20.0)
-		return -1.0;
-	e = exp(2.0 * x);
-	return (e - 1.0) / (e + 1.0);
+	double a = fabs(x);
+	double t;
+
+	/* Saturate early: e^2a overflows long before tanh stops being 1 to
+	 * every bit of a double. */
+	if (a > 22.0)
+		return copysign(1.0, x);
+	if (a < 0x1p-28)
+		return x; /* tanh(x) == x down here, sign and all */
+
+	if (a >= 1.0) {
+		t = expm1(2.0 * a);
+		return copysign(1.0 - 2.0 / (t + 2.0), x);
+	}
+	t = expm1(-2.0 * a);
+	return copysign(-t / (t + 2.0), x);
+}
+
+/* The inverse hyperbolics.
+ *
+ * Each has a closed form -- asinh(x) = log(x + sqrt(x*x + 1)) and its
+ * relatives -- and each closed form is unusable over part of its own domain.
+ * Two things go wrong.  For a large argument the x*x overflows while the
+ * ANSWER is a perfectly ordinary number near log(2x).  For a small one the
+ * argument of the logarithm is 1 plus something tiny, and forming that sum
+ * throws away every significant digit of the tiny part before log() ever sees
+ * it: asinh(1e-10) comes out as exactly 0 rather than 1e-10.
+ *
+ * So each is written in ranges, with log1p() carrying the small end -- it
+ * exists for exactly this -- and the log(2x) asymptote carrying the large one.
+ * The algebra in the middle branches is the closed form rearranged to keep the
+ * cancelling subtraction out of it; it is the classical fdlibm arrangement.
+ *
+ * The cutoffs are powers of two so they are exact: 2^-28 is where x*x falls
+ * below the last bit of 1.0, and 2^28 is where x*x nears the top of the range
+ * in which the middle branch is worth its extra arithmetic.
+ */
+#define LIKEOS_LN2 0.69314718055994530942
+
+double asinh(double x)
+{
+	double a = fabs(x);
+	double r;
+
+	if (a < 0x1p-28)
+		return x; /* asinh(x) == x to the last bit down here */
+	if (a > 0x1p28)
+		r = log(a) + LIKEOS_LN2; /* a*a would overflow */
+	else if (a > 2.0)
+		r = log(2.0 * a + 1.0 / (sqrt(a * a + 1.0) + a));
+	else
+		r = log1p(a + a * a / (1.0 + sqrt(a * a + 1.0)));
+	/* Odd function, and every branch above took |x|. */
+	return copysign(r, x);
+}
+
+double acosh(double x)
+{
+	if (x < 1.0)
+		return 0.0 / 0.0; /* NaN: acosh is undefined below 1 */
+	if (x == 1.0)
+		return 0.0;
+	if (x > 0x1p28)
+		return log(x) + LIKEOS_LN2;
+	if (x > 2.0)
+		return log(2.0 * x - 1.0 / (x + sqrt(x * x - 1.0)));
+	/* Near 1, where x*x - 1 cancels: work in t = x - 1, which is exact. */
+	{
+		double t = x - 1.0;
+
+		return log1p(t + sqrt(2.0 * t + t * t));
+	}
+}
+
+double atanh(double x)
+{
+	double a = fabs(x);
+	double r;
+
+	if (a > 1.0)
+		return 0.0 / 0.0; /* NaN: outside the domain */
+	if (a == 1.0)
+		return x / 0.0; /* the poles, with the sign of x */
+	if (a < 0x1p-28)
+		return x;
+	if (a < 0.5)
+		r = 0.5 * log1p(2.0 * a + 2.0 * a * a / (1.0 - a));
+	else
+		r = 0.5 * log1p(2.0 * a / (1.0 - a));
+	return copysign(r, x);
 }
 
 /* hypot: sqrt(x^2 + y^2) WITHOUT overflowing on the intermediate square, which
@@ -500,6 +618,13 @@ float atanf(float x) { return (float)atan(x); }
 float atan2f(float y, float x) { return (float)atan2(y, x); }
 float asinf(float x) { return (float)asin(x); }
 float acosf(float x) { return (float)acos(x); }
+float cbrtf(float x) { return (float)cbrt(x); }
+float sinhf(float x) { return (float)sinh(x); }
+float coshf(float x) { return (float)cosh(x); }
+float tanhf(float x) { return (float)tanh(x); }
+float asinhf(float x) { return (float)asinh(x); }
+float acoshf(float x) { return (float)acosh(x); }
+float atanhf(float x) { return (float)atanh(x); }
 float hypotf(float x, float y) { return (float)hypot(x, y); }
 float truncf(float x) { return (float)trunc(x); }
 float copysignf(float x, float y) { return __builtin_copysignf(x, y); }
@@ -618,6 +743,13 @@ long double atan2l(long double y, long double x)
 {
 	return (long double)atan2((double)y, (double)x);
 }
+long double cbrtl(long double x) { return (long double)cbrt((double)x); }
+long double sinhl(long double x) { return (long double)sinh((double)x); }
+long double coshl(long double x) { return (long double)cosh((double)x); }
+long double tanhl(long double x) { return (long double)tanh((double)x); }
+long double asinhl(long double x) { return (long double)asinh((double)x); }
+long double acoshl(long double x) { return (long double)acosh((double)x); }
+long double atanhl(long double x) { return (long double)atanh((double)x); }
 long double hypotl(long double x, long double y)
 {
 	return (long double)hypot((double)x, (double)y);

@@ -10,6 +10,7 @@
 // prints, no sleeping); readers park with the established wait_channel/
 // BLOCKED protocol.
 
+#include <kernel/ke/waitq.h>
 #include <kernel/dev/input/evdev.h>
 #include <kernel/uapi/input.h>
 #include <kernel/uapi/bug.h>
@@ -62,6 +63,11 @@ typedef struct {
 	 * stepped; the default stays CLOCK_REALTIME for compatibility. */
 	int clock_id;
 	int wq; // wait-channel key for blocked readers
+	/* Who is polling this device.  Separate from `wq' above, which is the
+	 * channel a BLOCKING read parks on -- a poller waits for readiness,
+	 * a reader waits for a byte, and they are woken from the same place
+	 * but tracked apart. */
+	struct wait_queue_head poll_wq;
 } evdev_dev_t;
 
 static evdev_dev_t g_evdev[EVDEV_NUM_UNITS];
@@ -127,6 +133,15 @@ static uint16_t evdev_e0_keycode(uint8_t code)
 	}
 }
 
+/* The poll wait queue of one unit, for poll()/select() to register on.
+ * NULL when the unit number is out of range. */
+struct wait_queue_head *evdev_pollq(int unit)
+{
+	if (unit < 0 || unit >= EVDEV_NUM_UNITS)
+		return NULL;
+	return &g_evdev[unit].poll_wq;
+}
+
 static void evdev_init_devices(void)
 {
 	evdev_dev_t *kbd = &g_evdev[EVDEV_UNIT_KEYBOARD];
@@ -137,6 +152,8 @@ static void evdev_init_devices(void)
 		return;
 
 	spinlock_init(&kbd->lock, "evdev_kbd");
+	for (i = 0; i < EVDEV_NUM_UNITS; i++)
+		wq_head_init(&g_evdev[i].poll_wq, "evdev-poll");
 	kbd->name = "LikeOS Keyboard";
 	/* Physical path in the conventional serio form; a display server uses
 	 * it to tell devices apart and to match configuration rules. */
@@ -242,8 +259,13 @@ static void evdev_queue_locked(evdev_dev_t *dev, uint16_t type, uint16_t code,
 
 static void evdev_wake_readers(evdev_dev_t *dev)
 {
+	extern void poll_notify_wq(struct wait_queue_head *);
+
 	sched_wake_channel((void *)&dev->wq);
-	poll_notify_io_ready();
+	/* Only the tasks polling THIS device.  The display server polls the
+	 * keyboard and the mouse as separate descriptors, and a mouse event
+	 * has no business waking anything else on the machine. */
+	poll_notify_wq(&dev->poll_wq);
 }
 
 // Emit a key event with automatic press/release/repeat value derivation.

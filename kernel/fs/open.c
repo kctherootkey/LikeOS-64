@@ -11,6 +11,10 @@
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
 
+static int64_t ftruncate_held(task_t *cur, vfs_file_t *f, uint64_t length);
+static int64_t fchmod_held(task_t *cur, vfs_file_t *f, uint64_t mode);
+static int64_t fchown_held(task_t *cur, vfs_file_t *f, uint64_t owner, uint64_t group);
+
 int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 {
 	might_sleep();
@@ -217,10 +221,40 @@ int64_t sys_close(uint64_t fd)
 	 * open.  Done here, while the descriptor is still valid, because the
 	 * file's identity (dev/ino) is what the locks are keyed on. */
 	{
-		vfs_file_t *lf = task_fds(cur)[fd];
-		if (lf && !IS_SOCKET_FD(lf) && !unix_sock_is(lf) &&
-		    !IS_EPOLL_FD(lf) && !pipe_is_end(lf) && (uintptr_t)lf > 3)
+		/* Under the table lock, and holding a reference of our own.
+		 *
+		 * The descriptor was read straight out of the table and used
+		 * without either.  frlock_release_for_file() calls vfs_fstat()
+		 * to learn the file's identity, and another thread closing the
+		 * same descriptor in that window releases the last reference --
+		 * so the fstat read ->ops out of freed memory and the machine
+		 * took a general protection fault inside vfs_fstat with the
+		 * allocator's poison in hand.
+		 *
+		 * The reference cannot simply be held across the lock either:
+		 * fstat can sleep, and this is a spinlock with interrupts off.
+		 * So the lock covers taking the reference, and the reference
+		 * covers the work. */
+		vfs_file_t *lf = NULL;
+		uint64_t glflags = 0;
+
+		fds_lock(cur, &glflags);
+		{
+			vfs_file_t *e = task_fds(cur)[fd];
+
+			if (e && !IS_SOCKET_FD(e) && !unix_sock_is(e) &&
+			    !IS_EPOLL_FD(e) && !pipe_is_end(e) &&
+			    (uintptr_t)e > 3) {
+				vfs_incref(e);
+				lf = e;
+			}
+		}
+		fds_unlock(cur, glflags);
+
+		if (lf) {
 			frlock_release_for_file(lf, (uint32_t)cur->tgid);
+			vfs_close(lf);
+		}
 	}
 
 	uint64_t lflags = 0;
@@ -502,20 +536,32 @@ int64_t sys_umask(uint64_t mask)
 int64_t sys_ftruncate(uint64_t fd, uint64_t length)
 {
 	task_t *cur = sched_current();
+	vfs_file_t *f;
+	int64_t ret;
+
 	if (!cur)
 		return -EFAULT;
-	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
+	/* Held across the call: the body reads the inode behind it and
+	 * can sleep doing so. */
+	f = fdget(cur, (int)fd);
+	if (!f)
 		return -EBADF;
-	vfs_file_t *file = task_fds(cur)[fd];
+	ret = ftruncate_held(cur, f, length);
+	fdput(f);
+	return ret;
+}
+
+static int64_t ftruncate_held(task_t *cur, vfs_file_t *f, uint64_t length)
+{
 	/* Only a real file has a length to set; POSIX gives EINVAL for the
 	 * rest, and dereferencing a marker here would fault the kernel. */
-	if (fd_is_special(file))
+	if (fd_is_special(f))
 		return -EINVAL;
-	int r = vfs_truncate(file, (unsigned long)length);
+	int r = vfs_truncate(f, (unsigned long)length);
 	/* Truncating contents drops set-id bits for a non-privileged caller,
      * same as write() (see strip_setid_file for the once-per-inode fast-path). */
-	if (r >= 0 && cur->cred.euid != 0 && !vfs_setid_clean(file))
-		strip_setid_file(file);
+	if (r >= 0 && cur->cred.euid != 0 && !vfs_setid_clean(f))
+		strip_setid_file(f);
 	return r;
 }
 
@@ -554,9 +600,24 @@ int64_t sys_chmod(uint64_t pathname, uint64_t mode)
 int64_t sys_fchmod(uint64_t fd, uint64_t mode)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
+	vfs_file_t *f;
+	int64_t ret;
+
+	if (!cur)
+		return -EFAULT;
+	/* Held across the call: the body reads the inode behind it and
+	 * can sleep doing so. */
+	f = fdget(cur, (int)fd);
+	if (!f)
 		return -EBADF;
-	if (fd_is_special(task_fds(cur)[fd]))
+	ret = fchmod_held(cur, f, mode);
+	fdput(f);
+	return ret;
+}
+
+static int64_t fchmod_held(task_t *cur, vfs_file_t *f, uint64_t mode)
+{
+	if (fd_is_special(f))
 		return 0; /* no perms to change */
 	unsigned new_mode = (unsigned)mode;
 	/* Only the owner (or root) may chmod, and a non-root caller not in the
@@ -564,7 +625,7 @@ int64_t sys_fchmod(uint64_t fd, uint64_t mode)
      * report the owner (vfs_fstat unsupported, e.g. the perm-less FAT path). */
 	if (cur->cred.euid != 0) {
 		struct kstat st;
-		if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK) {
+		if (vfs_fstat(f, &st) == ST_OK) {
 			if ((uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
 			if ((new_mode & S_ISGID) &&
@@ -572,7 +633,7 @@ int64_t sys_fchmod(uint64_t fd, uint64_t mode)
 				new_mode &= ~(unsigned)S_ISGID;
 		}
 	}
-	int r = vfs_fchmod(task_fds(cur)[fd], new_mode);
+	int r = vfs_fchmod(f, new_mode);
 	return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
 }
 
@@ -624,16 +685,31 @@ int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
 int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
+	vfs_file_t *f;
+	int64_t ret;
+
+	if (!cur)
+		return -EFAULT;
+	/* Held across the call: the body reads the inode behind it and
+	 * can sleep doing so. */
+	f = fdget(cur, (int)fd);
+	if (!f)
 		return -EBADF;
-	if (fd_is_special(task_fds(cur)[fd]))
+	ret = fchown_held(cur, f, owner, group);
+	fdput(f);
+	return ret;
+}
+
+static int64_t fchown_held(task_t *cur, vfs_file_t *f, uint64_t owner, uint64_t group)
+{
+	if (fd_is_special(f))
 		return 0; /* no ownership to change */
 	int new_uid = (int)owner, new_gid = (int)group;
 	/* Owner change is root-only; a non-root owner may regroup to one of
      * their groups (same rule as path chown).  Permissive if owner unknown. */
 	if (cur->cred.euid != 0) {
 		struct kstat st;
-		if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK) {
+		if (vfs_fstat(f, &st) == ST_OK) {
 			if (new_uid != -1 &&
 			    (uint32_t)new_uid != (uint32_t)st.st_uid)
 				return -EPERM;
@@ -647,14 +723,14 @@ int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)
 			}
 		}
 	}
-	int r = vfs_fchown(task_fds(cur)[fd], new_uid, new_gid);
+	int r = vfs_fchown(f, new_uid, new_gid);
 	if (r == ST_OK &&
 	    cur->cred.euid != 0) { /* drop set-id on ownership change */
 		struct kstat st;
-		if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK) {
+		if (vfs_fstat(f, &st) == ST_OK) {
 			unsigned clr = setid_strip_bits((uint32_t)st.st_mode);
 			if (clr)
-				vfs_fchmod(task_fds(cur)[fd],
+				vfs_fchmod(f,
 					   (unsigned)st.st_mode & ~clr);
 		}
 	}

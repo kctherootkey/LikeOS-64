@@ -26,7 +26,12 @@ set(CMAKE_SYSTEM_NAME LikeOS)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
 set(CMAKE_C_COMPILER "$ENV{LIKEOS_TOOLCHAIN}/likeos-cc")
-set(CMAKE_CXX_COMPILER "$ENV{LIKEOS_TOOLCHAIN}/likeos-cc")
+# likeos-c++, not likeos-cc.  The C driver passes -nostdinc without naming the
+# C++ header directories and links no C++ runtime, so a C++ source compiled
+# through it fails on <type_traits> -- the first standard header anything
+# includes.  It went unnoticed while ctwm, which is pure C, was the only CMake
+# package here.
+set(CMAKE_CXX_COMPILER "$ENV{LIKEOS_TOOLCHAIN}/likeos-c++")
 
 set(CMAKE_SYSROOT "$ENV{LIKEOS_SYSROOT}")
 set(CMAKE_FIND_ROOT_PATH "$ENV{LIKEOS_SYSROOT}/usr")

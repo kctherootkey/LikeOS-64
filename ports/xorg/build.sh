@@ -362,6 +362,36 @@ pkg_opts() {
 		# same one, or its configure finds no libfm-gtk at all.
 		echo "--with-gtk=3"
 		;;
+	gtk+)
+		# GTK 2, for HexChat.  (GTK 3 is the meson package `gtk'; this
+		# is the one whose tarball is still called gtk+.)
+		#
+		# X11 and nothing else: the other gdktargets are quartz, win32
+		# and directfb.
+		#
+		# Off: Xinerama, because libXinerama is not in the X port and a
+		# single-head desktop is what this is; CUPS and PAPI, which are
+		# printing systems reached over a network; libjasper, a JPEG2000
+		# decoder with a long history of its own; and gtk-doc, whose
+		# toolchain produces nothing shipped here.
+		#
+		# --disable-rebuilds is what keeps a cross build honest.  GTK 2
+		# regenerates several sources with tools it has just built --
+		# gdk-pixbuf-csource over the stock icons, the marshaller
+		# tables -- and those binaries are compiled for the TARGET, so
+		# running them here fails.  The tarball ships the generated
+		# copies for exactly this case; the option says to use them.
+		#
+		# --enable-explicit-deps=no keeps the .pc file to the libraries
+		# a caller actually links.  With it on, gtk+-2.0.pc lists every
+		# transitive X library by absolute build-host path.
+		echo "--with-gdktarget=x11 --disable-xinerama \
+		      --disable-cups --disable-papi --without-libjasper \
+		      --disable-gtk-doc --disable-gtk-doc-html \
+		      --disable-glibtest --disable-introspection \
+		      --disable-rebuilds --enable-explicit-deps=no \
+		      --disable-static"
+		;;
 	claws-mail)
 		# Off: everything needing a desktop session bus, a system
 		# service or a toolchain this system does not have.  --disable-svg
@@ -631,6 +661,108 @@ meson_opts() {
 		      -Dgspell-plugin=disabled -Dshortcuts-plugin=disabled \
 		      -Dtest-plugin=disabled -Dkeyfile-settings=true"
 		;;
+	dbus)
+		# The session bus.
+		#
+		# On: the daemon itself, the command-line tools (dbus-send,
+		# dbus-monitor, dbus-launch, dbus-uuidgen -- each of which is
+		# how a bus problem is diagnosed from a shell), traditional
+		# activation (starting a service from its .service file, which
+		# is exactly how xfconfd is reached), and X11 autolaunch, so
+		# dbus-launch can publish the bus address on the root window
+		# for anything started later in the session.
+		#
+		# Off: the system bus's init integration and every access
+		# control framework -- systemd units, launchd, SELinux,
+		# AppArmor and libaudit have nothing to attach to here.  epoll
+		# and inotify likewise: this kernel has neither, and dbus falls
+		# back to poll() and to not watching its configuration for
+		# changes, both of which are correct, just less efficient.
+		# The documentation needs Doxygen and ducktype; the test suites
+		# are for dbus's own developers.
+		#
+		# The session socket goes in /tmp, which is where the default
+		# address `unix:tmpdir=/tmp' looks for it.
+		echo "-Dmessage_bus=true -Dtools=true \
+		      -Dtraditional_activation=true -Dx11_autolaunch=enabled \
+		      -Dsystemd=disabled -Dlaunchd=disabled \
+		      -Dselinux=disabled -Dapparmor=disabled \
+		      -Dlibaudit=disabled -Depoll=disabled -Dinotify=disabled \
+		      -Ddoxygen_docs=disabled -Dducktype_docs=disabled \
+		      -Dqt_help=disabled -Dxml_docs=disabled \
+		      -Dmodular_tests=disabled -Dintrusive_tests=false \
+		      -Dinstalled_tests=false -Dstats=false \
+		      -Dsession_socket_dir=/tmp \
+		      -Drelocation=disabled"
+		;;
+	vte)
+		# The terminal widget, for xfce4-terminal.
+		#
+		# GTK 3 only.  The same tree builds a GTK 4 widget by default
+		# and there is no GTK 4 here; asking for it produces a
+		# configure failure rather than a skipped target.
+		#
+		# On, and each one is a feature the terminal would visibly
+		# lose: a11y is the accessible text interface, fribidi is
+		# bidirectional text (already built for Pango), and terminfo
+		# installs the xterm-256color description VTE sets TERM to --
+		# without it every curses program inside the terminal starts by
+		# failing to find its terminal type.
+		#
+		# Off: the GTK 4 widget; `app`, which is VTE's own demo
+		# terminal and not something to ship beside a real one; gir and
+		# vapi, which generate bindings for language runtimes this
+		# system does not have; glade, a catalog describing the widget
+		# to an interface designer; docs, needing gi-docgen; ICU, which
+		# is only used to decode the legacy non-UTF-8 encodings and is
+		# a very large dependency for that; and systemd, for scope
+		# registration on a system with no service manager.
+		#
+		# gnutls is ON, and it is not optional in any useful sense.
+		# VTE does not keep the scrollback in memory -- it writes it to
+		# a file in /tmp and encrypts it on the way out, and GnuTLS is
+		# the cipher.  Built without it, every line that scrolls off
+		# the top of a terminal is left in cleartext in a temporary
+		# file, and VTE says so by printing
+		#
+		#   WARNING: GnuTLS not enabled; data will be written to disk
+		#   unencrypted!
+		#
+		# into the terminal at startup.  GnuTLS is already in this
+		# sysroot for Claws Mail, so it costs nothing to link.
+		echo "-Dgtk3=true -Dgtk4=false -Da11y=true -Dfribidi=true \
+		      -Dterminfo=true -Dapp=false -Dgir=false -Dvapi=false \
+		      -Dglade=false -Ddocs=false -Dicu=false \
+		      -D_systemd=false -Dgnutls=true"
+		;;
+	hexchat)
+		# The IRC client.  Everything that can be built here is on.
+		#
+		# TLS is OpenSSL, which the X.Org port already imports into this
+		# sysroot, and it is what makes the client usable at all: the
+		# networks it ships in its server list are TLS-only now.  The
+		# checksum and fishlim plugins are C and need nothing else, so
+		# they are built.
+		#
+		# Off, and each for a missing runtime rather than a choice:
+		# the Lua, Perl and Python plugins are bindings to language
+		# runtimes that are not ported, so there is nothing for them to
+		# bind to; sysinfo reads the PCI ID database through pciutils,
+		# which is a different library from the libpciaccess the X
+		# server uses; libcanberra plays sound through an audio stack
+		# this system does not have; and the D-Bus interface is
+		# single-instance signalling and remote scripting, which needs
+		# dbus-glib -- the old bindings, not GDBus.
+		#
+		# The exec, upd and winamp plugins are Windows-only and their
+		# options exist so a Windows build can turn them on.
+		echo "-Dgtk-frontend=true -Dtext-frontend=false \
+		      -Dtheme-manager=false -Dtls=enabled -Dplugin=true \
+		      -Ddbus=disabled -Dlibcanberra=disabled \
+		      -Dwith-checksum=true -Dwith-fishlim=true \
+		      -Dwith-lua=false -Dwith-perl=false -Dwith-python=false \
+		      -Dwith-sysinfo=false -Dinstall-appdata=true"
+		;;
 	gtk)
 		echo "-Dx11_backend=true -Dwayland_backend=false \
 		      -Dbroadway_backend=false -Dprint_backends=file \
@@ -678,6 +810,28 @@ cmake_opts() {
 		      -DUSE_SREGEX=ON -DUSE_XRANDR=ON \
 		      -DMANDIR=/usr/share/man \
 		      -DETCDIR=/etc/X11/ctwm"
+		;;
+	fmt)
+		# The C++ formatting library, for VTE.  Shared, because VTE is
+		# not the only thing that will want it and a static libfmt
+		# would be copied into every user of it.
+		#
+		# FMT_TEST builds a test suite that downloads and builds
+		# googletest; FMT_DOC needs Doxygen and Python.  Neither
+		# produces anything shipped.
+		echo "-DBUILD_SHARED_LIBS=ON -DFMT_TEST=OFF -DFMT_DOC=OFF \
+		      -DFMT_INSTALL=ON"
+		;;
+	simdutf)
+		# UTF-8 validation and transcoding, for VTE.
+		#
+		# The benchmarks pull in several comparison libraries and the
+		# tools are development programs.  Neither is shipped, and the
+		# benchmarks do not cross-compile: they RUN during the build to
+		# choose an implementation.
+		echo "-DBUILD_SHARED_LIBS=ON -DSIMDUTF_TESTS=OFF \
+		      -DSIMDUTF_BENCHMARKS=OFF -DSIMDUTF_TOOLS=OFF \
+		      -DSIMDUTF_CXX_STANDARD=17"
 		;;
 	*) echo "" ;;
 	esac
@@ -1056,9 +1210,53 @@ keeps_generated_sources() {
 # (a Makefile is present in almost every package), so this is by name.
 is_plainmake() {
 	case "$1" in
-	xnedit) return 0 ;;
+	xnedit | lz4) return 0 ;;
 	esac
 	return 1
+}
+
+# The make target a plain-Makefile package is built with, and the variables it
+# needs on the command line.
+#
+# On the command line rather than in the environment: a make variable set that
+# way overrides any assignment inside the Makefile, and is inherited by every
+# sub-make.  Set in the environment instead, the package's own `CC = gcc' wins
+# and the whole tree is built for the build host.
+plainmake_args() {
+	case "$1" in
+	xnedit)
+		# The platform target creates the Makefile.<platform> symlinks
+		# and then builds util/, Xlt/, Microline/ and source/ in order.
+		echo "likeos CC=$here/toolchain/likeos-cc \
+		      PKG_CONFIG=$here/toolchain/likeos-pkg-config"
+		;;
+	lz4)
+		# Only the library: the default target also builds the lz4,
+		# lz4c and unlz4 programs, and nothing here is a compression
+		# tool -- VTE links liblz4 to compress its scrollback and that
+		# is the whole of why this is in the tree.
+		#
+		# BUILD_STATIC=no because everything here links dynamically,
+		# and a static archive doubles the build for nobody.
+		#
+		# PREFIX on the BUILD line as well as the install one, which is
+		# not redundant: liblz4.pc is generated during the build, from
+		# whatever PREFIX is set then.  Given only at install time, the
+		# library lands in /usr/lib and its .pc says prefix=/usr/local
+		# -- so every later package is told to look for the headers in
+		# a directory that does not exist, and VTE stopped on exactly
+		# that.
+		echo "-C lib PREFIX=/usr CC=$here/toolchain/likeos-cc \
+		      BUILD_STATIC=no"
+		;;
+	esac
+}
+
+# ...and the arguments its `make install' needs, beyond DESTDIR and PREFIX.
+plainmake_install_args() {
+	case "$1" in
+	lz4) echo "-C lib BUILD_STATIC=no" ;;
+	esac
 }
 
 # NetSurf and its libraries use the project's OWN build system: no configure,
@@ -1281,6 +1479,30 @@ build_one() {
 			cd "$dir" || exit 1
 			rm -rf .likeos-build
 			mkdir -p .likeos-build
+
+			# The PREVIOUS libstdc++'s installed headers, out of
+			# the way before this one is built against them.
+			#
+			# likeos-c++ puts $SYSROOT/usr/include/c++/<ver> on the
+			# include path whenever it exists, which is right for
+			# every other package and wrong for this one: the build
+			# tree has its own copy of the same headers, and two
+			# copies of a header that guards itself is one copy too
+			# many.  libstdc++ ships compatibility wrappers -- its
+			# fenv.h, complex.h and several more -- that exist only
+			# to `#include_next` the C library's header of that
+			# name.  Reached twice, the second one is silenced by
+			# its own include guard, the #include_next never
+			# happens, and the C header is never read at all.  That
+			# is how a rebuild meant to pick up a newly added
+			# <fenv.h> failed on the very names it was adding.
+			#
+			# Safe to delete: this build compiles against its own
+			# source tree and the headers it generates (the comment
+			# in likeos-c++ says as much), and `make install' below
+			# puts a complete set back.
+			rm -rf "$SYSROOT/usr/include/c++"
+
 			cd .likeos-build || exit 1
 
 			cfg="../libstdc++-v3/configure"
@@ -1354,15 +1576,22 @@ build_one() {
 	elif is_plainmake "$name"; then
 		(
 			cd "$dir" || exit 1
-			# The platform target creates the Makefile.<platform>
-			# symlinks and then builds util/, Xlt/, Microline/ and
-			# source/ in order.  CC and PKG_CONFIG are passed on the
-			# command line, which overrides the arm's defaults and is
-			# inherited by every sub-make.
-			make likeos -j"$(nproc)" \
-				CC="$here/toolchain/likeos-cc" \
-				PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
-				make install DESTDIR="$SYSROOT" PREFIX=/usr &&
+			# Never build on top of the last build, for the same
+			# reason the autotools arm distcleans: generated files
+			# carry the settings they were generated WITH.  lz4
+			# makes liblz4.pc from a template with the prefix baked
+			# in, as an ordinary file target -- so a rebuild with a
+			# corrected prefix found the old one up to date, left
+			# it alone, and reported success while shipping a .pc
+			# pointing at /usr/local.
+			#
+			# Failure ignored: a tree that has never been built has
+			# nothing to clean, and some of these have no clean
+			# target until their platform target has run.
+			make clean >/dev/null 2>&1 || true
+			make -j"$(nproc)" $(plainmake_args "$name") &&
+				make install DESTDIR="$SYSROOT" PREFIX=/usr \
+					$(plainmake_install_args "$name") &&
 				post_install "$name"
 		) >"$log" 2>&1
 	elif prefers_meson "$name" || is_meson "$name" "$dir"; then

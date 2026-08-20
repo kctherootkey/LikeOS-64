@@ -968,7 +968,13 @@ int64_t sys_socketpair(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		}
 		pfd[1] = fd_install(cur, (vfs_file_t *)usv[1]);
 		if (pfd[1] < 0) {
-			task_fds(cur)[pfd[0]] = NULL;
+			/* Undo the first install under the table lock: the
+		 * slot is shared with every other thread here. */
+		uint64_t fdflags = 0;
+
+		fds_lock(cur, &fdflags);
+		task_fds(cur)[pfd[0]] = NULL;
+		fds_unlock(cur, fdflags);
 			unix_close(usv[0]);
 			unix_close(usv[1]);
 			return pfd[1];
@@ -1009,7 +1015,13 @@ int64_t sys_socketpair(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	}
 	ufd[1] = fd_install(cur, MAKE_SOCKET_FD(sv[1]));
 	if (ufd[1] < 0) {
-		task_fds(cur)[ufd[0]] = NULL;
+		/* Undo the first install under the table lock: the
+	 * slot is shared with every other thread here. */
+	uint64_t fdflags = 0;
+
+	fds_lock(cur, &fdflags);
+	task_fds(cur)[ufd[0]] = NULL;
+	fds_unlock(cur, fdflags);
 		sock_close(sv[0]);
 		sock_close(sv[1]);
 		return ufd[1];

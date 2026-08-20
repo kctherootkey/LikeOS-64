@@ -102,6 +102,17 @@ int kill(int pid, int sig);
 
 // Sessions
 pid_t setsid(void);
+
+/* Detach from the controlling terminal and run in the background.
+ *
+ * Forks, leaves the parent, starts a new session, and unless told otherwise
+ * changes to / and points the three standard descriptors at /dev/null.  Not
+ * POSIX -- it is BSD's, and in every C library since.
+ *
+ * `nochdir' keeps the current directory (which pins the filesystem it is on);
+ * `noclose' keeps the standard descriptors, which is what a daemon that has
+ * already redirected its own output wants. */
+int daemon(int nochdir, int noclose);
 pid_t getsid(pid_t pid);
 pid_t getpgid(pid_t pid);
 
@@ -149,7 +160,13 @@ struct dirent;
 int getdents(int fd, struct dirent* dirp, unsigned int count);
 int getdents64(int fd, void* dirp, unsigned int count);
 
-// PTY helpers
+/* PTY helpers.
+ *
+ * POSIX puts these in <stdlib.h>, not here, and that is where the canonical
+ * declarations are.  They are repeated here because code in this tree has
+ * always found them through <unistd.h> and a header is a promise; but anything
+ * probing for them looks in <stdlib.h> -- VTE's configure does exactly that
+ * and concluded the system had no grantpt at all. */
 int posix_openpt(int flags);
 int grantpt(int fd);
 int unlockpt(int fd);
@@ -223,6 +240,26 @@ long sysconf(int name);
  * with us. */
 #define _SC_NPROCESSORS_CONF  83
 #define _SC_NPROCESSORS_ONLN  84
+/* Suggested buffer sizes for the reentrant passwd and group lookups.
+ *
+ * The pattern getpwnam_r imposes is: ask sysconf how big a buffer to bring,
+ * allocate that, call, and grow on ERANGE.  A program that does that and gets
+ * -1 from sysconf has to invent a size, and several do not bother to check --
+ * dbus asks for _SC_GETPW_R_SIZE_MAX and would not compile without it. */
+#define _SC_GETPW_R_SIZE_MAX  70
+#define _SC_GETGR_R_SIZE_MAX  69
+/* Limits a few configure scripts and programs ask about directly. */
+#define _SC_ARG_MAX           0
+#define _SC_CHILD_MAX         1
+#define _SC_NGROUPS_MAX       3
+#define _SC_JOB_CONTROL       7
+#define _SC_SAVED_IDS         8
+#define _SC_VERSION           29
+#define _SC_LINE_MAX          43
+#define _SC_HOST_NAME_MAX     180
+#define _SC_SYMLOOP_MAX       173
+#define _SC_PHYS_PAGES        85
+#define _SC_AVPHYS_PAGES      86
 
 // confstr
 #define _CS_PATH  0

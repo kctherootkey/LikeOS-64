@@ -132,8 +132,16 @@ ac_cv_path_MCOOKIE='/bin/openssl rand -hex 16'
 EOF
 
 if [ ! -f configure ] && [ -f autogen.sh ]; then
-	NOCONFIGURE=1 ./autogen.sh
-elif [ ! -f configure ] && [ -f configure.ac ]; then
+	# NOCONFIGURE is the convention for "generate the build system and
+	# stop", and most autogen.sh scripts honour it.  Some predate it and
+	# end with ./configure regardless -- with none of the cross arguments
+	# below, so it fails, and the failure does not matter: the generated
+	# configure is the whole point of this step and the real configure runs
+	# further down.  So the status is ignored and the RESULT is what the
+	# next arm checks.
+	NOCONFIGURE=1 ./autogen.sh || true
+fi
+if [ ! -f configure ] && [ -f configure.ac ]; then
 	# A release tarball ships a generated `configure` and no autogen.sh, so
 	# a patch to configure.ac has no effect until it is regenerated.  The
 	# port deletes `configure` to ask for exactly that; without this arm the

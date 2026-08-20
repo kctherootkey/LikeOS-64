@@ -1,0 +1,26 @@
+Define the preferences structure once
+
+`prefs' is declared extern in galculator.h and DEFINED in both main.c and
+config_file.c.  Two definitions of one object is not legal C; it linked for
+years only because the compilers of the day defaulted to -fcommon, which
+quietly merges tentative definitions of the same name into one.  GCC 10 made
+-fno-common the default and the link now fails outright:
+
+  multiple definition of `prefs'; galculator-main.o: first defined here
+
+config_file.c is the one that has to keep it.  Its prefs_list[] table is a
+static initialiser holding the address of every field -- &(prefs.bkg_color)
+and fifty-two more -- so the object must be complete at file scope there.
+main.c only ever reads and writes it through the extern declaration it already
+gets from galculator.h, so its copy is redundant as well as illegal.
+
+--- a/src/main.c
++++ b/src/main.c
+@@ -49,7 +49,6 @@
+ 
+ #define MASK_NUMLOCK GDK_MOD2_MASK
+ 
+-s_preferences		prefs;
+ s_current_status 	current_status = {0, 0, 0, 0, FALSE, FALSE, TRUE};
+ s_array				memory;
+ s_constant 			*constant;

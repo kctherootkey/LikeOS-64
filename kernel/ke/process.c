@@ -1,4 +1,5 @@
 // LikeOS-64 -- process identity, sessions, process groups and rusage.
+#include <kernel/fs/file.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -40,10 +41,10 @@ int64_t sys_tcgetpgrp(uint64_t fd)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
-	vfs_file_t *file = NULL;
-	if (fd < TASK_MAX_FDS) {
-		file = task_fds(cur)[fd];
-	}
+	/* Held only while the terminal behind it is resolved: devfs_get_tty()
+	 * reads the file, and the terminal it returns is owned by the device
+	 * layer, not by this descriptor, so it outlives the hold. */
+	vfs_file_t *file = fdget(cur, (int)fd);
 	tty_t *tty = NULL;
 	if (task_fd_is_console(cur, fd)) {
 		tty = cur->ctty ? cur->ctty : tty_get_console();
@@ -55,6 +56,7 @@ int64_t sys_tcgetpgrp(uint64_t fd)
 		} else {
 			tty = devfs_get_tty(file);
 		}
+		fdput(file);
 	}
 	if (!tty) {
 		return -ENOTTY;
@@ -67,10 +69,10 @@ int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
-	vfs_file_t *file = NULL;
-	if (fd < TASK_MAX_FDS) {
-		file = task_fds(cur)[fd];
-	}
+	/* Held only while the terminal behind it is resolved: devfs_get_tty()
+	 * reads the file, and the terminal it returns is owned by the device
+	 * layer, not by this descriptor, so it outlives the hold. */
+	vfs_file_t *file = fdget(cur, (int)fd);
 	tty_t *tty = NULL;
 	if (task_fd_is_console(cur, fd)) {
 		tty = cur->ctty ? cur->ctty : tty_get_console();
@@ -82,6 +84,7 @@ int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 		} else {
 			tty = devfs_get_tty(file);
 		}
+		fdput(file);
 	}
 	if (!tty) {
 		return -ENOTTY;

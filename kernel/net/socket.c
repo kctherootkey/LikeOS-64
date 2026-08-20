@@ -1,6 +1,7 @@
 // LikeOS-64 Socket Layer
 // Provides kernel-side socket abstraction for syscall layer
 
+#include <kernel/ke/waitq.h>
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/slab.h>
@@ -14,6 +15,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/cred.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/file.h>
 
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
@@ -152,8 +154,14 @@ int sock_create(int domain, int type, int protocol)
 		if (!sockets[i].active) {
 			net_socket_t *s = &sockets[i];
 			// Zero the entire struct first so any new fields default to 0.
+			/* The poll queue survives the slot being reused --
+			 * see wq_head_init_once(). */
+			struct wait_queue_head saved_wq = s->poll_wq;
+
 			for (size_t b = 0; b < sizeof(*s); b++)
 				((uint8_t *)s)[b] = 0;
+			s->poll_wq = saved_wq;
+			wq_head_init_once(&s->poll_wq, "sock-poll");
 			s->type = type;
 			if (type == SOCK_STREAM)
 				s->protocol = IPPROTO_TCP;
@@ -2554,18 +2562,36 @@ int sock_fcntl_net(int sockfd, int cmd, unsigned long arg)
 // ============================================================================
 int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 {
+	/* One exit: two descriptors are held here, and every way out has to
+	 * release both. */
+	struct vfs_file *in_file = NULL;
+	struct vfs_file *out_entry = NULL;
+	int ret;
+
 	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	if (count == 0)
-		return 0;
+	if (!cur) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (count == 0) {
+		ret = 0;
+		goto out;
+	}
 
 	// ---- Resolve in_fd: must be a regular VFS file (seekable) ----
-	if (in_fd < 0 || in_fd >= TASK_MAX_FDS)
-		return -EBADF;
-	struct vfs_file *in_file = task_fds(cur)[in_fd];
-	if (!in_file)
-		return -EBADF;
+	if (in_fd < 0 || in_fd >= TASK_MAX_FDS) {
+		ret = -EBADF;
+		goto out;
+	}
+	/* Both descriptors are held for the whole transfer: the loop below
+	 * reads from one and writes to the other, sleeping on each, and a
+	 * sibling thread closing either one meanwhile must not be able to
+	 * destroy what the transfer is using. */
+	in_file = fdget(cur, in_fd);
+	if (!in_file) {
+		ret = -EBADF;
+		goto out;
+	}
 	uintptr_t in_marker = (uintptr_t)in_file;
 	// Reject sockets, pipes, console markers as input
 	//
@@ -2577,21 +2603,30 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 	// dereferenced.  A descriptor kind that is merely unrecognised must be
 	// refused, never assumed to be a file.
 	if (IS_SOCKET_FD(in_file) || IS_EPOLL_FD(in_file) ||
-	    unix_sock_is(in_file))
-		return -EINVAL;
-	if (in_marker <= 3) // console markers
-		return -EINVAL;
-	if (pipe_is_end(in_file))
-		return -EINVAL;
+	    unix_sock_is(in_file)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (in_marker <= 3) { // console markers
+		ret = -EINVAL;
+		goto out;
+	}
+	if (pipe_is_end(in_file)) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	// ---- Resolve out_fd ----
-	if (out_fd < 0 || out_fd >= TASK_MAX_FDS)
-		return -EBADF;
-	struct vfs_file *out_entry = task_fds(cur)[out_fd];
+	if (out_fd < 0 || out_fd >= TASK_MAX_FDS) {
+		ret = -EBADF;
+		goto out;
+	}
+	out_entry = fdget(cur, out_fd);
 	if (!out_entry && (out_fd == 1 || out_fd == 2)) {
 		// stdout/stderr without explicit fd_table entry - treat as console
 	} else if (!out_entry) {
-		return -EBADF;
+		ret = -EBADF;
+		goto out;
 	}
 
 	// Determine output type
@@ -2610,14 +2645,16 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 		/* Refused explicitly, for the same reason as the input side:
 		 * the fall-through below treats everything it does not
 		 * recognise as a regular file. */
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	} else if (out_marker == 2 || out_marker == 3 ||
 		   (!out_entry && (out_fd == 1 || out_fd == 2))) {
 		out_is_console = 1;
 	} else if (out_entry && out_marker > 3 && !IS_EPOLL_FD(out_entry)) {
 		// Regular file - handled by the else branch in the write loop
 	} else {
-		return -EBADF;
+		ret = -EBADF;
+		goto out;
 	}
 
 	// ---- Handle offset: if non-NULL, save and restore file position ----
@@ -2625,12 +2662,16 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 	if (offset) {
 		// Save current file position
 		saved_pos = vfs_seek(in_file, 0, 1); // SEEK_CUR
-		if (saved_pos < 0)
-			return -ESPIPE;
+		if (saved_pos < 0) {
+			ret = -ESPIPE;
+			goto out;
+		}
 		// Seek to the requested offset
 		int64_t sret = vfs_seek(in_file, *offset, 0); // SEEK_SET
-		if (sret < 0)
-			return (int)sret;
+		if (sret < 0) {
+			ret = (int)sret;
+			goto out;
+		}
 	}
 
 // ---- Transfer loop ----
@@ -2640,7 +2681,8 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 	if (!sendfile_buf) {
 		if (offset)
 			vfs_seek(in_file, saved_pos, 0);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 	size_t total = 0;
 	int err = 0;
@@ -2762,7 +2804,15 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 		vfs_seek(in_file, saved_pos, 0); // SEEK_SET
 	}
 
-	return total > 0 ? (int)total : err;
+	ret = total > 0 ? (int)total : err;
+	goto out;
+
+out:
+	if (in_file)
+		fdput(in_file);
+	if (out_entry)
+		fdput(out_entry);
+	return ret;
 }
 
 // ============================================================================

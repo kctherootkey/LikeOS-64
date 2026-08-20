@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <fnmatch.h>
+#include <stdio.h>
 
 /* Simple glob: split pattern into directory + filename parts,
  * opendir the directory, and fnmatch each entry. */

@@ -5,6 +5,8 @@
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
+#include <kernel/mm/memory.h>
+#include <kernel/fs/file.h>
 
 static int64_t sys_dup_from(uint64_t oldfd, int from);
 
@@ -185,6 +187,182 @@ vfs_file_t *fd_dup_entry_at(task_t *cur, int fd)
 	return copy;
 }
 
+/* ------------------------------------------------------------------------
+ * fdget / fdput -- the only safe way to use what a descriptor names.
+ *
+ * The rule this enforces: a descriptor number is not a thing, it is a slot,
+ * and the slot can be emptied by any other thread of the process at any
+ * instant.  Reading the slot and then using what was in it are two steps, and
+ * between them a sibling thread's close() can release the last reference and
+ * destroy the object.  What follows is a use-after-free in whatever the caller
+ * did next -- an fstat that read ->ops out of the allocator's poison, a read
+ * that followed a freed pipe end, a file released a second time when the task
+ * that copied it exited.  All three were seen, all three from the same shape
+ * of code, and there are enough descriptor lookups in this kernel that fixing
+ * them one crash at a time is not a strategy.
+ *
+ * So: the lookup and the reference are ONE step, taken under the lock that
+ * close() holds while it empties the slot, and the reference -- not the slot
+ * -- is what keeps the object alive for as long as the caller needs it.  The
+ * lock is dropped before the caller does anything, because most of what
+ * callers do can sleep and this is a spinlock with interrupts off.
+ *
+ * The invariant that makes the reference-take safe: the table itself holds a
+ * reference on every entry, and an entry is removed from the table under this
+ * lock BEFORE that reference is dropped.  So a non-NULL slot, read under the
+ * lock, always names a live object.
+ *
+ * Descriptors here are not all one type -- a slot may hold a real file, a
+ * socket, a UNIX socket, an epoll instance, a pipe end, or one of the numeric
+ * console markers -- so each kind is held and released through its own
+ * counter.  Callers get the raw entry back and dispatch on it as they always
+ * have; what changes is only that it cannot die underneath them.
+ *
+ * A task with no shared descriptor table has no other thread that could close
+ * anything, and fds_lock() is a no-op for it.  The reference is still taken,
+ * so that callers need no second code path.
+ * ------------------------------------------------------------------------ */
+
+/* Take a hold of the kind this entry needs.  Called with the table locked, so
+ * the entry is live; the only failure is an entry that names nothing, which
+ * only the UNIX-socket marker can report. */
+static int fd_entry_hold(vfs_file_t *entry)
+{
+	uint64_t marker = (uint64_t)entry;
+
+	if (marker >= 1 && marker <= 3)
+		return 1; /* console stdio marker: no object to hold */
+	if (IS_SOCKET_FD(entry)) {
+		net_socket_t *s = sock_get(SOCKET_FD_IDX(entry));
+
+		if (!s)
+			return 0;
+		__atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+		return 1;
+	}
+	if (unix_sock_is(entry))
+		return unix_sock_lookup_hold((unix_socket_t *)entry) != NULL;
+	if (IS_EPOLL_FD(entry)) {
+		epoll_get(EPOLL_FD_IDX(entry));
+		return 1;
+	}
+	if (pipe_is_end(entry))
+		return pipe_end_hold((pipe_end_t *)entry) ? 1 : 0;
+	vfs_incref(entry);
+	return 1;
+}
+
+vfs_file_t *fdget(task_t *task, int fd)
+{
+	uint64_t flags;
+	vfs_file_t *entry;
+
+	if (!task || fd < 0 || fd >= TASK_MAX_FDS)
+		return NULL;
+
+	fds_lock(task, &flags);
+	entry = task_fds(task)[fd];
+	if (entry && !fd_entry_hold(entry))
+		entry = NULL;
+	fds_unlock(task, flags);
+	return entry;
+}
+
+/* Release a hold taken by fdget().
+ *
+ * Not the same as fd_release_entry(), and the difference matters for UNIX
+ * sockets: releasing a DESCRIPTOR drops the count that decides when the peer
+ * sees a hangup, while releasing a lookup must not.  Using the descriptor
+ * release here would hang up a socket that nobody had closed. */
+void fdput(vfs_file_t *entry)
+{
+	uint64_t marker = (uint64_t)entry;
+
+	if (!entry || (marker >= 1 && marker <= 3))
+		return;
+	if (IS_SOCKET_FD(entry)) {
+		sock_close(SOCKET_FD_IDX(entry));
+		return;
+	}
+	if (unix_sock_is(entry)) {
+		unix_sock_put_ref((unix_socket_t *)entry);
+		return;
+	}
+	if (IS_EPOLL_FD(entry)) {
+		epoll_put(EPOLL_FD_IDX(entry));
+		return;
+	}
+	if (pipe_is_end(entry)) {
+		pipe_close_end((pipe_end_t *)entry);
+		return;
+	}
+	vfs_close(entry);
+}
+
+/* Copy `src`'s whole descriptor table into `dst`, taking a reference for each
+ * entry -- what fork() owes every descriptor the child inherits.
+ *
+ * One implementation because there were two, and both had the same bug: they
+ * read a slot and took its reference as separate steps, so a sibling thread's
+ * close() in between released the last reference and the child inherited an
+ * entry naming a dead object -- which it released a second time on the way
+ * out.
+ *
+ * Two passes, and the reason is the allocator.  Duplicating a pipe end MAKES
+ * one, and the allocator must never run under the descriptor-table lock: it
+ * can unmap a slab page and then wait for every processor to acknowledge the
+ * shootdown, which a processor spinning for this lock with interrupts off can
+ * never do.  So the locked pass takes a HOLD on the end -- which allocates
+ * nothing -- and the second pass, with the lock dropped, makes the duplicate
+ * and lets the hold go.  The hold is what makes the second pass safe: the end
+ * cannot be destroyed between the two.
+ *
+ * `dst` is not reachable by anything else while this runs -- a child is not
+ * scheduled until fork has finished with it -- so only `src` needs locking.
+ */
+void fd_table_clone(task_t *dst, task_t *src)
+{
+	uint64_t pending[TASK_MAX_FDS / 64];
+	uint64_t flags;
+
+	mm_memset(pending, 0, sizeof(pending));
+
+	fds_lock(src, &flags);
+	for (int i = 0; i < TASK_MAX_FDS; i++) {
+		vfs_file_t *e = task_fds(src)[i];
+
+		dst->fd_flags[i] = task_get_fd_flags(src, (unsigned)i);
+		dst->fd_table[i] = NULL;
+		if (!e)
+			continue;
+		if (pipe_is_end(e)) {
+			if (pipe_end_hold((pipe_end_t *)e)) {
+				/* Stands in for the duplicate until the second
+				 * pass, and carries the hold that keeps it
+				 * alive until then. */
+				dst->fd_table[i] = e;
+				pending[i / 64] |= 1ULL << (i % 64);
+			}
+			continue;
+		}
+		dst->fd_table[i] = fd_dup_entry(e);
+	}
+	fds_unlock(src, flags);
+
+	for (int i = 0; i < TASK_MAX_FDS; i++) {
+		pipe_end_t *held;
+
+		if (!(pending[i / 64] & (1ULL << (i % 64))))
+			continue;
+		held = (pipe_end_t *)dst->fd_table[i];
+		/* A failed duplicate leaves the child without that descriptor,
+		 * which is what an out-of-memory fork has always done here --
+		 * never a slot naming somebody else's object. */
+		dst->fd_table[i] = (vfs_file_t *)pipe_dup_end(held);
+		pipe_close_end(held);
+	}
+}
+
 /* True for descriptors not backed by a real vfs_file_t: the stdio console dup
  * markers (1-3), pipe ends, epoll instances, and network / UNIX sockets.  These
  * carry no on-disk metadata, so fchmod/fchown/fsync are no-ops on them — and,
@@ -214,11 +392,20 @@ int fd_is_special(vfs_file_t *file)
 
 int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
+	/* One exit, so the hold taken further down is released on every
+	 * path.  The arms that answer before the lookup leave it NULL. */
+	vfs_file_t *file = NULL;
+	int64_t ret;
+
 	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	if (fd >= TASK_MAX_FDS)
-		return -EBADF;
+	if (!cur) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (fd >= TASK_MAX_FDS) {
+		ret = -EBADF;
+		goto out;
+	}
 
 	/* F_GETFD/F_SETFD are per-descriptor-slot flags stored in fd_flags[].
 	 * They must still REJECT a descriptor that is not open: programs probe
@@ -229,8 +416,10 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	 * the save path for a closed fd, where the following F_DUPFD failed
 	 * with EBADF and aborted the whole redirection. */
 	if (cmd == F_GETFD || cmd == F_SETFD) {
-		if (!task_fds(cur)[fd] && !task_fd_is_console(cur, fd))
-			return -EBADF;
+		if (!task_fds(cur)[fd] && !task_fd_is_console(cur, fd)) {
+			ret = -EBADF;
+			goto out;
+		}
 		if (cmd == F_GETFD)
 			/* Masked: FD_STDIO_CLOSED shares this byte and is
 			 * kernel-internal, not part of the fd flags POSIX
@@ -239,7 +428,8 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 					 FD_CLOEXEC);
 		task_set_fd_flags(cur, (unsigned)fd,
 				  (uint8_t)((uint32_t)arg & FD_CLOEXEC));
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
 	/* Advisory record locks.  Placed here, ahead of the per-descriptor-type
@@ -248,20 +438,40 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	 * (sockets, epoll, pipes) have no file to lock and must fall through to
 	 * their own handling rather than reach this. */
 	if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
-		vfs_file_t *lf = task_fds(cur)[fd];
-		if (!lf || IS_SOCKET_FD(lf) || unix_sock_is(lf) ||
-		    IS_EPOLL_FD(lf) || pipe_is_end(lf) || (uintptr_t)lf <= 3)
-			return -EBADF;
+		/* Held across frlock_fcntl(), which identifies the file by the
+		 * inode behind it and can wait for a conflicting lock. */
+		vfs_file_t *lf = fdget(cur, (int)fd);
 		k_flock_t kfl;
-		if (!arg || !validate_user_ptr(arg, sizeof(kfl)))
-			return -EFAULT;
-		if (copy_from_user(&kfl, (void *)arg, sizeof(kfl)) != 0)
-			return -EFAULT;
-		int fr = frlock_fcntl(lf, (int)cmd, &kfl, cur);
+		int fr;
+
+		if (!lf) {
+			ret = -EBADF;
+			goto out;
+		}
+		if (fd_is_special(lf)) {
+			fdput(lf);
+			ret = -EBADF;
+			goto out;
+		}
+		if (!arg || !validate_user_ptr(arg, sizeof(kfl))) {
+			fdput(lf);
+			ret = -EFAULT;
+			goto out;
+		}
+		if (copy_from_user(&kfl, (void *)arg, sizeof(kfl)) != 0) {
+			fdput(lf);
+			ret = -EFAULT;
+			goto out;
+		}
+		fr = frlock_fcntl(lf, (int)cmd, &kfl, cur);
+		fdput(lf);
 		if (fr == 0 && cmd == F_GETLK &&
-		    copy_to_user((void *)arg, &kfl, sizeof(kfl)) != 0)
-			return -EFAULT;
-		return fr;
+		    copy_to_user((void *)arg, &kfl, sizeof(kfl)) != 0) {
+			ret = -EFAULT;
+			goto out;
+		}
+		ret = fr;
+		goto out;
 	}
 
 	/* F_DUPFD/F_DUPFD_CLOEXEC: duplicate onto the lowest free descriptor
@@ -272,42 +482,56 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	 * before pointing it somewhere else for a builtin, so without this
 	 * every redirection in the current shell fails. */
 	if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-		if ((int64_t)arg < 0 || arg >= TASK_MAX_FDS)
-			return -EINVAL;
+		if ((int64_t)arg < 0 || arg >= TASK_MAX_FDS) {
+			ret = -EINVAL;
+			goto out;
+		}
 		/* Source must be open.  0/1/2 stay open as console markers
 		 * even when their fd_table slot is NULL. */
-		if (!task_fds(cur)[fd] && !task_fd_is_console(cur, fd))
-			return -EBADF;
+		if (!task_fds(cur)[fd] && !task_fd_is_console(cur, fd)) {
+			ret = -EBADF;
+			goto out;
+		}
 		int64_t newfd = sys_dup_from(fd, (int)arg);
-		if (newfd < 0)
-			return newfd;
+		if (newfd < 0) {
+			ret = newfd;
+			goto out;
+		}
 		/* POSIX: the copy does NOT inherit FD_CLOEXEC; F_DUPFD clears
 		 * it (sys_dup_from already did) and F_DUPFD_CLOEXEC sets it. */
 		if (cmd == F_DUPFD_CLOEXEC)
 			task_set_fd_flags(cur, (unsigned)newfd, FD_CLOEXEC);
-		return newfd;
+		ret = newfd;
+		goto out;
 	}
 
-	vfs_file_t *file = task_fds(cur)[fd];
+	/* Held for the rest of the call: the arms below read the file's flags
+	 * and hand it to its own filesystem. */
+	file = fdget(cur, (int)fd);
 
 	// Handle console markers: only when fd_table entry is NULL
 	if (task_fd_is_console(cur, fd)) {
 		if (cmd == F_GETFL) {
 			uint32_t fl = (fd == STDIN_FD) ? O_RDONLY : O_WRONLY;
 			fl |= (cur->console_flags & O_NONBLOCK);
-			return fl;
+			ret = fl;
+			goto out;
 		}
 		if (cmd == F_SETFL) {
 			cur->console_flags =
 				(cur->console_flags & ~O_NONBLOCK) |
 				((uint32_t)arg & O_NONBLOCK);
-			return 0;
+			ret = 0;
+			goto out;
 		}
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
-	if (!file)
-		return -EBADF;
+	if (!file) {
+		ret = -EBADF;
+		goto out;
+	}
 
 	// Console markers stored in fd_table by dup2 (oldfd+1: 1=stdin, 2=stdout, 3=stderr)
 	{
@@ -316,47 +540,59 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 			if (cmd == F_GETFL) {
 				uint32_t fl = (mv == 1) ? O_RDONLY : O_WRONLY;
 				fl |= (cur->console_flags & O_NONBLOCK);
-				return fl;
+				ret = fl;
+				goto out;
 			}
 			if (cmd == F_SETFL) {
 				cur->console_flags =
 					(cur->console_flags & ~O_NONBLOCK) |
 					((uint32_t)arg & O_NONBLOCK);
-				return 0;
+				ret = 0;
+				goto out;
 			}
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 	}
 
 	// Socket fd markers
 	if (IS_SOCKET_FD(file)) {
 		int idx = SOCKET_FD_IDX(file);
-		return sock_fcntl_net(idx, (int)cmd, (unsigned long)arg);
+		ret = sock_fcntl_net(idx, (int)cmd, (unsigned long)arg);
+		goto out;
 	}
 
 	// UNIX socket fd markers
 	if (unix_sock_is(file)) {
 		unix_socket_t *us = (unix_socket_t *)file;
-		if (!us)
-			return -EBADF;
+		if (!us) {
+			ret = -EBADF;
+			goto out;
+		}
 		if (cmd == F_GETFL) {
 			uint32_t fl = O_RDWR;
 			if (us->nonblock)
 				fl |= O_NONBLOCK;
-			return fl;
+			ret = fl;
+			goto out;
 		}
 		if (cmd == F_SETFL) {
 			us->nonblock = ((uint32_t)arg & O_NONBLOCK) ? 1 : 0;
-			return 0;
+			ret = 0;
+			goto out;
 		}
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	// Epoll fd markers
 	if (IS_EPOLL_FD(file)) {
-		if (cmd == F_GETFL)
-			return O_RDWR;
-		return -EINVAL;
+		if (cmd == F_GETFL) {
+			ret = O_RDWR;
+			goto out;
+		}
+		ret = -EINVAL;
+		goto out;
 	}
 
 	if (pipe_is_end(file)) {
@@ -365,18 +601,22 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 			uint32_t fl = end->is_read ? O_RDONLY : O_WRONLY;
 			if (end->flags & O_NONBLOCK)
 				fl |= O_NONBLOCK;
-			return fl;
+			ret = fl;
+			goto out;
 		}
 		if (cmd == 4) {
 			end->flags = (end->flags & ~O_NONBLOCK) |
 				     ((uint32_t)arg & O_NONBLOCK);
-			return 0;
+			ret = 0;
+			goto out;
 		}
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	if (cmd == 3) { // F_GETFL
-		return file->flags;
+		ret = file->flags;
+		goto out;
 	}
 	if (cmd == 4) { // F_SETFL
 		// POSIX: F_SETFL can change O_APPEND, O_NONBLOCK, O_ASYNC, O_DIRECT,
@@ -384,9 +624,16 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 		const uint32_t SETTABLE = O_APPEND | O_NONBLOCK;
 		file->flags =
 			(file->flags & ~SETTABLE) | ((uint32_t)arg & SETTABLE);
-		return 0;
+		ret = 0;
+		goto out;
 	}
-	return -EINVAL;
+	ret = -EINVAL;
+	goto out;
+
+out:
+	if (file)
+		fdput(file);
+	return ret;
 }
 
 // SYS_DUP - duplicate file descriptor

@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <sys/vfs.h>
+#include <unistd.h>
 
 /* Output column flags for --output */
 #define COL_SOURCE (1 << 0)

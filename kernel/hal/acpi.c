@@ -10,6 +10,12 @@
 #include <kernel/mm/memory.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/uapi/bug.h>
+/* AcpiHwClearAcpiStatus() is internal to ACPICA and reachable through no
+ * public header; achware.h, where it is declared, needs most of ACPICA's
+ * private types to parse.  So the one prototype is repeated here rather than
+ * assumed -- an assumed function returns int, and one that in fact returns
+ * something wider is silently truncated at the call. */
+ACPI_STATUS AcpiHwClearAcpiStatus(void);
 
 #define ACPI_DEBUG 0
 #if ACPI_DEBUG

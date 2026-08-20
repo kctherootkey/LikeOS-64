@@ -1,0 +1,32 @@
+# Names to show for desktop entries that come from a port's own tarball.
+#
+# Most entries in /usr/share/applications are written here (xterm.desktop,
+# xcalc.desktop, netsurf.desktop) and say whatever this file says.  Three come
+# from the packages themselves, installed into the sysroot by their own `make
+# install', and this is where those are given the names this desktop uses.
+#
+# Renaming rather than overriding.  A replacement .desktop file would have to
+# repeat the upstream Exec, Icon, MimeType, Categories, Keywords and Actions
+# lines, and every one of those is a thing to get wrong now and a thing to
+# forget on the next version bump.  Only the Name is ours; everything else
+# stays exactly as the package installed it.
+#
+# The names matter because two pairs of programs would otherwise collide in
+# the menu.  Galculator and xcalc are both "Calculator"; xfce4-terminal and
+# xterm are both "Terminal".  In each pair the newer program takes the plain
+# name and the X.Org one is qualified, which is the way round a user expects:
+# "Terminal" is the one to open, "Xterm" is the one you ask for by name.
+#
+# Applied by ports/xorg/gtk3/stage.sh after it copies the sysroot's entries,
+# which is the only moment both halves are in one directory.  The desktop
+# shortcuts in /etc/skel/Desktop carry the same names, written out there.
+#
+# Format: the .desktop file name, whitespace, then the name to show.  Blank
+# lines and # comments are ignored.  Localised Name[xx]= lines are left alone;
+# a user running in a language the package was translated into gets the
+# translation, which is the right outcome and is what the untouched file
+# already does.
+
+galculator.desktop        Calculator
+xfce4-terminal.desktop    Terminal
+io.github.Hexchat.desktop Hexchat IRC Client

@@ -1,0 +1,89 @@
+Reach std::out_ptr through vte::out_ptr, for a libstdc++ without it
+
+This tree asks for gnu++23 and uses std::out_ptr (P1132R7) at three call
+sites.  The feature landed in libstdc++ 14; the compiler this port is built
+with is GCC 13.3, whose front end accepts gnu++23 and whose library has every
+other C++23 feature VTE uses but not this one.  The build stops with
+
+  'out_ptr' is not a member of 'std'; did you mean 'auto_ptr'?
+
+Rather than rewrite the three call sites into raw-pointer-then-reset -- which
+is what std::out_ptr exists to avoid writing -- the name is indirected through
+vte::out_ptr in std-glue.hh, beside take_freeable and the other adapters of
+that kind.  Where __cpp_lib_out_ptr is defined it IS std::out_ptr and nothing
+changes; where it is not, a fourteen-line adapter provides the only behaviour
+these call sites use: convert to T**, and adopt what was stored when the full
+expression ends.
+
+--- a/src/std-glue.hh
++++ b/src/std-glue.hh
+@@ -31,6 +31,45 @@
+ template<typename T>
+ inline auto take_freeable(T* t) { return Freeable<T>{t}; }
+ 
++/* std::out_ptr, for a standard library that does not have it yet.
++ *
++ * P1132R7 landed in C++23 and in libstdc++ 14.  This tree asks for gnu++23
++ * and is built here with libstdc++ 13, which has every other C++23 feature it
++ * uses and not this one -- so the three call sites are spelled vte::out_ptr
++ * and resolve to the standard one wherever it exists.
++ *
++ * The semantics are the whole of what those call sites need: hand a T** to a C
++ * function that allocates, and adopt whatever it stored when the full
++ * expression ends.  A temporary of this type is destroyed after the call it
++ * was an argument to has returned, which is what makes the reset() land at the
++ * right moment -- the same mechanism the standard version uses.
++ */
++#if defined(__cpp_lib_out_ptr)
++template<typename SmartPtr>
++inline auto out_ptr(SmartPtr& p) { return std::out_ptr(p); }
++#else
++template<typename SmartPtr>
++class OutPtr {
++public:
++        using pointer = typename SmartPtr::pointer;
++
++        explicit OutPtr(SmartPtr& p) noexcept : m_owner{p} { }
++        ~OutPtr() { m_owner.reset(m_raw); }
++
++        OutPtr(OutPtr const&) = delete;
++        OutPtr& operator=(OutPtr const&) = delete;
++
++        operator pointer*() noexcept { return &m_raw; }
++
++private:
++        SmartPtr& m_owner;
++        pointer m_raw{nullptr};
++};
++
++template<typename SmartPtr>
++inline auto out_ptr(SmartPtr& p) { return OutPtr<SmartPtr>{p}; }
++#endif
++
+ #define VTE_DECLARE_FREEABLE(T, func) \
+ template<> \
+ class FreeableDeleter<T> { \
+--- a/src/vte.cc
++++ b/src/vte.cc
+@@ -7918,7 +7918,7 @@
+         gtk_style_context_save(context);
+         gtk_style_context_set_state (context, GTK_STATE_FLAG_NORMAL);
+         gtk_style_context_get(context, GTK_STATE_FLAG_NORMAL, "font",
+-                              static_cast<PangoFontDescription**>(std::out_ptr(desc)),
++                              static_cast<PangoFontDescription**>(vte::out_ptr(desc)),
+                               nullptr);
+ 
+         gtk_style_context_restore(context);
+--- a/src/widget.cc
++++ b/src/widget.cc
+@@ -1454,8 +1454,8 @@
+         auto attrs = vte::Freeable<PangoAttrList>{};
+         auto cursorpos = 0;
+         gtk_im_context_get_preedit_string(m_im_context.get(),
+-                                          std::out_ptr(str),
+-                                          std::out_ptr(attrs),
++                                          vte::out_ptr(str),
++                                          vte::out_ptr(attrs),
+                                           &cursorpos);
+         _vte_debug_print(vte::debug::category::EVENTS, "Input method pre-edit changed string \"{}\" cursor-position {}",
+                          str.get(), cursorpos);

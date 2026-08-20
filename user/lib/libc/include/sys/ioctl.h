@@ -74,7 +74,15 @@ extern "C" {
 #define SIOCDELRT       0x890C
 #define SIOCRTMSG       0x890D
 
-int ioctl(int fd, unsigned long request, void* argp);
+/* Variadic, as POSIX specifies and as every other C library declares it.
+ *
+ * The third argument is whatever the particular request wants -- a pointer to
+ * a struct for TIOCGWINSZ, a plain int for TIOCSCTTY, nothing at all for
+ * TIOCNOTTY -- and there is no one type that covers them.  Declared as void*
+ * it appeared to work, because C converts an integer constant 0 to a null
+ * pointer and warns about the rest; in C++ there is no such conversion and
+ * `ioctl(fd, TIOCSCTTY, fd)' simply does not compile. */
+int ioctl(int fd, unsigned long request, ...);
 
 #ifdef __cplusplus
 }

@@ -63,9 +63,29 @@ extern "C" {
 #define SO_OOBINLINE    10
 #define SO_LINGER       13
 #define SO_REUSEPORT    15
+#define SO_PEERCRED     17
 #define SO_RCVTIMEO     20
 #define SO_SNDTIMEO     21
 #define SO_BINDTODEVICE 25
+
+/* What SO_PEERCRED returns on a UNIX socket: who is on the other end.
+ *
+ * The kernel recorded these when the connection was made; neither side sent
+ * them and neither side can forge them.  That is what makes the option an
+ * authentication mechanism rather than a courtesy -- it is how a daemon on a
+ * UNIX socket decides whether a client may talk to it at all, which is
+ * precisely what D-Bus's EXTERNAL mechanism does with it.
+ *
+ * Read with getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len), where len
+ * starts as sizeof(struct ucred).  A socket that was never connected reports
+ * ENOTCONN.
+ *
+ * SCM_CREDENTIALS carries the same three fields as an ancillary message. */
+struct ucred {
+    int32_t  pid;
+    uint32_t uid;
+    uint32_t gid;
+};
 
 struct linger {
     int l_onoff;

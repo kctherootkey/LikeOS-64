@@ -2216,6 +2216,44 @@ bool mm_regions_clone(task_t *dst, const task_t *src)
 	return true;
 }
 
+/* Clone `src`'s region table into `dst` AND take the reference every
+ * file-backed region owes its backing file -- as one locked step.
+ *
+ * The two halves cannot be separated.  munmap() releases those same references
+ * while holding this lock for writing, so a copy taken outside it can name a
+ * file that is released before the reference is taken; the child then carries
+ * a pointer it does not own and destroys somebody else's reference when it
+ * execs or exits.  Both fork paths did exactly that -- one with the incref
+ * seventy lines further down -- which is why this lives here rather than being
+ * written out at each call site.
+ *
+ * Read, not write: only `src` is read, so concurrent forks need not wait on
+ * each other.  Excluding the writers is the whole requirement.
+ *
+ * Only an in-use slot owns a reference: the table is copied whole, stale
+ * pointers in unused slots and all, and referencing those would be as wrong as
+ * releasing them.
+ */
+bool mm_regions_clone_ref(task_t *dst, task_t *src)
+{
+	bool ok;
+
+	if (!dst || !src)
+		return false;
+
+	mm_read_lock(&src->mmap_lock);
+	ok = mm_regions_clone(dst, src);
+	if (ok) {
+		for (uint32_t i = 0; i < dst->mmap_capacity; i++) {
+			if (dst->mmap_regions[i].in_use &&
+			    dst->mmap_regions[i].file)
+				vfs_incref(dst->mmap_regions[i].file);
+		}
+	}
+	mm_read_unlock(&src->mmap_lock);
+	return ok;
+}
+
 /* Double the table, up to the ceiling.  Returns false only when the ceiling is
  * reached or memory has run out -- both of which mean the next mmap fails. */
 static bool mm_regions_grow(task_t *task)
@@ -4272,6 +4310,7 @@ bool mm_map_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr,
 
 	*pte = (physical_addr & ~0xFFFULL) | flags;
 
+
 	// Flush TLB if this is the current address space
 	if (pml4 == mm_get_current_address_space()) {
 		mm_flush_tlb(virtual_addr);
@@ -4833,6 +4872,7 @@ static void pagein_unlock(vfs_file_t *file)
  * itself is serialised by g_lazy_map_lock, which is why the ordinary fault
  * path can do this holding only a read lock).  Sleeps: it may read from the
  * backing file. */
+
 static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 			      int from_kernel_mode)
 {

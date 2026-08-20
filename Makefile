@@ -198,6 +198,8 @@ KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fstack-protector-strong -mstack-protector-guard=tls \
 			-mstack-protector-guard-reg=gs -mstack-protector-guard-offset=104 \
 			-mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
+			-Werror=implicit-function-declaration \
+			-Werror=misleading-indentation \
 			-I$(INCLUDE_DIR) -I$(KERNEL_DIR)/hal/acpica/include \
 			-D__LIKEOS__ -D__LIKEOS_KERNEL__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
@@ -400,7 +402,7 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 	libdlbase.so libdlchain.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
-	cxxprobe
+	cxxprobe forkstress
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -1016,6 +1018,11 @@ $(BUILD_DIR)/progerr: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/testmem
 	cp $(USER_DIR)/tests/testmem $@
+	$(USER_STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/forkstress: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/forkstress
+	cp $(USER_DIR)/tests/forkstress $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1820,7 +1827,14 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 		$(EXT4_STAGING)/etc/ssl/certs $(EXT4_STAGING)/etc/ssh \
 		$(EXT4_STAGING)/root $(EXT4_STAGING)/home \
 		$(EXT4_STAGING)/var/empty $(EXT4_STAGING)/var/run \
-		$(EXT4_STAGING)/var/log $(EXT4_STAGING)/tmp
+		$(EXT4_STAGING)/var/log $(EXT4_STAGING)/tmp \
+		$(EXT4_STAGING)/var/lib/dbus
+	# /var/lib/dbus holds the machine id, which dbus-daemon refuses to
+	# start without.  xinitrc writes it with dbus-uuidgen on the first
+	# session -- it identifies the INSTALLATION, so it is generated on the
+	# machine rather than shipped in the image where every copy would
+	# share one.  The directory is made here so that the only thing the
+	# session has to do is write a file.
 	# Kernel lives ONLY at /boot/kernel.elf (the bootloader loads it from ext4)
 	cp $(KERNEL_ELF) $(EXT4_STAGING)/boot/kernel.elf
 	# Userland programs -> /bin
@@ -1851,6 +1865,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/hello         $(EXT4_STAGING)/usr/local/bin/hello
 	cp $(BUILD_DIR)/progerr       $(EXT4_STAGING)/usr/local/bin/progerr
 	cp $(BUILD_DIR)/testmem       $(EXT4_STAGING)/usr/local/bin/testmem
+	cp $(BUILD_DIR)/forkstress    $(EXT4_STAGING)/usr/local/bin/forkstress
 	cp $(BUILD_DIR)/memstat       $(EXT4_STAGING)/usr/local/bin/memstat
 	cp $(BUILD_DIR)/teststress    $(EXT4_STAGING)/usr/local/bin/teststress
 	cp $(BUILD_DIR)/netstress     $(EXT4_STAGING)/usr/local/bin/netstress
@@ -1954,8 +1969,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# on name and the order was alphabetical -- which put a newly added
 	# Calculator at the very top.  Stamping them one second apart in the
 	# order below is what actually decides the layout, so it is written here
-	# rather than left to fall out of the filenames.
-	i=0; for f in pcmanfm xterm mousepad xnedit netsurf claws-mail xcalc; do \
+	# rather than left to fall out of the filenames.  The two pairs that
+	# do the same job are kept together and the newer one first: Terminal
+	# before Xterm, Calculator before X Calculator.
+	i=0; for f in pcmanfm xfce4-terminal xterm mousepad xnedit netsurf \
+	              hexchat claws-mail galculator xcalc; do \
 		for d in $(EXT4_STAGING)/etc/skel/Desktop \
 		         $(EXT4_STAGING)/root/Desktop; do \
 			[ -f "$$d/$$f.desktop" ] && \
@@ -1995,6 +2013,25 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	ports/xorg/gtk3/stage.sh $(EXT4_STAGING)
 	cp ports/openssl-3.5.6/apps/openssl.cnf $(EXT4_STAGING)/etc/ssl/openssl.cnf
 	cp res/etc/ssl/certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/certs/ca-certificates.crt
+	# ...and again under the name OpenSSL looks for on its own.
+	#
+	# A program that names the bundle explicitly finds it above.  One that
+	# calls SSL_CTX_set_default_verify_paths() -- which is what most of
+	# them do, and all a program has to do to "use the system's CAs" --
+	# looks in two places decided when OpenSSL was configured: the file
+	# $$OPENSSLDIR/cert.pem and hashed symlinks in $$OPENSSLDIR/certs.
+	# This port is built with --openssldir=/etc/ssl, so those are
+	# /etc/ssl/cert.pem and /etc/ssl/certs/<hash>.0, and until now the
+	# image had neither -- every certificate on it was unreachable by the
+	# default path.  HexChat is where that surfaced, as
+	#
+	#   Connection failed (Unable to get local issuer certificate.? (20))
+	#
+	# but nothing using the defaults could have verified anything.
+	#
+	# A relative symlink, which is what a distribution ships, rather than a
+	# second copy of 200KB that could drift from the first.
+	ln -sfn certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/cert.pem
 	# Signature file selects this device as the OS root; sample text file
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(EXT4_STAGING)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(EXT4_STAGING)/HELLO.TXT
@@ -2397,7 +2434,16 @@ xorg-manpages:
 # ships none -- so the port supplies it (ports/xorg/gtk3/man/mousepad.1) and
 # the build driver installs it into the sysroot's man1.  From here it is
 # indistinguishable from the others, which is the point.
+#
+# galculator, xfce4-terminal and hexchat each ship a page in their own tarball
+# and render like the rest.  The programs staged BESIDE them do not appear
+# here and cannot: the D-Bus tools and xfconf-query document themselves in
+# DocBook XML, which needs xmlto to turn into troff, and this tree deliberately
+# requires no documentation toolchain of the machine that builds it (every
+# port above is configured --disable-docs for the same reason).  Their absence
+# is a gap, not an oversight.
 GTK3_MAN_PROGS = claws-mail pcmanfm mousepad libfm-pref-apps lxshortcut \
+		 galculator xfce4-terminal hexchat \
 		 gio gsettings gdbus gapplication \
 		 fc-list fc-match fc-cache
 

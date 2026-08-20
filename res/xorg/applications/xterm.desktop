@@ -8,7 +8,7 @@
 # at a command line.
 Type=Application
 Version=1.0
-Name=XTerm
+Name=Xterm
 GenericName=Terminal
 Comment=Use the command line
 Exec=xterm

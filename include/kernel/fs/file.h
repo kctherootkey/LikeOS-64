@@ -12,6 +12,19 @@ int fd_install(task_t *task, vfs_file_t *file);
 int fd_install_from(task_t *task, vfs_file_t *file, int from);
 int fd_is_special(vfs_file_t *file);
 void fds_lock(task_t *task, uint64_t *flags);
+
+/* Resolve a descriptor to the object it names, with a reference held, or NULL
+ * if the descriptor is not open.  The result may be any of the kinds a slot
+ * can hold -- ask fd_is_special() before treating it as a vfs_file_t.  EVERY
+ * successful call must be paired with exactly one fdput(); see the block
+ * comment in kernel/fs/file.c for why reading the slot directly is not safe in
+ * a process that has threads. */
+/* Copy one task's descriptor table into another, taking a reference on every
+ * entry.  For fork: see the definition for why it takes two passes. */
+void fd_table_clone(task_t *dst, task_t *src);
+
+vfs_file_t *fdget(task_t *task, int fd);
+void fdput(vfs_file_t *entry);
 void fds_unlock(task_t *task, uint64_t flags);
 
 #endif /* _KERNEL_FS_FILE_H */

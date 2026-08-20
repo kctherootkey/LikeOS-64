@@ -1,4 +1,5 @@
 // LikeOS-64 -- read/write/readv/writev/lseek.
+#include <kernel/ke/waitq.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -14,7 +15,7 @@
  * write parks on the object itself and sched_wake_channel() releases it; a
  * task multiplexing several descriptors parks on the poll layer's own channel
  * and only this releases it before its one-tick fallback expires. */
-extern void poll_notify_io_ready(void);
+extern void poll_notify_wq(struct wait_queue_head *);
 
 // Pipe read/write helpers
 static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
@@ -99,7 +100,7 @@ static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
 	// on the poll layer's channel and nothing here would otherwise release
 	// them before its one-tick fallback expired.
 	sched_wake_channel(pipe);
-	poll_notify_io_ready();
+	poll_notify_wq(&pipe->poll_wq);
 
 	return (int64_t)to_read;
 }
@@ -192,10 +193,15 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 	// Wake up any readers blocked on this pipe -- see the note in
 	// pipe_read_to_user() for why the poll layer needs telling separately.
 	sched_wake_channel(pipe);
-	poll_notify_io_ready();
+	poll_notify_wq(&pipe->poll_wq);
 
 	return (int64_t)to_write;
 }
+
+static int64_t read_held(task_t *cur, vfs_file_t *file, uint64_t buf,
+			 uint64_t count);
+static int64_t write_held(task_t *cur, vfs_file_t *file, uint64_t buf,
+			  uint64_t count);
 
 // SYS_READ - read from file descriptor
 int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
@@ -223,10 +229,9 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 	 * would deadlock. */
 	mm_prefault_user_range(buf, count, 1);
 
-	vfs_file_t *file = NULL;
-	if (fd < TASK_MAX_FDS) {
-		file = task_fds(cur)[fd];
-	}
+	/* The console arm is decided by the descriptor being an unredirected
+	 * standard one, which means an EMPTY slot -- so it is settled before
+	 * any lookup, and a lookup would find nothing to hold anyway. */
 	if (task_fd_is_console(cur, fd) && fd == STDIN_FD) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 		if (tty && tty->fg_pgid == 0) {
@@ -240,10 +245,26 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 		int nonblock = (cur->console_flags & O_NONBLOCK) ? 1 : 0;
 		return tty_read(tty, (void *)buf, (long)count, nonblock);
 	}
-	if (!file) {
-		return -EBADF;
-	}
+	/* From here the object is USED, so it is held for as long as that
+	 * takes: every arm below can sleep, and a sibling thread closing this
+	 * descriptor meanwhile must not be able to destroy what we are using.
+	 * The single exit is what keeps the release paired with the hold. */
+	{
+		vfs_file_t *file = fdget(cur, (int)fd);
+		int64_t ret;
 
+		if (!file)
+			return -EBADF;
+		ret = read_held(cur, file, buf, count);
+		fdput(file);
+		return ret;
+	}
+}
+
+/* The body of read(2), with the descriptor's object already held. */
+static int64_t read_held(task_t *cur, vfs_file_t *file, uint64_t buf,
+			 uint64_t count)
+{
 	// Check for console dup markers (magic pointers 1, 2, 3).
 	// All three reference the same bidirectional /dev/console device,
 	// so any of them can be read from (matches Unix dup-of-tty semantics).
@@ -314,10 +335,8 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 	 * tty locks are taken (see sys_read).  Read-only touch: no COW. */
 	mm_prefault_user_range(buf, count, 0);
 
-	vfs_file_t *file = NULL;
-	if (fd < TASK_MAX_FDS) {
-		file = task_fds(cur)[fd];
-	}
+	/* As in sys_read: an unredirected standard descriptor is an EMPTY
+	 * slot, so this arm is settled without a lookup. */
 	if (task_fd_is_console(cur, fd) && fd != STDIN_FD) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 		if (tty && tty->fg_pgid == 0) {
@@ -330,10 +349,23 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 		}
 		return tty_write(tty, (const void *)buf, (long)count);
 	}
-	if (!file) {
-		return -EBADF;
-	}
+	/* Held across the dispatch below, for the reason given in sys_read. */
+	{
+		vfs_file_t *file = fdget(cur, (int)fd);
+		int64_t ret;
 
+		if (!file)
+			return -EBADF;
+		ret = write_held(cur, file, buf, count);
+		fdput(file);
+		return ret;
+	}
+}
+
+/* The body of write(2), with the descriptor's object already held. */
+static int64_t write_held(task_t *cur, vfs_file_t *file, uint64_t buf,
+			  uint64_t count)
+{
 	// Check for console dup markers (magic pointers 1, 2, 3).
 	// All three reference the same bidirectional /dev/console device.
 	uint64_t marker = (uint64_t)file;
@@ -402,20 +434,23 @@ int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 		return -ESPIPE;
 	}
 
-	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL) {
+	vfs_file_t *file = fdget(cur, (int)fd);
+	long result;
+
+	if (!file) {
 		return -EBADF;
 	}
-
-	vfs_file_t *file = task_fds(cur)[fd];
 
 	/* Console dup markers, pipes, sockets and epoll instances are not
 	 * seekable -- and must not be handed to vfs_seek, which would take the
 	 * marker for a pointer. */
 	if (fd_is_special(file)) {
+		fdput(file);
 		return -ESPIPE;
 	}
 
-	long result = vfs_seek(file, (long)offset, (int)whence);
+	result = vfs_seek(file, (long)offset, (int)whence);
+	fdput(file);
 
 	if (result < 0) {
 		return -EINVAL;

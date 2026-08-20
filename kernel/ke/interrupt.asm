@@ -70,6 +70,16 @@ isr_common_stub:
     ; rdi = GPR frame pointer for C handler
     mov rdi, rsp
 
+    ; The ABI the C handlers are compiled against requires DF=0, and the CPU
+    ; does NOT clear it on exception delivery: an interrupted user `rep movs`
+    ; running downward (memmove copying backward sets DF) hands the kernel
+    ; DF=1, and every kernel `rep stos`/`rep movs` from then until the iretq
+    ; runs BACKWARD -- writing below its buffer instead of into it.  That was
+    ; a page-in's neighbouring frame being shredded by an ordinary memset:
+    ; program text corrupted by a copy that never overflowed anything.  The
+    ; user's own DF comes back with RFLAGS on the iretq.
+    cld
+
     ; Check if we came from user mode: CS is at [rsp + 144]
     ; Stack layout after 15 GPR pushes + 2 macro pushes:
     ;   [rsp+0]=r15 ... [rsp+112]=rax [rsp+120]=int# [rsp+128]=err [rsp+136]=RIP [rsp+144]=CS
@@ -173,6 +183,7 @@ irq_common_stub:
 
     ; rdi = GPR frame pointer for C handler
     mov rdi, rsp
+    cld                        ; ABI: DF=0 for C code; the CPU does not clear it on interrupt entry
 
     ; Check if we came from user mode: CS is at [rsp + 144]
     xor r15, r15
@@ -353,6 +364,7 @@ ipi_common_stub:
     push r15
 
     mov rdi, rsp               ; Pass pointer to register structure
+    cld                        ; ABI: DF=0 for C code; the CPU does not clear it on interrupt entry
 
     ; Check if we came from user mode: CS is at [rsp + 144]
     ; Stack layout after 15 GPR pushes + 2 macro pushes (vector, dummy):

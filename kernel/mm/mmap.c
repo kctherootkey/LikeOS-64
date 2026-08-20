@@ -9,6 +9,7 @@
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
+#include <kernel/fs/file.h>
 
 /* The mmap region table lives in the mm layer: mm_find_mmap_region(),
  * mm_alloc_mmap_region() and mm_unmap_range_and_regions() (kernel/mm/memory.c,
@@ -55,9 +56,16 @@ int64_t sys_brk(uint64_t new_brk)
 static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			       uint64_t flags, uint64_t fd, uint64_t offset)
 {
+	/* One exit, so the backing file's hold is released however this
+	 * answers.  Anonymous mappings leave it NULL and release nothing. */
+	vfs_file_t *backing = NULL;
+	int64_t ret;
+
 	task_t *cur = sched_current();
-	if (!cur)
-		return -ENOMEM;
+	if (!cur) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	/* fd lookup below stays on the calling task; the region table,
 	 * mmap_base and pml4 belong to the thread-group leader. */
 	task_t *caller = cur;
@@ -65,7 +73,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 
 	// Security: Validate length - must be non-zero and reasonable
 	if (length == 0) {
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	// Security: Prevent integer overflow when aligning length
@@ -78,7 +87,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 
 	// Security: Prevent excessive allocation (max 2GB per mmap call)
 	if (length > (2ULL * 1024 * 1024 * 1024)) {
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	// Find a free mmap region slot
@@ -118,7 +128,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			"mmap: pid %d out of mmap regions (max %d): %d file-backed, %d anonymous (%llu KB), %d lazy",
 			cur->id, TASK_MAX_MMAP, n_file, n_anon,
 			(unsigned long long)(anon_bytes / 1024), n_lazy);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	// Determine virtual address
@@ -129,7 +140,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		}
 		// Security: Reject mappings below 64KB to prevent NULL deref exploits
 		if (addr < 0x10000) {
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 		vaddr = addr;
 
@@ -149,12 +161,14 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		if (cur->mmap_base < cur->brk + (4 * 1024 * 1024)) {
 			// Too close to heap
 			cur->mmap_base += length; // Rollback
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out;
 		}
 		// Security: Reject mappings below 64KB to prevent NULL deref exploits
 		if (cur->mmap_base < 0x10000) {
 			cur->mmap_base += length; // Rollback
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out;
 		}
 		vaddr = cur->mmap_base;
 	}
@@ -173,17 +187,21 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	/* Resolve and validate the backing file up front (also needed for the
 	 * lazy path).  Only real VFS files can back a mapping — socket/pipe/
 	 * epoll fd markers and stdio placeholders cannot. */
-	vfs_file_t *backing = NULL;
 	if (!is_anonymous) {
-		if (fd >= TASK_MAX_FDS || !task_fds(caller)[fd])
-			return -EBADF;
-		uint64_t marker = (uint64_t)task_fds(caller)[fd];
-		if (marker <= 3 || IS_SOCKET_FD(task_fds(caller)[fd]) ||
-		    unix_sock_is(task_fds(caller)[fd]) ||
-		    IS_EPOLL_FD(task_fds(caller)[fd]) ||
-		    pipe_is_end(task_fds(caller)[fd]))
-			return -ENODEV;
-		backing = task_fds(caller)[fd];
+		/* Held for the rest of the call.  The region records built
+		 * below take their own reference, but between this lookup and
+		 * that point the descriptor can be closed by a sibling thread
+		 * -- and then the reference is taken on a file that has already
+		 * been released. */
+		backing = fdget(caller, (int)fd);
+		if (!backing) {
+			ret = -EBADF;
+			goto out;
+		}
+		if (fd_is_special(backing)) {
+			ret = -ENODEV;
+			goto out;
+		}
 	}
 
 	/* Device mapping: /dev/fb0 maps the framebuffer BAR itself.  Pages
@@ -203,10 +221,13 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 				 * but pointless here, and implementing it means
 				 * copy-on-write over borrowed pages.  Say so
 				 * rather than silently sharing. */
-				return -EOPNOTSUPP;
+				ret = -EOPNOTSUPP;
+				goto out;
 			}
-			if ((offset & (PAGE_SIZE - 1)) != 0)
-				return -EINVAL;
+			if ((offset & (PAGE_SIZE - 1)) != 0) {
+				ret = -EINVAL;
+				goto out;
+			}
 			if (offset + length > sobj->size)
 				return -EINVAL; /* past the object's length */
 
@@ -232,7 +253,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 							cur->pml4, vaddr + cl);
 					if (!(flags & MAP_FIXED))
 						cur->mmap_base += length;
-					return -ENOMEM;
+					ret = -ENOMEM;
+					goto out;
 				}
 			}
 			/* Pin the object for the life of the mapping: the
@@ -256,7 +278,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 				shm_page_phys(sobj, offset / PAGE_SIZE);
 			region->in_use = true;
 			mm_merge_region_neighbours(cur, region);
-			return (int64_t)vaddr;
+			ret = (int64_t)vaddr;
+			goto out;
 		}
 	}
 
@@ -268,7 +291,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		if (!dev_phys) {
 			if (!(flags & MAP_FIXED))
 				cur->mmap_base += length; // Rollback
-			return -ENODEV;
+			ret = -ENODEV;
+			goto out;
 		}
 		for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
 			if (!mm_map_page_in_address_space(
@@ -279,7 +303,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 						cur->pml4, vaddr + cl);
 				if (!(flags & MAP_FIXED))
 					cur->mmap_base += length; // Rollback
-				return -ENOMEM;
+				ret = -ENOMEM;
+				goto out;
 			}
 		}
 		vfs_incref(backing);
@@ -297,7 +322,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->device_phys = dev_phys;
 		region->in_use = true;
 		mm_merge_region_neighbours(cur, region);
-		return (int64_t)vaddr;
+		ret = (int64_t)vaddr;
+		goto out;
 	}
 
 	/* Demand paging: PRIVATE mappings (anonymous or file-backed) are not
@@ -331,7 +357,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->file = backing;
 		region->in_use = true;
 		mm_merge_region_neighbours(cur, region);
-		return (int64_t)vaddr;
+		ret = (int64_t)vaddr;
+		goto out;
 	}
 
 	// Map pages (eager, MAP_SHARED only)
@@ -349,7 +376,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			if (!(flags & MAP_FIXED)) {
 				cur->mmap_base += length; // Rollback
 			}
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out;
 		}
 
 		/* No memset in production: mm_allocate_physical_page already
@@ -383,7 +411,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			if (!(flags & MAP_FIXED)) {
 				cur->mmap_base += length; // Rollback
 			}
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out;
 		}
 		pages_mapped++;
 	}
@@ -400,7 +429,13 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	region->in_use = true;
 	mm_merge_region_neighbours(cur, region);
 
-	return (int64_t)vaddr;
+	ret = (int64_t)vaddr;
+	goto out;
+
+out:
+	if (backing)
+		fdput(backing);
+	return ret;
 }
 
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,

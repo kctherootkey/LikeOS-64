@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <wchar.h>
+#include <uchar.h>
 #include <wctype.h>
 #include <locale.h>
 #include <langinfo.h>
@@ -42,6 +43,8 @@
 #include <sys/un.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <fenv.h>
+#include <search.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -857,6 +860,70 @@ static void *cow_writer_fn(void *arg)
 	 * every byte written exactly once. */
 	for (size_t i = (size_t)id; i < COW_STRESS_LEN; i += COW_THREADS)
 		g_cow_shared[i] = (unsigned char)(id + 1);
+	return NULL;
+}
+
+/* Copy-on-write COHERENCY: does a thread ever read a page through a stale
+ * translation after another thread copied it?
+ *
+ * The stress test above writes disjoint bytes and checks the result after the
+ * join, so it proves no write was LOST.  It cannot see the other failure: a
+ * thread reading a page through a translation that still points at the
+ * pre-copy frame, and so seeing the page as it was before the copy.  Both
+ * threads are in one address space and must see one memory; a window where
+ * they do not is a coherency bug, and it lasts from the moment the new mapping
+ * is published until every other processor has been told about it.
+ *
+ * The check rests on the processor's store ordering.  The writer stores to the
+ * page and then to a flag, in that order, and this architecture does not
+ * reorder stores.  So a reader that has seen the flag MUST see the page store
+ * -- unless its translation is pointing somewhere else entirely.  Nothing here
+ * depends on timing being lucky: if the reader sees the flag and not the
+ * write, that is a translation fault and nothing else.
+ *
+ * The pages have to be copy-on-write for there to be a copy at all, which is
+ * what the fork is for -- the child only has to stay alive.  The reader touches
+ * every page first, so it HAS a cached translation to go stale; without that
+ * it would simply walk the tables and find the new frame.
+ */
+#define COWSTALE_PAGES 256
+#define COWSTALE_PGSZ 4096
+static unsigned char *g_cowstale_mem;
+static volatile long *g_cowstale_flag;
+static volatile long g_cowstale_checked;
+static volatile long g_cowstale_stale;
+static volatile int g_cowstale_stop;
+
+static void *cowstale_reader_fn(void *arg)
+{
+	volatile unsigned char sink = 0;
+	long i;
+
+	(void)arg;
+	/* Populate this processor's translations for every shared page.  A
+	 * read does not resolve copy-on-write, so these stay pointing at the
+	 * frame the writer is about to copy away from. */
+	for (i = 0; i < COWSTALE_PAGES; i++)
+		sink ^= g_cowstale_mem[i * COWSTALE_PGSZ];
+	(void)sink;
+
+	for (i = 0; i < COWSTALE_PAGES; i++) {
+		long spins = 0;
+
+		while (*g_cowstale_flag < i) {
+			if (g_cowstale_stop)
+				return NULL;
+			if (++spins > 100000000L) {
+				g_cowstale_stop = 1;
+				return NULL;
+			}
+		}
+		__asm__ volatile("" ::: "memory");
+		if (g_cowstale_mem[i * COWSTALE_PGSZ] !=
+		    (unsigned char)(i + 1))
+			g_cowstale_stale++;
+		g_cowstale_checked++;
+	}
 	return NULL;
 }
 
@@ -6125,6 +6192,953 @@ static void test_exit_handlers(void)
  * exactly one way that matters -- they are quiet on NaN -- so that is what is
  * tested.
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * <fenv.h> -- the floating-point environment.
+ *
+ * x86-64 has two floating-point units and these functions have to agree about
+ * both: double arithmetic compiles to SSE and long double to x87, each with
+ * its own exception flags and rounding control.  A version that read only one
+ * of them would pass every test written in double and fail the moment a long
+ * double appeared, so both types are used deliberately below.
+ * ------------------------------------------------------------------ */
+static void test_fenv(void)
+{
+	printf("\n[TEST] <fenv.h> floating-point environment\n");
+
+	/* Start from a known state; every check below assumes it. */
+	feclearexcept(FE_ALL_EXCEPT);
+	test_result("feclearexcept leaves nothing raised",
+		    fetestexcept(FE_ALL_EXCEPT) == 0);
+
+	/* Raise one, see one. */
+	feraiseexcept(FE_DIVBYZERO);
+	test_result("feraiseexcept(FE_DIVBYZERO)",
+		    fetestexcept(FE_DIVBYZERO) == FE_DIVBYZERO);
+	test_result("...and nothing else",
+		    fetestexcept(FE_ALL_EXCEPT) == FE_DIVBYZERO);
+
+	/* Clearing one leaves the others. */
+	feraiseexcept(FE_OVERFLOW | FE_INEXACT);
+	feclearexcept(FE_DIVBYZERO);
+	test_result("feclearexcept clears only what it is given",
+		    fetestexcept(FE_DIVBYZERO) == 0 &&
+			    fetestexcept(FE_OVERFLOW) == FE_OVERFLOW &&
+			    fetestexcept(FE_INEXACT) == FE_INEXACT);
+	feclearexcept(FE_ALL_EXCEPT);
+
+	/* Real arithmetic on each unit raises the flag it should.
+	 *
+	 * `volatile' throughout: without it the compiler evaluates these at
+	 * compile time and no instruction ever runs, so no flag is set and the
+	 * test measures nothing. */
+	{
+		volatile double zero = 0.0;
+		volatile double one = 1.0;
+		volatile double r;
+
+		feclearexcept(FE_ALL_EXCEPT);
+		r = one / zero; /* SSE */
+		(void)r;
+		test_result("division by zero raises FE_DIVBYZERO (SSE)",
+			    fetestexcept(FE_DIVBYZERO) == FE_DIVBYZERO);
+
+		feclearexcept(FE_ALL_EXCEPT);
+		r = zero / zero;
+		(void)r;
+		test_result("0/0 raises FE_INVALID (SSE)",
+			    fetestexcept(FE_INVALID) == FE_INVALID);
+	}
+	{
+		/* The x87 side.  If fetestexcept read MXCSR only, this is the
+		 * check that fails. */
+		volatile long double lzero = 0.0L;
+		volatile long double lone = 1.0L;
+		volatile long double lr;
+
+		feclearexcept(FE_ALL_EXCEPT);
+		lr = lone / lzero;
+		(void)lr;
+		test_result("division by zero raises FE_DIVBYZERO (x87)",
+			    fetestexcept(FE_DIVBYZERO) == FE_DIVBYZERO);
+	}
+	feclearexcept(FE_ALL_EXCEPT);
+
+	/* Saving and restoring a set of flags. */
+	{
+		fexcept_t saved;
+
+		feraiseexcept(FE_OVERFLOW);
+		fegetexceptflag(&saved, FE_ALL_EXCEPT);
+		feclearexcept(FE_ALL_EXCEPT);
+		test_result("fegetexceptflag does not clear",
+			    fetestexcept(FE_ALL_EXCEPT) == 0);
+		fesetexceptflag(&saved, FE_ALL_EXCEPT);
+		test_result("fesetexceptflag puts them back",
+			    fetestexcept(FE_OVERFLOW) == FE_OVERFLOW);
+		feclearexcept(FE_ALL_EXCEPT);
+	}
+
+	/* Rounding.  The direction has to reach BOTH units, so it is checked
+	 * with a double (SSE) and a long double (x87). */
+	test_result("fegetround starts at FE_TONEAREST",
+		    fegetround() == FE_TONEAREST);
+	{
+		volatile double x = 1.5;
+		volatile double y;
+		volatile long double lx = 1.5L;
+		volatile long double ly;
+		int ok_up, ok_down, ok_x87;
+
+		fesetround(FE_UPWARD);
+		test_result("fesetround(FE_UPWARD) reads back",
+			    fegetround() == FE_UPWARD);
+		y = x + 1e-30; /* nudged so rounding decides the result */
+		ok_up = (y > 1.5);
+		ly = lx + 1e-30L;
+		ok_x87 = (ly > 1.5L);
+
+		fesetround(FE_DOWNWARD);
+		y = x - 1e-30;
+		ok_down = (y < 1.5);
+
+		fesetround(FE_TONEAREST);
+		test_result("FE_UPWARD rounds up (SSE)", ok_up);
+		test_result("FE_UPWARD rounds up (x87)", ok_x87);
+		test_result("FE_DOWNWARD rounds down (SSE)", ok_down);
+		test_result("rounding restored to nearest",
+			    fegetround() == FE_TONEAREST);
+	}
+	test_result("fesetround rejects a value that is not a direction",
+		    fesetround(12345) != 0 && fegetround() == FE_TONEAREST);
+
+	/* The environment as a whole. */
+	{
+		fenv_t env;
+
+		feclearexcept(FE_ALL_EXCEPT);
+		fesetround(FE_UPWARD);
+		feraiseexcept(FE_INEXACT);
+		test_result("fegetenv succeeds", fegetenv(&env) == 0);
+		/* fegetenv must not disturb what it read -- the instruction it
+		 * is built on masks every exception as a side effect, and an
+		 * implementation that forgets to put the control word back
+		 * leaves the process unable to trap for the rest of its
+		 * life. */
+		test_result("fegetenv changes nothing",
+			    fegetround() == FE_UPWARD &&
+				    fetestexcept(FE_INEXACT) == FE_INEXACT);
+
+		fesetround(FE_TONEAREST);
+		feclearexcept(FE_ALL_EXCEPT);
+		test_result("fesetenv restores the saved environment",
+			    fesetenv(&env) == 0 && fegetround() == FE_UPWARD &&
+				    fetestexcept(FE_INEXACT) == FE_INEXACT);
+
+		test_result("FE_DFL_ENV is the startup environment",
+			    fesetenv(FE_DFL_ENV) == 0 &&
+				    fegetround() == FE_TONEAREST &&
+				    fetestexcept(FE_ALL_EXCEPT) == 0);
+	}
+
+	/* feholdexcept / feupdateenv: run a block with the flags out of the
+	 * way, then put back what was there and add what happened. */
+	{
+		fenv_t env;
+
+		feclearexcept(FE_ALL_EXCEPT);
+		feraiseexcept(FE_OVERFLOW);
+		test_result("feholdexcept clears the flags",
+			    feholdexcept(&env) == 0 &&
+				    fetestexcept(FE_ALL_EXCEPT) == 0);
+		feraiseexcept(FE_INEXACT);
+		test_result("feupdateenv merges old and new",
+			    feupdateenv(&env) == 0 &&
+				    fetestexcept(FE_OVERFLOW) == FE_OVERFLOW &&
+				    fetestexcept(FE_INEXACT) == FE_INEXACT);
+		feclearexcept(FE_ALL_EXCEPT);
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * <search.h> -- the POSIX search tables.
+ *
+ * The tree is what matters here.  tsearch's interface allows a plain binary
+ * search tree, and a plain one becomes a linked list the moment the keys
+ * arrive in order -- which is the common case.  So the implementation
+ * balances, and what is checked below is that the balancing did not break the
+ * ordering: an in-order walk of sorted insertions must come back sorted, and
+ * must still be sorted after half the keys are deleted.
+ *
+ * host/test-search.sh does this over 20,000 keys against glibc and checks the
+ * tree's depth as well.
+ * ------------------------------------------------------------------ */
+static int uc_cmp_int(const void *a, const void *b)
+{
+	int x = *(const int *)a, y = *(const int *)b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static int uc_walk_prev;
+static int uc_walk_n;
+static int uc_walk_ordered;
+
+static void uc_walk_visit(const void *node, VISIT which, int depth)
+{
+	(void)depth;
+	if (which != postorder && which != leaf)
+		return;
+	{
+		int v = **(int *const *)node;
+
+		if (uc_walk_n && v <= uc_walk_prev)
+			uc_walk_ordered = 0;
+		uc_walk_prev = v;
+		uc_walk_n++;
+	}
+}
+
+static void test_search(void)
+{
+	printf("\n[TEST] <search.h> search tables\n");
+
+	/* ---- the tree ---- */
+	{
+		enum { N = 512 };
+		static int keys[N];
+		void *root = NULL;
+		int i, ok = 1;
+
+		/* Sorted insertion order on purpose: this is the input a plain
+		 * binary search tree degenerates on. */
+		for (i = 0; i < N; i++)
+			keys[i] = i;
+		for (i = 0; i < N; i++)
+			if (tsearch(&keys[i], &root, uc_cmp_int) == NULL)
+				ok = 0;
+		test_result("tsearch inserted every key", ok);
+
+		ok = 1;
+		for (i = 0; i < N; i++) {
+			void *f = tfind(&keys[i], &root, uc_cmp_int);
+
+			if (!f || **(int **)f != keys[i])
+				ok = 0;
+		}
+		test_result("tfind finds every key", ok);
+
+		{
+			int absent = -1;
+
+			test_result("tfind rejects a key that is not there",
+				    tfind(&absent, &root, uc_cmp_int) == NULL);
+		}
+
+		uc_walk_n = 0;
+		uc_walk_ordered = 1;
+		twalk(root, uc_walk_visit);
+		test_result("twalk visits every node once", uc_walk_n == N);
+		test_result("twalk is in order", uc_walk_ordered);
+
+		/* Deletion rebalances too, with its own rotations. */
+		ok = 1;
+		for (i = 0; i < N; i += 2)
+			if (tdelete(&keys[i], &root, uc_cmp_int) == NULL)
+				ok = 0;
+		test_result("tdelete removed every key it was given", ok);
+
+		ok = 1;
+		for (i = 0; i < N; i += 2)
+			if (tfind(&keys[i], &root, uc_cmp_int))
+				ok = 0;
+		for (i = 1; i < N; i += 2)
+			if (!tfind(&keys[i], &root, uc_cmp_int))
+				ok = 0;
+		test_result("the right half survived the deletions", ok);
+
+		uc_walk_n = 0;
+		uc_walk_ordered = 1;
+		twalk(root, uc_walk_visit);
+		test_result("twalk is still in order after deleting",
+			    uc_walk_ordered && uc_walk_n == N / 2);
+
+		for (i = 1; i < N; i += 2)
+			tdelete(&keys[i], &root, uc_cmp_int);
+		test_result("the tree is empty once every key is gone",
+			    root == NULL);
+	}
+
+	/* ---- the hash table ---- */
+	{
+		enum { N = 128 };
+		static char keys[N][16];
+		int i, ok = 1;
+
+		test_result("hcreate", hcreate(N) != 0);
+		for (i = 0; i < N; i++) {
+			ENTRY e;
+
+			snprintf(keys[i], sizeof keys[i], "k%d", i);
+			e.key = keys[i];
+			e.data = (void *)(long)i;
+			if (!hsearch(e, ENTER))
+				ok = 0;
+		}
+		test_result("hsearch ENTER filled the table", ok);
+
+		/* At the stated capacity, every key must still be findable --
+		 * which is what a probe sequence that cannot reach every slot
+		 * fails. */
+		ok = 1;
+		for (i = 0; i < N; i++) {
+			ENTRY q = { keys[i], NULL };
+			ENTRY *r = hsearch(q, FIND);
+
+			if (!r || (long)r->data != i)
+				ok = 0;
+		}
+		test_result("hsearch FIND finds every key", ok);
+
+		{
+			char absent[] = "nope";
+			ENTRY q = { absent, NULL };
+
+			test_result("hsearch FIND misses what is absent",
+				    hsearch(q, FIND) == NULL);
+		}
+		{
+			/* ENTER on a key already present RETURNS it; it does
+			 * not replace the data. */
+			ENTRY e = { keys[0], (void *)999L };
+			ENTRY *r = hsearch(e, ENTER);
+
+			test_result("hsearch ENTER on an existing key",
+				    r && (long)r->data == 0);
+		}
+		hdestroy();
+	}
+
+	/* ---- lsearch / lfind ---- */
+	{
+		int arr[16];
+		size_t n = 0;
+		int i, ok = 1;
+
+		for (i = 0; i < 8; i++) {
+			int v = i * 3;
+
+			if (!lsearch(&v, arr, &n, sizeof v, uc_cmp_int))
+				ok = 0;
+		}
+		test_result("lsearch appended eight elements", ok && n == 8);
+		{
+			int v = 3;
+
+			lsearch(&v, arr, &n, sizeof v, uc_cmp_int);
+			test_result("lsearch does not append a duplicate",
+				    n == 8);
+			test_result("lfind finds it",
+				    lfind(&v, arr, &n, sizeof v, uc_cmp_int) !=
+					    NULL);
+			v = 1;
+			test_result("lfind misses what is absent",
+				    lfind(&v, arr, &n, sizeof v, uc_cmp_int) ==
+					    NULL);
+		}
+	}
+
+	/* ---- insque / remque ---- */
+	{
+		struct qe {
+			struct qe *forw;
+			struct qe *back;
+			int v;
+		} a = { 0, 0, 1 }, b = { 0, 0, 2 }, c = { 0, 0, 3 };
+		struct qe *p;
+		int seen[4], n = 0;
+
+		insque(&a, NULL);
+		insque(&b, &a);
+		insque(&c, &a); /* between a and b */
+		for (p = &a; p && n < 4; p = p->forw)
+			seen[n++] = p->v;
+		test_result("insque links in the right order",
+			    n == 3 && seen[0] == 1 && seen[1] == 3 &&
+				    seen[2] == 2);
+
+		remque(&c);
+		n = 0;
+		for (p = &a; p && n < 4; p = p->forw)
+			seen[n++] = p->v;
+		test_result("remque unlinks the middle element",
+			    n == 2 && seen[0] == 1 && seen[1] == 2);
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * SO_PEERCRED -- who is on the other end of a UNIX socket.
+ *
+ * The kernel records this when the connection is made; neither side sends it
+ * and neither side can forge it, which is what makes it usable for
+ * authentication.  D-Bus's EXTERNAL mechanism is built on it, and the session
+ * bus this image runs is why it exists.
+ * ------------------------------------------------------------------ */
+static void test_so_peercred(void)
+{
+	printf("\n[TEST] SO_PEERCRED on UNIX sockets\n");
+
+	pid_t me = getpid();
+	uid_t myuid = geteuid();
+	gid_t mygid = getegid();
+
+	/* A socketpair: both ends belong to this process, so each end's peer
+	 * is this process. */
+	{
+		int sv[2];
+		struct ucred c;
+		socklen_t len = sizeof c;
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+			test_result("socketpair for SO_PEERCRED", 0);
+			return;
+		}
+		memset(&c, 0xFF, sizeof c);
+		test_result("getsockopt(SO_PEERCRED) on a socketpair",
+			    getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &c,
+				       &len) == 0);
+		test_result("...returns a struct ucred",
+			    len == sizeof(struct ucred));
+		test_result("...naming this process",
+			    c.pid == me && c.uid == myuid && c.gid == mygid);
+
+		/* Both ends answer, and answer the same. */
+		memset(&c, 0xFF, sizeof c);
+		len = sizeof c;
+		test_result("the other end answers too",
+			    getsockopt(sv[1], SOL_SOCKET, SO_PEERCRED, &c,
+				       &len) == 0 &&
+				    c.pid == me);
+		close(sv[0]);
+		close(sv[1]);
+	}
+
+	/* A socket that was never connected has no peer to describe. */
+	{
+		int s = socket(AF_UNIX, SOCK_STREAM, 0);
+		struct ucred c;
+		socklen_t len = sizeof c;
+
+		if (s >= 0) {
+			test_result("an unconnected socket reports ENOTCONN",
+				    getsockopt(s, SOL_SOCKET, SO_PEERCRED, &c,
+					       &len) == -1 &&
+					    errno == ENOTCONN);
+			close(s);
+		}
+	}
+
+	/* A buffer too small must be refused rather than half-filled. */
+	{
+		int sv[2];
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+			struct ucred c;
+			socklen_t len = sizeof(int);
+
+			test_result("a short buffer is refused",
+				    getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED,
+					       &c, &len) == -1);
+			close(sv[0]);
+			close(sv[1]);
+		}
+	}
+
+	/* connect/accept across a real socket, which is the path a bus client
+	 * takes.  The child connects; the parent accepts and asks who it is. */
+	{
+		const char *path = "/tmp/.likeos-peercred-test";
+		int ls, cs;
+		struct sockaddr_un sa;
+		pid_t child;
+
+		unlink(path);
+		ls = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (ls < 0) {
+			test_result("socket for the connect/accept case", 0);
+			return;
+		}
+		memset(&sa, 0, sizeof sa);
+		sa.sun_family = AF_UNIX;
+		strncpy(sa.sun_path, path, sizeof sa.sun_path - 1);
+		if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+		    listen(ls, 4) != 0) {
+			test_result("bind/listen for SO_PEERCRED", 0);
+			close(ls);
+			unlink(path);
+			return;
+		}
+
+		child = fork();
+		if (child == 0) {
+			int c = socket(AF_UNIX, SOCK_STREAM, 0);
+
+			if (c >= 0) {
+				connect(c, (struct sockaddr *)&sa, sizeof sa);
+				/* Hold the connection open long enough for the
+				 * parent to ask about it. */
+				char b;
+
+				read(c, &b, 1);
+				close(c);
+			}
+			_exit(0);
+		}
+
+		cs = accept(ls, NULL, NULL);
+		if (cs >= 0) {
+			struct ucred c;
+			socklen_t len = sizeof c;
+
+			memset(&c, 0xFF, sizeof c);
+			test_result("SO_PEERCRED on an accepted connection",
+				    getsockopt(cs, SOL_SOCKET, SO_PEERCRED, &c,
+					       &len) == 0);
+			/* The pid must be the CHILD's -- the credentials were
+			 * taken from whoever called connect(), which is the
+			 * whole point of the option. */
+			test_result("...names the process that connected",
+				    c.pid == child && c.uid == myuid);
+			close(cs);
+		} else {
+			test_result("accept for SO_PEERCRED", 0);
+		}
+		close(ls);
+		unlink(path);
+		waitpid(child, NULL, 0);
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * The small additions that came with the desktop ports: daemon(), the
+ * wait-status constructors, the new sysconf names, and the header placements
+ * that let a configure script find what it is looking for.
+ * ------------------------------------------------------------------ */
+static void test_misc_posix(void)
+{
+	printf("\n[TEST] daemon, wait-status macros, sysconf\n");
+
+	/* ---- W_EXITCODE / W_STOPCODE / WCOREDUMP ----
+	 *
+	 * The inverses of WIFEXITED and friends: given an exit code and a
+	 * signal, build the status word those macros will read back. */
+	test_result("W_EXITCODE round-trips an exit code",
+		    WIFEXITED(W_EXITCODE(42, 0)) &&
+			    WEXITSTATUS(W_EXITCODE(42, 0)) == 42);
+	test_result("W_EXITCODE round-trips a signal",
+		    WIFSIGNALED(W_EXITCODE(0, SIGTERM)) &&
+			    WTERMSIG(W_EXITCODE(0, SIGTERM)) == SIGTERM);
+	test_result("W_STOPCODE round-trips",
+		    WIFSTOPPED(W_STOPCODE(SIGSTOP)) &&
+			    WSTOPSIG(W_STOPCODE(SIGSTOP)) == SIGSTOP);
+	test_result("WCOREDUMP reads the core flag",
+		    !WCOREDUMP(W_EXITCODE(0, SIGSEGV)) &&
+			    WCOREDUMP(W_EXITCODE(0, SIGSEGV) | WCOREFLAG));
+
+	/* ---- sysconf ---- */
+	test_result("_SC_GETPW_R_SIZE_MAX is a usable buffer size",
+		    sysconf(_SC_GETPW_R_SIZE_MAX) > 0);
+	test_result("_SC_GETGR_R_SIZE_MAX is a usable buffer size",
+		    sysconf(_SC_GETGR_R_SIZE_MAX) > 0);
+	test_result("_SC_NGROUPS_MAX matches the limit",
+		    sysconf(_SC_NGROUPS_MAX) == NGROUPS_MAX);
+	test_result("_SC_ARG_MAX matches the limit",
+		    sysconf(_SC_ARG_MAX) == ARG_MAX);
+	test_result("_SC_VERSION reports POSIX.1-2008",
+		    sysconf(_SC_VERSION) == 200809L);
+	test_result("_SC_JOB_CONTROL is supported",
+		    sysconf(_SC_JOB_CONTROL) == 1);
+	test_result("_SC_HOST_NAME_MAX matches the limit",
+		    sysconf(_SC_HOST_NAME_MAX) == HOST_NAME_MAX);
+	test_result("_SC_PHYS_PAGES reports memory",
+		    sysconf(_SC_PHYS_PAGES) > 0);
+	test_result("an unknown sysconf name is EINVAL",
+		    (errno = 0, sysconf(999999) == -1 && errno == EINVAL));
+
+	/* ---- header placement ----
+	 *
+	 * Not decoration.  A configure script decides whether a function
+	 * EXISTS by compiling a program that includes the header the standard
+	 * names, and concludes it is missing when the declaration is
+	 * elsewhere.  Both of these were found that way: VTE decided this
+	 * system had no grantpt because it was declared only in <unistd.h>,
+	 * and called ffs() having included only <string.h>. */
+	test_result("grantpt and friends are declared in <stdlib.h>",
+		    (void *)grantpt != NULL && (void *)posix_openpt != NULL &&
+			    (void *)unlockpt != NULL && (void *)ptsname != NULL);
+	test_result("<string.h> brings in <strings.h>",
+		    ffs(0) == 0 && ffs(1) == 1 && ffs(8) == 4 &&
+			    ffs(0x80000000) == 32);
+
+	/* ---- ioctl is variadic ----
+	 *
+	 * POSIX declares the third argument with `...', and it has to be: the
+	 * requests take a struct pointer, a plain int, or nothing at all, and
+	 * a fixed void* parameter makes the int form uncompilable in C++.
+	 * That this call compiles at all is most of the test. */
+	{
+		struct winsize ws;
+		int fd = open("/dev/null", O_RDWR);
+
+		if (fd >= 0) {
+			/* Both shapes, on a device that implements neither --
+			 * the return value is not the point, the argument
+			 * types are. */
+			(void)ioctl(fd, TIOCGWINSZ, &ws);
+			(void)ioctl(fd, FIONBIO, 0);
+			close(fd);
+		}
+		test_result("ioctl accepts a pointer and an integer", 1);
+	}
+
+	/* ---- daemon() ----
+	 *
+	 * Tested from a child, because it is a call the CALLER does not return
+	 * from: the parent half of its internal fork exits.  So this forks,
+	 * the child calls daemon(), and the grandchild reports what it became
+	 * down a pipe.
+	 *
+	 * What is checked is what daemon() promises: a new session (so the
+	 * process is its own session leader and has no controlling terminal),
+	 * the root directory, and the three standard descriptors open on
+	 * something. */
+	{
+		int pfd[2];
+		pid_t child;
+
+		if (pipe(pfd) != 0) {
+			test_result("pipe for the daemon() test", 0);
+			return;
+		}
+		child = fork();
+		if (child == 0) {
+			close(pfd[0]);
+			if (daemon(0, 1) != 0)
+				_exit(1);
+			{
+				/* setsid() succeeded means this is now a
+				 * session leader: its sid is its own pid. */
+				pid_t sid = getsid(0);
+				pid_t self = getpid();
+				char cwd[256];
+				int ok_sid = (sid == self);
+				int ok_cwd = (getcwd(cwd, sizeof cwd) &&
+					      strcmp(cwd, "/") == 0);
+				char msg[2];
+
+				msg[0] = ok_sid ? '1' : '0';
+				msg[1] = ok_cwd ? '1' : '0';
+				write(pfd[1], msg, 2);
+			}
+			close(pfd[1]);
+			_exit(0);
+		}
+		close(pfd[1]);
+		{
+			char msg[2] = { 0, 0 };
+			ssize_t n = read(pfd[0], msg, 2);
+
+			close(pfd[0]);
+			waitpid(child, NULL, 0);
+			test_result("daemon() starts a new session",
+				    n == 2 && msg[0] == '1');
+			test_result("daemon() changes to the root directory",
+				    n == 2 && msg[1] == '1');
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * <uchar.h> -- the UTF-16 and UTF-32 converters of C11 7.28.
+ *
+ * The UTF-32 pair is mbrtowc/wcrtomb under another name, since wchar_t is a
+ * 32-bit code point here.  The UTF-16 pair is the interesting one: a character
+ * above U+FFFF is ONE multibyte sequence and TWO char16_t units, so mbrtoc16
+ * returns the high surrogate and keeps the low one in the mbstate_t, handing
+ * it back on a later call that consumes no input and returns (size_t)-3.
+ *
+ * host/test-unicode.sh compares all 1,112,063 code points against glibc.  What
+ * is checked here is that the same code behaves the same way as the system
+ * libc on the target, with the surrogate protocol and the error cases spelled
+ * out rather than swept.
+ * ------------------------------------------------------------------ */
+static void test_uchar(void)
+{
+	printf("\n[TEST] <uchar.h> UTF-16 / UTF-32 conversion\n");
+
+	mbstate_t st;
+	char out[MB_LEN_MAX];
+	char16_t c16 = 0;
+	char32_t c32 = 0;
+	size_t r;
+
+	/* ASCII: one byte, one unit, either way. */
+	memset(&st, 0, sizeof st);
+	test_result("mbrtoc16 ASCII",
+		    mbrtoc16(&c16, "A", 1, &st) == 1 && c16 == 'A');
+	memset(&st, 0, sizeof st);
+	test_result("c16rtomb ASCII",
+		    c16rtomb(out, 'A', &st) == 1 && out[0] == 'A');
+
+	/* U+20AC EURO SIGN: three bytes, still one UTF-16 unit. */
+	memset(&st, 0, sizeof st);
+	test_result("mbrtoc16 three-byte character",
+		    mbrtoc16(&c16, "\xE2\x82\xAC", 3, &st) == 3 &&
+			    c16 == 0x20AC);
+	memset(&st, 0, sizeof st);
+	test_result("c16rtomb three-byte character",
+		    c16rtomb(out, 0x20AC, &st) == 3 &&
+			    memcmp(out, "\xE2\x82\xAC", 3) == 0);
+
+	/* U+1F600 GRINNING FACE: four bytes, and a surrogate PAIR.
+	 *
+	 * The second call passes n = 0 on purpose: the low surrogate must come
+	 * out of the state without a byte being read. */
+	{
+		const char *emoji = "\xF0\x9F\x98\x80";
+		char16_t hi = 0, lo = 0;
+		size_t r1, r2;
+
+		memset(&st, 0, sizeof st);
+		r1 = mbrtoc16(&hi, emoji, 4, &st);
+		r2 = mbrtoc16(&lo, emoji, 0, &st);
+		test_result("mbrtoc16 splits U+1F600 into a surrogate pair",
+			    r1 == 4 && hi == 0xD83D && r2 == (size_t)-3 &&
+				    lo == 0xDE00);
+
+		/* mbsinit reports the pending half, because the conversion
+		 * genuinely is not in its initial state. */
+		memset(&st, 0, sizeof st);
+		mbrtoc16(&hi, emoji, 4, &st);
+		test_result("a pending surrogate is not the initial state",
+			    !mbsinit(&st));
+		mbrtoc16(&lo, emoji, 0, &st);
+		test_result("draining it returns to the initial state",
+			    mbsinit(&st));
+
+		/* And back: the high half writes nothing, the low half
+		 * writes the whole four-byte character. */
+		memset(&st, 0, sizeof st);
+		size_t n1 = c16rtomb(out, 0xD83D, &st);
+		size_t n2 = c16rtomb(out, 0xDE00, &st);
+
+		test_result("c16rtomb reassembles the pair",
+			    n1 == 0 && n2 == 4 && memcmp(out, emoji, 4) == 0);
+	}
+
+	/* UTF-32 is the code point itself, above the basic plane and below. */
+	memset(&st, 0, sizeof st);
+	test_result("mbrtoc32 U+1F600",
+		    mbrtoc32(&c32, "\xF0\x9F\x98\x80", 4, &st) == 4 &&
+			    c32 == 0x1F600);
+	memset(&st, 0, sizeof st);
+	test_result("c32rtomb U+1F600",
+		    c32rtomb(out, 0x1F600, &st) == 4 &&
+			    memcmp(out, "\xF0\x9F\x98\x80", 4) == 0);
+
+	/* A sequence split across two calls: -2, then the rest. */
+	memset(&st, 0, sizeof st);
+	r = mbrtoc16(&c16, "\xE2\x82", 2, &st);
+	test_result("mbrtoc16 reports an incomplete sequence",
+		    r == (size_t)-2);
+	test_result("mbrtoc16 resumes where it stopped",
+		    mbrtoc16(&c16, "\xAC", 1, &st) == 1 && c16 == 0x20AC);
+
+	/* Malformed input. */
+	memset(&st, 0, sizeof st);
+	errno = 0;
+	test_result("mbrtoc16 rejects an invalid byte",
+		    mbrtoc16(&c16, "\xFF", 1, &st) == (size_t)-1 &&
+			    errno == EILSEQ);
+
+	/* A low surrogate on its own encodes nothing at all. */
+	memset(&st, 0, sizeof st);
+	errno = 0;
+	test_result("c16rtomb rejects a lone low surrogate",
+		    c16rtomb(out, 0xDC00, &st) == (size_t)-1 &&
+			    errno == EILSEQ);
+
+	/* A high surrogate followed by something that is not its low half --
+	 * and the state must be cleared, so the NEXT character still works. */
+	memset(&st, 0, sizeof st);
+	errno = 0;
+	{
+		int held = (c16rtomb(out, 0xD800, &st) == 0);
+		int broke = (c16rtomb(out, 'A', &st) == (size_t)-1 &&
+			     errno == EILSEQ);
+		int recovered = (c16rtomb(out, 'A', &st) == 1);
+
+		test_result("c16rtomb rejects a broken pair and recovers",
+			    held && broke && recovered);
+	}
+
+	/* The null character: zero returned, one byte written. */
+	memset(&st, 0, sizeof st);
+	c16 = 0xFFFF;
+	test_result("mbrtoc16 of the null character",
+		    mbrtoc16(&c16, "", 1, &st) == 0 && c16 == 0);
+
+	/* The UTF-16 and UTF-32 encodings are Unicode, which the standard
+	 * asks the header to say. */
+#if defined(__STDC_UTF_16__) && defined(__STDC_UTF_32__)
+	test_result("__STDC_UTF_16__ / __STDC_UTF_32__ are defined", 1);
+#else
+	test_result("__STDC_UTF_16__ / __STDC_UTF_32__ are defined", 0);
+#endif
+}
+
+/* ------------------------------------------------------------------ *
+ * The hyperbolic family.
+ *
+ * Six functions in three precisions.  The interesting ones are the three
+ * inverses, which have no closed form that works over their whole domain --
+ * see src/math/math.c -- so each is written in ranges and each range boundary
+ * is a place two different expressions have to agree.
+ *
+ * This checks the properties rather than a table of digits: the identities
+ * (sinh(asinh(x)) == x), the small-argument behaviour that a naive
+ * implementation destroys, the domain edges, and the signs.  The exhaustive
+ * comparison against a reference implementation is host/test-math.sh, which
+ * sweeps 58,000 points; what belongs HERE is proof that the same code gives
+ * the same answers when it is the system libm on the target.
+ * ------------------------------------------------------------------ */
+static int close_enough(double got, double want, double rel)
+{
+	double d = got - want;
+
+	if (want == 0.0)
+		return (d < rel && d > -rel);
+	d /= want;
+	return (d < rel && d > -rel);
+}
+
+static void test_hyperbolic(void)
+{
+	printf("\n[TEST] hyperbolic and inverse hyperbolic functions\n");
+
+	volatile double zero = 0.0;
+	double inf = 1.0 / zero;
+
+	/* Known values, to a relative 1e-14 -- about fifty times looser than
+	 * what the implementation delivers, so this measures "right function"
+	 * and not "right to the last bit". */
+	test_result("asinh(1) == ln(1+sqrt2)",
+		    close_enough(asinh(1.0), 0.881373587019543, 1e-14));
+	test_result("acosh(2) == ln(2+sqrt3)",
+		    close_enough(acosh(2.0), 1.3169578969248166, 1e-14));
+	test_result("atanh(0.5) == 0.5*ln3",
+		    close_enough(atanh(0.5), 0.5493061443340549, 1e-14));
+
+	/* Each inverse against its forward function, at a value in every
+	 * branch of the range split: below 2^-28, between it and 1, between 1
+	 * and 2, above 2, and above 2^28. */
+	{
+		static const double v[] = { 1e-12, 0.25, 1.5, 3.0, 1e10 };
+		int ok_s = 1, ok_c = 1, ok_t = 1;
+
+		for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
+			if (!close_enough(sinh(asinh(v[i])), v[i], 1e-13))
+				ok_s = 0;
+			if (!close_enough(cosh(acosh(1.0 + v[i])), 1.0 + v[i],
+					  1e-13))
+				ok_c = 0;
+			/* atanh's domain stops at 1. */
+			if (v[i] < 1.0 &&
+			    !close_enough(tanh(atanh(v[i])), v[i], 1e-13))
+				ok_t = 0;
+		}
+		test_result("sinh(asinh(x)) == x across every branch", ok_s);
+		test_result("cosh(acosh(x)) == x across every branch", ok_c);
+		test_result("tanh(atanh(x)) == x across every branch", ok_t);
+	}
+
+	/* The small-argument end, which is the whole reason these are not
+	 * written from their closed forms.  asinh(x), atanh(x), sinh(x) and
+	 * tanh(x) are all x to within a relative 1e-15 down here; an
+	 * implementation that forms 1 + x*x, or e^x - e^-x, returns something
+	 * with half its digits gone -- or exactly zero. */
+	{
+		double t = 1e-10;
+
+		test_result("asinh(1e-10) keeps its digits",
+			    close_enough(asinh(t), t, 1e-15));
+		test_result("atanh(1e-10) keeps its digits",
+			    close_enough(atanh(t), t, 1e-15));
+		test_result("sinh(1e-10) keeps its digits",
+			    close_enough(sinh(t), t, 1e-15));
+		test_result("tanh(1e-10) keeps its digits",
+			    close_enough(tanh(t), t, 1e-15));
+	}
+
+	/* The large-argument end, where forming x*x would overflow but the
+	 * answer is an ordinary number near log(2x). */
+	test_result("asinh(1e300) does not overflow",
+		    close_enough(asinh(1e300), 691.4686750787736, 1e-13));
+	test_result("acosh(1e300) does not overflow",
+		    close_enough(acosh(1e300), 691.4686750787736, 1e-13));
+
+	/* Odd functions: the sign comes back out, including on zero. */
+	test_result("asinh is odd", asinh(-2.0) == -asinh(2.0));
+	test_result("atanh is odd", atanh(-0.5) == -atanh(0.5));
+	test_result("sinh is odd", sinh(-2.0) == -sinh(2.0));
+	test_result("tanh is odd", tanh(-2.0) == -tanh(2.0));
+	test_result("cosh is even", cosh(-2.0) == cosh(2.0));
+	test_result("signed zero survives",
+		    signbit(asinh(-0.0)) && signbit(atanh(-0.0)) &&
+			    signbit(sinh(-0.0)) && !signbit(asinh(0.0)));
+
+	/* Domain edges.  acosh is undefined below 1; atanh is undefined
+	 * outside [-1, 1] and infinite at the ends. */
+	test_result("acosh(1) == 0", acosh(1.0) == 0.0);
+	test_result("acosh below 1 is NaN", isnan(acosh(0.5)) &&
+						    isnan(acosh(-1.0)));
+	test_result("atanh(+-1) is +-inf",
+		    atanh(1.0) == inf && atanh(-1.0) == -inf);
+	test_result("atanh outside [-1,1] is NaN",
+		    isnan(atanh(2.0)) && isnan(atanh(-2.0)));
+	test_result("asinh(+-inf) is +-inf",
+		    asinh(inf) == inf && asinh(-inf) == -inf);
+	test_result("acosh(inf) is inf", acosh(inf) == inf);
+
+	/* The float and long double variants: declared, linked, and agreeing
+	 * with the double one to their own precision. */
+	test_result("asinhf/acoshf/atanhf",
+		    close_enough(asinhf(1.0f), 0.881373587019543, 1e-6) &&
+			    close_enough(acoshf(2.0f), 1.3169578969248166,
+					 1e-6) &&
+			    close_enough(atanhf(0.5f), 0.5493061443340549,
+					 1e-6));
+	test_result("sinhf/coshf/tanhf",
+		    close_enough(sinhf(1.0f), 1.1752011936438014, 1e-6) &&
+			    close_enough(coshf(1.0f), 1.5430806348152437,
+					 1e-6) &&
+			    close_enough(tanhf(1.0f), 0.7615941559557649,
+					 1e-6));
+	test_result("asinhl/acoshl/atanhl",
+		    close_enough((double)asinhl(1.0L), 0.881373587019543,
+				 1e-14) &&
+			    close_enough((double)acoshl(2.0L),
+					 1.3169578969248166, 1e-14) &&
+			    close_enough((double)atanhl(0.5L),
+					 0.5493061443340549, 1e-14));
+	test_result("sinhl/coshl/tanhl",
+		    close_enough((double)sinhl(1.0L), 1.1752011936438014,
+				 1e-14) &&
+			    close_enough((double)coshl(1.0L),
+					 1.5430806348152437, 1e-14) &&
+			    close_enough((double)tanhl(1.0L),
+					 0.7615941559557649, 1e-14));
+}
+
 static void test_math_classification(void)
 {
 	printf("\n[TEST] C99 math classification\n");
@@ -9574,6 +10588,81 @@ int main(int argc, char **argv)
 		snprintf(pts_path, sizeof(pts_path), "/dev/pts/%d", pty_num);
 		sfd = open(pts_path, O_RDWR);
 		test_result("open pts slave succeeds", sfd >= 0);
+	}
+
+	/* A non-blocking master read with nothing queued must report EAGAIN,
+	 * NOT end-of-file.
+	 *
+	 * Zero from read() on a pty master means the line is down -- every
+	 * terminal emulator treats it as "the child is gone" and tears the
+	 * session down.  Returning it merely because the child has not
+	 * written yet is a lie with teeth: VTE opens the master O_NONBLOCK
+	 * and reads it from a timer, so its first read landed before the
+	 * freshly exec'd shell had printed its prompt.  It read the zero as
+	 * EOF, released the pty, and closing the master hung up the line --
+	 * SIGHUP to the shell it had just started.  xfce4-terminal's window
+	 * never appeared and nothing reported an error, because as far as
+	 * every layer above was concerned the child had simply finished.
+	 *
+	 * The slave side (tty_read) and the master write path both had this
+	 * right; the master read was the one that did not. */
+	if (mfd >= 0 && sfd >= 0) {
+		char nbbuf[16];
+		int fl = fcntl(mfd, F_GETFL, 0);
+
+		test_result("master can be set O_NONBLOCK",
+			    fcntl(mfd, F_SETFL, fl | O_NONBLOCK) == 0);
+
+		errno = 0;
+		ssize_t r = read(mfd, nbbuf, sizeof nbbuf);
+
+		test_result("empty non-blocking master read is EAGAIN, not EOF",
+			    r == -1 && errno == EAGAIN);
+
+		/* And it still delivers data once the slave writes. */
+		if (write(sfd, "x", 1) == 1) {
+			/* The slave's line discipline may need a moment; the
+			 * point is that a non-empty read returns the byte and
+			 * never zero. */
+			int tries = 0;
+
+			do {
+				errno = 0;
+				r = read(mfd, nbbuf, sizeof nbbuf);
+			} while (r == -1 && errno == EAGAIN && ++tries < 1000);
+			test_result("master read returns the slave's byte",
+				    r >= 1);
+		}
+
+		/* Real EOF -- the one case that MAY return zero -- is the
+		 * slave being closed.  Checked on a pty of its own so the one
+		 * above stays usable. */
+		int m2 = posix_openpt(O_RDWR);
+		int n2 = -1;
+
+		if (m2 >= 0 && ioctl(m2, TIOCGPTN, &n2) == 0 && n2 >= 0) {
+			char p2[32];
+
+			snprintf(p2, sizeof p2, "/dev/pts/%d", n2);
+			grantpt(m2);
+			unlockpt(m2);
+			int s2 = open(p2, O_RDWR);
+
+			if (s2 >= 0) {
+				fcntl(m2, F_SETFL,
+				      fcntl(m2, F_GETFL, 0) | O_NONBLOCK);
+				close(s2);
+				errno = 0;
+				r = read(m2, nbbuf, sizeof nbbuf);
+				test_result("master read IS EOF once the slave closes",
+					    r == 0);
+			}
+			close(m2);
+		}
+
+		/* Put the master back the way the rest of this section
+		 * expects to find it. */
+		fcntl(mfd, F_SETFL, fl);
 	}
 
 	if (mfd >= 0 && sfd >= 0) {
@@ -17008,6 +18097,116 @@ network_section:
 						;
 				munmap(g_cow_shared, COW_STRESS_LEN);
 			}
+		}
+
+		/* 3b. THE stale-read test, which is a different failure from the
+		 *     one above and invisible to it.
+		 *
+		 *     Test 3 checks the pages after the joins, when every
+		 *     processor has long since been told about every copy.  It
+		 *     therefore sees a write that was thrown away and cannot see
+		 *     a read that was served from the pre-copy frame while the
+		 *     copy was still being announced.
+		 *
+		 *     Here one thread writes byte 0 of page i and then raises a
+		 *     flag; another thread waits for the flag and reads that same
+		 *     byte.  This architecture does not reorder stores, so having
+		 *     seen the flag the reader must see the write.  If it does
+		 *     not, its translation is still pointing at the frame the
+		 *     page was copied away from, and the two threads -- in ONE
+		 *     address space -- are looking at two different memories.
+		 *
+		 *     The flag has to be somewhere the writer can store to
+		 *     without faulting, or the fault would order the two stores
+		 *     for us and prove nothing; it is written once before the
+		 *     reader starts, which resolves its own copy. */
+		{
+			pthread_t rd;
+			int ok = 1, started = 0;
+			pid_t kid = -1;
+			int st = 0;
+
+			g_cowstale_checked = 0;
+			g_cowstale_stale = 0;
+			g_cowstale_stop = 0;
+			g_cowstale_mem = mmap(NULL,
+					      COWSTALE_PAGES * COWSTALE_PGSZ,
+					      PROT_READ | PROT_WRITE,
+					      MAP_PRIVATE | MAP_ANONYMOUS, -1,
+					      0);
+			void *flagpg = mmap(NULL, COWSTALE_PGSZ,
+					    PROT_READ | PROT_WRITE,
+					    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+			g_cowstale_flag = flagpg == MAP_FAILED ? NULL : flagpg;
+			if (g_cowstale_mem == MAP_FAILED || !g_cowstale_flag) {
+				test_fail("cow-stale: mmap failed");
+			} else {
+				memset(g_cowstale_mem, 0,
+				       COWSTALE_PAGES * COWSTALE_PGSZ);
+				*g_cowstale_flag = -1;
+
+				kid = fork();
+				if (kid == 0) {
+					usleep(400000);
+					_exit(0);
+				}
+
+				/* The flag page is copy-on-write too now.
+				 * Resolve it here so the loop below stores to
+				 * it without a fault. */
+				*g_cowstale_flag = -1;
+
+				if (pthread_create(&rd, NULL,
+						   cowstale_reader_fn,
+						   NULL) != 0) {
+					ok = 0;
+					test_fail("cow-stale: pthread_create failed");
+				} else {
+					started = 1;
+				}
+
+				if (started) {
+					for (long i = 0; i < COWSTALE_PAGES;
+					     i++) {
+						g_cowstale_mem[i * COWSTALE_PGSZ] =
+							(unsigned char)(i + 1);
+						__asm__ volatile("" ::: "memory");
+						*g_cowstale_flag = i;
+					}
+					pthread_join(rd, NULL);
+
+					if (g_cowstale_checked !=
+					    COWSTALE_PAGES) {
+						/* The reader gave up waiting;
+						 * nothing was proved either
+						 * way, so say so rather than
+						 * passing. */
+						printf("  cow-stale: reader checked only %ld of %d\n",
+						       (long)g_cowstale_checked,
+						       COWSTALE_PAGES);
+						ok = 0;
+					}
+					if (g_cowstale_stale) {
+						printf("  cow-stale: %ld of %ld reads came from the pre-copy frame\n",
+						       (long)g_cowstale_stale,
+						       (long)g_cowstale_checked);
+						ok = 0;
+					}
+					test_result("cow: a copied page is visible to other threads at once",
+						    ok);
+				}
+
+				if (kid > 0)
+					while (waitpid(kid, &st, 0) < 0 &&
+					       errno == EINTR)
+						;
+			}
+			if (g_cowstale_mem != MAP_FAILED)
+				munmap(g_cowstale_mem,
+				       COWSTALE_PAGES * COWSTALE_PGSZ);
+			if (flagpg != MAP_FAILED)
+				munmap(flagpg, COWSTALE_PGSZ);
 		}
 
 		/* 4. Unmapping must not hand a page back while another mapping
@@ -24510,6 +25709,12 @@ network_skip:;
 	test_loader_introspection();
 	test_exit_handlers();
 	test_math_classification();
+	test_hyperbolic();
+	test_uchar();
+	test_fenv();
+	test_search();
+	test_so_peercred();
+	test_misc_posix();
 	test_long_double_decompose();
 	test_semaphores();
 	test_timed_blocking();

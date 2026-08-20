@@ -3,6 +3,6 @@
 # PCManFM.
 [Desktop Entry]
 Type=Link
-Name=Calculator
+Name=X Calculator
 Icon=accessories-calculator
 URL=/usr/share/applications/xcalc.desktop

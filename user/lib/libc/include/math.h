@@ -117,6 +117,12 @@ double acos(double x);
 double sinh(double x);
 double cosh(double x);
 double tanh(double x);
+/* The inverse hyperbolics (C99 7.12.5.1-3).  Written in ranges rather than
+ * from the closed form -- see src/math/math.c for why the obvious
+ * log(x + sqrt(x*x + 1)) is wrong at both ends of the domain. */
+double asinh(double x);
+double acosh(double x);
+double atanh(double x);
 double hypot(double x, double y);
 double cbrt(double x);
 double trunc(double x);
@@ -156,6 +162,13 @@ float atanf(float x);
 float atan2f(float a, float b);
 float asinf(float x);
 float acosf(float x);
+float cbrtf(float x);
+float sinhf(float x);
+float coshf(float x);
+float tanhf(float x);
+float asinhf(float x);
+float acoshf(float x);
+float atanhf(float x);
 float hypotf(float a, float b);
 float truncf(float x);
 float copysignf(float a, float b);
@@ -194,6 +207,13 @@ long double cosl(long double x);
 long double tanl(long double x);
 long double atanl(long double x);
 long double atan2l(long double y, long double x);
+long double cbrtl(long double x);
+long double sinhl(long double x);
+long double coshl(long double x);
+long double tanhl(long double x);
+long double asinhl(long double x);
+long double acoshl(long double x);
+long double atanhl(long double x);
 long double hypotl(long double x, long double y);
 long double copysignl(long double x, long double y);
 /* Taking a long double apart and putting it back together.  Exact: they read

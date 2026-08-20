@@ -7,16 +7,33 @@
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
+#include <kernel/fs/file.h>
+
+static int64_t ioctl_held(task_t *cur, vfs_file_t *file, uint64_t fd,
+			  uint64_t req, uint64_t argp);
 
 int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 {
 	task_t *cur = sched_current();
+	vfs_file_t *file;
+	int64_t ret;
+
 	if (!cur)
 		return -EFAULT;
-	vfs_file_t *file = NULL;
-	if (fd < TASK_MAX_FDS) {
-		file = task_fds(cur)[fd];
-	}
+	/* Held across the whole dispatch: every arm below dereferences it or
+	 * hands it to a device driver, and all of them can sleep.  A NULL
+	 * result is not an error here -- an unredirected standard descriptor
+	 * is an empty slot, which the terminal arms handle. */
+	file = fdget(cur, (int)fd);
+	ret = ioctl_held(cur, file, fd, req, argp);
+	if (file)
+		fdput(file);
+	return ret;
+}
+
+static int64_t ioctl_held(task_t *cur, vfs_file_t *file, uint64_t fd,
+			  uint64_t req, uint64_t argp)
+{
 
 	// Socket fd markers - route to network ioctl handler
 	if (file && IS_SOCKET_FD(file)) {

@@ -85,6 +85,11 @@ extern "C" {
 #define OPEN_MAX    1024
 #define ARG_MAX     131072
 #define NGROUPS_MAX 32
+/* The longest hostname gethostname() can return, not counting the NUL, and
+ * the number of symbolic links path resolution will follow before giving up
+ * with ELOOP.  Both are asked about through sysconf() as well. */
+#define HOST_NAME_MAX 64
+#define SYMLOOP_MAX 40
 #define IOV_MAX     1024
 #define _POSIX_PATH_MAX  256
 #define _POSIX_NAME_MAX  14

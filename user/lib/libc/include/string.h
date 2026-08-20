@@ -56,4 +56,15 @@ size_t strxfrm(char* dest, const char* src, size_t n);
 }
 #endif
 
+/* The older, BSD-derived string functions: index, rindex, bcopy, strcasecmp
+ * and the bit-scan ffs family.
+ *
+ * They belong in <strings.h> and are declared there.  This include is what
+ * every other C library does as well, and it is not a convenience: those names
+ * predate <string.h> and a great deal of code -- VTE among the packages here
+ * -- calls ffs() or strcasecmp() having included only <string.h>, because that
+ * has always worked.  Placed after the extern "C" block above because
+ * <strings.h> opens one of its own. */
+#include <strings.h>
+
 #endif

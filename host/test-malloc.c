@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ---- stand-in thread control block --------------------------------------
@@ -241,6 +242,7 @@ static int test_munmap(void *addr, size_t len)
 void *lk_malloc(size_t n);
 void lk_free(void *p);
 void *lk_realloc(void *p, size_t n);
+size_t lk_malloc_usable_size(void *p);
 void *lk_calloc(size_t n, size_t m);
 int lk_posix_memalign(void **out, size_t align, size_t n);
 

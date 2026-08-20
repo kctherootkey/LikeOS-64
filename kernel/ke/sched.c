@@ -11,6 +11,7 @@
  * migrated in the window between reading it and taking its lock.
  */
 
+#include <kernel/fs/file.h>
 #include <kernel/ke/sched.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>
@@ -3088,7 +3089,7 @@ task_t *sched_fork_current(void)
 	 * copied nothing and the child died on its first lazy page. */
 	task_t *mm_src = task_mm_owner(cur);
 
-	if (!mm_regions_clone(child, mm_src)) {
+	if (!mm_regions_clone_ref(child, mm_src)) {
 		mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
 		mm_destroy_address_space(child_pml4);
 		kfree(child);
@@ -3151,14 +3152,11 @@ task_t *sched_fork_current(void)
 	 * smash detector's "which task's canary is this" diagnostics honest. */
 	child->stack_canary = generate_stack_canary();
 
-	/* Demand paging: the child inherits the region table by value; each
-	 * file-backed region pins its backing file with a reference, so the
-	 * child needs its own. */
-	for (uint32_t i = 0; i < child->mmap_capacity; i++) {
-		if (child->mmap_regions[i].in_use &&
-		    child->mmap_regions[i].file)
-			vfs_incref(child->mmap_regions[i].file);
-	}
+	/* Demand paging: the reference each file-backed region owes its backing
+	 * file was taken by mm_regions_clone_ref() above, together with the
+	 * copy.  It cannot be done here: between the copy and this point a
+	 * sibling thread's munmap can release the last reference, and the
+	 * child would reference a file that is already gone. */
 
 	// Child-specific fields
 	/* A newly forked child has no unreported stop/continue of its own; the
@@ -3253,51 +3251,9 @@ task_t *sched_fork_current(void)
 	 * that decides it -- see the note above where the field is first set. */
 	sched_add_child(cur->group_leader ? cur->group_leader : cur, child);
 
-	// Duplicate file descriptors
-	for (int i = 0; i < TASK_MAX_FDS; i++) {
-		/* The child owns a private table (child->files was cleared
-		 * above), so take the flags from the parent's EFFECTIVE array:
-		 * once the parent joined a thread group its own fd_flags[] is
-		 * the empty legacy one and the live bits live in ->files. */
-		child->fd_flags[i] = task_get_fd_flags(cur, (unsigned)i);
-		if (task_fds(cur)[i]) {
-			uint64_t marker = (uint64_t)task_fds(cur)[i];
-			if (marker >= 1 && marker <= 3) {
-				child->fd_table[i] = task_fds(cur)[i];
-			} else if (IS_SOCKET_FD(task_fds(cur)[i])) {
-				int idx = SOCKET_FD_IDX(task_fds(cur)[i]);
-				net_socket_t *s = sock_get(idx);
-				if (s)
-					__atomic_fetch_add(&s->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
-				child->fd_table[i] = task_fds(cur)[i];
-			} else if (unix_sock_is(task_fds(cur)[i])) {
-				unix_socket_t *us =
-					(unix_socket_t *)task_fds(cur)[i];
-				/* Both counters together: the descriptor
-				 * count that decides the hangup, and the
-				 * reference that keeps the socket in
-				 * existence. */
-				unix_sock_fdget(us);
-				child->fd_table[i] = task_fds(cur)[i];
-			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
-				/* The child gets its own descriptor onto the
-				 * same (kernel-global) instance, so the
-				 * instance gains a reference.  Without this the
-				 * child's close destroyed it for the parent. */
-				epoll_get(EPOLL_FD_IDX(task_fds(cur)[i]));
-				child->fd_table[i] = task_fds(cur)[i];
-			} else if (pipe_is_end(task_fds(cur)[i])) {
-				pipe_end_t *new_end = pipe_dup_end(
-					(pipe_end_t *)task_fds(cur)[i]);
-				child->fd_table[i] = (vfs_file_t *)new_end;
-			} else {
-				child->fd_table[i] = vfs_dup(task_fds(cur)[i]);
-			}
-		} else {
-			child->fd_table[i] = NULL;
-		}
-	}
+	/* Duplicate file descriptors: one reference per inherited entry, taken
+	 * under the table lock.  See fd_table_clone(). */
+	fd_table_clone(child, cur);
 
 	/* The region table was copied by mm_regions_clone() above, which had to
 	 * run immediately after the task_t copy; nothing to do here. */

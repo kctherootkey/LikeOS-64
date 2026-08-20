@@ -6,6 +6,7 @@
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/file.h>
 
 /*
  * Resolve a path against THIS task's working directory (and chroot), in place.
@@ -568,10 +569,16 @@ static int apply_chroot(task_t *cur, char *abs, size_t out_size)
 	return 0;
 }
 
+/* NOTE: `base' can point INTO the directory descriptor's file (its at_path),
+ * so the hold taken on that descriptor has to outlive normalize_path(), which
+ * is what copies the string out.  That is why this has a single exit rather
+ * than releasing as soon as the checks pass. */
 int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 		  size_t out_size)
 {
 	const char *base;
+	vfs_file_t *held = NULL;
+	int ret;
 
 	if (!cur || !path || !out || out_size < 2)
 		return -EINVAL;
@@ -592,31 +599,44 @@ int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 
 		if (dirfd < 0 || dirfd >= (int)TASK_MAX_FDS)
 			return -EBADF;
-		df = task_fds(cur)[dirfd];
+		/* Held: at_path is read off it below, and the resolution that
+		 * follows can sleep. */
+		df = fdget(cur, dirfd);
 		if (!df)
 			return -EBADF;
+		held = df;
 		/* The marker descriptors (sockets, epoll, pipes, the console)
 		 * are not files and have no path; a directory is required. */
-		if (IS_SOCKET_FD(df) || unix_sock_is(df) || IS_EPOLL_FD(df) ||
-		    pipe_is_end(df) || (uintptr_t)df <= 3)
-			return -ENOTDIR;
-		if (!df->at_path)
-			return -ENOTDIR;
+		if (fd_is_special(df)) {
+			ret = -ENOTDIR;
+			goto out;
+		}
+		if (!df->at_path) {
+			ret = -ENOTDIR;
+			goto out;
+		}
 		/* It must really be a directory: resolving "file" against a
 		 * regular file would otherwise invent a path that looks valid
 		 * and refers to nothing. */
 		{
 			struct kstat dst;
-			if (vfs_fstat(df, &dst) != ST_OK)
-				return -ENOTDIR;
-			if (!S_ISDIR(dst.st_mode))
-				return -ENOTDIR;
+			if (vfs_fstat(df, &dst) != ST_OK) {
+				ret = -ENOTDIR;
+				goto out;
+			}
+			if (!S_ISDIR(dst.st_mode)) {
+				ret = -ENOTDIR;
+				goto out;
+			}
 		}
 		base = df->at_path;
 	}
 
-	int r = normalize_path(base, path, out, out_size);
-	if (r != 0)
-		return r;
-	return apply_chroot(cur, out, out_size);
+	ret = normalize_path(base, path, out, out_size);
+	if (ret == 0)
+		ret = apply_chroot(cur, out, out_size);
+out:
+	if (held)
+		fdput(held);
+	return ret;
 }

@@ -10,6 +10,8 @@
 #include <kernel/net/ratelimit.h>
 #include <kernel/net/stats.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/mm/memory.h>
+#include <kernel/net/skb.h>
 
 // Global lock protecting the connection list and publish/unlink operations.
 static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
@@ -17,6 +19,27 @@ static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
 // Forward decl: wake any task sleeping in poll/select/epoll_wait immediately
 // when TCP socket data (or connection state change) becomes available.
 extern void poll_notify_io_ready(void);
+extern void poll_notify_wq(struct wait_queue_head *);
+
+/* Wake whoever is polling the SOCKET this connection belongs to.
+ *
+ * A connection has no waiters of its own -- poll() is called on a descriptor,
+ * and the descriptor names a net_socket_t.  owner_socket is that socket, or
+ * the self-pointer sentinel while the tcp layer still owns the connection and
+ * no socket can be polling it, or NULL once the socket has let go.
+ *
+ * With no socket there is nobody to wake, so only the sequence counter is
+ * bumped: that is what a poller between its scan and its park compares, and
+ * skipping it would let such a poller sleep through the event. */
+static void tcp_poll_notify(tcp_conn_t *conn)
+{
+	net_socket_t *s = conn ? (net_socket_t *)conn->owner_socket : NULL;
+
+	if (s && (void *)s != (void *)conn)
+		poll_notify_wq(&s->poll_wq);
+	else
+		poll_notify_io_ready();
+}
 
 // ---------------------------------------------------------------------------
 // IRQ-friendly blocking acquire of a per-connection spinlock.
@@ -768,7 +791,7 @@ static void tcp_fail_connection(tcp_conn_t *conn, int error)
 	conn->inflight_count = 0;
 	conn->last_rx_tick = timer_ticks();
 	tcp_conn_kill(conn); // sets state=CLOSED + drops the protocol reference
-	poll_notify_io_ready();
+	tcp_poll_notify(conn);
 	/* Wake any sock_recv blocked on this conn's rx_ready channel.  Otherwise
      * a connection that fails (RST, timeout) leaves the reader sleeping
      * forever instead of returning the error. */
@@ -1484,7 +1507,7 @@ static void tcp_consume_data_half_closed(tcp_conn_t *conn,
 		conn->rx_tail = (conn->rx_tail + copy) % conn->rx_buf_size;
 		conn->rcv_nxt += copy;
 		conn->rx_ready = 1;
-		poll_notify_io_ready();
+		tcp_poll_notify(conn);
 		sched_wake_channel((void *)&conn->rx_ready);
 	}
 }
@@ -2934,7 +2957,7 @@ established_segment:
                      * spinlocks for no observable benefit. */
 					int was_ready = conn->rx_ready;
 					conn->rx_ready = 1;
-					poll_notify_io_ready();
+					tcp_poll_notify(conn);
 					if (!was_ready)
 						sched_wake_channel(
 							(void *)&conn
@@ -3089,7 +3112,7 @@ established_segment:
 				conn->rcv_nxt += 1;
 				conn->state = TCP_STATE_CLOSE_WAIT;
 				conn->rx_ready = 1; // Wake up reader (EOF)
-				poll_notify_io_ready();
+				tcp_poll_notify(conn);
 				sched_wake_channel((void *)&conn->rx_ready);
 			} else {
 				// Out-of-order FIN (a data hole precedes it):

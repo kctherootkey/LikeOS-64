@@ -5,6 +5,21 @@
 #include <kernel/uapi/dirent.h>
 #include <kernel/uapi/stat.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/ke/sched.h>
+
+/* Is this a pointer the kernel could plausibly have stored?
+ *
+ * Kernel pointers live in the upper canonical half.  A free poison, a
+ * truncated value or uninitialised memory is not one, and following it is a
+ * general protection fault that halts the machine -- which is the worst
+ * possible outcome for a reference-counting bug, because the report dies with
+ * it, and with it every chance of learning who miscounted.  So the operations
+ * that follow ->ops check it first: a released file then costs an error
+ * return and a line of output instead of the machine. */
+static inline int vfs_ptr_plausible(const void *p)
+{
+	return (uintptr_t)p >= 0xffff800000000000ULL;
+}
 
 static const vfs_ops_t *g_root_ops = 0;
 static const vfs_ops_t *g_dev_ops = 0;
@@ -123,7 +138,7 @@ static int statc_get(const char *path, struct kstat *out)
 		return 0;
 	}
 	for (unsigned i = 0; i < VFS_STATC; i++)
-		if (g_statc[i].valid && strcmp(g_statc[i].path, path) == 0) {
+		if (g_statc[i].valid && kstrcmp(g_statc[i].path, path) == 0) {
 			*out = g_statc[i].st;
 			return 1;
 		}
@@ -1022,19 +1037,25 @@ int vfs_getxattr_ino(const char *path, unsigned long ino, const char *name,
 
 long vfs_read(vfs_file_t *f, void *buf, long bytes)
 {
-	if (!f || !f->ops || !f->ops->read)
+	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
+		return ST_INVALID;
+	if (!f->ops->read)
 		return ST_INVALID;
 	return f->ops->read(f, buf, bytes);
 }
 long vfs_write(vfs_file_t *f, const void *buf, long bytes)
 {
-	if (!f || !f->ops || !f->ops->write)
+	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
+		return ST_INVALID;
+	if (!f->ops->write)
 		return ST_INVALID;
 	return f->ops->write(f, buf, bytes);
 }
 long vfs_seek(vfs_file_t *f, long offset, int whence)
 {
-	if (!f || !f->ops || !f->ops->seek)
+	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
+		return -1;
+	if (!f->ops->seek)
 		return -1;
 	return f->ops->seek(f, offset, whence);
 }
@@ -1191,7 +1212,17 @@ void vfs_release_locks_for_task(uint64_t task_id)
 int vfs_close(vfs_file_t *f)
 {
 	BUG_ON(f == NULL);
-	if (!f || !f->ops || !f->ops->close)
+	if (!f)
+		return ST_INVALID;
+	/* Before ->ops is followed, not after: a released file's memory holds
+	 * the allocator's poison, and reading a function pointer out of that
+	 * is what turns a reference-counting bug into a halted machine. */
+	if (!vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops)) {
+		kprintf("vfs_close: release of an already-released file %p by caller=%p\n",
+			f, __builtin_return_address(0));
+		return ST_INVALID;
+	}
+	if (!f->ops->close)
 		return ST_INVALID;
 
 	// Atomically decrement refcount; only the thread that transitions 1→0 closes

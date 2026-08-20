@@ -14,14 +14,19 @@ int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count)
 		return 0;
 	if (!validate_user_ptr(dirp, count))
 		return -EFAULT;
-	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
+	vfs_file_t *file = fdget(cur, (int)fd);
+	long ret;
+
+	if (!file)
 		return -EBADF;
-	vfs_file_t *file = task_fds(cur)[fd];
 	/* Sockets and epoll instances were missing from this check, so
 	 * getdents64() on one reached vfs_readdir with a marker. */
-	if (fd_is_special(file))
+	if (fd_is_special(file)) {
+		fdput(file);
 		return -ENOTDIR;
-	long ret = vfs_readdir(file, (void *)dirp, (long)count);
+	}
+	ret = vfs_readdir(file, (void *)dirp, (long)count);
+	fdput(file);
 	if (ret == ST_UNSUPPORTED)
 		return -ENOTDIR;
 	return ret;
