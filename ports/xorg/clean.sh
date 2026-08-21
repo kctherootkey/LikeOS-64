@@ -13,7 +13,7 @@
 # network connection.  Pass -a to remove those too.
 #
 # Usage:
-#   clean.sh      remove unpacked trees, stamps, logs and the sysroot
+#   clean.sh      remove unpacked trees, stamps, logs, sysroot and host tools
 #   clean.sh -a   also remove the downloaded tarballs
 
 set -u
@@ -21,6 +21,7 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 SYSROOT="${LIKEOS_SYSROOT:-$root/build/xorg-sysroot}"
+HOSTTOOLS="$here/.hosttools"
 
 # Which package set to clean; see the comment in build.sh.  A sub-port cleans
 # its own trees and leaves the sysroot alone: the two share it, and removing it
@@ -71,17 +72,57 @@ done
 
 rm -rf "$port/.stamps" "$port/.logs"
 
-# The sysroot is shared, so only the top-level clean removes it.
-[ "$sub" = 0 ] && rm -rf "$SYSROOT"
+# The sysroot and the host-tool prefix are shared by both package sets, so only
+# the top-level clean removes them.
+#
+# $HOSTTOOLS is a dot-directory, so the loop above never saw it and it outlived
+# every clean: 200MB of build-machine binaries still sitting there after the
+# .stamps recording what is in them are gone.  It holds two different things,
+# though, and only one of them is this port's to delete:
+#
+#   built HERE, by ports-xorg and ports-gtk3 -- the native GLib, intltool and
+#   nsgenbind that packages above them run during their own build.  Derived,
+#   rebuilt by the next `make`, and removed with the stamps that describe them.
+#
+#   installed by `make deps` -- venv/, holding a meson newer than the apt one
+#   on distributions that ship below MESON_MIN_VERSION, and bin/meson pointing
+#   into it.  A build DEPENDENCY, in the same class as the apt packages deps
+#   installs, which distclean does not uninstall either.  Kept, because
+#   ports-gtk3 only checks meson and stops with "run make deps" if it is too
+#   old -- deleting the venv would make `make distclean && make` fail there,
+#   after rebuilding the whole X.Org port, on exactly the machines that needed
+#   the venv in the first place.
+#
+# Where deps never ran, nothing is kept and the prefix goes with everything
+# else: the rmdirs below take it once it is empty.
+if [ "$sub" = 0 ]; then
+	rm -rf "$SYSROOT"
+	for e in "$HOSTTOOLS"/*; do
+		[ -e "$e" ] || [ -L "$e" ] || continue
+		case "${e##*/}" in
+		venv) continue ;;
+		bin) continue ;;
+		esac
+		rm -rf "$e"
+	done
+	# bin/ is the one directory holding both halves: the programs the ports
+	# installed, beside the meson symlink deps put there.
+	for e in "$HOSTTOOLS"/bin/*; do
+		[ -e "$e" ] || [ -L "$e" ] || continue
+		[ "${e##*/}" = meson ] && continue
+		rm -rf "$e"
+	done
+	rmdir "$HOSTTOOLS/bin" "$HOSTTOOLS" 2>/dev/null
+fi
 
 label="ports/${port#"$root"/ports/}"
-also="the sysroot"
+also="the sysroot and host tools"
 [ "$sub" = 1 ] && also="stamps (the shared sysroot is kept)"
 if [ "$all" = 1 ]; then
 	rm -f "$port"/*.tar.* "$port/checksums.sha256"
-	echo "$label: removed $n source trees, $also and the tarballs"
+	echo "$label: removed $n source trees, $also, and the tarballs"
 else
-	echo "$label: removed $n source trees and $also (tarballs kept)"
+	echo "$label: removed $n source trees, $also (tarballs kept)"
 fi
 
 exit 0

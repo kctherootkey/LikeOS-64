@@ -47,7 +47,8 @@ export LIKEOS_SYSROOT="$SYSROOT"
 # .stamps still said they were built -- and the next netsurf build failed with
 # "nsgenbind: not found".  This lives beside .stamps and .logs, which are the
 # port's own build state and which the top-level clean does not touch, so the
-# three cannot get out of step with each other.
+# three cannot get out of step with each other -- and clean.sh removes all
+# three together, keeping only the meson venv `make deps` installs here.
 HOSTTOOLS="$here/.hosttools"
 
 # $HOSTTOOLS/share/aclocal is made here rather than left to whichever
