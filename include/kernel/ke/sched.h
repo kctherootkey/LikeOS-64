@@ -1088,7 +1088,6 @@ int sched_has_user_tasks(void); // Check if any user tasks are running
 #define MM_LEAK_INSTRUMENTATION DEBUG
 #endif
 
-#if MM_LEAK_INSTRUMENTATION
 /* Give a forked child its own copy of the parent's FPU state. */
 void task_fpu_fork(task_t *child, task_t *parent);
 
@@ -1116,6 +1115,7 @@ void task_debugreg_clear(task_t *t);
 void kernel_fpu_begin(void);
 void kernel_fpu_end(void);
 
+#if MM_LEAK_INSTRUMENTATION
 void sched_dump_task_leaks(void);
 #else
 static inline void sched_dump_task_leaks(void)
