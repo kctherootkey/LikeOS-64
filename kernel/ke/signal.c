@@ -165,6 +165,76 @@ static pending_signal_t *alloc_pending_signal(void)
 	return ps;
 }
 
+/* Drop every PENDING instance of the signals in `mask'.
+ *
+ * Both halves of the record: the bit that says a signal is pending and the
+ * queued description that carries its siginfo.  Clearing one and leaving the
+ * other would either resurrect the signal at the next dequeue or strand an
+ * allocation nothing will ever collect. */
+static void signal_flush_pending_mask(task_signal_state_t *sig,
+				      const kernel_sigset_t *mask)
+{
+	pending_signal_t **pp;
+
+	for (int s = 1; s < NSIG; s++) {
+		if (sigismember_k(mask, s))
+			sigdelset_k(&sig->pending, s);
+	}
+
+	pp = &sig->pending_queue;
+	while (*pp) {
+		pending_signal_t *ps = *pp;
+
+		if (sigismember_k(mask, ps->sig)) {
+			*pp = ps->next;
+			kfree(ps);
+			continue;
+		}
+		pp = &ps->next;
+	}
+}
+
+/* A stop and a continue cancel each other's PENDING instance.
+ *
+ * The two describe opposite states of the same process, so only the newer one
+ * can be true.  An older one still sitting in the queue is not history, it is
+ * an instruction that has not run yet -- and it takes effect after the newer
+ * one has already been acted on and reported.
+ *
+ * That is what broke "SIGTSTP stop reported via WUNTRACED".  kill(SIGSTOP)
+ * both stops the target and queues the signal, and a stopped task never runs
+ * to consume it, so the SIGSTOP stays pending.  kill(SIGCONT) then makes the
+ * task runnable with that stale SIGSTOP still queued behind it.  If the parent
+ * reaches kill(SIGTSTP) before the child is next scheduled, the child wakes,
+ * finds the stale SIGSTOP, takes the default stop action for it, and records
+ * jc_stop_signo = SIGSTOP over the SIGTSTP its parent is waiting to hear
+ * about -- so waitpid(WUNTRACED) reported a stop for the wrong signal.  How
+ * often that happens is purely how late the child is scheduled, which is why
+ * it turns from rare into repeatable as the machine gets busier.
+ *
+ * Per task rather than per thread group: stops and continues are applied to
+ * one task here (see sched_signal_task), so that is the scope the pending
+ * state has to agree with. */
+static void signal_cancel_opposite(task_signal_state_t *sig, int incoming)
+{
+	kernel_sigset_t flush;
+
+	mm_memset(&flush, 0, sizeof(flush));
+
+	if (incoming == SIGCONT) {
+		for (int s = 1; s < NSIG; s++) {
+			if (sig_default_action(s) == SIG_DFL_STOP)
+				sigaddset_k(&flush, s);
+		}
+	} else if (sig_default_action(incoming) == SIG_DFL_STOP) {
+		sigaddset_k(&flush, SIGCONT);
+	} else {
+		return;
+	}
+
+	signal_flush_pending_mask(sig, &flush);
+}
+
 /* Permission check for kill(2): may the calling task signal `target`?  The
  * privileged caller may signal anyone; otherwise the sender's real OR effective
  * uid must equal the target's real OR saved-set uid.  SIGCONT is additionally
@@ -214,6 +284,14 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 
 	task_signal_state_t *sigstate = &task->signals;
 	struct k_sigaction *act = &sigstate->action[sig];
+
+	/* Ahead of the ignore checks below, deliberately.  The disposition
+	 * decides whether the ARRIVING signal is delivered; it does not decide
+	 * whether the one this supersedes stays queued.  A program that
+	 * ignores SIGCONT still has its pending stops cancelled by one, which
+	 * is what keeps an ignored continue from being a continue that never
+	 * happened. */
+	signal_cancel_opposite(sigstate, sig);
 
 	// Check if signal is ignored (except SIGKILL/SIGSTOP)
 	if (!sig_kernel_only(sig)) {
@@ -1078,8 +1156,15 @@ static int signal_select(task_t *task, siginfo_t *info)
 			sched_mark_task_exited(task, 128 + signum);
 			return 0;
 		case SIG_DFL_STOP:
-			task->state = TASK_STOPPED;
-			signal_notify_jobctl(task, signum, 1);
+			/* The stop is entered HERE, by the task itself, and
+			 * nowhere else.  Marking the state was not enough: this
+			 * returns to the delivery path, which pops the frame and
+			 * IRETs back to user code, so a task "stopped" from here
+			 * carried on running with TASK_STOPPED written on it.
+			 * The whole stop -- leaving the run queue, the state,
+			 * the parent's event and giving up the CPU -- is one
+			 * step, and sched_do_signal_stop() is it. */
+			sched_do_signal_stop(task, signum);
 			return 0;
 		case SIG_DFL_CONT:
 			if (task->state == TASK_STOPPED) {

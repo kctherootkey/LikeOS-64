@@ -1237,6 +1237,12 @@ void sched_notify_parent_of_exit(task_t *task);
  * that received it. */
 void sched_kill_thread_group(task_t *task, int exit_code);
 
+/* Enter a job-control stop.  Called ONLY by the stopping task itself, from its
+ * signal-delivery point: a signaller marks the signal pending and wakes the
+ * target, and the target comes here.  Returns once continued -- or at once,
+ * with the stop cancelled, when a continue had already raced in. */
+void sched_do_signal_stop(task_t *t, int signo);
+
 void sched_reparent_children(
 	task_t *task); // Reparent children to init (task 1)
 uint32_t sched_get_ppid(task_t *task); // Get parent PID

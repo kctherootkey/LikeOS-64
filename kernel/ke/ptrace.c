@@ -225,11 +225,28 @@ _Static_assert(sizeof(ptrace_regs_t) == 26 * 8,
  *     syscall_handler takes.
  *
  * Runs with g_task_list_lock held; only reads task fields. */
+/* A published frame is only the tracee's USER state if it was pushed by an
+ * entry FROM user mode -- CPL 3 in its saved CS.  The pointer alone cannot be
+ * trusted: preemption reuses it as its resume mechanism, so a tracee that a
+ * timer parked on its way INTO a stop carries the timer's frame here, and
+ * that frame is the interrupted KERNEL context inside the stop machinery.
+ * Reporting it handed a debugger a kernel RIP as if it were the program's --
+ * PEEKTEXT on the "current instruction" then failed on a kernel address --
+ * and writing through it would have aimed the task's kernel resume at user
+ * register values.  A task stopped inside a syscall keeps its user state in
+ * the syscall frame, which is what the fall-through reaches. */
+static inline const interrupt_frame_t *ptrace_user_frame(const task_t *t)
+{
+	const interrupt_frame_t *f = t->preempt_frame;
+
+	return (f && (f->cs & 0x3) == 0x3) ? f : NULL;
+}
+
 static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
 {
 	mm_memset(out, 0, sizeof(*out));
 
-	const interrupt_frame_t *f = t->preempt_frame;
+	const interrupt_frame_t *f = ptrace_user_frame(t);
 
 	if (f) {
 		out->r15 = f->r15;
@@ -336,7 +353,10 @@ static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
  * would be granted by a straight copy. */
 static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
 {
-	interrupt_frame_t *f = t->preempt_frame;
+	/* Same test as the read side, and even less negotiable here: writing
+	 * user registers through a kernel-context frame would aim this task's
+	 * kernel resume point at them. */
+	interrupt_frame_t *f = (interrupt_frame_t *)ptrace_user_frame(t);
 
 	if (f) {
 		f->r15 = in->r15;
@@ -454,9 +474,14 @@ static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
 static int64_t ptrace_set_tf(task_t *t, bool on)
 {
 	uint64_t *rflags = NULL;
+	/* User frames only, exactly as in ptrace_user_frame(): a tracee that
+	 * preemption parked on its way into the stop carries the timer's
+	 * KERNEL frame here, and a trap flag written into that would
+	 * single-step kernel code the moment the task resumes. */
+	interrupt_frame_t *pf = (interrupt_frame_t *)ptrace_user_frame(t);
 
-	if (t->preempt_frame)
-		rflags = &t->preempt_frame->rflags;
+	if (pf)
+		rflags = &pf->rflags;
 	else if (t->syscall_frame)
 		rflags = &t->syscall_frame->rflags;
 

@@ -689,7 +689,31 @@ int smp_others_halted(void)
 	return g_smp_others_halted;
 }
 
-void smp_tlb_shootdown_sync(void)
+/* What the current shootdown generation asks each receiver to invalidate.
+ *
+ * The request travels beside the IPI, not in it: written under
+ * g_tlb_shootdown_lock immediately before the generation is published, read by
+ * the handler.  One slot is enough because senders serialize on that lock --
+ * but a receiver can still be LATE, handling generation N's interrupt after
+ * generation N+1 has overwritten this.  That is why the receiver only honours
+ * the request when three things line up (see the handler): the stamp here
+ * matches the generation it read, that generation is exactly one past its own
+ * last ack, and there is a page list at all.  Any other combination -- a
+ * coalesced pair of IPIs, a stamp from a newer request, a request with no
+ * list -- falls back to the full reload, which invalidates everything and so
+ * covers every request it might have missed.  The stamp is written BEFORE the
+ * fields and the fields before the generation, so on this architecture's
+ * ordered stores a receiver that sees newer fields necessarily sees the newer
+ * stamp and rejects the mixture. */
+static struct {
+	volatile uint64_t gen; /* generation this request belongs to */
+	volatile uint64_t pml4_phys; /* 0 = every address space */
+	volatile uint32_t naddr; /* 0 = flush everything */
+	volatile uint64_t addr[TLB_SHOOTDOWN_PAGE_CEILING];
+} g_tlb_flush_req;
+
+static void tlb_shootdown_send_and_wait(uint64_t pml4_phys,
+					const uint64_t *vaddrs, uint32_t naddr)
 {
 	if (g_smp_others_halted)
 		return;
@@ -720,6 +744,19 @@ void smp_tlb_shootdown_sync(void)
 	}
 	// Lock acquired with IRQs disabled.
 
+	/* Describe this request before publishing its generation.  g_tlb_gen
+	 * is stable here -- only senders advance it and they all hold this
+	 * lock -- so the stamp can name the generation before the atomic add
+	 * makes it visible.  Order matters and is stated above the struct:
+	 * stamp, then fields, then the generation itself. */
+	g_tlb_flush_req.gen = g_tlb_gen + 1;
+	g_tlb_flush_req.pml4_phys = pml4_phys;
+	if (naddr > TLB_SHOOTDOWN_PAGE_CEILING)
+		naddr = 0; /* too many to name: ask for everything */
+	g_tlb_flush_req.naddr = naddr;
+	for (uint32_t i = 0; i < naddr; i++)
+		g_tlb_flush_req.addr[i] = vaddrs[i];
+
 	// Advance the global generation.  The ack handler on each remote CPU
 	// reads this value AFTER its CR3 reload and stores it in g_tlb_cpu_gen.
 	// Using __ATOMIC_SEQ_CST ensures the store is globally ordered — in
@@ -731,6 +768,45 @@ void smp_tlb_shootdown_sync(void)
 	// Belt-and-suspenders mfence: guarantees all non-atomic PTE writes by
 	// the caller are flushed from the store buffer before the IPI is sent.
 	__asm__ volatile("mfence" ::: "memory");
+
+	/* Which CPUs the wait below must hear from.
+	 *
+	 * For a request against ONE address space: only the CPUs that hold it
+	 * loaded -- active or incoming -- right now.  A CPU that does not is
+	 * provably clean (no address-space identifiers in the TLB, no global
+	 * user mappings: its last CR3 load discarded every translation of this
+	 * space), and one that LOADS it after this snapshot walks the page
+	 * tables as the caller has already rewritten them -- the same argument
+	 * the skip-entirely gate rests on, taken per CPU instead of
+	 * all-or-nothing.  The mfence above orders those PTE writes before
+	 * this scan.
+	 *
+	 * What this buys is not the interrupt cost -- the broadcast still goes
+	 * everywhere, and a non-holder answers with one cheap acknowledge --
+	 * it is the WAIT: an idle CPU is by definition not a holder, and on a
+	 * loaded host the hypervisor can leave a halted virtual CPU unscheduled
+	 * for tens of milliseconds.  Waiting on those made every resolved
+	 * copy-on-write fault and small unmap pay an idle CPU's wake-up
+	 * latency; the measured stalls were 50-190 ms with the lagging CPU
+	 * always an idle one.
+	 *
+	 * A request with no particular address space (pml4 0: kernel mappings,
+	 * which every CPU can hold) still waits for everyone. */
+	uint64_t wait_mask = ~0ULL;
+	if (pml4_phys) {
+		wait_mask = 0;
+		for (uint32_t c = 0; c < online && c < 64; c++) {
+			percpu_t *p = percpu_get(c);
+
+			if (!p)
+				continue;
+			if (__atomic_load_n(&p->mmu_active_pml4,
+					    __ATOMIC_ACQUIRE) == pml4_phys ||
+			    __atomic_load_n(&p->mmu_incoming_pml4,
+					    __ATOMIC_ACQUIRE) == pml4_phys)
+				wait_mask |= 1ULL << c;
+		}
+	}
 
 	lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
 
@@ -793,11 +869,23 @@ void smp_tlb_shootdown_sync(void)
 	uint64_t start_tsc = timer_rdtsc();
 	uint64_t next_retry_tsc = start_tsc + tsc_10ms;
 
+	/* No warning for a slow-but-successful round, deliberately.  The wait
+	 * set is already only the CPUs running this address space, and an
+	 * acknowledgement is one interrupt away -- so the only thing left that
+	 * can make one take tens of milliseconds is a hypervisor host too busy
+	 * to run that virtual CPU.  Measured under two parallel stress suites:
+	 * a dozen 50-300 ms waits in seventy thousand rounds, every laggard a
+	 * descheduled-but-runnable vCPU.  That is the host's scheduler, not a
+	 * kernel defect, and no guest code can hurry it; a paravirtual flush
+	 * channel could, but none is offered here.  The 1000 ms timeout below
+	 * still reports the pathological case. */
 	for (;;) {
 		bool all_acked = true;
 		for (uint32_t c = 0; c < online; c++) {
 			if (c == my_cpu)
 				continue;
+			if (!(wait_mask & (1ULL << c)))
+				continue; /* holds nothing of this space */
 			if (__atomic_load_n(&g_tlb_cpu_gen[c],
 					    __ATOMIC_ACQUIRE) < new_gen) {
 				all_acked = false;
@@ -825,6 +913,8 @@ void smp_tlb_shootdown_sync(void)
 			for (uint32_t c = 0; c < online; c++) {
 				if (c == my_cpu)
 					continue;
+				if (!(wait_mask & (1ULL << c)))
+					continue;
 				if (__atomic_load_n(&g_tlb_cpu_gen[c],
 						    __ATOMIC_ACQUIRE) <
 				    new_gen) {
@@ -850,6 +940,8 @@ void smp_tlb_shootdown_sync(void)
 	for (uint32_t c = 0; c < online; c++) {
 		if (c == my_cpu)
 			continue;
+		if (!(wait_mask & (1ULL << c)))
+			continue;
 		uint64_t cgen =
 			__atomic_load_n(&g_tlb_cpu_gen[c], __ATOMIC_ACQUIRE);
 		if (cgen < new_gen) {
@@ -873,6 +965,94 @@ void smp_tlb_shootdown_sync(void)
 			}
 		}
 	}
+}
+
+void smp_tlb_shootdown_sync(void)
+{
+	/* No particular address space and no page list: every receiver does
+	 * the full reload, exactly as before the targeted form existed. */
+	tlb_shootdown_send_and_wait(0, NULL, 0);
+}
+
+/* The receiver's half of the shootdown: invalidate what the current request
+ * asks for, then acknowledge.  Runs in the IPI handler with interrupts off.
+ *
+ * The cheap path is taken only when this interrupt can be PROVEN to describe
+ * exactly one request and this CPU has missed none:
+ *
+ *   the generation is one past this CPU's own last ack (two or more means
+ *   coalesced interrupts whose earlier requests were overwritten), AND the
+ *   request's stamp equals that generation read twice, around the fields (a
+ *   mismatch means a newer sender is overwriting the slot), AND the request
+ *   names pages at all.
+ *
+ * Then: a request against an address space this CPU does not have loaded --
+ * active or incoming -- needs no invalidation at all, because without address-
+ * space identifiers in the TLB every CR3 load already discarded every
+ * non-global translation, and user mappings are never global here.  Otherwise
+ * each named page is invalidated singly.  EVERY other combination falls back
+ * to the full reload, which subsumes any request this CPU may have missed.
+ *
+ * The cheap path must acknowledge the generation it DECIDED on, not a fresh
+ * read: a fresh read could name a newer request whose pages were never
+ * invalidated here, and the sender of that request would then free them while
+ * this CPU still holds their translations. */
+void smp_tlb_shootdown_flush_and_ack(void)
+{
+	uint32_t me = this_cpu_id();
+
+	/* See all PTE writes published before the generation we are about to
+	 * read. */
+	__asm__ volatile("mfence" ::: "memory");
+
+	uint64_t cur = __atomic_load_n(&g_tlb_gen, __ATOMIC_ACQUIRE);
+	uint64_t prev = __atomic_load_n(&g_tlb_cpu_gen[me], __ATOMIC_RELAXED);
+
+	if (g_tlb_flush_req.gen == cur && cur == prev + 1) {
+		uint64_t pml4 = g_tlb_flush_req.pml4_phys;
+		uint32_t n = g_tlb_flush_req.naddr;
+		uint64_t addrs[TLB_SHOOTDOWN_PAGE_CEILING];
+
+		if (n > 0 && n <= TLB_SHOOTDOWN_PAGE_CEILING) {
+			for (uint32_t i = 0; i < n; i++)
+				addrs[i] = g_tlb_flush_req.addr[i];
+			/* Fields torn by a newer sender carry its newer stamp
+			 * (stores are ordered, the stamp is written first), so
+			 * re-reading it validates the copy just taken. */
+			if (g_tlb_flush_req.gen == cur) {
+				percpu_t *p = this_cpu();
+				bool mine =
+					pml4 == 0 ||
+					__atomic_load_n(&p->mmu_active_pml4,
+							__ATOMIC_ACQUIRE) ==
+						pml4 ||
+					__atomic_load_n(&p->mmu_incoming_pml4,
+							__ATOMIC_ACQUIRE) ==
+						pml4;
+
+				if (mine) {
+					for (uint32_t i = 0; i < n; i++)
+						__asm__ volatile(
+							"invlpg (%0)"
+							:
+							: "r"(addrs[i])
+							: "memory");
+				}
+				__atomic_store_n(&g_tlb_cpu_gen[me], cur,
+						 __ATOMIC_RELEASE);
+				return;
+			}
+		}
+	}
+
+	/* Full reload: covers every request up to whatever the ack below
+	 * re-reads, which is why that one MAY take a fresh generation. */
+	{
+		uint64_t cr3;
+		__asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+		__asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+	}
+	smp_tlb_shootdown_ack();
 }
 
 /*
@@ -943,7 +1123,36 @@ void smp_tlb_shootdown_mm_sync(uint64_t pml4_phys)
 	if (pml4_phys && !tlb_mm_loaded_elsewhere(pml4_phys))
 		return;
 
-	smp_tlb_shootdown_sync();
+	/* Named address space, no page list: holders reload fully, everyone
+	 * else just acknowledges. */
+	tlb_shootdown_send_and_wait(pml4_phys, NULL, 0);
+}
+
+/* Invalidate NAMED pages of one address space everywhere.
+ *
+ * The conventional finish for a single-page mapping change -- a resolved
+ * copy-on-write fault, a debugger poking a text page: the CPUs running the
+ * address space invalidate just those translations, every other CPU merely
+ * acknowledges, and nobody's whole TLB is destroyed for one page.  Above the
+ * ceiling the request degrades to the whole-space form, which is cheaper than
+ * a long invalidation loop on every receiver. */
+void smp_tlb_shootdown_pages_sync(uint64_t pml4_phys, const uint64_t *vaddrs,
+				  uint32_t naddr)
+{
+	if (g_smp_others_halted)
+		return;
+	if (percpu_get_online_count() <= 1)
+		return;
+
+	if (pml4_phys && !tlb_mm_loaded_elsewhere(pml4_phys))
+		return;
+
+	if (!vaddrs || naddr == 0 || naddr > TLB_SHOOTDOWN_PAGE_CEILING) {
+		tlb_shootdown_send_and_wait(pml4_phys, NULL, 0);
+		return;
+	}
+
+	tlb_shootdown_send_and_wait(pml4_phys, vaddrs, naddr);
 }
 
 void smp_halt_others(void)

@@ -355,6 +355,10 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 #define MM_TLB_GATHER_BATCH 64
 struct mm_tlb_gather {
 	uint64_t pages[MM_TLB_GATHER_BATCH];
+	/* The virtual page each entry was mapped at, so a small batch can be
+	 * invalidated singly on the CPUs that hold the address space instead
+	 * of costing every CPU its whole TLB. */
+	uint64_t vaddrs[MM_TLB_GATHER_BATCH];
 	unsigned n;
 	/* Physical root of the address space being unmapped, so the flush can
 	 * ask which CPUs actually have it loaded instead of interrupting all
@@ -382,8 +386,9 @@ void mm_put_pages_batch(const uint64_t *phys, unsigned n);
  * only if it is genuinely not known, which costs a broadcast per flush. */
 void mm_tlb_gather_init(struct mm_tlb_gather *g, uint64_t *pml4);
 /* Queue a page whose entry is already cleared; its reference is held until the
- * flush, which is what stops the page being reused too early. */
-void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys);
+ * flush, which is what stops the page being reused too early.  `vaddr` is
+ * where it was mapped, for the targeted invalidation. */
+void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys, uint64_t vaddr);
 /* Invalidate on every CPU, then drop the batch's references. */
 void mm_tlb_gather_flush(struct mm_tlb_gather *g);
 

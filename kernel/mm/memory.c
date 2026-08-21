@@ -12,6 +12,7 @@
 #include <kernel/fs/pagecache.h> // pagecache_get_stats for memstat breakdown
 #include <kernel/fs/vfs.h> // demand paging: file-backed page-in
 #include <kernel/ke/syscall.h> // PROT_* for lazy region protection
+#include <kernel/ke/timer.h> // timer_get_precise_us: the slow-fault detector
 
 // Enable SLAB allocator (comment out to use legacy fixed-size heap)
 #define USE_SLAB_ALLOCATOR
@@ -2025,13 +2026,14 @@ void mm_tlb_gather_init(struct mm_tlb_gather *g, uint64_t *pml4)
 /* Queue a page whose page-table entry has ALREADY been cleared.  Its reference
  * is deliberately still held: that is what keeps the page from being reused
  * before the invalidation below. */
-void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys)
+void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys, uint64_t vaddr)
 {
 	BUG_ON(g == NULL);
 	if (!phys)
 		return;
 	if (g->n == MM_TLB_GATHER_BATCH)
 		mm_tlb_gather_flush(g);
+	g->vaddrs[g->n] = vaddr & ~0xFFFULL;
 	g->pages[g->n++] = phys;
 }
 
@@ -2047,7 +2049,17 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 	 * down, in which case this costs nothing at all. */
 	if (sched_is_smp()) {
 		if (likely(!irqs_disabled())) {
-			smp_tlb_shootdown_mm_sync(g->pml4_phys);
+			/* A small batch names its pages, so the CPUs holding
+			 * this address space invalidate exactly those and no
+			 * CPU loses its whole TLB; a large one degrades to the
+			 * whole-space form.  The threshold is where receivers'
+			 * single-page invalidations stop being cheaper than
+			 * one full reload. */
+			if (g->n <= TLB_SHOOTDOWN_PAGE_CEILING)
+				smp_tlb_shootdown_pages_sync(g->pml4_phys,
+							     g->vaddrs, g->n);
+			else
+				smp_tlb_shootdown_mm_sync(g->pml4_phys);
 		} else {
 			/* Cannot be done from here: the ack-wait needs to be
 			 * able to service the very interrupts it is waiting on.
@@ -2094,7 +2106,7 @@ static void mm_unmap_page_gathered(uint64_t *pml4, uint64_t virtual_addr,
 	*pte = 0;
 	if (pml4 == mm_get_current_address_space())
 		mm_flush_tlb(virtual_addr);
-	mm_tlb_gather_page(g, phys);
+	mm_tlb_gather_page(g, phys, virtual_addr);
 }
 
 // Unmap virtual page in a specific address space
@@ -4654,7 +4666,7 @@ static bool mm_cow_fault_locked(uint64_t fault_addr)
 
 		mm_tlb_gather_init(&gather, faulting ? faulting->pml4 : NULL);
 	}
-	mm_tlb_gather_page(&gather, old_phys);
+	mm_tlb_gather_page(&gather, old_phys, page_addr);
 	mm_tlb_gather_flush(&gather);
 
 	/* new_phys came from the allocator holding one reference, and that is
@@ -4668,10 +4680,32 @@ bool mm_handle_cow_fault(uint64_t fault_addr)
 {
 	task_t *cur = sched_current();
 	task_t *mm = task_mm_owner(cur);
+
+	/* Stall detector, not a fix: one write to a private page must cost
+	 * microseconds.  The two phases are timed apart because they fail
+	 * differently -- the lock names a writer holding the address space,
+	 * the body names the copy machinery or the remote invalidation.
+	 *
+	 * The threshold sits ABOVE what a busy hypervisor host can inflict:
+	 * the resolve phase waits for invalidation acknowledgements, and a
+	 * runnable-but-descheduled virtual CPU was measured taking up to
+	 * ~300 ms to be given the time to answer.  That is the host's
+	 * scheduler, not this kernel, so only a stall no amount of host load
+	 * explains is worth a report. */
+	uint64_t t0 = timer_get_precise_us();
 	bool locked = mm_fault_lock(mm);
+	uint64_t t1 = timer_get_precise_us();
 	bool ret = mm_cow_fault_locked(fault_addr);
+	uint64_t t2 = timer_get_precise_us();
 
 	mm_fault_unlock(mm, locked);
+	WARN_RATELIMIT(
+		t2 - t0 > 500000,
+		"cow fault on %llx took %llu ms (lock wait %llu ms, resolve %llu ms)",
+		(unsigned long long)fault_addr,
+		(unsigned long long)((t2 - t0) / 1000),
+		(unsigned long long)((t1 - t0) / 1000),
+		(unsigned long long)((t2 - t1) / 1000));
 	return ret;
 }
 
@@ -4799,7 +4833,7 @@ bool mm_make_writable_in(uint64_t *pml4, uint64_t vaddr)
 		struct mm_tlb_gather g;
 
 		mm_tlb_gather_init(&g, pml4);
-		mm_tlb_gather_page(&g, old_phys);
+		mm_tlb_gather_page(&g, old_phys, page_addr);
 		mm_tlb_gather_flush(&g);
 	}
 	return true;
@@ -4811,11 +4845,11 @@ invalidate:
 	 * the target may be running right now with the old read-only
 	 * translation cached, and it would keep using it.
 	 *
-	 * Shoot down the whole address space rather than the one page: this is
-	 * the primitive that exists for "this pml4 changed", it asks which CPUs
-	 * actually have it loaded, and it is not on any hot path. */
+	 * Exactly one page changed, so name it: the CPUs holding this address
+	 * space invalidate that translation alone, and nobody else loses
+	 * anything. */
 	if (sched_is_smp())
-		smp_tlb_shootdown_mm_sync(virt_to_phys(pml4));
+		smp_tlb_shootdown_pages_sync(virt_to_phys(pml4), &page_addr, 1);
 	mm_flush_tlb(page_addr); /* and this CPU, which the above skips */
 	return true;
 }

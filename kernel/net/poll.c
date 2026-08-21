@@ -75,6 +75,21 @@ static volatile int g_poll_sleepers;
 struct poll_table {
 	struct wait_queue_head **heads; /* which queue entry i sits on */
 	struct wait_queue_entry *ents;
+	/* The descriptor entry that OWNS heads[i], with a reference held for
+	 * as long as the wait-queue entry is linked to it.
+	 *
+	 * The scan holds the descriptor only while it is looking at it, and
+	 * drops that hold before the sleep -- but the registration outlives
+	 * the scan by design, which is the whole point of registering.  With
+	 * only the scan's hold, a sibling thread closing the last descriptor
+	 * frees the pipe or socket while this poller is still on its queue,
+	 * and the wq_remove() below then writes through a pprev that points
+	 * into freed memory.  So the registration takes a reference of its
+	 * own, and the object cannot go away underneath it.
+	 *
+	 * NULL for a queue that belongs to something with no descriptor to
+	 * hold -- the console tty, which is never freed. */
+	void **held;
 	int n;   /* entries in use */
 	int cap; /* 0 when the allocation failed -- see poll_wait() */
 };
@@ -83,17 +98,21 @@ static void poll_table_init(struct poll_table *pt, int cap)
 {
 	pt->heads = NULL;
 	pt->ents = NULL;
+	pt->held = NULL;
 	pt->n = 0;
 	pt->cap = 0;
 	if (cap <= 0)
 		return;
 	pt->heads = kalloc((size_t)cap * sizeof(*pt->heads));
 	pt->ents = kalloc((size_t)cap * sizeof(*pt->ents));
-	if (!pt->heads || !pt->ents) {
+	pt->held = kalloc((size_t)cap * sizeof(*pt->held));
+	if (!pt->heads || !pt->ents || !pt->held) {
 		kfree(pt->heads);
 		kfree(pt->ents);
+		kfree(pt->held);
 		pt->heads = NULL;
 		pt->ents = NULL;
+		pt->held = NULL;
 		return; /* cap stays 0: poll_wait becomes a no-op */
 	}
 	pt->cap = cap;
@@ -104,8 +123,15 @@ static void poll_table_init(struct poll_table *pt, int cap)
  * dead allocation. */
 static void poll_table_reset(struct poll_table *pt)
 {
-	for (int i = 0; i < pt->n; i++)
+	for (int i = 0; i < pt->n; i++) {
+		/* Off the queue FIRST, then let go of what owns the queue.
+		 * The other order drops the last reference while this entry is
+		 * still linked, so the object -- and the head this is about to
+		 * unlink from -- can be freed between the two lines. */
 		wq_remove(pt->heads[i], &pt->ents[i]);
+		fdput(pt->held[i]);
+		pt->held[i] = NULL;
+	}
 	pt->n = 0;
 }
 
@@ -114,19 +140,27 @@ static void poll_table_free(struct poll_table *pt)
 	poll_table_reset(pt);
 	kfree(pt->heads);
 	kfree(pt->ents);
+	kfree(pt->held);
 	pt->heads = NULL;
 	pt->ents = NULL;
+	pt->held = NULL;
 	pt->cap = 0;
 }
 
-/* Register the calling task on `h'.
+/* Register the calling task on `h', which belongs to `owner'.
+ *
+ * `owner' is the descriptor entry the queue lives inside, and this takes a
+ * reference on it that lasts until poll_table_reset() unlinks the entry
+ * again -- see the note on poll_table::held.  Pass NULL only for a queue in
+ * an object that is never freed.
  *
  * A no-op when there is no table (the caller only wants the readiness mask, as
  * epoll_ctl does) or when the table is full or could not be allocated.  That
  * is safe rather than merely tolerable: a poller that fails to register still
  * re-scans on the periodic wakeup below, so the worst outcome is the latency
  * this whole change is removing, not a missed event. */
-static void poll_wait(struct poll_table *pt, struct wait_queue_head *h)
+static void poll_wait(struct poll_table *pt, void *owner,
+		      struct wait_queue_head *h)
 {
 	task_t *cur;
 
@@ -135,7 +169,14 @@ static void poll_wait(struct poll_table *pt, struct wait_queue_head *h)
 	cur = sched_current();
 	if (!cur)
 		return;
+	/* Before the entry goes on the queue, never after: the moment it is
+	 * linked, an unreferenced owner can be freed with this entry still on
+	 * it.  A refused hold means the object is already gone, so there is
+	 * nothing to register on. */
+	if (owner && !fdhold((vfs_file_t *)owner))
+		return;
 	wq_entry_init(&pt->ents[pt->n], cur);
+	pt->held[pt->n] = owner;
 	wq_add(h, &pt->ents[pt->n]);
 	pt->heads[pt->n] = h;
 	pt->n++;
@@ -286,7 +327,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 
 		if (tty)
-			poll_wait(pt, &tty->poll_wq);
+			poll_wait(pt, NULL, &tty->poll_wq);
 		if (events & (POLLIN | POLLRDNORM)) {
 			if (tty && tty->read_count > 0)
 				rev |= POLLIN | POLLRDNORM;
@@ -302,14 +343,14 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		net_socket_t *ns = sock_get(SOCKET_FD_IDX(entry));
 
 		if (ns)
-			poll_wait(pt, &ns->poll_wq);
+			poll_wait(pt, entry, &ns->poll_wq);
 		rev_out = (short)sock_poll(SOCKET_FD_IDX(entry), events);
 		goto out;
 	}
 
 	// UNIX socket fd marker
 	if (unix_sock_is(entry)) {
-		poll_wait(pt, &((unix_socket_t *)entry)->poll_wq);
+		poll_wait(pt, entry, &((unix_socket_t *)entry)->poll_wq);
 		rev_out = (short)unix_poll((unix_socket_t *)entry, events);
 		goto out;
 	}
@@ -333,7 +374,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 
 		if (tty)
-			poll_wait(pt, &tty->poll_wq);
+			poll_wait(pt, NULL, &tty->poll_wq);
 		if (events & (POLLIN | POLLRDNORM)) {
 			if (tty && tty->read_count > 0)
 				rev |= POLLIN | POLLRDNORM;
@@ -349,7 +390,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		pipe_end_t *pe = (pipe_end_t *)entry;
 		pipe_t *p = pe->pipe;
 
-		poll_wait(pt, &p->poll_wq);
+		poll_wait(pt, entry, &p->poll_wq);
 		WARN_ON(p->used >
 			p->size); /* pipe ring buffer invariant violated: used > capacity */
 		short rev = 0;
@@ -374,7 +415,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 	{
 		int pid = devfs_get_pty_master_id((vfs_file_t *)entry);
 		if (pid >= 0) {
-			poll_wait(pt, tty_pty_master_pollq(pid));
+			poll_wait(pt, entry, tty_pty_master_pollq(pid));
 			rev_out = (short)tty_pty_master_poll(pid, events);
 			goto out;
 		}
@@ -384,7 +425,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 	{
 		int unit = devfs_evdev_unit((vfs_file_t *)entry);
 		if (unit >= 0) {
-			poll_wait(pt, evdev_pollq(unit));
+			poll_wait(pt, entry, evdev_pollq(unit));
 			rev_out = evdev_poll(unit, events);
 			goto out;
 		}
@@ -396,7 +437,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		if (tty) {
 			short rev = 0;
 
-			poll_wait(pt, &tty->poll_wq);
+			poll_wait(pt, entry, &tty->poll_wq);
 			if ((events & (POLLIN | POLLRDNORM)) &&
 			    tty->read_count > 0)
 				rev |= POLLIN | POLLRDNORM;
@@ -478,7 +519,13 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 	if (timeout_ticks == 0) {
 		// Non-blocking poll
 	} else if (timeout_ticks != (uint64_t)-1) {
-		deadline = timer_ticks() + timeout_ticks;
+		/* +1 for the tick already in progress: timer_ticks() was read
+		 * at some unknown fraction into the current tick, so without it
+		 * the wake lands up to one tick early and the timeout expires
+		 * short of what was asked for.  A timeout may fire late, never
+		 * early; the futex and sleep paths arm their deadlines the same
+		 * way. */
+		deadline = timer_ticks() + timeout_ticks + 1;
 	}
 
 	while (1) {
@@ -609,7 +656,13 @@ static int sys_poll_locked(struct pollfd *fds, int nfds,
 	if (timeout_ticks == 0) {
 		// Non-blocking poll
 	} else if (timeout_ticks != (uint64_t)-1) {
-		deadline = timer_ticks() + timeout_ticks;
+		/* +1 for the tick already in progress: timer_ticks() was read
+		 * at some unknown fraction into the current tick, so without it
+		 * the wake lands up to one tick early and the timeout expires
+		 * short of what was asked for.  A timeout may fire late, never
+		 * early; the futex and sleep paths arm their deadlines the same
+		 * way. */
+		deadline = timer_ticks() + timeout_ticks + 1;
 	}
 
 	while (1) {
@@ -851,7 +904,13 @@ static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
 	if (timeout_ticks == 0) {
 		// Non-blocking
 	} else if (timeout_ticks != (uint64_t)-1) {
-		deadline = timer_ticks() + timeout_ticks;
+		/* +1 for the tick already in progress: timer_ticks() was read
+		 * at some unknown fraction into the current tick, so without it
+		 * the wake lands up to one tick early and the timeout expires
+		 * short of what was asked for.  A timeout may fire late, never
+		 * early; the futex and sleep paths arm their deadlines the same
+		 * way. */
+		deadline = timer_ticks() + timeout_ticks + 1;
 	}
 
 	while (1) {

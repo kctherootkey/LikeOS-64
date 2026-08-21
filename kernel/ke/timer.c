@@ -1158,6 +1158,35 @@ void timer_irq_handler(void)
 	}
 
 	if (is_bsp) {
+		/* What the tick counter SHOULD read, from the free-running
+		 * hardware clock.
+		 *
+		 * Computed before the seqlock write window opens, because the
+		 * PM-timer arm of timer_get_precise_us() reads that seqlock
+		 * and would spin on its own CPU forever inside it.
+		 *
+		 * Why it exists at all: every timed wait in this kernel --
+		 * nanosleep, select, poll, the futex deadlines -- counts
+		 * g_ticks, and a plain increment makes that a count of
+		 * INTERRUPT DELIVERIES, not of time.  Under a busy hypervisor
+		 * host the two come apart in both directions: the boot CPU is
+		 * descheduled for hundreds of milliseconds (no deliveries, the
+		 * counter stalls, sleeps oversleep), and on resume the missed
+		 * periods are injected back to back (a burst of deliveries in
+		 * microseconds, and every armed timeout expires at once --
+		 * observed as a 200 ms nanosleep taking 1095 ms and the four
+		 * timed waits after it all returning in 0 ms).  Durations must
+		 * come from a clock; the interrupt is only the sampling event.
+		 * So each tick RESYNCHRONISES the counter to the clock: a
+		 * burst collapses into one forward correction that matches
+		 * real elapsed time, and an early expiry becomes impossible.
+		 * The increment remains as the floor so the counter still
+		 * advances on machines where the clock cannot say (very early
+		 * boot, when the fallback is itself derived from g_ticks and
+		 * the resync is an exact no-op). */
+		uint64_t want_ticks = timer_get_precise_us() *
+				      (uint64_t)g_frequency / 1000000ULL;
+
 		/* Seqlock write: odd = updating, even = stable */
 		WARN_ON_ONCE(
 			g_tick_seq &
@@ -1165,7 +1194,10 @@ void timer_irq_handler(void)
 		g_tick_seq++;
 		__asm__ volatile("" ::: "memory");
 
-		g_ticks++;
+		if (want_ticks > g_ticks)
+			g_ticks = want_ticks;
+		else
+			g_ticks++;
 
 		/* Accumulate real wall-clock microseconds from PM Timer deltas.
          * Each delta represents actual elapsed time since last BSP tick,

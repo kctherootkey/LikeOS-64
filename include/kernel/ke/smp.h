@@ -125,8 +125,25 @@ void smp_tlb_shootdown_sync(void);
  */
 void smp_tlb_shootdown_mm_sync(uint64_t pml4_phys);
 
+/* Above this many pages a request is not worth naming singly: receivers do one
+ * full reload instead of a long invalidation loop.  The conventional ceiling,
+ * measured where single-page invalidation stops paying for itself. */
+#define TLB_SHOOTDOWN_PAGE_CEILING 33
+
+/* The same again, but naming the PAGES that changed: CPUs holding the address
+ * space invalidate exactly those translations, all others only acknowledge.
+ * The right form whenever the caller knows the addresses -- one resolved
+ * copy-on-write page must not cost every other CPU its whole TLB. */
+void smp_tlb_shootdown_pages_sync(uint64_t pml4_phys, const uint64_t *vaddrs,
+				  uint32_t naddr);
+
 // Called by TLB shootdown IPI handler to acknowledge completion
 void smp_tlb_shootdown_ack(void);
+
+/* The IPI handler's whole job: apply the pending invalidation request --
+ * named pages when it can be proven current, a full reload otherwise -- and
+ * acknowledge it.  Interrupts must be off. */
+void smp_tlb_shootdown_flush_and_ack(void);
 
 // Halt all other CPUs (for panic)
 void smp_halt_others(void);

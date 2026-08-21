@@ -223,10 +223,22 @@ vfs_file_t *fd_dup_entry_at(task_t *cur, int fd)
  * so that callers need no second code path.
  * ------------------------------------------------------------------------ */
 
-/* Take a hold of the kind this entry needs.  Called with the table locked, so
- * the entry is live; the only failure is an entry that names nothing, which
- * only the UNIX-socket marker can report. */
-static int fd_entry_hold(vfs_file_t *entry)
+/* Take a hold of the kind this entry needs; release it with fdput().
+ *
+ * Two callers, and the same precondition stated two ways.  fdget() calls it
+ * with the table locked, so the table's own reference is what keeps the entry
+ * live across the count.  Anyone else must ALREADY hold a reference, and is
+ * asking for a second one that outlives the first -- which is what a poller
+ * registered on an object's wait queue needs, since the entry stays linked
+ * after the scan that put it there has released its hold.  Either way the
+ * object is live when the count is taken, and the only failure is an entry
+ * that names nothing, which only the UNIX-socket marker can report.
+ *
+ * Deliberately the LOOKUP hold rather than the descriptor one: for a UNIX
+ * socket the descriptor count is what decides when the peer sees a hangup, and
+ * a second holder that is not a second descriptor must not move it.  fdput()
+ * is the matching release for exactly this reason. */
+int fdhold(vfs_file_t *entry)
 {
 	uint64_t marker = (uint64_t)entry;
 
@@ -262,7 +274,7 @@ vfs_file_t *fdget(task_t *task, int fd)
 
 	fds_lock(task, &flags);
 	entry = task_fds(task)[fd];
-	if (entry && !fd_entry_hold(entry))
+	if (entry && !fdhold(entry))
 		entry = NULL;
 	fds_unlock(task, flags);
 	return entry;

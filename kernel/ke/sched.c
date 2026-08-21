@@ -3915,6 +3915,24 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 	if (t->ptrace_exiting && event != PTRACE_EVENT_EXIT)
 		return;
 
+	/* Interrupts stay off from before the park until the tracer has been
+	 * woken.  The park below runs under the task-list lock, but the
+	 * notifications after it -- the SIGCHLD, the wake -- cannot: they take
+	 * that same lock themselves.  With interrupts on in between, the timer
+	 * could land there, and preemption treats a task already marked
+	 * TASK_STOPPED as voluntarily parked: it is switched away and the rest
+	 * of this function simply never runs.  The event was recorded, but the
+	 * wake was not sent -- so a tracer already asleep in waitpid() slept
+	 * for ever next to a perfectly reapable stop.  (Observed exactly
+	 * there: the stopped tracee's preempt frame pointed at the wake call.)
+	 *
+	 * Everything inside the window is spinlock-only and short.  The
+	 * restore comes before the yield at the bottom, where a preemption is
+	 * harmless: by then the stop is recorded AND announced, so the tracer
+	 * reaps it and the resume finds TASK_STOPPED, whichever path parks the
+	 * task first. */
+	uint64_t irqf = local_irq_save();
+
 	spin_lock_irqsave(&g_task_list_lock, &flags);
 	{
 		task_t *tracer = task_tracer_locked(t);
@@ -3930,6 +3948,36 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 			t->ptrace_event = event;
 			t->ptrace_msg = msg;
 			t->ptrace_stopped = 1;
+
+			/* Parked HERE, in the same breath as the event that
+			 * announces it, and not after the tracer has been told.
+			 *
+			 * A resume takes this lock, clears ptrace_stopped, and
+			 * then wakes the tracee with a claim that has to see
+			 * TASK_STOPPED to do anything.  Announcing the stop
+			 * before entering it let the tracer win that race: it
+			 * reaped the event and issued PTRACE_CONT while this
+			 * task was still RUNNING, the claim found the wrong
+			 * state and enqueued nothing, and this task then parked
+			 * itself with ptrace_stopped already cleared -- no
+			 * trace event left for waitpid to report, no
+			 * job-control event either, and nothing anywhere that
+			 * would ever wake it.  A stopped tracee and a tracer
+			 * blocked in waitpid for ever: the hang after
+			 * PTRACE_SINGLESTEP, whose next act is the PTRACE_CONT
+			 * that arrives fastest.
+			 *
+			 * With both under one lock the two orders are the only
+			 * two possible: the resume gets here first and finds
+			 * ptrace_stopped clear, so it reports ESRCH rather than
+			 * losing a wake; or the stop lands first and every
+			 * observer of ptrace_stopped also sees TASK_STOPPED.
+			 * task_ptrace_group_park() parks under this lock for
+			 * the same reason. */
+			if (t->on_rq)
+				rq_remove(t);
+			t->state = TASK_STOPPED;
+
 			/* Bumped before the wake below, so a tracer that is
 			 * deciding whether to sleep sees that something
 			 * happened even if it has not marked itself blocked
@@ -3943,6 +3991,7 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 	if (!tracer_proc) {
 		/* Untraced, or the tracer vanished between the caller's check
 		 * and here.  Nothing to stop for. */
+		local_irq_restore(irqf);
 		return;
 	}
 
@@ -3966,13 +4015,17 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 	}
 	sched_wake_wait_sleepers(tracer_proc);
 
-	/* Park.  TASK_STOPPED is the same state job control uses -- proven
-	 * machinery, and a tracee that is stopped is stopped regardless of who
-	 * stopped it.  ptrace_stopped is what says which kind of event this is,
-	 * so a tracer and a shell cannot consume each other's. */
-	if (t->on_rq)
-		rq_remove(t);
-	t->state = TASK_STOPPED;
+	/* Announced -- from here a preemption parks the task no worse than the
+	 * yield below would. */
+	local_irq_restore(irqf);
+
+	/* Already marked TASK_STOPPED above -- the same state job control uses,
+	 * because a tracee that is stopped is stopped regardless of who stopped
+	 * it, and ptrace_stopped is what says which kind of event it is, so a
+	 * tracer and a shell cannot consume each other's.  All that is left is
+	 * to give up the CPU; a resume that arrived while the notifications
+	 * above were running has already claimed this task and put it back on a
+	 * run queue, so it simply gets picked up again. */
 	if (t == sched_current())
 		sched_schedule();
 }
@@ -4572,6 +4625,117 @@ void sched_mark_task_exited(task_t *task, int status)
 // SIGNAL DELIVERY
 // ============================================================================
 
+/* Enter a job-control stop.  Runs in the STOPPING task's own context, from its
+ * signal-delivery point, which is the only context that may set this state.
+ *
+ * The parent is told FIRST, before the state changes -- the opposite of the
+ * order every other notification here uses, and for a reason that was found
+ * the hard way.  This runs with preemption live, and a timer landing between
+ * `state = TASK_STOPPED' and anything after it parks the task through the
+ * preemption path, which never returns here: whatever had not run yet simply
+ * never runs.  With the notification last, that was a task stopped with NO
+ * recorded event -- nothing for waitpid() to report, so the parent slept for
+ * ever, and no continue ever came because nobody knew there was a stop to
+ * continue.  (The observed corpse: TASK_STOPPED, no jobctl event, and a
+ * preempt frame whose RIP sat in the delivery machinery.)  Announced first,
+ * the worst any interleaving can do is report a stop the task is still
+ * entering -- which is what the old signaller-side stop reported always, and
+ * which waitpid()'s consumers already accept.
+ *
+ * The state transition itself runs with interrupts off so this CPU's timer
+ * cannot split it, and then a continue that raced the announcement is honoured
+ * rather than slept through: a parent that reaps the stop and continues it can
+ * do both before this task has parked, and that continue -- a wake aimed at
+ * TASK_STOPPED plus a queued SIGCONT -- would find the task not yet stopped
+ * (wake lost) and then parked with the continue signal pending (nothing left
+ * to wake it).  A pending continue at commit time therefore CANCELS the stop,
+ * the conventional rule: the two describe opposite states and only the newer
+ * one is true.  The continue is announced in the stop's place, because the
+ * eager announcement in the SIGCONT sender only fires when its wake claims a
+ * task that already parked. */
+void sched_do_signal_stop(task_t *t, int signo)
+{
+	if (!t)
+		return;
+
+	signal_notify_jobctl(t, signo, 1);
+
+	uint64_t irqf = local_irq_save();
+
+	if (t->on_rq)
+		rq_remove(t);
+	t->state = TASK_STOPPED;
+
+	if (sigismember_k(&t->signals.pending, SIGCONT)) {
+		t->state = TASK_RUNNING;
+		local_irq_restore(irqf);
+		signal_notify_jobctl(t, SIGCONT, 0);
+		return;
+	}
+	local_irq_restore(irqf);
+
+	/* Giving up the CPU is not optional: returning through the delivery
+	 * path reaches the IRETQ, and a "stopped" task would carry on
+	 * executing user code.  A preemption landing in the window since the
+	 * restore parks the task just as well -- and now with its event
+	 * already on record. */
+	if (t == sched_current())
+		sched_schedule();
+}
+
+/* Ask `task' to stop.  It stops ITSELF; this only makes it go and look.
+ *
+ * The signaller does not touch the target's scheduler state.  It used to --
+ * rq_remove() plus a straight store of TASK_STOPPED from whichever CPU called
+ * kill() -- and that is a cross-CPU write to another task's state with no
+ * claim and no lock, racing every place the target parks itself.  The target
+ * loses:
+ *
+ *	cur->wakeup_tick = end;
+ *	cur->state = TASK_BLOCKED;	<-- overwrites the stop
+ *	sched_schedule();
+ *
+ * A task asleep in nanosleep, or anywhere else that blocks, was marked
+ * TASK_STOPPED by the signaller and then wrote TASK_BLOCKED over it at its
+ * next park.  The stop was gone, but jc_stop_signo -- recorded by the same
+ * signaller -- still said it had stopped, so waitpid(WUNTRACED) reported a
+ * stop for a process that was still running.  The next SIGCONT then found it
+ * not TASK_STOPPED, so the claim that resumes a stopped task did nothing at
+ * all, and what happened afterwards depended on which of the two writes
+ * landed last.
+ *
+ * So the stop is performed by the target, in its own context, at its next
+ * signal-delivery point: the SIG_DFL_STOP case in signal_select() sets
+ * TASK_STOPPED and records the job-control event there.  That is the only
+ * place that can do it without racing, because it is the only place that is
+ * the task itself.  All that is owed from here is what any signal is owed --
+ * queue it, and make the target runnable so it reaches that point.
+ *
+ * Deliberately no job-control notification here either.  The event belongs to
+ * an actual stop, and the actual stop has not happened yet; announcing it now
+ * is what let a parent be told about a stop that never took place.  A
+ * waitpid(WUNTRACED) simply waits, which is what it is for, and the target
+ * notifies it on the way down.
+ *
+ * The wake mirrors the SIGKILL path below: claim it out of a sleep, re-enqueue
+ * it if it is READY but has fallen off a run queue, or poke the CPU it is
+ * running on so it reaches its return-to-user quickly.  A signal the target
+ * has blocked does not wake it -- signal_send() decides that -- and it stops
+ * when it unblocks the signal, which is the conventional behaviour. */
+static void sched_signal_stop_request(task_t *task, int sig, siginfo_t *info)
+{
+	signal_send(task, sig, info);
+
+	if (sched_claim_wake(task, TASK_BLOCKED)) {
+		sched_enqueue_ready(task);
+	} else if (task->state == TASK_READY) {
+		sched_enqueue_ready(task);
+	} else if (g_smp_initialized && task->state == TASK_RUNNING &&
+		   task->on_cpu != this_cpu_id()) {
+		smp_send_reschedule(task->on_cpu);
+	}
+}
+
 void sched_signal_task(task_t *task, int sig)
 {
 	if (!task)
@@ -4684,13 +4848,7 @@ void sched_signal_task(task_t *task, int sig)
 			task_ptrace_stop(task, SIGSTOP, 0, 0);
 			return;
 		}
-		if (task->on_rq)
-			rq_remove(task);
-		task->state = TASK_STOPPED;
-		signal_notify_jobctl(task, sig, 1);
-		signal_send(task, sig, &info);
-		if (task == sched_current())
-			sched_schedule();
+		sched_signal_stop_request(task, sig, &info);
 		return;
 	}
 
@@ -4704,26 +4862,7 @@ void sched_signal_task(task_t *task, int sig)
 	}
 
 	if (sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
-		struct k_sigaction *act = &task->signals.action[sig];
-		if (act->sa_handler == SIG_DFL) {
-			if (task->on_rq)
-				rq_remove(task);
-			task->state = TASK_STOPPED;
-			/* Record the stop for job control exactly as the
-			 * SIGSTOP path does.  Stopping here without it left
-			 * jc_stop_signo clear, so waitpid(WUNTRACED) had
-			 * nothing to report and the parent blocked forever on
-			 * a child that really had stopped — SIGSTOP worked,
-			 * the tty stop signals did not. */
-			signal_notify_jobctl(task, sig, 1);
-			signal_send(task, sig, &info);
-			if (task == sched_current())
-				sched_schedule();
-			return;
-		}
-		signal_send(task, sig, &info);
-		if (sched_claim_wake(task, TASK_BLOCKED))
-			sched_enqueue_ready(task);
+		sched_signal_stop_request(task, sig, &info);
 		return;
 	}
 
@@ -4821,12 +4960,16 @@ void sched_signal_task(task_t *task, int sig)
 		}
 		break;
 	case SIG_DFL_STOP:
-		if (task->on_rq)
-			rq_remove(task);
-		task->state = TASK_STOPPED;
-		// Stopped tasks can safely schedule since they're not being freed
-		if (task == sched_current())
-			sched_schedule();
+		/* Not stopped from here -- the target stops itself, in
+		 * sched_do_signal_stop(), at its delivery point.  Unreachable
+		 * today, since the four signals whose default action is STOP
+		 * are all routed through sched_signal_stop_request() above,
+		 * and kept in that shape so it cannot quietly reintroduce a
+		 * cross-CPU stop if that ever changes.  The signal is already
+		 * queued by the signal_send() above, so all that is owed is
+		 * the wake that gets the target to its delivery point. */
+		if (sched_claim_wake(task, TASK_BLOCKED))
+			sched_enqueue_ready(task);
 		break;
 	case SIG_DFL_IGN:
 		break;
@@ -5096,6 +5239,14 @@ void sched_dump_tasks(struct tty *tty)
 		void *wait_channel;
 		void *sp; /* saved kernel sp: 0 == "committed to a CPU" — a READY
 			   * task with sp==0 is the classic un-dispatchable strand */
+		/* Job-control forensics: an un-reaped stop/continue event and
+		 * the low pending-signal bits.  A STOPPED task with jc=0/0 and
+		 * a parent asleep in waitpid is the exact fingerprint of a
+		 * stop whose event went missing -- these three fields are what
+		 * decide whether the child never recorded it or the parent
+		 * lost the wake. */
+		int jc_stop, jc_cont;
+		uint32_t pend;
 		uint8_t state;
 		char is_leader, marker;
 	} *snaps = slab_alloc((size_t)snap_cap * sizeof(*snaps));
@@ -5125,6 +5276,10 @@ void sched_dump_tasks(struct tty *tty)
 		snaps[nsnaps].sp = t->sp;
 		snaps[nsnaps].is_leader = (t == t->group_leader) ? 'L' : '-';
 		snaps[nsnaps].marker = (t == cur) ? '*' : ' ';
+		snaps[nsnaps].jc_stop = t->jc_stop_signo;
+		snaps[nsnaps].jc_cont = t->jc_continued;
+		snaps[nsnaps].pend =
+			(uint32_t)t->signals.pending.sig[0];
 		nsnaps++;
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -5141,6 +5296,12 @@ void sched_dump_tasks(struct tty *tty)
 			snaps[i].nr_threads, snaps[i].is_leader,
 			snaps[i].last_rip, snaps[i].user_rip,
 			(uint64_t)snaps[i].sp, (uint64_t)snaps[i].wait_channel);
+		if (snaps[i].jc_stop || snaps[i].jc_cont || snaps[i].pend)
+			tty_printf(
+				tty,
+				"      jc_stop=%d jc_cont=%d pending=%08x\n",
+				snaps[i].jc_stop, snaps[i].jc_cont,
+				snaps[i].pend);
 	}
 	tty_printf(
 		tty,

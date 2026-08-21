@@ -24,6 +24,12 @@ void fds_lock(task_t *task, uint64_t *flags);
 void fd_table_clone(task_t *dst, task_t *src);
 
 vfs_file_t *fdget(task_t *task, int fd);
+
+/* Take a SECOND hold on an entry the caller already holds, for a reference
+ * that must outlive the lookup which produced it.  Released with fdput() like
+ * any other.  Returns 0 for an entry that names nothing. */
+int fdhold(vfs_file_t *entry);
+
 void fdput(vfs_file_t *entry);
 void fds_unlock(task_t *task, uint64_t flags);
 

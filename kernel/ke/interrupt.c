@@ -2213,19 +2213,12 @@ void ipi_handler(uint64_t *regs)
 		break;
 
 	case 0xFC: // IPI_TLB_SHOOTDOWN
-		// Invalidate TLB on this CPU and acknowledge
-		{
-			// Memory barrier to ensure we see all page table updates
-			// from the CPU that initiated the shootdown
-			__asm__ volatile("mfence" ::: "memory");
-			uint64_t cr3;
-			__asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-			__asm__ volatile("mov %0, %%cr3"
-					 :
-					 : "r"(cr3)
-					 : "memory");
-			smp_tlb_shootdown_ack();
-		}
+		/* Apply the sender's invalidation request -- the named pages
+		 * when the request is provably current, a full reload for any
+		 * ambiguity -- and acknowledge it.  All of it lives beside the
+		 * sender in smp.c, because the two halves share the request
+		 * slot and the generation protocol. */
+		smp_tlb_shootdown_flush_and_ack();
 		lapic_eoi();
 		break;
 
