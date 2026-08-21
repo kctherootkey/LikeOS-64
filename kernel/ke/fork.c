@@ -721,13 +721,68 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * other event: PTRACE_O_TRACECLONE. */
 	bool report_clone = (cur->tracer_pid != 0 &&
 			     (cur->ptrace_options & PTRACE_O_TRACECLONE));
+	uint64_t child_incarnation = child->incarnation;
 
-	// Enqueue child
-	sched_enqueue_ready(child);
+	/* A traced thread must not outrun its own announcement.
+	 *
+	 * Enqueueing first let the new thread run, finish, and raise its EXIT
+	 * event on another CPU before the tracer had collected the CLONE event
+	 * that names it -- the two events were then pending at once, and when
+	 * the exit surfaced first, the tracer met a thread id it had never
+	 * been told about and the exit report was effectively lost.  A
+	 * short-lived thread under a debugger hit this about once in a hundred
+	 * runs.
+	 *
+	 * So a REPORTED thread is born parked, in the same silent state the
+	 * group stop uses (stopped, no event of its own -- the CLONE event on
+	 * its creator is what names it), and the machinery that already exists
+	 * releases it: the tracer's resume of the process runs
+	 * task_ptrace_group_resume(), which frees silent parks and only them.
+	 * The tracer therefore always learns the id before the thread has
+	 * executed an instruction, which is also what lets it plant
+	 * breakpoints in the thread before it starts.  An unreported thread is
+	 * released immediately, as before. */
+	if (report_clone) {
+		child->ptrace_stopped = 1;
+		child->ptrace_stop_signo = 0;
+		child->state = TASK_STOPPED;
+	} else {
+		sched_enqueue_ready(child);
+	}
 
-	if (report_clone)
+	if (report_clone) {
 		task_ptrace_stop(cur, SIGTRAP, PTRACE_EVENT_CLONE,
 				 (unsigned long)child_pid);
+
+		/* The stop can be REFUSED -- the tracer vanished between the
+		 * report_clone check and the stop's own tracer resolution,
+		 * which lazily clears our link.  Then nobody will ever
+		 * group-resume the parked child: release it here.
+		 *
+		 * Through a fresh lookup, never through the pointer: in the
+		 * NORMAL path the child was released while we were parked and
+		 * may have run, exited and been freed already.  Id plus
+		 * incarnation says whether the task in the slot is still the
+		 * one we made; still silently parked says nobody released it. */
+		if (cur->tracer_pid == 0) {
+			uint64_t lf;
+			task_t *c;
+
+			spin_lock_irqsave(&g_task_list_lock, &lf);
+			c = sched_find_task_by_id_locked((uint32_t)child_pid);
+			if (c && c->incarnation == child_incarnation &&
+			    c->ptrace_stopped && c->ptrace_stop_signo == 0 &&
+			    c->state == TASK_STOPPED) {
+				c->ptrace_stopped = 0;
+				c->tracer_pid = 0;
+			} else {
+				c = NULL;
+			}
+			spin_unlock_irqrestore(&g_task_list_lock, lf);
+			if (c && sched_claim_wake(c, TASK_STOPPED))
+				sched_enqueue_ready(c);
+		}
+	}
 
 	// Set need_resched so the parent yields at the next opportunity,
 	// giving the newly created thread a chance to start promptly.
