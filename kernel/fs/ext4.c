@@ -772,13 +772,32 @@ typedef struct {
 	volatile uint64_t owner; /* exclusive owner task id                */
 	volatile int wdepth; /* exclusive recursion depth              */
 	volatile int w_wait; /* writers queued (fairness hint)         */
+	/* The other half of fairness.  Deferring every new reader to any
+	 * queued writer keeps readers from starving mutators -- but with
+	 * nothing bounding the OTHER direction, a continuous stream of
+	 * mutators (each queuing while its predecessor holds) kept w_wait
+	 * nonzero for as long as the stream lasted, and a first-time reader
+	 * never got a turn at all.  Measured: an exec's path resolution
+	 * starved for over two seconds behind another process's file-creation
+	 * storm, so its tracer concluded the exec stop was never coming.
+	 *
+	 * So the sem alternates in phases: when an exclusive release finds
+	 * readers waiting, THAT cohort (r_wait of them) is admitted before
+	 * the next writer -- reader_turn stays set until the cohort has
+	 * drained, and writers queue behind it.  Readers arriving during the
+	 * cohort's turn wait for the next phase, so the alternation is
+	 * bounded in both directions: a reader waits out at most one
+	 * exclusive hold, a writer at most one cohort. */
+	volatile int r_wait; /* readers queued (cohort size)           */
+	volatile int reader_turn; /* queued cohort admitted before writers  */
 	spinlock_t lock; /* protects the fields above              */
 } ext4_rwsem_t;
 
 #define EXT4_RWSEM_INIT(name)                                        \
 	{                                                            \
 		.readers = 0, .writer = 0, .owner = (uint64_t)-1,    \
-		.wdepth = 0, .w_wait = 0, .lock = SPINLOCK_INIT(name) \
+		.wdepth = 0, .w_wait = 0, .r_wait = 0,               \
+		.reader_turn = 0, .lock = SPINLOCK_INIT(name)        \
 	}
 
 /* Park the current task on `sem`'s wait channel.  Same discipline as the
@@ -801,6 +820,7 @@ static void ext4_rwsem_read_lock(ext4_rwsem_t *sem)
 	might_sleep();
 	task_t *cur = sched_current();
 	uint64_t my_id = cur ? cur->id : 0;
+	int queued = 0;
 	while (1) {
 		uint64_t flags;
 		spin_lock_irqsave(&sem->lock, &flags);
@@ -811,13 +831,27 @@ static void ext4_rwsem_read_lock(ext4_rwsem_t *sem)
 			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
-		int defer_to_writers = sem->w_wait && !(cur && cur->fs_rdepth);
+		/* Defer to queued writers -- unless it is this cohort's turn,
+		 * or deferring would deadlock a nested shared acquisition. */
+		int defer_to_writers = sem->w_wait && !sem->reader_turn &&
+				       !(cur && cur->fs_rdepth);
 		if (!sem->writer && !defer_to_writers) {
 			sem->readers++;
 			if (cur)
 				cur->fs_rdepth++;
+			if (queued) {
+				sem->r_wait--;
+				/* Cohort drained: the phase is over and the
+				 * queued writers go next. */
+				if (sem->r_wait == 0)
+					sem->reader_turn = 0;
+			}
 			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
+		}
+		if (!queued) {
+			sem->r_wait++;
+			queued = 1;
 		}
 		ext4_rwsem_park(sem, &flags);
 	}
@@ -862,7 +896,12 @@ static void ext4_rwsem_write_lock(ext4_rwsem_t *sem)
 			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
-		if (!sem->writer && sem->readers == 0) {
+		/* A cohort of readers was promised this phase; grabbing the
+		 * sem in the gap before they wake would re-starve them (the
+		 * wake is not instantaneous, and a writer that slips in here
+		 * puts the whole stream ahead of them again). */
+		int reader_phase = sem->reader_turn && sem->r_wait > 0;
+		if (!sem->writer && sem->readers == 0 && !reader_phase) {
 			sem->writer = 1;
 			sem->owner = my_id;
 			sem->wdepth = 1;
@@ -892,6 +931,10 @@ static void ext4_rwsem_write_unlock(ext4_rwsem_t *sem)
 	sem->writer = 0;
 	sem->owner = (uint64_t)-1;
 	sem->wdepth = 0;
+	/* Waiting readers get the next turn, ahead of any queued writer --
+	 * see reader_turn in the struct. */
+	if (sem->r_wait > 0)
+		sem->reader_turn = 1;
 	spin_unlock_irqrestore(&sem->lock, flags);
 	sched_wake_channel((void *)sem);
 }
@@ -928,6 +971,8 @@ static void ext4_rwsem_init(ext4_rwsem_t *sem, const char *name)
 	sem->owner = (uint64_t)-1;
 	sem->wdepth = 0;
 	sem->w_wait = 0;
+	sem->r_wait = 0;
+	sem->reader_turn = 0;
 	spinlock_init(&sem->lock, name);
 }
 
