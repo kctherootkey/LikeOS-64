@@ -48,7 +48,52 @@ SYSROOT="${LIKEOS_SYSROOT:-$ROOT/build/xorg-sysroot}"
 ZLIB="$ROOT/ports/lib/zlib-1.3.1"
 OPENSSL="$ROOT/ports/openssl-3.5.6"
 
-GCC_INC="$(gcc -print-file-name=include)"
+# The build host's C++ compiler.
+#
+# Not plainly `g++', because the version of the host compiler is a build
+# requirement of its own here: VTE is C++23, and its meson.build asserts
+#
+#     ERROR: Assert failed: needs g++ >= 12.1 for gnu++23 support
+#
+# against anything older.  Ubuntu 22.04's default g++ is 11.4, so a machine that
+# builds every other package in this tree stops on that one alone -- which is a
+# property of the build host, not of the port.
+#
+# So: the default compiler when it is new enough, and otherwise the newest
+# versioned g++ installed beside it.  `make deps' puts g++-12 there when the
+# default is too old, and that is the whole of the arrangement: nothing else has
+# to know which compiler was chosen, because everything that compiles C++ for
+# this system comes through this file.  LIKEOS_CXX overrides the search, for a
+# compiler that is installed somewhere this would not look.
+#
+# likeos-cc deliberately does NOT do the same.  No C package in the tree asks
+# for a newer gcc than the distributions ship, and the workarounds its comments
+# record are for the older ones.
+cxx_new_enough() {
+	v=$("$1" -dumpfullversion -dumpversion 2>/dev/null | head -1)
+	[ -n "$v" ] || return 1
+	[ "$(printf '%s\n%s\n' 12.1 "$v" | sort -V | head -1)" = 12.1 ]
+}
+
+CXX="${LIKEOS_CXX:-}"
+if [ -z "$CXX" ]; then
+	CXX=g++
+	if ! cxx_new_enough g++; then
+		for c in g++-15 g++-14 g++-13 g++-12; do
+			command -v "$c" >/dev/null 2>&1 || continue
+			if cxx_new_enough "$c"; then
+				CXX=$c
+				break
+			fi
+		done
+	fi
+fi
+
+# GCC's own headers and start files come from the compiler that was chosen
+# above, never from the default gcc: mixing one release's <stddef.h> and
+# crtbeginS.o into another release's compile is a difference that shows up as
+# something else entirely.
+GCC_INC="$($CXX -print-file-name=include)"
 
 # Where the C++ headers come from.
 #
@@ -133,7 +178,7 @@ set +f
 NOT_FATAL="-Wno-error=array-bounds"
 
 if [ "$is_link" = "0" ]; then
-	exec g++ $INCLUDES $COMPILE_FLAGS "$@" $NOT_FATAL
+	exec "$CXX" $INCLUDES $COMPILE_FLAGS "$@" $NOT_FATAL
 fi
 
 LIBDIRS="-L$LIBC -L$RTLD -L$SYSROOT/usr/lib -L$ROOT/build -L$OPENSSL"
@@ -167,8 +212,8 @@ CXXLIBS="-lstdc++ -lc -l:ld-likeos.so -lgcc -lgcc_eh"
 # fails outright with "relocation R_X86_64_32 against hidden symbol __TMC_END__
 # can not be used when making a PIE object".  gcc's own driver picks the S
 # variant for -pie for the same reason.
-CRTBEGIN=$(gcc -print-file-name=crtbeginS.o)
-CRTEND=$(gcc -print-file-name=crtendS.o)
+CRTBEGIN=$($CXX -print-file-name=crtbeginS.o)
+CRTEND=$($CXX -print-file-name=crtendS.o)
 
 # ...unless the caller has already named them.  libstdc++'s own libtool link
 # passes crtbeginS.o and crtendS.o explicitly, and adding a second copy is not
@@ -191,14 +236,14 @@ done
 # reader is concerned.  With the libraries after it instead, ld rejects the
 # result outright: ".eh_frame_hdr refers to overlapping FDEs".
 if [ "$is_shared" = "1" ]; then
-	exec g++ $INCLUDES $COMPILE_FLAGS -nostdlib -shared \
+	exec "$CXX" $INCLUDES $COMPILE_FLAGS -nostdlib -shared \
 		-Wl,--hash-style=gnu -Wl,-Bsymbolic-functions \
 		-Wl,-z,relro \
 		$LIBDIRS $NO_HOST_LIBS $RPATH_LINK \
 		$CRTBEGIN "$@" $CXXLIBS $CRTEND
 fi
 
-exec g++ $INCLUDES $COMPILE_FLAGS \
+exec "$CXX" $INCLUDES $COMPILE_FLAGS \
 	-nostdlib -pie \
 	-Wl,-T,"$LDS" -Wl,--hash-style=gnu -Wl,-z,now -Wl,-z,relro \
 	-Wl,--export-dynamic \

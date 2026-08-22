@@ -2487,6 +2487,10 @@ gtk3-manpages:
 # in `deps` below.  Raise it when a package that needs more is added.
 MESON_MIN_VERSION = 1.4.0
 
+# The newest g++ any package in the tree asks for.  VTE 0.84 is C++23 and its
+# meson.build asserts this exact version; nothing else here is anywhere near it.
+GXX_MIN_VERSION = 12.1
+
 deps:
 	@echo "Installing build dependencies..."
 	sudo apt update
@@ -2515,6 +2519,50 @@ deps:
 	# GTK's manual-page sources into troff -- without it those packages
 	# configure with man pages silently off.
 	sudo apt install -y g++ gettext docbook-xsl docbook-xml itstool || true
+	# ...and g++ has to be a NEW ENOUGH one, which is a second requirement
+	# hiding inside the first.  VTE is C++23, and its meson.build checks the
+	# compiler's version rather than trusting -std=gnu++23 to be accepted:
+	#
+	#     meson.build:179:2: ERROR: Assert failed: needs g++ >= 12.1 for
+	#     gnu++23 support
+	#
+	# Ubuntu 22.04's default g++ is 11.4, so that one package stops a GTK3
+	# port whose other 45 packages build -- a property of the build machine,
+	# not of the port, exactly like the meson version below.
+	#
+	# jammy carries g++-12 in universe beside the default compiler.
+	# Installing it changes nothing about what `g++' means on this machine,
+	# and nothing else needs to be told: ports/xorg/toolchain/likeos-c++ is
+	# the single door every C++ compile for the target goes through, and it
+	# picks the newest versioned g++ it can find whenever the default is too
+	# old.  (LIKEOS_CXX=... overrides that, for a compiler installed
+	# somewhere apt did not put it.)
+	@have=$$(g++ -dumpfullversion -dumpversion 2>/dev/null | head -1); \
+	need=$(GXX_MIN_VERSION); \
+	if [ -n "$$have" ] && \
+	   [ "$$(printf '%s\n%s\n' "$$need" "$$have" | sort -V | head -1)" = "$$need" ]; then \
+		echo "g++ $$have is new enough (need >= $$need)"; \
+	else \
+		echo "g++ $${have:-(none)} is older than $$need -- installing a versioned g++ beside it"; \
+		got=0; \
+		for v in 15 14 13 12; do \
+			if command -v g++-$$v >/dev/null 2>&1 && \
+			   [ "$$(printf '%s\n%s\n' "$$need" "$$(g++-$$v -dumpfullversion -dumpversion)" | sort -V | head -1)" = "$$need" ]; then \
+				got=$$v; break; \
+			fi; \
+		done; \
+		if [ "$$got" = 0 ]; then \
+			for v in 15 14 13 12; do \
+				apt-cache show g++-$$v >/dev/null 2>&1 || continue; \
+				if sudo apt install -y g++-$$v; then got=$$v; break; fi; \
+			done; \
+		fi; \
+		if [ "$$got" = 0 ]; then \
+			echo "WARNING: no g++ >= $$need available; the GTK3 port's vte package will not configure"; \
+		else \
+			echo "  using g++-$$got for the port's C++ (through toolchain/likeos-c++)"; \
+		fi; \
+	fi
 	# The apt meson is not always new enough.  GLib's meson.build asks for
 	# >= 1.4.0 and Ubuntu 24.04 ships 1.3.2, so the port stops there with
 	#

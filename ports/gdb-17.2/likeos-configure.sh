@@ -90,6 +90,16 @@ ln -sfn "$toolchain/likeos-cc" "$toolbin/x86_64-unknown-likeos-gcc"
 ln -sfn "$toolchain/likeos-c++" "$toolbin/x86_64-unknown-likeos-g++"
 ln -sfn "$toolchain/likeos-c++" "$toolbin/x86_64-unknown-likeos-c++"
 
+# pkg-config under the target-prefixed name as well, and pointing at the
+# sysroot-confined wrapper rather than the host's.
+#
+# autoconf's PKG_PROG_PKG_CONFIG looks for $host-pkg-config before plain
+# pkg-config, and every sub-configure gdb runs at MAKE time -- bfd's among them
+# -- searches this PATH.  Naming it here is what makes the confinement hold for
+# those too, rather than only for the top-level run below where PKG_CONFIG is
+# set in the environment.
+ln -sfn "$toolchain/likeos-pkg-config" "$toolbin/x86_64-unknown-likeos-pkg-config"
+
 PATH="$toolbin:$PATH"
 export PATH
 
@@ -105,8 +115,26 @@ cd "$bld"
 #   complete without it.
 # --disable-sim/--disable-libctf: a CPU simulator and the CTF debug format,
 #   neither of which anything here produces or needs.
+#
+# --without-zstd/--without-debuginfod: both default to `auto', and both are
+#   probed with PKG_CHECK_MODULES -- pkg-config alone, with no test that
+#   compiles anything.  That is the one probe shape a cross build cannot
+#   survive by accident: every other optional dependency here (lzma, xxhash,
+#   babeltrace ...) is probed by compiling a program that includes its header,
+#   which fails under likeos-cc's -nostdinc and correctly comes out `no'.  The
+#   pkg-config ones just see the BUILD host's libraries and say yes.  On a
+#   machine with libzstd-dev installed that ends as
+#
+#     src/bfd/compress.c:24:10: fatal error: zstd.h: No such file or directory
+#
+#   two thousand files into the build, and on a machine without it the same
+#   tree builds -- which is how this came in as "works in the VM, fails on the
+#   laptop".  PKG_CONFIG above confines the probes to the sysroot and is the
+#   general guard; these two say outright that the features are not built,
+#   because neither library is ported.
 CC="$toolchain/likeos-cc" \
 CXX="$toolchain/likeos-c++" \
+PKG_CONFIG="$toolchain/likeos-pkg-config" \
 LIKEOS_SYSROOT="$sysroot" \
 	"$src/configure" \
 	--host=x86_64-unknown-likeos --build="$(gcc -dumpmachine)" \
@@ -115,6 +143,7 @@ LIKEOS_SYSROOT="$sysroot" \
 	--disable-sim --disable-libctf \
 	--disable-tui --disable-nls --disable-werror \
 	--with-expat --with-system-zlib \
+	--without-zstd --without-debuginfod \
 	--with-gmp="$sysroot/usr" --with-mpfr="$sysroot/usr"
 
 echo "likeos-configure.sh: gdb configured for LikeOS-64 in build/"
