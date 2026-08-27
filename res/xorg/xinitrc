@@ -117,6 +117,40 @@ XCURSOR_THEME=LikeOS
 XCURSOR_SIZE=32
 export XCURSOR_THEME XCURSOR_SIZE
 
+# WebKit: accelerated compositing is ON, and this is where it used to be
+# switched off.
+#
+# WEBKIT_DISABLE_DMABUF_RENDERER=1 was exported here while the system had no
+# GL at all -- no Mesa, no libEGL -- because libepoxy abort()s the process
+# the moment an EGL entry point is called with no libEGL.so.1 to load, which
+# is how Claws Mail died on its first HTML message.  Mesa with llvmpipe now
+# provides EGL (see eglinfo) and the server provides GLX, so that danger is
+# gone.  The variable is worse than unnecessary now: WebKit reads it FIRST in
+# AcceleratedBackingStore::rendererBufferTransportMode(), reports no
+# transport at all, HardwareAccelerationManager concludes hardware
+# acceleration is unavailable, webkit://gpu shows "Policy: never" -- and
+# WebGL, which needs a composited canvas, is refused with "disabled or
+# unavailable" no matter what the settings say.
+#
+# What WebKit does with it unset: EGL_MESA_platform_surfaceless is present,
+# so the web process renders through llvmpipe and hands frames over as shared
+# memory (there is no GBM/DMA-BUF here, so the "Hardware" transport never
+# engages).  GTK's own GL check goes through GLX, which is why server-side
+# GLX is a prerequisite.  To fall back for debugging, export the variable
+# from a shell before starting luakit -- not here.
+#
+# Composite ON DEMAND, not always.  With acceleration available WebKit
+# defaults to forcing every page through the compositor: each layer is
+# painted into a GL texture by llvmpipe, composed with GL again, read back
+# into shared memory and uploaded by the UI process -- several full-screen
+# software passes per scroll step, where the cairo path needs one.  A GPU
+# makes that a win; llvmpipe on a VM made freebsd.org unscrollable.  With
+# forcing off, plain pages take the cairo path they always did and only
+# content that needs compositing (WebGL canvases, 3D transforms) gets it --
+# so get.webgl.org still renders and everything else is fast again.
+WEBKIT_FORCE_COMPOSITING_MODE=0
+export WEBKIT_FORCE_COMPOSITING_MODE
+
 # No terminal is started here on purpose.  Use "Xterm" on the window manager's
 # menu, which is Alt+F1 -- the menus are on keys rather than mouse buttons
 # because the desktop below owns all three buttons (see system.ctwmrc).

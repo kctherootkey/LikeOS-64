@@ -291,13 +291,16 @@ done
 #
 # configfsf.sub is checked as well, because that wrapper is what GMP delegates
 # to and replacing only the outer file would leave the rejection in place.
-for sub in config.sub configfsf.sub; do
+# autosetup-config.sub as well: SQLite's amalgamation build moved from
+# autoconf to autosetup, which carries the same validation script under its
+# own name in autosetup/.  Everything said above applies unchanged.
+for sub in config.sub configfsf.sub autosetup/autosetup-config.sub; do
 	[ -f "$sub" ] || continue
 	./"$sub" x86_64-unknown-likeos >/dev/null 2>&1 && continue
 	cp -f "$TOOLCHAIN/config.sub" "$sub"
 	chmod 755 "$sub"
 done
-for guess in config.guess configfsf.guess; do
+for guess in config.guess configfsf.guess autosetup/autosetup-config.guess; do
 	[ -f "$guess" ] || continue
 	./"$guess" >/dev/null 2>&1 && continue
 	cp -f "$TOOLCHAIN/config.guess" "$guess"

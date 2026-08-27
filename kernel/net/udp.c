@@ -234,6 +234,12 @@ void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port, uint32_t dst_ip,
 	uint64_t flags;
 	spin_lock_irqsave(&sk->lock, &flags);
 
+	if (!sk->udp_rx_queue) {
+		/* Slot mid-teardown: sock_close detaches the queue under
+		 * s->lock before freeing it. */
+		spin_unlock_irqrestore(&sk->lock, flags);
+		return;
+	}
 	int next = (sk->udp_rx_tail + 1) % 16;
 	if (next == sk->udp_rx_head) {
 		// Queue full, drop packet

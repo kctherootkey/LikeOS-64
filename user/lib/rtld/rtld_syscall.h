@@ -111,7 +111,7 @@ static inline void rtld_write_str(const char* s) {
     while (s[n]) n++;
     __syscall3(__NR_write, 1, (long)s, (long)n);
 }
-static inline void rtld_exit(int code) {
+__attribute__((noreturn)) static inline void rtld_exit(int code) {
     __syscall1(__NR_exit, code);
     __builtin_unreachable();
 }

@@ -52,20 +52,107 @@ typedef struct {
 static dns_cache_entry_t dns_cache[DNS_CACHE_SIZE];
 static int dns_cache_next = 0; // Next slot to use (round-robin)
 
-// Response buffer for async receive.
-//
-// dns_rx() fills this from the network receive path while a resolver is
-// spinning on dns_rx_ready in task context, so the id and the buffer MUST be
-// read together, under dns_lock.  Reading the id, deciding the buffer is ours,
-// and only then copying it out is a check-then-use race: another lookup's reply
-// can land in between and get copied out as our answer.  A reverse lookup
-// answering NXDOMAIN (routine, and netstat/ping do them constantly) then
-// surfaces as NXDOMAIN for a perfectly good name.
-static uint8_t dns_rx_buf[DNS_MAX_PACKET];
-static int dns_rx_len = 0;
-static uint16_t dns_rx_id = 0;
-static volatile int dns_rx_ready = 0;
+/* Per-query reply slots.
+ *
+ * The resolver used to keep ONE reply buffer for the whole system, and a
+ * page load fires a dozen lookups at once (every ad/CDN domain): each reply
+ * overwrote the previous one, one waiter won, everyone else resent and
+ * waited again.  Serializing the queries (the first fix) removed the fight
+ * but made a burst of N lookups cost N round trips end to end -- still
+ * seconds of stall on ad-heavy pages.  A slot per in-flight query, matched
+ * by the 16-bit transaction id, lets them all run concurrently: a burst
+ * costs ONE round trip.  Id collisions between two live queries are a
+ * 1-in-65536 lottery per pair; the loser times out and retries with a new
+ * id, which is the same recovery a lost packet gets. */
+#define DNS_INFLIGHT 16
+typedef struct {
+	int in_use;
+	uint16_t id;
+	volatile int ready;
+	int len;
+	uint8_t buf[DNS_MAX_PACKET];
+} dns_slot_t;
+static dns_slot_t dns_slots[DNS_INFLIGHT];
 static spinlock_t dns_lock = SPINLOCK_INIT("dns");
+
+static dns_slot_t *dns_slot_claim(uint16_t id)
+{
+	uint64_t f;
+	spin_lock_irqsave(&dns_lock, &f);
+	for (int i = 0; i < DNS_INFLIGHT; i++) {
+		if (!dns_slots[i].in_use) {
+			dns_slots[i].in_use = 1;
+			dns_slots[i].id = id;
+			dns_slots[i].ready = 0;
+			dns_slots[i].len = 0;
+			spin_unlock_irqrestore(&dns_lock, f);
+			return &dns_slots[i];
+		}
+	}
+	spin_unlock_irqrestore(&dns_lock, f);
+	return NULL; /* all in flight; caller falls back to waiting */
+}
+
+static void dns_slot_rearm(dns_slot_t *slot)
+{
+	uint64_t f;
+	spin_lock_irqsave(&dns_lock, &f);
+	slot->ready = 0;
+	slot->len = 0;
+	spin_unlock_irqrestore(&dns_lock, f);
+}
+
+static void dns_slot_release(dns_slot_t *slot)
+{
+	uint64_t f;
+	spin_lock_irqsave(&dns_lock, &f);
+	slot->in_use = 0;
+	spin_unlock_irqrestore(&dns_lock, f);
+}
+
+/* Wait for dns_rx() to post a reply into THIS query's slot, parking instead
+ * of burning the CPU.  Park on the slot's ready flag exactly the way
+ * sock_recv parks on rx_ready: mark BLOCKED, re-check, un-park via CAS if
+ * the waker fired in between (see the wake-claim memory -- a blind state
+ * write races the waker's claim), and let the timer sweep wake us at the
+ * deadline.  dns_rx() wakes the slot's channel from the receive path.
+ * Returns 0 when a reply is ready, negative on timeout/signal. */
+static int dns_wait_reply(dns_slot_t *slot, uint64_t deadline)
+{
+	while (!slot->ready) {
+		if (timer_ticks() >= deadline)
+			return -ETIMEDOUT;
+		task_t *cur = sched_current();
+		if (!cur) {
+			/* No scheduler context (early boot): spin as before. */
+			__asm__ volatile("pause");
+			continue;
+		}
+		if (signal_pending(cur))
+			return -EINTR;
+		cur->wait_channel = (void *)&slot->ready;
+		cur->wakeup_tick = deadline;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		cur->state = TASK_BLOCKED;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		if (slot->ready) {
+			task_state_t expected = TASK_BLOCKED;
+			if (__atomic_compare_exchange_n(&cur->state, &expected,
+							TASK_RUNNING, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				cur->wait_channel = NULL;
+				cur->wakeup_tick = 0;
+				break;
+			}
+			/* Waker claimed us; reconcile through the scheduler. */
+		}
+		sched_schedule();
+		cur->wait_channel = NULL;
+		cur->wakeup_tick = 0;
+	}
+	return 0;
+}
 
 /* Does `resp` answer the question `query` asked?
  *
@@ -360,16 +447,29 @@ void dns_rx(const uint8_t *data, uint16_t len)
 	if (!(flags & DNS_FLAG_QR))
 		return;
 
-	// Copy to response buffer.  Under dns_lock so a resolver cannot observe
-	// this id paired with a different reply's bytes.
+	/* Deliver into the slot whose query id this reply answers.  Under
+	 * dns_lock so a resolver cannot observe the ready flag paired with a
+	 * different reply's bytes.  No matching slot means a straggler for a
+	 * query that already timed out (or a spoof) -- dropped. */
+	dns_slot_t *hit = NULL;
 	uint64_t lflags;
 	spin_lock_irqsave(&dns_lock, &lflags);
-	for (int i = 0; i < len; i++)
-		dns_rx_buf[i] = data[i];
-	dns_rx_len = len;
-	dns_rx_id = id;
-	dns_rx_ready = 1;
+	for (int i = 0; i < DNS_INFLIGHT; i++) {
+		if (dns_slots[i].in_use && dns_slots[i].id == id &&
+		    !dns_slots[i].ready) {
+			for (int b = 0; b < len; b++)
+				dns_slots[i].buf[b] = data[b];
+			dns_slots[i].len = len;
+			dns_slots[i].ready = 1;
+			hit = &dns_slots[i];
+			break;
+		}
+	}
 	spin_unlock_irqrestore(&dns_lock, lflags);
+	/* Outside the lock, same as every other rx path: the wake takes
+	 * scheduler locks of its own. */
+	if (hit)
+		sched_wake_channel((void *)&hit->ready);
 }
 
 // ============================================================================
@@ -450,55 +550,69 @@ int dns_resolve(const char *hostname, uint32_t *ip_out)
 	if (query_len < 0)
 		return -EINVAL;
 
+	/* Claim an in-flight slot; every concurrent lookup gets its own, so a
+	 * page load's burst of resolutions costs one round trip, not N.  A
+	 * full table (16 lookups already in flight) briefly yields -- the
+	 * holders finish in a round trip each. */
+	dns_slot_t *slot;
+	while ((slot = dns_slot_claim(query_id)) == NULL) {
+		task_t *cur = sched_current();
+		if (cur && signal_pending(cur))
+			return -EINTR;
+		sched_yield_in_kernel();
+	}
+	int rc = -ETIMEDOUT;
+
 	// Send query and wait for response
 	for (int retry = 0; retry < DNS_MAX_RETRIES; retry++) {
-		/* Arm for this attempt under the lock: an unlocked reset can
-		 * clobber a reply dns_rx() is landing right now, leaving
-		 * ready=1 with len=0. */
-		uint64_t aflags;
-		spin_lock_irqsave(&dns_lock, &aflags);
-		dns_rx_ready = 0;
-		dns_rx_len = 0;
-		spin_unlock_irqrestore(&dns_lock, aflags);
+		/* Arm the slot for this attempt under the lock: an unlocked
+		 * reset can clobber a reply dns_rx() is landing right now,
+		 * leaving ready=1 with len=0. */
+		dns_slot_rearm(slot);
 
 		int ret = udp_send(dev, dns_server, DNS_CLIENT_PORT, DNS_PORT,
 				   query_buf, (uint16_t)query_len);
-		if (ret < 0)
-			return ret;
-
-		// Wait for response with timeout
-		uint64_t start = timer_ticks();
-		while (!dns_rx_ready) {
-			if (timer_ticks() - start > DNS_TIMEOUT_MS)
-				break;
-			// Yield CPU — simplified busy-wait with pause
-			__asm__ volatile("pause");
+		if (ret < 0) {
+			rc = ret;
+			goto out;
 		}
 
-		if (!dns_rx_ready)
-			continue; // Timeout, retry
+		/* Park until dns_rx() posts a reply into our slot or the
+		 * attempt times out.  A signal ends the lookup NOW: retrying
+		 * with it still pending would just burn every retry the same
+		 * way. */
+		{
+			int w = dns_wait_reply(
+				slot, timer_ticks() +
+					      timer_ms_to_ticks(
+						      DNS_TIMEOUT_MS));
+			if (w == -EINTR) {
+				rc = -EINTR;
+				goto out;
+			}
+			if (w < 0)
+				continue; // Timeout, retry
+		}
 
-		/* Take the id and the bytes together, then work only from the
-		 * snapshot.  Checking dns_rx_id and afterwards parsing the live
-		 * dns_rx_buf lets a reply that arrives in between be parsed as
-		 * ours. */
+		if (!slot->ready)
+			continue; // Spurious wake, retry
+
+		/* Snapshot the slot under the lock, then work only from the
+		 * snapshot -- dns_rx never overwrites a ready slot, but the
+		 * copy under the lock keeps the pairing airtight. */
 		uint8_t snap[DNS_MAX_PACKET];
 		int snap_len;
-		uint16_t snap_id;
 		uint64_t lflags;
 		spin_lock_irqsave(&dns_lock, &lflags);
-		snap_len = dns_rx_len;
-		snap_id = dns_rx_id;
+		snap_len = slot->len;
 		if (snap_len < 0)
 			snap_len = 0;
 		if (snap_len > DNS_MAX_PACKET)
 			snap_len = DNS_MAX_PACKET;
 		for (int i = 0; i < snap_len; i++)
-			snap[i] = dns_rx_buf[i];
+			snap[i] = slot->buf[i];
 		spin_unlock_irqrestore(&dns_lock, lflags);
 
-		if (snap_id != query_id)
-			continue; // Wrong response, retry
 		if (!dns_answers_our_question(snap, snap_len, query_buf,
 					      query_len))
 			continue; // id collided with a straggler — not ours
@@ -509,13 +623,17 @@ int dns_resolve(const char *hostname, uint32_t *ip_out)
 		    0) {
 			*ip_out = ip;
 			dns_cache_insert(hostname, ip, ttl);
-			return 0;
+			rc = 0;
+			goto out;
 		}
 		// Parse failed — don't retry, it's a definitive error
-		return -ENOENT;
+		rc = -ENOENT;
+		goto out;
 	}
 
-	return -ETIMEDOUT;
+out:
+	dns_slot_release(slot);
+	return rc;
 }
 
 // ============================================================================
@@ -526,7 +644,8 @@ void dns_init(void)
 	for (int i = 0; i < DNS_CACHE_SIZE; i++) {
 		dns_cache[i].valid = 0;
 	}
-	dns_rx_ready = 0;
+	for (int i = 0; i < DNS_INFLIGHT; i++)
+		dns_slots[i].in_use = 0;
 }
 
 // ============================================================================
@@ -587,60 +706,68 @@ int dns_query_raw(const char *name, uint16_t qtype, uint8_t *response,
 	if (query_len < 0)
 		return -EINVAL;
 
+	/* Own in-flight slot, same as dns_resolve. */
+	dns_slot_t *slot;
+	while ((slot = dns_slot_claim(query_id)) == NULL) {
+		task_t *cur = sched_current();
+		if (cur && signal_pending(cur))
+			return -EINTR;
+		sched_yield_in_kernel();
+	}
+	int rc = -ETIMEDOUT;
+
 	for (int retry = 0; retry < DNS_MAX_RETRIES; retry++) {
-		/* Arm for this attempt under the lock: an unlocked reset can
-		 * clobber a reply dns_rx() is landing right now, leaving
-		 * ready=1 with len=0. */
-		uint64_t aflags;
-		spin_lock_irqsave(&dns_lock, &aflags);
-		dns_rx_ready = 0;
-		dns_rx_len = 0;
-		spin_unlock_irqrestore(&dns_lock, aflags);
+		dns_slot_rearm(slot);
 
 		int ret = udp_send(dev, dns_server, DNS_CLIENT_PORT, DNS_PORT,
 				   query_buf, (uint16_t)query_len);
-		if (ret < 0)
-			return ret;
-
-		uint64_t start = timer_ticks();
-		while (!dns_rx_ready) {
-			if (timer_ticks() - start > DNS_TIMEOUT_MS)
-				break;
-			__asm__ volatile("pause");
+		if (ret < 0) {
+			rc = ret;
+			goto out;
 		}
 
-		if (!dns_rx_ready)
+		{
+			int w = dns_wait_reply(
+				slot, timer_ticks() +
+					      timer_ms_to_ticks(
+						      DNS_TIMEOUT_MS));
+			if (w == -EINTR) {
+				rc = -EINTR;
+				goto out;
+			}
+			if (w < 0)
+				continue;
+		}
+
+		if (!slot->ready)
 			continue;
 
-		/* Copy the id and the bytes out together, then decide.  The old
-		 * order — test dns_rx_id, then copy dns_rx_buf — let a reply
-		 * arriving in between be handed back as the answer to this query.
-		 * That is how a valid name came back NXDOMAIN: the bytes copied
-		 * were some other lookup's (a PTR NXDOMAIN is routine). */
+		/* Snapshot the slot under the lock -- the pairing of id and
+		 * bytes is airtight because dns_rx fills a slot only when its
+		 * id matches and it is not already ready. */
 		int copy_len;
-		uint16_t got_id;
 		uint64_t lflags;
 		spin_lock_irqsave(&dns_lock, &lflags);
-		copy_len = dns_rx_len;
-		got_id = dns_rx_id;
+		copy_len = slot->len;
 		if (copy_len < 0)
 			copy_len = 0;
 		if (copy_len > max_len)
 			copy_len = max_len;
 		for (int i = 0; i < copy_len; i++)
-			response[i] = dns_rx_buf[i];
+			response[i] = slot->buf[i];
 		spin_unlock_irqrestore(&dns_lock, lflags);
 
-		if (got_id != query_id)
-			continue; // Someone else's answer — retry
 		if (!dns_answers_our_question(response, copy_len, query_buf,
 					      query_len))
 			continue; // id collided with a straggler — not ours
 
-		return copy_len;
+		rc = copy_len;
+		goto out;
 	}
 
-	return -ETIMEDOUT;
+out:
+	dns_slot_release(slot);
+	return rc;
 }
 
 // ============================================================================

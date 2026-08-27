@@ -27,6 +27,16 @@
 # library has to match.
 -         gcc                13.3.0   https://ftp.gnu.org/gnu/gcc/gcc-%VERSION%/gcc-%VERSION%.tar.xz
 
+# ---- ICU ----------------------------------------------------------------
+# The Unicode and localisation library, for WebKit -- which requires it
+# outright (find_package(ICU REQUIRED)) and also requires HarfBuzz's ICU
+# integration, which is why this sits ABOVE harfbuzz in the order.  Built
+# twice from one tree like GLib: the cross build packages its data library by
+# RUNNING the tools (genrb, pkgdata), so a native copy of them is built first
+# and pointed at with --with-cross-build.  The tarball is the icu4c source
+# release; its top-level directory is plain "icu", which unpack.sh renames.
+-         icu                78.3     https://github.com/unicode-org/icu/releases/download/release-78.3/icu4c-78.3-sources.tgz
+
 # ---- GLib and its dependencies ------------------------------------------
 # libffi is how GObject calls a closure whose signature is only known at run
 # time (signals, bindings); PCRE2 is GRegex.
@@ -122,7 +132,9 @@
 -         libetpan           1.10.1   https://github.com/dinhvh/libetpan/archive/refs/tags/%VERSION%.tar.gz
 
 # ---- the applications ---------------------------------------------------
--         claws-mail         4.4.0    https://www.claws-mail.org/releases/claws-mail-%VERSION%.tar.xz
+# Claws Mail moved BELOW WebKitGTK: its fancy plugin (the HTML viewer) links
+# webkit2gtk-4.1, and configure --enable-fancy-plugin fails hard if the
+# library is not in the sysroot yet.  See the end of this manifest.
 
 # ---- Mousepad and what it edits with ------------------------------------
 # libxml2 is here rather than in the X manifest because nothing below GTK
@@ -266,3 +278,94 @@
 # the tools.  Its only dependency is expat, which the X.Org port already
 # provides for fontconfig.
 -         dbus               1.16.2   https://dbus.freedesktop.org/releases/dbus/dbus-%VERSION%.tar.xz
+
+# ---- the WebKit platform ------------------------------------------------
+# Everything below exists for one consumer each unless said otherwise:
+# WebKitGTK is the engine, luakit the browser driving it, and Claws Mail's
+# fancy plugin renders HTML mail with it.
+#
+# sqlite: WebKit's storage (localStorage, IndexedDB, the HTTP cache index)
+# and luakit's bookmarks and history.  The autoconf amalgamation tarball.
+-         sqlite-autoconf    3530400  https://sqlite.org/2026/sqlite-autoconf-%VERSION%.tar.gz
+# brotli and woff2: downloadable-font decompression.  WOFF2 is the format
+# webfonts actually arrive in; brotli is the compression under it.  Both are
+# small CMake libraries from the same stable (tag exports; neither project
+# publishes release tarballs).
+-         brotli             1.1.0    https://github.com/google/brotli/archive/refs/tags/v%VERSION%.tar.gz
+-         woff2              1.0.2    https://github.com/google/woff2/archive/refs/tags/v%VERSION%.tar.gz
+# libwebp: the WebP image decoder, a required WebKit dependency (with its
+# demux component, which is what WebKit actually asks pkg-config for).
+-         libwebp            1.6.0    https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-%VERSION%.tar.gz
+# libgcrypt (over libgpg-error): the WebCrypto implementation the GTK port
+# requires (USE_GCRYPT is not optional there).  libtasn1, its companion for
+# certificate handling, is already above for GnuTLS.
+-         libgpg-error       1.61     https://www.gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-%VERSION%.tar.bz2
+-         libgcrypt          1.12.2   https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%VERSION%.tar.bz2
+# libpsl: the public-suffix list, which is how libsoup decides where a cookie
+# may be scoped.  IDNA through the ICU built above.
+-         libpsl             0.23.3   https://github.com/rockdaboot/libpsl/releases/download/%VERSION%/libpsl-%VERSION%.tar.gz
+# nghttp2: HTTP/2 framing for libsoup.  Only the C library is built
+# (--enable-lib-only); the bundled tools are C++23 programs nothing ships.
+-         nghttp2            1.70.0   https://github.com/nghttp2/nghttp2/releases/download/v%VERSION%/nghttp2-%VERSION%.tar.xz
+# libxslt: WebKit's XSLTProcessor, over the libxml2 already built above.
+-         libxslt            1.1.45   https://download.gnome.org/sources/libxslt/1.1/libxslt-%VERSION%.tar.xz
+# libsoup 3: the HTTP stack of the webkit2gtk-4.1 API line.
+-         libsoup            3.6.6    https://download.gnome.org/sources/libsoup/3.6/libsoup-%VERSION%.tar.xz
+# glib-networking: the GIO TLS module (GnuTLS backend).  Without it libsoup
+# can speak only plain http:// -- every https:// connection fails with
+# "TLS support is not available".  Purely a runtime module, dlopen'd from
+# /usr/lib/gio/modules.
+-         glib-networking    2.80.1   https://download.gnome.org/sources/glib-networking/2.80/glib-networking-%VERSION%.tar.xz
+# ---- XF86VidMode, for GLX -----------------------------------------------
+# libGL's GLX code uses the VidMode extension for gamma queries; the header
+# and library are hard includes in Mesa's glxcmds.c, so they come first.
+-         xf86vidmodeproto   2.3.1    https://www.x.org/releases/individual/proto/xf86vidmodeproto-%VERSION%.tar.gz
+-         libXxf86vm         1.1.6    https://www.x.org/releases/individual/lib/libXxf86vm-%VERSION%.tar.xz
+
+# ---- Mesa / llvmpipe ----------------------------------------------------
+# Software OpenGL for the whole desktop: WebKit's accelerated compositing,
+# GTK's GL paths and the GLX/EGL clients all land on llvmpipe, Mesa's
+# LLVM-JIT rasterizer.  llvmpipe needs LLVM built FOR THE TARGET -- the JIT
+# runs inside the target process -- which is why the biggest package in the
+# whole port sits here.  LLVM only (no clang/lld), X86 backend only, one
+# shared libLLVM.  The tarball's inner directory is llvm-project-*.src;
+# unpack.sh renames it to llvm-<version> like everything else.
+-         llvm               23.1.0   https://github.com/llvm/llvm-project/releases/download/llvmorg-%VERSION%/llvm-project-%VERSION%.src.tar.xz
+# Mesa itself.  gallium llvmpipe (+ softpipe as the no-JIT fallback),
+# platform x11, GLX (dri path over the software winsys -- system 'likeos'
+# has no KMS/DRM, so Mesa selects drisw and renders through XShm), and real
+# EGL, which retires the hand-written libEGL stub the port carried while
+# there was no GL at all.
+-         mesa               25.3.6   https://archive.mesa3d.org/mesa-%VERSION%.tar.xz
+# GLU, the classic GL utility library: quadrics, tessellation, projection
+# helpers.  mesa-demos requires it, and so does a long tail of older GL
+# programs.
+-         glu                9.0.3    https://archive.mesa3d.org/glu/glu-%VERSION%.tar.xz
+# The classic GL clients -- glxinfo, glxgears, eglinfo and friends -- both as
+# the standard proof that GL works at all and as the programs a user expects
+# on an X desktop with OpenGL.
+-         mesa-demos         9.0.0    https://archive.mesa3d.org/demos/mesa-demos-%VERSION%.tar.xz
+
+# The engine itself.  2.52.6 is the newest stable release that still ships
+# the GTK3 API (webkit2gtk-4.1); the GTK4-only builds do not apply here.
+-         webkitgtk          2.52.6   https://webkitgtk.org/releases/webkitgtk-%VERSION%.tar.xz
+
+# ---- the applications, part two -----------------------------------------
+# Claws Mail, moved from above the WebKit chain: --enable-fancy-plugin makes
+# its configure require webkit2gtk-4.1, so it has to follow the engine.
+-         claws-mail         4.4.0    https://www.claws-mail.org/releases/claws-mail-%VERSION%.tar.xz
+
+# ---- luakit and its Lua -------------------------------------------------
+# Lua 5.1.5: luakit is written against Lua 5.1 (or LuaJIT, which is a far
+# larger port for no functional gain here) -- its build looks for lua-5.1 and
+# nothing newer, so the last release of the 5.1 line is the right version,
+# the same way GTK3 pins the toolkits it needs.  Built twice like GLib and
+# ICU: the build host needs the interpreter to run luakit's code generators,
+# the target needs the library luakit links.
+-         lua                5.1.5    https://www.lua.org/ftp/lua-%VERSION%.tar.gz
+# LuaFileSystem: luakit require()s "lfs" at startup for its download and
+# session handling.  A tag export (tag v1_9_0); the explicit URL carries the
+# upstream tag spelling while the column keeps the dotted version.
+-         luafilesystem      1.9.0    https://github.com/lunarmodules/luafilesystem/archive/refs/tags/v1_9_0.tar.gz
+# The browser.
+-         luakit             2.4.0    https://github.com/luakit/luakit/archive/refs/tags/%VERSION%.tar.gz

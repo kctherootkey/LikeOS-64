@@ -882,6 +882,18 @@ static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 	 * arithmetic against percpu_get(0) printed garbage; use the real id. */
 	uint32_t cpu_id = cpu->cpu_id;
 
+	/* A task whose task_t has been freed must never enter a queue: picking
+	 * it later means restoring context (FPU state pointer included) from
+	 * freed, reused memory -- a GPF at best, silent register corruption of
+	 * an innocent process at worst.  The WARN names the enqueue that held
+	 * the stale pointer; the refusal keeps the system alive. */
+	if (task->alive_magic != TASK_MAGIC_ALIVE) {
+		WARN_RATELIMIT(1,
+			       "rq_enqueue: refusing task %p with magic %x (freed task_t?)",
+			       (void *)task, task->alive_magic);
+		return;
+	}
+
 	/* Already queued.  Refusing is right -- it is queued, so it will run --
 	 * but only if it is REALLY queued.  If `on_rq' is set while the task is
 	 * in no queue at all, refusing here throws the wakeup away and the task
@@ -1578,6 +1590,7 @@ void sched_init(void)
 
 	// Bootstrap task (kernel main loop, always CPU 0)
 	mm_memset(&g_bootstrap_task, 0, sizeof(task_t));
+	g_bootstrap_task.alive_magic = TASK_MAGIC_ALIVE;
 	g_bootstrap_task.sp = 0;
 	g_bootstrap_task.pml4 = NULL;
 	g_bootstrap_task.entry = 0;
@@ -1647,6 +1660,10 @@ static task_t *sched_add_kthread(task_entry_t entry, void *arg, void *stack_mem,
 	*(--sp) = 0; // r15
 
 	mm_memset(t, 0, sizeof(task_t));
+	/* Stamp AFTER the zeroing wipes the struct -- stamping at kalloc time
+	 * was erased right here, and every new task was then refused by the
+	 * enqueue liveness gate (boot hung with "magic 0" warnings). */
+	t->alive_magic = TASK_MAGIC_ALIVE;
 	t->sp = sp;
 	t->pml4 = NULL;
 	t->entry = entry;
@@ -1735,6 +1752,10 @@ task_t *sched_add_user_task(task_entry_t entry, void *arg, uint64_t *pml4,
 	*(--k_sp) = 0; // r15
 
 	mm_memset(t, 0, sizeof(task_t));
+	/* Stamp AFTER the zeroing wipes the struct -- stamping at kalloc time
+	 * was erased right here, and every new task was then refused by the
+	 * enqueue liveness gate (boot hung with "magic 0" warnings). */
+	t->alive_magic = TASK_MAGIC_ALIVE;
 	t->sp = k_sp;
 	t->pml4 = pml4;
 	t->entry = entry;
@@ -2985,6 +3006,9 @@ void sched_remove_task(task_t *task)
 	 * one -- including a thread's empty one.  Released here, with the
 	 * task_t it belongs to. */
 	mm_regions_free(task);
+	/* From this instant, any pointer to this task_t is stale; the enqueue
+	 * check keys on this. */
+	task->alive_magic = TASK_MAGIC_DEAD;
 	kfree(task);
 }
 
@@ -3028,6 +3052,8 @@ task_t *sched_fork_current(void)
 		return NULL;
 
 	task_t *child = (task_t *)kalloc(sizeof(task_t));
+	if (child)
+		child->alive_magic = TASK_MAGIC_ALIVE;
 	if (!child)
 		return NULL;
 
@@ -5674,6 +5700,10 @@ void sched_init_ap(uint32_t cpu_id)
 	*(--sp) = 0; // r15
 
 	mm_memset(idle, 0, sizeof(task_t));
+	/* Stamp AFTER the zeroing wipes the struct -- stamping at kalloc time
+	 * was erased right here, and every new task was then refused by the
+	 * enqueue liveness gate (boot hung with "magic 0" warnings). */
+	idle->alive_magic = TASK_MAGIC_ALIVE;
 	idle->sp = sp;
 	idle->pml4 = NULL;
 	idle->entry = idle_entry;

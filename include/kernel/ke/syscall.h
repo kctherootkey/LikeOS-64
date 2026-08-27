@@ -163,6 +163,11 @@ typedef struct procmapinfo {
     uint64_t total_bytes;   /* sum of in-use region lengths */
     uint32_t n_regions;     /* in-use records */
     uint32_t capacity;      /* records the table can hold */
+    /* The main stack: mapped at exec directly into the page tables, so it is
+     * reported here or nowhere.  Must stay in step with the userspace copy in
+     * sys/procinfo.h; pthread_getattr_np() is the consumer. */
+    uint64_t stack_top;
+    uint64_t stack_size;
 } procmapinfo_t;
 
 
@@ -264,6 +269,7 @@ typedef struct procmapinfo {
  * The request numbers and register layout are this system's own; see
  * user/lib/libc/include/sys/ptrace.h for the interface contract. */
 #define SYS_PTRACE 408
+#define SYS_MINCORE 409 /* (addr, length, vec) page residency, one byte per page */
 
 /* Trace options (PTRACE_SETOPTIONS): which extra events stop the tracee.
  * Mirrored in user/lib/libc/include/sys/ptrace.h. */

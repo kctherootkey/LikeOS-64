@@ -345,7 +345,8 @@ static void unix_cred_of_current(struct ucred *c)
 int unix_create(int type, unix_socket_t **out)
 {
 	might_sleep();
-	if (type != SOCK_STREAM && type != SOCK_DGRAM)
+	if (type != SOCK_STREAM && type != SOCK_DGRAM &&
+	    type != SOCK_SEQPACKET)
 		return -EINVAL;
 
 	uint64_t tflags;
@@ -498,7 +499,9 @@ int unix_listen(unix_socket_t *us, int backlog)
 {
 	if (!us)
 		return -EBADF;
-	if (us->type != SOCK_STREAM)
+	/* The two connection-oriented types.  SEQPACKET listens and accepts
+	 * exactly like a stream; only the data transfer differs. */
+	if (us->type != SOCK_STREAM && us->type != SOCK_SEQPACKET)
 		return -EOPNOTSUPP;
 	if (!us->bound)
 		return -EINVAL;
@@ -681,6 +684,15 @@ int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 	if (!listener)
 		return -ECONNREFUSED;
 
+	/* A connection only makes sense between sockets speaking the same
+	 * protocol: a byte stream wired to a record socket would lose the
+	 * record boundaries one side is counting on.  The conventional error
+	 * for asking is EPROTOTYPE. */
+	if (listener->type != us->type) {
+		unix_put(listener);
+		return -EPROTOTYPE;
+	}
+
 	/* The rings are obtained with no lock held -- allocating can sleep. */
 	if (unix_ring_ensure(us) != 0) {
 		unix_put(listener);
@@ -702,7 +714,9 @@ int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 		for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
 			p[i] = 0;
 		server->active = 1;
-		server->type = SOCK_STREAM;
+		/* The child speaks whatever the listener speaks: an accepted
+		 * SEQPACKET connection keeps its record boundaries. */
+		server->type = us->type;
 		server->magic = UNIX_SOCK_MAGIC;
 		server->id = s_unix_next_id++;
 		/* One descriptor's worth, and one reference: accept() hands
@@ -821,6 +835,280 @@ int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 	return 0;
 }
 
+/* ============================================================================
+ * SEQPACKET record transfer.
+ *
+ * A SOCK_SEQPACKET connection is set up exactly like a stream -- listen,
+ * accept, one peer, one ring -- but the data keeps its message boundaries:
+ * each send is one record, each recv returns exactly one record (truncating
+ * if the caller's buffer is smaller), and records never coalesce or split.
+ * WebKit's process pairs speak this; it is what socketpair(AF_UNIX,
+ * SOCK_SEQPACKET) is for.
+ *
+ * The framing is a 4-byte little-endian length ahead of each record in the
+ * same byte ring the stream path uses.  A record goes into the ring in ONE
+ * critical section -- header and payload together, or not at all -- so a
+ * header in the ring proves its whole record is behind it, and the reader
+ * never has to wait mid-record.  bytes_written/bytes_read count header and
+ * payload both, on both sides, so the SCM_RIGHTS offset framing keeps
+ * working unchanged: a descriptor attached before a send carries the offset
+ * of that record's header.
+ * ==========================================================================*/
+
+/* One whole record into the peer's ring, or nothing.  The peer is held by
+ * the caller.  Returns the payload length sent, or a negative error.
+ *
+ * fd_entries/nfds are in-band descriptors that belong to THIS record, and
+ * they go into the peer's pending-fd queue inside the same critical section
+ * that writes the record bytes -- all of it or none of it.  They used to be
+ * pushed by the sendmsg layer BEFORE this was called, which broke two ways:
+ *   - a full ring parks here, and a signal then returns EINTR with the fds
+ *     already queued; the caller retries the sendmsg (that is what EINTR
+ *     means) and the same descriptors were pushed AGAIN.  The receiver's
+ *     descriptor stream gained an extra fd, and every later record's
+ *     attachment resolved one descriptor off -- a multiplexed IPC peer
+ *     (WebKit's process pairs) decoded garbage from that point on.
+ *   - a full pending-fd queue was reported by unix_push_fd as -EAGAIN, and
+ *     the sendmsg layer discarded that result, silently sending the record
+ *     with its descriptors missing.
+ * Doing both inserts under one lock makes the retry path safe (a failed
+ * call queued nothing) and turns queue-full into the same wait the ring
+ * uses. */
+static int unix_send_record(unix_socket_t *us, unix_socket_t *peer,
+			    const void *buf, size_t len,
+			    void **fd_entries, int nfds)
+{
+	uint64_t irqflags;
+
+	/* The record must fit the ring whole, with its header, and with one
+	 * slot spare (a completely full ring is indistinguishable from an
+	 * empty one).  Bigger is not "try later", it is "never": EMSGSIZE. */
+	if (len > (size_t)(UNIX_RING_SIZE - 8))
+		return -EMSGSIZE;
+	if (nfds < 0 || nfds > UNIX_PENDING_FDS - 1)
+		return -EINVAL; /* can never fit, waiting will not help */
+
+	/* Bounce the payload through kernel memory first: user memory must
+	 * never be touched under a socket lock (see unix_send), and the
+	 * insert below has to be one atomic critical section. */
+	uint8_t *kbuf = NULL;
+	if (len) {
+		kbuf = (uint8_t *)kalloc(len);
+		if (!kbuf)
+			return -ENOMEM;
+		const uint8_t *src = (const uint8_t *)buf;
+		smap_disable();
+		for (size_t i = 0; i < len; i++)
+			kbuf[i] = src[i];
+		smap_enable();
+	}
+
+	if (unix_ring_ensure(peer) != 0) {
+		if (kbuf)
+			kfree(kbuf);
+		return -ENOMEM;
+	}
+
+	size_t need = 4 + len;
+	for (;;) {
+		spin_lock_irqsave(&peer->lock, &irqflags);
+		if (peer->closed) {
+			spin_unlock_irqrestore(&peer->lock, irqflags);
+			if (kbuf)
+				kfree(kbuf);
+			return -EPIPE;
+		}
+		size_t free_space = (size_t)((peer->head - peer->tail - 1 +
+					      peer->bufsz) %
+					     peer->bufsz);
+		int fd_free = (peer->pending_fd_head - peer->pending_fd_tail -
+			       1 + UNIX_PENDING_FDS) %
+			      UNIX_PENDING_FDS;
+		if (free_space >= need && fd_free >= nfds) {
+			/* The record's start offset, which is what recvmsg
+			 * matches pending descriptors against -- captured
+			 * before the header advances it. */
+			uint64_t rec_off = peer->bytes_written;
+			/* Header, then payload, all under the one lock. */
+			for (int i = 0; i < 4; i++) {
+				peer->buf[peer->tail] =
+					(uint8_t)((len >> (8 * i)) & 0xFF);
+				peer->tail = (peer->tail + 1) % peer->bufsz;
+			}
+			for (size_t i = 0; i < len; i++) {
+				peer->buf[peer->tail] = kbuf[i];
+				peer->tail = (peer->tail + 1) % peer->bufsz;
+			}
+			/* This record's descriptors, same critical section.
+			 * Space was checked above; peer->lock is what
+			 * unix_push_fd would take, so push inline. */
+			for (int i = 0; i < nfds; i++) {
+				peer->pending_fds[peer->pending_fd_tail] =
+					fd_entries[i];
+				peer->pending_fd_off[peer->pending_fd_tail] =
+					rec_off;
+				peer->pending_fd_tail =
+					(peer->pending_fd_tail + 1) %
+					UNIX_PENDING_FDS;
+			}
+			peer->bytes_written += need;
+			peer->ready = 1;
+			spin_unlock_irqrestore(&peer->lock, irqflags);
+			sched_wake_channel(peer);
+			poll_notify_wq(&peer->poll_wq);
+			if (kbuf)
+				kfree(kbuf);
+			return (int)len;
+		}
+		/* Not enough room for the whole record.  Nothing has been
+		 * written, so returning EAGAIN or EINTR here is always
+		 * clean. */
+		if (us->nonblock) {
+			spin_unlock_irqrestore(&peer->lock, irqflags);
+			if (kbuf)
+				kfree(kbuf);
+			return -EAGAIN;
+		}
+		task_t *snd_cur = sched_current();
+		if (snd_cur && signal_pending(snd_cur)) {
+			spin_unlock_irqrestore(&peer->lock, irqflags);
+			if (kbuf)
+				kfree(kbuf);
+			return -EINTR;
+		}
+		if (!snd_cur) {
+			spin_unlock_irqrestore(&peer->lock, irqflags);
+			sched_yield_in_kernel();
+			continue;
+		}
+		/* Park on the peer, exactly as the stream path does; the
+		 * reader wakes us after draining. */
+		snd_cur->state = TASK_BLOCKED;
+		snd_cur->wait_channel = peer;
+		spin_unlock_irqrestore(&peer->lock, irqflags);
+		sched_schedule();
+		snd_cur->wait_channel = NULL;
+	}
+}
+
+/* sendmsg(2)'s entry: one SEQPACKET record and its descriptors, atomically.
+ * Peer resolution mirrors unix_send. */
+int unix_send_record_msg(unix_socket_t *us, const void *buf, size_t len,
+			 void **fd_entries, int nfds)
+{
+	might_sleep();
+	if (!us)
+		return -EBADF;
+	uint64_t tflags;
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	unix_socket_t *peer = us->peer;
+	if (peer && !unix_tryhold(peer))
+		peer = NULL;
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+	if (!peer) {
+		if (us->peer_closed)
+			return -EPIPE;
+		return -ENOTCONN;
+	}
+	if (peer->closed || peer->peer_closed) {
+		unix_put(peer);
+		return -EPIPE;
+	}
+	int r = unix_send_record(us, peer, buf, len, fd_entries, nfds);
+	unix_put(peer);
+	return r;
+}
+
+/* One whole record out of this socket's ring.  Data is known to be present
+ * unless another reader raced us to it, in which case -ENODATA asks the
+ * caller to go back to waiting.  Returns the number of payload bytes copied
+ * out (the record truncates silently to the caller's buffer, per the
+ * conventional SEQPACKET semantics). */
+static int unix_recv_record(unix_socket_t *us, uint8_t *dst, size_t len)
+{
+	uint64_t irqflags;
+	size_t cap = len;
+	if (cap > UNIX_RING_SIZE)
+		cap = UNIX_RING_SIZE;
+
+	/* Sized to the caller's buffer, not the record: bytes past the
+	 * caller's buffer are discarded either way, so they are never copied
+	 * anywhere.  Allocated before the lock -- kalloc can sleep. */
+	uint8_t *kbuf = NULL;
+	if (cap) {
+		kbuf = (uint8_t *)kalloc(cap);
+		if (!kbuf)
+			return -ENOMEM;
+	}
+
+	spin_lock_irqsave(&us->lock, &irqflags);
+	size_t used = (size_t)((us->tail - us->head + us->bufsz) % us->bufsz);
+	if (used < 4) {
+		/* Another reader consumed it between the wait and here. */
+		spin_unlock_irqrestore(&us->lock, irqflags);
+		if (kbuf)
+			kfree(kbuf);
+		return -ENODATA;
+	}
+	uint32_t reclen = 0;
+	for (int i = 0; i < 4; i++) {
+		reclen |= (uint32_t)us->buf[us->head] << (8 * i);
+		us->head = (us->head + 1) % us->bufsz;
+	}
+	/* The insert was atomic, so the whole record is here; anything else
+	 * means the ring was corrupted. */
+	if ((size_t)reclen + 4 > used) {
+		WARN_ON(1);
+		spin_unlock_irqrestore(&us->lock, irqflags);
+		if (kbuf)
+			kfree(kbuf);
+		return -EIO;
+	}
+	size_t take = reclen;
+	if (take > cap)
+		take = cap;
+	for (size_t i = 0; i < take; i++) {
+		kbuf[i] = us->buf[us->head];
+		us->head = (us->head + 1) % us->bufsz;
+	}
+	/* Discard whatever the caller's buffer could not hold: the record
+	 * boundary, not the byte count, is the unit here. */
+	us->head = (int)((us->head + (reclen - take)) % (size_t)us->bufsz);
+	us->bytes_read += 4 + reclen;
+	if (us->head == us->tail)
+		us->ready = 0;
+	spin_unlock_irqrestore(&us->lock, irqflags);
+
+	/* Space was freed: wake a sender parked on us, and tell the peer's
+	 * pollers it is writable again -- same idiom as the stream path. */
+	sched_wake_channel(us);
+	{
+		unix_socket_t *pw = NULL;
+		uint64_t pf;
+
+		spin_lock_irqsave(&us->lock, &pf);
+		if (us->peer) {
+			pw = us->peer;
+			unix_hold(pw);
+		}
+		spin_unlock_irqrestore(&us->lock, pf);
+		if (pw) {
+			poll_notify_wq(&pw->poll_wq);
+			unix_put(pw);
+		}
+	}
+
+	if (take) {
+		smap_disable();
+		for (size_t i = 0; i < take; i++)
+			dst[i] = kbuf[i];
+		smap_enable();
+	}
+	if (kbuf)
+		kfree(kbuf);
+	return (int)take;
+}
+
 int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 {
 	might_sleep();
@@ -856,6 +1144,12 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 	if (peer->closed || peer->peer_closed) {
 		unix_put(peer);
 		return -EPIPE;
+	}
+
+	if (us->type == SOCK_SEQPACKET) {
+		int r = unix_send_record(us, peer, buf, len, NULL, 0);
+		unix_put(peer);
+		return r;
 	}
 
 	const uint8_t *src = (const uint8_t *)buf;
@@ -1018,6 +1312,7 @@ int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags)
 
 	uint8_t *dst = (uint8_t *)buf;
 
+restart:
 	// Wait for data.  Re-read indices and peer-state via volatile each
 	// iteration so the compiler can't hoist them out of the loop.  Also
 	// bail if our own slot is closed under us (e.g. dup'd fd in another
@@ -1049,7 +1344,7 @@ int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags)
 		 * peer_closed above is the honest signal: the peer's own
 		 * teardown sets it, under the lock, on the socket it is
 		 * hanging up.  Nothing has to be inferred by looking. */
-		if (!us->connected && us->type == SOCK_STREAM)
+		if (!us->connected && us->type != SOCK_DGRAM)
 			return -ENOTCONN;
 		if (us->nonblock || dontwait)
 			return -EAGAIN;
@@ -1084,6 +1379,16 @@ int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags)
 				spin_unlock_irqrestore(&us->lock, rf);
 			}
 		}
+	}
+
+	/* Record sockets hand over exactly one record.  -ENODATA means a
+	 * sibling reader took it between the wait above and the pop; going
+	 * back to the wait is correct and rare. */
+	if (us->type == SOCK_SEQPACKET) {
+		int r = unix_recv_record(us, dst, len);
+		if (r == -ENODATA)
+			goto restart;
+		return r;
 	}
 
 	uint64_t irqflags;
@@ -1254,7 +1559,7 @@ static void unix_put(unix_socket_t *us)
 	 *
 	 * Collected under the lock and released after it: releasing can close
 	 * a socket or a pipe of its own, which takes locks and can free. */
-	void *dead_fds[16];
+	void *dead_fds[UNIX_PENDING_FDS];
 	int n_dead = 0;
 
 	spin_lock_irqsave(&unix_table_lock, &tflags);
@@ -1262,10 +1567,11 @@ static void unix_put(unix_socket_t *us)
 	WARN_ON(us->peer != NULL); /* destroyed still linked to a peer */
 	WARN_ON(us->accept_head !=
 		us->accept_tail); /* destroyed with connections queued */
-	while (us->pending_fd_head != us->pending_fd_tail && n_dead < 16) {
+	while (us->pending_fd_head != us->pending_fd_tail &&
+	       n_dead < UNIX_PENDING_FDS) {
 		dead_fds[n_dead++] = us->pending_fds[us->pending_fd_head];
 		us->pending_fds[us->pending_fd_head] = NULL;
-		us->pending_fd_head = (us->pending_fd_head + 1) % 16;
+		us->pending_fd_head = (us->pending_fd_head + 1) % UNIX_PENDING_FDS;
 	}
 	dead_ring = us->buf;
 	us->buf = NULL;
@@ -1540,7 +1846,8 @@ int unix_close(unix_socket_t *us)
 // ============================================================================
 int unix_socketpair(int type, unix_socket_t *sv[2])
 {
-	if (type != SOCK_STREAM && type != SOCK_DGRAM)
+	if (type != SOCK_STREAM && type != SOCK_DGRAM &&
+	    type != SOCK_SEQPACKET)
 		return -EINVAL;
 
 	// Both slot allocations + memsets + active=1 publish must happen
@@ -1793,6 +2100,13 @@ int unix_getsockopt(unix_socket_t *us, int level, int optname, void *optval,
 		val = us->type;
 		break;
 
+	case SO_ACCEPTCONN:
+		/* Read-only by definition: reports whether listen() has been
+		 * applied.  libsoup's server asks this of every socket it is
+		 * handed before it will serve on it. */
+		val = us->listening ? 1 : 0;
+		break;
+
 	case SO_ERROR: {
 		/* Read-and-clear, as POSIX requires: the pending error is
 		 * reported once.  This is how a program that connected in
@@ -1942,17 +2256,19 @@ int unix_poll(unix_socket_t *us, short events)
 // after taking the appropriate reference.  Receiver pops the head entry
 // in recvmsg and installs it in its own fd_table.
 //
-// The queue is small (16) because the imsg framing tmux uses sends at
-// most one fd per message and the peer drains promptly.  When full we
-// return -EAGAIN so the sender can retry; this preserves ordering with
-// data bytes already accepted by unix_send.
+// The queue holds UNIX_PENDING_FDS entries.  tmux, the original user,
+// sends at most one fd per imsg and drains promptly; WebKit's SEQPACKET
+// IPC attaches every shared buffer of a message at once, which is what
+// the size is set for.  When full we return -EAGAIN so the sender can
+// retry; this preserves ordering with data bytes already accepted by
+// unix_send.
 int unix_push_fd(unix_socket_t *sock, void *entry)
 {
 	if (!sock)
 		return -EBADF;
 	uint64_t flags;
 	spin_lock_irqsave(&sock->lock, &flags);
-	int next = (sock->pending_fd_tail + 1) % 16;
+	int next = (sock->pending_fd_tail + 1) % UNIX_PENDING_FDS;
 	if (next == sock->pending_fd_head) {
 		spin_unlock_irqrestore(&sock->lock, flags);
 		return -EAGAIN;
@@ -1968,6 +2284,31 @@ int unix_push_fd(unix_socket_t *sock, void *entry)
 	return 0;
 }
 
+/* Wake a sender parked for pending-fd queue space on `sock`, and tell the
+ * peer's pollers it is writable again.  Called by recvmsg after it pops this
+ * record's descriptors: the wake the sender got from the record read fires
+ * BEFORE the pop, so it re-checks a still-full queue and parks again -- and
+ * with the sender parked there are no further reads to wake it, ever. */
+void unix_fd_space_wake(unix_socket_t *sock)
+{
+	unix_socket_t *pw = NULL;
+	uint64_t pf;
+
+	if (!sock)
+		return;
+	sched_wake_channel(sock);
+	spin_lock_irqsave(&sock->lock, &pf);
+	if (sock->peer) {
+		pw = sock->peer;
+		unix_hold(pw);
+	}
+	spin_unlock_irqrestore(&sock->lock, pf);
+	if (pw) {
+		poll_notify_wq(&pw->poll_wq);
+		unix_put(pw);
+	}
+}
+
 int unix_pop_fd(unix_socket_t *sock, void **out_entry)
 {
 	if (!sock || !out_entry)
@@ -1979,7 +2320,7 @@ int unix_pop_fd(unix_socket_t *sock, void **out_entry)
 		return -EAGAIN;
 	}
 	*out_entry = sock->pending_fds[sock->pending_fd_head];
-	sock->pending_fd_head = (sock->pending_fd_head + 1) % 16;
+	sock->pending_fd_head = (sock->pending_fd_head + 1) % UNIX_PENDING_FDS;
 	spin_unlock_irqrestore(&sock->lock, flags);
 	return 0;
 }

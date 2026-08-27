@@ -5,8 +5,8 @@
 #
 # They are ports in their own right, built by the top-level Makefile into
 # build/ and staged onto the image, but nothing ever placed their headers,
-# libraries or pkg-config metadata where the X toolchain looks.  NetSurf needs
-# all three: libcurl to fetch, OpenSSL for https, zlib for compressed
+# libraries or pkg-config metadata where the X toolchain looks.  X clients
+# may need all three: libcurl to fetch, OpenSSL for https, zlib for compressed
 # transfers and for libpng.
 #
 # The .pc files in the source trees cannot be reused -- OpenSSL's say so in

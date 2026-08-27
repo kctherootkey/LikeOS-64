@@ -1,0 +1,47 @@
+Recognize LikeOS in the platform ladders.
+
+Three sites, all of the same shape -- an #if ladder that enumerates
+operating systems and falls into something wrong for one it has never met:
+
+  - ADT/bit.h picked BSD's <machine/endian.h>; this libc ships a proper
+    <endian.h> with both the underscored and the plain byte-order names.
+  - Support/Unix/Path.inc expected BSD's statvfs field spelling f_flags;
+    this system uses the POSIX spelling f_flag.
+  - is_local_impl tested MNT_LOCAL, which only BSD defines.  There are no
+    remote filesystems on this system at all, so the answer is simply true.
+
+--- a/llvm/include/llvm/ADT/bit.h
++++ b/llvm/include/llvm/ADT/bit.h
+@@ -30,7 +30,8 @@
+ 
+ #if defined(__linux__) || defined(__GNU__) || defined(__HAIKU__) ||            \
+     defined(__Fuchsia__) || defined(__EMSCRIPTEN__) || defined(__NetBSD__) ||  \
+-    defined(__OpenBSD__) || defined(__DragonFly__) || defined(__managarm__)
++    defined(__OpenBSD__) || defined(__DragonFly__) || defined(__managarm__) || \
++    defined(__LIKEOS__)
+ #include <endian.h>
+ #elif defined(_AIX)
+ #include <sys/machine.h>
+--- a/llvm/lib/Support/Unix/Path.inc
++++ b/llvm/lib/Support/Unix/Path.inc
+@@ -111,7 +111,7 @@
+ #endif
+ 
+ #if defined(__NetBSD__) || defined(__DragonFly__) || defined(__GNU__) ||       \
+-    defined(__MVS__)
++    defined(__MVS__) || defined(__LIKEOS__)
+ #define STATVFS_F_FLAG(vfs) (vfs).f_flag
+ #else
+ #define STATVFS_F_FLAG(vfs) (vfs).f_flags
+@@ -569,6 +569,11 @@
+   // The file system can have an arbitrary structure on z/OS; must go with the
+   // conservative answer.
+   return false;
++#elif defined(__LIKEOS__)
++  // No remote filesystems exist on this system at all; every mount is a
++  // local ext4 (or devfs) mount, so "local" is not conservative, it is
++  // simply true.
++  return true;
+ #else
+   return !!(STATVFS_F_FLAG(Vfs) & MNT_LOCAL);
+ #endif

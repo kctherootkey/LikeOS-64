@@ -1,0 +1,51 @@
+PPM2TIFF(1)                         LibTIFF                        PPM2TIFF(1)
+
+NAME
+       ppm2tiff - create a TIFF file from PPM, PGM and PBM image files
+
+       Synopsis
+
+       ppm2tiff [ options ] [ input.ppm ] output.tif
+
+DESCRIPTION
+       ppm2tiff converts a file in the PPM, PGM and PBM image formats to TIFF.
+       By default, the TIFF image is created with data samples packed (Planar-
+       Configuration=1),  compressed  with  the  Packbits  algorithm (Compres-
+       sion=32773), and with each strip no more than 8 kilobytes.  These char-
+       acteristics can be overridden, or explicitly specified with the options
+       described below.
+
+       If the PPM file contains greyscale data, then the  PhotometricInterpre-
+       tation tag is set to 1 (min-is-black), otherwise it is set to 2 (RGB).
+
+       If  no  PPM  file  is specified on the command line, ppm2tiff will read
+       from the standard input.
+
+OPTIONS
+       -c compress
+              Specify a compression scheme to use when writing image data:  -c
+              none  for  no  compression, -c packbits for PackBits compression
+              (will be used by default), -c lzw for Lempel-Ziv  &  Welch  com-
+              pression,  -c jpeg for baseline JPEG compression, -c zip for De-
+              flate compression, -c g3 for CCITT Group  3  (T.4)  compression,
+              and -c g4 for CCITT Group 4 (T.6) compression.
+
+       -r striprows
+              Write data with a specified number of rows per strip; by default
+              the  number  of rows/strip is selected so that each strip is ap-
+              proximately 8 kilobytes.
+
+       -R resolution
+              Mark the resultant image to have the specified X and  Y  resolu-
+              tion (in dots/inch).
+
+SEE ALSO
+       tiffinfo (1), tiffcp (1), tiffmedian (1), libtiff (3tiff)
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                      PPM2TIFF(1)

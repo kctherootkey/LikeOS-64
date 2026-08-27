@@ -1,0 +1,39 @@
+Guard JSHTMLMediaElementCustom.cpp with ENABLE(VIDEO), like its siblings.
+
+The file defines visitAdditionalChildren for JSHTMLMediaElement, and
+HTMLMediaElement.idl carries [Conditional=VIDEO] -- so with the media stack
+off (this port has no GStreamer, so ENABLE_VIDEO is OFF) the generated
+JSHTMLMediaElement.h still exists but declares nothing, and the build stops
+with
+
+    error: 'JSHTMLMediaElement' has not been declared
+
+Every other custom binding for a conditional interface wraps its whole body
+in the matching #if -- JSTrackCustom.cpp, in the same directory, is the exact
+pattern followed here, down to the placement after "config.h" and the bare
+#endif at the end of the file.  This one is simply missing it; the file is
+new (its copyright reads 2026) and was written against a build where VIDEO is
+always on.
+
+Upstream: not reported yet.  Unlike the rest of this port's patches this one
+is not LikeOS-specific -- it is a plain build fix for ENABLE_VIDEO=OFF and
+belongs upstream as-is.
+
+--- a/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
++++ b/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
+@@ -24,6 +24,9 @@
+  */
+ 
+ #include "config.h"
++
++#if ENABLE(VIDEO)
++
+ #include "JSHTMLMediaElement.h"
+ 
+ #include "TrackOpaqueRoot.h"
+@@ -39,3 +42,5 @@ void JSHTMLMediaElement::visitAdditionalChildren(Visitor& visitor)
+ DEFINE_VISIT_ADDITIONAL_CHILDREN(JSHTMLMediaElement);
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(VIDEO)

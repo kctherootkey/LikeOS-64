@@ -350,6 +350,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	case SYS_MADVISE:
 		return sys_madvise(a1, a2, a3);
 
+	case SYS_MINCORE:
+		return sys_mincore(a1, a2, a3);
+
 	case SYS_REBOOT:
 		return sys_reboot(a1, a2, a3, a4);
 

@@ -1,0 +1,135 @@
+ANGLE: this is a POSIX system, not a Linux one.
+
+ENABLE_WEBGL=ON (so WebGL can run on Mesa's llvmpipe) compiles the bundled
+ANGLE for the first time in this port, and its GTK platform file hardcodes
+ANGLE_PLATFORM_LINUX for every non-Apple, non-Windows build.  On this system
+that reaches for things it does not have:
+
+    src/common/SimpleMutex.cpp:17:18: fatal error: linux/futex.h:
+      No such file or directory
+
+  - PlatformGTK.cmake: define ANGLE_PLATFORM_LINUX only when CMake says the
+    target is Linux.  common/platform.h then classifies the system itself.
+  - platform.h: add __LIKEOS__ to the POSIX list so that classification
+    succeeds (the fallthrough is `#error Unsupported platform`).
+  - Display.cpp: the EGL/GLX display backends are selected by
+    ANGLE_PLATFORM_LINUX; they are exactly what this X11-on-Mesa port needs,
+    so admit __LIKEOS__ alongside it.
+  - log_utils.h, system_utils.h: the sysroot's libstdc++ is built without
+    wchar_t support, so std::wostream/std::wstring do not exist.  Only the
+    Windows paths ever use them; compile them out where the library lacks
+    them.
+  - Display.cpp, second part: the EGL_ANGLE_platform_angle_device_type_egl
+    client extension is likewise enabled only for ANGLE_PLATFORM_LINUX.
+    WebKitGTK asks for exactly that device type when it creates its ANGLE
+    display, and ANGLE's validation answered EGL_BAD_ATTRIBUTE before any
+    driver code ran -- WebGL "disabled or unavailable" on every page, with
+    nothing logged (found with user/bin/tests/anglecheck.cpp).
+
+--- a/Source/ThirdParty/ANGLE/PlatformGTK.cmake
++++ b/Source/ThirdParty/ANGLE/PlatformGTK.cmake
+@@ -1,4 +1,10 @@
+-list(APPEND ANGLE_DEFINITIONS ANGLE_PLATFORM_LINUX EGL_NO_PLATFORM_SPECIFIC_TYPES USE_SYSTEM_EGL)
++# ANGLE_PLATFORM_LINUX only where that is true: common/platform.h detects
++# every POSIX system by its own macros, and forcing the wrong platform makes
++# SimpleMutex reach for a kernel futex header the system does not have.
++if (CMAKE_SYSTEM_NAME MATCHES "Linux")
++    list(APPEND ANGLE_DEFINITIONS ANGLE_PLATFORM_LINUX)
++endif ()
++list(APPEND ANGLE_DEFINITIONS EGL_NO_PLATFORM_SPECIFIC_TYPES USE_SYSTEM_EGL)
+ include(linux.cmake)
+ 
+ if (USE_OPENGL)
+--- a/Source/ThirdParty/ANGLE/src/common/log_utils.h
++++ b/Source/ThirdParty/ANGLE/src/common/log_utils.h
+@@ -136,10 +136,15 @@
+         return FmtHexAutoSized(os, fmt.mValue, fmt.mPrefix, "0x", '0');
+     }
+ 
++#if !defined(__GLIBCXX__) || defined(_GLIBCXX_USE_WCHAR_T)
++    // Wide streams exist only where the C++ library was built with wchar_t
++    // support; a libstdc++ configured without it has no std::wostream to
++    // overload for.  Only the Windows paths ever format into wide streams.
+     friend std::wostream &operator<<(std::wostream &wos, const FmtHexHelper &fmt)
+     {
+         return FmtHexAutoSized(wos, fmt.mValue, fmt.mPrefix, L"0x", L'0');
+     }
++#endif
+ };
+ 
+ }  // namespace priv
+--- a/Source/ThirdParty/ANGLE/src/common/platform.h
++++ b/Source/ThirdParty/ANGLE/src/common/platform.h
+@@ -25,7 +25,7 @@
+ #    define ANGLE_PLATFORM_POSIX 1
+ #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) ||              \
+     defined(__DragonFly__) || defined(__sun) || defined(__GLIBC__) || defined(__GNU__) || \
+-    defined(__QNX__) || defined(__Fuchsia__) || defined(__HAIKU__)
++    defined(__QNX__) || defined(__Fuchsia__) || defined(__HAIKU__) || defined(__LIKEOS__)
+ #    define ANGLE_PLATFORM_POSIX 1
+ #else
+ #    error Unsupported platform.
+--- a/Source/ThirdParty/ANGLE/src/common/system_utils.h
++++ b/Source/ThirdParty/ANGLE/src/common/system_utils.h
+@@ -225,12 +225,14 @@
+ PageFaultHandler *CreatePageFaultHandler(PageFaultCallback callback);
+ 
+ #ifdef ANGLE_PLATFORM_WINDOWS
++#if !defined(__GLIBCXX__) || defined(_GLIBCXX_USE_WCHAR_T)
+ // Convert an UTF-16 wstring to an UTF-8 string.
+ std::string Narrow(const std::wstring_view &utf16);
+ 
+ // Convert an UTF-8 string to an UTF-16 wstring.
+ std::wstring Widen(const std::string_view &utf8);
+ #endif
++#endif
+ 
+ std::string StripFilenameFromPath(const std::string &path);
+ 
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/Display.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/Display.cpp
+@@ -62,7 +62,7 @@
+ #        include "libANGLE/renderer/gl/wgl/DisplayWGL.h"
+ #    elif ANGLE_ENABLE_CGL
+ #        include "libANGLE/renderer/gl/cgl/DisplayCGL.h"
+-#    elif defined(ANGLE_PLATFORM_LINUX)
++#    elif defined(ANGLE_PLATFORM_LINUX) || defined(__LIKEOS__)
+ #        include "libANGLE/renderer/gl/egl/DisplayEGL.h"
+ #        if defined(ANGLE_USE_X11)
+ #            include "libANGLE/renderer/gl/glx/DisplayGLX_api.h"
+@@ -426,7 +426,7 @@
+             impl = new rx::DisplayCGL(state);
+             break;
+ 
+-#    elif defined(ANGLE_PLATFORM_LINUX)
++#    elif defined(ANGLE_PLATFORM_LINUX) || defined(__LIKEOS__)
+ #        if defined(ANGLE_USE_GBM) || defined(ANGLE_USE_WAYLAND)
+             if (platformType == 0)
+             {
+@@ -477,7 +477,7 @@
+ #if defined(ANGLE_ENABLE_OPENGL)
+ #    if defined(ANGLE_PLATFORM_WINDOWS)
+             impl = new rx::DisplayWGL(state);
+-#    elif defined(ANGLE_PLATFORM_LINUX)
++#    elif defined(ANGLE_PLATFORM_LINUX) || defined(__LIKEOS__)
+ #        if defined(ANGLE_USE_GBM) || defined(ANGLE_USE_WAYLAND)
+             if (platformType == 0)
+             {
+@@ -533,7 +533,7 @@
+                 impl = rx::CreateVulkanWin32Display(state);
+             }
+             break;
+-#    elif defined(ANGLE_PLATFORM_LINUX)
++#    elif defined(ANGLE_PLATFORM_LINUX) || defined(__LIKEOS__)
+ #        if defined(ANGLE_USE_GBM)
+             if (platformType == EGL_PLATFORM_GBM_KHR && rx::IsVulkanGbmDisplayAvailable())
+             {
+@@ -2197,7 +2197,7 @@
+     extensions.x11Visual = true;
+ #endif
+ 
+-#if defined(ANGLE_PLATFORM_LINUX)
++#if defined(ANGLE_PLATFORM_LINUX) || defined(__LIKEOS__)
+     extensions.platformANGLEDeviceTypeEGLANGLE = true;
+ #endif
+ 

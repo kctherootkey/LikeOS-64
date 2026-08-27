@@ -2548,6 +2548,18 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				conn->max_seg_size = conn->peer_mss;
 				conn->state = TCP_STATE_ESTABLISHED;
 				conn->connect_done = 1;
+				/* Wake a non-blocking connect()er parked in
+				 * poll(POLLOUT).  The failure path
+				 * (tcp_fail_connection) notified the poller;
+				 * the success path never did, so a fresh
+				 * connection sat ESTABLISHED until some
+				 * unrelated event or the poll timeout woke the
+				 * caller -- luakit stuck at 10% on every typed
+				 * address (new host = new connect) while clicks
+				 * on keep-alive connections were fine.  The
+				 * blocking path spins on connect_done and never
+				 * noticed. */
+				tcp_poll_notify(conn);
 
 				// Negotiate TS / WS / SACK based on what the peer echoed
 				if (pop.ts_present) {
@@ -3190,6 +3202,12 @@ established_segment:
 						TCP_TIME_WAIT_TICKS;
 					tcp_queue_ack_locked(conn);
 					ack_pending = 1;
+					/* Peer FIN = EOF for a reader parked
+					 * through our half-close; data-less
+					 * FINs otherwise woke nobody. */
+					tcp_poll_notify(conn);
+					sched_wake_channel(
+						(void *)&conn->rx_ready);
 				} else {
 					conn->state = TCP_STATE_FIN_WAIT_2;
 					conn->fin_wait_2_deadline =
@@ -3213,6 +3231,9 @@ established_segment:
 			if (seq + payload_len == conn->rcv_nxt) {
 				conn->rcv_nxt += 1;
 				conn->state = TCP_STATE_CLOSING;
+				/* Same EOF wake as the TIME_WAIT arm. */
+				tcp_poll_notify(conn);
+				sched_wake_channel((void *)&conn->rx_ready);
 			}
 			tcp_queue_ack_locked(conn);
 			ack_pending = 1;
@@ -3234,6 +3255,9 @@ established_segment:
 				conn->state = TCP_STATE_TIME_WAIT;
 				conn->time_wait_tick =
 					timer_ticks() + TCP_TIME_WAIT_TICKS;
+				/* Same EOF wake as FIN_WAIT_1. */
+				tcp_poll_notify(conn);
+				sched_wake_channel((void *)&conn->rx_ready);
 			}
 		}
 		if (payload_len > 0 || (tcp_flags & TCP_FIN)) {
@@ -3927,6 +3951,34 @@ int tcp_at_mark(tcp_conn_t *conn)
 // On-demand connection-table snapshot for the Ctrl+N debug dump.
 // Lock-free best-effort read — values may tear, but this is purely
 // diagnostic and never used for correctness.
+/* Is `port` (host order) the local port of ANY connection still in the
+ * table -- TIME_WAIT and the other closing states included?
+ *
+ * The ephemeral-port allocator scans SOCKETS, but a connection outlives its
+ * socket: close() frees the socket slot while the conn walks FIN_WAIT/
+ * TIME_WAIT for up to a minute, its 4-tuple still live in this table.
+ * Handing that port to a new socket that then connects to the SAME remote
+ * (a browser reconnecting to the same host does this constantly) collides
+ * the new handshake with the old conn -- the SYN is answered out of the
+ * dying connection's state and the client sees the handshake fail with
+ * RST/broken pipe.  The allocator now asks this table too. */
+int tcp_local_port_in_use(uint16_t port)
+{
+	uint64_t flags;
+	int used = 0;
+
+	spin_lock_irqsave(&tcp_lock, &flags);
+	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
+		if (c->active && c->local_port == port &&
+		    c->state != TCP_STATE_LISTEN) {
+			used = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&tcp_lock, flags);
+	return used;
+}
+
 void tcp_dump_table(struct tty *tty)
 {
 	static const char *sn[] = { "CLOSED",  "LISTEN",  "SYN_SNT", "SYN_RCV",

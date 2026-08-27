@@ -1,0 +1,30 @@
+GLXGEARS(1)                 General Commands Manual                GLXGEARS(1)
+
+NAME
+       glxgears - draw three rotating gears, report frame rate
+
+SYNOPSIS
+       glxgears [-display displayname] [-info] [-fullscreen] [-geometry WxH]
+
+DESCRIPTION
+       glxgears renders the classic animated gears through GLX and prints a
+       frames-per-second figure every five seconds.  On LikeOS all rendering
+       is performed in software by Mesa's llvmpipe rasterizer; the reported
+       rate measures CPU rasterization and XShm presentation, not a GPU.
+
+OPTIONS
+       -display displayname
+              Connect to the named X display instead of $DISPLAY.
+
+       -info  Print the GL renderer, version and extension strings first.
+
+       -fullscreen
+              Run fullscreen rather than in a window.
+
+       -geometry WxH
+              Initial window size.
+
+SEE ALSO
+       glxinfo(1), eglinfo(1)
+
+LikeOS                                                             GLXGEARS(1)

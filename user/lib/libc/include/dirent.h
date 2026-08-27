@@ -25,6 +25,20 @@ struct dirent {
     char d_name[256];
 };
 
+/* The explicit 64-bit spelling of the SAME structure.  This libc was 64-bit
+ * from the start, so there is no distinct large-file variant to describe --
+ * but the transitional LFS API names live on in portable code (libgpg-error
+ * walks its descriptor table with getdents64 into struct dirent64), and a
+ * program using that spelling must find a type whose layout is exactly what
+ * getdents64() writes: this one. */
+struct dirent64 {
+    uint64_t d_ino;
+    uint64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[256];
+};
+
 typedef struct {
     int fd;
     int buf_pos;

@@ -141,12 +141,19 @@ struct termios {
     cc_t c_cc[NCCS];
 };
 
+/* Guarded because <sys/ioctl.h> carries the same definition: TIOCGWINSZ is
+ * that header's ioctl, and the conventional Unix arrangement is that
+ * including it alone suffices to use the ioctl -- SQLite's shell was the
+ * first program to include only it and fail on the struct. */
+#ifndef __likeos_winsize_defined
+#define __likeos_winsize_defined
 struct winsize {
     unsigned short ws_row;
     unsigned short ws_col;
     unsigned short ws_xpixel;
     unsigned short ws_ypixel;
 };
+#endif
 
 int tcgetattr(int fd, struct termios* termios_p);
 speed_t cfgetispeed(const struct termios *t);

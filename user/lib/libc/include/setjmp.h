@@ -21,6 +21,12 @@ typedef unsigned long sigjmp_buf[9];
 int  setjmp(jmp_buf env);
 void longjmp(jmp_buf env, int val) __attribute__((__noreturn__));
 
+/* The variants POSIX defines as not saving or restoring the signal mask.
+ * setjmp() here does not touch it either, so these are aliases; see
+ * src/setjmp.S.  Lua 5.1 needs them for any POSIX build. */
+int  _setjmp(jmp_buf env);
+void _longjmp(jmp_buf env, int val) __attribute__((__noreturn__));
+
 int  sigsetjmp(sigjmp_buf env, int savemask);
 void siglongjmp(sigjmp_buf env, int val) __attribute__((__noreturn__));
 

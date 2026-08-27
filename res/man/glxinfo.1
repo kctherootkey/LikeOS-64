@@ -1,0 +1,31 @@
+GLXINFO(1)                  General Commands Manual                 GLXINFO(1)
+
+NAME
+       glxinfo - report GLX and OpenGL information about the X display
+
+SYNOPSIS
+       glxinfo [-display displayname] [-B] [-v] [-t] [-s]
+
+DESCRIPTION
+       glxinfo lists the GLX extensions the display supports, the OpenGL
+       renderer, version and extension strings, and the available visuals
+       and framebuffer configurations.  It is the standard first check that
+       an OpenGL stack works at all.  On LikeOS the expected renderer string
+       names Mesa's llvmpipe: rendering is software, presented over XShm.
+
+OPTIONS
+       -display displayname
+              Connect to the named X display instead of $DISPLAY.
+
+       -B     Brief: print only the renderer/version block.
+
+       -v     Verbose visual output.
+
+       -t     Print visuals in tabular form.
+
+       -s     Print a single extension name per line.
+
+SEE ALSO
+       glxgears(1), eglinfo(1)
+
+LikeOS                                                              GLXINFO(1)

@@ -1,0 +1,41 @@
+TIFFSPLIT(1)                        LibTIFF                       TIFFSPLIT(1)
+
+NAME
+       tiffsplit - split a multi-image TIFF into single-image TIFF files
+
+SYNOPSIS
+       tiffsplit src.tif [ prefix ]
+
+DESCRIPTION
+       tiffsplit  takes  a multi-directory (page) TIFF file and creates one or
+       more single-directory (page) TIFF files from it.  The output files  are
+       given names created by concatenating a prefix, a lexically ordered suf-
+       fix  in the range [aaa--zzz], the suffix .tif (e.g. xaaa.tif, xaab.tif,
+       , xzzz.tif).  If a prefix is not specified on the command line, the de-
+       fault prefix of x is used.
+
+OPTIONS
+       None.
+
+EXIT STATUS
+       tiffsplit exits with one of the following values:
+
+       0:
+          Success
+
+       1:
+          An error occurred either reading the input or writing results.
+
+BUGS
+       Only a select set of "known tags" are copied when splitting.
+
+SEE ALSO
+       tiffcp (1), tiffinfo (1), libtiff (3tiff),
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                     TIFFSPLIT(1)

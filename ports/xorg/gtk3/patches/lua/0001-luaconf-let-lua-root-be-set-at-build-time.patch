@@ -1,0 +1,40 @@
+Let LUA_ROOT be set from the build, instead of always /usr/local/.
+
+luaconf.h defines LUA_ROOT unconditionally and builds LUA_PATH_DEFAULT and
+LUA_CPATH_DEFAULT out of it, so a -DLUA_ROOT on the command line is quietly
+overridden by the header -- the value compiled into the interpreter is always
+/usr/local/, whatever the package was configured with.
+
+This port installs Lua under /usr (INSTALL_TOP=$SYSROOT/usr), so require()
+searched /usr/local/lib/lua/5.1/ for C modules while LuaFileSystem was
+installed in /usr/lib/lua/5.1/.  luakit stopped on its first line:
+
+    Lua error: module 'lfs' not found
+      no file '/usr/local/lib/lua/5.1/lfs.so'
+      ...
+
+listing a dozen candidates, none of them where the file is.  Note the .lua
+list looks longer than the .so list only because luakit appends its own
+directories to package.path; nothing appends to package.cpath, so a C module
+is found through this default or not at all.
+
+Guarding the definition is the whole change -- the fallback is upstream's own
+value, so a build that says nothing still gets /usr/local/ and behaves exactly
+as before.  LUA_LDIR and LUA_CDIR are left alone: they derive from LUA_ROOT,
+so they follow it.
+
+Upstream: not reported (Lua 5.1 is long out of maintenance; 5.2 onwards
+already guard this).
+
+--- a/src/luaconf.h
++++ b/src/luaconf.h
+@@ -94,7 +94,9 @@
+ 	".\\?.dll;"  LUA_CDIR"?.dll;" LUA_CDIR"loadall.dll"
+ 
+ #else
++#ifndef LUA_ROOT
+ #define LUA_ROOT	"/usr/local/"
++#endif
+ #define LUA_LDIR	LUA_ROOT "share/lua/5.1/"
+ #define LUA_CDIR	LUA_ROOT "lib/lua/5.1/"
+ #define LUA_PATH_DEFAULT  \

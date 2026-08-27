@@ -121,6 +121,16 @@ time_t mktime(struct tm *tm)
 	return t;
 }
 
+/* timegm(3): mktime with the broken-down time taken as UTC.  On this system
+ * the two are one operation -- there are no timezones here, localtime() IS
+ * gmtime() -- but portable code (WTF's date handling, for one) selects
+ * timegm by name when the platform offers it, so the honest spelling
+ * exists. */
+time_t timegm(struct tm *tm)
+{
+	return mktime(tm);
+}
+
 /* Helper: append string, return chars written */
 static size_t _fmt_str(char *buf, size_t rem, const char *s)
 {

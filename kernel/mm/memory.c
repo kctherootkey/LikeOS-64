@@ -2037,9 +2037,59 @@ void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys, uint64_t vaddr)
 	g->pages[g->n++] = phys;
 }
 
+/* Pages whose release had to be DEFERRED because their TLB gather ran with
+ * interrupts disabled.
+ *
+ * The shootdown's ack-wait must be able to service the very IPIs it waits
+ * on, so it cannot run with IRQs off -- and a COW fault taken from an
+ * IRQs-off context (a signal frame written onto a forked child's
+ * copy-on-write stack from the IRQ delivery tail is the everyday case)
+ * lands exactly there.  Freeing anyway put pages back in the allocator
+ * while other CPUs still held stale translations to them: whoever got the
+ * page next was scribbled over by a stale writer -- observed for weeks as
+ * unexplainable cross-process heap corruption (poisoned GQueue pointers,
+ * malloc chunk-header damage) in whatever process was unlucky.
+ *
+ * So the pages are parked here instead, and released by the next flush
+ * that CAN shoot down -- gathers run on every COW fault, so the queue
+ * drains within moments on any live system. */
+#define TLB_DEFER_RING 1024
+static uint64_t g_tlb_defer_pages[TLB_DEFER_RING];
+static int g_tlb_defer_n;
+static spinlock_t g_tlb_defer_lock = SPINLOCK_INIT("tlbdefer");
+
+void mm_tlb_deferred_drain(void)
+{
+	if (!g_tlb_defer_n || irqs_disabled())
+		return;
+	/* Chunked: the batch buffer must stay small on the kernel stack, and
+	 * the take-then-shootdown-then-free order per chunk keeps the
+	 * invariant (no page freed before its stale translations die) even
+	 * against entries added concurrently. */
+	for (;;) {
+		uint64_t local[64];
+		int n = 0;
+		uint64_t f;
+
+		spin_lock_irqsave(&g_tlb_defer_lock, &f);
+		while (g_tlb_defer_n > 0 && n < 64)
+			local[n++] = g_tlb_defer_pages[--g_tlb_defer_n];
+		spin_unlock_irqrestore(&g_tlb_defer_lock, f);
+		if (!n)
+			return;
+		/* Every CPU drops every stale translation, then the pages can
+		 * safely re-enter the allocator. */
+		smp_tlb_shootdown_sync();
+		mm_put_pages_batch(local, (unsigned)n);
+	}
+}
+
 void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 {
 	BUG_ON(g == NULL);
+	/* Piggyback: any flush that CAN shoot down also drains what an
+	 * IRQs-off flush had to park. */
+	mm_tlb_deferred_drain();
 	if (g->n == 0)
 		return;
 
@@ -2061,13 +2111,34 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 			else
 				smp_tlb_shootdown_mm_sync(g->pml4_phys);
 		} else {
-			/* Cannot be done from here: the ack-wait needs to be
-			 * able to service the very interrupts it is waiting on.
-			 * Freeing anyway is no worse than the behaviour this
-			 * replaces, but the caller wants fixing, so name it. */
-			WARN_RATELIMIT(
-				1,
-				"TLB gather flushed with interrupts disabled - other CPUs keep stale translations to pages about to be released");
+			/* Cannot shoot down from here: the ack-wait needs to
+			 * service the very interrupts it is waiting on.  Park
+			 * the pages; the next IRQs-on flush releases them
+			 * AFTER a proper shootdown.  See g_tlb_defer_pages. */
+			uint64_t f;
+			int parked = 0;
+
+			spin_lock_irqsave(&g_tlb_defer_lock, &f);
+			while (parked < g->n &&
+			       g_tlb_defer_n < TLB_DEFER_RING)
+				g_tlb_defer_pages[g_tlb_defer_n++] =
+					g->pages[parked++];
+			spin_unlock_irqrestore(&g_tlb_defer_lock, f);
+			if (parked < g->n) {
+				/* Ring full (would take a thousand IRQs-off
+				 * COW faults with no IRQs-on gather between
+				 * them).  Freeing the remainder keeps the old
+				 * corruption window for these pages only;
+				 * say so. */
+				WARN_RATELIMIT(
+					1,
+					"TLB defer ring full - releasing %d pages with possible stale translations",
+					g->n - parked);
+				mm_put_pages_batch(g->pages + parked,
+						   (unsigned)(g->n - parked));
+			}
+			g->n = 0;
+			return;
 		}
 	}
 
@@ -4951,8 +5022,18 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 		return 0;
 
 	uint64_t phys = mm_allocate_physical_page();
-	if (!phys)
+	if (!phys) {
+		/* Out of physical pages is NOT a segfault, but failing this
+		 * fault delivers SIGSEGV to a task touching a perfectly valid
+		 * mapping -- under browser-grade memory pressure that reads
+		 * as a random crash on a library page.  Until there is real
+		 * reclaim-on-fault, at least say what actually happened. */
+		WARN_RATELIMIT(1,
+			       "demand fault: NO FREE PAGES for va=%llx (pid %d) - delivering SIGSEGV",
+			       (unsigned long long)page,
+			       mm ? (int)mm->id : -1);
 		return 0;
+	}
 
 	if (file) {
 		/* Page-in from the backing file.  This sleeps on disk I/O, so
@@ -5024,6 +5105,10 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 	bool ok = mm_map_page_in_address_space(mm->pml4, page, phys, map_flags);
 	spin_unlock_irqrestore(&g_lazy_map_lock, lf);
 	if (!ok) {
+		WARN_RATELIMIT(1,
+			       "demand fault: page-table install failed for va=%llx (pid %d)",
+			       (unsigned long long)page,
+			       mm ? (int)mm->id : -1);
 		mm_free_physical_page(phys);
 		return 0;
 	}

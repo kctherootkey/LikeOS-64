@@ -58,6 +58,10 @@ stage_lib() {
 # The C++ runtime.  Needed by HarfBuzz -- which Pango cannot do without -- so
 # by every GTK program whether or not it is itself C++.
 stage_lib libstdc++
+# ...and the half of it GCC keeps in a separate library: the outlined atomic
+# operations.  WebKit's lock-free structures do 128-bit compare-and-swap,
+# which GCC compiles to __atomic_*_16 calls that only this library answers.
+stage_lib libatomic
 
 # GLib, and the object and I/O layers above it.
 for l in libglib-2.0 libgobject-2.0 libgio-2.0 libgmodule-2.0 libgthread-2.0; do
@@ -91,8 +95,59 @@ stage_lib libtiff
 # The toolkit.
 stage_lib libatk-1.0
 stage_lib libepoxy
+
+# The stub libEGL (ports/xorg/egl-stub/, installed by import-egl-headers.sh).
+# It has to be ON THE IMAGE, not just in the sysroot: epoxy dlopen's
+# libEGL.so.1 at run time -- it is not a DT_NEEDED of anything, so no
+# dependency walk brings it along -- and epoxy abort()s the process when the
+# file is missing rather than reporting that EGL is unavailable.  Every entry
+# point returns 0 so a caller that probes for EGL is answered "no" instead of
+# being killed.
+stage_lib libEGL
 stage_lib libgdk-3
 stage_lib libgtk-3
+
+# Mesa: real OpenGL over llvmpipe.  libEGL above is now Mesa's own (the stub
+# stepped aside the moment Mesa installed -- see import-egl-headers.sh).
+# libGL/libGLESv2 for the APIs, libglapi as their shared dispatch,
+# libgallium as the driver megalibrary, and libLLVM because llvmpipe JITs
+# its rasterizers at run time.  The DRI driver directory is dlopen'd by
+# Mesa's loader with its own search path, so it is copied as a tree.
+for l in libGL libGLESv2 libLLVM libGLU; do stage_lib "$l"; done
+# The gallium megalibrary carries the version INSIDE the name
+# (libgallium-25.3.6.so, no .so.N chain), so stage_lib's pattern misses it.
+for f in "$SYSROOT"/usr/lib/libgallium-*.so; do
+	[ -e "$f" ] || continue
+	cp "$f" "$DEST/lib/$(basename "$f")"
+	staged=$((staged + 1))
+done
+# The DRI driver directory: dril's swrast_dri.so, the legacy-ABI shim the
+# X server's GLX dlopen()s at the path baked in from dri.pc (/usr/lib/dri).
+# Mesa's own client loaders do not use it -- they open libgallium directly.
+if [ -d "$SYSROOT/usr/lib/dri" ]; then
+	mkdir -p "$DEST/usr/lib/dri"
+	for f in "$SYSROOT"/usr/lib/dri/*; do
+		[ -e "$f" ] || continue
+		cp -a "$f" "$DEST/usr/lib/dri/"
+		staged=$((staged + 1))
+	done
+fi
+if [ -d "$SYSROOT/usr/share/drirc.d" ]; then
+	mkdir -p "$DEST/usr/share/drirc.d"
+	cp -a "$SYSROOT"/usr/share/drirc.d/* "$DEST/usr/share/drirc.d/" 2>/dev/null || true
+fi
+# The GL demo clients: the standard first question on a new GL stack is
+# "does glxinfo run", so they belong on the image.  anglecheck is the port's
+# own (user/bin/tests/anglecheck.cpp, built against the WebKit tree's ANGLE
+# archives): it replays WebKit's WebGL context creation step by step and
+# prints the first EGL error, which the browser's release build never does.
+for b in glxinfo glxgears glxgears_fbconfig eglinfo eglgears_x11 \
+	es2_info es2gears_x11 es2tri anglecheck; do
+	if [ -x "$SYSROOT/usr/bin/$b" ]; then
+		cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
+		staged=$((staged + 1))
+	fi
+done
 
 # Claws Mail's own dependencies: TLS, the mail protocols, spell checking, and
 # the protocol that tells the window manager an application is starting.
@@ -155,6 +210,24 @@ stage_lib libxfce4kbd-private-3
 # preference it is given.
 stage_lib libdbus-1
 
+# The WebKit platform, bottom up: Unicode, storage, image and font
+# decompression, crypto, HTTP -- then the engine's own two libraries.
+for l in libicuuc libicui18n libicudata; do stage_lib "$l"; done
+stage_lib libsqlite3
+stage_lib libbrotlicommon
+stage_lib libbrotlidec
+stage_lib libwoff2common
+stage_lib libwoff2dec
+for l in libsharpyuv libwebp libwebpdemux libwebpmux; do stage_lib "$l"; done
+stage_lib libgpg-error
+stage_lib libgcrypt
+stage_lib libpsl
+stage_lib libnghttp2
+stage_lib libxslt
+stage_lib libsoup-3.0
+stage_lib libjavascriptcoregtk-4.1
+stage_lib libwebkit2gtk-4.1
+
 # ---------------------------------------------------------------------------
 # Programs.
 # ---------------------------------------------------------------------------
@@ -181,6 +254,15 @@ done
 # read or set a preference without the dialog that owns it, and the first
 # thing to reach for when a setting does not stick.
 for b in galculator xfce4-terminal hexchat xfconf-query; do
+	[ -f "$SYSROOT/usr/bin/$b" ] || continue
+	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
+	staged=$((staged + 1))
+done
+
+# The web browser, the language it embeds (interpreter and compiler both --
+# luakit's configuration IS Lua, so the tools belong beside it), and the
+# database shell for the storage everything above keeps in SQLite.
+for b in luakit lua luac sqlite3; do
 	[ -f "$SYSROOT/usr/bin/$b" ] || continue
 	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 	staged=$((staged + 1))
@@ -263,6 +345,105 @@ if [ -f "$SYSROOT/usr/lib/xfce4/xfconf/xfconfd" ]; then
 	mkdir -p "$DEST/usr/lib/xfce4/xfconf"
 	cp "$SYSROOT/usr/lib/xfce4/xfconf/xfconfd" \
 		"$DEST/usr/lib/xfce4/xfconf/xfconfd"
+	staged=$((staged + 1))
+fi
+
+# WebKit's auxiliary processes, at the paths compiled into the library: every
+# web view is really these two processes reached over sockets, so a missing
+# WebKitWebProcess is not a degraded browser, it is a blank one.  MiniBrowser
+# ships beside them as the engine's reference client -- the first thing to
+# run when a page misbehaves in luakit, to see whose bug it is.
+if [ -d "$SYSROOT/usr/libexec/webkit2gtk-4.1" ]; then
+	mkdir -p "$DEST/usr/libexec/webkit2gtk-4.1"
+	for h in "$SYSROOT"/usr/libexec/webkit2gtk-4.1/*; do
+		[ -f "$h" ] || continue
+		cp "$h" "$DEST/usr/libexec/webkit2gtk-4.1/"
+		staged=$((staged + 1))
+	done
+fi
+
+# The injected bundle: the library WebKit loads INTO every web process.
+if [ -d "$SYSROOT/usr/lib/webkit2gtk-4.1" ]; then
+	mkdir -p "$DEST/usr/lib"
+	cp -a "$SYSROOT/usr/lib/webkit2gtk-4.1" "$DEST/usr/lib/"
+	staged=$((staged + 1))
+fi
+
+# GIO modules -- above all glib-networking's TLS backend.  Loaded by scanning
+# this directory; without it libsoup answers every https:// request with
+# "TLS support is not available", which surfaces in luakit as a blank page
+# and in Claws as mail that cannot be fetched.
+#
+# No giomodule.cache goes with them, and none is needed.  The cache is an
+# index gio-querymodules writes by DLOPENING each module and asking what
+# extension points it implements -- a target program, so it cannot run on the
+# build host, and glib-networking's own install step says as much ("skipping
+# custom install script because DESTDIR is set").  Absent a cache, GIO's
+# directory scan falls back to loading and initialising every module it finds
+# (giomodule.c, the else arm of the cache lookup), which registers the same
+# extension points; the cache only lets it defer that work until something
+# asks.  The cost is one dlopen of one module at first use.
+if [ -d "$SYSROOT/usr/lib/gio/modules" ]; then
+	mkdir -p "$DEST/usr/lib/gio/modules"
+	for m in "$SYSROOT"/usr/lib/gio/modules/*.so; do
+		[ -f "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/gio/modules/"
+		staged=$((staged + 1))
+	done
+fi
+
+# Claws Mail's plugins -- fancy (the WebKit HTML viewer) is why the directory
+# exists.  Loaded by the path recorded in the user's clawsrc; the skeleton
+# configuration below names fancy.so, so a fresh account starts with HTML
+# mail rendering.
+if [ -d "$SYSROOT/usr/lib/claws-mail/plugins" ]; then
+	mkdir -p "$DEST/usr/lib/claws-mail/plugins"
+	for m in "$SYSROOT"/usr/lib/claws-mail/plugins/*.so; do
+		[ -f "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/claws-mail/plugins/"
+		staged=$((staged + 1))
+	done
+fi
+
+# ...and fancy's OTHER half.  The plugin above runs in the claws process; this
+# runs inside the WebKit web process, which is a separate program, and fancy
+# refuses to load without it:
+#
+#   Error: Failed to find the companion WebKit extension
+#   /usr/lib/claws-mail/web_extensions/fancywebextension.so
+#   Plugin is not functional.
+#
+# Staging the plugins directory alone is not enough, because the two halves
+# live in different directories and only one of them is a "plugin" by claws'
+# own naming.  Nothing else in this tree uses web_extensions, so the loop is
+# written the same way rather than folded into the one above -- the message
+# claws prints names this exact path, and a reader who greps for it should
+# land here.
+if [ -d "$SYSROOT/usr/lib/claws-mail/web_extensions" ]; then
+	mkdir -p "$DEST/usr/lib/claws-mail/web_extensions"
+	for m in "$SYSROOT"/usr/lib/claws-mail/web_extensions/*.so; do
+		[ -f "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/claws-mail/web_extensions/"
+		staged=$((staged + 1))
+	done
+fi
+
+# Lua's C modules: LuaFileSystem, which luakit require()s at startup.  The
+# path is the one compiled into Lua 5.1's package.cpath.
+if [ -d "$SYSROOT/usr/lib/lua" ]; then
+	mkdir -p "$DEST/usr/lib"
+	cp -a "$SYSROOT/usr/lib/lua" "$DEST/usr/lib/"
+	staged=$((staged + 1))
+fi
+
+# luakit's web-process extension: the library WebKit loads into every web
+# process ON LUAKIT'S BEHALF (its userscript and page-scraping half).  The
+# path is compiled into the browser (LUAKIT_LIB_PATH); without the file every
+# page loads but nothing that runs in page context -- follow-mode hints,
+# formfiller -- works, with only a warning on stderr nobody sees.
+if [ -d "$SYSROOT/usr/lib/luakit" ]; then
+	mkdir -p "$DEST/usr/lib"
+	cp -a "$SYSROOT/usr/lib/luakit" "$DEST/usr/lib/"
 	staged=$((staged + 1))
 fi
 
@@ -535,7 +716,7 @@ rm -f "$DEST/usr/share/applications/xfce4-about.desktop"
 # Has to run HERE: the entries written for this image are copied by the X.Org
 # port's staging script, the ones above come from the sysroot, and this is the
 # first moment both are in one directory.  See res/xorg/applications/renames
-# for why these three are renamed rather than replaced.
+# for why they are renamed rather than replaced.
 #
 # Only the unlocalised Name= is touched, and only the first one -- a .desktop
 # file can hold several groups (Desktop Action blocks each have their own
@@ -651,6 +832,41 @@ for d in libfm pcmanfm gtksourceview-4; do
 	staged=$((staged + 1))
 done
 
+# luakit is mostly Lua: the binary is a runtime around /usr/share/luakit,
+# and /etc/xdg/luakit is the system configuration it loads (rc.lua and the
+# defaults).  Without either it prints "cannot find lib directory" and exits.
+if [ -d "$SYSROOT/usr/share/luakit" ]; then
+	mkdir -p "$DEST/usr/share"
+	cp -a "$SYSROOT/usr/share/luakit" "$DEST/usr/share/"
+	staged=$((staged + 1))
+fi
+# Our own userconf.lua, which rc.lua loads if it finds one on the config path
+# (`lousy.util.find_config("userconf.lua")` at the end of rc.lua).  It turns
+# accelerated compositing off, which is the difference between luakit showing a
+# blank page and rendering it -- see the file itself for why.  Order against the
+# upstream directory below does not matter: `cp -a dir target/' MERGES into an
+# existing target/dir rather than nesting a copy inside it, so both orders end
+# with rc.lua, theme.lua and userconf.lua side by side (checked, not assumed).
+if [ -f "$root/res/xorg/gtk3/luakit-userconf.lua" ]; then
+	mkdir -p "$DEST/etc/xdg/luakit"
+	cp "$root/res/xorg/gtk3/luakit-userconf.lua" \
+		"$DEST/etc/xdg/luakit/userconf.lua"
+	staged=$((staged + 1))
+fi
+
+if [ -d "$SYSROOT/etc/xdg/luakit" ]; then
+	mkdir -p "$DEST/etc/xdg"
+	cp -a "$SYSROOT/etc/xdg/luakit" "$DEST/etc/xdg/"
+	staged=$((staged + 1))
+fi
+# The PNG only: the SVG beside it would need librsvg, which is not ported,
+# and the icon lookup falls back to /usr/share/pixmaps by exactly this name.
+if [ -f "$SYSROOT/usr/share/pixmaps/luakit.png" ]; then
+	mkdir -p "$DEST/usr/share/pixmaps"
+	cp "$SYSROOT/usr/share/pixmaps/luakit.png" "$DEST/usr/share/pixmaps/"
+	staged=$((staged + 1))
+fi
+
 # ---------------------------------------------------------------------------
 # Their system-wide defaults, from the sysroot rather than this repository:
 # these are upstream's own files and there is nothing about this system to
@@ -743,7 +959,10 @@ fi
 if [ "${NO_STRIP:-0}" != "1" ] && [ "$staged" -gt 0 ]; then
 	find "$DEST/lib" "$DEST/usr/bin" "$DEST/usr/local/bin" \
 		"$DEST/usr/lib/gtk-3.0" "$DEST/usr/lib/enchant-2" \
-		"$DEST/usr/lib/libfm" "$DEST/usr/libexec" -type f \
+		"$DEST/usr/lib/libfm" "$DEST/usr/libexec" \
+		"$DEST/usr/lib/webkit2gtk-4.1" "$DEST/usr/lib/gio" \
+		"$DEST/usr/lib/claws-mail" "$DEST/usr/lib/lua" \
+		"$DEST/usr/lib/luakit" -type f \
 		\( -name '*.so*' -o -perm -u+x \) \
 		-exec strip --strip-debug {} + 2>/dev/null || true
 fi

@@ -228,8 +228,23 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 				ret = -EINVAL;
 				goto out;
 			}
-			if (offset + length > sobj->size)
-				return -EINVAL; /* past the object's length */
+			/* Bound the mapping by the object's PAGE span, not its
+			 * byte length.  `length` reaches this point already
+			 * rounded up to whole pages, but ftruncate() records
+			 * the exact byte size the caller set -- so comparing
+			 * the two refused every object whose size was not a
+			 * page multiple.  shm_set_size() allocates
+			 * ceil(size / PAGE_SIZE) pages, so the partial last
+			 * page is real, and POSIX maps it (zero tail included).
+			 * WebKit sizes its IPC message bodies to the byte,
+			 * which is how an https response (> 4 KB encoded, so
+			 * out-of-line in shared memory) could never be mapped
+			 * by its own sender, while http responses stayed under
+			 * the inline limit and never touched this path. */
+			uint64_t obj_span = (sobj->size + PAGE_SIZE - 1) &
+					    ~(uint64_t)(PAGE_SIZE - 1);
+			if (offset + length > obj_span)
+				return -EINVAL; /* past the object's pages */
 
 			/* PAGE_DEVICE marks these as pages this address space
 			 * does not own: teardown must not hand them back to the

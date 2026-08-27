@@ -1,0 +1,24 @@
+EGLINFO(1)                  General Commands Manual                 EGLINFO(1)
+
+NAME
+       eglinfo - report EGL information for the available platforms
+
+SYNOPSIS
+       eglinfo [-B] [-p platform]
+
+DESCRIPTION
+       eglinfo lists, per EGL platform, the vendor, version, client APIs and
+       extension strings, and the supported configurations.  On LikeOS the
+       X11 platform is served by Mesa over the software winsys; the client
+       APIs are OpenGL and OpenGL ES 2.
+
+OPTIONS
+       -B     Brief output: omit the configuration tables.
+
+       -p platform
+              Query only the named platform (x11).
+
+SEE ALSO
+       glxinfo(1), glxgears(1)
+
+LikeOS                                                              EGLINFO(1)

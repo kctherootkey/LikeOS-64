@@ -5,7 +5,22 @@
 #include <string.h>
 #include <stdlib.h>
 
-struct dirent64 {
+/* One record as getdents64() actually writes it, which is NOT the public
+ * struct dirent64 in <dirent.h> and must not be confused with it.
+ *
+ * The public one is a fixed-size value type: portable code declares objects of
+ * it, and testlibc requires sizeof/offsetof to match struct dirent exactly.
+ * What the kernel writes is a packed sequence of VARIABLE-length records, each
+ * d_reclen bytes, with the name occupying only as much as it needs.  So the
+ * name is a flexible array here: this type is only ever laid over the buffer,
+ * never instantiated, and giving it a char[256] would tell the compiler that
+ * 256 bytes are readable at d_name -- untrue for the last record in the
+ * buffer, where the record ends well before that.
+ *
+ * The field offsets are identical to the public struct's, so both describe the
+ * same bytes; only the tail differs.  d_off is signed because that is what the
+ * getdents64 record carries; readdir() casts it on the way out. */
+struct getdents64_record {
 	uint64_t d_ino;
 	int64_t d_off;
 	uint16_t d_reclen;
@@ -51,8 +66,9 @@ struct dirent *readdir(DIR *dirp)
 			dirp->buf_len = n;
 			dirp->buf_pos = 0;
 		}
-		struct dirent64 *d =
-			(struct dirent64 *)(dirp->buf + dirp->buf_pos);
+		struct getdents64_record *d =
+			(struct getdents64_record *)(dirp->buf +
+						     dirp->buf_pos);
 		if (d->d_reclen == 0) {
 			return NULL;
 		}

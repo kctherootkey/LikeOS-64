@@ -1,0 +1,71 @@
+GETTEXT(1)                       User Commands                      GETTEXT(1)
+
+NAME
+       gettext - translate message
+
+SYNOPSIS
+       gettext [OPTION] [[TEXTDOMAIN] MSGID]
+       gettext [OPTION] -s [MSGID]...
+
+DESCRIPTION
+       The  gettext  program  translates  a  natural language message into the
+       user's language, by looking up the translation in a message catalog.
+
+       Display native language translation of a textual message.
+
+   Options and arguments:
+       -d, --domain=TEXTDOMAIN
+              retrieve translated messages from TEXTDOMAIN
+
+       -c, --context=CONTEXT
+              specify context for MSGID
+
+       -e     enable expansion of some escape sequences
+
+       -n     suppress trailing newline
+
+       -E     (ignored for compatibility)
+
+       [TEXTDOMAIN] MSGID
+              retrieve translated message corresponding to MSGID from  TEXTDO-
+              MAIN
+
+   Informative output:
+       -h, --help
+              display this help and exit
+
+       -V, --version
+              display version information and exit
+
+       If the TEXTDOMAIN parameter is not given, the domain is determined from
+       the  environment  variable  TEXTDOMAIN.   If the message catalog is not
+       found in the regular directory, another location can be specified  with
+       the  environment  variable TEXTDOMAINDIR.  When used with the -s option
+       the program behaves like the 'echo' command.  But it  does  not  simply
+       copy  its arguments to stdout.  Instead those messages found in the se-
+       lected   catalog   are   translated.    Standard   search    directory:
+       /usr/share/locale
+
+AUTHOR
+       Written by Ulrich Drepper.
+
+REPORTING BUGS
+       Report     bugs    in    the    bug    tracker    at    <https://savan-
+       nah.gnu.org/projects/gettext> or by email to <bug-gettext@gnu.org>.
+
+COPYRIGHT
+       Copyright (C) 1995-2025 Free Software Foundation, Inc.  License GPLv3+:
+       GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>
+       This is free software: you are free  to  change  and  redistribute  it.
+       There is NO WARRANTY, to the extent permitted by law.
+
+SEE ALSO
+       The  full  documentation for gettext is maintained as a Texinfo manual.
+       If the info and gettext programs are properly installed at  your  site,
+       the command
+
+              info gettext
+
+       should give you access to the complete manual.
+
+GNU gettext-runtime 0.26           July 2025                        GETTEXT(1)

@@ -79,6 +79,22 @@ int madvise(void *addr, size_t len, int advice)
 	return 0;
 }
 
+/* mincore(2): one byte per page, bit 0 set when the page is resident.  A
+ * real question on this kernel -- anonymous memory and private file mappings
+ * are demand-paged, so a mapped page that has never been touched has no
+ * frame yet.  JavaScriptCore's heap statistics ask it about every marked
+ * block. */
+int mincore(void *addr, size_t length, unsigned char *vec)
+{
+	long ret = syscall3(SYS_MINCORE, (long)addr, (long)length, (long)vec);
+
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	return 0;
+}
+
 /* msync: flush a mapping back to its backing store.
  *
  * Nothing in this system needs to copy anything back.  A /dev/fb0 mapping

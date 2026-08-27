@@ -1,0 +1,180 @@
+TIFF2PS(1)                          LibTIFF                         TIFF2PS(1)
+
+NAME
+       tiff2ps - convert TIFF image to PostScript
+
+SYNOPSIS
+       tiff2ps [ options ] input.tif
+
+DESCRIPTION
+       tiff2ps  reads  TIFF images and writes PostScript or Encapsulated Post-
+       Script (EPS) on the standard output. By default tiff2ps writes Encapsu-
+       lated PostScript for the first image in the specified TIFF image file.
+
+       By default, tiff2ps will generate PostScript that fills a printed  area
+       specified  by  the  TIFF  tags in the input file.  If the file does not
+       contain XResolution or YResolution tags, then the printed area  is  set
+       according  to  the image dimensions.  The -w and -h options (see below)
+       can be used to set the dimensions of the printed area in inches;  over-
+       riding any relevant TIFF tags.
+
+       The  PostScript  generated  for  RGB, palette, and CMYK images uses the
+       colorimage  operator.   The  PostScript  generated  for  greyscale  and
+       bilevel  images  uses the image operator.  When the colorimage operator
+       is used, PostScript code to emulate this operator on  older  PostScript
+       printers  is also generated.  Note that this emulation code can be very
+       slow.
+
+       Color images with associated alpha data are  composited  over  a  white
+       background.
+
+OPTIONS
+       -1     Generate PostScript Level 1 (the default).
+
+       -2     Generate PostScript Level 2.
+
+       -3     Generate  PostScript Level 3. It basically allows one to use the
+              `/flateDecode filter for ZIP compressed TIFF images.
+
+       -8     Disable use of ASCII85 encoding with PostScript Level 2/3.
+
+       -a     Generate output for all IFDs (pages) in the input file.
+
+       -b margin
+              Specify the bottom margin for the output (in inches). This  does
+              not affect the height of the printed image.
+
+       -c     Center the image in the output. This option only shows an effect
+              if both the -w and the -h option are given.
+
+       -C name
+              Specify the document creator name.
+
+       -d dir Set  the  initial TIFF directory to the specified directory num-
+              ber.  (NB: Directories are numbered starting at zero.)  This op-
+              tion is useful for selecting individual pages  in  a  multi-page
+              (e.g. facsimile) file.
+
+       -D     Enable duplex printing (two pages per sheet of paper).
+
+       -e     Force the generation of Encapsulated PostScript (implies -z).
+
+       -h size
+              Specify the vertical size of the printed area (in inches).
+
+       -H     Specify  the  maximum  height  of image (in inches). Images with
+              larger sizes will be split in several pages. Option  -L  may  be
+              used for specifying size of split images overlapping.
+
+       -i     Enable/disable pixel interpolation.  This option requires a sin-
+              gle  numeric  value:  zero  to  disable  pixel interpolation and
+              non-zero to enable.  The default is enabled.
+
+       -L     Specify the size of overlapping for split  images  (in  inches).
+              Used in conjunction with -H and -W options.
+
+       -l     Specify  the  left  margin for the output (in inches). This does
+              not affect the width of the printed image.
+
+       -M size
+              Set maximum memory allocation size  (in  MiB).  The  default  is
+              256MiB.  Set to 0 to disable the limit.
+
+       -m     Where  possible  render  using the imagemask PostScript operator
+              instead of the image operator.  When this  option  is  specified
+              tiff2ps  will use imagemask for rendering 1 bit deep images.  If
+              this option is not specified or if the image  depth  is  greater
+              than 1 then the image operator is used.
+
+       -o ifdoffset
+              Set  the initial TIFF directory to the IFD at the specified file
+              offset.  This option is useful for  selecting  thumbnail  images
+              and the like which are hidden using the SubIFD tag.
+
+       -O     Write PostScript to specified file instead of standard output.
+
+       -p     Force the generation of (non-Encapsulated) PostScript.
+
+       -P L|P Set  optional  PageOrientation  DSC comment to Landscape or Por-
+              trait.
+
+       -r 90|180|270|auto
+              Rotate image by 90, 180, 270 degrees or auto.   Auto  picks  the
+              best  fit for the image on the specified paper size (eg portrait
+              or landscape) if -h or -w is specified. Rotation is  in  degrees
+              counterclockwise.  Auto  rotates 90 degrees ccw to produce land-
+              scape.
+
+       -s     Generate output for a single IFD (page) in the input file.
+
+       -t title
+              Specify the document title string.
+
+       -T     Print pages for top edge binding.
+
+       -w size
+              Specify the horizontal size of the printed area (in inches).
+
+       -W size
+              Specify the maximum width of  image  (in  inches).  Images  with
+              larger  sizes  will be split in several pages. Options -L and -W
+              are mutually exclusive.
+
+       -x     Override resolution units specified in the TIFF as centimeters.
+
+       -y     Override resolution units specified in the TIFF as inches.
+
+       -z     When generating PostScript Level 2, data is scaled  so  that  it
+              does  not  image  into  the deadzone on a page (the outer margin
+              that the printing device is unable to mark).  This  option  sup-
+              presses  this  behavior.   When PostScript Level 1 is generated,
+              data is imaged to the entire printed page and this option has no
+              affect.
+
+EXAMPLES
+       The following generates PostScript Level 2 for all pages of  a  facsim-
+       ile:
+
+          tiff2ps \-a2 fax.tif | lpr
+
+       Note  also  that if you have version 2.6.1 or newer of Ghostscript then
+       you can efficiently preview facsimile generated with the above command.
+
+       To generate Encapsulated PostScript for a the image at directory  2  of
+       an image use:
+
+          tiff2ps \-d 1 foo.tif
+
+       (Notice that directories are numbered starting at zero.)
+
+       If you have a long image, it may be split in several pages:
+
+          tiff2ps \-h11 \-w8.5 \-H14 \-L.5 foo.tif > foo.ps
+
+       The  page  size is set to 8.5x11 by -w and -h options. We will accept a
+       small amount of vertical compression, so -H set to 14.  Any  pages  be-
+       tween 11 and 14 inches will be fit onto one page.  Pages longer than 14
+       inches  are  cut off at 11 and continued on the next page. The -L.5 op-
+       tion says to repeat a half inch on the next page (to improve  readabil-
+       ity).
+
+BUGS
+       Because  PostScript  does  not  support the notion of a colormap, 8-bit
+       palette images produce 24-bit PostScript images.  This  conversion  re-
+       sults  in  output  that is six times bigger than the original image and
+       which takes a long time to send to a printer over a serial line.   Mat-
+       ters are even worse for 4-, 2-, and 1-bit palette images.
+
+       Does not handle tiled images when generating PostScript Level I output.
+
+SEE ALSO
+       pal2rgb  (1),  tiffinfo  (1),  tiffcp  (1), tiffgt (1), tiffmedian (1),
+       tiff2bw (1), libtiff (3tiff),
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                       TIFF2PS(1)

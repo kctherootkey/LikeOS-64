@@ -386,6 +386,9 @@ Button2 =	: frame		: f.raiselower
 #
 # When a program is added to ports/xorg/packages.list and staged, add it here.
 #
+# The browser is named the way res/xorg/applications/renames names it:
+# program and role together, so the entry says what it opens.
+#
 menu "defops"
 {
     "LikeOS"		f.title
@@ -394,7 +397,7 @@ menu "defops"
     "Editor"		!"mousepad &"
     "Xnedit"	!"xnedit &"
     "Mail"		!"claws-mail &"
-    "Browser"	!"netsurf &"
+    "Luakit Web Browser"	!"luakit &"
     "Calculator"	!"xcalc &"
     ""			f.separator
     "Restart ctwm"	f.restart

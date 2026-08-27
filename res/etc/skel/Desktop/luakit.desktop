@@ -1,0 +1,12 @@
+# A Type=Link shortcut, not a copy of the application's own desktop entry --
+# see xterm.desktop next to this file for why that distinction matters to
+# PCManFM.
+#
+# The name says both what it is and what it does: luakit is the image's web
+# browser (WebKit-engined), and the taskbar's Programs menu shows whatever
+# this file says.
+[Desktop Entry]
+Type=Link
+Name=Luakit Web Browser
+Icon=luakit
+URL=/usr/share/applications/luakit.desktop

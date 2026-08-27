@@ -304,6 +304,13 @@ typedef struct {
     Elf64_Word n_type;
 } Elf64_Nhdr;
 
+/* Note types for the SHT_NOTE/PT_NOTE sections a GNU toolchain emits.  The
+ * build id is the one readers care about: a hash of the object stamped at
+ * link time, which is how a cache keyed to "this exact binary" (JSC's
+ * bytecode cache, a debugger's symbol lookup) recognises it. */
+#define NT_GNU_ABI_TAG   1
+#define NT_GNU_BUILD_ID  3
+
 #ifdef __cplusplus
 }
 #endif

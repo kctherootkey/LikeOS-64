@@ -604,6 +604,18 @@ double modf(double x, double *iptr)
 	return x - i;
 }
 
+float modff(float x, float *iptr)
+{
+	/* Not (float)modf(): the integral part must be computed and stored in
+	 * FLOAT precision, or a float just below a large power of two could
+	 * round the wrong way through the double round-trip. */
+	float i = truncf(x);
+
+	if (iptr)
+		*iptr = i;
+	return x - i;
+}
+
 /* float entry points, for callers that use the f-suffixed names. */
 float sqrtf(float x) { return (float)sqrt(x); }
 float expf(float x) { return (float)exp(x); }
@@ -858,4 +870,473 @@ long double scalblnl(long double x, long e)
 	else if (e < -100000L)
 		e = -100000L;
 	return ldexpl(x, (int)e);
+}
+
+/* ========================================================================
+ * The rest of the C99 surface (7.12.6-7.12.14), added for the C++ runtime.
+ *
+ * libstdc++'s configure names every one of these in a single probe program,
+ * and one missing declaration switches every std:: math wrapper off --
+ * <cmath> then has no std::round, which is where ICU's build first stopped.
+ * The float and long double variants delegate to double, the convention the
+ * whole file already follows.
+ * ======================================================================== */
+
+/* float counterpart of u2d() at the top of the file. */
+static inline float u2f_(uint32_t u)
+{
+	union {
+		float f;
+		uint32_t u;
+	} v;
+	v.u = u;
+	return v.f;
+}
+
+/* Exponent extraction (7.12.6.11, 7.12.6.5).
+ *
+ * Read from the bit pattern rather than computed with a logarithm: logb must
+ * be exact, and a subnormal's exponent is below what the biased field can
+ * say, so the mantissa is renormalised first with an exact power-of-two
+ * multiply. */
+double logb(double x)
+{
+	uint64_t u = d2u(x);
+	int e = (int)((u >> 52) & 0x7FF);
+
+	if (e == 0x7FF) {
+		if (u << 12)
+			return x; /* NaN propagates */
+		return u2d(0x7FF0000000000000ULL); /* logb(+-inf) = +inf */
+	}
+	if (e == 0) {
+		if ((u << 1) == 0) /* logb(+-0) = -inf, and it is exact */
+			return u2d(0xFFF0000000000000ULL);
+		/* Subnormal: renormalise, then correct for the scaling. */
+		return logb(x * 0x1p64) - 64.0;
+	}
+	return (double)(e - 1023);
+}
+
+int ilogb(double x)
+{
+	uint64_t u = d2u(x);
+	int e = (int)((u >> 52) & 0x7FF);
+
+	if (e == 0x7FF)
+		return (u << 12) ? FP_ILOGBNAN : 2147483647;
+	if (e == 0) {
+		if ((u << 1) == 0)
+			return FP_ILOGB0;
+		return ilogb(x * 0x1p64) - 64;
+	}
+	return e - 1023;
+}
+
+float logbf(float x) { return (float)logb((double)x); }
+int ilogbf(float x)
+{
+	/* Through double, which represents every float exactly, so the
+	 * special-value answers carry over unchanged. */
+	return ilogb((double)x);
+}
+long double logbl(long double x) { return (long double)logb((double)x); }
+int ilogbl(long double x) { return ilogb((double)x); }
+
+/* Next representable value (7.12.11.3-4).
+ *
+ * Stepping the bit pattern by one IS the operation: IEEE-754 doubles of one
+ * sign compare like their bit patterns, so +-1 in the integer view is the
+ * adjacent value, subnormals and exponent boundaries included. */
+double nextafter(double x, double y)
+{
+	if (isnan(x) || isnan(y))
+		return x + y;
+	if (x == y)
+		return y; /* including the +0/-0 pair, per the standard */
+
+	uint64_t u = d2u(x);
+	if ((u << 1) == 0) {
+		/* From zero, the first step is the smallest subnormal with
+		 * the direction's sign. */
+		return u2d((y > 0.0) ? 1ULL : 0x8000000000000001ULL);
+	}
+	/* Toward the target means away from zero when the signs of x and the
+	 * direction agree, toward zero when they do not. */
+	if ((x < y) == (x > 0.0))
+		u++;
+	else
+		u--;
+	return u2d(u);
+}
+
+float nextafterf(float x, float y)
+{
+	if (isnan(x) || isnan(y))
+		return x + y;
+	if (x == y)
+		return y;
+
+	union { float f; uint32_t u; } v;
+	v.f = x;
+	if ((v.u << 1) == 0)
+		return (y > 0.0f) ? u2f_(1u) : u2f_(0x80000001u);
+	if ((x < y) == (x > 0.0f))
+		v.u++;
+	else
+		v.u--;
+	return v.f;
+}
+
+long double nextafterl(long double x, long double y)
+{
+	/* long double computes in double here, like the rest of the file. */
+	return (long double)nextafter((double)x, (double)y);
+}
+
+double nexttoward(double x, long double y)
+{
+	/* The comparison happens at the wider type so a target between two
+	 * doubles still says which way to step. */
+	if ((long double)x == y)
+		return (double)y;
+	return nextafter(x, (y > (long double)x) ? u2d(0x7FF0000000000000ULL)
+						 : u2d(0xFFF0000000000000ULL));
+}
+
+float nexttowardf(float x, long double y)
+{
+	if ((long double)x == y)
+		return (float)y;
+	return nextafterf(x, (y > (long double)x) ? u2f_(0x7F800000u)
+						  : u2f_(0xFF800000u));
+}
+
+long double nexttowardl(long double x, long double y)
+{
+	return nextafterl(x, y);
+}
+
+/* IEEE remainder (7.12.10.2-3), on the x87 unit.
+ *
+ * fprem1 is the instruction FOR this operation: it reduces by the quotient
+ * rounded to nearest-even -- exactly the definition -- and it is exact, where
+ * the naive x - rint(x/y)*y loses the answer entirely once x/y overflows the
+ * mantissa.  The instruction reduces the exponent difference by at most 63
+ * per issue and says "not done yet" in C2, hence the loop.
+ *
+ * remquo additionally reports the low three bits of that quotient, which is
+ * precisely what condition bits C0, C3, C1 hold after the final reduction
+ * (Q2, Q1, Q0 in the manual's naming). */
+double remainder(double x, double y)
+{
+	if (isnan(x) || isnan(y))
+		return x + y;
+	if (isinf(x) || y == 0.0)
+		return u2d(0x7FF8000000000000ULL); /* domain error: NaN */
+
+	double r = x;
+	unsigned short sw;
+	do {
+		__asm__ volatile("fprem1\n\tfnstsw %%ax"
+				 : "=t"(r), "=a"(sw)
+				 : "0"(r), "u"(y)
+				 : "cc");
+	} while (sw & 0x0400); /* C2: reduction incomplete */
+	return r;
+}
+
+double remquo(double x, double y, int *quo)
+{
+	if (quo)
+		*quo = 0;
+	if (isnan(x) || isnan(y))
+		return x + y;
+	if (isinf(x) || y == 0.0)
+		return u2d(0x7FF8000000000000ULL);
+
+	double r = x;
+	unsigned short sw;
+	do {
+		__asm__ volatile("fprem1\n\tfnstsw %%ax"
+				 : "=t"(r), "=a"(sw)
+				 : "0"(r), "u"(y)
+				 : "cc");
+	} while (sw & 0x0400);
+
+	if (quo) {
+		/* C0 (0x0100) = Q2, C3 (0x4000) = Q1, C1 (0x0200) = Q0. */
+		int q = ((sw & 0x0100) ? 4 : 0) | ((sw & 0x4000) ? 2 : 0) |
+			((sw & 0x0200) ? 1 : 0);
+		/* The quotient's sign is the XOR of the operands' signs. */
+		if ((d2u(x) ^ d2u(y)) & 0x8000000000000000ULL)
+			q = -q;
+		*quo = q;
+	}
+	return r;
+}
+
+float remainderf(float x, float y) { return (float)remainder(x, y); }
+float remquof(float x, float y, int *quo)
+{
+	return (float)remquo((double)x, (double)y, quo);
+}
+long double remainderl(long double x, long double y)
+{
+	return (long double)remainder((double)x, (double)y);
+}
+long double remquol(long double x, long double y, int *quo)
+{
+	return (long double)remquo((double)x, (double)y, quo);
+}
+
+/* Fused multiply-add (7.12.13.1), in plain double arithmetic.
+ *
+ * NOT __float128: the soft-float routines that would drag in live in libgcc
+ * with hidden visibility, so a libc.so referencing them cannot be linked
+ * against at all -- every executable link fails with "hidden symbol
+ * __addtf3 referenced by DSO".
+ *
+ * Instead the classical error-free transformations: Dekker's splitting makes
+ * the product exact as a hi+lo pair (x*y == p + e, exactly), Knuth's two-sum
+ * makes the first addition exact the same way, and only the final collapse
+ * rounds.  That last step can double-round in the same sub-ulp sliver the
+ * quad approach could; it is the file's usual trade -- an ulp-accurate
+ * fma whose one job here (letting the C++ runtime and WebKit's std:: calls
+ * resolve) it does exactly.
+ *
+ * The splitter overflows for |x| >= 2^970, so arguments that large (or
+ * non-finite) take the naive path: at those magnitudes the product has
+ * overflowed or the error term is beyond the format anyway. */
+double fma(double x, double y, double z)
+{
+	if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
+	    fabs(x) >= 0x1p970 || fabs(y) >= 0x1p970 || fabs(z) >= 0x1p970 ||
+	    x == 0.0 || y == 0.0)
+		return x * y + z;
+
+	const double C = 0x1p27 + 1.0; /* Dekker's splitter for 53 bits */
+	double t, xh, xl, yh, yl;
+
+	t = C * x;
+	xh = t - (t - x);
+	xl = x - xh;
+	t = C * y;
+	yh = t - (t - y);
+	yl = y - yh;
+
+	double p = x * y; /* rounded product */
+	double e = ((xh * yh - p) + xh * yl + xl * yh) + xl * yl;
+	/* x*y == p + e, exactly */
+
+	double s = p + z; /* rounded first sum */
+	double v = s - p;
+	double err = (p - (s - v)) + (z - v);
+	/* p + z == s + err, exactly */
+
+	return s + (err + e);
+}
+
+float fmaf(float x, float y, float z)
+{
+	/* Exact: the float product fits a double's mantissa whole, and the
+	 * one rounding to float happens at the end. */
+	return (float)((double)x * (double)y + (double)z);
+}
+
+long double fmal(long double x, long double y, long double z)
+{
+	return (long double)fma((double)x, (double)y, (double)z);
+}
+
+/* The error function pair (7.12.8.1-2).
+ *
+ * Two regimes, split where each method is comfortably inside its range:
+ *
+ *   |x| < 2.5   the Maclaurin series erf(x) = 2/sqrt(pi) * sum
+ *               (-1)^n x^(2n+1) / (n! (2n+1)).  Alternating with factorial
+ *               decay; at x = 2.5 the largest term is ~2^9 against an answer
+ *               near 1, so under seven digits of cancellation -- fine in
+ *               double.
+ *
+ *   |x| >= 2.5  the continued fraction erfc(x) = exp(-x^2)/sqrt(pi) *
+ *               1/(x + (1/2)/(x + (2/2)/(x + (3/2)/(x + ...)))), evaluated
+ *               with modified Lentz.  Converges in a few dozen terms and has
+ *               no cancellation at all.
+ *
+ * erfc for small x comes from 1 - erf (harmless there: erf < 0.9996), and
+ * erf for large x from 1 - erfc, where erfc is already tiny. */
+static double erf_series(double x)
+{
+	double t = x; /* term n = 0 */
+	double s = x;
+	double x2 = x * x;
+	for (int n = 1; n < 80; n++) {
+		t *= -x2 / n;
+		double add = t / (2 * n + 1);
+		s += add;
+		if (fabs(add) < 1e-20 * fabs(s))
+			break;
+	}
+	return s * 1.1283791670955125739; /* 2/sqrt(pi) */
+}
+
+static double erfc_cf(double x) /* x >= 2.5 */
+{
+	/* Modified Lentz on the continued fraction above. */
+	double tiny = 1e-300;
+	double f = x, c = f, d = 0.0;
+	for (int n = 1; n < 300; n++) {
+		double a = n * 0.5;
+		/* b = x for every level; a walks 1/2, 1, 3/2, ... */
+		d = x + a * d;
+		if (fabs(d) < tiny)
+			d = tiny;
+		c = x + a / c;
+		if (fabs(c) < tiny)
+			c = tiny;
+		d = 1.0 / d;
+		double delta = c * d;
+		f *= delta;
+		if (fabs(delta - 1.0) < 1e-17)
+			break;
+	}
+	/* f now holds x + CF; erfc = exp(-x^2)/sqrt(pi) / f. */
+	return exp(-x * x) * 0.5641895835477562869 / f;
+}
+
+double erf(double x)
+{
+	if (isnan(x))
+		return x;
+	double ax = fabs(x);
+	double r;
+	if (ax < 2.5)
+		r = erf_series(ax);
+	else if (ax < 40.0)
+		r = 1.0 - erfc_cf(ax);
+	else
+		r = 1.0;
+	return (x < 0) ? -r : r;
+}
+
+double erfc(double x)
+{
+	if (isnan(x))
+		return x;
+	if (x < 0)
+		return 2.0 - erfc(-x);
+	if (x < 2.5)
+		return 1.0 - erf_series(x);
+	if (x > 27.5)
+		return 0.0; /* underflows: exp(-x^2) below the format */
+	return erfc_cf(x);
+}
+
+float erff(float x) { return (float)erf((double)x); }
+float erfcf(float x) { return (float)erfc((double)x); }
+long double erfl(long double x) { return (long double)erf((double)x); }
+long double erfcl(long double x) { return (long double)erfc((double)x); }
+
+/* The gamma functions (7.12.8.3-4), by Lanczos approximation (g = 7, the
+ * standard nine-coefficient set), with the reflection formula carrying
+ * arguments below one half.  Good to ~1e-13 relative over the real line,
+ * which is the same neighbourhood the x87 transcendentals above live in.
+ *
+ * lgamma computes through the logarithm of the same approximation rather
+ * than log(tgamma(x)), so it keeps working long after tgamma has overflowed
+ * (tgamma overflows past x = 171.6; lgamma is finite to the end of the
+ * format). */
+static const double lanczos_g = 7.0;
+static const double lanczos_c[9] = {
+	0.99999999999980993,
+	676.5203681218851,
+	-1259.1392167224028,
+	771.32342877765313,
+	-176.61502916214059,
+	12.507343278686905,
+	-0.13857109526572012,
+	9.9843695780195716e-6,
+	1.5056327351493116e-7,
+};
+
+static double lanczos_sum(double x) /* x >= 0.5 */
+{
+	double a = lanczos_c[0];
+	for (int i = 1; i < 9; i++)
+		a += lanczos_c[i] / (x - 1.0 + i);
+	return a;
+}
+
+double tgamma(double x)
+{
+	if (isnan(x))
+		return x;
+	if (x == 0.0)
+		return copysign(u2d(0x7FF0000000000000ULL), x); /* pole */
+	if (x < 0.0 && x == trunc(x))
+		return u2d(0x7FF8000000000000ULL); /* negative integer: NaN */
+	if (x < 0.5) {
+		/* Reflection: gamma(x) = pi / (sin(pi x) gamma(1 - x)). */
+		return 3.14159265358979323846 /
+		       (sin(3.14159265358979323846 * x) * tgamma(1.0 - x));
+	}
+	double z = x - 1.0;
+	double t = z + lanczos_g + 0.5;
+	return 2.5066282746310002 /* sqrt(2 pi) */
+	       * pow(t, z + 0.5) * exp(-t) * lanczos_sum(x);
+}
+
+double lgamma(double x)
+{
+	if (isnan(x))
+		return x;
+	if (x == trunc(x) && x <= 0.0)
+		return u2d(0x7FF0000000000000ULL); /* poles: +inf */
+	if (x < 0.5) {
+		/* log|gamma(x)| = log(pi/|sin(pi x)|) - log|gamma(1 - x)| */
+		return log(3.14159265358979323846 /
+			   fabs(sin(3.14159265358979323846 * x))) -
+		       lgamma(1.0 - x);
+	}
+	double z = x - 1.0;
+	double t = z + lanczos_g + 0.5;
+	return 0.91893853320467274178 /* log(sqrt(2 pi)) */
+	       + (z + 0.5) * log(t) - t + log(lanczos_sum(x));
+}
+
+float tgammaf(float x) { return (float)tgamma((double)x); }
+float lgammaf(float x) { return (float)lgamma((double)x); }
+long double tgammal(long double x) { return (long double)tgamma((double)x); }
+long double lgammal(long double x) { return (long double)lgamma((double)x); }
+
+/* Width variants the probe wants and nothing here had yet: each one computes
+ * in double, which represents every float exactly. */
+float exp2f(float x) { return (float)exp2((double)x); }
+float expm1f(float x) { return (float)expm1((double)x); }
+float log1pf(float x) { return (float)log1p((double)x); }
+float fdimf(float a, float b) { return (float)fdim((double)a, (double)b); }
+float rintf(float x) { return (float)rint((double)x); }
+float nearbyintf(float x) { return (float)rint((double)x); }
+long lrintf(float x) { return lrint((double)x); }
+long long llrintf(float x) { return llrint((double)x); }
+
+long double exp2l(long double x) { return (long double)exp2((double)x); }
+long double expm1l(long double x) { return (long double)expm1((double)x); }
+long double log1pl(long double x) { return (long double)log1p((double)x); }
+long double fdiml(long double a, long double b)
+{
+	return (long double)fdim((double)a, (double)b);
+}
+long double rintl(long double x) { return (long double)rint((double)x); }
+long double nearbyintl(long double x) { return (long double)rint((double)x); }
+long lrintl(long double x) { return lrint((double)x); }
+long long llrintl(long double x) { return llrint((double)x); }
+long double fminl(long double a, long double b)
+{
+	return (long double)fmin((double)a, (double)b);
+}
+long double fmaxl(long double a, long double b)
+{
+	return (long double)fmax((double)a, (double)b);
 }

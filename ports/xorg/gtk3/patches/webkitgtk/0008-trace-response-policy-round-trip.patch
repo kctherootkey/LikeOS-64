@@ -1,0 +1,124 @@
+Trace the response-policy round trip under WEBKIT_SOUP_LOG.
+
+Patch 0007 settled where the https hang is NOT: with its read-loop tracing in
+the running image, an https load prints no [read] lines at all, so
+NetworkDataTaskSoup::read() is never called.  The 512 bytes in the soup wire
+log are libsoup's own MIME-sniff read, made inside soup_session_send_async()
+before WebKit ever touches the stream -- not the browser consuming the body.
+
+read() is reached only from the completion handler of didReceiveResponse(),
+and for a main resource that completion is an IPC round trip:
+
+  network   NetworkResourceLoader::didReceiveResponse
+              -> WebResourceLoader::DidReceiveResponse            (IPC ->)
+  web       WebResourceLoader::didReceiveResponse
+              -> policy decided (via the UI process)
+              -> NetworkResourceLoader::ContinueDidReceiveResponse (IPC <-)
+  network   continueDidReceiveResponse -> completion(Use) -> read()
+
+http completes this loop and https never does.  The release logs that cover
+every hop (LOADER_RELEASE_LOG, WEBRESOURCELOADER_RELEASE_LOG) are compiled out
+of this build -- WEBKIT_DEBUG=Network prints nothing -- so the stalled hop is
+invisible.  This puts one line at each hop, in both processes, gated on
+WEBKIT_SOUP_LOG like 0006/0007.  The last [hop] line printed names the hop
+that never happened.
+
+Upstream: not reportable -- bring-up instrumentation.
+
+--- a/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
+@@ -375,6 +375,11 @@
+ 
+     GUniqueOutPtr<GError> error;
+     GRefPtr<GInputStream> inputStream = adoptGRef(soup_session_send_finish(soupSession, result, &error.outPtr()));
++    // Round-trip tracing, on with WEBKIT_SOUP_LOG (see 0008): soup has finished
++    // its part -- headers parsed, MIME type sniffed -- and hands over the body
++    // stream here.  Everything after this line until read() is policy IPC.
++    if (getenv("WEBKIT_SOUP_LOG"))
++        WTFLogAlways("[hop] net: soup stream ready (%s)", error ? error->message : "ok");
+     if (error)
+         task->didFail(ResourceError::httpError(data->soupMessage.get(), error.get()));
+     else
+@@ -412,6 +417,9 @@
+     m_response.setDeprecatedNetworkLoadMetrics(Box<NetworkLoadMetrics>::create(m_networkLoadMetrics));
+ 
+     didReceiveResponse(ResourceResponse(m_response), NegotiatedLegacyTLS::No, PrivateRelayed::No, std::nullopt, [this, protectedThis = Ref { *this }](PolicyAction policyAction) {
++        // The far end of the round trip: only from here can read() start.
++        if (getenv("WEBKIT_SOUP_LOG"))
++            WTFLogAlways("[hop] net: policy completion arrived, action=%d state=%d", (int)policyAction, (int)m_state);
+         if (m_state == State::Canceling || m_state == State::Completed) {
+             clearRequest();
+             return;
+--- a/Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp
++++ b/Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp
+@@ -26,6 +26,8 @@
+ #include "config.h"
+ #include "NetworkResourceLoader.h"
+ 
++#include <cstdlib>
++
+ #include "ArgumentCoders.h"
+ #include "EarlyHintsResourceLoader.h"
+ #include "FormDataReference.h"
+@@ -911,6 +913,11 @@
+ 
+ void NetworkResourceLoader::didReceiveResponse(ResourceResponse&& receivedResponse, PrivateRelayed privateRelayed, ResponseCompletionHandler&& completionHandler)
+ {
++    // Round-trip tracing, on with WEBKIT_SOUP_LOG (see soup patch 0008).  The
++    // LOADER_RELEASE_LOG lines through this path are compiled out of this
++    // build, which is why the stalled hop was invisible.
++    if (getenv("WEBKIT_SOUP_LOG"))
++        WTFLogAlways("[hop] net: NetworkResourceLoader::didReceiveResponse status=%d main=%d", receivedResponse.httpStatusCode(), isMainResource());
+     LOADER_RELEASE_LOG("didReceiveResponse: (httpStatusCode=%d, MIMEType=%" PUBLIC_LOG_STRING ", expectedContentLength=%lld, hasCachedEntryForValidation=%d, hasNetworkLoadChecker=%d)", receivedResponse.httpStatusCode(), receivedResponse.mimeType().utf8().data(), receivedResponse.expectedContentLength(), !!m_cacheEntryForValidation, !!m_networkLoadChecker);
+ 
+ #if ENABLE(CONTENT_FILTERING)
+@@ -1054,6 +1061,8 @@
+         // a main resource because the embedding client must decide whether to allow the load.
+         bool willWaitForContinueDidReceiveResponse = isMainResource();
+         LOADER_RELEASE_LOG("didReceiveResponse: Sending WebResourceLoader::DidReceiveResponse IPC (willWaitForContinueDidReceiveResponse=%d)", willWaitForContinueDidReceiveResponse);
++        if (getenv("WEBKIT_SOUP_LOG"))
++            WTFLogAlways("[hop] net: sending DidReceiveResponse to web process, willWait=%d", willWaitForContinueDidReceiveResponse);
+         sendDidReceiveResponsePotentiallyInNewBrowsingContextGroup(response, privateRelayed, willWaitForContinueDidReceiveResponse);
+ 
+         if (shouldSendResourceLoadMessages())
+@@ -1573,6 +1582,8 @@
+ 
+ void NetworkResourceLoader::continueDidReceiveResponse()
+ {
++    if (getenv("WEBKIT_SOUP_LOG"))
++        WTFLogAlways("[hop] net: ContinueDidReceiveResponse arrived, handlers=%zu", m_responseCompletionHandlers.size());
+     LOADER_RELEASE_LOG("continueDidReceiveResponse: (hasCacheEntryWaitingForContinueDidReceiveResponse=%d, pendingResponseCompletionHandlers=%zu)", !!m_cacheEntryWaitingForContinueDidReceiveResponse, m_responseCompletionHandlers.size());
+     if (m_serviceWorkerFetchTask) {
+         LOADER_RELEASE_LOG("continueDidReceiveResponse: continuing with ServiceWorkerFetchTask (fetchIdentifier=%" PRIu64 ")", m_serviceWorkerFetchTask->fetchIdentifier().toUInt64());
+--- a/Source/WebKit/WebProcess/Network/WebResourceLoader.cpp
++++ b/Source/WebKit/WebProcess/Network/WebResourceLoader.cpp
+@@ -26,6 +26,8 @@
+ #include "config.h"
+ #include "WebResourceLoader.h"
+ 
++#include <cstdlib>
++
+ #include "FormDataReference.h"
+ #include "Logging.h"
+ #include "MessageSenderInlines.h"
+@@ -157,6 +159,11 @@
+ 
+ void WebResourceLoader::didReceiveResponse(ResourceResponse&& response, PrivateRelayed privateRelayed, bool needsContinueDidReceiveResponseMessage, std::optional<NetworkLoadMetrics>&& metrics)
+ {
++    // Round-trip tracing, on with WEBKIT_SOUP_LOG (see soup patch 0008): the
++    // response has crossed IPC into the web process.  If this line never
++    // prints for an https load, the message was lost in transit.
++    if (getenv("WEBKIT_SOUP_LOG"))
++        WTFLogAlways("[hop] web: DidReceiveResponse arrived status=%d needsContinue=%d", response.httpStatusCode(), needsContinueDidReceiveResponseMessage);
+     RefPtr coreLoader = m_coreLoader;
+     LOG(Network, "(WebProcess) WebResourceLoader::didReceiveResponse for '%s'. Status %d.", coreLoader->url().string().latin1().data(), response.httpStatusCode());
+     WEBRESOURCELOADER_RELEASE_LOG(WEBRESOURCELOADER_DIDRECEIVERESPONSE, response.httpStatusCode());
+@@ -181,6 +188,8 @@
+ #if ASSERT_ENABLED
+             m_isProcessingNetworkResponse = false;
+ #endif
++            if (getenv("WEBKIT_SOUP_LOG"))
++                WTFLogAlways("[hop] web: policy decided, sendingContinue=%d", !!(m_coreLoader && coreLoader->identifier()));
+             // If coreLoader becomes null as a result of the didReceiveResponse callback, we can't use the send function().
+             if (m_coreLoader && coreLoader->identifier())
+                 send(Messages::NetworkResourceLoader::ContinueDidReceiveResponse());

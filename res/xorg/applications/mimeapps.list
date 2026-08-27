@@ -40,16 +40,25 @@ application/x-shellscript=org.xfce.mousepad.desktop
 application/xml=org.xfce.mousepad.desktop
 text/xml=org.xfce.mousepad.desktop
 
-# Web pages and the image formats NetSurf can display go to the browser, which
-# is also the only program on this image that can show a picture at all.
-text/html=netsurf.desktop
-application/xhtml+xml=netsurf.desktop
-image/png=netsurf.desktop
-image/jpeg=netsurf.desktop
-image/gif=netsurf.desktop
-image/bmp=netsurf.desktop
-x-scheme-handler/http=netsurf.desktop
-x-scheme-handler/https=netsurf.desktop
+# Web pages and the http(s) schemes go to luakit, the WebKit browser: it is
+# the one on this image that renders a current page, and a default that opened
+# something else would be a default nobody keeps.
+#
+# Exactly the types luakit's own desktop entry claims, no more.  Its MimeType
+# line is the program's statement about what it handles, and using anything
+# else as the rule here would be this file guessing on its behalf.
+text/html=luakit.desktop
+application/xhtml+xml=luakit.desktop
+x-scheme-handler/http=luakit.desktop
+x-scheme-handler/https=luakit.desktop
+
+# The image formats go to the browser too: nothing on the image is an image
+# viewer, and luakit displays a picture given its path.  luakit's own desktop
+# entry does not claim these types, so they are assigned here.
+image/png=luakit.desktop
+image/jpeg=luakit.desktop
+image/gif=luakit.desktop
+image/bmp=luakit.desktop
 
 # Mail: a mailbox file, and the mailto: links every other program produces.
 application/mbox=claws-mail.desktop

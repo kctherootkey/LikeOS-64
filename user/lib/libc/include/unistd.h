@@ -271,6 +271,9 @@ long sysconf(int name);
 #define GRND_INSECURE   0x0004u
 
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags);
+/* Fill buf completely with random bytes or fail; buflen capped at 256.  The
+ * POSIX-adopted small-buffer form of the same entropy source. */
+int getentropy(void *buf, size_t buflen);
 
 // ELF auxiliary vector
 unsigned long getauxval(unsigned long type);

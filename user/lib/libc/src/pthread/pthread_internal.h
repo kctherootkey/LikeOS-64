@@ -111,6 +111,12 @@ struct __pthread {
 
     // Padding to ensure alignment
     char _pad[28];
+	/* Thread name, pthread_setname_np().  Fixed 16 bytes INCLUDING the
+	 * terminator, the size every conventional Unix uses, so ported code's
+	 * truncation expectations hold.  At the END of the struct: the front
+	 * is ABI (self at %fs:0, the canary at %fs:0x28 -- the static asserts
+	 * below guard exactly that). */
+	char name[16];
 };
 
 /* The loader reserves exactly LIKEOS_TCB_RESERVE bytes at the thread pointer

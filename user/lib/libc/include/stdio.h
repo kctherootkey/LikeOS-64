@@ -84,7 +84,17 @@ struct _IO_FILE {
      * sequence and continue on the next call. */
     unsigned wc_count;
     unsigned wc_value;
+    /* open_memstream(): a write-only stream whose backing store is a
+     * growing malloc'd buffer instead of a descriptor.  wbuf IS the
+     * buffer; these publish it to the caller's pointers on every flush.
+     * Fields sit at the END of the struct: FILE objects are allocated by
+     * this library only, so appending members never disturbs a caller. */
+    int ms;             /* 1 = memstream */
+    char **ms_bufp;     /* caller's buffer pointer, kept current */
+    size_t *ms_sizep;   /* caller's size, kept current */
 };
+
+FILE *open_memstream(char **bufp, size_t *sizep);
 
 extern FILE* stdin;
 extern FILE* stdout;

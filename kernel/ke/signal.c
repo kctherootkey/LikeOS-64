@@ -14,6 +14,34 @@
 // NOTE: Signal delivery now uses per-CPU storage via percpu_t
 // The old global syscall_signal_pending is deprecated.
 
+/* Capture / restore the interrupted context's x87/SSE state for the signal
+ * frame -- see the fpu[] field in signal_frame_t.  At both delivery points
+ * (syscall tail and IRQ tail) the hardware registers hold the CURRENT task's
+ * user state (the context switch saves and restores it around every
+ * migration), so a plain FXSAVE here reads the state the frame must
+ * preserve.  FXSAVE/FXRSTOR demand a 16-byte-aligned buffer and the packed
+ * frame cannot promise one, so both go through an aligned bounce. */
+static void sigframe_fpu_capture(uint8_t *dst512)
+{
+	uint8_t bounce[512] __attribute__((aligned(16)));
+
+	__asm__ volatile("fxsave (%0)" : : "r"(bounce) : "memory");
+	mm_memcpy(dst512, bounce, 512);
+}
+
+static void sigframe_fpu_restore(const uint8_t *src512)
+{
+	uint8_t bounce[512] __attribute__((aligned(16)));
+
+	mm_memcpy(bounce, src512, 512);
+	/* The frame lives on the user's stack and is user-writable: a
+	 * poisoned MXCSR with reserved bits set makes FXRSTOR raise #GP in
+	 * the KERNEL.  Clear the reserved high half; the low 16 bits are
+	 * the architected control/status bits and are all legal. */
+	*(uint32_t *)(bounce + 24) &= 0xFFFF;
+	__asm__ volatile("fxrstor (%0)" : : "r"(bounce) : "memory");
+}
+
 // Global POSIX timer pool
 static kernel_timer_t g_posix_timers[MAX_POSIX_TIMERS];
 static ktimer_t g_next_timerid = 1;
@@ -583,6 +611,7 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	// Build the signal frame in kernel memory first
 	signal_frame_t kframe;
 	mm_memset(&kframe, 0, sizeof(kframe));
+	sigframe_fpu_capture(kframe.fpu);
 
 	// Save all registers
 	kframe.rip = user_rip;
@@ -717,6 +746,20 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	cpu->syscall_saved_user_r14 = task->syscall_r14;
 	cpu->syscall_saved_user_r15 = task->syscall_r15;
 
+	/* Handler arguments 2 and 3.  An SA_SIGINFO handler is entered as
+	 * handler(sig, siginfo_t *, void *ucontext) and must be able to
+	 * dereference the siginfo: Xorg's crash handler reads si_code before
+	 * anything else, so a NULL here turned every X crash into a second
+	 * SIGSEGV inside the handler and lost the report of the first.  The
+	 * siginfo lives in the frame just written; there is no ucontext yet,
+	 * and NULL is at least honest about that.  syscall.asm loads these
+	 * two slots into RSI/RDX on the handler-call path. */
+	cpu->syscall_saved_user_rsi =
+		(act->sa_flags & SA_SIGINFO) ?
+			frame_addr + __builtin_offsetof(signal_frame_t, info) :
+			0;
+	cpu->syscall_saved_user_rdx = 0;
+
 	// Set signal pending flag - this tells syscall.asm to use signal return path
 	// The value is the signal number which will be loaded into RDI
 	// NOTE: Interrupts remain disabled until after sysret in syscall.asm
@@ -765,6 +808,7 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	// Build the signal frame in kernel memory first
 	signal_frame_t kframe;
 	mm_memset(&kframe, 0, sizeof(kframe));
+	sigframe_fpu_capture(kframe.fpu);
 
 	// Save all registers from the interrupt frame
 	kframe.rip = user_rip;
@@ -872,6 +916,12 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	 * the handler runs with. */
 	frame->rflags = user_rflags_sanitize(frame->rflags);
 	frame->rdi = (uint64_t)sig; // First argument: signal number
+	/* Second and third: the siginfo in the frame (SA_SIGINFO only) and no
+	 * ucontext -- see signal_setup_frame for why the pointer must be real. */
+	frame->rsi = (act->sa_flags & SA_SIGINFO) ?
+			     frame_addr + __builtin_offsetof(signal_frame_t, info) :
+			     0;
+	frame->rdx = 0;
 	// CS, SS, RFLAGS stay the same (user mode, same flags)
 
 	// Do NOT touch per-CPU SYSRET state — this path returns via IRETQ.
@@ -924,6 +974,13 @@ int signal_restore_frame(task_t *task)
 	smap_disable();
 	mm_memcpy(&kframe, (void *)frame_addr, sizeof(kframe));
 	smap_enable();
+
+	/* Put the interrupted computation's x87/SSE state back into the
+	 * hardware registers.  If the task is preempted between here and the
+	 * return to user mode, the context switch saves exactly this state
+	 * into the task's own area and restores it again -- so the resumed
+	 * code sees its registers regardless. */
+	sigframe_fpu_restore(kframe.fpu);
 
 	// Update task's saved values first (safe without cli)
 	task->syscall_rip = kframe.rip;

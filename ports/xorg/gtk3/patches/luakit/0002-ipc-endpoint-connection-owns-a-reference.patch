@@ -1,0 +1,84 @@
+Fix the endpoint use-after-free when a web process dies.
+
+ipc_endpoint_connect_to_socket() took no reference for the connection, but
+ipc_hup() dropped one -- so the HUP that fires when a web process exits or
+crashes stole the OWNER's reference.  One dead web process freed the
+endpoint while the webview still held d->ipc; every later send then wrote
+through the dangling pointer into whatever had reused the allocation.
+Observed as a deterministic SIGSEGV in g_queue_push_tail (the freed slice
+reused by a lua-serialize buffer, so the "queue" was message payload bytes),
+as "corrupted double-linked list" heap damage in the UI process, and as
+storms of "Trying to send an ipc message, but the endpoint went away."
+-- whose handling ALSO leaked the message's reference.
+
+The connection now holds its own reference; ipc_hup() disconnects (removing
+both watches, so it cannot fire twice) and drops exactly that reference.
+The send thread drops the message's reference on both outcomes.  ipc_send()
+tolerates a NULL queue (endpoint already replaced) instead of pushing into
+glib's NULL-queue warning.
+
+--- a/common/ipc.c
++++ b/common/ipc.c
+@@ -85,10 +85,11 @@
+         if((ipc->channel != NULL) && (ipc->status == IPC_ENDPOINT_CONNECTED))
+             g_io_channel_write_chars(ipc->channel, (gchar*)data, header->length, NULL, NULL);
+ 
+-        if((ipc->channel != NULL) && (ipc->status == IPC_ENDPOINT_CONNECTED))
+-            ipc_endpoint_decref(ipc);
+-        else
++        if(!((ipc->channel != NULL) && (ipc->status == IPC_ENDPOINT_CONNECTED)))
+             error("Trying to send an ipc message, but the endpoint went away.");
++        /* This message's reference is dropped on BOTH outcomes: the old
++         * went-away path leaked it, pinning dead endpoints forever. */
++        ipc_endpoint_decref(ipc);
+ 
+         g_free(out);
+     }
+@@ -123,8 +124,14 @@
+ 
+     if (ipc->channel)
+         g_async_queue_push(send_queue, msg);
+-    else
++    else if (ipc->queue)
+         g_queue_push_tail(ipc->queue, msg);
++    else {
++        /* Endpoint already replaced/drained: drop the message rather than
++         * push onto a queue that no longer exists. */
++        g_free(msg);
++        ipc_endpoint_decref(ipc);
++    }
+ }
+ 
+ static void
+@@ -213,8 +220,14 @@
+ {
+     g_assert(ipc->status == IPC_ENDPOINT_CONNECTED);
+     g_assert(ipc->channel);
++    /* Tear the connection down NOW (this also removes both watches, so this
++     * handler cannot fire again), then drop the reference the connection
++     * took in ipc_endpoint_connect_to_socket().  The endpoint itself stays
++     * alive for as long as its owner (the webview) holds it; sends after
++     * this point queue harmlessly on ipc->queue. */
++    ipc_endpoint_disconnect(ipc);
+     ipc_endpoint_decref(ipc);
+-    return TRUE;
++    return FALSE;
+ }
+ 
+ void
+@@ -299,6 +312,15 @@
+      * g_io_channel_unix_new(), but before it has been set up fully */
+     g_atomic_pointer_set(&ipc->channel, channel);
+ 
++    /* The CONNECTION holds its own reference, dropped by ipc_hup() when the
++     * peer goes away.  Without it, the hup handler's decref stole the
++     * owner's reference: one dead web process freed the endpoint while the
++     * webview still pointed at it, and every later send wrote through the
++     * dangling pointer into whatever had reused the slice -- observed as a
++     * deterministic crash in g_queue_push_tail and as heap corruption in
++     * the UI process whenever a web process crashed or was swapped. */
++    ipc_endpoint_incref_no_check(ipc);
++
+     ipc->status = IPC_ENDPOINT_CONNECTED;
+ 
+     if (!endpoints)

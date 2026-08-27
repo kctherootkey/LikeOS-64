@@ -191,6 +191,14 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                    void* (*start_routine)(void*), void* arg);
 void pthread_exit(void* retval) __attribute__((noreturn));
 int pthread_join(pthread_t thread, void** retval);
+/* The clock that measures `thread`'s CPU consumption; pass the result to
+ * clock_gettime().  POSIX interface; the id stays meaningful for the
+ * thread's lifetime and answers EINVAL afterwards. */
+int pthread_getcpuclockid(pthread_t thread, clockid_t *clockid);
+/* Thread names, 15 characters + terminator.  Stored in the thread's own
+ * control block; the whole process sees one namespace of them. */
+int pthread_setname_np(pthread_t thread, const char *name);
+int pthread_getname_np(pthread_t thread, char *name, size_t len);
 int pthread_detach(pthread_t thread);
 
 // Thread identity
@@ -344,6 +352,17 @@ void pthread_testcancel(void);
 /* Per-thread signal mask (threads are tasks here, so this is the calling
  * thread's own mask, reported the pthread way: return value, not errno). */
 int pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset);
+
+/* Direct a signal at ONE thread of this process, rather than at the process.
+ * The pthread way of reporting: the error number comes back as the return
+ * value and errno is left alone.  sig 0 probes that the thread still exists. */
+int pthread_kill(pthread_t thread, int sig);
+
+/* Report a live thread's actual attributes -- most importantly the stack's
+ * base and size, which is how a garbage collector or an unwinder learns where
+ * the stack it must walk begins and ends.  Works for any thread including the
+ * main one, whose stack the kernel set up long before this library ran. */
+int pthread_getattr_np(pthread_t thread, pthread_attr_t* attr);
 
 #ifdef __cplusplus
 }

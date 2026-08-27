@@ -1,0 +1,118 @@
+PRINTF_GETTEXT(1)                User Commands               PRINTF_GETTEXT(1)
+
+NAME
+       printf_gettext - translate format string and apply it
+
+SYNOPSIS
+       printf_gettext [OPTION] FORMAT [ARGUMENT]...
+
+DESCRIPTION
+       The  printf_gettext  program translates a format string into the user's
+       language, by looking up the translation in a message catalog,  and  ap-
+       plies the translated format string to the specified arguments.
+
+       Produces  formatted output, applying the native language translation of
+       FORMAT to the ARGUMENTs.
+
+   Options and arguments:
+       -c, --context=CONTEXT
+              specify context for FORMAT
+
+       FORMAT format string
+
+       ARGUMENT
+              string or numeric argument
+
+   Informative output:
+       -h, --help
+              display this help and exit
+
+       -V, --version
+              display version information and exit
+
+       The format string consists of
+
+              - plain text, - directives, that start with '%',  -  escape  se-
+              quences, that start with a backslash.
+
+       A directive that consumes an argument
+
+              -  starts  with '%' or '%m$' where m is a positive integer, - is
+              optionally followed by any of the characters '#', '0', '-', ' ',
+              '+',
+
+              each of which acts as a flag,
+
+              - is optionally followed by a width specification (a nonnegative
+              integer), - is optionally followed by '.' and a precision speci-
+              fication (an optional
+
+              nonnegative integer),
+
+              - is finished by a specifier
+
+              - 'c', that prints a character, - 's', that prints a  string,  -
+              'i',  'd',  that  print  an  integer, - 'u', 'o', 'x', 'X', that
+              print an unsigned (nonnegative) integer, - 'e', 'E', that  print
+              a floating-point number in scientific notation, - 'f', 'F', that
+              print  a  floating-point number without an exponent, - 'g', 'G',
+              that print a floating-point number in general notation,  -  'a',
+              'A', that print a floating-point number in hexadecimal notation.
+
+       Additionally there is the directive '%%', that prints a single '%'.
+
+       If  a  directive specifies the argument by its number ('%m$' notation),
+       all directives that consume an argument must do so.
+
+       The escape sequences are:
+
+       \\     backslash
+
+       \a     alert (BEL)
+
+       \b     backspace (BS)
+
+       \f     form feed (FF)
+
+       \n     new line (LF)
+
+       \r     carriage return (CR)
+
+       \t     horizontal tab (HT)
+
+       \v     vertical tab (VT)
+
+       \nnn   octal number with 1 to 3 octal digits
+
+       Environment variables:
+
+       The translation of the format string is looked up  in  the  translation
+       domain  given  by the environment variable TEXTDOMAIN.  It is looked up
+       in the catalogs directory given by  the  environment  variable  TEXTDO-
+       MAINDIR  or,  if  not present, in the default catalogs directory.  This
+       binary  is  configured  to  use   the   default   catalogs   directory:
+       /usr/share/locale
+
+AUTHOR
+       Written by Bruno Haible.
+
+REPORTING BUGS
+       Report     bugs    in    the    bug    tracker    at    <https://savan-
+       nah.gnu.org/projects/gettext> or by email to <bug-gettext@gnu.org>.
+
+COPYRIGHT
+       Copyright (C) 2025 Free Software Foundation, Inc.  License GPLv3+:  GNU
+       GPL version 3 or later <https://gnu.org/licenses/gpl.html>
+       This  is  free  software:  you  are free to change and redistribute it.
+       There is NO WARRANTY, to the extent permitted by law.
+
+SEE ALSO
+       The full documentation for printf_gettext is maintained  as  a  Texinfo
+       manual.  If the info and printf_gettext programs are properly installed
+       at your site, the command
+
+              info printf_gettext
+
+       should give you access to the complete manual.
+
+GNU gettext-runtime 0.26           July 2025                 PRINTF_GETTEXT(1)

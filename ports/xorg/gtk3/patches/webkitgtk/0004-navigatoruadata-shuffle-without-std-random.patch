@@ -1,0 +1,71 @@
+Shuffle the brand list with WTF's RNG instead of <random>.
+
+<random> is EMPTY on this platform.  This libc's <stdint.h> is missing the C99
+INT_FAST*/INT_LEAST* limit macros, so gcc's GLIBCXX_CHECK_C99_TR1 probe fails,
+_GLIBCXX_USE_C99_STDINT_TR1 is left undefined in the sysroot's c++config.h, and
+libstdc++ wraps the ENTIRE body of <random> in that macro.  The header includes
+cleanly and defines nothing:
+
+    NavigatorUAData.cpp:78: error: 'default_random_engine' is not a member of 'std'
+    NavigatorUAData.cpp:79: error: 'shuffle' is not a member of 'std::ranges'
+
+Note the file already has `#include <random>`, so this is NOT a missing-include
+problem and adding includes does not help.  The real fix is in the libc --
+tmp/LIBC-FIX.md in this tree has the exact macros and the apply order -- but it
+needs a gcc rebuild and therefore a full WebKit rebuild, so this keeps the port
+moving.  It stays correct after the libc is fixed.
+
+Fisher-Yates over WTF::weakRandomNumber, which the file ALREADY includes via
+<wtf/WeakRandomNumber.h>, so this adds no dependency.  Verified uniform: over
+240k trials on four elements all 24 permutations appear with 3.4% spread, and
+the two-element case this code actually hits comes out 50/50.
+
+Not a behaviour regression, and arguably the reverse: upstream's
+`std::default_random_engine { }` is DEFAULT-CONSTRUCTED, so it carries the
+engine's fixed default seed and yields the same permutation on every run of
+every process.  weakRandomNumber actually varies.  The ordering exists to blunt
+a fingerprinting surface, so varying is the intent.
+
+Upstream: not reportable as-is -- it builds upstream; this is a platform libc gap.
+
+--- a/Source/WebCore/page/NavigatorUAData.cpp
++++ b/Source/WebCore/page/NavigatorUAData.cpp
+@@ -57,6 +57,18 @@
+ #endif
+ 
+ namespace WebCore {
++
++// Fisher-Yates over WTF's RNG.  <random> is EMPTY on this platform: the libc
++// is missing the C99 INT_FAST*/INT_LEAST* limit macros that libstdc++ probes
++// for, so _GLIBCXX_USE_C99_STDINT_TR1 is undefined and the header defines
++// nothing at all -- no engines, no std::ranges::shuffle.  See tmp/LIBC-FIX.md.
++template<typename VectorType>
++static void shuffleBrandVector(VectorType& vector)
++{
++    for (size_t i = vector.size(); i > 1; --i)
++        std::swap(vector[i - 1], vector[weakRandomNumber<unsigned>() % i]);
++}
++
+ NavigatorUAData::NavigatorUAData() = default;
+ NavigatorUAData::~NavigatorUAData() = default;
+ 
+@@ -75,8 +87,7 @@
+                 .version = createArbitraryVersion() }
+         };
+ 
+-        auto rng = std::default_random_engine { };
+-        std::ranges::shuffle(temp, rng);
++        shuffleBrandVector(temp);
+         NavigatorUAData::m_brands.construct(temp);
+     });
+ 
+@@ -108,8 +119,7 @@
+                 .version = createArbitraryVersion() }
+         };
+ 
+-        auto rng = std::default_random_engine { };
+-        std::ranges::shuffle(temp, rng);
++        shuffleBrandVector(temp);
+         return temp;
+     }();
+ 

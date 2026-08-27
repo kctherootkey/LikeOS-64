@@ -400,7 +400,18 @@ typedef struct interrupt_frame {
 	uint64_t rip, cs, rflags, rsp, ss;
 } interrupt_frame_t;
 
+/* Liveness stamp for task_t.  Set when a task is created, replaced with
+ * TASK_MAGIC_DEAD immediately before the task_t is freed.  The enqueue path
+ * checks it: a stale pointer enqueueing a task whose memory has been freed
+ * (and possibly reused) is the recurring crash class behind "GPF on
+ * feedface poison in the context switch" -- the check turns that from a
+ * wild kernel fault hours later into a named WARN at the moment of the
+ * offending enqueue, and refuses the enqueue so the fault never happens. */
+#define TASK_MAGIC_ALIVE 0x4b534154u /* 'TASK' */
+#define TASK_MAGIC_DEAD 0x44414544u /* 'DEAD' */
+
 typedef struct task {
+	uint32_t alive_magic; // TASK_MAGIC_ALIVE until the task_t is freed
 	uint64_t *sp; // Saved stack pointer (cooperative switch)
 	uint64_t *
 		pml4; // Page table base (CR3) - NULL for kernel tasks (uses kernel PML4)
@@ -600,6 +611,13 @@ typedef struct task {
 
 	// User mode support
 	uint64_t user_stack_top; // User stack virtual address (for user tasks)
+	/* Size of that stack mapping.  Set on the exec paths beside
+	 * user_stack_top and reported through SYS_GETPROCMAPS: the stack is
+	 * mapped straight into the page tables rather than through the mmap
+	 * region table, so without this field userspace has no way to learn
+	 * its own main stack's extent -- which pthread_getattr_np() must
+	 * report (a conservative garbage collector scans exactly that range). */
+	uint64_t user_stack_size;
 	uint64_t
 		kernel_stack_top; // Kernel stack for syscalls/interrupts (for user tasks)
 	void *kernel_stack_base; // Kernel stack allocation base (for freeing)

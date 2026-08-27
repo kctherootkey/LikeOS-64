@@ -221,6 +221,12 @@ int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 		kinfo.brk = mm->brk;
 		kinfo.mmap_base = mm->mmap_base;
 		kinfo.capacity = mm->mmap_capacity;
+		/* The main stack is mapped straight into the page tables at
+		 * exec, not through the region table below, so it is reported
+		 * here or nowhere.  pthread_getattr_np() builds the main
+		 * thread's stack extent from exactly these two fields. */
+		kinfo.stack_top = mm->user_stack_top;
+		kinfo.stack_size = mm->user_stack_size;
 
 		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
 			mmap_region_t *r = &mm->mmap_regions[i];

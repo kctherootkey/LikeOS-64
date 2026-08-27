@@ -80,8 +80,8 @@ rm -rf "$port/.stamps" "$port/.logs"
 # .stamps recording what is in them are gone.  It holds two different things,
 # though, and only one of them is this port's to delete:
 #
-#   built HERE, by ports-xorg and ports-gtk3 -- the native GLib, intltool and
-#   nsgenbind that packages above them run during their own build.  Derived,
+#   built HERE, by ports-xorg and ports-gtk3 -- the native GLib and intltool
+#   that packages above them run during their own build.  Derived,
 #   rebuilt by the next `make`, and removed with the stamps that describe them.
 #
 #   installed by `make deps` -- venv/, holding a meson newer than the apt one

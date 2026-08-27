@@ -109,7 +109,8 @@
 #
 #     What IS ignored is everything derived from them: the source tree each
 #     tarball unpacks into (ports/xorg/<pkg>/), plus .stamps/, .logs/ and
-#     .hosttools/ -- the last holds tools built for THIS machine (nsgenbind),
+#     .hosttools/ -- the last holds tools built for THIS machine (GLib's
+#     code generators, intltool),
 #     which must never reach the image.  All three are covered by the `*/` rule
 #     below, because a gitignore `*` matches a leading dot.
 #     The build sysroot they install into lives under /build/ and is gone with it.
@@ -132,6 +133,12 @@
 #     `*/` rule above would drop it -- the build would then quietly produce an
 #     image whose only missing piece is one manual page.
 !/ports/xorg/gtk3/man/
+#     The one tarball that is NOT tracked: LLVM (~171 MB), which is over
+#     GitHub's 100 MB hard limit for a single file -- the push is refused, not
+#     warned about.  Its sha256 is in checksums.sha256 like every other one, so
+#     `make` fetches it through fetch.sh on a fresh clone and verifies the
+#     bytes; the set stays reproducible, it just needs the network once.
+/ports/xorg/gtk3/llvm-*.tar.xz
 #     Not listed, therefore tracked, and all required to build from a clone:
 #     packages.list (the manifest), fetch/unpack/build/stage/clean.sh, and
 #     checksums.sha256 (records which upstream bytes a build used).

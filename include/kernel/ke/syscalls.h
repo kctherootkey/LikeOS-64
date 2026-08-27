@@ -102,6 +102,7 @@ int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size,
 int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence);
 int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf);
 int64_t sys_madvise(uint64_t addr, uint64_t length, uint64_t advice);
+int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vec);
 int64_t sys_memstats(uint64_t a1, uint64_t a2);
 int64_t sys_mkdir(uint64_t pathname, uint64_t mode);
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,

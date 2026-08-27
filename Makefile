@@ -173,6 +173,23 @@ MTOOLS = mcopy
 
 # Directories
 BUILD_DIR = build
+
+# ---------------------------------------------------------------------------
+# Build-mode stamp: a kernel must be linked from objects that were ALL
+# compiled with the same DEBUG/CRASH_VERBOSE flags.  Nothing here tracks
+# header or flag dependencies, so switching modes (or two people building in
+# the same tree with different flags -- observed: DEBUG=1 from the terminal
+# and plain builds from tooling) quietly produced kernels linked from a MIX
+# of debug and non-debug objects.  That is not cosmetic: DEBUG memory.c
+# poisons freed pages where non-DEBUG code assumes the allocator zeroes
+# them, and the resulting kernels failed in ways no single-mode build does.
+# The stamp records the mode of the objects in $(BUILD_DIR); when the
+# requested mode differs, every kernel object is removed first.
+# ---------------------------------------------------------------------------
+BUILD_MODE := DEBUG=$(DEBUG)/CRASH_VERBOSE=$(CRASH_VERBOSE)
+MODE_STAMP := $(BUILD_DIR)/.build-mode
+$(shell mkdir -p $(BUILD_DIR);   if [ ! -f $(MODE_STAMP) ] || [ "$$(cat $(MODE_STAMP) 2>/dev/null)" != "$(BUILD_MODE)" ]; then     if ls $(BUILD_DIR)/*.o >/dev/null 2>&1; then       echo "build mode changed to $(BUILD_MODE): cleaning kernel objects" >&2;       rm -f $(BUILD_DIR)/*.o; rm -rf $(BUILD_DIR)/acpica;     fi;     printf '%s' "$(BUILD_MODE)" > $(MODE_STAMP);   fi)
+
 KERNEL_DIR = kernel
 INCLUDE_DIR = include
 BOOT_DIR = boot
@@ -402,7 +419,8 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 	libdlbase.so libdlchain.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
-	cxxprobe forkstress
+	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
+	webstress
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -1623,14 +1641,20 @@ $(BUILD_DIR)/openssh/bin/ssh: ports-openssh | $(BUILD_DIR)
 #
 # The libraries it links against have to exist first: openssl (the server uses
 # libcrypto for SHA1), zlib (libXfont2), ncurses (xterm's termcap) and curl
-# (NetSurf fetches with it).
+# (published alongside them for any X client that wants it).
 #
 # Those four are ports in their own right and install nowhere near the X
 # sysroot, so import-base-libs.sh copies their headers, libraries and
 # pkg-config descriptions into it before anything is built against them.  It
 # has to run HERE rather than by hand: `make distclean` deletes the sysroot,
-# and without this step the next build got all the way to NetSurf before
-# failing to find libcurl.
+# and without this step a build once got all the way to the first client
+# needing libcurl before failing to find it.
+#
+# import-egl-headers.sh is the same idea for the two Khronos EGL type headers.
+# libepoxy is built -Degl=yes because WebKitGTK does not compile without
+# <epoxy/egl.h>, and epoxy's GENERATED header includes <EGL/eglplatform.h>.
+# That header defines types, not code -- there is still no libEGL on this
+# system.  See the script for the full reasoning.
 # --------------------------------------------------------------------------
 XORG_SYSROOT = $(BUILD_DIR)/xorg-sysroot
 
@@ -1640,6 +1664,7 @@ ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
 	ports/xorg/fetch.sh
 	ports/xorg/unpack.sh
 	ports/xorg/import-base-libs.sh
+	ports/xorg/import-egl-headers.sh
 	ports/xorg/build.sh
 
 # The GTK3 stack and Claws Mail.
@@ -1731,6 +1756,72 @@ $(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(GTK3_SENTINEL) | $
 # merely needing the same port: the two are independent entries in the image's
 # prerequisite list, so under -j make is free to start this one first, and it
 # would then fail on a libstdc++ that was still being built.
+# Does std::call_once work?  luakit dies at RIP=0 with pthread_once's return
+# address on the stack, which is the shape libstdc++'s call_once produces when
+# the thread-local it tail-jumps through reads as zero.  This asks the question
+# away from WebKit, and prints each step BEFORE running it so the last line
+# printed names the one that died.
+# Does WebKit's shared-memory idiom work?  With compositing off (no GL), the
+# non-composited path -- cairo into a ShareableBitmap backed by POSIX shared
+# memory -- is the ONLY way a page reaches the screen, and pages are blank.
+# SharedMemoryUnix.cpp logs only the shm_open failure; a silent ftruncate or
+# mmap failure looks exactly like this.  Runs that sequence in WebKit's order
+# and names the step that fails.  Plain C, so no GTK3 sysroot needed beyond
+# the toolchain.
+# Does std::filesystem::directory_iterator work?  WebKit finds a web extension
+# by listing its directory with C++ filesystem, and a failure there is SILENT:
+# the error_code is set, the loop body never runs, and an empty list comes back.
+# luakit loads a web extension and shows a blank page; MiniBrowser loads none
+# and renders the same file.  Needs the GTK3 sysroot for libstdc++.
+# Does GIO's TLS work?  curl (OpenSSL) fetches https fine and MiniBrowser hangs
+# on it, so TCP is fine and the fault is in the OTHER TLS stack: GIO ->
+# glib-networking -> gnutls, which is what WebKit uses.  This drives exactly
+# that path and nothing else, with a timeout so a hang reports instead of
+# hanging.  Needs the GTK3 sysroot for gio.
+# Does libsoup fetch https?  This is the layer WebKit's network process
+# actually uses.  tlstest drives raw GIO and passes; MiniBrowser still hangs on
+# https.  Raw GIO was a reconstruction of libsoup's behaviour, and it only ever
+# tested the reconstruction -- so this uses SoupSession itself, sync and async.
+$(BUILD_DIR)/souptest: user/bin/tests/souptest.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-cc -o $@ $< \
+		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs libsoup-3.0)
+
+# The 512-byte stop in MiniBrowser, reproduced without WebKit.  souptest used
+# soup_session_send_and_read() on a plain session and passed; WebKit adds a
+# SoupContentSniffer (SoupNetworkSession.cpp:130) and drives the stream by hand
+# with g_input_stream_read_async().  This assembles that chain and varies one
+# element per run so the failing element names itself.
+$(BUILD_DIR)/snifftest: user/bin/tests/snifftest.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-cc -o $@ $< \
+		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs libsoup-3.0)
+
+# Phase-timed browser-like load: N threads doing parallel DNS + TCP + TLS +
+# HTTP, optional fork/SIGCHLD storm with an FPU-integrity sentinel.  Whichever
+# phase carries the navigation stall names the subsystem.
+$(BUILD_DIR)/webstress: user/bin/tests/webstress.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-cc -o $@ $< \
+		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs libsoup-3.0) \
+		-lpthread
+
+$(BUILD_DIR)/tlstest: user/bin/tests/tlstest.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-cc -o $@ $< \
+		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs gio-2.0)
+
+$(BUILD_DIR)/dirtest: user/bin/tests/dirtest.cpp $(GTK3_SENTINEL) | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-c++ -o $@ $<
+
+$(BUILD_DIR)/shmtest: user/bin/tests/shmtest.c | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-cc -o $@ $<
+
+$(BUILD_DIR)/oncetest: user/bin/tests/oncetest.cpp $(GTK3_SENTINEL) | $(BUILD_DIR)
+	@test -f $(XORG_SYSROOT)/usr/lib/libstdc++.so || { \
+		echo "ERROR: no libstdc++ in $(XORG_SYSROOT)."; \
+		echo "  The C++ runtime is built by the GTK3 port:"; \
+		echo "      make ports-gtk3"; \
+		exit 1; \
+	}
+	ports/xorg/toolchain/likeos-c++ -o $@ $<
+
 $(BUILD_DIR)/testcxx: user/bin/tests/testcxx.cpp $(GTK3_SENTINEL) | $(BUILD_DIR)
 	@test -f $(XORG_SYSROOT)/usr/lib/libstdc++.so || { \
 		echo "ERROR: no libstdc++ in $(XORG_SYSROOT)."; \
@@ -1877,6 +1968,13 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/pmap          $(EXT4_STAGING)/usr/local/bin/pmap
 	cp $(BUILD_DIR)/ttydump       $(EXT4_STAGING)/usr/local/bin/ttydump
 	cp $(BUILD_DIR)/cxxprobe      $(EXT4_STAGING)/usr/local/bin/cxxprobe
+	cp $(BUILD_DIR)/oncetest      $(EXT4_STAGING)/usr/local/bin/oncetest
+	cp $(BUILD_DIR)/shmtest       $(EXT4_STAGING)/usr/local/bin/shmtest
+	cp $(BUILD_DIR)/dirtest       $(EXT4_STAGING)/usr/local/bin/dirtest
+	cp $(BUILD_DIR)/tlstest       $(EXT4_STAGING)/usr/local/bin/tlstest
+	cp $(BUILD_DIR)/souptest      $(EXT4_STAGING)/usr/local/bin/souptest
+	cp $(BUILD_DIR)/snifftest     $(EXT4_STAGING)/usr/local/bin/snifftest
+	cp $(BUILD_DIR)/webstress     $(EXT4_STAGING)/usr/local/bin/webstress
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh
@@ -1972,7 +2070,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# rather than left to fall out of the filenames.  The two pairs that
 	# do the same job are kept together and the newer one first: Terminal
 	# before Xterm, Calculator before X Calculator.
-	i=0; for f in pcmanfm xfce4-terminal xterm mousepad xnedit netsurf \
+	i=0; for f in pcmanfm xfce4-terminal xterm mousepad xnedit luakit \
 	              hexchat claws-mail galculator xcalc; do \
 		for d in $(EXT4_STAGING)/etc/skel/Desktop \
 		         $(EXT4_STAGING)/root/Desktop; do \
@@ -2372,7 +2470,9 @@ openssh-manpages:
 # attempt from the page's own directory; between the two forms every page
 # renders.
 XORG_MAN_SKIP = bdftruncate ucs2any libevdev-tweak-device mouse-dpi-tool \
-		touchpad-edge-detector koi8rxterm gtf
+		touchpad-edge-detector koi8rxterm gtf \
+		icu-config derb genbrk gencfu gencnval gendict genrb \
+		makeconv pkgdata uconv icupkg gensprep icuexportdata
 
 .PHONY: xorg-manpages
 xorg-manpages:
@@ -2444,6 +2544,7 @@ xorg-manpages:
 # is a gap, not an oversight.
 GTK3_MAN_PROGS = claws-mail pcmanfm mousepad libfm-pref-apps lxshortcut \
 		 galculator xfce4-terminal hexchat \
+		 luakit lua luac sqlite3 \
 		 gio gsettings gdbus gapplication \
 		 fc-list fc-match fc-cache
 
@@ -2519,6 +2620,11 @@ deps:
 	# GTK's manual-page sources into troff -- without it those packages
 	# configure with man pages silently off.
 	sudo apt install -y g++ gettext docbook-xsl docbook-xml itstool || true
+	# WebKitGTK's build tooling: JavaScriptCore's code generators are ruby
+	# programs (the offline assembler that produces the interpreter is
+	# one), and cmake+ninja drive the tree.  Both cmake and ninja are on
+	# the lists above; ruby is only needed from the WebKit port on.
+	sudo apt install -y ruby || true
 	# ...and g++ has to be a NEW ENOUGH one, which is a second requirement
 	# hiding inside the first.  VTE is C++23, and its meson.build checks the
 	# compiler's version rather than trusting -std=gnu++23 to be accepted:

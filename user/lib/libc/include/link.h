@@ -18,6 +18,13 @@
 #include <stdint.h>
 #include <elf.h>
 
+/* Expand a generic ELF structure name to this platform's width: ElfW(Nhdr)
+ * is Elf64_Nhdr here.  The conventional spelling code uses so one source
+ * serves 32- and 64-bit systems; this system only has the one width, but the
+ * macro is where portable callers (JavaScriptCore's build-id walk was the
+ * first) expect it. */
+#define ElfW(type) Elf64_##type
+
 #ifdef __cplusplus
 extern "C" {
 #endif

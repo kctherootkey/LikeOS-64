@@ -16,8 +16,12 @@ typedef unsigned long uint64_t;
 
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
-typedef long long intmax_t;
-typedef unsigned long long uintmax_t;
+/* intmax_t is LONG, not long long: int64_t above is long, PRIdMAX in
+ * <inttypes.h> prints with "l", and every LP64 system makes the same
+ * choice.  It was long long once, which made printf("%li", (intmax_t)x)
+ * a format-mismatch error in code that is correct everywhere else. */
+typedef long intmax_t;
+typedef unsigned long uintmax_t;
 
 /* Fast types - use native register-width types for speed */
 typedef int8_t    int_fast8_t;
@@ -51,6 +55,44 @@ typedef uint64_t  uint_least64_t;
 #define INT64_MIN  (-9223372036854775808L)
 #define INT64_MAX  (9223372036854775807L)
 #define UINT64_MAX (18446744073709551615UL)
+
+/* Limits for the fast and least types.  C99 requires these alongside the
+ * typedefs, and their absence is not cosmetic: gcc's libstdc++ probes for
+ * exactly these macros to decide whether the platform has C99 <stdint.h>,
+ * and without them it compiles <random> away to nothing -- no engines, no
+ * distributions, no std::mt19937 anywhere in the C++ library (discovered
+ * first via WebKit's NavigatorUAData, then hard-blocked LLVM).
+ *
+ * Each value mirrors the typedef above it.  int_fast16_t and int_fast32_t
+ * are int32_t here (other libcs make them 64-bit), so these are NOT those
+ * libcs' numbers -- macros that disagree with the types they describe would
+ * pass the probe and be silently wrong. */
+#define INT_FAST8_MIN    INT8_MIN
+#define INT_FAST8_MAX    INT8_MAX
+#define INT_FAST16_MIN   INT32_MIN
+#define INT_FAST16_MAX   INT32_MAX
+#define INT_FAST32_MIN   INT32_MIN
+#define INT_FAST32_MAX   INT32_MAX
+#define INT_FAST64_MIN   INT64_MIN
+#define INT_FAST64_MAX   INT64_MAX
+#define UINT_FAST8_MAX   UINT8_MAX
+#define UINT_FAST16_MAX  UINT32_MAX
+#define UINT_FAST32_MAX  UINT32_MAX
+#define UINT_FAST64_MAX  UINT64_MAX
+
+#define INT_LEAST8_MIN   INT8_MIN
+#define INT_LEAST8_MAX   INT8_MAX
+#define INT_LEAST16_MIN  INT16_MIN
+#define INT_LEAST16_MAX  INT16_MAX
+#define INT_LEAST32_MIN  INT32_MIN
+#define INT_LEAST32_MAX  INT32_MAX
+#define INT_LEAST64_MIN  INT64_MIN
+#define INT_LEAST64_MAX  INT64_MAX
+#define UINT_LEAST8_MAX  UINT8_MAX
+#define UINT_LEAST16_MAX UINT16_MAX
+#define UINT_LEAST32_MAX UINT32_MAX
+#define UINT_LEAST64_MAX UINT64_MAX
+
 #define INTMAX_MIN  INT64_MIN
 #define INTMAX_MAX  INT64_MAX
 #define UINTMAX_MAX UINT64_MAX

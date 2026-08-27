@@ -91,6 +91,8 @@ static void streams_lock_release(void)
 
 /* Best effort: a stream that cannot be recorded still works, it just will not
  * be flushed by fflush(NULL).  Failing the fopen instead would be worse. */
+static int __memstream_publish(FILE *stream);
+
 static void stream_register(FILE *fp)
 {
 	streams_lock_acquire();
@@ -189,6 +191,12 @@ FILE *fopen(const char *pathname, const char *mode)
 	fp->wide_mode = 0;
 	fp->wc_count = 0;
 	fp->wc_value = 0;
+	/* Not a memstream.  malloc'd, so every field must be set: a stale
+	 * nonzero ms sent fclose() down the memstream path and realloc'd
+	 * whatever wbuf happened to be. */
+	fp->ms = 0;
+	fp->ms_bufp = NULL;
+	fp->ms_sizep = NULL;
 
 	stream_register(fp);
 	return fp;
@@ -202,6 +210,14 @@ int fclose(FILE *stream)
 
 	fflush(stream);
 	stream_unregister(stream);
+	if (stream->ms) {
+		/* Final publish; the BUFFER survives -- it is the whole point
+		 * of the stream, and the caller frees it. */
+		__memstream_publish(stream);
+		free(stream->buffer);
+		free(stream);
+		return 0;
+	}
 	int result = close(stream->fd);
 	if (stream != stdin && stream != stdout && stream != stderr) {
 		free(stream->buffer);
@@ -214,9 +230,57 @@ int fclose(FILE *stream)
 /* ------------------------------------------------------------------ */
 /* Internal: flush write buffer to fd                                   */
 /* ------------------------------------------------------------------ */
+/* Publish a memstream's buffer to the caller's pointers.  Kept NUL
+ * terminated past the reported size, per POSIX, and re-published on every
+ * grow because realloc may move the block. */
+static int __memstream_publish(FILE *stream)
+{
+	if (stream->wbuf_pos + 1 > stream->wbuf_size) {
+		size_t ns = stream->wbuf_size ? stream->wbuf_size * 2 : 128;
+		while (ns < stream->wbuf_pos + 1)
+			ns *= 2;
+		unsigned char *nb = realloc(stream->wbuf, ns);
+		if (!nb) {
+			stream->error = 1;
+			return EOF;
+		}
+		stream->wbuf = nb;
+		stream->wbuf_size = ns;
+	}
+	stream->wbuf[stream->wbuf_pos] = 0;
+	*stream->ms_bufp = (char *)stream->wbuf;
+	*stream->ms_sizep = stream->wbuf_pos;
+	return 0;
+}
+
 static int __flush_wbuf(FILE *stream)
 {
-	if (!stream || stream->wbuf_pos == 0)
+	if (!stream)
+		return 0;
+	/* A memstream never writes to a descriptor: "flushing" grows the
+	 * buffer (so the writer that found it full can continue) and
+	 * publishes it.  wbuf_pos is NOT reset -- it is the stream's size. */
+	if (stream->ms) {
+		/* Callers reach here for two different reasons and both must
+		 * be satisfied: fwrite's buffered loop flushes when the buffer
+		 * is FULL and needs space to make progress afterwards; a
+		 * user's fflush() wants the current contents published.  Grow
+		 * only when nearly full -- an unconditional doubling here made
+		 * every fflush() inflate the buffer. */
+		if (stream->wbuf_size - stream->wbuf_pos < 64) {
+			size_t ns = stream->wbuf_size ? stream->wbuf_size * 2 :
+						       128;
+			unsigned char *nb = realloc(stream->wbuf, ns);
+			if (!nb) {
+				stream->error = 1;
+				return EOF;
+			}
+			stream->wbuf = nb;
+			stream->wbuf_size = ns;
+		}
+		return __memstream_publish(stream);
+	}
+	if (stream->wbuf_pos == 0)
 		return 0;
 
 	size_t remaining = stream->wbuf_pos;
@@ -543,6 +607,12 @@ FILE *fdopen(int fd, const char *mode)
 	fp->wide_mode = 0;
 	fp->wc_count = 0;
 	fp->wc_value = 0;
+	/* Not a memstream.  malloc'd, so every field must be set: a stale
+	 * nonzero ms sent fclose() down the memstream path and realloc'd
+	 * whatever wbuf happened to be. */
+	fp->ms = 0;
+	fp->ms_bufp = NULL;
+	fp->ms_sizep = NULL;
 
 	stream_register(fp);
 	return fp;
@@ -640,8 +710,65 @@ int fflush(FILE *stream)
 	return __flush_wbuf(stream);
 }
 
+FILE *open_memstream(char **bufp, size_t *sizep)
+{
+	if (!bufp || !sizep) {
+		errno = EINVAL;
+		return NULL;
+	}
+	FILE *f = calloc(1, sizeof(FILE));
+	if (!f)
+		return NULL;
+	f->fd = -1; /* no descriptor behind it, ever */
+	f->wbuf = malloc(128);
+	if (!f->wbuf) {
+		free(f);
+		return NULL;
+	}
+	f->wbuf_size = 128;
+	f->wbuf_pos = 0;
+	f->buf_mode = _IOFBF;
+	f->ungetc_buf = -1;
+	f->ms = 1;
+	f->ms_bufp = bufp;
+	f->ms_sizep = sizep;
+	f->wbuf[0] = 0;
+	*bufp = (char *)f->wbuf;
+	*sizep = 0;
+	stream_register(f);
+	return f;
+}
+
 int fseek(FILE *stream, long offset, int whence)
 {
+	if (stream && stream->ms) {
+		/* Position IS wbuf_pos for a memstream.  Seeking past the end
+		 * zero-fills the gap, per POSIX; the published size follows
+		 * the high-water mark at the next flush/close. */
+		long base = 0;
+		if (whence == SEEK_CUR)
+			base = (long)stream->wbuf_pos;
+		else if (whence == SEEK_END)
+			base = (long)stream->wbuf_pos; /* size == pos here */
+		long np = base + offset;
+		if (np < 0) {
+			errno = EINVAL;
+			return -1;
+		}
+		while ((size_t)np + 1 > stream->wbuf_size) {
+			size_t ns = stream->wbuf_size * 2;
+			unsigned char *nb = realloc(stream->wbuf, ns);
+			if (!nb)
+				return -1;
+			stream->wbuf = nb;
+			stream->wbuf_size = ns;
+		}
+		if ((size_t)np > stream->wbuf_pos)
+			memset(stream->wbuf + stream->wbuf_pos, 0,
+			       (size_t)np - stream->wbuf_pos);
+		stream->wbuf_pos = (size_t)np;
+		return 0;
+	}
 	if (!stream) {
 		return -1;
 	}
@@ -667,6 +794,8 @@ int fseek(FILE *stream, long offset, int whence)
 
 long ftell(FILE *stream)
 {
+	if (stream && stream->ms)
+		return (long)stream->wbuf_pos;
 	if (!stream) {
 		return -1;
 	}

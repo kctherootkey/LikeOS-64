@@ -6,12 +6,14 @@
  */
 
 #include <pthread.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sched.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/procinfo.h> /* getprocmaps: the main thread's stack extent */
 #include "../syscalls/syscall.h"
 #include "pthread_internal.h"
 
@@ -734,6 +736,41 @@ void pthread_exit(void *retval)
 	__builtin_unreachable();
 }
 
+int pthread_setname_np(pthread_t thread, const char *name)
+{
+	if (!thread || !name)
+		return EINVAL;
+	/* ERANGE for names that do not fit, per the conventional contract:
+	 * 15 characters plus the terminator. */
+	size_t n = strlen(name);
+	if (n >= sizeof(thread->name))
+		return ERANGE;
+	memcpy(thread->name, name, n + 1);
+	return 0;
+}
+
+int pthread_getname_np(pthread_t thread, char *name, size_t len)
+{
+	if (!thread || !name)
+		return EINVAL;
+	size_t n = strlen(thread->name);
+	if (n + 1 > len)
+		return ERANGE;
+	memcpy(name, thread->name, n + 1);
+	return 0;
+}
+
+int pthread_getcpuclockid(pthread_t thread, clockid_t *clockid)
+{
+	if (!thread || !clockid)
+		return EINVAL;
+	/* Once the thread exits, clock_gettime on the encoded id answers
+	 * EINVAL -- the POSIX contract for a clockid whose thread is gone. */
+	*clockid = (clockid_t)(CLOCK_TID_CPUTIME_BASE |
+			       (thread->tid & 0x3FFFFFFF));
+	return 0;
+}
+
 int pthread_join(pthread_t thread, void **retval)
 {
 	if (!__pthread_initialized) {
@@ -1292,5 +1329,82 @@ int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
 		return err;
 	}
 	errno = saved;
+	return 0;
+}
+
+/* pthread_kill(): direct a signal at ONE thread.
+ *
+ * Threads are tasks here, each with its own kernel id, and sys_tgkill
+ * delivers to exactly that task (signal_send) -- pending per task if the
+ * signal is blocked there, which is what lets a suspended thread sit in
+ * sigsuspend() and take the resume signal the moment it unblocks it.
+ *
+ * The syscall is used directly rather than through kill(3) because both the
+ * semantics (thread-directed, not process-directed) and the error convention
+ * differ: the pthread_* family returns the error number and leaves errno
+ * alone. */
+int pthread_kill(pthread_t thread, int sig)
+{
+	if (!thread)
+		return ESRCH;
+	pid_t tid = thread->tid;
+	if (tid <= 0)
+		return ESRCH; /* already exited and reaped */
+	/* tgkill, not kill: the group check means a stale pthread_t whose tid
+	 * the kernel has reused for a DIFFERENT process misses (ESRCH) instead
+	 * of signalling a stranger. */
+	long rc = syscall3(SYS_TGKILL, (long)getpid(), (long)tid, (long)sig);
+	if (rc < 0)
+		return (int)-rc;
+	return 0;
+}
+
+/* pthread_getattr_np(): the attributes a running thread ACTUALLY has.
+ *
+ * The one answer callers are really after is the stack extent -- it is how a
+ * conservative garbage collector (JavaScriptCore's, through WTF::StackBounds)
+ * learns where the stack it must scan begins and ends.  Two cases:
+ *
+ *   created threads   this library allocated the stack and the TCB records
+ *                     it.  The usable range excludes the guard page at the
+ *                     bottom; the TLS block carved off the top stays inside
+ *                     the reported range, which is what the conventional
+ *                     implementations report too and only makes a scanner
+ *                     conservative, never wrong.
+ *
+ *   the main thread   the kernel mapped its stack at exec, before this
+ *                     library existed, so the kernel is asked: getprocmaps()
+ *                     reports the group's stack top and size alongside the
+ *                     region table.  No guard page is part of that mapping.
+ */
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr)
+{
+	if (!thread || !attr)
+		return EINVAL;
+
+	int rc = pthread_attr_init(attr);
+	if (rc != 0)
+		return rc;
+	attr->detachstate = (thread->detach_state == PTHREAD_CREATE_DETACHED)
+				    ? PTHREAD_CREATE_DETACHED
+				    : PTHREAD_CREATE_JOINABLE;
+
+	if (thread->stack_base) {
+		attr->stackaddr =
+			(char *)thread->stack_base + thread->guard_size;
+		attr->stacksize = thread->stack_size - thread->guard_size;
+		attr->guardsize = thread->guard_size;
+		return 0;
+	}
+
+	/* Main thread: the kernel knows what it mapped. */
+	procmapinfo_t info;
+	if (getprocmaps((int)thread->tid, &info, NULL, 0) < 0)
+		return errno ? errno : EINVAL;
+	if (!info.stack_top || !info.stack_size)
+		return ENOTSUP; /* kernel predates the stack report */
+	attr->stackaddr = (void *)(info.stack_top - info.stack_size);
+	attr->stacksize = (size_t)info.stack_size;
+	attr->guardsize = 0;
 	return 0;
 }

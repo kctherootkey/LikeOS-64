@@ -1,9 +1,10 @@
 # Names to show for desktop entries that come from a port's own tarball.
 #
 # Most entries in /usr/share/applications are written here (xterm.desktop,
-# xcalc.desktop, netsurf.desktop) and say whatever this file says.  Three come
-# from the packages themselves, installed into the sysroot by their own `make
-# install', and this is where those are given the names this desktop uses.
+# xcalc.desktop) and say whatever this file says.  The rest
+# come from the packages themselves, installed into the sysroot by their own
+# `make install', and this is where those are given the names this desktop
+# uses.
 #
 # Renaming rather than overriding.  A replacement .desktop file would have to
 # repeat the upstream Exec, Icon, MimeType, Categories, Keywords and Actions
@@ -16,6 +17,11 @@
 # xterm are both "Terminal".  In each pair the newer program takes the plain
 # name and the X.Org one is qualified, which is the way round a user expects:
 # "Terminal" is the one to open, "Xterm" is the one you ask for by name.
+#
+# Luakit is renamed for a different reason: it is not competing with anything,
+# it is the image's web browser, and a menu that offers "Luakit" alone tells a
+# user nothing about what it does.  "Luakit Web Browser" keeps the program's
+# name and adds the role, the way "Hexchat IRC Client" does.
 #
 # Applied by ports/xorg/gtk3/stage.sh after it copies the sysroot's entries,
 # which is the only moment both halves are in one directory.  The desktop
@@ -30,3 +36,4 @@
 galculator.desktop        Calculator
 xfce4-terminal.desktop    Terminal
 io.github.Hexchat.desktop Hexchat IRC Client
+luakit.desktop            Luakit Web Browser

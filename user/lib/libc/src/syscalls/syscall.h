@@ -209,6 +209,9 @@
 #define SYS_SHMDT       403
 #define SYS_SHMCTL      404
 #define SYS_GETPROCMAPS 407   /* (pid, procmapinfo*, procmap*, max) */
+#define SYS_MINCORE     409   /* (addr, length, vec) page residency, one byte per page */
+#define SYS_TKILL       258   /* (tid, sig) signal ONE thread */
+#define SYS_TGKILL      259   /* (tgid, tid, sig) same, group-checked */
 #define SYS_PTRACE      408   /* (request, pid, addr, data) — see sys/ptrace.h */
 #define XATTR_SYS_NOFOLLOW 0x40000000  /* OR'd into setxattr flags for lsetxattr */
 

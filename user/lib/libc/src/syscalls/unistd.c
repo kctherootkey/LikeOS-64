@@ -1541,6 +1541,31 @@ ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
 	return (ssize_t)ret;
 }
 
+/* getentropy(3): the small-buffer entropy call OpenBSD introduced and POSIX
+ * adopted.  Semantics differ from getrandom() in exactly two ways -- the
+ * request is capped at 256 bytes (EIO above that), and the call either fills
+ * the WHOLE buffer or fails -- so it is a loop over getrandom() rather than
+ * an alias for it.  libgcrypt's random gatherer is the first consumer. */
+int getentropy(void *buf, size_t buflen)
+{
+	if (buflen > 256) {
+		errno = EIO;
+		return -1;
+	}
+	unsigned char *p = (unsigned char *)buf;
+	size_t got = 0;
+	while (got < buflen) {
+		ssize_t r = getrandom(p + got, buflen - got, 0);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		got += (size_t)r;
+	}
+	return 0;
+}
+
 /* getauxval: access ELF auxiliary vector entries.
  * On x86-64 we have no AT_HWCAP/AT_PLATFORM mechanism exposed to
  * userspace today, so all lookups return 0. */

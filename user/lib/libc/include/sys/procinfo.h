@@ -69,6 +69,12 @@ typedef struct procmapinfo {
     uint64_t total_bytes;   /* sum of in-use region lengths */
     uint32_t n_regions;     /* in-use records */
     uint32_t capacity;      /* records the table can hold */
+    /* The main stack, which is mapped at exec directly into the page tables
+     * and so never appears among the regions: highest address and mapped
+     * size.  Zero on a task created before this field existed (a thread's
+     * kernel record carries no size).  pthread_getattr_np() reads these. */
+    uint64_t stack_top;
+    uint64_t stack_size;
 } procmapinfo_t;
 
 /* Report the address space of `pid`.  Fills *info always; fills up to `max`

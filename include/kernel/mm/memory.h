@@ -391,6 +391,7 @@ void mm_tlb_gather_init(struct mm_tlb_gather *g, uint64_t *pml4);
 void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys, uint64_t vaddr);
 /* Invalidate on every CPU, then drop the batch's references. */
 void mm_tlb_gather_flush(struct mm_tlb_gather *g);
+void mm_tlb_deferred_drain(void);
 
 /* ---- the task's mmap region table --------------------------------------
  *

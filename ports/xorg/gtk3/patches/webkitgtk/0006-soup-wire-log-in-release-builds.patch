@@ -1,0 +1,73 @@
+Let libsoup log the wire conversation in a release build.
+
+https:// hangs here while http:// works, with the connection ESTABLISHED and
+both queues empty, and curl plus a standalone libsoup program fetch the same
+URL fine.  Nothing short of the actual bytes distinguishes "we never wrote a
+request" from "we wrote one and the server answered nothing", and every
+attempt to reason it out from the layers below has been wrong.
+
+WEBKIT_DEBUG=Network produces nothing, because setupLogger()'s whole body sits
+inside
+
+    #if !LOG_DISABLED || !RELEASE_LOG_DISABLED
+
+and both are disabled in a release build -- so no SoupLogger is ever attached.
+soupLogPrinter is behind the same guard and its body is LOG()/RELEASE_LOG(),
+which compile to nothing too.  Soup's logging does NOT need a debug build --
+LoggingUnix.cpp says so in as many words ("some of our logging, such as Soup's
+is available in release builds") -- it only needs a logger on the session.
+
+So: a printer built on WTFLogAlways, which survives a release build, and an
+opt-in through WEBKIT_SOUP_LOG that attaches the logger directly and skips the
+log-channel machinery.  Off unless the variable is set, so a normal run is
+unchanged.
+
+Upstream: not reportable -- upstream's arrangement is deliberate; this is a
+bring-up aid for a platform where the usual debug build is impractical.
+
+--- a/Source/WebCore/platform/network/soup/SoupNetworkSession.cpp
++++ b/Source/WebCore/platform/network/soup/SoupNetworkSession.cpp
+@@ -54,6 +54,15 @@
+     return storage.get();
+ }
+ 
++// Always compiled, unlike the one below: WTFLogAlways survives a release
++// build, LOG and RELEASE_LOG do not.  Used by the WEBKIT_SOUP_LOG path in
++// setupLogger().  The direction character is libsoup's own: '>' is a request
++// header going out, '<' a response header coming back, ' ' body data.
++static void soupReleaseLogPrinter(SoupLogger*, SoupLoggerLogLevel, char direction, const char* data, gpointer)
++{
++    WTFLogAlways("[soup] %c %s", direction, data);
++}
++
+ #if !LOG_DISABLED || !RELEASE_LOG_DISABLED
+ inline static void soupLogPrinter(SoupLogger*, SoupLoggerLogLevel, char direction, const char* data, gpointer)
+ {
+@@ -154,6 +163,27 @@
+ 
+ void SoupNetworkSession::setupLogger()
+ {
++    // WEBKIT_SOUP_LOG makes libsoup log the wire conversation in a RELEASE
++    // build.  The block below is the upstream path, and it is compiled out
++    // whenever LOG_DISABLED and RELEASE_LOG_DISABLED are both set -- which is
++    // every release build, so WEBKIT_DEBUG=Network produces nothing at all.
++    // Soup's own logging does not need a debug build (LoggingUnix.cpp says so
++    // in as many words), only a SoupLogger attached to the session, so this
++    // attaches one directly and skips the log-channel machinery entirely.
++    //
++    // This exists because https:// hangs here with the connection ESTABLISHED
++    // and both queues empty, while curl and a standalone libsoup program fetch
++    // the same URL fine.  Nothing short of the actual request and response
++    // bytes distinguishes "we never wrote anything" from "we wrote it and the
++    // server said nothing".
++    if (getenv("WEBKIT_SOUP_LOG") && !soup_session_get_feature(m_soupSession.get(), SOUP_TYPE_LOGGER)) {
++        GRefPtr<SoupLogger> logger = adoptGRef(soup_logger_new(SOUP_LOGGER_LOG_BODY));
++        soup_session_add_feature(m_soupSession.get(), SOUP_SESSION_FEATURE(logger.get()));
++        soup_logger_set_printer(logger.get(), soupReleaseLogPrinter, nullptr, nullptr);
++        WTFLogAlways("[soup] logger attached to session");
++        return;
++    }
++
+ #if !LOG_DISABLED || !RELEASE_LOG_DISABLED
+     if (LogNetwork.state != WTFLogChannelState::On || soup_session_get_feature(m_soupSession.get(), SOUP_TYPE_LOGGER))
+         return;

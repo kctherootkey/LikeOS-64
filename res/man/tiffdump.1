@@ -1,0 +1,46 @@
+TIFFDUMP(1)                         LibTIFF                        TIFFDUMP(1)
+
+NAME
+       tiffdump - print verbatim information about TIFF files
+
+SYNOPSIS
+       tiffdump [ options ] name
+
+DESCRIPTION
+       tiffdump displays directory information from files created according to
+       the  Tag Image File Format, Revision 6.0.  The header of each TIFF file
+       (magic number, version, and first directory offset) is displayed,  fol-
+       lowed by the tag contents of each directory in the file.  For each tag,
+       the  name,  data type, count, and value(s) is displayed.  When the sym-
+       bolic name for a tag or data type is known, the symbolic name  is  dis-
+       played  followed  by it's numeric (decimal) value.  Tag values are dis-
+       played enclosed in <> characters immediately preceded by the  value  of
+       the  count field.  For example, an ImageWidth tag might be displayed as
+       ImageWidth (256) SHORT (3) 1<800>.
+
+       tiffdump is particularly useful for investigating the contents of  TIFF
+       files that libtiff does not understand.
+
+OPTIONS
+       -h     Force  numeric data to be printed in hexadecimal rather than the
+              default decimal.
+
+       -m items
+              Change the number of indirect data items that  are  printed.  By
+              default, this will be 24.
+
+       -o offset
+              Dump  the  contents  of the IFD at the a particular file offset.
+              The file offset may be specified using the usual C-style syntax;
+              i.e. a leading 0x for hexadecimal and a leading 0 for octal.
+
+SEE ALSO
+       tiffinfo (1), libtiff (3tiff)
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                      TIFFDUMP(1)

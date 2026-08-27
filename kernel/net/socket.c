@@ -17,6 +17,9 @@
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/file.h>
 
+/* Same extern tcp.c uses; poll.c exports it without a header. */
+extern void poll_notify_wq(struct wait_queue_head *);
+
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
 static spinlock_t socket_lock = SPINLOCK_INIT("socket");
@@ -91,6 +94,14 @@ static uint16_t alloc_ephemeral_port(net_socket_t *s)
 				break;
 			}
 		}
+		/* The socket table is not enough: a connection in TIME_WAIT/
+		 * FIN_WAIT still owns its port after its socket is gone, and
+		 * re-issuing that port to a reconnect toward the same remote
+		 * collides the handshake with the dying conn (sporadic
+		 * "connection reset"/"broken pipe" during parallel browser
+		 * loads).  See tcp_local_port_in_use(). */
+		if (!in_use && tcp_local_port_in_use(cand))
+			in_use = 1;
 		if (!in_use) {
 			port = cand;
 			break;
@@ -146,6 +157,18 @@ int sock_create(int domain, int type, int protocol)
 	if (type == SOCK_RAW && !capable())
 		return -EPERM;
 
+	/* The datagram receive queue is out-of-line (see udp_rx_entry_t) and
+	 * kalloc may sleep, so allocate BEFORE taking the table spinlock. */
+	udp_rx_entry_t *rxq = NULL;
+	if (type == SOCK_DGRAM || type == SOCK_RAW) {
+		rxq = (udp_rx_entry_t *)kalloc(sizeof(udp_rx_entry_t) *
+					       UDP_RX_QUEUE_ENTRIES);
+		if (!rxq)
+			return -ENOMEM;
+		mm_memset(rxq, 0,
+			  sizeof(udp_rx_entry_t) * UDP_RX_QUEUE_ENTRIES);
+	}
+
 	uint64_t flags;
 	spin_lock_irqsave(&socket_lock, &flags);
 
@@ -181,6 +204,8 @@ int sock_create(int domain, int type, int protocol)
 			s->lock = (spinlock_t)SPINLOCK_INIT("sock");
 			s->local_addr.sin_family = AF_INET;
 			s->remote_addr.sin_family = AF_INET;
+			s->udp_rx_queue = rxq;
+			rxq = NULL; /* owned by the slot now */
 
 			fd = i;
 			break;
@@ -188,6 +213,8 @@ int sock_create(int domain, int type, int protocol)
 	}
 
 	spin_unlock_irqrestore(&socket_lock, flags);
+	if (rxq)
+		kfree(rxq); /* no slot took it */
 	WARN_RATELIMIT(fd < 0, "sock_create: socket table full (%d slots)",
 		       NET_MAX_SOCKETS);
 	return fd;
@@ -714,7 +741,7 @@ int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 		uint64_t sflags;
 		spin_lock_irqsave(&s->lock, &sflags);
 
-		if (s->udp_rx_head == s->udp_rx_tail) {
+		if (!s->udp_rx_queue || s->udp_rx_head == s->udp_rx_tail) {
 			s->udp_rx_ready = 0;
 			spin_unlock_irqrestore(&s->lock, sflags);
 			return -EAGAIN;
@@ -770,12 +797,26 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 	if (s->type == SOCK_STREAM) {
 		if (!s->tcp)
 			return -ENOTCONN;
+		/* Our own half-close: the write direction is gone, whatever
+		 * state the connection is in.  POSIX says EPIPE. */
+		if (s->tx_shutdown)
+			return -EPIPE;
 		// Allow sends when the TCP layer is established even if sock_connect()
 		// returned EINPROGRESS (non-blocking path) before setting s->connected.
-		if (!s->connected && s->tcp->state != TCP_STATE_ESTABLISHED)
+		//
+		// ENOTCONN is for a connection that NEVER completed.  One that
+		// established and then left (server closed a pooled keep-alive
+		// conn before this socket's SO_ERROR check ever ran, so
+		// s->connected was never set) must report ECONNRESET/EPIPE --
+		// those are what a connection pool treats as "stale, retry on
+		// a fresh connection"; ENOTCONN surfaces as a user-visible
+		// failure.  conn->connect_done is the TCP layer's own record
+		// of having completed the handshake.
+		if (!s->connected && !s->tcp->connect_done &&
+		    s->tcp->state != TCP_STATE_ESTABLISHED)
 			return -ENOTCONN;
 		if (s->tcp->state != TCP_STATE_ESTABLISHED)
-			return -EPIPE;
+			return s->tcp->error ? -s->tcp->error : -EPIPE;
 
 		/* Send the WHOLE buffer before returning, not just the part
 		 * that happened to fit.
@@ -830,7 +871,9 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 				tcp_conn_get(conn);
 			int connected =
 				s->connected ||
-				(conn && conn->state == TCP_STATE_ESTABLISHED);
+				(conn && (conn->connect_done ||
+					  conn->state ==
+						  TCP_STATE_ESTABLISHED));
 			int nonblock = s->nonblock;
 			spin_unlock_irqrestore(&s->lock, sflags);
 			if (!conn || !connected) {
@@ -839,8 +882,9 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 				return total ? (int)total : -ENOTCONN;
 			}
 			if (conn->state != TCP_STATE_ESTABLISHED) {
+				int err = conn->error ? -conn->error : -EPIPE;
 				tcp_conn_release(conn);
-				return total ? (int)total : -EPIPE;
+				return total ? (int)total : err;
 			}
 
 			smap_disable();
@@ -878,6 +922,19 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 		return -EDESTADDRREQ;
 	return sock_sendto(sockfd, buf, len, flags, &s->remote_addr,
 			   sizeof(struct sockaddr_in));
+}
+
+/* No more data will ever arrive on this connection: the peer's FIN has been
+ * received (CLOSE_WAIT and everything after it) or the connection is dead.
+ * NOT FIN_WAIT_1/FIN_WAIT_2 -- those mean WE closed our send direction and
+ * the peer may still be transmitting; a receiver must keep waiting there
+ * (shutdown(SHUT_WR) then read-the-response is the standard client pattern,
+ * and treating those states as EOF cut the response off). */
+static int tcp_rx_finished(int state)
+{
+	return state == TCP_STATE_CLOSED || state == TCP_STATE_CLOSE_WAIT ||
+	       state == TCP_STATE_CLOSING || state == TCP_STATE_LAST_ACK ||
+	       state == TCP_STATE_TIME_WAIT;
 }
 
 // ============================================================================
@@ -934,8 +991,13 @@ again:
 				rc = total ? (int)total : -EBADF;
 				goto recv_out;
 			}
-			if (conn->rx_ready ||
-			    conn->state != TCP_STATE_ESTABLISHED)
+			/* Stop waiting when data is ready, the connection
+			 * erred, no more data can arrive, or our own read
+			 * direction was shut down.  A connection we half
+			 * closed (FIN_WAIT_1/2) keeps waiting: the peer is
+			 * still entitled to send. */
+			if (conn->rx_ready || conn->error ||
+			    tcp_rx_finished(conn->state) || s->rx_shutdown)
 				break;
 			if (nonblock || dontwait) {
 				rc = total ? (int)total : -EAGAIN;
@@ -985,8 +1047,9 @@ again:
                  * If the CAS fails the waker already claimed us and is
                  * enqueueing: wait for the entry to land and reconcile
                  * through sched_schedule (it picks us straight back). */
-				if (conn->rx_ready ||
-				    conn->state != TCP_STATE_ESTABLISHED) {
+				if (conn->rx_ready || conn->error ||
+				    tcp_rx_finished(conn->state) ||
+				    s->rx_shutdown) {
 					task_state_t expected = TASK_BLOCKED;
 					if (__atomic_compare_exchange_n(
 						    &cur->state, &expected,
@@ -1019,9 +1082,9 @@ again:
 			goto recv_out;
 		}
 
-		// Connection closed - return 0 (EOF)
-		if (conn->state == TCP_STATE_CLOSE_WAIT ||
-		    conn->state == TCP_STATE_CLOSED) {
+		// No more data will come (peer FIN received / conn dead /
+		// SHUT_RD applied here): drain the ring, then EOF.
+		if (tcp_rx_finished(conn->state) || s->rx_shutdown) {
 			if (conn->rx_head == conn->rx_tail) {
 				rc = (int)total;
 				goto recv_out;
@@ -1076,8 +1139,11 @@ again:
          * zero-window probe arrived on a full ring — copy=0 in tcp_rx).
          * Returning 0 here would look like EOF to OpenSSL.  Re-enter the
          * wait loop on a blocking ESTABLISHED socket instead. */
-		if (copy == 0 && conn->state == TCP_STATE_ESTABLISHED &&
-		    !peek) {
+		if (copy == 0 &&
+		    (conn->state == TCP_STATE_ESTABLISHED ||
+		     conn->state == TCP_STATE_FIN_WAIT_1 ||
+		     conn->state == TCP_STATE_FIN_WAIT_2) &&
+		    !s->rx_shutdown && !peek) {
 			uint64_t sfl;
 			spin_lock_irqsave(&s->lock, &sfl);
 			int nb2 = s->nonblock;
@@ -1196,7 +1262,13 @@ int sock_close(int sockfd)
 	s->tcp = NULL;
 	s->closed = 1;
 	s->active = 0;
+	/* Detach the datagram queue under the lock (delivery paths test it
+	 * under s->lock), free it after. */
+	udp_rx_entry_t *rxq_free = s->udp_rx_queue;
+	s->udp_rx_queue = NULL;
 	spin_unlock_irqrestore(&s->lock, flags);
+	if (rxq_free)
+		kfree(rxq_free);
 
 	// Do NOT hold s->lock across tcp_close/tcp_abort (they send FIN/RST and
 	// may free memory → TLB-shootdown IPIs).  We hold the socket reference,
@@ -1233,21 +1305,38 @@ int sock_close(int sockfd)
 // ============================================================================
 int sock_shutdown(int sockfd, int how)
 {
-	(void)how;
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return -EBADF;
 	net_socket_t *s = &sockets[sockfd];
 	if (!s->active)
 		return -EBADF;
+	if (how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR)
+		return -EINVAL;
 
+	/* shutdown() closes DIRECTIONS, not the socket.  This used to ignore
+	 * `how` and do everything close() does -- detach the connection, clear
+	 * `connected`, FIN both ways -- so shutdown(SHUT_WR), the half-close
+	 * that TLS teardown and request/EOF-response clients use, destroyed
+	 * the receive path too, and the next operation found no connection at
+	 * all and failed ENOTCONN ("Transport endpoint is not connected" from
+	 * a browser's connection pool was this).  The connection stays
+	 * attached: tcp_close() runs the proper FIN state machine
+	 * (ESTABLISHED -> FIN_WAIT_1, CLOSE_WAIT -> LAST_ACK), FIN_WAIT_1/2
+	 * still consume inbound data, and close() later finishes an
+	 * already-closing connection harmlessly (its switch treats the
+	 * closing states as no-ops). */
 	if (s->type == SOCK_STREAM && s->tcp) {
 		tcp_conn_t *c = s->tcp;
-		c->owner_socket = NULL;
-		s->tcp = NULL;
-		s->connected = 0;
-		s->listening = 0;
-		tcp_close(c);
-		tcp_conn_release(c); // drop the socket reference
+		if (how == SHUT_RD || how == SHUT_RDWR) {
+			s->rx_shutdown = 1;
+			/* A reader parked in sock_recv must wake to see it. */
+			sched_wake_channel((void *)&c->rx_ready);
+			poll_notify_wq(&s->poll_wq);
+		}
+		if ((how == SHUT_WR || how == SHUT_RDWR) && !s->tx_shutdown) {
+			s->tx_shutdown = 1;
+			tcp_close(c);
+		}
 	}
 
 	return 0;
@@ -1496,6 +1585,13 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 				*optlen = sizeof(int);
 			}
 			return 0;
+		case SO_ACCEPTCONN:
+			/* Read-only: has listen() been applied. */
+			if (*optlen >= sizeof(int)) {
+				*(int *)optval = s->listening ? 1 : 0;
+				*optlen = sizeof(int);
+			}
+			return 0;
 		case SO_REUSEADDR:
 		case SO_REUSEPORT:
 		case SO_BROADCAST:
@@ -1645,6 +1741,10 @@ void raw_socket_deliver(uint32_t src_ip, uint32_t dst_ip, uint8_t protocol,
 		uint64_t flags;
 		spin_lock_irqsave(&s->lock, &flags);
 
+		if (!s->udp_rx_queue) {
+			spin_unlock_irqrestore(&s->lock, flags);
+			continue; // socket being torn down
+		}
 		int next = (s->udp_rx_tail + 1) % 16;
 		if (next == s->udp_rx_head) {
 			spin_unlock_irqrestore(&s->lock, flags);
@@ -2035,8 +2135,11 @@ int sock_poll(int sockfd, short events)
 				if (conn->rx_ready ||
 				    conn->rx_head != conn->rx_tail)
 					revents |= POLLIN | POLLRDNORM;
-				if (conn->state == TCP_STATE_CLOSE_WAIT ||
-				    conn->state == TCP_STATE_CLOSED)
+				/* EOF is readable: peer FIN received (any
+				 * post-FIN state, not just CLOSE_WAIT), or
+				 * our own SHUT_RD. */
+				if (tcp_rx_finished(conn->state) ||
+				    s->rx_shutdown)
 					revents |= POLLIN | POLLRDNORM; // EOF
 			}
 			// Writable if connection established and space in tx buffer

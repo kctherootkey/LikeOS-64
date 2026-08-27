@@ -377,6 +377,28 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 		tp.tv_sec = total_secs;
 		tp.tv_nsec = frac_ns;
 		break;
+	default:
+		/* Per-thread CPU clocks for OTHER threads:
+		 * pthread_getcpuclockid() encodes the target's tid as
+		 * (CLOCK_TID_CPUTIME_BASE | tid).  The same tick accounting
+		 * that answers CLOCK_THREAD_CPUTIME_ID for the caller answers
+		 * it for any live thread; a dead or unknown tid is EINVAL,
+		 * which is what POSIX says a dangling clockid earns. */
+		if (clk_id >= 0x40000000) {
+			uint32_t tid = (uint32_t)(clk_id & 0x3FFFFFFF);
+			task_t *t = sched_find_task_by_id(tid);
+			if (!t)
+				return -EINVAL;
+			uint64_t ticks = t->utime_ticks + t->stime_ticks;
+			uint64_t hz = timer_get_frequency();
+			if (hz == 0)
+				hz = 100;
+			tp.tv_sec = ticks / hz;
+			tp.tv_nsec = (long)((ticks % hz) *
+					    (1000000000ULL / hz));
+			break;
+		}
+		return -EINVAL;
 	case 2: // CLOCK_PROCESS_CPUTIME_ID
 	case 3: // CLOCK_THREAD_CPUTIME_ID
 		// CPU time consumed, not time elapsed.  These used to return
@@ -401,8 +423,6 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 					       (1000000000ULL / freq));
 		}
 		break;
-	default:
-		return -EINVAL;
 	}
 
 	if (copy_to_user((void *)tp_ptr, &tp, sizeof(tp)) != 0) {

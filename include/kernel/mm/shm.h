@@ -15,10 +15,34 @@
 
 #include <kernel/uapi/types.h>
 
-/* System-wide limits.  Deliberately modest: each object pins physical pages
- * for as long as it exists, and an unlinked-but-still-mapped object keeps
- * them until the last mapping goes. */
-#define SHM_MAX_OBJECTS 64
+/* System-wide limits.
+ *
+ * SHM_MAX_OBJECTS counts POSIX and System V segments TOGETHER: shmget() names
+ * its segments "sysv.<key>" and allocates them from this same table (see
+ * shm_sysv_get), so the two namespaces compete for one pool.  That is what
+ * makes 64 far too few for a desktop:
+ *
+ *   - GTK draws X11 windows through MIT-SHM, which is shmget(), and takes a
+ *     segment per window buffer.  A program with a deep widget tree holds
+ *     dozens before it has drawn anything.
+ *   - WebKit paints every page into a ShareableBitmap backed by shm_open().
+ *
+ * At 64 the desktop's X11 segments were exhausting the table before WebKit
+ * could allocate a single backing store.  luakit loaded, styled and laid out
+ * its page -- hovering a link even showed the URL, so hit-testing worked --
+ * and then painted nothing, because shm_open() answered ENOMEM forever:
+ *
+ *     Failed to create shared memory: Cannot allocate memory
+ *
+ * MiniBrowser, one plain window with a shallow widget tree, stayed under the
+ * limit and rendered the same page perfectly.  That difference is the whole
+ * bug; it had nothing to do with WebKit configuration.
+ *
+ * 1024 entries cost sizeof(shm_object_t) each in .bss and nothing else --
+ * the table is an array of descriptors, not of memory.  Pages are still only
+ * pinned by segments that actually exist, which is what the note below is
+ * about, and SHM_MAX_PAGES still caps each one. */
+#define SHM_MAX_OBJECTS 1024
 #define SHM_NAME_MAX 64
 #define SHM_MAX_PAGES 16384 /* 64 MB per object */
 

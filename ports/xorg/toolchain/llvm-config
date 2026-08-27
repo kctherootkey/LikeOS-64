@@ -1,0 +1,57 @@
+#!/bin/sh
+# llvm-config for the CROSS build (mesa's meson runs this on the build host).
+#
+# The real llvm-config in the sysroot is a TARGET binary and cannot run here.
+# The native stage-1 tree has a runnable one, but its paths and library
+# answers describe the build host.  So: source-of-truth questions (version,
+# component list) are DELEGATED to the native copy, and everything that names
+# a path or a library is answered for the sysroot -- one shared libLLVM,
+# which is the only thing the target install ships.
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../../.." && pwd)
+SYSROOT="${LIKEOS_SYSROOT:-$root/build/xorg-sysroot}"
+NATIVE="$root/ports/xorg/gtk3/llvm-23.1.0/.likeos-native/bin/llvm-config"
+
+case "$1" in
+--version|--components)
+	exec "$NATIVE" "$@" ;;
+--includedir)
+	echo "$SYSROOT/usr/include" ;;
+--libdir)
+	echo "$SYSROOT/usr/lib" ;;
+--cppflags)
+	echo "-I$SYSROOT/usr/include -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS" ;;
+--cflags|--cxxflags)
+	echo "-I$SYSROOT/usr/include" ;;
+--ldflags)
+	echo "-L$SYSROOT/usr/lib" ;;
+--libs)
+	echo "-lLLVM" ;;
+--libfiles)
+	echo "$SYSROOT/usr/lib/libLLVM.so" ;;
+--system-libs)
+	echo "" ;;
+--shared-mode)
+	echo "shared" ;;
+--link-shared|--link-static)
+	# accepted as a mode flag when combined; alone they answer nothing
+	shift
+	[ $# -gt 0 ] && exec "$0" "$@"
+	echo "" ;;
+--obj-root|--prefix)
+	echo "$SYSROOT/usr" ;;
+--bindir)
+	echo "$SYSROOT/usr/bin" ;;
+--has-rtti)
+	echo "YES" ;;
+--build-mode)
+	echo "Release" ;;
+--assertion-mode)
+	echo "OFF" ;;
+--targets-built)
+	echo "X86" ;;
+*)
+	# Unknown query: let the native one try; paths it prints would be
+	# wrong, but the known path questions are all handled above.
+	exec "$NATIVE" "$@" ;;
+esac

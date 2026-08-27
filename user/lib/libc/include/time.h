@@ -22,6 +22,11 @@ struct timespec {
 #define CLOCK_MONOTONIC          1
 #define CLOCK_PROCESS_CPUTIME_ID 2
 #define CLOCK_THREAD_CPUTIME_ID  3
+/* Per-thread CPU clocks for OTHER threads: pthread_getcpuclockid() encodes
+ * the target's kernel tid into the clockid.  clock_gettime() on such an id
+ * reports that thread's consumed CPU time (user + system ticks), or EINVAL
+ * once the thread is gone. */
+#define CLOCK_TID_CPUTIME_BASE 0x40000000
 
 typedef int clockid_t;
 
@@ -57,6 +62,8 @@ struct tm *gmtime_r(const time_t *timep, struct tm *result);
 struct tm *localtime(const time_t *timep);
 struct tm *localtime_r(const time_t *timep, struct tm *result);
 time_t mktime(struct tm *tm);
+/* mktime with the fields taken as UTC; here the same operation (no timezones). */
+time_t timegm(struct tm* tm);
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 
 /* difftime(): seconds between two times, as a double (ISO C). */

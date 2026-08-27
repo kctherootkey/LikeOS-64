@@ -1,0 +1,318 @@
+LUAKIT(1)                        User Commands                       LUAKIT(1)
+
+NAME
+       Luakit - Fast, small, WebKit based browser framework extensible by Lua.
+
+SYNOPSIS
+       luakit [OPTION] [URI]
+
+DESCRIPTION
+       Luakit  is a highly configurable, browser framework based on the WebKit
+       web content engine and the GTK+ toolkit. It is very fast, extensible by
+       Lua and licensed under the GNU GPLv3 license. It is primarily  targeted
+       at  power  users, developers and any people with too much time on their
+       hands who want to have fine-grained control over their web browsers be-
+       haviour and interface.
+
+   Modes
+       Luakit can run in various modes, which specify how the  user  interacts
+       with the browser.
+
+       Normal mode
+              This  is  the  default mode when Luakit is started. You can load
+              URIs, open tabs and windows, access to other modes, etc.
+
+       All mode
+              Special meta-mode in which  the  bindings  are  present  in  all
+              modes.
+
+       Insert mode
+              When  selecting  form  fields  Luakit will enter the insert mode
+              which allows you to enter text in form fields  without  acciden-
+              tally triggering normal mode bindings.
+
+       Passthrough mode
+              Luakit  will  pass every key event to the WebView until the user
+              presses Escape. This is useful for using webpage shortcuts.
+
+       Command mode
+              Enter commands. Every action in Luakit is a  command,  so  basi-
+              cally you can do anything from there.
+
+       Lua mode
+              Execute arbitrary Lua commands within the Luakit environment.
+
+   Userscripts
+       Luakit  is  highly  extensible  with  userscripts written in Lua. These
+       scripts may provide additional modes. Some are embedded by default. You
+       will need to load the userscript to use its features. See the  CONFIGU-
+       RATION section for more details.
+
+OPTIONS
+   Help options
+       -h, --help
+              Show help options.
+
+       --help-all
+              Show all help options.
+
+       --help-gtk
+              Show GTK+ help options.
+
+   Application options
+       -k, --check
+              Check configuration file and exit.
+
+       -c, --config=FILE
+              Configuration file to use.
+
+       -n, --nonblock
+              Fork Luakit into the background.
+
+       -U, --nounique
+              Ignore libunique bindings.
+
+       -u, --uri=URI
+              URI(s) to load at startup.
+
+       -v, --verbose
+              Print debugging output.
+
+       -V, --version
+              Print version and exit.
+
+       --display=DISPLAY
+              X display to use.
+
+KEYBINDINGS
+       Luakit is fully usable with keyboard. Default bindings should be famil-
+       iar to users of Emacs and Vim; nonetheless a lot of keyboards and mouse
+       shortcuts are shared with popular web browsers.
+
+       Pressing  :  will  open the command prompt. You can enter commands from
+       there.  You can view the current list of bindings in Luakit's help page
+       with the
+
+              :help
+
+       command.
+
+       Some bindings have an uppercase version which will behave somewhat dif-
+       ferently. Some come with userscripts, so you will need to have the  ap-
+       propriate  userscript  loaded  to  use it.  Here follows a list of some
+       noteworthy default bindings.
+
+       ZZ     Quit and save the session.
+
+       ZQ     Quit without saving the session.
+
+       o, O   Open specified URIs. If uppercase, edit current URI.
+
+       t, T   Open specified URIs in new tab. If uppercase, edit current URI.
+
+       w, W   Open specified URIs in new window. If  uppercase,  edit  current
+              URI.
+
+       <Left>, <Down>, <Up>, <Right>
+       h, j, k, l
+              Scroll page vertically and horizontally.
+
+       <Home>, <End>
+       gg, G
+              Go to top / bottom of the page.
+
+       [count]%
+              Go to [count] percent of the page.
+
+       f, F   Enter  follow  mode.  Use  numbers or text to open corresponding
+              links. Use arrow to navigate between links. If  uppercase,  open
+              in new tab.  Requires follow userscript.
+
+       i      Enter  insert  mode.  In  some  case form fields may not receive
+              characters; press an arrow key to insert characters correctly.
+
+       gi     Enter insert mode in the first form  field.   Requires  go_input
+              userscript.
+
+       <F11>  Toggle fullscreen.
+
+       +, -   Change the zoom level.
+
+       =      Restore zoom level.
+
+       p, P   Open URI from clipboard. If uppercase, open in new tab.
+
+       y      Yank current URI to clipboard.
+
+       <Ctrl>x, <Ctrl>a
+              Decrement / increment last number in URI. This is useful for fo-
+              rum threads or any ordered website.
+
+       H, L   Go back / forward in the browser history.
+
+       <Ctrl><Shift><Tab>, <Ctrl><Tab>
+       <Ctrl><PageDown>, <Ctrl><PageUp>
+       gT, gt
+              Go to previous / next tab.
+
+       <Alt>[0-9]
+              Go to tab #, where # is between 0 and 9.
+
+       <, >   Reorder tabs.  Requires taborder userscript.
+
+       [count]d
+              Close [count] tabs.
+
+       u      Restore last closed tab.
+
+       gy     Duplicate current tab.
+
+       gh, gH Open homepage. If uppercase, open in new tab.
+
+       r, R   Reload current page. If uppercase, skip cache.
+
+       <Ctrl>c
+              Stop loading the current page.
+
+       <Ctrl>z
+              Enter passthrough mode. Use ESC to return to normal mode.
+
+       M[a-zA-Z0-9]
+              Associate current URI to quickmark #, where # is an ASCII letter
+              or a digit.  Requires quickmarks userscript.
+
+       go[a-zA-Z0-9], gn[a-zA-Z0-9], gw[a-zA-Z0-9]
+              Open  specified quickmark in current tab / new tab / new window.
+              Requires quickmarks userscript.
+
+       B      Add current URI to bookmarks.
+
+       gb, gB Open bookmarks manager. If uppercase, open in new tab.
+
+       /, ?   Search / reverse search for a string on current page.
+
+       n, N   Find next / previous result from search.
+
+COMMANDS
+       All bindings actually refer to commands. However, some commands do  not
+       have  bindings associated by default. If completion userscript is used,
+       you can autocomplete commands by pressing <TAB> by default. Once again,
+       you should consult the configuration files to get an  exhaustive  list.
+       The  currently available functions may be displayed from the help view,
+       which you can open with the :help command.
+
+       Here follows some noteworthy commands:
+
+       :bookmarks
+              Display and search bookmarks.
+
+       :downloads
+              Open Download page, which  displays  all  downloads  along  with
+              their status.
+
+       :dump  Download current page.
+
+       :save  Save the complete page as a single mhtml file.
+
+       :help  Display all commands and bindings, along with their description.
+              The help page also features some details about modes.
+
+       :history
+              Display and search history.
+
+       :inspect
+              Launch WebKit inspector.  Use :inspect! to toggle off.
+
+       :nohlsearch
+              Disable search highlighting.
+
+       :qmarks
+              Display the quickmarks list.
+
+       :tabhistory
+              Display the tab history.
+
+       :view-source
+              Display page source code.  Use :view-source! to toggle off.
+
+FILES
+       Luakit will load configuration files from the following folders in pri-
+       ority order:
+
+              $XDG_CONFIG_HOME/luakit
+
+              $XDG_CONFIG_DIRS/luakit
+
+       Default configuration files:
+
+       binds.lua
+              The keyboard and mouse bindings.
+
+       globals.lua
+              General  configuration,  like  home  page,  search engines, user
+              agent, per-domain properties, cookies policy.
+
+       modes.lua
+              All default modes are set in this file.
+
+       rc.lua Main configuration files. All other files are loaded from there.
+
+       theme.lua,
+              Colors definition.
+
+       webview.lua
+              WebKit related.
+
+       window.lua
+              Status bar, windows and tabs behaviour.
+
+       Embedded userscript will be loaded from $XDG_DATA_DIRS/luakit/lib.
+
+       All browsing-related files are stored in $XDG_DATA_HOME/luakit.  All of
+       are created if needed and if they do not exist. Depending on the  user-
+       scripts you are using, you may find:
+
+       bookmarks.db
+              An  SQLite3  database containing your complete bookmark list. If
+              you want to synchronise your bookmarks  between  your  different
+              systems,  just  share  this file. You can use a symbolic link if
+              the file is not stored in the required folder.
+
+       cookies.db
+              This file contains all details needed for websites keeping track
+              of your status, like login information. Delete  this  file  once
+              you  are  finished with browsing if you are not on your personal
+              system.
+
+       history.db
+              Your browsing history.  Delete this file once you  are  finished
+              with browsing if you are not on your personal system.
+
+       quickmarks
+              A  plain  text file saving your quickmarks. The structure is ex-
+              tremely simple: each line is a single quickmark; first character
+              is the quickmark shortcut and may be one of [a-zA-Z0-9];  second
+              character is a space; the remaining part is the URI.
+
+CONFIGURATION
+       If  you  do  not want to stick to the default configuration and want to
+       benefit from the flexibility and extensibility of Luakit, you can fully
+       configure it from the Lua configuration files.
+
+       If you do not want to start from scratch, you may use default  configu-
+       ration  files  and tweak them to fit your needs. Use the following com-
+       mand to copy configuration file to your home folder:
+
+              cp -r $XDG_CONFIG_DIRS/luakit $XDG_CONFIG_HOME
+
+       You can now edit the new files. Configuration should be quite straight-
+       forward, even if you do not know much about Lua.
+
+AUTHORS
+       Luakit    was    mainly    developed    by    Mason    Larobina    <ma-
+       son.larobina@gmail.com>.  Other  contributors are listed in the AUTHORS
+       file.
+
+       This man page was written by Pierre Neidhardt <ambrevar@gmail.com>.
+
+Luakit 2.4.0                      2012-10-10                         LUAKIT(1)

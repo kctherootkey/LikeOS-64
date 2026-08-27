@@ -1,0 +1,46 @@
+Build and install without the generated API documentation.
+
+The apidoc target runs build-utils/docgen/makedoc.lua on the BUILD host, and
+that script is not a standalone generator: it require()s luakit's own Lua
+modules (window, webview, binds, lousy) plus LuaFileSystem, so the build host
+would need a Lua 5.1 with lfs installed system-wide just to render HTML pages.
+What comes out is developer reference documentation under
+/usr/share/luakit/doc; luakit itself runs without it (the :help introspector
+falls back to "documentation not found" for the missing pages), and every
+other port in this tree drops its documentation for exactly this reason --
+the toolchain it needs belongs to the build host, and what it produces is
+never read on the image.
+
+The install lines for the apidocs go with the target; README/AUTHORS/COPYING
+stay, so the doc directory still says what the program is and under what terms
+it ships.
+
+Upstream: not reported (build-arrangement choice, not a defect).
+
+--- a/Makefile
++++ b/Makefile
+@@ -17,7 +17,7 @@ EXT_OBJS = $(foreach obj,$(EXT_SRCS:.c=.o),$(obj))
+ # Must be kept in sync with doc/docgen.ld
+ DOC_SRCS = $(filter-out lib/markdown.lua lib/lousy/init.lua,$(shell for d in doc/luadoc lib common/clib; do find $$d -type f; done)) tests/lib.lua
+
+-all: options newline luakit luakit.1 luakit.so apidoc
++all: options newline luakit luakit.1 luakit.so
+
+ options:
+ 	@echo luakit build options:
+@@ -91,14 +91,8 @@ clean:
+ 	rm -rf doc/apidocs doc/html luakit $(OBJS) $(EXT_OBJS) $(TSRC) $(THEAD) buildopts.h luakit.1 luakit.so
+
+ install: all
+-	install -d $(DESTDIR)$(DOCDIR)/classes
+-	install -d $(DESTDIR)$(DOCDIR)/modules
+-	install -d $(DESTDIR)$(DOCDIR)/pages
++	install -d $(DESTDIR)$(DOCDIR)
+ 	install -m644 README.md AUTHORS COPYING.GPLv3 $(DESTDIR)$(DOCDIR)
+-	install -m644 doc/apidocs/classes/* $(DESTDIR)$(DOCDIR)/classes
+-	install -m644 doc/apidocs/modules/* $(DESTDIR)$(DOCDIR)/modules
+-	install -m644 doc/apidocs/pages/* $(DESTDIR)$(DOCDIR)/pages
+-	install -m644 doc/apidocs/*.html $(DESTDIR)$(DOCDIR)
+ 	install -d $(DESTDIR)$(PREFIX)/share/luakit/lib/lousy/widget
+ 	install -m644 lib/*.* $(DESTDIR)$(PREFIX)/share/luakit/lib
+ 	install -m644 lib/lousy/*.* $(DESTDIR)$(PREFIX)/share/luakit/lib/lousy

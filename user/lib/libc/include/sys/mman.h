@@ -21,6 +21,15 @@ extern "C" {
 #define MAP_ANONYMOUS   0x20
 /* The older BSD spelling; still what a lot of code writes. */
 #define MAP_ANON      MAP_ANONYMOUS
+/* Historical BSD spelling for "this mapping is backed by a file" -- the
+ * default, so the flag carries no bits.  Kept because portable code still
+ * ORs it in (WTF's file mapping does). */
+#define MAP_FILE        0
+/* Advisory "do not reserve backing store" bit, carried for source
+ * compatibility: this kernel demand-pages every anonymous mapping and never
+ * reserves swap, so the behaviour asked for is the only behaviour there is.
+ * The kernel tests individual flag bits and ignores this one. */
+#define MAP_NORESERVE   0x4000
 
 // mmap error return
 #define MAP_FAILED      ((void*)-1)
@@ -35,6 +44,9 @@ extern "C" {
 #define MADV_DODUMP     17
 
 int madvise(void* addr, size_t len, int advice);
+/* One byte per page of the range into vec, bit 0 = resident.  Pages a
+ * demand-paged mapping has not faulted in yet report 0. */
+int mincore(void* addr, size_t length, unsigned char* vec);
 
 // Memory mapping
 void* mmap(void* addr, size_t length, int prot, int flags, int fd, long offset);

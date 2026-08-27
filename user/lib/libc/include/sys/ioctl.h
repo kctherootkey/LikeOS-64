@@ -17,6 +17,21 @@ extern "C" {
 #define TIOCSPGRP  0x5410
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
+
+/* The struct those two ioctls take.  Defined HERE as well as in <termios.h>
+ * (one guard shared between the two) because the conventional arrangement is
+ * that <sys/ioctl.h> alone suffices to call the window-size ioctls -- and
+ * programs rely on it: SQLite's shell includes nothing else for its
+ * screen-width probe. */
+#ifndef __likeos_winsize_defined
+#define __likeos_winsize_defined
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+#endif
 #define TIOCGPTN   0x80045430
 /* LikeOS-private: arm the shell's console prompt guard.  Deliberately
  * outside the conventional 0x54xx tty range — it previously sat on
@@ -83,6 +98,43 @@ extern "C" {
  * pointer and warns about the rest; in C++ there is no such conversion and
  * `ioctl(fd, TIOCSCTTY, fd)' simply does not compile. */
 int ioctl(int fd, unsigned long request, ...);
+
+/* The conventional ioctl request encoding: direction, size and type packed
+ * into the request number.  This system's own requests (TIOC*) predate these
+ * macros and keep their historical values; the macros exist for PORTED code
+ * that mints its own request numbers with _IO/_IOR/_IOW/_IOWR (Mesa's
+ * bundled sync-fence and DRM headers do, even in a build where no such
+ * device exists -- the headers must still parse).  The encoding matches the
+ * one every conventional Unix uses, so numbers computed here agree with the
+ * values ported code was compiled against elsewhere. */
+#define _IOC_NRBITS   8
+#define _IOC_TYPEBITS 8
+#define _IOC_SIZEBITS 14
+#define _IOC_DIRBITS  2
+
+#define _IOC_NRSHIFT   0
+#define _IOC_TYPESHIFT (_IOC_NRSHIFT + _IOC_NRBITS)
+#define _IOC_SIZESHIFT (_IOC_TYPESHIFT + _IOC_TYPEBITS)
+#define _IOC_DIRSHIFT  (_IOC_SIZESHIFT + _IOC_SIZEBITS)
+
+#define _IOC_NONE  0U
+#define _IOC_WRITE 1U
+#define _IOC_READ  2U
+
+#define _IOC(dir, type, nr, size)                                      \
+	(((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) |       \
+	 ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))
+
+#define _IO(type, nr)         _IOC(_IOC_NONE, (type), (nr), 0)
+#define _IOR(type, nr, argt)  _IOC(_IOC_READ, (type), (nr), sizeof(argt))
+#define _IOW(type, nr, argt)  _IOC(_IOC_WRITE, (type), (nr), sizeof(argt))
+#define _IOWR(type, nr, argt) \
+	_IOC(_IOC_READ | _IOC_WRITE, (type), (nr), sizeof(argt))
+
+#define _IOC_DIR(nr)  (((nr) >> _IOC_DIRSHIFT) & ((1 << _IOC_DIRBITS) - 1))
+#define _IOC_TYPE(nr) (((nr) >> _IOC_TYPESHIFT) & ((1 << _IOC_TYPEBITS) - 1))
+#define _IOC_NR(nr)   (((nr) >> _IOC_NRSHIFT) & ((1 << _IOC_NRBITS) - 1))
+#define _IOC_SIZE(nr) (((nr) >> _IOC_SIZESHIFT) & ((1 << _IOC_SIZEBITS) - 1))
 
 #ifdef __cplusplus
 }

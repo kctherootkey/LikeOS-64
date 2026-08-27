@@ -639,6 +639,9 @@ typedef struct __attribute__((packed)) {
 #define SOCK_STREAM 1 // TCP
 #define SOCK_DGRAM 2 // UDP
 #define SOCK_RAW 3 // Raw IP
+/* Connection-oriented, record-preserving; AF_UNIX only.  The value matches
+ * the userspace header (sys/socket.h). */
+#define SOCK_SEQPACKET 5
 
 #define AF_INET 2
 #define PF_INET AF_INET
@@ -652,6 +655,7 @@ typedef struct __attribute__((packed)) {
 #define SOL_UDP 17
 #define SO_REUSEADDR 2
 #define SO_TYPE 3
+#define SO_ACCEPTCONN 30 // read-only: reports the listening state
 #define SO_ERROR 4
 #define SO_BROADCAST 6
 #define SO_SNDBUF 7
@@ -767,7 +771,9 @@ struct in_pktinfo {
  * (sock_sendmsg / sock_recvmsg) don't need to pull in libc headers. */
 #define SCM_RIGHTS 0x01
 
-#define NET_MAX_SOCKETS 128
+/* 8x the old 128: with the UDP queue out of line a slot is a few hundred
+ * bytes, so the whole table costs less than ONE slot used to. */
+#define NET_MAX_SOCKETS 1024
 
 // Socket address structures
 typedef uint32_t socklen_t;
@@ -791,6 +797,19 @@ struct sockaddr_in {
 };
 
 // Kernel socket structure
+/* One received UDP/raw datagram -- see udp_rx_queue in net_socket. */
+typedef struct udp_rx_entry {
+	uint8_t data[NET_RX_BUF_SIZE];
+	uint16_t len;
+	struct sockaddr_in from;
+	uint32_t dst_ip; // Local destination IP (for IP_PKTINFO)
+	uint8_t ttl; // Received TTL  (for IP_RECVTTL)
+	uint8_t tos; // Received TOS  (for IP_RECVTOS)
+	uint32_t ifindex; // Interface index (for IP_PKTINFO)
+} udp_rx_entry_t;
+
+#define UDP_RX_QUEUE_ENTRIES 16
+
 typedef struct net_socket {
 	int type; // SOCK_STREAM, SOCK_DGRAM, SOCK_RAW
 	int protocol;
@@ -799,6 +818,13 @@ typedef struct net_socket {
 	int listening; // Is in listen state
 	int connected; // Is connected (TCP) or has default dest (UDP)
 	int closed; // Socket has been shut down
+	/* shutdown(2) direction flags.  These are OUR end's declarations, per
+	 * direction, and neither detaches the connection: a half-closed TCP
+	 * socket keeps receiving after SHUT_WR (FIN_WAIT_1/2 carry data), and
+	 * keeps sending after SHUT_RD.  See sock_shutdown() for why treating
+	 * shutdown() as close() broke every caller that half-closes. */
+	int tx_shutdown; // SHUT_WR applied: sends fail with EPIPE
+	int rx_shutdown; // SHUT_RD applied: reads drain the ring, then EOF
 	int nonblock; // O_NONBLOCK flag
 	int error; // Pending error
 
@@ -808,16 +834,17 @@ typedef struct net_socket {
 	// For TCP sockets
 	tcp_conn_t *tcp;
 
-	// For UDP sockets - simple receive queue
-	struct {
-		uint8_t data[NET_RX_BUF_SIZE];
-		uint16_t len;
-		struct sockaddr_in from;
-		uint32_t dst_ip; // Local destination IP (for IP_PKTINFO)
-		uint8_t ttl; // Received TTL  (for IP_RECVTTL)
-		uint8_t tos; // Received TOS  (for IP_RECVTOS)
-		uint32_t ifindex; // Interface index (for IP_PKTINFO)
-	} udp_rx_queue[16];
+	/* For UDP/raw sockets - receive queue, allocated at creation.
+	 *
+	 * This queue used to be INLINE: sixteen 4KB entries in EVERY socket,
+	 * 66KB per slot.  That is what pinned NET_MAX_SOCKETS at 128 -- and a
+	 * browser-grade burst (per-session connection pools across a dozen
+	 * threads) exhausted the table, so socket() failed with ENOMEM while
+	 * gigabytes of RAM sat free.  Only datagram sockets ever touch it, so
+	 * it is now allocated for SOCK_DGRAM/SOCK_RAW only and a TCP socket
+	 * costs a few hundred bytes.  NULL for TCP sockets; every consumer
+	 * checks under s->lock. */
+	udp_rx_entry_t *udp_rx_queue;
 	int udp_rx_head;
 	int udp_rx_tail;
 	volatile int udp_rx_ready;
@@ -1009,6 +1036,7 @@ int tcp_send_segment(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 void tcp_fill_info(tcp_conn_t *conn, struct tcp_info *info);
 struct tty; // forward declaration for dump output
 void tcp_dump_table(struct tty *tty);
+int tcp_local_port_in_use(uint16_t port);
 
 // ============================================================================
 // DHCP API
@@ -1396,6 +1424,13 @@ void loopback_process_pending(void);
 // ============================================================================
 #define UNIX_PATH_MAX 108
 
+/* Capacity of the in-band descriptor queue (SCM_RIGHTS in flight per socket).
+ * The table below holds MAX_UNIX_SOCKETS of these statically, so the size is
+ * a compromise: big enough that a burst of descriptor-carrying SEQPACKET
+ * messages does not bounce with EAGAIN, small enough not to double the
+ * table.  See the field's comment in unix_socket. */
+#define UNIX_PENDING_FDS 32
+
 struct sockaddr_un {
 	sa_family_t sun_family; // AF_UNIX
 	char sun_path[UNIX_PATH_MAX]; // Pathname
@@ -1416,7 +1451,7 @@ typedef struct unix_socket {
 	 * must never be handed out. */
 	uint64_t id;
 	int active;
-	int type; // SOCK_STREAM or SOCK_DGRAM
+	int type; // SOCK_STREAM, SOCK_DGRAM or SOCK_SEQPACKET
 	int bound;
 	/* A pathname bind also creates an S_IFSOCK node in the filesystem, and
 	 * this records that we own it so close() removes it again.  Abstract
@@ -1502,10 +1537,13 @@ typedef struct unix_socket {
 	// the receive ring at the time the fd was attached); recvmsg
 	// delivers the fd together with bytes up to (and not past) that
 	// boundary so stream-mode SCM_RIGHTS is correctly framed.
-	// Capacity is small because tmux sends at most one fd per imsg and
-	// drains promptly; over-flow returns -EAGAIN to caller.
-	void *pending_fds[16];
-	uint64_t pending_fd_off[16];
+	// Sized for the SEQPACKET users: WebKit's IPC attaches every shared
+	// buffer and file of a message as descriptors on ONE sendmsg, so a
+	// burst of messages can leave several dozen queued before the reader
+	// drains them.  tmux, the original user, sends at most one per imsg.
+	// Over-flow returns -EAGAIN to the caller.
+	void *pending_fds[UNIX_PENDING_FDS];
+	uint64_t pending_fd_off[UNIX_PENDING_FDS];
 	int pending_fd_head;
 	int pending_fd_tail;
 	uint64_t bytes_written; /* total bytes ever pushed into recv ring */
@@ -1604,10 +1642,16 @@ void unix_sock_put_ref(unix_socket_t *us);
  * queue; pop() removes the head entry.  Both return 0 on success or a
  * negative errno (EAGAIN if queue full / empty). */
 int unix_push_fd(unix_socket_t *sock, void *entry);
+void unix_fd_space_wake(unix_socket_t *sock);
 /* Queue an in-band descriptor for `us`'s PEER, finding and pinning that peer
  * inside the socket layer.  Callers must not resolve the peer themselves: a
  * peer pointer read once and used later can name a different socket. */
 int unix_send_fd(unix_socket_t *us, void *entry);
+/* One SEQPACKET record and its in-band descriptors in a single atomic
+ * insert -- see unix_send_record in unix_socket.c for why the two must
+ * never be queued separately. */
+int unix_send_record_msg(unix_socket_t *us, const void *buf, size_t len,
+			 void **fd_entries, int nfds);
 int unix_pop_fd(unix_socket_t *sock, void **out_entry);
 /* Peek the byte offset associated with the head of the pending-fd queue,
  * if any.  Returns 0 on success and stores the absolute byte offset (in

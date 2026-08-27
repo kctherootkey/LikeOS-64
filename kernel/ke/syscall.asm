@@ -235,10 +235,12 @@ syscall_entry:
     mov r14, [gs:PERCPU_SAVED_USER_R14]
     mov r15, [gs:PERCPU_SAVED_USER_R15]
 
-    ; Clear other registers for security (except RDI which has signal number)
+    ; Handler arguments: RDI is the signal number (loaded above); RSI and
+    ; RDX carry the siginfo pointer and (NULL) ucontext that signal_setup_frame
+    ; left in the saved-RSI/RDX slots.  Everything else is cleared.
+    mov rsi, [gs:PERCPU_SAVED_USER_RSI]
+    mov rdx, [gs:PERCPU_SAVED_USER_RDX]
     xor rax, rax
-    xor rsi, rsi
-    xor rdx, rdx
     xor r8, r8
     xor r9, r9
     xor r10, r10

@@ -1,0 +1,32 @@
+Include <sys/ucontext.h> only where the system provides it.
+
+The include sits in the header's catch-all arm, on the assumption that every
+Unix that is not OpenBSD or QNX carries the header.  This one does not: its
+kernel hands signal handlers no context argument at all (the third argument
+of an SA_SIGINFO handler is NULL), so the C library would have nothing
+truthful to put in such a header, and inventing types that describe no real
+kernel object would be worse than the missing file.
+
+Everything that DEREFERENCES a context in this header lives behind
+HAVE(MACHINE_CONTEXT), which is off for this platform: the build falls
+through to the portable PlatformRegisters -- a bare stack pointer -- and the
+thread suspension machinery in ThreadingPOSIX.cpp uses its approximate-stack-
+pointer path, which is exactly the arrangement the other no-machine-context
+ports run.  __has_include keeps the arm accurate anywhere rather than naming
+this system.
+
+Upstream: not reported yet (portability fix; candidate for upstreaming).
+
+--- a/Source/WTF/wtf/PlatformRegisters.h
++++ b/Source/WTF/wtf/PlatformRegisters.h
+@@ -39,8 +39,10 @@ typedef ucontext_t mcontext_t;
+ #elif OS(QNX)
+ #include <ucontext.h>
+-#else
++#elif __has_include(<sys/ucontext.h>)
+ #include <sys/ucontext.h>
++#else
++/* No context reaches a signal handler here; the portable arm below applies. */
+ #endif
+
+ namespace WTF {

@@ -1,0 +1,98 @@
+RAW2TIFF(1)                         LibTIFF                        RAW2TIFF(1)
+
+NAME
+       raw2tiff - create a TIFF file from a raw data file
+
+SYNOPSIS
+       raw2tiff [ options ] *input.raw output.tif
+
+DESCRIPTION
+       raw2tiff  converts a raw byte sequence into TIFF.  By default, the TIFF
+       image is created with data samples packed (PlanarConfiguration=1), com-
+       pressed with the PackBits algorithm (Compression=32773), and with  each
+       strip  no more than 8 kilobytes.  These characteristics can overridden,
+       or explicitly specified with the options described below.
+
+OPTIONS
+       -H number
+              Size of input image file header in bytes (0  by  default).  This
+              amount of data just will be skipped from the start of file while
+              reading.
+
+       -w number
+              Width of input image in pixels (can be guessed, see Guessing the
+              image geometry below).
+
+       option -b number
+
+              number of bands in input image (1 by default).
+
+       -d datatype
+              type  of  samples  in input image, where datatype may be one of:
+              box center; l|l.  T{ Data type T}   T{ Description T} _ T{  byte
+              T}   T{  8-bit  unsigned integer (default) T} _ T{ short T}   T{
+              16-bit unsigned integer T} _ T{ long T}   T{ 32-bit unsigned in-
+              teger T} _ T{ sbyte T}   T{ 8-bit signed integer T} _ T{  sshort
+              T}   T{  16-bit  signed  integer  T}  _  T{ slong T}   T{ 32-bit
+              signed integer T} _ T{ float T}   T{ 32-bit IEEE floating  point
+              T} _ T{ double T}   T{ 64-bit IEEE floating point T}
+
+       -i config
+              type  of sample interleaving in input image, where config may be
+              one of: box center; l|l.  T{ Configuration  T}   T{  Description
+              T}  _  T{ pixel T}   T{ pixel interleaved data (default) T} _ T{
+              band T}   T{ band interleaved data.  T}
+
+       -p photo
+              photometric interpretation (color space)  of  the  input  image,
+              where  photo  may  be  one  of: box center; l|l.  T{ Photometric
+              T}   T{ Description T} _ T{ miniswhite T}   T{ white color  rep-
+              resented  with  0  value  T} _ T{ minisblack T}   T{ black color
+              represented with 0 value (default) T} _ T{ rgb T}   T{ image has
+              RGB color model T} _ T{ cmyk T}   T{ image has CMYK  (separated)
+              color model T} _ T{ ycbcr T}   T{ image has YCbCr color model T}
+              _  T{ cielab T}   T{ image has CIE L*a*b color model T} _ T{ ic-
+              clab T}   T{ image has ICC L*a*b color  model  T}  _  T{  itulab
+              T}   T{ image has ITU L*a*b color model T}
+
+       -s     swap bytes fetched from the input file.
+
+       -L     input data has LSB2MSB bit order (default).
+
+       -M     input data has MSB2LSB bit order.
+
+       -c     Specify  a compression scheme to use when writing image data: -c
+              none for no compression, -c packbits for the  PackBits  compres-
+              sion algorithm (the default), -c jpeg for the baseline JPEG com-
+              pression  algorithm,  -c  zip  for the Deflate compression algo-
+              rithm, -c lzw for Lempel-Ziv & Welch.
+
+GUESSING THE IMAGE GEOMETRY
+       raw2tif can guess image width and height in case one or both  of  these
+       parameters  are not specified. If you omit one of those parameters, the
+       complementary one will be calculated based on  the  file  size  (taking
+       into  account  header size, number of bands and data type). If you omit
+       both parameters, the statistical approach will be  used.  Utility  will
+       compute  correlation  coefficient between two lines at the image center
+       using several appropriate line sizes and the highest absolute value  of
+       the  coefficient  will  indicate  the  right line size. That is why you
+       should be cautious with the very large images, because guessing process
+       may take a while (depending on your system performance). Of course, the
+       utility can't guess the header size, number of bands and data type,  so
+       it  should be specified manually. If you don't know anything about your
+       image, just try with the several combinations of those options.
+
+       There is no magic, it is just a mathematical statistics, so it  can  be
+       wrong  in some cases. But for most ordinary images guessing method will
+       work fine.
+
+SEE ALSO
+       pal2rgb (1), tiffinfo (1), tiffcp (1), tiffmedian (1), libtiff (3tiff)
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                      RAW2TIFF(1)

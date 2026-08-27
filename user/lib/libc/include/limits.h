@@ -84,6 +84,16 @@ extern "C" {
  * is the one to check before changing this one. */
 #define OPEN_MAX    1024
 #define ARG_MAX     131072
+
+/* POSIX minimum-value constants.  These are NOT this system's limits -- the
+ * real ones are above and larger -- they are the floor POSIX guarantees on
+ * every conforming system, and portable code sizes conservative buffers with
+ * them (LLVM sizes its command-line splitter by _POSIX_ARG_MAX). */
+#define _POSIX_ARG_MAX   4096
+#define _POSIX_PATH_MAX  256
+#define _POSIX_NAME_MAX  14
+#define _POSIX_OPEN_MAX  20
+#define _POSIX_PIPE_BUF  512
 #define NGROUPS_MAX 32
 /* The longest hostname gethostname() can return, not counting the NUL, and
  * the number of symbolic links path resolution will follow before giving up

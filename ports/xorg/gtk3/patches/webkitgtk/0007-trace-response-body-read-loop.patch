@@ -1,0 +1,62 @@
+Trace the response-body read loop under WEBKIT_SOUP_LOG.
+
+An https body stops after exactly 512 bytes on this system while the same page
+over http arrives whole (558 bytes).  The soup wire log from patch 0006 shows
+the request going out, a 200 with complete headers coming back, and then the
+body simply ending mid-token.  It does not show what the reader did next, and
+that is the missing piece: the body arrives through
+
+    read() -> g_input_stream_read_async -> readCallback -> didRead -> read()
+
+so "stopped at 512" is either a second read that never completes, one that
+completes with 0 (treated as end-of-body), or one that fails with an error.
+Those are three different bugs and the wire log cannot tell them apart.
+
+readCallback already has the GError in hand and turns it into didFail(), which
+surfaces as a load failure rather than as anything naming the cause; a read
+returning 0 goes to didFinishRead() and looks like a clean, if short, body.
+
+Off unless WEBKIT_SOUP_LOG is set, like 0006.
+
+Upstream: not reportable -- bring-up instrumentation.
+
+--- a/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
++++ b/Source/WebKit/NetworkProcess/soup/NetworkDataTaskSoup.cpp
+@@ -879,6 +879,19 @@
+ 
+     GUniqueOutPtr<GError> error;
+     gssize bytesRead = g_input_stream_read_finish(inputStream, result, &error.outPtr());
++    // Body-read tracing, on with WEBKIT_SOUP_LOG.  The response body arrives
++    // here in a loop -- read() -> readCallback -> didRead -> read() -- and on
++    // this system an https body stops after exactly 512 bytes while the same
++    // page over http arrives whole.  This says which step stops: whether the
++    // next read completes at all, what it returns, and whether it carries an
++    // error that is otherwise turned into a silent failure.
++    if (getenv("WEBKIT_SOUP_LOG")) {
++        if (error)
++            WTFLogAlways("[read] finish: ERROR %s (domain %s code %d)",
++                error->message, g_quark_to_string(error->domain), error->code);
++        else
++            WTFLogAlways("[read] finish: %zd bytes", (ssize_t)bytesRead);
++    }
+     if (error) {
+         if (task->m_soupMessage)
+             task->didFail(ResourceError::genericGError(task->m_currentRequest.url(), error.get()));
+@@ -896,6 +909,8 @@
+ {
+     RefPtr<NetworkDataTaskSoup> protectedThis(this);
+     ASSERT(m_inputStream);
++    if (getenv("WEBKIT_SOUP_LOG"))
++        WTFLogAlways("[read] issuing read_async(%zu)", (size_t)gDefaultReadBufferSize);
+     m_readBuffer.grow(gDefaultReadBufferSize);
+     g_input_stream_read_async(m_inputStream.get(), m_readBuffer.mutableSpan().data(), m_readBuffer.size(), RunLoopSourcePriority::AsyncIONetwork, m_cancellable.get(),
+         reinterpret_cast<GAsyncReadyCallback>(readCallback), protectedThis.leakRef());
+@@ -916,6 +931,8 @@
+ 
+ void NetworkDataTaskSoup::didFinishRead()
+ {
++    if (getenv("WEBKIT_SOUP_LOG"))
++        WTFLogAlways("[read] didFinishRead -- body complete");
+     ASSERT(m_inputStream);
+     g_input_stream_close(m_inputStream.get(), nullptr, nullptr);
+     m_inputStream = nullptr;

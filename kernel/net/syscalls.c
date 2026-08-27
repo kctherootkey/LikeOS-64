@@ -113,10 +113,22 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 	if (!us->connected)
 		return -ENOTCONN;
 
-	/* Process control data first so the fd arrives before (or with) the
-     * byte that the receiver associates it with.  The imsg framing tmux
-     * uses sends one fd per message and the receiver pops the next pending
-     * fd when it parses each imsg header. */
+	/* Collect the in-band descriptors FIRST, but do not queue them yet.
+     *
+     * For a stream socket they are pushed here, before the data, so the fd
+     * arrives before (or with) the byte the receiver associates it with --
+     * the imsg framing tmux uses sends one fd per message and the receiver
+     * pops the next pending fd when it parses each imsg header.
+     *
+     * For a SEQPACKET socket they are handed to unix_send_record_msg() and
+     * queued in the same critical section that writes the record.  Pushing
+     * them here first meant an EINTR from the full-ring wait (the caller
+     * retries the whole sendmsg) queued every descriptor twice, after which
+     * the peer's descriptor stream was permanently off by one -- WebKit's
+     * process pairs decoded the wrong attachment for every later message. */
+	void *seq_entries[UNIX_PENDING_FDS];
+	int seq_nent = 0;
+	int is_seqpacket = (us->type == SOCK_SEQPACKET);
 	if (kmsg->msg_control &&
 	    kmsg->msg_controllen >= sizeof(struct cmsghdr)) {
 		size_t clen = kmsg->msg_controllen;
@@ -189,15 +201,39 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 						if (!entry)
 							continue;
 					}
-					(void)unix_send_fd(us, entry);
+					if (is_seqpacket) {
+						if (seq_nent <
+						    UNIX_PENDING_FDS)
+							seq_entries[seq_nent++] =
+								entry;
+						else
+							fd_release_entry(
+								(vfs_file_t *)
+									entry);
+					} else {
+						(void)unix_send_fd(us, entry);
+					}
 				}
 			}
 			off += CMSG_ALIGN(cmsg->cmsg_len);
 		}
 	}
 
-	if (kmsg->msg_iovlen <= 0)
+	if (kmsg->msg_iovlen <= 0) {
+		/* A record with descriptors and no payload is still a record.
+		 * (A stream socket queued its fds above and sends nothing.) */
+		if (is_seqpacket && seq_nent) {
+			int r = unix_send_record_msg(ufd, NULL, 0, seq_entries,
+						     seq_nent);
+			if (r < 0) {
+				for (int i = 0; i < seq_nent; i++)
+					fd_release_entry(
+						(vfs_file_t *)seq_entries[i]);
+			}
+			return r;
+		}
 		return 0;
+	}
 	/* Cap the iov count so the on-stack copy of the array is bounded. */
 	int kiovcnt = kmsg->msg_iovlen;
 	if (kiovcnt > 256)
@@ -223,6 +259,69 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 	 * window manager and the terminal both bursting at once -- ended in
 	 * "[xcb] Unknown sequence number while processing queue".  Same bug
 	 * class as the ext4 xattr static scratch list. */
+	if (us->type == SOCK_SEQPACKET) {
+		/* One sendmsg is ONE record, however many iovecs carry it:
+		 * flattening here is what preserves the message boundary the
+		 * caller is relying on.  The descriptors above were queued
+		 * before any byte, so they carry this record's start offset. */
+		size_t rtotal = 0;
+		for (int i = 0; i < kiovcnt; i++)
+			rtotal += iov[i].iov_len;
+		if (rtotal > 65536 - 8)
+			return -EMSGSIZE;
+		int r;
+		if (kiovcnt == 1 || rtotal == 0) {
+			void *base = kiovcnt ? iov[0].iov_base : NULL;
+			if (rtotal &&
+			    !validate_user_ptr((uint64_t)base, rtotal)) {
+				r = -EFAULT;
+				goto seq_done;
+			}
+			r = unix_send_record_msg(ufd, base, rtotal,
+						 seq_entries, seq_nent);
+			goto seq_done;
+		}
+		{
+			uint8_t *flat = (uint8_t *)kalloc(rtotal);
+			if (!flat) {
+				r = -ENOMEM;
+				goto seq_done;
+			}
+			size_t o = 0;
+			for (int i = 0; i < kiovcnt; i++) {
+				size_t want = iov[i].iov_len;
+				if (!want)
+					continue;
+				if (!validate_user_ptr(
+					    (uint64_t)iov[i].iov_base, want)) {
+					kfree(flat);
+					r = -EFAULT;
+					goto seq_done;
+				}
+				copy_from_user(flat + o, iov[i].iov_base,
+					       want);
+				o += want;
+			}
+			/* The record layer bounces through kernel memory
+			 * itself; a kernel pointer just makes that trivial. */
+			r = unix_send_record_msg(ufd, flat, rtotal,
+						 seq_entries, seq_nent);
+			kfree(flat);
+		}
+seq_done:
+		/* On success the entries now belong to the peer's queue.  On
+		 * ANY failure nothing was queued (the insert is atomic), so
+		 * the references taken above must be dropped here -- the
+		 * caller will retry the whole sendmsg and re-collect them.
+		 * fd_release_entry knows a console marker from a real file. */
+		if (r < 0) {
+			for (int i = 0; i < seq_nent; i++)
+				fd_release_entry(
+					(vfs_file_t *)seq_entries[i]);
+		}
+		return r;
+	}
+
 	int64_t sent_total = 0;
 	for (int i = 0; i < kiovcnt; i++) {
 		size_t want = iov[i].iov_len;
@@ -269,6 +368,124 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 		total += iov[i].iov_len;
 	if (total == 0)
 		return 0;
+
+	if (us->type == SOCK_SEQPACKET) {
+		/* One recvmsg is ONE record.  Received into the iovecs -- via
+		 * a flattening buffer when there are several, because the
+		 * record must be consumed whole -- and accompanied by EVERY
+		 * descriptor the sender attached to it: their queued offsets
+		 * all equal the record's start position, captured here before
+		 * the receive advances it. */
+		uint64_t start_br = us->bytes_read;
+		int n;
+		if (riovcnt == 1) {
+			if (!validate_user_ptr((uint64_t)iov[0].iov_base,
+					       iov[0].iov_len))
+				return -EFAULT;
+			n = unix_recv(ufd, iov[0].iov_base, iov[0].iov_len,
+				      0);
+		} else {
+			/* A record cannot exceed the ring, so neither need
+			 * the flattening buffer, whatever the iovecs add up
+			 * to. */
+			if (total > 65536)
+				total = 65536;
+			uint8_t *flat = (uint8_t *)kalloc(total);
+			if (!flat)
+				return -ENOMEM;
+			n = unix_recv(ufd, flat, total, 0);
+			size_t o = 0;
+			for (int i = 0; i < riovcnt && (int)o < n; i++) {
+				size_t want = iov[i].iov_len;
+				if (!want)
+					continue;
+				if (o + want > (size_t)n)
+					want = (size_t)n - o;
+				if (!validate_user_ptr(
+					    (uint64_t)iov[i].iov_base, want)) {
+					kfree(flat);
+					return o ? (int)o : -EFAULT;
+				}
+				copy_to_user(iov[i].iov_base, flat + o, want);
+				o += want;
+			}
+			kfree(flat);
+		}
+		kmsg->msg_flags = 0;
+		if (n <= 0) {
+			kmsg->msg_controllen = 0;
+			return n;
+		}
+
+		/* Collect this record's descriptors into one SCM_RIGHTS
+		 * control message. */
+		int newfds[UNIX_PENDING_FDS];
+		int nfds = 0;
+		uint64_t fd_off;
+		task_t *cur = sched_current();
+		/* How many descriptors the caller's control buffer can even
+		 * report.  One past that is not installed-and-unreported (a
+		 * silent descriptor leak into the process); it is dropped and
+		 * released, and the truncation is declared. */
+		int space_fds = 0;
+		if (kmsg->msg_control) {
+			while (space_fds < UNIX_PENDING_FDS &&
+			       CMSG_SPACE(sizeof(int) *
+					  (size_t)(space_fds + 1)) <=
+				       kmsg->msg_controllen)
+				space_fds++;
+		}
+		while (unix_peek_fd_offset(us, &fd_off) == 0 &&
+		       fd_off <= start_br) {
+			void *entry = NULL;
+			if (unix_pop_fd(us, &entry) != 0 || !entry)
+				break;
+			int nf = -1;
+			if (nfds < space_fds && cur)
+				nf = fd_install_from(cur, entry, 0);
+			if (nf < 0) {
+				fd_release_entry((vfs_file_t *)entry);
+				kmsg->msg_flags |= MSG_CTRUNC;
+				continue;
+			}
+			newfds[nfds++] = nf;
+		}
+		/* Descriptor slots were just freed.  A sender can be parked on
+		 * exactly that: unix_send_record waits when the pending-fd
+		 * queue is full, and the wake it gets from the record read
+		 * fires BEFORE this loop pops the fds -- it re-checks, still
+		 * sees a full queue, and parks again.  Without a second wake
+		 * here it sleeps forever once the ring runs dry (no further
+		 * reads, because the sender is the one who would fill it):
+		 * observed as a page loading to ~80% and stopping, with every
+		 * later message on the connection queued behind the parked
+		 * send. */
+		if (nfds)
+			unix_fd_space_wake(us);
+		if (nfds && kmsg->msg_control &&
+		    kmsg->msg_controllen >=
+			    CMSG_SPACE(sizeof(int) * (size_t)nfds)) {
+			unsigned char cbuf[CMSG_SPACE(sizeof(int) *
+						      UNIX_PENDING_FDS)];
+			struct cmsghdr *c = (struct cmsghdr *)cbuf;
+			c->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)nfds);
+			c->cmsg_level = SOL_SOCKET;
+			c->cmsg_type = SCM_RIGHTS;
+			for (int i = 0; i < nfds; i++)
+				((int *)CMSG_DATA(c))[i] = newfds[i];
+			size_t clen = CMSG_SPACE(sizeof(int) * (size_t)nfds);
+			if (!validate_user_ptr((uint64_t)kmsg->msg_control,
+					       clen))
+				return -EFAULT;
+			copy_to_user(kmsg->msg_control, cbuf, clen);
+			kmsg->msg_controllen = clen;
+		} else {
+			if (nfds)
+				kmsg->msg_flags |= MSG_CTRUNC;
+			kmsg->msg_controllen = 0;
+		}
+		return n;
+	}
 
 	/* Stream-mode SCM_RIGHTS framing: if a pending fd is queued at byte
      * offset N (in the receiver's bytes_read coordinate system), clamp

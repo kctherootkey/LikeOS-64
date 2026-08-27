@@ -1,0 +1,111 @@
+Build dril, the legacy-DRI shim, without GBM.
+
+xorg-server 21.1's GLX (AIGLX) loads its software renderer by dlopen'ing
+<dridriverdir>/swrast_dri.so and calling __driDriverGetExtensions_swrast.
+Mesa 25 no longer exports that interface from libgallium; it lives in a
+separate compatibility library, dril ("DRI legacy"), which is installed under
+the old name and bridges to the new loader.  Without it the server has no
+GLX provider, no GLX visuals, and glxinfo answers "couldn't find RGB GLX
+visual or fbconfig" -- while client-side GL through libGL/libEGL (WebKit,
+eglgears) works fine, because that path never asks the server.
+
+Upstream only builds dril when GBM is on.  GBM exists to open DRM devices,
+which this system does not have (-Dgbm=disabled, no libdrm), and dril's use
+of it is confined to the hardware branch: init_dri2_configs() opens a GBM
+device for fd != -1 to ask EGL which formats the card supports.  The swrast
+provider always passes fd == -1 and, when that probe yields nothing, falls
+back to dril's own static config table -- the path this system takes.
+
+So: build dril whenever there is a Gallium X11/GLX stack, and when GBM is
+absent compile the hardware probe out.  The source is otherwise unchanged.
+
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -147,7 +147,10 @@
+ if with_egl
+   subdir('egl')
+ endif
+-if with_gallium and with_gbm
++# dril serves the X server's GLX, which is independent of GBM; the shim only
++# uses GBM to probe hardware formats and has a software fallback without it
++# (DRIL_NO_GBM, see targets/dril/meson.build).
++if with_gallium
+   if with_glx == 'dri' or with_platform_x11 or with_platform_xcb
+     subdir('gallium/targets/dril')
+   endif
+--- a/src/gallium/targets/dril/meson.build
++++ b/src/gallium/targets/dril/meson.build
+@@ -28,6 +28,10 @@
+ dril_link_depends = []
+ dril_drivers = []
+ 
++if not with_gbm
++  dril_c_args += ['-DDRIL_NO_GBM']
++endif
++
+ dri_sym = configure_file(input : 'dri.sym.in', output : 'dri.sym', configuration : sym_config)
+ 
+ if with_ld_version_script
+@@ -46,6 +50,7 @@
+     inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
+     inc_gallium_winsys,
+   ],
++  c_args : dril_c_args,
+   gnu_symbol_visibility : 'hidden',
+   link_args : [ld_args_build_id, ld_args_gc_sections, dril_ld_args],
+   link_depends : dril_link_depends,
+--- a/src/gallium/targets/dril/dril_target.c
++++ b/src/gallium/targets/dril/dril_target.c
+@@ -25,7 +25,9 @@
+ #include <dlfcn.h>
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
++#ifndef DRIL_NO_GBM
+ #include <gbm.h>
++#endif
+ #include "drm-uapi/drm_fourcc.h"
+ 
+ #define EGL_PLATFORM_GBM_MESA             0x31D7
+@@ -356,6 +358,13 @@
+    enum pipe_format last_pformat = 0;
+    unsigned last_start = 0;
+ 
++#ifdef DRIL_NO_GBM
++   /* No GBM: no way to open a device and ask EGL about it.  The software
++    * provider (fd == -1) has its own static config table behind this. */
++   if (fd != -1)
++      return NULL;
++#endif
++
+    /* dlopen/dlsym to avoid linkage */
+    egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!egl)
+@@ -369,6 +378,7 @@
+    EGLBoolean (*peglGetConfigAttrib)(EGLDisplay, EGLConfig, EGLint, EGLint *) = peglGetProcAddress("eglGetConfigAttrib");
+    const char *(*peglQueryString)(EGLDisplay, EGLint) = peglGetProcAddress("eglQueryString");
+ 
++#ifndef DRIL_NO_GBM
+    struct gbm_device *gbm = NULL;
+    if (fd != -1) {
+       /* try opening GBM for hardware driver info */
+@@ -378,6 +388,9 @@
+    }
+ 
+    EGLDisplay dpy = peglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_MESA, gbm ? gbm : EGL_DEFAULT_DISPLAY, NULL);
++#else
++   EGLDisplay dpy = peglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_MESA, EGL_DEFAULT_DISPLAY, NULL);
++#endif
+    if (!dpy)
+       goto out_gbm;
+    int maj, min;
+@@ -444,8 +457,10 @@
+    peglTerminate(dpy);
+ 
+ out_gbm:
++#ifndef DRIL_NO_GBM
+    if (gbm)
+       gbm_device_destroy(gbm);
++#endif
+ out:
+    dlclose(egl);
+    if (c)

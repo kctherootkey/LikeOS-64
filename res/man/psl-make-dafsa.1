@@ -1,0 +1,44 @@
+PSL(1)                           User Commands                          PSL(1)
+
+NAME
+       psl-make-dafsa  -  generate a compact and optimized DAFSA from a Public
+       Suffix List
+
+SYNOPSIS
+       psl-make-dafsa [options] infile outfile
+
+DESCRIPTION
+       psl-make-dafsa produces C/C++ code or an  architecture-independent  bi-
+       nary  object  that  represents a Deterministic Acyclic Finite State Au-
+       tomaton (DAFSA) from a textual representation of a Public Suffix  List.
+       Input and output files must be specified on the command line.
+
+       This compact representation enables optimized queries of the list, sav-
+       ing  both  time  and  space when compared to searches of human-readable
+       representations.
+
+OPTIONS
+       The format of the data read and written by  psl-make-dafsa  depends  on
+       options passed to it.
+
+       --output-format=[cxx|cxx+|binary]
+              cxx: (default) output is C/C++ code
+              cxx+: output is C/C++ code plus statistical assignments (used by
+              libpsl build process)
+              binary: output is an architecture-independent binary format
+
+       --encoding=[utf-8|ascii]
+              utf-8: (default) UTF-8 mode (output contains UTF-8 + punycode)
+              ascii:  (deprecated)  7-bit ASCII mode (output contains punycode
+              only)
+
+SEE ALSO
+       https://publicsuffix.org/, https://github.com/rockdaboot/libpsl
+
+COPYRIGHT
+       psl-make-dafsa was was  written  by  Olle  Liljenzin  as  part  of  the
+       Chromium  project  and has been modified by Tim Ruehsen and Daniel Kahn
+       Gillmor.  The code and its documentation is governed by a BSD-style li-
+       cense.
+
+psl 0.13.0                         July 2016                            PSL(1)

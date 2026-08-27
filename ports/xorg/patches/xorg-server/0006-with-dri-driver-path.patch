@@ -1,0 +1,29 @@
+Let configure be told the DRI driver path instead of asking pkg-config.
+
+configure derives DRI_DRIVER_PATH -- where AIGLX dlopen()s swrast_dri.so at
+run time -- from `pkg-config --variable=dridriverdir dri`.  Under a sysroot
+build that answer comes back prefixed with PKG_CONFIG_SYSROOT_DIR, which is
+right for compiler flags and wrong for a path the TARGET will use: the server
+shipped looking for /home/.../build/xorg-sysroot/usr/lib/dri/swrast_dri.so,
+logged "AIGLX error: dlopen of ... failed" and started with no GL provider.
+
+Same problem the port already meets with sdkdir in the drivers, same answer:
+an explicit option.  --with-dri-driver-path=DIR takes precedence; without it
+behaviour is unchanged.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -1453,7 +1453,12 @@
+ AC_DEFINE_DIR(COMPILEDDEFAULTFONTPATH, FONTPATH, [Default font path])
+ AC_DEFINE_DIR(SERVER_MISC_CONFIG_PATH, SERVERCONFIG, [Server miscellaneous config path])
+ AC_DEFINE_DIR(BASE_FONT_PATH, FONTROOTDIR, [Default base font path])
+-dridriverdir=`$PKG_CONFIG --variable=dridriverdir dri`
++AC_ARG_WITH(dri-driver-path,
++	AS_HELP_STRING([--with-dri-driver-path=DIR], [Directory the server loads DRI drivers from at run time (default: from dri.pc)]),
++	[dridriverdir="$withval"], [dridriverdir=""])
++if test "x$dridriverdir" = x; then
++	dridriverdir=`$PKG_CONFIG --variable=dridriverdir dri`
++fi
+ AC_DEFINE_DIR(DRI_DRIVER_PATH, dridriverdir, [Default DRI driver path])
+ AC_DEFINE_UNQUOTED(XVENDORNAME, ["$VENDOR_NAME"], [Vendor name])
+ AC_DEFINE_UNQUOTED(XVENDORNAMESHORT, ["$VENDOR_NAME_SHORT"], [Short vendor name])

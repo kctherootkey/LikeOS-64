@@ -1,0 +1,52 @@
+THUMBNAIL(1)                        LibTIFF                       THUMBNAIL(1)
+
+NAME
+       thumbnail - create a TIFF file with thumbnail images
+
+SYNOPSIS
+       thumbnail [ options ] input.tif output.tif
+
+DESCRIPTION
+       thumbnail is a program written to show how one might use the SubIFD tag
+       (#330) to store thumbnail images.  thumbnail copies a TIFF Class F fac-
+       simile  file  to  the output file and for each image an 8-bit greyscale
+       "thumbnail sketch" is created.  The output file contains the  thumbnail
+       image  with  the  associated full-resolution page linked below with the
+       SubIFD tag.
+
+       By default, thumbnail images are 216 pixels wide by  274  pixels  high.
+       Pixels  are  calculated  by sampling and filtering the input image with
+       each pixel value passed through a contrast curve.
+
+OPTIONS
+       -w width
+              Specify the width of thumbnail images in pixels.
+
+       -h height
+              Specify the height of thumbnail images in pixels.
+
+       -c contrast
+              Specify a contrast curve to apply in  generating  the  thumbnail
+              images.   By  default  pixels values are passed through a linear
+              contrast curve that simply maps the pixel value ranges.   Alter-
+              native  curves  are: box center; l|l.  T{ Curve T}   T{ Descrip-
+              tion T} _ T{ exp50 T}   T{ 50% exponential curve T} _  T{  exp60
+              T}   T{ 60% exponential curve T} _ T{ exp70 T}   T{ 70% exponen-
+              tial  curve  T} _ T{ exp80 T}   T{ 80% exponential curve T} _ T{
+              exp90 T}   T{ 90% exponential curve T} _ T{ exp T}   T{ pure ex-
+              ponential curve T} _ T{ linear T}   T{ linear curve T}
+
+BUGS
+       There are no options to control the format of the saved  thumbnail  im-
+       ages.
+
+SEE ALSO
+       tiffdump (1), tiffgt (1), tiffinfo (1), libtiff (3tiff),
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                     THUMBNAIL(1)

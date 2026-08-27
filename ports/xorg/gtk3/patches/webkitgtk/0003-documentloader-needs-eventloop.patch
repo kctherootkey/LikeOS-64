@@ -1,0 +1,39 @@
+DocumentLoader.cpp needs EventLoop.h for the type it calls through.
+
+removePlugInStreamLoader() reaches an event loop task group:
+
+    m_frame->protectedDocument()->eventLoop().queueTask(TaskSource::Networking, ...)
+
+`Document::eventLoop()` returns an `EventLoopTaskGroup&`, and calling
+queueTask() on it needs the COMPLETE type -- but the file includes no header
+that defines one.  ScriptExecutionContext.h, which it does get, carries only
+the forward declaration, so the build stops with
+
+    DocumentLoader.cpp:2062:48: error: invalid use of incomplete type
+        'class WebCore::EventLoopTaskGroup'
+
+Upstream never sees this because the unified build hides it: WebCore compiles
+eight .cpp files per translation unit, and in upstream's default configuration
+DocumentLoader.cpp shares its bundle with a file that pulls in EventLoop.h.
+Which files land in which bundle depends on the feature flags -- this port
+turns off video, web audio, media stream/recorder, WebRTC, encrypted media,
+WebGL, WebXR, gamepad and more, so the source list is shorter, the grouping
+shifts, and DocumentLoader.cpp comes to sit with neighbours that do not.  The
+missing include was always missing; only the neighbour was hiding it.
+
+So the fix is the include the file should have had, in its alphabetical place,
+and nothing else -- it is correct in any configuration and does not depend on
+which bundle the file lands in.  Same shape as the guard in 0002.
+
+Upstream: not reported yet (latent missing include; candidate for upstreaming).
+
+--- a/Source/WebCore/loader/DocumentLoader.cpp
++++ b/Source/WebCore/loader/DocumentLoader.cpp
+@@ -53,6 +53,7 @@
+ #include "DocumentWriter.h"
+ #include "ElementChildIteratorInlines.h"
+ #include "Event.h"
++#include "EventLoop.h"
+ #include "EventNames.h"
+ #include "ExtensionStyleSheets.h"
+ #include "FormSubmission.h"

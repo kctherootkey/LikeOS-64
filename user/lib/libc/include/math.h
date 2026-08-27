@@ -79,6 +79,12 @@
 extern "C" {
 #endif
 
+/* Evaluation-width types (C99 7.12p2).  FLT_EVAL_METHOD is 0 on x86-64 --
+ * arithmetic happens in SSE registers at the type's own width -- so these
+ * are simply the plain types. */
+typedef float  float_t;
+typedef double double_t;
+
 double fabs(double x);
 double fmod(double x, double y);
 double round(double x);
@@ -149,6 +155,7 @@ float  scalbnf(float x, int e);
 double scalbln(double x, long e);
 float  scalblnf(float x, long e);
 double modf(double x, double *iptr);
+float modff(float x, float *iptr);
 float sqrtf(float x);
 float expf(float x);
 float logf(float x);
@@ -222,6 +229,69 @@ long double frexpl(long double x, int *e);
 long double ldexpl(long double x, int e);
 long double scalbnl(long double x, int e);
 long double scalblnl(long double x, long e);
+
+/* The rest of the C99 <math.h> surface (7.12.6-7.12.14).
+ *
+ * Added for the C++ runtime: libstdc++'s configure probes one program that
+ * names every C99 math function in all three widths, and a single missing
+ * declaration fails the whole probe -- <cmath> then ships without the std::
+ * wrappers (no std::round, no std::lround ...), which is where ICU's build
+ * first tripped over it.  The float and long double variants follow the
+ * file's existing convention: they compute in double, which is the precision
+ * the primitives deliver anyway. */
+double erf(double x);
+double erfc(double x);
+double tgamma(double x);
+double lgamma(double x);
+double fma(double x, double y, double z);
+double logb(double x);
+int    ilogb(double x);
+double nextafter(double x, double y);
+double nexttoward(double x, long double y);
+double remainder(double x, double y);
+double remquo(double x, double y, int *quo);
+
+float erff(float x);
+float erfcf(float x);
+float tgammaf(float x);
+float lgammaf(float x);
+float fmaf(float x, float y, float z);
+float logbf(float x);
+int   ilogbf(float x);
+float nextafterf(float x, float y);
+float nexttowardf(float x, long double y);
+float remainderf(float x, float y);
+float remquof(float x, float y, int *quo);
+float exp2f(float x);
+float expm1f(float x);
+float log1pf(float x);
+float fdimf(float a, float b);
+float rintf(float x);
+float nearbyintf(float x);
+long        lrintf(float x);
+long long   llrintf(float x);
+
+long double erfl(long double x);
+long double erfcl(long double x);
+long double tgammal(long double x);
+long double lgammal(long double x);
+long double fmal(long double x, long double y, long double z);
+long double logbl(long double x);
+int         ilogbl(long double x);
+long double nextafterl(long double x, long double y);
+long double nexttowardl(long double x, long double y);
+long double remainderl(long double x, long double y);
+long double remquol(long double x, long double y, int *quo);
+long double exp2l(long double x);
+long double expm1l(long double x);
+long double log1pl(long double x);
+long double fdiml(long double a, long double b);
+long double rintl(long double x);
+long double nearbyintl(long double x);
+long        lrintl(long double x);
+long long   llrintl(long double x);
+long double fminl(long double a, long double b);
+long double fmaxl(long double a, long double b);
 
 /* The block closes HERE, at the end of the file.
  *

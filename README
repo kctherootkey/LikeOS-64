@@ -256,7 +256,6 @@ X Window System (ports/xorg, 79 packages):
   its devices are open, so no user needs the video or input groups.
 - ctwm: window manager, with a desktop bar and keyboard-driven root menus.
 - xterm: terminal emulator (UTF-8, 256 colour).
-- NetSurf: web browser, with its own layout and rendering engine.
 - XNEdit: Motif text editor.
 - xcalc, xclock, xload, xsetroot, xrandr, xset, xauth: the usual X clients.
 - Toolkits and libraries: libX11, libXt, libXaw, libXft, Motif, freetype,
@@ -482,7 +481,7 @@ Completed:
 - POSIX threads, shared memory, poll/select/epoll.
 - Per-task FPU state across context switches.
 - UTF-8 and Unicode throughout the console, the C library and X.
-- X.Org server on the framebuffer, with ctwm, xterm, NetSurf and XNEdit.
+- X.Org server on the framebuffer, with ctwm, xterm and XNEdit.
 - GTK3, and a desktop on it: PCManFM, Claws Mail and Mousepad.
 - Stack canaries and crashlog/assertion (BUG_ON/WARN_ON) infrastructure.
 - Framebuffer console optimizations and a VMware SVGA II driver.

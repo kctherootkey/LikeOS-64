@@ -1,0 +1,245 @@
+Port Mesa to LikeOS: a POSIX system with no KMS/DRM anywhere.
+
+Six changes, one theme -- the "software rasterizer only, no DRM, X11 via
+the drisw winsys" configuration had never been link-tested as a whole:
+
+ - util/detect_os.h, util/os_misc.c: DETECT_OS_LIKEOS, declared POSIX; the
+   os_misc include ladder accepts it (the sysconf paths do the real work).
+ - include/drm-uapi/drm.h: a platform branch that takes the ioctl request
+   macros from <sys/ioctl.h>; the header must parse even where no DRM
+   device can ever exist, because it defines types shared with code that
+   also runs where one does.
+ - gallium/frontends/dri/dri2_stubs.c (new) + meson.build: dri2.c is only
+   compiled with a DRM display system, but libEGL and libGL reference its
+   PUBLIC entry points unconditionally.  The stubs answer "unsupported" in
+   each interface's own vocabulary -- the same pattern kopper_stubs.c
+   already uses for a build without the vulkan swrast.
+ - meson.build: link xxf86vm for GLX on dri platform 'none' too, not only
+   'drm' -- glxcmds.c compiles the same VidMode calls on both.
+ - glx/glx_pbuffer.c: the dri3 buffer-age query behind HAVE_DRI3; without
+   DRI3 a GLX_DRIVER_DRI3 display cannot exist, so the branch is dead
+   there anyway -- but it must not be a link error.
+
+--- a/src/util/detect_os.h
++++ b/src/util/detect_os.h
+@@ -91,6 +91,14 @@
+ #define DETECT_OS_POSIX 1
+ #endif
+ 
++#if defined(__LIKEOS__)
++/* LikeOS: a POSIX system without KMS/DRM.  Every driver here is software
++ * (llvmpipe/softpipe over the drisw winsys), so the generic POSIX paths are
++ * exactly right and nothing OS-specific is wanted. */
++#define DETECT_OS_LIKEOS 1
++#define DETECT_OS_POSIX 1
++#endif
++
+ 
+ /*
+  * Make sure DETECT_OS_* are always defined, so that they can be used with #if
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -58,7 +58,7 @@
+ #  include <unistd.h>
+ #  include <log/log.h>
+ #  include <cutils/properties.h>
+-#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
++#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM || DETECT_OS_LIKEOS
+ #  include <unistd.h>
+ #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
+ #  include <sys/resource.h>
+--- a/include/drm-uapi/drm.h
++++ b/include/drm-uapi/drm.h
+@@ -41,6 +41,26 @@
+ #include <asm/ioctl.h>
+ typedef unsigned int drm_handle_t;
+ 
++#elif defined(__LIKEOS__)
++
++/* LikeOS has no DRM device at all -- this header is included for its type
++ * and request-number definitions by code that also runs where DRM exists.
++ * The request macros come from <sys/ioctl.h>, which carries the
++ * conventional _IO/_IOR/_IOW/_IOWR encoding. */
++#include <stdint.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++typedef int8_t   __s8;
++typedef uint8_t  __u8;
++typedef int16_t  __s16;
++typedef uint16_t __u16;
++typedef int32_t  __s32;
++typedef uint32_t __u32;
++typedef int64_t  __s64;
++typedef uint64_t __u64;
++typedef size_t   __kernel_size_t;
++typedef unsigned long drm_handle_t;
++
+ #else /* One of the BSDs */
+ 
+ #include <stdint.h>
+--- a/meson.build
++++ b/meson.build
+@@ -2112,7 +2112,11 @@
+     dep_glproto = dependency('glproto', version : dep_glproto_version)
+   endif
+   if with_glx == 'dri'
+-    if with_dri_platform == 'drm'
++    # glxcmds.c uses the VidMode extension wherever GLX is direct, not only
++    # on the drm platform: the 'none' platform (a POSIX system without
++    # KMS/DRM, running everything on the software winsys) compiles the same
++    # calls and must link the same library.
++    if with_dri_platform == 'drm' or with_dri_platform == 'none'
+       if with_glx_direct
+         dep_xxf86vm = dependency('xxf86vm')
+       endif
+--- a/src/gallium/frontends/dri/meson.build
++++ b/src/gallium/frontends/dri/meson.build
+@@ -34,6 +34,8 @@
+ 
+ if with_dri2
+   files_libdri += files('dri2.c')
++else
++  files_libdri += files('dri2_stubs.c')
+ endif
+ 
+ libdri_c_args = []
+--- a/src/glx/glx_pbuffer.c
++++ b/src/glx/glx_pbuffer.c
+@@ -286,9 +286,12 @@
+ 
+       psc = pdraw->psc;
+ 
++#ifdef HAVE_DRI3
+       if (psc->display->driver == GLX_DRIVER_DRI3)
+          *value = dri3_get_buffer_age(pdraw);
+-      else if (psc->display->driver == GLX_DRIVER_ZINK_YES)
++      else
++#endif
++      if (psc->display->driver == GLX_DRIVER_ZINK_YES)
+          *value = kopper_get_buffer_age(pdraw);
+ 
+       return 1;
+--- /dev/null
++++ b/src/gallium/frontends/dri/dri2_stubs.c
+@@ -0,0 +1,121 @@
++/*  SPDX-License-Identifier: MIT */
++
++/* Stubs for the dri2 entry points on builds without dri2.
++ *
++ * dri2.c is only compiled where a DRM display system exists, but libEGL and
++ * libGL reference its PUBLIC entry points unconditionally -- damage
++ * regions, DMA-BUF image creation, GL interop, the shader blob cache.  A
++ * software-only system (gallium drivers llvmpipe/softpipe over drisw, no
++ * KMS/DRM anywhere) therefore could not link them.  Exactly the situation
++ * kopper_stubs.c already solves for a build without the vulkan swrast:
++ * every entry answers "not supported" in its interface's own vocabulary,
++ * and the callers all have the corresponding failure path because real
++ * drivers may refuse these requests too.
++ */
++
++#include "dri_screen.h"
++#include "dri_drawable.h"
++#include "dri_util.h"
++#include "GL/mesa_glinterop.h"
++
++struct pipe_screen *
++dri2_init_screen(struct dri_screen *screen, bool driver_name_is_inferred)
++{
++   return NULL;
++}
++
++struct pipe_screen *
++dri_swrast_kms_init_screen(struct dri_screen *screen,
++                           bool driver_name_is_inferred)
++{
++   return NULL;
++}
++
++void
++dri2_init_drawable(struct dri_drawable *drawable, bool isPixmap,
++                   int alphaBits)
++{
++}
++
++/* Declared locally by its caller (drisw.c does the same); no header
++ * carries it. */
++extern bool
++dri_image_drawable_get_buffers(struct dri_drawable *drawable,
++                               struct __DRIimageList *images,
++                               const enum st_attachment_type *statts,
++                               unsigned statts_count);
++
++bool
++dri_image_drawable_get_buffers(struct dri_drawable *drawable,
++                               struct __DRIimageList *images,
++                               const enum st_attachment_type *statts,
++                               unsigned statts_count)
++{
++   return false;
++}
++
++struct dri_image *
++dri_create_image(struct dri_screen *screen,
++                 int width, int height, int format,
++                 const uint64_t *modifiers, const unsigned _count,
++                 unsigned int use, void *loaderPrivate)
++{
++   return NULL;
++}
++
++void
++dri_invalidate_drawable(struct dri_drawable *drawable)
++{
++}
++
++void
++dri_set_damage_region(struct dri_drawable *drawable, unsigned int nrects,
++                      int *rects)
++{
++}
++
++void
++dri_set_blob_cache_funcs(struct dri_screen *screen, __DRIblobCacheSet set,
++                         __DRIblobCacheGet get)
++{
++}
++
++int
++dri_interop_query_device_info(struct dri_context *ctx,
++                              struct mesa_glinterop_device_info *out)
++{
++   return MESA_GLINTEROP_UNSUPPORTED;
++}
++
++int
++dri_interop_export_object(struct dri_context *ctx,
++                          struct mesa_glinterop_export_in *in,
++                          struct mesa_glinterop_export_out *out)
++{
++   return MESA_GLINTEROP_UNSUPPORTED;
++}
++
++int
++dri_interop_flush_objects(struct dri_context *_ctx, unsigned count,
++                          struct mesa_glinterop_export_in *objects,
++                          struct mesa_glinterop_flush_out *out)
++{
++   return MESA_GLINTEROP_UNSUPPORTED;
++}
++
++bool
++dri2_query_compression_rates(struct dri_screen *_screen,
++                             const struct dri_config *config, int max,
++                             enum __DRIFixedRateCompression *rates,
++                             int *count)
++{
++   if (count)
++      *count = 0;
++   return false;
++}
++
++int
++dri_query_compatible_render_only_device_fd(int kms_only_fd)
++{
++   return -1;
++}

@@ -21,13 +21,20 @@ small_font_gtk2=DejaVu Sans 9
 normal_font_gtk2=DejaVu Sans 10
 bold_font_gtk2=DejaVu Sans Bold 10
 
+# Show the HTML part of multipart/alternative mail by default.  Upstream
+# prefers the text/plain part and leaves the HTML one as a click-to-view
+# alternative; with the fancy viewer loaded below there is no reason to make
+# the reader click through on every message.  Per-folder settings can still
+# override this (folder properties -> "HTML messages").
+promote_html_part=1
+
 # The programs Claws hands things off to.
 #
 # Upstream's defaults are firefox, gedit and xdg-open -- reasonable on the
 # distributions Claws is packaged for, none of which exist here.  Left alone,
 # clicking a link in a message spawns a browser that is not installed and the
 # link simply never opens, with the failure reported nowhere the user is
-# looking.  NetSurf is the browser this image ships, and there is no
+# looking.  luakit is the browser this image ships, and there is no
 # desktop-file database for an xdg-open to consult, so an attachment is better
 # handed to the browser -- which reads HTML, text and images -- than to nothing
 # at all.
@@ -38,6 +45,15 @@ bold_font_gtk2=DejaVu Sans Bold 10
 #
 # The quoting matters: Claws substitutes the path or URI into the one %s, and
 # the single quotes keep a URI containing shell metacharacters as one word.
-uri_open_command=netsurf '%s'
-mime_open_command=netsurf '%s'
+uri_open_command=luakit '%s'
+mime_open_command=luakit '%s'
 ext_editor_command=xterm -e nano %s
+
+# Plugins loaded at startup.  The block label is what src/common/plugin.c
+# looks for (PLUGINS_BLOCK_PREFIX + the plugin type, which is "GTK3" for a
+# claws-mail 4 build); a bare filename resolves against the standard plugin
+# directory, /usr/lib/claws-mail/plugins.  fancy is the WebKit HTML viewer --
+# loaded from the first run so HTML mail renders instead of showing as a
+# wall of markup.
+[Plugins_GTK3]
+fancy.so

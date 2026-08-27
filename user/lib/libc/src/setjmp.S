@@ -64,6 +64,31 @@ longjmp:
     .size   longjmp, .-longjmp
 
 /* ------------------------------------------------------------------ */
+/* _setjmp / _longjmp                                                   */
+/*                                                                      */
+/* These are the variants POSIX defines as explicitly NOT saving or     */
+/* restoring the signal mask.  setjmp() above already does not touch    */
+/* it -- see the sigjmp_buf note at the top of this file -- so on this  */
+/* platform the two pairs have identical semantics, and these are       */
+/* aliases rather than copies.  That is not a shortcut: _setjmp's       */
+/* contract is "no signal mask", and this is the implementation that    */
+/* honours it.  If setjmp ever learns to save the mask, these must      */
+/* become separate implementations that still do not.                   */
+/*                                                                      */
+/* They are missing often enough to matter: Lua 5.1 selects them for    */
+/* any POSIX build (LUA_USE_POSIX implies LUA_USE_ULONGJMP), and        */
+/* without them liblua.a links nowhere -- "undefined reference to       */
+/* `_longjmp'" out of every luaD_throw.                                 */
+/* ------------------------------------------------------------------ */
+    .globl  _setjmp
+    .type   _setjmp, @function
+    .set    _setjmp, setjmp
+
+    .globl  _longjmp
+    .type   _longjmp, @function
+    .set    _longjmp, longjmp
+
+/* ------------------------------------------------------------------ */
 /* sigsetjmp(sigjmp_buf env, int savemask)                              */
 /* savemask is accepted but signal mask is NOT saved (not supported).   */
 /* ------------------------------------------------------------------ */

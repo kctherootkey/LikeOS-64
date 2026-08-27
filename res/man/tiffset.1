@@ -1,0 +1,61 @@
+TIFFSET(1)                          LibTIFF                         TIFFSET(1)
+
+NAME
+       tiffset - set or unset a field in a TIFF header
+
+SYNOPSIS
+       tiffset [ options ] filename.tif
+
+DESCRIPTION
+       tiffset sets the value of a TIFF header to a specified value or removes
+       an existing setting.
+
+OPTIONS
+       -d dirnumber
+              Change the current directory (starting at 0).
+
+       -s tagnumber [ count ] value
+              Set the value of the named tag to the value or values specified.
+
+       -sd diroffset
+              Change the current directory by offset.
+
+       -sf tagnumber filename
+              Set  the value of the tag to the contents of filename.  This op-
+              tion is supported for ASCII tags only.
+
+       -u tagnumber
+              Unset the tag.
+
+EXAMPLES
+       The following example sets the image description tag (270) of a.tif  to
+       the contents of the file descrip:
+
+          tiffset -sf 270 descrip a.tif
+
+       The  following example sets the artist tag (315) of a.tif to the string
+       Anonymous:
+
+          tiffset -s 315 Anonymous a.tif
+
+       This example sets the resolution of the file a.tif to 300 dpi:
+
+          tiffset -s 296 2 a.tif
+          tiffset -s 282 300.0 a.tif
+          tiffset -s 283 300.0 a.tif
+
+       Set the photometric interpretation  of  the  third  page  of  a.tif  to
+       min-is-black (ie. inverts it):
+
+          tiffset -d 2 -s 262 1 a.tif
+
+SEE ALSO
+       tiffdump (1), tiffinfo (1), tiffcp (1), libtiff (3tiff)
+
+AUTHOR
+       LibTIFF contributors
+
+COPYRIGHT
+       1988-2025, LibTIFF contributors
+
+4.7                              Jun 27, 2026                       TIFFSET(1)

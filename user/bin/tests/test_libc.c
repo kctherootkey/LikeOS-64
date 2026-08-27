@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <sysexits.h>
 #include <sys/ipc.h>
 #include <assert.h>
 #include <limits.h>
@@ -9056,6 +9057,905 @@ static void test_resolver(void)
 			       " cases above are what was checked\n", h_errno);
 		}
 	}
+}
+
+
+
+// ========================================
+// mincore: page residency reporting
+// ========================================
+static void test_mincore(void)
+{
+	printf("\n[mincore]\n");
+
+	size_t pg = 4096;
+	/* Twelve pages of demand-paged anonymous memory: mapped but untouched
+	 * pages have no frame yet, so mincore must say so -- and must change
+	 * its answer when a page is touched. */
+	unsigned char *m = mmap(NULL, 12 * pg, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m == MAP_FAILED) {
+		test_fail("mincore mmap");
+		return;
+	}
+	unsigned char vec[12];
+	memset(vec, 0xAA, sizeof(vec));
+	int rc = mincore(m, 12 * pg, vec);
+	test_result("mincore on fresh mapping succeeds", rc == 0);
+	int untouched_resident = 0;
+	for (int i = 0; i < 12; i++)
+		untouched_resident += (vec[i] & 1);
+	test_result("untouched demand-paged pages not resident",
+		    untouched_resident == 0);
+
+	/* Touch three specific pages and ask again. */
+	m[0 * pg] = 1;
+	m[5 * pg] = 1;
+	m[11 * pg] = 1;
+	rc = mincore(m, 12 * pg, vec);
+	test_result("mincore after touching succeeds", rc == 0);
+	test_result("touched pages resident",
+		    (vec[0] & 1) && (vec[5] & 1) && (vec[11] & 1));
+	int now_resident = 0;
+	for (int i = 0; i < 12; i++)
+		now_resident += (vec[i] & 1);
+	test_result("only the touched pages became resident",
+		    now_resident == 3);
+
+	/* Misaligned start is EINVAL; length 0 is a successful no-op. */
+	errno = 0;
+	test_result("mincore rejects misaligned address",
+		    mincore(m + 1, pg, vec) < 0 && errno == EINVAL);
+	test_result("mincore length 0 is a no-op", mincore(m, 0, vec) == 0);
+
+	munmap(m, 12 * pg);
+}
+
+// ========================================
+// C99 math additions (the libstdc++ probe set)
+// ========================================
+/* The functions added for the C++ runtime: libstdc++'s configure names every
+ * C99 math function in one probe, so each of these existing -- and answering
+ * correctly -- is what turns std::round and friends on in <cmath>.  Reference
+ * values were computed independently and are checked to 1e-12 relative, the
+ * neighbourhood the x87-based transcendentals in this libc live in. */
+static int close_to(double got, double want, double rel)
+{
+	double diff = fabs(got - want);
+	double mag = fabs(want) > 1.0 ? fabs(want) : 1.0;
+	return diff <= rel * mag;
+}
+
+static void test_c99_math_additions(void)
+{
+	printf("\n[C99 math additions]\n");
+
+	/* Exact, bit-level answers first. */
+	test_result("nextafter(1,2) is 1+eps",
+		    nextafter(1.0, 2.0) == 1.0 + DBL_EPSILON);
+	test_result("nextafter(1,0) steps down",
+		    nextafter(1.0, 0.0) < 1.0 &&
+			    nextafter(nextafter(1.0, 0.0), 2.0) == 1.0);
+	test_result("nextafter(0,1) is smallest subnormal",
+		    nextafter(0.0, 1.0) > 0.0 &&
+			    nextafter(0.0, 1.0) / 2.0 == 0.0);
+	test_result("nexttoward matches nextafter",
+		    nexttoward(1.0, 2.0L) == nextafter(1.0, 2.0));
+	test_result("logb(8) == 3", logb(8.0) == 3.0);
+	test_result("logb(0.5) == -1", logb(0.5) == -1.0);
+	test_result("ilogb(0x1p-1060) == -1060", ilogb(0x1p-1060) == -1060);
+	test_result("ilogb(0) is FP_ILOGB0", ilogb(0.0) == FP_ILOGB0);
+
+	/* IEEE remainder: quotient rounded to nearest EVEN. */
+	test_result("remainder(5.5,2) == -0.5",
+		    remainder(5.5, 2.0) == -0.5);
+	test_result("remainder(7,2) == -1 (tie to even)",
+		    remainder(7.0, 2.0) == -1.0);
+	int q = 0;
+	double r = remquo(7.0, 2.0, &q);
+	test_result("remquo(7,2) remainder", r == -1.0);
+	test_result("remquo(7,2) quotient low bits", (q & 7) == 4 && q > 0);
+	r = remquo(-7.0, 2.0, &q);
+	test_result("remquo(-7,2) negative quotient", r == 1.0 && q < 0);
+
+	/* fma really fuses: (2^27+1)^2 - 2^54 is 2^28+1 exactly, where the
+	 * separately-rounded product loses the trailing 1. */
+	double a = 0x1p27 + 1.0;
+	test_result("fma fuses the multiply",
+		    fma(a, a, -0x1p54) == 0x1p28 + 1.0);
+	test_result("fma trivial", fma(2.0, 3.0, 4.0) == 10.0);
+
+	/* Transcendentals against independent references. */
+	test_result("erf(0) == 0", erf(0.0) == 0.0);
+	test_result("erf(1)", close_to(erf(1.0), 0.8427007929497149, 1e-12));
+	test_result("erf(0.25)",
+		    close_to(erf(0.25), 0.2763263901682369, 1e-12));
+	test_result("erf is odd", erf(-1.0) == -erf(1.0));
+	test_result("erfc(3)",
+		    close_to(erfc(3.0), 2.2090496998585438e-05, 1e-11));
+	test_result("erfc(10)",
+		    close_to(erfc(10.0), 2.088487583762545e-45, 1e-10));
+	test_result("erf+erfc == 1",
+		    close_to(erf(0.7) + erfc(0.7), 1.0, 1e-14));
+	test_result("tgamma(5) == 24", close_to(tgamma(5.0), 24.0, 1e-13));
+	test_result("tgamma(0.5) == sqrt(pi)",
+		    close_to(tgamma(0.5), 1.7724538509055159, 1e-12));
+	test_result("tgamma(-2.5)",
+		    close_to(tgamma(-2.5), -0.9453087204829417, 1e-11));
+	test_result("tgamma(-2) is a pole", isnan(tgamma(-2.0)));
+	test_result("lgamma(10)",
+		    close_to(lgamma(10.0), 12.801827480081467, 1e-12));
+	test_result("lgamma survives where tgamma overflows",
+		    isfinite(lgamma(200.0)) && isinf(tgamma(200.0)));
+
+	/* The float and long double spellings exist and agree. */
+	test_result("float variants",
+		    erff(1.0f) > 0.84f && logbf(8.0f) == 3.0f &&
+			    ilogbf(0.5f) == -1 &&
+			    remainderf(5.5f, 2.0f) == -0.5f);
+	test_result("long double variants",
+		    erfl(1.0L) > 0.84L && logbl(8.0L) == 3.0L &&
+			    fmal(2.0L, 3.0L, 4.0L) == 10.0L);
+}
+
+// ========================================
+// pthread_kill and pthread_getattr_np
+// ========================================
+static volatile sig_atomic_t pk_handler_ran;
+static volatile pid_t pk_handler_tid;
+
+static void pk_handler(int sig)
+{
+	(void)sig;
+	pk_handler_tid = gettid();
+	pk_handler_ran = 1;
+}
+
+struct pk_thread_state {
+	volatile pid_t tid;
+	volatile int done;
+	void *stack_probe; /* address of a local in the thread */
+	int attr_ok; /* getattr_np from inside the thread contains the local */
+};
+
+static void *pk_thread_fn(void *arg)
+{
+	struct pk_thread_state *st = (struct pk_thread_state *)arg;
+	int local = 0;
+
+	st->stack_probe = &local;
+	st->tid = gettid();
+
+	pthread_attr_t attr;
+	st->attr_ok = 0;
+	if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+		void *base = NULL;
+		size_t size = 0;
+		if (pthread_attr_getstack(&attr, &base, &size) == 0 &&
+		    (char *)&local >= (char *)base &&
+		    (char *)&local < (char *)base + size)
+			st->attr_ok = 1;
+	}
+
+	/* Sit here until the main thread has thrown a signal at us; the
+	 * handler runs on THIS thread, which is the whole point of
+	 * pthread_kill over kill. */
+	while (!pk_handler_ran)
+		sched_yield();
+	st->done = 1;
+	return NULL;
+}
+
+static void test_pthread_kill_and_getattr(void)
+{
+	printf("\n[pthread_kill / pthread_getattr_np]\n");
+
+	/* Main thread's own stack, as the kernel reports it. */
+	{
+		pthread_attr_t attr;
+		int rc = pthread_getattr_np(pthread_self(), &attr);
+		test_result("getattr_np(main) succeeds", rc == 0);
+		if (rc == 0) {
+			void *base = NULL;
+			size_t size = 0;
+			int lv = 0;
+			pthread_attr_getstack(&attr, &base, &size);
+			test_result("main stack has sane size",
+				    size >= 64 * 1024 &&
+					    size <= 64UL * 1024 * 1024);
+			test_result("main stack contains a local",
+				    (char *)&lv >= (char *)base &&
+					    (char *)&lv <
+						    (char *)base + size);
+		}
+	}
+
+	struct sigaction sa, oldsa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = pk_handler;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGUSR1, &sa, &oldsa);
+
+	pk_handler_ran = 0;
+	pk_handler_tid = 0;
+
+	struct pk_thread_state st;
+	memset(&st, 0, sizeof(st));
+	pthread_t th;
+	if (pthread_create(&th, NULL, pk_thread_fn, &st) != 0) {
+		test_fail("pthread_create for pthread_kill test");
+		sigaction(SIGUSR1, &oldsa, NULL);
+		return;
+	}
+	while (st.tid == 0)
+		sched_yield();
+
+	test_result("pthread_kill(sig 0) probes a live thread",
+		    pthread_kill(th, 0) == 0);
+
+	/* The directed signal must run its handler on the TARGET thread. */
+	test_result("pthread_kill delivers", pthread_kill(th, SIGUSR1) == 0);
+	for (int i = 0; i < 5000 && !st.done; i++)
+		usleep(1000);
+	test_result("handler ran", pk_handler_ran == 1);
+	test_result("handler ran on the target thread",
+		    pk_handler_tid == st.tid && st.tid != gettid());
+	test_result("thread getattr_np contains its own local",
+		    st.attr_ok == 1);
+
+	pthread_join(th, NULL);
+	sigaction(SIGUSR1, &oldsa, NULL);
+}
+
+// ========================================
+// AF_UNIX SOCK_SEQPACKET
+// ========================================
+static void test_unix_seqpacket(void)
+{
+	printf("\n[AF_UNIX SOCK_SEQPACKET]\n");
+
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) {
+		test_fail("socketpair(SOCK_SEQPACKET)");
+		return;
+	}
+	test_pass("socketpair(SOCK_SEQPACKET)");
+
+	/* Record boundaries survive: three sends are three receives with the
+	 * original lengths, never a coalesced byte stream. */
+	{
+		char buf[64];
+		test_result("send record 1", send(sv[0], "aaaa", 4, 0) == 4);
+		test_result("send record 2", send(sv[0], "bb", 2, 0) == 2);
+		test_result("send record 3",
+			    send(sv[0], "cccccc", 6, 0) == 6);
+		int r1 = recv(sv[1], buf, sizeof(buf), 0);
+		int r2 = recv(sv[1], buf, sizeof(buf), 0);
+		int r3 = recv(sv[1], buf, sizeof(buf), 0);
+		test_result("records kept their boundaries",
+			    r1 == 4 && r2 == 2 && r3 == 6);
+		test_result("last record's bytes intact",
+			    memcmp(buf, "cccccc", 6) == 0);
+	}
+
+	/* A record larger than the reader's buffer truncates -- and the NEXT
+	 * record arrives whole, because the boundary, not the byte count, is
+	 * the unit. */
+	{
+		char small[4];
+		char buf[64];
+		test_result("send long record",
+			    send(sv[0], "0123456789", 10, 0) == 10);
+		test_result("send following record",
+			    send(sv[0], "NEXT", 4, 0) == 4);
+		int r = recv(sv[1], small, sizeof(small), 0);
+		test_result("truncated to the buffer", r == 4 &&
+			    memcmp(small, "0123", 4) == 0);
+		r = recv(sv[1], buf, sizeof(buf), 0);
+		test_result("next record whole after truncation",
+			    r == 4 && memcmp(buf, "NEXT", 4) == 0);
+	}
+
+	/* A record can never fit the transport: EMSGSIZE, not a short write. */
+	{
+		static char big[70000];
+		memset(big, 'x', sizeof(big));
+		errno = 0;
+		int r = send(sv[0], big, sizeof(big), 0);
+		test_result("oversized record is EMSGSIZE",
+			    r < 0 && errno == EMSGSIZE);
+	}
+
+	/* SCM_RIGHTS rides the record: both descriptors of a pipe cross in
+	 * ONE message, and the payload arrives with them. */
+	{
+		int pfd[2];
+		if (pipe(pfd) == 0) {
+			char pay[8] = "WITHFDS";
+			struct iovec iv = { .iov_base = pay, .iov_len = 7 };
+			char cbuf[CMSG_SPACE(sizeof(int) * 2)];
+			memset(cbuf, 0, sizeof(cbuf));
+			struct msghdr mh;
+			memset(&mh, 0, sizeof(mh));
+			mh.msg_iov = &iv;
+			mh.msg_iovlen = 1;
+			mh.msg_control = cbuf;
+			mh.msg_controllen = sizeof(cbuf);
+			struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+			cm->cmsg_level = SOL_SOCKET;
+			cm->cmsg_type = SCM_RIGHTS;
+			cm->cmsg_len = CMSG_LEN(sizeof(int) * 2);
+			memcpy(CMSG_DATA(cm), pfd, sizeof(int) * 2);
+			test_result("sendmsg with two fds",
+				    sendmsg(sv[0], &mh, 0) == 7);
+
+			char rpay[16];
+			struct iovec riv = { .iov_base = rpay,
+					     .iov_len = sizeof(rpay) };
+			char rc[CMSG_SPACE(sizeof(int) * 8)];
+			struct msghdr rmh;
+			memset(&rmh, 0, sizeof(rmh));
+			rmh.msg_iov = &riv;
+			rmh.msg_iovlen = 1;
+			rmh.msg_control = rc;
+			rmh.msg_controllen = sizeof(rc);
+			int r = recvmsg(sv[1], &rmh, 0);
+			test_result("recvmsg got the record",
+				    r == 7 && memcmp(rpay, "WITHFDS", 7) == 0);
+			int got[2] = { -1, -1 };
+			struct cmsghdr *rcm = CMSG_FIRSTHDR(&rmh);
+			int nfds = 0;
+			if (rcm && rcm->cmsg_level == SOL_SOCKET &&
+			    rcm->cmsg_type == SCM_RIGHTS) {
+				nfds = (int)((rcm->cmsg_len -
+					      CMSG_LEN(0)) /
+					     sizeof(int));
+				if (nfds > 2)
+					nfds = 2;
+				memcpy(got, CMSG_DATA(rcm),
+				       (size_t)nfds * sizeof(int));
+			}
+			test_result("both fds arrived in one cmsg",
+				    nfds == 2 && got[0] >= 0 && got[1] >= 0);
+			if (nfds == 2) {
+				/* They are really the pipe: write through the
+				 * received end, read from the original. */
+				char c = 'Z', d = 0;
+				test_result("received fd is usable",
+					    write(got[1], &c, 1) == 1 &&
+						    read(pfd[0], &d, 1) == 1 &&
+						    d == 'Z');
+				close(got[0]);
+				close(got[1]);
+			}
+			close(pfd[0]);
+			close(pfd[1]);
+		} else {
+			test_fail("pipe for SCM_RIGHTS test");
+		}
+	}
+
+	/* Zero payload with several iovecs on the send side: the iovecs are
+	 * ONE record, reassembled in order. */
+	{
+		struct iovec iv[3] = {
+			{ .iov_base = "AB", .iov_len = 2 },
+			{ .iov_base = "CDE", .iov_len = 3 },
+			{ .iov_base = "F", .iov_len = 1 },
+		};
+		struct msghdr mh;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = iv;
+		mh.msg_iovlen = 3;
+		test_result("gathered send", sendmsg(sv[0], &mh, 0) == 6);
+		char buf[16];
+		int r = recv(sv[1], buf, sizeof(buf), 0);
+		test_result("gathered iovecs were one record",
+			    r == 6 && memcmp(buf, "ABCDEF", 6) == 0);
+	}
+
+	/* Nonblocking: a full ring answers EAGAIN without writing half a
+	 * record. */
+	{
+		int fl = fcntl(sv[0], F_GETFL, 0);
+		fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
+		static char rec[4000];
+		memset(rec, 'r', sizeof(rec));
+		int sent = 0, r;
+		errno = 0;
+		while ((r = send(sv[0], rec, sizeof(rec), 0)) > 0)
+			sent++;
+		test_result("full ring reports EAGAIN",
+			    r < 0 && errno == EAGAIN && sent >= 8);
+		/* Drain and confirm every record came back whole. */
+		char buf[4096];
+		int drained = 0;
+		while (drained < sent) {
+			r = recv(sv[1], buf, sizeof(buf), 0);
+			if (r != (int)sizeof(rec))
+				break;
+			drained++;
+		}
+		test_result("drained records whole", drained == sent);
+		fcntl(sv[0], F_SETFL, fl);
+	}
+
+	/* Hangup: close one end, the other reads end of file. */
+	{
+		close(sv[0]);
+		char buf[8];
+		test_result("EOF after peer close",
+			    recv(sv[1], buf, sizeof(buf), 0) == 0);
+		close(sv[1]);
+	}
+
+	/* The named-socket path: listen/accept carries the type, and a
+	 * mismatched connect is refused with EPROTOTYPE. */
+	{
+		struct sockaddr_un addr;
+		memset(&addr, 0, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		/* Abstract name (leading NUL): nothing to unlink. */
+		addr.sun_path[0] = '\0';
+		snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 2,
+			 "lk-seqtest-%d", getpid());
+		socklen_t alen = (socklen_t)(sizeof(addr.sun_family) + 1 +
+					     strlen(addr.sun_path + 1));
+
+		int ls = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+		int ok = ls >= 0 && bind(ls, (struct sockaddr *)&addr,
+					 alen) == 0 &&
+			 listen(ls, 4) == 0;
+		test_result("seqpacket bind+listen", ok);
+
+		if (ok) {
+			int cs = socket(AF_UNIX, SOCK_STREAM, 0);
+			errno = 0;
+			int cr = connect(cs, (struct sockaddr *)&addr, alen);
+			test_result("stream connect to seqpacket listener "
+				    "is EPROTOTYPE",
+				    cr < 0 && errno == EPROTOTYPE);
+			close(cs);
+
+			cs = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+			cr = connect(cs, (struct sockaddr *)&addr, alen);
+			test_result("seqpacket connect", cr == 0);
+			int as = cr == 0 ? accept(ls, NULL, NULL) : -1;
+			test_result("seqpacket accept", as >= 0);
+			if (as >= 0) {
+				char buf[16];
+				test_result("records over accepted pair",
+					    send(cs, "hello", 5, 0) == 5 &&
+						    recv(as, buf, sizeof(buf),
+							 0) == 5 &&
+						    memcmp(buf, "hello", 5) ==
+							    0);
+				close(as);
+			}
+			close(cs);
+		}
+		if (ls >= 0)
+			close(ls);
+	}
+}
+
+// ========================================
+// getentropy: the fill-or-fail entropy call
+// ========================================
+static void test_getentropy(void)
+{
+	printf("\n[getentropy]\n");
+
+	/* Fill-or-fail, unlike getrandom(): a successful call has written
+	 * every byte asked for.  Checked by pre-poisoning the buffer with a
+	 * byte value and requiring that not all of it survived -- 256 bytes
+	 * all landing on the same value is not a run this will see. */
+	unsigned char buf[256];
+
+	memset(buf, 0xA5, sizeof(buf));
+	test_result("getentropy(256) succeeds", getentropy(buf, 256) == 0);
+	int changed = 0;
+	for (size_t i = 0; i < sizeof(buf); i++)
+		if (buf[i] != 0xA5)
+			changed++;
+	test_result("the whole buffer was written", changed > 200);
+
+	/* Two calls differ.  A generator that returned a constant would pass
+	 * everything above. */
+	unsigned char a[32], b[32];
+	getentropy(a, sizeof(a));
+	getentropy(b, sizeof(b));
+	test_result("successive calls differ", memcmp(a, b, sizeof(a)) != 0);
+
+	test_result("getentropy(0) succeeds", getentropy(buf, 0) == 0);
+
+	/* The 256-byte cap is part of the contract, and the error for asking
+	 * past it is EIO -- not EINVAL, which is what a reader expects and
+	 * what libgcrypt's probe tests for. */
+	errno = 0;
+	test_result("over 256 bytes is EIO",
+		    getentropy(buf, 257) == -1 && errno == EIO);
+}
+
+// ========================================
+// timegm: mktime with the fields read as UTC
+// ========================================
+static void test_timegm(void)
+{
+	printf("\n[timegm]\n");
+
+	/* A date whose epoch value is arithmetic, not a table lookup:
+	 * 2001-09-09T01:46:40Z is exactly 1000000000. */
+	struct tm tm;
+
+	memset(&tm, 0, sizeof(tm));
+	tm.tm_year = 2001 - 1900;
+	tm.tm_mon = 8; /* September */
+	tm.tm_mday = 9;
+	tm.tm_hour = 1;
+	tm.tm_min = 46;
+	tm.tm_sec = 40;
+	test_result("timegm of a known instant",
+		    timegm(&tm) == (time_t)1000000000);
+
+	/* The epoch itself, and the leap day that a naive day count gets
+	 * wrong. */
+	memset(&tm, 0, sizeof(tm));
+	tm.tm_year = 70;
+	tm.tm_mday = 1;
+	test_result("timegm of the epoch", timegm(&tm) == (time_t)0);
+
+	memset(&tm, 0, sizeof(tm));
+	tm.tm_year = 2000 - 1900;
+	tm.tm_mon = 1; /* February */
+	tm.tm_mday = 29;
+	test_result("timegm of 2000-02-29", timegm(&tm) == (time_t)951782400);
+
+	/* Round trip: gmtime_r of what timegm produced must give the fields
+	 * back. */
+	time_t t = (time_t)1700000000;
+	struct tm back;
+	gmtime_r(&t, &back);
+	test_result("timegm(gmtime_r(t)) == t", timegm(&back) == t);
+}
+
+// ========================================
+// SO_ACCEPTCONN: does this socket listen?
+// ========================================
+static void test_so_acceptconn(void)
+{
+	printf("\n[SO_ACCEPTCONN]\n");
+
+	/* Read-only, and answered on both socket families -- libsoup asks it
+	 * of every descriptor it is handed before it will serve on it. */
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+
+	if (s < 0) {
+		test_fail("socket(AF_INET) for SO_ACCEPTCONN");
+	} else {
+		int v = -1;
+		socklen_t vl = sizeof(v);
+
+		test_result("getsockopt(SO_ACCEPTCONN) before listen",
+			    getsockopt(s, SOL_SOCKET, SO_ACCEPTCONN, &v,
+				       &vl) == 0 &&
+				    v == 0 && vl == sizeof(int));
+
+		struct sockaddr_in sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sin_family = AF_INET;
+		sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		sa.sin_port = 0;
+		if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) == 0 &&
+		    listen(s, 4) == 0) {
+			v = -1;
+			vl = sizeof(v);
+			test_result("SO_ACCEPTCONN after listen",
+				    getsockopt(s, SOL_SOCKET, SO_ACCEPTCONN,
+					       &v, &vl) == 0 &&
+					    v == 1);
+		} else {
+			test_fail("bind+listen for SO_ACCEPTCONN");
+		}
+		close(s);
+	}
+
+	/* And on AF_UNIX, which answers it from its own option table. */
+	int u[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0) {
+		int v = -1;
+		socklen_t vl = sizeof(v);
+
+		test_result("connected AF_UNIX socket is not listening",
+			    getsockopt(u[0], SOL_SOCKET, SO_ACCEPTCONN, &v,
+				       &vl) == 0 &&
+				    v == 0);
+		close(u[0]);
+		close(u[1]);
+	} else {
+		test_fail("socketpair for SO_ACCEPTCONN");
+	}
+}
+
+// ========================================
+// open_memstream / nftw / pthread_getcpuclockid
+// ========================================
+#include <ftw.h>
+
+static int g_ftw_files, g_ftw_dirs, g_ftw_depth_last;
+static int ftw_count_cb(const char *path, const struct stat *st, int type,
+			struct FTW *f)
+{
+	(void)path;
+	(void)st;
+	if (type == FTW_F)
+		g_ftw_files++;
+	if (type == FTW_D || type == FTW_DP) {
+		g_ftw_dirs++;
+		g_ftw_depth_last = (type == FTW_DP);
+	}
+	return 0;
+}
+
+static void *cpuclock_burn(void *arg)
+{
+	volatile unsigned long x = 0;
+	unsigned long *stop = arg;
+	while (!*stop)
+		x++;
+	return NULL;
+}
+
+static void test_memstream_ftw_cpuclock(void)
+{
+	printf("\n[open_memstream / nftw / pthread_getcpuclockid]\n");
+
+	/* open_memstream: everything written must come back through the
+	 * caller's pointers, NUL terminated, surviving growth past the
+	 * initial allocation. */
+	char *buf = NULL;
+	size_t sz = 0;
+	FILE *ms = open_memstream(&buf, &sz);
+	test_result("open_memstream returns a stream", ms != NULL);
+	if (ms) {
+		fprintf(ms, "hello %d", 42);
+		fflush(ms);
+		test_result("memstream publishes on fflush",
+			    buf && sz == 8 && strcmp(buf, "hello 42") == 0);
+		for (int i = 0; i < 100; i++)
+			fprintf(ms, " chunk %03d", i);
+		test_result("memstream position tracks writes",
+			    ftell(ms) == 8 + 100 * 10);
+		fclose(ms);
+		test_result("memstream final size after growth",
+			    sz == (size_t)(8 + 100 * 10) && buf[sz] == 0 &&
+				    strncmp(buf + 8, " chunk 000", 10) == 0);
+		free(buf);
+	}
+
+	/* nftw over a fabricated tree: 2 dirs (root + sub), 3 files; then
+	 * FTW_DEPTH must report the directory AFTER its contents. */
+	system("rm -rf /tmp/ftwtest");
+	mkdir("/tmp/ftwtest", 0755);
+	mkdir("/tmp/ftwtest/sub", 0755);
+	FILE *t;
+	t = fopen("/tmp/ftwtest/a", "w"); if (t) fclose(t);
+	t = fopen("/tmp/ftwtest/b", "w"); if (t) fclose(t);
+	t = fopen("/tmp/ftwtest/sub/c", "w"); if (t) fclose(t);
+
+	g_ftw_files = g_ftw_dirs = 0;
+	int r = nftw("/tmp/ftwtest", ftw_count_cb, 8, 0);
+	test_result("nftw visits every entry",
+		    r == 0 && g_ftw_files == 3 && g_ftw_dirs == 2);
+	g_ftw_files = g_ftw_dirs = g_ftw_depth_last = 0;
+	r = nftw("/tmp/ftwtest", ftw_count_cb, 8, FTW_DEPTH);
+	test_result("nftw FTW_DEPTH reports dirs post-order",
+		    r == 0 && g_ftw_dirs == 2 && g_ftw_depth_last == 1);
+	system("rm -rf /tmp/ftwtest");
+
+	/* pthread_getcpuclockid: another thread burns CPU; its clock must
+	 * advance while this thread mostly sleeps. */
+	unsigned long stop = 0;
+	pthread_t th;
+	if (pthread_create(&th, NULL, cpuclock_burn, &stop) == 0) {
+		clockid_t cid;
+		int gc = pthread_getcpuclockid(th, &cid);
+		struct timespec a = { 0, 0 }, b = { 0, 0 };
+		clock_gettime(cid, &a);
+		usleep(300000);
+		clock_gettime(cid, &b);
+		stop = 1;
+		pthread_join(th, NULL);
+		uint64_t na = (uint64_t)a.tv_sec * 1000000000ULL + a.tv_nsec;
+		uint64_t nb = (uint64_t)b.tv_sec * 1000000000ULL + b.tv_nsec;
+		test_result("pthread_getcpuclockid clock advances with burn",
+			    gc == 0 && nb > na);
+		/* Thread names: set/get round-trip, and the ERANGE contracts
+		 * on both directions. */
+		{
+			char nm[16];
+			pthread_t self = pthread_self();
+			test_result("pthread_setname_np round-trips",
+				    pthread_setname_np(self, "testlibc-nm") ==
+						    0 &&
+					    pthread_getname_np(self, nm,
+							       sizeof(nm)) ==
+						    0 &&
+					    strcmp(nm, "testlibc-nm") == 0);
+			test_result("setname > 15 chars is ERANGE",
+				    pthread_setname_np(
+					    self,
+					    "a-name-way-too-long-for-this") ==
+					    ERANGE);
+			test_result("getname into a too-small buffer is ERANGE",
+				    pthread_getname_np(self, nm, 4) == ERANGE);
+		}
+
+		/* Dead thread: the clock must answer EINVAL, not garbage. */
+		struct timespec c;
+		test_result("dead thread's cpu clock is EINVAL",
+			    clock_gettime(cid, &c) != 0);
+	} else {
+		test_result("pthread_create for cpuclock test", 0);
+	}
+}
+
+// ========================================
+// C99 <stdint.h> fast/least limit macros
+// ========================================
+static void test_stdint_limits(void)
+{
+	printf("\n[stdint fast/least limits]\n");
+
+	/* The macros must EXIST (their absence made gcc's libstdc++ configure
+	 * itself without C99 stdint support, which compiles <random> away to
+	 * an empty header -- no std::mt19937 anywhere in C++), and each must
+	 * agree with the TYPE it describes: assigning the limit to the type
+	 * and reading it back must be an identity.  A macro copied from a
+	 * libc whose fast types have different widths would pass existence
+	 * checks and corrupt arithmetic silently. */
+	int_fast16_t f16 = INT_FAST16_MAX;
+	int_fast32_t f32 = INT_FAST32_MIN;
+	uint_fast16_t uf16 = UINT_FAST16_MAX;
+	int_least16_t l16 = INT_LEAST16_MAX;
+	uint_least32_t ul32 = UINT_LEAST32_MAX;
+
+	test_result("INT_FAST16_MAX round-trips through int_fast16_t",
+		    f16 == INT_FAST16_MAX);
+	test_result("INT_FAST32_MIN round-trips through int_fast32_t",
+		    f32 == INT_FAST32_MIN);
+	test_result("UINT_FAST16_MAX round-trips through uint_fast16_t",
+		    uf16 == UINT_FAST16_MAX);
+	test_result("INT_LEAST16_MAX fits int_least16_t exactly",
+		    l16 == INT16_MAX);
+	test_result("UINT_LEAST32_MAX fits uint_least32_t exactly",
+		    ul32 == UINT32_MAX);
+	/* sizeof ties the macro to the typedef's real width: the fast 16/32
+	 * types are 32-bit HERE, so their limits must be the 32-bit ones. */
+	test_result("fast16 limits match the 32-bit fast16 typedef",
+		    sizeof(int_fast16_t) == 4 &&
+			    INT_FAST16_MAX == INT32_MAX);
+	test_result("least types are exact-width",
+		    sizeof(int_least16_t) == 2 && sizeof(int_least64_t) == 8 &&
+			    INT_LEAST64_MAX == INT64_MAX);
+
+	/* modff: fractional/integral split in FLOAT precision. */
+	{
+		float ip = 0;
+		float fr = modff(3.75f, &ip);
+		test_result("modff splits 3.75 into 3 + 0.75",
+			    ip == 3.0f && fr == 0.75f);
+		fr = modff(-2.5f, &ip);
+		test_result("modff truncates toward zero for negatives",
+			    ip == -2.0f && fr == -0.5f);
+	}
+
+	/* alloca() must be usable after <stdlib.h> alone -- the BSD/GNU
+	 * convention ported code relies on.  The write proves the memory is
+	 * real; the address differing from a second call proves it is not a
+	 * static buffer. */
+	{
+		char *a1 = alloca(32);
+		char *a2 = alloca(32);
+		a1[0] = 'x';
+		a2[0] = 'y';
+		test_result("alloca via stdlib.h returns distinct stack blocks",
+			    a1 != a2 && a1[0] == 'x' && a2[0] == 'y');
+	}
+
+	/* <sysexits.h>: the values are a wire convention (a mailer's peer
+	 * reads them), so they are checked against the numbers 4.0BSD fixed,
+	 * not merely for existence. */
+	test_result("sysexits values match the BSD convention",
+		    EX_OK == 0 && EX_USAGE == 64 && EX_IOERR == 74 &&
+			    EX_TEMPFAIL == 75 && EX_CONFIG == 78 &&
+			    EX__BASE == 64 && EX__MAX == 78);
+	/* POSIX minima must be the STANDARD's floors, and each must not
+	 * exceed the system's real limit above it. */
+	test_result("POSIX minima are the standard floors",
+		    _POSIX_ARG_MAX == 4096 && _POSIX_PATH_MAX == 256 &&
+			    _POSIX_PIPE_BUF == 512 &&
+			    _POSIX_ARG_MAX <= ARG_MAX &&
+			    _POSIX_PATH_MAX <= PATH_MAX &&
+			    _POSIX_PIPE_BUF <= PIPE_BUF);
+}
+
+// ========================================
+// struct dirent64 and the mkdir declaration in <sys/stat.h>
+// ========================================
+static void test_dirent64_and_stat_mkdir(void)
+{
+	printf("\n[dirent64 / sys-stat mkdir]\n");
+
+	/* struct dirent64 must describe EXACTLY what getdents64() writes:
+	 * portable code reads the buffer through this type (libgpg-error
+	 * walks its descriptor table that way), so a layout that differed
+	 * from struct dirent by even a field's offset would hand it the
+	 * wrong names.  Checked by field offsets, not by reading the two
+	 * declarations side by side. */
+	test_result("dirent64 is the same layout as dirent",
+		    sizeof(struct dirent64) == sizeof(struct dirent) &&
+			    offsetof(struct dirent64, d_ino) ==
+				    offsetof(struct dirent, d_ino) &&
+			    offsetof(struct dirent64, d_off) ==
+				    offsetof(struct dirent, d_off) &&
+			    offsetof(struct dirent64, d_reclen) ==
+				    offsetof(struct dirent, d_reclen) &&
+			    offsetof(struct dirent64, d_type) ==
+				    offsetof(struct dirent, d_type) &&
+			    offsetof(struct dirent64, d_name) ==
+				    offsetof(struct dirent, d_name));
+
+	/* And it really does read a directory. */
+	char dir[64];
+	snprintf(dir, sizeof(dir), "/tmp/lk-d64-%d", (int)getpid());
+	/* mkdir called with only <sys/stat.h> in mind: POSIX puts it there
+	 * (the mode macros are that header's), and a program that includes
+	 * nothing else must find it. */
+	test_result("mkdir declared by <sys/stat.h>", mkdir(dir, 0755) == 0);
+
+	char f1[128], f2[128];
+	snprintf(f1, sizeof(f1), "%s/alpha", dir);
+	snprintf(f2, sizeof(f2), "%s/beta", dir);
+	int fd = open(f1, O_CREAT | O_WRONLY, 0644);
+	if (fd >= 0)
+		close(fd);
+	fd = open(f2, O_CREAT | O_WRONLY, 0644);
+	if (fd >= 0)
+		close(fd);
+
+	int dfd = open(dir, O_RDONLY);
+	int saw_alpha = 0, saw_beta = 0, entries = 0;
+
+	if (dfd >= 0) {
+		char buf[1024];
+		int n;
+
+		while ((n = getdents64(dfd, buf, sizeof(buf))) > 0) {
+			int off = 0;
+
+			while (off < n) {
+				struct dirent64 *de =
+					(struct dirent64 *)(buf + off);
+
+				if (de->d_reclen == 0)
+					break;
+				entries++;
+				if (strcmp(de->d_name, "alpha") == 0)
+					saw_alpha = 1;
+				if (strcmp(de->d_name, "beta") == 0)
+					saw_beta = 1;
+				off += de->d_reclen;
+			}
+		}
+		close(dfd);
+	}
+	test_result("getdents64 read into dirent64", entries >= 2);
+	test_result("both entries were found", saw_alpha && saw_beta);
+
+	unlink(f1);
+	unlink(f2);
+	rmdir(dir);
 }
 
 int main(int argc, char **argv)
@@ -25727,6 +26627,16 @@ network_skip:;
 	test_printf_conversions();
 	test_futex_ops();
 	test_resolver();
+	test_mincore();
+	test_c99_math_additions();
+	test_pthread_kill_and_getattr();
+	test_unix_seqpacket();
+	test_getentropy();
+	test_timegm();
+	test_so_acceptconn();
+	test_memstream_ftw_cpuclock();
+	test_stdint_limits();
+	test_dirent64_and_stat_mkdir();
 
 	// ========================================
 	// Summary

@@ -44,8 +44,8 @@ export LIKEOS_SYSROOT="$SYSROOT"
 #
 # NOT under build/ either, which was the first attempt: `make clean` deletes
 # everything in build/ except xorg-sysroot, so the tools vanished while
-# .stamps still said they were built -- and the next netsurf build failed with
-# "nsgenbind: not found".  This lives beside .stamps and .logs, which are the
+# .stamps still said they were built -- and the next build that needed one
+# of them failed with "<tool>: not found".  This lives beside .stamps and .logs, which are the
 # port's own build state and which the top-level clean does not touch, so the
 # three cannot get out of step with each other -- and clean.sh removes all
 # three together, keeping only the meson venv `make deps` installs here.
@@ -172,8 +172,28 @@ pkg_opts() {
 		echo "--with-compression=no --with-fontrootdir=/usr/share/fonts/X11"
 		;;
 	xorg-server)
-		# fbdev + evdev only.  GLX/DRI/DRI3 are off, which is also what
+		# fbdev + evdev.  DRI/DRI2/DRI3 are off, which is also what
 		# keeps libxshmfence off the dependency list entirely.
+		#
+		# GLX is on when Mesa is in the sysroot, and only then: its
+		# configure needs gl.pc, and Mesa is built by the GTK3 port,
+		# which comes AFTER this one -- a fresh build in manifest order
+		# gets a server without GLX, and `./build.sh xorg-server` after
+		# gtk3/build.sh mesa gets one with it.  GLX here is AIGLX over
+		# software rendering: the server dlopen()s
+		# /usr/lib/dri/swrast_dri.so (Mesa's dril shim, see
+		# gtk3/patches/mesa/0002) and llvmpipe draws inside the server.
+		# Client-side GL never needed this; glxinfo/glxgears and every
+		# plain GLX program do, since GLX visuals come from the server.
+		# The driver path is given explicitly (patches/xorg-server/
+		# 0006): asked of pkg-config it comes back with the host
+		# sysroot prefixed, and the server then looks for the driver
+		# at a path that only exists on the build machine.
+		if [ -f "$SYSROOT/usr/lib/pkgconfig/gl.pc" ]; then
+			glx="--enable-glx --with-dri-driver-path=/usr/lib/dri"
+		else
+			glx="--disable-glx"
+		fi
 		#
 		# Also off: libdrm (nothing to talk to), pciaccess (the library
 		# is built for its header, but nothing here can reach the bus),
@@ -182,7 +202,7 @@ pkg_opts() {
 		# int10 (real-mode BIOS calls, which pciaccess would have
 		# carried), and the input thread (errno is not thread-local
 		# here yet).
-		echo "--disable-glx --disable-dri --disable-dri2 --disable-dri3 \
+		echo "$glx --disable-dri --disable-dri2 --disable-dri3 \
 		      --disable-xvfb --disable-xnest --disable-xwayland \
 		      --disable-xephyr --disable-dmx --disable-docs \
 		      --disable-devel-docs --disable-selective-werror \
@@ -277,10 +297,18 @@ pkg_opts() {
 		# the handful of Unicode routines GnuTLS uses.  The tools
 		# (certtool, gnutls-cli) are diagnostics for a machine with a
 		# terminal and time to spend; Claws links the library.
+		# The trust store is named at build time because that is the
+		# only moment GnuTLS accepts one: its verification API asks
+		# for "the system trust", and with no default configured that
+		# answer is empty -- glib-networking (WebKit's TLS) then fails
+		# every https:// certificate, and Claws can only trust servers
+		# the user has clicked through.  The path is where the image
+		# has always shipped its CA bundle.
 		echo "--disable-doc --disable-tests --disable-tools \
 		      --without-p11-kit --with-included-unistring \
 		      --without-tpm --without-tpm2 --disable-libdane \
-		      --disable-guile"
+		      --disable-guile \
+		      --with-default-trust-store-file=/etc/ssl/certs/ca-certificates.crt"
 		;;
 	enchant)
 		# hunspell is the backend, and the only one: aspell, nuspell,
@@ -308,6 +336,45 @@ pkg_opts() {
 		# encrypted.
 		echo "--with-openssl --with-gnutls --without-sasl \
 		      --disable-db --disable-dependency-tracking"
+		;;
+	libwebp)
+		# The demux component is what WebKit asks pkg-config for; mux
+		# costs nothing beside it.  Everything else is the tools'
+		# optional image I/O -- the LIBRARY needs none of it, and each
+		# would drag a host-side dependency probe into the build.
+		echo "--enable-libwebpdemux --enable-libwebpmux \
+		      --disable-gl --disable-sdl --disable-png --disable-jpeg \
+		      --disable-tiff --disable-gif --disable-wic"
+		;;
+	libgpg-error)
+		echo "--disable-doc --disable-tests --disable-nls \
+		      --enable-install-gpg-error-config"
+		;;
+	libgcrypt)
+		# --disable-asm: the assembler modules probe the platform by
+		# OS name and this system is on nobody's list; the C fallbacks
+		# are what every port here would get anyway, and WebCrypto is
+		# not a throughput path.
+		#
+		# --enable-random=getentropy names the one entropy gatherer
+		# this system has.  Auto-detection builds the whole museum --
+		# including the legacy device-polling module, which includes
+		# <sys/syscall.h> and stops the build on a header this libc
+		# does not carry.  getentropy(3) is in this libc precisely for
+		# this consumer.
+		echo "--disable-doc --disable-asm \
+		      --enable-random=getentropy \
+		      --with-libgpg-error-prefix=$SYSROOT/usr"
+		;;
+	nghttp2)
+		# Only libnghttp2: the bundled tools (nghttpx, h2load) are
+		# C++23 programs nothing here ships, and --enable-lib-only is
+		# upstream's switch for exactly this case.
+		echo "--enable-lib-only --disable-examples"
+		;;
+	libxslt)
+		echo "--without-python --without-debug --without-profiler \
+		      --with-crypto"
 		;;
 	libxml2)
 		# GtkSourceView reads its syntax definitions with the tree and
@@ -399,11 +466,19 @@ pkg_opts() {
 		# in particular keeps librsvg -- and with it a Rust toolchain --
 		# out of the dependency graph, for the same reason the Adwaita
 		# icon theme is pinned to its last PNG release.
+		# --enable-fancy-plugin is stated rather than left to its
+		# auto-detection: the plugin is the HTML mail viewer and the
+		# reason claws-mail sits BELOW webkitgtk in the manifest, and
+		# an auto probe that quietly found nothing would ship a mail
+		# client that renders HTML as a wall of tags with no error
+		# anywhere.  Stated, a missing WebKit stops the build at
+		# configure, which is where a broken order should surface.
 		echo "--disable-dbus --disable-gnome --disable-libnotify \
 		      --disable-gpgme --disable-compface --disable-ldap \
 		      --disable-jpilot --disable-networkmanager-support \
 		      --disable-svg --disable-valgrind --disable-manual \
-		      --enable-gnutls --enable-enchant --enable-libetpan"
+		      --enable-gnutls --enable-enchant --enable-libetpan \
+		      --enable-fancy-plugin"
 		;;
 	gettext)
 		# The bindings for languages this system has no runtime for, and
@@ -524,6 +599,22 @@ pkg_env() {
 # Per-package meson options, the counterpart of pkg_opts() above.
 meson_opts() {
 	case "$1" in
+	glu)
+		# The default provider is glvnd; this system's GL is Mesa's
+		# classic libGL, whose pkg-config name is plain "gl".
+		echo "-Dgl_provider=gl"
+		;;
+	mesa)
+		# Software GL for the desktop.  llvmpipe is the renderer;
+		# softpipe stays as the no-JIT fallback a debug session can
+		# force with GALLIUM_DRIVER=softpipe.  system 'likeos' in the
+		# cross file makes meson's KMS/DRM test false, so no libdrm is
+		# needed anywhere: GLX and EGL both ride the software winsys
+		# (drisw) and present through XShm.  The llvm dependency is
+		# answered by toolchain/llvm-config (a wrapper; the sysroot's
+		# real llvm-config is a target binary the host cannot run).
+		echo "-Dgallium-drivers=llvmpipe,softpipe -Dvulkan-drivers=[] 		      -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=disabled 		      -Dgles1=disabled -Dgles2=enabled -Dopengl=true 		      -Dllvm=enabled -Dshared-llvm=enabled -Ddraw-use-llvm=true 		      -Dglvnd=disabled -Dzstd=disabled -Dlmsensors=disabled 		      -Dlibunwind=disabled -Dvalgrind=disabled 		      -Dbuild-tests=false -Dtools=[] -Dvideo-codecs=[]"
+		;;
 	pixman)
 		# OpenMP drags in the host's libgomp, and with it the host libc,
 		# which then collides with ours over errno.  The tests are the
@@ -562,8 +653,13 @@ meson_opts() {
 		# and Cairo mutually dependent -- Cairo wants HarfBuzz for
 		# cairo-ft.  The utilities go with it, which is no loss; nothing
 		# on the image runs hb-view.
+		# icu=enabled, for WebKit: its cmake requires HarfBuzz WITH
+		# the ICU integration (find_package(HarfBuzz REQUIRED
+		# COMPONENTS ICU)), which is a separate small library
+		# (libharfbuzz-icu) built only when ICU is in the sysroot --
+		# and ICU is, because the manifest builds it above this.
 		echo "-Dglib=enabled -Dgobject=enabled -Dfreetype=enabled \
-		      -Dcairo=disabled -Dicu=disabled -Dchafa=disabled \
+		      -Dcairo=disabled -Dicu=enabled -Dchafa=disabled \
 		      -Dtests=disabled -Ddocs=disabled -Dbenchmark=disabled \
 		      -Dutilities=disabled -Dintrospection=disabled"
 		;;
@@ -623,9 +719,42 @@ meson_opts() {
 		# that it cannot create a GL context, and GTK draws through
 		# cairo -- which is what happens here.
 		#
-		# EGL stays off: it is what the Wayland backend uses, and that
-		# backend is not built.
-		echo "-Dglx=yes -Degl=no -Dx11=true -Dtests=false -Ddocs=false"
+		# EGL is ON for the same reason GLX is, and it was previously
+		# off on a wrong premise: that EGL is only the Wayland
+		# backend's business.  WebKitGTK needs <epoxy/egl.h> --
+		# PlatformDisplay.cpp and the six platform/graphics/egl/*.cpp
+		# files include it unconditionally, find_package(Epoxy) is
+		# REQUIRED in OptionsGTK.cmake, and SourcesGTK.txt lists those
+		# sources behind no feature flag.  Without this the engine does
+		# not compile at all.
+		#
+		# It costs nothing to enable and needs no EGL to exist:
+		#   - meson.build asks for `dependency('egl', required: false)`,
+		#     so no EGL package has to be found;
+		#   - the entry points are generated from the registry/egl.xml
+		#     that epoxy SHIPS, so no Khronos headers are needed;
+		#   - <epoxy/egl.h> is self-contained -- it pulls in only
+		#     epoxy/common.h and the generated header, and it #defines
+		#     __egl_h_ / __eglext_h_ specifically to keep the system's
+		#     <EGL/egl.h> OUT.
+		#
+		# At run time epoxy dlopens libEGL.so.1 lazily, exactly as it
+		# does libGL for GLX.  Nothing here calls an EGL entry point:
+		# the display is created only by
+		# initializePlatformDisplayIfNeeded(), whose two call sites are
+		# DrawingAreaCoordinatedGraphics (guarded by
+		# acceleratedCompositingEnabled, which is false because
+		# ENABLE_WEBGL=OFF turns canUseHardwareAcceleration off) and
+		# WebChromeClient (inside ENABLE(WEBGL), not compiled).  The
+		# WebProcessGLib call sites are inside PLATFORM(WPE).
+		#
+		# If that ever stops holding, the symptom is loud and specific:
+		# "Couldn't open libEGL.so.1" from epoxy, or WebKit's "Could
+		# not create default EGL display ... Aborting".  Either means
+		# real EGL is needed and Mesa swrast is the next step -- a stub
+		# libEGL does NOT help, because PlatformDisplayDefault::create()
+		# turns a null display into CRASH().
+		echo "-Dglx=yes -Degl=yes -Dx11=true -Dtests=false -Ddocs=false"
 		;;
 	gtksourceview)
 		# The editing widget.  gir and vapi generate bindings for
@@ -772,6 +901,39 @@ meson_opts() {
 		      -Dinstalled_tests=false -Dcolord=no \
 		      -Dcloudproviders=false -Dprofiler=false -Dtracker3=false"
 		;;
+
+	# ---- the WebKit chain ----------------------------------------------
+	libpsl)
+		# IDNA through the ICU built at the head of this manifest --
+		# the alternative runtime is libidn2, which is not ported.
+		echo "-Druntime=libicu -Dtests=false -Ddocs=false"
+		;;
+	libsoup)
+		# tls_check=false because the check RUNS a target program to
+		# see whether GIO has a TLS backend; the backend is
+		# glib-networking, built right after this, and the check
+		# cannot run under cross-compilation anyway.
+		echo "-Dtests=false -Ddocs=disabled -Dintrospection=disabled \
+		      -Dvapi=disabled -Dsysprof=disabled -Dtls_check=false \
+		      -Dbrotli=enabled -Dntlm=disabled -Dgssapi=disabled \
+		      -Dautobahn=disabled -Dpkcs11_tests=disabled"
+		;;
+	glib-networking)
+		# The OpenSSL backend and nothing else.  This is the TLS that
+		# every GIO user -- WebKitGTK/libsoup (luakit, MiniBrowser),
+		# anything speaking https through GLib -- runs on.  It was the
+		# GnuTLS backend until 2026-08-27; OpenSSL is the stack this
+		# system has exercised most (curl, ssh, the port's own tests),
+		# so the browsers now share it.  Exactly ONE backend may be
+		# installed: both modules register the same GTlsBackend
+		# extension point at equal priority and GIO would pick
+		# whichever it loaded first.  Switching back is documented in
+		# tmp/OPENSSL-INSTEADOF-GNUTLS.md.  GnuTLS itself stays in the
+		# manifest -- Claws Mail links it directly.  libproxy and the
+		# desktop proxy portal are services this system does not run.
+		echo "-Dopenssl=enabled -Dgnutls=disabled -Dlibproxy=disabled \
+		      -Dgnome_proxy=disabled -Dinstalled_tests=false"
+		;;
 	*) echo "" ;;
 	esac
 }
@@ -822,6 +984,15 @@ cmake_opts() {
 		# produces anything shipped.
 		echo "-DBUILD_SHARED_LIBS=ON -DFMT_TEST=OFF -DFMT_DOC=OFF \
 		      -DFMT_INSTALL=ON"
+		;;
+	brotli)
+		echo "-DBUILD_SHARED_LIBS=ON -DBROTLI_DISABLE_TESTS=ON"
+		;;
+	woff2)
+		# NO_CXX_FLAGS keeps woff2's hand-rolled -fno-exceptions set
+		# from fighting the wrapper's; brotli is found through the
+		# sysroot like everything else.
+		echo "-DBUILD_SHARED_LIBS=ON -DWOFF2_BUILD_NO_CXX_FLAGS=ON"
 		;;
 	simdutf)
 		# UTF-8 validation and transcoding, for VTE.
@@ -932,30 +1103,13 @@ build_subdirs() {
 # Anything a restricted build (see make_dirs) would otherwise leave behind.
 post_install() {
 	case "$1" in
-	netsurf)
-		# The build installs the binary and its resources but not the
-		# manual page, which sits unreferenced in docs/.  Installed
-		# under the name the image ships the binary as, so `man netsurf`
-		# matches the command the user actually has.
-		mkdir -p "$SYSROOT/usr/share/man/man1" || return 1
-		if [ -f docs/netsurf-fb.1 ]; then
-			cp -f docs/netsurf-fb.1 \
-				"$SYSROOT/usr/share/man/man1/netsurf.1" || return 1
-		fi
-		;;
-	utf8proc)
-		# NetSurf includes <libutf8proc/utf8proc.h>, but utf8proc
-		# installs its header at the include root as <utf8proc.h>.
-		# Both spellings are in use across distributions, and the
-		# package offers no option to choose, so the second one is
-		# provided here rather than patching every consumer.
-		#
-		# A copy, not a symlink: the sysroot is packed into the image
-		# and copied between machines, where a dangling absolute link
-		# would be worse than a duplicated 40KB header.
-		mkdir -p "$SYSROOT/usr/include/libutf8proc" || return 1
-		cp -f "$SYSROOT/usr/include/utf8proc.h" \
-			"$SYSROOT/usr/include/libutf8proc/utf8proc.h" || return 1
+	mesa)
+		# Mesa's libEGL/libGL are real now.  The marker tells
+		# import-egl-headers.sh to stop installing the stub libEGL the
+		# port carried while there was no GL at all -- reinstalling the
+		# stub over Mesa would put every GL program back on the
+		# "Couldn't open libEGL" path the stub existed to silence.
+		touch "$SYSROOT/usr/lib/.mesa-egl" || return 1
 		;;
 	libXpm)
 		# The .pc file is generated at the top level, so building only
@@ -1031,8 +1185,7 @@ is_cmake() {
 
 # Packages whose build produces programs that packages ABOVE them have to RUN.
 #
-# Same problem nsgenbind has (see the netsurf arm below), one level worse: a
-# cross-built generator is a target binary and cannot execute here.  GLib is the
+# A cross-built generator is a target binary and cannot execute here.  GLib is the
 # acute case -- glib-compile-resources, glib-genmarshal, glib-mkenums,
 # glib-compile-schemas and gdbus-codegen generate source for nearly everything
 # above it, and GTK's build alone invokes the first of those hundreds of times.
@@ -1068,8 +1221,7 @@ is_dataonly() {
 # Packages built for the BUILD machine, into $HOSTTOOLS rather than the
 # sysroot: tools the packages ABOVE them run during their own build.
 #
-# nsgenbind is the same idea handled inline in the netsurf arm; this is the
-# general form.  What comes out must never be a candidate for the image -- it
+# What comes out must never be a candidate for the image -- it
 # is compiled for this machine -- so the prefix is $HOSTTOOLS and the cross
 # wrappers are not used at all.
 is_hosttool() {
@@ -1260,21 +1412,6 @@ plainmake_install_args() {
 	esac
 }
 
-# NetSurf and its libraries use the project's OWN build system: no configure,
-# no meson -- a set of shared makefiles (the "buildsystem" package) that every
-# component includes and drives with make variables.  By name for the same
-# reason as is_plainmake: a bare Makefile is present in nearly every package
-# and so detects nothing.
-is_nsbuild() {
-	case "$1" in
-	buildsystem | libwapcaplet | libparserutils | libhubbub | libcss | \
-		libdom | libnsutils | libnslog | libnsgif | libnsbmp | \
-		libnspsl | libnsfb | nsgenbind | netsurf)
-		return 0
-		;;
-	esac
-	return 1
-}
 
 # Packages that compile nothing and so need no cross toolchain: building them
 # with the host compiler avoids a pointless cross-configure.
@@ -1339,7 +1476,205 @@ build_one() {
 	# `meson compile` first would also build the test programs, which
 	# several packages link against host-only helpers — failing the build
 	# over binaries that are never shipped.
-	if is_cmake "$name" "$dir"; then
+	if [ "$name" = webkitgtk ]; then
+		# The engine.  CMake with ninja, the port's cross toolchain
+		# file, and both tool sources on PATH: the port's native GLib
+		# tools (glib-compile-resources runs hundreds of times) and
+		# the port's own ruby, which the JavaScriptCore generators are
+		# written in.
+		#
+		# The option block reads long because WebKit defaults to a
+		# desktop this is not.  The shape of the port:
+		#   - the GTK3 API line (webkit2gtk-4.1), which is what both
+		#     consumers (luakit, Claws fancy) link;
+		#   - Cairo rendering (USE_SKIA=OFF): there is no GPU and no
+		#     GL here, and the cairo path is the software renderer,
+		#     drawing with the same library the whole desktop uses;
+		#   - the JavaScriptCore C-loop interpreter (ENABLE_JIT=OFF):
+		#     correct-by-construction on a young kernel, where the
+		#     JIT's W^X page dance would be the riskiest code in the
+		#     system for a speedup a mail viewer does not need;
+		#   - system malloc: bmalloc's virtual-memory gymnastics
+		#     (gigacage reservations in the terabytes) assume address
+		#     space this kernel does not hand out;
+		#   - no media stack: VIDEO/WEB_AUDIO and everything behind
+		#     them need GStreamer, which is not ported;
+		#   - the process supervisor extras off: journald, bubblewrap,
+		#     GBM/DRM and the GPU process all talk to kernel
+		#     interfaces that do not exist here.
+		#
+		# Accessibility (USE_ATSPI) is LEFT ON, upstream's setting, and
+		# the "Could NOT find ATSPI" line in the configure output is
+		# expected -- do not "fix" it by making USE_ATSPI conditional
+		# on that find, which is where this port spent a build.  The
+		# GTK port has no working accessibility-off configuration:
+		# AXCoreObject declares m_wrapper only for Cocoa, Windows,
+		# PlayStation/Haiku and ATSPI, while wrapper(), setWrapper()
+		# and detachWrapper() are unguarded, so WebCore does not
+		# compile without one of them -- and a dozen AXObjectCache
+		# platform hooks live only in the atspi sources.
+		#
+		# Leaving it on costs nothing, because nothing in the build
+		# actually consumes the library: ATSPI_LIBRARIES and
+		# ATSPI_INCLUDE_DIRS are referenced only inside
+		# Source/cmake/FindATSPI.cmake, and no source includes
+		# <atspi/...>.  WebKit speaks the AT-SPI D-Bus protocol
+		# directly over GDBus, from an interface description it
+		# generates with gdbus-codegen (the port's host GLib tools
+		# provide it, and PATH below finds them).
+		#
+		# At run time it is dormant: AccessibilityAtspi::connect()
+		# returns immediately when the bus address is empty, which is
+		# what it is with no accessibility bus on the session -- the
+		# same state a conventional desktop is in when a11y is off.
+		# MiniBrowser is kept: it is the reference client, and the
+		# first thing to run when a page misbehaves in luakit.
+		#
+		# The last four options are all about fitting the build on a
+		# machine rather than about the engine:
+		#   -O2 rather than the Release default of -O3.  The peak
+		#     memory of a WebCore unified compile is dominated by the
+		#     optimiser, -O3 buys inlining decisions that matter to a
+		#     JIT-less interpreter build very little, and it is what
+		#     the distributions ship WebKit as.
+		#   --no-keep-memory tells GNU ld to re-read input sections
+		#     instead of holding every one in memory.  libWebKit.so
+		#     is linked from something over half a gigabyte of
+		#     objects; without it that link alone is the high-water
+		#     mark of the entire build.
+		#   the link job pool holds link steps to one at a time, so
+		#     the linker never has to share the machine with another
+		#     copy of itself.
+		#
+		# The job count comes from MEMORY, not from the core count.
+		#
+		# WebCore's unified sources are the largest translation units
+		# in this whole tree -- each bundles eight .cpp files behind a
+		# header graph reaching most of the engine -- and a compiler
+		# on one of them peaks past two gigabytes.  A job count taken
+		# from nproc ignores that entirely: eight compilers on a box
+		# with eight gigabytes do not get a clean OOM kill, they get a
+		# swap storm, and the machine stops answering long before the
+		# kernel picks a victim.  This port lost a machine that way
+		# twice.
+		#
+		# So the count is MemTotal divided by three gigabytes per job,
+		# clamped to at least one and never above the core count --
+		# two jobs on the 8-core/7.9 GB machine this was ported on,
+		# which is what fits there alongside a desktop session.
+		# LIKEOS_WEBKIT_JOBS overrides it when the arithmetic is known
+		# to be wrong for a particular machine.
+		#
+		# A memory-capped cgroup is worth having either way, and is
+		# the only thing that keeps a misjudged count from taking the
+		# session down with it:
+		#
+		#   systemd-run --user --scope -p MemoryHigh=4000M \
+		#       -p MemoryMax=5000M ./gtk3/build.sh webkitgtk
+		#
+		# Note what it does and does not do.  MemoryHigh throttles and
+		# reclaims INSIDE the build, which protects the desktop -- but
+		# only if the cap leaves the desktop room.  Set too close to
+		# total memory it simply pins the cgroup at its limit while
+		# the host swaps anyway, which is what 5500M did here.
+		(
+			cd "$dir" || exit 1
+			PATH="$here/toolchain:$HOSTTOOLS/bin:$PATH"
+			export PATH
+			if ! command -v ruby >/dev/null 2>&1; then
+				echo "webkitgtk: no ruby on the build host." >&2
+				echo "  JavaScriptCore's generators are ruby;" >&2
+				echo "  install it with:  make deps" >&2
+				exit 1
+			fi
+			# unifdef, which the header generation runs ON THE BUILD
+			# HOST.  The tree bundles its source but would compile it
+			# with the cross compiler -- a binary this machine cannot
+			# execute -- so the port compiles that same source
+			# natively into .hosttools, where configure finds it
+			# on PATH.
+			if ! command -v unifdef >/dev/null 2>&1; then
+				cc -O2 -std=gnu99 -D_XOPEN_SOURCE=700 \
+					-o "$HOSTTOOLS/bin/unifdef" \
+					Source/ThirdParty/unifdef/unifdef.c ||
+					exit 1
+			fi
+			# MemTotal is in kB; 3 GB per job.  Clamped to at
+			# least one, and never more than there are cores.
+			memkb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+			jobs=$((memkb / (3 * 1024 * 1024)))
+			[ "$jobs" -lt 1 ] && jobs=1
+			[ "$jobs" -gt "$(nproc)" ] && jobs=$(nproc)
+			[ -n "${LIKEOS_WEBKIT_JOBS:-}" ] &&
+				jobs=$LIKEOS_WEBKIT_JOBS
+			echo "webkitgtk: $jobs compile job(s)" >&2
+
+			# Configure only when there is nothing to continue.
+			#
+			# Every other package here is rebuilt from scratch on a
+			# re-run, which costs seconds and buys certainty.  This
+			# one is hours, and an interrupted build -- a hang, a
+			# reboot, a Ctrl-C -- would otherwise start again at
+			# object one.  ninja already decides what is stale from
+			# the graph it wrote, so a build directory that carries
+			# a finished configure is worth continuing.  `-f`
+			# means "build this again from nothing" and so
+			# reconfigures, which is also how a changed option
+			# block above takes effect.
+			[ "$force" = "1" ] && rm -rf .likeos-build
+			if [ ! -f .likeos-build/build.ninja ]; then
+			rm -rf .likeos-build
+			LIKEOS_TOOLCHAIN="$here/toolchain" \
+			cmake -S . -B .likeos-build -G Ninja \
+				-DCMAKE_TOOLCHAIN_FILE="$here/toolchain/likeos-toolchain.cmake" \
+				-DCMAKE_INSTALL_PREFIX=/usr \
+				-DCMAKE_INSTALL_LIBDIR=lib \
+				-DCMAKE_BUILD_TYPE=Release \
+				-DPORT=GTK -DUSE_GTK4=OFF \
+				-DENABLE_X11_TARGET=ON \
+				-DENABLE_WAYLAND_TARGET=OFF \
+				-DENABLE_QUARTZ_TARGET=OFF \
+				-DUSE_SKIA=OFF \
+				-DENABLE_JIT=OFF -DENABLE_C_LOOP=ON \
+				-DENABLE_WEBASSEMBLY=OFF \
+				-DENABLE_SAMPLING_PROFILER=OFF \
+				-DUSE_SYSTEM_MALLOC=ON \
+				-DENABLE_MINIBROWSER=ON \
+				-DENABLE_INTROSPECTION=OFF \
+				-DENABLE_DOCUMENTATION=OFF \
+				-DENABLE_JOURNALD_LOG=OFF \
+				-DENABLE_BUBBLEWRAP_SANDBOX=OFF \
+				-DUSE_GBM=OFF -DUSE_LIBDRM=OFF \
+				-DENABLE_GPU_PROCESS=OFF \
+				-DUSE_GSTREAMER=OFF -DENABLE_VIDEO=OFF \
+				-DENABLE_WEB_AUDIO=OFF \
+				-DENABLE_MEDIA_STREAM=OFF \
+				-DENABLE_MEDIA_RECORDER=OFF \
+				-DENABLE_WEB_CODECS=OFF \
+				-DENABLE_MEDIA_SESSION=OFF \
+				-DENABLE_WEB_RTC=OFF \
+				-DENABLE_ENCRYPTED_MEDIA=OFF \
+				-DENABLE_SPEECH_SYNTHESIS=OFF \
+				-DUSE_FLITE=OFF -DUSE_SPIEL=OFF \
+				-DENABLE_GAMEPAD=OFF -DENABLE_WEBGL=ON \
+				-DENABLE_WEBDRIVER=OFF -DENABLE_WEBXR=OFF \
+				-DUSE_AVIF=OFF -DUSE_JPEGXL=OFF -DUSE_LCMS=OFF \
+				-DUSE_LIBHYPHEN=OFF -DUSE_LIBSECRET=OFF \
+				-DUSE_LIBBACKTRACE=OFF \
+				-DUSE_SYSPROF_CAPTURE=OFF \
+				-DENABLE_SPELLCHECK=ON -DENABLE_PDFJS=ON \
+				-DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" \
+				-DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
+				-DCMAKE_SHARED_LINKER_FLAGS="-Wl,--no-keep-memory" \
+				-DCMAKE_JOB_POOLS="link=1" \
+				-DCMAKE_JOB_POOL_LINK=link || exit 1
+			fi
+
+			cmake --build .likeos-build -j"$jobs" &&
+			DESTDIR="$SYSROOT" cmake --install .likeos-build &&
+			post_install "$name"
+		) >"$log" 2>&1
+	elif is_cmake "$name" "$dir"; then
 		(
 			cd "$dir" || exit 1
 			rm -rf .likeos-build
@@ -1353,104 +1688,6 @@ build_one() {
 				cmake --build .likeos-build -j"$(nproc)" &&
 				DESTDIR="$SYSROOT" cmake --install .likeos-build &&
 				post_install "$name"
-		) >"$log" 2>&1
-	elif is_nsbuild "$name"; then
-		(
-			cd "$dir" || exit 1
-
-			# Where the shared makefiles live once `buildsystem` has
-			# been installed.  It has to be given explicitly: the
-			# components default NSSHARED to $(PREFIX)/share/..., and
-			# PREFIX is /usr here, which would point at the HOST's
-			# /usr instead of the sysroot.  This is a build-time
-			# include path, so it is an absolute host path -- unlike
-			# PREFIX, which is where things end up on the target.
-			nsshared="$SYSROOT/usr/share/netsurf-buildsystem"
-
-			if [ "$name" = buildsystem ]; then
-				# Copies makefiles into place; compiles nothing.
-				make install PREFIX=/usr DESTDIR="$SYSROOT" &&
-					post_install "$name"
-			elif [ "$name" = nsgenbind ]; then
-				# Built for the BUILD machine, so the host
-				# compiler and NO cross wrappers: this binary
-				# runs here, during netsurf's build, and would
-				# be useless as a LikeOS executable.
-				make -j"$(nproc)" \
-					PREFIX="$HOSTTOOLS" \
-					NSSHARED="$nsshared" &&
-					make install PREFIX="$HOSTTOOLS" \
-						NSSHARED="$nsshared"
-			elif [ "$name" = netsurf ]; then
-				# The browser, not a library.
-				#
-				# TARGET=framebuffer is the frontend that draws
-				# through libnsfb, whose X surface makes it an
-				# ordinary X client -- the GTK frontend would
-				# drag in GTK, which is not ported.
-				#
-				# JavaScript is ON.  The bindings between the
-				# bundled Duktape engine and the DOM are
-				# generated by nsgenbind, which is built just
-				# above for THIS machine and found on PATH.
-				PATH="$HOSTTOOLS/bin:$PATH" \
-				make TARGET=framebuffer -j"$(nproc)" \
-					PREFIX=/usr DESTDIR="$SYSROOT" \
-					NSSHARED="$nsshared" \
-					CC="$here/toolchain/likeos-cc" \
-					AR="ar" BUILD_CC=cc \
-					PKGCONFIG="$here/toolchain/likeos-pkg-config" \
-					PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
-					PATH="$HOSTTOOLS/bin:$PATH" \
-					make install TARGET=framebuffer \
-						PREFIX=/usr DESTDIR="$SYSROOT" \
-						NSSHARED="$nsshared" \
-						CC="$here/toolchain/likeos-cc" \
-						AR="ar" BUILD_CC=cc \
-						PKGCONFIG="$here/toolchain/likeos-pkg-config" \
-						PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
-					post_install "$name"
-			else
-				# Static libraries.  Nothing but netsurf links
-				# them, so a shared build would ship eleven
-				# libraries to the image for one consumer, and
-				# add eleven chances for a soname mismatch.
-				#
-				# CC/AR come from the command line so they win:
-				# Makefile.tools only assigns CC when its origin
-				# is `default`, and a command-line variable is
-				# never overridden by a makefile.
-				#
-				# PKGCONFIG is the name this build system uses --
-				# NOT PKG_CONFIG, which it ignores.  Its default
-				# is `PKG_CONFIG_PATH=$(PREFIX)/lib/pkgconfig
-				# pkg-config`, and PREFIX is /usr here, so the
-				# default asks the HOST about the HOST's
-				# libraries.  That does not fail loudly: feature
-				# detection just answers "no" and the component
-				# quietly builds without the feature.  It cost an
-				# entire libnsfb build -- every X surface was
-				# omitted because xcb-icccm and friends were
-				# looked for on the build machine.  Both spellings
-				# are passed so neither name can go stale.
-				make -j"$(nproc)" \
-					PREFIX=/usr DESTDIR="$SYSROOT" \
-					NSSHARED="$nsshared" \
-					COMPONENT_TYPE=lib-static \
-					CC="$here/toolchain/likeos-cc" \
-					AR="ar" \
-					PKGCONFIG="$here/toolchain/likeos-pkg-config" \
-					PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
-					make install \
-						PREFIX=/usr DESTDIR="$SYSROOT" \
-						NSSHARED="$nsshared" \
-						COMPONENT_TYPE=lib-static \
-						CC="$here/toolchain/likeos-cc" \
-						AR="ar" \
-						PKGCONFIG="$here/toolchain/likeos-pkg-config" \
-						PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
-					post_install "$name"
-			fi
 		) >"$log" 2>&1
 	elif [ "$name" = gcc ]; then
 		# Not GCC: only libstdc++-v3 out of its tree, which is an
@@ -1555,8 +1792,290 @@ build_one() {
 			}
 
 			make -j"$(nproc)" &&
+				make install DESTDIR="$SYSROOT" ||
+				exit 1
+
+			# libatomic, from the same tree and for the same reason
+			# libstdc++ is here: it is the piece of the C++ runtime
+			# that carries the 16-byte atomic operations
+			# (__atomic_load_16 and friends).  GCC outlines those
+			# into calls, WebKit's lock-free machinery does 128-bit
+			# compare-and-swap throughout, and its configure stops
+			# outright when neither the builtins nor -latomic can
+			# satisfy them.  A standalone autotools project like
+			# libstdc++-v3, and a far simpler one.
+			cd "$dir" || exit 1
+			rm -rf .likeos-atomic
+			mkdir -p .likeos-atomic
+			cd .likeos-atomic || exit 1
+			CC="$here/toolchain/likeos-cc" \
+				../libatomic/configure \
+				--host=x86_64-likeos-gnu \
+				--build="$(../config.guess)" \
+				--prefix=/usr --disable-multilib \
+				>/dev/null &&
+				make -j"$(nproc)" &&
 				make install DESTDIR="$SYSROOT" &&
 				post_install "$name"
+		) >"$log" 2>&1
+	elif [ "$name" = sqlite-autoconf ]; then
+		# SQLite's amalgamation moved from autoconf to autosetup, which
+		# looks like a configure script and is not one: it REFUSES any
+		# option it does not know (--cache-file was the first casualty),
+		# so likeos-autogen.sh's arrangement cannot drive it.  What it
+		# does share with autoconf is config.sub validation, under its
+		# own name in autosetup/ -- replaced here exactly as the autogen
+		# script replaces the autoconf copies.  The shared-object flags
+		# need no help: autosetup's defaults are the ELF/GNU ones and
+		# the platform switch only overrides them for systems this is
+		# not.
+		#
+		# --soname=legacy is NOT optional here, whatever the name
+		# suggests.  SQLite defaults to --soname=none on purpose
+		# (autosetup/sqlite-config.tcl: "this project has no direct use
+		# for soname"), and a shared library with no DT_SONAME poisons
+		# everything that links it: with no soname to record, the
+		# linker writes into DT_NEEDED whatever string it used to find
+		# the file.  For anything located by absolute path -- which is
+		# how CMake and meson pass libraries -- that is the BUILD HOST's
+		# path, baked into a target binary:
+		#
+		#   libwebkit2gtk-4.1.so.0: NEEDED /home/.../xorg-sysroot/usr/lib/libsqlite3.so
+		#
+		# On the target that path does not exist, the library cannot be
+		# loaded, and every symbol in it comes out undefined -- which is
+		# how luakit came to start with a hundred lines of "undefined
+		# symbol: webkit_*" and then jump to a null slot.  libsoup was
+		# hit the same way.  Consumers found through -lsqlite3 instead
+		# record the bare "libsqlite3.so", the unversioned development
+		# symlink, which is not staged onto the image either.
+		#
+		# "legacy" is upstream's name for libsqlite3.so.0, the soname
+		# every distribution ships and the one the sysroot's own
+		# symlink already points at.
+		(
+			cd "$dir" || exit 1
+			[ -f Makefile ] && make distclean >/dev/null 2>&1
+			cp -f "$here/toolchain/config.sub" \
+				autosetup/autosetup-config.sub
+			cp -f "$here/toolchain/config.guess" \
+				autosetup/autosetup-config.guess
+			CC="$here/toolchain/likeos-cc" \
+			CXX="$here/toolchain/likeos-c++" \
+			./configure --host=x86_64-unknown-likeos \
+				--build="$(gcc -dumpmachine)" \
+				--prefix=/usr --libdir=/usr/lib \
+				--soname=legacy \
+				--disable-static-shell &&
+			make -j"$(nproc)" &&
+			make install DESTDIR="$SYSROOT" &&
+			post_install "$name"
+		) >"$log" 2>&1
+	elif [ "$name" = icu ]; then
+		# ICU builds twice from one tree, exactly like GLib: the cross
+		# build packages its data library by RUNNING genrb/pkgdata, so
+		# a native copy of the tools is built first and named with
+		# --with-cross-build.  Its configure is autoconf but lives in
+		# source/, and the platform makefile fragment is chosen from a
+		# fixed list of host_os names -- an autoconf cache variable, so
+		# the answer is supplied rather than the list patched: mh-linux
+		# is upstream's fragment for a GNU toolchain producing ELF
+		# shared objects, which is exactly what the wrapper drives.
+		(
+			cd "$dir" || exit 1
+			if [ ! -x .likeos-host/bin/pkgdata ]; then
+				rm -rf .likeos-host
+				mkdir -p .likeos-host
+				( cd .likeos-host &&
+				  ../source/configure --prefix="$HOSTTOOLS" \
+					--disable-samples --disable-tests \
+					--enable-static --disable-shared \
+					>/dev/null &&
+				  make -j"$(nproc)" ) || exit 1
+			fi
+
+			# The tree's config.sub predates this system; the
+			# toolchain's copy knows the triple.  likeos-autogen.sh
+			# does the same for the ordinary autotools packages.
+			cp -f "$here/toolchain/config.sub" source/config.sub
+			cp -f "$here/toolchain/config.guess" source/config.guess
+
+			rm -rf .likeos-build
+			mkdir -p .likeos-build
+			cd .likeos-build || exit 1
+			CC="$here/toolchain/likeos-cc" \
+			CXX="$here/toolchain/likeos-c++" \
+			AR=ar RANLIB=ranlib \
+			icu_cv_host_frag=mh-linux \
+			../source/configure \
+				--host=x86_64-unknown-likeos \
+				--build="$(gcc -dumpmachine)" \
+				--prefix=/usr --libdir=/usr/lib \
+				--with-cross-build="$dir/.likeos-host" \
+				--disable-samples --disable-tests \
+				--disable-extras --disable-icuio \
+				--disable-layoutex \
+				--enable-shared --disable-static &&
+			make -j"$(nproc)" &&
+			make install DESTDIR="$SYSROOT" &&
+			post_install "$name"
+		) >"$log" 2>&1
+	elif [ "$name" = lua ]; then
+		# Lua 5.1, twice from one tree like GLib and ICU: the HOST
+		# interpreter runs luakit's code generators (gentokens.lua),
+		# the TARGET library is what luakit links -- plus the
+		# interpreter itself for the image, since a scriptable system
+		# might as well ship the language its browser embeds.
+		#
+		# `generic` with the POSIX and dlopen features named
+		# explicitly, because the platform targets are a hardcoded OS
+		# list this system is not on.  LUA_USE_DLOPEN is what lets
+		# require() load a C module -- LuaFileSystem below is one --
+		# and needs no -ldl here: dlopen lives in this libc.
+		(
+			cd "$dir" || exit 1
+			make clean >/dev/null 2>&1 || true
+			make -j"$(nproc)" generic \
+				MYCFLAGS="-DLUA_USE_POSIX -DLUA_USE_DLOPEN" &&
+			make install INSTALL_TOP="$HOSTTOOLS" || exit 1
+			make clean >/dev/null 2>&1 || true
+			# `all' in src/, NOT the `generic' target, and the
+			# reason is not style: src/Makefile's platform targets
+			# are all of the form
+			#
+			#     generic:
+			#             $(MAKE) all MYCFLAGS=
+			#
+			# so `generic' CLEARS MYCFLAGS in its recursive make.
+			# Every flag named here was silently discarded -- the
+			# interpreter was built with none of them, and said so
+			# only when a C module was finally required:
+			#
+			#     dynamic libraries not enabled; check your Lua
+			#     installation
+			#
+			# LUA_ROOT has to agree with INSTALL_TOP below.
+			# luaconf.h derives package.path and package.cpath from
+			# it and this port installs under /usr, so with
+			# upstream's /usr/local/ default require() searched
+			# /usr/local/lib/lua/5.1/ while LuaFileSystem sat in
+			# /usr/lib/lua/5.1/.  luakit stopped on its first line
+			# with "module 'lfs' not found" and a list of a dozen
+			# candidates, none of them where the file is.  The
+			# definition needs patch 0001 to be overridable at all:
+			# luaconf.h defines it unconditionally, so a -D on the
+			# command line loses to the header.
+			#
+			# The .lua list looks longer than the .so list only
+			# because luakit appends its own directories to
+			# package.path.  Nothing appends to cpath, so a C
+			# module is found through this default or not at all.
+			#
+			# -Wl,-E is what upstream's own `linux' target passes:
+			# it exports the interpreter's symbols so a dlopen'd C
+			# module can resolve lua_* against the binary that
+			# loaded it.  luakit does not rely on this (it links
+			# liblua itself and already passes --export-dynamic),
+			# but the standalone interpreter does.  No -ldl: dlopen
+			# is in this libc.
+			make -j"$(nproc)" -C src all \
+				CC="$here/toolchain/likeos-cc" \
+				AR="ar rcu" RANLIB=ranlib \
+				MYCFLAGS="-DLUA_USE_POSIX -DLUA_USE_DLOPEN -DLUA_ROOT='\"/usr/\"'" \
+				MYLIBS="-Wl,-E" &&
+			make install INSTALL_TOP="$SYSROOT/usr" \
+				INSTALL_MAN="$SYSROOT/usr/share/man/man1" || \
+				exit 1
+			# The package predates pkg-config manifests; luakit
+			# finds Lua through one, so it is written here.  The
+			# paths are target paths -- likeos-pkg-config prefixes
+			# the sysroot when answering.
+			mkdir -p "$SYSROOT/usr/lib/pkgconfig"
+			cat >"$SYSROOT/usr/lib/pkgconfig/lua-5.1.pc" <<'LUAPC'
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: Lua
+Description: An extensible embeddable scripting language
+Version: 5.1.5
+Libs: -L${libdir} -llua -lm
+Cflags: -I${includedir}
+LUAPC
+		) >"$log" 2>&1
+	elif [ "$name" = luafilesystem ]; then
+		# One C file compiled into the module directory Lua 5.1's
+		# require() searches (/usr/lib/lua/5.1).  Its references to the
+		# Lua API stay undefined in the .so and resolve from the
+		# embedding program, which is why luakit links with
+		# --export-dynamic -- the arrangement every Lua C module uses.
+		(
+			cd "$dir" || exit 1
+			"$here/toolchain/likeos-cc" -O2 -fPIC -shared \
+				-o lfs.so src/lfs.c &&
+			mkdir -p "$SYSROOT/usr/lib/lua/5.1" &&
+			cp -f lfs.so "$SYSROOT/usr/lib/lua/5.1/lfs.so" &&
+			post_install "$name"
+		) >"$log" 2>&1
+	elif [ "$name" = luakit ]; then
+		# Plain make, with everything its config.mk would otherwise
+		# probe stated on the command line: the cross compiler, the
+		# confined pkg-config, the port's host Lua for the generators,
+		# and USE_LUAJIT=0 so nothing goes looking for a JIT.
+		#
+		# VERSION is stated for the same reason.  config.mk derives it
+		# by asking git, and falls back to a commit hash that `git
+		# archive' substituted into build-utils/getversion.sh -- which
+		# is what a tag export like this tarball carries.  The version
+		# goes into -DVERSION, into `luakit --version', and into the
+		# manual page; a hash there says nothing a reader can match
+		# against the manifest, which names the release.  Taken from
+		# the source directory's own suffix, which unpack.sh named
+		# from that manifest line.
+		(
+			cd "$dir" || exit 1
+			PATH="$HOSTTOOLS/bin:$PATH"
+			export PATH
+			ver=${dir##*-}
+
+			# `make clean' needs the SAME variables as the build,
+			# and it has to run after PATH is set.  config.mk
+			# probes for the Lua binary before it will do anything
+			# at all -- clean included -- and with none of this
+			# stated it stops with
+			#
+			#   config.mk:91: *** Cannot find the Lua binary name.
+			#
+			# which `|| true' then swallowed.  Nothing was cleaned,
+			# make found the binary newer than its prerequisites
+			# and relinked nothing, and `install' shipped a stale
+			# luakit.  That is how a rebuilt libsqlite3 left luakit
+			# still naming the old unversioned soname while every
+			# other consumer had been corrected.
+			make clean \
+				CC="$here/toolchain/likeos-cc" \
+				PKG_CONFIG="$here/toolchain/likeos-pkg-config" \
+				LUA_PKG_NAME=lua-5.1 LUA_BIN_NAME=lua \
+				USE_LUAJIT=0 DEVELOPMENT_PATHS=0 \
+				VERSION="$ver" \
+				PREFIX=/usr XDGPREFIX=/etc/xdg \
+				>/dev/null 2>&1 || true
+			make -j"$(nproc)" \
+				CC="$here/toolchain/likeos-cc" \
+				PKG_CONFIG="$here/toolchain/likeos-pkg-config" \
+				LUA_PKG_NAME=lua-5.1 LUA_BIN_NAME=lua \
+				USE_LUAJIT=0 DEVELOPMENT_PATHS=0 \
+				VERSION="$ver" \
+				PREFIX=/usr XDGPREFIX=/etc/xdg &&
+			make install DESTDIR="$SYSROOT" \
+				CC="$here/toolchain/likeos-cc" \
+				PKG_CONFIG="$here/toolchain/likeos-pkg-config" \
+				LUA_PKG_NAME=lua-5.1 LUA_BIN_NAME=lua \
+				USE_LUAJIT=0 DEVELOPMENT_PATHS=0 \
+				VERSION="$ver" \
+				PREFIX=/usr XDGPREFIX=/etc/xdg &&
+			post_install "$name"
 		) >"$log" 2>&1
 	elif is_hosttool "$name"; then
 		# For THIS machine: the host compiler, the host's own headers,
@@ -1593,6 +2112,69 @@ build_one() {
 			make -j"$(nproc)" $(plainmake_args "$name") &&
 				make install DESTDIR="$SYSROOT" PREFIX=/usr \
 					$(plainmake_install_args "$name") &&
+				post_install "$name"
+		) >"$log" 2>&1
+	elif [ "$name" = llvm ]; then
+		# LLVM for llvmpipe: the JIT runs inside TARGET processes, so
+		# the library is cross-compiled like everything else.  Two
+		# stages: a native tree that exists only to provide runnable
+		# tblgen (and a native llvm-config for the mesa wrapper to
+		# delegate to), then the target build -- LLVM only, X86
+		# backend only, one shared libLLVM, RTTI on because mesa
+		# subclasses LLVM types.  Link jobs pinned to 1: the dylib
+		# link peaks at several GB.
+		(
+			cd "$dir" || exit 1
+			if [ ! -x .likeos-native/bin/llvm-tblgen ] ||
+				[ ! -x .likeos-native/bin/llvm-config ]; then
+				cmake -S llvm -B .likeos-native -G Ninja \
+					-DCMAKE_BUILD_TYPE=Release \
+					-DLLVM_TARGETS_TO_BUILD=X86 \
+					-DLLVM_INCLUDE_TESTS=OFF \
+					-DLLVM_INCLUDE_BENCHMARKS=OFF \
+					-DLLVM_INCLUDE_EXAMPLES=OFF \
+					-DLLVM_INCLUDE_DOCS=OFF &&
+					ninja -C .likeos-native \
+						llvm-tblgen llvm-min-tblgen \
+						llvm-config || exit 1
+			fi
+			memkb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+			jobs=$((memkb / (1536 * 1024)))
+			[ "$jobs" -lt 1 ] && jobs=1
+			[ "$jobs" -gt "$(nproc)" ] && jobs=$(nproc)
+			echo "llvm: $jobs compile job(s)" >&2
+			if [ ! -f .likeos-build/build.ninja ]; then
+				rm -rf .likeos-build
+				LIKEOS_TOOLCHAIN="$here/toolchain" \
+				cmake -S llvm -B .likeos-build -G Ninja \
+					-DCMAKE_TOOLCHAIN_FILE="$here/toolchain/likeos-toolchain.cmake" \
+					-DCMAKE_INSTALL_PREFIX=/usr \
+					-DCMAKE_BUILD_TYPE=Release \
+					-DLLVM_TARGETS_TO_BUILD=X86 \
+					-DLLVM_HOST_TRIPLE=x86_64-likeos-gnu \
+					-DLLVM_TABLEGEN="$PWD/.likeos-native/bin/llvm-tblgen" \
+					-DLLVM_NATIVE_TOOL_DIR="$PWD/.likeos-native/bin" \
+					-DLLVM_BUILD_LLVM_DYLIB=ON \
+					-DLLVM_LINK_LLVM_DYLIB=ON \
+					-DLLVM_ENABLE_RTTI=ON \
+					-DLLVM_ENABLE_THREADS=ON \
+					-DLLVM_ENABLE_ZLIB=OFF \
+					-DLLVM_ENABLE_ZSTD=OFF \
+					-DLLVM_ENABLE_LIBXML2=OFF \
+					-DLLVM_ENABLE_LIBEDIT=OFF \
+					-DLLVM_ENABLE_LIBPFM=OFF \
+					-DLLVM_ENABLE_OCAMLDOC=OFF \
+					-DLLVM_ENABLE_BINDINGS=OFF \
+					-DLLVM_INCLUDE_TESTS=OFF \
+					-DLLVM_INCLUDE_BENCHMARKS=OFF \
+					-DLLVM_INCLUDE_EXAMPLES=OFF \
+					-DLLVM_INCLUDE_DOCS=OFF \
+					-DLLVM_INCLUDE_UTILS=OFF \
+					-DLLVM_BUILD_TOOLS=OFF \
+					-DLLVM_PARALLEL_LINK_JOBS=1 || exit 1
+			fi
+			ninja -C .likeos-build -j"$jobs" &&
+				DESTDIR="$SYSROOT" ninja -C .likeos-build install &&
 				post_install "$name"
 		) >"$log" 2>&1
 	elif prefers_meson "$name" || is_meson "$name" "$dir"; then

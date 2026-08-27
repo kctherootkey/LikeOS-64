@@ -236,7 +236,7 @@ static char *rtld_strcat(char *d, const char *s)
 	return r;
 }
 
-static void rtld_die(const char *msg)
+__attribute__((noreturn)) static void rtld_die(const char *msg)
 {
 	rtld_write_str("ld-likeos.so: fatal: ");
 	rtld_write_str(msg);
@@ -368,6 +368,9 @@ typedef struct dso {
 	uint64_t tls_align;
 	int tls_modid;
 	int64_t tls_offset;
+	/* dlopen'd object whose TLS slice is still to be filled from the
+	 * (now relocated) image -- see rtld_assign_tls / rtld_dlopen. */
+	int tls_needs_init;
 
 	/* Flags */
 	int relocated;
@@ -863,8 +866,38 @@ static void rtld_apply_relocs(dso_t *d, const Elf64_Rela *rel, size_t sz)
 				break;
 			}
 			{
+				/* Resolve the symbol, exactly as DTPMOD64 just
+				 * above and TPOFF64 just below both do.  The
+				 * offset wanted here is the variable's place
+				 * inside the TLS block of whichever object
+				 * DEFINES it -- and when the reference is to
+				 * another library's variable, this object's
+				 * own entry for it is UND with st_value 0.
+				 *
+				 * Reading st_value straight out of d->symtab
+				 * therefore yielded 0 for every cross-object
+				 * general-dynamic access, silently: the pair
+				 * (module, offset) named the right module and
+				 * the wrong slot, so a write landed at the
+				 * front of that module's block and the owning
+				 * library read its variable back as zero.
+				 *
+				 * WebKit hit this on std::__once_call, which
+				 * libstdc++ places at offset 0x10.  WebKit's
+				 * webkitInitialize() stores its lambda there
+				 * through __tls_get_addr and calls
+				 * pthread_once(&flag, __once_proxy); the proxy
+				 * reads __once_call back from 0x10, found the
+				 * zero this left, and tail-jumped to it.  Both
+				 * luakit and Claws Mail died at RIP=0 with
+				 * pthread_once's return address on the stack
+				 * and nothing to say why. */
 				const Elf64_Sym *sym = &d->symtab[sidx];
-				*tgt = sym->st_value + rel[i].r_addend;
+				sym_result_t sr = rtld_lookup_symbol(
+					d->strtab + sym->st_name, NULL);
+				uint64_t sv = sr.sym ? sr.sym->st_value :
+						       sym->st_value;
+				*tgt = sv + rel[i].r_addend;
 			}
 			break;
 
@@ -965,13 +998,18 @@ static void rtld_assign_tls(dso_t *d)
 	d->tls_offset = -(int64_t)g_tls_static_size; /* variant-II */
 
 	/* Already-running threads have a block whose images were copied at
-	 * creation, so a late arrival must initialise its own slice here. */
+	 * creation, so a late arrival must initialise its own slice.  Zero it
+	 * now, but do NOT copy the image yet: this runs at load time, before
+	 * the object is relocated, and a TLS initialiser can carry a dynamic
+	 * relocation of its own -- Mesa's libGL starts its per-thread context
+	 * pointer at `&dummyContext', which is an R_X86_64_RELATIVE into
+	 * .tdata.  Copied here, the slice held the link-time address, every
+	 * glX call compared it against the relocated one, missed, and
+	 * dereferenced it (GTK's first GL context creation took luakit down).
+	 * The copy is made in rtld_dlopen() once the relocation pass is over. */
 	if (g_tls_initialised && g_tls_tp) {
-		uint8_t *dst = g_tls_tp + d->tls_offset;
-		rtld_memset(dst, 0, d->tls_memsz);
-		if (d->tls_filesz && d->tls_image)
-			rtld_memcpy(dst, (const void *)d->tls_image,
-				    d->tls_filesz);
+		rtld_memset(g_tls_tp + d->tls_offset, 0, d->tls_memsz);
+		d->tls_needs_init = 1;
 	}
 }
 
@@ -1047,7 +1085,22 @@ void *__tls_get_addr(tls_index_t *ti)
 		if (g_dsos[i].tls_modid == (int)ti->ti_module)
 			return (void *)(tp + g_dsos[i].tls_offset +
 					ti->ti_offset);
-	return NULL;
+
+	/* No module with that id.  Returning NULL here is the worst possible
+	 * answer: the caller has asked "where is this thread's copy of that
+	 * variable", and a null address is not a diagnosis, it is a booby
+	 * trap.  The read or write lands at a low address and the failure
+	 * surfaces somewhere else entirely -- and when the variable happens to
+	 * hold a function pointer, as libstdc++'s std::__once_call does, the
+	 * program does not fault on the access at all: it reads a zero and
+	 * jumps to it, arriving at RIP=0 with nothing on the stack to say
+	 * which variable was never allocated.
+	 *
+	 * Say what happened instead.  There is no correct value to return, so
+	 * this does not return. */
+	rtld_write_str("ld-likeos.so: __tls_get_addr: no TLS block for "
+		       "module id\n");
+	rtld_die("unallocated TLS module");
 }
 
 /* ================================================================== */
@@ -1218,6 +1271,26 @@ static int rtld_pread(int fd, void *buf, size_t n, long off)
 	return 0;
 }
 
+/* Upper bound on a shared library, as a sanity check only: it rejects a file
+ * that cannot be an ELF object before any of it is trusted.  It is NOT a
+ * statement about how much can be mapped -- segments are mapped straight from
+ * the file and paged in on demand, so a large library costs address space, not
+ * memory.
+ *
+ * This was 64 MB, and that was too small for a real one.  libwebkit2gtk-4.1 is
+ * 92,113,008 bytes, so every load of it failed here, before the ELF magic was
+ * even checked.  The failure is quiet in the worst way: the library is simply
+ * never mapped, and the first sign is a screen of "undefined symbol: webkit_*"
+ * from the relocation pass, followed by a jump to a null PLT slot and a SIGSEGV
+ * at RIP 0.  Nothing names the library that was skipped.
+ *
+ * One gigabyte instead.  Nothing legitimate approaches it -- the next largest
+ * object in this system is libicudata at 33 MB -- while an unstripped or
+ * debug-built engine has room to grow.  The value only has to be absurd, not
+ * tight; e_type and the ELF magic are what actually decide validity, a few
+ * lines below. */
+#define RTLD_MAX_LIBRARY_SIZE (1024L * 1024 * 1024)
+
 static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 {
 	int fd = rtld_open(path, O_RDONLY);
@@ -1230,7 +1303,7 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 	 * text costs neither disk reads nor memory until it is executed. */
 	long file_size = rtld_lseek(fd, 0, SEEK_END);
 	if (file_size <= (long)sizeof(Elf64_Ehdr) ||
-	    file_size > 64 * 1024 * 1024)
+	    file_size > RTLD_MAX_LIBRARY_SIZE)
 		goto fail;
 
 	Elf64_Ehdr ehdr_buf;
@@ -1742,8 +1815,22 @@ void *_rtld_dlopen(const char *filename, int flags)
 	/* Lock down RELRO for anything newly relocated (see the startup path). */
 	for (int i = 0; i < g_ndsos; i++)
 		rtld_protect_relro(&g_dsos[i]);
-	/* No-op after the first call; a dlopen'd object's slice is initialised
-	 * in rtld_assign_tls() as it is assigned out of the surplus. */
+	/* Now that the images are relocated, fill the TLS slice of every
+	 * newly assigned object in THIS thread's block (rtld_assign_tls zeroed
+	 * it and deferred the copy -- see there).  Before the constructors:
+	 * those may already read __thread variables. */
+	if (g_tls_tp)
+		for (int i = 0; i < g_ndsos; i++) {
+			dso_t *d = &g_dsos[i];
+			if (!d->tls_needs_init)
+				continue;
+			d->tls_needs_init = 0;
+			if (d->tls_memsz && d->tls_filesz && d->tls_image)
+				rtld_memcpy(g_tls_tp + d->tls_offset,
+					    (const void *)d->tls_image,
+					    d->tls_filesz);
+		}
+	/* No-op after the first call (the startup path lays the block out). */
 	rtld_init_tls();
 	for (int i = g_ndsos - 1; i >= 0; i--)
 		rtld_init_dso(&g_dsos[i]);
@@ -2167,8 +2254,19 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 			if (e->d_tag == DT_NEEDED) {
 				const char *need =
 					main_dso->strtab + e->d_un.d_val;
+				/* Report a failure here exactly as the
+				 * recursive loader does.  This return value
+				 * used to be discarded, so a library the MAIN
+				 * program depends on could fail to load and
+				 * say nothing at all: the run then died in the
+				 * relocation pass with a screen of "undefined
+				 * symbol", none of which named the library
+				 * that was missing.  That is how an
+				 * over-tight size cap on libwebkit2gtk hid
+				 * itself. */
 				if (!rtld_find_dso(need))
-					rtld_load_library(need);
+					if (!rtld_load_library(need))
+						rtld_report_missing(need);
 			}
 
 	/* ---- Relocate (dependencies first) ---- */

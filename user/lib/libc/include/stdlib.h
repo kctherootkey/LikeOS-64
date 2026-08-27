@@ -6,6 +6,10 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+/* alloca() is available after <stdlib.h>, as it is on the BSDs and on
+ * GNU systems: decades of ported code (Mesa's c99_alloca.h among them)
+ * relies on exactly that and never includes <alloca.h> itself. */
+#include <alloca.h>
 
 /* Environment storage limits.
  * MAX_ENV_SIZE is the cap for ONE "NAME" or "value" string.  It was 4096,

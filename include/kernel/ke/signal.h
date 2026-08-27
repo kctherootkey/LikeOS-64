@@ -440,6 +440,20 @@ typedef struct signal_frame {
 	// Saved signal mask
 	kernel_sigset_t saved_mask;
 
+	/* FXSAVE image of the interrupted context.
+	 *
+	 * The x87/SSE registers are caller-saved in the ABI, and a signal
+	 * handler is a caller that the interrupted code never made: the first
+	 * SSE-using libc call inside the handler clobbers XMM registers the
+	 * interrupted computation still owns.  Restoring only the integer
+	 * registers at sigreturn resumed that computation with someone else's
+	 * floating-point state -- observed as JavaScript engines dereferencing
+	 * NaN-boxed doubles whose bits had changed mid-interpretation, and as
+	 * heap corruption from pointers computed off corrupted values.  Every
+	 * POSIX kernel carries the FP state in the signal frame for exactly
+	 * this reason. */
+	uint8_t fpu[512];
+
 	// Sigreturn trampoline code (if needed)
 	uint8_t retcode[16];
 } __attribute__((packed)) signal_frame_t;

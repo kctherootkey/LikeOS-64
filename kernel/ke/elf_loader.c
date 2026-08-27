@@ -761,6 +761,7 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 	t->brk_start = lr.brk_start;
 	t->brk = lr.brk_start;
 	t->user_stack_top = USER_STACK_TOP;
+	t->user_stack_size = USER_STACK_SIZE;
 	t->mmap_base = USER_STACK_TOP - (4 * 1024 * 1024);
 
 	/* Register the loader's lazy ranges: anonymous BSS (zero-filled on
@@ -949,6 +950,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	cur->brk_start = lr.brk_start;
 	cur->brk = lr.brk_start;
 	cur->user_stack_top = USER_STACK_TOP_EXEC;
+	cur->user_stack_size = USER_STACK_SIZE_EXEC;
 	/* Clear stale mmap_region slots inherited from parent via fork+exec,
 	 * releasing any file references pinned for demand paging.
 	 *
