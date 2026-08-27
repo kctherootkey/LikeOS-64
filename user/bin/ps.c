@@ -224,6 +224,7 @@ static int opt_bsd_v = 0; /* BSD v (virtual memory format)   */
 static int opt_custom_fmt = 0; /* -o was given                    */
 
 /* Modifiers */
+static int opt_threads = 0; /* -L/-T: one row per thread, not per process */
 static int opt_forest = 0; /* --forest / BSD f / -H           */
 static int opt_no_header = 0; /* BSD h / --no-headers             */
 static int opt_show_header = 1; /* --headers (default)              */
@@ -1274,6 +1275,7 @@ static void print_help(void)
 	       "  r                only running processes\n"
 	       "  T                all processes on this terminal\n"
 	       "  -N               negate selection\n"
+	       "  -L, -T           show threads (one row per thread)\n"
 	       "\n"
 	       "Selection by list:\n"
 	       "  -p, --pid PID    select by PID\n"
@@ -1467,7 +1469,7 @@ static int parse_unix_opts(int argc, char **argv)
 	optind = 1;
 	int c;
 	while ((c = getopt_long(argc, argv,
-				"eAadfFlp:C:G:g:u:U:s:t:o:O:Hwq:Nk:", long_opts,
+				"eAadfFlp:C:G:g:u:U:s:t:o:O:HwLTq:Nk:", long_opts,
 				NULL)) != -1) {
 		switch (c) {
 		case 'e':
@@ -1476,6 +1478,10 @@ static int parse_unix_opts(int argc, char **argv)
 			break;
 		case 'a':
 			opt_all_tty = 1;
+			break;
+		case 'L':
+		case 'T':
+			opt_threads = 1;
 			break;
 		case 'd':
 			opt_all_tty = 1;
@@ -1661,6 +1667,11 @@ int main(int argc, char **argv)
 		free(all);
 		return 1;
 	}
+
+	/* One row per process unless threads were asked for: the kernel
+	 * reports every thread as its own task. */
+	if (!opt_threads)
+		total = procinfo_fold_threads(all, total);
 
 	/* Discover my own session & tty */
 	for (int i = 0; i < total; i++) {

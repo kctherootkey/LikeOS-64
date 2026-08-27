@@ -14,7 +14,13 @@
 #
 # Sizes are one point larger than upstream's 9, which is chosen for displays
 # considerably denser than the ones this runs on.
+#
+# The block label is not decoration: prefs_read_config() in src/prefs_gtk.c
+# skips everything up to the "[Common]" line and stops at the next '[', so a
+# key placed outside that block is never read at all.  Every setting below,
+# up to the plugin block, must stay inside it.
 
+[Common]
 message_font_gtk2=DejaVu Sans Mono 10
 print_font_gtk2=DejaVu Sans Mono 10
 small_font_gtk2=DejaVu Sans 9

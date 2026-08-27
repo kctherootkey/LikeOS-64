@@ -89,6 +89,12 @@ int getprocmaps(int pid, procmapinfo_t *info, procmap_t *buf, int max);
  * Returns:   number of entries filled, or -1 on error (errno set) */
 int getprocinfo(procinfo_t* buf, int max_count);
 
+/* Reduce a getprocinfo() listing to one record per process: every thread
+ * (pid != tgid) is folded into its thread-group leader, whose utime/stime
+ * become the group's total and whose state becomes running if any thread
+ * is.  In place; returns the new count.  Skip it to list threads. */
+int procinfo_fold_threads(procinfo_t *buf, int n);
+
 #ifdef __cplusplus
 }
 #endif

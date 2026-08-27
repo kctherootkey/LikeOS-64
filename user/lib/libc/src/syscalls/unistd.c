@@ -1,3 +1,4 @@
+#include <sys/procinfo.h>
 #include <unistd.h>
 #include <stdio.h>    /* snprintf: fchdir builds a /dev/fd path */
 #include <errno.h>
@@ -1239,7 +1240,7 @@ int reboot(int cmd)
 	return 0;
 }
 
-int getprocmaps(int pid, void *info, void *buf, int max)
+int getprocmaps(int pid, procmapinfo_t *info, procmap_t *buf, int max)
 {
 	long ret = syscall4(SYS_GETPROCMAPS, (long)pid, (long)info, (long)buf,
 			    (long)max);
@@ -1250,7 +1251,7 @@ int getprocmaps(int pid, void *info, void *buf, int max)
 	return (int)ret;
 }
 
-int getprocinfo(void *buf, int max_count)
+int getprocinfo(procinfo_t *buf, int max_count)
 {
 	long ret = syscall2(SYS_GETPROCINFO, (long)buf, (long)max_count);
 	if (ret < 0) {
@@ -1258,6 +1259,70 @@ int getprocinfo(void *buf, int max_count)
 		return -1;
 	}
 	return (int)ret;
+}
+
+/* Fold the threads of a getprocinfo() listing into their processes.
+ *
+ * The kernel schedules threads, not processes, and reports one record per
+ * task: a browser with forty threads comes back as forty records that share
+ * a tgid and differ only in pid, state and CPU time.  A process listing
+ * wants one row per process, which on any conventional Unix means the
+ * thread-group leader -- the task whose pid equals its tgid -- carrying the
+ * sum of the group's CPU time.  This does that in place and returns the new
+ * count; records are moved, never reallocated.
+ *
+ * A group whose leader is missing from the listing (the leader can be gone
+ * while its threads finish) is represented by its first member instead, so
+ * the process still shows up exactly once.  Per-task fields that are not
+ * additive -- the state -- take the "most alive" value: a process with any
+ * runnable thread is running, whatever its leader is doing. */
+int procinfo_fold_threads(procinfo_t *buf, int n)
+{
+	int out = 0;
+
+	for (int i = 0; i < n; i++) {
+		procinfo_t *t = &buf[i];
+
+		if (t->pid == t->tgid) {
+			/* Leader: it stays.  Everything already folded into
+			 * a stand-in representative for this group (a member
+			 * that came before it) is moved over. */
+			for (int j = 0; j < out; j++) {
+				if (buf[j].tgid == t->tgid) {
+					t->utime_ticks += buf[j].utime_ticks;
+					t->stime_ticks += buf[j].stime_ticks;
+					if (buf[j].state <= 1 && t->state > 1)
+						t->state = buf[j].state;
+					buf[j] = *t;
+					t = &buf[j];
+					goto folded;
+				}
+			}
+			if (out != i)
+				buf[out] = *t;
+			out++;
+			continue;
+		}
+
+		/* Thread: add to its group's row if one exists ... */
+		for (int j = 0; j < out; j++) {
+			procinfo_t *r = &buf[j];
+			if (r->tgid != t->tgid)
+				continue;
+			r->utime_ticks += t->utime_ticks;
+			r->stime_ticks += t->stime_ticks;
+			if (t->state <= 1 && r->state > 1)
+				r->state = t->state;
+			goto folded;
+		}
+		/* ... otherwise it becomes the stand-in. */
+		if (out != i)
+			buf[out] = *t;
+		out++;
+folded:
+		;
+	}
+	return out;
 }
 
 int sysinfo(struct sysinfo *info)

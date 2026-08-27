@@ -644,6 +644,11 @@ static void collect_processes(void)
 		cleanup_and_exit(1);
 	}
 
+	/* The kernel lists every thread as a task of its own; unless the
+	 * threads view is on, fold them into their processes. */
+	if (!opt_threads)
+		n = procinfo_fold_threads(g_raw, n);
+
 	/* Swap previous and current */
 	if (g_prev_procs)
 		free(g_prev_procs);
@@ -1095,7 +1100,7 @@ static void format_field_value(const proc_entry_t *pe, int field_id, char *buf,
 		break;
 	case FLD_COMMAND:
 		if (pe->info.is_kernel) {
-			/* Kernel threads shown in brackets like Linux */
+			/* Kernel threads shown in brackets, the conventional way */
 			if (pe->info.comm[0])
 				snprintf(buf, bufsz, "[%s]", pe->info.comm);
 			else
