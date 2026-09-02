@@ -107,7 +107,8 @@ chmod 4755 "$DEST/usr/bin/Xorg"
 # Listed by name rather than copied wholesale, because the sysroot's bin/ also
 # holds build tooling (ucs2any, bdftruncate) and host-side diagnostics.
 for b in startx xinit xauth xsetroot xterm uxterm resize ctwm \
-	 xset xrandr xclock xload xcalc xnedit xnc twm; do
+	 xset xrandr xclock xload xcalc xnedit xnc twm \
+	 modetest vbltest proptest; do
 	[ -f "$SYSROOT/usr/bin/$b" ] && cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 done
 
@@ -221,8 +222,36 @@ done
 if [ -f "$SYSROOT/etc/fonts/fonts.conf" ]; then
 	mkdir -p "$DEST/etc/fonts"
 	cp "$SYSROOT/etc/fonts/fonts.conf" "$DEST/etc/fonts/fonts.conf"
-	[ -d "$SYSROOT/etc/fonts/conf.d" ] &&
-		cp -a "$SYSROOT/etc/fonts/conf.d" "$DEST/etc/fonts/conf.d"
+	# -L, and it matters: upstream ships conf.d as SYMLINKS into
+	# /usr/share/fontconfig/conf.avail, and `cp -a' copied the links
+	# rather than what they point at.  Every one of the 22 rule files on
+	# the image was therefore dangling, and fontconfig ran with no rules
+	# at all -- no 45-latin to bind DejaVu Sans to the sans-serif generic,
+	# no 30-metric-aliases to turn Arial into Liberation Sans, and no
+	# 70-no-bitmaps, which left the fixed-width X11 PCF fonts staged above
+	# as legitimate matches for any family a page names.  A web page whose
+	# CSS asks for a font that is not installed -- which is nearly every
+	# page, since they name Helvetica or Roboto -- was then rendered in a
+	# MONOSPACE font, with the layout that follows from it: text wider than
+	# the boxes drawn for it, overflowing backgrounds, and links whose
+	# clickable area no longer matches where the words appear.
+	#
+	# GTK programs were unaffected, which is what made this hard to see:
+	# Pango asks for "DejaVu Sans" by its exact name from settings.ini and
+	# needs no rules to find it.
+	if [ -d "$SYSROOT/etc/fonts/conf.d" ]; then
+		mkdir -p "$DEST/etc/fonts/conf.d"
+		cp -RL "$SYSROOT/etc/fonts/conf.d/." "$DEST/etc/fonts/conf.d/"
+	fi
+	# The library those links were drawn from.  Not needed now that the
+	# rules above are real files, but it is what makes the convention
+	# usable on the image: enabling another rule is a symlink into here,
+	# exactly as it is on any other system.
+	if [ -d "$SYSROOT/usr/share/fontconfig/conf.avail" ]; then
+		mkdir -p "$DEST/usr/share/fontconfig"
+		cp -a "$SYSROOT/usr/share/fontconfig/conf.avail" \
+			"$DEST/usr/share/fontconfig/"
+	fi
 	# fonts.conf names this cache directory.  Created here because
 	# fontconfig cannot create it itself, and without it every client
 	# rescans every font directory at startup.
@@ -240,6 +269,11 @@ fi
 # Configuration.
 # ---------------------------------------------------------------------------
 cp "$root/res/xorg/xorg.conf" "$DEST/etc/X11/xorg.conf"
+
+# The second configuration: the display-manager one, picked by xserverrc when
+# /dev/dri/card0 exists.  Both are always installed -- which one runs is a
+# question about the machine that booted the image, not about the image.
+cp "$root/res/xorg/xorg.conf.modesetting" "$DEST/etc/X11/xorg.conf.modesetting"
 
 # ---------------------------------------------------------------------------
 # Drop debug information.

@@ -336,13 +336,16 @@ long fbdev_write(uint64_t pos, const void *user_buf, long bytes)
 	smap_disable();
 	kmemcpy(base + pos, user_buf, (size_t)bytes);
 	smap_enable();
-	// Tell the SVGA host about the touched scanlines.
-	if (vmsvga2_active() && bytes > 0 && fi.pixels_per_scanline) {
+	/* Announce the touched scanlines.  Through the flush hook rather than
+	 * to the SVGA driver by name: where a display-manager driver has the
+	 * screen, the console's framebuffer is a buffer object it scans out
+	 * and the hook is what reaches it -- calling the framebuffer driver
+	 * directly would update a display nobody is looking at. */
+	if (bytes > 0 && fi.pixels_per_scanline) {
 		uint32_t pitch = fi.pixels_per_scanline * fi.bytes_per_pixel;
 		uint32_t y0 = (uint32_t)(pos / pitch);
 		uint32_t y1 = (uint32_t)((pos + (uint64_t)bytes - 1) / pitch);
-		vmsvga2_update_rect(0, y0, fi.horizontal_resolution,
-				    y1 - y0 + 1);
+		fb_flush_rect(0, y0, fi.horizontal_resolution, y1 - y0 + 1);
 	}
 	return bytes;
 }

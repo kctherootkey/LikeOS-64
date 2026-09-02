@@ -1,0 +1,98 @@
+MODETEST(1)                      User Commands                     MODETEST(1)
+
+NAME
+       modetest - list and exercise the display manager's mode-setting objects
+
+SYNOPSIS
+       modetest [options]
+
+DESCRIPTION
+       modetest  talks to the kernel's display manager through /dev/dri/card0,
+       prints the mode-setting objects it finds there -- connectors, encoders,
+       CRTCs, planes, framebuffers and their properties -- and can drive them:
+       set a mode, put a test pattern on the screen, move a  hardware  cursor,
+       flip pages in step with the vertical blank.
+
+       With  no options it dumps everything it can read, which needs no privi-
+       lege beyond opening the node.  The test options do need the node's mas-
+       ter rights, which means nothing else may hold them -- run these from  a
+       text  console, not from inside an X session, or the mode set fails with
+       EACCES.
+
+       On this system the display manager is the kernel's vmwgfx driver, which
+       binds to the VMware SVGA II / SVGA3D device.  Where there  is  no  such
+       device there is no /dev/dri at all and this program has nothing to talk
+       to; see drminfo(1), which says so in as many words.
+
+OPTIONS
+   Query options
+       -c     List connectors and their modes.
+
+       -e     List encoders.
+
+       -f     List framebuffers.
+
+       -p     List CRTCs and planes.
+
+   Test options
+       -s connector_id[,connector_id][@crtc_id]:mode[@format]
+              Set  a mode on the given connectors.  The mode may be written as
+              widthxheight[-vrefresh],      as       a       full       timing
+              (hdisp,hss,hse,htot,vdisp,vss,vse,vtot-vrefresh),  or  as #index
+              to pick the connector's n-th mode.  A test pattern is drawn into
+              a buffer of the given pixel format and scanned out.
+
+       -P plane_id@crtc_id:widthxheight[+x+y][*scale][@format]
+              Put a test pattern on the given plane.
+
+       -C     Exercise the hardware cursor.
+
+       -v     Flip pages in step with the vertical blank, and report the  rate
+              achieved.   This  is the direct measurement of whether vertical-
+              blank events arrive; on this system they are  generated  by  the
+              kernel at 60 Hz.
+
+       -r     Set each connector's preferred mode.
+
+       -w object_id:property_name:value
+              Set one property on one object.
+
+       -a     Use the atomic interface rather than the legacy calls.
+
+       -F pattern[,pattern]
+              Choose the fill patterns for the test buffers.
+
+       -o path
+              Write a writeback connector's output buffer to a file.
+
+   Generic options
+       -d     Drop  master  rights after the mode set, so that another program
+              can take them.
+
+       -D device
+              Open the given device node instead of searching.
+
+       -M module
+              Open the node  belonging  to  the  named  driver,  for  instance
+              vmwgfx.
+
+EXAMPLES
+       Dump everything the display manager exposes:
+
+              modetest
+
+       Set the first connector's preferred mode and paint a test pattern:
+
+              modetest -M vmwgfx -s 32:1920x1080
+
+       Measure page flips against the vertical blank:
+
+              modetest -M vmwgfx -v -s 32:1920x1080
+
+EXIT STATUS
+       Zero when every requested operation succeeded, non-zero otherwise.
+
+SEE ALSO
+       drminfo(1), vbltest(1), proptest(1), Xorg(1)
+
+libdrm 2.4.124                    August 2026                      MODETEST(1)

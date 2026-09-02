@@ -278,7 +278,8 @@ void futex_init(void)
 	futex_initialized = true;
 }
 
-int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
+static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
+			     uint64_t timeout_ns, uint32_t bitset)
 {
 	might_sleep();
 	if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
@@ -316,7 +317,7 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
 	waiter->uaddr = uaddr;
 	waiter->key = key;
 	waiter->task = cur;
-	waiter->bitset = 0xFFFFFFFF; // Default bitset
+	waiter->bitset = bitset; /* FUTEX_BITSET_MATCH_ANY for plain waits */
 	waiter->removed_by_wake = false;
 
 	// Add to wait queue
@@ -339,13 +340,31 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
 	waiter->next = bucket->head;
 	bucket->head = waiter;
 
-	// Block the task
-	cur->state = TASK_BLOCKED;
-	WARN_ON(cur->on_rq); /* task is still on runqueue when going BLOCKED in futex_wait */
+	/* Say WHERE this task sleeps before saying THAT it is asleep.
+	 *
+	 * TASK_BLOCKED is the thing that makes a task claimable: every waker,
+	 * on every processor, CAS's BLOCKED -> READY and enqueues, and each
+	 * finds its target through one of the two fields set below --
+	 * sched_wake_channel() matches `wait_channel', the timer's
+	 * expired-sleeper scan matches `wakeup_tick'.  Neither takes this
+	 * bucket's lock, so holding it here holds off neither.
+	 *
+	 * Storing the state first published this task as claimable while both
+	 * fields still described its PREVIOUS sleep.  The wide window is the
+	 * timer's: a thread just out of a timed wait carries a `wakeup_tick'
+	 * that is already in the past, so the next tick on any processor
+	 * claimed it -- before the `else' branch below, written for precisely
+	 * that hazard, had run to clear it.  The task was then enqueued while
+	 * it was still executing here, which is what the WARN reported, and it
+	 * came straight back out of sched_schedule() having never slept.  For
+	 * a process with a dozen threads on condition variables that is a
+	 * spurious wakeup per wait, absorbed by the caller's retry loop and
+	 * paid for in syscalls.
+	 *
+	 * Identity first and state last is the order every other parking site
+	 * in this kernel uses -- sched_bsp_park(), and the shape quoted in the
+	 * note above sched_request_stop(). */
 	cur->wait_channel = (void *)uaddr;
-
-	ftrace_log_key(FT_WAIT_BLOCK, uaddr, expected_val, (uint32_t)cur->id,
-		       key, bucket_idx, bucket_count(bucket->head));
 
 	// Set wakeup time if timeout specified
 	uint64_t deadline_tick = 0;
@@ -365,6 +384,20 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
 		 * timed sleep cannot wake this task straight back up. */
 		cur->wakeup_tick = 0;
 	}
+
+	/* Checked while the state is still RUNNING, which is what makes it an
+	 * invariant: rq_enqueue_locked() refuses a RUNNING task, so a queued
+	 * one here means the flag and the queues disagree.  After the store
+	 * below the same test would fire on a legitimate concurrent wake --
+	 * sched_schedule() documents that race and handles it -- which is what
+	 * it was doing where it used to stand. */
+	WARN_ON(cur->on_rq);
+
+	// Block the task
+	cur->state = TASK_BLOCKED;
+
+	ftrace_log_key(FT_WAIT_BLOCK, uaddr, expected_val, (uint32_t)cur->id,
+		       key, bucket_idx, bucket_count(bucket->head));
 
 	spin_unlock_irqrestore(&bucket->lock, flags);
 
@@ -434,7 +467,7 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
 	return -EINTR;
 }
 
-int futex_wake(uint64_t uaddr, int nr_wake)
+static int futex_wake_common(uint64_t uaddr, int nr_wake, uint32_t bitset)
 {
 	BUG_ON(!futex_initialized);
 	if (nr_wake <= 0)
@@ -450,64 +483,140 @@ int futex_wake(uint64_t uaddr, int nr_wake)
 // This allows using irqsave (needed for scheduler consistency) while
 // keeping the critical section short enough to avoid TLB shootdown timeouts
 #define MAX_DEFERRED_WAKE 32
-	task_t *wake_list[MAX_DEFERRED_WAKE];
-	int wake_count = 0;
-
 	uint64_t flags;
-	spin_lock_irqsave(&bucket->lock, &flags);
 
-	ftrace_log_key(FT_WAKE_ENTER, uaddr, (uint32_t)nr_wake, 0, key,
-		       bucket_idx, bucket_count(bucket->head));
+	/* Batched, and it LOOPS until the requested number really have been
+	 * woken.
+	 *
+	 * The batch exists so the bucket lock is not held across the enqueues;
+	 * that part is right and unchanged.  What was wrong was treating the
+	 * batch size as the end of the job: the walk simply stopped once 32
+	 * tasks had been collected and returned, leaving every waiter past the
+	 * 32nd linked in the bucket and still TASK_BLOCKED.
+	 *
+	 * pthread_cond_broadcast() asks for 0x7FFFFFFF -- wake everyone -- and
+	 * then increments the sequence, so the event those waiters were
+	 * sleeping for is consumed.  No later wake is coming for them.  Above
+	 * 32 threads on one condition variable, a broadcast woke 32 and put
+	 * the rest to sleep for the life of the process.
+	 *
+	 * That is not a corner case for this workload: a browser tab under
+	 * load runs seventy-odd threads, nearly all of them parked in
+	 * pthread_cond_wait on a handful of worker-pool condition variables.
+	 * The observed end state was every thread in futex_wait or poll, four
+	 * of them on mutexes whose owners had been broadcast away, and not one
+	 * thread runnable.
+	 *
+	 * So: fill a batch, drop the lock, enqueue, and if the batch filled up
+	 * go back for more.  Unlinking as it goes makes restarting from the
+	 * head correct, and the walk only repeats while a full batch says
+	 * there may be more. */
+	for (;;) {
+		task_t *wake_list[MAX_DEFERRED_WAKE];
+		int wake_count = 0;
 
-	futex_waiter_t **pp = &bucket->head;
-	while (*pp && woken < nr_wake && wake_count < MAX_DEFERRED_WAKE) {
-		futex_waiter_t *w = *pp;
+		spin_lock_irqsave(&bucket->lock, &flags);
 
-		if (w->key == key) {
-			// Remove from list
-			*pp = w->next;
+		ftrace_log_key(FT_WAKE_ENTER, uaddr, (uint32_t)nr_wake, 0, key,
+			       bucket_idx, bucket_count(bucket->head));
 
-			// Mark as removed so futex_wait cleanup knows not to scan the list.
-			// The waiter memory is freed by the waiting thread, not us, to
-			// prevent ABA races with kalloc recycling the same address.
-			w->removed_by_wake = true;
+		futex_waiter_t **pp = &bucket->head;
+		while (*pp && woken < nr_wake &&
+		       wake_count < MAX_DEFERRED_WAKE) {
+			futex_waiter_t *w = *pp;
 
-			// Collect task for deferred wakeup.  The BLOCKED->READY
-			// claim must be atomic: the sleep-timeout and signal
-			// wakers run under g_task_list_lock (not this bucket
-			// lock) and can claim the same task concurrently — a
-			// plain check-then-set let both sides enqueue it.
-			task_t *task = w->task;
-			ftrace_log_key(FT_WAKE_FOUND, uaddr, (uint32_t)task->id,
-				       (uint32_t)task->state, w->key,
-				       bucket_idx, 0);
-			if (sched_claim_wake(task, TASK_BLOCKED)) {
-				task->wait_channel = NULL;
-				task->wakeup_tick = 0;
-				wake_list[wake_count] = task;
-				wake_count++;
-				woken++;
+			if (w->key == key && (w->bitset & bitset)) {
+				// Remove from list
+				*pp = w->next;
+
+				/* Mark as removed so futex_wait cleanup knows
+				 * not to scan the list.  The waiter memory is
+				 * freed by the waiting thread, not us, to
+				 * prevent ABA races with kalloc recycling the
+				 * same address. */
+				w->removed_by_wake = true;
+
+				/* Collect task for deferred wakeup.  The
+				 * BLOCKED->READY claim must be atomic: the
+				 * sleep-timeout and signal wakers run under
+				 * g_task_list_lock (not this bucket lock) and
+				 * can claim the same task concurrently -- a
+				 * plain check-then-set let both sides enqueue
+				 * it. */
+				task_t *task = w->task;
+
+				ftrace_log_key(FT_WAKE_FOUND, uaddr,
+					       (uint32_t)task->id,
+					       (uint32_t)task->state, w->key,
+					       bucket_idx, 0);
+				if (sched_claim_wake(task, TASK_BLOCKED)) {
+					task->wait_channel = NULL;
+					task->wakeup_tick = 0;
+					wake_list[wake_count] = task;
+					wake_count++;
+					woken++;
+				}
+				/* A waiter that is NOT blocked (already woken
+				 * by a signal, or a zombie) is still unlinked
+				 * but does not count against nr_wake: counting
+				 * it would consume a wake slot that a real
+				 * sleeper needed. */
+			} else {
+				pp = &w->next;
 			}
-			// NOTE: If task is NOT BLOCKED (e.g. already woken by signal,
-			// or is a zombie), we still remove the stale waiter entry
-			// (removed_by_wake = true) but do NOT count it against nr_wake.
-			// Counting non-blocked waiters consumed wake slots silently,
-			// preventing legitimate blocked waiters from being woken.
-		} else {
-			pp = &w->next;
 		}
-	}
 
-	spin_unlock_irqrestore(&bucket->lock, flags);
+		int filled = (wake_count == MAX_DEFERRED_WAKE);
 
-	ftrace_log(FT_WAKE_DONE, uaddr, (uint32_t)woken, (uint32_t)wake_count);
+		spin_unlock_irqrestore(&bucket->lock, flags);
 
-	// Now enqueue tasks outside the lock
-	for (int i = 0; i < wake_count; i++) {
-		sched_enqueue_ready(wake_list[i]);
+		ftrace_log(FT_WAKE_DONE, uaddr, (uint32_t)woken,
+			   (uint32_t)wake_count);
+
+		// Now enqueue tasks outside the lock
+		for (int i = 0; i < wake_count; i++)
+			sched_enqueue_ready(wake_list[i]);
+
+		/* Only go round again if the batch filled: that is the one
+		 * case where waiters this call was asked to wake may still be
+		 * linked.  Any other exit means the walk reached the end of
+		 * the bucket or satisfied nr_wake. */
+		if (!filled || woken >= nr_wake)
+			break;
 	}
 
 	return woken;
+}
+
+int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
+{
+	return futex_wait_common(uaddr, expected_val, timeout_ns,
+				 FUTEX_BITSET_MATCH_ANY);
+}
+
+int futex_wait_bitset(uint64_t uaddr, uint32_t expected_val,
+		      uint64_t timeout_ns, uint32_t bitset)
+{
+	if (bitset == 0)
+		return -EINVAL;
+	return futex_wait_common(uaddr, expected_val, timeout_ns, bitset);
+}
+
+int futex_wake(uint64_t uaddr, int nr_wake)
+{
+	return futex_wake_common(uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY);
+}
+
+/* Wake only the waiters whose bitset intersects `bitset'.  A plain
+ * FUTEX_WAIT sleeps with every bit set and so matches any wake; a
+ * FUTEX_WAIT_BITSET sleeper is woken only by a wake naming one of its
+ * bits -- how a condition variable wakes one class of waiter and not
+ * another on the same word. */
+int futex_wake_bitset(uint64_t uaddr, int nr_wake, uint32_t bitset)
+{
+	if (bitset == 0)
+		return -EINVAL;
+	return futex_wake_common(uaddr, nr_wake, bitset);
 }
 
 // Like futex_wake but uses a specific task's PML4 for key computation.
@@ -706,7 +815,7 @@ void exit_robust_list(task_t *task)
 	if (!task || !task->robust_list)
 		return;
 
-	// The robust_list_head structure format (Linux ABI):
+	// The robust_list_head structure format (the conventional ABI):
 	// struct robust_list_head {
 	//     struct robust_list *list;           // Pointer to first entry
 	//     long futex_offset;                  // Offset of futex word in entry

@@ -110,6 +110,23 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot);
 int64_t sys_munmap(uint64_t addr, uint64_t length);
 int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr);
+int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
+		   uint64_t flags, uint64_t new_addr);
+int64_t sys_eventfd2(uint64_t initval, uint64_t flags);
+int64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
+int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
+		     uint64_t offset);
+int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
+		      uint64_t len);
+int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags);
+int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_ptr,
+			    uint64_t old_ptr);
+int64_t sys_timerfd_gettime(uint64_t fd, uint64_t cur_ptr);
+int64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags);
+int64_t sys_signalfd4(uint64_t fd, uint64_t mask_ptr, uint64_t sizemask,
+		      uint64_t flags);
+int64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_ptr,
+			    uint64_t rem_ptr);
 int64_t sys_net_getinfo(uint64_t a1, uint64_t a2, uint64_t a3);
 int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode);
 int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,

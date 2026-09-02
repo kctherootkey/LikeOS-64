@@ -1,0 +1,37 @@
+libxshmfence on LikeOS: the futex branch.
+
+The fence is a futex in a page of shared memory.  The futex branch of
+xshmfence_futex.h is written for one kernel's <linux/futex.h> and its raw
+syscall, and the alternative is an umtx that only one BSD has; everything
+else falls back to pthread primitives in shared memory, which is slower and
+which this libc's process-shared mutexes were never meant to carry.  This
+system has a futex call in its libc (<sys/futex.h>); give the header a
+branch that uses it.  The build passes --enable-futex, since the configure
+probe only knows the two other spellings.
+
+diff -Nur a/src/xshmfence_futex.h b/src/xshmfence_futex.h
+--- a/src/xshmfence_futex.h	2024-12-14 03:05:01.000000000 +0100
++++ b/src/xshmfence_futex.h	2026-08-27 18:47:09.341434393 +0200
+@@ -45,6 +45,22 @@
+ 	return sys_futex(addr, UMTX_OP_WAIT_UINT, value);
+ }
+ 
++#elif defined(__LIKEOS__)
++
++/* LikeOS: the futex call is a libc function, the operation numbers come
++ * from <sys/futex.h>. */
++#include <stdint.h>
++#include <limits.h>
++#include <sys/futex.h>
++
++static inline int futex_wake(int32_t *addr) {
++	return futex((uint32_t *)addr, FUTEX_WAKE, INT_MAX, NULL, NULL, 0) == -1 ? errno : 0;
++}
++
++static inline int futex_wait(int32_t *addr, int32_t value) {
++	return futex((uint32_t *)addr, FUTEX_WAIT, (uint32_t)value, NULL, NULL, 0) == -1 ? errno : 0;
++}
++
+ #else
+ 
+ #include <stdint.h>

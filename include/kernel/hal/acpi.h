@@ -539,7 +539,7 @@ int acpi_aml_eval_dep(const char *device_path,
 int acpi_aml_eval_crs(const char *device_path, acpi_crs_result_t *result);
 
 // Activate a PNP device by reading _CRS and passing it to _SRS.
-// This is what Linux's PNP subsystem does to enable devices.
+// This is what a conventional PNP subsystem does to enable devices.
 int acpi_aml_activate_dev(const char *device_path);
 
 // Call _DSM on a device with given UUID, revision, function index, and arg.

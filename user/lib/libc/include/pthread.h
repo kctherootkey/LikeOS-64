@@ -191,6 +191,12 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
                    void* (*start_routine)(void*), void* arg);
 void pthread_exit(void* retval) __attribute__((noreturn));
 int pthread_join(pthread_t thread, void** retval);
+/* Join without blocking: EBUSY while the thread still runs. */
+int pthread_tryjoin_np(pthread_t thread, void** retval);
+/* Handlers run around fork(): `prepare' in the parent before, `parent' and
+ * `child' after, in the respective process. */
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+		   void (*child)(void));
 /* The clock that measures `thread`'s CPU consumption; pass the result to
  * clock_gettime().  POSIX interface; the id stays meaningful for the
  * thread's lifetime and answers EINVAL afterwards. */

@@ -154,6 +154,25 @@ pkg_opts() {
 	libICE | libSM) echo "--disable-specs --without-xmlto --without-fop --disable-docs" ;;
 	libXt) echo "--disable-specs --without-xmlto --without-fop --disable-malloc0returnsnull" ;;
 	libxkbfile) echo "--disable-docs" ;;
+	libdrm)
+		# The test tools (modetest, vbltest, proptest) publish no manual
+		# pages -- upstream treats them as developer programs and
+		# documents them through their own -h output.  Here they are the
+		# first thing anyone reaches for when a display does not come up,
+		# so the port carries pages for them, written from their option
+		# tables; drminfo's page rides along, since it belongs to the
+		# same set of tools even though the program is this system's own.
+		# Installed into the sysroot's man1 so that the repository's
+		# xorg-manpages target renders them exactly like the pages that
+		# did come from a source tree.
+		if [ -d "$here/man" ]; then
+			mkdir -p "$SYSROOT/usr/share/man/man1" || return 1
+			for m in "$here/man"/*.1; do
+				[ -f "$m" ] || continue
+				cp -f "$m" "$SYSROOT/usr/share/man/man1/" || return 1
+			done
+		fi
+		;;
 	libXpm) echo "--disable-docs --without-xmlto --without-fop --disable-open-zfile" ;;
 	libXaw) echo "--disable-specs --without-xmlto --without-fop --disable-docs" ;;
 	libfontenc) echo "--disable-docs" ;;
@@ -172,46 +191,58 @@ pkg_opts() {
 		echo "--with-compression=no --with-fontrootdir=/usr/share/fonts/X11"
 		;;
 	xorg-server)
-		# fbdev + evdev.  DRI/DRI2/DRI3 are off, which is also what
-		# keeps libxshmfence off the dependency list entirely.
+		# Two shapes of server, decided by what the sysroot holds.
 		#
 		# GLX is on when Mesa is in the sysroot, and only then: its
 		# configure needs gl.pc, and Mesa is built by the GTK3 port,
 		# which comes AFTER this one -- a fresh build in manifest order
 		# gets a server without GLX, and `./build.sh xorg-server` after
-		# gtk3/build.sh mesa gets one with it.  GLX here is AIGLX over
-		# software rendering: the server dlopen()s
-		# /usr/lib/dri/swrast_dri.so (Mesa's dril shim, see
-		# gtk3/patches/mesa/0002) and llvmpipe draws inside the server.
-		# Client-side GL never needed this; glxinfo/glxgears and every
-		# plain GLX program do, since GLX visuals come from the server.
-		# The driver path is given explicitly (patches/xorg-server/
-		# 0006): asked of pkg-config it comes back with the host
-		# sysroot prefixed, and the server then looks for the driver
-		# at a path that only exists on the build machine.
+		# gtk3/build.sh mesa gets one with it.  The driver path is given
+		# explicitly (patches/xorg-server/0006): asked of pkg-config it
+		# comes back with the host sysroot prefixed.
+		#
+		# The display-manager path (libdrm, DRI2, DRI3, Present, glamor,
+		# the modesetting driver) is on when libdrm AND Mesa's libgbm
+		# are there.  glamor is the GL-backed acceleration the
+		# modesetting driver draws with, through EGL on a GBM device;
+		# DRI3 hands clients a render node and takes their buffers as
+		# descriptors, which needs xtrans fd passing (configure only
+		# knows the systems it can assume that on, so it is stated) and
+		# libxshmfence.  Without them the server is the fbdev + software
+		# GLX one, which is also what /etc/X11/xorg.conf selects on a
+		# machine without /dev/dri/card0 (res/xorg/xserverrc).
 		if [ -f "$SYSROOT/usr/lib/pkgconfig/gl.pc" ]; then
 			glx="--enable-glx --with-dri-driver-path=/usr/lib/dri"
 		else
 			glx="--disable-glx"
 		fi
+		if [ -f "$SYSROOT/usr/lib/pkgconfig/libdrm.pc" ] && \
+		   [ -f "$SYSROOT/usr/lib/pkgconfig/gbm.pc" ]; then
+			drm="--enable-libdrm --enable-dri2 --enable-dri3 \
+			     --enable-present --enable-glamor \
+			     --enable-xshmfence --enable-xtrans-send-fds"
+		else
+			drm="--disable-libdrm --disable-dri2 --disable-dri3 \
+			     --disable-glamor"
+		fi
 		#
-		# Also off: libdrm (nothing to talk to), pciaccess (the library
-		# is built for its header, but nothing here can reach the bus),
-		# vgahw (drives VGA registers through port I/O, which userspace
-		# cannot do here, and the fbdev DDX does not use it),
-		# int10 (real-mode BIOS calls, which pciaccess would have
-		# carried), and the input thread (errno is not thread-local
-		# here yet).
-		echo "$glx --disable-dri --disable-dri2 --disable-dri3 \
+		# Also off: DRI1 (the pre-DRI2 protocol, needs the drivers
+		# nothing here has), pciaccess (the library is built for its
+		# header, but nothing here can reach the bus -- the modesetting
+		# driver opens the node it is told in xorg.conf), vgahw (VGA
+		# registers through port I/O, which userspace cannot do here),
+		# int10 (real-mode BIOS calls), and the input thread (errno
+		# is thread-local now, but the thread has not been revalidated).
+		echo "$glx $drm --disable-dri \
 		      --disable-xvfb --disable-xnest --disable-xwayland \
 		      --disable-xephyr --disable-dmx --disable-docs \
 		      --disable-devel-docs --disable-selective-werror \
 		      --disable-systemd-logind --disable-suid-wrapper \
 		      --without-dtrace --disable-config-udev --disable-config-hal \
 		      --enable-xorg --with-fontrootdir=/usr/share/fonts/X11 \
-		      --disable-input-thread --disable-libdrm \
+		      --disable-input-thread \
 		      --disable-pciaccess --disable-int10-module \
-		      --with-int10=stub --disable-glamor \
+		      --with-int10=stub \
 		      --with-sha1=libcrypto --with-default-xkb-rules=evdev \
 		      --disable-vgahw"
 		;;
@@ -605,15 +636,23 @@ meson_opts() {
 		echo "-Dgl_provider=gl"
 		;;
 	mesa)
-		# Software GL for the desktop.  llvmpipe is the renderer;
-		# softpipe stays as the no-JIT fallback a debug session can
-		# force with GALLIUM_DRIVER=softpipe.  system 'likeos' in the
-		# cross file makes meson's KMS/DRM test false, so no libdrm is
-		# needed anywhere: GLX and EGL both ride the software winsys
-		# (drisw) and present through XShm.  The llvm dependency is
-		# answered by toolchain/llvm-config (a wrapper; the sysroot's
-		# real llvm-config is a target binary the host cannot run).
-		echo "-Dgallium-drivers=llvmpipe,softpipe -Dvulkan-drivers=[] 		      -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=disabled 		      -Dgles1=disabled -Dgles2=enabled -Dopengl=true 		      -Dllvm=enabled -Dshared-llvm=enabled -Ddraw-use-llvm=true 		      -Dglvnd=disabled -Dzstd=disabled -Dlmsensors=disabled 		      -Dlibunwind=disabled -Dvalgrind=disabled 		      -Dbuild-tests=false -Dtools=[] -Dvideo-codecs=[]"
+		# GL for the desktop.  svga is the driver for the VMware SVGA3D
+		# device behind /dev/dri (the kernel's vmwgfx interface);
+		# llvmpipe is the renderer wherever there is no such device
+		# (and the fallback the loader picks when the device has no 3D),
+		# softpipe the no-JIT fallback a debug session can force with
+		# GALLIUM_DRIVER=softpipe.  system 'likeos' counts as a KMS/DRM
+		# system (patches/mesa/0003), so libdrm, DRI3 and GBM are in.
+		# The llvm dependency is answered by toolchain/llvm-config (a
+		# wrapper; the sysroot's real llvm-config is a target binary the
+		# host cannot run).
+		echo "-Dgallium-drivers=svga,llvmpipe,softpipe -Dvulkan-drivers=[] \
+		      -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=enabled \
+		      -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
+		      -Dllvm=enabled -Dshared-llvm=enabled -Ddraw-use-llvm=true \
+		      -Dglvnd=disabled -Dzstd=disabled -Dlmsensors=disabled \
+		      -Dlibunwind=disabled -Dvalgrind=disabled \
+		      -Dbuild-tests=false -Dtools=[] -Dvideo-codecs=[]"
 		;;
 	pixman)
 		# OpenMP drags in the host's libgomp, and with it the host libc,
@@ -628,8 +667,19 @@ meson_opts() {
 		      -Denable-bash-completion=false"
 		;;
 	libpciaccess) echo "-Dzlib=disabled" ;;
+	# libxshmfence: futexes through this libc (patches/libxshmfence), the
+	# fence files in /dev/shm.
+	libxshmfence) echo "--enable-futex --with-shared-memory-dir=/dev/shm" ;;
 	xkeyboard-config) echo "-Dcompat-rules=true -Dxorg-rules-symlinks=true" ;;
-	libdrm) echo "-Dtests=false -Dcairo-tests=disabled -Dman-pages=disabled" ;;
+	# libdrm: only the driver this kernel has (vmwgfx); the test programs
+	# (modetest, vbltest, proptest) are installed as the display driver's
+	# diagnostics; no udev here.
+	libdrm) echo "-Dvmwgfx=enabled -Dintel=disabled -Dradeon=disabled \
+		      -Damdgpu=disabled -Dnouveau=disabled -Domap=disabled \
+		      -Dexynos=disabled -Dfreedreno=disabled -Dtegra=disabled \
+		      -Detnaviv=disabled -Dudev=false -Dvalgrind=disabled \
+		      -Dcairo-tests=disabled -Dman-pages=disabled \
+		      -Dtests=true -Dinstall-test-programs=true" ;;
 
 	# ---- the GTK3 stack ------------------------------------------------
 	#
@@ -941,6 +991,17 @@ meson_opts() {
 # Per-package CMake options.
 cmake_opts() {
 	case "$1" in
+	libjpeg-turbo)
+		# The version-8 API and soname: that is what everything here
+		# links against (see packages.list).  The TurboJPEG wrapper is
+		# a second, simpler API that nothing here uses, and the static
+		# library has no consumer either.  SIMD stays on -- it is the
+		# whole point of this library and the build host has the
+		# assembler for it.
+		echo "-DWITH_JPEG8=ON -DENABLE_STATIC=OFF -DENABLE_SHARED=ON \
+		      -DWITH_TURBOJPEG=OFF -DWITH_SIMD=ON -DWITH_JAVA=OFF \
+		      -DCMAKE_INSTALL_LIBDIR=/usr/lib"
+		;;
 	ctwm)
 		# Off: the m4 preprocessor for config files (needs m4 on the
 		# target), session management (no session manager here), and
@@ -1185,10 +1246,11 @@ is_cmake() {
 
 # Packages whose build produces programs that packages ABOVE them have to RUN.
 #
-# A cross-built generator is a target binary and cannot execute here.  GLib is the
-# acute case -- glib-compile-resources, glib-genmarshal, glib-mkenums,
-# glib-compile-schemas and gdbus-codegen generate source for nearly everything
-# above it, and GTK's build alone invokes the first of those hundreds of times.
+# A cross-built generator is a target binary and cannot execute here.  GLib is
+# the only such package left -- glib-compile-resources, glib-genmarshal,
+# glib-mkenums, glib-compile-schemas and gdbus-codegen generate source for
+# nearly everything above it, and GTK's build alone invokes the first of those
+# hundreds of times.
 #
 # So GLib is built TWICE from one tree: natively into $HOSTTOOLS for the
 # generators, then cross for the library.  Both from the same tarball, which is
@@ -1212,6 +1274,8 @@ needs_host_build() {
 is_dataonly() {
 	case "$1" in
 	dejavu-fonts-ttf) return 0 ;;
+	liberation-fonts-ttf) return 0 ;;
+	NotoSans) return 0 ;;
 	hunspell-en_US) return 0 ;;
 	shared-mime-info) return 0 ;;
 	esac
@@ -1255,6 +1319,41 @@ install_data() {
 					"$SYSROOT/usr/share/fonts/truetype/dejavu/" ||
 					return 1
 			done
+		done
+		;;
+	liberation-fonts-ttf)
+		# All twelve faces: the regular, bold, italic and bold-italic of
+		# Sans, Serif and Mono.  Unlike DejaVu there is nothing here to
+		# leave out -- each one is the metric substitute for a face the
+		# web asks for by name (Arial, Times New Roman, Courier New),
+		# and a missing italic is a page that falls back to a synthetic
+		# slant with different widths, which is the problem this font
+		# was added to solve.
+		mkdir -p "$SYSROOT/usr/share/fonts/truetype/liberation" || return 1
+		for f in *.ttf; do
+			[ -f "$f" ] || continue
+			cp -f "$f" \
+				"$SYSROOT/usr/share/fonts/truetype/liberation/" ||
+				return 1
+		done
+		;;
+	NotoSans)
+		# Four faces of the several hundred in the archive: regular,
+		# bold, italic and bold-italic at normal width.  The condensed
+		# and semi-condensed widths and the nine weights are variable-
+		# font source material that no CSS here selects, and the OTF
+		# copies duplicate the TTFs.
+		#
+		# HINTED, because everything else on this image is: the display
+		# is a virtual framebuffer at 96dpi where unhinted small text
+		# smears.  The nested NotoSans/ level is the zip's own layout.
+		mkdir -p "$SYSROOT/usr/share/fonts/truetype/noto" || return 1
+		for face in Regular Bold Italic BoldItalic; do
+			f="NotoSans/hinted/ttf/NotoSans-$face.ttf"
+			[ -f "$f" ] || continue
+			cp -f "$f" \
+				"$SYSROOT/usr/share/fonts/truetype/noto/" ||
+				return 1
 		done
 		;;
 	shared-mime-info)
@@ -1487,21 +1586,37 @@ build_one() {
 		# desktop this is not.  The shape of the port:
 		#   - the GTK3 API line (webkit2gtk-4.1), which is what both
 		#     consumers (luakit, Claws fancy) link;
-		#   - Cairo rendering (USE_SKIA=OFF): there is no GPU and no
-		#     GL here, and the cairo path is the software renderer,
-		#     drawing with the same library the whole desktop uses;
-		#   - the JavaScriptCore C-loop interpreter (ENABLE_JIT=OFF):
-		#     correct-by-construction on a young kernel, where the
-		#     JIT's W^X page dance would be the riskiest code in the
-		#     system for a speedup a mail viewer does not need;
+		#   - Skia rendering (USE_SKIA=ON): the engine's own renderer,
+		#     with its GPU backend on the GL that Mesa's svga driver
+		#     now provides through the kernel's display manager.  Where
+		#     there is no GPU it falls back to its CPU backend and
+		#     draws in software, so the same build is correct on both
+		#     machines;
+		#   - the GPU process, GBM and libdrm: rendered frames are
+		#     handed between processes as buffer descriptors rather
+		#     than copied through shared memory, which is what
+		#     webkit://gpu calls the DMABuf renderer;
+		#   - the JavaScriptCore JIT, all four tiers, with WebAssembly
+		#     and the sampling profiler.  It needs an executable
+		#     mapping, a real ucontext_t in the signal frame and
+		#     XSAVE-preserved vector state across a context switch --
+		#     all of which this kernel now has (see the WTF patches,
+		#     which is where OS(LIKEOS) is declared);
 		#   - system malloc: bmalloc's virtual-memory gymnastics
 		#     (gigacage reservations in the terabytes) assume address
 		#     space this kernel does not hand out;
-		#   - no media stack: VIDEO/WEB_AUDIO and everything behind
-		#     them need GStreamer, which is not ported;
-		#   - the process supervisor extras off: journald, bubblewrap,
-		#     GBM/DRM and the GPU process all talk to kernel
-		#     interfaces that do not exist here.
+		#   - the media stack OFF entirely (USE_GSTREAMER,
+		#     ENABLE_VIDEO, ENABLE_WEB_AUDIO and the rest below).
+		#     There is no audio driver in this kernel, so nothing a
+		#     decoder produced could ever be heard, and the engine
+		#     composites video frames itself rather than through a
+		#     GStreamer sink -- so the framework, its plugin sets and
+		#     the codec libraries under them bought nothing but build
+		#     time and image size.  They were removed from the port
+		#     with this switch;
+		#   - the supervisor extras still off: journald wants a
+		#     logging daemon, bubblewrap a sandbox built on namespaces
+		#     and seccomp, neither of which exists here.
 		#
 		# Accessibility (USE_ATSPI) is LEFT ON, upstream's setting, and
 		# the "Could NOT find ATSPI" line in the configure output is
@@ -1634,19 +1749,22 @@ build_one() {
 				-DENABLE_X11_TARGET=ON \
 				-DENABLE_WAYLAND_TARGET=OFF \
 				-DENABLE_QUARTZ_TARGET=OFF \
-				-DUSE_SKIA=OFF \
-				-DENABLE_JIT=OFF -DENABLE_C_LOOP=ON \
-				-DENABLE_WEBASSEMBLY=OFF \
-				-DENABLE_SAMPLING_PROFILER=OFF \
+				-DUSE_SKIA=ON \
+				-DENABLE_JIT=ON -DENABLE_C_LOOP=OFF \
+				-DENABLE_DFG_JIT=ON -DENABLE_FTL_JIT=ON \
+				-DENABLE_WEBASSEMBLY=ON \
+				-DENABLE_SAMPLING_PROFILER=ON \
 				-DUSE_SYSTEM_MALLOC=ON \
 				-DENABLE_MINIBROWSER=ON \
 				-DENABLE_INTROSPECTION=OFF \
 				-DENABLE_DOCUMENTATION=OFF \
 				-DENABLE_JOURNALD_LOG=OFF \
 				-DENABLE_BUBBLEWRAP_SANDBOX=OFF \
-				-DUSE_GBM=OFF -DUSE_LIBDRM=OFF \
-				-DENABLE_GPU_PROCESS=OFF \
+				-DUSE_GBM=ON -DUSE_LIBDRM=ON \
+				-DENABLE_GPU_PROCESS=ON \
 				-DUSE_GSTREAMER=OFF -DENABLE_VIDEO=OFF \
+				-DUSE_GSTREAMER_GL=OFF \
+				-DENABLE_MEDIA_SOURCE=OFF \
 				-DENABLE_WEB_AUDIO=OFF \
 				-DENABLE_MEDIA_STREAM=OFF \
 				-DENABLE_MEDIA_RECORDER=OFF \

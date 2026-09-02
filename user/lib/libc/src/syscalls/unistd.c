@@ -1,3 +1,4 @@
+#include <elf.h>
 #include <sys/procinfo.h>
 #include <unistd.h>
 #include <stdio.h>    /* snprintf: fchdir builds a /dev/fd path */
@@ -454,19 +455,27 @@ extern void __pthread_fork_prepare(void);
 extern void __pthread_fork_parent(void);
 extern void __pthread_fork_child(void);
 
+extern void __atfork_run_prepare(void);
+extern void __atfork_run_parent(void);
+extern void __atfork_run_child(void);
+
 pid_t fork(void)
 {
-	/* Lock order: pthread outside, malloc inside (pthread code allocates;
+	/* Application atfork handlers outermost, then the libc's own.
+	 * Lock order: pthread outside, malloc inside (pthread code allocates;
 	 * the allocator never calls into pthread).  Released in reverse. */
+	__atfork_run_prepare();
 	__pthread_fork_prepare();
 	__malloc_fork_prepare();
 	long ret = syscall0(SYS_FORK);
 	if (ret == 0) {
 		__malloc_fork_child();
 		__pthread_fork_child();
+		__atfork_run_child();
 	} else {
 		__malloc_fork_parent();
 		__pthread_fork_parent();
+		__atfork_run_parent();
 	}
 	if (ret < 0) {
 		errno = -ret;
@@ -1231,7 +1240,7 @@ int utimes(const char *path, const struct timeval tv[2])
 
 int reboot(int cmd)
 {
-	// Use Linux reboot magic numbers
+	// The conventional reboot magic numbers
 	long ret = syscall4(SYS_REBOOT, 0xfee1dead, 672274793, cmd, 0);
 	if (ret < 0) {
 		errno = -ret;
@@ -1631,12 +1640,20 @@ int getentropy(void *buf, size_t buflen)
 	return 0;
 }
 
-/* getauxval: access ELF auxiliary vector entries.
- * On x86-64 we have no AT_HWCAP/AT_PLATFORM mechanism exposed to
- * userspace today, so all lookups return 0. */
+/* getauxval: look an entry up in the ELF auxiliary vector.  The vector's
+ * address is recorded by __libc_init_environ() at start-up (it sits right
+ * after the environment's terminating NULL); until then, or in a process
+ * that had no vector at all, every lookup fails with ENOENT. */
+extern Elf64_auxv_t *__libc_auxv;
+
 unsigned long getauxval(unsigned long type)
 {
-	(void)type;
+	if (__libc_auxv && type != AT_NULL) {
+		for (Elf64_auxv_t *a = __libc_auxv; a->a_type != AT_NULL; a++)
+			if (a->a_type == type)
+				return a->a_un.a_val;
+	}
+	errno = ENOENT;
 	return 0UL;
 }
 
@@ -1752,7 +1769,7 @@ clock_t clock(void)
 long syscall(long number, ...)
 {
 	va_list ap;
-	long a1, a2, a3, a4, a5, a6;
+	long a1, a2, a3, a4, a5, a6, r;
 	va_start(ap, number);
 	a1 = va_arg(ap, long);
 	a2 = va_arg(ap, long);
@@ -1761,7 +1778,18 @@ long syscall(long number, ...)
 	a5 = va_arg(ap, long);
 	a6 = va_arg(ap, long);
 	va_end(ap);
-	return syscall6(number, a1, a2, a3, a4, a5, a6);
+	r = syscall6(number, a1, a2, a3, a4, a5, a6);
+	/* The contract callers are written against: -1 with errno set, not
+	 * the kernel's raw negative errno.  Returning the raw value left
+	 * errno untouched, so a caller that checked it read whatever the
+	 * previous call had left there.  Kernel error returns occupy
+	 * [-4095, -1]; anything below is a value in its own right -- a large
+	 * offset, an address -- and is passed through. */
+	if (r < 0 && r > -4096) {
+		errno = (int)-r;
+		return -1;
+	}
+	return r;
 }
 
 /* ---- extended attributes (sys/xattr.h) ---- */

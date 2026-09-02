@@ -441,6 +441,15 @@ int clock_gettime(clockid_t clk_id, struct timespec *tp)
 	return 0;
 }
 
+int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *req,
+		    struct timespec *rem)
+{
+	long ret = syscall4(SYS_CLOCK_NANOSLEEP, (long)clock_id, (long)flags,
+			    (long)req, (long)rem);
+	/* POSIX: the error is the return value, errno is left alone. */
+	return ret < 0 ? (int)-ret : 0;
+}
+
 int clock_getres(clockid_t clk_id, struct timespec *res)
 {
 	long ret = syscall2(SYS_CLOCK_GETRES, (long)clk_id, (long)res);
@@ -448,5 +457,16 @@ int clock_getres(clockid_t clk_id, struct timespec *res)
 		errno = -ret;
 		return -1;
 	}
+	return 0;
+}
+
+int sigwait(const sigset_t *set, int *sig)
+{
+	siginfo_t info;
+	int r = sigwaitinfo(set, &info);
+	if (r < 0)
+		return errno;
+	if (sig)
+		*sig = r;
 	return 0;
 }

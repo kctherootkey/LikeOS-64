@@ -1,0 +1,65 @@
+Tell WTF how many processors this machine has.
+
+numberOfProcessorCores() picks its implementation by operating system, and
+the arm that calls sysconf(_SC_NPROCESSORS_ONLN) is spelled as a list of OS
+names: LINUX, AIX, OPENBSD, NETBSD, FREEBSD, HAIKU.  OS(LIKEOS) is in none of
+them -- and, unlike most of WTF, there is no POSIX arm to fall through to.
+The #else is:
+
+    s_numberOfCores = defaultIfUnavailable;   /* 1 */
+
+So every WebKit process on this system believed it was running on a
+uniprocessor, whatever the machine actually was, and said so silently.  There
+is nothing to detect in the build and no warning at run time; the only visible
+trace is a number in webkit://gpu that happens to be smaller than on another
+box.  That is what led here: "Threaded rendering: GPU (1 threads)" against
+"GPU (2 threads)" on a second virtual machine of the same shape on the same
+host.
+
+sysconf(_SC_NPROCESSORS_ONLN) is implemented here (user/lib/libc/src/syscalls/
+unistd.c): it counts the bits the kernel puts in the default affinity mask,
+which is one per online CPU, and never answers zero.  _SC_NPROCESSORS_CONF
+answers the same, CPUs not being taken offline at run time.  So the existing
+arm is joined rather than a new one written, exactly as OS(LIKEOS) joins the
+LINUX arms in the WTF patches next to this one.
+
+The paint-thread count is the smallest of the things this decides.  With one
+core reported:
+
+  - SkiaPaintingEngine::numberOfGPUPaintingThreads() is `cores >= 4 ? 2 : 1',
+    so tile painting in the web process ran on a single worker;
+  - numberOfCPUPaintingThreads() is max(1, min(8, cores / 2)) -- also 1, which
+    is what the software fallback would have got;
+  - WorkQueue's concurrent queue is built with `numberOfProcessorCores() - 1'
+    workers.  That is ZERO, on a queue whose whole purpose is to run work off
+    the calling thread;
+  - JavaScriptCore's overrideDefaults() takes its "fewer than four cores"
+    garbage-collector tuning, and then the `cores <= 1' branch inside it that
+    sets gcIncrementScale to 1 -- the most conservative incremental collection
+    it has;
+  - WebPageProxy and WebProcessActivityState both gate behaviour on
+    `cores > 4', which could not become true.
+
+None of that is a rendering fault and none of it fails visibly.  It is the
+engine being told, wrongly, that it has nowhere to put concurrent work.
+
+--- a/Source/WTF/wtf/NumberOfCores.cpp
++++ b/Source/WTF/wtf/NumberOfCores.cpp
+@@ -32,7 +32,7 @@
+ 
+ #if OS(DARWIN)
+ #include <sys/sysctl.h>
+-#elif OS(LINUX) || OS(AIX) || OS(OPENBSD) || OS(NETBSD) || OS(FREEBSD) || OS(HAIKU)
++#elif OS(LINUX) || OS(LIKEOS) || OS(AIX) || OS(OPENBSD) || OS(NETBSD) || OS(FREEBSD) || OS(HAIKU)
+ #include <unistd.h>
+ #elif OS(QNX)
+ #include <sys/syspage.h>
+@@ -68,7 +68,7 @@
+     int sysctlResult = sysctl(name, sizeof(name) / sizeof(int), &result, &length, 0, 0);
+ 
+     s_numberOfCores = sysctlResult < 0 ? defaultIfUnavailable : result;
+-#elif OS(LINUX) || OS(AIX) || OS(OPENBSD) || OS(NETBSD) || OS(FREEBSD) || OS(HAIKU)
++#elif OS(LINUX) || OS(LIKEOS) || OS(AIX) || OS(OPENBSD) || OS(NETBSD) || OS(FREEBSD) || OS(HAIKU)
+     long sysconfResult = sysconf(_SC_NPROCESSORS_ONLN);
+ 
+     s_numberOfCores = sysconfResult < 0 ? defaultIfUnavailable : static_cast<int>(sysconfResult);

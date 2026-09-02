@@ -1,4 +1,6 @@
 // LikeOS-64 -- mmap, munmap and brk.
+#include <kernel/dev/device.h>
+#include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -85,55 +87,59 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	// Round up length to page size
 	length = PAGE_ALIGN(length);
 
-	// Security: Prevent excessive allocation (max 2GB per mmap call)
-	if (length > (2ULL * 1024 * 1024 * 1024)) {
+	/* Upper bound on one call.  Private mappings are lazy, so a large
+	 * reservation costs page tables only as it is touched: language
+	 * runtimes reserve gigabytes up front (a JIT's executable pool, a
+	 * WebAssembly linear memory with guard region) and commit pieces with
+	 * mprotect.  64 GB leaves the 47-bit user space comfortably shared
+	 * between such reservations and the ordinary heap. */
+	if (length > (64ULL * 1024 * 1024 * 1024)) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	// Find a free mmap region slot
-	mmap_region_t *region = mm_alloc_mmap_region(cur);
-	if (!region) {
-		/* Loud on purpose: a process that runs out of region slots
-		 * fails every subsequent mmap, which downstream looks like a
-		 * random allocation crash rather than a table limit -- a
-		 * dlopen() failing here is reported by the loader as "cannot
-		 * find", which sends the reader looking for a missing file.
-		 *
-		 * The breakdown says WHY the table is full, which the bare
-		 * count does not: file-backed entries are libraries and their
-		 * segments (four per shared object, so a large dependency graph
-		 * alone accounts for hundreds), while anonymous ones are heap,
-		 * thread stacks and large allocations.  Whichever dominates is
-		 * where to look. */
-		int n_file = 0, n_anon = 0, n_lazy = 0;
-		uint64_t anon_bytes = 0;
+	/* ...and the machine's own bound underneath it: a mapping larger than
+	 * all the RAM there is can never be backed, however lazily it is
+	 * filled in.  Refusing it here is the difference between a caller
+	 * that can handle the answer and one that dies on a page fault
+	 * half-way through its data.
+	 *
+	 * MAP_NORESERVE is the caller saying it knows what it is doing, and
+	 * keeps the reservations the paragraph above is about working on any
+	 * size of machine: what a runtime reserves and never commits is
+	 * exactly what the flag is for. */
+	if ((flags & MAP_ANONYMOUS) && !(flags & MAP_NORESERVE)) {
+		uint64_t ram = mm_get_usable_pages() * PAGE_SIZE;
+		if (ram && length > ram) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
 
+	// Determine virtual address
+	uint64_t vaddr;
+	if (flags & MAP_FIXED_NOREPLACE) {
+		/* The hint form of MAP_FIXED: take the address only if nothing
+		 * is there.  Checked against the region table rather than the
+		 * page tables, so an untouched lazy mapping counts as
+		 * occupied, as it must. */
+		if (addr == 0 || (addr & (PAGE_SIZE - 1)) || addr < 0x10000) {
+			ret = -EINVAL;
+			goto out;
+		}
 		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
 			mmap_region_t *r = &cur->mmap_regions[i];
 
 			if (!r->in_use)
 				continue;
-			if (r->file) {
-				n_file++;
-			} else {
-				n_anon++;
-				anon_bytes += r->length;
+			if (addr < r->start + r->length &&
+			    r->start < addr + length) {
+				ret = -EEXIST;
+				goto out;
 			}
-			if (r->lazy)
-				n_lazy++;
 		}
-		WARN_RATELIMIT(
-			1,
-			"mmap: pid %d out of mmap regions (max %d): %d file-backed, %d anonymous (%llu KB), %d lazy",
-			cur->id, TASK_MAX_MMAP, n_file, n_anon,
-			(unsigned long long)(anon_bytes / 1024), n_lazy);
-		ret = -ENOMEM;
-		goto out;
+		flags |= MAP_FIXED;
 	}
-
-	// Determine virtual address
-	uint64_t vaddr;
 	if (flags & MAP_FIXED) {
 		if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
 			return -EINVAL; // Invalid fixed address
@@ -171,6 +177,53 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			goto out;
 		}
 		vaddr = cur->mmap_base;
+	}
+
+	/* Claim a region record only now, AFTER the MAP_FIXED teardown above:
+	 * that teardown may split a record straddling the range, which takes a
+	 * slot itself, and may grow (reallocate) the whole table -- a pointer
+	 * taken before it could be re-handed out or left dangling. */
+	mmap_region_t *region = mm_alloc_mmap_region(cur);
+	if (!region) {
+		/* Loud on purpose: a process that runs out of region slots
+		 * fails every subsequent mmap, which downstream looks like a
+		 * random allocation crash rather than a table limit -- a
+		 * dlopen() failing here is reported by the loader as "cannot
+		 * find", which sends the reader looking for a missing file.
+		 *
+		 * The breakdown says WHY the table is full, which the bare
+		 * count does not: file-backed entries are libraries and their
+		 * segments (four per shared object, so a large dependency graph
+		 * alone accounts for hundreds), while anonymous ones are heap,
+		 * thread stacks and large allocations.  Whichever dominates is
+		 * where to look. */
+		int n_file = 0, n_anon = 0, n_lazy = 0;
+		uint64_t anon_bytes = 0;
+
+		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
+			mmap_region_t *r = &cur->mmap_regions[i];
+
+			if (!r->in_use)
+				continue;
+			if (r->file) {
+				n_file++;
+			} else {
+				n_anon++;
+				anon_bytes += r->length;
+			}
+			if (r->lazy)
+				n_lazy++;
+		}
+		WARN_RATELIMIT(
+			1,
+			"mmap: pid %d out of mmap regions (max %d): %d file-backed, %d anonymous (%llu KB), %d lazy",
+			cur->id, TASK_MAX_MMAP, n_file, n_anon,
+			(unsigned long long)(anon_bytes / 1024), n_lazy);
+		/* The address was already carved out of the mmap area. */
+		if (!(flags & MAP_FIXED))
+			cur->mmap_base += length;
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	// Calculate page flags
@@ -226,6 +279,11 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			}
 			if ((offset & (PAGE_SIZE - 1)) != 0) {
 				ret = -EINVAL;
+				goto out;
+			}
+			if ((sobj->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) &&
+			    (prot & PROT_WRITE)) {
+				ret = -EPERM;
 				goto out;
 			}
 			/* Bound the mapping by the object's PAGE span, not its
@@ -339,6 +397,84 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		mm_merge_region_neighbours(cur, region);
 		ret = (int64_t)vaddr;
 		goto out;
+	}
+
+	/* Registered device nodes and anonymous device files: the driver
+	 * names the pages, the address space maps them as device pages it
+	 * does not own, and the driver's object is pinned by the record. */
+	if (backing) {
+		const struct device_ops *dops = device_file_ops(backing);
+		if (dops) {
+			struct device_mmap dm;
+			int rc;
+
+			if (!dops->mmap) {
+				ret = -ENODEV;
+				goto out;
+			}
+			if ((offset & (PAGE_SIZE - 1)) != 0) {
+				ret = -EINVAL;
+				goto out;
+			}
+			mm_memset(&dm, 0, sizeof(dm));
+			dm.offset = offset;
+			dm.length = length;
+			dm.prot = prot;
+			dm.flags = flags;
+			rc = dops->mmap(backing, &dm);
+			if (rc < 0 || !dm.page_phys) {
+				if (!(flags & MAP_FIXED))
+					cur->mmap_base += length;
+				ret = rc < 0 ? rc : -ENODEV;
+				goto out;
+			}
+			uint64_t dflags = page_flags | PAGE_DEVICE | dm.pte_extra;
+			/* A tracked object's new entries are born with the
+			 * write bit withheld, so the first write to each page
+			 * faults and is recorded; see mm_dirty_ops. */
+			if (dm.dirty_ops && dm.dirty_ops->wp_new_mapping &&
+			    dm.dirty_ops->wp_new_mapping(dm.obj))
+				dflags = (dflags & ~(uint64_t)PAGE_WRITABLE) |
+					 PAGE_DIRTY_TRACKED;
+			for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
+				uint64_t phys = dm.page_phys(dm.obj, off / PAGE_SIZE);
+				if (!phys || !mm_map_page_in_address_space(
+						     cur->pml4, vaddr + off,
+						     phys, dflags)) {
+					for (uint64_t cl = 0; cl < off;
+					     cl += PAGE_SIZE)
+						mm_unmap_page_in_address_space(
+							cur->pml4, vaddr + cl);
+					if (!(flags & MAP_FIXED))
+						cur->mmap_base += length;
+					if (dm.put)
+						dm.put(dm.obj);
+					ret = -ENOMEM;
+					goto out;
+				}
+			}
+			/* The driver handed us one reference on dm.obj (it
+			 * took it in ->mmap); the record owns it from here. */
+			vfs_incref(backing);
+			region->start = vaddr;
+			region->length = length;
+			region->prot = prot;
+			region->flags = flags | MAP_SHARED;
+			region->fd = (int)fd;
+			region->offset = offset;
+			region->lazy = false;
+			region->file = backing;
+			region->device = true;
+			region->device_phys = dm.page_phys(dm.obj, 0);
+			region->dev_obj = dm.obj;
+			region->dev_get = dm.get;
+			region->dev_put = dm.put;
+			region->dev_dirty = dm.dirty_ops;
+			region->in_use = true;
+			mm_merge_region_neighbours(cur, region);
+			ret = (int64_t)vaddr;
+			goto out;
+		}
 	}
 
 	/* Demand paging: PRIVATE mappings (anonymous or file-backed) are not
@@ -456,8 +592,19 @@ out:
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		 uint64_t flags, uint64_t fd, uint64_t offset)
 {
-	RUN_WRITE_LOCKED(
-		sys_mmap_locked(addr, length, prot, flags, fd, offset));
+	int64_t ret;
+
+	RUN_WRITE_LOCKED_RET(
+		ret, sys_mmap_locked(addr, length, prot, flags, fd, offset));
+
+	/* MAP_POPULATE: touch every page now.  Done after the address-space
+	 * lock is dropped because the fault handlers take it for reading
+	 * themselves; nothing else can move the region in between, the
+	 * caller is the only one who knows the address yet. */
+	if (ret >= 0 && (flags & MAP_POPULATE))
+		mm_prefault_user_range((uint64_t)ret, PAGE_ALIGN(length),
+				       (prot & PROT_WRITE) != 0);
+	return ret;
 }
 
 // SYS_MUNMAP - unmap memory

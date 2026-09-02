@@ -49,11 +49,23 @@ typedef uint64_t  uint_least64_t;
 #define INT16_MIN  (-32768)
 #define INT16_MAX  (32767)
 #define UINT16_MAX (65535)
-#define INT32_MIN  (-2147483648)
 #define INT32_MAX  (2147483647)
+/* Written as -MAX-1, not as the literal, and the difference is the TYPE.
+ * 2147483648 does not fit in an int, so `-2147483648' is a long, and
+ * 9223372036854775808 does not fit in a long, so `-9223372036854775808L' is
+ * a 128-bit integer -- neither of which is the type the standard says these
+ * macros have.  Code that only compares against them cannot tell; code that
+ * asks the compiler about the type can, and says so at the far end:
+ *
+ *   error: no matching function for call to 'bit_cast<uint32_t>(long int)'
+ *   error: no matching function for call to 'bit_cast<uint64_t>(__int128)'
+ *
+ * which is where this was found (JavaScriptCore's WebAssembly compiler,
+ * saturating the result of a float-to-int truncation). */
+#define INT32_MIN  (-INT32_MAX - 1)
 #define UINT32_MAX (4294967295U)
-#define INT64_MIN  (-9223372036854775808L)
 #define INT64_MAX  (9223372036854775807L)
+#define INT64_MIN  (-INT64_MAX - 1)
 #define UINT64_MAX (18446744073709551615UL)
 
 /* Limits for the fast and least types.  C99 requires these alongside the

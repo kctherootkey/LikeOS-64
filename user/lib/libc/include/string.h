@@ -26,6 +26,10 @@ char* strchr(const char* s, int c);
 char* strrchr(const char* s, int c);
 char* strstr(const char* haystack, const char* needle);
 char* strdup(const char* s);
+/* Pointer to the first `c' in s, or to its terminating NUL -- never NULL. */
+char* strchrnul(const char* s, int c);
+/* memset(s, 0, n) that the compiler may not optimise away. */
+void explicit_bzero(void* s, size_t n);
 char* strndup(const char* s, size_t n);
 char* strtok(char* str, const char* delim);
 char* strtok_r(char* str, const char* delim, char** saveptr);

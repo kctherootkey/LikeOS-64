@@ -484,6 +484,55 @@ int vfs_register_devfs(const vfs_ops_t *ops)
 	g_dev_ops = ops;
 	return ST_OK;
 }
+
+/* Extra mount points besides /dev: pseudo filesystems at /sys and /proc.
+ * A path is owned by the mount whose prefix it starts with (followed by
+ * end-of-string or '/'). */
+#define VFS_MAX_MOUNTS 4
+static struct {
+	const char *prefix;
+	size_t len;
+	const vfs_ops_t *ops;
+} g_mounts[VFS_MAX_MOUNTS];
+static int g_nmounts;
+
+int vfs_register_mount(const char *prefix, const vfs_ops_t *ops)
+{
+	if (!prefix || !ops || g_nmounts >= VFS_MAX_MOUNTS)
+		return ST_INVALID;
+	size_t l = 0;
+	while (prefix[l])
+		l++;
+	g_mounts[g_nmounts].prefix = prefix;
+	g_mounts[g_nmounts].len = l;
+	g_mounts[g_nmounts].ops = ops;
+	g_nmounts++;
+	return ST_OK;
+}
+
+static const vfs_ops_t *vfs_mount_ops(const char *path)
+{
+	if (!path)
+		return NULL;
+	for (int i = 0; i < g_nmounts; i++) {
+		size_t l = g_mounts[i].len;
+		size_t k = 0;
+		while (k < l && path[k] == g_mounts[i].prefix[k])
+			k++;
+		if (k == l && (path[l] == 0 || path[l] == '/'))
+			return g_mounts[i].ops;
+	}
+	return NULL;
+}
+
+/* Names of the mount points directly under /, for the root listing. */
+int vfs_mount_name(int index, const char **name_out)
+{
+	if (index < 0 || index >= g_nmounts)
+		return 0;
+	*name_out = g_mounts[index].prefix + 1;
+	return 1;
+}
 int vfs_root_ready(void)
 {
 	return g_root_ops != 0;
@@ -637,6 +686,22 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 		WARN_ON(ret == ST_OK && *out == NULL);
 		return ret;
 	}
+	{
+		const vfs_ops_t *mo = vfs_mount_ops(path);
+		if (mo) {
+			if (!mo->open)
+				return ST_UNSUPPORTED;
+			int ret = mo->open(path, flags, out);
+			if (ret == ST_OK && *out) {
+				(*out)->refcount = 1;
+				(*out)->flags = flags;
+				(*out)->is_root_dir = 0;
+				(*out)->dev_injected = 0;
+				vfs_set_at_path(*out, path);
+			}
+			return ret;
+		}
+	}
 
 	if (!g_root_ops || !g_root_ops->open)
 		return ST_UNSUPPORTED;
@@ -681,6 +746,11 @@ static int vfs_raw_stat(const char *path, struct kstat *st)
 			return ST_UNSUPPORTED;
 		return g_dev_ops->stat(path, st);
 	}
+	{
+		const vfs_ops_t *mo = vfs_mount_ops(path);
+		if (mo)
+			return mo->stat ? mo->stat(path, st) : ST_UNSUPPORTED;
+	}
 	if (!g_root_ops || !g_root_ops->stat)
 		return ST_UNSUPPORTED;
 	return g_root_ops->stat(path, st);
@@ -710,6 +780,11 @@ int vfs_chdir(const char *path)
 			return ST_UNSUPPORTED;
 		return g_dev_ops->chdir(path);
 	}
+	{
+		const vfs_ops_t *mo = vfs_mount_ops(path);
+		if (mo)
+			return mo->chdir ? mo->chdir(path) : ST_UNSUPPORTED;
+	}
 	if (!g_root_ops || !g_root_ops->chdir)
 		return ST_UNSUPPORTED;
 	return g_root_ops->chdir(path);
@@ -720,7 +795,10 @@ int vfs_chdir(const char *path)
  * leaving every caller below unchanged.) */
 static const vfs_ops_t *vfs_ops_for_path(const char *path)
 {
-	return vfs_is_dev_path(path) ? g_dev_ops : g_root_ops;
+	if (vfs_is_dev_path(path))
+		return g_dev_ops;
+	const vfs_ops_t *mo = vfs_mount_ops(path);
+	return mo ? mo : g_root_ops;
 }
 
 /* Flush the root filesystem's pending metadata + journal (sync(2)).  No-op when
@@ -1043,6 +1121,47 @@ long vfs_read(vfs_file_t *f, void *buf, long bytes)
 		return ST_INVALID;
 	return f->ops->read(f, buf, bytes);
 }
+/* Read at an offset the caller names.
+ *
+ * The point of it is what it does NOT do: consult or move f->pos.  A file's
+ * position belongs to the descriptor, and a mapping shares its handle with
+ * that descriptor -- mmap references the caller's open file, and fork shares
+ * it again.  So a page-in that seeks the handle, reads and seeks back is
+ * racing every read() and lseek() the program makes on the same descriptor,
+ * and loses by filling the page from the wrong part of the file.  The
+ * reference has no such race because paging there reads by index and never
+ * looks at the descriptor at all; this is that property, expressed as a call.
+ *
+ * A filesystem without ->read_at still gets the old sequence, but under the
+ * handle's page-in flag, which is at least the same serialisation pread(2)
+ * already uses. */
+long vfs_pread(vfs_file_t *f, void *buf, long bytes, long off)
+{
+	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
+		return ST_INVALID;
+	if (off < 0)
+		return ST_INVALID;
+	if (f->ops->read_at)
+		return f->ops->read_at(f, buf, bytes, off);
+	if (!f->ops->read || !f->ops->seek)
+		return ST_INVALID;
+
+	while (__atomic_test_and_set(&f->pagein_busy, __ATOMIC_ACQUIRE))
+		sched_yield_in_kernel();
+	task_t *cur = sched_current();
+	f->pagein_owner = cur ? (int64_t)cur->id : -1;
+
+	long r = ST_INVALID;
+	long saved = f->ops->seek(f, 0, 1 /* SEEK_CUR */);
+	if (saved >= 0 && f->ops->seek(f, off, 0 /* SEEK_SET */) >= 0) {
+		r = f->ops->read(f, buf, bytes);
+		f->ops->seek(f, saved, 0);
+	}
+	f->pagein_owner = -1;
+	__atomic_clear(&f->pagein_busy, __ATOMIC_RELEASE);
+	return r;
+}
+
 long vfs_write(vfs_file_t *f, const void *buf, long bytes)
 {
 	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
@@ -1072,6 +1191,33 @@ long vfs_readdir(vfs_file_t *f, void *buf, long bytes)
 
 	// If this is the root directory and we haven't injected /dev yet, inject it first
 	if (f->is_root_dir && !f->dev_injected && g_dev_ops) {
+		/* The other mount points (/sys, /proc) first: they are not
+		 * on the root filesystem either. */
+		for (int mi = 0;; mi++) {
+			const char *mn;
+			if (!vfs_mount_name(mi, &mn))
+				break;
+			unsigned nl = 0;
+			while (mn[nl])
+				nl++;
+			unsigned short rl = (unsigned short)(sizeof(struct dirent64) + nl + 1);
+			rl = (rl + 7) & ~7;
+			if (bytes < rl)
+				break;
+			struct dirent64 ment;
+			mm_memset(&ment, 0, sizeof(ment));
+			ment.d_ino = 3 + (uint64_t)mi;
+			ment.d_off = rl;
+			ment.d_reclen = rl;
+			ment.d_type = DT_DIR;
+			smap_disable();
+			mm_memcpy(out, &ment, sizeof(ment));
+			mm_memcpy(out + sizeof(ment), mn, nl + 1);
+			smap_enable();
+			out += rl;
+			bytes -= rl;
+			total += rl;
+		}
 		// Calculate size for "dev" entry
 		unsigned short reclen =
 			(unsigned short)(sizeof(struct dirent64) +

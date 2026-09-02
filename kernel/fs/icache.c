@@ -635,8 +635,8 @@ void icache_io_lock(ic_inode_t *inode)
 		}
 		task_t *cur = sched_current();
 		if (cur) {
-			cur->state = TASK_BLOCKED;
 			cur->wait_channel = &inode->io_locked;
+			cur->state = TASK_BLOCKED;
 		}
 		spin_unlock_irqrestore(&inode->io_wait_lock, flags);
 		sched_schedule();

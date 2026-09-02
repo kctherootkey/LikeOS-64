@@ -71,7 +71,8 @@ void socket_init(void)
 // pick the same port for another socket.  Callers set the remaining
 // local_addr fields (family/addr) around this call; only sin_port + bound key
 // the collision scan, so their ordering does not matter.  Returns host-order.
-static uint16_t alloc_ephemeral_port(net_socket_t *s)
+static uint16_t alloc_ephemeral_port(net_socket_t *s, uint32_t dst_ip,
+				    uint16_t dst_port)
 {
 	// Draw the randomized starting point BEFORE taking the port lock —
 	// random_get_bytes may take the entropy lock, which must not nest under
@@ -95,13 +96,32 @@ static uint16_t alloc_ephemeral_port(net_socket_t *s)
 			}
 		}
 		/* The socket table is not enough: a connection in TIME_WAIT/
-		 * FIN_WAIT still owns its port after its socket is gone, and
-		 * re-issuing that port to a reconnect toward the same remote
+		 * FIN_WAIT still owns its 4-tuple after its socket is gone,
+		 * and re-issuing it to a reconnect toward the SAME remote
 		 * collides the handshake with the dying conn (sporadic
 		 * "connection reset"/"broken pipe" during parallel browser
-		 * loads).  See tcp_local_port_in_use(). */
-		if (!in_use && tcp_local_port_in_use(cand))
-			in_use = 1;
+		 * loads).
+		 *
+		 * Only toward the same remote.  This used to reject a
+		 * candidate if ANY connection held the port, which is a much
+		 * stronger rule than the collision needs and it priced the
+		 * ephemeral range in CONNECTIONS rather than in
+		 * connections-per-peer: with every close lingering a minute
+		 * in TIME_WAIT, a few thousand requests exhausted all 16384
+		 * ports, and each allocation then walked all 128 candidates
+		 * against the whole connection table -- with interrupts off,
+		 * while the receive path needed the same lock.  Asking about
+		 * the 4-tuple instead is what actually prevents the
+		 * collision, and it lets one local port serve as many peers
+		 * as there are peers. */
+		if (!in_use) {
+			if (dst_ip)
+				in_use = tcp_4tuple_in_use(
+					net_ntohl(s->local_addr.sin_addr.s_addr),
+					cand, dst_ip, dst_port);
+			else
+				in_use = tcp_local_port_in_use(cand);
+		}
 		if (!in_use) {
 			port = cand;
 			break;
@@ -306,7 +326,7 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 	s->local_addr = *addr;
 	if (s->local_addr.sin_port == 0) {
 		// Reserves the port and sets s->bound under the port lock.
-		alloc_ephemeral_port(s);
+		alloc_ephemeral_port(s, 0, 0);
 	}
 	s->bind_euid = current_euid();
 	s->bound = 1;
@@ -449,8 +469,10 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
 		s->local_addr.sin_family = AF_INET;
 		s->bind_euid = current_euid();
-		// Reserves the port and sets s->bound under the port lock.
-		alloc_ephemeral_port(s);
+		/* Reserves the port and sets s->bound under the port lock.
+		 * The destination goes in because the port only has to be
+		 * free TOWARD IT -- see alloc_ephemeral_port(). */
+		alloc_ephemeral_port(s, dst_ip, net_ntohs(addr->sin_port));
 	}
 
 	s->remote_addr = *addr;
@@ -651,7 +673,7 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 			s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
 			s->bind_euid = current_euid();
 			// Reserves the port and sets s->bound under the port lock.
-			alloc_ephemeral_port(s);
+			alloc_ephemeral_port(s, 0, 0);
 		}
 
 		uint16_t src_port = net_ntohs(s->local_addr.sin_port);
@@ -1890,12 +1912,12 @@ int sock_socketpair(int domain, int type, int protocol, int sv[2])
 	s0->local_addr.sin_family = AF_INET;
 	s0->local_addr.sin_addr.s_addr = net_htonl(0x7F000001);
 	s0->bind_euid = current_euid();
-	uint16_t port0 = alloc_ephemeral_port(s0);
+	uint16_t port0 = alloc_ephemeral_port(s0, 0, 0);
 
 	s1->local_addr.sin_family = AF_INET;
 	s1->local_addr.sin_addr.s_addr = net_htonl(0x7F000001);
 	s1->bind_euid = current_euid();
-	uint16_t port1 = alloc_ephemeral_port(s1);
+	uint16_t port1 = alloc_ephemeral_port(s1, 0, 0);
 
 	// Cross-connect the pair now that both local ports are fixed.
 	s0->remote_addr.sin_family = AF_INET;
@@ -2151,9 +2173,22 @@ int sock_poll(int sockfd, short events)
 			// Error / hangup
 			if (conn->error)
 				revents |= POLLERR;
+			/* Hangup means BOTH directions are finished.
+			 *
+			 * CLOSE_WAIT does not qualify and used to be listed
+			 * here: it means the peer sent FIN and we have not
+			 * closed our side, which is the ordinary end of every
+			 * keep-alive HTTP response.  Reporting a full hangup
+			 * for it told the caller the connection was dead
+			 * while it was still perfectly readable -- the EOF is
+			 * already signalled, correctly, as POLLIN above, and
+			 * that is the whole of what a reader needs.  A client
+			 * library that believes HUP instead tears the
+			 * connection down mid-exchange and reports the error
+			 * of whatever it tried next. */
 			if (conn->state == TCP_STATE_CLOSED ||
-			    conn->state == TCP_STATE_CLOSE_WAIT ||
-			    conn->state == TCP_STATE_TIME_WAIT)
+			    conn->state == TCP_STATE_TIME_WAIT ||
+			    (s->rx_shutdown && s->tx_shutdown))
 				revents |= POLLHUP;
 		} else if (!s->connected && !s->listening) {
 			// Unconnected TCP socket is writable (can connect)

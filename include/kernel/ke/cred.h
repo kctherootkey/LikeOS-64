@@ -9,8 +9,9 @@
 // enforcement consults the effective/fs IDs; this credential layer only stores
 // and reports them and implements the POSIX set*-id transitions.
 //
-// Note: threads (CLONE_THREAD) currently get an independent copy rather than a
-// shared credential — full POSIX shared-cred semantics is a later refinement.
+// Threads (CLONE_THREAD) each carry a copy; the set*-id syscalls apply their
+// result to every thread of the group (cred_broadcast in cred.c), which gives
+// the process-wide semantics POSIX asks for.
 #ifndef LIKEOS_CRED_H
 #define LIKEOS_CRED_H
 

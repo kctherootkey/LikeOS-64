@@ -56,6 +56,11 @@ typedef unsigned long  u_int64_t;
 
 typedef int64_t  off64_t;
 typedef long     suseconds_t;
+/* The argument type of usleep(3) and ualarm(3): a count of microseconds,
+ * unsigned and at least 32 bits.  POSIX dropped the type in 2008 along with
+ * those two functions, but code written against the older standard still
+ * declares variables with it, and every C library still defines it. */
+typedef unsigned int useconds_t;
 typedef long     clock_t;
 typedef int      key_t;
 typedef int      id_t;

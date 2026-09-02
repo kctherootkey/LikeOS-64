@@ -2,13 +2,14 @@
 #ifndef _KERNEL_SIGNAL_H_
 #define _KERNEL_SIGNAL_H_
 
+#include <kernel/ke/fpu.h>
 #include <kernel/uapi/types.h>
 
 // Forward declarations
 struct task;
 struct interrupt_frame;
 
-// Signal numbers (Linux compatible)
+// Signal numbers (the conventional numbering)
 #define SIGHUP 1
 #define SIGINT 2
 #define SIGQUIT 3
@@ -215,8 +216,11 @@ typedef struct sigaltstack {
 // sigaltstack flags
 #define SS_ONSTACK 1
 #define SS_DISABLE 2
-#define MINSIGSTKSZ 2048
-#define SIGSTKSZ 8192
+/* The frame a handler is entered with carries the whole extended register
+ * file (up to FPU_STATE_MAX bytes), so the smallest usable alternate stack
+ * is a good deal larger than the historical 2 KB. */
+#define MINSIGSTKSZ 12288
+#define SIGSTKSZ 65536
 
 // Interval timer types
 #define ITIMER_REAL 0 // Real time (SIGALRM)
@@ -244,6 +248,9 @@ typedef int32_t ktimer_t;
 #define CLOCK_MONOTONIC_RAW 4
 #define CLOCK_REALTIME_COARSE 5
 #define CLOCK_MONOTONIC_COARSE 6
+#define CLOCK_BOOTTIME 7
+/* clock_nanosleep(): the request is an absolute time on the clock. */
+#define TIMER_ABSTIME 1
 
 struct k_timespec {
 	int64_t tv_sec; // Seconds
@@ -407,56 +414,72 @@ static inline int sig_default_action(int sig)
 // Maximum pending signals per task
 #define MAX_PENDING_SIGNALS 32
 
-// Signal frame - saved on user stack during signal delivery
-// This must match what sys_rt_sigreturn expects
+/* ---- Machine context handed to a signal handler --------------------------
+ *
+ * The third argument of an SA_SIGINFO handler points at this.  The register
+ * order in gregs[] is the conventional x86-64 one (the REG_* indices below),
+ * which is what portable code -- debuggers, language runtimes that resume a
+ * faulting instruction by editing REG_RIP, garbage collectors that scan a
+ * suspended thread's registers -- has been written against.
+ *
+ * The frame is the ONLY copy of the interrupted registers: sigreturn reads
+ * them back from here, so a handler that writes to gregs[] changes where and
+ * with what the interrupted code resumes.  That is the documented contract
+ * of ucontext, not an accident of layout.
+ *
+ * This layout is mirrored byte for byte by <sys/ucontext.h> in the libc. */
+enum {
+	REG_R8 = 0, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14,
+	REG_R15, REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX,
+	REG_RCX, REG_RSP, REG_RIP, REG_EFL, REG_CSGSFS, REG_ERR, REG_TRAPNO,
+	REG_OLDMASK, REG_CR2, NGREG
+};
+
+typedef struct mcontext {
+	uint64_t gregs[NGREG];
+	/* Points at the extended register image in the frame (FXSAVE layout
+	 * for the first 512 bytes, XSAVE header and components after it). */
+	void *fpregs;
+	uint64_t __reserved[8];
+} mcontext_t;
+
+typedef struct ucontext {
+	uint64_t uc_flags;
+	struct ucontext *uc_link;
+	stack_t uc_stack;
+	mcontext_t uc_mcontext;
+	kernel_sigset_t uc_sigmask;
+	uint8_t __reserved[64];
+} ucontext_t;
+
+/* Bytes reserved in every frame for the extended register image.  Fixed
+ * rather than g_fpu_state_size so the frame has one shape; the image is
+ * 64-byte aligned within the frame, as XSAVE demands. */
+#define SIGFRAME_FPU_SIZE FPU_STATE_MAX
+
+/* Signal frame -- what the kernel writes on the user stack to enter a
+ * handler, and what sys_rt_sigreturn reads back.  Laid out on the stack as
+ *
+ *     frame_addr:                 signal_frame_t (this struct)
+ *     align_up(end, 64):          SIGFRAME_FPU_SIZE bytes of register image
+ *
+ * The handler is entered with RSP == frame_addr, so `pretcode' is what its
+ * `ret' pops.  Everything the interrupted context needs lives in `uc'. */
 typedef struct signal_frame {
-	// Return address (points to sigreturn trampoline)
-	uint64_t pretcode;
-
-	// Saved registers (for restoration by sigreturn)
-	uint64_t rax;
-	uint64_t rbx;
-	uint64_t rcx;
-	uint64_t rdx;
-	uint64_t rsi;
-	uint64_t rdi;
-	uint64_t rbp;
-	uint64_t rsp; // Original user RSP before signal
-	uint64_t r8;
-	uint64_t r9;
-	uint64_t r10;
-	uint64_t r11;
-	uint64_t r12;
-	uint64_t r13;
-	uint64_t r14;
-	uint64_t r15;
-	uint64_t rip; // Original return address
-	uint64_t rflags;
-
-	// Signal info
+	uint64_t pretcode; // return address: sa_restorer or &retcode
+	ucontext_t uc; // registers, mask, altstack state
 	int sig;
+	int __pad;
 	siginfo_t info;
-
-	// Saved signal mask
-	kernel_sigset_t saved_mask;
-
-	/* FXSAVE image of the interrupted context.
-	 *
-	 * The x87/SSE registers are caller-saved in the ABI, and a signal
-	 * handler is a caller that the interrupted code never made: the first
-	 * SSE-using libc call inside the handler clobbers XMM registers the
-	 * interrupted computation still owns.  Restoring only the integer
-	 * registers at sigreturn resumed that computation with someone else's
-	 * floating-point state -- observed as JavaScript engines dereferencing
-	 * NaN-boxed doubles whose bits had changed mid-interpretation, and as
-	 * heap corruption from pointers computed off corrupted values.  Every
-	 * POSIX kernel carries the FP state in the signal frame for exactly
-	 * this reason. */
-	uint8_t fpu[512];
-
-	// Sigreturn trampoline code (if needed)
+	// Sigreturn trampoline (used when sa_restorer is not set)
 	uint8_t retcode[16];
-} __attribute__((packed)) signal_frame_t;
+} signal_frame_t;
+
+/* Where the register image sits for a frame at `frame_addr'. */
+static inline uint64_t sigframe_fpu_addr(uint64_t frame_addr)
+{
+	return (frame_addr + sizeof(signal_frame_t) + 63) & ~63ULL;
+}
 
 // Pending signal queue entry
 typedef struct pending_signal {
@@ -471,6 +494,12 @@ typedef struct task_signal_state {
 	kernel_sigset_t blocked; // Blocked signals mask
 	kernel_sigset_t pending; // Pending signals bitmask
 	pending_signal_t *pending_queue; // Queue for siginfo
+	/* Woken whenever a signal is queued for this task: signalfd readers
+	 * and pollers sleep here (the signals they want are blocked, so the
+	 * ordinary "actionable signal" wake does not apply to them).
+	 * Allocated on first signalfd use (signalfd_task_wq), freed with the
+	 * task; NULL for the many tasks that never use a signalfd. */
+	struct wait_queue_head *sigfd_wq;
 	kernel_sigset_t saved_mask; // Saved mask for sigsuspend
 	int in_sigsuspend; // Currently in sigsuspend
 	stack_t altstack; // Alternate signal stack
@@ -531,8 +560,18 @@ extern uint64_t syscall_saved_user_rax;
 
 // Signal API for kernel use
 void signal_init_task(struct task *task);
+/* The task's signalfd wait queue, allocated on first use (NULL when the
+ * allocation fails).  kernel/fs/signalfd.c */
+struct wait_queue_head;
+struct wait_queue_head *signalfd_task_wq(struct task *task);
 void signal_reset_on_exec(struct task *task);
 void signal_fork_copy(struct task *child, struct task *parent);
+/* The same for a clone that SHARES its creator's handlers (CLONE_SIGHAND,
+ * which CLONE_THREAD implies): the dispositions and the blocked mask stay,
+ * everything per-task is reset.  Must be called for every such clone -- the
+ * task_t was produced by a wholesale copy, so skipping it leaves two tasks
+ * owning one signalfd wait queue and one pending-siginfo list. */
+void signal_thread_copy(struct task *child, struct task *parent);
 void signal_cleanup_task(struct task *task);
 int signal_send(struct task *task, int sig, siginfo_t *info);
 int signal_send_group(int pgid, int sig, siginfo_t *info);
@@ -573,6 +612,9 @@ int signal_permission(struct task *target, int sig);
 int signal_pending(struct task *task);
 int signal_should_restart(struct task *task);
 int signal_dequeue(struct task *task, kernel_sigset_t *mask, siginfo_t *info);
+/* ...and the signalfd form: `want' is the set to TAKE, not the set to skip. */
+int signal_dequeue_wanted(struct task *task, const kernel_sigset_t *want,
+			  siginfo_t *info);
 /* Queue a synchronous fault signal (SIGSEGV/SIGILL/SIGBUS/SIGFPE) with the
  * si_code and si_addr a debugger needs, forcing the disposition back to default
  * if the program blocked or ignored it -- a fault cannot be declined, since

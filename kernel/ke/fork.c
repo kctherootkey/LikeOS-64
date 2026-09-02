@@ -546,6 +546,12 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			sighand_struct_get(cur->sighand);
 			child->sighand = cur->sighand;
 		}
+		/* Sharing the DISPOSITIONS does not mean sharing the rest of
+		 * the signal state, and this arm used to do nothing at all --
+		 * so a new thread carried away the creator's signalfd wait
+		 * queue and its pending-siginfo list, and whichever of the two
+		 * was reaped first freed them both.  See signal_thread_copy(). */
+		signal_thread_copy(child, cur);
 	} else {
 		// Copy signal handlers (already done by memcpy)
 		child->sighand = NULL;

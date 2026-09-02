@@ -1,4 +1,5 @@
 // LikeOS-64 Kernel Signal Implementation
+#include <kernel/dev/device.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/sched.h>
 #include <kernel/mm/memory.h>
@@ -10,36 +11,173 @@
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/icache.h>
 #include <kernel/ke/uaccess.h>
+#include <kernel/ke/waitq.h>
 
 // NOTE: Signal delivery now uses per-CPU storage via percpu_t
+/* Bytes below RSP the ABI reserves for leaf functions (the red zone); a
+ * signal frame is placed below it.  Rationale with the frame builders. */
+#define SIGFRAME_REDZONE 128
+
 // The old global syscall_signal_pending is deprecated.
 
-/* Capture / restore the interrupted context's x87/SSE state for the signal
- * frame -- see the fpu[] field in signal_frame_t.  At both delivery points
- * (syscall tail and IRQ tail) the hardware registers hold the CURRENT task's
- * user state (the context switch saves and restores it around every
- * migration), so a plain FXSAVE here reads the state the frame must
- * preserve.  FXSAVE/FXRSTOR demand a 16-byte-aligned buffer and the packed
- * frame cannot promise one, so both go through an aligned bounce. */
-static void sigframe_fpu_capture(uint8_t *dst512)
+/* The interrupted context's extended register state travels in the signal
+ * frame (see signal_frame_t): the x87/SSE/AVX registers are caller-saved in
+ * the ABI, and a handler is a caller the interrupted code never made, so
+ * without this the first vector-using libc call inside a handler clobbers
+ * registers the interrupted computation still owns.
+ *
+ * At both delivery points (syscall tail and IRQ tail) the hardware registers
+ * hold the CURRENT task's user state -- the context switch saves and
+ * restores it around every migration -- so the image is taken straight from
+ * the registers into the user frame.  The frame's image slot is 64-byte
+ * aligned (sigframe_fpu_addr), which XSAVE requires. */
+static void sigframe_fpu_capture(uint64_t fpu_addr)
 {
-	uint8_t bounce[512] __attribute__((aligned(16)));
-
-	__asm__ volatile("fxsave (%0)" : : "r"(bounce) : "memory");
-	mm_memcpy(dst512, bounce, 512);
+	smap_disable();
+	fpu_save((void *)fpu_addr);
+	smap_enable();
 }
 
-static void sigframe_fpu_restore(const uint8_t *src512)
+/* The reverse, at sigreturn.  The image sits on the user's own stack and is
+ * user-writable, and a poisoned one makes the restore instruction fault in
+ * the kernel, so it is copied into the task's own save area, sanitised
+ * there, and loaded from there.  Interrupts are off across the three steps:
+ * a context switch in between would overwrite the save area with the live
+ * (handler's) registers and the wrong state would be loaded. */
+static void sigframe_fpu_restore(task_t *task, uint64_t fpu_addr)
 {
-	uint8_t bounce[512] __attribute__((aligned(16)));
+	uint64_t irqf = local_irq_save();
 
-	mm_memcpy(bounce, src512, 512);
-	/* The frame lives on the user's stack and is user-writable: a
-	 * poisoned MXCSR with reserved bits set makes FXRSTOR raise #GP in
-	 * the KERNEL.  Clear the reserved high half; the low 16 bits are
-	 * the architected control/status bits and are all legal. */
-	*(uint32_t *)(bounce + 24) &= 0xFFFF;
-	__asm__ volatile("fxrstor (%0)" : : "r"(bounce) : "memory");
+	smap_disable();
+	mm_memcpy(task->fpu_state, (const void *)fpu_addr, g_fpu_state_size);
+	smap_enable();
+	fpu_sanitize_state(task->fpu_state);
+	fpu_restore(task->fpu_state);
+	local_irq_restore(irqf);
+}
+
+/* ---- Frame placement and construction, shared by both delivery paths ----
+ *
+ * Choose where the frame goes (the alternate stack if the action asks for
+ * one and we are not already on it, else below the interrupted RSP, past
+ * the red zone), and give both addresses the alignment the ABI and XSAVE
+ * demand: the handler is entered as though by a call, so RSP % 16 must be
+ * 8 there (the compiler lays out the handler's frame on that assumption,
+ * and the first `movaps' to a stack local faults otherwise), and the
+ * register image must sit on a 64-byte boundary. */
+static int sigframe_place(task_t *task, const struct k_sigaction *act,
+			  uint64_t user_rsp, uint64_t *frame_addr_out,
+			  uint64_t *fpu_addr_out, int *on_altstack_out)
+{
+	const stack_t *alt = &task->signals.altstack;
+	uint64_t sp = user_rsp - SIGFRAME_REDZONE;
+	int on_alt = 0;
+
+	if (alt->ss_sp && alt->ss_size && !(alt->ss_flags & SS_DISABLE)) {
+		uint64_t lo = (uint64_t)alt->ss_sp;
+		uint64_t hi = lo + alt->ss_size;
+
+		if (user_rsp >= lo && user_rsp < hi) {
+			on_alt = 1; /* already on it: nest below */
+		} else if (act->sa_flags & SA_ONSTACK) {
+			sp = hi; /* switch: no red zone on a fresh stack */
+			on_alt = 1;
+		}
+	}
+
+	uint64_t fpu_addr = (sp - SIGFRAME_FPU_SIZE) & ~63ULL;
+	uint64_t frame_addr =
+		((fpu_addr - sizeof(signal_frame_t)) & ~0xFULL) - 8;
+
+	/* sigframe_fpu_addr() must land back on the slot chosen here. */
+	WARN_ON(sigframe_fpu_addr(frame_addr) != fpu_addr);
+	WARN_ON((frame_addr & 0xF) != 8);
+
+	if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF)
+		return -1;
+	*frame_addr_out = frame_addr;
+	*fpu_addr_out = fpu_addr;
+	*on_altstack_out = on_alt;
+	return 0;
+}
+
+/* Fill in everything in the frame that is not a register: identity,
+ * siginfo, the mask sigreturn restores, the altstack description, the
+ * trampoline, the return address. */
+static void sigframe_fill(signal_frame_t *kf, task_t *task, int sig,
+			  const siginfo_t *info, const struct k_sigaction *act,
+			  uint64_t frame_addr, uint64_t fpu_addr, int on_alt)
+{
+	kf->sig = sig;
+	if (info)
+		mm_memcpy(&kf->info, info, sizeof(siginfo_t));
+
+	/* Save the mask sigreturn must restore.  Normally that is the current
+	 * blocked set, but if ppoll()/pselect() installed a temporary mask
+	 * for its wait, the caller's ORIGINAL mask is the one that has to
+	 * come back after the handler -- take ownership of that deferred
+	 * restore here. */
+	if (task->sigmask_restore_pending) {
+		kf->uc.uc_sigmask = task->sigmask_saved;
+		task->sigmask_restore_pending = 0;
+	} else {
+		kf->uc.uc_sigmask = task->signals.blocked;
+	}
+
+	kf->uc.uc_flags = 0;
+	kf->uc.uc_link = NULL;
+	kf->uc.uc_stack = task->signals.altstack;
+	kf->uc.uc_stack.ss_flags =
+		(kf->uc.uc_stack.ss_flags & SS_DISABLE) ? SS_DISABLE :
+		on_alt					 ? SS_ONSTACK :
+							   0;
+	kf->uc.uc_mcontext.fpregs = (void *)fpu_addr;
+
+	/* Sigreturn trampoline: mov $SYS_RT_SIGRETURN, %rax ; syscall.
+	 * The fallback when sa_restorer is not set. */
+	kf->retcode[0] = 0x48; // REX.W
+	kf->retcode[1] = 0xc7; // mov rax, imm32
+	kf->retcode[2] = 0xc0;
+	kf->retcode[3] = 0x00; // SYS_RT_SIGRETURN = 256 = 0x100
+	kf->retcode[4] = 0x01;
+	kf->retcode[5] = 0x00;
+	kf->retcode[6] = 0x00;
+	kf->retcode[7] = 0x0f; // syscall
+	kf->retcode[8] = 0x05;
+
+	if (act->sa_restorer)
+		kf->pretcode = (uint64_t)act->sa_restorer;
+	else
+		kf->pretcode = frame_addr +
+			       __builtin_offsetof(signal_frame_t, retcode);
+}
+
+/* Copy the frame out and capture the register image behind it. */
+static void sigframe_commit(const signal_frame_t *kf, uint64_t frame_addr,
+			    uint64_t fpu_addr)
+{
+	smap_disable();
+	mm_memcpy((void *)frame_addr, kf, sizeof(*kf));
+	smap_enable();
+	sigframe_fpu_capture(fpu_addr);
+}
+
+/* Mask update on handler entry, and SA_RESETHAND. */
+static void sigframe_enter_handler(task_t *task, int sig,
+				   struct k_sigaction *act)
+{
+	sigorset_k(&task->signals.blocked, &task->signals.blocked,
+		   &act->sa_mask);
+	if (!(act->sa_flags & SA_NODEFER))
+		sigaddset_k(&task->signals.blocked, sig);
+	/* A handler must not be able to make itself unkillable for its
+	 * duration, via sa_mask or via being SIGKILL/SIGSTOP itself. */
+	sig_strip_unblockable(&task->signals.blocked);
+
+	if (act->sa_flags & SA_RESETHAND)
+		act->sa_handler = SIG_DFL;
+
+	task->signals.signal_frame_depth++;
 }
 
 // Global POSIX timer pool
@@ -54,6 +192,8 @@ void signal_init_task(task_t *task)
 		return;
 
 	task_signal_state_t *sig = &task->signals;
+
+	sig->sigfd_wq = NULL;
 
 	// Clear all handlers to default
 	for (int i = 0; i < NSIG; i++) {
@@ -115,6 +255,54 @@ void signal_reset_on_exec(task_t *task)
 
 // Copy signal handlers from parent to child during fork
 // POSIX: signal dispositions are inherited across fork
+/* The signal state a NEW task must not inherit, whatever kind of clone made
+ * it.  Both callers below start from a wholesale `mm_memcpy(child, cur,
+ * sizeof(task_t))', so every field here is currently a copy of the creator's
+ * -- and for the three POINTERS that is not a copy at all, it is a second
+ * reference to one object with two owners, each of which frees it on the way
+ * out:
+ *
+ *   - sigfd_wq is the wait queue signalfd readers and sigwait() sleep on.  It
+ *     is per-TASK, allocated on first use and freed by sched_destroy_task().
+ *     Sharing it meant the first of the two to be reaped freed the other's,
+ *     and the survivor's next signal_send() spun forever on a spinlock in
+ *     freed memory -- with interrupts disabled, so the machine simply
+ *     stopped.
+ *   - pending_queue is the list of queued siginfos, freed node by node in
+ *     signal_cleanup_task().  Two owners, one list: a double free.
+ *   - pending itself: POSIX says a new thread's pending set is empty, and a
+ *     copied bit describes a signal whose queued description belongs to
+ *     somebody else.
+ *
+ * The rest is per-task by definition: sigaltstack is explicitly per-thread
+ * and not inherited, a saved mask belongs to the sigsuspend that saved it,
+ * the interval timers and alarm() are the PROCESS's and are kept by the
+ * leader, and a frame depth describes handlers running on this task's stack.
+ *
+ * What a new task DOES inherit -- the blocked mask and the dispositions -- is
+ * left exactly as the memcpy found it, which is what both POSIX fork(2) and
+ * pthread_create(3) require. */
+static void signal_reset_new_task(task_signal_state_t *csig)
+{
+	sigemptyset_k(&csig->pending);
+	csig->pending_queue = NULL;
+	csig->sigfd_wq = NULL;
+
+	sigemptyset_k(&csig->saved_mask);
+	csig->in_sigsuspend = 0;
+
+	csig->altstack.ss_sp = NULL;
+	csig->altstack.ss_flags = SS_DISABLE;
+	csig->altstack.ss_size = 0;
+
+	mm_memset(&csig->itimer_real, 0, sizeof(csig->itimer_real));
+	mm_memset(&csig->itimer_virtual, 0, sizeof(csig->itimer_virtual));
+	mm_memset(&csig->itimer_prof, 0, sizeof(csig->itimer_prof));
+	csig->alarm_ticks = 0;
+
+	csig->signal_frame_depth = 0;
+}
+
 void signal_fork_copy(task_t *child, task_t *parent)
 {
 	BUG_ON(child == NULL || parent == NULL);
@@ -132,27 +320,29 @@ void signal_fork_copy(task_t *child, task_t *parent)
 	// Copy blocked mask (inherited across fork)
 	csig->blocked = psig->blocked;
 
-	// Clear pending signals (not inherited - child starts fresh)
-	sigemptyset_k(&csig->pending);
-	csig->pending_queue = NULL;
+	signal_reset_new_task(csig);
+}
 
-	// Clear saved mask and sigsuspend state
-	sigemptyset_k(&csig->saved_mask);
-	csig->in_sigsuspend = 0;
-
-	// Alternate stack is NOT inherited across fork
-	csig->altstack.ss_sp = NULL;
-	csig->altstack.ss_flags = SS_DISABLE;
-	csig->altstack.ss_size = 0;
-
-	// Timers are NOT inherited (child gets fresh timer state)
-	mm_memset(&csig->itimer_real, 0, sizeof(csig->itimer_real));
-	mm_memset(&csig->itimer_virtual, 0, sizeof(csig->itimer_virtual));
-	mm_memset(&csig->itimer_prof, 0, sizeof(csig->itimer_prof));
-	csig->alarm_ticks = 0;
-
-	// Clear signal frame address
-	csig->signal_frame_depth = 0;
+/* The CLONE_THREAD/CLONE_SIGHAND counterpart of signal_fork_copy().
+ *
+ * A thread that shares its creator's handlers took the other arm of that
+ * branch in do_clone(), which set up the shared sighand_struct and then went
+ * straight on -- so nothing reset the signal state at all, and the new thread
+ * began life holding the creator's queue pointers.  That is the whole of the
+ * bug described above; a thread reached it every time, a forked child never
+ * did.
+ *
+ * The dispositions are not copied here: they are the shared sighand_struct's,
+ * and the action[] array the memcpy left behind is the same one the creator
+ * has.  The blocked mask stays too -- pthread_create(3) says the new thread
+ * inherits the creating thread's mask. */
+void signal_thread_copy(task_t *child, task_t *parent)
+{
+	BUG_ON(child == NULL || parent == NULL);
+	if (!child || !parent)
+		return;
+	(void)parent;
+	signal_reset_new_task(&child->signals);
 }
 
 // Cleanup signal state when task exits
@@ -321,8 +511,13 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 	 * happened. */
 	signal_cancel_opposite(sigstate, sig);
 
-	// Check if signal is ignored (except SIGKILL/SIGSTOP)
-	if (!sig_kernel_only(sig)) {
+	/* Check if signal is ignored (except SIGKILL/SIGSTOP -- and except
+	 * while it is blocked: the disposition that matters is the one in
+	 * force when the signal is finally delivered, and the program has
+	 * until then to install a handler.  Discarding it here also took it
+	 * away from a signalfd watching it, which is a common shape: block
+	 * the signal, ignore it, read it from the descriptor.) */
+	if (!sig_kernel_only(sig) && !sigismember_k(&sigstate->blocked, sig)) {
 		if (act->sa_handler == SIG_IGN) {
 			return 0; // Signal ignored
 		}
@@ -332,6 +527,10 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 			return 0;
 		}
 	}
+
+	/* Whether this signal was ALREADY pending decides, below, if a second
+	 * description of it is worth keeping -- so read it before setting. */
+	int was_pending = sigismember_k(&sigstate->pending, sig);
 
 	// Add to pending mask
 	sigaddset_k(&sigstate->pending, sig);
@@ -358,6 +557,24 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 	     sig == SIGFPE || sig == SIGTRAP || task->tracer_pid != 0))
 		keep_info = 1;
 
+	/* A BLOCKED signal is one somebody means to READ.  sigwait(),
+	 * sigtimedwait() and signalfd() all hand their caller a siginfo, and
+	 * what is in it -- who sent it, above all -- exists nowhere else once
+	 * this returns.  Dropping it here is what made every signalfd record
+	 * read back ssi_pid == 0 for a signal that a perfectly ordinary
+	 * kill(2) had sent. */
+	if (info && !keep_info && sigismember_k(&sigstate->blocked, sig))
+		keep_info = 1;
+
+	/* Non-realtime signals do not queue: one pending instance is all there
+	 * ever is, so a second send while the first is still pending adds an
+	 * allocation that only the reader of a signal it will never see could
+	 * free.  The description already recorded is the one that stands.
+	 * (Realtime signals are exempt: queueing every instance is the whole
+	 * difference between them and the rest.) */
+	if (keep_info && was_pending && sig < SIGRTMIN)
+		keep_info = 0;
+
 	if (keep_info) {
 		pending_signal_t *ps = alloc_pending_signal();
 		if (ps) {
@@ -367,6 +584,11 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 			sigstate->pending_queue = ps;
 		}
 	}
+
+	/* signalfd readers/pollers of this task sleep on this queue whatever
+	 * the mask says. */
+	if (sigstate->sigfd_wq)
+		poll_notify_wq(sigstate->sigfd_wq);
 
 	// Wake BLOCKED tasks when the signal is actionable (not masked).
 	// This is needed because some callers (sys_tkill, sys_rt_sigqueueinfo,
@@ -467,6 +689,56 @@ int signal_should_restart(task_t *task)
 }
 
 // Dequeue a pending signal (returns signal number, 0 if none)
+/* Dequeue a pending signal that IS a member of `want'.
+ *
+ * The mask signal_dequeue() takes below is a set to SKIP -- a blocked set.
+ * A signalfd needs the opposite question asked: it watches a set and wants
+ * exactly those.  Handing its watch set to signal_dequeue() answered the
+ * inverse, so a descriptor watching SIGUSR1 dequeued everything except
+ * SIGUSR1 and reported EAGAIN with the signal sitting pending in front of
+ * it -- and the process died of it the moment the mask was restored.
+ *
+ * SIGKILL and SIGSTOP are never taken here whatever the watch set says:
+ * they are not a descriptor's to consume. */
+int signal_dequeue_wanted(task_t *task, const kernel_sigset_t *want,
+			  siginfo_t *info)
+{
+	task_signal_state_t *sig;
+
+	if (!task || !want)
+		return 0;
+	sig = &task->signals;
+
+	for (int s = 1; s < NSIG; s++) {
+		if (sig_kernel_only(s))
+			continue;
+		if (!sigismember_k(want, s) || !sigismember_k(&sig->pending, s))
+			continue;
+
+		sigdelset_k(&sig->pending, s);
+		if (info) {
+			pending_signal_t **pp = &sig->pending_queue;
+
+			mm_memset(info, 0, sizeof(*info));
+			info->si_signo = s;
+			info->si_code = SI_USER;
+			while (*pp) {
+				if ((*pp)->sig == s) {
+					pending_signal_t *ps = *pp;
+					*pp = ps->next;
+					mm_memcpy(info, &ps->info,
+						  sizeof(siginfo_t));
+					kfree(ps);
+					break;
+				}
+				pp = &(*pp)->next;
+			}
+		}
+		return s;
+	}
+	return 0;
+}
+
 int signal_dequeue(task_t *task, kernel_sigset_t *mask, siginfo_t *info)
 {
 	BUG_ON(task == NULL);
@@ -558,9 +830,10 @@ int signal_dequeue(task_t *task, kernel_sigset_t *mask, siginfo_t *info)
  * syscall issued inline from a leaf function leaves its red zone live too,
  * since the syscall instruction pushes nothing.
  */
-#define SIGFRAME_REDZONE 128
+/* (SIGFRAME_REDZONE itself is defined at the top of the file, ahead of the
+ * placement helper that uses it.) */
 
-// Setup a signal frame on the user stack
+// Setup a signal frame on the user stack (syscall-return path).
 // Returns 0 on success, -1 on failure
 int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 		       struct k_sigaction *act)
@@ -580,123 +853,38 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	// RIP 0 — an instant SIGSEGV (exec at VA 0) instead of running the handler.
 	uint64_t handler = (uint64_t)act->sa_handler;
 
-	/* Place the signal frame so the handler is entered with the alignment
-	 * the ABI promises it.
-	 *
-	 * The handler is entered as though by a call: RSP points AT the return
-	 * address (pretcode, the first field of the frame).  At the target of a
-	 * call, RSP % 16 == 8 -- 16-byte aligned before the call, minus the
-	 * 8-byte return address the call pushed.  That is what the compiler
-	 * assumes when it lays out the handler's own frame.
-	 *
-	 * Putting the frame at a 16-ALIGNED address gives the handler
-	 * RSP % 16 == 0 instead, so everything it computes is 8 bytes out and
-	 * the first 16-byte-aligned SSE store to the stack (`movaps %xmm0,
-	 * (%rsp)`, which gcc emits for something as ordinary as initialising a
-	 * local struct) raises a general protection fault -- inside the
-	 * handler, with nothing to suggest the frame was misplaced.
-	 *
-	 * Hence: align down, then step back 8. */
-	uint64_t frame_addr =
-		((user_rsp - SIGFRAME_REDZONE - sizeof(signal_frame_t)) &
-		 ~0xFULL) - 8;
-	WARN_ON((frame_addr & 0xF) !=
-		8); /* handler must be entered with RSP % 16 == 8 */
+	uint64_t frame_addr, fpu_addr;
+	int on_alt;
 
-	// Validate the stack address is in user space
-	if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
+	if (sigframe_place(task, act, user_rsp, &frame_addr, &fpu_addr,
+			   &on_alt) < 0)
 		return -1;
-	}
 
 	// Build the signal frame in kernel memory first
 	signal_frame_t kframe;
 	mm_memset(&kframe, 0, sizeof(kframe));
-	sigframe_fpu_capture(kframe.fpu);
 
-	// Save all registers
-	kframe.rip = user_rip;
-	kframe.rsp = user_rsp;
-	kframe.rflags = user_rflags;
-	kframe.rbp = task->syscall_rbp;
-	kframe.rbx = task->syscall_rbx;
-	kframe.r12 = task->syscall_r12;
-	kframe.r13 = task->syscall_r13;
-	kframe.r14 = task->syscall_r14;
-	kframe.r15 = task->syscall_r15;
-	kframe.rcx = 0;
-	kframe.rdx = 0;
-	kframe.rsi = 0;
-	kframe.rdi = 0;
-	kframe.r8 = 0;
-	kframe.r9 = 0;
-	kframe.r10 = 0;
-	kframe.r11 = 0;
+	/* The interrupted context, as the handler will see it in
+	 * uc_mcontext.  A syscall may clobber the caller-saved registers
+	 * (the ABI allows it), so only the callee-saved set and RAX -- the
+	 * syscall's return value -- are meaningful here; the rest read 0. */
+	uint64_t *g = kframe.uc.uc_mcontext.gregs;
+	g[REG_RIP] = user_rip;
+	g[REG_RSP] = user_rsp;
+	g[REG_EFL] = user_rflags;
+	g[REG_RBP] = task->syscall_rbp;
+	g[REG_RBX] = task->syscall_rbx;
+	g[REG_R12] = task->syscall_r12;
+	g[REG_R13] = task->syscall_r13;
+	g[REG_R14] = task->syscall_r14;
+	g[REG_R15] = task->syscall_r15;
+	g[REG_RAX] = task->syscall_rax;
+	g[REG_CSGSFS] = 0x33; /* user code selector */
 
-	// Save syscall return value for sigreturn
-	kframe.rax = task->syscall_rax;
-
-	// Signal info
-	kframe.sig = sig;
-	if (info) {
-		mm_memcpy(&kframe.info, info, sizeof(siginfo_t));
-	}
-
-	/* Save the mask sigreturn must restore.  Normally that is the current
-	 * blocked set, but if ppoll()/pselect() installed a temporary mask for
-	 * its wait, the caller's ORIGINAL mask is the one that has to come back
-	 * after the handler — take ownership of that deferred restore here. */
-	if (task->sigmask_restore_pending) {
-		kframe.saved_mask = task->sigmask_saved;
-		task->sigmask_restore_pending = 0;
-	} else {
-		kframe.saved_mask = task->signals.blocked;
-	}
-
-	// Set up sigreturn trampoline code in the frame
-	// mov rax, SYS_RT_SIGRETURN (256)
-	// syscall
-	// This is the fallback if sa_restorer is not set
-	kframe.retcode[0] = 0x48; // REX.W
-	kframe.retcode[1] = 0xc7; // mov rax, imm32
-	kframe.retcode[2] = 0xc0;
-	kframe.retcode[3] = 0x00; // SYS_RT_SIGRETURN = 256 = 0x100
-	kframe.retcode[4] = 0x01;
-	kframe.retcode[5] = 0x00;
-	kframe.retcode[6] = 0x00;
-	kframe.retcode[7] = 0x0f; // syscall
-	kframe.retcode[8] = 0x05;
-
-	// Set return address - use sa_restorer if provided, else use embedded trampoline
-	if (act->sa_restorer) {
-		kframe.pretcode = (uint64_t)act->sa_restorer;
-	} else {
-		// Point to the retcode in the frame itself
-		kframe.pretcode = frame_addr +
-				  __builtin_offsetof(signal_frame_t, retcode);
-	}
-
-	// Copy frame to user stack (SMAP-aware)
-	smap_disable();
-	mm_memcpy((void *)frame_addr, &kframe, sizeof(kframe));
-	smap_enable();
-
-	// Update signal mask - block sa_mask and current signal (unless SA_NODEFER)
-	sigorset_k(&task->signals.blocked, &task->signals.blocked,
-		   &act->sa_mask);
-	if (!(act->sa_flags & SA_NODEFER)) {
-		sigaddset_k(&task->signals.blocked, sig);
-	}
-	/* A handler must not be able to make itself unkillable for its duration,
-	 * via sa_mask or via being SIGKILL/SIGSTOP itself. */
-	sig_strip_unblockable(&task->signals.blocked);
-
-	// Reset handler if SA_RESETHAND
-	if (act->sa_flags & SA_RESETHAND) {
-		act->sa_handler = SIG_DFL;
-	}
-
-	// Save frame address in task for sigreturn to find
-	task->signals.signal_frame_depth++;
+	sigframe_fill(&kframe, task, sig, info, act, frame_addr, fpu_addr,
+		      on_alt);
+	sigframe_commit(&kframe, frame_addr, fpu_addr);
+	sigframe_enter_handler(task, sig, act);
 
 	// Also update task's saved values
 	task->syscall_rsp = frame_addr;
@@ -748,17 +936,17 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 
 	/* Handler arguments 2 and 3.  An SA_SIGINFO handler is entered as
 	 * handler(sig, siginfo_t *, void *ucontext) and must be able to
-	 * dereference the siginfo: Xorg's crash handler reads si_code before
-	 * anything else, so a NULL here turned every X crash into a second
-	 * SIGSEGV inside the handler and lost the report of the first.  The
-	 * siginfo lives in the frame just written; there is no ucontext yet,
-	 * and NULL is at least honest about that.  syscall.asm loads these
-	 * two slots into RSI/RDX on the handler-call path. */
+	 * dereference both: Xorg's crash handler reads si_code before
+	 * anything else, and a language runtime's fault handler resumes the
+	 * faulting instruction by editing the ucontext.  Both live in the
+	 * frame just written.  syscall.asm loads these two slots into
+	 * RSI/RDX on the handler-call path. */
 	cpu->syscall_saved_user_rsi =
 		(act->sa_flags & SA_SIGINFO) ?
 			frame_addr + __builtin_offsetof(signal_frame_t, info) :
 			0;
-	cpu->syscall_saved_user_rdx = 0;
+	cpu->syscall_saved_user_rdx =
+		frame_addr + __builtin_offsetof(signal_frame_t, uc);
 
 	// Set signal pending flag - this tells syscall.asm to use signal return path
 	// The value is the signal number which will be loaded into RDI
@@ -792,104 +980,48 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	// SIGSEGV (exec at VA 0) instead of running the handler.
 	uint64_t handler = (uint64_t)act->sa_handler;
 
-	// Calculate new stack position for signal frame (16-byte aligned)
-	/* Same alignment rule as signal_setup_frame(): the handler is entered
-	 * as though by a call, so RSP must be 8 (mod 16) there. */
-	uint64_t frame_addr =
-		((user_rsp - SIGFRAME_REDZONE - sizeof(signal_frame_t)) &
-		 ~0xFULL) - 8;
-	WARN_ON((frame_addr & 0xF) != 8);
+	uint64_t frame_addr, fpu_addr;
+	int on_alt;
 
-	// Validate the stack address is in user space
-	if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
+	if (sigframe_place(task, act, user_rsp, &frame_addr, &fpu_addr,
+			   &on_alt) < 0)
 		return -1;
-	}
 
 	// Build the signal frame in kernel memory first
 	signal_frame_t kframe;
 	mm_memset(&kframe, 0, sizeof(kframe));
-	sigframe_fpu_capture(kframe.fpu);
 
-	// Save all registers from the interrupt frame
-	kframe.rip = user_rip;
-	kframe.rsp = user_rsp;
-	kframe.rflags = user_rflags;
-	kframe.rbp = frame->rbp;
-	kframe.rbx = frame->rbx;
-	kframe.r12 = frame->r12;
-	kframe.r13 = frame->r13;
-	kframe.r14 = frame->r14;
-	kframe.r15 = frame->r15;
-	kframe.rcx = frame->rcx;
-	kframe.rdx = frame->rdx;
-	kframe.rsi = frame->rsi;
-	kframe.rdi = frame->rdi;
-	kframe.r8 = frame->r8;
-	kframe.r9 = frame->r9;
-	kframe.r10 = frame->r10;
-	kframe.r11 = frame->r11;
+	/* The whole register file: an interrupt can land on any instruction,
+	 * with every register live. */
+	uint64_t *g = kframe.uc.uc_mcontext.gregs;
+	g[REG_RIP] = user_rip;
+	g[REG_RSP] = user_rsp;
+	g[REG_EFL] = user_rflags;
+	g[REG_RBP] = frame->rbp;
+	g[REG_RBX] = frame->rbx;
+	g[REG_R12] = frame->r12;
+	g[REG_R13] = frame->r13;
+	g[REG_R14] = frame->r14;
+	g[REG_R15] = frame->r15;
+	g[REG_RCX] = frame->rcx;
+	g[REG_RDX] = frame->rdx;
+	g[REG_RSI] = frame->rsi;
+	g[REG_RDI] = frame->rdi;
+	g[REG_R8] = frame->r8;
+	g[REG_R9] = frame->r9;
+	g[REG_R10] = frame->r10;
+	g[REG_R11] = frame->r11;
+	g[REG_RAX] = frame->rax;
+	g[REG_CSGSFS] = frame->cs & 0xFFFF;
+	g[REG_TRAPNO] = frame->int_no;
+	g[REG_ERR] = frame->err_code;
+	if (info && (sig == SIGSEGV || sig == SIGBUS))
+		g[REG_CR2] = (uint64_t)info->si_addr;
 
-	// Save RAX for sigreturn
-	kframe.rax = frame->rax;
-
-	// Signal info
-	kframe.sig = sig;
-	if (info) {
-		mm_memcpy(&kframe.info, info, sizeof(siginfo_t));
-	}
-
-	/* Save the mask sigreturn must restore.  Normally that is the current
-	 * blocked set, but if ppoll()/pselect() installed a temporary mask for
-	 * its wait, the caller's ORIGINAL mask is the one that has to come back
-	 * after the handler — take ownership of that deferred restore here. */
-	if (task->sigmask_restore_pending) {
-		kframe.saved_mask = task->sigmask_saved;
-		task->sigmask_restore_pending = 0;
-	} else {
-		kframe.saved_mask = task->signals.blocked;
-	}
-
-	// Set up sigreturn trampoline code
-	kframe.retcode[0] = 0x48; // REX.W
-	kframe.retcode[1] = 0xc7; // mov rax, imm32
-	kframe.retcode[2] = 0xc0;
-	kframe.retcode[3] = 0x00; // SYS_RT_SIGRETURN = 256 = 0x100
-	kframe.retcode[4] = 0x01;
-	kframe.retcode[5] = 0x00;
-	kframe.retcode[6] = 0x00;
-	kframe.retcode[7] = 0x0f; // syscall
-	kframe.retcode[8] = 0x05;
-
-	// Set return address
-	if (act->sa_restorer) {
-		kframe.pretcode = (uint64_t)act->sa_restorer;
-	} else {
-		kframe.pretcode = frame_addr +
-				  __builtin_offsetof(signal_frame_t, retcode);
-	}
-
-	// Copy frame to user stack
-	smap_disable();
-	mm_memcpy((void *)frame_addr, &kframe, sizeof(kframe));
-	smap_enable();
-
-	// Update signal mask
-	sigorset_k(&task->signals.blocked, &task->signals.blocked,
-		   &act->sa_mask);
-	if (!(act->sa_flags & SA_NODEFER)) {
-		sigaddset_k(&task->signals.blocked, sig);
-	}
-	/* A handler must not be able to make itself unkillable for its duration,
-	 * via sa_mask or via being SIGKILL/SIGSTOP itself. */
-	sig_strip_unblockable(&task->signals.blocked);
-
-	// Reset handler if SA_RESETHAND
-	if (act->sa_flags & SA_RESETHAND) {
-		act->sa_handler = SIG_DFL;
-	}
-
-	// Save frame address for sigreturn
-	task->signals.signal_frame_depth++;
+	sigframe_fill(&kframe, task, sig, info, act, frame_addr, fpu_addr,
+		      on_alt);
+	sigframe_commit(&kframe, frame_addr, fpu_addr);
+	sigframe_enter_handler(task, sig, act);
 
 	// Also update task's saved syscall values so sigreturn works correctly
 	task->syscall_rsp = frame_addr;
@@ -916,12 +1048,12 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	 * the handler runs with. */
 	frame->rflags = user_rflags_sanitize(frame->rflags);
 	frame->rdi = (uint64_t)sig; // First argument: signal number
-	/* Second and third: the siginfo in the frame (SA_SIGINFO only) and no
-	 * ucontext -- see signal_setup_frame for why the pointer must be real. */
+	/* Second and third: the siginfo in the frame (SA_SIGINFO only) and
+	 * the ucontext. */
 	frame->rsi = (act->sa_flags & SA_SIGINFO) ?
 			     frame_addr + __builtin_offsetof(signal_frame_t, info) :
 			     0;
-	frame->rdx = 0;
+	frame->rdx = frame_addr + __builtin_offsetof(signal_frame_t, uc);
 	// CS, SS, RFLAGS stay the same (user mode, same flags)
 
 	// Do NOT touch per-CPU SYSRET state — this path returns via IRETQ.
@@ -975,32 +1107,36 @@ int signal_restore_frame(task_t *task)
 	mm_memcpy(&kframe, (void *)frame_addr, sizeof(kframe));
 	smap_enable();
 
-	/* Put the interrupted computation's x87/SSE state back into the
-	 * hardware registers.  If the task is preempted between here and the
+	/* Put the interrupted computation's extended register state back
+	 * into the hardware.  If the task is preempted between here and the
 	 * return to user mode, the context switch saves exactly this state
 	 * into the task's own area and restores it again -- so the resumed
 	 * code sees its registers regardless. */
-	sigframe_fpu_restore(kframe.fpu);
+	sigframe_fpu_restore(task, sigframe_fpu_addr(frame_addr));
+
+	/* The registers come out of uc_mcontext -- possibly edited by the
+	 * handler, which is the point of handing it a ucontext. */
+	const uint64_t *g = kframe.uc.uc_mcontext.gregs;
 
 	// Update task's saved values first (safe without cli)
-	task->syscall_rip = kframe.rip;
-	task->syscall_rsp = kframe.rsp;
+	task->syscall_rip = g[REG_RIP];
+	task->syscall_rsp = g[REG_RSP];
 	/* kframe came off the user's own stack -- see user_rflags_sanitize(). */
-	task->syscall_rflags = user_rflags_sanitize(kframe.rflags);
-	task->syscall_rbp = kframe.rbp;
-	task->syscall_rbx = kframe.rbx;
-	task->syscall_r12 = kframe.r12;
-	task->syscall_r13 = kframe.r13;
-	task->syscall_r14 = kframe.r14;
-	task->syscall_r15 = kframe.r15;
+	task->syscall_rflags = user_rflags_sanitize(g[REG_EFL]);
+	task->syscall_rbp = g[REG_RBP];
+	task->syscall_rbx = g[REG_RBX];
+	task->syscall_r12 = g[REG_R12];
+	task->syscall_r13 = g[REG_R13];
+	task->syscall_r14 = g[REG_R14];
+	task->syscall_r15 = g[REG_R15];
 
 	// Save RAX (syscall return value) for assembly to restore
-	task->syscall_rax = kframe.rax;
+	task->syscall_rax = g[REG_RAX];
 
 	/* Restore signal mask.  kframe was just read back from the user's own
-	 * stack, so saved_mask is user-writable: a process could otherwise edit
+	 * stack, so the mask is user-writable: a process could otherwise edit
 	 * it to include SIGKILL and sigreturn itself unkillable. */
-	task->signals.blocked = kframe.saved_mask;
+	task->signals.blocked = kframe.uc.uc_sigmask;
 	sig_strip_unblockable(&task->signals.blocked);
 
 	// Clear sigsuspend flag if set
@@ -1012,17 +1148,16 @@ int signal_restore_frame(task_t *task)
 
 	// Restore registers to per-CPU storage (output to syscall.asm)
 	percpu_t *cpu = this_cpu();
-	cpu->syscall_saved_user_rip = kframe.rip;
-	cpu->syscall_user_rsp = kframe.rsp;
-	cpu->syscall_saved_user_rflags = user_rflags_sanitize(kframe.rflags);
-	cpu->syscall_saved_user_rbp = kframe.rbp;
-	cpu->syscall_saved_user_rbx = kframe.rbx;
-	cpu->syscall_saved_user_r12 = kframe.r12;
-	cpu->syscall_saved_user_r13 = kframe.r13;
-	cpu->syscall_saved_user_r14 = kframe.r14;
-	cpu->syscall_saved_user_r15 = kframe.r15;
-	cpu->syscall_saved_user_rax =
-		kframe.rax; // Syscall return value (e.g., -EINTR)
+	cpu->syscall_saved_user_rip = g[REG_RIP];
+	cpu->syscall_user_rsp = g[REG_RSP];
+	cpu->syscall_saved_user_rflags = user_rflags_sanitize(g[REG_EFL]);
+	cpu->syscall_saved_user_rbp = g[REG_RBP];
+	cpu->syscall_saved_user_rbx = g[REG_RBX];
+	cpu->syscall_saved_user_r12 = g[REG_R12];
+	cpu->syscall_saved_user_r13 = g[REG_R13];
+	cpu->syscall_saved_user_r14 = g[REG_R14];
+	cpu->syscall_saved_user_r15 = g[REG_R15];
+	cpu->syscall_saved_user_rax = g[REG_RAX];
 
 	/* And the rest of the register file.
 	 *
@@ -1033,14 +1168,14 @@ int signal_restore_frame(task_t *task)
 	 * register load and its use corrupted the interrupted program at random.
 	 * That is not a rare window: it is every instruction that is not a
 	 * syscall. */
-	cpu->syscall_saved_user_rdi = kframe.rdi;
-	cpu->syscall_saved_user_rsi = kframe.rsi;
-	cpu->syscall_saved_user_rdx = kframe.rdx;
-	cpu->syscall_saved_user_rcx = kframe.rcx;
-	cpu->syscall_saved_user_r8 = kframe.r8;
-	cpu->syscall_saved_user_r9 = kframe.r9;
-	cpu->syscall_saved_user_r10 = kframe.r10;
-	cpu->syscall_saved_user_r11 = kframe.r11;
+	cpu->syscall_saved_user_rdi = g[REG_RDI];
+	cpu->syscall_saved_user_rsi = g[REG_RSI];
+	cpu->syscall_saved_user_rdx = g[REG_RDX];
+	cpu->syscall_saved_user_rcx = g[REG_RCX];
+	cpu->syscall_saved_user_r8 = g[REG_R8];
+	cpu->syscall_saved_user_r9 = g[REG_R9];
+	cpu->syscall_saved_user_r10 = g[REG_R10];
+	cpu->syscall_saved_user_r11 = g[REG_R11];
 
 	// Tell syscall.asm to use the restored context
 	// Use special value 0xFFFFFFFFFFFFFFFF (-1) to indicate sigreturn (not a handler call)
@@ -1533,14 +1668,16 @@ void signal_check_posix_timers(uint64_t current_tick)
 	}
 }
 
-static void kill_task(task_t *t, int sig)
+static void kill_task(task_t *t, int sig, task_t *sender)
 {
 	if (!t) {
 		return;
 	}
 	// Use sched_signal_task which properly handles SIGKILL/SIGSTOP
-	// and other signals with their default actions
-	sched_signal_task(t, sig);
+	// and other signals with their default actions.  The sender travels
+	// with it: kill(2) is required to name itself in the siginfo, and a
+	// sigwait()/signalfd() reader has no other way to learn who signalled.
+	sched_signal_task_from(t, sig, sender);
 }
 
 int64_t sys_kill(uint64_t pid, uint64_t sig)
@@ -1596,7 +1733,7 @@ int64_t sys_kill(uint64_t pid, uint64_t sig)
 		return perr;
 	if (sig == 0)
 		return 0;
-	kill_task(t, (int)sig);
+	kill_task(t, (int)sig, self);
 	return 0;
 }
 
@@ -1720,7 +1857,51 @@ int64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize)
 	return 0;
 }
 
-// SYS_RT_SIGTIMEDWAIT - wait for signal with timeout
+/* SYS_RT_SIGTIMEDWAIT -- accept one of `set', waiting for it if need be.
+ *
+ * sigwait(3) and sigwaitinfo(3) land here.  Their whole premise is that the
+ * caller has BLOCKED the signals it names: they are not to be delivered to a
+ * handler, they are to be handed to this call.  Three things followed from
+ * that premise and all three were wrong here:
+ *
+ *   - The dequeue took the WRONG SET.  signal_dequeue()'s mask is a set to
+ *     SKIP, so passing the wanted set told it to consume everything EXCEPT
+ *     what the caller asked for.  The awaited signal was reported to the
+ *     caller and left pending, so the moment the caller restored its mask --
+ *     the very next line of any sigwait() user -- the signal it had just
+ *     "received" was delivered for real and killed it.  signal_dequeue_wanted()
+ *     is the one that asks the question this call means.
+ *
+ *   - The wait could not be woken.  A bare `state = TASK_BLOCKED; schedule()'
+ *     with no queue and no timer registers no wakeup with anything, and the
+ *     one sweep that rescues blocked tasks only looks at UNBLOCKED pending
+ *     signals -- which, by the premise above, this is never waiting for.  The
+ *     signalfd queue is exactly the right thing to sleep on: signal_send()
+ *     notifies it for every signal queued to the task, blocked or not.
+ *
+ *   - Nothing could interrupt it, SIGKILL included.  The loop checked only
+ *     has_exited, so a caller waiting for a signal that never came never
+ *     returned to user space and so never reached the place where a fatal
+ *     signal is acted on.  That is an unkillable process holding its terminal,
+ *     which from the console is indistinguishable from a hung machine.
+ *
+ * The timeout was decorative for the same reason: the deadline was computed
+ * but never armed, so it was only ever consulted after a wake that could not
+ * happen.  It is armed on the task here, which is what the timer sweep looks
+ * at.
+ */
+static int sigtimedwait_ready(task_t *t, const kernel_sigset_t *want)
+{
+	for (int s = 1; s < NSIG; s++) {
+		if (sig_kernel_only(s))
+			continue;
+		if (sigismember_k(want, s) &&
+		    sigismember_k(&t->signals.pending, s))
+			return 1;
+	}
+	return 0;
+}
+
 int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
 			    uint64_t timeout_ptr, uint64_t sigsetsize)
 {
@@ -1737,54 +1918,87 @@ int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
 			   sizeof(kernel_sigset_t)) != 0) {
 		return -EFAULT;
 	}
+	/* Not waitable by anybody: these two are acted on, never handed over. */
+	sigdelset_k(&wait_set, SIGKILL);
+	sigdelset_k(&wait_set, SIGSTOP);
 
-	struct k_timespec timeout;
+	int timed = 0;
 	uint64_t deadline = 0;
 	if (timeout_ptr) {
+		struct k_timespec timeout;
+
 		if (copy_from_user(&timeout, (void *)timeout_ptr,
 				   sizeof(struct k_timespec)) != 0) {
 			return -EFAULT;
 		}
+		if (timeout.tv_sec < 0 || timeout.tv_nsec < 0 ||
+		    timeout.tv_nsec >= 1000000000L) {
+			return -EINVAL;
+		}
 		uint32_t freq = timer_get_frequency();
 		uint64_t ticks =
-			timeout.tv_sec * freq +
+			(uint64_t)timeout.tv_sec * freq +
 			(uint64_t)timeout.tv_nsec * freq / 1000000000ULL;
+		/* A real timeout must never round down to "poll": a 1 ms wait
+		 * on a 100 Hz tick is short, not zero. */
+		if (ticks == 0 && (timeout.tv_sec || timeout.tv_nsec))
+			ticks = 1;
+		timed = 1;
 		deadline = timer_ticks() + ticks;
 	}
 
-	// Check if any signals in wait_set are already pending
-	while (1) {
-		for (int sig = 1; sig < NSIG; sig++) {
-			if (sigismember_k(&wait_set, sig) &&
-			    sigismember_k(&cur->signals.pending, sig)) {
-				// Found a signal
-				siginfo_t info;
-				signal_dequeue(cur, &wait_set, &info);
+	for (;;) {
+		siginfo_t info;
+		int sig;
 
-				if (info_ptr) {
-					if (copy_to_user(
-						    (void *)info_ptr, &info,
-						    sizeof(siginfo_t)) != 0) {
-						return -EFAULT;
-					}
-				}
-				return sig;
+		mm_memset(&info, 0, sizeof(info));
+		sig = signal_dequeue_wanted(cur, &wait_set, &info);
+		if (sig > 0) {
+			if (info_ptr &&
+			    copy_to_user((void *)info_ptr, &info,
+					 sizeof(siginfo_t)) != 0) {
+				return -EFAULT;
 			}
+			return sig;
 		}
 
-		// Check timeout
-		if (timeout_ptr && timer_ticks() >= deadline) {
-			return -EAGAIN;
-		}
-
-		// Block task and wait
-		cur->state = TASK_BLOCKED;
-		sched_schedule();
-
-		// Check if we should exit
-		if (cur->has_exited) {
+		/* A signal the caller did NOT ask for and has not blocked has
+		 * to be delivered instead -- that is what ends this wait
+		 * early, and it is how a fatal one gets acted on at all. */
+		if (signal_pending(cur))
 			return -EINTR;
+		if (cur->has_exited)
+			return -EINTR;
+		if (timed && timer_ticks() >= deadline)
+			return -EAGAIN;
+
+		struct wait_queue_head *wq = signalfd_task_wq(cur);
+		if (!wq)
+			return -ENOMEM;
+
+		struct wait_queue_entry we;
+		uint64_t fl = local_irq_save();
+
+		wq_entry_init(&we, cur);
+		wq_add(wq, &we);
+		/* Re-checked with the entry already on the queue and
+		 * interrupts off: signal_send() sets the pending bit before it
+		 * notifies, so a signal that arrives in the window is either
+		 * seen here or wakes us from the queue. */
+		if (!sigtimedwait_ready(cur, &wait_set) && !signal_pending(cur) &&
+		    !(timed && timer_ticks() >= deadline)) {
+			cur->wait_channel = wq;
+			cur->wakeup_tick = timed ? deadline : 0;
+			cur->state = TASK_BLOCKED;
+			local_irq_restore(fl);
+			sched_schedule();
+		} else {
+			local_irq_restore(fl);
 		}
+		wq_remove(wq, &we);
+		/* A queue wake does not disarm the timer; leaving it set would
+		 * cut short whatever this task blocks on next. */
+		cur->wakeup_tick = 0;
 	}
 }
 
@@ -1829,6 +2043,59 @@ int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig,
 	return signal_send(target, (int)sig, &info);
 }
 
+/* Park until a signal the task has NOT blocked is pending.
+ *
+ * pause(2) and sigsuspend(2) are both exactly this wait, and both used to
+ * write it as `state = TASK_BLOCKED' once, outside a loop that called
+ * sched_schedule() round it.  Two things were wrong with that shape:
+ *
+ *   - after the first wake the state was no longer BLOCKED, so every further
+ *     turn of the loop was a plain yield: a spin at full CPU for as long as
+ *     the wait lasted;
+ *   - when a signal was ALREADY pending on entry the loop body never ran, so
+ *     the caller went back to user space still marked TASK_BLOCKED -- a task
+ *     the scheduler is entitled to leave off its run queue at the next
+ *     preemption, which is a process that simply stops for good.
+ *
+ * The queue slept on is the one signal_send() notifies for every signal
+ * queued to the task, so the wake is prompt rather than waiting on the timer
+ * sweep; the re-check happens with the entry already queued and interrupts
+ * off, so a signal arriving in the window cannot be missed.
+ */
+static void signal_wait_pending(task_t *cur)
+{
+	for (;;) {
+		if (signal_pending(cur) || cur->has_exited)
+			break;
+
+		struct wait_queue_head *wq = signalfd_task_wq(cur);
+		struct wait_queue_entry we;
+		uint64_t fl;
+
+		if (wq) {
+			wq_entry_init(&we, cur);
+			fl = local_irq_save();
+			wq_add(wq, &we);
+		} else {
+			/* No memory for a queue: the timer sweep still wakes a
+			 * blocked task with an unblocked signal pending, which
+			 * is precisely the condition waited for here. */
+			fl = local_irq_save();
+		}
+		if (!signal_pending(cur)) {
+			cur->wait_channel = wq;
+			cur->state = TASK_BLOCKED;
+			local_irq_restore(fl);
+			sched_schedule();
+		} else {
+			local_irq_restore(fl);
+		}
+		if (wq)
+			wq_remove(wq, &we);
+	}
+	cur->state = TASK_RUNNING;
+}
+
 // SYS_RT_SIGSUSPEND - suspend until signal
 int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize)
 {
@@ -1846,30 +2113,54 @@ int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize)
 		return -EFAULT;
 	}
 
-	// Save current mask and set new one
-	cur->signals.saved_mask = cur->signals.blocked;
+	/* Install the temporary mask.  The restore is DEFERRED, through the
+	 * same machinery ppoll()/pselect() use (poll_sigmask_install and the
+	 * consumer at the syscall exit): the caller's mask must stay OFF
+	 * until the signal that ended the wait has had its handler set up,
+	 * and the handler's frame must carry the CALLER's mask so sigreturn
+	 * puts that back once the handler is done.  That is the contract:
+	 * the handler runs under the temporary mask, and sigsuspend()
+	 * returns after it, with the original mask restored.
+	 *
+	 * Restoring the mask right here, before returning -- what this used
+	 * to do -- broke both halves at once.  The signal that ended the
+	 * wait was still only PENDING; with the caller's mask back on, a
+	 * caller who had it blocked (the reason to sigsuspend at all) got no
+	 * handler run and returned with the signal still queued -- to fire,
+	 * spuriously, whenever that mask was next lifted.
+	 *
+	 * That killed web processes.  The script engine parks a thread by
+	 * signalling it; the handler publishes the thread's registers and
+	 * sigsuspends awaiting the SAME signal as the resume.  With the
+	 * eager restore, the resume signal survived the sigsuspend and
+	 * re-entered the handler after it had already finished -- which
+	 * looks like a fresh park request, so the thread published its
+	 * registers, posted the acknowledgement semaphore ONE EXTRA TIME,
+	 * and froze with nobody intending to wake it.  Every suspension
+	 * after that consumed a stale acknowledgement and proceeded while
+	 * the target was NOT parked: the collector walked the stacks of
+	 * running threads (memory corruption with no pattern), and the
+	 * register pointer it read could be nulled mid-read by the escaping
+	 * thread -- the reproducible tip of it, a crash in getRegisters()
+	 * loading address zero. */
+	cur->sigmask_saved = cur->signals.blocked;
+	cur->sigmask_restore_pending = 1;
 	cur->signals.blocked = newmask;
 	cur->signals.in_sigsuspend = 1;
 
 	// Can't block SIGKILL/SIGSTOP
 	sig_strip_unblockable(&cur->signals.blocked);
 
-	// Block until signal
-	cur->state = TASK_BLOCKED;
+	// Wait for a signal the temporary mask lets through
+	signal_wait_pending(cur);
 
-	while (!signal_pending(cur)) {
-		sched_schedule();
-		if (cur->has_exited) {
-			cur->signals.in_sigsuspend = 0;
-			cur->signals.blocked = cur->signals.saved_mask;
-			return -EINTR;
-		}
-	}
-
-	// Restore mask
 	cur->signals.in_sigsuspend = 0;
-	cur->signals.blocked = cur->signals.saved_mask;
-
+	/* No mask restore here.  On the way out, signal delivery runs first
+	 * -- still under the temporary mask, so the awaited handler actually
+	 * fires, taking the parked mask into its frame (sigframe_fill) for
+	 * sigreturn to restore -- and poll_sigmask_restore_pending() puts
+	 * the mask back only if no handler claimed it (the signal was
+	 * fetched by another thread, or its action terminates us anyway). */
 	return -EINTR; // sigsuspend always returns EINTR
 }
 
@@ -2013,24 +2304,8 @@ int64_t sys_pause(void)
 		return -EFAULT;
 
 	// Block until any signal arrives
-	cur->state = TASK_BLOCKED;
-
-	while (!signal_pending(cur)) {
-		sched_schedule();
-		if (cur->has_exited) {
-			return -EINTR;
-		}
-	}
+	signal_wait_pending(cur);
 
 	return -EINTR; // pause always returns EINTR
 }
 
-// SYS_SIGNALFD / SYS_SIGNALFD4 - create signalfd (simplified stub)
-int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags)
-{
-	(void)fd;
-	(void)mask_ptr;
-	(void)flags;
-	// signalfd is complex to implement fully - return ENOSYS for now
-	return -ENOSYS;
-}

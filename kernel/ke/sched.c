@@ -43,12 +43,12 @@ extern void ctx_switch_asm(uint64_t **old_sp, uint64_t *new_sp);
  * exception UNMASKED -- the first inexact result would trap. */
 static void task_fpu_init(task_t *t)
 {
-	t->fpu_state = (uint8_t *)(((uintptr_t)t->fpu_area + 15) & ~(uintptr_t)15);
+	t->fpu_state = (uint8_t *)(((uintptr_t)t->fpu_area +
+				    (FPU_STATE_ALIGN - 1)) &
+				   ~(uintptr_t)(FPU_STATE_ALIGN - 1));
 	t->fpu_saved = 0;
 	t->fpu_kdepth = 0;
-	mm_memset(t->fpu_state, 0, 512);
-	*(uint16_t *)(t->fpu_state + 0) = 0x037F;  /* FCW */
-	*(uint32_t *)(t->fpu_state + 24) = 0x1F80; /* MXCSR */
+	fpu_init_state(t->fpu_state);
 }
 
 static inline void task_fpu_save(task_t *t)
@@ -57,7 +57,7 @@ static inline void task_fpu_save(task_t *t)
 	 * area already holds this task's real values and the CPU holds the
 	 * kernel's scratch. */
 	if (t && t->fpu_state && !t->fpu_saved)
-		__asm__ volatile("fxsave (%0)" : : "r"(t->fpu_state) : "memory");
+		fpu_save(t->fpu_state);
 }
 
 /* ---- Hardware debug registers ----------------------------------------- *
@@ -135,7 +135,7 @@ void kernel_fpu_begin(void)
 	if (!t || !t->fpu_state)
 		return;
 	if (t->fpu_kdepth++ == 0) {
-		__asm__ volatile("fxsave (%0)" : : "r"(t->fpu_state) : "memory");
+		fpu_save(t->fpu_state);
 		t->fpu_saved = 1;
 	}
 }
@@ -147,7 +147,7 @@ void kernel_fpu_end(void)
 	if (!t || !t->fpu_state || t->fpu_kdepth == 0)
 		return;
 	if (--t->fpu_kdepth == 0) {
-		__asm__ volatile("fxrstor (%0)" : : "r"(t->fpu_state) : "memory");
+		fpu_restore(t->fpu_state);
 		t->fpu_saved = 0;
 	}
 }
@@ -162,23 +162,23 @@ void task_fpu_fork(task_t *child, task_t *parent)
 {
 	if (!child || !parent)
 		return;
-	child->fpu_state = (uint8_t *)(((uintptr_t)child->fpu_area + 15) &
-				       ~(uintptr_t)15);
+	child->fpu_state = (uint8_t *)(((uintptr_t)child->fpu_area +
+					(FPU_STATE_ALIGN - 1)) &
+				       ~(uintptr_t)(FPU_STATE_ALIGN - 1));
 	child->fpu_saved = 0;
 	child->fpu_kdepth = 0;
 	/* Push the parent's live registers out first -- unless a
 	 * kernel_fpu_begin() section already did, in which case the CPU holds
 	 * kernel scratch and the save area is the good copy. */
 	if (!parent->fpu_saved)
-		__asm__ volatile("fxsave (%0)" : : "r"(parent->fpu_state)
-				 : "memory");
-	mm_memcpy(child->fpu_state, parent->fpu_state, 512);
+		fpu_save(parent->fpu_state);
+	mm_memcpy(child->fpu_state, parent->fpu_state, g_fpu_state_size);
 }
 
 static inline void task_fpu_restore(task_t *t)
 {
 	if (t && t->fpu_state)
-		__asm__ volatile("fxrstor (%0)" : : "r"(t->fpu_state) : "memory");
+		fpu_restore(t->fpu_state);
 }
 
 // ============================================================================
@@ -598,6 +598,50 @@ static void dead_thread_queue(task_t *task)
  * the kernel-stack free — all inside the wait.  All of that now runs in
  * dead_thread_reap (scheduling-tail context, IRQs on), where the child has
  * long since left its CPU. */
+/* See the declaration in sched.h.  Both halves run under g_dead_thread_lock,
+ * which is also where sched_remove_task() decides whether it may destroy a
+ * task -- that shared lock is what makes the decision indivisible. */
+bool sched_task_pin(task_t *t)
+{
+	uint64_t flags;
+	bool ok;
+
+	if (!t || !task_ptr_ok(t))
+		return false;
+	spin_lock_irqsave(&g_dead_thread_lock, &flags);
+	ok = !t->condemned;
+	if (ok)
+		t->pin_count++;
+	spin_unlock_irqrestore(&g_dead_thread_lock, flags);
+	return ok;
+}
+
+void sched_task_unpin(task_t *t)
+{
+	uint64_t flags;
+	bool hand_back = false;
+
+	if (!t)
+		return;
+	spin_lock_irqsave(&g_dead_thread_lock, &flags);
+	if (t->pin_count > 0 && --t->pin_count == 0 && t->destroy_deferred &&
+	    !(t->group_leader == t && t->group_ref > 0)) {
+		/* The destroy path gave up on it while we held it, and we are
+		 * the last holder: hand it back, exactly as the group_ref drop
+		 * in sched_remove_task() does. */
+		t->destroy_deferred = false;
+		if (!t->on_dead_queue) {
+			t->dead_next = g_dead_head;
+			g_dead_head = t;
+			g_dead_thread_count++;
+			t->on_dead_queue = true;
+		}
+		hand_back = true;
+	}
+	spin_unlock_irqrestore(&g_dead_thread_lock, flags);
+	(void)hand_back;
+}
+
 void sched_defer_reap(task_t *child)
 {
 	if (!child)
@@ -1364,7 +1408,26 @@ void sched_enqueue_ready(task_t *task)
 	{
 		task_t *cur = sched_current();
 
-		if (cur && cur != task && !is_idle_task(cur))
+		/* Including when `cur' is the idle task -- especially then.
+		 *
+		 * This used to skip it, which is exactly backwards: a
+		 * processor running its idle task is the one with nothing
+		 * better to do.  The wake that matters is the LOCAL one, where
+		 * no IPI is sent because the target processor is this one: the
+		 * idle task wakes somebody (the reaper in its own loop does),
+		 * the flag is suppressed, and the idle loop goes back to hlt
+		 * with a runnable task sitting on its queue.  Nothing rescues
+		 * it -- the queue head never moves and that processor stays on
+		 * idle indefinitely.  Seen as a run queue stuck at length 1
+		 * with an unchanging head while its CPU accumulates context
+		 * switches, and, when the stranded task was ksoftirqd, as the
+		 * network quietly stopping: NET_RX raised, nothing left to
+		 * service it, and a page load that halts part-way.
+		 *
+		 * The reference does the same thing without the exception --
+		 * the idle scheduling class asks for a reschedule
+		 * unconditionally when anything becomes runnable. */
+		if (cur && cur != task)
 			cur->need_resched = 1;
 	}
 }
@@ -1534,6 +1597,8 @@ static void task_init_common(task_t *t)
 	 * mmap() retries the allocation and fails with ENOMEM if it cannot. */
 	t->mmap_regions = NULL;
 	t->mmap_capacity = 0;
+	t->mmap_hwm = 0;
+	t->mmap_hint = 0;
 	mm_regions_init(t);
 	/* One address-space lock per task_t; only the group leader's is ever
 	 * taken (see task_mm_owner), but every task_t carries an initialised
@@ -2439,6 +2504,45 @@ static void idle_entry(void *arg)
 		 * interrupts enabled, which is what the reaper asks for. */
 		dead_thread_reap();
 
+		/* Look before halting: this loop never entered the scheduler at
+		 * all, so a task made runnable on this processor without an
+		 * interrupt -- a local wake, which sends no IPI because the
+		 * target is here -- waited for something unrelated to happen.
+		 *
+		 * ONLY the flag, and only one attempt, then halt regardless.
+		 *
+		 * Consulting the run queue as well, and looping while it was
+		 * non-empty, is what the first version of this did, and it was
+		 * a serious mistake: a queued task that CANNOT be picked keeps
+		 * the queue non-empty for ever.  There is one such case by
+		 * design -- a task with sp == 0 is committed to another
+		 * processor and every other one must refuse it (see
+		 * rq_note_sp0_refusal) -- and where that used to cost one
+		 * futile retry per timer tick, the loop turned it into a
+		 * processor spinning at full speed, refusing the same task
+		 * millions of times, running nothing else.  Anything pinned to
+		 * that processor -- ksoftirqd, for one -- then starves, which
+		 * is worse than the strand this was written to cure.
+		 *
+		 * The flag cannot do that: it is cleared before the call, so a
+		 * pass that resolves nothing falls through to the halt and
+		 * waits for a real event rather than asking again immediately.
+		 * That is the reference's idle loop exactly -- test the flag,
+		 * schedule once, otherwise halt. */
+		{
+			task_t *me = sched_current();
+
+			if (me && me->need_resched) {
+				me->need_resched = 0;
+				sched_schedule();
+			}
+		}
+
+		/* sti and hlt as a pair: the interrupt-enable takes effect one
+		 * instruction late, so an interrupt arriving here is taken
+		 * after the halt has begun and wakes it, rather than being
+		 * delivered before it and leaving the processor asleep with
+		 * work pending. */
 		__asm__ volatile("sti");
 		__asm__ volatile("hlt");
 	}
@@ -2776,7 +2880,8 @@ void sched_remove_task(task_t *task)
 	{
 		uint64_t gflags;
 		spin_lock_irqsave(&g_dead_thread_lock, &gflags);
-		if (task->group_leader == task && task->group_ref > 0) {
+		if ((task->group_leader == task && task->group_ref > 0) ||
+		    task->pin_count > 0) {
 			task->destroy_deferred = true;
 			/* Re-arm the queue guard: this task_t is NOT being
 			 * destroyed after all, so the last thread out must be
@@ -2785,6 +2890,11 @@ void sched_remove_task(task_t *task)
 			spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
 			return;
 		}
+		/* Committed, under the same lock a pin is taken with: from
+		 * here nobody may take a new reference to this task_t, and
+		 * every would-be pinner is told so rather than being left to
+		 * dereference it after it is gone. */
+		task->condemned = true;
 		spin_unlock_irqrestore(&g_dead_thread_lock, gflags);
 	}
 
@@ -3006,6 +3116,10 @@ void sched_remove_task(task_t *task)
 	 * one -- including a thread's empty one.  Released here, with the
 	 * task_t it belongs to. */
 	mm_regions_free(task);
+	if (task->signals.sigfd_wq) {
+		kfree(task->signals.sigfd_wq);
+		task->signals.sigfd_wq = NULL;
+	}
 	/* From this instant, any pointer to this task_t is stale; the enqueue
 	 * check keys on this. */
 	task->alive_magic = TASK_MAGIC_DEAD;
@@ -3026,6 +3140,13 @@ int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
 		mmap_region_t *r = &task->mmap_regions[i];
 		if (r->in_use)
 			continue;
+		/* This claims a slot directly instead of going through
+		 * mm_alloc_mmap_region(), so it owes the bound the same
+		 * update: a region the lookup's high-water mark does not
+		 * cover is a region that cannot be found, and these are the
+		 * executable's own lazy mappings. */
+		if (i + 1 > task->mmap_hwm)
+			task->mmap_hwm = i + 1;
 		r->start = start;
 		r->length = length;
 		r->prot = prot;
@@ -3349,6 +3470,35 @@ void sched_reap_zombies(task_t *parent)
  * task), RUNNING, or already exited — observed as the rq_enqueue_locked
  * "double-enqueue" warnings under parallel teststress.  CAS makes exactly one
  * waker win; only the winner may clear wait state and enqueue. */
+/* Claim a sleeping task: the CAS every waker in this kernel goes through.
+ *
+ * Which imposes a rule on the other side, on every site that parks a task.
+ * TASK_BLOCKED is what makes a task claimable, and a waker finds its target
+ * by one of two fields: sched_wake_channel() and sched_wake_channel_once()
+ * match `wait_channel', sched_wake_expired_sleepers() matches `wakeup_tick'
+ * -- and the latter has no channel to qualify it, so ANY non-zero deadline
+ * already in the past matches.  Neither takes the lock the parking site
+ * holds; nothing about that lock holds them off.
+ *
+ * So a parking site must write its identity FIRST and the state LAST:
+ *
+ *	cur->wait_channel = <what it waits on>;
+ *	cur->wakeup_tick  = <deadline, or 0>;
+ *	cur->state        = TASK_BLOCKED;
+ *	sched_schedule();
+ *
+ * The other order publishes the task as claimable while both fields still
+ * describe its PREVIOUS sleep, and a stale deadline is claimed by the very
+ * next tick on any processor.  The task is then enqueued while it is still
+ * executing at the parking site -- which is safe only by way of the sp == 0
+ * double-run guard -- and comes straight back out of sched_schedule() having
+ * never slept.  Nothing returns a wrong answer, because every caller here
+ * re-checks its condition in a loop; it is paid for in syscalls, and in
+ * threaded processes it is paid continuously.
+ *
+ * (Publishing BLOCKED before arming a comparator or re-checking a condition
+ * is a separate and also-necessary ordering; the two nest, identity first.
+ * kernel/ke/hrtimer.c does both.) */
 int sched_claim_wake(task_t *t, task_state_t from)
 {
 	task_state_t expected = from;
@@ -3405,6 +3555,21 @@ void sched_wake_channel(void *channel)
 			if (t->wait_channel == channel &&
 			    sched_claim_wake(t, TASK_BLOCKED)) {
 				t->wait_channel = NULL;
+				/* And the deadline with it.  A waiter woken by
+				 * its channel has no use for the timer it may
+				 * also have armed, and leaving the tick behind
+				 * makes it a trap for the task's NEXT sleep:
+				 * sched_wake_expired_sleepers() matches on
+				 * `state == BLOCKED && wakeup_tick != 0 &&
+				 * now >= wakeup_tick' with no channel to
+				 * qualify it, so a deadline left in the past
+				 * claims the task at the very next tick of
+				 * whatever it parks on afterwards.  Every other
+				 * waker here -- sched_wake_task(),
+				 * sched_wake_channel_once(), the expiry scan
+				 * itself -- clears both fields; this one
+				 * cleared only the channel. */
+				t->wakeup_tick = 0;
 				to_wake[nwake++] = t;
 			}
 		}
@@ -3451,56 +3616,99 @@ int sched_wake_channel_once(void *channel, int max)
 	return nwake;
 }
 
-// Wake tasks whose sleep timer has expired
+/* Wake every task whose deadline has passed.
+ *
+ * THE ONE RULE: this is the only thing in the system that makes a TIMEOUT
+ * happen.  A futex with a deadline, a poll() with a timeout, nanosleep(),
+ * sem_timedwait() -- none of them are woken by an event, because the event is
+ * that no event came.  A task this scan does not reach does not wait longer;
+ * it waits FOR EVER.
+ *
+ * That is what the previous version did.  It claimed at most 16 tasks per
+ * tick, in one pass, always walking from the head of the list, and its comment
+ * argued the overflow was harmless because "the next tick wakes them".  That
+ * holds only if the set of expired tasks drains.  It does not: every task
+ * parked in poll()/select()/epoll_wait() re-arms `wakeup_tick = now + 1' on
+ * every iteration, so each is expired again on the very next tick, and each
+ * sits at the same place in the list.  Past roughly sixteen multiplexing
+ * threads -- one browser tab is thirty-five -- the budget is spent before the
+ * walk ever reaches the tail, every tick, for ever.  Everything after the
+ * cutoff keeps its armed deadline and is never woken by it again.
+ *
+ * The symptom was not a slow timeout, it was a dead process: a WebKit thread
+ * blocked in pthread_cond_timedwait past the cutoff never got its ETIMEDOUT,
+ * so its main loop stopped iterating, so nothing drained its IPC socket, and
+ * a page load stopped at 49% with 8 KB sitting readable in a socket nobody
+ * was left to read.  Nothing looked broken anywhere else: the futex word was
+ * exactly what the waiter slept on (no wake was owed), the network stack was
+ * idle and clean, and every other thread was legitimately asleep.
+ *
+ * So: loop until a pass comes back short, exactly as sched_wake_channel()
+ * does, and for the same reason.  The claim stays gated on batch space -- a
+ * task may be claimed only if it is also enqueued in the same pass, or it is
+ * left READY on no run queue and stranded -- and the loop is what turns
+ * "skipped this tick" back into "woken this tick".
+ *
+ * Terminates: a woken task is CAS'd out of TASK_BLOCKED and has its deadline
+ * cleared, so it cannot match a later pass, and it cannot re-arm one until it
+ * runs, which cannot happen while this call is still on the processor.  Each
+ * full pass therefore strictly reduces the number of matches, so there are at
+ * most ceil(N / SLEEPER_WAKE_BATCH) of them.
+ */
+#define SLEEPER_WAKE_BATCH 32
+
 void sched_wake_expired_sleepers(uint64_t current_tick)
 {
-	// Collect tasks that we actually wake, then enqueue only those.
-	// A blanket "READY + !on_rq" scan is dangerous on SMP because it can
-	// re-enqueue a task that's currently RUNNING but hasn't been marked as
-	// such yet (or was momentarily marked READY by a buggy caller).
-	//
-	// CLAIM GATE: gate sched_claim_wake() itself on batch space (nwake < 16),
-	// NOT just the enqueue.  sched_claim_wake() transitions the task
-	// BLOCKED->READY and we then clear its wakeup_tick — so if we claim a task
-	// we cannot fit in this batch, it is left READY, on no runqueue, with its
-	// timer disarmed, and no later tick re-finds it: a permanent strand (seen
-	// as a 100ms nanosleep measured at ~964ms).  With the && short-circuit, a
-	// full batch skips the claim entirely, leaving the overflow task BLOCKED
-	// with its timer still armed so the next tick (10ms) wakes it — bounded,
-	// self-correcting, never stranded.  Single pass, no re-scan loop: this
-	// runs in the timer IRQ with interrupts off and must not lengthen that
-	// window.
-	task_t *to_wake[16];
-	int nwake = 0;
+	int first_pass = 1;
 
-	uint64_t flags;
-	spin_lock_irqsave(&g_task_list_lock, &flags);
-	for (task_t *t = g_task_list_head; t; t = t->next) {
-		// Check signal timers for ALL tasks
-		signal_check_timers(t, current_tick);
+	for (;;) {
+		task_t *to_wake[SLEEPER_WAKE_BATCH];
+		int nwake = 0;
+		uint64_t flags;
 
-		// Check sleep timer
-		if (t->state == TASK_BLOCKED && t->wakeup_tick != 0 &&
-		    current_tick >= t->wakeup_tick) {
-			if (nwake < 16 && sched_claim_wake(t, TASK_BLOCKED)) {
-				t->wakeup_tick = 0;
-				to_wake[nwake++] = t;
+		spin_lock_irqsave(&g_task_list_lock, &flags);
+		for (task_t *t = g_task_list_head; t; t = t->next) {
+			/* Once per tick per task, whatever the batch is doing:
+			 * these are the POSIX interval timers, and a task the
+			 * batch cannot fit still has to have its SIGALRM
+			 * accounted or the signal is lost outright. */
+			if (first_pass)
+				signal_check_timers(t, current_tick);
+
+			if (nwake >= SLEEPER_WAKE_BATCH) {
+				/* The first pass keeps walking anyway -- it
+				 * still owes every remaining task the timer
+				 * check above.  Later passes have nothing left
+				 * to do here and stop. */
+				if (first_pass)
+					continue;
+				break;
 			}
-		}
 
-		// Wake blocked tasks with pending signals
-		if (t->state == TASK_BLOCKED && signal_pending(t)) {
-			if (nwake < 16 && sched_claim_wake(t, TASK_BLOCKED)) {
-				t->wakeup_tick = 0;
-				to_wake[nwake++] = t;
-			}
+			if (t->state != TASK_BLOCKED)
+				continue;
+			/* A deadline that has passed, or a signal that must be
+			 * delivered -- both mean "stop waiting". */
+			if (!((t->wakeup_tick != 0 &&
+			       current_tick >= t->wakeup_tick) ||
+			      signal_pending(t)))
+				continue;
+			if (!sched_claim_wake(t, TASK_BLOCKED))
+				continue;
+			t->wakeup_tick = 0;
+			to_wake[nwake++] = t;
 		}
-	}
-	spin_unlock_irqrestore(&g_task_list_lock, flags);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-	// Enqueue only the tasks we actually transitioned from BLOCKED→READY
-	for (int i = 0; i < nwake; i++) {
-		sched_enqueue_ready(to_wake[i]);
+		/* Outside the list lock: enqueueing takes run-queue locks, and
+		 * taking those beneath this one would fix an ordering between
+		 * them that every other caller would have to honour. */
+		for (int i = 0; i < nwake; i++)
+			sched_enqueue_ready(to_wake[i]);
+
+		first_pass = 0;
+		if (nwake < SLEEPER_WAKE_BATCH)
+			break; /* pass came back short => nothing is left due */
 	}
 }
 
@@ -3583,8 +3791,12 @@ void sched_kill_thread_group(task_t *task, int exit_code)
 		int guard = 0;
 
 		do {
+			/* Pinned HERE, while the task-list lock still proves
+			 * this pointer names a live task.  A target that
+			 * cannot be pinned is already being destroyed and is
+			 * skipped: it needs no signal, it is leaving anyway. */
 			if (t != task && !t->has_exited &&
-			    n < TASK_GROUP_KILL_MAX)
+			    n < TASK_GROUP_KILL_MAX && sched_task_pin(t))
 				targets[n++] = t;
 			t = t->thread_group_next;
 			/* A ring that does not lead back to its leader is
@@ -3613,8 +3825,14 @@ void sched_kill_thread_group(task_t *task, int exit_code)
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-	for (int i = 0; i < n; i++)
+	/* Collected under the task-list lock and used after it is dropped.
+	 * Each one carries a pin taken during the walk, so the task_t cannot
+	 * be freed underneath signal_send() -- which is what took a GPF here,
+	 * reading a wait-queue pointer out of a page-poisoned task_t. */
+	for (int i = 0; i < n; i++) {
 		sched_signal_task(targets[i], SIGKILL);
+		sched_task_unpin(targets[i]);
+	}
 }
 
 /* Wake every thread of `proc`'s process that is parked in waitpid().
@@ -3644,7 +3862,11 @@ void sched_wake_wait_sleepers(task_t *proc)
 		int guard = 0;
 
 		do {
-			if (n < WAIT_WAKE_MAX)
+			/* Pinned during the walk for the same reason the kill
+			 * path pins: every dereference below happens with the
+			 * task-list lock dropped, and a sibling reaped in that
+			 * window would be read out of a page-poisoned task_t. */
+			if (n < WAIT_WAKE_MAX && sched_task_pin(t))
 				cand[n++] = t;
 			t = t->thread_group_next;
 			if (!task_ptr_ok(t) || ++guard > WAIT_WAKE_MAX)
@@ -3664,6 +3886,7 @@ void sched_wake_wait_sleepers(task_t *proc)
 
 		if (wake)
 			sched_wake_task(cand[i]);
+		sched_task_unpin(cand[i]);
 	}
 }
 
@@ -4764,6 +4987,21 @@ static void sched_signal_stop_request(task_t *task, int sig, siginfo_t *info)
 
 void sched_signal_task(task_t *task, int sig)
 {
+	/* No named sender: the kernel's own signals -- ^C from the terminal,
+	 * SIGPIPE on a closed pipe, a hangup.  There is no pid to record and
+	 * the task that happens to be current when the tty driver runs is not
+	 * one; see sched_signal_task_from(). */
+	sched_signal_task_from(task, sig, NULL);
+}
+
+/* As above, but `sender' is the process that ASKED for the signal -- kill(2)
+ * and its group forms.  POSIX requires an SI_USER siginfo to name it, and
+ * nothing can reconstruct it afterwards: a signalfd or sigwaitinfo() reader is
+ * handed whatever was recorded here, which is why every such record used to
+ * report ssi_pid == 0.  A sender is only ever passed from the syscall that is
+ * running in that process's own context. */
+void sched_signal_task_from(task_t *task, int sig, task_t *sender)
+{
 	if (!task)
 		return;
 
@@ -4792,6 +5030,12 @@ void sched_signal_task(task_t *task, int sig)
 	mm_memset(&info, 0, sizeof(info));
 	info.si_signo = sig;
 	info.si_code = SI_USER;
+	if (sender && sender->privilege == TASK_USER) {
+		/* The PROCESS, not the thread: si_pid is what the receiver
+		 * would kill() back, and the real uid is what POSIX names. */
+		info.si_pid = sender->tgid ? sender->tgid : sender->id;
+		info.si_uid = sender->cred.uid;
+	}
 
 	if (sig == SIGKILL) {
 		signal_send(task, sig, &info);
@@ -4855,6 +5099,27 @@ void sched_signal_task(task_t *task, int sig)
 			 * away directly, so no unrelated task is disturbed. */
 			smp_send_reschedule(task->on_cpu);
 		}
+		return;
+	}
+
+	/* A blocked signal is recorded, never acted on.  It stays pending
+	 * until the task unblocks it or reads it through a signalfd -- which
+	 * is the entire point of having blocked it.
+	 *
+	 * This path is the one a task takes when it signals ITSELF, and it
+	 * decided the default action without ever consulting the mask: a
+	 * process that blocked SIGUSR1 and then did kill(getpid(), SIGUSR1)
+	 * -- the standard way to hand a signal to a signalfd -- was killed by
+	 * it instead of queueing it.  The same shortcut stopped a process on
+	 * a blocked SIGTSTP.
+	 *
+	 * SIGKILL returned above and SIGSTOP cannot be blocked at all, so
+	 * neither can be swallowed here.  SIGCONT is excluded because a
+	 * continue resumes a stopped process whether or not the signal is
+	 * blocked; its own branch below queues it correctly. */
+	if (sig != SIGSTOP && sig != SIGCONT &&
+	    sigismember_k(&task->signals.blocked, sig)) {
+		signal_send(task, sig, &info);
 		return;
 	}
 
@@ -5031,7 +5296,7 @@ int sched_signal_all(task_t *sender, int sig)
 		 * signal is skipped rather than failing the whole call. */
 		if (signal_permission(targets[i], sig) != 0)
 			continue;
-		sched_signal_task(targets[i], sig);
+		sched_signal_task_from(targets[i], sig, sender);
 		delivered++;
 	}
 	return delivered ? 0 : -ESRCH;
@@ -5173,7 +5438,7 @@ int sched_signal_pgrp_checked(int pgid, int sig)
 		if (signal_permission(targets[i], sig) != 0)
 			continue;
 		if (sig != 0)
-			sched_signal_task(targets[i], sig);
+			sched_signal_task_from(targets[i], sig, sched_current());
 		delivered++;
 	}
 	return delivered ? 0 : -EPERM;
@@ -5273,6 +5538,14 @@ void sched_dump_tasks(struct tty *tty)
 		 * lost the wake. */
 		int jc_stop, jc_cont;
 		uint32_t pend;
+		/* Why a READY task at the head of a queue is not being run.
+		 * `refus` counts consecutive times the pick refused it (see
+		 * rq_note_sp0_refusal); `aff` is its CPU mask, 0 meaning any.
+		 * A strand with refus climbing is being dequeued and put back;
+		 * one with refus stuck at zero is never reaching the pick at
+		 * all, and those are different bugs. */
+		unsigned refus;
+		uint64_t aff;
 		uint8_t state;
 		char is_leader, marker;
 	} *snaps = slab_alloc((size_t)snap_cap * sizeof(*snaps));
@@ -5304,6 +5577,8 @@ void sched_dump_tasks(struct tty *tty)
 		snaps[nsnaps].marker = (t == cur) ? '*' : ' ';
 		snaps[nsnaps].jc_stop = t->jc_stop_signo;
 		snaps[nsnaps].jc_cont = t->jc_continued;
+		snaps[nsnaps].refus = t->sp0_refusals;
+		snaps[nsnaps].aff = t->cpu_affinity;
 		snaps[nsnaps].pend =
 			(uint32_t)t->signals.pending.sig[0];
 		nsnaps++;
@@ -5322,6 +5597,10 @@ void sched_dump_tasks(struct tty *tty)
 			snaps[i].nr_threads, snaps[i].is_leader,
 			snaps[i].last_rip, snaps[i].user_rip,
 			(uint64_t)snaps[i].sp, (uint64_t)snaps[i].wait_channel);
+		if (snaps[i].refus || snaps[i].aff)
+			tty_printf(tty, "      refus=%u aff=%llx\n",
+				   snaps[i].refus,
+				   (unsigned long long)snaps[i].aff);
 		if (snaps[i].jc_stop || snaps[i].jc_cont || snaps[i].pend)
 			tty_printf(
 				tty,

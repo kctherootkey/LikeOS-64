@@ -95,6 +95,72 @@ uint64_t mm_get_kernel_heap_start(void);
  * fault means a pre-fault shield is missing at some user-copy site. */
 int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode);
 
+/* ==========================================================================
+ * Dirty tracking for device mappings.
+ *
+ * A driver whose device holds a second copy of mapped pages registers these
+ * callbacks on the mapping (device_mmap.dirty_ops); they ride on every
+ * region record describing it.  `obj' is always the record's dev_obj and
+ * `offset' a byte offset within the driver's FILE -- the record's offset
+ * plus the page's distance into the record, which survives splits because
+ * a split maintains offset = original + delta.
+ * ========================================================================== */
+struct mm_dirty_ops {
+	/* A write faulted against an entry the tracker had write-protected
+	 * (PAGE_DIRTY_TRACKED set, PAGE_WRITABLE absent).  Record the page;
+	 * the fault handler grants write permission afterwards either way --
+	 * the MAPPING is writable, only the tracker had borrowed the bit. */
+	void (*mkwrite)(void *obj, uint64_t offset);
+	/* The entry for a written page is about to be discarded by unmap,
+	 * taking the processor's dirty record with it; called once per such
+	 * page so the write is not forgotten. */
+	void (*page_dirty)(void *obj, uint64_t offset);
+	/* Should a NEW mapping's entries be created with the write bit
+	 * withheld?  Asked once per mmap.  A tracker that learns of writes
+	 * from faults must say yes: this kernel installs a device mapping's
+	 * entries eagerly, and an entry born writable would never fault --
+	 * the writes through it would simply never be seen.  (The reference
+	 * implementation gets this for free from demand-faulted mappings,
+	 * whose entries it creates read-only while fault-tracking.) */
+	int (*wp_new_mapping)(void *obj);
+};
+
+/* One pass over the CURRENT address space's mappings of one driver object.
+ *
+ * Matching is by record: in_use, device, dev_obj == obj, dev_dirty == ops.
+ * `file_base' is the driver-file offset of the object's first page and
+ * `npages' its length, so a record's pages can be placed within the object;
+ * [first, last) further narrows the pass to a page window of the object.
+ *
+ * Both walks modify entries with atomic exchanges -- the processor sets
+ * accessed/dirty bits with locked cycles of its own, and a plain
+ * read-modify-write would lose a bit set between the read and the write --
+ * and both return only after the changed translations are gone from every
+ * processor, because a stale one still honouring the old entry would let
+ * writes through unrecorded.  `marked' counts entries changed; `matched'
+ * counts records seen, so the caller can tell whether OTHER address spaces
+ * also map the object (their records are not walkable from here). */
+struct mm_dirty_walk {
+	void *obj;
+	const struct mm_dirty_ops *ops;
+	uint64_t file_base;
+	uint64_t npages;
+	uint64_t first, last; /* page window within the object */
+	/* clean walk only: called for each dirty page found, with the
+	 * page's index within the object. */
+	void (*record)(void *arg, uint64_t page);
+	void *arg;
+	/* out */
+	uint64_t marked;
+	uint64_t matched;
+};
+/* Take PAGE_WRITABLE from every writable entry in the window (marking it
+ * PAGE_DIRTY_TRACKED); the next write faults and is reported to mkwrite. */
+int mm_dirty_wp_mappings(struct mm_dirty_walk *w);
+/* Clear the dirty bit of every dirty entry in the window, reporting each
+ * through `record'. */
+int mm_dirty_clean_mappings(struct mm_dirty_walk *w);
+
 /* Pre-fault a user buffer range before copying to/from it while holding
  * FS/socket locks: materialises lazy pages (and resolves COW when the
  * copy will WRITE into the buffer) so no page fault needing file I/O can
@@ -120,6 +186,12 @@ void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write);
 // physical page allocator.  Unmap/teardown/clone paths must never free,
 // refcount or COW such pages — only clear or copy the PTE.
 #define PAGE_DEVICE 0x400
+/* Write permission withheld by a dirty tracker (available bit 11).  Set
+ * when mm_dirty_wp_mappings() takes PAGE_WRITABLE away from an entry so
+ * the write fault that follows is recognised as bookkeeping rather than a
+ * protection error, and so mprotect() knows the missing write bit is not
+ * its to restore.  Only meaningful together with PAGE_DEVICE. */
+#define PAGE_DIRTY_TRACKED 0x800
 #define PAGE_NO_EXECUTE 0x8000000000000000ULL
 
 // Physical address mask for extracting physical address from page table entries
@@ -435,6 +507,11 @@ void mm_merge_mmap_regions(struct task *task);
  * after every successful mmap: without it the region table only ever grows,
  * because merging used to happen on munmap alone. */
 void mm_merge_region_neighbours(struct task *task, struct mmap_region *region);
+/* Take / drop the references a region record holds (its file and, for a
+ * mapping of a driver object, the object).  A new record copied from an
+ * existing one must hold before it is published. */
+void mm_region_ref_hold(struct mmap_region *r);
+void mm_region_ref_drop(struct mmap_region *r);
 /* Pages this address space actually has resident -- the real resident set,
  * as opposed to how much address space has been reserved. */
 uint64_t mm_count_resident_pages(uint64_t *pml4);
@@ -453,6 +530,8 @@ uint64_t mm_count_resident_pages(uint64_t *pml4);
 void mm_init_page_refcounts(void);
 void mm_get_page(uint64_t physical_addr);
 void mm_put_page(uint64_t physical_addr);
+
+
 uint16_t mm_get_page_refcount(uint64_t physical_addr);
 
 // Kernel Heap Allocator
@@ -483,6 +562,7 @@ void mm_print_memory_stats(void);
 void mm_print_heap_stats(void);
 bool mm_validate_heap(void);
 uint64_t mm_get_free_pages(void);
+uint64_t mm_get_usable_pages(void);
 /* Print which call sites hold the allocated pages (diagnostics). */
 /* Leak-hunt instrumentation, DEBUG builds only -- see the block comment in
  * kernel/mm/memory.c.  When it is off the counters do not exist and every use
@@ -615,6 +695,19 @@ void mm_mark_guard_page(uint64_t virt_addr);
  * style, and the wrapper does the acquire/release exactly once -- adding an
  * unlock to every return path is how one gets missed.
  */
+/* Same, but the result lands in `var' and control continues (for callers
+ * with work to do after the lock is dropped). */
+#define RUN_WRITE_LOCKED_RET(var, call)              \
+	do {                                         \
+		task_t *__cur = sched_current();     \
+		task_t *__mm = task_mm_owner(__cur); \
+		if (!__mm)                           \
+			return -EFAULT;              \
+		mm_write_lock(&__mm->mmap_lock);     \
+		(var) = (call);                      \
+		mm_write_unlock(&__mm->mmap_lock);   \
+	} while (0)
+
 #define RUN_WRITE_LOCKED(call)                       \
 	do {                                         \
 		task_t *__cur = sched_current();     \

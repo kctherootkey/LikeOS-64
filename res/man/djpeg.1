@@ -9,190 +9,252 @@ SYNOPSIS
 DESCRIPTION
        djpeg  decompresses  the  named  JPEG file, or the standard input if no
        file is named, and produces an image file on the standard output.  PBM-
-       PLUS (PPM/PGM), BMP, GIF, Targa, or RLE (Utah  Raster  Toolkit)  output
-       format  can  be selected.  (RLE is supported only if the URT library is
-       available, which it isn't on most non-Unix systems.)
+       PLUS (PPM/PGM), BMP, GIF, or Targa output format can be selected.
 
 OPTIONS
        All switch names may be abbreviated; for  example,  -grayscale  may  be
        written  -gray or -gr.  Most of the "basic" switches can be abbreviated
        to as little as one letter.  Upper and lower case are equivalent  (thus
-       -BMP  is the same as -bmp).  British spellings are also accepted (e.g.,
+       -BMP  is  the same as -bmp).  British spellings are also accepted (e.g.
        -greyscale), though for brevity these are not mentioned below.
 
        The basic switches are:
 
        -colors N
-              Reduce image to at most N colors.  This reduces  the  number  of
-              colors  used in the output image, so that it can be displayed on
-              a colormapped display or stored in a  colormapped  file  format.
-              For  example, if you have an 8-bit display, you'd need to reduce
-              to 256 or fewer colors.
+              Reduce image to at most N colors [legacy feature].  This reduces
+              the number of colors used in the output image so that it can  be
+              stored  in  a  colormapped  file format.  This feature cannot be
+              used when decompressing lossless JPEG images.
 
        -quantize N
-              Same as -colors.  -colors is the recommended name, -quantize  is
-              provided only for backwards compatibility.
+              Same as -colors.  -colors is the recommended name.  -quantize is
+              provided only for backward compatibility.
 
-       -fast  Select recommended processing options for fast, low quality out-
-              put.   (The  default options are chosen for highest quality out-
-              put.)  Currently, this is  equivalent  to  -dct  fast  -nosmooth
-              -onepass -dither ordered.
+       -fast  Select recommended processing  options  for  low-quality  output
+              [legacy  feature].  (The default options are chosen for highest-
+              quality output.)  Currently, this is  equivalent  to  -dct  fast
+              -nosmooth  -onepass -dither ordered.  On modern CPUs, these set-
+              tings have little or no performance  benefit  and  are  retained
+              solely for backward compatibility.
 
        -grayscale
-              Force  grayscale  output even if JPEG file is color.  Useful for
-              viewing on monochrome  displays;  also,  djpeg  runs  noticeably
-              faster in this mode.
+              Force  grayscale  output  even if JPEG file is full-color.  This
+              feature cannot be used when  decompressing  full-color  lossless
+              JPEG images.
 
-       -rgb   Force  RGB  output even if JPEG file is grayscale.  This is pro-
-              vided to support applications  that  don't  want  to  cope  with
-              grayscale as a separate case.
+       -rgb   Force  RGB  output even if JPEG file is grayscale.  This feature
+              cannot be used when decompressing grayscale  lossless  JPEG  im-
+              ages.
 
        -scale M/N
-              Scale  the  output  image  by a factor M/N.  Currently supported
-              scale factors are M/N with all M from 1 to 16, where  N  is  the
-              source  DCT  size, which is 8 for baseline JPEG.  If the /N part
-              is omitted, then M specifies the DCT scaled size to  be  applied
-              on the given input.  For baseline JPEG this is equivalent to M/8
-              scaling,  since  the  source  DCT  size  for baseline JPEG is 8.
-              Scaling is handy if the image is larger than your screen;  also,
-              djpeg runs much faster when scaling down the output.
+              Scale  the  output  image  by a factor M/N.  Currently the scale
+              factor must be M/8, where M is an integer between 1 and  16  in-
+              clusive,  or  any  reduced  fraction  thereof (such as 1/2, 3/4,
+              etc.)  Scaling is handy if the image is larger than your screen.
+              This feature cannot be used when decompressing lossless JPEG im-
+              ages.
 
-       -bmp   Select  BMP  output  format (Windows flavor).  8-bit colormapped
-              format is emitted if -colors or -grayscale is specified,  or  if
-              the  JPEG file is grayscale; otherwise, 24-bit full-color format
-              is emitted.
-
-       -gif   Select GIF output format (LZW compressed).  Since GIF  does  not
-              support more than 256 colors, -colors 256 is assumed (unless you
-              specify  a smaller number of colors).  If you specify -fast, the
-              default number of colors is 216.
-
-       -gif0  Select GIF output format (uncompressed).   Since  GIF  does  not
-              support more than 256 colors, -colors 256 is assumed (unless you
-              specify  a smaller number of colors).  If you specify -fast, the
-              default number of colors is 216.
-
-       -os2   Select BMP output format (OS/2 1.x flavor).   8-bit  colormapped
+       -bmp   Select BMP output format (Windows  flavor).   8-bit  colormapped
               format  is  emitted if -colors or -grayscale is specified, or if
               the JPEG file is grayscale; otherwise, 24-bit full-color  format
-              is emitted.
+              is  emitted.   This  format  can only be used when decompressing
+              8-bit-per-sample JPEG images.
+
+       -gif   Select GIF  output  format  (LZW-compressed)  [legacy  feature].
+              Since  GIF does not support more than 256 colors, -colors 256 is
+              assumed (unless you specify a smaller number of colors).  If you
+              specify -fast, the default number of colors is 216.  This format
+              can only be used when decompressing 8-bit-per-sample or  12-bit-
+              per-sample lossy JPEG images.
+
+       -gif0  Select GIF output format (uncompressed) [legacy feature].  Since
+              GIF  does  not  support more than 256 colors, -colors 256 is as-
+              sumed (unless you specify a smaller number of colors).   If  you
+              specify -fast, the default number of colors is 216.  This format
+              can  only be used when decompressing 8-bit-per-sample or 12-bit-
+              per-sample lossy JPEG images.
+
+       -os2   Select BMP output format (OS/2  1.x  flavor)  [legacy  feature].
+              8-bit  colormapped format is emitted if -colors or -grayscale is
+              specified, or if the JPEG file is grayscale;  otherwise,  24-bit
+              full-color format is emitted.  This format can only be used when
+              decompressing 8-bit-per-sample JPEG images.
 
        -pnm   Select PBMPLUS (PPM/PGM) output format (this is the default for-
               mat).   PGM  is  emitted  if  the  JPEG  file is grayscale or if
               -grayscale is specified; otherwise PPM is emitted.
 
-       -rle   Select RLE output format.  (Requires URT library.)
-
-       -targa Select Targa output format.  Grayscale format is emitted if  the
-              JPEG file is grayscale or if -grayscale is specified; otherwise,
-              colormapped  format  is  emitted if -colors is specified; other-
-              wise, 24-bit full-color format is emitted.
+       -targa Select Targa output format [legacy feature].   Grayscale  format
+              is  emitted  if  the  JPEG file is grayscale or if -grayscale is
+              specified; otherwise, colormapped format is emitted  if  -colors
+              is  specified;  otherwise,  24-bit full-color format is emitted.
+              This format can only be used when decompressing 8-bit-per-sample
+              JPEG images.
 
        Switches for advanced users:
 
        -dct int
-              Use integer DCT method (default).
+              Use accurate integer DCT method (default).
 
        -dct fast
-              Use fast integer DCT (less accurate).
+              Use less accurate integer DCT method [legacy feature].  When the
+              Independent JPEG Group's software was first  released  in  1991,
+              the  decompression  time for a 1-megapixel JPEG image on a main-
+              stream PC was measured in minutes.  Thus, the fast  integer  DCT
+              algorithm  provided  noticeable performance benefits.  On modern
+              CPUs running libjpeg-turbo, however, the decompression time  for
+              a  1-megapixel  JPEG image is measured in milliseconds, and thus
+              the performance benefits of the fast algorithm are much less no-
+              ticeable.  On modern x86/x86-64 CPUs that support AVX2  instruc-
+              tions,  the  fast  and int methods have similar performance.  On
+              other types of CPUs, the fast method is  generally  about  5-15%
+              faster than the int method.
+
+              If  the JPEG image was compressed using a quality level of 85 or
+              below, then there should be little  or  no  perceptible  quality
+              difference  between  the two algorithms.  When decompressing im-
+              ages that were compressed using quality levels  above  85,  how-
+              ever,  the  difference  between the fast and int methods becomes
+              more pronounced.  With images compressed using  quality=97,  for
+              instance,  the  fast method incurs generally about a 4-6 dB loss
+              in PSNR relative to the int method, but this can be  larger  for
+              some  images.   If  you can avoid it, do not use the fast method
+              when decompressing images that  were  compressed  using  quality
+              levels  above  97.  The algorithm often degenerates for such im-
+              ages and can actually produce a more lossy output image than  if
+              the JPEG image had been compressed using lower quality levels.
 
        -dct float
-              Use  floating-point  DCT  method.   The  float  method  is  very
-              slightly  more  accurate than the int method, but is much slower
-              unless your machine has very fast floating-point hardware.  Also
-              note that results of the floating-point method may vary slightly
-              across machines, while the integer methods should give the  same
-              results  everywhere.  The fast integer method is much less accu-
-              rate than the other two.
+              Use  floating-point  DCT  method  [legacy  feature].   The float
+              method does not produce significantly more accurate results than
+              the int method, and it is much slower.   The  float  method  may
+              also give different results on different machines due to varying
+              roundoff  behavior,  whereas the integer methods should give the
+              same results on all machines.
 
        -dither fs
-              Use Floyd-Steinberg dithering in color quantization.
+              Use Floyd-Steinberg dithering  when  quantizing  colors  [legacy
+              feature].
 
        -dither ordered
-              Use ordered dithering in color quantization.
+              Use ordered dithering when quantizing colors [legacy feature].
 
        -dither none
-              Do not use dithering in color quantization.  By default,  Floyd-
-              Steinberg  dithering  is applied when quantizing colors; this is
-              slow but usually produces the best results.  Ordered dither is a
-              compromise between speed and quality; no dithering is  fast  but
-              usually  looks  awful.   Note that these switches have no effect
-              unless color quantization is being done.  Ordered dither is only
-              available in -onepass mode.
+              Do  not  use  dithering when quantizing colors [legacy feature].
+              By default, Floyd-Steinberg dithering is applied when quantizing
+              colors.  This is slower but usually produces the  best  results.
+              Ordered dithering is a compromise between speed and quality.  No
+              dithering  is  faster  but usually looks awful.  Note that these
+              switches have no effect unless color quantization is being done.
+              Ordered dithering is only available in -onepass mode.
+
+       -icc file
+              Extract ICC color management profile to the specified file.
 
        -map file
-              Quantize to the colors used in the specified image  file.   This
-              is  useful  for  producing  multiple  files with identical color
-              maps, or for forcing a predefined set of colors to be used.  The
-              file must be a GIF or PPM file. This  option  overrides  -colors
-              and -onepass.
+              Quantize to the colors used in the specified image file  [legacy
+              feature].   This  is  useful  for  producing multiple files with
+              identical color maps, or for forcing a predefined set of  colors
+              to  be  used.   The  file must be a GIF or PPM file. This option
+              overrides -colors and -onepass.
 
        -nosmooth
-              Don't use high-quality upsampling.
+              Use a faster, lower-quality upsampling routine.
 
        -onepass
-              Use  one-pass  instead of two-pass color quantization.  The one-
-              pass method is faster and needs less memory, but it  produces  a
-              lower-quality  image.   -onepass  is ignored unless you also say
-              -colors N.   Also,  the  one-pass  method  is  always  used  for
-              grayscale output (the two-pass method is no improvement then).
+              Use one-pass instead of two-pass color quantization [legacy fea-
+              ture].  The one-pass method needs less memory, but it produces a
+              lower-quality image.  -onepass is ignored unless you also  spec-
+              ify  -colors  N.   Also,  the one-pass method is always used for
+              grayscale output.  (The two-pass method has  no  improvement  in
+              that case.)
 
        -maxmemory N
               Set  limit  for  amount of memory to use in processing large im-
               ages.  Value is in thousands of bytes, or millions of  bytes  if
               "M"  is  attached  to  the number.  For example, -max 4m selects
-              4000000 bytes.  If more space is needed, temporary files will be
-              used.
+              4000000 bytes.  If more space is needed, an error will occur.
+
+       -maxscans N
+              Abort if the JPEG image contains more than N scans.   This  fea-
+              ture  demonstrates  a  method  by  which  applications can guard
+              against  denial-of-service  attacks  instigated  by   specially-
+              crafted  malformed  JPEG  images  containing numerous scans with
+              missing image data or image data consisting only of  "EOB  runs"
+              (a  feature  of  progressive JPEG images that allows potentially
+              hundreds of thousands of adjoining zero-value pixels to be  rep-
+              resented using only a few bytes.)  Attempting to decompress such
+              malformed  JPEG  images  can cause excessive CPU activity, since
+              the decompressor must fully process each scan (even if the  scan
+              is corrupt) before it can proceed to the next scan.
 
        -outfile name
               Send output image to the named file, not to standard output.
 
+       -memsrc
+              Load  input file into memory before decompressing.  This feature
+              was implemented mainly as a way of testing the in-memory  source
+              manager (jpeg_mem_src().)
+
+       -report
+              Report decompression progress.
+
+       -skip Y0,Y1
+              Decompress  all  rows  of the JPEG image except those between Y0
+              and Y1 (inclusive.)  Note that if decompression scaling is being
+              used, then Y0 and Y1 are relative to  the  scaled  image  dimen-
+              sions.
+
+       -crop WxH+X+Y
+              Decompress  only  a rectangular subregion of the image, starting
+              at point X,Y with width W and height H.  If necessary, X will be
+              shifted left to the nearest iMCU boundary, and the width will be
+              increased accordingly.  Note that if  decompression  scaling  is
+              being used, then X, Y, W, and H are relative to the scaled image
+              dimensions.   Currently  this option only works with the PBMPLUS
+              (PPM/PGM), GIF, and Targa output formats.
+
+       -strict
+              Treat all warnings as fatal.  This feature also  demonstrates  a
+              method  by  which  applications can guard against attacks insti-
+              gated by specially-crafted malformed JPEG images.  Enabling this
+              option will cause the decompressor to abort if  the  JPEG  image
+              contains incomplete or corrupt image data.
+
        -verbose
-              Enable debug printout.  More -v's give more output.  Also,  ver-
+              Enable  debug printout.  More -v's give more output.  Also, ver-
               sion information is printed at startup.
 
        -debug Same as -verbose.
 
+       -version
+              Print version information and exit.
+
 EXAMPLES
-       This  example  decompresses  the JPEG file foo.jpg, quantizes it to 256
-       colors, and saves the output in 8-bit BMP format in foo.bmp:
+       This example decompresses the JPEG file foo.jpg and saves the output in
+       8-bit BMP format in foo.bmp:
 
-              djpeg -colors 256 -bmp foo.jpg > foo.bmp
-
-HINTS
-       To get a quick preview of an image, use the  -grayscale  and/or  -scale
-       switches.  -grayscale -scale 1/8 is the fastest case.
-
-       Several  options  are  available  that  trade off image quality to gain
-       speed.  -fast turns on the recommended settings.
-
-       -dct fast and/or -nosmooth gain speed at a small sacrifice in  quality.
-       When  producing  a  color-quantized  image, -onepass -dither ordered is
-       fast but much lower quality than the default  behavior.   -dither  none
-       may  give  acceptable results in two-pass mode, but is seldom tolerable
-       in one-pass mode.
-
-       If you are fortunate enough to have very fast floating point  hardware,
-       -dct  float  may  be  even faster than -dct fast.  But on most machines
-       -dct float is slower than -dct int; in this case it is not worth using,
-       because its theoretical accuracy advantage is too small to be  signifi-
-       cant in practice.
+              djpeg -bmp foo.jpg > foo.bmp
 
 ENVIRONMENT
        JPEGMEM
-              If  this  environment  variable is set, its value is the default
-              memory limit.  The value  is  specified  as  described  for  the
-              -maxmemory  switch.   JPEGMEM overrides the default value speci-
-              fied when the program was compiled, and itself is overridden  by
+              If this environment variable is set, its value  is  the  default
+              memory  limit.   The  value  is  specified  as described for the
+              -maxmemory switch.  JPEGMEM overrides the default  value  speci-
+              fied  when the program was compiled, and itself is overridden by
               an explicit -maxmemory.
 
 SEE ALSO
        cjpeg(1), jpegtran(1), rdjpgcom(1), wrjpgcom(1)
        ppm(5), pgm(5)
-       Wallace,  Gregory  K.   "The  JPEG Still Picture Compression Standard",
+       Wallace, Gregory K.  "The JPEG  Still  Picture  Compression  Standard",
        Communications of the ACM, April 1991 (vol. 34, no. 4), pp. 30-44.
 
 AUTHOR
        Independent JPEG Group
 
-                                 28 April 2019                        DJPEG(1)
+       This file was modified by The libjpeg-turbo Project to include only in-
+       formation relevant to libjpeg-turbo, to wordsmith certain sections, and
+       to describe features not present in libjpeg.
+
+                                 17 June 2024                         DJPEG(1)

@@ -530,8 +530,14 @@ static int64_t ptrace_set_tf(task_t *t, bool on)
  * Translation is per page because one translation covers exactly one page; a
  * request spanning a boundary is split rather than trusted to stay put.
  */
-static int64_t ptrace_xfer_mem(task_t *mm, uint64_t addr, void *kbuf,
-			       size_t len, bool write)
+/* Read or write another address space's memory into a KERNEL buffer.
+ *
+ * Exported (as mm_xfer_task_memory) for /proc/<pid>/mem, which is the same
+ * operation reached a different way -- the reference has both for the same
+ * reason: PEEKDATA is one word per syscall, and anything that wants to read a
+ * whole mapping needs a file to read it from. */
+int64_t ptrace_xfer_mem(task_t *mm, uint64_t addr, void *kbuf,
+			size_t len, bool write)
 {
 	uint8_t *b = (uint8_t *)kbuf;
 	uint64_t end = addr + len;
@@ -1012,8 +1018,22 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 	 * any of the work that can sleep.
 	 */
 	case PT_GETAUXV: {
-		uint64_t src = t->auxv_addr;
-		uint64_t srclen = t->auxv_len;
+		/* The vector belongs to the exec'd IMAGE, which means the
+		 * thread-group leader: elf_setup_stack records it on the task
+		 * that called execve and on no other.  A debugger, though,
+		 * names whichever LWP it is currently stopped on -- attach to
+		 * a browser and that is some worker thread, never the leader
+		 * -- and this used to read THAT task's fields: zero, reported
+		 * honestly as "never exec'd".  gdb then had no AT_ENTRY, could
+		 * not place a position-independent executable (`break exit' at
+		 * its file-relative 0x600), and the same missing displacement
+		 * made the DT_DEBUG lookup read the wrong address, so no
+		 * shared library ever appeared either.  One wrong task, both
+		 * symptoms; same shape as the crash reporter reading the
+		 * faulting thread's empty region table. */
+		task_t *img = task_mm_owner(t);
+		uint64_t src = img ? img->auxv_addr : 0;
+		uint64_t srclen = img ? img->auxv_len : 0;
 
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
 
@@ -1021,6 +1041,17 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * error: a tracee stopped at PTRACE_TRACEME before its exec is
 		 * a legitimate thing to ask about, and the honest answer is
 		 * that it has none yet. */
+		/* One line per attach, so a debugger that cannot place a
+		 * breakpoint says WHY instead of leaving it to be inferred.
+		 * gdb reports an empty vector and a zero load bias
+		 * identically -- as a symbol at its link-time address -- and
+		 * the three values below separate the possible causes:
+		 * a task that never exec'd (src == 0), a length of zero, and
+		 * a read of the tracee's stack that failed. */
+		WARN_RATELIMIT(!src || !srclen,
+			       "ptrace GETAUXV: pid %d has no vector (addr=%llx len=%llu) - a PIE debugged against this reports every symbol at its link address",
+			       (int)pid, (unsigned long long)src,
+			       (unsigned long long)srclen);
 		if (!src || !srclen)
 			return 0;
 
@@ -1045,6 +1076,11 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		ret = ptrace_xfer_mem(mm, src, kbuf, srclen, false);
 		mm_read_unlock(&mm->mmap_lock);
 		if (ret != 0) {
+			WARN_RATELIMIT(
+				1,
+				"ptrace GETAUXV: pid %d reading %llu bytes at %llx from the tracee failed (%lld)",
+				(int)pid, (unsigned long long)srclen,
+				(unsigned long long)src, (long long)ret);
 			kfree(kbuf);
 			return ret;
 		}

@@ -111,8 +111,11 @@ typedef unsigned long sigset_t;
 // Alternate stack flags
 #define SS_ONSTACK  1
 #define SS_DISABLE  2
-#define MINSIGSTKSZ 2048
-#define SIGSTKSZ    8192
+/* A signal frame carries the whole extended register file (up to 4 KB on
+ * an AVX-512 machine), so the smallest usable alternate stack is a good
+ * deal larger than the historical 2 KB. */
+#define MINSIGSTKSZ 12288
+#define SIGSTKSZ    65536
 
 // Interval timer types
 #define ITIMER_REAL    0
@@ -275,9 +278,16 @@ struct sigevent {
     void*    sigev_notify_attributes;
 };
 
-// Timer ID type
+// Timer ID type.  Also defined in <time.h>, which is where POSIX puts both;
+// the guards let a translation unit include either header, or both.
+#ifndef __timer_t_defined
+#define __timer_t_defined
 typedef int timer_t;
+#endif
+#ifndef __clockid_t_defined
+#define __clockid_t_defined
 typedef int clockid_t;
+#endif
 
 // Signal functions
 int raise(int sig);
@@ -293,6 +303,8 @@ int sigsuspend(const sigset_t* mask);
 int sigpending(sigset_t* set);
 int sigtimedwait(const sigset_t* set, siginfo_t* info, const struct timespec* timeout);
 int sigwaitinfo(const sigset_t* set, siginfo_t* info);
+/* Wait for one of `set' and return its number in *sig (0 or an errno). */
+int sigwait(const sigset_t* set, int* sig);
 int sigqueue(pid_t pid, int sig, const sigval_t value);
 
 // Process signals

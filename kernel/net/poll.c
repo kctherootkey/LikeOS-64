@@ -159,8 +159,7 @@ static void poll_table_free(struct poll_table *pt)
  * is safe rather than merely tolerable: a poller that fails to register still
  * re-scans on the periodic wakeup below, so the worst outcome is the latency
  * this whole change is removing, not a missed event. */
-static void poll_wait(struct poll_table *pt, void *owner,
-		      struct wait_queue_head *h)
+void poll_wait(struct poll_table *pt, void *owner, struct wait_queue_head *h)
 {
 	task_t *cur;
 
@@ -444,6 +443,17 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 			if (events & (POLLOUT | POLLWRNORM))
 				rev |= POLLOUT | POLLWRNORM;
 			rev_out = rev;
+			goto out;
+		}
+	}
+
+	// Registered device nodes and anonymous device files: the driver's
+	// own poll hook (or always-ready when it has none).
+	{
+		short rev_dev;
+		if (devfs_device_poll((vfs_file_t *)entry, events, pt,
+				      &rev_dev) == 0) {
+			rev_out = rev_dev;
 			goto out;
 		}
 	}

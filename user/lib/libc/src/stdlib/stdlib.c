@@ -1,3 +1,4 @@
+#include <elf.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
@@ -618,11 +619,21 @@ int env_count(void)
  * function runs there is no environment to read -- see __malloc_env_ready(). */
 extern void __malloc_env_ready(void);
 
+/* The auxiliary vector follows the environment's terminating NULL on the
+ * initial stack; found once here for getauxval(). */
+Elf64_auxv_t *__libc_auxv;
+
 void __libc_init_environ(char **envp)
 {
 	g_env_count = 0;
 	if (!envp)
 		return;
+	{
+		char **p = envp;
+		while (*p)
+			p++;
+		__libc_auxv = (Elf64_auxv_t *)(p + 1);
+	}
 	for (int i = 0; envp[i] && g_env_count < MAX_ENV_VARS; i++) {
 		char *eq = strchr(envp[i], '=');
 		if (!eq)
@@ -962,4 +973,13 @@ lldiv_t lldiv(long long num, long long den)
 	r.quot = num / den;
 	r.rem = num % den;
 	return r;
+}
+
+void *reallocarray(void *ptr, size_t nmemb, size_t size)
+{
+	if (size && nmemb > (size_t)-1 / size) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return realloc(ptr, nmemb * size);
 }

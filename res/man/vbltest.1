@@ -1,0 +1,39 @@
+VBLTEST(1)                       User Commands                      VBLTEST(1)
+
+NAME
+       vbltest - measure the display manager's vertical-blank rate
+
+SYNOPSIS
+       vbltest [options]
+
+DESCRIPTION
+       vbltest  asks  the kernel's display manager for a vertical-blank event,
+       waits for it, asks for the next one, and every five seconds prints  the
+       rate  it  is getting.  It is the shortest answer to "are vertical-blank
+       events arriving, and at what frequency", which is the question behind a
+       session that tears, stutters, or never repaints at all.
+
+       The number to expect on this system is 60 Hz: the kernel's  driver  has
+       no  vertical-blank interrupt from the emulated device and generates the
+       events from a high-resolution timer instead, which is what  the  refer-
+       ence  driver does on the same hardware.  A rate that drifts far from 60
+       says the timer is not firing when it should, not that  the  display  is
+       misconfigured.
+
+       Reading  events needs no master rights, so this can run while X has the
+       display.
+
+OPTIONS
+       -D device
+              Open the given device node instead of searching.
+
+       -M module
+              Open the node  belonging  to  the  named  driver,  for  instance
+              vmwgfx.
+
+       -s     Wait on the secondary pipe rather than the first.
+
+SEE ALSO
+       drminfo(1), modetest(1), proptest(1)
+
+libdrm 2.4.124                    August 2026                       VBLTEST(1)

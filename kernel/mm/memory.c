@@ -715,42 +715,81 @@ static uint64_t g_alloc_hint = 0;
 
 // Find first free bit in bitmap
 // Uses hint to avoid rescanning already-allocated low pages
+/* First free page in the bitmap words [begin_word, end_word), or -1. */
+static uint64_t find_free_page_in(uint64_t begin_word, uint64_t end_word)
+{
+	for (uint64_t i = begin_word; i < end_word; i++) {
+		if (mm_state.physical_bitmap[i] == 0xFFFFFFFF)
+			continue;
+		for (int bit = 0; bit < 32; bit++) {
+			if (!(mm_state.physical_bitmap[i] & (1 << bit)))
+				return i * 32 + bit;
+		}
+	}
+	return (uint64_t)-1;
+}
+
+/* The first page at or above 4 GB, as a page index, or 0 when the managed
+ * range is entirely low.  Everything below it is the only memory a device
+ * that carries 32-bit addresses can be given. */
+static uint64_t dma_boundary_page(void)
+{
+	if (mm_state.memory_start >= 0x100000000ULL)
+		return 0; /* no low memory at all: nothing to protect */
+	uint64_t low = (0x100000000ULL - mm_state.memory_start) / PAGE_SIZE;
+
+	return low < mm_state.total_pages ? low : 0;
+}
+
+/* Ordinary single-page allocation, taken from HIGH memory first.
+ *
+ * Anonymous pages, page-table pages, page-cache pages -- none of them care
+ * where they are, and there are millions of them.  Contiguous runs for DMA
+ * care very much: several NICs here carry 32-bit addresses only, and
+ * mm_allocate_contiguous_pages() can serve them only from below 4 GB.  This
+ * used to be one rotating scan over the whole range, so ordinary allocations
+ * consumed the low region like any other, and on a machine with more than
+ * 4 GB the drivers eventually found nothing contiguous left down there --
+ * which is what the "served from above 4 GB" warnings were saying, one per
+ * buffer, for the rest of the session.
+ *
+ * Keeping the low region for the allocations that cannot use anything else
+ * is what a DMA zone is.  It is a preference, not a reservation: when high
+ * memory is gone the low region is used rather than failing, because an
+ * allocation that fails is worse than one a device cannot reach.
+ */
 static uint64_t find_free_page(void)
 {
 	BUG_ON(mm_state.physical_bitmap == NULL);
 	uint64_t num_words = mm_state.bitmap_size / sizeof(uint32_t);
-	uint64_t start = g_alloc_hint / 32; // Start from hint word
+	uint64_t dma_words = (dma_boundary_page() + 31) / 32;
+	uint64_t page;
 
-	// Search from hint to end
-	for (uint64_t i = start; i < num_words; i++) {
-		if (mm_state.physical_bitmap[i] != 0xFFFFFFFF) {
-			// Found a uint32_t with free bits
-			for (int bit = 0; bit < 32; bit++) {
-				if (!(mm_state.physical_bitmap[i] &
-				      (1 << bit))) {
-					uint64_t page = i * 32 + bit;
-					g_alloc_hint =
-						page +
-						1; // Next search starts after this
-					return page;
-				}
-			}
+	if (dma_words > num_words)
+		dma_words = num_words;
+
+	if (dma_words < num_words) {
+		/* High memory, resuming where the last one left off. */
+		uint64_t hint = g_alloc_hint / 32;
+
+		if (hint < dma_words || hint >= num_words)
+			hint = dma_words;
+		page = find_free_page_in(hint, num_words);
+		if (page == (uint64_t)-1)
+			page = find_free_page_in(dma_words, hint);
+		if (page != (uint64_t)-1) {
+			g_alloc_hint = page + 1;
+			return page;
 		}
 	}
 
-	// Wrap around: search from beginning to hint
-	for (uint64_t i = 0; i < start; i++) {
-		if (mm_state.physical_bitmap[i] != 0xFFFFFFFF) {
-			for (int bit = 0; bit < 32; bit++) {
-				if (!(mm_state.physical_bitmap[i] &
-				      (1 << bit))) {
-					uint64_t page = i * 32 + bit;
-					g_alloc_hint = page + 1;
-					return page;
-				}
-			}
-		}
-	}
+	/* Low memory: either this machine has none above 4 GB (in which case
+	 * the scan above already covered everything and this is the only
+	 * pass), or high memory is exhausted and reaching down here is better
+	 * than failing. */
+	page = find_free_page_in(0, dma_words ? dma_words : num_words);
+	if (page != (uint64_t)-1)
+		return page; /* deliberately does not move the high hint */
 
 	return (uint64_t)-1; // No free pages
 }
@@ -1081,6 +1120,7 @@ uint64_t mm_allocate_physical_page(void)
 }
 
 // Free a physical page (SMP-safe)
+
 void mm_free_physical_page(uint64_t physical_address)
 {
 	WARN_ON(physical_address &
@@ -1176,6 +1216,7 @@ void mm_free_physical_page(uint64_t physical_address)
 
 void mm_free_physical_pages_batch(const uint64_t *phys, unsigned n)
 {
+
 	uint64_t flags;
 	unsigned i;
 
@@ -1183,6 +1224,7 @@ void mm_free_physical_pages_batch(const uint64_t *phys, unsigned n)
 		return;
 	BUG_ON(phys == NULL);
 	BUG_ON(n > MM_FREE_BATCH_MAX);
+
 
 #if DEBUG
 	/* The poison pass below deliberately runs with the lock dropped.
@@ -1327,6 +1369,14 @@ void mm_put_pages_batch(const uint64_t *phys, unsigned n)
 uint64_t mm_get_free_pages(void)
 {
 	return mm_state.free_pages;
+}
+
+/* All the RAM the machine has, in pages -- what the memory map reported as
+ * usable, not the address span it is scattered over. */
+uint64_t mm_get_usable_pages(void)
+{
+	return mm_state.usable_pages ? mm_state.usable_pages :
+				       mm_state.total_pages;
 }
 
 // Allocate contiguous physical pages (SMP-safe)
@@ -1552,6 +1602,68 @@ static void free_pt_page(uint64_t phys)
 		// Allocated from general pool — return there
 		mm_free_physical_page(phys);
 	}
+}
+
+/* No processor may still be walking these tables when they go back to the
+ * allocator.
+ *
+ * Page-table pages and ordinary pages come from the SAME allocator here:
+ * allocate_pt_page() falls back to mm_allocate_physical_page() as soon as the
+ * reserved pool runs out, and the pool holds one address space's worth, so the
+ * fallback is reached within the first handful of processes.  A table released
+ * while any processor could still be walking it therefore comes straight back
+ * as somebody's heap, and from then on the two disagree about what the memory
+ * is: the processor reads a program's data as page-table entries, and the
+ * program reads page-table entries as its data.  Both have been seen -- an
+ * entry of all ones in a live table, and a heap chunk whose size field is all
+ * ones.
+ *
+ * The rule is the reference's, in its order: unlink the page, invalidate, THEN
+ * free.  What makes the invalidate sufficient is that remote invalidation here
+ * is an inter-processor interrupt.  A processor cannot take one part-way
+ * through a walk, so every acknowledgement is that processor saying it is not
+ * inside a walk of anything unlinked before the request went out -- and the
+ * full reload it does on the way flushes the paging-structure caches too,
+ * which hold the upper-level entries and which no address-specific
+ * invalidation would touch.  (An architecture whose remote invalidation is not
+ * an interrupt has no such promise and must wait out a grace period instead;
+ * that is the only reason the reference has a second mechanism for it.)
+ *
+ * Switching this processor's own CR3 away, which is all that used to happen,
+ * says nothing about any other processor.
+ *
+ * One barrier covers the whole teardown rather than one per batch: an address
+ * space reaching here is already unreachable -- no task refers to it -- so
+ * after the barrier nothing can begin a walk of any part of it, and the rest
+ * of the tree can be dismantled at leisure. */
+static void pt_free_barrier(uint64_t pml4_phys)
+{
+	uint32_t online = percpu_get_online_count();
+
+	for (uint32_t c = 0; c < online && c < 64; c++) {
+		percpu_t *p = percpu_get(c);
+
+		if (!p)
+			continue;
+		if (__atomic_load_n(&p->mmu_active_pml4, __ATOMIC_ACQUIRE) ==
+			    pml4_phys ||
+		    __atomic_load_n(&p->mmu_incoming_pml4, __ATOMIC_ACQUIRE) ==
+			    pml4_phys) {
+			/* Still loaded somewhere.  The barrier below cannot
+			 * help with this one: that processor will go on
+			 * walking these tables for its kernel mappings after
+			 * they are freed, because the kernel half lives in the
+			 * same tree.  Nothing here can make it leave, so say
+			 * so -- a report naming the processor is worth more
+			 * than the corruption it turns into. */
+			WARN_RATELIMIT(
+				1,
+				"page tables of address space %llx freed while CPU %u still has it loaded",
+				(unsigned long long)pml4_phys, c);
+			break;
+		}
+	}
+	smp_tlb_shootdown_sync();
 }
 
 // Initialize page table page pool by reserving physical memory
@@ -2181,6 +2293,7 @@ static void mm_unmap_page_gathered(uint64_t *pml4, uint64_t virtual_addr,
 }
 
 // Unmap virtual page in a specific address space
+
 void mm_unmap_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr)
 {
 	uint64_t *pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
@@ -2221,6 +2334,7 @@ void mm_unmap_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr)
  * getting out of step.
  */
 
+
 /* Give a task its region table.  Called once, when the task is created. */
 bool mm_regions_init(task_t *task)
 {
@@ -2232,15 +2346,41 @@ bool mm_regions_init(task_t *task)
 	task->mmap_regions = (mmap_region_t *)kalloc(bytes);
 	if (!task->mmap_regions) {
 		task->mmap_capacity = 0;
+		task->mmap_hwm = 0;
+		task->mmap_hint = 0;
 		return false;
 	}
 	mm_memset(task->mmap_regions, 0, bytes);
 	task->mmap_capacity = MMAP_REGIONS_INITIAL;
+	task->mmap_hwm = 0;
+	task->mmap_hint = 0;
 	return true;
 }
 
 /* Release it.  Every task owns its own allocation, including a thread's empty
  * one, so this is unconditional at teardown. */
+/* A region record's references: its backing file, and -- for a mapping of
+ * a driver object -- the object itself.  Every record holds its own, so a
+ * split takes one more and a merge or release drops one. */
+void mm_region_ref_hold(mmap_region_t *r)
+{
+	if (r->file)
+		vfs_incref(r->file);
+	if (r->dev_obj && r->dev_get)
+		r->dev_get(r->dev_obj);
+}
+
+void mm_region_ref_drop(mmap_region_t *r)
+{
+	if (r->file) {
+		vfs_close(r->file);
+		r->file = NULL;
+	}
+	if (r->dev_obj && r->dev_put)
+		r->dev_put(r->dev_obj);
+	r->dev_obj = NULL;
+}
+
 void mm_regions_free(task_t *task)
 {
 	if (!task || !task->mmap_regions)
@@ -2259,14 +2399,17 @@ void mm_regions_free(task_t *task)
 	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
 		mmap_region_t *r = &task->mmap_regions[i];
 
-		if (r->in_use && r->file) {
-			vfs_close(r->file);
-			r->file = NULL;
-		}
+		if (r->in_use)
+			mm_region_ref_drop(r);
 	}
 	kfree(task->mmap_regions);
 	task->mmap_regions = NULL;
 	task->mmap_capacity = 0;
+	/* The bound and the hint describe a table that no longer exists.  exec
+	 * calls this and then builds a new one, so leaving them set would have
+	 * the new table scanned against the old table's extent. */
+	task->mmap_hwm = 0;
+	task->mmap_hint = 0;
 }
 
 /* Replace a task's table with a copy of `src`'s.
@@ -2289,6 +2432,8 @@ bool mm_regions_clone(task_t *dst, const task_t *src)
 	dst->mmap_regions = (mmap_region_t *)kalloc(bytes);
 	if (!dst->mmap_regions) {
 		dst->mmap_capacity = 0;
+		dst->mmap_hwm = 0;
+		dst->mmap_hint = 0;
 		return false;
 	}
 	mm_memset(dst->mmap_regions, 0, bytes);
@@ -2296,6 +2441,12 @@ bool mm_regions_clone(task_t *dst, const task_t *src)
 		mm_memcpy(dst->mmap_regions, src->mmap_regions,
 			  (size_t)src->mmap_capacity * sizeof(mmap_region_t));
 	dst->mmap_capacity = cap;
+	/* The table is copied slot for slot, so the child's bound is the
+	 * parent's.  Leaving it at zero would make every one of the child's
+	 * inherited mappings invisible to the lookup -- the copy would be
+	 * there and nothing would find it. */
+	dst->mmap_hwm = src->mmap_hwm > cap ? cap : src->mmap_hwm;
+	dst->mmap_hint = 0;
 	return true;
 }
 
@@ -2328,9 +2479,8 @@ bool mm_regions_clone_ref(task_t *dst, task_t *src)
 	ok = mm_regions_clone(dst, src);
 	if (ok) {
 		for (uint32_t i = 0; i < dst->mmap_capacity; i++) {
-			if (dst->mmap_regions[i].in_use &&
-			    dst->mmap_regions[i].file)
-				vfs_incref(dst->mmap_regions[i].file);
+			if (dst->mmap_regions[i].in_use)
+				mm_region_ref_hold(&dst->mmap_regions[i]);
 		}
 	}
 	mm_read_unlock(&src->mmap_lock);
@@ -2385,6 +2535,12 @@ mmap_region_t *mm_alloc_mmap_region(task_t *task)
 			 * leak into a new region. */
 			mm_memset(&task->mmap_regions[i], 0,
 				  sizeof(mmap_region_t));
+			/* Raised at the CLAIM, not when the caller finally
+			 * sets in_use: the slot is spoken for from here, and
+			 * an over-estimate only costs a longer scan while an
+			 * under-estimate would hide a live mapping. */
+			if (i + 1 > task->mmap_hwm)
+				task->mmap_hwm = i + 1;
 			return &task->mmap_regions[i];
 		}
 	}
@@ -2400,6 +2556,8 @@ mmap_region_t *mm_alloc_mmap_region(task_t *task)
 				continue;
 			mm_memset(&task->mmap_regions[i], 0,
 				  sizeof(mmap_region_t));
+			if (i + 1 > task->mmap_hwm)
+				task->mmap_hwm = i + 1;
 			return &task->mmap_regions[i];
 		}
 	}
@@ -2417,13 +2575,33 @@ mmap_region_t *mm_alloc_mmap_region(task_t *task)
 	return NULL;
 }
 
-/* Find the in-use region covering `addr`, or NULL. */
+/* Find the in-use region covering `addr`, or NULL.
+ *
+ * Two things keep this off the whole table: the slot that answered last time
+ * is tried first (faults come in runs inside one mapping), and the scan that
+ * follows stops at the high-water mark rather than the capacity.  Both are
+ * described where they are declared; both are hints, and a wrong one costs a
+ * scan, never a wrong answer -- the region is re-checked against `addr'
+ * either way. */
 mmap_region_t *mm_find_mmap_region(task_t *task, uint64_t addr)
 {
-	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
+	uint32_t hint = task->mmap_hint;
+	uint32_t end = task->mmap_hwm;
+
+	if (end > task->mmap_capacity)
+		end = task->mmap_capacity;
+	if (hint < end) {
+		mmap_region_t *r = &task->mmap_regions[hint];
+
+		if (r->in_use && addr >= r->start &&
+		    addr < r->start + r->length)
+			return r;
+	}
+	for (uint32_t i = 0; i < end; i++) {
 		mmap_region_t *r = &task->mmap_regions[i];
 		if (r->in_use && addr >= r->start &&
 		    addr < r->start + r->length) {
+			task->mmap_hint = i;
 			return r;
 		}
 	}
@@ -2509,6 +2687,8 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 		return false;
 	if (a->file != b->file)
 		return false;
+	if (a->dev_obj != b->dev_obj)
+		return false;
 	/* Same file: the offsets have to run on without a break, or the two
 	 * halves are showing different parts of it. */
 	if (a->file && a->offset + a->length != b->offset)
@@ -2550,9 +2730,7 @@ void mm_merge_region_neighbours(task_t *task, mmap_region_t *region)
 		region->length += b->length;
 		/* Each record held its own reference; the one that goes away
 		 * drops its own. */
-		if (b->file)
-			vfs_close(b->file);
-		b->file = NULL;
+		mm_region_ref_drop(b);
 		b->in_use = false;
 		b->length = 0;
 		break;
@@ -2564,9 +2742,7 @@ void mm_merge_region_neighbours(task_t *task, mmap_region_t *region)
 		if (a == region || !mm_regions_mergeable(a, region))
 			continue;
 		a->length += region->length;
-		if (region->file)
-			vfs_close(region->file);
-		region->file = NULL;
+		mm_region_ref_drop(region);
 		region->in_use = false;
 		region->length = 0;
 		break;
@@ -2664,9 +2840,7 @@ void mm_merge_mmap_regions(task_t *task)
 				a->length += b->length;
 				/* Each record held its own reference; the one
 				 * that goes away drops its own. */
-				if (b->file)
-					vfs_close(b->file);
-				b->file = NULL;
+				mm_region_ref_drop(b);
 				b->in_use = false;
 				b->length = 0;
 				j++;
@@ -2830,6 +3004,29 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 		uint64_t unmap_end =
 			(end_addr < region_end) ? end_addr : region_end;
 
+		/* A watched device mapping: the entries about to be cleared
+		 * carry the only record of what the processor wrote through
+		 * them, so each written page is handed to the tracker before
+		 * the record goes.  Without this, write-then-unmap loses the
+		 * write: the pages still hold the data, but nothing is left
+		 * to say the device's copy is behind. */
+		if (region->device && region->dev_dirty &&
+		    region->dev_dirty->page_dirty && region->dev_obj) {
+			for (uint64_t va = cur_addr; va < unmap_end;
+			     va += PAGE_SIZE) {
+				uint64_t *pte = mm_get_page_table_from_pml4(
+					task->pml4, va, false);
+
+				if (pte && (*pte & PAGE_PRESENT) &&
+				    (*pte & PAGE_DEVICE) &&
+				    (*pte & PAGE_DIRTY))
+					region->dev_dirty->page_dirty(
+						region->dev_obj,
+						region->offset +
+							(va - region->start));
+			}
+		}
+
 		/* Clear the entries within [cur_addr, unmap_end).  The pages
 		 * are not released yet -- the gather holds them until every
 		 * CPU has dropped the translation. */
@@ -2839,10 +3036,7 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 		/* Update or free the region record. */
 		if (cur_addr == region->start && unmap_end == region_end) {
 			region->in_use = false;
-			if (region->file) {
-				vfs_close(region->file);
-				region->file = NULL;
-			}
+			mm_region_ref_drop(region);
 			region->lazy = false;
 		} else if (cur_addr == region->start) {
 			/* Keep file_off = offset + (addr - start) invariant
@@ -2885,8 +3079,7 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 				tail->offset = region->offset +
 					       (unmap_end - region->start);
 				/* Each record closes its own reference. */
-				if (tail->file)
-					vfs_incref(tail->file);
+				mm_region_ref_hold(tail);
 				tail->in_use = true;
 			}
 			/* With no slot for the tail its pages stay mapped but
@@ -4125,6 +4318,10 @@ void mm_destroy_address_space(uint64_t *pml4)
 		sched_mmu_track_done(g_kernel_pml4_phys);
 	}
 
+	/* Every processor acknowledges an invalidation before one byte of this
+	 * tree goes back to the allocator.  See pt_free_barrier(). */
+	pt_free_barrier(pml4_phys);
+
 	int pages_freed = 0;
 	int pt_freed = 0;
 
@@ -4393,7 +4590,6 @@ bool mm_map_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr,
 
 	*pte = (physical_addr & ~0xFFFULL) | flags;
 
-
 	// Flush TLB if this is the current address space
 	if (pml4 == mm_get_current_address_space()) {
 		mm_flush_tlb(virtual_addr);
@@ -4539,17 +4735,34 @@ bool mm_mark_page_cow(uint64_t virtual_addr)
  *
  * Returns true when the lock was taken and must be released.
  * ========================================================================== */
+/* Take the address space for reading, or say that it could not be taken.
+ *
+ * A false return now means "do not resolve this fault", and both callers obey
+ * it.  It used to mean "resolve it anyway, without the lock", which is not
+ * something a fault may do.  The region table it walks is an array that
+ * mm_regions_grow() replaces and kfree()s under the write lock, so a fault
+ * reading it unlocked can be walking freed -- and by then handed out again --
+ * memory as though it were region records.  A record whose backing file has
+ * been overwritten by whatever took that memory next makes the fault fill an
+ * executable page with zeros, and the process dies later executing them,
+ * nowhere near the cause.
+ *
+ * Interrupts being disabled is what used to force the choice, since the
+ * semaphore parks and parking with interrupts off does not end well.  But
+ * "cannot park" is not "cannot acquire": the lock is almost always free, and
+ * one non-parking attempt takes it properly in that case, so the common fault
+ * is now correctly locked where before it was not locked at all.  Only when a
+ * writer actually holds it -- exactly the window where the table is being
+ * replaced and reading it would be wrong -- does this give up.
+ *
+ * The reference draws the same line: a fault arriving where the handler may
+ * not sleep is failed outright rather than resolved without mmap_lock. */
 static bool mm_fault_lock(task_t *mm)
 {
 	if (!mm)
 		return false;
-	if (unlikely(irqs_disabled())) {
-		/* Reported by the fault entry point rather than here: it knows
-		 * the instruction that faulted, and without that this warning
-		 * says only that SOMEBODY is missing a shield.  See the
-		 * matching WARN in exception_handler(). */
-		return false;
-	}
+	if (unlikely(irqs_disabled()))
+		return mm_read_trylock(&mm->mmap_lock);
 	mm_read_lock(&mm->mmap_lock);
 	return true;
 }
@@ -4567,6 +4780,255 @@ static void mm_fault_unlock(task_t *mm, bool locked)
 // here runs with the address space held stable for reading: no munmap can pull
 // the region out from under it, and no fork can turn the mapping into a shared
 // one part-way through.
+/* Is this physical address one the direct map can actually reach?
+ *
+ * Asked before any address taken OUT of a page-table entry is followed.  The
+ * reference asks the same question with pfn_valid() and answers a failure
+ * with print_bad_pte(): the entry is corrupt, so it is named and the fault is
+ * refused rather than dereferenced.
+ *
+ * Refusing matters more here than it looks.  phys_to_virt() of an address
+ * past the direct map does not produce an unmapped pointer, it produces a
+ * NON-CANONICAL one -- and `rep movs` through one of those is a general
+ * protection fault in ring 0, which is the whole machine rather than one
+ * process.  A page table with 0xffffffffffffffff in one slot is exactly that
+ * shape: the address bits mask to 0x000ffffffffff000, phys_to_virt() lands at
+ * 0x000f87fffffff000, and the copy-on-write copy takes the system down with
+ * an Oops instead of the faulting process down with a signal.
+ *
+ * Zero is refused too: no page-table entry naming physical page 0 is one this
+ * kernel wrote. */
+static bool mm_phys_is_mappable(uint64_t phys)
+{
+	return phys != 0 && phys < g_direct_map_limit;
+}
+
+/* Allocate a page for a fault, reclaiming first if the free list has run dry.
+ *
+ * The reference's allocator does not report failure until it has tried to
+ * make room: its slow path reclaims and retries, and only an allocation that
+ * still cannot be satisfied afterwards fails.  Ours reported failure straight
+ * away, so a machine whose memory had all ended up in the page cache killed
+ * whatever touched a lazy mapping next -- a browser tab, or the terminal it
+ * was started from -- while megabytes of clean, droppable file pages sat
+ * there unreclaimed.
+ *
+ * This sits at the fault rather than inside mm_allocate_physical_page()
+ * because reclaim takes page-cache locks and the allocator is reached from
+ * places that hold them; a fault is process context with nothing of the sort
+ * held, which is why the page-in below is allowed to sleep on disk here.
+ *
+ * Clean pages only.  Writing dirty ones back needs the filesystem's I/O lock
+ * for writing, and a fault can already hold it shared -- the same reasoning
+ * pagecache_reclaim_if_needed() spells out.  Dropping the clean ones is what
+ * relieves the pressure; the dirty ones become reclaimable once the writeback
+ * thread has dealt with them. */
+static uint64_t mm_alloc_page_for_fault(void)
+{
+	uint64_t phys = mm_allocate_physical_page();
+
+	if (likely(phys != 0))
+		return phys;
+
+	/* A small batch, the size the reference uses for one reclaim round.
+	 * Asking for thousands here would not find them any faster -- the
+	 * scan is bounded either way -- and this runs on a fault, where the
+	 * work is paid for by whoever touched the page. */
+	pagecache_shrink(32, 0);
+	pagecache_request_writeback();
+	return mm_allocate_physical_page();
+}
+
+/* ==========================================================================
+ * Dirty tracking for device mappings.
+ *
+ * A driver whose device keeps a second copy of mapped pages needs to know
+ * what the processor wrote through the mapping, and the processor already
+ * records that: every write leaves the dirty bit in the entry that mapped
+ * it, and a write against an entry with the write bit withheld raises a
+ * fault that names the page.  The two walks below and the fault branch in
+ * the copy-on-write handler turn those records into the driver's, through
+ * the mm_dirty_ops callbacks riding on the mapping's region records.
+ *
+ * Two rules make this correct where a first attempt was not:
+ *
+ *  - Every entry update is an atomic exchange.  The processor sets the
+ *    accessed and dirty bits with locked cycles of its own, from any CPU's
+ *    table walk, at any moment; a plain read-modify-write that races one
+ *    loses the bit, and a lost dirty bit is a write the device never
+ *    hears about -- pixels from the previous frame, sourced from a copy
+ *    the client already replaced.
+ *
+ *  - No walk returns before the translations it changed are gone from
+ *    every processor.  The dirty bit is only written into an entry by a
+ *    walk that did not already have it cached; a processor still holding
+ *    the old translation keeps writing through it, recording nothing, for
+ *    as long as the translation lives.  The same holds for the write bit:
+ *    a cached writable translation lets writes through long after the
+ *    entry was protected.  One ranged invalidation per walk, after the
+ *    entries are changed and before the caller trusts the result.
+ * ========================================================================== */
+
+/* Atomically update one device entry: succeed only while `need' is fully
+ * set, then clear `clear' and set `set'.  Returns false when the entry is
+ * not a present device entry or lacks `need' -- including when a competing
+ * update got there first, which is an answer, not an error. */
+static bool mm_dirty_pte_update(uint64_t *pte, uint64_t need, uint64_t clear,
+				uint64_t set)
+{
+	uint64_t old = __atomic_load_n(pte, __ATOMIC_RELAXED);
+
+	for (;;) {
+		if ((old & (PAGE_PRESENT | PAGE_DEVICE)) !=
+		    (PAGE_PRESENT | PAGE_DEVICE))
+			return false;
+		if ((old & need) != need)
+			return false;
+		if (__atomic_compare_exchange_n(pte, &old,
+						(old & ~clear) | set, false,
+						__ATOMIC_RELAXED,
+						__ATOMIC_RELAXED))
+			return true;
+		/* `old' now holds what beat us; decide again from that. */
+	}
+}
+
+static int mm_dirty_walk_mappings(struct mm_dirty_walk *w, bool clean)
+{
+	task_t *cur = sched_current();
+	task_t *mm = task_mm_owner(cur);
+	uint64_t pml4_phys;
+
+	w->marked = 0;
+	w->matched = 0;
+	if (!mm || !mm->pml4 || !w->obj || !w->ops)
+		return -EINVAL;
+	if (irqs_disabled())
+		return -EINVAL; /* cannot take the address-space lock here */
+
+	/* The walk covers the CURRENT address space only: its lock can be
+	 * taken from here and its tables cannot be torn down while it is
+	 * held.  Records other address spaces hold on the same object are
+	 * counted by the caller against `matched' (see the tracker), never
+	 * walked -- taking another task's address-space lock from inside a
+	 * submission is an ordering nothing else in this kernel does. */
+	mm_read_lock(&mm->mmap_lock);
+	for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+		mmap_region_t *r = &mm->mmap_regions[i];
+
+		if (!r->in_use || !r->device || r->dev_obj != w->obj ||
+		    r->dev_dirty != w->ops)
+			continue;
+		w->matched++;
+		if (r->offset < w->file_base)
+			continue; /* not a record of this object's pages */
+
+		/* The record's pages within the object, clipped to the
+		 * caller's window.  offset = base + delta survives splits,
+		 * so this holds for any surviving fragment. */
+		uint64_t rp0 = (r->offset - w->file_base) / PAGE_SIZE;
+		uint64_t rp1 = rp0 + r->length / PAGE_SIZE;
+
+		if (rp1 > w->npages)
+			rp1 = w->npages;
+		uint64_t p0 = (w->first > rp0) ? w->first : rp0;
+		uint64_t p1 = (w->last < rp1) ? w->last : rp1;
+
+		for (uint64_t p = p0; p < p1; p++) {
+			uint64_t va = r->start + (p - rp0) * PAGE_SIZE;
+			uint64_t *pte = mm_get_page_table_from_pml4(mm->pml4,
+								    va, false);
+
+			if (!pte)
+				continue;
+			if (clean) {
+				if (!mm_dirty_pte_update(pte, PAGE_DIRTY,
+							 PAGE_DIRTY, 0))
+					continue;
+				w->marked++;
+				mm_flush_tlb(va);
+				/* Recorded before this walk's invalidation
+				 * completes, which is fine: the caller reads
+				 * the record only after the walk returns. */
+				if (w->record)
+					w->record(w->arg, p);
+			} else {
+				if (!mm_dirty_pte_update(pte, PAGE_WRITABLE,
+							 PAGE_WRITABLE,
+							 PAGE_DIRTY_TRACKED))
+					continue;
+				w->marked++;
+				mm_flush_tlb(va);
+			}
+		}
+	}
+	pml4_phys = virt_to_phys(mm->pml4);
+	mm_read_unlock(&mm->mmap_lock);
+
+	/* The rule above: nothing is reported until no processor can still
+	 * be using a translation this walk changed. */
+	if (w->marked)
+		smp_tlb_shootdown_mm_sync(pml4_phys);
+	return 0;
+}
+
+int mm_dirty_wp_mappings(struct mm_dirty_walk *w)
+{
+	return mm_dirty_walk_mappings(w, false);
+}
+
+int mm_dirty_clean_mappings(struct mm_dirty_walk *w)
+{
+	return mm_dirty_walk_mappings(w, true);
+}
+
+/* A write faulted against a tracked device entry (PAGE_DIRTY_TRACKED set,
+ * write bit withheld).  Report the page to the tracker, then hand the
+ * write bit back: the MAPPING is writable -- the tracker had only borrowed
+ * the bit to be told about this moment.  Runs under the address-space
+ * read lock the fault wrapper takes.
+ *
+ * The order is load-bearing: the page is recorded BEFORE the entry becomes
+ * writable.  A tracker pass that protects entries and then reads its
+ * records must find either the protected entry (the write has not landed)
+ * or the record (it has); an entry made writable before the record exists
+ * is a window where the write lands and the pass sees neither. */
+static bool mm_dirty_mkwrite_locked(uint64_t va, uint64_t *pte)
+{
+	task_t *mm = task_mm_owner(sched_current());
+	mmap_region_t *r = NULL;
+
+	if (!mm || !mm->mmap_regions)
+		return false;
+	for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+		mmap_region_t *c = &mm->mmap_regions[i];
+
+		if (c->in_use && va >= c->start &&
+		    va < c->start + c->length) {
+			r = c;
+			break;
+		}
+	}
+	if (!r || !r->device)
+		return false;
+	/* The tracked bit only ever withholds write from a mapping that HAS
+	 * it; a region without PROT_WRITE is genuinely read-only and the
+	 * fault is the caller's error. */
+	if (!(r->prot & PROT_WRITE))
+		return false;
+
+	if (r->dev_dirty && r->dev_dirty->mkwrite && r->dev_obj)
+		r->dev_dirty->mkwrite(r->dev_obj,
+				      r->offset + (va - r->start));
+
+	mm_dirty_pte_update(pte, 0, 0, PAGE_WRITABLE | PAGE_DIRTY);
+	mm_flush_tlb(va);
+	/* Local invalidation only: granting permission needs no broadcast.
+	 * A processor still holding the protected translation faults
+	 * spuriously, re-reads the entry, and carries on. */
+	return true;
+}
+
 static bool mm_cow_fault_locked(uint64_t fault_addr)
 {
 	uint64_t page_addr = fault_addr & ~0xFFFULL;
@@ -4575,6 +5037,15 @@ static bool mm_cow_fault_locked(uint64_t fault_addr)
 	if (!pte || !(*pte & PAGE_PRESENT)) {
 		return false;
 	}
+
+	/* A tracked device entry whose write bit the dirty tracker is
+	 * holding: bookkeeping, not a protection error.  Checked before the
+	 * copy-on-write test because a device entry is never COW -- its
+	 * pages belong to a driver's object, shared by design. */
+	if ((*pte & (PAGE_DEVICE | PAGE_DIRTY_TRACKED)) ==
+		    (PAGE_DEVICE | PAGE_DIRTY_TRACKED) &&
+	    !(*pte & PAGE_WRITABLE))
+		return mm_dirty_mkwrite_locked(page_addr, pte);
 
 	// Check if this is a COW page
 	if (!(*pte & PAGE_COW)) {
@@ -4599,7 +5070,25 @@ static bool mm_cow_fault_locked(uint64_t fault_addr)
 		// parent and child to share the same physical page after fork,
 		// breaking COW semantics (the parent's writes would be visible
 		// to the child and vice versa).
-		uint64_t new_phys = mm_allocate_physical_page();
+		//
+		// Untracked is not the same as arbitrary.  Device memory mapped
+		// into a process is legitimately outside the counted range and
+		// must be copied; an address the direct map cannot reach is not
+		// memory at all, and the only way an entry comes to hold one is
+		// that something wrote over the page table.  Following it is a
+		// ring-0 fault on a non-canonical address -- see
+		// mm_phys_is_mappable() -- so the entry is named and the fault
+		// refused, which turns a halted machine into a signal for the
+		// process that owns the corruption.
+		if (!mm_phys_is_mappable(old_phys)) {
+			WARN_RATELIMIT(
+				1,
+				"cow: bad page table entry for VA 0x%lx: entry 0x%lx names physical 0x%lx, outside the direct map",
+				(unsigned long)page_addr,
+				(unsigned long)*pte, (unsigned long)old_phys);
+			return false;
+		}
+		uint64_t new_phys = mm_alloc_page_for_fault();
 		if (!new_phys) {
 			kprintf("mm_handle_cow_fault: untracked page copy alloc failed\n");
 			return false;
@@ -4673,7 +5162,7 @@ static bool mm_cow_fault_locked(uint64_t fault_addr)
 	spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
 
 	// Allocate a new physical page (outside lock for performance)
-	uint64_t new_phys = mm_allocate_physical_page();
+	uint64_t new_phys = mm_alloc_page_for_fault();
 	if (!new_phys) {
 		mm_put_page(old_phys); /* undo the pin */
 		kprintf("mm_handle_cow_fault: Failed to allocate new page\n");
@@ -4765,9 +5254,17 @@ bool mm_handle_cow_fault(uint64_t fault_addr)
 	 * explains is worth a report. */
 	uint64_t t0 = timer_get_precise_us();
 	bool locked = mm_fault_lock(mm);
-	uint64_t t1 = timer_get_precise_us();
-	bool ret = mm_cow_fault_locked(fault_addr);
-	uint64_t t2 = timer_get_precise_us();
+	uint64_t t1, t2;
+	bool ret;
+
+	/* Refusing costs this access a SIGSEGV or a fixup.  Resolving it
+	 * against an address space somebody is in the middle of changing
+	 * costs a wrong page, silently, and the crash arrives much later. */
+	if (!locked)
+		return false;
+	t1 = timer_get_precise_us();
+	ret = mm_cow_fault_locked(fault_addr);
+	t2 = timer_get_precise_us();
 
 	mm_fault_unlock(mm, locked);
 	WARN_RATELIMIT(
@@ -4817,7 +5314,7 @@ bool mm_make_writable_in(uint64_t *pml4, uint64_t vaddr)
 	 * writable in place would leave both sharers on one page, which is the
 	 * exact corruption this exists to prevent. */
 	if (page_idx == (uint64_t)-1) {
-		uint64_t new_phys = mm_allocate_physical_page();
+		uint64_t new_phys = mm_alloc_page_for_fault();
 		uint64_t uflags;
 
 		if (!new_phys)
@@ -4868,7 +5365,7 @@ bool mm_make_writable_in(uint64_t *pml4, uint64_t vaddr)
 	mm_get_page(old_phys);
 	spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
 
-	uint64_t new_phys = mm_allocate_physical_page();
+	uint64_t new_phys = mm_alloc_page_for_fault();
 
 	if (!new_phys) {
 		mm_put_page(old_phys);
@@ -4935,48 +5432,11 @@ invalidate:
  * final non-sleeping check+map. */
 static spinlock_t g_lazy_map_lock = SPINLOCK_INIT("lazymap");
 
-/* Serialises file page-in PER FILE HANDLE.  A region's backing vfs_file is
- * shared with the user's fd and across the fork family (vfs_dup), so the
- * seek/read/seek-back sequence below must not interleave with another
- * faulting task using the SAME handle.  Unrelated processes open their own
- * handles (rtld opens libraries per process), so their page-ins proceed in
- * parallel — the previous GLOBAL flag serialised every page-in in the
- * system and could starve a cold-starting process for seconds while
- * another process fault-stormed (observed as the TLS-test child missing
- * its 10 s ready deadline under parallel teststress).  Sleeping-friendly:
- * atomic flag + yield.  Holders can no longer be killed in place (fatal
- * signals defer to delivery points), so the flag is always released.
- * task_close_open_files clears a flag its dying owner left behind
- * (crash-abandon) before dropping the region's file reference. */
-static void pagein_lock(vfs_file_t *file)
-{
-	while (__atomic_test_and_set(&file->pagein_busy, __ATOMIC_ACQUIRE))
-		sched_yield_in_kernel();
-	task_t *cur = sched_current();
-	file->pagein_owner = cur ? (int64_t)cur->id : -1;
-}
-static void pagein_unlock(vfs_file_t *file)
-{
-	file->pagein_owner = -1;
-	__atomic_clear(&file->pagein_busy, __ATOMIC_RELEASE);
-}
+/* The per-handle page-in flag (vfs_file::pagein_busy) is not taken here any
+ * more: the page-in below reads positionally and has no descriptor state to
+ * protect.  The flag remains for vfs_pread()'s fallback and for pread(2), and
+ * sched.c still clears one a dying owner abandoned. */
 
-/* Body of the demand fault, run with the address-space semaphore held for
- * reading by the wrapper below.  The region table it consults and the page
- * tables it installs into are exactly what that lock protects. */
-/* Materialise one lazily-mapped page of `mm'.
- *
- * Takes the address space explicitly rather than deriving it from the running
- * task, because it is also used to populate a page of a process that is NOT
- * running: a debugger reading or planting a breakpoint in a tracee that has
- * been stopped since before its text was ever touched.  Nothing else about the
- * work differs -- the region table consulted and the page tables installed
- * into were already `mm''s and never the CPU's current ones.
- *
- * The caller holds mm's address-space semaphore (either mode; the install
- * itself is serialised by g_lazy_map_lock, which is why the ordinary fault
- * path can do this holding only a read lock).  Sleeps: it may read from the
- * backing file. */
 
 static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 			      int from_kernel_mode)
@@ -4999,12 +5459,29 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 			    PAGE_NO_EXECUTE;
 		found = 1;
 	} else {
-		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+		/* Same bound and hint as mm_find_mmap_region(): this is THE
+		 * hot path -- one pass of it per page a process touches for
+		 * the first time -- and walking the whole capacity here is
+		 * what made a long-running browser slower with every tab it
+		 * had ever opened. */
+		uint32_t end = mm->mmap_hwm;
+		uint32_t hint = mm->mmap_hint;
+
+		if (end > mm->mmap_capacity)
+			end = mm->mmap_capacity;
+		if (hint >= end)
+			hint = 0; /* stale: the table shrank under it */
+		for (uint32_t n = 0; n < end; n++) {
+			/* Start at the hint and wrap, so a run of faults in
+			 * one mapping answers on the first iteration. */
+			uint32_t i = hint + n < end ? hint + n :
+						     hint + n - end;
 			mmap_region_t *r = &mm->mmap_regions[i];
 			if (!r->in_use || !r->lazy)
 				continue;
 			if (page < r->start || page >= r->start + r->length)
 				continue;
+			mm->mmap_hint = i;
 			if (!(r->prot & (PROT_READ | PROT_WRITE | PROT_EXEC)))
 				return 0; // PROT_NONE — genuine fault
 			map_flags = PAGE_PRESENT | PAGE_USER;
@@ -5021,7 +5498,7 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 	if (!found)
 		return 0;
 
-	uint64_t phys = mm_allocate_physical_page();
+	uint64_t phys = mm_alloc_page_for_fault();
 	if (!phys) {
 		/* Out of physical pages is NOT a segfault, but failing this
 		 * fault delivers SIGSEGV to a task touching a perfectly valid
@@ -5045,16 +5522,34 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 		 * pre-fault their buffers precisely so that lock-holding
 		 * copy loops never reach this path. */
 		(void)from_kernel_mode;
-		pagein_lock(file);
-		long saved = vfs_seek(file, 0, SEEK_CUR);
-		long fsize = vfs_seek(file, 0, SEEK_END);
+		/* Read the page WITHOUT going near the handle's position.
+		 *
+		 * The position belongs to the DESCRIPTOR, and this handle is
+		 * that descriptor: mmap references the caller's open file, and
+		 * fork shares it again.  Seeking it here, reading, and seeking
+		 * back -- which is what this did -- races every read() and
+		 * lseek() the program makes on the same descriptor, and a lost
+		 * race fills the page from the wrong offset in the file.  A
+		 * library's text page then holds code that does not belong
+		 * there and the process dies branching into it, arbitrarily
+		 * later and nowhere near the cause.  The per-handle page-in
+		 * flag did not cover it: only page-ins and pread(2) ever took
+		 * that flag, while read(), readv(), lseek() and sendfile()
+		 * moved the position freely.
+		 *
+		 * The reference has no such race, because a fault there reads
+		 * by index through the page cache and never consults the open
+		 * file at all.  vfs_pread() is that property expressed as a
+		 * call; the size comes from fstat for the same reason, since
+		 * seeking to SEEK_END is a position change too. */
+		struct kstat pst;
+		long fsize = (vfs_fstat(file, &pst) == 0) ? (long)pst.st_size :
+							    -1;
 		long got = -1;
-		if (saved >= 0 && fsize >= 0 &&
-		    vfs_seek(file, (long)file_off, SEEK_SET) >= 0) {
-			got = vfs_read(file, phys_to_virt(phys), PAGE_SIZE);
-			vfs_seek(file, saved, SEEK_SET);
-		}
-		pagein_unlock(file);
+
+		if (fsize >= 0)
+			got = vfs_pread(file, phys_to_virt(phys), PAGE_SIZE,
+					(long)file_off);
 		if (got < 0)
 			got = 0;
 		/* A short read is legitimate ONLY at EOF inside the mapping
@@ -5127,12 +5622,20 @@ static int mm_demand_fault_locked(uint64_t fault_addr, int from_kernel_mode)
 				  from_kernel_mode);
 }
 
+
 int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 {
 	task_t *cur = sched_current();
 	task_t *mm = task_mm_owner(cur);
 	bool locked = mm_fault_lock(mm);
-	int ret = mm_demand_fault_locked(fault_addr, from_kernel_mode);
+	int ret;
+
+	/* Same bargain as the COW path: a refused fault is one access
+	 * failing, an unlocked one is a region record read out of memory that
+	 * is being freed. */
+	if (!locked)
+		return 0;
+	ret = mm_demand_fault_locked(fault_addr, from_kernel_mode);
 
 	mm_fault_unlock(mm, locked);
 	return ret;
@@ -5877,10 +6380,36 @@ void mm_initialize_syscall(void)
 	// Set CSTAR for compatibility mode (unused in 64-bit only kernel)
 	wrmsr(MSR_CSTAR, (uint64_t)syscall_entry);
 
-	// Set SFMASK - RFLAGS bits to clear on SYSCALL
-	// Clear IF (interrupt flag), TF (trap flag), DF (direction flag), and AC (SMAP bypass)
-	// IF (bit 9) = 0x200, TF (bit 8) = 0x100, DF (bit 10) = 0x400, AC (bit 18) = 0x40000
-	wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x40000);
+	/* SFMASK: the RFLAGS bits the processor clears when SYSCALL enters the
+	 * kernel.  Everything a user thread can set for itself and the kernel
+	 * must not inherit belongs here -- SYSCALL clears NOTHING that is not
+	 * named, and the flags it leaves alone are the caller's.
+	 *
+	 * NT is the one with teeth.  POPF at CPL 3 cannot touch IF or IOPL,
+	 * but it CAN set NT, and NT changes what IRETQ means: with it set the
+	 * processor treats the IRET as a return from a nested task and
+	 * switches through the TSS back-link instead of popping the frame.
+	 * The syscall return path executes IRETQ (sigreturn restores the whole
+	 * register file, which SYSRET cannot), so a program that sets NT and
+	 * then takes a signal made the kernel task-switch into whatever the
+	 * back-link happened to hold.  Nothing about that is recoverable and
+	 * nothing about it looks like its cause.
+	 *
+	 * The rest: TF (no single-stepping the kernel), IF (entry must be with
+	 * interrupts off), DF (kernel string ops run forward -- syscall_entry
+	 * has a CLD as well, and this is why it should not have been needed),
+	 * AC (a user thread that set AC would let every kernel access bypass
+	 * SMAP), IOPL (never run kernel code at a borrowed I/O privilege),
+	 * RF (SYSRET cannot restore it, so do not carry it in), ID, and the
+	 * arithmetic flags so no user value survives into kernel code.
+	 *
+	 * This is the set the reference implementation masks, bit for bit. */
+	wrmsr(MSR_SFMASK,
+	      0x1UL /*CF*/ | 0x4UL /*PF*/ | 0x10UL /*AF*/ | 0x40UL /*ZF*/ |
+		      0x80UL /*SF*/ | 0x100UL /*TF*/ | 0x200UL /*IF*/ |
+		      0x400UL /*DF*/ | 0x800UL /*OF*/ | 0x3000UL /*IOPL*/ |
+		      0x4000UL /*NT*/ | 0x10000UL /*RF*/ | 0x40000UL /*AC*/ |
+		      0x200000UL /*ID*/);
 }
 
 // ============================================================================

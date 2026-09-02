@@ -1,0 +1,110 @@
+Mesa on LikeOS with the display-manager device.
+
+The first port patch declared LikeOS a POSIX system without KMS/DRM, which
+was true at the time.  The kernel now carries a display-manager interface
+(/dev/dri/card0, /dev/dri/renderD128, the vmwgfx ioctl set) and a
+sysfs-style device tree, and libdrm is built.  So:
+
+ - meson.build: `likeos' joins the systems that have KMS/DRM, which turns
+   on the drm DRI platform, DRI3 presentation, libgbm and the vmwgfx
+   winsys, exactly as on the reference system.
+ - src/loader/loader.c: the fast PCI-id lookup reads
+   /sys/dev/char/MAJ:MIN/device/{vendor,device}; the tree serves those.
+ - src/gallium/winsys/svga/drm/pb_buffer_simple_fenced.c: sched_yield()
+   while draining fences, as on every other POSIX system.
+ - src/util/detect_os.h: the comment no longer claims there is no DRM.
+
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/meson.build b/meson.build
+--- a/meson.build	2026-08-27 18:45:57.984957678 +0200
++++ b/meson.build	2026-08-27 18:45:55.366630409 +0200
+@@ -144,7 +144,7 @@
+ 
+ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ 
+-system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm', 'likeos'].contains(host_machine.system())
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+Binärdateien a/src/compiler/nir/__pycache__/nir_algebraic.cpython-312.pyc und b/src/compiler/nir/__pycache__/nir_algebraic.cpython-312.pyc sind verschieden.
+Binärdateien a/src/compiler/nir/__pycache__/nir_intrinsics.cpython-312.pyc und b/src/compiler/nir/__pycache__/nir_intrinsics.cpython-312.pyc sind verschieden.
+Binärdateien a/src/compiler/nir/__pycache__/nir_opcodes.cpython-312.pyc und b/src/compiler/nir/__pycache__/nir_opcodes.cpython-312.pyc sind verschieden.
+Binärdateien a/src/compiler/__pycache__/builtin_types.cpython-312.pyc und b/src/compiler/__pycache__/builtin_types.cpython-312.pyc sind verschieden.
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/src/gallium/winsys/svga/drm/pb_buffer_simple_fenced.c b/src/gallium/winsys/svga/drm/pb_buffer_simple_fenced.c
+--- a/src/gallium/winsys/svga/drm/pb_buffer_simple_fenced.c	2026-02-19 19:55:18.000000000 +0100
++++ b/src/gallium/winsys/svga/drm/pb_buffer_simple_fenced.c	2026-08-27 18:45:55.370264119 +0200
+@@ -16,7 +16,7 @@
+ 
+ #include "util/detect.h"
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_SOLARIS
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_SOLARIS || DETECT_OS_LIKEOS
+ #include <unistd.h>
+ #include <sched.h>
+ #endif
+@@ -774,7 +774,7 @@
+    /* Wait on outstanding fences */
+    while (fenced_mgr->num_fenced) {
+       mtx_unlock(&fenced_mgr->mutex);
+-#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_SOLARIS
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_SOLARIS || DETECT_OS_LIKEOS
+       sched_yield();
+ #endif
+       mtx_lock(&fenced_mgr->mutex);
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/src/loader/loader.c b/src/loader/loader.c
+--- a/src/loader/loader.c	2026-02-19 19:55:18.000000000 +0100
++++ b/src/loader/loader.c	2026-08-27 18:45:55.367883007 +0200
+@@ -668,7 +668,7 @@
+    return true;
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+ static int loader_get_linux_pci_field(int maj, int min, const char *field)
+ {
+    char path[PATH_MAX + 1];
+@@ -703,12 +703,12 @@
+ 
+    return *vendor_id && *chip_id;
+ }
+-#endif /* __linux__ */
++#endif /* __linux__ || __LIKEOS__ */
+ 
+ bool
+ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
+ {
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+    /* Implementation without causing full enumeration of DRM devices. */
+    if (loader_get_linux_pci_id_for_fd(fd, vendor_id, chip_id))
+       return true;
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/apiexec.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/apiexec.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/gl_XML.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/gl_XML.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/glX_proto_common.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/glX_proto_common.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/glX_XML.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/glX_XML.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/license.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/license.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/marshal_XML.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/marshal_XML.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/static_data.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/static_data.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/glapi/gen/__pycache__/typeexpr.cpython-312.pyc und b/src/mesa/glapi/glapi/gen/__pycache__/typeexpr.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/glapi/new/__pycache__/genCommon.cpython-312.pyc und b/src/mesa/glapi/new/__pycache__/genCommon.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/main/__pycache__/format_parser.cpython-312.pyc und b/src/mesa/main/__pycache__/format_parser.cpython-312.pyc sind verschieden.
+Binärdateien a/src/mesa/main/__pycache__/get_hash_params.cpython-312.pyc und b/src/mesa/main/__pycache__/get_hash_params.cpython-312.pyc sind verschieden.
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/src/util/detect_os.h b/src/util/detect_os.h
+--- a/src/util/detect_os.h	2026-08-27 18:45:57.984549162 +0200
++++ b/src/util/detect_os.h	2026-08-27 18:45:55.370682279 +0200
+@@ -92,9 +92,9 @@
+ #endif
+ 
+ #if defined(__LIKEOS__)
+-/* LikeOS: a POSIX system without KMS/DRM.  Every driver here is software
+- * (llvmpipe/softpipe over the drisw winsys), so the generic POSIX paths are
+- * exactly right and nothing OS-specific is wanted. */
++/* LikeOS: a POSIX system with a display-manager (DRM-style) kernel
++ * interface and a sysfs-style device tree; the generic POSIX paths are
++ * right for everything else. */
+ #define DETECT_OS_LIKEOS 1
+ #define DETECT_OS_POSIX 1
+ #endif
+Binärdateien a/src/util/format/__pycache__/u_format_pack.cpython-312.pyc und b/src/util/format/__pycache__/u_format_pack.cpython-312.pyc sind verschieden.
+Binärdateien a/src/util/format/__pycache__/u_format_parse.cpython-312.pyc und b/src/util/format/__pycache__/u_format_parse.cpython-312.pyc sind verschieden.
+Binärdateien a/src/util/perf/__pycache__/u_trace.cpython-312.pyc und b/src/util/perf/__pycache__/u_trace.cpython-312.pyc sind verschieden.

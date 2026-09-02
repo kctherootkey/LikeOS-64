@@ -1,0 +1,25 @@
+The dma-buf capability on LikeOS.
+
+The generic screen-capability helper asks the kernel about PRIME dma-buf
+support (drmGetCap DRM_CAP_PRIME) only on the systems it has heard of;
+everywhere else the block is compiled out and caps->dmabuf stays 0.  On
+LikeOS the kernel answers the query (import|export = 3), but with the
+capability reported as absent GBM routed every buffer through its dumb
+fallback -- which accepts only CURSOR+ARGB8888 and SCANOUT+XRGB8888 -- so
+the glamor front buffer (ARGB8888, SCANOUT|RENDERING) failed with EINVAL
+and the X server died in ScreenInit with nothing in any log.  The device,
+the kernel and the format capabilities were all willing; the query was
+never made.
+
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/src/gallium/auxiliary/util/u_screen.c b/src/gallium/auxiliary/util/u_screen.c
+--- a/src/gallium/auxiliary/util/u_screen.c	2026-02-19 19:55:18.000000000 +0100
++++ b/src/gallium/auxiliary/util/u_screen.c	2026-08-28 15:10:00.000000000 +0200
+@@ -132,7 +132,7 @@
+ 
+    caps->throttle = true;
+ 
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM || DETECT_OS_LIKEOS)
+    if (pscreen->get_screen_fd) {
+       uint64_t cap;
+       int fd = pscreen->get_screen_fd(pscreen);

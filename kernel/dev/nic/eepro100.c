@@ -338,7 +338,7 @@ static int e100_load_bases(eepro100_dev_t *d)
 
 // ============================================================================
 // 22-byte CmdConfigure payload.  The values below are the well-known
-// "safe" defaults used by Linux's e100 driver; only a handful of bits
+// "safe" defaults used by the reference e100 driver; only a handful of bits
 // matter to QEMU's eepro100 emulation:
 //
 //   byte[0]   = 22       (configuration byte count)

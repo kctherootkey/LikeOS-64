@@ -303,7 +303,11 @@ typedef struct {
 #define AT_EUID 12 // Effective uid
 #define AT_GID 13 // Real gid
 #define AT_EGID 14 // Effective gid
+#define AT_PLATFORM 15 // Address of the platform name string
+#define AT_HWCAP 16 // CPU feature word (CPUID.1:EDX)
+#define AT_CLKTCK 17 // Frequency of times() ticks
 #define AT_SECURE 23 // Boolean, was exec setuid-like?
+#define AT_HWCAP2 26 // Extension of AT_HWCAP
 #define AT_RANDOM 25 // Address of 16 random bytes
 #define AT_EXECFN 31 // Filename of program
 

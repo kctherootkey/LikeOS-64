@@ -52,6 +52,7 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 	case FUTEX_WAIT: {
 		// Convert timeout to nanoseconds
 		uint64_t timeout_ns = 0;
+		int have_timeout = 0;
 		if (timeout) {
 			// timeout points to struct timespec
 			if (validate_user_ptr(timeout,
@@ -63,8 +64,19 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 					(uint64_t)ts->tv_sec * 1000000000ULL +
 					(uint64_t)ts->tv_nsec;
 				smap_enable();
+				have_timeout = 1;
 			}
 		}
+		/* A timeout of zero is "do not wait", not "wait for ever".
+		 * futex_wait() reads timeout_ns == 0 as no deadline at all, so
+		 * passing it through turns the shortest possible wait into an
+		 * unbounded one -- and a caller reaches it by ordinary means:
+		 * libc converts an absolute POSIX deadline to a relative one,
+		 * and a deadline that is merely reached rather than passed
+		 * converts to exactly zero.  The BITSET arm below has always
+		 * refused the equivalent case; this one did not. */
+		if (have_timeout && timeout_ns == 0)
+			return -ETIMEDOUT;
 		return futex_wait(uaddr, (uint32_t)val, timeout_ns);
 	}
 
@@ -75,12 +87,8 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 		 * CLOCK_MONOTONIC -- and waiters carry a bitset that a
 		 * FUTEX_WAKE_BITSET must match.
 		 *
-		 * The bitset is accepted and ignored: every waiter here is
-		 * created with all bits set, and the only caller in this system
-		 * (GLib) passes FUTEX_BITSET_MATCH_ANY, for which "match all"
-		 * IS the correct answer.  A selective bitset would need the
-		 * value plumbed into futex_wait/futex_wake; there is nothing to
-		 * exercise it yet, and guessing at it would be untested code.
+		 * The bitset (val3) is carried by the waiter and consulted by
+		 * FUTEX_WAKE_BITSET.
 		 */
 		uint64_t timeout_ns = 0;
 
@@ -116,14 +124,95 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 				timeout_ns = deadline_ns - now_ns;
 			}
 		}
-		return futex_wait(uaddr, (uint32_t)val, timeout_ns);
+		return futex_wait_bitset(uaddr, (uint32_t)val, timeout_ns,
+					 (uint32_t)val3);
 	}
 
 	case FUTEX_WAKE:
-	case FUTEX_WAKE_BITSET:
-		/* The bitset (val3) is ignored for the reason given above: all
-		 * waiters match, which is right for FUTEX_BITSET_MATCH_ANY. */
 		return futex_wake(uaddr, (int)val);
+
+	case FUTEX_WAKE_BITSET:
+		return futex_wake_bitset(uaddr, (int)val, (uint32_t)val3);
+
+	case FUTEX_WAKE_OP: {
+		/* Atomically apply an operation to *uaddr2, wake `val'
+		 * waiters on uaddr, and -- if the OLD value of *uaddr2
+		 * satisfies the comparison -- also wake `timeout' (reused as
+		 * a count) waiters on uaddr2.  How a condition variable's
+		 * broadcast wakes both its waiters and the mutex's in one
+		 * call. */
+		if (!validate_user_ptr(uaddr2, sizeof(uint32_t)))
+			return -EFAULT;
+
+		uint32_t enc = (uint32_t)val3;
+		int op = (enc >> 28) & 0xF;
+		int cmp = (enc >> 24) & 0xF;
+		uint32_t oparg = (enc >> 12) & 0xFFF;
+		uint32_t cmparg = enc & 0xFFF;
+		int shift = op & FUTEX_OP_OPARG_SHIFT;
+
+		op &= ~FUTEX_OP_OPARG_SHIFT;
+		if (shift) {
+			if (oparg > 31)
+				return -EINVAL;
+			oparg = 1u << oparg;
+		}
+		if (op > FUTEX_OP_XOR || cmp > FUTEX_OP_CMP_GE)
+			return -ENOSYS;
+
+		uint32_t oldval, newval;
+		volatile uint32_t *p2 = (volatile uint32_t *)uaddr2;
+
+		smap_disable();
+		do {
+			oldval = *p2;
+			switch (op) {
+			case FUTEX_OP_SET:
+				newval = oparg;
+				break;
+			case FUTEX_OP_ADD:
+				newval = oldval + oparg;
+				break;
+			case FUTEX_OP_OR:
+				newval = oldval | oparg;
+				break;
+			case FUTEX_OP_ANDN:
+				newval = oldval & ~oparg;
+				break;
+			default:
+				newval = oldval ^ oparg;
+				break;
+			}
+		} while (!__sync_bool_compare_and_swap(p2, oldval, newval));
+		smap_enable();
+
+		int hit;
+		switch (cmp) {
+		case FUTEX_OP_CMP_EQ:
+			hit = oldval == cmparg;
+			break;
+		case FUTEX_OP_CMP_NE:
+			hit = oldval != cmparg;
+			break;
+		case FUTEX_OP_CMP_LT:
+			hit = oldval < cmparg;
+			break;
+		case FUTEX_OP_CMP_LE:
+			hit = oldval <= cmparg;
+			break;
+		case FUTEX_OP_CMP_GT:
+			hit = oldval > cmparg;
+			break;
+		default:
+			hit = oldval >= cmparg;
+			break;
+		}
+
+		int woken = futex_wake(uaddr, (int)val);
+		if (hit)
+			woken += futex_wake(uaddr2, (int)timeout);
+		return woken;
+	}
 
 	case FUTEX_REQUEUE:
 	case FUTEX_CMP_REQUEUE:

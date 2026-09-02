@@ -265,7 +265,16 @@ __attribute__((noreturn)) static void rtld_die(const char *msg)
 /* An X server loads its client libraries plus a driver module per device
  * and an extension module per protocol extension, so the object table has
  * to be far larger than a typical program needs. */
-#define MAX_DSOS 256
+/* How many objects one process may have loaded at once.
+ *
+ * 256 is plenty for a program and its libraries, and far too few for one
+ * that loads a directory full of plugins: a media framework enumerating its
+ * plugins opens every one of them in a single process -- around 170 here,
+ * on top of the sixty-odd libraries they share -- and ran straight into
+ * this as "too many shared objects", after which it reported no plugins at
+ * all.  The table is static, so the cost is address space in every process;
+ * the entries are small beside the mappings they describe. */
+#define MAX_DSOS 1024
 
 /* Object names are at most a basename ("libXfont2.so.2"), so a small fixed
  * buffer is enough and keeps the loader allocation-free. */
@@ -373,6 +382,12 @@ typedef struct dso {
 	int tls_needs_init;
 
 	/* Flags */
+	/* reloc_started is set on ENTRY to rtld_relocate, relocated only when
+	 * the work is finished.  Two fields rather than one because the RELRO
+	 * pass must be able to tell "someone is relocating this right now"
+	 * from "this is done": freezing the GOT of an object still being
+	 * relocated faults the thread doing the relocating. */
+	int reloc_started;
 	int relocated;
 	int initialized;
 	int is_main;
@@ -423,6 +438,81 @@ static int g_dlerror_set;
  * or a stale entry is trusted after the library behind it is gone. */
 static unsigned long long g_dl_adds;
 static unsigned long long g_dl_subs;
+
+/* ------------------------------------------------------------------ *
+ * The loader lock.
+ *
+ * Everything below -- g_dsos, g_ndsos, the link map, the TLS block, the
+ * dlerror buffer -- is process-wide state edited by whichever thread happens
+ * to call dlopen().  It was edited without any lock at all, and WebKit calls
+ * dlopen() from its worker threads while other threads are running, so two
+ * dlopens could and did overlap.
+ *
+ * The failure that led here: rtld_relocate() marked an object relocated on
+ * ENTRY, before doing the work, so a second thread's relocate pass skipped
+ * the object as finished while the first was still inside its relocation
+ * loop -- and then ran the RELRO pass, which mprotect()ed the very GOT pages
+ * the first thread was still writing.  The next store faulted, in
+ * rtld_apply_relocs, with the loader's own instruction pointer in the dump.
+ * The array append (g_dsos[g_ndsos++]) raced just as freely; that one loses
+ * an object quietly instead of crashing.
+ *
+ * RECURSIVE, and not optionally so: dlopen() runs the new object's
+ * constructors, dlclose() runs its destructors, and either may call back into
+ * dlopen/dlsym/dlclose.  A plain mutex would deadlock the process on the
+ * first plugin whose constructor loads another plugin.
+ *
+ * Drepper's three-state futex mutex (0 free, 1 held, 2 held-with-waiters), so
+ * the uncontended case is one compare-and-swap and no syscall, which is what
+ * the common case is -- dlsym() through this lock is called hundreds of times
+ * during GL entry-point resolution and must not enter the kernel each time.
+ * ------------------------------------------------------------------ */
+static int g_dl_lock;		/* 0 = free, 1 = held, 2 = held + waiters */
+static int g_dl_lock_owner;	/* tid of the holder, 0 when free */
+static unsigned g_dl_lock_depth;
+
+static void rtld_lock(void)
+{
+	int tid = rtld_gettid();
+
+	/* Already ours?  Only this thread can ever read its own tid here: the
+	 * owner clears the field before releasing the lock, so a thread that
+	 * does not hold it reads either 0 or somebody else's. */
+	if (__atomic_load_n(&g_dl_lock_owner, __ATOMIC_RELAXED) == tid) {
+		g_dl_lock_depth++;
+		return;
+	}
+
+	int c = 0;
+	if (!__atomic_compare_exchange_n(&g_dl_lock, &c, 1, 0, __ATOMIC_ACQUIRE,
+					 __ATOMIC_RELAXED)) {
+		/* Contended.  Announce the waiter (state 2) before sleeping,
+		 * so the holder knows to wake somebody on the way out, and
+		 * re-announce after every wake -- the exchange both takes the
+		 * lock if it came free and re-arms the flag if it did not. */
+		if (c != 2)
+			c = __atomic_exchange_n(&g_dl_lock, 2, __ATOMIC_ACQUIRE);
+		while (c != 0) {
+			rtld_futex_wait(&g_dl_lock, 2);
+			c = __atomic_exchange_n(&g_dl_lock, 2, __ATOMIC_ACQUIRE);
+		}
+	}
+	__atomic_store_n(&g_dl_lock_owner, tid, __ATOMIC_RELAXED);
+	g_dl_lock_depth = 1;
+}
+
+static void rtld_unlock(void)
+{
+	if (--g_dl_lock_depth)
+		return;
+	/* Owner cleared BEFORE the lock is dropped: the next holder writes
+	 * this field, and it must not still say us when it does. */
+	__atomic_store_n(&g_dl_lock_owner, 0, __ATOMIC_RELAXED);
+	if (__atomic_fetch_sub(&g_dl_lock, 1, __ATOMIC_RELEASE) != 1) {
+		__atomic_store_n(&g_dl_lock, 0, __ATOMIC_RELEASE);
+		rtld_futex_wake(&g_dl_lock, 1);
+	}
+}
 
 static void rtld_set_error(const char *msg)
 {
@@ -1626,6 +1716,11 @@ static void rtld_protect_relro(dso_t *d)
 {
 	if (!d || !d->relro_len || d->relro_done)
 		return;
+	/* Not merely started -- FINISHED.  An object whose relocation is still
+	 * running has GOT slots yet to be written, and freezing them here is a
+	 * SIGSEGV in whoever is writing them. */
+	if (!d->relocated)
+		return;
 
 	/* Both ends round DOWN.  The end especially: p_memsz is page-aligned by
 	 * construction (the linker pads the region out), and rounding it up
@@ -1663,9 +1758,9 @@ static void rtld_protect_relro(dso_t *d)
 
 static void rtld_relocate(dso_t *d)
 {
-	if (d->relocated)
+	if (d->reloc_started)
 		return;
-	d->relocated = 1;
+	d->reloc_started = 1;
 	if (d->rela && d->rela_size)
 		rtld_apply_relocs(d, d->rela, d->rela_size);
 	if (d->jmprel && d->jmprel_size) {
@@ -1682,6 +1777,9 @@ static void rtld_relocate(dso_t *d)
 			rtld_setup_pltgot(d);
 		}
 	}
+	/* Last, and only on the way out: rtld_protect_relro reads this to
+	 * decide the GOT is finished with and may be frozen. */
+	d->relocated = 1;
 }
 
 static void rtld_init_dso(dso_t *d)
@@ -1761,7 +1859,10 @@ void _rtld_tls_init(void *tp)
 	}
 }
 
-void *_rtld_dlopen(const char *filename, int flags)
+/* The body of dlopen, with the loader lock already held.  Split out rather
+ * than locked inline because it returns from a dozen places and every one of
+ * them has to unlock. */
+static void *rtld_dlopen_locked(const char *filename, int flags)
 {
 	(void)flags;
 	g_dlerror_set = 0;
@@ -1855,7 +1956,18 @@ void *_rtld_dlopen(const char *filename, int flags)
 	return ld;
 }
 
-void *_rtld_dlsym(void *handle, const char *symbol)
+void *_rtld_dlopen(const char *filename, int flags)
+{
+	rtld_lock();
+	void *r = rtld_dlopen_locked(filename, flags);
+	rtld_unlock();
+	return r;
+}
+
+/* Locked for the walk of g_dsos, which a concurrent dlopen may be appending
+ * to or a dlclose zeroing underneath it.  Recursion makes this safe to reach
+ * from a constructor running inside dlopen. */
+static void *rtld_dlsym_locked(void *handle, const char *symbol)
 {
 	g_dlerror_set = 0;
 	if (handle == RTLD_DEFAULT || !handle) {
@@ -1875,7 +1987,15 @@ void *_rtld_dlsym(void *handle, const char *symbol)
 	return NULL;
 }
 
-int _rtld_dlclose(void *handle)
+void *_rtld_dlsym(void *handle, const char *symbol)
+{
+	rtld_lock();
+	void *r = rtld_dlsym_locked(handle, symbol);
+	rtld_unlock();
+	return r;
+}
+
+static int rtld_dlclose_locked(void *handle)
 {
 	g_dlerror_set = 0;
 	if (!handle)
@@ -1896,6 +2016,30 @@ int _rtld_dlclose(void *handle)
 	}
 	if (d->fini_fn)
 		d->fini_fn();
+
+	/* Nothing may be left that would call into these pages once they are
+	 * gone.  An object's own finalizers clear what it registered under
+	 * its own handle, but atexit(3) cannot tag a registration with the
+	 * object its caller lives in -- it is compiled once, inside the C
+	 * library -- so a handler registered that way survives the object
+	 * and exit() later jumps into the hole where it used to be.  The
+	 * symptom is a crash on the way out with the instruction pointer in
+	 * unmapped memory, long after the call that caused it.
+	 *
+	 * The C library is asked to drop anything pointing into the range,
+	 * whatever it was tagged with.  Looked up rather than called
+	 * directly: the loader links against nothing, and a program without
+	 * a C library has nothing to purge. */
+	if (d->map_base && d->map_size) {
+		sym_result_t pr = rtld_lookup_symbol("__cxa_purge_range", d);
+		if (pr.sym && pr.dso) {
+			void (*purge)(void *, unsigned long) =
+				(void (*)(void *, unsigned long))(pr.dso->base +
+								  pr.sym->st_value);
+			purge((void *)d->map_base, d->map_size);
+		}
+	}
+
 	/* Off the debugger's list BEFORE the pages go away, and announced as
 	 * RT_DELETE while it happens.  A debugger that read the list after the
 	 * unmap but before the removal would follow l_ld into memory that is no
@@ -1916,6 +2060,14 @@ int _rtld_dlclose(void *handle)
 	 * pointing into them is a fault waiting for the next lookup. */
 	g_dl_subs++;
 	return 0;
+}
+
+int _rtld_dlclose(void *handle)
+{
+	rtld_lock();
+	int r = rtld_dlclose_locked(handle);
+	rtld_unlock();
+	return r;
 }
 
 char *_rtld_dlerror(void)
@@ -2130,7 +2282,19 @@ int _rtld_dladdr(const void *addr, const char **fname, void **fbase,
 	if (!d)
 		return 0;
 	if (fname)
-		*fname = d->name;
+		/* The PATHNAME of the object, not its soname.
+		 *
+		 * A library that wants to know where it is installed asks
+		 * this and takes the directory of the answer.  Handed a bare
+		 * "libfoo.so.0" the directory is "." -- which becomes
+		 * whatever the process's working directory happens to be, so
+		 * the library concludes it lives wherever the user ran the
+		 * program from.  Relocatable builds locate their plugins and
+		 * data that way: GStreamer reported "Using library installed
+		 * in /root", looked for its plugins under that, found none,
+		 * and -- since a missing directory is not an error -- said
+		 * nothing at all. */
+		*fname = d->path ? d->path : d->name;
 	if (fbase)
 		*fbase = (void *)d->base;
 	if (sname)
@@ -2177,6 +2341,7 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 	rtld->path = "/lib/ld-likeos.so";
 	rtld->base = own_base;
 	rtld->dynamic = own_dyn;
+	rtld->reloc_started = 1;
 	rtld->relocated = 1;
 	rtld->initialized = 1;
 	rtld_parse_dynamic(rtld);

@@ -159,7 +159,7 @@ static int ne_reset(ne2k_dev_t *dev)
 // byte appears twice** in the I/O space (real silicon and QEMU both do
 // this — see ne2000_reset() in QEMU which explicitly duplicates the
 // PROM contents into pairs).  So to recover the 6 MAC bytes we read
-// 12 bytes and keep every other one.  This matches Linux's `ne.c`.
+// 12 bytes and keep every other one.  This matches the reference `ne.c`.
 // ============================================================================
 static void ne_read_mac(ne2k_dev_t *dev)
 {

@@ -187,6 +187,25 @@ syscall_entry:
     ;   104: rcx, 112: r11, 120: user_rsp
     mov [rsp + 12*8], rax
 
+    ; SYSRET can only return to a CANONICAL address, and it takes that
+    ; address from RCX.  Handed a non-canonical one it raises #GP with CPL
+    ; still 0 and the USER stack already loaded: a kernel-mode fault on a
+    ; user-controlled stack, which is the worst shape a fault can have.
+    ;
+    ; The address is reachable from user mode.  sigreturn restores RIP from a
+    ; frame on the process's own stack, and a tracer can set a tracee's RIP to
+    ; anything at all -- neither has to be an address SYSRET will take.
+    ;
+    ; So test it, and return through IRETQ where it will not do.  IRETQ takes
+    ; any address; a bad one faults in USER mode and becomes a signal for the
+    ; process, which is what it should have been.  The reference makes the
+    ; same test at the same point and falls back the same way.
+    mov rax, [rsp + 13*8]      ; the RCX slot: the RIP SYSRET would load
+    shl rax, 16
+    sar rax, 16                ; sign-extend from bit 47
+    cmp rax, [rsp + 13*8]
+    jne .return_via_iret
+
     pop r15
     pop r14
     pop r13
@@ -207,6 +226,34 @@ syscall_entry:
 
     o64 sysret
 
+.return_via_iret:
+    ; The same return, built as an IRET frame.  RCX and R11 are the two
+    ; registers SYSCALL destroys, so they are free to use as scratch here.
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    pop rax
+    ; [rsp] = user RIP, [rsp+8] = user RFLAGS, [rsp+16] = user RSP.  The
+    ; frame is pushed BELOW them, into the space the pops just freed.
+    mov r11, [rsp + 8]
+    mov rcx, [rsp + 16]
+    push qword USER_SS_SEL
+    push rcx                   ; user RSP
+    push r11                   ; user RFLAGS
+    push qword USER_CS_SEL
+    mov rcx, [rsp + 4*8]       ; user RIP, four pushes higher now
+    push rcx
+    iretq
+
 .signal_return:
     ; Signal handler or sigreturn path
     ; RDI has value from per-CPU syscall_signal_pending
@@ -225,6 +272,19 @@ syscall_entry:
     ; Load modified context from per-CPU saved variables
     mov rcx, [gs:PERCPU_SAVED_USER_RIP]       ; Handler address -> RCX for SYSRET
     mov r11, [gs:PERCPU_SAVED_USER_RFLAGS]    ; RFLAGS -> R11 for SYSRET
+
+    ; The handler address came straight from the process's own sigaction, so
+    ; it is whatever the program said -- including an address SYSRET cannot
+    ; return to.  Same test and same fallback as the normal return above;
+    ; here it matters more, because nothing else checks this value at all.
+    ; Tested while still on the KERNEL stack: past the switch below there is
+    ; nowhere left to build a frame.
+    mov rax, rcx
+    shl rax, 16
+    sar rax, 16
+    cmp rax, rcx
+    jne .signal_return_iret
+
     mov rsp, [gs:PERCPU_SYSCALL_URSP]         ; Signal frame on stack (stored in user_rsp)
 
     ; Restore callee-saved registers (handler expects these)
@@ -246,6 +306,32 @@ syscall_entry:
     xor r10, r10
 
     o64 sysret
+
+.signal_return_iret:
+    ; The handler entered through IRETQ instead.  RDI already holds the
+    ; signal number and must survive; everything else is set up exactly as
+    ; the SYSRET path above sets it.
+    mov rax, [gs:PERCPU_SYSCALL_URSP]
+    push qword USER_SS_SEL
+    push rax                                  ; user RSP (the signal frame)
+    push r11                                  ; RFLAGS
+    push qword USER_CS_SEL
+    push rcx                                  ; handler address
+    mov rbp, [gs:PERCPU_SAVED_USER_RBP]
+    mov rbx, [gs:PERCPU_SAVED_USER_RBX]
+    mov r12, [gs:PERCPU_SAVED_USER_R12]
+    mov r13, [gs:PERCPU_SAVED_USER_R13]
+    mov r14, [gs:PERCPU_SAVED_USER_R14]
+    mov r15, [gs:PERCPU_SAVED_USER_R15]
+    mov rsi, [gs:PERCPU_SAVED_USER_RSI]
+    mov rdx, [gs:PERCPU_SAVED_USER_RDX]
+    xor rax, rax
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
+    xor r11, r11
+    xor rcx, rcx
+    iretq
 
 .sigreturn_restore:
     ; Sigreturn: restore the COMPLETE user context, via IRETQ.

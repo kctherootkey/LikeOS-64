@@ -1,0 +1,39 @@
+Give a server built without bus enumeration libdrm's compiler flags.
+
+configure adds LIBDRM_CFLAGS/LIBDRM_LIBS to the Xorg flags in one place only:
+inside the branch that configures libpciaccess.  The assumption is that a
+server which talks to a display manager also enumerates the PCI bus, and on
+every system upstream builds for it that holds.
+
+This server is built --disable-pciaccess (nothing here can reach the bus from
+userspace; the modesetting driver is told which node to open in xorg.conf), so
+that branch is not taken and libdrm's include directory never reaches the
+compiler.  The build then fails in hw/xfree86/dri2 on
+
+    xf86drm.h:40:10: fatal error: drm.h: No such file or directory
+
+because <drm.h> lives in ${includedir}/libdrm, which is what LIBDRM_CFLAGS
+names.  The modesetting driver would fail the same way.
+
+So add them in the other branch too, when libdrm is enabled.  A build with
+libpciaccess is unaffected.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -1862,6 +1862,16 @@
+ 		if test "x$INT10MODULE" = xyes && test "x$INT10" != xstub; then
+ 			AC_MSG_ERROR([Cannot build int10 without libpciaccess])
+ 		fi
++		dnl libdrm's flags are added above only along with libpciaccess,
++		dnl on the assumption that a server which talks to a display
++		dnl manager also enumerates the bus.  A server built without bus
++		dnl enumeration still needs them: hw/xfree86/dri2 and the
++		dnl modesetting driver include <xf86drm.h>, which includes
++		dnl <drm.h> from libdrm's own include directory.
++		if test "x$DRM" = xyes; then
++			XORG_SYS_LIBS="$XORG_SYS_LIBS $LIBDRM_LIBS"
++			XORG_CFLAGS="$XORG_CFLAGS $LIBDRM_CFLAGS"
++		fi
+ 	fi
+ 	AC_MSG_RESULT([$PCI])
+ 

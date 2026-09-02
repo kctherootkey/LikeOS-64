@@ -2,6 +2,7 @@
 // Supports static (ET_EXEC) and dynamic/PIE (ET_DYN) executables.
 // When PT_INTERP is present, loads the dynamic linker (ld-likeos.so) and
 // passes control to it with an auxiliary vector on the stack.
+#include <kernel/ke/timer.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/file.h>
 #include <kernel/ke/elf.h>
@@ -485,7 +486,7 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 	typedef struct {
 		uint64_t t, v;
 	} ax_t;
-	ax_t ax[16];
+	ax_t ax[24];
 	int ac = 0;
 	ax[ac].t = AT_PHDR;
 	ax[ac].v = mr->phdr_addr;
@@ -538,9 +539,38 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 		ax[ac].v = (uid != euid || gid != egid) ? 1 : 0;
 		ac++;
 	}
+	/* Facts about the machine and the kernel that a runtime asks
+	 * getauxval() for rather than probing: the CPUID feature word, the
+	 * tick rate times() counts in, the platform name. */
+	{
+		uint32_t a, b, c, d;
+		__asm__ volatile("cpuid"
+				 : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+				 : "a"(1), "c"(0));
+		ax[ac].t = AT_HWCAP;
+		ax[ac].v = d;
+		ac++;
+		/* HWCAP2 bit 1: FSGSBASE usable from user mode. */
+		ax[ac].t = AT_HWCAP2;
+		ax[ac].v = (g_cpu_features_ext & CPU_FEATURE_FSGSBASE) ? 2 : 0;
+		ac++;
+		ax[ac].t = AT_CLKTCK;
+		ax[ac].v = timer_get_frequency();
+		ac++;
+	}
+	/* Three entries whose values are addresses of strings/bytes placed
+	 * on the stack below; filled in once those addresses are known. */
+	int ac_platform = ac++;
+	int ac_random = ac++;
+	int ac_execfn = ac++;
 	ax[ac].t = AT_NULL;
 	ax[ac].v = 0;
 	ac++;
+
+	static const char platform_str[] = "x86_64";
+	uint8_t random_bytes[16];
+	random_get_bytes(random_bytes, sizeof(random_bytes), 0);
+	const char *execfn = (argc > 0 && argv[0]) ? argv[0] : "";
 
 	// Total string space
 	size_t str_total = 0;
@@ -548,6 +578,8 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 		str_total += elf_strlen(argv[i]) + 1;
 	for (int i = 0; i < envc; i++)
 		str_total += elf_strlen(envp[i]) + 1;
+	str_total += sizeof(platform_str) + sizeof(random_bytes) +
+		     elf_strlen(execfn) + 1;
 
 	// Pointers area: argc + argv[] + NULL + envp[] + NULL + auxv
 	size_t ptrs = 8 + (argc + 1) * 8 + (envc + 1) * 8 + ac * 16;
@@ -583,6 +615,26 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 		sv -= l;
 		mm_memcpy(sw, envp[i], l);
 		ev[i] = sv;
+	}
+	{
+		size_t l = elf_strlen(execfn) + 1;
+		sw -= l;
+		sv -= l;
+		mm_memcpy(sw, execfn, l);
+		ax[ac_execfn].t = AT_EXECFN;
+		ax[ac_execfn].v = sv;
+
+		sw -= sizeof(random_bytes);
+		sv -= sizeof(random_bytes);
+		mm_memcpy(sw, random_bytes, sizeof(random_bytes));
+		ax[ac_random].t = AT_RANDOM;
+		ax[ac_random].v = sv;
+
+		sw -= sizeof(platform_str);
+		sv -= sizeof(platform_str);
+		mm_memcpy(sw, platform_str, sizeof(platform_str));
+		ax[ac_platform].t = AT_PLATFORM;
+		ax[ac_platform].v = sv;
 	}
 
 	uint64_t sp_va = (sv - ptrs) & ~15ULL;

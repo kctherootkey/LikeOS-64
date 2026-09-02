@@ -1,4 +1,7 @@
 // LikeOS-64 -- read/write/readv/writev/lseek.
+#include <kernel/uapi/status.h>
+#include <kernel/uapi/stat.h>
+#include <kernel/fs/devfs.h>
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
@@ -55,8 +58,8 @@ static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
 
 		// Block waiting for data
 		if (cur) {
-			cur->state = TASK_BLOCKED;
 			cur->wait_channel = pipe; // Wait on the pipe
+			cur->state = TASK_BLOCKED;
 			spin_unlock_irqrestore(&pipe->lock, flags);
 			sched_schedule();
 			spin_lock_irqsave(&pipe->lock, &flags);
@@ -149,8 +152,8 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 
 		// Block waiting for space
 		if (cur) {
-			cur->state = TASK_BLOCKED;
 			cur->wait_channel = pipe;
+			cur->state = TASK_BLOCKED;
 			spin_unlock_irqrestore(&pipe->lock, flags);
 			sched_schedule();
 			spin_lock_irqsave(&pipe->lock, &flags);
@@ -520,4 +523,125 @@ int64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t iovcnt)
 			break; // short read
 	}
 	return total;
+}
+
+/* pread(2) / pwrite(2): read or write at an explicit offset without moving
+ * the descriptor's position.  Only a plain file has a position to leave
+ * alone; every other kind is ESPIPE, as POSIX says.
+ *
+ * The filesystem interface reads at the handle's position, so this is a
+ * seek-read-seek-back sequence made atomic against the other user of that
+ * position on the same handle -- the demand-paging page-in -- by the
+ * handle's pagein flag, which serialises exactly such sequences. */
+static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
+			  int64_t offset, int write)
+{
+	task_t *cur = sched_current();
+	vfs_file_t *file;
+	int64_t ret;
+
+	if (!cur)
+		return -EFAULT;
+	if (offset < 0)
+		return -EINVAL;
+	if (count == 0)
+		return 0;
+	if (!validate_user_ptr(buf, count))
+		return -EFAULT;
+	file = fdget(cur, (int)fd);
+	if (!file)
+		return -EBADF;
+	if (fd_is_special(file) || devfs_is_devfile(file)) {
+		fdput(file);
+		return -ESPIPE;
+	}
+	if (write ? (!(file->flags & (O_WRONLY | O_RDWR))) :
+		    (file->flags & O_WRONLY)) {
+		fdput(file);
+		return -EBADF;
+	}
+
+	if (!write) {
+		/* A positional read is exactly what vfs_pread() is: it uses
+		 * the filesystem's own positioned read where there is one and
+		 * only falls back to the seek/read/seek-back dance -- under
+		 * this handle's flag -- where there is not.  pread(2) is
+		 * defined not to disturb the position, so it should not be
+		 * open-coding a way to disturb it and put it back. */
+		ret = vfs_pread(file, (void *)buf, (long)count, (long)offset);
+		fdput(file);
+		return ret;
+	}
+
+	while (__atomic_test_and_set(&file->pagein_busy, __ATOMIC_ACQUIRE))
+		sched_yield_in_kernel();
+	file->pagein_owner = (int64_t)cur->id;
+
+	long saved = vfs_seek(file, 0, 1 /* SEEK_CUR */);
+	if (saved < 0) {
+		ret = saved;
+		goto unlock;
+	}
+	long at = vfs_seek(file, (long)offset, 0 /* SEEK_SET */);
+	if (at < 0) {
+		ret = at;
+		goto unlock;
+	}
+	ret = vfs_write(file, (const void *)buf, (long)count);
+	vfs_seek(file, saved, 0);
+unlock:
+	file->pagein_owner = -1;
+	__atomic_clear(&file->pagein_busy, __ATOMIC_RELEASE);
+	fdput(file);
+	return ret;
+}
+
+int64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+{
+	return prw_common(fd, buf, count, (int64_t)offset, 0);
+}
+
+int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
+		     uint64_t offset)
+{
+	return prw_common(fd, buf, count, (int64_t)offset, 1);
+}
+
+/* fallocate(2): reserve space.  The filesystems here have no preallocation
+ * of their own, so mode 0 that extends the file is a truncate up (the
+ * blocks are then allocated on the first write, which is what the caller
+ * can observe anyway) and everything else is unsupported. */
+int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
+		      uint64_t len)
+{
+	task_t *cur = sched_current();
+	vfs_file_t *file;
+	struct kstat st;
+	int64_t ret = 0;
+
+	if (!cur)
+		return -EFAULT;
+	if ((int64_t)offset < 0 || (int64_t)len <= 0)
+		return -EINVAL;
+	if (mode & ~1ULL /* FALLOC_FL_KEEP_SIZE */)
+		return -EOPNOTSUPP;
+	file = fdget(cur, (int)fd);
+	if (!file)
+		return -EBADF;
+	if (fd_is_special(file) || devfs_is_devfile(file)) {
+		fdput(file);
+		return -ENODEV;
+	}
+	if (!(file->flags & (O_WRONLY | O_RDWR))) {
+		fdput(file);
+		return -EBADF;
+	}
+	if (mode == 0 && vfs_fstat(file, &st) == 0 &&
+	    offset + len > st.st_size) {
+		int r = vfs_truncate(file, (unsigned long)(offset + len));
+		if (r != ST_OK)
+			ret = -EIO;
+	}
+	fdput(file);
+	return ret;
 }

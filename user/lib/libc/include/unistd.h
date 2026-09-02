@@ -46,6 +46,11 @@ extern "C" {
 // File operations
 int open(const char* pathname, int flags, ...);
 ssize_t read(int fd, void* buf, size_t count);
+/* Positional I/O: at `offset', leaving the descriptor's position alone. */
+ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
+#define pread64 pread
+#define pwrite64 pwrite
 ssize_t write(int fd, const void* buf, size_t count);
 int close(int fd);
 off_t lseek(int fd, off_t offset, int whence);
@@ -124,7 +129,7 @@ unsigned int alarm(unsigned int seconds);
 unsigned int sleep(unsigned int seconds);
 /* Implemented in libc but not previously declared here, so every caller got an
  * implicit declaration — which -Werror=implicit turns into a build failure. */
-int usleep(unsigned int usec);
+int usleep(useconds_t usec);
 int pause(void);
 pid_t vfork(void);
 int gethostname(char* name, size_t len);
@@ -133,6 +138,12 @@ char* getlogin(void);
 int getlogin_r(char* buf, size_t bufsize);
 int setlogin(const char* name);
 int fsync(int fd);
+int fdatasync(int fd);
+/* Processors online / configured (the sysconf() values, as ints). */
+int get_nprocs(void);
+int get_nprocs_conf(void);
+#define lseek64 lseek
+#define ftruncate64 ftruncate
 void sync(void);
 int ftruncate(int fd, off_t length);
 int truncate(const char* path, off_t length);

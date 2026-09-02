@@ -1,11 +1,9 @@
--- Hardware-acceleration policy: LEFT AT LUAKIT'S DEFAULT.
+-- luakit's user configuration for this image.
 --
--- This file once forced "never", because the system had no GL at all -- no
--- Mesa, no libEGL, no DRM -- and WebKit's compositing could only fail.
--- Mesa with llvmpipe now provides real (software) OpenGL through GLX/EGL,
--- and WebKit composites through it, so the override is gone.  To fall back
--- for debugging:
---   settings.override_setting("webview.hardware_acceleration_policy", "never")
+-- The one setting worth reading before anything else is the
+-- hardware-acceleration policy further down: it is chosen at startup from
+-- whether this machine has a GPU the kernel could bind, so the same image is
+-- correct on a machine with one and on a machine without.
 
 local settings = require "settings"
 
@@ -25,20 +23,65 @@ settings.window.new_window_size = "1024x768"
 -- available through domain_props if a page's shaders are too slow.
 settings.webview.enable_webgl = true
 
--- Hardware acceleration: OFF by default, ON per site.
+-- Hardware acceleration: DECIDED BY THE MACHINE, at startup.
 --
--- WebKitGTK 2.44+ has only two real rendering modes for this toolkit:
--- "always" runs every page through the accelerated compositor, "never" paints
--- with cairo.  ("on-demand" is accepted and treated as "always".)  On this
--- system GL is llvmpipe -- software -- so the compositor means several
--- full-screen CPU passes per scroll step and freebsd.org became unscrollable;
--- cairo needs one pass and is fast.  WebGL requires the compositor, so it is
--- unavailable on "never" pages.  The policy is a per-view setting, so the
--- default is the fast path and sites that need GL are listed below; add
--- your own the same way (or from luakit: `:set webview.hardware_acceleration_policy always`
--- affects the current view only until the next domain change).
-settings.webview.hardware_acceleration_policy = "never"
-settings.on["get.webgl.org"].webview.hardware_acceleration_policy = "always"
+-- WebKitGTK 2.44+ has two real rendering modes for this toolkit: "always"
+-- runs every page through the accelerated compositor, "never" paints with
+-- cairo.  ("on-demand" is accepted and treated as "always".)  Which one is
+-- right depends entirely on what is underneath:
+--
+--   With a GPU -- the kernel bound a display-manager driver, /dev/dri/card0
+--   exists, and Mesa reaches it through the svga driver -- the compositor
+--   draws into GPU textures and hands the finished frame over as a buffer
+--   descriptor.  That is what WebGL, accelerated 2D canvas and the GPU
+--   process all need, and it is faster than cairo on every page.
+--
+--   Without one, GL is llvmpipe: the compositor becomes several full-screen
+--   CPU passes per scroll step (freebsd.org was unscrollable that way) where
+--   cairo needs one.  So plain pages take cairo, and the sites that cannot
+--   work without a compositor are listed individually.
+--
+-- The test is the node, because that is the thing that is actually different
+-- between the two machines.  Reading it here rather than hardcoding a policy
+-- keeps ONE image working correctly on both.
+local acceleration = "never"
+do
+    local node = io.open("/dev/dri/card0", "r")
+    if node then
+        node:close()
+        acceleration = "always"
+    end
+end
+settings.webview.hardware_acceleration_policy = acceleration
+if acceleration == "never" then
+    -- WebGL needs the compositor, so the pages that are only about WebGL get
+    -- it even on the software path -- slowly, but they work.
+    settings.on["get.webgl.org"].webview.hardware_acceleration_policy = "always"
+end
+
+-- Media: OFF.
+--
+-- Video is the most expensive thing a page can start on this machine, and it
+-- starts without being asked: a decoder thread per stream, decoded frames held
+-- in memory, and a compositor pass per frame on top.  None of it is why the
+-- browser is here.
+--
+-- `enable_mediasource' is the one that matters.  Practically every video on
+-- the web today is delivered through Media Source Extensions -- the page feeds
+-- segments to the player from JavaScript -- so refusing MSE stops the pipeline
+-- before it is built rather than after.  A plain progressive <video src=...>
+-- file is not covered by it, which is what the gesture setting below is for:
+-- such a file will still play, but only when the user clicks it, never on its
+-- own.  `enable_webaudio' goes with them; it is the same decode-and-mix work
+-- with no picture attached.
+--
+-- These stay correct after WebKit is rebuilt with -DENABLE_VIDEO=OFF: the
+-- properties exist in the API whether or not the feature was compiled in, and
+-- setting them then simply has nothing left to switch off.  Until that rebuild
+-- happens they are what actually turns media off in this image.
+settings.webview.enable_mediasource = false
+settings.webview.media_playback_requires_gesture = true
+settings.webview.enable_webaudio = false
 
 -- Default typed addresses to https://, not http://.
 --

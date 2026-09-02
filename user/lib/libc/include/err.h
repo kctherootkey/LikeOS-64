@@ -22,6 +22,9 @@ void vwarnx(const char* fmt, va_list ap);
 
 /* Program name used by err/warn family.  Set automatically at startup. */
 extern const char* __progname;
+/* argv[0] as given, and its basename; set by the C runtime at start-up. */
+extern char* program_invocation_name;
+extern char* program_invocation_short_name;
 void __libc_set_progname(const char* argv0);
 
 #ifdef __cplusplus

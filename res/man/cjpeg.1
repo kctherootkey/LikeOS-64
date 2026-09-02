@@ -10,36 +10,31 @@ DESCRIPTION
        cjpeg compresses the named image file, or the standard input if no file
        is  named,  and  produces a JPEG/JFIF file on the standard output.  The
        currently supported input file formats are: PPM (PBMPLUS color format),
-       PGM (PBMPLUS grayscale format), BMP, GIF, Targa, and RLE  (Utah  Raster
-       Toolkit  format).   (RLE is supported only if the URT library is avail-
-       able, which it isn't on most non-Unix systems.)
+       PGM (PBMPLUS grayscale format), BMP, GIF [legacy  feature],  and  Targa
+       [legacy feature].
 
 OPTIONS
-       All switch names may be abbreviated; for  example,  -grayscale  may  be
-       written  -gray or -gr.  Most of the "basic" switches can be abbreviated
-       to as little as one letter.  Upper and lower case are equivalent  (thus
-       -BMP  is the same as -bmp).  British spellings are also accepted (e.g.,
+       All  switch  names  may  be abbreviated; for example, -grayscale may be
+       written -gray or -gr.  Most of the "basic" switches can be  abbreviated
+       to  as little as one letter.  Upper and lower case are equivalent (thus
+       -BMP is the same as -bmp).  British spellings are also  accepted  (e.g.
        -greyscale), though for brevity these are not mentioned below.
 
        The basic switches are:
 
        -quality N[,...]
               Scale quantization tables to adjust image quality.  Quality is 0
-              (worst) to 100 (best); default  is  75.   (See  below  for  more
+              (worst)  to  100  (best);  default  is  75.  (See below for more
               info.)
 
        -grayscale
-              Create  monochrome  JPEG  file from color input.  Be sure to use
-              this switch when compressing a grayscale BMP or  GIF  file,  be-
-              cause  cjpeg  isn't bright enough to notice whether a BMP or GIF
-              file uses only shades of gray.  By saying -grayscale, you'll get
-              a smaller JPEG file that takes less time to process.
+              Create monochrome JPEG file from  color  input.   By  specifying
+              -grayscale,  you'll get a smaller JPEG file that takes less time
+              to process.
 
        -rgb   Create RGB JPEG file.  Using this switch suppresses the  conver-
               sion  from RGB colorspace input to the default YCbCr JPEG color-
-              space.  You can use this switch in combination with the -block N
-              switch (see below) for lossless JPEG coding.  See also the -rgb1
-              switch below.
+              space.
 
        -optimize
               Perform optimization of entropy  encoding  parameters.   Without
@@ -49,19 +44,14 @@ OPTIONS
               decompression are unaffected by -optimize.
 
        -progressive
-              Create progressive JPEG file (see below).
+              Create progressive JPEG file (see below).  Implies -optimize un-
+              less -arithmetic is also specified.
 
-       -scale M/N
-              Scale the output image by a  factor  M/N.   Currently  supported
-              scale  factors  are  M/N with all N from 1 to 16, where M is the
-              destination DCT size, which is 8 by default (see -block N switch
-              below).
-
-       -targa Input file is Targa format.  Targa files that contain an  "iden-
-              tification" field will not be automatically recognized by cjpeg;
-              for  such  files you must specify -targa to make cjpeg treat the
-              input as Targa format.  For most Targa  files,  you  won't  need
-              this switch.
+       -targa Input file is Targa format [legacy feature].  Targa  files  that
+              contain an "identification" field will not be automatically rec-
+              ognized  by  cjpeg.   For such files, you must specify -targa to
+              make cjpeg treat the input as  Targa  format.   For  most  Targa
+              files, you won't need this switch.
 
        The  -quality  switch  lets  you trade off compressed file size against
        quality of the reconstructed image: the higher the quality setting, the
@@ -69,17 +59,18 @@ OPTIONS
        original  input.   Normally  you want to use the lowest quality setting
        (smallest file) that decompresses  into  something  visually  indistin-
        guishable  from  the original image.  For this purpose the quality set-
-       ting should be between 50 and 95; the default  of  75  is  often  about
-       right.  If you see defects at -quality 75, then go up 5 or 10 counts at
-       a time until you are happy with the output image.  (The optimal setting
-       will vary from one image to another.)
+       ting should generally be between 50 and 95 (the default is 75) for pho-
+       tographic images.  If you see defects at -quality 75, then go up  5  or
+       10  counts  at  a time until you are happy with the output image.  (The
+       optimal setting will vary from one image to another.)
 
-       -quality  100 will generate a quantization table of all 1's, minimizing
-       loss in the quantization step (but there is still information  loss  in
-       subsampling, as well as roundoff error).  This setting is mainly of in-
-       terest  for  experimental  purposes.  Quality values above about 95 are
-       not recommended for normal use; the compressed file size goes  up  dra-
-       matically for hardly any gain in output image quality.
+       -quality 100 will generate a quantization table of all 1's,  minimizing
+       loss  in  the quantization step (but there is still information loss in
+       subsampling, as well as roundoff error.)  For most images, specifying a
+       quality value above about 95 will increase the size of  the  compressed
+       file dramatically, and while the quality gain from these higher quality
+       values is measurable (using metrics such as PSNR or SSIM), it is rarely
+       perceivable by human vision.
 
        In the other direction, quality values below 50 will produce very small
        files of low image quality.  Settings around 5 to 10 might be useful in
@@ -91,24 +82,35 @@ OPTIONS
        able to decode the resulting file.  Use -baseline if you need to ensure
        compatibility at low quality values.)
 
-       The -quality option has been extended in IJG version 7 for  support  of
-       separate quality settings for luminance and chrominance (or in general,
-       for  every  provided  quantization table slot).  This feature is useful
-       for high-quality applications which cannot accept the damage  of  color
-       data  by  coarse  subsampling  settings.  You can now easily reduce the
-       color data amount more smoothly with  finer  control  without  separate
-       subsampling.   The resulting file is fully compliant with standard JPEG
-       decoders.  Note that the -quality ratings refer to the quantization ta-
-       ble slots, and that the last value is replicated if there are  more  q-
-       table slots than parameters.  The default q-table slots are 0 for lumi-
-       nance  and  1  for chrominance with default tables as given in the JPEG
-       standard.  This is compatible with the old behaviour in case that  only
-       one  parameter  is  given,  which  is  then used for both luminance and
-       chrominance (slots 0 and 1).  More or custom quantization tables can be
-       set with -qtables and assigned to  components  with  -qslots  parameter
-       (see  the  "wizard"  switches below).  Caution: You must explicitly add
-       -sample 1x1 for efficient separate color quality selection,  since  the
-       default value used by library is 2x2!
+       The -quality option has been extended in this version of cjpeg to  sup-
+       port  separate  quality  settings for luminance and chrominance (or, in
+       general, separate settings for every  quantization  table  slot.)   The
+       principle  is the same as chrominance subsampling:  since the human eye
+       is more sensitive to spatial changes in brightness than spatial changes
+       in color, the chrominance components can be quantized more than the lu-
+       minance components without incurring any visible  image  quality  loss.
+       However, unlike subsampling, this feature reduces data in the frequency
+       domain  instead  of  the  spatial  domain,  which allows for more fine-
+       grained control.  This option is useful in  quality-sensitive  applica-
+       tions,  for  which  the artifacts generated by subsampling may be unac-
+       ceptable.
+
+       The -quality option accepts a comma-separated list of parameters, which
+       respectively refer to the quality levels that should be assigned to the
+       quantization table slots.  If there are more q-table slots than parame-
+       ters, then the last parameter is replicated.  Thus, if only one quality
+       parameter is given, this is used for  both  luminance  and  chrominance
+       (slots  0 and 1, respectively), preserving the legacy behavior of cjpeg
+       v6b and prior.  More (or customized) quantization  tables  can  be  set
+       with  the  -qtables  option and assigned to components with the -qslots
+       option (see the "wizard" switches below.)
+
+       JPEG files generated with separate luminance  and  chrominance  quality
+       are fully compliant with standard JPEG decoders.
+
+       CAUTION:  For this setting to be useful, be sure to pass an argument of
+       -sample 1x1 to cjpeg to disable  chrominance  subsampling.   Otherwise,
+       the default subsampling level (2x2, AKA "4:2:0") will be used.
 
        The  -progressive  switch  creates  a "progressive JPEG" file.  In this
        type of JPEG file, the data is stored in multiple scans  of  increasing
@@ -121,114 +123,183 @@ OPTIONS
 
        Switches for advanced users:
 
+       -precision N
+              Create  JPEG  file with N-bit data precision.  N is 2 to 16; de-
+              fault is 8.  If N is not 8 or 12, then -lossless  must  also  be
+              specified.   Note  that  only the PBMPLUS input file format sup-
+              ports data precisions other than 8.  Note also that PBMPLUS  in-
+              put files are silently scaled to the target data precision, even
+              if it is lower than the precision of the input file.  Passing an
+              argument of -verbose to cjpeg will cause it to print information
+              about the precision of the input file.  Caution: only 8-bit data
+              precision is widely implemented, so many decoders will be unable
+              to handle JPEG files with other data precisions.
+
+              -precision 12 implies -optimize unless -arithmetic is also spec-
+              ified.
+
+       -lossless psv[,Pt]
+              Create a lossless JPEG file using the specified predictor selec-
+              tion value (1 through 7) and optional point transform (0 through
+              precision  -  1,  where  precision is the JPEG data precision in
+              bits).  A point transform value of 0 (the default) is  necessary
+              in  order  to  create  a  fully lossless JPEG file.  (A non-zero
+              point transform value right-shifts  the  input  samples  by  the
+              specified  number  of bits, which is effectively a form of lossy
+              color quantization.)  Caution: lossless JPEG is not  yet  widely
+              implemented,  so  many decoders will be unable to handle a loss-
+              less JPEG file at all.  In most cases,  compressing  and  decom-
+              pressing  a  lossless JPEG file is considerably slower than com-
+              pressing and decompressing a lossy JPEG file, and lossless  JPEG
+              files are much larger than lossy JPEG files.  Also note that the
+              following  features  will be unavailable when compressing or de-
+              compressing a lossless JPEG file:
+
+              - Quality/quantization table selection
+
+              - Color space conversion (the JPEG image will use the same color
+              space as the input image)
+
+              - Color quantization
+
+              - DCT/IDCT algorithm selection
+
+              - Smoothing
+
+              - Downsampling/upsampling
+
+              - IDCT scaling
+
+              - Partial image decompression
+
+              - Transformations using jpegtran
+
+              Any switches used to enable or configure those features will  be
+              ignored.
+
        -arithmetic
-              Use  arithmetic  coding.   Caution: arithmetic coded JPEG is not
-              yet widely implemented, so many decoders will be unable to  view
-              an arithmetic coded JPEG file at all.
-
-       -block N
-              Set  DCT  block size.  All N from 1 to 16 are possible.  Default
-              is 8 (baseline format).  Larger values produce  higher  compres-
-              sion,  smaller  values  produce  higher quality (exact DCT stage
-              possible with 1 or 2; with the default quality of 75 and default
-              quantization tables the DCT+Quantization stage is  lossless  for
-              N=1).   Caution: An implementation of the JPEG SmartScale exten-
-              sion is required for this feature.  SmartScale enabled  JPEG  is
-              not  yet  widely implemented, so many decoders will be unable to
-              view a SmartScale extended JPEG file at all.
-
-       -rgb1  Create RGB JPEG file with  reversible  color  transform.   Works
-              like the -rgb switch (see above) and inserts a simple reversible
-              color transform into the processing which significantly improves
-              the compression.  Use this switch in combination with the -block
-              N  switch  (see above) for lossless JPEG coding.  Caution: A de-
-              coder with inverse color transform support is required for  this
-              feature.   Reversible  color transform support is not yet widely
-              implemented, so many decoders will  be  unable  to  view  a  re-
-              versible color transformed JPEG file at all.
-
-       -bgycc Create  big  gamut  YCC JPEG file.  In this type of encoding the
-              color difference components are quantized further by a factor of
-              2 compared to the normal Cb/Cr values, thus  creating  space  to
-              allow larger color values with higher saturation than the normal
-              gamut limits to be encoded.  In order to compensate for the loss
-              of  color  fidelity  compared  to a normal YCC encoded file, the
-              color quantization tables can be adjusted accordingly.  For  ex-
-              ample,  cjpeg -bgycc -quality 80,90 will give similar results as
-              cjpeg -quality 80.  Caution: For correct decompression a decoder
-              with big gamut YCC support (JFIF version 2) is required.  An old
-              decoder may or may not display a  big  gamut  YCC  encoded  JPEG
-              file,  depending  on  JFIF version check and corresponding warn-
-              ing/error configuration.  In case of a granted decompression the
-              old decoder will display the image with half saturated colors.
+              Use  arithmetic  coding.   Caution: arithmetic-coded JPEG is not
+              yet widely implemented, so many decoders will be unable to  han-
+              dle an arithmetic-coded JPEG file at all.
 
        -dct int
-              Use integer DCT method (default).
+              Use accurate integer DCT method (default).
 
        -dct fast
-              Use fast integer DCT (less accurate).
+              Use less accurate integer DCT method [legacy feature].  When the
+              Independent  JPEG  Group's  software was first released in 1991,
+              the compression time for a 1-megapixel JPEG  image  on  a  main-
+              stream  PC  was measured in minutes.  Thus, the fast integer DCT
+              algorithm provided noticeable performance benefits.   On  modern
+              CPUs  running libjpeg-turbo, however, the compression time for a
+              1-megapixel JPEG image is measured in milliseconds, and thus the
+              performance benefits of the fast algorithm are much less notice-
+              able.  On modern x86/x86-64 CPUs that support AVX2 instructions,
+              the fast and int methods have  similar  performance.   On  other
+              types  of  CPUs, the fast method is generally about 5-15% faster
+              than the int method.
+
+              For quality levels of 90 and below, there should be little or no
+              perceptible quality difference between the two algorithms.   For
+              quality  levels  above  90,  however, the difference between the
+              fast and int methods becomes more pronounced.  With  quality=97,
+              for  instance,  the  fast method incurs generally about a 1-3 dB
+              loss in PSNR relative to the int method, but this can be  larger
+              for some images.  Do not use the fast method with quality levels
+              above  97.   The  algorithm  often degenerates at quality=98 and
+              above and can actually produce a more lossy image than if  lower
+              quality  levels had been used.  Also, in libjpeg-turbo, the fast
+              method is not fully accelerated for quality levels above 97,  so
+              it will be slower than the int method.
 
        -dct float
-              Use  floating-point  DCT  method.   The  float  method  is  very
-              slightly  more  accurate than the int method, but is much slower
-              unless your machine has very fast floating-point hardware.  Also
-              note that results of the floating-point method may vary slightly
-              across machines, while the integer methods should give the  same
-              results  everywhere.  The fast integer method is much less accu-
-              rate than the other two.
+              Use  floating-point  DCT  method  [legacy  feature].   The float
+              method does not produce significantly more accurate results than
+              the int method, and it is much slower.  The float method may al-
+              so give different results on different machines due  to  varying
+              roundoff  behavior,  whereas the integer methods should give the
+              same results on all machines.
 
-       -nosmooth
-              Don't use high-quality downsampling.
+       -icc file
+              Embed ICC color management profile contained  in  the  specified
+              file.
 
        -restart N
-              Emit a JPEG restart marker every N MCU  rows,  or  every  N  MCU
-              blocks  if  "B"  is attached to the number.  -restart 0 (the de-
-              fault) means no restart markers.
+              Emit  a JPEG restart marker every N MCU rows, or every N MCUs if
+              "B" is attached to the number.
+
+              In typical JPEG images, an MCU (Minimum Coded Unit) is the mini-
+              mum set of interleaved "data units" (8x8 DCT blocks if the image
+              is lossy or samples if the image is lossless) necessary to  rep-
+              resent  at  least one data unit per component.  (For example, an
+              MCU in an interleaved lossy JPEG image that uses  4:2:2  subsam-
+              pling consists of two luminance blocks followed by one block for
+              each  chrominance component.)  In single-component or non-inter-
+              leaved JPEG images, an MCU is the same as a data unit.   An  MCU
+              row is a row of MCUs spanning the entire width of the image.
+
+              -restart 0 (the default) means no restart markers.
 
        -smooth N
               Smooth the input image to eliminate dithering noise.  N, ranging
-              from 1 to 100, indicates the strength of smoothing.  0 (the  de-
+              from  1 to 100, indicates the strength of smoothing.  0 (the de-
               fault) means no smoothing.
 
        -maxmemory N
-              Set  limit  for  amount of memory to use in processing large im-
-              ages.  Value is in thousands of bytes, or millions of  bytes  if
-              "M"  is  attached  to  the number.  For example, -max 4m selects
-              4000000 bytes.  If more space is needed, temporary files will be
-              used.
+              Set limit for amount of memory to use in  processing  large  im-
+              ages.   Value  is in thousands of bytes, or millions of bytes if
+              "M" is attached to the number.  For  example,  -max  4m  selects
+              4000000 bytes.  If more space is needed, an error will occur.
 
        -outfile name
               Send output image to the named file, not to standard output.
 
+       -memdst
+              Compress  to  memory instead of a file.  This feature was imple-
+              mented mainly as a way of testing the in-memory destination man-
+              ager (jpeg_mem_dest()), but it is also useful for  benchmarking,
+              since it reduces the I/O overhead.
+
+       -report
+              Report compression progress.
+
+       -strict
+              Treat  all  warnings  as fatal.  Enabling this option will cause
+              the compressor to abort if an  LZW-compressed  GIF  input  image
+              contains incomplete or corrupt image data.
+
        -verbose
-              Enable debug printout.  More -v's give more output.  Also,  ver-
+              Enable  debug printout.  More -v's give more output.  Also, ver-
               sion information is printed at startup.
 
        -debug Same as -verbose.
 
-       The  -restart option inserts extra markers that allow a JPEG decoder to
+       -version
+              Print version information and exit.
+
+       The -restart option inserts extra markers that allow a JPEG decoder  to
        resynchronize after a transmission error.  Without restart markers, any
-       damage to a compressed file will usually ruin the image from the  point
-       of  the error to the end of the image; with restart markers, the damage
-       is usually confined to the portion of the image up to the next  restart
-       marker.   Of course, the restart markers occupy extra space.  We recom-
-       mend -restart 1 for images that will be transmitted  across  unreliable
+       damage  to a compressed file will usually ruin the image from the point
+       of the error to the end of the image; with restart markers, the  damage
+       is  usually confined to the portion of the image up to the next restart
+       marker.  Of course, the restart markers occupy extra space.  We  recom-
+       mend  -restart  1 for images that will be transmitted across unreliable
        networks such as Usenet.
 
-       The  -smooth  option  filters  the input to eliminate fine-scale noise.
-       This is often useful when converting dithered images to JPEG: a  moder-
-       ate  smoothing factor of 10 to 50 gets rid of dithering patterns in the
-       input file, resulting in a smaller JPEG file and a  better-looking  im-
-       age.   Too  large  a smoothing factor will visibly blur the image, how-
-       ever.
+       The -smooth option filters the input  to  eliminate  fine-scale  noise.
+       This  is often useful when converting dithered images to JPEG: a moder-
+       ate smoothing factor of 10 to 50 gets rid of dithering patterns in  the
+       input  file,  resulting in a smaller JPEG file and a better-looking im-
+       age.  Too large a smoothing factor will visibly blur the image,  howev-
+       er.
 
        Switches for wizards:
 
        -baseline
-              Force baseline-compatible quantization tables to  be  generated.
-              This  clamps  quantization  values to 8 bits even at low quality
-              settings.  (This switch is poorly named, since it does  not  en-
-              sure  that  the  output is actually baseline JPEG.  For example,
+              Force  baseline-compatible  quantization tables to be generated.
+              This clamps quantization values to 8 bits even  at  low  quality
+              settings.   (This  switch is poorly named, since it does not en-
+              sure that the output is actually baseline  JPEG.   For  example,
               you can use -baseline and -progressive together.)
 
        -qtables file
@@ -243,59 +314,60 @@ OPTIONS
        -scans file
               Use the scan script given in the specified text file.
 
-       The "wizard" switches are intended for experimentation with  JPEG.   If
-       you  don't know what you are doing, don't use them.  These switches are
+       The  "wizard"  switches are intended for experimentation with JPEG.  If
+       you don't know what you are doing, don't use them.  These switches  are
        documented further in the file wizard.txt.
 
 EXAMPLES
-       This example compresses the PPM file foo.ppm with a quality  factor  of
+       This  example  compresses the PPM file foo.ppm with a quality factor of
        60 and saves the output as foo.jpg:
 
               cjpeg -quality 60 foo.ppm > foo.jpg
 
 HINTS
-       Color  GIF  files  are not the ideal input for JPEG; JPEG is really in-
-       tended for compressing  full-color  (24-bit)  images.   In  particular,
-       don't  try  to  convert  cartoons, line drawings, and other images that
-       have only a few distinct colors.  GIF works great on these,  JPEG  does
-       not.   If you want to convert a GIF to JPEG, you should experiment with
-       cjpeg's -quality and -smooth options to get a satisfactory  conversion.
-       -smooth 10 or so is often helpful.
+       Color GIF files are not the ideal input for JPEG; JPEG  is  really  in-
+       tended  for  compressing full-color (24-bit through 48-bit) images.  In
+       particular, don't try to convert cartoons, line drawings, and other im-
+       ages that have only a few distinct colors.  GIF works great  on  these;
+       JPEG does not.  If you want to convert a GIF to JPEG, you should exper-
+       iment  with  cjpeg's -quality and -smooth options to get a satisfactory
+       conversion.  -smooth 10 or so is often helpful.
 
-       Avoid  running an image through a series of JPEG compression/decompres-
-       sion cycles.  Image quality loss will accumulate; after ten or  so  cy-
-       cles  the  image  may  be noticeably worse than it was after one cycle.
-       It's best to use a lossless format while manipulating  an  image,  then
+       Avoid running an image through a series of JPEG  compression/decompres-
+       sion  cycles.   Image quality loss will accumulate; after ten or so cy-
+       cles the image may be noticeably worse than it  was  after  one  cycle.
+       It's  best  to  use a lossless format while manipulating an image, then
        convert to JPEG format when you are ready to file the image away.
 
        The -optimize option to cjpeg is worth using when you are making a "fi-
-       nal"  version  for  posting or archiving.  It's also a win when you are
-       using low quality settings to make very small JPEG files; the  percent-
-       age  improvement  is  often a lot more than it is on larger files.  (At
-       present, -optimize mode is always selected when generating  progressive
+       nal" version for posting or archiving.  It's also a win  when  you  are
+       using  low quality settings to make very small JPEG files; the percent-
+       age improvement is often a lot more than it is on  larger  files.   (At
+       present,  -optimize mode is always selected when generating progressive
        JPEG files.)
 
 ENVIRONMENT
        JPEGMEM
-              If  this  environment  variable is set, its value is the default
-              memory limit.  The value  is  specified  as  described  for  the
-              -maxmemory  switch.   JPEGMEM overrides the default value speci-
-              fied when the program was compiled, and itself is overridden  by
+              If this environment variable is set, its value  is  the  default
+              memory  limit.   The  value  is  specified  as described for the
+              -maxmemory switch.  JPEGMEM overrides the default  value  speci-
+              fied  when the program was compiled, and itself is overridden by
               an explicit -maxmemory.
 
 SEE ALSO
        djpeg(1), jpegtran(1), rdjpgcom(1), wrjpgcom(1)
        ppm(5), pgm(5)
-       Wallace,  Gregory  K.   "The  JPEG Still Picture Compression Standard",
+       Wallace, Gregory K.  "The JPEG  Still  Picture  Compression  Standard",
        Communications of the ACM, April 1991 (vol. 34, no. 4), pp. 30-44.
 
 AUTHOR
        Independent JPEG Group
 
-BUGS
+       This file was modified by The libjpeg-turbo Project to include only in-
+       formation relevant to libjpeg-turbo, to wordsmith certain sections, and
+       to describe features not present in libjpeg.
+
+ISSUES
        Not all variants of BMP and Targa file formats are supported.
 
-       The -targa switch is not a bug, it's a feature.  (It would be a bug  if
-       the Targa format designers had not been clueless.)
-
-                               10 February 2023                       CJPEG(1)
+                                30 August 2024                        CJPEG(1)

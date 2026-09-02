@@ -100,6 +100,50 @@ static inline void tcp_lock_release(spinlock_t *lock, uint64_t flags)
 // ---------------------------------------------------------------------------
 
 static tcp_conn_t *g_tcp_conn_list; // head of the all-connections list
+
+/* Demux hash: connections by 4-tuple.
+ *
+ * The list above is walked in full by every path that has to find a
+ * connection, and the receive path is one of them -- so demultiplexing a
+ * single packet cost one comparison per LIVE CONNECTION, under tcp_lock,
+ * with interrupts disabled.  That is affordable with a handful of
+ * connections and ruinous with thousands, and thousands is exactly what a
+ * browser produces: every closed connection sits in TIME_WAIT for a minute
+ * (TCP_TIME_WAIT_TICKS), so a few hundred requests a second leaves tens of
+ * thousands of dead entries for each arriving packet to walk past.
+ *
+ * The cost does not stay in the walk.  It is paid with interrupts off, so
+ * the network card's receive interrupt is not serviced while it runs; the
+ * card's ring overflows, the packets in it are lost, and the peers
+ * retransmit -- which produces more packets, each walking the same longer
+ * list.  What the user sees is a stack that works well at low connection
+ * counts and collapses into multi-second stalls and timeouts at high ones,
+ * with the network never actually saturated.
+ *
+ * So connections are also chained by a hash of their 4-tuple, and every
+ * lookup that has the tuple uses that instead: one short bucket rather
+ * than the whole table, regardless of how many connections are dying.  The
+ * list itself stays -- the timer sweep and the diagnostics want to visit
+ * everything -- and both are edited together under tcp_lock.
+ *
+ * The local address is deliberately NOT part of the key: a connection may
+ * be bound to the wildcard address, which a lookup for a specific local
+ * address must still find (see tcp_find_conn_locked), and a key that
+ * included it would put the two in different buckets. */
+#define TCP_EHASH_BUCKETS 1024
+static tcp_conn_t *g_tcp_ehash[TCP_EHASH_BUCKETS];
+
+static inline uint32_t tcp_ehash_key(uint16_t local_port, uint32_t remote_ip,
+				     uint16_t remote_port)
+{
+	/* Multiplicative mix of the three fields; the high bits of the
+	 * product are the ones that carry every input bit. */
+	uint64_t x = ((uint64_t)remote_ip << 32) ^
+		     ((uint32_t)local_port << 16) ^ remote_port;
+
+	x *= 0x9E3779B97F4A7C15ULL;
+	return (uint32_t)(x >> 52) & (TCP_EHASH_BUCKETS - 1);
+}
 static uint32_t g_tcp_conn_count; // number of live connections (bounded)
 
 static void tcp_conn_final_free(tcp_conn_t *conn); // forward
@@ -923,6 +967,8 @@ static int tcp_syncookie_validate(uint32_t src_ip, uint32_t dst_ip,
 void tcp_init(void)
 {
 	g_tcp_conn_list = NULL;
+	for (int i = 0; i < TCP_EHASH_BUCKETS; i++)
+		g_tcp_ehash[i] = NULL;
 	g_tcp_conn_count = 0;
 	// Generate ISN and SYN cookie secrets from CSPRNG
 	random_get_bytes(tcp_isn_secret, sizeof(tcp_isn_secret), 0);
@@ -1143,8 +1189,19 @@ static void tcp_conn_free_unpublished(tcp_conn_t *conn)
 // being reordered before the 4-tuple/link stores.
 static inline void tcp_publish_conn(tcp_conn_t *conn)
 {
+	uint32_t b = tcp_ehash_key(conn->local_port, conn->remote_ip,
+				   conn->remote_port);
+
 	conn->list_next = g_tcp_conn_list;
 	g_tcp_conn_list = conn;
+	/* Into the demux hash as well, on the same lock and in the same
+	 * breath: a connection visible on one and not the other is a packet
+	 * delivered to nowhere (or a port handed out twice).  Listeners go
+	 * in too -- their key is degenerate (remote 0:0) but keeping the
+	 * insert unconditional means the unlink can be unconditional as
+	 * well, and the two can never disagree about membership. */
+	conn->hash_next = g_tcp_ehash[b];
+	g_tcp_ehash[b] = conn;
 	__asm__ volatile("" ::: "memory");
 	conn->active = 1;
 }
@@ -1165,6 +1222,19 @@ static void tcp_conn_final_free(tcp_conn_t *conn)
 		}
 		pp = &(*pp)->list_next;
 	}
+	/* ...and out of the demux hash.  The key is the 4-tuple, which has
+	 * not changed since the insert, so this finds the same bucket. */
+	uint32_t b = tcp_ehash_key(conn->local_port, conn->remote_ip,
+				   conn->remote_port);
+	tcp_conn_t **hp = &g_tcp_ehash[b];
+	while (*hp) {
+		if (*hp == conn) {
+			*hp = conn->hash_next;
+			break;
+		}
+		hp = &(*hp)->hash_next;
+	}
+	conn->hash_next = NULL;
 	conn->active = 0;
 	spin_unlock_irqrestore(&tcp_lock, flags);
 
@@ -1235,7 +1305,12 @@ static void tcp_detach_listener_children(tcp_conn_t *listener)
 static tcp_conn_t *tcp_find_conn_locked(uint32_t local_ip, uint16_t local_port,
 					uint32_t remote_ip, uint16_t remote_port)
 {
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
+	/* One bucket of the demux hash, not the whole table -- see the note
+	 * above g_tcp_ehash.  The comparison below is unchanged: the hash
+	 * only narrows the candidates. */
+	uint32_t b = tcp_ehash_key(local_port, remote_ip, remote_port);
+
+	for (tcp_conn_t *c = g_tcp_ehash[b]; c; c = c->hash_next) {
 		// Skip LISTEN (separate lookup) and CLOSED (dead — a killed
 		// TIME_WAIT awaiting reap, or a peer-reset connection kept only
 		// for the owning socket's SO_ERROR; neither should demux a
@@ -1591,7 +1666,9 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	// TIME_WAIT connection with the same 4-tuple (mark it CLOSED so it is no
 	// longer found) before publishing this one, so demux resolves this
 	// 4-tuple to the new connection.
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
+	for (tcp_conn_t *c = g_tcp_ehash[tcp_ehash_key(src_port, dst_ip,
+						       dst_port)];
+	     c; c = c->hash_next) {
 		if (c->active && c->state == TCP_STATE_TIME_WAIT &&
 		    c->proto_ref && c->local_port == src_port &&
 		    c->remote_port == dst_port && c->local_ip == local_ip &&
@@ -3962,6 +4039,38 @@ int tcp_at_mark(tcp_conn_t *conn)
  * the new handshake with the old conn -- the SYN is answered out of the
  * dying connection's state and the client sees the handshake fail with
  * RST/broken pipe.  The allocator now asks this table too. */
+/* Is this exact 4-tuple live?  What a connecting socket needs to know, and
+ * a hash lookup rather than a scan -- see the note above g_tcp_ehash.
+ *
+ * The connection this asks about may be in TIME_WAIT, which is the point:
+ * reusing a 4-tuple whose previous connection is still winding down lets
+ * the old connection's late packets land on the new one.  Reusing the
+ * local PORT toward a different peer is fine and is what keeps the
+ * ephemeral range from running out. */
+int tcp_4tuple_in_use(uint32_t local_ip, uint16_t local_port,
+		      uint32_t remote_ip, uint16_t remote_port)
+{
+	uint64_t flags;
+	int used = 0;
+	uint32_t b = tcp_ehash_key(local_port, remote_ip, remote_port);
+
+	spin_lock_irqsave(&tcp_lock, &flags);
+	for (tcp_conn_t *c = g_tcp_ehash[b]; c; c = c->hash_next) {
+		if (c->active && c->state != TCP_STATE_LISTEN &&
+		    c->state != TCP_STATE_CLOSED &&
+		    c->local_port == local_port &&
+		    c->remote_port == remote_port &&
+		    c->remote_ip == remote_ip &&
+		    (c->local_ip == local_ip || c->local_ip == 0 ||
+		     local_ip == 0)) {
+			used = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&tcp_lock, flags);
+	return used;
+}
+
 int tcp_local_port_in_use(uint16_t port)
 {
 	uint64_t flags;

@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h> /* getpagesize() for the msync alignment check */
@@ -121,4 +122,23 @@ int msync(void *addr, size_t length, int flags)
 	}
 	(void)length;
 	return 0;
+}
+
+void *mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...)
+{
+	void *new_address = NULL;
+
+	if (flags & MREMAP_FIXED) {
+		va_list ap;
+		va_start(ap, flags);
+		new_address = va_arg(ap, void *);
+		va_end(ap);
+	}
+	long ret = syscall5(SYS_MREMAP, (long)old_address, (long)old_size,
+			    (long)new_size, (long)flags, (long)new_address);
+	if (ret < 0 && ret > -4096) {
+		errno = (int)-ret;
+		return MAP_FAILED;
+	}
+	return (void *)ret;
 }

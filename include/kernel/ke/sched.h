@@ -2,6 +2,7 @@
 #ifndef _KERNEL_SCHED_H_
 #define _KERNEL_SCHED_H_
 
+#include <kernel/ke/fpu.h>
 #include <kernel/uapi/types.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/signal.h>
@@ -110,6 +111,33 @@ static inline void spinlock_init(spinlock_t *lock, const char *name)
 	lock->name = name;
 }
 
+/* How long spin_lock() waits before it says so.
+ *
+ * A spinlock here spins forever, with interrupts disabled, and prints
+ * nothing.  So a lock that is never released presents as a machine that
+ * stopped -- no message, no oops, nothing to tell it apart from a wedged
+ * device, a stuck display or a task that simply went to sleep and was never
+ * woken.  Every one of those is a different bug, and the console cannot
+ * distinguish them.
+ *
+ * The threshold has to sit above the longest LEGITIMATE hold in this kernel,
+ * which is the SVGA FIFO: svga_fifo_wait_progress() waits for the host to
+ * drain the command FIFO with svga_fifo_lock held and gives up after two
+ * seconds (SVGA_BUSY_TIMEOUT_US).  A `pause' is tens of cycles, so 2^29 of
+ * them is several seconds on any processor this runs on -- comfortably past
+ * that, and far past every other hold, which are all bounded by a handful of
+ * instructions.
+ *
+ * Reporting does not break the lock or change what happens next: the waiter
+ * goes back to spinning.  This only turns a silent freeze into a named one.
+ */
+#define SPIN_STALL_PAUSES (1u << 29)
+
+/* Defined in ke/stack_guard.c, beside the other diagnostics that have to run
+ * from a wedged context: prints the lock's name and the caller chain that
+ * reached it.  Declared here because spin_lock() below is what calls it. */
+void spin_report_stall(spinlock_t *lock);
+
 /* ============================================================================
  * mm_rwsem_t — the address-space read/write semaphore
  *
@@ -153,6 +181,7 @@ static inline void spin_lock(spinlock_t *lock)
 		return;
 	}
 	// SMP mode: actual spinlock with atomic CAS
+	uint32_t spins = 0;
 	while (1) {
 		uint32_t expected = 0;
 		uint32_t desired = 1;
@@ -167,6 +196,12 @@ static inline void spin_lock(spinlock_t *lock)
 		}
 		// Spin with PAUSE instruction (reduces power, improves SMP performance)
 		__asm__ volatile("pause" ::: "memory");
+		/* Long past any hold this kernel takes: say which lock, and
+		 * keep waiting.  See SPIN_STALL_PAUSES. */
+		if (__builtin_expect(++spins == SPIN_STALL_PAUSES, 0)) {
+			spins = 0;
+			spin_report_stall(lock);
+		}
 	}
 }
 
@@ -224,6 +259,20 @@ static inline uint64_t local_irq_save(void)
 			 :
 			 : "memory");
 	return flags;
+}
+
+// Are interrupts on right now?  What a sleeping wait has to ask before it
+// yields: a context switch with interrupts disabled resumes some other task
+// with them still off, and the CPU this one was on can no longer be
+// preempted -- so code that CAN yield must spin instead when the answer is
+// no.  (RFLAGS.IF, bit 9.)
+static inline int irqs_enabled(void)
+{
+	uint64_t flags;
+	__asm__ volatile("pushfq\n\t"
+			 "popq %0"
+			 : "=r"(flags)::"memory");
+	return (flags & (1ULL << 9)) != 0;
 }
 
 // Restore interrupt flags
@@ -350,6 +399,7 @@ typedef enum {
 
 // Memory region for mmap tracking
 struct vfs_file; /* forward — region may pin a file for demand paging */
+struct mm_dirty_ops; /* forward — driver-registered write tracking */
 typedef struct mmap_region {
 	uint64_t start; // Virtual start address
 	uint64_t length; // Length in bytes
@@ -370,6 +420,21 @@ typedef struct mmap_region {
 	 * allocator, shared (not copied) across fork. */
 	bool device;
 	uint64_t device_phys; // physical base backing region start
+	/* Driver object whose pages this device mapping shows (registered
+	 * device nodes and anonymous device files); pinned per record via
+	 * get/put, released when the record goes away.  NULL for the older
+	 * device mappings (/dev/fb0, /dev/shm), which pin through `file'. */
+	void *dev_obj;
+	void (*dev_get)(void *obj);
+	void (*dev_put)(void *obj);
+	/* Dirty tracking for the mapping, when the driver asked for it: the
+	 * device holds a second copy of these pages and has to be told what
+	 * the processor wrote.  Carried on EVERY record describing the
+	 * mapping -- splits and forked copies inherit it with the rest of
+	 * the record -- so the write-fault and unmap paths can reach the
+	 * tracker from whichever record they meet.  NULL for mappings
+	 * nothing watches.  See mm_dirty_ops in mm/memory.h. */
+	const struct mm_dirty_ops *dev_dirty;
 } mmap_region_t;
 
 /* The user's registers as syscall_entry leaves them on the kernel stack.
@@ -810,6 +875,20 @@ typedef struct task {
 	 * pointer. */
 	mmap_region_t *mmap_regions;
 	uint32_t mmap_capacity;
+	/* One past the highest slot ever claimed.  The table only grows -- a
+	 * process that once had four thousand mappings keeps the slots after
+	 * it drops to forty -- and every lookup used to walk the whole
+	 * CAPACITY.  At ~100 bytes a slot that is hundreds of kilobytes read
+	 * per page fault, so a browser got slower the longer it ran and never
+	 * got faster again.  Never lowered, so it can be read without the
+	 * write lock: it is an upper bound, and nothing above it is in use. */
+	uint32_t mmap_hwm;
+	/* The slot that answered the last lookup.  Faults arrive in runs
+	 * inside one mapping -- a heap being touched, a file being read -- so
+	 * testing this first answers most of them without a scan at all.  A
+	 * stale value costs nothing: it is re-checked against the address
+	 * before it is used. */
+	uint32_t mmap_hint;
 	uint64_t mmap_base; // Base address for mmap allocations
 
 	/* Guards this address space: the region table above, mmap_base, brk,
@@ -913,7 +992,7 @@ typedef struct task {
 	 * `fpu_state` must be RECOMPUTED for a forked child: the wholesale
 	 * task copy duplicates the pointer, which would leave the child saving
 	 * its registers into its parent's task_t. */
-	uint8_t fpu_area[512 + 16];
+	uint8_t fpu_area[FPU_STATE_MAX + FPU_STATE_ALIGN];
 	uint8_t *fpu_state;
 
 	/* Hardware debug registers: four watchpoint addresses, the status
@@ -947,6 +1026,29 @@ typedef struct task {
 	volatile int fpu_saved;
 	/* Nesting depth of kernel_fpu_begin(). */
 	volatile int fpu_kdepth;
+	/* A transient pin on this task_t, taken by code that found the task on
+	 * the global task list and must keep dereferencing it AFTER dropping
+	 * that list's lock.
+	 *
+	 * The signal paths need exactly this: sched_kill_thread_group() and
+	 * sys_exit_group() collect their siblings under g_task_list_lock and
+	 * then signal them with the lock dropped, because signal_send() takes
+	 * locks of its own.  A sibling reaped in that window was signalled
+	 * through freed memory -- signal_send() reads `sigstate->sigfd_wq' out
+	 * of the poisoned page and hands the poison to poll_notify_wq(), which
+	 * spin-locks a wait-queue head at 0xfeedfacefeedfad6 and takes a GPF in
+	 * the kernel.  Guarding with task_ptr_ok() before the call, which is
+	 * what this used to do, narrows that window without closing it: the
+	 * task can be freed between the check and the dereference.
+	 *
+	 * `condemned' is the other half.  It is set, under g_dead_thread_lock,
+	 * by the destroy path at the instant it commits, so a pin taken under
+	 * the same lock either wins (the destroy defers) or is refused (the
+	 * caller skips that target).  There is no order in which both can
+	 * believe they own the task_t. */
+	volatile int pin_count;
+	volatile bool condemned;
+
 	/* Set when a leader's destruction was postponed because group_ref was
 	 * still non-zero.  Tells the last thread to hand the leader back to
 	 * dead_thread_queue() instead of leaking it. */
@@ -1232,6 +1334,7 @@ task_t *sched_find_task_by_id_locked(
 	uint32_t pid); // Find task by PID (caller holds g_task_list_lock)
 task_t *sched_task_by_canary(
 	uint64_t canary); // Crash diagnostic: lock-free, __stack_chk_fail only
+
 /* Parent/child list edits.  The list is protected by g_wait_lock, which
  * sys_waitpid() also holds while walking it -- an unlocked edit both corrupts
  * the list and lets a waiter miss the exit it was about to sleep through.
@@ -1267,6 +1370,11 @@ uint32_t sched_get_ppid(task_t *task); // Get parent PID
 void sched_reap_zombies(task_t *parent); // Reap all zombie children of parent
 void sched_mark_task_exited(task_t *task, int status);
 void sched_signal_task(task_t *task, int sig);
+/* Same, naming the process that asked for it: kill(2) and its group forms.
+ * The pair (si_pid, si_uid) it records is the only account of the sender a
+ * sigwaitinfo()/signalfd() reader ever gets.  Pass NULL for the kernel's own
+ * signals (tty ^C, SIGPIPE, hangup), which have no sender. */
+void sched_signal_task_from(task_t *task, int sig, task_t *sender);
 
 // Record the /sbin/init task (PID 1).  Once set, the scheduler protects it
 // from ordinary signals and panics if it ever exits.
@@ -1307,6 +1415,16 @@ void thread_group_remove(task_t *thread);
  * poison -- non-NULL, non-canonical, and fatal to touch with the task-list
  * lock held and interrupts off. */
 bool task_ptr_ok(const task_t *t); // Remove thread from group
+
+/* Keep `t' allocated across a window where no lock protects it.
+ *
+ * pin: call with g_task_list_lock HELD -- being on that list is what proves
+ * the task is alive at the instant of the call.  Returns false if the task is
+ * already committed to destruction, in which case the caller must not touch
+ * it again.  unpin: call with no locks held; the last unpin of a task whose
+ * destruction was postponed hands it back to the reaper. */
+bool sched_task_pin(task_t *t);
+void sched_task_unpin(task_t *t);
 /* Wake every thread of `proc`'s thread group that is parked in waitpid().
  * A wait belongs to the PROCESS -- children hang off the group leader and any
  * thread may reap them -- so a notifier that wakes only the task it recorded as

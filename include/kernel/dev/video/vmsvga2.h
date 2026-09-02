@@ -375,6 +375,12 @@ uint32_t vmsvga2_get_fifo_caps(void); // SVGA_FIFO_CAP_* bits
 uint32_t vmsvga2_get_vram_size(void);
 uint32_t vmsvga2_get_max_width(void);
 uint32_t vmsvga2_get_max_height(void);
+// The resolution the host recommends: its own screen, asked for over the
+// backdoor or read out of the display topology, once, at probe.  Returns <0
+// when the hypervisor gave no answer.  Nothing to do with the boot
+// framebuffer -- this is the display the virtual machine is shown on, not
+// the mode list the virtual firmware happened to advertise.
+int vmsvga2_get_host_preferred(uint32_t *width, uint32_t *height);
 svga_pixel_format_t vmsvga2_get_pixel_format(void);
 
 // Modesetting
@@ -389,6 +395,11 @@ void vmsvga2_update_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void vmsvga2_update_full(void);
 void vmsvga2_fifo_flush(void); // drain all queued commands
 uint32_t vmsvga2_fence_insert(void); // returns fence value (0 if unavail)
+uint32_t vmsvga2_fence_alloc(void);  // allocate only; caller submits the command
+/* Tell this layer that something above it owns a command-buffer channel on
+ * the same device: it then emits no FIFO fences of its own, so the device's
+ * one fence register has a single writer.  See vmsvga2.c. */
+void vmsvga2_set_cmdbuf_owner(int on);
 int vmsvga2_fence_passed(uint32_t fence);
 int vmsvga2_fence_wait(uint32_t fence, uint64_t timeout_us);
 

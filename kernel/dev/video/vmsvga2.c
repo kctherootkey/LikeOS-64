@@ -119,6 +119,16 @@ typedef struct {
 	uint32_t max_height;
 	uint32_t host_bpp;
 
+	// The resolution the host recommends, sampled once at probe; 0 when
+	// the hypervisor did not answer (see svga_query_host_preferred()).
+	uint32_t pref_width;
+	uint32_t pref_height;
+	const char *pref_source; // where the answer came from, for the log
+	// What the topology registers said, kept even when it was discounted,
+	// so the log can say why there was no recommendation.
+	uint32_t topo_width;
+	uint32_t topo_height;
+
 	// CRTC state (current scanout mode)
 	struct {
 		uint32_t width;
@@ -395,8 +405,11 @@ static void svga_fifo_commit(uint32_t bytes)
 	g_svga.reserved_in_place = 0;
 }
 
-// Convenience: reserve, copy, commit, doorbell — one self-contained command.
-static int svga_fifo_write_cmd(const void *cmd, uint32_t bytes)
+// Convenience: reserve, copy, commit — one self-contained command, queued
+// but not announced.  The doorbell is a register write and a register write
+// leaves the virtual machine, so a caller with a run of commands to queue
+// rings once at the end rather than once per command.
+static int svga_fifo_write_cmd_quiet(const void *cmd, uint32_t bytes)
 {
 	uint64_t f;
 	void *dst;
@@ -410,8 +423,17 @@ static int svga_fifo_write_cmd(const void *cmd, uint32_t bytes)
 	kmemcpy(dst, cmd, bytes);
 	svga_fifo_commit(bytes);
 	spin_unlock_irqrestore(&svga_fifo_lock, f);
-	svga_doorbell();
 	return 0;
+}
+
+// ...and the announcing form, which is what a lone command uses.
+static int svga_fifo_write_cmd(const void *cmd, uint32_t bytes)
+{
+	int rc = svga_fifo_write_cmd_quiet(cmd, bytes);
+
+	if (rc == 0)
+		svga_doorbell();
+	return rc;
 }
 
 // ===========================================================================
@@ -424,6 +446,51 @@ static int svga_has_fence(void)
 	       svga_has_fifo_reg(SVGA_FIFO_FENCE);
 }
 
+/* Does something above this layer own a command-buffer channel on the same
+ * device?
+ *
+ * The device has ONE fence register, and an SVGA_CMD_FENCE executed out of a
+ * command buffer advances it exactly as readily as one executed out of the
+ * FIFO.  With two streams emitting fences into one register, a value on it
+ * says "somebody got this far" -- which is not what a waiter asked.  A FIFO
+ * wait then returns because a command-buffer fence went past it, and the
+ * caller unbinds a guest memory region, or reuses a buffer, that the host has
+ * not finished reading.
+ *
+ * So while a command-buffer owner is registered this layer emits NO fences,
+ * and every drain here falls back to SVGA_REG_SYNC -- unambiguous, and what a
+ * device without fence support uses anyway.  The register is then written by
+ * one stream only, which is the invariant the reference driver keeps by never
+ * using the FIFO for commands once it has a command-buffer manager. */
+static int g_cmdbuf_owner;
+
+void vmsvga2_set_cmdbuf_owner(int on)
+{
+	g_cmdbuf_owner = on ? 1 : 0;
+}
+
+/* Allocate a fence number without submitting anything.
+ *
+ * The caller submits SVGA_CMD_FENCE itself, through the channel its other
+ * commands went down.  That matters once command buffers carry the work:
+ * a fence written to the FIFO orders against the FIFO, not against a
+ * command-buffer context, so it can pass while the batches it was meant to
+ * follow are still being executed. */
+uint32_t vmsvga2_fence_alloc(void)
+{
+	uint32_t fence;
+	uint64_t f;
+
+	if (!g_svga.present || !svga_has_fence())
+		return 0;
+	spin_lock_irqsave(&svga_fifo_lock, &f);
+	fence = ++g_svga.next_fence;
+	if (fence == 0)
+		fence = g_svga.next_fence = 1;
+	spin_unlock_irqrestore(&svga_fifo_lock, f);
+	return fence;
+}
+
 uint32_t vmsvga2_fence_insert(void)
 {
 	uint32_t fence;
@@ -431,7 +498,9 @@ uint32_t vmsvga2_fence_insert(void)
 	uint64_t f;
 	void *dst;
 
-	if (!g_svga.present || !svga_has_fence())
+	/* 0 means "no fence for this stream": every caller then drains with
+	 * SVGA_REG_SYNC instead.  See g_cmdbuf_owner. */
+	if (!g_svga.present || !svga_has_fence() || g_cmdbuf_owner)
 		return 0;
 
 	spin_lock_irqsave(&svga_fifo_lock, &f);
@@ -568,6 +637,8 @@ void vmsvga2_fifo_flush(void)
 		(void)svga_legacy_sync();
 }
 
+static void vmsvga2_hw_irq_notify(uint32_t status);
+
 // ===========================================================================
 // IRQ handling
 // ===========================================================================
@@ -593,6 +664,7 @@ int vmsvga2_irq(void)
 	if (status & (SVGA_IRQFLAG_ANY_FENCE | SVGA_IRQFLAG_FENCE_GOAL |
 		      SVGA_IRQFLAG_FIFO_PROGRESS))
 		sched_wake_channel((void *)&svga_fence_waiters);
+	vmsvga2_hw_irq_notify(status);
 	return 1;
 }
 
@@ -2115,6 +2187,145 @@ int vmsvga2_get_edid(uint8_t *buf, uint32_t len)
 }
 
 // ===========================================================================
+// Host-preferred ("recommended") resolution
+// ===========================================================================
+//
+// What the guest should come up in is the host's business, and the boot
+// firmware is the wrong place to ask.  The GOP mode list is whatever the
+// virtual firmware chose to advertise -- a handful of stock sizes, usually
+// topping out well below the panel -- and it says nothing about the display
+// the virtual machine's window is actually on.  The hypervisor knows, and
+// answers in one of two ways:
+//
+//   1. The backdoor: a port-I/O protocol on 0x5658 entered with 'VMXh' in
+//      EAX (the same channel kernel/dev/gpu/vmwgfx/vmw_msg.c speaks for
+//      RPCI, here in its simplest single-command form).  Command 17 returns
+//      the host's screen size packed into EAX -- width in the high half,
+//      height in the low.  This is the size the VMware tools call the
+//      recommended resolution: the host's panel, not the guest's window.
+//
+//   2. The display topology registers, when the device advertises them.  At
+//      reset, display 0 holds the layout the host wants the guest to come up
+//      in, which on a single-monitor guest is the same answer.
+//
+// Both are read once, at probe, before anything programs a mode: the
+// topology registers carry the host's layout only until the guest writes a
+// topology of its own into them, after which they read back the guest's.
+//
+// Neither source exists everywhere -- QEMU answers no screen-size command
+// and hands back the magic for commands it does not know -- so both are
+// best-effort, and every answer is bounds-checked before it is believed.
+// Nothing else depends on getting one: without an answer the driver falls
+// back to its built-in preference list.
+
+#define SVGA_BACKDOOR_PORT 0x5658
+#define SVGA_BACKDOOR_MAGIC 0x564D5868U /* 'VMXh' */
+#define SVGA_BACKDOOR_GETSCREENSIZE 17
+
+// Plausibility bounds for a screen size.  Anything outside them is a host
+// that did not answer -- a bus reading back all ones, an echoed magic, a
+// register that was never implemented -- rather than a display to configure.
+#define SVGA_PREF_MIN_WIDTH 640U
+#define SVGA_PREF_MIN_HEIGHT 480U
+#define SVGA_PREF_MAX_DIM 16384U
+
+static int svga_pref_plausible(uint32_t w, uint32_t h)
+{
+	return w >= SVGA_PREF_MIN_WIDTH && h >= SVGA_PREF_MIN_HEIGHT &&
+	       w <= SVGA_PREF_MAX_DIM && h <= SVGA_PREF_MAX_DIM;
+}
+
+// The host's screen size over the backdoor.  Only ever called with the SVGA
+// II adapter present, so port 0x5658 belongs to the hypervisor and not to
+// some unrelated ISA device.
+static int svga_backdoor_screen_size(uint32_t *w, uint32_t *h)
+{
+	uint32_t eax = SVGA_BACKDOOR_MAGIC;
+	uint32_t ebx = 0;
+	uint32_t ecx = SVGA_BACKDOOR_GETSCREENSIZE;
+	uint32_t edx = SVGA_BACKDOOR_PORT;
+
+	__asm__ __volatile__("inl %%dx, %%eax"
+			     : "+a"(eax), "+b"(ebx), "+c"(ecx), "+d"(edx)
+			     :
+			     : "memory");
+
+	// All ones: the protocol's refusal, and also what an unclaimed port
+	// reads back.  The magic returned unchanged: a hypervisor that does
+	// not implement this command.
+	if (eax == 0xFFFFFFFFU || eax == SVGA_BACKDOOR_MAGIC)
+		return -1;
+	*w = eax >> 16;
+	*h = eax & 0xFFFFU;
+	return 0;
+}
+
+// The host's layout for display 0, before any guest modeset has overwritten
+// the topology registers.
+//
+// Discounted when it merely repeats the mode the device is already in.  The
+// topology registers are guest-writable, and on a UEFI guest the firmware
+// has already programmed this device through the very same register file to
+// put its GOP framebuffer up -- so a topology equal to the current scanout
+// is the firmware's choice being read back, which is precisely the answer
+// this whole path exists not to take.  The backdoor is not second-guessed
+// this way: there the host is unambiguously the one talking.
+static int svga_topology_screen_size(uint32_t *w, uint32_t *h)
+{
+	uint32_t width, height;
+
+	if (!(g_svga.caps & SVGA_CAP_DISPLAY_TOPOLOGY))
+		return -1;
+	svga_write_reg(SVGA_REG_DISPLAY_ID, 0);
+	width = svga_read_reg(SVGA_REG_DISPLAY_WIDTH);
+	height = svga_read_reg(SVGA_REG_DISPLAY_HEIGHT);
+	if (width == 0 || height == 0)
+		return -1;
+	g_svga.topo_width = width;
+	g_svga.topo_height = height;
+	if (width == svga_read_reg(SVGA_REG_WIDTH) &&
+	    height == svga_read_reg(SVGA_REG_HEIGHT))
+		return -1;
+	*w = width;
+	*h = height;
+	return 0;
+}
+
+// Poll both sources once and remember the first plausible answer.
+static void svga_query_host_preferred(void)
+{
+	uint32_t w = 0, h = 0;
+
+	g_svga.pref_width = 0;
+	g_svga.pref_height = 0;
+	g_svga.pref_source = NULL;
+
+	if (svga_backdoor_screen_size(&w, &h) == 0 &&
+	    svga_pref_plausible(w, h)) {
+		g_svga.pref_source = "host screen";
+	} else if (svga_topology_screen_size(&w, &h) == 0 &&
+		   svga_pref_plausible(w, h)) {
+		g_svga.pref_source = "host topology";
+	} else {
+		return;
+	}
+	g_svga.pref_width = w;
+	g_svga.pref_height = h;
+}
+
+int vmsvga2_get_host_preferred(uint32_t *width, uint32_t *height)
+{
+	if (!g_svga.present || g_svga.pref_width == 0 ||
+	    g_svga.pref_height == 0)
+		return -1;
+	if (width)
+		*width = g_svga.pref_width;
+	if (height)
+		*height = g_svga.pref_height;
+	return 0;
+}
+
+// ===========================================================================
 // Device bring-up
 // ===========================================================================
 
@@ -2246,6 +2457,11 @@ int vmsvga2_init(void)
 	if (WARN_ON(g_svga.vram_size == 0))
 		return -1;
 
+	// Ask the host what it wants us in, while the answer is still the
+	// host's: the topology registers hold its layout only until a guest
+	// modeset writes over them, and that happens further down this boot.
+	svga_query_host_preferred();
+
 	// The framebuffer BAR lives below 4 GB and the direct map spans at
 	// least 16 GB, so the direct-map alias is always available.
 	BUG_ON(!is_phys_in_direct_map(g_svga.fb_phys));
@@ -2283,6 +2499,17 @@ int vmsvga2_init(void)
 	kprintf("svga2: caps=0x%x fifo_caps=0x%x max=%ux%u host_bpp=%u\n",
 		g_svga.caps, g_svga.fifo_caps, g_svga.max_width,
 		g_svga.max_height, g_svga.host_bpp);
+	if (g_svga.pref_width)
+		kprintf("svga2: host recommends %ux%u (%s)\n",
+			g_svga.pref_width, g_svga.pref_height,
+			g_svga.pref_source);
+	else if (g_svga.topo_width)
+		kprintf("svga2: host recommends nothing: topology %ux%u only "
+			"mirrors the firmware's mode\n",
+			g_svga.topo_width, g_svga.topo_height);
+	else
+		kprintf("svga2: host recommends nothing: no backdoor answer, "
+			"no topology\n");
 
 	return 0;
 }
@@ -2300,48 +2527,125 @@ int vmsvga2_init(void)
 #define SCREEN_MAX_HEIGHT 0xFFFFFFFFU
 #endif
 
-// Boot-time best-fit mode selection.  Uses the same preferred-resolution
-// table (and SCREEN_LARGE build define) as the bootloader's GOP mode
-// selection, bounded by the device's maximum geometry and VRAM.  Takes over
-// the display from the GOP framebuffer: console rendering continues through
-// the same fb double-buffer path, with dirty flushes forwarded to the host
-// as screen-update commands via the fb flush hook.
+// What SCREEN_SIZE asks for: the top of the mode list, not the whole of it.
+// The list below reaches higher than either of these so that a device which
+// can only do a little still finds the best it can do; the ceiling is what
+// keeps a device which can do a lot from coming up larger than the build
+// asked for.
+#if defined(SCREEN_LARGE)
+#define SCREEN_PREF_MAX_WIDTH 1920U
+#define SCREEN_PREF_MAX_HEIGHT 1200U
+#else
+#define SCREEN_PREF_MAX_WIDTH 1280U
+#define SCREEN_PREF_MAX_HEIGHT 800U
+#endif
+
+// Why a mode cannot be used, or NULL when it can.
+//
+// The bounds are the ones the reference driver applies to this device: the
+// geometry the adapter reports it can scan out, and the memory the scan-out
+// reads from.  For this console that memory is the framebuffer aperture --
+// it puts pixels in VRAM and the device reads them from there -- so VRAM is
+// the honest limit here, and a small graphics-memory setting shows up as a
+// small screen no matter what the panel in front of the user can do.  (The
+// display manager scans out of guest memory instead and is bounded by
+// something else entirely; see kernel/dev/gpu/vmwgfx/vmw_drv.c.)
+static const char *svga_mode_reject(uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0)
+		return "empty";
+	if (w > SCREEN_MAX_WIDTH || h > SCREEN_MAX_HEIGHT)
+		return "above the build's MAX_SCREEN_SIZE";
+	if (w > g_svga.max_width || h > g_svga.max_height)
+		return "beyond the geometry the adapter reports";
+	if ((uint64_t)w * h * 4 > g_svga.vram_size)
+		return "more video memory than the adapter has";
+	return NULL;
+}
+
+static int svga_mode_usable(uint32_t w, uint32_t h)
+{
+	return svga_mode_reject(w, h) == NULL;
+}
+
+// ...and is one the build would pick on its own.  SCREEN_SIZE bounds what
+// the mode list may offer; it does not overrule the host, which knows what
+// it is showing this guest on.  MAX_SCREEN_SIZE, which does overrule it, is
+// checked in svga_mode_reject() above and so applies to both.
+static int svga_mode_preferable(uint32_t w, uint32_t h)
+{
+	return svga_mode_usable(w, h) && w <= SCREEN_PREF_MAX_WIDTH &&
+	       h <= SCREEN_PREF_MAX_HEIGHT;
+}
+
+// Boot-time mode selection.  The host's own recommendation comes first --
+// see the host-preferred section above -- so the mode the guest comes up in
+// is the one the display in front of the user actually wants, whether or not
+// the boot firmware ever advertised it: the GOP mode list bounds what the
+// bootloader could pick, and nothing here.  Only when the hypervisor has no
+// answer does this fall back to the built-in preference table, which is the
+// same one (and the same SCREEN_LARGE build define) the bootloader walks.
+//
+// Either way the choice is bounded by the build-time ceiling, the device's
+// maximum geometry and VRAM.  Takes over the display from the GOP
+// framebuffer: console rendering continues through the same fb double-buffer
+// path, with dirty flushes forwarded to the host as screen-update commands
+// via the fb flush hook.
 void vmsvga2_setup_boot_mode(void)
 {
+	// The standard mode list, largest first: the same set the reference
+	// driver offers on a connector of this device, rather than the
+	// handful of sizes the boot firmware happened to advertise.  The
+	// first entry that clears svga_mode_reject() wins, so a device that
+	// can only do a little still gets the best it can do -- which on a
+	// machine with little graphics memory is a mode no short list would
+	// have contained.
 	static const struct {
 		uint32_t width;
 		uint32_t height;
-	} preferred[] = {
-#if defined(SCREEN_LARGE)
-		{ 1920, 1200 }, { 1920, 1080 }, { 1280, 800 },
-		{ 1280, 768 },	{ 1024, 768 },
-#else
-		{ 1280, 800 },	{ 1280, 768 },	{ 1024, 768 },
-#endif
+	} builtin[] = {
+		{ 2560, 1600 }, { 2560, 1440 }, { 1920, 1440 },
+		{ 1920, 1200 }, { 1920, 1080 }, { 1856, 1392 },
+		{ 1792, 1344 }, { 1680, 1050 }, { 1600, 1200 },
+		{ 1600, 900 },	{ 1440, 900 },	{ 1400, 1050 },
+		{ 1366, 768 },	{ 1360, 768 },	{ 1280, 1024 },
+		{ 1280, 960 },	{ 1280, 800 },	{ 1280, 768 },
+		{ 1280, 720 },	{ 1152, 864 },	{ 1024, 768 },
+		{ 800, 600 },	{ 640, 480 },
 	};
 	framebuffer_info_t fi;
 	uint32_t w = 0, h = 0;
+	const char *source = "fallback";
 	uint32_t fence;
 	unsigned int i;
 
 	if (!g_svga.present)
 		return;
 
-	for (i = 0; i < sizeof(preferred) / sizeof(preferred[0]); i++) {
-		uint64_t need = (uint64_t)preferred[i].width *
-				preferred[i].height * 4;
-		if (preferred[i].width <= SCREEN_MAX_WIDTH &&
-		    preferred[i].height <= SCREEN_MAX_HEIGHT &&
-		    preferred[i].width <= g_svga.max_width &&
-		    preferred[i].height <= g_svga.max_height &&
-		    need <= g_svga.vram_size) {
-			w = preferred[i].width;
-			h = preferred[i].height;
-			break;
+	// What the host recommends, if it said and if it fits.  A ceiling the
+	// build asked for still wins: MAX_SCREEN_SIZE is an explicit "never
+	// above this", not a guess for the host to correct.
+	if (vmsvga2_get_host_preferred(&w, &h) == 0) {
+		const char *why = svga_mode_reject(w, h);
+		if (!why) {
+			source = g_svga.pref_source;
+		} else {
+			kprintf("svga2: host recommends %ux%u, declined: %s\n",
+				w, h, why);
+			w = 0;
+			h = 0;
+		}
+	}
+
+	for (i = 0; w == 0 && i < sizeof(builtin) / sizeof(builtin[0]); i++) {
+		if (svga_mode_preferable(builtin[i].width, builtin[i].height)) {
+			w = builtin[i].width;
+			h = builtin[i].height;
+			source = "mode list";
 		}
 	}
 	if (w == 0) {
-		// Nothing in the table fits (tiny VRAM, or a ceiling below every
+		// Nothing in the list fits (tiny VRAM, or a ceiling below every
 		// entry): last resort, and small enough that the ceiling is not
 		// worth honouring at the price of having no display at all.
 		w = 640;
@@ -2384,8 +2688,9 @@ void vmsvga2_setup_boot_mode(void)
 		(void)svga_legacy_sync();
 	svga_report_errors();
 
-	kprintf("svga2: display %ux%ux%u pitch=%u (%s)\n", g_svga.crtc.width,
-		g_svga.crtc.height, g_svga.crtc.bpp, g_svga.crtc.pitch,
+	kprintf("svga2: display %ux%ux%u pitch=%u from %s (%s)\n",
+		g_svga.crtc.width, g_svga.crtc.height, g_svga.crtc.bpp,
+		g_svga.crtc.pitch, source,
 		svga_has_fence() ? "fenced" : "sync-only");
 }
 
@@ -2397,4 +2702,227 @@ void vmsvga2_shutdown(void)
 	svga_write_reg(SVGA_REG_ENABLE, 0);
 	g_svga.active = 0;
 	g_svga.crtc.enabled = 0;
+}
+
+// ===========================================================================
+// Exports for the display-manager (DRM-style) driver in kernel/dev/gpu.
+//
+// That driver owns the device's 3D/KMS interface to userspace; this file
+// keeps owning the hardware access primitives (register file, FIFO, fence
+// IRQ) and the boot-time console framebuffer.  The two meet here.
+// ===========================================================================
+
+#include <kernel/dev/video/vmsvga2_hw.h>
+#include <kernel/dev/video/fbdev.h>
+
+int vmsvga2_hw_present(void)
+{
+	return g_svga.present;
+}
+
+const pci_device_t *vmsvga2_hw_pci(void)
+{
+	return g_svga.present ? g_svga.pci : NULL;
+}
+
+uint32_t vmsvga2_hw_read_reg(uint32_t index)
+{
+	return svga_read_reg(index);
+}
+
+void vmsvga2_hw_write_reg(uint32_t index, uint32_t value)
+{
+	svga_write_reg(index, value);
+}
+
+int vmsvga2_hw_has_fifo_cap(uint32_t cap)
+{
+	return svga_has_fifo_cap(cap);
+}
+
+int vmsvga2_hw_has_fifo_reg(uint32_t reg)
+{
+	return svga_has_fifo_reg(reg);
+}
+
+uint32_t vmsvga2_hw_fifo_reg(uint32_t reg)
+{
+	return svga_has_fifo_reg(reg) ? g_svga.fifo[reg] : 0;
+}
+
+void vmsvga2_hw_geometry(struct vmsvga2_hw_geometry *g)
+{
+	g->fb_phys = g_svga.fb_phys;
+	g->fb_virt = g_svga.fb_virt;
+	g->vram_size = g_svga.vram_size;
+	g->max_width = g_svga.max_width;
+	g->max_height = g_svga.max_height;
+	g->width = g_svga.crtc.width;
+	g->height = g_svga.crtc.height;
+	g->bpp = g_svga.crtc.bpp;
+	g->pitch = g_svga.crtc.pitch;
+	g->fb_offset = g_svga.crtc.fb_offset;
+	g->caps = g_svga.caps;
+	g->fifo_caps = g_svga.fifo_caps;
+	g->fifo_size = g_svga.fifo_size;
+	g->irq_enabled = g_svga.irq_enabled;
+}
+
+/* One command of `bytes' from `data', atomically. */
+int vmsvga2_hw_fifo_submit(const void *data, uint32_t bytes)
+{
+	if (!g_svga.present || !g_svga.fifo)
+		return -1;
+	if (bytes & 3)
+		return -1;
+	if (bytes > g_svga.bounce_size && bytes > g_svga.fifo_size / 2)
+		return -1;
+	return svga_fifo_write_cmd(data, bytes);
+}
+
+/* The same, queued but not announced: the caller has a run of commands and
+ * finishes it with vmsvga2_hw_doorbell().  One trap out of the virtual
+ * machine for the run instead of one per damage rectangle. */
+int vmsvga2_hw_fifo_submit_batch(const void *data, uint32_t bytes)
+{
+	if (!g_svga.present || !g_svga.fifo)
+		return -1;
+	if (bytes & 3)
+		return -1;
+	if (bytes > g_svga.bounce_size && bytes > g_svga.fifo_size / 2)
+		return -1;
+	return svga_fifo_write_cmd_quiet(data, bytes);
+}
+
+/* A reservation the caller fills in place; must be followed by a commit
+ * of the same size with the lock still held.  The lock is taken here and
+ * released by the commit (or the abort). */
+static uint64_t g_hw_fifo_flags;
+
+void *vmsvga2_hw_fifo_reserve(uint32_t bytes)
+{
+	void *dst;
+
+	if (!g_svga.present || !g_svga.fifo || (bytes & 3))
+		return NULL;
+	if (bytes > g_svga.bounce_size && bytes > g_svga.fifo_size / 2)
+		return NULL;
+	spin_lock_irqsave(&svga_fifo_lock, &g_hw_fifo_flags);
+	dst = svga_fifo_reserve(bytes);
+	if (!dst)
+		spin_unlock_irqrestore(&svga_fifo_lock, g_hw_fifo_flags);
+	return dst;
+}
+
+void vmsvga2_hw_fifo_commit(uint32_t bytes)
+{
+	svga_fifo_commit(bytes);
+	spin_unlock_irqrestore(&svga_fifo_lock, g_hw_fifo_flags);
+	svga_doorbell();
+}
+
+void vmsvga2_hw_fifo_abort(void)
+{
+	g_svga.reserved_bytes = 0;
+	g_svga.reserved_in_place = 0;
+	spin_unlock_irqrestore(&svga_fifo_lock, g_hw_fifo_flags);
+}
+
+void vmsvga2_hw_doorbell(void)
+{
+	svga_doorbell();
+}
+
+uint32_t vmsvga2_hw_fence_current(void)
+{
+	return svga_has_fence() ? g_svga.fifo[SVGA_FIFO_FENCE] : 0;
+}
+
+int vmsvga2_hw_has_fence(void)
+{
+	return svga_has_fence();
+}
+
+void vmsvga2_hw_set_fence_goal(uint32_t goal)
+{
+	if (!g_svga.irq_enabled || !svga_has_fifo_reg(SVGA_FIFO_FENCE_GOAL))
+		return;
+	g_svga.fifo[SVGA_FIFO_FENCE_GOAL] = goal;
+	svga_write_reg(SVGA_REG_IRQMASK,
+		       SVGA_IRQFLAG_ANY_FENCE | SVGA_IRQFLAG_FENCE_GOAL);
+	svga_doorbell();
+}
+
+/* The fence interrupt: one consumer beyond this file. */
+static vmsvga2_hw_irq_cb_t g_hw_irq_cb;
+
+void vmsvga2_hw_set_irq_callback(vmsvga2_hw_irq_cb_t cb)
+{
+	g_hw_irq_cb = cb;
+}
+
+/* Called from vmsvga2_irq() after the status has been acknowledged. */
+static void vmsvga2_hw_irq_notify(uint32_t status)
+{
+	vmsvga2_hw_irq_cb_t cb = g_hw_irq_cb;
+
+	if (cb)
+		cb(status);
+}
+
+/* Display ownership hand-over.  While the display-manager driver's master
+ * holds the screen the console must not paint (see fbdev_display_owned);
+ * on release the console is redrawn in full and the boot mode restored. */
+static int g_hw_display_taken;
+
+void vmsvga2_hw_display_take(void)
+{
+	if (g_hw_display_taken)
+		return;
+	g_hw_display_taken = 1;
+	fbdev_opened();
+}
+
+void vmsvga2_hw_display_release(void)
+{
+	if (!g_hw_display_taken)
+		return;
+	g_hw_display_taken = 0;
+	svga_write_reg(SVGA_REG_TRACES, 1);
+	fbdev_closed();
+}
+
+int vmsvga2_hw_display_taken(void)
+{
+	return g_hw_display_taken;
+}
+
+/* Mode set for the display-manager, device only.
+ *
+ * The console does NOT follow.  For a console that is itself a client of
+ * the display manager (drm_console.c) its framebuffer is a buffer object,
+ * not this device's video memory, and cascading a client's mode through
+ * console_reinit_framebuffer() would move the console back onto video
+ * memory that nothing is scanning out -- in the middle of somebody else's
+ * session, at that. */
+int vmsvga2_hw_set_mode_device(uint32_t width, uint32_t height)
+{
+	return vmsvga2_set_mode(width, height, 32);
+}
+
+/* Mode set for the display-manager: the console's framebuffer geometry
+ * follows (console_reinit_framebuffer), as the fbdev ioctl path does. */
+int vmsvga2_hw_set_mode(uint32_t width, uint32_t height)
+{
+	framebuffer_info_t fi;
+	int rc = vmsvga2_set_mode(width, height, 32);
+
+	if (rc != 0)
+		return rc;
+	if (vmsvga2_get_info(&fi) != 0)
+		return -1;
+	/* Cascade the new geometry through fb/console/tty (SIGWINCH). */
+	if (console_reinit_framebuffer(&fi) != 0)
+		return -1;
+	return 0;
 }

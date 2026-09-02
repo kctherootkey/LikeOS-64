@@ -1,5 +1,5 @@
 // LikeOS-64 Hardware Abstraction Layer - Visual Scrollbar Interface
-// Linux Gnome Chrome-style scrollbar rendering system
+// Desktop-browser-style scrollbar rendering system
 
 #ifndef _KERNEL_SCROLLBAR_H_
 #define _KERNEL_SCROLLBAR_H_
@@ -16,7 +16,7 @@
 #define SCROLLBAR_MARGIN 3 // 3 pixel margin from edge
 #define SCROLLBAR_MIN_HEIGHT 60 // Minimum scrollbar height
 
-// Color scheme (Linux Gnome Chrome Style)
+// Color scheme (the desktop-browser scrollbar look)
 #define SCROLLBAR_TRACK_COLOR 0xF5F5F5 // Very light gray background
 #define SCROLLBAR_BUTTON_NORMAL 0xE0E0E0 // Light gray button
 #define SCROLLBAR_BUTTON_HOVER 0xD0D0D0 // Slightly darker on hover

@@ -444,10 +444,17 @@ void sys_exit_group(uint64_t status)
 
 		do {
 			if (t != cur && !t->has_exited) {
-				if (ntargets < capacity)
-					targets[ntargets++] = t;
-				else
+				/* Pinned while the task-list lock still proves
+				 * the pointer names a live task -- see
+				 * sched_task_pin().  One that refuses the pin
+				 * is already being destroyed and needs no
+				 * signal. */
+				if (ntargets < capacity) {
+					if (sched_task_pin(t))
+						targets[ntargets++] = t;
+				} else {
 					overflow++;
+				}
 			}
 			t = t->thread_group_next;
 			/* Same guard as sched_kill_thread_group: a broken ring
@@ -468,8 +475,25 @@ void sys_exit_group(uint64_t status)
 	 * which group_exiting is supposed to prevent. */
 	WARN_ON(overflow != 0);
 
-	for (int i = 0; i < ntargets; i++)
+	/* These pointers were collected under g_task_list_lock and are used
+	 * after it is dropped, which is the only way they can be used at all
+	 * -- sched_signal_task takes locks of its own.  A sibling reaped in
+	 * that window used to leave a freed task_t here, and signal_send()
+	 * walked straight into it: the crash was a `lock cmpxchg' on
+	 * 0xfeedfacefeedfad6 -- the page-poison pattern plus the offset of the
+	 * lock inside the signalfd wait queue it read out of dead memory.  A
+	 * general protection fault in the kernel, so the machine rather than
+	 * the process.
+	 *
+	 * A task_ptr_ok() test immediately before the call, which is what
+	 * stood here, cannot fix that: it is a check, and the task can still
+	 * be freed between it and the dereference inside signal_send().  Each
+	 * target now carries a PIN taken during the collection above, so the
+	 * task_t cannot be freed until the matching unpin below. */
+	for (int i = 0; i < ntargets; i++) {
 		sched_signal_task(targets[i], SIGKILL);
+		sched_task_unpin(targets[i]);
+	}
 
 	if (targets != stack_targets)
 		kfree(targets);

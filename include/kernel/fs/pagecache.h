@@ -193,6 +193,8 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty);
 // Check memory pressure and evict if necessary.
 // Called from the page allocator when free pages are low.
 void pagecache_reclaim_if_needed(void);
+/* Ask the writeback thread to run, so dirty pages become reclaimable. */
+void pagecache_request_writeback(void);
 
 // --- Invalidation ---
 

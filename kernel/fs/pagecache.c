@@ -414,10 +414,25 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 
 	unsigned long reclaimed = 0;
 	unsigned long scanned = 0;
-	// Limit scan to 2 * total_pages to avoid infinite loops
-	unsigned long max_scan = pc_stat_total_pages * 2;
+	/* Bound the scan by what was ASKED FOR, not by how big the cache is.
+	 *
+	 * The loop below runs with pc_lru_lock held and interrupts disabled
+	 * from end to end -- a clean page is evicted without ever dropping it.
+	 * So a limit proportional to the cache is a period with interrupts off
+	 * proportional to the cache, and the moment that matters most is the
+	 * worst one for it: when memory is short the cache is at its largest
+	 * and its least reclaimable, so the scan runs to its limit every time
+	 * and finds almost nothing.  Hundreds of thousands of entries walked
+	 * per call, on every call, reads as the machine having stopped.
+	 *
+	 * The reference reclaims in small batches for this reason and leaves
+	 * the caller to come back for more, which is cheap because the clock
+	 * hand keeps its place between calls. */
+	unsigned long max_scan = nr_pages * 8;
 	if (max_scan < 64)
 		max_scan = 64;
+	if (max_scan > pc_stat_total_pages * 2)
+		max_scan = pc_stat_total_pages * 2;
 
 	uint64_t lru_flags;
 	spin_lock_irqsave(&pc_lru_lock, &lru_flags);
@@ -595,6 +610,15 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 // ============================================================================
 // Memory pressure check
 // ============================================================================
+
+/* Ask the writeback thread to run.  Reclaim can only drop CLEAN pages, so a
+ * cache full of dirty ones has nothing to give until they have been written;
+ * this is how a caller that just failed an allocation says so. */
+void pagecache_request_writeback(void)
+{
+	if (pc_initialized)
+		pc_writeback_pending = 1;
+}
 
 void pagecache_reclaim_if_needed(void)
 {

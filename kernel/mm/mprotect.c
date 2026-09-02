@@ -98,8 +98,7 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 				tail->start = end;
 				tail->length = r_end - end;
 				tail->offset = r->offset + (end - r->start);
-				if (tail->file)
-					vfs_incref(tail->file);
+				mm_region_ref_hold(tail);
 				tail->in_use = true;
 				r->length = end - r->start;
 				r_end = end;
@@ -118,8 +117,7 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 				mid->length = r_end - addr;
 				mid->offset = r->offset + (addr - r->start);
 				mid->prot = prot;
-				if (mid->file)
-					vfs_incref(mid->file);
+				mm_region_ref_hold(mid);
 				mid->in_use = true;
 				r->length = addr - r->start;
 			} else {
@@ -145,14 +143,28 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 		{
 			uint64_t *pte =
 				mm_get_page_table_from_pml4(pml4, vaddr, false);
-			if (pte && (*pte & PAGE_DEVICE))
+			if (pte && (*pte & PAGE_DEVICE)) {
 				page_flags |= PAGE_DEVICE |
 					      (*pte & (PAGE_WRITE_THROUGH |
 						       PAGE_CACHE_DISABLE));
+				/* An entry whose write bit the dirty tracker
+				 * is holding keeps that state: the bit is the
+				 * tracker's to give back (through the write
+				 * fault, which records the page first), not
+				 * this call's.  Restoring it here would let
+				 * writes through with nothing recording them. */
+				if ((*pte & PAGE_DIRTY_TRACKED) &&
+				    !(*pte & PAGE_WRITABLE)) {
+					page_flags |= PAGE_DIRTY_TRACKED;
+					page_flags &= ~(uint64_t)PAGE_WRITABLE;
+				} else if (*pte & PAGE_DIRTY_TRACKED) {
+					page_flags |= PAGE_DIRTY_TRACKED;
+				}
+			}
 		}
 
 		// Remap with new protection
-		mm_map_page_in_address_space(pml4, vaddr, phys, flags);
+		mm_map_page_in_address_space(pml4, vaddr, phys, page_flags);
 	}
 
 	// Flush TLB for modified pages on local CPU

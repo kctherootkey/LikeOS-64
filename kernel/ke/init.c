@@ -1,4 +1,10 @@
 // LikeOS-64 Kernel Initialization
+void vmwgfx_init(void);
+void drm_console_start_worker(void);
+#include <kernel/fs/sysfs.h>
+void procfs_init(void);
+#include <kernel/ke/hrtimer.h>
+#include <kernel/ke/fpu.h>
 #include <kernel/io/console.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/interrupt.h>
@@ -170,6 +176,10 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 	mm_enable_nx();
 	mm_remap_kernel_with_nx();
 	mm_enable_smep_smap();
+	/* Extended register state: pick XCR0 and size the per-task save
+	 * image before the first task_t is built around it. */
+	fpu_init_bsp();
+	fpu_init_cpu();
 
 	// Request max-performance CPU frequency behavior (enable HWP, EPP=0) so the
 	// core does not linger in a low idle P-state.  Per-CPU MSR; APs do the same
@@ -219,6 +229,10 @@ __no_stack_protector void continue_system_startup(void)
 	shm_init();
 	devfs_init();
 	vfs_register_devfs(devfs_get_ops());
+	/* The sysfs-style device tree and /proc: read-only views of the
+	 * PCI table and the task list. */
+	sysfs_init();
+	procfs_init();
 	tty_init();
 
 	static scrollbar_t system_scrollbar;
@@ -240,6 +254,7 @@ __no_stack_protector void continue_system_startup(void)
 	acpi_pm_init();
 	timer_init_hpet(); // Prefer HPET for precise wall-clock timing if available
 	timer_init_pmtimer(); // Probe ACPI PM Timer for sub-tick interpolation
+	hrtimer_init_hw(); // One HPET comparator for nanosecond deadlines
 
 	// Detect x2APIC mode early so lapic_eoi() works for all drivers.
 	// Without this, MMIO-based EOI is a no-op in x2APIC mode and
@@ -249,8 +264,11 @@ __no_stack_protector void continue_system_startup(void)
 	// VMware SVGA II display adapter (QEMU -vga vmware, VMware,
 	// VirtualBox VMSVGA).  On failure or absence the GOP framebuffer
 	// path set up above keeps running unchanged.
-	if (vmsvga2_init() == 0)
+	if (vmsvga2_init() == 0) {
 		vmsvga2_setup_boot_mode();
+		/* The display-manager interface on the same device. */
+		vmwgfx_init();
+	}
 
 	xhci_boot_init(&g_xhci_boot);
 	usbhid_init();
@@ -267,6 +285,10 @@ __no_stack_protector void continue_system_startup(void)
 
 	futex_init();
 	sched_init();
+	/* The console's display-manager client can have a thread now: it went
+	 * onto KMS back with the display driver, before there was a scheduler
+	 * to give it one, and has been pushing its updates inline since. */
+	drm_console_start_worker();
 
 	/* The primordial task established by sched_init() is the sole root origin
 	 * of the credential system (real/effective/saved uid/gid all 0).  Every

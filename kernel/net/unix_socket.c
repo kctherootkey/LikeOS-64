@@ -983,8 +983,8 @@ static int unix_send_record(unix_socket_t *us, unix_socket_t *peer,
 		}
 		/* Park on the peer, exactly as the stream path does; the
 		 * reader wakes us after draining. */
-		snd_cur->state = TASK_BLOCKED;
 		snd_cur->wait_channel = peer;
+		snd_cur->state = TASK_BLOCKED;
 		spin_unlock_irqrestore(&peer->lock, irqflags);
 		sched_schedule();
 		snd_cur->wait_channel = NULL;
@@ -1218,10 +1218,39 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 		if (n == chunk)
 			continue; /* chunk placed; keep going */
 
-		/* Ring is full. */
-		if (sent > 0)
-			break; /* partial write — report what we sent */
+		/* Ring is full.
+		 *
+		 * A BLOCKING stream socket must not stop here.  It used to:
+		 * once anything had been placed, a full ring ended the call
+		 * and the count written was returned, which is a short write
+		 * on a socket whose caller was never told to expect one.
+		 * POSIX permits that; Linux does not do it, and the ports in
+		 * this tree are written against what Linux does -- its
+		 * unix_stream_sendmsg() sleeps and carries on, and returns
+		 * less than asked only when a signal cuts a transfer that had
+		 * already begun.
+		 *
+		 * What it cost: luakit's IPC channel is unbuffered and passes
+		 * NULL for the bytes-written out-parameter
+		 * (g_io_channel_write_chars in common/ipc.c), so a short write
+		 * is invisible to it and the tail of the message is simply
+		 * dropped.  The receiver's framing then reads the NEXT
+		 * message's bytes as the remainder of this one and the stream
+		 * is desynchronised for good -- surfacing far away, in
+		 * lua_deserialize_value, as a type byte matching no case and
+		 * the assertion that a value was pushed failing by zero.
+		 *
+		 * It needed no huge message: the ring is 64K shared with
+		 * whatever the reader has not consumed, so a reader kept busy
+		 * -- rendering an advertisement-heavy page, say -- leaves a
+		 * few free bytes and truncates the next small message.  That
+		 * is why this only ever showed up on heavy sites.
+		 *
+		 * O_NONBLOCK is the one case where a short write IS the
+		 * contract, and it keeps the old behaviour. */
 		if (us->nonblock) {
+			if (sent > 0)
+				break; /* what fitted; the caller expects this */
 			unix_put(peer);
 			return -EAGAIN;
 		}
@@ -1250,15 +1279,23 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);
 					unix_put(peer);
-					return -EPIPE;
+					/* Same rule as the signal below: data
+					 * already placed is reported, and the
+					 * next call is the one that says
+					 * EPIPE. */
+					return sent > 0 ? sent : -EPIPE;
 				}
-				/* Interruptible: send() returns EINTR, and no
-				 * data has been written at this point. */
+				/* Interruptible.  EINTR only when nothing has
+				 * gone yet: once bytes are in the peer's ring
+				 * they cannot be taken back, so a signal that
+				 * arrives mid-transfer reports the count --
+				 * telling the caller EINTR after moving data
+				 * would have it send those bytes twice. */
 				if (snd_cur && signal_pending(snd_cur)) {
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);
 					unix_put(peer);
-					return -EINTR;
+					return sent > 0 ? sent : -EINTR;
 				}
 				if (!snd_cur) {
 					spin_unlock_irqrestore(&peer->lock,
@@ -1268,8 +1305,8 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 							  &irqflags);
 					continue;
 				}
-				snd_cur->state = TASK_BLOCKED;
 				snd_cur->wait_channel = peer;
+				snd_cur->state = TASK_BLOCKED;
 				spin_unlock_irqrestore(&peer->lock, irqflags);
 				sched_schedule();
 				spin_lock_irqsave(&peer->lock, &irqflags);
@@ -1370,8 +1407,8 @@ restart:
 			 * sleeper that misses it would never be woken. */
 			if (us->head == us->tail && !us->peer_closed &&
 			    !us->closed) {
-				rcv_cur->state = TASK_BLOCKED;
 				rcv_cur->wait_channel = us;
+				rcv_cur->state = TASK_BLOCKED;
 				spin_unlock_irqrestore(&us->lock, rf);
 				sched_schedule();
 				rcv_cur->wait_channel = NULL;

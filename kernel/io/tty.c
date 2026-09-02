@@ -912,6 +912,16 @@ static long tty_read_inner(tty_t *tty, void *buf, long count, int nonblock)
 				}
 				spin_unlock_irqrestore(&tty_lock, _f);
 				sched_schedule();
+				/* Disarm the VTIME deadline.  It belongs to this
+				 * one park: the loop below re-arms it if it
+				 * takes this branch again, and the branch after
+				 * it -- the read with no VTIME -- sets no
+				 * deadline at all and would inherit this one.
+				 * Left behind, a deadline already in the past
+				 * is claimed by sched_wake_expired_sleepers()
+				 * on the next tick of every later wait this
+				 * task makes, wherever it makes it. */
+				cur->wakeup_tick = 0;
 				if (cur->state == TASK_ZOMBIE ||
 				    cur->has_exited || signal_pending(cur)) {
 					if (signal_pending(cur)) {
@@ -1429,8 +1439,8 @@ long tty_pty_master_read(int id, void *buf, long count, int nonblock)
 			spin_unlock_irqrestore(&pty->lock, flags);
 			return -EINTR;
 		}
-		cur->state = TASK_BLOCKED;
 		cur->wait_channel = (void *)&pty->master_read_waiters;
+		cur->state = TASK_BLOCKED;
 		spin_unlock_irqrestore(&pty->lock, flags);
 		sched_schedule();
 	}

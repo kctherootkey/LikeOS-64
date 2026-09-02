@@ -490,28 +490,59 @@ int64_t sys_getegid(void)
 	return c ? (int64_t)c->cred.egid : 0;
 }
 
+/* A credential change applies to the PROCESS, and a process here is a
+ * thread group whose members each carry their own copy of the credential.
+ * So a successful set*id on one thread is copied to every sibling: a
+ * server that drops root after opening its devices must not leave a helper
+ * thread still privileged.  The copy is taken under the task-list lock,
+ * which is what keeps the group list stable; a sibling in the middle of
+ * its own set*id call simply loses the race, as it would on any system. */
+static void cred_broadcast(task_t *c)
+{
+	task_t *leader = c->group_leader ? c->group_leader : c;
+	task_t *t;
+	uint64_t flags;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	for_each_thread(leader, t) {
+		if (t != c)
+			t->cred = c->cred;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+}
+
+/* Run one credential operation on the caller and, if it succeeded, apply
+ * the result to the whole thread group. */
+#define CRED_GROUP_OP(call)                       \
+	do {                                      \
+		task_t *__c = sched_current();    \
+		int __rc;                         \
+		if (!__c)                         \
+			return -EPERM;            \
+		__rc = (call);                    \
+		if (__rc == 0)                    \
+			cred_broadcast(__c);      \
+		return __rc;                      \
+	} while (0)
+
 int64_t sys_setuid(uint64_t uid)
 {
-	task_t *c = sched_current();
-	return c ? cred_setuid(&c->cred, (uint32_t)uid) : -EPERM;
+	CRED_GROUP_OP(cred_setuid(&__c->cred, (uint32_t)uid));
 }
 
 int64_t sys_setgid(uint64_t gid)
 {
-	task_t *c = sched_current();
-	return c ? cred_setgid(&c->cred, (uint32_t)gid) : -EPERM;
+	CRED_GROUP_OP(cred_setgid(&__c->cred, (uint32_t)gid));
 }
 
 int64_t sys_seteuid(uint64_t uid)
 {
-	task_t *c = sched_current();
-	return c ? cred_seteuid(&c->cred, (uint32_t)uid) : -EPERM;
+	CRED_GROUP_OP(cred_seteuid(&__c->cred, (uint32_t)uid));
 }
 
 int64_t sys_setegid(uint64_t gid)
 {
-	task_t *c = sched_current();
-	return c ? cred_setegid(&c->cred, (uint32_t)gid) : -EPERM;
+	CRED_GROUP_OP(cred_setegid(&__c->cred, (uint32_t)gid));
 }
 
 int64_t sys_getgroups(uint64_t size, uint64_t list)
@@ -545,6 +576,7 @@ int64_t sys_setgroups(uint64_t size, uint64_t list)
 		return -EINVAL;
 	if (size == 0) {
 		c->cred.ngroups = 0;
+		cred_broadcast(c);
 		return 0;
 	}
 	if (!validate_user_ptr(list, sizeof(int) * (size_t)size))
@@ -556,23 +588,20 @@ int64_t sys_setgroups(uint64_t size, uint64_t list)
 	for (uint64_t i = 0; i < size; i++)
 		c->cred.groups[i] = (uint32_t)tmp[i];
 	c->cred.ngroups = (uint32_t)size;
+	cred_broadcast(c);
 	return 0;
 }
 
 int64_t sys_setresuid(uint64_t ruid, uint64_t euid, uint64_t suid)
 {
-	task_t *c = sched_current();
-	return c ? cred_setresuid(&c->cred, (uint32_t)ruid, (uint32_t)euid,
-				  (uint32_t)suid) :
-		   -EPERM;
+	CRED_GROUP_OP(cred_setresuid(&__c->cred, (uint32_t)ruid, (uint32_t)euid,
+				     (uint32_t)suid));
 }
 
 int64_t sys_setresgid(uint64_t rgid, uint64_t egid, uint64_t sgid)
 {
-	task_t *c = sched_current();
-	return c ? cred_setresgid(&c->cred, (uint32_t)rgid, (uint32_t)egid,
-				  (uint32_t)sgid) :
-		   -EPERM;
+	CRED_GROUP_OP(cred_setresgid(&__c->cred, (uint32_t)rgid, (uint32_t)egid,
+				     (uint32_t)sgid));
 }
 
 int64_t sys_getresuid(uint64_t ruid, uint64_t euid, uint64_t suid)

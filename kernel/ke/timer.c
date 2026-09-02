@@ -1,4 +1,5 @@
 // LikeOS-64 Timer Driver
+#include <kernel/ke/hrtimer.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/io/console.h>
@@ -134,6 +135,18 @@ typedef struct __attribute__((packed)) {
 #define HPET_GEN_CONFIG_OFFSET 0x010
 #define HPET_MAIN_COUNTER_OFFSET 0x0F0
 #define HPET_GEN_CONFIG_ENABLE (1ULL << 0)
+
+/* The HPET mapping, for the high-resolution timer layer that borrows one
+ * of its comparators (kernel/ke/hrtimer.c). */
+volatile uint64_t *timer_hpet_regs(void)
+{
+	return g_hpet_available ? g_hpet_regs : NULL;
+}
+
+uint32_t timer_hpet_period_fs(void)
+{
+	return g_hpet_period_fs;
+}
 
 static inline uint64_t hpet_read_reg(uint32_t offset)
 {
@@ -1250,6 +1263,9 @@ void timer_irq_handler(void)
 		// Wake any tasks whose sleep timer has expired and check signal timers
 		// This handles alarm(), itimer, and wakes sleeping tasks
 		sched_wake_expired_sleepers(g_ticks);
+		/* High-resolution timers: the only expiry path without an HPET
+		 * comparator, and the safety net with one. */
+		hrtimer_tick();
 
 		// Page cache: signal periodic dirty writeback
 		pagecache_timer_tick(g_ticks);

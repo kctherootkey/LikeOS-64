@@ -264,7 +264,7 @@ static int vm_activate(vmxnet3_dev_t *dev)
 	vmxnet3_misc_conf_t *mc = &s->devRead.misc;
 	mc->driverInfo.version = 1;
 	// gos packed: bits 0-1 = bits, bits 2-5 = type, bits 6-21 = ver, 22-31 misc
-	// 64-bit Linux-flavoured guest: bits=2, type=1
+	// 64-bit guest of the conventional flavour: bits=2, type=1
 	mc->driverInfo.gos = 2u | (1u << 2);
 	mc->driverInfo.vmxnet3RevSpt = 0x1; // rev1
 	mc->driverInfo.uptVerSpt = 0x1; // UPT1

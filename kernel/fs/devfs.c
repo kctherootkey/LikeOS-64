@@ -9,6 +9,11 @@
 #include <kernel/dev/rand/random.h>
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/input/evdev.h>
+#include <kernel/dev/device.h>
+#include <kernel/uapi/anonfd.h>
+#include <kernel/ke/uaccess.h>
+#include <kernel/fs/file.h>
+#include <kernel/net/net.h>
 #include <kernel/uapi/bug.h>
 
 #define DEVFS_TYPE_TTY 1
@@ -26,7 +31,10 @@
 #define DEVFS_TYPE_FD_DIR 13 /* /dev/fd: the caller's own descriptors */
 #define DEVFS_TYPE_SHM_DIR 14 /* /dev/shm: POSIX shared memory namespace  */
 #define DEVFS_TYPE_SHM 15 /* /dev/shm/<name>; object in `shm`        */
-#define DEVFS_TYPE_MAX DEVFS_TYPE_SHM
+#define DEVFS_TYPE_DEVICE 16 /* registered node; ops in `node->ops`     */
+#define DEVFS_TYPE_DEVICE_DIR 17 /* registered directory                 */
+#define DEVFS_TYPE_ANON 18 /* anonymous device file; ops in `aops`     */
+#define DEVFS_TYPE_MAX DEVFS_TYPE_ANON
 
 /* Device-node group owners; values must match /etc/group on the root fs. */
 #define DEVFS_GID_TTY 5
@@ -42,6 +50,11 @@ typedef struct {
 	uint64_t fpos; // byte position (framebuffer device)
 	int evdev_id; // input device unit (DEVFS_TYPE_EVDEV)
 	shm_object_t *shm; // shared memory object (DEVFS_TYPE_SHM)
+	/* Registered device nodes and anonymous device files: the node (NULL
+	 * for anonymous), the operations, and the driver's per-open state. */
+	struct devfs_node *node;
+	const struct device_ops *aops;
+	void *dev_priv;
 	/* The name this handle was opened under.  Several device paths share
 	 * one type (/dev/tty, /dev/console and /dev/tty0 are all DEVFS_TYPE_TTY),
 	 * so the type alone cannot say which node a descriptor refers to — and
@@ -143,6 +156,255 @@ static devfs_file_t *devfs_alloc_file(void)
 	WARN_ON(df->vfs.fs_private != df);
 	return df;
 }
+static devfs_file_t *devfs_file_of(vfs_file_t *f)
+{
+	if (!f || f->ops != &g_devfs_ops)
+		return NULL;
+	return (devfs_file_t *)f->fs_private;
+}
+
+/* ---- Registered device nodes -------------------------------------------
+ *
+ * Drivers add nodes here at init; the path switches below consult this
+ * table when none of the built-in names matched.  The table is small and
+ * scanned linearly: a system has dozens of device nodes, not thousands. */
+#define DEVFS_MAX_NODES 64
+static struct devfs_node *g_nodes[DEVFS_MAX_NODES];
+static spinlock_t g_nodes_lock = SPINLOCK_INIT("devfs_nodes");
+
+static struct devfs_node *devfs_node_lookup(const char *path)
+{
+	uint64_t fl;
+	struct devfs_node *found = NULL;
+
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		struct devfs_node *n = g_nodes[i];
+		if (n && kstrcmp(n->path, path) == 0) {
+			found = n;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return found;
+}
+
+/* Does `path' name a registered directory, with or without a trailing
+ * slash? */
+static struct devfs_node *devfs_dir_lookup(const char *path)
+{
+	char tmp[48];
+	size_t n = 0;
+
+	while (path[n] && n < sizeof(tmp) - 1) {
+		tmp[n] = path[n];
+		n++;
+	}
+	tmp[n] = 0;
+	if (n > 1 && tmp[n - 1] == '/')
+		tmp[n - 1] = 0;
+	struct devfs_node *d = devfs_node_lookup(tmp);
+	return (d && d->is_dir) ? d : NULL;
+}
+
+static int devfs_register_common(struct devfs_node *node, int is_dir)
+{
+	uint64_t fl;
+
+	if (!node || node->path[0] != '/' || !is_prefix(node->path, "/dev/"))
+		return -EINVAL;
+	if (!is_dir && !node->ops)
+		return -EINVAL;
+	node->is_dir = is_dir;
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		if (g_nodes[i] && kstrcmp(g_nodes[i]->path, node->path) == 0) {
+			spin_unlock_irqrestore(&g_nodes_lock, fl);
+			return -EEXIST;
+		}
+	}
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		if (!g_nodes[i]) {
+			g_nodes[i] = node;
+			node->registered = 1;
+			spin_unlock_irqrestore(&g_nodes_lock, fl);
+			return 0;
+		}
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return -ENOSPC;
+}
+
+int device_register(struct devfs_node *node)
+{
+	return devfs_register_common(node, 0);
+}
+
+int device_register_dir(struct devfs_node *node)
+{
+	return devfs_register_common(node, 1);
+}
+
+int device_unregister(struct devfs_node *node)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		if (g_nodes[i] == node) {
+			g_nodes[i] = NULL;
+			node->registered = 0;
+			spin_unlock_irqrestore(&g_nodes_lock, fl);
+			return 0;
+		}
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return -ENOENT;
+}
+
+/* Directory listing of a registered directory: every registered node
+ * whose path is `dir'/<one component>. */
+static int devfs_node_child(const char *dir, unsigned index, char *name,
+			    size_t cap, int *is_dir)
+{
+	size_t dl = 0;
+	unsigned seen = 0;
+	uint64_t fl;
+	int rc = 0;
+
+	while (dir[dl])
+		dl++;
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		struct devfs_node *n = g_nodes[i];
+		if (!n)
+			continue;
+		if (!is_prefix(n->path, dir) || n->path[dl] != '/')
+			continue;
+		const char *rest = n->path + dl + 1;
+		int one = 1;
+		for (const char *q = rest; *q; q++)
+			if (*q == '/')
+				one = 0;
+		if (!one || !*rest)
+			continue;
+		if (seen++ == index) {
+			size_t k = 0;
+			while (rest[k] && k < cap - 1) {
+				name[k] = rest[k];
+				k++;
+			}
+			name[k] = 0;
+			*is_dir = n->is_dir;
+			rc = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return rc;
+}
+
+static devfs_file_t *devfs_file_of(vfs_file_t *f);
+
+void *device_file_priv(vfs_file_t *file)
+{
+	devfs_file_t *df = devfs_file_of(file);
+	return df ? df->dev_priv : NULL;
+}
+
+void device_file_set_priv(vfs_file_t *file, void *priv)
+{
+	devfs_file_t *df = devfs_file_of(file);
+	if (df)
+		df->dev_priv = priv;
+}
+
+struct devfs_node *device_file_node(vfs_file_t *file)
+{
+	devfs_file_t *df = devfs_file_of(file);
+	return (df && df->type == DEVFS_TYPE_DEVICE) ? df->node : NULL;
+}
+
+const struct device_ops *device_file_ops(vfs_file_t *file)
+{
+	devfs_file_t *df = devfs_file_of(file);
+	if (!df)
+		return NULL;
+	if (df->type == DEVFS_TYPE_DEVICE)
+		return df->node ? df->node->ops : NULL;
+	if (df->type == DEVFS_TYPE_ANON)
+		return df->aops;
+	return NULL;
+}
+
+vfs_file_t *device_anon_file(const struct device_ops *ops, void *priv,
+			     const char *name, int flags)
+{
+	devfs_file_t *df;
+
+	if (!ops)
+		return NULL;
+	df = devfs_alloc_file();
+	if (!df)
+		return NULL;
+	df->type = DEVFS_TYPE_ANON;
+	df->aops = ops;
+	df->dev_priv = priv;
+	df->vfs.flags = flags;
+	if (name) {
+		size_t k = 0;
+		while (name[k] && k < sizeof(df->path) - 1) {
+			df->path[k] = name[k];
+			k++;
+		}
+		df->path[k] = 0;
+	}
+	return &df->vfs;
+}
+
+/* poll() support for the generic kinds: returns -1 when `f' is not one. */
+int devfs_device_poll(vfs_file_t *f, short events, struct poll_table *pt,
+		      short *revents)
+{
+	const struct device_ops *ops = device_file_ops(f);
+
+	if (!ops)
+		return -1;
+	if (!ops->poll) {
+		/* No poll hook: always ready, like a regular file. */
+		short rev = 0;
+		if (events & (POLLIN | POLLRDNORM))
+			rev |= POLLIN | POLLRDNORM;
+		if (events & (POLLOUT | POLLWRNORM))
+			rev |= POLLOUT | POLLWRNORM;
+		*revents = rev;
+		return 0;
+	}
+	*revents = ops->poll(f, events, pt);
+	return 0;
+}
+
+static int devfs_open_device(struct devfs_node *node, int flags,
+			     vfs_file_t **out, task_t *cur)
+{
+	devfs_file_t *df = devfs_alloc_file();
+
+	if (!df)
+		return ST_NOMEM;
+	df->type = DEVFS_TYPE_DEVICE;
+	df->node = node;
+	df->vfs.flags = flags;
+	if (node->ops->open) {
+		int rc = node->ops->open(node, &df->vfs, flags, cur);
+		if (rc < 0) {
+			kfree(df);
+			return rc == -ENOMEM ? ST_NOMEM : (rc == -EACCES ? ST_ACCESS : ST_IO);
+		}
+	}
+	*out = &df->vfs;
+	return ST_OK;
+}
+
 
 static int devfs_open_tty(tty_t *tty, vfs_file_t **out)
 {
@@ -419,6 +681,23 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 		}
 		return devfs_open_pty_slave(id, out);
 	}
+
+	/* Registered nodes: a directory, or a device with its own ops. */
+	{
+		struct devfs_node *d = devfs_dir_lookup(path);
+		if (d) {
+			devfs_file_t *df = devfs_alloc_file();
+			if (!df)
+				return ST_NOMEM;
+			df->type = DEVFS_TYPE_DEVICE_DIR;
+			df->node = d;
+			*out = &df->vfs;
+			return ST_OK;
+		}
+		struct devfs_node *n = devfs_node_lookup(path);
+		if (n && !n->is_dir)
+			return devfs_open_device(n, flags, out, cur);
+	}
 	return ST_NOT_FOUND;
 }
 
@@ -576,7 +855,29 @@ int devfs_stat(const char *path, struct kstat *st)
 		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 136;
 		rmin = (uint32_t)id;
 	} else {
-		return ST_NOT_FOUND;
+		struct devfs_node *d = devfs_dir_lookup(path);
+		if (d) {
+			st->st_mode = S_IFDIR | (d->mode ? d->mode : 0755);
+			st->st_uid = d->uid;
+			st->st_gid = d->gid;
+			st->st_nlink = 1;
+			st->st_atime = now;
+			st->st_mtime = now;
+			st->st_ctime = now;
+			return ST_OK;
+		}
+		struct devfs_node *n = devfs_node_lookup(path);
+		if (!n)
+			return ST_NOT_FOUND;
+		st->st_mode = S_IFCHR | (n->mode & 07777);
+		st->st_uid = n->uid;
+		st->st_gid = n->gid;
+		st->st_rdev = ((uint64_t)n->major << 8) | n->minor;
+		st->st_nlink = 1;
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		return ST_OK;
 	}
 	st->st_mode = S_IFCHR | perm;
 	st->st_gid = gid;
@@ -599,6 +900,8 @@ int devfs_chdir(const char *path)
 	    is_path(path, "/dev/shm") || is_path(path, "/dev/shm/")) {
 		return ST_OK;
 	}
+	if (devfs_dir_lookup(path))
+		return ST_OK;
 	return ST_NOT_FOUND;
 }
 
@@ -611,6 +914,12 @@ long devfs_read(vfs_file_t *f, void *buf, long bytes)
 		return -EINVAL;
 	WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_MAX);
 	int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
+	if (df->type == DEVFS_TYPE_DEVICE || df->type == DEVFS_TYPE_ANON) {
+		const struct device_ops *ops = device_file_ops(f);
+		if (!ops || !ops->read)
+			return -EINVAL;
+		return ops->read(f, buf, bytes, nonblock);
+	}
 	if (df->type == DEVFS_TYPE_TTY) {
 		WARN_ON(df->tty == NULL);
 		return tty_read(df->tty, buf, bytes, nonblock);
@@ -668,6 +977,13 @@ long devfs_write(vfs_file_t *f, const void *buf, long bytes)
 	if (!df)
 		return -EINVAL;
 	WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_MAX);
+	if (df->type == DEVFS_TYPE_DEVICE || df->type == DEVFS_TYPE_ANON) {
+		const struct device_ops *ops = device_file_ops(f);
+		if (!ops || !ops->write)
+			return -EINVAL;
+		return ops->write(f, buf, bytes,
+				  (f->flags & O_NONBLOCK) ? 1 : 0);
+	}
 	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
 		WARN_ON(df->tty ==
 			NULL); /* TTY/PTY-slave write with NULL tty pointer: state corruption */
@@ -712,6 +1028,12 @@ long devfs_seek(vfs_file_t *f, long offset, int whence)
 	if (!f)
 		return -EINVAL;
 	df = (devfs_file_t *)f->fs_private;
+	if (df && (df->type == DEVFS_TYPE_DEVICE || df->type == DEVFS_TYPE_ANON)) {
+		const struct device_ops *ops = device_file_ops(f);
+		if (!ops || !ops->seek)
+			return -ESPIPE;
+		return ops->seek(f, offset, whence);
+	}
 	if (!df || df->type != DEVFS_TYPE_FB0)
 		return -EINVAL;
 	fbdev_get_phys(&size);
@@ -772,9 +1094,17 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	devfs_file_t *df = (devfs_file_t *)f->fs_private;
 	if (!df)
 		return -EINVAL;
+	/* DEVICE_DIR belongs here too: a registered directory (/dev/dri) has
+	 * its own listing branch below, but this gate never admitted it, so
+	 * readdir answered ENOTDIR and the branch was dead code.  libdrm's
+	 * drmGetDevices2() -- the way Mesa enumerates GPUs -- begins with
+	 * readdir of /dev/dri, so every EGL display found ZERO devices and
+	 * eglInitialize failed, which is why glamor always fell back to
+	 * llvmpipe while direct opens of the very same nodes worked. */
 	if (df->type != DEVFS_TYPE_DIR && df->type != DEVFS_TYPE_PTS_DIR &&
 	    df->type != DEVFS_TYPE_INPUT_DIR && df->type != DEVFS_TYPE_FD_DIR &&
-	    df->type != DEVFS_TYPE_SHM_DIR) {
+	    df->type != DEVFS_TYPE_SHM_DIR &&
+	    df->type != DEVFS_TYPE_DEVICE_DIR) {
 		return -ENOTDIR;
 	}
 	if (df->dir_pos) {
@@ -826,6 +1156,29 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 				     "stderr", 15, 10);
 		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
 				     "shm", 16, 4);
+		/* Registered nodes directly under /dev. */
+		{
+			char nm[48];
+			int isd;
+			for (unsigned i = 0;
+			     devfs_node_child("/dev", i, nm, sizeof(nm), &isd);
+			     i++)
+				devfs_write_dirent64((char *)buf,
+						     (unsigned)bytes, &out_off,
+						     nm, 100 + i, isd ? 4 : 2);
+		}
+		df->dir_pos = 1;
+		return (long)out_off;
+	}
+	if (df->type == DEVFS_TYPE_DEVICE_DIR) {
+		char nm[48];
+		int isd;
+		for (unsigned i = 0; df->node && devfs_node_child(df->node->path, i,
+							     nm, sizeof(nm),
+							     &isd);
+		     i++)
+			devfs_write_dirent64((char *)buf, (unsigned)bytes,
+					     &out_off, nm, 100 + i, isd ? 4 : 2);
 		df->dir_pos = 1;
 		return (long)out_off;
 	}
@@ -936,7 +1289,90 @@ static int devfs_truncate(vfs_file_t *f, unsigned long size)
 	df = (devfs_file_t *)f->fs_private;
 	if (!df || df->type != DEVFS_TYPE_SHM || !df->shm)
 		return ST_INVALID; /* no other device node has a settable length */
+	/* Seals: a sealed memfd cannot change size in the sealed direction. */
+	if ((df->shm->seals & F_SEAL_SHRINK) && size < df->shm->size)
+		return ST_PERM;
+	if ((df->shm->seals & F_SEAL_GROW) && size > df->shm->size)
+		return ST_PERM;
 	return devfs_shm_status(shm_set_size(df->shm, size));
+}
+
+/* memfd_create(2): an anonymous shared memory object behind a descriptor.
+ * It is a /dev/shm object in every respect except that it has no name in
+ * the namespace -- so ftruncate, fstat, mmap(MAP_SHARED) and descriptor
+ * passing all work as they do for shm_open(), unchanged. */
+int64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags)
+{
+	task_t *cur = sched_current();
+	char *name = NULL;
+	size_t nlen = 0;
+	static unsigned g_memfd_seq;
+
+	if (!cur)
+		return -EFAULT;
+	if (flags & ~(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB))
+		return -EINVAL;
+	if (copy_user_string((const char *)name_ptr, 250, &name, &nlen) < 0)
+		return -EFAULT;
+	/* Unique internal name, then drop it from the namespace at once:
+	 * only the descriptor refers to the object. */
+	char iname[SHM_NAME_MAX];
+	unsigned seq = __atomic_fetch_add(&g_memfd_seq, 1, __ATOMIC_RELAXED);
+	ksnprintf(iname, sizeof(iname), ".memfd.%u.%u", (unsigned)cur->id, seq);
+	shm_object_t *obj = shm_create_get(iname, 0600);
+	if (!obj) {
+		kfree(name);
+		return -ENOMEM;
+	}
+	obj->uid = cur->cred.fsuid;
+	obj->gid = cur->cred.fsgid;
+	obj->sealable = (flags & MFD_ALLOW_SEALING) != 0;
+	obj->seals = obj->sealable ? 0 : F_SEAL_SEAL;
+	shm_unlink_name(iname);
+
+	devfs_file_t *df = devfs_alloc_file();
+	if (!df) {
+		shm_put(obj);
+		kfree(name);
+		return -ENOMEM;
+	}
+	df->type = DEVFS_TYPE_SHM;
+	df->shm = obj;
+	ksnprintf(df->path, sizeof(df->path), "memfd:%s", name);
+	kfree(name);
+	df->vfs.refcount = 1;
+	df->vfs.flags = O_RDWR;
+	int fd = fd_install(cur, &df->vfs);
+	if (fd < 0) {
+		vfs_close(&df->vfs);
+		return fd;
+	}
+	if (flags & MFD_CLOEXEC)
+		task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
+	return fd;
+}
+
+/* fcntl(F_ADD_SEALS / F_GET_SEALS) on a memfd. */
+int devfs_shm_seals(vfs_file_t *f, int add, unsigned seals, unsigned *out)
+{
+	devfs_file_t *df = devfs_file_of(f);
+
+	if (!df || df->type != DEVFS_TYPE_SHM || !df->shm)
+		return -EINVAL;
+	shm_object_t *o = df->shm;
+	if (!add) {
+		*out = o->seals;
+		return 0;
+	}
+	if (!o->sealable)
+		return -EINVAL;
+	if (o->seals & F_SEAL_SEAL)
+		return -EPERM;
+	if (seals & ~(F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE |
+		      F_SEAL_FUTURE_WRITE))
+		return -EINVAL;
+	o->seals |= seals;
+	return 0;
 }
 
 static int devfs_unlink(const char *path)
@@ -990,6 +1426,11 @@ int devfs_close(vfs_file_t *f)
 			 * object releases its pages when the last one goes. */
 			shm_put(df->shm);
 			df->shm = NULL;
+		} else if (df->type == DEVFS_TYPE_DEVICE ||
+			   df->type == DEVFS_TYPE_ANON) {
+			const struct device_ops *ops = device_file_ops(f);
+			if (ops && ops->release)
+				ops->release(f);
 		}
 		kfree(df);
 	}
@@ -1029,6 +1470,12 @@ int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 		else
 			f->flags &= ~O_NONBLOCK;
 		return 0;
+	}
+	if (df->type == DEVFS_TYPE_DEVICE || df->type == DEVFS_TYPE_ANON) {
+		const struct device_ops *ops = device_file_ops(f);
+		if (!ops || !ops->ioctl)
+			return -ENOTTY;
+		return (int)ops->ioctl(f, req, argp, cur);
 	}
 	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
 		return tty_ioctl(df->tty, req, argp, cur);
@@ -1098,6 +1545,40 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 		st->st_mtime = now;
 		st->st_ctime = now;
 		return ST_OK;
+	}
+
+	if (df->type == DEVFS_TYPE_DEVICE && df->node) {
+		const struct device_ops *ops = df->node->ops;
+		mm_memset(st, 0, sizeof(*st));
+		st->st_mode = S_IFCHR | (df->node->mode & 07777);
+		st->st_uid = df->node->uid;
+		st->st_gid = df->node->gid;
+		st->st_rdev = ((uint64_t)df->node->major << 8) |
+			      df->node->minor;
+		st->st_nlink = 1;
+		st->st_blksize = 4096;
+		if (ops && ops->fstat)
+			return ops->fstat(f, st);
+		return 0;
+	}
+	if (df->type == DEVFS_TYPE_ANON) {
+		/* An anonymous file: no device number, a regular-file-ish
+		 * mode so callers that require S_ISCHR know it is not a
+		 * device node, and whatever size the object reports. */
+		const struct device_ops *ops = df->aops;
+		mm_memset(st, 0, sizeof(*st));
+		st->st_mode = S_IFREG | 0600;
+		st->st_nlink = 1;
+		st->st_blksize = 4096;
+		if (ops && ops->fstat)
+			return ops->fstat(f, st);
+		return 0;
+	}
+	if (df->type == DEVFS_TYPE_DEVICE_DIR) {
+		st->st_mode = S_IFDIR | 0755;
+		st->st_nlink = 1;
+		st->st_size = 0;
+		return 0;
 	}
 
 	switch (df->type) {

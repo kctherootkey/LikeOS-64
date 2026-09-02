@@ -270,6 +270,17 @@ typedef struct procmapinfo {
  * user/lib/libc/include/sys/ptrace.h for the interface contract. */
 #define SYS_PTRACE 408
 #define SYS_MINCORE 409 /* (addr, length, vec) page residency, one byte per page */
+#define SYS_CLOCK_NANOSLEEP 410 /* (clockid, flags, req, rem) */
+#define SYS_MREMAP 411 /* (old_addr, old_size, new_size, flags, new_addr) */
+#define SYS_EVENTFD2 412 /* (initval, flags) */
+#define SYS_TIMERFD_CREATE 413 /* (clockid, flags) */
+#define SYS_TIMERFD_SETTIME 414 /* (fd, flags, new, old) */
+#define SYS_TIMERFD_GETTIME 415 /* (fd, cur) */
+#define SYS_MEMFD_CREATE 416 /* (name, flags) */
+#define SYS_PREAD64 417 /* (fd, buf, count, offset) */
+#define SYS_PWRITE64 418 /* (fd, buf, count, offset) */
+#define SYS_FDATASYNC 419 /* (fd) */
+#define SYS_FALLOCATE 420 /* (fd, mode, offset, len) */
 
 /* Trace options (PTRACE_SETOPTIONS): which extra events stop the tracee.
  * Mirrored in user/lib/libc/include/sys/ptrace.h. */
@@ -300,6 +311,18 @@ typedef struct procmapinfo {
 #define MADV_SEQUENTIAL 2
 #define MADV_WILLNEED 3
 #define MADV_DONTNEED 4
+/* MADV_FREE: the pages may be reclaimed and the contents lost.  Discarding
+ * them at once (as DONTNEED does) is one of the allowed outcomes -- a later
+ * read sees zeros, which is what the caller agreed to. */
+#define MADV_FREE 8
+/* Accepted as hints with nothing behind them. */
+#define MADV_REMOVE 9
+#define MADV_DONTFORK 10
+#define MADV_DOFORK 11
+#define MADV_MERGEABLE 12
+#define MADV_UNMERGEABLE 13
+#define MADV_HUGEPAGE 14
+#define MADV_NOHUGEPAGE 15
 #define MADV_DONTDUMP 16
 #define MADV_DODUMP 17
 #define SYS_CHROOT 400
@@ -456,6 +479,17 @@ typedef struct k_flock {
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
 #define MAP_ANON MAP_ANONYMOUS
+/* Pre-fault the whole range at mmap time instead of on first touch.  Only a
+ * hint elsewhere; here it is honoured, because a caller asking for it is
+ * usually about to hand the memory to a device or to a signal handler that
+ * cannot take a page fault. */
+#define MAP_POPULATE 0x8000
+/* Like MAP_FIXED, but refuses (EEXIST) instead of silently replacing a
+ * mapping already at that address. */
+#define MAP_FIXED_NOREPLACE 0x100000
+/* Pure hints: no bits of behaviour behind them on this kernel. */
+#define MAP_NORESERVE 0x4000
+#define MAP_STACK 0x20000
 
 // mmap failure return
 #define MAP_FAILED ((void *)-1)

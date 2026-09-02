@@ -54,8 +54,8 @@ void fat32_io_lock(void)
 			return;
 		}
 		if (cur) {
-			cur->state = TASK_BLOCKED;
 			cur->wait_channel = (void *)&fat32_io_locked;
+			cur->state = TASK_BLOCKED;
 		}
 		spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
 		sched_schedule();
@@ -916,7 +916,7 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
              *   - The "lseek past EOF, then write" sparse pattern leaves
              *     genuinely unwritten cluster regions; readers see
              *     whatever was previously on those sectors.  This matches
-             *     ext2/3/4 with discard disabled and Linux's vfat driver
+             *     ext2/3/4 with discard disabled and the reference vfat driver
              *     defaults; if strict zero-on-allocate is required for
              *     security, add a mount option that re-enables the
              *     write_sectors call below. */

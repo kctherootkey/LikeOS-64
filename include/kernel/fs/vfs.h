@@ -178,6 +178,14 @@ typedef struct {
 	 * error rather than a crash.  Keep them that way. */
 	int (*open_mode)(const char *path, int flags, unsigned int mode,
 			 vfs_file_t **out);
+	/* Read at an explicit offset without touching the handle's position.
+	 *
+	 * Optional: vfs_pread() falls back to seek/read/seek-back for a
+	 * filesystem that does not have it.  Worth having wherever a file can
+	 * be mapped, because demand paging reads through this and a mapping
+	 * shares its handle with the caller's open descriptor -- see
+	 * vfs_pread(). */
+	long (*read_at)(vfs_file_t *f, void *buf, long bytes, long off);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -213,6 +221,10 @@ struct vfs_file {
 int vfs_init(void);
 int vfs_register_root(const vfs_ops_t *ops);
 int vfs_register_devfs(const vfs_ops_t *ops);
+/* A further filesystem at `prefix' ("/sys", "/proc"); paths under it go to
+ * `ops'.  The name is listed in the root directory. */
+int vfs_register_mount(const char *prefix, const vfs_ops_t *ops);
+int vfs_mount_name(int index, const char **name_out);
 int vfs_root_ready(void);
 int vfs_open(const char *path, int flags, vfs_file_t **out);
 /* open() with the creation mode for O_CREAT.  `mode` is the FINAL mode -- the
@@ -224,6 +236,10 @@ int vfs_open_mode(const char *path, int flags, unsigned int mode,
 int vfs_stat(const char *path, struct kstat *st);
 int vfs_chdir(const char *path);
 long vfs_read(vfs_file_t *f, void *buf, long bytes);
+/* Read `bytes' at `off'.  Does not consult or move the handle's position when
+ * the filesystem can read positionally; falls back to seek/read/seek-back
+ * under the handle's page-in flag when it cannot. */
+long vfs_pread(vfs_file_t *f, void *buf, long bytes, long off);
 long vfs_write(vfs_file_t *f, const void *buf, long bytes);
 long vfs_seek(vfs_file_t *f, long offset, int whence);
 long vfs_readdir(vfs_file_t *f, void *buf, long bytes);

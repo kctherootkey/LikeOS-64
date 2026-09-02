@@ -15,6 +15,9 @@
 extern char **environ;
 
 const char *__progname = "";
+static char g_empty_name[1] = "";
+char *program_invocation_name = g_empty_name;
+char *program_invocation_short_name = g_empty_name;
 
 void __libc_set_progname(const char *argv0)
 {
@@ -26,6 +29,8 @@ void __libc_set_progname(const char *argv0)
 		if (*q == '/')
 			p = q + 1;
 	__progname = p;
+	program_invocation_name = (char *)argv0;
+	program_invocation_short_name = (char *)p;
 }
 
 static const char *_progname(void)

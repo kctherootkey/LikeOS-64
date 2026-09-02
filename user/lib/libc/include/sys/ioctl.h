@@ -7,7 +7,7 @@ extern "C" {
 
 #include <sys/types.h>
 
-// ioctl request codes (Linux-compatible)
+// ioctl request codes (the conventional numbers)
 #define TCGETS     0x5401
 #define TCSETS     0x5402
 #define TCSETSW    0x5403
@@ -55,7 +55,7 @@ struct winsize {
 #define TIOCMBIC   0x5417
 #define TIOCMBIS   0x5416
 
-// Network interface ioctls (Linux-compatible)
+// Network interface ioctls (the conventional numbers)
 #define SIOCGIFCONF     0x8912
 #define SIOCGIFFLAGS    0x8913
 #define SIOCSIFFLAGS    0x8914

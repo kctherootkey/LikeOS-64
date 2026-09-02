@@ -58,6 +58,19 @@ extern "C" {
 #define F_GETFL         3
 #define F_SETFL         4
 #define F_DUPFD_CLOEXEC 1030
+/* memfd seals. */
+#define F_ADD_SEALS 1033
+#define F_GET_SEALS 1034
+#define F_SEAL_SEAL         0x0001
+#define F_SEAL_SHRINK       0x0002
+#define F_SEAL_GROW         0x0004
+#define F_SEAL_WRITE        0x0008
+#define F_SEAL_FUTURE_WRITE 0x0010
+/* fallocate(): reserve [offset, offset+len).  Mode 0 grows the file;
+ * FALLOC_FL_KEEP_SIZE is accepted as a no-op. */
+#define FALLOC_FL_KEEP_SIZE 1
+int fallocate(int fd, int mode, off_t offset, off_t len);
+int posix_fallocate(int fd, off_t offset, off_t len);
 /* POSIX advisory record locking.  Values are the conventional x86-64 ones so
  * the ABI matches what software expects to find. */
 #define F_GETLK         5

@@ -72,3 +72,9 @@ int _dl_find_object(void *address, struct dl_find_object *result)
 {
 	return _rtld_find_object(address, result);
 }
+
+void *dlvsym(void *handle, const char *symbol, const char *version)
+{
+	(void)version;
+	return dlsym(handle, symbol);
+}

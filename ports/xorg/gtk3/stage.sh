@@ -132,6 +132,20 @@ if [ -d "$SYSROOT/usr/lib/dri" ]; then
 		staged=$((staged + 1))
 	done
 fi
+# The GBM backend directory, next door to it and just as dlopen'd: libgbm
+# loads its DRI backend from a path baked in at build time (/usr/lib/gbm),
+# and without dri_gbm.so there the loader reports "failed to open dri" and
+# gbm_create_device() fails.  That is what the display manager builds its
+# EGL display on, so glamor gets no device and the server falls back to
+# software rendering with every accelerated driver on the image unused.
+if [ -d "$SYSROOT/usr/lib/gbm" ]; then
+	mkdir -p "$DEST/usr/lib/gbm"
+	for f in "$SYSROOT"/usr/lib/gbm/*; do
+		[ -e "$f" ] || continue
+		cp -a "$f" "$DEST/usr/lib/gbm/"
+		staged=$((staged + 1))
+	done
+fi
 if [ -d "$SYSROOT/usr/share/drirc.d" ]; then
 	mkdir -p "$DEST/usr/share/drirc.d"
 	cp -a "$SYSROOT"/usr/share/drirc.d/* "$DEST/usr/share/drirc.d/" 2>/dev/null || true

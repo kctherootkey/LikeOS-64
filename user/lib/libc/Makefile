@@ -2,7 +2,16 @@ CC = gcc
 AR = ar
 LD = ld
 DEBUG ?= 0
-CFLAGS = -Wall -Wextra -Werror=implicit-function-declaration \
+# Header dependencies.  Without them a change to a header in include/ rebuilt
+# nothing at all -- only the objects whose .c also changed saw it -- so the
+# library could be assembled from objects compiled against two different
+# layouts of FILE, pthread_t or struct stat.  See the same note in the top
+# Makefile.  -MMD writes the header list beside each object, -MP keeps a
+# deleted header from becoming an error, and the -include at the bottom feeds
+# them back.
+DEPFLAGS = -MMD -MP
+
+CFLAGS = $(DEPFLAGS) -Wall -Wextra -Werror=implicit-function-declaration \
 	-Werror=misleading-indentation -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -I./include
 ifeq ($(DEBUG),1)
@@ -29,7 +38,7 @@ LOCALE_SRC = src/locale/locale.c src/locale/multibyte.c src/locale/wctype.c \
              src/locale/wcwidth.c src/locale/wcstr.c src/locale/unicode.c \
              src/locale/uchar.c
 EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c src/stdio/wstdio.c src/stdio/stdio_ext.c
-SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c src/syscalls/ptrace.c
+SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c src/syscalls/ptrace.c src/syscalls/anonfd.c
 DLFCN_SRC = src/dl/dlfcn.c
 PWD_SRC = src/pwd/pwd.c src/pwd/grp.c src/pwd/shadow.c src/pwd/creds.c
 NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c src/net/resolv.c
@@ -37,6 +46,8 @@ PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthr
 STACK_CHK_SRC = src/stack_chk.c
 PTHREAD_ASM = src/pthread/clone.S
 SETJMP_ASM  = src/setjmp.S
+UCONTEXT_ASM = src/misc/ucontext.S
+MISC_SRC = src/misc/makecontext.c src/misc/threads.c
 CRT0_SRC = src/crt0.S
 CRT1_SRC = src/crt1.S
 CRTI_SRC = src/crti.S
@@ -60,6 +71,7 @@ PWD_OBJ = $(PWD_SRC:.c=.o)
 NET_OBJ = $(NET_SRC:.c=.o)
 PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 SETJMP_OBJ  = $(SETJMP_ASM:.S=.o)
+UCONTEXT_OBJ = $(UCONTEXT_ASM:.S=.o) $(MISC_SRC:.c=.o)
 STACK_CHK_OBJ = $(STACK_CHK_SRC:.c=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 CRT1_OBJ = $(CRT1_SRC:.S=.o)
@@ -69,7 +81,7 @@ CRTN_OBJ = $(CRTN_SRC:.S=.o)
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
            $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(ICONV_OBJ) $(LOCALE_OBJ) $(SYSCALLS_OBJ) \
-           $(NET_OBJ) $(SETJMP_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ)
+           $(NET_OBJ) $(SETJMP_OBJ) $(UCONTEXT_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 
@@ -133,6 +145,7 @@ $(CRTN): $(CRTN_OBJ)
 clean:
 	rm -f $(ALL_OBJ) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(CRTI_OBJ) $(CRTN_OBJ) $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN)
 	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
+	find src -name '*.d' -delete
 
 .PHONY: all clean
 
@@ -146,3 +159,8 @@ clean:
 # resolve from libc.so.
 libm.a:
 	$(AR) rcs $@
+
+# The header dependencies recorded by -MMD above.  `-include' because they do
+# not exist before the first build of each object, and their absence is not an
+# error.  Both spellings: %.o and %.pic.o each write their own.
+-include $(wildcard src/*/*.d)

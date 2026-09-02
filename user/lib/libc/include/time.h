@@ -22,13 +22,47 @@ struct timespec {
 #define CLOCK_MONOTONIC          1
 #define CLOCK_PROCESS_CPUTIME_ID 2
 #define CLOCK_THREAD_CPUTIME_ID  3
+/* Further names for the monotonic and real-time clocks.  Nothing here slews
+ * the monotonic clock or suspends the machine, so RAW and BOOTTIME read the
+ * same as MONOTONIC, and the COARSE variants are not any coarser. */
+#define CLOCK_MONOTONIC_RAW      4
+#define CLOCK_REALTIME_COARSE    5
+#define CLOCK_MONOTONIC_COARSE   6
+#define CLOCK_BOOTTIME           7
+/* clock_nanosleep() flag: the request is an absolute time on the clock. */
+#define TIMER_ABSTIME            1
 /* Per-thread CPU clocks for OTHER threads: pthread_getcpuclockid() encodes
  * the target's kernel tid into the clockid.  clock_gettime() on such an id
  * reports that thread's consumed CPU time (user + system ticks), or EINVAL
  * once the thread is gone. */
 #define CLOCK_TID_CPUTIME_BASE 0x40000000
 
+/* clockid_t and timer_t.  POSIX puts both in <time.h>; <signal.h> defines
+ * them as well, because the per-process timer calls take a struct sigevent
+ * and are declared beside it.  The guards keep the two headers from
+ * colliding when a translation unit includes both under a standard older
+ * than C11, which is where repeating a typedef is an error rather than
+ * merely redundant. */
+#ifndef __clockid_t_defined
+#define __clockid_t_defined
 typedef int clockid_t;
+#endif
+#ifndef __timer_t_defined
+#define __timer_t_defined
+typedef int timer_t;
+#endif
+
+/* The interval-timer value POSIX puts in <time.h> beside timer_t: the
+ * period and the initial expiry of a per-process timer.  <signal.h>
+ * defines it too, under the same guard, because the calls that take it are
+ * declared there next to struct sigevent. */
+#ifndef _STRUCT_ITIMERSPEC
+#define _STRUCT_ITIMERSPEC
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+#endif
 
 /* The unit clock() counts in.  POSIX fixes this at exactly one million
  * regardless of how fast the system timer actually ticks, so it is a property
@@ -76,6 +110,11 @@ double difftime(time_t time1, time_t time0);
 char *strptime(const char *s, const char *format, struct tm *tm);
 
 int nanosleep(const struct timespec *req, struct timespec *rem);
+/* Sleep on a named clock, relative or (TIMER_ABSTIME) to an absolute
+ * deadline.  Returns 0 or an errno value (not -1/errno): EINTR with *rem
+ * filled in for a relative sleep cut short by a signal. */
+int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *req,
+		    struct timespec *rem);
 
 char *ctime(const time_t *timep);
 char *ctime_r(const time_t *timep, char *buf);

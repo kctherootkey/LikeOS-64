@@ -12,7 +12,7 @@
 //   0x2449 — i82801
 //
 // All variants present the same Simplified Command Block / Receive Frame
-// Area programming model used by Linux's `e100` driver, so a single
+// Area programming model used by the reference `e100` driver, so a single
 // driver covers every PCI ID above.
 
 #ifndef _KERNEL_EEPRO100_H_

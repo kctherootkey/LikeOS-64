@@ -19,6 +19,10 @@ extern "C" {
 ssize_t readv(int fd, const struct iovec* iov, int iovcnt);
 ssize_t writev(int fd, const struct iovec* iov, int iovcnt);
 
+/* Positional vectored I/O at `offset', leaving the file position alone. */
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset);
+ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset);
+
 #ifdef __cplusplus
 }
 #endif

@@ -33,12 +33,24 @@ static int64_t sys_madvise_locked(uint64_t addr, uint64_t length,
 
 	switch (advice) {
 	case MADV_DONTNEED:
+	case MADV_FREE:
+		/* FREE permits the kernel to drop the pages any time before
+		 * they are written again; dropping them now is the simplest
+		 * conforming choice and the one allocators (which use it for
+		 * a cheap "I am done with this") expect to cost nothing. */
 		mm_dontneed_range(cur, addr, length);
 		return 0;
 	case MADV_NORMAL:
 	case MADV_RANDOM:
 	case MADV_SEQUENTIAL:
 	case MADV_WILLNEED:
+	case MADV_REMOVE:
+	case MADV_DONTFORK:
+	case MADV_DOFORK:
+	case MADV_MERGEABLE:
+	case MADV_UNMERGEABLE:
+	case MADV_HUGEPAGE:
+	case MADV_NOHUGEPAGE:
 	case MADV_DONTDUMP:
 	case MADV_DODUMP:
 		return 0;

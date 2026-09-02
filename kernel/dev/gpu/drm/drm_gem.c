@@ -1,0 +1,504 @@
+// LikeOS-64 -- display-manager objects: buffers and surfaces, their handles,
+// and sharing across processes (PRIME / dma-buf).
+#include <kernel/dev/gpu/drm.h>
+#include <kernel/uapi/drm/dma-buf.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/ke/uaccess.h>
+#include <kernel/fs/file.h>
+#include <kernel/mm/memory.h>
+#include <kernel/net/net.h>
+
+/* Object ids map to mmap offsets: object k lives at offset (k+1) << 36, a
+ * 64 GB window each, which no single object exceeds. */
+#define DRM_MMAP_SHIFT 36
+
+struct drm_gem_object *drm_gem_alloc(struct drm_device *dev,
+				    enum drm_gem_kind kind, uint64_t size)
+{
+	struct drm_gem_object *o = kalloc(sizeof(*o));
+	uint64_t fl;
+
+	if (!o)
+		return NULL;
+	mm_memset(o, 0, sizeof(*o));
+	o->refs = 1;
+	o->dev = dev;
+	o->kind = kind;
+	o->size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+	o->npages = (uint32_t)(o->size / PAGE_SIZE);
+	spin_lock_irqsave(&dev->lock, &fl);
+	o->id = ++dev->next_obj_id;
+	o->next = dev->objects;
+	dev->objects = o;
+	spin_unlock_irqrestore(&dev->lock, fl);
+	return o;
+}
+
+int drm_gem_alloc_pages(struct drm_gem_object *o)
+{
+	if (o->pages || o->npages == 0)
+		return 0;
+	o->pages = kalloc(o->npages * sizeof(uint64_t));
+	if (!o->pages)
+		return -ENOMEM;
+	for (uint32_t i = 0; i < o->npages; i++) {
+		o->pages[i] = mm_allocate_physical_page();
+		if (!o->pages[i]) {
+			for (uint32_t j = 0; j < i; j++)
+				mm_free_physical_page(o->pages[j]);
+			kfree(o->pages);
+			o->pages = NULL;
+			return -ENOMEM;
+		}
+		/* Zeroed, like the contiguous variant below: these pages are
+		 * mmapped by clients and become device state (MOBs, COTables),
+		 * so recycled kernel pages must not shine through -- that is
+		 * both stale-state corruption on the device side and an
+		 * information leak on the user side. */
+		mm_memset(phys_to_virt(o->pages[i]), 0, PAGE_SIZE);
+	}
+	return 0;
+}
+
+/* Pages for an object the CPU has to see as ONE linear range.
+ *
+ * The console's framebuffer is written through a single base pointer with
+ * plain stores, so its backing has to be virtually contiguous.  The direct
+ * map is linear over physical memory, which makes a physically contiguous
+ * run a virtually contiguous one; pages taken one at a time are neither.
+ * Everything else about the object is unchanged -- drm_gem_put() frees the
+ * frames one by one, which is what the allocator does with a run anyway. */
+int drm_gem_alloc_pages_contig(struct drm_gem_object *o)
+{
+	if (o->pages || o->npages == 0)
+		return 0;
+	o->pages = kalloc(o->npages * sizeof(uint64_t));
+	if (!o->pages)
+		return -ENOMEM;
+	uint64_t base = mm_allocate_contiguous_pages(o->npages);
+	if (!base) {
+		kfree(o->pages);
+		o->pages = NULL;
+		return -ENOMEM;
+	}
+	for (uint32_t i = 0; i < o->npages; i++)
+		o->pages[i] = base + (uint64_t)i * PAGE_SIZE;
+	mm_memset(phys_to_virt(base), 0, (size_t)o->npages * PAGE_SIZE);
+	return 0;
+}
+
+void *drm_gem_page_virt(struct drm_gem_object *o, uint32_t page)
+{
+	if (!o->pages || page >= o->npages)
+		return NULL;
+	return phys_to_virt(o->pages[page]);
+}
+
+void drm_gem_get(struct drm_gem_object *o)
+{
+	__atomic_fetch_add(&o->refs, 1, __ATOMIC_ACQ_REL);
+}
+
+void drm_gem_put(struct drm_gem_object *o)
+{
+	if (!o)
+		return;
+	if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) != 0)
+		return;
+	struct drm_device *dev = o->dev;
+	uint64_t fl;
+
+	/* The device may still be reading it: wait for the last submission
+	 * that referenced it. */
+	if (o->fence) {
+		drm_fence_wait(o->fence, 2000000000ULL);
+		drm_fence_put(o->fence);
+		o->fence = NULL;
+	}
+	/* dev->drv is NULL until drm_dev_register() attaches the backend, and
+	 * a backend may build objects of its own before it registers.  Such
+	 * an object was never handed to the backend -- there is nothing for
+	 * it to free -- and the rest of this function still holds. */
+	if (dev->drv && dev->drv->gem_free)
+		dev->drv->gem_free(o);
+	spin_lock_irqsave(&dev->lock, &fl);
+	struct drm_gem_object **pp = &dev->objects;
+	while (*pp) {
+		if (*pp == o) {
+			*pp = o->next;
+			break;
+		}
+		pp = &(*pp)->next;
+	}
+	spin_unlock_irqrestore(&dev->lock, fl);
+	if (o->pages) {
+		/* If the driver gave these pages to its device, only the
+		 * driver knows when the device has stopped reaching them --
+		 * and freeing them early is invisible from this side, because
+		 * the writes that follow are the device's, not a processor's.
+		 * See gem_release_pages(). */
+		if (dev->drv && dev->drv->gem_release_pages) {
+			dev->drv->gem_release_pages(o);
+		} else {
+			for (uint32_t i = 0; i < o->npages; i++)
+				if (o->pages[i])
+					mm_free_physical_page(o->pages[i]);
+		}
+		kfree(o->pages);
+	}
+	kfree(o);
+}
+
+/* ---- mmap offsets ------------------------------------------------------ */
+//
+// The offset a client mmaps on the device node is not a file position, it
+// names an object: each object owns a 4GB-aligned window addressed by its
+// device-global id.  The window is wider than any object can be, the id is
+// never reused for the object's lifetime, and both directions below are the
+// only place the encoding exists -- every ioctl that reports a map handle
+// asks here, so the scheme is free to be this simple.
+
+uint64_t drm_gem_mmap_offset(struct drm_gem_object *o)
+{
+	return (uint64_t)o->id << 32;
+}
+
+/* Object by mmap offset (a reference), for the device node's mmap. */
+struct drm_gem_object *drm_gem_by_offset(struct drm_device *dev,
+					 uint64_t offset)
+{
+	uint32_t id = (uint32_t)(offset >> 32);
+	struct drm_gem_object *found = NULL;
+	uint64_t fl;
+
+	spin_lock_irqsave(&dev->lock, &fl);
+	for (struct drm_gem_object *o = dev->objects; o; o = o->next) {
+		if (o->id == id) {
+			drm_gem_get(o);
+			found = o;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dev->lock, fl);
+	return found;
+}
+
+/* ---- handles -------------------------------------------------------- */
+
+/* Handles name the file they belong to.
+ *
+ * A client that shares a surface passes the id its own file holds and the
+ * other side is expected to find the same object -- which a bare per-file
+ * index cannot do, because every file has an index 20.  Carrying the file
+ * in the upper half makes an id mean one object device-wide, so a
+ * reference by id can be resolved whoever created it, while every ordinary
+ * lookup stays the same array index it was. */
+#define DRM_HANDLE_SLOT_BITS 16
+#define DRM_HANDLE_SLOT_MASK ((1u << DRM_HANDLE_SLOT_BITS) - 1)
+
+static uint32_t drm_handle_make(struct drm_file *fp, uint32_t slot)
+{
+	return (fp->file_id << DRM_HANDLE_SLOT_BITS) | slot;
+}
+
+/* The handle naming a slot this file already holds. */
+uint32_t drm_gem_handle_of_slot(struct drm_file *fp, uint32_t slot)
+{
+	return drm_handle_make(fp, slot);
+}
+
+int drm_gem_handle_create(struct drm_file *fp, struct drm_gem_object *o,
+			  uint32_t *handle_out)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&fp->lock, &fl);
+	for (uint32_t h = 1; h < fp->nhandles; h++) {
+		if (!fp->handles[h]) {
+			drm_gem_get(o);
+			fp->handles[h] = o;
+			spin_unlock_irqrestore(&fp->lock, fl);
+			*handle_out = drm_handle_make(fp, h);
+			return 0;
+		}
+	}
+	/* Grow. */
+	uint32_t ncap = fp->nhandles ? fp->nhandles * 2 : 64;
+	if (ncap > DRM_MAX_HANDLES) {
+		spin_unlock_irqrestore(&fp->lock, fl);
+		return -ENOSPC;
+	}
+	spin_unlock_irqrestore(&fp->lock, fl);
+	struct drm_gem_object **nt = kalloc(ncap * sizeof(*nt));
+	if (!nt)
+		return -ENOMEM;
+	mm_memset(nt, 0, ncap * sizeof(*nt));
+	spin_lock_irqsave(&fp->lock, &fl);
+	if (fp->handles) {
+		mm_memcpy(nt, fp->handles, fp->nhandles * sizeof(*nt));
+		kfree(fp->handles);
+	}
+	uint32_t h = fp->nhandles ? fp->nhandles : 1;
+	fp->handles = nt;
+	fp->nhandles = ncap;
+	drm_gem_get(o);
+	fp->handles[h] = o;
+	spin_unlock_irqrestore(&fp->lock, fl);
+	*handle_out = drm_handle_make(fp, h);
+	return 0;
+}
+
+/* This file's own handle, and nothing else: the id has to name this file. */
+struct drm_gem_object *drm_gem_lookup(struct drm_file *fp, uint32_t handle)
+{
+	uint64_t fl;
+	struct drm_gem_object *o = NULL;
+	uint32_t slot = handle & DRM_HANDLE_SLOT_MASK;
+
+	if (!handle || (handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
+		return NULL;
+	spin_lock_irqsave(&fp->lock, &fl);
+	if (slot && slot < fp->nhandles && fp->handles[slot]) {
+		o = fp->handles[slot];
+		drm_gem_get(o);
+	}
+	spin_unlock_irqrestore(&fp->lock, fl);
+	return o;
+}
+
+/* An id belonging to ANOTHER file on the same device.
+ *
+ * This is how one process references a surface another created and told it
+ * about; the caller decides whether it is entitled to (see the surface
+ * reference path).  The device lock is held while the owning file is found
+ * and the reference taken, so a file closing concurrently either has not
+ * been unlinked yet -- and the object is referenced before it can go -- or
+ * has, and the lookup misses. */
+struct drm_gem_object *drm_gem_lookup_foreign(struct drm_device *dev,
+					      uint32_t handle)
+{
+	uint32_t owner = handle >> DRM_HANDLE_SLOT_BITS;
+	uint32_t slot = handle & DRM_HANDLE_SLOT_MASK;
+	struct drm_gem_object *o = NULL;
+	uint64_t fl;
+
+	if (!handle || !slot)
+		return NULL;
+	spin_lock_irqsave(&dev->lock, &fl);
+	for (struct drm_file *f = dev->files; f; f = f->next) {
+		if (f->file_id != owner)
+			continue;
+		if (slot < f->nhandles && f->handles[slot]) {
+			o = f->handles[slot];
+			drm_gem_get(o);
+		}
+		break;
+	}
+	spin_unlock_irqrestore(&dev->lock, fl);
+	return o;
+}
+
+int drm_gem_handle_delete(struct drm_file *fp, uint32_t handle)
+{
+	uint64_t fl;
+	struct drm_gem_object *o = NULL;
+
+	uint32_t slot = handle & DRM_HANDLE_SLOT_MASK;
+
+	if (!handle || (handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
+		return -EINVAL;
+	spin_lock_irqsave(&fp->lock, &fl);
+	if (slot && slot < fp->nhandles && fp->handles[slot]) {
+		o = fp->handles[slot];
+		fp->handles[slot] = NULL;
+	}
+	spin_unlock_irqrestore(&fp->lock, fl);
+	if (!o)
+		return -EINVAL;
+	drm_gem_put(o);
+	return 0;
+}
+
+/* ---- PRIME: dma-buf descriptors ----------------------------------------- */
+
+struct dmabuf_ctx {
+	struct drm_gem_object *obj;
+};
+
+static uint64_t dmabuf_page_phys(void *obj, uint64_t index)
+{
+	struct drm_gem_object *o = obj;
+	return o->dev->drv->gem_page_phys ? o->dev->drv->gem_page_phys(o, index) :
+					     0;
+}
+
+/* Region-record get/put for descriptor mappings; census as in drm_drv.c. */
+static void dmabuf_obj_get(void *obj)
+{
+	drm_gem_get(obj);
+	drm_gem_dirty_map_note(obj);
+}
+
+static void dmabuf_obj_put(void *obj)
+{
+	drm_gem_dirty_map_drop(obj);
+	drm_gem_put(obj);
+}
+
+/* Descriptor mappings address the object from byte zero of the
+ * descriptor, so their record offsets are object offsets already.  The
+ * sweeps never walk these records (they carry these callbacks, not the
+ * device node's, which is how the census notices them and answers with
+ * the whole object); only the write fault and the unmap harvest arrive
+ * here. */
+static void dmabuf_dirty_mkwrite(void *obj, uint64_t offset)
+{
+	drm_gem_dirty_fault_page(obj, offset / PAGE_SIZE);
+}
+
+static void dmabuf_dirty_page_dirty(void *obj, uint64_t offset)
+{
+	drm_gem_dirty_mark_page(obj, offset / PAGE_SIZE);
+}
+
+static int dmabuf_dirty_wp_new(void *obj)
+{
+	return drm_gem_dirty_wp_new_mapping(obj);
+}
+
+static const struct mm_dirty_ops dmabuf_dirty_ops = {
+	.mkwrite = dmabuf_dirty_mkwrite,
+	.page_dirty = dmabuf_dirty_page_dirty,
+	.wp_new_mapping = dmabuf_dirty_wp_new,
+};
+
+/* A mapping made through the descriptor rather than the device node: it
+ * writes the same pages, so it counts. */
+static int dmabuf_mmap(vfs_file_t *f, struct device_mmap *m)
+{
+	struct dmabuf_ctx *c = device_file_priv(f);
+	struct drm_gem_object *o = c->obj;
+
+	if (!o->dev->drv->gem_page_phys)
+		return -ENODEV;
+	if (m->offset + m->length > o->size)
+		return -EINVAL;
+	m->page_phys = dmabuf_page_phys;
+	m->obj = o;
+	m->get = dmabuf_obj_get;
+	m->put = dmabuf_obj_put;
+	m->pte_extra = o->dev->drv->gem_mmap_pte_extra;
+	m->dirty_ops = &dmabuf_dirty_ops;
+	drm_gem_get(o); /* the mapping's reference */
+	drm_gem_dirty_map_note(o); /* ...and the initial record's census entry */
+	return 0;
+}
+
+static short dmabuf_poll(vfs_file_t *f, short events, struct poll_table *pt)
+{
+	struct dmabuf_ctx *c = device_file_priv(f);
+	struct drm_fence *fence = c->obj->fence;
+
+	if (fence) {
+		poll_wait(pt, f, &fence->wq);
+		if (!fence->signaled)
+			return 0;
+	}
+	return events & (POLLIN | POLLOUT);
+}
+
+static long dmabuf_ioctl(vfs_file_t *f, unsigned long req, void *argp,
+			 struct task *cur)
+{
+	struct dmabuf_ctx *c = device_file_priv(f);
+	(void)cur;
+
+	if (_IOC_TYPE(req) != DMA_BUF_BASE)
+		return -ENOTTY;
+	switch (_IOC_NR(req)) {
+	case 0: { /* DMA_BUF_IOCTL_SYNC: wait for the device before CPU use */
+		struct dma_buf_sync s;
+		if (copy_from_user(&s, argp, sizeof(s)) != 0)
+			return -EFAULT;
+		if (!(s.flags & DMA_BUF_SYNC_END) && c->obj->fence)
+			drm_fence_wait(c->obj->fence, 2000000000ULL);
+		return 0;
+	}
+	case 1: /* DMA_BUF_SET_NAME */
+		return 0;
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int dmabuf_fstat(vfs_file_t *f, struct kstat *st)
+{
+	struct dmabuf_ctx *c = device_file_priv(f);
+	st->st_size = c->obj->size;
+	return 0;
+}
+
+static void dmabuf_release(vfs_file_t *f)
+{
+	struct dmabuf_ctx *c = device_file_priv(f);
+
+	if (c) {
+		drm_gem_put(c->obj);
+		kfree(c);
+	}
+}
+
+static const struct device_ops dmabuf_ops = {
+	.mmap = dmabuf_mmap,
+	.poll = dmabuf_poll,
+	.ioctl = dmabuf_ioctl,
+	.fstat = dmabuf_fstat,
+	.release = dmabuf_release,
+};
+
+int drm_prime_export(struct drm_file *fp, struct drm_gem_object *o, int flags)
+{
+	task_t *cur = sched_current();
+	struct dmabuf_ctx *c = kalloc(sizeof(*c));
+	(void)fp;
+
+	if (!c)
+		return -ENOMEM;
+	drm_gem_get(o);
+	c->obj = o;
+	vfs_file_t *file = device_anon_file(&dmabuf_ops, c, "dmabuf",
+					    (flags & O_RDWR) ? O_RDWR : O_RDONLY);
+	if (!file) {
+		drm_gem_put(o);
+		kfree(c);
+		return -ENOMEM;
+	}
+	file->refcount = 1;
+	int fd = fd_install(cur, file);
+	if (fd < 0) {
+		vfs_close(file);
+		return fd;
+	}
+	if (flags & O_CLOEXEC)
+		task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
+	return fd;
+}
+
+struct drm_gem_object *drm_prime_import(int fd)
+{
+	task_t *cur = sched_current();
+	vfs_file_t *f = fdget(cur, fd);
+
+	if (!f)
+		return NULL;
+	if (device_file_ops(f) != &dmabuf_ops) {
+		fdput(f);
+		return NULL;
+	}
+	struct dmabuf_ctx *c = device_file_priv(f);
+	struct drm_gem_object *o = c->obj;
+	drm_gem_get(o);
+	fdput(f);
+	return o;
+}

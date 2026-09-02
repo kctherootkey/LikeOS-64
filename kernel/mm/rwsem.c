@@ -40,8 +40,8 @@ static void mm_rwsem_park(mm_rwsem_t *sem, uint64_t *flags)
 	task_t *cur = sched_current();
 
 	if (cur) {
-		cur->state = TASK_BLOCKED;
 		cur->wait_channel = (void *)sem;
+		cur->state = TASK_BLOCKED;
 	}
 	spin_unlock_irqrestore(&sem->lock, *flags);
 	sched_schedule();
@@ -81,6 +81,46 @@ void mm_read_lock(mm_rwsem_t *sem)
 		}
 		mm_rwsem_park(sem, &flags);
 	}
+}
+
+/* One attempt at the shared hold, never parking.
+ *
+ * For callers that cannot park -- a page fault taken with interrupts disabled
+ * is the case this exists for.  It answers the same question mm_read_lock()
+ * does and grants the same three outcomes, but where that one would sleep this
+ * one says no, so the caller can refuse whatever it was about to do instead of
+ * doing it without the lock.
+ *
+ * Note there is no might_sleep(): not sleeping is the entire point. */
+bool mm_read_trylock(mm_rwsem_t *sem)
+{
+	task_t *cur;
+	uint64_t my_id, flags;
+
+	BUG_ON(sem == NULL);
+	cur = sched_current();
+	my_id = cur ? cur->id : 0;
+
+	spin_lock_irqsave(&sem->lock, &flags);
+	if (sem->writer && sem->owner == my_id && cur) {
+		/* Already ours exclusively — recursion, as in mm_read_lock(). */
+		sem->wdepth++;
+		spin_unlock_irqrestore(&sem->lock, flags);
+		return true;
+	}
+	{
+		int defer = sem->w_wait && !(cur && cur->mm_rdepth);
+
+		if (!sem->writer && !defer) {
+			sem->readers++;
+			if (cur)
+				cur->mm_rdepth++;
+			spin_unlock_irqrestore(&sem->lock, flags);
+			return true;
+		}
+	}
+	spin_unlock_irqrestore(&sem->lock, flags);
+	return false;
 }
 
 void mm_read_unlock(mm_rwsem_t *sem)

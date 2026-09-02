@@ -837,3 +837,17 @@ size_t strxfrm(char *dest, const char *src, size_t n)
 	}
 	return len;
 }
+
+char *strchrnul(const char *s, int c)
+{
+	while (*s && *s != (char)c)
+		s++;
+	return (char *)s;
+}
+
+void explicit_bzero(void *s, size_t n)
+{
+	volatile unsigned char *p = (volatile unsigned char *)s;
+	while (n--)
+		*p++ = 0;
+}

@@ -281,7 +281,7 @@
 #define GPIO_NOMAP (-1)
 
 // ============================================================================
-// Platform GPIO lookup tables (like Linux pinctrl-intel)
+// Platform GPIO lookup tables (as the reference pinctrl-intel driver keeps them)
 // ============================================================================
 
 // Per-group definition from hardware spec

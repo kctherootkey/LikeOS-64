@@ -22,9 +22,10 @@
 # several small X apps into aggregate source packages, and unpacking those
 # would no longer be the upstream tree.
 #
-# Every download is recorded in checksums.sha256.  On a later run an existing
-# tarball is verified against that file rather than re-fetched, so the set is
-# reproducible and a corrupted or substituted tarball is caught.
+# Every download is recorded in checksums.sha256, and every archive present is
+# verified against that record at the end of each run -- so the set is
+# reproducible and a corrupted or substituted archive is caught rather than
+# absorbed.  A mismatch fails the fetch and leaves the record alone.
 #
 # Usage:  ./fetch.sh [package ...]      (no arguments = everything)
 
@@ -235,12 +236,56 @@ while read -r section name version deb repo rest; do
 	fi
 done <"$list"
 
-# Record what we have, so a later run verifies instead of re-downloading and a
-# substituted tarball is noticed.
-( cd "$port" && sha256sum *.tar.* 2>/dev/null | sort -k2 ) >"$sums.new"
+# Verify what is on disk against what was recorded, then record anything new.
+#
+# This used to rewrite the file from whatever the directory happened to
+# contain, which is why the promise made at the top of this script -- that a
+# later run verifies an existing tarball and notices a substituted one -- was
+# never kept: a replaced tarball simply had its new checksum written over the
+# old one, and nothing ever compared the two.  A recorded checksum is now
+# AUTHORITY.  It is checked, never silently replaced, and a mismatch fails the
+# fetch rather than being absorbed into the record.
+#
+# That matters most for the archives git does not carry.  Two are too large to
+# commit (LLVM, and the Noto Sans zip) and arrive over the network on a fresh
+# clone; the recorded checksum is the only thing standing between that download
+# and the build.
+#
+# `.zip' is covered as well as `.tar.*'.  The glob here used to be `*.tar.*'
+# alone, so the two zip archives in the GTK3 port were never recorded at all --
+# including the one the paragraph above depends on.
+verify_failed=0
+: >"$sums.new"
+for f in "$port"/*.tar.* "$port"/*.zip; do
+	[ -f "$f" ] || continue # an unmatched glob is the literal pattern
+	base=${f##*/}
+	have=$(sha256sum "$f" | cut -d' ' -f1)
+	want=$(awk -v b="$base" '$2 == b { print $1; exit }' "$sums" 2>/dev/null)
+	if [ -n "$want" ] && [ "$have" != "$want" ]; then
+		echo "  BAD  $base" >&2
+		echo "         recorded $want" >&2
+		echo "         on disk  $have" >&2
+		verify_failed=$((verify_failed + 1))
+		continue
+	fi
+	[ -n "$want" ] || echo "  new  $base (recording its checksum)"
+	printf '%s  %s\n' "$have" "$base" >>"$sums.new"
+done
+
+if [ "$verify_failed" -gt 0 ]; then
+	# The record is left exactly as it was: it describes the bytes this
+	# port was built and tested against, and the ones on disk are not
+	# them.  Delete the offending archive and re-run to fetch it again.
+	rm -f "$sums.new"
+	echo "$verify_failed archive(s) do not match $(basename "$sums"); \
+record left untouched" >&2
+	exit 1
+fi
+
 if [ -s "$sums.new" ]; then
+	sort -k2 "$sums.new" -o "$sums.new"
 	mv "$sums.new" "$sums"
-	echo "checksums written to $(basename "$sums")"
+	echo "checksums verified/written to $(basename "$sums")"
 else
 	rm -f "$sums.new"
 fi

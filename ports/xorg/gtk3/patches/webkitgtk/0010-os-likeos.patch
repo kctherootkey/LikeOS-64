@@ -1,0 +1,201 @@
+Declare this system to WTF: OS(LIKEOS).
+
+Until now the engine compiled here only because it found `unix' defined and
+took the generic POSIX arms.  That was enough for a cairo-rendering,
+interpreter-only build, and it is not enough for this one: the JIT and the
+sampling profiler need to read and write the machine context out of a signal
+frame, and the code that does so is selected by operating system, not by a
+feature test.  There is no arm this system can take, so HAVE_MACHINE_CONTEXT
+stays undefined and the profiler is compiled out -- silently.
+
+So the platform gets a name.  OS(LIKEOS) is defined from __LIKEOS__ (which
+the port's compiler wrapper defines) and joins OS(UNIX), which it already
+qualified for through `unix'.  Nothing that was taking a POSIX arm changes.
+
+The five capabilities it is then added to are each true here, and each was
+verified rather than assumed:
+
+  HAVE_MACHINE_CONTEXT -- the kernel now delivers a real ucontext_t as the
+    third argument of a SA_SIGINFO handler, with the conventional x86-64
+    gregs[] layout and REG_* indices, and sigreturn restores what the handler
+    edited (kernel/ke/signal.c).  That is exactly what the OS(LINUX) arm of
+    MachineContext.h reads, so that arm is extended rather than copied.
+  HAVE_MADV_FREE / HAVE_MADV_DONTNEED -- both are implemented
+    (kernel/mm/madvise.c).
+  HAVE_DLADDR -- the dynamic loader answers it (user/lib/rtld).
+  HAVE_FALLOCATE -- implemented (kernel/fs/read_write.c).
+  HAVE_INT128_T -- a compiler property on a 64-bit target, listed by OS
+    upstream; the compiler is the same GCC.
+
+InlineASM.h gets the same treatment for a different reason: the LLInt is
+generated as inline assembly, and the local-label syntax and the directive
+that hides a symbol are chosen there by operating system too.  With no arm
+matching, LOCAL_LABEL_STRING went undefined and the generated
+LLIntAssembly.h did not compile at all ("expected â)â before
+âLOCAL_LABEL_STRINGâ").  The object format here is ELF and the
+assembler is GNU as, so this system belongs in the arm that says so.
+
+--- a/Source/WTF/wtf/PlatformOS.h
++++ b/Source/WTF/wtf/PlatformOS.h
+@@ -107,6 +107,11 @@
+ #define WTF_OS_HURD 1
+ #endif
+ 
++/* OS(LIKEOS) - LikeOS */
++#if defined(__LIKEOS__)
++#define WTF_OS_LIKEOS 1
++#endif
++
+ /* OS(LINUX) - Linux */
+ #if defined(__linux__)
+ #define WTF_OS_LINUX 1
+@@ -139,6 +144,7 @@
+     || OS(FUCHSIA)          \
+     || OS(HAIKU)            \
+     || OS(HURD)             \
++    || OS(LIKEOS)           \
+     || OS(LINUX)            \
+     || OS(NETBSD)           \
+     || OS(OPENBSD)          \
+--- a/Source/WTF/wtf/PlatformHave.h
++++ b/Source/WTF/wtf/PlatformHave.h
+@@ -192,7 +192,7 @@
+ #endif
+ 
+ /* watchOS (ARM64_32) must not use int128_t because of wrong behavior. */
+-#if (OS(DARWIN) || OS(LINUX)) && CPU(ADDRESS64)
++#if (OS(DARWIN) || OS(LINUX) || OS(LIKEOS)) && CPU(ADDRESS64)
+ #define HAVE_INT128_T 1
+ #endif
+ 
+@@ -208,7 +208,7 @@
+ #define HAVE_DISPATCH_H 1
+ #endif
+ 
+-#if OS(DARWIN) || OS(HAIKU)
++#if OS(DARWIN) || OS(HAIKU) || OS(LIKEOS)
+ #define HAVE_MADV_FREE 1
+ #endif
+ 
+@@ -216,7 +216,7 @@
+ #define HAVE_MADV_FREE_REUSE 1
+ #endif
+ 
+-#if OS(DARWIN) || OS(HAIKU) || OS(QNX)
++#if OS(DARWIN) || OS(HAIKU) || OS(QNX) || OS(LIKEOS)
+ #define HAVE_MADV_DONTNEED 1
+ #endif
+ 
+@@ -240,7 +240,7 @@
+ #define HAVE_MACH_MEMORY_ENTRY 1
+ #endif
+ 
+-#if OS(DARWIN) || OS(FUCHSIA) || ((OS(FREEBSD) || OS(HAIKU) || OS(NETBSD) || OS(OPENBSD) || OS(LINUX) || OS(HURD) || OS(QNX)) && (CPU(X86_64) || CPU(ARM) || CPU(ARM64) || CPU(RISCV64)))
++#if OS(DARWIN) || OS(FUCHSIA) || ((OS(FREEBSD) || OS(HAIKU) || OS(NETBSD) || OS(OPENBSD) || OS(LINUX) || OS(LIKEOS) || OS(HURD) || OS(QNX)) && (CPU(X86_64) || CPU(ARM) || CPU(ARM64) || CPU(RISCV64)))
+ #define HAVE_MACHINE_CONTEXT 1
+ #endif
+ 
+@@ -249,11 +249,11 @@
+ #define HAVE_BACKTRACE_SYMBOLS 1
+ #endif
+ 
+-#if OS(DARWIN) || OS(HAIKU) || OS(LINUX) || OS(HURD)
++#if OS(DARWIN) || OS(HAIKU) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ #define HAVE_DLADDR 1
+ #endif
+ 
+-#if OS(LINUX)
++#if OS(LINUX) || OS(LIKEOS)
+ #define HAVE_FALLOCATE 1
+ #endif
+ 
+--- a/Source/JavaScriptCore/runtime/MachineContext.h
++++ b/Source/JavaScriptCore/runtime/MachineContext.h
+@@ -187,7 +187,7 @@
+ #error Unknown Architecture
+ #endif
+ 
+-#elif OS(FUCHSIA) || OS(LINUX) || OS(HURD)
++#elif OS(FUCHSIA) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ 
+ #if CPU(X86_64)
+     return reinterpret_cast<void*&>((uintptr_t&) machineContext.gregs[REG_RSP]);
+@@ -304,7 +304,7 @@
+ #error Unknown Architecture
+ #endif
+ 
+-#elif OS(FUCHSIA) || OS(LINUX) || OS(HURD)
++#elif OS(FUCHSIA) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ 
+ // The following sequence depends on glibc's sys/ucontext.h.
+ #if CPU(X86_64)
+@@ -462,7 +462,7 @@
+ #error Unknown Architecture
+ #endif
+ 
+-#elif OS(FUCHSIA) || OS(LINUX) || OS(HURD)
++#elif OS(FUCHSIA) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ 
+ // The following sequence depends on glibc's sys/ucontext.h.
+ #if CPU(X86_64)
+@@ -634,7 +634,7 @@
+ #error Unknown Architecture
+ #endif
+ 
+-#elif OS(FUCHSIA) || OS(LINUX) || OS(HURD)
++#elif OS(FUCHSIA) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ 
+ // The following sequence depends on glibc's sys/ucontext.h.
+ #if CPU(X86_64)
+@@ -691,7 +691,7 @@
+ #error Unknown Architecture
+ #endif
+ 
+-#elif OS(FUCHSIA) || OS(LINUX) || OS(HURD)
++#elif OS(FUCHSIA) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ 
+ // The following sequence depends on glibc's sys/ucontext.h.
+ #if CPU(X86_64)
+@@ -808,7 +808,7 @@
+ #error Unknown Architecture
+ #endif
+ 
+-#elif OS(FUCHSIA) || OS(LINUX) || OS(HURD)
++#elif OS(FUCHSIA) || OS(LINUX) || OS(LIKEOS) || OS(HURD)
+ 
+ // The following sequence depends on glibc's sys/ucontext.h.
+ #if CPU(X86_64)
+--- a/Source/WTF/wtf/InlineASM.h
++++ b/Source/WTF/wtf/InlineASM.h
+@@ -64,6 +64,7 @@
+     // IBM's own file format
+ #define HIDE_SYMBOL(name) ".lglobl " #name
+ #elif  OS(LINUX)               \
++    || OS(LIKEOS)              \
+     || OS(FREEBSD)             \
+     || OS(FUCHSIA)             \
+     || OS(HAIKU)               \
+@@ -83,6 +84,7 @@
+ #if OS(DARWIN)
+ #define LOCAL_LABEL_STRING(name) "L" #name
+ #elif  OS(LINUX)               \
++    || OS(LIKEOS)              \
+     || OS(FREEBSD)             \
+     || OS(FUCHSIA)             \
+     || OS(OPENBSD)             \
+--- a/Source/WTF/wtf/glib/FileSystemGlib.cpp
++++ b/Source/WTF/wtf/glib/FileSystemGlib.cpp
+@@ -60,7 +60,12 @@
+ #endif
+ }
+ 
+-#if OS(LINUX)
++/* LIKEOS reads the same path: its /proc gives every process a `self' entry
++ * with an `exe' link to the file it was loaded from.  Without this arm the
++ * generic Unix one below is taken, which looks for /proc/curproc/file --
++ * a name that does not exist here -- and every caller is told the path is
++ * unknown. */
++#if OS(LINUX) || OS(LIKEOS)
+ CString currentExecutablePath()
+ {
+     static char readLinkBuffer[PATH_MAX];

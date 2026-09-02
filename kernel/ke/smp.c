@@ -1,6 +1,7 @@
 // LikeOS-64 - SMP (Symmetric Multi-Processing) Implementation
 // AP startup, CPU synchronization, and SMP management
 
+#include <kernel/ke/fpu.h>
 #include <kernel/ke/smp.h>
 #include <kernel/hal/acpi.h>
 #include <kernel/hal/lapic.h>
@@ -138,6 +139,9 @@ __no_stack_protector void ap_entry(void)
 
 	// Enable SMEP/SMAP (per-CPU CR4 bits)
 	mm_enable_smep_smap();
+	/* Same XCR0 as the BSP: a task's XSAVE image must mean the same
+	 * thing on whichever CPU restores it. */
+	fpu_init_cpu();
 
 	// Program IA32_PAT entry 1 = WC (per-CPU MSR; must match the BSP or the
 	// framebuffer runs effective-UC on this AP -- ~90x slower flushes).

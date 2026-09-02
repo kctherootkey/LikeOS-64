@@ -21,6 +21,10 @@ extern "C" {
 #define RTLD_NOLOAD     0x0004  /* Don't load, just return handle if already loaded */
 #define RTLD_NODELETE   0x1000  /* Don't unload on dlclose() */
 
+/* dlsym() with a symbol version: versions are not recorded here, so the
+ * name alone is looked up. */
+void* dlvsym(void* handle, const char* symbol, const char* version);
+
 /* Pseudo-handles for dlsym() */
 #define RTLD_DEFAULT    ((void *)0)   /* Search default symbol scope */
 #define RTLD_NEXT       ((void *)-1)  /* Search next object after caller */

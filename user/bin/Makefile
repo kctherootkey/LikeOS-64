@@ -6,7 +6,12 @@ RTLD_DIR = ../lib/rtld
 LIBPAM_DIR = ../lib/libpam
 LIBCRYPT_DIR = ../lib/libcrypt
 
-CFLAGS = -Wall -Wextra -Werror=implicit-function-declaration \
+# Header dependencies: without them a change to a libc header rebuilt none of
+# these programs, so a binary could be linked against a libc whose structures
+# it was not compiled for.  See the note in the top Makefile.
+DEPFLAGS = -MMD -MP
+
+CFLAGS = $(DEPFLAGS) -Wall -Wextra -Werror=implicit-function-declaration \
 	-Werror=misleading-indentation -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include \
          -I$(LIBPAM_DIR)/include \
@@ -46,12 +51,12 @@ AUTH_LDFLAGS = -L$(LIBPAM_DIR) -L$(LIBCRYPT_DIR) \
 
 # Programs (sources live alongside this Makefile in user/bin/)
 # getty/init link only against libc; login needs libpam+libcrypt (custom rule below).
-PROGRAMS = hello ls cat cmp pwd stat progerr memstat uname nproc shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink getty init id whoami groups adduser deluser permbench kdump
+PROGRAMS = hello ls cat cmp pwd stat progerr memstat uname nproc shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink getty init id whoami groups adduser deluser permbench kdump drminfo
 
 # Test programs (sources live in user/bin/tests/, built as tests/<name>)
 # test_libc has a custom rule (needs libpam+libcrypt for the auth tests).
 TESTS = test_syscalls testmem teststress netstress openssltest usbtest ext4test fbtest pmap ttydump \
-	forkstress
+	forkstress wkstress codecheck
 TEST_BINS = $(addprefix tests/,$(TESTS))
 
 all: $(PROGRAMS) $(TEST_BINS) tests/test_libc login passwd su addgroup delgroup reboot halt
@@ -102,5 +107,9 @@ halt: poweroff
 
 clean:
 	rm -f *.o $(PROGRAMS) login passwd su addgroup delgroup reboot halt tests/*.o $(TEST_BINS) tests/test_libc
+	rm -f *.d tests/*.d shell/*.d
 
 .PHONY: all clean
+
+# The header dependencies recorded by -MMD above.
+-include $(wildcard *.d tests/*.d shell/*.d)

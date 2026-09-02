@@ -65,6 +65,10 @@ typedef struct shm_object {
 	unsigned uid;
 	unsigned gid;
 	unsigned long ino; /* stable identity for fstat */
+	/* memfd seals (F_SEAL_*): 0 for a named object, F_SEAL_SEAL for a
+	 * memfd created without MFD_ALLOW_SEALING. */
+	unsigned seals;
+	int sealable;
 } shm_object_t;
 
 void shm_init(void);

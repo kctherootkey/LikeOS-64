@@ -974,6 +974,20 @@ int console_reinit_framebuffer(framebuffer_info_t *fb)
 	WARN_ON_ONCE(max_cols == 0 || max_rows == 0);
 	g_sb.visible_lines = max_rows;
 
+	/* A taller screen shows more of the scrollback at once, so the
+	 * furthest the view can be scrolled back moves up.  A viewport left
+	 * where it was would sit past the end of the ring -- the view would
+	 * be short of lines at the bottom, and the scrollbar's thumb would
+	 * hang off the end of its track. */
+	{
+		uint32_t eff = sb_effective_total();
+		uint32_t max_vp = (eff > max_rows) ? (eff - max_rows) : 0;
+		if (g_sb.viewport_top > max_vp) {
+			g_sb.viewport_top = max_vp;
+			g_sb.at_bottom = 1;
+		}
+	}
+
 	// Swap the double-buffer backend to the new front buffer/geometry
 	if (fb_reinit(fb_info) != 0) {
 		spin_unlock_irqrestore(&console_lock, flags);

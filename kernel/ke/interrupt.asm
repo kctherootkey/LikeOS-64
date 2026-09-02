@@ -338,6 +338,39 @@ IRQ 28, 60              ; MSI: e1000e NIC
 ; vmxnet3 paravirt NIC MSI vector (61)
 IRQ 29, 61              ; MSI: vmxnet3 NIC
 
+; HPET comparator interrupt for the high-resolution timer queue
+IRQ 30, 62              ; hrtimer (HPET one-shot comparator)
+
+; ----------------------------------------------------------------------------
+; Vectors 63..127: handed out at run time by irq_alloc_vector() (MSI/MSI-X
+; lines for drivers that register through kernel/ke/irq.c).  One stub each,
+; and a table of their addresses so the IDT can be filled in a loop.
+; ----------------------------------------------------------------------------
+%macro IRQ_VEC 1
+global irq_vec%1
+irq_vec%1:
+    cli
+    push 0
+    push %1
+    jmp irq_common_stub
+%endmacro
+
+%assign vec 63
+%rep 65
+IRQ_VEC vec
+%assign vec vec+1
+%endrep
+
+section .data
+global irq_dyn_stub_table
+irq_dyn_stub_table:
+%assign vec 63
+%rep 65
+    dq irq_vec%+vec
+%assign vec vec+1
+%endrep
+section .text
+
 ; ============================================================================
 ; IPI (Inter-Processor Interrupt) Handlers for SMP
 ; These are high-vector interrupts sent between CPUs via LAPIC

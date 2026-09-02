@@ -1,5 +1,5 @@
 // LikeOS-64 Hardware Abstraction Layer - Visual Scrollbar Implementation
-// Linux Gnome Chrome-style scrollbar rendering system
+// Desktop-browser-style scrollbar rendering system
 
 #include <kernel/io/scrollbar.h>
 #include <kernel/dev/video/fb.h>
@@ -492,14 +492,19 @@ void scrollbar_compute_geometry(scrollbar_t *sb)
 	sb->thumb_height = h;
 	// Map scroll_position to thumb_y within track
 	uint32_t max_scroll = sb->total_content - sb->visible_content;
+	/* A position past the end scrolls the thumb off the track.  It is not
+	 * this code's business how the caller ended up there -- a screen that
+	 * grew taller leaves a viewport further back than the content now
+	 * allows -- but the geometry has to come out inside the track. */
+	uint32_t pos = clampu32(sb->scroll_position, 0, max_scroll);
 	uint32_t track_range = (sb->track_height > sb->thumb_height) ?
 				       (sb->track_height - sb->thumb_height) :
 				       0;
 	uint32_t ty = sb->track_y;
 	if (max_scroll > 0 && track_range > 0) {
 		ty = sb->track_y +
-		     (uint32_t)((uint64_t)sb->scroll_position *
-				(uint64_t)track_range / (uint64_t)max_scroll);
+		     (uint32_t)((uint64_t)pos * (uint64_t)track_range /
+				(uint64_t)max_scroll);
 	}
 	sb->thumb_y = ty;
 	WARN_ON(sb->thumb_y <

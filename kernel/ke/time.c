@@ -1,4 +1,6 @@
 // LikeOS-64 -- time of day, clocks, sleeping and interval timers.
+#include <kernel/ke/hrtimer.h>
+#include <kernel/ke/signal.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -270,89 +272,95 @@ int64_t sys_timer_delete(uint64_t timerid)
 	return timer_delete_internal((ktimer_t)timerid);
 }
 
+/* Sleep on the high-resolution timer queue until an absolute monotonic
+ * deadline; on a signal, write what was left to *rem_ptr (relative) and
+ * report EINTR.  Shared by nanosleep and clock_nanosleep. */
+static int64_t sleep_until_ns(uint64_t abs_ns, uint64_t rem_ptr)
+{
+	uint64_t remaining = 0;
+	int rc = hrtimer_sleep_until(abs_ns, &remaining);
+
+	if (rc == -EINTR && rem_ptr) {
+		struct k_timespec rem;
+
+		rem.tv_sec = remaining / 1000000000ULL;
+		rem.tv_nsec = remaining % 1000000000ULL;
+		if (copy_to_user((void *)rem_ptr, &rem, sizeof(rem)) != 0)
+			return -EFAULT;
+	}
+	return rc;
+}
+
+static int timespec_valid(const struct k_timespec *ts)
+{
+	return ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L;
+}
+
 // SYS_NANOSLEEP - sleep with nanosecond precision
-// Uses timer-based wakeup: set wakeup_tick and block, timer IRQ wakes us
 int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr)
 {
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-
 	struct k_timespec req;
-	if (copy_from_user(&req, (void *)req_ptr, sizeof(struct k_timespec)) !=
-	    0) {
-		return -EFAULT;
-	}
 
-	// Calculate ticks to sleep using measured timer frequency.
-	//
-	// Two boundary corrections vs. the obvious floor division:
-	//
-	//   1. ROUND UP nsec→ticks.  For sub-tick requests (e.g. usleep(1500)
-	//      at 100 Hz) floor gives 0; we'd then clamp to 1 tick which is
-	//      fine, but for requests that fall between tick multiples (e.g.
-	//      15 ms at 100 Hz, floor = 1) the original code returned after
-	//      only 10 ms — less than requested.  Ceiling math fixes that.
-	//
-	//   2. ADD ONE EXTRA TICK to absorb the partial-tick uncertainty at
-	//      the start of the sleep.  timer_ticks() was read at some
-	//      unknown fraction ε ∈ [0, 1 tick) past the most recent timer
-	//      IRQ; the next timer IRQ fires after (1 tick − ε) wall time,
-	//      and subsequent IRQs are 1 tick apart.  Without the +1, a 100
-	//      ms request at 100 Hz could return after as little as 9·10 ms
-	//      = 90 ms of wall time (when ε ≈ 0).  Combined with TSC vs PIT
-	//      calibration drift in clock_gettime, this is why
-	//      "Timer accuracy under CPU load" reports 79 ms for a 100 ms
-	//      usleep and fails the >= 80 ms check.
-	uint32_t freq = timer_get_frequency();
-	if (freq == 0)
-		freq = 100;
+	if (copy_from_user(&req, (void *)req_ptr, sizeof(struct k_timespec)) !=
+	    0)
+		return -EFAULT;
+	if (!timespec_valid(&req))
+		return -EINVAL;
+
 	uint64_t total_ns =
 		(uint64_t)req.tv_sec * 1000000000ULL + (uint64_t)req.tv_nsec;
-	uint64_t ticks =
-		(total_ns * (uint64_t)freq + 999999999ULL) / 1000000000ULL;
-	if (ticks == 0 && total_ns > 0) {
-		ticks = 1;
-	}
-	if (ticks > 0) {
-		ticks +=
-			1; // Partial-tick boundary compensation (see comment above).
-	}
+	if (total_ns == 0)
+		return 0;
+	return sleep_until_ns(hrtimer_now_ns() + total_ns, rem_ptr);
+}
 
-	uint64_t start = timer_ticks();
-	uint64_t end = start + ticks;
+/* SYS_CLOCK_NANOSLEEP - nanosleep against a named clock, optionally to an
+ * absolute deadline (TIMER_ABSTIME).  An absolute sleep reports no
+ * remaining time, as the deadline itself is the remaining time. */
+int64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_ptr,
+			    uint64_t rem_ptr)
+{
+	struct k_timespec req;
 
-	// Loop until sleep time expires or interrupted by signal
-	while (timer_ticks() < end) {
-		// Check for pending signal BEFORE blocking
-		if (signal_pending(cur)) {
-			if (rem_ptr) {
-				uint64_t now = timer_ticks();
-				uint64_t elapsed = now - start;
-				uint64_t remaining =
-					(elapsed < ticks) ? ticks - elapsed : 0;
-				struct k_timespec rem;
-				rem.tv_sec = remaining / freq;
-				rem.tv_nsec = (uint64_t)(remaining % freq) *
-					      1000000000ULL / freq;
-				copy_to_user((void *)rem_ptr, &rem,
-					     sizeof(struct k_timespec));
-			}
-			cur->wakeup_tick = 0;
-			return -EINTR;
+	switch (clk_id) {
+	case CLOCK_REALTIME:
+	case CLOCK_MONOTONIC:
+	case CLOCK_MONOTONIC_RAW:
+	case CLOCK_BOOTTIME:
+	case CLOCK_REALTIME_COARSE:
+	case CLOCK_MONOTONIC_COARSE:
+		break;
+	case CLOCK_PROCESS_CPUTIME:
+	case CLOCK_THREAD_CPUTIME:
+		return -EOPNOTSUPP;
+	default:
+		return -EINVAL;
+	}
+	if (copy_from_user(&req, (void *)req_ptr, sizeof(struct k_timespec)) !=
+	    0)
+		return -EFAULT;
+	if (!timespec_valid(&req))
+		return -EINVAL;
+
+	uint64_t req_ns =
+		(uint64_t)req.tv_sec * 1000000000ULL + (uint64_t)req.tv_nsec;
+	uint64_t abs_ns;
+
+	if (flags & TIMER_ABSTIME) {
+		/* Translate a REALTIME deadline into the monotonic clock the
+		 * timers run on; the two differ by the boot epoch. */
+		if (clk_id == CLOCK_REALTIME || clk_id == CLOCK_REALTIME_COARSE) {
+			uint64_t epoch_ns =
+				timer_get_boot_epoch() * 1000000000ULL;
+			abs_ns = req_ns > epoch_ns ? req_ns - epoch_ns : 0;
+		} else {
+			abs_ns = req_ns;
 		}
-
-		// Set wakeup timer and block - timer IRQ will wake us
-		cur->wakeup_tick = end;
-		cur->state = TASK_BLOCKED;
-		sched_schedule();
-
-		// Woken up - either by timer expiry or signal
-		// Loop will check timer and signal conditions
+		return sleep_until_ns(abs_ns, 0);
 	}
-
-	cur->wakeup_tick = 0;
-	return 0;
+	if (req_ns == 0)
+		return 0;
+	return sleep_until_ns(hrtimer_now_ns() + req_ns, rem_ptr);
 }
 
 // SYS_CLOCK_GETTIME - get time from specified clock
@@ -369,11 +377,18 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 	uint64_t frac_ns = (total_us % 1000000ULL) * 1000ULL;
 
 	switch (clk_id) {
-	case 0: // CLOCK_REALTIME
+	case CLOCK_REALTIME:
+	case CLOCK_REALTIME_COARSE:
 		tp.tv_sec = timer_get_boot_epoch() + total_secs;
 		tp.tv_nsec = frac_ns;
 		break;
-	case 1: // CLOCK_MONOTONIC
+	case CLOCK_MONOTONIC:
+	case CLOCK_MONOTONIC_RAW:
+	case CLOCK_MONOTONIC_COARSE:
+	case CLOCK_BOOTTIME:
+		/* One clock behind all four names: nothing here slews or
+		 * suspends, so RAW and BOOTTIME cannot differ from MONOTONIC,
+		 * and the COARSE variants are simply not any coarser. */
 		tp.tv_sec = total_secs;
 		tp.tv_nsec = frac_ns;
 		break;
@@ -435,7 +450,7 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 // SYS_CLOCK_GETRES - get clock resolution
 int64_t sys_clock_getres(uint64_t clk_id, uint64_t res_ptr)
 {
-	if (clk_id > 3) {
+	if (clk_id > CLOCK_BOOTTIME && clk_id < 0x40000000) {
 		return -EINVAL;
 	}
 

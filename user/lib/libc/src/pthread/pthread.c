@@ -24,7 +24,11 @@
 
 // Default stack size: 2MB with 4KB guard page
 #define PTHREAD_STACK_MIN (16 * 1024) // 16 KB minimum
-#define PTHREAD_STACK_DEFAULT (2 * 1024 * 1024) // 2 MB default
+/* 8 MB, the conventional default.  Compiler back ends (a browser's JIT
+ * tiers, LLVM inside the GL driver) recurse deeply on worker threads and
+ * overflowed the 2 MB this used to be; the pages are demand-faulted, so
+ * the size costs nothing until used. */
+#define PTHREAD_STACK_DEFAULT (8 * 1024 * 1024)
 #define PTHREAD_GUARD_SIZE (4 * 1024) // 4 KB guard page
 
 // TLS block layout (dynamic sizing)
@@ -769,6 +773,62 @@ int pthread_getcpuclockid(pthread_t thread, clockid_t *clockid)
 	*clockid = (clockid_t)(CLOCK_TID_CPUTIME_BASE |
 			       (thread->tid & 0x3FFFFFFF));
 	return 0;
+}
+
+/* Up to this many atfork handler triples. */
+#define ATFORK_MAX 32
+static struct {
+	void (*prepare)(void);
+	void (*parent)(void);
+	void (*child)(void);
+} g_atfork[ATFORK_MAX];
+static int g_atfork_n;
+
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+		   void (*child)(void))
+{
+	if (g_atfork_n >= ATFORK_MAX)
+		return ENOMEM;
+	g_atfork[g_atfork_n].prepare = prepare;
+	g_atfork[g_atfork_n].parent = parent;
+	g_atfork[g_atfork_n].child = child;
+	g_atfork_n++;
+	return 0;
+}
+
+/* Called by fork(): prepare handlers in reverse registration order, the
+ * others in registration order. */
+void __atfork_run_prepare(void)
+{
+	for (int i = g_atfork_n - 1; i >= 0; i--)
+		if (g_atfork[i].prepare)
+			g_atfork[i].prepare();
+}
+
+void __atfork_run_parent(void)
+{
+	for (int i = 0; i < g_atfork_n; i++)
+		if (g_atfork[i].parent)
+			g_atfork[i].parent();
+}
+
+void __atfork_run_child(void)
+{
+	for (int i = 0; i < g_atfork_n; i++)
+		if (g_atfork[i].child)
+			g_atfork[i].child();
+}
+
+int pthread_tryjoin_np(pthread_t thread, void **retval)
+{
+	if (!thread)
+		return EINVAL;
+	struct __pthread *tcb = thread;
+	if (tcb->detach_state == PTHREAD_CREATE_DETACHED)
+		return EINVAL;
+	if (tcb->tid_futex != 0)
+		return EBUSY;
+	return pthread_join(thread, retval);
 }
 
 int pthread_join(pthread_t thread, void **retval)

@@ -294,7 +294,12 @@ typedef struct {
 #define AT_EUID   12
 #define AT_GID    13
 #define AT_EGID   14
+#define AT_PLATFORM 15
+#define AT_HWCAP  16
+#define AT_CLKTCK 17
 #define AT_SECURE 23
+#define AT_HWCAP2 26
+#define AT_EXECFN 31
 #define AT_RANDOM 25
 
 /* Note header, as found in PT_NOTE segments. */

@@ -150,6 +150,50 @@ int at_quick_exit(void (*func)(void))
  * and only begins again if the list actually changed while it was running,
  * which is the case the re-scan was there for.
  */
+/*
+ * Drop every handler that would call into [base, base + size).
+ *
+ * A shared object that is unloaded must leave no handler behind pointing
+ * into it, or exit() jumps into memory that is no longer mapped.  The
+ * registration's own tag is not enough to guarantee that: atexit(3) has no
+ * way to name the object its caller lives in -- the function is compiled
+ * once, here, so the only handle it could pass is this one's -- and a
+ * handler registered that way outlives the object that asked for it.
+ *
+ * So the loader says which address range is going away and everything
+ * pointing into it goes, whatever it was tagged with.  Both halves are
+ * checked: the function to call, and the argument, which for an atexit(3)
+ * handler IS the function.
+ */
+void __cxa_purge_range(void *base, unsigned long size)
+{
+	uintptr_t lo = (uintptr_t)base;
+	uintptr_t hi = lo + size;
+
+	if (!base || !size)
+		return;
+	exit_lock_acquire();
+	for (struct exit_block *b = exit_head; b; b = b->next) {
+		size_t i = 0;
+		while (i < b->count) {
+			uintptr_t fn = (uintptr_t)b->h[i].fn;
+			uintptr_t arg = (uintptr_t)b->h[i].arg;
+
+			if ((fn >= lo && fn < hi) || (arg >= lo && arg < hi)) {
+				/* Order among the survivors is preserved:
+				 * later handlers still run before earlier
+				 * ones, which is what exit(3) promises. */
+				for (size_t j = i + 1; j < b->count; j++)
+					b->h[j - 1] = b->h[j];
+				b->count--;
+				continue;
+			}
+			i++;
+		}
+	}
+	exit_lock_release();
+}
+
 void __cxa_finalize(void *dso)
 {
 	exit_lock_acquire();

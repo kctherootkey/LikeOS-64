@@ -1,0 +1,81 @@
+DRMINFO(1)                       User Commands                      DRMINFO(1)
+
+NAME
+       drminfo - report the display-manager device and what it can do
+
+SYNOPSIS
+       drminfo [-n node] [-v]
+
+DESCRIPTION
+       drminfo  opens each node under /dev/dri, asks it which driver is behind
+       it, what capabilities that driver advertises and which mode-setting ob-
+       jects it exposes, and prints the lot.  Where the driver  is  vmwgfx  it
+       also asks for the device parameters that decide what the graphics stack
+       above  can  do  --  whether  the device has 3D at all, its shader-model
+       level, how much memory it will accept for surfaces and buffers.
+
+       It reads all of this through the  kernel's  own  interface  with  plain
+       ioctl(2)  calls and no library in between.  That is the point: it still
+       answers when the userspace graphics stack is broken or  missing,  which
+       is  exactly  when  the  question  "did  the kernel find a GPU" is being
+       asked.   The  tools  that  use  libdrm  --  modetest(1),   proptest(1),
+       vbltest(1) -- go deeper but need that stack to be working.
+
+       With  no  arguments  every  node  is examined.  Opening a node needs no
+       privilege beyond the permissions on it: card0 is readable by the  video
+       group, renderD128 by anyone.
+
+OPTIONS
+       -n node
+              Examine  one node.  The argument is either a path or a bare num-
+              ber, in which case /dev/dri/cardN is used.
+
+       -v     Print every mode of every connector, rather than the first few.
+
+OUTPUT
+       For each node:
+
+       driver The driver's name and its interface version --  on  this  system
+              vmwgfx  2.20.0  --  followed  by its date and description.  This
+              version is a contract: it is what Mesa's svga driver checks  be-
+              fore it will use the device.
+
+       capabilities
+              The  generic  capabilities,  one per line.  The interesting ones
+              are DUMB_BUFFER  (the  device  can  allocate  a  plain  scan-out
+              buffer),  PRIME  (buffers can be passed between processes as de-
+              scriptors, which is what lets the browser hand  rendered  frames
+              to the compositor without copying them), and TIMESTAMP_MONOTONIC
+              (vertical-blank events carry a monotonic timestamp).
+
+       vmwgfx parameters
+              Present only for that driver.  3D is 1 when the device offers 3D
+              acceleration  at  all; where it is 0 -- some hypervisors present
+              the device without it -- Mesa falls back to  its  software  ras-
+              teriser  and  everything  still works, more slowly.  SM4_1 , SM5
+              and GL43 say how far the shader model goes, which  is  what  de-
+              cides the OpenGL version Mesa can advertise.
+
+       mode setting
+              The  counts of CRTCs, connectors, encoders and framebuffers, the
+              range of framebuffer sizes the device will scan  out,  and  then
+              each object: connectors with their type, connection state, phys-
+              ical  size  and  modes;  encoders with the CRTCs they can drive;
+              CRTCs with the mode currently set on them; planes with the pixel
+              formats they accept.
+
+EXIT STATUS
+       0      At least one node was examined.
+
+       1      There is no /dev/dri -- no GPU driver bound to any device --  or
+              the named node could not be opened.  This is the normal state on
+              a  machine  whose  display device this kernel has no driver for;
+              the console runs on the framebuffer and the X server falls  back
+              to /etc/X11/xorg.conf and software rendering.
+
+       2      A bad argument.
+
+SEE ALSO
+       modetest(1), proptest(1), vbltest(1), Xorg(1)
+
+LikeOS                            August 2026                       DRMINFO(1)

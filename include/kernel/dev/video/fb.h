@@ -68,6 +68,16 @@ int fb_reinit(framebuffer_info_t *fb_info);
 typedef void (*fb_flush_hook_t)(uint32_t x, uint32_t y, uint32_t w,
 				uint32_t h);
 void fb_set_flush_hook(fb_flush_hook_t hook);
+// The hook currently installed, so a driver that replaces it can put back
+// what was there if its own takeover fails.
+fb_flush_hook_t fb_get_flush_hook(void);
+// Push one rectangle through the hook immediately.  For a writer that put
+// pixels into the front buffer itself and so has no dirty region for the
+// console's flush path to find -- /dev/fb0 writes.  Goes through the hook
+// rather than to any particular display driver, so the same call works
+// whether the screen is driven by the display manager or by the framebuffer
+// driver underneath it.
+void fb_flush_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 // Run the hook for any pending flushed area.  fb_flush_dirty_regions() calls
 // this automatically; callers of the _unlocked variant must invoke it after
 // releasing the framebuffer lock.

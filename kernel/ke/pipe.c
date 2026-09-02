@@ -189,7 +189,17 @@ int64_t sys_pipe(uint64_t pipefd_ptr)
 		return -EFAULT;
 	}
 
-	pipe_t *pipe = pipe_create(4096);
+	/* 64 KB, which is what a conventional Unix gives a pipe, and not the
+	 * single page this used to be.
+	 *
+	 * The size is not just a throughput knob: a writer whose message does
+	 * not fit blocks part-way through it, and a reader that waits for a
+	 * whole message before consuming any of it then waits for a writer
+	 * that cannot finish.  Protocols that send self-describing packets
+	 * over a pipe -- a plugin scanner reporting what it found, for one --
+	 * are built expecting the usual capacity and stall against a smaller
+	 * one, part-way through the work, with nothing to show for it. */
+	pipe_t *pipe = pipe_create(64 * 1024);
 	if (!pipe) {
 		return -ENOMEM;
 	}

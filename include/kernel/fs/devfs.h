@@ -26,7 +26,14 @@ int devfs_is_devfile(vfs_file_t *f);
 int devfs_is_fb0(vfs_file_t *f);
 /* POSIX shared memory object behind a /dev/shm handle, or NULL. */
 struct shm_object *devfs_shm_object(vfs_file_t *f);
+/* memfd seals: add==0 reads into *out, add!=0 ORs seals in. */
+int devfs_shm_seals(vfs_file_t *f, int add, unsigned seals, unsigned *out);
 int devfs_evdev_unit(vfs_file_t *f); // event-device unit or -1
+/* Registered device nodes / anonymous device files (kernel/dev/device.h):
+ * poll dispatch (returns -1 if `f' is not one) and the mmap hook. */
+struct poll_table;
+int devfs_device_poll(vfs_file_t *f, short events, struct poll_table *pt,
+		      short *revents);
 long devfs_seek(vfs_file_t *f, long offset, int whence);
 
 // Helpers for syscall layer

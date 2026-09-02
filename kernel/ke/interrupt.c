@@ -1,4 +1,6 @@
 // LikeOS-64 Interrupt Management
+#include <kernel/ke/irq.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/dev/usb/xhci.h>
 #include <kernel/ke/timer.h>
@@ -212,6 +214,7 @@ extern void irq26(); // ACPI SCI
 extern void irq27(); // E1000 NIC MSI
 extern void irq28(); // e1000e NIC MSI
 extern void irq29(); // vmxnet3 NIC MSI
+extern void irq30(); // HPET comparator (hrtimer)
 
 extern void isr0();
 extern void isr1();
@@ -498,6 +501,14 @@ void idt_init()
 		      0x8E); // MSI: e1000e NIC (82574L/82583V)
 	idt_set_entry(61, (uint64_t)irq29, 0x08,
 		      0x8E); // MSI: vmxnet3 paravirt NIC
+	idt_set_entry(62, (uint64_t)irq30, 0x08,
+		      0x8E); // HPET comparator: high-resolution timers
+	/* 63..127: run-time allocated (irq_alloc_vector). */
+	{
+		extern uint64_t irq_dyn_stub_table[];
+		for (int v = 63; v <= 127; v++)
+			idt_set_entry(v, irq_dyn_stub_table[v - 63], 0x08, 0x8E);
+	}
 
 	// IPI vectors for SMP
 	idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08,
@@ -1156,17 +1167,26 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 	task_tty_printf(
 		cur, "\nMemory map (mmap regions tracked by syscall layer):\n");
 	if (cur) {
-		/* Always the per-task array.  mm_struct carries mmap_regions /
-		 * mmap_count / mmap_capacity too, and every one of them is
-		 * dead: the array is never allocated and the count is never
-		 * incremented, so preferring them (which this used to do
-		 * whenever cur->mm existed, i.e. always) printed an empty map
-		 * for every crash.  sys_mmap records into task->mmap_regions
-		 * and fork copies that array directly. */
-		mmap_region_t *regions = cur->mmap_regions;
+		/* The table belongs to the address space, which means the
+		 * thread-group LEADER -- task_mm_owner() -- not to whichever
+		 * thread happened to fault.  A thread gets its own record
+		 * array and that array stays empty, so reading `cur` directly
+		 * printed "(none recorded)" for every crash in a thread, and
+		 * took the call chain below down with it: that scan decides
+		 * which stack values are executable by looking them up in this
+		 * same list, so an empty list means "(none found)" no matter
+		 * what is on the stack.  Browser crashes are nearly all in
+		 * threads, so nearly all of them reported nothing.
+		 *
+		 * (mm_struct carries mmap_regions / mmap_count / mmap_capacity
+		 * too, and those really are dead -- never allocated, never
+		 * incremented.  sys_mmap records into the task array.) */
+		task_t *mmo = task_mm_owner(cur);
+		mmap_region_t *regions = mmo ? mmo->mmap_regions : NULL;
+		uint32_t ncap = mmo ? mmo->mmap_capacity : 0;
 		int shown = 0;
 
-		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
+		for (uint32_t i = 0; regions && i < ncap; i++) {
 			mmap_region_t *r = &regions[i];
 			if (!r->in_use)
 				continue;
@@ -1197,6 +1217,16 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 		if (!shown)
 			task_tty_printf(cur, "  (none recorded)\n");
 	}
+
+	/* Same table as the map above, and for the same reason: the region
+	 * records belong to the address space -- the thread-group leader --
+	 * and a thread's own array is empty.  This scan decides which stack
+	 * values are executable by looking them up in that list, so reading
+	 * the wrong one makes it find nothing at all. */
+	task_t *chain_mmo = task_mm_owner(cur);
+	mmap_region_t *chain_regions = chain_mmo ? chain_mmo->mmap_regions :
+						   NULL;
+	uint32_t chain_cap = chain_mmo ? chain_mmo->mmap_capacity : 0;
 
 	/* Probable call chain, recovered by scanning the stack.
 	 *
@@ -1241,9 +1271,10 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 
 				if ((v >> 47) != 0 || v < 0x1000)
 					continue;
-				for (uint32_t r = 0; r < cur->mmap_capacity; r++) {
+				for (uint32_t r = 0; chain_regions && r < chain_cap;
+				     r++) {
 					mmap_region_t *reg =
-						&cur->mmap_regions[r];
+						&chain_regions[r];
 
 					if (!reg->in_use || !(reg->prot & 0x4))
 						continue;
@@ -1374,8 +1405,32 @@ static void report_userspace_crash(task_t *cur, uint64_t *regs, int signum,
 	if (!fault_signal_is_fatal(cur, signum))
 		return;
 #ifdef CRASH_VERBOSE
+	/* Interrupts go back on for the duration of the report.
+	 *
+	 * An exception is entered with them disabled, and this report is
+	 * hundreds of lines pushed through a console that is polled a byte at
+	 * a time -- seconds, during which this processor answers nothing.
+	 * The others notice: invalidating a translation needs an
+	 * acknowledgement from every processor, so one that cannot take an
+	 * interrupt stalls all of them, and a single process's crash turns
+	 * into missed invalidations across the machine -- reported as
+	 * "TLB shootdown sync timeout" while the report is still printing,
+	 * with the crash it was describing left looking like the cause.
+	 *
+	 * Safe exactly here: the fault came from user mode with interrupts
+	 * on, so no kernel lock is held and nothing above this frame depends
+	 * on them staying off.  A kernel-mode fault gets the old behaviour,
+	 * because there a lock may well be held. */
+	int from_user = (regs[REGS_CS] & 3) == 3;
+	int had_if = (regs[REGS_RFLAGS] & 0x200ULL) != 0;
+	int reenable = from_user && had_if && !irqs_enabled();
+
+	if (reenable)
+		__asm__ volatile("sti" ::: "memory");
 	report_userspace_crash_detailed(cur, regs, signum, signame, cr2,
 					int_no);
+	if (reenable)
+		__asm__ volatile("cli" ::: "memory");
 #else
 	task_tty_printf(cur, "User process %d killed by %s\n",
 			cur ? (int)cur->id : -1, signame);
@@ -1815,7 +1870,11 @@ void exception_handler(uint64_t *regs)
 
 		report_userspace_crash(cur, regs, fault_sig, fault_name,
 				       fault_addr, (int)int_no);
-		sched_signal_task(cur, fault_sig);
+		/* With the fault's own si_code and si_addr, not the bare
+		 * SI_USER a kill() would carry: a handler that recovers from
+		 * the fault -- a runtime's guard-page or bounds-check trap,
+		 * a debugger's report -- is useless without the address. */
+		signal_force_fault(cur, fault_sig, fault_code, fault_addr);
 		/* The old tail parked in sti;hlt unconditionally ("timer will
 		 * preempt us away"), assuming the signal is fatal.  When the
 		 * process has a user handler installed (or the signal blocked),
@@ -1904,6 +1963,13 @@ void irq_handler(uint64_t *regs)
 		task_capture_user_segments(sched_current());
 
 	g_total_irq_count++;
+
+	/* Handlers registered through irq_request_*(): tried first, on any
+	 * vector.  A handler that answers "not mine" leaves the interrupt to
+	 * the fixed arms below, so a registered device may share a line with
+	 * one of them. */
+	if (irq_dispatch(int_no))
+		return;
 
 	// Legacy INTx dispatch for E1000 / e1000e NICs (when MSI is not
 	// available, e.g. VirtualBox).  These MUST be checked BEFORE any
@@ -2026,6 +2092,13 @@ void irq_handler(uint64_t *regs)
 				return;
 			}
 		}
+	}
+
+	/* HPET comparator: the high-resolution timer queue is due. */
+	if (int_no == HRTIMER_VECTOR) {
+		hrtimer_irq();
+		lapic_eoi();
+		return;
 	}
 
 	// MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).

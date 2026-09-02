@@ -1,0 +1,49 @@
+PROPTEST(1)                      User Commands                     PROPTEST(1)
+
+NAME
+       proptest - print and set display-manager object properties
+
+SYNOPSIS
+       proptest [options]
+       proptest [options] object-id object-type property-id value
+
+DESCRIPTION
+       Every mode-setting object -- connector, CRTC, plane -- carries a set of
+       named  properties,  and  that  is  where most of what can be configured
+       about the display actually lives: the power state of a  connector,  its
+       EDID  blob,  the gamma table of a CRTC, the source and destination rec-
+       tangles of a plane.
+
+       In its first form proptest prints all of  them,  with  each  property's
+       type,  its  permitted  range or enumeration, and its current value.  In
+       its second form it sets one.
+
+       Setting a property needs the node's master rights, so  it  fails  while
+       another program -- an X server, say -- holds them.  Printing does not.
+
+OPTIONS
+       -D device
+              Open the given device node instead of searching.
+
+       -M module
+              Open  the  node  belonging  to  the  named  driver, for instance
+              vmwgfx.
+
+OPERANDS
+       object-type
+              One of connector, crtc, or plane.
+
+       object-id
+              The numeric id of the object, as printed by the first form or by
+              modetest(1).
+
+       property-id
+              The numeric id of the property, likewise.
+
+       value  The new value: a number, or the numeric member  of  an  enumera-
+              tion.
+
+SEE ALSO
+       drminfo(1), modetest(1), vbltest(1)
+
+libdrm 2.4.124                    August 2026                      PROPTEST(1)

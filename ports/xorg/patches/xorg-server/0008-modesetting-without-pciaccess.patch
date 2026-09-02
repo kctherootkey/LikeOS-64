@@ -1,0 +1,76 @@
+Build the modesetting driver without bus enumeration.
+
+The driver's DriverRec names two members that only exist when the server is
+built with libpciaccess -- the PCI id match table and the PCI probe entry
+point -- but names them unconditionally:
+
+    driver.c:124:5: error: 'ms_device_match' undeclared here (not in a function)
+
+Everything around them is already conditional (the table itself, the probe
+function, the platform-bus probe below), so this is upstream not building the
+combination rather than a decision to require it.  Nothing else in the file
+needs the bus: the device is named by the Device section's kmsdev option and
+opened by Probe(), which is the path this system takes.
+
+So guard the two members, and with them the two helpers that exist only to
+serve the PCI probe (ms_DRICreatePCIBusID and probe_hw_pci, which the compiler
+otherwise reports as defined-but-unused).  A server built WITH libpciaccess
+compiles to exactly what it did before.
+
+--- a/hw/xfree86/drivers/modesetting/driver.c
++++ b/hw/xfree86/drivers/modesetting/driver.c
+@@ -78,9 +78,11 @@
+ static Bool PreInit(ScrnInfoPtr pScrn, int flags);
+ 
+ static Bool Probe(DriverPtr drv, int flags);
++#ifdef XSERVER_LIBPCIACCESS
+ static Bool ms_pci_probe(DriverPtr driver,
+                          int entity_num, struct pci_device *device,
+                          intptr_t match_data);
++#endif
+ static Bool ms_driver_func(ScrnInfoPtr scrn, xorgDriverFuncOp op, void *data);
+ 
+ /* window wrapper functions used to get the notification when
+@@ -121,8 +123,16 @@
+     NULL,
+     0,
+     ms_driver_func,
++#ifdef XSERVER_LIBPCIACCESS
+     ms_device_match,
+     ms_pci_probe,
++#else
++    /* supported_devices and PciProbe: bus matching, which a server built
++     * without bus enumeration never performs.  The device comes from the
++     * Device section's kmsdev option instead, through Probe() below. */
++    NULL,
++    NULL,
++#endif
+ #ifdef XSERVER_PLATFORM_BUS
+     ms_platform_probe,
+ #endif
+@@ -291,6 +301,7 @@
+     return FALSE;
+ }
+ 
++#ifdef XSERVER_LIBPCIACCESS
+ static char *
+ ms_DRICreatePCIBusID(const struct pci_device *dev)
+ {
+@@ -302,7 +313,9 @@
+ 
+     return busID;
+ }
++#endif
+ 
++#ifdef XSERVER_LIBPCIACCESS
+ static Bool
+ probe_hw_pci(const char *dev, struct pci_device *pdev)
+ {
+@@ -333,6 +346,7 @@
+     free(devid);
+     return ret;
+ }
++#endif
+ 
+ static const OptionInfoRec *
+ AvailableOptions(int chipid, int busid)

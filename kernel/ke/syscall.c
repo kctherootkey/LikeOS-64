@@ -319,7 +319,13 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	case SYS_SET_TID_ADDRESS:
 		return sys_set_tid_address(a1);
 	case SYS_FUTEX:
-		return sys_futex(a1, a2, a3, a4, a5, 0);
+		/* val3 is the sixth argument, and dropping it made every
+		 * bitset operation arrive with an empty bitset -- which the
+		 * futex code correctly refuses as EINVAL.  FUTEX_WAIT_BITSET
+		 * is what a timed condition wait compiles to, so every one of
+		 * them failed instantly instead of waiting; FUTEX_WAKE_OP read
+		 * its whole encoded operation from it as well. */
+		return sys_futex(a1, a2, a3, a4, a5, a6);
 	case SYS_SET_ROBUST_LIST:
 		return sys_set_robust_list(a1, a2);
 	case SYS_GET_ROBUST_LIST:
@@ -352,6 +358,30 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
 	case SYS_MINCORE:
 		return sys_mincore(a1, a2, a3);
+	case SYS_CLOCK_NANOSLEEP:
+		return sys_clock_nanosleep(a1, a2, a3, a4);
+	case SYS_MREMAP:
+		return sys_mremap(a1, a2, a3, a4, a5);
+	case SYS_EVENTFD2:
+		return sys_eventfd2(a1, a2);
+	case SYS_TIMERFD_CREATE:
+		return sys_timerfd_create(a1, a2);
+	case SYS_TIMERFD_SETTIME:
+		return sys_timerfd_settime(a1, a2, a3, a4);
+	case SYS_TIMERFD_GETTIME:
+		return sys_timerfd_gettime(a1, a2);
+	case SYS_MEMFD_CREATE:
+		return sys_memfd_create(a1, a2);
+	case SYS_SIGNALFD4:
+		return sys_signalfd4(a1, a2, a3, a4);
+	case SYS_PREAD64:
+		return sys_pread64(a1, a2, a3, a4);
+	case SYS_PWRITE64:
+		return sys_pwrite64(a1, a2, a3, a4);
+	case SYS_FDATASYNC:
+		return sys_fsync(a1);
+	case SYS_FALLOCATE:
+		return sys_fallocate(a1, a2, a3, a4);
 
 	case SYS_REBOOT:
 		return sys_reboot(a1, a2, a3, a4);

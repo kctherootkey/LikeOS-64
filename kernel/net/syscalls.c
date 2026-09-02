@@ -598,51 +598,95 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 	    unix_peek_fd_offset(us, &fd_off) == 0 && fd_off <= start_br)
 		deliver_fd_now = 1;
 
-	/* Deliver one pending fd via SCM_RIGHTS, but only at the correct
-     * byte boundary. */
+	/* Deliver the pending descriptors due at this point in the stream --
+	 * ALL of them, not one.
+	 *
+	 * One sendmsg may carry several descriptors, and they arrive together
+	 * or not at all: the receiver reads one control message and takes what
+	 * is in it.  Handing over only the first left the caller holding one
+	 * descriptor and, for the rest, whatever its array was initialised to.
+	 * A program that initialises to -1 -- which is the careful thing to do
+	 * -- then maps -1, gets MAP_FAILED back, and stores THAT as a pointer.
+	 * The fault comes much later and somewhere else: at -1 + a field
+	 * offset, or as free() of an all-ones pointer, or as a jump into a run
+	 * of 0xff.  Every one of those is this, seen from further away.
+	 *
+	 * The record path a few hundred lines above has always done it this
+	 * way, and so does the reference implementation's scm_detach_fds():
+	 * install as many as the caller's control buffer can report, release
+	 * the remainder rather than leaking them into the process unreported,
+	 * and say MSG_CTRUNC when any were left behind.
+	 *
+	 * The stream framing is unchanged: a descriptor is due only if it was
+	 * queued at or before the byte offset this call started reading from.
+	 * The loop re-asks that for every descriptor, so a later frame's
+	 * descriptors stay queued for the read that carries their bytes. */
 	kmsg->msg_flags = 0;
 	if (deliver_fd_now && kmsg->msg_control &&
 	    kmsg->msg_controllen >= CMSG_SPACE(sizeof(int))) {
-		void *entry = NULL;
-		if (unix_pop_fd(us, &entry) == 0 && entry) {
-			task_t *cur = sched_current();
-			/* fd_install_from, not a bare scan: it claims the slot
-			 * under the descriptor-table lock (so two threads of one
-			 * process cannot be handed the same number) and clears
-			 * the slot's flag byte -- a recycled slot that kept a
-			 * stale FD_CLOEXEC made the received descriptor vanish
-			 * at the next exec. */
-			int newfd = cur ? fd_install_from(cur, entry, 0) : -1;
-			if (newfd < 0) {
-				/* No descriptor slot: give the reference back.
-				 *
-				 * Exactly the mirror of the fd_dup_entry_at()
-				 * that took it, which is the point of routing
-				 * it through the same place.  Hand-written, it
-				 * unwound only some of what had been taken --
-				 * it knew a socket had a descriptor count but
-				 * not that the socket also had a lifetime
-				 * reference, and it had no case at all for a
-				 * regular file, so those were simply kept
-				 * forever. */
+		task_t *cur = sched_current();
+		int newfds[UNIX_PENDING_FDS];
+		int nfds = 0;
+		/* How many the caller's control buffer can actually report.
+		 * One past that is not installed-and-unreported -- that would
+		 * be a descriptor leaked into the process with no way to find
+		 * it -- it is released, and the truncation declared. */
+		int space_fds = 0;
+
+		while (space_fds < UNIX_PENDING_FDS &&
+		       CMSG_SPACE(sizeof(int) * (size_t)(space_fds + 1)) <=
+			       kmsg->msg_controllen)
+			space_fds++;
+
+		for (;;) {
+			void *entry = NULL;
+			int nf;
+
+			/* The head must belong to the bytes just delivered.
+			 * The first one is known to (deliver_fd_now); each
+			 * further one is asked about in its own right. */
+			if (nfds > 0 &&
+			    (unix_peek_fd_offset(us, &fd_off) != 0 ||
+			     fd_off > start_br))
+				break;
+			if (unix_pop_fd(us, &entry) != 0 || !entry)
+				break;
+			nf = (nfds < space_fds && cur) ?
+				     fd_install_from(cur, entry, 0) :
+				     -1;
+			if (nf < 0) {
+				/* No slot, or no room to report it: give the
+				 * reference back exactly as the sender's
+				 * fd_dup_entry_at() took it. */
 				fd_release_entry((vfs_file_t *)entry);
 				kmsg->msg_flags |= MSG_CTRUNC;
-				kmsg->msg_controllen = 0;
-			} else {
-				unsigned char cbuf[CMSG_SPACE(sizeof(int))];
-				struct cmsghdr *c = (struct cmsghdr *)cbuf;
-				c->cmsg_len = CMSG_LEN(sizeof(int));
-				c->cmsg_level = SOL_SOCKET;
-				c->cmsg_type = SCM_RIGHTS;
-				*(int *)CMSG_DATA(c) = newfd;
-				if (!validate_user_ptr(
-					    (uint64_t)kmsg->msg_control,
-					    CMSG_SPACE(sizeof(int))))
-					return -EFAULT;
-				copy_to_user(kmsg->msg_control, cbuf,
-					     CMSG_SPACE(sizeof(int)));
-				kmsg->msg_controllen = CMSG_SPACE(sizeof(int));
+				if (nfds >= space_fds)
+					break;
+				continue;
 			}
+			newfds[nfds++] = nf;
+		}
+		/* Queue slots were just freed; a sender parked on a full
+		 * pending-fd queue has to be told.  Same reason the record
+		 * path wakes here -- see the note there. */
+		if (nfds)
+			unix_fd_space_wake(us);
+		if (nfds) {
+			unsigned char cbuf[CMSG_SPACE(sizeof(int) *
+						      UNIX_PENDING_FDS)];
+			struct cmsghdr *c = (struct cmsghdr *)cbuf;
+			size_t clen = CMSG_SPACE(sizeof(int) * (size_t)nfds);
+
+			c->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)nfds);
+			c->cmsg_level = SOL_SOCKET;
+			c->cmsg_type = SCM_RIGHTS;
+			for (int i = 0; i < nfds; i++)
+				((int *)CMSG_DATA(c))[i] = newfds[i];
+			if (!validate_user_ptr((uint64_t)kmsg->msg_control,
+					       clen))
+				return -EFAULT;
+			copy_to_user(kmsg->msg_control, cbuf, clen);
+			kmsg->msg_controllen = clen;
 		} else {
 			kmsg->msg_controllen = 0;
 		}

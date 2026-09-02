@@ -808,8 +808,8 @@ static void ext4_rwsem_park(ext4_rwsem_t *sem, uint64_t *flags)
 {
 	task_t *cur = sched_current();
 	if (cur) {
-		cur->state = TASK_BLOCKED;
 		cur->wait_channel = (void *)sem;
+		cur->state = TASK_BLOCKED;
 	}
 	spin_unlock_irqrestore(&sem->lock, *flags);
 	sched_schedule();
@@ -2566,6 +2566,24 @@ static int ext4_resolve_ex(ext4_fs_t *fs, unsigned long start_ino,
 		return ST_INVALID;
 	if (depth > 12)
 		return ST_INVALID; /* ELOOP guard            */
+
+	/* A trailing slash names the thing THROUGH the link, and it has to be
+	 * a directory.
+	 *
+	 * "a/b/" means the same as "a/b/.", so the last component is followed
+	 * even by the callers that otherwise stop at a link -- lstat and
+	 * friends -- and the answer must be a directory or the path is wrong.
+	 * Without this, listing a directory reached by a symbolic link
+	 * reported the link itself however the name was written, because the
+	 * tool asks with lstat and a trailing slash is exactly how one says
+	 * "the directory, not the link". */
+	size_t plen = 0;
+	while (path[plen])
+		plen++;
+	int trailing_slash = (plen > 0 && path[plen - 1] == '/');
+	if (trailing_slash)
+		follow_final = 1;
+
 	unsigned long cur = (path[0] == '/') ? EXT4_ROOT_INO : start_ino;
 	const char *p = path;
 	while (*p == '/')
@@ -2627,6 +2645,13 @@ static int ext4_resolve_ex(ext4_fs_t *fs, unsigned long start_ino,
 			if ((d.i_mode & S_IFMT) != S_IFDIR)
 				return ST_NOT_FOUND;
 		}
+	}
+	if (trailing_slash) {
+		ext4_inode d;
+		if (!ext4_get_inode_cached(fs, cur, &d))
+			return ST_IO;
+		if ((d.i_mode & S_IFMT) != S_IFDIR)
+			return ST_NOT_FOUND; /* "file/" is not a path */
 	}
 	*out_ino = cur;
 	return ST_OK;
@@ -2812,7 +2837,27 @@ static int ext4_stat_vfs_impl(const char *path, struct kstat *st)
 	return ext4_stat_fill(g_ext4_fs, ino, st);
 }
 
-static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
+/* The read itself, at an offset the CALLER names.
+ *
+ * Split out from the descriptor's read so that a caller which has no
+ * descriptor position -- demand paging is the one that matters -- can read
+ * without touching one.  The reference draws the same line: a page fault goes
+ * to the page cache by index and never consults the open file's offset, which
+ * is a property of the descriptor and nothing to do with the mapping.
+ *
+ * Doing it the other way round is what this replaces.  Paging used to seek the
+ * shared handle to the page's offset, read, and seek back -- and a mapping's
+ * handle IS the caller's open file (mmap references it, fork shares it), so
+ * any read() or lseek() on that descriptor while a fault was in flight moved
+ * the position out from under it.  The fault then filled the page from
+ * somewhere else in the file.  For a library's text that is a page of code
+ * that is not the code that belongs there, and the process dies branching
+ * into it -- arbitrarily later, and nowhere near the read that caused it.
+ *
+ * `ra' is the readahead state to use and update; a positioned read passes its
+ * own so it cannot disturb the descriptor's sequential-access tracking. */
+static long ext4_read_at_impl(vfs_file_t *f, void *buf, long bytes,
+			      unsigned long pos, pc_readahead_t *ra)
 {
 	if (!f || !buf)
 		return ST_INVALID;
@@ -2821,10 +2866,10 @@ static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
 		return ef && ef->is_dir ? -EISDIR : ST_INVALID;
 	if (bytes < 0)
 		return ST_INVALID;
-	if (ef->pos >= ef->size)
+	if (pos >= ef->size)
 		return 0;
-	if ((unsigned long)bytes > ef->size - ef->pos)
-		bytes = (long)(ef->size - ef->pos);
+	if ((unsigned long)bytes > ef->size - pos)
+		bytes = (long)(ef->size - pos);
 
 	/* Read-your-writes for the data write-back buffer is handled by the
 	 * ext4_read entry point (flushes under the exclusive lock when the
@@ -2837,8 +2882,8 @@ static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
 
 	smap_disable();
 	while (remaining) {
-		unsigned long page_idx = ef->pos / PAGE_SIZE;
-		unsigned page_off = ef->pos % PAGE_SIZE;
+		unsigned long page_idx = pos / PAGE_SIZE;
+		unsigned page_off = pos % PAGE_SIZE;
 		unsigned avail = PAGE_SIZE - page_off;
 		unsigned chunk =
 			(remaining < avail) ? (unsigned)remaining : avail;
@@ -2851,22 +2896,38 @@ static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
 		}
 		mm_memcpy((uint8_t *)buf + copied, pg->data + page_off, chunk);
 
-		pc_readahead_t ra;
-		ra.last_page_index = ef->ra_last_page;
-		ra.sequential_count = ef->ra_seq_count;
-		ra.ra_pages = ef->ra_pages;
-		pagecache_readahead(&ra, chain_id, page_idx, ef->size,
+		pagecache_readahead(ra, chain_id, page_idx, ef->size,
 				    &ef->fs->sb, chain_id);
-		ef->ra_last_page = ra.last_page_index;
-		ef->ra_seq_count = ra.sequential_count;
-		ef->ra_pages = ra.ra_pages;
 
-		ef->pos += chunk;
+		pos += chunk;
 		copied += chunk;
 		remaining -= chunk;
 	}
 	smap_enable();
 	return (long)copied;
+}
+
+/* The descriptor's read: the same thing at the descriptor's own position,
+ * advancing it and keeping its readahead state. */
+static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
+{
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	pc_readahead_t ra;
+	long r;
+
+	if (!ef)
+		return ST_INVALID;
+	ra.last_page_index = ef->ra_last_page;
+	ra.sequential_count = ef->ra_seq_count;
+	ra.ra_pages = ef->ra_pages;
+	r = ext4_read_at_impl(f, buf, bytes, ef->pos, &ra);
+	if (r > 0) {
+		ef->pos += (unsigned long)r;
+		ef->ra_last_page = ra.last_page_index;
+		ef->ra_seq_count = ra.sequential_count;
+		ef->ra_pages = ra.ra_pages;
+	}
+	return r;
 }
 
 static long ext4_seek_impl(vfs_file_t *f, long offset, int whence)
@@ -7997,6 +8058,40 @@ static long ext4_read(vfs_file_t *f, void *buf, long bytes)
 	ext4_iunlock_shared(ino);
 	return r;
 }
+/* Read at an explicit offset, leaving the descriptor's position alone.
+ *
+ * Same locking as ext4_read above -- the reasons are identical and written
+ * out there -- with the position and the readahead state supplied by the
+ * caller instead of taken from the handle. */
+static long ext4_read_at(vfs_file_t *f, void *buf, long bytes, long off)
+{
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	pc_readahead_t ra;
+
+	if (!ef || off < 0)
+		return ST_INVALID;
+	unsigned long ino = ef->ino;
+
+	ra.last_page_index = 0;
+	ra.sequential_count = 0;
+	ra.ra_pages = 0;
+
+	ext4_ilock_shared(ino);
+	ext4_meta_rlock();
+	int wb_hit = (s_wb_len && s_wb_ino == ino);
+	ext4_meta_runlock();
+	if (wb_hit) {
+		ext4_io_lock();
+		ext4_wb_flush(ef->fs ? ef->fs : g_ext4_fs);
+		ext4_io_unlock();
+	}
+	ext4_meta_rlock();
+	long r = ext4_read_at_impl(f, buf, bytes, (unsigned long)off, &ra);
+	ext4_meta_runlock();
+	ext4_iunlock_shared(ino);
+	return r;
+}
+
 static long ext4_write(vfs_file_t *f, const void *buf, long bytes)
 {
 	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
@@ -8383,6 +8478,7 @@ static const vfs_ops_t ext4_vfs_ops = {
 	.open = ext4_open,
 	.stat = ext4_stat_vfs,
 	.read = ext4_read,
+	.read_at = ext4_read_at,
 	.write = ext4_write,
 	.seek = ext4_seek,
 	.readdir = ext4_readdir,
@@ -9023,7 +9119,7 @@ static int ext4_journal_recover(ext4_fs_t *fs, int *did_work)
 
 	/* Mark the journal empty: s_start = 0, s_sequence = end_txn.  On a csum
      * journal the superblock carries its own checksum (seed ~0 over 1024 bytes),
-     * so restamp it after editing or Linux/e2fsck will reject the journal sb. */
+     * so restamp it after editing or e2fsck will reject the journal sb. */
 	jsb->s_start = __builtin_bswap32(0);
 	jsb->s_sequence = __builtin_bswap32(end_txn);
 	ext4_jsb_csum_set(jblk,
@@ -9551,7 +9647,8 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 						  sb->s_first_ino;
 	out->journal_inum = sb->s_journal_inum;
 	out->read_only = 0; /* writes enabled */
-	/* errors= policy for runtime corruption (ext4_fs_error).  Linux applies a
+	/* errors= policy for runtime corruption (ext4_fs_error).  The reference
+	 * driver applies a
      * mount-time default of remount-ro on metadata corruption regardless of the
      * on-disk s_errors hint (mke2fs stamps s_errors=continue by default), since
      * leaving a corrupt filesystem writable risks compounding the damage.  We do
@@ -9730,7 +9827,8 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
      * v2, async-commit and fast-commit remain unsupported on the write side and
      * fall back to direct writes.  On a metadata_csum fs whose journal is still
      * plain (mke2fs ships it that way — the kernel upgrades it on first rw mount)
-     * we upgrade it to csum-v3 here, matching Linux, so our own images get
+     * we upgrade it to csum-v3 here, matching the reference driver, so our
+     * own images get
      * csum-protected journaling.  Must run after recovery so j_sequence reflects
      * the post-recovery journal state (and the log is clean before any upgrade). */
 	out->j_enabled = 0;
@@ -9782,7 +9880,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 				s_epoch_seq = 0;
 
 				/* Make the journal a well-formed csum-v3 journal on a
-                 * metadata_csum fs, like the Linux kernel does on first rw mount.
+                 * metadata_csum fs, as the reference driver does on first rw mount.
                  * Fires when the journal is still plain OR was left half-upgraded
                  * (CSUM_V3 set but s_checksum_type unset — jbd2/e2fsck reject
                  * that).  Only with a CLEAN log (s_start==0, true after recovery /

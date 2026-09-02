@@ -27,7 +27,14 @@ typedef signed long        ssize_t;
 #define __NR_mprotect   329
 #define __NR_brk        12
 #define __NR_exit       60
+#define __NR_gettid     313
+#define __NR_futex      315
 #define __NR_arch_prctl 318
+
+// futex operations (see include/kernel/ke/futex.h)
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+#define FUTEX_PRIVATE_FLAG  128
 
 // mmap constants
 #define PROT_NONE   0
@@ -117,6 +124,24 @@ __attribute__((noreturn)) static inline void rtld_exit(int code) {
 }
 static inline int rtld_arch_prctl(int code, unsigned long addr) {
     return (int)__syscall2(__NR_arch_prctl, code, (long)addr);
+}
+
+// The loader's own lock needs a thread identity and a way to block.  Both are
+// raw syscalls for the usual reason: ld-likeos.so links against nothing, and
+// the C library it would otherwise borrow these from is itself an object the
+// loader has to map before anything can call into it.
+static inline int rtld_gettid(void) {
+    return (int)__syscall0(__NR_gettid);
+}
+// PRIVATE, because the loader's lock lives in the loader's own writable data
+// and is never shared between processes.
+static inline void rtld_futex_wait(int* uaddr, int val) {
+    __syscall6(__NR_futex, (long)uaddr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+               val, 0, 0, 0);
+}
+static inline void rtld_futex_wake(int* uaddr, int n) {
+    __syscall6(__NR_futex, (long)uaddr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+               n, 0, 0, 0);
 }
 
 #endif // _RTLD_SYSCALL_H

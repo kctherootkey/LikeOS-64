@@ -64,6 +64,17 @@ void fb_set_flush_hook(fb_flush_hook_t hook)
 	g_flush_hook = hook;
 }
 
+fb_flush_hook_t fb_get_flush_hook(void)
+{
+	return g_flush_hook;
+}
+
+void fb_flush_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	if (g_flush_hook && w && h)
+		g_flush_hook(x, y, w, h);
+}
+
 // Accumulate a flushed rect (pixel coords, inclusive); caller holds fb_lock.
 static void hook_accumulate(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
 {

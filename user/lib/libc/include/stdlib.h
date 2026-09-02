@@ -69,6 +69,10 @@ void abort(void) __attribute__((noreturn));
 
 // Environment
 char* getenv(const char* name);
+/* getenv() that answers NULL in a set-user-ID/set-group-ID process. */
+char* secure_getenv(const char* name);
+/* realloc(ptr, nmemb * size) with the multiplication checked for overflow. */
+void* reallocarray(void* ptr, size_t nmemb, size_t size);
 int system(const char *command);
 int setenv(const char* name, const char* value, int overwrite);
 int unsetenv(const char* name);

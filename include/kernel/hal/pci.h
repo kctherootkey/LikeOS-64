@@ -7,7 +7,7 @@
 
 #define PCI_MAX_DEVICES 256
 
-typedef struct {
+typedef struct pci_device {
 	unsigned char bus;
 	unsigned char device;
 	unsigned char function;
@@ -55,6 +55,11 @@ uint8_t pci_find_capability(const pci_device_t *dev, uint8_t cap_id);
 // vector targeting the BSP's APIC ID, enables MSI, and disables legacy INTx.
 // Returns 0 on success, -1 if device has no MSI capability.
 int pci_enable_msi(const pci_device_t *dev, uint8_t vector);
+/* MSI aimed at a particular local APIC; MSI-X table entry `entry'. */
+int pci_enable_msi_cpu(const pci_device_t *dev, uint8_t vector,
+		       uint32_t apic_id);
+int pci_enable_msix(const pci_device_t *dev, int entry, uint8_t vector,
+		    uint32_t apic_id);
 
 // Find the PCI-to-PCI bridge whose secondary bus matches target_bus.
 // Returns the bridge pci_device_t* or NULL if not found.

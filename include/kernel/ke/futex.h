@@ -12,7 +12,7 @@
 // Number of hash buckets for futex wait queues
 #define FUTEX_HASH_BUCKETS 256
 
-// Futex operation codes (Linux-compatible)
+// Futex operation codes (the conventional numbering)
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
 #define FUTEX_FD 2 // Deprecated
@@ -28,6 +28,23 @@
 // Futex flags
 #define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_CLOCK_REALTIME 256
+
+/* The bitset a plain wait/wake carries: matches everything. */
+#define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFu
+
+/* FUTEX_WAKE_OP: val3 encodes  op(4) | cmp(4) | oparg(12) | cmparg(12). */
+#define FUTEX_OP_SET 0
+#define FUTEX_OP_ADD 1
+#define FUTEX_OP_OR 2
+#define FUTEX_OP_ANDN 3
+#define FUTEX_OP_XOR 4
+#define FUTEX_OP_OPARG_SHIFT 8
+#define FUTEX_OP_CMP_EQ 0
+#define FUTEX_OP_CMP_NE 1
+#define FUTEX_OP_CMP_LT 2
+#define FUTEX_OP_CMP_LE 3
+#define FUTEX_OP_CMP_GT 4
+#define FUTEX_OP_CMP_GE 5
 
 // Futex owner died flag (for robust mutexes)
 #define FUTEX_OWNER_DIED (1 << 30)
@@ -48,6 +65,12 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns);
 // Returns: number of waiters woken
 int futex_wake(uint64_t uaddr, int nr_wake);
 
+// Bitset variants: the sleeper carries `bitset', a wake names the bits it
+// addresses, and only intersecting pairs meet.  A zero bitset is -EINVAL.
+int futex_wait_bitset(uint64_t uaddr, uint32_t expected_val,
+		      uint64_t timeout_ns, uint32_t bitset);
+int futex_wake_bitset(uint64_t uaddr, int nr_wake, uint32_t bitset);
+
 // Like futex_wake but uses a specific task's PML4 for key computation.
 // Use when performing futex operations on behalf of a task that may differ
 // from sched_current() (e.g. cross-CPU SIGKILL in sched_mark_task_exited).
@@ -61,7 +84,7 @@ int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue);
 // ROBUST FUTEX SUPPORT
 // ============================================================================
 
-// Robust futex list structures (Linux ABI compatible)
+// Robust futex list structures (the conventional ABI)
 struct robust_list {
 	struct robust_list *next;
 };

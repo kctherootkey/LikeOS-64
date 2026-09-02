@@ -30,6 +30,9 @@ void mm_rwsem_init(mm_rwsem_t *sem, const char *name);
  * holds it shared bypasses writer-preference (see task->mm_rdepth). */
 void mm_read_lock(mm_rwsem_t *sem);
 void mm_read_unlock(mm_rwsem_t *sem);
+/* One attempt, never parks.  For callers that may not sleep -- see the page
+ * fault paths, which use it to decide whether they may proceed at all. */
+bool mm_read_trylock(mm_rwsem_t *sem);
 
 /* Exclusive acquisition.  Recursive for the owning task. */
 void mm_write_lock(mm_rwsem_t *sem);

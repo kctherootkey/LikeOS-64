@@ -13,6 +13,7 @@
 #include <malloc.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -9700,7 +9701,13 @@ static int ftw_count_cb(const char *path, const struct stat *st, int type,
 static void *cpuclock_burn(void *arg)
 {
 	volatile unsigned long x = 0;
-	unsigned long *stop = arg;
+	/* Volatile because the flag is written by another thread with no
+	 * synchronisation in between: without it the compiler is entitled to
+	 * read *stop once before the loop, and at -O2 it does -- the loop
+	 * becomes an unconditional jump and this thread never stops, on any
+	 * kernel.  The test still measures what it measured: a thread that
+	 * burns CPU until it is told to stop. */
+	volatile unsigned long *stop = arg;
 	while (!*stop)
 		x++;
 	return NULL;
@@ -9755,9 +9762,9 @@ static void test_memstream_ftw_cpuclock(void)
 
 	/* pthread_getcpuclockid: another thread burns CPU; its clock must
 	 * advance while this thread mostly sleeps. */
-	unsigned long stop = 0;
+	volatile unsigned long stop = 0;
 	pthread_t th;
-	if (pthread_create(&th, NULL, cpuclock_burn, &stop) == 0) {
+	if (pthread_create(&th, NULL, cpuclock_burn, (void *)&stop) == 0) {
 		clockid_t cid;
 		int gc = pthread_getcpuclockid(th, &cid);
 		struct timespec a = { 0, 0 }, b = { 0, 0 };
@@ -9883,6 +9890,2777 @@ static void test_stdint_limits(void)
 // ========================================
 // struct dirent64 and the mkdir declaration in <sys/stat.h>
 // ========================================
+
+/* ======================================================================
+ * ucontext: the machine context handed to a signal handler, and the
+ * getcontext/makecontext/swapcontext family built on the same record.
+ * ====================================================================== */
+#include <ucontext.h>
+
+static volatile int g_uc_seen_ucontext;
+static volatile void *g_uc_fault_addr;
+static volatile long g_uc_rip_matches;
+static char g_uc_good_buf[64];
+static volatile int g_uc_on_altstack;
+static volatile int g_uc_altstack_flag;
+static char *g_uc_altstack;
+
+static void uc_segv_handler(int sig, siginfo_t *si, void *ctx)
+{
+	ucontext_t *uc = (ucontext_t *)ctx;
+	(void)sig;
+
+	g_uc_seen_ucontext = (uc != NULL);
+	g_uc_fault_addr = si ? si->si_addr : NULL;
+	if (!uc)
+		return;
+	/* The fault came from `movl $1, (%rax)' with RAX = the bad address;
+	 * pointing RAX at a good buffer and returning re-executes it there.
+	 * CR2 carries the address as well. */
+	g_uc_rip_matches = (uc->uc_mcontext.gregs[REG_RAX] ==
+			    (greg_t)(uintptr_t)g_uc_fault_addr) &&
+			   (uc->uc_mcontext.gregs[REG_CR2] ==
+			    (greg_t)(uintptr_t)g_uc_fault_addr);
+	uc->uc_mcontext.gregs[REG_RAX] = (greg_t)(uintptr_t)g_uc_good_buf;
+}
+
+static void uc_altstack_handler(int sig, siginfo_t *si, void *ctx)
+{
+	ucontext_t *uc = (ucontext_t *)ctx;
+	char probe;
+	(void)sig;
+	(void)si;
+
+	g_uc_on_altstack = (&probe >= g_uc_altstack &&
+			    &probe < g_uc_altstack + SIGSTKSZ);
+	g_uc_altstack_flag = uc ? uc->uc_stack.ss_flags : -1;
+}
+
+static ucontext_t g_uc_main, g_uc_co;
+static volatile int g_uc_trace[8];
+static volatile int g_uc_ntrace;
+
+static void uc_coroutine(int a, int b)
+{
+	g_uc_trace[g_uc_ntrace++] = a;
+	swapcontext(&g_uc_co, &g_uc_main);
+	g_uc_trace[g_uc_ntrace++] = b;
+	/* returning resumes uc_link */
+}
+
+static void test_ucontext(void)
+{
+	printf("\n[TEST] ucontext: signal machine context, altstack, coroutines\n");
+
+	/* ---- A fault handler that repairs the faulting register ---- */
+	struct sigaction sa, old;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = uc_segv_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSEGV, &sa, &old);
+
+	g_uc_seen_ucontext = 0;
+	g_uc_fault_addr = NULL;
+	g_uc_rip_matches = 0;
+	memset(g_uc_good_buf, 0, sizeof(g_uc_good_buf));
+	{
+		volatile uintptr_t bad = 0xDEAD0000UL; /* unmapped */
+		/* RAX = bad; store faults; handler repoints RAX; store lands
+		 * in g_uc_good_buf. */
+		__asm__ volatile("movq %0, %%rax\n\t"
+				 "movl $0x11223344, (%%rax)\n\t"
+				 :
+				 : "r"(bad)
+				 : "rax", "memory");
+		test_result("SA_SIGINFO handler received a ucontext",
+			    g_uc_seen_ucontext);
+		test_result("si_addr is the faulting address",
+			    (uintptr_t)g_uc_fault_addr == bad);
+		test_result("gregs[REG_RAX] and REG_CR2 show the fault",
+			    g_uc_rip_matches);
+		test_result("editing gregs in the handler changed the resumed context",
+			    *(volatile int *)g_uc_good_buf == 0x11223344);
+	}
+	sigaction(SIGSEGV, &old, NULL);
+
+	/* ---- SA_ONSTACK: the handler runs on the alternate stack ---- */
+	g_uc_altstack = malloc(SIGSTKSZ);
+	if (g_uc_altstack) {
+		stack_t ss, oss;
+		ss.ss_sp = g_uc_altstack;
+		ss.ss_size = SIGSTKSZ;
+		ss.ss_flags = 0;
+		test_result("sigaltstack accepts SIGSTKSZ",
+			    sigaltstack(&ss, &oss) == 0);
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_sigaction = uc_altstack_handler;
+		sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGUSR2, &sa, &old);
+		g_uc_on_altstack = 0;
+		g_uc_altstack_flag = -1;
+		raise(SIGUSR2);
+		test_result("SA_ONSTACK handler ran on the alternate stack",
+			    g_uc_on_altstack);
+		test_result("uc_stack.ss_flags reports SS_ONSTACK",
+			    g_uc_altstack_flag == SS_ONSTACK);
+		/* Without SA_ONSTACK it must stay on the main stack. */
+		sa.sa_flags = SA_SIGINFO;
+		sigaction(SIGUSR2, &sa, NULL);
+		g_uc_on_altstack = 1;
+		raise(SIGUSR2);
+		test_result("without SA_ONSTACK the handler uses the main stack",
+			    !g_uc_on_altstack);
+		sigaction(SIGUSR2, &old, NULL);
+		ss.ss_flags = SS_DISABLE;
+		sigaltstack(&ss, NULL);
+		free(g_uc_altstack);
+		g_uc_altstack = NULL;
+	}
+
+	/* ---- getcontext returns twice ---- */
+	{
+		ucontext_t c;
+		volatile int n = 0;
+		getcontext(&c);
+		n++;
+		if (n == 1)
+			setcontext(&c);
+		test_result("getcontext/setcontext: getcontext returned twice",
+			    n == 2);
+	}
+
+	/* ---- makecontext/swapcontext coroutine ping-pong ---- */
+	{
+		static char costack[64 * 1024];
+		g_uc_ntrace = 0;
+		getcontext(&g_uc_co);
+		g_uc_co.uc_stack.ss_sp = costack;
+		g_uc_co.uc_stack.ss_size = sizeof(costack);
+		g_uc_co.uc_link = &g_uc_main;
+		makecontext(&g_uc_co, (void (*)(void))uc_coroutine, 2, 7, 9);
+		g_uc_trace[g_uc_ntrace++] = 1;
+		swapcontext(&g_uc_main, &g_uc_co); /* -> a=7, back */
+		g_uc_trace[g_uc_ntrace++] = 2;
+		swapcontext(&g_uc_main, &g_uc_co); /* -> b=9, return -> link */
+		g_uc_trace[g_uc_ntrace++] = 3;
+		test_result("makecontext/swapcontext: interleaving is 1,7,2,9,3",
+			    g_uc_ntrace == 5 && g_uc_trace[0] == 1 &&
+				    g_uc_trace[1] == 7 && g_uc_trace[2] == 2 &&
+				    g_uc_trace[3] == 9 && g_uc_trace[4] == 3);
+	}
+}
+
+/* ======================================================================
+ * Extended register state: the x87/SSE/AVX registers must survive a
+ * signal handler that uses them, and a context switch to a thread that
+ * uses them.
+ * ====================================================================== */
+static int cpu_has_osxsave_avx(void)
+{
+	unsigned int a, b, c, d;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+			 : "a"(1), "c"(0));
+	if (!(c & (1u << 27)) || !(c & (1u << 28)))
+		return 0; /* OSXSAVE, AVX */
+	unsigned int xlo, xhi;
+	__asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+	return (xlo & 0x6) == 0x6; /* SSE and AVX state enabled in XCR0 */
+}
+
+static void xs_clobber_handler(int sig)
+{
+	(void)sig;
+	/* Clobber XMM/YMM0-1 with something recognisable. */
+	static const unsigned char junk[32] = { 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+						0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+						0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+						0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+						0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+						0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+						0xAA, 0xAA };
+	__asm__ volatile("movdqu (%0), %%xmm0\n\t"
+			 "movdqu (%0), %%xmm1\n\t"
+			 :
+			 : "r"(junk)
+			 : "xmm0", "xmm1", "memory");
+}
+
+static volatile int g_xs_thread_stop;
+static volatile int g_xs_thread_bad;
+
+static void *xs_thread_fn(void *arg)
+{
+	int avx = *(int *)arg;
+	unsigned char pat[32], out[32];
+
+	for (int i = 0; i < 32; i++)
+		pat[i] = (unsigned char)(0x50 + i);
+	while (!g_xs_thread_stop) {
+		if (avx) {
+			__asm__ volatile("vmovdqu (%0), %%ymm3\n\t"
+					 :
+					 : "r"(pat)
+					 : "xmm3", "memory");
+			for (volatile int spin = 0; spin < 2000; spin++)
+				;
+			__asm__ volatile("vmovdqu %%ymm3, (%0)\n\t"
+					 :
+					 : "r"(out)
+					 : "memory");
+		} else {
+			__asm__ volatile("movdqu (%0), %%xmm3\n\t"
+					 :
+					 : "r"(pat)
+					 : "xmm3", "memory");
+			for (volatile int spin = 0; spin < 2000; spin++)
+				;
+			__asm__ volatile("movdqu %%xmm3, (%0)\n\t"
+					 :
+					 : "r"(out)
+					 : "memory");
+		}
+		if (memcmp(pat, out, avx ? 32 : 16) != 0)
+			g_xs_thread_bad = 1;
+	}
+	return NULL;
+}
+
+static void test_xsave(void)
+{
+	printf("\n[TEST] Extended register state across signals and threads\n");
+
+	int avx = cpu_has_osxsave_avx();
+	printf("  (AVX state %s)\n", avx ? "enabled by the kernel" :
+					  "not available, testing SSE only");
+
+	/* ---- Across a signal handler ---- */
+	unsigned char in[32], out[32];
+	for (int i = 0; i < 32; i++)
+		in[i] = (unsigned char)(i * 7 + 1);
+	signal(SIGUSR1, xs_clobber_handler);
+	if (avx) {
+		__asm__ volatile("vmovdqu (%0), %%ymm0\n\t"
+				 "vmovdqu (%0), %%ymm1\n\t"
+				 :
+				 : "r"(in)
+				 : "xmm0", "xmm1", "memory");
+		raise(SIGUSR1);
+		__asm__ volatile("vmovdqu %%ymm0, (%0)\n\t"
+				 :
+				 : "r"(out)
+				 : "memory");
+		test_result("YMM0 survives a signal handler that clobbers it",
+			    memcmp(in, out, 32) == 0);
+		__asm__ volatile("vmovdqu %%ymm1, (%0)\n\t" : : "r"(out) : "memory");
+		test_result("YMM1 survives a signal handler that clobbers it",
+			    memcmp(in, out, 32) == 0);
+	} else {
+		__asm__ volatile("movdqu (%0), %%xmm0\n\t"
+				 :
+				 : "r"(in)
+				 : "xmm0", "memory");
+		raise(SIGUSR1);
+		__asm__ volatile("movdqu %%xmm0, (%0)\n\t" : : "r"(out) : "memory");
+		test_result("XMM0 survives a signal handler that clobbers it",
+			    memcmp(in, out, 16) == 0);
+	}
+	signal(SIGUSR1, SIG_DFL);
+
+	/* ---- Across context switches: two threads with live vectors ---- */
+	pthread_t th;
+	g_xs_thread_stop = 0;
+	g_xs_thread_bad = 0;
+	if (pthread_create(&th, NULL, xs_thread_fn, &avx) == 0) {
+		unsigned char pat[32], got[32];
+		int bad = 0;
+		for (int i = 0; i < 32; i++)
+			pat[i] = (unsigned char)(0xC0 - i);
+		struct timespec t0;
+		mono_now(&t0);
+		while (mono_elapsed_ms(&t0) < 300) {
+			if (avx) {
+				__asm__ volatile("vmovdqu (%0), %%ymm3\n\t"
+						 :
+						 : "r"(pat)
+						 : "xmm3", "memory");
+				sched_yield();
+				__asm__ volatile("vmovdqu %%ymm3, (%0)\n\t"
+						 :
+						 : "r"(got)
+						 : "memory");
+			} else {
+				__asm__ volatile("movdqu (%0), %%xmm3\n\t"
+						 :
+						 : "r"(pat)
+						 : "xmm3", "memory");
+				sched_yield();
+				__asm__ volatile("movdqu %%xmm3, (%0)\n\t"
+						 :
+						 : "r"(got)
+						 : "memory");
+			}
+			if (memcmp(pat, got, avx ? 32 : 16) != 0)
+				bad = 1;
+		}
+		g_xs_thread_stop = 1;
+		pthread_join(th, NULL);
+		test_result("vector registers preserved across context switches (main)",
+			    !bad);
+		test_result("vector registers preserved across context switches (thread)",
+			    !g_xs_thread_bad);
+	} else {
+		test_fail("xsave thread create");
+	}
+}
+
+/* ======================================================================
+ * Large and special mappings: multi-GB lazy reservations carved up with
+ * mprotect, MAP_FIXED_NOREPLACE, MAP_POPULATE, MADV_FREE.
+ * ====================================================================== */
+static void test_mmap_large(void)
+{
+	printf("\n[TEST] Large reservations and mmap flags\n");
+	size_t pg = 4096;
+
+	/* An 8 GB PROT_NONE reservation, as a JIT or a WebAssembly memory
+	 * makes, then commit a piece of it in the middle. */
+	size_t big = 8ULL << 30;
+	char *r = mmap(NULL, big, PROT_NONE,
+		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	test_result("8 GB PROT_NONE reservation succeeds", r != MAP_FAILED);
+	if (r != MAP_FAILED) {
+		char *piece = r + (3ULL << 30) + 64 * pg;
+		test_result("mprotect(RW) of a 1 MB piece inside it",
+			    mprotect(piece, 1 << 20, PROT_READ | PROT_WRITE) == 0);
+		piece[0] = 1;
+		piece[(1 << 20) - 1] = 2;
+		test_result("the committed piece is usable",
+			    piece[0] == 1 && piece[(1 << 20) - 1] == 2);
+		/* The rest is still PROT_NONE: touching it from a child
+		 * must fault. */
+		pid_t c = fork();
+		if (c == 0) {
+			r[pg] = 1;
+			_exit(0);
+		}
+		int st = 0;
+		waitpid(c, &st, 0);
+		test_result("the uncommitted part still faults",
+			    WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+		test_result("munmap of the whole reservation", munmap(r, big) == 0);
+	}
+
+	/* MAP_FIXED_NOREPLACE */
+	char *a = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (a != MAP_FAILED) {
+		errno = 0;
+		void *b = mmap(a + pg, pg, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+			       -1, 0);
+		test_result("MAP_FIXED_NOREPLACE over an existing mapping is EEXIST",
+			    b == MAP_FAILED && errno == EEXIST);
+		munmap(a, 4 * pg);
+		void *c2 = mmap(a, pg, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+				-1, 0);
+		test_result("MAP_FIXED_NOREPLACE on a free address takes it",
+			    c2 == (void *)a);
+		if (c2 != MAP_FAILED)
+			munmap(c2, pg);
+	}
+
+	/* MAP_POPULATE: every page resident before first touch. */
+	unsigned char *pp = mmap(NULL, 16 * pg, PROT_READ | PROT_WRITE,
+				 MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1,
+				 0);
+	if (pp != MAP_FAILED) {
+		unsigned char vec[16];
+		int resident = 0;
+		if (mincore(pp, 16 * pg, vec) == 0)
+			for (int i = 0; i < 16; i++)
+				resident += vec[i] & 1;
+		test_result("MAP_POPULATE faults the whole range in",
+			    resident == 16);
+		/* MADV_FREE releases them again and reads back zeros. */
+		pp[3 * pg] = 0x5A;
+		test_result("MADV_FREE is accepted",
+			    madvise(pp, 16 * pg, MADV_FREE) == 0);
+		test_result("pages read back zero after MADV_FREE",
+			    pp[3 * pg] == 0);
+		test_result("MADV_HUGEPAGE/DONTFORK are accepted as hints",
+			    madvise(pp, 16 * pg, MADV_HUGEPAGE) == 0 &&
+				    madvise(pp, 16 * pg, MADV_DONTFORK) == 0);
+		munmap(pp, 16 * pg);
+	}
+
+	/* mremap: grow (moving if need be) keeps the pages; shrink trims. */
+	unsigned char *m = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m != MAP_FAILED) {
+		for (int i = 0; i < 4; i++)
+			m[i * pg] = (unsigned char)(0x30 + i);
+		/* Block the space right after it so growth must move. */
+		void *blocker = mmap(m + 4 * pg, pg, PROT_READ,
+				     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+				     -1, 0);
+		errno = 0;
+		void *nm = mremap(m, 4 * pg, 64 * pg, 0);
+		test_result("mremap without MAYMOVE fails with ENOMEM when blocked",
+			    nm == MAP_FAILED && errno == ENOMEM);
+		nm = mremap(m, 4 * pg, 64 * pg, MREMAP_MAYMOVE);
+		test_result("mremap(MAYMOVE) grows to 64 pages", nm != MAP_FAILED);
+		if (nm != MAP_FAILED) {
+			unsigned char *n2 = nm;
+			int ok = 1;
+			for (int i = 0; i < 4; i++)
+				if (n2[i * pg] != (unsigned char)(0x30 + i))
+					ok = 0;
+			test_result("the moved pages kept their contents", ok);
+			n2[60 * pg] = 7;
+			test_result("the new tail is usable", n2[60 * pg] == 7);
+			void *sm = mremap(n2, 64 * pg, 2 * pg, 0);
+			test_result("mremap shrinks in place", sm == (void *)n2);
+			munmap(n2, 2 * pg);
+		}
+		if (blocker != MAP_FAILED)
+			munmap(blocker, pg);
+	}
+}
+
+/* ======================================================================
+ * futex bitsets and FUTEX_WAKE_OP
+ * ====================================================================== */
+static volatile int g_fb_word;
+static volatile int g_fb_word2;
+static volatile int g_fb_woken;
+
+static void *fb_waiter(void *arg)
+{
+	unsigned int bits = (unsigned int)(uintptr_t)arg;
+	long r = syscall(SYS_FUTEX, (long)&g_fb_word,
+			 FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE, 0, 0, 0,
+			 (long)bits);
+	(void)r;
+	__sync_fetch_and_add(&g_fb_woken, 1);
+	return NULL;
+}
+
+static void *fb_waiter2(void *arg)
+{
+	(void)arg;
+	syscall(SYS_FUTEX, (long)&g_fb_word2, FUTEX_WAIT_OP | FUTEX_PRIVATE, 0,
+		0, 0, 0);
+	__sync_fetch_and_add(&g_fb_woken, 1);
+	return NULL;
+}
+
+static void test_futex_bitset(void)
+{
+	printf("\n[TEST] futex bitsets and FUTEX_WAKE_OP\n");
+	pthread_t t1, t2;
+
+	g_fb_word = 0;
+	g_fb_woken = 0;
+	pthread_create(&t1, NULL, fb_waiter, (void *)(uintptr_t)0x1);
+	pthread_create(&t2, NULL, fb_waiter, (void *)(uintptr_t)0x2);
+	usleep(50000);
+	/* Wake only the bit-2 sleeper. */
+	long n = syscall(SYS_FUTEX, (long)&g_fb_word,
+			 FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE, 10, 0, 0,
+			 (long)0x2);
+	usleep(50000);
+	test_result("FUTEX_WAKE_BITSET(0x2) woke exactly one waiter",
+		    n == 1 && g_fb_woken == 1);
+	n = syscall(SYS_FUTEX, (long)&g_fb_word,
+		    FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE, 10, 0, 0, (long)0x4);
+	usleep(20000);
+	test_result("FUTEX_WAKE_BITSET(0x4) matches nobody",
+		    n == 0 && g_fb_woken == 1);
+	n = syscall(SYS_FUTEX, (long)&g_fb_word,
+		    FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE, 10, 0, 0, (long)0x1);
+	pthread_join(t1, NULL);
+	pthread_join(t2, NULL);
+	test_result("FUTEX_WAKE_BITSET(0x1) woke the other", n == 1 &&
+							       g_fb_woken == 2);
+	errno = 0;
+	n = syscall(SYS_FUTEX, (long)&g_fb_word,
+		    FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE, 1, 0, 0, 0L);
+	test_result("a zero bitset is EINVAL", n < 0 && errno == EINVAL);
+
+	/* FUTEX_WAKE_OP: (word2 += 1) while waking word2's sleeper if the
+	 * OLD word2 value was 0 -- the condvar-broadcast shape. */
+	g_fb_word = 0;
+	g_fb_word2 = 0;
+	g_fb_woken = 0;
+	pthread_create(&t2, NULL, fb_waiter2, NULL);
+	usleep(50000);
+	unsigned int op = (1u << 28) /* FUTEX_OP_ADD */ | (0u << 24) /* CMP_EQ */ |
+			  (1u << 12) /* oparg 1 */ | 0u /* cmparg 0 */;
+	n = syscall(SYS_FUTEX, (long)&g_fb_word, 5 /* FUTEX_WAKE_OP */ | FUTEX_PRIVATE,
+		    1, 1 /* nr_wake2 */, (long)&g_fb_word2, (long)op);
+	pthread_join(t2, NULL);
+	test_result("FUTEX_WAKE_OP applied the ADD to the second word",
+		    g_fb_word2 == 1);
+	test_result("FUTEX_WAKE_OP woke the second word's waiter on a true compare",
+		    n == 1 && g_fb_woken == 1);
+}
+
+/* ======================================================================
+ * clock_nanosleep and the additional clock ids; nanosleep precision.
+ * ====================================================================== */
+static void test_clock_nanosleep(void)
+{
+	printf("\n[TEST] clock_nanosleep, extra clocks, sleep precision\n");
+	struct timespec a, b, req;
+
+	test_result("CLOCK_MONOTONIC_RAW readable",
+		    clock_gettime(CLOCK_MONOTONIC_RAW, &a) == 0);
+	test_result("CLOCK_BOOTTIME readable",
+		    clock_gettime(CLOCK_BOOTTIME, &a) == 0);
+	test_result("CLOCK_REALTIME_COARSE readable",
+		    clock_gettime(CLOCK_REALTIME_COARSE, &a) == 0);
+	test_result("CLOCK_MONOTONIC_COARSE readable",
+		    clock_gettime(CLOCK_MONOTONIC_COARSE, &a) == 0);
+
+	/* Relative 20 ms. */
+	req.tv_sec = 0;
+	req.tv_nsec = 20 * 1000000L;
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &req, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+	test_result("clock_nanosleep relative returns 0", rc == 0);
+	test_result("clock_nanosleep relative 20 ms slept 20..80 ms",
+		    ms >= 20 && ms <= 80);
+
+	/* Absolute deadline 30 ms out. */
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	req = a;
+	req.tv_nsec += 30 * 1000000L;
+	if (req.tv_nsec >= 1000000000L) {
+		req.tv_nsec -= 1000000000L;
+		req.tv_sec++;
+	}
+	rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+	test_result("clock_nanosleep TIMER_ABSTIME returns 0", rc == 0);
+	test_result("clock_nanosleep TIMER_ABSTIME 30 ms slept 30..90 ms",
+		    ms >= 30 && ms <= 90);
+	/* A deadline in the past returns at once. */
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	req = a;
+	req.tv_sec -= 1;
+	rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+	test_result("past absolute deadline returns immediately",
+		    rc == 0 && ms < 15);
+	test_result("CPU-time clocks are rejected for sleeping",
+		    clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, &req, NULL) != 0);
+	req.tv_sec = 0;
+	req.tv_nsec = 2000000000L;
+	test_result("an invalid timespec is EINVAL",
+		    clock_nanosleep(CLOCK_MONOTONIC, 0, &req, NULL) == EINVAL);
+
+	/* Precision: a 1 ms nanosleep should take about 1 ms with the
+	 * high-resolution timer, and never a full scheduler tick's worth
+	 * of overshoot beyond a few ms.  Reported, and bounded loosely
+	 * enough for a tick-driven fallback. */
+	long worst = 0;
+	for (int i = 0; i < 20; i++) {
+		req.tv_sec = 0;
+		req.tv_nsec = 1000000L;
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		nanosleep(&req, NULL);
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		long us = (b.tv_sec - a.tv_sec) * 1000000 +
+			  (b.tv_nsec - a.tv_nsec) / 1000;
+		if (us > worst)
+			worst = us;
+	}
+	printf("  (worst 1 ms nanosleep: %ld us)\n", worst);
+	test_result("1 ms nanosleep never undersleeps and stays under 30 ms",
+		    worst >= 1000 && worst < 30000);
+}
+
+/* ======================================================================
+ * Credentials are per process: a set*id in one thread applies to all.
+ * ====================================================================== */
+static volatile int g_ct_stop;
+static void *ct_spin(void *arg)
+{
+	(void)arg;
+	while (!g_ct_stop)
+		sched_yield();
+	return (void *)(uintptr_t)geteuid();
+}
+
+/* ---- sigsuspend delivery order ------------------------------------------
+ *
+ * The contract under test: when sigsuspend()'s temporary mask lets a
+ * pending signal through, that signal's HANDLER runs before sigsuspend
+ * returns, the signal is consumed by that delivery, and the caller's
+ * original mask is back afterwards.  A kernel that restores the mask
+ * before delivering leaves the signal pending behind a mask that blocks
+ * it -- it then fires spuriously whenever the mask next opens.
+ *
+ * That exact spurious re-delivery broke the script engine's thread-park
+ * protocol (a handler publishes state, sigsuspends awaiting the SAME
+ * signal as the wake, and a stale delivery after the handler finished
+ * looks like a fresh park request): threads froze, acknowledgement
+ * semaphores went unbalanced, and the collector walked stacks of RUNNING
+ * threads.  The second test below is that protocol, distilled. */
+
+static volatile sig_atomic_t g_ssd_runs;
+
+static void ssd_count_handler(int sig)
+{
+	(void)sig;
+	g_ssd_runs++;
+}
+
+static volatile sig_atomic_t g_ssp_runs;
+static volatile sig_atomic_t g_ssp_parked;
+static volatile sig_atomic_t g_ssp_suspended; /* the suspender's count */
+static sem_t g_ssp_sem;
+static volatile sig_atomic_t g_ssp_stop;
+
+static void ssp_park_handler(int sig)
+{
+	(void)sig;
+	g_ssp_runs++;
+	if (g_ssp_suspended) {
+		/* The wake: its only job is to end the sigsuspend below. */
+		return;
+	}
+	g_ssp_parked = 1;
+	sem_post(&g_ssp_sem);
+	sigset_t allow;
+	sigfillset(&allow);
+	sigdelset(&allow, SIGUSR1);
+	sigsuspend(&allow);
+	g_ssp_parked = 0;
+	sem_post(&g_ssp_sem);
+}
+
+static void *ssp_worker(void *arg)
+{
+	(void)arg;
+	while (!g_ssp_stop)
+		usleep(1000);
+	return NULL;
+}
+
+static void test_sigsuspend_delivery(void)
+{
+	printf("\n[TEST] sigsuspend delivers the awaited handler before returning\n");
+	pid_t c = fork();
+	if (c == 0) {
+		alarm(10); /* the broken semantics HANG the park protocol */
+
+		/* Part 1: pending-but-blocked signal, then sigsuspend that
+		 * allows it. */
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = ssd_count_handler;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGUSR2, &sa, NULL);
+
+		sigset_t blockusr2, oldmask;
+		sigemptyset(&blockusr2);
+		sigaddset(&blockusr2, SIGUSR2);
+		sigprocmask(SIG_BLOCK, &blockusr2, &oldmask);
+		raise(SIGUSR2); /* pending behind the block */
+
+		sigset_t allow;
+		sigfillset(&allow);
+		sigdelset(&allow, SIGUSR2);
+		g_ssd_runs = 0;
+		sigsuspend(&allow); /* must run the handler, then return */
+
+		if (g_ssd_runs != 1)
+			_exit(10); /* handler did not run inside sigsuspend */
+
+		sigset_t pend;
+		sigemptyset(&pend);
+		sigpending(&pend);
+		if (sigismember(&pend, SIGUSR2))
+			_exit(11); /* the delivery did not consume the signal */
+
+		sigset_t cur;
+		sigemptyset(&cur);
+		sigprocmask(SIG_SETMASK, NULL, &cur);
+		if (!sigismember(&cur, SIGUSR2))
+			_exit(12); /* the caller's mask did not come back */
+		sigprocmask(SIG_SETMASK, &oldmask, NULL);
+
+		/* Part 2: the park protocol, 200 cycles.  The handler that
+		 * parks blocks its own signal (sa_mask), exactly as the
+		 * engine's does -- that mask is what a stale pending signal
+		 * used to hide behind. */
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = ssp_park_handler;
+		sigemptyset(&sa.sa_mask);
+		sigaddset(&sa.sa_mask, SIGUSR1);
+		sigaction(SIGUSR1, &sa, NULL);
+		sem_init(&g_ssp_sem, 0, 0);
+
+		pthread_t th;
+		if (pthread_create(&th, NULL, ssp_worker, NULL) != 0)
+			_exit(13);
+
+		for (int i = 0; i < 200; i++) {
+			int runs_before = g_ssp_runs;
+
+			g_ssp_suspended = 0;
+			pthread_kill(th, SIGUSR1); /* park */
+			sem_wait(&g_ssp_sem);
+			if (!g_ssp_parked)
+				_exit(14); /* acknowledged without parking */
+			g_ssp_suspended = 1;
+			pthread_kill(th, SIGUSR1); /* wake */
+			sem_wait(&g_ssp_sem);
+			if (g_ssp_parked)
+				_exit(15); /* acknowledged without waking */
+			g_ssp_suspended = 0;
+
+			/* Give a stale signal its chance to misfire, then
+			 * check the books: exactly two handler runs, and a
+			 * balanced semaphore. */
+			usleep(2000);
+			if (g_ssp_runs != runs_before + 2)
+				_exit(16); /* spurious (re-)delivery */
+			if (sem_trywait(&g_ssp_sem) == 0)
+				_exit(17); /* unpaired acknowledgement */
+		}
+
+		g_ssp_stop = 1;
+		pthread_join(th, NULL);
+		_exit(0);
+	}
+	int st = 0;
+	waitpid(c, &st, 0);
+	test_result("handler runs inside sigsuspend; no stale signal; park protocol balanced",
+		    WIFEXITED(st) && WEXITSTATUS(st) == 0);
+	if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
+		printf("  (child exit code %d)\n", WEXITSTATUS(st));
+	else if (WIFSIGNALED(st))
+		printf("  (child killed by signal %d -- the protocol hung)\n",
+		       WTERMSIG(st));
+}
+
+static void test_cred_threads(void)
+{
+	printf("\n[TEST] set*id applies to every thread of the process\n");
+	if (geteuid() != 0) {
+		printf("  (not root, skipped)\n");
+		return;
+	}
+	pid_t c = fork();
+	if (c == 0) {
+		pthread_t th;
+		g_ct_stop = 0;
+		if (pthread_create(&th, NULL, ct_spin, NULL) != 0)
+			_exit(3);
+		usleep(20000);
+		if (setresuid(1234, 1234, 1234) != 0)
+			_exit(4);
+		usleep(20000);
+		g_ct_stop = 1;
+		void *r = NULL;
+		pthread_join(th, &r);
+		_exit((uintptr_t)r == 1234 ? 0 : 5);
+	}
+	int st = 0;
+	waitpid(c, &st, 0);
+	test_result("a sibling thread sees the new effective uid",
+		    WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+
+/* ======================================================================
+ * Anonymous descriptor kinds: eventfd, timerfd, signalfd, memfd (+seals).
+ * ====================================================================== */
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <sys/signalfd.h>
+#include <sys/auxv.h>
+#include <sys/prctl.h>
+#include <err.h>
+#include <threads.h>
+
+static void *afd_writer(void *arg)
+{
+	int fd = (int)(intptr_t)arg;
+	usleep(30000);
+	eventfd_write(fd, 5);
+	return NULL;
+}
+
+static void test_anonfd(void)
+{
+	printf("\n[TEST] eventfd / timerfd / signalfd / memfd\n");
+
+	/* ---- eventfd ---- */
+	int efd = eventfd(3, EFD_NONBLOCK | EFD_CLOEXEC);
+	test_result("eventfd() creates a descriptor", efd >= 0);
+	if (efd >= 0) {
+		eventfd_t v = 0;
+		test_result("initial value readable", eventfd_read(efd, &v) == 0 && v == 3);
+		errno = 0;
+		test_result("empty counter is EAGAIN with EFD_NONBLOCK",
+			    eventfd_read(efd, &v) < 0 && errno == EAGAIN);
+		test_result("eventfd_write adds", eventfd_write(efd, 2) == 0 &&
+						 eventfd_write(efd, 4) == 0 &&
+						 eventfd_read(efd, &v) == 0 && v == 6);
+		struct pollfd pfd = { .fd = efd, .events = POLLIN };
+		test_result("poll: not readable while zero",
+			    poll(&pfd, 1, 0) == 0);
+		eventfd_write(efd, 1);
+		test_result("poll: readable when non-zero",
+			    poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN));
+		eventfd_read(efd, &v);
+		test_result("FD_CLOEXEC honoured",
+			    fcntl(efd, F_GETFD) & FD_CLOEXEC);
+		/* A blocking read woken by another thread. */
+		int bfd = eventfd(0, 0);
+		pthread_t th;
+		pthread_create(&th, NULL, afd_writer, (void *)(intptr_t)bfd);
+		v = 0;
+		test_result("blocking read wakes on a write from another thread",
+			    eventfd_read(bfd, &v) == 0 && v == 5);
+		pthread_join(th, NULL);
+		close(bfd);
+		/* Semaphore mode. */
+		int sfd = eventfd(3, EFD_SEMAPHORE | EFD_NONBLOCK);
+		eventfd_read(sfd, &v);
+		test_result("EFD_SEMAPHORE reads 1 at a time", v == 1 &&
+			    eventfd_read(sfd, &v) == 0 && v == 1);
+		close(sfd);
+		close(efd);
+	}
+
+	/* ---- timerfd ---- */
+	int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+	test_result("timerfd_create()", tfd >= 0);
+	if (tfd >= 0) {
+		struct itimerspec its = { { 0, 10 * 1000000L }, { 0, 10 * 1000000L } };
+		test_result("timerfd_settime periodic 10 ms",
+			    timerfd_settime(tfd, 0, &its, NULL) == 0);
+		struct pollfd pfd = { .fd = tfd, .events = POLLIN };
+		int r = poll(&pfd, 1, 500);
+		uint64_t ticks = 0;
+		test_result("timerfd becomes readable", r == 1);
+		test_result("read returns expirations",
+			    read(tfd, &ticks, 8) == 8 && ticks >= 1);
+		usleep(55000);
+		read(tfd, &ticks, 8);
+		test_result("periodic: several expirations accumulate (>=3 in 55 ms)",
+			    ticks >= 3);
+		struct itimerspec cur;
+		test_result("timerfd_gettime reports the interval",
+			    timerfd_gettime(tfd, &cur) == 0 &&
+				    cur.it_interval.tv_nsec == 10 * 1000000L);
+		struct itimerspec off = { { 0, 0 }, { 0, 0 } };
+		timerfd_settime(tfd, 0, &off, NULL);
+		read(tfd, &ticks, 8);
+		errno = 0;
+		test_result("disarmed timerfd is EAGAIN",
+			    read(tfd, &ticks, 8) < 0 && errno == EAGAIN);
+		close(tfd);
+	}
+
+	/* ---- signalfd ---- */
+	sigset_t mask, old;
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGUSR1);
+	sigprocmask(SIG_BLOCK, &mask, &old);
+	int sgfd = signalfd(-1, &mask, SFD_NONBLOCK);
+	test_result("signalfd()", sgfd >= 0);
+	if (sgfd >= 0) {
+		struct signalfd_siginfo ssi;
+		errno = 0;
+		test_result("no signal pending: EAGAIN",
+			    read(sgfd, &ssi, sizeof(ssi)) < 0 && errno == EAGAIN);
+		kill(getpid(), SIGUSR1);
+		struct pollfd pfd = { .fd = sgfd, .events = POLLIN };
+		test_result("signalfd pollable after the signal",
+			    poll(&pfd, 1, 200) == 1);
+		ssize_t n = read(sgfd, &ssi, sizeof(ssi));
+		test_result("read returns the signalfd_siginfo",
+			    n == (ssize_t)sizeof(ssi) && ssi.ssi_signo == SIGUSR1 &&
+				    ssi.ssi_pid == (uint32_t)getpid());
+		sigset_t pend;
+		sigpending(&pend);
+		test_result("the signal was consumed", !sigismember(&pend, SIGUSR1));
+		close(sgfd);
+	}
+	sigprocmask(SIG_SETMASK, &old, NULL);
+
+	/* ---- memfd + seals ---- */
+	int mfd = memfd_create("testlibc", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	test_result("memfd_create()", mfd >= 0);
+	if (mfd >= 0) {
+		test_result("ftruncate sizes it", ftruncate(mfd, 8192) == 0);
+		struct stat st;
+		test_result("fstat reports the size",
+			    fstat(mfd, &st) == 0 && st.st_size == 8192);
+		char *m = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+		test_result("mmap(MAP_SHARED) of a memfd", m != MAP_FAILED);
+		if (m != MAP_FAILED) {
+			strcpy(m, "shared");
+			/* Visible through a second mapping. */
+			char *m2 = mmap(NULL, 8192, PROT_READ, MAP_SHARED, mfd, 0);
+			test_result("second mapping sees the data",
+				    m2 != MAP_FAILED && strcmp(m2, "shared") == 0);
+			if (m2 != MAP_FAILED)
+				munmap(m2, 8192);
+			munmap(m, 8192);
+		}
+		test_result("F_GET_SEALS starts empty", fcntl(mfd, F_GET_SEALS) == 0);
+		test_result("F_ADD_SEALS(SHRINK)", fcntl(mfd, F_ADD_SEALS, F_SEAL_SHRINK) == 0);
+		errno = 0;
+		test_result("shrinking a SHRINK-sealed memfd fails",
+			    ftruncate(mfd, 4096) < 0);
+		test_result("growing it still works", ftruncate(mfd, 16384) == 0);
+		fcntl(mfd, F_ADD_SEALS, F_SEAL_WRITE);
+		errno = 0;
+		void *w = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+		test_result("writable mapping of a WRITE-sealed memfd is EPERM",
+			    w == MAP_FAILED && errno == EPERM);
+		fcntl(mfd, F_ADD_SEALS, F_SEAL_SEAL);
+		errno = 0;
+		test_result("sealing after F_SEAL_SEAL is EPERM",
+			    fcntl(mfd, F_ADD_SEALS, F_SEAL_GROW) < 0 && errno == EPERM);
+		/* Passed to a child through fork: same object. */
+		pid_t c = fork();
+		if (c == 0) {
+			char *cm = mmap(NULL, 4096, PROT_READ, MAP_SHARED, mfd, 0);
+			_exit(cm != MAP_FAILED && strcmp(cm, "shared") == 0 ? 0 : 1);
+		}
+		int stt = 0;
+		waitpid(c, &stt, 0);
+		test_result("a forked child maps the same memfd",
+			    WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+		close(mfd);
+	}
+	int unsealable = memfd_create("x", 0);
+	if (unsealable >= 0) {
+		test_result("without MFD_ALLOW_SEALING F_SEAL_SEAL is preset",
+			    fcntl(unsealable, F_GET_SEALS) == F_SEAL_SEAL);
+		close(unsealable);
+	}
+}
+
+/* ======================================================================
+ * /sys and /proc
+ * ====================================================================== */
+static void test_sysfs_procfs(void)
+{
+	printf("\n[TEST] /sys and /proc\n");
+	struct stat st;
+	char buf[512];
+
+	test_result("/sys is a directory", stat("/sys", &st) == 0 && S_ISDIR(st.st_mode));
+	test_result("/sys/bus/pci/devices exists",
+		    stat("/sys/bus/pci/devices", &st) == 0 && S_ISDIR(st.st_mode));
+	DIR *d = opendir("/sys/bus/pci/devices");
+	int npci = 0;
+	char first[64] = "";
+	if (d) {
+		struct dirent *de;
+		while ((de = readdir(d)) != NULL) {
+			if (de->d_name[0] == '.')
+				continue;
+			if (!first[0])
+				snprintf(first, sizeof(first), "%s", de->d_name);
+			npci++;
+		}
+		closedir(d);
+	}
+	test_result("PCI devices are listed", npci > 0);
+	if (first[0]) {
+		char path[128];
+		snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", first);
+		int fd = open(path, O_RDONLY);
+		ssize_t n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+		if (fd >= 0)
+			close(fd);
+		test_result("vendor file reads as 0x....", n > 2 && buf[0] == '0' && buf[1] == 'x');
+		snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", first);
+		fd = open(path, O_RDONLY);
+		n = fd >= 0 ? read(fd, buf, sizeof(buf)) : -1;
+		if (fd >= 0)
+			close(fd);
+		test_result("config file is the 256-byte header", n == 256);
+		snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/uevent", first);
+		fd = open(path, O_RDONLY);
+		n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+		if (fd >= 0)
+			close(fd);
+		if (n > 0)
+			buf[n] = 0;
+		test_result("uevent names PCI_SLOT_NAME",
+			    n > 0 && strstr(buf, "PCI_SLOT_NAME=") != NULL);
+	}
+
+	/* /proc */
+	test_result("/proc/self/exe is a symlink",
+		    lstat("/proc/self/exe", &st) == 0 && S_ISLNK(st.st_mode));
+	ssize_t l = readlink("/proc/self", buf, sizeof(buf) - 1);
+	if (l > 0)
+		buf[l] = 0;
+	test_result("/proc/self resolves to our pid",
+		    l > 0 && atoi(buf) == getpid());
+	l = readlink("/proc/self/fd/0", buf, sizeof(buf) - 1);
+	test_result("/proc/self/fd/0 is a link", l > 0);
+	int fd = open("/proc/self/status", O_RDONLY);
+	ssize_t n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n > 0)
+		buf[n] = 0;
+	test_result("/proc/self/status has Pid:", n > 0 && strstr(buf, "Pid:") != NULL);
+	fd = open("/proc/self/maps", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	test_result("/proc/self/maps lists mappings", n > 0);
+	fd = open("/proc/uptime", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	test_result("/proc/uptime readable", n > 0);
+	fd = open("/proc/meminfo", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n > 0)
+		buf[n] = 0;
+	test_result("/proc/meminfo has MemTotal", n > 0 && strstr(buf, "MemTotal") != NULL);
+	d = opendir("/proc");
+	int found_self = 0, found_pid = 0;
+	if (d) {
+		struct dirent *de;
+		char me[16];
+		snprintf(me, sizeof(me), "%d", getpid());
+		while ((de = readdir(d)) != NULL) {
+			if (strcmp(de->d_name, me) == 0)
+				found_pid = 1;
+			if (strcmp(de->d_name, "uptime") == 0)
+				found_self = 1;
+		}
+		closedir(d);
+	}
+	test_result("/proc lists our pid and the static files", found_pid && found_self);
+	errno = 0;
+	test_result("/proc files are read-only",
+		    open("/proc/uptime", O_WRONLY) < 0);
+}
+
+/* ======================================================================
+ * pread/pwrite, fallocate, and the small POSIX/GNU additions.
+ * ====================================================================== */
+static volatile int g_af_order[3];
+static volatile int g_af_n;
+static void af_prepare(void) { g_af_order[g_af_n++] = 1; }
+static void af_parent(void) { g_af_order[g_af_n++] = 2; }
+static void af_child(void) { _exit(g_af_order[0] == 1 ? 0 : 9); }
+
+static void *tj_thread(void *a)
+{
+	usleep(40000);
+	return a;
+}
+
+static int c11_fn(void *a)
+{
+	return *(int *)a + 1;
+}
+
+static void test_posix_additions(void)
+{
+	printf("\n[TEST] pread/pwrite, fallocate and libc additions\n");
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/tlpw%d", getpid());
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		write(fd, "0123456789", 10);
+		off_t pos = lseek(fd, 0, SEEK_CUR);
+		char b[8] = { 0 };
+		test_result("pread at offset 4", pread(fd, b, 3, 4) == 3 && memcmp(b, "456", 3) == 0);
+		test_result("pread leaves the position alone", lseek(fd, 0, SEEK_CUR) == pos);
+		test_result("pwrite at offset 2", pwrite(fd, "AB", 2, 2) == 2);
+		test_result("pwrite leaves the position alone", lseek(fd, 0, SEEK_CUR) == pos);
+		lseek(fd, 0, SEEK_SET);
+		read(fd, b, 6);
+		test_result("pwrite took effect", memcmp(b, "01AB45", 6) == 0);
+		errno = 0;
+		test_result("pread past EOF reads 0", pread(fd, b, 4, 100) == 0);
+		test_result("fdatasync()", fdatasync(fd) == 0);
+		test_result("fallocate grows the file",
+			    fallocate(fd, 0, 0, 4096) == 0);
+		struct stat st;
+		fstat(fd, &st);
+		test_result("size is 4096 after fallocate", st.st_size == 4096);
+		test_result("posix_fallocate returns 0", posix_fallocate(fd, 0, 8192) == 0);
+		struct iovec iov[2] = { { b, 2 }, { b + 2, 2 } };
+		test_result("preadv", preadv(fd, iov, 2, 0) == 4 && memcmp(b, "01AB", 4) == 0);
+		close(fd);
+		unlink(path);
+	} else {
+		test_fail("pread test file");
+	}
+	int pfd[2];
+	pipe(pfd);
+	errno = 0;
+	test_result("pread on a pipe is ESPIPE",
+		    pread(pfd[0], path, 1, 0) < 0 && errno == ESPIPE);
+	close(pfd[0]);
+	close(pfd[1]);
+
+	/* strchrnul / reallocarray / explicit_bzero / secure_getenv */
+	test_result("strchrnul finds", *strchrnul("abc", 'b') == 'b');
+	test_result("strchrnul at end", *strchrnul("abc", 'z') == 0);
+	errno = 0;
+	test_result("reallocarray overflow is ENOMEM",
+		    reallocarray(NULL, (size_t)1 << 40, (size_t)1 << 40) == NULL &&
+			    errno == ENOMEM);
+	void *ra = reallocarray(NULL, 4, 8);
+	test_result("reallocarray allocates", ra != NULL);
+	free(ra);
+	char zb[8] = "secret";
+	explicit_bzero(zb, sizeof(zb));
+	test_result("explicit_bzero zeroes", zb[0] == 0 && zb[5] == 0);
+	setenv("TL_SEC", "1", 1);
+	test_result("secure_getenv works in a normal process",
+		    secure_getenv("TL_SEC") != NULL);
+	test_result("get_nprocs >= 1", get_nprocs() >= 1 && get_nprocs_conf() >= get_nprocs());
+	test_result("program_invocation_short_name is set",
+		    program_invocation_short_name && program_invocation_short_name[0]);
+	test_result("getauxval(AT_PAGESZ) is 4096", getauxval(AT_PAGESZ) == 4096);
+	test_result("getauxval(AT_RANDOM) points at 16 bytes",
+		    getauxval(AT_RANDOM) != 0);
+	test_result("getauxval(AT_PLATFORM) is x86_64",
+		    getauxval(AT_PLATFORM) &&
+			    strcmp((const char *)getauxval(AT_PLATFORM), "x86_64") == 0);
+	test_result("getauxval(AT_EXECFN) is set",
+		    getauxval(AT_EXECFN) && ((const char *)getauxval(AT_EXECFN))[0]);
+	errno = 0;
+	test_result("getauxval of an absent type is 0/ENOENT",
+		    getauxval(9999) == 0 && errno == ENOENT);
+	char nm[16] = "";
+	prctl(PR_SET_NAME, "tlname");
+	prctl(PR_GET_NAME, nm);
+	test_result("prctl PR_SET_NAME/GET_NAME", strcmp(nm, "tlname") == 0);
+
+	/* pthread_atfork ordering */
+	g_af_n = 0;
+	pthread_atfork(af_prepare, af_parent, af_child);
+	pid_t c = fork();
+	if (c == 0)
+		_exit(7); /* child handler already exited with 0 */
+	int st = 0;
+	waitpid(c, &st, 0);
+	test_result("pthread_atfork: prepare ran before, child handler in the child",
+		    WIFEXITED(st) && WEXITSTATUS(st) == 0 && g_af_order[0] == 1 &&
+			    g_af_order[1] == 2);
+
+	/* pthread_tryjoin_np */
+	pthread_t th;
+	pthread_create(&th, NULL, tj_thread, (void *)0x77);
+	void *rv = NULL;
+	test_result("tryjoin on a running thread is EBUSY",
+		    pthread_tryjoin_np(th, &rv) == EBUSY);
+	usleep(80000);
+	test_result("tryjoin on a finished thread joins it",
+		    pthread_tryjoin_np(th, &rv) == 0 && rv == (void *)0x77);
+
+	/* sigwait */
+	sigset_t set, oldm;
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR2);
+	sigprocmask(SIG_BLOCK, &set, &oldm);
+	kill(getpid(), SIGUSR2);
+	int sig = 0;
+	test_result("sigwait returns the pending signal",
+		    sigwait(&set, &sig) == 0 && sig == SIGUSR2);
+	sigprocmask(SIG_SETMASK, &oldm, NULL);
+
+	/* C11 threads */
+	thrd_t t11;
+	int in = 41, out = 0;
+	test_result("thrd_create", thrd_create(&t11, c11_fn, &in) == thrd_success);
+	test_result("thrd_join returns the result",
+		    thrd_join(t11, &out) == thrd_success && out == 42);
+	mtx_t mx;
+	test_result("mtx_init/lock/trylock/unlock",
+		    mtx_init(&mx, mtx_plain) == thrd_success && mtx_lock(&mx) == thrd_success &&
+			    mtx_trylock(&mx) == thrd_busy && mtx_unlock(&mx) == thrd_success);
+	mtx_destroy(&mx);
+}
+
+
+/* ======================================================================
+ * The display-manager device: /dev/dri/card0 (mode setting, dumb
+ * buffers, events, PRIME) -- skipped where the machine has no GPU driver.
+ * ====================================================================== */
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <drm/drm_fourcc.h>
+#include <sys/sysmacros.h>
+
+static void test_drm(void)
+{
+	printf("\n[TEST] display-manager device (/dev/dri)\n");
+	struct stat st;
+
+	if (stat("/dev/dri/card0", &st) != 0) {
+		printf("  (no /dev/dri/card0: no display-manager driver here, skipped)\n");
+		return;
+	}
+	test_result("/dev/dri/card0 is a character device", S_ISCHR(st.st_mode));
+	test_result("card0 is major 226 minor 0", major(st.st_rdev) == 226 && minor(st.st_rdev) == 0);
+	test_result("/dev/dri/renderD128 exists", stat("/dev/dri/renderD128", &st) == 0 &&
+						       minor(st.st_rdev) == 128);
+	int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	test_result("open card0", fd >= 0);
+	if (fd < 0)
+		return;
+
+	/* VERSION: the two-call string protocol */
+	struct drm_version v;
+	memset(&v, 0, sizeof(v));
+	test_result("DRM_IOCTL_VERSION (lengths)", ioctl(fd, DRM_IOCTL_VERSION, &v) == 0);
+	char name[32] = "", date[32] = "", desc[64] = "";
+	v.name = name; v.name_len = sizeof(name) - 1;
+	v.date = date; v.date_len = sizeof(date) - 1;
+	v.desc = desc; v.desc_len = sizeof(desc) - 1;
+	test_result("DRM_IOCTL_VERSION (strings)", ioctl(fd, DRM_IOCTL_VERSION, &v) == 0);
+	name[v.name_len] = 0;
+	printf("  (driver %s %d.%d.%d)\n", name, v.version_major, v.version_minor, v.version_patchlevel);
+	test_result("driver name is vmwgfx", strcmp(name, "vmwgfx") == 0);
+	test_result("driver version major is 2", v.version_major == 2);
+
+	/* sysfs-style lookup by device number */
+	char spath[96], buf[256];
+	snprintf(spath, sizeof(spath), "/sys/dev/char/%u:%u/uevent", 226u, 0u);
+	int sfd = open(spath, O_RDONLY);
+	ssize_t n = sfd >= 0 ? read(sfd, buf, sizeof(buf) - 1) : -1;
+	if (sfd >= 0)
+		close(sfd);
+	if (n > 0)
+		buf[n] = 0;
+	test_result("/sys/dev/char/226:0/uevent names dri/card0",
+		    n > 0 && strstr(buf, "DEVNAME=dri/card0") != NULL);
+	snprintf(spath, sizeof(spath), "/sys/dev/char/226:0/device/vendor");
+	sfd = open(spath, O_RDONLY);
+	n = sfd >= 0 ? read(sfd, buf, sizeof(buf) - 1) : -1;
+	if (sfd >= 0)
+		close(sfd);
+	if (n > 0)
+		buf[n] = 0;
+	test_result("/sys/dev/char/226:0/device/vendor is 0x15ad",
+		    n > 0 && strstr(buf, "0x15ad") != NULL);
+	test_result("/sys/class/drm/card0 resolves", stat("/sys/class/drm/card0/dev", &st) == 0);
+
+	/* caps */
+	struct drm_get_cap cap = { DRM_CAP_DUMB_BUFFER, 0 };
+	test_result("DRM_CAP_DUMB_BUFFER", ioctl(fd, DRM_IOCTL_GET_CAP, &cap) == 0 && cap.value == 1);
+	cap.capability = DRM_CAP_PRIME;
+	test_result("DRM_CAP_PRIME import+export", ioctl(fd, DRM_IOCTL_GET_CAP, &cap) == 0 && cap.value == 3);
+	cap.capability = DRM_CAP_TIMESTAMP_MONOTONIC;
+	test_result("DRM_CAP_TIMESTAMP_MONOTONIC", ioctl(fd, DRM_IOCTL_GET_CAP, &cap) == 0 && cap.value == 1);
+
+	/* master + magic */
+	test_result("SET_MASTER", ioctl(fd, DRM_IOCTL_SET_MASTER, 0) == 0);
+	int fd2 = open("/dev/dri/card0", O_RDWR);
+	struct drm_auth au = { 0 };
+	test_result("GET_MAGIC on a second file", fd2 >= 0 && ioctl(fd2, DRM_IOCTL_GET_MAGIC, &au) == 0 && au.magic != 0);
+	test_result("AUTH_MAGIC by the master", ioctl(fd, DRM_IOCTL_AUTH_MAGIC, &au) == 0);
+	int rfd = open("/dev/dri/renderD128", O_RDWR);
+	errno = 0;
+	test_result("render node refuses GET_MAGIC (EACCES)",
+		    rfd >= 0 && ioctl(rfd, DRM_IOCTL_GET_MAGIC, &au) < 0 && errno == EACCES);
+	errno = 0;
+	test_result("render node refuses mode setting",
+		    rfd >= 0 && ioctl(rfd, DRM_IOCTL_MODE_GETRESOURCES, &cap) < 0 && errno == EACCES);
+
+	/* resources */
+	struct drm_mode_card_res res;
+	memset(&res, 0, sizeof(res));
+	test_result("MODE_GETRESOURCES (counts)", ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0);
+	test_result("one crtc, one connector, one encoder",
+		    res.count_crtcs == 1 && res.count_connectors == 1 && res.count_encoders == 1);
+	uint32_t crtc_id = 0, conn_id = 0, enc_id = 0;
+	res.crtc_id_ptr = (uint64_t)(uintptr_t)&crtc_id;
+	res.connector_id_ptr = (uint64_t)(uintptr_t)&conn_id;
+	res.encoder_id_ptr = (uint64_t)(uintptr_t)&enc_id;
+	res.count_fbs = 0;
+	ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res);
+	test_result("ids are non-zero", crtc_id && conn_id && enc_id);
+
+	struct drm_mode_get_connector gc;
+	memset(&gc, 0, sizeof(gc));
+	gc.connector_id = conn_id;
+	test_result("MODE_GETCONNECTOR (counts)", ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &gc) == 0);
+	test_result("connector is connected with modes",
+		    gc.connection == 1 && gc.count_modes >= 1 && gc.connector_type == DRM_MODE_CONNECTOR_VIRTUAL);
+	struct drm_mode_modeinfo modes[24];
+	uint32_t nm = gc.count_modes < 24 ? gc.count_modes : 24;
+	gc.modes_ptr = (uint64_t)(uintptr_t)modes;
+	gc.count_modes = nm;
+	gc.count_props = 0;
+	gc.count_encoders = 0;
+	ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &gc);
+	test_result("first mode is preferred", nm > 0 && (modes[0].type & DRM_MODE_TYPE_PREFERRED));
+	printf("  (preferred mode %s @%u)\n", modes[0].name, modes[0].vrefresh);
+
+	struct drm_mode_get_encoder ge;
+	memset(&ge, 0, sizeof(ge));
+	ge.encoder_id = enc_id;
+	test_result("MODE_GETENCODER", ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &ge) == 0 &&
+					     ge.possible_crtcs == 1);
+
+	/* dumb buffer of the preferred mode */
+	struct drm_mode_create_dumb cd;
+	memset(&cd, 0, sizeof(cd));
+	cd.width = modes[0].hdisplay;
+	cd.height = modes[0].vdisplay;
+	cd.bpp = 32;
+	test_result("MODE_CREATE_DUMB", ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) == 0 &&
+					      cd.handle && cd.pitch >= cd.width * 4 && cd.size >= (uint64_t)cd.pitch * cd.height);
+	struct drm_mode_map_dumb md = { .handle = cd.handle };
+	test_result("MODE_MAP_DUMB", ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md) == 0 && md.offset);
+	uint32_t *px = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)md.offset);
+	test_result("mmap of the dumb buffer", px != MAP_FAILED);
+	if (px != MAP_FAILED) {
+		for (uint32_t y = 0; y < cd.height; y++)
+			for (uint32_t x = 0; x < cd.width; x++)
+				px[y * (cd.pitch / 4) + x] = ((x * 255 / cd.width) << 16) | ((y * 255 / cd.height) << 8) | 0x40;
+		test_result("buffer readable back", px[0] == 0x40);
+	}
+	struct drm_mode_fb_cmd fb;
+	memset(&fb, 0, sizeof(fb));
+	fb.width = cd.width;
+	fb.height = cd.height;
+	fb.pitch = cd.pitch;
+	fb.bpp = 32;
+	fb.depth = 24;
+	fb.handle = cd.handle;
+	test_result("MODE_ADDFB", ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb) == 0 && fb.fb_id);
+
+	struct drm_mode_crtc sc;
+	memset(&sc, 0, sizeof(sc));
+	sc.crtc_id = crtc_id;
+	sc.fb_id = fb.fb_id;
+	sc.set_connectors_ptr = (uint64_t)(uintptr_t)&conn_id;
+	sc.count_connectors = 1;
+	sc.mode = modes[0];
+	sc.mode_valid = 1;
+	test_result("MODE_SETCRTC shows the buffer", ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &sc) == 0);
+
+	struct drm_mode_crtc gcr;
+	memset(&gcr, 0, sizeof(gcr));
+	gcr.crtc_id = crtc_id;
+	test_result("MODE_GETCRTC reports the fb", ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &gcr) == 0 &&
+						       gcr.fb_id == fb.fb_id && gcr.mode_valid);
+
+	struct drm_clip_rect clip = { 0, 0, (unsigned short)cd.width, (unsigned short)(cd.height / 2) };
+	struct drm_mode_fb_dirty_cmd dirty;
+	memset(&dirty, 0, sizeof(dirty));
+	dirty.fb_id = fb.fb_id;
+	dirty.num_clips = 1;
+	dirty.clips_ptr = (uint64_t)(uintptr_t)&clip;
+	test_result("MODE_DIRTYFB", ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &dirty) == 0);
+
+	/* vblank: synchronous, then as an event */
+	union drm_wait_vblank wv;
+	memset(&wv, 0, sizeof(wv));
+	wv.request.type = _DRM_VBLANK_RELATIVE;
+	wv.request.sequence = 2;
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	int wr = ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &wv);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	test_result("WAIT_VBLANK relative 2 waits about two frames (10..80 ms)", wr == 0 && ms >= 10 && ms <= 80);
+	memset(&wv, 0, sizeof(wv));
+	wv.request.type = _DRM_VBLANK_RELATIVE | _DRM_VBLANK_EVENT;
+	wv.request.sequence = 1;
+	wv.request.signal = 0x1234;
+	test_result("WAIT_VBLANK with EVENT queues", ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &wv) == 0);
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	test_result("the fd becomes readable", poll(&pfd, 1, 500) == 1);
+	struct drm_event_vblank ev;
+	n = read(fd, &ev, sizeof(ev));
+	test_result("read returns a vblank event with our user_data",
+		    n == (ssize_t)sizeof(ev) && ev.base.type == DRM_EVENT_VBLANK && ev.user_data == 0x1234 &&
+			    ev.crtc_id == crtc_id);
+
+	/* page flip to a second buffer with an event */
+	struct drm_mode_create_dumb cd2 = cd;
+	cd2.handle = 0;
+	ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd2);
+	struct drm_mode_fb_cmd fb2 = fb;
+	fb2.handle = cd2.handle;
+	fb2.fb_id = 0;
+	ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb2);
+	struct drm_mode_crtc_page_flip flip = { .crtc_id = crtc_id, .fb_id = fb2.fb_id,
+						.flags = DRM_MODE_PAGE_FLIP_EVENT, .user_data = 0x77 };
+	test_result("MODE_PAGE_FLIP", ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) == 0);
+	test_result("flip completion event arrives",
+		    poll(&pfd, 1, 500) == 1 && read(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev) &&
+			    ev.base.type == DRM_EVENT_FLIP_COMPLETE && ev.user_data == 0x77);
+
+	/* PRIME: export, import in a child over fork, and via SCM_RIGHTS */
+	struct drm_prime_handle ph = { .handle = cd.handle, .flags = DRM_CLOEXEC | DRM_RDWR };
+	test_result("PRIME_HANDLE_TO_FD", ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) == 0 && ph.fd >= 0);
+	if (ph.fd >= 0) {
+		struct drm_prime_handle ih = { .fd = ph.fd };
+		test_result("PRIME_FD_TO_HANDLE on the render node",
+			    rfd >= 0 && ioctl(rfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ih) == 0 && ih.handle);
+		uint32_t *m2 = mmap(NULL, 4096, PROT_READ, MAP_SHARED, ph.fd, 0);
+		test_result("mmap of the dma-buf sees the pixels", m2 != MAP_FAILED && m2[0] == 0x40);
+		if (m2 != MAP_FAILED)
+			munmap(m2, 4096);
+		pid_t c = fork();
+		if (c == 0) {
+			uint32_t *cm = mmap(NULL, 4096, PROT_READ, MAP_SHARED, ph.fd, 0);
+			_exit(cm != MAP_FAILED && cm[0] == 0x40 ? 0 : 1);
+		}
+		int stt = 0;
+		waitpid(c, &stt, 0);
+		test_result("a forked child maps the dma-buf", WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+		close(ph.fd);
+	}
+	struct drm_gem_close gcl = { .handle = cd2.handle };
+	test_result("GEM_CLOSE", ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gcl) == 0);
+
+	if (px != MAP_FAILED)
+		munmap(px, cd.size);
+	test_result("MODE_RMFB", ioctl(fd, DRM_IOCTL_MODE_RMFB, &fb.fb_id) == 0);
+	ioctl(fd, DRM_IOCTL_MODE_RMFB, &fb2.fb_id);
+	struct drm_mode_destroy_dumb dd = { .handle = cd.handle };
+	test_result("MODE_DESTROY_DUMB", ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd) == 0);
+	test_result("DROP_MASTER", ioctl(fd, DRM_IOCTL_DROP_MASTER, 0) == 0);
+	if (rfd >= 0)
+		close(rfd);
+	if (fd2 >= 0)
+		close(fd2);
+	close(fd);
+}
+
+
+/* ======================================================================
+ * The 3D side of the display-manager device (vmwgfx ioctls): skipped on
+ * hosts without 3D.
+ * ====================================================================== */
+#include <drm/vmwgfx_drm.h>
+#include <drm/sync_file.h>
+
+static long vmw_cmd(int fd, unsigned nr, unsigned dir, void *arg, size_t size)
+{
+	unsigned long req = _IOC(dir, 'd', 0x40 + nr, size);
+	return ioctl(fd, req, arg);
+}
+
+/* What does a buffer hold after a readback?  Four answers, four meanings.
+ * The pattern: the device wrote the surface content back.  The sentinel the
+ * buffer was filled with before the readback: the device wrote nothing --
+ * which for a surface the host never RENDERED into is CORRECT guest-backed
+ * behaviour, not a failure: the MOB is the canonical storage and the host
+ * has nothing newer to write back.  (Observed on VMware 2026-08-28: readback
+ * of an uploaded-only surface leaves the buffer untouched, while readback
+ * after GL rendering delivers the rendered pixels.)  Zeroes: the device
+ * wrote back an EMPTY host copy -- upload-direction data loss.  A mix:
+ * corruption.  Only the last two are failures. */
+#define GB_XFER_PATTERN 0
+#define GB_XFER_UNTOUCHED 1
+#define GB_XFER_ZEROS 2
+#define GB_XFER_MIX 3
+static int gb_xfer_classify(const uint32_t *pix, int n, uint32_t seed,
+			    uint32_t sentinel, int *out_bad)
+{
+	int pat = 0, zero = 0, sent = 0;
+
+	for (int i = 0; i < n; i++) {
+		uint32_t v = pix[i];
+		if (v == (seed ^ (uint32_t)i * 2654435761u))
+			pat++;
+		if (v == 0)
+			zero++;
+		if (v == sentinel)
+			sent++;
+	}
+	*out_bad = n - pat;
+	if (pat == n)
+		return GB_XFER_PATTERN;
+	if (sent == n)
+		return GB_XFER_UNTOUCHED;
+	if (zero == n)
+		return GB_XFER_ZEROS;
+	return GB_XFER_MIX;
+}
+
+static const char *gb_xfer_name(int cls)
+{
+	switch (cls) {
+	case GB_XFER_PATTERN:
+		return "the pattern (device wrote the content back)";
+	case GB_XFER_UNTOUCHED:
+		return "the untouched sentinel (nothing newer host-side; correct)";
+	case GB_XFER_ZEROS:
+		return "zeroes (device wrote back an EMPTY host copy: upload lost)";
+	default:
+		return "a mix (corruption)";
+	}
+}
+
+static void test_drm_3d(void)
+{
+	printf("\n[TEST] display-manager device: 3D (vmwgfx)\n");
+	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		printf("  (no render node, skipped)\n");
+		return;
+	}
+	struct drm_vmw_getparam_arg gp = { .param = DRM_VMW_PARAM_3D };
+	if (vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp)) != 0 || !gp.value) {
+		printf("  (host has no 3D, skipped)\n");
+		close(fd);
+		return;
+	}
+	gp.param = DRM_VMW_PARAM_HW_CAPS;
+	vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp));
+	int gb = (gp.value & 0x08000000) != 0;
+	gp.param = DRM_VMW_PARAM_DX;
+	vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp));
+	int dx = (int)gp.value;
+	printf("  (guest-backed objects %s, DX %s)\n", gb ? "yes" : "no", dx ? "yes" : "no");
+
+	/* buffer object + map + SYNCCPU */
+	union drm_vmw_alloc_bo_arg bo;
+	memset(&bo, 0, sizeof(bo));
+	bo.req.size = 65536;
+	test_result("ALLOC_BO", vmw_cmd(fd, DRM_VMW_ALLOC_BO, _IOC_READ | _IOC_WRITE, &bo, sizeof(bo)) == 0 &&
+				      bo.rep.handle && bo.rep.map_handle);
+	uint32_t *bm = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)bo.rep.map_handle);
+	test_result("mmap of the BO via map_handle", bm != MAP_FAILED);
+	if (bm != MAP_FAILED) {
+		bm[0] = 0xABCD;
+		munmap(bm, 65536);
+	}
+	struct drm_vmw_synccpu_arg sc = { .op = drm_vmw_synccpu_grab, .flags = drm_vmw_synccpu_read,
+					  .handle = bo.rep.handle };
+	test_result("SYNCCPU grab on an idle BO", vmw_cmd(fd, DRM_VMW_SYNCCPU, _IOC_WRITE, &sc, sizeof(sc)) == 0);
+	sc.op = drm_vmw_synccpu_release;
+	vmw_cmd(fd, DRM_VMW_SYNCCPU, _IOC_WRITE, &sc, sizeof(sc));
+
+	/* An empty EXECBUF still yields a fence (the "flush for fence" case). */
+	struct drm_vmw_fence_rep rep;
+	memset(&rep, 0, sizeof(rep));
+	rep.error = -EFAULT;
+	struct drm_vmw_execbuf_arg eb;
+	memset(&eb, 0, sizeof(eb));
+	eb.version = DRM_VMW_EXECBUF_VERSION;
+	eb.context_handle = 0xFFFFFFFFu;
+	eb.imported_fence_fd = -1;
+	eb.fence_rep = (uint64_t)(uintptr_t)&rep;
+	eb.flags = DRM_VMW_EXECBUF_FLAG_EXPORT_FENCE_FD;
+	test_result("EXECBUF (empty) returns 0", vmw_cmd(fd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) == 0);
+	test_result("fence_rep filled: error 0, handle set", rep.error == 0 && rep.handle != 0);
+	test_result("fence fd exported", rep.fd >= 0);
+	struct drm_vmw_fence_wait_arg fw = { .handle = rep.handle, .timeout_us = 1000000, .flags = DRM_VMW_FENCE_FLAG_EXEC };
+	test_result("FENCE_WAIT", vmw_cmd(fd, DRM_VMW_FENCE_WAIT, _IOC_READ | _IOC_WRITE, &fw, sizeof(fw)) == 0);
+	struct drm_vmw_fence_signaled_arg fs = { .handle = rep.handle, .flags = DRM_VMW_FENCE_FLAG_EXEC };
+	test_result("FENCE_SIGNALED after the wait", vmw_cmd(fd, DRM_VMW_FENCE_SIGNALED, _IOC_READ | _IOC_WRITE, &fs, sizeof(fs)) == 0 && fs.signaled);
+	if (rep.fd >= 0) {
+		struct pollfd pfd = { .fd = rep.fd, .events = POLLIN };
+		test_result("sync_file is readable once signalled", poll(&pfd, 1, 1000) == 1);
+		struct sync_merge_data md;
+		memset(&md, 0, sizeof(md));
+		strcpy(md.name, "t");
+		md.fd2 = rep.fd;
+		test_result("SYNC_IOC_MERGE", ioctl(rep.fd, SYNC_IOC_MERGE, &md) == 0 && md.fence >= 0);
+		if (md.fence >= 0)
+			close(md.fence);
+		close(rep.fd);
+	}
+	struct drm_vmw_fence_arg fu = { .handle = rep.handle };
+	test_result("FENCE_UNREF", vmw_cmd(fd, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &fu, sizeof(fu)) == 0);
+
+	/* contexts */
+	union drm_vmw_extended_context_arg ctx;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.req = dx ? drm_vmw_context_dx : drm_vmw_context_legacy;
+	int cr = vmw_cmd(fd, DRM_VMW_CREATE_EXTENDED_CONTEXT, _IOC_READ | _IOC_WRITE, &ctx, sizeof(ctx));
+	test_result("CREATE_EXTENDED_CONTEXT", cr == 0 && ctx.rep.cid >= 0);
+	if (cr == 0) {
+		struct drm_vmw_context_arg ca = { .cid = ctx.rep.cid };
+		test_result("UNREF_CONTEXT", vmw_cmd(fd, DRM_VMW_UNREF_CONTEXT, _IOC_WRITE, &ca, sizeof(ca)) == 0);
+	}
+
+	if (gb) {
+		/* a 64x64 XRGB surface with its own backup */
+		union drm_vmw_gb_surface_create_ext_arg sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.req.base.svga3d_flags = 0;
+		/* SVGA3D_X8R8G8B8: XRGB, 4 bytes a pixel, and the one 32-bit
+		 * format every guest-backed device has -- it is what the
+		 * driver's own scan-out surface is.  (Format 23 is not
+		 * B8G8R8X8_UNORM, which is 142; 23 is SVGA3D_FORMAT_DEAD1, a
+		 * hole left where a format was removed.) */
+		sa.req.base.format = 1; /* SVGA3D_X8R8G8B8 */
+		sa.req.base.mip_levels = 1;
+		sa.req.base.drm_surface_flags = drm_vmw_surface_flag_shareable | drm_vmw_surface_flag_create_buffer;
+		sa.req.base.buffer_handle = 0xFFFFFFFFu;
+		sa.req.base.base_size.width = 64;
+		sa.req.base.base_size.height = 64;
+		sa.req.base.base_size.depth = 1;
+		sa.req.base.array_size = 1;
+		sa.req.version = drm_vmw_gb_surface_v1;
+		int sr = vmw_cmd(fd, DRM_VMW_GB_SURFACE_CREATE_EXT, _IOC_READ | _IOC_WRITE, &sa, sizeof(sa));
+		test_result("GB_SURFACE_CREATE_EXT", sr == 0 && sa.rep.handle && sa.rep.buffer_handle != 0xFFFFFFFFu);
+		test_result("backup size is 64*64*4", sa.rep.backup_size == 64 * 64 * 4);
+		if (sr == 0) {
+			uint32_t *pix = mmap(NULL, sa.rep.buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+					     (off_t)sa.rep.buffer_map_handle);
+			test_result("backup buffer maps", pix != MAP_FAILED);
+			if (pix != MAP_FAILED) {
+				/* A pattern that varies per pixel, not one
+				 * repeated value: a copy that lands at the
+				 * wrong offset, or a readback that fills only
+				 * the first page, both survive a constant. */
+				for (int i = 0; i < 64 * 64; i++)
+					pix[i] = 0x00FF8000u ^ (uint32_t)i * 2654435761u;
+				/* Upload: UPDATE_GB_SURFACE names the surface HANDLE;
+				 * the kernel rewrites it to the device id. */
+				uint32_t cmd[3] = { 1102 /* SVGA_3D_CMD_UPDATE_GB_SURFACE */, 4, sa.rep.handle };
+				memset(&rep, 0, sizeof(rep));
+				rep.error = -EFAULT;
+				eb.commands = (uint64_t)(uintptr_t)cmd;
+				eb.command_size = sizeof(cmd);
+				eb.flags = 0;
+				eb.fence_rep = (uint64_t)(uintptr_t)&rep;
+				test_result("EXECBUF UPDATE_GB_SURFACE accepted",
+					    vmw_cmd(fd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) == 0 && rep.error == 0);
+				struct drm_vmw_fence_wait_arg w2 = { .handle = rep.handle, .timeout_us = 1000000, .flags = DRM_VMW_FENCE_FLAG_EXEC };
+				test_result("fence of the upload passes", vmw_cmd(fd, DRM_VMW_FENCE_WAIT, _IOC_READ | _IOC_WRITE, &w2, sizeof(w2)) == 0);
+				struct drm_vmw_fence_arg u2 = { .handle = rep.handle };
+				vmw_cmd(fd, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &u2, sizeof(u2));
+
+				/* The round trips -- the only thing here
+				 * that proves pixels actually move between
+				 * guest memory and the surface.
+				 *
+				 * These transfers are the path every X pixel
+				 * takes that is not rendered host-side: glamor
+				 * falls back to CPU drawing for core-font text
+				 * (readback, draw, upload) and uploads every
+				 * client-rendered image.  Where a transfer
+				 * silently moves nothing, window borders and
+				 * fills (host-rendered) still appear while all
+				 * text and window content is black -- with
+				 * every ioctl and fence succeeding.  Only
+				 * comparing pixels can see it.
+				 *
+				 * Round trip 1 uses the whole-surface commands
+				 * (UPDATE/READBACK_GB_SURFACE); round trip 2
+				 * the per-image ones (UPDATE/READBACK_GB_IMAGE)
+				 * -- the forms the kernel console and Mesa
+				 * actually use, so the two rounds can implicate
+				 * a command family, not just "the device". */
+				memset(pix, 0xAA, 64 * 64 * 4);
+				uint32_t rb[3] = { 1104 /* SVGA_3D_CMD_READBACK_GB_SURFACE */, 4, sa.rep.handle };
+				memset(&rep, 0, sizeof(rep));
+				rep.error = -EFAULT;
+				eb.commands = (uint64_t)(uintptr_t)rb;
+				eb.command_size = sizeof(rb);
+				eb.flags = 0;
+				eb.fence_rep = (uint64_t)(uintptr_t)&rep;
+				test_result("EXECBUF READBACK_GB_SURFACE accepted",
+					    vmw_cmd(fd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) == 0 && rep.error == 0);
+				struct drm_vmw_fence_wait_arg w3 = { .handle = rep.handle, .timeout_us = 1000000, .flags = DRM_VMW_FENCE_FLAG_EXEC };
+				test_result("fence of the readback passes",
+					    vmw_cmd(fd, DRM_VMW_FENCE_WAIT, _IOC_READ | _IOC_WRITE, &w3, sizeof(w3)) == 0);
+				struct drm_vmw_fence_arg u3 = { .handle = rep.handle };
+				vmw_cmd(fd, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &u3, sizeof(u3));
+				struct drm_vmw_synccpu_arg sc;
+				memset(&sc, 0, sizeof(sc));
+				sc.op = drm_vmw_synccpu_grab;
+				sc.flags = drm_vmw_synccpu_read;
+				sc.handle = sa.rep.buffer_handle;
+				test_result("SYNCCPU grabs the backup buffer for reading",
+					    vmw_cmd(fd, DRM_VMW_SYNCCPU, _IOC_WRITE, &sc, sizeof(sc)) == 0);
+
+				int bad = 0;
+				int cls = gb_xfer_classify(pix, 64 * 64, 0x00FF8000u,
+							   0xAAAAAAAAu, &bad);
+				test_result("whole-surface readback does not lose or corrupt data",
+					    cls == GB_XFER_PATTERN || cls == GB_XFER_UNTOUCHED);
+				printf("      (READBACK_GB_SURFACE left %s; [0]=%08x [1]=%08x)\n",
+				       gb_xfer_name(cls), (unsigned)pix[0], (unsigned)pix[1]);
+				sc.op = drm_vmw_synccpu_release;
+				vmw_cmd(fd, DRM_VMW_SYNCCPU, _IOC_WRITE, &sc, sizeof(sc));
+
+				/* Round trip 2: the per-image commands. */
+				for (int i = 0; i < 64 * 64; i++)
+					pix[i] = 0x00123456u ^ (uint32_t)i * 2654435761u;
+				/* SVGA3dSurfaceImageId {sid,face,mipmap} + SVGA3dBox {x,y,z,w,h,d} */
+				uint32_t up2[11] = { 1101 /* SVGA_3D_CMD_UPDATE_GB_IMAGE */, 36,
+						     sa.rep.handle, 0, 0,
+						     0, 0, 0, 64, 64, 1 };
+				memset(&rep, 0, sizeof(rep));
+				rep.error = -EFAULT;
+				eb.commands = (uint64_t)(uintptr_t)up2;
+				eb.command_size = sizeof(up2);
+				eb.fence_rep = (uint64_t)(uintptr_t)&rep;
+				test_result("EXECBUF UPDATE_GB_IMAGE accepted",
+					    vmw_cmd(fd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) == 0 && rep.error == 0);
+				struct drm_vmw_fence_wait_arg w4 = { .handle = rep.handle, .timeout_us = 1000000, .flags = DRM_VMW_FENCE_FLAG_EXEC };
+				test_result("fence of the image upload passes",
+					    vmw_cmd(fd, DRM_VMW_FENCE_WAIT, _IOC_READ | _IOC_WRITE, &w4, sizeof(w4)) == 0);
+				struct drm_vmw_fence_arg u4 = { .handle = rep.handle };
+				vmw_cmd(fd, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &u4, sizeof(u4));
+
+				memset(pix, 0x55, 64 * 64 * 4);
+				/* SVGA3dSurfaceImageId {sid,face,mipmap} */
+				uint32_t rb2[5] = { 1103 /* SVGA_3D_CMD_READBACK_GB_IMAGE */, 12,
+						    sa.rep.handle, 0, 0 };
+				memset(&rep, 0, sizeof(rep));
+				rep.error = -EFAULT;
+				eb.commands = (uint64_t)(uintptr_t)rb2;
+				eb.command_size = sizeof(rb2);
+				eb.fence_rep = (uint64_t)(uintptr_t)&rep;
+				test_result("EXECBUF READBACK_GB_IMAGE accepted",
+					    vmw_cmd(fd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) == 0 && rep.error == 0);
+				struct drm_vmw_fence_wait_arg w5 = { .handle = rep.handle, .timeout_us = 1000000, .flags = DRM_VMW_FENCE_FLAG_EXEC };
+				test_result("fence of the image readback passes",
+					    vmw_cmd(fd, DRM_VMW_FENCE_WAIT, _IOC_READ | _IOC_WRITE, &w5, sizeof(w5)) == 0);
+				struct drm_vmw_fence_arg u5 = { .handle = rep.handle };
+				vmw_cmd(fd, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &u5, sizeof(u5));
+				sc.op = drm_vmw_synccpu_grab;
+				sc.flags = drm_vmw_synccpu_read;
+				test_result("SYNCCPU grabs for the image readback",
+					    vmw_cmd(fd, DRM_VMW_SYNCCPU, _IOC_WRITE, &sc, sizeof(sc)) == 0);
+				cls = gb_xfer_classify(pix, 64 * 64, 0x00123456u,
+						       0x55555555u, &bad);
+				test_result("per-image readback does not lose or corrupt data (console/Mesa form)",
+					    cls == GB_XFER_PATTERN || cls == GB_XFER_UNTOUCHED);
+				printf("      (READBACK_GB_IMAGE left %s; [0]=%08x [1]=%08x)\n",
+				       gb_xfer_name(cls), (unsigned)pix[0], (unsigned)pix[1]);
+				sc.op = drm_vmw_synccpu_release;
+				vmw_cmd(fd, DRM_VMW_SYNCCPU, _IOC_WRITE, &sc, sizeof(sc));
+				munmap(pix, sa.rep.buffer_size);
+			}
+			/* a command naming a handle that is not ours is refused */
+			uint32_t bad[3] = { 1102, 4, 0x7FFF };
+			eb.commands = (uint64_t)(uintptr_t)bad;
+			eb.command_size = sizeof(bad);
+			eb.fence_rep = 0;
+			errno = 0;
+			test_result("EXECBUF refuses an unknown surface handle",
+				    vmw_cmd(fd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) < 0 && errno == EINVAL);
+			/* share the surface: PRIME export, re-import by REF_EXT(PRIME) */
+			struct drm_prime_handle ph = { .handle = sa.rep.handle, .flags = DRM_CLOEXEC };
+			test_result("PRIME export of a surface", ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) == 0);
+			if (ph.fd >= 0) {
+				int fd2 = open("/dev/dri/renderD128", O_RDWR);
+				union drm_vmw_gb_surface_reference_ext_arg ra;
+				memset(&ra, 0, sizeof(ra));
+				ra.req.sid = ph.fd;
+				ra.req.handle_type = DRM_VMW_HANDLE_PRIME;
+				int rr = fd2 >= 0 ? vmw_cmd(fd2, DRM_VMW_GB_SURFACE_REF_EXT, _IOC_READ | _IOC_WRITE, &ra, sizeof(ra)) : -1;
+				test_result("GB_SURFACE_REF_EXT by dma-buf in another file",
+					    rr == 0 && ra.rep.crep.handle && ra.rep.creq.base.base_size.width == 64 &&
+						    ra.rep.creq.base.format == 1 && ra.rep.crep.backup_size == 64 * 64 * 4);
+				if (fd2 >= 0)
+					close(fd2);
+				close(ph.fd);
+			}
+			struct drm_vmw_surface_arg ua = { .sid = (int32_t)sa.rep.handle };
+			test_result("UNREF_SURFACE", vmw_cmd(fd, DRM_VMW_UNREF_SURFACE, _IOC_WRITE, &ua, sizeof(ua)) == 0);
+		}
+		struct drm_vmw_get_3d_cap_arg cap;
+		static uint32_t caps[300];
+		cap.buffer = (uint64_t)(uintptr_t)caps;
+		cap.max_size = sizeof(caps);
+		test_result("GET_3D_CAP fills the devcap array",
+			    vmw_cmd(fd, DRM_VMW_GET_3D_CAP, _IOC_WRITE, &cap, sizeof(cap)) == 0 && caps[0] /* DEVCAP_3D */);
+	}
+	struct drm_vmw_handle_close_arg hc = { .handle = bo.rep.handle };
+	test_result("UNREF_DMABUF (handle close)", vmw_cmd(fd, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &hc, sizeof(hc)) == 0);
+
+	/* The host message channel.  Either the hypervisor answers it and a
+	 * log line is accepted, or it does not exist and the driver says
+	 * ENODEV -- both are correct, and a third answer is not. */
+	{
+		char msg[] = "log LikeOS testlibc: display-manager message channel";
+		struct drm_vmw_msg_arg ma;
+		memset(&ma, 0, sizeof(ma));
+		ma.send = (uint64_t)(uintptr_t)msg;
+		ma.send_only = 1;
+		int rc = vmw_cmd(fd, DRM_VMW_MSG, _IOC_READ | _IOC_WRITE, &ma, sizeof(ma));
+		test_result("MSG: a host log line is accepted or refused cleanly",
+			    rc == 0 || rc == -ENODEV || rc == -EIO);
+		printf("      (message channel: %s)\n",
+		       rc == 0 ? "present" : rc == -ENODEV ? "absent" : "present, refused");
+	}
+
+	/* A fence event: the same wait as FENCE_WAIT, delivered as a
+	 * readable event instead.  With nothing submitted the fence is
+	 * already signalled, so the event has to be there straight away --
+	 * which is the case the driver has to special-case and the one most
+	 * likely to be got wrong. */
+	{
+		struct drm_vmw_fence_event_arg fe;
+		memset(&fe, 0, sizeof(fe));
+		fe.user_data = 0x5AFE7E57ull;
+		int rc = vmw_cmd(fd, DRM_VMW_FENCE_EVENT, _IOC_WRITE, &fe, sizeof(fe));
+		test_result("FENCE_EVENT is accepted", rc == 0);
+		if (rc == 0) {
+			struct pollfd pf = { .fd = fd, .events = POLLIN };
+			int pr = poll(&pf, 1, 2000);
+			test_result("FENCE_EVENT: the device becomes readable", pr == 1);
+			if (pr == 1) {
+				char buf[128];
+				ssize_t n = read(fd, buf, sizeof(buf));
+				struct drm_event *ev = (struct drm_event *)buf;
+				test_result("FENCE_EVENT: the event is a fence event",
+					    n >= (ssize_t)sizeof(struct drm_vmw_event_fence) &&
+						    ev->type == DRM_VMW_EVENT_FENCE_SIGNALED);
+				if (n >= (ssize_t)sizeof(struct drm_vmw_event_fence)) {
+					struct drm_vmw_event_fence *evf =
+						(struct drm_vmw_event_fence *)buf;
+					test_result("FENCE_EVENT: it carries the caller's cookie",
+						    evf->user_data == 0x5AFE7E57ull);
+				}
+			}
+		}
+	}
+	close(fd);
+
+	/* UPDATE_LAYOUT is the host telling the guest what geometry it would
+	 * like.  It changes what the display advertises, so it belongs to
+	 * whoever holds the display: the render node must refuse it, and the
+	 * card node must take it. */
+	{
+		int rfd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+		struct drm_vmw_rect r = { 0, 0, 1024, 768 };
+		struct drm_vmw_update_layout_arg ul;
+		memset(&ul, 0, sizeof(ul));
+		ul.num_outputs = 1;
+		ul.rects = (uint64_t)(uintptr_t)&r;
+		if (rfd >= 0) {
+			int rc = vmw_cmd(rfd, DRM_VMW_UPDATE_LAYOUT, _IOC_WRITE, &ul,
+					 sizeof(ul));
+			test_result("UPDATE_LAYOUT is refused on the render node",
+				    rc == -EACCES || rc == -EINVAL || rc == -EPERM);
+			close(rfd);
+		}
+		int cfd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+		if (cfd >= 0) {
+			/* The layout pushed here becomes the connector's
+			 * PREFERRED mode and OUTLIVES this process: the next
+			 * mode-setting client starts at whatever it names.
+			 * Passing a made-up 1024x768 left every X session
+			 * after a test run in 1024x768 on a 1920x1200 host.
+			 * So ask the connector what is preferred right now and
+			 * push exactly that -- acceptance is exercised, and
+			 * nothing anyone sees changes. */
+			struct drm_mode_card_res cres;
+			uint32_t cids[4], conn = 0;
+			memset(&cres, 0, sizeof(cres));
+			cres.connector_id_ptr = (uint64_t)(uintptr_t)cids;
+			cres.count_connectors = 4;
+			if (ioctl(cfd, DRM_IOCTL_MODE_GETRESOURCES, &cres) == 0 &&
+			    cres.count_connectors >= 1)
+				conn = cids[0];
+			struct drm_mode_get_connector gc2;
+			memset(&gc2, 0, sizeof(gc2));
+			gc2.connector_id = conn;
+			if (conn && ioctl(cfd, DRM_IOCTL_MODE_GETCONNECTOR, &gc2) == 0 &&
+			    gc2.count_modes) {
+				struct drm_mode_modeinfo pm[24];
+				uint32_t nm2 = gc2.count_modes < 24 ? gc2.count_modes : 24;
+				memset(&gc2, 0, sizeof(gc2));
+				gc2.connector_id = conn;
+				gc2.modes_ptr = (uint64_t)(uintptr_t)pm;
+				gc2.count_modes = nm2;
+				if (ioctl(cfd, DRM_IOCTL_MODE_GETCONNECTOR, &gc2) == 0 &&
+				    gc2.count_modes) {
+					uint32_t pick = 0;
+					for (uint32_t i = 0; i < nm2; i++)
+						if (pm[i].type & DRM_MODE_TYPE_PREFERRED) {
+							pick = i;
+							break;
+						}
+					r.w = pm[pick].hdisplay;
+					r.h = pm[pick].vdisplay;
+				}
+			}
+			int rc = vmw_cmd(cfd, DRM_VMW_UPDATE_LAYOUT, _IOC_WRITE, &ul,
+					 sizeof(ul));
+			/* EACCES when an X server holds the display: also correct. */
+			test_result("UPDATE_LAYOUT is accepted on the card node",
+				    rc == 0 || rc == -EACCES);
+			close(cfd);
+		}
+	}
+}
+
+/* ======================================================================
+ * The plumbing Mesa stands on between /dev/dri and a GL screen.  eglinfo
+ * reports only "failed to create gbm device" when any link below breaks,
+ * so each is pinned separately: the device numbers libdrm reads back with
+ * fstat, the sysfs walk it recognises a DRM node by, the fd dup Mesa does
+ * before using a display fd (os_dupfd_cloexec), and the dlopens that GBM
+ * and EGL perform -- a dlopen that fails inside gbm_create_device is
+ * swallowed whole, no message anywhere.
+ * ====================================================================== */
+/* What the DEVICE holds for a surface, read WITHOUT going through Mesa:
+ * reference the surface on the card node, ask the device to write its host
+ * copy back into the guest backup, and look at the first pixel.
+ *
+ * This is the only way to tell two failures apart that look identical from
+ * OpenGL.  When a draw is followed by glReadPixels and the buffer still
+ * holds the clear colour, either the rendering never happened, or it
+ * happened and the READBACK that brings it into guest memory did not.
+ * Mesa's glReadPixels uses that same readback, so it cannot distinguish
+ * them; this can.  Returns 0 if the surface could not be read. */
+/* The scan-out surface's pixels are 0xAARRGGBB (a red clear reads back as
+ * ffff0000, a green one as ff00ff00). */
+#define GPU_R(px) ((unsigned)(((px) >> 16) & 0xFF))
+#define GPU_G(px) ((unsigned)(((px) >> 8) & 0xFF))
+#define GPU_B(px) ((unsigned)((px) & 0xFF))
+
+static uint32_t gpu_host_pixel(int cfd, uint32_t bo_handle, int do_readback)
+{
+	union drm_vmw_gb_surface_reference_ext_arg ra;
+	struct drm_vmw_fence_rep frep;
+	struct drm_vmw_execbuf_arg eb;
+	uint32_t cmdbuf[3] = { 1104 /* READBACK_GB_SURFACE */, 4, bo_handle };
+	uint32_t px = 0;
+
+	if (cfd < 0 || !bo_handle)
+		return 0;
+	memset(&ra, 0, sizeof(ra));
+	ra.req.sid = bo_handle;
+	ra.req.handle_type = DRM_VMW_HANDLE_LEGACY;
+	if (vmw_cmd(cfd, DRM_VMW_GB_SURFACE_REF_EXT, _IOC_READ | _IOC_WRITE, &ra,
+		    sizeof(ra)) != 0)
+		return 0;
+	memset(&frep, 0, sizeof(frep));
+	memset(&eb, 0, sizeof(eb));
+	eb.version = DRM_VMW_EXECBUF_VERSION;
+	eb.context_handle = 0xFFFFFFFFu;
+	eb.imported_fence_fd = -1;
+	eb.commands = (uint64_t)(uintptr_t)cmdbuf;
+	eb.command_size = sizeof(cmdbuf);
+	eb.fence_rep = (uint64_t)(uintptr_t)&frep;
+	if (do_readback &&
+	    vmw_cmd(cfd, DRM_VMW_EXECBUF, _IOC_WRITE, &eb, sizeof(eb)) == 0 &&
+	    frep.handle) {
+		struct drm_vmw_fence_wait_arg fw = { .handle = frep.handle,
+						     .timeout_us = 1000000,
+						     .flags = DRM_VMW_FENCE_FLAG_EXEC };
+		struct drm_vmw_fence_arg fu = { .handle = frep.handle };
+
+		vmw_cmd(cfd, DRM_VMW_FENCE_WAIT, _IOC_READ | _IOC_WRITE, &fw, sizeof(fw));
+		vmw_cmd(cfd, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &fu, sizeof(fu));
+	}
+	uint32_t *kp = mmap(NULL, ra.rep.crep.buffer_size, PROT_READ, MAP_SHARED,
+			    cfd, (off_t)ra.rep.crep.buffer_map_handle);
+	if (kp != MAP_FAILED) {
+		px = kp[0];
+		munmap(kp, ra.rep.crep.buffer_size);
+	}
+	struct drm_vmw_surface_arg us = { .sid = (int32_t)ra.rep.crep.handle };
+	struct drm_vmw_handle_close_arg hc = { .handle = ra.rep.crep.buffer_handle };
+
+	vmw_cmd(cfd, DRM_VMW_UNREF_SURFACE, _IOC_WRITE, &us, sizeof(us));
+	vmw_cmd(cfd, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &hc, sizeof(hc));
+	return px;
+}
+
+static void test_gpu_userland(void)
+{
+	struct stat st;
+
+	printf("\n[TEST] GPU userland plumbing (/dev/dri -> Mesa)\n");
+	if (stat("/dev/dri/card0", &st) != 0) {
+		printf("  (no display-manager device, skipped)\n");
+		return;
+	}
+	test_result("card0 is char 226:0",
+		    S_ISCHR(st.st_mode) && major(st.st_rdev) == 226 && minor(st.st_rdev) == 0);
+	test_result("renderD128 is char 226:128",
+		    stat("/dev/dri/renderD128", &st) == 0 && S_ISCHR(st.st_mode) &&
+			    major(st.st_rdev) == 226 && minor(st.st_rdev) == 128);
+	/* drmNodeIsDRM: a node is a DRM node iff this sysfs path resolves. */
+	test_result("/sys/dev/char/226:0 resolves", stat("/sys/dev/char/226:0", &st) == 0);
+	test_result("/sys/dev/char/226:128/device/drm exists (drmNodeIsDRM)",
+		    stat("/sys/dev/char/226:128/device/drm", &st) == 0);
+
+	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	test_result("open renderD128", fd >= 0);
+	int dfd = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 3) : -1;
+	test_result("F_DUPFD_CLOEXEC of the drm fd", dfd >= 3);
+	if (dfd >= 0) {
+		struct drm_vmw_getparam_arg gp = { .param = DRM_VMW_PARAM_3D };
+		test_result("the dup carries the device (GET_PARAM 3D)",
+			    vmw_cmd(dfd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp,
+				    sizeof(gp)) == 0);
+		test_result("FD_CLOEXEC is set on the dup",
+			    (fcntl(dfd, F_GETFD, 0) & FD_CLOEXEC) != 0);
+		close(dfd);
+	}
+
+	/* What GBM loads when gbm_create_device() runs. */
+	void *bk = dlopen("/usr/lib/gbm/dri_gbm.so", RTLD_NOW | RTLD_GLOBAL);
+	test_result("dlopen of the GBM backend (dri_gbm.so)", bk != NULL);
+	if (!bk)
+		printf("      (dlerror: %s)\n", dlerror());
+	void *g = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+	test_result("dlopen libgbm.so.1", g != NULL);
+	if (!g)
+		printf("      (dlerror: %s)\n", dlerror());
+	if (g && fd >= 0) {
+		void *(*create)(int) = (void *(*)(int))dlsym(g, "gbm_create_device");
+		const char *(*backend_name)(void *) =
+			(const char *(*)(void *))dlsym(g, "gbm_device_get_backend_name");
+		void (*destroy)(void *) = (void (*)(void *))dlsym(g, "gbm_device_destroy");
+		void *dev = create ? create(fd) : NULL;
+		test_result("gbm_create_device on the render node", dev != NULL);
+		if (dev && backend_name)
+			printf("      (gbm backend: %s)\n", backend_name(dev));
+		if (dev && destroy)
+			destroy(dev);
+	}
+	/* What GLX/EGL load for a hardware screen. */
+	void *dri = dlopen("/usr/lib/dri/vmwgfx_dri.so", RTLD_NOW | RTLD_GLOBAL);
+	test_result("dlopen vmwgfx_dri.so", dri != NULL);
+	if (!dri)
+		printf("      (dlerror: %s)\n", dlerror());
+
+	/* How Mesa finds GPUs at all: drmGetDevices2() starts by LISTING
+	 * /dev/dri.  Opening the nodes by name proves nothing about this --
+	 * the listing was broken for months while every open worked, and the
+	 * only symptom was eglInitialize failing with no message. */
+	{
+		DIR *d = opendir("/dev/dri");
+		int saw_card = 0, saw_render = 0;
+		struct dirent *de;
+		test_result("opendir /dev/dri", d != NULL);
+		while (d && (de = readdir(d)) != NULL) {
+			if (strcmp(de->d_name, "card0") == 0)
+				saw_card = 1;
+			if (strcmp(de->d_name, "renderD128") == 0)
+				saw_render = 1;
+		}
+		if (d)
+			closedir(d);
+		test_result("readdir lists card0", saw_card);
+		test_result("readdir lists renderD128", saw_render);
+	}
+	{
+		/* The prefix of libdrm's drmDevice, enough to check nodes. */
+		struct mini_drmdev {
+			char **nodes;
+			int available_nodes;
+			int bustype;
+		};
+		void *ldrm = dlopen("libdrm.so.2", RTLD_NOW | RTLD_GLOBAL);
+		test_result("dlopen libdrm.so.2", ldrm != NULL);
+		int (*getdevs)(uint32_t, void **, int) =
+			ldrm ? (int (*)(uint32_t, void **, int))dlsym(ldrm, "drmGetDevices2") : NULL;
+		void (*freedevs)(void **, int) =
+			ldrm ? (void (*)(void **, int))dlsym(ldrm, "drmFreeDevices") : NULL;
+		void *devs[8];
+		int n = getdevs ? getdevs(0, devs, 8) : -1;
+		test_result("drmGetDevices2 finds the device", n >= 1);
+		if (n >= 1) {
+			struct mini_drmdev *d0 = devs[0];
+			printf("      (bustype %d, nodes 0x%x)\n", d0->bustype,
+			       (unsigned)d0->available_nodes);
+			test_result("it is a PCI device", d0->bustype == 0);
+			test_result("it has the primary node", (d0->available_nodes & 1) != 0);
+			test_result("it has the render node", (d0->available_nodes & 4) != 0);
+			if (freedevs)
+				freedevs(devs, n);
+		}
+	}
+
+	/* The whole glamor front half, exactly as the X server runs it: a GBM
+	 * device on the CARD node (glamor's fd is the KMS fd), EGL on top of
+	 * it, a no-config GL context made current with no surface, and the
+	 * renderer asked for its name. */
+	int has3d = 0;
+	if (fd >= 0) {
+		struct drm_vmw_getparam_arg gp3 = { .param = DRM_VMW_PARAM_3D };
+		has3d = vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp3,
+				sizeof(gp3)) == 0 && gp3.value == 1;
+	}
+	int cfd2 = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	void *g2 = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+	void *(*gbm_create)(int) =
+		g2 ? (void *(*)(int))dlsym(g2, "gbm_create_device") : NULL;
+	void (*gbm_destroy)(void *) =
+		g2 ? (void (*)(void *))dlsym(g2, "gbm_device_destroy") : NULL;
+	void *cgbm = (gbm_create && cfd2 >= 0) ? gbm_create(cfd2) : NULL;
+	test_result("gbm_create_device on the card node", cgbm != NULL);
+	void *egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+	test_result("dlopen libEGL.so.1", egl != NULL);
+	if (egl && cgbm) {
+		void *(*gpa)(const char *) =
+			(void *(*)(const char *))dlsym(egl, "eglGetProcAddress");
+		int (*egl_err)(void) = (int (*)(void))dlsym(egl, "eglGetError");
+		void *(*getdpy)(unsigned, void *, const void *) =
+			(void *(*)(unsigned, void *, const void *))dlsym(egl, "eglGetPlatformDisplay");
+		void *dpy = getdpy ? getdpy(0x31D7 /* EGL_PLATFORM_GBM_KHR */, cgbm, NULL) : NULL;
+		test_result("eglGetPlatformDisplay(GBM)", dpy != NULL);
+		int (*egl_init)(void *, int *, int *) =
+			(int (*)(void *, int *, int *))dlsym(egl, "eglInitialize");
+		int emaj = 0, emin = 0;
+		int inited = dpy && egl_init && egl_init(dpy, &emaj, &emin);
+		test_result("eglInitialize on the GBM device (glamor's first check)", inited);
+		if (!inited) {
+			printf("      (eglGetError: 0x%x)\n", egl_err ? egl_err() : 0);
+		} else {
+			const char *(*qs)(void *, int) =
+				(const char *(*)(void *, int))dlsym(egl, "eglQueryString");
+			printf("      (EGL %d.%d, vendor %s)\n", emaj, emin,
+			       qs ? qs(dpy, 0x3053 /* EGL_VENDOR */) : "?");
+			unsigned (*bind)(unsigned) =
+				(unsigned (*)(unsigned))dlsym(egl, "eglBindAPI");
+			if (bind)
+				bind(0x30A2 /* EGL_OPENGL_API */);
+			void *(*cctx)(void *, void *, void *, const int *) =
+				(void *(*)(void *, void *, void *, const int *))dlsym(egl, "eglCreateContext");
+			static const int noattr[] = { 0x3038 /* EGL_NONE */ };
+			void *ctx = cctx ? cctx(dpy, NULL /* EGL_NO_CONFIG_KHR */, NULL, noattr) : NULL;
+			test_result("no-config GL context (EGL_KHR_no_config_context)", ctx != NULL);
+			if (!ctx)
+				printf("      (eglGetError: 0x%x)\n", egl_err ? egl_err() : 0);
+			int (*mkcur)(void *, void *, void *, void *) =
+				(int (*)(void *, void *, void *, void *))dlsym(egl, "eglMakeCurrent");
+			int cur = ctx && mkcur && mkcur(dpy, NULL, NULL, ctx);
+			test_result("surfaceless eglMakeCurrent", cur);
+			if (cur) {
+				const unsigned char *(*glgs)(unsigned) =
+					gpa ? (const unsigned char *(*)(unsigned))gpa("glGetString") : NULL;
+				const char *ren = glgs ? (const char *)glgs(0x1F01 /* GL_RENDERER */) : NULL;
+				printf("      (GL_RENDERER: %s)\n", ren ? ren : "?");
+				if (has3d)
+					test_result("renderer is the device, not llvmpipe",
+						    ren && !strstr(ren, "llvmpipe") && !strstr(ren, "softpipe"));
+
+				/* The decisive question for a black X screen:
+				 * does GL rendering actually land in a
+				 * scan-out buffer, and does the KERNEL's idea
+				 * of that surface hold the same pixels?  Clear
+				 * a gbm bo to red through a GL framebuffer,
+				 * then read it back both ways.  GL red +
+				 * kernel black would mean the display shows a
+				 * different surface than Mesa renders into;
+				 * GL black means rendering never lands. */
+				void *(*bocreate3)(void *, uint32_t, uint32_t, uint32_t, uint32_t) =
+					(void *(*)(void *, uint32_t, uint32_t, uint32_t, uint32_t))dlsym(g2, "gbm_bo_create");
+				unsigned long (*bohandle3)(void *) =
+					(unsigned long (*)(void *))dlsym(g2, "gbm_bo_get_handle");
+				void (*bodestroy3)(void *) =
+					(void (*)(void *))dlsym(g2, "gbm_bo_destroy");
+				void *rbo = bocreate3 ? bocreate3(cgbm, 64, 64, 0x34325258u /* XRGB8888 */,
+								  (1u << 0) | (1u << 2)) : NULL;
+				void *(*imgcreate)(void *, void *, unsigned, void *, const int *) =
+					gpa ? (void *(*)(void *, void *, unsigned, void *, const int *))gpa("eglCreateImageKHR") : NULL;
+				unsigned (*imgdestroy)(void *, void *) =
+					gpa ? (unsigned (*)(void *, void *))gpa("eglDestroyImageKHR") : NULL;
+				void *img = (rbo && imgcreate) ?
+					imgcreate(dpy, NULL, 0x30B0 /* EGL_NATIVE_PIXMAP_KHR */, rbo, NULL) : NULL;
+				test_result("EGLImage from a scan-out gbm bo", img != NULL);
+				if (img) {
+					void (*gentex)(int, unsigned *) = (void (*)(int, unsigned *))gpa("glGenTextures");
+					void (*bindtex)(unsigned, unsigned) = (void (*)(unsigned, unsigned))gpa("glBindTexture");
+					void (*teximg)(unsigned, void *) = (void (*)(unsigned, void *))gpa("glEGLImageTargetTexture2DOES");
+					void (*genfbo)(int, unsigned *) = (void (*)(int, unsigned *))gpa("glGenFramebuffers");
+					void (*bindfbo)(unsigned, unsigned) = (void (*)(unsigned, unsigned))gpa("glBindFramebuffer");
+					void (*fbotex)(unsigned, unsigned, unsigned, unsigned, int) =
+						(void (*)(unsigned, unsigned, unsigned, unsigned, int))gpa("glFramebufferTexture2D");
+					unsigned (*fbostat)(unsigned) = (unsigned (*)(unsigned))gpa("glCheckFramebufferStatus");
+					void (*clearcol)(float, float, float, float) =
+						(void (*)(float, float, float, float))gpa("glClearColor");
+					void (*clear)(unsigned) = (void (*)(unsigned))gpa("glClear");
+					void (*finish)(void) = (void (*)(void))gpa("glFinish");
+					void (*readpix)(int, int, int, int, unsigned, unsigned, void *) =
+						(void (*)(int, int, int, int, unsigned, unsigned, void *))gpa("glReadPixels");
+					unsigned tex = 0, fbo = 0;
+					gentex(1, &tex);
+					bindtex(0x0DE1 /* GL_TEXTURE_2D */, tex);
+					teximg(0x0DE1, img);
+					genfbo(1, &fbo);
+					bindfbo(0x8D40 /* GL_FRAMEBUFFER */, fbo);
+					fbotex(0x8D40, 0x8CE0 /* COLOR_ATTACHMENT0 */, 0x0DE1, tex, 0);
+					unsigned fst = fbostat(0x8D40);
+					test_result("framebuffer complete on the scan-out texture",
+						    fst == 0x8CD5 /* COMPLETE */);
+					clearcol(1.0f, 0.0f, 0.0f, 1.0f);
+					clear(0x4000 /* GL_COLOR_BUFFER_BIT */);
+					finish();
+					unsigned char px[4] = { 0, 0, 0, 0 };
+					readpix(1, 1, 1, 1, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */, px);
+					test_result("GL rendering lands (glReadPixels sees red)",
+						    px[0] == 255 && px[1] == 0 && px[2] == 0);
+					if (!(px[0] == 255 && px[1] == 0))
+						printf("      (readpixels: %u,%u,%u,%u)\n",
+						       px[0], px[1], px[2], px[3]);
+					/* Now ask the KERNEL what that surface
+					 * holds: READBACK_GB_SURFACE copies the
+					 * host content into the guest backup,
+					 * which maps.  Same sid the display
+					 * would scan out. */
+					uint32_t kh = (uint32_t)bohandle3(rbo);
+					union drm_vmw_gb_surface_reference_ext_arg ra2;
+					memset(&ra2, 0, sizeof(ra2));
+					ra2.req.sid = kh;
+					ra2.req.handle_type = DRM_VMW_HANDLE_LEGACY;
+					int rr2 = vmw_cmd(cfd2, DRM_VMW_GB_SURFACE_REF_EXT,
+							  _IOC_READ | _IOC_WRITE, &ra2, sizeof(ra2));
+					test_result("GB_SURFACE_REF_EXT by handle", rr2 == 0);
+					if (rr2 == 0) {
+						uint32_t cmdbuf[3] = { 1104 /* READBACK_GB_SURFACE */, 4, kh };
+						struct drm_vmw_fence_rep frep;
+						struct drm_vmw_execbuf_arg eb2;
+						memset(&frep, 0, sizeof(frep));
+						frep.error = -1;
+						memset(&eb2, 0, sizeof(eb2));
+						eb2.version = DRM_VMW_EXECBUF_VERSION;
+						eb2.context_handle = 0xFFFFFFFFu;
+						eb2.imported_fence_fd = -1;
+						eb2.commands = (uint64_t)(uintptr_t)cmdbuf;
+						eb2.command_size = sizeof(cmdbuf);
+						eb2.fence_rep = (uint64_t)(uintptr_t)&frep;
+						int er2 = vmw_cmd(cfd2, DRM_VMW_EXECBUF, _IOC_WRITE,
+								  &eb2, sizeof(eb2));
+						test_result("READBACK_GB_SURFACE submits", er2 == 0);
+						if (er2 == 0 && frep.handle) {
+							struct drm_vmw_fence_wait_arg fw2 = {
+								.handle = frep.handle,
+								.timeout_us = 1000000,
+								.flags = DRM_VMW_FENCE_FLAG_EXEC
+							};
+							vmw_cmd(cfd2, DRM_VMW_FENCE_WAIT,
+								_IOC_READ | _IOC_WRITE, &fw2, sizeof(fw2));
+							struct drm_vmw_fence_arg fu2 = { .handle = frep.handle };
+							vmw_cmd(cfd2, DRM_VMW_FENCE_UNREF, _IOC_WRITE, &fu2, sizeof(fu2));
+						}
+						uint32_t *kp = mmap(NULL, ra2.rep.crep.buffer_size,
+								    PROT_READ, MAP_SHARED, cfd2,
+								    (off_t)ra2.rep.crep.buffer_map_handle);
+						test_result("backup of the scan-out surface maps", kp != MAP_FAILED);
+						if (kp != MAP_FAILED) {
+							test_result("the kernel-visible surface holds the pixels (host content is red)",
+								    (kp[0] & 0xFFFFFF) == 0xFF0000);
+							if ((kp[0] & 0xFFFFFF) != 0xFF0000)
+								printf("      (backup pixel: %08x)\n", kp[0]);
+							munmap(kp, ra2.rep.crep.buffer_size);
+						}
+						struct drm_vmw_surface_arg us2 = { .sid = (int32_t)ra2.rep.crep.handle };
+						vmw_cmd(cfd2, DRM_VMW_UNREF_SURFACE, _IOC_WRITE, &us2, sizeof(us2));
+						struct drm_vmw_handle_close_arg hc2 = { .handle = ra2.rep.crep.buffer_handle };
+						vmw_cmd(cfd2, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &hc2, sizeof(hc2));
+					}
+					/* The half the red-clear does NOT
+					 * cover -- and the half every missing
+					 * glyph and black GTK window lives
+					 * in: SAMPLING a texture the guest
+					 * uploaded.  A fill comes out of the
+					 * shader alone; text and client
+					 * images are textures uploaded from
+					 * guest memory and then drawn.  So:
+					 * upload an 8x8 green texture, draw
+					 * it across the red framebuffer,
+					 * read the result.  Green = the
+					 * upload+sample path works end to
+					 * end.  Red = the draw ran but
+					 * sampled nothing.  Black = the draw
+					 * itself did not land. */
+					unsigned (*mkshader)(unsigned) = (unsigned (*)(unsigned))gpa("glCreateShader");
+					void (*shsrc)(unsigned, int, const char **, const int *) =
+						(void (*)(unsigned, int, const char **, const int *))gpa("glShaderSource");
+					void (*shcomp)(unsigned) = (void (*)(unsigned))gpa("glCompileShader");
+					void (*shiv)(unsigned, unsigned, int *) =
+						(void (*)(unsigned, unsigned, int *))gpa("glGetShaderiv");
+					void (*shlog)(unsigned, int, int *, char *) =
+						(void (*)(unsigned, int, int *, char *))gpa("glGetShaderInfoLog");
+					unsigned (*mkprog)(void) = (unsigned (*)(void))gpa("glCreateProgram");
+					void (*attach)(unsigned, unsigned) = (void (*)(unsigned, unsigned))gpa("glAttachShader");
+					void (*link)(unsigned) = (void (*)(unsigned))gpa("glLinkProgram");
+					void (*proiv)(unsigned, unsigned, int *) =
+						(void (*)(unsigned, unsigned, int *))gpa("glGetProgramiv");
+					void (*useprog)(unsigned) = (void (*)(unsigned))gpa("glUseProgram");
+					int (*uloc)(unsigned, const char *) =
+						(int (*)(unsigned, const char *))gpa("glGetUniformLocation");
+					void (*uni1i)(int, int) = (void (*)(int, int))gpa("glUniform1i");
+					int (*aloc)(unsigned, const char *) =
+						(int (*)(unsigned, const char *))gpa("glGetAttribLocation");
+					void (*genva)(int, unsigned *) = (void (*)(int, unsigned *))gpa("glGenVertexArrays");
+					void (*bindva)(unsigned) = (void (*)(unsigned))gpa("glBindVertexArray");
+					void (*genbuf)(int, unsigned *) = (void (*)(int, unsigned *))gpa("glGenBuffers");
+					void (*bindbuf)(unsigned, unsigned) = (void (*)(unsigned, unsigned))gpa("glBindBuffer");
+					void (*bufdata)(unsigned, long, const void *, unsigned) =
+						(void (*)(unsigned, long, const void *, unsigned))gpa("glBufferData");
+					void (*vattr)(unsigned, int, unsigned, unsigned char, int, const void *) =
+						(void (*)(unsigned, int, unsigned, unsigned char, int, const void *))gpa("glVertexAttribPointer");
+					void (*venable)(unsigned) = (void (*)(unsigned))gpa("glEnableVertexAttribArray");
+					void (*draw)(unsigned, int, int) = (void (*)(unsigned, int, int))gpa("glDrawArrays");
+					void (*teximg2)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *) =
+						(void (*)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *))gpa("glTexImage2D");
+					void (*texsub2)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *) =
+						(void (*)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *))gpa("glTexSubImage2D");
+					void (*texpar)(unsigned, unsigned, int) =
+						(void (*)(unsigned, unsigned, int))gpa("glTexParameteri");
+					void (*acttex)(unsigned) = (void (*)(unsigned))gpa("glActiveTexture");
+					void (*viewport)(int, int, int, int) = (void (*)(int, int, int, int))gpa("glViewport");
+					unsigned (*glerr)(void) = (unsigned (*)(void))gpa("glGetError");
+					void (*getteximg)(unsigned, int, unsigned, unsigned, void *) =
+						(void (*)(unsigned, int, unsigned, unsigned, void *))gpa("glGetTexImage");
+					int sampling_ready = mkshader && shsrc && shcomp && mkprog &&
+							     attach && link && useprog && uloc && uni1i &&
+							     aloc && genbuf && bindbuf && bufdata && vattr &&
+							     venable && draw && teximg2 && texsub2 &&
+							     texpar && acttex && viewport;
+					if (sampling_ready) {
+						static const char *vs_src =
+							"#version 140\n"
+							"in vec2 p; out vec2 t;\n"
+							"void main(){ t = p*0.5+0.5; gl_Position = vec4(p,0,1); }\n";
+						static const char *fs_src =
+							"#version 140\n"
+							"uniform sampler2D s; in vec2 t; out vec4 c;\n"
+							"void main(){ c = texture(s, t); }\n";
+						unsigned vsh = mkshader(0x8B31), fsh = mkshader(0x8B30);
+						int okv = 0, okf = 0, okl = 0;
+						shsrc(vsh, 1, &vs_src, NULL); shcomp(vsh);
+						shiv(vsh, 0x8B81, &okv);
+						shsrc(fsh, 1, &fs_src, NULL); shcomp(fsh);
+						shiv(fsh, 0x8B81, &okf);
+						unsigned prog = mkprog();
+						attach(prog, vsh); attach(prog, fsh); link(prog);
+						proiv(prog, 0x8B82, &okl);
+						test_result("texture-sampling shader compiles and links",
+							    okv && okf && okl);
+						if (!(okv && okf && okl) && shlog) {
+							char log[256]; int n = 0;
+							shlog(okv ? fsh : vsh, sizeof(log) - 1, &n, log);
+							log[n < 0 ? 0 : n] = 0;
+							printf("      (shader log: %s)\n", log);
+						}
+						useprog(prog);
+						unsigned vao = 0;
+						if (genva && bindva) { genva(1, &vao); bindva(vao); }
+						static const float quad[12] = { -1, -1, 1, -1, 1, 1,
+										-1, -1, 1, 1, -1, 1 };
+						unsigned vb = 0;
+						genbuf(1, &vb);
+						bindbuf(0x8892 /* ARRAY_BUFFER */, vb);
+						bufdata(0x8892, sizeof(quad), quad, 0x88E4 /* STATIC_DRAW */);
+						int pa = aloc(prog, "p");
+						vattr((unsigned)pa, 2, 0x1406 /* FLOAT */, 0, 0, NULL);
+						venable((unsigned)pa);
+						viewport(0, 0, 64, 64);
+
+						/* Before a single texel is involved: does a
+						 * DRAW land, and does it come back?
+						 *
+						 * Two separate questions that the same
+						 * readpixels used to answer as one.  The draw
+						 * here uses the SAME vertices, viewport and
+						 * render target with a fragment shader that
+						 * writes a constant, so nothing about textures
+						 * is involved: what it produces is either on
+						 * the render target or it is not.
+						 *
+						 * And it is asked TWICE, of two different
+						 * readers.  gpu_host_pixel() asks the device
+						 * for its own copy of the surface, through a
+						 * readback this test issues itself; glReadPixels
+						 * asks the GL stack.  They are separate
+						 * failures with separate causes, and reporting
+						 * them as one is what made every test below
+						 * this point read as a texturing failure when
+						 * texturing was fine. */
+						{
+							static const char *fs_solid =
+								"#version 140\n"
+								"out vec4 c;\n"
+								"void main(){ c = vec4(0,1,0,1); }\n";
+							unsigned sfs = mkshader(0x8B30);
+							int oks = 0, okls = 0;
+
+							shsrc(sfs, 1, &fs_solid, NULL);
+							shcomp(sfs);
+							shiv(sfs, 0x8B81, &oks);
+							unsigned sprog = mkprog();
+							attach(sprog, vsh);
+							attach(sprog, sfs);
+							link(sprog);
+							proiv(sprog, 0x8B82, &okls);
+							if (oks && okls) {
+								useprog(sprog);
+								int spa = aloc(sprog, "p");
+								if (spa >= 0) {
+									vattr((unsigned)spa, 2, 0x1406, 0, 0, NULL);
+									venable((unsigned)spa);
+								}
+								draw(0x0004 /* TRIANGLES */, 0, 6);
+								finish();
+								unsigned char gp[4] = { 9, 9, 9, 9 };
+								readpix(32, 32, 1, 1, 0x1908, 0x1401, gp);
+								unsigned dev = (unsigned)gpu_host_pixel(
+									cfd2, (uint32_t)bohandle3(rbo), 1);
+
+								test_result("a draw with no texture lands (vertices, shader, render target)",
+									    GPU_G(dev) == 255 &&
+										    GPU_R(dev) == 0 &&
+										    GPU_B(dev) == 0);
+								test_result("the render target reads back through GL after a draw",
+									    gp[0] == 0 && gp[1] == 255 &&
+										    gp[2] == 0);
+								if (!(gp[0] == 0 && gp[1] == 255 && gp[2] == 0))
+									printf("      (the device holds %02x,%02x,%02x; glReadPixels says %u,%u,%u -- the drawing is there, the readback of it is not)\n",
+									       GPU_R(dev), GPU_G(dev), GPU_B(dev),
+									       gp[0], gp[1], gp[2]);
+							} else {
+								test_fail("a draw with no texture lands (vertices, shader, render target)");
+								test_fail("the render target reads back through GL after a draw");
+							}
+							useprog(prog);
+							vattr((unsigned)pa, 2, 0x1406, 0, 0, NULL);
+							venable((unsigned)pa);
+						}
+						acttex(0x84C0 /* TEXTURE0 */);
+						unsigned stex = 0;
+						gentex(1, &stex);
+						bindtex(0x0DE1, stex);
+						/* Filter must not need mipmaps, or the
+						 * texture is incomplete and samples
+						 * BLACK -- which is this bug's shape,
+						 * so it must not be the test's. */
+						texpar(0x0DE1, 0x2801 /* MIN_FILTER */, 0x2600 /* NEAREST */);
+						texpar(0x0DE1, 0x2800 /* MAG_FILTER */, 0x2600);
+						static unsigned char green8[8 * 8 * 4];
+						for (int i = 0; i < 8 * 8; i++) {
+							green8[i * 4 + 0] = 0;
+							green8[i * 4 + 1] = 255;
+							green8[i * 4 + 2] = 0;
+							green8[i * 4 + 3] = 255;
+						}
+						teximg2(0x0DE1, 0, 0x8058 /* RGBA8 */, 8, 8, 0,
+							0x1908 /* RGBA */, 0x1401, green8);
+
+						/* Did the upload reach the host?
+						 *
+						 * glGetTexImage asks the device for the image
+						 * it is holding, which for a guest-backed
+						 * surface means a readback into the backing
+						 * store and a copy out of it -- the opposite
+						 * direction to the upload just made, and a
+						 * direction already known to work (the render
+						 * target read back correctly above).  So green
+						 * here means the guest's bytes DID reach the
+						 * host and only SAMPLING is broken; anything
+						 * else means the upload is where they are
+						 * lost, and the sampling result below says
+						 * nothing more. */
+						if (getteximg) {
+							static unsigned char back[8 * 8 * 4];
+
+							memset(back, 0x11, sizeof(back));
+							getteximg(0x0DE1, 0, 0x1908, 0x1401, back);
+							test_result("a guest-uploaded texture reads back from the device",
+								    back[0] == 0 && back[1] == 255 && back[2] == 0);
+							if (!(back[1] == 255))
+								printf("      (texel 0 read back %u,%u,%u,%u)\n",
+								       back[0], back[1], back[2], back[3]);
+						}
+						uni1i(uloc(prog, "s"), 0);
+						viewport(0, 0, 64, 64);
+						draw(0x0004 /* TRIANGLES */, 0, 6);
+						finish();
+						/* Asked of the DEVICE, not of glReadPixels.
+						 * What is being tested here is whether the
+						 * texture's bytes reached the host and were
+						 * sampled -- and reading the answer back
+						 * through GL puts a second, unrelated
+						 * mechanism in the way of it.  When that
+						 * mechanism was broken this test reported a
+						 * texturing failure that did not exist, and
+						 * once reported a PASS it had not earned,
+						 * having read a colour an earlier test left
+						 * in the buffer. */
+						unsigned sdev = (unsigned)gpu_host_pixel(
+							cfd2, (uint32_t)bohandle3(rbo), 1);
+						test_result("sampling a guest-uploaded RGBA texture works (glyph/PutImage path)",
+							    GPU_R(sdev) == 0 && GPU_G(sdev) == 255 &&
+								    GPU_B(sdev) == 0);
+						printf("      (device holds %02x,%02x,%02x; glGetError 0x%x)\n",
+						       GPU_R(sdev), GPU_G(sdev), GPU_B(sdev),
+						       glerr ? glerr() : 0);
+
+						/* Partial update -- the PutImage shape:
+						 * overwrite one corner of the texture
+						 * with blue and redraw. */
+						static unsigned char blue4[4 * 4 * 4];
+						for (int i = 0; i < 4 * 4; i++) {
+							blue4[i * 4 + 0] = 0;
+							blue4[i * 4 + 1] = 0;
+							blue4[i * 4 + 2] = 255;
+							blue4[i * 4 + 3] = 255;
+						}
+						texsub2(0x0DE1, 0, 0, 0, 4, 4, 0x1908, 0x1401, blue4);
+						draw(0x0004, 0, 6);
+						finish();
+						/* The updated corner is the texture's origin,
+						 * which the quad puts at the render target's
+						 * origin -- so pixel 0, which is the pixel the
+						 * device is asked about. */
+						unsigned bdev = (unsigned)gpu_host_pixel(
+							cfd2, (uint32_t)bohandle3(rbo), 1);
+						test_result("partial texture update samples back (glTexSubImage2D path)",
+							    GPU_R(bdev) == 0 && GPU_G(bdev) == 0 &&
+								    GPU_B(bdev) == 255);
+						printf("      (subimage corner on the device: %02x,%02x,%02x)\n",
+						       GPU_R(bdev), GPU_G(bdev), GPU_B(bdev));
+
+						/* A one-channel texture -- the glyph
+						 * atlas shape (GL_R8).  Sampling gives
+						 * (r,0,0,1): expect half-red. */
+						unsigned rtex = 0;
+						gentex(1, &rtex);
+						bindtex(0x0DE1, rtex);
+						texpar(0x0DE1, 0x2801, 0x2600);
+						texpar(0x0DE1, 0x2800, 0x2600);
+						static unsigned char gray8[8 * 8];
+						for (int i = 0; i < 8 * 8; i++)
+							gray8[i] = 0x80;
+						teximg2(0x0DE1, 0, 0x8229 /* R8 */, 8, 8, 0,
+							0x1903 /* RED */, 0x1401, gray8);
+						draw(0x0004, 0, 6);
+						finish();
+						unsigned rdev = (unsigned)gpu_host_pixel(
+							cfd2, (uint32_t)bohandle3(rbo), 1);
+						test_result("sampling a one-channel texture works (glyph-atlas shape)",
+							    GPU_R(rdev) >= 0x70 && GPU_R(rdev) <= 0x90 &&
+								    GPU_G(rdev) == 0 && GPU_B(rdev) == 0);
+						printf("      (R8 on the device: %02x,%02x,%02x; glGetError 0x%x)\n",
+						       GPU_R(rdev), GPU_G(rdev), GPU_B(rdev),
+						       glerr ? glerr() : 0);
+					} else {
+						test_fail("texture-sampling GL entry points resolve");
+					}
+					if (imgdestroy)
+						imgdestroy(dpy, img);
+				}
+				if (rbo && bodestroy3)
+					bodestroy3(rbo);
+				mkcur(dpy, NULL, NULL, NULL);
+			}
+			void (*dctx)(void *, void *) =
+				(void (*)(void *, void *))dlsym(egl, "eglDestroyContext");
+			if (ctx && dctx)
+				dctx(dpy, ctx);
+			int (*term)(void *) = (int (*)(void *))dlsym(egl, "eglTerminate");
+			if (term)
+				term(dpy);
+		}
+	}
+	/* The front buffer exactly as modesetting's ScreenInit creates it once
+	 * glamor is up: a gbm SCANOUT+RENDERING bo at the display mode (an
+	 * svga guest-backed surface underneath, not a dumb buffer), ADDFB of
+	 * its handle, and SETCRTC to show it.  Every step that fails in there
+	 * surfaces in X only as "AddScreen/ScreenInit failed". */
+	if (cgbm && cfd2 >= 0 && g2) {
+		struct drm_mode_card_res res2;
+		uint32_t crtcs2[4], conns2[4];
+		memset(&res2, 0, sizeof(res2));
+		res2.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs2;
+		res2.count_crtcs = 4;
+		res2.connector_id_ptr = (uint64_t)(uintptr_t)conns2;
+		res2.count_connectors = 4;
+		struct drm_mode_get_connector gc3;
+		struct drm_mode_modeinfo md[24];
+		uint32_t mw = 0, mh = 0;
+		struct drm_mode_modeinfo mm;
+		memset(&mm, 0, sizeof(mm));
+		if (ioctl(cfd2, DRM_IOCTL_MODE_GETRESOURCES, &res2) == 0 &&
+		    res2.count_crtcs >= 1 && res2.count_connectors >= 1) {
+			memset(&gc3, 0, sizeof(gc3));
+			gc3.connector_id = conns2[0];
+			gc3.modes_ptr = (uint64_t)(uintptr_t)md;
+			gc3.count_modes = 24;
+			if (ioctl(cfd2, DRM_IOCTL_MODE_GETCONNECTOR, &gc3) == 0 &&
+			    gc3.count_modes >= 1) {
+				mm = md[0];
+				mw = mm.hdisplay;
+				mh = mm.vdisplay;
+			}
+		}
+		void *(*bocreate)(void *, uint32_t, uint32_t, uint32_t, uint32_t) =
+			(void *(*)(void *, uint32_t, uint32_t, uint32_t, uint32_t))dlsym(g2, "gbm_bo_create");
+		unsigned long (*bohandle)(void *) =
+			(unsigned long (*)(void *))dlsym(g2, "gbm_bo_get_handle");
+		unsigned (*bostride)(void *) =
+			(unsigned (*)(void *))dlsym(g2, "gbm_bo_get_stride");
+		void (*bodestroy)(void *) =
+			(void (*)(void *))dlsym(g2, "gbm_bo_destroy");
+		if (mw && bocreate) {
+			errno = 0;
+			/* GBM_FORMAT_ARGB8888, GBM_BO_USE_SCANOUT | USE_RENDERING:
+			 * what drmmode_create_bo asks for at depth 24. */
+			void *bo = bocreate(cgbm, mw, mh, 0x34325241u,
+					    (1u << 0) | (1u << 2));
+			test_result("gbm scanout+rendering bo at the display mode", bo != NULL);
+			if (!bo) {
+				printf("      (%ux%u ARGB8888; errno=%d)\n", mw, mh, errno);
+				/* modesetting would fall back to XRGB only via
+				 * modifiers; still, name whether XRGB works. */
+				bo = bocreate(cgbm, mw, mh, 0x34325258u,
+					      (1u << 0) | (1u << 2));
+				printf("      (XRGB8888 instead: %s)\n", bo ? "works" : "also fails");
+			}
+			/* ARGB with RENDERING only: is the refusal specific to
+			 * the scanout bind, or to the format at all? */
+			void *bo2 = bocreate(cgbm, 256, 256, 0x34325241u, (1u << 2));
+			printf("      (ARGB rendering-only bo: %s)\n", bo2 ? "works" : "fails");
+			if (bo2 && bodestroy)
+				bodestroy(bo2);
+			if (bo) {
+				uint32_t handle = (uint32_t)bohandle(bo);
+				uint32_t stride = bostride(bo);
+				struct drm_mode_fb_cmd fbc;
+				memset(&fbc, 0, sizeof(fbc));
+				fbc.width = mw;
+				fbc.height = mh;
+				fbc.pitch = stride;
+				fbc.bpp = 32;
+				fbc.depth = 24;
+				fbc.handle = handle;
+				errno = 0;
+				int ar = ioctl(cfd2, DRM_IOCTL_MODE_ADDFB, &fbc);
+				test_result("ADDFB of the gbm bo (a surface, not a dumb buffer)",
+					    ar == 0 && fbc.fb_id != 0);
+				if (ar != 0)
+					printf("      (errno=%d handle=%u stride=%u)\n", errno,
+					       handle, stride);
+				if (ar == 0) {
+					struct drm_mode_crtc sc2;
+					memset(&sc2, 0, sizeof(sc2));
+					sc2.crtc_id = crtcs2[0];
+					sc2.fb_id = fbc.fb_id;
+					sc2.set_connectors_ptr = (uint64_t)(uintptr_t)conns2;
+					sc2.count_connectors = 1;
+					sc2.mode = mm;
+					sc2.mode_valid = 1;
+					errno = 0;
+					test_result("SETCRTC shows the glamor front buffer",
+						    ioctl(cfd2, DRM_IOCTL_MODE_SETCRTC, &sc2) == 0);
+					if (errno)
+						printf("      (errno=%d)\n", errno);
+					/* The step that actually moves pixels.  A
+					 * surface framebuffer reaches the screen
+					 * target by being bound to it (or copied
+					 * into the driver's display surface);
+					 * SETCRTC alone proves none of that, and
+					 * a failure here is exactly the "black
+					 * screen, everything else fine" case. */
+					struct drm_mode_fb_dirty_cmd dc;
+					struct drm_clip_rect dr = { 0, 0, (short)mw, (short)mh };
+					memset(&dc, 0, sizeof(dc));
+					dc.fb_id = fbc.fb_id;
+					dc.num_clips = 1;
+					dc.clips_ptr = (uint64_t)(uintptr_t)&dr;
+					errno = 0;
+					int drc = ioctl(cfd2, DRM_IOCTL_MODE_DIRTYFB, &dc);
+					test_result("DIRTYFB presents the surface (pixels reach the screen)",
+						    drc == 0);
+					if (drc != 0)
+						printf("      (errno=%d -- the present path refused it)\n",
+						       errno);
+					struct drm_mode_crtc_page_flip pf2;
+					memset(&pf2, 0, sizeof(pf2));
+					pf2.crtc_id = crtcs2[0];
+					pf2.fb_id = fbc.fb_id;
+					errno = 0;
+					int pr2 = ioctl(cfd2, DRM_IOCTL_MODE_PAGE_FLIP, &pf2);
+					test_result("PAGE_FLIP to the surface framebuffer",
+						    pr2 == 0 || errno == EINVAL);
+					ioctl(cfd2, DRM_IOCTL_MODE_RMFB, &fbc.fb_id);
+				}
+				if (bodestroy)
+					bodestroy(bo);
+			}
+		}
+	}
+
+	/* Split which layer refuses ARGB8888 scanout.  The kernel has no
+	 * format-conditional path, so if this direct ioctl succeeds the
+	 * refusal above is Mesa's own format-capability check -- and the
+	 * devcap words it consults are printed to say why. */
+	if (cfd2 >= 0) {
+		static uint32_t caps3[300];
+		struct drm_vmw_get_3d_cap_arg c3;
+		memset(&c3, 0, sizeof(c3));
+		c3.buffer = (uint64_t)(uintptr_t)caps3;
+		c3.max_size = sizeof(caps3);
+		if (vmw_cmd(cfd2, DRM_VMW_GET_3D_CAP, _IOC_WRITE, &c3, sizeof(c3)) == 0)
+			printf("      (dxfmt caps: BGRA_TYPELESS[213]=%x BGRA_SRGB[214]=%x "
+			       "BGRX_TYPELESS[215]=%x BGRX_SRGB[216]=%x BGRA[240]=%x BGRX[241]=%x)\n",
+			       caps3[213], caps3[214], caps3[215], caps3[216],
+			       caps3[240], caps3[241]);
+		union drm_vmw_gb_surface_create_ext_arg sa2;
+		memset(&sa2, 0, sizeof(sa2));
+		/* HINT_TEXTURE | HINT_RENDERTARGET | BIND_SHADER_RESOURCE |
+		 * BIND_RENDER_TARGET: what svga_texture_create sends. */
+		sa2.req.base.svga3d_flags =
+			(1u << 5) | (1u << 6) | (1u << 23) | (1u << 24);
+		sa2.req.base.format = 141; /* SVGA3D_B8G8R8A8_UNORM */
+		sa2.req.base.mip_levels = 1;
+		sa2.req.base.drm_surface_flags = drm_vmw_surface_flag_scanout |
+						 drm_vmw_surface_flag_shareable |
+						 drm_vmw_surface_flag_create_buffer;
+		sa2.req.base.buffer_handle = 0xFFFFFFFFu;
+		sa2.req.base.base_size.width = 64;
+		sa2.req.base.base_size.height = 64;
+		sa2.req.base.base_size.depth = 1;
+		sa2.req.base.array_size = 1;
+		sa2.req.version = drm_vmw_gb_surface_v1;
+		int rc141 = vmw_cmd(cfd2, DRM_VMW_GB_SURFACE_CREATE_EXT,
+				    _IOC_READ | _IOC_WRITE, &sa2, sizeof(sa2));
+		test_result("kernel accepts a B8G8R8A8 scanout surface", rc141 == 0 && sa2.rep.handle);
+		if (rc141 == 0) {
+			struct drm_vmw_surface_arg u141 = { .sid = (int32_t)sa2.rep.handle };
+			vmw_cmd(cfd2, DRM_VMW_UNREF_SURFACE, _IOC_WRITE, &u141, sizeof(u141));
+			struct drm_vmw_handle_close_arg h141 = { .handle = sa2.rep.buffer_handle };
+			vmw_cmd(cfd2, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &h141, sizeof(h141));
+		} else {
+			printf("      (rc=%d)\n", rc141);
+		}
+	}
+
+	if (cgbm && gbm_destroy)
+		gbm_destroy(cgbm);
+	if (cfd2 >= 0)
+		close(cfd2);
+	if (fd >= 0)
+		close(fd);
+}
+
 static void test_dirent64_and_stat_mkdir(void)
 {
 	printf("\n[dirent64 / sys-stat mkdir]\n");
@@ -14036,11 +16814,34 @@ int main(int argc, char **argv)
 		    mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1,
 			 0) == MAP_FAILED &&
 			    errno == EINVAL);
+	/* A length no address space can hold, rather than a number that merely
+	 * sounded large.
+	 *
+	 * This used to ask for 3 GB and expect ENOMEM, which stopped being a
+	 * security property the moment the machine had 4 GB -- and was never
+	 * one on a real 16 GB system.  An anonymous mapping is demand-paged:
+	 * asking for 3 GB reserves addresses, not memory, and succeeding is
+	 * the correct answer.  The test was asserting a limitation, so it
+	 * failed as soon as the limitation went away.
+	 *
+	 * What must always fail is a request that cannot be satisfied by any
+	 * amount of memory: the user half is 47 bits, so 1 << 47 does not fit
+	 * however much RAM is fitted. */
 	errno = 0;
-	test_result("mmap(3 GB) -> ENOMEM",
-		    mmap(NULL, 3ULL * 1024 * 1024 * 1024, PROT_READ,
+	test_result("mmap(128 TB, larger than the user address space) -> ENOMEM",
+		    mmap(NULL, 1ULL << 47, PROT_READ,
 			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED &&
 			    errno == ENOMEM);
+
+	/* And a length whose page-rounding overflows.  SIZE_MAX rounds up to
+	 * zero, which is the classic way a length check is passed by a value
+	 * that then allocates nothing and leaves the caller with a mapping it
+	 * believes is enormous. */
+	errno = 0;
+	test_result("mmap(SIZE_MAX, page-rounding overflows) fails",
+		    mmap(NULL, (size_t)-1, PROT_READ,
+			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED &&
+			    (errno == ENOMEM || errno == EINVAL));
 	errno = 0;
 	test_result("mmap(bad fd) -> EBADF",
 		    mmap(NULL, 4096, PROT_READ, MAP_SHARED, 9999, 0) ==
@@ -14116,12 +16917,43 @@ int main(int argc, char **argv)
 		munmap(valid_fixed, 4096);
 	}
 
-	// Test: Excessive mmap size (> 2GB limit) should fail
-	void *huge_mmap =
-		mmap(NULL, 3ULL * 1024 * 1024 * 1024, PROT_READ | PROT_WRITE,
-		     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	test_result("mmap(3GB) fails (exceeds 2GB limit)",
-		    huge_mmap == MAP_FAILED);
+	/* A large anonymous mapping SUCCEEDS, and is real where it is touched.
+	 *
+	 * The inverse of what this used to assert.  3 GB of anonymous memory is
+	 * a reservation of addresses; the pages arrive on first touch, so the
+	 * request is legitimate on any machine whose address space can hold it
+	 * -- and on a 16 GB system it is ordinary.  Demanding that it fail was
+	 * testing a 2 GB limit that no longer exists.
+	 *
+	 * Touching the two ends and the middle is what makes this worth
+	 * running: it proves the mapping is backed on demand rather than
+	 * merely promised, and that the far end of a multi-gigabyte region is
+	 * reachable -- which is where a 32-bit truncation in the region
+	 * bookkeeping would show up. */
+	const size_t huge_len = 3ULL * 1024 * 1024 * 1024;
+	void *huge_mmap = mmap(NULL, huge_len, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	test_result("mmap(3GB) succeeds (demand-paged reservation)",
+		    huge_mmap != MAP_FAILED);
+	if (huge_mmap != MAP_FAILED) {
+		volatile char *h = (volatile char *)huge_mmap;
+		size_t last = huge_len - 1;
+		size_t mid = huge_len / 2;
+		int ok;
+
+		h[0] = 0x11;
+		h[mid] = 0x22;
+		h[last] = 0x33;
+		ok = (h[0] == 0x11 && h[mid] == 0x22 && h[last] == 0x33);
+		test_result("3GB mapping is writable at both ends and the middle",
+			    ok);
+		/* Only the three touched pages were ever backed, so this
+		 * releases three pages and a lot of address space. */
+		test_result("munmap of the 3GB mapping succeeds",
+			    munmap(huge_mmap, huge_len) == 0);
+		huge_mmap = MAP_FAILED;
+	}
 
 	// Test: Multiple small mmaps should succeed
 	void *multi1 = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
@@ -26637,6 +29469,19 @@ network_skip:;
 	test_memstream_ftw_cpuclock();
 	test_stdint_limits();
 	test_dirent64_and_stat_mkdir();
+	test_ucontext();
+	test_xsave();
+	test_mmap_large();
+	test_futex_bitset();
+	test_clock_nanosleep();
+	test_sigsuspend_delivery();
+	test_cred_threads();
+	test_anonfd();
+	test_sysfs_procfs();
+	test_posix_additions();
+	test_drm();
+	test_drm_3d();
+	test_gpu_userland();
 
 	// ========================================
 	// Summary

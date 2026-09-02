@@ -1,0 +1,53 @@
+Report the guest-backed memory pool as the video memory size.
+
+The svga driver answered every question about how much memory the device
+has with a placeholder of one megabyte and a note wondering whether the
+host could be asked.  It can, and the display manager already reports it:
+the guest-backed object pool is what surfaces are allocated out of, and it
+is what the hypervisor's configured graphics memory becomes.  With the
+placeholder in place, anything that asked -- a renderer query, an
+application sizing its caches -- was told the device has one megabyte.
+
+The winsys already reads the pool for its own flush heuristics; this
+carries the number through to the screen so the driver can report it.
+
+--- a/src/gallium/drivers/svga/svga_winsys.h
++++ b/src/gallium/drivers/svga/svga_winsys.h
+@@ -707,6 +707,9 @@
+ 
+    /** Do we support coherent surface memory? */
+    bool have_coherent;
++
++   /** Size of the guest-backed object memory pool, in bytes. */
++   uint64_t gb_mem_size;
+    /**
+     * Create and define a GB shader.
+     */
+--- a/src/gallium/winsys/svga/drm/vmw_screen_ioctl.c
++++ b/src/gallium/winsys/svga/drm/vmw_screen_ioctl.c
+@@ -1155,6 +1155,8 @@
+       else
+          vws->ioctl.num_cap_3d = SVGA3D_DEVCAP_MAX;
+ 
++      vws->base.gb_mem_size = vws->ioctl.max_mob_memory;
++
+       if (vws->ioctl.have_drm_2_16) {
+          vws->base.have_coherent = true;
+          getenv_val = getenv("SVGA_FORCE_COHERENT");
+--- a/src/gallium/drivers/svga/svga_screen.c
++++ b/src/gallium/drivers/svga/svga_screen.c
+@@ -526,7 +526,13 @@
+ 
+    caps->vendor_id = 0x15ad; /* VMware Inc. */
+    caps->device_id = sws->device_id ? sws->device_id : 0x0405; /* assume SVGA II */
+-   caps->video_memory = 1; /* XXX: Query the host ? */
++   /* The guest-backed object pool the display manager reports, in
++    * megabytes; surfaces are allocated out of it and nothing else here
++    * bounds them.  The placeholder this replaces claimed one megabyte,
++    * which is neither the host's configuration nor a useful number for
++    * anything asking how much memory is available. */
++   caps->video_memory = sws->gb_mem_size ?
++      (unsigned)(sws->gb_mem_size >> 20) : 1;
+    caps->copy_between_compressed_and_plain_formats = sws->have_vgpu10;
+    caps->doubles = sws->have_sm5;
+    caps->uma = false;

@@ -123,6 +123,13 @@ endif
 # The kernel gets the same define so the SVGA driver's boot-time best-fit
 # mode selection uses the identical preferred-resolution table.
 #
+# The table is the fallback, not the first choice: on a VMware-family
+# adapter the SVGA driver asks the hypervisor for the resolution it
+# recommends -- the host's own screen -- and uses that when it fits, whether
+# or not it appears in this table or in the firmware's GOP mode list (see
+# kernel/dev/video/vmsvga2.c).  This table still decides the bootloader's
+# GOP mode, which is what the screen shows until the driver takes over.
+#
 # Large is the default because both ends of the mode list are a preference
 # rather than a demand: the bootloader walks the fallback chain down to
 # 1024x768, so asking for 1920x1200 on a display that cannot do it costs
@@ -145,6 +152,12 @@ endif
 # notebook, VirtualBox, VMware and QEMU all offer 1920x1200 and a default build
 # takes it, leaving a guest screen the host has to shrink to fit -- which is
 # exactly what full-screen mode then cannot do cleanly.
+#
+# The ceiling also bounds the host's own recommendation, on the grounds that a
+# build that names a maximum means it: a hypervisor that recommends more than
+# MAX_SCREEN_SIZE is declined and the table is used instead.  A host that
+# answers is usually the better judge, so on a machine where the guest should
+# simply match the display, leave this unset.
 ifdef MAX_SCREEN_SIZE
   MAX_SCREEN_W := $(word 1,$(subst x, ,$(subst X,x,$(strip $(MAX_SCREEN_SIZE)))))
   MAX_SCREEN_H := $(word 2,$(subst x, ,$(subst X,x,$(strip $(MAX_SCREEN_SIZE)))))
@@ -210,7 +223,25 @@ BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
 # codegen is kept integer-only here.  fb.c is the one deliberate exception (see
 # its per-file flags below): it uses SSE for the framebuffer blits and brackets
 # them with kernel_fpu_begin()/kernel_fpu_end().
-KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+# Header dependencies.
+#
+# Every kernel object has a rule naming only its .c file, so a change to a
+# HEADER rebuilt nothing at all: the objects whose .c happened to be touched
+# picked up the new definitions and the rest kept the old ones.  Where the
+# header describes a layout -- task_t and everything reachable from it, which
+# is most of them -- that is not a stale build, it is one kernel compiled
+# against two different structure layouts, reading each other's fields at the
+# wrong offsets.  It presents as corruption with no bad code anywhere in it,
+# and the only way back is to remember to rebuild by hand.
+#
+# -MMD writes the list of headers each object really used next to it, -MP adds
+# a do-nothing rule for each so that DELETING or renaming a header is not an
+# error, and the -include below feeds them back to make.  System headers are
+# excluded (-MMD rather than -MD); with -nostdinc there are none anyway.
+DEPFLAGS = -MMD -MP
+
+KERNEL_CFLAGS = $(DEPFLAGS) \
+			-m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-mno-sse -mno-sse2 -mno-mmx -mno-80387 \
 			-fstack-protector-strong -mstack-protector-guard=tls \
 			-mstack-protector-guard-reg=gs -mstack-protector-guard-offset=104 \
@@ -268,6 +299,20 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/fb.o \
               $(BUILD_DIR)/vmsvga2.o \
               $(BUILD_DIR)/fbdev.o \
+              $(BUILD_DIR)/drm_drv.o \
+              $(BUILD_DIR)/drm_console.o \
+              $(BUILD_DIR)/drm_gem.o \
+              $(BUILD_DIR)/drm_dirty.o \
+              $(BUILD_DIR)/drm_fence.o \
+              $(BUILD_DIR)/drm_kms.o \
+              $(BUILD_DIR)/vmw_drv.o \
+              $(BUILD_DIR)/vmw_mob.o \
+              $(BUILD_DIR)/vmw_dirty.o \
+              $(BUILD_DIR)/vmw_surface.o \
+              $(BUILD_DIR)/vmw_context.o \
+              $(BUILD_DIR)/vmw_execbuf.o \
+              $(BUILD_DIR)/vmw_stdu.o \
+              $(BUILD_DIR)/vmw_msg.o \
               $(BUILD_DIR)/evdev.o \
               $(BUILD_DIR)/interrupt.o \
               $(BUILD_DIR)/interrupt_c.o \
@@ -302,6 +347,9 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/ioapic.o \
 			  $(BUILD_DIR)/timer.o \
 			  $(BUILD_DIR)/sched.o \
+			  $(BUILD_DIR)/fpu.o \
+			  $(BUILD_DIR)/hrtimer.o \
+			  $(BUILD_DIR)/irq.o \
 			  $(BUILD_DIR)/syscall.o \
 			  $(BUILD_DIR)/syscall_c.o \
 			  $(BUILD_DIR)/uaccess.o \
@@ -313,10 +361,17 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/fs_readdir.o \
 			  $(BUILD_DIR)/fs_xattr.o \
 			  $(BUILD_DIR)/fs_ioctl.o \
+			  $(BUILD_DIR)/fs_pseudofs.o \
+			  $(BUILD_DIR)/fs_sysfs.o \
+			  $(BUILD_DIR)/fs_procfs.o \
+			  $(BUILD_DIR)/fs_eventfd.o \
+			  $(BUILD_DIR)/fs_timerfd.o \
+			  $(BUILD_DIR)/fs_signalfd.o \
 			  $(BUILD_DIR)/fs_sync.o \
 			  $(BUILD_DIR)/mm_mmap.o \
 			  $(BUILD_DIR)/mm_mprotect.o \
 			  $(BUILD_DIR)/mm_madvise.o \
+			  $(BUILD_DIR)/mm_mremap.o \
 			  $(BUILD_DIR)/ke_fork.o \
 			  $(BUILD_DIR)/ke_exit.o \
 			  $(BUILD_DIR)/ke_exec.o \
@@ -410,7 +465,7 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	sleep strings file grep wc head tail echo printf free uptime nproc dmesg which date time \
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
-	id whoami groups su passwd adduser addgroup deluser delgroup kdump \
+	id whoami groups su passwd adduser addgroup deluser delgroup kdump drminfo \
 	gdb gdbserver
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
@@ -420,7 +475,7 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
-	webstress
+	webstress wkstress codecheck
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -543,6 +598,48 @@ $(BUILD_DIR)/vmsvga2.o: $(KERNEL_DIR)/dev/video/vmsvga2.c $(SCREEN_STAMP) | $(BU
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fbdev.o: $(KERNEL_DIR)/dev/video/fbdev.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_drv.o: $(KERNEL_DIR)/dev/gpu/drm/drm_drv.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_console.o: $(KERNEL_DIR)/dev/gpu/drm/drm_console.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_gem.o: $(KERNEL_DIR)/dev/gpu/drm/drm_gem.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_dirty.o: $(KERNEL_DIR)/dev/gpu/drm/drm_dirty.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_dirty.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_dirty.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_fence.o: $(KERNEL_DIR)/dev/gpu/drm/drm_fence.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_kms.o: $(KERNEL_DIR)/dev/gpu/drm/drm_kms.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_drv.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_drv.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_mob.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_mob.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_surface.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_surface.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_context.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_context.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_execbuf.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_execbuf.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_stdu.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_stdu.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_msg.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_msg.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/evdev.o: $(KERNEL_DIR)/dev/input/evdev.c | $(BUILD_DIR)
@@ -732,6 +829,15 @@ $(BUILD_DIR)/timer.o: $(KERNEL_DIR)/ke/timer.c | $(BUILD_DIR)
 $(BUILD_DIR)/sched.o: $(KERNEL_DIR)/ke/sched.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/fpu.o: $(KERNEL_DIR)/ke/fpu.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hrtimer.o: $(KERNEL_DIR)/ke/hrtimer.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/irq.o: $(KERNEL_DIR)/ke/irq.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/tty.o: $(KERNEL_DIR)/io/tty.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -771,6 +877,24 @@ $(BUILD_DIR)/fs_xattr.o: $(KERNEL_DIR)/fs/xattr.c | $(BUILD_DIR)
 $(BUILD_DIR)/fs_ioctl.o: $(KERNEL_DIR)/fs/ioctl.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/fs_pseudofs.o: $(KERNEL_DIR)/fs/pseudofs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_sysfs.o: $(KERNEL_DIR)/fs/sysfs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_procfs.o: $(KERNEL_DIR)/fs/procfs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_eventfd.o: $(KERNEL_DIR)/fs/eventfd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_timerfd.o: $(KERNEL_DIR)/fs/timerfd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_signalfd.o: $(KERNEL_DIR)/fs/signalfd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/fs_sync.o: $(KERNEL_DIR)/fs/sync.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -781,6 +905,9 @@ $(BUILD_DIR)/mm_mprotect.o: $(KERNEL_DIR)/mm/mprotect.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mm_madvise.o: $(KERNEL_DIR)/mm/madvise.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mm_mremap.o: $(KERNEL_DIR)/mm/mremap.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ke_fork.o: $(KERNEL_DIR)/ke/fork.c | $(BUILD_DIR)
@@ -1041,6 +1168,22 @@ $(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/forkstress: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/forkstress
 	cp $(USER_DIR)/tests/forkstress $@
+
+$(BUILD_DIR)/wkstress: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/wkstress
+	cp $(USER_DIR)/tests/wkstress $@
+
+$(BUILD_DIR)/codecheck: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/codecheck
+	cp $(USER_DIR)/tests/codecheck $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# drminfo: what the display-manager device is and what it can do, read from
+# the device itself through plain ioctls -- no libdrm, so it still answers on a
+# system whose graphics stack above the kernel is broken or absent.
+$(BUILD_DIR)/drminfo: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) drminfo
+	cp $(USER_DIR)/drminfo $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1957,6 +2100,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/progerr       $(EXT4_STAGING)/usr/local/bin/progerr
 	cp $(BUILD_DIR)/testmem       $(EXT4_STAGING)/usr/local/bin/testmem
 	cp $(BUILD_DIR)/forkstress    $(EXT4_STAGING)/usr/local/bin/forkstress
+	cp $(BUILD_DIR)/wkstress      $(EXT4_STAGING)/usr/local/bin/wkstress
+	cp $(BUILD_DIR)/codecheck     $(EXT4_STAGING)/usr/local/bin/codecheck
 	cp $(BUILD_DIR)/memstat       $(EXT4_STAGING)/usr/local/bin/memstat
 	cp $(BUILD_DIR)/teststress    $(EXT4_STAGING)/usr/local/bin/teststress
 	cp $(BUILD_DIR)/netstress     $(EXT4_STAGING)/usr/local/bin/netstress
@@ -2442,6 +2587,54 @@ openssh-manpages:
 		echo "  res/man/$$base.1 ($$(wc -l < res/man/$$base.1) lines)"; \
 	done
 
+# The naming rule, checked rather than remembered.
+#
+# This system does not name another operating system in its own code: the
+# right words are "conventional Unix", "the reference driver", "POSIX", or
+# the name of the thing itself.  The rule is easy to keep and easy to forget,
+# and a slip is invisible in review because the sentence still reads well.
+#
+# So it is a target.  It looks at THIS tree's sources -- the kernel, the
+# libc, the userland programs and the resources -- and not at the ports,
+# whose sources are upstream's and whose patches quote upstream identifiers
+# (a build target named "x86_64-linux-gcc", a `#ifdef __linux__' being
+# extended) that cannot be spelled any other way.
+#
+# The exemptions in the grep are of the same kind: NAMES of things outside
+# this system, where the word is an identifier rather than a description --
+# the terminfo entry a terminal reports as TERM, the ELF OSABI constant, the
+# console font format, and the PAM implementation whose ABI the libpam here
+# matches.  Renaming any of those would name something that does not exist.
+#
+# Not wired into the build: a failing grep in the middle of an image build
+# would be a poor way to learn this, and the check costs nothing to run.
+NAMING_DIRS = kernel include user res
+# ...except the interface headers copied in verbatim.  The display manager's
+# ioctl definitions (include/kernel/uapi/drm, user/lib/libc/include/drm) and
+# the device's own SVGA3D headers are UPSTREAM FILES, kept byte-faithful so
+# that a program built against them here and one built elsewhere agree about
+# the interface; their copyright and licence lines are not this tree's prose
+# to edit.
+# acpica is likewise an upstream tree, imported whole: its per-platform
+# headers are named after the systems they configure ACPICA for.
+NAMING_SKIP_DIRS = drm uapi svga acpica
+.PHONY: check-naming
+check-naming:
+	@bad=$$(grep -rniE '\blinux\b' $(NAMING_DIRS) \
+		$(addprefix --exclude-dir=,$(NAMING_SKIP_DIRS)) \
+		--include='*.c' --include='*.h' --include='*.S' \
+		--include='*.asm' --include='*.lua' --include='*.sh' \
+		--include='*.conf' 2>/dev/null \
+		| grep -viE '__linux__|__gnu_linux__|-U ?linux|x86_64-linux|linux-gnu|TERM=linux|"linux"|GNU/Linux|Linux/i386|Linux-PAM' \
+		|| true); \
+	if [ -n "$$bad" ]; then \
+		echo "$$bad"; \
+		echo "check-naming: the sources above name another operating system."; \
+		echo "  Say \"conventional Unix\", \"POSIX\", or the name of the thing."; \
+		exit 1; \
+	fi; \
+	echo "check-naming: clean ($(NAMING_DIRS))"
+
 # Render the X.Org manual pages, the same way openssh-manpages above does.
 #
 # Maintenance target, not part of the build: the rendered pages are checked in
@@ -2779,3 +2972,12 @@ bootloader: $(BOOTLOADER_EFI)
 usb: $(GPT_DISK)
 
 .PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
+
+# Feed back the header dependencies recorded by -MMD (see DEPFLAGS above).
+#
+# `-include' rather than `include': the files do not exist before the first
+# build of each object, and their absence is not an error.  The wildcards are
+# evaluated when this line is read, which is exactly right -- a .d that does
+# not exist yet belongs to an object that is going to be compiled anyway.
+-include $(wildcard $(BUILD_DIR)/*.d)
+-include $(wildcard $(BUILD_DIR)/acpica/*/*.d)

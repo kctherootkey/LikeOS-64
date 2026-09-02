@@ -1,4 +1,5 @@
 // LikeOS-64 - Minimal PCI enumeration
+#include <kernel/mm/memory.h>
 #include <kernel/hal/pci.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/sched.h>
@@ -82,7 +83,7 @@ void pci_init(void)
 // downward.  On Intel Arrow Lake / Meteor Lake:
 //   32-bit window: 0x70000000-0xBFFFFFFF
 //   64-bit window: ~0x5000000000-0x501C2FFFFF (above 4 GB)
-// Linux pci_assign_unassigned_bus_resources() assigns 64-bit BARs from the
+// The reference pci_assign_unassigned_bus_resources() assigns 64-bit BARs from the
 // 64-bit window (e.g. 0x501C2DD000 for LPSS I2C).
 static unsigned long g_next_bar_base = 0xBF000000UL;
 static unsigned long g_next_bar64_base = 0x501C300000UL;
@@ -382,6 +383,12 @@ uint8_t pci_find_capability(const pci_device_t *dev, uint8_t cap_id)
 
 int pci_enable_msi(const pci_device_t *dev, uint8_t vector)
 {
+	return pci_enable_msi_cpu(dev, vector, lapic_get_id_cpuid());
+}
+
+int pci_enable_msi_cpu(const pci_device_t *dev, uint8_t vector,
+		       uint32_t apic_id)
+{
 	BUG_ON(dev == NULL);
 	WARN_ON(vector <
 		32); /* MSI vector must be >= 32 (0-31 are CPU exceptions) */
@@ -407,7 +414,7 @@ int pci_enable_msi(const pci_device_t *dev, uint8_t vector)
 	// Program Message Address (cap_off + 4)
 	// Use CPUID-based APIC ID — safe to call before lapic_init(), unlike
 	// lapic_get_id() which needs x2APIC mode detection to be set up first.
-	uint32_t bsp_apic_id = lapic_get_id_cpuid();
+	uint32_t bsp_apic_id = apic_id;
 	uint32_t msi_addr = MSI_ADDR_BASE | ((bsp_apic_id & 0xFF) << 12);
 	pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off + 0x04,
 			msi_addr);
@@ -447,5 +454,71 @@ int pci_enable_msi(const pci_device_t *dev, uint8_t vector)
 	kprintf("PCI MSI: enabled for %02x:%02x.%x - vector %d, addr 0x%x (APIC %d), %s\n",
 		dev->bus, dev->device, dev->function, vector, msi_addr,
 		bsp_apic_id, is_64bit ? "64-bit" : "32-bit");
+	return 0;
+}
+
+/* MSI-X: a table of (address, data) entries in one of the device's BARs,
+ * each its own interrupt.  Programs entry `entry' for `vector' on the CPU
+ * with `apic_id', unmasks it, enables the MSI-X function, and disables
+ * INTx. */
+int pci_enable_msix(const pci_device_t *dev, int entry, uint8_t vector,
+		    uint32_t apic_id)
+{
+	BUG_ON(dev == NULL);
+	uint8_t cap = pci_find_capability(dev, PCI_CAP_MSIX);
+
+	if (cap == 0)
+		return -1;
+
+	uint32_t dw0 = pci_cfg_read32(dev->bus, dev->device, dev->function, cap);
+	uint16_t ctrl = (uint16_t)(dw0 >> 16);
+	int table_size = (ctrl & 0x7FF) + 1;
+
+	if (entry < 0 || entry >= table_size)
+		return -1;
+
+	uint32_t table = pci_cfg_read32(dev->bus, dev->device, dev->function,
+					cap + 4);
+	unsigned bir = table & 0x7;
+	uint64_t table_off = table & ~0x7u;
+
+	if (bir > 5)
+		return -1;
+	uint64_t bar = dev->bar[bir];
+	if (bar & 1)
+		return -1; /* I/O BAR cannot hold a table */
+	uint64_t base = bar & ~0xFULL;
+	if (((bar >> 1) & 0x3) == 0x2 && bir < 5) /* 64-bit BAR */
+		base |= (uint64_t)dev->bar[bir + 1] << 32;
+	if (!base)
+		return -1;
+
+	uint64_t ent_phys = base + table_off + (uint64_t)entry * 16;
+	uint64_t page = ent_phys & ~0xFFFULL;
+	uint64_t virt = mm_map_device_mmio(page, 2);
+	if (!virt)
+		return -1;
+	volatile uint32_t *e = (volatile uint32_t *)(virt + (ent_phys - page));
+
+	/* Mask the entry while it is programmed, then unmask. */
+	e[3] |= 1;
+	e[0] = MSI_ADDR_BASE | ((apic_id & 0xFF) << 12);
+	e[1] = 0;
+	e[2] = vector; /* edge, fixed delivery */
+	e[3] &= ~1u;
+
+	/* Function mask off, MSI-X enable on. */
+	dw0 = pci_cfg_read32(dev->bus, dev->device, dev->function, cap);
+	dw0 &= ~(1u << 30); /* function mask */
+	dw0 |= (1u << 31); /* enable */
+	pci_cfg_write32(dev->bus, dev->device, dev->function, cap, dw0);
+
+	uint32_t cmd = pci_cfg_read32(dev->bus, dev->device, dev->function, 0x04);
+	cmd |= PCI_CMD_INTX_DISABLE;
+	pci_cfg_write32(dev->bus, dev->device, dev->function, 0x04, cmd);
+
+	kprintf("PCI MSI-X: %02x:%02x.%x entry %d -> vector %d (APIC %u), table of %d\n",
+		dev->bus, dev->device, dev->function, entry, vector, apic_id,
+		table_size);
 	return 0;
 }

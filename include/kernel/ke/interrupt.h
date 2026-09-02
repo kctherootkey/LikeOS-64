@@ -204,6 +204,7 @@ extern void irq17(void); // MSI: xHCI USB controller 1 (vector 49)
 extern void irq27(void); // MSI: E1000 NIC (vector 59)
 extern void irq28(void); // MSI: e1000e NIC (vector 60)
 extern void irq29(void); // MSI: vmxnet3 NIC (vector 61)
+extern void irq30(void); // HPET comparator: high-resolution timers (vector 62)
 
 // MSI vector assignment
 #define XHCI_MSI_VECTOR 48 // IDT vector for xHCI USB controller 0
@@ -211,6 +212,7 @@ extern void irq29(void); // MSI: vmxnet3 NIC (vector 61)
 #define E1000_MSI_VECTOR 59 // IDT vector for E1000 NIC
 #define E1000E_MSI_VECTOR 60 // IDT vector for e1000e (82574L/82583V) NIC
 #define VMXNET3_MSI_VECTOR 61 // IDT vector for vmxnet3 paravirt NIC
+#define HRTIMER_VECTOR 62 // IDT vector for the HPET comparator (hrtimer.c)
 
 // IPI stubs (SMP inter-processor interrupts)
 extern void ipi_vector_0xFC(void); // TLB shootdown

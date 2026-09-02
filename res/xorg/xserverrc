@@ -47,4 +47,22 @@
 # changes.  Clients connect over the AF_UNIX socket and are authorised by the
 # cookie in $XAUTHORITY, which is what stops another local user from attaching
 # to this session's display.
+# Which configuration to run with.
+#
+# Two of them: /etc/X11/xorg.conf drives /dev/fb0 through the fbdev driver and
+# renders in software, and works on any machine that boots to a framebuffer;
+# /etc/X11/xorg.conf.modesetting drives the display manager through
+# /dev/dri/card0 with glamor and DRI3, which needs a GPU the kernel has a
+# driver for.  The node is the test: it exists only where such a driver bound
+# to a device, so probing for it here picks the accelerated configuration
+# exactly where it can work and leaves the fallback in place everywhere else
+# -- no per-machine editing, and one image for both.
+#
+# Named relative, not as a path.  Xorg is setuid root (see below), and a
+# server with elevated privileges rejects an absolute -config argument
+# outright; a bare name is looked up in /etc/X11, which is where the file is.
+if [ -e /dev/dri/card0 ]; then
+	set -- -config xorg.conf.modesetting "$@"
+fi
+
 exec /usr/bin/Xorg -noreset -nolisten tcp "$@"

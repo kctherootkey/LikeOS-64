@@ -40,7 +40,7 @@ typedef unsigned int speed_t;
 #define VMIN 8
 #define VTIME 9
 
-// ioctl request codes (Linux-compatible)
+// ioctl request codes (the conventional numbers)
 #define TCGETS 0x5401
 #define TCSETS 0x5402
 #define TCSETSW 0x5403

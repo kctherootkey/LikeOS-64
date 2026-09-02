@@ -440,9 +440,9 @@ int arp_recv_reply(uint32_t target_ip, uint8_t mac_out[6],
 		if (timer_ticks() - start > timeout_ticks)
 			return -1;
 
-		cur->state = TASK_BLOCKED;
 		cur->wait_channel = (void *)&arp_reply_ready;
 		cur->wakeup_tick = start + timeout_ticks;
+		cur->state = TASK_BLOCKED;
 		sched_schedule();
 		cur->wait_channel = NULL;
 		cur->wakeup_tick = 0;

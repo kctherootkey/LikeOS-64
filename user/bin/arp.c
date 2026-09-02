@@ -8,7 +8,7 @@
  *   arp [-vn] [-H type] [-i if] [-a [host] | -d host | -s host hw | -f [file]]
  *
  * Options:
- *   -a   display entries (BSD style)  -e   display entries (Linux style)
+ *   -a   display entries (BSD style)  -e   display entries (default style)
  *   -s   set a static entry           -d   delete an entry
  *   -f   read entries from file       -D   use device hw address
  *   -H   hardware type (default ether) -i   interface
@@ -316,7 +316,7 @@ static void print_help(void)
 	printf("  arp [-vnD] [-H type] [-i if] -f [filename]\n\n");
 	printf("Options:\n");
 	printf("  -a               display (all) entries in BSD style\n");
-	printf("  -e               display in default (Linux) style\n");
+	printf("  -e               display in the default style\n");
 	printf("  -d hostname      delete an ARP entry\n");
 	printf("  -s hostname hw   set a new ARP entry\n");
 	printf("  -D, --use-device use device's hardware address\n");
@@ -332,7 +332,7 @@ static void print_help(void)
 int main(int argc, char *argv[])
 {
 	int numeric = 0, verbose = 0;
-	int bsd_style = 0; /* -a => BSD, -e => Linux (default) */
+	int bsd_style = 0; /* -a => BSD, -e => the default style */
 	int use_device = 0;
 	const char *iface = NULL;
 	const char *hw_type = "ether";

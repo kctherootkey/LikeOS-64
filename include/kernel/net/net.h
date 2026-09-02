@@ -595,6 +595,11 @@ typedef struct tcp_conn {
 	uint8_t proto_ref;
 	uint8_t on_reap_queue;
 	struct tcp_conn *list_next;
+	//   * hash_next: bucket chain of the 4-tuple demux hash (g_tcp_ehash),
+	//     protected by tcp_lock exactly like list_next.  The key is the
+	//     4-tuple, which is written before tcp_publish_conn() and never
+	//     changed afterwards, so an entry never needs rehashing.
+	struct tcp_conn *hash_next;
 	struct tcp_conn *reap_next;
 } tcp_conn_t;
 
@@ -1037,6 +1042,11 @@ void tcp_fill_info(tcp_conn_t *conn, struct tcp_info *info);
 struct tty; // forward declaration for dump output
 void tcp_dump_table(struct tty *tty);
 int tcp_local_port_in_use(uint16_t port);
+/* Is this exact 4-tuple already taken (any state but LISTEN/CLOSED)?  The
+ * question a connecting socket has to ask before claiming a local port --
+ * see the note in alloc_ephemeral_port(). */
+int tcp_4tuple_in_use(uint32_t local_ip, uint16_t local_port,
+		      uint32_t remote_ip, uint16_t remote_port);
 
 // ============================================================================
 // DHCP API

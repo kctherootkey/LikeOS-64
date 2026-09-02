@@ -1,4 +1,6 @@
 // LikeOS-64 -- the file-descriptor table and fd-surgery syscalls.
+#include <kernel/uapi/anonfd.h>
+#include <kernel/fs/devfs.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/pipe.h>
@@ -441,6 +443,27 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 		task_set_fd_flags(cur, (unsigned)fd,
 				  (uint8_t)((uint32_t)arg & FD_CLOEXEC));
 		ret = 0;
+		goto out;
+	}
+
+	/* memfd seals. */
+	if (cmd == F_ADD_SEALS || cmd == F_GET_SEALS) {
+		vfs_file_t *sf = fdget(cur, (int)fd);
+		unsigned out = 0;
+		int r;
+
+		if (!sf) {
+			ret = -EBADF;
+			goto out;
+		}
+		if (fd_is_special(sf)) {
+			fdput(sf);
+			ret = -EINVAL;
+			goto out;
+		}
+		r = devfs_shm_seals(sf, cmd == F_ADD_SEALS, (unsigned)arg, &out);
+		fdput(sf);
+		ret = r < 0 ? r : (cmd == F_GET_SEALS ? (int64_t)out : 0);
 		goto out;
 	}
 

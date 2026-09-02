@@ -92,6 +92,27 @@
 # are PNG.  Every later one is symbolic SVG, which would mean librsvg, which
 # would mean a Rust toolchain.
 -         dejavu-fonts-ttf   2.37     https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-%VERSION%.tar.bz2
+
+# Liberation is not a second opinion about how text should look -- it is the
+# METRIC-COMPATIBLE substitute for Arial, Times New Roman and Courier New, and
+# fontconfig's 30-metric-aliases.conf maps those three names onto it the moment
+# it is installed.  Without it every page whose CSS says `Arial, Helvetica,
+# sans-serif' -- which is most of the web that does not ship its own webfont --
+# was laid out in DejaVu Sans, whose glyphs are appreciably wider.  Text then
+# takes more room than the page was designed for: navigation bars overflow,
+# containers that clip do so in the wrong place, and elements land on top of
+# links, which is why they could not be clicked on debian.org and freebsd.org
+# while sites carrying their own webfonts (cnn.com, spiegel.de) were fine.
+#
+# 2.00.1 rather than the current 2.1.5 because it is the last release published
+# as ready-made TTFs: upstream now ships only sources, which are built with
+# fontforge.  The metrics -- the entire point of this font -- are the same.
+-         liberation-fonts-ttf 2.00.1 https://releases.pagure.org/liberation-fonts/liberation-fonts-ttf-%VERSION%.tar.gz
+
+# Noto Sans covers what DejaVu and Liberation do not, and is asked for by name
+# by a growing number of sites.  This is the Latin/Greek/Cyrillic release only
+# -- the full Noto set is hundreds of megabytes of scripts nothing here renders.
+-         NotoSans           v2.015   https://github.com/notofonts/latin-greek-cyrillic/releases/download/NotoSans-%VERSION%/NotoSans-%VERSION%.zip
 -         hicolor-icon-theme 0.18     https://icon-theme.freedesktop.org/releases/hicolor-icon-theme-%VERSION%.tar.xz
 -         adwaita-icon-theme 3.38.0   https://download.gnome.org/sources/adwaita-icon-theme/3.38/adwaita-icon-theme-%VERSION%.tar.xz
 

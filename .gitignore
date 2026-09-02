@@ -139,6 +139,12 @@
 #     `make` fetches it through fetch.sh on a fresh clone and verifies the
 #     bytes; the set stays reproducible, it just needs the network once.
 /ports/xorg/gtk3/llvm-*.tar.xz
+#     And the one archive that is not a tarball but hits the same wall: the
+#     Noto Sans release zip (~117 MB), also over the 100 MB limit.  Every
+#     other archive here is tracked, including the other zip
+#     (hunspell-en_US, 194 KB) -- this one is excluded for its size alone,
+#     and fetch.sh pulls it on a fresh clone exactly as it does LLVM.
+/ports/xorg/gtk3/NotoSans-*.zip
 #     Not listed, therefore tracked, and all required to build from a clone:
 #     packages.list (the manifest), fetch/unpack/build/stage/clean.sh, and
 #     checksums.sha256 (records which upstream bytes a build used).

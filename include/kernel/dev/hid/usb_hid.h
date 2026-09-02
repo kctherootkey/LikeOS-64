@@ -243,11 +243,11 @@ typedef struct {
 
 // Intel ISH (Integrated Sensor Hub) PCI class/vendor IDs
 // The ISH appears as a PCI device with class 0x1180 (Signal processing controller)
-// Linux handles it through intel-ish-hid driver; we just detect and skip it.
+// The reference systems handle it with a dedicated driver; we detect and skip it.
 #define INTEL_ISH_PCI_VENDOR 0x8086
 #define INTEL_ISH_PCI_CLASS 0x1180 // Signal processing controller
 
-// Known Intel ISH device IDs (from Linux intel-ish-hid driver)
+// Known Intel ISH device IDs (from the reference intel-ish-hid driver)
 #define INTEL_ISH_DEV_CHV 0x22D8 // Cherry View
 #define INTEL_ISH_DEV_BXT_Ax 0x0AA2 // Broxton A-step
 #define INTEL_ISH_DEV_BXT_P 0x1AA2 // Broxton P

@@ -276,7 +276,6 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 			if (timer_ticks() - start > timeout_ticks)
 				return -1;
 			// Block the task until woken by icmp_rx or timeout
-			cur->state = TASK_BLOCKED;
 			cur->wait_channel = (void *)&icmp_reply_ready;
 			// Set a wakeup deadline so we wake on timeout even without a reply
 			uint64_t remaining =
@@ -284,6 +283,7 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 			if (remaining > timeout_ticks)
 				remaining = 0; // underflow guard
 			cur->wakeup_tick = timer_ticks() + remaining;
+			cur->state = TASK_BLOCKED;
 			sched_schedule();
 			cur->wait_channel = NULL;
 			cur->wakeup_tick = 0;

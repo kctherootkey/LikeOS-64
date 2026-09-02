@@ -1,0 +1,41 @@
+The dma-buf UAPI lives under <drm/>, not under a kernel-specific directory.
+
+USE_GBM=ON compiles the GBM graphics path for the first time in this port,
+and its CPU-access bracket includes the dma-buf UAPI at the path the
+reference kernel installs it to:
+
+    MemoryMappedGPUBuffer.cpp:39:10: fatal error: linux/dma-buf.h:
+      No such file or directory
+
+Everything it needs from that header is already present and correct.  This
+libc installs the same UAPI -- struct dma_buf_sync, the DMA_BUF_SYNC_* flags
+and DMA_BUF_IOCTL_SYNC, byte for byte from the same source -- as
+<drm/dma-buf.h>, beside drm.h, drm_mode.h, drm_fourcc.h and sync_file.h, the
+other four headers this file's neighbours already include that way.  The
+ioctl behind it is implemented too: kernel/dev/gpu/drm/drm_gem.c dispatches
+_IOC_TYPE(req) == DMA_BUF_BASE and handles request 0 by waiting for the
+device before the CPU touches the mapping.
+
+So this is a spelling difference and nothing more, and the arm is written to
+say only that: on this system the header is <drm/dma-buf.h>, everywhere else
+it is where it always was.
+
+Not fixed by adding the other directory to the sysroot: that would put a
+second copy of one UAPI on the include path under a name that promises a
+kernel this is not, and the next port to reach for something else under it
+would find a directory that exists and a header that does not.
+
+--- a/Source/WebCore/platform/graphics/gbm/MemoryMappedGPUBuffer.cpp
++++ b/Source/WebCore/platform/graphics/gbm/MemoryMappedGPUBuffer.cpp
+@@ -36,7 +36,11 @@
+ #include "VivanteSuperTiledTextureInlines.h"
+ #include <epoxy/egl.h>
+ #include <fcntl.h>
++#if defined(__LIKEOS__)
++#include <drm/dma-buf.h>
++#else
+ #include <linux/dma-buf.h>
++#endif
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <wtf/SafeStrerror.h>

@@ -121,6 +121,93 @@ bug_report_atomic_sleep(const char *file, int line, const char *func)
 		kprintf("WARNING: further might_sleep() reports suppressed\n");
 }
 
+/* ---- spinlock stall reporter ----
+ *
+ * spin_lock() calls this when a lock has not come free after SPIN_STALL_PAUSES
+ * PAUSE instructions -- seconds, where every real hold in this kernel is
+ * microseconds.  By then the waiting processor has had interrupts disabled for
+ * that whole time, so it is not being preempted, is not taking timer ticks and
+ * is not going to recover on its own: from the outside the machine has stopped.
+ *
+ * What is worth printing is the lock's NAME and the chain that reached it.  The
+ * name identifies the subsystem, and the two ends of a deadlock report
+ * separately (each processor is stuck on its own lock), so the pair of messages
+ * names the cycle.  A single message with no counterpart means the holder is
+ * not spinning at all -- it is a lock leaked by a path that returned or died
+ * without releasing.
+ *
+ * Not re-entrant, deliberately.  kprintf() takes locks of its own (the console,
+ * the serial port), so a report issued from inside the console's own lock would
+ * come straight back here; the flag makes the nested call return and the outer
+ * one do the printing.  It also keeps the two ends of a deadlock from
+ * interleaving their traces into one unreadable block.
+ *
+ * Rate-limited like the might_sleep() reporter above: a stalled lock keeps
+ * stalling, and the first few reports are the whole story.
+ */
+void __attribute__((no_stack_protector)) spin_report_stall(spinlock_t *lock)
+{
+	static volatile unsigned char reporting;
+	static int count;
+
+	if (count >= 8)
+		return;
+	if (__atomic_test_and_set(&reporting, __ATOMIC_ACQUIRE))
+		return;
+	count++;
+
+	uint64_t rbp;
+	__asm__ volatile("mov %%rbp, %0" : "=r"(rbp));
+
+	int gs_ok = (int)read_gs_base_msr();
+	task_t *cur = gs_ok ? sched_current() : NULL;
+
+	/* Address and state FIRST, and as plain integers.
+	 *
+	 * The name is printed separately and last, because a stalled lock is
+	 * quite likely to be one that no longer exists: a lock in freed memory
+	 * is never released, which is exactly how a wait ends up unbounded.
+	 * Its `name' is then whatever the allocator left in that slot, and
+	 * printing it faults inside kprintf -- which is what happened the first
+	 * time this fired, cutting the message off at "spinlock '" and taking
+	 * the useful half of the report with it.  The address alone identifies
+	 * the object, and `locked=1' with a name that does not resolve is
+	 * itself the diagnosis. */
+	kprintf("WARNING: spinlock %016llx (locked=%u) not acquired after "
+		"%u million spins; cpu %d [%s pid=%d]\n",
+		(uint64_t)(uintptr_t)lock, (unsigned)lock->locked,
+		(unsigned)(SPIN_STALL_PAUSES / 1000000u),
+		gs_ok ? (int)this_cpu_id() : -1,
+		cur ? (cur->comm[0] ? cur->comm : "(anon)") : "(no task)",
+		cur ? (int)cur->id : -1);
+
+	/* Same readability test the frame walk uses: a kernel address that the
+	 * current page tables actually map.  It does not prove the bytes are a
+	 * string, so the print is bounded as well. */
+	const char *nm = lock->name;
+	if (nm && _ksc_is_kern((uint64_t)nm) &&
+	    mm_user_addr_mapped((uint64_t)nm, 1)) {
+		char buf[33];
+		int i = 0;
+		while (i < 32 && mm_user_addr_mapped((uint64_t)(nm + i), 1) &&
+		       nm[i] >= 0x20 && nm[i] < 0x7f)
+			buf[i] = nm[i], i++;
+		buf[i] = '\0';
+		kprintf("  name '%s'%s\n", buf,
+			i == 32 ? " (truncated)" : "");
+	} else {
+		kprintf("  name pointer %016llx is not readable -- this lock is "
+			"very likely in freed memory\n",
+			(uint64_t)(uintptr_t)nm);
+	}
+
+	_ksc_trace(rbp, (uint64_t)__builtin_return_address(0));
+	if (count == 8)
+		kprintf("WARNING: further spinlock stall reports suppressed\n");
+
+	__atomic_clear(&reporting, __ATOMIC_RELEASE);
+}
+
 /* ---- main handler ---- */
 
 __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void)
