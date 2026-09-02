@@ -56,6 +56,7 @@
 extern uint64_t _rtld_tls_size(void) __attribute__((weak));
 extern uint64_t _rtld_tls_align(void) __attribute__((weak));
 extern void _rtld_tls_init(void *tp) __attribute__((weak));
+extern void _rtld_tls_free(void *tp) __attribute__((weak));
 
 static size_t __rtld_tls_size(void)
 {
@@ -65,6 +66,12 @@ static size_t __rtld_tls_size(void)
 static size_t __rtld_tls_align(void)
 {
 	return _rtld_tls_align ? (size_t)_rtld_tls_align() : 16;
+}
+
+static void __rtld_tls_free(void *tp)
+{
+	if (_rtld_tls_free)
+		_rtld_tls_free(tp);
 }
 
 static void __rtld_tls_init(void *tp)
@@ -692,6 +699,16 @@ void pthread_exit(void *retval)
 
 	// Call TSD destructors (pthread_tsd.c, which owns the key table)
 	__pthread_tsd_run_destructors();
+
+	/* Give back the TLS blocks the loader allocated for this thread on
+	 * demand (modules that arrived through dlopen after the thread's own
+	 * block was sized).  Here because it is the last point BOTH exit
+	 * paths pass through while the thread still has a stack to run on:
+	 * a detached thread leaves below through __unmapself, which is raw
+	 * assembly that can call nothing, and a joinable one never runs
+	 * again after this function.  Destructors first -- they may still
+	 * touch __thread data. */
+	__rtld_tls_free(tcb);
 
 	// Mark as exited (before exit so joiners see it)
 	tcb->state = THREAD_STATE_EXITED;

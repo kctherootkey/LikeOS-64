@@ -1224,11 +1224,11 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 		 * once anything had been placed, a full ring ended the call
 		 * and the count written was returned, which is a short write
 		 * on a socket whose caller was never told to expect one.
-		 * POSIX permits that; Linux does not do it, and the ports in
-		 * this tree are written against what Linux does -- its
-		 * unix_stream_sendmsg() sleeps and carries on, and returns
-		 * less than asked only when a signal cuts a transfer that had
-		 * already begun.
+		 * POSIX permits that; the reference implementation does not do
+		 * it, and the ports in this tree are written against what it
+		 * does -- its stream sendmsg sleeps and carries on, and
+		 * returns less than asked only when a signal cuts a transfer
+		 * that had already begun.
 		 *
 		 * What it cost: luakit's IPC channel is unbuffered and passes
 		 * NULL for the bytes-written out-parameter

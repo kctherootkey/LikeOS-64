@@ -335,6 +335,54 @@ static inline int sigismember_k(const kernel_sigset_t *set, int sig)
 	return (set->sig[0] & (1ULL << (sig - 1))) ? 1 : 0;
 }
 
+/* The same two operations on a PENDING set, done atomically.
+ *
+ * A task's pending set is written from two directions at once: the SENDER,
+ * which runs on whatever CPU called kill(2) or fired the timer, and the task
+ * ITSELF, clearing the bit for the signal it is about to deliver.  Both
+ * directions are read-modify-write on one word, so an interleaving loses
+ * whichever update stored second -- and interrupts being off on one CPU does
+ * not exclude the other, nor does it exclude an interrupt handler on this one
+ * that sends a signal to the task it interrupted.
+ *
+ * Both directions of the loss do damage, and neither announces itself:
+ *
+ *   - the SENDER's bit is dropped, and a signal the kernel accepted and
+ *     reported success for is never delivered;
+ *   - the DEQUEUE's clear is dropped, and a signal that was already delivered
+ *     stays pending, so its handler runs a SECOND time for one send.
+ *
+ * The set is a single word, so a locked bit operation is exact.  Each returns
+ * the PREVIOUS state of the bit, which is the only thing a caller racing for
+ * it can act on: the sender learns whether it superseded an instance still
+ * pending, and the dequeuer learns whether the bit was really still its to
+ * take.
+ */
+static inline int sigaddset_k_atomic(kernel_sigset_t *set, int sig)
+{
+	uint64_t bit;
+
+	if (sig <= 0 || sig >= NSIG)
+		return 0;
+	bit = 1ULL << (sig - 1);
+	return (__atomic_fetch_or(&set->sig[0], bit, __ATOMIC_ACQ_REL) & bit) ?
+		       1 :
+		       0;
+}
+
+static inline int sigdelset_k_atomic(kernel_sigset_t *set, int sig)
+{
+	uint64_t bit;
+
+	if (sig <= 0 || sig >= NSIG)
+		return 0;
+	bit = 1ULL << (sig - 1);
+	return (__atomic_fetch_and(&set->sig[0], ~bit, __ATOMIC_ACQ_REL) &
+		bit) ?
+		       1 :
+		       0;
+}
+
 static inline void sigorset_k(kernel_sigset_t *dest, const kernel_sigset_t *a,
 			      const kernel_sigset_t *b)
 {

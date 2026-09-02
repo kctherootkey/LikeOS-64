@@ -213,40 +213,88 @@ int drm_gem_handle_create(struct drm_file *fp, struct drm_gem_object *o,
 {
 	uint64_t fl;
 
-	spin_lock_irqsave(&fp->lock, &fl);
-	for (uint32_t h = 1; h < fp->nhandles; h++) {
-		if (!fp->handles[h]) {
-			drm_gem_get(o);
-			fp->handles[h] = o;
-			spin_unlock_irqrestore(&fp->lock, fl);
-			*handle_out = drm_handle_make(fp, h);
-			return 0;
+	/* The table has to be grown without the lock -- kalloc may sleep --
+	 * and that window is where this used to go wrong.  The old code
+	 * dropped the lock, allocated, retook it, and then carried on using
+	 * the capacity it had read BEFORE the window, without checking
+	 * whether anything had changed.  Two threads growing the table at the
+	 * same moment therefore both installed their own replacement:
+	 *
+	 *   - the second overwrote the first's table pointer, so the slot the
+	 *     first had just handed out was silently reused for the second's
+	 *     object, and a handle already returned to userspace now named
+	 *     something else entirely; and
+	 *   - the copy into the new table was sized from the CURRENT
+	 *     nhandles, which the first thread had already enlarged, so a
+	 *     third grower could memcpy more entries than the buffer it had
+	 *     allocated could hold.
+	 *
+	 * The client sees this as a valid surface handle that stops
+	 * resolving, or resolves to an object of the wrong kind, some time
+	 * after it was issued -- the command referencing it is refused, the
+	 * driver abandons the batch and carries on with state the device
+	 * never received, and the crash lands somewhere else entirely.  It
+	 * needs two threads to grow the table in the same instant, which is
+	 * why it only shows up on pages that create surfaces in bursts.
+	 *
+	 * So the capacity the decision was made on is re-checked once the
+	 * lock is back: if it moved, this attempt is void -- drop the new
+	 * table and start again, because the winner's table may already have
+	 * the free slot this call wanted. */
+	for (;;) {
+		spin_lock_irqsave(&fp->lock, &fl);
+		for (uint32_t h = 1; h < fp->nhandles; h++) {
+			if (!fp->handles[h]) {
+				drm_gem_get(o);
+				fp->handles[h] = o;
+				spin_unlock_irqrestore(&fp->lock, fl);
+				*handle_out = drm_handle_make(fp, h);
+				return 0;
+			}
 		}
-	}
-	/* Grow. */
-	uint32_t ncap = fp->nhandles ? fp->nhandles * 2 : 64;
-	if (ncap > DRM_MAX_HANDLES) {
+		/* Grow. */
+		uint32_t oldcap = fp->nhandles;
+		uint32_t ncap = oldcap ? oldcap * 2 : 64;
+
+		if (ncap > DRM_MAX_HANDLES) {
+			spin_unlock_irqrestore(&fp->lock, fl);
+			return -ENOSPC;
+		}
 		spin_unlock_irqrestore(&fp->lock, fl);
-		return -ENOSPC;
+
+		struct drm_gem_object **nt = kalloc(ncap * sizeof(*nt));
+
+		if (!nt)
+			return -ENOMEM;
+		mm_memset(nt, 0, ncap * sizeof(*nt));
+
+		spin_lock_irqsave(&fp->lock, &fl);
+		if (fp->nhandles != oldcap) {
+			/* Somebody else grew it while we were allocating. */
+			spin_unlock_irqrestore(&fp->lock, fl);
+			kfree(nt);
+			continue;
+		}
+		struct drm_gem_object **old = fp->handles;
+
+		if (old)
+			mm_memcpy(nt, old, oldcap * sizeof(*nt));
+		fp->handles = nt;
+		fp->nhandles = ncap;
+		/* The first slot the old table did not have.  Slot 0 is never
+		 * issued, so a first allocation starts at 1. */
+		uint32_t h = oldcap ? oldcap : 1;
+
+		drm_gem_get(o);
+		fp->handles[h] = o;
+		spin_unlock_irqrestore(&fp->lock, fl);
+		/* Freed outside the lock: kfree can fire a TLB-shootdown IPI,
+		 * which must not happen with interrupts disabled. */
+		if (old)
+			kfree(old);
+		*handle_out = drm_handle_make(fp, h);
+		return 0;
 	}
-	spin_unlock_irqrestore(&fp->lock, fl);
-	struct drm_gem_object **nt = kalloc(ncap * sizeof(*nt));
-	if (!nt)
-		return -ENOMEM;
-	mm_memset(nt, 0, ncap * sizeof(*nt));
-	spin_lock_irqsave(&fp->lock, &fl);
-	if (fp->handles) {
-		mm_memcpy(nt, fp->handles, fp->nhandles * sizeof(*nt));
-		kfree(fp->handles);
-	}
-	uint32_t h = fp->nhandles ? fp->nhandles : 1;
-	fp->handles = nt;
-	fp->nhandles = ncap;
-	drm_gem_get(o);
-	fp->handles[h] = o;
-	spin_unlock_irqrestore(&fp->lock, fl);
-	*handle_out = drm_handle_make(fp, h);
-	return 0;
 }
 
 /* This file's own handle, and nothing else: the id has to name this file. */

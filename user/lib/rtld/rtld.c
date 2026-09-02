@@ -256,11 +256,42 @@ __attribute__((noreturn)) static void rtld_die(const char *msg)
  * the two in step. */
 #define RTLD_TCB_RESERVE 2048
 
-/* Spare static TLS, handed out to objects that arrive via dlopen() after the
- * block has been laid out.  Without it, a dlopen'd module carrying __thread
- * data has nowhere to live: its offsets would fall outside the allocation.
- * This is the same trick as the conventional loader's static TLS surplus. */
+/* Spare static TLS.
+ *
+ * Only ONE kind of late-arriving object needs this now: one whose code was
+ * compiled for the initial-exec model, whose __thread accesses are
+ * R_X86_64_TPOFF64 relocations resolved to a FIXED offset from the thread
+ * pointer.  Such an object cannot be given a block of its own, because
+ * there is no indirection left to point at one -- the offset is already
+ * burned into the instruction stream, and every thread's block was sized
+ * before the object existed.
+ *
+ * Everything else that arrives through dlopen() -- the general-dynamic
+ * model, which is what a shared library is compiled for unless it asks
+ * otherwise -- goes through the DTV instead and takes nothing from here.
+ * That is the difference between this and what it replaced: the surplus
+ * used to be the ONLY route, so a single dlopen'd module with a few
+ * kilobytes of __thread data exhausted it for everyone and the loader had
+ * to refuse the object outright. */
 #define RTLD_TLS_SURPLUS 1024
+
+/* Per-thread dynamic thread vector.
+ *
+ * Slot 0 holds the slot count; slots 1..RTLD_DTV_SLOTS hold, for the thread
+ * that owns the vector, the address of that module's TLS block -- a slice of
+ * the static area for a module that has one, or a block allocated on first
+ * access for a module that does not.  It lives at the bottom of the thread's
+ * own TLS reservation (see rtld_init_tls), so it costs no separate
+ * allocation and is unmapped with the thread.
+ *
+ * The count bounds how many TLS-BEARING modules one process may have; ids
+ * are handed out only to objects that actually carry a PT_TLS segment, and
+ * they are never reused, so this is a lifetime total rather than a
+ * high-water mark.  An object that would exceed it falls back to the static
+ * surplus above and is refused only if that is exhausted too -- the failure
+ * this used to have at the first dlopen. */
+#define RTLD_DTV_SLOTS 64
+#define RTLD_DTV_BYTES ((uint64_t)(1 + RTLD_DTV_SLOTS) * 8)
 
 /* An X server loads its client libraries plus a driver module per device
  * and an extension module per protocol extension, so the object table has
@@ -377,6 +408,9 @@ typedef struct dso {
 	uint64_t tls_align;
 	int tls_modid;
 	int64_t tls_offset;
+	/* No slice of the static area: this module's blocks are allocated
+	 * per thread on first access and reached through the DTV. */
+	int tls_dynamic;
 	/* dlopen'd object whose TLS slice is still to be filled from the
 	 * (now relocated) image -- see rtld_assign_tls / rtld_dlopen. */
 	int tls_needs_init;
@@ -426,6 +460,11 @@ static uint64_t g_tls_static_align = 16;
 static int g_tls_initialised;   /* the block is laid out exactly once */
 static uint8_t *g_tls_tp;       /* thread pointer of the initial thread */
 static uint64_t g_tls_reserved; /* bytes below tp available for TLS */
+/* How far the static area may grow: everything below THAT and above the
+ * bottom of the reservation belongs to the DTV.  Separate from
+ * g_tls_reserved because that now covers both, and a late static object
+ * checked against the total would be handed space the vector is using. */
+static uint64_t g_tls_static_limit;
 static uint64_t g_page_size = 4096;
 
 static char g_dlerror_buf[256];
@@ -1047,11 +1086,60 @@ static void rtld_apply_relocs(dso_t *d, const Elf64_Rela *rel, size_t sz)
  * executable and every one of those accesses silently reads the wrong slice.
  * _dl_main() therefore calls this for main_dso before loading any DT_NEEDED
  * library; do not reorder it. */
+/* Does this object reach its own __thread data by a fixed offset from the
+ * thread pointer?  True when it carries an initial-exec relocation, which
+ * only a static slice can satisfy -- see RTLD_TLS_SURPLUS.  Called before
+ * relocation, on the tables rtld_parse_dynamic() has already found. */
+static int rtld_needs_static_tls(const dso_t *d)
+{
+	const Elf64_Rela *r;
+	uint64_t n;
+
+	if (d->rela && d->rela_size) {
+		r = d->rela;
+		n = d->rela_size / sizeof(*r);
+		for (uint64_t i = 0; i < n; i++)
+			if (ELF64_R_TYPE(r[i].r_info) == R_X86_64_TPOFF64)
+				return 1;
+	}
+	if (d->jmprel && d->jmprel_size) {
+		r = d->jmprel;
+		n = d->jmprel_size / sizeof(*r);
+		for (uint64_t i = 0; i < n; i++)
+			if (ELF64_R_TYPE(r[i].r_info) == R_X86_64_TPOFF64)
+				return 1;
+	}
+	return 0;
+}
+
+static dso_t *rtld_dso_by_modid(int modid)
+{
+	if (modid <= 0)
+		return NULL;
+	for (int i = 0; i < g_ndsos; i++)
+		if (g_dsos[i].tls_modid == modid && g_dsos[i].tls_memsz)
+			return &g_dsos[i];
+	return NULL;
+}
+
 static void rtld_assign_tls(dso_t *d)
 {
 	if (!d->tls_memsz)
 		return;
 	d->tls_modid = g_tls_next_modid++;
+
+	/* Arrived through dlopen, after every thread's block was sized.
+	 *
+	 * Unless it needs a fixed offset (initial-exec), give it no static
+	 * slice at all: its blocks are allocated per thread on first access
+	 * and found through the DTV, so its size is bounded by nothing here
+	 * and it competes with no other object. */
+	if (g_tls_initialised && !rtld_needs_static_tls(d) &&
+	    d->tls_modid <= RTLD_DTV_SLOTS) {
+		d->tls_dynamic = 1;
+		d->tls_offset = 0;
+		return;
+	}
 
 	/* Use the object's OWN p_align, never a rounded-up minimum.  For
 	 * local-exec accesses the static linker has already burned the offset
@@ -1075,7 +1163,7 @@ static void rtld_assign_tls(dso_t *d)
 	/* Objects loaded after the block was laid out (dlopen) can only be
 	 * given space that was already reserved as surplus — the block cannot
 	 * grow, because every thread already has one at a fixed size. */
-	if (g_tls_initialised && want > g_tls_reserved) {
+	if (g_tls_initialised && want > g_tls_static_limit) {
 		rtld_write_str("ld-likeos.so: ");
 		rtld_write_str(d->name ? d->name : "?");
 		rtld_write_str(": no static TLS space left for this object\n");
@@ -1100,6 +1188,35 @@ static void rtld_assign_tls(dso_t *d)
 	if (g_tls_initialised && g_tls_tp) {
 		rtld_memset(g_tls_tp + d->tls_offset, 0, d->tls_memsz);
 		d->tls_needs_init = 1;
+	}
+}
+
+/* This thread's DTV.  Lives at the bottom of the thread's own reservation;
+ * valid for any thread whose block was sized by _rtld_tls_size(). */
+static uint64_t *rtld_dtv(const uint8_t *tp)
+{
+	return (uint64_t *)(tp - g_tls_reserved);
+}
+
+/* Point every static module's slot at this thread's slice, and clear the
+ * rest.  A dynamic module's slot stays empty until the thread first asks
+ * for it (see __tls_get_addr), because most threads never touch most
+ * modules and an eager allocation would cost a block per thread per
+ * module for nothing. */
+static void rtld_dtv_init(uint8_t *tp)
+{
+	uint64_t *dtv = rtld_dtv(tp);
+
+	for (uint64_t i = 0; i <= RTLD_DTV_SLOTS; i++)
+		dtv[i] = 0;
+	dtv[0] = RTLD_DTV_SLOTS;
+	for (int i = 0; i < g_ndsos; i++) {
+		dso_t *d = &g_dsos[i];
+
+		if (!d->tls_memsz || d->tls_dynamic)
+			continue;
+		if (d->tls_modid > 0 && d->tls_modid <= RTLD_DTV_SLOTS)
+			dtv[d->tls_modid] = (uint64_t)(tp + d->tls_offset);
 	}
 }
 
@@ -1130,6 +1247,15 @@ static void rtld_init_tls(void)
 	uint64_t reserved = stat_sz + RTLD_TLS_SURPLUS;
 	reserved = (reserved + g_tls_static_align - 1) &
 		   ~(g_tls_static_align - 1);
+	/* The DTV goes UNDERNEATH the static area, at the bottom of the
+	 * reservation: static offsets are negative from the thread pointer
+	 * and must keep the addresses they were resolved to, so nothing may
+	 * be inserted between them and tp.  Every thread's block is sized
+	 * through _rtld_tls_size(), so every thread gets one. */
+	g_tls_static_limit = reserved;
+	reserved += RTLD_DTV_BYTES;
+	reserved = (reserved + g_tls_static_align - 1) &
+		   ~(g_tls_static_align - 1);
 	uint64_t total = reserved + RTLD_TCB_RESERVE;
 
 	void *blk = rtld_mmap(NULL, total + g_page_size, PROT_READ | PROT_WRITE,
@@ -1144,6 +1270,7 @@ static void rtld_init_tls(void)
 	g_tls_reserved = reserved;
 	g_tls_tp = tp;
 	g_tls_initialised = 1;
+	rtld_dtv_init(tp);
 
 	for (int i = 0; i < g_ndsos; i++) {
 		dso_t *d = &g_dsos[i];
@@ -1171,26 +1298,105 @@ void *__tls_get_addr(tls_index_t *ti)
 {
 	uint64_t tp;
 	__asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
-	for (int i = 0; i < g_ndsos; i++)
-		if (g_dsos[i].tls_modid == (int)ti->ti_module)
-			return (void *)(tp + g_dsos[i].tls_offset +
-					ti->ti_offset);
 
-	/* No module with that id.  Returning NULL here is the worst possible
-	 * answer: the caller has asked "where is this thread's copy of that
-	 * variable", and a null address is not a diagnosis, it is a booby
-	 * trap.  The read or write lands at a low address and the failure
-	 * surfaces somewhere else entirely -- and when the variable happens to
-	 * hold a function pointer, as libstdc++'s std::__once_call does, the
-	 * program does not fault on the access at all: it reads a zero and
-	 * jumps to it, arriving at RIP=0 with nothing on the stack to say
-	 * which variable was never allocated.
-	 *
-	 * Say what happened instead.  There is no correct value to return, so
-	 * this does not return. */
-	rtld_write_str("ld-likeos.so: __tls_get_addr: no TLS block for "
-		       "module id\n");
-	rtld_die("unallocated TLS module");
+	/* Fast path: the thread already has a block for this module.  Two
+	 * loads and an add -- this is on the path of every general-dynamic
+	 * __thread access in the process, so it stays free of locks, calls
+	 * and searches. */
+	uint64_t m = ti->ti_module;
+	uint64_t *dtv = rtld_dtv((const uint8_t *)tp);
+
+	if (m >= 1 && m <= RTLD_DTV_SLOTS && dtv[m])
+		return (void *)(dtv[m] + ti->ti_offset);
+
+	/* Slow path: first use of this module by this thread. */
+	dso_t *d = rtld_dso_by_modid((int)m);
+
+	if (!d) {
+		/* No module with that id.  Returning NULL here is the worst
+		 * possible answer: the caller has asked "where is this
+		 * thread's copy of that variable", and a null address is not
+		 * a diagnosis, it is a booby trap.  The read or write lands
+		 * at a low address and the failure surfaces somewhere else
+		 * entirely -- and when the variable happens to hold a
+		 * function pointer, as libstdc++'s std::__once_call does, the
+		 * program does not fault on the access at all: it reads a
+		 * zero and jumps to it, arriving at RIP=0 with nothing on the
+		 * stack to say which variable was never allocated.
+		 *
+		 * Say what happened instead.  There is no correct value to
+		 * return, so this does not return. */
+		rtld_write_str("ld-likeos.so: __tls_get_addr: no TLS block for "
+			       "module id\n");
+		rtld_die("unallocated TLS module");
+	}
+
+	uint64_t base;
+
+	if (!d->tls_dynamic) {
+		/* Has a slice of the static area: its address is fixed for
+		 * the life of the thread and needs no allocation.  Reached
+		 * here only the first time, or for a module whose id is past
+		 * the vector. */
+		base = tp + (uint64_t)d->tls_offset;
+	} else {
+		/* Give this thread its own copy.  Mapped rather than carved
+		 * out of the thread's block: the block was sized before this
+		 * module existed, which is the whole reason this path is
+		 * here.  A page is the smallest thing that can be mapped, so
+		 * a module with a few bytes of __thread data costs one --
+		 * paid once per thread that actually touches it. */
+		uint64_t len = (d->tls_memsz + g_page_size - 1) &
+			       ~(g_page_size - 1);
+		void *blk = rtld_mmap(NULL, len, PROT_READ | PROT_WRITE,
+				      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		if (blk == MAP_FAILED) {
+			rtld_write_str("ld-likeos.so: __tls_get_addr: out of "
+				       "memory for a thread's TLS block\n");
+			rtld_die("TLS allocation failed");
+		}
+		/* Anonymous pages are already zero, which is .tbss; the
+		 * initialised part is copied over it. */
+		if (d->tls_filesz && d->tls_image)
+			rtld_memcpy(blk, (const void *)d->tls_image,
+				    d->tls_filesz);
+		base = (uint64_t)blk;
+	}
+
+	if (m >= 1 && m <= RTLD_DTV_SLOTS)
+		dtv[m] = base;
+	return (void *)(base + ti->ti_offset);
+}
+
+/* Release what this thread's DTV allocated.  Called by the C library from
+ * the one place both an exiting detached thread and an exiting joinable one
+ * pass through, while the thread still has a stack to run on.
+ *
+ * Only the mapped blocks: a static module's slot points into the thread's
+ * own allocation, which goes away with it. */
+void _rtld_tls_free(void *tp) __attribute__((visibility("default")));
+void _rtld_tls_free(void *tp)
+{
+	if (!tp || !g_tls_initialised)
+		return;
+
+	uint64_t *dtv = rtld_dtv((const uint8_t *)tp);
+
+	if (dtv[0] != RTLD_DTV_SLOTS)
+		return; /* never initialised for this thread */
+	for (uint64_t m = 1; m <= RTLD_DTV_SLOTS; m++) {
+		if (!dtv[m])
+			continue;
+		dso_t *d = rtld_dso_by_modid((int)m);
+
+		if (d && d->tls_dynamic) {
+			uint64_t len = (d->tls_memsz + g_page_size - 1) &
+				       ~(g_page_size - 1);
+			rtld_munmap((void *)dtv[m], len);
+		}
+		dtv[m] = 0;
+	}
 }
 
 /* ================================================================== */
@@ -1849,7 +2055,9 @@ void _rtld_tls_init(void *tp)
 		return;
 	for (int i = 0; i < g_ndsos; i++) {
 		dso_t *d = &g_dsos[i];
-		if (!d->tls_memsz || !d->tls_offset)
+		/* A dynamic module has no slice here; its block is made when
+		 * this thread first reaches for it. */
+		if (!d->tls_memsz || d->tls_dynamic || !d->tls_offset)
 			continue;
 		uint8_t *dst = t + d->tls_offset;
 		rtld_memset(dst, 0, d->tls_memsz);
@@ -1857,6 +2065,8 @@ void _rtld_tls_init(void *tp)
 			rtld_memcpy(dst, (const void *)d->tls_image,
 				    d->tls_filesz);
 	}
+	/* The vector itself, at the bottom of the same reservation. */
+	rtld_dtv_init(t);
 }
 
 /* The body of dlopen, with the loader lock already held.  Split out rather
@@ -1926,7 +2136,8 @@ static void *rtld_dlopen_locked(const char *filename, int flags)
 			if (!d->tls_needs_init)
 				continue;
 			d->tls_needs_init = 0;
-			if (d->tls_memsz && d->tls_filesz && d->tls_image)
+			if (d->tls_memsz && d->tls_filesz && d->tls_image &&
+			    !d->tls_dynamic)
 				rtld_memcpy(g_tls_tp + d->tls_offset,
 					    (const void *)d->tls_image,
 					    d->tls_filesz);

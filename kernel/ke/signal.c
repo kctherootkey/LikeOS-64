@@ -18,6 +18,27 @@
  * signal frame is placed below it.  Rationale with the frame builders. */
 #define SIGFRAME_REDZONE 128
 
+/* Serialises every task's queued-siginfo list.
+ *
+ * The pending BITMASK is handled without a lock, by the atomic operations in
+ * signal.h.  The queued descriptions cannot be: they are a linked list, and a
+ * sender pushing a node while the owning task unlinks one either loses the
+ * push or leaves the pushed node pointing at memory that was just freed.
+ *
+ * One lock for all tasks rather than one per task, deliberately.  The
+ * critical sections are a list push and a walk over at most one node per
+ * signal number, so there is nothing to contend for; and a per-task lock
+ * lives in the task, which is exactly what a previous per-task lock here got
+ * wrong -- a lock in memory that had been freed under a second owner left the
+ * next sender spinning forever with interrupts disabled, which presents as a
+ * machine that simply stopped.  A file-static lock cannot be freed.
+ *
+ * It is a LEAF lock: nothing is called while it is held.  In particular the
+ * allocation happens before it and kfree() after it, because kfree() can
+ * raise a TLB shootdown IPI and that must not happen with interrupts off.
+ */
+static spinlock_t g_sigqueue_lock = SPINLOCK_INIT("sigqueue");
+
 // The old global syscall_signal_pending is deprecated.
 
 /* The interrupted context's extended register state travels in the signal
@@ -355,13 +376,22 @@ void signal_cleanup_task(task_t *task)
 	task_signal_state_t *sig = &task->signals;
 
 	// Free pending signal queue
-	pending_signal_t *ps = sig->pending_queue;
+	uint64_t flags;
+	pending_signal_t *ps;
+
+	/* Unhook the whole list under the lock, then free it outside: a sender
+	 * that raced this far is pushing onto the same head. */
+	spin_lock_irqsave(&g_sigqueue_lock, &flags);
+	ps = sig->pending_queue;
+	sig->pending_queue = NULL;
+	spin_unlock_irqrestore(&g_sigqueue_lock, flags);
+
 	while (ps) {
 		pending_signal_t *next = ps->next;
+
 		kfree(ps);
 		ps = next;
 	}
-	sig->pending_queue = NULL;
 
 	// Clear any POSIX timers owned by this task
 	for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
@@ -393,22 +423,36 @@ static void signal_flush_pending_mask(task_signal_state_t *sig,
 				      const kernel_sigset_t *mask)
 {
 	pending_signal_t **pp;
+	pending_signal_t *dead = NULL;
+	uint64_t flags;
 
 	for (int s = 1; s < NSIG; s++) {
 		if (sigismember_k(mask, s))
-			sigdelset_k(&sig->pending, s);
+			sigdelset_k_atomic(&sig->pending, s);
 	}
 
+	spin_lock_irqsave(&g_sigqueue_lock, &flags);
 	pp = &sig->pending_queue;
 	while (*pp) {
 		pending_signal_t *ps = *pp;
 
 		if (sigismember_k(mask, ps->sig)) {
 			*pp = ps->next;
-			kfree(ps);
+			ps->next = dead;
+			dead = ps;
 			continue;
 		}
 		pp = &ps->next;
+	}
+	spin_unlock_irqrestore(&g_sigqueue_lock, flags);
+
+	/* Released only after the lock and the interrupt flag are given back:
+	 * kfree() can raise a TLB shootdown IPI. */
+	while (dead) {
+		pending_signal_t *next = dead->next;
+
+		kfree(dead);
+		dead = next;
 	}
 }
 
@@ -529,11 +573,14 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 	}
 
 	/* Whether this signal was ALREADY pending decides, below, if a second
-	 * description of it is worth keeping -- so read it before setting. */
-	int was_pending = sigismember_k(&sigstate->pending, sig);
-
-	// Add to pending mask
-	sigaddset_k(&sigstate->pending, sig);
+	 * description of it is worth keeping -- so read it before setting, and
+	 * do both in ONE operation.  The task itself may be clearing the bit
+	 * for a signal it is delivering on another CPU at this instant; read
+	 * and set as separate steps and whichever store lands second wipes the
+	 * other out.  Losing the clear is the worse of the two: the signal
+	 * stays pending after it was delivered, and its handler runs a second
+	 * time for this one send. */
+	int was_pending = sigaddset_k_atomic(&sigstate->pending, sig);
 
 	/* Keep the description, not just the number.
 	 *
@@ -577,11 +624,20 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 
 	if (keep_info) {
 		pending_signal_t *ps = alloc_pending_signal();
+
 		if (ps) {
+			uint64_t flags;
+
+			/* Filled in before the lock is taken: kalloc() may
+			 * sleep, and nothing may sleep holding a spinlock.
+			 * Only the link itself has to be serialised. */
 			ps->sig = sig;
 			mm_memcpy(&ps->info, info, sizeof(siginfo_t));
+
+			spin_lock_irqsave(&g_sigqueue_lock, &flags);
 			ps->next = sigstate->pending_queue;
 			sigstate->pending_queue = ps;
+			spin_unlock_irqrestore(&g_sigqueue_lock, flags);
 		}
 	}
 
@@ -715,23 +771,35 @@ int signal_dequeue_wanted(task_t *task, const kernel_sigset_t *want,
 		if (!sigismember_k(want, s) || !sigismember_k(&sig->pending, s))
 			continue;
 
-		sigdelset_k(&sig->pending, s);
+		/* Claim it.  The clear reports whether the bit was still set,
+		 * so the test above and the take here cannot both succeed for
+		 * one send when a sender is touching the same word. */
+		if (!sigdelset_k_atomic(&sig->pending, s))
+			continue;
 		if (info) {
-			pending_signal_t **pp = &sig->pending_queue;
+			pending_signal_t *ps = NULL;
+			pending_signal_t **pp;
+			uint64_t flags;
 
 			mm_memset(info, 0, sizeof(*info));
 			info->si_signo = s;
 			info->si_code = SI_USER;
+
+			spin_lock_irqsave(&g_sigqueue_lock, &flags);
+			pp = &sig->pending_queue;
 			while (*pp) {
 				if ((*pp)->sig == s) {
-					pending_signal_t *ps = *pp;
+					ps = *pp;
 					*pp = ps->next;
-					mm_memcpy(info, &ps->info,
-						  sizeof(siginfo_t));
-					kfree(ps);
 					break;
 				}
 				pp = &(*pp)->next;
+			}
+			spin_unlock_irqrestore(&g_sigqueue_lock, flags);
+
+			if (ps) {
+				mm_memcpy(info, &ps->info, sizeof(siginfo_t));
+				kfree(ps);
 			}
 		}
 		return s;
@@ -781,26 +849,38 @@ int signal_dequeue(task_t *task, kernel_sigset_t *mask, siginfo_t *info)
 				continue;
 			}
 
-			// Remove from pending
-			sigdelset_k(&sig->pending, signum);
+			/* Remove from pending, and take it only if the bit
+			 * was still ours to take: a sender on another CPU
+			 * shares this word. */
+			if (!sigdelset_k_atomic(&sig->pending, signum))
+				continue;
 
 			// Find and remove from queue if present
 			if (info) {
+				pending_signal_t *ps = NULL;
+				pending_signal_t **pp;
+				uint64_t flags;
+
 				mm_memset(info, 0, sizeof(*info));
 				info->si_signo = signum;
 				info->si_code = SI_USER;
 
-				pending_signal_t **pp = &sig->pending_queue;
+				spin_lock_irqsave(&g_sigqueue_lock, &flags);
+				pp = &sig->pending_queue;
 				while (*pp) {
 					if ((*pp)->sig == signum) {
-						pending_signal_t *ps = *pp;
+						ps = *pp;
 						*pp = ps->next;
-						mm_memcpy(info, &ps->info,
-							  sizeof(siginfo_t));
-						kfree(ps);
 						break;
 					}
 					pp = &(*pp)->next;
+				}
+				spin_unlock_irqrestore(&g_sigqueue_lock, flags);
+
+				if (ps) {
+					mm_memcpy(info, &ps->info,
+						  sizeof(siginfo_t));
+					kfree(ps);
 				}
 			}
 
