@@ -1,19 +1,18 @@
 -- luakit's user configuration for this image.
 --
 -- The one setting worth reading before anything else is the
--- hardware-acceleration policy further down: it is OFF, deliberately, even
--- where the kernel bound a GPU -- because on the GTK3 API line the
--- "accelerated" path ends in a per-frame CPU map that costs more than it
--- saves.  The reasoning is written out there.
+-- hardware-acceleration policy further down: it is chosen at startup from
+-- whether this machine has a GPU the kernel could bind, so the same image is
+-- correct on a machine with one and on a machine without.
 
 local settings = require "settings"
 
 -- Where a new window starts and how big it opens.  luakit's own defaults are
 -- its project page and 800x600; this image opens on the LikeOS site at
--- 1024x768, which fits the 1280x800 and larger framebuffers the port runs on
--- with the window manager's bar still visible.
+-- 1280x1024, which fits the 1280x1024 and larger framebuffers the port runs
+-- on with the window manager's bar still visible.
 settings.window.home_page = "https://likeos.systemtrap.com"
-settings.window.new_window_size = "1024x768"
+settings.window.new_window_size = "1280x1024"
 
 -- WebGL: ON.  luakit ships it off (webview.enable_webgl defaults to false in
 -- lib/webview.lua), so a page asking for a WebGL context is refused before
@@ -24,36 +23,45 @@ settings.window.new_window_size = "1024x768"
 -- available through domain_props if a page's shaders are too slow.
 settings.webview.enable_webgl = true
 
--- Hardware acceleration: OFF, on every machine, GPU or not.
+-- Hardware acceleration: DECIDED BY THE MACHINE, at startup.
 --
--- WebKitGTK has two real rendering modes for this toolkit: "always" runs
--- every page through the accelerated compositor, "never" paints with cairo.
--- ("on-demand" is accepted and treated as "always".)  This used to be chosen
--- at startup from whether /dev/dri/card0 existed.  It is now "never" either
--- way, and the reason is specific to the GTK3 API line.
+-- WebKitGTK has two real rendering modes for this toolkit: "always" runs every
+-- page through the accelerated compositor, "never" paints with cairo.
+-- ("on-demand" is accepted and treated as "always".)  With a GPU the
+-- compositor is what WebGL, the accelerated 2D canvas and the GPU process all
+-- need; without one, GL is llvmpipe and the compositor becomes several
+-- full-screen CPU passes per scroll step where cairo needs one, which is what
+-- made freebsd.org unscrollable.
 --
--- With the compositor on, the accelerated path is NOT "render on the GPU and
--- show it".  It is: the web process renders the tile with the GPU, hands it
--- over as a dma-buf descriptor, and then the UI process CPU-MAPS that buffer
--- and composites from the mapped bytes with cairo.  The map is a full
--- processor/device synchronisation once per frame -- measured at ~6.8ms of
--- every maximized frame on faz.net, more than the whole kernel driver costs.
+-- Measured, so that it is not re-discovered from scratch: on the GTK3 API line
+-- the accelerated path does NOT end on the GPU.  WebKit hands the compositor's
+-- buffer straight to the toolkit only when its EGL display is the one GTK
+-- already uses, and GTK 3.24's X11 backend is GLX-only, so that is never true
+-- here -- the UI process CPU-maps the tile every frame and composites it with
+-- cairo anyway.  webkit://gpu reports exactly that: "Native interface: None",
+-- "Usage: Mapping".  The map is a processor/device synchronisation once a
+-- frame, ~6.8ms of every maximized frame, and turning the compositor off
+-- removes it.  "never" was the default here for a while for that reason.
 --
--- WebKit only skips the map when its EGL display is the one GTK already
--- uses, and on GTK3 under X11 that is never true: the sharing path is
--- compiled only for GTK4, and GTK 3.24's X11 backend is GLX-only, so there
--- is no EGL display to share.  webkit://gpu says so directly --
--- "Native interface: None", "Usage: Mapping".  No setting changes it.
+-- It is back on because the rest of the engine assumes it.  With it off,
+-- WebKit's non-composited paths -- which upstream barely exercises -- stop
+-- acting on wheel events, and crashed the web process on a null
+-- overflow-controls host layer in RenderLayerCompositor.  Scrolling does not
+-- depend on the choice any more: the wheel is bound below and never reaches
+-- the engine either way.
 --
--- So the comparison is "GPU render + device round trip + CPU map + cairo
--- composite" against plain "cairo", and plain cairo is the shorter path.
--- res/xorg/xinitrc sets WEBKIT_FORCE_COMPOSITING_MODE=0 to match; the two
--- have to stay in step.
---
--- Reverse both the day WebKit is built against GTK4 (webkit2gtk-6.0): the
--- display is shared there, the map disappears, and the accelerated path
--- becomes the shorter one for real.
+-- To trade those two back for the frame rate, set this to "never" AND set
+-- WEBKIT_FORCE_COMPOSITING_MODE=0 in res/xorg/xinitrc -- the two have to stay
+-- in step.  The real fix is WebKit on GTK4 (webkit2gtk-6.0), where the display
+-- is shared, the map disappears and this becomes right for nothing.
 local acceleration = "never"
+do
+    local node = io.open("/dev/dri/card0", "r")
+    if node then
+        node:close()
+        acceleration = "always"
+    end
+end
 settings.webview.hardware_acceleration_policy = acceleration
 if acceleration == "never" then
     -- WebGL needs the compositor, so the pages that are only about WebGL get
