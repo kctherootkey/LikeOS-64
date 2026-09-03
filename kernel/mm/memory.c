@@ -2362,12 +2362,26 @@ bool mm_regions_init(task_t *task)
 /* A region record's references: its backing file, and -- for a mapping of
  * a driver object -- the object itself.  Every record holds its own, so a
  * split takes one more and a merge or release drops one. */
+/* Tell a driver's dirty tracker that a record which can write its object
+ * came or went.  Only writable records count -- see mm_dirty_ops.map_census.
+ * Separate from the get/put above because those are the object's REFERENCE
+ * count, which a read-only mapping owes just like any other. */
+void mm_region_census(const mmap_region_t *r, int add)
+{
+	if (!r->dev_obj || !r->dev_dirty || !r->dev_dirty->map_census)
+		return;
+	if (!(r->prot & PROT_WRITE))
+		return;
+	r->dev_dirty->map_census(r->dev_obj, add);
+}
+
 void mm_region_ref_hold(mmap_region_t *r)
 {
 	if (r->file)
 		vfs_incref(r->file);
 	if (r->dev_obj && r->dev_get)
 		r->dev_get(r->dev_obj);
+	mm_region_census(r, 1);
 }
 
 void mm_region_ref_drop(mmap_region_t *r)
@@ -2376,6 +2390,8 @@ void mm_region_ref_drop(mmap_region_t *r)
 		vfs_close(r->file);
 		r->file = NULL;
 	}
+	/* Before the object pointer goes: the census names it. */
+	mm_region_census(r, 0);
 	if (r->dev_obj && r->dev_put)
 		r->dev_put(r->dev_obj);
 	r->dev_obj = NULL;
@@ -2693,6 +2709,16 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 	 * halves are showing different parts of it. */
 	if (a->file && a->offset + a->length != b->offset)
 		return false;
+	/* A device mapping's offset is read the same way -- the dirty tracker
+	 * turns a faulting address into a page of the object with
+	 * `offset + (va - start)'.  Two records that abut in virtual space
+	 * but not in the object would, once merged, hand the tracker the
+	 * wrong page for every address in the second half: writes recorded
+	 * against pages nobody touched, and the pages actually written left
+	 * stale.  Physical contiguity is already required above but does not
+	 * imply this, since the two are independent fields. */
+	if (a->device && a->offset + a->length != b->offset)
+		return false;
 	return true;
 }
 
@@ -2976,6 +3002,54 @@ void mm_dontneed_range(task_t *task, uint64_t addr, uint64_t length)
 	mm_tlb_gather_flush(&gather);
 }
 
+/* Hand the tracker every page a record's entries say was written, before
+ * those entries are discarded.
+ *
+ * For a swept mapping the processor's dirty bit in the page-table entry is
+ * the ONLY record that a write happened, so an entry thrown away while it is
+ * set takes the write with it: the pages still hold the data and nothing is
+ * left to tell the device its copy is behind.  Both paths that discard a
+ * device mapping's entries call this first -- munmap, and the address-space
+ * teardown every exiting process runs.
+ *
+ * [from, to) is a virtual range inside the record.  Cheap for everything
+ * else: a record that watches nothing returns at the first test. */
+void mm_region_harvest_dirty(uint64_t *pml4, const mmap_region_t *r,
+			     uint64_t from, uint64_t to)
+{
+	if (!pml4 || !r->device || !r->dev_dirty || !r->dev_dirty->page_dirty ||
+	    !r->dev_obj)
+		return;
+	for (uint64_t va = from; va < to; va += PAGE_SIZE) {
+		uint64_t *pte = mm_get_page_table_from_pml4(pml4, va, false);
+
+		if (pte && (*pte & PAGE_PRESENT) && (*pte & PAGE_DEVICE) &&
+		    (*pte & PAGE_DIRTY))
+			r->dev_dirty->page_dirty(r->dev_obj,
+						 r->offset + (va - r->start));
+	}
+}
+
+/* Every device record of an address space about to be destroyed.
+ *
+ * The teardown frees the page tables wholesale rather than unmapping range by
+ * range, so nothing else on that path harvests -- and a process that dies
+ * having just painted into a buffer another process still displays would take
+ * those writes with it.  Runs while the tables and the record table are both
+ * still alive, which is what makes it the last possible moment. */
+void mm_regions_harvest_dirty(task_t *task, uint64_t *pml4)
+{
+	if (!task || !task->mmap_regions || !pml4)
+		return;
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
+		mmap_region_t *r = &task->mmap_regions[i];
+
+		if (r->in_use)
+			mm_region_harvest_dirty(pml4, r, r->start,
+						r->start + r->length);
+	}
+}
+
 int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 {
 	uint64_t cur_addr = addr;
@@ -3007,25 +3081,9 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 		/* A watched device mapping: the entries about to be cleared
 		 * carry the only record of what the processor wrote through
 		 * them, so each written page is handed to the tracker before
-		 * the record goes.  Without this, write-then-unmap loses the
-		 * write: the pages still hold the data, but nothing is left
-		 * to say the device's copy is behind. */
-		if (region->device && region->dev_dirty &&
-		    region->dev_dirty->page_dirty && region->dev_obj) {
-			for (uint64_t va = cur_addr; va < unmap_end;
-			     va += PAGE_SIZE) {
-				uint64_t *pte = mm_get_page_table_from_pml4(
-					task->pml4, va, false);
-
-				if (pte && (*pte & PAGE_PRESENT) &&
-				    (*pte & PAGE_DEVICE) &&
-				    (*pte & PAGE_DIRTY))
-					region->dev_dirty->page_dirty(
-						region->dev_obj,
-						region->offset +
-							(va - region->start));
-			}
-		}
+		 * the record goes. */
+		mm_region_harvest_dirty(task->pml4, region, cur_addr,
+					unmap_end);
 
 		/* Clear the entries within [cur_addr, unmap_end).  The pages
 		 * are not released yet -- the gather holds them until every
@@ -4913,20 +4971,43 @@ static int mm_dirty_walk_mappings(struct mm_dirty_walk *w, bool clean)
 	 * walked -- taking another task's address-space lock from inside a
 	 * submission is an ordering nothing else in this kernel does. */
 	mm_read_lock(&mm->mmap_lock);
-	for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
-		mmap_region_t *r = &mm->mmap_regions[i];
+	/* To the high-water mark, not the capacity.  The table only ever
+	 * grows, so a process that once had thousands of mappings keeps the
+	 * slots after it drops to dozens -- and this walk runs once or twice
+	 * per coherent surface per submission.  Nothing above the mark has
+	 * ever been in use; see where mmap_hwm is declared. */
+	uint32_t nregions = mm->mmap_hwm;
 
-		if (!r->in_use || !r->device || r->dev_obj != w->obj ||
-		    r->dev_dirty != w->ops)
+	if (nregions > mm->mmap_capacity)
+		nregions = mm->mmap_capacity;
+	for (uint32_t i = 0; i < nregions; i++) {
+		mmap_region_t *r = &mm->mmap_regions[i];
+		uint64_t base;
+
+		if (!r->in_use || !r->device || r->dev_obj != w->obj)
+			continue;
+		/* Which flavour of record this is decides where its offsets
+		 * start; a record of neither flavour is not one of ours. */
+		if (r->dev_dirty == w->ops)
+			base = w->file_base;
+		else if (w->ops_alt && r->dev_dirty == w->ops_alt)
+			base = w->file_base_alt;
+		else
+			continue;
+		/* Read-only records are not in the census and have no write
+		 * bit to take or dirty bit to find, so they are not walked
+		 * either: `matched' must count the same population the
+		 * census does or the comparison is meaningless. */
+		if (!(r->prot & PROT_WRITE))
 			continue;
 		w->matched++;
-		if (r->offset < w->file_base)
+		if (r->offset < base)
 			continue; /* not a record of this object's pages */
 
 		/* The record's pages within the object, clipped to the
 		 * caller's window.  offset = base + delta survives splits,
 		 * so this holds for any surviving fragment. */
-		uint64_t rp0 = (r->offset - w->file_base) / PAGE_SIZE;
+		uint64_t rp0 = (r->offset - base) / PAGE_SIZE;
 		uint64_t rp1 = rp0 + r->length / PAGE_SIZE;
 
 		if (rp1 > w->npages)
@@ -4996,19 +5077,26 @@ int mm_dirty_clean_mappings(struct mm_dirty_walk *w)
 static bool mm_dirty_mkwrite_locked(uint64_t va, uint64_t *pte)
 {
 	task_t *mm = task_mm_owner(sched_current());
-	mmap_region_t *r = NULL;
+	mmap_region_t *r;
 
 	if (!mm || !mm->mmap_regions)
 		return false;
-	for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
-		mmap_region_t *c = &mm->mmap_regions[i];
-
-		if (c->in_use && va >= c->start &&
-		    va < c->start + c->length) {
-			r = c;
-			break;
-		}
-	}
+	/* Through the hinted lookup, not a scan of the whole capacity.
+	 *
+	 * This runs ONCE PER PAGE, PER FRAME: a fault-tracked surface hands
+	 * the write bit back one page at a time, so a full-screen repaint
+	 * arrives here once for every page of the surface -- about 2250 of
+	 * them at 1920x1200, sixty times a second.  Walking the region table
+	 * for each meant a browser's several thousand mappings re-read on
+	 * every one, which is hundreds of millions of struct probes a second
+	 * spent inside the fault handler.  That does not merely slow the
+	 * painting down: it is kernel time, so everything else on the machine
+	 * waits for it -- which is what made the pointer itself lag.
+	 *
+	 * mm_find_mmap_region() answers from the previous slot when the
+	 * faults run through one mapping, which is exactly what a rasteriser
+	 * walking a surface does. */
+	r = mm_find_mmap_region(mm, va);
 	if (!r || !r->device)
 		return false;
 	/* The tracked bit only ever withholds write from a mapping that HAS

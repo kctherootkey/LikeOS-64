@@ -96,8 +96,14 @@ static size_t surf_image_bytes(const SVGA3dSurfaceDesc *desc,
 	if (surf_is_planar(desc))
 		return (size_t)bl.width * bl.height * bl.depth *
 		       desc->bytesPerBlock;
+	/* pitchBytesPerBlock for the row pitch, which is what the reference's
+	 * image-size helper uses and what sizes the backing buffer.  Using the
+	 * block's STORAGE size here instead made this disagree with
+	 * vmw_surface_size() for any format where the two differ, so the mip
+	 * chain the tracker walked was laid out differently from the buffer
+	 * the device was given. */
 	return (size_t)bl.height * bl.depth *
-	       ((size_t)bl.width * desc->bytesPerBlock);
+	       ((size_t)bl.width * desc->pitchBytesPerBlock);
 }
 
 /* Build the layout, refusing shapes whose strides come out empty; the
@@ -239,6 +245,51 @@ struct vmw_surface_dirty {
  * rows dirties the rows in full, one crossing slices dirties them in
  * full: the range is sequential backing bytes, so whatever the x of its
  * endpoints, everything between the crossed boundaries was inside it. */
+/* Grow one axis of a box so it covers what it covered before AND [start, end).
+ *
+ * Written as an explicit union, which is a DELIBERATE departure from the
+ * reference and the only one in this file.  The reference moves the origin
+ * down to meet a new range but only recomputes the extent when that range
+ * reaches PAST the old far edge:
+ *
+ *	box_c2 = box->x + box->w;
+ *	if (box->w == 0 || box->x > loc_start->x)
+ *		box->x = loc_start->x;
+ *	if (box_c2 < loc_end->x)
+ *		box->w = loc_end->x - box->x;
+ *
+ * When the origin moves left and the new range ends before the old far edge,
+ * the extent is left alone -- so the far edge moves left with the origin and
+ * the box comes out SMALLER than it was.  Area that was already recorded as
+ * dirty is silently dropped, and the device is never told about it.
+ *
+ * It is reachable in ordinary use.  Page runs are handed over in increasing
+ * order, so a run that lies entirely inside one row extends the box along x;
+ * the next run, on a later row, can start at a smaller x.  Adding a box of
+ * x=[305,817) and then one of x=[100,200) leaves x=100 w=512, which covers
+ * [100,612) -- everything from 612 to 817 has been forgotten.  The same
+ * applies to the y and z arms.
+ *
+ * A union is never smaller than either input, so this can only ever report
+ * more than the reference, never less. */
+static void surf_box_axis_union(uint32_t *origin, uint32_t *extent,
+				uint32_t start, uint32_t end)
+{
+	uint32_t far;
+
+	if (*extent == 0) {
+		*origin = start;
+		*extent = end - start;
+		return;
+	}
+	far = *origin + *extent;
+	if (start < *origin)
+		*origin = start;
+	if (end > far)
+		far = end;
+	*extent = far - *origin;
+}
+
 static void surf_subres_dirty_add(struct vmw_surface_dirty *dirty,
 				  const struct vmw_surf_loc *loc_start,
 				  const struct vmw_surf_loc *loc_end)
@@ -247,35 +298,26 @@ static void surf_subres_dirty_add(struct vmw_surface_dirty *dirty,
 	SVGA3dBox *box;
 	uint32_t level = loc_start->sub_resource % l->num_mip_levels;
 	const SVGA3dSize *size = &l->mip[level].size;
-	uint32_t box_c2;
 
 	if (loc_start->sub_resource >= dirty->num_subres)
 		return;
 	box = &dirty->boxes[loc_start->sub_resource];
-	box_c2 = box->z + box->d;
-	if (box->d == 0 || box->z > loc_start->z)
-		box->z = loc_start->z;
-	if (box_c2 < loc_end->z)
-		box->d = loc_end->z - box->z;
+	surf_box_axis_union(&box->z, &box->d, loc_start->z, loc_end->z);
 
 	if (loc_start->z + 1 == loc_end->z) {
-		box_c2 = box->y + box->h;
-		if (box->h == 0 || box->y > loc_start->y)
-			box->y = loc_start->y;
-		if (box_c2 < loc_end->y)
-			box->h = loc_end->y - box->y;
+		surf_box_axis_union(&box->y, &box->h, loc_start->y,
+				    loc_end->y);
 
 		if (loc_start->y + 1 == loc_end->y) {
-			box_c2 = box->x + box->w;
-			if (box->w == 0 || box->x > loc_start->x)
-				box->x = loc_start->x;
-			if (box_c2 < loc_end->x)
-				box->w = loc_end->x - box->x;
+			surf_box_axis_union(&box->x, &box->w, loc_start->x,
+					    loc_end->x);
 		} else {
+			/* More than one row: every column of them is in. */
 			box->x = 0;
 			box->w = size->width;
 		}
 	} else {
+		/* More than one slice: all of every row of them is in. */
 		box->y = 0;
 		box->h = size->height;
 		box->x = 0;
@@ -345,18 +387,29 @@ static void surf_buf_dirty_range_add(struct vmw_surface_dirty *dirty,
 	const struct vmw_surf_layout *l = &dirty->layout;
 	size_t backup_end = l->mip_chain_bytes;
 	SVGA3dBox *box = &dirty->boxes[0];
-	uint32_t box_c2;
 
 	if (start >= backup_end)
 		return;
 	if (end > backup_end)
 		end = backup_end;
+	if (end > 0xffffffffu)		/* a box extent is 32 bits */
+		end = 0xffffffffu;
+	if (start >= end)
+		return;
 	box->h = box->d = 1;
-	box_c2 = box->x + box->w;
-	if (box->w == 0 || box->x > start)
-		box->x = start;
-	if (box_c2 < end)
-		box->w = end - box->x;
+	/* The same union the texture path takes.  Folding the range in by
+	 * hand here got it wrong: it pulled the origin left without adding
+	 * the distance to the extent, so the box slid off its own right edge
+	 * and the bytes it used to cover stopped being re-read.  A client
+	 * filling a buffer back to front lost nearly all of it.
+	 *
+	 * What that looks like on screen is worth naming, because it does
+	 * not look like the other dirty-tracking faults: the bytes of a
+	 * VERTEX buffer are coordinates, so stale ones do not leave a stale
+	 * rectangle behind, they draw a triangle to the wrong shape -- a
+	 * flat-filled area with a diagonal edge, in the middle of a page
+	 * that is otherwise correct. */
+	surf_box_axis_union(&box->x, &box->w, (uint32_t)start, (uint32_t)end);
 }
 
 /* ---- driver interface --------------------------------------------------- */
@@ -449,6 +502,58 @@ uint32_t vmw_surface_dirty_count(const struct vmw_surface *s)
  * DX_UPDATE_SUBRESOURCE addresses array surfaces; UPDATE_GB_IMAGE only
  * knows face and level.  The device that offers DX contexts takes the
  * former, exactly as the reference driver chooses. */
+/* How much of a surface each emitted box actually covers.
+ *
+ * One box a frame says nothing about its SIZE, and the size is the thing the
+ * host pays for: an UPDATE over the whole surface makes it re-read every byte
+ * of the backing store, so a box that is always full-surface costs 8.8MB a
+ * frame at 1920x1200 against 3MB at 1024x768 -- the same ratio as the frame
+ * rate that was measured.  Accumulated here and reported with the rest. */
+static uint64_t g_emit_texels;      /* texels the boxes covered */
+static uint64_t g_emit_surface;     /* texels those surfaces hold in total */
+/* ...and what those texels WEIGH.  Reported separately because a texel is
+ * not four bytes: the surface this tracker spends its time on turns out to
+ * be one byte per texel, so counting four made the traffic look four times
+ * what it is and pointed a whole day of work at the wrong flow. */
+static uint64_t g_emit_bytes;
+
+void vmw_surface_dirty_emit_stats(uint64_t *covered, uint64_t *total,
+				  uint64_t *bytes)
+{
+	*covered = g_emit_texels;
+	*total = g_emit_surface;
+	*bytes = g_emit_bytes;
+	g_emit_texels = 0;
+	g_emit_surface = 0;
+	g_emit_bytes = 0;
+}
+
+/* Put a surface's dirt back, in full.
+ *
+ * For the case where the commands vmw_surface_dirty_emit() produced never
+ * reached the device: the boxes were cleared as they were written into the
+ * batch, so if that batch is then dropped the record of those writes is gone
+ * while the device still holds the old bytes.  Nothing writes those pages
+ * again until the content itself is redrawn, so the stale region simply stays
+ * -- through a scroll, through a workspace switch, until the page is reloaded.
+ *
+ * Marking everything rather than reconstructing what was emitted: the batch
+ * is dropped rarely, the whole surface is a superset of whatever was lost,
+ * and a superset only ever costs bandwidth.  Getting it wrong in the other
+ * direction costs a permanent artefact. */
+void vmw_surface_dirty_mark_all(struct vmw_surface *s)
+{
+	struct vmw_surface_dirty *dirty = s->dirty;
+	uint64_t fl;
+
+	if (!dirty)
+		return;
+	spin_lock_irqsave(&dirty->lock, &fl);
+	for (uint32_t i = 0; i < dirty->num_subres; ++i)
+		surf_subres_dirty_full(dirty, i);
+	spin_unlock_irqrestore(&dirty->lock, fl);
+}
+
 uint32_t vmw_surface_dirty_emit(struct vmw_device *v, struct vmw_surface *s,
 				void *out, uint32_t cap)
 {
@@ -467,6 +572,22 @@ uint32_t vmw_surface_dirty_emit(struct vmw_device *v, struct vmw_surface *s,
 		if ((uint32_t)(p - (uint8_t *)out) + VMW_SURF_DIRTY_CMD_MAX >
 		    cap)
 			break; /* the rest keeps its dirt for next time */
+		{
+			uint32_t lvl = i % dirty->layout.num_mip_levels;
+			const SVGA3dSize *sz = &dirty->layout.mip[lvl].size;
+
+			const SVGA3dSurfaceDesc *de = dirty->layout.desc;
+			uint32_t bw = de->blockSize.width ?
+					      de->blockSize.width : 1;
+			uint32_t bh = de->blockSize.height ?
+					      de->blockSize.height : 1;
+
+			g_emit_texels += (uint64_t)box->w * box->h;
+			g_emit_surface += (uint64_t)sz->width * sz->height;
+			g_emit_bytes += (uint64_t)((box->w + bw - 1) / bw) *
+					((box->h + bh - 1) / bh) *
+					de->bytesPerBlock;
+		}
 		SVGA3dCmdHeader *h = (SVGA3dCmdHeader *)p;
 
 		if (v->has_dx) {
@@ -500,16 +621,33 @@ uint32_t vmw_surface_dirty_emit(struct vmw_device *v, struct vmw_surface *s,
 }
 
 /* The page tracker hands over page runs; bytes are what the boxes want. */
+/* The transfer reports pages of the BUFFER; the boxes are in bytes of the
+ * SURFACE.  Subtracting the surface's base is what keeps the two apart when
+ * more than one surface is in the buffer -- without it a surface sitting part
+ * way in reads its neighbour's pages as its own and dirties the wrong rows. */
 static void surf_pull_cb(void *arg, uint64_t first, uint64_t last)
 {
 	struct vmw_surface *s = arg;
+	uint64_t base = s->backup_offset;
+	uint64_t start = first * PAGE_SIZE;
+	uint64_t end = last * PAGE_SIZE;
 
-	vmw_surface_dirty_range_add(s, (size_t)first * PAGE_SIZE,
-				    (size_t)last * PAGE_SIZE);
+	if (end <= base)
+		return;
+	if (start < base)
+		start = base;
+	vmw_surface_dirty_range_add(s, (size_t)(start - base),
+				    (size_t)(end - base));
 }
 
 void vmw_surface_dirty_pull(struct vmw_surface *s)
 {
-	if (s->dirty && s->backup)
-		drm_gem_dirty_transfer(s->backup, surf_pull_cb, s);
+	uint64_t first, last;
+
+	if (!s->dirty || !s->backup)
+		return;
+	/* Only this surface's own window of the buffer. */
+	first = s->backup_offset / PAGE_SIZE;
+	last = (s->backup_offset + s->backup_size + PAGE_SIZE - 1) / PAGE_SIZE;
+	drm_gem_dirty_transfer(s->backup, first, last, surf_pull_cb, s);
 }

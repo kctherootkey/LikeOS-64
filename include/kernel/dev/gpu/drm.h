@@ -56,7 +56,33 @@ void drm_fence_signal(struct drm_fence *f);
 /* Signal every fence with seqno <= passed (wrap-safe). */
 void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed);
 /* 0 signalled, -ETIMEDOUT, -EINTR. */
-int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns);
+/* Wait for a fence, bounded by `timeout_ns'.
+ *
+ * `intr' says what a pending signal means here.  A caller that can REPORT the
+ * interruption -- an ioctl that returns -EINTR to a program that will retry
+ * it -- passes 1 and gets -EINTR the moment a signal is deliverable.
+ *
+ * A caller that cannot passes 0.  Teardown is the case: the pages are going
+ * to be handed back whatever this returns, and the device is still reading
+ * them until the fence passes.  Giving up early there does not interrupt
+ * anything, it just frees memory out from under the device -- so those waits
+ * are not interruptible, only bounded, exactly as the reference driver does
+ * it in its object-release path. */
+int drm_fence_wait_flags(struct drm_fence *f, uint64_t timeout_ns, int intr);
+
+static inline int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns)
+{
+	return drm_fence_wait_flags(f, timeout_ns, 1);
+}
+/* What waiting for fences has cost since the last call, in timestamp-counter
+ * ticks and in waits, and reset by reading.
+ *
+ * A client that renders as fast as the device lets it spends its frame here,
+ * and a driver measuring only its own code cannot tell that apart from a
+ * client that simply has nothing to draw.  Read by whoever reports frame
+ * accounting; the fence layer only counts. */
+void drm_fence_wait_stats(uint64_t *tsc_ticks, uint64_t *waits);
+
 /* A sync_file descriptor for the fence (installs into the caller). */
 int drm_fence_export_fd(struct drm_fence *f, int cloexec);
 /* The fence behind a sync_file descriptor of the caller (a reference). */
@@ -121,12 +147,38 @@ struct drm_gem_object *drm_gem_lookup_foreign(struct drm_device *dev,
  * success; on failure the object simply has no tracker. */
 int drm_gem_dirty_add(struct drm_gem_object *o);
 void drm_gem_dirty_release(struct drm_gem_object *o);
+/* The mapping census the sweeps check themselves against: one record that can
+ * WRITE the object came (add = 1) or went (add = 0).  Wired into
+ * mm_dirty_ops.map_census; the address space calls it, not the driver. */
+void drm_gem_dirty_map_census(void *obj, int add);
 /* Harvest the processor's record of client writes into the tracker.
  * Called once per object per submission, before the ranges are consumed. */
 void drm_gem_dirty_scan(struct drm_gem_object *o);
-/* Hand the accumulated dirty page ranges to the caller, clearing them from
- * the tracker: cb(arg, first, last) per run of dirty pages. */
-void drm_gem_dirty_transfer(struct drm_gem_object *o,
+/* Scans since the last call, how many had to report the WHOLE object because
+ * a mapping was out of the sweep's reach, and how many used the faulting
+ * method.  Reset by reading; see the note in drm_dirty.c. */
+void drm_gem_dirty_scan_stats(uint64_t *scans, uint64_t *full, uint64_t *fault);
+/* Pages the sweeps actually found dirty, and pages those objects hold, since
+ * the last call -- sampled BEFORE a whole-object fallback overrides the
+ * answer.  Says whether that fallback is costing anything: equal numbers mean
+ * the client really is rewriting everything. */
+void drm_gem_dirty_scan_found(uint64_t *found_pages, uint64_t *total_pages);
+/* Why scans still reported everything: a record dropped while tracking was
+ * live, or the one-off switch onto the faulting method.  Reset by reading. */
+void drm_gem_dirty_scan_why(uint64_t *dropped, uint64_t *switched);
+/* Scans answered by comparing page CONTENT instead of reporting the whole
+ * object, and the pages that pass found actually changed. */
+void drm_gem_dirty_scan_content(uint64_t *scans, uint64_t *pages,
+				uint64_t *shared, uint64_t *refresh);
+/* Hand the accumulated dirty page ranges inside ONE WINDOW of the object to
+ * the caller, clearing only those: cb(arg, first, last) per run of dirty
+ * pages, in pages of the object.
+ *
+ * A window because one buffer object can back several resources, while the
+ * tracking belongs to the buffer.  Whoever consumes must take only its own
+ * pages and leave its neighbours' alone. */
+void drm_gem_dirty_transfer(struct drm_gem_object *o, uint64_t first_page,
+			    uint64_t last_page,
 			    void (*cb)(void *arg, uint64_t first,
 				       uint64_t last),
 			    void *arg);
@@ -136,12 +188,13 @@ void drm_gem_dirty_fault_page(struct drm_gem_object *o, uint64_t page);
 void drm_gem_dirty_mark_page(struct drm_gem_object *o, uint64_t page);
 /* Census of region records mapping the object; the get/put wrappers of
  * every mapping flavour call these as records come and go. */
-void drm_gem_dirty_map_note(struct drm_gem_object *o);
-void drm_gem_dirty_map_drop(struct drm_gem_object *o);
 int drm_gem_dirty_wp_new_mapping(struct drm_gem_object *o);
 /* The mapping callbacks a device-mmap of a gem object registers. */
 struct mm_dirty_ops;
 extern const struct mm_dirty_ops drm_gem_dirty_mmap_ops;
+/* The same tracking for a mapping made through an exported descriptor
+ * (drm_gem.c); records carrying these address the object from byte zero. */
+extern const struct mm_dirty_ops drm_gem_dmabuf_dirty_ops;
 
 /* Handles: per-file namespace. */
 int drm_gem_handle_create(struct drm_file *fp, struct drm_gem_object *o,
@@ -284,6 +337,15 @@ struct drm_driver {
 	/* objects */
 	int (*gem_init)(struct drm_gem_object *o); /* after pages exist */
 	void (*gem_free)(struct drm_gem_object *o);
+	/* Bring the driver's idea of which fences have passed up to date.
+	 *
+	 * A fence is marked signalled by whoever notices, and on a device with
+	 * a fence interrupt that is the interrupt.  Where there is none --
+	 * SVGA_CAP_IRQMASK is absent on some hosts -- nothing notices unless
+	 * somebody asks, so a waiter that only tests the flag is waiting for
+	 * an unrelated thread to ask on its behalf.  This is how it asks for
+	 * itself. */
+	void (*fence_poll)(struct drm_device *dev);
 	/* Release the object's backing pages.
 	 *
 	 * Optional, and the reason it exists is that a driver may have given

@@ -504,6 +504,26 @@ typedef struct k_flock {
 #define EBADF 9 // Bad file descriptor
 #define ECHILD 10 // No child processes
 #define EINTR 4 // Interrupted system call
+
+/* Not an error a program can ever see: the answer "a signal cut this call
+ * short before it had done anything, so it may simply be run again".
+ *
+ * A handler wants an interrupted call RESUMED, not failed, whenever it was
+ * installed with SA_RESTART -- that is the whole meaning of the flag, and a
+ * program that sets it is entitled to write no EINTR handling at all.  The
+ * decision needs two things the waiting code does not have: which signal is
+ * about to be delivered, and its flags.  So the wait says only that it is
+ * resumable, and the syscall return path settles it -- into a restart, or
+ * into EINTR when the handler did not ask for one.
+ *
+ * Numbered above the range shared with userspace so it can never be mistaken
+ * for one, and syscall_handler() converts every one of them; nothing else
+ * may return it to user mode. */
+#define ERESTARTSYS 512
+
+/* The SYSCALL instruction is two bytes (0F 05).  Restarting a call means
+ * returning to the instruction itself rather than the one after it. */
+#define SYSCALL_INSN_LEN 2
 #define ESRCH 3 // No such process
 #define EIO 5 // I/O error
 #define ENOMEM 12 // Out of memory

@@ -110,9 +110,20 @@ void drm_gem_put(struct drm_gem_object *o)
 	uint64_t fl;
 
 	/* The device may still be reading it: wait for the last submission
-	 * that referenced it. */
+	 * that referenced it.
+	 *
+	 * Uninterruptibly.  The pages go back to the allocator on the next
+	 * line whatever happens here, so a wait that gives up because a signal
+	 * is pending does not defer the free -- it just performs it while the
+	 * device is still reading, and the memory is handed to the next caller
+	 * of the allocator to write over.  The result is corruption of some
+	 * unrelated structure, arbitrarily later, in a process that has no
+	 * connection to this object.  A browser is the worst case: its threads
+	 * carry a pending signal almost continuously (the collector parks them
+	 * with one, the profiler samples with another), so the interruptible
+	 * form returned at once nearly every time it was called. */
 	if (o->fence) {
-		drm_fence_wait(o->fence, 2000000000ULL);
+		drm_fence_wait_flags(o->fence, 2000000000ULL, 0);
 		drm_fence_put(o->fence);
 		o->fence = NULL;
 	}
@@ -385,21 +396,26 @@ static uint64_t dmabuf_page_phys(void *obj, uint64_t index)
 static void dmabuf_obj_get(void *obj)
 {
 	drm_gem_get(obj);
-	drm_gem_dirty_map_note(obj);
 }
 
 static void dmabuf_obj_put(void *obj)
 {
-	drm_gem_dirty_map_drop(obj);
 	drm_gem_put(obj);
 }
 
 /* Descriptor mappings address the object from byte zero of the
- * descriptor, so their record offsets are object offsets already.  The
- * sweeps never walk these records (they carry these callbacks, not the
- * device node's, which is how the census notices them and answers with
- * the whole object); only the write fault and the unmap harvest arrive
- * here. */
+ * descriptor, so their record offsets are object offsets already -- which
+ * is why they carry their own callbacks: the sweep tells the two flavours
+ * of record apart by the callback pointer and places each by its own base
+ * (mm_dirty_walk.ops_alt).
+ *
+ * They used to be left out of the sweep on purpose, on the theory that a
+ * descriptor mapping was a rare cross-process case best answered by
+ * reporting the whole object.  It is the ordinary case: a browser's web
+ * process paints its tiles through exactly such a mapping and draws them
+ * from the same process, and every one of its submissions re-sent the
+ * whole tile to the device -- two megabytes a frame that nothing had
+ * written -- because the record was in plain sight and not looked at. */
 static void dmabuf_dirty_mkwrite(void *obj, uint64_t offset)
 {
 	drm_gem_dirty_fault_page(obj, offset / PAGE_SIZE);
@@ -415,10 +431,11 @@ static int dmabuf_dirty_wp_new(void *obj)
 	return drm_gem_dirty_wp_new_mapping(obj);
 }
 
-static const struct mm_dirty_ops dmabuf_dirty_ops = {
+const struct mm_dirty_ops drm_gem_dmabuf_dirty_ops = {
 	.mkwrite = dmabuf_dirty_mkwrite,
 	.page_dirty = dmabuf_dirty_page_dirty,
 	.wp_new_mapping = dmabuf_dirty_wp_new,
+	.map_census = drm_gem_dirty_map_census,
 };
 
 /* A mapping made through the descriptor rather than the device node: it
@@ -437,9 +454,8 @@ static int dmabuf_mmap(vfs_file_t *f, struct device_mmap *m)
 	m->get = dmabuf_obj_get;
 	m->put = dmabuf_obj_put;
 	m->pte_extra = o->dev->drv->gem_mmap_pte_extra;
-	m->dirty_ops = &dmabuf_dirty_ops;
+	m->dirty_ops = &drm_gem_dmabuf_dirty_ops;
 	drm_gem_get(o); /* the mapping's reference */
-	drm_gem_dirty_map_note(o); /* ...and the initial record's census entry */
 	return 0;
 }
 
@@ -469,8 +485,12 @@ static long dmabuf_ioctl(vfs_file_t *f, unsigned long req, void *argp,
 		struct dma_buf_sync s;
 		if (copy_from_user(&s, argp, sizeof(s)) != 0)
 			return -EFAULT;
+		/* Uninterruptible: this ioctl exists to promise the caller the
+		 * device is finished before it touches the mapping, and it
+		 * reports nothing back.  Returning early on a signal would
+		 * hand back that promise unkept. */
 		if (!(s.flags & DMA_BUF_SYNC_END) && c->obj->fence)
-			drm_fence_wait(c->obj->fence, 2000000000ULL);
+			drm_fence_wait_flags(c->obj->fence, 2000000000ULL, 0);
 		return 0;
 	}
 	case 1: /* DMA_BUF_SET_NAME */

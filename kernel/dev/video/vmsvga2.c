@@ -568,7 +568,7 @@ int vmsvga2_fence_wait(uint32_t fence, uint64_t timeout_us)
 
 		g_svga.fifo[SVGA_FIFO_FENCE_GOAL] = fence;
 		svga_write_reg(SVGA_REG_IRQMASK,
-			       SVGA_IRQFLAG_ANY_FENCE |
+			       SVGA_IRQ_BASE_MASK | SVGA_IRQFLAG_ANY_FENCE |
 				       SVGA_IRQFLAG_FENCE_GOAL);
 		svga_doorbell();
 		start = timer_get_precise_us();
@@ -718,9 +718,11 @@ static void svga_irq_init(void)
 					0x04, cmd & ~PCI_CMD_INTX_DISABLE);
 	}
 
-	// Clear any stale status, mask all sources until a waiter arms them.
+	/* Clear any stale status, then arm the sources that must always be
+	 * on.  The fence-goal sources below are armed per wait; these are not
+	 * optional -- they are how a command-buffer completion is announced. */
 	outl(g_svga.io_base + SVGA_IRQSTATUS_PORT, 0xFF);
-	svga_write_reg(SVGA_REG_IRQMASK, 0);
+	svga_write_reg(SVGA_REG_IRQMASK, SVGA_IRQ_BASE_MASK);
 
 	g_vmsvga_legacy_irq = irq;
 	ioapic_configure_legacy_irq(irq, (uint8_t)(32 + irq),
@@ -1137,8 +1139,11 @@ int vmsvga2_reset(void)
 	svga_write_reg(SVGA_REG_CONFIG_DONE, 1);
 	svga_write_reg(SVGA_REG_GUEST_ID, SVGA_GUEST_ID_OTHER);
 	if (g_svga.irq_enabled) {
+		/* Re-arm rather than silence: a mode set happens whenever the
+		 * screen is resized, and leaving the mask at zero afterwards
+		 * turned the fence interrupt off for the rest of the session. */
 		outl(g_svga.io_base + SVGA_IRQSTATUS_PORT, 0xFF);
-		svga_write_reg(SVGA_REG_IRQMASK, 0);
+		svga_write_reg(SVGA_REG_IRQMASK, SVGA_IRQ_BASE_MASK);
 	}
 
 	if (g_svga.active && w && h)
@@ -2849,7 +2854,8 @@ void vmsvga2_hw_set_fence_goal(uint32_t goal)
 		return;
 	g_svga.fifo[SVGA_FIFO_FENCE_GOAL] = goal;
 	svga_write_reg(SVGA_REG_IRQMASK,
-		       SVGA_IRQFLAG_ANY_FENCE | SVGA_IRQFLAG_FENCE_GOAL);
+		       SVGA_IRQ_BASE_MASK | SVGA_IRQFLAG_ANY_FENCE |
+			       SVGA_IRQFLAG_FENCE_GOAL);
 	svga_doorbell();
 }
 

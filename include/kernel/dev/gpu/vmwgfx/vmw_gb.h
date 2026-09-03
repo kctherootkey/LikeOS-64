@@ -9,6 +9,7 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
 
+#include <kernel/mm/rwsem.h>
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/dev/gpu/vmwgfx/svga/svga3d_reg.h>
@@ -94,6 +95,17 @@ struct vmw_surface {
 	uint32_t array_size;
 	uint32_t byte_stride;
 	uint32_t backup_size;
+	/* Where this surface starts inside `backup'.
+	 *
+	 * A surface is created against whatever buffer handle the client
+	 * names, and the client's allocator puts several of them in one
+	 * buffer -- but the dirty tracking belongs to the BUFFER.  So the
+	 * window has to be carried here, or consuming this surface's dirty
+	 * pages takes its neighbours' as well.  Zero for a surface that was
+	 * given a buffer of its own, which is why the arithmetic below is
+	 * written out rather than left implicit: it is right by construction
+	 * instead of by coincidence. */
+	uint64_t backup_offset;
 	struct drm_gem_object *backup; /* the MOB-backed buffer */
 	int defined; /* DEFINE_GB_SURFACE sent */
 	int bound; /* BIND_GB_SURFACE sent */
@@ -111,9 +123,11 @@ struct vmw_surface {
 };
 
 /* Serialized size of a surface with these parameters. */
+/* Bytes of backing a surface needs.  `flags' carries SVGA3D_SURFACE_CUBEMAP,
+ * which decides the layer count when there is no array size. */
 uint32_t vmw_surface_size(uint32_t format, const SVGA3dSize *size,
 			  uint32_t mip_levels, uint32_t array_size,
-			  uint32_t samples);
+			  uint32_t samples, uint64_t flags);
 int vmw_surface_alloc_id(struct vmw_device *v);
 void vmw_surface_free_id(struct vmw_device *v, uint32_t sid);
 int vmw_surface_define(struct vmw_device *v, struct vmw_surface *s);
@@ -126,6 +140,75 @@ void vmw_surface_dirty_range_add(struct vmw_surface *s, size_t start,
 				 size_t end);
 void vmw_surface_dirty_pull(struct vmw_surface *s);
 uint32_t vmw_surface_dirty_count(const struct vmw_surface *s);
+/* Put a surface's dirt back in full, for when the commands emit() produced
+ * never reached the device: emit clears each box as it writes it, so a batch
+ * that is dropped afterwards takes the record of those writes with it. */
+void vmw_surface_dirty_mark_all(struct vmw_surface *s);
+
+/* What the command-buffer channel cost since the last call: buffers handed
+ * to the device, their payload, and how long the device took to finish one
+ * (submission to the moment it was found completed).  Reset by the call. */
+void vmw_cmdbuf_stats(uint64_t *submits, uint64_t *kbytes, uint64_t *avg_us,
+		      uint64_t *max_us);
+/* Texels the emitted boxes covered, and texels those surfaces hold, since
+ * the last call.  Says whether the updates are tight or whole-surface. */
+void vmw_surface_dirty_emit_stats(uint64_t *covered, uint64_t *total,
+				  uint64_t *bytes);
+
+/* Per-frame accounting for the scan-out path.
+ *
+ * The question these answer is why a window at 1920x1200 is unusable while
+ * the same page at 1024x768 is not, when everything measurable on the host
+ * scales with area and nothing in it is superlinear.  What a host harness
+ * cannot see is how much WORK per frame the client actually asks for, so the
+ * counts are taken where the work arrives and reported against presents.
+ *
+ * vmw_stdu_present() is the frame marker; everything else accumulates. */
+void vmw_execbuf_note_frame(void);
+/* One screen-target bind; the display server should need very few. */
+void vmw_execbuf_note_bind(void);
+
+/* ---- where the time goes ------------------------------------------------
+ *
+ * The counts above say how much work arrives per frame; they cannot say
+ * whether the frame rate is set by this kernel, by the client, or by the
+ * host -- and those three want completely different fixes.  A second's
+ * worth of a frame is 1000ms, so a stage that accumulates 700ms in a second
+ * IS the frame rate and everything else is noise.  That is the number these
+ * produce.
+ *
+ * Timestamp-counter ticks rather than microseconds: a submission takes a
+ * few microseconds, so a microsecond clock read around it rounds most
+ * samples to zero or one and the sum says nothing.  The conversion happens
+ * once, in the report.
+ *
+ * VMW_T_EXECBUF is the whole ioctl and CONTAINS scan/emit/submit/fence;
+ * VMW_T_PRESENT is the whole present and contains blit.  They are reported
+ * as they are rather than as remainders so a stage that is missing from the
+ * breakdown shows up as a gap rather than as a negative number. */
+enum vmw_time_stage {
+	VMW_T_EXECBUF,	/* the whole execbuf ioctl */
+	VMW_T_SCAN,	/* coherent-surface page-table scan + box pull */
+	VMW_T_EMIT,	/* turning boxes into update commands */
+	VMW_T_SUBMIT,	/* handing the batch to the device */
+	VMW_T_FENCE,	/* emitting the fence that ends the batch */
+	VMW_T_PRESENT,	/* the whole scan-out present */
+	VMW_T_BLIT,	/* the guest-pixel copy inside a present */
+	VMW_T_SLOT,	/* waiting for a free command-buffer slot */
+	VMW_T_LOCK,	/* waiting for execbuf_lock */
+	VMW_T_VALIDATE, /* copying and checking the client's stream */
+	VMW_T_MAX
+};
+void vmw_execbuf_note_time(enum vmw_time_stage stage, uint64_t tsc_ticks);
+
+/* Pixels the host is told to re-read (UPDATE_GB_SCREENTARGET) and pixels the
+ * guest copied itself, and whether the present covered the whole screen.
+ * Together with the frame count these say whether the display path is
+ * paying per damaged pixel or per screen. */
+void vmw_execbuf_note_update(uint64_t pixels, int full);
+void vmw_execbuf_note_blit(uint64_t pixels);
+/* One submission that found no free command-buffer slot and had to wait. */
+void vmw_execbuf_note_slot_wait(void);
 uint32_t vmw_surface_dirty_emit(struct vmw_device *v, struct vmw_surface *s,
 				void *out, uint32_t cap);
 /* The largest update command one dirty subresource can become. */
@@ -250,6 +333,31 @@ struct vmw_device {
 	/* command buffer */
 	struct vmw_cb_slot cb_slot[16];
 	int cb_nslots;
+	/* Submitters that found every slot in flight sleep here; the reaper
+	 * wakes them as slots come free.  See cb_slot_claim(). */
+	struct wait_queue_head cb_wq;
+	/* One submission at a time.
+	 *
+	 * A submission is not just a copy of the client's commands: it
+	 * REWRITES them (handles become device ids), it can GROW a context's
+	 * object tables underneath the device, and it harvests and emits the
+	 * coherent-surface updates.  None of that is atomic, and two threads
+	 * of one process submit against the same context constantly.
+	 *
+	 * The table growth is what makes it unsafe rather than merely
+	 * racy: vmw_context_cotable_reserve() drains the queue, asks the
+	 * device to write the current table back, copies it into a bigger
+	 * buffer and points the context at the copy.  A DEFINE submitted by
+	 * another thread between the readback and the switch executes against
+	 * the OLD table and is then thrown away with it -- so its view id
+	 * survives with a stale entry, and every draw that uses it samples
+	 * whatever that entry happens to name.  The device reports nothing:
+	 * the id is valid, only its contents are wrong.
+	 *
+	 * The reference serialises the whole of execbuf for the same reason
+	 * (its cmdbuf_mutex).  Held across validation and hand-over only --
+	 * execution is asynchronous, so this does not serialise the device. */
+	mm_rwsem_t execbuf_lock;
 	/* Commands accumulate here and go to the device as one buffer. */
 	uint8_t *pend;
 	uint32_t pend_len;
@@ -268,8 +376,17 @@ struct vmw_device {
 	 * to two owners, which is how it turned into corrupted kernel memory
 	 * far away from here. */
 	spinlock_t defer_lock;
-	uint64_t defer_free[64];
+	/* Grown on demand, not a fixed 64.
+	 *
+	 * A full-screen image is 1920x1200x4 -- 2250 pages -- and they are
+	 * released together.  With room for 64 the rest had to go back
+	 * IMMEDIATELY, while the device could still be reading them, and the
+	 * page-table pages freed after them each found the area full and made
+	 * the device idle one page at a time.  So the same fixed size caused
+	 * both a use-after-free and a stall, and both scaled with the image. */
+	uint64_t *defer_free;
 	uint32_t defer_n;
+	uint32_t defer_cap;
 	uint64_t cb_last_progress_us; /* last time ANY buffer finished */
 	uint32_t cb_size; /* payload bytes per slot */
 	/* The command-buffer channel is claimed with this flag, not with a
@@ -289,6 +406,18 @@ struct vmw_device {
 	int st_defined;
 	uint32_t st_w, st_h;
 	uint32_t st_bound_sid;		/* what the target currently shows */
+	/* WHICH surface that id belonged to.
+	 *
+	 * The id alone is not identity: ids are reused, so a destroyed
+	 * surface's number can come back attached to a different one, and
+	 * a target left bound to the old meaning shows the wrong thing.
+	 * Rebinding on every full present avoided that by never trusting the
+	 * id -- at the cost of a BIND_GB_SCREENTARGET per page flip, which
+	 * the display server issues once a frame, and which makes the host
+	 * re-establish the scan-out every time.  Keeping the object as well
+	 * settles identity properly and lets the bind be skipped when
+	 * nothing has actually changed. */
+	const void *st_bound_obj;
 	struct vmw_surface *st_surface;	/* the driver's display surface */
 	struct drm_gem_object *st_bo;	/* its MOB backing */
 };

@@ -100,6 +100,12 @@ static void vmw_irq_cb(uint32_t status)
 	vmw_fence_check(&g_vmw);
 }
 
+static void vmw_drm_fence_poll(struct drm_device *dev)
+{
+	(void)dev;
+	vmw_fence_check(&g_vmw);
+}
+
 /* Insert a fence after whatever was just submitted; returns it. */
 struct drm_fence *vmw_fence_emit(struct vmw_device *v, uint32_t flags)
 {
@@ -1027,6 +1033,13 @@ static long vmw_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
 		if (!o)
 			return -ENOENT;
 		int rc = 0;
+		/* Ask the device first, exactly as DRM_VMW_FENCE_WAIT does.
+		 * Without it this tests a flag only an interrupt or an
+		 * unrelated thread would have set, so a fence that passed long
+		 * ago still looks pending and the map sleeps for a tick.  This
+		 * call is on the display path: gbm_bo_map() reaches it once
+		 * per frame. */
+		vmw_fence_check(v);
 		if (a->op == drm_vmw_synccpu_grab && o->fence && !o->fence->signaled) {
 			if (a->flags & drm_vmw_synccpu_dontblock)
 				rc = -EBUSY;
@@ -1177,6 +1190,7 @@ static const struct drm_driver vmw_driver = {
 	.master_drop = vmw_master_drop,
 	.gem_init = vmw_gem_init,
 	.gem_free = vmw_gem_free,
+	.fence_poll = vmw_drm_fence_poll,
 	.gem_release_pages = vmw_gem_release_pages,
 	.gem_page_phys = vmw_gem_page_phys,
 	.gem_mmap_pte_extra = 0,
@@ -1540,6 +1554,7 @@ void vmwgfx_init(void)
 			drm_connector_add_mode(&v->drm, c, &m);
 		}
 	}
+	mm_rwsem_init(&v->execbuf_lock, "vmw_execbuf");
 	vmsvga2_hw_set_irq_callback(vmw_irq_cb);
 
 	/* Put the console on this device's KMS path.

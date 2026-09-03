@@ -541,6 +541,34 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 }
 
 // Wrapper that handles signal delivery after syscall
+/* Point the task back at the SYSCALL instruction it is inside, with the call
+ * number back in the register the instruction reads it from, so that returning
+ * to user mode runs the same call again with the same arguments.
+ *
+ * Both return paths have to be told, because which one runs is not known yet:
+ *
+ *   - a handler set up below returns through the signal frame, which is built
+ *     from `syscall_rip' and `syscall_rax' and restored by sigreturn;
+ *   - no handler returns through the frame on the kernel stack, whose RIP slot
+ *     the SYSRET path loads and whose RAX slot the C return value overwrites.
+ *
+ * Writing all three keeps them consistent whichever way it goes; the one that
+ * is not used is discarded with the frame.  Arguments need no attention: they
+ * are in registers SYSCALL preserves, and neither path has touched them.
+ *
+ * A task with no saved frame cannot be sent back to the instruction at all --
+ * there is nothing to rewind -- so it keeps the interruption instead. */
+static void syscall_arrange_restart(task_t *cur, uint64_t num, int64_t *ret)
+{
+	if (!cur || !cur->syscall_frame)
+		return; /* *ret keeps -EINTR */
+
+	cur->syscall_rip -= SYSCALL_INSN_LEN;
+	cur->syscall_rax = num;
+	cur->syscall_frame->rip -= SYSCALL_INSN_LEN;
+	*ret = (int64_t)num;
+}
+
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 			uint64_t a4, uint64_t a5, uint64_t a6)
 {
@@ -662,6 +690,18 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 		unix_sock_put_ref(held);
 	}
 
+	/* Settle a resumable interruption before anything can return.
+	 *
+	 * Assume the pessimistic answer, then upgrade it below if a restart
+	 * turns out to be allowed.  Doing it in this order is what guarantees
+	 * the internal code cannot escape: every path from here either
+	 * rewrites `ret' to the call number (restarting) or leaves it at
+	 * -EINTR. */
+	int restart = (ret == -(int64_t)ERESTARTSYS);
+
+	if (restart)
+		ret = -EINTR;
+
 	// Check for pending signals before returning to userspace.
 	// Skip for:
 	//   * SYS_EXIT       — task is already being torn down.
@@ -687,6 +727,18 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 		cur = sched_current();
 		if (cur && cur->privilege == TASK_USER && !cur->has_exited &&
 		    cur->state != TASK_ZOMBIE && signal_pending(cur)) {
+			/* A handler is about to run.  Whether the call it
+			 * interrupted comes back is its own choice, made when
+			 * it was installed: SA_RESTART on every signal now
+			 * pending means resume, anything else means report the
+			 * interruption.  Decided BEFORE the frame is built,
+			 * because the frame carries the RIP and RAX that
+			 * sigreturn will restore -- rewinding them afterwards
+			 * would change nothing. */
+			if (restart && signal_should_restart(cur))
+				syscall_arrange_restart(cur, num, &ret);
+			restart = 0; /* settled, whichever way it went */
+
 			// Save syscall return value so sigreturn can restore it
 			cur->syscall_rax = (uint64_t)ret;
 			signal_deliver(cur);
@@ -696,6 +748,19 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 				// Should not return here
 			}
 		}
+	}
+
+	/* Resumable, and nothing was delivered after all -- the signal that
+	 * cut the call short is no longer deliverable (another thread took a
+	 * shared one, or its disposition changed while this ran).  Nothing
+	 * happened that the program could observe, so the call simply resumes,
+	 * with no handler in between.  The reference does the same. */
+	if (restart) {
+		cur = sched_current();
+		if (cur && cur->privilege == TASK_USER && !cur->has_exited &&
+		    cur->state != TASK_ZOMBIE)
+			syscall_arrange_restart(cur, num, &ret);
+		restart = 0;
 	}
 
 	/* ppoll()/pselect() leave their temporary mask installed across the
@@ -747,6 +812,14 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 	 * through it would be reading, or corrupting, an unrelated frame. */
 	if (cur)
 		cur->syscall_frame = NULL;
+
+	/* Belt and braces.  Every path above resolves the internal code, but
+	 * this is the only door to user mode and the cost of one comparison is
+	 * nothing against a program being handed 512 as an errno. */
+	if (ret == -(int64_t)ERESTARTSYS) {
+		WARN_ON(1);
+		ret = -EINTR;
+	}
 
 	return ret;
 }

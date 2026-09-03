@@ -11,6 +11,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/timer.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 #include <kernel/mm/memory.h>
@@ -137,19 +138,98 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 	poll_notify_wq(&dev->vbl_wq); /* SYNCCPU / execbuf throttles */
 }
 
-int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns)
+/* How long to keep asking the device before giving the processor up.
+ *
+ * Host fences retire in tens of microseconds.  Sleeping for one instead costs
+ * a whole timer tick -- 10ms at the default rate, and the wait used to ask for
+ * two of them -- because that is the granularity of the only wake available
+ * when the device has no fence interrupt.  Trading a bounded spin for that is
+ * what keeps a per-frame wait from quantising the frame rate: a buffer map on
+ * the display path waits on the fence of the batch that drew it, so one
+ * unnecessary sleep per frame is the difference between 60fps and 50, and
+ * several is the difference between usable and not. */
+#define DRM_FENCE_SPIN_NS 200000ULL /* 200us */
+
+/* Where the sleep starts, and how far it backs off.  Short enough that a
+ * batch of a millisecond or two is not rounded up to a tick, long enough that
+ * a wait of seconds does not spend itself waking up. */
+#define DRM_FENCE_POLL_NS 250000ULL /* 250us */
+#define DRM_FENCE_POLL_MAX_NS 500000ULL /* 500us */
+
+/* Wake the sleeper when its poll deadline passes.  Runs from the timer, so it
+ * claims the task the way every other waker must: a claim without an enqueue
+ * strands it. */
+static void fence_poll_wake(hrtimer_t *t)
+{
+	task_t *task = t->arg;
+
+	if (sched_claim_wake(task, TASK_BLOCKED)) {
+		task->wait_channel = NULL;
+		sched_enqueue_ready(task);
+	}
+}
+
+static void drm_fence_poll(struct drm_fence *f)
+{
+	struct drm_device *dev = f->dev;
+
+	if (!f->signaled && dev && dev->drv && dev->drv->fence_poll)
+		dev->drv->fence_poll(dev);
+}
+
+/* What waiting has cost, for whoever reports frame accounting.  Relaxed
+ * atomics: a lost sample would skew a diagnostic and nothing else, and this
+ * sits on the path whose cost is being measured. */
+static uint64_t g_wait_ticks;
+static uint64_t g_wait_count;
+
+void drm_fence_wait_stats(uint64_t *tsc_ticks, uint64_t *waits)
+{
+	if (tsc_ticks)
+		*tsc_ticks = __atomic_exchange_n(&g_wait_ticks, 0,
+						 __ATOMIC_RELAXED);
+	if (waits)
+		*waits = __atomic_exchange_n(&g_wait_count, 0, __ATOMIC_RELAXED);
+}
+
+static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 {
 	task_t *cur = sched_current();
 	uint64_t deadline = hrtimer_now_ns() + timeout_ns;
+	uint64_t spin_until = hrtimer_now_ns() + DRM_FENCE_SPIN_NS;
+	uint64_t poll_ns = DRM_FENCE_POLL_NS;
+
+	/* Before anything is decided: the fence may already have passed and
+	 * nobody have noticed. */
+	drm_fence_poll(f);
 
 	while (!f->signaled) {
-		if (signal_pending(cur))
-			return -EINTR;
+		/* Resumable, not failed.  Nothing has been consumed and no
+		 * state has moved, so running the call again is exactly
+		 * equivalent to never having been interrupted -- which is what
+		 * a handler installed with SA_RESTART asked for.  The syscall
+		 * return path decides; see ERESTARTSYS. */
+		if (intr && signal_pending(cur))
+			return -ERESTARTSYS;
 		uint64_t now = hrtimer_now_ns();
 		if (now >= deadline)
 			return -ETIMEDOUT;
+		if (now < spin_until) {
+			/* Still inside the window where asking is cheaper than
+			 * sleeping. */
+			for (int i = 0; i < 64; i++)
+				__asm__ volatile("pause" ::: "memory");
+			drm_fence_poll(f);
+			continue;
+		}
 		struct wait_queue_entry we;
-		uint64_t fl = local_irq_save();
+		hrtimer_t poll_timer;
+		int highres = hrtimer_is_highres();
+		uint64_t fl;
+
+		if (highres)
+			hrtimer_init(&poll_timer, fence_poll_wake, cur);
+		fl = local_irq_save();
 
 		wq_entry_init(&we, cur);
 		wq_add(&f->wq, &we);
@@ -159,12 +239,31 @@ int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns)
 			break;
 		}
 		cur->wait_channel = f;
-		/* Poll the device every few ms too: the fence IRQ is not
-		 * available on every host. */
-		cur->wakeup_tick = timer_ticks() + timer_ms_to_ticks(4) + 1;
+		/* Sleep, and ask again on waking: the fence interrupt is not
+		 * available on every host, and where it is missing this is the
+		 * only thing that makes progress.
+		 *
+		 * The deadline comes from the high-resolution timer where there
+		 * is one, because the periodic tick is 10ms and a batch that
+		 * takes one or two milliseconds is the ordinary case -- sleeping
+		 * a whole tick for it quantises the frame rate to the tick.
+		 * (The old code asked for `timer_ms_to_ticks(4) + 1', which
+		 * rounds 4ms up to one tick and then adds another: a wait the
+		 * comment described as a few milliseconds slept for twenty.)
+		 * The interval backs off so a genuinely long wait does not
+		 * spend the whole time waking up. */
+		if (highres) {
+			hrtimer_start(&poll_timer, now + poll_ns);
+			if (poll_ns < DRM_FENCE_POLL_MAX_NS)
+				poll_ns *= 2;
+		} else {
+			cur->wakeup_tick = timer_ticks() + 1;
+		}
 		cur->state = TASK_BLOCKED;
 		local_irq_restore(fl);
 		sched_schedule();
+		if (highres)
+			hrtimer_cancel(&poll_timer);
 		/* Disarm: this deadline belongs to this poll and to nothing
 		 * after it.  Left set, it is claimed on the next tick of
 		 * whatever this task waits on next -- see the note above
@@ -172,8 +271,27 @@ int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns)
 		cur->wakeup_tick = 0;
 		cur->wait_channel = NULL;
 		wq_remove(&f->wq, &we);
+		/* Woken by the timer rather than by a signalling: nothing has
+		 * looked at the device, so look now. */
+		drm_fence_poll(f);
 	}
 	return 0;
+}
+
+int drm_fence_wait_flags(struct drm_fence *f, uint64_t timeout_ns, int intr)
+{
+	uint64_t t0;
+	int rc;
+
+	/* A fence that has already passed costs nothing and is not a wait;
+	 * counting it would bury the ones that are. */
+	if (f->signaled)
+		return 0;
+	t0 = timer_rdtsc();
+	rc = fence_wait_do(f, timeout_ns, intr);
+	__atomic_fetch_add(&g_wait_ticks, timer_rdtsc() - t0, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&g_wait_count, 1, __ATOMIC_RELAXED);
+	return rc;
 }
 
 /* ---- sync_file ------------------------------------------------------- */

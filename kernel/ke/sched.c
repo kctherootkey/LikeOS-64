@@ -2768,6 +2768,13 @@ void exit_mm_self(task_t *task)
 	 * one the task points at, or the wrong tables get taken apart. */
 	WARN_ON(mm && mm->pml4 && mm->pml4 != pml4);
 
+	/* The tables are about to be freed wholesale rather than unmapped
+	 * range by range, so this is the last moment a device mapping's dirty
+	 * bits can be read.  A process that dies having just painted into a
+	 * buffer another process still displays would otherwise take those
+	 * writes with it. */
+	mm_regions_harvest_dirty(task, pml4);
+
 	/* Stop advertising ownership of user memory BEFORE giving it up.
 	 * copy_to_user/copy_from_user test exactly this, so a preemption in
 	 * this window finds a task that says it cannot reach user addresses --

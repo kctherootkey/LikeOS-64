@@ -471,6 +471,10 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			region->dev_put = dm.put;
 			region->dev_dirty = dm.dirty_ops;
 			region->in_use = true;
+			/* The driver handed over its own reference above, so
+			 * this record takes no dev_get -- but it is still a
+			 * record, and the tracker counts records. */
+			mm_region_census(region, 1);
 			mm_merge_region_neighbours(cur, region);
 			ret = (int64_t)vaddr;
 			goto out;

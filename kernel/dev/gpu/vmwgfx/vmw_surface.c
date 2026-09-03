@@ -33,13 +33,24 @@ static uint32_t level_bytes(const SVGA3dSurfaceDesc *d, uint32_t w, uint32_t h,
 	uint32_t bw = divup(w, d->blockSize.width);
 	uint32_t bh = divup(h, d->blockSize.height);
 	uint32_t bd = divup(z, d->blockSize.depth);
-	uint32_t pitch = bw * d->pitchBytesPerBlock;
-	return pitch * bh * bd;
+
+	/* A planar format stores its planes one after another and its block
+	 * carries all of them, so its size comes from the block's STORAGE
+	 * size and there is no row pitch to speak of.  Everything else is
+	 * rows of pitch.  This is the split the reference's image-size helper
+	 * makes, and it has to be made identically here and in the dirty
+	 * tracker's surf_image_bytes(): this function decides how big the
+	 * backing buffer is, that one decides where in it every row lives, and
+	 * for NV12 and YV12 -- the only formats whose two per-block sizes
+	 * differ, 6 against 2 -- they disagreed by a factor of three. */
+	if (d->blockDesc & SVGA3DBLOCKDESC_PLANAR_YUV)
+		return bw * bh * bd * d->bytesPerBlock;
+	return (bw * d->pitchBytesPerBlock) * bh * bd;
 }
 
 uint32_t vmw_surface_size(uint32_t format, const SVGA3dSize *size,
 			  uint32_t mip_levels, uint32_t array_size,
-			  uint32_t samples)
+			  uint32_t samples, uint64_t flags)
 {
 	if (format >= SVGA3D_FORMAT_MAX)
 		return 0;
@@ -55,7 +66,14 @@ uint32_t vmw_surface_size(uint32_t format, const SVGA3dSize *size,
 	if (d->blockDesc == SVGA3DBLOCKDESC_NONE || d->bytesPerBlock == 0)
 		return 0;
 	uint64_t total = 0;
-	uint32_t layers = array_size ? array_size : 1;
+	/* A cubemap carries no array size and six faces.  Counting it as one
+	 * layer sized the backing buffer at a sixth of what the surface needs,
+	 * while the dirty tracker's layout -- which applies the same rule the
+	 * reference does -- addressed all six.  The device, told the surface
+	 * is a cubemap, reads the same six.  See vmw_surface_dirty_alloc(). */
+	uint32_t layers = array_size ? array_size :
+			  ((flags & SVGA3D_SURFACE_CUBEMAP) ?
+				   SVGA3D_MAX_SURFACE_FACES : 1);
 	if (samples < 1)
 		samples = 1;
 	for (uint32_t m = 0; m < mip_levels; m++) {
@@ -318,8 +336,12 @@ static int surface_create_common(struct vmw_device *v, struct drm_file *fp,
 	if (ext && req->svga3d_flags_upper_32_bits && !v->has_sm41)
 		return -EINVAL;
 	uint32_t samples = b->multisample_count ? b->multisample_count : 1;
+	uint64_t sflags = b->svga3d_flags;
+	if (ext)
+		sflags |= (uint64_t)req->svga3d_flags_upper_32_bits << 32;
 	uint32_t size = vmw_surface_size(b->format, (const SVGA3dSize *)&b->base_size,
-					 b->mip_levels, b->array_size, samples);
+					 b->mip_levels, b->array_size, samples,
+					 sflags);
 	if (size == 0)
 		return -EINVAL;
 	if (v->max_mob_size && size > v->max_mob_size)

@@ -32,6 +32,7 @@
 #include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/timer.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -106,8 +107,11 @@ static int stdu_bind(struct vmw_device *v, uint32_t sid)
 	c.image.face = 0;
 	c.image.mipmap = 0;
 	int rc = vmw_cmd_one(v, SVGA_3D_CMD_BIND_GB_SCREENTARGET, &c, sizeof(c));
-	if (rc == 0)
+	if (rc == 0) {
 		v->st_bound_sid = sid;
+		v->st_bound_obj = NULL;   /* the caller records identity */
+		vmw_execbuf_note_bind();
+	}
 	return rc;
 }
 
@@ -191,7 +195,8 @@ static int stdu_display_surface_fmt(struct vmw_device *v, uint32_t w, uint32_t h
 	s->base_size.height = h;
 	s->base_size.depth = 1;
 	s->scanout = 1;
-	s->backup_size = vmw_surface_size(s->format, &s->base_size, 1, 1, 0);
+	s->backup_size = vmw_surface_size(s->format, &s->base_size, 1, 1, 0,
+					  s->flags);
 	if (s->backup_size < w * h * 4)
 		s->backup_size = w * h * 4;
 
@@ -292,6 +297,11 @@ static int stdu_update_target(struct vmw_device *v, int x1, int y1, int x2, int 
 	c.rect.y = (uint32_t)y1;
 	c.rect.w = (uint32_t)(x2 - x1);
 	c.rect.h = (uint32_t)(y2 - y1);
+	/* Recorded here rather than at the caller: this is the ONE command
+	 * that costs the host a re-read, and every path that shows anything
+	 * ends in it. */
+	vmw_execbuf_note_update((uint64_t)c.rect.w * c.rect.h,
+				c.rect.w == v->st_w && c.rect.h == v->st_h);
 	/* Fire and forget.  This runs for every damage rectangle the server
 	 * reports -- hundreds a second while a window is dragged -- and
 	 * waiting for the host to finish each one put the whole desktop,
@@ -319,8 +329,11 @@ static int stdu_cpu_blit(struct vmw_device *v, struct drm_framebuffer *fb,
 	uint32_t bpp = fb->bpp / 8;
 	uint32_t dst_pitch = v->st_w * 4;
 
+	uint64_t t0 = timer_rdtsc();
+
 	if (bpp != 4)
 		return -EINVAL;
+	vmw_execbuf_note_blit((uint64_t)(x2 - x1) * (y2 - y1));
 	for (int y = y1; y < y2; y++) {
 		uint64_t soff = fb->offset + (uint64_t)y * fb->pitch +
 				(uint64_t)x1 * bpp;
@@ -343,6 +356,7 @@ static int stdu_cpu_blit(struct vmw_device *v, struct drm_framebuffer *fb,
 			bytes -= chunk;
 		}
 	}
+	vmw_execbuf_note_time(VMW_T_BLIT, timer_rdtsc() - t0);
 	return 0;
 }
 
@@ -428,9 +442,13 @@ int vmw_stdu_ensure(struct vmw_device *v, uint32_t w, uint32_t h)
  *
  * `full' asks for the whole framebuffer and (re)binds what is scanned out;
  * a dirty-rectangle update passes full = 0 and only refreshes that box. */
-int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
-		     int y1, int x2, int y2, int full)
+static int vmw_stdu_present_do(struct vmw_device *v, struct drm_framebuffer *fb,
+			       int x1, int y1, int x2, int y2, int full)
 {
+	/* One present is one frame, which is what the execbuf counters are
+	 * reported against. */
+	vmw_execbuf_note_frame();
+
 	int rc;
 
 	if (!v->st_defined || !fb || !fb->obj)
@@ -454,8 +472,17 @@ int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
 			 * scan-out buffer may have been replaced by a
 			 * different surface that happens to hold the same
 			 * id. */
-			if (full || v->st_bound_sid != s->sid)
+			/* Bind only when the target is not already showing
+			 * THIS surface.  A full present no longer forces it:
+			 * what a full present means is that the whole area
+			 * has to be re-sent, which is the update below, not
+			 * that the binding is stale. */
+			if (v->st_bound_sid != s->sid ||
+			    v->st_bound_obj != (const void *)s) {
 				rc = stdu_bind(v, s->sid);
+				if (rc == 0)
+					v->st_bound_obj = (const void *)s;
+			}
 			if (rc == 0)
 				rc = stdu_update_target(v, x1, y1, x2, y2);
 			/* If the device would not take it, fall through to the
@@ -481,12 +508,14 @@ int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
 				stdu_report_fail("display surface", fresh);
 				return fresh;
 			}
-			if (v->st_bound_sid != v->st_surface->sid) {
+			if (v->st_bound_sid != v->st_surface->sid ||
+			    v->st_bound_obj != (const void *)v->st_surface) {
 				rc = stdu_bind(v, v->st_surface->sid);
 				if (rc) {
 					stdu_report_fail("bind display surface", rc);
 					return rc;
 				}
+				v->st_bound_obj = (const void *)v->st_surface;
 			}
 			/* A display surface the host has only just defined
 			 * holds no image.  Copying the dirty rectangle into
@@ -522,12 +551,14 @@ int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
 		stdu_report_fail("display surface", fresh);
 		return fresh;
 	}
-	if (v->st_bound_sid != v->st_surface->sid) {
+	if (v->st_bound_sid != v->st_surface->sid ||
+	    v->st_bound_obj != (const void *)v->st_surface) {
 		rc = stdu_bind(v, v->st_surface->sid);
 		if (rc) {
 			stdu_report_fail("bind display surface", rc);
 			return rc;
 		}
+		v->st_bound_obj = (const void *)v->st_surface;
 	}
 	/* As above: a surface that has just been defined shows nothing until
 	 * something has been put in all of it. */
@@ -555,6 +586,22 @@ int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
 	/* A finished update has to reach the display rather than wait for
 	 * whatever is submitted next. */
 	vmw_cmd_flush(v);
+	return rc;
+}
+
+/* The present, timed.
+ *
+ * Every path out of it is included -- the copies, the command building and
+ * the flush that hands the batch over -- because the question this answers
+ * is how much of a frame the display path costs the guest, and a breakdown
+ * that stopped at the interesting half would answer a different one. */
+int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
+		     int y1, int x2, int y2, int full)
+{
+	uint64_t t0 = timer_rdtsc();
+	int rc = vmw_stdu_present_do(v, fb, x1, y1, x2, y2, full);
+
+	vmw_execbuf_note_time(VMW_T_PRESENT, timer_rdtsc() - t0);
 	return rc;
 }
 

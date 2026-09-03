@@ -4,6 +4,8 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/hrtimer.h>
+#include <kernel/ke/waitq.h>
+#include <kernel/hal/lapic.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 
@@ -29,6 +31,39 @@
 /* How much is gathered before it has to go.  Comfortably inside a slot, and
  * far more than a frame's worth of object commands. */
 #define VMW_PEND_BYTES (64 * 1024)
+
+/* What the command-buffer channel has cost since the last report.
+ *
+ * Every submission is two register writes that leave the virtual machine,
+ * and the host then charges its own per-buffer overhead before it looks at
+ * a single command -- neither of which is visible in any guest-side timer.
+ * The only way to see it is the round trip: submitted_us on the slot against
+ * the moment the buffer is found completed.  Reaping is driven by the
+ * command-buffer interrupt, so that moment is close to the real one.
+ *
+ * What the numbers mean.  With `n' buffers a second at `t' microseconds each,
+ * n*t is the host time a second that no guest counter accounts for, and it is
+ * the same time the frame spends inside `fencewait'.  If it is large, the fix
+ * is FEWER buffers -- gather more per submission -- and if it is small the
+ * host's time is going into pixels instead and batching will not buy it back. */
+static struct {
+	uint64_t submits;
+	uint64_t bytes;
+	uint64_t done;
+	uint64_t lat_us;
+	uint64_t lat_max_us;
+} g_cb;
+
+void vmw_cmdbuf_stats(uint64_t *submits, uint64_t *kbytes, uint64_t *avg_us,
+		      uint64_t *max_us)
+{
+	*submits = g_cb.submits;
+	*kbytes = g_cb.bytes / 1024;
+	*avg_us = g_cb.done ? g_cb.lat_us / g_cb.done : 0;
+	*max_us = g_cb.lat_max_us;
+	g_cb.submits = g_cb.bytes = g_cb.done = 0;
+	g_cb.lat_us = g_cb.lat_max_us = 0;
+}
 
 /* Slot states.
  *
@@ -57,6 +92,7 @@ static void pend_lock(struct vmw_device *v);
 static void pend_unlock(struct vmw_device *v);
 static int pend_flush_locked(struct vmw_device *v);
 static void defer_drain(struct vmw_device *v);
+void vmw_cmd_drain(struct vmw_device *v);
 static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 				int timed_out);
 
@@ -65,6 +101,7 @@ static int vmw_cmdbuf_bringup(struct vmw_device *v)
 	v->cb_busy = 0;
 	v->cb_nslots = 0;
 	v->cb_last_progress_us = timer_get_precise_us();
+	wq_head_init(&v->cb_wq, "vmw_cb");
 	if (!v->has_cmdbuf)
 		return 0;
 	for (int i = 0; i < VMW_CB_SLOTS; i++) {
@@ -188,6 +225,8 @@ static void cb_slot_ring(struct vmw_device *v, struct vmw_cb_slot *s)
 	h->dxContext = s->dx;
 	__asm__ volatile("" ::: "memory");
 	s->submitted_us = timer_get_precise_us();
+	g_cb.submits++;
+	g_cb.bytes += s->bytes;
 	uint64_t pa = s->hdr_phys | s->ctx;
 	cb_channel_acquire(v);
 	/* The ticket is taken inside the claim, so ticket order IS the order
@@ -291,8 +330,18 @@ static void cb_reap(struct vmw_device *v, int may_recover)
 			continue;
 		}
 		v->cb_last_progress_us = timer_get_precise_us();
-		if (h->status == SVGA_CB_STATUS_COMPLETED)
+		if (h->status == SVGA_CB_STATUS_COMPLETED) {
+			uint64_t us = v->cb_last_progress_us > s->submitted_us ?
+					      v->cb_last_progress_us -
+						      s->submitted_us :
+					      0;
+
+			g_cb.done++;
+			g_cb.lat_us += us;
+			if (us > g_cb.lat_max_us)
+				g_cb.lat_max_us = us;
 			cb_slot_completed(v, s);
+		}
 		else if (cb_slot_handle_error(v, s, timed_out)) {
 			/* Handed back to the device -- the repaired payload,
 			 * or the same one again: the slot is in flight and
@@ -305,6 +354,10 @@ static void cb_reap(struct vmw_device *v, int may_recover)
 		 * arrive would sit out its whole timeout for nothing. */
 		cb_slot_completed(v, s);
 		__atomic_store_n(&s->state, CB_FREE, __ATOMIC_RELEASE);
+		/* A slot is free: whoever is asleep for one may have it.  From
+		 * the interrupt as well as from a submitter -- the wait queue
+		 * is the same one the fence layer wakes from here. */
+		wq_wake_all(&v->cb_wq);
 	}
 }
 
@@ -333,6 +386,99 @@ static void cb_slot_completed(struct vmw_device *v, struct vmw_cb_slot *s)
 	drm_fence_signal_upto(&v->drm, seq);
 }
 
+/* ---- waiting without paying a timeslice for it --------------------------
+ *
+ * Two places on the submission path wait for something that is normally
+ * over in microseconds: the gather lock, held for a copy and two register
+ * writes, and a free command-buffer slot, which the device hands back a
+ * few hundred microseconds after it was rung.  Both used to wait by
+ * yielding the processor, and a yield is not a short wait: the task goes
+ * to the back of its run queue and whatever is in front of it runs for up
+ * to its whole timeslice -- SCHED_TIME_SLICE ticks of the periodic timer,
+ * twenty milliseconds.  With a display server and a browser submitting
+ * against each other, a lock held for five microseconds cost the loser a
+ * frame, and it showed up in the frame accounting as `slotwait' events of
+ * seven to fourteen milliseconds and presents of two to four.
+ *
+ * So a short wait spins -- with `pause', bounded by the timestamp counter
+ * -- and only a long one gives the processor up.  A waiter for a slot then
+ * SLEEPS rather than yields, woken by the reaper the moment a slot comes
+ * free, with a timer behind it for the host without a completion
+ * interrupt.  The same shape as the fence wait in drm_fence.c, for the
+ * same reason. */
+#define VMW_SPIN_LOCK_US 100  /* the gather lock: a copy and a doorbell */
+#define VMW_SPIN_SLOT_US 200  /* a slot: the device's usual turnaround */
+#define VMW_SLOT_POLL_NS 1000000ULL /* asleep for a slot: look again after */
+
+static uint64_t spin_ticks(uint64_t us)
+{
+	return lapic_get_tsc_freq() / 1000000ULL * us;
+}
+
+static int can_sleep(void)
+{
+	return sched_current() && irqs_enabled();
+}
+
+static int cb_any_slot_free(const struct vmw_device *v)
+{
+	for (int i = 1; i < v->cb_nslots; i++)
+		if (v->cb_slot[i].state == CB_FREE)
+			return 1;
+	return 0;
+}
+
+/* The poll deadline for a sleeping slot waiter.  From the timer, so it
+ * claims the task the way every waker must: a claim without an enqueue
+ * strands it. */
+static void cb_slot_poll_wake(hrtimer_t *t)
+{
+	task_t *task = t->arg;
+
+	if (sched_claim_wake(task, TASK_BLOCKED)) {
+		task->wait_channel = NULL;
+		sched_enqueue_ready(task);
+	}
+}
+
+/* Sleep until the reaper frees a slot, or the poll interval passes. */
+static void cb_slot_sleep(struct vmw_device *v)
+{
+	task_t *cur = sched_current();
+	struct wait_queue_entry we;
+	hrtimer_t poll_timer;
+	int highres = hrtimer_is_highres();
+	uint64_t fl;
+
+	if (highres)
+		hrtimer_init(&poll_timer, cb_slot_poll_wake, cur);
+	fl = local_irq_save();
+	wq_entry_init(&we, cur);
+	wq_add(&v->cb_wq, &we);
+	/* Queued first, then looked again: a slot freed between the failed
+	 * pass and the add would otherwise be a wake nobody was there for. */
+	if (cb_any_slot_free(v)) {
+		local_irq_restore(fl);
+		wq_remove(&v->cb_wq, &we);
+		return;
+	}
+	cur->wait_channel = &v->cb_wq;
+	if (highres)
+		hrtimer_start(&poll_timer, hrtimer_now_ns() + VMW_SLOT_POLL_NS);
+	else
+		cur->wakeup_tick = timer_ticks() + 1;
+	cur->state = TASK_BLOCKED;
+	local_irq_restore(fl);
+	sched_schedule();
+	if (highres)
+		hrtimer_cancel(&poll_timer);
+	/* Disarm: this deadline belongs to this wait and to nothing after
+	 * it -- see the note above sched_claim_wake(). */
+	cur->wakeup_tick = 0;
+	cur->wait_channel = NULL;
+	wq_remove(&v->cb_wq, &we);
+}
+
 /* Claim a free slot, reaping while none is available.  The slot comes back
  * in CB_FILLING: the caller fills it, rings it, and only then publishes it
  * with cb_slot_published(). */
@@ -349,6 +495,8 @@ static struct vmw_cb_slot *cb_slot_claim(struct vmw_device *v)
 	 * points at the guilty batch and one that misleads.  The cost is
 	 * sixteen loads of a status word per submission, against two exits
 	 * from the virtual machine. */
+	uint64_t t0 = 0;
+
 	cb_reap(v, 1);
 	for (;;) {
 		/* Slot 0 is reserved: see cb_slot_take(). */
@@ -361,15 +509,28 @@ static struct vmw_cb_slot *cb_slot_claim(struct vmw_device *v)
 			if (__atomic_compare_exchange_n(&s->state, &st,
 							CB_FILLING, 0,
 							__ATOMIC_ACQUIRE,
-							__ATOMIC_RELAXED))
+							__ATOMIC_RELAXED)) {
+				/* Only a claim that had to wait is recorded:
+				 * the ordinary one finds a slot on the first
+				 * pass and costs nothing, and counting those
+				 * would bury the ones that matter. */
+				if (t0)
+					vmw_execbuf_note_time(VMW_T_SLOT,
+							      timer_rdtsc() - t0);
 				return s;
+			}
+		}
+		if (!t0) {
+			t0 = timer_rdtsc();
+			vmw_execbuf_note_slot_wait();
 		}
 		cb_reap(v, 1);
 		defer_drain(v);
-		if (sched_current() && irqs_enabled())
-			sched_yield_in_kernel();
-		else
+		if (!can_sleep() ||
+		    timer_rdtsc() - t0 < spin_ticks(VMW_SPIN_SLOT_US))
 			__asm__ volatile("pause");
+		else
+			cb_slot_sleep(v);
 	}
 }
 
@@ -872,9 +1033,67 @@ static int cb_submit_async(struct vmw_device *v, const void *payload,
  * means it has worked through the command as well.  Waiting for that on the
  * spot is what this replaces: it happened per buffer destroyed, and a
  * display server destroys one per pixmap. */
-#define VMW_DEFER_MAX \
-	((uint32_t)(sizeof(((struct vmw_device *)0)->defer_free) / \
-		    sizeof(((struct vmw_device *)0)->defer_free[0])))
+/* Enough entries to hold a quarter of a gigabyte of pages waiting on the
+ * device.  Past that something is wrong with the device rather than with the
+ * client, and making it idle is the right answer. */
+#define VMW_DEFER_CAP_MAX (1u << 16)
+#define VMW_DEFER_CAP_MIN 64u
+
+/* Make room for `need' more pages, growing the holding area if necessary.
+ *
+ * The allocation happens with the lock DROPPED -- it may sleep -- so the
+ * capacity is re-tested after retaking it and a loser frees its spare copy.
+ * Returns false only when the area cannot grow, and the caller then has to
+ * make the device idle instead. */
+static bool defer_reserve(struct vmw_device *v, uint32_t need)
+{
+	uint64_t fl;
+
+	for (;;) {
+		uint32_t want, have_n;
+		uint64_t *nw, *old;
+
+		spin_lock_irqsave(&v->defer_lock, &fl);
+		if (v->defer_n + need <= v->defer_cap) {
+			spin_unlock_irqrestore(&v->defer_lock, fl);
+			return true;
+		}
+		have_n = v->defer_n;
+		spin_unlock_irqrestore(&v->defer_lock, fl);
+
+		want = v->defer_cap ? v->defer_cap : VMW_DEFER_CAP_MIN;
+		while (want < have_n + need) {
+			if (want > VMW_DEFER_CAP_MAX / 2)
+				return false;
+			want *= 2;
+		}
+		nw = kalloc((size_t)want * sizeof(*nw));
+		if (!nw)
+			return false;
+
+		spin_lock_irqsave(&v->defer_lock, &fl);
+		if (v->defer_n + need <= v->defer_cap) {
+			/* someone else grew it while this allocated */
+			spin_unlock_irqrestore(&v->defer_lock, fl);
+			kfree(nw);
+			return true;
+		}
+		if (want < v->defer_n + need) {
+			/* it filled further meanwhile: size it again */
+			spin_unlock_irqrestore(&v->defer_lock, fl);
+			kfree(nw);
+			continue;
+		}
+		for (uint32_t i = 0; i < v->defer_n; i++)
+			nw[i] = v->defer_free[i];
+		old = v->defer_free;
+		v->defer_free = nw;
+		v->defer_cap = want;
+		spin_unlock_irqrestore(&v->defer_lock, fl);
+		kfree(old);
+		return true;
+	}
+}
 
 /* Put one page in the holding area, or free it the slow way if it is full.
  *
@@ -899,19 +1118,34 @@ static void defer_free_page(struct vmw_device *v, uint64_t phys)
 	 * is free -- precisely when the device has NOT caught up. */
 	defer_drain(v);
 
-	spin_lock_irqsave(&v->defer_lock, &fl);
-	if (v->defer_n < VMW_DEFER_MAX) {
-		v->defer_free[v->defer_n++] = phys;
-		queued = 1;
+	if (defer_reserve(v, 1)) {
+		spin_lock_irqsave(&v->defer_lock, &fl);
+		if (v->defer_n < v->defer_cap) {
+			v->defer_free[v->defer_n++] = phys;
+			queued = 1;
+		}
+		spin_unlock_irqrestore(&v->defer_lock, fl);
 	}
-	spin_unlock_irqrestore(&v->defer_lock, fl);
 	if (queued)
 		return;
 
-	/* Nowhere to hold it: fall back to making sure the device is
-	 * done, which is always allowed, just slower. */
-	vmw_cmd_flush(v);
-	cb_reap(v, 1);
+	/* Nowhere to hold it, so the page can only be released by making sure
+	 * the device is finished with it -- and that means WAITING.
+	 *
+	 * vmw_cmd_flush() only hands the gathered commands over and cb_reap()
+	 * only collects buffers that have already finished; neither of them
+	 * waits for anything, so between them they were no guarantee at all.
+	 * This path is reached exactly when the holding area is full, which is
+	 * when the client is churning buffers hardest and the device is
+	 * furthest behind -- the worst moment to hand a page it is still
+	 * reading back to the allocator, where the next allocation writes over
+	 * what the device is about to display.
+	 *
+	 * vmw_cmd_drain() flushes, waits for every slot to fall idle, and
+	 * drains the holding area on its way out -- so afterwards nothing is
+	 * in flight and this page, and everything that was held, are all
+	 * genuinely free. */
+	vmw_cmd_drain(v);
 	mm_free_physical_page(phys);
 }
 
@@ -927,7 +1161,7 @@ static void defer_free_page(struct vmw_device *v, uint64_t phys)
  * in unrelated kernel structures came from. */
 static void defer_drain(struct vmw_device *v)
 {
-	uint64_t pages[VMW_DEFER_MAX];
+	uint64_t *pages;
 	uint32_t n;
 	uint64_t fl;
 
@@ -937,17 +1171,20 @@ static void defer_drain(struct vmw_device *v)
 		if (v->cb_slot[i].state != CB_FREE)
 			return; /* something is still in flight */
 
+	/* The whole array is taken, not copied into one on the stack: it is
+	 * grown to whatever a client's buffers needed and no longer has a
+	 * bound small enough to stand there. */
 	spin_lock_irqsave(&v->defer_lock, &fl);
+	pages = v->defer_free;
 	n = v->defer_n;
-	if (n > VMW_DEFER_MAX)
-		n = VMW_DEFER_MAX;
-	for (uint32_t i = 0; i < n; i++)
-		pages[i] = v->defer_free[i];
+	v->defer_free = NULL;
 	v->defer_n = 0;
+	v->defer_cap = 0;
 	spin_unlock_irqrestore(&v->defer_lock, fl);
 
 	for (uint32_t i = 0; i < n; i++)
 		mm_free_physical_page(pages[i]);
+	kfree(pages);
 }
 
 /* Release the pages that backed a buffer object.
@@ -974,7 +1211,6 @@ static void defer_drain(struct vmw_device *v)
 void vmw_defer_free_pages(struct vmw_device *v, const uint64_t *pages,
 			  uint32_t n)
 {
-	const uint32_t cap = sizeof(v->defer_free) / sizeof(v->defer_free[0]);
 	uint32_t i = 0;
 
 	if (!v || !pages)
@@ -984,11 +1220,11 @@ void vmw_defer_free_pages(struct vmw_device *v, const uint64_t *pages,
 
 	/* One critical section for the whole buffer: the count must not move
 	 * between the test and the store, or two callers claim one slot. */
-	{
+	if (defer_reserve(v, n)) {
 		uint64_t fl;
 
 		spin_lock_irqsave(&v->defer_lock, &fl);
-		for (; i < n && v->defer_n < cap; i++)
+		for (; i < n && v->defer_n < v->defer_cap; i++)
 			if (pages[i])
 				v->defer_free[v->defer_n++] = pages[i];
 		spin_unlock_irqrestore(&v->defer_lock, fl);
@@ -996,12 +1232,17 @@ void vmw_defer_free_pages(struct vmw_device *v, const uint64_t *pages,
 	if (i == n)
 		return;
 
-	/* Too many to hold.  Make the device work through everything it has
-	 * been given, which is what the holding area was waiting for anyway,
-	 * then the rest can go back directly. */
-	vmw_cmd_flush(v);
-	cb_reap(v, 1);
-	defer_drain(v);
+	/* Nowhere to hold the rest, so the only way they can go back is to
+	 * make the device finish with them first -- once, here, for whatever
+	 * is left of this buffer.
+	 *
+	 * This used to flush and reap and then free them regardless.  Neither
+	 * of those waits for anything: vmw_cmd_flush() hands the gathered
+	 * commands over and cb_reap() collects what has already finished, so
+	 * the pages went back to the allocator while the host could still be
+	 * reading them.  A full-screen image put 2186 of its 2250 pages
+	 * through that path every time one was torn down. */
+	vmw_cmd_drain(v);
 	for (; i < n; i++)
 		if (pages[i])
 			mm_free_physical_page(pages[i]);
@@ -1134,22 +1375,44 @@ uint32_t vmw_cmd_fence_emit(struct vmw_device *v)
 	}
 
 	pend_lock(v);
-	/* A fence follows what came before it: anything gathered for a DX
-	 * context goes first, in its own buffer. */
-	if (v->pend_len && v->pend_dx != SVGA3D_INVALID_ID)
-		pend_flush_locked(v);
 	seq = vmsvga2_fence_alloc();
 	if (seq) {
-		if (v->pend_len + sizeof(cmd) > VMW_PEND_BYTES)
-			pend_flush_locked(v);
-		cmd[0] = SVGA_CMD_FENCE;
-		cmd[1] = seq;
-		mm_memcpy(v->pend + v->pend_len, cmd, sizeof(cmd));
-		v->pend_len += (uint32_t)sizeof(cmd);
-		v->pend_dx = SVGA3D_INVALID_ID;
-		v->pend_fence_seq = seq;
-		if (pend_flush_locked(v) != 0)
-			seq = 0;
+		if (v->pend_len) {
+			/* TAG the buffer the work is already in, rather than
+			 * handing that buffer over and then a second one
+			 * carrying eight bytes of SVGA_CMD_FENCE.
+			 *
+			 * Nothing here ever reads the device's fence
+			 * register -- vmw_fence_check() says why, at length --
+			 * so the FENCE COMMAND was never what told this driver
+			 * the fence had passed.  The COMPLETION of the buffer
+			 * is (cb_slot_completed), and the slot carries the
+			 * sequence out of band.  So the command was pure cost:
+			 * a whole second command buffer, a second pair of
+			 * doorbell register writes, and a second exit to the
+			 * host, for every submission -- and a submission is
+			 * every execbuf, eight to twelve a frame.
+			 *
+			 * It is also more accurate this way.  The fence now
+			 * passes when the batch it stands for completes,
+			 * instead of when a buffer queued behind that batch
+			 * does. */
+			v->pend_fence_seq = seq;
+			if (pend_flush_locked(v) != 0)
+				seq = 0;
+		} else {
+			/* Nothing gathered: everything this fence stands for
+			 * has already gone, so it needs a buffer of its own to
+			 * complete behind them.  One context executes its
+			 * buffers in order, so completion of this one means
+			 * completion of all of them. */
+			cmd[0] = SVGA_CMD_FENCE;
+			cmd[1] = seq;
+			if (cb_submit_async_seq(v, cmd, (uint32_t)sizeof(cmd),
+						SVGA_CB_FLAG_NONE, 0,
+						SVGA_CB_CONTEXT_0, seq) != 0)
+				seq = 0;
+		}
 	}
 	pend_unlock(v);
 	return seq;
@@ -1221,11 +1484,19 @@ int vmw_cmd_raw(struct vmw_device *v, const void *cmds, uint32_t bytes, int ring
  * display). */
 static void pend_lock(struct vmw_device *v)
 {
+	uint64_t t0 = 0;
+
 	while (__atomic_test_and_set(&v->pend_busy, __ATOMIC_ACQUIRE)) {
-		if (sched_current() && irqs_enabled())
-			sched_yield_in_kernel();
-		else
+		if (!t0)
+			t0 = timer_rdtsc();
+		/* Spin for the ordinary hold; yield only for one that has
+		 * outlived it -- the holder asleep for a slot, typically.
+		 * See the note above cb_slot_claim(). */
+		if (!can_sleep() ||
+		    timer_rdtsc() - t0 < spin_ticks(VMW_SPIN_LOCK_US))
 			__asm__ volatile("pause");
+		else
+			sched_yield_in_kernel();
 	}
 }
 

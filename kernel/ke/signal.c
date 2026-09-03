@@ -734,6 +734,20 @@ int signal_should_restart(task_t *task)
 			    sigismember_k(&sig->blocked, s)) {
 				continue;
 			}
+			/* Only a signal that will actually RUN A HANDLER has
+			 * an opinion.  SA_RESTART describes what a handler
+			 * wants done with the call it interrupted, so a
+			 * disposition that runs no handler -- default or
+			 * ignore -- expresses nothing, and its zeroed flags
+			 * are not a vote against restarting.  Reading them as
+			 * one is what made an ignored SIGCHLD arriving during
+			 * a wait come back as a spurious EINTR for a program
+			 * that had installed no handler at all and could not
+			 * have been interrupted by anything it could see. */
+			if (sig->action[s].sa_handler == SIG_DFL ||
+			    sig->action[s].sa_handler == SIG_IGN) {
+				continue;
+			}
 			// Check if this signal's handler has SA_RESTART
 			if (!(sig->action[s].sa_flags & SA_RESTART)) {
 				return 0; // At least one signal lacks SA_RESTART
@@ -741,7 +755,9 @@ int signal_should_restart(task_t *task)
 		}
 	}
 
-	return 1; // All pending signals have SA_RESTART (or no pending signals)
+	/* Every handler that will run asked for it -- or none will run, in
+	 * which case nothing observable happened and the call simply resumes. */
+	return 1;
 }
 
 // Dequeue a pending signal (returns signal number, 0 if none)

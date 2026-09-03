@@ -123,11 +123,26 @@ struct mm_dirty_ops {
 	 * implementation gets this for free from demand-faulted mappings,
 	 * whose entries it creates read-only while fault-tracking.) */
 	int (*wp_new_mapping)(void *obj);
+	/* A record that can WRITE this object appeared (add = 1) or went away
+	 * (add = 0).
+	 *
+	 * The tracker compares the records it can WALK against the records
+	 * that EXIST, and answers a shortfall by reporting the whole object
+	 * dirty -- so what "exists" must mean the same thing on both sides,
+	 * and a read-only record belongs on neither.  It cannot dirty a page,
+	 * and counting it made a browser whose UI process maps every tile
+	 * read-only to composite it report every tile whole-dirty for ever.
+	 *
+	 * Driven from the record's own lifetime (mm_region_ref_hold/drop) and
+	 * from mprotect, so a mapping that gains or loses write permission is
+	 * counted from that moment. */
+	void (*map_census)(void *obj, int add);
 };
 
 /* One pass over the CURRENT address space's mappings of one driver object.
  *
- * Matching is by record: in_use, device, dev_obj == obj, dev_dirty == ops.
+ * Matching is by record: in_use, device, dev_obj == obj, dev_dirty == ops
+ * (or ops_alt, placed by file_base_alt).
  * `file_base' is the driver-file offset of the object's first page and
  * `npages' its length, so a record's pages can be placed within the object;
  * [first, last) further narrows the pass to a page window of the object.
@@ -144,6 +159,16 @@ struct mm_dirty_walk {
 	void *obj;
 	const struct mm_dirty_ops *ops;
 	uint64_t file_base;
+	/* A second flavour of record for the same object, with its own base:
+	 * a buffer mapped through an exported descriptor carries the
+	 * descriptor's callbacks and addresses the object from byte zero,
+	 * where the device-node mapping carries the node's callbacks and sits
+	 * at the object's window in the node's offset space.  Both write the
+	 * same pages; a sweep that walks only one of them reports the other
+	 * as unreachable and the whole object as dirty on every pass.  NULL
+	 * when there is no second flavour. */
+	const struct mm_dirty_ops *ops_alt;
+	uint64_t file_base_alt;
 	uint64_t npages;
 	uint64_t first, last; /* page window within the object */
 	/* clean walk only: called for each dirty page found, with the
@@ -510,6 +535,20 @@ void mm_merge_region_neighbours(struct task *task, struct mmap_region *region);
 /* Take / drop the references a region record holds (its file and, for a
  * mapping of a driver object, the object).  A new record copied from an
  * existing one must hold before it is published. */
+/* One record that can write a driver object came (add = 1) or went (add = 0).
+ * Called by the record's lifetime hooks and by mprotect; a no-op for records
+ * that are read-only or that watch nothing.  See mm_dirty_ops.map_census. */
+void mm_region_census(const struct mmap_region *r, int add);
+
+
+/* Hand a driver's dirty tracker every page whose entry says it was written,
+ * before those entries are discarded.  A swept mapping keeps that fact
+ * nowhere else, so a discard without this loses the write and leaves the
+ * device showing what it had.  Called by munmap for the range it retires and
+ * by the exit teardown for the whole address space. */
+void mm_region_harvest_dirty(uint64_t *pml4, const struct mmap_region *r,
+			     uint64_t from, uint64_t to);
+void mm_regions_harvest_dirty(struct task *task, uint64_t *pml4);
 void mm_region_ref_hold(struct mmap_region *r);
 void mm_region_ref_drop(struct mmap_region *r);
 /* Pages this address space actually has resident -- the real resident set,

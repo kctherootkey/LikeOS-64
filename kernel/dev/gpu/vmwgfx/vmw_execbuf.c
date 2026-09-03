@@ -15,6 +15,8 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
+#include <kernel/ke/timer.h>
+#include <kernel/hal/lapic.h>
 
 /* Distinct objects one submission may touch.
  *
@@ -727,8 +729,239 @@ static void vmw_execbuf_note_reject(uint32_t id, uint32_t bsize, int rc)
 		sched_current() ? (int)sched_current()->id : -1);
 }
 
-int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
-		struct drm_vmw_execbuf_arg *a)
+/* ---- per-frame accounting ---------------------------------------------
+ *
+ * Reported once a second, and only while something is actually being drawn,
+ * so an idle desktop stays silent.  Rates per FRAME rather than per second
+ * because that is the number the question is about: a frame has 16.7ms and
+ * the interesting quantity is how much of it the client asks for.
+ */
+static struct {
+	uint64_t frames;    /* presents */
+	uint64_t submits;   /* execbuf calls */
+	uint64_t rejects;   /* batches the device refused */
+	uint64_t restores;  /* dirt put back after a drop */
+	uint64_t coherent;  /* coherent surfaces scanned */
+	uint64_t boxes;     /* dirty boxes emitted */
+	uint64_t cmdbytes;  /* client command bytes */
+	uint64_t binds;     /* screen-target rebinds */
+	uint64_t upd_px;    /* pixels the host was told to re-read */
+	uint64_t blit_px;   /* pixels the guest copied itself */
+	uint64_t fulls;     /* presents covering the whole screen */
+	uint64_t slotwaits; /* submissions that found no free slot */
+	uint64_t tsc[VMW_T_MAX];
+	uint64_t last_us;
+} g_eb;
+
+void vmw_execbuf_note_time(enum vmw_time_stage stage, uint64_t tsc_ticks)
+{
+	if ((unsigned)stage < VMW_T_MAX)
+		__atomic_fetch_add(&g_eb.tsc[stage], tsc_ticks,
+				   __ATOMIC_RELAXED);
+}
+
+void vmw_execbuf_note_update(uint64_t pixels, int full)
+{
+	__atomic_fetch_add(&g_eb.upd_px, pixels, __ATOMIC_RELAXED);
+	if (full)
+		__atomic_fetch_add(&g_eb.fulls, 1, __ATOMIC_RELAXED);
+}
+
+void vmw_execbuf_note_blit(uint64_t pixels)
+{
+	__atomic_fetch_add(&g_eb.blit_px, pixels, __ATOMIC_RELAXED);
+}
+
+void vmw_execbuf_note_slot_wait(void)
+{
+	__atomic_fetch_add(&g_eb.slotwaits, 1, __ATOMIC_RELAXED);
+}
+
+void vmw_execbuf_note_bind(void)
+{
+	__atomic_fetch_add(&g_eb.binds, 1, __ATOMIC_RELAXED);
+}
+
+void vmw_execbuf_note_frame(void)
+{
+	/* The present path does not hold execbuf_lock, which everything else
+	 * here does.  A lost count would only skew a diagnostic, but the add
+	 * is free. */
+	__atomic_fetch_add(&g_eb.frames, 1, __ATOMIC_RELAXED);
+}
+
+static void execbuf_stat_report(void)
+{
+	uint64_t now = timer_get_precise_us();
+	uint64_t f;
+
+	if (!g_eb.last_us) {
+		g_eb.last_us = now;
+		return;
+	}
+	if (now - g_eb.last_us < 1000000)
+		return;
+	g_eb.last_us = now;
+	/* Per FRAME where frames were presented; where none were -- offscreen
+	 * rendering with nothing reaching the screen -- the same figures are
+	 * per second, and the frame count of 0 says so. */
+	f = g_eb.frames ? g_eb.frames : 1;
+	{
+		uint64_t covered, total, ubytes;
+
+		vmw_surface_dirty_emit_stats(&covered, &total, &ubytes);
+		/* Megabytes the host has to re-read per second because of
+		 * those updates, at four bytes a texel, and what share of the
+		 * surface they covered.  A share near 100 means the whole
+		 * buffer is being re-sent every frame. */
+		kprintf("[drm] vmwgfx: updates covered %llu%% of surface, %llu MB/s re-read\n",
+			(unsigned long long)(total ? covered * 100 / total : 0),
+			(unsigned long long)(ubytes / 1024 / 1024));
+	}
+	/* Tenths, because these rates can be well under one per frame and
+	 * whole numbers would round that away to nothing. */
+#define PER_FRAME(x) (unsigned long long)((x) * 10 / f / 10), \
+		     (unsigned long long)((x) * 10 / f % 10)
+	kprintf("[drm] vmwgfx: %llu frames/s  execbuf %llu.%llu/frame  coherent %llu.%llu  boxes %llu.%llu  cmdKB %llu.%llu  binds %llu  rejects %llu  restores %llu\n",
+		(unsigned long long)g_eb.frames,
+		PER_FRAME(g_eb.submits),
+		PER_FRAME(g_eb.coherent),
+		PER_FRAME(g_eb.boxes),
+		PER_FRAME(g_eb.cmdbytes / 1024),
+		(unsigned long long)g_eb.binds,
+		(unsigned long long)g_eb.rejects,
+		(unsigned long long)g_eb.restores);
+	/* Where the second went.
+	 *
+	 * Milliseconds OUT OF THE 1000 this line covers, so the numbers are
+	 * directly comparable with the budget: a stage at 900 is the frame
+	 * rate, a stage at 20 is not worth touching whatever it does.  They
+	 * overlap by construction -- execbuf contains scan/emit/submit/fence,
+	 * present contains blit -- and they are wall time across every
+	 * processor, so a total above 1000 means several threads were in here
+	 * at once, which is itself worth seeing.
+	 *
+	 * `fencewait' is the client blocked on the device: high there with
+	 * everything else low says the host, not this driver, sets the rate.
+	 * `slotwait' is the opposite end -- submissions queued behind the
+	 * sixteen command buffers, i.e. the device being fed faster than it
+	 * drains.
+	 *
+	 * update/blit are megapixels a second: what the host must re-read for
+	 * the display, and what the processor copied to get it there.  A
+	 * display path paying per damaged pixel and one paying per screen look
+	 * identical in the frame count and nothing alike here. */
+	{
+		uint64_t hz = lapic_get_tsc_freq();
+		uint64_t wait_ticks = 0, waits = 0;
+
+		drm_fence_wait_stats(&wait_ticks, &waits);
+#define MS(t) (unsigned long long)(hz ? (t) * 1000ULL / hz : 0)
+		if (hz)
+			kprintf("[drm] vmwgfx: ms/s  execbuf %llu (scan %llu emit %llu submit %llu fence %llu)  present %llu (blit %llu)  slotwait %llu (%llu)  fencewait %llu (%llu waits)\n",
+				MS(g_eb.tsc[VMW_T_EXECBUF]),
+				MS(g_eb.tsc[VMW_T_SCAN]),
+				MS(g_eb.tsc[VMW_T_EMIT]),
+				MS(g_eb.tsc[VMW_T_SUBMIT]),
+				MS(g_eb.tsc[VMW_T_FENCE]),
+				MS(g_eb.tsc[VMW_T_PRESENT]),
+				MS(g_eb.tsc[VMW_T_BLIT]),
+				MS(g_eb.tsc[VMW_T_SLOT]),
+				(unsigned long long)g_eb.slotwaits, MS(wait_ticks),
+				(unsigned long long)waits);
+		{
+			uint64_t cbn = 0, cbkb = 0, cbavg = 0, cbmax = 0;
+
+			vmw_cmdbuf_stats(&cbn, &cbkb, &cbavg, &cbmax);
+			/* n * avg is the host time per second that no guest
+			 * counter sees -- the same time that shows up as
+			 * fencewait.  Large means batch more per buffer;
+			 * small means the host's time is going into pixels. */
+			kprintf("[drm] vmwgfx: cmdbuf %llu/s  %llu KB/s  host %llu us avg  %llu us max  (%llu ms/s of host)\n",
+				(unsigned long long)cbn,
+				(unsigned long long)cbkb,
+				(unsigned long long)cbavg,
+				(unsigned long long)cbmax,
+				(unsigned long long)(cbn * cbavg / 1000));
+		}
+		if (hz)
+			kprintf("[drm] vmwgfx: ms/s  execbuf_lock %llu  validate %llu\n",
+				MS(g_eb.tsc[VMW_T_LOCK]),
+				MS(g_eb.tsc[VMW_T_VALIDATE]));
+#undef MS
+		uint64_t scans = 0, sfull = 0, sfault = 0;
+
+		drm_gem_dirty_scan_stats(&scans, &sfull, &sfault);
+		/* A coverage of 100% means one of two things and they want
+		 * opposite fixes: `full' says how many scans could not reach
+		 * every mapping and reported the whole object to stay correct
+		 * -- bandwidth nobody asked for -- and the rest is the client
+		 * genuinely repainting. */
+		uint64_t found = 0, tot = 0;
+
+		drm_gem_dirty_scan_found(&found, &tot);
+		/* The share the sweep would have reported on its own.  Near
+		 * 100 means the whole-object fallback is telling the truth and
+		 * a reverse map would save nothing. */
+		kprintf("[drm] vmwgfx: sweep found %llu%% of tracked pages dirty (%llu of %llu)\n",
+			(unsigned long long)(tot ? found * 100 / tot : 0),
+			(unsigned long long)found, (unsigned long long)tot);
+		uint64_t dropped = 0, switched = 0;
+		uint64_t cscans = 0, cpages = 0, cshared = 0, crefresh = 0;
+
+		drm_gem_dirty_scan_content(&cscans, &cpages, &cshared,
+					   &crefresh);
+		/* `shared' is a buffer backing more than one coherent surface,
+		 * where one set of fingerprints cannot describe two device
+		 * copies and the whole object is reported instead; `refresh'
+		 * is the periodic full report that bounds how long anything
+		 * the tracker got wrong can survive. */
+		kprintf("[drm] vmwgfx: content scans %llu, %llu pages changed, %llu shared, %llu refresh\n",
+			(unsigned long long)cscans,
+			(unsigned long long)cpages,
+			(unsigned long long)cshared,
+			(unsigned long long)crefresh);
+		drm_gem_dirty_scan_why(&dropped, &switched);
+		kprintf("[drm] vmwgfx: dirty scans %llu, %llu whole-object (%llu unreachable at setup, %llu unreachable now), %llu by fault\n",
+			(unsigned long long)scans, (unsigned long long)sfull,
+			(unsigned long long)dropped, (unsigned long long)switched,
+			(unsigned long long)sfault);
+		kprintf("[drm] vmwgfx: display update %llu Mpx/s, guest blit %llu Mpx/s, %llu of %llu presents full-screen\n",
+			(unsigned long long)(g_eb.upd_px / 1000000),
+			(unsigned long long)(g_eb.blit_px / 1000000),
+			(unsigned long long)g_eb.fulls,
+			(unsigned long long)g_eb.frames);
+	}
+#undef PER_FRAME
+	g_eb.frames = g_eb.submits = g_eb.coherent = 0;
+	g_eb.boxes = g_eb.cmdbytes = g_eb.rejects = g_eb.restores = 0;
+	g_eb.binds = 0;
+	g_eb.upd_px = g_eb.blit_px = g_eb.fulls = g_eb.slotwaits = 0;
+	for (int i = 0; i < VMW_T_MAX; i++)
+		g_eb.tsc[i] = 0;
+}
+
+/* Put back the dirt of every coherent surface this submission emitted for.
+ *
+ * vmw_surface_dirty_emit() clears each box as it writes the command that
+ * carries it, on the understanding that the command is about to run.  When
+ * the batch does not run after all, that understanding is wrong and the
+ * writes those boxes described are lost: the device keeps the bytes it had,
+ * and nothing marks them again until the content is redrawn from scratch. */
+static void execbuf_restore_dirt(struct vmw_val *val)
+{
+	for (uint32_t i = 0; i < val->nrefs; i++) {
+		struct drm_gem_object *o = val->refs[i];
+		struct vmw_surface *cs =
+			o->kind == DRM_GEM_SURFACE ? o->priv : NULL;
+
+		if (cs && cs->coherent && cs->defined && cs->backup)
+			vmw_surface_dirty_mark_all(cs);
+	}
+}
+
+static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
+			  struct drm_vmw_execbuf_arg *a)
 {
 	struct drm_vmw_fence_rep rep;
 	int rc = 0;
@@ -743,6 +976,18 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 	struct vmw_val *val = kalloc(sizeof(*val));
 	if (!val)
 		return -ENOMEM;
+	/* Everything from here to `out' rewrites shared state -- the
+	 * context's object tables above all.  See execbuf_lock. */
+	/* Timed on its own.  This is a WRITE lock across the whole ioctl, so
+	 * every client submitting to this device -- the display server's
+	 * acceleration and the browser's web process at once -- takes turns
+	 * through it, and a queue here is invisible in every other stage. */
+	{
+		uint64_t t_lock = timer_rdtsc();
+
+		mm_write_lock(&v->execbuf_lock);
+		vmw_execbuf_note_time(VMW_T_LOCK, timer_rdtsc() - t_lock);
+	}
 	mm_memset(val, 0, sizeof(*val));
 	val->v = v;
 	val->fp = fp;
@@ -751,6 +996,7 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 		extern struct vmw_context *vmw_file_context(struct drm_file *fp, uint32_t cid);
 		val->ctx = vmw_file_context(fp, a->context_handle);
 		if (!val->ctx || !val->ctx->dx) {
+			mm_write_unlock(&v->execbuf_lock);
 			kfree(val);
 			return -EINVAL;
 		}
@@ -759,9 +1005,11 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 
 	uint8_t *cmds = NULL;  /* the client's stream, rewritten in place */
 	uint8_t *batch = NULL; /* stream with coherent updates ahead of it */
+	uint64_t t_val = timer_rdtsc();
 	if (a->command_size) {
 		cmds = kalloc(a->command_size);
 		if (!cmds) {
+			mm_write_unlock(&v->execbuf_lock);
 			kfree(val);
 			return -ENOMEM;
 		}
@@ -801,12 +1049,16 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 			off += sizeof(*h) + bsize;
 		}
 	}
+	vmw_execbuf_note_time(VMW_T_VALIDATE, timer_rdtsc() - t_val);
 
 	/* Wait for an imported fence first. */
 	if ((a->flags & DRM_VMW_EXECBUF_FLAG_IMPORT_FENCE_FD) && a->imported_fence_fd >= 0) {
 		struct drm_fence *f = drm_fence_from_fd(a->imported_fence_fd);
 		if (f) {
-			drm_fence_wait(f, 2000000000ULL);
+			/* Uninterruptible: the batch below is submitted either
+			 * way, and it may only run once this fence has passed.
+			 * Nothing here can report a refusal to the caller. */
+			drm_fence_wait_flags(f, 2000000000ULL, 0);
 			drm_fence_put(f);
 		}
 	}
@@ -855,6 +1107,8 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 	uint8_t *start = cmds;
 	uint32_t nboxes = 0;
 
+	uint64_t t_stage = timer_rdtsc();
+
 	for (uint32_t i = 0; i < val->nrefs; i++) {
 		struct drm_gem_object *o = val->refs[i];
 		struct vmw_surface *cs =
@@ -865,8 +1119,11 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 		drm_gem_dirty_scan(cs->backup);
 		vmw_surface_dirty_pull(cs);
 		nboxes += vmw_surface_dirty_count(cs);
+		g_eb.coherent++;
 	}
+	vmw_execbuf_note_time(VMW_T_SCAN, timer_rdtsc() - t_stage);
 	if (nboxes) {
+		t_stage = timer_rdtsc();
 		batch = kalloc((size_t)nboxes * VMW_SURF_DIRTY_CMD_MAX +
 			       a->command_size);
 		if (!batch) {
@@ -889,6 +1146,7 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 		if (a->command_size)
 			mm_memcpy(batch + pre, cmds, a->command_size);
 		start = batch;
+		vmw_execbuf_note_time(VMW_T_EMIT, timer_rdtsc() - t_stage);
 	}
 
 	/* Asynchronous: the caller's fence is what tells it when the work is
@@ -896,8 +1154,15 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 	 * it cannot pass before this batch.  Waiting here instead put every
 	 * client's rendering thread to sleep for the host's execution time
 	 * of every batch it submitted. */
-	if (rc == 0 && (a->command_size || pre))
+	g_eb.submits++;
+	g_eb.boxes += nboxes;
+	g_eb.cmdbytes += a->command_size;
+	execbuf_stat_report();
+	if (rc == 0 && (a->command_size || pre)) {
+		t_stage = timer_rdtsc();
 		rc = vmw_cmd_submit_async(v, start, a->command_size + pre, dx_cid);
+		vmw_execbuf_note_time(VMW_T_SUBMIT, timer_rdtsc() - t_stage);
+	}
 	/* A DEVICE rejection is not the client's errno.  The reference driver
 	 * never reports execution errors through this ioctl -- the commands
 	 * were validated and queued, and what the device later makes of them
@@ -916,12 +1181,32 @@ int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
 			kprintf("[drm] vmwgfx: execbuf: device rejected a %u-byte batch (%d); dropped\n",
 				a->command_size, rc);
 		}
+		/* The batch carried this submission's coherent-surface updates
+		 * in front of the client's commands, and emit() cleared each
+		 * box as it wrote it.  Dropping the batch therefore drops
+		 * those updates while the record of them is already gone: the
+		 * device keeps the old bytes and nothing asks again, so the
+		 * stale region stays until the content itself is redrawn.
+		 * Put the dirt back so the next submission re-sends it. */
+		g_eb.rejects++;
+		if (pre) {
+			execbuf_restore_dirt(val);
+			g_eb.restores++;
+		}
 		rc = 0;
 	}
-	if (rc)
+	if (rc) {
+		/* Never submitted, so the updates emitted in front of the
+		 * client's commands never ran either -- and their boxes are
+		 * already cleared. */
+		if (pre)
+			execbuf_restore_dirt(val);
 		goto out;
+	}
 
+	t_stage = timer_rdtsc();
 	struct drm_fence *fence = vmw_fence_emit(v, DRM_VMW_FENCE_FLAG_EXEC | DRM_VMW_FENCE_FLAG_QUERY);
+	vmw_execbuf_note_time(VMW_T_FENCE, timer_rdtsc() - t_stage);
 	if (!fence) {
 		rc = -ENOMEM;
 		goto out;
@@ -969,5 +1254,22 @@ out:
 	kfree(val->refs);
 	kfree(val->htab);
 	kfree(val);
+	mm_write_unlock(&v->execbuf_lock);
+	return rc;
+}
+
+/* The ioctl, timed.
+ *
+ * Around the whole call rather than inside it: what matters is how much of
+ * the client's frame this kernel keeps, and that includes the copy of the
+ * stream, the walk that validates it, the lock it waits on and every
+ * allocation -- none of which is visible from any single stage. */
+int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
+		struct drm_vmw_execbuf_arg *a)
+{
+	uint64_t t0 = timer_rdtsc();
+	int rc = vmw_execbuf_do(v, fp, a);
+
+	vmw_execbuf_note_time(VMW_T_EXECBUF, timer_rdtsc() - t0);
 	return rc;
 }

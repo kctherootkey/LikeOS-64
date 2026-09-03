@@ -229,8 +229,11 @@ static long drm_read(vfs_file_t *file, void *buf, long bytes, int nonblock)
 		spin_unlock_irqrestore(&fp->lock, fl);
 		if (nonblock)
 			return -EAGAIN;
+		/* Resumable: control only reaches here with `done' still zero,
+		 * so not one byte has been handed to the caller and running the
+		 * read again is indistinguishable from never having stopped. */
 		if (signal_pending(cur))
-			return -EINTR;
+			return -ERESTARTSYS;
 		struct wait_queue_entry we;
 		fl = local_irq_save();
 		wq_entry_init(&we, cur);
@@ -270,12 +273,10 @@ static uint64_t drm_mmap_page_phys(void *obj, uint64_t index)
 static void drm_mmap_get(void *obj)
 {
 	drm_gem_get(obj);
-	drm_gem_dirty_map_note(obj);
 }
 
 static void drm_mmap_put(void *obj)
 {
-	drm_gem_dirty_map_drop(obj);
 	drm_gem_put(obj);
 }
 
@@ -308,10 +309,9 @@ static int drm_mmap(vfs_file_t *file, struct device_mmap *m)
 	m->put = drm_mmap_put;
 	m->pte_extra = dev->drv->gem_mmap_pte_extra;
 	m->dirty_ops = &drm_gem_dirty_mmap_ops;
-	/* The initial record's reference is the one taken above, not a
-	 * dev_get -- so its census entry is made here.  The failure path in
-	 * the caller releases through m->put, which pairs with it. */
-	drm_gem_dirty_map_note(o);
+	/* The census entry is NOT made here: it depends on the mapping's
+	 * protection, which only the address space knows, so mmap makes it
+	 * once the record exists (mm_region_census). */
 	return 0;
 }
 

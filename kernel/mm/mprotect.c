@@ -77,7 +77,12 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 				continue; /* no overlap */
 
 			if (addr <= r->start && end >= r_end) {
+				/* The tracker counts writable records, and
+				 * this one may just have become one or
+				 * stopped being one. */
+				mm_region_census(r, 0);
 				r->prot = prot; /* whole region */
+				mm_region_census(r, 1);
 				continue;
 			}
 
@@ -117,11 +122,15 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 				mid->length = r_end - addr;
 				mid->offset = r->offset + (addr - r->start);
 				mid->prot = prot;
+				/* Counted by the hold below, which sees the
+				 * protection just assigned. */
 				mm_region_ref_hold(mid);
 				mid->in_use = true;
 				r->length = addr - r->start;
 			} else {
+				mm_region_census(r, 0);
 				r->prot = prot;
+				mm_region_census(r, 1);
 			}
 		}
 	}

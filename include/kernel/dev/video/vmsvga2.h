@@ -131,6 +131,24 @@ enum {
 #define SVGA_IRQFLAG_ANY_FENCE 0x1
 #define SVGA_IRQFLAG_FIFO_PROGRESS 0x2
 #define SVGA_IRQFLAG_FENCE_GOAL 0x4
+#define SVGA_IRQFLAG_COMMAND_BUFFER 0x8
+#define SVGA_IRQFLAG_ERROR 0x10
+
+/* The sources that stay armed for the life of the device.
+ *
+ * A command buffer completes asynchronously, and a fence emitted through that
+ * channel has passed when its buffer does -- so on any host new enough to use
+ * command buffers this, and not ANY_FENCE, is the interrupt that says a fence
+ * passed.  ANY_FENCE and FENCE_GOAL belong to the older FIFO fences and are
+ * armed only around a wait for one.
+ *
+ * Left masked -- which is what "mask all sources until a waiter arms them"
+ * did -- nothing ever announced a completion, so every fence wait fell back
+ * to polling and a per-frame wait cost whatever the poll interval was.
+ *
+ * ERROR travels with it: a buffer the device refused has to be collected as
+ * promptly as one it finished, or the slot stays busy. */
+#define SVGA_IRQ_BASE_MASK (SVGA_IRQFLAG_COMMAND_BUFFER | SVGA_IRQFLAG_ERROR)
 
 // ---------------------------------------------------------------------------
 // FIFO (BAR2) — 32-bit word indices

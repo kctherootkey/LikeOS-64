@@ -873,22 +873,49 @@ static void munmap_chunk(mchunkptr p)
  * so coalescing can never walk past the border, then free the remainder. */
 static void fencepost_old_top(struct malloc_state *av, mchunkptr old_top, size_t old_size)
 {
-    if (!old_top || old_size == 0)
+    if (!old_top || old_size < 2 * CHUNK_HDR_SZ)
         return;
 
-    if (old_size >= MINSIZE + 2 * CHUNK_HDR_SZ) {
-        size_t rest = (old_size - MINSIZE) & ~MALLOC_ALIGN_MASK;
-        set_head(chunk_at_offset(old_top, rest + 2 * SIZE_SZ), 0 | PREV_INUSE);
-        set_head(chunk_at_offset(old_top, rest), (2 * SIZE_SZ) | PREV_INUSE);
-        set_foot(chunk_at_offset(old_top, rest), (2 * SIZE_SZ));
+    /* The two markers go at the very END of the heap, always:
+     *
+     *   [ remainder ][ CHUNK_HDR_SZ, in use ][ size 0 ]
+     *                ^ heap end - 32          ^ heap end - 16
+     *
+     * The zero-sized one is where every walk stops, and the one before it is
+     * marked in use so nothing coalesces into the border.  heap_trim() finds
+     * the heap's end again by stepping back to exactly these two, so their
+     * position is not free to vary.
+     *
+     * `rest' is what is left in front of them.  It used to be computed only
+     * when the old top was big enough to leave a whole chunk there, and an
+     * old top that was not -- under MINSIZE + 2 * CHUNK_HDR_SZ -- was simply
+     * marked in use and left alone.  That left the heap with NO terminator:
+     * the last chunk ran to the final byte, so the chunk before it had a
+     * neighbour whose header was off the end of the heap.  _int_free() reads
+     * that header unconditionally (inuse_bit_at_offset(nextchunk, nextsize)
+     * in the forward-coalesce test), and heaps are HEAP_MAX_SIZE-aligned with
+     * nothing mapped beyond them -- so freeing that chunk faulted inside
+     * free(), in whichever thread happened to own it, arbitrarily long after
+     * the heap was built.
+     *
+     * The markers fit whatever the old top's size, because a top chunk is
+     * never smaller than MINSIZE and the pair needs exactly MINSIZE.  When
+     * what is left in front of them is too small to be a chunk of its own,
+     * the in-use marker simply absorbs it. */
+    size_t rest = old_size - 2 * CHUNK_HDR_SZ;
+
+    if (rest >= MINSIZE) {
+        set_head(chunk_at_offset(old_top, rest + CHUNK_HDR_SZ), 0 | PREV_INUSE);
+        set_head(chunk_at_offset(old_top, rest), CHUNK_HDR_SZ | PREV_INUSE);
+        set_foot(chunk_at_offset(old_top, rest), CHUNK_HDR_SZ);
         set_head(old_top, rest | PREV_INUSE |
                  (av != &main_arena ? NON_MAIN_ARENA : 0));
-        if (rest >= MINSIZE)
-            _int_free(av, old_top, 1);
+        _int_free(av, old_top, 1);
     } else {
-        /* Too small to split: leave it marked in use (a bounded leak). */
-        set_head(old_top, old_size | PREV_INUSE |
+        set_head(chunk_at_offset(old_top, rest + CHUNK_HDR_SZ), 0 | PREV_INUSE);
+        set_head(old_top, (rest + CHUNK_HDR_SZ) | PREV_INUSE |
                  (av != &main_arena ? NON_MAIN_ARENA : 0));
+        set_foot(old_top, rest + CHUNK_HDR_SZ);
     }
 }
 
