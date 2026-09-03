@@ -32,39 +32,6 @@
  * far more than a frame's worth of object commands. */
 #define VMW_PEND_BYTES (64 * 1024)
 
-/* What the command-buffer channel has cost since the last report.
- *
- * Every submission is two register writes that leave the virtual machine,
- * and the host then charges its own per-buffer overhead before it looks at
- * a single command -- neither of which is visible in any guest-side timer.
- * The only way to see it is the round trip: submitted_us on the slot against
- * the moment the buffer is found completed.  Reaping is driven by the
- * command-buffer interrupt, so that moment is close to the real one.
- *
- * What the numbers mean.  With `n' buffers a second at `t' microseconds each,
- * n*t is the host time a second that no guest counter accounts for, and it is
- * the same time the frame spends inside `fencewait'.  If it is large, the fix
- * is FEWER buffers -- gather more per submission -- and if it is small the
- * host's time is going into pixels instead and batching will not buy it back. */
-static struct {
-	uint64_t submits;
-	uint64_t bytes;
-	uint64_t done;
-	uint64_t lat_us;
-	uint64_t lat_max_us;
-} g_cb;
-
-void vmw_cmdbuf_stats(uint64_t *submits, uint64_t *kbytes, uint64_t *avg_us,
-		      uint64_t *max_us)
-{
-	*submits = g_cb.submits;
-	*kbytes = g_cb.bytes / 1024;
-	*avg_us = g_cb.done ? g_cb.lat_us / g_cb.done : 0;
-	*max_us = g_cb.lat_max_us;
-	g_cb.submits = g_cb.bytes = g_cb.done = 0;
-	g_cb.lat_us = g_cb.lat_max_us = 0;
-}
-
 /* Slot states.
  *
  * CB_FILLING is not a formality.  A slot becomes reapable only once it has
@@ -225,8 +192,6 @@ static void cb_slot_ring(struct vmw_device *v, struct vmw_cb_slot *s)
 	h->dxContext = s->dx;
 	__asm__ volatile("" ::: "memory");
 	s->submitted_us = timer_get_precise_us();
-	g_cb.submits++;
-	g_cb.bytes += s->bytes;
 	uint64_t pa = s->hdr_phys | s->ctx;
 	cb_channel_acquire(v);
 	/* The ticket is taken inside the claim, so ticket order IS the order
@@ -330,18 +295,8 @@ static void cb_reap(struct vmw_device *v, int may_recover)
 			continue;
 		}
 		v->cb_last_progress_us = timer_get_precise_us();
-		if (h->status == SVGA_CB_STATUS_COMPLETED) {
-			uint64_t us = v->cb_last_progress_us > s->submitted_us ?
-					      v->cb_last_progress_us -
-						      s->submitted_us :
-					      0;
-
-			g_cb.done++;
-			g_cb.lat_us += us;
-			if (us > g_cb.lat_max_us)
-				g_cb.lat_max_us = us;
+		if (h->status == SVGA_CB_STATUS_COMPLETED)
 			cb_slot_completed(v, s);
-		}
 		else if (cb_slot_handle_error(v, s, timed_out)) {
 			/* Handed back to the device -- the repaired payload,
 			 * or the same one again: the slot is in flight and
@@ -510,19 +465,11 @@ static struct vmw_cb_slot *cb_slot_claim(struct vmw_device *v)
 							CB_FILLING, 0,
 							__ATOMIC_ACQUIRE,
 							__ATOMIC_RELAXED)) {
-				/* Only a claim that had to wait is recorded:
-				 * the ordinary one finds a slot on the first
-				 * pass and costs nothing, and counting those
-				 * would bury the ones that matter. */
-				if (t0)
-					vmw_execbuf_note_time(VMW_T_SLOT,
-							      timer_rdtsc() - t0);
 				return s;
 			}
 		}
 		if (!t0) {
 			t0 = timer_rdtsc();
-			vmw_execbuf_note_slot_wait();
 		}
 		cb_reap(v, 1);
 		defer_drain(v);

@@ -110,7 +110,6 @@ static int stdu_bind(struct vmw_device *v, uint32_t sid)
 	if (rc == 0) {
 		v->st_bound_sid = sid;
 		v->st_bound_obj = NULL;   /* the caller records identity */
-		vmw_execbuf_note_bind();
 	}
 	return rc;
 }
@@ -300,8 +299,6 @@ static int stdu_update_target(struct vmw_device *v, int x1, int y1, int x2, int 
 	/* Recorded here rather than at the caller: this is the ONE command
 	 * that costs the host a re-read, and every path that shows anything
 	 * ends in it. */
-	vmw_execbuf_note_update((uint64_t)c.rect.w * c.rect.h,
-				c.rect.w == v->st_w && c.rect.h == v->st_h);
 	/* Fire and forget.  This runs for every damage rectangle the server
 	 * reports -- hundreds a second while a window is dragged -- and
 	 * waiting for the host to finish each one put the whole desktop,
@@ -329,11 +326,9 @@ static int stdu_cpu_blit(struct vmw_device *v, struct drm_framebuffer *fb,
 	uint32_t bpp = fb->bpp / 8;
 	uint32_t dst_pitch = v->st_w * 4;
 
-	uint64_t t0 = timer_rdtsc();
 
 	if (bpp != 4)
 		return -EINVAL;
-	vmw_execbuf_note_blit((uint64_t)(x2 - x1) * (y2 - y1));
 	for (int y = y1; y < y2; y++) {
 		uint64_t soff = fb->offset + (uint64_t)y * fb->pitch +
 				(uint64_t)x1 * bpp;
@@ -356,7 +351,6 @@ static int stdu_cpu_blit(struct vmw_device *v, struct drm_framebuffer *fb,
 			bytes -= chunk;
 		}
 	}
-	vmw_execbuf_note_time(VMW_T_BLIT, timer_rdtsc() - t0);
 	return 0;
 }
 
@@ -445,10 +439,6 @@ int vmw_stdu_ensure(struct vmw_device *v, uint32_t w, uint32_t h)
 static int vmw_stdu_present_do(struct vmw_device *v, struct drm_framebuffer *fb,
 			       int x1, int y1, int x2, int y2, int full)
 {
-	/* One present is one frame, which is what the execbuf counters are
-	 * reported against. */
-	vmw_execbuf_note_frame();
-
 	int rc;
 
 	if (!v->st_defined || !fb || !fb->obj)
@@ -598,10 +588,8 @@ static int vmw_stdu_present_do(struct vmw_device *v, struct drm_framebuffer *fb,
 int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
 		     int y1, int x2, int y2, int full)
 {
-	uint64_t t0 = timer_rdtsc();
 	int rc = vmw_stdu_present_do(v, fb, x1, y1, x2, y2, full);
 
-	vmw_execbuf_note_time(VMW_T_PRESENT, timer_rdtsc() - t0);
 	return rc;
 }
 

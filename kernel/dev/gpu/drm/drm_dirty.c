@@ -265,13 +265,6 @@ static spinlock_t g_dirty_lock = SPINLOCK_INIT("drm_dirty");
 /* ---- small bitmap helpers ---------------------------------------------- */
 
 #define BITS_PER_WORD 64
-/* Words in one of the two bitmaps. */
-static inline uint64_t dirty_words(const struct drm_gem_dirty *d)
-{
-	return (d->bitmap_size + BITS_PER_WORD - 1) / BITS_PER_WORD;
-}
-
-
 static inline void bit_set(uint64_t *map, uint64_t n)
 {
 	map[n / BITS_PER_WORD] |= 1ULL << (n % BITS_PER_WORD);
@@ -535,112 +528,6 @@ static void dirty_scan_mkwrite(struct drm_gem_object *o,
 
 /* ---- the interface the driver uses -------------------------------------- */
 
-/* How the scans answered, since the last read.
- *
- * The driver's per-frame report says how much of a surface the updates
- * covered, and 100% has two completely different causes: a client that
- * really did repaint the whole thing, and a tracker that could not reach
- * every mapping and so reported everything to stay correct.  The first is
- * the client's business; the second is a full-surface transfer per frame
- * that nothing asked for.  Only this tells them apart. */
-static uint64_t g_scans;
-static uint64_t g_scans_full;
-static uint64_t g_scans_fault; /* answered by the MKWRITE method */
-/* Why a scan had to report everything.  Both mean "a mapping this sweep
- * cannot reach", but they want different fixes and are counted apart:
- * `dropped' is the latch set once at setup, when records already existed
- * that the first walk could not reach; `switch' is a scan that found one
- * while running.  A dropped RECORD is deliberately not among them any
- * more -- see drm_gem_dirty_map_census. */
-static uint64_t g_scans_dropped;
-static uint64_t g_scans_switch;
-/* What the sweep FOUND, before a full-object answer overrode it, against
- * what the object holds.
- *
- * The whole-object fallback is only waste to the extent that the truth is
- * smaller, and that is not obvious: a staging buffer the client rewrites end
- * to end every frame is genuinely 100% dirty, and tracking it perfectly would
- * transfer exactly as much.  Building a reverse map to escape the fallback is
- * a large and delicate change, so it is worth knowing which of the two this
- * is before paying for it. */
-static uint64_t g_scan_found_pages;
-static uint64_t g_scan_total_pages;
-/* What the content pass answered instead of "the whole object". */
-static uint64_t g_content_scans;
-static uint64_t g_content_pages;
-/* Scans the content pass REFUSED because the buffer has more than one
- * consumer, and scans that reported everything to refresh the device. */
-static uint64_t g_content_shared;
-static uint64_t g_scans_refresh;
-
-/* Pages the tracker would have reported, had the fallback not overridden it. */
-static uint64_t dirty_bits_population(const struct drm_gem_dirty *d)
-{
-	uint64_t n = 0;
-
-	/* Counted by hand: __builtin_popcountll becomes a libgcc call in a
-	 * freestanding build compiled without the POPCNT instruction, and
-	 * this kernel links no libgcc.  The SWAR fold below is branch-free
-	 * and runs over eight words for a two-megabyte object. */
-	for (uint64_t w = 0; w < dirty_words(d); w++) {
-		uint64_t v = d->bitmap[w];
-
-		v = v - ((v >> 1) & 0x5555555555555555ULL);
-		v = (v & 0x3333333333333333ULL) +
-		    ((v >> 2) & 0x3333333333333333ULL);
-		v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
-		n += (v * 0x0101010101010101ULL) >> 56;
-	}
-	return n;
-}
-
-void drm_gem_dirty_scan_found(uint64_t *found_pages, uint64_t *total_pages)
-{
-	if (found_pages)
-		*found_pages = __atomic_exchange_n(&g_scan_found_pages, 0,
-						   __ATOMIC_RELAXED);
-	if (total_pages)
-		*total_pages = __atomic_exchange_n(&g_scan_total_pages, 0,
-						   __ATOMIC_RELAXED);
-}
-
-void drm_gem_dirty_scan_content(uint64_t *scans, uint64_t *pages,
-				uint64_t *shared, uint64_t *refresh)
-{
-	if (scans)
-		*scans = __atomic_exchange_n(&g_content_scans, 0,
-					     __ATOMIC_RELAXED);
-	if (pages)
-		*pages = __atomic_exchange_n(&g_content_pages, 0,
-					     __ATOMIC_RELAXED);
-	if (shared)
-		*shared = __atomic_exchange_n(&g_content_shared, 0,
-					      __ATOMIC_RELAXED);
-	if (refresh)
-		*refresh = __atomic_exchange_n(&g_scans_refresh, 0,
-					       __ATOMIC_RELAXED);
-}
-
-void drm_gem_dirty_scan_why(uint64_t *dropped, uint64_t *switched)
-{
-	if (dropped)
-		*dropped = __atomic_exchange_n(&g_scans_dropped, 0,
-					       __ATOMIC_RELAXED);
-	if (switched)
-		*switched = __atomic_exchange_n(&g_scans_switch, 0,
-						__ATOMIC_RELAXED);
-}
-
-void drm_gem_dirty_scan_stats(uint64_t *scans, uint64_t *full, uint64_t *fault)
-{
-	if (scans)
-		*scans = __atomic_exchange_n(&g_scans, 0, __ATOMIC_RELAXED);
-	if (full)
-		*full = __atomic_exchange_n(&g_scans_full, 0, __ATOMIC_RELAXED);
-	if (fault)
-		*fault = __atomic_exchange_n(&g_scans_fault, 0, __ATOMIC_RELAXED);
-}
-
 /* A page's content, in one word.
  *
  * FNV-1a over the page as 64-bit words: one exclusive-or and one multiply per
@@ -723,9 +610,7 @@ static int dirty_content_scan(struct drm_gem_object *o,
 			continue;
 		d->fp[i] = h;
 		dirty_record_page(d, i);
-		__atomic_fetch_add(&g_content_pages, 1, __ATOMIC_RELAXED);
 	}
-	__atomic_fetch_add(&g_content_scans, 1, __ATOMIC_RELAXED);
 	return 0;
 }
 
@@ -743,28 +628,16 @@ void drm_gem_dirty_scan(struct drm_gem_object *o)
 	if (d && d->full) {
 		d->full = 0;
 		report_all = 1;
-		__atomic_fetch_add(&g_scans_dropped, 1, __ATOMIC_RELAXED);
 	}
 	spin_unlock_irqrestore(&g_dirty_lock, fl);
 	if (!d)
 		return;
 
-	__atomic_fetch_add(&g_scans, 1, __ATOMIC_RELAXED);
 	if (d->method == DRM_GEM_DIRTY_PAGETABLE) {
 		dirty_scan_pagetable(o, d, &foreign);
 	} else {
-		__atomic_fetch_add(&g_scans_fault, 1, __ATOMIC_RELAXED);
 		dirty_scan_mkwrite(o, d, &foreign);
 	}
-
-	/* Sampled here: after the sweep has said what it found, before the
-	 * override below replaces it with everything. */
-	spin_lock_irqsave(&g_dirty_lock, &fl);
-	__atomic_fetch_add(&g_scan_found_pages, dirty_bits_population(d),
-			   __ATOMIC_RELAXED);
-	__atomic_fetch_add(&g_scan_total_pages, d->bitmap_size,
-			   __ATOMIC_RELAXED);
-	spin_unlock_irqrestore(&g_dirty_lock, fl);
 
 	if (foreign) {
 		/* Mappings exist that the sweep could not reach, or one
@@ -772,7 +645,6 @@ void drm_gem_dirty_scan(struct drm_gem_object *o)
 		 * written, so every page is reported.  Costly and correct;
 		 * see the header comment. */
 		report_all = 1;
-		__atomic_fetch_add(&g_scans_switch, 1, __ATOMIC_RELAXED);
 	}
 
 	/* The device's copy is not observable from here, so no answer this
@@ -786,16 +658,13 @@ void drm_gem_dirty_scan(struct drm_gem_object *o)
 		d->since_refresh = 0;
 		refresh = 1;
 	}
-	/* Counted whether or not the content pass runs, because it is the
-	 * measurement that says whether the pass could ever be trusted here. */
+	/* A buffer with more than one consumer: one set of fingerprints
+	 * cannot describe two device copies, so the content pass refuses it
+	 * and the whole object is reported.  See dirty_content_scan(). */
 	shared = d->ref_count > 1;
 	spin_unlock_irqrestore(&g_dirty_lock, fl);
-	if (refresh) {
+	if (refresh)
 		report_all = 1;
-		__atomic_fetch_add(&g_scans_refresh, 1, __ATOMIC_RELAXED);
-	}
-	if (shared)
-		__atomic_fetch_add(&g_content_shared, 1, __ATOMIC_RELAXED);
 
 	/* Whatever the sweeps could not answer for, the content answers --
 	 * outside the lock, because it reads every page of the object and the
@@ -809,7 +678,6 @@ void drm_gem_dirty_scan(struct drm_gem_object *o)
 
 	spin_lock_irqsave(&g_dirty_lock, &fl);
 	if (report_all) {
-		__atomic_fetch_add(&g_scans_full, 1, __ATOMIC_RELAXED);
 		bits_set_range(d->bitmap, 0, d->bitmap_size);
 		__atomic_store_n(&d->brk, BRK_MAKE(0, d->bitmap_size),
 				 __ATOMIC_RELAXED);

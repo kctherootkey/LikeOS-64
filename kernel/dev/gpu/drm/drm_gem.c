@@ -3,6 +3,7 @@
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/uapi/drm/dma-buf.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/timer.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
@@ -100,6 +101,167 @@ void drm_gem_get(struct drm_gem_object *o)
 	__atomic_fetch_add(&o->refs, 1, __ATOMIC_ACQ_REL);
 }
 
+/* How many objects may sit waiting for the device before a free waits after
+ * all.  The queue exists to move a wait off the drawing thread, not to let an
+ * unbounded amount of memory sit unreclaimed: a client that destroys objects
+ * far faster than the device retires them must still be made to slow down. */
+#define DRM_GEM_DEAD_MAX 256
+
+static void gem_destroy_final(struct drm_gem_object *o);
+
+static void gem_reap(struct drm_device *dev, int poll)
+{
+	uint64_t fl;
+
+	if (!dev || !__atomic_load_n(&dev->dead_n, __ATOMIC_RELAXED))
+		return;
+	/* Not from inside another reap: see dev->reaping.  What this one
+	 * leaves behind, the walk already running collects on its next turn,
+	 * and failing that the next submission does -- there are hundreds of
+	 * those a second. */
+	if (__atomic_exchange_n(&dev->reaping, 1, __ATOMIC_ACQUIRE))
+		return;
+
+	/* Asking the device costs a walk of every command-buffer slot through
+	 * uncached memory, so it is done by the caller that is between frames
+	 * anyway -- NOT by every drm_gem_put().  A submission drops a
+	 * reference on each object it named, which is ten a submission and
+	 * some thousands a second: polling the device on each of those turned
+	 * a queue meant to REMOVE work from the drawing thread into a new cost
+	 * on it.  Without the poll this still frees everything whose fence was
+	 * already known to have passed. */
+	if (poll && dev->drv && dev->drv->fence_poll)
+		dev->drv->fence_poll(dev);
+
+	for (;;) {
+		struct drm_gem_object *o = NULL, **pp;
+
+		spin_lock_irqsave(&dev->lock, &fl);
+		for (pp = &dev->dead; *pp; pp = &(*pp)->dead_next) {
+			if (!(*pp)->fence || (*pp)->fence->signaled) {
+				o = *pp;
+				*pp = o->dead_next;
+				dev->dead_n--;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&dev->lock, fl);
+		if (!o)
+			break;
+		if (o->fence) {
+			drm_fence_put(o->fence);
+			o->fence = NULL;
+		}
+		gem_destroy_final(o);
+	}
+	__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+}
+
+/* The reaper thread.
+ *
+ * Destroying an object is not free -- a surface's teardown builds and queues
+ * a DESTROY command, unbinds its MOB and hands the page-table pages back --
+ * and a browser destroys hundreds of them a second.  All of that used to land
+ * inside an execbuf ioctl, which is a thread trying to draw a frame.
+ *
+ * It does not belong there.  Nothing waits for a destroyed object, so the
+ * work can happen on any thread at any time; put on a thread of its own it
+ * costs a browser frame nothing at all, and on a machine with eight
+ * processors it costs the machine nothing either.
+ *
+ * A plain 2ms tick rather than a wait queue: the only thing the timing
+ * affects is how long a freed object's memory stays unreclaimed, the queue
+ * has a cap for the case where that matters (DRM_GEM_DEAD_MAX), and a tick
+ * cannot miss a wakeup. */
+static struct drm_device *g_reap_dev;
+static uint8_t g_reap_stack[16384] __attribute__((aligned(16)));
+
+static void gem_reap_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		task_t *self = sched_current();
+
+		if (self) {
+			self->wait_channel = (void *)&g_reap_dev;
+			self->wakeup_tick = timer_ticks() +
+					    timer_ms_to_ticks(2) + 1;
+			self->state = TASK_BLOCKED;
+			sched_schedule();
+			self->wakeup_tick = 0;
+			self->wait_channel = NULL;
+			if (self->state != TASK_RUNNING)
+				self->state = TASK_RUNNING;
+		}
+		if (g_reap_dev)
+			gem_reap(g_reap_dev, 0);
+	}
+}
+
+void drm_gem_reap_start(struct drm_device *dev)
+{
+	if (g_reap_dev)
+		return;
+	g_reap_dev = dev;
+	task_t *t = sched_add_task(gem_reap_thread, 0, g_reap_stack,
+				   sizeof(g_reap_stack));
+	if (t) {
+		const char *nm = "drm-reap";
+		unsigned i = 0;
+
+		for (; nm[i] && i < sizeof(t->comm) - 1; i++)
+			t->comm[i] = nm[i];
+		t->comm[i] = '\0';
+	}
+}
+
+void drm_gem_reap(struct drm_device *dev)
+{
+	/* Without asking the device.  Something already asks it several
+	 * hundred times a second -- the driver's own fence poll, and every
+	 * thread that waits -- so a queued object is seen to be free within a
+	 * few milliseconds whatever this does, and nothing waits for it.
+	 * Asking here as well was measurable cost for nothing. */
+	gem_reap(dev, 0);
+}
+
+/* Wait for the oldest queued object and finish it, however long that takes.
+ * Only for the cap above and for teardown; the ordinary path never waits. */
+static void gem_reap_one_blocking(struct drm_device *dev)
+{
+	struct drm_gem_object *o;
+	uint64_t fl;
+
+	if (__atomic_exchange_n(&dev->reaping, 1, __ATOMIC_ACQUIRE))
+		return; /* someone is already emptying it */
+	spin_lock_irqsave(&dev->lock, &fl);
+	o = dev->dead;
+	if (o) {
+		dev->dead = o->dead_next;
+		dev->dead_n--;
+	}
+	spin_unlock_irqrestore(&dev->lock, fl);
+	if (!o) {
+		__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+		return;
+	}
+	if (o->fence) {
+		/* Uninterruptibly.  The pages go back to the allocator below
+		 * whatever happens here, so a wait that gives up because a
+		 * signal is pending does not defer the free -- it performs it
+		 * while the device is still reading, and the memory is handed
+		 * to the next caller of the allocator to write over.  A
+		 * browser is the worst case: its threads carry a pending
+		 * signal almost continuously, so the interruptible form
+		 * returned at once nearly every time it was called. */
+		drm_fence_wait_flags(o->fence, 2000000000ULL, 0);
+		drm_fence_put(o->fence);
+		o->fence = NULL;
+	}
+	gem_destroy_final(o);
+	__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+}
+
 void drm_gem_put(struct drm_gem_object *o)
 {
 	if (!o)
@@ -109,24 +271,40 @@ void drm_gem_put(struct drm_gem_object *o)
 	struct drm_device *dev = o->dev;
 	uint64_t fl;
 
-	/* The device may still be reading it: wait for the last submission
-	 * that referenced it.
-	 *
-	 * Uninterruptibly.  The pages go back to the allocator on the next
-	 * line whatever happens here, so a wait that gives up because a signal
-	 * is pending does not defer the free -- it just performs it while the
-	 * device is still reading, and the memory is handed to the next caller
-	 * of the allocator to write over.  The result is corruption of some
-	 * unrelated structure, arbitrarily later, in a process that has no
-	 * connection to this object.  A browser is the worst case: its threads
-	 * carry a pending signal almost continuously (the collector parks them
-	 * with one, the profiler samples with another), so the interruptible
-	 * form returned at once nearly every time it was called. */
+	/* Whatever the device is already known to have finished with goes now,
+	 * in this caller's time rather than in the time of the thread that
+	 * happened to drop the last reference to it.  Without asking the
+	 * device: see gem_reap(). */
+	gem_reap(dev, 0);
+
+	/* Still being read: queue it instead of standing here.  This wait --
+	 * `gemfree' in the per-caller fencewait report -- was a quarter of the
+	 * wall clock in a maximized browser and zero in a small window, which
+	 * is what named it: nothing about destroying an object needs the
+	 * thread that destroys it to stop drawing. */
+	if (o->fence && !o->fence->signaled) {
+		spin_lock_irqsave(&dev->lock, &fl);
+		o->dead_next = dev->dead;
+		dev->dead = o;
+		dev->dead_n++;
+		int over = dev->dead_n > DRM_GEM_DEAD_MAX;
+		spin_unlock_irqrestore(&dev->lock, fl);
+		if (over)
+			gem_reap_one_blocking(dev);
+		return;
+	}
 	if (o->fence) {
-		drm_fence_wait_flags(o->fence, 2000000000ULL, 0);
 		drm_fence_put(o->fence);
 		o->fence = NULL;
 	}
+	gem_destroy_final(o);
+}
+
+static void gem_destroy_final(struct drm_gem_object *o)
+{
+	struct drm_device *dev = o->dev;
+	uint64_t fl;
+
 	/* dev->drv is NULL until drm_dev_register() attaches the backend, and
 	 * a backend may build objects of its own before it registers.  Such
 	 * an object was never handed to the backend -- there is nothing for
@@ -176,6 +354,27 @@ uint64_t drm_gem_mmap_offset(struct drm_gem_object *o)
 }
 
 /* Object by mmap offset (a reference), for the device node's mmap. */
+/* Take a reference only if the object still has one.
+ *
+ * A lookup walks the device's list, which an object stays on until its
+ * teardown finishes -- and its teardown may now be waiting for the device
+ * (see drm_gem_reap).  A plain drm_gem_get() there resurrects an object whose
+ * last reference has already gone and whose memory is about to be handed
+ * back.  The window was always open; queueing the teardown widens it from
+ * microseconds to milliseconds, which is what makes it worth closing. */
+int drm_gem_get_unless_zero(struct drm_gem_object *o)
+{
+	int r = __atomic_load_n(&o->refs, __ATOMIC_RELAXED);
+
+	while (r != 0) {
+		if (__atomic_compare_exchange_n(&o->refs, &r, r + 1, 1,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED))
+			return 1;
+	}
+	return 0;
+}
+
 struct drm_gem_object *drm_gem_by_offset(struct drm_device *dev,
 					 uint64_t offset)
 {
@@ -185,8 +384,7 @@ struct drm_gem_object *drm_gem_by_offset(struct drm_device *dev,
 
 	spin_lock_irqsave(&dev->lock, &fl);
 	for (struct drm_gem_object *o = dev->objects; o; o = o->next) {
-		if (o->id == id) {
-			drm_gem_get(o);
+		if (o->id == id && drm_gem_get_unless_zero(o)) {
 			found = o;
 			break;
 		}

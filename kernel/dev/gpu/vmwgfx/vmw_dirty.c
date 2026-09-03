@@ -502,32 +502,6 @@ uint32_t vmw_surface_dirty_count(const struct vmw_surface *s)
  * DX_UPDATE_SUBRESOURCE addresses array surfaces; UPDATE_GB_IMAGE only
  * knows face and level.  The device that offers DX contexts takes the
  * former, exactly as the reference driver chooses. */
-/* How much of a surface each emitted box actually covers.
- *
- * One box a frame says nothing about its SIZE, and the size is the thing the
- * host pays for: an UPDATE over the whole surface makes it re-read every byte
- * of the backing store, so a box that is always full-surface costs 8.8MB a
- * frame at 1920x1200 against 3MB at 1024x768 -- the same ratio as the frame
- * rate that was measured.  Accumulated here and reported with the rest. */
-static uint64_t g_emit_texels;      /* texels the boxes covered */
-static uint64_t g_emit_surface;     /* texels those surfaces hold in total */
-/* ...and what those texels WEIGH.  Reported separately because a texel is
- * not four bytes: the surface this tracker spends its time on turns out to
- * be one byte per texel, so counting four made the traffic look four times
- * what it is and pointed a whole day of work at the wrong flow. */
-static uint64_t g_emit_bytes;
-
-void vmw_surface_dirty_emit_stats(uint64_t *covered, uint64_t *total,
-				  uint64_t *bytes)
-{
-	*covered = g_emit_texels;
-	*total = g_emit_surface;
-	*bytes = g_emit_bytes;
-	g_emit_texels = 0;
-	g_emit_surface = 0;
-	g_emit_bytes = 0;
-}
-
 /* Put a surface's dirt back, in full.
  *
  * For the case where the commands vmw_surface_dirty_emit() produced never
@@ -572,22 +546,6 @@ uint32_t vmw_surface_dirty_emit(struct vmw_device *v, struct vmw_surface *s,
 		if ((uint32_t)(p - (uint8_t *)out) + VMW_SURF_DIRTY_CMD_MAX >
 		    cap)
 			break; /* the rest keeps its dirt for next time */
-		{
-			uint32_t lvl = i % dirty->layout.num_mip_levels;
-			const SVGA3dSize *sz = &dirty->layout.mip[lvl].size;
-
-			const SVGA3dSurfaceDesc *de = dirty->layout.desc;
-			uint32_t bw = de->blockSize.width ?
-					      de->blockSize.width : 1;
-			uint32_t bh = de->blockSize.height ?
-					      de->blockSize.height : 1;
-
-			g_emit_texels += (uint64_t)box->w * box->h;
-			g_emit_surface += (uint64_t)sz->width * sz->height;
-			g_emit_bytes += (uint64_t)((box->w + bw - 1) / bw) *
-					((box->h + bh - 1) / bh) *
-					de->bytesPerBlock;
-		}
 		SVGA3dCmdHeader *h = (SVGA3dCmdHeader *)p;
 
 		if (v->has_dx) {

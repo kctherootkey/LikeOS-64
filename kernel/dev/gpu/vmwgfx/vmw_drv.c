@@ -1044,7 +1044,8 @@ static long vmw_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
 			if (a->flags & drm_vmw_synccpu_dontblock)
 				rc = -EBUSY;
 			else
-				rc = drm_fence_wait(o->fence, VMW_FENCE_TIMEOUT_NS);
+				rc = drm_fence_wait(o->fence,
+						    VMW_FENCE_TIMEOUT_NS);
 		}
 		drm_gem_put(o);
 		return rc;

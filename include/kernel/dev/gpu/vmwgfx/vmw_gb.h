@@ -145,70 +145,13 @@ uint32_t vmw_surface_dirty_count(const struct vmw_surface *s);
  * that is dropped afterwards takes the record of those writes with it. */
 void vmw_surface_dirty_mark_all(struct vmw_surface *s);
 
-/* What the command-buffer channel cost since the last call: buffers handed
- * to the device, their payload, and how long the device took to finish one
- * (submission to the moment it was found completed).  Reset by the call. */
-void vmw_cmdbuf_stats(uint64_t *submits, uint64_t *kbytes, uint64_t *avg_us,
-		      uint64_t *max_us);
-/* Texels the emitted boxes covered, and texels those surfaces hold, since
- * the last call.  Says whether the updates are tight or whole-surface. */
-void vmw_surface_dirty_emit_stats(uint64_t *covered, uint64_t *total,
-				  uint64_t *bytes);
 
-/* Per-frame accounting for the scan-out path.
- *
- * The question these answer is why a window at 1920x1200 is unusable while
- * the same page at 1024x768 is not, when everything measurable on the host
- * scales with area and nothing in it is superlinear.  What a host harness
- * cannot see is how much WORK per frame the client actually asks for, so the
- * counts are taken where the work arrives and reported against presents.
- *
- * vmw_stdu_present() is the frame marker; everything else accumulates. */
-void vmw_execbuf_note_frame(void);
-/* One screen-target bind; the display server should need very few. */
-void vmw_execbuf_note_bind(void);
-
-/* ---- where the time goes ------------------------------------------------
- *
- * The counts above say how much work arrives per frame; they cannot say
- * whether the frame rate is set by this kernel, by the client, or by the
- * host -- and those three want completely different fixes.  A second's
- * worth of a frame is 1000ms, so a stage that accumulates 700ms in a second
- * IS the frame rate and everything else is noise.  That is the number these
- * produce.
- *
- * Timestamp-counter ticks rather than microseconds: a submission takes a
- * few microseconds, so a microsecond clock read around it rounds most
- * samples to zero or one and the sum says nothing.  The conversion happens
- * once, in the report.
- *
- * VMW_T_EXECBUF is the whole ioctl and CONTAINS scan/emit/submit/fence;
- * VMW_T_PRESENT is the whole present and contains blit.  They are reported
- * as they are rather than as remainders so a stage that is missing from the
- * breakdown shows up as a gap rather than as a negative number. */
-enum vmw_time_stage {
-	VMW_T_EXECBUF,	/* the whole execbuf ioctl */
-	VMW_T_SCAN,	/* coherent-surface page-table scan + box pull */
-	VMW_T_EMIT,	/* turning boxes into update commands */
-	VMW_T_SUBMIT,	/* handing the batch to the device */
-	VMW_T_FENCE,	/* emitting the fence that ends the batch */
-	VMW_T_PRESENT,	/* the whole scan-out present */
-	VMW_T_BLIT,	/* the guest-pixel copy inside a present */
-	VMW_T_SLOT,	/* waiting for a free command-buffer slot */
-	VMW_T_LOCK,	/* waiting for execbuf_lock */
-	VMW_T_VALIDATE, /* copying and checking the client's stream */
-	VMW_T_MAX
-};
-void vmw_execbuf_note_time(enum vmw_time_stage stage, uint64_t tsc_ticks);
 
 /* Pixels the host is told to re-read (UPDATE_GB_SCREENTARGET) and pixels the
  * guest copied itself, and whether the present covered the whole screen.
  * Together with the frame count these say whether the display path is
  * paying per damaged pixel or per screen. */
-void vmw_execbuf_note_update(uint64_t pixels, int full);
-void vmw_execbuf_note_blit(uint64_t pixels);
 /* One submission that found no free command-buffer slot and had to wait. */
-void vmw_execbuf_note_slot_wait(void);
 uint32_t vmw_surface_dirty_emit(struct vmw_device *v, struct vmw_surface *s,
 				void *out, uint32_t cap);
 /* The largest update command one dirty subresource can become. */

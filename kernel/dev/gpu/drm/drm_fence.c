@@ -118,8 +118,25 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 	int nw = 0;
 
 	spin_lock_irqsave(&dev->lock, &fl);
-	if ((int32_t)(passed - dev->fence_passed) > 0)
-		dev->fence_passed = passed;
+	/* Nothing new: every fence this number covers is already signalled,
+	 * so there is nothing to walk and nobody to wake.
+	 *
+	 * This is the common case by far -- the device is polled several
+	 * hundred times a second and most of those find the same number as
+	 * last time -- and the walk it skips is over every LIVE fence, of
+	 * which a browser holds one per object it has not yet re-submitted.
+	 * Walking that list, under this lock, with interrupts off, on every
+	 * poll, is where the driver's own time was going.
+	 *
+	 * Safe because the invariant holds on the other side: a fence whose
+	 * sequence has already passed is marked signalled by
+	 * drm_fence_create() under this same lock, so an unsignalled fence
+	 * always has a sequence ahead of `fence_passed'. */
+	if ((int32_t)(passed - dev->fence_passed) <= 0) {
+		spin_unlock_irqrestore(&dev->lock, fl);
+		return;
+	}
+	dev->fence_passed = passed;
 	for (struct drm_fence *f = dev->fences; f; f = f->next) {
 		if (!f->signaled && (int32_t)(passed - f->seqno) >= 0) {
 			f->signaled = 1;
@@ -180,17 +197,6 @@ static void drm_fence_poll(struct drm_fence *f)
 /* What waiting has cost, for whoever reports frame accounting.  Relaxed
  * atomics: a lost sample would skew a diagnostic and nothing else, and this
  * sits on the path whose cost is being measured. */
-static uint64_t g_wait_ticks;
-static uint64_t g_wait_count;
-
-void drm_fence_wait_stats(uint64_t *tsc_ticks, uint64_t *waits)
-{
-	if (tsc_ticks)
-		*tsc_ticks = __atomic_exchange_n(&g_wait_ticks, 0,
-						 __ATOMIC_RELAXED);
-	if (waits)
-		*waits = __atomic_exchange_n(&g_wait_count, 0, __ATOMIC_RELAXED);
-}
 
 static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 {
@@ -280,18 +286,9 @@ static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 
 int drm_fence_wait_flags(struct drm_fence *f, uint64_t timeout_ns, int intr)
 {
-	uint64_t t0;
-	int rc;
-
-	/* A fence that has already passed costs nothing and is not a wait;
-	 * counting it would bury the ones that are. */
 	if (f->signaled)
 		return 0;
-	t0 = timer_rdtsc();
-	rc = fence_wait_do(f, timeout_ns, intr);
-	__atomic_fetch_add(&g_wait_ticks, timer_rdtsc() - t0, __ATOMIC_RELAXED);
-	__atomic_fetch_add(&g_wait_count, 1, __ATOMIC_RELAXED);
-	return rc;
+	return fence_wait_do(f, timeout_ns, intr);
 }
 
 /* ---- sync_file ------------------------------------------------------- */

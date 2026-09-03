@@ -74,15 +74,6 @@ static inline int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns)
 {
 	return drm_fence_wait_flags(f, timeout_ns, 1);
 }
-/* What waiting for fences has cost since the last call, in timestamp-counter
- * ticks and in waits, and reset by reading.
- *
- * A client that renders as fast as the device lets it spends its frame here,
- * and a driver measuring only its own code cannot tell that apart from a
- * client that simply has nothing to draw.  Read by whoever reports frame
- * accounting; the fence layer only counts. */
-void drm_fence_wait_stats(uint64_t *tsc_ticks, uint64_t *waits);
-
 /* A sync_file descriptor for the fence (installs into the caller). */
 int drm_fence_export_fd(struct drm_fence *f, int cloexec);
 /* The fence behind a sync_file descriptor of the caller (a reference). */
@@ -102,6 +93,9 @@ enum drm_gem_kind { DRM_GEM_BO = 1, DRM_GEM_SURFACE = 2 };
 
 struct drm_gem_object {
 	int refs;
+	/* While the device may still be reading this object after its last
+	 * reference has gone: the queue it waits on.  See drm_gem_reap(). */
+	struct drm_gem_object *dead_next;
 	struct drm_device *dev;
 	enum drm_gem_kind kind;
 	uint32_t id; /* device-global, for mmap offsets and flink names */
@@ -154,22 +148,6 @@ void drm_gem_dirty_map_census(void *obj, int add);
 /* Harvest the processor's record of client writes into the tracker.
  * Called once per object per submission, before the ranges are consumed. */
 void drm_gem_dirty_scan(struct drm_gem_object *o);
-/* Scans since the last call, how many had to report the WHOLE object because
- * a mapping was out of the sweep's reach, and how many used the faulting
- * method.  Reset by reading; see the note in drm_dirty.c. */
-void drm_gem_dirty_scan_stats(uint64_t *scans, uint64_t *full, uint64_t *fault);
-/* Pages the sweeps actually found dirty, and pages those objects hold, since
- * the last call -- sampled BEFORE a whole-object fallback overrides the
- * answer.  Says whether that fallback is costing anything: equal numbers mean
- * the client really is rewriting everything. */
-void drm_gem_dirty_scan_found(uint64_t *found_pages, uint64_t *total_pages);
-/* Why scans still reported everything: a record dropped while tracking was
- * live, or the one-off switch onto the faulting method.  Reset by reading. */
-void drm_gem_dirty_scan_why(uint64_t *dropped, uint64_t *switched);
-/* Scans answered by comparing page CONTENT instead of reporting the whole
- * object, and the pages that pass found actually changed. */
-void drm_gem_dirty_scan_content(uint64_t *scans, uint64_t *pages,
-				uint64_t *shared, uint64_t *refresh);
 /* Hand the accumulated dirty page ranges inside ONE WINDOW of the object to
  * the caller, clearing only those: cb(arg, first, last) per run of dirty
  * pages, in pages of the object.
@@ -197,6 +175,26 @@ extern const struct mm_dirty_ops drm_gem_dirty_mmap_ops;
 extern const struct mm_dirty_ops drm_gem_dmabuf_dirty_ops;
 
 /* Handles: per-file namespace. */
+/* Finish off every object whose device work has since completed.
+ *
+ * Freeing an object the device is still reading has to wait for it, and
+ * waiting is the one thing that must not happen on a thread that is trying to
+ * draw: measured at a quarter of the wall clock in a maximized browser, ~30
+ * objects a second at ~8ms each, all of it inside whatever thread happened to
+ * drop the last reference.  So the wait is not done there any more -- the
+ * object is queued and finished here, by whoever comes past next.
+ *
+ * Process context only: the teardown submits commands (a MOB has to be
+ * destroyed before its pages go back) and takes the device lock. */
+void drm_gem_reap(struct drm_device *dev);
+
+/* Start the thread that does the above, so that no client's ioctl has to.
+ * Called once, from drm_dev_register(). */
+void drm_gem_reap_start(struct drm_device *dev);
+
+/* Take a reference only if the object still has one; see the definition. */
+int drm_gem_get_unless_zero(struct drm_gem_object *o);
+
 int drm_gem_handle_create(struct drm_file *fp, struct drm_gem_object *o,
 			  uint32_t *handle_out);
 struct drm_gem_object *drm_gem_lookup(struct drm_file *fp, uint32_t handle);
@@ -410,6 +408,17 @@ struct drm_device {
 
 	/* objects */
 	struct drm_gem_object *objects;
+	/* Objects whose last reference has gone while the device was still
+	 * working through the submission that named them.  See drm_gem_reap. */
+	struct drm_gem_object *dead;
+	int dead_n;
+	/* One reaper at a time.  Finishing an object frees the objects it
+	 * holds -- a surface drops its backup buffer -- and that lands back in
+	 * drm_gem_put(), which reaps.  Without this the queue is walked once
+	 * per object ON TOP of the walk that is already running: 256 queued
+	 * objects became 256 nested frame sets and a kernel stack overflow
+	 * (double fault, opening faz.net). */
+	int reaping;
 	uint32_t next_obj_id;
 	uint32_t next_flink;
 

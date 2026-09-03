@@ -139,29 +139,52 @@ export XCURSOR_THEME XCURSOR_SIZE
 # GLX is a prerequisite.  To fall back for debugging, export the variable
 # from a shell before starting luakit -- not here.
 #
-# Composite ON DEMAND, and only where compositing is slow.
+# Compositing OFF, on every machine -- including this one, which HAS a GPU.
 #
-# With acceleration available WebKit defaults to forcing every page through
-# the compositor.  On a machine with a GPU that is what is wanted: each layer
-# is painted into a GPU texture and the finished frame is handed to the UI
-# process as a buffer descriptor, which is faster than the cairo path on
-# every page and is the only way WebGL and the accelerated canvas work at all.
+# That looks wrong and is not.  With compositing forced on, WebKitGTK's
+# accelerated path here is:
 #
-# Without one, GL is llvmpipe: the same arrangement becomes several
-# full-screen software passes per scroll step -- painted with llvmpipe,
-# composed with llvmpipe, read back to shared memory, uploaded again -- where
-# cairo needs one, and freebsd.org was unscrollable that way.  So on that
-# machine, and only there, the forcing is switched off; luakit's own policy
-# setting (res/xorg/gtk3/luakit-userconf.lua) makes the matching choice from
-# the same test.
+#     web process renders the tile with the GPU
+#       -> hands it over as a dma-buf descriptor
+#       -> the UI process CPU-MAPS it (gbm_bo_map)
+#       -> cairo composites from the mapped bytes
+#       -> X puts it on the screen
 #
-# The test is /dev/dri/card0: it exists exactly where the kernel bound a
-# display-manager driver to a GPU.  To force either behaviour by hand, export
-# the variable from a shell before starting luakit -- not here.
-if [ ! -e /dev/dri/card0 ]; then
-	WEBKIT_FORCE_COMPOSITING_MODE=0
-	export WEBKIT_FORCE_COMPOSITING_MODE
-fi
+# The map in the middle is a full processor/device synchronisation once per
+# frame: the mapping thread blocks until the device has finished the tile.
+# Measured on faz.net, it is ~6.8ms of every maximized frame and ~2.2ms of
+# every small-window one -- the single largest item left in the frame, larger
+# than everything the kernel driver does put together.
+#
+# It cannot be configured away.  WebKit only skips the map when its EGL
+# display is the one GTK is already using
+# (Display::glDisplayIsSharedWithGtk()), and on the GTK3 API line under X11
+# that is never true: the shared path,
+# gdk_x11_display_get_egl_display(), is compiled only for GTK4
+# (UIProcess/gtk/DisplayX11.cpp), so the GTK3 branch always creates a display
+# of its own and marks it owned.  GTK 3.24's X11 backend has no EGL at all --
+# it is GLX only -- so there is nothing to share with, and a WebKit EGLImage
+# could not be sampled by a GDK GLX context anyway.  webkit://gpu reports it
+# as "Native interface: None" and "Usage: Mapping"; those are the only values
+# it can print on this toolkit.
+#
+# So the choice is not "GPU compositing versus cairo".  It is "GPU render
+# plus a device round trip plus a CPU map plus a cairo composite" versus
+# "cairo".  The second is the shorter path, which is why it is the default
+# here.  The cost is that WebGL and the accelerated 2D canvas need the
+# compositor; luakit's own policy setting
+# (res/xorg/gtk3/luakit-userconf.lua) makes the matching choice and turns it
+# back on for the pages that are only about WebGL.
+#
+# This becomes wrong the day WebKit is built against GTK4 (webkit2gtk-6.0),
+# because then the display IS shared, the map disappears and the accelerated
+# path is genuinely shorter.  Delete this and the block in luakit-userconf.lua
+# together on that day.
+#
+# To get the accelerated path back by hand, export the variable with a
+# different value from a shell before starting luakit -- not here.
+WEBKIT_FORCE_COMPOSITING_MODE=0
+export WEBKIT_FORCE_COMPOSITING_MODE
 
 # No terminal is started here on purpose.  Use "Xterm" on the window manager's
 # menu, which is Alt+F1 -- the menus are on keys rather than mouse buttons

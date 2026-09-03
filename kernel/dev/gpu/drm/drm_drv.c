@@ -517,8 +517,8 @@ static long drm_core_ioctl(struct drm_device *dev, struct drm_file *fp,
 		uint64_t fl;
 		spin_lock_irqsave(&dev->lock, &fl);
 		for (struct drm_gem_object *o = dev->objects; o; o = o->next) {
-			if (o->flink_name && (uint32_t)o->flink_name == g->name) {
-				drm_gem_get(o);
+			if (o->flink_name && (uint32_t)o->flink_name == g->name &&
+			    drm_gem_get_unless_zero(o)) {
 				found = o;
 				break;
 			}
@@ -761,6 +761,9 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 			      "drm", pci);
 
 	drm_kms_init(dev);
+	/* Object teardown runs here, not in a client's ioctl.  See
+	 * drm_gem_reap_start(). */
+	drm_gem_reap_start(dev);
 	kprintf("[drm] %s: /dev/dri/card%d + renderD%d (%s), version %d.%d.%d\n",
 		drv->name, dev->index, DRM_RENDER_MINOR_BASE + dev->index,
 		dev->unique, drv->major, drv->minor, drv->patch);

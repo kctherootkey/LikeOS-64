@@ -1,9 +1,10 @@
 -- luakit's user configuration for this image.
 --
 -- The one setting worth reading before anything else is the
--- hardware-acceleration policy further down: it is chosen at startup from
--- whether this machine has a GPU the kernel could bind, so the same image is
--- correct on a machine with one and on a machine without.
+-- hardware-acceleration policy further down: it is OFF, deliberately, even
+-- where the kernel bound a GPU -- because on the GTK3 API line the
+-- "accelerated" path ends in a per-frame CPU map that costs more than it
+-- saves.  The reasoning is written out there.
 
 local settings = require "settings"
 
@@ -23,35 +24,36 @@ settings.window.new_window_size = "1024x768"
 -- available through domain_props if a page's shaders are too slow.
 settings.webview.enable_webgl = true
 
--- Hardware acceleration: DECIDED BY THE MACHINE, at startup.
+-- Hardware acceleration: OFF, on every machine, GPU or not.
 --
--- WebKitGTK 2.44+ has two real rendering modes for this toolkit: "always"
--- runs every page through the accelerated compositor, "never" paints with
--- cairo.  ("on-demand" is accepted and treated as "always".)  Which one is
--- right depends entirely on what is underneath:
+-- WebKitGTK has two real rendering modes for this toolkit: "always" runs
+-- every page through the accelerated compositor, "never" paints with cairo.
+-- ("on-demand" is accepted and treated as "always".)  This used to be chosen
+-- at startup from whether /dev/dri/card0 existed.  It is now "never" either
+-- way, and the reason is specific to the GTK3 API line.
 --
---   With a GPU -- the kernel bound a display-manager driver, /dev/dri/card0
---   exists, and Mesa reaches it through the svga driver -- the compositor
---   draws into GPU textures and hands the finished frame over as a buffer
---   descriptor.  That is what WebGL, accelerated 2D canvas and the GPU
---   process all need, and it is faster than cairo on every page.
+-- With the compositor on, the accelerated path is NOT "render on the GPU and
+-- show it".  It is: the web process renders the tile with the GPU, hands it
+-- over as a dma-buf descriptor, and then the UI process CPU-MAPS that buffer
+-- and composites from the mapped bytes with cairo.  The map is a full
+-- processor/device synchronisation once per frame -- measured at ~6.8ms of
+-- every maximized frame on faz.net, more than the whole kernel driver costs.
 --
---   Without one, GL is llvmpipe: the compositor becomes several full-screen
---   CPU passes per scroll step (freebsd.org was unscrollable that way) where
---   cairo needs one.  So plain pages take cairo, and the sites that cannot
---   work without a compositor are listed individually.
+-- WebKit only skips the map when its EGL display is the one GTK already
+-- uses, and on GTK3 under X11 that is never true: the sharing path is
+-- compiled only for GTK4, and GTK 3.24's X11 backend is GLX-only, so there
+-- is no EGL display to share.  webkit://gpu says so directly --
+-- "Native interface: None", "Usage: Mapping".  No setting changes it.
 --
--- The test is the node, because that is the thing that is actually different
--- between the two machines.  Reading it here rather than hardcoding a policy
--- keeps ONE image working correctly on both.
+-- So the comparison is "GPU render + device round trip + CPU map + cairo
+-- composite" against plain "cairo", and plain cairo is the shorter path.
+-- res/xorg/xinitrc sets WEBKIT_FORCE_COMPOSITING_MODE=0 to match; the two
+-- have to stay in step.
+--
+-- Reverse both the day WebKit is built against GTK4 (webkit2gtk-6.0): the
+-- display is shared there, the map disappears, and the accelerated path
+-- becomes the shorter one for real.
 local acceleration = "never"
-do
-    local node = io.open("/dev/dri/card0", "r")
-    if node then
-        node:close()
-        acceleration = "always"
-    end
-end
 settings.webview.hardware_acceleration_policy = acceleration
 if acceleration == "never" then
     -- WebGL needs the compositor, so the pages that are only about WebGL get
