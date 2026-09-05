@@ -1,0 +1,56 @@
+X11, GTK 3: adopt the toolkit's EGL display instead of creating our own.
+
+Whether the user-interface process shows a frame from the rendering process
+by importing its dma-buf as an EGLImage, or by mapping it and copying it
+through the processor, is decided by Display::glDisplayIsSharedWithGtk(): the
+import needs a context on the same EGLDisplay GDK draws with.  On X11 with
+GTK 3 this file always created a display of its own and marked it owned, so
+the answer was never yes and every frame was copied -- about 7ms of a
+maximized frame on this system, and the difference between 60 and 30 frames
+a second when scrolling.
+
+GTK 3 has no accessor for the display its contexts live on, so this takes the
+route the Wayland side of this class already takes: realize a throwaway popup
+window, ask GDK for a GL context on it, make it current and read the display
+back with eglGetCurrentDisplay().  With the toolkit patched to create its X11
+contexts through EGL (patches/gtk/0002) that is a display we can share, and
+it is adopted without being marked owned.  A toolkit still on GLX leaves no
+EGL context current, and the existing fallback creates an owned display as
+before -- so this is safe against either toolkit.
+
+Only an owned display is ever terminated (the "closed" handler checks), so
+adopting GDK's cannot take it away from GDK.
+
+--- a/Source/WebKit/UIProcess/gtk/DisplayX11.cpp
++++ b/Source/WebKit/UIProcess/gtk/DisplayX11.cpp
+@@ -58,6 +58,30 @@
+     m_glDisplay = GLDisplay::create(gdk_x11_display_get_egl_display(m_gdkDisplay.get()));
+     if (m_glDisplay)
+         return true;
++#else
++    // GTK 3 has no accessor for the display its own contexts live on, so the
++    // route the Wayland side already takes: realize a throwaway window, ask
++    // GDK for a context on it, make it current and read the display back from
++    // EGL.  A GDK that creates its X11 contexts through EGL answers with the
++    // display the toolkit itself draws with, and a display shared that way is
++    // what lets a frame arrive as a dma-buf and be shown without a copy.  A
++    // GDK still on GLX leaves no EGL context current, and the fallback below
++    // creates a display of our own as before.
++    {
++        auto* window = gtk_window_new(GTK_WINDOW_POPUP);
++        gtk_widget_realize(window);
++        if (auto context = adoptGRef(gdk_window_create_gl_context(gtk_widget_get_window(window), nullptr))) {
++            if (gdk_gl_context_realize(context.get(), nullptr)) {
++                gdk_gl_context_make_current(context.get());
++                if (eglGetCurrentContext() != EGL_NO_CONTEXT)
++                    m_glDisplay = GLDisplay::create(eglGetCurrentDisplay());
++                gdk_gl_context_clear_current();
++            }
++        }
++        gtk_widget_destroy(window);
++    }
++    if (m_glDisplay)
++        return true;
+ #endif
+ 
+     auto* xDisplay = GDK_DISPLAY_XDISPLAY(m_gdkDisplay.get());

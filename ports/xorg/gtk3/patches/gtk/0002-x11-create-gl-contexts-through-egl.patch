@@ -1,0 +1,1212 @@
+X11: create GL contexts through EGL, with GLX as the fallback.
+
+A GL context GDK creates is what a program draws into a GdkWindow with and,
+through gdk_cairo_draw_from_gl(), what it composites GL textures of its own
+into.  A program whose picture is produced in another process -- a web
+engine's user-interface process, whose rendering process draws the page --
+receives each frame as a dma-buf descriptor, and the only way to show such a
+frame without copying it is to import it as an EGLImage and bind that to a
+texture in the toolkit's own context.  That needs the toolkit's context to be
+an EGL context on the EGLDisplay the image was created on.  A GLX context
+cannot take an EGLImage at all, so under GLX the program maps the buffer and
+copies it through the processor once per frame, at the full size of the
+window: on this system about 7ms of every maximized frame, which is the
+difference between 60 and 30 frames a second.
+
+The Wayland and Windows backends already create their contexts through EGL.
+This is the same arrangement for the X11 backend, modelled on
+gdkglcontext-wayland.c.  What is X11-specific: the display is an EGL display
+on the Xlib connection; an X window is itself an EGL native window, so there
+is nothing to create or resize between the two; and config selection has to
+name a config whose native visual is the window's, because EGL puts a surface
+on a window only from such a config and eglChooseConfig() ignores that
+attribute when selecting, so configs are enumerated and matched by hand.
+
+EGL is tried first when a screen brings GL up, and only where it can serve a
+window on the screen's default visual; otherwise the GLX path runs exactly as
+before.  GDK_GL=glx forces GLX for a session.  A display is one or the other
+for its whole life.  The GL-capable default visuals are cached on the root
+window under GDK_VISUALS_EGL, beside the GLX path's GDK_VISUALS, so a session
+that switches backends does not read the other's choice as its own.
+
+gdk_x11_display_get_glx_version() answers FALSE on a display driven through
+EGL -- it is asked about GLX -- and GLX_EXT_texture_from_pixmap is not
+offered there, so gdkgl.c's generic texture upload takes over for cairo
+surfaces.
+
+--- a/gdk/gdkinternals.h
++++ b/gdk/gdkinternals.h
+@@ -101,7 +101,10 @@
+   GDK_GL_SOFTWARE_DRAW_SURFACE  = 1 << 3,
+   GDK_GL_TEXTURE_RECTANGLE      = 1 << 4,
+   GDK_GL_LEGACY                 = 1 << 5,
+-  GDK_GL_GLES                   = 1 << 6
++  GDK_GL_GLES                   = 1 << 6,
++  /* X11: create contexts through GLX even where EGL is available.  The
++   * two are never mixed on one display. */
++  GDK_GL_GLX                    = 1 << 7
+ } GdkGLFlags;
+ 
+ extern GList            *_gdk_default_filters;
+--- a/gdk/gdk.c
++++ b/gdk/gdk.c
+@@ -145,6 +145,7 @@
+   { "texture-rectangle",     GDK_GL_TEXTURE_RECTANGLE },
+   { "legacy",                GDK_GL_LEGACY },
+   { "gles",                  GDK_GL_GLES },
++  { "glx",                   GDK_GL_GLX },
+ };
+ 
+ #ifdef G_ENABLE_DEBUG
+--- a/gdk/x11/gdkdisplay-x11.h
++++ b/gdk/x11/gdkdisplay-x11.h
+@@ -149,8 +149,31 @@
+   guint has_glx_multisample : 1;
+   guint has_glx_visual_rating : 1;
+   guint has_glx_create_es2_context : 1;
++
++  /* EGL information.  The display is driven through EGL rather than GLX
++   * wherever it can be brought up (gdkglcontext-x11.c says why), and then
++   * none of the GLX fields above are used. */
++  gpointer egl_display;          /* an EGLDisplay */
++  gint egl_major_version;
++  gint egl_minor_version;
++  /* How the display was obtained -- through which entry point -- which
++   * decides how a native window is later handed to EGL: by address through
++   * a platform entry point, by value through the legacy one. */
++  gint egl_platform;             /* GDK_X11_EGL_PLATFORM_* */
++
++  guint have_egl : 1;
++  guint egl_tried : 1;           /* bring-up attempted; answer is have_egl */
++
++  /* EGL extensions we check */
++  guint have_egl_buffer_age : 1;
++  guint have_egl_swap_buffers_with_damage : 1;
++  guint have_egl_surfaceless_context : 1;
+ };
+ 
++#define GDK_X11_EGL_PLATFORM_NONE 0   /* eglGetDisplay() */
++#define GDK_X11_EGL_PLATFORM_KHR  1   /* eglGetPlatformDisplay(), EGL 1.5 */
++#define GDK_X11_EGL_PLATFORM_EXT  2   /* eglGetPlatformDisplayEXT() */
++
+ struct _GdkX11DisplayClass
+ {
+   GdkDisplayClass parent_class;
+--- a/gdk/x11/gdkglcontext-x11.h
++++ b/gdk/x11/gdkglcontext-x11.h
+@@ -26,6 +26,7 @@
+ 
+ #include <epoxy/gl.h>
+ #include <epoxy/glx.h>
++#include <epoxy/egl.h>
+ 
+ #include "gdkglcontextprivate.h"
+ #include "gdkdisplayprivate.h"
+@@ -49,6 +50,12 @@
+   guint do_frame_sync : 1;
+ 
+   guint do_blit_swap : 1;
++
++  /* Set instead of the GLX fields when the display was brought up through
++   * EGL (GdkX11Display.have_egl). */
++  EGLContext egl_context;
++  EGLConfig egl_config;
++  guint egl_swap_interval_set : 1;
+ };
+ 
+ struct _GdkX11GLContextClass
+--- a/gdk/x11/gdkglcontext-x11.c
++++ b/gdk/x11/gdkglcontext-x11.c
+@@ -40,9 +40,19 @@
+ #include <cairo/cairo-xlib.h>
+ 
+ #include <epoxy/glx.h>
++#include <epoxy/egl.h>
+ 
+ G_DEFINE_TYPE (GdkX11GLContext, gdk_x11_gl_context, GDK_TYPE_GL_CONTEXT)
+ 
++/* The EGL half of this backend is defined further down, after the GLX
++ * helpers it sits beside; these two are reached from the GLX-era entry
++ * points above it. */
++static void gdk_x11_window_invalidate_for_new_frame_egl (GdkWindow      *window,
++                                                         cairo_region_t *update_area);
++static void gdk_x11_gl_context_end_frame_egl             (GdkGLContext   *context,
++                                                         cairo_region_t *painted,
++                                                         cairo_region_t *damage);
++
+ typedef struct {
+   GdkDisplay *display;
+ 
+@@ -134,6 +144,12 @@
+   if (window->gl_paint_context == NULL)
+     return;
+ 
++  if (display_x11->have_egl)
++    {
++      gdk_x11_window_invalidate_for_new_frame_egl (window, update_area);
++      return;
++    }
++
+   context_x11 = GDK_X11_GL_CONTEXT (window->gl_paint_context);
+ 
+   buffer_age = 0;
+@@ -229,6 +245,12 @@
+   DrawableInfo *info;
+   GLXDrawable drawable;
+ 
++  if (display_x11->have_egl)
++    {
++      gdk_x11_gl_context_end_frame_egl (context, painted, damage);
++      return;
++    }
++
+   gdk_gl_context_make_current (context);
+ 
+   info = get_glx_drawable_info (window);
+@@ -443,6 +465,10 @@
+   GdkX11Display *display_x11;
+ 
+   display_x11 = GDK_X11_DISPLAY (gdk_gl_context_get_display (paint_context));
++  /* Texture-from-pixmap is a GLX extension; under EGL the generic upload
++   * in gdkgl.c takes over. */
++  if (display_x11->have_egl)
++    return FALSE;
+   if (!display_x11->has_glx_texture_from_pixmap)
+     return FALSE;
+ 
+@@ -616,6 +642,798 @@
+   return res;
+ }
+ 
++
++/* ---- EGL --------------------------------------------------------------------
++ *
++ * Why this backend creates its contexts through EGL where it can, and through
++ * GLX only when it cannot.
++ *
++ * A context GDK creates is what a program draws into a GdkWindow with, and --
++ * through gdk_cairo_draw_from_gl() -- what it composites GL textures of its own
++ * into.  A program whose picture is produced elsewhere, in another process,
++ * hands each frame over as a dma-buf descriptor, and the only way to show such
++ * a frame without copying it is to import it as an EGLImage and bind that to a
++ * texture in the toolkit's own context.  That works only if the toolkit's
++ * context is an EGL context on the EGLDisplay the image was created on.  A GLX
++ * context cannot take an EGLImage at all, so under GLX the program is left to
++ * map the buffer and copy it through the processor, once per frame, at the
++ * full size of the window.  (A web engine's user-interface process is exactly
++ * such a program; its rendering process draws the page and sends descriptors.)
++ *
++ * The Wayland and Windows backends already create their contexts through EGL.
++ * This is the same arrangement for X11, modelled on gdkglcontext-wayland.c.
++ * What is X11-specific:
++ *
++ *   - the display is an EGL display on the Xlib connection;
++ *   - an X window IS an EGL native window, so there is no intermediate object
++ *     to create or resize (Wayland needs wl_egl_window; this needs nothing);
++ *   - config selection has to name a config whose native visual is the
++ *     window's own.  EGL puts a surface on a window only from such a config,
++ *     and eglChooseConfig() ignores the attribute when selecting, so the
++ *     configs are enumerated and matched by hand.
++ *
++ * GDK_GL=glx forces the GLX path for a session.  A display is one or the
++ * other for its whole life; the two are never mixed.
++ */
++
++/* The EGL 1.5 / EXT platform entry points, fetched by name: the header may
++ * declare them, the library at run time may still not have them. */
++typedef EGLDisplay (EGLAPIENTRY *GdkEglGetPlatformDisplayFunc)         (EGLenum, void *, const EGLAttrib *);
++typedef EGLDisplay (EGLAPIENTRY *GdkEglGetPlatformDisplayEXTFunc)      (EGLenum, void *, const EGLint *);
++typedef EGLSurface (EGLAPIENTRY *GdkEglCreatePlatformWindowSurfaceFunc)    (EGLDisplay, EGLConfig, void *, const EGLAttrib *);
++typedef EGLSurface (EGLAPIENTRY *GdkEglCreatePlatformWindowSurfaceEXTFunc) (EGLDisplay, EGLConfig, void *, const EGLint *);
++
++typedef struct {
++  GdkDisplay *display;
++
++  /* The window's own surface: what an attached context draws to. */
++  EGLSurface egl_surface;
++
++  /* Where the implementation cannot make a context current without a
++   * surface, an unattached context gets a 1x1 window of its own, the way
++   * the GLX path does. */
++  Window dummy_xwin;
++  EGLSurface dummy_surface;
++} EglDrawableInfo;
++
++static void
++egl_drawable_info_free (gpointer data_)
++{
++  EglDrawableInfo *data = data_;
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (data->display);
++  EGLDisplay edpy = display_x11->egl_display;
++  Display *dpy = gdk_x11_display_get_xdisplay (data->display);
++
++  /* A surface still current to a context is released by EGL when that
++   * context lets go of it -- the rule, not a hazard. */
++  if (data->egl_surface != EGL_NO_SURFACE)
++    eglDestroySurface (edpy, data->egl_surface);
++  if (data->dummy_surface != EGL_NO_SURFACE)
++    eglDestroySurface (edpy, data->dummy_surface);
++
++  if (data->dummy_xwin != None)
++    {
++      gdk_x11_display_error_trap_push (data->display);
++      XDestroyWindow (dpy, data->dummy_xwin);
++      gdk_x11_display_error_trap_pop_ignored (data->display);
++    }
++
++  g_slice_free (EglDrawableInfo, data);
++}
++
++static EglDrawableInfo *
++get_egl_drawable_info (GdkWindow *window)
++{
++  return g_object_get_data (G_OBJECT (window), "-gdk-x11-window-egl-info");
++}
++
++static void
++set_egl_drawable_info (GdkWindow       *window,
++                       EglDrawableInfo *info)
++{
++  g_object_set_data_full (G_OBJECT (window), "-gdk-x11-window-egl-info",
++                          info, egl_drawable_info_free);
++}
++
++/* Obtain the EGL display for the Xlib connection.  The platform entry
++ * points say WHAT KIND of native display is being handed over; the legacy
++ * one guesses from the pointer.  Preferred where they exist, and which one
++ * answered is recorded, because the matching surface entry point takes the
++ * native window differently (see egl_create_window_surface). */
++static EGLDisplay
++gdk_x11_get_egl_display (GdkX11Display *display_x11,
++                         gint          *platform_out)
++{
++  Display *dpy = gdk_x11_display_get_xdisplay (GDK_DISPLAY (display_x11));
++  EGLDisplay edpy;
++
++  if (epoxy_has_egl_extension (NULL, "EGL_KHR_platform_x11"))
++    {
++      GdkEglGetPlatformDisplayFunc get =
++        (GdkEglGetPlatformDisplayFunc) eglGetProcAddress ("eglGetPlatformDisplay");
++
++      if (get != NULL)
++        {
++          edpy = get (EGL_PLATFORM_X11_KHR, dpy, NULL);
++          if (edpy != EGL_NO_DISPLAY)
++            {
++              *platform_out = GDK_X11_EGL_PLATFORM_KHR;
++              return edpy;
++            }
++        }
++    }
++
++  if (epoxy_has_egl_extension (NULL, "EGL_EXT_platform_x11"))
++    {
++      GdkEglGetPlatformDisplayEXTFunc get =
++        (GdkEglGetPlatformDisplayEXTFunc) eglGetProcAddress ("eglGetPlatformDisplayEXT");
++
++      if (get != NULL)
++        {
++          edpy = get (EGL_PLATFORM_X11_EXT, dpy, NULL);
++          if (edpy != EGL_NO_DISPLAY)
++            {
++              *platform_out = GDK_X11_EGL_PLATFORM_EXT;
++              return edpy;
++            }
++        }
++    }
++
++  *platform_out = GDK_X11_EGL_PLATFORM_NONE;
++  return eglGetDisplay ((EGLNativeDisplayType) dpy);
++}
++
++/* Put an EGL window surface on an X window.  Through a platform entry point
++ * the native window is passed BY ADDRESS -- the platform extensions define
++ * it as a pointer to the Window -- and through the legacy one by value. */
++static EGLSurface
++egl_create_window_surface (GdkX11Display *display_x11,
++                           EGLConfig      config,
++                           Window         xwindow)
++{
++  EGLDisplay edpy = display_x11->egl_display;
++
++  switch (display_x11->egl_platform)
++    {
++    case GDK_X11_EGL_PLATFORM_KHR:
++      {
++        GdkEglCreatePlatformWindowSurfaceFunc create =
++          (GdkEglCreatePlatformWindowSurfaceFunc) eglGetProcAddress ("eglCreatePlatformWindowSurface");
++
++        if (create != NULL)
++          return create (edpy, config, &xwindow, NULL);
++      }
++      break;
++
++    case GDK_X11_EGL_PLATFORM_EXT:
++      {
++        GdkEglCreatePlatformWindowSurfaceEXTFunc create =
++          (GdkEglCreatePlatformWindowSurfaceEXTFunc) eglGetProcAddress ("eglCreatePlatformWindowSurfaceEXT");
++
++        if (create != NULL)
++          return create (edpy, config, &xwindow, NULL);
++      }
++      break;
++
++    default:
++      break;
++    }
++
++  return eglCreateWindowSurface (edpy, config,
++                                 (EGLNativeWindowType) (uintptr_t) xwindow,
++                                 NULL);
++}
++
++struct eglconfiginfo {
++  EGLint alpha_size;
++  EGLint depth_size;
++  EGLint stencil_size;
++  EGLint sample_buffers;
++  EGLint caveat;
++};
++
++/* The config for an X visual.
++ *
++ * Every config usable with a visual carries that visual's id, which is how
++ * the two worlds are joined.  Among the configs for one visual the preference
++ * is the GLX path's: the alpha the visual implies (an rgba visual wants it,
++ * the system visual does not), none of the depth, stencil or multisample
++ * buffers nothing here uses, and no caveat.  A config missing the preferred
++ * properties is still taken over nothing at all; only a config an rgba visual
++ * cannot blend through is refused outright. */
++static gboolean
++find_eglconfig_for_visual_id (GdkX11Display         *display_x11,
++                              VisualID               visual_id,
++                              gboolean               want_alpha,
++                              EGLConfig             *config_out,
++                              struct eglconfiginfo  *info_out)
++{
++  EGLDisplay edpy = display_x11->egl_display;
++  EGLConfig *configs;
++  EGLConfig best = NULL;
++  int best_score = -1;
++  EGLint n_configs = 0;
++  EGLint renderable_bits;
++  EGLint i;
++
++  if ((_gdk_gl_flags & GDK_GL_GLES) != 0)
++    renderable_bits = EGL_OPENGL_ES2_BIT | EGL_OPENGL_ES3_BIT_KHR;
++  else
++    renderable_bits = EGL_OPENGL_BIT;
++
++  if (!eglGetConfigs (edpy, NULL, 0, &n_configs) || n_configs <= 0)
++    return FALSE;
++
++  configs = g_new (EGLConfig, n_configs);
++  if (!eglGetConfigs (edpy, configs, n_configs, &n_configs))
++    {
++      g_free (configs);
++      return FALSE;
++    }
++
++  for (i = 0; i < n_configs; i++)
++    {
++      EGLint id = 0, surface_type = 0, renderable = 0, buffer_type = 0;
++      struct eglconfiginfo ci = { 0, 0, 0, 0, EGL_NONE };
++      int score;
++
++      if (!eglGetConfigAttrib (edpy, configs[i], EGL_NATIVE_VISUAL_ID, &id) ||
++          (VisualID) id != visual_id)
++        continue;
++      if (!eglGetConfigAttrib (edpy, configs[i], EGL_SURFACE_TYPE, &surface_type) ||
++          (surface_type & EGL_WINDOW_BIT) == 0)
++        continue;
++      if (!eglGetConfigAttrib (edpy, configs[i], EGL_RENDERABLE_TYPE, &renderable) ||
++          (renderable & renderable_bits) == 0)
++        continue;
++      if (!eglGetConfigAttrib (edpy, configs[i], EGL_COLOR_BUFFER_TYPE, &buffer_type) ||
++          buffer_type != EGL_RGB_BUFFER)
++        continue;
++
++      eglGetConfigAttrib (edpy, configs[i], EGL_ALPHA_SIZE, &ci.alpha_size);
++      eglGetConfigAttrib (edpy, configs[i], EGL_DEPTH_SIZE, &ci.depth_size);
++      eglGetConfigAttrib (edpy, configs[i], EGL_STENCIL_SIZE, &ci.stencil_size);
++      eglGetConfigAttrib (edpy, configs[i], EGL_SAMPLE_BUFFERS, &ci.sample_buffers);
++      eglGetConfigAttrib (edpy, configs[i], EGL_CONFIG_CAVEAT, &ci.caveat);
++
++      if (want_alpha && ci.alpha_size == 0)
++        continue;
++
++      score = 0;
++      if (want_alpha ? ci.alpha_size > 0 : ci.alpha_size == 0)
++        score += 8;
++      if (ci.depth_size == 0)
++        score += 4;
++      if (ci.stencil_size == 0)
++        score += 2;
++      if (ci.sample_buffers == 0)
++        score += 1;
++      if (ci.caveat != EGL_NONE)
++        score -= 16;
++
++      if (score > best_score)
++        {
++          best_score = score;
++          best = configs[i];
++          if (info_out != NULL)
++            *info_out = ci;
++        }
++    }
++
++  g_free (configs);
++
++  if (best == NULL)
++    return FALSE;
++  if (config_out != NULL)
++    *config_out = best;
++  return TRUE;
++}
++
++static gboolean
++find_eglconfig_for_window (GdkWindow  *window,
++                           EGLConfig  *config_out,
++                           GError    **error)
++{
++  GdkDisplay *display = gdk_window_get_display (window);
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  GdkVisual *visual = gdk_window_get_visual (window);
++  VisualID xvisual_id = XVisualIDFromVisual (gdk_x11_visual_get_xvisual (visual));
++  gboolean use_rgba;
++
++  use_rgba = (visual == gdk_screen_get_rgba_visual (gdk_display_get_default_screen (display)));
++
++  if (!find_eglconfig_for_visual_id (display_x11, xvisual_id, use_rgba, config_out, NULL))
++    {
++      g_set_error_literal (error, GDK_GL_ERROR,
++                           GDK_GL_ERROR_UNSUPPORTED_FORMAT,
++                           _("No available configurations for the given RGBA pixel format"));
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
++/* Bring EGL up on the display.  Once; the answer is remembered either way.
++ *
++ * Nothing here terminates the display on a failed bring-up.  The EGL display
++ * for an X connection is one object however many times it is asked for, and
++ * a program may already have initialised it for its own use before GDK gets
++ * here -- terminating it would take theirs away with ours. */
++static gboolean
++gdk_x11_display_init_egl (GdkDisplay *display)
++{
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  Display *dpy = gdk_x11_display_get_xdisplay (display);
++  EGLDisplay edpy;
++  EGLint major, minor;
++  gint platform;
++  gboolean use_es;
++
++  if (display_x11->have_egl)
++    return TRUE;
++  if (display_x11->egl_tried)
++    return FALSE;
++  display_x11->egl_tried = TRUE;
++
++  if (_gdk_gl_flags & (GDK_GL_DISABLE | GDK_GL_GLX))
++    return FALSE;
++
++  if (!epoxy_has_egl ())
++    return FALSE;
++
++  edpy = gdk_x11_get_egl_display (display_x11, &platform);
++  if (edpy == EGL_NO_DISPLAY)
++    return FALSE;
++
++  if (!eglInitialize (edpy, &major, &minor))
++    return FALSE;
++
++  use_es = (_gdk_gl_flags & GDK_GL_GLES) != 0;
++  if (!eglBindAPI (use_es ? EGL_OPENGL_ES_API : EGL_OPENGL_API))
++    return FALSE;
++
++  /* A core profile -- what a GdkGLContext asks for unless told otherwise --
++   * needs EGL_KHR_create_context.  Without it this display cannot serve the
++   * contexts GDK creates, and GLX may still be able to. */
++  if (!epoxy_has_egl_extension (edpy, "EGL_KHR_create_context"))
++    return FALSE;
++
++  display_x11->egl_display = edpy;
++  display_x11->egl_platform = platform;
++
++  /* The one X11 condition: EGL must be able to put a window surface on the
++   * screen's default visual, or every ordinary window would be refused a
++   * context that GLX would have granted.  Checked before committing, so the
++   * fallback is still open. */
++  if (!find_eglconfig_for_visual_id (display_x11,
++                                     XVisualIDFromVisual (DefaultVisual (dpy, DefaultScreen (dpy))),
++                                     FALSE, NULL, NULL))
++    {
++      display_x11->egl_display = NULL;
++      display_x11->egl_platform = GDK_X11_EGL_PLATFORM_NONE;
++      return FALSE;
++    }
++
++  display_x11->egl_major_version = major;
++  display_x11->egl_minor_version = minor;
++  display_x11->have_egl = TRUE;
++
++  display_x11->have_egl_buffer_age =
++    epoxy_has_egl_extension (edpy, "EGL_EXT_buffer_age");
++  display_x11->have_egl_swap_buffers_with_damage =
++    epoxy_has_egl_extension (edpy, "EGL_EXT_swap_buffers_with_damage");
++  display_x11->have_egl_surfaceless_context =
++    epoxy_has_egl_extension (edpy, "EGL_KHR_surfaceless_context");
++
++  GDK_NOTE (OPENGL,
++            g_message ("EGL API version %d.%d found on X11 (%s)\n"
++                       " - Vendor: %s\n"
++                       " - Version: %s\n"
++                       " - Client APIs: %s\n"
++                       " - Checked extensions:\n"
++                       "\t* EGL_KHR_create_context: yes\n"
++                       "\t* EGL_EXT_buffer_age: %s\n"
++                       "\t* EGL_EXT_swap_buffers_with_damage: %s\n"
++                       "\t* EGL_KHR_surfaceless_context: %s",
++                       major, minor,
++                       platform == GDK_X11_EGL_PLATFORM_KHR ? "EGL_KHR_platform_x11" :
++                       platform == GDK_X11_EGL_PLATFORM_EXT ? "EGL_EXT_platform_x11" :
++                                                              "eglGetDisplay",
++                       eglQueryString (edpy, EGL_VENDOR),
++                       eglQueryString (edpy, EGL_VERSION),
++                       eglQueryString (edpy, EGL_CLIENT_APIS),
++                       display_x11->have_egl_buffer_age ? "yes" : "no",
++                       display_x11->have_egl_swap_buffers_with_damage ? "yes" : "no",
++                       display_x11->have_egl_surfaceless_context ? "yes" : "no"));
++
++  return TRUE;
++}
++
++/* The surfaces of the window a context is created on, made once per
++ * toplevel and kept for its life, as the GLX path keeps its GLXWindow. */
++static EglDrawableInfo *
++egl_drawable_info_ensure (GdkWindow  *impl_window,
++                          EGLConfig   config,
++                          GError    **error)
++{
++  GdkDisplay *display = gdk_window_get_display (impl_window);
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  Display *dpy = gdk_x11_display_get_xdisplay (display);
++  EglDrawableInfo *info;
++  gboolean failed = FALSE;
++
++  info = get_egl_drawable_info (impl_window);
++  if (info != NULL)
++    return info;
++
++  info = g_slice_new0 (EglDrawableInfo);
++  info->display = display;
++  info->egl_surface = EGL_NO_SURFACE;
++  info->dummy_xwin = None;
++  info->dummy_surface = EGL_NO_SURFACE;
++
++  gdk_x11_display_error_trap_push (display);
++
++  info->egl_surface = egl_create_window_surface (display_x11, config,
++                                                 gdk_x11_window_get_xid (impl_window));
++  if (info->egl_surface == EGL_NO_SURFACE)
++    failed = TRUE;
++
++  if (!failed && !display_x11->have_egl_surfaceless_context)
++    {
++      XVisualInfo visual_template, *visual_list;
++      XSetWindowAttributes attrs;
++      unsigned long mask;
++      EGLint visual_id = 0;
++      int n_visuals = 0;
++
++      /* A window of the config's own visual, off screen and never shown. */
++      eglGetConfigAttrib (display_x11->egl_display, config,
++                          EGL_NATIVE_VISUAL_ID, &visual_id);
++      visual_template.screen = DefaultScreen (dpy);
++      visual_template.visualid = (VisualID) visual_id;
++      visual_list = XGetVisualInfo (dpy, VisualIDMask | VisualScreenMask,
++                                    &visual_template, &n_visuals);
++      if (visual_list == NULL || n_visuals < 1)
++        failed = TRUE;
++      else
++        {
++          attrs.override_redirect = True;
++          attrs.colormap = XCreateColormap (dpy, DefaultRootWindow (dpy),
++                                            visual_list[0].visual, AllocNone);
++          attrs.border_pixel = 0;
++          mask = CWOverrideRedirect | CWColormap | CWBorderPixel;
++          info->dummy_xwin = XCreateWindow (dpy, DefaultRootWindow (dpy),
++                                            -100, -100, 1, 1, 0,
++                                            visual_list[0].depth,
++                                            CopyFromParent,
++                                            visual_list[0].visual,
++                                            mask, &attrs);
++          info->dummy_surface = egl_create_window_surface (display_x11, config,
++                                                           info->dummy_xwin);
++          if (info->dummy_surface == EGL_NO_SURFACE)
++            failed = TRUE;
++        }
++      if (visual_list != NULL)
++        XFree (visual_list);
++    }
++
++  if (gdk_x11_display_error_trap_pop (display))
++    failed = TRUE;
++
++  if (failed)
++    {
++      g_set_error_literal (error, GDK_GL_ERROR,
++                           GDK_GL_ERROR_NOT_AVAILABLE,
++                           _("Unable to create a GL context"));
++      egl_drawable_info_free (info);
++      return NULL;
++    }
++
++  set_egl_drawable_info (impl_window, info);
++  return info;
++}
++
++#define N_EGL_ATTRS     16
++
++static gboolean
++gdk_x11_gl_context_realize_egl (GdkGLContext  *context,
++                                GError       **error)
++{
++  GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (context);
++  GdkDisplay *display = gdk_gl_context_get_display (context);
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  GdkGLContext *share = gdk_gl_context_get_shared_context (context);
++  GdkWindow *window = gdk_gl_context_get_window (context);
++  EGLContext ctx;
++  EGLint context_attribs[N_EGL_ATTRS];
++  int major, minor, flags;
++  gboolean debug_bit, forward_bit, legacy_bit, use_es;
++  int i = 0;
++
++  gdk_gl_context_get_required_version (context, &major, &minor);
++  debug_bit = gdk_gl_context_get_debug_enabled (context);
++  forward_bit = gdk_gl_context_get_forward_compatible (context);
++  legacy_bit = (_gdk_gl_flags & GDK_GL_LEGACY) != 0 ||
++               (share != NULL && gdk_gl_context_is_legacy (share));
++  use_es = (_gdk_gl_flags & GDK_GL_GLES) != 0 ||
++           (share != NULL && gdk_gl_context_get_use_es (share));
++
++  flags = 0;
++  if (debug_bit)
++    flags |= EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
++  if (forward_bit)
++    flags |= EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR;
++
++  if (!use_es)
++    {
++      eglBindAPI (EGL_OPENGL_API);
++
++      /* A core profile, unless in legacy mode */
++      context_attribs[i++] = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
++      context_attribs[i++] = legacy_bit
++                           ? EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR
++                           : EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR;
++      context_attribs[i++] = EGL_CONTEXT_MAJOR_VERSION_KHR;
++      context_attribs[i++] = legacy_bit ? 3 : major;
++      context_attribs[i++] = EGL_CONTEXT_MINOR_VERSION_KHR;
++      context_attribs[i++] = legacy_bit ? 0 : minor;
++    }
++  else
++    {
++      eglBindAPI (EGL_OPENGL_ES_API);
++
++      context_attribs[i++] = EGL_CONTEXT_CLIENT_VERSION;
++      context_attribs[i++] = major == 3 ? 3 : 2;
++    }
++
++  context_attribs[i++] = EGL_CONTEXT_FLAGS_KHR;
++  context_attribs[i++] = flags;
++
++  context_attribs[i++] = EGL_NONE;
++  g_assert (i < N_EGL_ATTRS);
++
++  GDK_NOTE (OPENGL,
++            g_message ("Creating EGL context version %d.%d (debug:%s, forward:%s, legacy:%s, es:%s)",
++                       major, minor,
++                       debug_bit ? "yes" : "no",
++                       forward_bit ? "yes" : "no",
++                       legacy_bit ? "yes" : "no",
++                       use_es ? "yes" : "no"));
++
++  ctx = eglCreateContext (display_x11->egl_display,
++                          context_x11->egl_config,
++                          share != NULL ? GDK_X11_GL_CONTEXT (share)->egl_context
++                                        : EGL_NO_CONTEXT,
++                          context_attribs);
++
++  /* Not to be had as asked: try again as a legacy context, as the GLX path
++   * and the Wayland backend do. */
++  if (ctx == EGL_NO_CONTEXT && !legacy_bit && !use_es)
++    {
++      g_assert (context_attribs[0] == EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR);
++      context_attribs[1] = EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR;
++      context_attribs[3] = 3;
++      context_attribs[5] = 0;
++
++      legacy_bit = TRUE;
++
++      GDK_NOTE (OPENGL, g_message ("eglCreateContext failed, switching to legacy"));
++      ctx = eglCreateContext (display_x11->egl_display,
++                              context_x11->egl_config,
++                              share != NULL ? GDK_X11_GL_CONTEXT (share)->egl_context
++                                            : EGL_NO_CONTEXT,
++                              context_attribs);
++    }
++
++  if (ctx == EGL_NO_CONTEXT)
++    {
++      g_set_error_literal (error, GDK_GL_ERROR,
++                           GDK_GL_ERROR_NOT_AVAILABLE,
++                           _("Unable to create a GL context"));
++      return FALSE;
++    }
++
++  /* The drawable, before the context is committed to: an attached context
++   * draws to the window's surface, an unattached one needs one only where
++   * surfaceless contexts are missing. */
++  if (egl_drawable_info_ensure (window->impl_window, context_x11->egl_config, error) == NULL)
++    {
++      eglDestroyContext (display_x11->egl_display, ctx);
++      return FALSE;
++    }
++
++  context_x11->egl_context = ctx;
++  context_x11->is_direct = TRUE;
++
++  gdk_gl_context_set_is_legacy (context, legacy_bit);
++  gdk_gl_context_set_use_es (context, use_es);
++
++  GDK_NOTE (OPENGL, g_message ("Realized EGL context[%p]", ctx));
++
++  return TRUE;
++}
++
++static void
++gdk_x11_gl_context_end_frame_egl (GdkGLContext   *context,
++                                  cairo_region_t *painted,
++                                  cairo_region_t *damage)
++{
++  GdkWindow *window = gdk_gl_context_get_window (context);
++  GdkDisplay *display = gdk_window_get_display (window);
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  EglDrawableInfo *info;
++
++  gdk_gl_context_make_current (context);
++
++  info = get_egl_drawable_info (window->impl_window);
++  if (info == NULL || info->egl_surface == EGL_NO_SURFACE)
++    return;
++
++  GDK_NOTE (OPENGL,
++            g_message ("Swapping EGL buffers for window %lu",
++                       (unsigned long) gdk_x11_window_get_xid (window)));
++
++  if (display_x11->have_egl_swap_buffers_with_damage)
++    {
++      int i, j, n_rects = cairo_region_num_rectangles (damage);
++      EGLint *rects = g_new (EGLint, n_rects * 4);
++      cairo_rectangle_int_t rect;
++      int scale = gdk_window_get_scale_factor (window);
++      int window_height = gdk_window_get_height (window);
++
++      /* EGL wants device pixels with the origin at the bottom left. */
++      for (i = 0, j = 0; i < n_rects; i++)
++        {
++          cairo_region_get_rectangle (damage, i, &rect);
++          rects[j++] = rect.x * scale;
++          rects[j++] = (window_height - rect.height - rect.y) * scale;
++          rects[j++] = rect.width * scale;
++          rects[j++] = rect.height * scale;
++        }
++      eglSwapBuffersWithDamageEXT (display_x11->egl_display, info->egl_surface,
++                                   rects, n_rects);
++      g_free (rects);
++    }
++  else
++    eglSwapBuffers (display_x11->egl_display, info->egl_surface);
++}
++
++static void
++gdk_x11_window_invalidate_for_new_frame_egl (GdkWindow      *window,
++                                             cairo_region_t *update_area)
++{
++  cairo_rectangle_int_t window_rect;
++  GdkDisplay *display = gdk_window_get_display (window);
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (window->gl_paint_context);
++  EglDrawableInfo *info;
++  EGLint buffer_age = 0;
++  gboolean invalidate_all;
++
++  context_x11->do_blit_swap = FALSE;
++
++  info = get_egl_drawable_info (window->impl_window);
++
++  if (display_x11->have_egl_buffer_age && info != NULL &&
++      info->egl_surface != EGL_NO_SURFACE)
++    {
++      gdk_gl_context_make_current (window->gl_paint_context);
++      eglQuerySurface (display_x11->egl_display, info->egl_surface,
++                       EGL_BUFFER_AGE_EXT, &buffer_age);
++    }
++
++  invalidate_all = FALSE;
++  if (buffer_age == 0 || buffer_age >= 4)
++    invalidate_all = TRUE;
++  else
++    {
++      if (buffer_age >= 2)
++        {
++          if (window->old_updated_area[0])
++            cairo_region_union (update_area, window->old_updated_area[0]);
++          else
++            invalidate_all = TRUE;
++        }
++      if (buffer_age >= 3)
++        {
++          if (window->old_updated_area[1])
++            cairo_region_union (update_area, window->old_updated_area[1]);
++          else
++            invalidate_all = TRUE;
++        }
++    }
++
++  if (invalidate_all)
++    {
++      window_rect.x = 0;
++      window_rect.y = 0;
++      window_rect.width = gdk_window_get_width (window);
++      window_rect.height = gdk_window_get_height (window);
++
++      /* If nothing else is known, repaint everything so that the back
++       * buffer is fully up-to-date for the swapbuffer */
++      cairo_region_union_rectangle (update_area, &window_rect);
++    }
++}
++
++static gboolean
++gdk_x11_display_make_gl_context_current_egl (GdkDisplay   *display,
++                                             GdkGLContext *context)
++{
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++  GdkX11GLContext *context_x11;
++  GdkWindow *window;
++  EglDrawableInfo *info;
++  EGLSurface surface;
++
++  if (context == NULL)
++    {
++      eglMakeCurrent (display_x11->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                      EGL_NO_CONTEXT);
++      return TRUE;
++    }
++
++  context_x11 = GDK_X11_GL_CONTEXT (context);
++  if (context_x11->egl_context == EGL_NO_CONTEXT)
++    {
++      g_critical ("No EGL context associated to the GdkGLContext; you must "
++                  "call gdk_gl_context_realize() first.");
++      return FALSE;
++    }
++
++  window = gdk_gl_context_get_window (context);
++  info = get_egl_drawable_info (window->impl_window);
++  if (info == NULL)
++    {
++      g_critical ("No EGL surface associated to the GdkGLContext's window");
++      return FALSE;
++    }
++
++  if (context_x11->is_attached)
++    surface = info->egl_surface;
++  else if (display_x11->have_egl_surfaceless_context)
++    surface = EGL_NO_SURFACE;
++  else
++    surface = info->dummy_surface;
++
++  GDK_NOTE (OPENGL,
++            g_message ("Making EGL context current to surface %p", surface));
++
++  if (!eglMakeCurrent (display_x11->egl_display, surface, surface,
++                       context_x11->egl_context))
++    {
++      GDK_NOTE (OPENGL, g_message ("Making EGL context current failed"));
++      return FALSE;
++    }
++
++  if (context_x11->is_attached)
++    {
++      gboolean do_frame_sync;
++
++      /* The GLX path's rule: with a compositing manager the swap need not
++       * wait for the display, since what reaches the screen is the
++       * compositor's business and it paces itself; without one, the swap is
++       * what puts the frame on the screen and is timed to the refresh.  The
++       * interval belongs to the surface just made current. */
++      do_frame_sync = !gdk_screen_is_composited (gdk_window_get_screen (window));
++
++      if (!context_x11->egl_swap_interval_set ||
++          do_frame_sync != context_x11->do_frame_sync)
++        {
++          context_x11->do_frame_sync = do_frame_sync;
++          context_x11->egl_swap_interval_set = TRUE;
++          eglSwapInterval (display_x11->egl_display, do_frame_sync ? 1 : 0);
++        }
++    }
++
++  return TRUE;
++}
++
++/* The EGL flavour of the visual choice below (_gdk_x11_screen_update_visuals_for_gl):
++ * the same picking, fed from EGL configs instead of GLX visual attributes. */
++static void gdk_x11_screen_update_visuals_for_egl (GdkX11Screen *x11_screen);
++
+ static gboolean
+ gdk_x11_gl_context_realize (GdkGLContext  *context,
+                             GError       **error)
+@@ -639,6 +1457,9 @@
+   display_x11 = GDK_X11_DISPLAY (display);
+   share = gdk_gl_context_get_shared_context (context);
+ 
++  if (display_x11->have_egl)
++    return gdk_x11_gl_context_realize_egl (context, error);
++
+   gdk_gl_context_get_required_version (context, &major, &minor);
+   debug_bit = gdk_gl_context_get_debug_enabled (context);
+   compat_bit = gdk_gl_context_get_forward_compatible (context);
+@@ -807,6 +1628,21 @@
+ {
+   GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (gobject);
+ 
++  if (context_x11->egl_context != EGL_NO_CONTEXT)
++    {
++      GdkGLContext *context = GDK_GL_CONTEXT (gobject);
++      GdkDisplay *display = gdk_gl_context_get_display (context);
++      GdkX11Display *display_x11 = GDK_X11_DISPLAY (display);
++
++      if (eglGetCurrentContext () == context_x11->egl_context)
++        eglMakeCurrent (display_x11->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                        EGL_NO_CONTEXT);
++
++      GDK_NOTE (OPENGL, g_message ("Destroying EGL context"));
++      eglDestroyContext (display_x11->egl_display, context_x11->egl_context);
++      context_x11->egl_context = EGL_NO_CONTEXT;
++    }
++
+   if (context_x11->glx_context != NULL)
+     {
+       GdkGLContext *context = GDK_GL_CONTEXT (gobject);
+@@ -841,6 +1677,7 @@
+ gdk_x11_gl_context_init (GdkX11GLContext *self)
+ {
+   self->do_frame_sync = TRUE;
++  self->egl_context = EGL_NO_CONTEXT;
+ }
+ 
+ gboolean
+@@ -852,12 +1689,16 @@
+   int error_base, event_base;
+   int screen_num;
+ 
+-  if (display_x11->have_glx)
++  if (display_x11->have_glx || display_x11->have_egl)
+     return TRUE;
+ 
+   if (_gdk_gl_flags & GDK_GL_DISABLE)
+     return FALSE;
+ 
++  /* EGL where it can be had, for the reasons given above it; GLX otherwise. */
++  if (gdk_x11_display_init_egl (display))
++    return TRUE;
++
+   dpy = gdk_x11_display_get_xdisplay (display);
+ 
+   if (!epoxy_has_glx (dpy))
+@@ -1120,7 +1961,7 @@
+ }
+ 
+ static gboolean
+-get_cached_gl_visuals (GdkDisplay *display, int *system, int *rgba)
++get_cached_gl_visuals (GdkDisplay *display, const char *property, int *system, int *rgba)
+ {
+   gboolean found;
+   Atom type_return;
+@@ -1136,7 +1977,7 @@
+ 
+   gdk_x11_display_error_trap_push (display);
+   if (XGetWindowProperty (dpy, DefaultRootWindow (dpy),
+-                          gdk_x11_get_xatom_by_name_for_display (display, "GDK_VISUALS"),
++                          gdk_x11_get_xatom_by_name_for_display (display, property),
+                           0, 2, False, XA_INTEGER, &type_return,
+                           &format_return, &nitems_return,
+                           &bytes_after_return, &data) == Success)
+@@ -1162,7 +2003,7 @@
+ }
+ 
+ static void
+-save_cached_gl_visuals (GdkDisplay *display, int system, int rgba)
++save_cached_gl_visuals (GdkDisplay *display, const char *property, int system, int rgba)
+ {
+   long visualdata[2];
+   Display *dpy;
+@@ -1174,7 +2015,7 @@
+ 
+   gdk_x11_display_error_trap_push (display);
+   XChangeProperty (dpy, DefaultRootWindow (dpy),
+-                   gdk_x11_get_xatom_by_name_for_display (display, "GDK_VISUALS"),
++                   gdk_x11_get_xatom_by_name_for_display (display, property),
+                    XA_INTEGER, 32, PropModeReplace,
+                    (unsigned char *)visualdata, 2);
+   gdk_x11_display_error_trap_pop_ignored (display);
+@@ -1197,8 +2038,15 @@
+   dpy = gdk_x11_display_get_xdisplay (display);
+ 
+   /* We save the default visuals as a property on the root window to avoid
+-     having to initialize GL each time, as it may not be used later. */
+-  if (get_cached_gl_visuals (display, &system_visual_id, &rgba_visual_id))
++     having to initialize GL each time, as it may not be used later.
++
++     One property per backend: the two pick from different tables and a
++     session may switch between them (GDK_GL=glx).  Whichever is present is
++     taken -- a visual either path chose is an ordinary X visual the other
++     can put a context on. */
++  if (((_gdk_gl_flags & GDK_GL_GLX) == 0 &&
++       get_cached_gl_visuals (display, "GDK_VISUALS_EGL", &system_visual_id, &rgba_visual_id)) ||
++      get_cached_gl_visuals (display, "GDK_VISUALS", &system_visual_id, &rgba_visual_id))
+     {
+       for (i = 0; i < x11_screen->nvisuals; i++)
+         {
+@@ -1217,6 +2065,15 @@
+   if (!gdk_x11_screen_init_gl (screen))
+     return;
+ 
++  if (display_x11->have_egl)
++    {
++      gdk_x11_screen_update_visuals_for_egl (x11_screen);
++      save_cached_gl_visuals (display, "GDK_VISUALS_EGL",
++                              gdk_x11_visual_get_xvisual (x11_screen->system_visual)->visualid,
++                              x11_screen->rgba_visual ? gdk_x11_visual_get_xvisual (x11_screen->rgba_visual)->visualid : 0);
++      return;
++    }
++
+   gl_info = g_new0 (struct glvisualinfo, x11_screen->nvisuals);
+ 
+   for (i = 0; i < x11_screen->nvisuals; i++)
+@@ -1256,11 +2113,49 @@
+ 
+   g_free (gl_info);
+ 
+-  save_cached_gl_visuals (display,
++  save_cached_gl_visuals (display, "GDK_VISUALS",
+                           gdk_x11_visual_get_xvisual (x11_screen->system_visual)->visualid,
+                           x11_screen->rgba_visual ? gdk_x11_visual_get_xvisual (x11_screen->rgba_visual)->visualid : 0);
+ }
+ 
++static void
++gdk_x11_screen_update_visuals_for_egl (GdkX11Screen *x11_screen)
++{
++  GdkX11Display *display_x11 = GDK_X11_DISPLAY (x11_screen->display);
++  struct glvisualinfo *gl_info;
++  int i;
++
++  gl_info = g_new0 (struct glvisualinfo, x11_screen->nvisuals);
++
++  for (i = 0; i < x11_screen->nvisuals; i++)
++    {
++      GdkVisual *visual = x11_screen->visuals[i];
++      VisualID visual_id = gdk_x11_visual_get_xvisual (visual)->visualid;
++      struct eglconfiginfo ci;
++
++      if (!find_eglconfig_for_visual_id (display_x11, visual_id,
++                                         visual_is_rgba (visual), NULL, &ci))
++        continue;
++
++      gl_info[i].supports_gl = 1;
++      /* An EGL window surface is always back-buffered. */
++      gl_info[i].double_buffer = 1;
++      gl_info[i].stereo = 0;
++      gl_info[i].alpha_size = ci.alpha_size;
++      gl_info[i].depth_size = ci.depth_size;
++      gl_info[i].stencil_size = ci.stencil_size;
++      gl_info[i].num_multisample = ci.sample_buffers;
++      gl_info[i].visual_caveat = ci.caveat == EGL_NONE ? GLX_NONE_EXT
++                                                        : GLX_SLOW_VISUAL_EXT;
++    }
++
++  x11_screen->system_visual = pick_better_visual_for_gl (x11_screen, gl_info, x11_screen->system_visual);
++  if (x11_screen->rgba_visual)
++    x11_screen->rgba_visual = pick_better_visual_for_gl (x11_screen, gl_info, x11_screen->rgba_visual);
++
++  g_free (gl_info);
++}
++
+ GdkGLContext *
+ gdk_x11_window_create_gl_context (GdkWindow    *window,
+                                   gboolean      attached,
+@@ -1282,6 +2177,25 @@
+       return NULL;
+     }
+ 
++  if (GDK_X11_DISPLAY (display)->have_egl)
++    {
++      EGLConfig egl_config;
++
++      if (!find_eglconfig_for_window (window, &egl_config, error))
++        return NULL;
++
++      context = g_object_new (GDK_TYPE_X11_GL_CONTEXT,
++                              "display", display,
++                              "window", window,
++                              "shared-context", share,
++                              NULL);
++
++      context->egl_config = egl_config;
++      context->is_attached = attached;
++
++      return GDK_GL_CONTEXT (context);
++    }
++
+   visual = gdk_window_get_visual (window);
+   if (!find_fbconfig_for_visual (display, visual, &config, error))
+     return NULL;
+@@ -1304,6 +2218,9 @@
+ {
+   GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (context);
+ 
++  if (GDK_X11_DISPLAY (display)->have_egl)
++    return context_x11->egl_context == eglGetCurrentContext ();
++
+   return context_x11->glx_context == glXGetCurrentContext ();
+ }
+ 
+@@ -1317,6 +2234,9 @@
+   GdkScreen *screen;
+   gboolean do_frame_sync = FALSE;
+ 
++  if (GDK_X11_DISPLAY (display)->have_egl)
++    return gdk_x11_display_make_gl_context_current_egl (display, context);
++
+   if (context == NULL)
+     {
+       glXMakeContextCurrent (dpy, None, None, NULL);
+@@ -1393,6 +2313,11 @@
+   if (!gdk_x11_screen_init_gl (gdk_display_get_default_screen (display)))
+     return FALSE;
+ 
++  /* Asked about GLX specifically; a display brought up through EGL has
++   * none to report. */
++  if (GDK_X11_DISPLAY (display)->have_egl)
++    return FALSE;
++
+   if (major != NULL)
+     *major = GDK_X11_DISPLAY (display)->glx_version / 10;
+   if (minor != NULL)
