@@ -45,8 +45,12 @@ root=$(cd "$here/../.." && pwd)
 SYSROOT="${LIKEOS_SYSROOT:-$root/build/xorg-sysroot}"
 
 mkdir -p "$SYSROOT/usr/include/EGL" "$SYSROOT/usr/include/KHR"
-cp "$here/egl-headers/EGL/eglplatform.h" "$SYSROOT/usr/include/EGL/eglplatform.h"
-cp "$here/egl-headers/KHR/khrplatform.h" "$SYSROOT/usr/include/KHR/khrplatform.h"
+# Copied only when the bytes changed: a fresh mtime on either header marks
+# most of WebKitGTK's objects stale (see copy_hdrs in import-base-libs.sh).
+for h in EGL/eglplatform.h KHR/khrplatform.h; do
+	cmp -s "$here/egl-headers/$h" "$SYSROOT/usr/include/$h" 2>/dev/null ||
+		cp "$here/egl-headers/$h" "$SYSROOT/usr/include/$h"
+done
 
 # The stub libEGL.so.1.  Headers alone are not enough: epoxy resolves EGL
 # entry points by dlopen'ing libEGL.so.1 when one is CALLED, and abort()s the

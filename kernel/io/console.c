@@ -2494,83 +2494,69 @@ int kstrcmp(const char *s1, const char *s2)
 }
 
 // Memory set
-/* The store counterpart of kmemcpy(), widened for the same reason: clearing
- * a framebuffer rectangle is the same size of job as copying one. */
+/* mm_memset() behind the libc signature -- see there for the string
+ * instruction choice.  This is on the framebuffer path too: clearing a
+ * rectangle is the same size of job as copying one. */
 void *kmemset(void *ptr, int value, size_t size)
 {
-	unsigned char *p = (unsigned char *)ptr;
-
-	if (size >= 64) {
-		uint64_t pattern = (uint8_t)value;
-		size_t q = size >> 3;
-		size_t r = size & 7;
-
-		pattern |= pattern << 8;
-		pattern |= pattern << 16;
-		pattern |= pattern << 32;
-		__asm__ volatile("rep stosq"
-				 : "+D"(p), "+c"(q)
-				 : "a"(pattern)
-				 : "memory");
-		__asm__ volatile("rep stosb"
-				 : "+D"(p), "+c"(r)
-				 : "a"((uint8_t)value)
-				 : "memory");
-		return ptr;
-	}
-	while (size--) {
-		*p++ = (unsigned char)value;
-	}
+	mm_memset(ptr, value, size);
 	return ptr;
 }
 
 // Memory copy
-/* Copy with the processor's string move rather than a byte at a time.
+/* mm_memcpy() behind the libc signature -- see there for the string
+ * instruction choice.
  *
  * This is on the framebuffer path: stdu_cpu_blit() copies the damaged
  * rectangle into the display surface through here, row by row.  Scrolling a
  * page whose image covers the screen damages all of it, so at 1920x1200x4
  * that is 8.8MB a frame -- and a loop moving one byte per iteration spent
- * about 11ms of a 16.7ms frame on it, against 1.1ms for the same copy done
- * eight bytes at a time.  The same blit at 1024x768 is 3MB, which fits in
- * cache and cost about a tenth as much: that is why the smaller window stayed
- * usable while the full-screen one did not.
- *
- * Eight bytes at a time with a byte tail, rather than `rep movsb' alone,
- * because the byte form is only fast on processors that optimise it and the
- * wide form is fast everywhere.  Both need DF clear, which kernel entry
- * guarantees.  Forward order, so an overlapping copy behaves exactly as the
- * byte loop did. */
+ * about 11ms of a 16.7ms frame on it, against under 1ms for the string
+ * move.  The same blit at 1024x768 is 3MB, which fits in cache and cost
+ * about a tenth as much: that is why the smaller window stayed usable while
+ * the full-screen one did not. */
 void *kmemcpy(void *dest, const void *src, size_t size)
 {
-	unsigned char *d = (unsigned char *)dest;
-	const unsigned char *s = (const unsigned char *)src;
-
-	if (size >= 64) {
-		size_t q = size >> 3;
-		size_t r = size & 7;
-
-		__asm__ volatile("rep movsq"
-				 : "+D"(d), "+S"(s), "+c"(q)
-				 :
-				 : "memory");
-		__asm__ volatile("rep movsb"
-				 : "+D"(d), "+S"(s), "+c"(r)
-				 :
-				 : "memory");
-		return dest;
-	}
-	while (size--) {
-		*d++ = *s++;
-	}
+	mm_memcpy(dest, src, size);
 	return dest;
 }
 
 // Memory compare
+/* Eight bytes at a time, four loads per step, because the kernel is built
+ * without optimisation and a byte loop costs about a nanosecond a byte
+ * here against a tenth of that (measured: 4KB compared in 0.2us against
+ * 2.1us).  The words are only tested for equality; once a block differs the
+ * byte loop below finds the first differing byte and its sign, so the result
+ * is exactly what the byte loop alone returned.  The loads are unaligned,
+ * which x86 permits; the typedef tells the compiler so. */
+typedef uint64_t __attribute__((may_alias, aligned(1))) u64_unaligned_t;
+#define LD64(p) (*(const u64_unaligned_t *)(p))
+
 int kmemcmp(const void *s1, const void *s2, size_t n)
 {
 	const unsigned char *p1 = (const unsigned char *)s1;
 	const unsigned char *p2 = (const unsigned char *)s2;
+
+	while (n >= 32) {
+		uint64_t diff = (LD64(p1) ^ LD64(p2)) |
+				(LD64(p1 + 8) ^ LD64(p2 + 8)) |
+				(LD64(p1 + 16) ^ LD64(p2 + 16)) |
+				(LD64(p1 + 24) ^ LD64(p2 + 24));
+		if (diff) {
+			break;
+		}
+		p1 += 32;
+		p2 += 32;
+		n -= 32;
+	}
+	while (n >= 8) {
+		if (LD64(p1) != LD64(p2)) {
+			break;
+		}
+		p1 += 8;
+		p2 += 8;
+		n -= 8;
+	}
 	while (n--) {
 		if (*p1 != *p2) {
 			return *p1 - *p2;

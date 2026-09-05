@@ -969,19 +969,24 @@ meson_opts() {
 		      -Dautobahn=disabled -Dpkcs11_tests=disabled"
 		;;
 	glib-networking)
-		# The OpenSSL backend and nothing else.  This is the TLS that
+		# The GnuTLS backend and nothing else.  This is the TLS that
 		# every GIO user -- WebKitGTK/libsoup (luakit, MiniBrowser),
-		# anything speaking https through GLib -- runs on.  It was the
-		# GnuTLS backend until 2026-08-27; OpenSSL is the stack this
-		# system has exercised most (curl, ssh, the port's own tests),
-		# so the browsers now share it.  Exactly ONE backend may be
-		# installed: both modules register the same GTlsBackend
-		# extension point at equal priority and GIO would pick
-		# whichever it loaded first.  Switching back is documented in
-		# tmp/OPENSSL-INSTEADOF-GNUTLS.md.  GnuTLS itself stays in the
-		# manifest -- Claws Mail links it directly.  libproxy and the
-		# desktop proxy portal are services this system does not run.
-		echo "-Dopenssl=enabled -Dgnutls=disabled -Dlibproxy=disabled \
+		# anything speaking https through GLib -- runs on.  GnuTLS is
+		# upstream's default and the backend libsoup is developed and
+		# tested against; glib-networking's own meson_options.txt keeps
+		# OpenSSL off and says so ("General-purpose Linux distros
+		# should leave it disabled").  The port ran the OpenSSL backend
+		# between 2026-08-27 and 2026-09-05 and is back on GnuTLS.
+		# Exactly ONE backend may be installed: both modules register
+		# the same GTlsBackend extension point at equal priority and
+		# GIO would pick whichever it loaded first -- so a switch must
+		# also delete the other module from the sysroot, because
+		# `meson install' only adds, and stage.sh copies every .so it
+		# finds in /usr/lib/gio/modules.  GnuTLS is already in the
+		# manifest ahead of this (over GMP, nettle and libtasn1);
+		# Claws Mail links it directly.  libproxy and the desktop
+		# proxy portal are services this system does not run.
+		echo "-Dgnutls=enabled -Dopenssl=disabled -Dlibproxy=disabled \
 		      -Dgnome_proxy=disabled -Dinstalled_tests=false"
 		;;
 	*) echo "" ;;
@@ -1171,6 +1176,28 @@ post_install() {
 		# stub over Mesa would put every GL program back on the
 		# "Couldn't open libEGL" path the stub existed to silence.
 		touch "$SYSROOT/usr/lib/.mesa-egl" || return 1
+		;;
+	glib-networking)
+		# Only ONE GIO TLS module may end up on the image.  Both
+		# backends register the GTlsBackend extension point at the same
+		# priority, so with two present GIO picks whichever it loaded
+		# first -- and stage.sh copies every .so out of this directory.
+		# `meson install' only ever adds files, so the module left over
+		# from the other backend has to go explicitly; without this,
+		# flipping -Dgnutls/-Dopenssl leaves the old one behind and the
+		# backend actually used is decided by readdir order.  Deleting
+		# the one we did not build keeps the choice in meson_opts().
+		if [ -d "$SYSROOT/usr/lib/gio/modules" ]; then
+			case "$(meson_opts glib-networking)" in
+			*-Dgnutls=enabled*) other=libgioopenssl.so ;;
+			*-Dopenssl=enabled*) other=libgiognutls.so ;;
+			*) other= ;;
+			esac
+			if [ -n "$other" ]; then
+				rm -f "$SYSROOT/usr/lib/gio/modules/$other" \
+				      "$SYSROOT/usr/lib/gio/modules/${other%.so}.la"
+			fi
+		fi
 		;;
 	libXpm)
 		# The .pc file is generated at the top level, so building only

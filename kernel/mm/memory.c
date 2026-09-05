@@ -220,54 +220,64 @@ static struct {
 static memory_map_info_t g_uefi_memory_map = { 0 };
 
 // Utility functions (non-static, declared in memory.h)
+/* Block fill and copy.  kmemset()/kmemcpy() in console.c are these same two
+ * functions behind the libc signature, so the console and framebuffer paths
+ * run exactly this code.
+ *
+ * String instructions throughout rather than C loops: the kernel is built
+ * without optimisation, where a byte loop costs about a nanosecond a byte
+ * against about three nanoseconds for a `rep stosb'/`rep movsb' of any
+ * length under 64.  Which wide form to use above that depends on the
+ * processor.  With ERMS (CPUID.7:EBX[9], Ivy Bridge and later; hypervisors
+ * pass it through) the byte forms move whole cache lines per step and cope
+ * with misaligned operands, where the quadword forms pay about double:
+ * measured on an 8.8MB framebuffer blit whose rows are not 8-aligned,
+ * 0.74ms by `rep movsb' against 0.88ms by `rep movsq', and a 9MB misaligned
+ * fill at 0.23ms by `rep stosb' against 6ms for the byte loop mm_memset()
+ * used to fall back to whenever the destination was not 8-aligned.  Without
+ * ERMS the quadword forms are the fast ones, so that path aligns the
+ * destination with a byte head and finishes with a byte tail.
+ *
+ * All of these need DF clear, which every kernel entry path guarantees.
+ * Copies run forward, so an overlapping copy with dest below src behaves as
+ * the byte loop did. */
 void mm_memset(void *dest, int val, size_t len)
 {
 	BUG_ON(dest == NULL);
-	uint8_t *ptr = (uint8_t *)dest;
+	uint8_t *p = (uint8_t *)dest;
 	uint8_t byte_val = (uint8_t)val;
 
-	// Fast path: for larger sizes, use 64-bit stores
-	if (len >= 32 && ((uint64_t)ptr & 7) == 0) {
-		// Create 64-bit pattern from byte value
+	if (len >= 64 && !(g_cpu_features_ext & CPU_FEATURE_ERMS)) {
 		uint64_t pattern = byte_val;
+		size_t head = (8 - ((uint64_t)p & 7)) & 7;
+		size_t words, tail;
+
 		pattern |= pattern << 8;
 		pattern |= pattern << 16;
 		pattern |= pattern << 32;
 
-		uint64_t *ptr64 = (uint64_t *)ptr;
-		size_t words = len / 8;
-		size_t remainder = len % 8;
-
-		// Use rep stosq for very large fills (uses CPU's optimized path)
-		if (words >= 64) {
-			__asm__ volatile("rep stosq"
-					 : "+D"(ptr64), "+c"(words)
-					 : "a"(pattern)
-					 : "memory");
-			ptr = (uint8_t *)ptr64;
-			len = remainder;
-		} else {
-			// Manual unrolled loop for medium sizes
-			while (words >= 4) {
-				ptr64[0] = pattern;
-				ptr64[1] = pattern;
-				ptr64[2] = pattern;
-				ptr64[3] = pattern;
-				ptr64 += 4;
-				words -= 4;
-			}
-			while (words--) {
-				*ptr64++ = pattern;
-			}
-			ptr = (uint8_t *)ptr64;
-			len = remainder;
-		}
+		len -= head;
+		words = len >> 3;
+		tail = len & 7;
+		__asm__ volatile("rep stosb"
+				 : "+D"(p), "+c"(head)
+				 : "a"(byte_val)
+				 : "memory");
+		__asm__ volatile("rep stosq"
+				 : "+D"(p), "+c"(words)
+				 : "a"(pattern)
+				 : "memory");
+		__asm__ volatile("rep stosb"
+				 : "+D"(p), "+c"(tail)
+				 : "a"(byte_val)
+				 : "memory");
+		return;
 	}
 
-	// Handle remaining bytes
-	while (len--) {
-		*ptr++ = byte_val;
-	}
+	__asm__ volatile("rep stosb"
+			 : "+D"(p), "+c"(len)
+			 : "a"(byte_val)
+			 : "memory");
 }
 
 void mm_memcpy(void *dest, const void *src, size_t len)
@@ -276,18 +286,32 @@ void mm_memcpy(void *dest, const void *src, size_t len)
 	uint8_t *d = (uint8_t *)dest;
 	const uint8_t *s = (const uint8_t *)src;
 
-	// Fast path: use rep movsb for larger aligned copies
-	if (len >= 64) {
+	if (len >= 64 && !(g_cpu_features_ext & CPU_FEATURE_ERMS)) {
+		size_t head = (8 - ((uint64_t)d & 7)) & 7;
+		size_t words, tail;
+
+		len -= head;
+		words = len >> 3;
+		tail = len & 7;
 		__asm__ volatile("rep movsb"
-				 : "+D"(d), "+S"(s), "+c"(len)
+				 : "+D"(d), "+S"(s), "+c"(head)
+				 :
+				 : "memory");
+		__asm__ volatile("rep movsq"
+				 : "+D"(d), "+S"(s), "+c"(words)
+				 :
+				 : "memory");
+		__asm__ volatile("rep movsb"
+				 : "+D"(d), "+S"(s), "+c"(tail)
 				 :
 				 : "memory");
 		return;
 	}
 
-	while (len--) {
-		*d++ = *s++;
-	}
+	__asm__ volatile("rep movsb"
+			 : "+D"(d), "+S"(s), "+c"(len)
+			 :
+			 : "memory");
 }
 
 // Get current CR3 (page table base)
@@ -6273,6 +6297,12 @@ __no_stack_protector void mm_enable_smep_smap(void)
 	if (ebx & (1 << 0)) {
 		g_cpu_features_ext |= CPU_FEATURE_FSGSBASE;
 		cr4 |= (1ULL << 16);
+	}
+
+	// ERMS: bit 9 of EBX, selects the string-instruction form mm_memcpy()
+	// and mm_memset() use.  Same value on every CPU of the machine.
+	if (ebx & (1 << 9)) {
+		g_cpu_features_ext |= CPU_FEATURE_ERMS;
 	}
 
 	// SMEP: bit 7 of EBX from CPUID, enables CR4 bit 20

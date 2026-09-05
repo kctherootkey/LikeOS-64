@@ -335,7 +335,8 @@ typedef struct {
 	vfs_file_t vfs;
 	struct pfs *fs;
 	struct pfs_node *node;
-	char *data; /* file contents, generated at open */
+	char *data; /* file contents, generated at open and at each rewind */
+	long cap; /* bytes allocated at data */
 	long len;
 	long pos;
 	unsigned dirpos;
@@ -356,7 +357,7 @@ static const char *pfs_rel(struct pfs *fs, const char *path)
 	return path + k;
 }
 
-static long pfs_generate(struct pfs_node *n, char **out)
+static long pfs_generate(struct pfs_node *n, char **out, long *cap_out)
 {
 	long cap = 4096;
 
@@ -371,6 +372,7 @@ static long pfs_generate(struct pfs_node *n, char **out)
 		}
 		if (len <= cap) {
 			*out = buf;
+			*cap_out = cap;
 			return len;
 		}
 		kfree(buf);
@@ -447,7 +449,7 @@ static int pfs_open_common(struct pfs *fs, const char *path, int flags,
 	pf->fs = fs;
 	pf->node = n;
 	if (n->type == PFS_FILE) {
-		long len = pfs_generate(n, &pf->data);
+		long len = pfs_generate(n, &pf->data, &pf->cap);
 		if (len < 0) {
 			pfs_node_put(n);
 			kfree(pf);
@@ -510,6 +512,33 @@ static long pfs_read(vfs_file_t *f, void *buf, long bytes)
 		if (n > 0)
 			pf->pos += n;
 		return n;
+	}
+	/* A read from the start renders the file again, as the reference
+	 * procfs does (seq_file), and readers rely on that: a monitor that
+	 * keeps /proc/meminfo open and rewinds it every few seconds -- WebKit's
+	 * memory pressure monitor is one -- otherwise reads the numbers from
+	 * open() for as long as the process lives.  Rendered in place when it
+	 * fits, so a second thread reading the same open file at most sees a
+	 * torn line, never a freed buffer. */
+	if (pf->pos == 0 && pf->node->show && pf->data) {
+		long len = pf->node->show(pf->node, pf->data, pf->cap);
+
+		if (len >= 0 && len <= pf->cap) {
+			pf->len = len;
+		} else if (len > pf->cap) {
+			char *fresh;
+			long fcap;
+
+			len = pfs_generate(pf->node, &fresh, &fcap);
+			if (len >= 0) {
+				char *old = pf->data;
+
+				pf->data = fresh;
+				pf->cap = fcap;
+				pf->len = len;
+				kfree(old);
+			}
+		}
 	}
 	if (pf->pos >= pf->len)
 		return 0;

@@ -166,6 +166,41 @@ static long show_maps(struct pfs_node *n, char *buf, long cap)
 	return p;
 }
 
+/* /proc/<pid>/statm: "size resident shared text lib data dt", in pages.
+ * Resident is counted from the page tables the way ps does it (system.c),
+ * and size is the estimate ps reports as VSZ.  The other five are not
+ * tracked here and read as zero, as lib and dt do on the reference system
+ * too.  WebKit's memoryFootprint() is what this was added for: it takes the
+ * second field, and its relief logger subtracts the third. */
+static long show_statm(struct pfs_node *n, char *buf, long cap)
+{
+	task_t *t = proc_task((int)n->arg2);
+	uint64_t size = 0, resident;
+
+	if (!t || task_may_access(t, ACCESS_READ) != 0)
+		return 0;
+	task_t *mm = task_mm_owner(t);
+	if (!mm)
+		return 0;
+	if (mm->brk > mm->brk_start)
+		size += mm->brk - mm->brk_start;
+	size += 2 * 1024 * 1024; /* user stack, the figure system.c assumes */
+	if (mm->mmap_regions) {
+		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+			if (mm->mmap_regions[i].in_use)
+				size += mm->mmap_regions[i].length;
+		}
+	}
+	/* The walk reads page-table pages, and the write side of mmap_lock
+	 * is what frees those (munmap, exit): hold the read side across it. */
+	mm_read_lock(&mm->mmap_lock);
+	resident = mm_count_resident_pages(mm->pml4);
+	mm_read_unlock(&mm->mmap_lock);
+	return pfs_printf(buf, cap, 0, "%llu %llu 0 0 0 0 0\n",
+			  (unsigned long long)(size / PAGE_SIZE),
+			  (unsigned long long)resident);
+}
+
 /* /proc/<pid>/mem: the process's address space, read at the offset asked for.
  *
  * The same thing PTRACE_PEEKDATA gives one word at a time, as a file -- which
@@ -341,9 +376,9 @@ static int pid_list(struct pfs_node *dir, unsigned index, char *name,
 	static const char *const names[] = { "cmdline", "comm",	 "stat",
 					     "status",	"maps",	 "mem",
 					     "auxv",	"exe",	 "cwd",
-					     "fd" };
+					     "fd",	"statm" };
 	(void)dir;
-	if (index >= 10)
+	if (index >= 11)
 		return 0;
 	ksnprintf(name, (size_t)cap, "%s", names[index]);
 	*type = index == 9 ? DT_DIR : (index >= 7 ? DT_LNK : DT_REG);
@@ -399,6 +434,10 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n)
 			n->show = show_maps;
+	} else if (kstrcmp(name, "statm") == 0) {
+		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
+		if (n)
+			n->show = show_statm;
 	} else if (kstrcmp(name, "mem") == 0) {
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n) {
@@ -488,12 +527,23 @@ static long show_meminfo(struct pfs_node *n, char *buf, long cap)
 	(void)n;
 
 	mm_get_memory_stats(&ms);
+	/* Available is what an allocation can still get: the free pages plus
+	 * the page cache, which the fault path drops on demand
+	 * (mm_alloc_page_for_fault).  It used to equal MemFree, which with a
+	 * warm cache made most of RAM look spoken for to anyone deciding when
+	 * to shed memory -- WebKit's pressure monitor reads this line. */
+	uint64_t cached = ms.pagecache_pages * PAGE_SIZE;
+	uint64_t avail = ms.free_memory + cached;
+	if (avail > ms.total_memory)
+		avail = ms.total_memory;
 	p = pfs_printf(buf, cap, p, "MemTotal:       %10llu kB\n",
 		       (unsigned long long)(ms.total_memory / 1024));
 	p = pfs_printf(buf, cap, p, "MemFree:        %10llu kB\n",
 		       (unsigned long long)(ms.free_memory / 1024));
 	p = pfs_printf(buf, cap, p, "MemAvailable:   %10llu kB\n",
-		       (unsigned long long)(ms.free_memory / 1024));
+		       (unsigned long long)(avail / 1024));
+	p = pfs_printf(buf, cap, p, "Cached:         %10llu kB\n",
+		       (unsigned long long)(cached / 1024));
 	p = pfs_printf(buf, cap, p, "SwapTotal:               0 kB\n");
 	p = pfs_printf(buf, cap, p, "SwapFree:                0 kB\n");
 	return p;

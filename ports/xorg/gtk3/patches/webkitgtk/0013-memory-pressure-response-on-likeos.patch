@@ -1,0 +1,350 @@
+Give the engine back its memory pressure response.
+
+There is no swap on this system, so memory WebKit holds is memory nothing
+else can have, and the engine has to hand it back before the machine is
+full.  It never did.  Upstream has two mechanisms for that, and the platform
+selection compiled both out here, silently:
+
+  1. The per-process monitor.  MemoryPressureHandler measures the process
+     every 30 s through memoryFootprint() and, above a third of
+     min(3 GB, RAM), prunes caches and curbs the JavaScript heap; above a
+     half it drops everything.  On this system memoryFootprint() was
+     generic/MemoryFootprintGeneric.cpp, which returns 0 with system malloc,
+     so the policy stayed Unrestricted forever -- and the web process never
+     switched the monitor on anyway, because WebProcess.cpp does so only
+     with FastMalloc ("some kind of testing or debugging is probably
+     happening" otherwise) and the port builds with USE_SYSTEM_MALLOC=ON.
+
+  2. The system monitor.  On Linux the UI process watches /proc/meminfo
+     (UIProcess/linux/MemoryPressureMonitor.cpp) and, at 90% of RAM in use,
+     tells every process over IPC to release memory; at 95%, to release it
+     all.  Monitor, message and receiver are all #if OS(LINUX).
+
+The system monitor is the one that matters without swap, and it cannot
+simply be switched on: the message is declared under OS(LINUX) in
+AuxiliaryProcess.messages.in, its receiver in AuxiliaryProcess.h, and the
+handler's trigger for it in wtf/MemoryPressureHandler.h -- three headers
+that between them are included by most of the engine, so widening any of
+them rebuilds it all.
+
+So the monitor moves into the handler.  wtf/likeos/MemoryPressureHandlerLikeOS.cpp
+is this system's platform file, replacing the generic one: every process
+installs the handler already (WebProcess, NetworkProcess, GPUProcess, and the
+UI process through installMemoryPressureHandler()), and install() there
+starts one thread per process that reads /proc/meminfo the way the Linux
+monitor does, on its polling curve, and delivers the verdict to its own
+process instead of over IPC.  Same knob, WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR=1.
+The response and hold-off are those of unix/MemoryPressureHandlerUnix.cpp,
+with the hold-off timer -- a member declared under the same OS list --
+replaced by a deadline the thread honours.
+
+The thresholds are lower than Linux's, and the reason is the swap.  Linux
+declares pressure at 90% and critical at 95%: the last 10%, plus swap, is
+what covers the time between the machine getting there and the processes
+responding.  Here there is no plus.  The reserve alone has to cover one
+polling interval of allocation -- a page load can take a hundred megabytes
+in the second between polls -- and the response itself, which allocates
+before it frees.  Doubling the reserve is the adjustment: pressure at 80%,
+critical at 90%, the polling curve shifted down the same ten points
+(one-second polls from 75% in use, five-second ones below 40%).  "In use" is
+MemTotal minus MemAvailable, and the kernel now counts its page cache as
+available, since it drops that on demand.
+
+memoryFootprint() becomes linux/MemoryFootprintLinux.cpp, reading
+/proc/self/statm, which the kernel gained for this; and the web process
+switches the periodic monitor on with system malloc, which on this system is
+the only malloc, not a debugging choice.  With a real footprint the policy
+thresholds start to mean something: on a 4 GB machine a web process is
+Conservative from 1 GB resident and Strict from 1.5 GB, and an inactive one
+that reaches 0.9 x RAM is killed rather than allowed to take the machine
+with it.
+
+The UI process installs the handler on this system as it does on Linux; the
+guard there also gated it on the Linux monitor's own disable check, which
+the handler now performs itself.
+
+--- a/Source/WTF/wtf/PlatformGTK.cmake
++++ b/Source/WTF/wtf/PlatformGTK.cmake
+@@ -72,6 +72,16 @@
+ 
+         unix/MemoryPressureHandlerUnix.cpp
+     )
++elseif (CMAKE_SYSTEM_NAME MATCHES "LikeOS")
++    # The Linux footprint reader: /proc/self/statm has the same seven fields
++    # here.  The pressure handler is this system's own; see the file for why
++    # it is not unix/MemoryPressureHandlerUnix.cpp plus the Linux monitor.
++    list(APPEND WTF_SOURCES
++        linux/CurrentProcessMemoryStatus.cpp
++        linux/MemoryFootprintLinux.cpp
++
++        likeos/MemoryPressureHandlerLikeOS.cpp
++    )
+ else ()
+     list(APPEND WTF_SOURCES
+         generic/MemoryFootprintGeneric.cpp
+--- a/Source/WTF/wtf/ProcessMemoryStatus.h
++++ b/Source/WTF/wtf/ProcessMemoryStatus.h
+@@ -25,7 +25,7 @@
+ 
+ #pragma once
+ 
+-#if OS(LINUX) || OS(HAIKU)
++#if OS(LINUX) || OS(HAIKU) || OS(LIKEOS)
+ 
+ #include <wtf/ForbidHeapAllocation.h>
+ 
+@@ -47,4 +47,4 @@
+ 
+ using WTF::ProcessMemoryStatus;
+ 
+-#endif // OS(LINUX) || OS(HAIKU)
++#endif // OS(LINUX) || OS(HAIKU) || OS(LIKEOS)
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -526,6 +526,12 @@
+         // If we're running with FastMalloc disabled, some kind of testing or debugging is probably happening.
+         // Let's be nice and not enable the memory kill mechanism.
+         memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(isFastMallocEnabled() || JSC::Options::enableStrongRefTracker() || JSC::Options::dumpHeapOnLowMemory());
++#elif OS(LIKEOS)
++        // System malloc is the only malloc this port has, not a debugging
++        // choice, so the monitor is wanted here exactly as with FastMalloc:
++        // without it the policy never leaves Unrestricted and nothing is
++        // ever pruned.  See wtf/likeos/MemoryPressureHandlerLikeOS.cpp.
++        memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(true);
+ #endif
+         memoryPressureHandler.setMemoryKillCallback([this, protectedThis = Ref { *this }] () {
+             WebCore::logMemoryStatistics(LogMemoryStatisticsReason::OutOfMemoryDeath);
+--- a/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
++++ b/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
+@@ -164,6 +164,11 @@
+ #if OS(LINUX)
+     if (!MemoryPressureMonitor::disabled())
+         installMemoryPressureHandler();
++#elif OS(LIKEOS)
++    // The system monitor is inside the handler on this system
++    // (wtf/likeos/MemoryPressureHandlerLikeOS.cpp) and honours the same
++    // WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR itself.
++    installMemoryPressureHandler();
+ #endif
+ 
+ #if PLATFORM(GTK)
+--- /dev/null
++++ b/Source/WTF/wtf/likeos/MemoryPressureHandlerLikeOS.cpp
+@@ -0,0 +1,217 @@
++/*
++ * MemoryPressureHandler for LikeOS.
++ *
++ * This system has no swap, so what WebKit holds nothing else can have, and
++ * the engine must give memory back before the machine is full.  Upstream has
++ * two ways of noticing that it should, and this file provides both for a
++ * system that is not Linux:
++ *
++ *   - the system monitor.  On Linux the UI process watches /proc/meminfo
++ *     (UIProcess/linux/MemoryPressureMonitor.cpp) and tells every process
++ *     over IPC to release memory when the machine is nearly full.  That
++ *     message, its receiver and the handler's trigger for it are all
++ *     declared under OS(LINUX), in headers most of the engine includes, so
++ *     the monitor lives here instead: every process installs this handler,
++ *     and install() starts one thread per process that reads /proc/meminfo
++ *     the way the Linux monitor does and delivers the verdict to its own
++ *     process.  Same knob: WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR=1.
++ *
++ *   - the per-process monitor.  MemoryPressureHandler::measurementTimerFired()
++ *     compares memoryFootprint() with fractions of min(3 GB, RAM) every 30 s
++ *     and prunes accordingly; that needs a footprint, which
++ *     linux/MemoryFootprintLinux.cpp supplies from /proc/self/statm.
++ *
++ * The response and its hold-off are those of unix/MemoryPressureHandlerUnix.cpp;
++ * the hold-off timer, a member declared under the same OS list, is replaced
++ * by a deadline the polling thread honours.
++ *
++ * The thresholds are lower than Linux's because of the swap.  Linux declares
++ * pressure at 90% of RAM in use and critical at 95%: the last 10%, plus swap,
++ * covers the time between the machine getting there and the processes
++ * responding.  Here there is no plus.  The reserve alone has to cover one
++ * polling interval of allocation -- a page load can take a hundred megabytes
++ * in the second between polls -- and the response itself, which allocates
++ * before it frees.  So the reserve is doubled: pressure at 80%, critical at
++ * 90%, and the polling curve shifted down the same ten points, one-second
++ * polls from 75% in use and five-second ones below 40%.  "In use" is
++ * MemTotal minus MemAvailable, and the kernel counts its page cache as
++ * available, since it drops that on demand.
++ */
++
++#include "config.h"
++#include <wtf/MemoryPressureHandler.h>
++
++#include <algorithm>
++#include <atomic>
++#include <malloc.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wtf/MainThread.h>
++#include <wtf/MemoryFootprint.h>
++#include <wtf/MonotonicTime.h>
++#include <wtf/Threading.h>
++#include <wtf/linux/CurrentProcessMemoryStatus.h>
++#include <wtf/text/WTFString.h>
++
++namespace WTF {
++
++// Percent of RAM in use.  See the note at the top for the values.
++static const int s_memoryPressurePercentageThreshold = 80;
++static const int s_memoryPressurePercentageThresholdCritical = 90;
++static const double s_minUsedMemoryPercentageForPolling = 40;
++static const double s_maxUsedMemoryPercentageForPolling = 75;
++static const Seconds s_minPollingInterval { 1_s };
++static const Seconds s_maxPollingInterval { 5_s };
++
++// Hold-off after a response, as in unix/MemoryPressureHandlerUnix.cpp: at
++// least s_minimumHoldOffTime, s_holdOffMultiplier times the time the release
++// took if it freed at least s_minimumBytesFreedToUseMinimumHoldOffTime, and
++// s_maximumHoldOffTime if it freed less than that.
++static const Seconds s_minimumHoldOffTime { 5_s };
++static const Seconds s_maximumHoldOffTime { 30_s };
++static const size_t s_minimumBytesFreedToUseMinimumHoldOffTime = 1 * MB;
++static const unsigned s_holdOffMultiplier = 20;
++
++// The hold-off deadline, as MonotonicTime seconds.  Written on the main
++// thread by holdOff(), read by the polling thread.
++static std::atomic<double> s_holdOffUntil { 0 };
++
++static int systemMemoryUsedAsPercentage()
++{
++    FILE* file = fopen("/proc/meminfo", "r");
++    if (!file)
++        return -1;
++
++    unsigned long long total = 0;
++    unsigned long long available = 0;
++    bool haveTotal = false;
++    bool haveAvailable = false;
++    char line[128];
++    while (fgets(line, sizeof(line), file)) {
++        unsigned long long value;
++        if (sscanf(line, "MemTotal: %llu kB", &value) == 1) {
++            total = value;
++            haveTotal = true;
++        } else if (sscanf(line, "MemAvailable: %llu kB", &value) == 1) {
++            available = value;
++            haveAvailable = true;
++        }
++        if (haveTotal && haveAvailable)
++            break;
++    }
++    fclose(file);
++
++    if (!haveTotal || !haveAvailable || !total || available > total)
++        return -1;
++    return static_cast<int>(((total - available) * 100) / total);
++}
++
++static Seconds pollIntervalForUsedMemoryPercentage(int usedPercentage)
++{
++    // The Linux monitor's curve: poll seldom while memory is plentiful,
++    // every second once it is not, linearly in between.
++    if (usedPercentage < s_minUsedMemoryPercentageForPolling)
++        return s_maxPollingInterval;
++
++    if (usedPercentage >= s_maxUsedMemoryPercentageForPolling)
++        return s_minPollingInterval;
++
++    return s_minPollingInterval + (s_maxPollingInterval - s_minPollingInterval) *
++        ((s_maxUsedMemoryPercentageForPolling - usedPercentage) / (s_maxUsedMemoryPercentageForPolling - s_minUsedMemoryPercentageForPolling));
++}
++
++static size_t processMemoryUsage()
++{
++    ProcessMemoryStatus memoryStatus;
++    currentProcessMemoryStatus(memoryStatus);
++    return memoryStatus.resident - memoryStatus.shared;
++}
++
++static bool monitorDisabled()
++{
++    const char* value = getenv("WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR");
++    return value && !strcmp(value, "1");
++}
++
++void MemoryPressureHandler::install()
++{
++    if (m_installed)
++        return;
++    m_installed = true;
++
++    // One thread for the life of the process, started by the first
++    // install(); uninstall()/install() around a hold-off must not add more.
++    static bool monitorStarted = false;
++    if (monitorStarted || monitorDisabled())
++        return;
++    monitorStarted = true;
++
++    Thread::create("MemoryPressureMonitor"_s, [this] {
++        Seconds pollInterval = s_maxPollingInterval;
++        while (true) {
++            sleep(pollInterval);
++
++            int usedPercentage = systemMemoryUsedAsPercentage();
++            if (usedPercentage == -1) {
++                pollInterval = s_maxPollingInterval;
++                continue;
++            }
++
++            if (usedPercentage >= s_memoryPressurePercentageThreshold && MonotonicTime::now().secondsSinceEpoch().value() >= s_holdOffUntil.load()) {
++                bool isCritical = usedPercentage >= s_memoryPressurePercentageThresholdCritical;
++                // The response sets the real hold-off once it has run; this
++                // keeps the next poll from queueing another one before then.
++                s_holdOffUntil.store((MonotonicTime::now() + s_minimumHoldOffTime).secondsSinceEpoch().value());
++                callOnMainThread([this, isCritical] {
++                    respondToMemoryPressure(isCritical ? Critical::Yes : Critical::No);
++                });
++            }
++            pollInterval = pollIntervalForUsedMemoryPercentage(usedPercentage);
++        }
++    })->detach();
++}
++
++void MemoryPressureHandler::uninstall()
++{
++    m_installed = false;
++}
++
++void MemoryPressureHandler::holdOff(Seconds seconds)
++{
++    s_holdOffUntil.store((MonotonicTime::now() + seconds).secondsSinceEpoch().value());
++}
++
++void MemoryPressureHandler::respondToMemoryPressure(Critical critical, Synchronous synchronous)
++{
++    if (!m_installed)
++        return;
++
++    setMemoryPressureStatus(SystemMemoryPressureStatus::Critical);
++
++    MonotonicTime startTime = MonotonicTime::now();
++    int64_t processMemory = processMemoryUsage();
++    releaseMemory(critical, synchronous);
++    int64_t bytesFreed = processMemory - processMemoryUsage();
++
++    setMemoryPressureStatus(SystemMemoryPressureStatus::Normal);
++
++    Seconds holdOffTime = s_maximumHoldOffTime;
++    if (bytesFreed > 0 && static_cast<size_t>(bytesFreed) >= s_minimumBytesFreedToUseMinimumHoldOffTime)
++        holdOffTime = (MonotonicTime::now() - startTime) * s_holdOffMultiplier;
++    holdOff(std::max(holdOffTime, s_minimumHoldOffTime));
++}
++
++void MemoryPressureHandler::platformReleaseMemory(Critical)
++{
++#if HAVE(MALLOC_TRIM)
++    malloc_trim(0);
++#endif
++}
++
++std::optional<MemoryPressureHandler::ReliefLogger::MemoryUsage> MemoryPressureHandler::ReliefLogger::platformMemoryUsage()
++{
++    return MemoryUsage { processMemoryUsage(), memoryFootprint() };
++}
++
++} // namespace WTF

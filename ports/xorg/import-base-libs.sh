@@ -53,6 +53,22 @@ Cflags: -I\${includedir} $6
 PC
 }
 
+# Headers go in only when their bytes changed.  A plain cp gives the copy a
+# fresh mtime, and ninja in the WebKitGTK tree reads that as "input changed":
+# one re-run of this script (every `make ports-xorg`) marked 527 of its
+# objects stale -- zconf.h alone is reached by most of WebCore -- for a
+# rebuild of hours over identical bytes.  The libraries keep cp -a, which
+# preserves the build's own mtime, so a library that really was rebuilt still
+# relinks what uses it.
+copy_hdrs() { # copy_hdrs DIR FILE...
+	dst=$1
+	shift
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		cmp -s "$f" "$dst/$(basename "$f")" 2>/dev/null ||
+			cp -f "$f" "$dst/"
+	done
+}
 copy_libs() {
 	for f in "$BUILD"/$1; do
 		[ -e "$f" ] || continue
@@ -62,7 +78,7 @@ copy_libs() {
 
 # ---- zlib ----------------------------------------------------------------
 if [ -n "$zlib_dir" ]; then
-	cp -f "$zlib_dir/zlib.h" "$zlib_dir/zconf.h" "$inc/"
+	copy_hdrs "$inc" "$zlib_dir/zlib.h" "$zlib_dir/zconf.h"
 	copy_libs 'libz.so*'
 	write_pc zlib "$(ver_of "$zlib_dir")" "zlib compression library" "-lz" "" ""
 	echo "  zlib     $(ver_of "$zlib_dir")"
@@ -71,7 +87,7 @@ fi
 # ---- OpenSSL -------------------------------------------------------------
 if [ -n "$ssl_dir" ]; then
 	mkdir -p "$inc/openssl"
-	cp -f "$ssl_dir"/include/openssl/*.h "$inc/openssl/" 2>/dev/null || true
+	copy_hdrs "$inc/openssl" "$ssl_dir"/include/openssl/*.h
 	copy_libs 'libssl.so*'
 	copy_libs 'libcrypto.so*'
 	v=$(ver_of "$ssl_dir")
@@ -84,7 +100,7 @@ fi
 # ---- libcurl -------------------------------------------------------------
 if [ -n "$curl_dir" ]; then
 	mkdir -p "$inc/curl"
-	cp -f "$curl_dir"/include/curl/*.h "$inc/curl/" 2>/dev/null || true
+	copy_hdrs "$inc/curl" "$curl_dir"/include/curl/*.h
 	copy_libs 'libcurl.so*'
 	copy_libs 'libnghttp2.so*'
 	write_pc libcurl "$(ver_of "$curl_dir")" "Library to transfer files with HTTP, FTP, etc." \

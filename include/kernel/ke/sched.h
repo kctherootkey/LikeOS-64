@@ -72,6 +72,7 @@ struct task;
 // CPUID leaf 7 extended features (EBX)
 #define CPU_FEATURE_FSGSBASE (1 << 0) // FSGSBASE instructions supported
 #define CPU_FEATURE_SMEP (1 << 7) // Supervisor Mode Execution Prevention
+#define CPU_FEATURE_ERMS (1 << 9) // Enhanced REP MOVSB/STOSB: byte string ops are the fast ones
 #define CPU_FEATURE_SMAP (1 << 20) // Supervisor Mode Access Prevention
 
 // Global CPU feature flags (detected at boot)
