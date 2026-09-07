@@ -1,0 +1,87 @@
+Web Inspector, GTK: keep the data to save alive until the write has run.
+
+Saving from the inspector (a console message, a resource) wrote a file that
+began with heap garbage instead of the content.  platformSave() decoded or
+UTF-8-encoded the content into two locals and handed their pointer to
+g_file_replace_contents_async(), which takes no copy (it wraps the pointer
+with g_bytes_new_static) and performs the write from a worker thread,
+main-loop iterations later -- after platformSave() has returned and freed
+the locals.  The write then read whatever the allocator had put into the
+released memory.
+
+Hold the data in a heap structure owned by the asynchronous operation and
+release it in the completion callback, which is what the upstream
+refactoring of this code (WebInspectorUIProxyGLib.cpp) does today.
+
+--- a/Source/WebKit/UIProcess/Inspector/gtk/WebInspectorUIProxyGtk.cpp
++++ b/Source/WebKit/UIProcess/Inspector/gtk/WebInspectorUIProxyGtk.cpp
+@@ -51,6 +51,8 @@
+ #include <WebCore/InspectorDebuggableType.h>
+ #include <WebCore/NotImplemented.h>
+ #include <wtf/FileSystem.h>
++#include <wtf/glib/GUniquePtr.h>
++#include <wtf/glib/WTFGType.h>
+ #include <wtf/text/Base64.h>
+ #include <wtf/text/CString.h>
+ #include <wtf/text/WTFString.h>
+@@ -529,10 +531,29 @@
+     notImplemented();
+ }
+ 
++// The write is asynchronous.  g_file_replace_contents_async() takes no copy
++// of the contents (it wraps the pointer with g_bytes_new_static) and reads
++// them from a worker thread, main-loop iterations after platformSave() has
++// returned.  The data therefore has to outlive the call: it is held here and
++// released by the completion callback.  Kept in locals of platformSave(), as
++// it used to be, the file received whatever the allocator had put into the
++// freed memory by the time the write ran -- a few bytes of heap garbage.
++struct PlatformSaveData {
++    Vector<uint8_t> dataVector;
++    CString dataString;
++};
++WEBKIT_DEFINE_ASYNC_DATA_STRUCT(PlatformSaveData)
++using PlatformSaveDataPtr = std::unique_ptr<PlatformSaveData, decltype(&destroyPlatformSaveData)>;
++
+ static void fileReplaceContentsCallback(GObject* sourceObject, GAsyncResult* result, gpointer userData)
+ {
++    PlatformSaveDataPtr data(static_cast<PlatformSaveData*>(userData), destroyPlatformSaveData);
+     GFile* file = G_FILE(sourceObject);
+-    g_file_replace_contents_finish(file, result, nullptr, nullptr);
++    GUniqueOutPtr<GError> error;
++    if (!g_file_replace_contents_finish(file, result, nullptr, &error.outPtr())) {
++        GUniquePtr<char> path(g_file_get_path(file));
++        LOG_ERROR("Error replacing contents of file %s: %s", path.get(), error->message);
++    }
+ }
+ 
+ void WebInspectorUIProxy::platformSave(Vector<WebCore::InspectorFrontendClient::SaveData>&& saveDatas, bool forceSaveAs)
+@@ -562,23 +583,21 @@
+     if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(dialog.get())) != GTK_RESPONSE_ACCEPT)
+         return;
+ 
+-    Vector<uint8_t> dataVector;
+-    CString dataString;
++    PlatformSaveDataPtr platformSaveData(createPlatformSaveData(), destroyPlatformSaveData);
+     if (saveDatas[0].base64Encoded) {
+         auto decodedData = base64Decode(saveDatas[0].content, { Base64DecodeOption::ValidatePadding });
+         if (!decodedData)
+             return;
+         decodedData->shrinkToFit();
+-        dataVector = WTF::move(*decodedData);
++        platformSaveData->dataVector = WTF::move(*decodedData);
+     } else
+-        dataString = saveDatas[0].content.utf8();
++        platformSaveData->dataString = saveDatas[0].content.utf8();
+ 
+-    const char* data = !dataString.isNull() ? dataString.data() : reinterpret_cast<const char*>(dataVector.span().data());
+-    size_t dataLength = !dataString.isNull() ? dataString.length() : dataVector.size();
++    const char* data = !platformSaveData->dataString.isNull() ? platformSaveData->dataString.data() : reinterpret_cast<const char*>(platformSaveData->dataVector.span().data());
++    size_t dataLength = !platformSaveData->dataString.isNull() ? platformSaveData->dataString.length() : platformSaveData->dataVector.size();
+     GRefPtr<GFile> file = adoptGRef(gtk_file_chooser_get_file(chooser));
+-    GUniquePtr<char> path(g_file_get_path(file.get()));
+     g_file_replace_contents_async(file.get(), data, dataLength, nullptr, false,
+-        G_FILE_CREATE_REPLACE_DESTINATION, nullptr, fileReplaceContentsCallback, protectedInspectorPage().get());
++        G_FILE_CREATE_REPLACE_DESTINATION, nullptr, fileReplaceContentsCallback, platformSaveData.release());
+ }
+ 
+ void WebInspectorUIProxy::platformLoad(const String&, CompletionHandler<void(const String&)>&& completionHandler)

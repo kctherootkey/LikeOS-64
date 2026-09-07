@@ -82,6 +82,9 @@ void console_apply_sysfont(void); // Apply loaded system font and redraw screen
 // Runtime resolution change (display driver modeset): re-derives geometry,
 // swaps the fb backend, redraws, resizes the console tty (SIGWINCH).
 int console_reinit_framebuffer(framebuffer_info_t *fb);
+// Repaint the whole screen from the console's own state and flush it: for
+// a display driver that has just set a mode under the console.
+void console_repaint(void);
 int console_get_framebuffer_info(framebuffer_info_t *out);
 void console_clear(void);
 // Write one byte of a UTF-8 stream.  Incomplete sequences are held in an

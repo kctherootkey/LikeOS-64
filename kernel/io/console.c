@@ -936,6 +936,54 @@ void console_apply_sysfont(void)
 // Declared here rather than via tty.h: console sits below the tty layer.
 extern void tty_console_resize(void);
 
+/* Paint everything the console shows -- the text area, the scrollbar --
+ * from its own state, and mark the whole screen for the next flush.  The
+ * caller holds console_lock and flushes afterwards, outside it.
+ *
+ * This is the repaint after the display changed under the console: a mode
+ * set (the resolution chosen at boot once the display driver is up, or a
+ * display server handing the screen back), a font change.  Nothing drawn
+ * before it survives, so the cursor's memory of the pixels under it is
+ * dropped as well: kept, the next blink would "restore" two columns saved
+ * under the OLD geometry into a cell of the new one -- which is how a
+ * freshly set mode showed a few scrambled characters until the screen was
+ * repainted for some other reason. */
+static void console_repaint_locked(void)
+{
+	cursor_pixels_saved = 0;
+	cursor_shown = 0;
+
+	// Full clear (including the old scrollbar area), then rebuild the
+	// scrollbar for the current geometry and re-render the scrollback view.
+	fb_fill_rect(0, 0, fb_info->horizontal_resolution,
+		     fb_info->vertical_resolution, bg_color);
+	scrollbar_t *sb = scrollbar_get_system();
+	if (sb) {
+		scrollbar_init_system_default(sb);
+		scrollbar_render(sb);
+	}
+	console_render_view();
+	console_sync_scrollbar();
+	fb_mark_full_dirty();
+}
+
+// Repaint the whole screen and flush it to the display.  For a display
+// driver that has just set a mode: what the screen holds at that point is
+// whatever the previous mode, or the device, left in the pixels.
+void console_repaint(void)
+{
+	uint64_t flags;
+
+	if (!fb_info || !fb_info->framebuffer_base)
+		return;
+	spin_lock_irqsave(&console_lock, &flags);
+	console_repaint_locked();
+	spin_unlock_irqrestore(&console_lock, flags);
+
+	// Flush outside console_lock: the flush hook may reach code that logs.
+	fb_flush_dirty_regions();
+}
+
 // Copy of the current framebuffer parameters (fbdev/GOP fallback path).
 int console_get_framebuffer_info(framebuffer_info_t *out)
 {
@@ -1002,17 +1050,7 @@ int console_reinit_framebuffer(framebuffer_info_t *fb)
 	if (cursor_y >= max_rows)
 		cursor_y = max_rows ? max_rows - 1 : 0;
 
-	// Full clear (including the old scrollbar area), then rebuild the
-	// scrollbar for the new geometry and re-render the scrollback view.
-	fb_fill_rect(0, 0, fb_info->horizontal_resolution,
-		     fb_info->vertical_resolution, bg_color);
-	scrollbar_t *sb = scrollbar_get_system();
-	if (sb) {
-		scrollbar_init_system_default(sb);
-		scrollbar_render(sb);
-	}
-	console_render_view();
-	console_sync_scrollbar();
+	console_repaint_locked();
 
 	spin_unlock_irqrestore(&console_lock, flags);
 

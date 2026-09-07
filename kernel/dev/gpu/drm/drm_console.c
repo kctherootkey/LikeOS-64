@@ -291,6 +291,12 @@ int drm_console_takeover(struct drm_device *dev)
 			console_reinit_framebuffer(&saved);
 		return -EIO;
 	}
+	/* The mode is set and the console draws into this buffer now: paint
+	 * every cell again from the console's own state and send the whole
+	 * screen, so what the display shows from here on is that and not
+	 * what the mode change left behind -- the previous mode's pixels, or
+	 * the cursor's record of them. */
+	console_repaint();
 	console_push_all();
 
 	kprintf("[drm] %s: console on KMS, %ux%u\n", dev->drv->name, w, h);
