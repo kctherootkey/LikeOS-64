@@ -2761,8 +2761,10 @@ void exit_mm_self(task_t *task)
 
 	mm = task->mm;
 	pml4 = task->pml4;
-	if (!mm && !pml4)
+	if (!mm && !pml4) {
+		vfork_release(task); /* nothing left to leave: let the lender go */
 		return; /* already done */
+	}
 
 	/* An address space reached through a shared record must be the same
 	 * one the task points at, or the wrong tables get taken apart. */
@@ -2820,6 +2822,11 @@ void exit_mm_self(task_t *task)
 	}
 
 	task->in_exit_teardown = false;
+
+	/* Off the borrowed address space now -- CR3 is the kernel's and the
+	 * reference is dropped -- so the thread parked in vfork can have it
+	 * back.  A no-op for anything but a vfork child. */
+	vfork_release(task);
 }
 
 /*
@@ -3032,6 +3039,14 @@ void sched_remove_task(task_t *task)
 		else
 			smp_tlb_shootdown_sync();
 	}
+
+	/* A vfork child that died without ever running exit_mm_self() (an
+	 * exit marked from interrupt context) still holds its lender parked:
+	 * the spin above has established it runs nowhere, so let go here.
+	 * The reference it holds on the shared record is dropped just below
+	 * like any other thread's, and cannot be the last one -- the parked
+	 * thread holds its own until it exits. */
+	vfork_release(task);
 
 	// Release mm_struct (deferred from sched_mark_task_exited).
 	// The spin-wait above guarantees the task is no longer running on any
@@ -3298,6 +3313,15 @@ task_t *sched_fork_current(void)
 	child->ptrace_notify_seq = 0;
 	child->syscall_regs_valid = 0;
 	child->syscall_frame = NULL;
+
+	/* Not a borrower, whatever the parent is.  A vfork child that forks
+	 * gets a copy of the address space it was borrowing -- cloned from
+	 * the lender's tables and region list above -- and owns it outright.
+	 * The copy of the task_t brought the lender's route along. */
+	child->vfork_mm_owner = NULL;
+	child->vfork_parent_id = 0;
+	child->vfork_parent_incarnation = 0;
+	child->vfork_done = 0;
 
 	/* Fresh kernel-stack canary: the wholesale copy above duplicated the
 	 * parent's.  The child's kernel context is only the hand-built

@@ -1,19 +1,25 @@
 /*
  * posix_spawn() and friends.
  *
- * Built on fork()+exec(), which is what the interface is worth on a system
- * that can fork cheaply: not the process creation itself, but the error
- * reporting.  With plain fork+exec, a failed exec happens in the child, where
- * the only way to tell the parent is to invent a channel for it -- so every
- * program that cares reinvents the same close-on-exec pipe, and every program
- * that does not silently gets a child that exits 127.  posix_spawn() reports
- * the error as its return value, so callers get it right without trying.
+ * Built on clone(CLONE_VM | CLONE_VFORK): the child runs in this process's
+ * address space, on a small stack of its own, and the calling thread sleeps
+ * until the child has exec'd or exited.  Nothing is copied.  That is the
+ * whole point of the interface on a system where fork is not cheap: a fork of
+ * a large threaded program walks every page-table entry it has, marks each
+ * page copy-on-write and broadcasts an invalidation -- and every other thread
+ * of the program that faults meanwhile waits the whole time -- only for the
+ * copy to be thrown away at exec a few microseconds later.
  *
- * That pipe is the interesting part of this file.  The child writes its errno
- * into it and _exit()s if anything fails before the program is running; the
- * pipe is O_CLOEXEC, so a successful exec closes it and the parent's read()
- * returns 0.  Nothing else distinguishes "exec failed" from "the program ran
- * and exited immediately".
+ * Sharing the address space is also what makes the error reporting free.  A
+ * failed exec happens in the child; with fork it has to invent a channel back
+ * (a close-on-exec pipe, reinvented by every program that cares), here the
+ * child writes its errno into the caller's frame and the parent reads it when
+ * clone() returns, which is not before the child is gone.
+ *
+ * The price is the vfork discipline: until exec, the child may touch nothing
+ * the parent will look at afterwards, may not allocate, and may not take a
+ * lock -- another thread of the parent may hold it.  Everything the child does
+ * here is a plain system call on data prepared before the clone.
  *
  * Errors are RETURNED, not signalled through errno -- that is what POSIX
  * specifies for this family, and it differs from almost every other call here.
@@ -26,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>      /* clone(), CLONE_VM, CLONE_VFORK */
+#include <sys/mman.h>   /* the child's stack */
 #include <sys/wait.h>   /* waitpid: reaping a child whose exec failed */
 
 /* One entry in the file-actions list.  A linked list rather than an array so
@@ -315,17 +323,64 @@ int posix_spawnattr_setschedpolicy(posix_spawnattr_t *attr, int policy)
 /* The spawn itself                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Everything the child does between fork() and exec().  Returns an errno on
- * failure; the caller reports it through the pipe and exits.
+/* What the child needs, living in the parent's frame.  The child reads it
+ * through the address space it shares with the parent and writes back one
+ * int; the parent reads that once clone() has returned, which is after the
+ * child has exec'd or exited. */
+struct spawn_args {
+	const char *file;
+	char *const *argv;
+	char *const *envp;
+	const posix_spawn_file_actions_t *file_actions;
+	const posix_spawnattr_t *attrp;
+	const sigset_t *parent_mask; /* what the parent had before blocking all */
+	int use_path;
+	volatile int err;
+};
+
+/* Everything the child does before exec().  Returns an errno on failure.
  *
- * Nothing here may allocate or take a lock: after fork() this process is a
- * copy of a possibly-threaded parent, and any lock held by a thread that did
- * not come along is held forever.  All the memory these actions need was
- * allocated before the fork, when the actions were added. */
-static int spawn_child_setup(const posix_spawn_file_actions_t *file_actions,
-			     const posix_spawnattr_t *attrp)
+ * This runs in the PARENT'S address space with the parent thread parked (see
+ * the file comment): every call below is a plain system call wrapper, the
+ * only memory written is the caller's `err', and execvp()'s PATH search works
+ * in a buffer on this stack.  Reading environ is fine -- it is the parent's,
+ * and it is what the child is meant to read. */
+static int spawn_child_setup(const struct spawn_args *a)
 {
+	const posix_spawnattr_t *attrp = a->attrp;
 	short flags = attrp ? attrp->__flags : 0;
+	int sig;
+
+	/* Signals first.  Every handler the parent installed is code written
+	 * to run in the parent; run in a child that shares the parent's
+	 * memory it could corrupt what the parent expects to find, so each
+	 * caught signal goes back to SIG_DFL here (exec would do the same a
+	 * moment later, so the program being started sees no difference).
+	 * SIG_IGN survives exec and stays, unless SETSIGDEF names the signal.
+	 * None of this is observable in between: the parent blocked every
+	 * signal before the clone, the mask is inherited, and it is only
+	 * replaced at the very end.  The child's dispositions are its own
+	 * copy -- the parent's are untouched. */
+	for (sig = 1; sig < NSIG; sig++) {
+		struct sigaction sa;
+
+		if (sig == SIGKILL || sig == SIGSTOP)
+			continue;
+		if ((flags & POSIX_SPAWN_SETSIGDEF) &&
+		    sigismember(&attrp->__sd, sig) > 0) {
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = SIG_DFL;
+			(void)sigaction(sig, &sa, NULL);
+			continue;
+		}
+		if (sigaction(sig, NULL, &sa) != 0)
+			continue;
+		if (sa.sa_handler != SIG_DFL && sa.sa_handler != SIG_IGN) {
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = SIG_DFL;
+			(void)sigaction(sig, &sa, NULL);
+		}
+	}
 
 	if (flags & POSIX_SPAWN_SETSID) {
 		if (setsid() < 0)
@@ -347,30 +402,6 @@ static int spawn_child_setup(const posix_spawn_file_actions_t *file_actions,
 			return errno;
 	}
 
-	if (flags & POSIX_SPAWN_SETSIGDEF) {
-		struct sigaction sa;
-		int sig;
-
-		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = SIG_DFL;
-		for (sig = 1; sig < NSIG; sig++) {
-			if (!sigismember(&attrp->__sd, sig))
-				continue;
-			/* A failure here means the signal cannot be caught
-			 * (SIGKILL, SIGSTOP), which is not an error: it is
-			 * already at its default disposition. */
-			(void)sigaction(sig, &sa, NULL);
-		}
-	}
-
-	/* The mask is installed AFTER the dispositions are reset, so a signal
-	 * arriving in the window does not run a handler inherited from the
-	 * parent -- the whole point of SETSIGDEF. */
-	if (flags & POSIX_SPAWN_SETSIGMASK) {
-		if (sigprocmask(SIG_SETMASK, &attrp->__ss, NULL) != 0)
-			return errno;
-	}
-
 	if (flags & (POSIX_SPAWN_SETSCHEDPARAM | POSIX_SPAWN_SETSCHEDULER)) {
 		/* Scheduling policies are not implemented on this system
 		 * (_POSIX_PRIORITY_SCHEDULING is -1), so rather than ignore the
@@ -379,21 +410,21 @@ static int spawn_child_setup(const posix_spawn_file_actions_t *file_actions,
 		return ENOTSUP;
 	}
 
-	if (file_actions) {
-		const struct __spawn_action *a;
+	if (a->file_actions) {
+		const struct __spawn_action *act;
 
-		for (a = file_actions->__head; a; a = a->next) {
-			switch (a->op) {
+		for (act = a->file_actions->__head; act; act = act->next) {
+			switch (act->op) {
 			case SPAWN_OPEN: {
 				/* Open, then move to the requested descriptor.
 				 * open() gives the lowest free one, which is
 				 * usually not the one asked for. */
-				int fd = open(a->path, a->oflag, a->mode);
+				int fd = open(act->path, act->oflag, act->mode);
 
 				if (fd < 0)
 					return errno;
-				if (fd != a->fd) {
-					if (dup2(fd, a->fd) < 0) {
+				if (fd != act->fd) {
+					if (dup2(fd, act->fd) < 0) {
 						int e = errno;
 
 						close(fd);
@@ -406,11 +437,11 @@ static int spawn_child_setup(const posix_spawn_file_actions_t *file_actions,
 			case SPAWN_CLOSE:
 				/* Closing an already-closed descriptor is a
 				 * failure per POSIX, so EBADF propagates. */
-				if (close(a->fd) != 0)
+				if (close(act->fd) != 0)
 					return errno;
 				break;
 			case SPAWN_DUP2:
-				if (dup2(a->fd, a->newfd) < 0)
+				if (dup2(act->fd, act->newfd) < 0)
 					return errno;
 				/* dup2 clears FD_CLOEXEC on the new
 				 * descriptor, which is what is wanted: the
@@ -418,74 +449,102 @@ static int spawn_child_setup(const posix_spawn_file_actions_t *file_actions,
 				 * program being run. */
 				break;
 			case SPAWN_CHDIR:
-				if (chdir(a->path) != 0)
+				if (chdir(act->path) != 0)
 					return errno;
 				break;
 			case SPAWN_FCHDIR:
-				if (fchdir(a->fd) != 0)
+				if (fchdir(act->fd) != 0)
 					return errno;
 				break;
 			}
 		}
 	}
 
+	/* Last, so that nothing above ran with a signal deliverable: the mask
+	 * the caller asked for, or else the one the parent had. */
+	if (sigprocmask(SIG_SETMASK,
+			(flags & POSIX_SPAWN_SETSIGMASK) ? &attrp->__ss :
+							   a->parent_mask,
+			NULL) != 0)
+		return errno;
+
 	return 0;
 }
+
+/* The child, from its first instruction on its own stack to exec or _exit.
+ * Never returns: clone() would exit the process with its value, but the
+ * parent must find `err' set either way. */
+static int spawn_child(void *arg)
+{
+	struct spawn_args *a = arg;
+	int err = spawn_child_setup(a);
+
+	if (err == 0) {
+		if (a->use_path)
+			execvp(a->file, a->argv);
+		else
+			execve(a->file, a->argv, a->envp ? a->envp : environ);
+		err = errno;
+	}
+	a->err = err;
+	_exit(127);
+}
+
+/* The child's stack.  It runs in the parent's address space and cannot use
+ * the parent's stack -- the parent is parked in the middle of it -- so it
+ * gets a mapping of its own, released once it is done.  The deepest path is
+ * execvp()'s PATH search with its on-stack buffers, well under this. */
+#define SPAWN_STACK_SIZE (64 * 1024)
 
 static int spawn_common(pid_t *pid, const char *file,
 			const posix_spawn_file_actions_t *file_actions,
 			const posix_spawnattr_t *attrp, char *const argv[],
 			char *const envp[], int use_path)
 {
-	int err_pipe[2];
+	struct spawn_args args;
+	sigset_t all, saved;
+	void *stack;
 	pid_t child;
-	int err = 0;
-	ssize_t n;
+	int err;
 
 	if (!file || !argv)
 		return EINVAL;
 
-	/* O_CLOEXEC is what makes this work: a successful exec closes the
-	 * write end, the parent's read() returns 0, and that -- not any
-	 * message -- is how success is signalled. */
-	if (pipe2(err_pipe, O_CLOEXEC) != 0)
+	stack = mmap(NULL, SPAWN_STACK_SIZE, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (stack == MAP_FAILED)
 		return errno;
 
-	child = fork();
-	if (child < 0) {
-		int e = errno;
+	args.file = file;
+	args.argv = argv;
+	args.envp = envp;
+	args.file_actions = file_actions;
+	args.attrp = attrp;
+	args.parent_mask = &saved;
+	args.use_path = use_path;
+	args.err = 0;
 
-		close(err_pipe[0]);
-		close(err_pipe[1]);
-		return e;
-	}
+	/* Block everything: the child inherits the mask, and between its
+	 * first instruction and its own sigprocmask() it must not run one of
+	 * this process's handlers (see spawn_child_setup).  Restored below,
+	 * whatever happened. */
+	sigfillset(&all);
+	sigprocmask(SIG_BLOCK, &all, &saved);
 
-	if (child == 0) {
-		close(err_pipe[0]);
+	/* This thread sleeps in here until the child has exec'd or exited;
+	 * the other threads of the process keep running. */
+	child = clone(spawn_child, (char *)stack + SPAWN_STACK_SIZE,
+		      CLONE_VM | CLONE_VFORK | SIGCHLD, &args, (pid_t *)NULL,
+		      (void *)NULL, (pid_t *)NULL);
+	err = (child < 0) ? errno : (int)args.err;
 
-		err = spawn_child_setup(file_actions, attrp);
-		if (err == 0) {
-			if (use_path)
-				execvp(file, argv);
-			else
-				execve(file, argv, envp ? envp : environ);
-			err = errno;
-		}
+	sigprocmask(SIG_SETMASK, &saved, NULL);
+	munmap(stack, SPAWN_STACK_SIZE);
 
-		/* Report and go.  A short or failed write leaves the parent
-		 * seeing a clean exec, which is wrong but not correctable from
-		 * here -- and the child must not linger either way. */
-		(void)!write(err_pipe[1], &err, sizeof(err));
-		_exit(127);
-	}
+	if (child < 0)
+		return err;
 
-	close(err_pipe[1]);
-	do {
-		n = read(err_pipe[0], &err, sizeof(err));
-	} while (n < 0 && errno == EINTR);
-	close(err_pipe[0]);
-
-	if (n == (ssize_t)sizeof(err) && err != 0) {
+	if (err != 0) {
 		/* The child never became the program, so it is this call's
 		 * business to reap it -- reporting failure AND leaving a zombie
 		 * would be the worst of both. */

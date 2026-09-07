@@ -35,16 +35,7 @@ pid_t gettid(void)
 	return (pid_t)syscall0(SYS_GETTID);
 }
 
-// SYS_VFORK - create child sharing parent's address space
-pid_t vfork(void)
-{
-	long ret = syscall0(SYS_VFORK);
-	if (ret < 0) {
-		errno = -ret;
-		return -1;
-	}
-	return (pid_t)ret;
-}
+/* vfork() lives in vfork.S: it must not have a stack frame of its own. */
 
 // SYS_EXIT_GROUP - exit all threads in process
 void exit_group(int status)

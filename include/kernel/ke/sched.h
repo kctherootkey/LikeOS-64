@@ -1113,6 +1113,28 @@ typedef struct task {
 	mm_struct_t *mm; // Shared address space (CLONE_VM)
 	files_struct_t *files; // Shared file descriptors (CLONE_FILES)
 	sighand_struct_t *sighand; // Shared signal handlers (CLONE_SIGHAND)
+
+	/* vfork.
+	 *
+	 * A CLONE_VM child that is not a thread runs in ANOTHER process's
+	 * address space until it execs or exits, and while it does, every
+	 * piece of address-space bookkeeping it consults -- the region table,
+	 * the break, the mmap base, the lock over them -- is that process's:
+	 * task_mm_owner() routes there.  Written once at creation, before the
+	 * child can run; cleared once, by the child itself, when it stops
+	 * using the borrowed space (exec's point of no return, or exit).
+	 * After that it is an ordinary process with the empty table it was
+	 * given at creation. */
+	struct task *vfork_mm_owner;
+	/* The thread that called vfork and is parked in vfork_wait() until
+	 * this child lets go.  Id and incarnation rather than a pointer: it is
+	 * looked up under the task-list lock when the time comes. */
+	uint32_t vfork_parent_id;
+	uint64_t vfork_parent_incarnation;
+	/* Parent side: raised by the child's vfork_release(), consumed by
+	 * vfork_wait().  One flag is enough -- the thread sleeps for the whole
+	 * life of the borrowing child, so it never has two at once. */
+	volatile int vfork_done;
 } task_t;
 
 /* THE descriptor table of `t`.  A thread created with CLONE_FILES shares one
@@ -1250,7 +1272,18 @@ static inline void sched_dump_task_leaks(void)
 
 static inline task_t *task_mm_owner(task_t *t)
 {
-	return (t && t->group_leader) ? t->group_leader : t;
+	task_t *owner;
+
+	if (!t)
+		return NULL;
+	owner = t->group_leader ? t->group_leader : t;
+	/* A vfork child (and any thread it makes before it execs) works in
+	 * the address space of the process that called vfork, so its
+	 * bookkeeping is that process's too.  One hop only: the field names
+	 * a lender's own leader, never another borrower. */
+	if (owner->vfork_mm_owner)
+		return owner->vfork_mm_owner;
+	return owner;
 }
 
 /* Register a lazy (demand-paged) region on a task — used by the ELF
@@ -1290,6 +1323,14 @@ int sched_claim_wake(task_t *t,
  * than leaving it for the reaper.  Idempotent; the task must already be
  * unrunnable.  Called from sched_exit_park(). */
 void exit_mm_self(task_t *task);
+
+/* A vfork child has stopped using the address space it borrowed: cut the
+ * bookkeeping route to the lender and wake the thread parked in vfork.
+ * Idempotent, and a no-op for any other task.  Called at exec's point of no
+ * return (elf_loader.c) once the CPU has left the borrowed tables, from
+ * exit_mm_self(), and -- for an exit that never ran that -- as a backstop
+ * from sched_remove_task(). */
+void vfork_release(task_t *child);
 
 /* Where a finished thread goes: releases its address space, then parks with
  * interrupts enabled until it is reaped.  Never returns. */

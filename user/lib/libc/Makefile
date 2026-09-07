@@ -45,6 +45,8 @@ NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netd
 PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c src/pthread/semaphore.c
 STACK_CHK_SRC = src/stack_chk.c
 PTHREAD_ASM = src/pthread/clone.S
+# vfork() cannot be written in C: see src/syscalls/vfork.S.
+SYSCALLS_ASM = src/syscalls/vfork.S
 SETJMP_ASM  = src/setjmp.S
 UCONTEXT_ASM = src/misc/ucontext.S
 MISC_SRC = src/misc/makecontext.c src/misc/threads.c
@@ -65,7 +67,7 @@ MATH_OBJ = $(MATH_SRC:.c=.o)
 REGEX_OBJ = $(REGEX_SRC:.c=.o)
 ICONV_OBJ = $(ICONV_SRC:.c=.o)
 LOCALE_OBJ = $(LOCALE_SRC:.c=.o)
-SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
+SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o) $(SYSCALLS_ASM:.S=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
 PWD_OBJ = $(PWD_SRC:.c=.o)
 NET_OBJ = $(NET_SRC:.c=.o)

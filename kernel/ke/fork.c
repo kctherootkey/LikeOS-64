@@ -191,6 +191,119 @@ extern void task_set_fs_base(task_t *task, uint64_t base);
 extern int g_next_id;
 extern spinlock_t g_task_list_lock;
 
+/* ============================================================================
+ * vfork
+ *
+ * A CLONE_VM child that is not a thread borrows the caller's address space,
+ * bookkeeping included (task_mm_owner() routes it to the lender's leader),
+ * and the calling thread is parked until the child execs or exits.  That is
+ * all vfork ever promised, and it is what makes it cheap: no page table is
+ * walked, no page is marked copy-on-write, no invalidation is broadcast --
+ * the whole of which a fork of a large threaded program pays for, only to
+ * throw the copy away at exec a few microseconds later.
+ *
+ * Nothing the parked thread could do meanwhile would be safe, so the park is
+ * not interruptible: returning early would put two processes in one address
+ * space with the bookkeeping owned by one of them.  A signal still WAKES the
+ * sleeper -- sched_signal_task() does that for SIGKILL so that kernel locks
+ * are not orphaned -- which is why vfork_wait() is a loop that goes straight
+ * back to sleep until the flag says otherwise, and acts on the signal on the
+ * way out to user mode like any other syscall.
+ *
+ * The child lets go in vfork_release(), from three places: exec's point of no
+ * return (after the CPU has switched to the new tables), exit_mm_self() (after
+ * it has switched to the kernel's), and sched_remove_task() as a backstop for
+ * an exit that never ran the former.  All three are the child's own context or
+ * a reaper acting after it has stopped running -- never while it might still
+ * be executing on the borrowed tables.
+ * ========================================================================== */
+
+static spinlock_t g_vfork_lock = SPINLOCK_INIT("vfork");
+
+/* The test and the transition to BLOCKED are one step under g_vfork_lock,
+ * which is the lock the child raises the flag under, so a wake cannot fall
+ * between them -- the pattern mm_rwsem_park() uses. */
+static void vfork_wait(task_t *cur, bool have_slot, uint64_t slot)
+{
+	for (;;) {
+		uint64_t fl;
+
+		spin_lock_irqsave(&g_vfork_lock, &fl);
+		if (cur->vfork_done) {
+			cur->vfork_done = 0;
+			spin_unlock_irqrestore(&g_vfork_lock, fl);
+			break;
+		}
+		cur->wait_channel = (void *)&cur->vfork_done;
+		cur->state = TASK_BLOCKED;
+		spin_unlock_irqrestore(&g_vfork_lock, fl);
+		sched_schedule();
+	}
+	/* A wake by signal leaves the channel set (only a channel wake clears
+	 * it); do not carry it into the next thing this thread blocks on. */
+	cur->wait_channel = NULL;
+
+	/* A vfork() child returns from the very call that made it, into the
+	 * frame it shares with the caller, and the first call it makes after
+	 * that reuses the stack slot holding vfork's own return address.  Put
+	 * back what was there when this thread entered the kernel, so its own
+	 * return lands where it came from.  (glibc keeps the address in a
+	 * caller-saved register across the syscall instead; that needs the
+	 * child to inherit such a register, which fork_child_return does not
+	 * do.)  A caller with a stack frame of its own gets the same eight
+	 * bytes it had -- the child could not have used that frame validly
+	 * anyway. */
+	if (have_slot)
+		(void)copy_to_user((void *)cur->syscall_rsp, &slot,
+				   sizeof(slot));
+}
+
+void vfork_release(task_t *child)
+{
+	uint64_t fl, fl2;
+	uint32_t pid;
+	uint64_t inc;
+	task_t *parent = NULL;
+
+	if (!child)
+		return;
+	/* Not a borrower, or already released.  Unlocked read: only the
+	 * child itself, or the reaper after it, ever writes these. */
+	if (!child->vfork_parent_id && !child->vfork_mm_owner)
+		return;
+
+	spin_lock_irqsave(&g_vfork_lock, &fl);
+	child->vfork_mm_owner = NULL;
+	pid = child->vfork_parent_id;
+	inc = child->vfork_parent_incarnation;
+	child->vfork_parent_id = 0;
+	child->vfork_parent_incarnation = 0;
+	spin_unlock_irqrestore(&g_vfork_lock, fl);
+	if (!pid)
+		return;
+
+	/* The parent is looked up, not dereferenced from a saved pointer: it
+	 * is parked and cannot go away, but an id plus incarnation costs
+	 * nothing and can never follow a stale pointer.  The flag goes up
+	 * under g_vfork_lock, inside the task-list lock (that order is the
+	 * only one anybody uses); the wake goes outside both, because
+	 * sched_wake_channel() takes the task-list lock itself.  The address
+	 * handed to it is only ever compared, never dereferenced. */
+	spin_lock_irqsave(&g_task_list_lock, &fl);
+	parent = sched_find_task_by_id_locked(pid);
+	if (parent && parent->incarnation == inc) {
+		spin_lock_irqsave(&g_vfork_lock, &fl2);
+		parent->vfork_done = 1;
+		spin_unlock_irqrestore(&g_vfork_lock, fl2);
+	} else {
+		parent = NULL;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, fl);
+
+	if (parent)
+		sched_wake_channel((void *)&parent->vfork_done);
+}
+
 // SYS_CLONE - create a new thread or process
 // Full implementation with all CLONE_* flags
 int64_t sys_clone(uint64_t flags, uint64_t child_stack,
@@ -210,12 +323,23 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) {
 		return -EINVAL;
 	}
+	/* CLONE_VM without CLONE_THREAD is vfork or nothing.  A separate
+	 * process sharing an address space for good would have nobody to own
+	 * the bookkeeping once the lender exits; a vfork child borrows it only
+	 * for as long as the lender is parked in here. */
+	if ((flags & CLONE_VM) && !(flags & CLONE_THREAD) &&
+	    !(flags & CLONE_VFORK)) {
+		return -EINVAL;
+	}
 
 	// Extract flag meanings
 	bool share_vm = (flags & CLONE_VM) != 0;
 	bool share_files = (flags & CLONE_FILES) != 0;
 	bool share_sighand = (flags & CLONE_SIGHAND) != 0;
 	bool is_thread = (flags & CLONE_THREAD) != 0;
+	/* Park the caller until the child execs or exits.  Meaningful for a
+	 * process; a thread made with the flag is simply a thread. */
+	bool is_vfork = (flags & CLONE_VFORK) != 0 && !is_thread;
 	bool set_tls = (flags & CLONE_SETTLS) != 0;
 	bool set_parent_tid = (flags & CLONE_PARENT_SETTID) != 0;
 	bool set_child_tid = (flags & CLONE_CHILD_SETTID) != 0;
@@ -315,6 +439,15 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * in-progress syscall. */
 	child->syscall_frame = NULL;
 	child->syscall_regs_valid = 0;
+
+	/* vfork state, per child: cleared for every kind of clone -- the copy
+	 * duplicated the creator's, and a child of a vfork child must not
+	 * inherit its creator's borrowing -- and set further down for a vfork
+	 * child of its own. */
+	child->vfork_mm_owner = NULL;
+	child->vfork_parent_id = 0;
+	child->vfork_parent_incarnation = 0;
+	child->vfork_done = 0;
 
 	/* The copy above duplicated the POINTER to the parent's region table,
 	 * not the table.  A CLONE_VM thread gets an empty one of its own --
@@ -470,6 +603,17 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 		child->in_exit_teardown = false;
 	}
 
+	/* A vfork child: the address space it now shares belongs, bookkeeping
+	 * and all, to the lender's leader.  Set before the child can run, so
+	 * that its very first fault is routed right; cleared by the child in
+	 * vfork_release().  (A thread also shares, but a thread's route is its
+	 * group leader and needs no field.) */
+	if (share_vm && !is_thread) {
+		child->vfork_mm_owner = mm_src;
+		child->vfork_parent_id = cur->id;
+		child->vfork_parent_incarnation = cur->incarnation;
+	}
+
 	// Handle CLONE_FILES (share file descriptors)
 	if (share_files) {
 		if (cur->files) {
@@ -623,14 +767,35 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 		child->exit_signal = SIGCHLD;
 		child->parent = proc;
 		sched_add_child(proc, child);
+
+		/* The rest of what sched_fork_current() clears for a new
+		 * process and a thread inherits: watchpoints armed on behalf
+		 * of a tracer that does not know this process exists (a debug
+		 * register left set would trap a process nobody is watching --
+		 * a SIGTRAP whose default action kills it), and in-flight
+		 * per-syscall state that belongs to the creator's syscall. */
+		child->dr_addr[0] = 0;
+		child->dr_addr[1] = 0;
+		child->dr_addr[2] = 0;
+		child->dr_addr[3] = 0;
+		child->dr_status = 0;
+		child->dr_control = 0;
+		child->dr_active = 0;
+		child->ptrace_sig_delivery = 0;
+		child->ptrace_signal_injected = 0;
+		child->syscall_unix_ref = NULL;
+		child->fs_rdepth = 0;
 	}
 
 	// Handle CLONE_SETTLS
 	if (set_tls) {
 		task_set_fs_base(child, tls);
-	} else {
-		child->fs_base = 0;
 	}
+	/* Otherwise the copy's fs_base stands: a child made without
+	 * CLONE_SETTLS keeps its creator's thread pointer, exactly as fork
+	 * does (see the TLS note in sched_fork_current).  Zeroing it here left
+	 * a vfork child with no TLS at all, and its first errno store faulted
+	 * at a small absolute address. */
 
 	// Handle CLONE_CHILD_CLEARTID
 	if (clear_child_tid && child_tidptr) {
@@ -727,6 +892,22 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// Once enqueued, another CPU might run and free the child before we read it.
 	int64_t child_pid = child->id;
 
+	/* vfork: everything the park needs, gathered BEFORE the child can
+	 * run.  The flag must be down before the child could raise it, and the
+	 * eight bytes at the caller's stack pointer -- vfork's return address
+	 * when the child runs on the caller's own stack -- must be read before
+	 * the child's first call overwrites them.  See vfork_wait(). */
+	uint64_t slot = 0;
+	bool have_slot = false;
+
+	if (is_vfork) {
+		cur->vfork_done = 0;
+		if (share_vm && child_stack == 0)
+			have_slot = copy_from_user(&slot,
+						   (const void *)cur->syscall_rsp,
+						   sizeof(slot)) == 0;
+	}
+
 	/* Tell the tracer a thread appeared, if it asked.
 	 *
 	 * A debugger that is not told has to notice by polling the thread list,
@@ -809,13 +990,21 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// This is the standard behavior: thread creation is a reschedule point.
 	cur->need_resched = 1;
 
+	/* The child has the address space -- and, for vfork() proper, this
+	 * thread's user stack -- until it execs or exits.  Nothing to do but
+	 * wait for it. */
+	if (is_vfork)
+		vfork_wait(cur, have_slot, slot);
+
 	return child_pid;
 }
 
 // SYS_VFORK - create child that shares parent's memory until exec/exit
 int64_t sys_vfork(void)
 {
-	// For now, implement as regular fork
-	// True vfork semantics would suspend parent until child execs or exits
-	return sys_fork();
+	/* What every vfork(2) is: a clone that shares the address space and
+	 * parks the caller.  No child stack -- the child runs on the caller's
+	 * own, which is why libc's vfork() is a frameless stub and why
+	 * vfork_wait() restores the return slot when the child is done. */
+	return sys_clone(CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0);
 }

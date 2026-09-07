@@ -25,6 +25,7 @@
 #include <locale.h>
 #include <langinfo.h>
 #include <fcntl.h>
+#include <spawn.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <dlfcn.h>
@@ -12736,6 +12737,24 @@ static void test_dirent64_and_stat_mkdir(void)
 	rmdir(dir);
 }
 
+/* posix_spawn() from a thread that is not the main one, while the main
+ * thread keeps allocating: the spawning thread is parked in vfork, the
+ * others must go on unaffected (a threaded program launching a helper). */
+static volatile int spawn_thread_done;
+static pid_t spawn_thread_pid;
+static int spawn_thread_rc;
+
+static void *spawn_from_thread(void *arg)
+{
+	char *const av[] = { "sh", "-c", "exit 5", NULL };
+
+	(void)arg;
+	spawn_thread_rc = posix_spawn(&spawn_thread_pid, "/bin/sh", NULL, NULL,
+				      av, environ);
+	__atomic_store_n(&spawn_thread_done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
 int main(int argc, char **argv)
 {
 	g_ctor_saw_main_before = g_ctor_ran; /* constructors must precede main */
@@ -18142,6 +18161,166 @@ int main(int argc, char **argv)
 					    WEXITSTATUS(status) == 42);
 		} else {
 			test_fail("vfork() failed");
+		}
+	}
+
+	/* Real vfork semantics: the child runs in the parent's address space
+	 * and the parent does not return from vfork() until the child has
+	 * exec'd or exited.  So a store by the child is simply visible, with
+	 * no wait at all -- a copy-on-write fork would have hidden it. */
+	printf("\n[TEST] vfork() shares memory and parks the parent\n");
+	{
+		static volatile int vfork_shared = 0;
+		pid_t child = vfork();
+		if (child == 0) {
+			vfork_shared = 1234;
+			_exit(0);
+		} else if (child > 0) {
+			int status;
+			test_result("vfork() child's store visible in the parent",
+				    vfork_shared == 1234);
+			waitpid(child, &status, 0);
+			test_result("vfork() child reaped",
+				    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		} else {
+			test_fail("vfork() failed");
+		}
+	}
+
+	/* The child's execve() call runs on the parent's stack, right over
+	 * the slot holding vfork()'s return address; the parent must still
+	 * return from vfork() to the right place afterwards. */
+	printf("\n[TEST] vfork() + execve()\n");
+	{
+		pid_t child = vfork();
+		if (child == 0) {
+			char *const av[] = { "sh", "-c", "exit 7", NULL };
+			execve("/bin/sh", av, environ);
+			_exit(127);
+		} else if (child > 0) {
+			int status;
+			waitpid(child, &status, 0);
+			test_result("vfork()+execve() child exit status 7",
+				    WIFEXITED(status) && WEXITSTATUS(status) == 7);
+		} else {
+			test_fail("vfork() failed");
+		}
+	}
+
+	printf("\n[TEST] posix_spawn()\n");
+	{
+		pid_t pid = -1;
+		char *const av[] = { "sh", "-c", "exit 3", NULL };
+		char *const av2[] = { "sh", "-c", "exit 4", NULL };
+		int status = 0;
+		int r = posix_spawn(&pid, "/bin/sh", NULL, NULL, av, environ);
+
+		test_result("posix_spawn() returns 0", r == 0);
+		if (r == 0) {
+			pid_t w = waitpid(pid, &status, 0);
+			test_result("posix_spawn() child reaped with status 3",
+				    w == pid && WIFEXITED(status) &&
+					    WEXITSTATUS(status) == 3);
+		}
+
+		/* A program that cannot be exec'd is reported as the return
+		 * value -- the child that failed is reaped by the call. */
+		r = posix_spawn(&pid, "/nonexistent/program", NULL, NULL, av,
+				environ);
+		test_result("posix_spawn() of a missing file returns ENOENT",
+			    r == ENOENT);
+
+		r = posix_spawnp(&pid, "sh", NULL, NULL, av2, environ);
+		test_result("posix_spawnp() finds sh on PATH", r == 0);
+		if (r == 0) {
+			pid_t w = waitpid(pid, &status, 0);
+			test_result("posix_spawnp() child reaped with status 4",
+				    w == pid && WIFEXITED(status) &&
+					    WEXITSTATUS(status) == 4);
+		}
+	}
+
+	printf("\n[TEST] posix_spawn() file actions and attributes\n");
+	{
+		int pfd[2];
+
+		if (pipe(pfd) == 0) {
+			posix_spawn_file_actions_t fa;
+			posix_spawnattr_t attr;
+			sigset_t sd;
+			char *const av[] = { "sh", "-c", "echo spawned", NULL };
+			pid_t pid = -1;
+			int r;
+
+			posix_spawn_file_actions_init(&fa);
+			posix_spawn_file_actions_adddup2(&fa, pfd[1], 1);
+			posix_spawn_file_actions_addclose(&fa, pfd[0]);
+			posix_spawnattr_init(&attr);
+			sigemptyset(&sd);
+			sigaddset(&sd, SIGINT);
+			posix_spawnattr_setsigdefault(&attr, &sd);
+			posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
+
+			r = posix_spawn(&pid, "/bin/sh", &fa, &attr, av, environ);
+			close(pfd[1]);
+			test_result("posix_spawn() with file actions returns 0",
+				    r == 0);
+			if (r == 0) {
+				char buf[64];
+				ssize_t n = read(pfd[0], buf, sizeof(buf) - 1);
+				int status = 0;
+
+				buf[n > 0 ? n : 0] = '\0';
+				test_result("child's stdout arrived through the dup2 action",
+					    n > 0 && strncmp(buf, "spawned", 7) == 0);
+				waitpid(pid, &status, 0);
+				test_result("file-actions child exited 0",
+					    WIFEXITED(status) &&
+						    WEXITSTATUS(status) == 0);
+			}
+			close(pfd[0]);
+			/* The child's dup2/close acted on its own table only. */
+			test_result("parent's stdout untouched by the child's dup2",
+				    fcntl(1, F_GETFD) != -1);
+			posix_spawn_file_actions_destroy(&fa);
+			posix_spawnattr_destroy(&attr);
+		} else {
+			test_fail("pipe() failed");
+		}
+	}
+
+	printf("\n[TEST] posix_spawn() from a secondary thread\n");
+	{
+		pthread_t th;
+
+		spawn_thread_done = 0;
+		spawn_thread_pid = -1;
+		spawn_thread_rc = -1;
+		if (pthread_create(&th, NULL, spawn_from_thread, NULL) == 0) {
+			int status = 0;
+			unsigned long allocs = 0;
+
+			/* The spawning thread is parked in vfork; this one must
+			 * keep running, allocating and freeing meanwhile. */
+			while (!__atomic_load_n(&spawn_thread_done,
+						__ATOMIC_ACQUIRE)) {
+				void *p = malloc(64 + (allocs % 512));
+
+				free(p);
+				allocs++;
+			}
+			pthread_join(th, NULL);
+			test_result("posix_spawn() from a thread returns 0",
+				    spawn_thread_rc == 0);
+			if (spawn_thread_rc == 0) {
+				pid_t w = waitpid(spawn_thread_pid, &status, 0);
+				test_result("thread-spawned child reaped with status 5",
+					    w == spawn_thread_pid &&
+						    WIFEXITED(status) &&
+						    WEXITSTATUS(status) == 5);
+			}
+		} else {
+			test_fail("pthread_create() failed");
 		}
 	}
 

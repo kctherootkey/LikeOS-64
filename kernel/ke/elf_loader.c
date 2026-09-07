@@ -982,6 +982,25 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		return 0;
 	}
 
+	/* Point of no return for a vfork child: from here the new image is
+	 * what this process becomes, so it stops being a borrower of its
+	 * parent's address space.  The bookkeeping route is cut NOW -- the
+	 * region table cleared below and the lazy ranges registered further
+	 * down must be this process's own, not the lender's -- but the parent
+	 * is not woken until this CPU has actually left its page tables, after
+	 * mm_switch_address_space() at the end.  `old' is the lender's and is
+	 * left alone.  A failure above this line returned with everything as
+	 * it was, and the child carries on in the borrowed space until it
+	 * exits (vfork_release() runs from exit_mm_self() then). */
+	mm_struct_t *borrowed = NULL;
+
+	if (cur->vfork_mm_owner) {
+		borrowed = cur->mm;
+		cur->mm = NULL;
+		cur->vfork_mm_owner = NULL;
+		old = NULL;
+	}
+
 	/* Allocate a fresh per-process TLS page with a new random canary.
      * Must be done before mm_destroy_address_space(old) frees the old TLS. */
 	setup_user_tls_canary(pml4, cur);
@@ -1095,16 +1114,26 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	}
 
 	mm_switch_address_space(pml4);
-	/* The address space being discarded is the one to invalidate, not the
-	 * one just loaded -- and only on CPUs that still have it.  This CPU has
-	 * already left it on the line above. */
-	if (smp_is_enabled() && old)
-		smp_tlb_shootdown_mm_sync(virt_to_phys(old));
-	else if (smp_is_enabled())
-		smp_tlb_shootdown_sync();
-	if (old) {
-		MM_LEAK_INC(g_as_destroy_exec);
-		mm_destroy_address_space(old);
+	if (borrowed) {
+		/* The space just left is the lender's: still in use, and not
+		 * changed by anything here, so there is nothing to invalidate
+		 * and nothing to destroy.  Drop the reference taken at clone
+		 * (never the last one: the parked thread holds its own) and
+		 * let the parent go. */
+		mm_struct_put(borrowed);
+		vfork_release(cur);
+	} else {
+		/* The address space being discarded is the one to invalidate,
+		 * not the one just loaded -- and only on CPUs that still have
+		 * it.  This CPU has already left it on the line above. */
+		if (smp_is_enabled() && old)
+			smp_tlb_shootdown_mm_sync(virt_to_phys(old));
+		else if (smp_is_enabled())
+			smp_tlb_shootdown_sync();
+		if (old) {
+			MM_LEAK_INC(g_as_destroy_exec);
+			mm_destroy_address_space(old);
+		}
 	}
 
 	*out_stack_ptr = sp;
