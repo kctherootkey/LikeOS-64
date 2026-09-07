@@ -1006,7 +1006,19 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 		uint32_t h = 0;
 		if (drm_fence_handle_create(fp, fence, &h) == 0)
 			rep.handle = h;
-		rep.mask = fence->flags;
+		/* ZERO, as the reference driver leaves it -- not the fence's
+		 * flags.  Mesa's winsys reads `mask' the other way round: on
+		 * every wait and every "has it passed?" it computes
+		 * EXEC & ~mask and treats a result of zero as "nothing left to
+		 * wait for" (vmw_fence.c, vmw_fence_finish/vmw_fence_signalled).
+		 * Reporting EXEC|QUERY here therefore told userspace that every
+		 * fence had passed the moment it was created: no map ever
+		 * waited for its readback (the CPU read the previous frame),
+		 * and every vertex, index, upload and texture buffer was reused
+		 * while the device was still reading it -- the skewed geometry
+		 * and misplaced image strips in the browser, and every wrong
+		 * paint gltile reports. */
+		rep.mask = 0;
 		rep.seqno = fence->seqno;
 		rep.passed_seqno = v->drm.fence_passed;
 		rep.fd = -1;

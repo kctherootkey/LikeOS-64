@@ -156,7 +156,7 @@ fi
 # archives): it replays WebKit's WebGL context creation step by step and
 # prints the first EGL error, which the browser's release build never does.
 for b in glxinfo glxgears glxgears_fbconfig eglinfo eglgears_x11 \
-	es2_info es2gears_x11 es2tri anglecheck; do
+	es2_info es2gears_x11 es2tri anglecheck gltile; do
 	if [ -x "$SYSROOT/usr/bin/$b" ]; then
 		cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 		staged=$((staged + 1))
