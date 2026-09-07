@@ -232,12 +232,12 @@ int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 				struct k_rusage_compat ru;
 				for (size_t i = 0; i < sizeof(ru); i++)
 					((uint8_t *)&ru)[i] = 0;
-				ticks_to_timeval(child->utime_ticks,
-						 &ru.ru_utime_sec,
-						 &ru.ru_utime_usec);
-				ticks_to_timeval(child->stime_ticks,
-						 &ru.ru_stime_sec,
-						 &ru.ru_stime_usec);
+				cputime_to_timeval(child->utime_us,
+						   &ru.ru_utime_sec,
+						   &ru.ru_utime_usec);
+				cputime_to_timeval(child->stime_us,
+						   &ru.ru_stime_sec,
+						   &ru.ru_stime_usec);
 				copy_to_user((void *)rusage_ptr, &ru,
 					     sizeof(ru));
 			}

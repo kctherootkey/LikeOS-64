@@ -16,6 +16,8 @@
 #include <ctype.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <termios.h>
 #include <sys/procinfo.h>
 #include <sys/sysinfo.h>
@@ -30,7 +32,16 @@
 #define MAX_FIELDS 64
 #define MAX_FILTERS 32
 #define PAGE_SIZE 4096
-#define HZ 100
+/* Clock ticks per second of the CPU-time figures the kernel reports, and
+ * the number of processors: both asked for at start-up, never assumed. */
+static long g_hz = 100;
+static long g_ncpu = 1;
+#define HZ g_hz
+/* When the current and the previous listing were taken, in seconds of the
+ * monotonic clock: the real interval, which is what a rate has to be
+ * measured against -- the nominal delay is neither what a round of
+ * collecting and painting takes nor what an interrupted delay lasted. */
+static double g_sample_time = 0.0, g_prev_sample_time = 0.0;
 
 /* ======================================================================
  * Field IDs (the displayable columns)
@@ -627,6 +638,21 @@ static void format_started(uint64_t start_tick, char *buf, size_t bufsz)
  * Process data collection
  * ====================================================================== */
 
+/* Ticks of the reporting clock between the previous listing and this one,
+ * or 0 when the interval is too short to measure a rate over: the kernel
+ * reports hundredths of a second, so under a fifth of a second the figures
+ * would be rounding, not usage.  Callers then keep the previous ones. */
+static double elapsed_sample_ticks(void)
+{
+	double dt = g_sample_time - g_prev_sample_time;
+
+	if (g_prev_sample_time <= 0.0)
+		return 0.0;
+	if (dt < 0.2)
+		return 0.0;
+	return dt * (double)HZ;
+}
+
 static void collect_processes(void)
 {
 	if (!g_raw) {
@@ -656,6 +682,13 @@ static void collect_processes(void)
 	g_prev_nprocs = g_nprocs;
 	g_procs = NULL;
 	g_nprocs = 0;
+	{
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		g_prev_sample_time = g_sample_time;
+		g_sample_time = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+	}
 
 	g_procs = malloc(n * sizeof(proc_entry_t));
 	if (!g_procs) {
@@ -708,16 +741,22 @@ static void collect_processes(void)
 							 prev_total) :
 							0;
 					double elapsed_ticks_d =
-						opt_delay * (double)HZ;
+						elapsed_sample_ticks();
 					if (elapsed_ticks_d > 0.0) {
+						/* Irix mode: a share of ONE
+						 * processor, so a process with
+						 * threads on several can pass
+						 * 100%.  Solaris mode: a share
+						 * of all of them. */
 						pe->pcpu = (double)delta_ticks *
 							   100.0 /
 							   elapsed_ticks_d;
-						if (!opt_irix) {
-							/* Solaris mode: divide by number of CPUs */
-							/* For now use 1 CPU */
-							pe->pcpu /= 1.0;
-						}
+						if (!opt_irix)
+							pe->pcpu /= (double)g_ncpu;
+					} else {
+						/* Interval too short: last
+						 * known figure. */
+						pe->pcpu = g_prev_procs[j].pcpu;
 					}
 					break;
 				}
@@ -1259,12 +1298,17 @@ static void print_summary_cpu(void)
 		return;
 	g_summary_lines++;
 
-	/* Calculate aggregate CPU from all processes */
-	double total_us = 0.0, total_sy = 0.0, total_id = 100.0;
+	/* Calculate aggregate CPU from all processes.  Kept across a
+	 * listing taken too soon after the last to measure a rate over. */
+	static double total_us = 0.0, total_sy = 0.0, total_id = 100.0;
 
 	if (g_prev_procs && g_iteration > 0) {
-		double elapsed_ticks = opt_delay * (double)HZ;
+		/* Over every processor: the line is the machine's share, so a
+		 * tick is worth 100 / (interval * processors) percent. */
+		double elapsed_ticks = elapsed_sample_ticks() * (double)g_ncpu;
 		if (elapsed_ticks > 0.0) {
+			total_us = 0.0;
+			total_sy = 0.0;
 			for (int i = 0; i < g_nprocs; i++) {
 				/* Find in previous */
 				for (int j = 0; j < g_prev_nprocs; j++) {
@@ -1306,10 +1350,10 @@ static void print_summary_cpu(void)
 					}
 				}
 			}
+			total_id = 100.0 - total_us - total_sy;
+			if (total_id < 0.0)
+				total_id = 0.0;
 		}
-		total_id = 100.0 - total_us - total_sy;
-		if (total_id < 0.0)
-			total_id = 0.0;
 	}
 
 	char line[256];
@@ -2602,59 +2646,61 @@ static int parse_options(int argc, char *argv[])
  * a timed wait on stdin read.
  * ====================================================================== */
 
-static volatile int g_alarm_fired = 0;
-
-static void sigalrm_handler(int sig)
+static double mono_seconds(void)
 {
-	(void)sig;
-	g_alarm_fired = 1;
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* Wait `seconds' for a key, and return it, or -1 when the time is up.
+ *
+ * The whole interval is waited out against the monotonic clock: a wait
+ * that ends early -- a signal, a read that returns nothing, a timeout the
+ * system rounds down -- is resumed for the remainder.  Every %CPU figure is
+ * a delta over this interval, and the kernel reports CPU time in hundredths
+ * of a second, so a listing taken a few milliseconds after the last one
+ * shows nothing but rounding: a busy process with twenty threads, each
+ * rounded up to one hundredth, read as thousands of percent. */
 static int interruptible_delay(double seconds)
 {
-	if (opt_batch) {
-		/* In batch mode just sleep */
-		if (seconds >= 1.0) {
+	double deadline = mono_seconds() + seconds;
+
+	for (;;) {
+		double left = deadline - mono_seconds();
+
+		if (left <= 0.0)
+			return -1;
+		if (opt_batch) {
 			struct timespec ts;
-			ts.tv_sec = (time_t)seconds;
-			ts.tv_nsec = (long)((seconds - (double)ts.tv_sec) *
-					    1000000000.0);
+
+			ts.tv_sec = (time_t)left;
+			ts.tv_nsec = (long)((left - (double)ts.tv_sec) * 1e9);
 			nanosleep(&ts, NULL);
-		} else if (seconds > 0.0) {
-			struct timespec ts;
-			ts.tv_sec = 0;
-			ts.tv_nsec = (long)(seconds * 1000000000.0);
-			nanosleep(&ts, NULL);
+			continue;
 		}
-		return -1;
+		fd_set rfds;
+		struct timeval tv;
+
+		FD_ZERO(&rfds);
+		FD_SET(STDIN_FILENO, &rfds);
+		tv.tv_sec = (time_t)left;
+		tv.tv_usec = (long)((left - (double)tv.tv_sec) * 1e6);
+		int r = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+
+		if (r > 0) {
+			unsigned char c;
+			ssize_t n = read(STDIN_FILENO, &c, 1);
+
+			if (n == 1)
+				return (int)c;
+			/* Nothing after all (or end of input): keep waiting. */
+			continue;
+		}
+		if (r < 0 && errno != EINTR)
+			return -1;
 	}
-
-	/* Set up SIGALRM */
-	struct sigaction sa, old_sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = sigalrm_handler;
-	sa.sa_flags = 0;
-	sigaction(SIGALRM, &sa, &old_sa);
-
-	g_alarm_fired = 0;
-
-	/* Set alarm */
-	unsigned int alarm_sec = (unsigned int)seconds;
-	if (alarm_sec < 1)
-		alarm_sec = 1;
-	alarm(alarm_sec);
-
-	/* Block on read - will be interrupted by SIGALRM or actual input */
-	unsigned char c;
-	ssize_t n = read(STDIN_FILENO, &c, 1);
-
-	/* Cancel alarm */
-	alarm(0);
-	sigaction(SIGALRM, &old_sa, NULL);
-
-	if (n == 1)
-		return (int)c;
-	return -1;
 }
 
 /* ======================================================================
@@ -2663,6 +2709,15 @@ static int interruptible_delay(double seconds)
 
 int main(int argc, char *argv[])
 {
+	{
+		long v = sysconf(_SC_CLK_TCK);
+
+		if (v > 0)
+			g_hz = v;
+		v = sysconf(_SC_NPROCESSORS_ONLN);
+		if (v > 0)
+			g_ncpu = v;
+	}
 	/* Parse command line */
 	if (parse_options(argc, argv) < 0)
 		return 1;

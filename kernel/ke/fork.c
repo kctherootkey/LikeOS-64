@@ -1,5 +1,6 @@
 // LikeOS-64 -- fork, clone and vfork.
 #include <kernel/ke/sched.h>
+#include <kernel/ke/timer.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
 #include <kernel/mm/rwsem.h>
@@ -395,6 +396,19 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	child->need_resched = 0;
 	child->remaining_ticks = SCHED_TIME_SLICE;
 	child->preempt_frame = NULL;
+	/* CPU time is per task and starts at zero.  The copy above handed the
+	 * child its creator's lifetime utime/stime, and for a thread that is
+	 * not merely wrong for the thread itself: everything that shows a
+	 * PROCESS sums its threads, so each pthread_create appeared as a
+	 * burst of CPU equal to the creator's whole history, in one sample.
+	 * The web process creates threads continually with a main thread
+	 * carrying seconds of CPU, and top reported it at 8000% on six
+	 * processors for one refresh -- more CPU than the machine has.
+	 * Same for the start time: a thread starts now, not when its creator
+	 * did. */
+	child->start_tick = timer_ticks();
+	child->utime_us = 0;
+	child->stime_us = 0;
 	child->exit_code = 0;
 	child->has_exited = false;
 	child->exit_lock = 0;

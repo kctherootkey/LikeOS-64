@@ -520,6 +520,15 @@ uint64_t timer_us_to_ticks(uint64_t us)
 	return secs * freq + (frac * freq + 999999ULL) / 1000000ULL;
 }
 
+uint64_t timer_ticks_to_user_hz(uint64_t ticks)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+
+	if (freq == 100)
+		return ticks;
+	return ticks * 100ULL / freq;
+}
+
 uint64_t timer_ms_to_ticks(uint64_t ms)
 {
 	uint64_t freq = g_frequency ? g_frequency : 100;
@@ -1159,7 +1168,7 @@ uint64_t timer_ticks(void)
 	return g_ticks;
 }
 
-void timer_irq_handler(void)
+void timer_irq_handler(int from_user)
 {
 	// Determine if we're on BSP or AP
 	// Only BSP (CPU 0) manages global tick counter and task wakeups.
@@ -1169,6 +1178,11 @@ void timer_irq_handler(void)
 	if (sched_is_smp()) {
 		is_bsp = (this_cpu_id() == 0);
 	}
+	/* The clock, read once per interrupt: the boot CPU resynchronises the
+	 * tick counter to it, and every CPU charges CPU time from it.  Read
+	 * before the boot CPU's seqlock write window below opens -- the
+	 * PM-timer arm of this reads that seqlock. */
+	uint64_t now_us = timer_get_precise_us();
 
 	if (is_bsp) {
 		/* What the tick counter SHOULD read, from the free-running
@@ -1197,8 +1211,7 @@ void timer_irq_handler(void)
 		 * advances on machines where the clock cannot say (very early
 		 * boot, when the fallback is itself derived from g_ticks and
 		 * the resync is an exact no-op). */
-		uint64_t want_ticks = timer_get_precise_us() *
-				      (uint64_t)g_frequency / 1000000ULL;
+		uint64_t want_ticks = now_us * (uint64_t)g_frequency / 1000000ULL;
 
 		/* Seqlock write: odd = updating, even = stable */
 		WARN_ON_ONCE(
@@ -1285,16 +1298,48 @@ void timer_irq_handler(void)
 			if (cur == cpu->idle_task)
 				skip = 1;
 		}
-		if (!skip) {
-			if (cur->privilege == TASK_USER) {
-				if (cur->preempt_frame &&
-				    (cur->preempt_frame->cs & 3) == 3)
-					cur->utime_ticks++;
-				else
-					cur->stime_ticks++;
-			} else {
-				cur->stime_ticks++;
-			}
+		/* Charge the REAL time since this CPU's previous interrupt,
+		 * not "one tick".  The boot CPU runs at the rate its timer was
+		 * calibrated to and the others at whatever their LAPIC timers
+		 * were programmed for, and the two differ by an integer
+		 * factor on a virtual machine -- counted as ticks and divided
+		 * by one rate, a busy process on the other CPUs showed twenty
+		 * times its real share (12000% on six processors).  Measured,
+		 * the rates cancel out.
+		 *
+		 * The interval is bounded: after a long stall (the hypervisor
+		 * descheduling this CPU, or the first interrupt after boot)
+		 * the whole gap would otherwise be charged to whoever happens
+		 * to be running now. */
+		static uint64_t boot_last_us; /* before the per-CPU area exists */
+		uint64_t *last_us = sched_is_smp() ? &this_cpu()->acct_last_us :
+						     &boot_last_us;
+		uint64_t delta_us = *last_us ? now_us - *last_us : 0;
+
+		*last_us = now_us;
+		if (delta_us > 1000000ULL)
+			delta_us = 1000000ULL;
+		/* Only a task on THIS processor consumes its time.  The
+		 * current-task pointer can still name one that was pulled to
+		 * another processor and runs there now; charging it here as
+		 * well would count the same interval twice.  A task that has
+		 * marked itself blocked but not been switched away from yet
+		 * is still executing here -- in the scheduler, or spinning in
+		 * a wait -- and that is its system time. */
+		if (!skip && sched_is_smp() && cur->on_cpu != this_cpu_id())
+			skip = 1;
+		if (!skip && delta_us) {
+			/* What the interrupt landed in is on the interrupt
+			 * frame the caller read for us.  The task's
+			 * preempt_frame cannot answer this: it is published on
+			 * the way OUT of an interrupt and cleared on resume, so
+			 * here it is NULL for a task running in user mode --
+			 * which charged every user tick to system time and
+			 * left `us' at zero in top for as long as it existed. */
+			if (cur->privilege == TASK_USER && from_user)
+				cur->utime_us += delta_us;
+			else
+				cur->stime_us += delta_us;
 		}
 
 		if (cur->remaining_ticks > 0) {

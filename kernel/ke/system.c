@@ -355,9 +355,14 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 		else
 			p->tty_nr = t->ctty->id;
 		p->is_kernel = (t->privilege == TASK_KERNEL) ? 1 : 0;
-		p->start_tick = t->start_tick;
-		p->utime_ticks = t->utime_ticks;
-		p->stime_ticks = t->stime_ticks;
+		/* In sysconf(_SC_CLK_TCK) units -- 100 Hz -- not the timer's
+		 * own ticks.  The timer is calibrated to whatever rate the
+		 * machine really delivers (several hundred Hz on a VM), and a
+		 * listing that divided raw ticks by 100 showed a process at
+		 * many times its real CPU share: 6000% on six processors. */
+		p->start_tick = timer_ticks_to_user_hz(t->start_tick);
+		p->utime_ticks = timer_us_to_user_hz(t->utime_us);
+		p->stime_ticks = timer_us_to_user_hz(t->stime_us);
 		/* Only meaningful while the task is actually asleep; a running
 		 * task's last blocking site would be a stale answer.  Withheld
 		 * from callers who may not read the process: it is a kernel

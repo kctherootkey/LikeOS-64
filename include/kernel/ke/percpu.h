@@ -101,6 +101,10 @@ struct percpu {
 	// Nested interrupt count
 	volatile int interrupt_nesting;
 
+	// When this CPU's timer last charged CPU time (timer_get_precise_us);
+	// 0 until the first tick.  See timer_irq_handler().
+	uint64_t acct_last_us;
+
 	// Need reschedule flag
 	volatile int need_resched;
 

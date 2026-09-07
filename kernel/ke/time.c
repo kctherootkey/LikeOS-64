@@ -59,14 +59,11 @@ int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz)
 	return 0;
 }
 
-// Ticks -> seconds and microseconds, at whatever rate the timer is running.
-void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec)
+// A CPU time (microseconds, see utime_us) -> seconds and microseconds.
+void cputime_to_timeval(uint64_t us, int64_t *sec, int64_t *usec)
 {
-	uint32_t freq = timer_get_frequency();
-	if (freq == 0)
-		freq = 100;
-	*sec = (int64_t)(ticks / freq);
-	*usec = (int64_t)((ticks % freq) * (1000000 / freq));
+	*sec = (int64_t)(us / 1000000ULL);
+	*usec = (int64_t)(us % 1000000ULL);
 }
 
 // Forward declaration for signal functions
@@ -404,13 +401,10 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 			task_t *t = sched_find_task_by_id(tid);
 			if (!t)
 				return -EINVAL;
-			uint64_t ticks = t->utime_ticks + t->stime_ticks;
-			uint64_t hz = timer_get_frequency();
-			if (hz == 0)
-				hz = 100;
-			tp.tv_sec = ticks / hz;
-			tp.tv_nsec = (long)((ticks % hz) *
-					    (1000000000ULL / hz));
+			uint64_t us = t->utime_us + t->stime_us;
+
+			tp.tv_sec = us / 1000000ULL;
+			tp.tv_nsec = (long)((us % 1000000ULL) * 1000ULL);
 			break;
 		}
 		return -EINVAL;
@@ -428,14 +422,10 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 		// single-threaded process the two agree exactly.
 		{
 			task_t *cur = sched_current();
-			uint64_t ticks =
-				cur ? cur->utime_ticks + cur->stime_ticks : 0;
-			uint32_t freq = timer_get_frequency();
-			if (freq == 0)
-				freq = 100;
-			tp.tv_sec = (int64_t)(ticks / freq);
-			tp.tv_nsec = (int64_t)((ticks % freq) *
-					       (1000000000ULL / freq));
+			uint64_t us = cur ? cur->utime_us + cur->stime_us : 0;
+
+			tp.tv_sec = (int64_t)(us / 1000000ULL);
+			tp.tv_nsec = (int64_t)((us % 1000000ULL) * 1000ULL);
 		}
 		break;
 	}

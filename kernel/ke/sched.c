@@ -1537,8 +1537,8 @@ static void task_init_common(task_t *t)
 	t->cmdline[0] = '\0';
 	t->environ[0] = '\0';
 	t->start_tick = timer_ticks();
-	t->utime_ticks = 0;
-	t->stime_ticks = 0;
+	t->utime_us = 0;
+	t->stime_us = 0;
 	t->cwd[0] = '/';
 	t->cwd[1] = 0;
 	// Credentials policy (mirrors the conventional inheritance model):
@@ -3358,8 +3358,8 @@ task_t *sched_fork_current(void)
 	child->remaining_ticks = SCHED_TIME_SLICE;
 	child->preempt_frame = NULL;
 	child->start_tick = timer_ticks();
-	child->utime_ticks = 0;
-	child->stime_ticks = 0;
+	child->utime_us = 0;
+	child->stime_us = 0;
 
 	// Thread group: fork creates a new process (new thread group)
 	thread_group_init(child);

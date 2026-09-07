@@ -825,8 +825,12 @@ typedef struct task {
 
 	// Timing / accounting
 	uint64_t start_tick; // Tick count when task was created
-	uint64_t utime_ticks; // Ticks spent in user mode
-	uint64_t stime_ticks; // Ticks spent in kernel mode
+	/* CPU time in MICROSECONDS, measured: each timer interrupt charges the
+	 * real time since the previous interrupt on that CPU to whatever it
+	 * interrupted.  Not ticks -- the boot CPU and the others run their
+	 * timers at different, calibrated rates, so a tick is not a unit. */
+	uint64_t utime_us; // Time spent in user mode
+	uint64_t stime_us; // Time spent in kernel mode
 
 	// Current working directory
 	char cwd[256];

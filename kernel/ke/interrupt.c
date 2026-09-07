@@ -2201,7 +2201,7 @@ void irq_handler(uint64_t *regs)
 	case 32: {
 		g_irq0_count++;
 
-		timer_irq_handler();
+		timer_irq_handler((regs[REGS_CS] & 3) == 3);
 		net_timer_tick();
 		// Send EOI before preemption to avoid missing ticks
 		pic_send_eoi(irq);

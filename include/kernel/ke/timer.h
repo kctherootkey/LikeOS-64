@@ -31,7 +31,19 @@ uint64_t timer_s_to_ticks(uint64_t secs);
 uint64_t timer_ticks_to_s(uint64_t ticks); /* inverse, truncating */
 uint64_t timer_us_per_tick(void); /* for durations already counted in ticks */
 void timer_calibrate_frequency(void);
-void timer_irq_handler(void);
+/* `from_user' says what the tick interrupted: user mode (1) or the kernel
+ * (0), read off the interrupt frame by the caller.  It decides whether the
+ * tick is charged to the task's user or system time. */
+void timer_irq_handler(int from_user);
+/* Convert a count of the boot CPU's ticks -- whatever rate its timer was
+ * calibrated to -- into the 100 Hz clock ticks userspace is told about
+ * (sysconf(_SC_CLK_TCK)).  For start times, which are tick counts. */
+uint64_t timer_ticks_to_user_hz(uint64_t ticks);
+/* The same for a CPU time in microseconds (utime_us / stime_us). */
+static inline uint64_t timer_us_to_user_hz(uint64_t us)
+{
+	return us / 10000ULL;
+}
 uint64_t timer_get_uptime(void); // seconds since boot
 uint64_t timer_get_boot_epoch(void); // Unix epoch at boot time
 void timer_set_boot_epoch(
@@ -59,6 +71,6 @@ static inline uint64_t timer_rdtsc(void)
 
 /* Shared with the syscall layer split out of ke/syscall.c. */
 struct task;
-void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec);
+void cputime_to_timeval(uint64_t us, int64_t *sec, int64_t *usec);
 
 #endif // _KERNEL_TIMER_H_

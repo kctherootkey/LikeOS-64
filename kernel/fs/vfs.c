@@ -1189,64 +1189,50 @@ long vfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	unsigned char *out = (unsigned char *)buf;
 	long total = 0;
 
-	// If this is the root directory and we haven't injected /dev yet, inject it first
+	/* The root directory lists what is not on the root filesystem as
+	 * well: the mount points (/proc, /sys, ...) and /dev.  Injected once
+	 * per open, ahead of the filesystem's own entries.
+	 *
+	 * Each record is laid out exactly as ext4_readdir_impl() lays out its
+	 * own -- the name at d_name, byte 19, and d_reclen = 19 + name + NUL
+	 * rounded up to 8 -- because that is where every reader takes the
+	 * name from.  These used to copy the name after sizeof(struct
+	 * dirent64), which is 24 with the flexible member padded, so byte 19
+	 * held a zero and every mount point listed as a nameless directory.
+	 * find joined "/" and "" into "/", recursed into the root again at
+	 * every level, printed "/" each time and overflowed its stack. */
 	if (f->is_root_dir && !f->dev_injected && g_dev_ops) {
-		/* The other mount points (/sys, /proc) first: they are not
-		 * on the root filesystem either. */
-		for (int mi = 0;; mi++) {
+		for (int mi = -1;; mi++) {
 			const char *mn;
-			if (!vfs_mount_name(mi, &mn))
+
+			if (mi < 0) {
+				mn = "dev";
+			} else if (!vfs_mount_name(mi, &mn)) {
 				break;
+			}
 			unsigned nl = 0;
 			while (mn[nl])
 				nl++;
-			unsigned short rl = (unsigned short)(sizeof(struct dirent64) + nl + 1);
-			rl = (rl + 7) & ~7;
+			unsigned short rl = (unsigned short)((19 + nl + 1 + 7) & ~7u);
 			if (bytes < rl)
 				break;
-			struct dirent64 ment;
-			mm_memset(&ment, 0, sizeof(ment));
-			ment.d_ino = 3 + (uint64_t)mi;
-			ment.d_off = rl;
-			ment.d_reclen = rl;
-			ment.d_type = DT_DIR;
+			uint8_t rec[24 + 256];
+			struct dirent64 *e = (struct dirent64 *)rec;
+
+			mm_memset(rec, 0, sizeof(rec));
+			e->d_ino = mi < 0 ? 2 : 3 + (uint64_t)mi;
+			e->d_off = rl;
+			e->d_reclen = rl;
+			e->d_type = DT_DIR;
+			mm_memcpy(e->d_name, mn, nl + 1);
 			smap_disable();
-			mm_memcpy(out, &ment, sizeof(ment));
-			mm_memcpy(out + sizeof(ment), mn, nl + 1);
+			mm_memcpy(out, rec, rl);
 			smap_enable();
 			out += rl;
 			bytes -= rl;
 			total += rl;
 		}
-		// Calculate size for "dev" entry
-		unsigned short reclen =
-			(unsigned short)(sizeof(struct dirent64) +
-					 4); // "dev" + null
-		reclen = (reclen + 7) & ~7; // Align to 8 bytes
-		WARN_ON(reclen % 8 != 0);
-
-		if (bytes >= reclen) {
-			// Build entry in kernel buffer first, then copy to user
-			struct dirent64 ent;
-			ent.d_ino = 2; // Fake inode for /dev
-			ent.d_off = reclen;
-			ent.d_reclen = reclen;
-			ent.d_type = DT_DIR;
-			ent.d_name[0] = 'd';
-			ent.d_name[1] = 'e';
-			ent.d_name[2] = 'v';
-			ent.d_name[3] = '\0';
-
-			// SMAP-aware copy to user buffer
-			smap_disable();
-			mm_memcpy(out, &ent, sizeof(ent));
-			smap_enable();
-
-			out += reclen;
-			bytes -= reclen;
-			total += reclen;
-			f->dev_injected = 1;
-		}
+		f->dev_injected = 1;
 	}
 
 	// Now get remaining entries from underlying FS

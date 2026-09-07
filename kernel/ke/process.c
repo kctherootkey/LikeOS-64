@@ -142,10 +142,10 @@ int64_t sys_getpgid(uint64_t pid)
 
 // POSIX getrusage(2) - resource usage.
 //
-// The CPU times are real: the timer tick charges every task to utime_ticks or
-// stime_ticks depending on the privilege level it interrupted (see
-// timer_handle_tick), so the accounting already exists and only needs
-// reporting.  wait4() has been reporting a dead child's times from the same
+// The CPU times are real: every timer interrupt charges the time since the
+// previous one on that CPU to utime_us or stime_us of the task it interrupted,
+// by the privilege level it interrupted (see timer_irq_handler), so the
+// accounting already exists and only needs reporting.  wait4() has been reporting a dead child's times from the same
 // counters all along; this is the same conversion for a live process.
 //
 // Resolution is one timer tick, so a process that has run for less than a tick
@@ -196,10 +196,10 @@ int64_t sys_getrusage(uint64_t who, uint64_t uptr)
 	switch ((int)(int32_t)who) {
 	case K_RUSAGE_SELF:
 		if (cur) {
-			ticks_to_timeval(cur->utime_ticks, &ru.ru_utime_sec,
-					 &ru.ru_utime_usec);
-			ticks_to_timeval(cur->stime_ticks, &ru.ru_stime_sec,
-					 &ru.ru_stime_usec);
+			cputime_to_timeval(cur->utime_us, &ru.ru_utime_sec,
+					   &ru.ru_utime_usec);
+			cputime_to_timeval(cur->stime_us, &ru.ru_stime_sec,
+					   &ru.ru_stime_usec);
 		}
 		break;
 	case K_RUSAGE_CHILDREN:

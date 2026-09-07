@@ -105,14 +105,16 @@ static long show_stat(struct pfs_node *n, char *buf, long cap)
 
 	if (!t)
 		return 0;
-	uint64_t hz = timer_get_frequency();
+	/* utime, stime and starttime in clock ticks of sysconf(_SC_CLK_TCK),
+	 * as the format specifies -- not the timer's calibrated ticks. */
 	return pfs_printf(buf, cap, 0,
 			  "%d (%s) %s %d %d %d 0 -1 0 0 0 0 0 %llu %llu 0 0 20 0 %d 0 %llu 0 0\n",
 			  t->id, t->comm, state_letter(t), sched_get_ppid(t),
-			  t->pgid, t->sid, (unsigned long long)t->utime_ticks,
-			  (unsigned long long)t->stime_ticks,
+			  t->pgid, t->sid,
+			  (unsigned long long)timer_us_to_user_hz(t->utime_us),
+			  (unsigned long long)timer_us_to_user_hz(t->stime_us),
 			  t->group_leader ? t->group_leader->nr_threads : 1,
-			  (unsigned long long)(t->start_tick / (hz ? hz : 100)));
+			  (unsigned long long)timer_ticks_to_user_hz(t->start_tick));
 }
 
 static long show_status(struct pfs_node *n, char *buf, long cap)
