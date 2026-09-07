@@ -464,8 +464,16 @@ ctx_switch_asm:
     push r14
     push r15
 
-    mov [rdi], rsp
+    ; Leave the old stack BEFORE publishing where it was left.  The
+    ; reaper (sched_remove_task) treats a published sp as "this task is
+    ; off its stack and may be freed"; with the store first there was one
+    ; instruction -- with interrupts enabled -- during which the stack was
+    ; both published and still in use, and an IRQ taken there ran on a
+    ; stack another CPU was free to release.  Seen as a double fault with
+    ; RIP=0 on a freshly zeroed stack page.  rax is caller-saved.
+    mov rax, rsp
     mov rsp, rsi
+    mov [rdi], rax
 
     pop r15
     pop r14

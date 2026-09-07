@@ -9,6 +9,8 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 
+extern void poll_notify_wq(struct wait_queue_head *);
+
 bool pipe_is_end(const void *ptr)
 {
 	if (!ptr) {
@@ -164,8 +166,13 @@ void pipe_close_end(pipe_end_t *end)
 
 		spin_unlock_irqrestore(&pipe->lock, flags);
 
-		// Wake up waiters outside the lock
+		// Wake up waiters outside the lock: readers/writers parked on
+		// the pipe itself, and pollers, for whom the last writer
+		// leaving is POLLHUP and the last reader leaving is POLLERR.
+		// The pollers used to learn this from poll's per-tick re-scan,
+		// which no longer happens.
 		sched_wake_channel(pipe);
+		poll_notify_wq(&pipe->poll_wq);
 
 		if (should_free) {
 			if (pipe->buffer) {

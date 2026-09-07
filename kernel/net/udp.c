@@ -7,6 +7,8 @@
 #include <kernel/net/stats.h>
 #include <kernel/uapi/bug.h>
 
+extern void poll_notify_wq(struct wait_queue_head *);
+
 // UDP pseudo-header for checksum
 typedef struct __attribute__((packed)) {
 	uint32_t src_addr;
@@ -283,4 +285,8 @@ void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port, uint32_t dst_ip,
 	 * closes the set-vs-park race.  Done after dropping sk->lock — the
 	 * waker path takes scheduler locks. */
 	sched_wake_channel((void *)&sk->udp_rx_ready);
+	/* And whoever is multiplexing on the socket.  Only the recvfrom()
+	 * channel was woken here; a poll()/select() waiter learned about the
+	 * datagram from the per-tick re-scan that poll no longer does. */
+	poll_notify_wq(&sk->poll_wq);
 }

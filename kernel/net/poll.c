@@ -92,6 +92,12 @@ struct poll_table {
 	void **held;
 	int n;   /* entries in use */
 	int cap; /* 0 when the allocation failed -- see poll_wait() */
+	/* Set when a registration was refused (no table, table full, object
+	 * already gone).  A poller that is not on every queue it asked about
+	 * cannot be woken by all of them, so the sleep falls back to the
+	 * one-tick re-scan for that iteration instead of sleeping until a
+	 * wake that may never come. */
+	int unregistered;
 };
 
 static void poll_table_init(struct poll_table *pt, int cap)
@@ -101,6 +107,7 @@ static void poll_table_init(struct poll_table *pt, int cap)
 	pt->held = NULL;
 	pt->n = 0;
 	pt->cap = 0;
+	pt->unregistered = 0;
 	if (cap <= 0)
 		return;
 	pt->heads = kalloc((size_t)cap * sizeof(*pt->heads));
@@ -133,6 +140,7 @@ static void poll_table_reset(struct poll_table *pt)
 		pt->held[i] = NULL;
 	}
 	pt->n = 0;
+	pt->unregistered = 0;
 }
 
 static void poll_table_free(struct poll_table *pt)
@@ -163,8 +171,12 @@ void poll_wait(struct poll_table *pt, void *owner, struct wait_queue_head *h)
 {
 	task_t *cur;
 
-	if (!pt || !h || pt->n >= pt->cap)
+	if (!pt || !h)
 		return;
+	if (pt->n >= pt->cap) {
+		pt->unregistered = 1;
+		return;
+	}
 	cur = sched_current();
 	if (!cur)
 		return;
@@ -172,8 +184,10 @@ void poll_wait(struct poll_table *pt, void *owner, struct wait_queue_head *h)
 	 * linked, an unreferenced owner can be freed with this entry still on
 	 * it.  A refused hold means the object is already gone, so there is
 	 * nothing to register on. */
-	if (owner && !fdhold((vfs_file_t *)owner))
+	if (owner && !fdhold((vfs_file_t *)owner)) {
+		pt->unregistered = 1;
 		return;
+	}
 	wq_entry_init(&pt->ents[pt->n], cur);
 	pt->held[pt->n] = owner;
 	wq_add(h, &pt->ents[pt->n]);
@@ -206,17 +220,31 @@ void poll_notify_io_ready(void)
 	__atomic_fetch_add(&g_poll_io_seq, 1, __ATOMIC_RELEASE);
 }
 
-// Block the calling task until an I/O event fires or `deadline` is reached
-// (whichever comes first).  Used by select/poll/epoll_wait between scan
-// iterations to avoid busy-spinning while waiting on fds that are not yet
-// ready.  Previously this slept for exactly one timer tick (up to 10 ms),
-// which caused visible typing lag in programs like nc and openssl that use
-// poll() to multiplex stdin and a TCP socket: keystrokes fired tty_wake_readers
-// but the poll task had no wait_channel set, so it slept the full tick before
-// noticing that stdin was ready.  Now the task parks on g_poll_io_ready so any
-// I/O producer can wake it instantly.
+// Block the calling task until one of the wait queues it registered on
+// during the scan (poll_wait) is notified, or `deadline` is reached.  Used by
+// select/poll/epoll_wait between scan iterations.
+//
+// Until 2026-09 this ALSO armed `wakeup_tick = now + 1' on every call, so a
+// task parked in poll()/select()/epoll_wait() woke on every timer tick,
+// re-scanned every descriptor, found nothing and went back to sleep.  That
+// was a safety net from the days when readiness producers had no queue to
+// wake; every one of them now calls poll_notify_wq() on the object's own
+// queue, and the sequence check below closes the scan-then-park race, so the
+// periodic re-scan carried no events -- only cost.  The cost scaled with the
+// number of multiplexing THREADS on the machine, not with I/O: one heavy
+// browser tab holds 150-200 GLib main loops, which at 100 Hz meant 20,000
+// wakeups, descriptor re-scans and context switches per second, plus several
+// full task-list walks per tick in sched_wake_expired_sleepers() to hand them
+// out.  Seen as ~60% total CPU on an 8-processor machine with the page idle.
+//
+// A poller with no deadline now sleeps until it is woken (`wakeup_tick = 0');
+// signals still break the wait because the sleeper sweep checks
+// signal_pending() regardless of the deadline.  The one-tick re-scan is kept
+// only for a poller that could not register on every object it asked about
+// (pt->unregistered), since nothing else can be relied on to wake that one.
 static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
-				       int have_deadline, uint64_t seq_before)
+				       int have_deadline, uint64_t seq_before,
+				       const struct poll_table *pt)
 {
 	task_t *cur = sched_current();
 	if (!cur) {
@@ -224,11 +252,12 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 		return;
 	}
 	uint64_t now = timer_ticks();
-	uint64_t wake = now + 1;
-	if (have_deadline && deadline_ticks < wake) {
+	uint64_t wake = 0; /* no deadline: sleep until notified */
+	if (!pt || pt->unregistered)
+		wake = now + 1; /* fallback: re-scan next tick */
+	if (have_deadline && (wake == 0 || deadline_ticks < wake))
 		wake = deadline_ticks;
-	}
-	if (wake <= now) {
+	if (wake != 0 && wake <= now) {
 		__asm__ volatile("pause");
 		return;
 	}
@@ -625,7 +654,7 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 
 		poll_sleep_until_next_tick(deadline,
 					   timeout_ticks != (uint64_t)-1,
-					   seq_before);
+					   seq_before, pt);
 	}
 }
 
@@ -717,7 +746,7 @@ static int sys_poll_locked(struct pollfd *fds, int nfds,
 
 		poll_sleep_until_next_tick(deadline,
 					   timeout_ticks != (uint64_t)-1,
-					   seq_before);
+					   seq_before, pt);
 	}
 }
 
@@ -1008,7 +1037,7 @@ static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
 
 		poll_sleep_until_next_tick(deadline,
 					   timeout_ticks != (uint64_t)-1,
-					   seq_before);
+					   seq_before, pt);
 	}
 }
 

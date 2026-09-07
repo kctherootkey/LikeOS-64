@@ -2955,8 +2955,29 @@ void sched_remove_task(task_t *task)
 				}
 			}
 
-			if (running_on == (uint32_t)-1) {
-				break; // Task is not running on any CPU
+			/* `current_task' alone is not enough.  sched_schedule()
+			 * re-points it at the NEXT task, then keeps running on
+			 * the old task's stack with interrupts enabled -- FPU
+			 * save, debug registers, any IRQ that lands -- until
+			 * ctx_switch_asm finally moves RSP.  A dying task in
+			 * that window is nobody's current_task, and this used
+			 * to free its stack out from under it: the exiting
+			 * task's parent had already put it on the dead list
+			 * (sched_defer_reap from waitpid), in_exit_path had
+			 * just been cleared, and the reaper on an idle CPU
+			 * released the stack while CPU0 was still on it.  The
+			 * fault was a double fault at RIP=0 with RSP inside a
+			 * zeroed kernel-stack page and current == idle/0,
+			 * "ps aux" exiting while luakit was busy.
+			 *
+			 * `sp' is the reliable signal: the dispatcher zeroes it
+			 * when a task starts running and ctx_switch_asm
+			 * publishes it only once RSP has left that stack.
+			 * sp == 0 means "on a stack somewhere, or still
+			 * switching off one" -- wait for it either way. */
+			if (running_on == (uint32_t)-1 &&
+			    __atomic_load_n(&task->sp, __ATOMIC_ACQUIRE) != 0) {
+				break; // Off every CPU and off its stack
 			}
 
 			// Task is still running — nudge ONLY the CPU it is on.
@@ -2964,7 +2985,8 @@ void sched_remove_task(task_t *task)
 			// CPU on every retry, an IPI storm that dominated the
 			// spin's cost (each IPI to a HLT-parked vCPU is
 			// expensive under virtualization).
-			smp_send_reschedule(running_on);
+			if (running_on != (uint32_t)-1)
+				smp_send_reschedule(running_on);
 
 			// Brief pause to let the other CPU context switch
 			for (volatile int i = 0; i < 1000; i++) {
@@ -3658,10 +3680,11 @@ int sched_wake_channel_once(void *channel, int max)
  * That is what the previous version did.  It claimed at most 16 tasks per
  * tick, in one pass, always walking from the head of the list, and its comment
  * argued the overflow was harmless because "the next tick wakes them".  That
- * holds only if the set of expired tasks drains.  It does not: every task
- * parked in poll()/select()/epoll_wait() re-arms `wakeup_tick = now + 1' on
- * every iteration, so each is expired again on the very next tick, and each
- * sits at the same place in the list.  Past roughly sixteen multiplexing
+ * holds only if the set of expired tasks drains.  It did not: every task
+ * parked in poll()/select()/epoll_wait() used to re-arm `wakeup_tick = now +
+ * 1' on every iteration (poll now sleeps until notified or until its real
+ * deadline, but a timed poll still expires here), so each was expired again
+ * on the very next tick, and each sat at the same place in the list.  Past roughly sixteen multiplexing
  * threads -- one browser tab is thirty-five -- the budget is spent before the
  * walk ever reaches the tail, every tick, for ever.  Everything after the
  * cutoff keeps its armed deadline and is never woken by it again.

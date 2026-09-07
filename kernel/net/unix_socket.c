@@ -530,21 +530,26 @@ int unix_accept(unix_socket_t *us, struct sockaddr_un *addr, socklen_t *addrlen,
 	if (!us->listening)
 		return -EINVAL;
 
-	// Wait for incoming connection.  Re-fetch the queue indices each
+	// Wait for an incoming connection.  Re-fetch the queue indices each
 	// iteration via volatile reads so the compiler can't hoist them out
-	// of the loop, and bail if the listener was closed under us.  We
-	// MUST yield rather than just pause: in the common case the task
-	// that will enqueue (a forked child running unix_connect) is on the
-	// same CPU as the listener, and a tight pause loop here will starve
-	// it forever — the test hangs with parent on accept and no child
-	// visible because the child never gets CPU.
+	// of the loop, and bail if the listener was closed under us.
+	//
+	// The wait PARKS on the listener: unix_connect() publishes a
+	// connection under us->lock and then sched_wake_channel(listener),
+	// and unix_close() wakes the same channel after marking the socket
+	// closed.  This used to be a sched_yield_in_kernel() loop, which
+	// kept a blocked accept() runnable for ever -- luakit has a thread
+	// that sits in accept() for the life of the browser, and it showed
+	// up as a permanently READY task taking a run-queue slot and a
+	// context switch on every pass through the scheduler.
 	task_t *acc_cur = sched_current();
 	for (;;) {
 		int h = *(volatile int *)&us->accept_head;
 		int t = *(volatile int *)&us->accept_tail;
 		if (h != t)
 			break;
-		if (!*(volatile int *)&us->active)
+		if (!*(volatile int *)&us->active ||
+		    *(volatile int *)&us->closed)
 			return -EBADF;
 		if (us->nonblock)
 			return -EAGAIN;
@@ -553,7 +558,25 @@ int unix_accept(unix_socket_t *us, struct sockaddr_un *addr, socklen_t *addrlen,
 		 * before connecting (previously an unkillable forever-wait). */
 		if (acc_cur && signal_pending(acc_cur))
 			return -EINTR;
-		sched_yield_in_kernel();
+		if (!acc_cur) {
+			sched_yield_in_kernel();
+			continue;
+		}
+		/* Re-test under the lock: a connection published between the
+		 * check above and here would otherwise be slept through --
+		 * same idiom as the recv path. */
+		uint64_t pf;
+		spin_lock_irqsave(&us->lock, &pf);
+		if (us->accept_head == us->accept_tail && us->active &&
+		    !us->closed) {
+			acc_cur->wait_channel = us;
+			acc_cur->state = TASK_BLOCKED;
+			spin_unlock_irqrestore(&us->lock, pf);
+			sched_schedule();
+			acc_cur->wait_channel = NULL;
+		} else {
+			spin_unlock_irqrestore(&us->lock, pf);
+		}
 	}
 
 	uint64_t flags;
