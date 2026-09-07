@@ -34,6 +34,16 @@ EGL -- it is asked about GLX -- and GLX_EXT_texture_from_pixmap is not
 offered there, so gdkgl.c's generic texture upload takes over for cairo
 surfaces.
 
+The cairo half of a GL paint -- everything in the window that is not itself
+GL -- is composited into the back buffer by that generic upload, which maps
+the paint surface.  Under GLX the paint surface is an X pixmap that
+texture-from-pixmap binds without a copy; under EGL an X pixmap would cost a
+round trip to the server for every rectangle of every frame (XShmGetImage of
+a pixmap the server rendered on the same device, and the data written
+straight back on unmap), so an EGL context asks for a memory surface, which
+is what the upload was written for and what the Wayland backend paints into
+(gdk_gl_context_set_image_paint_surface).
+
 --- a/gdk/gdkinternals.h
 +++ b/gdk/gdkinternals.h
 @@ -101,7 +101,10 @@
@@ -973,17 +983,30 @@ surfaces.
  static gboolean
  gdk_x11_gl_context_realize (GdkGLContext  *context,
                              GError       **error)
-@@ -639,6 +1457,9 @@
+@@ -639,6 +1457,21 @@
    display_x11 = GDK_X11_DISPLAY (display);
    share = gdk_gl_context_get_shared_context (context);
- 
+
 +  if (display_x11->have_egl)
-+    return gdk_x11_gl_context_realize_egl (context, error);
++    {
++      if (!gdk_x11_gl_context_realize_egl (context, error))
++        return FALSE;
++      /* What GDK draws with cairo during a GL paint is uploaded from the
++       * paint surface by gdkgl.c's generic path, texture-from-pixmap being
++       * GLX's.  That upload maps the surface, and an X pixmap answers a
++       * map with a round trip to the server for every rectangle of every
++       * frame -- XShmGetImage of a pixmap the server rendered on the same
++       * device, and the data written straight back on unmap.  A memory
++       * surface is what the upload was written for, and what the Wayland
++       * backend paints into. */
++      gdk_gl_context_set_image_paint_surface (context, TRUE);
++      return TRUE;
++    }
 +
    gdk_gl_context_get_required_version (context, &major, &minor);
    debug_bit = gdk_gl_context_get_debug_enabled (context);
    compat_bit = gdk_gl_context_get_forward_compatible (context);
-@@ -807,6 +1628,21 @@
+@@ -807,6 +1640,21 @@
  {
    GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (gobject);
  
@@ -1005,7 +1028,7 @@ surfaces.
    if (context_x11->glx_context != NULL)
      {
        GdkGLContext *context = GDK_GL_CONTEXT (gobject);
-@@ -841,6 +1677,7 @@
+@@ -841,6 +1689,7 @@
  gdk_x11_gl_context_init (GdkX11GLContext *self)
  {
    self->do_frame_sync = TRUE;
@@ -1013,7 +1036,7 @@ surfaces.
  }
  
  gboolean
-@@ -852,12 +1689,16 @@
+@@ -852,12 +1701,16 @@
    int error_base, event_base;
    int screen_num;
  
@@ -1031,7 +1054,7 @@ surfaces.
    dpy = gdk_x11_display_get_xdisplay (display);
  
    if (!epoxy_has_glx (dpy))
-@@ -1120,7 +1961,7 @@
+@@ -1120,7 +1973,7 @@
  }
  
  static gboolean
@@ -1040,7 +1063,7 @@ surfaces.
  {
    gboolean found;
    Atom type_return;
-@@ -1136,7 +1977,7 @@
+@@ -1136,7 +1989,7 @@
  
    gdk_x11_display_error_trap_push (display);
    if (XGetWindowProperty (dpy, DefaultRootWindow (dpy),
@@ -1049,7 +1072,7 @@ surfaces.
                            0, 2, False, XA_INTEGER, &type_return,
                            &format_return, &nitems_return,
                            &bytes_after_return, &data) == Success)
-@@ -1162,7 +2003,7 @@
+@@ -1162,7 +2015,7 @@
  }
  
  static void
@@ -1058,7 +1081,7 @@ surfaces.
  {
    long visualdata[2];
    Display *dpy;
-@@ -1174,7 +2015,7 @@
+@@ -1174,7 +2027,7 @@
  
    gdk_x11_display_error_trap_push (display);
    XChangeProperty (dpy, DefaultRootWindow (dpy),
@@ -1067,7 +1090,7 @@ surfaces.
                     XA_INTEGER, 32, PropModeReplace,
                     (unsigned char *)visualdata, 2);
    gdk_x11_display_error_trap_pop_ignored (display);
-@@ -1197,8 +2038,15 @@
+@@ -1197,8 +2050,15 @@
    dpy = gdk_x11_display_get_xdisplay (display);
  
    /* We save the default visuals as a property on the root window to avoid
@@ -1085,7 +1108,7 @@ surfaces.
      {
        for (i = 0; i < x11_screen->nvisuals; i++)
          {
-@@ -1217,6 +2065,15 @@
+@@ -1217,6 +2077,15 @@
    if (!gdk_x11_screen_init_gl (screen))
      return;
  
@@ -1101,7 +1124,7 @@ surfaces.
    gl_info = g_new0 (struct glvisualinfo, x11_screen->nvisuals);
  
    for (i = 0; i < x11_screen->nvisuals; i++)
-@@ -1256,11 +2113,49 @@
+@@ -1256,11 +2125,49 @@
  
    g_free (gl_info);
  
@@ -1152,7 +1175,7 @@ surfaces.
  GdkGLContext *
  gdk_x11_window_create_gl_context (GdkWindow    *window,
                                    gboolean      attached,
-@@ -1282,6 +2177,25 @@
+@@ -1282,6 +2189,25 @@
        return NULL;
      }
  
@@ -1178,7 +1201,7 @@ surfaces.
    visual = gdk_window_get_visual (window);
    if (!find_fbconfig_for_visual (display, visual, &config, error))
      return NULL;
-@@ -1304,6 +2218,9 @@
+@@ -1304,6 +2230,9 @@
  {
    GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (context);
  
@@ -1188,7 +1211,7 @@ surfaces.
    return context_x11->glx_context == glXGetCurrentContext ();
  }
  
-@@ -1317,6 +2234,9 @@
+@@ -1317,6 +2246,9 @@
    GdkScreen *screen;
    gboolean do_frame_sync = FALSE;
  
@@ -1198,7 +1221,7 @@ surfaces.
    if (context == NULL)
      {
        glXMakeContextCurrent (dpy, None, None, NULL);
-@@ -1393,6 +2313,11 @@
+@@ -1393,6 +2325,11 @@
    if (!gdk_x11_screen_init_gl (gdk_display_get_default_screen (display)))
      return FALSE;
  
@@ -1210,3 +1233,111 @@ surfaces.
    if (major != NULL)
      *major = GDK_X11_DISPLAY (display)->glx_version / 10;
    if (minor != NULL)
+--- a/gdk/gdkglcontextprivate.h
++++ b/gdk/gdkglcontextprivate.h
+@@ -75,6 +75,12 @@
+
+ void                    gdk_gl_context_set_is_legacy            (GdkGLContext    *context,
+                                                                  gboolean         is_legacy);
++/* Whether the cairo half of a GL paint goes into a memory surface rather
++ * than one of the windowing system's; a backend whose contexts cannot
++ * bind the latter as textures sets it (see gdkglcontext.c). */
++void                    gdk_gl_context_set_image_paint_surface  (GdkGLContext    *context,
++                                                                 gboolean         image);
++gboolean                gdk_gl_context_get_image_paint_surface  (GdkGLContext    *context);
+
+ void                    gdk_gl_context_upload_texture           (GdkGLContext    *context,
+                                                                  cairo_surface_t *image_surface,
+--- a/gdk/gdkglcontext.c
++++ b/gdk/gdkglcontext.c
+@@ -109,6 +109,10 @@
+   guint is_legacy : 1;
+   guint has_tex_param : 1;
+
++  /* The cairo half of a GL paint is drawn into a memory surface; see
++   * gdk_gl_context_set_image_paint_surface(). */
++  guint image_paint_surface : 1;
++
+   int use_es;
+
+   GdkGLContextPaintData *paint_data;
+@@ -712,6 +716,44 @@
+   priv->is_legacy = !!is_legacy;
+ }
+
++/*
++ * gdk_gl_context_set_image_paint_surface:
++ * @context: a #GdkGLContext
++ * @image: whether the cairo half of a GL paint goes into a memory surface
++ *
++ * During a GL paint, what the window draws with cairo lands in a surface of
++ * its own and is composited into the back buffer as a texture at the end
++ * (gdk_gl_texture_from_surface).  A backend whose contexts can bind the
++ * windowing system's own surfaces as textures -- GLX, through
++ * texture-from-pixmap -- wants that surface to be one of those.  A backend
++ * whose contexts cannot wants a plain memory surface, which the generic
++ * upload reads directly, rather than one it would have to read back from
++ * the windowing system for every rectangle of every frame.
++ *
++ * Set by the backend when it realizes the context; consulted for a
++ * window's paint context.
++ */
++void
++gdk_gl_context_set_image_paint_surface (GdkGLContext *context,
++                                        gboolean      image)
++{
++  GdkGLContextPrivate *priv = gdk_gl_context_get_instance_private (context);
++
++  g_return_if_fail (GDK_IS_GL_CONTEXT (context));
++
++  priv->image_paint_surface = !!image;
++}
++
++gboolean
++gdk_gl_context_get_image_paint_surface (GdkGLContext *context)
++{
++  GdkGLContextPrivate *priv = gdk_gl_context_get_instance_private (context);
++
++  g_return_val_if_fail (GDK_IS_GL_CONTEXT (context), FALSE);
++
++  return priv->image_paint_surface;
++}
++
+ /**
+  * gdk_gl_context_set_use_es:
+  * @context: a #GdkGLContext:
+--- a/gdk/gdkwindow.c
++++ b/gdk/gdkwindow.c
+@@ -2998,10 +2998,28 @@
+
+   if (needs_surface)
+     {
+-      window->current_paint.surface = gdk_window_create_similar_surface (window,
+-                                                                         surface_content,
+-                                                                         MAX (clip_box.width, 1),
+-                                                                         MAX (clip_box.height, 1));
++      if (window->current_paint.use_gl &&
++          gdk_gl_context_get_image_paint_surface (window->gl_paint_context))
++        {
++          /* The GL paint composites this surface into the back buffer by
++           * uploading it as a texture (gdk_gl_texture_from_surface), and
++           * the context has asked for that upload to be fed from memory
++           * rather than from a surface of the windowing system's that it
++           * would first have to read back.  Sized and scaled as the
++           * window's own surface would be. */
++          int scale = gdk_window_get_scale_factor (window);
++
++          window->current_paint.surface =
++            cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
++                                        MAX (clip_box.width, 1) * scale,
++                                        MAX (clip_box.height, 1) * scale);
++          cairo_surface_set_device_scale (window->current_paint.surface, scale, scale);
++        }
++      else
++        window->current_paint.surface = gdk_window_create_similar_surface (window,
++                                                                           surface_content,
++                                                                           MAX (clip_box.width, 1),
++                                                                           MAX (clip_box.height, 1));
+       sx = sy = 1;
+       cairo_surface_get_device_scale (window->current_paint.surface, &sx, &sy);
+       cairo_surface_set_device_offset (window->current_paint.surface, -clip_box.x*sx, -clip_box.y*sy);
