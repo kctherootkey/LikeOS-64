@@ -395,6 +395,33 @@ static int vmw_ldu_copy(struct vmw_device *v, struct drm_framebuffer *fb,
 	return 0;
 }
 
+/* The legacy display path, retired before a screen target takes the screen.
+ *
+ * Until here the boot console showed itself the old way: pixels in the
+ * framebuffer aperture, an SVGA_CMD_UPDATE through the FIFO for every
+ * changed rectangle, and SVGA_REG_TRACES on so the host also noticed writes
+ * that announced nothing.  The screen target that follows is a different
+ * mechanism on the host, fed from a different queue, and the two were left
+ * to race: updates of the legacy framebuffer still sitting in the FIFO
+ * could be consumed AFTER the target had been defined and painted, and the
+ * host then showed that framebuffer -- black, the console having moved out
+ * of it -- rather than the target.  Which of the two won depended on how
+ * far the host had got with the FIFO at that moment, so the screen came up
+ * black on some boots and not on others.
+ *
+ * So: no more tracing (it belongs to the legacy path; a device driven
+ * through command buffers has no use for it), and the FIFO drained --
+ * SVGA_REG_SYNC until
+ * SVGA_REG_BUSY clears -- so that everything the legacy path ever said has
+ * been heard before the target says anything.  Free when nothing is queued,
+ * which is every mode set after the first. */
+static void vmw_legacy_display_retire(struct vmw_device *v)
+{
+	(void)v;
+	vmsvga2_set_traces(0);
+	vmsvga2_fifo_flush();
+}
+
 static int vmw_mode_set(struct drm_device *dev, struct drm_crtc *crtc,
 			const struct drm_mode_modeinfo *mode,
 			struct drm_framebuffer *fb, int x, int y)
@@ -403,6 +430,10 @@ static int vmw_mode_set(struct drm_device *dev, struct drm_crtc *crtc,
 	(void)crtc;
 	(void)x;
 	(void)y;
+
+	/* For vmw_display_verify(): refusals from before this mode set are
+	 * somebody else's -- a display server's, typically. */
+	v->cb_errors_seen = v->cb_errors;
 
 	/* Will a screen object or a screen target carry this mode?  Then its
 	 * geometry comes from the command that defines it, and the mode
@@ -417,9 +448,9 @@ static int vmw_mode_set(struct drm_device *dev, struct drm_crtc *crtc,
 	 * not merely redundant beside a screen target -- programming them
 	 * cycles SVGA_REG_ENABLE, and disabling the device resets it, which
 	 * stops the command-buffer contexts: the very next screen-target
-	 * command comes back SVGA_CB_STATUS_CB_HEADER_ERROR.  Upstream never
-	 * touches these registers again after bring-up on such a device, and
-	 * neither does this.  (cb_submit_raw() can restart a stopped context
+	 * command comes back SVGA_CB_STATUS_CB_HEADER_ERROR.  These
+	 * registers are never touched again after bring-up on such a
+	 * device.  (cb_submit_raw() can restart a stopped context
 	 * now, but not resetting the device at all is strictly better than
 	 * recovering from it.)  The aperture path cannot need them either:
 	 * it is only reached when the screen paths are refused, and it
@@ -443,6 +474,7 @@ static int vmw_mode_set(struct drm_device *dev, struct drm_crtc *crtc,
 	/* Screen targets first: on a device with guest-backed objects this is
 	 * the path the host expects, and the two below may be refused. */
 	if (vmw_stdu_available(v)) {
+		vmw_legacy_display_retire(v);
 		if (vmw_stdu_set_mode(v, mode->hdisplay, mode->vdisplay, fb) == 0) {
 			v->screen_defined = 0;
 			return 0;
@@ -493,6 +525,78 @@ static int vmw_crtc_disable(struct drm_device *dev, struct drm_crtc *crtc)
 		vmw_stdu_teardown(v);
 	v->screen_defined = 0;
 	return 0;
+}
+
+/* Did the console's screen come up?  See drm_driver.display_verify.
+ *
+ * Everything on the screen-target path is queued and executed later, and
+ * a buffer the device refuses is repaired by dropping the one command it
+ * did not like -- so a define, a bind or an update can vanish without any
+ * caller hearing of it, and the first anyone knows is a screen that stays
+ * black.  Waiting for the device to finish and then asking whether it
+ * refused anything since the mode set is the only test that sees that.  A
+ * device that has stopped answering shows up the same way: the wait gives
+ * up on it and the buffers it never took are counted as refused. */
+static int vmw_display_verify(struct drm_device *dev)
+{
+	struct vmw_device *v = dev->priv;
+
+	if (!vmw_stdu_available(v))
+		return 0; /* the other paths answer as they go */
+	vmw_cmd_drain(v);
+	if (!v->st_defined) {
+		kprintf("[drm] vmwgfx: no screen target after the console's mode set\n");
+		return -ENODEV;
+	}
+	if (v->cb_errors != v->cb_errors_seen) {
+		kprintf("[drm] vmwgfx: the device refused %u command buffer(s) while the console's screen was set up\n",
+			v->cb_errors - v->cb_errors_seen);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* The screen-target path cannot be trusted: put the display back the way
+ * the boot console had it.  See drm_driver.display_fallback.  The console
+ * has already stopped drawing into its buffer object and has its old flush
+ * hook back, so everything painted from here on goes into the aperture and
+ * is announced through the FIFO, exactly as before this driver initialised.
+ *
+ * The legacy mode set is what makes it certain.  Cycling SVGA_REG_ENABLE
+ * resets the device: whatever screen target the host still holds -- an
+ * empty one, if the refused command was the update that should have
+ * filled it -- goes with the reset, and the host is back to showing the
+ * framebuffer aperture, which no queued command can take away again.  The
+ * reset also drops the guest-backed state (object tables, contexts), so
+ * the driver stops offering it: screen-target scan-out is off for good and
+ * 3D with it, and a display server finds the device as it was before 3D
+ * was detected -- the framebuffer and screen-object paths, which need
+ * nothing of what was lost. */
+static void vmw_display_fallback(struct drm_device *dev)
+{
+	struct vmw_device *v = dev->priv;
+
+	if (v->st_defined)
+		vmw_stdu_teardown(v);
+	v->st_refused = 1;
+	v->has_gb = 0;
+	v->has_dx = 0;
+	v->has_3d = 0;
+	v->has_sm41 = 0;
+	v->has_sm5 = 0;
+	v->has_gl43 = 0;
+	v->otables_ready = 0;
+	v->devcaps[SVGA3D_DEVCAP_DXCONTEXT] = 0;
+	v->devcaps[SVGA3D_DEVCAP_SM41] = 0;
+	v->devcaps[SVGA3D_DEVCAP_SM5] = 0;
+	v->devcaps[SVGA3D_DEVCAP_GL43] = 0;
+	kprintf("[drm] vmwgfx: screen-target display refused; console and scan-out back on the framebuffer, 3D off\n");
+	vmsvga2_set_traces(1);
+	if (vmsvga2_hw_set_mode(v->hw.width, v->hw.height) != 0)
+		kprintf("[drm] vmwgfx: legacy mode set %ux%u failed as well\n",
+			v->hw.width, v->hw.height);
+	vmsvga2_hw_geometry(&v->hw);
+	vmsvga2_update_rect(0, 0, v->hw.width, v->hw.height);
 }
 
 static int vmw_fb_dirty(struct drm_device *dev, struct drm_crtc *crtc,
@@ -762,8 +866,8 @@ static long vmw_ioctl_get_param(struct vmw_device *v, struct drm_vmw_getparam_ar
 		a->value = v->max_mob_size;
 		return 0;
 	case DRM_VMW_PARAM_SCREEN_TARGET:
-		/* What upstream answers: whether the screen target is the
-		 * display unit in use, not whether a size register answered. */
+		/* Whether the screen target is the display unit in use, not
+		 * whether a size register answered. */
 		a->value = vmw_stdu_available(v);
 		return 0;
 	case DRM_VMW_PARAM_DX:
@@ -1202,6 +1306,8 @@ static const struct drm_driver vmw_driver = {
 	.cursor_set = vmw_cursor_set,
 	.cursor_move = vmw_cursor_move,
 	.dpms = vmw_dpms,
+	.display_verify = vmw_display_verify,
+	.display_fallback = vmw_display_fallback,
 	.hw_vblank = 0,
 	.ioctl = vmw_ioctl,
 	.render_allowed = vmw_render_allowed,
@@ -1293,7 +1399,7 @@ static const uint32_t vmw_builtin_modes[][2] = {
  *
  * A screen object or a screen target never reads that aperture.  The image
  * stays in guest memory and the host is told where it is, so the bounds that
- * apply are the ones the reference driver uses on such a device: the primary
+ * apply are the device's own for such a scan-out: the primary
  * surface memory the device reports, the largest image it can sample, and --
  * for a screen object, which is scanned out of a guest memory region -- the
  * device's limit on how large such a region may be.  Under those the screen

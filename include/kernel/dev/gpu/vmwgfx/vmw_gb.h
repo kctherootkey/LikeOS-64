@@ -268,6 +268,16 @@ struct vmw_device {
 	} otable[SVGA_OTABLE_DX_MAX];
 	int otables_ready;
 	int cb_ready;    /* the command-buffer channel is up and started */
+	/* Buffers the device refused or that were given up on: every path
+	 * out of cb_slot_handle_error() that ends with work thrown away.
+	 * vmw_mode_set() notes the count and vmw_display_verify() compares:
+	 * "did the console's screen come up" is answered by "nothing was
+	 * refused between the mode set and now". */
+	uint32_t cb_errors, cb_errors_seen;
+	/* The screen-target path was tried for the console and the device
+	 * would not carry it; the display runs on the framebuffer aperture
+	 * from here on.  See vmw_display_fallback(). */
+	int st_refused;
 	uint8_t *mob_ids; /* bitmap */
 	uint8_t *surface_ids;
 	uint8_t *context_ids;
@@ -297,9 +307,8 @@ struct vmw_device {
 	 * whatever that entry happens to name.  The device reports nothing:
 	 * the id is valid, only its contents are wrong.
 	 *
-	 * The reference serialises the whole of execbuf for the same reason
-	 * (its cmdbuf_mutex).  Held across validation and hand-over only --
-	 * execution is asynchronous, so this does not serialise the device. */
+	 * Held across validation and hand-over only -- execution is
+	 * asynchronous, so this does not serialise the device. */
 	mm_rwsem_t execbuf_lock;
 	/* Commands accumulate here and go to the device as one buffer. */
 	uint8_t *pend;

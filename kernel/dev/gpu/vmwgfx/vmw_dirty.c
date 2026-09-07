@@ -2,7 +2,7 @@
 //
 // The page tracker (drm_dirty.c) answers in pages of the backing buffer;
 // the device wants boxes of texels in a subresource.  This file is the
-// translation, ported from the reference driver: a byte range of the
+// translation: a byte range of the
 // backing store is located within the surface's layout -- sheet, layer,
 // mip level, block coordinates -- and folded into one box per
 // subresource, the union of everything that touched it.  At submission
@@ -15,9 +15,9 @@
 // slices, mip levels and layers, in that nesting order.  A range that
 // spans whole rows therefore dirties the rows in full whatever its x
 // extents, one that spans slices dirties them in full, and one that
-// spans subresources dirties the interior ones in full -- exactly the
-// reference driver's reading, kept bit for bit because a box drawn too
-// small is the corruption this machinery once caused: texels the client
+// spans subresources dirties the interior ones in full.  That reading is
+// kept exact, because a box drawn too small is the corruption this
+// machinery once caused: texels the client
 // wrote and the device never re-read.
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
@@ -96,8 +96,8 @@ static size_t surf_image_bytes(const SVGA3dSurfaceDesc *desc,
 	if (surf_is_planar(desc))
 		return (size_t)bl.width * bl.height * bl.depth *
 		       desc->bytesPerBlock;
-	/* pitchBytesPerBlock for the row pitch, which is what the reference's
-	 * image-size helper uses and what sizes the backing buffer.  Using the
+	/* pitchBytesPerBlock for the row pitch, which is what
+	 * vmw_surface_size() uses and what sizes the backing buffer.  Using the
 	 * block's STORAGE size here instead made this disagree with
 	 * vmw_surface_size() for any format where the two differ, so the mip
 	 * chain the tracker walked was laid out differently from the buffer
@@ -247,10 +247,9 @@ struct vmw_surface_dirty {
  * endpoints, everything between the crossed boundaries was inside it. */
 /* Grow one axis of a box so it covers what it covered before AND [start, end).
  *
- * Written as an explicit union, which is a DELIBERATE departure from the
- * reference and the only one in this file.  The reference moves the origin
- * down to meet a new range but only recomputes the extent when that range
- * reaches PAST the old far edge:
+ * Written as an explicit union, deliberately.  The shorter form -- move
+ * the origin down to meet a new range but only recompute the extent when
+ * that range reaches PAST the old far edge --
  *
  *	box_c2 = box->x + box->w;
  *	if (box->w == 0 || box->x > loc_start->x)
@@ -271,7 +270,7 @@ struct vmw_surface_dirty {
  * applies to the y and z arms.
  *
  * A union is never smaller than either input, so this can only ever report
- * more than the reference, never less. */
+ * more than that form would, never less. */
 static void surf_box_axis_union(uint32_t *origin, uint32_t *extent,
 				uint32_t start, uint32_t end)
 {
@@ -501,7 +500,7 @@ uint32_t vmw_surface_dirty_count(const struct vmw_surface *s)
  *
  * DX_UPDATE_SUBRESOURCE addresses array surfaces; UPDATE_GB_IMAGE only
  * knows face and level.  The device that offers DX contexts takes the
- * former, exactly as the reference driver chooses. */
+ * former. */
 /* Put a surface's dirt back, in full.
  *
  * For the case where the commands vmw_surface_dirty_emit() produced never

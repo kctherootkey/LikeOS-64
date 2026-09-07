@@ -8,8 +8,7 @@
 // raises a fault that names the page.  This file turns those two records
 // into one the driver can consume, per object, as a bitmap of dirty pages.
 //
-// The shape is the reference implementation's, ported to this kernel's
-// address spaces, and it tracks by one of two methods per object:
+// It tracks by one of two methods per object:
 //
 //   PAGETABLE -- leave the mapping writable and, once per submission,
 //   sweep the entries for hardware dirty bits, clearing as it goes.  Cheap
@@ -23,14 +22,12 @@
 // An object starts in the method its size suggests and switches when the
 // evidence says the other would be cheaper: repeated sweeps that find
 // nothing argue for faulting, repeated frames that fault in more than a
-// tenth of the object argue for sweeping.  The counters and thresholds
-// match the reference implementation.
+// tenth of the object argue for sweeping.
 //
-// What is deliberately different, and why:
+// Two things about the mappings, and why:
 //
-//   - The reference walks every mapping of the object through the shared
-//     file's reverse map.  This kernel has no such map, so the sweeps walk
-//     the SUBMITTING address space's region records instead -- which is
+//   - There is no reverse map from an object to every mapping of it, so
+//     the sweeps walk the SUBMITTING address space's region records --
 //     every mapping there is, in the only case that occurs: the process
 //     that mapped the buffer is the process that submits -- whether it
 //     mapped it through the device node or through an exported descriptor
@@ -48,7 +45,7 @@
 //     cannot see is covered by the same full-object answer, latched when a
 //     mapping record is dropped while tracking is live.
 //
-// Two rules carried over unchanged, because each was once a corruption:
+// Two rules that hold without exception, because each was once a corruption:
 // entries are only ever changed with atomic exchanges (the processor sets
 // dirty bits with locked cycles of its own, and a plain read-modify-write
 // races them and loses writes), and no sweep's result is trusted until the
@@ -95,7 +92,7 @@ enum drm_gem_dirty_method {
 
 /* Which method a brand-new tracker starts with.
  *
- * The reference starts an object of one page table's worth of entries or
+ * The obvious policy starts an object of one page table's worth of entries or
  * less -- 512 -- with the sweep, and everything larger with faults, on the
  * grounds that a sweep reads the whole object while faults only touch what
  * is written.
@@ -111,9 +108,8 @@ enum drm_gem_dirty_method {
  * So every tracker starts with the sweep, and the adaptive switch below
  * moves the ones that turn out to be sparsely written over to faults after a
  * quiet spell.  Being wrong in this direction costs one cheap sweep per
- * frame until it settles; being wrong in the other cost a storm.  This is
- * the one place the method policy deliberately departs from the reference,
- * and scratchpad/methodpolicy measures both halves of it. */
+ * frame until it settles; being wrong in the other cost a storm.
+ * scratchpad/methodpolicy measures both halves of it. */
 #define DRM_GEM_DIRTY_START_PAGETABLE 1
 
 /* How many scans a fingerprint is believed for.
@@ -180,11 +176,11 @@ struct drm_gem_dirty {
 	 * write bit to since the last protection pass.
 	 *
 	 * Needed because a fault can land BETWEEN a pass and the
-	 * consumption that follows it.  The reference cannot reach that
-	 * state: its fault handler takes the buffer object's reservation,
-	 * which the submission holds across both, so the write simply
-	 * waits and lands in the next submission's record.  Nothing here
-	 * serialises the two, so the page's record is consumed while the
+	 * consumption that follows it.  A fault handler that took a
+	 * per-object reservation held by the submission across both could
+	 * not reach that state: the write would simply wait and land in
+	 * the next submission's record.  Nothing here serialises the two,
+	 * so the page's record is consumed while the
 	 * page holds the write bit -- and the bracket the next pass works
 	 * from was just emptied by that same consumption, so it would
 	 * never be protected again.  A page like that stops faulting, and
@@ -341,9 +337,7 @@ static uint64_t bits_next_clear(const uint64_t *map, uint64_t size,
  * Nothing here needs mutual exclusion.  The bit is set atomically, and the
  * bracket is folded with compare-and-swap: `start' only ever moves down and
  * `end' only ever moves up, so concurrent recorders converge on the union
- * whatever order they land in, which is the same answer a lock would give.
- * The reference records the same way -- a bit set and a min/max -- under the
- * page-table lock it is already holding, with no lock of its own. */
+ * whatever order they land in, which is the same answer a lock would give. */
 static void dirty_record_page(struct drm_gem_dirty *d, uint64_t page)
 {
 	if (page >= d->bitmap_size)

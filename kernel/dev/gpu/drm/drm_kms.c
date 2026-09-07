@@ -247,10 +247,8 @@ static void vbl_deliver(struct drm_device *dev, int crtc);
  * With termination owned solely by the callback there is nothing to cancel
  * and no ordering to lose: the only writer that arms is whoever moved
  * `running' from 0 to 1 (under the lock), and the only re-armer is the
- * callback itself while `running' stays 1.  The reference reaches the same
- * safety by putting vblank state under a spinlock and DEFERRING disable to a
- * timer instead of doing it synchronously in hot paths; the cost here is the
- * same as there -- the counter runs at most one period past its last use. */
+ * callback itself while `running' stays 1.  The cost is that the counter
+ * runs at most one period past its last use. */
 static spinlock_t g_vbl_lock = SPINLOCK_INIT("drm_vbl");
 
 static void vbl_timer_fire(hrtimer_t *t)
@@ -454,9 +452,9 @@ void drm_kms_file_release(struct drm_device *dev, struct drm_file *fp)
 static int vbl_wait_sync(struct drm_device *dev, int crtc, uint64_t target)
 {
 	task_t *cur = sched_current();
-	/* The reference caps this wait rather than trusting the counter to
-	 * arrive; a target that can never be reached must not park a thread
-	 * for the life of the process. */
+	/* Capped rather than trusting the counter to arrive: a target that
+	 * can never be reached must not park a thread for the life of the
+	 * process. */
 	uint64_t deadline = timer_ticks() + timer_ms_to_ticks(3000) + 1;
 	int rc = 0;
 

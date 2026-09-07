@@ -11,7 +11,7 @@
 
 /* ---- command buffers ---------------------------------------------------- */
 //
-// ASYNCHRONOUS, like the reference implementation: a submission hands the
+// ASYNCHRONOUS: a submission hands the
 // device a buffer and returns; completion and errors are collected later
 // (on the next claim, from the fence tick, or by a synchronous waiter).
 // The old shape -- one buffer, and every submission waiting for the device
@@ -253,9 +253,8 @@ static int cb_deadline_passed(struct vmw_device *v, uint64_t started_us)
  * lock.
  *
  * So the interrupt only collects what has plainly finished, and anything
- * that needs doing about a failure waits for the next submitter -- which
- * is where the reference driver puts it as well, in a work item rather
- * than in the interrupt. */
+ * that needs doing about a failure waits for the next submitter: task
+ * context, never the interrupt. */
 static void cb_reap(struct vmw_device *v, int may_recover)
 {
 	for (int i = 0; i < v->cb_nslots; i++) {
@@ -676,7 +675,7 @@ static void cb_resubmit_preempted(struct vmw_device *v, uint32_t ctx,
  * behind it stays in the device's queue, untouched, and simply restarting
  * the context does not bring them back -- their status never leaves
  * SVGA_CB_STATUS_NONE and nothing here can tell them from work in
- * progress.  So the recovery is the reference driver's: PREEMPT the
+ * progress.  So the recovery is: PREEMPT the
  * context, which returns every buffer that had not begun; skip the one
  * command the device would not take; restart the context; and hand the
  * repaired buffer and everything that came back over again, in submission
@@ -724,6 +723,7 @@ static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 		kprintf("[drm] vmwgfx: device command buffer refused (status %u)\n",
 			status);
 		s->err_rc = cb_status_rc(status);
+		v->cb_errors++;
 		cb_recover_unlock(v);
 		return 0;
 	}
@@ -750,6 +750,7 @@ static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 		}
 		cb_resubmit_preempted(v, s->ctx, NULL);
 		s->err_rc = -ETIMEDOUT;
+		v->cb_errors++;
 		cb_recover_unlock(v);
 		return 0;
 	}
@@ -782,6 +783,7 @@ static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 		kprintf("[drm] vmwgfx: command-buffer channel did not recover (status %u)\n",
 			status);
 		s->err_rc = cb_status_rc(status);
+		v->cb_errors++;
 		cb_recover_unlock(v);
 		return 0;
 	}
@@ -792,6 +794,7 @@ static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 	 * remainder of the batch is still handed back below; the answer is
 	 * about the command that was dropped. */
 	s->err_rc = -EINVAL;
+	v->cb_errors++;
 
 	/* Everything the device still holds on this context, back. */
 	cb_preempt_context(v, s->ctx);
@@ -804,9 +807,7 @@ static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 	 * FIFO-format command whose length is implied by the id, and of
 	 * those only SVGA_CMD_FENCE ever reaches these buffers from this
 	 * driver.  Anything else cannot be measured, so nothing past it can
-	 * be found and the rest of the buffer is given up.  (The reference
-	 * driver's vmw_cmd_describe() draws the same line at the same
-	 * place.) */
+	 * be found and the rest of the buffer is given up. */
 	uint32_t off = h->errorOffset;
 	uint32_t new_start = s->bytes;
 
@@ -844,8 +845,7 @@ static int cb_slot_handle_error(struct vmw_device *v, struct vmw_cb_slot *s,
 		 * that ended the batch went with it.  Put a fresh fence in
 		 * its place: a number above every one handed out so far, so
 		 * every waiter for a fence that can no longer arrive is
-		 * released rather than sitting out its timeout.  (The
-		 * reference driver sends a fence here for the same reason.)
+		 * released rather than sitting out its timeout.
 		 *
 		 * Once only.  A device that refuses even this has nothing
 		 * left to be salvaged into, and installing another fence
@@ -1149,7 +1149,7 @@ static void defer_drain(struct vmw_device *v)
  * whose chunk headers stop making sense.  Nothing on this side can catch it,
  * because no processor performs the write.
  *
- * The rule the reference keeps is that a buffer's pages are freed only once
+ * The rule is that a buffer's pages are freed only once
  * the device is idle with respect to that buffer, and that a buffer which is
  * not idle has its release deferred rather than forced.  Both halves are
  * here: what fits in the holding area waits there for the device to drain on
@@ -1273,8 +1273,7 @@ static int cb_start_context(struct vmw_device *v, uint32_t ctx)
  * SVGA_CB_STATUS_NONE, so nothing here can tell them from a buffer the
  * device is still working through, and restarting the context does not
  * bring them back.  Preempting does -- every buffer that had not begun
- * comes back marked PREEMPTED, and the guest submits it again.  This is
- * what the reference driver does at exactly this point. */
+ * comes back marked PREEMPTED, and the guest submits it again. */
 static int cb_preempt_context(struct vmw_device *v, uint32_t ctx)
 {
 	struct {
@@ -1368,8 +1367,8 @@ uint32_t vmw_cmd_fence_emit(struct vmw_device *v)
 /* Device-format bytes -- SVGA_CMD_*, not SVGA3D commands -- down whichever
  * channel this driver owns.
  *
- * This is the reference driver's VMW_CMD_RESERVE: with a command-buffer
- * manager, the FIFO is not used for commands AT ALL.  Everything goes down
+ * With the command-buffer channel up, the FIFO is not used for commands
+ * AT ALL.  Everything goes down
  * the one channel -- FIFO-format commands, SVGA3D commands and the fence
  * alike -- and that is not tidiness, it is the two things a display needs:
  *
@@ -1423,8 +1422,7 @@ int vmw_cmd_raw(struct vmw_device *v, const void *cmds, uint32_t bytes, int ring
  * stutter: fast while buffers last, stalled while they are collected, fast
  * again.
  *
- * So commands are gathered and handed over together, which is what the
- * reference implementation's command-buffer manager does.  What forces a
+ * So commands are gathered and handed over together.  What forces a
  * hand-over: no more room, a change of DX context (one buffer carries one),
  * a caller that needs the answer, a fence (which must follow what came
  * before it), and a finished screen update (which has to reach the
@@ -1476,8 +1474,7 @@ static int pend_flush_locked(struct vmw_device *v)
  * For the rare moment when memory the device is reading is about to be
  * replaced or read by the processor.  Queued submission means earlier
  * batches may still be executing, and they were built against the object
- * that is about to change -- the reference implementation waits for the
- * buffer to go idle at exactly these points, and this is that wait. */
+ * that is about to change -- so the device is made idle first. */
 void vmw_cmd_drain(struct vmw_device *v)
 {
 	if (!v->cb_ready)

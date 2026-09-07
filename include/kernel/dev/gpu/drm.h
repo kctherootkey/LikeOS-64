@@ -66,8 +66,7 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed);
  * to be handed back whatever this returns, and the device is still reading
  * them until the fence passes.  Giving up early there does not interrupt
  * anything, it just frees memory out from under the device -- so those waits
- * are not interruptible, only bounded, exactly as the reference driver does
- * it in its object-release path. */
+ * are not interruptible, only bounded. */
 int drm_fence_wait_flags(struct drm_fence *f, uint64_t timeout_ns, int intr);
 
 static inline int drm_fence_wait(struct drm_fence *f, uint64_t timeout_ns)
@@ -392,6 +391,19 @@ struct drm_driver {
 
 	/* caps the core does not know */
 	int (*get_cap)(struct drm_device *dev, uint64_t cap, uint64_t *val);
+
+	/* The console's screen, checked and rescued (drm_console.c).
+	 *
+	 * display_verify: the console has set its mode and painted its whole
+	 * screen; wait until the device has executed all of it and say
+	 * whether the device accepted every command.  A display path that
+	 * quietly dropped one is a black screen that nothing else reports.
+	 * display_fallback: that path cannot be trusted; put the display back
+	 * the way the console found it before this driver initialised.  The
+	 * console has already stopped drawing into the driver's buffer and
+	 * restored the flush hook it had before. */
+	int (*display_verify)(struct drm_device *dev);
+	void (*display_fallback)(struct drm_device *dev);
 };
 
 struct drm_device {

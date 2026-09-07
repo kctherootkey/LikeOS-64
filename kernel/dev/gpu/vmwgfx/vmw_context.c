@@ -65,10 +65,10 @@ static uint32_t bo_mobid(struct drm_gem_object *bo)
  *   table, without this function hearing about it.  So no kernel-side
  *   watermark can say how much of the table is live: after READBACK the
  *   ENTIRE buffer is the device's state, the copy must span the ENTIRE old
- *   buffer, and validSizeInBytes on the switch is the ENTIRE old size --
- *   exactly what the reference implementation does (its readback records
- *   the full table size and its resize copies every page of the old
- *   buffer).  Copying any tracked prefix instead throws away the entries
+ *   buffer, and validSizeInBytes on the switch is the ENTIRE old size:
+ *   the readback records the full table size and the resize copies
+ *   every page of the old buffer.  Copying any tracked prefix instead
+ *   throws away the entries
  *   defined since the last grow; the ids stay valid-looking, draws that
  *   use them are accepted, and the rendering lands nowhere.
  *
@@ -114,9 +114,7 @@ int vmw_context_cotable_reserve(struct vmw_device *v, struct vmw_context *c,
 		 * processor and then points the context at a different one.
 		 * Doing that while the device is still working through the
 		 * old table is how a context comes to reject the state
-		 * objects defined in it, and then every draw that uses them.
-		 * The reference implementation waits for the same thing at
-		 * this point, on the buffer itself. */
+		 * objects defined in it, and then every draw that uses them. */
 		vmw_cmd_drain(v);
 		/* Synchronous: the table has been written back by the time
 		 * this returns, so the copy below sees it.  And CHECKED:
@@ -239,11 +237,10 @@ int vmw_context_create(struct vmw_device *v, struct drm_file *fp, int dx,
 			 * A DX context's query results live in a MOB the
 			 * CLIENT owns and names: Mesa allocates it and binds
 			 * it with DX_BIND_QUERY in its own command stream
-			 * (validated in vmw_execbuf.c), exactly as the
-			 * reference driver expects -- there, the kernel only
-			 * remembers which MOB that was so it can re-bind it
-			 * with DX_BIND_ALL_QUERY when a context it had
-			 * evicted comes back.
+			 * (validated in vmw_execbuf.c), and the kernel's only
+			 * part in it is to remember which MOB that was, so it
+			 * can be re-bound with DX_BIND_ALL_QUERY should the
+			 * context ever be evicted and brought back.
 			 *
 			 * Binding a kernel MOB to every query of a context
 			 * that has not defined a single query is not that,

@@ -37,9 +37,9 @@ static uint32_t level_bytes(const SVGA3dSurfaceDesc *d, uint32_t w, uint32_t h,
 	/* A planar format stores its planes one after another and its block
 	 * carries all of them, so its size comes from the block's STORAGE
 	 * size and there is no row pitch to speak of.  Everything else is
-	 * rows of pitch.  This is the split the reference's image-size helper
-	 * makes, and it has to be made identically here and in the dirty
-	 * tracker's surf_image_bytes(): this function decides how big the
+	 * rows of pitch.  The split has to be made identically here and in
+	 * the dirty tracker's surf_image_bytes(), and it is: this function
+	 * decides how big the
 	 * backing buffer is, that one decides where in it every row lives, and
 	 * for NV12 and YV12 -- the only formats whose two per-block sizes
 	 * differ, 6 against 2 -- they disagreed by a factor of three. */
@@ -308,7 +308,7 @@ struct drm_gem_object *vmw_surface_object_create(struct vmw_device *v,
 	 SVGA3D_SURFACE_DRAWINDIRECT_ARGS | SVGA3D_SURFACE_RESOURCE_CLAMP |    \
 	 SVGA3D_SURFACE_STAGING_COPY)
 
-/* The formats a screen target can scan out, as upstream lists them: the two
+/* The formats a screen target can scan out: the two
  * legacy 32-bit ones and the DX B/R 8888 pair. */
 int vmw_format_is_screen_target(uint32_t f)
 {
@@ -377,10 +377,10 @@ static int surface_create_common(struct vmw_device *v, struct drm_file *fp,
 	/* The coherence contract: the client maps this surface's backing for
 	 * good and STOPS sending update commands for it -- its GL stack skips
 	 * every explicit upload for a persistently-mapped buffer and leaves
-	 * making the CPU's writes visible to the kernel.  The reference
-	 * driver honours that by write-protecting the mapping, collecting
-	 * dirtied ranges, and emitting the update commands itself at every
-	 * submission that references the surface.  Ignoring the flag is not
+	 * making the CPU's writes visible to the kernel.  Honouring that
+	 * means write-protecting the mapping, collecting the dirtied ranges,
+	 * and emitting the update commands from here at every submission
+	 * that references the surface.  Ignoring the flag is not
 	 * an option with teeth so much as a jaw: the compositor's entire
 	 * vertex stream lives in such buffers, so every one of its draws
 	 * reads data the device never received and renders nothing --
@@ -534,9 +534,8 @@ static int surface_ref_common(struct vmw_device *v, struct drm_file *fp,
 		 *
 		 * Not from a render node: a render client has no display
 		 * server to have been handed an id by, and letting it name
-		 * any id would let it reach another process's surfaces.  The
-		 * reference implementation draws the line in the same place
-		 * (a render client must already hold the object). */
+		 * any id would let it reach another process's surfaces: a
+		 * render client must already hold the object. */
 		if (!so && !fp->is_render)
 			so = drm_gem_lookup_foreign(&v->drm, (uint32_t)arg->sid);
 	}
@@ -793,8 +792,7 @@ long vmw_ioctl_ref_surface(struct vmw_device *v, struct drm_file *fp, void *kb)
 	 * which is how a second process learns its geometry without having
 	 * been told.  size_addr stays zero: the mip-level sizes were the
 	 * caller's array at create time and there is nowhere here to put
-	 * them, which is what the reference driver reports as well when the
-	 * caller passed no buffer for them. */
+	 * them. */
 	mm_memset(&a->rep, 0, sizeof(a->rep));
 	a->rep.flags = (uint32_t)s->flags;
 	a->rep.format = s->format;

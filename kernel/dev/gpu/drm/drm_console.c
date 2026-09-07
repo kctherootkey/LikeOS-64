@@ -61,6 +61,13 @@ static struct {
 	/* The thread that pushes.  Everything below is why it exists. */
 	task_t *worker;
 	volatile int worker_ready;
+
+	/* The display as the console had it before the takeover: the
+	 * framebuffer it drew into and the flush hook that announced its
+	 * rectangles.  What drm_console_fallback() goes back to. */
+	framebuffer_info_t saved;
+	int have_saved;
+	fb_flush_hook_t legacy_hook;
 } g_con;
 
 static uint8_t g_con_stack[16384] __attribute__((aligned(16)));
@@ -179,10 +186,24 @@ static void console_push_all(void)
  * there is nothing dirty. */
 static void drm_console_worker(void *arg)
 {
+	int first = 1;
+
 	(void)arg;
 	g_con.worker_ready = 1;
 	for (;;) {
 		task_t *self = sched_current();
+
+		/* Once, when the machine is up enough to have a thread for
+		 * this: the whole screen again.  Everything the boot pushed
+		 * inline was submitted before there was a scheduler, and one
+		 * full present from a running system costs a few
+		 * milliseconds against a screen that might otherwise stay
+		 * behind whatever the device made of those. */
+		if (first) {
+			first = 0;
+			if (!g_con.suspended)
+				console_push_all();
+		}
 
 		if (self) {
 			self->wait_channel = (void *)&g_con;
@@ -211,10 +232,51 @@ static void drm_console_worker(void *arg)
 
 /* ---- taking the console over ----------------------------------------- */
 
+/* Give the screen back to the display the console had before.
+ *
+ * For a screen-target path that did not come up -- the mode set failed, or
+ * it succeeded and the device then refused what was painted into it (see
+ * drm_driver.display_verify).  The console stops drawing into the buffer
+ * object first and gets its old flush hook back, THEN the driver puts the
+ * device back on its legacy path: the repaint the driver's fallback does
+ * must already be announced the old way.  Without the driver's help, the
+ * console at least draws into the framebuffer it had; with it, the device
+ * is reset to showing that framebuffer, which is the one state of this
+ * device that no queued command can take away. */
+static void drm_console_fallback(struct drm_device *dev, const char *why)
+{
+	kprintf("[drm] %s: console display %s; back on the framebuffer\n",
+		dev->drv->name, why);
+	g_con.taken = 0;
+	g_con.suspended = 0;
+	fb_set_flush_hook(g_con.legacy_hook);
+	/* The CRTC off its buffer: on this device that tears the screen
+	 * target down, so the aperture is what is left to show. */
+	drm_kms_crtc_set_kernel(dev, 0, NULL, 0);
+	if (dev->drv->display_fallback)
+		dev->drv->display_fallback(dev);
+	else if (g_con.have_saved)
+		console_reinit_framebuffer(&g_con.saved);
+	g_con.dev = NULL;
+}
+
+/* The console's screen, as the device sees it.  After a mode set and a full
+ * paint: has the device accepted all of it?  Falls back if not, and says
+ * so.  Returns 0 when the console is on the display, -EIO when it has been
+ * moved back to the framebuffer. */
+static int drm_console_verify(struct drm_device *dev)
+{
+	if (!dev->drv->display_verify)
+		return 0;
+	if (dev->drv->display_verify(dev) == 0)
+		return 0;
+	drm_console_fallback(dev, "did not come up");
+	return -EIO;
+}
+
 int drm_console_takeover(struct drm_device *dev)
 {
-	framebuffer_info_t fi, saved;
-	int have_saved;
+	framebuffer_info_t fi;
 
 	if (g_con.taken)
 		return -EBUSY;
@@ -265,13 +327,19 @@ int drm_console_takeover(struct drm_device *dev)
 	g_con.h = h;
 	g_con.pitch = pitch;
 
+	g_con.have_saved = console_get_framebuffer_info(&g_con.saved) == 0;
+	g_con.legacy_hook = fb_get_flush_hook();
+
 	if (drm_kms_crtc_set_kernel(dev, 0, mode, fb_id) != 0) {
-		g_con.dev = NULL;
+		/* Not merely "no takeover": the mode set may have got as far
+		 * as putting the device on a screen target that now shows
+		 * nothing, and the framebuffer the console still draws into
+		 * would then never reach the screen again. */
+		drm_console_fallback(dev, "mode set failed");
 		return -EIO;
 	}
 
 	/* Where the console draws from here on. */
-	have_saved = console_get_framebuffer_info(&saved) == 0;
 	fi.framebuffer_base = phys_to_virt(o->pages[0]);
 	fi.framebuffer_size = pitch * h;
 	fi.horizontal_resolution = w;
@@ -279,16 +347,10 @@ int drm_console_takeover(struct drm_device *dev)
 	fi.pixels_per_scanline = pitch / 4;
 	fi.bytes_per_pixel = 4;
 
-	fb_flush_hook_t old_hook = fb_get_flush_hook();
 	fb_set_flush_hook(console_flush_hook);
 	g_con.taken = 1;
 	if (console_reinit_framebuffer(&fi) != 0) {
-		/* Put back exactly what was there: the caller carries on with
-		 * the display it already had. */
-		g_con.taken = 0;
-		fb_set_flush_hook(old_hook);
-		if (have_saved)
-			console_reinit_framebuffer(&saved);
+		drm_console_fallback(dev, "could not be set up");
 		return -EIO;
 	}
 	/* The mode is set and the console draws into this buffer now: paint
@@ -298,6 +360,13 @@ int drm_console_takeover(struct drm_device *dev)
 	 * the cursor's record of them. */
 	console_repaint();
 	console_push_all();
+
+	/* Everything above was queued to the device.  Before this is called
+	 * a success, the device has to have accepted all of it -- see
+	 * drm_console_verify(): a refused define or update is a black screen
+	 * that nothing else would ever report. */
+	if (drm_console_verify(dev) != 0)
+		return -EIO;
 
 	kprintf("[drm] %s: console on KMS, %ux%u\n", dev->drv->name, w, h);
 	return 0;
@@ -340,12 +409,15 @@ void drm_console_resume(struct drm_device *dev)
 	 * nothing else could write there. */
 	g_con.suspended = 0;
 	if (drm_kms_crtc_set_kernel(dev, 0, &g_con.mode, g_con.fb_id) != 0) {
-		kprintf("[drm] %s: console mode set failed after the display "
-			"manager exited\n",
-			dev->drv->name);
+		/* Not a message and a black screen: the display the manager
+		 * left is gone with it, so the console has to be put
+		 * SOMEWHERE that shows, and the framebuffer aperture is the
+		 * one place this device can always be made to show. */
+		drm_console_fallback(dev, "mode set failed after the display manager exited");
 		return;
 	}
 	console_push_all();
+	(void)drm_console_verify(dev);
 }
 
 int drm_console_active(const struct drm_device *dev)

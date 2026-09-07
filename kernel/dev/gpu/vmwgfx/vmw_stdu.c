@@ -71,17 +71,17 @@ static struct drm_gem_object *stdu_mob_bo(struct vmw_device *v, uint32_t size)
 int vmw_stdu_available(struct vmw_device *v)
 {
 	/* On a device with guest-backed objects the screen target IS the
-	 * display path -- upstream picks the display unit from that
-	 * capability alone (SVGA_CAP_GBOBJECTS => vmw_du_screen_target) and
-	 * reads SVGA_REG_SCREENTARGET_MAX_WIDTH only for size limits.
+	 * display path: the display unit follows from that capability alone
+	 * (SVGA_CAP_GBOBJECTS), and SVGA_REG_SCREENTARGET_MAX_WIDTH is read
+	 * only for size limits.
 	 *
-	 * Requiring that register to be non-zero here was a deviation with
+	 * Requiring that register to be non-zero here was a mistake with
 	 * teeth: where it reads 0 the screen target was switched off, and a
 	 * guest-backed surface then fell to the screen-object blit, which
 	 * cannot show one -- it takes the command, answers success and
 	 * displays nothing.  Every ioctl passed, no error was logged
 	 * anywhere, and X drew a fully working desktop onto a black screen. */
-	return v->has_gb && v->otables_ready;
+	return v->has_gb && v->otables_ready && !v->st_refused;
 }
 
 static void stdu_drop_surface(struct vmw_device *v)

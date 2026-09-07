@@ -8,11 +8,41 @@
 local settings = require "settings"
 
 -- Where a new window starts and how big it opens.  luakit's own defaults are
--- its project page and 800x600; this image opens on the LikeOS site at
--- 1280x1024, which fits the 1280x1024 and larger framebuffers the port runs
--- on with the window manager's bar still visible.
+-- its project page and 800x600; this image opens on the LikeOS site, at a
+-- size chosen from the screen the X server is running -- one step below it,
+-- so the window fits with the window manager's bar and frame still visible:
+--
+--     1920x1200, 1920x1080  ->  1280x1024
+--     1280x1024, 1280x800   ->  1024x768
+--     1024x768              ->   800x600
+--
+-- The screen size comes from xrandr's header line ("Screen 0: minimum ...,
+-- current 1920 x 1080, maximum ..."), which is the server's own answer and
+-- needs no support from luakit, which has no screen-size API of its own.
+-- Any screen the table does not name gets the largest of the three sizes
+-- that leaves room, by width; and if xrandr cannot be asked at all the
+-- window opens at 1280x1024, which is what this image used before.
 settings.window.home_page = "https://likeos.systemtrap.com"
-settings.window.new_window_size = "1280x1024"
+do
+    local size = "1280x1024"
+    local sw
+    local p = io.popen("xrandr --current 2>/dev/null")
+    if p then
+        local out = p:read("*a") or ""
+        p:close()
+        sw = tonumber(out:match("current (%d+) x %d+"))
+    end
+    if sw then
+        if sw >= 1920 then
+            size = "1280x1024"
+        elseif sw >= 1280 then
+            size = "1024x768"
+        else
+            size = "800x600"
+        end
+    end
+    settings.window.new_window_size = size
+end
 
 -- WebGL: ON.  luakit ships it off (webview.enable_webgl defaults to false in
 -- lib/webview.lua), so a page asking for a WebGL context is refused before

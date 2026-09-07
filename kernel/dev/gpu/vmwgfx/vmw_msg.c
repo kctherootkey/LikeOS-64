@@ -11,8 +11,7 @@
 // the hypervisor's own log next to everything else about the virtual
 // machine.
 //
-// The protocol, as the open specification and the reference driver describe
-// it:
+// The protocol, as the open specification describes it:
 //
 //   OPEN(protocol)   -> a channel number and a cookie
 //   SENDSIZE(len)    -> the channel is ready for a message of len bytes

@@ -854,11 +854,11 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 	/* Coherent surfaces referenced by this submission: their backing is
 	 * persistently mapped by the client, which by contract sends NO
 	 * update commands for it -- the kernel makes the CPU's writes
-	 * visible.  The reference driver write-protects the mapping,
-	 * collects the dirtied boxes and emits updates for exactly those at
-	 * every submission that references the surface; with no
-	 * write-protection machinery here the whole surface is treated as
-	 * dirty instead, which transfers more bytes to the same effect.
+	 * visible.  Write-protecting the mapping, collecting the dirtied
+	 * boxes and emitting updates for exactly those at every submission
+	 * that references the surface is the precise way; where that
+	 * machinery is not available the whole surface is treated as dirty
+	 * instead, which transfers more bytes to the same effect.
 	 * The update must reach the device BEFORE the commands that read
 	 * the data; both go through the one submission channel, which
 	 * orders them.  The objects are pinned in refs[] until after
@@ -940,8 +940,8 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 	if (rc == 0 && (a->command_size || pre)) {
 		rc = vmw_cmd_submit_async(v, start, a->command_size + pre, dx_cid);
 	}
-	/* A DEVICE rejection is not the client's errno.  The reference driver
-	 * never reports execution errors through this ioctl -- the commands
+	/* A DEVICE rejection is not the client's errno.  Execution errors
+	 * are never reported through this ioctl -- the commands
 	 * were validated and queued, and what the device later makes of them
 	 * goes to the log, not to the caller: Mesa's winsys treats any error
 	 * here as unrecoverable and calls abort(), so returning the device's
@@ -1006,7 +1006,7 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 		uint32_t h = 0;
 		if (drm_fence_handle_create(fp, fence, &h) == 0)
 			rep.handle = h;
-		/* ZERO, as the reference driver leaves it -- not the fence's
+		/* ZERO -- not the fence's
 		 * flags.  Mesa's winsys reads `mask' the other way round: on
 		 * every wait and every "has it passed?" it computes
 		 * EXEC & ~mask and treats a result of zero as "nothing left to
