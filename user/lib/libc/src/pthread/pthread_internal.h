@@ -119,6 +119,33 @@ struct __pthread {
 	char name[16];
 };
 
+/* The calling thread's kernel id, from its TCB.
+ *
+ * Every lock and unlock used to ask the kernel with a gettid() syscall --
+ * for a plain mutex too, where the answer is only recorded -- and a thread
+ * living in GLib takes and releases locks by the hundred thousand per
+ * second, so it spent most of its time entering and leaving the kernel.
+ * A WebKit process on a busy page showed 100% CPU with `gettid' as the
+ * last syscall of every busy thread.
+ *
+ * The TCB's tid is written by the kernel at clone (CLONE_PARENT_SETTID) and
+ * by __pthread_init_main for the main thread; fork refreshes it in the
+ * child (__pthread_fork_child).  Zero means "not yet known": the loader's
+ * and the kernel's bootstrap TLS blocks are zero-filled, and a thread can
+ * in principle run before its creator's clone returns -- both fall back to
+ * the syscall.  A vfork child shares its parent's TCB and therefore reads
+ * the parent's id, which is what the vfork discipline (nothing but exec or
+ * _exit) already assumes. */
+static inline pid_t __pthread_tid(void)
+{
+	struct __pthread *tcb;
+	__asm__ volatile("mov %%fs:0, %0" : "=r"(tcb));
+	pid_t tid = tcb ? tcb->tid : 0;
+	if (tid <= 0)
+		tid = gettid();
+	return tid;
+}
+
 /* The loader reserves exactly LIKEOS_TCB_RESERVE bytes at the thread pointer
  * for this structure.  If it ever outgrows that, threads would scribble past
  * the end of their TLS allocation — fail the build instead. */

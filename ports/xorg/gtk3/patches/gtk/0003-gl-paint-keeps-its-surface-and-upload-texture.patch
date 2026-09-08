@@ -1,0 +1,388 @@
+GL paint: keep the memory surface and the upload texture across frames.
+
+Once a window has a GL context, every paint of it goes through the GL
+path: what cairo draws lands in a memory surface (patch 0002), the parts of
+that surface the paint touched are uploaded as textures at the end, and
+the back buffer is swapped.  Two things in that path were done afresh for
+every frame, and both grow with the window:
+
+- The memory surface was allocated per paint, sized to the paint's clip
+  box.  For a browser window that is several megabytes -- above the size
+  a C library serves from its heap -- so each frame mapped fresh pages,
+  faulted every one of them in as cairo cleared and drew, and unmapped
+  them at the end, with the invalidation of every other processor's
+  translations that an unmap carries.  A page continuously repainting
+  (an animation, a scroll) paid that per frame, in proportion to its
+  area, on the toolkit's main thread.  The context now holds one surface
+  the size of the window and hands it out for every frame; the device
+  offset places the clip box in it exactly as a surface cut to size would,
+  and nothing outside the region a paint clears and draws is ever read.
+
+- gdk_gl_texture_from_surface's generic upload defined a new GL texture
+  for every rectangle of every frame, filled it, drew it and destroyed
+  it.  On a device where defining a texture is a round trip to the host
+  and an allocation and a release in the kernel, the frame's time went
+  there.  The paint context now keeps one texture the size of the window
+  (device pixels); each rectangle is uploaded into its own place with
+  glTexSubImage2D and drawn from there, all rectangles in one draw.  The
+  texture-rectangle variant (legacy contexts without NPOT textures)
+  keeps the old per-rectangle code.
+
+Upstream: GTK 3 does the same per-frame work on Wayland and is not
+going to change; GTK 4 keeps its buffers.  LikeOS-specific in that the
+costs above are what they are on this kernel and this GPU.
+
+--- a/gdk/gdkglcontextprivate.h
++++ b/gdk/gdkglcontextprivate.h
+@@ -69,6 +69,15 @@
+ 
+   GdkGLContextProgram *current_program;
+ 
++  /* gdk_gl_texture_from_surface's generic upload draws the cairo half of a
++   * paint through this texture: sized to the window in device pixels and
++   * kept from frame to frame, each rectangle uploaded into its own place
++   * with glTexSubImage2D and drawn from there.  Zero until first used;
++   * the storage is redefined when the window's size changes. */
++  guint upload_texture;
++  int upload_texture_width;
++  int upload_texture_height;
++
+   guint is_legacy : 1;
+   guint use_es : 1;
+ } GdkGLContextPaintData;
+@@ -81,12 +90,24 @@
+ void                    gdk_gl_context_set_image_paint_surface  (GdkGLContext    *context,
+                                                                  gboolean         image);
+ gboolean                gdk_gl_context_get_image_paint_surface  (GdkGLContext    *context);
++/* The memory surface itself, held by the context across frames; a new
++ * reference each time. */
++cairo_surface_t *       gdk_gl_context_ref_paint_surface        (GdkGLContext    *context,
++                                                                 int              width,
++                                                                 int              height);
+ 
+ void                    gdk_gl_context_upload_texture           (GdkGLContext    *context,
+                                                                  cairo_surface_t *image_surface,
+                                                                  int              width,
+                                                                  int              height,
+                                                                  guint            texture_target);
++void                    gdk_gl_context_upload_subtexture        (GdkGLContext    *context,
++                                                                 cairo_surface_t *image_surface,
++                                                                 int              x,
++                                                                 int              y,
++                                                                 int              width,
++                                                                 int              height,
++                                                                 guint            texture_target);
+ GdkGLContextPaintData * gdk_gl_context_get_paint_data           (GdkGLContext    *context);
+ gboolean                gdk_gl_context_use_texture_rectangle    (GdkGLContext    *context);
+ gboolean                gdk_gl_context_has_framebuffer_blit     (GdkGLContext    *context);
+--- a/gdk/gdkglcontext.c
++++ b/gdk/gdkglcontext.c
+@@ -113,6 +113,12 @@
+    * gdk_gl_context_set_image_paint_surface(). */
+   guint image_paint_surface : 1;
+ 
++  /* That surface, kept from frame to frame; see
++   * gdk_gl_context_ref_paint_surface(). */
++  cairo_surface_t *paint_surface;
++  int paint_surface_width;
++  int paint_surface_height;
++
+   int use_es;
+ 
+   GdkGLContextPaintData *paint_data;
+@@ -151,6 +157,12 @@
+   g_clear_object (&priv->window);
+   g_clear_object (&priv->shared_context);
+ 
++  /* Here rather than in finalize: the surface holds a reference on the
++   * window it was last painted for (gdk_cairo_surface_mark_as_direct),
++   * and a window's destruction disposes its paint context explicitly
++   * while other contexts may still keep it alive as their shared one. */
++  g_clear_pointer (&priv->paint_surface, cairo_surface_destroy);
++
+   G_OBJECT_CLASS (gdk_gl_context_parent_class)->dispose (gobject);
+ }
+ 
+@@ -161,6 +173,7 @@
+   GdkGLContextPrivate *priv = gdk_gl_context_get_instance_private (context);
+ 
+   g_clear_pointer (&priv->paint_data, g_free);
++  g_clear_pointer (&priv->paint_surface, cairo_surface_destroy);
+   G_OBJECT_CLASS (gdk_gl_context_parent_class)->finalize (gobject);
+ }
+ 
+@@ -295,6 +308,71 @@
+     }
+ }
+ 
++/*
++ * gdk_gl_context_upload_subtexture:
++ * @context: a #GdkGLContext
++ * @image_surface: an image surface
++ * @x: where the image lands in the texture, in texels
++ * @y: likewise
++ * @width: the image's width
++ * @height: the image's height
++ * @texture_target: the bound texture target
++ *
++ * gdk_gl_context_upload_texture() for a texture whose storage already
++ * exists: @image_surface lands at (@x, @y) of the texture bound to
++ * @texture_target, with the same pixel-format handling.
++ */
++void
++gdk_gl_context_upload_subtexture (GdkGLContext    *context,
++                                  cairo_surface_t *image_surface,
++                                  int              x,
++                                  int              y,
++                                  int              width,
++                                  int              height,
++                                  guint            texture_target)
++{
++  GdkGLContextPrivate *priv = gdk_gl_context_get_instance_private (context);
++  GLvoid *data;
++  int stride;
++  GLenum format, type;
++
++  g_return_if_fail (GDK_IS_GL_CONTEXT (context));
++
++  data = cairo_image_surface_get_data (image_surface);
++  stride = cairo_image_surface_get_stride (image_surface);
++
++  if (priv->use_es)
++    {
++      format = GL_RGBA;
++      type = GL_UNSIGNED_BYTE;
++    }
++  else
++    {
++      format = GL_BGRA;
++      type = GL_UNSIGNED_INT_8_8_8_8_REV;
++    }
++
++  /* GL_UNPACK_ROW_LENGTH is available on desktop GL, OpenGL ES >= 3.0, or if
++   * the GL_EXT_unpack_subimage extension for OpenGL ES 2.0 is available
++   */
++  if (!priv->use_es ||
++      (priv->use_es && (priv->gl_version >= 30 || priv->has_unpack_subimage)))
++    {
++      glPixelStorei (GL_UNPACK_ALIGNMENT, 4);
++      glPixelStorei (GL_UNPACK_ROW_LENGTH, stride / 4);
++      glTexSubImage2D (texture_target, 0, x, y, width, height, format, type, data);
++      glPixelStorei (GL_UNPACK_ROW_LENGTH, 0);
++    }
++  else
++    {
++      int i;
++
++      for (i = 0; i < height; i++)
++        glTexSubImage2D (texture_target, 0, x, y + i, width, 1, format, type,
++                         (unsigned char *) data + (i * stride));
++    }
++}
++
+ static gboolean
+ gdk_gl_context_real_realize (GdkGLContext  *self,
+                              GError       **error)
+@@ -754,6 +832,55 @@
+   return priv->image_paint_surface;
+ }
+ 
++/*
++ * gdk_gl_context_ref_paint_surface:
++ * @context: a #GdkGLContext
++ * @width: the surface's width, in device pixels
++ * @height: the surface's height, in device pixels
++ *
++ * The memory surface for the cairo half of a GL paint (see
++ * gdk_gl_context_set_image_paint_surface()), held by the context and
++ * handed out again for every frame that wants the same size.
++ *
++ * A surface for a window of any real size is several megabytes, which is
++ * above what a C library serves from its heap: allocated per frame it
++ * arrived as fresh pages, every one of them faulted in as the paint
++ * touched it, and went back to the kernel at the end of the paint with
++ * the invalidation of every other processor's translations that an unmap
++ * carries -- per frame, for as long as the window kept repainting, and
++ * in proportion to its area.  Nothing of the previous frame is ever read:
++ * a paint clears the region it is about to draw before drawing it.
++ *
++ * Returns: (transfer full): the surface, with a reference for the caller
++ */
++cairo_surface_t *
++gdk_gl_context_ref_paint_surface (GdkGLContext *context,
++                                  int           width,
++                                  int           height)
++{
++  GdkGLContextPrivate *priv = gdk_gl_context_get_instance_private (context);
++
++  g_return_val_if_fail (GDK_IS_GL_CONTEXT (context), NULL);
++
++  width = MAX (width, 1);
++  height = MAX (height, 1);
++
++  if (priv->paint_surface != NULL &&
++      (priv->paint_surface_width != width ||
++       priv->paint_surface_height != height ||
++       cairo_surface_status (priv->paint_surface) != CAIRO_STATUS_SUCCESS))
++    g_clear_pointer (&priv->paint_surface, cairo_surface_destroy);
++
++  if (priv->paint_surface == NULL)
++    {
++      priv->paint_surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, width, height);
++      priv->paint_surface_width = width;
++      priv->paint_surface_height = height;
++    }
++
++  return cairo_surface_reference (priv->paint_surface);
++}
++
+ /**
+  * gdk_gl_context_set_use_es:
+  * @context: a #GdkGLContext:
+--- a/gdk/gdkgl.c
++++ b/gdk/gdkgl.c
+@@ -767,6 +767,112 @@
+   cairo_surface_get_device_offset (surface,
+                                    &device_x_offset, &device_y_offset);
+ 
++#define FLIP_Y(_y) (unscaled_window_height - (_y))
++
++  if (!use_texture_rectangle)
++    {
++      /* One texture the size of the window, kept from frame to frame (see
++       * GdkGLContextPaintData): each rectangle is uploaded into its own
++       * place in it and drawn from there, so a frame costs one upload per
++       * rectangle and nothing else.  The path below defines a new texture
++       * for every rectangle of every frame and destroys it after the
++       * draw; on a device where defining a texture is a round trip to the
++       * host and an allocation in the kernel, that -- times the number of
++       * rectangles a frame repaints -- is where the frame's time went. */
++      GdkGLContextPaintData *paint_data = gdk_gl_context_get_paint_data (paint_context);
++      GdkTexturedQuad *quads;
++      cairo_rectangle_int_t extents;
++      int texture_width, texture_height;
++      int n_quads = 0;
++
++      texture_width = MAX (gdk_window_get_width (window) * window_scale, 1);
++      texture_height = MAX (gdk_window_get_height (window) * window_scale, 1);
++
++      if (paint_data->upload_texture == 0)
++        {
++          glGenTextures (1, &paint_data->upload_texture);
++          glBindTexture (GL_TEXTURE_2D, paint_data->upload_texture);
++          glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++          glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++          glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++          glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++          paint_data->upload_texture_width = 0;
++          paint_data->upload_texture_height = 0;
++        }
++      else
++        glBindTexture (GL_TEXTURE_2D, paint_data->upload_texture);
++
++      if (paint_data->upload_texture_width != texture_width ||
++          paint_data->upload_texture_height != texture_height)
++        {
++          if (gdk_gl_context_get_use_es (paint_context))
++            glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA, texture_width, texture_height, 0,
++                          GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++          else
++            glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA, texture_width, texture_height, 0,
++                          GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
++          paint_data->upload_texture_width = texture_width;
++          paint_data->upload_texture_height = texture_height;
++        }
++
++      n_rects = cairo_region_num_rectangles (region);
++      quads = g_new (GdkTexturedQuad, n_rects);
++
++      for (i = 0; i < n_rects; i++)
++        {
++          int tx, ty, tw, th;
++
++          cairo_region_get_rectangle (region, i, &rect);
++
++          e = rect;
++          e.x *= sx;
++          e.y *= sy;
++          e.x += (int)device_x_offset;
++          e.y += (int)device_y_offset;
++          e.width *= sx;
++          e.height *= sy;
++
++          /* Where the rectangle sits in the window, in device pixels: the
++           * same place it takes in the texture. */
++          tx = rect.x * window_scale;
++          ty = rect.y * window_scale;
++          tw = MIN (e.width, texture_width - tx);
++          th = MIN (e.height, texture_height - ty);
++          if (tx < 0 || ty < 0 || tw <= 0 || th <= 0)
++            continue;
++
++          image = cairo_surface_map_to_image (surface, &e);
++          if (cairo_surface_status (image) == CAIRO_STATUS_SUCCESS)
++            {
++              GdkTexturedQuad quad = {
++                tx, FLIP_Y (ty),
++                tx + tw, FLIP_Y (ty + th),
++                tx / (float) texture_width, ty / (float) texture_height,
++                (tx + tw) / (float) texture_width, (ty + th) / (float) texture_height,
++              };
++
++              gdk_gl_context_upload_subtexture (paint_context, image, tx, ty, tw, th, GL_TEXTURE_2D);
++              quads[n_quads++] = quad;
++            }
++          cairo_surface_unmap_image (surface, image);
++        }
++
++      if (n_quads > 0)
++        {
++          /* Every quad covers exactly its own rectangle, so one scissor
++           * around them all is all the clipping the draw needs. */
++          cairo_region_get_extents (region, &extents);
++          glEnable (GL_SCISSOR_TEST);
++          glScissor (extents.x * window_scale, FLIP_Y ((extents.y + extents.height) * window_scale),
++                     extents.width * window_scale, extents.height * window_scale);
++          gdk_gl_texture_quads (paint_context, GL_TEXTURE_2D, n_quads, quads, TRUE);
++          glDisable (GL_SCISSOR_TEST);
++        }
++
++      g_free (quads);
++      return;
++    }
++
+   glGenTextures (1, &texture_id);
+   if (use_texture_rectangle)
+     target = GL_TEXTURE_RECTANGLE_ARB;
+@@ -783,8 +889,6 @@
+ 
+   n_rects = cairo_region_num_rectangles (region);
+ 
+-#define FLIP_Y(_y) (unscaled_window_height - (_y))
+-
+   for (i = 0; i < n_rects; i++)
+     {
+       cairo_region_get_rectangle (region, i, &rect);
+--- a/gdk/gdkwindow.c
++++ b/gdk/gdkwindow.c
+@@ -3009,10 +3009,17 @@
+            * window's own surface would be. */
+           int scale = gdk_window_get_scale_factor (window);
+ 
++          /* Held by the context from frame to frame and sized to the
++           * window rather than to this paint's clip box, so that a window
++           * repainting continuously does not allocate, fault in and
++           * release several megabytes per frame.  The device offset below
++           * puts the clip box's origin at the surface's, as it would in a
++           * surface cut to size; nothing outside the region about to be
++           * painted is read back out of it. */
+           window->current_paint.surface =
+-            cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+-                                        MAX (clip_box.width, 1) * scale,
+-                                        MAX (clip_box.height, 1) * scale);
++            gdk_gl_context_ref_paint_surface (window->gl_paint_context,
++                                              gdk_window_get_width (window) * scale,
++                                              gdk_window_get_height (window) * scale);
+           cairo_surface_set_device_scale (window->current_paint.surface, scale, scale);
+         }
+       else

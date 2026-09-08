@@ -1377,7 +1377,8 @@ void sched_defer_reap(
 	task_t *child); // waitpid reap: unlink from parent, destroy deferred
 task_t *sched_find_task_by_id(uint32_t pid); // Find task by PID
 task_t *sched_find_task_by_id_locked(
-	uint32_t pid); // Find task by PID (caller holds g_task_list_lock)
+	uint32_t pid);
+task_t *sched_find_next_task_by_id_locked(uint32_t min_id); // Find task by PID (caller holds g_task_list_lock)
 task_t *sched_task_by_canary(
 	uint64_t canary); // Crash diagnostic: lock-free, __stack_chk_fail only
 

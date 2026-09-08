@@ -59,10 +59,10 @@ static inline int __atomic_xchg(volatile int *ptr, int new_val)
 	return __sync_lock_test_and_set(ptr, new_val);
 }
 
-// Get current thread ID
+// Get current thread ID (cached in the TCB; see __pthread_tid)
 static inline pid_t __gettid(void)
 {
-	return gettid();
+	return __pthread_tid();
 }
 
 // Add mutex to robust list

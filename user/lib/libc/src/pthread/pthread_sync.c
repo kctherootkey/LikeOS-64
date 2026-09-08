@@ -230,7 +230,7 @@ int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
 	if (!rwlock)
 		return EINVAL;
 
-	pid_t tid = gettid();
+	pid_t tid = __pthread_tid();
 
 	// Indicate we're waiting to write (gives us priority over new readers)
 	__atomic_add(&rwlock->waiters_writers, 1);
@@ -270,7 +270,7 @@ int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
 
 	if (__atomic_cas(&rwlock->state, RWLOCK_UNLOCKED, RWLOCK_WRITELOCKED) ==
 	    RWLOCK_UNLOCKED) {
-		rwlock->writer_tid = gettid();
+		rwlock->writer_tid = __pthread_tid();
 		return 0;
 	}
 
@@ -285,7 +285,7 @@ int pthread_rwlock_timedwrlock(pthread_rwlock_t *rwlock,
 	if (!abstime)
 		return pthread_rwlock_wrlock(rwlock);
 
-	pid_t tid = gettid();
+	pid_t tid = __pthread_tid();
 
 	__atomic_add(&rwlock->waiters_writers, 1);
 

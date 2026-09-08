@@ -1005,19 +1005,29 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
      * Must be done before mm_destroy_address_space(old) frees the old TLS. */
 	setup_user_tls_canary(pml4, cur);
 
-	cur->pml4 = pml4;
-	/* And the shared record, if this process has one.
-	 *
-	 * Any process that has ever created a thread carries an mm_struct, and
-	 * it keeps its own copy of the page-table root.  Updating only the task
-	 * left that copy pointing at the address space destroyed a few lines
-	 * below -- so the next release of the mm_struct handed a long-dead page
-	 * table to be taken apart a second time, feeding the page-table pool
-	 * memory it had already been given.  Harmless only for as long as
-	 * nothing routed an ordinary exit through the mm_struct; the teardown
-	 * path does. */
-	if (cur->mm)
-		cur->mm->pml4 = pml4;
+	/* Published under g_task_list_lock (see exit_mm_self): a
+	 * sys_getprocinfo walker that read the old root under the lock must
+	 * be out of the old tables before they are destroyed below, and the
+	 * lock is what orders the two. */
+	{
+		uint64_t lflags;
+		spin_lock_irqsave(&g_task_list_lock, &lflags);
+		cur->pml4 = pml4;
+		/* And the shared record, if this process has one.
+		 *
+		 * Any process that has ever created a thread carries an
+		 * mm_struct, and it keeps its own copy of the page-table root.
+		 * Updating only the task left that copy pointing at the
+		 * address space destroyed a few lines below -- so the next
+		 * release of the mm_struct handed a long-dead page table to be
+		 * taken apart a second time, feeding the page-table pool memory
+		 * it had already been given.  Harmless only for as long as
+		 * nothing routed an ordinary exit through the mm_struct; the
+		 * teardown path does. */
+		if (cur->mm)
+			cur->mm->pml4 = pml4;
+		spin_unlock_irqrestore(&g_task_list_lock, lflags);
+	}
 	cur->brk_start = lr.brk_start;
 	cur->brk = lr.brk_start;
 	cur->user_stack_top = USER_STACK_TOP_EXEC;

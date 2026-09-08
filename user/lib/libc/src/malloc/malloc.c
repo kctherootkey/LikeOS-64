@@ -88,7 +88,16 @@ extern int futex_wake(volatile int *uaddr, int count);
 #define TCACHE_DEAD        ((void *)1)
 
 #define DEFAULT_MMAP_THRESHOLD      (128UL * 1024)
-#define MMAP_THRESHOLD_MAX          (4UL * 1024 * 1024)
+/* Ceiling of the sliding threshold, as the reference sets it for 64-bit
+ * (4 MB times the word size).  A request above it is ALWAYS mapped and
+ * always unmapped again on free, whatever the workload has taught the
+ * threshold -- so this is the size from which a buffer that is allocated
+ * and released once per frame (a toolkit's paint surface for a window of
+ * any real size, a decoded image) pays a fresh mapping, a page fault per
+ * page and an unmap with its cross-processor invalidation every time.
+ * At 4 MB that line ran between the window sizes a browser is usable at
+ * and the ones it is not. */
+#define MMAP_THRESHOLD_MAX          (4UL * 1024 * 1024 * sizeof(long))
 #define DEFAULT_MMAP_MAX            32
 #define DEFAULT_TRIM_THRESHOLD      (128UL * 1024)
 #define DEFAULT_TOP_PAD             (128UL * 1024)

@@ -1455,6 +1455,28 @@ static uint32_t ring_free(uint32_t head, uint32_t tail, uint32_t size)
 	return size - 1 - used;
 }
 
+/* Append `len` bytes to the receive ring at rx_tail, splitting the copy at
+ * the wrap.  Stores at most the free space and returns the count stored;
+ * the caller advances rcv_nxt by that much.  Caller holds conn->lock. */
+static uint32_t tcp_rx_ring_store(tcp_conn_t *conn, const uint8_t *src,
+				  uint32_t len)
+{
+	uint32_t avail =
+		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
+	if (len > avail)
+		len = avail;
+	if (len == 0)
+		return 0;
+	uint32_t first = conn->rx_buf_size - conn->rx_tail;
+	if (first > len)
+		first = len;
+	mm_memcpy(conn->rx_buf + conn->rx_tail, src, first);
+	if (len > first)
+		mm_memcpy(conn->rx_buf, src + first, len - first);
+	conn->rx_tail = (conn->rx_tail + len) % conn->rx_buf_size;
+	return len;
+}
+
 // ============================================================================
 // Send TCP Segment
 // ============================================================================
@@ -1681,9 +1703,20 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	tcp_publish_conn(conn);
 	spin_unlock_irqrestore(&tcp_lock, flags);
 
-	// Send SYN
-	tcp_send_syn_packet(dev, local_ip, dst_ip, src_port, dst_port,
-			    conn->iss, 0, TCP_SYN, TCP_WINDOW_SIZE, conn);
+	// Send SYN.  A local drop (skb pool empty under a burst) is not
+	// network loss: retry on the short local-drop interval rather than
+	// waiting out a full SYN retransmit period, as the timer already
+	// does for its own resends.
+	if (tcp_send_syn_packet(dev, local_ip, dst_ip, src_port, dst_port,
+				conn->iss, 0, TCP_SYN, TCP_WINDOW_SIZE,
+				conn) < 0) {
+		uint64_t cflags;
+		tcp_lock_acquire(&conn->lock, &cflags);
+		if (conn->state == TCP_STATE_SYN_SENT)
+			conn->retransmit_tick =
+				timer_ticks() + TCP_LOCAL_DROP_RETRY_TICKS;
+		tcp_lock_release(&conn->lock, cflags);
+	}
 
 	return conn;
 }
@@ -1859,7 +1892,7 @@ int tcp_close(tcp_conn_t *conn)
 			conn->dev, conn->local_ip, conn->remote_ip,
 			conn->local_port, conn->remote_port, conn->snd_nxt,
 			conn->rcv_nxt, TCP_FIN | TCP_ACK,
-			(uint16_t)conn->rcv_wnd, NULL, 0);
+			tcp_advertised_window(conn), NULL, 0);
 		// Queue the FIN for retransmit whether or not the immediate
 		// send succeeded.  A local drop (skb pool exhausted under load)
 		// must not swallow the FIN: if it is not queued, snd_nxt never
@@ -1884,7 +1917,7 @@ int tcp_close(tcp_conn_t *conn)
 			conn->dev, conn->local_ip, conn->remote_ip,
 			conn->local_port, conn->remote_port, conn->snd_nxt,
 			conn->rcv_nxt, TCP_FIN | TCP_ACK,
-			(uint16_t)conn->rcv_wnd, NULL, 0);
+			tcp_advertised_window(conn), NULL, 0);
 		// Same local-drop safety as the ESTABLISHED case above.
 		if (tcp_queue_inflight(conn, conn->snd_nxt, TCP_FIN | TCP_ACK,
 				       NULL, 0) == 0) {
@@ -2588,6 +2621,15 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 		return;
 	}
 
+	/* Send-side readiness on entry.  ACK processing below frees inflight
+	 * slots and a window advertisement can reopen a closed peer window;
+	 * both flip tx_ready 0->1, and a writer parked in poll(POLLOUT) --
+	 * every GLib socket, so every browser request -- learns of it only
+	 * from a wake.  None of those paths woke anybody: the poller sat
+	 * until some unrelated descriptor fired.  Compared at
+	 * deferred_ack_out, once for the whole segment. */
+	int tx_was_ready = conn->tx_ready;
+
 	// Central inbound validation for the fully-synchronized states
 	// (RST / blind-SYN / PAWS in one place — see tcp_validate_incoming).
 	// The handshake states and TIME_WAIT keep their own handling below.
@@ -3004,34 +3046,32 @@ established_segment:
 			}
 		}
 
+		/* A segment that starts before rcv_nxt and reaches past it
+		 * carries bytes we already have followed by bytes we do not:
+		 * the retransmission of a segment we could only partly store
+		 * (ring full), or one the peer re-segmented when it collapsed
+		 * small skbs for a retransmit.  It used to fall through to the
+		 * "already received" branch and be discarded whole, so the
+		 * peer -- which had already received the ACK for the prefix
+		 * -- re-sent the same tail at every backed-off RTO and got the
+		 * same dup-ACK back.  Trim the stale prefix and take the rest
+		 * in order (RFC 9293 §3.10.7.4 accepts any segment that
+		 * overlaps the window). */
+		if (payload_len > 0 && (int32_t)(seq - conn->rcv_nxt) < 0 &&
+		    (int32_t)(seq + payload_len - conn->rcv_nxt) > 0) {
+			uint32_t trim = conn->rcv_nxt - seq;
+			payload += trim;
+			payload_len = (uint16_t)(payload_len - trim);
+			seq = conn->rcv_nxt;
+		}
+
 		// Process data: in-order vs out-of-order
 		if (payload_len > 0) {
 			if (seq == conn->rcv_nxt) {
-				uint32_t avail =
-					ring_free(conn->rx_head, conn->rx_tail,
-						  conn->rx_buf_size);
-				uint32_t copy = payload_len;
-				if (copy > avail)
-					copy = avail;
-				/* Bulk-copy into the rx ring, splitting at the buffer wrap.
-                 * Previously this was a per-byte loop under conn->lock —
-                 * ~1460 dependent stores per segment, and the same pattern
-                 * repeats in the OOO drain below. */
-				if (copy > 0) {
-					uint32_t first = conn->rx_buf_size -
-							 conn->rx_tail;
-					if (first > copy)
-						first = copy;
-					mm_memcpy(conn->rx_buf + conn->rx_tail,
-						  payload, first);
-					if (copy > first) {
-						mm_memcpy(conn->rx_buf,
-							  payload + first,
-							  copy - first);
-					}
-					conn->rx_tail = (conn->rx_tail + copy) %
-							conn->rx_buf_size;
-				}
+				/* Bulk-copy into the rx ring (split at the wrap);
+				 * stores what fits, the peer resends the rest. */
+				uint32_t copy = tcp_rx_ring_store(conn, payload,
+								  payload_len);
 				conn->rcv_nxt += copy;
 				/* Only wake the reader when at least one byte was stored.
                  * Setting rx_ready=1 with copy=0 (ring full, probe dropped)
@@ -3068,49 +3108,78 @@ established_segment:
 					tcp_grow_rx_buf(conn);
 				}
 
-				// Drain any contiguous OOO segments
+				/* Drain the reassembly queue.  A queued entry can
+				 * start BEFORE rcv_nxt: the peer re-segmented on
+				 * retransmit, or the in-order segment just stored
+				 * overlapped it.  The drain used to wait for an
+				 * exact seq match that never came, so the entry
+				 * pinned its slot for the life of the connection
+				 * and its bytes -- which the peer had seen SACKed
+				 * and would not resend until it detected reneging
+				 * -- were never delivered.  Trim the stale prefix
+				 * instead, and discard an entry lying entirely
+				 * behind rcv_nxt. */
+				int had_ooo = conn->ooo_count > 0;
 				int progress = 1;
 				while (progress && conn->ooo_count > 0) {
 					progress = 0;
 					for (uint8_t k = 0; k < conn->ooo_count;
 					     k++) {
-						if (conn->ooo[k].seq ==
-						    conn->rcv_nxt) {
-							uint16_t l =
-								conn->ooo[k]
-									.len;
-							uint32_t a2 = ring_free(
-								conn->rx_head,
-								conn->rx_tail,
-								conn->rx_buf_size);
-							if (l > a2)
-								l = (uint16_t)
-									a2;
-							for (uint16_t j = 0;
-							     j < l; j++) {
-								conn->rx_buf
-									[conn->rx_tail] =
-									conn->ooo[k]
-										.data[j];
-								conn->rx_tail =
-									(conn->rx_tail +
-									 1) %
-									conn->rx_buf_size;
+						tcp_ooo_segment_t *e =
+							&conn->ooo[k];
+						int32_t off = (int32_t)(
+							conn->rcv_nxt - e->seq);
+						if (off < 0)
+							continue; /* still ahead */
+						if (off < (int32_t)e->len) {
+							uint16_t l = (uint16_t)(
+								e->len - off);
+							uint32_t st =
+								tcp_rx_ring_store(
+									conn,
+									e->data +
+										off,
+									l);
+							conn->rcv_nxt += st;
+							if (st < l) {
+								/* Ring full (cannot
+								 * happen for data
+								 * inside the window
+								 * we advertised):
+								 * keep the rest
+								 * queued at its new
+								 * start. */
+								uint32_t skip =
+									(uint32_t)off +
+									st;
+								uint16_t rem =
+									(uint16_t)(l -
+										   st);
+								for (uint16_t j =
+									     0;
+								     j < rem;
+								     j++)
+									e->data[j] =
+										e->data[skip +
+											j];
+								e->seq +=
+									skip;
+								e->len = rem;
+								if (st == 0)
+									continue;
+								progress = 1;
+								break;
 							}
-							conn->rcv_nxt += l;
-							// Remove this entry
-							for (uint8_t m = k + 1;
-							     m <
-							     conn->ooo_count;
-							     m++)
-								conn->ooo[m -
-									  1] =
-									conn->ooo
-										[m];
-							conn->ooo_count--;
-							progress = 1;
-							break;
 						}
+						/* Consumed (or entirely stale):
+						 * remove this entry. */
+						for (uint8_t m = k + 1;
+						     m < conn->ooo_count; m++)
+							conn->ooo[m - 1] =
+								conn->ooo[m];
+						conn->ooo_count--;
+						progress = 1;
+						break;
 					}
 				}
 
@@ -3127,8 +3196,14 @@ established_segment:
                  * OOO segments and PSH still force an immediate ACK to
                  * avoid hurting interactive / handshake latency. */
 				conn->segs_since_ack++;
+				/* had_ooo: this segment filled (part of) a gap.
+				 * RFC 5681 §4.2 wants that ACKed at once -- the
+				 * peer is in loss recovery and its next move
+				 * waits on it.  The test used to look at
+				 * ooo_count AFTER the drain, so a retransmit
+				 * that closed the last hole was delay-ACKed. */
 				if (conn->segs_since_ack >= 4 ||
-				    conn->ooo_count > 0 ||
+				    conn->ooo_count > 0 || had_ooo ||
 				    (tcp_flags & TCP_PSH)) {
 					tcp_queue_ack_locked(conn);
 					ack_pending = 1;
@@ -3144,16 +3219,22 @@ established_segment:
 				}
 			} else if ((int32_t)(seq - conn->rcv_nxt) > 0 &&
 				   payload_len <= TCP_MSS) {
-				// Out-of-order: insert sorted, dedup
+				// Out-of-order: insert sorted; a segment already
+				// covered by a queued entry is a duplicate.
+				// Partial overlaps are queued as-is and trimmed
+				// by the drain.
 				int dup = 0;
 				uint8_t pos = 0;
 				for (; pos < conn->ooo_count; pos++) {
-					if (conn->ooo[pos].seq == seq) {
+					uint32_t qs = conn->ooo[pos].seq;
+					uint32_t qe = qs + conn->ooo[pos].len;
+					if ((int32_t)(seq - qs) >= 0 &&
+					    (int32_t)((seq + payload_len) -
+						      qe) <= 0) {
 						dup = 1;
 						break;
 					}
-					if ((int32_t)(seq -
-						      conn->ooo[pos].seq) < 0)
+					if ((int32_t)(seq - qs) < 0)
 						break;
 				}
 				if (!dup && conn->ooo_count < TCP_MAX_OOO) {
@@ -3461,6 +3542,9 @@ established_segment:
 	}
 
 deferred_ack_out:;
+	if (!tx_was_ready && conn->tx_ready)
+		tcp_poll_notify(conn);
+
 	/* Snapshot the deferred ACK params UNDER conn->lock, then release
      * the lock, then transmit.  This removes the NIC TX (skb build +
      * checksum + tx_lock + MMIO doorbell) from the conn->lock-held
@@ -3537,6 +3621,10 @@ void tcp_timer_tick(void)
 		void *shed_rx = NULL, *shed_tx = NULL, *shed_if = NULL,
 		     *shed_ooo = NULL;
 		tcp_lock_acquire(&conn->lock, &flags);
+		/* The cork deadline and the SACK-covered-head drop below can
+		 * flip tx_ready 0->1; pollers waiting for POLLOUT need the
+		 * wake (see tcp_rx). */
+		int tx_was_ready = conn->tx_ready;
 
 		// Terminally-dead connections are reclaimed by reference counting
 		// (tcp_conn_kill drops the protocol reference; the connection is
@@ -3793,7 +3881,7 @@ void tcp_timer_tick(void)
 					conn->remote_ip, conn->local_port,
 					conn->remote_port, conn->snd_una - 1,
 					conn->rcv_nxt, TCP_ACK,
-					(uint16_t)conn->rcv_wnd, NULL, 0);
+					tcp_advertised_window(conn), NULL, 0);
 				conn->keep_probes_sent = 1;
 				conn->keep_next_tick =
 					now + conn->keepintvl_ticks;
@@ -3808,7 +3896,7 @@ void tcp_timer_tick(void)
 					conn->remote_ip, conn->local_port,
 					conn->remote_port, conn->snd_una - 1,
 					conn->rcv_nxt, TCP_ACK,
-					(uint16_t)conn->rcv_wnd, NULL, 0);
+					tcp_advertised_window(conn), NULL, 0);
 				conn->keep_probes_sent++;
 				conn->keep_next_tick =
 					now + conn->keepintvl_ticks;
@@ -3829,7 +3917,7 @@ void tcp_timer_tick(void)
 					 conn->remote_ip, conn->local_port,
 					 conn->remote_port, conn->snd_una - 1,
 					 conn->rcv_nxt, TCP_ACK,
-					 (uint16_t)conn->rcv_wnd, NULL, 0);
+					 tcp_advertised_window(conn), NULL, 0);
 			NET_STATS_INC(NET_MIB_TCP_PERSISTPROBES);
 			if (conn->persist_backoff < 7)
 				conn->persist_backoff++;
@@ -3841,6 +3929,8 @@ void tcp_timer_tick(void)
 		}
 
 unlock_conn:
+		if (!tx_was_ready && conn->tx_ready)
+			tcp_poll_notify(conn);
 		tcp_lock_release(&conn->lock, flags);
 
 		// Free any shed TIME_WAIT buffers now that conn->lock is dropped.
@@ -4107,11 +4197,20 @@ void tcp_dump_table(struct tty *tty)
 		tty,
 		"slot st       laddr:lport            raddr:rport       p= ar rc tr cw ss if snd_wnd rcv_buf rcv_adv ws ts sack srtt rto rnxt-snxt-suna\n");
 	int i = 0;
+	uint64_t now = timer_ticks();
 	// Best-effort lock-free walk (diagnostic): a torn read at worst
 	// garbles one line.
 	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next, i++) {
 		if (!c->active)
 			continue;
+		/* idle = time since the last segment from the peer; bo = RTO
+		 * backoff exponent; da = dup-ACKs counted; dack = delayed ACK
+		 * armed; adv = free bytes at our last advertisement; pers =
+		 * zero-window persist probe armed. */
+		uint64_t idle_ms = (c->last_rx_tick && now > c->last_rx_tick) ?
+					   (now - c->last_rx_tick) *
+						   timer_us_per_tick() / 1000 :
+					   0;
 		const char *s = (c->state <= TCP_STATE_TIME_WAIT) ?
 					sn[c->state] :
 					"???";
@@ -4127,7 +4226,7 @@ void tcp_dump_table(struct tty *tty)
 		uint32_t free_b = c->rx_buf_size - used;
 		tty_printf(
 			tty,
-			"%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d ar=%u rc=%u tr=%u cw=%u ss=%u if=%u snd_wnd=%u rcv_buf=%u rcv_adv=%u ws=%d/%d ts=%d sack=%d srtt=%u rto=%u rnxt=%u snxt=%u suna=%u rxh=%u rxt=%u rxrdy=%d used=%u ooo=%u txrdy=%d\n",
+			"%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d ar=%u rc=%u tr=%u cw=%u ss=%u if=%u snd_wnd=%u rcv_buf=%u rcv_adv=%u ws=%d/%d ts=%d sack=%d srtt=%u rto=%u rnxt=%u snxt=%u suna=%u rxh=%u rxt=%u rxrdy=%d used=%u ooo=%u txrdy=%d idle=%llums bo=%u da=%u dack=%d adv=%u pers=%d\n",
 			i, s, (li >> 24) & 0xff, (li >> 16) & 0xff,
 			(li >> 8) & 0xff, li & 0xff, c->local_port,
 			(ri >> 24) & 0xff, (ri >> 16) & 0xff, (ri >> 8) & 0xff,
@@ -4142,7 +4241,11 @@ void tcp_dump_table(struct tty *tty)
 			(unsigned)c->srtt_us, (unsigned)c->rto_us, c->rcv_nxt,
 			c->snd_nxt, c->snd_una, (unsigned)c->rx_head,
 			(unsigned)c->rx_tail, (int)c->rx_ready, (unsigned)used,
-			(unsigned)c->ooo_count, (int)c->tx_ready);
+			(unsigned)c->ooo_count, (int)c->tx_ready,
+			(unsigned long long)idle_ms, (unsigned)c->rto_backoff,
+			(unsigned)c->dup_acks, (int)c->delayed_ack_pending,
+			(unsigned)c->rcv_adv_last_bytes,
+			(int)(c->persist_tick != 0));
 	}
 
 	/* Network-RX / softirq state — to localise a loopback delivery stall:

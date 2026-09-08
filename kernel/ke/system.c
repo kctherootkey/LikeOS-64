@@ -284,32 +284,47 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 
 	uint64_t flags;
 	int count = 0;
-	spin_lock_irqsave(&g_task_list_lock, &flags);
 
-	// g_task_list_head is declared static in sched.c, but we can
-	// iterate using sched_find_task_by_id or we use extern.
-	// Actually we declared g_task_list_lock extern in sched.h,
-	// but not g_task_list_head. Let's just use a different approach:
-	// iterate IDs from 0 upward.
-	// Actually, let's access the list directly. We need to declare it extern.
-	// For now, use the approach of iterating via sched_find_task_by_id
-	// which acquires its own lock... but we already hold the lock.
-	// Better: we declared an extern iterator in the header or iterate by PID.
+	/* Walk the live tasks in id order, one task per lock hold.
+	 *
+	 * This used to try every id from 0 to g_next_id, taking and dropping
+	 * g_task_list_lock for each and scanning the whole task list inside.
+	 * Ids are never reused, so after hours of a browser creating threads
+	 * that was tens of thousands of holds, each with interrupts off and
+	 * the lock re-taken within a few instructions of its release.  A CPU
+	 * already spinning for the lock (every wake goes through it) never won
+	 * that race and sat with interrupts off for the whole listing: it
+	 * could not acknowledge TLB shootdowns, so every unmap on the machine
+	 * waited out the one-second timeout, and `top' itself took seconds per
+	 * refresh.  Now the number of holds is the number of tasks, whatever
+	 * ids have been issued. */
 
-	// We'll iterate PIDs. Not ideal but safe. sched_find_task_by_id
-	// acquires the lock internally, so we must NOT hold it here.
-	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	/* Resident-set counts belong to an address space, not a thread:
+	 * remembered for the duration of the call so a 30-thread process has
+	 * its page tables walked once, not 30 times.  Keyed by owner id as
+	 * well as root, so a root recycled by a new process between two holds
+	 * cannot be served the old count. */
+	struct {
+		uint64_t *pml4;
+		int owner_id;
+		uint64_t rss;
+	} rss_cache[64];
+	int nrss = 0;
 
-	// Iterate all possible PIDs (g_next_id is the next ID to assign)
-	extern int g_next_id;
-	int max_pid = g_next_id;
-
-	for (int pid = 0; pid < max_pid && count < (int)max_count; pid++) {
+	uint32_t next_id = 0;
+	for (;;) {
+		if (count >= (int)max_count)
+			break;
 		spin_lock_irqsave(&g_task_list_lock, &flags);
-		task_t *t = sched_find_task_by_id_locked(pid);
-		if (!t || sched_task_hidden(t)) {
-			/* Skip empty slots and the kernel's swapper-class tasks
-			 * (bootstrap + idle), which are not real processes. */
+		task_t *t = sched_find_next_task_by_id_locked(next_id);
+		if (!t) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			break;
+		}
+		next_id = (uint32_t)t->id + 1;
+		if (sched_task_hidden(t)) {
+			/* The kernel's swapper-class tasks (bootstrap + idle)
+			 * are not real processes. */
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			continue;
 		}
@@ -404,17 +419,36 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 			 * memory but keeps its address space looked like an
 			 * unbounded leak under the old number.
 			 *
-			 * KNOWN COST: this walks the page tables with
-			 * g_task_list_lock held and interrupts off, for a time
-			 * proportional to the process's resident set.  Moving
-			 * it outside the lock needs something to keep the
-			 * address space alive once the lock is dropped, and no
-			 * such reference exists yet -- doing it without one
-			 * would trade a long lock hold for a use-after-free on
-			 * the page tables, which is worse.  Left here
-			 * deliberately until address-space lifetime is
-			 * refcounted. */
-			p->rss = mm_count_resident_pages(mm->pml4);
+			 * Walked with g_task_list_lock held, which is what keeps
+			 * the tables alive: exit_mm_self() withdraws a root and
+			 * exec publishes a new one under this lock, and the
+			 * reaper unlinks a task under it before freeing
+			 * anything.  The hold is one address space long (a
+			 * few hundred microseconds for a large process), and
+			 * paid once per address space per call. */
+			{
+				int hit = -1;
+				for (int c = 0; c < nrss; c++) {
+					if (rss_cache[c].pml4 == mm->pml4 &&
+					    rss_cache[c].owner_id == mm->id) {
+						hit = c;
+						break;
+					}
+				}
+				if (hit >= 0) {
+					p->rss = rss_cache[hit].rss;
+				} else {
+					p->rss = mm_count_resident_pages(
+						mm->pml4);
+					if (nrss < 64) {
+						rss_cache[nrss].pml4 = mm->pml4;
+						rss_cache[nrss].owner_id =
+							mm->id;
+						rss_cache[nrss].rss = p->rss;
+						nrss++;
+					}
+				}
+			}
 		}
 
 		// Copy comm

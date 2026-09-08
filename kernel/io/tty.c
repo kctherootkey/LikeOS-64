@@ -1121,11 +1121,21 @@ long tty_write(tty_t *tty, const void *buf, long count)
 void __attribute__((format(printf, 2, 3))) tty_printf(tty_t *tty,
 						      const char *fmt, ...)
 {
-	char buf[320];
+	/* 512: a Ctrl+N TCP table line runs to ~370 characters with a
+	 * 15-character peer address and full-width sequence numbers.  At 320
+	 * it was cut off after `adv=' -- and since kvsnprintf returns the
+	 * length the line WOULD have had, tty_write was handed that longer
+	 * count and printed whatever lay past the buffer on the stack as the
+	 * tail of the line. */
+	char buf[512];
 	va_list args;
 	__builtin_va_start(args, fmt);
 	int len = kvsnprintf(buf, sizeof(buf), fmt, args);
 	__builtin_va_end(args);
+	if (len < 0)
+		return;
+	if (len > (int)sizeof(buf) - 1)
+		len = (int)sizeof(buf) - 1;
 	if (tty)
 		tty_write(tty, buf, len);
 	else

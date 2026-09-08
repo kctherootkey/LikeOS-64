@@ -2577,6 +2577,22 @@ task_t *sched_find_task_by_id_locked(uint32_t id)
 	return NULL;
 }
 
+/* The live task with the smallest id >= min_id, or NULL.  Lets a caller
+ * walk the list in id order while dropping g_task_list_lock between steps:
+ * a task's `next' pointer is worthless once the lock is gone, an id is not.
+ * Caller holds g_task_list_lock. */
+task_t *sched_find_next_task_by_id_locked(uint32_t min_id)
+{
+	task_t *best = NULL;
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		if ((uint32_t)t->id < min_id)
+			continue;
+		if (!best || (uint32_t)t->id < (uint32_t)best->id)
+			best = t;
+	}
+	return best;
+}
+
 /* Parent/child lists are protected by g_wait_lock.
  *
  * They used to be maintained with no lock whatsoever, while sys_waitpid() read
@@ -2783,8 +2799,18 @@ void exit_mm_self(task_t *task)
 	 * which by the next line is true.  Reversed, the same window has the
 	 * kernel faulting on a user address for a task that no longer has
 	 * one mapped. */
-	task->pml4 = NULL;
-	task->mm = NULL;
+	/* Under g_task_list_lock: sys_getprocinfo reads a task's page-table
+	 * root under that lock and walks the tables while still holding it,
+	 * so the root must not be withdrawn -- and the tables freed below --
+	 * while a walker that found it is inside them.  exec publishes its
+	 * new root the same way. */
+	{
+		uint64_t lflags;
+		spin_lock_irqsave(&g_task_list_lock, &lflags);
+		task->pml4 = NULL;
+		task->mm = NULL;
+		spin_unlock_irqrestore(&g_task_list_lock, lflags);
+	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	/* Leave the address space before destroying it.  The kernel's own

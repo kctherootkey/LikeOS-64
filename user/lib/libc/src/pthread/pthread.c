@@ -350,6 +350,11 @@ void __pthread_fork_child(void)
 			self->next = self;
 			self->prev = self;
 			__thread_list_head = self;
+			/* The TCB was copied from the parent and still carries
+			 * the parent thread's id; the mutex and rwlock code
+			 * reads its owner id from here (__pthread_tid). */
+			self->tid = gettid();
+			self->tid_futex = self->tid;
 		}
 		/* Zombie stacks recorded in the parent belong to parent
 		 * threads; drop them rather than munmap addresses the child
@@ -589,6 +594,11 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 		__rtld_tls_init(tcb);
 
 	tcb->self = tcb;
+	/* Not the previous occupant's: a recycled stack carries the TCB of a
+	 * thread that is gone, and __pthread_tid() must see "unknown" until
+	 * clone writes the new id (zero falls back to the syscall). */
+	tcb->tid = 0;
+	tcb->tid_futex = 0;
 	tcb->state = THREAD_STATE_RUNNING;
 	tcb->retval = NULL;
 	tcb->stack_base = stack_base;
