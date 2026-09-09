@@ -36,15 +36,48 @@ struct drm_gem_object *drm_gem_alloc(struct drm_device *dev,
 	return o;
 }
 
+/* Make room for an object's frames before taking any.
+ *
+ * They come from the free list, which the page cache is allowed to grow into
+ * until a few MB remain (its watermarks), and nothing but a page fault
+ * reclaimed on the allocator's behalf.  A texture wants hundreds or thousands
+ * of frames at once, so once the cache had filled RAM every glTexImage2D
+ * failed -- Mesa says GL_OUT_OF_MEMORY -- while MemAvailable, which counts
+ * the cache, told the panel, top and WebKit's pressure monitor that memory
+ * was plentiful.  Objects are created from ioctls: process context, no
+ * filesystem lock held, so reclaiming here is as safe as on a fault.
+ *
+ * The first few times it has to reclaim are logged, so a run that hits this
+ * says so in dmesg instead of leaving the symptom to be guessed at. */
+static void gem_make_room(uint32_t npages)
+{
+	uint64_t before = mm_get_free_pages();
+	uint64_t after;
+
+	mm_reclaim_for_pages(npages);
+	after = mm_get_free_pages();
+	if (after != before) {
+		static unsigned budget = 8;
+
+		if (budget) {
+			budget--;
+			kprintf("drm: gem: reclaimed %lu page-cache pages for a %u-page object, %lu free now\n",
+				(unsigned long)(after - before), npages,
+				(unsigned long)after);
+		}
+	}
+}
+
 int drm_gem_alloc_pages(struct drm_gem_object *o)
 {
 	if (o->pages || o->npages == 0)
 		return 0;
+	gem_make_room(o->npages);
 	o->pages = kalloc(o->npages * sizeof(uint64_t));
 	if (!o->pages)
 		return -ENOMEM;
 	for (uint32_t i = 0; i < o->npages; i++) {
-		o->pages[i] = mm_allocate_physical_page();
+		o->pages[i] = mm_allocate_physical_page_reclaim();
 		if (!o->pages[i]) {
 			for (uint32_t j = 0; j < i; j++)
 				mm_free_physical_page(o->pages[j]);

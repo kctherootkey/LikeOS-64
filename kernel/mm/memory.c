@@ -4905,7 +4905,7 @@ static bool mm_phys_is_mappable(uint64_t phys)
  * pagecache_reclaim_if_needed() spells out.  Dropping the clean ones is what
  * relieves the pressure; the dirty ones become reclaimable once the writeback
  * thread has dealt with them. */
-static uint64_t mm_alloc_page_for_fault(void)
+uint64_t mm_allocate_physical_page_reclaim(void)
 {
 	uint64_t phys = mm_allocate_physical_page();
 
@@ -4919,6 +4919,37 @@ static uint64_t mm_alloc_page_for_fault(void)
 	pagecache_shrink(32, 0);
 	pagecache_request_writeback();
 	return mm_allocate_physical_page();
+}
+
+static uint64_t mm_alloc_page_for_fault(void)
+{
+	return mm_allocate_physical_page_reclaim();
+}
+
+/* Make room for an allocation of `pages' frames before it starts, keeping
+ * the cache's own high watermark on top as a margin for everything else that
+ * allocates meanwhile.  For the same callers as above: process context, no
+ * filesystem lock held.
+ *
+ * In batches, because pagecache_shrink() holds the LRU lock with interrupts
+ * off for the whole of one call and bounds its scan by what it was asked
+ * for: one request for a thousand frames would be one long interrupts-off
+ * scan.  A batch that reclaims nothing means the cache has no clean pages
+ * left to give, and asking again would only repeat the scan. */
+void mm_reclaim_for_pages(uint64_t pages)
+{
+	uint64_t need = pages + PC_HIGH_WATERMARK_PAGES;
+
+	while (mm_state.free_pages < need) {
+		uint64_t want = need - mm_state.free_pages;
+
+		if (want > 128)
+			want = 128;
+		if (pagecache_shrink(want, 0) == 0)
+			break;
+	}
+	if (mm_state.free_pages < need)
+		pagecache_request_writeback();
 }
 
 /* ==========================================================================

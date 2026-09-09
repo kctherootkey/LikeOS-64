@@ -1719,7 +1719,7 @@ int vmw_mob_bind(struct vmw_device *v, struct vmw_mob *mob, const uint64_t *page
 		mob->pt_pages = kalloc(sizeof(uint64_t));
 		if (!mob->pt_pages)
 			return -ENOMEM;
-		mob->pt_pages[0] = mm_allocate_physical_page();
+		mob->pt_pages[0] = mm_allocate_physical_page_reclaim();
 		if (!mob->pt_pages[0]) {
 			kfree(mob->pt_pages);
 			mob->pt_pages = NULL;
@@ -1743,7 +1743,7 @@ int vmw_mob_bind(struct vmw_device *v, struct vmw_mob *mob, const uint64_t *page
 		if (!mob->pt_pages)
 			return -ENOMEM;
 		for (uint32_t i = 0; i < nl1 + 1; i++) {
-			mob->pt_pages[i] = mm_allocate_physical_page();
+			mob->pt_pages[i] = mm_allocate_physical_page_reclaim();
 			if (!mob->pt_pages[i]) {
 				for (uint32_t j = 0; j < i; j++)
 					mm_free_physical_page(mob->pt_pages[j]);

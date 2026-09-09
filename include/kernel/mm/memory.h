@@ -344,6 +344,15 @@ uint64_t mm_allocate_physical_page(void);
 void mm_free_physical_page(uint64_t physical_address);
 uint64_t mm_allocate_contiguous_pages(size_t page_count);
 void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count);
+/* The allocator's slow path, for process context with no filesystem lock
+ * held: when the free list has run dry, drop clean page-cache pages and try
+ * again.  What a page fault uses; what anything else that needs frames in
+ * bulk -- a GPU object's backing store -- must use too, or it fails while
+ * the page cache holds most of RAM and every figure says memory is plentiful.
+ * Never from an interrupt or under a spinlock: reclaim takes the cache's own
+ * locks. */
+uint64_t mm_allocate_physical_page_reclaim(void);
+void mm_reclaim_for_pages(uint64_t pages);
 
 // Virtual Memory Manager
 void mm_initialize_virtual_memory(void);
