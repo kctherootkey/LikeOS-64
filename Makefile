@@ -492,6 +492,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/applications/*) \
 	$(wildcard res/xorg/gtk3/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
+	$(wildcard res/xorg/gtk3/adblock/*.txt) \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
 	user/bin/tests/apnews-urls.txt
 
@@ -2241,6 +2242,21 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	done; true
 	chmod 0644 $(EXT4_STAGING)/etc/skel/Desktop/*.desktop \
 	           $(EXT4_STAGING)/root/Desktop/*.desktop
+	# luakit's ad blocker (lib/adblock.lua, loaded by rc.lua) is only as
+	# good as the filter lists it finds: it reads every *.txt in the
+	# adblock/ subdirectory of its per-user data directory,
+	# ~/.local/share/luakit/adblock, and with none there it is enabled and
+	# blocks nothing.  EasyList and EasyPrivacy go into the skeleton, so
+	# every account adduser creates gets them, and into /root, which adduser
+	# never creates.  The snapshots live in res/xorg/gtk3/adblock/ and go
+	# stale (EasyList expects an update every few days); refresh.sh there
+	# fetches the current ones.  Per user, because luakit writes its
+	# `subscriptions' bookkeeping file next to the lists.
+	for d in $(EXT4_STAGING)/etc/skel $(EXT4_STAGING)/root; do \
+		mkdir -p "$$d/.local/share/luakit/adblock"; \
+		cp res/xorg/gtk3/adblock/*.txt "$$d/.local/share/luakit/adblock/"; \
+		chmod 0644 "$$d"/.local/share/luakit/adblock/*.txt; \
+	done
 	chmod 0700 $(EXT4_STAGING)/root
 	# X11 puts its per-display listening socket at /tmp/.X11-unix/X<n>.  The
 	# directory must exist before the server binds, and carries the same

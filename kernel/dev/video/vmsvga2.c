@@ -2515,6 +2515,12 @@ int vmsvga2_init(void)
 	else
 		kprintf("svga2: host recommends nothing: no backdoor answer, "
 			"no topology\n");
+	// The mode registers as found: on a UEFI guest they are the firmware's
+	// GOP mode (VMware's EFI puts up 1024x768 whatever the host shows the
+	// guest in), so they are logged, not believed.  Boot of 2026-09-09.
+	kprintf("svga2: mode registers at probe %ux%u enable=%u\n",
+		svga_read_reg(SVGA_REG_WIDTH), svga_read_reg(SVGA_REG_HEIGHT),
+		svga_read_reg(SVGA_REG_ENABLE));
 
 	return 0;
 }
