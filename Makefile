@@ -475,7 +475,7 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
-	webstress wkstress codecheck
+	webstress wkstress codecheck apload
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -492,7 +492,8 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/applications/*) \
 	$(wildcard res/xorg/gtk3/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
-	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh
+	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
+	user/bin/tests/apnews-urls.txt
 
 # Full prerequisite set for the ext4 image (every staged build artifact).
 # The C++ runtime's test program, but only once there is a C++ runtime.
@@ -1946,6 +1947,17 @@ $(BUILD_DIR)/webstress: user/bin/tests/webstress.c $(GTK3_SENTINEL) | $(BUILD_DI
 		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs libsoup-3.0) \
 		-lpthread
 
+# apnews.com the way luakit loads it, without luakit: a web process that
+# issues the captured URL list and a --network-process child running libsoup
+# exactly as WebKit's SoupNetworkSession/NetworkDataTaskSoup drive it, joined
+# by the same SOCK_SEQPACKET + shared-memory IPC.  Per-phase timings from
+# libsoup's metrics, stall reports from both sides.  The URL list is staged
+# next to it (see the recipe below).
+$(BUILD_DIR)/apload: user/bin/tests/apload.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	ports/xorg/toolchain/likeos-cc -o $@ $< \
+		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs libsoup-3.0) \
+		-lpthread
+
 $(BUILD_DIR)/tlstest: user/bin/tests/tlstest.c $(GTK3_SENTINEL) | $(BUILD_DIR)
 	ports/xorg/toolchain/likeos-cc -o $@ $< \
 		$$(ports/xorg/toolchain/likeos-pkg-config --cflags --libs gio-2.0)
@@ -2120,6 +2132,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/souptest      $(EXT4_STAGING)/usr/local/bin/souptest
 	cp $(BUILD_DIR)/snifftest     $(EXT4_STAGING)/usr/local/bin/snifftest
 	cp $(BUILD_DIR)/webstress     $(EXT4_STAGING)/usr/local/bin/webstress
+	cp $(BUILD_DIR)/apload        $(EXT4_STAGING)/usr/local/bin/apload
+	cp user/bin/tests/apnews-urls.txt $(EXT4_STAGING)/usr/local/bin/apnews-urls.txt
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh

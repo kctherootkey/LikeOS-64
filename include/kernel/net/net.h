@@ -430,6 +430,11 @@ typedef struct tcp_conn {
 	// sends periodic window probes with exponential backoff.  0 = unarmed.
 	uint64_t persist_tick;
 	uint8_t persist_backoff;
+	/* A send that failed LOCALLY (ARP pending pool full, transmit ring
+	 * full, no buffer) with nothing in flight: tx_ready was cleared and no
+	 * ACK can ever set it again.  tcp_timer_tick re-opens the socket for
+	 * writing when this passes.  0 = unarmed. */
+	uint64_t tx_retry_tick;
 
 	// Negotiated segment sizing and outstanding transmit queue
 	uint16_t peer_mss;

@@ -1995,7 +1995,8 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 	 * observed as "send failed: Operation not permitted" when the conn was
 	 * reset mid-transfer.  Report the real condition: the conn's recorded
 	 * error (ECONNRESET/ETIMEDOUT from tcp_fail_connection) or EPIPE. */
-	if (!conn || conn->state != TCP_STATE_ESTABLISHED)
+	if (!conn || (conn->state != TCP_STATE_ESTABLISHED &&
+		      conn->state != TCP_STATE_CLOSE_WAIT))
 		return (conn && conn->error) ? -conn->error : -EPIPE;
 	if (len == 0)
 		return 0;
@@ -2010,7 +2011,8 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 
 	/* TOCTOU re-check: state may have changed to CLOSED by tcp_fail_connection
      * on another CPU between the unlocked entry check above and here. */
-	if (conn->state != TCP_STATE_ESTABLISHED) {
+	if (conn->state != TCP_STATE_ESTABLISHED &&
+	    conn->state != TCP_STATE_CLOSE_WAIT) {
 		int err = conn->error ? -conn->error : -EPIPE;
 		tcp_lock_release(&conn->lock, flags);
 		return err;
@@ -2077,6 +2079,16 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 					conn->rcv_nxt, TCP_ACK | TCP_PSH,
 					tcp_advertised_window(conn),
 					data + sent, seg_len, opts, olen) < 0) {
+			/* A local drop (ARP pending pool full, transmit ring
+			 * full, no buffer).  With nothing of this write in
+			 * flight there is no ACK to set tx_ready again, so a
+			 * non-blocking writer that gets EAGAIN here would wait
+			 * for POLLOUT for ever -- the browser's network
+			 * process froze in exactly that wait.  Arm the retry
+			 * tick instead; tcp_timer_tick re-opens the socket. */
+			if (sent == 0)
+				conn->tx_retry_tick = timer_ticks() +
+						      TCP_LOCAL_DROP_RETRY_TICKS;
 			break;
 		}
 
@@ -2107,6 +2119,7 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 
 	// Data went out — no window stall, so disarm any persist probe.
 	conn->persist_tick = 0;
+	conn->tx_retry_tick = 0;
 	conn->retransmit_tick = timer_ticks() + tcp_rto_ticks(conn);
 	conn->retransmit_count = 0;
 
@@ -3712,6 +3725,28 @@ void tcp_timer_tick(void)
 			conn->cork_deadline = 0;
 			conn->tx_ready = 1;
 		}
+
+		/* A send that failed locally armed this (tcp_send_data): give
+		 * the writer its POLLOUT back now that the drop's cause has
+		 * had a tick to clear.  The 0->1 flip is notified at
+		 * unlock_conn like the cork case above. */
+		if (conn->tx_retry_tick && now >= conn->tx_retry_tick) {
+			conn->tx_retry_tick = 0;
+			conn->tx_ready = 1;
+		}
+
+		/* Invariant: ESTABLISHED, nothing in flight, peer window open,
+		 * no persist, cork or retry timer armed -- writable.  Every
+		 * path that clears tx_ready is one of those four conditions,
+		 * so a connection found like this slipped through a hole and
+		 * its writer is parked on POLLOUT with nobody left to wake it
+		 * (seen: a browser network process stuck for good in a
+		 * synchronous TLS close on such a socket).  Reopen it. */
+		if (conn->state == TCP_STATE_ESTABLISHED && !conn->tx_ready &&
+		    conn->inflight_count == 0 && conn->snd_wnd > 0 &&
+		    conn->persist_tick == 0 && conn->tx_retry_tick == 0 &&
+		    conn->cork_deadline == 0)
+			conn->tx_ready = 1;
 
 		// Retransmission timeout
 		if (conn->state == TCP_STATE_SYN_SENT &&

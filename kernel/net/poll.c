@@ -1214,17 +1214,62 @@ sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 	return ret;
 }
 
+/* The descriptor set of poll()/ppoll().
+ *
+ * Both used to take at most 256 entries and answer EINVAL above that, from a
+ * 256-entry array on the 16 KB kernel stack.  A GLib main loop polls one
+ * descriptor per open connection, and WebKit's network process keeps up to
+ * 256 connections open (idle ones for 115 s) plus its wake-up descriptors, so
+ * it crossed 256 a few seconds into a page load.  GLib treats a failed poll
+ * as "nothing ready" and goes straight around again, dispatching no
+ * descriptor event at all until the set shrinks: the browser froze for as
+ * long as the connection count stayed high, and the only trace was
+ * "poll(2) failed due to: Invalid argument" on the console.  Now the limit is
+ * the descriptor table itself: a small set stays on the stack as before, a
+ * larger one is copied through the heap. */
+#define POLL_STACK_FDS 256
+
+struct poll_fds {
+	struct pollfd stack[POLL_STACK_FDS];
+	struct pollfd *heap;
+	struct pollfd *fds;
+	size_t sz;
+};
+
+static int poll_fds_get(struct poll_fds *pf, uint64_t uptr, int nfds)
+{
+	pf->heap = NULL;
+	pf->fds = pf->stack;
+	if (nfds < 0 || nfds > TASK_MAX_FDS)
+		return -EINVAL;
+	pf->sz = (size_t)nfds * sizeof(struct pollfd);
+	if (!validate_user_ptr(uptr, pf->sz))
+		return -EFAULT;
+	if (nfds > POLL_STACK_FDS) {
+		pf->heap = kalloc(pf->sz);
+		if (!pf->heap)
+			return -ENOMEM;
+		pf->fds = pf->heap;
+	}
+	copy_from_user(pf->fds, (void *)uptr, pf->sz);
+	return 0;
+}
+
+static void poll_fds_put(struct poll_fds *pf, uint64_t uptr)
+{
+	copy_to_user((void *)uptr, pf->fds, pf->sz);
+	kfree(pf->heap);
+	pf->heap = NULL;
+}
+
 __attribute__((noinline)) int64_t
 sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
 {
 	int nfds = (int)a2;
-	if (nfds < 0 || nfds > 256)
-		return -EINVAL;
-	size_t sz = (size_t)nfds * sizeof(struct pollfd);
-	if (!validate_user_ptr(a1, sz))
-		return -EFAULT;
-	struct pollfd kfds[256];
-	copy_from_user(kfds, (void *)a1, sz);
+	struct poll_fds pf;
+	int r = poll_fds_get(&pf, a1, nfds);
+	if (r < 0)
+		return r;
 	int timeout_ms = (int)(int64_t)a3;
 	uint64_t timeout_ticks;
 	if (timeout_ms < 0)
@@ -1236,8 +1281,8 @@ sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
 		 * AND discarded the remainder, so this returned early twice
 		 * over -- a 200ms poll() came back in about 129ms. */
 		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
-	int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
-	copy_to_user((void *)a1, kfds, sz);
+	int ret = sys_poll_internal(pf.fds, nfds, timeout_ticks);
+	poll_fds_put(&pf, a1);
 	return ret;
 }
 
@@ -1245,13 +1290,10 @@ __attribute__((noinline)) int64_t
 sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 {
 	int nfds = (int)a2;
-	if (nfds < 0 || nfds > 256)
-		return -EINVAL;
-	size_t sz = (size_t)nfds * sizeof(struct pollfd);
-	if (!validate_user_ptr(a1, sz))
-		return -EFAULT;
-	struct pollfd kfds[256];
-	copy_from_user(kfds, (void *)a1, sz);
+	struct poll_fds pf;
+	int r = poll_fds_get(&pf, a1, nfds);
+	if (r < 0)
+		return r;
 	uint64_t timeout_ticks = (uint64_t)-1;
 	if (a3 && validate_user_ptr(a3, 16)) {
 		uint64_t tv_sec = 0;
@@ -1268,13 +1310,15 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	}
 	kernel_sigset_t saved_mask;
 	int have_mask = poll_sigmask_install(a4, &saved_mask);
-	if (have_mask < 0)
+	if (have_mask < 0) {
+		kfree(pf.heap);
 		return have_mask;
-	int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
+	}
+	int ret = sys_poll_internal(pf.fds, nfds, timeout_ticks);
 	/* The mask stays installed on purpose; it is put back after signal
 	 * delivery (poll_sigmask_restore_pending). */
 	(void)saved_mask;
-	copy_to_user((void *)a1, kfds, sz);
+	poll_fds_put(&pf, a1);
 	return ret;
 }
 

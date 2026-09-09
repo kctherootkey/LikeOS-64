@@ -50,9 +50,20 @@
 struct net_device;
 typedef struct net_device net_device_t;
 
-#define SKB_SMALL_DATA 1536 // >= 1518 (max Ethernet frame), 16-aligned
-#define SKB_JUMBO_DATA 65535 // max IPv4 datagram
 #define SKB_HEADROOM 128 // reserved at front for header prepends
+/* A small slot must hold a maximum Ethernet frame (1518) PLUS the headroom
+ * every skb reserves, because skb_alloc() sizes its request as payload +
+ * SKB_HEADROOM.  At 1536 it did not: a full-size received frame (1514 +
+ * 128) fell through to the JUMBO pool, whose 128 slots were the whole
+ * receive capacity of the machine for full-MTU segments.  Forty CDN
+ * connections each opening with a 10-segment window exhausted them in one
+ * round trip, after which every further full-size frame was dropped on
+ * the floor (netstat: "buffer allocation failures", per-interface
+ * rx_errors) while ACKs and other small frames still got through -- a TLS
+ * handshake whose certificate flight never arrives, a stream that never
+ * leaves slow start.  16-aligned. */
+#define SKB_SMALL_DATA (1536 + SKB_HEADROOM)
+#define SKB_JUMBO_DATA 65535 // max IPv4 datagram
 
 typedef struct sk_buff {
 	struct sk_buff *next; // queue linkage (caller-managed)

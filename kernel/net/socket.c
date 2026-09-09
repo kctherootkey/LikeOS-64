@@ -903,7 +903,8 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 					tcp_conn_release(conn);
 				return total ? (int)total : -ENOTCONN;
 			}
-			if (conn->state != TCP_STATE_ESTABLISHED) {
+			if (conn->state != TCP_STATE_ESTABLISHED &&
+			    conn->state != TCP_STATE_CLOSE_WAIT) {
 				int err = conn->error ? -conn->error : -EPIPE;
 				tcp_conn_release(conn);
 				return total ? (int)total : err;
@@ -2164,10 +2165,24 @@ int sock_poll(int sockfd, short events)
 				    s->rx_shutdown)
 					revents |= POLLIN | POLLRDNORM; // EOF
 			}
-			// Writable if connection established and space in tx buffer
+			/* Writable: ESTABLISHED or CLOSE_WAIT (the peer's FIN
+			 * closed only its direction) with room to send; and
+			 * every state after our own FIN or shutdown(SHUT_WR),
+			 * where a write fails at once with EPIPE -- a writer
+			 * parked on POLLOUT must be woken to collect that
+			 * error, not left asleep until the socket dies. */
 			if (events & (POLLOUT | POLLWRNORM)) {
-				if (conn->state == TCP_STATE_ESTABLISHED &&
-				    conn->tx_ready)
+				int st = conn->state;
+				int open_dir = st == TCP_STATE_ESTABLISHED ||
+					       st == TCP_STATE_CLOSE_WAIT;
+				int tx_done = st == TCP_STATE_FIN_WAIT_1 ||
+					      st == TCP_STATE_FIN_WAIT_2 ||
+					      st == TCP_STATE_CLOSING ||
+					      st == TCP_STATE_LAST_ACK ||
+					      st == TCP_STATE_TIME_WAIT ||
+					      st == TCP_STATE_CLOSED ||
+					      s->tx_shutdown;
+				if ((open_dir && conn->tx_ready) || tx_done)
 					revents |= POLLOUT | POLLWRNORM;
 			}
 			// Error / hangup

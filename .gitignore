@@ -161,6 +161,7 @@
 /user/bin/tests/*
 !/user/bin/tests/*.c
 !/user/bin/tests/*.h
+!/user/bin/tests/apnews-urls.txt
 #     testcxx.cpp is the only C++ source in the tree, and this line is the
 #     reason it went missing: without it the file was ignored, never committed,
 #     and existed only on the machine it was written on.  Every other machine

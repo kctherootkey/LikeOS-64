@@ -2204,7 +2204,7 @@ int vmsvga2_get_edid(uint8_t *buf, uint32_t len)
 //
 //   1. The backdoor: a port-I/O protocol on 0x5658 entered with 'VMXh' in
 //      EAX (the same channel kernel/dev/gpu/vmwgfx/vmw_msg.c speaks for
-//      RPCI, here in its simplest single-command form).  Command 17 returns
+//      RPCI, here in its simplest single-command form).  Command 15 returns
 //      the host's screen size packed into EAX -- width in the high half,
 //      height in the low.  This is the size the VMware tools call the
 //      recommended resolution: the host's panel, not the guest's window.
@@ -2225,7 +2225,7 @@ int vmsvga2_get_edid(uint8_t *buf, uint32_t len)
 
 #define SVGA_BACKDOOR_PORT 0x5658
 #define SVGA_BACKDOOR_MAGIC 0x564D5868U /* 'VMXh' */
-#define SVGA_BACKDOOR_GETSCREENSIZE 17
+#define SVGA_BACKDOOR_GETSCREENSIZE 15
 
 // Plausibility bounds for a screen size.  Anything outside them is a host
 // that did not answer -- a bus reading back all ones, an echoed magic, a
