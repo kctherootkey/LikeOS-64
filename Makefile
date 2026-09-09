@@ -364,6 +364,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/fs_pseudofs.o \
 			  $(BUILD_DIR)/fs_sysfs.o \
 			  $(BUILD_DIR)/fs_procfs.o \
+			  $(BUILD_DIR)/fs_tmpfs.o \
 			  $(BUILD_DIR)/fs_eventfd.o \
 			  $(BUILD_DIR)/fs_timerfd.o \
 			  $(BUILD_DIR)/fs_signalfd.o \
@@ -494,6 +495,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
+	host/gen-cursors.c \
 	user/bin/tests/apnews-urls.txt
 
 # Full prerequisite set for the ext4 image (every staged build artifact).
@@ -886,6 +888,9 @@ $(BUILD_DIR)/fs_sysfs.o: $(KERNEL_DIR)/fs/sysfs.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fs_procfs.o: $(KERNEL_DIR)/fs/procfs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_tmpfs.o: $(KERNEL_DIR)/fs/tmpfs.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fs_eventfd.o: $(KERNEL_DIR)/fs/eventfd.c | $(BUILD_DIR)
@@ -2141,6 +2146,12 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# bash language/builtin test suite (run: testbash.sh)
 	cp user/bin/tests/testbash.sh $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/testbash.sh
+	# luakit runs through a launcher that keeps its cache and data on the
+	# RAM filesystem (/ram) instead of the disk; it sits ahead of
+	# /usr/bin/luakit on the PATH.  LUAKIT_RAM=0 or ~/.config/luakit/use-disk
+	# bypasses it -- see the script for the switch and what it copies back.
+	cp res/xorg/luakit-ram.sh $(EXT4_STAGING)/usr/local/bin/luakit
+	chmod 755 $(EXT4_STAGING)/usr/local/bin/luakit
 	# Resources, manpages, config
 	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr

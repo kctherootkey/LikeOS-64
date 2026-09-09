@@ -3,6 +3,7 @@ void vmwgfx_init(void);
 void drm_console_start_worker(void);
 #include <kernel/fs/sysfs.h>
 void procfs_init(void);
+#include <kernel/fs/tmpfs.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/fpu.h>
 #include <kernel/io/console.h>
@@ -233,6 +234,10 @@ __no_stack_protector void continue_system_startup(void)
 	 * PCI table and the task list. */
 	sysfs_init();
 	procfs_init();
+	/* /ram: a filesystem that lives in memory, for whatever should not
+	 * touch the disk (luakit's caches and databases, see
+	 * res/xorg/luakit-ram.sh). */
+	tmpfs_init();
 	tty_init();
 
 	static scrollbar_t system_scrollbar;

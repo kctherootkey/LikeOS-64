@@ -1,0 +1,181 @@
+WebKitGTK: show the pointer-with-hourglass while a page loads.
+
+A page that is still loading, or whose web process has stopped answering,
+looked exactly like one that was ready: the arrow, a page that does not yet
+scroll, and no cue but the progress number in luakit's status bar.  The
+cursor theme generated into /usr/share/icons/LikeOS has had the "progress"
+cursor (the pointer with the small hourglass beside it) since the theme was
+added; nothing ever asked for it.
+
+Drive it from the two states the view already tracks.  WebKitWebView's
+is-loading (WEBKIT_LOAD_STARTED until FINISHED or the failure that ends the
+load) and is-web-process-responsive (the responsiveness timer, which trips
+when a click or key press goes unanswered for three seconds) feed one "busy"
+flag on the GTK widget.  While it is set the widget's window carries the
+progress cursor; the cursors WebCore keeps sending for whatever is under the
+pointer are held back and the last of them is put in place when the wait
+ends, or, with none, whatever was shown before.  A load that starts before
+the widget is realized shows the cursor from realize().
+
+Wheel events are not a signal here: on this port they go to the web process's
+event dispatcher without a reply, so nothing in the UI process can tell a
+scroll that was handled from one that is waiting.
+
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
+@@ -462,12 +462,25 @@
+ #endif
+ }
+ 
++#if PLATFORM(GTK)
++// LikeOS: the pointer over the view shows the small hourglass while the page
++// is loading or its web process has stopped answering.
++static void webkitWebViewUpdateBusyCursor(WebKitWebView* webView)
++{
++    WebKitWebViewPrivate* priv = webView->priv;
++    webkitWebViewBaseSetBusy(WEBKIT_WEB_VIEW_BASE(webView), priv->isLoading || !priv->isWebProcessResponsive);
++}
++#endif
++
+ static void webkitWebViewSetIsLoading(WebKitWebView* webView, bool isLoading)
+ {
+     if (webView->priv->isLoading == isLoading)
+         return;
+ 
+     webView->priv->isLoading = isLoading;
++#if PLATFORM(GTK)
++    webkitWebViewUpdateBusyCursor(webView);
++#endif
+     g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_IS_LOADING]);
+ }
+ 
+@@ -5606,6 +5619,9 @@
+         return;
+ 
+     webView->priv->isWebProcessResponsive = isResponsive;
++#if PLATFORM(GTK)
++    webkitWebViewUpdateBusyCursor(webView);
++#endif
+     g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_IS_WEB_PROCESS_RESPONSIVE]);
+ }
+ 
+--- a/Source/WebKit/UIProcess/API/gtk/WebKitWebViewBase.cpp
++++ b/Source/WebKit/UIProcess/API/gtk/WebKitWebViewBase.cpp
+@@ -386,6 +386,15 @@
+     std::unique_ptr<PointerLockManager> pointerLockManager;
+ 
+     Vector<CompletionHandler<void()>> nextPresentationUpdateCallbacks;
++
++    // LikeOS: while the page loads, or its web process has stopped answering,
++    // the pointer over the view carries the small hourglass (the cursor
++    // theme's "progress") so the wait is visible where the person is looking.
++    // Cursor requests from WebCore are held back meanwhile; the last one is
++    // put in place when the wait ends, and with none, what was shown before.
++    bool isBusy { false };
++    std::optional<Cursor> cursorRequestedWhileBusy;
++    GRefPtr<GdkCursor> cursorBeforeBusy;
+ };
+ 
+ /**
+@@ -627,6 +636,8 @@
+         priv->pageProxy->activityStateDidChange(flagsToUpdate);
+ }
+ 
++static void webkitWebViewBaseShowBusyCursor(WebKitWebViewBase*);
++
+ static void webkitWebViewBaseRealize(GtkWidget* widget)
+ {
+     WebKitWebViewBase* webView = WEBKIT_WEB_VIEW_BASE(widget);
+@@ -676,6 +687,10 @@
+         auto* monitor = gdk_display_get_monitor_at_window(gtk_widget_get_display(widget), window);
+         webkitWebViewBaseUpdateDisplayID(webView, monitor);
+     }
++
++    // A wait that began before there was a window to show it on.
++    if (priv->isBusy)
++        webkitWebViewBaseShowBusyCursor(webView);
+ #endif
+ 
+     auto* imContext = priv->inputMethodFilter.context();
+@@ -3688,7 +3703,7 @@
+     RELEASE_ASSERT_NOT_REACHED();
+ }
+ 
+-void webkitWebViewBaseSetCursor(WebKitWebViewBase* webViewBase, const Cursor& cursor)
++static void webkitWebViewBaseApplyCursor(WebKitWebViewBase* webViewBase, const Cursor& cursor)
+ {
+     if (cursor.type() == Cursor::Type::Invalid)
+         return;
+@@ -3751,3 +3766,65 @@
+     gdk_window_set_cursor(window, newCursor.get());
+ #endif // USE(GTK4)
+ }
++
++void webkitWebViewBaseSetCursor(WebKitWebViewBase* webViewBase, const Cursor& cursor)
++{
++    if (webViewBase->priv->isBusy) {
++        // Kept for when the wait ends; the hourglass stays until then.
++        webViewBase->priv->cursorRequestedWhileBusy = cursor;
++        return;
++    }
++    webkitWebViewBaseApplyCursor(webViewBase, cursor);
++}
++
++static void webkitWebViewBaseShowBusyCursor(WebKitWebViewBase* webViewBase)
++{
++    WebKitWebViewBasePrivate* priv = webViewBase->priv;
++#if USE(GTK4)
++    priv->cursorBeforeBusy = gtk_widget_get_cursor(GTK_WIDGET(webViewBase));
++#else
++    GdkWindow* window = gtk_widget_get_window(GTK_WIDGET(webViewBase));
++    if (!window)
++        return; // Not realized yet: realize() shows it once there is a window.
++    priv->cursorBeforeBusy = gdk_window_get_cursor(window);
++#endif
++    webkitWebViewBaseApplyCursor(webViewBase, Cursor::fromType(Cursor::Type::Progress));
++}
++
++void webkitWebViewBaseSetBusy(WebKitWebViewBase* webViewBase, bool busy)
++{
++    WebKitWebViewBasePrivate* priv = webViewBase->priv;
++    if (priv->isBusy == busy)
++        return;
++
++    priv->isBusy = busy;
++    if (busy) {
++        priv->cursorRequestedWhileBusy = std::nullopt;
++        webkitWebViewBaseShowBusyCursor(webViewBase);
++        return;
++    }
++
++    GRefPtr<GdkCursor> cursorBeforeBusy = WTF::move(priv->cursorBeforeBusy);
++#if !USE(GTK4)
++    GdkWindow* window = gtk_widget_get_window(GTK_WIDGET(webViewBase));
++    if (!window) {
++        // Never shown, or gone with the window; WebCore sends the cursor
++        // again on the next pointer motion.
++        priv->cursorRequestedWhileBusy = std::nullopt;
++        return;
++    }
++#endif
++    if (priv->cursorRequestedWhileBusy) {
++        Cursor cursor = *priv->cursorRequestedWhileBusy;
++        priv->cursorRequestedWhileBusy = std::nullopt;
++        webkitWebViewBaseApplyCursor(webViewBase, cursor);
++        return;
++    }
++
++    // Nothing asked for a cursor during the wait: put back the one from before.
++#if USE(GTK4)
++    gtk_widget_set_cursor(GTK_WIDGET(webViewBase), cursorBeforeBusy.get());
++#else
++    gdk_window_set_cursor(window, cursorBeforeBusy.get());
++#endif
++}
+--- a/Source/WebKit/UIProcess/API/gtk/WebKitWebViewBasePrivate.h
++++ b/Source/WebKit/UIProcess/API/gtk/WebKitWebViewBasePrivate.h
+@@ -147,3 +147,4 @@
+ 
+ WebKit::RendererBufferDescription webkitWebViewBaseGetRendererBufferDescription(WebKitWebViewBase*);
+ void webkitWebViewBaseSetCursor(WebKitWebViewBase*, const WebCore::Cursor&);
++void webkitWebViewBaseSetBusy(WebKitWebViewBase*, bool);

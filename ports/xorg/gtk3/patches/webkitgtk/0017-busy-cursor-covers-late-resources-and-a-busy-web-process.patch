@@ -1,0 +1,218 @@
+WebKitGTK: keep the hourglass while resources still arrive and while the web
+process is too busy to answer.
+
+Patch 0016 showed the pointer-with-hourglass between WEBKIT_LOAD_STARTED and
+WEBKIT_LOAD_FINISHED.  Two things a person reads as "still loading" fall
+outside that window: resources the page asked for late (a fetch started by
+a script before the load event, or one a click starts), which keep arriving
+after the load has officially finished; and the web process working through
+layout or script so that nothing on the page reacts to a click yet.  The
+responsiveness timer only notices the second after a click or key press has
+gone unanswered for three seconds.
+
+Two more inputs, both from the UI process:
+
+  - The page load state's networkRequestsInProgress, which the web process
+    reports while any of its resource loads is in flight (after the main
+    frame's progress completed, only loads a user gesture started count, so
+    a page that polls in the background does not trip it).  After the load
+    it holds the hourglass for at most ten seconds per stretch.
+
+  - A measurement.  While a load is in progress, while such a stretch lasts,
+    and for five seconds after either, a quarter-second watch pings the web
+    process's main thread (WebProcessProxy::isResponsive) and counts an
+    answer that takes longer than a quarter second as busy.  The watch stops
+    once the page has settled, so an idle page costs nothing.
+
+The cursor decision itself is unchanged: any of loading, late network
+activity, a slow main thread, or the responsiveness timer's verdict shows
+the hourglass, and the base widget restores WebCore's cursor afterwards.
+
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
+@@ -106,6 +106,9 @@
+ #include "WebKitPrintOperationPrivate.h"
+ #include "WebKitWebInspectorPrivate.h"
+ #include "WebKitWebViewBasePrivate.h"
++#include "WebProcessProxy.h"
++#include <wtf/MonotonicTime.h>
++#include <wtf/glib/GWeakPtr.h>
+ #include <WebCore/RefPtrCairo.h>
+ #endif
+ 
+@@ -260,6 +263,10 @@
+ 
+ static std::array<GParamSpec*, N_PROPERTIES> sObjProperties;
+ 
++#if PLATFORM(GTK)
++static void webkitWebViewNetworkActivityChanged(WebKitWebView*);
++#endif
++
+ class PageLoadStateObserver final : public RefCounted<PageLoadStateObserver>, public PageLoadState::Observer {
+     WTF_MAKE_TZONE_ALLOCATED_INLINE(PageLoadStateObserver);
+ public:
+@@ -310,7 +317,12 @@
+     void willChangeCanGoForward() override { }
+     void didChangeCanGoForward() override { }
+     void willChangeNetworkRequestsInProgress() override { }
+-    void didChangeNetworkRequestsInProgress() override { }
++    void didChangeNetworkRequestsInProgress() override
++    {
++#if PLATFORM(GTK)
++        webkitWebViewNetworkActivityChanged(m_webView);
++#endif
++    }
+     void willChangeCertificateInfo() override { }
+     void didChangeCertificateInfo() override { }
+     void willChangeWebProcessIsResponsive() override { }
+@@ -437,6 +449,16 @@
+     WebKitWebExtensionMode webExtensionMode;
+ 
+     bool isWebProcessResponsive;
++#if PLATFORM(GTK)
++    // LikeOS busy cursor -- see webkitWebViewBusyWatchTick().
++    bool networkBusy { false };
++    bool mainThreadBusy { false };
++    bool pingOutstanding { false };
++    MonotonicTime pingSentAt;
++    MonotonicTime networkBusyUntil;
++    MonotonicTime busyWindowEnd;
++    unsigned busyWatchSource { 0 };
++#endif
+ #if ENABLE(WEBXR) && USE(OPENXR)
+     bool isImmersiveModeEnabled;
+ #endif
+@@ -463,12 +485,108 @@
+ }
+ 
+ #if PLATFORM(GTK)
+-// LikeOS: the pointer over the view shows the small hourglass while the page
+-// is loading or its web process has stopped answering.
++// LikeOS: the pointer over the view carries the small hourglass while what
++// is on screen is not yet what the person will get: the page is loading,
++// resources it asked for are still arriving, or its web process is too busy
++// to answer -- which is when nothing on the page reacts to a click.
++//
++// Loading and network activity come from the page load state.  Busyness is
++// measured: while a load is in progress and for a few seconds after, the
++// watch below pings the web process's main thread every quarter second and
++// counts an answer that takes longer than that as busy.  The pings stop when
++// the page has settled, so an idle page costs nothing.
++static constexpr Seconds busyWatchInterval = 250_ms;
++static constexpr Seconds busyPingSlow = 250_ms;
++static constexpr Seconds busySettleWindow = 5_s;
++// A stretch of network activity after the load (a fetch the page started
++// late, or one a click started) holds the hourglass at most this long, so a
++// page that polls forever does not wait forever.
++static constexpr Seconds busyNetworkMax = 10_s;
++
+ static void webkitWebViewUpdateBusyCursor(WebKitWebView* webView)
+ {
+     WebKitWebViewPrivate* priv = webView->priv;
+-    webkitWebViewBaseSetBusy(WEBKIT_WEB_VIEW_BASE(webView), priv->isLoading || !priv->isWebProcessResponsive);
++    webkitWebViewBaseSetBusy(WEBKIT_WEB_VIEW_BASE(webView), priv->isLoading || priv->networkBusy || priv->mainThreadBusy || !priv->isWebProcessResponsive);
++}
++
++static gboolean webkitWebViewBusyWatchTick(gpointer);
++
++static void webkitWebViewStartBusyWatch(WebKitWebView* webView)
++{
++    WebKitWebViewPrivate* priv = webView->priv;
++    priv->busyWindowEnd = MonotonicTime::now() + busySettleWindow;
++    if (!priv->busyWatchSource)
++        priv->busyWatchSource = g_timeout_add(busyWatchInterval.millisecondsAs<unsigned>(), webkitWebViewBusyWatchTick, webView);
++}
++
++static void webkitWebViewStopBusyWatch(WebKitWebView* webView)
++{
++    WebKitWebViewPrivate* priv = webView->priv;
++    if (priv->busyWatchSource) {
++        g_source_remove(priv->busyWatchSource);
++        priv->busyWatchSource = 0;
++    }
++    priv->networkBusy = false;
++    priv->mainThreadBusy = false;
++}
++
++static void webkitWebViewPingAnswered(WebKitWebView* webView)
++{
++    WebKitWebViewPrivate* priv = webView->priv;
++    priv->pingOutstanding = false;
++    priv->mainThreadBusy = false;
++    webkitWebViewUpdateBusyCursor(webView);
++}
++
++static gboolean webkitWebViewBusyWatchTick(gpointer userData)
++{
++    auto* webView = WEBKIT_WEB_VIEW(userData);
++    WebKitWebViewPrivate* priv = webView->priv;
++    auto now = MonotonicTime::now();
++    bool network = getPage(webView).pageLoadState().networkRequestsInProgress();
++
++    priv->networkBusy = network && (priv->isLoading || now < priv->networkBusyUntil);
++    if (priv->isLoading || priv->networkBusy)
++        priv->busyWindowEnd = now + busySettleWindow;
++
++    if (now >= priv->busyWindowEnd) {
++        // Settled: the last cursor decision, then no more ticks.
++        priv->busyWatchSource = 0;
++        priv->networkBusy = false;
++        priv->mainThreadBusy = false;
++        webkitWebViewUpdateBusyCursor(webView);
++        return G_SOURCE_REMOVE;
++    }
++
++    if (!priv->pingOutstanding) {
++        priv->pingOutstanding = true;
++        priv->pingSentAt = now;
++        // Answered when the web process's main thread gets to it; answered
++        // with false, at once, when the process is already known to be
++        // unresponsive or has gone -- is-web-process-responsive covers those.
++        getPage(webView).legacyMainFrameProcess().isResponsive([weakView = GWeakPtr<WebKitWebView>(webView)](bool) {
++            if (auto* view = weakView.get())
++                webkitWebViewPingAnswered(view);
++        });
++    } else if (now - priv->pingSentAt >= busyPingSlow)
++        priv->mainThreadBusy = true;
++
++    webkitWebViewUpdateBusyCursor(webView);
++    return G_SOURCE_CONTINUE;
++}
++
++static void webkitWebViewNetworkActivityChanged(WebKitWebView* webView)
++{
++    WebKitWebViewPrivate* priv = webView->priv;
++    auto now = MonotonicTime::now();
++    if (getPage(webView).pageLoadState().networkRequestsInProgress()) {
++        if (!priv->isLoading)
++            priv->networkBusyUntil = now + busyNetworkMax;
++        priv->networkBusy = true;
++        webkitWebViewStartBusyWatch(webView);
++    } else
++        priv->networkBusy = false;
++    webkitWebViewUpdateBusyCursor(webView);
+ }
+ #endif
+ 
+@@ -479,6 +597,13 @@
+ 
+     webView->priv->isLoading = isLoading;
+ #if PLATFORM(GTK)
++    if (!isLoading && getPage(webView).pageLoadState().networkRequestsInProgress()) {
++        // Requests the page started before its load event finished: they
++        // keep the hourglass, within the same allowance as a late fetch.
++        webView->priv->networkBusyUntil = MonotonicTime::now() + busyNetworkMax;
++        webView->priv->networkBusy = true;
++    }
++    webkitWebViewStartBusyWatch(webView);
+     webkitWebViewUpdateBusyCursor(webView);
+ #endif
+     g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_IS_LOADING]);
+@@ -1252,6 +1377,7 @@
+     WebKitWebView* webView = WEBKIT_WEB_VIEW(object);
+ 
+ #if PLATFORM(GTK)
++    webkitWebViewStopBusyWatch(webView);
+     webkitWebViewCancelFaviconRequest(webView);
+     webView->priv->faviconChangedHandlerID = 0;
+ #endif

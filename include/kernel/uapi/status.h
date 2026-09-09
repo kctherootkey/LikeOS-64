@@ -25,6 +25,7 @@ typedef enum {
 	ST_ACCESS = -18, // permission denied by mode/ACL — maps to EACCES
 	ST_PERM =
 		-19, // operation not permitted (ownership/privilege) — maps to EPERM
+	ST_XDEV = -20, // the two paths are on different filesystems — maps to EXDEV
 } status_t;
 
 #endif // LIKEOS_STATUS_H

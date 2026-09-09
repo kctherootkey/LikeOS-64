@@ -689,9 +689,15 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 	{
 		const vfs_ops_t *mo = vfs_mount_ops(path);
 		if (mo) {
-			if (!mo->open)
+			if (!mo->open && !mo->open_mode)
 				return ST_UNSUPPORTED;
-			int ret = mo->open(path, flags, out);
+			/* ->open_mode when the mount has it, for the same reason
+			 * as the root below: an O_CREAT open should create with
+			 * the mode the caller asked for.  Until tmpfs no mount
+			 * could create anything, so only ->open was tried. */
+			int ret = mo->open_mode ?
+					  mo->open_mode(path, flags, cmode, out) :
+					  mo->open(path, flags, out);
 			if (ret == ST_OK && *out) {
 				(*out)->refcount = 1;
 				(*out)->flags = flags;
@@ -1274,8 +1280,15 @@ int vfs_unlink(const char *path)
 }
 int vfs_rename(const char *oldpath, const char *newpath)
 {
-	if (!g_root_ops || !g_root_ops->rename)
+	/* By path, like unlink: a name below a mount point (/ram) belongs to
+	 * that filesystem.  Both names must be on the same one -- a rename
+	 * cannot move data between filesystems, and EXDEV is what tells mv
+	 * to copy and delete instead. */
+	const vfs_ops_t *ops = vfs_ops_for_path(oldpath);
+	if (!ops || !ops->rename)
 		return ST_UNSUPPORTED;
+	if (vfs_ops_for_path(newpath) != ops)
+		return ST_XDEV;
 	/* Renaming removes the old name (parent write + sticky) and creates the
 	 * new one (new parent write); the source inode's flags must permit it. */
 	int pr = vfs_permission_remove(oldpath);
@@ -1288,35 +1301,38 @@ int vfs_rename(const char *oldpath, const char *newpath)
 	if (im != ST_OK)
 		return im;
 	vfs_meta_bump();
-	return g_root_ops->rename(oldpath, newpath);
+	return ops->rename(oldpath, newpath);
 }
 /* Create a socket or FIFO node.  Same permission rule as creating any other
  * name: write+search on the containing directory.  The caller is expected to
  * have already applied its umask to `mode`. */
 int vfs_mknod(const char *path, unsigned int mode)
 {
-	if (!g_root_ops || !g_root_ops->mknod)
+	const vfs_ops_t *ops = vfs_ops_for_path(path);
+	if (!ops || !ops->mknod)
 		return ST_UNSUPPORTED;
 	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
 	if (pr != ST_OK)
 		return pr;
 	vfs_meta_bump();
-	return g_root_ops->mknod(path, mode);
+	return ops->mknod(path, mode);
 }
 
 int vfs_mkdir(const char *path, unsigned int mode)
 {
-	if (!g_root_ops || !g_root_ops->mkdir)
+	const vfs_ops_t *ops = vfs_ops_for_path(path);
+	if (!ops || !ops->mkdir)
 		return ST_UNSUPPORTED;
 	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
 	if (pr != ST_OK)
 		return pr;
 	vfs_meta_bump();
-	return g_root_ops->mkdir(path, mode);
+	return ops->mkdir(path, mode);
 }
 int vfs_rmdir(const char *path)
 {
-	if (!g_root_ops || !g_root_ops->rmdir)
+	const vfs_ops_t *ops = vfs_ops_for_path(path);
+	if (!ops || !ops->rmdir)
 		return ST_UNSUPPORTED;
 	int pr = vfs_permission_remove(path);
 	if (pr != ST_OK)
@@ -1325,7 +1341,7 @@ int vfs_rmdir(const char *path)
 	if (im != ST_OK)
 		return im;
 	vfs_meta_bump();
-	return g_root_ops->rmdir(path);
+	return ops->rmdir(path);
 }
 
 void vfs_release_locks_for_task(uint64_t task_id)
@@ -1339,6 +1355,10 @@ void vfs_release_locks_for_task(uint64_t task_id)
 		g_root_ops->release_locks_for_task(task_id);
 	if (g_dev_ops && g_dev_ops->release_locks_for_task)
 		g_dev_ops->release_locks_for_task(task_id);
+	/* The mounts too: tmpfs holds a sleeping mutex across its operations. */
+	for (int i = 0; i < g_nmounts; i++)
+		if (g_mounts[i].ops->release_locks_for_task)
+			g_mounts[i].ops->release_locks_for_task(task_id);
 }
 
 int vfs_close(vfs_file_t *f)

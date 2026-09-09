@@ -77,6 +77,8 @@ int vfs_status_to_errno(int st)
 		return -EACCES;
 	case ST_PERM:
 		return -EPERM;
+	case ST_XDEV:
+		return -EXDEV;
 	default:
 		return -EACCES;
 	}

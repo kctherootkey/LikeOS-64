@@ -28,9 +28,11 @@
  * Pixels are PREMULTIPLIED alpha, which is what Xcursor and the Render
  * extension expect; straight alpha renders with bright fringes on the edges.
  *
- * Each cursor is written at several nominal sizes in one file.  Xcursor picks
- * the size closest to what the client asked for, so shipping 24/32/48 means the
- * cursor stays sharp instead of being scaled from a single bitmap.
+ * The plain hourglass is written at several nominal sizes in one file.
+ * Xcursor picks the size closest to what the client asked for, so shipping
+ * 24/32/48 means the cursor stays sharp instead of being scaled from a single
+ * bitmap.  The pointer variant is written at ONE size -- see build_ptr_watch
+ * for why it must not scale.
  *
  * Usage: gen-cursors <output-directory>
  */
@@ -84,58 +86,89 @@ static void canvas_free(canvas *c)
 	free(c);
 }
 
-/* A shape is a predicate over DESIGN coordinates (the 32x32 grid below). */
+/* Source-over one pixel, premultiplied; `cov' is the coverage 0..1. */
+static void blend(pixel *d, colour col, double cov)
+{
+	double sa = cov * col.a;
+	double inv = 1.0 - sa;
+
+	d->r = col.r * sa + d->r * inv;
+	d->g = col.g * sa + d->g * inv;
+	d->b = col.b * sa + d->b * inv;
+	d->a = sa + d->a * inv;
+}
+
+/* A shape is a predicate over DESIGN coordinates. */
 typedef int (*shape_fn)(double x, double y, const void *ctx);
 
 /*
- * Rasterise one shape.  `scale' maps design units to pixels and `ox'/`oy'
- * shift the shape within the image, so the same predicates draw the hourglass
- * on its own and tucked beside an arrow, at any size, with no second copy of
- * the geometry.
+ * How design coordinates land on the canvas.  `scale' maps design units to
+ * pixels and `ox'/`oy' place the design origin, so the same predicates draw
+ * the hourglass on its own and tucked beside an arrow, at any size, with no
+ * second copy of the geometry.
+ *
+ * The hourglass TURNS OVER at the end of its cycle, which is what an
+ * hourglass does and what the cursor it imitates did, and there are two ways
+ * to show that, both about the centre (rcx, rcy): `rot' spins the drawing in
+ * the plane, and `sy' squashes it vertically, through zero, to the mirror
+ * image -- a turn about the horizontal axis, seen edge-on in the middle
+ * frame.  The spin is the better animation when there is room for it; the
+ * turn is what the small glass beside the pointer uses, because a nine-pixel
+ * drawing spun through 60 degrees is a smear, and it would sweep across the
+ * pointer while it turned.
  */
+typedef struct {
+	double scale;
+	double ox, oy;
+	double rot;
+	double sy;
+	double rcx, rcy;
+} xform;
+
+/*
+ * The pixel being rasterised, for shapes defined on the PIXEL grid rather
+ * than the design grid (the sand's checkerboard).  fill_shape sets it before
+ * sampling a pixel, so every subsample of that pixel sees the same value and
+ * such a shape is wholly in or wholly out of a pixel -- never antialiased
+ * into a grey smear, whatever the scale.
+ */
+static int cur_px, cur_py;
+
 static void fill_shape(canvas *c, shape_fn in, const void *ctx, colour col,
-		       double scale, double ox, double oy, double rot)
+		       const xform *xf)
 {
 	const double step = 1.0 / SS;
 	const double unit = 1.0 / (SS * SS);
-	const double cs = cos(-rot), sn = sin(-rot);
+	const double cs = cos(-xf->rot), sn = sin(-xf->rot);
 
 	for (int py = 0; py < c->h; py++) {
 		for (int px = 0; px < c->w; px++) {
 			double cov = 0.0;
 
+			cur_px = px;
+			cur_py = py;
 			for (int sy = 0; sy < SS; sy++)
 				for (int sx = 0; sx < SS; sx++) {
-					double x = (px + (sx + 0.5) * step - ox) / scale;
-					double y = (py + (sy + 0.5) * step - oy) / scale;
+					double x = (px + (sx + 0.5) * step -
+						    xf->ox) / xf->scale;
+					double y = (py + (sy + 0.5) * step -
+						    xf->oy) / xf->scale;
 
-					if (rot != 0.0) {
-						/* Rotate about the design centre.
-						 * The hourglass TURNS OVER at the
-						 * end of its cycle, which is what
-						 * an hourglass does and what the
-						 * cursor it imitates did. */
-						double rx = x - 16.0;
-						double ry = y - 16.0;
+					if (xf->sy != 1.0)
+						y = xf->rcy +
+						    (y - xf->rcy) / xf->sy;
+					if (xf->rot != 0.0) {
+						double rx = x - xf->rcx;
+						double ry = y - xf->rcy;
 
-						x = 16.0 + rx * cs - ry * sn;
-						y = 16.0 + rx * sn + ry * cs;
+						x = xf->rcx + rx * cs - ry * sn;
+						y = xf->rcy + rx * sn + ry * cs;
 					}
 					if (in(x, y, ctx))
 						cov += unit;
 				}
-			if (cov <= 0.0)
-				continue;
-
-			/* Source-over, premultiplied. */
-			pixel *d = &c->p[(size_t)py * c->w + px];
-			double sa = cov * col.a;
-			double inv = 1.0 - sa;
-
-			d->r = col.r * sa + d->r * inv;
-			d->g = col.g * sa + d->g * inv;
-			d->b = col.b * sa + d->b * inv;
-			d->a = sa + d->a * inv;
+			if (cov > 0.0)
+				blend(&c->p[(size_t)py * c->w + px], col, cov);
 		}
 	}
 }
@@ -179,56 +212,69 @@ static unsigned int *canvas_argb(const canvas *c)
 /* ---- Geometry: the hourglass -------------------------------------------- */
 
 /*
- * Design grid is 32x32.  The glass is two funnels meeting at a neck, capped
- * top and bottom:
+ * The glass is two funnels meeting at a neck, capped top and bottom:
  *
- *        7            25
- *    3   +------------+     cap
- *          \        /       upper funnel
- *   16         ><           neck
- *          /        \       lower funnel
- *   29   +------------+     cap
+ *        left        right
+ *   top   +------------+     cap
+ *           \        /       upper funnel
+ * neck_y        ><           neck
+ *           /        \       lower funnel
+ *   bot   +------------+     cap
+ *
+ * The dimensions are a parameter, not constants, because the same drawing is
+ * made at two very different sizes: on its own it fills a 32-unit design grid
+ * that is scaled to the cursor size; beside the pointer it is nine pixels
+ * wide, drawn at scale 1 with every straight edge on a pixel boundary,
+ * because at that size a half-pixel edge is a grey line.
  */
-#define G_LEFT 9.5
-#define G_RIGHT 22.5
-#define G_TOP 4.0
-#define G_BOT 28.0
-#define G_CAP 2.0
-#define G_NECK_Y 16.0
-#define G_NECK_HW 1.0
+typedef struct {
+	double left, right, top, bot; /* the outer box */
+	double cap;		      /* thickness of the solid end bars */
+	double neck_y, neck_hw;	      /* height and half-width of the neck */
+} glass;
 
-static double glass_halfwidth(double y)
+static double glass_cx(const glass *g)
 {
-	const double full = (G_RIGHT - G_LEFT) / 2.0;
-	const double top_in = G_TOP + G_CAP;
-	const double bot_in = G_BOT - G_CAP;
+	return (g->left + g->right) / 2.0;
+}
+
+static double glass_cy(const glass *g)
+{
+	return (g->top + g->bot) / 2.0;
+}
+
+static double glass_halfwidth(const glass *g, double y)
+{
+	const double full = (g->right - g->left) / 2.0;
+	const double top_in = g->top + g->cap;
+	const double bot_in = g->bot - g->cap;
 
 	if (y <= top_in || y >= bot_in)
 		return full;
-	if (y < G_NECK_Y) {
-		double t = (y - top_in) / (G_NECK_Y - top_in);
-		return full + (G_NECK_HW - full) * t;
+	if (y < g->neck_y) {
+		double t = (y - top_in) / (g->neck_y - top_in);
+		return full + (g->neck_hw - full) * t;
 	}
 	{
-		double t = (y - G_NECK_Y) / (bot_in - G_NECK_Y);
-		return G_NECK_HW + (full - G_NECK_HW) * t;
+		double t = (y - g->neck_y) / (bot_in - g->neck_y);
+		return g->neck_hw + (full - g->neck_hw) * t;
 	}
 }
 
-#define G_CX ((G_LEFT + G_RIGHT) / 2.0)
-
 typedef struct {
+	const glass *g;
 	double inset;
 } inset_ctx;
 
 static int in_glass(double x, double y, const void *vctx)
 {
 	const inset_ctx *c = vctx;
+	const glass *g = c->g;
 	double d = c->inset;
 
-	if (y < G_TOP + d || y > G_BOT - d)
+	if (y < g->top + d || y > g->bot - d)
 		return 0;
-	return fabs(x - G_CX) <= glass_halfwidth(y) - d;
+	return fabs(x - glass_cx(g)) <= glass_halfwidth(g, y) - d;
 }
 
 /*
@@ -237,34 +283,36 @@ static int in_glass(double x, double y, const void *vctx)
  * the sand looks conserved.
  */
 typedef struct {
+	const glass *g;
 	double f;
 	double inset;
+	double stream_hw;
 } sand_ctx;
 
 /*
- * Grains, not a fill.  A checkerboard over the DESIGN grid, so at the nominal
- * 32px size every other pixel is set exactly as the cursor this imitates does
- * it; at other sizes the same pattern scales with the rest of the drawing.
+ * Grains, not a fill.  A checkerboard over the PIXEL grid, so at every size
+ * exactly every other pixel is set, as the cursor this imitates does it.
  * Without it the sand reads as a solid block of colour, which is the single
- * biggest thing that made an earlier attempt look wrong.
+ * biggest thing that made an earlier attempt look wrong; and with the board
+ * on the design grid instead, any size other than the nominal one blurred it
+ * into a grey wash.
  */
-static int sand_dither(double x, double y)
+static int sand_dither(void)
 {
-	int ix = (int)floor(x), iy = (int)floor(y);
-
-	return ((ix + iy) & 1) == 0;
+	return ((cur_px + cur_py) & 1) == 0;
 }
 
 static int in_sand_top(double x, double y, const void *vctx)
 {
 	const sand_ctx *s = vctx;
-	inset_ctx ic = { s->inset };
-	double top_in = G_TOP + G_CAP;
-	double surface = top_in + (G_NECK_Y - top_in) * s->f;
+	const glass *g = s->g;
+	inset_ctx ic = { g, s->inset };
+	double top_in = g->top + g->cap;
+	double surface = top_in + (g->neck_y - top_in) * s->f;
 
-	if (y < surface || y > G_NECK_Y)
+	if (y < surface || y > g->neck_y)
 		return 0;
-	if (!sand_dither(x, y))
+	if (!sand_dither())
 		return 0;
 	return in_glass(x, y, &ic);
 }
@@ -272,13 +320,14 @@ static int in_sand_top(double x, double y, const void *vctx)
 static int in_sand_bottom(double x, double y, const void *vctx)
 {
 	const sand_ctx *s = vctx;
-	inset_ctx ic = { s->inset };
-	double bot_in = G_BOT - G_CAP;
-	double surface = bot_in - (bot_in - G_NECK_Y) * s->f;
+	const glass *g = s->g;
+	inset_ctx ic = { g, s->inset };
+	double bot_in = g->bot - g->cap;
+	double surface = bot_in - (bot_in - g->neck_y) * s->f;
 
 	if (y < surface || y > bot_in)
 		return 0;
-	if (!sand_dither(x, y))
+	if (!sand_dither())
 		return 0;
 	return in_glass(x, y, &ic);
 }
@@ -286,81 +335,94 @@ static int in_sand_bottom(double x, double y, const void *vctx)
 static int in_stream(double x, double y, const void *vctx)
 {
 	const sand_ctx *s = vctx;
-	double bot_in = G_BOT - G_CAP;
-	double surface = bot_in - (bot_in - G_NECK_Y) * s->f;
+	const glass *g = s->g;
+	double bot_in = g->bot - g->cap;
+	double surface = bot_in - (bot_in - g->neck_y) * s->f;
 
 	/* No stream at the very start or end of the cycle -- an hourglass that
 	 * is full or empty is not pouring. */
 	if (s->f <= 0.05 || s->f >= 0.95)
 		return 0;
-	if (y < G_NECK_Y || y > surface)
+	if (y < g->neck_y || y > surface)
 		return 0;
-	return fabs(x - G_CX) <= 0.6;
+	return fabs(x - glass_cx(g)) <= s->stream_hw;
 }
 
-/* ---- Geometry: the arrow ------------------------------------------------ */
+/* The end caps, drawn solid.  On the cursor this imitates, the frame is a
+ * filled dark bar across the top and the bottom -- not a hollow outline -- and
+ * that is most of what makes the silhouette recognisable at 32 pixels. */
+static int in_caps(double x, double y, const void *vctx)
+{
+	const inset_ctx *c = vctx;
+	const glass *g = c->g;
+
+	if (fabs(x - glass_cx(g)) > (g->right - g->left) / 2.0)
+		return 0;
+	return (y >= g->top && y <= g->top + g->cap) ||
+	       (y >= g->bot - g->cap && y <= g->bot);
+}
+
+/* The lit edge: a white stripe just inside the left wall of each chamber,
+ * between the two insets.  Together with the darker BEVEL laid under the body
+ * this gives the glass the shaded, three-dimensional look the original has --
+ * flat silver on its own looks like a sticker. */
+typedef struct {
+	const glass *g;
+	double from, to;
+} hilite_ctx;
+
+static int in_highlight(double x, double y, const void *vctx)
+{
+	const hilite_ctx *h = vctx;
+	const glass *g = h->g;
+	inset_ctx a = { g, h->from }, b = { g, h->to };
+
+	if (y < g->top + g->cap + 0.5 || y > g->bot - g->cap - 0.5)
+		return 0;
+	if (x > glass_cx(g))
+		return 0; /* left half only */
+	return in_glass(x, y, &a) && !in_glass(x, y, &b);
+}
+
+/* ---- Geometry: the pointer ---------------------------------------------- */
 
 /*
- * The conventional X left_ptr outline, hot spot at (0,0), as a polygon in
- * design units.  Point-in-polygon by ray crossing -- exact, and it keeps the
- * shape readable as a list of corners instead of a stack of half-planes.
+ * The pointer this cursor is a variant of is NOT drawn here.  It is the X core
+ * cursor font's left_ptr, exactly as the server shows it over every other
+ * window: this theme defines no left_ptr, so XcursorLibraryLoadCursor falls
+ * back to XCreateGlyphCursor on glyphs 68/69 of cursor.pcf, black on white.
+ * A pointer that changes size or colour the moment it goes busy looks like a
+ * different pointer, and the switch back and forth is what the eye sees; so
+ * the busy variant carries those same pixels, and only adds to them.
+ *
+ * Transcribed from ports/xorg/font-cursor-misc-1.0.4/cursor.bdf: the 10x16
+ * mask glyph (BBX 10 16 -1 -15) is the white shape, and the 8x14 source
+ * glyph (BBX 8 14 0 -14) is black on top of it, both placed at their shared
+ * origin -- which is where the hot spot goes, one pixel in from the corner.
  */
-static const double ARROW[][2] = {
-	{ 0.0, 0.0 },	{ 0.0, 16.4 }, { 4.1, 12.6 },  { 6.7, 18.6 },
-	{ 9.6, 17.3 },	{ 7.0, 11.5 }, { 12.0, 11.3 },
+#define PTR_W 10
+#define PTR_H 16
+#define PTR_XHOT 1
+#define PTR_YHOT 1
+
+static const char CORE_PTR[PTR_H][PTR_W + 1] = {
+	"..        ",
+	".#.       ",
+	".##.      ",
+	".###.     ",
+	".####.    ",
+	".#####.   ",
+	".######.  ",
+	".#######. ",
+	".########.",
+	".#####....",
+	".##.##.   ",
+	".#. .##.  ",
+	"..  .##.  ",
+	"     .##. ",
+	"     .##. ",
+	"      ..  ",
 };
-#define ARROW_N ((int)(sizeof ARROW / sizeof ARROW[0]))
-
-static int point_in_poly(double x, double y, const double poly[][2], int n)
-{
-	int inside = 0;
-
-	for (int i = 0, j = n - 1; i < n; j = i++) {
-		double xi = poly[i][0], yi = poly[i][1];
-		double xj = poly[j][0], yj = poly[j][1];
-
-		if ((yi > y) != (yj > y) &&
-		    x < (xj - xi) * (y - yi) / (yj - yi) + xi)
-			inside = !inside;
-	}
-	return inside;
-}
-
-static int in_arrow(double x, double y, const void *ctx)
-{
-	(void)ctx;
-	return point_in_poly(x, y, ARROW, ARROW_N);
-}
-
-/* The white body: the same polygon shrunk towards its centroid, which gives a
- * uniform dark border without needing a second hand-drawn outline. */
-static int in_arrow_body(double x, double y, const void *ctx)
-{
-	static double inner[ARROW_N][2];
-	static int built;
-	(void)ctx;
-
-	if (!built) {
-		double cx = 0, cy = 0;
-
-		for (int i = 0; i < ARROW_N; i++) {
-			cx += ARROW[i][0];
-			cy += ARROW[i][1];
-		}
-		cx /= ARROW_N;
-		cy /= ARROW_N;
-		for (int i = 0; i < ARROW_N; i++) {
-			double dx = ARROW[i][0] - cx, dy = ARROW[i][1] - cy;
-			double len = sqrt(dx * dx + dy * dy);
-			double k = len > 0 ? (len - 1.15) / len : 0;
-
-			inner[i][0] = cx + dx * k;
-			inner[i][1] = cy + dy * k;
-		}
-		built = 1;
-	}
-	return point_in_poly(x, y, inner, ARROW_N);
-}
 
 /* ---- Palette ------------------------------------------------------------ */
 
@@ -378,56 +440,51 @@ static const colour SAND = { 0.0, 0.0, 0.0, 1.0 };
 
 /* ---- Frame assembly ----------------------------------------------------- */
 
-/* The end caps, drawn solid.  On the cursor this imitates, the frame is a
- * filled dark bar across the top and the bottom -- not a hollow outline -- and
- * that is most of what makes the silhouette recognisable at 32 pixels. */
-static int in_caps(double x, double y, const void *ctx)
+static void draw_hourglass(canvas *c, const glass *g, double f,
+			   const xform *xf)
 {
-	(void)ctx;
-	if (fabs(x - G_CX) > (G_RIGHT - G_LEFT) / 2.0)
-		return 0;
-	return (y >= G_TOP && y <= G_TOP + G_CAP) ||
-	       (y >= G_BOT - G_CAP && y <= G_BOT);
+	const double one = 1.0 / xf->scale; /* one pixel, in design units */
+	/*
+	 * At the design size the outline is 0.9 units of black with 0.7 of
+	 * darker grey bevelled inside it.  Where one pixel is wider than that
+	 * outline -- the small glass beside the pointer -- the bevel would
+	 * be a fraction of a pixel of antialiasing noise, so the outline
+	 * becomes exactly one pixel of black and the body starts right
+	 * inside it; the highlight likewise shrinks to one pixel.
+	 */
+	const int small = one > 0.9;
+	const double edge = small ? one : 1.6;
+	inset_ctx outer = { g, 0.0 };
+	inset_ctx bevel = { g, 0.9 };
+	inset_ctx inner = { g, edge };
+	hilite_ctx hi = { g, small ? edge : 2.0, small ? edge + one : 4.0 };
+	sand_ctx sand = { g, f, edge, small ? one / 2.0 : 0.6 };
+
+	fill_shape(c, in_glass, &outer, OUTLINE, xf);
+	if (!small)
+		fill_shape(c, in_glass, &bevel, BEVEL, xf);
+	fill_shape(c, in_glass, &inner, GLASS, xf);
+	fill_shape(c, in_highlight, &hi, HILITE, xf);
+	fill_shape(c, in_sand_top, &sand, SAND, xf);
+	fill_shape(c, in_sand_bottom, &sand, SAND, xf);
+	fill_shape(c, in_stream, &sand, SAND, xf);
+	fill_shape(c, in_caps, &outer, OUTLINE, xf);
 }
 
-/* The lit edge: a two-pixel white stripe just inside the left wall of each
- * chamber.  Together with the darker BEVEL laid under the body this gives the
- * glass the shaded, three-dimensional look the original has -- flat silver on
- * its own looks like a sticker. */
-static int in_highlight(double x, double y, const void *ctx)
+/* The core pointer, pixel for pixel, its corner at (x0, y0).  Drawn last so
+ * that nothing the hourglass does -- including turning over -- touches it. */
+static void draw_core_ptr(canvas *c, int x0, int y0)
 {
-	inset_ctx in2 = { 2.0 }, in4 = { 4.0 };
-	(void)ctx;
+	for (int y = 0; y < PTR_H; y++)
+		for (int x = 0; x < PTR_W; x++) {
+			char ch = CORE_PTR[y][x];
+			pixel *d;
 
-	if (y < G_TOP + G_CAP + 0.5 || y > G_BOT - G_CAP - 0.5)
-		return 0;
-	if (x > G_CX)
-		return 0; /* left half only */
-	return in_glass(x, y, &in2) && !in_glass(x, y, &in4);
-}
-
-static void draw_hourglass(canvas *c, double f, double scale, double ox,
-			   double oy, double rot)
-{
-	inset_ctx outer = { 0.0 };
-	inset_ctx bevel = { 0.9 };
-	inset_ctx inner = { 1.6 };
-	sand_ctx sand = { f, 1.6 };
-
-	fill_shape(c, in_glass, &outer, OUTLINE, scale, ox, oy, rot);
-	fill_shape(c, in_glass, &bevel, BEVEL, scale, ox, oy, rot);
-	fill_shape(c, in_glass, &inner, GLASS, scale, ox, oy, rot);
-	fill_shape(c, in_highlight, NULL, HILITE, scale, ox, oy, rot);
-	fill_shape(c, in_sand_top, &sand, SAND, scale, ox, oy, rot);
-	fill_shape(c, in_sand_bottom, &sand, SAND, scale, ox, oy, rot);
-	fill_shape(c, in_stream, &sand, SAND, scale, ox, oy, rot);
-	fill_shape(c, in_caps, NULL, OUTLINE, scale, ox, oy, rot);
-}
-
-static void draw_arrow(canvas *c, double scale, double ox, double oy)
-{
-	fill_shape(c, in_arrow, NULL, OUTLINE, scale, ox, oy, 0.0);
-	fill_shape(c, in_arrow_body, NULL, GLASS, scale, ox, oy, 0.0);
+			if (ch == ' ')
+				continue;
+			d = &c->p[(size_t)(y0 + y) * c->w + (x0 + x)];
+			blend(d, ch == '#' ? OUTLINE : HILITE, 1.0);
+		}
 }
 
 /* ---- Xcursor writing ---------------------------------------------------- */
@@ -491,30 +548,46 @@ static void write_xcursor(const char *path, const frame *fr, int n)
 
 /*
  * The cycle: the sand drains, then the glass turns over and it starts again.
- * DRAIN_FRAMES show the sand running out; FLIP_FRAMES rotate the whole thing
- * through half a turn, which is why fill_shape takes a rotation at all.
+ * DRAIN_FRAMES show the sand running out; FLIP_FRAMES take the whole thing
+ * through half a turn, by spinning it or by turning it over (see xform).
  */
 #define DRAIN_FRAMES 10
 #define FLIP_FRAMES 3
 #define NFRAMES (DRAIN_FRAMES + FLIP_FRAMES)
 #define FRAME_MS 110
 
-/* Fill level and rotation for frame `i' of the cycle. */
-static void frame_state(int i, double *f, double *rot)
+enum flip { SPIN, TURN };
+
+/* Fill level and orientation for frame `i' of the cycle. */
+static void frame_state(int i, enum flip how, double *f, xform *xf)
 {
+	double angle;
+
+	xf->rot = 0.0;
+	xf->sy = 1.0;
 	if (i < DRAIN_FRAMES) {
 		*f = (double)i / (DRAIN_FRAMES - 1);
-		*rot = 0.0;
-	} else {
-		/* Turning over: drained, so the sand is all in the bottom --
-		 * which the rotation carries up to the top for the next pass. */
-		*f = 1.0;
-		*rot = 3.14159265358979 * (double)(i - DRAIN_FRAMES + 1) /
-		       (double)FLIP_FRAMES;
+		return;
 	}
+	/* Turning over: drained, so the sand is all in the bottom -- which the
+	 * half turn carries up to the top for the next pass. */
+	*f = 1.0;
+	angle = 3.14159265358979 * (double)(i - DRAIN_FRAMES + 1) /
+		(double)FLIP_FRAMES;
+	if (how == SPIN)
+		xf->rot = angle;
+	else
+		xf->sy = cos(angle);
 }
+
 static const int SIZES[] = { 24, 32, 48 };
 #define NSIZES ((int)(sizeof SIZES / sizeof SIZES[0]))
+
+/* The glass on its own, on the 32-unit design grid. */
+static const glass BIG_GLASS = {
+	.left = 9.5, .right = 22.5, .top = 4.0, .bot = 28.0,
+	.cap = 2.0, .neck_y = 16.0, .neck_hw = 1.0,
+};
 
 /*
  * The plain hourglass.  Hot spot at the centre of the glass, which is where a
@@ -527,18 +600,20 @@ static void build_watch(const char *dir, const char *name)
 
 	for (int s = 0; s < NSIZES; s++) {
 		int px = SIZES[s];
-		double scale = px / 32.0;
+		xform xf = { .scale = px / 32.0, .ox = 0, .oy = 0,
+			     .rcx = glass_cx(&BIG_GLASS),
+			     .rcy = glass_cy(&BIG_GLASS) };
 
 		for (int i = 0; i < NFRAMES; i++) {
 			canvas *c = canvas_new(px, px);
-			double f, rot;
+			double f;
 
-			frame_state(i, &f, &rot);
-			draw_hourglass(c, f, scale, 0, 0, rot);
+			frame_state(i, SPIN, &f, &xf);
+			draw_hourglass(c, &BIG_GLASS, f, &xf);
 			fr[n].size = px;
 			fr[n].w = fr[n].h = px;
-			fr[n].xhot = (int)(G_CX * scale);
-			fr[n].yhot = (int)(G_NECK_Y * scale);
+			fr[n].xhot = (int)(glass_cx(&BIG_GLASS) * xf.scale);
+			fr[n].yhot = (int)(BIG_GLASS.neck_y * xf.scale);
 			fr[n].delay = FRAME_MS;
 			fr[n].px = canvas_argb(c);
 			canvas_free(c);
@@ -554,43 +629,55 @@ static void build_watch(const char *dir, const char *name)
 }
 
 /*
- * Arrow plus a small hourglass: "working, but the interface still responds".
- * The hourglass is drawn at 60% and tucked to the lower right of the arrow, and
- * the hot spot stays at the arrow's tip because that is what the user is
- * pointing with.
+ * The pointer plus a small hourglass: "working, but the interface still
+ * responds".  The pointer is the core font's, pixel for pixel (see CORE_PTR),
+ * and the hourglass sits to its right, one pixel clear of the widest row,
+ * with its top level with the pointer's tip.  The hot spot is the pointer's,
+ * because that is what the user is pointing with.
+ *
+ * ONE image, at ONE nominal size.  The core pointer is a bitmap the server
+ * shows at a fixed size whatever XCURSOR_SIZE says, and this cursor has to
+ * match it exactly, so it must not come in sizes either: Xcursor takes the
+ * one image on offer for any size a client asks.
  */
+#define SMALL_X (PTR_W + 1)  /* left edge of the glass */
+#define SMALL_Y 1	      /* level with the tip of the pointer */
+
+static const glass SMALL_GLASS = {
+	.left = 0.0, .right = 9.0, .top = 0.0, .bot = 15.0,
+	.cap = 1.5, .neck_y = 7.5, .neck_hw = 0.5,
+};
+
 static void build_ptr_watch(const char *dir, const char *name)
 {
-	frame fr[NSIZES * NFRAMES];
-	int n = 0;
+	const int W = SMALL_X + (int)SMALL_GLASS.right;
+	const int H = PTR_H;
+	frame fr[NFRAMES];
+	xform xf = { .scale = 1.0, .ox = SMALL_X, .oy = SMALL_Y,
+		     .rcx = glass_cx(&SMALL_GLASS),
+		     .rcy = glass_cy(&SMALL_GLASS) };
 
-	for (int s = 0; s < NSIZES; s++) {
-		int px = SIZES[s];
-		double scale = px / 32.0;
+	for (int i = 0; i < NFRAMES; i++) {
+		canvas *c = canvas_new(W, H);
+		double f;
 
-		for (int i = 0; i < NFRAMES; i++) {
-			canvas *c = canvas_new(px, px);
-			double f, rot;
-
-			frame_state(i, &f, &rot);
-			draw_hourglass(c, f, scale * 0.58,
-				       px * 0.40, px * 0.34, rot);
-			draw_arrow(c, scale, 0.5 * scale, 0.5 * scale);
-			fr[n].size = px;
-			fr[n].w = fr[n].h = px;
-			fr[n].xhot = 0;
-			fr[n].yhot = 0;
-			fr[n].delay = FRAME_MS;
-			fr[n].px = canvas_argb(c);
-			canvas_free(c);
-			n++;
-		}
+		frame_state(i, TURN, &f, &xf);
+		draw_hourglass(c, &SMALL_GLASS, f, &xf);
+		draw_core_ptr(c, 0, 0);
+		fr[i].size = 32;
+		fr[i].w = W;
+		fr[i].h = H;
+		fr[i].xhot = PTR_XHOT;
+		fr[i].yhot = PTR_YHOT;
+		fr[i].delay = FRAME_MS;
+		fr[i].px = canvas_argb(c);
+		canvas_free(c);
 	}
 
 	char path[1024];
 	snprintf(path, sizeof path, "%s/cursors/%s", dir, name);
-	write_xcursor(path, fr, n);
-	for (int i = 0; i < n; i++)
+	write_xcursor(path, fr, NFRAMES);
+	for (int i = 0; i < NFRAMES; i++)
 		free(fr[i].px);
 }
 
