@@ -103,14 +103,17 @@ static void drm_release(vfs_file_t *file)
 		drm_master_drop(dev, fp);
 	/* Every handle this file held. */
 	for (uint32_t h = 1; h < fp->nhandles; h++) {
-		if (fp->handles[h]) {
-			struct drm_gem_object *o = fp->handles[h];
-			fp->handles[h] = NULL;
+		struct drm_gem_object **cell = drm_handle_slot(fp, h);
+
+		if (*cell) {
+			struct drm_gem_object *o = *cell;
+			*cell = NULL;
 			drm_gem_put(o);
 		}
 	}
-	if (fp->handles)
-		kfree(fp->handles);
+	for (uint32_t k = 0; k < fp->nhandles / DRM_HANDLE_CHUNK; k++)
+		kfree(fp->handles[k]);
+	fp->nhandles = 0;
 	drm_fence_handles_release(fp);
 	drm_kms_file_release(dev, fp);
 	if (dev->drv->postclose)
@@ -558,7 +561,7 @@ static long drm_core_ioctl(struct drm_device *dev, struct drm_file *fp,
 		uint64_t fl;
 		spin_lock_irqsave(&fp->lock, &fl);
 		for (uint32_t i = 1; i < fp->nhandles; i++)
-			if (fp->handles[i] == o) {
+			if (*drm_handle_slot(fp, i) == o) {
 				h = drm_gem_handle_of_slot(fp, i);
 				break;
 			}

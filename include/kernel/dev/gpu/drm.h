@@ -216,7 +216,15 @@ void *drm_gem_page_virt(struct drm_gem_object *o, uint32_t page);
 #define DRM_MAX_PROPS 48
 #define DRM_MAX_BLOBS 32
 #define DRM_MAX_FBS 64
-#define DRM_MAX_HANDLES 4096
+/* Handles per file.  The slot half of a handle is 16 bits wide (see
+ * drm_gem.c), so this is the most the encoding can name; it was 4096, and a
+ * web process rendering a heavy page -- two handles per texture, one per
+ * buffer -- ran into that with most of RAM free.  The table is kept in
+ * chunks of one page of pointers so growing it never needs a large
+ * contiguous allocation, which the kernel allocator cannot reclaim for. */
+#define DRM_MAX_HANDLES 65536
+#define DRM_HANDLE_CHUNK 512
+#define DRM_HANDLE_CHUNKS (DRM_MAX_HANDLES / DRM_HANDLE_CHUNK)
 
 struct drm_prop {
 	uint32_t id;
@@ -294,9 +302,15 @@ struct drm_file {
 	int authenticated;
 	uint32_t magic;
 	uint32_t uid;
-	/* handle -> object; index 0 unused (handle 0 is "none") */
-	struct drm_gem_object **handles;
+	/* handle -> object, chunk k holding slots [k * DRM_HANDLE_CHUNK, +CHUNK);
+	 * index 0 unused (handle 0 is "none").  nhandles is the number of
+	 * slots installed, a multiple of the chunk; handle_hint is the lowest
+	 * slot that may be free (everything below it is taken), so a create
+	 * does not rescan a full prefix under the lock every time. */
+	struct drm_gem_object **handles[DRM_HANDLE_CHUNKS];
 	uint32_t nhandles;
+	uint32_t handle_hint;
+	int handles_full_reported;
 	uint32_t file_id; /* names this file inside every handle it hands out */
 	/* fence handle -> fence, a namespace of its own */
 	struct drm_fence **fences;
@@ -310,6 +324,14 @@ struct drm_file {
 	void *priv; /* backend per-file state */
 	struct drm_file *next; /* device list */
 };
+
+/* The slot's cell; the caller holds fp->lock and has checked
+ * slot < fp->nhandles. */
+static inline struct drm_gem_object **drm_handle_slot(struct drm_file *fp,
+						      uint32_t slot)
+{
+	return &fp->handles[slot / DRM_HANDLE_CHUNK][slot % DRM_HANDLE_CHUNK];
+}
 
 /* ---- the driver ---------------------------------------------------------- */
 

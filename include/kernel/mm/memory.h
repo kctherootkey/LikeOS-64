@@ -352,7 +352,7 @@ void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count);
  * Never from an interrupt or under a spinlock: reclaim takes the cache's own
  * locks. */
 uint64_t mm_allocate_physical_page_reclaim(void);
-void mm_reclaim_for_pages(uint64_t pages);
+uint64_t mm_reclaim_for_pages(uint64_t pages);
 
 // Virtual Memory Manager
 void mm_initialize_virtual_memory(void);

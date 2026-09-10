@@ -96,6 +96,17 @@ int vmw_surface_alloc_id(struct vmw_device *v)
 	spin_lock_irqsave(&v->id_lock, &fl);
 	int id = vmw_id_alloc(v->surface_ids, VMW_NUM_SURFACES);
 	spin_unlock_irqrestore(&v->id_lock, fl);
+	if (id < 0) {
+		/* The client sees this as GL_OUT_OF_MEMORY with RAM to spare;
+		 * the pool is device-wide, so name it once. */
+		static int reported;
+
+		if (!reported) {
+			reported = 1;
+			kprintf("vmwgfx: surface id pool exhausted: all %u ids in use\n",
+				(unsigned)VMW_NUM_SURFACES);
+		}
+	}
 	return id;
 }
 
@@ -482,8 +493,13 @@ static int surface_create_common(struct vmw_device *v, struct drm_file *fp,
 	else if (s->backup)
 		bhandle = b->buffer_handle;
 	drm_gem_put(so); /* the handle holds it */
-	if (rc)
+	if (rc) {
+		/* The surface's handle was made before the backup's failed;
+		 * the client never learns it, so take it back. */
+		if (handle)
+			drm_gem_handle_delete(fp, handle);
 		return rc;
+	}
 	mm_memset(rep, 0, sizeof(*rep));
 	rep->handle = handle;
 	rep->backup_size = size;

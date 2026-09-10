@@ -51,19 +51,21 @@ struct drm_gem_object *drm_gem_alloc(struct drm_device *dev,
  * says so in dmesg instead of leaving the symptom to be guessed at. */
 static void gem_make_room(uint32_t npages)
 {
-	uint64_t before = mm_get_free_pages();
-	uint64_t after;
+	uint64_t reclaimed = mm_reclaim_for_pages(npages);
 
-	mm_reclaim_for_pages(npages);
-	after = mm_get_free_pages();
-	if (after != before) {
+	/* Counted by the reclaimer, not read off the free-page counter
+	 * before and after: every other CPU moves that counter meanwhile,
+	 * and a difference taken across the call once came out at -1 -- a
+	 * concurrent allocation, printed unsigned, for a reclaim that had
+	 * never run. */
+	if (reclaimed) {
 		static unsigned budget = 8;
 
 		if (budget) {
 			budget--;
 			kprintf("drm: gem: reclaimed %lu page-cache pages for a %u-page object, %lu free now\n",
-				(unsigned long)(after - before), npages,
-				(unsigned long)after);
+				(unsigned long)reclaimed, npages,
+				(unsigned long)mm_get_free_pages());
 		}
 	}
 }
@@ -481,59 +483,98 @@ int drm_gem_handle_create(struct drm_file *fp, struct drm_gem_object *o,
 	 *
 	 * So the capacity the decision was made on is re-checked once the
 	 * lock is back: if it moved, this attempt is void -- drop the new
-	 * table and start again, because the winner's table may already have
-	 * the free slot this call wanted. */
+	 * chunk and start again, because the winner's chunk may already have
+	 * the free slot this call wanted.
+	 *
+	 * The table grows one chunk at a time and the old chunks stay where
+	 * they are, so growing never copies anything and never asks for more
+	 * than a page of pointers -- a table that doubled needed a contiguous
+	 * allocation of its full size each time, which the kernel allocator
+	 * cannot reclaim page cache for, and at 65536 slots that is half a
+	 * megabyte. */
 	for (;;) {
 		spin_lock_irqsave(&fp->lock, &fl);
-		for (uint32_t h = 1; h < fp->nhandles; h++) {
-			if (!fp->handles[h]) {
+		/* Slot 0 is never issued; nothing below the hint is free. */
+		if (fp->handle_hint == 0)
+			fp->handle_hint = 1;
+		for (uint32_t h = fp->handle_hint; h < fp->nhandles; h++) {
+			struct drm_gem_object **slot = drm_handle_slot(fp, h);
+
+			if (!*slot) {
 				drm_gem_get(o);
-				fp->handles[h] = o;
+				*slot = o;
+				fp->handle_hint = h + 1;
 				spin_unlock_irqrestore(&fp->lock, fl);
 				*handle_out = drm_handle_make(fp, h);
 				return 0;
 			}
 		}
-		/* Grow. */
+		/* Grow by a chunk. */
 		uint32_t oldcap = fp->nhandles;
-		uint32_t ncap = oldcap ? oldcap * 2 : 64;
 
-		if (ncap > DRM_MAX_HANDLES) {
+		if (oldcap >= DRM_MAX_HANDLES) {
+			/* Full.  Say so once per file, with what the slots
+			 * hold: the client sees only an out-of-memory error
+			 * from its GL library, with most of RAM free, and
+			 * the split between surfaces and buffers is what
+			 * tells a leak from a page that really uses this
+			 * many. */
+			uint32_t nsurf = 0, nbo = 0, nother = 0;
+			int report = !fp->handles_full_reported;
+
+			if (report) {
+				fp->handles_full_reported = 1;
+				for (uint32_t h = 1; h < oldcap; h++) {
+					struct drm_gem_object *e =
+						*drm_handle_slot(fp, h);
+
+					if (!e)
+						continue;
+					if (e->kind == DRM_GEM_SURFACE)
+						nsurf++;
+					else if (e->kind == DRM_GEM_BO)
+						nbo++;
+					else
+						nother++;
+				}
+			}
 			spin_unlock_irqrestore(&fp->lock, fl);
+			if (report)
+				kprintf("drm: gem: handle table full for pid %d: %u slots hold %u surfaces, %u buffers, %u other\n",
+					sched_current() ? (int)sched_current()->id : -1,
+					(unsigned)DRM_MAX_HANDLES, nsurf, nbo,
+					nother);
 			return -ENOSPC;
 		}
 		spin_unlock_irqrestore(&fp->lock, fl);
 
-		struct drm_gem_object **nt = kalloc(ncap * sizeof(*nt));
+		struct drm_gem_object **chunk =
+			kalloc(DRM_HANDLE_CHUNK * sizeof(*chunk));
 
-		if (!nt)
+		if (!chunk)
 			return -ENOMEM;
-		mm_memset(nt, 0, ncap * sizeof(*nt));
+		mm_memset(chunk, 0, DRM_HANDLE_CHUNK * sizeof(*chunk));
 
 		spin_lock_irqsave(&fp->lock, &fl);
 		if (fp->nhandles != oldcap) {
 			/* Somebody else grew it while we were allocating. */
 			spin_unlock_irqrestore(&fp->lock, fl);
-			kfree(nt);
+			/* Freed outside the lock: kfree can fire a
+			 * TLB-shootdown IPI, which must not happen with
+			 * interrupts disabled. */
+			kfree(chunk);
 			continue;
 		}
-		struct drm_gem_object **old = fp->handles;
-
-		if (old)
-			mm_memcpy(nt, old, oldcap * sizeof(*nt));
-		fp->handles = nt;
-		fp->nhandles = ncap;
-		/* The first slot the old table did not have.  Slot 0 is never
+		fp->handles[oldcap / DRM_HANDLE_CHUNK] = chunk;
+		fp->nhandles = oldcap + DRM_HANDLE_CHUNK;
+		/* The first slot the table did not have.  Slot 0 is never
 		 * issued, so a first allocation starts at 1. */
 		uint32_t h = oldcap ? oldcap : 1;
 
 		drm_gem_get(o);
-		fp->handles[h] = o;
+		*drm_handle_slot(fp, h) = o;
+		fp->handle_hint = h + 1;
 		spin_unlock_irqrestore(&fp->lock, fl);
-		/* Freed outside the lock: kfree can fire a TLB-shootdown IPI,
-		 * which must not happen with interrupts disabled. */
-		if (old)
-			kfree(old);
 		*handle_out = drm_handle_make(fp, h);
 		return 0;
 	}
@@ -549,9 +590,10 @@ struct drm_gem_object *drm_gem_lookup(struct drm_file *fp, uint32_t handle)
 	if (!handle || (handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
 		return NULL;
 	spin_lock_irqsave(&fp->lock, &fl);
-	if (slot && slot < fp->nhandles && fp->handles[slot]) {
-		o = fp->handles[slot];
-		drm_gem_get(o);
+	if (slot && slot < fp->nhandles) {
+		o = *drm_handle_slot(fp, slot);
+		if (o)
+			drm_gem_get(o);
 	}
 	spin_unlock_irqrestore(&fp->lock, fl);
 	return o;
@@ -579,9 +621,10 @@ struct drm_gem_object *drm_gem_lookup_foreign(struct drm_device *dev,
 	for (struct drm_file *f = dev->files; f; f = f->next) {
 		if (f->file_id != owner)
 			continue;
-		if (slot < f->nhandles && f->handles[slot]) {
-			o = f->handles[slot];
-			drm_gem_get(o);
+		if (slot < f->nhandles) {
+			o = *drm_handle_slot(f, slot);
+			if (o)
+				drm_gem_get(o);
 		}
 		break;
 	}
@@ -599,9 +642,13 @@ int drm_gem_handle_delete(struct drm_file *fp, uint32_t handle)
 	if (!handle || (handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
 		return -EINVAL;
 	spin_lock_irqsave(&fp->lock, &fl);
-	if (slot && slot < fp->nhandles && fp->handles[slot]) {
-		o = fp->handles[slot];
-		fp->handles[slot] = NULL;
+	if (slot && slot < fp->nhandles) {
+		struct drm_gem_object **cell = drm_handle_slot(fp, slot);
+
+		o = *cell;
+		*cell = NULL;
+		if (o && slot < fp->handle_hint)
+			fp->handle_hint = slot;
 	}
 	spin_unlock_irqrestore(&fp->lock, fl);
 	if (!o)

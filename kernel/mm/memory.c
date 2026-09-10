@@ -4936,20 +4936,25 @@ static uint64_t mm_alloc_page_for_fault(void)
  * for: one request for a thousand frames would be one long interrupts-off
  * scan.  A batch that reclaims nothing means the cache has no clean pages
  * left to give, and asking again would only repeat the scan. */
-void mm_reclaim_for_pages(uint64_t pages)
+uint64_t mm_reclaim_for_pages(uint64_t pages)
 {
 	uint64_t need = pages + PC_HIGH_WATERMARK_PAGES;
+	uint64_t reclaimed = 0;
 
 	while (mm_state.free_pages < need) {
 		uint64_t want = need - mm_state.free_pages;
+		unsigned long got;
 
 		if (want > 128)
 			want = 128;
-		if (pagecache_shrink(want, 0) == 0)
+		got = pagecache_shrink(want, 0);
+		if (got == 0)
 			break;
+		reclaimed += got;
 	}
 	if (mm_state.free_pages < need)
 		pagecache_request_writeback();
+	return reclaimed;
 }
 
 /* ==========================================================================
