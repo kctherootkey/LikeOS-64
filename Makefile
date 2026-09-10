@@ -2185,6 +2185,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# Content-Type; without it every attachment is sent as
 	# application/octet-stream and the receiving client has to guess.
 	cp res/etc/mime.types    $(EXT4_STAGING)/etc/mime.types
+	# Which program opens an attachment of a given type.  Claws Mail
+	# reads ~/.mailcap and then this file before falling back to its
+	# "Open with" prompt; without it every PDF attachment asks first.
+	cp res/etc/mailcap       $(EXT4_STAGING)/etc/mailcap
 	cp res/etc/resolv.conf   $(EXT4_STAGING)/etc/resolv.conf
 	# What init (process 1) starts and supervises at boot: the console getty
 	# and the services listed there.

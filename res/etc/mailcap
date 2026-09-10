@@ -1,0 +1,32 @@
+# Which program opens an attachment of a given media type, installed as
+# /etc/mailcap.
+#
+# Read by Claws Mail when a MIME part is opened (double-click on the
+# attachment, or "Open" in its menu).  mailcap_get_command_for_type() in
+# src/common/utils.c tries ~/.mailcap first and this file second; with no
+# entry for the type it falls through to the "Open with" prompt, prefilled
+# with mime_open_command from clawsrc but asking every single time.  An entry
+# here is what makes "Open" open something.
+#
+# Claws' reader is not a full mailcap(5) implementation, and this file is
+# written to what it actually does: the type is matched as an exact string
+# (no wildcards, no "application/*"), the command is everything up to the
+# next ';', and the only flags it understands are "needsterminal" and
+# "test=".  '%s' is replaced with the path of the saved part.
+#
+# The mimeapps.list in /usr/share/applications is the equivalent for the
+# file manager and the desktop; the two are separate mechanisms, and a type
+# that should open the same way from both places has to be named in both.
+#
+# When the user ticks "Remember" in the Open with prompt, Claws writes the
+# choice to ~/.mailcap, which takes precedence over this file.
+
+# PDF goes to the browser: WebKit is built with its PDF.js viewer, so luakit
+# renders a PDF given its path, and nothing else on the image displays one.
+# The quotes keep a saved path containing spaces as one argument.  Claws
+# splits the command itself (execute_command_line), not through a shell.
+# Both spellings, because the reader's match is exact: application/pdf is
+# what a compliant sender uses, and application/x-pdf is what enough others
+# still send that a rule for one alone would be a prompt on the other.
+application/pdf; luakit '%s'
+application/x-pdf; luakit '%s'

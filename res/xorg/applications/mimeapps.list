@@ -60,6 +60,15 @@ image/jpeg=luakit.desktop
 image/gif=luakit.desktop
 image/bmp=luakit.desktop
 
+# PDF goes to the browser as well: WebKit is built with its PDF.js viewer
+# (ENABLE_PDFJS, on by default for the GTK port, and the viewer bundle is
+# compiled into libwebkit2gtk), so luakit renders a PDF handed to it as a path
+# or file:// URI, and nothing else on the image reads one.  Assigned here for
+# the same reason as the images: luakit's desktop entry does not claim the
+# type.  Claws Mail does not consult this file for attachments; /etc/mailcap
+# carries the matching rule for it.
+application/pdf=luakit.desktop
+
 # Mail: a mailbox file, and the mailto: links every other program produces.
 application/mbox=claws-mail.desktop
 message/rfc822=claws-mail.desktop

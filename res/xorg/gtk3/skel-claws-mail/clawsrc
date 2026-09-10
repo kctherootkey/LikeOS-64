@@ -27,6 +27,16 @@ small_font_gtk2=DejaVu Sans 9
 normal_font_gtk2=DejaVu Sans 10
 bold_font_gtk2=DejaVu Sans Bold 10
 
+# Open the main window maximized.  Upstream starts at a saved 780x568 that
+# leaves most of the screen empty on this desktop, and there is nothing else
+# on it a mail client should leave room for.  This is the same key Claws writes
+# back on exit from the window's state (mainwindow_state_event_cb in
+# src/mainwindow.c), so the window keeps following what the user last left
+# it at; this only chooses where a fresh account starts.  main_window_popup()
+# applies it with gtk_window_maximize() after the window is shown, which
+# reaches ctwm as a _NET_WM_STATE client message it answers with a full zoom.
+mainwin_maximised=1
+
 # Show the HTML part of multipart/alternative mail by default.  Upstream
 # prefers the text/plain part and leaves the HTML one as a click-to-view
 # alternative; with the fancy viewer loaded below there is no reason to make
