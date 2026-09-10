@@ -1,0 +1,96 @@
+WebKitGTK: present this system as Ubuntu's build of this engine.
+
+The user agent is assembled from uname(2), so this port announced itself
+as "X11; LikeOS x86_64".  Servers and the scripts they serve classify a
+browser by that platform token, and one they have never seen is an
+unknown browser: they do not understand it, and serve accordingly.
+navigator.platform was worse: WebCore consults uname for it only on the
+systems it lists, and this one answered "".
+
+Send instead exactly what the same engine sends from Ubuntu, a string
+that is on every such list: the "Ubuntu" brand in the slot the build
+system's USER_AGENT_BRANDING option fills, and that distribution's kernel
+name in place of this system's -- in the user agent, in
+navigator.platform, and in the platform of the user-agent client hints,
+which have to agree with each other.  The machine field stays what uname
+reports.  The brand define is made in UserAgentGLib.cpp rather than
+through the cmake option, which is a global compile definition: the
+string is used in that file alone, and the option would recompile the
+whole tree for it.
+
+--- a/Source/WebCore/platform/glib/UserAgentGLib.cpp
++++ b/Source/WebCore/platform/glib/UserAgentGLib.cpp
+@@ -39,6 +39,17 @@
+ #include <sys/utsname.h>
+ #endif
+ 
++#if OS(LIKEOS) && !defined(USER_AGENT_BRANDING)
++// This port presents itself as Ubuntu's build of this engine: that string
++// is on every server's list, and this system's own name is on none, which
++// reads as an unknown browser.  The brand goes in the slot the build
++// system's USER_AGENT_BRANDING option fills; it is defined here rather than
++// through that option because the option is a global compile definition
++// that every object in the tree would be rebuilt for, and the string is
++// used in this file alone.  The kernel name is substituted below.
++#define USER_AGENT_BRANDING "Ubuntu"
++#endif
++
+ // WARNING! WARNING! WARNING!
+ //
+ // The user agent is ludicrously fragile. The most innocent change can
+@@ -66,7 +77,14 @@
+ 
+     struct utsname name;
+     uname(&name);
+-    static NeverDestroyed<const String> uaOSVersion(makeString(unsafeSpan(name.sysname), ' ', unsafeSpan(name.machine)));
++#if OS(LIKEOS)
++    // The kernel name Ubuntu's build sends, completing the brand above; the
++    // machine stays what uname reports.
++    auto sysname = "Linux"_s;
++#else
++    auto sysname = unsafeSpan(name.sysname);
++#endif
++    static NeverDestroyed<const String> uaOSVersion(makeString(sysname, ' ', unsafeSpan(name.machine)));
+     return uaOSVersion;
+ #else
+     // We will always claim to be Safari in Intel Mac OS X, since Safari without
+--- a/Source/WebCore/page/NavigatorBase.cpp
++++ b/Source/WebCore/page/NavigatorBase.cpp
+@@ -46,7 +46,7 @@
+ #include <wtf/text/MakeString.h>
+ #include <wtf/text/WTFString.h>
+ 
+-#if OS(LINUX)
++#if OS(LINUX) || OS(LIKEOS)
+ #include "sys/utsname.h"
+ #include <wtf/StdLibExtras.h>
+ #endif
+@@ -102,6 +102,15 @@
+         return uname(&osname) >= 0 ? makeString(unsafeSpan(osname.sysname), " "_s, unsafeSpan(osname.machine)) : emptyString();
+     }();
+     return platformName->isolatedCopy();
++#elif OS(LIKEOS)
++    // What scripts read here has to agree with the user agent, which presents
++    // this system as Ubuntu's build of this engine (UserAgentGLib.cpp): the
++    // kernel name that build reports, and the machine uname reports.
++    static NeverDestroyed<String> platformName = [] {
++        struct utsname osname;
++        return uname(&osname) >= 0 ? makeString("Linux "_s, unsafeSpan(osname.machine)) : emptyString();
++    }();
++    return platformName->isolatedCopy();
+ #elif PLATFORM(IOS_FAMILY)
+     return PAL::deviceName();
+ #elif OS(MACOS)
+--- a/Source/WebCore/page/NavigatorUAData.cpp
++++ b/Source/WebCore/page/NavigatorUAData.cpp
+@@ -151,6 +151,10 @@
+         return uname(&osname) >= 0 ? makeString(unsafeSpan(osname.sysname)) : emptyString();
+     }();
+     return platformName->isolatedCopy();
++#elif OS(LIKEOS)
++    // The client-hint counterpart of NavigatorBase::platform(): the kernel
++    // name of Ubuntu's build of this engine, which the user agent presents.
++    return "Linux"_s;
+ #elif PLATFORM(IOS_FAMILY)
+     return (PAL::currentUserInterfaceIdiomIsDesktop() || PAL::currentUserInterfaceIdiomIsVision()) ? "macOS"_s : "iOS"_s;
+ #elif OS(MACOS)
