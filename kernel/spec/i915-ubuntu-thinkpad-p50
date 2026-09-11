@@ -1,0 +1,18 @@
+00:02.0 VGA compatible controller [0300]: Intel Corporation HD Graphics 530 [8086:191b] (rev 06)
+	Subsystem: Lenovo HD Graphics 530 [17aa:222e]
+	Kernel driver in use: i915
+	Kernel modules: i915
+
+  *-display
+       Beschreibung: VGA compatible controller
+       Produkt: HD Graphics 530
+       Hersteller: Intel Corporation
+       Physische ID: 2
+       Bus-Informationen: pci@0000:00:02.0
+       Logischer Name: /dev/fb0
+       Version: 06
+       Breite: 64 bits
+       Takt: 33MHz
+       Fähigkeiten: pciexpress msi pm vga_controller bus_master cap_list rom fb
+       Konfiguration: depth=32 driver=i915 latency=0 resolution=1920,1080
+       Ressourcen: irq:140 memory:c2000000-c2ffffff memory:60000000-6fffffff ioport:5000(Größe=64) memory:c0000-dffff

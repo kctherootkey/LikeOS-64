@@ -1,9 +1,9 @@
 -- luakit's user configuration for this image.
 --
 -- The one setting worth reading before anything else is the
--- hardware-acceleration policy further down: it is chosen at startup from
--- whether this machine has a GPU the kernel could bind, so the same image is
--- correct on a machine with one and on a machine without.
+-- hardware-acceleration policy further down: it is "always" on every
+-- machine, GPU or not, and the comment there says what that costs and how
+-- to change it for one machine or one site.
 
 local settings = require "settings"
 
@@ -53,51 +53,39 @@ end
 -- available through domain_props if a page's shaders are too slow.
 settings.webview.enable_webgl = true
 
--- Hardware acceleration: DECIDED BY THE MACHINE, at startup.
+-- Hardware acceleration: ALWAYS, on every machine.
 --
 -- WebKitGTK has two real rendering modes for this toolkit: "always" runs every
 -- page through the accelerated compositor, "never" paints with cairo.
--- ("on-demand" is accepted and treated as "always".)  With a GPU the
--- compositor is what WebGL, the accelerated 2D canvas and the GPU process all
--- need; without one, GL is llvmpipe and the compositor becomes several
--- full-screen CPU passes per scroll step where cairo needs one, which is what
--- made freebsd.org unscrollable.
+-- ("on-demand" is accepted and treated as "always".)  The compositor is what
+-- WebGL, the accelerated 2D canvas and CSS 3D transforms need, and it is also
+-- what the rest of the engine assumes: with it off, WebKit's non-composited
+-- paths -- which upstream barely exercises -- crashed the web process on a
+-- null overflow-controls host layer in RenderLayerCompositor.
+--
+-- This used to be decided by whether /dev/dri/card0 existed, on the grounds
+-- that without a GPU the compositor runs on llvmpipe and costs several
+-- full-screen CPU passes per frame where cairo needs one (freebsd.org was
+-- unscrollable that way).  It is on everywhere now, the ThinkPad on /dev/fb0
+-- included, so that both kinds of machine run the same engine paths; the
+-- GL underneath is llvmpipe there and the svga driver on a VMware guest with
+-- 3D.  Scrolling does not depend on this either way: luakit binds the wheel
+-- itself and it never reaches the engine.
 --
 -- Measured, so that it is not re-discovered from scratch: on the GTK3 API line
--- the accelerated path does NOT end on the GPU.  WebKit hands the compositor's
--- buffer straight to the toolkit only when its EGL display is the one GTK
--- already uses, and GTK 3.24's X11 backend is GLX-only, so that is never true
--- here -- the UI process CPU-maps the tile every frame and composites it with
--- cairo anyway.  webkit://gpu reports exactly that: "Native interface: None",
--- "Usage: Mapping".  The map is a processor/device synchronisation once a
--- frame, ~6.8ms of every maximized frame, and turning the compositor off
--- removes it.  "never" was the default here for a while for that reason.
+-- the accelerated path does NOT end on the GPU even where there is one.
+-- WebKit hands the compositor's buffer straight to the toolkit only when its
+-- EGL display is the one GTK already uses, and GTK 3.24's X11 backend is
+-- GLX-only, so that is never true here -- the UI process CPU-maps the tile
+-- every frame and composites it with cairo anyway.  webkit://gpu reports
+-- exactly that: "Native interface: None", "Usage: Mapping".
 --
--- It is back on because the rest of the engine assumes it.  With it off,
--- WebKit's non-composited paths -- which upstream barely exercises -- stop
--- acting on wheel events, and crashed the web process on a null
--- overflow-controls host layer in RenderLayerCompositor.  Scrolling does not
--- depend on the choice any more: the wheel is bound below and never reaches
--- the engine either way.
---
--- To trade those two back for the frame rate, set this to "never" AND set
--- WEBKIT_FORCE_COMPOSITING_MODE=0 in res/xorg/xinitrc -- the two have to stay
--- in step.  The real fix is WebKit on GTK4 (webkit2gtk-6.0), where the display
--- is shared, the map disappears and this becomes right for nothing.
-local acceleration = "never"
-do
-    local node = io.open("/dev/dri/card0", "r")
-    if node then
-        node:close()
-        acceleration = "always"
-    end
-end
-settings.webview.hardware_acceleration_policy = acceleration
-if acceleration == "never" then
-    -- WebGL needs the compositor, so the pages that are only about WebGL get
-    -- it even on the software path -- slowly, but they work.
-    settings.on["get.webgl.org"].webview.hardware_acceleration_policy = "always"
-end
+-- To go back to cairo for one machine, set this to "never" and export
+-- WEBKIT_FORCE_COMPOSITING_MODE=0 before starting luakit (res/xorg/xinitrc
+-- explains the variable); a per-user ~/.config/luakit/userconf.lua takes
+-- precedence over this file.  Per site, settings.on["domain"] does the same
+-- for a page whose layers are too slow on the software path.
+settings.webview.hardware_acceleration_policy = "always"
 
 -- Media: OFF.
 --

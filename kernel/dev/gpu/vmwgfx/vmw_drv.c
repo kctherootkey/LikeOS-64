@@ -228,12 +228,23 @@ static uint64_t vmw_gem_page_phys(struct drm_gem_object *o, uint64_t index)
 
 /* ---- scan-out ---------------------------------------------------------- */
 
-/* Define screen object 0.  With a buffer object the host scans the
- * object's GMR directly; with a surface (a rendered image, which lives
- * in host memory) the screen has no backing store and the image is
- * blitted onto it with BLIT_SURFACE_TO_SCREEN. */
+/* Define screen object 0.
+ *
+ * With a buffer object the screen's backing store -- the host's copy of
+ * what is on it -- is the framebuffer aperture, and the image is carried
+ * onto it with BLIT_GMRFB_TO_SCREEN from the object's guest memory region.
+ * That is the reference driver's arrangement (its screen-object unit pins a
+ * backing buffer in VRAM and names SVGA_GMR_FRAMEBUFFER here), and the one
+ * the host is known to take.  Naming the object's own region as the backing
+ * store instead was never seen accepted: VMware with 3D off refused the
+ * definition outright.  It also means the aperture has to hold the screen,
+ * which is what bounds the mode -- see vmw_scanout_limits().
+ *
+ * With a surface (a rendered image, which lives in host memory) the screen
+ * has no backing store and the image is blitted onto it with
+ * BLIT_SURFACE_TO_SCREEN. */
 static int vmw_define_screen(struct vmw_device *v, uint32_t w, uint32_t h,
-			     struct drm_gem_object *o, uint32_t pitch)
+			     struct drm_gem_object *o)
 {
 	struct vmw_bo *b = (o && o->kind == DRM_GEM_BO) ? o->priv : NULL;
 	uint32_t cmd[12];
@@ -241,6 +252,8 @@ static int vmw_define_screen(struct vmw_device *v, uint32_t w, uint32_t h,
 
 	if (!backed && !(o && o->kind == DRM_GEM_SURFACE))
 		return -ENODEV;
+	if (backed && (uint64_t)w * h * 4 > v->hw.vram_size)
+		return -ENOSPC; /* the aperture cannot hold the backing store */
 	cmd[0] = SVGA_CMD_DEFINE_SCREEN;
 	cmd[1] = 11 * 4; /* structSize */
 	cmd[2] = 0; /* id */
@@ -249,9 +262,9 @@ static int vmw_define_screen(struct vmw_device *v, uint32_t w, uint32_t h,
 	cmd[5] = h;
 	cmd[6] = 0; /* root x */
 	cmd[7] = 0; /* root y */
-	cmd[8] = backed ? (uint32_t)b->gmr_id : SVGA_GMR_NULL;
+	cmd[8] = backed ? SVGA_GMR_FRAMEBUFFER : SVGA_GMR_NULL;
 	cmd[9] = 0; /* offset */
-	cmd[10] = backed ? pitch : 0;
+	cmd[10] = backed ? w * 4 : 0; /* pitch */
 	cmd[11] = 0; /* cloneCount */
 	if (vmw_cmd_raw(v, cmd, sizeof(cmd), 1) != 0)
 		return -EIO;
@@ -490,13 +503,18 @@ static int vmw_mode_set(struct drm_device *dev, struct drm_crtc *crtc,
 	 * black screen -- so the screen target above is the only path, and if
 	 * it could not carry the mode the caller must hear about it. */
 	if (v->has_screen_object && fb_is_surface(fb) && v->has_3d && !v->has_gb) {
-		if (vmw_define_screen(v, mode->hdisplay, mode->vdisplay, fb->obj, 0) == 0)
+		vmw_legacy_display_retire(v);
+		if (vmw_define_screen(v, mode->hdisplay, mode->vdisplay, fb->obj) == 0)
 			return vmw_surface_blit_screen(v, fb->obj, 0, 0,
 						       mode->hdisplay, mode->vdisplay);
 	}
 	if (v->has_screen_object && fb_is_gmr_scanout(fb)) {
-		if (vmw_define_screen(v, mode->hdisplay, mode->vdisplay, fb->obj,
-				      fb->pitch) == 0)
+		/* The same two queues as for a screen target: the legacy
+		 * console's updates are still in the FIFO, the screen goes
+		 * down the command-buffer channel.  Drain the one before the
+		 * other says anything. */
+		vmw_legacy_display_retire(v);
+		if (vmw_define_screen(v, mode->hdisplay, mode->vdisplay, fb->obj) == 0)
 			return vmw_sou_blit(v, fb->obj, fb->pitch, 0, 0,
 					    mode->hdisplay, mode->vdisplay);
 	}
@@ -541,12 +559,19 @@ static int vmw_display_verify(struct drm_device *dev)
 {
 	struct vmw_device *v = dev->priv;
 
-	if (!vmw_stdu_available(v))
-		return 0; /* the other paths answer as they go */
-	vmw_cmd_drain(v);
-	if (!v->st_defined) {
-		kprintf("[drm] vmwgfx: no screen target after the console's mode set\n");
-		return -ENODEV;
+	if (vmw_stdu_available(v)) {
+		vmw_cmd_drain(v);
+		if (!v->st_defined) {
+			kprintf("[drm] vmwgfx: no screen target after the console's mode set\n");
+			return -ENODEV;
+		}
+	} else if (v->screen_defined && v->cb_ready) {
+		/* A screen object over the command-buffer channel is just as
+		 * silent: the define and the blits are queued, and a refused
+		 * one is dropped.  Ask the same question. */
+		vmw_cmd_drain(v);
+	} else {
+		return 0; /* the legacy path answers as it goes */
 	}
 	if (v->cb_errors != v->cb_errors_seen) {
 		kprintf("[drm] vmwgfx: the device refused %u command buffer(s) while the console's screen was set up\n",
@@ -578,19 +603,28 @@ static void vmw_display_fallback(struct drm_device *dev)
 
 	if (v->st_defined)
 		vmw_stdu_teardown(v);
-	v->st_refused = 1;
-	v->has_gb = 0;
-	v->has_dx = 0;
-	v->has_3d = 0;
-	v->has_sm41 = 0;
-	v->has_sm5 = 0;
-	v->has_gl43 = 0;
-	v->otables_ready = 0;
-	v->devcaps[SVGA3D_DEVCAP_DXCONTEXT] = 0;
-	v->devcaps[SVGA3D_DEVCAP_SM41] = 0;
-	v->devcaps[SVGA3D_DEVCAP_SM5] = 0;
-	v->devcaps[SVGA3D_DEVCAP_GL43] = 0;
-	kprintf("[drm] vmwgfx: screen-target display refused; console and scan-out back on the framebuffer, 3D off\n");
+	if (vmw_stdu_available(v)) {
+		v->st_refused = 1;
+		v->has_gb = 0;
+		v->has_dx = 0;
+		v->has_3d = 0;
+		v->has_sm41 = 0;
+		v->has_sm5 = 0;
+		v->has_gl43 = 0;
+		v->otables_ready = 0;
+		v->devcaps[SVGA3D_DEVCAP_DXCONTEXT] = 0;
+		v->devcaps[SVGA3D_DEVCAP_SM41] = 0;
+		v->devcaps[SVGA3D_DEVCAP_SM5] = 0;
+		v->devcaps[SVGA3D_DEVCAP_GL43] = 0;
+		kprintf("[drm] vmwgfx: screen-target display refused; console and scan-out back on the framebuffer, 3D off\n");
+	} else {
+		/* The screen object was refused: not offered again, so a
+		 * display server's mode set takes the aperture path the
+		 * console is going back to, rather than repeating this. */
+		v->has_screen_object = 0;
+		kprintf("[drm] vmwgfx: screen-object display refused; console and scan-out back on the framebuffer\n");
+	}
+	v->screen_defined = 0;
 	vmsvga2_set_traces(1);
 	if (vmsvga2_hw_set_mode(v->hw.width, v->hw.height) != 0)
 		kprintf("[drm] vmwgfx: legacy mode set %ux%u failed as well\n",
@@ -680,7 +714,7 @@ static int vmw_page_flip(struct drm_device *dev, struct drm_crtc *crtc,
 	if (v->screen_defined && fb_is_surface(fb) && !v->has_gb) {
 		if (v->scan_gmr != SVGA_GMR_NULL)
 			vmw_define_screen(v, crtc->mode.hdisplay, crtc->mode.vdisplay,
-					  fb->obj, 0);
+					  fb->obj);
 		return vmw_surface_blit_screen(v, fb->obj, 0, 0,
 					       crtc->mode.hdisplay, crtc->mode.vdisplay);
 	}
@@ -688,11 +722,13 @@ static int vmw_page_flip(struct drm_device *dev, struct drm_crtc *crtc,
 		return -ENODEV;
 	if (v->screen_defined && fb->obj->priv &&
 	    ((struct vmw_bo *)fb->obj->priv)->gmr_id >= 0 && fb->offset == 0) {
-		/* Re-point the screen at the new buffer and show it. */
-		if (vmw_define_screen(v, crtc->mode.hdisplay, crtc->mode.vdisplay,
-				      fb->obj, fb->pitch) == 0)
-			return vmw_sou_blit(v, fb->obj, fb->pitch, 0, 0,
-					    crtc->mode.hdisplay, crtc->mode.vdisplay);
+		/* The screen's backing store is the aperture, not the buffer,
+		 * so a flip is one blit from the new buffer's region; the
+		 * screen stays as defined.  Remember which region is on it
+		 * for vmw_fb_dirty(). */
+		v->scan_gmr = (uint32_t)((struct vmw_bo *)fb->obj->priv)->gmr_id;
+		return vmw_sou_blit(v, fb->obj, fb->pitch, 0, 0,
+				    crtc->mode.hdisplay, crtc->mode.vdisplay);
 	}
 	return vmw_ldu_copy(v, fb, 0, 0, (int)fb->width, (int)fb->height);
 }
@@ -1397,13 +1433,15 @@ static const uint32_t vmw_builtin_modes[][2] = {
  * exactly that: 4 MB of it comes back as 1176x885, which is a statement
  * about the aperture and not about any display.
  *
- * A screen object or a screen target never reads that aperture.  The image
- * stays in guest memory and the host is told where it is, so the bounds that
- * apply are the device's own for such a scan-out: the primary
- * surface memory the device reports, the largest image it can sample, and --
- * for a screen object, which is scanned out of a guest memory region -- the
- * device's limit on how large such a region may be.  Under those the screen
- * can be far larger than the aperture would ever have allowed.
+ * A screen target never reads that aperture.  The image stays in guest
+ * memory and the host is told where it is, so the bounds that apply are the
+ * device's own for such a scan-out: the primary surface memory the device
+ * reports and the largest image it can sample.  Under those the screen can
+ * be far larger than the aperture would ever have allowed.
+ *
+ * A screen object is half way: its image is in a guest memory region too,
+ * but its backing store is the aperture (see vmw_define_screen()), so the
+ * aperture's memory still bounds it -- only its geometry registers do not.
  *
  * Every widening is conditional on the device reporting the register that
  * justifies it; a device that reports nothing keeps the aperture's bounds,
@@ -1416,35 +1454,45 @@ static void vmw_scanout_limits(struct vmw_device *v)
 	uint32_t h = v->hw.max_height ? v->hw.max_height : VMW_SCANOUT_MAX_DIM;
 
 	v->scanout_in_guest_memory = v->has_screen_object || v->has_screentarget;
-	if (v->scanout_in_guest_memory) {
+	if (v->has_screentarget) {
 		uint32_t reg;
 
-		if (v->hw.caps & SVGA_CAP_GBOBJECTS) {
-			reg = vmsvga2_hw_read_reg(SVGA_REG_MAX_PRIMARY_MEM);
-			if ((uint64_t)reg > mem)
-				mem = reg;
-		}
-		if (v->has_gb) {
-			reg = v->devcaps[SVGA3D_DEVCAP_MAX_TEXTURE_WIDTH];
-			if (reg > w)
-				w = reg;
-			reg = v->devcaps[SVGA3D_DEVCAP_MAX_TEXTURE_HEIGHT];
-			if (reg > h)
-				h = reg;
-		}
-		if (v->has_gb) {
-			/* Only a bound, and only where the device states one:
-			 * a zero here means "unstated", not "zero-sized". */
-			reg = vmsvga2_hw_read_reg(SVGA_REG_SCREENTARGET_MAX_WIDTH);
-			if (reg && reg < w)
-				w = reg;
-			reg = vmsvga2_hw_read_reg(SVGA_REG_SCREENTARGET_MAX_HEIGHT);
-			if (reg && reg < h)
-				h = reg;
-		} else if (v->hw.caps & SVGA_CAP_GMR2) {
-			/* The register is only meaningful on a device with the
-			 * second-generation regions; on an older one there is
-			 * nothing to read and the bounds above stand. */
+		/* A screen target reads guest memory only; the memory that
+		 * bounds it is the primary-surface memory the device states. */
+		reg = vmsvga2_hw_read_reg(SVGA_REG_MAX_PRIMARY_MEM);
+		if ((uint64_t)reg > mem)
+			mem = reg;
+		reg = v->devcaps[SVGA3D_DEVCAP_MAX_TEXTURE_WIDTH];
+		if (reg > w)
+			w = reg;
+		reg = v->devcaps[SVGA3D_DEVCAP_MAX_TEXTURE_HEIGHT];
+		if (reg > h)
+			h = reg;
+		/* Only a bound, and only where the device states one: a zero
+		 * here means "unstated", not "zero-sized". */
+		reg = vmsvga2_hw_read_reg(SVGA_REG_SCREENTARGET_MAX_WIDTH);
+		if (reg && reg < w)
+			w = reg;
+		reg = vmsvga2_hw_read_reg(SVGA_REG_SCREENTARGET_MAX_HEIGHT);
+		if (reg && reg < h)
+			h = reg;
+	} else if (v->has_screen_object) {
+		uint32_t reg;
+
+		/* A screen object's image is in guest memory, but its backing
+		 * store is in the aperture (vmw_define_screen()), so the
+		 * memory bound stays the aperture's -- the reference driver
+		 * bounds its screen-object modes by VRAM too.  The geometry
+		 * bound does not: MAX_WIDTH/MAX_HEIGHT are the device's
+		 * statement about scanning the aperture out directly, and a
+		 * screen object is not that; the reference driver allows
+		 * 8192 either way and lets the memory decide.  On 4 MB that
+		 * is the difference between 1152x864 and 1280x800. */
+		w = VMW_SCANOUT_MAX_DIM;
+		h = VMW_SCANOUT_MAX_DIM;
+		if (v->hw.caps & SVGA_CAP_GMR2) {
+			/* The image's region: the register is only meaningful
+			 * on a device with the second-generation regions. */
 			reg = vmsvga2_hw_read_reg(SVGA_REG_GMRS_MAX_PAGES);
 			if (reg && (uint64_t)reg * PAGE_SIZE < mem)
 				mem = (uint64_t)reg * PAGE_SIZE;

@@ -77,7 +77,8 @@ Section "Module"
 	# does not accelerate, and the driver uses it wholesale if glamor
 	# cannot start.  dri2, dri3 and present are built into the server,
 	# not modules, and must not be listed.
-	Load	"glamoregl"
+	# Not loaded while AccelMethod is "none" below; put it back with glamor.
+	#Load	"glamoregl"
 	Load	"fb"
 EndSection
 
@@ -101,26 +102,27 @@ Section "Device"
 	# the driver's idea of which comes first.
 	Option		"kmsdev"	"/dev/dri/card0"
 
-	# Draw with glamor: the driver renders through EGL on a GBM device
-	# made from the node above, which reaches the GPU via Mesa's svga
-	# driver.  Without this the driver falls back to shadow-buffer
-	# software rendering -- correct, but no faster than fbdev.
+	# Draw in software: the driver renders with the CPU into a shadow
+	# buffer and copies the damaged rectangles into a dumb buffer the
+	# display manager scans out, announcing them with DIRTYFB.  No GL in
+	# the server, so there is no DRI2/DRI3 and clients render through
+	# Mesa's software rasteriser (llvmpipe) and hand pixels over the X
+	# socket -- the same arrangement the fbdev configuration has, with
+	# the display manager doing the mode set instead of /dev/fb0.
 	#
-	# If glamor cannot start (a device with no 3D support, e.g. the
-	# emulated SVGA device some hypervisors present, where Mesa lands on
-	# its software rasteriser), the driver says so in the log and carries
-	# on with the shadow buffer.  Nothing here has to change for that.
-	Option		"AccelMethod"	"glamor"
-
-	# Hand clients buffers by descriptor (DRI3) rather than copying pixel
-	# data through the X socket.  This is what puts direct rendering --
-	# and with it WebKit's GPU process -- on the GPU.
-	Option		"DRI"		"3"
-
-	# Page-flip rather than copy when a client presents a full-screen
-	# buffer.  Requires the display manager to report a completion event
-	# for the flip, which the kernel driver does.
-	Option		"PageFlip"	"true"
+	# This is deliberate (2026-09-11): the GPU's 3D is not used at all,
+	# on this machine as on one without a GPU, so both run the same
+	# rendering paths.  glamor -- the driver rendering through EGL on a
+	# GBM device made from the node above, reaching the GPU via Mesa's
+	# svga driver -- is what this replaces.  To have it back:
+	#
+	#     Option "AccelMethod" "glamor"
+	#     Option "DRI"         "3"       hand clients buffers by descriptor
+	#     Option "PageFlip"    "true"    flip, not copy, on a full-screen present
+	#
+	# plus Load "glamoregl" above, and drop LIBGL_ALWAYS_SOFTWARE from
+	# res/xorg/xinitrc, which pins the clients to llvmpipe to match.
+	Option		"AccelMethod"	"none"
 EndSection
 
 Section "Screen"

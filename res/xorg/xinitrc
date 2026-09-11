@@ -139,13 +139,15 @@ export XCURSOR_THEME XCURSOR_SIZE
 # GLX is a prerequisite.  To fall back for debugging, export the variable
 # from a shell before starting luakit -- not here.
 #
-# Composite where there is a GPU, and not where there is not.
+# Composite everywhere -- with a GPU and without.
 #
 # With acceleration available WebKit forces every page through its compositor.
-# That is what WebGL, the accelerated canvas and the GPU process need, and on
-# a machine with no GPU it is the wrong choice outright: GL is llvmpipe, so the
-# arrangement becomes several full-screen software passes per scroll step where
-# cairo needs one, and freebsd.org was unscrollable that way.
+# That is what WebGL, the accelerated canvas and the GPU process need.  On a
+# machine with no GPU the GL underneath is llvmpipe, so the arrangement is
+# several full-screen software passes per scroll step where cairo needs one
+# (freebsd.org was unscrollable that way); it is on there anyway now, so that
+# both kinds of machine run the same engine paths -- see the acceleration
+# policy in res/xorg/gtk3/luakit-userconf.lua, which is "always" to match.
 #
 # Known and measured, so that nobody re-discovers it: on the GTK3 API line the
 # accelerated path does NOT end on the GPU.  WebKit only hands the compositor's
@@ -168,13 +170,39 @@ export XCURSOR_THEME XCURSOR_SIZE
 # display is shared there, the map disappears, and the accelerated path is
 # genuinely the shorter one.
 #
-# The test is /dev/dri/card0: it exists exactly where the kernel bound a
-# display-manager driver to a GPU.  To force either behaviour by hand, export
-# the variable from a shell before starting luakit -- not here.
-if [ ! -e /dev/dri/card0 ]; then
-	WEBKIT_FORCE_COMPOSITING_MODE=0
-	export WEBKIT_FORCE_COMPOSITING_MODE
-fi
+# WEBKIT_FORCE_COMPOSITING_MODE=0 used to be exported here on a machine
+# without /dev/dri/card0, alongside a "never" policy in the luakit config:
+# the two have to stay in step, because "always" in the settings forces
+# compositing whatever the variable says, and "never" only takes with the
+# variable at 0.  To go back to cairo on one machine, export the variable
+# from a shell before starting luakit and set the policy in a per-user
+# ~/.config/luakit/userconf.lua -- not here.
+
+# Mesa: the software rasteriser, always.
+#
+# With this set, libGL and libEGL never load a hardware driver: GLX and EGL
+# on X11 render with llvmpipe and put pixels up with PutImage/XShm, and
+# EGL's surfaceless platform (WebKit's web process) is llvmpipe as well.
+# On a machine without a GPU that is what happens anyway; on one with the
+# VMware SVGA3D device it is what stops Mesa's svga driver from being used
+# -- deliberate (2026-09-11), so that every machine runs the same rendering
+# paths.  The X server matches: res/xorg/xorg.conf.modesetting has glamor
+# off, so it offers no DRI3 that a client could reach the GPU through.  The
+# two go back together: drop this and put glamor back there.
+LIBGL_ALWAYS_SOFTWARE=1
+export LIBGL_ALWAYS_SOFTWARE
+
+# WebKit's frames from the web process to the UI process: shared memory,
+# always.  WebKit adds its "hardware" transport (DMA-BUF through GBM) on
+# top of shared memory whenever it finds a display-manager render node,
+# and with the rasteriser pinned to llvmpipe above that would mean
+# software-rendered buffers exported as DMA-BUFs from the render node --
+# a combination nothing here has run.  Shared memory is the transport a
+# machine without a GPU uses, so it is the one every machine uses.  This
+# is not WEBKIT_DISABLE_DMABUF_RENDERER, which would switch acceleration
+# off altogether (see above).
+WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+export WEBKIT_DMABUF_RENDERER_FORCE_SHM
 
 # No terminal is started here on purpose.  Use "Xterm" on the window manager's
 # menu, which is Alt+F1 -- the menus are on keys rather than mouse buttons

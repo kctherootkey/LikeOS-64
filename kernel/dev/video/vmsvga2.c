@@ -464,9 +464,27 @@ static int svga_has_fence(void)
  * using the FIFO for commands once it has a command-buffer manager. */
 static int g_cmdbuf_owner;
 
+/* Where that owner wants this layer's guest-memory-region commands sent.
+ *
+ * A screen object or a blit names a region by id, and on a device driven
+ * through command buffers those commands go down the command-buffer
+ * channel.  The DEFINE_GMR2/REMAP_GMR2 that make the id mean anything used
+ * to go into the FIFO regardless -- two streams with no order between
+ * them, and the host executed the screen definition before it had heard
+ * of the region it named, and refused it (VMware, 3D off: "command error
+ * at offset 0: command 34").  With the channel set, the region commands
+ * travel the same way as everything that refers to them. */
+static int (*g_cmd_channel)(const void *cmds, uint32_t bytes, int ring);
+
 void vmsvga2_set_cmdbuf_owner(int on)
 {
 	g_cmdbuf_owner = on ? 1 : 0;
+}
+
+void vmsvga2_set_cmd_channel(int (*submit)(const void *cmds, uint32_t bytes,
+					    int ring))
+{
+	g_cmd_channel = submit;
 }
 
 /* Allocate a fence number without submitting anything.
@@ -1299,6 +1317,47 @@ int vmsvga2_gmr_bind(int gmr_id, const uint64_t *page_phys,
 		if (WARN_ON_ONCE(page_phys[i] & (PAGE_SIZE - 1)))
 			return -1; // DMA alignment violation
 
+	if (svga_has_gmr2() && g_cmd_channel) {
+		// Down the owner's command channel, so the region is defined
+		// before anything on that channel names it.  The page list is
+		// remapped in pieces small enough to be batched with the rest
+		// of the stream; the device allows any number of REMAPs.
+		enum { REMAP_CHUNK_PAGES = 1024 };
+		uint32_t def[3] = { SVGA_CMD_DEFINE_GMR2, (uint32_t)gmr_id,
+				    num_pages };
+		uint32_t *remap = kalloc(5 * 4 + REMAP_CHUNK_PAGES * 8);
+		uint32_t off;
+
+		if (!remap)
+			return -1;
+		if (g_cmd_channel(def, sizeof(def), 0) != 0) {
+			kfree(remap);
+			return -1;
+		}
+		for (off = 0; off < num_pages; off += REMAP_CHUNK_PAGES) {
+			uint32_t n = num_pages - off;
+			uint64_t *ppns = (uint64_t *)&remap[5];
+			int last;
+
+			if (n > REMAP_CHUNK_PAGES)
+				n = REMAP_CHUNK_PAGES;
+			last = off + n >= num_pages;
+			remap[0] = SVGA_CMD_REMAP_GMR2;
+			remap[1] = (uint32_t)gmr_id;
+			remap[2] = SVGA_REMAP_GMR2_PPN64;
+			remap[3] = off; // offsetPages
+			remap[4] = n; // numPages
+			for (i = 0; i < n; i++)
+				ppns[i] = page_phys[off + i] >> 12;
+			if (g_cmd_channel(remap, 5 * 4 + n * 8, last) != 0) {
+				kfree(remap);
+				return -1;
+			}
+		}
+		kfree(remap);
+		return 0;
+	}
+
 	if (svga_has_gmr2()) {
 		// DEFINE_GMR2 + REMAP_GMR2 with a 64-bit PPN list.
 		uint32_t hdr_words = 1 + 2; // cmd + {gmrId, numPages}
@@ -1397,12 +1456,17 @@ int vmsvga2_gmr_free(int gmr_id)
 	g_gmrs[gmr_id].used = 0;
 	spin_unlock_irqrestore(&svga_gmr_lock, f);
 
-	// Ensure the host is done with the region before unbinding.
+	// Ensure the host is done with the region before unbinding.  On the
+	// owner's channel the unbind simply follows whatever named the region,
+	// in order; the FIFO drain is for the legacy path.
 	vmsvga2_fifo_flush();
 	if (svga_has_gmr2()) {
 		uint32_t cmd[3] = { SVGA_CMD_DEFINE_GMR2, (uint32_t)gmr_id,
 				    0 };
-		(void)svga_fifo_write_cmd(cmd, sizeof(cmd));
+		if (g_cmd_channel)
+			(void)g_cmd_channel(cmd, sizeof(cmd), 1);
+		else
+			(void)svga_fifo_write_cmd(cmd, sizeof(cmd));
 	} else {
 		svga_write_reg(SVGA_REG_GMR_ID, (uint32_t)gmr_id);
 		svga_write_reg(SVGA_REG_GMR_DESCRIPTOR, 0);

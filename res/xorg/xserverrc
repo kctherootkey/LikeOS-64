@@ -52,11 +52,13 @@
 # Two of them: /etc/X11/xorg.conf drives /dev/fb0 through the fbdev driver and
 # renders in software, and works on any machine that boots to a framebuffer;
 # /etc/X11/xorg.conf.modesetting drives the display manager through
-# /dev/dri/card0 with glamor and DRI3, which needs a GPU the kernel has a
-# driver for.  The node is the test: it exists only where such a driver bound
-# to a device, so probing for it here picks the accelerated configuration
-# exactly where it can work and leaves the fallback in place everywhere else
-# -- no per-machine editing, and one image for both.
+# /dev/dri/card0, which needs a GPU the kernel has a driver for.  The node is
+# the test: it exists only where such a driver bound to a device, so probing
+# for it here picks the display-manager configuration exactly where it can
+# work and leaves the fallback in place everywhere else -- no per-machine
+# editing, and one image for both.  Both render in software: the modesetting
+# configuration has glamor switched off on purpose (see the comment there),
+# so the GPU is only ever used for the mode set and the scan-out.
 #
 # Named relative, not as a path.  Xorg is setuid root (see below), and a
 # server with elevated privileges rejects an absolute -config argument

@@ -32,6 +32,16 @@
  * far more than a frame's worth of object commands. */
 #define VMW_PEND_BYTES (64 * 1024)
 
+/* The console driver's guest-memory-region commands, down this channel.
+ * See vmsvga2_set_cmd_channel(). */
+static struct vmw_device *g_cmd_channel_dev;
+static int vmw_cmd_channel(const void *cmds, uint32_t bytes, int ring)
+{
+	if (!g_cmd_channel_dev)
+		return -ENODEV;
+	return vmw_cmd_raw(g_cmd_channel_dev, cmds, bytes, ring);
+}
+
 /* Slot states.
  *
  * CB_FILLING is not a formality.  A slot becomes reapable only once it has
@@ -126,8 +136,13 @@ static int vmw_cmdbuf_bringup(struct vmw_device *v)
 	/* From here the FIFO is not this driver's command stream, and this
 	 * device's one fence register belongs to the channel above.  The
 	 * layer underneath stops emitting fences of its own; see
-	 * vmsvga2_set_cmdbuf_owner(). */
+	 * vmsvga2_set_cmdbuf_owner().  Its guest-memory-region commands come
+	 * down this channel too, so a region is defined before the screen or
+	 * blit that names it -- the FIFO and the channel have no order between
+	 * them. */
+	g_cmd_channel_dev = v;
 	vmsvga2_set_cmdbuf_owner(1);
+	vmsvga2_set_cmd_channel(vmw_cmd_channel);
 	return 0;
 fail:
 	for (int i = 0; i < v->cb_nslots; i++) {
@@ -141,6 +156,7 @@ fail:
 	v->cb_size = 0;
 	v->has_cmdbuf = 0;
 	v->has_dx = 0;
+	vmsvga2_set_cmd_channel(NULL);
 	vmsvga2_set_cmdbuf_owner(0); /* the FIFO carries everything again */
 	return 0;
 }

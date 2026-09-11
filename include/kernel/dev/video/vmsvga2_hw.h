@@ -74,6 +74,12 @@ uint32_t vmsvga2_fence_alloc(void);
  * the same device: it then emits no FIFO fences of its own, so the device's
  * one fence register has a single writer.  See vmsvga2.c. */
 void vmsvga2_set_cmdbuf_owner(int on);
+/* ...and hand it the commands this layer still has to issue for that owner's
+ * buffers (guest memory region define/remap/unbind), so they travel down the
+ * same channel as the commands that name the regions, in order.  NULL puts
+ * them back on the FIFO.  `ring' as in vmw_cmd_raw(): 0 batches, 1 announces. */
+void vmsvga2_set_cmd_channel(int (*submit)(const void *cmds, uint32_t bytes,
+					    int ring));
 int vmsvga2_cursor_define_alpha(uint32_t width, uint32_t height, uint32_t hot_x,
 				uint32_t hot_y, const uint32_t *argb_pixels);
 int vmsvga2_cursor_move(int32_t x, int32_t y, int visible);

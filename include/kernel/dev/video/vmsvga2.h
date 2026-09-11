@@ -418,6 +418,8 @@ uint32_t vmsvga2_fence_alloc(void);  // allocate only; caller submits the comman
  * the same device: it then emits no FIFO fences of its own, so the device's
  * one fence register has a single writer.  See vmsvga2.c. */
 void vmsvga2_set_cmdbuf_owner(int on);
+void vmsvga2_set_cmd_channel(int (*submit)(const void *cmds, uint32_t bytes,
+					    int ring));
 int vmsvga2_fence_passed(uint32_t fence);
 int vmsvga2_fence_wait(uint32_t fence, uint64_t timeout_us);
 
