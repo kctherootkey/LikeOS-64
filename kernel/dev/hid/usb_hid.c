@@ -1,6 +1,7 @@
 // LikeOS-64 - USB HID (Human Interface Device) Class Driver
 //
-// Implements the USB HID specification 1.11 for Boot Protocol keyboards and mice.
+// Implements the USB HID specification 1.11 for Boot Protocol keyboards and
+// Boot/Report Protocol mice.
 // This driver uses Interrupt IN transfers via the xHCI controller to receive
 // periodic input reports from HID devices.
 //
@@ -9,8 +10,11 @@
 //      for any device/interface with class code 0x03 (HID).
 //   2. The probe function parses the configuration descriptor to find HID
 //      interfaces and their Interrupt IN endpoints.
-//   3. For Boot Protocol devices (subclass=1), the driver sends SET_PROTOCOL(Boot)
-//      and SET_IDLE(0) requests per the USB HID spec Section 7.2.6/7.2.4.
+//   3. Keyboards run in Boot Protocol (SET_PROTOCOL(Boot), fixed 8-byte
+//      report).  Mice fetch their report descriptor first: when it yields a
+//      Button/X/Y/Wheel layout the mouse runs in Report Protocol, because the
+//      Boot Protocol mouse report has no wheel; otherwise Boot Protocol.
+//      SET_IDLE(0) follows per USB HID spec Section 7.2.6/7.2.4.
 //   4. An interrupt IN endpoint is configured and a transfer ring is allocated.
 //   5. PRIMARY path (interrupt-driven, lowest latency):
 //      xhci_handle_transfer_event() → usbhid_irq_completion()
@@ -484,6 +488,410 @@ static void hid_process_keyboard_report(usbhid_device_t *hdev,
 }
 
 // ============================================================================
+// HID Report Descriptor Parser (mouse)
+// (USB HID 1.11, Section 6.2.2 - Report Descriptor)
+// ============================================================================
+//
+// Boot Protocol (Appendix B.2) fixes the mouse report at buttons/X/Y.  The
+// wheel is not part of that layout: most mice send a 3-byte report in boot
+// mode and only include Wheel in their Report Protocol report, whose layout
+// the report descriptor describes.  To scroll with a USB mouse the driver
+// therefore fetches the report descriptor, resolves where Button, X, Y and
+// Wheel sit in the Input report, and runs the mouse in Report Protocol.
+// Anything the parser cannot resolve keeps the old Boot Protocol path.
+
+// Usage pages / usages resolved here (USB HID Usage Tables 1.12)
+#define HID_UP_GENERIC_DESKTOP 0x01
+#define HID_UP_BUTTON 0x09
+#define HID_GD_USAGE_MOUSE 0x02
+#define HID_GD_USAGE_X 0x30
+#define HID_GD_USAGE_Y 0x31
+#define HID_GD_USAGE_WHEEL 0x38
+#define HID_USAGE(page, id) (((uint32_t)(page) << 16) | (uint32_t)(id))
+
+// Main item data bits (HID 1.11, Section 6.2.2.5)
+#define HID_MAIN_CONSTANT (1u << 0)
+#define HID_MAIN_VARIABLE (1u << 1)
+
+// Collection types (HID 1.11, Section 6.2.2.6)
+#define HID_COLLECTION_APPLICATION 0x01
+
+#define HID_PARSE_MAX_USAGES 16
+#define HID_PARSE_MAX_FIELD_BITS 32
+
+// Record one Input field with usage `usage` at `off`/`size` bits of report
+// `rid`.  First match wins; all fields must come from the same report ID.
+static void hid_parse_record_field(usbhid_mouse_layout_t *l, int *found_rid,
+				   uint32_t usage, uint32_t off, uint32_t size,
+				   uint8_t is_signed, uint8_t rid)
+{
+	if (off + size > 0xFFFF || size == 0 || size > HID_PARSE_MAX_FIELD_BITS)
+		return;
+	if (*found_rid >= 0 && *found_rid != rid)
+		return; // belongs to a different report on this endpoint
+
+	usbhid_field_t *f = NULL;
+	if ((usage >> 16) == HID_UP_BUTTON) {
+		if (l->buttons.bit_size == 0) {
+			f = &l->buttons;
+			size = 1;
+		} else if (size == 1 &&
+			   l->buttons.bit_offset + l->buttons.bit_size == off &&
+			   l->buttons.bit_size < 8) {
+			l->buttons.bit_size++; // next button, contiguous
+			return;
+		} else {
+			return;
+		}
+	} else if (usage == HID_USAGE(HID_UP_GENERIC_DESKTOP, HID_GD_USAGE_X)) {
+		f = &l->x;
+	} else if (usage == HID_USAGE(HID_UP_GENERIC_DESKTOP, HID_GD_USAGE_Y)) {
+		f = &l->y;
+	} else if (usage ==
+		   HID_USAGE(HID_UP_GENERIC_DESKTOP, HID_GD_USAGE_WHEEL)) {
+		f = &l->wheel;
+	}
+	if (!f || f->bit_size != 0)
+		return;
+
+	f->bit_offset = (uint16_t)off;
+	f->bit_size = (uint8_t)size;
+	f->is_signed = is_signed;
+	*found_rid = rid;
+}
+
+// Parse a mouse report descriptor for the Input fields the driver consumes.
+// Fields inside a Mouse application collection are preferred: when one
+// opens, anything recorded before it is discarded, and nothing recorded
+// after it closes replaces its fields.  Push/Pop global items are not
+// supported (mice do not use them).
+//
+// Returns 1 when Button, X, Y and Wheel were all found in one Input report
+// and fills *out (with `valid` left clear for the caller to set), 0 when the
+// caller should stay on Boot Protocol.
+static int hid_parse_mouse_report_desc(const uint8_t *rd, uint16_t rd_len,
+				       usbhid_mouse_layout_t *out)
+{
+	// Global items (HID 1.11, Section 6.2.2.7)
+	uint16_t usage_page = 0;
+	int32_t logical_min = 0;
+	uint32_t report_size = 0;
+	uint32_t report_count = 0;
+	uint8_t report_id = 0;
+	uint8_t uses_report_ids = 0;
+
+	// Local items (Section 6.2.2.8) - cleared after every Main item
+	uint32_t usages[HID_PARSE_MAX_USAGES]; // HID_USAGE(page, id)
+	int usage_count = 0;
+	uint32_t usage_min = 0;
+	uint32_t usage_max = 0;
+	int has_usage_range = 0;
+
+	// Collection tracking
+	int depth = 0;
+	int mouse_depth = -1; // depth the Mouse application collection opened at
+	int mouse_seen = 0; // a Mouse application collection has been closed
+
+	// Input bit position per report ID: each ID is its own bit stream
+	uint16_t input_bits[256];
+	hid_memset(input_bits, 0, sizeof(input_bits));
+
+	usbhid_mouse_layout_t l;
+	hid_memset(&l, 0, sizeof(l));
+	int found_rid = -1;
+
+	uint32_t pos = 0;
+	while (pos < rd_len) {
+		uint8_t prefix = rd[pos];
+
+		// Long item (Section 6.2.2.3): skip
+		if (prefix == 0xFE) {
+			if (pos + 2 >= rd_len)
+				break;
+			pos += 3u + rd[pos + 1];
+			continue;
+		}
+
+		// Short item
+		uint8_t bsize = prefix & 0x03;
+		uint8_t btype = (prefix >> 2) & 0x03;
+		uint8_t btag = (prefix >> 4) & 0x0F;
+		uint32_t size = (bsize == 3) ? 4 : bsize;
+		if (pos + 1 + size > rd_len)
+			break;
+
+		uint32_t u = 0;
+		for (uint32_t i = 0; i < size; i++)
+			u |= (uint32_t)rd[pos + 1 + i] << (8 * i);
+		int32_t sv;
+		if (size == 1)
+			sv = (int8_t)u;
+		else if (size == 2)
+			sv = (int16_t)u;
+		else
+			sv = (int32_t)u;
+		pos += 1 + size;
+
+		switch (btype) {
+		case 0: // Main item
+			if (btag == 0x0A) { // Collection
+				if ((u & 0xFF) == HID_COLLECTION_APPLICATION &&
+				    mouse_depth < 0 && !mouse_seen &&
+				    usage_count > 0 &&
+				    usages[0] == HID_USAGE(HID_UP_GENERIC_DESKTOP,
+							   HID_GD_USAGE_MOUSE)) {
+					// Mouse collection: start over inside it
+					mouse_depth = depth;
+					hid_memset(&l, 0, sizeof(l));
+					found_rid = -1;
+				}
+				depth++;
+			} else if (btag == 0x0C) { // End Collection
+				if (depth > 0)
+					depth--;
+				if (mouse_depth >= 0 && depth == mouse_depth) {
+					mouse_depth = -1;
+					mouse_seen = 1;
+				}
+			} else if (btag == 0x08) { // Input
+				uint32_t base = input_bits[report_id];
+				uint64_t total =
+					(uint64_t)report_size * report_count;
+				int usable = !(u & HID_MAIN_CONSTANT) &&
+					     (u & HID_MAIN_VARIABLE) &&
+					     report_size > 0 &&
+					     (mouse_depth >= 0 || !mouse_seen);
+				if (usable) {
+					for (uint32_t n = 0; n < report_count;
+					     n++) {
+						uint32_t usage;
+						// Fields past the 64 Kbit bound
+						// can never be delivered; this
+						// also bounds the loop against
+						// a garbage Report Count.
+						uint64_t off =
+							base +
+							(uint64_t)n * report_size;
+						if (off + report_size > 0xFFFF)
+							break;
+						if (has_usage_range) {
+							usage = usage_min + n;
+							if (usage > usage_max)
+								usage = usage_max;
+						} else if (usage_count > 0) {
+							int k = (n < (uint32_t)usage_count) ?
+									(int)n :
+									usage_count - 1;
+							usage = usages[k];
+						} else {
+							break;
+						}
+						hid_parse_record_field(
+							&l, &found_rid, usage,
+							(uint32_t)off,
+							report_size,
+							logical_min < 0,
+							report_id);
+					}
+				}
+				if (base + total > 0xFFFF)
+					input_bits[report_id] = 0xFFFF;
+				else
+					input_bits[report_id] =
+						(uint16_t)(base + total);
+			}
+			// Output/Feature items (0x09/0x0B) carry no Input bits.
+			// Every Main item clears the local items.
+			usage_count = 0;
+			has_usage_range = 0;
+			break;
+
+		case 1: // Global item
+			switch (btag) {
+			case 0x0: // Usage Page
+				usage_page = (uint16_t)u;
+				break;
+			case 0x1: // Logical Minimum
+				logical_min = sv;
+				break;
+			case 0x7: // Report Size
+				report_size = u;
+				break;
+			case 0x8: // Report ID
+				report_id = (uint8_t)u;
+				uses_report_ids = 1;
+				break;
+			case 0x9: // Report Count
+				report_count = u;
+				break;
+			default: // Logical Max, Physical, Unit, Push/Pop
+				break;
+			}
+			break;
+
+		case 2: { // Local item
+			// A 4-byte usage carries its own page in the high word
+			uint32_t full = (size == 4) ? u :
+						      HID_USAGE(usage_page, u);
+			switch (btag) {
+			case 0x0: // Usage
+				if (usage_count < HID_PARSE_MAX_USAGES)
+					usages[usage_count++] = full;
+				break;
+			case 0x1: // Usage Minimum
+				usage_min = full;
+				has_usage_range = 1;
+				break;
+			case 0x2: // Usage Maximum
+				usage_max = full;
+				has_usage_range = 1;
+				break;
+			default:
+				break;
+			}
+			break;
+		}
+
+		default:
+			break;
+		}
+	}
+
+	if (l.buttons.bit_size == 0 || l.x.bit_size == 0 ||
+	    l.y.bit_size == 0 || l.wheel.bit_size == 0)
+		return 0;
+
+	uint32_t end = 0;
+	const usbhid_field_t *fs[4] = { &l.buttons, &l.x, &l.y, &l.wheel };
+	for (int i = 0; i < 4; i++) {
+		uint32_t e = (uint32_t)fs[i]->bit_offset + fs[i]->bit_size;
+		if (e > end)
+			end = e;
+	}
+	uint32_t bytes = (end + 7) / 8;
+	if (bytes == 0 || bytes > USBHID_REPORT_BUF_SIZE - 1)
+		return 0;
+
+	l.report_bytes = (uint8_t)bytes;
+	l.has_report_id = uses_report_ids;
+	l.report_id = (uint8_t)found_rid;
+	l.valid = 0;
+	*out = l;
+	return 1;
+}
+
+// Extract `bit_size` bits at `bit_offset` from a `len`-byte report.
+// HID reports are little-endian bit streams: bit 0 of byte 0 comes first.
+// Out-of-range fields read as 0.
+static uint32_t hid_extract_bits(const uint8_t *data, uint32_t len,
+				 uint32_t bit_offset, uint8_t bit_size)
+{
+	if (bit_size == 0 || bit_size > HID_PARSE_MAX_FIELD_BITS)
+		return 0;
+	if (bit_offset + bit_size > len * 8)
+		return 0;
+
+	uint32_t val = 0;
+	for (uint8_t i = 0; i < bit_size; i++) {
+		uint32_t bit = bit_offset + i;
+		if (data[bit >> 3] & (1u << (bit & 7)))
+			val |= (1u << i);
+	}
+	return val;
+}
+
+// Value of one layout field, sign-extended when the descriptor declared a
+// negative logical minimum (relative axes always do).
+static int32_t hid_field_value(const uint8_t *data, uint32_t len,
+			       const usbhid_field_t *f)
+{
+	uint32_t v = hid_extract_bits(data, len, f->bit_offset, f->bit_size);
+	if (f->is_signed && f->bit_size < 32 &&
+	    (v & (1u << (f->bit_size - 1))))
+		v |= ~((1u << f->bit_size) - 1);
+	return (int32_t)v;
+}
+
+// Decode a Report Protocol mouse input report with the parsed layout.
+static void hid_process_mouse_report_desc(usbhid_device_t *hdev,
+					  const uint8_t *report, uint32_t len)
+{
+	const usbhid_mouse_layout_t *l = &hdev->mouse_layout;
+
+	if (l->has_report_id) {
+		// Other reports (consumer keys, vendor pages) share the
+		// endpoint; only the mouse report is decoded.
+		if (len < 1 || report[0] != l->report_id)
+			return;
+		report++;
+		len--;
+	}
+	if (len < l->report_bytes)
+		return;
+
+	uint8_t buttons = (uint8_t)hid_extract_bits(
+		report, len, l->buttons.bit_offset, l->buttons.bit_size);
+	int dx = hid_field_value(report, len, &l->x);
+	int dy = hid_field_value(report, len, &l->y);
+	int wheel = hid_field_value(report, len, &l->wheel);
+
+	if (wheel > 127)
+		wheel = 127;
+	else if (wheel < -127)
+		wheel = -127;
+
+	mouse_inject_usb_movement(dx, dy, buttons, (int8_t)wheel);
+}
+
+// Fetch and parse the mouse's report descriptor.  Returns 1 with
+// hdev->mouse_layout filled in when the mouse can run in Report Protocol,
+// 0 when it has to stay in Boot Protocol.  Called during probe, before the
+// interrupt IN endpoint is armed, so the (page-aligned, DMA-safe) report
+// buffer can hold the descriptor for the control transfer.
+static int hid_mouse_fetch_layout(usbhid_device_t *hdev,
+				  uint16_t report_desc_len)
+{
+	if (report_desc_len == 0)
+		return 0;
+	if (report_desc_len > 4096) // one page of report_buf is usable
+		return 0;
+
+	int st = xhci_control_transfer(hdev->ctrl, hdev->usb_dev,
+				       USB_RT_D2H | USB_RT_STD | USB_RT_IFACE,
+				       USB_REQ_GET_DESCRIPTOR,
+				       (uint16_t)(USB_DESC_HID_REPORT << 8),
+				       hdev->interface_num, report_desc_len,
+				       hdev->report_buf);
+	if (st != ST_OK) {
+		kprintf("[USBHID] GET_DESCRIPTOR(Report) failed: %d - staying in Boot Protocol\n",
+			st);
+		return 0;
+	}
+	__asm__ volatile("" ::: "memory");
+
+	usbhid_mouse_layout_t l;
+	int ok = hid_parse_mouse_report_desc(hdev->report_buf, report_desc_len,
+					     &l);
+	hid_memset(hdev->report_buf, 0, report_desc_len);
+	if (!ok) {
+		kprintf("[USBHID] Report descriptor (%u bytes) has no usable mouse+wheel layout - staying in Boot Protocol\n",
+			report_desc_len);
+		return 0;
+	}
+
+	uint32_t need = (uint32_t)l.report_bytes + l.has_report_id;
+	if (need > hdev->int_in_max_pkt) {
+		kprintf("[USBHID] Mouse report (%u bytes) exceeds interrupt packet (%u) - staying in Boot Protocol\n",
+			need, hdev->int_in_max_pkt);
+		return 0;
+	}
+
+	l.valid = 1;
+	hdev->mouse_layout = l;
+	return 1;
+}
+
+// ============================================================================
 // HID Mouse Report Processing
 // (USB HID 1.11, Appendix B.2 - Boot Mouse Input Report)
 // ============================================================================
@@ -500,6 +908,11 @@ static void hid_process_keyboard_report(usbhid_device_t *hdev,
 static void hid_process_mouse_report(usbhid_device_t *hdev,
 				     const uint8_t *report, uint8_t len)
 {
+	if (hdev->mouse_layout.valid) {
+		hid_process_mouse_report_desc(hdev, report, len);
+		return;
+	}
+
 	if (len < HID_BOOT_MOUSE_MIN_SIZE)
 		return;
 
@@ -1144,7 +1557,11 @@ int usbhid_probe(xhci_controller_t *ctrl, usb_device_t *dev,
 							HID_BOOT_MOUSE_REPORT_SIZE;
 					}
 
-					// Continue scanning for endpoint descriptors for this interface
+					// Continue scanning for the HID class descriptor and
+					// endpoint descriptors for this interface.  The HID
+					// descriptor (USB HID 1.11, Section 7.1) precedes the
+					// endpoints and names the report descriptor length.
+					uint16_t report_desc_len = 0;
 					uint8_t *ep_ptr = ptr + desc_len;
 					while (ep_ptr < end) {
 						uint8_t ep_len = ep_ptr[0];
@@ -1158,6 +1575,18 @@ int usbhid_probe(xhci_controller_t *ctrl, usb_device_t *dev,
 						if (ep_type ==
 						    USB_DESC_INTERFACE)
 							break;
+
+						if (ep_type == USB_DESC_HID &&
+						    ep_len >=
+							    sizeof(usb_hid_desc_t)) {
+							usb_hid_desc_t *hd =
+								(usb_hid_desc_t *)
+									ep_ptr;
+							if (hd->desc_type ==
+							    USB_DESC_HID_REPORT)
+								report_desc_len =
+									hd->desc_length;
+						}
 
 						if (ep_type ==
 						    USB_DESC_ENDPOINT) {
@@ -1220,16 +1649,49 @@ int usbhid_probe(xhci_controller_t *ctrl, usb_device_t *dev,
 						continue;
 					}
 
-					// Set Boot Protocol (USB HID 1.11, Section 7.2.6)
-					// Boot Protocol is simpler and has fixed report formats,
-					// which is exactly what we need for our driver.
-					int st = hid_set_protocol(
-						ctrl, dev, hdev->interface_num,
-						HID_PROTOCOL_BOOT);
-					if (st != ST_OK) {
-						hid_dbg("SET_PROTOCOL(Boot) failed: %d (may already be in boot mode)\n",
-							st);
-						// Some devices may not support this; continue anyway
+					// Choose the protocol (USB HID 1.11, Section 7.2.6).
+					// Keyboards use Boot Protocol: fixed 8-byte report.
+					// Mice use Report Protocol when their report
+					// descriptor yields a layout with a wheel, because
+					// the Boot Protocol report carries no wheel (see
+					// hid_parse_mouse_report_desc).  Otherwise Boot.
+					int st;
+					int use_report = 0;
+					if (hdev->type == USBHID_TYPE_MOUSE &&
+					    hid_mouse_fetch_layout(
+						    hdev, report_desc_len)) {
+						st = hid_set_protocol(
+							ctrl, dev,
+							hdev->interface_num,
+							HID_PROTOCOL_REPORT);
+						if (st == ST_OK) {
+							use_report = 1;
+						} else {
+							kprintf("[USBHID] SET_PROTOCOL(Report) failed: %d - staying in Boot Protocol\n",
+								st);
+							hid_memset(
+								&hdev->mouse_layout,
+								0,
+								sizeof(hdev->mouse_layout));
+						}
+					}
+					if (use_report) {
+						hdev->boot_protocol = 0;
+						hdev->report_size = (uint8_t)(
+							hdev->mouse_layout
+								.report_bytes +
+							hdev->mouse_layout
+								.has_report_id);
+					} else {
+						st = hid_set_protocol(
+							ctrl, dev,
+							hdev->interface_num,
+							HID_PROTOCOL_BOOT);
+						if (st != ST_OK) {
+							hid_dbg("SET_PROTOCOL(Boot) failed: %d (may already be in boot mode)\n",
+								st);
+							// Some devices may not support this; continue anyway
+						}
 					}
 
 					// Set Idle rate to 0 (report only on change)
@@ -1273,10 +1735,28 @@ int usbhid_probe(xhci_controller_t *ctrl, usb_device_t *dev,
 						 USBHID_TYPE_KEYBOARD) ?
 							"Keyboard" :
 							"Mouse";
-					kprintf("[USBHID] %s detected on port %d (EP%d, %d-byte reports)\n",
+					kprintf("[USBHID] %s detected on port %d (EP%d, %d-byte reports, %s Protocol)\n",
 						type_str, dev->port,
 						hdev->int_in_ep,
-						hdev->report_size);
+						hdev->report_size,
+						hdev->boot_protocol ? "Boot" :
+								      "Report");
+					if (!hdev->boot_protocol) {
+						const usbhid_mouse_layout_t *l =
+							&hdev->mouse_layout;
+						kprintf("[USBHID]   mouse layout: report ID %d, %u buttons@%u, X@%u/%u, Y@%u/%u, wheel@%u/%u (bit offset/size)\n",
+							l->has_report_id ?
+								(int)l->report_id :
+								-1,
+							l->buttons.bit_size,
+							l->buttons.bit_offset,
+							l->x.bit_offset,
+							l->x.bit_size,
+							l->y.bit_offset,
+							l->y.bit_size,
+							l->wheel.bit_offset,
+							l->wheel.bit_size);
+					}
 
 					found_hid = 1;
 				}

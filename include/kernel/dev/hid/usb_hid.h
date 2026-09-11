@@ -181,6 +181,33 @@ typedef struct __attribute__((packed)) {
 } usb_hid_desc_t;
 
 // ============================================================================
+// Report Protocol mouse layout (parsed from the HID report descriptor)
+// ============================================================================
+
+// One field of a Report Protocol input report: a bit range inside the report
+// body (the byte after the report ID, when the device uses report IDs).
+typedef struct {
+	uint16_t bit_offset; // First bit of the field in the report body
+	uint8_t bit_size; // Field width in bits (0 = field not present)
+	uint8_t is_signed; // Logical minimum below zero → sign-extend
+} usbhid_field_t;
+
+// Where buttons, X, Y and Wheel live in a mouse's Report Protocol input
+// report.  Boot Protocol has a fixed layout with no wheel on most mice; the
+// wheel only exists in the Report Protocol layout that the device's report
+// descriptor spells out, so the mouse must run in Report Protocol to scroll.
+typedef struct {
+	uint8_t valid; // Layout parsed; reports are decoded with it
+	uint8_t has_report_id; // Reports start with a report ID byte
+	uint8_t report_id; // ID of the mouse input report (if has_report_id)
+	uint8_t report_bytes; // Report body bytes covered by the fields
+	usbhid_field_t buttons; // bit_size = number of buttons (1 bit each)
+	usbhid_field_t x;
+	usbhid_field_t y;
+	usbhid_field_t wheel;
+} usbhid_mouse_layout_t;
+
+// ============================================================================
 // USB HID Device Instance
 // ============================================================================
 
@@ -230,6 +257,7 @@ typedef struct {
 	uint8_t active; // Device is active and polling
 	uint8_t configured; // Device has been configured
 	uint8_t boot_protocol; // Using boot protocol (vs report protocol)
+	usbhid_mouse_layout_t mouse_layout; // Report Protocol mouse layout
 	uint8_t needs_resubmit; // Transfer completed, needs re-arm
 
 	// Pending interrupt transfer
