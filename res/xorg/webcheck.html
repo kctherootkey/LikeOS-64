@@ -179,6 +179,41 @@ if (!window.WebAssembly) {
   } catch (e) { bad('WebAssembly streaming', e.name + ': ' + e.message); }
 }
 
+/* The same paths again, but at the size a real site uses.  Everything
+   above is a few bytes and stays inside one process; a page's script
+   bundle, a wasm module or an XHR answer is megabytes and crosses between
+   the web process and the network process, where anything over 4 KB is
+   handed over as a shared-memory object rather than copied inline. */
+try {
+  var big = new Uint8Array(16 * 1024 * 1024);
+  for (var i = 0; i < big.length; i += 4096) big[i] = i & 0xff;
+  var bb = new Blob([big], { type: 'application/octet-stream' });
+  var bu = URL.createObjectURL(bb);
+  fetch(bu).then(function (r) { return r.arrayBuffer(); }).then(function (a) {
+    if (a.byteLength === big.length) ok('16 MB blob', 'created, fetched, whole');
+    else bad('16 MB blob', 'came back ' + a.byteLength + ' of ' + big.length + ' bytes');
+    URL.revokeObjectURL(bu);
+  }).catch(function (e) { bad('16 MB blob', e.name + ': ' + e.message); });
+} catch (e) { bad('16 MB blob', e.name + ': ' + e.message); }
+
+try {
+  var parts = [];
+  for (var k = 0; k < 64; k++) parts.push(new Uint8Array(256 * 1024));
+  var many = parts.map(function (p) { return URL.createObjectURL(new Blob([p])); });
+  var left = many.length, failed = 0;
+  many.forEach(function (u2) {
+    fetch(u2).then(function (r) { return r.arrayBuffer(); }).then(function (a) {
+      if (a.byteLength !== 256 * 1024) failed++;
+    }).catch(function () { failed++; }).then(function () {
+      if (--left === 0) {
+        if (failed) bad('64 x 256 KB blobs', failed + ' of 64 failed');
+        else ok('64 x 256 KB blobs', 'all whole');
+        many.forEach(function (u3) { URL.revokeObjectURL(u3); });
+      }
+    });
+  });
+} catch (e) { bad('64 x 256 KB blobs', e.name + ': ' + e.message); }
+
 try { structuredClone({ a: [1, 2] }); ok('structuredClone'); }
 catch (e) { bad('structuredClone', e.name + ': ' + e.message); }
 

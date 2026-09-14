@@ -1,0 +1,33 @@
+Tell a new web process whether ad blocking is on.
+
+lib/adblock.lua sends a newly created web process its rules and each list's
+enabled flag, but never the module's own `enabled' state.  The web module
+declares that state as `local enabled = true' and only learns otherwise from
+an "enable" signal, emitted once, to the processes that exist at the time the
+user runs `:adblock-disable'.
+
+So `:abd' turns blocking off in the processes that are running and in none of
+the ones created afterwards.  Open a page that makes luakit spawn or swap a
+web process and that page is filtered again, with nothing in the UI to say
+so -- which is exactly what made the command look like it does nothing when
+it was used to test whether the blocker was breaking a site.
+
+Sending the state alongside the rules costs one message and makes the command
+mean what it says.
+
+Upstream: applies to luakit 2.4.0 as shipped; worth reporting.
+
+--- a/lib/adblock.lua	2025-02-14 13:18:26.000000000 +0100
++++ b/lib/adblock.lua	2026-09-14 22:40:28.434494414 +0200
+@@ -490,6 +490,11 @@
+ luakit.add_signal("web-extension-created", function (view)
+     new_web_extension_created = true
+     adblock_wm:emit_signal(view, "update_rules", _M.rules)
++    -- ...and whether blocking is on at all.  Without this the new process
++    -- keeps the web module's own default (true) and goes on filtering after
++    -- `:adblock-disable', which is what made that command look like it does
++    -- nothing when it was used to test whether the blocker broke a site.
++    adblock_wm:emit_signal(view, "enable", _M.enabled)
+     for name, list in pairs(_M.rules) do
+         local enabled = util.table.hasitem(list.opts, "Enabled")
+         adblock_wm:emit_signal(view, "list_set_enabled", name, enabled)

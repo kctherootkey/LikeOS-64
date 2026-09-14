@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 /* Days per month (non-leap, then leap) */
 static const int _mon_days[2][12] = {
@@ -86,18 +87,341 @@ struct tm *gmtime(const time_t *timep)
 	return gmtime_r(timep, &_gmtime_buf);
 }
 
-/* No timezone support — localtime is the same as gmtime */
-struct tm *localtime_r(const time_t *timep, struct tm *result)
+
+/* ===================================================================
+ * Time zones
+ *
+ * There is no zoneinfo database on this system, so the zone cannot be read
+ * from /usr/share/zoneinfo the way it is elsewhere.  What there is instead:
+ *
+ *   - the POSIX TZ string, which describes a zone completely in a few
+ *     characters -- "CET-1CEST,M3.5.0,M10.5.0/3" is central Europe, standard
+ *     time one hour east of UTC, summer time from the last Sunday in March to
+ *     the last Sunday in October at 03:00.  That is the format POSIX itself
+ *     specifies for TZ and it is parsed in full below;
+ *
+ *   - a table of the zone NAMES people actually set, because TZ on this
+ *     system holds an Olson name ("Europe/Berlin").  It has to: ICU, which
+ *     is what the browser's Date and Intl ask, accepts nothing else, and one
+ *     variable has to serve both.  The table maps a name to its POSIX rule.
+ *
+ * A name that is not in the table leaves the clock on UTC rather than
+ * guessing, and /etc/profile's comment says where to change it.  The rules
+ * here are the current ones; a zone that changes its law needs the line
+ * updated, which is the price of not carrying a database.
+ * =================================================================== */
+
+struct tz_when {
+	int mode; /* 0 none, 1 = Mm.w.d, 2 = Jn (no Feb 29), 3 = n (0-365) */
+	int m, w, d;
+	int n;
+	long secs; /* seconds after local midnight */
+};
+
+static char g_tz_std[16] = "UTC";
+static char g_tz_dst[16] = "";
+static long g_tz_std_east; /* local = UTC + this */
+static long g_tz_dst_east;
+static struct tz_when g_tz_start, g_tz_end;
+static int g_tz_has_dst;
+static int g_tz_done;
+
+static const struct {
+	const char *name;
+	const char *rule;
+} g_tz_table[] = {
+	{ "UTC", "UTC0" },
+	{ "Etc/UTC", "UTC0" },
+	{ "GMT", "UTC0" },
+	{ "Etc/GMT", "UTC0" },
+	/* central Europe */
+	{ "Europe/Berlin", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Vienna", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Zurich", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Paris", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Madrid", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Rome", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Amsterdam", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Brussels", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Luxembourg", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Prague", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Warsaw", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Budapest", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Stockholm", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Oslo", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Copenhagen", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Zagreb", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Bratislava", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	{ "Europe/Ljubljana", "CET-1CEST,M3.5.0,M10.5.0/3" },
+	/* western Europe */
+	{ "Europe/London", "GMT0BST,M3.5.0/1,M10.5.0" },
+	{ "Europe/Dublin", "GMT0IST,M3.5.0/1,M10.5.0" },
+	{ "Europe/Lisbon", "WET0WEST,M3.5.0/1,M10.5.0" },
+	/* eastern Europe */
+	{ "Europe/Helsinki", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Athens", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Bucharest", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Kyiv", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Kiev", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Riga", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Tallinn", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Vilnius", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Sofia", "EET-2EEST,M3.5.0/3,M10.5.0/4" },
+	{ "Europe/Istanbul", "<+03>-3" },
+	{ "Europe/Moscow", "MSK-3" },
+	/* the Americas */
+	{ "America/New_York", "EST5EDT,M3.2.0,M11.1.0" },
+	{ "America/Toronto", "EST5EDT,M3.2.0,M11.1.0" },
+	{ "America/Chicago", "CST6CDT,M3.2.0,M11.1.0" },
+	{ "America/Denver", "MST7MDT,M3.2.0,M11.1.0" },
+	{ "America/Phoenix", "MST7" },
+	{ "America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0" },
+	{ "America/Vancouver", "PST8PDT,M3.2.0,M11.1.0" },
+	{ "America/Anchorage", "AKST9AKDT,M3.2.0,M11.1.0" },
+	{ "America/Sao_Paulo", "<-03>3" },
+	{ "America/Mexico_City", "CST6" },
+	{ "America/Bogota", "<-05>5" },
+	{ "America/Buenos_Aires", "<-03>3" },
+	{ "America/Argentina/Buenos_Aires", "<-03>3" },
+	/* Asia and Oceania */
+	{ "Asia/Tokyo", "JST-9" },
+	{ "Asia/Seoul", "KST-9" },
+	{ "Asia/Shanghai", "CST-8" },
+	{ "Asia/Hong_Kong", "HKT-8" },
+	{ "Asia/Singapore", "<+08>-8" },
+	{ "Asia/Kolkata", "IST-5:30" },
+	{ "Asia/Calcutta", "IST-5:30" },
+	{ "Asia/Dubai", "<+04>-4" },
+	{ "Asia/Jerusalem", "IST-2IDT,M3.4.4/26,M10.5.0" },
+	{ "Australia/Sydney", "AEST-10AEDT,M10.1.0,M4.1.0/3" },
+	{ "Australia/Melbourne", "AEST-10AEDT,M10.1.0,M4.1.0/3" },
+	{ "Australia/Brisbane", "AEST-10" },
+	{ "Australia/Perth", "AWST-8" },
+	{ "Pacific/Auckland", "NZST-12NZDT,M9.5.0,M4.1.0/3" },
+	{ "Africa/Cairo", "EET-2EEST,M4.5.5/0,M10.5.4/24" },
+	{ "Africa/Johannesburg", "SAST-2" },
+	{ "Africa/Lagos", "WAT-1" },
+};
+
+/* A zone name ("CET"), or a quoted one ("<+04>"). */
+static const char *tz_parse_name(const char *p, char *out, size_t cap)
 {
-	return gmtime_r(timep, result);
+	size_t i = 0;
+
+	if (*p == '<') {
+		p++;
+		while (*p && *p != '>') {
+			if (i + 1 < cap)
+				out[i++] = *p;
+			p++;
+		}
+		if (*p == '>')
+			p++;
+	} else {
+		while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) {
+			if (i + 1 < cap)
+				out[i++] = *p;
+			p++;
+		}
+	}
+	out[i] = '\0';
+	return p;
 }
 
-struct tm *localtime(const time_t *timep)
+/* [+|-]hh[:mm[:ss]].  POSIX states the value to ADD TO LOCAL to reach UTC,
+ * so the sign is flipped to get the offset east of UTC that everything
+ * below wants. */
+static const char *tz_parse_offset(const char *p, long *east)
 {
-	return gmtime_r(timep, &_gmtime_buf);
+	int sign = 1;
+	long v = 0, part;
+
+	if (*p == '+')
+		p++;
+	else if (*p == '-') {
+		sign = -1;
+		p++;
+	}
+	part = 0;
+	while (*p >= '0' && *p <= '9')
+		part = part * 10 + (*p++ - '0');
+	v = part * 3600;
+	if (*p == ':') {
+		p++;
+		part = 0;
+		while (*p >= '0' && *p <= '9')
+			part = part * 10 + (*p++ - '0');
+		v += part * 60;
+		if (*p == ':') {
+			p++;
+			part = 0;
+			while (*p >= '0' && *p <= '9')
+				part = part * 10 + (*p++ - '0');
+			v += part;
+		}
+	}
+	*east = -(sign * v);
+	return p;
 }
 
-time_t mktime(struct tm *tm)
+static const char *tz_parse_when(const char *p, struct tz_when *w)
+{
+	long part;
+
+	w->mode = 0;
+	w->secs = 2 * 3600; /* POSIX default: 02:00 local */
+	if (*p == 'M') {
+		p++;
+		w->mode = 1;
+		part = 0;
+		while (*p >= '0' && *p <= '9')
+			part = part * 10 + (*p++ - '0');
+		w->m = (int)part;
+		if (*p == '.')
+			p++;
+		part = 0;
+		while (*p >= '0' && *p <= '9')
+			part = part * 10 + (*p++ - '0');
+		w->w = (int)part;
+		if (*p == '.')
+			p++;
+		part = 0;
+		while (*p >= '0' && *p <= '9')
+			part = part * 10 + (*p++ - '0');
+		w->d = (int)part;
+	} else if (*p == 'J' || (*p >= '0' && *p <= '9')) {
+		w->mode = (*p == 'J') ? 2 : 3;
+		if (*p == 'J')
+			p++;
+		part = 0;
+		while (*p >= '0' && *p <= '9')
+			part = part * 10 + (*p++ - '0');
+		w->n = (int)part;
+	} else {
+		return p;
+	}
+	if (*p == '/') {
+		long east;
+		p++;
+		/* the same syntax as an offset, but a plain time of day:
+		 * parse it and undo the sign flip */
+		p = tz_parse_offset(p, &east);
+		w->secs = -east;
+	}
+	return p;
+}
+
+static void tz_parse(const char *tz)
+{
+	const char *p = tz;
+
+	g_tz_has_dst = 0;
+	g_tz_dst[0] = '\0';
+	g_tz_start.mode = g_tz_end.mode = 0;
+	p = tz_parse_name(p, g_tz_std, sizeof(g_tz_std));
+	if (!g_tz_std[0]) {
+		strcpy(g_tz_std, "UTC");
+		g_tz_std_east = 0;
+		return;
+	}
+	p = tz_parse_offset(p, &g_tz_std_east);
+	if (*p && *p != ',') {
+		p = tz_parse_name(p, g_tz_dst, sizeof(g_tz_dst));
+		if (g_tz_dst[0]) {
+			g_tz_has_dst = 1;
+			if (*p && *p != ',')
+				p = tz_parse_offset(p, &g_tz_dst_east);
+			else
+				g_tz_dst_east = g_tz_std_east + 3600;
+		}
+	}
+	if (g_tz_has_dst && *p == ',') {
+		p++;
+		p = tz_parse_when(p, &g_tz_start);
+		if (*p == ',') {
+			p++;
+			p = tz_parse_when(p, &g_tz_end);
+		}
+		if (!g_tz_start.mode || !g_tz_end.mode) {
+			/* a summer-time name with no rule cannot be applied */
+			g_tz_has_dst = 0;
+		}
+	} else if (g_tz_has_dst) {
+		/* POSIX says a missing rule means the US rule; without one
+		 * stated, standard time all year is the safe reading. */
+		g_tz_has_dst = 0;
+	}
+}
+
+static time_t tz_days_from_epoch(int year, int mon0, int mday)
+{
+	time_t days = 0;
+	int y;
+
+	for (y = 1970; y < year; y++)
+		days += _is_leap(y) ? 366 : 365;
+	for (y = 0; y < mon0; y++)
+		days += _mon_days[_is_leap(year)][y];
+	return days + (mday - 1);
+}
+
+/* The instant a rule fires, in UTC, for a given year.  `east' is the offset
+ * in force just BEFORE the change, which is what the rule's time of day is
+ * expressed in. */
+static time_t tz_transition(int year, const struct tz_when *w, long east)
+{
+	time_t days;
+
+	if (w->mode == 1) {
+		int leap = _is_leap(year);
+		int mon0 = w->m - 1;
+		int mlen = _mon_days[leap][mon0];
+		time_t first = tz_days_from_epoch(year, mon0, 1);
+		int wday_first = (int)((first + 4) % 7); /* 1970-01-01 = Thu */
+		int shift = (w->d - wday_first + 7) % 7;
+		int mday = 1 + shift + (w->w - 1) * 7;
+		while (mday > mlen)
+			mday -= 7;
+		days = tz_days_from_epoch(year, mon0, mday);
+	} else if (w->mode == 2) {
+		/* Jn: day n of the year, February 29 never counted */
+		int n = w->n;
+		int leap = _is_leap(year);
+		if (leap && n >= 60)
+			n++;
+		days = tz_days_from_epoch(year, 0, 1) + (n - 1);
+	} else {
+		days = tz_days_from_epoch(year, 0, 1) + w->n;
+	}
+	return days * 86400 + w->secs - east;
+}
+
+static int tz_is_dst(time_t t)
+{
+	struct tm probe;
+	time_t start, end;
+	int year;
+
+	if (!g_tz_has_dst)
+		return 0;
+	gmtime_r(&t, &probe);
+	year = probe.tm_year + 1900;
+	start = tz_transition(year, &g_tz_start, g_tz_std_east);
+	end = tz_transition(year, &g_tz_end, g_tz_dst_east);
+	if (start <= end)
+		return t >= start && t < end; /* northern hemisphere */
+	return t >= start || t < end; /* southern: summer spans new year */
+}
+
+static void tz_ensure(void)
+{
+	if (!g_tz_done)
+		tzset();
+}
+
+/* What a broken-down time says, read as UTC.  mktime() and timegm() differ
+ * only in what they do with the answer. */
+static time_t tz_tm_to_utc(const struct tm *tm)
 {
 	int year = tm->tm_year + 1900;
 	int mon = tm->tm_mon;
@@ -109,26 +433,81 @@ time_t mktime(struct tm *tm)
 	for (int m = 0; m < mon; m++)
 		t += _mon_days[leap][m];
 	t += tm->tm_mday - 1;
-	t = t * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec;
+	return t * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec;
+}
 
-	/* Fill in derived fields */
+struct tm *localtime_r(const time_t *timep, struct tm *result)
+{
+	time_t t = *timep;
+	int dst;
+	time_t local;
+
+	tz_ensure();
+	dst = tz_is_dst(t);
+	local = t + (dst ? g_tz_dst_east : g_tz_std_east);
+	gmtime_r(&local, result);
+	result->tm_isdst = dst;
+	return result;
+}
+
+struct tm *localtime(const time_t *timep)
+{
+	return localtime_r(timep, &_gmtime_buf);
+}
+
+/* mktime(3): the broken-down time is LOCAL, and the answer is UTC. */
+time_t mktime(struct tm *tm)
+{
+	time_t as_utc, res;
+	int dst;
+
+	tz_ensure();
+	as_utc = tz_tm_to_utc(tm);
+	/* Which offset applied depends on the answer, and the answer depends
+	 * on the offset.  Resolve it the usual way: assume standard time,
+	 * then ask what was actually in force at the instant that gives.  A
+	 * caller that already knows says so through tm_isdst. */
+	if (tm->tm_isdst > 0)
+		dst = g_tz_has_dst;
+	else if (tm->tm_isdst == 0)
+		dst = 0;
+	else
+		dst = tz_is_dst(as_utc - g_tz_std_east);
+	res = as_utc - (dst ? g_tz_dst_east : g_tz_std_east);
+	if (tm->tm_isdst < 0) {
+		/* One correction pass: a time inside the spring-forward gap
+		 * or the autumn overlap lands on the other side otherwise. */
+		int again = tz_is_dst(res);
+		if (again != dst) {
+			dst = again;
+			res = as_utc - (dst ? g_tz_dst_east : g_tz_std_east);
+		}
+	}
+
+	/* The derived fields describe the LOCAL time the caller gave. */
 	struct tm check;
+	gmtime_r(&as_utc, &check);
+	tm->tm_wday = check.tm_wday;
+	tm->tm_yday = check.tm_yday;
+	tm->tm_isdst = dst;
+
+	return res;
+}
+
+/* timegm(3): mktime with the broken-down time taken as UTC.  Portable code
+ * uses the pair to learn the zone offset -- WTF's date handling computes
+ * exactly timegm(&t) - mktime(&t) where the platform has no tm_gmtoff --
+ * so the two must differ by the offset, and this one applies none. */
+time_t timegm(struct tm *tm)
+{
+	time_t t = tz_tm_to_utc(tm);
+	struct tm check;
+
 	gmtime_r(&t, &check);
 	tm->tm_wday = check.tm_wday;
 	tm->tm_yday = check.tm_yday;
 	tm->tm_isdst = 0;
-
 	return t;
-}
-
-/* timegm(3): mktime with the broken-down time taken as UTC.  On this system
- * the two are one operation -- there are no timezones here, localtime() IS
- * gmtime() -- but portable code (WTF's date handling, for one) selects
- * timegm by name when the platform offers it, so the honest spelling
- * exists. */
-time_t timegm(struct tm *tm)
-{
-	return mktime(tm);
 }
 
 /* Helper: append string, return chars written */
@@ -391,12 +770,31 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm)
 			n = _fmt_num(s + pos, max - pos, tm->tm_year + 1900, 4);
 			pos += n;
 			break;
-		case 'z':
-			n = _fmt_str(s + pos, max - pos, "+0000");
+		case 'z': {
+			/* The zone the broken-down time is in, which its own
+			 * tm_isdst says; there is no tm_gmtoff to read. */
+			char zb[8];
+			long off;
+			long a;
+			tz_ensure();
+			off = (tm->tm_isdst > 0 && g_tz_has_dst) ? g_tz_dst_east :
+								  g_tz_std_east;
+			a = off < 0 ? -off : off;
+			zb[0] = off < 0 ? '-' : '+';
+			zb[1] = (char)('0' + (a / 36000) % 10);
+			zb[2] = (char)('0' + (a / 3600) % 10);
+			zb[3] = (char)('0' + ((a % 3600) / 600) % 10);
+			zb[4] = (char)('0' + ((a % 3600) / 60) % 10);
+			zb[5] = '\0';
+			n = _fmt_str(s + pos, max - pos, zb);
 			pos += n;
 			break;
+		}
 		case 'Z':
-			n = _fmt_str(s + pos, max - pos, "UTC");
+			tz_ensure();
+			n = _fmt_str(s + pos, max - pos,
+				     (tm->tm_isdst > 0 && g_tz_has_dst) ? g_tz_dst :
+									  g_tz_std);
 			pos += n;
 			break;
 		default:
@@ -496,7 +894,55 @@ int daylight = 0;
 
 void tzset(void)
 {
-	/* No timezone database: localtime == gmtime, name is fixed. */
+	const char *tz = getenv("TZ");
+	const char *rule = NULL;
+
+	char fromfile[64];
+
+	g_tz_done = 1;
+	if (!tz || !*tz) {
+		/* Nothing in the environment.  /etc/timezone holds the zone
+		 * name for the whole system, and reading it here means a
+		 * process that never saw a login shell -- a daemon, a
+		 * program started by init -- still keeps local time. */
+		FILE *f = fopen("/etc/timezone", "r");
+		if (f) {
+			if (fgets(fromfile, (int)sizeof(fromfile), f)) {
+				size_t n = strlen(fromfile);
+				while (n && (fromfile[n - 1] == '\n' ||
+					     fromfile[n - 1] == '\r' ||
+					     fromfile[n - 1] == ' ' ||
+					     fromfile[n - 1] == '\t'))
+					fromfile[--n] = '\0';
+				if (fromfile[0])
+					tz = fromfile;
+			}
+			fclose(f);
+		}
+	}
+	if (!tz || !*tz) {
+		rule = "UTC0";
+	} else if (strchr(tz, ',') || strchr(tz, '<') ||
+		   (!strchr(tz, '/') && *tz != ':')) {
+		/* already a POSIX rule */
+		rule = tz;
+	} else {
+		if (*tz == ':')
+			tz++;
+		for (size_t i = 0; i < sizeof(g_tz_table) / sizeof(g_tz_table[0]); i++) {
+			if (strcmp(g_tz_table[i].name, tz) == 0) {
+				rule = g_tz_table[i].rule;
+				break;
+			}
+		}
+		if (!rule)
+			rule = "UTC0"; /* a name with no rule here stays UTC */
+	}
+	tz_parse(rule);
+	tzname[0] = g_tz_std;
+	tzname[1] = g_tz_has_dst ? g_tz_dst : g_tz_std;
+	timezone = -g_tz_std_east;
+	daylight = g_tz_has_dst;
 }
 
 /* ===================================================================
