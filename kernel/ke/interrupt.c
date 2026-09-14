@@ -1437,6 +1437,55 @@ static void report_userspace_crash(task_t *cur, uint64_t *regs, int signum,
 #endif
 }
 
+/* A process ending itself on purpose -- abort(), or a handler re-raising a
+ * fault it could not deal with -- raises the signal through kill() and is
+ * simply gone with status 128+sig: there is no exception for the report
+ * above to describe, and libc's abort() prints nothing.  The context is
+ * still there, though: the user's registers as syscall_entry left them on
+ * the kernel stack.  Laid out as the exception path would have pushed them,
+ * they feed the same report -- registers, memory map, and the executable
+ * addresses on the stack that stand in for a call chain.  Called from
+ * sys_kill(), in the sender's own syscall, with no lock held. */
+void report_userspace_self_signal(task_t *sender, int signum,
+				  const char *signame)
+{
+	int tgid = sender->tgid ? (int)sender->tgid : (int)sender->id;
+
+	kprintf("process %d (%s) raised %s (%d) on itself from thread %d\n",
+		tgid, sender->comm, signame, signum, (int)sender->id);
+#ifdef CRASH_VERBOSE
+	syscall_user_frame_t *f = sender->syscall_frame;
+	uint64_t regs[22];
+
+	if (!f)
+		return;
+	for (int i = 0; i < 22; i++)
+		regs[i] = 0;
+	regs[REGS_R15] = f->r15;
+	regs[REGS_R14] = f->r14;
+	regs[REGS_R13] = f->r13;
+	regs[REGS_R12] = f->r12;
+	regs[REGS_R10] = f->r10;
+	regs[REGS_R9] = f->r9;
+	regs[REGS_R8] = f->r8;
+	regs[REGS_RBP] = f->rbp;
+	regs[REGS_RDI] = f->rdi;
+	regs[REGS_RSI] = f->rsi;
+	regs[REGS_RDX] = f->rdx;
+	regs[REGS_RBX] = f->rbx;
+	regs[REGS_RAX] = f->rax;
+	/* SYSCALL left the user's RIP in RCX and RFLAGS in R11; the user's
+	 * own RCX and R11 are gone.  The selectors are not read by the
+	 * detailed report. */
+	regs[REGS_RIP] = f->rip;
+	regs[REGS_RFLAGS] = f->rflags;
+	regs[REGS_RSP] = f->rsp;
+	regs[REGS_CS] = 0x1b;
+	regs[REGS_SS] = 0x23;
+	report_userspace_crash_detailed(sender, regs, signum, signame, 0, 0);
+#endif
+}
+
 /*
  * The single "return from an interrupt" work point.  Every interrupt and
  * exception path that can hand control back to user mode funnels through here

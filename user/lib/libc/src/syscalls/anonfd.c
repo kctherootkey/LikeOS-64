@@ -160,8 +160,21 @@ int prctl(int option, ...)
 	a1 = va_arg(ap, unsigned long);
 	va_end(ap);
 	switch (option) {
-	case PR_SET_NAME:
-		return pthread_setname_np(pthread_self(), (const char *)a1) ? -1 : 0;
+	case PR_SET_NAME: {
+		/* The conventional contract truncates to 15 characters; the
+		 * pthread call refuses a longer name, so cut it here. */
+		const char *src = (const char *)a1;
+		char name[16];
+		size_t i;
+		if (!src) {
+			errno = EFAULT;
+			return -1;
+		}
+		for (i = 0; i < 15 && src[i]; i++)
+			name[i] = src[i];
+		name[i] = 0;
+		return pthread_setname_np(pthread_self(), name) ? -1 : 0;
+	}
 	case PR_GET_NAME:
 		return pthread_getname_np(pthread_self(), (char *)a1, 16) ? -1 : 0;
 	case PR_GET_DUMPABLE:

@@ -8,6 +8,24 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 
+/* A descriptor passed over a socket that could not be handed to the
+ * receiver: no free descriptor, or a control buffer too small to report
+ * it.  The receiver learns only that its control data was truncated,
+ * and a program that then gives up rarely says why -- said a few times
+ * per boot. */
+static void unix_report_dropped_fd(task_t *cur, int no_room_to_report)
+{
+	static int said;
+
+	if (said >= 8)
+		return;
+	said++;
+	kprintf("process %d (%s): a descriptor passed over a socket was dropped (%s)\n",
+		cur ? (int)cur->tgid : -1, cur ? cur->comm : "?",
+		no_room_to_report ? "control buffer too small" : "no free descriptor");
+}
+
+
 // Helper: extract socket index from a process fd (via fd_table marker)
 /* Hand an accepted peer address back to userspace.
  *
@@ -446,6 +464,7 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 			if (nf < 0) {
 				fd_release_entry((vfs_file_t *)entry);
 				kmsg->msg_flags |= MSG_CTRUNC;
+				unix_report_dropped_fd(cur, nfds >= space_fds);
 				continue;
 			}
 			newfds[nfds++] = nf;
@@ -660,6 +679,7 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 				 * fd_dup_entry_at() took it. */
 				fd_release_entry((vfs_file_t *)entry);
 				kmsg->msg_flags |= MSG_CTRUNC;
+				unix_report_dropped_fd(cur, nfds >= space_fds);
 				if (nfds >= space_fds)
 					break;
 				continue;

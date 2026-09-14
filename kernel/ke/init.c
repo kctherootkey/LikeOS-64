@@ -1,5 +1,6 @@
 // LikeOS-64 Kernel Initialization
 void vmwgfx_init(void);
+int i915_init(void);
 void drm_console_start_worker(void);
 #include <kernel/fs/sysfs.h>
 void procfs_init(void);
@@ -273,6 +274,10 @@ __no_stack_protector void continue_system_startup(void)
 		vmsvga2_setup_boot_mode();
 		/* The display-manager interface on the same device. */
 		vmwgfx_init();
+	} else {
+		/* Intel integrated graphics on real hardware.  A refusal at
+		 * any point leaves the GOP framebuffer path as it is. */
+		(void)i915_init();
 	}
 
 	xhci_boot_init(&g_xhci_boot);
@@ -284,6 +289,11 @@ __no_stack_protector void continue_system_startup(void)
 	mouse_init();
 
 	storage_fs_init(&g_storage_state);
+	/* A display driver's late bring-up -- firmware from the root
+	 * filesystem, a thread of its own -- cannot happen here: this only
+	 * sets the storage state up, the root is mounted several steps
+	 * later by the polling loop, and the scheduler does not exist yet.
+	 * storage.c calls drm_late_init() at the point the root is chosen. */
 
 	// Initialize networking (E1000 NIC driver, protocol stack, DHCP)
 	net_init();

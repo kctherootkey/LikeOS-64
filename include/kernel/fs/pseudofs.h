@@ -17,6 +17,10 @@ struct pfs;
  * (may exceed cap: the caller then retries with a bigger buffer), or a
  * negative errno. */
 typedef long (*pfs_show_t)(struct pfs_node *n, char *buf, long cap);
+/* Accept a write of `len' bytes (a copy in kernel memory, not NUL
+ * terminated) to a file that takes input -- a sysfs attribute that sets
+ * something.  Return the bytes consumed or a negative errno. */
+typedef long (*pfs_store_t)(struct pfs_node *n, const char *buf, long len);
 /* Dynamic directory: list child `index' into name (return 1) or return 0
  * at the end; `type' receives DT_DIR / DT_REG / DT_LNK. */
 typedef int (*pfs_list_t)(struct pfs_node *dir, unsigned index, char *name,
@@ -39,6 +43,7 @@ struct pfs_node {
 	struct pfs *fs;
 	/* files */
 	pfs_show_t show;
+	pfs_store_t store; /* writable when set */
 	/* Files too large, or too changeable, to be materialised whole at
 	 * open: this is called per read with the offset the caller is at, and
 	 * takes precedence over `show'.  /proc/<pid>/mem is the reason it
@@ -73,6 +78,10 @@ struct pfs_node *pfs_add_file(struct pfs *fs, const char *path,
 			      pfs_show_t show, void *arg, uint64_t arg2);
 struct pfs_node *pfs_add_link(struct pfs *fs, const char *path,
 			      const char *target);
+/* A file that is read through `show' and written through `store'. */
+struct pfs_node *pfs_add_file_rw(struct pfs *fs, const char *path,
+				 pfs_show_t show, pfs_store_t store, void *arg,
+				 uint64_t arg2);
 /* Make a directory dynamic. */
 void pfs_set_dynamic(struct pfs_node *dir, pfs_list_t list,
 		     pfs_lookup_t lookup);

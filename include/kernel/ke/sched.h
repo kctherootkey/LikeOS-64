@@ -24,7 +24,7 @@ struct task;
  * Not free to raise: task_t embeds fd_table[] and fd_flags[] (9 KB at 1024, of
  * a 56 KB task_t) and fork() copies all of it, and files_struct_t embeds the
  * same pair again.  1024 is what a conventional system offers by default. */
-#define TASK_MAX_FDS 1024
+#define TASK_MAX_FDS 4096
 
 // Maximum memory regions per task (for mmap tracking)
 /* Address-space regions per process.  The dynamic linker maps roughly one

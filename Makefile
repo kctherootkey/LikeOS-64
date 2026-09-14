@@ -22,6 +22,11 @@ CRASH_VERBOSE ?= 0
 ifeq ($(DEBUG),1)
   override CRASH_VERBOSE := 1
 endif
+# Pass I915_DEBUG=1 for the Intel graphics driver's detailed log (every
+# register it programs, every mode set and flip); without it the driver
+# prints what it found and any error.  Not part of the build-mode stamp:
+# touch the driver's sources or clean to change it.
+I915_DEBUG ?= 0
 
 ifeq ($(DEBUG),1)
   KERNEL_DEBUG_CFLAGS = -DDEBUG=1 -DCRASH_VERBOSE=1 -g3 -gdwarf-4
@@ -37,6 +42,7 @@ else ifeq ($(CRASH_VERBOSE),1)
 else
   KERNEL_DEBUG_CFLAGS =
 endif
+KERNEL_DEBUG_CFLAGS += -DI915_DEBUG=$(I915_DEBUG)
 
 # Codename for this release
 CODENAME = blessed kitty
@@ -305,6 +311,56 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/drm_dirty.o \
               $(BUILD_DIR)/drm_fence.o \
               $(BUILD_DIR)/drm_kms.o \
+              $(BUILD_DIR)/drm_syncobj.o \
+              $(BUILD_DIR)/drm_edid.o \
+              $(BUILD_DIR)/drm_edid_parse.o \
+              $(BUILD_DIR)/drm_modes.o \
+              $(BUILD_DIR)/i915_pci.o \
+              $(BUILD_DIR)/i915_drv.o \
+              $(BUILD_DIR)/i915_uncore.o \
+              $(BUILD_DIR)/i915_gtt.o \
+              $(BUILD_DIR)/i915_irq.o \
+              $(BUILD_DIR)/intel_vbt_parse.o \
+              $(BUILD_DIR)/intel_opregion.o \
+              $(BUILD_DIR)/intel_dp_aux.o \
+              $(BUILD_DIR)/intel_power.o \
+              $(BUILD_DIR)/intel_cdclk.o \
+              $(BUILD_DIR)/intel_dpll.o \
+              $(BUILD_DIR)/intel_ddi.o \
+              $(BUILD_DIR)/intel_dp.o \
+              $(BUILD_DIR)/intel_pps.o \
+              $(BUILD_DIR)/intel_backlight.o \
+              $(BUILD_DIR)/intel_gmbus.o \
+              $(BUILD_DIR)/intel_infoframe.o \
+              $(BUILD_DIR)/intel_hdmi.o \
+              $(BUILD_DIR)/intel_hotplug.o \
+              $(BUILD_DIR)/intel_dmc_parse.o \
+              $(BUILD_DIR)/intel_dmc.o \
+              $(BUILD_DIR)/i915_firmware.o \
+              $(BUILD_DIR)/i915_workarounds.o \
+              $(BUILD_DIR)/i915_mocs.o \
+              $(BUILD_DIR)/i915_vma.o \
+              $(BUILD_DIR)/intel_display.o \
+              $(BUILD_DIR)/drm_atomic.o \
+              $(BUILD_DIR)/i915_rps.o \
+              $(BUILD_DIR)/i915_guc.o \
+              $(BUILD_DIR)/intel_dpll_calc.o \
+              $(BUILD_DIR)/intel_dpll_icl.o \
+              $(BUILD_DIR)/intel_dpll_bxt.o \
+              $(BUILD_DIR)/intel_dpll_hsw.o \
+              $(BUILD_DIR)/intel_tc.o \
+              $(BUILD_DIR)/i915_ppgtt.o \
+              $(BUILD_DIR)/i915_lrc.o \
+              $(BUILD_DIR)/i915_renderstate_gen9.o \
+              $(BUILD_DIR)/i915_engine.o \
+              $(BUILD_DIR)/i915_execlists.o \
+              $(BUILD_DIR)/i915_request.o \
+              $(BUILD_DIR)/i915_gem_context.o \
+              $(BUILD_DIR)/i915_gem.o \
+              $(BUILD_DIR)/i915_gem_execbuf.o \
+              $(BUILD_DIR)/i915_query.o \
+              $(BUILD_DIR)/i915_ioctl.o \
+              $(BUILD_DIR)/firmware.o \
               $(BUILD_DIR)/vmw_drv.o \
               $(BUILD_DIR)/vmw_mob.o \
               $(BUILD_DIR)/vmw_dirty.o \
@@ -437,6 +493,15 @@ BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
 # The bootloader reads /boot/kernel.elf straight from the ext4 partition, so
 # the complete OS lives on one stick with no FAT data filesystem anywhere.
 EXT4_STAGING  = $(BUILD_DIR)/ext4_staging
+# Where the Intel graphics firmware blobs come from at image-build time: the
+# vendor firmware package as the build host has it installed (plain or
+# zstd-compressed files).  res/firmware/i915.list names what is wanted;
+# whatever is absent is skipped with a note, never an error.  Point this at
+# a directory of your own to build from an unpacked copy of the package.
+FIRMWARE_SRC ?= /lib/firmware/i915
+# Where the host keeps the firmware licence texts (the package documents them
+# separately from the blobs).
+FIRMWARE_LICENSE_DIR ?= $(firstword $(wildcard /usr/share/doc/*-firmware/licenses))
 EXT4_ROOT_IMG = $(BUILD_DIR)/ext4root.img
 EXT4_ESP_IMG  = $(BUILD_DIR)/ext4esp.img
 GPT_DISK      = $(BUILD_DIR)/likeos-ext4.img
@@ -467,7 +532,7 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup kdump drminfo \
-	gdb gdbserver
+	backlight gdb gdbserver
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
@@ -494,6 +559,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/gtk3/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
+	res/firmware/i915.list \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
 	host/gen-cursors.c \
 	user/bin/tests/apnews-urls.txt
@@ -623,6 +689,31 @@ $(BUILD_DIR)/drm_fence.o: $(KERNEL_DIR)/dev/gpu/drm/drm_fence.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/drm_kms.o: $(KERNEL_DIR)/dev/gpu/drm/drm_kms.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_atomic.o: $(KERNEL_DIR)/dev/gpu/drm/drm_atomic.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_syncobj.o: $(KERNEL_DIR)/dev/gpu/drm/drm_syncobj.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_edid.o: $(KERNEL_DIR)/dev/gpu/drm/drm_edid.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_edid_parse.o: $(KERNEL_DIR)/dev/gpu/drm/drm_edid_parse.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drm_modes.o: $(KERNEL_DIR)/dev/gpu/drm/drm_modes.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The Intel graphics driver (kernel/dev/gpu/i915): one rule per object.
+$(BUILD_DIR)/i915_%.o: $(KERNEL_DIR)/dev/gpu/i915/i915_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/intel_%.o: $(KERNEL_DIR)/dev/gpu/i915/display/intel_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/firmware.o: $(KERNEL_DIR)/ke/firmware.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vmw_drv.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_drv.c | $(BUILD_DIR)
@@ -1191,6 +1282,12 @@ $(BUILD_DIR)/codecheck: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/drminfo: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) drminfo
 	cp $(USER_DIR)/drminfo $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# backlight: the display backlight through /sys/class/backlight.
+$(BUILD_DIR)/backlight: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) backlight
+	cp $(USER_DIR)/backlight $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
@@ -2156,6 +2253,29 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
 	cp res/man/*.1           $(EXT4_STAGING)/usr/share/man/man1/
+	# Intel graphics firmware (see FIRMWARE_SRC above): only the blobs
+	# the list names, decompressed where the host keeps them compressed.
+	mkdir -p $(EXT4_STAGING)/lib/firmware/i915
+	@n=0; missing=0; \
+	for f in $$(grep -v '^#' res/firmware/i915.list | grep -v '^$$'); do \
+		if [ -f "$(FIRMWARE_SRC)/$$f" ]; then \
+			cp "$(FIRMWARE_SRC)/$$f" $(EXT4_STAGING)/lib/firmware/i915/$$f; n=$$((n+1)); \
+		elif [ -f "$(FIRMWARE_SRC)/$$f.zst" ]; then \
+			zstd -q -d -f "$(FIRMWARE_SRC)/$$f.zst" -o $(EXT4_STAGING)/lib/firmware/i915/$$f; n=$$((n+1)); \
+		else \
+			missing=$$((missing+1)); \
+		fi; \
+	done; \
+	for l in $(FIRMWARE_SRC)/../LICENSE.i915 $(FIRMWARE_SRC)/../LICENSE.i915.zst \
+		 $(FIRMWARE_LICENSE_DIR)/LICENSE.i915 $(FIRMWARE_LICENSE_DIR)/LICENSE.i915.gz; do \
+		[ -f "$$l" ] || continue; \
+		mkdir -p $(EXT4_STAGING)/usr/share/doc/firmware; \
+		case $$l in *.zst) zstd -q -d -f "$$l" -o $(EXT4_STAGING)/usr/share/doc/firmware/LICENSE.i915;; \
+			*.gz) gzip -c -d "$$l" > $(EXT4_STAGING)/usr/share/doc/firmware/LICENSE.i915;; \
+			*) cp "$$l" $(EXT4_STAGING)/usr/share/doc/firmware/LICENSE.i915;; esac; \
+		break; \
+	done; \
+	echo "firmware: $$n Intel graphics blobs staged, $$missing not found in $(FIRMWARE_SRC)"
 	# X cursor theme.
 	#
 	# Generated, not committed: the artwork is geometry, so it lives as the
@@ -2181,6 +2301,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# /bin/sh when the file is missing, whatever the password database says.
 	cp res/etc/shells        $(EXT4_STAGING)/etc/shells
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
+	# The time zone, as an Olson name.  /etc/profile exports it as $$TZ,
+	# which is the only way ICU (and so the browser's Date and Intl) can
+	# learn the zone on this system -- there is no zoneinfo tree here and
+	# libc's localtime() is UTC.  See the comment in res/etc/profile.
+	cp res/etc/timezone      $(EXT4_STAGING)/etc/timezone
 	# Media types.  Claws Mail reads this to set an attachment's
 	# Content-Type; without it every attachment is sent as
 	# application/octet-stream and the receiving client has to guess.
@@ -2299,6 +2424,13 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# is a no-op until the port has produced something: an image without
 	# GTK3 is a working image, one that half-contains it is not.
 	ports/xorg/gtk3/stage.sh $(EXT4_STAGING)
+	# A page that tests, from inside the browser, everything a web site
+	# needs from the engine: storage, cookies, crypto, the clock and the
+	# time zone, and which APIs this build leaves out.  Open
+	# file:///usr/share/likeos/webcheck.html in luakit when a site works
+	# elsewhere and not here -- the red lines are the reason.
+	mkdir -p $(EXT4_STAGING)/usr/share/likeos
+	cp res/xorg/webcheck.html $(EXT4_STAGING)/usr/share/likeos/webcheck.html
 	cp ports/openssl-3.5.6/apps/openssl.cnf $(EXT4_STAGING)/etc/ssl/openssl.cnf
 	cp res/etc/ssl/certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/certs/ca-certificates.crt
 	# ...and again under the name OpenSSL looks for on its own.
@@ -2851,6 +2983,24 @@ deps:
 	# dependency and nothing links against it; the port needs the program.
 	sudo apt install -y meson ninja-build libtool gperf xsltproc xfonts-utils \
 		bison flex cmake groff python3-pip shared-mime-info || true
+	# zstd unpacks the Intel graphics firmware blobs, which the vendor
+	# firmware package stores compressed, at image-build time.
+	sudo apt install -y zstd || true
+	# Mesa's Intel driver (iris) compiles its helper kernels at build
+	# time with mesa_clc and vtn_bindgen2, two programs the port builds
+	# natively (ports/xorg/build.sh, meson_host_opts mesa) against the
+	# HOST's LLVM and clang, with libclc and the SPIR-V tools.  Without
+	# these the port builds Mesa without iris and says so.
+	# The libclc RUNTIME (the .bc/.spv libraries under /usr/lib/clc) is a
+	# separate package from its -dev headers and the -dev does not pull it
+	# in; mesa_clc links the OpenCL builtins from it, so it is named here.
+	# The versioned names first: a release that ships only llvm-NN-dev
+	# has no unversioned llvm-dev/clang metapackages.
+	sudo apt install -y llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev \
+		libclc-18 libclc-18-dev spirv-tools libllvmspirvlib-18-dev \
+		python3-mako python3-yaml || \
+	sudo apt install -y llvm-dev clang libclang-dev libclc-dev spirv-tools \
+		libllvmspirvlib-dev python3-mako python3-yaml || true
 	# GTK3 port build tooling.  g++ builds the target's libstdc++ and the two
 	# C++ packages above it (HarfBuzz, Enchant); gettext supplies the HOST's
 	# msgfmt, which every package with translations runs at build time;

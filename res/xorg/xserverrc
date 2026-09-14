@@ -60,11 +60,26 @@
 # configuration has glamor switched off on purpose (see the comment there),
 # so the GPU is only ever used for the mode set and the scan-out.
 #
+# A third, xorg.conf.modesetting-i915, drives the Intel graphics driver with
+# glamor on: rendering on the GPU through the same node.  Which of the three
+# is asked of the driver, not guessed from the node: drminfo --driver names
+# it, and drminfo --has-display says whether it has lit a screen at all --
+# a driver that found its device but offers no connector yet (or a
+# render-only one) must not be handed the display server, which would fail
+# to find a screen and leave the framebuffer server never tried.
+#
 # Named relative, not as a path.  Xorg is setuid root (see below), and a
 # server with elevated privileges rejects an absolute -config argument
 # outright; a bare name is looked up in /etc/X11, which is where the file is.
-if [ -e /dev/dri/card0 ]; then
-	set -- -config xorg.conf.modesetting "$@"
+if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0; then
+	case "$(drminfo --driver /dev/dri/card0 2>/dev/null)" in
+	i915)
+		set -- -config xorg.conf.modesetting-i915 "$@"
+		;;
+	*)
+		set -- -config xorg.conf.modesetting "$@"
+		;;
+	esac
 fi
 
 exec /usr/bin/Xorg -noreset -nolisten tcp "$@"

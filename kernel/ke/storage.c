@@ -8,6 +8,9 @@
 #include <kernel/io/sysfont.h>
 #include <kernel/io/cursor.h>
 #include <kernel/dev/input/mouse.h>
+/* Display drivers finish their bring-up once there is a filesystem to
+ * read firmware from and a scheduler to give them a thread. */
+void drm_late_init(void);
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/dcache.h>
 #include <kernel/fs/icache.h>
@@ -105,6 +108,7 @@ void storage_fs_poll(storage_fs_state_t *state)
 				if (cursor_load("/res/left_ptr") == 0) {
 					mouse_apply_cursor();
 				}
+				drm_late_init();
 			} else {
 				kprintf("EXT4: signature not found on %s\n",
 					bdev->name);
@@ -140,6 +144,7 @@ void storage_fs_poll(storage_fs_state_t *state)
 				if (cursor_load("/res/left_ptr") == 0) {
 					mouse_apply_cursor();
 				}
+				drm_late_init();
 
 				userinit_redisplay_prompt(); // Redisplay prompt after mount messages
 			} else {

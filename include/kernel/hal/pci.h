@@ -35,6 +35,46 @@ void pci_cfg_write32(unsigned char bus, unsigned char dev, unsigned char func,
 void pci_enable_busmaster_mem(const pci_device_t *dev);
 void pci_assign_unassigned_bars(void);
 
+/* Narrow config accesses, built on the dword ones: a read-modify-write of
+ * the containing dword under the same lock, so a driver that needs to
+ * poke one byte (a capability's control word, the VGA decode enable) does
+ * not clobber its neighbours. */
+uint8_t pci_cfg_read8(const pci_device_t *dev, unsigned char off);
+uint16_t pci_cfg_read16(const pci_device_t *dev, unsigned char off);
+uint32_t pci_cfg_read32_dev(const pci_device_t *dev, unsigned char off);
+void pci_cfg_write8(const pci_device_t *dev, unsigned char off, uint8_t v);
+void pci_cfg_write16(const pci_device_t *dev, unsigned char off, uint16_t v);
+void pci_cfg_write32_dev(const pci_device_t *dev, unsigned char off,
+			 uint32_t v);
+
+/* A decoded base address register.
+ *
+ * The raw dwords in pci_device_t.bar[] carry the type bits and, for a
+ * 64-bit memory BAR, only the low half; nothing there says how large the
+ * window is.  This reads the pair, sizes the window the standard way
+ * (all-ones written and read back with decoding paused, the original
+ * restored) and hands back one description.  `index' is the BAR number
+ * 0-5; a 64-bit BAR consumes index+1 as well, and asking for that upper
+ * half returns -EINVAL.  Returns 0 when the BAR is implemented, -ENOENT
+ * when it is not. */
+#define PCI_BAR_IO 0x01
+#define PCI_BAR_MEM64 0x02
+#define PCI_BAR_PREFETCH 0x04
+struct pci_bar {
+	uint64_t base;
+	uint64_t size;
+	uint32_t flags; /* PCI_BAR_* */
+};
+int pci_bar_decode(const pci_device_t *dev, int index, struct pci_bar *out);
+
+/* The expansion ROM register (0x30): base and size when one is present
+ * (the enable bit is left as found), -ENOENT otherwise. */
+int pci_rom_decode(const pci_device_t *dev, struct pci_bar *out);
+
+/* The device on `bus' at `device'.`function', or NULL. */
+const pci_device_t *pci_find_bdf(unsigned char bus, unsigned char device,
+				 unsigned char function);
+
 // PCI Capability IDs
 #define PCI_CAP_MSI 0x05
 #define PCI_CAP_MSIX 0x11

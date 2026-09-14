@@ -446,6 +446,7 @@ typedef struct k_sysinfo {
 #define F_GETFL 3
 #define F_SETFL 4
 #define F_DUPFD_CLOEXEC 1030
+#define F_DUPFD_QUERY 1027 /* 1 if arg names the same open file description */
 /* POSIX advisory record locking (see kernel/fs/frlock.c). */
 #define F_GETLK 5
 #define F_SETLK 6
@@ -543,6 +544,8 @@ typedef struct k_flock {
 #define EEXIST 17 // File exists
 #define EXDEV 18 // Cross-device link
 #define EISDIR 21 // Is a directory
+#define EFBIG 27 // File too large
+#define ENXIO 6 // No such device or address
 #define ENOSPC 28 // No space left on device
 #define EROFS 30 // Read-only file system
 #define ENAMETOOLONG 36 // File name too long
@@ -551,6 +554,7 @@ typedef struct k_flock {
 #define ENOSYS 38 // Function not implemented
 #define ENOTEMPTY 39 // Directory not empty
 #define ENODATA 61 // No data available (xattr: no such attribute)
+#define ETIME 62 // Timer expired
 #define ETIMEDOUT 110 // Connection timed out
 #define ENOTSOCK 88 // Socket operation on non-socket
 #define EDESTADDRREQ 89 // Destination address required

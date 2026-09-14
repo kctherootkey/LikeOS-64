@@ -374,7 +374,7 @@ static inline void lpss_write(i2c_dw_controller_t *ctrl, uint32_t reg,
 	*(volatile uint32_t *)((uint8_t *)ctrl->base + reg) = val;
 }
 
-static uint16_t pci_cfg_read16(uint8_t bus, uint8_t device, uint8_t function,
+static uint16_t i2c_hid_pci_read16(uint8_t bus, uint8_t device, uint8_t function,
 			       uint8_t off)
 {
 	uint32_t value = pci_cfg_read32(bus, device, function, off & 0xFC);
@@ -382,7 +382,7 @@ static uint16_t pci_cfg_read16(uint8_t bus, uint8_t device, uint8_t function,
 	return (uint16_t)((value >> shift) & 0xFFFF);
 }
 
-static void pci_cfg_write16(uint8_t bus, uint8_t device, uint8_t function,
+static void i2c_hid_pci_write16(uint8_t bus, uint8_t device, uint8_t function,
 			    uint8_t off, uint16_t value)
 {
 	uint8_t aligned = off & 0xFC;
@@ -486,7 +486,7 @@ static uint16_t ecam_read16(uint8_t bus, uint8_t dev, uint8_t func,
 		if (p)
 			return *p;
 	}
-	return pci_cfg_read16(bus, dev, func, (uint8_t)off);
+	return i2c_hid_pci_read16(bus, dev, func, (uint8_t)off);
 }
 
 static void ecam_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off,
@@ -500,7 +500,7 @@ static void ecam_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off,
 			return;
 		}
 	}
-	pci_cfg_write16(bus, dev, func, (uint8_t)off, val);
+	i2c_hid_pci_write16(bus, dev, func, (uint8_t)off, val);
 }
 
 // ============================================================================

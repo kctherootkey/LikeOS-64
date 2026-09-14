@@ -128,6 +128,12 @@ void gdt_install_tss(void);
 
 // Exception handlers
 void exception_handler(uint64_t *regs);
+
+/* Crash report for a process raising a core-dumping signal on itself
+ * (abort()); called from sys_kill in the sender's syscall. */
+struct task;
+void report_userspace_self_signal(struct task *sender, int signum,
+				  const char *signame);
 void kernel_oops(const char *reason, uint64_t *regs);
 __attribute__((noreturn, format(printf, 1, 2))) void panic(const char *fmt,
 							   ...);

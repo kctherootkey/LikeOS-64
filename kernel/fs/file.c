@@ -61,6 +61,18 @@ int fd_install_from(task_t *task, vfs_file_t *file, int from)
 		}
 	}
 	fds_unlock(task, flags);
+	if (ret == -EMFILE) {
+		/* Said a few times per boot: a process at the limit fails in
+		 * ways that name nothing -- a descriptor passed over a socket
+		 * is dropped, a device handle cannot be exported -- and the
+		 * program that then gives up rarely says why. */
+		static int said;
+		if (said < 8) {
+			said++;
+			kprintf("process %d (%s) has no free file descriptor: all %d in use\n",
+				(int)task->tgid, task->comm, TASK_MAX_FDS);
+		}
+	}
 	return ret;
 }
 
@@ -516,6 +528,29 @@ int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	 * A shell saves a standard descriptor this way (fcntl(1, F_DUPFD, 10))
 	 * before pointing it somewhere else for a builtin, so without this
 	 * every redirection in the current shell fails. */
+	/* F_DUPFD_QUERY: do the two descriptors name the same open file
+	 * description (one made from the other by dup)?  The graphics
+	 * library asks this of the device descriptors it is handed, to
+	 * share one screen between them; without an answer it assumes
+	 * they differ and opens the device again for each. */
+	if (cmd == F_DUPFD_QUERY) {
+		if ((int64_t)arg < 0 || arg >= TASK_MAX_FDS) {
+			ret = -EBADF;
+			goto out;
+		}
+		int a_open = task_fds(cur)[fd] || task_fd_is_console(cur, fd);
+		int b_open = task_fds(cur)[arg] || task_fd_is_console(cur, arg);
+		if (!a_open || !b_open) {
+			ret = -EBADF;
+			goto out;
+		}
+		if (fd == arg)
+			ret = 1;
+		else
+			ret = (task_fds(cur)[fd] && task_fds(cur)[fd] == task_fds(cur)[arg]) ? 1 : 0;
+		goto out;
+	}
+
 	if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
 		if ((int64_t)arg < 0 || arg >= TASK_MAX_FDS) {
 			ret = -EINVAL;

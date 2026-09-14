@@ -1100,6 +1100,20 @@ int mkfifo(const char *path, mode_t mode)
 	return mknod(path, (mode & 07777) | S_IFIFO, 0);
 }
 
+/* The directory-relative forms answer exactly as the plain ones: the
+ * kernel has no device or FIFO nodes to make on a filesystem, so every
+ * variant reports ENOSYS. */
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev)
+{
+	(void)dirfd;
+	return mknod(path, mode, dev);
+}
+
+int mkfifoat(int dirfd, const char *path, mode_t mode)
+{
+	return mknodat(dirfd, path, (mode & 07777) | S_IFIFO, 0);
+}
+
 int link(const char *oldpath, const char *newpath)
 {
 	long ret = syscall2(SYS_LINK, (long)oldpath, (long)newpath);

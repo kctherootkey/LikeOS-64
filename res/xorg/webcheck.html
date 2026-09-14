@@ -1,0 +1,150 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LikeOS web engine check</title>
+<style>
+body{font:14px monospace;margin:1em;background:#111;color:#ddd}
+h1{font-size:16px}
+.ok{color:#5f5}.bad{color:#f66;font-weight:bold}.warn{color:#fd5}
+td{padding:1px 10px 1px 0;vertical-align:top}
+td:first-child{color:#8af}
+</style>
+<h1>LikeOS web engine check</h1>
+<p>Every line a site depends on. Anything in <span class="bad">red</span> is a
+reason a page can fail on this machine and work elsewhere.</p>
+<table id="t"></table>
+<script>
+var T = document.getElementById('t');
+function row(name, state, text) {
+  var tr = T.insertRow(-1);
+  tr.insertCell(-1).textContent = name;
+  var c = tr.insertCell(-1);
+  c.className = state;
+  c.textContent = text;
+}
+function ok(n, t) { row(n, 'ok', 'ok   ' + (t || '')); }
+function bad(n, t) { row(n, 'bad', 'FAIL ' + (t || '')); }
+function info(n, t) { row(n, '', t); }
+
+/* --- what the page is told it is ------------------------------------- */
+info('userAgent', navigator.userAgent);
+info('platform', navigator.platform);
+info('languages', JSON.stringify(navigator.languages));
+info('cores', String(navigator.hardwareConcurrency));
+
+/* --- the clock -------------------------------------------------------- */
+var d = new Date();
+info('Date.now()', d.toString());
+var off = -d.getTimezoneOffset();
+var tz = 'unknown';
+try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+if (off === 0 && (tz === 'UTC' || tz === 'Etc/Unknown')) {
+  row('timezone', 'warn', 'UTC+0 (' + tz + ') -- no TZ set: date pickers and ' +
+      '"today" comparisons run on the wrong clock');
+} else {
+  ok('timezone', tz + ' (UTC' + (off < 0 ? '' : '+') + (off / 60) + ')');
+}
+
+/* --- storage: what most logins actually need -------------------------- */
+try {
+  localStorage.setItem('likeos-probe', '1');
+  if (localStorage.getItem('likeos-probe') !== '1') throw new Error('read back wrong');
+  localStorage.removeItem('likeos-probe');
+  ok('localStorage');
+} catch (e) { bad('localStorage', e.name + ': ' + e.message); }
+
+try {
+  sessionStorage.setItem('likeos-probe', '1');
+  sessionStorage.removeItem('likeos-probe');
+  ok('sessionStorage');
+} catch (e) { bad('sessionStorage', e.name + ': ' + e.message); }
+
+document.cookie = 'likeosprobe=1; path=/; SameSite=Lax';
+if (document.cookie.indexOf('likeosprobe=1') >= 0) ok('cookies');
+else bad('cookies', 'document.cookie did not keep the value');
+
+if (!window.indexedDB) {
+  bad('indexedDB', 'the API is missing entirely');
+} else {
+  var req;
+  try { req = indexedDB.open('likeos-probe', 1); }
+  catch (e) { bad('indexedDB', 'open() threw ' + e.name + ': ' + e.message); req = null; }
+  if (req) {
+    var settled = false;
+    setTimeout(function () {
+      if (!settled) bad('indexedDB', 'open() never completed (no event in 8 s)');
+      settled = true;
+    }, 8000);
+    req.onupgradeneeded = function (e) { e.target.result.createObjectStore('s'); };
+    req.onerror = function () {
+      settled = true;
+      bad('indexedDB', 'open() failed: ' + (req.error ? req.error.name + ': ' + req.error.message : '?'));
+    };
+    req.onsuccess = function () {
+      var db = req.result;
+      try {
+        var tx = db.transaction('s', 'readwrite');
+        tx.objectStore('s').put('x', 'k');
+        tx.oncomplete = function () { settled = true; ok('indexedDB', 'open, write and commit'); db.close(); };
+        tx.onerror = function () { settled = true; bad('indexedDB', 'write failed: ' + (tx.error ? tx.error.message : '?')); };
+        tx.onabort = function () { settled = true; bad('indexedDB', 'write aborted: ' + (tx.error ? tx.error.message : '?')); };
+      } catch (e) { settled = true; bad('indexedDB', 'transaction threw ' + e.name + ': ' + e.message); }
+    };
+  }
+}
+
+/* --- crypto: logins and QR pairing use it ----------------------------- */
+if (!window.crypto || !crypto.getRandomValues) bad('crypto.getRandomValues', 'missing');
+else { var a = new Uint8Array(8); crypto.getRandomValues(a); ok('crypto.getRandomValues'); }
+if (!window.crypto || !crypto.subtle) {
+  bad('crypto.subtle', 'missing -- WhatsApp, PayPal and every passkey flow need it');
+} else {
+  crypto.subtle.digest('SHA-256', new Uint8Array([1, 2, 3])).then(function () {
+    ok('crypto.subtle', 'digest');
+    return crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  }).then(function () { ok('crypto.subtle', 'ECDH key generation'); })
+    .catch(function (e) { bad('crypto.subtle', e.name + ': ' + e.message); });
+}
+
+/* --- transports ------------------------------------------------------- */
+if (!window.WebSocket) bad('WebSocket', 'missing');
+else ok('WebSocket', 'constructor present (connection not tested here)');
+if (!window.fetch) bad('fetch', 'missing'); else ok('fetch');
+if (!window.caches) row('CacheStorage', 'warn', 'missing');
+else ok('CacheStorage');
+if (!navigator.serviceWorker) row('serviceWorker', 'warn', 'missing');
+else ok('serviceWorker');
+
+/* --- APIs this build leaves out, which sites probe for ---------------- */
+var absent = [];
+['AudioContext', 'OfflineAudioContext', 'HTMLMediaElement', 'HTMLVideoElement',
+ 'Audio', 'MediaSource', 'MediaRecorder', 'MediaStream', 'VideoDecoder',
+ 'Gamepad', 'RTCPeerConnection', 'PublicKeyCredential', 'MediaKeys',
+ 'speechSynthesis', 'OffscreenCanvas', 'Notification', 'ResizeObserver',
+ 'IntersectionObserver', 'BroadcastChannel', 'structuredClone',
+ 'ReportingObserver', 'WebAssembly'].forEach(function (n) {
+  if (!(n in window)) absent.push(n);
+});
+['mediaDevices', 'getGamepads', 'mediaSession', 'mediaCapabilities', 'permissions',
+ 'clipboard', 'webdriver', 'plugins', 'sendBeacon', 'locks'].forEach(function (n) {
+  if (!(n in navigator)) absent.push('navigator.' + n);
+});
+row('missing APIs', absent.length ? 'warn' : 'ok',
+    absent.length ? absent.join(', ') : 'none of the probed set');
+
+/* --- JavaScript itself ------------------------------------------------ */
+try {
+  /* the things a modern site bundle is compiled down to */
+  eval('(async()=>{})');
+  eval('({...{a:1}})');
+  eval('(class X { #p = 1; get p(){ return this.#p; } })');
+  eval('"x".replaceAll("x","y")');
+  eval('[1].at(0)');
+  eval('(/(?<y>\\d)/u).exec("1").groups.y');
+  ok('JS syntax', 'async, spread, private fields, replaceAll, at, named groups');
+} catch (e) { bad('JS syntax', e.name + ': ' + e.message); }
+try {
+  var n = new Intl.NumberFormat('de-DE').format(1234.5);
+  var dd = new Intl.DateTimeFormat('de-DE', { dateStyle: 'long' }).format(new Date(0));
+  ok('Intl', n + '  /  ' + dd);
+} catch (e) { bad('Intl', e.name + ': ' + e.message); }
+</script>

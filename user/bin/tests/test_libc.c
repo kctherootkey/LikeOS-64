@@ -25,9 +25,11 @@
 #include <locale.h>
 #include <langinfo.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <spawn.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <drm/i915_drm.h>
 #include <dlfcn.h>
 #include <link.h>
 #include <semaphore.h>
@@ -1244,6 +1246,417 @@ static void test_dev_nodes(void)
 		    stat("/dev/input", &st) == 0 && S_ISDIR(st.st_mode));
 	test_result("stat(/dev/fb0) is a char device",
 		    stat("/dev/fb0", &st) == 0 && S_ISCHR(st.st_mode));
+}
+
+// ============================================================================
+// pipe2 flags and prctl thread names -- what a renderer's thread pools and
+// pipe loaders rely on
+// ============================================================================
+static void test_pipe2_prctl(void)
+{
+	int p[2];
+	int fl;
+
+	printf("\n--- pipe2 / prctl ---\n");
+
+	test_result("pipe2(O_CLOEXEC|O_NONBLOCK)",
+		    pipe2(p, O_CLOEXEC | O_NONBLOCK) == 0);
+	fl = fcntl(p[0], F_GETFD);
+	test_result("pipe2: read end has FD_CLOEXEC", fl >= 0 && (fl & FD_CLOEXEC));
+	fl = fcntl(p[1], F_GETFD);
+	test_result("pipe2: write end has FD_CLOEXEC", fl >= 0 && (fl & FD_CLOEXEC));
+	fl = fcntl(p[0], F_GETFL);
+	test_result("pipe2: read end is O_NONBLOCK", fl >= 0 && (fl & O_NONBLOCK));
+	{
+		char c;
+		errno = 0;
+		test_result("pipe2: empty non-blocking read gives EAGAIN",
+			    read(p[0], &c, 1) == -1 && errno == EAGAIN);
+		test_result("pipe2: write then read round trip",
+			    write(p[1], "x", 1) == 1 && read(p[0], &c, 1) == 1 &&
+				    c == 'x');
+	}
+	close(p[0]);
+	close(p[1]);
+
+	test_result("pipe2(0) plain", pipe2(p, 0) == 0);
+	fl = fcntl(p[0], F_GETFD);
+	test_result("pipe2(0): no FD_CLOEXEC", fl >= 0 && !(fl & FD_CLOEXEC));
+	close(p[0]);
+	close(p[1]);
+
+	{
+		char name[17];
+		memset(name, 0, sizeof(name));
+		test_result("prctl(PR_SET_NAME)",
+			    prctl(PR_SET_NAME, "libc-test-thr") == 0);
+		test_result("prctl(PR_GET_NAME) reads it back",
+			    prctl(PR_GET_NAME, name) == 0 &&
+				    strcmp(name, "libc-test-thr") == 0);
+		/* Names are truncated to 15 characters plus the terminator. */
+		test_result("prctl(PR_SET_NAME) long name",
+			    prctl(PR_SET_NAME, "0123456789abcdefXYZ") == 0);
+		memset(name, 0, sizeof(name));
+		test_result("prctl(PR_GET_NAME) truncated to 15",
+			    prctl(PR_GET_NAME, name) == 0 &&
+				    strcmp(name, "0123456789abcde") == 0);
+		prctl(PR_SET_NAME, "test_libc");
+	}
+}
+
+// ============================================================================
+// The display-manager render node with the Intel driver: what a renderer
+// does first.  Skipped (not failed) on machines whose driver is not i915.
+// ============================================================================
+/* A device mapping torn down on one processor must be gone from the
+ * translation caches of the others.  The other thread pins itself to a
+ * second processor, reads the page once (so that processor translates
+ * it), then spins in user mode -- nothing else loads another address
+ * space there, so the translation stays cached -- until told to write.
+ * By then the address is mapped to a different object; the write must
+ * land in that one. */
+static volatile uint32_t *g_tlb_va;
+static volatile int g_tlb_phase;
+static volatile int g_tlb_round;
+static volatile int g_tlb_pinned;
+
+static void *tlb_other_cpu(void *arg)
+{
+	cpu_set_t one;
+	(void)arg;
+	CPU_ZERO(&one);
+	CPU_SET(1, &one);
+	g_tlb_pinned = sched_setaffinity(0, sizeof(one), &one) == 0;
+	volatile uint32_t sink = g_tlb_va[0];
+	(void)sink;
+	__atomic_store_n(&g_tlb_phase, 2, __ATOMIC_SEQ_CST);
+	while (__atomic_load_n(&g_tlb_phase, __ATOMIC_SEQ_CST) != 3)
+		;
+	g_tlb_va[0] = 0x5A000000u | (uint32_t)g_tlb_round;
+	return NULL;
+}
+
+static uint32_t gem_pread_word(int fd, uint32_t handle, uint32_t off)
+{
+	struct drm_i915_gem_pread pr;
+	uint32_t v = 0xFFFFFFFFu;
+	memset(&pr, 0, sizeof(pr));
+	pr.handle = handle;
+	pr.offset = off;
+	pr.size = 4;
+	pr.data_ptr = (uint64_t)(uintptr_t)&v;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) != 0)
+		return 0xFFFFFFFFu;
+	return v;
+}
+
+static void test_drm_i915_unmap_other_cpu(int fd)
+{
+	struct drm_i915_gem_create ca, cb;
+	struct drm_i915_gem_mmap_offset ma, mb;
+	cpu_set_t zero;
+	int stale = 0, rounds = 0, same_cpu = 0;
+
+	memset(&ca, 0, sizeof(ca));
+	ca.size = 4096;
+	memset(&cb, 0, sizeof(cb));
+	cb.size = 4096;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &ca) != 0 ||
+	    ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &cb) != 0) {
+		printf("  (no objects for the cross-processor unmap test)\n");
+		return;
+	}
+	memset(&ma, 0, sizeof(ma));
+	ma.handle = ca.handle;
+	ma.flags = I915_MMAP_OFFSET_WB;
+	memset(&mb, 0, sizeof(mb));
+	mb.handle = cb.handle;
+	mb.flags = I915_MMAP_OFFSET_WB;
+	CPU_ZERO(&zero);
+	CPU_SET(0, &zero);
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &ma) != 0 ||
+	    ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &mb) != 0 ||
+	    sched_setaffinity(0, sizeof(zero), &zero) != 0) {
+		printf("  (no mapping offsets or affinity: cross-processor unmap test skipped)\n");
+		goto out;
+	}
+	for (int round = 0; round < 8; round++) {
+		pthread_t th;
+		uint32_t *va = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+				    (off_t)ma.offset);
+		if (va == MAP_FAILED)
+			break;
+		va[0] = 0x0A000000u | (uint32_t)round;
+		g_tlb_va = va;
+		g_tlb_round = round;
+		__atomic_store_n(&g_tlb_phase, 1, __ATOMIC_SEQ_CST);
+		if (pthread_create(&th, NULL, tlb_other_cpu, NULL) != 0) {
+			munmap(va, 4096);
+			break;
+		}
+		while (__atomic_load_n(&g_tlb_phase, __ATOMIC_SEQ_CST) != 2)
+			;
+		/* the object under the address changes */
+		if (mmap(va, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+			 (off_t)mb.offset) != (void *)va) {
+			__atomic_store_n(&g_tlb_phase, 3, __ATOMIC_SEQ_CST);
+			pthread_join(th, NULL);
+			munmap(va, 4096);
+			break;
+		}
+		va[0] = 0x0B000000u | (uint32_t)round;
+		__atomic_store_n(&g_tlb_phase, 3, __ATOMIC_SEQ_CST);
+		pthread_join(th, NULL);
+		if (!g_tlb_pinned)
+			same_cpu++;
+		uint32_t a = gem_pread_word(fd, ca.handle, 0);
+		uint32_t b = gem_pread_word(fd, cb.handle, 0);
+		if (a == (0x5A000000u | (uint32_t)round))
+			stale++;
+		else if (b != (0x5A000000u | (uint32_t)round))
+			printf("  round %d: the write landed nowhere expected (A %08x, B %08x)\n",
+			       round, a, b);
+		rounds++;
+		munmap(va, 4096);
+	}
+	if (same_cpu == rounds)
+		printf("  (only one processor: the cross-processor unmap test says nothing)\n");
+	test_result("i915 unmapping a device mapping invalidates other processors",
+		    rounds > 0 && stale == 0);
+	if (stale)
+		printf("  (%d of %d rounds: the other processor wrote through the old translation)\n",
+		       stale, rounds);
+out:
+	{
+		struct drm_gem_close gc;
+		memset(&gc, 0, sizeof(gc));
+		gc.handle = ca.handle;
+		ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+		gc.handle = cb.handle;
+		ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+	}
+}
+
+static void test_drm_i915(void)
+{
+	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	struct drm_version v;
+	char name[16];
+
+	printf("\n--- Intel graphics (i915) render node ---\n");
+	if (fd < 0) {
+		printf("  (no /dev/dri/renderD128: skipped)\n");
+		return;
+	}
+	memset(&v, 0, sizeof(v));
+	memset(name, 0, sizeof(name));
+	v.name = name;
+	v.name_len = sizeof(name) - 1;
+	if (ioctl(fd, DRM_IOCTL_VERSION, &v) != 0 || strcmp(name, "i915") != 0) {
+		printf("  (driver is '%s', not i915: skipped)\n", name);
+		close(fd);
+		return;
+	}
+	/* parameters */
+	int chipset = 0;
+	struct drm_i915_getparam gp = { .param = I915_PARAM_CHIPSET_ID, .value = &chipset };
+	test_result("i915 GETPARAM chipset id", ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0 && chipset != 0);
+	int softpin = 0;
+	gp.param = I915_PARAM_HAS_EXEC_SOFTPIN;
+	gp.value = &softpin;
+	test_result("i915 GETPARAM softpin", ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0 && softpin == 1);
+	gp.param = 9999;
+	test_result("i915 GETPARAM unknown -> EINVAL", ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) == -1 && errno == EINVAL);
+
+	/* an object, mapped write-back and write-combining */
+	struct drm_i915_gem_create c;
+	memset(&c, 0, sizeof(c));
+	c.size = 4096 * 3 + 1;
+	test_result("i915 GEM_CREATE", ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &c) == 0 && c.handle != 0);
+	test_result("i915 GEM_CREATE rounds the size", c.size == 4096 * 4);
+	struct drm_i915_gem_mmap_offset mo;
+	memset(&mo, 0, sizeof(mo));
+	mo.handle = c.handle;
+	mo.flags = I915_MMAP_OFFSET_WB;
+	test_result("i915 MMAP_OFFSET WB", ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &mo) == 0 && mo.offset != 0);
+	uint32_t *p = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)mo.offset);
+	test_result("i915 object mmap", p != MAP_FAILED);
+	if (p != MAP_FAILED) {
+		p[0] = 0xdeadbeef;
+		p[4095] = 0x11223344;
+		test_result("i915 object mmap read back", p[0] == 0xdeadbeef && p[4095] == 0x11223344);
+		/* the same pages through pread */
+		struct drm_i915_gem_pread pr;
+		uint32_t back = 0;
+		memset(&pr, 0, sizeof(pr));
+		pr.handle = c.handle;
+		pr.offset = 4095 * 4;
+		pr.size = 4;
+		pr.data_ptr = (uint64_t)(uintptr_t)&back;
+		test_result("i915 GEM_PREAD sees the mapping's write",
+			    ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) == 0 && back == 0x11223344);
+		munmap(p, 16384);
+	}
+	struct drm_i915_gem_mmap_offset mo2;
+	memset(&mo2, 0, sizeof(mo2));
+	mo2.handle = c.handle;
+	mo2.flags = I915_MMAP_OFFSET_WC;
+	test_result("i915 MMAP_OFFSET WC differs from WB",
+		    ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &mo2) == 0 && mo2.offset != mo.offset);
+	test_drm_i915_unmap_other_cpu(fd);
+	struct drm_i915_gem_set_domain sd = { .handle = c.handle, .read_domains = I915_GEM_DOMAIN_CPU, .write_domain = I915_GEM_DOMAIN_CPU };
+	test_result("i915 SET_DOMAIN", ioctl(fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &sd) == 0);
+	struct drm_i915_gem_busy busy = { .handle = c.handle };
+	test_result("i915 BUSY idle object", ioctl(fd, DRM_IOCTL_I915_GEM_BUSY, &busy) == 0 && busy.busy == 0);
+	struct drm_i915_gem_wait w = { .bo_handle = c.handle, .timeout_ns = 1000000 };
+	test_result("i915 WAIT idle object", ioctl(fd, DRM_IOCTL_I915_GEM_WAIT, &w) == 0);
+
+	/* contexts and address spaces */
+	struct drm_i915_gem_context_create cc;
+	memset(&cc, 0, sizeof(cc));
+	int have_ctx = ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_CREATE, &cc) == 0;
+	test_result("i915 CONTEXT_CREATE", have_ctx && cc.ctx_id != 0);
+	if (have_ctx) {
+		struct drm_i915_gem_context_param cp;
+		memset(&cp, 0, sizeof(cp));
+		cp.ctx_id = cc.ctx_id;
+		cp.param = I915_CONTEXT_PARAM_GTT_SIZE;
+		test_result("i915 CONTEXT_GETPARAM GTT_SIZE is 48-bit",
+			    ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_GETPARAM, &cp) == 0 &&
+				    cp.value == (1ULL << 48));
+		cp.param = I915_CONTEXT_PARAM_PRIORITY;
+		cp.value = 500;
+		test_result("i915 CONTEXT_SETPARAM priority", ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_SETPARAM, &cp) == 0);
+		cp.value = 0;
+		test_result("i915 CONTEXT_GETPARAM priority reads back",
+			    ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_GETPARAM, &cp) == 0 && (int64_t)cp.value == 500);
+		/* an empty batch: MI_BATCH_BUFFER_END, softpinned, with an out fence */
+		struct drm_i915_gem_create bc;
+		memset(&bc, 0, sizeof(bc));
+		bc.size = 4096;
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &bc) == 0) {
+			struct drm_i915_gem_mmap_offset bm;
+			memset(&bm, 0, sizeof(bm));
+			bm.handle = bc.handle;
+			bm.flags = I915_MMAP_OFFSET_WB;
+			uint32_t *b = MAP_FAILED;
+			if (ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &bm) == 0)
+				b = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)bm.offset);
+			if (b != MAP_FAILED) {
+				b[0] = (0x0a << 23); /* MI_BATCH_BUFFER_END */
+				b[1] = 0;
+				munmap(b, 4096);
+				struct drm_i915_gem_set_domain bsd = { .handle = bc.handle, .read_domains = I915_GEM_DOMAIN_CPU, .write_domain = I915_GEM_DOMAIN_CPU };
+				ioctl(fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &bsd);
+				struct drm_i915_gem_exec_object2 obj;
+				memset(&obj, 0, sizeof(obj));
+				obj.handle = bc.handle;
+				obj.offset = 0x10000000;
+				obj.flags = EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+				struct drm_i915_gem_execbuffer2 eb;
+				memset(&eb, 0, sizeof(eb));
+				eb.buffers_ptr = (uint64_t)(uintptr_t)&obj;
+				eb.buffer_count = 1;
+				eb.batch_len = 8;
+				eb.flags = I915_EXEC_RENDER | I915_EXEC_NO_RELOC | I915_EXEC_HANDLE_LUT |
+					   I915_EXEC_BATCH_FIRST | I915_EXEC_FENCE_OUT;
+				eb.rsvd1 = cc.ctx_id;
+				int erc = ioctl(fd, DRM_IOCTL_I915_GEM_EXECBUFFER2_WR, &eb);
+				test_result("i915 EXECBUFFER2 empty batch", erc == 0);
+				if (erc == 0) {
+					int ofd = (int)(eb.rsvd2 >> 32);
+					test_result("i915 out fence fd", ofd >= 0);
+					if (ofd >= 0) {
+						struct pollfd pfd = { .fd = ofd, .events = POLLIN };
+						int prc = poll(&pfd, 1, 2000);
+						test_result("i915 out fence signals within 2 s", prc == 1);
+						close(ofd);
+					}
+					struct drm_i915_gem_wait bw = { .bo_handle = bc.handle, .timeout_ns = 2000000000LL };
+					test_result("i915 WAIT on the batch object", ioctl(fd, DRM_IOCTL_I915_GEM_WAIT, &bw) == 0);
+				}
+			}
+			struct drm_gem_close gcb = { .handle = bc.handle };
+			ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gcb);
+		}
+		struct drm_i915_gem_context_destroy cd = { .ctx_id = cc.ctx_id };
+		test_result("i915 CONTEXT_DESTROY", ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_DESTROY, &cd) == 0);
+		test_result("i915 CONTEXT_DESTROY twice -> ENOENT",
+			    ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_DESTROY, &cd) == -1 && errno == ENOENT);
+	}
+	struct drm_i915_gem_vm_control vm;
+	memset(&vm, 0, sizeof(vm));
+	test_result("i915 VM_CREATE", ioctl(fd, DRM_IOCTL_I915_GEM_VM_CREATE, &vm) == 0 && vm.vm_id != 0);
+	test_result("i915 VM_DESTROY", ioctl(fd, DRM_IOCTL_I915_GEM_VM_DESTROY, &vm) == 0);
+	/* an object over the process's own pages */
+	{
+		void *mem = NULL;
+		if (posix_memalign(&mem, 4096, 8192) == 0 && mem) {
+			memset(mem, 0x5a, 8192);
+			struct drm_i915_gem_userptr up;
+			memset(&up, 0, sizeof(up));
+			up.user_ptr = (uint64_t)(uintptr_t)mem;
+			up.user_size = 8192;
+			int urc = ioctl(fd, DRM_IOCTL_I915_GEM_USERPTR, &up);
+			test_result("i915 USERPTR over 2 pages", urc == 0 && up.handle != 0);
+			if (urc == 0) {
+				struct drm_i915_gem_pread upr;
+				uint32_t word = 0;
+				memset(&upr, 0, sizeof(upr));
+				upr.handle = up.handle;
+				upr.offset = 4096 + 16;
+				upr.size = 4;
+				upr.data_ptr = (uint64_t)(uintptr_t)&word;
+				test_result("i915 USERPTR pread sees the memory",
+					    ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &upr) == 0 && word == 0x5a5a5a5a);
+				struct drm_gem_close ugc = { .handle = up.handle };
+				test_result("i915 USERPTR close", ioctl(fd, DRM_IOCTL_GEM_CLOSE, &ugc) == 0);
+				/* the memory is still the process's */
+				test_result("i915 USERPTR memory intact", ((uint8_t *)mem)[4100] == 0x5a);
+			}
+			up.user_ptr += 1; /* unaligned */
+			test_result("i915 USERPTR unaligned -> EINVAL",
+				    ioctl(fd, DRM_IOCTL_I915_GEM_USERPTR, &up) == -1 && errno == EINVAL);
+			free(mem);
+		}
+	}
+	/* syncobjs */
+	struct drm_syncobj_create sc;
+	memset(&sc, 0, sizeof(sc));
+	sc.flags = DRM_SYNCOBJ_CREATE_SIGNALED;
+	test_result("syncobj create (signalled)", ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &sc) == 0 && sc.handle != 0);
+	if (sc.handle) {
+		uint32_t h = sc.handle;
+		struct drm_syncobj_wait sw;
+		memset(&sw, 0, sizeof(sw));
+		sw.handles = (uint64_t)(uintptr_t)&h;
+		sw.count_handles = 1;
+		sw.timeout_nsec = 0;
+		test_result("syncobj wait on a signalled one", ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw) == 0);
+		struct drm_syncobj_array sa = { .handles = (uint64_t)(uintptr_t)&h, .count_handles = 1 };
+		test_result("syncobj reset", ioctl(fd, DRM_IOCTL_SYNCOBJ_RESET, &sa) == 0);
+		test_result("syncobj wait on an empty one -> EINVAL",
+			    ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw) == -1 && errno == EINVAL);
+		/* The timeline wait in its binary form: no points array at all
+		 * (every point zero), "wait available" -- how the graphics
+		 * library waits for an imported fence to appear.  Empty and
+		 * not yet submitted, so it times out; a fault here means the
+		 * missing array was refused. */
+		struct drm_syncobj_timeline_wait tw;
+		memset(&tw, 0, sizeof(tw));
+		tw.handles = (uint64_t)(uintptr_t)&h;
+		tw.count_handles = 1;
+		tw.timeout_nsec = 0;
+		tw.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
+		int twr = ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &tw);
+		test_result("syncobj timeline wait without a points array is not a fault",
+			    twr == 0 || (twr == -1 && errno != EFAULT));
+		struct drm_syncobj_destroy sdst = { .handle = h };
+		test_result("syncobj destroy", ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &sdst) == 0);
+	}
+	struct drm_gem_close gc = { .handle = c.handle };
+	test_result("GEM_CLOSE", ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc) == 0);
+	close(fd);
 }
 
 // ============================================================================
@@ -5863,6 +6276,10 @@ static void test_bash_libc_additions(void)
 	errno = 0;
 	test_result("mkfifo -> ENOSYS",
 		    mkfifo(tmpp("nofifo"), 0644) == -1 && errno == ENOSYS);
+	test_result("mkfifoat -> ENOSYS (no FIFO nodes on a filesystem)",
+		    mkfifoat(AT_FDCWD, tmpp("nofifo2"), 0644) == -1 && errno == ENOSYS);
+	test_result("mknodat -> ENOSYS",
+		    mknodat(AT_FDCWD, tmpp("nonode"), S_IFCHR | 0644, 0) == -1 && errno == ENOSYS);
 
 	/* wide-char helpers used by ported code */
 	wchar_t wbuf[8];
@@ -11144,8 +11561,13 @@ static void test_drm(void)
 	test_result("DRM_IOCTL_VERSION (strings)", ioctl(fd, DRM_IOCTL_VERSION, &v) == 0);
 	name[v.name_len] = 0;
 	printf("  (driver %s %d.%d.%d)\n", name, v.version_major, v.version_minor, v.version_patchlevel);
-	test_result("driver name is vmwgfx", strcmp(name, "vmwgfx") == 0);
-	test_result("driver version major is 2", v.version_major == 2);
+	/* Two drivers can sit behind card0; what is expected of the device
+	 * depends on which. */
+	int is_vmw = strcmp(name, "vmwgfx") == 0;
+	int is_i915 = strcmp(name, "i915") == 0;
+	test_result("driver name is vmwgfx or i915", is_vmw || is_i915);
+	test_result("driver version major is the driver's own",
+		    (is_vmw && v.version_major == 2) || (is_i915 && v.version_major == 1));
 
 	/* sysfs-style lookup by device number */
 	char spath[96], buf[256];
@@ -11165,8 +11587,8 @@ static void test_drm(void)
 		close(sfd);
 	if (n > 0)
 		buf[n] = 0;
-	test_result("/sys/dev/char/226:0/device/vendor is 0x15ad",
-		    n > 0 && strstr(buf, "0x15ad") != NULL);
+	test_result("/sys/dev/char/226:0/device/vendor is the driver's",
+		    n > 0 && strstr(buf, is_i915 ? "0x8086" : "0x15ad") != NULL);
 	test_result("/sys/class/drm/card0 resolves", stat("/sys/class/drm/card0/dev", &st) == 0);
 
 	/* caps */
@@ -11195,8 +11617,14 @@ static void test_drm(void)
 	struct drm_mode_card_res res;
 	memset(&res, 0, sizeof(res));
 	test_result("MODE_GETRESOURCES (counts)", ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0);
-	test_result("one crtc, one connector, one encoder",
-		    res.count_crtcs == 1 && res.count_connectors == 1 && res.count_encoders == 1);
+	/* the virtual device has exactly one of each; a real one has at
+	 * least one, and as many connectors as it has ports */
+	test_result(is_vmw ? "one crtc, one connector, one encoder" :
+			     "at least one crtc, connector and encoder",
+		    is_vmw ? (res.count_crtcs == 1 && res.count_connectors == 1 &&
+			      res.count_encoders == 1) :
+			     (res.count_crtcs >= 1 && res.count_connectors >= 1 &&
+			      res.count_encoders >= 1));
 	uint32_t crtc_id = 0, conn_id = 0, enc_id = 0;
 	res.crtc_id_ptr = (uint64_t)(uintptr_t)&crtc_id;
 	res.connector_id_ptr = (uint64_t)(uintptr_t)&conn_id;
@@ -11210,7 +11638,9 @@ static void test_drm(void)
 	gc.connector_id = conn_id;
 	test_result("MODE_GETCONNECTOR (counts)", ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &gc) == 0);
 	test_result("connector is connected with modes",
-		    gc.connection == 1 && gc.count_modes >= 1 && gc.connector_type == DRM_MODE_CONNECTOR_VIRTUAL);
+		    gc.connection == 1 && gc.count_modes >= 1 &&
+			    (is_vmw ? gc.connector_type == DRM_MODE_CONNECTOR_VIRTUAL :
+				      gc.connector_type != DRM_MODE_CONNECTOR_VIRTUAL));
 	struct drm_mode_modeinfo modes[24];
 	uint32_t nm = gc.count_modes < 24 ? gc.count_modes : 24;
 	gc.modes_ptr = (uint64_t)(uintptr_t)modes;
@@ -11840,6 +12270,28 @@ static void test_drm_3d(void)
 #define GPU_G(px) ((unsigned)(((px) >> 8) & 0xFF))
 #define GPU_B(px) ((unsigned)((px) & 0xFF))
 
+/* Pixel 0 of a buffer as the KERNEL sees it: through the virtual
+ * device's readback on vmwgfx, and straight out of the object's memory
+ * on i915 (GEM_PREAD; the first pixel sits at offset 0 in every tiling).
+ * Asking the kernel rather than GL keeps a broken readback from being
+ * reported as broken rendering, and the reverse. */
+static uint32_t gpu_host_pixel(int cfd, uint32_t bo_handle, int do_readback);
+static uint32_t probe_pixel(int is_vmw, int cfd, uint32_t bo_handle)
+{
+	if (is_vmw)
+		return gpu_host_pixel(cfd, bo_handle, 1);
+	struct drm_i915_gem_pread pr;
+	uint32_t px = 0;
+	memset(&pr, 0, sizeof(pr));
+	pr.handle = bo_handle;
+	pr.offset = 0;
+	pr.size = 4;
+	pr.data_ptr = (uint64_t)(uintptr_t)&px;
+	if (cfd < 0 || !bo_handle || ioctl(cfd, DRM_IOCTL_I915_GEM_PREAD, &pr) != 0)
+		return 0xDEADBEEFu;
+	return px;
+}
+
 static uint32_t gpu_host_pixel(int cfd, uint32_t bo_handle, int do_readback)
 {
 	union drm_vmw_gb_surface_reference_ext_arg ra;
@@ -11910,13 +12362,39 @@ static void test_gpu_userland(void)
 
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
 	test_result("open renderD128", fd >= 0);
+	/* Which driver: the virtual device's own requests are only made of
+	 * the virtual device; the GL path below is asked of either. */
+	int is_vmw = 0;
+	if (fd >= 0) {
+		struct drm_version dv;
+		char dn[16];
+		memset(&dv, 0, sizeof(dv));
+		memset(dn, 0, sizeof(dn));
+		dv.name = dn;
+		dv.name_len = sizeof(dn) - 1;
+		if (ioctl(fd, DRM_IOCTL_VERSION, &dv) == 0)
+			is_vmw = strcmp(dn, "vmwgfx") == 0;
+		printf("  (driver %s)\n", dn);
+	}
 	int dfd = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 3) : -1;
 	test_result("F_DUPFD_CLOEXEC of the drm fd", dfd >= 3);
 	if (dfd >= 0) {
+		/* the query the graphics library makes before sharing one
+		 * screen between two descriptors of the device */
+		test_result("F_DUPFD_QUERY says the dup is the same open file",
+			    fcntl(fd, F_DUPFD_QUERY, dfd) == 1);
+		int other = open("/dev/null", O_RDONLY);
+		test_result("F_DUPFD_QUERY says another file is not",
+			    other >= 0 && fcntl(fd, F_DUPFD_QUERY, other) == 0);
+		if (other >= 0)
+			close(other);
 		struct drm_vmw_getparam_arg gp = { .param = DRM_VMW_PARAM_3D };
-		test_result("the dup carries the device (GET_PARAM 3D)",
-			    vmw_cmd(dfd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp,
-				    sizeof(gp)) == 0);
+		struct drm_version dv2;
+		memset(&dv2, 0, sizeof(dv2));
+		test_result("the dup carries the device",
+			    is_vmw ? vmw_cmd(dfd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp,
+					     sizeof(gp)) == 0 :
+				     ioctl(dfd, DRM_IOCTL_VERSION, &dv2) == 0);
 		test_result("FD_CLOEXEC is set on the dup",
 			    (fcntl(dfd, F_GETFD, 0) & FD_CLOEXEC) != 0);
 		close(dfd);
@@ -11944,10 +12422,13 @@ static void test_gpu_userland(void)
 			destroy(dev);
 	}
 	/* What GLX/EGL load for a hardware screen. */
-	void *dri = dlopen("/usr/lib/dri/vmwgfx_dri.so", RTLD_NOW | RTLD_GLOBAL);
-	test_result("dlopen vmwgfx_dri.so", dri != NULL);
-	if (!dri)
-		printf("      (dlerror: %s)\n", dlerror());
+	void *dri = NULL;
+	if (is_vmw) {
+		dri = dlopen("/usr/lib/dri/vmwgfx_dri.so", RTLD_NOW | RTLD_GLOBAL);
+		test_result("dlopen vmwgfx_dri.so", dri != NULL);
+		if (!dri)
+			printf("      (dlerror: %s)\n", dlerror());
+	}
 
 	/* How Mesa finds GPUs at all: drmGetDevices2() starts by LISTING
 	 * /dev/dri.  Opening the nodes by name proves nothing about this --
@@ -12002,7 +12483,7 @@ static void test_gpu_userland(void)
 	 * it, a no-config GL context made current with no surface, and the
 	 * renderer asked for its name. */
 	int has3d = 0;
-	if (fd >= 0) {
+	if (is_vmw && fd >= 0) {
 		struct drm_vmw_getparam_arg gp3 = { .param = DRM_VMW_PARAM_3D };
 		has3d = vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp3,
 				sizeof(gp3)) == 0 && gp3.value == 1;
@@ -12113,13 +12594,82 @@ static void test_gpu_userland(void)
 					clearcol(1.0f, 0.0f, 0.0f, 1.0f);
 					clear(0x4000 /* GL_COLOR_BUFFER_BIT */);
 					finish();
+					{
+						unsigned cdev = (unsigned)probe_pixel(
+							is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+						test_result("the cleared buffer holds red as the kernel sees it",
+							    GPU_R(cdev) == 255 && GPU_G(cdev) == 0 &&
+								    GPU_B(cdev) == 0);
+						printf("      (kernel view of pixel 0: %02x,%02x,%02x)\n",
+						       GPU_R(cdev), GPU_G(cdev), GPU_B(cdev));
+					}
+					/* The same again, twice: a context's first
+					 * batch carries the whole pipeline setup,
+					 * every later one only what changed and
+					 * relies on the engine keeping the rest.  A
+					 * second clear that does not land is a
+					 * context that lost its state between two
+					 * batches.
+					 *
+					 * Pixel 0 is blackened through the kernel
+					 * first, so what the second clear leaves
+					 * says which batch ran: green = the second,
+					 * red = the first again, black = neither. */
+					if (!is_vmw) {
+						struct drm_i915_gem_pwrite pw;
+						uint32_t black = 0;
+						memset(&pw, 0, sizeof(pw));
+						pw.handle = (uint32_t)bohandle3(rbo);
+						pw.offset = 0;
+						pw.size = 4;
+						pw.data_ptr = (uint64_t)(uintptr_t)&black;
+						if (ioctl(cfd2, DRM_IOCTL_I915_GEM_PWRITE, &pw) != 0)
+							printf("      (pwrite of pixel 0 failed: %s)\n", strerror(errno));
+						unsigned cb = (unsigned)probe_pixel(is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+						printf("      (pixel 0 blackened through the kernel: %02x,%02x,%02x)\n",
+						       GPU_R(cb), GPU_G(cb), GPU_B(cb));
+					}
+					clearcol(0.0f, 1.0f, 0.0f, 1.0f);
+					clear(0x4000);
+					finish();
+					{
+						unsigned c2 = (unsigned)probe_pixel(
+							is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+						test_result("a second clear lands (green, the context's second batch)",
+							    GPU_R(c2) == 0 && GPU_G(c2) == 255 && GPU_B(c2) == 0);
+						printf("      (kernel view after the second clear: %02x,%02x,%02x -- %s)\n",
+						       GPU_R(c2), GPU_G(c2), GPU_B(c2),
+						       GPU_G(c2) == 255 ? "the second batch ran" :
+						       GPU_R(c2) == 255 ? "the FIRST batch ran again" :
+									  "no batch touched it");
+					}
+					clearcol(0.0f, 0.0f, 1.0f, 1.0f);
+					clear(0x4000);
+					finish();
+					{
+						unsigned c3 = (unsigned)probe_pixel(
+							is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+						test_result("a third clear lands (blue)",
+							    GPU_R(c3) == 0 && GPU_G(c3) == 0 && GPU_B(c3) == 255);
+						printf("      (kernel view after the third clear: %02x,%02x,%02x)\n",
+						       GPU_R(c3), GPU_G(c3), GPU_B(c3));
+					}
+					/* Now GL's own readback of the last clear: a
+					 * copy the engine makes into a staging buffer
+					 * the processor then reads. */
 					unsigned char px[4] = { 0, 0, 0, 0 };
 					readpix(1, 1, 1, 1, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */, px);
-					test_result("GL rendering lands (glReadPixels sees red)",
-						    px[0] == 255 && px[1] == 0 && px[2] == 0);
-					if (!(px[0] == 255 && px[1] == 0))
+					test_result("GL rendering reads back (glReadPixels sees the last clear, blue)",
+						    px[0] == 0 && px[1] == 0 && px[2] == 255);
+					if (!(px[2] == 255 && px[0] == 0))
 						printf("      (readpixels: %u,%u,%u,%u)\n",
 						       px[0], px[1], px[2], px[3]);
+					/* and back to red, so the draws below start from
+					 * what they expect */
+					clearcol(1.0f, 0.0f, 0.0f, 1.0f);
+					clear(0x4000);
+					finish();
+					if (is_vmw) {
 					/* Now ask the KERNEL what that surface
 					 * holds: READBACK_GB_SURFACE copies the
 					 * host content into the guest backup,
@@ -12175,6 +12725,7 @@ static void test_gpu_userland(void)
 						vmw_cmd(cfd2, DRM_VMW_UNREF_SURFACE, _IOC_WRITE, &us2, sizeof(us2));
 						struct drm_vmw_handle_close_arg hc2 = { .handle = ra2.rep.crep.buffer_handle };
 						vmw_cmd(cfd2, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &hc2, sizeof(hc2));
+					}
 					}
 					/* The half the red-clear does NOT
 					 * cover -- and the half every missing
@@ -12323,8 +12874,8 @@ static void test_gpu_userland(void)
 								finish();
 								unsigned char gp[4] = { 9, 9, 9, 9 };
 								readpix(32, 32, 1, 1, 0x1908, 0x1401, gp);
-								unsigned dev = (unsigned)gpu_host_pixel(
-									cfd2, (uint32_t)bohandle3(rbo), 1);
+								unsigned dev = (unsigned)probe_pixel(
+									is_vmw, cfd2, (uint32_t)bohandle3(rbo));
 
 								test_result("a draw with no texture lands (vertices, shader, render target)",
 									    GPU_G(dev) == 255 &&
@@ -12340,6 +12891,94 @@ static void test_gpu_userland(void)
 							} else {
 								test_fail("a draw with no texture lands (vertices, shader, render target)");
 								test_fail("the render target reads back through GL after a draw");
+							}
+
+							/* The same draw as the FIRST batch of a
+							 * fresh context: its own texture over the
+							 * same image, its own framebuffer, its own
+							 * copy of the shaders, drawn before
+							 * anything else.  Landing here and not
+							 * above means the engine loses a
+							 * context's state between batches;
+							 * landing nowhere means a draw never
+							 * lands at all. */
+							void *ctx2 = cctx ? cctx(dpy, NULL, NULL, noattr) : NULL;
+							int cur2 = ctx2 && mkcur && mkcur(dpy, NULL, NULL, ctx2);
+							test_result("a second context becomes current", cur2);
+							if (cur2) {
+								unsigned tex2 = 0, fbo2 = 0;
+								gentex(1, &tex2);
+								bindtex(0x0DE1, tex2);
+								teximg(0x0DE1, img);
+								genfbo(1, &fbo2);
+								bindfbo(0x8D40, fbo2);
+								fbotex(0x8D40, 0x8CE0, 0x0DE1, tex2, 0);
+								unsigned v2 = mkshader(0x8B31), f2 = mkshader(0x8B30);
+								int ok2v = 0, ok2f = 0, ok2l = 0;
+								shsrc(v2, 1, &vs_src, NULL);
+								shcomp(v2);
+								shiv(v2, 0x8B81, &ok2v);
+								shsrc(f2, 1, &fs_solid, NULL);
+								shcomp(f2);
+								shiv(f2, 0x8B81, &ok2f);
+								unsigned p2 = mkprog();
+								attach(p2, v2);
+								attach(p2, f2);
+								link(p2);
+								proiv(p2, 0x8B82, &ok2l);
+								unsigned vao2 = 0, vb2 = 0;
+								if (genva && bindva) {
+									genva(1, &vao2);
+									bindva(vao2);
+								}
+								genbuf(1, &vb2);
+								bindbuf(0x8892, vb2);
+								bufdata(0x8892, sizeof(quad), quad, 0x88E4);
+								if (ok2v && ok2f && ok2l) {
+									useprog(p2);
+									int pa2 = aloc(p2, "p");
+									vattr((unsigned)pa2, 2, 0x1406, 0, 0, NULL);
+									venable((unsigned)pa2);
+									viewport(0, 0, 64, 64);
+									draw(0x0004, 0, 6);
+									finish();
+									unsigned d2 = (unsigned)probe_pixel(
+										is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+									test_result("a draw lands as a fresh context's first batch",
+										    GPU_G(d2) == 255 && GPU_R(d2) == 0 && GPU_B(d2) == 0);
+									printf("      (kernel view after the fresh context's draw: %02x,%02x,%02x)\n",
+									       GPU_R(d2), GPU_G(d2), GPU_B(d2));
+									/* and its second batch: the same draw again,
+									 * after a clear to red in between */
+									clearcol(1.0f, 0.0f, 0.0f, 1.0f);
+									clear(0x4000);
+									finish();
+									unsigned d2r = (unsigned)probe_pixel(
+										is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+									test_result("a clear lands as that context's second batch",
+										    GPU_R(d2r) == 255 && GPU_G(d2r) == 0 && GPU_B(d2r) == 0);
+									printf("      (kernel view after the fresh context's clear: %02x,%02x,%02x)\n",
+									       GPU_R(d2r), GPU_G(d2r), GPU_B(d2r));
+									draw(0x0004, 0, 6);
+									finish();
+									unsigned d3 = (unsigned)probe_pixel(
+										is_vmw, cfd2, (uint32_t)bohandle3(rbo));
+									/* only a draw over a red the clear
+									 * actually produced says anything */
+									test_result("the same draw lands as that context's third batch",
+										    GPU_R(d2r) == 255 && GPU_G(d3) == 255 &&
+											    GPU_R(d3) == 0 && GPU_B(d3) == 0);
+									printf("      (kernel view after the later draw: %02x,%02x,%02x)\n",
+									       GPU_R(d3), GPU_G(d3), GPU_B(d3));
+								} else {
+									test_fail("a draw lands as a fresh context's first batch");
+								}
+								/* back to the first context for what follows */
+								mkcur(dpy, NULL, NULL, ctx);
+								bindfbo(0x8D40, fbo);
+								if (genva && bindva)
+									bindva(vao);
+								bindbuf(0x8892, vb);
 							}
 							useprog(prog);
 							vattr((unsigned)pa, 2, 0x1406, 0, 0, NULL);
@@ -12405,8 +13044,8 @@ static void test_gpu_userland(void)
 						 * once reported a PASS it had not earned,
 						 * having read a colour an earlier test left
 						 * in the buffer. */
-						unsigned sdev = (unsigned)gpu_host_pixel(
-							cfd2, (uint32_t)bohandle3(rbo), 1);
+						unsigned sdev = (unsigned)probe_pixel(
+							is_vmw, cfd2, (uint32_t)bohandle3(rbo));
 						test_result("sampling a guest-uploaded RGBA texture works (glyph/PutImage path)",
 							    GPU_R(sdev) == 0 && GPU_G(sdev) == 255 &&
 								    GPU_B(sdev) == 0);
@@ -12431,8 +13070,8 @@ static void test_gpu_userland(void)
 						 * which the quad puts at the render target's
 						 * origin -- so pixel 0, which is the pixel the
 						 * device is asked about. */
-						unsigned bdev = (unsigned)gpu_host_pixel(
-							cfd2, (uint32_t)bohandle3(rbo), 1);
+						unsigned bdev = (unsigned)probe_pixel(
+							is_vmw, cfd2, (uint32_t)bohandle3(rbo));
 						test_result("partial texture update samples back (glTexSubImage2D path)",
 							    GPU_R(bdev) == 0 && GPU_G(bdev) == 0 &&
 								    GPU_B(bdev) == 255);
@@ -12454,8 +13093,8 @@ static void test_gpu_userland(void)
 							0x1903 /* RED */, 0x1401, gray8);
 						draw(0x0004, 0, 6);
 						finish();
-						unsigned rdev = (unsigned)gpu_host_pixel(
-							cfd2, (uint32_t)bohandle3(rbo), 1);
+						unsigned rdev = (unsigned)probe_pixel(
+							is_vmw, cfd2, (uint32_t)bohandle3(rbo));
 						test_result("sampling a one-channel texture works (glyph-atlas shape)",
 							    GPU_R(rdev) >= 0x70 && GPU_R(rdev) <= 0x90 &&
 								    GPU_G(rdev) == 0 && GPU_B(rdev) == 0);
@@ -12613,7 +13252,7 @@ static void test_gpu_userland(void)
 	 * format-conditional path, so if this direct ioctl succeeds the
 	 * refusal above is Mesa's own format-capability check -- and the
 	 * devcap words it consults are printed to say why. */
-	if (cfd2 >= 0) {
+	if (is_vmw && cfd2 >= 0) {
 		static uint32_t caps3[300];
 		struct drm_vmw_get_3d_cap_arg c3;
 		memset(&c3, 0, sizeof(c3));
@@ -12780,11 +13419,14 @@ int main(int argc, char **argv)
      *   testlibc all      — run all sections including network
      *   testlibc network  — run only the networking sections */
 	int net_only = (argc > 1 && strcmp(argv[1], "network") == 0);
+	/*   testlibc gpu      -- run only the display-manager and GPU sections */
+	int gpu_only = (argc > 1 && strcmp(argv[1], "gpu") == 0);
 	int skip_network =
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
 	printf("\n========================================\n");
 	printf("  LikeOS-64 Libc Tests%s\n", net_only     ? " (network only)" :
+					     gpu_only     ? " (graphics only)" :
 					     skip_network ? " (no network)" :
 							    " (all)");
 	printf("========================================\n\n");
@@ -12841,6 +13483,8 @@ int main(int argc, char **argv)
 
 	if (net_only)
 		goto network_section;
+	if (gpu_only)
+		goto gpu_section;
 
 	// ========================================
 	// Test: malloc/free
@@ -20304,6 +20948,8 @@ int main(int argc, char **argv)
 	// Device nodes, framebuffer device, event devices
 	// ========================================
 	test_dev_nodes();
+	test_pipe2_prctl();
+	test_drm_i915();
 	test_fbdev();
 	test_evdev();
 	test_shebang();
@@ -29658,6 +30304,9 @@ network_skip:;
 	test_anonfd();
 	test_sysfs_procfs();
 	test_posix_additions();
+gpu_section:
+	if (gpu_only)
+		test_drm_i915();
 	test_drm();
 	test_drm_3d();
 	test_gpu_userland();

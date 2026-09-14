@@ -44,6 +44,57 @@ struct drm_fence *drm_fence_create(struct drm_device *dev, uint32_t seqno,
 	return f;
 }
 
+struct drm_fence *drm_fence_create_ctx(struct drm_device *dev,
+				       uint64_t context, uint64_t seqno64)
+{
+	struct drm_fence *f = kalloc(sizeof(*f));
+	uint64_t fl;
+
+	if (!f)
+		return NULL;
+	mm_memset(f, 0, sizeof(*f));
+	f->refs = 1;
+	f->dev = dev;
+	f->context = context;
+	f->seqno64 = seqno64;
+	/* Out of the device-wide sequence's way: a stream fence is never
+	 * "already passed" by that numbering. */
+	f->seqno = dev->fence_passed;
+	wq_head_init(&f->wq, "drm_fence");
+	spin_lock_irqsave(&dev->lock, &fl);
+	f->next = dev->fences;
+	dev->fences = f;
+	spin_unlock_irqrestore(&dev->lock, fl);
+	return f;
+}
+
+void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
+			       uint64_t passed)
+{
+	uint64_t fl;
+	struct drm_fence *wake[64];
+	int nw = 0;
+
+	spin_lock_irqsave(&dev->lock, &fl);
+	for (struct drm_fence *f = dev->fences; f; f = f->next) {
+		if (!f->signaled && f->context == context &&
+		    f->seqno64 <= passed) {
+			f->signaled = 1;
+			f->signal_ns = hrtimer_now_ns();
+			if (nw < 64) {
+				drm_fence_get(f);
+				wake[nw++] = f;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&dev->lock, fl);
+	for (int i = 0; i < nw; i++) {
+		poll_notify_wq(&wake[i]->wq);
+		drm_fence_put(wake[i]);
+	}
+	poll_notify_wq(&dev->vbl_wq);
+}
+
 struct drm_fence *drm_fence_signalled(struct drm_device *dev)
 {
 	struct drm_fence *f = drm_fence_create(dev, dev->fence_passed, 0);

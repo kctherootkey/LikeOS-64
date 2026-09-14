@@ -114,6 +114,19 @@ int drm_gem_alloc_pages_contig(struct drm_gem_object *o)
 		return -ENOMEM;
 	uint64_t base = mm_allocate_contiguous_pages(o->npages);
 	if (!base) {
+		/* A run of frames the page cache is sitting on looks exactly
+		 * like no memory at all: drop what is clean and ask once
+		 * more before giving up, the way every other bulk allocation
+		 * here does.  Without this a buffer the device needs -- a
+		 * ring, a console framebuffer -- fails permanently on a
+		 * machine whose memory is merely CACHED, not used. */
+		mm_reclaim_for_pages(o->npages * 2);
+		base = mm_allocate_contiguous_pages(o->npages);
+	}
+	if (!base) {
+		kprintf("[drm] %s: no run of %u free pages for a %llu KB buffer\n",
+			o->dev && o->dev->drv ? o->dev->drv->name : "drm", o->npages,
+			(unsigned long long)(o->size / 1024));
 		kfree(o->pages);
 		o->pages = NULL;
 		return -ENOMEM;
@@ -388,6 +401,16 @@ uint64_t drm_gem_mmap_offset(struct drm_gem_object *o)
 	return (uint64_t)o->id << 32;
 }
 
+/* A kind in the top byte, the id below it: a client asking for the same
+ * object write-combined and write-back gets two windows, and the mapping
+ * code learns which from the offset alone.  Ids stay under 2^24, which
+ * the object counter never reaches in the life of a boot. */
+uint64_t drm_gem_mmap_offset_kind(struct drm_gem_object *o, unsigned kind)
+{
+	return ((uint64_t)(kind & DRM_GEM_MMAP_KIND_MAX) << 56) |
+	       ((uint64_t)o->id << 32);
+}
+
 /* Object by mmap offset (a reference), for the device node's mmap. */
 /* Take a reference only if the object still has one.
  *
@@ -413,7 +436,7 @@ int drm_gem_get_unless_zero(struct drm_gem_object *o)
 struct drm_gem_object *drm_gem_by_offset(struct drm_device *dev,
 					 uint64_t offset)
 {
-	uint32_t id = (uint32_t)(offset >> 32);
+	uint32_t id = (uint32_t)(offset >> 32) & 0xFFFFFFu;
 	struct drm_gem_object *found = NULL;
 	uint64_t fl;
 
@@ -661,6 +684,7 @@ int drm_gem_handle_delete(struct drm_file *fp, uint32_t handle)
 
 struct dmabuf_ctx {
 	struct drm_gem_object *obj;
+	uint64_t pos; /* the seek position; the file carries no data */
 };
 
 static uint64_t dmabuf_page_phys(void *obj, uint64_t index)
@@ -785,6 +809,33 @@ static int dmabuf_fstat(vfs_file_t *f, struct kstat *st)
 	return 0;
 }
 
+/* A buffer file has a size and nothing to read, but seeking to its end
+ * is how a client learns how large an imported buffer is: the handle
+ * ioctl does not say, and a size of zero fails an allocation later. */
+static long dmabuf_seek(vfs_file_t *f, long offset, int whence)
+{
+	struct dmabuf_ctx *c = device_file_priv(f);
+	long pos;
+
+	switch (whence) {
+	case SEEK_SET:
+		pos = offset;
+		break;
+	case SEEK_CUR:
+		pos = (long)c->pos + offset;
+		break;
+	case SEEK_END:
+		pos = (long)c->obj->size + offset;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (pos < 0 || (uint64_t)pos > c->obj->size)
+		return -EINVAL;
+	c->pos = (uint64_t)pos;
+	return pos;
+}
+
 static void dmabuf_release(vfs_file_t *f)
 {
 	struct dmabuf_ctx *c = device_file_priv(f);
@@ -796,6 +847,7 @@ static void dmabuf_release(vfs_file_t *f)
 }
 
 static const struct device_ops dmabuf_ops = {
+	.seek = dmabuf_seek,
 	.mmap = dmabuf_mmap,
 	.poll = dmabuf_poll,
 	.ioctl = dmabuf_ioctl,

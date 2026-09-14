@@ -5,6 +5,8 @@ NAME
 
 SYNOPSIS
        drminfo [-n node] [-v]
+       drminfo --driver [node]
+       drminfo --has-display [node]
 
 DESCRIPTION
        drminfo  opens each node under /dev/dri, asks it which driver is behind
@@ -31,6 +33,21 @@ OPTIONS
               ber, in which case /dev/dri/cardN is used.
 
        -v     Print every mode of every connector, rather than the first few.
+
+       --driver [node]
+              Print only the name of the driver behind node  (default  /dev/
+              dri/card0)  and  nothing  else,  and  exit  with status 1 when
+              there is no such node or no driver answers.  This is  what  the
+              X  server's  start-up  script  asks  to choose a configuration:
+              i915 gets the accelerated one, vmwgfx the software  one,  and a
+              machine with no node keeps the framebuffer server.
+
+       --has-display [node]
+              Print nothing; exit with status 0 when the node  reports  at
+              least  one  connector  and one CRTC, 1 otherwise.  A display
+              server must not be pointed at a device that has  no  screen
+              to  offer  --  a driver that found its device but has not lit
+              a display yet -- and this is how the start-up script asks.
 
 OUTPUT
        For each node:

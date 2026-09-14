@@ -2,15 +2,14 @@
 //
 // Display servers (X.org fbdev/modesetting) drive the screen through this
 // interface: FBIOGET_* for geometry discovery, mmap of the framebuffer for
-// pixel access, FBIOPUT_VSCREENINFO for mode changes.  When the VMware SVGA
-// II driver owns the display, mode changes route through its runtime modeset
-// path (console included); on the GOP fallback the single boot mode is the
-// only accepted mode.
+// pixel access, FBIOPUT_VSCREENINFO for mode changes.  The display driver
+// that owns the screen registers a backend (see fbdev.h) and mode changes
+// route through it (console included); with no backend the boot framebuffer
+// is what the node shows and its single mode is the only accepted one.
 
 #include <kernel/dev/input/mouse.h>
 #include <kernel/dev/video/fb.h>
 #include <kernel/dev/video/fbdev.h>
-#include <kernel/dev/video/vmsvga2.h>
 #include <kernel/uapi/fb.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
@@ -39,11 +38,27 @@ static int fbdev_copy_from_user(void *dst, const void *user_src, size_t len)
 	return 0;
 }
 
+static const struct fbdev_backend *g_backend;
+
+void fbdev_register_backend(const struct fbdev_backend *b)
+{
+	if (b && (!b->get_info || !b->get_phys)) {
+		WARN_ON_ONCE(1); /* an incomplete backend; keep the old one */
+		return;
+	}
+	g_backend = b;
+}
+
+const struct fbdev_backend *fbdev_backend(void)
+{
+	return g_backend;
+}
+
 // Current scanout geometry from the active backend.  Returns 0 on success.
 static int fbdev_current_info(framebuffer_info_t *fi)
 {
-	if (vmsvga2_active())
-		return vmsvga2_get_info(fi);
+	if (g_backend)
+		return g_backend->get_info(fi);
 	return console_get_framebuffer_info(fi);
 }
 
@@ -51,8 +66,8 @@ uint64_t fbdev_get_phys(uint64_t *size_out)
 {
 	framebuffer_info_t fi;
 
-	if (vmsvga2_active())
-		return vmsvga2_get_fb_phys(size_out);
+	if (g_backend)
+		return g_backend->get_phys(size_out);
 	if (console_get_framebuffer_info(&fi) != 0 || !fi.framebuffer_base)
 		return 0;
 	if (size_out)
@@ -75,11 +90,11 @@ uint64_t fbdev_mmap_phys(uint64_t offset, uint64_t length)
 	if (offset >= size || length > size - offset)
 		return 0;
 	/* A mapping client (X.org fbdev style) scans out by storing straight
-	 * to VRAM and sends no update commands.  Enable SVGA traces so the
-	 * host snoops those writes; sticky-on - the console's explicit
-	 * update-rect path remains correct alongside it, at a small
-	 * host-side tracking cost once a client has mapped the fb. */
-	vmsvga2_set_traces(1);
+	 * to the framebuffer and sends no update commands; a driver that
+	 * needs to know (the VMware one turns on its trace mode so the host
+	 * snoops those writes) learns it here. */
+	if (g_backend && g_backend->mapped)
+		g_backend->mapped();
 	return phys + offset;
 }
 
@@ -121,9 +136,8 @@ static void fbdev_fill_var(struct fb_var_screeninfo *var,
 static void fbdev_fill_fix(struct fb_fix_screeninfo *fix,
 			   const framebuffer_info_t *fi)
 {
-	static const char id_svga[] = "svga2";
 	static const char id_gop[] = "gopfb";
-	const char *id = vmsvga2_active() ? id_svga : id_gop;
+	const char *id = (g_backend && g_backend->id) ? g_backend->id : id_gop;
 	uint64_t size = 0;
 	uint64_t phys = fbdev_get_phys(&size);
 	int i;
@@ -158,30 +172,25 @@ static int fbdev_put_var(const struct fb_var_screeninfo *var)
 	    var->bits_per_pixel == fi.bytes_per_pixel * 8)
 		return 0;
 
+	if (!g_backend || !g_backend->set_mode)
+		return -EINVAL; // only the current mode exists
+
 	if (var->activate & FB_ACTIVATE_TEST) {
-		if (!vmsvga2_active())
-			return -EINVAL; // GOP: only the current mode exists
-		if (var->xres > vmsvga2_get_max_width() ||
-		    var->yres > vmsvga2_get_max_height())
-			return -EINVAL;
-		if ((uint64_t)var->xres * var->yres *
-			    (var->bits_per_pixel / 8) >
-		    vmsvga2_get_vram_size())
-			return -EINVAL;
+		if (g_backend->test_mode)
+			return g_backend->test_mode(var->xres, var->yres,
+						    var->bits_per_pixel);
 		return 0;
 	}
 
-	if (!vmsvga2_active())
-		return -EINVAL; // GOP framebuffer cannot change modes
-
-	if (vmsvga2_set_mode(var->xres, var->yres, var->bits_per_pixel) != 0)
+	if (g_backend->set_mode(var->xres, var->yres, var->bits_per_pixel) != 0)
 		return -EINVAL;
-	if (WARN_ON_ONCE(vmsvga2_get_info(&fi) != 0))
+	if (WARN_ON_ONCE(g_backend->get_info(&fi) != 0))
 		return -EIO;
 	// Cascade the new geometry through fb/console/tty (SIGWINCH).
 	if (console_reinit_framebuffer(&fi) != 0)
 		return -EIO;
-	vmsvga2_update_full();
+	if (g_backend->update_full)
+		g_backend->update_full();
 	return 0;
 }
 
@@ -209,7 +218,9 @@ static int g_fb0_opens;
  * writing to the same pixels, and the console would win whenever anything --
  * a kernel message, an echoed keystroke -- made it draw.  On a system with
  * virtual terminals this is what KD_GRAPHICS does; the open count is the same
- * signal without the VT.
+ * signal without the VT.  A display manager on a DRM node never opens this
+ * device, so drm_master_set()/drm_master_drop() count as an open and a close
+ * on its behalf.
  *
  * The console keeps updating its BACK buffer throughout, so nothing written
  * meanwhile is lost: the full redraw on the last close brings it all back.
@@ -282,12 +293,11 @@ int fbdev_ioctl(unsigned long req, void *argp, struct task *cur)
 	}
 	case FBIOBLANK: {
 		long level = (long)(uint64_t)argp;
-		if (vmsvga2_active())
-			return vmsvga2_display_enable(level ==
-						      FB_BLANK_UNBLANK) == 0 ?
+		if (g_backend && g_backend->blank)
+			return g_backend->blank(level == FB_BLANK_UNBLANK) == 0 ?
 				       0 :
 				       -EIO;
-		return 0; // GOP: blanking not supported, pretend success
+		return 0; // blanking not supported, pretend success
 	}
 	case FBIOGETCMAP:
 	case FBIOPUTCMAP:

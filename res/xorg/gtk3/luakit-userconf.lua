@@ -137,3 +137,23 @@ window.methods.search_open = function (w, arg)
     end
     return uri
 end
+
+-- What a page's JavaScript prints, on the terminal that started X.
+--
+-- A site that misbehaves here but not on another machine almost always says
+-- why in its own console: an exception from a script, a request the network
+-- refused, a storage API that would not open.  None of that is visible
+-- otherwise -- luakit has no console pane, and the web inspector needs a
+-- window of its own.  WebKit can write the same messages to stdout instead,
+-- which on this system lands in the terminal `startx' was typed in and in the
+-- serial log beside it.
+--
+-- Off by default because it is every message from every page, including the
+-- ones sites print on purpose.  Turn it on for a session with:
+--
+--     LIKEOS_WEB_CONSOLE=1 startx
+--
+-- and read the lines that appear while the page that misbehaves loads.
+if os.getenv("LIKEOS_WEB_CONSOLE") == "1" then
+    settings.webview.enable_write_console_messages_to_stdout = true
+end

@@ -1,0 +1,41 @@
+# Firmware blobs the Intel graphics driver may load, one per line, as named
+# under /lib/firmware/i915 in the vendor firmware package.  The image build
+# copies each that exists in FIRMWARE_SRC (decompressing a .zst copy) into
+# /lib/firmware/i915 on the image; a missing file is skipped with a note,
+# since the display never depends on firmware -- only display power saving
+# (DMC) and, on the newest parts, engine scheduling (GuC/HuC) do.
+#
+# Display microcode (DMC), one per platform, the version the driver asks for:
+skl_dmc_ver1_27.bin
+kbl_dmc_ver1_04.bin
+bxt_dmc_ver1_07.bin
+glk_dmc_ver1_04.bin
+icl_dmc_ver1_09.bin
+tgl_dmc_ver2_12.bin
+rkl_dmc_ver2_03.bin
+dg1_dmc_ver2_02.bin
+adls_dmc_ver2_01.bin
+adlp_dmc_ver2_16.bin
+dg2_dmc_ver2_08.bin
+# Scheduling firmware (GuC) and media firmware (HuC), Gen11 and later:
+icl_guc_70.1.1.bin
+icl_huc_9.0.0.bin
+tgl_guc_70.1.1.bin
+tgl_huc_7.9.3.bin
+dg1_guc_70.1.1.bin
+dg1_huc_7.9.3.bin
+adlp_guc_70.1.1.bin
+adlp_guc_70.bin
+dg2_guc_70.bin
+dg2_huc_gsc.bin
+# Skylake-generation GuC/HuC (optional; execlists run without them):
+skl_guc_70.1.1.bin
+skl_huc_2.0.0.bin
+kbl_guc_70.1.1.bin
+kbl_huc_4.0.0.bin
+cml_guc_70.1.1.bin
+cml_huc_4.0.0.bin
+glk_guc_70.1.1.bin
+glk_huc_4.0.0.bin
+bxt_guc_70.1.1.bin
+bxt_huc_2.0.0.bin

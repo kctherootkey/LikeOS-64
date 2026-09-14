@@ -567,6 +567,20 @@ pkg_opts() {
 # small programs, not a second copy of the library to develop against.
 meson_host_opts() {
 	case "$1" in
+	mesa)
+		# Only the two build-host programs the Intel driver's own build
+		# runs (mesa_clc, vtn_bindgen2), against the HOST's LLVM and
+		# clang: no drivers, no platforms, nothing for the image.
+		echo "-Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+		      -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true \
+		      -Dgallium-drivers=[] -Dvulkan-drivers=[] -Dplatforms=[] \
+		      -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+		      -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+		      -Dllvm=enabled -Dshared-llvm=enabled \
+		      -Dbuild-tests=false -Dtools=[] -Dvideo-codecs=[] \
+		      -Dzstd=disabled -Dlmsensors=disabled -Dlibunwind=disabled \
+		      -Dvalgrind=disabled"
+		;;
 	glib)
 		echo "-Dtests=false -Dinstalled_tests=false -Dnls=disabled \
 		      -Dman-pages=disabled -Dintrospection=disabled \
@@ -646,7 +660,23 @@ meson_opts() {
 		# The llvm dependency is answered by toolchain/llvm-config (a
 		# wrapper; the sysroot's real llvm-config is a target binary the
 		# host cannot run).
-		echo "-Dgallium-drivers=svga,llvmpipe,softpipe -Dvulkan-drivers=[] \
+		#
+		# iris is the driver for Intel integrated graphics behind the
+		# kernel's i915 interface.  Its build compiles helper kernels
+		# with mesa_clc/vtn_bindgen2 from the native half of this
+		# package (meson_host_opts), found on PATH in $HOSTTOOLS/bin:
+		# hence -Dmesa-clc=system.  Ray tracing (intel-rt) needs more
+		# than that and nothing here uses it; intel-elk keeps the Gen8
+		# (Broadwell) compiler in, which the kernel driver supports.
+		if mesa_iris_wanted 2>/dev/null; then
+			drivers="svga,llvmpipe,softpipe,iris"
+			iris="-Dmesa-clc=system -Dprecomp-compiler=system \
+			      -Dintel-rt=disabled -Dintel-elk=true"
+		else
+			drivers="svga,llvmpipe,softpipe"
+			iris=""
+		fi
+		echo "-Dgallium-drivers=$drivers -Dvulkan-drivers=[] $iris \
 		      -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=enabled \
 		      -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
 		      -Dllvm=enabled -Dshared-llvm=enabled -Ddraw-use-llvm=true \
@@ -1286,9 +1316,50 @@ is_cmake() {
 #
 # One manifest line and one stamp: the two builds are two halves of porting
 # GLib, not two packages, and nothing else can use half of it.
+# Can this machine build Mesa's OpenCL-C compiler (mesa_clc) and the SPIR-V
+# binding generator (vtn_bindgen2)?  The Intel driver (iris) compiles its
+# own helper kernels at build time with them, and they need the build
+# host's clang libraries, libclc and the SPIR-V tools.  `make deps'
+# installs those; without them the port still builds, minus iris, and says
+# so loudly.  LIKEOS_MESA_IRIS=1 turns the shortfall into an error,
+# LIKEOS_MESA_IRIS=0 leaves iris out even when the tools are there.
+# The host's llvm-config: the unversioned name, or the newest versioned
+# one (a distribution that installs llvm-NN-dev alone ships only
+# llvm-config-NN; meson looks for both, this check has to as well).
+host_llvm_config() {
+	if command -v llvm-config >/dev/null 2>&1; then
+		command -v llvm-config
+		return 0
+	fi
+	for v in 21 20 19 18 17 16 15; do
+		if command -v "llvm-config-$v" >/dev/null 2>&1; then
+			command -v "llvm-config-$v"
+			return 0
+		fi
+	done
+	return 1
+}
+
+mesa_iris_wanted() {
+	[ "${LIKEOS_MESA_IRIS:-auto}" = 0 ] && return 1
+	if host_llvm_config >/dev/null 2>&1 &&
+	   pkg-config --exists SPIRV-Tools 2>/dev/null &&
+	   pkg-config --exists LLVMSPIRVLib 2>/dev/null &&
+	   { pkg-config --exists libclc 2>/dev/null || [ -d /usr/lib/clc ]; }; then
+		return 0
+	fi
+	if [ "${LIKEOS_MESA_IRIS:-auto}" = 1 ]; then
+		echo "mesa: LIKEOS_MESA_IRIS=1 but the host lacks clang/libclc/SPIRV-Tools/LLVMSPIRVLib (run: make deps)" >&2
+		exit 1
+	fi
+	echo "mesa: NOTE: the Intel driver (iris) is LEFT OUT -- the host lacks clang/libclc/SPIRV-Tools/LLVMSPIRVLib; run 'make deps' and rebuild mesa" >&2
+	return 1
+}
+
 needs_host_build() {
 	case "$1" in
 	glib) return 0 ;;
+	mesa) mesa_iris_wanted; return $? ;;
 	esac
 	return 1
 }

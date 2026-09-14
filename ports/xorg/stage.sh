@@ -274,6 +274,9 @@ cp "$root/res/xorg/xorg.conf" "$DEST/etc/X11/xorg.conf"
 # /dev/dri/card0 exists.  Both are always installed -- which one runs is a
 # question about the machine that booted the image, not about the image.
 cp "$root/res/xorg/xorg.conf.modesetting" "$DEST/etc/X11/xorg.conf.modesetting"
+# The third: the Intel driver with glamor on, picked by xserverrc when
+# drminfo names i915 behind the node.
+cp "$root/res/xorg/xorg.conf.modesetting-i915" "$DEST/etc/X11/xorg.conf.modesetting-i915"
 
 # ---------------------------------------------------------------------------
 # Drop debug information.

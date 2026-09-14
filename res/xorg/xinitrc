@@ -189,8 +189,19 @@ export XCURSOR_THEME XCURSOR_SIZE
 # paths.  The X server matches: res/xorg/xorg.conf.modesetting has glamor
 # off, so it offers no DRI3 that a client could reach the GPU through.  The
 # two go back together: drop this and put glamor back there.
-LIBGL_ALWAYS_SOFTWARE=1
-export LIBGL_ALWAYS_SOFTWARE
+#
+# Except on Intel graphics.  There the kernel's i915 driver, Mesa's iris
+# driver and the glamor configuration (xorg.conf.modesetting-i915, chosen
+# by xserverrc) exist for the accelerated path, so neither of the two
+# software pins below is set: GL goes to the GPU and WebKit's frames travel
+# as DMA-BUFs.  The driver's name is asked of the node the way xserverrc
+# asks it, so the two scripts always agree.
+LIKEOS_GPU_DRIVER=$(drminfo --driver /dev/dri/card0 2>/dev/null)
+export LIKEOS_GPU_DRIVER
+if [ "$LIKEOS_GPU_DRIVER" != "i915" ]; then
+	LIBGL_ALWAYS_SOFTWARE=1
+	export LIBGL_ALWAYS_SOFTWARE
+fi
 
 # WebKit's frames from the web process to the UI process: shared memory,
 # always.  WebKit adds its "hardware" transport (DMA-BUF through GBM) on
@@ -201,8 +212,10 @@ export LIBGL_ALWAYS_SOFTWARE
 # machine without a GPU uses, so it is the one every machine uses.  This
 # is not WEBKIT_DISABLE_DMABUF_RENDERER, which would switch acceleration
 # off altogether (see above).
-WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
-export WEBKIT_DMABUF_RENDERER_FORCE_SHM
+if [ "$LIKEOS_GPU_DRIVER" != "i915" ]; then
+	WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+	export WEBKIT_DMABUF_RENDERER_FORCE_SHM
+fi
 
 # No terminal is started here on purpose.  Use "Xterm" on the window manager's
 # menu, which is Alt+F1 -- the menus are on keys rather than mouse buttons

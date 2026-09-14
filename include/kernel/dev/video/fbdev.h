@@ -9,8 +9,33 @@
 #define _KERNEL_DEV_VIDEO_FBDEV_H_
 
 #include <kernel/uapi/types.h>
+#include <kernel/dev/video/fb.h>
 
 struct task;
+
+/* The display driver behind /dev/fb0.
+ *
+ * Whichever driver owns the screen registers one of these; /dev/fb0 then
+ * reports that driver's geometry, maps that driver's memory and routes mode
+ * changes and blanking to it.  With none registered the boot framebuffer
+ * (the console's own) is what the node shows, with its single mode.  Only
+ * get_info and get_phys are required; a NULL optional entry answers the
+ * conventional way (no mode changes, blanking pretended, nothing to do on
+ * map). */
+struct fbdev_backend {
+	const char *id; /* fb_fix_screeninfo.id, at most 15 characters */
+	int (*get_info)(framebuffer_info_t *out); /* current scanout geometry */
+	uint64_t (*get_phys)(uint64_t *size_out); /* base + size for mmap */
+	void (*mapped)(void); /* a client mapped the framebuffer */
+	/* 0 when the mode can be set, negative errno otherwise. */
+	int (*test_mode)(uint32_t w, uint32_t h, uint32_t bpp);
+	int (*set_mode)(uint32_t w, uint32_t h, uint32_t bpp);
+	int (*blank)(int unblank); /* 1 = display on */
+	void (*update_full)(void); /* whole screen changed */
+};
+/* Register (or, with NULL, withdraw) the backend. */
+void fbdev_register_backend(const struct fbdev_backend *b);
+const struct fbdev_backend *fbdev_backend(void);
 
 // ioctl entry for /dev/fb0 (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO,
 // FBIOPUT_VSCREENINFO, FBIOBLANK).  argp is a raw user pointer.

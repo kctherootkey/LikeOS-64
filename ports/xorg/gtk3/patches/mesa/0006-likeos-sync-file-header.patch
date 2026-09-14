@@ -1,0 +1,35 @@
+The sync-file ioctl header on LikeOS.
+
+The DRM sync-file interface header (the fence file descriptors a driver
+exports and merges) carries its own copy of the kernel's fixed-width
+types and ioctl macros for systems that are not the one it was written
+on, and picks the BSD ioctl header for every one of them.  LikeOS is not
+a BSD: it has sys/ioctl.h with the _IO macros the interface uses.  The
+same treatment the port gives the DRM header itself (0001), for the
+Intel driver, which is the first user of this header here.
+
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/include/drm-uapi/sync_file.h b/include/drm-uapi/sync_file.h
+--- a/include/drm-uapi/sync_file.h
++++ b/include/drm-uapi/sync_file.h
+@@ -11,6 +11,21 @@
+ #include <linux/ioctl.h>
+ #include <linux/types.h>
+ 
++#elif defined(__LIKEOS__)
++
++#include <stdint.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++
++typedef int8_t   __s8;
++typedef uint8_t  __u8;
++typedef int16_t  __s16;
++typedef uint16_t __u16;
++typedef int32_t  __s32;
++typedef uint32_t __u32;
++typedef int64_t  __s64;
++typedef uint64_t __u64;
++
+ #else /* One of the BSDs */
+ 
+ #include <stdint.h>

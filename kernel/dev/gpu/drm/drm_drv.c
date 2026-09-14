@@ -11,9 +11,11 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 #include <kernel/fs/sysfs.h>
+#include <kernel/fs/pseudofs.h>
 #include <kernel/mm/memory.h>
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/rand/random.h>
 
 #define DRM_MAJOR 226
@@ -115,6 +117,7 @@ static void drm_release(vfs_file_t *file)
 		kfree(fp->handles[k]);
 	fp->nhandles = 0;
 	drm_fence_handles_release(fp);
+	drm_syncobj_file_release(fp);
 	drm_kms_file_release(dev, fp);
 	if (dev->drv->postclose)
 		dev->drv->postclose(dev, fp);
@@ -147,6 +150,16 @@ int drm_master_set(struct drm_device *dev, struct drm_file *fp)
 		spin_unlock_irqrestore(&dev->lock, fl);
 		return -EBUSY;
 	}
+	if (dev->master == fp) {
+		/* Already the master: a display server asks again (SET_MASTER
+		 * on entering its VT) after having become master by opening
+		 * the node.  Nothing changes hands, so nothing below runs
+		 * again -- the hand-over below is counted (fbdev_opened), and
+		 * a second count with one release on exit left the console
+		 * neither painting nor listening after X had gone. */
+		spin_unlock_irqrestore(&dev->lock, fl);
+		return 0;
+	}
 	dev->master = fp;
 	fp->is_master = 1;
 	fp->authenticated = 1;
@@ -155,6 +168,15 @@ int drm_master_set(struct drm_device *dev, struct drm_file *fp)
 	drm_console_suspend(dev);
 	if (dev->drv->master_set)
 		dev->drv->master_set(dev, fp);
+	/* ...and stops LISTENING.  The console's output is silenced above,
+	 * but its input -- the pointer driving the scrollbar, the scrollback
+	 * and the terminal's mouse reporting -- is gated on the display being
+	 * owned (fbdev_display_owned), which a display manager on this node
+	 * never signals by itself: it opens /dev/dri/cardN, not /dev/fb0.
+	 * Said here, for every driver, rather than by one driver's hook: with
+	 * the Intel driver every scroll in an X window was also scrolling the
+	 * console underneath, unseen until X exited. */
+	fbdev_opened();
 	return 0;
 }
 
@@ -172,6 +194,11 @@ void drm_master_drop(struct drm_device *dev, struct drm_file *fp)
 	spin_unlock_irqrestore(&dev->lock, fl);
 	if (dev->drv->master_drop)
 		dev->drv->master_drop(dev, fp);
+	/* The display is the console's again: input is forwarded to it once
+	 * more and its screen and pointer are repainted in full (see
+	 * fbdev_closed) -- after the driver has handed the hardware back and
+	 * before the console's mode is set again below. */
+	fbdev_closed();
 	/* ...and back, which means setting the mode again: the CRTC is on a
 	 * framebuffer that is going away with the client that made it. */
 	drm_console_resume(dev);
@@ -283,11 +310,47 @@ static void drm_mmap_put(void *obj)
 	drm_gem_put(obj);
 }
 
+/* A mapping that does not start at the object's first page, or that is
+ * of a particular kind, carries this in place of the object: the page
+ * index is shifted and the object reference is held by it.  Such
+ * mappings are never dirty-tracked (the tracker addresses the object
+ * from byte zero), which is right for the drivers that use them -- the
+ * tracking exists for a device that cannot see the pages, and a device
+ * with an address space of its own can. */
+struct drm_mmap_ctx {
+	int refs;
+	struct drm_gem_object *obj;
+	uint64_t first_page;
+};
+
+static uint64_t drm_mmap_ctx_page_phys(void *arg, uint64_t index)
+{
+	struct drm_mmap_ctx *c = arg;
+	struct drm_gem_object *o = c->obj;
+	return o->dev->drv->gem_page_phys(o, c->first_page + index);
+}
+
+static void drm_mmap_ctx_get(void *arg)
+{
+	struct drm_mmap_ctx *c = arg;
+	__atomic_fetch_add(&c->refs, 1, __ATOMIC_ACQ_REL);
+}
+
+static void drm_mmap_ctx_put(void *arg)
+{
+	struct drm_mmap_ctx *c = arg;
+	if (__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL) == 0) {
+		drm_gem_put(c->obj);
+		kfree(c);
+	}
+}
+
 static int drm_mmap(vfs_file_t *file, struct device_mmap *m)
 {
 	struct drm_file *fp = drm_file_of(file);
 	struct drm_device *dev = fp->dev;
 	struct drm_gem_object *o = drm_gem_by_offset(dev, m->offset);
+	unsigned kind = drm_gem_mmap_kind_of(m->offset);
 
 	if (!o)
 		return -EINVAL;
@@ -296,21 +359,36 @@ static int drm_mmap(vfs_file_t *file, struct device_mmap *m)
 		return -ENODEV;
 	}
 	/* The offset within the window is the offset within the object. */
-	uint64_t inner = m->offset - drm_gem_mmap_offset(o);
+	uint64_t inner = m->offset & 0xFFFFFFFFULL;
 	if (inner + m->length > o->size) {
 		drm_gem_put(o);
 		return -EINVAL;
 	}
-	if (inner) {
-		/* Sub-range mappings: shift the page index. */
-		drm_gem_put(o);
-		return -EINVAL;
+	uint64_t pte = dev->drv->gem_mmap_pte ?
+			       dev->drv->gem_mmap_pte(o, kind) :
+			       dev->drv->gem_mmap_pte_extra;
+	if (inner || kind) {
+		struct drm_mmap_ctx *c = kalloc(sizeof(*c));
+		if (!c) {
+			drm_gem_put(o);
+			return -ENOMEM;
+		}
+		c->refs = 1;
+		c->obj = o; /* the reference taken above */
+		c->first_page = inner / PAGE_SIZE;
+		m->page_phys = drm_mmap_ctx_page_phys;
+		m->obj = c;
+		m->get = drm_mmap_ctx_get;
+		m->put = drm_mmap_ctx_put;
+		m->pte_extra = pte;
+		m->dirty_ops = NULL;
+		return 0;
 	}
 	m->page_phys = drm_mmap_page_phys;
 	m->obj = o; /* the reference taken above is the mapping's */
 	m->get = drm_mmap_get;
 	m->put = drm_mmap_put;
-	m->pte_extra = dev->drv->gem_mmap_pte_extra;
+	m->pte_extra = pte;
 	m->dirty_ops = &drm_gem_dirty_mmap_ops;
 	/* The census entry is NOT made here: it depends on the mapping's
 	 * protection, which only the address space knows, so mmap makes it
@@ -331,13 +409,14 @@ static int drm_is_render_only_ok(unsigned nr)
 	case 0x2e: /* PRIME_FD_TO_HANDLE */
 		return 1;
 	default:
-		return 0;
+		return drm_syncobj_is_ioctl(nr);
 	}
 }
 
 static long drm_core_ioctl(struct drm_device *dev, struct drm_file *fp,
 			   unsigned nr, void *kb, unsigned size, int *handled)
 {
+	(void)size; /* every core request is a fixed-size structure */
 	*handled = 1;
 	switch (nr) {
 	case 0x00: { /* VERSION */
@@ -468,7 +547,7 @@ static long drm_core_ioctl(struct drm_device *dev, struct drm_file *fp,
 			return 0;
 		case DRM_CAP_SYNCOBJ:
 		case DRM_CAP_SYNCOBJ_TIMELINE:
-			c->value = 0;
+			c->value = 1;
 			return 0;
 		default:
 			if (dev->drv->get_cap &&
@@ -643,6 +722,10 @@ static long drm_ioctl(vfs_file_t *file, unsigned long req, void *argp,
 				       -ENOTTY;
 		if (!handled)
 			rc = -ENOTTY;
+	} else if (drm_syncobj_is_ioctl(nr)) {
+		rc = drm_syncobj_ioctl(dev, fp, nr, kbuf, size, &handled);
+		if (!handled)
+			rc = -ENOTTY;
 	} else {
 		rc = drm_core_ioctl(dev, fp, nr, kbuf, size, &handled);
 		if (!handled)
@@ -661,22 +744,29 @@ static long drm_ioctl(vfs_file_t *file, unsigned long req, void *argp,
 	 *
 	 * ENOTTY is left out on purpose: probing for an ioctl that does not
 	 * exist is how userspace tests for optional features, and answering
-	 * that is not a failure. */
-	if (rc < 0 && rc != -ENOTTY) {
-		static uint32_t seen[64];
+	 * that is not a failure.  Nor is a call cut short by a signal: the
+	 * caller resumes or retries it. */
+	if (rc < 0 && rc != -ENOTTY && rc != -ERESTARTSYS && rc != -EINTR &&
+	    rc != -EAGAIN) {
+		/* Once per command, error AND process: a client that dies
+		 * of a refused call is usually not the one that first made
+		 * it, and a line hidden behind another process's is a
+		 * death with no cause on record. */
+		static uint64_t seen[128];
 		static unsigned nseen;
 		unsigned i;
-		uint32_t key = ((uint32_t)nr << 16) | (uint32_t)(-rc & 0xFFFF);
+		int pid = sched_current() ? (int)sched_current()->tgid : -1;
+		uint64_t key = ((uint64_t)(uint32_t)pid << 32) | ((uint32_t)nr << 16) |
+			       (uint32_t)(-rc & 0xFFFF);
 
-		for (i = 0; i < nseen && i < 64; i++)
+		for (i = 0; i < nseen && i < 128; i++)
 			if (seen[i] == key)
 				break;
-		if (i >= nseen && nseen < 64) {
+		if (i >= nseen && nseen < 128) {
 			seen[nseen++] = key;
 			kprintf("drm: ioctl nr=0x%02x (%s) returned %d for pid %d\n",
 				(unsigned)nr,
-				is_driver_ioctl ? "driver" : "core", (int)rc,
-				sched_current() ? (int)sched_current()->id : -1);
+				is_driver_ioctl ? "driver" : "core", (int)rc, pid);
 		}
 	}
 
@@ -702,6 +792,122 @@ static const struct device_ops drm_node_ops = {
 
 static struct devfs_node g_dri_dir;
 static int g_dri_dir_registered;
+static struct drm_device *g_drm_devices;
+
+void drm_late_init(void)
+{
+	for (struct drm_device *dev = g_drm_devices; dev; dev = dev->next_dev) {
+		if (dev->late_init_done)
+			continue;
+		dev->late_init_done = 1;
+		if (dev->drv->late_init) {
+			int rc = dev->drv->late_init(dev);
+			if (rc)
+				kprintf("[drm] %s: late init failed (%d)\n",
+					dev->drv->name, rc);
+		}
+	}
+}
+
+static long drm_show_hotplug(struct pfs_node *n, char *buf, long cap)
+{
+	struct drm_device *dev = n->arg;
+	return ksnprintf(buf, (size_t)cap, "%u\n", dev->hotplug_epoch);
+}
+
+/* ---- power ---------------------------------------------------------------- */
+
+int drm_suspend(struct drm_device *dev)
+{
+	int rc;
+
+	if (!dev->drv->suspend || !dev->drv->atomic_commit)
+		return -ENODEV;
+	if (dev->suspended)
+		return 0;
+	/* The console keeps drawing into its buffer; nothing pushes it
+	 * while the device is down. */
+	drm_console_suspend(dev);
+	rc = dev->drv->suspend(dev);
+	if (rc) {
+		drm_console_resume(dev);
+		return rc;
+	}
+	dev->suspended = 1;
+	kprintf("[drm] %s: suspended\n", dev->drv->name);
+	return 0;
+}
+
+int drm_resume(struct drm_device *dev)
+{
+	int rc;
+
+	if (!dev->drv->resume || !dev->drv->atomic_commit)
+		return -ENODEV;
+	if (!dev->suspended)
+		return 0;
+	rc = dev->drv->resume(dev);
+	if (rc) {
+		kprintf("[drm] %s: resume failed (%d)\n", dev->drv->name, rc);
+		return rc;
+	}
+	dev->suspended = 0;
+	/* What was shown before is shown again: the committed state, every
+	 * active crtc as a fresh mode set. */
+	rc = drm_atomic_replay(dev);
+	if (rc)
+		kprintf("[drm] %s: the display did not come back (%d)\n",
+			dev->drv->name, rc);
+	/* the console's pushes resume; its mode was part of the replay
+	 * when it owns the screen, so no second mode set */
+	drm_console_resume_pushes(dev);
+	kprintf("[drm] %s: resumed\n", dev->drv->name);
+	return rc;
+}
+
+int drm_suspend_all(void)
+{
+	int rc = 0;
+	for (struct drm_device *dev = g_drm_devices; dev; dev = dev->next_dev) {
+		int r = drm_suspend(dev);
+		if (r && r != -ENODEV && rc == 0)
+			rc = r;
+	}
+	return rc;
+}
+
+int drm_resume_all(void)
+{
+	int rc = 0;
+	for (struct drm_device *dev = g_drm_devices; dev; dev = dev->next_dev) {
+		int r = drm_resume(dev);
+		if (r && r != -ENODEV && rc == 0)
+			rc = r;
+	}
+	return rc;
+}
+
+static long drm_show_power_state(struct pfs_node *n, char *buf, long cap)
+{
+	struct drm_device *dev = n->arg;
+	return ksnprintf(buf, (size_t)cap, "%s\n", dev->suspended ? "off" : "on");
+}
+
+/* "off" / "on": the whole suspend and resume path, for exercising it on
+ * a machine that has no system sleep to trigger it. */
+static long drm_store_power_state(struct pfs_node *n, const char *buf, long len)
+{
+	struct drm_device *dev = n->arg;
+	int rc;
+
+	if (len >= 3 && buf[0] == 'o' && buf[1] == 'f' && buf[2] == 'f')
+		rc = drm_suspend(dev);
+	else if (len >= 2 && buf[0] == 'o' && buf[1] == 'n')
+		rc = drm_resume(dev);
+	else
+		return -EINVAL;
+	return rc ? rc : len;
+}
 
 int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 		     const pci_device_t *pci, void *priv)
@@ -759,6 +965,22 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 		  "dri/renderD%d", DRM_RENDER_MINOR_BASE + dev->index);
 	sysfs_add_char_device(dev->devname_card, DRM_MAJOR, (uint32_t)dev->index,
 			      "drm", pci);
+	/* /sys/class/drm/cardN/hotplug: a count that changes whenever a
+	 * connector's status did.  No event bus carries hotplugs to clients
+	 * here; a client that cares polls this and re-reads its connectors
+	 * when it moved. */
+	{
+		char base[96];
+		if (pci)
+			ksnprintf(base, sizeof(base), "bus/pci/devices/0000:%02x:%02x.%x/drm/card%d",
+				  pci->bus, pci->device, pci->function, dev->index);
+		else
+			ksnprintf(base, sizeof(base), "devices/virtual/drm/card%d", dev->index);
+		sysfs_add_attr(base, "hotplug", drm_show_hotplug, NULL, dev, 0);
+		if (drv->suspend && drv->resume && drv->atomic_commit)
+			sysfs_add_attr(base, "power_state", drm_show_power_state,
+				       drm_store_power_state, dev, 0);
+	}
 	sysfs_add_char_device(dev->devname_render, DRM_MAJOR,
 			      (uint32_t)(DRM_RENDER_MINOR_BASE + dev->index),
 			      "drm", pci);
@@ -767,6 +989,10 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 	/* Object teardown runs here, not in a client's ioctl.  See
 	 * drm_gem_reap_start(). */
 	drm_gem_reap_start(dev);
+	dev->next_dev = g_drm_devices;
+	g_drm_devices = dev;
+	if (pci)
+		sysfs_pci_set_driver(pci, drv->name);
 	kprintf("[drm] %s: /dev/dri/card%d + renderD%d (%s), version %d.%d.%d\n",
 		drv->name, dev->index, DRM_RENDER_MINOR_BASE + dev->index,
 		dev->unique, drv->major, drv->minor, drv->patch);

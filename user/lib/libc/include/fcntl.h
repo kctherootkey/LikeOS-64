@@ -58,6 +58,7 @@ extern "C" {
 #define F_GETFL         3
 #define F_SETFL         4
 #define F_DUPFD_CLOEXEC 1030
+#define F_DUPFD_QUERY   1027
 /* memfd seals. */
 #define F_ADD_SEALS 1033
 #define F_GET_SEALS 1034

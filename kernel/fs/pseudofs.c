@@ -291,6 +291,18 @@ struct pfs_node *pfs_add_file(struct pfs *fs, const char *path,
 	return n;
 }
 
+struct pfs_node *pfs_add_file_rw(struct pfs *fs, const char *path,
+				 pfs_show_t show, pfs_store_t store, void *arg,
+				 uint64_t arg2)
+{
+	struct pfs_node *n = pfs_add_file(fs, path, show, arg, arg2);
+	if (n) {
+		n->store = store;
+		n->mode = 0644;
+	}
+	return n;
+}
+
 struct pfs_node *pfs_add_link(struct pfs *fs, const char *path,
 			      const char *target)
 {
@@ -433,11 +445,17 @@ static int pfs_open_common(struct pfs *fs, const char *path, int flags,
 
 	if (!rel)
 		return ST_NOT_FOUND;
-	if ((flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
+	if ((flags & (O_CREAT | O_TRUNC)) && !(flags & (O_WRONLY | O_RDWR)))
 		return ST_PERM;
 	struct pfs_node *n = pfs_lookup(fs, rel);
 	if (!n)
 		return ST_NOT_FOUND;
+	/* Only a file with a store callback opens for writing (O_TRUNC on
+	 * it is harmless: there is nothing to truncate). */
+	if ((flags & (O_WRONLY | O_RDWR)) && (n->type != PFS_FILE || !n->store)) {
+		pfs_node_put(n);
+		return ST_PERM;
+	}
 	pfs_file_t *pf = kalloc(sizeof(*pf));
 	if (!pf) {
 		pfs_node_put(n);
@@ -552,12 +570,23 @@ static long pfs_read(vfs_file_t *f, void *buf, long bytes)
 	return n;
 }
 
+#define PFS_STORE_MAX 256
+
 static long pfs_write(vfs_file_t *f, const void *buf, long bytes)
 {
-	(void)f;
-	(void)buf;
-	(void)bytes;
-	return -EACCES;
+	pfs_file_t *pf = f->fs_private;
+	char tmp[PFS_STORE_MAX];
+
+	if (!pf || !pf->node || pf->node->type != PFS_FILE || !pf->node->store)
+		return -EACCES;
+	if (bytes <= 0)
+		return 0;
+	if (bytes > PFS_STORE_MAX)
+		bytes = PFS_STORE_MAX;
+	smap_disable();
+	mm_memcpy(tmp, buf, bytes);
+	smap_enable();
+	return pf->node->store(pf->node, tmp, bytes);
 }
 
 static long pfs_seek(vfs_file_t *f, long offset, int whence)

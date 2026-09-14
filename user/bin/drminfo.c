@@ -14,9 +14,16 @@
  * userspace stack above it does not, which is exactly when a tool that
  * depends on that stack is no use.
  *
- * Usage: drminfo [-n node] [-v]
+ * Usage: drminfo [-n node] [-v] [--driver [node]]
  *   -n   examine one node (a path, or a number meaning /dev/dri/card<N>)
  *   -v   also list every mode of every connector and every property value
+ *   --driver   print only the driver's name for the node (default
+ *              /dev/dri/card0) and exit 1 when there is none -- what a
+ *              startup script asks to decide which X configuration and
+ *              which rendering policy this machine gets
+ *   --has-display   exit 0 when the node reports a connector and a CRTC,
+ *              1 otherwise: a display server should not be pointed at a
+ *              device that has no screen to offer
  */
 
 #include <stdio.h>
@@ -28,11 +35,14 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <stdint.h>
 #include <sys/sysmacros.h>
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 #include <drm/vmwgfx_drm.h>
+#include <drm/i915_drm.h>
 
 /* vmwgfx_drm.h numbers the driver's commands but does not spell the ioctls
  * out: every consumer builds them from DRM_COMMAND_BASE, and the one this
@@ -462,6 +472,160 @@ static void driver_name(int fd, char *out, size_t cap)
 	out[v.name_len] = '\0';
 }
 
+/* The Intel driver's parameters: what the device is and how it is built,
+ * as GETPARAM answers them.  A parameter the driver does not answer yet is
+ * shown as such rather than skipped, so the list doubles as a record of
+ * what is implemented. */
+static void print_i915(int fd)
+{
+	static const struct {
+		int param;
+		const char *name;
+		int hex;
+	} params[] = {
+		{ I915_PARAM_CHIPSET_ID, "chipset id", 1 },
+		{ I915_PARAM_REVISION, "revision", 1 },
+		{ I915_PARAM_HAS_LLC, "has LLC", 0 },
+		{ I915_PARAM_SLICE_MASK, "slice mask", 1 },
+		{ I915_PARAM_SUBSLICE_MASK, "subslice mask", 1 },
+		{ I915_PARAM_SUBSLICE_TOTAL, "subslices", 0 },
+		{ I915_PARAM_EU_TOTAL, "execution units", 0 },
+		{ I915_PARAM_CS_TIMESTAMP_FREQUENCY, "timestamp Hz", 0 },
+		{ I915_PARAM_MMAP_GTT_VERSION, "mmap version", 0 },
+		{ I915_PARAM_HAS_EXEC_SOFTPIN, "softpin", 0 },
+		{ I915_PARAM_HAS_EXEC_NO_RELOC, "no-reloc", 0 },
+		{ I915_PARAM_HAS_EXEC_HANDLE_LUT, "handle LUT", 0 },
+		{ I915_PARAM_HAS_EXEC_BATCH_FIRST, "batch first", 0 },
+		{ I915_PARAM_HAS_EXEC_FENCE_ARRAY, "fence arrays", 0 },
+		{ I915_PARAM_HAS_CONTEXT_ISOLATION, "context isolation", 0 },
+		{ I915_PARAM_HAS_GPU_RESET, "gpu reset", 0 },
+		{ I915_PARAM_HAS_SCHEDULER, "scheduler caps", 1 },
+	};
+	printf("  i915 parameters:\n");
+	for (unsigned i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
+		struct drm_i915_getparam gp;
+		int value = 0;
+		gp.param = params[i].param;
+		gp.value = &value;
+		if (ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) == -1) {
+			printf("    %-20s (%s)\n", params[i].name,
+			       errno == EINVAL ? "not implemented" :
+						 strerror(errno));
+			continue;
+		}
+		if (params[i].hex)
+			printf("    %-20s 0x%x\n", params[i].name, value);
+		else
+			printf("    %-20s %d\n", params[i].name, value);
+	}
+	/* A round trip through the object and context interface: what the
+	 * Mesa driver does first when it opens the device. */
+	{
+		struct drm_i915_gem_create c;
+		struct drm_i915_gem_mmap_offset mo;
+		struct drm_i915_gem_context_create cc;
+		struct drm_i915_gem_context_destroy cd;
+		struct drm_i915_gem_vm_control vm;
+		struct drm_gem_close gc;
+		memset(&c, 0, sizeof(c));
+		c.size = 65536;
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &c) == 0) {
+			memset(&mo, 0, sizeof(mo));
+			mo.handle = c.handle;
+			mo.flags = I915_MMAP_OFFSET_WB;
+			int mrc = ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_GTT, &mo);
+			printf("    object create        handle %u, %llu bytes, mmap offset %s\n",
+			       c.handle, (unsigned long long)c.size,
+			       mrc == 0 ? "ok" : strerror(errno));
+			if (mrc == 0) {
+				void *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+					       (off_t)mo.offset);
+				if (p != MAP_FAILED) {
+					((volatile uint32_t *)p)[0] = 0x12345678;
+					printf("    object mmap          ok (%s)\n",
+					       ((volatile uint32_t *)p)[0] == 0x12345678 ? "readback ok" : "readback FAILED");
+					munmap(p, 65536);
+				} else {
+					printf("    object mmap          %s\n", strerror(errno));
+				}
+			}
+			memset(&gc, 0, sizeof(gc));
+			gc.handle = c.handle;
+			ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+		} else {
+			printf("    object create        %s\n", strerror(errno));
+		}
+		memset(&cc, 0, sizeof(cc));
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_CREATE, &cc) == 0) {
+			printf("    context create       id %u\n", cc.ctx_id);
+			memset(&cd, 0, sizeof(cd));
+			cd.ctx_id = cc.ctx_id;
+			ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_DESTROY, &cd);
+		} else {
+			printf("    context create       %s\n", strerror(errno));
+		}
+		memset(&vm, 0, sizeof(vm));
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_VM_CREATE, &vm) == 0) {
+			printf("    vm create            id %u\n", vm.vm_id);
+			ioctl(fd, DRM_IOCTL_I915_GEM_VM_DESTROY, &vm);
+		} else {
+			printf("    vm create            %s\n", strerror(errno));
+		}
+		/* engines and topology through QUERY */
+		struct drm_i915_query_item it[2];
+		struct drm_i915_query q;
+		memset(it, 0, sizeof(it));
+		it[0].query_id = DRM_I915_QUERY_ENGINE_INFO;
+		it[1].query_id = DRM_I915_QUERY_TOPOLOGY_INFO;
+		memset(&q, 0, sizeof(q));
+		q.num_items = 2;
+		q.items_ptr = (uint64_t)(uintptr_t)it;
+		if (ioctl(fd, DRM_IOCTL_I915_QUERY, &q) == 0) {
+			printf("    query engine info    %d bytes\n", it[0].length);
+			printf("    query topology       %d bytes\n", it[1].length);
+			if (it[0].length > 0) {
+				char *buf = calloc(1, (size_t)it[0].length);
+				it[0].data_ptr = (uint64_t)(uintptr_t)buf;
+				q.num_items = 1;
+				if (buf && ioctl(fd, DRM_IOCTL_I915_QUERY, &q) == 0) {
+					struct drm_i915_query_engine_info *ei = (void *)buf;
+					static const char *cls[] = { "render", "copy", "video", "video-enhance", "compute" };
+					printf("    engines             ");
+					for (unsigned k = 0; k < ei->num_engines; k++)
+						printf(" %s%u",
+						       ei->engines[k].engine.engine_class < 5 ?
+							       cls[ei->engines[k].engine.engine_class] : "?",
+						       ei->engines[k].engine.engine_instance);
+					printf("\n");
+				}
+				free(buf);
+			}
+		} else {
+			printf("    query                %s\n", strerror(errno));
+		}
+	}
+}
+
+/* Does the node offer a display: at least one connector and one CRTC?
+ * A driver that has found its device but not yet lit a screen (or a
+ * render-only device) answers no, and the X server's start-up script then
+ * keeps the framebuffer server. */
+static int has_display(const char *node)
+{
+	struct drm_mode_card_res res;
+	int fd = open(node, O_RDWR);
+
+	if (fd < 0)
+		return 1;
+	memset(&res, 0, sizeof(res));
+	if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == -1) {
+		close(fd);
+		return 1;
+	}
+	close(fd);
+	return (res.count_connectors > 0 && res.count_crtcs > 0) ? 0 : 1;
+}
+
 static int examine(const char *path)
 {
 	char name[64];
@@ -485,6 +649,8 @@ static int examine(const char *path)
 	driver_name(fd, name, sizeof(name));
 	if (!strcmp(name, "vmwgfx"))
 		print_vmw(fd);
+	else if (!strcmp(name, "i915"))
+		print_i915(fd);
 
 	print_kms(fd);
 	printf("\n");
@@ -541,6 +707,31 @@ static int examine_all(void)
 	return 0;
 }
 
+/* The driver's name alone, for scripts.  Nothing else is printed, so the
+ * output can be compared with a string. */
+static int print_driver(const char *node)
+{
+	struct drm_version v;
+	char name[32];
+	int fd = open(node, O_RDWR);
+
+	if (fd < 0)
+		return 1;
+	memset(&v, 0, sizeof(v));
+	memset(name, 0, sizeof(name));
+	v.name = name;
+	v.name_len = sizeof(name) - 1;
+	if (ioctl(fd, DRM_IOCTL_VERSION, &v) == -1) {
+		close(fd);
+		return 1;
+	}
+	close(fd);
+	if (!name[0])
+		return 1;
+	printf("%s\n", name);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *node = NULL;
@@ -552,10 +743,30 @@ int main(int argc, char **argv)
 			verbose = 1;
 		} else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
 			node = argv[++i];
+		} else if (!strcmp(argv[i], "--has-display")) {
+			const char *n = "/dev/dri/card0";
+			if (i + 1 < argc)
+				n = argv[++i];
+			if (n[0] >= '0' && n[0] <= '9') {
+				snprintf(path, sizeof(path), "/dev/dri/card%s", n);
+				n = path;
+			}
+			return has_display(n);
+		} else if (!strcmp(argv[i], "--driver")) {
+			const char *n = "/dev/dri/card0";
+			if (i + 1 < argc)
+				n = argv[++i];
+			if (n[0] >= '0' && n[0] <= '9') {
+				snprintf(path, sizeof(path), "/dev/dri/card%s", n);
+				n = path;
+			}
+			return print_driver(n);
 		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-			printf("usage: drminfo [-n node] [-v]\n"
+			printf("usage: drminfo [-n node] [-v] [--driver [node]]\n"
 			       "  -n   one node: a path, or a number N for /dev/dri/card<N>\n"
-			       "  -v   list every mode rather than the first few\n");
+			       "  -v   list every mode rather than the first few\n"
+			       "  --driver   print the driver name of the node (card0) only\n"
+			       "  --has-display   exit 0 when the node has a connector and a CRTC\n");
 			return 0;
 		} else {
 			fprintf(stderr, "drminfo: unknown argument '%s'\n", argv[i]);

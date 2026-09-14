@@ -148,6 +148,30 @@ static void sysfs_add_pci(const pci_device_t *d)
 	dir->arg = (void *)d;
 }
 
+int sysfs_pci_set_driver(const pci_device_t *dev, const char *name)
+{
+	char base[64], path[128], target[128];
+
+	if (!dev || !name)
+		return -EINVAL;
+	pci_relpath(dev, base, sizeof(base));
+	struct pfs_node *dir = pfs_lookup(&g_sysfs, base);
+	if (!dir)
+		return -ENOENT;
+	dir->arg2 = (uint64_t)(uintptr_t)name;
+	ksnprintf(path, sizeof(path), "bus/pci/drivers/%s", name);
+	if (!pfs_mkdir(&g_sysfs, path))
+		return -ENOMEM;
+	ksnprintf(path, sizeof(path), "bus/pci/drivers/%s/0000:%02x:%02x.%x",
+		  name, dev->bus, dev->device, dev->function);
+	ksnprintf(target, sizeof(target), "/sys/%s", base);
+	pfs_add_link(&g_sysfs, path, target);
+	ksnprintf(path, sizeof(path), "%s/driver", base);
+	ksnprintf(target, sizeof(target), "../../../bus/pci/drivers/%s", name);
+	pfs_add_link(&g_sysfs, path, target);
+	return 0;
+}
+
 /* ---- character devices ---- */
 
 static long chr_show_uevent(struct pfs_node *n, char *buf, long cap)
@@ -216,6 +240,46 @@ int sysfs_add_char_device(const char *name, uint32_t major, uint32_t minor,
 	ksnprintf(path, sizeof(path), "class/%s/%s", class, bn);
 	pfs_add_link(&g_sysfs, path, target);
 	return 0;
+}
+
+int sysfs_add_class_device(const char *class, const char *name,
+			   const pci_device_t *pci, char *base, size_t cap)
+{
+	char path[128], target[128];
+
+	if (pci) {
+		char pcirel[64];
+		pci_relpath(pci, pcirel, sizeof(pcirel));
+		ksnprintf(base, cap, "%s/%s/%s", pcirel, class, name);
+	} else {
+		ksnprintf(base, cap, "devices/virtual/%s/%s", class, name);
+	}
+	if (!pfs_mkdir(&g_sysfs, base))
+		return -ENOMEM;
+	if (pci) {
+		ksnprintf(path, sizeof(path), "%s/device", base);
+		pfs_add_link(&g_sysfs, path, "../..");
+	}
+	ksnprintf(path, sizeof(path), "%s/subsystem", base);
+	ksnprintf(target, sizeof(target), "/sys/class/%s", class);
+	pfs_add_link(&g_sysfs, path, target);
+	ksnprintf(path, sizeof(path), "class/%s", class);
+	pfs_mkdir(&g_sysfs, path);
+	ksnprintf(path, sizeof(path), "class/%s/%s", class, name);
+	ksnprintf(target, sizeof(target), "/sys/%s", base);
+	pfs_add_link(&g_sysfs, path, target);
+	return 0;
+}
+
+struct pfs_node *sysfs_add_attr(const char *base, const char *name,
+				pfs_show_t show, pfs_store_t store, void *arg,
+				uint64_t arg2)
+{
+	char path[192];
+	ksnprintf(path, sizeof(path), "%s/%s", base, name);
+	if (store)
+		return pfs_add_file_rw(&g_sysfs, path, show, store, arg, arg2);
+	return pfs_add_file(&g_sysfs, path, show, arg, arg2);
 }
 
 void sysfs_init(void)

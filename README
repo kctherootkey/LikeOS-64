@@ -124,6 +124,20 @@ Graphics and input
 - Framebuffer console with scrollback, a scrollbar, and a mouse pointer.
 - VMware SVGA II driver with mode setting and a hardware cursor; the UEFI GOP
   framebuffer is the fallback on hardware without it.
+- Intel graphics (i915): a native driver for the integrated GPUs of the
+  Broadwell through Meteor Lake generations, fully driven on Skylake-class
+  parts (the ThinkPad P50's HD Graphics 530 is the reference machine):
+  eDP panel bring-up from the VBT and EDID (link training, panel power
+  sequencing, PWM backlight with /sys/class/backlight/intel_backlight and
+  the backlight(1) tool), HDMI/DVI and DisplayPort outputs with hotplug
+  re-detection, X-/Y-tiled scanout, execution-list command submission with
+  per-context 48-bit address spaces, hang detection and engine reset, the
+  i915 ioctl interface Mesa's iris driver uses (GEM objects, contexts,
+  execbuffer2, sync objects, queries), DMC firmware loading from
+  /lib/firmware/i915.  Older generations and the Xe2+ parts are identified
+  and left to the firmware framebuffer.  The X server picks
+  xorg.conf.modesetting-i915 (glamor, DRI3, page flipping) when it is the
+  driver; drminfo(1) reports it.
 - /dev/fb0 (fbdev) and /dev/input/event* (evdev), which is what the X server
   drives.
 - PS/2 keyboard and mouse, USB HID, and I2C-HID touchpads.

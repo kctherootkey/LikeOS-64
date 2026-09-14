@@ -41,6 +41,15 @@ struct drm_fence {
 	struct drm_device *dev;
 	uint32_t seqno; /* backend sequence */
 	uint32_t flags; /* DRM_VMW_FENCE_FLAG_* or backend bits */
+	/* A second numbering for devices with several independent streams:
+	 * `context' names the stream (an engine's timeline), `seqno64' the
+	 * position in it.  Zero context = the single device-wide sequence
+	 * above, which is what drm_fence_signal_upto() advances. */
+	uint64_t context;
+	uint64_t seqno64;
+	/* Set when the work behind the fence failed (a reset threw it
+	 * away); the fence is signalled all the same. */
+	int error;
 	volatile int signaled;
 	uint64_t signal_ns;
 	struct wait_queue_head wq;
@@ -55,6 +64,13 @@ void drm_fence_put(struct drm_fence *f);
 void drm_fence_signal(struct drm_fence *f);
 /* Signal every fence with seqno <= passed (wrap-safe). */
 void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed);
+/* A fence on stream `context' at position `seqno64' (never zero); it is
+ * signalled by drm_fence_signal_upto_ctx() once the stream has passed it,
+ * or individually with drm_fence_signal(). */
+struct drm_fence *drm_fence_create_ctx(struct drm_device *dev,
+				       uint64_t context, uint64_t seqno64);
+void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
+			       uint64_t passed);
 /* 0 signalled, -ETIMEDOUT, -EINTR. */
 /* Wait for a fence, bounded by `timeout_ns'.
  *
@@ -100,6 +116,11 @@ struct drm_gem_object {
 	uint32_t id; /* device-global, for mmap offsets and flink names */
 	uint64_t size; /* bytes */
 	uint32_t npages;
+	/* The pages are a client's own (an object over user memory): they
+	 * were referenced, not allocated, and are released with a reference
+	 * drop, never freed.  Recorded here rather than in the driver's
+	 * per-object state, which is gone by the time the pages go. */
+	int pages_borrowed;
 	uint64_t *pages; /* physical page addresses (BOs) */
 	/* Last submission that touched the object; waited for before CPU
 	 * access and before destruction. */
@@ -132,6 +153,15 @@ int drm_gem_alloc_pages(struct drm_gem_object *o);
 int drm_gem_alloc_pages_contig(struct drm_gem_object *o);
 /* The mmap offset userspace uses for this object on the device node. */
 uint64_t drm_gem_mmap_offset(struct drm_gem_object *o);
+/* The same, for a mapping of a particular kind (a driver's notion:
+ * write-back, write-combining, uncached, through an aperture).  Kind 0 is
+ * the plain offset above.  See drm_gem.c for the encoding. */
+#define DRM_GEM_MMAP_KIND_MAX 15
+uint64_t drm_gem_mmap_offset_kind(struct drm_gem_object *o, unsigned kind);
+static inline unsigned drm_gem_mmap_kind_of(uint64_t offset)
+{
+	return (unsigned)(offset >> 56) & DRM_GEM_MMAP_KIND_MAX;
+}
 uint32_t drm_gem_handle_of_slot(struct drm_file *fp, uint32_t slot);
 struct drm_gem_object *drm_gem_lookup_foreign(struct drm_device *dev,
 					      uint32_t handle);
@@ -211,11 +241,16 @@ void *drm_gem_page_virt(struct drm_gem_object *o, uint32_t page);
 
 /* ---- mode objects ------------------------------------------------------ */
 
-#define DRM_MAX_CONNECTORS 4
-#define DRM_MAX_MODES 24
-#define DRM_MAX_PROPS 48
-#define DRM_MAX_BLOBS 32
-#define DRM_MAX_FBS 64
+/* Sized for a real display controller: several outputs, each with the
+ * modes a monitor's EDID lists plus the standard table behind it, and a
+ * compositor that keeps a framebuffer per surface it presents. */
+#define DRM_MAX_CONNECTORS 8
+#define DRM_MAX_CRTCS DRM_MAX_CONNECTORS
+#define DRM_MAX_PLANES 32
+#define DRM_MAX_MODES 128
+#define DRM_MAX_PROPS 96
+#define DRM_MAX_BLOBS 128
+#define DRM_MAX_FBS 1024
 /* Handles per file.  The slot half of a handle is 16 bits wide (see
  * drm_gem.c), so this is the most the encoding can name; it was 4096, and a
  * web process rendering a heavy page -- two handles per texture, one per
@@ -256,14 +291,43 @@ struct drm_crtc {
 	int index;
 	int active;
 	struct drm_mode_modeinfo mode;
+	uint32_t mode_blob; /* MODE_ID: the mode above as a blob, 0 when off */
 	uint32_t fb_id;
 	int x, y;
 	uint16_t gamma[3][256];
+	int gamma_identity; /* the table above is the identity */
 	/* cursor */
 	uint32_t cursor_handle_w, cursor_handle_h;
 	int cursor_x, cursor_y;
 	struct drm_gem_object *cursor_obj;
+	/* The framebuffer the core wraps a legacy cursor object in, so that
+	 * the cursor is a plane like any other (atomic drivers). */
+	uint32_t cursor_fb_id;
 	uint32_t primary_plane_id, cursor_plane_id;
+};
+
+/* A plane: a source rectangle of a framebuffer shown on a rectangle of a
+ * CRTC.  Every CRTC has a primary and a cursor plane; a driver may add
+ * overlays.  The fields below are the COMMITTED state; a change goes
+ * through a drm_atomic_state first. */
+struct drm_plane {
+	uint32_t id;
+	int index;
+	uint32_t type; /* DRM_PLANE_TYPE_* */
+	uint32_t possible_crtcs; /* bit = crtc index */
+	int crtc; /* crtc index, -1 when off */
+	uint32_t fb_id;
+	uint32_t src_x, src_y, src_w, src_h; /* 16.16 */
+	int32_t crtc_x, crtc_y;
+	uint32_t crtc_w, crtc_h;
+	int32_t hot_x, hot_y; /* cursor hot spot */
+	/* what it scans out */
+	const uint32_t *formats;
+	uint32_t nformats;
+	const uint64_t *modifiers;
+	uint32_t nmodifiers;
+	uint32_t in_formats_blob;
+	void *priv; /* the driver's per-plane state */
 };
 
 struct drm_connector {
@@ -278,6 +342,13 @@ struct drm_connector {
 	struct drm_mode_modeinfo modes[DRM_MAX_MODES];
 	uint32_t nmodes;
 	uint32_t edid_blob_id;
+	/* From the EDID, when there is one: the sink's limits (used to
+	 * filter the standard table) and what it is. */
+	uint32_t range_max_clock_khz, range_min_vrefresh, range_max_vrefresh;
+	uint32_t range_min_hfreq_khz, range_max_hfreq_khz;
+	int is_hdmi;
+	char sink_name[14];
+	void *priv; /* the driver's per-connector state */
 };
 
 struct drm_encoder {
@@ -315,6 +386,9 @@ struct drm_file {
 	/* fence handle -> fence, a namespace of its own */
 	struct drm_fence **fences;
 	uint32_t nfences;
+	/* synchronisation objects (drm_syncobj.c), another namespace */
+	struct drm_syncobj **syncobjs;
+	uint32_t nsyncobjs;
 	spinlock_t lock;
 	/* event queue */
 	struct drm_pending_event *events, *events_tail;
@@ -331,6 +405,103 @@ static inline struct drm_gem_object **drm_handle_slot(struct drm_file *fp,
 						      uint32_t slot)
 {
 	return &fp->handles[slot / DRM_HANDLE_CHUNK][slot % DRM_HANDLE_CHUNK];
+}
+
+/* ---- atomic state (drm_atomic.c) ---------------------------------------- */
+/*
+ * A mode-setting request is a STATE: the value every plane, CRTC and
+ * connector would have once it is applied, built from the committed
+ * state and the properties the caller changes, checked as a whole by the
+ * core and the driver, and then applied by the driver in one go.  The
+ * legacy calls (SETCRTC, PAGE_FLIP, SETPLANE, CURSOR, DPMS, SETGAMMA) and
+ * the kernel console's own mode set are translated into such states for
+ * a driver that has the atomic entry points; a driver without them keeps
+ * the older per-call entry points below.
+ */
+struct drm_plane_state {
+	struct drm_plane *plane;
+	int crtc; /* crtc index, -1 off */
+	uint32_t fb_id;
+	struct drm_framebuffer *fb; /* resolved fb_id, NULL when 0 */
+	uint32_t src_x, src_y, src_w, src_h; /* 16.16 */
+	int32_t crtc_x, crtc_y;
+	uint32_t crtc_w, crtc_h;
+	int32_t hot_x, hot_y;
+	int changed; /* named in this request */
+	int fb_changed; /* a different framebuffer (or none) */
+	int crtc_changed; /* moved between crtcs or switched on/off */
+	int geometry_changed;
+};
+
+struct drm_crtc_state {
+	struct drm_crtc *crtc;
+	int active;
+	int mode_valid;
+	struct drm_mode_modeinfo mode; /* what the client asked for */
+	/* What the transcoder actually runs: the driver's check fills it in
+	 * when it differs (a panel with one native timing that the pipe
+	 * scales the client's mode onto). */
+	struct drm_mode_modeinfo adjusted_mode;
+	int use_scaler;
+	uint16_t gamma[3][256];
+	int gamma_identity;
+	int changed; /* named in this request, or a plane of it was */
+	int mode_changed; /* a full mode set: the pipe comes down and up */
+	int active_changed;
+	int gamma_changed;
+	int connectors_changed;
+	uint32_t connector_mask; /* connectors on this crtc in this state */
+	int event; /* a flip event was asked for */
+};
+
+struct drm_connector_state {
+	struct drm_connector *conn;
+	int crtc; /* crtc index, -1 */
+	int dpms;
+	int changed;
+};
+
+struct drm_atomic_state {
+	struct drm_device *dev;
+	struct drm_file *fp; /* NULL: the kernel console */
+	uint32_t flags; /* DRM_MODE_ATOMIC_* */
+	uint64_t user_data; /* for the flip events */
+	int allow_modeset;
+	struct drm_plane_state planes[DRM_MAX_PLANES];
+	struct drm_crtc_state crtcs[DRM_MAX_CRTCS];
+	struct drm_connector_state conns[DRM_MAX_CONNECTORS];
+};
+
+struct drm_atomic_state *drm_atomic_state_alloc(struct drm_device *dev,
+						struct drm_file *fp,
+						uint32_t flags);
+void drm_atomic_state_free(struct drm_atomic_state *st);
+/* Property writes into a state; -EINVAL for a property the object does
+ * not have, -ENOENT for an object id that does not exist. */
+int drm_atomic_plane_set(struct drm_atomic_state *st, struct drm_plane *p,
+			 uint32_t prop, uint64_t val);
+int drm_atomic_crtc_set(struct drm_atomic_state *st, struct drm_crtc *c,
+			uint32_t prop, uint64_t val);
+int drm_atomic_conn_set(struct drm_atomic_state *st, struct drm_connector *c,
+			uint32_t prop, uint64_t val);
+/* The core's consistency checks, then the driver's. */
+int drm_atomic_check(struct drm_atomic_state *st);
+/* Apply: the driver programs the hardware, then the objects take the
+ * state's values and the flip events are queued.  Check first. */
+int drm_atomic_commit(struct drm_atomic_state *st);
+/* The primary and cursor plane of a crtc. */
+struct drm_plane *drm_crtc_primary(struct drm_device *dev, int crtc);
+struct drm_plane *drm_crtc_cursor(struct drm_device *dev, int crtc);
+/* The plane's state inside `st'. */
+static inline struct drm_plane_state *drm_atomic_plane_state(struct drm_atomic_state *st,
+							     const struct drm_plane *p)
+{
+	return &st->planes[p->index];
+}
+/* Iteration helpers for drivers: the crtcs and planes the request names. */
+static inline int drm_crtc_state_needs_modeset(const struct drm_crtc_state *cs)
+{
+	return cs->mode_changed || cs->active_changed || cs->connectors_changed;
 }
 
 /* ---- the driver ---------------------------------------------------------- */
@@ -383,12 +554,27 @@ struct drm_driver {
 	/* the pages of an object for mmap, or -1 if not mappable */
 	uint64_t (*gem_page_phys)(struct drm_gem_object *o, uint64_t index);
 	uint64_t gem_mmap_pte_extra;
+	/* Optional: the PTE cache bits for a mapping of this object of this
+	 * kind (drm_gem_mmap_offset_kind), overriding the constant above.
+	 * PAGE_WRITE_THROUGH alone is write-combining; with
+	 * PAGE_CACHE_DISABLE, uncached; 0 write-back. */
+	uint64_t (*gem_mmap_pte)(struct drm_gem_object *o, unsigned kind);
+	/* Optional: called once the root filesystem is mounted, for the
+	 * parts of bring-up that need a file (firmware) or a thread. */
+	int (*late_init)(struct drm_device *dev);
 
 	/* KMS */
 	int (*mode_set)(struct drm_device *dev, struct drm_crtc *crtc,
 			const struct drm_mode_modeinfo *mode,
 			struct drm_framebuffer *fb, int x, int y);
 	int (*crtc_disable)(struct drm_device *dev, struct drm_crtc *crtc);
+	/* Optional: the connector's sink, asked on a probe (GETCONNECTOR
+	 * from a client, a hotplug).  detect returns DRM_MODE_CONNECTED /
+	 * DISCONNECTED / UNKNOWNCONNECTION; get_modes refills the mode list
+	 * (through drm_connector_set_edid() or drm_connector_add_mode())
+	 * and returns how many there are. */
+	int (*detect)(struct drm_device *dev, struct drm_connector *c);
+	int (*get_modes)(struct drm_device *dev, struct drm_connector *c);
 	/* the framebuffer scanned out changed contents in these rects */
 	int (*fb_dirty)(struct drm_device *dev, struct drm_crtc *crtc,
 			struct drm_framebuffer *fb,
@@ -396,12 +582,47 @@ struct drm_driver {
 	/* flip to fb (immediately; the core sends the event) */
 	int (*page_flip)(struct drm_device *dev, struct drm_crtc *crtc,
 			 struct drm_framebuffer *fb);
+	/* Scanout formats and layout modifiers.  NULL lists mean the core's
+	 * defaults: XR24/AR24/RG16 and the linear layout.  They fill the
+	 * IN_FORMATS property and bound what ADDFB2 accepts. */
+	const uint32_t *fb_formats;
+	uint32_t nfb_formats;
+	const uint64_t *fb_modifiers;
+	uint32_t nfb_modifiers;
+	/* Optional: check a framebuffer against the object it lives in and
+	 * settle its layout.  *modifier holds what the caller asked for
+	 * (DRM_FORMAT_MOD_INVALID when it named none, as the old ADDFB does);
+	 * the driver replaces it with the layout the object actually has and
+	 * rejects pitches or sizes that layout cannot scan out.  Without it
+	 * only the linear layout is accepted. */
+	int (*fb_check)(struct drm_device *dev, struct drm_gem_object *o,
+			const struct drm_mode_fb_cmd2 *r, uint64_t *modifier);
 	int (*cursor_set)(struct drm_device *dev, struct drm_crtc *crtc,
 			  struct drm_gem_object *o, uint32_t w, uint32_t h,
 			  int32_t hot_x, int32_t hot_y);
 	int (*cursor_move)(struct drm_device *dev, struct drm_crtc *crtc,
 			   int x, int y);
 	int (*dpms)(struct drm_device *dev, struct drm_connector *c, int mode);
+	/* Atomic mode setting.  A driver with these two never sees mode_set,
+	 * crtc_disable, page_flip, cursor_set/move or dpms: every change
+	 * arrives as a checked drm_atomic_state.  atomic_check refuses a
+	 * state the hardware cannot show (and may fill in adjusted_mode /
+	 * use_scaler); atomic_commit applies one the check accepted, in
+	 * whatever order the hardware wants, and returns 0 -- after which
+	 * the core records the state as current. */
+	int (*atomic_check)(struct drm_device *dev, struct drm_atomic_state *st);
+	int (*atomic_commit)(struct drm_device *dev, struct drm_atomic_state *st);
+	/* Entries in the CRTC's gamma table (0: no table).  With atomic ops
+	 * the core advertises GAMMA_LUT / GAMMA_LUT_SIZE and hands the table
+	 * over in the crtc state; SETGAMMA arrives the same way. */
+	uint32_t gamma_size;
+	/* Power.  suspend takes the hardware down -- outputs, engines,
+	 * interrupts -- without touching the core's idea of what is shown;
+	 * resume brings the hardware back to where a mode set can be made,
+	 * after which the core replays the committed state through
+	 * atomic_commit.  Atomic drivers only. */
+	int (*suspend)(struct drm_device *dev);
+	int (*resume)(struct drm_device *dev);
 	/* 1 when the backend delivers vblanks itself (drm_vblank_tick) */
 	int hw_vblank;
 
@@ -469,6 +690,8 @@ struct drm_device {
 	uint32_t nconn;
 	struct drm_encoder enc[DRM_MAX_CONNECTORS];
 	uint32_t nenc;
+	struct drm_plane planes[DRM_MAX_PLANES];
+	uint32_t nplanes;
 	struct drm_prop props[DRM_MAX_PROPS];
 	uint32_t nprops;
 	struct drm_blob blobs[DRM_MAX_BLOBS];
@@ -478,8 +701,13 @@ struct drm_device {
 	uint32_t prop_dpms, prop_edid, prop_crtc_id, prop_type, prop_fb_id,
 		prop_active, prop_mode_id, prop_src_x, prop_src_y, prop_src_w,
 		prop_src_h, prop_crtc_x, prop_crtc_y, prop_crtc_w, prop_crtc_h,
-		prop_in_formats, prop_link_status, prop_non_desktop;
-	uint32_t in_formats_blob;
+		prop_in_formats, prop_link_status, prop_non_desktop,
+		prop_gamma_lut, prop_gamma_lut_size;
+	uint32_t in_formats_blob; /* the primary planes' */
+	uint32_t in_formats_cursor_blob;
+	/* Bumped on every connector status change (drm_connector_hotplug);
+	 * what /sys reports so a client can tell whether to look again. */
+	uint32_t hotplug_epoch;
 
 	/* vblank: one counter per crtc, driven by hrtimer or the backend */
 	struct {
@@ -499,6 +727,10 @@ struct drm_device {
 	/* the devfs nodes */
 	struct devfs_node node_card, node_render;
 	char devname_card[32], devname_render[32];
+	/* all registered devices, for drm_late_init() */
+	struct drm_device *next_dev;
+	int late_init_done;
+	int suspended; /* drm_suspend() done, drm_resume() not yet */
 };
 
 /* Registration: creates the nodes and the sysfs entries. */
@@ -513,18 +745,85 @@ void drm_console_suspend(struct drm_device *dev);
  * the startup code once the scheduler exists; until then pushes are inline. */
 void drm_console_start_worker(void);
 void drm_console_resume(struct drm_device *dev);
+/* Resume the pushes only: the screen was already set up again. */
+void drm_console_resume_pushes(struct drm_device *dev);
 int drm_console_active(const struct drm_device *dev);
 
 int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 		     const pci_device_t *pci, void *priv);
+/* The device down and up again (a system sleep, or the power_state
+ * attribute in /sys for exercising the path): 0, or -ENODEV for a
+ * driver without the entry points. */
+int drm_suspend(struct drm_device *dev);
+int drm_resume(struct drm_device *dev);
+/* Every registered device, in registration order. */
+int drm_suspend_all(void);
+int drm_resume_all(void);
+/* Once storage is up: every registered driver's late_init, once. */
+void drm_late_init(void);
+
+/* ---- synchronisation objects (drm_syncobj.c) --------------------------- */
+/* A container for a fence (binary) or for a timeline of them, shared
+ * between processes as a descriptor; what a renderer passes between its
+ * submissions and what it waits on.  The kernel-side users are drivers
+ * attaching the fences of their submissions. */
+struct drm_syncobj;
+int drm_syncobj_is_ioctl(unsigned nr);
+long drm_syncobj_ioctl(struct drm_device *dev, struct drm_file *fp,
+		       unsigned nr, void *kb, unsigned size, int *handled);
+void drm_syncobj_file_release(struct drm_file *fp);
+/* By handle (a reference), NULL when unknown. */
+struct drm_syncobj *drm_syncobj_lookup(struct drm_file *fp, uint32_t handle);
+void drm_syncobj_get(struct drm_syncobj *so);
+void drm_syncobj_put(struct drm_syncobj *so);
+/* The binary payload (a reference), NULL when none. */
+struct drm_fence *drm_syncobj_fence_get(struct drm_syncobj *so);
+/* Replace the binary payload (NULL = reset). */
+void drm_syncobj_replace_fence(struct drm_syncobj *so, struct drm_fence *f);
+/* Attach a fence at a timeline point (point 0 = the binary payload). */
+int drm_syncobj_add_point(struct drm_syncobj *so, struct drm_fence *f,
+			  uint64_t point);
+/* The fence that stands for `point' (a reference): the binary payload for
+ * 0, else the earliest submitted point at or beyond it.  -ENOENT when
+ * nothing has been submitted for it yet; an always-signalled fence when
+ * the timeline has already passed it. */
+int drm_syncobj_find_fence(struct drm_syncobj *so, uint64_t point,
+			   struct drm_fence **out);
 
 /* KMS helpers for backends. */
 void drm_mode_fill(struct drm_mode_modeinfo *m, uint32_t w, uint32_t h,
 		   uint32_t hz, int preferred);
 int drm_connector_add(struct drm_device *dev, uint32_t type, uint32_t mm_w,
 		      uint32_t mm_h);
+/* An overlay plane on the crtcs of `possible_crtcs' (the primary and
+ * cursor planes of every crtc are made by drm_connector_add).  NULL
+ * formats: the driver's scanout list. */
+int drm_plane_add(struct drm_device *dev, uint32_t type, uint32_t possible_crtcs,
+		  const uint32_t *formats, uint32_t nformats,
+		  const uint64_t *modifiers, uint32_t nmodifiers);
+/* The connector's status changed (a hotplug): re-probe it, bump the
+ * epoch clients read from /sys, note it in the log. */
+void drm_connector_hotplug(struct drm_device *dev, int conn);
 int drm_connector_add_mode(struct drm_device *dev, int conn,
 			   const struct drm_mode_modeinfo *m);
+/* Forget the connector's modes (before get_modes refills them). */
+void drm_connector_clear_modes(struct drm_device *dev, int conn);
+/* Install an EDID: the blob property, the physical size, and the mode
+ * list with the preferred mode first.  A NULL/short EDID removes the
+ * blob.  Returns the number of modes, or a negative errno. */
+int drm_connector_set_edid(struct drm_device *dev, int conn,
+			   const uint8_t *edid, unsigned len);
+/* Add the standard table's modes that fit the connector's EDID range (or,
+ * with no EDID, the caller's limits) and are not already listed. */
+int drm_connector_add_std_modes(struct drm_device *dev, int conn,
+				uint32_t max_clock_khz, uint32_t max_w,
+				uint32_t max_h);
+struct i2c_adapter;
+/* Read a display's EDID over an I2C adapter (DDC at address 0x50, one
+ * block per read, extensions at their segment).  `buf' holds up to
+ * `max_blocks' * 128 bytes; returns the number of blocks read, 0 when
+ * the display did not answer, negative on a bad base block. */
+int drm_edid_read(struct i2c_adapter *adapter, uint8_t *buf, int max_blocks);
 struct drm_framebuffer *drm_fb_lookup(struct drm_device *dev, uint32_t id);
 /* Deliver a vblank from hardware (when drv->hw_vblank). */
 void drm_vblank_tick(struct drm_device *dev, int crtc);

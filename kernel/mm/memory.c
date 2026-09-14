@@ -1404,12 +1404,17 @@ uint64_t mm_get_usable_pages(void)
 }
 
 // Allocate contiguous physical pages (SMP-safe)
-uint64_t mm_allocate_contiguous_pages(size_t page_count)
+static uint64_t mm_allocate_contiguous_pages_do(size_t page_count,
+						 size_t align_pages,
+						 void *caller)
 {
 	if (page_count == 0) {
 		kprintf("mm_allocate_contiguous_pages: page_count is 0\n");
 		return 0;
 	}
+	if (align_pages == 0)
+		align_pages = 1;
+	(void)caller; /* recorded only when page-owner tracking is built */
 
 	uint64_t flags;
 	spin_lock_irqsave(&mm_phys_lock, &flags);
@@ -1476,6 +1481,23 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 		     start_page++) {
 			bool found = true;
 
+			/* Alignment is in physical address terms, and the
+			 * managed range need not start on the boundary. */
+			if (align_pages > 1) {
+				uint64_t phys = mm_state.memory_start +
+						start_page * PAGE_SIZE;
+				uint64_t mis = phys & ((uint64_t)align_pages *
+							       PAGE_SIZE -
+						       1);
+				if (mis) {
+					start_page += ((uint64_t)align_pages *
+							       PAGE_SIZE -
+						       mis) /
+							      PAGE_SIZE -
+						      1;
+					continue;
+				}
+			}
 			// Check if all pages in range are free
 			for (size_t i = 0; i < page_count; i++) {
 				if (is_page_allocated(start_page + i)) {
@@ -1490,8 +1512,7 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 				for (size_t i = 0; i < page_count; i++) {
 					set_page_bit(start_page + i);
 					mm_state.free_pages--;
-					PAGE_OWNER_SET(start_page + i,
-						       __builtin_return_address(0));
+					PAGE_OWNER_SET(start_page + i, caller);
 					/* Each frame carries the caller's one
 					 * reference, exactly as the single-page
 					 * allocator does — the run is released
@@ -1511,6 +1532,24 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 
 	spin_unlock_irqrestore(&mm_phys_lock, flags);
 	return 0; // No contiguous block found
+}
+
+uint64_t mm_allocate_contiguous_pages(size_t page_count)
+{
+	return mm_allocate_contiguous_pages_do(page_count, 1,
+					       __builtin_return_address(0));
+}
+
+uint64_t mm_allocate_contiguous_pages_aligned(size_t page_count,
+					      size_t align_pages)
+{
+	if (align_pages & (align_pages - 1)) {
+		kprintf("mm_allocate_contiguous_pages_aligned: alignment %lu is not a power of two\n",
+			(unsigned long)align_pages);
+		return 0;
+	}
+	return mm_allocate_contiguous_pages_do(page_count, align_pages,
+					       __builtin_return_address(0));
 }
 
 // Free contiguous physical pages
@@ -2095,6 +2134,76 @@ uint64_t mm_map_device_mmio(uint64_t phys_addr, size_t num_pages)
 	return mm_map_mmio(phys_addr, num_pages);
 }
 
+uint64_t mm_map_mmio_flags(uint64_t phys_addr, size_t num_pages, int attr)
+{
+	uint64_t phys_base = phys_addr & ~0xFFFULL;
+	uint64_t page_offset = phys_addr & 0xFFFULL;
+	uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_GLOBAL |
+			 PAGE_NO_EXECUTE;
+	uint64_t virt_base;
+	int in_direct;
+
+	if (num_pages == 0)
+		return 0;
+	uint64_t phys_last = phys_base + ((uint64_t)num_pages - 1) * PAGE_SIZE;
+	if (phys_last < phys_base)
+		return 0;
+	/* PWT alone selects PAT entry 1 (write-combining once programmed);
+	 * PWT+PCD selects entry 3, uncached. */
+	if (attr == MM_MMIO_WC)
+		flags |= PAGE_WRITE_THROUGH;
+	else
+		flags |= PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE;
+
+	in_direct = is_phys_in_direct_map(phys_last);
+	if (in_direct) {
+		virt_base = (uint64_t)phys_to_virt(phys_base);
+	} else {
+		uint64_t lock_flags;
+		spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+		virt_base = mm_state.next_virtual_addr;
+		mm_state.next_virtual_addr += num_pages * PAGE_SIZE;
+		spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+	}
+	for (size_t i = 0; i < num_pages; i++) {
+		uint64_t va = virt_base + i * PAGE_SIZE;
+		uint64_t pa = phys_base + i * PAGE_SIZE;
+		if (!mm_map_page(va, pa, flags)) {
+			kprintf("mm_map_mmio_flags: failed to map VA 0x%lx -> PA 0x%lx\n",
+				va, pa);
+			if (!in_direct)
+				for (size_t j = 0; j < i; j++)
+					mm_unmap_page(virt_base + j * PAGE_SIZE);
+			return 0;
+		}
+	}
+	if (sched_is_smp())
+		smp_tlb_shootdown_sync();
+	return virt_base + page_offset;
+}
+
+void mm_unmap_mmio(uint64_t virt_addr, size_t num_pages)
+{
+	uint64_t virt_base = virt_addr & ~0xFFFULL;
+
+	if (num_pages == 0)
+		return;
+	if (is_direct_map_addr(virt_base)) {
+		/* Back to the ordinary write-back direct-map entry. */
+		uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_GLOBAL |
+				 PAGE_NO_EXECUTE;
+		for (size_t i = 0; i < num_pages; i++) {
+			uint64_t va = virt_base + i * PAGE_SIZE;
+			mm_map_page(va, virt_to_phys((void *)va), flags);
+		}
+	} else {
+		for (size_t i = 0; i < num_pages; i++)
+			mm_unmap_page_no_shootdown(virt_base + i * PAGE_SIZE);
+	}
+	if (sched_is_smp())
+		smp_tlb_shootdown_sync();
+}
+
 // Unmap virtual page without TLB shootdown (for batched operations)
 // Caller MUST call smp_tlb_shootdown_sync() after unmapping all pages!
 void mm_unmap_page_no_shootdown(uint64_t virtual_addr)
@@ -2156,6 +2265,7 @@ void mm_tlb_gather_init(struct mm_tlb_gather *g, uint64_t *pml4)
 {
 	BUG_ON(g == NULL);
 	g->n = 0;
+	g->device_cleared = 0;
 	g->pml4_phys = pml4 ? virt_to_phys(pml4) : 0;
 }
 
@@ -2226,7 +2336,7 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 	/* Piggyback: any flush that CAN shoot down also drains what an
 	 * IRQs-off flush had to park. */
 	mm_tlb_deferred_drain();
-	if (g->n == 0)
+	if (g->n == 0 && g->device_cleared == 0)
 		return;
 
 	/* Invalidate everywhere before a single reference is dropped.  These
@@ -2240,19 +2350,33 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 			 * CPU loses its whole TLB; a large one degrades to the
 			 * whole-space form.  The threshold is where receivers'
 			 * single-page invalidations stop being cheaper than
-			 * one full reload. */
-			if (g->n <= TLB_SHOOTDOWN_PAGE_CEILING)
+			 * one full reload.  Cleared device entries are not
+			 * named (they queue no page), so any of those takes
+			 * the whole-space form too. */
+			if (g->device_cleared || g->n > TLB_SHOOTDOWN_PAGE_CEILING)
+				smp_tlb_shootdown_mm_sync(g->pml4_phys);
+			else
 				smp_tlb_shootdown_pages_sync(g->pml4_phys,
 							     g->vaddrs, g->n);
-			else
-				smp_tlb_shootdown_mm_sync(g->pml4_phys);
+			g->device_cleared = 0;
 		} else {
+			if (g->device_cleared) {
+				/* No page to park, and no shootdown possible
+				 * here: the translations of these device pages
+				 * stay wherever they are cached until the next
+				 * one.  Said once; the range unmap path asserts
+				 * interrupts on, so this is not expected. */
+				WARN_RATELIMIT(1,
+					       "device mapping torn down with interrupts off - %u translations not invalidated elsewhere",
+					       g->device_cleared);
+				g->device_cleared = 0;
+			}
 			/* Cannot shoot down from here: the ack-wait needs to
 			 * service the very interrupts it is waiting on.  Park
 			 * the pages; the next IRQs-on flush releases them
 			 * AFTER a proper shootdown.  See g_tlb_defer_pages. */
 			uint64_t f;
-			int parked = 0;
+			unsigned parked = 0;
 
 			spin_lock_irqsave(&g_tlb_defer_lock, &f);
 			while (parked < g->n &&
@@ -2268,20 +2392,22 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 				 * say so. */
 				WARN_RATELIMIT(
 					1,
-					"TLB defer ring full - releasing %d pages with possible stale translations",
+					"TLB defer ring full - releasing %u pages with possible stale translations",
 					g->n - parked);
 				mm_put_pages_batch(g->pages + parked,
-						   (unsigned)(g->n - parked));
+						   g->n - parked);
 			}
 			g->n = 0;
 			return;
 		}
 	}
 
+	g->device_cleared = 0;
 	/* One acquisition of the physical allocator's lock for the whole batch
 	 * rather than one per page.  The array is already sized to the batch
 	 * maximum, so it goes straight through. */
-	mm_put_pages_batch(g->pages, g->n);
+	if (g->n)
+		mm_put_pages_batch(g->pages, g->n);
 	g->n = 0;
 }
 
@@ -2301,11 +2427,18 @@ static void mm_unmap_page_gathered(uint64_t *pml4, uint64_t virtual_addr,
 	if (!pte || !(*pte & PAGE_PRESENT))
 		return;
 
-	/* Device MMIO is not allocator-owned: clear the entry, queue nothing. */
+	/* Device memory is not allocator-owned: clear the entry and queue
+	 * no page.  The translation is still cached wherever this address
+	 * space has run, though, so the flush must reach those processors
+	 * even with nothing to release -- a thread of a graphics client
+	 * that keeps its processor on this address space would otherwise go
+	 * on writing through the old translation, into whatever object the
+	 * page belongs to next.  Counted, so the flush knows. */
 	if (*pte & PAGE_DEVICE) {
 		*pte = 0;
 		if (pml4 == mm_get_current_address_space())
 			mm_flush_tlb(virtual_addr);
+		g->device_cleared++;
 		return;
 	}
 
@@ -5745,13 +5878,18 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 		mm_free_physical_page(phys);
 		return 1; // already materialised by a concurrent fault
 	}
-	bool ok = mm_map_page_in_address_space(mm->pml4, page, phys, map_flags);
+	uint64_t *pml4 = mm->pml4;
+	bool ok = pml4 && mm_map_page_in_address_space(pml4, page, phys, map_flags);
 	spin_unlock_irqrestore(&g_lazy_map_lock, lf);
 	if (!ok) {
-		WARN_RATELIMIT(1,
-			       "demand fault: page-table install failed for va=%llx (pid %d)",
-			       (unsigned long long)page,
-			       mm ? (int)mm->id : -1);
+		/* A process on its way out has its tables withdrawn while
+		 * its other threads may still be running: their faults
+		 * fail quietly, they are about to be stopped. */
+		if (pml4)
+			WARN_RATELIMIT(1,
+				       "demand fault: page-table install failed for va=%llx (pid %d)",
+				       (unsigned long long)page,
+				       mm ? (int)mm->id : -1);
 		mm_free_physical_page(phys);
 		return 0;
 	}

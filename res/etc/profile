@@ -22,6 +22,31 @@ export EDITOR=nano
 # is treated as a byte per character and comes out mangled.
 [ -n "$LANG" ] || export LANG=en_US.UTF-8
 
+# The time zone, as an Olson name ("Europe/Berlin", "America/New_York").
+#
+# It has to be said here because nothing else on this system knows it.  This
+# libc has no time zone database: its localtime() is gmtime(), tzname is fixed
+# at "UTC", and there is no /etc/localtime or /usr/share/zoneinfo on the image
+# to read -- so a C program's idea of local time is UTC and stays UTC.
+#
+# The browser is the part that suffers.  ICU carries a complete zone database
+# of its own inside /lib/libicudata.so (the rules through 2026a), and that is
+# what JavaScript's Date and Intl actually ask; but ICU was compiled for this
+# system without the code that reads /etc/localtime, so the ONLY way it learns
+# the zone is this variable.  Unset, every page sees a browser running at
+# UTC+0 with no daylight saving: Date.getTimezoneOffset() returns 0 and
+# Intl.DateTimeFormat().resolvedOptions().timeZone says "UTC".  Booking sites,
+# calendars and anything that compares a date against "today" then work off a
+# clock one or two hours from the one on the wall.
+#
+# /etc/timezone holds the name so it can be changed in one place.
+if [ -z "$TZ" ]; then
+	if [ -r /etc/timezone ]; then
+		TZ=$(head -n 1 /etc/timezone 2>/dev/null)
+	fi
+	[ -n "$TZ" ] && export TZ
+fi
+
 # Where programs put per-user sockets and other things that must not survive a
 # reboot.  On systems with a session manager this is /run/user/<uid>, created
 # and cleaned up at login; there is none here, so it is created on first login

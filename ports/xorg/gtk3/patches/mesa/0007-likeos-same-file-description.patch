@@ -1,0 +1,38 @@
+Descriptor comparison on LikeOS.
+
+os_same_file_description() answers whether two descriptors name one open
+file description.  The Intel driver duplicates the device descriptor it
+is given (one copy for the buffer manager, one for the screen) and asks
+this before exporting a buffer handle to the screen's copy: the same
+description means the buffer's own handle is valid there and nothing
+else is needed.
+
+The function only knew how to ask on the system it was written for; on
+LikeOS it returned "cannot tell", and the driver then took the other
+path -- exported the buffer as a dma-buf and imported it again through
+the screen's descriptor.  The kernel hands back the handle the buffer
+already has (one handle per object per description), which the driver
+recorded as a second, separately owned handle and closed a second time
+when the buffer was freed.  Freed handle numbers are reused at once, so
+the second close usually destroyed whatever buffer had taken the number
+in between: the device faulted on addresses that no longer existed, or a
+submission named a handle that was gone and the driver aborted.  When
+the number had not yet been reused the kernel refused the close, which
+is the GEM_CLOSE EINVAL seen once per client.
+
+LikeOS answers the question through fcntl(F_DUPFD_QUERY), the same
+interface the function already prefers; it simply was not consulted for
+this system.
+
+diff -Nur -x .likeos-build -x '*.o' -x '.likeos-*' a/src/util/os_file.c b/src/util/os_file.c
+--- a/src/util/os_file.c
++++ b/src/util/os_file.c
+@@ -243,7 +243,7 @@
+    if (fd1 == fd2)
+       return 0;
+ 
+-#if DETECT_OS_LINUX
++#if DETECT_OS_LINUX || DETECT_OS_LIKEOS
+    /* Use F_DUPFD_QUERY if available. */
+    int r = fcntl(fd1, F_DUPFD_QUERY, fd2);
+ 

@@ -68,7 +68,35 @@ static struct {
 	framebuffer_info_t saved;
 	int have_saved;
 	fb_flush_hook_t legacy_hook;
+	/* 1 while /dev/fb0 is served from the console's buffer object (a
+	 * device with no framebuffer driver of its own registered none). */
+	int fbdev_registered;
 } g_con;
+
+/* ---- /dev/fb0 on the console's buffer ----------------------------------- */
+
+static int drm_console_fb_get_info(framebuffer_info_t *out)
+{
+	if (!g_con.taken)
+		return -1;
+	return console_get_framebuffer_info(out);
+}
+
+static uint64_t drm_console_fb_get_phys(uint64_t *size_out)
+{
+	if (!g_con.taken || !g_con.obj || !g_con.obj->npages)
+		return 0;
+	if (size_out)
+		*size_out = g_con.obj->size;
+	/* Contiguous by construction (drm_gem_alloc_pages_contig). */
+	return g_con.obj->pages[0];
+}
+
+static const struct fbdev_backend drm_console_fbdev = {
+	.id = "drmfb",
+	.get_info = drm_console_fb_get_info,
+	.get_phys = drm_console_fb_get_phys,
+};
 
 static uint8_t g_con_stack[16384] __attribute__((aligned(16)));
 
@@ -249,6 +277,10 @@ static void drm_console_fallback(struct drm_device *dev, const char *why)
 		dev->drv->name, why);
 	g_con.taken = 0;
 	g_con.suspended = 0;
+	if (g_con.fbdev_registered) {
+		fbdev_register_backend(NULL);
+		g_con.fbdev_registered = 0;
+	}
 	fb_set_flush_hook(g_con.legacy_hook);
 	/* The CRTC off its buffer: on this device that tears the screen
 	 * target down, so the aperture is what is left to show. */
@@ -282,7 +314,7 @@ int drm_console_takeover(struct drm_device *dev)
 		return -EBUSY;
 	/* Both halves of the display path have to exist: something to set the
 	 * mode with, and something to push a changed rectangle through. */
-	if (!dev->drv->mode_set || !dev->drv->fb_dirty)
+	if ((!dev->drv->mode_set && !dev->drv->atomic_commit) || !dev->drv->fb_dirty)
 		return -ENODEV;
 	if (dev->ncrtc == 0 || dev->nconn == 0 || dev->conn[0].nmodes == 0)
 		return -ENODEV;
@@ -368,6 +400,15 @@ int drm_console_takeover(struct drm_device *dev)
 	if (drm_console_verify(dev) != 0)
 		return -EIO;
 
+	/* Where the display driver has no framebuffer driver beneath it,
+	 * /dev/fb0 shows this buffer: a program that maps the framebuffer
+	 * draws into what the console scans out, and its rows reach the
+	 * device through the flush hook like the console's own. */
+	if (!fbdev_backend()) {
+		fbdev_register_backend(&drm_console_fbdev);
+		g_con.fbdev_registered = 1;
+	}
+
 	kprintf("[drm] %s: console on KMS, %ux%u\n", dev->drv->name, w, h);
 	return 0;
 }
@@ -418,6 +459,14 @@ void drm_console_resume(struct drm_device *dev)
 	}
 	console_push_all();
 	(void)drm_console_verify(dev);
+}
+
+void drm_console_resume_pushes(struct drm_device *dev)
+{
+	if (!g_con.taken || g_con.dev != dev)
+		return;
+	g_con.suspended = 0;
+	console_push_all();
 }
 
 int drm_console_active(const struct drm_device *dev)

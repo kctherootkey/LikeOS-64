@@ -11,6 +11,7 @@
 
 #include <kernel/dev/video/vmsvga2.h>
 #include <kernel/dev/video/fb.h>
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
 #include <kernel/hal/pci.h>
@@ -21,6 +22,9 @@
 #include <kernel/ke/timer.h>
 #include <kernel/ke/signal.h>
 #include <kernel/mm/memory.h>
+#include <kernel/ke/syscall.h> /* errno values */
+
+static const struct fbdev_backend vmsvga2_fbdev_backend;
 
 // ===========================================================================
 // Sleeping mutex (the kernel has no generic sleeping mutex; modesetting is
@@ -859,8 +863,10 @@ int vmsvga2_set_mode(uint32_t width, uint32_t height, uint32_t bpp)
 
 	svga_mutex_lock(&svga_modeset_mutex);
 	rc = svga_program_mode(width, height, bpp);
-	if (rc == 0)
+	if (rc == 0) {
 		g_svga.active = 1;
+		fbdev_register_backend(&vmsvga2_fbdev_backend);
+	}
 	svga_mutex_unlock(&svga_modeset_mutex);
 	svga_report_errors(); // safe context: surface deferred FIFO errors
 	return rc;
@@ -1200,6 +1206,38 @@ int vmsvga2_resume(void)
 // ===========================================================================
 // Capability / limit reporting
 // ===========================================================================
+
+/* ---- /dev/fb0 backend --------------------------------------------------- */
+
+static void vmsvga2_fb_mapped(void)
+{
+	/* A mapping client scans out by storing straight to VRAM and sends
+	 * no update commands.  Traces make the host snoop those writes;
+	 * sticky-on -- the console's explicit update-rect path remains
+	 * correct alongside it, at a small host-side tracking cost once a
+	 * client has mapped the framebuffer. */
+	vmsvga2_set_traces(1);
+}
+
+static int vmsvga2_fb_test_mode(uint32_t w, uint32_t h, uint32_t bpp)
+{
+	if (w > vmsvga2_get_max_width() || h > vmsvga2_get_max_height())
+		return -EINVAL;
+	if ((uint64_t)w * h * (bpp / 8) > vmsvga2_get_vram_size())
+		return -EINVAL;
+	return 0;
+}
+
+static const struct fbdev_backend vmsvga2_fbdev_backend = {
+	.id = "svga2",
+	.get_info = vmsvga2_get_info,
+	.get_phys = vmsvga2_get_fb_phys,
+	.mapped = vmsvga2_fb_mapped,
+	.test_mode = vmsvga2_fb_test_mode,
+	.set_mode = vmsvga2_set_mode,
+	.blank = vmsvga2_display_enable,
+	.update_full = vmsvga2_update_full,
+};
 
 int vmsvga2_active(void)
 {
@@ -2946,9 +2984,11 @@ static void vmsvga2_hw_irq_notify(uint32_t status)
 		cb(status);
 }
 
-/* Display ownership hand-over.  While the display-manager driver's master
- * holds the screen the console must not paint (see fbdev_display_owned);
- * on release the console is redrawn in full and the boot mode restored. */
+/* Display ownership hand-over, the part of it that is this device's: the
+ * generic side -- the console neither painting nor listening while a
+ * master holds the screen, and its full redraw on release -- is done by
+ * drm_master_set()/drm_master_drop() for every driver (fbdev_opened /
+ * fbdev_closed), so it is not repeated here. */
 static int g_hw_display_taken;
 
 void vmsvga2_hw_display_take(void)
@@ -2956,7 +2996,6 @@ void vmsvga2_hw_display_take(void)
 	if (g_hw_display_taken)
 		return;
 	g_hw_display_taken = 1;
-	fbdev_opened();
 }
 
 void vmsvga2_hw_display_release(void)
@@ -2965,7 +3004,6 @@ void vmsvga2_hw_display_release(void)
 		return;
 	g_hw_display_taken = 0;
 	svga_write_reg(SVGA_REG_TRACES, 1);
-	fbdev_closed();
 }
 
 int vmsvga2_hw_display_taken(void)

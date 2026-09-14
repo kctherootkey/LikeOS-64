@@ -1,0 +1,195 @@
+# X server configuration for the Intel graphics driver (i915), installed as
+# /etc/X11/xorg.conf.modesetting-i915 and chosen by xserverrc when drminfo
+# names that driver behind /dev/dri/card0.
+#
+# The same modesetting configuration as xorg.conf.modesetting, with the one
+# difference that decides where pixels are made: glamor is on, so X renders
+# through EGL/GBM on the GPU and offers DRI3, and clients (Mesa's iris
+# driver, WebKit's DMA-BUF path) reach the same GPU through the render node.
+# The software policy of the VMware configuration is deliberate there (see
+# its comments) and deliberately absent here: the whole point of the driver
+# beneath this file is the accelerated path.
+#
+# xorg.conf.modesetting -- the display-manager configuration for LikeOS-64.
+#
+# Selected by /etc/X11/xinit/xserverrc when /dev/dri/card0 exists, i.e. when
+# the kernel found a display device it has a driver for (today the VMware
+# SVGA II / SVGA3D device, through kernel/dev/gpu/vmwgfx).  Without that node
+# the server is started with the plain /etc/X11/xorg.conf instead, which
+# drives /dev/fb0 through the fbdev driver and renders in software; that
+# remains the fallback and nothing here changes it.
+#
+# What this file buys over the fallback: the modesetting driver talks to the
+# display manager directly, so it sets modes, page-flips and drives the
+# hardware cursor rather than copying a shadow buffer into a fixed-format
+# framebuffer, and it draws with glamor -- rendering through EGL/GL on the
+# GPU, which is also what lets client-side DRI3 hand the server buffers by
+# descriptor instead of pushing pixels over the socket.
+#
+# Everything is stated explicitly, for the same reason as in the fallback
+# file: there is no udev and no hal (the server is built --disable-config-udev
+# --disable-config-hal), so devices are not discovered at runtime, and the
+# server is built --disable-pciaccess, so the video driver cannot find the
+# device by probing the bus and is told which node to open.
+
+Section "ServerFlags"
+	# Without a hotplug backend, the InputDevice sections below are the
+	# only source of input devices, and they only take effect when the
+	# server is not also trying to add devices itself.
+	Option	"AutoAddDevices"	"false"
+	Option	"AutoEnableDevices"	"false"
+
+	# No virtual terminals to switch to, so the key combination that would
+	# do it has nothing to do; and there is no other session to hand the
+	# display back to.
+	Option	"DontVTSwitch"		"true"
+
+	# Ctrl+Alt+Backspace stays enabled: with no session manager and no way
+	# to switch away, it is the only way to end a wedged server from the
+	# keyboard.
+	Option	"DontZap"		"false"
+
+	# Never blank the screen, and never power the display down.
+	#
+	# Both defaults are on: the server blanks after ten minutes idle
+	# (BlankTime) and runs the DPMS timers on top of that.  Neither is worth
+	# anything here.  There is no panel to save and no battery to spare --
+	# the display is a window on somebody else's desktop, which has its own
+	# screensaver and its own idea of when the machine is idle, and which
+	# is by then very likely showing something else entirely.  What the
+	# timers actually produce is a session that has gone dark by the time
+	# you come back to it.
+	#
+	# Off at the server rather than with xset from the session startup, so
+	# it holds for a session started any other way too, and so there is one
+	# place that says it.
+	Option	"BlankTime"		"0"
+	Option	"StandbyTime"		"0"
+	Option	"SuspendTime"		"0"
+	Option	"OffTime"		"0"
+EndSection
+
+Section "Files"
+	# Stated in full rather than relying on the compiled-in default: the
+	# default list names directories that do not exist here, and the server
+	# treats a missing font path element as a fatal error at startup.
+	FontPath	"/usr/share/fonts/X11/misc"
+
+	ModulePath	"/usr/lib/xorg/modules"
+EndSection
+
+Section "Module"
+	# glamoregl is glamor's EGL half -- it makes the EGL display from the
+	# node and is what the modesetting driver loads when AccelMethod is
+	# glamor.  It is named here as well so that a failure to find it is
+	# reported at startup, next to the ModulePath that would be wrong,
+	# rather than deep inside driver initialisation.
+	#
+	# fb is still needed: glamor falls back to it for the operations it
+	# does not accelerate, and the driver uses it wholesale if glamor
+	# cannot start.  dri2, dri3 and present are built into the server,
+	# not modules, and must not be listed.
+	Load	"glamoregl"
+	Load	"fb"
+EndSection
+
+Section "Monitor"
+	Identifier	"Monitor0"
+	# No EDID to read over a framebuffer device, so the server has no way
+	# to learn the monitor's limits.  These are deliberately generous: the
+	# mode actually used is the one the framebuffer is already in, and
+	# ranges that are too narrow would cause the server to reject it.
+	HorizSync	20.0 - 100.0
+	VertRefresh	40.0 - 80.0
+EndSection
+
+Section "Device"
+	Identifier	"GPU"
+	Driver		"modesetting"
+
+	# Which display-manager node to open.  With no bus enumeration this is
+	# not discoverable; the driver's own default is this same path, but it
+	# is stated so that a machine with more than one node is not left to
+	# the driver's idea of which comes first.
+	Option		"kmsdev"	"/dev/dri/card0"
+
+	# Draw in software: the driver renders with the CPU into a shadow
+	# buffer and copies the damaged rectangles into a dumb buffer the
+	# display manager scans out, announcing them with DIRTYFB.  No GL in
+	# the server, so there is no DRI2/DRI3 and clients render through
+	# Mesa's software rasteriser (llvmpipe) and hand pixels over the X
+	# socket -- the same arrangement the fbdev configuration has, with
+	# the display manager doing the mode set instead of /dev/fb0.
+	#
+	# This is deliberate (2026-09-11): the GPU's 3D is not used at all,
+	# on this machine as on one without a GPU, so both run the same
+	# rendering paths.  glamor -- the driver rendering through EGL on a
+	# GBM device made from the node above, reaching the GPU via Mesa's
+	# svga driver -- is what this replaces.  To have it back:
+	#
+	#     Option "AccelMethod" "glamor"
+	#     Option "DRI"         "3"       hand clients buffers by descriptor
+	#     Option "PageFlip"    "true"    flip, not copy, on a full-screen present
+	#
+	# plus Load "glamoregl" above, and drop LIBGL_ALWAYS_SOFTWARE from
+	# res/xorg/xinitrc, which pins the clients to llvmpipe to match.
+	Option		"AccelMethod"	"glamor"
+	Option		"DRI"	"3"
+	Option		"PageFlip"	"true"
+EndSection
+
+Section "Screen"
+	Identifier	"Screen0"
+	Device		"GPU"
+	Monitor		"Monitor0"
+	# Depth is not forced: the driver reports the depth the display
+	# manager is in, and asking for one the device cannot scan out would
+	# fail the mode set.
+	SubSection "Display"
+	EndSubSection
+EndSection
+
+Section "InputDevice"
+	Identifier	"Keyboard0"
+	Driver		"evdev"
+	Option		"Device"	"/dev/input/event0"
+	# Take an exclusive grab on the device (EVIOCGRAB).
+	#
+	# On a system with virtual terminals the server stops the console
+	# reading the keyboard by putting the VT into raw mode.  There are no
+	# VTs here, so the grab is what does it: while one is held the kernel
+	# stops feeding scancodes to the console tty.
+	#
+	# Without it every keystroke goes to BOTH X and the shell that ran
+	# startx -- the console echoes them over the display, and the line is
+	# waiting to be executed the moment the session ends.
+	Option		"GrabDevice"	"true"
+	# evdev is the rule set that matches the key codes this kernel emits;
+	# the alternative ("base") assumes the older, different numbering.
+	Option		"XkbRules"	"evdev"
+	Option		"XkbModel"	"pc105"
+	Option		"XkbLayout"	"us"
+EndSection
+
+Section "InputDevice"
+	Identifier	"Mouse0"
+	Driver		"evdev"
+	Option		"Device"	"/dev/input/event1"
+	# NOT grabbed, unlike the keyboard.
+	#
+	# The keyboard needs a grab because the console tty would otherwise
+	# receive every keystroke as well.  The pointer has no such path -- the
+	# console only draws a cursor with it, and that is already suppressed
+	# while another program owns the framebuffer.
+	#
+	# Grabbing it made the pointer stick to the bottom edge and move only
+	# horizontally until it eventually freed itself, so it costs something
+	# and buys nothing here.
+EndSection
+
+Section "ServerLayout"
+	Identifier	"Default"
+	Screen		0 "Screen0"
+	InputDevice	"Keyboard0"	"CoreKeyboard"
+	InputDevice	"Mouse0"	"CorePointer"
+EndSection

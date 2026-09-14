@@ -82,7 +82,7 @@ extern "C" {
  * Raising it here costs nothing (nothing in libc is dimensioned by it); the
  * kernel side is a fixed array inside every task_t, which is why that number
  * is the one to check before changing this one. */
-#define OPEN_MAX    1024
+#define OPEN_MAX    4096
 #define ARG_MAX     131072
 
 /* POSIX minimum-value constants.  These are NOT this system's limits -- the

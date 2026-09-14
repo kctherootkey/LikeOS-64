@@ -1,0 +1,83 @@
+.TH BACKLIGHT 1 "September 2026" "LikeOS-64" "User Commands"
+.SH NAME
+backlight \- read and set the display backlight
+.SH SYNOPSIS
+.B backlight
+.RB [ \-d
+.IR device ]
+.RB [ \-q ]
+.br
+.B backlight
+.RB [ \-d
+.IR device ]
+.I level
+|
+.IB n %
+|
+.BI + n %
+|
+.BI \- n %
+|
+.B on
+|
+.B off
+.br
+.B backlight \-l
+.SH DESCRIPTION
+.B backlight
+prints or changes the brightness of a display backlight the kernel
+drives.  Each such backlight is a directory under
+.IR /sys/class/backlight/ ,
+with the files
+.IR brightness ,
+.IR max_brightness ,
+.I actual_brightness
+and
+.IR bl_power ;
+.B backlight
+is a convenience over reading and writing them.
+.PP
+Without an argument the current level, the maximum and the percentage
+are printed.  A plain number sets the level in the device's own units
+(0 to
+.IR max_brightness );
+a number followed by
+.B %
+sets it as a percentage of the maximum; with a leading
+.B +
+or
+.B \-
+the value is relative to the current one.
+.B off
+switches the backlight off (the panel keeps its picture, dark) and
+.B on
+switches it back on.
+.SH OPTIONS
+.TP
+.BI \-d " device"
+The device under
+.I /sys/class/backlight/
+to use.  The default is the first one there; on a machine with Intel
+graphics that is
+.IR intel_backlight .
+.TP
+.B \-l
+List the backlight devices with their type and level.
+.TP
+.B \-q
+Print the level only, as a number.
+.SH EXAMPLES
+.TP
+.B backlight 50%
+Half brightness.
+.TP
+.B backlight +10%
+A step up.
+.TP
+.B backlight off
+Dark, for example while a long download runs.
+.SH FILES
+.I /sys/class/backlight/*/brightness
+.SH SEE ALSO
+.BR drminfo (1),
+.BR xrandr (1)

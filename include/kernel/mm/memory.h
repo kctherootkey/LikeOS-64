@@ -466,6 +466,11 @@ struct mm_tlb_gather {
 	 * of costing every CPU its whole TLB. */
 	uint64_t vaddrs[MM_TLB_GATHER_BATCH];
 	unsigned n;
+	/* Device-mapped entries cleared since the last flush.  They own no
+	 * page to release, so they are not in the arrays above -- but their
+	 * translations are cached on other processors all the same, and a
+	 * flush with nothing to release must still invalidate them there. */
+	unsigned device_cleared;
 	/* Physical root of the address space being unmapped, so the flush can
 	 * ask which CPUs actually have it loaded instead of interrupting all
 	 * of them.  Zero means "unknown" and falls back to a broadcast. */
@@ -648,6 +653,30 @@ void mm_flush_all_tlb(void);
 // address space with uncacheable (write-through + cache-disable) flags.
 // Returns the virtual address, or 0 on failure.
 uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages);
+
+/* The same with the cache attribute chosen by the caller.
+ *
+ * Device memory is not all the same kind: a register window must be
+ * uncached (every access has a side effect), a framebuffer or a graphics
+ * aperture wants write-combining (stores are buffered and burst out, which
+ * is the difference between a screen that updates and one that crawls).
+ * MM_MMIO_UC selects the uncached type; MM_MMIO_WC selects PAT entry 1,
+ * which fb_pat_program_wc_this_cpu() has made write-combining on every
+ * CPU.  The range is mapped where mm_map_device_mmio() would map it (in
+ * the direct map when it lies inside it, else in a fresh range). */
+#define MM_MMIO_UC 0
+#define MM_MMIO_WC 1
+uint64_t mm_map_mmio_flags(uint64_t phys_addr, size_t num_pages, int attr);
+/* Undo a mapping made by mm_map_mmio_flags() outside the direct map: the
+ * pages are unmapped and the virtual range is left unused (it is not
+ * reclaimed; the bump allocator has no free).  A direct-map range is
+ * returned to its write-back mapping. */
+void mm_unmap_mmio(uint64_t virt_addr, size_t num_pages);
+/* Physically contiguous pages whose base is a multiple of
+ * `align_pages' * PAGE_SIZE (a power of two).  Same ownership rules as
+ * mm_allocate_contiguous_pages(). */
+uint64_t mm_allocate_contiguous_pages_aligned(size_t page_count,
+					      size_t align_pages);
 
 // Device MMIO mapping for PCI/SoC BARs.
 // If the physical range is already covered by the kernel direct map, this

@@ -5,6 +5,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/ke/syscall.h> /* errno values */
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA 0xCFC
@@ -521,4 +522,187 @@ int pci_enable_msix(const pci_device_t *dev, int entry, uint8_t vector,
 		dev->bus, dev->device, dev->function, entry, vector, apic_id,
 		table_size);
 	return 0;
+}
+
+/* ---- narrow config access ------------------------------------------- */
+
+uint32_t pci_cfg_read32_dev(const pci_device_t *dev, unsigned char off)
+{
+	return pci_cfg_read32(dev->bus, dev->device, dev->function, off);
+}
+
+void pci_cfg_write32_dev(const pci_device_t *dev, unsigned char off,
+			 uint32_t v)
+{
+	pci_cfg_write32(dev->bus, dev->device, dev->function, off, v);
+}
+
+uint8_t pci_cfg_read8(const pci_device_t *dev, unsigned char off)
+{
+	uint32_t v = pci_cfg_read32(dev->bus, dev->device, dev->function,
+				    off & 0xFC);
+	return (uint8_t)(v >> (8 * (off & 3)));
+}
+
+uint16_t pci_cfg_read16(const pci_device_t *dev, unsigned char off)
+{
+	uint32_t v = pci_cfg_read32(dev->bus, dev->device, dev->function,
+				    off & 0xFC);
+	return (uint16_t)(v >> (8 * (off & 2)));
+}
+
+/* The dword is read and written under one hold of the config lock, so two
+ * CPUs poking different bytes of the same dword cannot lose each other's
+ * write. */
+static void pci_cfg_rmw(const pci_device_t *dev, unsigned char off,
+			uint32_t mask, uint32_t value)
+{
+	unsigned int address =
+		(unsigned int)((1u << 31) | ((unsigned int)dev->bus << 16) |
+			       ((unsigned int)dev->device << 11) |
+			       ((unsigned int)dev->function << 8) | (off & 0xFC));
+	uint64_t flags;
+
+	spin_lock_irqsave(&pci_lock, &flags);
+	outl(PCI_CONFIG_ADDRESS, address);
+	uint32_t v = inl(PCI_CONFIG_DATA);
+	v = (v & ~mask) | (value & mask);
+	outl(PCI_CONFIG_ADDRESS, address);
+	outl(PCI_CONFIG_DATA, v);
+	spin_unlock_irqrestore(&pci_lock, flags);
+}
+
+void pci_cfg_write8(const pci_device_t *dev, unsigned char off, uint8_t v)
+{
+	unsigned shift = 8 * (off & 3);
+	pci_cfg_rmw(dev, off, 0xFFu << shift, (uint32_t)v << shift);
+}
+
+void pci_cfg_write16(const pci_device_t *dev, unsigned char off, uint16_t v)
+{
+	unsigned shift = 8 * (off & 2);
+	pci_cfg_rmw(dev, off, 0xFFFFu << shift, (uint32_t)v << shift);
+}
+
+/* ---- BAR decoding ------------------------------------------------------ */
+
+/* Size a base address register: with the device's decoding paused, write
+ * all ones, read back, restore.  The bits that stayed zero are the
+ * window's alignment, which is its size. */
+static uint64_t pci_size_register(const pci_device_t *dev, unsigned char off,
+				  uint32_t orig, uint32_t typebits)
+{
+	pci_cfg_write32(dev->bus, dev->device, dev->function, off, 0xFFFFFFFFu);
+	uint32_t v = pci_cfg_read32(dev->bus, dev->device, dev->function, off);
+	pci_cfg_write32(dev->bus, dev->device, dev->function, off, orig);
+	v &= ~typebits;
+	if (!v)
+		return 0;
+	return (uint64_t)(~v + 1u); /* lowest set bit */
+}
+
+int pci_bar_decode(const pci_device_t *dev, int index, struct pci_bar *out)
+{
+	if (!dev || !out || index < 0 || index > 5)
+		return -EINVAL;
+	unsigned char off = (unsigned char)(0x10 + index * 4);
+	/* The upper half of a 64-bit BAR is not a BAR of its own. */
+	if (index > 0) {
+		uint32_t prev = dev->bar[index - 1];
+		if (!(prev & 1) && ((prev >> 1) & 3) == 2)
+			return -EINVAL;
+	}
+	uint32_t lo = pci_cfg_read32(dev->bus, dev->device, dev->function, off);
+	mm_memset(out, 0, sizeof(*out));
+
+	/* Pause decoding while the register is probed: a write of all ones
+	 * to a live BAR moves the window for the instant between the two
+	 * config cycles, and a device that is being scanned out of during
+	 * that instant (the boot framebuffer) shows it. */
+	uint16_t cmd = pci_cfg_read16(dev, 0x04);
+	uint16_t paused = cmd & (uint16_t)~0x3;
+	if (paused != cmd)
+		pci_cfg_write16(dev, 0x04, paused);
+
+	if (lo & 1) {
+		uint64_t size = pci_size_register(dev, off, lo, 0x3);
+		if (size)
+			size &= 0xFFFF; /* I/O windows are 16-bit */
+		out->base = lo & ~0x3ULL;
+		out->size = size;
+		out->flags = PCI_BAR_IO;
+	} else {
+		int is64 = ((lo >> 1) & 3) == 2;
+		uint32_t hi = 0;
+		uint64_t size_lo = pci_size_register(dev, off, lo, 0xF);
+		uint64_t size = size_lo;
+
+		if (is64 && index < 5) {
+			unsigned char offh = (unsigned char)(off + 4);
+			hi = pci_cfg_read32(dev->bus, dev->device, dev->function,
+					    offh);
+			pci_cfg_write32(dev->bus, dev->device, dev->function,
+					offh, 0xFFFFFFFFu);
+			uint32_t vh = pci_cfg_read32(dev->bus, dev->device,
+						     dev->function, offh);
+			pci_cfg_write32(dev->bus, dev->device, dev->function,
+					offh, hi);
+			/* The low half sized to zero means the window is at
+			 * least 4 GB: its size lives entirely in the high
+			 * half. */
+			if (size_lo == 0) {
+				if (vh)
+					size = (uint64_t)(~vh + 1u) << 32;
+			}
+		}
+		out->base = (lo & ~0xFULL) | ((uint64_t)hi << 32);
+		out->size = size;
+		out->flags = is64 ? PCI_BAR_MEM64 : 0;
+		if (lo & 0x8)
+			out->flags |= PCI_BAR_PREFETCH;
+	}
+	if (paused != cmd)
+		pci_cfg_write16(dev, 0x04, cmd);
+	if (out->size == 0)
+		return -ENOENT;
+	return 0;
+}
+
+int pci_rom_decode(const pci_device_t *dev, struct pci_bar *out)
+{
+	if (!dev || !out)
+		return -EINVAL;
+	uint32_t orig = pci_cfg_read32(dev->bus, dev->device, dev->function,
+				       0x30);
+	mm_memset(out, 0, sizeof(*out));
+	uint16_t cmd = pci_cfg_read16(dev, 0x04);
+	uint16_t paused = cmd & (uint16_t)~0x3;
+	if (paused != cmd)
+		pci_cfg_write16(dev, 0x04, paused);
+	/* Bit 0 is the enable; the address field starts at bit 11. */
+	pci_cfg_write32(dev->bus, dev->device, dev->function, 0x30,
+			0xFFFFF800u | (orig & 1));
+	uint32_t v = pci_cfg_read32(dev->bus, dev->device, dev->function, 0x30);
+	pci_cfg_write32(dev->bus, dev->device, dev->function, 0x30, orig);
+	if (paused != cmd)
+		pci_cfg_write16(dev, 0x04, cmd);
+	v &= 0xFFFFF800u;
+	if (!v)
+		return -ENOENT;
+	out->base = orig & 0xFFFFF800u;
+	out->size = (uint64_t)(~v + 1u);
+	out->flags = 0;
+	return 0;
+}
+
+const pci_device_t *pci_find_bdf(unsigned char bus, unsigned char device,
+				 unsigned char function)
+{
+	for (int i = 0; i < g_pci_count; i++) {
+		const pci_device_t *p = &g_pci_devices[i];
+		if (p->bus == bus && p->device == device &&
+		    p->function == function)
+			return p;
+	}
+	return NULL;
 }

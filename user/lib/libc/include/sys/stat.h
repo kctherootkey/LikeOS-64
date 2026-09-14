@@ -74,6 +74,8 @@ int fchmod(int fd, mode_t mode);
 mode_t umask(mode_t mask);
 int mknod(const char* path, mode_t mode, dev_t dev);
 int mkfifo(const char* path, mode_t mode);
+int mknodat(int dirfd, const char* path, mode_t mode, dev_t dev);
+int mkfifoat(int dirfd, const char* path, mode_t mode);
 /* POSIX puts mkdir HERE, in <sys/stat.h> -- the mode argument's S_ macros
  * are this header's.  unistd.h has carried a duplicate declaration since the
  * early ports and keeps it for the code written against it; a program that

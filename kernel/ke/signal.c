@@ -12,6 +12,7 @@
 #include <kernel/fs/icache.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/waitq.h>
+#include <kernel/ke/interrupt.h>
 
 // NOTE: Signal delivery now uses per-CPU storage via percpu_t
 /* Bytes below RSP the ABI reserves for leaf functions (the red zone); a
@@ -961,9 +962,19 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	mm_memset(&kframe, 0, sizeof(kframe));
 
 	/* The interrupted context, as the handler will see it in
-	 * uc_mcontext.  A syscall may clobber the caller-saved registers
-	 * (the ABI allows it), so only the callee-saved set and RAX -- the
-	 * syscall's return value -- are meaningful here; the rest read 0. */
+	 * uc_mcontext: the callee-saved set, RAX (the syscall's return
+	 * value), and the argument registers as syscall_entry pushed them.
+	 *
+	 * The argument registers are caller-saved, so a syscall RETURN may
+	 * leave them anything -- but a RESTART re-executes the SYSCALL
+	 * instruction from this very context once the handler's sigreturn
+	 * has put it back, and the instruction reads its arguments from
+	 * exactly these registers.  They used to read 0 here: a restarted
+	 * ioctl(fd, req, arg) came back as ioctl(0, 0, 0), ENOTTY from the
+	 * standard input, and Mesa aborted the web process for it whenever
+	 * the collector's SIGUSR1 (installed with SA_RESTART) landed on a
+	 * fence wait inside an execbuf.  RCX and R11 are gone -- SYSCALL
+	 * itself overwrites them -- and the ABI lets them be. */
 	uint64_t *g = kframe.uc.uc_mcontext.gregs;
 	g[REG_RIP] = user_rip;
 	g[REG_RSP] = user_rsp;
@@ -975,6 +986,16 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	g[REG_R14] = task->syscall_r14;
 	g[REG_R15] = task->syscall_r15;
 	g[REG_RAX] = task->syscall_rax;
+	if (task->syscall_frame) {
+		const syscall_user_frame_t *f = task->syscall_frame;
+
+		g[REG_RDI] = f->rdi;
+		g[REG_RSI] = f->rsi;
+		g[REG_RDX] = f->rdx;
+		g[REG_R8] = f->r8;
+		g[REG_R9] = f->r9;
+		g[REG_R10] = f->r10;
+	}
 	g[REG_CSGSFS] = 0x33; /* user code selector */
 
 	sigframe_fill(&kframe, task, sig, info, act, frame_addr, fpu_addr,
@@ -1829,6 +1850,31 @@ int64_t sys_kill(uint64_t pid, uint64_t sig)
 		return perr;
 	if (sig == 0)
 		return 0;
+	/* A process raising a core-dumping signal on itself -- abort(), or a
+	 * handler passing on a fault it could not deal with -- is the one
+	 * death that leaves no trace at all: no exception for the crash
+	 * reporter, nothing printed by libc, and the fast path for a task
+	 * signalling itself never reaches the delivery-time line.  Reported
+	 * here, while the caller's user context is still on its kernel
+	 * stack, and only when the default action is what will happen. */
+	if (self->privilege == TASK_USER &&
+	    sig_default_action((int)sig) == SIG_DFL_CORE &&
+	    (t->tgid ? t->tgid : t->id) ==
+		    (self->tgid ? self->tgid : self->id) &&
+	    t->signals.action[sig].sa_handler == SIG_DFL) {
+		static const char *const names[] = {
+			[SIGQUIT] = "SIGQUIT", [SIGILL] = "SIGILL",
+			[SIGTRAP] = "SIGTRAP", [SIGABRT] = "SIGABRT",
+			[SIGBUS] = "SIGBUS",   [SIGFPE] = "SIGFPE",
+			[SIGSEGV] = "SIGSEGV",
+		};
+		const char *name = sig < sizeof(names) / sizeof(names[0]) &&
+						   names[sig] ?
+					   names[sig] :
+					   "a signal";
+
+		report_userspace_self_signal(self, (int)sig, name);
+	}
 	kill_task(t, (int)sig, self);
 	return 0;
 }
