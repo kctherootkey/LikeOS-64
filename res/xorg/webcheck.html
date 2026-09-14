@@ -131,6 +131,57 @@ var absent = [];
 row('missing APIs', absent.length ? 'warn' : 'ok',
     absent.length ? absent.join(', ') : 'none of the probed set');
 
+/* --- blobs, workers and WebAssembly ------------------------------------
+   The WhatsApp failure is a module that dies with "No such file or
+   directory", which is a file error reaching JavaScript.  These are the
+   paths that can produce one. */
+try {
+  var b = new Blob(['likeos'], { type: 'text/plain' });
+  var u = URL.createObjectURL(b);
+  fetch(u).then(function (r) { return r.text(); }).then(function (t) {
+    if (t === 'likeos') ok('blob: URL', 'created, fetched, read back');
+    else bad('blob: URL', 'read back ' + JSON.stringify(t));
+    URL.revokeObjectURL(u);
+  }).catch(function (e) { bad('blob: URL', e.name + ': ' + e.message); });
+} catch (e) { bad('blob: URL', e.name + ': ' + e.message); }
+
+try {
+  var fr = new FileReader();
+  fr.onload = function () { ok('FileReader', 'read a Blob'); };
+  fr.onerror = function () { bad('FileReader', String(fr.error && fr.error.message)); };
+  fr.readAsText(new Blob(['x']));
+} catch (e) { bad('FileReader', e.name + ': ' + e.message); }
+
+try {
+  var wu = URL.createObjectURL(new Blob(['onmessage=function(e){postMessage(e.data*2);}'],
+                                        { type: 'text/javascript' }));
+  var w = new Worker(wu);
+  var wdone = false;
+  setTimeout(function () { if (!wdone) bad('Worker', 'no reply in 6 s'); }, 6000);
+  w.onmessage = function (e) { wdone = true; ok('Worker', 'blob worker replied ' + e.data); w.terminate(); };
+  w.onerror = function (e) { wdone = true; bad('Worker', e.message || 'error event'); };
+  w.postMessage(21);
+} catch (e) { bad('Worker', e.name + ': ' + e.message); }
+
+if (!window.WebAssembly) {
+  bad('WebAssembly', 'missing');
+} else {
+  /* the smallest valid module: header only */
+  var wasm = new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]);
+  try {
+    WebAssembly.instantiate(wasm).then(function () { ok('WebAssembly', 'compile and instantiate'); })
+      .catch(function (e) { bad('WebAssembly', e.name + ': ' + e.message); });
+  } catch (e) { bad('WebAssembly', e.name + ': ' + e.message); }
+  try {
+    var resp = new Response(wasm, { headers: { 'Content-Type': 'application/wasm' } });
+    WebAssembly.instantiateStreaming(resp).then(function () { ok('WebAssembly', 'streaming'); })
+      .catch(function (e) { bad('WebAssembly streaming', e.name + ': ' + e.message); });
+  } catch (e) { bad('WebAssembly streaming', e.name + ': ' + e.message); }
+}
+
+try { structuredClone({ a: [1, 2] }); ok('structuredClone'); }
+catch (e) { bad('structuredClone', e.name + ': ' + e.message); }
+
 /* --- JavaScript itself ------------------------------------------------ */
 try {
   /* the things a modern site bundle is compiled down to */
