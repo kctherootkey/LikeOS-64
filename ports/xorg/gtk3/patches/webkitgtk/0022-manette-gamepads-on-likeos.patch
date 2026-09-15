@@ -1,0 +1,125 @@
+libmanette drives gamepads through evdev, which this system provides with
+the same event codes and ioctl encoding (see the libmanette port patch).
+WebKit enables that path only for OS(LINUX); take it on OS(LIKEOS) too,
+as every distribution build does, instead of compiling the generic stub.
+
+diff -ru a/Source/WebCore/platform/gamepad/manette/ManetteGamepad.cpp b/Source/WebCore/platform/gamepad/manette/ManetteGamepad.cpp
+--- a/Source/WebCore/platform/gamepad/manette/ManetteGamepad.cpp	2026-09-15 04:37:54.696330801 +0200
++++ b/Source/WebCore/platform/gamepad/manette/ManetteGamepad.cpp	2026-09-15 04:38:11.447331741 +0200
+@@ -26,10 +26,16 @@
+ #include "config.h"
+ #include "ManetteGamepad.h"
+ 
+-#if ENABLE(GAMEPAD) && OS(LINUX)
++#if ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+ 
+ #include "ManetteGamepadProvider.h"
++// This platform's evdev UAPI header carries the same event codes under a
++// different name (as in libevdev.h).
++#if OS(LIKEOS)
++#include <sys/input.h>
++#else
+ #include <linux/input-event-codes.h>
++#endif
+ #include <wtf/HexNumber.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/text/CString.h>
+@@ -180,4 +186,4 @@
+ 
+ } // namespace WebCore
+ 
+-#endif // ENABLE(GAMEPAD) && OS(LINUX)
++#endif // ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+diff -ru a/Source/WebCore/platform/gamepad/manette/ManetteGamepad.h b/Source/WebCore/platform/gamepad/manette/ManetteGamepad.h
+--- a/Source/WebCore/platform/gamepad/manette/ManetteGamepad.h	2026-09-15 04:37:54.690398028 +0200
++++ b/Source/WebCore/platform/gamepad/manette/ManetteGamepad.h	2026-09-15 04:38:11.445822394 +0200
+@@ -25,7 +25,7 @@
+ 
+ #pragma once
+ 
+-#if ENABLE(GAMEPAD) && OS(LINUX)
++#if ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+ 
+ #include "PlatformGamepad.h"
+ 
+@@ -87,4 +87,4 @@
+ 
+ } // namespace WebCore
+ 
+-#endif // ENABLE(GAMEPAD) && OS(LINUX)
++#endif // ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+diff -ru a/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.cpp b/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.cpp
+--- a/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.cpp	2026-09-15 04:37:54.683968800 +0200
++++ b/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.cpp	2026-09-15 04:38:11.444413258 +0200
+@@ -27,7 +27,7 @@
+ #include "config.h"
+ #include "ManetteGamepadProvider.h"
+ 
+-#if ENABLE(GAMEPAD) && OS(LINUX)
++#if ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+ 
+ #include "GUniquePtrManette.h"
+ #include "GamepadProviderClient.h"
+@@ -193,4 +193,4 @@
+ 
+ } // namespace WebCore
+ 
+-#endif // ENABLE(GAMEPAD) && OS(LINUX)
++#endif // ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+diff -ru a/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.h b/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.h
+--- a/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.h	2026-09-15 04:37:54.677532547 +0200
++++ b/Source/WebCore/platform/gamepad/manette/ManetteGamepadProvider.h	2026-09-15 04:38:11.442861969 +0200
+@@ -26,7 +26,7 @@
+ 
+ #pragma once
+ 
+-#if ENABLE(GAMEPAD) && OS(LINUX)
++#if ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+ 
+ #include "GamepadProvider.h"
+ #include <libmanette.h>
+@@ -82,4 +82,4 @@
+ 
+ } // namespace WebCore
+ 
+-#endif // ENABLE(GAMEPAD) && OS(LINUX)
++#endif // ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+diff -ru a/Source/WebKit/UIProcess/Gamepad/manette/UIGamepadProviderManette.cpp b/Source/WebKit/UIProcess/Gamepad/manette/UIGamepadProviderManette.cpp
+--- a/Source/WebKit/UIProcess/Gamepad/manette/UIGamepadProviderManette.cpp	2026-09-15 04:37:54.670129767 +0200
++++ b/Source/WebKit/UIProcess/Gamepad/manette/UIGamepadProviderManette.cpp	2026-09-15 04:38:11.441164058 +0200
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include "UIGamepadProvider.h"
+ 
+-#if ENABLE(GAMEPAD) && OS(LINUX)
++#if ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+ 
+ #include "WebPageProxy.h"
+ #include <WebCore/ManetteGamepadProvider.h>
+@@ -61,4 +61,4 @@
+ 
+ }
+ 
+-#endif // ENABLE(GAMEPAD) && OS(LINUX)
++#endif // ENABLE(GAMEPAD) && (OS(LINUX) || OS(LIKEOS))
+diff -ru a/Source/WebKit/UIProcess/Gamepad/UIGamepadProvider.cpp b/Source/WebKit/UIProcess/Gamepad/UIGamepadProvider.cpp
+--- a/Source/WebKit/UIProcess/Gamepad/UIGamepadProvider.cpp	2026-09-15 04:37:54.663205510 +0200
++++ b/Source/WebKit/UIProcess/Gamepad/UIGamepadProvider.cpp	2026-09-15 04:38:11.439090270 +0200
+@@ -250,7 +250,7 @@
+     });
+ }
+ 
+-#if !PLATFORM(COCOA) && !(USE(MANETTE) && OS(LINUX)) && !USE(LIBWPE) && !USE(WPE_PLATFORM)
++#if !PLATFORM(COCOA) && !(USE(MANETTE) && (OS(LINUX) || OS(LIKEOS))) && !USE(LIBWPE) && !USE(WPE_PLATFORM)
+ 
+ void UIGamepadProvider::platformSetDefaultGamepadProvider()
+ {
+@@ -271,7 +271,7 @@
+ {
+ }
+ 
+-#endif // !PLATFORM(COCOA) && !(USE(MANETTE) && OS(LINUX)) && !USE(LIBWPE) && !USE(WPE_PLATFORM)
++#endif // !PLATFORM(COCOA) && !(USE(MANETTE) && (OS(LINUX) || OS(LIKEOS))) && !USE(LIBWPE) && !USE(WPE_PLATFORM)
+ 
+ }
+ 

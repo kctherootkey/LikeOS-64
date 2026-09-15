@@ -1,0 +1,104 @@
+diff -ru -x .likeos-build libmanette-0.2.7/src/manette-device.c libmanette-0.2.7/src/manette-device.c
+--- libmanette-0.2.7/src/manette-device.c	2024-02-09 13:43:46.000000000 +0100
++++ libmanette-0.2.7/src/manette-device.c	2026-09-14 23:27:58.377175623 +0200
+@@ -28,7 +28,14 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <libevdev/libevdev.h>
++/* This platform's evdev UAPI header carries the same event codes under a
++ * different name; see libevdev.h. */
++#ifdef __LIKEOS__
++#include <sys/input.h>
++#include <sys/ioctl.h>
++#else
+ #include <linux/input-event-codes.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -50,7 +57,11 @@
+ 
+   ManetteMapping *mapping;
+ 
++  /* Force feedback is an evdev extension a kernel may not have: without
++   * EVIOCSFF there is no way to upload an effect, and no device rumbles. */
++#ifdef EVIOCSFF
+   struct ff_effect rumble_effect;
++#endif
+ };
+ 
+ G_DEFINE_TYPE (ManetteDevice, manette_device, G_TYPE_OBJECT)
+@@ -329,8 +340,10 @@
+ manette_device_init (ManetteDevice *self)
+ {
+   self->event_source_id = -1;
++#ifdef EVIOCSFF
+   self->rumble_effect.type = FF_RUMBLE;
+   self->rumble_effect.id = -1;
++#endif
+ }
+ 
+ static gchar *
+@@ -784,6 +797,10 @@
+ 
+   g_return_val_if_fail (MANETTE_IS_DEVICE (self), FALSE);
+ 
++#ifndef EVIOCSFF
++  return FALSE;
++#endif
++
+   if (ioctl (self->fd, EVIOCGBIT (EV_FF, sizeof (gulong) * 4), features) == -1)
+     return FALSE;
+ 
+@@ -818,6 +835,11 @@
+   g_return_val_if_fail (MANETTE_IS_DEVICE (self), FALSE);
+   g_return_val_if_fail (milliseconds <= G_MAXINT16, FALSE);
+ 
++#ifndef EVIOCSFF
++  g_debug ("Rumble is not supported: the kernel has no force feedback.");
++
++  return FALSE;
++#else
+   self->rumble_effect.u.rumble.strong_magnitude = strong_magnitude;
+   self->rumble_effect.u.rumble.weak_magnitude = weak_magnitude;
+   self->rumble_effect.replay.length = milliseconds;
+@@ -840,4 +862,5 @@
+   }
+ 
+   return TRUE;
++#endif
+ }
+diff -ru -x .likeos-build libmanette-0.2.7/src/manette-event-mapping.c libmanette-0.2.7/src/manette-event-mapping.c
+--- libmanette-0.2.7/src/manette-event-mapping.c	2024-02-09 13:43:46.000000000 +0100
++++ libmanette-0.2.7/src/manette-event-mapping.c	2026-09-14 23:26:37.333536875 +0200
+@@ -18,7 +18,13 @@
+ 
+ #include "manette-event-mapping-private.h"
+ 
++/* This platform's evdev UAPI header carries the same event codes under a
++ * different name; see libevdev.h. */
++#ifdef __LIKEOS__
++#include <sys/input.h>
++#else
+ #include <linux/input-event-codes.h>
++#endif
+ #include "manette-event-private.h"
+ 
+ static GSList *
+diff -ru -x .likeos-build libmanette-0.2.7/src/manette-mapping.c libmanette-0.2.7/src/manette-mapping.c
+--- libmanette-0.2.7/src/manette-mapping.c	2024-02-09 13:43:46.000000000 +0100
++++ libmanette-0.2.7/src/manette-mapping.c	2026-09-14 23:26:37.343413216 +0200
+@@ -19,7 +19,13 @@
+ #include "manette-mapping-private.h"
+ 
+ #include <errno.h>
++/* This platform's evdev UAPI header carries the same event codes under a
++ * different name; see libevdev.h. */
++#ifdef __LIKEOS__
++#include <sys/input.h>
++#else
+ #include <linux/input-event-codes.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ 

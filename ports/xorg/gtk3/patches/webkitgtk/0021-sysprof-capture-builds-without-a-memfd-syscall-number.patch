@@ -1,0 +1,46 @@
+diff -ru a/Source/ThirdParty/libsysprof-capture/sysprof-capture-reader.c b/Source/ThirdParty/libsysprof-capture/sysprof-capture-reader.c
+--- a/Source/ThirdParty/libsysprof-capture/sysprof-capture-reader.c	2026-09-14 23:58:41.496158234 +0200
++++ b/Source/ThirdParty/libsysprof-capture/sysprof-capture-reader.c	2026-09-14 23:58:41.502751050 +0200
+@@ -60,6 +60,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
+diff -ru a/Source/ThirdParty/libsysprof-capture/sysprof-capture-writer.c b/Source/ThirdParty/libsysprof-capture/sysprof-capture-writer.c
+--- a/Source/ThirdParty/libsysprof-capture/sysprof-capture-writer.c	2026-09-14 23:58:41.496852312 +0200
++++ b/Source/ThirdParty/libsysprof-capture/sysprof-capture-writer.c	2026-09-14 23:58:41.501036226 +0200
+@@ -65,6 +65,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
+diff -ru a/Source/ThirdParty/libsysprof-capture/sysprof-platform.c b/Source/ThirdParty/libsysprof-capture/sysprof-platform.c
+--- a/Source/ThirdParty/libsysprof-capture/sysprof-platform.c	2026-09-14 23:58:41.497296003 +0200
++++ b/Source/ThirdParty/libsysprof-capture/sysprof-platform.c	2026-09-14 23:58:41.501724948 +0200
+@@ -56,6 +56,7 @@
+ 
+ #include "config.h"
+ 
++#include <fcntl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/syscall.h>
+@@ -64,6 +65,12 @@
+ #include "sysprof-capture-util-private.h"
+ #include "sysprof-platform.h"
+ 
++/* The fallback below, for a system whose <sys/syscall.h> has no memfd_create
++ * number, opens its temporary file with O_BINARY, which only Windows defines. */
++#ifndef O_BINARY
++# define O_BINARY 0
++#endif
++
+ #ifndef __NR_memfd_create
+ static const char *
+ get_tmpdir (void)

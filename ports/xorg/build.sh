@@ -1019,6 +1019,82 @@ meson_opts() {
 		echo "-Dgnutls=enabled -Dopenssl=disabled -Dlibproxy=disabled \
 		      -Dgnome_proxy=disabled -Dinstalled_tests=false"
 		;;
+	gstreamer)
+		# WebKit's media stack (ENABLE_VIDEO, ENABLE_WEB_AUDIO,
+		# MEDIA_SOURCE, MEDIA_STREAM, MEDIA_RECORDER, WEB_CODECS) is
+		# built on GStreamer, and is on in every distribution's WebKit.
+		# The tools (gst-launch-1.0, gst-inspect-1.0) are kept: they
+		# are how a pipeline is debugged on the target.  The PTP helper
+		# is Rust in this release and a network-clock daemon besides.
+		echo "-Dptp-helper=disabled -Dcheck=disabled \
+		      -Dlibunwind=disabled -Dlibdw=disabled -Ddbghelp=disabled \
+		      -Dbash-completion=disabled -Dexamples=disabled \
+		      -Dtests=disabled -Dbenchmarks=disabled -Dtools=enabled \
+		      -Dintrospection=disabled -Dnls=disabled -Ddoc=disabled"
+		;;
+	gst-plugins-base)
+		# WebKit needs the app, pbutils, video, tag, gl, audio and fft
+		# libraries from here.  GL on EGL (what WebKit hands it) with
+		# the X11 window system.  No codec libraries are ported, so the
+		# ogg/vorbis/theora/opus plugins are off by name rather than
+		# left to auto-detection.
+		echo "-Dgl=enabled -Dgl_api=opengl,gles2 -Dgl_platform=egl,glx \
+		      -Dgl_winsys=x11,egl -Dgl-graphene=disabled \
+		      -Dalsa=disabled -Dcdparanoia=disabled -Dlibvisual=disabled \
+		      -Dogg=disabled -Dopus=disabled -Dtheora=disabled \
+		      -Dtremor=disabled -Dvorbis=disabled -Diso-codes=disabled \
+		      -Dorc=disabled -Dqt5=disabled -Dexamples=disabled \
+		      -Dtests=disabled -Dtools=enabled -Dintrospection=disabled \
+		      -Dnls=disabled -Ddoc=disabled"
+		;;
+	libmanette)
+		# WebKit's ENABLE_GAMEPAD.  Devices come from evdev; gudev
+		# (udev hotplug) does not exist here.
+		echo "-Ddemos=false -Dbuild-tests=false -Dinstall-tests=false \
+		      -Ddoc=false -Dintrospection=false -Dvapi=false \
+		      -Dgudev=disabled"
+		;;
+	libsecret)
+		# WebKit's USE_LIBSECRET (persistent HTTP credential storage).
+		echo "-Dmanpage=false -Dcrypto=libgcrypt -Dvapi=false \
+		      -Dgtk_doc=false -Dintrospection=false \
+		      -Dbash_completion=disabled"
+		;;
+	gst-plugins-good)
+		# Every plugin whose dependencies are in the sysroot, as a
+		# distribution ships it; WebKit asks for elements from all over
+		# this set (scaletempo, for one).  The ones WebKit's video path
+		# cannot do without are named so a missing dependency fails the
+		# build instead of silently dropping them:
+		#   isomp4    qtdemux -- MP4/MOV, what most sites serve
+		#   matroska  matroskademux -- WebM, what YouTube serves
+		#   autodetect  autoaudiosink.  NOT for sound: there is no audio
+		#             device here, and WebKit's player RELEASE_ASSERTs
+		#             that it got an audio sink.  With no real sink to
+		#             choose, autoaudiosink plugs a fakesink, so a video
+		#             with a soundtrack plays silently instead of taking
+		#             the web process down.
+		#   audiofx   scaletempo, which WebKit's player asks for.
+		echo "-Disomp4=enabled -Dmatroska=enabled -Dautodetect=enabled \
+		      -Daudiofx=enabled -Dexamples=disabled -Dtests=disabled \
+		      -Ddoc=disabled -Dnls=disabled -Dorc=disabled \
+		      -Dqt5=disabled -Dqt6=disabled"
+		;;
+	gst-plugins-bad)
+		# Every plugin whose dependencies are in the sysroot.  Named:
+		#   videoparsers  h264parse, h265parse, vp9parse... -- WebKit's
+		#             Media Source path (how YouTube plays) advertises
+		#             H.264/H.265 only when a parser exists
+		#   debugutils    fakevideosink, which WebKit's player asks for
+		#   subenc        webvttenc, WebKit's subtitle handling
+		echo "-Dvideoparsers=enabled -Ddebugutils=enabled \
+		      -Dsubenc=enabled -Dexamples=disabled -Dtests=disabled \
+		      -Ddoc=disabled -Dnls=disabled -Dorc=disabled \
+		      -Dintrospection=disabled"
+		;;
+	gst-libav)
+		echo "-Ddoc=disabled -Dtests=disabled"
+		;;
 	*) echo "" ;;
 	esac
 }
@@ -1703,18 +1779,24 @@ build_one() {
 		#   - system malloc: bmalloc's virtual-memory gymnastics
 		#     (gigacage reservations in the terabytes) assume address
 		#     space this kernel does not hand out;
-		#   - the media stack OFF entirely (USE_GSTREAMER,
-		#     ENABLE_VIDEO, ENABLE_WEB_AUDIO and the rest below).
-		#     There is no audio driver in this kernel, so nothing a
-		#     decoder produced could ever be heard, and the engine
-		#     composites video frames itself rather than through a
-		#     GStreamer sink -- so the framework, its plugin sets and
-		#     the codec libraries under them bought nothing but build
-		#     time and image size.  They were removed from the port
-		#     with this switch;
-		#   - the supervisor extras still off: journald wants a
-		#     logging daemon, bubblewrap a sandbox built on namespaces
-		#     and seccomp, neither of which exists here.
+		#   - every other feature option at the value Ubuntu's
+		#     WebKitGTK 2.52.6 is built with (its debian/rules and the
+		#     amd64 build log of 2.52.6-0ubuntu0.24.04.1): the
+		#     GStreamer media stack (VIDEO, WEB_AUDIO, MEDIA_SOURCE,
+		#     MEDIA_STREAM, MEDIA_RECORDER, WEB_CODECS, GSTREAMER_GL),
+		#     GAMEPAD, WEBDRIVER, LCMS, LIBHYPHEN, LIBSECRET,
+		#     SYSPROF_CAPTURE and MEMORY_SAMPLER on; AVIF, JPEGXL,
+		#     SPEECH_SYNTHESIS and LIBBACKTRACE off.  Everything not
+		#     named below is WebKit's own default, as it is there.
+		#     Sysprof's capture library is the copy WebKit bundles
+		#     rather than a system one;
+		#   - what still differs from Ubuntu, each for a reason on
+		#     this system: journald wants a logging daemon, bubblewrap
+		#     a sandbox built on namespaces and seccomp, introspection
+		#     a g-ir-scanner that RUNS the target library, Wayland a
+		#     compositor -- none of which exists here; RESOURCE_USAGE's
+		#     only implementation is OS(LINUX)-guarded; and system
+		#     malloc stays, for the reason above.
 		#
 		# Accessibility (USE_ATSPI) is LEFT ON, upstream's setting, and
 		# the "Could NOT find ATSPI" line in the configure output is
@@ -1847,38 +1929,19 @@ build_one() {
 				-DENABLE_X11_TARGET=ON \
 				-DENABLE_WAYLAND_TARGET=OFF \
 				-DENABLE_QUARTZ_TARGET=OFF \
-				-DUSE_SKIA=ON \
-				-DENABLE_JIT=ON -DENABLE_C_LOOP=OFF \
-				-DENABLE_DFG_JIT=ON -DENABLE_FTL_JIT=ON \
-				-DENABLE_WEBASSEMBLY=ON \
-				-DENABLE_SAMPLING_PROFILER=ON \
 				-DUSE_SYSTEM_MALLOC=ON \
 				-DENABLE_MINIBROWSER=ON \
+				-DENABLE_WEBDRIVER=ON \
 				-DENABLE_INTROSPECTION=OFF \
 				-DENABLE_DOCUMENTATION=OFF \
 				-DENABLE_JOURNALD_LOG=OFF \
 				-DENABLE_BUBBLEWRAP_SANDBOX=OFF \
-				-DUSE_GBM=ON -DUSE_LIBDRM=ON \
-				-DENABLE_GPU_PROCESS=ON \
-				-DUSE_GSTREAMER=OFF -DENABLE_VIDEO=OFF \
-				-DUSE_GSTREAMER_GL=OFF \
-				-DENABLE_MEDIA_SOURCE=OFF \
-				-DENABLE_WEB_AUDIO=OFF \
-				-DENABLE_MEDIA_STREAM=OFF \
-				-DENABLE_MEDIA_RECORDER=OFF \
-				-DENABLE_WEB_CODECS=OFF \
-				-DENABLE_MEDIA_SESSION=OFF \
-				-DENABLE_WEB_RTC=OFF \
-				-DENABLE_ENCRYPTED_MEDIA=OFF \
+				-DENABLE_MEMORY_SAMPLER=ON \
 				-DENABLE_SPEECH_SYNTHESIS=OFF \
-				-DUSE_FLITE=OFF -DUSE_SPIEL=OFF \
-				-DENABLE_GAMEPAD=OFF -DENABLE_WEBGL=ON \
-				-DENABLE_WEBDRIVER=OFF -DENABLE_WEBXR=OFF \
-				-DUSE_AVIF=OFF -DUSE_JPEGXL=OFF -DUSE_LCMS=OFF \
-				-DUSE_LIBHYPHEN=OFF -DUSE_LIBSECRET=OFF \
+				-DUSE_AVIF=OFF -DUSE_JPEGXL=OFF \
 				-DUSE_LIBBACKTRACE=OFF \
-				-DUSE_SYSPROF_CAPTURE=OFF \
-				-DENABLE_SPELLCHECK=ON -DENABLE_PDFJS=ON \
+				-DUSE_SYSPROF_CAPTURE=ON \
+				-DUSE_SYSTEM_SYSPROF_CAPTURE=OFF \
 				-DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" \
 				-DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
 				-DCMAKE_SHARED_LINKER_FLAGS="-Wl,--no-keep-memory" \
@@ -2086,6 +2149,48 @@ build_one() {
 			make -j"$(nproc)" &&
 			make install DESTDIR="$SYSROOT" &&
 			post_install "$name"
+		) >"$log" 2>&1
+	elif [ "$name" = ffmpeg ]; then
+		# The video decoders behind gst-libav: H.264, H.265, VP8, VP9 --
+		# plus ONE audio decoder, AAC.  Not for sound (there is no audio
+		# device, and what it decodes goes to a fakesink): sites like
+		# YouTube only start a video when the browser also claims the
+		# soundtrack's codec, and WebKit's Media Source path claims AAC
+		# as soon as an AAC decoder exists.
+		# FFmpeg's configure is its own, not autoconf -- it refuses
+		# --host and every other option it does not know -- so it gets
+		# an arm of its own, the way sqlite's autosetup does.
+		#
+		# --disable-everything, then only what WebKit's video path
+		# asks for.  No programs, no network, no devices, no scaling
+		# or resampling libraries; libavfilter stays because gst-libav
+		# links it.  --target-os=none is configure's generic POSIX
+		# target; the compiler it is given is the port's own driver.
+		# nasm (a build-host tool) assembles the SIMD decoding loops,
+		# without which H.264 decodes several times slower.
+		(
+			cd "$dir" || exit 1
+			[ -f ffbuild/config.mak ] && make distclean >/dev/null 2>&1
+			PATH="$HOSTTOOLS/bin:$PATH"
+			export PATH
+			./configure --prefix=/usr --libdir=/usr/lib \
+				--shlibdir=/usr/lib \
+				--enable-cross-compile --target-os=none --arch=x86_64 \
+				--cc="$here/toolchain/likeos-cc" \
+				--cxx="$here/toolchain/likeos-c++" \
+				--ld="$here/toolchain/likeos-cc" \
+				--pkg-config="$here/toolchain/likeos-pkg-config" \
+				--enable-shared --disable-static --enable-pic \
+				--disable-programs --disable-doc --disable-network \
+				--disable-autodetect --disable-everything \
+				--disable-avdevice --disable-swscale \
+				--disable-swresample --disable-postproc \
+				--enable-decoder=h264,hevc,vp8,vp9,aac \
+				--enable-parser=h264,hevc,vp8,vp9,aac \
+				--x86asmexe=nasm &&
+				make -j"$(nproc)" &&
+				make install DESTDIR="$SYSROOT" &&
+				post_install "$name"
 		) >"$log" 2>&1
 	elif [ "$name" = icu ]; then
 		# ICU builds twice from one tree, exactly like GLib: the cross

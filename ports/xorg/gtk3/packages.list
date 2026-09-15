@@ -369,6 +369,31 @@
 # on an X desktop with OpenGL.
 -         mesa-demos         9.0.0    https://archive.mesa3d.org/demos/mesa-demos-%VERSION%.tar.xz
 
+# ---- WebKit's optional libraries, as a distribution builds it --------------
+# Each turns on a WebKit option that is on in Ubuntu's and Debian's WebKitGTK:
+#   lcms2       USE_LCMS         colour management of images with ICC profiles
+#   hyphen      USE_LIBHYPHEN    CSS `hyphens: auto`
+#   libsecret   USE_LIBSECRET    persistent HTTP credential storage
+#   libmanette  ENABLE_GAMEPAD   the Gamepad API, over evdev
+#   gstreamer + gst-plugins-base
+#               USE_GSTREAMER    ENABLE_VIDEO, ENABLE_WEB_AUDIO, MEDIA_SOURCE,
+#                                MEDIA_STREAM, MEDIA_RECORDER, WEB_CODECS
+-         lcms2              2.16     https://github.com/mm2/Little-CMS/releases/download/lcms%VERSION%/lcms2-%VERSION%.tar.gz
+-         hyphen             2.8.8    https://downloads.sourceforge.net/hunspell/hyphen-%VERSION%.tar.gz
+-         libsecret          0.21.4   https://download.gnome.org/sources/libsecret/0.21/libsecret-%VERSION%.tar.xz
+-         libmanette         0.2.7    https://download.gnome.org/sources/libmanette/0.2/libmanette-%VERSION%.tar.xz
+-         gstreamer          1.24.13  https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-%VERSION%.tar.xz
+-         gst-plugins-base   1.24.13  https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-%VERSION%.tar.xz
+# Video playback: the MP4 and WebM demuxers (and the autoaudiosink WebKit
+# requires, which falls back to a fakesink -- there is no sound here), the
+# video parsers WebKit's Media Source path needs, and FFmpeg's H.264/H.265/
+# VP8/VP9 decoders through gst-libav.  Loaded by GStreamer at run time: none
+# of these needs WebKit rebuilt.
+-         gst-plugins-good   1.24.13  https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-%VERSION%.tar.xz
+-         gst-plugins-bad    1.24.13  https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-%VERSION%.tar.xz
+-         ffmpeg             7.1.1    https://ffmpeg.org/releases/ffmpeg-%VERSION%.tar.xz
+-         gst-libav          1.24.13  https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-%VERSION%.tar.xz
+
 # The engine itself.  2.52.6 is the newest stable release that still ships
 # the GTK3 API (webkit2gtk-4.1); the GTK4-only builds do not apply here.
 -         webkitgtk          2.52.6   https://webkitgtk.org/releases/webkitgtk-%VERSION%.tar.xz

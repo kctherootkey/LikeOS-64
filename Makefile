@@ -2177,7 +2177,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 		$(EXT4_STAGING)/root $(EXT4_STAGING)/home \
 		$(EXT4_STAGING)/var/empty $(EXT4_STAGING)/var/run \
 		$(EXT4_STAGING)/var/log $(EXT4_STAGING)/tmp \
-		$(EXT4_STAGING)/var/lib/dbus
+		$(EXT4_STAGING)/var/tmp $(EXT4_STAGING)/var/lib/dbus
 	# /var/lib/dbus holds the machine id, which dbus-daemon refuses to
 	# start without.  xinitrc writes it with dbus-uuidgen on the first
 	# session -- it identifies the INSTALLATION, so it is generated on the
@@ -2407,6 +2407,12 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# their own /tmp/tmux-<uid> socket dir (tmux then makes it 0700); the sticky
 	# bit keeps users from deleting each other's files.
 	chmod 1777 $(EXT4_STAGING)/tmp
+	# /var/tmp, the same mode: temporary files that are too big for /tmp or
+	# must survive a reboot.  WebKit's media player writes a progressively
+	# downloaded video there (GStreamer's download buffering) -- without the
+	# directory an ordinary <video src=...mp4> never starts, while Media
+	# Source streams (YouTube) play, which is how it was found.
+	chmod 1777 $(EXT4_STAGING)/var/tmp
 	# --- X.Org: server, drivers, libraries, keymaps, fonts, config.
 	# Staged by a script rather than inline: it is a few hundred files
 	# picked out of a build sysroot that also holds static archives,

@@ -239,6 +239,23 @@ stage_lib libpsl
 stage_lib libnghttp2
 stage_lib libxslt
 stage_lib libsoup-3.0
+# The libraries behind WebKit's distribution-default options: colour
+# management, hyphenation, credential storage, gamepads, and GStreamer --
+# the media stack under <video>, <audio>, Web Audio, Media Source and
+# WebCodecs.
+stage_lib liblcms2
+stage_lib libhyphen
+stage_lib libsecret-1
+stage_lib libmanette-0.2
+for l in libgstreamer-1.0 libgstbase-1.0 libgstcontroller-1.0 libgstnet-1.0 \
+	libgstallocators-1.0 libgstapp-1.0 libgstaudio-1.0 libgstfft-1.0 \
+	libgstgl-1.0 libgstpbutils-1.0 libgstriff-1.0 libgstrtp-1.0 \
+	libgstrtsp-1.0 libgstsdp-1.0 libgsttag-1.0 libgstvideo-1.0 \
+	libgstcodecparsers-1.0; do
+	stage_lib "$l"
+done
+# FFmpeg, whose decoders gst-libav's plugin wraps (H.264, H.265, VP8, VP9).
+for l in libavutil libavcodec libavformat libavfilter; do stage_lib "$l"; done
 stage_lib libjavascriptcoregtk-4.1
 stage_lib libwebkit2gtk-4.1
 
@@ -302,7 +319,9 @@ done
 # The GLib and fontconfig command-line tools.  Small, and each answers a
 # question that is otherwise unanswerable on a running system: what settings a
 # schema holds, what a font name resolves to, what a URI scheme maps to.
-for b in gio gsettings gdbus gapplication fc-list fc-match fc-cache; do
+for b in gio gsettings gdbus gapplication fc-list fc-match fc-cache \
+	gst-launch-1.0 gst-inspect-1.0 gst-discoverer-1.0 gst-typefind-1.0 \
+	gst-device-monitor-1.0 gst-play-1.0; do
 	[ -f "$SYSROOT/usr/bin/$b" ] || continue
 	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 	staged=$((staged + 1))
@@ -340,8 +359,11 @@ fi
 # so these keep the layout they were built with rather than moving to /usr/bin.
 # ---------------------------------------------------------------------------
 if [ -d "$SYSROOT/usr/libexec" ]; then
+	# gst-plugin-scanner: GStreamer forks it to load each plugin once and
+	# record what it provides in the registry cache; without it every
+	# plugin is loaded into the calling process instead.
 	for h in menu-cache/menu-cached menu-cache/menu-cache-gen \
-		gio-launch-desktop; do
+		gio-launch-desktop gstreamer-1.0/gst-plugin-scanner; do
 		[ -f "$SYSROOT/usr/libexec/$h" ] || continue
 		mkdir -p "$DEST/usr/libexec/$(dirname "$h")"
 		cp "$SYSROOT/usr/libexec/$h" "$DEST/usr/libexec/$h"
@@ -404,6 +426,38 @@ if [ -d "$SYSROOT/usr/lib/gio/modules" ]; then
 		cp "$m" "$DEST/usr/lib/gio/modules/"
 		staged=$((staged + 1))
 	done
+fi
+
+# GStreamer's plugins: every element (playbin, decodebin, appsrc, the
+# converters, the GL upload) is one of these, found by scanning this path.
+if [ -d "$SYSROOT/usr/lib/gstreamer-1.0" ]; then
+	mkdir -p "$DEST/usr/lib/gstreamer-1.0"
+	for m in "$SYSROOT"/usr/lib/gstreamer-1.0/*.so; do
+		[ -f "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/gstreamer-1.0/"
+		staged=$((staged + 1))
+	done
+
+	# ...and where GStreamer actually LOOKS for them.  It does not use the
+	# compiled-in /usr/lib/gstreamer-1.0: it asks dladdr() where
+	# libgstreamer-1.0 itself was loaded from and takes that directory --
+	# /lib here, like every library -- so it scans /lib/gstreamer-1.0 and
+	# runs /lib/../libexec/gstreamer-1.0/gst-plugin-scanner.  The compiled-in
+	# paths are only its fallback for when dladdr() fails, which it does not
+	# on this system.  Without these two links every element is "not found"
+	# and WebKit's player gets no audio sink.  Relative targets, like the
+	# xkb link the X.Org port ships.
+	ln -sfn ../usr/lib/gstreamer-1.0 "$DEST/lib/gstreamer-1.0"
+	mkdir -p "$DEST/libexec"
+	ln -sfn ../usr/libexec/gstreamer-1.0 "$DEST/libexec/gstreamer-1.0"
+fi
+
+# Hyphenation patterns for WebKit's `hyphens: auto`, read from the path
+# libhyphen's users look in.
+if [ -d "$SYSROOT/usr/share/hyphen" ]; then
+	mkdir -p "$DEST/usr/share/hyphen"
+	cp "$SYSROOT"/usr/share/hyphen/*.dic "$DEST/usr/share/hyphen/" 2>/dev/null || true
+	staged=$((staged + 1))
 fi
 
 # Claws Mail's plugins -- fancy (the WebKit HTML viewer) is why the directory
@@ -976,7 +1030,7 @@ if [ "${NO_STRIP:-0}" != "1" ] && [ "$staged" -gt 0 ]; then
 		"$DEST/usr/lib/libfm" "$DEST/usr/libexec" \
 		"$DEST/usr/lib/webkit2gtk-4.1" "$DEST/usr/lib/gio" \
 		"$DEST/usr/lib/claws-mail" "$DEST/usr/lib/lua" \
-		"$DEST/usr/lib/luakit" -type f \
+		"$DEST/usr/lib/luakit" "$DEST/usr/lib/gstreamer-1.0" -type f \
 		\( -name '*.so*' -o -perm -u+x \) \
 		-exec strip --strip-debug {} + 2>/dev/null || true
 fi
