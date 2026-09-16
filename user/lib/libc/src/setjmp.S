@@ -15,6 +15,8 @@
  *   [0..7] = same as jmp_buf
  *   [8]    = signal mask placeholder (not used; signal mask save/restore
  *            is not supported — savemask is accepted but ignored)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
     .section .text

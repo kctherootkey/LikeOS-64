@@ -1,4 +1,4 @@
-// LikeOS-64 -- contexts: an address space, an engine map, and a logical
+// LikeOS -- contexts: an address space, an engine map, and a logical
 // ring context per engine the context has run on.
 //
 // The first context an engine ever runs carries a register state the
@@ -6,6 +6,9 @@
 // defaults and saves the full state at the first switch-out).  That
 // saved image is the template every later context on the engine starts
 // from, patched with its own ring and page directory.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_renderstate.h>

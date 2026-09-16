@@ -15,7 +15,10 @@
  * passes, the mechanism is sound and the crash is something WebKit does on
  * top of it.  Each step announces itself BEFORE it runs, so the last line
  * printed names the step that died.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <cstdio>
 #include <mutex>
 #include <pthread.h>

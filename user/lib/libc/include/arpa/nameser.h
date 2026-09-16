@@ -18,6 +18,8 @@
  * rather than fail to link much later.  <resolv.h> declares what IS
  * implemented -- res_query and the name-decompression routine that goes with
  * it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _ARPA_NAMESER_H

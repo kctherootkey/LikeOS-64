@@ -11,7 +11,10 @@
  * currency formats, translated month names -- is that of the C locale, and
  * setlocale reports honestly which name it settled on rather than pretending a
  * request for de_DE.UTF-8 changed how strcoll() orders strings.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <locale.h>
 #include <langinfo.h>
 #include <stdlib.h>

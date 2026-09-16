@@ -1,7 +1,10 @@
-// LikeOS-64 ELF64 Loader Implementation
+// LikeOS ELF64 Loader Implementation
 // Supports static (ET_EXEC) and dynamic/PIE (ET_DYN) executables.
 // When PT_INTERP is present, loads the dynamic linker (ld-likeos.so) and
 // passes control to it with an auxiliary vector on the stack.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/timer.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/file.h>

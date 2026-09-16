@@ -1,4 +1,4 @@
-// LikeOS-64 -- GEM objects for Intel graphics: creation, mapping, state.
+// LikeOS -- GEM objects for Intel graphics: creation, mapping, state.
 //
 // Objects are the DRM core's (pages, handles, sharing); this file keeps
 // what the hardware cares about -- tiling, cache attribute, where the
@@ -6,6 +6,9 @@
 // Coherency on parts with a shared last-level cache is by the cache;
 // objects the client marks uncached (and every part without one) get
 // their lines flushed at the domain transitions.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/uapi/drm/i915_drm.h>

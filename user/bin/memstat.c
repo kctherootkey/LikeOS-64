@@ -1,5 +1,7 @@
-// memstat - Display memory statistics for LikeOS-64
+// memstat - Display memory statistics for LikeOS
 // Usage: memstat
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <stdio.h>
 #include <stdint.h>

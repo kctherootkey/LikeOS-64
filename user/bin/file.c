@@ -3,7 +3,10 @@
  *
  * Full implementation per file(1) manpage.
  * Performs filesystem tests, magic number tests, and text/language heuristics.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

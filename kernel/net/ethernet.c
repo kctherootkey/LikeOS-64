@@ -1,4 +1,7 @@
-// LikeOS-64 Ethernet Frame Layer
+// LikeOS Ethernet Frame Layer
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/net/skb.h>

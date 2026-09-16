@@ -7,7 +7,10 @@
  * decades of use (EX_USAGE has been 64 since 4.0BSD) and every system that
  * ships this header uses the same numbers, so a program compiled here
  * exits with the codes its remote peer expects.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYSEXITS_H
 #define _SYSEXITS_H
 

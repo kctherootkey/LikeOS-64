@@ -18,7 +18,10 @@
  * has not yet consumed them) and the FPU environment are recorded; the
  * caller-saved rest is dead at a function-call boundary, which is what
  * these are.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #define oRBP    120
 #define oRSP    160
 #define oRBX    128

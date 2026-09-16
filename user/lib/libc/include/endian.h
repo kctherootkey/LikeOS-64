@@ -10,7 +10,10 @@
  * __BYTE_ORDER/__LITTLE_ENDIAN names, and the plain BYTE_ORDER/LITTLE_ENDIAN
  * ones that came from BSD.  X11's Xarch.h expects the underscored set and
  * derives the plain names from them if they are absent.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _ENDIAN_H
 #define _ENDIAN_H
 

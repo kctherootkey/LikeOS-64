@@ -1,4 +1,7 @@
-// LikeOS-64 IPv4 Layer
+// LikeOS IPv4 Layer
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/dev/rand/random.h>

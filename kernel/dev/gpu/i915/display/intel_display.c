@@ -1,4 +1,4 @@
-// LikeOS-64 -- pipes, transcoders and planes of Skylake, and the DRM
+// LikeOS -- pipes, transcoders and planes of Skylake, and the DRM
 // backend built on them.
 //
 // A mode set for an output: its power wells up, the panel powered, a PLL
@@ -7,6 +7,9 @@
 // on, the primary plane pointed at the framebuffer with watermarks that
 // keep it fed, and finally the backlight.  Teardown is the reverse.  The
 // DRM core calls in through the drm_driver entry points at the bottom.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>

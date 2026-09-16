@@ -1,4 +1,4 @@
-// LikeOS-64 -- the combo PHY ports of Ice Lake and later: their PLLs,
+// LikeOS -- the combo PHY ports of Ice Lake and later: their PLLs,
 // the PHY itself, and its signal levels.
 //
 // A combo port (DDI A, B and -- on some parts -- C, D, E) has its PLL
@@ -11,6 +11,9 @@
 // which are not a translation table in the DDI here but a set of PHY
 // registers written per level.  Type-C ports are another matter
 // (intel_tc.c).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

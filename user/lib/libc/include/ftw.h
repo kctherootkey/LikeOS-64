@@ -5,7 +5,10 @@
  * callback receives the path, that entry's stat result (or the reason it
  * has none), a type code, and a struct FTW locating the basename and depth.
  * ftw() is the historical interface, kept as a thin wrapper.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _FTW_H
 #define _FTW_H
 

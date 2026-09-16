@@ -7,6 +7,9 @@
 # values are pinned here.  The table code is pure; the driver's own
 # functions are compiled on the host with the register access stubbed
 # out.  Run from the repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-mocs-test.$$
 trap 'rm -rf "$TMP"' EXIT

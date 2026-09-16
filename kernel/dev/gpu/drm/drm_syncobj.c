@@ -1,4 +1,4 @@
-// LikeOS-64 -- synchronisation objects.
+// LikeOS -- synchronisation objects.
 //
 // A syncobj is a handle a renderer passes between its submissions: a
 // container for one fence (binary) or for a timeline of them, where each
@@ -13,6 +13,9 @@
 // attach/signal notification (the same sleep the fence wait uses, see
 // drm_fence.c), so a fence signalled from an interrupt never has to know
 // which syncobjs hold it.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/uapi/ioctl.h>
 #include <kernel/ke/sched.h>

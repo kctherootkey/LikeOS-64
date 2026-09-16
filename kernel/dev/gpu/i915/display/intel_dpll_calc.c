@@ -1,6 +1,9 @@
-// LikeOS-64 -- pure PLL arithmetic for the display PLLs of Ice Lake and
+// LikeOS -- pure PLL arithmetic for the display PLLs of Ice Lake and
 // later (combo PHY DCO/divider values), kept free of kernel headers so
 // the build host can run it (host/test-dpll-icl.sh).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/intel_dpll_calc.h>
 
 /* The combo PLL's DCO and dividers for the DisplayPort link rates, per

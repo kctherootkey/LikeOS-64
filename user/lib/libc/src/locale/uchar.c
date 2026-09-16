@@ -12,7 +12,10 @@
  * has to hand back the second one on a later call, with no input consumed.  It
  * lives in the caller's mbstate_t, flagged by a bit that multibyte.c's own
  * packing cannot produce -- see ST_PENDING below.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <uchar.h>
 #include <wchar.h>
 #include <errno.h>

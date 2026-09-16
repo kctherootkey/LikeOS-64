@@ -1,4 +1,7 @@
-// LikeOS-64 -- QUERY: what the device is made of, item by item.
+// LikeOS -- QUERY: what the device is made of, item by item.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/io/console.h>

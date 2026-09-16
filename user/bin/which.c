@@ -13,6 +13,8 @@
  *   0  All specified commands were found and executable
  *   1  One or more commands not found or not executable
  *   2  Invalid option specified
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

@@ -1,4 +1,4 @@
-# Makefile.likeos — build OpenSSL 3.5.6 for LikeOS-64
+# Makefile.likeos — build OpenSSL 3.5.6 for LikeOS
 #
 # Outputs:
 #   libcrypto.so.3  / libcrypto.so  (crypto primitives)
@@ -12,6 +12,8 @@
 #   3. Link the `openssl` binary as a PIE via a tiny wrapper script that
 #      replaces gcc with our `ld` + user_dyn.lds + crt1.o.
 #      OpenSSL exposes ${LDCMD:-$(CC)} for exactly this purpose.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 OPENSSL_SRC := .
 LIBC_DIR    := ../../user/lib/libc

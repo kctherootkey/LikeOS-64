@@ -4,6 +4,8 @@
  * Usage: uptime [options]
  *
  * Full implementation per the uptime(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

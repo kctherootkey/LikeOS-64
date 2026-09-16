@@ -8,6 +8,8 @@
 #
 # Usage (from a package directory):
 #   ../toolchain/likeos-autogen.sh [extra ./configure arguments...]
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -e
 

@@ -1,5 +1,7 @@
-// LikeOS-64 Kernel Executive - Interrupt Management
+// LikeOS Kernel Executive - Interrupt Management
 // IDT, IRQ, and exception handling for 64-bit kernel
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_INTERRUPT_H_
 #define _KERNEL_INTERRUPT_H_

@@ -1,10 +1,13 @@
-// LikeOS-64 Network Statistics — per-CPU aggregate protocol counters.
+// LikeOS Network Statistics — per-CPU aggregate protocol counters.
 //
 // Every protocol event and packet-discard path bumps a counter here so that
 // conditions that were previously silent (out-of-window drops, PAWS drops,
 // reassembly-queue overflow, backlog overflow, buffer exhaustion) become
 // observable through netstat and the Ctrl+N diagnostic dump.  The fast path
 // is a single lock-free add to the calling CPU's private row.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/stats.h>
 #include <kernel/net/skb.h>
 #include <kernel/ke/percpu.h>

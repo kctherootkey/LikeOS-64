@@ -1,8 +1,10 @@
-// LikeOS-64 Network Rate-Limit Infrastructure
+// LikeOS Network Rate-Limit Infrastructure
 // Token-bucket rate limiter (global and per-source-IP variants).
 //
 // All functions are safe to call from softirq context (spinlock protected).
 // Do NOT call from hard-IRQ context — the per-source table walk is O(N).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_RATELIMIT_H_
 #define _KERNEL_RATELIMIT_H_

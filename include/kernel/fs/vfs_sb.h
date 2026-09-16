@@ -1,4 +1,4 @@
-/* LikeOS-64 — VFS superblock interface.
+/* LikeOS — VFS superblock interface.
  *
  * Filesystem-independent abstraction between the cache layers
  * (dcache / icache / pagecache) and a concrete filesystem driver
@@ -29,7 +29,10 @@
  *                   end of a file's block chain.  FAT32 uses 0x0FFFFFF8;
  *                   EXT4 can use 0.  Caches treat any value >= the marker
  *                   (and 0) as "no more blocks".
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _KERNEL_VFS_SB_H_
 #define _KERNEL_VFS_SB_H_
 

@@ -49,24 +49,28 @@
 # to this session's display.
 # Which configuration to run with.
 #
-# Two of them: /etc/X11/xorg.conf drives /dev/fb0 through the fbdev driver and
-# renders in software, and works on any machine that boots to a framebuffer;
-# /etc/X11/xorg.conf.modesetting drives the display manager through
-# /dev/dri/card0, which needs a GPU the kernel has a driver for.  The node is
-# the test: it exists only where such a driver bound to a device, so probing
-# for it here picks the display-manager configuration exactly where it can
-# work and leaves the fallback in place everywhere else -- no per-machine
-# editing, and one image for both.  Both render in software: the modesetting
-# configuration has glamor switched off on purpose (see the comment there),
-# so the GPU is only ever used for the mode set and the scan-out.
+# Four of them, one per kind of machine:
 #
-# A third, xorg.conf.modesetting-i915, drives the Intel graphics driver with
-# glamor on: rendering on the GPU through the same node.  Which of the three
-# is asked of the driver, not guessed from the node: drminfo --driver names
-# it, and drminfo --has-display says whether it has lit a screen at all --
-# a driver that found its device but offers no connector yet (or a
+#   Intel graphics (i915)          xorg.conf.modesetting-i915     glamor on
+#   VMware, 3D acceleration on     xorg.conf.modesetting-vmwgfx-3d glamor on
+#   VMware, 3D acceleration off    xorg.conf.modesetting          software
+#   any other display driver       xorg.conf.modesetting          software
+#   no display driver at all       xorg.conf (fbdev on /dev/fb0)  software
+#
+# glamor renders X on the GPU (Mesa iris, or svga on the SVGA3D device) and
+# offers DRI3, through which GL clients -- WebKit included -- reach the same
+# device.  The software configurations draw with the CPU; the display manager
+# (or /dev/fb0) is only used for the mode set and the scan-out.
+#
+# All of it is asked of the driver, not guessed: drminfo --driver names it,
+# drminfo --has-3d says whether it renders 3D on the device (for vmwgfx that
+# is the VM's "Accelerate 3D graphics" setting, read by the kernel from the
+# device), and drminfo --has-display says whether it has lit a screen at all
+# -- a driver that found its device but offers no connector yet (or a
 # render-only one) must not be handed the display server, which would fail
-# to find a screen and leave the framebuffer server never tried.
+# to find a screen and leave the framebuffer server never tried.  xinitrc
+# asks --has-3d the same way to decide whether GL clients are pinned to
+# llvmpipe, so the server and the clients always agree.
 #
 # Named relative, not as a path.  Xorg is setuid root (see below), and a
 # server with elevated privileges rejects an absolute -config argument
@@ -75,6 +79,13 @@ if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0; then
 	case "$(drminfo --driver /dev/dri/card0 2>/dev/null)" in
 	i915)
 		set -- -config xorg.conf.modesetting-i915 "$@"
+		;;
+	vmwgfx)
+		if drminfo --has-3d /dev/dri/card0; then
+			set -- -config xorg.conf.modesetting-vmwgfx-3d "$@"
+		else
+			set -- -config xorg.conf.modesetting "$@"
+		fi
 		;;
 	*)
 		set -- -config xorg.conf.modesetting "$@"

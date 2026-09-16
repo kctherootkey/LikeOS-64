@@ -6,7 +6,10 @@
  * includes <sys/errno.h> and does not get it fails with a wall of "E...
  * undeclared" errors that name every error constant it uses and never mention
  * the header.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_ERRNO_H
 #define _SYS_ERRNO_H
 

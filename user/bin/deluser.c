@@ -11,7 +11,10 @@
  *   deluser USER GROUP       remove a user from a group
  *
  * Only the superuser may remove accounts.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>

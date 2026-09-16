@@ -2,6 +2,8 @@
  * rm - remove files or directories
  *
  * Full implementation per rm(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

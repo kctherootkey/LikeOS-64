@@ -6,7 +6,11 @@
  * localtime() makes of it, and that mktime() is its exact inverse.
  *
  * The instants are chosen around the European and American transitions,
- * which is where an off-by-one week or an inverted sign shows up. */
+ * which is where an off-by-one week or an inverted sign shows up.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

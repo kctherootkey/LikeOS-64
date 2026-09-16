@@ -2,7 +2,10 @@
  * df - report file system disk space usage
  *
  * Usage: df [OPTION]... [FILE]...
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

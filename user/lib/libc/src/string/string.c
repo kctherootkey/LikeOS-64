@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>

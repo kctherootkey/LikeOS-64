@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _ERRNO_H
 #define _ERRNO_H
 

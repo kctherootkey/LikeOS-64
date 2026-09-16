@@ -4,7 +4,11 @@
  * on the initial stack: the program headers' address, the page size, the
  * credentials the image started with, the CPU feature word, the address of
  * sixteen random bytes, the name of the executable.  The C runtime records
- * where the vector is at start-up; getauxval() looks entries up in it. */
+ * where the vector is at start-up; getauxval() looks entries up in it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_AUXV_H
 #define _SYS_AUXV_H
 

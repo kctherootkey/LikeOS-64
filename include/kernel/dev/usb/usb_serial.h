@@ -1,4 +1,6 @@
-// LikeOS-64 - USB serial logging backend
+// LikeOS - USB serial logging backend
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef LIKEOS_USB_SERIAL_H
 #define LIKEOS_USB_SERIAL_H

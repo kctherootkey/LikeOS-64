@@ -1,4 +1,4 @@
-LikeOS-64
+LikeOS
 =========
 
 A modern 64-bit operating system built from scratch, featuring a Unix-like
@@ -21,7 +21,7 @@ Current state
 Overview
 --------
 
-LikeOS-64 is a Unix-like operating system demonstrating modern OS development:
+LikeOS is a Unix-like operating system demonstrating modern OS development:
 
 - Complete userland: ring 3 processes with syscall interface.
 - Process management: preemptive multitasking scheduler.
@@ -242,7 +242,7 @@ Included commands (selection):
 
 Ported applications
 ~~~~~~~~~~~~~~~~~~~
-Third-party software ported to LikeOS-64 (under ports/).  Sources are kept
+Third-party software ported to LikeOS (under ports/).  Sources are kept
 byte-identical to upstream; everything that differs is a build file or a patch
 under the port's own directory.
 

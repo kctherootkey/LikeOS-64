@@ -5,6 +5,9 @@
 # that lands on them must not lose its translations when the old one is
 # finally torn down.  The list logic is pure; the driver's own functions
 # are compiled on the host.  Run from the repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-vma-test.$$
 trap 'rm -rf "$TMP"' EXIT

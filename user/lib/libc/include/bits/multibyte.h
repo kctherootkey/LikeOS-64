@@ -10,7 +10,10 @@
  * declaration here means the two headers cannot drift apart.
  *
  * The encoding is UTF-8; the implementation is in src/locale/multibyte.c.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _BITS_MULTIBYTE_H
 #define _BITS_MULTIBYTE_H
 

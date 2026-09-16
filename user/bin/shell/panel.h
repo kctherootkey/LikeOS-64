@@ -1,4 +1,4 @@
-/* LikeOS-64 -- shared drawing for the desktop panel and its widgets.
+/* LikeOS -- shared drawing for the desktop panel and its widgets.
  *
  * The clock and the load monitor exist twice over: as the standalone programs
  * datetime(1) and load(1), and as areas inside taskbar(1).  This header is what
@@ -8,7 +8,10 @@
  * Everything here is Cairo drawing into a caller-supplied context at a
  * caller-supplied rectangle.  Nothing owns a widget, a window or a timer; the
  * programs do that.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _LIKEOS_PANEL_H
 #define _LIKEOS_PANEL_H
 

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _NET_ROUTE_H
 #define _NET_ROUTE_H
 

@@ -1,4 +1,4 @@
-// LikeOS-64 System Font Loader
+// LikeOS System Font Loader
 // Loads PSF1 (PC Screen Font v1) fonts for console display.
 //
 // The console addresses glyphs by Unicode code point, so the interesting part
@@ -7,6 +7,8 @@
 // That table is turned here into a sorted code point -> glyph array which
 // sysfont_glyph_index() binary-searches, plus a direct-indexed fast path for
 // Latin-1 (the range essentially all console output falls in).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/io/sysfont.h>
 #include <kernel/io/console.h>

@@ -16,6 +16,8 @@
  *   -4   IPv4 (default)
  *
  * Route parameters: metric, mss, window, irtt, reject, mod, dyn, reinstate
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

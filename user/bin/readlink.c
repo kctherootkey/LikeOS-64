@@ -6,6 +6,8 @@
  * symlink in every component (differing in existence requirements).  Also
  * supports -n/--no-newline, -z/--zero, -q/-s (quiet, default) and
  * -v/--verbose, plus --help/--version.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

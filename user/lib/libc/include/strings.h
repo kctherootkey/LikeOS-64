@@ -1,6 +1,9 @@
 /*
  * strings.h - BSD string functions for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _STRINGS_H
 #define _STRINGS_H
 

@@ -1,4 +1,4 @@
-# Makefile.likeos — build OpenSSH 10.4p1 for LikeOS-64.
+# Makefile.likeos — build OpenSSH 10.4p1 for LikeOS.
 #
 # The port is configured by likeos-configure.sh (which drives the stock
 # autoconf configure through the likeos-cc cross wrapper) and then built with
@@ -7,6 +7,8 @@
 #
 # Outputs (in this directory): ssh sshd sshd-session sshd-auth scp sftp
 #   ssh-keygen sftp-server ssh-agent ssh-add ssh-keyscan ...
+#
+# Copyright (C) 2026 The LikeOS Project
 
 STAMP := .likeos-configured
 

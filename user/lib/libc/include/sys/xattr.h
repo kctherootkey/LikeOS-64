@@ -1,4 +1,9 @@
-/* sys/xattr.h - extended attribute calls (LikeOS-64 libc) */
+/*
+ * sys/xattr.h - extended attribute calls (LikeOS libc)
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_XATTR_H
 #define _SYS_XATTR_H
 

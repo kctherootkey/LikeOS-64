@@ -2,6 +2,8 @@
  * cp - copy files and directories
  *
  * Full implementation per cp(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

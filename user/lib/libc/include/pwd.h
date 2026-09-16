@@ -1,6 +1,9 @@
 /*
  * pwd.h - user database (/etc/passwd) for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _PWD_H
 #define _PWD_H
 

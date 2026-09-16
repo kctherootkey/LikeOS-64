@@ -1,4 +1,4 @@
-// LikeOS-64 -- the settings this generation needs before it renders.
+// LikeOS -- the settings this generation needs before it renders.
 //
 // Silicon ships with behaviour its own documentation calls wrong: a
 // cache that must not prefetch, a sampler that must not be powered
@@ -17,6 +17,9 @@
 // A "chicken" register carries a write mask in its upper half: a bit is
 // only changed where the matching mask bit is set, so two drivers can
 // own different bits of one register.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>

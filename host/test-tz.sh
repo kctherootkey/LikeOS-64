@@ -4,6 +4,9 @@
 # The file is compiled natively with every public name it defines renamed out
 # of the way, so it can be linked beside the host's own libc and called
 # directly.  The zone logic itself is pure: a TZ string in, an offset out.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-tz-test.$$
 trap 'rm -rf "$TMP"' EXIT

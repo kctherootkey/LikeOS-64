@@ -1,4 +1,7 @@
-// LikeOS-64 TTY/PTY subsystem
+// LikeOS TTY/PTY subsystem
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_TTY_H_
 #define _KERNEL_TTY_H_
 
@@ -137,6 +140,8 @@ int tty_pty_slave_open(int id);
 void tty_pty_slave_set_vf(int id, void *vf); // diagnostic (pty dump)
 void tty_dump_ptys(tty_t *out); // Ctrl+N diagnostic dump
 int tty_pty_is_allocated(int id);
+/* Owning uid of pty slave `id' (the user that opened its master), or 0. */
+uint32_t tty_pty_owner_uid(int id);
 long tty_pty_master_read(int id, void *buf, long count, int nonblock);
 long tty_pty_master_write(int id, const void *buf, long count,
 			  int nonblock);

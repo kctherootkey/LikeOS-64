@@ -1,4 +1,4 @@
-// LikeOS-64 Network Statistics — aggregate protocol counters (MIB-style)
+// LikeOS Network Statistics — aggregate protocol counters (MIB-style)
 //
 // Per-CPU lock-free counters for every protocol event and, crucially, every
 // packet-discard path that was previously silent.  Increments use the
@@ -6,6 +6,9 @@
 // torn read; readers fold all rows with net_stats_fold().  The internal
 // enum below is kernel-private; net_get_stats() (socket.c) projects the
 // folded totals onto the stable user-facing net_stats_info_t (net.h).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_NET_STATS_H_
 #define _KERNEL_NET_STATS_H_
 

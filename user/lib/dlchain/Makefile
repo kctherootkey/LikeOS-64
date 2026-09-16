@@ -7,6 +7,8 @@
 #
 # NOTE: -Bsymbolic is deliberately NOT used here.  It would bind libdlchain's
 # references to libdlbase at link time and defeat the entire point.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 CC = gcc
 LD = ld

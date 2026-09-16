@@ -1,10 +1,13 @@
-// LikeOS-64 -- vmwgfx: guest-backed surfaces.
+// LikeOS -- vmwgfx: guest-backed surfaces.
 //
 // A surface is the device's texture / render target / buffer object; its
 // contents live in a MOB-backed buffer object the driver allocates
 // ("backup") and binds to it.  Userspace names it by a handle, maps its
 // backup, and shares it across processes as a dma-buf (the surface's
 // creation parameters travel with it: GB_SURFACE_REF returns them).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/ke/sched.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 Futex (Fast Userspace Mutex) Subsystem
+// LikeOS Futex (Fast Userspace Mutex) Subsystem
 // ============================================================================
 // Hash-bucket implementation for scalable futex operations.
 //
@@ -11,6 +11,8 @@
 //   - Physical address key for shared futexes, virtual+PML4 for private
 //   - Robust futex support for pthread_mutex_t with PTHREAD_MUTEX_ROBUST
 // ============================================================================
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/futex.h>
 #include <kernel/ke/sched.h>

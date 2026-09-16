@@ -3,6 +3,8 @@
  *
  * Usage: uname [OPTION]...
  * Print certain system information. With no OPTION, same as -s.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

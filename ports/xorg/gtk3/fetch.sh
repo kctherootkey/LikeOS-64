@@ -7,6 +7,8 @@
 # only the package list differs.
 #
 # Usage:  ./fetch.sh [package ...]      (no arguments = everything)
+#
+# Copyright (C) 2026 The LikeOS Project
 
 here=$(cd "$(dirname "$0")" && pwd)
 exec env LIKEOS_PORT_DIR="$here" "$here/../fetch.sh" "$@"

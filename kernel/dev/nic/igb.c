@@ -1,4 +1,4 @@
-// LikeOS-64 Intel 82576 Gigabit Ethernet Controller (igb) NIC Driver
+// LikeOS Intel 82576 Gigabit Ethernet Controller (igb) NIC Driver
 //
 // Drives the 82575 / 82576 / I350 / I210 / I211 family.  QEMU exposes
 // `-device igb` as a 82576 (vendor 0x8086, device 0x10C9).  The 8257x
@@ -7,6 +7,8 @@
 // instead of 0x2800/0x3800 and need their RXDCTL/TXDCTL.ENABLE bit
 // asserted.  We use legacy INTx for IRQ delivery (no MSI vector slot
 // is reserved for igb).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/igb.h>
 #include <kernel/net/net.h>

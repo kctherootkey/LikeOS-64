@@ -5,6 +5,9 @@
 # they see their own declarations, and with every public name redefined to a
 # likeos_* one so the result can be linked alongside the host C library and
 # compared against it function by function.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 SRC=user/lib/libc/src/locale

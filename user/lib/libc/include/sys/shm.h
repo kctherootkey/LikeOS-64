@@ -6,7 +6,10 @@
  * identifier shmget() returns means the same thing in every process, which is
  * what lets one process create a segment and hand the id to another (exactly
  * how the MIT-SHM X extension works).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_SHM_H
 #define _SYS_SHM_H
 

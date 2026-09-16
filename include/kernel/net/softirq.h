@@ -1,4 +1,4 @@
-// LikeOS-64 — Deferred-work (softirq) framework
+// LikeOS — Deferred-work (softirq) framework
 //
 // Hard interrupt handlers run with interrupts disabled and *must* return
 // quickly so that:
@@ -15,6 +15,8 @@
 //
 // Softirq handlers run with interrupts ENABLED, so they cannot delay TLB
 // shootdown IPIs no matter how long they take.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef LIKEOS_SOFTIRQ_H
 #define LIKEOS_SOFTIRQ_H

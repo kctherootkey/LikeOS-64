@@ -1,6 +1,9 @@
 /*
  * sys/param.h - system parameters for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_PARAM_H
 #define _SYS_PARAM_H
 

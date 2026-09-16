@@ -1,3 +1,5 @@
+# Copyright (C) 2026 The LikeOS Project
+
 CC = gcc
 LD = ld
 

@@ -1,4 +1,7 @@
-// LikeOS-64 -- the file-descriptor table and fd-surgery syscalls.
+// LikeOS -- the file-descriptor table and fd-surgery syscalls.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/uapi/anonfd.h>
 #include <kernel/fs/devfs.h>
 #include <kernel/ke/sched.h>

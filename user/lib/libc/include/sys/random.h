@@ -1,4 +1,9 @@
-/* <sys/random.h> -- getrandom(2). */
+/*
+ * <sys/random.h> -- getrandom(2).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_RANDOM_H
 #define _SYS_RANDOM_H
 

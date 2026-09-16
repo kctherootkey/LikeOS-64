@@ -7,7 +7,10 @@
  * This is a minimal getty: it establishes a fresh session on the terminal,
  * displays the issue banner and login prompt, reads the user name and hands
  * off to /bin/login, which performs authentication.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

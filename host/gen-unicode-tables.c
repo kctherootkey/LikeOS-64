@@ -27,7 +27,10 @@
  * drawing on it cannot disagree about where the cursor ended up.
  *
  * The output is committed; this is how it is reproduced, not part of the build.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

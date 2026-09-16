@@ -6,7 +6,10 @@
  * ftruncate/fstat/mmap/close/dup all work on it without anything special.
  * That also means `ls /dev/shm` shows what exists, which is how the same
  * namespace behaves elsewhere.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>

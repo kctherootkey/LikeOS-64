@@ -17,7 +17,10 @@
  * surrogate half or a value past U+10FFFF sets EILSEQ and returns (size_t)-1.
  * Accepting them would let one encoding of a character slip past a check
  * written against another, which is the shape of a long line of security bugs.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <wchar.h>
 #include <stdlib.h>
 #include <stdio.h> /* EOF, which btowc/wctob are specified in terms of */

@@ -1,4 +1,7 @@
-// LikeOS-64 UDP (User Datagram Protocol)
+// LikeOS UDP (User Datagram Protocol)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

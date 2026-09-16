@@ -8,7 +8,10 @@
  *
  * Note: --follow=name and inotify are not available on this OS;
  * -f polls with sleep, --follow=name falls back to descriptor mode.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

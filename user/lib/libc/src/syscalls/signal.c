@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <signal.h>
 #include <errno.h>
 #include <unistd.h>

@@ -2,7 +2,10 @@
  * du - estimate file space usage
  *
  * Usage: du [OPTION]... [FILE]...
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

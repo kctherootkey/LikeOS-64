@@ -7,6 +7,8 @@
  *
  * Supports section numbers, -k (apropos), -f (whatis),
  * and all standard command-line options.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

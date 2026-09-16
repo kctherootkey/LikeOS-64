@@ -6,6 +6,9 @@
 # missing.  The arithmetic is pure, so the build host exercises it
 # against a ring that fills, wraps and drains.  Run from the repository
 # root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-ring-test.$$
 trap 'rm -rf "$TMP"' EXIT

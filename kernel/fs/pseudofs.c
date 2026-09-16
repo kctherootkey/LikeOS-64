@@ -1,4 +1,7 @@
-// LikeOS-64 -- in-memory pseudo filesystems: the tree and its VFS glue.
+// LikeOS -- in-memory pseudo filesystems: the tree and its VFS glue.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/pseudofs.h>
 #include <kernel/uapi/status.h>
 #include <kernel/uapi/stat.h>

@@ -1,5 +1,7 @@
-// LikeOS-64 - SMP (Symmetric Multi-Processing) Implementation
+// LikeOS - SMP (Symmetric Multi-Processing) Implementation
 // AP startup, CPU synchronization, and SMP management
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/fpu.h>
 #include <kernel/ke/smp.h>

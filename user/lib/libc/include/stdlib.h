@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _STDLIB_H
 #define _STDLIB_H
 

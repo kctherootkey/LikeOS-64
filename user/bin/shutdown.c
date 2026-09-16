@@ -11,6 +11,8 @@
  *   "hh:mm" — absolute wall-clock time (24 h format, today or tomorrow)
  *
  * If no TIME is given, "+1" is implied.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

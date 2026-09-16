@@ -14,7 +14,10 @@
  *
  * A timeout is set, because the symptom is a hang: without one this program
  * would reproduce the bug by never finishing, which tells nobody anything.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <gio/gio.h>
 #include <stdio.h>
 

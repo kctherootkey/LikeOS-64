@@ -1,9 +1,11 @@
-// LikeOS-64 NE2000-compatible PCI NIC Driver (Realtek RTL8029AS)
+// LikeOS NE2000-compatible PCI NIC Driver (Realtek RTL8029AS)
 //
 // The RTL8029(AS) is the PCI bus member of the NE2000 family of 10 Mbit
 // Ethernet controllers.  It uses an internal 16 KiB SRAM accessed via a
 // "remote DMA" register file, and a single 32-port I/O window (BAR0).
 // Emulated by QEMU as `-device ne2k_pci`.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/ne2k.h>
 #include <kernel/net/net.h>

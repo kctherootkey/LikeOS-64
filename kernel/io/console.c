@@ -1,5 +1,7 @@
-// LikeOS-64 Hardware Abstraction Layer - Console
+// LikeOS Hardware Abstraction Layer - Console
 // Framebuffer-based console and printf implementation for 64-bit kernel
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #define BOOT_DEBUG 0
 

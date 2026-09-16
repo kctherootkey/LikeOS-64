@@ -1,4 +1,4 @@
-// LikeOS-64 -- EXECBUFFER2: a client's batch, submitted.
+// LikeOS -- EXECBUFFER2: a client's batch, submitted.
 //
 // The client names the objects its batch touches and where each must be
 // in the context's address space (softpin; a client without it gets
@@ -6,6 +6,9 @@
 // the fences it waits on are waited for, the request is emitted and
 // queued, and the fences it promises (an out fence, syncobjs) are
 // attached to the request's own.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/uapi/drm/i915_drm.h>

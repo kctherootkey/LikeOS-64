@@ -27,7 +27,10 @@
  *   - `s///g` must make progress on an empty match, or a pattern that can
  *     match nothing (like `x*`) loops forever.  After an empty match the scan
  *     advances one character, copying it through.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

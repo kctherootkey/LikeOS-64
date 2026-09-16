@@ -1,4 +1,7 @@
-// LikeOS-64 -- user-memory access primitives.
+// LikeOS -- user-memory access primitives.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 System Font Loader
+// LikeOS System Font Loader
 // Loads PSF1 (PC Screen Font v1) fonts for console display.
 //
 // The console addresses glyphs by Unicode code point, not by byte, so what
@@ -6,6 +6,8 @@
 // follows them: a list, one entry per glyph, of the code points that glyph
 // renders.  PSF1 carries that table as UCS-2, which covers the Basic
 // Multilingual Plane -- everything a fixed-width console font holds glyphs for.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_SYSFONT_H_
 #define _KERNEL_SYSFONT_H_

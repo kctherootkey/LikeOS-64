@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _STDARG_H
 #define _STDARG_H
 

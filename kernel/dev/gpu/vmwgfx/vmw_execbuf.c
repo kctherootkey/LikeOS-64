@@ -1,4 +1,4 @@
-// LikeOS-64 -- vmwgfx: command stream submission.
+// LikeOS -- vmwgfx: command stream submission.
 //
 // Userspace builds SVGA3D command streams naming its OWN handles: a surface
 // handle where the device wants a surface id, a buffer handle where it
@@ -8,6 +8,9 @@
 // are rewritten to the device's, and each object touched is pinned until
 // the fence the submission ends with has passed.  A command not in the
 // table is refused: the stream is untrusted input.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/ke/sched.h>

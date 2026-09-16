@@ -3,7 +3,10 @@
  *
  * Full implementation per GNU coreutils stat(1) manpage.
  * Supports all format sequences for both file and filesystem mode.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <kernel/ke/storage.h>
 #include <kernel/io/console.h>
 #include <kernel/fs/vfs.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 CPU P-state / HWP configuration
+// LikeOS CPU P-state / HWP configuration
 //
 // Requests maximum-performance frequency behavior so the core does not linger
 // in a low idle P-state.  On real hardware (measured on a Lenovo: core at 51%
@@ -21,6 +21,8 @@
 // neither HWP nor, usually, EIST) and AMD take neither path and we never touch
 // an MSR that would fault.  There is no #GP fixup handler in this kernel, so
 // every rdmsr/wrmsr here must be one the CPUID feature bits guarantee exists.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/hal/cpu_pstate.h>
 #include <kernel/io/console.h>

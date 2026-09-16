@@ -16,6 +16,8 @@
  *   - truncated and random descriptors: must not crash
  *
  * Build and run:  ./host/test-usbhid.sh
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdint.h>

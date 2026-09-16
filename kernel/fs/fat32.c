@@ -1,4 +1,7 @@
-// LikeOS-64 - FAT32 implementation with Long File Name (LFN) support
+// LikeOS - FAT32 implementation with Long File Name (LFN) support
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/fat32.h>
 #include <kernel/io/console.h>
 #include <kernel/fs/vfs.h>

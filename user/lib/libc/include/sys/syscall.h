@@ -2,7 +2,11 @@
  *
  * The numbers the kernel dispatches on (include/kernel/ke/syscall.h).  The
  * libc's own wrappers use them through src/syscalls/syscall.h; a program
- * that needs a call the libc does not wrap yet uses syscall(SYS_xxx, ...). */
+ * that needs a call the libc does not wrap yet uses syscall(SYS_xxx, ...).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_SYSCALL_H
 #define _SYS_SYSCALL_H
 

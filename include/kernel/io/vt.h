@@ -1,4 +1,4 @@
-// LikeOS-64 VT (Virtual Terminal) layer
+// LikeOS VT (Virtual Terminal) layer
 // ANSI/VT100/VT220/xterm escape sequence parser and terminal emulator state.
 // Sits between tty.c (line discipline, PTY) and console.c (framebuffer renderer).
 //
@@ -13,6 +13,8 @@
 //   console.c — framebuffer renderer bridge, cursor blink timer, scrollback
 //        ↓
 //   fb.c — pixel-level drawing
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_VT_H_
 #define _KERNEL_VT_H_

@@ -17,6 +17,8 @@
  * poison check.
  *
  * Build and run:  ./host/test-string.sh
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #define _GNU_SOURCE

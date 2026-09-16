@@ -14,6 +14,9 @@
 # each writing every byte it allocated; it starved the desktop of CPU and
 # pushed the machine into swap.  The knobs are LK_* environment variables --
 # raise them deliberately for a long hunt, never by default.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 OUT=${TMPDIR:-/tmp}/likeos-malloc-test.$$

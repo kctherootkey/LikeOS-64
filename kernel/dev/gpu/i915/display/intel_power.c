@@ -1,4 +1,4 @@
-// LikeOS-64 -- display power wells.
+// LikeOS -- display power wells.
 //
 // The display engine is split into wells that can be powered down when
 // unused.  Which wells exist and which register requests them differs
@@ -10,6 +10,9 @@
 // names what a caller is about to touch; get/put keep the wells it
 // needs up, refcounted.  A request goes through the driver's control
 // register; the state bit answers when the well is up.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/hal/lapic.h>

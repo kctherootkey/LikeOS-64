@@ -1,4 +1,4 @@
-// LikeOS-64 Inode Cache
+// LikeOS Inode Cache
 //
 // Caches per-file metadata indexed by the FS-native inode identifier (FAT32
 // start cluster, EXT4 inode number).  Reference counted: open handles hold
@@ -10,6 +10,8 @@
 //
 // All FS-specific I/O dispatches through vfs_superblock_t->ops, so this file
 // references no FAT32 (or EXT4) symbols directly.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/icache.h>
 #include <kernel/fs/vfs_sb.h>

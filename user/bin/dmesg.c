@@ -5,6 +5,8 @@
  *
  * Full implementation per the dmesg(1) manpage.
  * Default behaviour: show kernel-only messages.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

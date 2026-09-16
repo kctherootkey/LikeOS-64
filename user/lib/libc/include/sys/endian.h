@@ -14,7 +14,10 @@
  * libpciaccess is one example, where the non-BSD arm of its #ifdef chain still
  * calls letoh16().  Without them the header would resolve but the call would
  * not.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_ENDIAN_H
 #define _SYS_ENDIAN_H
 

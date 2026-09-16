@@ -1,5 +1,7 @@
-// LikeOS-64 I/O Subsystem - Mouse Driver
+// LikeOS I/O Subsystem - Mouse Driver
 // PS/2 mouse input handling and cursor management
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/input/mouse.h>

@@ -1,5 +1,7 @@
-// LikeOS-64 - SMP (Symmetric Multi-Processing) Support
+// LikeOS - SMP (Symmetric Multi-Processing) Support
 // AP startup, CPU synchronization, and SMP management
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_SMP_H_
 #define _KERNEL_SMP_H_

@@ -2,7 +2,10 @@
  * creds.c - process credential helpers not backed by a dedicated syscall:
  *   setreuid()/setregid() emulated on top of getres*id()/setres*id(),
  *   and getlogin()/getlogin_r()/setlogin() over a stored login name.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>

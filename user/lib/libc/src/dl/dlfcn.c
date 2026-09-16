@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 dlfcn.c - Dynamic linking API wrappers
+ * LikeOS dlfcn.c - Dynamic linking API wrappers
  *
  * These thin wrappers call into ld-likeos.so's exported symbols.
  * When a dynamically linked program is loaded, the runtime linker
@@ -8,6 +8,8 @@
  *
  * The _rtld_* functions are provided by ld-likeos.so with default
  * visibility, so they appear in the global symbol scope.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <dlfcn.h>

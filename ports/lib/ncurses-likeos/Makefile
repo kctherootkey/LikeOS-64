@@ -2,6 +2,8 @@
 #
 # Builds a shared library providing the ncurses API using ANSI escape sequences.
 # Based on ncurses 6.5 API (source in ../ncurses-6.5/).
+#
+# Copyright (C) 2026 The LikeOS Project
 
 BASEDIR = ../../..
 LIBC_DIR = $(BASEDIR)/user/lib/libc

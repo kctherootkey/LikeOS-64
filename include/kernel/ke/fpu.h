@@ -1,4 +1,4 @@
-// LikeOS-64 -- extended processor state (x87 / SSE / AVX / AVX-512).
+// LikeOS -- extended processor state (x87 / SSE / AVX / AVX-512).
 //
 // One task's register file is saved and restored as a single opaque block.
 // On a CPU with XSAVE the block is the XSAVE standard-format image, sized
@@ -10,6 +10,9 @@
 // Enabling AVX in XCR0 is what makes AVX usable in user mode at all: without
 // OSXSAVE a VEX-encoded instruction raises #UD, and a JIT that has read
 // CPUID's AVX bit will emit exactly those.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_KE_FPU_H
 #define KERNEL_KE_FPU_H
 

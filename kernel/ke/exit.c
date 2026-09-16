@@ -1,4 +1,7 @@
-// LikeOS-64 -- exit, exit_group and waitpid.
+// LikeOS -- exit, exit_group and waitpid.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

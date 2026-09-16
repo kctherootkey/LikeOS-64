@@ -21,7 +21,10 @@
  * over the result, so every symbol it defines AND every symbol it calls gains
  * an lk_ prefix in one step.  math.c calls nothing outside itself, so the
  * renaming is self-consistent and the object still links.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

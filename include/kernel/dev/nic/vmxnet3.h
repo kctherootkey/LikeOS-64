@@ -1,9 +1,11 @@
-// LikeOS-64 VMware vmxnet3 paravirtualized NIC Driver
+// LikeOS VMware vmxnet3 paravirtualized NIC Driver
 //
 // Supports the VMware vmxnet3 paravirtual NIC (vendor 0x15AD, device
 // 0x07B0) as exposed by VMware ESXi/Workstation/Fusion and emulated by
 // QEMU as `-device vmxnet3`.  The driver implements UPT/Vmxnet3
 // revision 1 — sufficient for basic packet I/O on every supported host.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_VMXNET3_H_
 #define _KERNEL_VMXNET3_H_

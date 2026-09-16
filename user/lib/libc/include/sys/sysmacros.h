@@ -15,7 +15,10 @@
  *
  * The practical consequence is that minor numbers run 0..255.  That is the
  * kernel's limit, not this header's.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_SYSMACROS_H
 #define _SYS_SYSMACROS_H
 

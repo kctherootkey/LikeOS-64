@@ -1,5 +1,7 @@
-// LikeOS-64 - ACPI Support for SMP
+// LikeOS - ACPI Support for SMP
 // RSDP, RSDT/XSDT, and MADT parsing for CPU enumeration
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_ACPI_H_
 #define _KERNEL_ACPI_H_

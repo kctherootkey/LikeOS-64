@@ -2,7 +2,11 @@
  *
  * read() returns the number of expirations since the last read (as a
  * uint64_t) and blocks until there is one; poll() reports readable when
- * there is.  Deadlines are met with the kernel's high-resolution timer. */
+ * there is.  Deadlines are met with the kernel's high-resolution timer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_TIMERFD_H
 #define _SYS_TIMERFD_H
 

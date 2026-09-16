@@ -11,6 +11,8 @@
  * that invokes _init itself pushed a return address (8 bytes), so after the
  * push RSP is 16-byte aligned — matching the ABI requirement for any call
  * inside the .init body.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
         .section .init,"ax",@progbits

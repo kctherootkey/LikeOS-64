@@ -1,9 +1,12 @@
-// LikeOS-64 -- VMware SVGA II hardware access exported to the
+// LikeOS -- VMware SVGA II hardware access exported to the
 // display-manager driver (kernel/dev/gpu/vmwgfx).
 //
 // The boot console driver (vmsvga2.c) keeps the register file, the FIFO
 // engine and the fence interrupt; the display-manager driver builds its
 // command streams, KMS and buffer objects on top of these.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_VIDEO_VMSVGA2_HW_H
 #define KERNEL_DEV_VIDEO_VMSVGA2_HW_H
 

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <time.h>
 #include <string.h>
 #include <stdio.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 — address-space read/write semaphore
+// LikeOS — address-space read/write semaphore
 //
 // See <kernel/mm/rwsem.h> for what this lock covers and who takes it.
 //
@@ -17,6 +17,8 @@
 // EXCLUSIVE hold is granted as a depth increment for the same reason -- mmap()
 // holds the lock for writing and then copies its arguments from user memory,
 // which can fault straight back into a reader.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/mm/rwsem.h>
 #include <kernel/uapi/bug.h>

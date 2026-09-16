@@ -21,6 +21,8 @@
  * code, its stacks and its heap, so the kernel hands it out only to the user
  * that owns the process (and to root, who may look at any of them).  A pid
  * belonging to someone else answers "Operation not permitted".
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

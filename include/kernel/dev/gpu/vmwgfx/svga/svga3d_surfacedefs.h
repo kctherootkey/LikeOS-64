@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+
 /**************************************************************************
  *
  * Copyright (c) 2009-2024 Broadcom. All Rights Reserved. The term
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
  *
+ *
+ * Copyright (C) 2026 The LikeOS Project
  **************************************************************************/
 
 #ifndef _SVGA3D_SURFACEDEFS_H_

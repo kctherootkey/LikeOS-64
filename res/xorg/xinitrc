@@ -178,41 +178,50 @@ export XCURSOR_THEME XCURSOR_SIZE
 # from a shell before starting luakit and set the policy in a per-user
 # ~/.config/luakit/userconf.lua -- not here.
 
-# Mesa: the software rasteriser, always.
+# Mesa: the GPU where the machine has one that renders 3D, the software
+# rasteriser everywhere else.
 #
-# With this set, libGL and libEGL never load a hardware driver: GLX and EGL
-# on X11 render with llvmpipe and put pixels up with PutImage/XShm, and
-# EGL's surfaceless platform (WebKit's web process) is llvmpipe as well.
-# On a machine without a GPU that is what happens anyway; on one with the
-# VMware SVGA3D device it is what stops Mesa's svga driver from being used
-# -- deliberate (2026-09-11), so that every machine runs the same rendering
-# paths.  The X server matches: res/xorg/xorg.conf.modesetting has glamor
-# off, so it offers no DRI3 that a client could reach the GPU through.  The
-# two go back together: drop this and put glamor back there.
+#   Intel graphics (i915)          GPU: Mesa iris
+#   VMware, 3D acceleration on     GPU: Mesa svga on the SVGA3D device
+#   VMware, 3D acceleration off    llvmpipe
+#   anything else                  llvmpipe
 #
-# Except on Intel graphics.  There the kernel's i915 driver, Mesa's iris
-# driver and the glamor configuration (xorg.conf.modesetting-i915, chosen
-# by xserverrc) exist for the accelerated path, so neither of the two
-# software pins below is set: GL goes to the GPU and WebKit's frames travel
-# as DMA-BUFs.  The driver's name is asked of the node the way xserverrc
-# asks it, so the two scripts always agree.
+# The GPU cases are exactly the ones where xserverrc starts X with glamor
+# (xorg.conf.modesetting-i915 / -vmwgfx-3d), which offers DRI3 so clients
+# reach the same device, and WebKit's frames travel as DMA-BUFs.  Both
+# scripts ask the same questions of the node -- drminfo --has-display and
+# --has-3d -- so the server and the clients always agree.
+#
+# Everywhere else LIBGL_ALWAYS_SOFTWARE is set: libGL and libEGL never load
+# a hardware driver, GLX and EGL on X11 render with llvmpipe and put pixels
+# up with PutImage/XShm, and EGL's surfaceless platform (WebKit's web
+# process) is llvmpipe as well.  On VMware with 3D off the device has
+# nothing to render with, so that is what would happen anyway -- the pin
+# only makes it certain and quick.
 LIKEOS_GPU_DRIVER=$(drminfo --driver /dev/dri/card0 2>/dev/null)
 export LIKEOS_GPU_DRIVER
-if [ "$LIKEOS_GPU_DRIVER" != "i915" ]; then
+LIKEOS_GPU_3D=0
+if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0 &&
+	drminfo --has-3d /dev/dri/card0; then
+	LIKEOS_GPU_3D=1
+fi
+export LIKEOS_GPU_3D
+if [ "$LIKEOS_GPU_3D" != "1" ]; then
 	LIBGL_ALWAYS_SOFTWARE=1
 	export LIBGL_ALWAYS_SOFTWARE
 fi
 
-# WebKit's frames from the web process to the UI process: shared memory,
-# always.  WebKit adds its "hardware" transport (DMA-BUF through GBM) on
-# top of shared memory whenever it finds a display-manager render node,
-# and with the rasteriser pinned to llvmpipe above that would mean
-# software-rendered buffers exported as DMA-BUFs from the render node --
-# a combination nothing here has run.  Shared memory is the transport a
-# machine without a GPU uses, so it is the one every machine uses.  This
-# is not WEBKIT_DISABLE_DMABUF_RENDERER, which would switch acceleration
-# off altogether (see above).
-if [ "$LIKEOS_GPU_DRIVER" != "i915" ]; then
+# WebKit's frames from the web process to the UI process: shared memory
+# wherever GL is pinned to llvmpipe above.  WebKit adds its "hardware"
+# transport (DMA-BUF through GBM) on top of shared memory whenever it finds
+# a display-manager render node, and with the rasteriser pinned to llvmpipe
+# that would mean software-rendered buffers exported as DMA-BUFs from the
+# render node -- a combination nothing here has run.  Shared memory is the
+# transport a machine without a GPU uses.  On the GPU machines (i915,
+# VMware with 3D) the frames travel as DMA-BUFs.  This is not
+# WEBKIT_DISABLE_DMABUF_RENDERER, which would switch acceleration off
+# altogether (see above).
+if [ "$LIKEOS_GPU_3D" != "1" ]; then
 	WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
 	export WEBKIT_DMABUF_RENDERER_FORCE_SHM
 fi

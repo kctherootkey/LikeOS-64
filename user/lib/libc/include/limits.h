@@ -1,6 +1,9 @@
 /*
  * limits.h - implementation limits for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _LIMITS_H
 #define _LIMITS_H
 

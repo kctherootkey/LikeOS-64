@@ -1,4 +1,7 @@
-// LikeOS-64 System Call Handler
+// LikeOS System Call Handler
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/percpu.h>

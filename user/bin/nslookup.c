@@ -18,6 +18,8 @@
  * Settings (via 'set' or -option):
  *   type/querytype, class, domain, port, timeout, retry,
  *   [no]debug, [no]d2, [no]search, [no]recurse, [no]vc, [no]fail
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

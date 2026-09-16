@@ -1,16 +1,19 @@
 /*
- * config.h - hand-written tmux 3.6a feature flags for LikeOS-64.
+ * config.h - hand-written tmux 3.6a feature flags for LikeOS.
  *
  * These macros are normally produced by autoconf's `configure` script.
  * Since we cross-compile statically against a fixed environment (the
- * LikeOS-64 libc + libevent.so), the appropriate values are known at
+ * LikeOS libc + libevent.so), the appropriate values are known at
  * port time and recorded here.
  *
  * Conventions:
  *   HAVE_xxx        - libc/syscall feature is present.
  *   When undefined, tmux falls back to the corresponding compat/xxx.c
  *   implementation supplied with the upstream tarball.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef TMUX_CONFIG_H_LIKEOS
 #define TMUX_CONFIG_H_LIKEOS
 

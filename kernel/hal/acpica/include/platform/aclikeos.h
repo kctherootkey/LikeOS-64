@@ -1,5 +1,7 @@
 /*
- * aclikeos.h - ACPICA platform header for LikeOS-64
+ * aclikeos.h - ACPICA platform header for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef __ACLIKEOS_H__

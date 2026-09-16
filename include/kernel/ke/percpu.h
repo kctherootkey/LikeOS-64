@@ -1,5 +1,7 @@
-// LikeOS-64 - Per-CPU Data Infrastructure for SMP
+// LikeOS - Per-CPU Data Infrastructure for SMP
 // Provides per-CPU variables accessed via GS segment
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_PERCPU_H_
 #define _KERNEL_PERCPU_H_

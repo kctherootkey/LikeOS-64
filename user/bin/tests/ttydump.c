@@ -29,6 +29,8 @@
  * It also asks for a cursor-position report at startup: a terminal answers
  * that unprompted, so the first line of output tells you the return path
  * carries escape bytes at all before you test anything else with it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

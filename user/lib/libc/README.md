@@ -1,8 +1,8 @@
-# LikeOS-64 Userland C Library (libc)
+# LikeOS Userland C Library (libc)
 
 ## Overview
 
-A comprehensive userland C library implementation for LikeOS-64, providing standard C library functionality for user programs through a clean syscall interface.
+A comprehensive userland C library implementation for LikeOS, providing standard C library functionality for user programs through a clean syscall interface.
 
 ## Architecture
 
@@ -287,11 +287,11 @@ The libc uses these syscall numbers (defined in kernel):
 
 ## Conclusion
 
-The LikeOS-64 userland C library provides a solid foundation for user programs with:
+The LikeOS userland C library provides a solid foundation for user programs with:
 - Clean separation from kernel
 - Standard C library interface
 - Efficient syscall mechanism
 - Comprehensive string and I/O support
 - Extensible architecture for future enhancements
 
-This implementation enables writing portable C programs for LikeOS-64 using familiar standard library functions.
+This implementation enables writing portable C programs for LikeOS using familiar standard library functions.

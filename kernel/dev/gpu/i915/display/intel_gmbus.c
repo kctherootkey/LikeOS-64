@@ -1,4 +1,4 @@
-// LikeOS-64 -- GMBUS, the I2C controller of the display engine.
+// LikeOS -- GMBUS, the I2C controller of the display engine.
 //
 // Every DDC line of the integrated graphics device (the EDID wire of an
 // HDMI, DVI or VGA sink) ends at this one controller, which multiplexes
@@ -9,6 +9,9 @@
 // message so the next one follows with a repeated START; an explicit
 // "stop" cycle ends the transfer.  A write-then-read pair with a one-byte
 // index (the DDC offset) folds into a single "index" cycle.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _ARPA_INET_H
 #define _ARPA_INET_H
 

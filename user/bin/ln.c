@@ -7,6 +7,8 @@
  * -P/--physical, -r/--relative, -s/--symbolic, -S/--suffix,
  * -t/--target-directory, -T/--no-target-directory, -v/--verbose,
  * --help, --version.  Hard links by default; symbolic with -s.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

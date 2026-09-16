@@ -1,4 +1,4 @@
-// LikeOS-64 Intel 8255x ("eepro100") NIC Driver
+// LikeOS Intel 8255x ("eepro100") NIC Driver
 //
 // Supports the entire Intel 82557 / 82558 / 82559 / 82550 / 82551 / 82562 /
 // 82801 family (vendor 0x8086).  In QEMU these correspond to the
@@ -14,6 +14,8 @@
 // All variants present the same Simplified Command Block / Receive Frame
 // Area programming model used by the reference `e100` driver, so a single
 // driver covers every PCI ID above.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_EEPRO100_H_
 #define _KERNEL_EEPRO100_H_

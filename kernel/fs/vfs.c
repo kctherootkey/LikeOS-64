@@ -1,4 +1,7 @@
-// LikeOS-64 - Minimal VFS implementation
+// LikeOS - Minimal VFS implementation
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/vfs.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>

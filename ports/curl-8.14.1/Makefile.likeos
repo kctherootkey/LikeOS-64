@@ -1,4 +1,4 @@
-# Makefile.likeos — build curl 8.14.1 for LikeOS-64.
+# Makefile.likeos — build curl 8.14.1 for LikeOS.
 #
 # Outputs:
 #   libcurl.so.4        (shared library, SONAME = libcurl.so.4)
@@ -17,6 +17,8 @@
 #   libevent/ncurses pattern (ld -shared -nostdlib).
 #   Link the curl binary as a PIE using ld + user_dyn.lds + crt1.o,
 #   matching the tmux/nano port convention.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 CURL_SRC  := .
 LIBC_DIR  := ../../user/lib/libc

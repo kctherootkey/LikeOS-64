@@ -6,6 +6,9 @@
 # conversion functions are pure, so the build host's compiler runs them
 # through a table of the rates the hardware has.  Run from the repository
 # root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-dpll-test.$$
 trap 'rm -rf "$TMP"' EXIT

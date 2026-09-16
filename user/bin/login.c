@@ -8,7 +8,10 @@
  * Usage: login [-f username] [-h host] [username]
  *   -f username   skip authentication for username (root only)
  *   -h host       remote host name (recorded for a future sshd; unused now)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

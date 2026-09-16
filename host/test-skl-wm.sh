@@ -6,6 +6,9 @@
 # plane and the panel shows stripes.  The computation is pure integer
 # arithmetic, so the build host runs it against the numbers of the
 # machine this was written for.  Run from the repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-sklwm-test.$$
 trap 'rm -rf "$TMP"' EXIT

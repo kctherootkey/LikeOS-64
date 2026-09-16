@@ -1,5 +1,7 @@
-; LikeOS-64 Stack Switch Assembly
+; LikeOS Stack Switch Assembly
 ; Switches to a new stack and calls a function on it
+;
+; Copyright (C) 2026 The LikeOS Project
 
 section .text
 global switch_stack_and_call

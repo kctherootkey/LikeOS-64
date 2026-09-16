@@ -28,6 +28,8 @@
  *     the two cannot interleave and the run is deterministic.
  *
  * Build and run:  ./host/test-malloc.sh
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #define _GNU_SOURCE

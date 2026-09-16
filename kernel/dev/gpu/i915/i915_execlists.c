@@ -1,4 +1,4 @@
-// LikeOS-64 -- execution lists: handing contexts to the hardware and
+// LikeOS -- execution lists: handing contexts to the hardware and
 // reading its status buffer.
 //
 // One context in the port at a time: the head of the engine's queue (and
@@ -9,6 +9,9 @@
 // next context goes in.  Completion of the requests themselves is by
 // sequence number (i915_engine.c), which does not depend on the status
 // buffer -- so a missed status entry costs latency, never a lost fence.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/hal/lapic.h>

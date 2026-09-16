@@ -1,4 +1,4 @@
-// LikeOS-64 -- interrupts of Intel graphics.
+// LikeOS -- interrupts of Intel graphics.
 //
 // One MSI vector, a hierarchy of cause registers beneath it.  Gen8-10:
 // a master register whose bits name GT pairs, display pipes, ports and
@@ -11,6 +11,9 @@
 // At this stage nothing is enabled below the master except what the
 // display and engine code turn on later; the handler acknowledges what
 // arrives so a stray source can never storm.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/ke/irq.h>

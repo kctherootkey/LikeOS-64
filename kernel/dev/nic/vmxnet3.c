@@ -1,9 +1,11 @@
-// LikeOS-64 VMware vmxnet3 paravirtualized NIC Driver
+// LikeOS VMware vmxnet3 paravirtualized NIC Driver
 //
 // Implements UPT/Vmxnet3 revision 1, the lowest-common-denominator that
 // every supporting host (ESXi, Workstation, Fusion, QEMU) accepts.  We
 // run with a single TX queue and a single RX queue.  Interrupts are
 // delivered as legacy INTx.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/vmxnet3.h>
 #include <kernel/net/net.h>

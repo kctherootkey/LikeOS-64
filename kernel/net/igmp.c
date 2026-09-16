@@ -1,6 +1,8 @@
-// LikeOS-64 IGMPv2 (RFC 2236) - minimal: send Membership Report on join,
+// LikeOS IGMPv2 (RFC 2236) - minimal: send Membership Report on join,
 // send Leave Group on drop, respond to General Query with reports for joined
 // groups.  Does not maintain timers per group; queries get an immediate reply.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>

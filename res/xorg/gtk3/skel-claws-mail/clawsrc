@@ -1,4 +1,4 @@
-# Claws Mail defaults for a new account on LikeOS-64.
+# Claws Mail defaults for a new account on LikeOS.
 #
 # Copied to ~/.claws-mail the first time the program runs, by the copy_dir() of
 # SYSCONFDIR/skel/.claws-mail in src/main.c.  Only the settings that this system

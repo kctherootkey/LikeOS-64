@@ -1,5 +1,7 @@
-// LikeOS-64 Socket Layer
+// LikeOS Socket Layer
 // Provides kernel-side socket abstraction for syscall layer
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/waitq.h>
 #include <kernel/net/net.h>

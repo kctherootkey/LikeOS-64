@@ -1,5 +1,7 @@
 // inet_pton / inet_ntop / inet_aton — RFC 3493 §6.6, §6.7.
 // Only AF_INET supported.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

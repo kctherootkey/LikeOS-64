@@ -7,6 +7,9 @@
 # worse, as a working build of the wrong thing.  PKG_CONFIG_LIBDIR (not _PATH)
 # REPLACES the default search path rather than adding to it, which is what
 # makes this airtight.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 self=$0

@@ -6,7 +6,10 @@
  * as real symbols a caller can take their address, a shared library resolves
  * one copy instead of one per translation unit, and a program that only
  * declares them (as configure-generated code likes to) still links.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <wchar.h>
 #include <wctype.h>
 #include <stdlib.h>

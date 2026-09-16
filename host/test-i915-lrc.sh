@@ -1,6 +1,9 @@
 #!/bin/sh
 # Host test for the Intel driver's logical ring context layout
 # (kernel/dev/gpu/i915/i915_lrc.c), which is pure.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-i915-lrc-test.$$
 trap 'rm -rf "$TMP"' EXIT

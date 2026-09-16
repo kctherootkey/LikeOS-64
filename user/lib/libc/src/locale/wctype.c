@@ -10,7 +10,10 @@
  * categories -- the Arabic-Indic digits are alpha rather than digit, a
  * titlecase letter is both upper and lower.  Deriving the tables from a working
  * implementation (see host/gen-unicode-tables.c) is what keeps those right.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <wctype.h>
 #include <wchar.h>
 #include <string.h>

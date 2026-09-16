@@ -1,4 +1,4 @@
-// LikeOS-64 -- firmware blobs for devices that need one loaded.
+// LikeOS -- firmware blobs for devices that need one loaded.
 //
 // A display controller's power-management microcode, a graphics device's
 // scheduling firmware: files the driver reads from /lib/firmware/<name>
@@ -6,6 +6,9 @@
 // usable once storage is mounted -- a driver that initialises earlier
 // asks from its late-init hook, and treats absence as a feature it does
 // without rather than a failure.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_KE_FIRMWARE_H
 #define KERNEL_KE_FIRMWARE_H
 

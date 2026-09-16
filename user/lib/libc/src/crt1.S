@@ -6,6 +6,8 @@
  *
  * This is the same layout as crt0.S, but for PIE executables that
  * are loaded by ld-likeos.so.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
     .section .text

@@ -1,4 +1,4 @@
-// LikeOS-64 input event UAPI - /dev/input/eventN interface
+// LikeOS input event UAPI - /dev/input/eventN interface
 //
 // Event structure, event types/codes and ioctl encoding follow the de-facto
 // standard evdev interface so existing input drivers (xf86-input-evdev) can
@@ -11,6 +11,8 @@
 // smaller list -- it fails to compile.  More generally, a driver enumerating
 // a device's capabilities must be able to ask about a code and be told "not
 // supported", which it cannot do if the name does not exist.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_UAPI_INPUT_H_
 #define _KERNEL_UAPI_INPUT_H_

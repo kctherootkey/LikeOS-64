@@ -5,7 +5,10 @@
  * Supports: --help, --version
  *
  * Repeatedly output a line with all specified STRING(s), or 'y'.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>

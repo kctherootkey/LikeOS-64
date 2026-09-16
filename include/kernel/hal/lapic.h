@@ -1,5 +1,7 @@
-// LikeOS-64 - Local APIC (LAPIC) Support for SMP
+// LikeOS - Local APIC (LAPIC) Support for SMP
 // Provides per-CPU interrupt controller, timer, and IPI support
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_LAPIC_H_
 #define _KERNEL_LAPIC_H_

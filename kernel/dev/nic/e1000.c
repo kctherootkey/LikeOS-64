@@ -1,10 +1,13 @@
-// LikeOS-64 Intel E1000 NIC Driver
+// LikeOS Intel E1000 NIC Driver
 // Supports the e1000-class parts:
 //   - 82540EM  (QEMU `-device e1000`, VirtualBox "Intel PRO/1000 MT Desktop")
 //   - 82545EM  (VMware default, VirtualBox "Intel PRO/1000 MT Server" and
 //               "Intel PRO/1000 T Server")
 // Note: The 82574L (PCI 0x10D3) is an e1000e-class part and is handled
 // by the separate e1000e driver in this directory, not here.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/nic/e1000.h>
 #include <kernel/net/net.h>
 #include <kernel/hal/pci.h>

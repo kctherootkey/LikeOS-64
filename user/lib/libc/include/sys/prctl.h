@@ -3,7 +3,11 @@
  * The subset that has meaning here: the thread name (PR_SET_NAME /
  * PR_GET_NAME).  The other well-known options are accepted and answered
  * with their conventional defaults so that portable start-up code
- * (hardening, dumpable state, child-subreaper) runs unchanged. */
+ * (hardening, dumpable state, child-subreaper) runs unchanged.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_PRCTL_H
 #define _SYS_PRCTL_H
 

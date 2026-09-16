@@ -1,4 +1,4 @@
-// LikeOS-64 VMware SVGA II display driver
+// LikeOS VMware SVGA II display driver
 //
 // Device interface definitions derived from the openly documented VMware
 // SVGA II virtual display adapter (as implemented by VMware products, QEMU
@@ -19,6 +19,8 @@
 //   irq_lock  (spin)    — IRQ-visible state (pending flags, fence wakeups)
 //   modeset_mutex       — sleeping mutex for mode changes (infrequent)
 //   per-object spinlocks + refcounts for buffer objects
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_DEV_VIDEO_VMSVGA2_H_
 #define _KERNEL_DEV_VIDEO_VMSVGA2_H_

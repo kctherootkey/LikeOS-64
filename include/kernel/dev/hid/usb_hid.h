@@ -1,4 +1,4 @@
-// LikeOS-64 - USB HID (Human Interface Device) Driver
+// LikeOS - USB HID (Human Interface Device) Driver
 // Implements USB HID Class specification 1.11
 // Supports Boot Protocol keyboards and mice per USB HID spec Chapter 7/8
 // Also handles Intel HID-ISHTP sensor hub discovery (graceful skip)
@@ -7,6 +7,8 @@
 //   - USB Device Class Definition for Human Interface Devices (HID) 1.11
 //   - USB HID Usage Tables 1.12
 //   - Intel Integrated Sensor Hub (ISH) / HID-over-ISHTP (skip/ignore)
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef LIKEOS_USBHID_H
 #define LIKEOS_USBHID_H

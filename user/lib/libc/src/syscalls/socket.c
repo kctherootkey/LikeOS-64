@@ -1,4 +1,7 @@
 // LikeOS libc socket syscall wrappers
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/epoll.h>

@@ -1,5 +1,9 @@
 /* makecontext(3): rewrite a context so that resuming it calls `func' on
- * ucp->uc_stack, then continues with ucp->uc_link (or exits). */
+ * ucp->uc_stack, then continues with ucp->uc_link (or exits).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <ucontext.h>
 #include <stdarg.h>
 #include <stdint.h>

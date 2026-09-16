@@ -1,5 +1,5 @@
 /*
- * sh - LikeOS-64 userland shell
+ * sh - LikeOS userland shell
  *
  * Built-in commands: cd, help, history, export, alias, unalias, time, exit
  *
@@ -24,6 +24,8 @@
  *   ||   Run next if previous fails
  *   &    Run command in background
  *   \|   Escaped pipe literal
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>
@@ -1433,7 +1435,7 @@ static int run_builtin(int argc, char **argv)
 		return 0;
 	}
 	if (strcmp(argv[0], "help") == 0) {
-		printf("LikeOS-64 Shell (userland)\n");
+		printf("LikeOS Shell (userland)\n");
 		printf("Built-in commands:\n");
 		printf("  cd <dir>       - Change directory\n");
 		printf("  alias [-p] [name[=value] ...] - Define/display aliases\n");

@@ -1,4 +1,4 @@
-// LikeOS-64 -- display-manager backend for the VMware SVGA II / SVGA3D
+// LikeOS -- display-manager backend for the VMware SVGA II / SVGA3D
 // device ("vmwgfx": the name userspace's driver stack looks for).
 //
 // Sits on the hardware primitives kernel/dev/video/vmsvga2.c exports.  Two
@@ -10,6 +10,9 @@
 //     the buffer object into VRAM and announced with SVGA_CMD_UPDATE.
 // Fences come from the FIFO fence register; the fence interrupt signals
 // them where the host has one, a short timer polls where it has not.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
@@ -1326,6 +1329,10 @@ static const struct drm_driver vmw_driver = {
 	.patch = 0,
 	.cursor_w = 64,
 	.cursor_h = 64,
+	/* Surface ids cross processes by value (DRI2: X server to client, then
+	 * GB_SURFACE_REF on the client's own file), so a handle must name one
+	 * object device-wide.  See struct drm_driver. */
+	.global_handles = 1,
 	.postclose = vmw_postclose,
 	.master_set = vmw_master_set,
 	.master_drop = vmw_master_drop,

@@ -4,7 +4,10 @@
  * Full implementation per head(1) manpage.
  * Supports: -c [-]NUM, -n [-]NUM, -q, -v, -z, --help, --version
  * NUM may have multiplier suffixes: b, kB, K, MB, M, GB, G, etc.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

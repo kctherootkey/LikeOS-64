@@ -1,4 +1,7 @@
-// LikeOS-64 Kernel Signal Implementation
+// LikeOS Kernel Signal Implementation
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/device.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/sched.h>

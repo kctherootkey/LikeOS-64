@@ -6,7 +6,10 @@
  *   'h' for hours, or 'd' for days.
  *   Multiple arguments are summed.
  *   Fractional numbers are supported (e.g. sleep 0.5).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

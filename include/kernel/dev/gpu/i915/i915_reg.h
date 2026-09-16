@@ -1,9 +1,12 @@
-// LikeOS-64 -- register offsets of Intel integrated graphics (Gen8 onwards).
+// LikeOS -- register offsets of Intel integrated graphics (Gen8 onwards).
 //
 // Offsets are into the MMIO window (BAR0); names follow the datasheets'
 // register names.  Only what the driver uses is here; the file grows with
 // the driver.  Generation-specific offsets carry the generation in their
 // name (GEN8_, GEN9_, GEN11_, GEN12_).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_REG_H
 #define KERNEL_DEV_GPU_I915_REG_H
 

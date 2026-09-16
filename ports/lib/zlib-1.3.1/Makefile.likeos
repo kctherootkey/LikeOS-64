@@ -1,4 +1,4 @@
-# Makefile.likeos - build zlib 1.3.1 as a shared library for LikeOS-64.
+# Makefile.likeos - build zlib 1.3.1 as a shared library for LikeOS.
 #
 # Outputs:
 #   libz.so.1.3.1  (deflate/inflate/gzip compression library)
@@ -9,6 +9,8 @@
 #   Compile all 15 zlib source files with -fPIC, link as ELF shared object
 #   following the same libevent/ncurses-likeos pattern used in LikeOS ports.
 #   No configure step required — zlib's zconf.h is platform-independent.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 LIBC_DIR  := ../../../user/lib/libc
 RTLD_DIR  := ../../../user/lib/rtld

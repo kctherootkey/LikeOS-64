@@ -23,6 +23,8 @@
  *
  * Errors are RETURNED, not signalled through errno -- that is what POSIX
  * specifies for this family, and it differs from almost every other call here.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <spawn.h>

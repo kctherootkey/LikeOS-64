@@ -1,4 +1,4 @@
-// LikeOS-64 -- vmwgfx: guest-backed objects (SVGA3D with GB/DX).
+// LikeOS -- vmwgfx: guest-backed objects (SVGA3D with GB/DX).
 //
 // Internal to the backend.  The device keeps its object tables (OTables)
 // in guest memory the driver hands it; every surface, context, shader and
@@ -6,6 +6,9 @@
 // page-table-described guest memory region.  Commands reach the device
 // through command buffers (which can name a DX context) or, on hosts
 // without them, the FIFO.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
 

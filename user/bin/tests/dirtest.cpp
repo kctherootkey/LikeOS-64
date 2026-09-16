@@ -22,7 +22,10 @@
  * directory.  If readdir sees luakit.so and directory_iterator does not, the
  * fault is in libstdc++'s filesystem layer sitting on this libc -- and the
  * error_code printed below says which call underneath it failed.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <cstdio>
 #include <cstring>
 #include <cerrno>

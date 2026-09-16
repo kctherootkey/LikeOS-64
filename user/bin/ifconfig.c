@@ -18,6 +18,8 @@
  *   up/down, [-]arp, [-]promisc, [-]allmulti, [-]multicast,
  *   mtu N, dstaddr, netmask, broadcast, pointopoint,
  *   hw class address, txqueuelen N, metric N
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

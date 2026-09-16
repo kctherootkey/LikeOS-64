@@ -1,4 +1,4 @@
-// LikeOS-64 -- Type-C ports (Ice Lake and Tiger Lake).
+// LikeOS -- Type-C ports (Ice Lake and Tiger Lake).
 //
 // A Type-C port's PHY sits behind the flexible I/O adapter (FIA), which
 // muxes the connector between a DisplayPort alternate-mode sink, the
@@ -12,6 +12,9 @@
 // None of this has run on hardware: the ThinkPad P50 this driver was
 // written on has no Type-C PHY.  The sequences follow the programming
 // guides; every step reports what it found.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

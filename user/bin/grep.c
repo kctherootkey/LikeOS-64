@@ -4,7 +4,10 @@
  * Full implementation per GNU grep(1) manpage.
  * Includes inline BRE/ERE regex engine, fixed-string matching,
  * recursive search, context lines, colorized output, and all options.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

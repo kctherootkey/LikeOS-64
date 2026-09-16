@@ -5,7 +5,10 @@
  * character is a Unicode code point and nothing is lost converting to or from
  * one.  The multibyte encoding is UTF-8 in every locale; see
  * src/locale/multibyte.c for why that is a decision rather than a gap.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _WCHAR_H
 #define _WCHAR_H
 

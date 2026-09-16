@@ -1,4 +1,4 @@
-# CMake cross-compilation description for LikeOS-64.
+# CMake cross-compilation description for LikeOS.
 #
 # The counterpart of likeos-cross.ini (meson) and likeos-autogen.sh (autotools).
 # Only one package here uses CMake -- ctwm -- but without this it configures
@@ -10,6 +10,8 @@
 # Point CMake at it with -DCMAKE_TOOLCHAIN_FILE=<this file>.  It reads
 # LIKEOS_SYSROOT and LIKEOS_TOOLCHAIN from the environment so the paths are not
 # baked in.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 # A real system name, with a platform module next to this file describing it.
 #

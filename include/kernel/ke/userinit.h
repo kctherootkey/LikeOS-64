@@ -1,6 +1,8 @@
-// LikeOS-64 user-space init launcher
+// LikeOS user-space init launcher
 // Starts /sbin/init (PID 1) once the root filesystem is ready and keeps it
 // alive: init spawns getty, which runs login and the user's shell.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_USERINIT_H_
 #define _KERNEL_USERINIT_H_

@@ -17,7 +17,10 @@
  * The exception macros are the x87 status-word bit positions, which MXCSR
  * deliberately reuses for its own low six bits -- that is why one mask can be
  * applied to both.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _FENV_H
 #define _FENV_H
 

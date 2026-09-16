@@ -1,4 +1,7 @@
-// LikeOS-64 - Minimal IOAPIC support (legacy IRQ routing)
+// LikeOS - Minimal IOAPIC support (legacy IRQ routing)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #pragma once
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;

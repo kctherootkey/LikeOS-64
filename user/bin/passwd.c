@@ -6,7 +6,10 @@
  * A normal user may change only their own password; the superuser may change
  * any account and its aging attributes.  New passwords are hashed with
  * yescrypt using a cryptographically random salt (crypt_gensalt).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

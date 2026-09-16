@@ -1,5 +1,7 @@
-# LikeOS-64 UEFI Build System
+# LikeOS UEFI Build System
 # Professional UEFI kernel build with modular directory structure
+#
+# Copyright (C) 2026 The LikeOS Project
 
 # Pass DEBUG=1 on the command line to enable verbose stack-smash output in libc
 # and kernel memory poisoning (freed slabs, freed pages, uninitialized allocs).
@@ -2128,12 +2130,12 @@ $(GTK3_SENTINEL): ports-gtk3 | $(BUILD_DIR)
 
 
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
-	@echo "Building LikeOS-64 kernel as ELF64..."
+	@echo "Building LikeOS kernel as ELF64..."
 	$(LD) $(KERNEL_LDFLAGS) -T kernel.lds $(KERNEL_OBJS) -o $(KERNEL_ELF)
 ifndef NO_STRIP
 	$(STRIP) $(KERNEL_ELF)
 endif
-	@echo "LikeOS-64 ELF64 kernel built: $(KERNEL_ELF)"
+	@echo "LikeOS ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
 $(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S $(SCREEN_STAMP) | $(BUILD_DIR)
@@ -2245,8 +2247,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	# luakit runs through a launcher that keeps its cache and data on the
 	# RAM filesystem (/ram) instead of the disk; it sits ahead of
-	# /usr/bin/luakit on the PATH.  LUAKIT_RAM=0 or ~/.config/luakit/use-disk
-	# bypasses it -- see the script for the switch and what it copies back.
+	# /usr/bin/luakit on the PATH.  /ram is world-writable and sticky, so
+	# the launcher gives each user a private /ram/<name>, created 0700 in
+	# one step and never adopted from another owner.  LUAKIT_RAM=0 or
+	# ~/.config/luakit/use-disk bypasses it -- see the script for the
+	# switch and what it copies back.
 	cp res/xorg/luakit-ram.sh $(EXT4_STAGING)/usr/local/bin/luakit
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/luakit
 	# Resources, manpages, config
@@ -2495,7 +2500,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 # Run the single ext4 GPT USB disk in QEMU (UEFI).  The firmware runs the ESP's
 # bootloader, which then loads /boot/kernel.elf from the ext4 root partition.
 qemu: $(GPT_DISK)
-	@echo "Running LikeOS-64 from the ext4 GPT USB disk in QEMU..."
+	@echo "Running LikeOS from the ext4 GPT USB disk in QEMU..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
@@ -2510,7 +2515,7 @@ qemu: $(GPT_DISK)
 NIC_DEVICE ?= e1000
 
 qemu-usb: $(GPT_DISK)
-	@echo "Running LikeOS-64 from the ext4 GPT USB disk + $(NIC_DEVICE) networking..."
+	@echo "Running LikeOS from the ext4 GPT USB disk + $(NIC_DEVICE) networking..."
 	@# sudo is required so SLIRP can open a raw ICMP socket on the host;
 	@# without it, external `ping` (e.g. ping 8.8.8.8) is silently dropped
 	@# while the synthetic gateway reply (10.0.2.2) still works.
@@ -2526,7 +2531,7 @@ qemu-usb-gdb:
 	@echo "Rebuilding kernel with debug symbols (-g)..."
 	$(MAKE) clean
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 $(GPT_DISK)
-	@echo "Running LikeOS-64 from the ext4 GPT USB disk + $(NIC_DEVICE) + GDB server on :1234..."
+	@echo "Running LikeOS from the ext4 GPT USB disk + $(NIC_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	@# sudo: see qemu-usb target above (SLIRP raw ICMP socket).
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
@@ -2542,7 +2547,7 @@ qemu-realusb:
 ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
-	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
+	@echo "Running LikeOS in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
@@ -2558,7 +2563,7 @@ endif
 	@echo "Rebuilding kernel with debug symbols (-g)..."
 	$(MAKE) clean
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
-	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
+	@echo "Running LikeOS in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
@@ -2568,7 +2573,7 @@ endif
 
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
 qemu-usb-passthrough: $(GPT_DISK)
-	@echo "Running LikeOS-64 from the ext4 GPT USB disk with host USB passthrough (if any)..."
+	@echo "Running LikeOS from the ext4 GPT USB disk with host USB passthrough (if any)..."
 	@echo "Autodetecting host USB devices via lsusb (override with PASSTHROUGH_FILTER=vid:pid,vid:pid)."
 	@set -e; \
 	devices=""; \
@@ -3126,7 +3131,7 @@ deps:
 
 # Help target
 help:
-	@echo "LikeOS-64 UEFI Build System"
+	@echo "LikeOS UEFI Build System"
 	@echo "Available targets:"
 	@echo "  all        - Build the single ext4 GPT USB disk (build/likeos-ext4.img)"
 	@echo "  kernel     - Build kernel ELF only"

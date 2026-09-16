@@ -26,7 +26,10 @@
  *
  * Only your own processes, unless you are root: the bytes of another
  * process's memory are as private as the map that says where they are.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

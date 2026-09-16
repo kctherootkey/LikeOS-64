@@ -1,9 +1,12 @@
-// LikeOS-64 -- display-manager fences and sync_file descriptors.
+// LikeOS -- display-manager fences and sync_file descriptors.
 //
 // A fence is a point in the GPU's command stream; it signals when the
 // device has passed it.  Userspace waits on it by handle (the backend's
 // fence ioctls) or as a sync_file descriptor: poll() readable when
 // signalled, mergeable with another into a fence for both.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/uapi/drm/sync_file.h>
 #include <kernel/uapi/ioctl.h>

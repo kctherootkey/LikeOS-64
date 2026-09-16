@@ -4,7 +4,10 @@
  * Each routine writes "<progname>: <fmt>: <strerror(errno)>\n" to stderr
  * (errx/warnx omit the strerror suffix).  The err* variants exit with the
  * supplied status after printing.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <err.h>
 #include <stdio.h>
 #include <stdlib.h>

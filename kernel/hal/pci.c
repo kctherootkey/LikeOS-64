@@ -1,4 +1,7 @@
-// LikeOS-64 - Minimal PCI enumeration
+// LikeOS - Minimal PCI enumeration
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/mm/memory.h>
 #include <kernel/hal/pci.h>
 #include <kernel/io/console.h>

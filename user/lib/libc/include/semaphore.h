@@ -18,6 +18,8 @@
  * would have to live in shared memory and be woken across address spaces;
  * asking for one gets ENOSYS rather than a semaphore that silently only works
  * within one process.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _SEMAPHORE_H

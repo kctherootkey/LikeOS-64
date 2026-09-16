@@ -1,4 +1,7 @@
-// LikeOS-64 -- time of day, clocks, sleeping and interval timers.
+// LikeOS -- time of day, clocks, sleeping and interval timers.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/sched.h>

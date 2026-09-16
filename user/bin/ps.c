@@ -3,6 +3,8 @@
  *
  * Full implementation per the ps(1) manpage.
  * Supports UNIX (-), BSD (no dash), and GNU (--) option styles.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

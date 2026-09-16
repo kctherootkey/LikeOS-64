@@ -2,7 +2,11 @@
  *
  * Block the signals in `mask' with sigprocmask() first; the descriptor then
  * delivers them as signalfd_siginfo records, one per read, and poll()
- * reports it readable while any is pending. */
+ * reports it readable while any is pending.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_SIGNALFD_H
 #define _SYS_SIGNALFD_H
 

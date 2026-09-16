@@ -4,6 +4,8 @@
  * Detects "Verify return code: 20" in the output (TLS handshake complete),
  * waits KILL_DELAY_MS milliseconds, kills the child, and loops.
  * Exits after 10 minutes and prints a summary.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

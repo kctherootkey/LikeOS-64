@@ -1,10 +1,12 @@
-// LikeOS-64 — sk_buff pool and queue implementation
+// LikeOS — sk_buff pool and queue implementation
 //
 // Two-class pool (small 1536 B data / jumbo 65535 B data).  Each pool slot
 // holds one sk_buff_t header followed by its data buffer in a single static
 // allocation, so we never touch the page or slab allocator on the packet
 // fast path.  Free-list manipulation is protected by a per-class spinlock
 // held only long enough to swing one `next` pointer.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/skb.h>
 #include <kernel/io/console.h>

@@ -1,4 +1,7 @@
-// LikeOS-64 - devfs (device filesystem)
+// LikeOS - devfs (device filesystem)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/devfs.h>
 #include <kernel/mm/shm.h>
 #include <kernel/mm/memory.h>
@@ -36,10 +39,8 @@
 #define DEVFS_TYPE_ANON 18 /* anonymous device file; ops in `aops`     */
 #define DEVFS_TYPE_MAX DEVFS_TYPE_ANON
 
-/* Device-node group owners; values must match /etc/group on the root fs. */
-#define DEVFS_GID_TTY 5
-#define DEVFS_GID_VIDEO 44
-#define DEVFS_GID_INPUT 104
+/* DEVFS_GID_TTY / _VIDEO / _INPUT / _RENDER come from <kernel/dev/device.h>,
+ * shared with the drivers that register their own nodes. */
 
 typedef struct {
 	vfs_file_t vfs;
@@ -820,7 +821,7 @@ int devfs_stat(const char *path, struct kstat *st)
 		st->st_ctime = now;
 		return ST_OK;
 	}
-	uint32_t perm, gid = 0, rmaj, rmin;
+	uint32_t perm, uid = 0, gid = 0, rmaj, rmin;
 	if (is_path(path, "/dev/tty")) {
 		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 0;
 	} else if (is_path(path, "/dev/console")) {
@@ -849,10 +850,14 @@ int devfs_stat(const char *path, struct kstat *st)
 		int id = devfs_parse_unit(path + 9);
 		if (id < 0)
 			return ST_NOT_FOUND;
-		/* Slaves stay world-rw: nodes are root-owned (no per-open
-		 * chown), so 0620 would lock non-root sessions out of their
-		 * own terminal. */
-		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 136;
+		/* A session's own terminal: read/write for the user that
+		 * allocated the pty, write for group tty so wall(1) and
+		 * write(1) can reach it, nothing for anyone else.  The owner
+		 * comes from the master's opener (tty_pty_owner_uid), which
+		 * is what makes 0620 usable at all -- while the nodes were
+		 * unconditionally root-owned it had to be 0666. */
+		perm = 0620, uid = tty_pty_owner_uid(id), gid = DEVFS_GID_TTY;
+		rmaj = 136;
 		rmin = (uint32_t)id;
 	} else {
 		struct devfs_node *d = devfs_dir_lookup(path);
@@ -880,6 +885,7 @@ int devfs_stat(const char *path, struct kstat *st)
 		return ST_OK;
 	}
 	st->st_mode = S_IFCHR | perm;
+	st->st_uid = uid;
 	st->st_gid = gid;
 	st->st_rdev = ((uint64_t)rmaj << 8) | rmin;
 	st->st_nlink = 1;
@@ -1524,7 +1530,7 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	devfs_file_t *df = (devfs_file_t *)f->fs_private;
 	if (!df)
 		return -EINVAL;
-	uint32_t perm, gid = 0, rmaj, rmin;
+	uint32_t perm, uid = 0, gid = 0, rmaj, rmin;
 
 	/* Shared memory objects are not devices: they have an owner, a mode and
 	 * a length of their own, and fstat() is how a caller learns the size
@@ -1588,8 +1594,9 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	case DEVFS_TYPE_PTY_MASTER:
 		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 2;
 		break;
-	case DEVFS_TYPE_PTY_SLAVE:
-		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 136;
+	case DEVFS_TYPE_PTY_SLAVE: /* 0620 owner:tty -- see devfs_stat() */
+		perm = 0620, gid = DEVFS_GID_TTY, rmaj = 136;
+		uid = tty_pty_owner_uid(df->pty_id);
 		rmin = (uint32_t)df->pty_id;
 		break;
 	case DEVFS_TYPE_RANDOM:
@@ -1650,6 +1657,7 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 		return -EINVAL;
 	}
 	st->st_mode = S_IFCHR | perm;
+	st->st_uid = uid;
 	st->st_gid = gid;
 	st->st_rdev = ((uint64_t)rmaj << 8) | rmin;
 	st->st_nlink = 1;

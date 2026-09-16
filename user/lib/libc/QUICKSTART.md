@@ -1,4 +1,4 @@
-# LikeOS-64 libc Quick Reference
+# LikeOS libc Quick Reference
 
 ## Building User Programs
 
@@ -9,7 +9,7 @@
 #include <stdio.h>
 
 int main(void) {
-    printf("Hello, LikeOS-64!\n");
+    printf("Hello, LikeOS!\n");
     return 0;
 }
 ```

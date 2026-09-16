@@ -3,7 +3,10 @@
  *
  * Full implementation per wc(1) manpage.
  * Supports: -c, -m, -l, -L, -w, --files0-from, --total, --help, --version
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

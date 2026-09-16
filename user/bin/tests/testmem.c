@@ -1,7 +1,9 @@
-// testmem - Memory allocation test program for LikeOS-64
+// testmem - Memory allocation test program for LikeOS
 // Usage: testmem <size_mb> [small]
 //   size_mb: Total memory to allocate in megabytes
 //   small:   If specified, allocate in small chunks (4KB) instead of one big block
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,7 +186,7 @@ static int test_small_allocations(size_t total_mb)
 
 int main(int argc, char **argv)
 {
-	printf("=== LikeOS-64 Memory Test ===\n\n");
+	printf("=== LikeOS Memory Test ===\n\n");
 
 	if (argc < 2) {
 		printf("Usage: testmem <size_mb> [small]\n");

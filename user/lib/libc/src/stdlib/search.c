@@ -16,7 +16,10 @@
  * that step visits every slot before repeating.  A power-of-two size with the
  * same probe would revisit a fraction of the table and loop for ever on a full
  * one.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <search.h>
 #include <stdlib.h>
 #include <string.h>

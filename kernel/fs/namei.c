@@ -1,4 +1,7 @@
-// LikeOS-64 -- path resolution, permission checks and name-space syscalls.
+// LikeOS -- path resolution, permission checks and name-space syscalls.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/pipe.h>

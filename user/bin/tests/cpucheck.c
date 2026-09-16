@@ -10,6 +10,9 @@
 //   -f folds threads into their processes first, exactly as top does, and
 //      reports the folded rows: this is the computation behind top's %CPU
 //      column, so a row above the ceiling here is a folding defect.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

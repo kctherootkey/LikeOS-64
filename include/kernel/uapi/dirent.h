@@ -1,4 +1,7 @@
-// LikeOS-64 - dirent64 structure for getdents64
+// LikeOS - dirent64 structure for getdents64
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_DIRENT_H_
 #define _KERNEL_DIRENT_H_
 

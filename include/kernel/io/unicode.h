@@ -1,4 +1,4 @@
-// LikeOS-64 Unicode support for the console
+// LikeOS Unicode support for the console
 //
 // The console decodes UTF-8 and addresses glyphs by code point, which leaves
 // one question the byte-oriented code never had to answer: how many cells does
@@ -6,6 +6,8 @@
 // Asian wide character takes two.  Getting it wrong is not cosmetic -- the
 // program writing to the console computes its own columns the same way, and a
 // disagreement leaves the cursor and the text permanently out of step.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_UNICODE_H_
 #define _KERNEL_UNICODE_H_

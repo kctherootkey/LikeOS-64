@@ -6,7 +6,10 @@
  * use space that is not in [H, T), may not split a command across the
  * end of the ring, and may never leave T equal to H, which the engine
  * reads as an empty ring.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>

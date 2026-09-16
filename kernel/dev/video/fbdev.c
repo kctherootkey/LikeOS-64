@@ -1,4 +1,4 @@
-// LikeOS-64 fbdev core - backend-neutral /dev/fb0 implementation
+// LikeOS fbdev core - backend-neutral /dev/fb0 implementation
 //
 // Display servers (X.org fbdev/modesetting) drive the screen through this
 // interface: FBIOGET_* for geometry discovery, mmap of the framebuffer for
@@ -6,6 +6,8 @@
 // that owns the screen registers a backend (see fbdev.h) and mode changes
 // route through it (console included); with no backend the boot framebuffer
 // is what the node shows and its single mode is the only accepted one.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/input/mouse.h>
 #include <kernel/dev/video/fb.h>

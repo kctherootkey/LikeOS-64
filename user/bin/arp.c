@@ -15,6 +15,8 @@
  *   -n   numeric addresses            -v   verbose
  *
  * Entry modifiers for -s: temp, pub, trail
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

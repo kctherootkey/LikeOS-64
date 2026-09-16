@@ -1,11 +1,13 @@
 /*
- * oslikeos.c - ACPICA OS Services Layer for LikeOS-64
+ * oslikeos.c - ACPICA OS Services Layer for LikeOS
  *
  * Based on the Zephyr RTOS ACPICA OSL (oszephyr.c) by Intel Corp.
- * Adapted for the LikeOS-64 freestanding 64-bit kernel.
+ * Adapted for the LikeOS freestanding 64-bit kernel.
  *
  * Copyright (c) 1999 - 2025, Intel Corp. (ACPICA)
  * See kernel/hal/acpica/LICENSE for ACPICA licensing terms.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include "acpi.h"

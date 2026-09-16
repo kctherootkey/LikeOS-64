@@ -24,6 +24,12 @@
  *   --has-display   exit 0 when the node reports a connector and a CRTC,
  *              1 otherwise: a display server should not be pointed at a
  *              device that has no screen to offer
+ *   --has-3d   exit 0 when the node's driver renders 3D on the device: i915,
+ *              or vmwgfx with the VM's 3D acceleration switched on.  Decides
+ *              glamor in X and GPU vs llvmpipe for GL clients (xserverrc,
+ *              xinitrc)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>
@@ -626,6 +632,36 @@ static int has_display(const char *node)
 	return (res.count_connectors > 0 && res.count_crtcs > 0) ? 0 : 1;
 }
 
+/* Does the node's driver render 3D on the device itself?  i915 always does;
+ * vmwgfx only when the virtual device offers 3D -- the VM's "Accelerate 3D
+ * graphics" setting, which the kernel reads from the device and answers as
+ * DRM_VMW_PARAM_3D (the same question Mesa's svga driver asks before it
+ * binds).  Anything else answers no.  The session start-up scripts decide
+ * from this whether X runs glamor and whether GL clients are pinned to the
+ * software rasteriser, so the two always agree. */
+static int has_3d(const char *node)
+{
+	char name[32];
+	int fd = open(node, O_RDWR);
+	int ret = 1;
+
+	if (fd < 0)
+		return 1;
+	driver_name(fd, name, sizeof(name));
+	if (!strcmp(name, "i915")) {
+		ret = 0;
+	} else if (!strcmp(name, "vmwgfx")) {
+		struct drm_vmw_getparam_arg a;
+
+		memset(&a, 0, sizeof(a));
+		a.param = DRM_VMW_PARAM_3D;
+		if (drm_ioctl(fd, DRMINFO_IOCTL_VMW_GET_PARAM, &a) == 0 && a.value)
+			ret = 0;
+	}
+	close(fd);
+	return ret;
+}
+
 static int examine(const char *path)
 {
 	char name[64];
@@ -752,6 +788,15 @@ int main(int argc, char **argv)
 				n = path;
 			}
 			return has_display(n);
+		} else if (!strcmp(argv[i], "--has-3d")) {
+			const char *n = "/dev/dri/card0";
+			if (i + 1 < argc)
+				n = argv[++i];
+			if (n[0] >= '0' && n[0] <= '9') {
+				snprintf(path, sizeof(path), "/dev/dri/card%s", n);
+				n = path;
+			}
+			return has_3d(n);
 		} else if (!strcmp(argv[i], "--driver")) {
 			const char *n = "/dev/dri/card0";
 			if (i + 1 < argc)
@@ -766,7 +811,9 @@ int main(int argc, char **argv)
 			       "  -n   one node: a path, or a number N for /dev/dri/card<N>\n"
 			       "  -v   list every mode rather than the first few\n"
 			       "  --driver   print the driver name of the node (card0) only\n"
-			       "  --has-display   exit 0 when the node has a connector and a CRTC\n");
+			       "  --has-display   exit 0 when the node has a connector and a CRTC\n"
+			       "  --has-3d   exit 0 when the node's driver renders 3D on the device\n"
+			       "             (i915; vmwgfx with the VM's 3D acceleration on)\n");
 			return 0;
 		} else {
 			fprintf(stderr, "drminfo: unknown argument '%s'\n", argv[i]);

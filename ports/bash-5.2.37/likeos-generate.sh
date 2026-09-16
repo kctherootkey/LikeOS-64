@@ -22,6 +22,9 @@
 # run during the build, they are not part of the shell.
 #
 # Re-run with:  make -f Makefile.likeos generate
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 cd "$(dirname "$0")"
 

@@ -1,7 +1,9 @@
-// LikeOS-64 NE2000-compatible PCI NIC Driver
+// LikeOS NE2000-compatible PCI NIC Driver
 // Supports the Realtek RTL8029(AS) (vendor 0x10EC, device 0x8029) which
 // is the PCI-bus member of the venerable NE2000 family.  Emulated by QEMU
 // as `-device ne2k_pci` and shipped on countless cheap 90s NICs.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_NE2K_H_
 #define _KERNEL_NE2K_H_

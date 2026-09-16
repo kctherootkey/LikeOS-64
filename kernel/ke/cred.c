@@ -1,9 +1,11 @@
-// LikeOS-64 - UNIX process credentials
+// LikeOS - UNIX process credentials
 //
 // The set*-id transition rules below follow POSIX: a privileged process
 // (effective uid 0) may set IDs freely; an unprivileged process may only
 // switch among its real, effective and saved-set IDs.  The filesystem IDs
 // track the effective IDs (we do not expose a separate setfsuid/setfsgid).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/cred.h>
 #include <kernel/ke/sched.h> /* task_t, sched_current() */

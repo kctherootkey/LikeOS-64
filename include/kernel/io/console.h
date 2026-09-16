@@ -1,5 +1,7 @@
-// LikeOS-64 Hardware Abstraction Layer - Console Interface
+// LikeOS Hardware Abstraction Layer - Console Interface
 // Framebuffer-based console and printf services for kernel subsystems
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_CONSOLE_H_
 #define _KERNEL_CONSOLE_H_

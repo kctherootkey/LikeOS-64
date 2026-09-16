@@ -1,4 +1,6 @@
-; LikeOS-64 SYSCALL/SYSRET Entry Point
+; LikeOS SYSCALL/SYSRET Entry Point
+;
+; Copyright (C) 2026 The LikeOS Project
 
 BITS 64
 SECTION .text

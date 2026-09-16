@@ -1,4 +1,4 @@
-// LikeOS-64 Intel e1000e (PCIe gigabit) NIC Driver
+// LikeOS Intel e1000e (PCIe gigabit) NIC Driver
 //
 // Targets (verified working on real hardware and/or hypervisor):
 //   - Intel 82574L Gigabit Network Connection                 (PCI 0x10D3)
@@ -62,6 +62,9 @@
 //   Set E1000E_DBG to 1 (just below the includes) to enable the full
 //   verbose register-dump / state-trace firehose used during bring-up.
 // ---------------------------------------------------------------------------
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/nic/e1000e.h>
 #include <kernel/dev/nic/e1000.h>
 #include <kernel/net/net.h>

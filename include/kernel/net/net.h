@@ -1,5 +1,7 @@
-// LikeOS-64 Network Subsystem Interface
+// LikeOS Network Subsystem Interface
 // Network device abstraction, protocol dispatch, and socket API
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_NET_H_
 #define _KERNEL_NET_H_

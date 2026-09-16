@@ -8,6 +8,8 @@
 # every bash feature - the widely used ones, broadly.
 #
 # Each check prints PASS or FAIL; the exit status is the number of failures.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 pass=0
 fail=0

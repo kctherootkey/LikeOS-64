@@ -3,7 +3,10 @@
  * scatter-gather syscalls.  The kernel implementation processes the iovecs
  * sequentially; partial-transfer semantics on errors mid-stream are
  * documented under POSIX.1-2017 §readv/writev "RETURN VALUE".
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <sys/uio.h>
 #include <errno.h>
 #include "syscall.h"

@@ -1,10 +1,13 @@
-// LikeOS-64 -- the display side of the Intel graphics driver.
+// LikeOS -- the display side of the Intel graphics driver.
 //
 // Outputs (DDI ports carrying eDP, DisplayPort or HDMI), the pipes and
 // transcoders that feed them, the PLLs that clock them, the power wells
 // they sit in, and the panel's power sequencing and backlight.  The
 // state lives in struct intel_display inside the device; the mode-object
 // side (connectors, CRTCs) is the DRM core's, mapped onto these by index.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DISPLAY_H
 #define KERNEL_DEV_GPU_I915_INTEL_DISPLAY_H
 

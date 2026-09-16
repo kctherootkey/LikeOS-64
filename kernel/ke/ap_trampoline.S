@@ -1,4 +1,4 @@
-; LikeOS-64 AP (Application Processor) Startup Trampoline
+; LikeOS AP (Application Processor) Startup Trampoline
 ; This code runs in real mode, transitions to long mode,
 ; then jumps to the C entry point ap_entry()
 ;
@@ -10,6 +10,8 @@
 ;   0x110: Stack pointer (64-bit)
 ;   0x118: CPU ID (32-bit)
 ;   0x120: Entry point address (64-bit)
+;
+; Copyright (C) 2026 The LikeOS Project
 
 [bits 16]
 section .text

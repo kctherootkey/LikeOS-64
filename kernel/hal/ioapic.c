@@ -1,4 +1,7 @@
-// LikeOS-64 - Minimal IOAPIC support
+// LikeOS - Minimal IOAPIC support
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/io/console.h>
 #include <kernel/hal/ioapic.h>
 #include <kernel/ke/interrupt.h> // for idt vector constants if needed

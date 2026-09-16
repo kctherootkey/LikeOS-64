@@ -1,4 +1,9 @@
-/* The rusage block reported by getrusage() and wait4(). */
+/*
+ * The rusage block reported by getrusage() and wait4().
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_UAPI_RUSAGE_H
 #define _KERNEL_UAPI_RUSAGE_H
 

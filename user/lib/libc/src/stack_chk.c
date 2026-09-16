@@ -1,6 +1,9 @@
 // Stack canary support for libc (-fstack-protector-strong)
 // Uses fs:0x28 (TLS slot) as the canary source - set per-process at exec time.
 // __stack_chk_guard is kept for linking against objects compiled with =global.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <stdint.h>
 
 uint64_t __stack_chk_guard = 0xDEADBEEFCAFEBABEULL;

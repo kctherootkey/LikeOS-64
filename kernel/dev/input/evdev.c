@@ -1,4 +1,4 @@
-// LikeOS-64 evdev input core - implementation
+// LikeOS evdev input core - implementation
 //
 // Ring-buffered input events with the standard event-device semantics:
 // whole input_event records via read(), EV_SYN frame terminators, drop-
@@ -9,6 +9,8 @@
 // grab holder.  Producers run in interrupt context (spin_lock_irqsave, no
 // prints, no sleeping); readers park with the established wait_channel/
 // BLOCKED protocol.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/waitq.h>
 #include <kernel/dev/input/evdev.h>

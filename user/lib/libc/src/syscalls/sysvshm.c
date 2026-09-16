@@ -1,6 +1,9 @@
 /*
  * System V shared memory syscall wrappers.  See include/sys/shm.h.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <sys/shm.h>
 #include <errno.h>
 #include "syscall.h"

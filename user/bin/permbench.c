@@ -3,7 +3,10 @@
  * first as root, then as uid 1000, to localize the non-root slowdown.
  * Output goes to stdout (console, mirrored to serial).  NOT part of the
  * shipped system; wired into init temporarily for measurement.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 Dentry Cache
+// LikeOS Dentry Cache
 //
 // Caches directory lookup results keyed by (parent_cluster, name_hash)
 // so that repeated open()/stat()/access() calls on the same path skip
@@ -8,6 +8,8 @@
 // lookups where most candidates miss.
 //
 // SMP-safe with per-bucket spinlocks.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_DCACHE_H_
 #define _KERNEL_DCACHE_H_

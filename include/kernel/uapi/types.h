@@ -1,5 +1,7 @@
-// LikeOS-64 Common Types - Standard type definitions for kernel
+// LikeOS Common Types - Standard type definitions for kernel
 // Provides consistent type definitions across all kernel modules
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_TYPES_H_
 #define _KERNEL_TYPES_H_

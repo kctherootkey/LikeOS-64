@@ -1,5 +1,9 @@
 /* Host test: the address form of the submission interface (appended to
- * the driver's own two helpers by host/test-execaddr.sh). */
+ * the driver's own two helpers by host/test-execaddr.sh).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 
 static int fails;

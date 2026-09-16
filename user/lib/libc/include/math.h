@@ -3,7 +3,10 @@
  *
  * Only the entry points used by ported applications (currently tmux) are
  * declared.  Implementations live in src/math/math.c.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _MATH_H
 #define _MATH_H
 

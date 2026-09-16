@@ -1,10 +1,13 @@
-// LikeOS-64 - shebang (#!) script loader
+// LikeOS - shebang (#!) script loader
 //
 // Turns execve() of a "#!interpreter [arg]" file into execve() of the
 // interpreter with the script path appended to argv, following the
 // conventional Unix interpreter-script semantics.  Uses only the
 // fs-independent vfs_* API and the existing VFS synchronization; no locks
 // or persistent state of its own.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/script_loader.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/fs/vfs.h>

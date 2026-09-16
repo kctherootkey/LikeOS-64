@@ -17,7 +17,10 @@
  *   -x           Two-byte hexadecimal display (default)
  *   -h, --help   Display help
  *   -V, --version Display version
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -4,6 +4,8 @@
  * Usage: time [options] command [arguments...]
  *
  * Full implementation per the time(1) manpage (GNU time).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

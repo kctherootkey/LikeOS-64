@@ -1,4 +1,8 @@
-/* assert.h - assertion macro for LikeOS libc */
+/*
+ * assert.h - assertion macro for LikeOS libc
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 /*
  * DELIBERATELY NOT GUARDED against repeated inclusion.

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_PROCINFO_H
 #define _SYS_PROCINFO_H
 

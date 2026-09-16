@@ -4,7 +4,10 @@
  * Only what the shared memory calls need: this system has no message queues or
  * semaphores, and shm exists chiefly because the MIT-SHM X extension is built
  * on it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_IPC_H
 #define _SYS_IPC_H
 

@@ -1,4 +1,4 @@
-/* LikeOS-64 POSIX shared memory objects — see include/kernel/mm/shm.h.
+/* LikeOS POSIX shared memory objects — see include/kernel/mm/shm.h.
  *
  * Locking: one spinlock covers the table and every object's fields.  Nothing is
  * allocated or freed while it is held — the page array is large enough to take
@@ -11,7 +11,10 @@
  *
  * Reading obj->pages unlocked during a resize is safe because `resizing`
  * excludes the only other writer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <kernel/mm/shm.h>
 #include <kernel/mm/memory.h>
 #include <kernel/mm/slab.h>

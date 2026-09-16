@@ -1,4 +1,7 @@
-// LikeOS-64 -- display-manager core: what the core's own files share.
+// LikeOS -- display-manager core: what the core's own files share.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_DRM_INTERNAL_H
 #define KERNEL_DEV_GPU_DRM_INTERNAL_H
 

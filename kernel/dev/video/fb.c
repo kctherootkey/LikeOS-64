@@ -1,5 +1,7 @@
-// LikeOS-64 Framebuffer Optimization System - Implementation
+// LikeOS Framebuffer Optimization System - Implementation
 // High-performance double buffering, write-combining, and SSE-optimized rendering
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #define BOOT_DEBUG 0
 

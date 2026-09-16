@@ -5,7 +5,10 @@
  * Supports: -n, -e, -E, --help, --version
  * Escape sequences (with -e):
  *   \\  \a  \b  \c  \e  \f  \n  \r  \t  \v  \0NNN  \xHH
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>

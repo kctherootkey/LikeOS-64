@@ -1,4 +1,4 @@
-# CMake platform description for LikeOS-64.
+# CMake platform description for LikeOS.
 #
 # CMake loads Platform/${CMAKE_SYSTEM_NAME}.cmake to learn how a system builds
 # and links.  There is no module for this one, and the obvious workaround --
@@ -11,6 +11,8 @@
 # the standard Unix search paths.  Those get re-rooted into the sysroot by
 # CMAKE_FIND_ROOT_PATH (see likeos-toolchain.cmake), so naming them here does
 # not let the build host's /usr in.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set(UNIX 1)
 

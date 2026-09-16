@@ -1,8 +1,10 @@
-// LikeOS-64 - PS/2 Controller (8042) Initialization
+// LikeOS - PS/2 Controller (8042) Initialization
 // Minimal init: BIOS/UEFI firmware already configured i8042 emulation on
 // the eSPI bus.  We set up CTR for keyboard + mouse and program IOAPIC.
 // No PNP _SRS (triggers EC GPE storms), no self-test (leaks stale 0x55
 // on eSPI), no ECAM/PCH decode (preserved by pci.c bridge-skip fix).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/io/console.h>
 #include <kernel/dev/hid/ps2.h>

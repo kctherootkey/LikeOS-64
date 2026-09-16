@@ -1,9 +1,12 @@
-// LikeOS-64 -- what kind of Intel graphics device this is.
+// LikeOS -- what kind of Intel graphics device this is.
 //
 // Every device id in the PCI table points at one of these descriptors:
 // the generation and the feature flags the driver gates its code paths
 // on.  Nothing in the driver tests a device id or a platform name at run
 // time; it asks the descriptor.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_DEVICE_INFO_H
 #define KERNEL_DEV_GPU_I915_DEVICE_INFO_H
 

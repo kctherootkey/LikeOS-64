@@ -1,4 +1,4 @@
-// LikeOS-64 -- the DisplayPort AUX channel.
+// LikeOS -- the DisplayPort AUX channel.
 //
 // A slow serial side channel to a DisplayPort sink: native reads and
 // writes of its DPCD register space, and I2C tunnelled over it (how an
@@ -7,6 +7,9 @@
 // transaction is written into the data registers as a header plus
 // payload, started with the busy bit, and its reply read back the same
 // way.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

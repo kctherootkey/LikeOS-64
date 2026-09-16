@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 semaphore.c - POSIX semaphores
+ * LikeOS semaphore.c - POSIX semaphores
  *
  * Built on the futex, which is what a semaphore wants: the count IS the word a
  * blocked thread sleeps on, so a waiter is woken by the same write that makes
@@ -12,6 +12,8 @@
  * waking someone who is blocked, costs a syscall.
  *
  * See <semaphore.h> for what is deliberately not implemented.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <semaphore.h>

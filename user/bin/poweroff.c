@@ -5,6 +5,8 @@
  * determines the default action. All three accept the same options.
  *
  * Implements the poweroff(8)/reboot(8)/halt(8) command per systemd manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

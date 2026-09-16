@@ -1,4 +1,7 @@
-// LikeOS-64 -- extended processor state: discovery and image helpers.
+// LikeOS -- extended processor state: discovery and image helpers.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/fpu.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>

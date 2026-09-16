@@ -1,9 +1,11 @@
 /*
- * LikeOS-64 POSIX Threads - Thread-Specific Data (TSD)
+ * LikeOS POSIX Threads - Thread-Specific Data (TSD)
  *
  * Also known as Thread-Local Storage (TLS) keys.
  * Provides pthread_key_create, pthread_key_delete, 
  * pthread_getspecific, pthread_setspecific.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <pthread.h>

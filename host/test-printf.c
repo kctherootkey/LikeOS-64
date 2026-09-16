@@ -26,6 +26,8 @@
  * it, arbitrarily far from here.
  *
  * Build and run:  ./host/test-printf.sh
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #define _GNU_SOURCE

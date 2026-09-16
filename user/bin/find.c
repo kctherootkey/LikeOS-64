@@ -9,7 +9,10 @@
  *           -links, -readable, -writable, -executable, -true, -false
  *   Actions: -print, -print0, -printf, -exec, -execdir, -delete, -ls, -prune, -quit
  *   Operators: !, -not, -a, -and, -o, -or, (, )
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

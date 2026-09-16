@@ -1,5 +1,7 @@
-// LikeOS-64 HAL - 16550 UART Serial Console (COM1)
+// LikeOS HAL - 16550 UART Serial Console (COM1)
 // Minimal polled driver for logging to QEMU -serial stdio
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/hal/serial.h>
 #include <kernel/ke/interrupt.h> // for inb/outb

@@ -1,10 +1,13 @@
-// LikeOS-64 -- the global GTT, stolen memory, and what the fuses say.
+// LikeOS -- the global GTT, stolen memory, and what the fuses say.
 //
 // The graphics function's config space says how much memory the firmware
 // stole for the device (the framebuffer it set up lives there) and how
 // large the global GTT is; BAR0's upper half is the GTT itself, one 8-byte
 // entry per 4 KB page of graphics address space.  This file decodes those
 // and reads the fuse registers that describe the render array.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>

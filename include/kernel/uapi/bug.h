@@ -1,4 +1,4 @@
-// LikeOS-64 — Central debug / assertion infrastructure
+// LikeOS — Central debug / assertion infrastructure
 //
 // Single place to define all kernel debugging macros.  Include this header
 // (directly or via a per-subsystem header) in every kernel .c file so the
@@ -21,6 +21,8 @@
 //   refcount_t                Hardened reference-counter type.
 //   refcount_set/read/inc/dec_and_test/inc_not_zero  Refcount operations.
 //   likely(x) / unlikely(x)  Branch-prediction hints.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_BUG_H_
 #define _KERNEL_BUG_H_

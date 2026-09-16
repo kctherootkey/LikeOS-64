@@ -1,4 +1,4 @@
-// LikeOS-64 -- ioctl request encoding (the conventional layout).
+// LikeOS -- ioctl request encoding (the conventional layout).
 //
 //   bits  0..7   number
 //   bits  8..15  type (a driver's magic character)
@@ -7,6 +7,9 @@
 //
 // Identical to the libc's <sys/ioctl.h>, so a request built on either side
 // decodes on the other.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_UAPI_IOCTL_H
 #define KERNEL_UAPI_IOCTL_H
 

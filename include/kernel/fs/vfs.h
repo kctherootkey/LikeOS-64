@@ -1,4 +1,7 @@
-// LikeOS-64 - Minimal VFS interface (single mount, read-only)
+// LikeOS - Minimal VFS interface (single mount, read-only)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_VFS_H
 #define LIKEOS_VFS_H
 

@@ -7,6 +7,8 @@
 # nothing else -- the sysroot is roughly 200 MB, what ships is a fraction of it.
 #
 # Usage:  stage.sh <staging-root>
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -eu
 
@@ -277,6 +279,9 @@ cp "$root/res/xorg/xorg.conf.modesetting" "$DEST/etc/X11/xorg.conf.modesetting"
 # The third: the Intel driver with glamor on, picked by xserverrc when
 # drminfo names i915 behind the node.
 cp "$root/res/xorg/xorg.conf.modesetting-i915" "$DEST/etc/X11/xorg.conf.modesetting-i915"
+# The fourth: VMware with 3D acceleration on, glamor on the SVGA3D device,
+# picked by xserverrc when drminfo names vmwgfx and --has-3d answers yes.
+cp "$root/res/xorg/xorg.conf.modesetting-vmwgfx-3d" "$DEST/etc/X11/xorg.conf.modesetting-vmwgfx-3d"
 
 # ---------------------------------------------------------------------------
 # Drop debug information.

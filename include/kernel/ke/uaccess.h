@@ -1,4 +1,9 @@
-/* User-memory access primitives shared by the syscall layer. */
+/*
+ * User-memory access primitives shared by the syscall layer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_KE_UACCESS_H
 #define _KERNEL_KE_UACCESS_H
 

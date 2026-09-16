@@ -3,7 +3,10 @@
  *
  * Declares crypt()/crypt_r().  The implementation lives in libcrypt.so and
  * hashes with yescrypt ($y$).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _CRYPT_H
 #define _CRYPT_H
 

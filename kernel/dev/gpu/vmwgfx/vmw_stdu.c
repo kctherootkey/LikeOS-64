@@ -1,4 +1,4 @@
-// LikeOS-64 -- vmwgfx: scan-out through screen targets.
+// LikeOS -- vmwgfx: scan-out through screen targets.
 //
 // The device offers three ways to put a picture on the screen, and which one
 // is right is decided by what the device advertises, not by preference:
@@ -27,6 +27,8 @@
 // device allows up to SVGA_REG_SCREENTARGET_MAX_WIDTH-sized targets and
 // several of them, and nothing below assumes there is only one beyond the
 // single id it uses.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/dev/gpu/drm_internal.h>

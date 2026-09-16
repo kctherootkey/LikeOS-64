@@ -12,6 +12,8 @@
  * works for self-tests.
  *
  * Requires: SOCK_RAW + IP_HDRINCL (raw socket access).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

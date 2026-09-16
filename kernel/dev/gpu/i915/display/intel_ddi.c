@@ -1,4 +1,4 @@
-// LikeOS-64 -- the DDI ports of Skylake.
+// LikeOS -- the DDI ports of Skylake.
 //
 // A DDI is a digital output that carries DisplayPort or HDMI depending on
 // what the board wires to it.  Bringing one up for DisplayPort: route
@@ -7,6 +7,9 @@
 // the link training through the DP_TP control register's pattern bits
 // and the sink's DPCD (intel_dp.c).  The transcoder is attached to the
 // port through TRANS_DDI_FUNC_CTL by the pipe code (intel_display.c).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

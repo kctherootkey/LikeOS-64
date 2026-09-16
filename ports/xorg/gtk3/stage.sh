@@ -11,6 +11,8 @@
 # is a working image; one that silently half-contains it is not.
 #
 # Usage:  stage.sh <staging-root>
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -eu
 

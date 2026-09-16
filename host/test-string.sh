@@ -4,6 +4,9 @@
 # Compares libc's string.c against the host glibc function by function, with
 # every destination placed against a guard page so an out-of-bounds write dies
 # where it is made.  See the comment at the top of host/test-string.c.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 OUT=${TMPDIR:-/tmp}/likeos-string-test.$$

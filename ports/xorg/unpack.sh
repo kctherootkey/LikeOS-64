@@ -15,6 +15,8 @@
 # and runs autogen.sh first, so nothing downstream has to care.
 #
 # Usage:  ./unpack.sh [package ...]      (no arguments = everything)
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -u
 

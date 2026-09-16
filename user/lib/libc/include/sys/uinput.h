@@ -1,4 +1,4 @@
-// LikeOS-64 uinput UAPI - the interface for creating an input device from
+// LikeOS uinput UAPI - the interface for creating an input device from
 // userspace, as opposed to reading one through <sys/input.h>.
 //
 // A program opens /dev/uinput, describes a device with the UI_SET_* and
@@ -16,6 +16,9 @@
 //
 // If /dev/uinput is ever implemented, nothing here changes and nothing built
 // against it needs rebuilding — the definitions are already the real ones.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _SYS_UINPUT_H
 #define _SYS_UINPUT_H
 

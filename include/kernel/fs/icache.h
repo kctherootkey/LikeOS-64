@@ -1,4 +1,4 @@
-// LikeOS-64 Inode Cache
+// LikeOS Inode Cache
 //
 // Caches per-file metadata (size, attributes, dirent location) indexed by
 // the filesystem's native inode identifier.  For FAT32 that is the file's
@@ -12,6 +12,8 @@
 // without requiring the global per-FS I/O lock.
 //
 // SMP-safe with per-bucket spinlocks and per-inode locks.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_ICACHE_H_
 #define _KERNEL_ICACHE_H_

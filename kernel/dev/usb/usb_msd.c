@@ -1,10 +1,12 @@
-// LikeOS-64 - USB Mass Storage (Bulk-Only Transport) Driver
+// LikeOS - USB Mass Storage (Bulk-Only Transport) Driver
 // Clean implementation following USB Mass Storage Class specification
 //
 // BOT Protocol:
 // 1. Send Command Block Wrapper (CBW) via bulk OUT
 // 2. Transfer data (if any) via bulk IN or OUT
 // 3. Receive Command Status Wrapper (CSW) via bulk IN
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/usb/usb_msd.h>
 #include <kernel/mm/memory.h>

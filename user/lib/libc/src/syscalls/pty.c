@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <stdio.h>

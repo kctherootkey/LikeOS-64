@@ -15,6 +15,8 @@
  * Conversions: %d %i %u %o %x %X %c %s %[...] %f %e %g %a %n %p %%, with
  * assignment suppression (*), a maximum field width, and the h/hh/l/ll/L/z/j/t
  * length modifiers.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

@@ -1,4 +1,4 @@
-# LikeOS-64 build artifacts
+# LikeOS build artifacts
 #
 # Only compiler/linker output is ignored here; all source (including the
 # third-party ports/ trees and user/ sources) stays tracked.  Verified that no

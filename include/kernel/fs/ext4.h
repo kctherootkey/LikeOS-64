@@ -1,4 +1,4 @@
-// LikeOS-64 - ext4 filesystem driver
+// LikeOS - ext4 filesystem driver
 //
 // Mount, extent/indirect block mapping, directory traversal, block allocation
 // + metadata writeback, journaling (ordered mode), metadata_csum, xattrs/ACLs,
@@ -23,6 +23,9 @@
 //   bits 62..32   : inode number (31 bits)
 //   bits 31..0    : logical block index within the file (32 bits)
 //
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_EXT4_H
 #define LIKEOS_EXT4_H
 

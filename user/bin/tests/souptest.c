@@ -18,7 +18,10 @@
  * MiniBrowser.  Then https:// synchronously, then https:// asynchronously --
  * async is how WebKit issues every request.  Timeouts throughout, because the
  * symptom is a hang and a test that hangs reports nothing.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <libsoup/soup.h>
 #include <stdio.h>
 

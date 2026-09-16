@@ -1,4 +1,4 @@
-// LikeOS-64 -- vmwgfx: dirty regions of a coherent surface.
+// LikeOS -- vmwgfx: dirty regions of a coherent surface.
 //
 // The page tracker (drm_dirty.c) answers in pages of the backing buffer;
 // the device wants boxes of texels in a subresource.  This file is the
@@ -19,6 +19,8 @@
 // kept exact, because a box drawn too small is the corruption this
 // machinery once caused: texels the client
 // wrote and the device never re-read.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/dev/gpu/vmwgfx/svga/svga3d_surfacedefs.h>

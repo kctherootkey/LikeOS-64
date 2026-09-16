@@ -1,10 +1,12 @@
-// LikeOS-64 - ChaCha20-based CSPRNG with Entropy Pool
+// LikeOS - ChaCha20-based CSPRNG with Entropy Pool
 //
 // Implements:
 //   - ChaCha20 block cipher (RFC 7539)
 //   - Entropy pool with mixing from timer jitter, interrupts, devices
 //   - /dev/random (blocking) and /dev/urandom (non-blocking) support
 //   - SipHash-2-4 for TCP ISN generation (RFC 6528)
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/rand/random.h>
 #include <kernel/ke/timer.h>

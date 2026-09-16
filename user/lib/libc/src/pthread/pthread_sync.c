@@ -1,7 +1,9 @@
 /*
- * LikeOS-64 POSIX Threads - Synchronization Primitives
+ * LikeOS POSIX Threads - Synchronization Primitives
  *
  * Read-write locks, spinlocks, and barriers.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <pthread.h>

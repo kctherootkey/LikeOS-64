@@ -1,4 +1,4 @@
-// LikeOS-64 -- DisplayPort and eDP sinks: detection, EDID, link training.
+// LikeOS -- DisplayPort and eDP sinks: detection, EDID, link training.
 //
 // A DisplayPort link is negotiated: the sink says what rates and lane
 // counts it takes (DPCD), the driver picks the least that carries the
@@ -7,6 +7,9 @@
 // saw, adjust the swing" until the sink reports every lane locked.
 // eDP is the same protocol on the internal panel, with panel power
 // sequencing around it.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

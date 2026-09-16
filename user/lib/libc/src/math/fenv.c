@@ -21,7 +21,10 @@
  * therefore paired with an FLDENV that puts a control word back, and the
  * pairing is not optional -- dropping it leaves the process unable to trap on
  * anything for the rest of its life.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <fenv.h>
 
 /* Where MXCSR keeps the exception masks: the same six bits as the flags,

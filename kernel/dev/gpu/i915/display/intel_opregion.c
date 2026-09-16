@@ -1,10 +1,13 @@
-// LikeOS-64 -- the ACPI OpRegion of Intel graphics.
+// LikeOS -- the ACPI OpRegion of Intel graphics.
 //
 // An 8 KB region in system memory, named by the ASLS config register,
 // through which firmware and driver talk about the display: the VBT is
 // inside it (or, when too large, at an address it names), and its
 // mailboxes carry the firmware's requests (backlight, display switch)
 // and the driver's declaration that it owns the display.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

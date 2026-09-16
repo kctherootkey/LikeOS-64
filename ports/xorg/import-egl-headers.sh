@@ -38,6 +38,9 @@
 #     sha256(KHR/khrplatform.h) e206a6931f98ffe1c5c7ece69c4f94bbe1c9279243f40cbe7782848a0d3fa2de
 #
 # Re-runnable: everything is a copy or an overwrite.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)

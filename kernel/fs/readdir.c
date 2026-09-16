@@ -1,4 +1,7 @@
-// LikeOS-64 -- directory reading.
+// LikeOS -- directory reading.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/fs/icache.h>

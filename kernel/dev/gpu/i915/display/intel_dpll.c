@@ -1,4 +1,4 @@
-// LikeOS-64 -- the display PLLs of Skylake.
+// LikeOS -- the display PLLs of Skylake.
 //
 // Four of them.  DPLL0 belongs to CDCLK (the firmware programmed it and
 // it is not touched); DPLL1-3 are shared between ports.  For DisplayPort a
@@ -6,6 +6,9 @@
 // dividers computed from the pixel clock.  A port is then routed to its
 // PLL through DPLL_CTRL2.  PLLs are refcounted so two ports at the same
 // DP link rate share one.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/hal/lapic.h>

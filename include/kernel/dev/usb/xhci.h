@@ -1,5 +1,8 @@
-// LikeOS-64 - xHCI (USB 3.0) Host Controller Driver
+// LikeOS - xHCI (USB 3.0) Host Controller Driver
 // Interrupt-driven implementation with synchronous transfer support
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_XHCI_H
 #define LIKEOS_XHCI_H
 

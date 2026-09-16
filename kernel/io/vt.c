@@ -1,4 +1,4 @@
-// LikeOS-64 VT (Virtual Terminal) layer
+// LikeOS VT (Virtual Terminal) layer
 // ANSI/VT100/VT220/xterm terminal emulator extracted from tty.c.
 //
 // Responsibilities:
@@ -10,6 +10,8 @@
 //   - Cell buffer: per-cell (char, fg_rgb, bg_rgb) for full alt-screen swap and dirty redraw
 //   - Dirty-row tracking: marks which rows changed; vt_flush_dirty() re-renders from cell buffer
 //   - DSR / DA / XTWINOPS terminal query replies
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/io/vt.h>
 #include <kernel/io/console.h>

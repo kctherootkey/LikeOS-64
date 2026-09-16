@@ -4,7 +4,10 @@
  * nl_langinfo(CODESET) reports "UTF-8": that is the encoding the console, the
  * terminal emulator and the tools on this system all use, and a great deal of
  * software will not enable its multibyte handling until it sees that answer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _LANGINFO_H
 #define _LANGINFO_H
 

@@ -2,6 +2,8 @@
  * pwd - print name of current/working directory
  *
  * Full implementation per pwd(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

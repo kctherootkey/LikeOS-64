@@ -1,4 +1,7 @@
-// LikeOS-64 - Block device registry
+// LikeOS - Block device registry
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/block/block.h>
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>

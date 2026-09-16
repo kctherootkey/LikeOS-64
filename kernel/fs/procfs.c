@@ -1,9 +1,12 @@
-// LikeOS-64 -- /proc: processes and a few system facts, as files.
+// LikeOS -- /proc: processes and a few system facts, as files.
 //
 // The process listing itself lives behind SYS_GETPROCINFO; this tree
 // carries the per-process paths programs open by name -- /proc/self/exe,
 // /proc/self/fd/N, /proc/<pid>/maps, cmdline -- and the classic system
 // files (uptime, meminfo, version, cpuinfo).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/pseudofs.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/vfs.h>
@@ -444,7 +447,14 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n) {
 			n->read_at = show_mem;
-			n->mode = 0400;
+			/* 0600, the conventional mode for this file: it is
+			 * the read/write window onto an inferior's address
+			 * space.  Only the read half is implemented here
+			 * (pseudofs has no write path at all), so a write
+			 * fails -- but the mode describes the file, and
+			 * show_mem() gates every access on task_may_access()
+			 * regardless of it. */
+			n->mode = 0600;
 		}
 	} else if (kstrcmp(name, "auxv") == 0) {
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);

@@ -1,4 +1,7 @@
-// LikeOS-64 Scheduling and SMP syscall wrappers
+// LikeOS Scheduling and SMP syscall wrappers
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <sched.h>
 #include <unistd.h>
 #include <errno.h>

@@ -1,7 +1,11 @@
 /* The combo PLL solver of Ice Lake and later against the link rates the
  * hardware's tables give and a few HDMI pixel clocks: every DisplayPort
  * entry must reproduce its link rate, every HDMI clock must be met
- * within 0.05% with the DCO in range. */
+ * within 0.05% with the DCO in range.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include "../include/kernel/dev/gpu/i915/intel_dpll_calc.h"

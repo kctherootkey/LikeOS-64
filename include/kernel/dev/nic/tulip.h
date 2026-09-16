@@ -1,4 +1,4 @@
-// LikeOS-64 DEC 21x4x ("Tulip") NIC Driver
+// LikeOS DEC 21x4x ("Tulip") NIC Driver
 //
 // Drives the DEC/Intel 21040 / 21041 / 21140 / 21142 / 21143 ("Tulip")
 // family of 10/100 Mbit/s PCI Ethernet controllers.  QEMU exposes
@@ -8,6 +8,8 @@
 // each 8 bytes apart in BAR0.  We use BAR0 as MMIO if the chip exposes
 // it that way (QEMU does), else fall back to PMIO via BAR0 I/O port.
 // Single TX and RX descriptor ring, "ring" mode (not chained).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_TULIP_H_
 #define _KERNEL_TULIP_H_

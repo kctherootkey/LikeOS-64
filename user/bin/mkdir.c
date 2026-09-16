@@ -2,6 +2,8 @@
  * mkdir - make directories
  *
  * Full implementation per mkdir(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

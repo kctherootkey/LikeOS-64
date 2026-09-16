@@ -1,5 +1,9 @@
 /* Private: the syscall instruction wrappers.  The numbers live in the
-   public <sys/syscall.h>. */
+   * public <sys/syscall.h>.
+   *
+   * Copyright (C) 2026 The LikeOS Project
+   */
+
 #include <sys/syscall.h>
 // Syscall numbers (must match kernel)
 

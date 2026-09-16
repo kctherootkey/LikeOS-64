@@ -1,4 +1,7 @@
-// LikeOS-64 -- HDMI infoframes (pure; see intel_infoframe.c).
+// LikeOS -- HDMI infoframes (pure; see intel_infoframe.c).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_INTEL_INFOFRAME_H
 #define KERNEL_DEV_GPU_I915_INTEL_INFOFRAME_H
 

@@ -16,6 +16,8 @@
  *   -W N      timeout in seconds          -R N      retries
  *   -N N      ndots threshold             -C        SOA from each NS
  *   -s        no SERVFAIL retry           -4        IPv4 transport
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

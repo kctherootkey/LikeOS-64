@@ -1,4 +1,7 @@
-// LikeOS-64 -- the i915 ioctl table: device parameters, contexts, spaces.
+// LikeOS -- the i915 ioctl table: device parameters, contexts, spaces.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/uapi/drm/i915_drm.h>

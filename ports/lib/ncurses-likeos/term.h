@@ -1,7 +1,10 @@
 /*
  * term.h - minimal terminfo/termcap header for LikeOS
  * Provides tigetstr/tigetnum/tputs stubs (implementation in curses.c)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _TERM_H
 #define _TERM_H
 

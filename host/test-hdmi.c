@@ -1,4 +1,7 @@
 // Host test: HDMI AVI infoframe packing and CEA video codes.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/dev/gpu/i915/intel_infoframe.h>
 #include <stdio.h>

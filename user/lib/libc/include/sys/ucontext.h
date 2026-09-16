@@ -11,7 +11,11 @@
  * registers -- and it works here.
  *
  * The register order in gregs[] is the conventional x86-64 one, so code
- * written against the REG_* names of other systems compiles unchanged. */
+ * written against the REG_* names of other systems compiles unchanged.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_UCONTEXT_H
 #define _SYS_UCONTEXT_H
 

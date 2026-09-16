@@ -24,6 +24,9 @@
 //   -d DEV  render node (/dev/dri/renderD128)
 //   -S      EGL surfaceless platform instead of GBM
 //   -v      print every paint
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

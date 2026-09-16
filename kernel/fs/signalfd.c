@@ -1,10 +1,13 @@
-// LikeOS-64 -- signalfd: receive signals by reading a descriptor.
+// LikeOS -- signalfd: receive signals by reading a descriptor.
 //
 // The signals in the mask are expected to be BLOCKED by the caller; the
 // descriptor then dequeues them into signalfd_siginfo records instead of
 // their being delivered to a handler, and poll() reports the descriptor
 // readable while one is pending.  An event loop that already sits in
 // poll() thus handles SIGCHLD or SIGTERM in line with everything else.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/device.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>

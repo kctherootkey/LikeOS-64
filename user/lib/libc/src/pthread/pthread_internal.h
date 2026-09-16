@@ -1,8 +1,10 @@
 /*
- * LikeOS-64 POSIX Threads - Internal Definitions
+ * LikeOS POSIX Threads - Internal Definitions
  *
  * Shared internal structures between pthread implementation files.
  * Not part of the public API.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _PTHREAD_INTERNAL_H

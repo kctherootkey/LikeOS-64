@@ -1,4 +1,6 @@
-// LikeOS-64 Stack Canary Support — kernel smash reporter
+// LikeOS Stack Canary Support — kernel smash reporter
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>

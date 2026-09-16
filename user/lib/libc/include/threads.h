@@ -1,4 +1,9 @@
-/* <threads.h> -- C11 threads, over the POSIX threads in this libc. */
+/*
+ * <threads.h> -- C11 threads, over the POSIX threads in this libc.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _THREADS_H
 #define _THREADS_H
 

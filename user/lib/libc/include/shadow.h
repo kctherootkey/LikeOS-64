@@ -1,6 +1,9 @@
 /*
  * shadow.h - shadow password database (/etc/shadow) for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SHADOW_H
 #define _SHADOW_H
 

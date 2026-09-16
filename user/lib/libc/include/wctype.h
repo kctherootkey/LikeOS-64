@@ -3,7 +3,10 @@
  *
  * The answers come from the Unicode Character Database (see
  * host/gen-unicode-tables.py), so these classify every script, not just ASCII.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _WCTYPE_H
 #define _WCTYPE_H
 

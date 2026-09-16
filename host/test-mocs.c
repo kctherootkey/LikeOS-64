@@ -1,5 +1,9 @@
 /* Host test: the cache-control tables (appended to the driver's own
- * table code by host/test-mocs.sh). */
+ * table code by host/test-mocs.sh).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 
 static int fails;

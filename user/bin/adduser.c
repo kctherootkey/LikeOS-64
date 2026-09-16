@@ -13,7 +13,10 @@
  *
  * Accounts are created in /etc/passwd, /etc/shadow and /etc/group; a home
  * directory is created (and seeded from /etc/skel) unless suppressed.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>

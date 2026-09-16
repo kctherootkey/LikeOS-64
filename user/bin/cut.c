@@ -5,7 +5,10 @@
  * Supports: -b, -c, -d, -f, -n, -s, -z
  *           --complement, --output-delimiter
  *           --help, --version
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

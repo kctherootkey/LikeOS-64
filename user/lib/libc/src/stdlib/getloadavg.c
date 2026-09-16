@@ -9,7 +9,10 @@
  * The kernel already maintains the three exponentially-weighted averages and
  * reports them through sysinfo(2) as fixed-point values scaled by 1 << 16, so
  * this is a conversion rather than a new mechanism.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/sysinfo.h>

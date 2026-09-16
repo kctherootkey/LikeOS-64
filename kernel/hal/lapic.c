@@ -1,6 +1,8 @@
-// LikeOS-64 - Local APIC (LAPIC) Implementation
+// LikeOS - Local APIC (LAPIC) Implementation
 // Per-CPU interrupt controller, timer, and IPI support
 // Supports both xAPIC (MMIO) and x2APIC (MSR) modes
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>

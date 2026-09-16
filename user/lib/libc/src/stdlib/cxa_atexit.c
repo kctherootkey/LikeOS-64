@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 cxa_atexit.c - Exit-time and thread-exit-time handler registration
+ * LikeOS cxa_atexit.c - Exit-time and thread-exit-time handler registration
  *
  * One list serves atexit(3), __cxa_atexit and __cxa_thread_atexit_impl, because
  * they differ only in what they record, not in when they run.  atexit() is the
@@ -24,6 +24,8 @@
  * The first block is static, so registration works before the allocator does --
  * a constructor running out of .init_array can register a destructor before
  * main(), and failing there would be silent.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdlib.h>

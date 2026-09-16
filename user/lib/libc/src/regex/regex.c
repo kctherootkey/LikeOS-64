@@ -1,5 +1,5 @@
 /*
- * regex.c - POSIX regular expressions for LikeOS-64.
+ * regex.c - POSIX regular expressions for LikeOS.
  *
  * Supports both flavours POSIX defines:
  *   BRE (default)      \(..\) groups, \{m,n\} bounds, backreferences \1..\9;
@@ -17,6 +17,8 @@
  * backtracker finds, so every path from a given start position is explored
  * and the longest overall match wins; `steps` bounds that exploration so a
  * pathological pattern degrades to "best found so far" instead of hanging.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <regex.h>

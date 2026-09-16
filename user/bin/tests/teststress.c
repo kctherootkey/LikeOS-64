@@ -1,4 +1,7 @@
 // teststress - stress test program that runs random commands in a loop
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

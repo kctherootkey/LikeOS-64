@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <errno.h>

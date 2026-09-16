@@ -14,7 +14,10 @@
  * Deliberately uses write(2) rather than <iostream>: iostreams are themselves
  * set up by a static constructor in libstdc++, so printing through them cannot
  * report that constructors did not run.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <chrono>
 #include <string>
 #include <vector>

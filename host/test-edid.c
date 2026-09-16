@@ -1,4 +1,9 @@
-/* Tests for the EDID parser and the standard mode table.  See test-edid.sh. */
+/*
+ * Tests for the EDID parser and the standard mode table.  See test-edid.sh.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
 #include <kernel/dev/gpu/drm_edid.h>

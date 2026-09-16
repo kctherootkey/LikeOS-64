@@ -1,4 +1,7 @@
-// LikeOS-64 ICMP (Internet Control Message Protocol)
+// LikeOS ICMP (Internet Control Message Protocol)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/timer.h>

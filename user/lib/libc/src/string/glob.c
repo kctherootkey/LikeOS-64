@@ -3,6 +3,8 @@
  *
  * Supports basic wildcard patterns (* and ?) in filenames.
  * Used by GNU nano for nanorc "include" directives.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <glob.h>

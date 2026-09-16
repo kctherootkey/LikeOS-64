@@ -1,4 +1,7 @@
-// LikeOS-64 -- the socket-layer syscalls.
+// LikeOS -- the socket-layer syscalls.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

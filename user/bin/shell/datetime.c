@@ -1,4 +1,4 @@
-// LikeOS-64 -- datetime, the standalone clock.
+// LikeOS -- datetime, the standalone clock.
 //
 // Two lines, right-aligned, in the arrangement the Windows 11 taskbar uses:
 //
@@ -12,6 +12,8 @@
 // Since taskbar(1) took over the desktop bar this is no longer started by
 // xinitrc.  It is kept because the stacked form is the nicer one when it has a
 // window to itself.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include "panel.h"
 

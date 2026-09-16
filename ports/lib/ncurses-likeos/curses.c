@@ -7,7 +7,7 @@
  *
  * Based on the ncurses 6.5 API (source in ports/lib/ncurses-6.5/).
  *
- * Copyright (C) 2026 LikeOS Project
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include "curses.h"

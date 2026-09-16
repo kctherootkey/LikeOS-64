@@ -1,4 +1,7 @@
-// LikeOS-64 -- /sys: PCI devices and character device classes.
+// LikeOS -- /sys: PCI devices and character device classes.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/sysfs.h>
 #include <kernel/fs/pseudofs.h>
 #include <kernel/fs/vfs.h>

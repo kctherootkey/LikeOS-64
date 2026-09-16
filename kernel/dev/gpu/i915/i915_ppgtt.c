@@ -1,4 +1,4 @@
-// LikeOS-64 -- per-process graphics address spaces (Gen8+ 4-level tables).
+// LikeOS -- per-process graphics address spaces (Gen8+ 4-level tables).
 //
 // A 48-bit address space of the same shape as the CPU's: a page map
 // level 4 of 512 entries to page directory pointers, to page directories,
@@ -6,6 +6,9 @@
 // that lead to one scratch page, so the hardware never walks into an
 // absent entry (which it treats as a fault and stops on).  Tables are
 // allocated as ranges are bound and kept until the space dies.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/io/console.h>

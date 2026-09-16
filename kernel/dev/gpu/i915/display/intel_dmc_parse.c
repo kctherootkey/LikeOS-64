@@ -1,9 +1,12 @@
-// LikeOS-64 -- parsing the display microcontroller's firmware package.
+// LikeOS -- parsing the display microcontroller's firmware package.
 //
 // Pure: fixed-width types only, no kernel services, so the build host's
 // compiler can run it against a synthetic package (host/test-dmc.sh).
 // Every multi-byte field is read byte-wise: the file is little-endian
 // and not necessarily aligned in memory.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/intel_dmc.h>
 
 #define CSS_HEADER_SIZE 128

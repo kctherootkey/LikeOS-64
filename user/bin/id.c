@@ -4,7 +4,10 @@
  * Usage: id [OPTION]... [USER]...
  * Print user and group information for each specified USER, or (when USER is
  * omitted) for the current process.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

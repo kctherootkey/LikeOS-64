@@ -1,4 +1,8 @@
-/* getline.c / getdelim.c - line-reading functions for LikeOS libc */
+/*
+ * getline.c / getdelim.c - line-reading functions for LikeOS libc
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 #include <stdio.h>
 #include <stdlib.h>

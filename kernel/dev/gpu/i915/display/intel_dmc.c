@@ -1,4 +1,4 @@
-// LikeOS-64 -- loading the display microcontroller (DMC).
+// LikeOS -- loading the display microcontroller (DMC).
 //
 // The DMC is a small controller in the display engine that runs the
 // display's deep power states: with the pipes idle it can power the
@@ -15,6 +15,9 @@
 // state this driver does not track yet; with the states off the display
 // simply stays powered, which is what every other part of the driver
 // assumes.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

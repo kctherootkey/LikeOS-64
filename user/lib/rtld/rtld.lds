@@ -1,4 +1,8 @@
-/* ld-likeos.so linker script */
+/*
+ * ld-likeos.so linker script
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)

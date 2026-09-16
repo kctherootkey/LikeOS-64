@@ -1,5 +1,9 @@
 /* Host test: the link-rate encoding of the display PLLs (appended to the
- * driver's own two functions by host/test-dpll.sh). */
+ * driver's own two functions by host/test-dpll.sh).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 
 static int fails;

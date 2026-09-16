@@ -4,7 +4,10 @@
  * Not installed: <wctype.h> and <wchar.h> are the public face of this.  The
  * tables themselves live in unicode.c, which host/gen-unicode-tables.c
  * produces.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _LIBC_UNICODE_H
 #define _LIBC_UNICODE_H
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+
 /*
  * Framework for buffer objects that can be shared across devices/subsystems.
  *
@@ -15,6 +16,8 @@
  *
  * You should have received a copy of the GNU General Public License along with
  * this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _DMA_BUF_UAPI_H_

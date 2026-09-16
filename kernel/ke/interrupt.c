@@ -1,4 +1,7 @@
-// LikeOS-64 Interrupt Management
+// LikeOS Interrupt Management
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/irq.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/interrupt.h>

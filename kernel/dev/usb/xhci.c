@@ -1,4 +1,4 @@
-// LikeOS-64 - xHCI (USB 3.0) Host Controller Driver
+// LikeOS - xHCI (USB 3.0) Host Controller Driver
 // Interrupt-driven implementation with synchronous transfer API
 //
 // Design principles:
@@ -6,6 +6,8 @@
 // 2. Properly handle ring wraparound with link TRBs
 // 3. Use interrupt-driven completion with synchronous wait API
 // 4. Clear, simple state machine for transfers
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/usb/xhci.h>
 #include <kernel/dev/usb/usb.h>

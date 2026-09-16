@@ -4,7 +4,11 @@
  * stack; setcontext() resumes such a record; makecontext() rewrites one so
  * that resuming it calls a function on a stack of the caller's choosing;
  * swapcontext() saves the current context and resumes another in one step.
- * Coroutine libraries and green-thread schedulers are built on these. */
+ * Coroutine libraries and green-thread schedulers are built on these.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _UCONTEXT_H
 #define _UCONTEXT_H
 

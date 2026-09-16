@@ -18,7 +18,10 @@
  * An unsupported name fails in iconv_open with EINVAL, which is what callers
  * check -- so a program offering an encoding menu simply reports that one
  * unavailable instead of misconverting.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <iconv.h>
 #include <errno.h>
 #include <stdlib.h>

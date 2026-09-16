@@ -1,4 +1,7 @@
-// LikeOS-64 Network Rate-Limit Infrastructure
+// LikeOS Network Rate-Limit Infrastructure
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/ratelimit.h>
 #include <kernel/ke/timer.h>
 #include <kernel/uapi/bug.h>

@@ -1,6 +1,9 @@
 /*
  * utime.h — file access and modification time for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _UTIME_H
 #define _UTIME_H
 

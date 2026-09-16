@@ -1,4 +1,7 @@
-// LikeOS-64 ELF64 Loader Definitions
+// LikeOS ELF64 Loader Definitions
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_ELF_H_
 #define _KERNEL_ELF_H_
 

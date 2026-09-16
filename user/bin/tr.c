@@ -11,7 +11,10 @@
  * Ranges: CHAR1-CHAR2
  * Repeats: [CHAR*] [CHAR*REPEAT]
  * Escape sequences: \\ \a \b \f \n \r \t \v \NNN (octal)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

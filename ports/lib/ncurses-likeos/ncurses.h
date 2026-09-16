@@ -1,7 +1,10 @@
 /*
  * ncurses.h - ncurses compatibility wrapper for LikeOS
  * Just includes curses.h (as ncurses.h does in real ncurses)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _NCURSES_H
 #define _NCURSES_H
 

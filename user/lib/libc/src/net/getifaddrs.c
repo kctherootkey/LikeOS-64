@@ -1,4 +1,6 @@
 // getifaddrs / freeifaddrs — built atop NET_GET_IFACE_INFO.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <ifaddrs.h>
 #include <netdb.h>

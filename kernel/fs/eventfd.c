@@ -1,4 +1,4 @@
-// LikeOS-64 -- eventfd: a 64-bit counter behind a descriptor.
+// LikeOS -- eventfd: a 64-bit counter behind a descriptor.
 //
 // write() adds to the counter, read() returns it and zeroes it (or, in
 // semaphore mode, returns 1 and decrements), poll() says readable when it
@@ -6,6 +6,9 @@
 // event loops (GLib's GWakeup, a compositor's frame clock) use to wake
 // themselves from another thread through the same poll() they already sit
 // in.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/device.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>

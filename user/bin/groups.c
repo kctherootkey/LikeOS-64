@@ -4,7 +4,10 @@
  * Usage: groups [OPTION]... [USERNAME]...
  * Print group memberships for each USERNAME or, if none is specified, for the
  * current process.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

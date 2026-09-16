@@ -1,5 +1,7 @@
-// LikeOS-64 - USB Core Utilities
+// LikeOS - USB Core Utilities
 // Generic USB helper functions
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/usb/usb.h>
 #include <kernel/io/console.h>

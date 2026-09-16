@@ -1,4 +1,4 @@
-// LikeOS-64 -- display-manager core (the DRM interface), kernel side.
+// LikeOS -- display-manager core (the DRM interface), kernel side.
 //
 // One device = one GPU with a primary node (/dev/dri/cardN: mode setting,
 // master/authentication, everything) and a render node (/dev/dri/renderDN:
@@ -7,6 +7,9 @@
 // buffer sharing across processes (PRIME / dma-buf), fences (sync_file),
 // mode objects and the event/vblank machinery, and calls the backend for
 // what touches hardware.  The core never includes a backend header.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_DRM_H
 #define KERNEL_DEV_GPU_DRM_H
 
@@ -516,6 +519,24 @@ struct drm_driver {
 	const char *date;
 	int major, minor, patch;
 	uint32_t cursor_w, cursor_h; /* 0 = no hw cursor */
+
+	/* How this driver's object handles are numbered.
+	 *
+	 * 0: a handle is the object's slot in the file's own table -- small,
+	 * dense, reused lowest-first, meaningful only to that file.  That is
+	 * what every graphics library assumes: Mesa's i915 backend sizes a
+	 * per-submission array by the largest handle VALUE in the batch, so
+	 * with the other numbering a file that had been opened 25th carried
+	 * a 6.5 MB allocation and clear on every frame, growing with each
+	 * open of the device until malloc failed.
+	 *
+	 * 1: the file's id rides in the handle's upper half, so a handle
+	 * names one object device-wide and another process can resolve it
+	 * (drm_gem_lookup_foreign).  Only vmwgfx wants this: its surface ids
+	 * are passed between processes by value, X server to client, and
+	 * its graphics library never indexes by them.  Everything else
+	 * leaves it 0. */
+	int global_handles;
 
 	/* file lifetime */
 	int (*open)(struct drm_device *dev, struct drm_file *fp);

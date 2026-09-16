@@ -1,4 +1,7 @@
-// LikeOS-64 Network Subsystem - Device Registry and Initialization
+// LikeOS Network Subsystem - Device Registry and Initialization
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/dev/nic/e1000.h>
 #include <kernel/dev/nic/e1000e.h>

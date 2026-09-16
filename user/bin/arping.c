@@ -16,6 +16,8 @@
  *   -q        quiet output              -b        broadcast only
  *   -D        duplicate address detect  -A        ARP reply mode
  *   -U        unsolicited ARP mode      -V        version
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

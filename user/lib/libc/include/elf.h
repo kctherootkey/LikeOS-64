@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 elf.h - ELF64 object file format
+ * LikeOS elf.h - ELF64 object file format
  *
  * The declarations a program needs to read the format it is itself loaded
  * from.  <link.h> uses the program-header pieces; anything examining a binary
@@ -9,6 +9,8 @@
  * ELF64 only, which is the only class this system runs.  A 32-bit binary is
  * not something the kernel loads, so declaring Elf32_* here would describe a
  * file nothing can execute.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _ELF_H

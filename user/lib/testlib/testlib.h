@@ -1,7 +1,9 @@
 /*
- * LikeOS-64 test shared library header
+ * LikeOS test shared library header
  *
  * This library is used to verify dlopen/dlsym/dlclose functionality.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _TESTLIB_H

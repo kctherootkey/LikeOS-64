@@ -3,6 +3,9 @@
 #
 # Compares libc's hyperbolic functions against the host glibc across their
 # whole domains.  See the comment at the top of host/test-math.c.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 TMP=${TMPDIR:-/tmp}/likeos-math-test.$$

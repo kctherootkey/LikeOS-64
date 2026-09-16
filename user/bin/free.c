@@ -4,6 +4,8 @@
  * Usage: free [options]
  *
  * Full implementation per the free(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

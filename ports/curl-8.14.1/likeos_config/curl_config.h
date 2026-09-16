@@ -1,14 +1,16 @@
-/* curl_config.h — Hand-crafted configuration header for LikeOS-64.
+/* curl_config.h — Hand-crafted configuration header for LikeOS.
  *
  * This file plays the role of the autoconf-generated lib/curl_config.h.
  * It is included (indirectly) by every curl source file via curl_setup.h
  * when HAVE_CONFIG_H is defined, which we pass on the compiler command line.
  *
  * Architecture: x86-64 (LP64 — sizeof(long) == sizeof(void*) == 8)
- * Platform:     LikeOS-64 (custom POSIX-compatible OS)
+ * Platform:     LikeOS (custom POSIX-compatible OS)
  * TLS backend:  OpenSSL 3.5.6
  * HTTP/2:       nghttp2 1.65.0
  * Compression:  zlib 1.3.1
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef CURL_CONFIG_LIKEOS_H

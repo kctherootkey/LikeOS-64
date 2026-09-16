@@ -1,4 +1,8 @@
-/* LikeOS-64 User Program Linker Script */
+/*
+ * LikeOS User Program Linker Script
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 ENTRY(_entry)
 

@@ -1,6 +1,8 @@
-// LikeOS-64 - ACPI Implementation using ACPICA Reference Implementation
+// LikeOS - ACPI Implementation using ACPICA Reference Implementation
 // RSDP, RSDT/XSDT, and MADT parsing for CPU enumeration
 // AML evaluation delegated to ACPICA
+//
+// Copyright (C) 2026 The LikeOS Project
 
 // ACPICA headers (must be included before kernel acpi.h to avoid macro conflicts)
 #include "acpica/include/acpi.h"

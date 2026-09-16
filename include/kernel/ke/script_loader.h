@@ -1,4 +1,7 @@
-// LikeOS-64 - shebang (#!) script loader for execve()
+// LikeOS - shebang (#!) script loader for execve()
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_SCRIPT_LOADER_H_
 #define _KERNEL_SCRIPT_LOADER_H_
 

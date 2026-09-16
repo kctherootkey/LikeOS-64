@@ -35,6 +35,8 @@
  * for why it must not scale.
  *
  * Usage: gen-cursors <output-directory>
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>
@@ -742,7 +744,7 @@ int main(int argc, char **argv)
 	 * looked for there before falling back to the core font. */
 	fprintf(f, "[Icon Theme]\n"
 		   "Name=LikeOS\n"
-		   "Comment=LikeOS-64 cursors\n"
+		   "Comment=LikeOS cursors\n"
 		   "Inherits=Adwaita\n");
 	fclose(f);
 

@@ -5,7 +5,10 @@
  * since the kernel does not enforce per-task resource limits.  RLIMIT_NOFILE
  * is the exception -- the fd table is a fixed size, so that one is answered
  * honestly.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <sys/resource.h>
 #include <string.h>
 #include <errno.h>

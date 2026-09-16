@@ -1,4 +1,4 @@
-// LikeOS-64 -- register access and forcewake for Intel graphics.
+// LikeOS -- register access and forcewake for Intel graphics.
 //
 // The GT's register file is not always powered: the hardware puts render,
 // media and GT-common units to sleep on their own, and a register read
@@ -7,6 +7,9 @@
 // wait for the acknowledge -- and every GT register access below takes
 // the domains its offset belongs to, refcounted so nested users pay once.
 // Display registers need none.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/hal/lapic.h>

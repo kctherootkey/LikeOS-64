@@ -1,4 +1,9 @@
-/* sys/statvfs.h - filesystem statistics (POSIX interface) */
+/*
+ * sys/statvfs.h - filesystem statistics (POSIX interface)
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_STATVFS_H
 #define _SYS_STATVFS_H
 

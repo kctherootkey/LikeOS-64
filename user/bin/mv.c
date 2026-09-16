@@ -2,6 +2,8 @@
  * mv - move (rename) files
  *
  * Full implementation per mv(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

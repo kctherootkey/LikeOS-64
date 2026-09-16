@@ -14,6 +14,8 @@
  *   -i   IP address(es)      -I   all IP addresses
  *   -s   short hostname      -v   verbose
  *   -V   version             -n   node name
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

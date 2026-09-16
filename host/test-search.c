@@ -17,7 +17,10 @@
  * The two implementations coexist by the same trick as the other host tests:
  * search.c is compiled on its own and objcopy renames every symbol it defines
  * or calls, so glibc's tsearch and this one can be called from one program.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 /* tdestroy is a GNU extension and the host header hides it otherwise. */
 #define _GNU_SOURCE
 #include <search.h>

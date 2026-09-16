@@ -5,7 +5,10 @@
  * /etc/shadow via crypt(); account management rejects unknown or locked
  * accounts; sessions and credential establishment are no-ops.  No /etc/pam.d
  * configuration or loadable modules yet - keep it simple, extend later.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <security/pam_appl.h>
 #include <stdlib.h>
 #include <string.h>

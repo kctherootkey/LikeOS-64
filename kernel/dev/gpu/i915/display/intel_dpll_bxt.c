@@ -1,4 +1,4 @@
-// LikeOS-64 -- the port PHY PLLs of Broxton and Gemini Lake.
+// LikeOS -- the port PHY PLLs of Broxton and Gemini Lake.
 //
 // Every DDI here has a PLL of its own inside its PHY, programmed with a
 // feedback divider (integer and fraction), a reference divider and two
@@ -7,6 +7,9 @@
 // powered and initialised by the firmware for the ports it lit; a PHY
 // found off is brought up here.  Signal levels are register writes
 // into the PHY's transmitter words, not a DDI translation table.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

@@ -4,7 +4,10 @@
  * Usage: whoami [OPTION]...
  * Print the user name associated with the current effective user ID.
  * Same as id -un.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

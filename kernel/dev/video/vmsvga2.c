@@ -1,4 +1,4 @@
-// LikeOS-64 VMware SVGA II display driver
+// LikeOS VMware SVGA II display driver
 //
 // Supports the SVGA II virtual display adapter exposed by VMware products,
 // QEMU ("-vga vmware") and VirtualBox ("VMSVGA").  Every optional feature is
@@ -8,6 +8,8 @@
 //
 // See include/kernel/dev/video/vmsvga2.h for the architecture and locking
 // model overview.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/video/vmsvga2.h>
 #include <kernel/dev/video/fb.h>

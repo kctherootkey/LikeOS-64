@@ -18,6 +18,8 @@
  * A failure in the unwinder does not report itself: a throw with no usable
  * tables calls std::terminate, so the process aborts rather than printing a
  * wrong answer.  That is why "caught" being printed at all is most of the test.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <cstdio>
@@ -180,7 +182,7 @@ static void test_thread_local(void)
 int main(void)
 {
 	std::printf("\n========================================\n");
-	std::printf("  LikeOS-64 C++ runtime tests\n");
+	std::printf("  LikeOS C++ runtime tests\n");
 	std::printf("========================================\n\n");
 
 	std::atexit(report_at_exit);

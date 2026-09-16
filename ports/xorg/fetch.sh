@@ -28,6 +28,8 @@
 # absorbed.  A mismatch fails the fetch and leaves the record alone.
 #
 # Usage:  ./fetch.sh [package ...]      (no arguments = everything)
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -u
 

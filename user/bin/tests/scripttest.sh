@@ -1,5 +1,8 @@
 #!/bin/sh
-# LikeOS-64 shebang self-test.  Run as:  SCRIPTTEST_MARK=1 scripttest.sh one two
+# LikeOS shebang self-test.  Run as:  SCRIPTTEST_MARK=1 scripttest.sh one two
+#
+# Copyright (C) 2026 The LikeOS Project
+
 echo "scripttest: interpreted by /bin/sh, script=$0"
 echo "scripttest: argc=$# arg1=$1 arg2=$2"
 echo "scripttest: HOME=$HOME PATH=$PATH"

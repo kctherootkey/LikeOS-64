@@ -1,4 +1,4 @@
-// LikeOS-64 -- the Gen9 null render state: the batch that puts the
+// LikeOS -- the Gen9 null render state: the batch that puts the
 // whole 3D pipeline into a valid, empty state.
 //
 // The render engine comes out of reset with its pipeline state
@@ -15,6 +15,9 @@
 // mapped; everything it points at lies in the same page after the
 // commands.  It ends with MI_BATCH_BUFFER_END at word 885; the
 // words after that are the state it points at.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_renderstate.h>
 
 /* byte offsets of the 64-bit addresses to relocate */

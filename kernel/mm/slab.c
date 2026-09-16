@@ -1,6 +1,8 @@
-// LikeOS-64 SLAB Allocator Implementation
+// LikeOS SLAB Allocator Implementation
 // Dynamic kernel heap using size-class caches for efficient allocation
 // Maps physical pages to kernel virtual address space
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/mm/slab.h>
 #include <kernel/mm/memory.h>

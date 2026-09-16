@@ -1,5 +1,5 @@
 /* ============================================================================
- * ld-likeos.so  —  LikeOS-64 Runtime Dynamic Linker
+ * ld-likeos.so  —  LikeOS Runtime Dynamic Linker
  *
  * Self-contained (no libc dependency).  The kernel loads this as the ELF
  * interpreter (PT_INTERP) at a fixed high address (0x7F0000000000).
@@ -19,7 +19,10 @@
  *   - __tls_get_addr   (compiler-generated TLS access)
  *   - _dl_fixup        (lazy PLT resolution)
  *   - _rtld_dlopen / _rtld_dlsym / _rtld_dlclose / _rtld_dlerror
- * ========================================================================= */
+ * =========================================================================
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 #include "rtld_syscall.h"
 

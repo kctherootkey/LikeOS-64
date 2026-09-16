@@ -1,5 +1,7 @@
-// LikeOS-64 Framebuffer Optimization System
+// LikeOS Framebuffer Optimization System
 // High-performance double buffering, write-combining, and SSE-optimized rendering
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_FB_OPTIMIZE_H_
 #define _KERNEL_FB_OPTIMIZE_H_

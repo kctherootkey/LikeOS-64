@@ -11,7 +11,10 @@
  * search.  A property that holds over a contiguous block costs one entry
  * no matter how many code points the block spans, which is why the whole
  * of Unicode fits in a few kilobytes here.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include "unicode.h"
 
 int __uni_in_range(const struct range *tab, size_t n, unsigned cp)

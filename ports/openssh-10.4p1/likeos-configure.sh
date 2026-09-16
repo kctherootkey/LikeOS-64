@@ -1,5 +1,5 @@
 #!/bin/sh
-# likeos-configure.sh — configure OpenSSH for the LikeOS-64 target.
+# likeos-configure.sh — configure OpenSSH for the LikeOS target.
 #
 # Runs the stock autoconf configure through the LikeOS cross-compiler wrapper
 # (likeos-cc), then applies the handful of config.h corrections the cross probe
@@ -10,6 +10,9 @@
 #   * disable utmpx (no utmpx database on this platform)
 #
 # Idempotent: re-running reconfigures from scratch.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 cd "$(dirname "$0")"
 
@@ -68,4 +71,4 @@ enable HAVE_STRUCT_STATVFS_F_NAMEMAX
 # no utmpx database on this platform
 enable DISABLE_UTMPX
 
-echo "likeos-configure.sh: OpenSSH configured for LikeOS-64"
+echo "likeos-configure.sh: OpenSSH configured for LikeOS"

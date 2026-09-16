@@ -4,7 +4,10 @@
  * Light-weight version that only pulls in what portable applications
  * (notably tmux/libevent) need.  intmax_t / uintmax_t alias int64_t and
  * uint64_t since we are LP64 only.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _INTTYPES_H
 #define _INTTYPES_H
 

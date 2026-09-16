@@ -1,4 +1,7 @@
-// LikeOS-64 Kernel Initialization
+// LikeOS Kernel Initialization
+//
+// Copyright (C) 2026 The LikeOS Project
+
 void vmwgfx_init(void);
 int i915_init(void);
 void drm_console_start_worker(void);
@@ -139,9 +142,9 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 	 * hardcoded "v0.2" while uname already reported the real one.  The
 	 * fallback mirrors the one in sys_uname for a build without the define. */
 #ifdef LIKEOS_VERSION
-	kprintf("\nLikeOS-64 Kernel v%s\n\n", LIKEOS_VERSION);
+	kprintf("\nLikeOS Kernel v%s\n\n", LIKEOS_VERSION);
 #else
-	kprintf("\nLikeOS-64 Kernel\n\n");
+	kprintf("\nLikeOS Kernel\n\n");
 #endif
 	console_set_color(15, 0);
 

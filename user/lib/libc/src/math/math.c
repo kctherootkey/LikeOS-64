@@ -4,7 +4,10 @@
  * Just enough to satisfy ports (tmux uses fabs/fmod/round).  The
  * implementations operate on the bit-pattern of `double` directly so
  * they need no FP register tricks beyond what GCC emits inline.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <math.h>
 #include <stdint.h>
 

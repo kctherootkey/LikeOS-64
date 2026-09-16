@@ -1,5 +1,7 @@
-// LikeOS-64 I/O Subsystem - Keyboard Driver
+// LikeOS I/O Subsystem - Keyboard Driver
 // PS/2 keyboard input handling and device management
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/input/keyboard.h>
 #include <kernel/ke/interrupt.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 -- a minimal I2C transfer interface.
+// LikeOS -- a minimal I2C transfer interface.
 //
 // Display hardware carries several small I2C masters: the GMBUS controller
 // of an integrated graphics device, a GPIO pair bit-banged when that
@@ -6,6 +6,9 @@
 // offers.  What reads through them -- an EDID block from a monitor, a
 // DDC/CI register -- does not care which.  This is the common shape: a
 // message list, one transfer entry point, no bus enumeration.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_I2C_H
 #define KERNEL_DEV_I2C_H
 

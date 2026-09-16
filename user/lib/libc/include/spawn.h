@@ -11,7 +11,10 @@
  *
  * Here it is implemented on fork+exec (see src/stdlib/spawn.c) with exactly
  * that error pipe, which is what the interface is worth on this system.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SPAWN_H
 #define _SPAWN_H
 

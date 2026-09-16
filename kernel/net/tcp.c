@@ -1,4 +1,7 @@
-// LikeOS-64 TCP (Transmission Control Protocol)
+// LikeOS TCP (Transmission Control Protocol)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/io/tty.h>

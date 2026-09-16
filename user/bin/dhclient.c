@@ -21,6 +21,8 @@
  *   -H   send hostname        -F   send FQDN
  *   -V   vendor class         -R   request options list
  *   -I   client identifier    -timeout N  lease timeout
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

@@ -2,6 +2,8 @@
  * more - display the contents of a file in a terminal
  *
  * Full implementation per more(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

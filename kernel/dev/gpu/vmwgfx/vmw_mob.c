@@ -1,4 +1,7 @@
-// LikeOS-64 -- vmwgfx: command buffers, MOBs and object tables.
+// LikeOS -- vmwgfx: command buffers, MOBs and object tables.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

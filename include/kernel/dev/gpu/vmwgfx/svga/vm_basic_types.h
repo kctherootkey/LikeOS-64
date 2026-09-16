@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
+
 /**********************************************************
  *
  * Copyright (c) 2024 Broadcom.
  * The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
  *
+ *
+ * Copyright (C) 2026 The LikeOS Project
  **********************************************************/
+
 #ifndef VM_BASIC_TYPES_H
 #define VM_BASIC_TYPES_H
 

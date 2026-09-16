@@ -14,6 +14,8 @@
 //
 // The same probe produces the width tables in the C library, so the two agree
 // by construction rather than by inspection.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/io/unicode.h>
 

@@ -1,4 +1,4 @@
-// LikeOS-64 -- the GT side of the Intel graphics driver: engines, address
+// LikeOS -- the GT side of the Intel graphics driver: engines, address
 // spaces, contexts, requests.
 //
 // An engine (render, blitter, video...) executes work from a ring buffer
@@ -8,6 +8,9 @@
 // in some address space, run by one engine under one context, whose
 // completion is a sequence number the engine writes and a fence the
 // driver signals.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_GT_H
 #define KERNEL_DEV_GPU_I915_GT_H
 

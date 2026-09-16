@@ -1,4 +1,7 @@
-// LikeOS-64 UNIX Domain Sockets
+// LikeOS UNIX Domain Sockets
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/waitq.h>
 #include <kernel/net/net.h>
 #include <kernel/mm/memory.h>

@@ -1,8 +1,10 @@
 /*
- * LikeOS-64 POSIX Threads (pthreads) Header
+ * LikeOS POSIX Threads (pthreads) Header
  * 
  * Provides threading primitives: threads, mutexes, condition variables,
  * read-write locks, spinlocks, barriers, and thread-specific data.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _PTHREAD_H

@@ -1,4 +1,7 @@
-// LikeOS-64 - FAT32 read-only skeleton
+// LikeOS - FAT32 read-only skeleton
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_FAT32_H
 #define LIKEOS_FAT32_H
 

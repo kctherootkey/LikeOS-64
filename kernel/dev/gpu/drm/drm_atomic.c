@@ -1,4 +1,4 @@
-// LikeOS-64 -- display-manager core: atomic mode setting.
+// LikeOS -- display-manager core: atomic mode setting.
 //
 // A request is a state: every plane, CRTC and connector with the value it
 // would have once the request is applied.  The state starts as a copy of
@@ -13,6 +13,9 @@
 // and the kernel console's mode set -- are translated into such states
 // here for a driver that has atomic entry points, so that driver has one
 // path to program the hardware through, not six.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/dev/gpu/drm_edid.h>

@@ -103,7 +103,10 @@
  *   -k       accept any TLS certificate
  *   -v       one line per finished load
  *   -q       no per-second timeline
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

@@ -1,5 +1,9 @@
 /* Host test: the ranges an address space has given out (appended to the
- * driver's own list logic by host/test-vma.sh). */
+ * driver's own list logic by host/test-vma.sh).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 #include <string.h>
 

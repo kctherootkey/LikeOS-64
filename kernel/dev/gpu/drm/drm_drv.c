@@ -1,5 +1,8 @@
-// LikeOS-64 -- display-manager core: devices, files, ioctl dispatch,
+// LikeOS -- display-manager core: devices, files, ioctl dispatch,
 // events, the primary/render nodes.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/uapi/ioctl.h>
@@ -20,7 +23,7 @@
 
 #define DRM_MAJOR 226
 #define DRM_RENDER_MINOR_BASE 128
-#define DEVFS_GID_VIDEO 44
+/* DEVFS_GID_VIDEO / DEVFS_GID_RENDER: <kernel/dev/device.h>, via drm.h. */
 
 int drm_copy_from_user(void *dst, const void *user, size_t n)
 {
@@ -949,9 +952,14 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 	n = &dev->node_render;
 	ksnprintf(n->path, sizeof(n->path), "/dev/dri/renderD%d",
 		  DRM_RENDER_MINOR_BASE + dev->index);
-	n->mode = 0666;
+	/* 0660 root:render, like the primary node is 0660 root:video.  The
+	 * render node was world-readable and -writable, which made its group
+	 * ownership decorative: any account could submit command buffers to
+	 * the GPU and map the buffers it produced.  A client that needs
+	 * off-screen rendering joins `render' now. */
+	n->mode = 0660;
 	n->uid = 0;
-	n->gid = DEVFS_GID_VIDEO;
+	n->gid = DEVFS_GID_RENDER;
 	n->major = DRM_MAJOR;
 	n->minor = (uint32_t)(DRM_RENDER_MINOR_BASE + dev->index);
 	n->ops = &drm_node_ops;

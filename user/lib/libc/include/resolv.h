@@ -14,6 +14,8 @@
  * servers to try in order, `search' the domains appended to an unqualified
  * name, and `options timeout:' / `options attempts:' how long and how often to
  * wait.  It is read once per res_init(), not once per query.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _RESOLV_H

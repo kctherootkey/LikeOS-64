@@ -1,10 +1,12 @@
-// LikeOS-64 evdev input core - /dev/input/eventN
+// LikeOS evdev input core - /dev/input/eventN
 //
 // Standard event-device interface for display servers (xf86-input-evdev):
 // input_event records via read(), capability/identity ioctls, exclusive
 // grabs.  Two fixed devices: unit 0 = keyboard, unit 1 = mouse.  The
 // keyboard/mouse drivers feed raw events here in parallel with the cooked
 // tty path; a grab suppresses the tty path entirely.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_DEV_INPUT_EVDEV_H_
 #define _KERNEL_DEV_INPUT_EVDEV_H_

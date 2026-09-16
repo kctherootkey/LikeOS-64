@@ -1,4 +1,4 @@
-// LikeOS-64 -- character devices with driver-supplied operations.
+// LikeOS -- character devices with driver-supplied operations.
 //
 // The original device nodes (ttys, /dev/fb0, /dev/input/event*, /dev/shm)
 // are wired into devfs by name, with their ioctl, mmap and poll behaviour
@@ -14,6 +14,9 @@
 // from the descriptor layer's point of view, dup(), fork(), exec(),
 // close() refcounting, fstat(), poll() and descriptor passing over AF_UNIX
 // all work on it with no special cases.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_DEVICE_H
 #define KERNEL_DEV_DEVICE_H
 
@@ -24,6 +27,19 @@ struct task;
 struct poll_table;
 struct kstat;
 struct devfs_node;
+
+/* Group owners for device nodes.  The numbers must match /etc/group on the
+ * root filesystem (res/etc/group).  They live here rather than next to each
+ * user so devfs's built-in nodes and a driver's registered ones cannot drift
+ * apart -- the DRM driver used to carry its own copy of DEVFS_GID_VIDEO. */
+#define DEVFS_GID_TTY 5
+#define DEVFS_GID_VIDEO 44
+#define DEVFS_GID_INPUT 104
+/* Render nodes are a separate group from `video' by de-facto Unix convention:
+ * membership grants the use of the GPU for computation and off-screen
+ * rendering, but not access to a display's scanout -- which is what makes it
+ * safe to give to an ordinary account. */
+#define DEVFS_GID_RENDER 108
 
 /* Describes what a driver's ->mmap wants mapped.  The driver fills it in;
  * the memory manager builds the page tables from it.  Pages named here are

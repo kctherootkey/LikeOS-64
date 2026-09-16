@@ -1,6 +1,8 @@
 // getaddrinfo / freeaddrinfo / gai_strerror / gethostbyname /
 // getservbyname / getservbyport — minimal RFC 3493 implementation
 // using on-system /etc/services + /etc/hosts and the kernel DNS resolver.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <netdb.h>
 #include <arpa/inet.h>

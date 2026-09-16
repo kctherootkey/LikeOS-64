@@ -9,7 +9,10 @@
  * the scheduling affinity mask.  --all reports the configured count instead;
  * the two are the same here because processors are never taken offline at
  * runtime.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

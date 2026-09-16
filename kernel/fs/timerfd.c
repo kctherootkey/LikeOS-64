@@ -1,10 +1,13 @@
-// LikeOS-64 -- timerfd: a timer whose expirations are read from a
+// LikeOS -- timerfd: a timer whose expirations are read from a
 // descriptor and waited for with poll().
 //
 // read() returns the number of expirations since the last read (8 bytes)
 // and blocks, or says EAGAIN, when there are none.  Built on the
 // high-resolution timer queue, so a one-shot or periodic deadline is met
 // to the microsecond rather than to the scheduler tick.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/device.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>

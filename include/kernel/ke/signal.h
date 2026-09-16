@@ -1,4 +1,7 @@
-// LikeOS-64 Signal Definitions
+// LikeOS Signal Definitions
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_SIGNAL_H_
 #define _KERNEL_SIGNAL_H_
 

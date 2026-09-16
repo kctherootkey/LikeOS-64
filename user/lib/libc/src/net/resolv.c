@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 resolv.c - DNS stub resolver
+ * LikeOS resolv.c - DNS stub resolver
  *
  * The raw query interface: build a DNS message, send it to the servers named
  * in /etc/resolv.conf, and hand the reply back unparsed.  getaddrinfo() answers
@@ -15,6 +15,8 @@
  * Truncated replies are retried over TCP, which matters more than it sounds:
  * a TXT record set routinely exceeds the 512 bytes UDP carries, and a caller
  * that never retries sees a valid-looking answer with records missing.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <resolv.h>

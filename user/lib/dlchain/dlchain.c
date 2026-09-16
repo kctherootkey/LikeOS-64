@@ -5,6 +5,8 @@
  * has to load, relocate and initialise libdlbase.so as a side effect.  Every
  * function here reaches into that dependency, so if the loader skipped it the
  * calls return the wrong value or fault instead of quietly appearing to work.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 extern int dlbase_value(void);

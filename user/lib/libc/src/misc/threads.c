@@ -1,4 +1,9 @@
-/* C11 <threads.h> over pthreads. */
+/*
+ * C11 <threads.h> over pthreads.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <threads.h>
 #include <errno.h>
 #include <stdint.h>

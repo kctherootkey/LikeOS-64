@@ -6,6 +6,9 @@
 # at face value puts every buffer in the upper half of the space far out
 # of range, which is what the driver did before.  Run from the
 # repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-execaddr-test.$$
 trap 'rm -rf "$TMP"' EXIT

@@ -5,6 +5,8 @@
 # read.  See ../build.sh for why the two ports share one set of scripts.
 #
 # Usage:  ./clean.sh [-a]               (-a also removes the downloaded tarballs)
+#
+# Copyright (C) 2026 The LikeOS Project
 
 here=$(cd "$(dirname "$0")" && pwd)
 exec env LIKEOS_PORT_DIR="$here" "$here/../clean.sh" "$@"

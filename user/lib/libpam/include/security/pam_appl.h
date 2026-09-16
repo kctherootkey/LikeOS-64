@@ -5,7 +5,10 @@
  * application entry points backed by a single built-in "unix" policy (shadow +
  * crypt).  There is no /etc/pam.d parsing or dynamically loaded modules yet.
  * The function signatures and constants match Linux-PAM so callers port easily.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SECURITY_PAM_APPL_H
 #define _SECURITY_PAM_APPL_H
 

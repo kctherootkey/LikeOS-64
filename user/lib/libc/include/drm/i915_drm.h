@@ -1,4 +1,4 @@
-/* LikeOS-64 -- the i915 user interface.
+/* LikeOS -- the i915 user interface.
  *
  * The ioctls, parameters and structures a client of an integrated Intel
  * graphics device uses.  Binary-compatible with the upstream i915 uAPI:
@@ -6,6 +6,7 @@
  * the Mesa driver for this hardware runs unchanged.  Written for this
  * kernel; comments describe what each thing means here.
  */
+
 #ifndef _UAPI_I915_DRM_H_
 #define _UAPI_I915_DRM_H_
 

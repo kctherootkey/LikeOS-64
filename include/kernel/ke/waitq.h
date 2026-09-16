@@ -30,7 +30,10 @@
  * keystroke).  The lock covers the list only; task states are changed through
  * the scheduler's own claim protocol, which is what makes a concurrent wake
  * and timeout safe.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _KERNEL_WAITQ_H_
 #define _KERNEL_WAITQ_H_
 

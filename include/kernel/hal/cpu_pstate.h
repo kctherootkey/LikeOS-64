@@ -1,4 +1,7 @@
-// LikeOS-64 CPU P-state / HWP configuration
+// LikeOS CPU P-state / HWP configuration
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_HAL_CPU_PSTATE_H_
 #define _KERNEL_HAL_CPU_PSTATE_H_
 

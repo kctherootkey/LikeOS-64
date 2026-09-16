@@ -1,4 +1,9 @@
-/* Syscall entry points. */
+/*
+ * Syscall entry points.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_KE_SYSCALLS_H
 #define _KERNEL_KE_SYSCALLS_H
 

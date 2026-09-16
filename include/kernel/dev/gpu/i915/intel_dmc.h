@@ -1,4 +1,4 @@
-// LikeOS-64 -- the display microcontroller's firmware image (pure parser).
+// LikeOS -- the display microcontroller's firmware image (pure parser).
 //
 // The DMC firmware package: a CSS header (the signed-module wrapper),
 // a package header listing one image per silicon stepping, and per
@@ -6,6 +6,9 @@
 // loading) followed by the program.  intel_dmc_parse() picks the image
 // for a stepping and checks it; intel_dmc.c writes it into the
 // controller's memory.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DMC_H
 #define KERNEL_DEV_GPU_I915_INTEL_DMC_H
 

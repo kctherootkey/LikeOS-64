@@ -1,5 +1,8 @@
-// LikeOS-64 -- the null render state (pure: fixed-width types only, so
+// LikeOS -- the null render state (pure: fixed-width types only, so
 // the host tests compile it).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_RENDERSTATE_H
 #define KERNEL_DEV_GPU_I915_RENDERSTATE_H
 

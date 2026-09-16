@@ -18,7 +18,10 @@
  * "to end of file" (l_len == 0).  Locks are stored as given rather than merged:
  * merging adjacent ranges would save table slots but makes the unlock path much
  * harder to get right, and the callers here lock whole files.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

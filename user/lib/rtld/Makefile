@@ -1,4 +1,6 @@
-# Makefile for ld-likeos.so — LikeOS-64 runtime dynamic linker
+# Makefile for ld-likeos.so — LikeOS runtime dynamic linker
+#
+# Copyright (C) 2026 The LikeOS Project
 
 CC      = gcc
 AS      = gcc

@@ -1,8 +1,10 @@
-// LikeOS-64 -- shared drawing for the desktop panel and its widgets.
+// LikeOS -- shared drawing for the desktop panel and its widgets.
 //
 // See panel.h for what this is and why it exists: the clock and the load
 // monitor are drawn by these functions whether they are running as their own
 // programs or as areas inside the taskbar, so the two cannot drift apart.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include "panel.h"
 

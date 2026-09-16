@@ -15,6 +15,8 @@
 # Usage:
 #   clean.sh      remove unpacked trees, stamps, logs, sysroot and host tools
 #   clean.sh -a   also remove the downloaded tarballs
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -u
 

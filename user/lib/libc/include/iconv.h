@@ -1,6 +1,9 @@
 /*
  * iconv.h - character set conversion, as specified by POSIX.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _ICONV_H
 #define _ICONV_H
 

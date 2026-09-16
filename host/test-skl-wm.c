@@ -1,5 +1,9 @@
 /* Host test: the display watermark levels (appended to the driver's own
- * computation by host/test-skl-wm.sh). */
+ * computation by host/test-skl-wm.sh).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 
 static int fails;

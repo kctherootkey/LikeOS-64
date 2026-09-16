@@ -3,6 +3,8 @@
  *
  * Full implementation per less(1) manpage.
  * A pager program for viewing text files with backward/forward navigation.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

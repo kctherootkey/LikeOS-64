@@ -4,7 +4,10 @@
  * Modelled on the BSD libutil interface so portable terminal applications
  * (notably tmux) can build unmodified.  The implementations live in
  * src/syscalls/pty_util.c and use posix_openpt + ioctl(TIOCSCTTY).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _UTIL_H
 #define _UTIL_H
 

@@ -14,7 +14,10 @@
  * Two deliberate divergences are asserted rather than compared: glibc's
  * converter accepts F5 80 80 80 as U+140000 and F8 as a five-byte lead, both
  * of which RFC 3629 removed from UTF-8.  Matching it there would be a bug.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

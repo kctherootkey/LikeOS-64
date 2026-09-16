@@ -1,4 +1,4 @@
-// LikeOS-64 Dentry Cache
+// LikeOS Dentry Cache
 //
 // Caches the results of directory lookups keyed by
 // (parent_inode_id, case-insensitive name hash).  parent_inode_id is
@@ -16,6 +16,8 @@
 // Uses a hash table with per-bucket spinlocks for SMP safety.
 // A global LRU doubly-linked list provides eviction ordering when
 // the cache exceeds DC_MAX_ENTRIES.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/dcache.h>
 #include <kernel/mm/memory.h>

@@ -31,7 +31,10 @@
  * unprivileged tracer is attached -- the exec still runs, it just does not
  * raise the ids.  Otherwise attaching to a program that is about to run a
  * set-id binary would be a way to inherit its identity.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_PTRACE_H
 #define _SYS_PTRACE_H
 

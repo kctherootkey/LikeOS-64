@@ -1,4 +1,4 @@
-// LikeOS-64 -- the Video BIOS Tables (pure: the host tests compile it).
+// LikeOS -- the Video BIOS Tables (pure: the host tests compile it).
 //
 // The firmware describes the board's display wiring in a table the
 // driver cannot do without: which DDI ports exist and what they carry,
@@ -7,6 +7,9 @@
 // a BIOS data block header, and a chain of tagged blocks; the layout of
 // several blocks changed with the BDB version, which the parser honours
 // where the fields it needs moved.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/intel_display.h>
 #include <kernel/dev/gpu/drm_edid.h>
 

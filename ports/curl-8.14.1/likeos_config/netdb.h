@@ -7,7 +7,10 @@
  * (e.g.  `1 = 1`) and the compiler rejects them with "expected identifier
  * before numeric constant".  Undefine the conflicting names right after
  * pulling in the system header so only curl's own enum definition is used.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include_next <netdb.h>
 
 #undef DNS_TYPE_A

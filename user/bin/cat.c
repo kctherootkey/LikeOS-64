@@ -2,6 +2,8 @@
  * cat - concatenate files and print on the standard output
  *
  * Full implementation per cat(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

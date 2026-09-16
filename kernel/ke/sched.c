@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 per-CPU preemptive scheduler
+ * LikeOS per-CPU preemptive scheduler
  *
  * Round-robin over per-CPU run queues, O(1) enqueue and dequeue, no priorities:
  * every runnable task gets SCHED_TIME_SLICE ticks before the timer preempts it.
@@ -9,6 +9,8 @@
  * lock of the processor named by task->on_cpu, and on_cpu changes only under
  * that lock -- so re-read on_cpu after locking, because the task may have
  * migrated in the window between reading it and taking its lock.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <kernel/fs/file.h>

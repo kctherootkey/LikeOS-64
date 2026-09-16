@@ -1,13 +1,15 @@
-# Makefile.likeos - cross-build of tmux 3.6a for LikeOS-64.
+# Makefile.likeos - cross-build of tmux 3.6a for LikeOS.
 #
 # Links dynamically against:
-#   - libc.so      (LikeOS-64 libc - PIE-friendly)
+#   - libc.so      (LikeOS libc - PIE-friendly)
 #   - libevent.so  (built from ports/lib/libevent-2.1.12)
-#   - ncurses.so   (LikeOS-64 ncurses-likeos port)
+#   - ncurses.so   (LikeOS ncurses-likeos port)
 #   - ld-likeos.so (dynamic loader)
 #
 # Position-independent executable produced via the user_dyn.lds linker
 # script, matching the convention used for nano(1) and the other ports.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 LIBC_DIR     := ../../user/lib/libc
 RTLD_DIR     := ../../user/lib/rtld

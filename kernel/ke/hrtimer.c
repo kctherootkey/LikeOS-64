@@ -1,4 +1,7 @@
-// LikeOS-64 -- high-resolution timers on an HPET comparator.
+// LikeOS -- high-resolution timers on an HPET comparator.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

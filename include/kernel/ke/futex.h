@@ -1,7 +1,9 @@
-// LikeOS-64 Futex (Fast Userspace Mutex) Subsystem
+// LikeOS Futex (Fast Userspace Mutex) Subsystem
 // ============================================================================
 // Hash-bucket implementation for scalable futex operations
 // ============================================================================
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_FUTEX_H_
 #define _KERNEL_FUTEX_H_

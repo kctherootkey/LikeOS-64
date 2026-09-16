@@ -2,6 +2,9 @@
 # Host test for the Ice Lake+ combo PLL solver
 # (kernel/dev/gpu/i915/display/intel_dpll_calc.c).  Run from the
 # repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-dpll-icl-test.$$
 trap 'rm -rf "$TMP"' EXIT

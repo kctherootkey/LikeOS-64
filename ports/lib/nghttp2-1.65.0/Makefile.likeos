@@ -1,4 +1,4 @@
-# Makefile.likeos - build nghttp2 1.65.0 as a shared library for LikeOS-64.
+# Makefile.likeos - build nghttp2 1.65.0 as a shared library for LikeOS.
 #
 # Outputs:
 #   libnghttp2.so.14       (HTTP/2 framing library)
@@ -8,6 +8,8 @@
 #   config.h (from ./configure --enable-lib-only run on the host) for
 #   platform detection, then link as an ELF shared object following the
 #   libevent/ncurses pattern used throughout LikeOS ports.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 LIBC_DIR  := ../../../user/lib/libc
 RTLD_DIR  := ../../../user/lib/rtld

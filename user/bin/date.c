@@ -5,6 +5,8 @@
  *        date [-u|--utc|--universal] [MMDDhhmm[[CC]YY][.ss]]
  *
  * Full implementation per the date(1) manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

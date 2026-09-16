@@ -29,7 +29,10 @@
  * Every chunk is printed as it arrives, so a run that stops mid-body still
  * shows how far it got and whether the final read returned 0 (a premature
  * end-of-body) or never came back at all (a lost wakeup).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <libsoup/soup.h>
 #include <stdio.h>
 #include <string.h>

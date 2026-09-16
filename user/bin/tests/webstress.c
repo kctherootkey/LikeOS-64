@@ -29,7 +29,10 @@
  * TLS slow -> handshake data path (the browser's "Broken pipe"/"Connection
  * reset" handshake errors would show here too, as FAILED lines); HTTP slow
  * with the rest fast -> libsoup/session layer above them all.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <libsoup/soup.h>
 #include <gio/gio.h>
 #include <netdb.h>

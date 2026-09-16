@@ -1,5 +1,7 @@
-// LikeOS-64 - xHCI Boot Integration
+// LikeOS - xHCI Boot Integration
 // High-level interface for boot-time USB initialization and polling
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/xhci_boot.h>
 #include <kernel/dev/hid/usb_hid.h>

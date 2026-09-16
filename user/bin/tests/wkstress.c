@@ -43,7 +43,10 @@
  * contention will not break any other way.
  *
  * Exit status is 0 when every call in every round did what it promised.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>

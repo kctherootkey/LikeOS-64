@@ -1,4 +1,4 @@
-// LikeOS-64 -- interrupt registration.
+// LikeOS -- interrupt registration.
 //
 // A driver asks for an interrupt line and gives a handler; the dispatcher
 // calls every handler registered on the vector that fired and acknowledges
@@ -16,6 +16,9 @@
 //   irq_request_msi()     allocate a vector, enable MSI on the PCI device
 //                         aimed at a CPU, register the handler.
 //   irq_request_msix()    the same over an MSI-X table entry.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_KE_IRQ_H
 #define KERNEL_KE_IRQ_H
 

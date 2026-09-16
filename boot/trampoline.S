@@ -14,6 +14,8 @@
 #   RDI = kernel_entry (virtual address)
 #   RSI = boot_info (pointer)
 #   RDX = pml4_addr (physical address of page tables)
+#
+# Copyright (C) 2026 The LikeOS Project
 
 .section .text
 .global trampoline_jump

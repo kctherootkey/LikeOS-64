@@ -1,4 +1,7 @@
-// LikeOS-64 -- interrupt registration and dispatch.
+// LikeOS -- interrupt registration and dispatch.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/irq.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

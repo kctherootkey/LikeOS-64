@@ -1,4 +1,7 @@
-// LikeOS-64 -- mmap, munmap and brk.
+// LikeOS -- mmap, munmap and brk.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/device.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>
@@ -16,6 +19,91 @@
 /* The mmap region table lives in the mm layer: mm_find_mmap_region(),
  * mm_alloc_mmap_region() and mm_unmap_range_and_regions() (kernel/mm/memory.c,
  * declared in kernel/mm/memory.h). */
+
+/* ---- mmap address selection: BEGIN (host/test-mmap-gap.sh cuts from here) ----
+ *
+ * Where a mapping that names no address of its own is placed.
+ *
+ * This used to be a cursor: mmap_base started 4 MB under the stack and every
+ * such mapping moved it down by its own length, for good -- munmap never
+ * moved it back up, and nothing looked at what was already there.  The
+ * loader places every shared library with MAP_FIXED, bottom-up from
+ * 0x7f0000000000, so the two allocators grew towards each other with no
+ * fence between them.  A process that maps and unmaps a few megabytes per
+ * frame (a graphics driver's per-submission scratch) spends address space
+ * at that rate, and an hour in the cursor is inside the libraries: the next
+ * mapping is recorded ON TOP of a library's text or data, two records
+ * describe the same pages, and when the scratch is unmapped the library's
+ * pages go with it.  What is left re-faults as zeros -- a GOT slot that
+ * reads 0, text that executes as zeros -- long after and nowhere near the
+ * cause.
+ *
+ * So the address comes from the region table instead: the highest gap
+ * below the ceiling that holds `length' bytes and overlaps no record.
+ * Top-down first fit, the conventional layout, so a freed range is reused
+ * and the area never marches anywhere.  The floor keeps the 4 MB margin
+ * above the heap the cursor had.
+ *
+ * The table is not sorted, so each step is one walk for the lowest start
+ * among the records overlapping the candidate, and the candidate then moves
+ * to just below it.  Every step lowers `end', so it terminates; the common
+ * case -- the top gap is free, which is what unmapping the previous frame's
+ * scratch leaves behind -- is a single walk.  Pure over its arguments so
+ * the build host can check it. */
+static uint64_t mmap_gap_search(const mmap_region_t *regions, uint32_t n,
+				uint64_t ceiling, uint64_t floor,
+				uint64_t length)
+{
+	uint64_t end = ceiling;
+
+	if (length == 0 || ceiling < floor)
+		return 0;
+	while (end >= floor && end - floor >= length) {
+		uint64_t start = end - length;
+		uint64_t block = 0;
+		int blocked = 0;
+
+		for (uint32_t i = 0; i < n; i++) {
+			const mmap_region_t *r = &regions[i];
+
+			if (!r->in_use || r->length == 0)
+				continue;
+			if (r->start < end && start < r->start + r->length) {
+				if (!blocked || r->start < block)
+					block = r->start;
+				blocked = 1;
+			}
+		}
+		if (!blocked)
+			return start;
+		/* Everything from `block' up to `end' is spoken for. */
+		end = block & ~(uint64_t)(PAGE_SIZE - 1);
+	}
+	return 0;
+}
+/* ---- mmap address selection: END ---- */
+
+/* The search above, over this address space: bounded by mmap_hwm like every
+ * other lookup (nothing above it is in use), the ceiling 4 MB under the
+ * stack as the cursor's starting point was, the floor 4 MB above the heap
+ * and never below the first 64 KB.  Shared with mremap's move, which had a
+ * second copy of the cursor and the same fault. */
+uint64_t mmap_find_gap(task_t *cur, uint64_t length)
+{
+	/* A task built by the kernel rather than exec has no stack top on
+	 * record (sched.c leaves it 0); the conventional top serves. */
+	uint64_t top =
+		cur->user_stack_top ? cur->user_stack_top : USER_STACK_TOP;
+	uint64_t ceiling = top - (4 * 1024 * 1024);
+	uint64_t floor = cur->brk + (4 * 1024 * 1024);
+	uint32_t n = cur->mmap_hwm;
+
+	if (floor < 0x10000)
+		floor = 0x10000;
+	if (n > cur->mmap_capacity)
+		n = cur->mmap_capacity;
+	return mmap_gap_search(cur->mmap_regions, n, ceiling, floor, length);
+}
 
 static int64_t sys_brk_locked(uint64_t new_brk)
 {
@@ -161,22 +249,15 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		 * would report the old file and protection for these pages. */
 		mm_unmap_range_and_regions(cur, vaddr, length);
 	} else {
-		// Allocate from mmap area (grows down from below stack)
-		// Move base down first, then return the new base as the start of the mapped region
-		cur->mmap_base -= length;
-		if (cur->mmap_base < cur->brk + (4 * 1024 * 1024)) {
-			// Too close to heap
-			cur->mmap_base += length; // Rollback
+		vaddr = mmap_find_gap(cur, length);
+		if (!vaddr) {
 			ret = -ENOMEM;
 			goto out;
 		}
-		// Security: Reject mappings below 64KB to prevent NULL deref exploits
-		if (cur->mmap_base < 0x10000) {
-			cur->mmap_base += length; // Rollback
-			ret = -ENOMEM;
-			goto out;
-		}
-		vaddr = cur->mmap_base;
+		/* mmap_base is a low-water mark now, kept for reporting; it is
+		 * no longer the cursor, so nothing below rolls it back. */
+		if (vaddr < cur->mmap_base)
+			cur->mmap_base = vaddr;
 	}
 
 	/* Claim a region record only now, AFTER the MAP_FIXED teardown above:
@@ -219,9 +300,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			"mmap: pid %d out of mmap regions (max %d): %d file-backed, %d anonymous (%llu KB), %d lazy",
 			cur->id, TASK_MAX_MMAP, n_file, n_anon,
 			(unsigned long long)(anon_bytes / 1024), n_lazy);
-		/* The address was already carved out of the mmap area. */
-		if (!(flags & MAP_FIXED))
-			cur->mmap_base += length;
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -324,8 +402,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 					     cl += PAGE_SIZE)
 						mm_unmap_page_in_address_space(
 							cur->pml4, vaddr + cl);
-					if (!(flags & MAP_FIXED))
-						cur->mmap_base += length;
 					ret = -ENOMEM;
 					goto out;
 				}
@@ -362,8 +438,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			page_flags | PAGE_DEVICE | PAGE_WRITE_THROUGH;
 
 		if (!dev_phys) {
-			if (!(flags & MAP_FIXED))
-				cur->mmap_base += length; // Rollback
 			ret = -ENODEV;
 			goto out;
 		}
@@ -374,8 +448,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 				for (uint64_t cl = 0; cl < off; cl += PAGE_SIZE)
 					mm_unmap_page_in_address_space(
 						cur->pml4, vaddr + cl);
-				if (!(flags & MAP_FIXED))
-					cur->mmap_base += length; // Rollback
 				ret = -ENOMEM;
 				goto out;
 			}
@@ -423,8 +495,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			dm.flags = flags;
 			rc = dops->mmap(backing, &dm);
 			if (rc < 0 || !dm.page_phys) {
-				if (!(flags & MAP_FIXED))
-					cur->mmap_base += length;
 				ret = rc < 0 ? rc : -ENODEV;
 				goto out;
 			}
@@ -445,8 +515,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 					     cl += PAGE_SIZE)
 						mm_unmap_page_in_address_space(
 							cur->pml4, vaddr + cl);
-					if (!(flags & MAP_FIXED))
-						cur->mmap_base += length;
 					if (dm.put)
 						dm.put(dm.obj);
 					ret = -ENOMEM;
@@ -528,9 +596,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 				mm_unmap_page_in_address_space(cur->pml4,
 							       vaddr + cleanup);
 			}
-			if (!(flags & MAP_FIXED)) {
-				cur->mmap_base += length; // Rollback
-			}
 			ret = -ENOMEM;
 			goto out;
 		}
@@ -562,9 +627,6 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			     cleanup += PAGE_SIZE) {
 				mm_unmap_page_in_address_space(cur->pml4,
 							       vaddr + cleanup);
-			}
-			if (!(flags & MAP_FIXED)) {
-				cur->mmap_base += length; // Rollback
 			}
 			ret = -ENOMEM;
 			goto out;

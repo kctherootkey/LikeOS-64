@@ -1,10 +1,12 @@
 /*
- * LikeOS-64 platform shim for OpenSSL 3.x
+ * LikeOS platform shim for OpenSSL 3.x
  *
  * Included via -include in every compilation unit when building with the
  * likeos-x86_64 Configure target.  Provides the handful of POSIX/Linux-isms
  * that OpenSSL assumes but that LikeOS exposes under slightly different names
  * or that need small compile-time adjustments.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _OPENSSL_OS_DEP_LIKEOS_H

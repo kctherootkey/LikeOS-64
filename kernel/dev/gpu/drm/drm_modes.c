@@ -1,10 +1,13 @@
-// LikeOS-64 -- standard display timings (pure: the host tests compile it).
+// LikeOS -- standard display timings (pure: the host tests compile it).
 //
 // Three sources of modes for a display that gives none, or too few, of its
 // own: the VESA DMT list of fixed timings, the CEA-861 video codes that
 // televisions use, and the CVT and GTF formulas that derive timings from a
 // geometry.  Timings are what the pixel clock and the sync generator are
 // programmed with, so unlike a virtual device's these have to be right.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm_edid.h>
 
 /* ---- helpers ------------------------------------------------------------- */

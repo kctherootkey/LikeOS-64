@@ -5,7 +5,10 @@
  * are present on BSD but absent from the LikeOS userland C library.
  * All additions are guarded by __LIKEOS__ so the file is a no-op on a
  * standard system.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _COMPAT_LIKEOS_H
 #define _COMPAT_LIKEOS_H
 

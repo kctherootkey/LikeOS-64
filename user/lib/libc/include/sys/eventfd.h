@@ -3,7 +3,11 @@
  * write() adds to it, read() takes it (all of it, or 1 in semaphore mode)
  * and blocks while it is zero, poll() reports readable while it is not.
  * The wake-up primitive event loops use to interrupt a poll() from another
- * thread. */
+ * thread.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_EVENTFD_H
 #define _SYS_EVENTFD_H
 

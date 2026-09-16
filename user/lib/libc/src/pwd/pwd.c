@@ -4,7 +4,10 @@
  * Each line is "name:passwd:uid:gid:gecos:dir:shell".  The reentrant helpers
  * parse a line in place inside a caller-supplied buffer; the classic entry
  * points wrap them with static storage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>

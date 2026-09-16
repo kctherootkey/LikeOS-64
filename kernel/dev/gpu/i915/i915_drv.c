@@ -1,4 +1,4 @@
-// LikeOS-64 -- Intel integrated graphics: probe and the DRM backend.
+// LikeOS -- Intel integrated graphics: probe and the DRM backend.
 //
 // The device is found on the PCI bus, named from the table, and brought
 // up in layers: registers and forcewake, the global GTT and stolen
@@ -6,6 +6,9 @@
 // can refuse, and a refusal at any point tears down what came before and
 // leaves the machine on the boot framebuffer -- the driver's presence
 // must never cost a screen.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/uapi/drm/i915_drm.h>

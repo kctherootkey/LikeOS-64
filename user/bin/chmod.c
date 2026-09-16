@@ -6,6 +6,8 @@
  * ([ugoa]*([-+=]([rwxXst]*|[ugo]))+, comma-separated), plus the options
  * -c/--changes, -f/--silent/--quiet, -v/--verbose, -R/--recursive,
  * --reference=RFILE, --preserve-root/--no-preserve-root, --help, --version.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

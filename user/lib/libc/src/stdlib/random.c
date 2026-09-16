@@ -15,7 +15,10 @@
  *
  * None of this is suitable for anything security-related — getrandom(2) is the
  * source for that.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdlib.h>
 #include <stdint.h>
 

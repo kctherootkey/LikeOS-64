@@ -4,7 +4,10 @@
  * Each line is "name:hash:lstchg:min:max:warn:inact:expire:flag".  Empty
  * numeric fields decode to -1.  /etc/shadow is mode 0600, so these calls only
  * succeed for a privileged (root) reader.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <shadow.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 - ext4 filesystem driver
+// LikeOS - ext4 filesystem driver
 //
 // A full read/write ext4 driver: extent + indirect block mapping, directory
 // traversal, allocation and metadata writeback, symlinks/hard links, journaling
@@ -11,6 +11,8 @@
 //
 // The block-chain integration uses self-describing block ids — see the
 // big comment in include/kernel/fs/ext4.h.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/ext4.h>
 #include <kernel/io/console.h>

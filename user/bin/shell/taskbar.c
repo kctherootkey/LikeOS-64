@@ -1,4 +1,4 @@
-// LikeOS-64 -- taskbar, the desktop shell's panel.
+// LikeOS -- taskbar, the desktop shell's panel.
 //
 // A Windows 2000-style bar across the bottom of the screen:
 //
@@ -29,6 +29,8 @@
 // with a GTK theme that has its own ideas.  Drawing it directly is less code
 // than overriding all of that, and the hit-testing is a handful of rectangle
 // comparisons because the layout is computed in one place (layout()).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include "panel.h"
 

@@ -1,4 +1,4 @@
-// LikeOS-64 -- the memory object control tables of Intel graphics.
+// LikeOS -- the memory object control tables of Intel graphics.
 //
 // Every surface a batch touches names, in a few bits of its state, an
 // entry of a table that says how the engine caches it: whether reads
@@ -17,6 +17,9 @@
 // one table for the render engine, two entries a register; it belongs
 // to the render context, so besides being written as registers it is
 // loaded from the batch whose saved state becomes the golden image.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>

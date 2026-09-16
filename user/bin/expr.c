@@ -21,7 +21,10 @@
  * rather than on the token: "10" is a string until something asks it to be a
  * number.  That is modelled below by keeping the string always and converting
  * on demand.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

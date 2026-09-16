@@ -1,4 +1,4 @@
-// LikeOS-64 -- the GuC: firmware load, the command transport, submission.
+// LikeOS -- the GuC: firmware load, the command transport, submission.
 //
 // The GuC is a microcontroller in the GT.  Loaded with its firmware it
 // can own command submission (the host registers contexts and asks
@@ -14,6 +14,9 @@
 // driver was written on takes no GuC by this policy.  The register
 // and message formats are those of firmware major version 70, which is
 // the version named in the device table.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>

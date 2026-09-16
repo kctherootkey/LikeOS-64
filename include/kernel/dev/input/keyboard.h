@@ -1,5 +1,7 @@
-// LikeOS-64 I/O Subsystem - Keyboard Driver Interface
+// LikeOS I/O Subsystem - Keyboard Driver Interface
 // PS/2 keyboard device management and input processing
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_KEYBOARD_H_
 #define _KERNEL_KEYBOARD_H_

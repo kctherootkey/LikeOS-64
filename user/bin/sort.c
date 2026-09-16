@@ -5,7 +5,10 @@
  * Supports: -b, -d, -f, -g, -i, -M, -h, -n, -R, -r, -V
  *           -c, -C, -k, -m, -o, -s, -t, -u, -z
  *           --help, --version
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

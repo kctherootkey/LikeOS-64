@@ -1,7 +1,9 @@
-// LikeOS-64 Realtek RTL8139 NIC Driver
+// LikeOS Realtek RTL8139 NIC Driver
 // Supports the RTL8139 (vendor 0x10EC, device 0x8139) PCI 10/100 Ethernet
 // controller as emulated by QEMU `-device rtl8139` and most real
 // RTL8139/RTL8139C/RTL8139C+ silicon.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_RTL8139_H_
 #define _KERNEL_RTL8139_H_

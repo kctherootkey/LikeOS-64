@@ -3,7 +3,11 @@
  * Usage: ext4test [base]   (default base /tmp/ext4test)
  *   - xattr tests run on   <base>.dat
  *   - htree tests run in   <base>.d/
- * Run, then on the host: sudo e2fsck -fn /dev/sdbN  (must stay clean). */
+ * Run, then on the host: sudo e2fsck -fn /dev/sdbN  (must stay clean).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>

@@ -1,9 +1,12 @@
-// LikeOS-64 -- reading a display's EDID over DDC.
+// LikeOS -- reading a display's EDID over DDC.
 //
 // The sink answers at I2C address 0x50; block 0 at offset 0, extension
 // blocks after it, the segment register (0x30) selecting each pair of
 // blocks beyond the first two.  Retried: a panel that has just been
 // powered answers late, and a monitor's DDC is slow.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/dev/i2c.h>

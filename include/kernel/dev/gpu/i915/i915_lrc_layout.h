@@ -1,9 +1,12 @@
-// LikeOS-64 -- the logical ring context image layout (pure: fixed-width
+// LikeOS -- the logical ring context image layout (pure: fixed-width
 // types only, so the host tests compile it).
 //
 // What the hardware saves and restores when it switches contexts: a page
 // of hardware status followed by the register state, laid out as the
 // MI_LOAD_REGISTER_IMM sequences the context restore executes.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_LRC_LAYOUT_H
 #define KERNEL_DEV_GPU_I915_LRC_LAYOUT_H
 

@@ -1,4 +1,4 @@
-// LikeOS-64 -- the kernel console as a display-manager client.
+// LikeOS -- the kernel console as a display-manager client.
 //
 // Who owns the screen while the machine boots.
 //
@@ -29,6 +29,9 @@
 // console's own before anything it draws can appear.  drm_console_suspend()
 // and drm_console_resume() are those two moments; the DRM core calls them
 // when a master is set and dropped.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/dev/video/fb.h>

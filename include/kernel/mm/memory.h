@@ -1,5 +1,7 @@
-// LikeOS-64 Memory Management - Interface
+// LikeOS Memory Management - Interface
 // Physical Memory Manager, Paging, and Kernel Allocator (kalloc)
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef MEMORY_H
 #define MEMORY_H
@@ -518,6 +520,11 @@ struct mmap_region *mm_find_mmap_region(struct task *task, uint64_t addr);
 /* Claim a free, zeroed region slot (in_use stays false -- the caller sets it
  * once the mapping is fully built), or NULL when the table is full. */
 struct mmap_region *mm_alloc_mmap_region(struct task *task);
+/* Where a mapping with no address of its own goes: the highest gap under the
+ * ceiling that holds `length' bytes and overlaps no record, or 0 when there
+ * is none.  Defined in kernel/mm/mmap.c; mremap's move uses the same choice.
+ * Caller holds the address space's write lock. */
+uint64_t mmap_find_gap(struct task *cur, uint64_t length);
 /* Tear down every mapping in [addr, addr+length): free the pages AND release
  * or trim the records covering them.  Returns 1 if anything was found.  Both
  * munmap and MAP_FIXED must use this -- freeing pages without releasing the

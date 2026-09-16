@@ -1,5 +1,7 @@
-// LikeOS-64 Poll / Select / Epoll Implementation
+// LikeOS Poll / Select / Epoll Implementation
 // Multiplexed I/O for sockets, pipes, and regular file descriptors
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
 #include <kernel/ke/sched.h>

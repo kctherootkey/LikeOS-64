@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 clone() system call wrapper
+ * LikeOS clone() system call wrapper
  *
  * The clone() syscall requires special handling because the child thread
  * must start executing at a specified entry point with its own stack,
@@ -18,6 +18,8 @@
  *   2. Call sys_clone
  *   3. Parent: return child's TID
  *   4. Child: pop fn/arg from stack, call fn(arg), then exit with result
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 .global clone

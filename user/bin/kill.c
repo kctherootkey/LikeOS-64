@@ -4,7 +4,10 @@
  * Usage: kill [-s sigspec] [-sigspec] pid ...
  *        kill -l [sigspec]
  *        kill -L
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

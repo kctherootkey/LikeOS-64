@@ -1,10 +1,13 @@
-// LikeOS-64 -- the sysfs-style device attribute tree at /sys.
+// LikeOS -- the sysfs-style device attribute tree at /sys.
 //
 // What userspace device libraries read to find out what a descriptor is:
 // given a character device's major:minor, /sys/dev/char/MAJ:MIN/ leads to
 // the PCI device behind it (vendor, device, revision, config space) and to
 // the driver's other nodes.  Built from the kernel's own PCI table at boot;
 // drivers add their nodes as they register them.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_FS_SYSFS_H
 #define KERNEL_FS_SYSFS_H
 

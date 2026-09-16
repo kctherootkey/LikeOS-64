@@ -1,5 +1,7 @@
-; GDT Assembly functions for LikeOS-64
+; GDT Assembly functions for LikeOS
 ; 64-bit GDT loading functions
+;
+; Copyright (C) 2026 The LikeOS Project
 
 [BITS 64]
 

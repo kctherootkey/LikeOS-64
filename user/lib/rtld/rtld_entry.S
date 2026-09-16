@@ -1,9 +1,12 @@
 /* ============================================================================
- * rtld_entry.S — LikeOS-64 Dynamic Linker entry & PLT trampoline
+ * rtld_entry.S — LikeOS Dynamic Linker entry & PLT trampoline
  *
  *   _start               — initial entry from kernel
  *   _dl_runtime_resolve  — lazy PLT resolution trampoline
- * ========================================================================= */
+ * =========================================================================
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
     .text
 

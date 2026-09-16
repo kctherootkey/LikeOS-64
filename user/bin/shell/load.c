@@ -1,4 +1,4 @@
-// LikeOS-64 -- load, the standalone load and memory monitor.
+// LikeOS -- load, the standalone load and memory monitor.
 //
 // The same two panes the taskbar shows in its tray, in a window of their own.
 // All the drawing and sampling is in panel.c, so this and the panel cannot
@@ -8,6 +8,8 @@
 // Since taskbar(1) took over the desktop bar this is no longer started by
 // xinitrc.  It is kept because it is useful on its own -- run it from a
 // terminal to watch the load while something is building.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include "panel.h"
 

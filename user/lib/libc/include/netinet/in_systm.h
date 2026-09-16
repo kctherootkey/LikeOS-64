@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _NETINET_IN_SYSTM_H
 #define _NETINET_IN_SYSTM_H
 

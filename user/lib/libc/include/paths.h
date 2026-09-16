@@ -1,6 +1,9 @@
 /*
  * paths.h - canonical pathnames as defined by 4.4BSD <paths.h>.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _PATHS_H
 #define _PATHS_H
 

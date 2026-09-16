@@ -1,5 +1,7 @@
 // Stack canary support for ld-likeos.so
 // Must be self-contained — libc is not available during rtld startup.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 unsigned long long __stack_chk_guard = 0xDEADBEEFCAFEBABEULL;
 

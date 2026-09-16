@@ -1,5 +1,9 @@
 /* Descriptor kinds that are not files: eventfd, timerfd, signalfd, memfd;
- * and the positional / preallocating file calls added alongside them. */
+ * and the positional / preallocating file calls added alongside them.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include "syscall.h"
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>

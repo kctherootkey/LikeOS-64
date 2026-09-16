@@ -18,6 +18,9 @@
 # for the target.
 #
 # Re-runnable: everything is a copy or an overwrite.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)

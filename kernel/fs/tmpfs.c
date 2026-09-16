@@ -1,4 +1,7 @@
-// LikeOS-64 -- tmpfs: a filesystem kept entirely in RAM, mounted at /ram.
+// LikeOS -- tmpfs: a filesystem kept entirely in RAM, mounted at /ram.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 /*
  * Why it exists: to take the disk out of an experiment.  luakit on this
  * system boots from a USB stick through ext4, and on every page it loads it

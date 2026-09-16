@@ -1,5 +1,7 @@
-// LikeOS-64 Memory Management - Implementation
+// LikeOS Memory Management - Implementation
 // Complete Physical Memory Manager, Virtual Memory Manager, and Kernel Heap Allocator
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>

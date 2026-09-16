@@ -12,7 +12,10 @@
  * So the macro calls exactly one function, and it is named in the reserved
  * double-underscore space where no conforming program may collide with it.
  * This is what the reference libcs do, and why the problem never appears there.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,10 +1,13 @@
-// LikeOS-64 -- in-memory pseudo filesystems (sysfs-style and proc-style).
+// LikeOS -- in-memory pseudo filesystems (sysfs-style and proc-style).
 //
 // A tree of directories, text files and symlinks that exists only as
 // kernel data: file contents are produced by a callback when the file is
 // opened, directory listings are the children (plus, for a dynamic
 // directory, whatever its enumerate callback adds).  Two instances are
 // mounted: /sys, describing devices, and /proc, describing processes.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_FS_PSEUDOFS_H
 #define KERNEL_FS_PSEUDOFS_H
 

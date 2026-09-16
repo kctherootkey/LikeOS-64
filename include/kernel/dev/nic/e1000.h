@@ -1,9 +1,11 @@
-// LikeOS-64 Intel E1000 NIC Driver
+// LikeOS Intel E1000 NIC Driver
 // Supports the e1000-class parts:
 //   - 82540EM  (QEMU `-device e1000`, VBox "Intel PRO/1000 MT Desktop")
 //   - 82543GC  (QEMU `-device e1000-82543gc`, VBox "Intel PRO/1000 T Server")
 //   - 82544GC  (QEMU `-device e1000-82544gc`)
 //   - 82545EM  (VMware, VBox "Intel PRO/1000 MT Server")
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_E1000_H_
 #define _KERNEL_E1000_H_

@@ -1,6 +1,9 @@
 /*
  * libgen.h - pathname manipulation for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _LIBGEN_H
 #define _LIBGEN_H
 

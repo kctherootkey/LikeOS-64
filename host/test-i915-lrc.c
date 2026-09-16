@@ -1,4 +1,9 @@
-/* Tests for the logical ring context image layout.  See test-i915-lrc.sh. */
+/*
+ * Tests for the logical ring context image layout.  See test-i915-lrc.sh.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <kernel/dev/gpu/i915/i915_lrc_layout.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_renderstate.h>

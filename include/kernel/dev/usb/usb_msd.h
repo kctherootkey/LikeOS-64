@@ -1,4 +1,7 @@
-// LikeOS-64 - USB Mass Storage (Bulk-Only Transport) Driver
+// LikeOS - USB Mass Storage (Bulk-Only Transport) Driver
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_USB_MSD_H
 #define LIKEOS_USB_MSD_H
 

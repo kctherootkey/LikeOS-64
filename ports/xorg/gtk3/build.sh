@@ -5,6 +5,8 @@
 # read.  See ../build.sh for why the two ports share one set of scripts.
 #
 # Usage:  ./build.sh [-f] [package ...]  (no arguments = everything not yet built)
+#
+# Copyright (C) 2026 The LikeOS Project
 
 here=$(cd "$(dirname "$0")" && pwd)
 exec env LIKEOS_PORT_DIR="$here" "$here/../build.sh" "$@"

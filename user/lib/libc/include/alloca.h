@@ -5,7 +5,10 @@
  * frame and vanish on the caller's return.  Every compiler this system
  * builds with provides it as a builtin, and the macro is the whole
  * implementation -- exactly how every other libc does it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _ALLOCA_H
 #define _ALLOCA_H
 

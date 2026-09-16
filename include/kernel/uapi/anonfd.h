@@ -1,6 +1,9 @@
-// LikeOS-64 -- user-visible constants for the anonymous descriptor kinds.
+// LikeOS -- user-visible constants for the anonymous descriptor kinds.
 // Mirrored by the libc's <sys/eventfd.h>, <sys/timerfd.h>, <sys/signalfd.h>
 // and <sys/mman.h>; the values are the conventional ones.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_UAPI_ANONFD_H
 #define KERNEL_UAPI_ANONFD_H
 

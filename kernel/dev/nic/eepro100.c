@@ -1,4 +1,4 @@
-// LikeOS-64 Intel 8255x ("eepro100") NIC Driver
+// LikeOS Intel 8255x ("eepro100") NIC Driver
 //
 // See include/kernel/eepro100.h for the supported PCI device IDs and a
 // summary of the simplified Command Block / Receive Frame Area model
@@ -9,6 +9,8 @@
 // from kernel/ke/interrupt.c, MAC read out of the on-chip 93C46-style
 // EEPROM, and DMA descriptors allocated from contiguous low-physical
 // pages.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/eepro100.h>
 #include <kernel/net/net.h>

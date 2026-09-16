@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Build a minimal Debian-based USB image that boots straight into X11 and launches LikeOS in QEMU/KVM.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

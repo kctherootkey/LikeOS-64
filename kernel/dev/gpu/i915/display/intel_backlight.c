@@ -1,10 +1,13 @@
-// LikeOS-64 -- the panel backlight (PCH PWM, Sunrise Point family).
+// LikeOS -- the panel backlight (PCH PWM, Sunrise Point family).
 //
 // A PWM in the PCH drives the panel's backlight: a frequency (from the
 // VBT, in Hz, turned into a count of raw-clock cycles) and a duty cycle,
 // with an enable and a polarity bit.  Brightness is the duty cycle; the
 // VBT's minimum keeps the panel from being turned all the way off by a
 // low setting.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

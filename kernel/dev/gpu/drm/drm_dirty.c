@@ -1,4 +1,4 @@
-// LikeOS-64 -- GEM object dirty tracking for coherent mappings.
+// LikeOS -- GEM object dirty tracking for coherent mappings.
 //
 // A client that maps a buffer coherently writes through the mapping and
 // announces nothing: no ioctl, no command.  The device keeps a second copy
@@ -52,6 +52,8 @@
 // translations it changed are gone from every processor (a stale one lets
 // writes through unrecorded).  Both live in mm_dirty_*_mappings(); see the
 // comment there.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/mm/memory.h>

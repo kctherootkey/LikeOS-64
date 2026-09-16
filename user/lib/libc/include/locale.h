@@ -5,7 +5,10 @@
  * still remembers and reports the name it was given, because that is what
  * programs test before enabling their multibyte code paths.  See
  * src/locale/locale.c.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _LOCALE_H
 #define _LOCALE_H
 

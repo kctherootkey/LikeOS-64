@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 link.h - Walking the loaded shared objects
+ * LikeOS link.h - Walking the loaded shared objects
  *
  * dl_iterate_phdr() hands a callback one description per object currently
  * loaded: where it sits in memory, what it is called, and its program headers.
@@ -9,6 +9,8 @@
  *
  * The work is done by ld-likeos.so, which is the only thing that knows the
  * object list; this header and the wrapper beside it are the public face of it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _LINK_H

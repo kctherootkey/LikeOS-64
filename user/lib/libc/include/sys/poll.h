@@ -1,4 +1,9 @@
-/* sys/poll.h — redirect to <poll.h> for LikeOS compatibility */
+/*
+ * sys/poll.h — redirect to <poll.h> for LikeOS compatibility
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_POLL_H
 #define _SYS_POLL_H
 

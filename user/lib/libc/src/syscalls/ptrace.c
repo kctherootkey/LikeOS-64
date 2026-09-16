@@ -3,7 +3,10 @@
  * A thin pass-through: the kernel does all the interpreting, because what the
  * addr and data arguments mean depends on the request.  See <sys/ptrace.h> for
  * the interface and the access-control rules.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <sys/ptrace.h>
 #include <errno.h>
 #include "syscall.h"

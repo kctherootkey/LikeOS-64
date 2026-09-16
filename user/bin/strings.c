@@ -2,7 +2,10 @@
  * strings - print the sequences of printable characters in files
  *
  * Implements all GNU binutils strings options per manpage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

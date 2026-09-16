@@ -1,4 +1,7 @@
-// LikeOS-64 Pipe Implementation
+// LikeOS Pipe Implementation
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/pipe.h>
 #include <kernel/mm/memory.h>

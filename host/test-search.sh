@@ -4,6 +4,9 @@
 # Checks libc's <search.h> -- the AVL tree behind tsearch above all -- against
 # the host glibc and against the invariants a tree has to hold.  See the
 # comment at the top of host/test-search.c.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 TMP=${TMPDIR:-/tmp}/likeos-search-test.$$

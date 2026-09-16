@@ -5,6 +5,9 @@
 # decoder from kernel/dev/hid/usb_hid.c against real-world descriptors.
 # The code under test is cut out of the live kernel source at build time, so
 # there is no copy to drift.  See the comment at the top of host/test-usbhid.c.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 TMP=${TMPDIR:-/tmp}/likeos-usbhid-test.$$

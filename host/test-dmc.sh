@@ -2,6 +2,9 @@
 # Host test for the DMC firmware package parser
 # (kernel/dev/gpu/i915/display/intel_dmc_parse.c), run against synthetic
 # packages.  Run from the repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-dmc-test.$$
 trap 'rm -rf "$TMP"' EXIT

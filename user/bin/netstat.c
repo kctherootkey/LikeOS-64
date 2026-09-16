@@ -16,6 +16,8 @@
  *   -v   verbose             -W   wide       -g   multicast groups
  *   -w   RAW sockets         -4   IPv4       -M   masquerade
  *   -F   FIB                 -C   route cache
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

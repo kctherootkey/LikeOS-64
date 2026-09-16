@@ -1,5 +1,7 @@
-// LikeOS-64 - Per-CPU Data Implementation
+// LikeOS - Per-CPU Data Implementation
 // Per-CPU variable management and GS segment setup
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/percpu.h>
 #include <kernel/io/console.h>

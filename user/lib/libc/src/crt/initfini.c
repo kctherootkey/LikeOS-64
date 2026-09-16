@@ -19,7 +19,10 @@
  * The symbols come from the linker script, which already brackets both
  * sections.  They are weak so a program linked without either section still
  * links: start and end then compare equal and the loops do nothing.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stddef.h>
 
 /* Entries are called with (argc, argv, envp).  Constructors written in C take

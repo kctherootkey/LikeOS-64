@@ -1,5 +1,7 @@
-// LikeOS-64 - Cryptographically Secure Random Number Generator
+// LikeOS - Cryptographically Secure Random Number Generator
 // ChaCha20-based CSPRNG with entropy pool
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_RANDOM_H_
 #define _KERNEL_RANDOM_H_

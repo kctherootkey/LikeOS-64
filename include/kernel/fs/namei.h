@@ -1,4 +1,9 @@
-/* Path resolution and permission checking for the syscall layer. */
+/*
+ * Path resolution and permission checking for the syscall layer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_FS_NAMEI_H
 #define _KERNEL_FS_NAMEI_H
 

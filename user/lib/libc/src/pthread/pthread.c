@@ -1,8 +1,10 @@
 /*
- * LikeOS-64 POSIX Threads Implementation
+ * LikeOS POSIX Threads Implementation
  *
  * Core thread functions: create, exit, join, detach, self, equal
  * Uses clone() with thread flags and futex for join synchronization.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <pthread.h>

@@ -9,6 +9,8 @@
  * Also the HEADER struct, which is the message header laid out as bitfields.
  * Software that builds or inspects a query by hand uses it, GLib's resolver
  * among them.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _ARPA_NAMESER_COMPAT_H

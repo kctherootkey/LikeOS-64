@@ -34,7 +34,10 @@
  * useful part: damage that starts and ends on a page boundary and is exactly
  * one page long says a single frame was lost, which is a very different bug
  * from a stray write that happens to land nearby.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <dlfcn.h>
 #include <sched.h>
 #include <errno.h>

@@ -11,7 +11,10 @@
  * Including the real header rather than repeating any of it: there is one
  * definition of O_RDONLY in this libc and this is not a second place to keep
  * it in step.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_FCNTL_H
 #define _SYS_FCNTL_H
 

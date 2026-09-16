@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <efi.h>
 #include <efilib.h>
 
@@ -1236,9 +1240,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     
     // Initialize serial port for debug output (VMware)
     serial_init();
-    serial_puts("\n\n=== LikeOS-64 UEFI Bootloader starting ===\n");
+    serial_puts("\n\n=== LikeOS UEFI Bootloader starting ===\n");
     
-    Print(L"LikeOS-64 Enhanced UEFI Bootloader\r\n");
+    Print(L"LikeOS Enhanced UEFI Bootloader\r\n");
     Print(L"===================================\r\n");
     Print(L"ELF64 Loader with Paging Support\r\n\r\n");
 

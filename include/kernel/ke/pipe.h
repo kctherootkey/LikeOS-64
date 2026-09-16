@@ -1,4 +1,7 @@
-// LikeOS-64 Pipe Support
+// LikeOS Pipe Support
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_PIPE_H_
 #define _KERNEL_PIPE_H_
 

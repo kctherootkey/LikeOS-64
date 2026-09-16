@@ -4,7 +4,10 @@
  * Our libc does not implement BSD-style advisory file locking yet, but
  * the symbol must exist so portable applications compile.  Calls return
  * 0 (no-op) - the kernel does not enforce flock semantics.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_FILE_H
 #define _SYS_FILE_H
 

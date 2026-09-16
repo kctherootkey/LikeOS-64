@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <elf.h>
 #include <stdlib.h>
 #include <unistd.h>

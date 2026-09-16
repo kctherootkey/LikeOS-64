@@ -1,5 +1,8 @@
-// LikeOS-64 - xHCI Boot Integration
+// LikeOS - xHCI Boot Integration
 // High-level interface for boot-time USB initialization
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_XHCI_BOOT_H
 #define LIKEOS_XHCI_BOOT_H
 

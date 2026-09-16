@@ -29,6 +29,8 @@
 # std::terminate instead of the handler waiting for it, and nothing in the
 # failure says why.  The unwind tables themselves come from user_dyn.lds, which
 # used to discard them.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -e
 

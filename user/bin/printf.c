@@ -8,7 +8,10 @@
  *   and all C format specs: d i o u x X f e E g G c s (with width/precision)
  *
  * FORMAT is reused as many times as necessary to consume all ARGUMENTs.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

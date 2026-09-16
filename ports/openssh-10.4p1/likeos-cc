@@ -1,11 +1,14 @@
 #!/bin/sh
 # likeos-cc — a gcc driver wrapper that makes autoconf's compile/link probes
-# build LikeOS-64 PIE binaries against the LikeOS libc + rtld + OpenSSL.
+# build LikeOS PIE binaries against the LikeOS libc + rtld + OpenSSL.
 #
 # configure invokes $CC for both "-c" compiles and for full links (it uses gcc
 # as the link driver, not ld directly).  This wrapper adds the freestanding
 # include paths on every invocation, and the LikeOS crt1/linker-script/rtld
 # glue only when it is actually linking a program.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 # Derive the repo root from this script's own location

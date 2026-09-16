@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_DEVFS_H_
 #define _KERNEL_DEVFS_H_
 

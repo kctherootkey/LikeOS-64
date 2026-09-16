@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 libc dynamic memory allocator
+ * LikeOS libc dynamic memory allocator
  *
  * Classic bin-based heap allocator with per-thread caching and multiple
  * arenas:
@@ -29,6 +29,8 @@
  * builds print a detailed line (which check failed, the offending chunk
  * address and its size field); production builds print only that heap
  * corruption was detected, without exposing any internal state.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdlib.h>

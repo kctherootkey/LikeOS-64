@@ -1,4 +1,7 @@
-// LikeOS-64 -- the Intel graphics driver's device state.
+// LikeOS -- the Intel graphics driver's device state.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_DRV_H
 #define KERNEL_DEV_GPU_I915_DRV_H
 

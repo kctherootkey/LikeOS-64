@@ -1,4 +1,4 @@
-// LikeOS-64 Unified Page Cache
+// LikeOS Unified Page Cache
 //
 // Caches file data pages indexed by (inode_id, page_index).  `inode_id` is the
 // filesystem's native inode identifier (FAT32 start cluster, EXT4 inode no.);
@@ -8,6 +8,8 @@
 //
 // CLOCK eviction on a global LRU ring.  Write-back dirty tracking.
 // Sequential read-ahead.  SMP-safe with per-bucket spinlocks.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_PAGECACHE_H_
 #define _KERNEL_PAGECACHE_H_

@@ -1,4 +1,7 @@
-// LikeOS-64 Preemptive Scheduler with Full Kernel Preemption and SMP Spinlocks
+// LikeOS Preemptive Scheduler with Full Kernel Preemption and SMP Spinlocks
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_SCHED_H_
 #define _KERNEL_SCHED_H_
 

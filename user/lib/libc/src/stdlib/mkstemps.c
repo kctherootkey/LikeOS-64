@@ -1,4 +1,8 @@
-/* mkstemps.c - create temporary file for LikeOS libc */
+/*
+ * mkstemps.c - create temporary file for LikeOS libc
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 #include <stdlib.h>
 #include <string.h>

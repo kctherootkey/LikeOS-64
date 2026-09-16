@@ -1,9 +1,11 @@
-// LikeOS-64 fbdev core - backend-neutral /dev/fb0 implementation
+// LikeOS fbdev core - backend-neutral /dev/fb0 implementation
 //
 // Bridges the framebuffer device node to whichever display backend owns the
 // screen: the VMware SVGA II driver when active, otherwise the boot GOP
 // framebuffer.  Exposes the standard fbdev ioctl surface (see uapi/fb.h) and
 // the physical range for user mmap of the framebuffer.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_DEV_VIDEO_FBDEV_H_
 #define _KERNEL_DEV_VIDEO_FBDEV_H_

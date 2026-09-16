@@ -1,7 +1,9 @@
 /*
- * LikeOS-64 test shared library implementation
+ * LikeOS test shared library implementation
  *
  * Provides simple functions for dlopen/dlsym testing.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include "testlib.h"

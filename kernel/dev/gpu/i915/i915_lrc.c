@@ -1,4 +1,4 @@
-// LikeOS-64 -- the logical ring context image (pure: host tests compile it).
+// LikeOS -- the logical ring context image (pure: host tests compile it).
 //
 // What the hardware saves and restores when it switches contexts: a page
 // of hardware status followed by the register state, laid out as the
@@ -6,6 +6,9 @@
 // driver fills the state page in with the ring and page directory the
 // context should run with; the hardware writes the rest at its first
 // context save.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_lrc_layout.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 

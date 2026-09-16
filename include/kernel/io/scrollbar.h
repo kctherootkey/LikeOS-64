@@ -1,5 +1,7 @@
-// LikeOS-64 Hardware Abstraction Layer - Visual Scrollbar Interface
+// LikeOS Hardware Abstraction Layer - Visual Scrollbar Interface
 // Desktop-browser-style scrollbar rendering system
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_SCROLLBAR_H_
 #define _KERNEL_SCROLLBAR_H_

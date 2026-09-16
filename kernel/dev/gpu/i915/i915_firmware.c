@@ -1,4 +1,4 @@
-// LikeOS-64 -- the GT's firmware images: GuC and HuC.
+// LikeOS -- the GT's firmware images: GuC and HuC.
 //
 // The GuC is a controller in the GT that can own command submission and
 // power management; the HuC authenticates media workloads.  On the
@@ -7,6 +7,9 @@
 // described: the package that ships them is staged on the image, the
 // loader below reads their headers, and the log says what would be
 // used.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/firmware.h>

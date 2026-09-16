@@ -1,4 +1,4 @@
-# Makefile.likeos — build gdb 17.2 for LikeOS-64.
+# Makefile.likeos — build gdb 17.2 for LikeOS.
 #
 # The tarball is unpacked and patched by unpack.sh, configured by
 # likeos-configure.sh, and then built with the configure-generated Makefile in
@@ -12,6 +12,8 @@
 # configure sources that file and drops gdbserver from the subdirectory list if
 # it names no entry for the host.  So adding the entry (patch 0004) is what
 # turns it on, and this makefile only has to ask for the target.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 SRC_STAMP := .likeos-unpacked
 STAMP     := .likeos-configured

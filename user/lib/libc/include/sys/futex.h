@@ -2,7 +2,11 @@
  *
  * futex() waits on / wakes a 32-bit word shared between threads or, in
  * shared memory, between processes.  The operations and flags are the
- * conventional ones; see the kernel's include/kernel/ke/futex.h. */
+ * conventional ones; see the kernel's include/kernel/ke/futex.h.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _SYS_FUTEX_H
 #define _SYS_FUTEX_H
 

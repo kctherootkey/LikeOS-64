@@ -1,5 +1,7 @@
-// LikeOS-64 storage bootstrap
+// LikeOS storage bootstrap
 // Handles FAT32 probing and signature selection for root storage
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_STORAGE_H_
 #define _KERNEL_STORAGE_H_

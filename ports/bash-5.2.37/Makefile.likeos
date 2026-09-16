@@ -10,6 +10,8 @@
 # produced by likeos-generate.sh, which also builds the three build-machine
 # tools it needs into hosttools/.  The build regenerates them automatically
 # when they are missing, so `distclean` can safely delete them.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 CC = gcc
 LD = ld

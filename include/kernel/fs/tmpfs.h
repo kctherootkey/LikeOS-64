@@ -1,4 +1,7 @@
-// LikeOS-64 -- tmpfs: a filesystem kept entirely in RAM, mounted at /ram.
+// LikeOS -- tmpfs: a filesystem kept entirely in RAM, mounted at /ram.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_TMPFS_H
 #define LIKEOS_TMPFS_H
 

@@ -1,4 +1,4 @@
-// LikeOS-64 — address-space read/write semaphore
+// LikeOS — address-space read/write semaphore
 //
 // The lock that makes address-space changes safe against page faults.
 //
@@ -17,6 +17,8 @@
 //
 // The type itself is declared in <kernel/ke/sched.h>, next to spinlock_t,
 // because task_t embeds it.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_MM_RWSEM_H_
 #define _KERNEL_MM_RWSEM_H_

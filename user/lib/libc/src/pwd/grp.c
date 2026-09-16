@@ -3,7 +3,10 @@
  *
  * Each line is "name:passwd:gid:member,member,...".  The member list is parsed
  * into a NULL-terminated char* array packed into the tail of the caller buffer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <grp.h>
 #include <unistd.h>
 #include <stdio.h>

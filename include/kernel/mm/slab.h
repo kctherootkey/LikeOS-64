@@ -1,6 +1,8 @@
-// LikeOS-64 SLAB Allocator
+// LikeOS SLAB Allocator
 // Dynamic kernel heap using size-class caches for efficient allocation
 // SMP-safe with per-cache spinlocks
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_SLAB_H_
 #define _KERNEL_SLAB_H_

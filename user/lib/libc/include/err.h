@@ -1,6 +1,9 @@
 /*
  * err.h - 4.4BSD err / warn family for fatal and non-fatal diagnostics.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _ERR_H
 #define _ERR_H
 

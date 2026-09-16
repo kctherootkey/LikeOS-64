@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 features.h - Feature-test macro plumbing
+ * LikeOS features.h - Feature-test macro plumbing
  *
  * Not a standard header.  It exists because a great deal of portable software
  * includes it -- usually guarded by HAVE_FEATURES_H, sometimes not -- and
@@ -12,6 +12,8 @@
  * the port toolchain undefine __linux__ for exactly the same reason -- taking
  * another system's code path because a macro happened to be set is how a port
  * acquires bugs that are invisible at the point they are introduced.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _FEATURES_H

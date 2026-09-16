@@ -1,9 +1,11 @@
 /*
- * LikeOS-64 dlfcn.h - Dynamic linking interface
+ * LikeOS dlfcn.h - Dynamic linking interface
  *
  * Provides dlopen/dlsym/dlclose/dlerror for runtime loading
  * of shared libraries.  The actual work is done by ld-likeos.so;
  * these are thin wrappers that call into the runtime linker.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _DLFCN_H

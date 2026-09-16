@@ -1,4 +1,4 @@
-// LikeOS-64 -- HDMI and DVI on the DDI ports.
+// LikeOS -- HDMI and DVI on the DDI ports.
 //
 // A TMDS sink is simpler than DisplayPort: no link training, no
 // bandwidth negotiation -- the port's clock is the pixel clock, which a
@@ -8,6 +8,9 @@
 // it is getting (the AVI infoframe, sent as a data-island packet in the
 // blanking), and the voltage settings of the transmitter.  A DVI sink
 // gets the same stream without packets.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

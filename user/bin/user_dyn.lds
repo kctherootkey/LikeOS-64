@@ -1,4 +1,8 @@
-/* LikeOS-64 User Program Linker Script — dynamically linked PIE */
+/*
+ * LikeOS User Program Linker Script — dynamically linked PIE
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
 
 ENTRY(_entry)
 

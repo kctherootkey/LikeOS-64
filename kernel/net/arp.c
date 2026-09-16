@@ -1,4 +1,7 @@
-// LikeOS-64 ARP (Address Resolution Protocol)
+// LikeOS ARP (Address Resolution Protocol)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/slab.h>

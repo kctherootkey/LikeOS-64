@@ -5,7 +5,10 @@
  * Supports: --help, --version
  *
  * Exit with a status code indicating success.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <string.h>
 

@@ -1,4 +1,7 @@
-// LikeOS-64 PIT Timer Driver
+// LikeOS PIT Timer Driver
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_TIMER_H_
 #define _KERNEL_TIMER_H_
 

@@ -4,6 +4,8 @@
  * Full implementation per the top(1) manpage.
  * Supports batch mode, interactive commands, filtering,
  * sorting, memory/CPU scaling, forest view, and more.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

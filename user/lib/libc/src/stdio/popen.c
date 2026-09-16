@@ -9,6 +9,8 @@
  * pclose() can reap the right process and return its exit status.  fds that
  * are themselves popen streams are marked close-on-exec so nested popen()
  * children do not inherit each other's pipe ends (the POSIX requirement).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

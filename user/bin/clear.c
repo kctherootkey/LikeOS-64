@@ -4,6 +4,8 @@
  * Implementation per clear(1) manpage.
  * Clears the terminal screen and its scrollback buffer.
  * Uses ANSI/xterm escape sequences.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

@@ -1,6 +1,8 @@
-// LikeOS-64 — Deferred-work (softirq) framework
+// LikeOS — Deferred-work (softirq) framework
 //
 // See include/kernel/softirq.h for design rationale.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/softirq.h>
 #include <kernel/ke/percpu.h>

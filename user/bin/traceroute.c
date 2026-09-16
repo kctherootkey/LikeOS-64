@@ -19,6 +19,8 @@
  *   -F        do not fragment               -r       bypass routing
  *   -t tos    Type of Service               -z ms    send wait interval
  *   --sport   source port                   --mtu    discover MTU
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

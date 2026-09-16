@@ -1,4 +1,4 @@
-// LikeOS-64 -- EDID: what a display says about itself.
+// LikeOS -- EDID: what a display says about itself.
 //
 // The 128-byte base block a monitor or panel answers with over DDC or AUX,
 // plus optional extension blocks (CEA-861 for televisions and HDMI sinks),
@@ -6,6 +6,9 @@
 // preferred timing, its physical size, its name, whether it is an HDMI
 // sink.  The parser is pure (no kernel dependencies) so the host test
 // harness can run it against recorded blocks.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_DRM_EDID_H
 #define KERNEL_DEV_GPU_DRM_EDID_H
 

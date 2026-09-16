@@ -1,4 +1,4 @@
-// LikeOS-64 - USB HID (Human Interface Device) Class Driver
+// LikeOS - USB HID (Human Interface Device) Class Driver
 //
 // Implements the USB HID specification 1.11 for Boot Protocol keyboards and
 // Boot/Report Protocol mice.
@@ -30,6 +30,8 @@
 //   - USB HID Usage Tables 1.12
 //   - Intel xHCI specification 1.2 (for interrupt endpoint handling)
 //   - Intel Integrated Sensor Hub - detected and skipped gracefully
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/hid/usb_hid.h>
 #include <kernel/dev/usb/xhci.h>

@@ -16,7 +16,10 @@
  * good deal of C code tests __has_include(<uchar.h>) and, failing to find it,
  * falls back to `#define char16_t uint16_t' -- which is a fair guess in C and
  * a disaster in C++, where char16_t is a keyword and cannot be a macro.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _UCHAR_H
 #define _UCHAR_H
 

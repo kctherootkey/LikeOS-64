@@ -8,6 +8,9 @@
 # one with objcopy.  Its undefined references (malloc, memcpy, write, ...) keep
 # their names and resolve to the host libc, which is what we want: the
 # formatter is the thing under test, not the allocator underneath it.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 
 OUT=${TMPDIR:-/tmp}/likeos-printf-test.$$

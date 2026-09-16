@@ -21,6 +21,8 @@
  *
  *     rm build/kernel.elf && make NO_STRIP=1
  *     addr2line -f -e build/kernel.elf <address>
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

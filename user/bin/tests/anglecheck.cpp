@@ -9,7 +9,11 @@
  * the very ANGLE objects linked into libwebkit2gtk, and reports the first one
  * that fails together with EGL_GetError().  Built by the top-level Makefile
  * against the WebKit build tree's libGLESv2.a/libANGLE.a (thin archives, so
- * the tree must be present). */
+ * the tree must be present).
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>

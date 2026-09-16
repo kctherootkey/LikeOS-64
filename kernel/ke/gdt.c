@@ -1,5 +1,7 @@
-// LikeOS-64 Kernel Executive - GDT Management
+// LikeOS Kernel Executive - GDT Management
 // Global Descriptor Table setup with TSS support for 64-bit mode
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/interrupt.h>
 #include <kernel/uapi/bug.h>

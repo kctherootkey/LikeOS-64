@@ -1,4 +1,4 @@
-// LikeOS-64 -- the port clocks of Haswell and Broadwell.
+// LikeOS -- the port clocks of Haswell and Broadwell.
 //
 // The LCPLL runs at 2.7 GHz (and drives CDCLK too); a DisplayPort port is
 // clocked straight from it at 2.7, 1.35 or 0.81 GHz through its clock
@@ -6,6 +6,9 @@
 // with a reference divider, a feedback divider and a post divider found
 // by search.  The buffer translations are a table per output kind
 // written into the DDI like Skylake's.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 - HID over I2C Driver
+// LikeOS - HID over I2C Driver
 // Intel DesignWare I2C controller + Microsoft HID-over-I2C protocol
 //
 // Discovers Intel LPSS Serial IO I2C controllers via PCI (with ACPI
@@ -18,6 +18,8 @@
 // platform supports a legacy PS/2 mouse, so the I2C driver is not
 // strictly required at this time. We may revisit and address the issue
 // in the future if it becomes necessary.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/hid/i2c_hid.h>
 #include <kernel/io/console.h>

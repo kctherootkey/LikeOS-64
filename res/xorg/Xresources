@@ -1,4 +1,4 @@
-! X resources for LikeOS-64, installed as /etc/X11/Xresources.
+! X resources for LikeOS, installed as /etc/X11/Xresources.
 !
 ! Read via $XENVIRONMENT, which the session startup script exports.  That is
 ! the toolkit's own per-host resource file mechanism, and it needs no running

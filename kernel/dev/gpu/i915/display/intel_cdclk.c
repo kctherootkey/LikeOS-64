@@ -1,4 +1,4 @@
-// LikeOS-64 -- the display core clock, and the pcode mailbox it needs.
+// LikeOS -- the display core clock, and the pcode mailbox it needs.
 //
 // CDCLK is the clock the display engine runs on; on Skylake it is
 // derived from DPLL0, whose link rate the firmware chose (2.7 GHz gives
@@ -6,6 +6,9 @@
 // CDCLK running for the panel it lit; the driver reads it, checks it is
 // enough for the modes it sets, and only reprograms it when it must
 // (which needs the pcode's consent: prepare, change, notify).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/hal/lapic.h>

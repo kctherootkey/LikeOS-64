@@ -1,4 +1,7 @@
-// LikeOS-64 System Call Interface
+// LikeOS System Call Interface
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _KERNEL_SYSCALL_H_
 #define _KERNEL_SYSCALL_H_
 

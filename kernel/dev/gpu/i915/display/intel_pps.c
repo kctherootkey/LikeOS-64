@@ -1,10 +1,13 @@
-// LikeOS-64 -- eDP panel power sequencing (PCH-side, Sunrise Point family).
+// LikeOS -- eDP panel power sequencing (PCH-side, Sunrise Point family).
 //
 // A panel must be powered in order: VDD (so its AUX channel answers),
 // then panel power, then the backlight, with the delays its maker
 // specifies (T1..T12 in the VBT); off in reverse.  Getting a delay
 // wrong is a panel that shows nothing or one that is damaged, so the
 // VBT values are used when present and conservative ones otherwise.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>

@@ -1,5 +1,7 @@
-; LikeOS-64 Interrupt Handlers
+; LikeOS Interrupt Handlers
 ; Assembly stubs for 64-bit interrupt handling
+;
+; Copyright (C) 2026 The LikeOS Project
 
 [BITS 64]
 

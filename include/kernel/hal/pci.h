@@ -1,4 +1,7 @@
-// LikeOS-64 - Minimal PCI enumeration (legacy config mechanism #1)
+// LikeOS - Minimal PCI enumeration (legacy config mechanism #1)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_PCI_H
 #define LIKEOS_PCI_H
 

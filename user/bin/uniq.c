@@ -5,7 +5,10 @@
  * Supports: -c, -d, -D, -f, -i, -s, -u, -z, -w
  *           --all-repeated[=METHOD], --group[=METHOD]
  *           --help, --version
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -13,6 +13,8 @@
 #   ./build.sh                 build everything not yet built
 #   ./build.sh libX11 libXext  build just these (and rebuild them)
 #   ./build.sh -f              force: ignore stamps
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -u
 

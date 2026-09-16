@@ -5,7 +5,10 @@
  * helpers.  login_tty arranges for the slave fd to become the controlling
  * tty of the calling process via setsid + ioctl(TIOCSCTTY) and rebinds
  * stdin/stdout/stderr to it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <util.h>
 #include <unistd.h>
 #include <fcntl.h>

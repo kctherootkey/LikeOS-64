@@ -1,5 +1,7 @@
-// LikeOS-64 Userspace Syscall Test Program
+// LikeOS Userspace Syscall Test Program
 // Tests all implemented syscalls: read, write, open, close, mmap, brk, yield, getpid, exit
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -210,7 +212,7 @@ int main(void)
 {
 	printf("\n");
 	printf("========================================\n");
-	printf("  LikeOS-64 Userspace Syscall Tests\n");
+	printf("  LikeOS Userspace Syscall Tests\n");
 	printf("========================================\n\n");
 
 	// Run all tests

@@ -1,4 +1,7 @@
-// LikeOS-64 - Block device abstraction
+// LikeOS - Block device abstraction
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_BLOCK_H
 #define LIKEOS_BLOCK_H
 

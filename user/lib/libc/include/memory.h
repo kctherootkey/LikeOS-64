@@ -10,6 +10,8 @@
  *
  * Every system still ships it for that reason, and every one of them ships it
  * as exactly this: a redirection to <string.h>.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _MEMORY_H

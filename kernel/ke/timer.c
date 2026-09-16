@@ -1,4 +1,7 @@
-// LikeOS-64 Timer Driver
+// LikeOS Timer Driver
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/interrupt.h>

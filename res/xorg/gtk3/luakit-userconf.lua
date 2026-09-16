@@ -4,6 +4,8 @@
 -- hardware-acceleration policy further down: it is "always" on every
 -- machine, GPU or not, and the comment there says what that costs and how
 -- to change it for one machine or one site.
+--
+-- Copyright (C) 2026 The LikeOS Project
 
 local settings = require "settings"
 

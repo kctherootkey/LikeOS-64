@@ -6,6 +6,8 @@
  * loader relocated only the object named in dlopen() and left anything pulled
  * in underneath with an unrelocated GOT.  Calling dlbase_value() through
  * libdlchain.so is what proves the dependency really was relocated.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 /* A global, so reaching it needs a relocated GOT entry rather than a

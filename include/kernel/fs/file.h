@@ -1,4 +1,9 @@
-/* The per-task file-descriptor table. */
+/*
+ * The per-task file-descriptor table.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_FS_FILE_H
 #define _KERNEL_FS_FILE_H
 

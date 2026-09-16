@@ -147,6 +147,8 @@
  * GNU General Public License ("GPL") version 2 as published by the Free
  * Software Foundation.
  *
+ *
+ * Copyright (C) 2026 The LikeOS Project
  *****************************************************************************/
 
 #ifndef __ACENV_H__

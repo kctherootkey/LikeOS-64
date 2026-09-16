@@ -1,4 +1,7 @@
-// LikeOS-64 -- firmware blobs, read from the root filesystem.
+// LikeOS -- firmware blobs, read from the root filesystem.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/firmware.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/syscall.h>

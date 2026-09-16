@@ -1,4 +1,7 @@
-// LikeOS-64 -- read/write/readv/writev/lseek.
+// LikeOS -- read/write/readv/writev/lseek.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/uapi/status.h>
 #include <kernel/uapi/stat.h>
 #include <kernel/fs/devfs.h>

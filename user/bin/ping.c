@@ -20,6 +20,8 @@
  *   -f        flood ping                -a        audible
  *   -A        adaptive interval         -D        timestamps
  *   -R        record route              -r        bypass routing
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

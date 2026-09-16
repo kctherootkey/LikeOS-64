@@ -1,4 +1,4 @@
-// LikeOS-64 -- the Intel graphics device table.
+// LikeOS -- the Intel graphics device table.
 //
 // Every integrated and discrete Intel graphics device from the i830 to
 // Panther Lake, by PCI device id, with the descriptor that says which
@@ -10,6 +10,9 @@
 // The table is ours: ids and names from the public product lists, in a
 // layout that carries the SKU's GT level and a marketing name where one
 // helps a log line be recognisable.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_device_info.h>
 
 #define NAME_ONLY(platform_, name_, gen_)                                  \

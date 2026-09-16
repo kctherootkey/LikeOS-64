@@ -1,9 +1,11 @@
-// LikeOS-64 framebuffer device UAPI - /dev/fb0 ioctl interface
+// LikeOS framebuffer device UAPI - /dev/fb0 ioctl interface
 //
 // Layout and request numbers follow the de-facto standard fbdev interface
 // so existing display servers (X.org fbdev/modesetting) can be ported
 // against it unchanged.  Mirrored into the userspace libc include tree;
 // keep both copies in sync.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_UAPI_FB_H_
 #define _KERNEL_UAPI_FB_H_

@@ -6,7 +6,10 @@
  * Authenticates through the PAM framework, switches credentials, sets up the
  * environment and executes the target user's shell.  When invoked by root, no
  * password is required.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

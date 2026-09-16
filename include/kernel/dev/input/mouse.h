@@ -1,5 +1,7 @@
-// LikeOS-64 I/O Subsystem - Mouse Driver Interface
+// LikeOS I/O Subsystem - Mouse Driver Interface
 // PS/2 mouse device management and input processing
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_MOUSE_H_
 #define _KERNEL_MOUSE_H_

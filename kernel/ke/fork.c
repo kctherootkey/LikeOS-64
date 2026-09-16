@@ -1,4 +1,7 @@
-// LikeOS-64 -- fork, clone and vfork.
+// LikeOS -- fork, clone and vfork.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/syscall.h>

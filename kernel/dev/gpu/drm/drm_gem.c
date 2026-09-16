@@ -1,5 +1,8 @@
-// LikeOS-64 -- display-manager objects: buffers and surfaces, their handles,
+// LikeOS -- display-manager objects: buffers and surfaces, their handles,
 // and sharing across processes (PRIME / dma-buf).
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/uapi/drm/dma-buf.h>
 #include <kernel/ke/sched.h>
@@ -453,20 +456,48 @@ struct drm_gem_object *drm_gem_by_offset(struct drm_device *dev,
 
 /* ---- handles -------------------------------------------------------- */
 
-/* Handles name the file they belong to.
+/* How a slot becomes the handle a client sees -- the driver's choice, see
+ * drm_driver.global_handles.
  *
- * A client that shares a surface passes the id its own file holds and the
- * other side is expected to find the same object -- which a bare per-file
- * index cannot do, because every file has an index 20.  Carrying the file
- * in the upper half makes an id mean one object device-wide, so a
- * reference by id can be resolved whoever created it, while every ordinary
- * lookup stays the same array index it was. */
+ * Plain: the handle IS the slot.  Small, dense, lowest free reused, and
+ * meaningful only to this file -- the numbering every graphics library is
+ * written against.  This was not always so: every handle used to carry the
+ * file's id in its upper half, and a library that sized a per-frame array by
+ * the largest handle in a batch (Mesa's i915 backend does) allocated and
+ * cleared 6.5 MB per frame for a file opened 25th -- more with every later
+ * open of the device, until malloc gave up.
+ *
+ * Global: the file's id rides in the upper half, so a handle names one
+ * object device-wide.  A client that shares a surface passes the id its own
+ * file holds and the other side is expected to find the same object, which
+ * a bare per-file index cannot do, because every file has an index 20.
+ * Only vmwgfx asks for this; its library never indexes by the value. */
 #define DRM_HANDLE_SLOT_BITS 16
 #define DRM_HANDLE_SLOT_MASK ((1u << DRM_HANDLE_SLOT_BITS) - 1)
 
+static int drm_handles_global(const struct drm_file *fp)
+{
+	return fp->dev && fp->dev->drv && fp->dev->drv->global_handles;
+}
+
 static uint32_t drm_handle_make(struct drm_file *fp, uint32_t slot)
 {
-	return (fp->file_id << DRM_HANDLE_SLOT_BITS) | slot;
+	if (drm_handles_global(fp))
+		return (fp->file_id << DRM_HANDLE_SLOT_BITS) | slot;
+	return slot;
+}
+
+/* The slot a handle of THIS file names, or 0 for a handle that is not one
+ * of this file's: zero, another file's under the global numbering, or out
+ * of the slot range under the plain one. */
+static uint32_t drm_handle_slot_of(struct drm_file *fp, uint32_t handle)
+{
+	if (drm_handles_global(fp)) {
+		if ((handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
+			return 0;
+		return handle & DRM_HANDLE_SLOT_MASK;
+	}
+	return handle > DRM_HANDLE_SLOT_MASK ? 0 : handle;
 }
 
 /* The handle naming a slot this file already holds. */
@@ -603,14 +634,14 @@ int drm_gem_handle_create(struct drm_file *fp, struct drm_gem_object *o,
 	}
 }
 
-/* This file's own handle, and nothing else: the id has to name this file. */
+/* This file's own handle, and nothing else. */
 struct drm_gem_object *drm_gem_lookup(struct drm_file *fp, uint32_t handle)
 {
 	uint64_t fl;
 	struct drm_gem_object *o = NULL;
-	uint32_t slot = handle & DRM_HANDLE_SLOT_MASK;
+	uint32_t slot = drm_handle_slot_of(fp, handle);
 
-	if (!handle || (handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
+	if (!slot)
 		return NULL;
 	spin_lock_irqsave(&fp->lock, &fl);
 	if (slot && slot < fp->nhandles) {
@@ -638,6 +669,10 @@ struct drm_gem_object *drm_gem_lookup_foreign(struct drm_device *dev,
 	struct drm_gem_object *o = NULL;
 	uint64_t fl;
 
+	/* Only a global handle says which file it belongs to; a plain slot
+	 * number from another file names nothing here. */
+	if (!dev->drv || !dev->drv->global_handles)
+		return NULL;
 	if (!handle || !slot)
 		return NULL;
 	spin_lock_irqsave(&dev->lock, &fl);
@@ -659,10 +694,9 @@ int drm_gem_handle_delete(struct drm_file *fp, uint32_t handle)
 {
 	uint64_t fl;
 	struct drm_gem_object *o = NULL;
+	uint32_t slot = drm_handle_slot_of(fp, handle);
 
-	uint32_t slot = handle & DRM_HANDLE_SLOT_MASK;
-
-	if (!handle || (handle >> DRM_HANDLE_SLOT_BITS) != fp->file_id)
+	if (!slot)
 		return -EINVAL;
 	spin_lock_irqsave(&fp->lock, &fl);
 	if (slot && slot < fp->nhandles) {

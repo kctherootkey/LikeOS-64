@@ -1,4 +1,7 @@
-// LikeOS-64 -- the engines: bring-up, status pages, retirement, reset.
+// LikeOS -- the engines: bring-up, status pages, retirement, reset.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/hal/lapic.h>

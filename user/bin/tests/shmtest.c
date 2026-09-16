@@ -23,7 +23,10 @@
  * that is not released, so the table fills and later attempts fail with ENOMEM
  * even though nothing is really exhausted.  The kernel has SHM_MAX_OBJECTS=64,
  * which a browser would burn through quickly if release were broken.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>

@@ -3,7 +3,10 @@
  *
  * Provides the small set of __dead, __unused, __packed, __used,
  * __printflike, etc. macros that BSD-derived sources expect.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SYS_CDEFS_H
 #define _SYS_CDEFS_H
 

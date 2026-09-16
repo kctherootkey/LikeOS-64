@@ -1,4 +1,4 @@
-// LikeOS-64 Unified Page Cache
+// LikeOS Unified Page Cache
 //
 // Caches file data pages indexed by (inode_id, page_index).  inode_id is the
 // FS-native identifier (FAT32 start cluster, EXT4 inode number); the cache
@@ -9,6 +9,8 @@
 // CLOCK eviction on a global LRU ring.  Per-bucket spinlocks for the hash
 // table; global spinlock for LRU/dirty lists.  Dirty writeback on the
 // timer + close/sync.  Sequential read-ahead with adaptive window sizing.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/vfs_sb.h>

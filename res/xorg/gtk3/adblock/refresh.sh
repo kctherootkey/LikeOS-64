@@ -6,6 +6,9 @@
 # marks itself as expiring after a few days, so run this before a release
 # build, then rebuild the image.  The files are redistributed unchanged,
 # under the terms in their own headers (https://easylist.to/pages/licence.html).
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 for list in easylist easyprivacy; do

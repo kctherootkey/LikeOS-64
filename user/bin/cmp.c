@@ -8,7 +8,10 @@
  * settle.
  *
  * Exit status follows the usual convention: 0 identical, 1 differing, 2 error.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

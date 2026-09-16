@@ -11,6 +11,8 @@
 //
 // All returned pointers are owned by the libc and overwritten on the next
 // call (POSIX-2008 §3.2 «Concept»: getprotobyname not thread-safe).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 -- which ranges of an address space are spoken for.
+// LikeOS -- which ranges of an address space are spoken for.
 //
 // A client places its objects itself and hands the range back to its
 // own allocator the moment it is done with an object -- before the
@@ -15,6 +15,9 @@
 // marked superseded and their translations are simply overwritten);
 // unbinding clears translations only for a binding that still owns
 // its range.  The list logic is pure so the build host can check it.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 
 void i915_vma_list_attach(struct i915_vma **head, struct i915_vma *v)

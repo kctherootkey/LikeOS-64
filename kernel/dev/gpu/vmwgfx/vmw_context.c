@@ -1,9 +1,12 @@
-// LikeOS-64 -- vmwgfx: rendering contexts and legacy shaders.
+// LikeOS -- vmwgfx: rendering contexts and legacy shaders.
 //
 // A DX context is where all VGPU10 state lives; its object tables
 // (COTables: views, states, shaders, queries...) are MOB-backed buffers
 // the driver grows as userspace's ids climb.  Legacy GB contexts and
 // shaders exist for hosts without DX.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/ke/sched.h>

@@ -1,10 +1,12 @@
 /*
- * LikeOS-64 stdio_ext.c - Inspecting a FILE from outside the C library
+ * LikeOS stdio_ext.c - Inspecting a FILE from outside the C library
  *
  * See <stdio_ext.h> for what these are and why they are here.  Each one is a
  * few lines; what matters is that they exist, because their absence makes
  * every GNU package that bundles gnulib fail to build with a #error naming
  * neither the package nor the cause.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio_ext.h>

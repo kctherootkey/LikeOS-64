@@ -4,7 +4,10 @@
  * These swap regardless of the machine's own byte order; endian.h builds the
  * host/network conversions on top of them.  GCC's builtins compile to a single
  * bswap/rotate instruction, so there is no reason to hand-roll the shifts.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _BYTESWAP_H
 #define _BYTESWAP_H
 

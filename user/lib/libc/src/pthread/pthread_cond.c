@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 POSIX Threads - Condition Variable Implementation
+ * LikeOS POSIX Threads - Condition Variable Implementation
  *
  * Futex-based condition variables using sequence number protocol.
  * 
@@ -8,6 +8,8 @@
  * - wait: save seq, unlock mutex, futex_wait on seq, relock mutex
  * - signal: increment seq, futex_wake(1)
  * - broadcast: increment seq, futex_wake(all) or use requeue
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <pthread.h>

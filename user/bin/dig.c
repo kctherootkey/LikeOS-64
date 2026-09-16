@@ -20,6 +20,8 @@
  *   tcp, short, trace, recurse, search, cmd, comments, stats,
  *   question, answer, authority, additional, all, multiline,
  *   time=N, tries=N, retry=N, ndots=N, bufsize=N, dnssec, nsid
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

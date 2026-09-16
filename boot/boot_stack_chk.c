@@ -1,4 +1,7 @@
 // Stack canary support for the UEFI bootloader
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <stdint.h>
 
 uint64_t __stack_chk_guard = 0xDEADBEEFCAFEBABEULL;

@@ -1,4 +1,4 @@
-// LikeOS-64 - UNIX process credentials
+// LikeOS - UNIX process credentials
 //
 // A per-task credential set: real / effective / saved-set user and group IDs,
 // the filesystem IDs (which track the effective IDs), and the supplementary
@@ -12,6 +12,9 @@
 // Threads (CLONE_THREAD) each carry a copy; the set*-id syscalls apply their
 // result to every thread of the group (cred_broadcast in cred.c), which gives
 // the process-wide semantics POSIX asks for.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_CRED_H
 #define LIKEOS_CRED_H
 

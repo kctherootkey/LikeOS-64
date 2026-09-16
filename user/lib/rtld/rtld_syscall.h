@@ -1,4 +1,7 @@
 // ld-likeos.so — Minimal syscall stubs (no libc dependency)
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef _RTLD_SYSCALL_H
 #define _RTLD_SYSCALL_H
 

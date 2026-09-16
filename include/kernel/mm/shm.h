@@ -1,4 +1,4 @@
-/* LikeOS-64 POSIX shared memory objects.
+/* LikeOS POSIX shared memory objects.
  *
  * A named, reference-counted array of physical pages.  Unlike every other
  * mapping in this system, these pages are shared between processes that are
@@ -9,7 +9,10 @@
  * The objects are reached through /dev/shm, so a handle on one is an ordinary
  * vfs_file and inherits dup/fork/exec/close refcounting, fstat, ftruncate and
  * descriptor passing for free rather than needing a parallel set of hooks.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _KERNEL_MM_SHM_H_
 #define _KERNEL_MM_SHM_H_
 

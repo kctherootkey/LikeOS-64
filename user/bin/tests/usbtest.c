@@ -6,6 +6,8 @@
  * bottleneck during slow curl downloads.  If usbtest reports multi-MB/s and
  * curl is at 300 KB/s, the storage stack is fine and the problem is in the
  * network/TLS/userspace pipeline.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

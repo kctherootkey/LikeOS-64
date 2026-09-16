@@ -1,4 +1,4 @@
-// LikeOS-64 -- vmwgfx: the guest-to-host message channel (the "backdoor").
+// LikeOS -- vmwgfx: the guest-to-host message channel (the "backdoor").
 //
 // The device is only half of what the hypervisor exposes.  The other half is
 // a port-I/O protocol on port 0x5658, entered with a magic value in EAX, and
@@ -26,6 +26,8 @@
 // implement RPCI (or on real hardware, where port 0x5658 reads back all
 // ones) the OPEN simply fails, and everything above is told so.  Nothing in
 // the graphics path depends on a message getting through.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/dev/gpu/drm_internal.h>

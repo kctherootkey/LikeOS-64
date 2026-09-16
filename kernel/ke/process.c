@@ -1,4 +1,7 @@
-// LikeOS-64 -- process identity, sessions, process groups and rusage.
+// LikeOS -- process identity, sessions, process groups and rusage.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/fs/file.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

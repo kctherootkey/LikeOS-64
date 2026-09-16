@@ -17,6 +17,8 @@
  *
  * Error path only in the parent: the child gets 0 and returns at once.  The
  * pushes there go below the return slot and are the parent's own to use.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 	.text

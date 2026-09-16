@@ -1,4 +1,4 @@
-// LikeOS-64 -- high-resolution timers.
+// LikeOS -- high-resolution timers.
 //
 // The scheduler tick is periodic and coarse (100-200 Hz as calibrated), and
 // every timed wait used to be rounded up to it.  That is fine for a shell
@@ -13,6 +13,9 @@
 // in interrupt context on the CPU that took the timer interrupt, with
 // interrupts disabled: they may wake tasks (sched_claim_wake +
 // sched_enqueue_ready, poll_notify_wq) and re-arm timers, and nothing else.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_KE_HRTIMER_H
 #define KERNEL_KE_HRTIMER_H
 

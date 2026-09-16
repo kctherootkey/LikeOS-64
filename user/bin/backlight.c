@@ -6,7 +6,10 @@
  * actual_brightness and bl_power.  This is the shell's hand on it:
  * print the level, set it in raw units or percent, step it, switch it
  * off and on.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

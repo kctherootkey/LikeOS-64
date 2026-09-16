@@ -11,7 +11,10 @@
  * unchangeable afterwards.  It is tracked here (and settable through fwide)
  * because programs query it; the implementation would work without it, but a
  * program that asks is entitled to a truthful answer.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <wchar.h>
 #include <stdlib.h>

@@ -1,4 +1,4 @@
-// LikeOS-64 Intel e1000e (PCI Express) NIC Driver
+// LikeOS Intel e1000e (PCI Express) NIC Driver
 //
 // Targets the gigabit PCI-Express family of Intel server/desktop NICs that
 // share the 82574L register layout:
@@ -13,6 +13,8 @@
 // The legacy descriptor format is used for both RX and TX (the same format
 // the older e1000 driver uses); this keeps the driver simple while still
 // being functionally correct for the supported hardware.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_E1000E_H_
 #define _KERNEL_E1000E_H_

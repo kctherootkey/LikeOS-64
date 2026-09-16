@@ -1,4 +1,7 @@
-// LikeOS-64 - Common status and error codes
+// LikeOS - Common status and error codes
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_STATUS_H
 #define LIKEOS_STATUS_H
 

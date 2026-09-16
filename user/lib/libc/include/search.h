@@ -12,7 +12,10 @@
  * The tree is the one worth knowing about: it is kept balanced (an AVL tree),
  * so a program that inserts already-sorted keys -- which is most programs
  * reading a sorted file -- gets O(log n) lookups rather than a linked list.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _SEARCH_H
 #define _SEARCH_H
 

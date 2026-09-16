@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #include <stdio.h>
 #include <sysexits.h>
 #include <sys/ipc.h>
@@ -13425,7 +13429,7 @@ int main(int argc, char **argv)
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
 	printf("\n========================================\n");
-	printf("  LikeOS-64 Libc Tests%s\n", net_only     ? " (network only)" :
+	printf("  LikeOS Libc Tests%s\n", net_only     ? " (network only)" :
 					     gpu_only     ? " (graphics only)" :
 					     skip_network ? " (no network)" :
 							    " (all)");

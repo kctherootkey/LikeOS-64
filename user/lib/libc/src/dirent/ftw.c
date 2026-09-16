@@ -29,7 +29,10 @@
  * a process-wide resource this library must not silently move under a
  * multithreaded caller (conventional Unix implementations document exactly
  * that hazard).
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <ftw.h>
 #include <dirent.h>
 #include <errno.h>

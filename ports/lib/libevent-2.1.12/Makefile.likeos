@@ -1,7 +1,9 @@
 # Makefile.likeos - cross-build of libevent 2.1.12 as a PIC shared object
-# (libevent.so) for LikeOS-64 userland.  Uses select(2)+poll(2)+signal(3)
+# (libevent.so) for LikeOS userland.  Uses select(2)+poll(2)+signal(3)
 # back-ends; epoll/eventfd/timerfd/signalfd/kqueue/openssl/zlib are all
 # disabled in include/event2/event-config.h.  No autoconf is involved.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 LIBC_DIR     := ../../../user/lib/libc
 RTLD_DIR     := ../../../user/lib/rtld

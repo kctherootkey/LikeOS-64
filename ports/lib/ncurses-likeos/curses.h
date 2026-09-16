@@ -5,7 +5,7 @@
  * Provides the subset of ncurses needed by GNU nano and other curses programs.
  * Based on ncurses 6.5 API from ports/lib/ncurses-6.5/.
  *
- * Copyright (C) 2026 LikeOS Project
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _CURSES_H

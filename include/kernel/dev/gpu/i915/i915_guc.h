@@ -1,4 +1,7 @@
-// LikeOS-64 -- the GuC: firmware load, the command transport, submission.
+// LikeOS -- the GuC: firmware load, the command transport, submission.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef I915_GUC_H
 #define I915_GUC_H
 

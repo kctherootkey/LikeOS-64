@@ -10,7 +10,10 @@
  * Getting this wrong is not cosmetic.  Every line editor, pager and terminal
  * multiplexer computes cursor positions from wcwidth, so a character reported
  * at the wrong width leaves the cursor and the text permanently out of step.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <wchar.h>
 #include "unicode.h"
 

@@ -1,9 +1,12 @@
-// LikeOS-64 -- display-manager core: mode setting.
+// LikeOS -- display-manager core: mode setting.
 //
 // The mode objects (connectors, encoders, crtcs, planes, properties,
 // blobs, framebuffers), the legacy and atomic mode-setting ioctls, dumb
 // buffers, cursors, page flips, dirty rectangles, and the vblank counter
 // with its events.  What touches hardware goes through drm_driver.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/dev/gpu/drm_internal.h>

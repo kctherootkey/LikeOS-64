@@ -1,4 +1,4 @@
-// LikeOS-64 -- mremap(2): resize or move a mapping without copying pages.
+// LikeOS -- mremap(2): resize or move a mapping without copying pages.
 //
 // A growing heap or hash table wants more address space at the same place
 // if that is free, and somewhere else otherwise -- either way keeping the
@@ -6,6 +6,9 @@
 // the region record; moving carries the page-table entries over to the new
 // address one by one and unlinks them from the old, so the physical pages
 // change address without ever being touched.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -129,13 +132,17 @@ static int64_t sys_mremap_locked(uint64_t old_addr, uint64_t old_size,
 		mm_unmap_range_and_regions(cur, new_addr, new_size);
 		dest = new_addr;
 	} else {
-		cur->mmap_base -= new_size;
-		if (cur->mmap_base < cur->brk + (4 * 1024 * 1024) ||
-		    cur->mmap_base < 0x10000) {
-			cur->mmap_base += new_size;
+		/* The top-down first fit sys_mmap uses (kernel/mm/mmap.c).
+		 * This was a second copy of the cursor that replaced, with the
+		 * same fault: it never looked at the table, so a realloc that
+		 * moved a large block could put it down on a shared library.
+		 * The source range is still recorded while the destination is
+		 * chosen, so the two can never overlap. */
+		dest = mmap_find_gap(cur, new_size);
+		if (!dest)
 			return -ENOMEM;
-		}
-		dest = cur->mmap_base;
+		if (dest < cur->mmap_base)
+			cur->mmap_base = dest;
 	}
 
 	/* A fresh record for the destination, carrying the source's
@@ -143,18 +150,12 @@ static int64_t sys_mremap_locked(uint64_t old_addr, uint64_t old_size,
 	 * reason sys_mmap gives. */
 	mmap_region_t *nr = mm_alloc_mmap_region(cur);
 
-	if (!nr) {
-		if (!(flags & MREMAP_FIXED))
-			cur->mmap_base += new_size;
+	if (!nr)
 		return -ENOMEM;
-	}
 	/* mm_alloc_mmap_region may have grown the table; re-find the source. */
 	r = mm_find_mmap_region(cur, old_addr);
-	if (!r) {
-		if (!(flags & MREMAP_FIXED))
-			cur->mmap_base += new_size;
+	if (!r)
 		return -EFAULT;
-	}
 
 	nr->start = dest;
 	nr->length = new_size;

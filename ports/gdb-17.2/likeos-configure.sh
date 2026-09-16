@@ -1,5 +1,5 @@
 #!/bin/sh
-# likeos-configure.sh — configure gdb 17.2 for the LikeOS-64 target.
+# likeos-configure.sh — configure gdb 17.2 for the LikeOS target.
 #
 # Drives the stock autoconf configure through the LikeOS cross wrappers.  gdb is
 # C++, so it needs likeos-c++ from the xorg toolchain -- the only C++-capable
@@ -12,6 +12,9 @@
 # keeps src/ clean enough to re-unpack and re-patch.
 #
 # Idempotent: re-running reconfigures from scratch.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -146,4 +149,4 @@ LIKEOS_SYSROOT="$sysroot" \
 	--without-zstd --without-debuginfod \
 	--with-gmp="$sysroot/usr" --with-mpfr="$sysroot/usr"
 
-echo "likeos-configure.sh: gdb configured for LikeOS-64 in build/"
+echo "likeos-configure.sh: gdb configured for LikeOS in build/"

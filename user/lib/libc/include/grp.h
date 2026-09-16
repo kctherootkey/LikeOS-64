@@ -1,6 +1,9 @@
 /*
  * grp.h - group database (/etc/group) for LikeOS
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _GRP_H
 #define _GRP_H
 

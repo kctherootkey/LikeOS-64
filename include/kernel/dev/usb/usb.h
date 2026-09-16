@@ -1,4 +1,7 @@
-// LikeOS-64 - USB Device Definitions
+// LikeOS - USB Device Definitions
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef LIKEOS_USB_H
 #define LIKEOS_USB_H
 

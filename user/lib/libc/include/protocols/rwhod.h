@@ -16,7 +16,10 @@
  * so -- exactly as it would on any system where rwhod is not running.  The
  * header is here because programs conditionally compile against it and expect
  * it to exist.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _PROTOCOLS_RWHOD_H
 #define _PROTOCOLS_RWHOD_H 1
 

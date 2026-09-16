@@ -1,9 +1,12 @@
-// LikeOS-64 -- HDMI infoframes: the packets that describe the picture.
+// LikeOS -- HDMI infoframes: the packets that describe the picture.
 //
 // Pure: fixed-width types and the mode table only, so the build host's
 // compiler can run it (host/test-hdmi.sh).  An infoframe is a 4-byte
 // header (type, version, payload length, checksum) and a payload; the
 // checksum makes the whole thing sum to zero modulo 256.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/dev/gpu/i915/intel_infoframe.h>
 

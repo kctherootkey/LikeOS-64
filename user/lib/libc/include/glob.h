@@ -1,7 +1,10 @@
 /*
  * glob.h - pathname pattern matching for LikeOS
  * Minimal implementation sufficient for nano's rcfile.c usage.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #ifndef _GLOB_H
 #define _GLOB_H
 

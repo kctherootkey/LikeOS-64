@@ -1,4 +1,4 @@
-// LikeOS-64 - HID over I2C Driver
+// LikeOS - HID over I2C Driver
 // Intel DesignWare I2C controller + Microsoft HID-over-I2C protocol
 //
 // Supports Intel LPSS Serial IO I2C found on Tiger Lake through Arrow Lake.
@@ -9,6 +9,8 @@
 //   - Synopsys DesignWare DW_apb_i2c Databook
 //   - Microsoft HID over I2C Protocol Specification v1.0
 //   - Intel LPSS Serial IO I2C documentation
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef LIKEOS_I2C_HID_H
 #define LIKEOS_I2C_HID_H

@@ -1,4 +1,4 @@
-// LikeOS-64 Intel 82576 Gigabit Ethernet Controller (igb) NIC Driver
+// LikeOS Intel 82576 Gigabit Ethernet Controller (igb) NIC Driver
 //
 // Supports the 82575 / 82576 / I350 / I210 / I211 family of PCIe gigabit
 // controllers.  The QEMU emulation target is `-device igb` (vendor 0x8086,
@@ -9,6 +9,8 @@
 //     internal layout for the per-queue rings)
 //   - Per-queue RX/TX descriptor control registers at queue-0 offsets
 //   - PCI Express capability for INTx-disable handling
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_IGB_H_
 #define _KERNEL_IGB_H_

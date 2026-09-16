@@ -1,4 +1,4 @@
-// LikeOS-64 — Socket Buffer (sk_buff)
+// LikeOS — Socket Buffer (sk_buff)
 //
 // A reference-counted, ownership-transferring packet buffer used end-to-end
 // by the network stack.  Replaces the previous "static byte buffer + global
@@ -40,6 +40,8 @@
 // No spinlock is ever held across a layer-to-layer call.  All shared state
 // is protected by short-held, per-resource locks (per-queue, per-socket,
 // per-pool freelist).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef LIKEOS_SKB_H
 #define LIKEOS_SKB_H

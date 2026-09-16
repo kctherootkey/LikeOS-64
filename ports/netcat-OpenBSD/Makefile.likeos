@@ -1,6 +1,8 @@
 # Makefile.likeos - Build netcat (nc) for LikeOS
 #
 # Links against LikeOS libc.so; no external library dependencies.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 CC = gcc
 LD = ld

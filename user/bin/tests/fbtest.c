@@ -5,6 +5,9 @@
 // unblank, probe the unsupported ioctls it would fall back from, exercise
 // the read/write/lseek file interface, then mmap the framebuffer, paint the
 // whole screen blue, and finally unmap, restore the mode and close.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>

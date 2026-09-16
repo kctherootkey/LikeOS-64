@@ -1,5 +1,5 @@
 /*
- * LikeOS-64 stdio_ext.h - Inspecting a FILE from outside the C library
+ * LikeOS stdio_ext.h - Inspecting a FILE from outside the C library
  *
  * Not standard, and not an extension invented here: this is the interface
  * Solaris introduced and glibc, musl and the BSDs adopted, and it is what
@@ -17,6 +17,8 @@
  *
  * __fseterr is the musl spelling rather than the Solaris one; gnulib looks for
  * exactly that name.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #ifndef _STDIO_EXT_H

@@ -1,11 +1,13 @@
 /*
- * LikeOS-64 POSIX Threads - Mutex Implementation
+ * LikeOS POSIX Threads - Mutex Implementation
  *
  * Futex-based mutexes with support for:
  * - Normal mutexes (fast path via atomic CAS)
  * - Recursive mutexes (owner tracking + count)
  * - Error-checking mutexes (deadlock detection)
  * - Robust mutexes (automatic cleanup on owner death)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <pthread.h>

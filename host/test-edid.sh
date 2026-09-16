@@ -3,6 +3,9 @@
 # (kernel/dev/gpu/drm/drm_edid_parse.c, drm_modes.c).  Both are pure --
 # fixed-width types only -- so the build host's compiler runs them against
 # recorded EDID blocks and published timings.  Run from the repository root.
+#
+# Copyright (C) 2026 The LikeOS Project
+
 set -e
 TMP=${TMPDIR:-/tmp}/likeos-edid-test.$$
 trap 'rm -rf "$TMP"' EXIT

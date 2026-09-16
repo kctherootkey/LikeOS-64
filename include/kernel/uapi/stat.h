@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
 #ifndef _KERNEL_STAT_H_
 #define _KERNEL_STAT_H_
 

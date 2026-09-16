@@ -25,6 +25,8 @@
 # package built before it the order is not observable.  A package that installs
 # a header named like one of the libc's would now win, which is the hazard to
 # remember if a build ever starts using a declaration it should not have.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 set -e
 

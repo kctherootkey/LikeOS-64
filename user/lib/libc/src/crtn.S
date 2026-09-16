@@ -7,6 +7,8 @@
  *   crti.o prologue (push %rbp / mov %rsp,%rbp)
  *     ... body fragments from intermediate objects (e.g. call cpuid_setup) ...
  *   crtn.o epilogue (pop %rbp / ret)
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
         .section .init,"ax",@progbits

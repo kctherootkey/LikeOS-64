@@ -1,9 +1,11 @@
-// LikeOS-64 Realtek RTL8139 NIC Driver
+// LikeOS Realtek RTL8139 NIC Driver
 //
 // The RTL8139 is a venerable 10/100 Mbit/s PCI Ethernet controller. It is
 // supported by QEMU (`-device rtl8139`) and most physical RTL8139C /
 // RTL8139C+ cards.  It uses I/O-port (PMIO) registers (BAR0) and a single
 // linear ring buffer for RX with four 2 KiB transmit slots.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/rtl8139.h>
 #include <kernel/net/net.h>

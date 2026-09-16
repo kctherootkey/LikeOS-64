@@ -1,4 +1,4 @@
-// LikeOS-64 DEC 21x4x ("Tulip") NIC Driver
+// LikeOS DEC 21x4x ("Tulip") NIC Driver
 //
 // Drives the DEC 21040 / 21041 / 21140 / 21142 / 21143 PCI Ethernet
 // controllers — the QEMU `-device tulip` exposes a 21143 (vendor 0x1011,
@@ -6,6 +6,8 @@
 // and RX descriptor ring in "ring" mode (RER/TER on the last entry to
 // loop back to the head).  Legacy INTx only — no MSI/MSI-X on this
 // part family.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/tulip.h>
 #include <kernel/net/net.h>

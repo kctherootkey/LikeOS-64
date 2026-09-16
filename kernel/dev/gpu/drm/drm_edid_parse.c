@@ -1,5 +1,8 @@
-// LikeOS-64 -- the EDID parser (pure: no kernel calls, so the host tests
+// LikeOS -- the EDID parser (pure: no kernel calls, so the host tests
 // compile it too).  See drm_edid.h.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/drm_edid.h>
 
 #ifndef EINVAL

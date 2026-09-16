@@ -1,5 +1,7 @@
-// LikeOS-64 Mouse Cursor Loader
+// LikeOS Mouse Cursor Loader
 // Loads Xcursor format cursor files for mouse pointer display
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #ifndef _KERNEL_CURSOR_H_
 #define _KERNEL_CURSOR_H_

@@ -1,4 +1,7 @@
-// LikeOS-64 TTY/PTY subsystem
+// LikeOS TTY/PTY subsystem
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/ke/waitq.h>
 #include <kernel/io/tty.h>
 #include <kernel/io/vt.h>
@@ -8,6 +11,7 @@
 #include <kernel/dev/usb/usb_serial.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/cred.h> /* current_cred(), for the pty slave's owner */
 #include <kernel/ke/timer.h>
 #include <kernel/net/net.h>
 #include <kernel/uapi/bug.h>
@@ -92,6 +96,14 @@ typedef struct pty {
 	task_t *slave_write_waiters;
 	int master_open;
 	int slave_open;
+	/* Who owns the slave node: the user that opened the master, recorded
+	 * at allocation.  /dev/pts/N is that user's terminal (mode 0620), so
+	 * without this the node would have to stay world-writable -- which is
+	 * what it used to be, letting any account read another's keystrokes
+	 * and write to its screen.  This is what grantpt(3) is for elsewhere;
+	 * nothing here hands a pty to a different user after the fact, so
+	 * there is no chown path to keep in step. */
+	uint32_t owner_uid;
 	void *slave_vf; // diagnostic: slave's vfs_file (refcount visibility)
 	/* Who is polling the MASTER end.  The slave end has its own, in the
 	 * tty_t above -- the two directions become ready independently, and a
@@ -1289,6 +1301,13 @@ int tty_pty_allocate(int *out_id)
 			wq_head_init_once(&pty->slave.poll_wq,
 					  "pty-slave-poll");
 			pty->id = i;
+			/* Whoever opened the master owns the slave node; see
+			 * owner_uid.  Kernel context (no current task) leaves
+			 * it root-owned. */
+			{
+				cred_t *c = current_cred();
+				pty->owner_uid = c ? c->euid : 0;
+			}
 			pty->master_open = 1;
 			pty->slave_open = 0;
 			pty->slave.id = i;
@@ -1375,6 +1394,18 @@ int tty_pty_is_allocated(int id)
 		return 0;
 	}
 	return pty->master_open || pty->slave_open;
+}
+
+/* Owning uid of a pty slave node -- see pty_t.owner_uid.  An id that names no
+ * pty answers 0, the conventional root ownership for a node that is not
+ * there. */
+uint32_t tty_pty_owner_uid(int id)
+{
+	pty_t *pty = tty_get_pty(id);
+	if (!pty) {
+		return 0;
+	}
+	return pty->owner_uid;
 }
 
 long tty_pty_master_read(int id, void *buf, long count, int nonblock)

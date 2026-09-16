@@ -1,4 +1,4 @@
-// LikeOS-64 AMD PCnet32 NIC Driver
+// LikeOS AMD PCnet32 NIC Driver
 //
 // Supports the AMD PCnet-PCI family (PCI 0x1022:0x2000):
 //   - Am79C970A   "PCnet-PCI II"
@@ -8,6 +8,8 @@
 // Programs the chip in 32-bit DWord I/O mode with SWSTYLE=2 ("PCnet-PCI II
 // 32-bit"), which works on every member of the family.  The chip has only
 // legacy INTx — no MSI/MSI-X.
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/pcnet32.h>
 #include <kernel/net/net.h>

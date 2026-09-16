@@ -1,4 +1,4 @@
-// LikeOS-64 -- the GT's clock: render P-states.
+// LikeOS -- the GT's clock: render P-states.
 //
 // Left to the firmware the GT idles at its lowest P-state and stays
 // there: nothing in this driver runs the up/down evaluation the hardware
@@ -7,6 +7,9 @@
 // non-turbo frequency once and leave the hardware's own controller off,
 // so the request is what runs (the part still throttles itself for heat
 // and power).  Nothing to do on a platform whose GuC owns the clocks.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/io/console.h>

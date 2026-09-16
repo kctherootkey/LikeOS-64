@@ -1,4 +1,7 @@
-// LikeOS-64 -- pure PLL arithmetic shared by the driver and the host tests.
+// LikeOS -- pure PLL arithmetic shared by the driver and the host tests.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DPLL_CALC_H
 #define KERNEL_DEV_GPU_I915_INTEL_DPLL_CALC_H
 

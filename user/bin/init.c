@@ -40,7 +40,10 @@
  * Filesystems are assumed already mounted (the root is mounted by the kernel);
  * userspace mounting is a future addition -- a "wait" entry running a mount
  * script is the intended place for it.
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

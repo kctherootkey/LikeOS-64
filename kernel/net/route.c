@@ -1,7 +1,9 @@
-// LikeOS-64 - IP Routing Table
+// LikeOS - IP Routing Table
 //
 // Static routing table with longest-prefix-match lookup.
 // Populated by DHCP and ioctl (SIOCADDRT/SIOCDELRT).
+//
+// Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>

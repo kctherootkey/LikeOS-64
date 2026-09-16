@@ -5,6 +5,8 @@
  * Supports: -i, -0, -u, -C, -S, -v, --help, --version,
  *           --block-signal, --default-signal, --ignore-signal,
  *           --list-signal-handling, NAME=VALUE, COMMAND [ARG...]
+ *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 #include <stdio.h>

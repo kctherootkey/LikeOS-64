@@ -1,4 +1,4 @@
-// LikeOS-64 -- hotplug: noticing a sink being plugged in or pulled.
+// LikeOS -- hotplug: noticing a sink being plugged in or pulled.
 //
 // Each DDI has a hotplug detect pin.  The south display engine (the
 // PCH) filters its pulses -- a long one is a plug or an unplug, a short
@@ -8,6 +8,9 @@
 // port what is there now (DPCD over AUX, the EDID over DDC), and updates
 // the connector's status and mode list.  A client that asks the
 // connector again (a display server re-probing) sees the new sink.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
