@@ -31,22 +31,6 @@ static inline double u2d(uint64_t u)
 	return v.d;
 }
 
-/* Absolute value ---------------------------------------------------------- */
-double fabs(double x)
-{
-	return u2d(d2u(x) & ~(uint64_t)0x8000000000000000ULL);
-}
-float fabsf(float x)
-{
-	union {
-		float f;
-		uint32_t u;
-	} v;
-	v.f = x;
-	v.u &= 0x7FFFFFFFu;
-	return v.f;
-}
-
 /* Truncation toward zero -------------------------------------------------- */
 static double trunc_d(double x)
 {
@@ -57,60 +41,6 @@ static double trunc_d(double x)
 		long long i = (long long)x;
 		return (double)i;
 	}
-}
-
-/* Floor / Ceil / Round ---------------------------------------------------- */
-double floor(double x)
-{
-	double t = trunc_d(x);
-	if (x < 0 && t != x)
-		t -= 1.0;
-	return t;
-}
-double ceil(double x)
-{
-	double t = trunc_d(x);
-	if (x > 0 && t != x)
-		t += 1.0;
-	return t;
-}
-double round(double x)
-{
-	return (x >= 0) ? floor(x + 0.5) : ceil(x - 0.5);
-}
-float floorf(float x)
-{
-	return (float)floor(x);
-}
-float ceilf(float x)
-{
-	return (float)ceil(x);
-}
-float roundf(float x)
-{
-	return (float)round(x);
-}
-
-/* fmod (IEEE-754 remainder, sign of x) ------------------------------------ */
-double fmod(double x, double y)
-{
-	if (y == 0.0)
-		return 0.0;
-	double q = x / y;
-	double t = trunc_d(q);
-	return x - t * y;
-}
-float fmodf(float x, float y)
-{
-	return (float)fmod(x, y);
-}
-
-/* Square root via x86 SSE (sqrtsd is a single instruction) ---------------- */
-double sqrt(double x)
-{
-	double r;
-	__asm__ __volatile__("sqrtsd %1, %0" : "=x"(r) : "x"(x));
-	return r;
 }
 
 /* Transcendentals.
@@ -125,146 +55,6 @@ double sqrt(double x)
  * small enough to be obviously correct.
  */
 
-/* log2(x), the primitive the other logarithms are built from. */
-double log2(double x)
-{
-	double r;
-	__asm__("fld1\n\tfxch %%st(1)\n\tfyl2x" : "=t"(r) : "0"(x) : "st(1)");
-	return r;
-}
-
-double log(double x)
-{
-	return log2(x) * 0.69314718055994530942; /* ln(2) */
-}
-
-double log10(double x)
-{
-	return log2(x) * 0.30102999566398119521; /* log10(2) */
-}
-
-/* log(1+x), accurate for tiny x where log(1+x) would lose everything to
- * cancellation.  fyl2xp1 exists precisely for this and is valid for
- * |x| < 1 - sqrt(2)/2; fall back outside that. */
-double log1p(double x)
-{
-	double r;
-
-	if (x < -0.29 || x > 0.29)
-		return log(1.0 + x);
-	__asm__("fld1\n\tfxch %%st(1)\n\tfyl2xp1" : "=t"(r) : "0"(x) : "st(1)");
-	return r * 0.69314718055994530942;
-}
-
-/* 2^x, the primitive the exponentials are built from.  f2xm1 computes
- * 2^f - 1 for |f| <= 1, so the argument is split into integer and fractional
- * parts and recombined with fscale. */
-double exp2(double x)
-{
-	double r;
-
-	__asm__("fld %%st(0)\n\t"     /* x x            */
-		"frndint\n\t"         /* i x            */
-		"fsubr %%st,%%st(1)\n\t" /* i f  (f=x-i)  */
-		"fxch %%st(1)\n\t"    /* f i            */
-		"f2xm1\n\t"           /* 2^f-1 i        */
-		"fld1\n\t"            /* 1 2^f-1 i      */
-		"faddp\n\t"           /* 2^f i          */
-		"fscale\n\t"          /* 2^f*2^i i      */
-		"fstp %%st(1)"        /* result         */
-		: "=t"(r)
-		: "0"(x));
-	return r;
-}
-
-double exp(double x)
-{
-	return exp2(x * 1.4426950408889634074); /* 1/ln(2) */
-}
-
-/* e^x - 1, for tiny x where exp(x)-1 would cancel to nothing. */
-double expm1(double x)
-{
-	if (x > -0.5 && x < 0.5) {
-		/* 2^y - 1 directly, which is what f2xm1 computes. */
-		double r;
-		double y = x * 1.4426950408889634074;
-		if (y > -1.0 && y < 1.0) {
-			__asm__("f2xm1" : "=t"(r) : "0"(y));
-			return r;
-		}
-	}
-	return exp(x) - 1.0;
-}
-
-double pow(double x, double y)
-{
-	/* The special cases are not decoration: pow(x,0) is 1 for every x
-	 * including NaN, and log2 of a non-positive number is undefined. */
-	if (y == 0.0)
-		return 1.0;
-	if (x == 0.0)
-		return (y > 0.0) ? 0.0 : 1.0 / 0.0;
-	if (x < 0.0) {
-		/* Defined only for integral exponents; the sign follows the
-		 * parity. */
-		double iy = (y < 0) ? -y : y;
-		if (iy != (double)(long long)iy)
-			return 0.0 / 0.0; /* NaN */
-		return (((long long)iy & 1) ? -1.0 : 1.0) * exp2(y * log2(-x));
-	}
-	return exp2(y * log2(x));
-}
-
-double sin(double x)
-{
-	double r;
-	__asm__("fsin" : "=t"(r) : "0"(x));
-	return r;
-}
-
-double cos(double x)
-{
-	double r;
-	__asm__("fcos" : "=t"(r) : "0"(x));
-	return r;
-}
-
-/* Both at once.
- *
- * A GNU extension rather than a standard function, and worth having as more
- * than a convenience wrapper: fsincos computes the pair in ONE instruction,
- * where calling sin() and cos() separately does the argument reduction and the
- * polynomial evaluation twice.  Software that rotates or draws circles asks
- * for it by name -- GTK's GL demo does, which is where its absence showed.
- *
- * fsincos leaves cos in ST(0) and sin in ST(1), which is what "=t" and "=u"
- * name.  Its argument domain is |x| < 2^63, the same as the fsin and fcos
- * above; outside that all three leave the operand untouched, which is a
- * property of this file's trigonometry generally rather than of this function.
- */
-void sincos(double x, double *s, double *c)
-{
-	double sn, cs;
-
-	__asm__("fsincos" : "=t"(cs), "=u"(sn) : "0"(x));
-	if (s)
-		*s = sn;
-	if (c)
-		*c = cs;
-}
-
-void sincosf(float x, float *s, float *c)
-{
-	double sn, cs;
-
-	sincos((double)x, &sn, &cs);
-	if (s)
-		*s = (float)sn;
-	if (c)
-		*c = (float)cs;
-}
-
 void sincosl(long double x, long double *s, long double *c)
 {
 	long double sn, cs;
@@ -274,109 +64,6 @@ void sincosl(long double x, long double *s, long double *c)
 		*s = sn;
 	if (c)
 		*c = cs;
-}
-
-double tan(double x)
-{
-	double r, discard;
-	/* fptan pushes 1.0 after the result, so the stack has to be unwound. */
-	__asm__("fptan" : "=t"(discard), "=u"(r) : "0"(x));
-	(void)discard;
-	return r;
-}
-
-/* atan2 is the primitive: fpatan takes both arguments and gets the quadrant
- * right, which is the whole reason atan2 exists. */
-double atan2(double y, double x)
-{
-	double r;
-	__asm__("fpatan" : "=t"(r) : "0"(x), "u"(y) : "st(1)");
-	return r;
-}
-
-double atan(double x)
-{
-	return atan2(x, 1.0);
-}
-
-double asin(double x)
-{
-	/* asin(x) = atan2(x, sqrt(1-x^2)) — correct at |x| = 1, where the
-	 * atan(x/sqrt(1-x^2)) form divides by zero. */
-	return atan2(x, sqrt(1.0 - x * x));
-}
-
-double acos(double x)
-{
-	return atan2(sqrt(1.0 - x * x), x);
-}
-
-/* sinh and tanh, through expm1 rather than exp.
- *
- * Both are differences of two exponentials that approach each other as the
- * argument approaches zero, and writing them that way destroys the answer:
- * sinh(x) as (e^x - e^-x)/2 subtracts 1.0000000001 from 0.9999999999 and keeps
- * whatever survives, which for x = 1e-10 is eight correct digits out of
- * sixteen.  The error is in the SUBTRACTION, so no amount of accuracy in exp()
- * helps -- the digits are gone before it returns.
- *
- * expm1(x) computes e^x - 1 without ever forming e^x, so the small quantity
- * stays small and keeps its precision.  Rewriting each function in terms of
- * t = e^|x| - 1 is then exact algebra:
- *
- *   sinh = (t*t + 2t) / (2(t+1))     tanh = (e^2a - 1) / (e^2a + 1)
- *
- * and each is given in the two forms below because they round differently --
- * which of the two is used is the only thing the |x| < 1 test decides.
- *
- * Both take |x| and put the sign back at the end: they are odd functions, and
- * a branch on the sign is a second thing that can be wrong.
- */
-double sinh(double x)
-{
-	double a = fabs(x);
-	double t;
-
-	/* Above this, e^-a has underflowed relative to e^a and sinh IS
-	 * e^a / 2.  exp() overflows a little beyond it, which is correct:
-	 * so does sinh. */
-	if (a > 22.0)
-		return copysign(0.5 * exp(a), x);
-
-	t = expm1(a);
-	if (a < 1.0)
-		return copysign(0.5 * (2.0 * t - t * t / (t + 1.0)), x);
-	return copysign(0.5 * (t + t / (t + 1.0)), x);
-}
-
-double cosh(double x)
-{
-	/* No cancellation here -- cosh is a SUM of the same two exponentials,
-	 * and near zero both are near 1 and add to 2 without losing anything.
-	 * So the direct form is the right one. */
-	double e = exp(fabs(x));
-
-	return (e + 1.0 / e) * 0.5;
-}
-
-double tanh(double x)
-{
-	double a = fabs(x);
-	double t;
-
-	/* Saturate early: e^2a overflows long before tanh stops being 1 to
-	 * every bit of a double. */
-	if (a > 22.0)
-		return copysign(1.0, x);
-	if (a < 0x1p-28)
-		return x; /* tanh(x) == x down here, sign and all */
-
-	if (a >= 1.0) {
-		t = expm1(2.0 * a);
-		return copysign(1.0 - 2.0 / (t + 2.0), x);
-	}
-	t = expm1(-2.0 * a);
-	return copysign(-t / (t + 2.0), x);
 }
 
 /* The inverse hyperbolics.
@@ -400,194 +87,6 @@ double tanh(double x)
  */
 #define LIKEOS_LN2 0.69314718055994530942
 
-double asinh(double x)
-{
-	double a = fabs(x);
-	double r;
-
-	if (a < 0x1p-28)
-		return x; /* asinh(x) == x to the last bit down here */
-	if (a > 0x1p28)
-		r = log(a) + LIKEOS_LN2; /* a*a would overflow */
-	else if (a > 2.0)
-		r = log(2.0 * a + 1.0 / (sqrt(a * a + 1.0) + a));
-	else
-		r = log1p(a + a * a / (1.0 + sqrt(a * a + 1.0)));
-	/* Odd function, and every branch above took |x|. */
-	return copysign(r, x);
-}
-
-double acosh(double x)
-{
-	if (x < 1.0)
-		return 0.0 / 0.0; /* NaN: acosh is undefined below 1 */
-	if (x == 1.0)
-		return 0.0;
-	if (x > 0x1p28)
-		return log(x) + LIKEOS_LN2;
-	if (x > 2.0)
-		return log(2.0 * x - 1.0 / (x + sqrt(x * x - 1.0)));
-	/* Near 1, where x*x - 1 cancels: work in t = x - 1, which is exact. */
-	{
-		double t = x - 1.0;
-
-		return log1p(t + sqrt(2.0 * t + t * t));
-	}
-}
-
-double atanh(double x)
-{
-	double a = fabs(x);
-	double r;
-
-	if (a > 1.0)
-		return 0.0 / 0.0; /* NaN: outside the domain */
-	if (a == 1.0)
-		return x / 0.0; /* the poles, with the sign of x */
-	if (a < 0x1p-28)
-		return x;
-	if (a < 0.5)
-		r = 0.5 * log1p(2.0 * a + 2.0 * a * a / (1.0 - a));
-	else
-		r = 0.5 * log1p(2.0 * a / (1.0 - a));
-	return copysign(r, x);
-}
-
-/* hypot: sqrt(x^2 + y^2) WITHOUT overflowing on the intermediate square, which
- * is the only reason to call it rather than writing the formula out. */
-double hypot(double x, double y)
-{
-	double t;
-
-	x = fabs(x);
-	y = fabs(y);
-	if (x < y) {
-		t = x;
-		x = y;
-		y = t;
-	}
-	if (x == 0.0)
-		return 0.0;
-	t = y / x;
-	return x * sqrt(1.0 + t * t);
-}
-
-double cbrt(double x)
-{
-	if (x == 0.0)
-		return 0.0;
-	if (x < 0.0)
-		return -exp2(log2(-x) / 3.0);
-	return exp2(log2(x) / 3.0);
-}
-
-double trunc(double x)
-{
-	return (x < 0.0) ? ceil(x) : floor(x);
-}
-
-double copysign(double x, double y)
-{
-	return __builtin_copysign(x, y);
-}
-
-double fmin(double a, double b)
-{
-	if (a != a)
-		return b; /* NaN loses, per the standard */
-	if (b != b)
-		return a;
-	return a < b ? a : b;
-}
-
-double fmax(double a, double b)
-{
-	if (a != a)
-		return b;
-	if (b != b)
-		return a;
-	return a > b ? a : b;
-}
-
-double fdim(double a, double b)
-{
-	return (a > b) ? a - b : 0.0;
-}
-
-/* Quiet NaN.
- *
- * The argument is a payload: an implementation may encode it in the NaN's
- * significand so that a program can tell one NaN from another.  This one
- * ignores it and returns the default quiet NaN, which the standard permits
- * ("if the argument is not a valid n-char sequence ... the result is a quiet
- * NaN") and which is what every caller here actually wants -- the payload is
- * used by numerical debuggers, and nothing on this system reads it back. */
-double nan(const char *tag)
-{
-	(void)tag;
-	return __builtin_nan("");
-}
-
-float nanf(const char *tag)
-{
-	(void)tag;
-	return __builtin_nanf("");
-}
-
-long double nanl(const char *tag)
-{
-	(void)tag;
-	return __builtin_nanl("");
-}
-
-/* The double and float halves of the scaling family.
- *
- * All of them go through the long double primitives at the bottom of this
- * file, which read and write the exponent field directly.  Scaling by a power
- * of two is EXACT in the 80-bit format -- its exponent range is far wider than
- * either of these types -- so converting the result back rounds exactly once
- * and lands on the correctly rounded answer, subnormal results included.
- *
- * ldexp used to be `x * exp2((double) e)' and frexp used to recover the
- * exponent with floor(log2(fabs(x))).  Both were wrong at the ends of the
- * range, not merely slow: the intermediate 2^e overflows to infinity for e
- * above 1023 even when x * 2^e is perfectly representable, so
- * ldexp(5e-324, 1074) -- the smallest subnormal scaled up to exactly 1.0 --
- * returned infinity.  Reading the exponent field cannot overflow, because it
- * never forms 2^e as a value at all. */
-double ldexp(double x, int e)
-{
-	return (double)ldexpl((long double)x, e);
-}
-
-float ldexpf(float x, int e)
-{
-	return (float)ldexpl((long double)x, e);
-}
-
-double frexp(double x, int *e)
-{
-	return (double)frexpl((long double)x, e);
-}
-
-float frexpf(float x, int *e)
-{
-	return (float)frexpl((long double)x, e);
-}
-
-/* scalbn is the same operation under the name C99 gives it for radix-2
- * systems, which this is; scalbln takes a long count.  Software asks for one
- * spelling or the other depending on its age -- HarfBuzz uses scalbnf. */
-double scalbn(double x, int e)
-{
-	return ldexp(x, e);
-}
-
-float scalbnf(float x, int e)
-{
-	return ldexpf(x, e);
-}
-
 double scalbln(double x, long e)
 {
 	return (double)scalblnl((long double)x, e);
@@ -598,150 +97,7 @@ float scalblnf(float x, long e)
 	return (float)scalblnl((long double)x, e);
 }
 
-double modf(double x, double *iptr)
-{
-	double i = trunc(x);
-
-	if (iptr)
-		*iptr = i;
-	return x - i;
-}
-
-float modff(float x, float *iptr)
-{
-	/* Not (float)modf(): the integral part must be computed and stored in
-	 * FLOAT precision, or a float just below a large power of two could
-	 * round the wrong way through the double round-trip. */
-	float i = truncf(x);
-
-	if (iptr)
-		*iptr = i;
-	return x - i;
-}
-
 /* float entry points, for callers that use the f-suffixed names. */
-float sqrtf(float x) { return (float)sqrt(x); }
-float expf(float x) { return (float)exp(x); }
-float logf(float x) { return (float)log(x); }
-float log2f(float x) { return (float)log2(x); }
-float log10f(float x) { return (float)log10(x); }
-float powf(float x, float y) { return (float)pow(x, y); }
-float sinf(float x) { return (float)sin(x); }
-float cosf(float x) { return (float)cos(x); }
-float tanf(float x) { return (float)tan(x); }
-float atanf(float x) { return (float)atan(x); }
-float atan2f(float y, float x) { return (float)atan2(y, x); }
-float asinf(float x) { return (float)asin(x); }
-float acosf(float x) { return (float)acos(x); }
-float cbrtf(float x) { return (float)cbrt(x); }
-float sinhf(float x) { return (float)sinh(x); }
-float coshf(float x) { return (float)cosh(x); }
-float tanhf(float x) { return (float)tanh(x); }
-float asinhf(float x) { return (float)asinh(x); }
-float acoshf(float x) { return (float)acosh(x); }
-float atanhf(float x) { return (float)atanh(x); }
-float hypotf(float x, float y) { return (float)hypot(x, y); }
-float truncf(float x) { return (float)trunc(x); }
-float copysignf(float x, float y) { return __builtin_copysignf(x, y); }
-float fminf(float a, float b) { return (float)fmin(a, b); }
-float fmaxf(float a, float b) { return (float)fmax(a, b); }
-
-/* Round-to-nearest with the result converted to an integer type.
- *
- * These are not lround(round(x)): the standard says they round halfway cases
- * AWAY from zero, whereas the current rounding mode (which a cast follows)
- * rounds to even.  Building them on round(), which already rounds away from
- * zero, keeps that right. */
-long lround(double x)
-{
-	return (long)round(x);
-}
-
-long long llround(double x)
-{
-	return (long long)round(x);
-}
-
-long lroundf(float x)
-{
-	return (long)round((double)x);
-}
-
-long long llroundf(float x)
-{
-	return (long long)round((double)x);
-}
-
-/* long double is x87 80-bit here; the value is rounded in that precision
- * before conversion so the extra range is not lost first. */
-long double roundl(long double x)
-{
-	/* Away from zero on halfway cases, matching round(). */
-	return (x < 0.0L) ? -(long double)floor((double)(-x) + 0.5)
-			  : (long double)floor((double)x + 0.5);
-}
-
-long lroundl(long double x)
-{
-	return (long)roundl(x);
-}
-
-long long llroundl(long double x)
-{
-	return (long long)roundl(x);
-}
-
-long lrint(double x)
-{
-	return (long)x;
-}
-
-long long llrint(double x)
-{
-	return (long long)x;
-}
-
-double rint(double x)
-{
-	double r;
-	__asm__("frndint" : "=t"(r) : "0"(x));
-	return r;
-}
-
-double nearbyint(double x)
-{
-	return rint(x);
-}
-
-/* long double entry points.
- *
- * long double is the x87 80-bit format here, so sqrtl and fabsl use the x87
- * instructions directly rather than narrowing to double first — narrowing
- * would throw away the extra range and precision that is the only reason to
- * ask for a long double. The transcendentals do narrow: the x87 ones already
- * compute in 80-bit internally, so the accuracy lost is in the final rounding
- * only. */
-long double sqrtl(long double x)
-{
-	long double r;
-	__asm__("fsqrt" : "=t"(r) : "0"(x));
-	return r;
-}
-
-long double fabsl(long double x)
-{
-	long double r;
-	__asm__("fabs" : "=t"(r) : "0"(x));
-	return r;
-}
-
-long double floorl(long double x) { return (long double)floor((double)x); }
-long double ceill(long double x) { return (long double)ceil((double)x); }
-long double truncl(long double x) { return (long double)trunc((double)x); }
-long double fmodl(long double x, long double y)
-{
-	return (long double)fmod((double)x, (double)y);
-}
 long double expl(long double x) { return (long double)exp((double)x); }
 long double logl(long double x) { return (long double)log((double)x); }
 long double log2l(long double x) { return (long double)log2((double)x); }
@@ -769,11 +125,6 @@ long double hypotl(long double x, long double y)
 {
 	return (long double)hypot((double)x, (double)y);
 }
-long double copysignl(long double x, long double y)
-{
-	return __builtin_copysignl(x, y);
-}
-
 /* frexpl / ldexpl — taking a long double apart and putting it back together.
  *
  * These are how software that formats floating point by hand gets at the
@@ -802,66 +153,6 @@ union ldbits {
 		uint16_t pad[3];
 	} i;
 };
-
-long double frexpl(long double x, int *e)
-{
-	union ldbits u = { .f = x };
-	int ee = u.i.se & 0x7fff;
-	int dummy;
-
-	if (!e)
-		e = &dummy; /* every path below writes it */
-
-	if (ee == 0) {
-		/* Zero, or subnormal.  A subnormal has no leading one to
-		 * report an exponent against, so scale it into the normal
-		 * range first and take the scaling back off the answer.  2^64
-		 * is more than the width of the significand, so one step is
-		 * always enough. */
-		if (x != 0.0L) {
-			x = frexpl(x * 0x1p64L, e);
-			*e -= 64;
-		} else {
-			*e = 0;
-		}
-		return x;
-	}
-	if (ee == 0x7fff) {
-		/* Infinity or NaN.  The standard leaves *e unspecified; zero
-		 * is the least surprising thing to leave behind. */
-		*e = 0;
-		return x;
-	}
-
-	/* A normal value is 1.significand x 2^(ee - 16383), and the result
-	 * wants 0.5 <= |m| < 1 -- so the exponent is one larger and the
-	 * significand is that of a value in [0.5, 1), which is the biased
-	 * exponent 16382. */
-	*e = ee - 0x3ffe;
-	u.i.se &= 0x8000;
-	u.i.se |= 0x3ffe;
-	return u.f;
-}
-
-long double ldexpl(long double x, int e)
-{
-	long double r;
-
-	/* fscale multiplies by 2 raised to the truncated integer in ST(1), and
-	 * is exact.  It needs no special cases: zero and infinity scale to
-	 * themselves, a NaN propagates, and a result too large or too small for
-	 * the format saturates to infinity or to zero the same way an ordinary
-	 * multiplication would. */
-	__asm__("fscale" : "=t"(r) : "0"(x), "u"((long double)e));
-	return r;
-}
-
-/* Same operation under the name C99 gives it for radix-2 systems, which this
- * is.  Software asks for one or the other depending on its age. */
-long double scalbnl(long double x, int e)
-{
-	return ldexpl(x, e);
-}
 
 long double scalblnl(long double x, long e)
 {
@@ -896,107 +187,6 @@ static inline float u2f_(uint32_t u)
 	return v.f;
 }
 
-/* Exponent extraction (7.12.6.11, 7.12.6.5).
- *
- * Read from the bit pattern rather than computed with a logarithm: logb must
- * be exact, and a subnormal's exponent is below what the biased field can
- * say, so the mantissa is renormalised first with an exact power-of-two
- * multiply. */
-double logb(double x)
-{
-	uint64_t u = d2u(x);
-	int e = (int)((u >> 52) & 0x7FF);
-
-	if (e == 0x7FF) {
-		if (u << 12)
-			return x; /* NaN propagates */
-		return u2d(0x7FF0000000000000ULL); /* logb(+-inf) = +inf */
-	}
-	if (e == 0) {
-		if ((u << 1) == 0) /* logb(+-0) = -inf, and it is exact */
-			return u2d(0xFFF0000000000000ULL);
-		/* Subnormal: renormalise, then correct for the scaling. */
-		return logb(x * 0x1p64) - 64.0;
-	}
-	return (double)(e - 1023);
-}
-
-int ilogb(double x)
-{
-	uint64_t u = d2u(x);
-	int e = (int)((u >> 52) & 0x7FF);
-
-	if (e == 0x7FF)
-		return (u << 12) ? FP_ILOGBNAN : 2147483647;
-	if (e == 0) {
-		if ((u << 1) == 0)
-			return FP_ILOGB0;
-		return ilogb(x * 0x1p64) - 64;
-	}
-	return e - 1023;
-}
-
-float logbf(float x) { return (float)logb((double)x); }
-int ilogbf(float x)
-{
-	/* Through double, which represents every float exactly, so the
-	 * special-value answers carry over unchanged. */
-	return ilogb((double)x);
-}
-long double logbl(long double x) { return (long double)logb((double)x); }
-int ilogbl(long double x) { return ilogb((double)x); }
-
-/* Next representable value (7.12.11.3-4).
- *
- * Stepping the bit pattern by one IS the operation: IEEE-754 doubles of one
- * sign compare like their bit patterns, so +-1 in the integer view is the
- * adjacent value, subnormals and exponent boundaries included. */
-double nextafter(double x, double y)
-{
-	if (isnan(x) || isnan(y))
-		return x + y;
-	if (x == y)
-		return y; /* including the +0/-0 pair, per the standard */
-
-	uint64_t u = d2u(x);
-	if ((u << 1) == 0) {
-		/* From zero, the first step is the smallest subnormal with
-		 * the direction's sign. */
-		return u2d((y > 0.0) ? 1ULL : 0x8000000000000001ULL);
-	}
-	/* Toward the target means away from zero when the signs of x and the
-	 * direction agree, toward zero when they do not. */
-	if ((x < y) == (x > 0.0))
-		u++;
-	else
-		u--;
-	return u2d(u);
-}
-
-float nextafterf(float x, float y)
-{
-	if (isnan(x) || isnan(y))
-		return x + y;
-	if (x == y)
-		return y;
-
-	union { float f; uint32_t u; } v;
-	v.f = x;
-	if ((v.u << 1) == 0)
-		return (y > 0.0f) ? u2f_(1u) : u2f_(0x80000001u);
-	if ((x < y) == (x > 0.0f))
-		v.u++;
-	else
-		v.u--;
-	return v.f;
-}
-
-long double nextafterl(long double x, long double y)
-{
-	/* long double computes in double here, like the rest of the file. */
-	return (long double)nextafter((double)x, (double)y);
-}
-
 double nexttoward(double x, long double y)
 {
 	/* The comparison happens at the wider type so a target between two
@@ -1018,133 +208,6 @@ float nexttowardf(float x, long double y)
 long double nexttowardl(long double x, long double y)
 {
 	return nextafterl(x, y);
-}
-
-/* IEEE remainder (7.12.10.2-3), on the x87 unit.
- *
- * fprem1 is the instruction FOR this operation: it reduces by the quotient
- * rounded to nearest-even -- exactly the definition -- and it is exact, where
- * the naive x - rint(x/y)*y loses the answer entirely once x/y overflows the
- * mantissa.  The instruction reduces the exponent difference by at most 63
- * per issue and says "not done yet" in C2, hence the loop.
- *
- * remquo additionally reports the low three bits of that quotient, which is
- * precisely what condition bits C0, C3, C1 hold after the final reduction
- * (Q2, Q1, Q0 in the manual's naming). */
-double remainder(double x, double y)
-{
-	if (isnan(x) || isnan(y))
-		return x + y;
-	if (isinf(x) || y == 0.0)
-		return u2d(0x7FF8000000000000ULL); /* domain error: NaN */
-
-	double r = x;
-	unsigned short sw;
-	do {
-		__asm__ volatile("fprem1\n\tfnstsw %%ax"
-				 : "=t"(r), "=a"(sw)
-				 : "0"(r), "u"(y)
-				 : "cc");
-	} while (sw & 0x0400); /* C2: reduction incomplete */
-	return r;
-}
-
-double remquo(double x, double y, int *quo)
-{
-	if (quo)
-		*quo = 0;
-	if (isnan(x) || isnan(y))
-		return x + y;
-	if (isinf(x) || y == 0.0)
-		return u2d(0x7FF8000000000000ULL);
-
-	double r = x;
-	unsigned short sw;
-	do {
-		__asm__ volatile("fprem1\n\tfnstsw %%ax"
-				 : "=t"(r), "=a"(sw)
-				 : "0"(r), "u"(y)
-				 : "cc");
-	} while (sw & 0x0400);
-
-	if (quo) {
-		/* C0 (0x0100) = Q2, C3 (0x4000) = Q1, C1 (0x0200) = Q0. */
-		int q = ((sw & 0x0100) ? 4 : 0) | ((sw & 0x4000) ? 2 : 0) |
-			((sw & 0x0200) ? 1 : 0);
-		/* The quotient's sign is the XOR of the operands' signs. */
-		if ((d2u(x) ^ d2u(y)) & 0x8000000000000000ULL)
-			q = -q;
-		*quo = q;
-	}
-	return r;
-}
-
-float remainderf(float x, float y) { return (float)remainder(x, y); }
-float remquof(float x, float y, int *quo)
-{
-	return (float)remquo((double)x, (double)y, quo);
-}
-long double remainderl(long double x, long double y)
-{
-	return (long double)remainder((double)x, (double)y);
-}
-long double remquol(long double x, long double y, int *quo)
-{
-	return (long double)remquo((double)x, (double)y, quo);
-}
-
-/* Fused multiply-add (7.12.13.1), in plain double arithmetic.
- *
- * NOT __float128: the soft-float routines that would drag in live in libgcc
- * with hidden visibility, so a libc.so referencing them cannot be linked
- * against at all -- every executable link fails with "hidden symbol
- * __addtf3 referenced by DSO".
- *
- * Instead the classical error-free transformations: Dekker's splitting makes
- * the product exact as a hi+lo pair (x*y == p + e, exactly), Knuth's two-sum
- * makes the first addition exact the same way, and only the final collapse
- * rounds.  That last step can double-round in the same sub-ulp sliver the
- * quad approach could; it is the file's usual trade -- an ulp-accurate
- * fma whose one job here (letting the C++ runtime and WebKit's std:: calls
- * resolve) it does exactly.
- *
- * The splitter overflows for |x| >= 2^970, so arguments that large (or
- * non-finite) take the naive path: at those magnitudes the product has
- * overflowed or the error term is beyond the format anyway. */
-double fma(double x, double y, double z)
-{
-	if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
-	    fabs(x) >= 0x1p970 || fabs(y) >= 0x1p970 || fabs(z) >= 0x1p970 ||
-	    x == 0.0 || y == 0.0)
-		return x * y + z;
-
-	const double C = 0x1p27 + 1.0; /* Dekker's splitter for 53 bits */
-	double t, xh, xl, yh, yl;
-
-	t = C * x;
-	xh = t - (t - x);
-	xl = x - xh;
-	t = C * y;
-	yh = t - (t - y);
-	yl = y - yh;
-
-	double p = x * y; /* rounded product */
-	double e = ((xh * yh - p) + xh * yl + xl * yh) + xl * yl;
-	/* x*y == p + e, exactly */
-
-	double s = p + z; /* rounded first sum */
-	double v = s - p;
-	double err = (p - (s - v)) + (z - v);
-	/* p + z == s + err, exactly */
-
-	return s + (err + e);
-}
-
-float fmaf(float x, float y, float z)
-{
-	/* Exact: the float product fits a double's mantissa whole, and the
-	 * one rounding to float happens at the end. */
-	return (float)((double)x * (double)y + (double)z);
 }
 
 long double fmal(long double x, long double y, long double z)
@@ -1236,7 +299,6 @@ double erfc(double x)
 	return erfc_cf(x);
 }
 
-float erff(float x) { return (float)erf((double)x); }
 float erfcf(float x) { return (float)erfc((double)x); }
 long double erfl(long double x) { return (long double)erf((double)x); }
 long double erfcl(long double x) { return (long double)erfc((double)x); }
@@ -1315,31 +377,28 @@ long double lgammal(long double x) { return (long double)lgamma((double)x); }
 
 /* Width variants the probe wants and nothing here had yet: each one computes
  * in double, which represents every float exactly. */
-float exp2f(float x) { return (float)exp2((double)x); }
-float expm1f(float x) { return (float)expm1((double)x); }
-float log1pf(float x) { return (float)log1p((double)x); }
-float fdimf(float a, float b) { return (float)fdim((double)a, (double)b); }
-float rintf(float x) { return (float)rint((double)x); }
-float nearbyintf(float x) { return (float)rint((double)x); }
-long lrintf(float x) { return lrint((double)x); }
-long long llrintf(float x) { return llrint((double)x); }
-
 long double exp2l(long double x) { return (long double)exp2((double)x); }
 long double expm1l(long double x) { return (long double)expm1((double)x); }
 long double log1pl(long double x) { return (long double)log1p((double)x); }
-long double fdiml(long double a, long double b)
+
+/* fmodl: fprem is exact and this is its purpose.  It reduces by at most 64
+ * bits of quotient per step, so it is repeated until the C2 flag reports the
+ * reduction complete.  (The double and float forms come from the LLVM libc
+ * sources under llvm-libc/; their long double form wants a 128-bit division
+ * from libgcc, which this library does not link.) */
+long double fmodl(long double x, long double y)
 {
-	return (long double)fdim((double)a, (double)b);
-}
-long double rintl(long double x) { return (long double)rint((double)x); }
-long double nearbyintl(long double x) { return (long double)rint((double)x); }
-long lrintl(long double x) { return lrint((double)x); }
-long long llrintl(long double x) { return llrint((double)x); }
-long double fminl(long double a, long double b)
-{
-	return (long double)fmin((double)a, (double)b);
-}
-long double fmaxl(long double a, long double b)
-{
-	return (long double)fmax((double)a, (double)b);
+	long double r = x;
+	unsigned short sw;
+
+	if (isnan(x) || isnan(y) || isinf(x) || y == 0.0L)
+		return (x * y) / (x * y); /* NaN */
+	if (isinf(y))
+		return x;
+	do {
+		__asm__("fprem\n\tfnstsw %%ax"
+			: "=t"(r), "=a"(sw)
+			: "0"(r), "u"(y));
+	} while (sw & 0x0400); /* C2: partial remainder, go again */
+	return r;
 }

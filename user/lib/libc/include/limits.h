@@ -107,9 +107,14 @@ extern "C" {
 #define _POSIX_PATH_MAX  256
 #define _POSIX_NAME_MAX  14
 
-/* Size limits */
+/* Size limits.  <stdint.h> defines SIZE_MAX too; whichever header comes
+ * second must not redefine it. */
+#ifndef SSIZE_MAX
 #define SSIZE_MAX   LONG_MAX
+#endif
+#ifndef SIZE_MAX
 #define SIZE_MAX    ULONG_MAX
+#endif
 
 #ifdef __cplusplus
 }

@@ -2559,6 +2559,9 @@ void mm_region_ref_hold(mmap_region_t *r)
 	mm_region_census(r, 1);
 }
 
+static void region_harvest_obj(uint64_t *pml4, const mmap_region_t *r,
+			       void *obj, uint64_t from, uint64_t to);
+
 /* Release everything a record holds: its file and its driver object.
  *
  * Each pointer is taken OUT of the slot with an exchange before it is
@@ -2567,8 +2570,15 @@ void mm_region_ref_hold(mmap_region_t *r)
  * can find the thread count at zero, and each then runs the leader's table
  * with no lock (task_close_open_files).  Read-then-clear as two steps let two
  * of them release the same reference.  Everywhere else the caller holds the
- * address-space lock and the exchange costs nothing. */
-void mm_region_ref_drop(mmap_region_t *r)
+ * address-space lock and the exchange costs nothing.
+ *
+ * `pml4' is given when the record's page-table entries are still in place and
+ * about to be discarded wholesale -- the exit walk, where nothing unmaps range
+ * by range.  Those entries carry the only record of what the processor wrote
+ * through a watched mapping, so they are read here, by the one thread that
+ * took the object and therefore knows it is still alive, before the object is
+ * released.  munmap harvests before it clears its entries and passes NULL. */
+void mm_region_retire(mmap_region_t *r, uint64_t *pml4)
 {
 	vfs_file_t *f = __atomic_exchange_n(&r->file, NULL, __ATOMIC_ACQ_REL);
 	void *obj = __atomic_exchange_n(&r->dev_obj, NULL, __ATOMIC_ACQ_REL);
@@ -2577,12 +2587,19 @@ void mm_region_ref_drop(mmap_region_t *r)
 		vfs_close(f);
 	if (!obj)
 		return;
+	if (pml4)
+		region_harvest_obj(pml4, r, obj, r->start, r->start + r->length);
 	/* The census names the object, so it is told with the pointer just
 	 * taken -- mm_region_census() reads the slot, which is empty now. */
 	if (r->dev_dirty && r->dev_dirty->map_census && (r->prot & PROT_WRITE))
 		r->dev_dirty->map_census(obj, 0);
 	if (r->dev_put)
 		r->dev_put(obj);
+}
+
+void mm_region_ref_drop(mmap_region_t *r)
+{
+	mm_region_retire(r, NULL);
 }
 
 void mm_regions_free(task_t *task)
@@ -3197,45 +3214,35 @@ void mm_dontneed_range(task_t *task, uint64_t addr, uint64_t length)
  * the ONLY record that a write happened, so an entry thrown away while it is
  * set takes the write with it: the pages still hold the data and nothing is
  * left to tell the device its copy is behind.  Both paths that discard a
- * device mapping's entries call this first -- munmap, and the address-space
- * teardown every exiting process runs.
+ * device mapping's entries harvest first -- munmap, through this function,
+ * and the record release at exit, through mm_region_retire(), which reads the
+ * entries the process is about to lose wholesale with its page tables.  (An
+ * earlier harvest on the exit path ran after the records had already been
+ * retired, so it found nothing to read and every dying process took its last
+ * writes with it.)
  *
  * [from, to) is a virtual range inside the record.  Cheap for everything
  * else: a record that watches nothing returns at the first test. */
-void mm_region_harvest_dirty(uint64_t *pml4, const mmap_region_t *r,
-			     uint64_t from, uint64_t to)
+static void region_harvest_obj(uint64_t *pml4, const mmap_region_t *r,
+			       void *obj, uint64_t from, uint64_t to)
 {
 	if (!pml4 || !r->device || !r->dev_dirty || !r->dev_dirty->page_dirty ||
-	    !r->dev_obj)
+	    !obj)
 		return;
 	for (uint64_t va = from; va < to; va += PAGE_SIZE) {
 		uint64_t *pte = mm_get_page_table_from_pml4(pml4, va, false);
 
 		if (pte && (*pte & PAGE_PRESENT) && (*pte & PAGE_DEVICE) &&
 		    (*pte & PAGE_DIRTY))
-			r->dev_dirty->page_dirty(r->dev_obj,
+			r->dev_dirty->page_dirty(obj,
 						 r->offset + (va - r->start));
 	}
 }
 
-/* Every device record of an address space about to be destroyed.
- *
- * The teardown frees the page tables wholesale rather than unmapping range by
- * range, so nothing else on that path harvests -- and a process that dies
- * having just painted into a buffer another process still displays would take
- * those writes with it.  Runs while the tables and the record table are both
- * still alive, which is what makes it the last possible moment. */
-void mm_regions_harvest_dirty(task_t *task, uint64_t *pml4)
+void mm_region_harvest_dirty(uint64_t *pml4, const mmap_region_t *r,
+			     uint64_t from, uint64_t to)
 {
-	if (!task || !task->mmap_regions || !pml4)
-		return;
-	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
-		mmap_region_t *r = &task->mmap_regions[i];
-
-		if (r->in_use)
-			mm_region_harvest_dirty(pml4, r, r->start,
-						r->start + r->length);
-	}
+	region_harvest_obj(pml4, r, r->dev_obj, from, to);
 }
 
 int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)

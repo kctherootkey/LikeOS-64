@@ -590,13 +590,16 @@ void mm_region_census(const struct mmap_region *r, int add);
 /* Hand a driver's dirty tracker every page whose entry says it was written,
  * before those entries are discarded.  A swept mapping keeps that fact
  * nowhere else, so a discard without this loses the write and leaves the
- * device showing what it had.  Called by munmap for the range it retires and
- * by the exit teardown for the whole address space. */
+ * device showing what it had.  Called by munmap for the range it retires; the
+ * exit path harvests through mm_region_retire() instead. */
 void mm_region_harvest_dirty(uint64_t *pml4, const struct mmap_region *r,
 			     uint64_t from, uint64_t to);
-void mm_regions_harvest_dirty(struct task *task, uint64_t *pml4);
 void mm_region_ref_hold(struct mmap_region *r);
 void mm_region_ref_drop(struct mmap_region *r);
+/* ref_drop, plus the harvest above over the record's whole range when `pml4'
+ * is given: for the exit walk, where the entries are still in place and are
+ * about to go with the page tables rather than through munmap. */
+void mm_region_retire(struct mmap_region *r, uint64_t *pml4);
 /* Pages this address space actually has resident -- the real resident set,
  * as opposed to how much address space has been reserved. */
 uint64_t mm_count_resident_pages(uint64_t *pml4);

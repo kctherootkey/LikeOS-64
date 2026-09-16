@@ -23,6 +23,20 @@ endif
 # PIC flags for shared-library objects
 PIC_CFLAGS = $(CFLAGS) -fPIC
 
+# C++ for the vendored LLVM libc math (see LLVM_MATH_SRC).  Freestanding: no
+# libstdc++ headers, no exceptions, no RTTI, no guard variables -- the code
+# needs none of them and libc.so links no C++ runtime.  Overlay mode, so its
+# proxy headers take FP_*, FE_* and errno from this library's own <math.h>,
+# <fenv.h> and <errno.h>.  LIBC_COPT_PUBLIC_PACKAGING is what makes each
+# function a plain C symbol rather than a namespaced one.  The sources are
+# pristine third-party code, so their warnings are not this tree's to fix.
+CXX = g++
+CXXFLAGS = $(DEPFLAGS) -std=c++20 -w -O2 -nostdlib -nostdinc++ -fno-builtin \
+	-fno-exceptions -fno-rtti -fno-threadsafe-statics -fstack-protector-strong \
+	-mno-red-zone -ffreestanding -I./include -I./src/math/llvm-libc \
+	-DLIBC_NAMESPACE=__llvm_libc_likeos -DLIBC_COPT_PUBLIC_PACKAGING
+PIC_CXXFLAGS = $(CXXFLAGS) -fPIC
+
 # Source files
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
@@ -31,7 +45,12 @@ STDLIB_SRC = src/crt/initfini.c src/stdlib/stdlib.c src/stdlib/cxa_atexit.c src/
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c src/dirent/ftw.c
-MATH_SRC = src/math/math.c src/math/fenv.c
+MATH_SRC = src/math/math.c src/math/fenv.c src/math/hyperbolic.c
+# The double and float transcendentals come from LLVM libc's correctly rounded
+# implementations, vendored pristine under src/math/llvm-libc (C++, built
+# freestanding, no runtime beyond errno).  math.c keeps only what LLVM does not
+# provide: the long double forms, erf/gamma and fmodl.
+LLVM_MATH_SRC = $(wildcard src/math/llvm-libc/src/math/generic/*.cpp)
 REGEX_SRC = src/regex/regex.c
 ICONV_SRC = src/iconv/iconv.c
 # Locale and wide-character support.  unicode.c is generated -- see
@@ -65,7 +84,7 @@ STDLIB_OBJ = $(STDLIB_SRC:.c=.o)
 CTYPE_OBJ = $(CTYPE_SRC:.c=.o)
 TIME_OBJ = $(TIME_SRC:.c=.o)
 DIR_OBJ = $(DIR_SRC:.c=.o)
-MATH_OBJ = $(MATH_SRC:.c=.o)
+MATH_OBJ = $(MATH_SRC:.c=.o) $(LLVM_MATH_SRC:.cpp=.o)
 REGEX_OBJ = $(REGEX_SRC:.c=.o)
 ICONV_OBJ = $(ICONV_SRC:.c=.o)
 LOCALE_OBJ = $(LOCALE_SRC:.c=.o)
@@ -146,6 +165,12 @@ $(CRTN): $(CRTN_OBJ)
 %.pic.o: %.S
 	$(CC) $(PIC_CFLAGS) -c $< -o $@
 
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+%.pic.o: %.cpp
+	$(CXX) $(PIC_CXXFLAGS) -c $< -o $@
+
 clean:
 	rm -f $(ALL_OBJ) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(CRTI_OBJ) $(CRTN_OBJ) $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN)
 	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
@@ -167,4 +192,4 @@ libm.a:
 # The header dependencies recorded by -MMD above.  `-include' because they do
 # not exist before the first build of each object, and their absence is not an
 # error.  Both spellings: %.o and %.pic.o each write their own.
--include $(wildcard src/*/*.d)
+-include $(wildcard src/*/*.d) $(wildcard src/math/llvm-libc/src/math/generic/*.d)

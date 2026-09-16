@@ -399,6 +399,33 @@ static void supervise(void)
 	}
 }
 
+/* The zone name from /etc/timezone, as TZ, for every process on the system.
+ *
+ * libc reads that file itself, so its clock is right without this.  ICU does
+ * not: on a system it does not recognise it consults nothing but $TZ, and
+ * without it falls back to a fixed-offset zone with no daylight-saving rule.
+ * A browser then has two clocks -- Date from libc, Intl from ICU -- that
+ * disagree by an hour half the year, which web pages notice.  The login
+ * profile exports TZ for login shells; this covers what does not descend from
+ * one, and is inherited by everything init starts. */
+static void export_timezone(void)
+{
+	char zone[64];
+	FILE *f;
+
+	if (getenv("TZ"))
+		return;
+	f = fopen("/etc/timezone", "r");
+	if (!f)
+		return;
+	if (fgets(zone, sizeof(zone), f)) {
+		zone[strcspn(zone, "\r\n")] = '\0';
+		if (zone[0])
+			setenv("TZ", zone, 0);
+	}
+	fclose(f);
+}
+
 int main(void)
 {
 	int i;
@@ -410,6 +437,7 @@ int main(void)
 	 * program names from inittab lines. */
 	setenv("PATH", PATH_DEFAULT, 1);
 	setenv("LANG", LANG_DEFAULT, 1);
+	export_timezone();
 
 	load_inittab();
 

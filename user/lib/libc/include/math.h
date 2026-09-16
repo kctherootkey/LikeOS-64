@@ -78,6 +78,12 @@
 #define FP_ILOGB0   (-2147483647 - 1)
 #define FP_ILOGBNAN (-2147483647 - 1)
 
+/* C99 7.12: how domain and range errors are reported.  Both ways, as on any
+ * IEEE-754 system: errno is set and the floating-point exception is raised. */
+#define MATH_ERRNO     1
+#define MATH_ERREXCEPT 2
+#define math_errhandling (MATH_ERRNO | MATH_ERREXCEPT)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -197,6 +203,10 @@ long        lrint(double x);
 long long   llrint(double x);
 double      rint(double x);
 double      nearbyint(double x);
+/* C23: round half to even, in the current rounding mode's stead. */
+double      roundeven(double x);
+float       roundevenf(float x);
+long double roundevenl(long double x);
 
 /* long double variants.  sqrtl/fabsl/copysignl keep the full 80-bit format;
  * the rest compute in double, which is the precision their x87 primitives

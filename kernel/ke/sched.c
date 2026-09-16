@@ -510,6 +510,18 @@ static void task_close_open_files(task_t *task)
 		if (owner->nr_threads != 0)
 			return;
 
+		/* The page tables these records describe.  Still in place: the
+		 * address space is released later, in exit_mm_self() -- and for
+		 * a thread the tables are the group's shared ones, the same the
+		 * leader's records name, whichever task_t still holds the root
+		 * (a leader that exited first has dropped its own by now). */
+		uint64_t *pml4 = task->pml4;
+
+		if (!pml4 && task->mm)
+			pml4 = task->mm->pml4;
+		if (!pml4)
+			pml4 = owner->pml4;
+
 		for (uint32_t i = 0; i < owner->mmap_capacity; i++) {
 			mmap_region_t *r = &owner->mmap_regions[i];
 			vfs_file_t *f = NULL;
@@ -569,9 +581,17 @@ static void task_close_open_files(task_t *task)
 			 *
 			 * The canonical drop takes the object out of the slot
 			 * with the same exchange the file got above, so the
-			 * threads racing this loop still release it once. */
+			 * threads racing this loop still release it once.
+			 *
+			 * With the page tables: the entries are about to go
+			 * wholesale with the address space, never through
+			 * munmap, so this is the last chance to read the dirty
+			 * bits a watched mapping's writes left in them.  The
+			 * harvest that used to sit in exit_mm_self() for this
+			 * ran after this loop had emptied the records and never
+			 * read anything. */
 			if (r->in_use)
-				mm_region_ref_drop(r);
+				mm_region_retire(r, pml4);
 			r->in_use = false;
 			r->lazy = false;
 		}
@@ -2808,11 +2828,11 @@ void exit_mm_self(task_t *task)
 	WARN_ON(mm && mm->pml4 && mm->pml4 != pml4);
 
 	/* The tables are about to be freed wholesale rather than unmapped
-	 * range by range, so this is the last moment a device mapping's dirty
-	 * bits can be read.  A process that dies having just painted into a
-	 * buffer another process still displays would otherwise take those
-	 * writes with it. */
-	mm_regions_harvest_dirty(task, pml4);
+	 * range by range.  A watched device mapping's dirty bits were read
+	 * when its record was retired -- task_close_open_files(), on the last
+	 * thread out -- which ran before this and is therefore where the
+	 * harvest lives; by now the records are empty and there is nothing
+	 * left here to read. */
 
 	/* Stop advertising ownership of user memory BEFORE giving it up.
 	 * copy_to_user/copy_from_user test exactly this, so a preemption in
