@@ -459,17 +459,33 @@ static uint32_t tcp_compute_ts_offset(uint32_t local_ip, uint32_t remote_ip,
 	return (uint32_t)(h ^ 0x54534F46U /* 'TSOF' */);
 }
 
+/* The timestamp clock runs in MILLISECONDS -- derived from the tick count
+ * and the calibrated tick length, so it costs no timer read per segment.
+ *
+ * It used to be the raw tick count, i.e. a ~100 Hz clock.  RFC 7323 allows
+ * any rate between 1 ms and 1 s per unit, so that was correct; but the
+ * reference stack's clock is a millisecond one, and a passive observer can
+ * measure a peer's timestamp rate from two segments.  A 100 Hz clock under a
+ * User-Agent claiming that system is another line in the fingerprint that
+ * says "not what it claims to be" -- see tcp_build_options() for what that
+ * costs on the sites that check.  The granularity stays one tick; only the
+ * unit changed. */
+static uint32_t tcp_ts_clock_ms(void)
+{
+	return (uint32_t)((timer_ticks() * timer_us_per_tick()) / 1000ULL);
+}
+
 static uint32_t tcp_ts_now_for(const tcp_conn_t *conn)
 {
 	uint32_t off = (conn && conn->ts_offset) ? conn->ts_offset :
 						   tcp_ts_offset_global();
-	return (uint32_t)timer_ticks() + off;
+	return tcp_ts_clock_ms() + off;
 }
 
 // Backwards-compatible global accessor for paths with no conn (RST, etc.).
 __attribute__((unused)) static uint32_t tcp_ts_now(void)
 {
-	return (uint32_t)timer_ticks() + tcp_ts_offset_global();
+	return tcp_ts_clock_ms() + tcp_ts_offset_global();
 }
 
 // Build TCP option block. Caller passes flags actually being sent.
@@ -484,44 +500,49 @@ static uint8_t tcp_build_options(tcp_conn_t *conn, uint8_t flags,
 	int is_syn = (flags & TCP_SYN) != 0;
 	int is_synack = is_syn && (flags & TCP_ACK);
 
-	// MSS only on SYN / SYN+ACK
+	/* The option block is laid out EXACTLY as the reference stack lays out
+	 * its own, byte for byte:
+	 *
+	 *   SYN / SYN+ACK:  MSS(4)  SACK-permitted(2)+timestamps(10)  NOP WS(3)
+	 *                   = 20 bytes, with SACK-permitted and timestamps
+	 *                   packed into one aligned run when both go, and
+	 *                   either one preceded by two NOPs when it goes alone;
+	 *   later segments: NOP NOP timestamps(10), then any SACK blocks.
+	 *
+	 * It used to be MSS, NOP NOP SACK, NOP WS, NOP NOP TS -- 24 bytes, every
+	 * option correct, in an order no operating system uses.  The order is
+	 * not protocol: it is a fingerprint.  Every large site's bot manager
+	 * classifies the client operating system from the SYN -- option
+	 * order, window, scale, TTL, DF -- and compares it with what the
+	 * User-Agent claims; a SYN matching no known system under a User-Agent
+	 * that says "X11; Linux" is the classic sign of a tool, and those sites
+	 * answer it not with an error but with a degraded page: a shop that
+	 * calls a valid e-mail address invalid, a search that finds nothing, a
+	 * login that is simply refused.  The same engine under the real
+	 * system's stack, on the same machine, gets the real page.
+	 *
+	 * On SYN+ACK an option is answered only if the peer offered it (RFC
+	 * 7323 forbids answering timestamps to a peer that sent none); the
+	 * SYN offers all three. */
+	int want_sack = is_syn && (!is_synack || (conn && conn->sack_ok));
+	int want_ws = is_syn && (!is_synack || (conn && conn->ws_enabled));
+	int want_ts = is_syn ? (!is_synack || (conn && conn->ts_enabled)) :
+				 (conn && conn->ts_enabled);
+
 	if (is_syn) {
 		buf[n++] = TCP_OPT_MSS;
 		buf[n++] = TCP_OPT_MSS_LEN;
 		buf[n++] = (uint8_t)(mss_to_advertise >> 8);
 		buf[n++] = (uint8_t)mss_to_advertise;
 	}
-
-	// SACK Permitted on SYN; on SYN+ACK only if peer offered (sack_ok set)
-	if (is_syn) {
-		if (!is_synack || (conn && conn->sack_ok)) {
-			buf[n++] = TCP_OPT_NOP;
-			buf[n++] = TCP_OPT_NOP;
+	if (want_ts) {
+		if (want_sack) {
 			buf[n++] = TCP_OPT_SACK_PERM;
 			buf[n++] = TCP_OPT_SACK_PERM_LEN;
-		}
-	}
-
-	// Window Scale: SYN always offers; SYN+ACK only if peer offered (snd_wscale set via ws_enabled)
-	if (is_syn) {
-		if (!is_synack || (conn && conn->ws_enabled)) {
+		} else {
 			buf[n++] = TCP_OPT_NOP;
-			buf[n++] = TCP_OPT_WSCALE;
-			buf[n++] = TCP_OPT_WSCALE_LEN;
-			// We use rcv_wscale = 7 (128x scale → 8MB max window) by default
-			uint8_t my_ws = (conn && conn->rcv_wscale) ?
-						conn->rcv_wscale :
-						7;
-			buf[n++] = my_ws;
+			buf[n++] = TCP_OPT_NOP;
 		}
-	}
-
-	// Timestamps: include on SYN unconditionally; on later segments only if negotiated
-	if (is_syn || (conn && conn->ts_enabled)) {
-		// Pad to 4-byte boundary first for clean TS layout
-		// (RFC 7323 §3 recommends 2 NOPs to align 10-byte TS to 32-bit boundary)
-		buf[n++] = TCP_OPT_NOP;
-		buf[n++] = TCP_OPT_NOP;
 		buf[n++] = TCP_OPT_TIMESTAMP;
 		buf[n++] = TCP_OPT_TIMESTAMP_LEN;
 		put_be32(buf + n, tcp_ts_now_for(conn));
@@ -530,6 +551,19 @@ static uint8_t tcp_build_options(tcp_conn_t *conn, uint8_t flags,
 			(conn && conn->ts_enabled) ? conn->ts_recent : 0;
 		put_be32(buf + n, tsecr);
 		n += 4;
+	} else if (want_sack) {
+		buf[n++] = TCP_OPT_NOP;
+		buf[n++] = TCP_OPT_NOP;
+		buf[n++] = TCP_OPT_SACK_PERM;
+		buf[n++] = TCP_OPT_SACK_PERM_LEN;
+	}
+	if (want_ws) {
+		buf[n++] = TCP_OPT_NOP;
+		buf[n++] = TCP_OPT_WSCALE;
+		buf[n++] = TCP_OPT_WSCALE_LEN;
+		/* rcv_wscale 7 (128x, 8 MB max window) by default -- also what
+		 * the reference stack sends on a default configuration. */
+		buf[n++] = (conn && conn->rcv_wscale) ? conn->rcv_wscale : 7;
 	}
 
 	// SACK blocks on non-SYN when we have OOO data
@@ -1711,7 +1745,7 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	// waiting out a full SYN retransmit period, as the timer already
 	// does for its own resends.
 	if (tcp_send_syn_packet(dev, local_ip, dst_ip, src_port, dst_port,
-				conn->iss, 0, TCP_SYN, TCP_WINDOW_SIZE,
+				conn->iss, 0, TCP_SYN, TCP_SYN_WINDOW,
 				conn) < 0) {
 		uint64_t cflags;
 		tcp_lock_acquire(&conn->lock, &cflags);
@@ -2959,20 +2993,16 @@ established_segment:
 				if (conn->ts_enabled && pop.ts_present &&
 				    pop.tsecr != 0) {
 					uint32_t now_ts = tcp_ts_now_for(conn);
-					uint32_t elapsed_ticks =
-						now_ts - pop.tsecr;
-					/* A TS unit IS one tick (tcp_ts_now_for
-					 * builds the option straight from
-					 * timer_ticks), so the microseconds it
-					 * represents depend on the measured tick
-					 * rate.  Hardcoding 10000 over-stated
-					 * every RTT sample at any other rate,
-					 * and an over-stated RTT inflates the
-					 * RTO it feeds. */
-					tcp_update_rtt(
-						conn,
-						(uint32_t)(elapsed_ticks *
-							   timer_us_per_tick()));
+					uint32_t elapsed_ms = now_ts - pop.tsecr;
+					/* A TS unit is one MILLISECOND
+					 * (tcp_ts_clock_ms), whatever the tick
+					 * rate.  It used to be one tick, and the
+					 * conversion below tracked the measured
+					 * tick length; an earlier hardcoded
+					 * 10000 us over-stated every RTT sample
+					 * at any other rate, inflating the RTO
+					 * it feeds. */
+					tcp_update_rtt(conn, elapsed_ms * 1000U);
 					rtt_sampled = 1;
 				}
 				if (!rtt_sampled) {
@@ -3768,7 +3798,7 @@ void tcp_timer_tick(void)
 						conn->remote_ip,
 						conn->local_port,
 						conn->remote_port, conn->iss, 0,
-						TCP_SYN, TCP_WINDOW_SIZE,
+						TCP_SYN, TCP_SYN_WINDOW,
 						conn) >= 0) {
 				conn->retransmit_count++;
 				conn->retransmit_tick =

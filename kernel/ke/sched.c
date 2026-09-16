@@ -553,6 +553,25 @@ static void task_close_open_files(task_t *task)
 				}
 				vfs_close(f);
 			}
+			/* The file is not all a record holds.  A device
+			 * mapping's record also pins the driver object behind
+			 * it (mm_region_ref_hold/drop), and this loop, which
+			 * took the file by hand, left that reference in the
+			 * slot -- then cleared in_use, so mm_regions_free() at
+			 * reap skipped the slot and nothing ever dropped it.
+			 * Every GPU buffer a process still had mapped when it
+			 * died stayed allocated for good: its pages, handles
+			 * and descriptors correctly released, the object itself
+			 * pinned by a record nobody would look at again.  A
+			 * browser lost hundreds of megabytes of buffers per
+			 * session that way (gem_stats: objects-live climbing
+			 * with handles-held flat).
+			 *
+			 * The canonical drop takes the object out of the slot
+			 * with the same exchange the file got above, so the
+			 * threads racing this loop still release it once. */
+			if (r->in_use)
+				mm_region_ref_drop(r);
 			r->in_use = false;
 			r->lazy = false;
 		}

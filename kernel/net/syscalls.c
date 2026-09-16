@@ -135,18 +135,24 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 		return -ENOTCONN;
 
 	/* Collect the in-band descriptors FIRST, but do not queue them yet.
-     *
-     * For a stream socket they are pushed here, before the data, so the fd
-     * arrives before (or with) the byte the receiver associates it with --
-     * the imsg framing tmux uses sends one fd per message and the receiver
-     * pops the next pending fd when it parses each imsg header.
-     *
-     * For a SEQPACKET socket they are handed to unix_send_record_msg() and
-     * queued in the same critical section that writes the record.  Pushing
-     * them here first meant an EINTR from the full-ring wait (the caller
-     * retries the whole sendmsg) queued every descriptor twice, after which
-     * the peer's descriptor stream was permanently off by one -- WebKit's
-     * process pairs decoded the wrong attachment for every later message. */
+	 *
+	 * For BOTH socket types they are handed to the send that carries the
+	 * bytes -- unix_send_record_msg() for a SEQPACKET record,
+	 * unix_send_fds() for a stream -- and queued in the same critical
+	 * section that places the first byte.  Pushing them here first meant
+	 * a failed or retried data send left them queued anyway: an EINTR
+	 * from the full-ring wait (the caller retries the whole sendmsg)
+	 * queued every descriptor twice, after which the peer's descriptor
+	 * stream was permanently off by one -- WebKit's process pairs decoded
+	 * the wrong attachment for every later message.  The stream path kept
+	 * that arrangement until 2026-09-16 AND discarded unix_send_fd()'s
+	 * return, so a full peer ring leaked the reference outright; a
+	 * dma-buf so leaked pins its GEM object for the rest of the boot.
+	 * See unix_send_fds().
+	 *
+	 * The imsg framing tmux uses is unaffected: the receiver pops the
+	 * next pending fd when it parses each imsg header, and the fd is
+	 * queued at the offset of that header's first byte. */
 	void *seq_entries[UNIX_PENDING_FDS];
 	int seq_nent = 0;
 	int is_seqpacket = (us->type == SOCK_SEQPACKET);
@@ -222,18 +228,17 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 						if (!entry)
 							continue;
 					}
-					if (is_seqpacket) {
-						if (seq_nent <
-						    UNIX_PENDING_FDS)
-							seq_entries[seq_nent++] =
-								entry;
-						else
-							fd_release_entry(
-								(vfs_file_t *)
-									entry);
-					} else {
-						(void)unix_send_fd(us, entry);
-					}
+					/* Both socket types: collected here,
+					 * queued with the bytes.  Past the
+					 * ring's capacity a descriptor cannot
+					 * be delivered at all; releasing it is
+					 * the honest outcome, not a silent
+					 * keep. */
+					if (seq_nent < UNIX_PENDING_FDS)
+						seq_entries[seq_nent++] = entry;
+					else
+						fd_release_entry(
+							(vfs_file_t *)entry);
 				}
 			}
 			off += CMSG_ALIGN(cmsg->cmsg_len);
@@ -241,11 +246,18 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 	}
 
 	if (kmsg->msg_iovlen <= 0) {
-		/* A record with descriptors and no payload is still a record.
-		 * (A stream socket queued its fds above and sends nothing.) */
-		if (is_seqpacket && seq_nent) {
-			int r = unix_send_record_msg(ufd, NULL, 0, seq_entries,
-						     seq_nent);
+		/* Descriptors and no payload: a zero-byte SEQPACKET record,
+		 * or -- for a stream -- descriptors queued at the current
+		 * offset to ride with the next byte.  Either way a failure
+		 * means nothing was queued and the references are still ours
+		 * to drop. */
+		if (seq_nent) {
+			int r = is_seqpacket ?
+					unix_send_record_msg(ufd, NULL, 0,
+							     seq_entries,
+							     seq_nent) :
+					unix_send_fds(ufd, NULL, 0, 0,
+						      seq_entries, seq_nent);
 			if (r < 0) {
 				for (int i = 0; i < seq_nent; i++)
 					fd_release_entry(
@@ -344,6 +356,12 @@ seq_done:
 	}
 
 	int64_t sent_total = 0;
+	/* The descriptors ride with the first byte this call places.  Until
+	 * unix_send_fds() has taken them, every exit that placed nothing must
+	 * release what fd_dup_entry_at() took above -- that is the leak this
+	 * path used to have.  Once a send has returned bytes, the peer owns
+	 * them. */
+	int fds_pending = seq_nent;
 	for (int i = 0; i < kiovcnt; i++) {
 		size_t want = iov[i].iov_len;
 		if (want == 0)
@@ -354,14 +372,38 @@ seq_done:
 		 * full peer ring. */
 		if (want > 65536)
 			want = 65536;
-		if (!validate_user_ptr((uint64_t)iov[i].iov_base, want))
+		if (!validate_user_ptr((uint64_t)iov[i].iov_base, want)) {
+			if (fds_pending)
+				for (int k = 0; k < seq_nent; k++)
+					fd_release_entry(
+						(vfs_file_t *)seq_entries[k]);
 			return sent_total ? (int)sent_total : -EFAULT;
-		int r = unix_send(ufd, iov[i].iov_base, want, 0);
-		if (r < 0)
+		}
+		int r = fds_pending ?
+				unix_send_fds(ufd, iov[i].iov_base, want, 0,
+					      seq_entries, seq_nent) :
+				unix_send(ufd, iov[i].iov_base, want, 0);
+		if (r < 0) {
+			/* Nothing placed by this call, so nothing queued. */
+			if (fds_pending)
+				for (int k = 0; k < seq_nent; k++)
+					fd_release_entry(
+						(vfs_file_t *)seq_entries[k]);
 			return sent_total ? (int)sent_total : r;
+		}
+		fds_pending = 0; /* queued with the bytes just placed */
 		sent_total += r;
 		if ((size_t)r < want)
 			break; /* peer's ring is full; report what went */
+	}
+	if (fds_pending) {
+		/* Every iovec was empty: the zero-byte case. */
+		int r = unix_send_fds(ufd, NULL, 0, 0, seq_entries, seq_nent);
+		if (r < 0) {
+			for (int k = 0; k < seq_nent; k++)
+				fd_release_entry((vfs_file_t *)seq_entries[k]);
+			return r;
+		}
 	}
 	return (int)sent_total;
 }

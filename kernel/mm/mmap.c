@@ -84,17 +84,25 @@ static uint64_t mmap_gap_search(const mmap_region_t *regions, uint32_t n,
 /* ---- mmap address selection: END ---- */
 
 /* The search above, over this address space: bounded by mmap_hwm like every
- * other lookup (nothing above it is in use), the ceiling 4 MB under the
- * stack as the cursor's starting point was, the floor 4 MB above the heap
- * and never below the first 64 KB.  Shared with mremap's move, which had a
- * second copy of the cursor and the same fault. */
+ * other lookup (nothing above it is in use), the ceiling a guard below the
+ * stack's LOWEST page, the floor 4 MB above the heap and never below the
+ * first 64 KB.  Shared with mremap's move, which had a second copy of the
+ * cursor and the same fault.
+ *
+ * The ceiling used to be a fixed 4 MB under the stack top, from the days
+ * of a 2 MB stack.  The stack is 8 MB now, most of it a lazy region
+ * (memory.h, USER_STACK_SIZE): a ceiling inside it would hand a library
+ * the addresses a deep recursion is about to grow into. */
 uint64_t mmap_find_gap(task_t *cur, uint64_t length)
 {
-	/* A task built by the kernel rather than exec has no stack top on
-	 * record (sched.c leaves it 0); the conventional top serves. */
+	/* A task built by the kernel rather than exec has no stack top or
+	 * size on record (sched.c leaves them 0); the conventional ones
+	 * serve. */
 	uint64_t top =
 		cur->user_stack_top ? cur->user_stack_top : USER_STACK_TOP;
-	uint64_t ceiling = top - (4 * 1024 * 1024);
+	uint64_t stack =
+		cur->user_stack_size ? cur->user_stack_size : USER_STACK_SIZE;
+	uint64_t ceiling = top - stack - USER_STACK_GUARD;
 	uint64_t floor = cur->brk + (4 * 1024 * 1024);
 	uint32_t n = cur->mmap_hwm;
 

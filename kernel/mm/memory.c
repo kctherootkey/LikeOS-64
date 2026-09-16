@@ -1100,8 +1100,17 @@ void mm_initialize_physical_memory(uint64_t memory_size)
 	kprintf("Physical Memory Manager initialized\n");
 }
 
-// Allocate a physical page (SMP-safe)
-uint64_t mm_allocate_physical_page(void)
+/* The allocator proper.  `caller' is whoever wanted the page, handed in by
+ * the entry points below rather than read here with
+ * __builtin_return_address(0).
+ *
+ * Reading it here names the LAST WRAPPER, and every demand fault and every
+ * GEM buffer reaches the allocator through one -- so the page-owner report
+ * put them all in a single bucket labelled mm_allocate_physical_page_reclaim,
+ * which is the largest entry in the report and says nothing about who filled
+ * it.  Threading the caller through costs one argument and makes that bucket
+ * name the fault site, the GEM object or the page-table walker instead. */
+static uint64_t mm_alloc_page_do(void *caller)
 {
 	uint64_t flags;
 	spin_lock_irqsave(&mm_phys_lock, &flags);
@@ -1119,7 +1128,8 @@ uint64_t mm_allocate_physical_page(void)
 
 	set_page_bit(page);
 	mm_state.free_pages--;
-	PAGE_OWNER_SET(page, __builtin_return_address(0));
+	(void)caller; /* recorded only when page-owner tracking is built */
+	PAGE_OWNER_SET(page, caller);
 
 	uint64_t phys = mm_state.memory_start + (page * PAGE_SIZE);
 	WARN_ON(phys &
@@ -1143,6 +1153,12 @@ uint64_t mm_allocate_physical_page(void)
 #endif
 	}
 	return phys;
+}
+
+// Allocate a physical page (SMP-safe)
+uint64_t mm_allocate_physical_page(void)
+{
+	return mm_alloc_page_do(__builtin_return_address(0));
 }
 
 // Free a physical page (SMP-safe)
@@ -2543,17 +2559,30 @@ void mm_region_ref_hold(mmap_region_t *r)
 	mm_region_census(r, 1);
 }
 
+/* Release everything a record holds: its file and its driver object.
+ *
+ * Each pointer is taken OUT of the slot with an exchange before it is
+ * released, so the slot itself is the arbiter of who releases it.  The exit
+ * walk needs that: several threads of one group die together, more than one
+ * can find the thread count at zero, and each then runs the leader's table
+ * with no lock (task_close_open_files).  Read-then-clear as two steps let two
+ * of them release the same reference.  Everywhere else the caller holds the
+ * address-space lock and the exchange costs nothing. */
 void mm_region_ref_drop(mmap_region_t *r)
 {
-	if (r->file) {
-		vfs_close(r->file);
-		r->file = NULL;
-	}
-	/* Before the object pointer goes: the census names it. */
-	mm_region_census(r, 0);
-	if (r->dev_obj && r->dev_put)
-		r->dev_put(r->dev_obj);
-	r->dev_obj = NULL;
+	vfs_file_t *f = __atomic_exchange_n(&r->file, NULL, __ATOMIC_ACQ_REL);
+	void *obj = __atomic_exchange_n(&r->dev_obj, NULL, __ATOMIC_ACQ_REL);
+
+	if (f)
+		vfs_close(f);
+	if (!obj)
+		return;
+	/* The census names the object, so it is told with the pointer just
+	 * taken -- mm_region_census() reads the slot, which is empty now. */
+	if (r->dev_dirty && r->dev_dirty->map_census && (r->prot & PROT_WRITE))
+		r->dev_dirty->map_census(obj, 0);
+	if (r->dev_put)
+		r->dev_put(obj);
 }
 
 void mm_regions_free(task_t *task)
@@ -5040,9 +5069,9 @@ static bool mm_phys_is_mappable(uint64_t phys)
  * pagecache_reclaim_if_needed() spells out.  Dropping the clean ones is what
  * relieves the pressure; the dirty ones become reclaimable once the writeback
  * thread has dealt with them. */
-uint64_t mm_allocate_physical_page_reclaim(void)
+static uint64_t mm_alloc_page_reclaim_do(void *caller)
 {
-	uint64_t phys = mm_allocate_physical_page();
+	uint64_t phys = mm_alloc_page_do(caller);
 
 	if (likely(phys != 0))
 		return phys;
@@ -5053,12 +5082,20 @@ uint64_t mm_allocate_physical_page_reclaim(void)
 	 * work is paid for by whoever touched the page. */
 	pagecache_shrink(32, 0);
 	pagecache_request_writeback();
-	return mm_allocate_physical_page();
+	return mm_alloc_page_do(caller);
 }
 
+uint64_t mm_allocate_physical_page_reclaim(void)
+{
+	return mm_alloc_page_reclaim_do(__builtin_return_address(0));
+}
+
+/* The same for a demand fault.  The address recorded is the FAULT SITE's,
+ * not this helper's: it is the five callers below that are worth telling
+ * apart in the page-owner report. */
 static uint64_t mm_alloc_page_for_fault(void)
 {
-	return mm_allocate_physical_page_reclaim();
+	return mm_alloc_page_reclaim_do(__builtin_return_address(0));
 }
 
 /* Make room for an allocation of `pages' frames before it starts, keeping

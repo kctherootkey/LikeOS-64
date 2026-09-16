@@ -1137,11 +1137,53 @@ static int unix_recv_record(unix_socket_t *us, uint8_t *dst, size_t len)
 
 int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 {
+	return unix_send_fds(us, buf, len, flags, NULL, 0);
+}
+
+/* A stream send that carries in-band descriptors, queued ATOMICALLY with
+ * the first byte this call places -- the same contract unix_send_record
+ * gives a SEQPACKET record, and for the same reason.
+ *
+ * The descriptors used to be pushed onto the peer's pending-fd ring by the
+ * syscall layer BEFORE any byte was sent, through unix_send_fd(), whose
+ * return value that layer then discarded.  Two leaks followed, both of the
+ * reference fd_dup_entry_at() had taken on the passed file:
+ *
+ *  - the peer's ring full (32 entries) or the peer gone: unix_push_fd()
+ *    said -EAGAIN / -ENOTCONN, nobody released the entry, and the file
+ *    behind it could never reach its last close;
+ *  - the data send then failing with nothing placed (-EAGAIN on a
+ *    non-blocking socket, -EINTR while parked): the caller retries the
+ *    whole sendmsg -- libxcb does exactly this -- and the descriptors were
+ *    pushed a second time.  The receiver then held a descriptor it never
+ *    asked for and never closed.
+ *
+ * Either way the file lived for the rest of the boot.  For a dma-buf that
+ * file is what pins a GEM object's pages: the X server takes every DRI3
+ * pixmap as a descriptor over its STREAM socket, so a browser session left
+ * hundreds of megabytes of compositor tiles referenced by nothing that
+ * any process could still close.
+ *
+ * Rules, matching the record path: the descriptors go into the peer's ring
+ * under the same lock and only together with at least one byte, at the
+ * byte offset that byte will have; a full descriptor ring is a full ring
+ * (nothing is placed, and a blocking caller parks until the reader pops --
+ * unix_fd_space_wake() is that wake); on ANY return with nothing sent the
+ * descriptors were NOT queued and the caller still owns their references.
+ * Zero bytes with descriptors is not a stream case anything here sends
+ * (tmux's imsg and X requests both carry bytes); it queues them at the
+ * current offset if there is room and otherwise fails, never blocks.
+ * `fd_entries' are the caller's; this never frees the array. */
+int unix_send_fds(unix_socket_t *us, const void *buf, size_t len, int flags,
+		  void **fd_entries, int nfds)
+{
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
 	(void)flags;
 	if (!us)
 		return -EBADF;
+	if (nfds < 0 || (nfds > 0 && !fd_entries))
+		return -EINVAL;
 
 	/* Take a reference on the peer and keep it for the whole call.
 	 *
@@ -1173,7 +1215,7 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 	}
 
 	if (us->type == SOCK_SEQPACKET) {
-		int r = unix_send_record(us, peer, buf, len, NULL, 0);
+		int r = unix_send_record(us, peer, buf, len, fd_entries, nfds);
 		unix_put(peer);
 		return r;
 	}
@@ -1181,6 +1223,28 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 	const uint8_t *src = (const uint8_t *)buf;
 	int sent = 0;
 	uint64_t irqflags;
+
+	if (len == 0 && nfds) {
+		/* Descriptors and no bytes: they go with whatever byte comes
+		 * next, at the offset it will have.  Room or refusal, decided
+		 * once; see the header comment. */
+		int room;
+
+		spin_lock_irqsave(&peer->lock, &irqflags);
+		room = ((peer->pending_fd_head - peer->pending_fd_tail - 1 +
+			 UNIX_PENDING_FDS) % UNIX_PENDING_FDS) >= nfds;
+		if (room) {
+			for (int i = 0; i < nfds; i++) {
+				peer->pending_fds[peer->pending_fd_tail] = fd_entries[i];
+				peer->pending_fd_off[peer->pending_fd_tail] = peer->bytes_written;
+				peer->pending_fd_tail =
+					(peer->pending_fd_tail + 1) % UNIX_PENDING_FDS;
+			}
+		}
+		spin_unlock_irqrestore(&peer->lock, irqflags);
+		unix_put(peer);
+		return room ? 0 : -EAGAIN;
+	}
 	/* Set when this call queued data, cleared when the poll layer has been
 	 * told.  Not done per chunk: the loop runs once per 256 bytes, and a
 	 * large write would otherwise sweep the run queue hundreds of times to
@@ -1221,7 +1285,21 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 		/* Push into the peer's ring under its lock — kernel memory only. */
 		spin_lock_irqsave(&peer->lock, &irqflags);
 		size_t n = 0;
-		while (n < chunk) {
+		/* Descriptors still to queue need their ring slots BEFORE any
+		 * byte goes in: a byte placed without them would be one the
+		 * receiver associates with descriptors that never arrive.  No
+		 * room for them is a full ring -- nothing is placed, and the
+		 * full-ring path below parks or reports EAGAIN exactly as for
+		 * bytes. */
+		int fd_room = 1;
+		if (nfds &&
+		    ((peer->pending_fd_head - peer->pending_fd_tail - 1 +
+		      UNIX_PENDING_FDS) % UNIX_PENDING_FDS) < nfds)
+			fd_room = 0;
+		/* The offset the first byte below will have: what the receiver
+		 * matches the descriptors against.  Captured before it moves. */
+		uint64_t rec_off = peer->bytes_written;
+		while (fd_room && n < chunk) {
 			int next = (peer->tail + 1) % peer->bufsz;
 			if (next == peer->head)
 				break; /* ring full */
@@ -1229,6 +1307,17 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 			peer->tail = next;
 			peer->bytes_written++;
 			n++;
+		}
+		if (n && nfds) {
+			/* Same critical section as the bytes they ride with.
+			 * From here on the peer owns the references. */
+			for (int i = 0; i < nfds; i++) {
+				peer->pending_fds[peer->pending_fd_tail] = fd_entries[i];
+				peer->pending_fd_off[peer->pending_fd_tail] = rec_off;
+				peer->pending_fd_tail =
+					(peer->pending_fd_tail + 1) % UNIX_PENDING_FDS;
+			}
+			nfds = 0;
 		}
 		if (n)
 			peer->ready = 1;
@@ -1300,7 +1389,14 @@ int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 			}
 
 			spin_lock_irqsave(&peer->lock, &irqflags);
-			while ((peer->tail + 1) % peer->bufsz == peer->head) {
+			/* Full means: no byte fits, OR descriptors still to
+			 * queue have no slots -- the reader's pop is what frees
+			 * those, and it wakes this channel too
+			 * (unix_fd_space_wake). */
+			while ((peer->tail + 1) % peer->bufsz == peer->head ||
+			       (nfds &&
+				((peer->pending_fd_head - peer->pending_fd_tail - 1 +
+				  UNIX_PENDING_FDS) % UNIX_PENDING_FDS) < nfds)) {
 				if (peer->closed) {
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);

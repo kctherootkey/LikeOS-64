@@ -250,6 +250,14 @@ typedef struct __attribute__((packed)) {
  * window even larger. */
 #define TCP_WINDOW_SIZE 65535
 #define TCP_MSS 1460 // Maximum Segment Size
+/* The window a SYN advertises: 44 segments, 64240 bytes for the MSS above.
+ * The receive window itself is TCP_WINDOW_SIZE; this is the one number of
+ * it that goes on the wire unscaled, and it is what the reference stack
+ * puts there (its initial window is rounded down to a whole number of
+ * segments).  65535 in a SYN is what its OWN fingerprint databases file
+ * under "not that system" -- see tcp_build_options() for why the SYN must
+ * read as the system the User-Agent names. */
+#define TCP_SYN_WINDOW (44 * TCP_MSS)
 #define TCP_RX_BUF_SIZE 131072 // Initial per-conn RX ring (grows on demand)
 /* Max size the per-conn RX ring can grow to via auto-tuning.  Throughput
  * is BDP-capped at rx_buf_size / RTT — at 481 ms RTT (e.g. VMware NAT to
@@ -1626,6 +1634,12 @@ int unix_accept(unix_socket_t *us, struct sockaddr_un *addr,
 int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 		 socklen_t addrlen);
 int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags);
+/* unix_send carrying in-band descriptors, queued atomically with the first
+ * byte it places (a SEQPACKET socket gets one record).  On ANY negative
+ * return nothing was queued and the caller still owns the entries'
+ * references; on success the peer owns them.  See unix_socket.c. */
+int unix_send_fds(unix_socket_t *us, const void *buf, size_t len, int flags,
+		  void **fd_entries, int nfds);
 int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags);
 int unix_close(unix_socket_t *us);
 int unix_socketpair(int type, unix_socket_t *sv[2]);

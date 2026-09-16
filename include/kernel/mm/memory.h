@@ -20,7 +20,32 @@
 #define USER_SPACE_END \
 	0x00007FFFFFFFFFFFULL // End of user space (canonical low half)
 #define USER_STACK_TOP 0x00007FFFFFF00000ULL // User stack top (grows down)
-#define USER_STACK_SIZE (2 * 1024 * 1024) // 2MB default user stack
+/* The main thread's stack: 8 MB, which is what RLIMIT_STACK defaults to on
+ * the systems this software was written against, and therefore what its
+ * libraries size themselves by.
+ *
+ * It was 2 MB.  pthread_getattr_np() reports this figure for the main
+ * thread (kernel/ke/system.c fills it from user_stack_size), and
+ * JavaScriptCore sizes its interpreter stack from it: it allows itself
+ * min(reported stack, 5 MB) minus reserve zones.  With 2 MB reported it got
+ * ~1.8 MB where the same engine on the same sites gets 5 MB elsewhere, and
+ * every framework-heavy page threw "Maximum call stack size exceeded" deep
+ * inside site code that never sees it anywhere else.  The sites catch it
+ * and show their generic failure: a shop calling a valid e-mail invalid, a
+ * consent banner that never records the consent, a messenger's crypto
+ * module failing to load, a search returning nothing.  No network or cookie
+ * instrument can see it; a small test page never gets deep enough to hit it.
+ *
+ * Only the top USER_STACK_EAGER_SIZE is mapped at exec, exactly as the
+ * whole stack used to be; the rest is a lazy zero-fill region below it
+ * (task_register_lazy_region), so the growth room costs physical pages
+ * only where a process actually recurses into it. */
+#define USER_STACK_SIZE (8 * 1024 * 1024)
+#define USER_STACK_EAGER_SIZE (2 * 1024 * 1024)
+/* Kept clear between the stack's lowest page and the highest mapping the
+ * address-space search hands out (mmap_find_gap): a stray write below the
+ * stack faults instead of landing in a library. */
+#define USER_STACK_GUARD (1 * 1024 * 1024)
 #define KERNEL_STACK_SIZE (16 * 1024) // 16KB kernel stack per task
 
 // Kernel space virtual address constants

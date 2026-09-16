@@ -288,7 +288,20 @@ static int ipv4_send_common(net_device_t *dev, uint32_t dst_ip,
 	if (fragment_payload == 0 || len <= max_payload)
 		fragment_payload = max_payload;
 
-	uint16_t identification = (uint16_t)random_u32();
+	/* The identification field counts up from a random start rather than
+	 * being drawn fresh for every datagram.  Either is correct; only one
+	 * matches the reference stack, whose datagrams carry a counter, and
+	 * the difference is one of the handful of fields passive fingerprinters
+	 * classify the sending system by (see tcp_build_options()).  Random
+	 * per-datagram identification is filed under other systems entirely. */
+	static uint32_t ident_next;
+	static int ident_seeded;
+	if (!ident_seeded) {
+		ident_next = random_u32();
+		ident_seeded = 1;
+	}
+	uint16_t identification =
+		(uint16_t)__atomic_fetch_add(&ident_next, 1, __ATOMIC_RELAXED);
 	uint32_t src_ip = out_dev == net_get_loopback() ?
 				  (lo_src_override ? lo_src_override : dst_ip) :
 				  out_dev->ip_addr;
@@ -301,6 +314,15 @@ static int ipv4_send_common(net_device_t *dev, uint32_t dst_ip,
 			chunk = fragment_payload;
 		if (offset + chunk < len)
 			frag_flags |= IPV4_FLAG_MF;
+		/* A TCP segment travels with Don't-Fragment, as the reference
+		 * stack sends every one: a router on a narrower path answers
+		 * with ICMP fragmentation-needed and tcp_handle_pmtu() clamps
+		 * the connection's MSS (RFC 1191), instead of the path
+		 * fragmenting the segment.  Also a fingerprint field.  A segment
+		 * this stack has to fragment itself (a payload wider than the
+		 * device MTU, which TCP never hands down) keeps DF clear. */
+		if (protocol == IP_PROTO_TCP && len <= max_payload)
+			frag_flags |= IPV4_FLAG_DF;
 		frag_flags |= (uint16_t)((offset / 8) & IPV4_FRAG_OFFSET_MASK);
 
 		uint16_t total_len = (uint16_t)(sizeof(ipv4_header_t) + chunk);

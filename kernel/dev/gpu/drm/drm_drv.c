@@ -818,6 +818,172 @@ static long drm_show_hotplug(struct pfs_node *n, char *buf, long cap)
 	return ksnprintf(buf, (size_t)cap, "%u\n", dev->hotplug_epoch);
 }
 
+/* Where the GPU's pages are, read before and after a run.
+ *
+ * `memstat -o' can say that drm_gem_alloc_pages() holds the memory, but not
+ * WHICH objects hold it or whether anything still references them -- and
+ * those are different bugs.  A client that has exited should leave neither
+ * live objects nor a dead queue behind, so this separates the two:
+ *
+ *   objects-live    still referenced by somebody (a handle, a mapping, the
+ *                   scanout, a driver structure).  Memory here means a
+ *                   reference was not dropped.
+ *   dead-queued     unreferenced, waiting for the device to finish reading
+ *                   them (see drm_gem_put / gem_reap).  Memory here means
+ *                   fences are not being retired, not that a ref leaked.
+ *   borrowed-pages  an object over a client's own memory (gem_userptr):
+ *                   its pages are counted here but were never ours to free.
+ *
+ * Counted under the device lock, formatted after it: ksnprintf with
+ * interrupts disabled is not worth the shorter function.  The walk is
+ * bounded so a corrupt list cannot hold the lock forever. */
+#define DRM_GEM_STATS_MAX 100000u
+
+static long drm_show_gem_stats(struct pfs_node *n, char *buf, long cap)
+{
+	struct drm_device *dev = n->arg;
+	unsigned long live = 0, live_pages = 0;
+	unsigned long bo = 0, bo_pages = 0, surf = 0, surf_pages = 0;
+	unsigned long borrowed = 0, borrowed_pages = 0;
+	unsigned long waiting = 0, waiting_pages = 0;
+	unsigned long dead = 0, dead_pages = 0, dead_unsignalled = 0;
+	unsigned long files = 0, guard;
+	unsigned long created;
+	/* Which open file's handle table still names the live objects.
+	 * DRM_GEM_STATS_FILES bounds what is PRINTED; the totals below count
+	 * every file however many there are. */
+#define DRM_GEM_STATS_FILES 8
+	uint32_t f_id[DRM_GEM_STATS_FILES];
+	int f_render[DRM_GEM_STATS_FILES];
+	unsigned long f_handles[DRM_GEM_STATS_FILES];
+	unsigned long f_pages[DRM_GEM_STATS_FILES];
+	unsigned nfiles_shown = 0;
+	unsigned long handles_total = 0, handle_pages_total = 0;
+	unsigned long fb_owned = 0, fb_owned_pages = 0;
+	unsigned long fb_internal = 0, fb_internal_pages = 0;
+	int dead_n;
+	uint64_t fl;
+
+	spin_lock_irqsave(&dev->lock, &fl);
+	guard = DRM_GEM_STATS_MAX;
+	for (struct drm_gem_object *o = dev->objects; o && guard; o = o->next) {
+		guard--;
+		live++;
+		live_pages += o->npages;
+		if (o->kind == DRM_GEM_SURFACE) {
+			surf++;
+			surf_pages += o->npages;
+		} else {
+			bo++;
+			bo_pages += o->npages;
+		}
+		if (o->pages_borrowed) {
+			borrowed++;
+			borrowed_pages += o->npages;
+		}
+		if (o->fence && !o->fence->signaled) {
+			waiting++;
+			waiting_pages += o->npages;
+		}
+	}
+	guard = DRM_GEM_STATS_MAX;
+	for (struct drm_gem_object *o = dev->dead; o && guard;
+	     o = o->dead_next) {
+		guard--;
+		dead++;
+		dead_pages += o->npages;
+		if (o->fence && !o->fence->signaled)
+			dead_unsignalled++;
+	}
+	guard = DRM_GEM_STATS_MAX;
+	for (struct drm_file *f = dev->files; f && guard; f = f->next) {
+		unsigned long fh = 0, fpg = 0;
+
+		guard--;
+		files++;
+		/* Slots read under the DEVICE lock without the file's own,
+		 * exactly as drm_gem_lookup_foreign() does: a file cannot be
+		 * unlinked from dev->files while this lock is held. */
+		for (uint32_t h = 1; h < f->nhandles; h++) {
+			struct drm_gem_object *o = *drm_handle_slot(f, h);
+
+			if (!o)
+				continue;
+			fh++;
+			fpg += o->npages;
+		}
+		handles_total += fh;
+		handle_pages_total += fpg;
+		if (nfiles_shown < DRM_GEM_STATS_FILES) {
+			f_id[nfiles_shown] = f->file_id;
+			f_render[nfiles_shown] = f->is_render;
+			f_handles[nfiles_shown] = fh;
+			f_pages[nfiles_shown] = fpg;
+			nfiles_shown++;
+		}
+	}
+	/* The other reference this side can count.  An internal framebuffer
+	 * (owner NULL) is the console's or a cursor wrapper's and is NOT
+	 * freed when a client exits -- drm_kms_file_release() frees only
+	 * those whose owner is the closing file -- so it is worth seeing
+	 * separately from the ones a client owns. */
+	for (int i = 0; i < DRM_MAX_FBS; i++) {
+		struct drm_framebuffer *fb = &dev->fbs[i];
+
+		if (!fb->id || !fb->obj)
+			continue;
+		if (fb->owner) {
+			fb_owned++;
+			fb_owned_pages += fb->obj->npages;
+		} else {
+			fb_internal++;
+			fb_internal_pages += fb->obj->npages;
+		}
+	}
+	created = dev->next_obj_id;
+	dead_n = dev->dead_n;
+	spin_unlock_irqrestore(&dev->lock, fl);
+
+	long len = ksnprintf(
+		buf, (size_t)cap,
+		"objects-live     %lu  pages %lu (%lu MB)\n"
+		"  buffers        %lu  pages %lu (%lu MB)\n"
+		"  surfaces       %lu  pages %lu (%lu MB)\n"
+		"  borrowed       %lu  pages %lu  (client memory, never ours to free)\n"
+		"  awaiting-fence %lu  pages %lu\n"
+		"dead-queued      %lu  pages %lu (%lu MB)  dead_n %d  unsignalled %lu\n"
+		"open-files       %lu\n"
+		"objects-created  %lu\n",
+		live, live_pages, live_pages / 256, bo, bo_pages,
+		bo_pages / 256, surf, surf_pages, surf_pages / 256, borrowed,
+		borrowed_pages, waiting, waiting_pages, dead, dead_pages,
+		dead_pages / 256, dead_n, dead_unsignalled, files, created);
+
+	/* What KEEPS the live objects alive.  A live object is held by a
+	 * handle, a framebuffer, a mapping or a driver structure; the first
+	 * two are countable from here, and between them they answer the
+	 * question a leak hunt actually asks -- whether a client that has
+	 * exited left something behind (handles-held well under
+	 * objects-live), or whether a client still running is holding it
+	 * (one file's handle count carrying the difference).
+	 *
+	 * An object can be counted twice, by a handle AND by a framebuffer
+	 * over it: these are reference holders, not a partition of memory. */
+	if (len > 0 && len < cap)
+		len += ksnprintf(buf + len, (size_t)(cap - len),
+				 "handles-held     %lu  pages %lu (%lu MB)\n"
+				 "framebuffers     owned %lu pages %lu / internal %lu pages %lu\n",
+				 handles_total, handle_pages_total,
+				 handle_pages_total / 256, fb_owned,
+				 fb_owned_pages, fb_internal, fb_internal_pages);
+	for (unsigned i = 0; i < nfiles_shown && len > 0 && len < cap; i++)
+		len += ksnprintf(buf + len, (size_t)(cap - len),
+				 "  file %u (%s) handles %lu  pages %lu (%lu MB)\n",
+				 f_id[i], f_render[i] ? "render" : "card",
+				 f_handles[i], f_pages[i], f_pages[i] / 256);
+	return len;
+}
+
 /* ---- power ---------------------------------------------------------------- */
 
 int drm_suspend(struct drm_device *dev)
@@ -985,6 +1151,11 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 		else
 			ksnprintf(base, sizeof(base), "devices/virtual/drm/card%d", dev->index);
 		sysfs_add_attr(base, "hotplug", drm_show_hotplug, NULL, dev, 0);
+		/* Read it before and after a run to see whether a client left
+		 * objects referenced or only left them queued: see
+		 * drm_show_gem_stats(). */
+		sysfs_add_attr(base, "gem_stats", drm_show_gem_stats, NULL, dev,
+			       0);
 		if (drv->suspend && drv->resume && drv->atomic_commit)
 			sysfs_add_attr(base, "power_state", drm_show_power_state,
 				       drm_store_power_state, dev, 0);

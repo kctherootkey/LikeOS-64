@@ -470,7 +470,13 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 				uint64_t interp_base, const cred_t *newcred)
 {
 	BUG_ON(pml4 == NULL || mr == NULL);
-	if (!mm_map_user_stack(pml4, stack_top, stack_size))
+	/* Only the top of the stack is mapped here; the caller registers the
+	 * rest as a lazy zero-fill region once the task has a region table
+	 * (see USER_STACK_SIZE in memory.h for why the stack is bigger than
+	 * what is worth mapping up front). */
+	if (!mm_map_user_stack(pml4, stack_top,
+			       stack_size > USER_STACK_EAGER_SIZE ?
+				       USER_STACK_EAGER_SIZE : stack_size))
 		return 0;
 
 	int argc = 0;
@@ -784,12 +790,12 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 		lr.interp_entry = ie;
 	}
 
-#define USER_STACK_TOP 0x00007FFFFFF00000ULL
-#define USER_STACK_SIZE \
-	(2 * 1024 * 1024) /* 2MB — matches memory.h. Smaller stacks (64K)
-                                                 * cause ports/lib/* (libevent, ncurses, tmux's
-                                                 * deeply-recursive parser/log paths) to overflow
-                                                 * silently and SIGSEGV on the guard region. */
+	/* USER_STACK_TOP / USER_STACK_SIZE come from <kernel/mm/memory.h>;
+	 * this file used to carry its own copies, which is how a change to
+	 * one and not the other would have gone unnoticed.  Smaller stacks
+	 * (64K) made the ported libraries (libevent, ncurses, tmux's
+	 * deeply-recursive parser/log paths) overflow silently; 2 MB made
+	 * JavaScriptCore throw inside site code -- see memory.h. */
 
 	/* No set-id transition happens on this path -- it spawns a fresh task
 	 * rather than replacing an image -- so the current credentials are
@@ -817,7 +823,7 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 	t->brk = lr.brk_start;
 	t->user_stack_top = USER_STACK_TOP;
 	t->user_stack_size = USER_STACK_SIZE;
-	t->mmap_base = USER_STACK_TOP - (4 * 1024 * 1024);
+	t->mmap_base = USER_STACK_TOP - USER_STACK_SIZE - USER_STACK_GUARD;
 
 	/* Register the loader's lazy ranges: anonymous BSS (zero-filled on
 	 * first touch) and demand-paged executable/interpreter segments
@@ -833,6 +839,11 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 					  lr.lazy_regions[i].prot, bf,
 					  lr.lazy_regions[i].file_off);
 	}
+	/* The stack's growth room: everything below the eagerly mapped top,
+	 * zero-filled on first touch like BSS.  See USER_STACK_SIZE. */
+	task_register_lazy_region(t, USER_STACK_TOP - USER_STACK_SIZE,
+				  USER_STACK_SIZE - USER_STACK_EAGER_SIZE,
+				  PROT_READ | PROT_WRITE, NULL, 0);
 	for (int b = 0; b < 2; b++)
 		if (lr.backing[b])
 			vfs_close(lr.backing[b]);
@@ -970,9 +981,8 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		lr.interp_entry = ie;
 	}
 
-#define USER_STACK_TOP_EXEC 0x00007FFFFFF00000ULL
-#define USER_STACK_SIZE_EXEC \
-	(2 * 1024 * 1024) /* See note in elf_load_and_run. */
+#define USER_STACK_TOP_EXEC USER_STACK_TOP
+#define USER_STACK_SIZE_EXEC USER_STACK_SIZE /* one figure, memory.h */
 
 	uint64_t sp =
 		elf_setup_stack(pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC,
@@ -1035,8 +1045,24 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	cur->brk = lr.brk_start;
 	cur->user_stack_top = USER_STACK_TOP_EXEC;
 	cur->user_stack_size = USER_STACK_SIZE_EXEC;
-	/* Clear stale mmap_region slots inherited from parent via fork+exec,
-	 * releasing any file references pinned for demand paging.
+	/* Release the mmap_region slots inherited from the parent via
+	 * fork+exec: EVERY reference an in-use record holds, through the one
+	 * routine munmap() and the exit path use for the same job.
+	 *
+	 * This used to release only the record's file, by hand.  A record of
+	 * a device mapping also holds a reference on the driver object behind
+	 * it -- fork's mm_regions_clone_ref() takes one per record so the
+	 * child's copy is as good as the parent's -- and that one was never
+	 * dropped here.  A browser's UI process maps its GPU buffers and
+	 * forks a helper process for every page it opens (its launcher passes
+	 * descriptors to the child, which is what makes it fork rather than
+	 * vfork); each fork put one more reference on every mapped buffer
+	 * and each exec forgot it.  The buffers -- viewport-sized, a fixed
+	 * fraction of everything the session allocated -- stayed referenced
+	 * by nothing that any process could still close, hundreds of
+	 * megabytes of them after an hour, while their pages, handles and
+	 * descriptors were all correctly gone.  (kernel/dev/gpu/drm
+	 * gem_stats: objects-live climbing with handles-held flat.)
 	 *
 	 * Under the address-space lock, because munmap() releases exactly the
 	 * same references while holding it for writing.  Unlocked, the two
@@ -1044,33 +1070,32 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	 * one reference, dropped twice, and the file destroyed while other
 	 * mappings still named it.  That is the general protection fault this
 	 * loop was taking, with the allocator's poison where ->ops should be.
+	 * mm_region_ref_drop() takes each reference OUT of the slot before
+	 * releasing it, so whoever loses the race finds nothing left.
 	 *
-	 * Taking the reference OUT of the slot before releasing it also means
-	 * that whoever loses the race finds nothing left to release. */
+	 * ONLY an in-use slot owns references.  A slot that is not in use can
+	 * still carry stale pointers -- mm_regions_clone() copies the whole
+	 * table by value, and fork's incref pass deliberately skips the slots
+	 * that are not in use -- so releasing on the pointers alone would
+	 * drop references that were never taken. */
 	{
 		task_t *mm_owner = task_mm_owner(cur);
 
 		mm_write_lock(&mm_owner->mmap_lock);
 		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
-			vfs_file_t *rf = NULL;
+			mmap_region_t *r = &cur->mmap_regions[i];
 
-			/* ONLY an in-use slot owns a reference.  A slot that is
-			 * not in use can still carry a stale file pointer --
-			 * mm_regions_clone() copies the whole table by value,
-			 * and fork's incref pass deliberately skips the slots
-			 * that are not in use -- so releasing on the pointer
-			 * alone drops references that were never taken. */
-			if (cur->mmap_regions[i].in_use)
-				rf = cur->mmap_regions[i].file;
-			cur->mmap_regions[i].file = NULL;
-			cur->mmap_regions[i].lazy = false;
-			cur->mmap_regions[i].in_use = false;
-			if (rf)
-				vfs_close(rf);
+			if (r->in_use)
+				mm_region_ref_drop(r);
+			r->file = NULL;
+			r->dev_obj = NULL;
+			r->lazy = false;
+			r->device = false;
+			r->in_use = false;
 		}
 		mm_write_unlock(&mm_owner->mmap_lock);
 	}
-	cur->mmap_base = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
+	cur->mmap_base = USER_STACK_TOP_EXEC - USER_STACK_SIZE_EXEC - USER_STACK_GUARD;
 
 	/* Register the new image's lazy ranges (anon BSS + demand-paged
 	 * executable/interpreter segments), then drop the loader's file
@@ -1085,6 +1110,10 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 					  lr.lazy_regions[i].prot, bf,
 					  lr.lazy_regions[i].file_off);
 	}
+	/* The stack's growth room, as in elf_load_and_run. */
+	task_register_lazy_region(cur, USER_STACK_TOP_EXEC - USER_STACK_SIZE_EXEC,
+				  USER_STACK_SIZE_EXEC - USER_STACK_EAGER_SIZE,
+				  PROT_READ | PROT_WRITE, NULL, 0);
 	for (int b = 0; b < 2; b++)
 		if (lr.backing[b])
 			vfs_close(lr.backing[b]);
