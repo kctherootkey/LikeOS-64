@@ -50,15 +50,26 @@
  * case -- the top gap is free, which is what unmapping the previous frame's
  * scratch leaves behind -- is a single walk.  Pure over its arguments so
  * the build host can check it. */
-static uint64_t mmap_gap_search(const mmap_region_t *regions, uint32_t n,
-				uint64_t ceiling, uint64_t floor,
-				uint64_t length)
+/* `max_steps' bounds the walks (0 = no bound); when the bound is what ended
+ * the search, *gave_up is set and the answer is 0 without meaning "no room". */
+static uint64_t mmap_gap_search_steps(const mmap_region_t *regions, uint32_t n,
+				      uint64_t ceiling, uint64_t floor,
+				      uint64_t length, uint32_t max_steps,
+				      int *gave_up)
 {
 	uint64_t end = ceiling;
+	uint32_t steps = 0;
 
+	if (gave_up)
+		*gave_up = 0;
 	if (length == 0 || ceiling < floor)
 		return 0;
 	while (end >= floor && end - floor >= length) {
+		if (max_steps && steps++ >= max_steps) {
+			if (gave_up)
+				*gave_up = 1;
+			return 0;
+		}
 		uint64_t start = end - length;
 		uint64_t block = 0;
 		int blocked = 0;
@@ -81,6 +92,108 @@ static uint64_t mmap_gap_search(const mmap_region_t *regions, uint32_t n,
 	}
 	return 0;
 }
+
+static uint64_t mmap_gap_search(const mmap_region_t *regions, uint32_t n,
+				uint64_t ceiling, uint64_t floor,
+				uint64_t length)
+{
+	return mmap_gap_search_steps(regions, n, ceiling, floor, length, 0,
+				     NULL);
+}
+
+/* Is [start, end) clear of every record?  One walk. */
+static int mmap_gap_window_free(const mmap_region_t *regions, uint32_t n,
+				uint64_t start, uint64_t end)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		const mmap_region_t *r = &regions[i];
+
+		if (!r->in_use || r->length == 0)
+			continue;
+		if (r->start < end && start < r->start + r->length)
+			return 0;
+	}
+	return 1;
+}
+
+/* The answer mmap_gap_search() gives, from ONE ordered pass.
+ *
+ * The search above takes a walk of the whole table for every record it has
+ * to step past, and what it steps past is everything mapped above the first
+ * gap that fits.  That is the square of the table for a process whose
+ * mappings do not coalesce -- and a graphics client's do not: every buffer
+ * the GL library has mapped is a device record of its own, thousands of them
+ * in a display server or a browser, packed under the ceiling with holes too
+ * small for the next request.  Measured on the build host with this very
+ * code, unoptimised as the kernel is built: about 10 ms for one 64 KB mmap
+ * against 4000 such records, 90 ms against 10000, 1.8 s against 40000 --
+ * each under the address-space write lock, which every page fault of every
+ * thread of that process waits on.  The cursor this replaced was constant
+ * time, so nothing had shown it.  The same tables through the pass below:
+ * 0.5 ms, 1.5 ms and 9 ms.
+ *
+ * Here the records that can matter (those starting below the ceiling) are
+ * put in descending address order first, and the candidate's top then only
+ * ever moves down across them: n log n for the order, n for the pass.
+ * `order' is the caller's scratch, room for n slot numbers.
+ *
+ * Records never overlap one another, which is what lets the pass trust that
+ * nothing sorted after a record reaches above it.  The caller does not rely
+ * on that: it checks the window it is handed back (mmap_gap_window_free)
+ * and falls back to the search above if the table ever says otherwise. */
+static uint64_t mmap_gap_search_sorted(const mmap_region_t *regions, uint32_t n,
+				       uint64_t ceiling, uint64_t floor,
+				       uint64_t length, uint16_t *order)
+{
+	static const uint32_t gaps[] = { 19930, 8858, 3937, 1750, 701, 301,
+					 132,	57,   23,   10,	  4,   1 };
+	uint64_t end = ceiling;
+	uint32_t m = 0;
+
+	if (length == 0 || ceiling < floor || !order)
+		return 0;
+	for (uint32_t i = 0; i < n; i++) {
+		const mmap_region_t *r = &regions[i];
+
+		/* A record starting at or above the ceiling blocks no window
+		 * below it. */
+		if (!r->in_use || r->length == 0 || r->start >= ceiling)
+			continue;
+		order[m++] = (uint16_t)i;
+	}
+	/* Shell sort, highest start first: no recursion, no second buffer. */
+	for (unsigned g = 0; g < sizeof(gaps) / sizeof(gaps[0]); g++) {
+		uint32_t gap = gaps[g];
+
+		for (uint32_t i = gap; i < m; i++) {
+			uint16_t key = order[i];
+			uint64_t key_start = regions[key].start;
+			uint32_t j = i;
+
+			while (j >= gap &&
+			       regions[order[j - gap]].start < key_start) {
+				order[j] = order[j - gap];
+				j -= gap;
+			}
+			order[j] = key;
+		}
+	}
+	for (uint32_t k = 0; k < m; k++) {
+		const mmap_region_t *r = &regions[order[k]];
+
+		if (end < floor || end - floor < length)
+			return 0;
+		/* The highest record not yet passed ends at or below the
+		 * window: nothing lower can reach into it either. */
+		if (r->start + r->length <= end - length)
+			return end - length;
+		if (r->start < end)
+			end = r->start & ~(uint64_t)(PAGE_SIZE - 1);
+	}
+	if (end < floor || end - floor < length)
+		return 0;
+	return end - length;
+}
 /* ---- mmap address selection: END ---- */
 
 /* The search above, over this address space: bounded by mmap_hwm like every
@@ -93,6 +206,8 @@ static uint64_t mmap_gap_search(const mmap_region_t *regions, uint32_t n,
  * of a 2 MB stack.  The stack is 8 MB now, most of it a lazy region
  * (memory.h, USER_STACK_SIZE): a ceiling inside it would hand a library
  * the addresses a deep recursion is about to grow into. */
+#define MMAP_GAP_PLAIN_STEPS 4
+
 uint64_t mmap_find_gap(task_t *cur, uint64_t length)
 {
 	/* A task built by the kernel rather than exec has no stack top or
@@ -110,7 +225,56 @@ uint64_t mmap_find_gap(task_t *cur, uint64_t length)
 		floor = 0x10000;
 	if (n > cur->mmap_capacity)
 		n = cur->mmap_capacity;
-	return mmap_gap_search(cur->mmap_regions, n, ceiling, floor, length);
+
+	const mmap_region_t *tab = cur->mmap_regions;
+	uint64_t hint = cur->mmap_gap_hint;
+	uint64_t got = 0;
+
+	/* First the place most likely to be free, for the price of one walk:
+	 * right under the last placement, or the top of the range munmap gave
+	 * back last (mm_unmap_range_and_regions raises the hint to it).  That
+	 * is where a client that maps and unmaps buffers as it draws finds
+	 * its next address nearly every time.  The window is CHECKED, never
+	 * assumed -- the hint is only a place to look first. */
+	if (hint && !(hint & (PAGE_SIZE - 1)) && hint <= ceiling &&
+	    hint >= floor && hint - floor >= length &&
+	    mmap_gap_window_free(tab, n, hint - length, hint))
+		got = hint - length;
+
+	/* Otherwise the highest gap that fits.  A few steps of the plain
+	 * search first: when the space under the ceiling is free, or nearly,
+	 * that is the whole answer for a walk or two, cheaper than putting
+	 * the table in order.  Past that it is the ordered pass, whose cost
+	 * does not depend on how much is mapped above the gap. */
+	int gave_up = 0;
+
+	if (!got)
+		got = mmap_gap_search_steps(tab, n, ceiling, floor, length,
+					    MMAP_GAP_PLAIN_STEPS, &gave_up);
+	if (!got && gave_up && n) {
+		uint16_t *order;
+
+		BUILD_BUG_ON(TASK_MAX_MMAP > 0xFFFF);
+		order = (uint16_t *)kalloc((size_t)n * sizeof(uint16_t));
+		if (order) {
+			got = mmap_gap_search_sorted(tab, n, ceiling, floor,
+						     length, order);
+			kfree(order);
+			/* Trusted only as far as the table bears it out. */
+			if (got && !mmap_gap_window_free(tab, n, got,
+							 got + length)) {
+				WARN_ON_ONCE(1);
+				got = 0;
+			}
+		}
+	}
+	/* No scratch memory, or a table the ordered pass could not make
+	 * sense of: the plain search to the end, slow but self-contained. */
+	if (!got && gave_up)
+		got = mmap_gap_search(tab, n, ceiling, floor, length);
+	if (got)
+		cur->mmap_gap_hint = got;
+	return got;
 }
 
 static int64_t sys_brk_locked(uint64_t new_brk)

@@ -157,6 +157,36 @@ enum drm_gem_dirty_method {
  * really does share buffers, and that this was the fault. */
 #define DRM_GEM_DIRTY_CONTENT_SCAN 0
 
+/* Whether a sweep that reached every mapping is BELIEVED, or every scan
+ * reports the whole object.
+ *
+ * OFF -- and until 2026-09-16 it was off without anybody having decided so.
+ * A scan reports the whole object whenever the census (o->map_records) counts
+ * a writable record the sweep did not walk, and the census was never right:
+ * a fork gives the child a record of every device mapping, and the child's
+ * exec released the record's file but neither the object reference nor the
+ * census entry.  Any process that forks with such a buffer mapped left it
+ * counting one record too many for good -- the display server runs its
+ * keymap compiler that way, a browser launches a helper per page -- and from
+ * then on every scan of it answered "whole object": the exact answer below
+ * did not decide what the device was sent.  The measurements of that period
+ * agree: whole-object answers equal to scans, in every sample taken.
+ *
+ * Then the leak was fixed (exec and exit now release what a record holds,
+ * census entry included), the count became true, and the exact answer went
+ * live for the first time -- in the display server, whose one coherent buffer
+ * is the vertex ring everything on the screen is drawn from.  What the user
+ * saw is the picture described above, unchanged: text collapsed onto the
+ * origin of its window, fills at the place of an earlier draw, exposed areas
+ * left black with later repaints across them.  Stale vertex data.
+ *
+ * So the whole-object answer is now the stated policy rather than the
+ * by-product of a miscount.  It is what every session before that date
+ * rendered with, and it costs what they paid: the buffer is 512 KB.  Set to 1
+ * to let an all-reached sweep stand again -- after the tracker has been shown
+ * right on the device, which no harness here can do. */
+#define DRM_GEM_DIRTY_EXACT 0
+
 struct drm_gem_dirty {
 	enum drm_gem_dirty_method method;
 	unsigned int change_count;
@@ -635,11 +665,12 @@ void drm_gem_dirty_scan(struct drm_gem_object *o)
 		dirty_scan_mkwrite(o, d, &foreign);
 	}
 
-	if (foreign) {
+	if (foreign || !DRM_GEM_DIRTY_EXACT) {
 		/* Mappings exist that the sweep could not reach, or one
 		 * vanished with its record: every page might have been
 		 * written, so every page is reported.  Costly and correct;
-		 * see the header comment. */
+		 * see the header comment.  And by policy even when the sweep
+		 * reached them all: see DRM_GEM_DIRTY_EXACT. */
 		report_all = 1;
 	}
 

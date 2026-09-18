@@ -64,7 +64,10 @@ static int add(uint64_t start, uint64_t length)
 static int overlaps_any(uint64_t start, uint64_t length)
 {
 	for (int i = 0; i < NREG; i++)
-		if (tab[i].in_use && tab[i].start < start + length &&
+		/* A record of no length occupies nothing (the kernel's
+		 * searches skip it the same way). */
+		if (tab[i].in_use && tab[i].length &&
+		    tab[i].start < start + length &&
 		    start < tab[i].start + tab[i].length)
 			return 1;
 	return 0;
@@ -199,6 +202,92 @@ int main(void)
 		CHECK(got == want, "trial %d: got %llx want %llx (n=%d len=%llx)",
 		      trial, (unsigned long long)got, (unsigned long long)want,
 		      n, (unsigned long long)len);
+	}
+
+	/* 8. The ordered pass must give the SAME answer as the plain search
+	 * -- it replaces it wherever the plain one would take more than a
+	 * few walks -- and both must match the specification.  Same random
+	 * tables as above, plus what the plain search meets in a real
+	 * process: records straddling the ceiling, records above it, records
+	 * under the floor, starts that are not page aligned (an executable's
+	 * lazy ranges), zero-length and unused slots. */
+	{
+		static uint16_t order[NREG];
+
+		for (int trial = 0; trial < 20000; trial++) {
+			clear();
+			int n = rand() % 40;
+			int aligned = 1;
+			for (int i = 0; i < n; i++) {
+				uint64_t s = sf - 0x8000 +
+					     (uint64_t)(rand() % 0x420) * PAGE_SIZE;
+				uint64_t l = (uint64_t)(1 + rand() % 12) * PAGE_SIZE;
+
+				if (rand() % 8 == 0) {
+					s += 0x123; /* unaligned start */
+					aligned = 0;
+				}
+				if (rand() % 16 == 0)
+					l = 0;
+				/* keep the table what the kernel keeps it:
+				 * records do not overlap one another */
+				if (l && overlaps_any(s, l))
+					continue;
+				int slot = add(s, l);
+				if (slot >= 0 && rand() % 16 == 0)
+					tab[slot].in_use = 0;
+			}
+			uint64_t len = (uint64_t)(1 + rand() % 16) * PAGE_SIZE;
+			uint64_t plain = mmap_gap_search(tab, NREG, sc, sf, len);
+			uint64_t sorted = mmap_gap_search_sorted(tab, NREG, sc,
+								 sf, len, order);
+			CHECK(sorted == plain,
+			      "ordered trial %d: got %llx, plain search %llx (n=%d len=%llx)",
+			      trial, (unsigned long long)sorted,
+			      (unsigned long long)plain, n,
+			      (unsigned long long)len);
+			/* ...and the specification, which walks whole pages
+			 * and so speaks only for page-aligned tables. */
+			if (aligned)
+				CHECK(sorted == brute(sc, sf, len),
+				      "ordered trial %d: got %llx, specification %llx",
+				      trial, (unsigned long long)sorted,
+				      (unsigned long long)brute(sc, sf, len));
+			if (sorted) {
+				CHECK(!overlaps_any(sorted, len),
+				      "ordered trial %d: %llx overlaps", trial,
+				      (unsigned long long)sorted);
+				CHECK(sorted >= sf && sorted + len <= sc,
+				      "ordered trial %d: %llx outside the window",
+				      trial, (unsigned long long)sorted);
+				CHECK(mmap_gap_window_free(tab, NREG, sorted,
+							   sorted + len),
+				      "ordered trial %d: window check disagrees",
+				      trial);
+			}
+			/* The bounded search: the plain answer when it
+			 * finishes, and says so when it does not. */
+			int gave_up = 0;
+			uint64_t few = mmap_gap_search_steps(tab, NREG, sc, sf,
+							     len, 4, &gave_up);
+			CHECK(gave_up ? few == 0 : few == plain,
+			      "bounded trial %d: got %llx gave_up %d, plain %llx",
+			      trial, (unsigned long long)few, gave_up,
+			      (unsigned long long)plain);
+		}
+		/* No scratch is an answer of 0, never a wild write. */
+		clear();
+		CHECK(mmap_gap_search_sorted(tab, NREG, CEIL, FLOOR, 0x10000,
+					     NULL) == 0,
+		      "ordered pass without scratch");
+		/* Every slot in use: the order array is filled to the brim. */
+		clear();
+		for (int i = 0; i < NREG; i++)
+			add(CEIL - (uint64_t)(i + 1) * 0x3000, 0x2000);
+		CHECK(mmap_gap_search_sorted(tab, NREG, CEIL, FLOOR, 0x2000,
+					     order) ==
+			      mmap_gap_search(tab, NREG, CEIL, FLOOR, 0x2000),
+		      "full table");
 	}
 
 	if (fails) {

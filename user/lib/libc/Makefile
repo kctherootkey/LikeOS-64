@@ -171,12 +171,26 @@ $(CRTN): $(CRTN_OBJ)
 %.pic.o: %.cpp
 	$(CXX) $(PIC_CXXFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(ALL_OBJ) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(CRTI_OBJ) $(CRTN_OBJ) $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN)
-	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
-	find src -name '*.d' -delete
+# `clean' leaves the LLVM math objects alone.  They are 130 C++ files of
+# pristine third-party code that take far longer to compile than the rest of
+# the library put together, and nothing a `make clean' is normally run for
+# reaches them: CXXFLAGS does not see DEBUG, and their header dependencies are
+# tracked, so their .d files are kept with them -- deleting those while the
+# objects stayed would leave objects that no header change could rebuild.
+# `distclean' removes them.
+LLVM_MATH_OBJ = $(LLVM_MATH_SRC:.cpp=.o)
+LLVM_MATH_PIC = $(LLVM_MATH_SRC:.cpp=.pic.o)
 
-.PHONY: all clean
+clean:
+	rm -f $(filter-out $(LLVM_MATH_OBJ),$(ALL_OBJ)) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(CRTI_OBJ) $(CRTN_OBJ) $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN)
+	rm -f $(filter-out $(LLVM_MATH_PIC),$(LIBC_PIC)) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
+	find src -path src/math/llvm-libc -prune -o -name '*.d' -exec rm -f {} +
+
+distclean: clean
+	rm -f $(LLVM_MATH_OBJ) $(LLVM_MATH_PIC)
+	find src/math/llvm-libc -name '*.d' -delete
+
+.PHONY: all clean distclean
 
 # libm.a — deliberately EMPTY.
 #

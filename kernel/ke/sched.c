@@ -1640,6 +1640,7 @@ static void task_init_common(task_t *t)
 	t->mmap_capacity = 0;
 	t->mmap_hwm = 0;
 	t->mmap_hint = 0;
+	t->mmap_gap_hint = 0;
 	mm_regions_init(t);
 	/* One address-space lock per task_t; only the group leader's is ever
 	 * taken (see task_mm_owner), but every task_t carries an initialised

@@ -58,9 +58,15 @@ static int drm_open(struct devfs_node *node, vfs_file_t *file, int flags,
 	 * names one object across the whole device rather than one per file.
 	 * Never zero, so a valid handle is never a small integer that some
 	 * other file could also produce. */
+	/* 1..0x7FFF, each in turn.  This was `1 + (n & 0x7FFE)', and a mask
+	 * with its low bit clear gives every number TWICE: two files opened
+	 * one after the other carried the same id, so under the global
+	 * numbering (drm_driver.global_handles) each one's handles passed
+	 * for the other's -- a surface named by its creator's id resolved in
+	 * the wrong file's table. */
 	static uint32_t next_file_id;
-	fp->file_id = 1 + (__atomic_fetch_add(&next_file_id, 1, __ATOMIC_RELAXED) &
-			   0x7FFEu);
+	fp->file_id = 1 + (__atomic_fetch_add(&next_file_id, 1, __ATOMIC_RELAXED) %
+			   0x7FFFu);
 	fp->is_render = (node == &dev->node_render);
 	fp->uid = cur ? cur->cred.euid : 0;
 	spinlock_init(&fp->lock, "drm_file");

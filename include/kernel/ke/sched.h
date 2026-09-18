@@ -897,6 +897,13 @@ typedef struct task {
 	 * stale value costs nothing: it is re-checked against the address
 	 * before it is used. */
 	uint32_t mmap_hint;
+	/* Where mmap_find_gap() looks FIRST for a mapping with no address of
+	 * its own: the top of the window right under the last placement, or
+	 * the end of the range munmap released last.  Only ever a place to
+	 * look -- the window is checked against the table before it is used
+	 * -- so a stale or zero value costs one walk and nothing else.  Read
+	 * and written under the address-space write lock. */
+	uint64_t mmap_gap_hint;
 	uint64_t mmap_base; // Base address for mmap allocations
 
 	/* Guards this address space: the region table above, mmap_base, brk,

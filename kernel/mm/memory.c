@@ -2523,12 +2523,14 @@ bool mm_regions_init(task_t *task)
 		task->mmap_capacity = 0;
 		task->mmap_hwm = 0;
 		task->mmap_hint = 0;
+		task->mmap_gap_hint = 0;
 		return false;
 	}
 	mm_memset(task->mmap_regions, 0, bytes);
 	task->mmap_capacity = MMAP_REGIONS_INITIAL;
 	task->mmap_hwm = 0;
 	task->mmap_hint = 0;
+	task->mmap_gap_hint = 0;
 	return true;
 }
 
@@ -2631,6 +2633,7 @@ void mm_regions_free(task_t *task)
 	 * the new table scanned against the old table's extent. */
 	task->mmap_hwm = 0;
 	task->mmap_hint = 0;
+	task->mmap_gap_hint = 0;
 }
 
 /* Replace a task's table with a copy of `src`'s.
@@ -2668,6 +2671,9 @@ bool mm_regions_clone(task_t *dst, const task_t *src)
 	 * there and nothing would find it. */
 	dst->mmap_hwm = src->mmap_hwm > cap ? cap : src->mmap_hwm;
 	dst->mmap_hint = 0;
+	/* Same layout, so the same place to look first (see mmap_find_gap);
+	 * it is checked before use either way. */
+	dst->mmap_gap_hint = src->mmap_gap_hint;
 	return true;
 }
 
@@ -3343,6 +3349,23 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 		}
 
 		freed_any = 1;
+		/* The next mapping with no address of its own looks here
+		 * first (mmap_find_gap): a client that unmaps a buffer and maps
+		 * the next one gets the address back for one walk of the
+		 * table, not a search of it.  Only ever raised here, so a run
+		 * of unmaps leaves it at the highest hole.
+		 *
+		 * Only for a range inside the area those mappings are placed
+		 * in -- at or above its low-water mark, mmap_base.  The loader
+		 * puts libraries at addresses of ITS choosing with MAP_FIXED,
+		 * far below, and keeps its own idea of where the next one
+		 * goes: a hint left down there by the teardown under a
+		 * MAP_FIXED, or by a dlclose, would have the kernel place a
+		 * mapping where the loader is about to put a library, and
+		 * MAP_FIXED replaces what it finds. */
+		if (cur_addr >= task->mmap_base &&
+		    unmap_end > task->mmap_gap_hint)
+			task->mmap_gap_hint = unmap_end;
 		cur_addr = region_end;
 	}
 

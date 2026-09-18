@@ -844,6 +844,14 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 	task_register_lazy_region(t, USER_STACK_TOP - USER_STACK_SIZE,
 				  USER_STACK_SIZE - USER_STACK_EAGER_SIZE,
 				  PROT_READ | PROT_WRITE, NULL, 0);
+	/* The initial TLS page (setup_user_tls_canary) is mapped inside the
+	 * range mmap_find_gap() hands out, about 500 MB under its ceiling,
+	 * and that search believes the region table: without a record it
+	 * would place a mapping over a page that is present and NOT zero --
+	 * the self-pointer and the canary -- which calloc() then returns as
+	 * cleared memory, since it trusts a fresh mapping to be. */
+	task_register_lazy_region(t, USER_INITIAL_TLS_VA, PAGE_SIZE,
+				  PROT_READ | PROT_WRITE, NULL, 0);
 	for (int b = 0; b < 2; b++)
 		if (lr.backing[b])
 			vfs_close(lr.backing[b]);
@@ -1096,6 +1104,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		mm_write_unlock(&mm_owner->mmap_lock);
 	}
 	cur->mmap_base = USER_STACK_TOP_EXEC - USER_STACK_SIZE_EXEC - USER_STACK_GUARD;
+	cur->mmap_gap_hint = 0; /* the old image's; see mmap_find_gap() */
 
 	/* Register the new image's lazy ranges (anon BSS + demand-paged
 	 * executable/interpreter segments), then drop the loader's file
@@ -1113,6 +1122,9 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	/* The stack's growth room, as in elf_load_and_run. */
 	task_register_lazy_region(cur, USER_STACK_TOP_EXEC - USER_STACK_SIZE_EXEC,
 				  USER_STACK_SIZE_EXEC - USER_STACK_EAGER_SIZE,
+				  PROT_READ | PROT_WRITE, NULL, 0);
+	/* ...and the initial TLS page's record, for the same reason. */
+	task_register_lazy_region(cur, USER_INITIAL_TLS_VA, PAGE_SIZE,
 				  PROT_READ | PROT_WRITE, NULL, 0);
 	for (int b = 0; b < 2; b++)
 		if (lr.backing[b])

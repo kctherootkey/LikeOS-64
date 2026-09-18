@@ -79,21 +79,28 @@ void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
 	int nw = 0;
 
 	spin_lock_irqsave(&dev->lock, &fl);
-	for (struct drm_fence *f = dev->fences; f; f = f->next) {
-		if (!f->signaled && f->context == context &&
-		    f->seqno64 <= passed) {
-			f->signaled = 1;
-			f->signal_ns = hrtimer_now_ns();
-			if (nw < 64) {
+	/* In batches, so that none is signalled without being woken: see
+	 * drm_fence_signal_upto(). */
+	for (;;) {
+		nw = 0;
+		for (struct drm_fence *f = dev->fences; f && nw < 64;
+		     f = f->next) {
+			if (!f->signaled && f->context == context &&
+			    f->seqno64 <= passed) {
+				f->signaled = 1;
+				f->signal_ns = hrtimer_now_ns();
 				drm_fence_get(f);
 				wake[nw++] = f;
 			}
 		}
-	}
-	spin_unlock_irqrestore(&dev->lock, fl);
-	for (int i = 0; i < nw; i++) {
-		poll_notify_wq(&wake[i]->wq);
-		drm_fence_put(wake[i]);
+		spin_unlock_irqrestore(&dev->lock, fl);
+		for (int i = 0; i < nw; i++) {
+			poll_notify_wq(&wake[i]->wq);
+			drm_fence_put(wake[i]);
+		}
+		if (nw < 64)
+			break;
+		spin_lock_irqsave(&dev->lock, &fl);
 	}
 	poll_notify_wq(&dev->vbl_wq);
 }
@@ -191,20 +198,39 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 		return;
 	}
 	dev->fence_passed = passed;
-	for (struct drm_fence *f = dev->fences; f; f = f->next) {
-		if (!f->signaled && (int32_t)(passed - f->seqno) >= 0) {
-			f->signaled = 1;
-			f->signal_ns = hrtimer_now_ns();
-			if (nw < 64) {
+	/* In batches of what `wake' holds, until a pass finds no more.
+	 *
+	 * A fence used to be marked signalled whether or not there was room
+	 * left to wake it, so the 65th and later of one pass were signalled
+	 * in silence -- and the list is newest first, so the ones dropped
+	 * were the OLDEST, the ones somebody had been waiting on longest.  A
+	 * waiter inside the kernel polls and recovers; a poll() on a fence
+	 * descriptor does not, since it sleeps until it is told (there is no
+	 * per-tick rescan any more).  A browser's UI process waits for each
+	 * frame exactly that way, so one burst of completions -- the device
+	 * coming back from a long operation with everything queued behind it
+	 * done at once -- left a frame that was never shown and a web view
+	 * that never painted again.  Marking only what can be woken, and
+	 * going round again for the rest, wakes every one. */
+	for (;;) {
+		nw = 0;
+		for (struct drm_fence *f = dev->fences; f && nw < 64;
+		     f = f->next) {
+			if (!f->signaled && (int32_t)(passed - f->seqno) >= 0) {
+				f->signaled = 1;
+				f->signal_ns = hrtimer_now_ns();
 				drm_fence_get(f);
 				wake[nw++] = f;
 			}
 		}
-	}
-	spin_unlock_irqrestore(&dev->lock, fl);
-	for (int i = 0; i < nw; i++) {
-		poll_notify_wq(&wake[i]->wq);
-		drm_fence_put(wake[i]);
+		spin_unlock_irqrestore(&dev->lock, fl);
+		for (int i = 0; i < nw; i++) {
+			poll_notify_wq(&wake[i]->wq);
+			drm_fence_put(wake[i]);
+		}
+		if (nw < 64)
+			break;
+		spin_lock_irqsave(&dev->lock, &fl);
 	}
 	poll_notify_wq(&dev->vbl_wq); /* SYNCCPU / execbuf throttles */
 }

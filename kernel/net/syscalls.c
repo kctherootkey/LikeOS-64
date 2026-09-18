@@ -574,18 +574,36 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 				total = cap;
 		} else {
 			deliver_fd_now = 1;
-			/* Clamp to the offset of the next pending fd, if any, so we
-             * don't accidentally pull data past it.  Look one slot ahead. */
+			/* Clamp to the offset of the next LATER pending fd, if any,
+			 * so we don't pull data past it.
+			 *
+			 * This looked exactly one slot ahead, modulo 16 -- the
+			 * ring's size before it became UNIX_PENDING_FDS.  With
+			 * the head in the upper half of the ring that read a
+			 * slot from a lap ago, whose offset is always behind
+			 * `br', so nothing was clamped: the read ran on into the
+			 * next frame and that frame's descriptor stayed queued
+			 * until the read AFTER it.  The X server then had a
+			 * DRI3 request in hand without its descriptor, failed
+			 * it, and gave the late descriptor to the client's next
+			 * such request -- every buffer of that connection one
+			 * off from then on.  One slot is not enough either: the
+			 * descriptors of one sendmsg all carry the same offset,
+			 * so the first LATER one can be several slots on. */
 			uint64_t irq_flags;
 			spin_lock_irqsave(&us->lock, &irq_flags);
-			int nxt = (us->pending_fd_head + 1) % 16;
-			if (nxt != us->pending_fd_tail) {
+			for (int nxt = (us->pending_fd_head + 1) % UNIX_PENDING_FDS;
+			     us->pending_fd_head != us->pending_fd_tail &&
+			     nxt != us->pending_fd_tail;
+			     nxt = (nxt + 1) % UNIX_PENDING_FDS) {
 				uint64_t nxt_off = us->pending_fd_off[nxt];
-				if (nxt_off > br) {
-					size_t cap = (size_t)(nxt_off - br);
-					if (total > cap)
-						total = cap;
-				}
+
+				if (nxt_off <= br)
+					continue;
+				size_t cap = (size_t)(nxt_off - br);
+				if (total > cap)
+					total = cap;
+				break;
 			}
 			spin_unlock_irqrestore(&us->lock, irq_flags);
 		}

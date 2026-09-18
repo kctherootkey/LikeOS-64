@@ -2697,6 +2697,8 @@ clean:
 	$(MAKE) -C $(USER_DIR) clean
 
 distclean: clean
+	@# The LLVM math objects, which `clean' keeps -- see user/lib/libc/Makefile.
+	$(MAKE) -C user/lib/libc distclean
 	$(MAKE) -C ports/lib/ncurses-likeos clean
 	$(MAKE) -C ports/lib/libevent-2.1.12 -f Makefile.likeos clean
 	$(MAKE) -C ports/lib/zlib-1.3.1 -f Makefile.likeos clean
