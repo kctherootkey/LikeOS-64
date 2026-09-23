@@ -113,6 +113,103 @@ settings.webview.enable_mediasource = false
 settings.webview.media_playback_requires_gesture = true
 settings.webview.enable_webaudio = false
 
+-- A web process of its own for a new site: ON, switchable at run time.
+--
+-- A tab keeps its web process for every site it is pointed at, and the
+-- process keeps what earlier sites left in it.  Seen on the ThinkPad: play
+-- a few videos on youtube.com, then load redhat.com in the same tab, and it
+-- scrolls in stalls; close the tab (`d', the process exits) and load
+-- redhat.com again, and it scrolls as it should.  One reading of that --
+-- the process, grown past 1.5 GB by the video, pruning itself every 30 s
+-- from then on -- is what this image's WebKit now leaves off by default
+-- (WebProcess.cpp in ports/xorg/gtk3/patches/webkitgtk/0013 says how and
+-- why).  This setting is the other lever, the one that copies what closing
+-- the tab did by hand.  It went in switched off, to be tried on the same
+-- image if the first did not hold up; tried on the ThinkPad, it was the
+-- better browser -- scrolling stayed smooth and memory stayed down -- so
+-- it is on.
+--
+-- With it on, a load whose site differs from the one this tab first showed
+-- -- typed with `o', clicked, or started by a script; not a form
+-- submission, a reload or a back/forward step -- opens in a new tab in the
+-- same place, and this tab closes.  New tabs (`t', middle click) are never
+-- touched: their first load has no earlier site.  The old page leaves
+-- history the way `d' loses it; `u' brings the closed tab back.  Frames are not
+-- affected: navigation-request fires for every frame, a provisional
+-- load-status only for the top one, and the two are matched by address.
+-- Two sites are the same when their last two host labels agree
+-- (www.redhat.com and access.redhat.com); a two-label public suffix such
+-- as co.uk makes distinct sites under it look like one, which only keeps a
+-- load in its process, never moves one that should stay.
+--
+-- Switch it off from the luakit://settings/ page (it is remembered); it is
+-- read at each load, so there is nothing to restart.  WebKit's own process
+-- swapping (WebKitWebContext:process-swap-on-cross-site-navigation-enabled)
+-- was tried first and made scrolling worse even on a fresh redhat.com; it
+-- keeps a spare process warm and parks used ones for five minutes, and this
+-- does neither -- the old process is gone when the tab is.
+settings.register_settings({
+    ["webview.fresh_process_per_site"] = {
+        type = "boolean",
+        default = true,
+        desc = "Load a page from another site in a new tab that replaces this one, so that it starts in a web process of its own -- what closing the tab and opening the page again does by hand. Reloads and back/forward stay where they are; the old page leaves history, and `u' brings the tab back.",
+    },
+})
+do
+    local webview = require "webview"
+    local lousy = require "lousy"
+
+    -- The part of a host that names its site: the last two labels.
+    local function site_of(uri)
+        if type(uri) ~= "string" or uri == "" then return nil end
+        local u = lousy.uri.parse(uri)
+        if not u or (u.scheme ~= "http" and u.scheme ~= "https") then return nil end
+        local host = (u.host or ""):lower()
+        if host == "" then return nil end
+        return host:match("([^.]+%.[^.]+)$") or host
+    end
+
+    -- Per view: the site it first showed, and the request luakit was last
+    -- asked to decide on, with its reason, to match the load that follows.
+    local first_site = setmetatable({}, { __mode = "k" })
+    local requested = setmetatable({}, { __mode = "k" })
+
+    webview.add_signal("init", function (view)
+        view:add_signal("navigation-request", function (v, uri, reason)
+            requested[v] = { uri = uri, reason = reason }
+        end)
+        view:add_signal("load-status", function (v, status)
+            if status == "committed" then
+                if not first_site[v] then first_site[v] = site_of(v.uri) end
+                return
+            end
+            if status ~= "provisional" then return end
+            local req = requested[v]
+            requested[v] = nil
+            if not settings.get_setting("webview.fresh_process_per_site") then return end
+            if not req or req.uri ~= v.uri then return end      -- a frame's, or none
+            -- Typed, scripted or clicked only.  A form submission is a
+            -- POST, and the tab that replaces this one would GET the
+            -- address instead; back/forward and reloads stay put.
+            if req.reason ~= "other" and req.reason ~= "link-clicked" then return end
+            local from, to = first_site[v], site_of(v.uri)
+            if not from or not to or from == to then return end
+            local w = webview.window(v)
+            if not w then return end
+            local uri = v.uri
+            -- Not from inside the view's own signal: the tab goes away in
+            -- the next main-loop turn, and the load with it.
+            luakit.idle_add(function ()
+                local idx = w.tabs:indexof(v)
+                if not idx then return false end
+                w:new_tab(uri, { switch = (w.view == v), order = function () return idx + 1 end })
+                w:close_tab(v)
+                return false
+            end)
+        end)
+    end)
+end
+
 -- Default typed addresses to https://, not http://.
 --
 -- window.search_open turns what the user typed after `o` into a target.  A

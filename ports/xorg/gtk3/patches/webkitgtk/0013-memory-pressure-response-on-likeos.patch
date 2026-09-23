@@ -51,18 +51,116 @@ MemTotal minus MemAvailable, and the kernel now counts its page cache as
 available, since it drops that on demand.
 
 memoryFootprint() becomes linux/MemoryFootprintLinux.cpp, reading
-/proc/self/statm, which the kernel gained for this; and the web process
-switches the periodic monitor on with system malloc, which on this system is
-the only malloc, not a debugging choice.  With a real footprint the policy
-thresholds start to mean something: on a 4 GB machine a web process is
-Conservative from 1 GB resident and Strict from 1.5 GB, and an inactive one
-that reaches 0.9 x RAM is killed rather than allowed to take the machine
-with it.
+/proc/self/statm, which the kernel gained for this.  The web process does
+NOT switch the per-process monitor on with it, though, and that is a change
+of mind: it did at first, on the grounds that system malloc is the only
+malloc here and not a debugging choice, and what that bought was a process
+measuring itself every 30 s against fractions of min(3 GB, RAM) --
+Conservative from 1 GB resident, Strict from 1.5 GB -- and, for as long as
+it stayed above them, releasing every 30 s: at Strict the decoded data of
+every image on the page, the style resolver, the compiled JavaScript, and
+a full collection, all rebuilt on the next paint.  A web process that has
+played video is above 1.5 GB for the rest of its life (system malloc hands
+back little of what the player freed), and a ThinkPad showed what that
+looks like: a page loaded after youtube in the same tab scrolled in stalls
+until the tab was closed and the process with it, while a fresh process
+was fine.  That the monitor is the whole of it is not measured; that the
+mechanism is real and upstream never runs it with system malloc is.  So
+the monitor is off unless WEBKIT_PERIODIC_MEMORY_MONITOR=1 asks for it,
+and with it goes the per-process kill at 0.9 x RAM; the system monitor's
+critical release at 90% is what stands between a runaway process and a
+full machine.
+
+Every trigger writes one line to stderr, prefixed by the pid: which
+monitor fired, what it saw, what the release cost and freed, and the
+process policy at the time.  The UI process also switches the relief
+logger on for the web process as WebProcessPool.cpp does for Linux; with
+no journal here that logger falls back to WTFLogAlways, so its "Memory
+pressure relief: Total" line with the resident size before and after
+follows each of them.  When a page stalls, the lines say whether the
+engine was releasing memory at the time, and why.
 
 The UI process installs the handler on this system as it does on Linux; the
 guard there also gated it on the Linux monitor's own disable check, which
 the handler now performs itself.
 
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -477,7 +477,7 @@
+ 
+     setLegacyPresentingApplicationPID(parameters.presentingApplicationPID);
+ 
+-#if OS(LINUX)
++#if OS(LINUX) || OS(LIKEOS)
+     MemoryPressureHandler::ReliefLogger::setLoggingEnabled(parameters.shouldEnableMemoryPressureReliefLogging);
+ #endif
+ 
+@@ -526,6 +526,36 @@
+         // If we're running with FastMalloc disabled, some kind of testing or debugging is probably happening.
+         // Let's be nice and not enable the memory kill mechanism.
+         memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(isFastMallocEnabled() || JSC::Options::enableStrongRefTracker() || JSC::Options::dumpHeapOnLowMemory());
++#elif OS(LIKEOS)
++        // Off unless asked for, as upstream leaves it with system malloc.
++        //
++        // This port switched it on (system malloc is its only malloc, not a
++        // debugging choice), and what that buys is a process that measures
++        // itself every 30 s against fractions of min(3 GB, RAM): Conservative
++        // from 1 GB resident, Strict from 1.5 GB, and for as long as it is
++        // above them a release every 30 s -- at Strict the decoded data of
++        // every image on the page, the style resolver, the compiled
++        // JavaScript, and a full collection, all of it rebuilt on the next
++        // paint.  Resident is what /proc/self/statm reports, and a process
++        // that has played video stays above 1.5 GB for the rest of its life,
++        // since system malloc hands back little of what the player freed.
++        // That is one reading of a ThinkPad report -- a page loaded after
++        // youtube in the same tab scrolled in stalls until the tab was
++        // closed and the process with it; a fresh process was fine -- and
++        // the mechanism is real whether or not it is the whole story.
++        //
++        // The system monitor stays (wtf/likeos/MemoryPressureHandlerLikeOS.cpp):
++        // it releases when the MACHINE is at 80%, which without swap is the
++        // case that matters.  What goes with this one is the per-process
++        // kill at 0.9 x RAM; the system monitor's critical release at 90% is
++        // what stands between a runaway process and a full machine now.
++        //
++        // WEBKIT_PERIODIC_MEMORY_MONITOR=1 in the environment switches it
++        // back on, so the two can be compared on the same machine.
++        {
++            const char* value = getenv("WEBKIT_PERIODIC_MEMORY_MONITOR");
++            memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(value && value[0] == '1' && !value[1]);
++        }
+ #endif
+         memoryPressureHandler.setMemoryKillCallback([this, protectedThis = Ref { *this }] () {
+             WebCore::logMemoryStatistics(LogMemoryStatisticsReason::OutOfMemoryDeath);
+--- a/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
++++ b/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
+@@ -164,6 +164,11 @@
+ #if OS(LINUX)
+     if (!MemoryPressureMonitor::disabled())
+         installMemoryPressureHandler();
++#elif OS(LIKEOS)
++    // The system monitor is inside the handler on this system
++    // (wtf/likeos/MemoryPressureHandlerLikeOS.cpp) and honours the same
++    // WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR itself.
++    installMemoryPressureHandler();
+ #endif
+ 
+ #if PLATFORM(GTK)
+@@ -224,6 +229,14 @@
+ #if OS(LINUX)
+     if (MemoryPressureMonitor::disabled())
+         parameters.shouldSuppressMemoryPressureHandler = true;
++#elif OS(LIKEOS)
++    // What WebProcessPool.cpp does for Linux: the web process writes one
++    // line per memory release, with its resident size before and after, to
++    // stderr (there is no journal here, so RELEASE_LOG is off and the relief
++    // logger falls back to WTFLogAlways).  Beside the trigger lines from
++    // wtf/likeos/MemoryPressureHandlerLikeOS.cpp it says, when a page
++    // stalls, whether the engine was releasing memory at the time.
++    parameters.shouldEnableMemoryPressureReliefLogging = true;
+ #endif
+ 
+ #if USE(GSTREAMER)
 --- a/Source/WTF/wtf/PlatformGTK.cmake
 +++ b/Source/WTF/wtf/PlatformGTK.cmake
 @@ -72,6 +72,16 @@
@@ -99,38 +197,9 @@ the handler now performs itself.
  
 -#endif // OS(LINUX) || OS(HAIKU)
 +#endif // OS(LINUX) || OS(HAIKU) || OS(LIKEOS)
---- a/Source/WebKit/WebProcess/WebProcess.cpp
-+++ b/Source/WebKit/WebProcess/WebProcess.cpp
-@@ -526,6 +526,12 @@
-         // If we're running with FastMalloc disabled, some kind of testing or debugging is probably happening.
-         // Let's be nice and not enable the memory kill mechanism.
-         memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(isFastMallocEnabled() || JSC::Options::enableStrongRefTracker() || JSC::Options::dumpHeapOnLowMemory());
-+#elif OS(LIKEOS)
-+        // System malloc is the only malloc this port has, not a debugging
-+        // choice, so the monitor is wanted here exactly as with FastMalloc:
-+        // without it the policy never leaves Unrestricted and nothing is
-+        // ever pruned.  See wtf/likeos/MemoryPressureHandlerLikeOS.cpp.
-+        memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(true);
- #endif
-         memoryPressureHandler.setMemoryKillCallback([this, protectedThis = Ref { *this }] () {
-             WebCore::logMemoryStatistics(LogMemoryStatisticsReason::OutOfMemoryDeath);
---- a/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
-+++ b/Source/WebKit/UIProcess/glib/WebProcessPoolGLib.cpp
-@@ -164,6 +164,11 @@
- #if OS(LINUX)
-     if (!MemoryPressureMonitor::disabled())
-         installMemoryPressureHandler();
-+#elif OS(LIKEOS)
-+    // The system monitor is inside the handler on this system
-+    // (wtf/likeos/MemoryPressureHandlerLikeOS.cpp) and honours the same
-+    // WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR itself.
-+    installMemoryPressureHandler();
- #endif
- 
- #if PLATFORM(GTK)
 --- /dev/null
 +++ b/Source/WTF/wtf/likeos/MemoryPressureHandlerLikeOS.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,260 @@
 +/*
 + * MemoryPressureHandler for LikeOS.
 + *
@@ -152,7 +221,9 @@ the handler now performs itself.
 + *   - the per-process monitor.  MemoryPressureHandler::measurementTimerFired()
 + *     compares memoryFootprint() with fractions of min(3 GB, RAM) every 30 s
 + *     and prunes accordingly; that needs a footprint, which
-+ *     linux/MemoryFootprintLinux.cpp supplies from /proc/self/statm.
++ *     linux/MemoryFootprintLinux.cpp supplies from /proc/self/statm.  The
++ *     web process leaves this one off unless WEBKIT_PERIODIC_MEMORY_MONITOR=1
++ *     is set, as upstream does with system malloc; WebProcess.cpp says why.
 + *
 + * The response and its hold-off are those of unix/MemoryPressureHandlerUnix.cpp;
 + * the hold-off timer, a member declared under the same OS list, is replaced
@@ -180,6 +251,7 @@ the handler now performs itself.
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#include <unistd.h>
 +#include <wtf/MainThread.h>
 +#include <wtf/MemoryFootprint.h>
 +#include <wtf/MonotonicTime.h>
@@ -209,6 +281,30 @@ the handler now performs itself.
 +// The hold-off deadline, as MonotonicTime seconds.  Written on the main
 +// thread by holdOff(), read by the polling thread.
 +static std::atomic<double> s_holdOffUntil { 0 };
++
++// The last reading that made the polling thread ask for a response, for
++// the line the response writes.
++static std::atomic<int> s_usedPercentageAtRequest { -1 };
++
++// Every trigger writes a line to stderr, prefixed by the pid so that the
++// web process, the network process and the UI process can be told apart:
++// which monitor fired, what it saw, what the release cost and freed.  A
++// release is rare and never cheap -- at its heaviest it drops every
++// decoded image, the style resolver and the compiled JavaScript of every
++// page in the process -- so when a page stalls, these lines say whether
++// the engine was releasing at the time, and why.  The relief logger's
++// own "Memory pressure relief: Total" line, which the UI process switches
++// on for the web process as it does on Linux, follows with the resident
++// size before and after.
++static const char* policyName(MemoryUsagePolicy policy)
++{
++    switch (policy) {
++    case MemoryUsagePolicy::Unrestricted: return "Unrestricted";
++    case MemoryUsagePolicy::Conservative: return "Conservative";
++    case MemoryUsagePolicy::Strict: return "Strict";
++    }
++    return "?";
++}
 +
 +static int systemMemoryUsedAsPercentage()
 +{
@@ -296,6 +392,7 @@ the handler now performs itself.
 +                // The response sets the real hold-off once it has run; this
 +                // keeps the next poll from queueing another one before then.
 +                s_holdOffUntil.store((MonotonicTime::now() + s_minimumHoldOffTime).secondsSinceEpoch().value());
++                s_usedPercentageAtRequest.store(usedPercentage);
 +                callOnMainThread([this, isCritical] {
 +                    respondToMemoryPressure(isCritical ? Critical::Yes : Critical::No);
 +                });
@@ -329,14 +426,29 @@ the handler now performs itself.
 +
 +    setMemoryPressureStatus(SystemMemoryPressureStatus::Normal);
 +
++    Seconds took = MonotonicTime::now() - startTime;
 +    Seconds holdOffTime = s_maximumHoldOffTime;
 +    if (bytesFreed > 0 && static_cast<size_t>(bytesFreed) >= s_minimumBytesFreedToUseMinimumHoldOffTime)
-+        holdOffTime = (MonotonicTime::now() - startTime) * s_holdOffMultiplier;
-+    holdOff(std::max(holdOffTime, s_minimumHoldOffTime));
++        holdOffTime = took * s_holdOffMultiplier;
++    holdOffTime = std::max(holdOffTime, s_minimumHoldOffTime);
++    holdOff(holdOffTime);
++
++    WTFLogAlways("[%d] memory pressure: system at %d%% in use, %s release took %.0f ms and freed %lld MB, next one in %.0f s at the earliest",
++        static_cast<int>(getpid()), s_usedPercentageAtRequest.load(),
++        critical == Critical::Yes ? "critical" : "non-critical",
++        took.milliseconds(), static_cast<long long>(bytesFreed / (1024 * 1024)), holdOffTime.seconds());
 +}
 +
-+void MemoryPressureHandler::platformReleaseMemory(Critical)
++void MemoryPressureHandler::platformReleaseMemory(Critical critical)
 +{
++    // Reached from both monitors: the system one above, and the per-process
++    // one (MemoryPressureHandler::measurementTimerFired, on when
++    // WEBKIT_PERIODIC_MEMORY_MONITOR=1) whose verdict is the policy named
++    // here -- Conservative or Strict is that monitor talking, Unrestricted
++    // means the system one did.
++    WTFLogAlways("[%d] memory pressure: %s release, resident %zu MB, process policy %s",
++        static_cast<int>(getpid()), critical == Critical::Yes ? "critical" : "non-critical",
++        memoryFootprint() / (1024 * 1024), policyName(m_memoryUsagePolicy));
 +#if HAVE(MALLOC_TRIM)
 +    malloc_trim(0);
 +#endif
