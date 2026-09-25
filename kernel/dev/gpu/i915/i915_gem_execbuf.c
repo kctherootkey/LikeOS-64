@@ -91,18 +91,20 @@ static struct i915_vma *bind_object(struct i915_vm *vm, struct drm_gem_object *o
 	}
 	if (pinned) {
 		v->pinned = 1;
+		i915_vm_vma_claim(vm, v, want, o->npages);
 	} else if (!v->attached) {
+		/* The driver picks the address: below 4 GB unless the client
+		 * says the object may live anywhere, since what it writes
+		 * into a command may be a 32-bit address. */
 		uint64_t align = ex->alignment > 4096 ? ex->alignment : 4096;
-		uint64_t fl;
-		spin_lock_irqsave(&vm->lock, &fl);
-		vm->alloc_next = (vm->alloc_next + align - 1) & ~(align - 1);
-		want = vm->alloc_next;
-		vm->alloc_next += (uint64_t)o->npages * 4096;
-		spin_unlock_irqrestore(&vm->lock, fl);
+		int low = !(ex->flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS);
+		v->pinned = 0;
+		if (i915_vm_vma_alloc(vm, v, o->npages, align, low) != 0)
+			return NULL;
 	} else {
 		want = v->addr;
+		i915_vm_vma_claim(vm, v, want, o->npages);
 	}
-	i915_vm_vma_claim(vm, v, want, o->npages);
 	if (i915_vm_bind(vm, v->addr, o->pages, o->npages,
 			 bo->caching == I915_CACHING_NONE) != 0) {
 		i915_vm_vma_release(vm, v);
@@ -126,6 +128,8 @@ static int apply_relocs(struct drm_file *fp, struct drm_gem_object *o,
 		return 0;
 	if (n > EXEC_MAX_RELOCS)
 		return -EINVAL;
+	/* The processor writes into the object; the caller has made sure
+	 * no engine is still using it. */
 	struct drm_i915_gem_relocation_entry *r = kalloc(n * sizeof(*r));
 	if (!r)
 		return -ENOMEM;
@@ -135,28 +139,33 @@ static int apply_relocs(struct drm_file *fp, struct drm_gem_object *o,
 	}
 	int rc = 0;
 	for (uint32_t i = 0; i < n; i++) {
-		struct drm_gem_object *t = NULL;
 		uint64_t target_off = 0;
+		uint32_t ti = nobjs;
 		if (lut) {
 			if (r[i].target_handle >= nobjs) {
 				rc = -EINVAL;
 				break;
 			}
-			t = objs[r[i].target_handle];
-			target_off = exs[r[i].target_handle].offset;
+			ti = r[i].target_handle;
 		} else {
 			for (uint32_t j = 0; j < nobjs; j++) {
 				if (exs[j].handle == r[i].target_handle) {
-					t = objs[j];
-					target_off = exs[j].offset;
+					ti = j;
 					break;
 				}
 			}
 		}
-		if (!t) {
+		if (ti >= nobjs) {
 			rc = -ENOENT;
 			break;
 		}
+		target_off = exs[ti].offset;
+		/* A relocation with a write domain is how a client of the
+		 * older buffer-manager library says the batch writes the
+		 * target (a decoder's output surface): the object is written
+		 * by this submission as surely as one flagged so. */
+		if (r[i].write_domain)
+			exs[ti].flags |= EXEC_OBJECT_WRITE;
 		/* what goes INTO a buffer is read back by the hardware out of
 		 * a command, so it is written the way the hardware reads it */
 		uint64_t value = addr_to_user(target_off + r[i].delta);
@@ -180,16 +189,24 @@ static int apply_relocs(struct drm_file *fp, struct drm_gem_object *o,
 		copy_to_user((void *)(uintptr_t)ex->relocs_ptr, r, n * sizeof(*r));
 	kfree(r);
 	(void)fp;
+	(void)objs;
 	return rc;
 }
 
 /* The engine a submission is aimed at, and the slot of the context's
  * logical rings it runs in: the map entry with an explicit map (two
  * entries that name one engine are two logical rings), the engine
- * itself with the legacy map. */
-static struct i915_engine *engine_for(struct i915_gem_context *ctx, uint64_t flags, int *slot)
+ * itself with the legacy map.
+ *
+ * The video ring flags: on a part with two video engines a BSD
+ * submission names one of them, or neither and takes turns; on a part
+ * with one the flags mean nothing.  Naming a video ring on any other
+ * engine is an error. */
+static struct i915_engine *engine_for(struct i915_gem_context *ctx, struct drm_file *fp,
+				      uint64_t flags, int *slot)
 {
 	unsigned ring = (unsigned)(flags & I915_EXEC_RING_MASK);
+	unsigned bsd = (unsigned)(flags & I915_EXEC_BSD_MASK);
 	struct i915_engine *e;
 	if (ctx->explicit_engines) {
 		if (ring >= (unsigned)ctx->nengines || ring >= I915_CTX_LRC_SLOTS)
@@ -199,14 +216,33 @@ static struct i915_engine *engine_for(struct i915_gem_context *ctx, uint64_t fla
 			*slot = (int)ring;
 		return e;
 	}
+	if (ring != I915_EXEC_BSD && bsd)
+		return NULL;
 	switch (ring) {
 	case I915_EXEC_DEFAULT:
 	case I915_EXEC_RENDER:
 		e = ctx->engines[0];
 		break;
-	case I915_EXEC_BSD:
-		e = ctx->engines[2];
+	case I915_EXEC_BSD: {
+		struct i915_engine *v0 = ctx->engines[2];
+		struct i915_engine *v1 = i915_engine_by_id(ctx->i915, I915_VCS1);
+		if (!v0 || !v1) {
+			e = v0;
+			break;
+		}
+		if (bsd == I915_EXEC_BSD_DEFAULT) {
+			struct i915_file *f = fp->priv;
+			uint32_t turn = f ? __atomic_fetch_add(&f->bsd_next, 1, __ATOMIC_RELAXED) : 0;
+			e = (turn & 1) ? v1 : v0;
+		} else if (bsd == I915_EXEC_BSD_RING1) {
+			e = v0;
+		} else if (bsd == I915_EXEC_BSD_RING2) {
+			e = v1;
+		} else {
+			return NULL;
+		}
 		break;
+	}
 	case I915_EXEC_BLT:
 		e = ctx->engines[3];
 		break;
@@ -252,6 +288,9 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 	struct i915_gem_context *ctx = NULL;
 	struct i915_request *rq = NULL;
 	struct drm_fence *in_fence = NULL;
+	struct drm_fence **waits = NULL;
+	unsigned nwait = 0;
+	int locked = 0;
 	uint32_t n = a->buffer_count;
 	int lut = !!(a->flags & I915_EXEC_HANDLE_LUT);
 	int changed = 0;
@@ -302,7 +341,7 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 		goto out;
 	}
 	int slot = 0;
-	struct i915_engine *e = engine_for(ctx, a->flags, &slot);
+	struct i915_engine *e = engine_for(ctx, fp, a->flags, &slot);
 	if (!e) {
 		why = "no such engine";
 		rc = -EINVAL;
@@ -387,7 +426,7 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 		goto out;
 	}
 
-	/* objects and their bindings */
+	/* the objects */
 	for (uint32_t i = 0; i < n; i++) {
 		if (exs[i].flags & __EXEC_OBJECT_UNKNOWN_FLAGS) {
 			why = "unknown object flags";
@@ -400,26 +439,13 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 			rc = -ENOENT;
 			goto out;
 		}
-		if (!bind_object(ctx->vm, objs[i], &exs[i], &changed)) {
-			i915_bind_failed_once(i915, exs[i].offset,
-					      (uint64_t)objs[i]->npages * 4096,
-					      !!(exs[i].flags & EXEC_OBJECT_PINNED));
-			why = "binding an object";
-			rc = -ENOMEM;
-			goto out;
-		}
 	}
-	if (!(a->flags & I915_EXEC_NO_RELOC)) {
-		for (uint32_t i = 0; i < n; i++) {
-			if ((rc = apply_relocs(fp, objs[i], &exs[i], objs, exs, n, lut))) {
-				why = "relocations";
-				goto out;
-			}
-		}
+	waits = kalloc((size_t)n * (1 + I915_ENGINE_CLASSES) * sizeof(*waits));
+	if (!waits) {
+		why = "memory for the waits";
+		rc = -ENOMEM;
+		goto out;
 	}
-	/* what the CPU wrote must be visible to the device */
-	for (uint32_t i = 0; i < n; i++)
-		i915_gem_object_flush_for_gpu(i915, objs[i]);
 
 	/* waits: the in fence, the fence array, other engines' writes */
 	if (a->flags & I915_EXEC_FENCE_IN) {
@@ -460,14 +486,64 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 			}
 		}
 	}
-	for (uint32_t i = 0; i < n; i++) {
-		struct i915_bo *bo = objs[i]->priv;
-		if (bo->write_fence && !bo->write_fence->signaled &&
-		    bo->write_fence->context != e->fence_context) {
-			if ((rc = wait_fence(bo->write_fence))) {
-				why = "waiting for another engine's write";
+	/* Bindings, relocations and the dependencies, under the submission
+	 * lock; the waits themselves outside it, and everything looked at
+	 * again afterwards, since another submission may have run meanwhile.
+	 * Out of the loop the lock is held and nothing is outstanding. */
+	for (;;) {
+		mm_write_lock(&i915->submit_lock);
+		locked = 1;
+		for (uint32_t i = 0; i < n; i++) {
+			if (!bind_object(ctx->vm, objs[i], &exs[i], &changed)) {
+				i915_bind_failed_once(i915, exs[i].offset,
+						      (uint64_t)objs[i]->npages * 4096,
+						      !!(exs[i].flags & EXEC_OBJECT_PINNED));
+				why = "binding an object";
+				rc = -ENOMEM;
 				goto out;
 			}
+		}
+		nwait = 0;
+		if (!(a->flags & I915_EXEC_NO_RELOC)) {
+			/* an object the processor patches must be idle first:
+			 * an engine may still be reading the last batch in it */
+			for (uint32_t i = 0; i < n; i++)
+				if (exs[i].relocation_count)
+					i915_gem_object_fences(objs[i], 1, 0, waits, &nwait);
+			if (nwait == 0) {
+				for (uint32_t i = 0; i < n; i++) {
+					if ((rc = apply_relocs(fp, objs[i], &exs[i], objs, exs, n, lut))) {
+						why = "relocations";
+						goto out;
+					}
+				}
+			}
+		}
+		if (nwait == 0) {
+			/* what the CPU wrote must be visible to the device */
+			for (uint32_t i = 0; i < n; i++)
+				i915_gem_object_flush_for_gpu(i915, objs[i]);
+			/* One engine's work is ordered behind its own; another's
+			 * writes must be done before this engine touches the
+			 * object, and its reads before this engine writes it. */
+			for (uint32_t i = 0; i < n; i++)
+				i915_gem_object_fences(objs[i], !!(exs[i].flags & EXEC_OBJECT_WRITE),
+						       e->fence_context, waits, &nwait);
+		}
+		if (nwait == 0)
+			break;
+		mm_write_unlock(&i915->submit_lock);
+		locked = 0;
+		rc = 0;
+		for (unsigned k = 0; k < nwait; k++) {
+			if (rc == 0)
+				rc = wait_fence(waits[k]);
+			drm_fence_put(waits[k]);
+		}
+		nwait = 0;
+		if (rc) {
+			why = "waiting for another engine";
+			goto out;
 		}
 	}
 
@@ -500,26 +576,41 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 	}
 	ctx->vm->tlb_dirty = 0;
 
-	/* the request's fence: on the objects, the out fence, the syncobjs */
-	for (uint32_t i = 0; i < n; i++) {
-		struct drm_gem_object *o = rq->objs[i];
-		struct i915_bo *bo = o->priv;
-		drm_fence_get(rq->fence);
-		if (exs[i].flags & EXEC_OBJECT_WRITE) {
-			if (bo->write_fence)
-				drm_fence_put(bo->write_fence);
-			bo->write_fence = rq->fence;
-		} else {
-			if (bo->read_fence)
-				drm_fence_put(bo->read_fence);
-			bo->read_fence = rq->fence;
+	/* The request's fence on the objects, before any other submission
+	 * can look at them; the fences displaced are dropped afterwards,
+	 * since dropping may free.  Then the out fence and the syncobjs. */
+	{
+		unsigned cls = e->class < I915_ENGINE_CLASSES ? e->class : 0;
+		unsigned nold = 0;
+		uint64_t fl;
+		spin_lock_irqsave(&i915->sync_lock, &fl);
+		for (uint32_t i = 0; i < n; i++) {
+			struct drm_gem_object *o = rq->objs[i];
+			struct i915_bo *bo = o->priv;
+			if (exs[i].flags & EXEC_OBJECT_WRITE) {
+				drm_fence_get(rq->fence);
+				if (bo->write_fence)
+					waits[nold++] = bo->write_fence;
+				bo->write_fence = rq->fence;
+				bo->write_class = (uint8_t)cls;
+			}
+			/* a writer reads too, as far as the busy call is concerned */
+			drm_fence_get(rq->fence);
+			if (bo->read_fence[cls])
+				waits[nold++] = bo->read_fence[cls];
+			bo->read_fence[cls] = rq->fence;
+			/* the core's teardown wait */
+			drm_fence_get(rq->fence);
+			if (o->fence)
+				waits[nold++] = o->fence;
+			o->fence = rq->fence;
 		}
-		/* the core's teardown wait */
-		drm_fence_get(rq->fence);
-		if (o->fence)
-			drm_fence_put(o->fence);
-		o->fence = rq->fence;
+		spin_unlock_irqrestore(&i915->sync_lock, fl);
+		for (unsigned k = 0; k < nold; k++)
+			drm_fence_put(waits[k]);
 	}
+	mm_write_unlock(&i915->submit_lock);
+	locked = 0;
 	if (a->flags & I915_EXEC_FENCE_OUT) {
 		int fd = drm_fence_export_fd(rq->fence, 1);
 		if (fd < 0) {
@@ -556,6 +647,13 @@ out:
 				cur ? (int)cur->tgid : -1, cur ? cur->comm : "?", (int)rc, why,
 				n, (unsigned long long)a->flags, a->batch_start_offset, a->batch_len);
 		}
+	}
+	if (locked)
+		mm_write_unlock(&i915->submit_lock);
+	if (waits) {
+		for (unsigned k = 0; k < nwait; k++)
+			drm_fence_put(waits[k]);
+		kfree(waits);
 	}
 	if (rq)
 		i915_request_put(rq);

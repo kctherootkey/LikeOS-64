@@ -1,0 +1,248 @@
+LikeOS takes the same paths as the other POSIX system the library knows.
+
+The library tells its two worlds apart by one compiler macro, and the
+toolchain here does not define that one.  Every guard that chooses between
+that system and Windows now also accepts LikeOS; the test suite, the logger
+back ends and the bundled test framework are left as they are, since none
+of them is built.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/GmmLib/CachePolicy/GmmXe2_LPGCachePolicy.cpp
++++ b/Source/GmmLib/CachePolicy/GmmXe2_LPGCachePolicy.cpp
+@@ -396,7 +396,7 @@
+         __GMM_ASSERT(false);
+     }
+ 
+-#if (defined __linux__ || defined(WDDM_LINUX))
++#if ((defined(__linux__) || defined(__LIKEOS__)) || defined(WDDM_LINUX))
+     IsCpuCacheable = false;
+ #endif
+     // requested compressed and coherent
+--- a/Source/GmmLib/inc/External/Linux/GmmResourceInfoLinExt.h
++++ b/Source/GmmLib/inc/External/Linux/GmmResourceInfoLinExt.h
+@@ -21,7 +21,7 @@
+ ============================================================================*/
+ #pragma once
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+ 
+ #ifdef __cplusplus
+ extern "C" {
+--- a/Source/GmmLib/inc/External/Common/GmmPageTableMgr.h
++++ b/Source/GmmLib/inc/External/Common/GmmPageTableMgr.h
+@@ -28,7 +28,7 @@
+ #pragma once
+ #include "GmmHw.h"
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+ #include <pthread.h>
+ #endif
+ 
+@@ -108,7 +108,7 @@
+         GmmClientContext    *pClientContext;    ///< ClientContext of the client creating this Object
+ 
+          //OS-specific defn
+-#if defined  __linux__
++#if (defined(__linux__) || defined(__LIKEOS__))
+ 	pthread_mutex_t PoolLock;
+ #endif
+     public:
+@@ -134,7 +134,7 @@
+         GMM_VIRTUAL GMM_PAGETABLEPool * __GetFreePoolNode(uint32_t * FreePoolNodeIdx, POOL_TYPE PoolType);
+ 
+ 
+-#if defined __linux__
++#if (defined(__linux__) || defined(__LIKEOS__))
+         //returns number of BOs for indicated TTs = NumNodePoolElements+1 BOs for root table and pools
+         GMM_VIRTUAL int GetNumOfPageTableBOs(uint8_t TTFlags);
+         //returns BO* list for indicated TT in client allocated memory
+--- a/Source/GmmLib/inc/Internal/Linux/GmmResourceInfoLinInt.h
++++ b/Source/GmmLib/inc/Internal/Linux/GmmResourceInfoLinInt.h
+@@ -22,7 +22,7 @@
+ 
+ #pragma once
+ 
+-#if defined(__linux__) && !LHDM
++#if (defined(__linux__) || defined(__LIKEOS__)) && !LHDM
+ 
+ // GMM Lib Client Exports
+ #include "External/Common/GmmCommonExt.h"
+--- a/Source/GmmLib/Texture/GmmTextureAlloc.cpp
++++ b/Source/GmmLib/Texture/GmmTextureAlloc.cpp
+@@ -826,7 +826,7 @@
+         }
+         else
+         {
+-#if defined(__GMM_KMD__) || defined(__linux__)
++#if defined(__GMM_KMD__) || (defined(__linux__) || defined(__LIKEOS__))
+             GMM_ASSERTDPF(0, "Surface too large!");
+ #endif
+             Status = GMM_ERROR;
+--- a/Source/GmmLib/inc/External/Common/GmmResourceInfoExt.h
++++ b/Source/GmmLib/inc/External/Common/GmmResourceInfoExt.h
+@@ -189,7 +189,7 @@
+ // Place holder for GMM_RESOURCE_FLAG definition.
+ //---------------------------------------------------------------------------
+ #include "GmmResourceFlags.h"
+-#if defined __linux__
++#if (defined(__linux__) || defined(__LIKEOS__))
+     #include "External/Linux/GmmResourceInfoLinExt.h"
+ #endif
+ 
+--- a/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.cpp
++++ b/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.cpp
+@@ -31,7 +31,7 @@
+ 
+ #if !defined(__GMM_KMD)
+ 
+-#if defined(__linux__)
++#if (defined(__linux__) || defined(__LIKEOS__))
+ #include "Internal/Linux/GmmResourceInfoLinInt.h"
+ 
+ #define _aligned_free(ptr) free(ptr)
+--- a/Source/GmmLib/inc/External/Common/GmmInfo.h
++++ b/Source/GmmLib/inc/External/Common/GmmInfo.h
+@@ -141,7 +141,7 @@
+         {
+ #if defined(_WIN32)
+             return(InterlockedIncrement((LONG *)&RefCount) - 1);  //InterLockedIncrement() returns incremented value
+-#elif defined(__linux__)
++#elif (defined(__linux__) || defined(__LIKEOS__))
+             return(__sync_fetch_and_add(&RefCount, 1));
+ #endif
+         }
+@@ -163,7 +163,7 @@
+                 }
+ #if defined(_WIN32)
+             } while (!(InterlockedCompareExchange((LONG *)&RefCount, TargetValue, CurrentValue) == CurrentValue));
+-#elif defined(__linux__)
++#elif (defined(__linux__) || defined(__LIKEOS__))
+             } while (!__sync_bool_compare_and_swap(&RefCount, CurrentValue, TargetValue));
+ #endif
+ 
+--- a/Source/GmmLib/TranslationTable/GmmPageTableMgr.cpp
++++ b/Source/GmmLib/TranslationTable/GmmPageTableMgr.cpp
+@@ -28,7 +28,7 @@
+ #include "../TranslationTable/GmmUmdTranslationTable.h"
+ #include "External/Common/GmmClientContext.h"
+ 
+-#if defined(__linux__)
++#if (defined(__linux__) || defined(__LIKEOS__))
+ #include "Internal/Linux/GmmResourceInfoLinInt.h"
+ #endif
+ 
+@@ -44,7 +44,7 @@
+         LeaveCriticalSection(&PoolLock); \
+     }
+ extern GMM_MA_LIB_CONTEXT *pGmmMALibContext;
+-#if defined(__linux__)
++#if (defined(__linux__) || defined(__LIKEOS__))
+ GMM_STATUS GmmLib::__GmmDeviceAlloc(GmmClientContext *        pClientContext,
+                                     GMM_DEVICE_CALLBACKS_INT *pDeviceCbInt,
+                                     GMM_DEVICE_ALLOC *        pAlloc)
+@@ -608,7 +608,7 @@
+     return GMM_SUCCESS;
+ }
+ 
+-#if defined(__linux__) && !_WIN32
++#if (defined(__linux__) || defined(__LIKEOS__)) && !_WIN32
+ /////////////////////////////////////////////////////////////////////////////////////
+ /// Gets size of PageTable buffer object (BOs) list
+ ///
+--- a/Source/GmmLib/Resource/Linux/GmmResourceInfoLinCWrapper.cpp
++++ b/Source/GmmLib/Resource/Linux/GmmResourceInfoLinCWrapper.cpp
+@@ -22,7 +22,7 @@
+ 
+ #include "Internal/Common/GmmLibInc.h"
+ 
+-#if defined(__linux__) && !LHDM
++#if (defined(__linux__) || defined(__LIKEOS__)) && !LHDM
+ #include "Internal/Linux/GmmResourceInfoLinInt.h"
+ 
+ /////////////////////////////////////////////////////////////////////////////////////
+--- a/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h
++++ b/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h
+@@ -27,7 +27,7 @@
+ #pragma once
+ #include "External/Common/GmmPageTableMgr.h"
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+ #include <pthread.h>
+ #include <string.h>
+ 
+@@ -448,7 +448,7 @@
+     public:
+ #ifdef _WIN32
+         CRITICAL_SECTION    TTLock;                  //synchronized access of PageTable obj
+-#elif defined __linux__
++#elif (defined(__linux__) || defined(__LIKEOS__))
+         pthread_mutex_t TTLock;
+ #endif
+ 
+--- a/Source/GmmLib/Utility/GmmLog/GmmLog.cpp
++++ b/Source/GmmLib/Utility/GmmLog/GmmLog.cpp
+@@ -197,7 +197,7 @@
+ #elif defined(__ANDROID__)
+             // Log to logcat
+             SpdLogger   = spdlog::android_logger(GMM_LOGGER_NAME, GMM_LOG_TAG);
+-#elif defined(__linux__)
++#elif (defined(__linux__) || defined(__LIKEOS__))
+             // Log to syslog
+             SpdLogger = spdlog::syslog_logger(GMM_LOGGER_NAME, GMM_LOG_TAG, 1 /*Log Pid*/);
+ #else
+--- a/Source/GmmLib/CachePolicy/GmmGen8CachePolicy.h
++++ b/Source/GmmLib/CachePolicy/GmmGen8CachePolicy.h
+@@ -145,7 +145,7 @@
+ DEFINE_CACHE_ELEMENT(GMM_RESOURCE_USAGE_SURFACE_HME_DOWNSAMPLED_ENCODE                    , 1   , 1    , 1  , 0  , 1);
+ DEFINE_CACHE_ELEMENT(GMM_RESOURCE_USAGE_SURFACE_HME_DOWNSAMPLED_ENCODE_DST                , 1   , 1    , 0  , 0  , 1);
+ DEFINE_CACHE_ELEMENT(GMM_RESOURCE_USAGE_SURFACE_ME_DISTORTION_ENCODE                      , 1   , 1    , 1  , 0  , 1);
+-#if defined(__linux__) && !defined(ANDROID)
++#if (defined(__linux__) || defined(__LIKEOS__)) && !defined(ANDROID)
+ DEFINE_CACHE_ELEMENT(GMM_RESOURCE_USAGE_SURFACE_MV_DATA_ENCODE                            , 1   , 1    , 0  , 0  , 1);
+ DEFINE_CACHE_ELEMENT(GMM_RESOURCE_USAGE_SURFACE_BRC_ME_DISTORTION_ENCODE                  , 1   , 1    , 0  , 0  , 1);
+ DEFINE_CACHE_ELEMENT(GMM_RESOURCE_USAGE_PAK_OBJECT_ENCODE                                 , 1   , 1    , 0  , 0  , 1);
+--- a/Source/GmmLib/inc/External/Common/GmmCommonExt.h
++++ b/Source/GmmLib/inc/External/Common/GmmCommonExt.h
+@@ -85,7 +85,7 @@
+ #define GMM_NO_FENCE_REG        0xDEADBEEF
+ #define GMM_MAX_DISPLAYS        3
+ 
+-#if defined __linux__
++#if (defined(__linux__) || defined(__LIKEOS__))
+ typedef void* HANDLE;
+ #endif
+ 
+--- a/Source/GmmLib/GlobalInfo/GmmInfo.cpp
++++ b/Source/GmmLib/GlobalInfo/GmmInfo.cpp
+@@ -939,7 +939,7 @@
+ {
+     int32_t *Ref = &RefCount;
+ 
+-#if defined(__linux__)
++#if (defined(__linux__) || defined(__LIKEOS__))
+     // returns 0 only when registering the first client
+     return (__sync_fetch_and_add(Ref, 1));
+ #endif
+@@ -974,7 +974,7 @@
+         {
+             break;
+         }
+-#if defined(__linux__)
++#if (defined(__linux__) || defined(__LIKEOS__))
+     } while(!__sync_bool_compare_and_swap(Ref, CurrentValue, TargetValue));
+ #endif
+     return TargetValue;
+--- a/Source/util/gfxDebug.h
++++ b/Source/util/gfxDebug.h
+@@ -124,7 +124,7 @@
+ 
+ #else
+ 
+-#ifndef __linux__
++#if !defined(__linux__) && !defined(__LIKEOS__)
+     #include "igdKrnlEtwMacros.h"
+ #endif
+ 

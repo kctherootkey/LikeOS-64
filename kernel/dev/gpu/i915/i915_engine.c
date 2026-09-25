@@ -66,8 +66,18 @@ static int hwsp_alloc(struct i915_engine *e)
 	}
 	if (i915->drm.drv->gem_init)
 		i915->drm.drv->gem_init(o);
+	/* The page the device writes and the processor reads: sequence
+	 * numbers, context status.  Bound so that the two see the same
+	 * memory -- through the shared last-level cache where the part has
+	 * one, as the ring and the context image are.  Bound uncached (the
+	 * way a scanout surface is) the device's writes went past the
+	 * processor's caches, and a line the processor had read before
+	 * stayed stale in them: a completed batch went unnoticed until the
+	 * line happened to be evicted or the hang check looked, seconds
+	 * later. */
 	uint32_t ggtt;
-	if (i915_ggtt_bind_scanout(i915, o, &ggtt) != 0) {
+	int uncached = !(i915->info->flags & I915_INFO_HAS_LLC);
+	if (i915_ggtt_bind_obj(i915, o, uncached, &ggtt) != 0) {
 		drm_gem_put(o);
 		return -ENOMEM;
 	}
@@ -191,12 +201,22 @@ int i915_gt_reset_all(struct i915_device *i915)
 int i915_engines_init(struct i915_device *i915)
 {
 	const struct intel_device_info *info = i915->info;
+	uint32_t engine_mask = info->engine_mask;
 	int n = 0;
+
+	/* The second video engine belongs to the GT3 and GT4 parts of the
+	 * Gen8/Gen9 core families, not to the platform as a whole. */
+	int gt = (i915->id && i915->id->gt) ? i915->id->gt : info->gt;
+	if (gt >= 3 && (info->platform == I915_PLATFORM_BROADWELL ||
+			info->platform == I915_PLATFORM_SKYLAKE ||
+			info->platform == I915_PLATFORM_KABYLAKE ||
+			info->platform == I915_PLATFORM_COFFEELAKE))
+		engine_mask |= I915_ENGINE_VCS1;
 
 	mm_memset(i915->engines, 0, sizeof(i915->engines));
 	for (unsigned i = 0; i < sizeof(engine_descs) / sizeof(engine_descs[0]); i++) {
 		const struct engine_desc *d = &engine_descs[i];
-		if (!(info->engine_mask & d->mask))
+		if (!(engine_mask & d->mask))
 			continue;
 		uint32_t base = info->gen >= 11 ? d->base_gen11 : d->base_gen9;
 		if (!base)
@@ -314,9 +334,17 @@ void i915_engine_irq(struct i915_engine *e, uint32_t bits)
 		i915_engine_retire(e);
 }
 
+uint32_t i915_hwsp_read(struct i915_engine *e, unsigned index)
+{
+	const volatile uint32_t *p = &e->hwsp[index];
+	if (!(e->i915->info->flags & I915_INFO_HAS_LLC))
+		__asm__ volatile("clflush (%0)" ::"r"(p) : "memory");
+	return *p;
+}
+
 static uint32_t hwsp_seqno(struct i915_engine *e)
 {
-	return e->hwsp[I915_HWS_SEQNO_INDEX];
+	return i915_hwsp_read(e, I915_HWS_SEQNO_INDEX);
 }
 
 /* Requests whose sequence the engine has passed: their fences signal,
@@ -524,6 +552,7 @@ int i915_engine_reset(struct i915_engine *e, const char *why)
 		i915_request_put(rq);
 	}
 	e->hwsp[I915_HWS_SEQNO_INDEX] = e->next_seqno - 1;
+	__asm__ volatile("clflush (%0)" ::"r"(&e->hwsp[I915_HWS_SEQNO_INDEX]) : "memory");
 	e->last_retired = e->next_seqno - 1;
 	engine_hw_init(e);
 	/* whatever was queued but not submitted runs now */

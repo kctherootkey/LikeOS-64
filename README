@@ -138,6 +138,19 @@ Graphics and input
   and left to the firmware framebuffer.  The X server picks
   xorg.conf.modesetting-i915 (glamor, DRI3, page flipping) when it is the
   driver; drminfo(1) reports it.
+- Hardware video: on Intel graphics the video engines decode through VA-API
+  (libva, the iHD driver -- intel-media-driver on gmmlib -- with the i965
+  driver as the fallback LIBVA_DRIVER_NAME=i965 selects, GStreamer's va
+  plugin -- vah264dec, vah265dec,
+  vavp8dec, vavp9dec, vaav1dec -- and FFmpeg's vaapi hwaccels; vainfo(1),
+  ffmpeg(1) and ffprobe(1) exercise it from a shell).  On VMware the display
+  adapter's video overlay stream is driven by the display manager's stream
+  ioctls and offered by the X server as the "VMware Overlay Video Engine"
+  XVideo adaptor, next to glamor's textured adaptor on the SVGA3D device;
+  xvinfo(1) lists them, and players that draw through XVideo (gst-play-1.0,
+  xvimagesink) use them.  The browser decodes with the VA-API decoders where
+  they exist and composites the frames with the page in its web process, as
+  on any desktop.
 - /dev/fb0 (fbdev) and /dev/input/event* (evdev), which is what the X server
   drives.
 - PS/2 keyboard and mouse, USB HID, and I2C-HID touchpads.
@@ -271,7 +284,8 @@ X Window System (ports/xorg, 79 packages):
 - ctwm: window manager, with a desktop bar and keyboard-driven root menus.
 - xterm: terminal emulator (UTF-8, 256 colour).
 - XNEdit: Motif text editor.
-- xcalc, xclock, xload, xsetroot, xrandr, xset, xauth: the usual X clients.
+- xcalc, xclock, xload, xsetroot, xrandr, xset, xauth, xvinfo: the usual X
+  clients.
 - Toolkits and libraries: libX11, libXt, libXaw, libXft, Motif, freetype,
   fontconfig, pixman, libpng, libjpeg, xkbcomp and xkeyboard-config.
 

@@ -68,6 +68,7 @@ static int drm_open(struct devfs_node *node, vfs_file_t *file, int flags,
 	fp->file_id = 1 + (__atomic_fetch_add(&next_file_id, 1, __ATOMIC_RELAXED) %
 			   0x7FFFu);
 	fp->is_render = (node == &dev->node_render);
+	fp->vfs = file;
 	fp->uid = cur ? cur->cred.euid : 0;
 	spinlock_init(&fp->lock, "drm_file");
 	wq_head_init(&fp->wq, "drm_file");
@@ -372,6 +373,13 @@ static int drm_mmap(vfs_file_t *file, struct device_mmap *m)
 	if (inner + m->length > o->size) {
 		drm_gem_put(o);
 		return -EINVAL;
+	}
+	if (dev->drv->gem_mmap_kind) {
+		int krc = dev->drv->gem_mmap_kind(o, kind, inner / PAGE_SIZE, m);
+		if (krc != 0) {
+			drm_gem_put(o); /* the driver holds its own */
+			return krc < 0 ? krc : 0;
+		}
 	}
 	uint64_t pte = dev->drv->gem_mmap_pte ?
 			       dev->drv->gem_mmap_pte(o, kind) :

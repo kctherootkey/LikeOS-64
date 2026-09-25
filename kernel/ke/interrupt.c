@@ -1020,6 +1020,8 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 			access = "read";
 	} else if (int_no == 6) {
 		reason = "illegal instruction";
+	} else if (int_no == (uint64_t)-1) {
+		reason = "signal raised by the process itself";
 	} else if (int_no == 0) {
 		reason = "divide by zero";
 	} else if (int_no == 4) {
@@ -1485,7 +1487,7 @@ void report_userspace_self_signal(task_t *sender, int signum,
 	regs[REGS_RSP] = f->rsp;
 	regs[REGS_CS] = 0x1b;
 	regs[REGS_SS] = 0x23;
-	report_userspace_crash_detailed(sender, regs, signum, signame, 0, 0);
+	report_userspace_crash_detailed(sender, regs, signum, signame, 0, (uint64_t)-1);
 #endif
 }
 

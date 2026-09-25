@@ -59,28 +59,37 @@
 // Initialize the futex hash table (called once during kernel init)
 void futex_init(void);
 
+// `shared' (the syscall's op without FUTEX_PRIVATE_FLAG) keys the word by
+// the page frame it lives in, so a waiter and a waker in different
+// processes mapping the same memory meet; a private futex is keyed by the
+// process and the virtual address.
+
 // Futex wait: block until futex value changes or timeout
 // Returns: 0 on success, -EAGAIN if value changed, -ETIMEDOUT on timeout
-int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns);
+int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns,
+	       bool shared);
 
 // Futex wake: wake up to nr_wake waiters
 // Returns: number of waiters woken
-int futex_wake(uint64_t uaddr, int nr_wake);
+int futex_wake(uint64_t uaddr, int nr_wake, bool shared);
 
 // Bitset variants: the sleeper carries `bitset', a wake names the bits it
 // addresses, and only intersecting pairs meet.  A zero bitset is -EINVAL.
 int futex_wait_bitset(uint64_t uaddr, uint32_t expected_val,
-		      uint64_t timeout_ns, uint32_t bitset);
-int futex_wake_bitset(uint64_t uaddr, int nr_wake, uint32_t bitset);
+		      uint64_t timeout_ns, uint32_t bitset, bool shared);
+int futex_wake_bitset(uint64_t uaddr, int nr_wake, uint32_t bitset,
+		      bool shared);
 
 // Like futex_wake but uses a specific task's PML4 for key computation.
 // Use when performing futex operations on behalf of a task that may differ
 // from sched_current() (e.g. cross-CPU SIGKILL in sched_mark_task_exited).
+// Keys the word as shared: the thread-exit and robust-list wakes.
 int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t *on_behalf_of);
 
 // Futex requeue: wake some waiters and move others to a different futex
 // Returns: total number of waiters processed (woken + requeued)
-int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue);
+int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue,
+		  bool shared);
 
 // ============================================================================
 // ROBUST FUTEX SUPPORT

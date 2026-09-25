@@ -40,8 +40,10 @@ struct i915_vm {
 	uint64_t scratch_page, scratch_pt, scratch_pd, scratch_pdp;
 	struct i915_page_list tables;
 	spinlock_t lock;
-	/* where objects that ask for no address go (relocation clients) */
-	uint64_t alloc_next;
+	/* where objects that ask for no address go (relocation clients):
+	 * next-fit cursors, one for the zone below 4 GB an object without
+	 * the 48-bit flag must stay in, one for the zone above it */
+	uint64_t alloc_low, alloc_high;
 	int tlb_dirty; /* bindings changed since the last submission */
 	struct i915_vma *vmas; /* the bindings that own ranges here */
 };
@@ -186,6 +188,11 @@ struct i915_engine *i915_engine_by_class(struct i915_device *i915, int class, in
 void i915_engine_irq(struct i915_engine *e, uint32_t bits);
 /* Retire completed requests (signal fences, drop object refs). */
 void i915_engine_retire(struct i915_engine *e);
+/* A word of the engine's status page, as the device last wrote it.  On a
+ * part with a last-level cache the page is bound cached and the device's
+ * writes are seen through it; elsewhere the processor's own copy of the
+ * line is dropped first. */
+uint32_t i915_hwsp_read(struct i915_engine *e, unsigned index);
 /* Reset one engine after a hang. */
 int i915_engine_reset(struct i915_engine *e, const char *why);
 int i915_gt_reset_all(struct i915_device *i915);

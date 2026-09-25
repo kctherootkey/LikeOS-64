@@ -375,7 +375,21 @@ struct vmw_device {
 	const void *st_bound_obj;
 	struct vmw_surface *st_surface;	/* the driver's display surface */
 	struct drm_gem_object *st_bo;	/* its MOB backing */
+	void *overlay_priv;		/* the video overlay streams (vmw_overlay.c) */
 };
+
+/* ---- video overlay streams (vmw_overlay.c) ---- */
+int vmw_overlay_init(struct vmw_device *v);
+void vmw_overlay_close(struct vmw_device *v);
+int vmw_overlay_num_streams(struct vmw_device *v);
+int vmw_overlay_num_free_streams(struct vmw_device *v);
+void vmw_overlay_file_release(struct vmw_device *v, struct drm_file *fp);
+long vmw_ioctl_control_stream(struct vmw_device *v, struct drm_file *fp,
+			      struct drm_vmw_control_stream_arg *arg);
+long vmw_ioctl_claim_stream(struct vmw_device *v, struct drm_file *fp,
+			    struct drm_vmw_stream_arg *arg);
+long vmw_ioctl_unref_stream(struct vmw_device *v, struct drm_file *fp,
+			    struct drm_vmw_stream_arg *arg);
 
 /* ---- screen-target scan-out ---- */
 struct drm_framebuffer;

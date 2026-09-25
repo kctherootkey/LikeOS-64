@@ -30,6 +30,11 @@ struct option {
 
 int getopt_long(int argc, char * const argv[], const char *optstring,
                 const struct option *longopts, int *longindex);
+/* Like getopt_long(), but a single dash introduces a long option too
+ * ("-name"); an argument that matches no long option falls back to the
+ * short options. */
+int getopt_long_only(int argc, char * const argv[], const char *optstring,
+                     const struct option *longopts, int *longindex);
 
 #ifdef __cplusplus
 }

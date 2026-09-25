@@ -1,0 +1,65 @@
+The va and kms plugins are built only for the one Unix their meson files name;
+this system has the same DRM and libva and takes the same branch.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- gst-plugins-bad-1.24.13/gst-libs/gst/va/meson.build
++++ gst-plugins-bad-1.24.13/gst-libs/gst/va/meson.build
+@@ -45,12 +45,13 @@
+               '-DBUILDING_GST_VA',
+               '-DG_LOG_DOMAIN="GStreamer-VA"']
+ 
+-if host_system not in ['linux', 'windows']
++# This system's DRM and libva are the Unix ones; it takes that branch.
++if host_system not in ['linux', 'likeos', 'windows']
+   subdir_done()
+ endif
+ 
+ va_opt = get_option('va')
+-if host_system == 'linux'
++if host_system in ['linux', 'likeos']
+   msdk_opt = get_option('msdk')
+   qsv_opt = get_option('qsv')
+   if va_opt.disabled() and msdk_opt.disabled() and qsv_opt.disabled()
+@@ -74,7 +75,7 @@
+   subdir_done()
+ endif
+ 
+-if host_system == 'linux'
++if host_system in ['linux', 'likeos']
+   libva_drm_dep = dependency('libva-drm', version: libva_req, required: va_required)
+   if not libva_drm_dep.found()
+     subdir_done()
+--- gst-plugins-bad-1.24.13/sys/va/meson.build
++++ gst-plugins-bad-1.24.13/sys/va/meson.build
+@@ -34,7 +34,8 @@
+   'gstvadevice_win32.cpp'
+ ]
+ 
+-if host_system not in ['linux', 'windows']
++# This system's DRM and libva are the Unix ones; it takes that branch.
++if host_system not in ['linux', 'likeos', 'windows']
+   subdir_done()
+ endif
+ 
+@@ -55,7 +56,7 @@
+ extra_dep = []
+ c_std_arg = ['c_std=c99']
+ 
+-if host_system == 'linux'
++if host_system in ['linux', 'likeos']
+   libgudev_dep = dependency('gudev-1.0', required: get_option('udev'), allow_fallback: true)
+   if libgudev_dep.found()
+     extra_args += ['-DHAVE_GUDEV']
+--- gst-plugins-bad-1.24.13/sys/kms/meson.build
++++ gst-plugins-bad-1.24.13/sys/kms/meson.build
+@@ -6,7 +6,8 @@
+ ]
+ extra_deps = []
+ 
+-if host_system != 'linux'
++# This system's DRM is the Unix one; it takes that branch.
++if host_system not in ['linux', 'likeos']
+   subdir_done()
+ endif
+ 

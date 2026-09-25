@@ -226,6 +226,15 @@ if [ "$LIKEOS_GPU_3D" != "1" ]; then
 	export WEBKIT_DMABUF_RENDERER_FORCE_SHM
 fi
 
+# Video in the browser is decoded by GStreamer -- the VA-API decoders
+# (vah264dec ...) on Intel graphics, FFmpeg's on the processor elsewhere --
+# and composited with the page by the web process, as on any desktop.  Of
+# the two VA-API drivers libva takes the newer one (iHD) where it is;
+# LIBVA_DRIVER_NAME=i965 asks for the older one, which serves the same
+# parts.  The X server's XVideo adaptors (the display adapter's
+# overlay stream on VMware, glamor's textured path) serve the players that
+# draw through XVideo, gst-play-1.0 and xvimagesink among them.
+
 # No terminal is started here on purpose.  Use "Xterm" on the window manager's
 # menu, which is Alt+F1 -- the menus are on keys rather than mouse buttons
 # because the desktop below owns all three buttons (see system.ctwmrc).

@@ -31,6 +31,10 @@ typedef int key_t;
 #define IPC_SET  1
 #define IPC_STAT 2
 
+/* A key from a file and a project id: the file's inode and device with
+ * the id, as every implementation has made it. */
+key_t ftok(const char *path, int id);
+
 struct ipc_perm {
     key_t          key;
     unsigned int   uid, gid;

@@ -305,6 +305,54 @@ void icache_ref(ic_inode_t *inode)
 	}
 }
 
+int icache_flag_if_referenced(unsigned long start_cluster, uint32_t flag)
+{
+	ic_inode_t *n = icache_lookup(start_cluster);
+	uint64_t flags;
+	int held = 0;
+
+	if (!n)
+		return 0;
+	spin_lock_irqsave(&ic_lru_lock, &flags);
+	if (n->refcount > 0) {
+		n->flags |= flag;
+		held = 1;
+	}
+	spin_unlock_irqrestore(&ic_lru_lock, flags);
+	return held;
+}
+
+int icache_unref_flagged(ic_inode_t *inode, uint32_t flag)
+{
+	uint64_t flags;
+	int last = 0;
+
+	if (!inode)
+		return 0;
+	spin_lock_irqsave(&ic_lru_lock, &flags);
+	if (inode->refcount == 1 && (inode->flags & flag)) {
+		/* The caller takes over: the reference is dropped here so
+		 * nobody else can become the last one, and the flag with it
+		 * so the answer is given exactly once. */
+		inode->refcount = 0;
+		inode->flags &= ~flag;
+		last = 1;
+		if (!(inode->flags & IC_DEAD))
+			ic_lru_add(inode);
+		spin_unlock_irqrestore(&ic_lru_lock, flags);
+		if (inode->flags & IC_DEAD) {
+			ic_chain_account_free(inode);
+			if (inode->chain)
+				kfree(inode->chain);
+			kfree(inode);
+		}
+		return last;
+	}
+	spin_unlock_irqrestore(&ic_lru_lock, flags);
+	icache_unref(inode);
+	return 0;
+}
+
 void icache_unref(ic_inode_t *inode)
 {
 	if (!inode)

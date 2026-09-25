@@ -86,6 +86,7 @@ static int i915_gem_init_obj(struct drm_gem_object *o)
 	if (!bo)
 		return -ENOMEM;
 	mm_memset(bo, 0, sizeof(*bo));
+	bo->fence_id = -1;
 	o->priv = bo;
 	return 0;
 }
@@ -98,6 +99,25 @@ static void i915_gem_free_obj(struct drm_gem_object *o)
 /* User mappings of buffers: write-combining by default, so a display
  * server's writes stream to memory the display engine reads without a
  * flush; the plain cache kinds when a client asks for them by name. */
+/* A fence waiter asking whether anything has completed: the engines are
+ * looked at directly, so a wait finishes within its poll interval even
+ * when the completion interrupt was not seen. */
+static void i915_fence_poll(struct drm_device *dev)
+{
+	struct i915_device *i915 = &g_i915;
+	(void)dev;
+	if (!i915->gt_ready)
+		return;
+	for (int i = 0; i < I915_NUM_ENGINES; i++) {
+		struct i915_engine *e = &i915->engines[i];
+		if (!e->present)
+			continue;
+		if (!i915->guc.submission)
+			i915_execlists_process_csb(e);
+		i915_engine_retire(e);
+	}
+}
+
 static uint64_t i915_gem_mmap_pte(struct drm_gem_object *o, unsigned kind)
 {
 	(void)o;
@@ -242,6 +262,7 @@ static int i915_resume(struct drm_device *dev)
 		return rc;
 	if (i915->nengines) {
 		i915_engines_resume(i915);
+		i915_fences_restore(i915);
 		i915->gt_ready = 1;
 	}
 	return 0;
@@ -257,6 +278,7 @@ static int i915_late_init(struct drm_device *dev)
 		 * up after it and run their first batch through it. */
 		if (i915_guc_init(i915) == 0 && (i915->info->flags & I915_INFO_GUC_MANDATORY) &&
 		    i915_engines_init(i915) == 0) {
+			i915_fences_init(i915);
 			i915->gt_ready = 1;
 			if (i915_guc_submission_enable(i915) != 0 || i915_gt_golden_init(i915) != 0) {
 				kprintf("[drm] i915: no engine executed its first batch through the GuC; rendering disabled\n");
@@ -289,6 +311,7 @@ static const struct drm_driver i915_driver = {
 	.gem_page_phys = i915_gem_page_phys,
 	.gem_mmap_pte_extra = PAGE_WRITE_THROUGH,
 	.gem_mmap_pte = i915_gem_mmap_pte,
+	.gem_mmap_kind = i915_gem_mmap_kind,
 	.atomic_check = intel_atomic_check,
 	.atomic_commit = intel_atomic_commit,
 	.gamma_size = 256,
@@ -303,6 +326,7 @@ static const struct drm_driver i915_driver = {
 	.detect = intel_detect,
 	.get_modes = intel_get_modes,
 	.hw_vblank = 1,
+	.fence_poll = i915_fence_poll,
 	.display_verify = intel_display_verify,
 	.display_fallback = intel_display_fallback,
 	.ioctl = i915_ioctl,
@@ -366,6 +390,8 @@ int i915_init(void)
 		return -ENODEV;
 	}
 	mm_memset(i915, 0, sizeof(*i915));
+	mm_rwsem_init(&i915->submit_lock, "i915_submit");
+	spinlock_init(&i915->sync_lock, "i915_sync");
 	i915->pci = pci;
 	i915->id = id;
 	i915->info = id->info;
@@ -478,6 +504,7 @@ int i915_init(void)
 		kprintf("[drm] i915: execution lists on %s are not brought up yet; display only\n",
 			i915->info->name);
 	} else if (i915_engines_init(i915) == 0) {
+		i915_fences_init(i915);
 		i915->gt_ready = 1;
 		if (i915_gt_golden_init(i915) != 0) {
 			kprintf("[drm] i915: no engine executed its first batch; rendering disabled\n");

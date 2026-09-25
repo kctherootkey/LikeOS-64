@@ -17,6 +17,7 @@
 #include <kernel/ke/futex.h>
 #include <kernel/ke/sched.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/rwsem.h>
 #include <kernel/ke/timer.h>
 #include <kernel/uapi/types.h>
 #include <kernel/ke/syscall.h>
@@ -233,14 +234,75 @@ static uint64_t futex_private_key(uint64_t tgid, uint64_t uaddr)
 	return (tgid * 0x9E3779B97F4A7C15ULL) ^ uaddr;
 }
 
+/* The key of a futex issued WITHOUT the private flag.
+ *
+ * What the reference does, by the page: a word in memory the process
+ * shares with others -- a MAP_SHARED mapping, which is where the X server
+ * and its clients keep the fences they wait on -- is keyed by that memory,
+ * so the two processes meet on one key; a word in the process's own memory
+ * (its stack, heap or a private mapping) is keyed by the process and the
+ * address, exactly as a private futex is.  The second half matters: a
+ * private page can be copied on a later fork, and a key made from its
+ * frame would then name a page the waker no longer writes.
+ *
+ * The mapping's kind comes from the region record; the frame from the
+ * task's own page tables (see above for why not CR3).  A shared, readable
+ * page not yet present is touched -- from a syscall only, where the fault
+ * handler serves the demand fault as it does for the wait path's own read
+ * of the word -- and looked up again.  From the exit walk (`may_block'
+ * false: the task may be past owning user memory, may hold a lock, may
+ * run on another CPU) nothing is touched and the lock is only tried; the
+ * table is read as it stands, and a page that is gone makes the word a
+ * private one, which its waiter -- a joiner on a private stack -- also
+ * resolved it to. */
+static uint64_t futex_shared_key(uint64_t uaddr, task_t *task, bool may_block)
+{
+	task_t *mm = task_mm_owner(task);
+	uint64_t *pml4 = task ? task->pml4 : NULL;
+	bool locked = false;
+	bool in_shared = false;
+	bool readable = false;
+	uint64_t phys = 0;
+
+	if (!mm || !mm->mmap_regions || !pml4)
+		return futex_private_key(task ? (uint64_t)task->tgid : 0, uaddr);
+
+	if (may_block) {
+		mm_read_lock(&mm->mmap_lock);
+		locked = true;
+	} else {
+		locked = mm_read_trylock(&mm->mmap_lock);
+	}
+	mmap_region_t *r = mm_find_mmap_region(mm, uaddr);
+	if (r && (r->flags & MAP_SHARED)) {
+		in_shared = true;
+		readable = (r->prot & PROT_READ) != 0;
+		phys = mm_virt_to_phys_in(pml4, uaddr);
+	}
+	if (locked)
+		mm_read_unlock(&mm->mmap_lock);
+
+	if (in_shared && !phys && readable && may_block) {
+		smap_disable();
+		(void)*(volatile uint32_t *)uaddr;
+		smap_enable();
+		mm_read_lock(&mm->mmap_lock);
+		phys = mm_virt_to_phys_in(pml4, uaddr);
+		mm_read_unlock(&mm->mmap_lock);
+	}
+
+	if (!in_shared || !phys)
+		return futex_private_key(task ? (uint64_t)task->tgid : 0, uaddr);
+	return phys | (1ULL << 63);
+}
+
 // Get the key for a futex address
-// - Shared futexes: physical address (same across processes)
+// - Shared futexes: the page frame (the same in every process mapping it)
 // - Private futexes: the owning process, combined with the virtual address
 static uint64_t futex_get_key(uint64_t uaddr, bool shared)
 {
 	if (shared) {
-		// For shared futexes, use physical address as key
-		return mm_get_physical_address(uaddr);
+		return futex_shared_key(uaddr, sched_current(), true);
 	} else {
 		task_t *cur = sched_current();
 
@@ -256,7 +318,7 @@ static uint64_t futex_get_key_for_task(uint64_t uaddr, bool shared,
 				       task_t *task)
 {
 	if (shared) {
-		return mm_get_physical_address(uaddr);
+		return futex_shared_key(uaddr, task, false);
 	} else {
 		return futex_private_key(task ? (uint64_t)task->tgid : 0,
 					 uaddr);
@@ -281,7 +343,7 @@ void futex_init(void)
 }
 
 static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
-			     uint64_t timeout_ns, uint32_t bitset)
+			     uint64_t timeout_ns, uint32_t bitset, bool shared)
 {
 	might_sleep();
 	if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
@@ -305,7 +367,7 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 	}
 
 	// Compute hash key and bucket
-	uint64_t key = futex_get_key(uaddr, false); // Private futex
+	uint64_t key = futex_get_key(uaddr, shared);
 	uint32_t bucket_idx = futex_hash_fn(key);
 	BUG_ON(bucket_idx >= FUTEX_HASH_BUCKETS);
 	futex_bucket_t *bucket = &futex_hash[bucket_idx];
@@ -469,13 +531,14 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 	return -EINTR;
 }
 
-static int futex_wake_common(uint64_t uaddr, int nr_wake, uint32_t bitset)
+static int futex_wake_common(uint64_t uaddr, int nr_wake, uint32_t bitset,
+			     bool shared)
 {
 	BUG_ON(!futex_initialized);
 	if (nr_wake <= 0)
 		return 0;
 
-	uint64_t key = futex_get_key(uaddr, false);
+	uint64_t key = futex_get_key(uaddr, shared);
 	uint32_t bucket_idx = futex_hash_fn(key);
 	futex_bucket_t *bucket = &futex_hash[bucket_idx];
 
@@ -590,23 +653,25 @@ static int futex_wake_common(uint64_t uaddr, int nr_wake, uint32_t bitset)
 	return woken;
 }
 
-int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
+int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns,
+	       bool shared)
 {
 	return futex_wait_common(uaddr, expected_val, timeout_ns,
-				 FUTEX_BITSET_MATCH_ANY);
+				 FUTEX_BITSET_MATCH_ANY, shared);
 }
 
 int futex_wait_bitset(uint64_t uaddr, uint32_t expected_val,
-		      uint64_t timeout_ns, uint32_t bitset)
+		      uint64_t timeout_ns, uint32_t bitset, bool shared)
 {
 	if (bitset == 0)
 		return -EINVAL;
-	return futex_wait_common(uaddr, expected_val, timeout_ns, bitset);
+	return futex_wait_common(uaddr, expected_val, timeout_ns, bitset,
+				 shared);
 }
 
-int futex_wake(uint64_t uaddr, int nr_wake)
+int futex_wake(uint64_t uaddr, int nr_wake, bool shared)
 {
-	return futex_wake_common(uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY);
+	return futex_wake_common(uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY, shared);
 }
 
 /* Wake only the waiters whose bitset intersects `bitset'.  A plain
@@ -614,16 +679,20 @@ int futex_wake(uint64_t uaddr, int nr_wake)
  * FUTEX_WAIT_BITSET sleeper is woken only by a wake naming one of its
  * bits -- how a condition variable wakes one class of waiter and not
  * another on the same word. */
-int futex_wake_bitset(uint64_t uaddr, int nr_wake, uint32_t bitset)
+int futex_wake_bitset(uint64_t uaddr, int nr_wake, uint32_t bitset,
+		      bool shared)
 {
 	if (bitset == 0)
 		return -EINVAL;
-	return futex_wake_common(uaddr, nr_wake, bitset);
+	return futex_wake_common(uaddr, nr_wake, bitset, shared);
 }
 
 // Like futex_wake but uses a specific task's PML4 for key computation.
 // This is needed when waking futex waiters on behalf of a different task
 // (e.g. during sched_mark_task_exited called cross-CPU via SIGKILL).
+// The wake is a shared one, as the thread-exit wake of the tid word and
+// the robust-list death wake are in the reference: the joiner and the
+// mutex waiters sleep on these words without the private flag.
 int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t *on_behalf_of)
 {
 	if (nr_wake <= 0)
@@ -632,7 +701,7 @@ int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t *on_behalf_of)
 	ftrace_log(FT_WAKE_TASK, uaddr, (uint32_t)nr_wake,
 		   on_behalf_of ? (uint32_t)on_behalf_of->id : 0xFFFF);
 
-	uint64_t key = futex_get_key_for_task(uaddr, false, on_behalf_of);
+	uint64_t key = futex_get_key_for_task(uaddr, true, on_behalf_of);
 	uint32_t bucket_idx = futex_hash_fn(key);
 	futex_bucket_t *bucket = &futex_hash[bucket_idx];
 
@@ -676,13 +745,14 @@ int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t *on_behalf_of)
 	return woken;
 }
 
-int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue)
+int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue,
+		  bool shared)
 {
 	if (nr_wake < 0 || nr_requeue < 0)
 		return -EINVAL;
 
-	uint64_t key1 = futex_get_key(uaddr, false);
-	uint64_t key2 = futex_get_key(uaddr2, false);
+	uint64_t key1 = futex_get_key(uaddr, shared);
+	uint64_t key2 = futex_get_key(uaddr2, shared);
 	uint32_t bucket_idx1 = futex_hash_fn(key1);
 	uint32_t bucket_idx2 = futex_hash_fn(key2);
 

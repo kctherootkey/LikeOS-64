@@ -9,6 +9,7 @@
 #include <kernel/dev/gpu/i915/i915_device_info.h>
 #include <kernel/hal/pci.h>
 #include <kernel/ke/sched.h>
+#include <kernel/mm/rwsem.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>
 #include <kernel/dev/gpu/i915/i915_guc.h>
@@ -139,7 +140,34 @@ struct i915_device {
 	uint32_t rps_rp0, rps_rp1, rps_rpn, rps_cur;
 	/* the GuC (i915_guc.c) */
 	struct i915_guc guc;
+	/* Submissions, one at a time: from binding an object through
+	 * recording the request on it, so that the order of sequence
+	 * numbers is the order in the rings and in the queues, and no
+	 * submission sees an object between another's submission and its
+	 * record of it.  Waits for other engines happen outside it. */
+	mm_rwsem_t submit_lock;
+	/* the fences recorded on objects (write_fence, read_fence[]) */
+	spinlock_t sync_lock;
+	/* the fence registers (i915_fence.c): which object holds each */
+	spinlock_t fence_lock;
+	int num_fences;
+	struct drm_gem_object *fence_obj[32];
 };
+
+/* The driver's own mapping kind: the object through the graphics aperture
+ * (drm_gem_mmap_offset_kind), translated by the global address space and,
+ * for a tiled object, a fence register. */
+#define I915_MMAP_KIND_GTT 4
+
+/* i915_fence.c */
+int i915_fences_init(struct i915_device *i915);
+void i915_fences_restore(struct i915_device *i915);
+int i915_gem_mmap_kind(struct drm_gem_object *o, unsigned kind, uint64_t first_page,
+		       struct device_mmap *m);
+void i915_fence_object_free(struct i915_device *i915, struct drm_gem_object *o);
+/* i915_gtt.c: a binding low in the global space, where the aperture reaches */
+int i915_ggtt_bind_obj_mappable(struct i915_device *i915, struct drm_gem_object *o,
+				uint32_t *ggtt_offset);
 
 /* Name the allocation a failed submission could not make, once. */
 void i915_enomem_once(struct i915_device *i915, const char *what);
@@ -165,6 +193,7 @@ struct i915_vma {
 	uint32_t npages;
 	int pinned; /* at the client's address */
 	int attached; /* owns its range in the address space */
+	int allocated; /* the driver chose the address (a relocation client) */
 };
 
 /* i915_vma.c: the ranges an address space has given out */
@@ -175,6 +204,20 @@ unsigned i915_vma_list_supersede(struct i915_vma **head, uint64_t addr,
 unsigned i915_vm_vma_claim(struct i915_vm *vm, struct i915_vma *v,
 			   uint64_t addr, uint32_t npages);
 int i915_vm_vma_release(struct i915_vm *vm, struct i915_vma *v);
+/* Pure: the first gap of `npages' pages aligned to `align', at or after
+ * `from' and wholly below `limit', that no binding on the list overlaps;
+ * 0 when there is none. */
+uint64_t i915_vma_list_find_gap(struct i915_vma *head, uint64_t from,
+				uint64_t limit, uint32_t npages, uint64_t align);
+/* i915_ppgtt.c: an address for an object the client did not place, taken
+ * and attached under the space's lock.  `low' keeps it below 4 GB (an
+ * object without the 48-bit flag). */
+int i915_vm_vma_alloc(struct i915_vm *vm, struct i915_vma *v, uint32_t npages,
+		      uint64_t align, int low);
+
+/* The engine classes of the interface: render, copy, video, video
+ * enhancement, compute. */
+#define I915_ENGINE_CLASSES 5
 
 /* Per-object driver state (drm_gem_object.priv): where the object sits in
  * the GGTT (scanout, rings, context images) and in the address spaces
@@ -191,13 +234,23 @@ struct i915_bo {
 	uint32_t madv; /* I915_MADV_* */
 	int purged;
 	uint32_t read_domains, write_domain;
-	/* last submission reading / writing the object */
+	/* last submission writing the object, and the class of the engine
+	 * it ran on; the last reader on each engine class (a writer counts
+	 * as a reader of its own class, as the busy call reports it) */
 	struct drm_fence *write_fence;
-	struct drm_fence *read_fence;
+	uint8_t write_class;
+	struct drm_fence *read_fence[I915_ENGINE_CLASSES];
 	uint64_t user_size; /* what CREATE asked for, before rounding */
 	/* The pages are a client's own (USERPTR): referenced, not owned;
 	 * released with mm_put_page() rather than freed. */
 	int userptr;
+	/* Mapped through the aperture (i915_fence.c): how many mappings, the
+	 * binding made for them (or the scanout one reused), the fence */
+	int gtt_map_refs;
+	int gtt_map_bound;
+	int gtt_map_own;
+	uint32_t gtt_map_ggtt;
+	int fence_id; /* -1 = none */
 };
 
 /* Per-file driver state (drm_file.priv): the contexts and address
@@ -208,6 +261,9 @@ struct i915_file {
 	struct i915_gem_context *ctx[I915_MAX_CONTEXTS]; /* 0 = the default */
 	struct i915_vm *vm[I915_MAX_VMS]; /* ids 1.. */
 	spinlock_t lock;
+	/* which video engine the next I915_EXEC_BSD submission that names
+	 * neither ring goes to, on a part with two */
+	uint32_t bsd_next;
 };
 
 /* i915_gem.c */
@@ -219,6 +275,12 @@ void i915_gem_object_free(struct drm_gem_object *o);
 struct i915_gem_context *i915_file_context(struct drm_file *fp, uint32_t id);
 /* Wait for whatever last wrote (and, if `write', read) the object. */
 int i915_gem_object_wait(struct drm_gem_object *o, int write, uint64_t timeout_ns);
+/* The unsignalled fences recorded on an object, referenced, appended to
+ * `out': the writer's, and every reader's when `write' (the caller means
+ * to write it).  Fences of `skip_context' are left out (an engine's own
+ * work is ordered behind its own); 0 skips none. */
+void i915_gem_object_fences(struct drm_gem_object *o, int write, uint64_t skip_context,
+			    struct drm_fence **out, unsigned *n);
 /* i915_gem_execbuf.c */
 long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 			  void *kb, int wr);

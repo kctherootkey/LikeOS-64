@@ -20,6 +20,7 @@ mkdir -p "$TMP"
 	sed -n '/^void i915_vma_list_attach/,/^}$/p' kernel/dev/gpu/i915/i915_vma.c
 	sed -n '/^int i915_vma_list_detach/,/^}$/p' kernel/dev/gpu/i915/i915_vma.c
 	sed -n '/^unsigned i915_vma_list_supersede/,/^}$/p' kernel/dev/gpu/i915/i915_vma.c
+	sed -n '/^uint64_t i915_vma_list_find_gap/,/^}$/p' kernel/dev/gpu/i915/i915_vma.c
 	cat host/test-vma.c
 } > "$TMP/test.c"
 cc -std=gnu11 -Wall -Wextra -O1 -o "$TMP/test" "$TMP/test.c"

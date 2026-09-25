@@ -31,6 +31,7 @@
 #include <kernel/ke/futex.h>
 #include <kernel/net/net.h>
 #include <kernel/mm/slab.h>
+#include <kernel/mm/sysv_sem.h>
 #include <kernel/dev/rand/random.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/dev/usb/usb_msd.h>
@@ -795,6 +796,7 @@ static void dead_thread_reap(void)
 			if (dead->fds_pending_close) {
 				dead->fds_pending_close = false;
 				task_close_open_files(dead);
+				sysv_sem_exit(dead);
 			}
 		}
 		sched_remove_task(dead);
@@ -4862,8 +4864,12 @@ void sched_mark_task_exited(task_t *task, int status)
 	 * the filesystem-level locks; releasing here is idempotent.) */
 	{
 		task_t *ldr = task->group_leader;
-		if (!ldr || ldr->nr_threads == 0)
+		if (!ldr || ldr->nr_threads == 0) {
 			frlock_release_for_task((uint32_t)task->tgid);
+			/* the semaphore adjustments the process asked to have
+			 * undone: now, before its parent can see it gone */
+			sysv_sem_exit(task);
+		}
 	}
 
 	// CRITICAL: Do NOT release mm_struct here!  The PML4 owned by the

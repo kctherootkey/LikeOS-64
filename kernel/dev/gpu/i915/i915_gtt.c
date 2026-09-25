@@ -458,6 +458,47 @@ int i915_ggtt_bind_obj(struct i915_device *i915, struct drm_gem_object *o,
 	return 0;
 }
 
+/* A binding the aperture can reach: bottom-up from the first page the map
+ * hands out, below the aperture's size, uncached (the processor reaches
+ * these pages through the aperture, the engines by their own means). */
+int i915_ggtt_bind_obj_mappable(struct i915_device *i915, struct drm_gem_object *o,
+				uint32_t *ggtt_offset)
+{
+	if (!i915->gtt_virt || !o->pages || !o->npages || !i915->bar_aperture.size)
+		return -EINVAL;
+	if (ggtt_map_init(i915) != 0)
+		return -ENOMEM;
+	uint32_t limit = (uint32_t)(i915->bar_aperture.size / 4096);
+	if (limit > i915->ggtt_map_pages)
+		limit = i915->ggtt_map_pages;
+	if (o->npages > limit)
+		return -ENOSPC;
+	uint32_t start = i915->ggtt_map_first;
+	while (start + o->npages <= limit) {
+		uint32_t i = 0;
+		for (; i < o->npages; i++)
+			if (ggtt_map_used(i915, start + i))
+				break;
+		if (i == o->npages) {
+			for (uint32_t k = 0; k < o->npages; k++) {
+				ggtt_map_set(i915, start + k, 1);
+				ggtt_write_pte(i915, start + k,
+					       ggtt_pte_encode(i915, o->pages[k], 1));
+			}
+			ggtt_flush(i915);
+			*ggtt_offset = start * 4096;
+			return 0;
+		}
+		start += i + 1;
+	}
+	static int said;
+	if (said < 4) {
+		said++;
+		kprintf("[drm] i915: no room behind the aperture for %u pages\n", o->npages);
+	}
+	return -ENOSPC;
+}
+
 void i915_ggtt_rewrite_all(struct i915_device *i915)
 {
 	struct drm_device *dev = &i915->drm;

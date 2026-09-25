@@ -109,7 +109,7 @@ chmod 4755 "$DEST/usr/bin/Xorg"
 # Listed by name rather than copied wholesale, because the sysroot's bin/ also
 # holds build tooling (ucs2any, bdftruncate) and host-side diagnostics.
 for b in startx xinit xauth xsetroot xterm uxterm resize ctwm \
-	 xset xrandr xclock xload xcalc xnedit xnc twm \
+	 xset xrandr xvinfo xclock xload xcalc xnedit xnc twm \
 	 modetest vbltest proptest; do
 	[ -f "$SYSROOT/usr/bin/$b" ] && cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 done

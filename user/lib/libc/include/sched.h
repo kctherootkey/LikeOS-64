@@ -44,11 +44,9 @@ extern "C" {
 #define CLONE_NEWIPC         0x08000000
 
 // CPU set for affinity (supports up to 64 CPUs)
-#define CPU_SETSIZE 64
-
-typedef struct {
-    unsigned long bits[CPU_SETSIZE / (8 * sizeof(unsigned long))];
-} cpu_set_t;
+/* CPU_SETSIZE and cpu_set_t are in <bits/sched_param.h>: the thread
+ * attribute type embeds a set, and that type is visible from
+ * <sys/types.h> too. */
 
 // CPU set macros
 #define CPU_ZERO(set)       do { (set)->bits[0] = 0; } while(0)
@@ -69,9 +67,9 @@ static __inline int __cpu_count(const cpu_set_t* set) {
 #define CPU_COUNT(set)      __cpu_count(set)
 
 // Scheduling parameters
-struct sched_param {
-    int sched_priority;
-};
+/* struct sched_param lives in <bits/sched_param.h>: the thread attribute
+ * type embeds it, and that type is visible from <sys/types.h> too. */
+#include <bits/sched_param.h>
 
 // Basic scheduling
 int sched_yield(void);

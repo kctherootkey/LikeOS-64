@@ -13,6 +13,15 @@ extern "C" {
 #include <stdint.h>
 #include <sys/types.h>
 
+/* The whence values of lseek(2).  POSIX has <unistd.h> and <fcntl.h>
+ * define them as well as <stdio.h>; software that seeks a descriptor
+ * without ever touching stdio counts on it. */
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2

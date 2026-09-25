@@ -26,25 +26,74 @@ extern int _rtld_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *),
 			      void *data);
 extern int _rtld_dladdr(const void *addr, const char **fname, void **fbase,
 			const char **sname, void **saddr);
+extern void _rtld_lock(void);
+extern void _rtld_unlock(void);
+
+/* dlerror() is per thread, as in every other implementation: the message
+ * describes THIS thread's last dlopen/dlsym/dlclose.  The loader keeps one
+ * process-wide buffer that every call clears on entry, so the wrappers below
+ * hold the loader lock around the call and the fetch of its outcome, and
+ * keep the result here.  Without this a thread whose dlsym had just failed
+ * could see dlerror() return NULL because another thread resolved a symbol
+ * in between -- and GLib's g_module_symbol() reads "NULL symbol, no error"
+ * as success, which is how GStreamer's start-up came to call a null
+ * function pointer in the web process. */
+#define DL_ERROR_MAX 256
+static __thread char dl_error_buf[DL_ERROR_MAX];
+static __thread int dl_error_set;
+
+static void dl_capture_error(void)
+{
+	const char *m = _rtld_dlerror();
+	size_t i = 0;
+
+	if (!m) {
+		dl_error_set = 0;
+		return;
+	}
+	while (m[i] && i < DL_ERROR_MAX - 1) {
+		dl_error_buf[i] = m[i];
+		i++;
+	}
+	dl_error_buf[i] = '\0';
+	dl_error_set = 1;
+}
 
 void *dlopen(const char *filename, int flags)
 {
-	return _rtld_dlopen(filename, flags);
+	_rtld_lock();
+	void *r = _rtld_dlopen(filename, flags);
+	dl_capture_error();
+	_rtld_unlock();
+	return r;
 }
 
 void *dlsym(void *handle, const char *symbol)
 {
-	return _rtld_dlsym(handle, symbol);
+	_rtld_lock();
+	void *r = _rtld_dlsym(handle, symbol);
+	dl_capture_error();
+	_rtld_unlock();
+	return r;
 }
 
 int dlclose(void *handle)
 {
-	return _rtld_dlclose(handle);
+	_rtld_lock();
+	int r = _rtld_dlclose(handle);
+	dl_capture_error();
+	_rtld_unlock();
+	return r;
 }
 
+/* This thread's last message, once: the next call answers NULL, as the
+ * interface specifies. */
 char *dlerror(void)
 {
-	return _rtld_dlerror();
+	if (!dl_error_set)
+		return NULL;
+	dl_error_set = 0;
+	return dl_error_buf;
 }
 
 int dladdr(const void *addr, Dl_info *info)

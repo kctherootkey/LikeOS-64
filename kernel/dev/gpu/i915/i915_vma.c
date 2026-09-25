@@ -67,6 +67,35 @@ unsigned i915_vma_list_supersede(struct i915_vma **head, uint64_t addr,
 	return n;
 }
 
+/* The first gap of `npages' pages, aligned to `align' bytes, at or after
+ * `from' and wholly below `limit', that no binding on the list overlaps;
+ * 0 when there is none.  Next fit: the search walks forward from `from'
+ * and hops over every binding it runs into, so the cost is the number of
+ * bindings in the way, not a sorted view of the whole list. */
+uint64_t i915_vma_list_find_gap(struct i915_vma *head, uint64_t from,
+				uint64_t limit, uint32_t npages, uint64_t align)
+{
+	uint64_t size = (uint64_t)npages * 4096;
+	uint64_t cand = (from + align - 1) & ~(align - 1);
+
+	if (!size || !align || (align & (align - 1)))
+		return 0;
+	for (;;) {
+		uint64_t bump = 0;
+
+		if (cand + size < cand || cand + size > limit)
+			return 0;
+		for (struct i915_vma *o = head; o; o = o->vm_next) {
+			uint64_t oend = o->addr + (uint64_t)o->npages * 4096;
+			if (o->addr < cand + size && cand < oend && oend > bump)
+				bump = oend;
+		}
+		if (!bump)
+			return cand;
+		cand = (bump + align - 1) & ~(align - 1);
+	}
+}
+
 /* ---- with the address space's lock ------------------------------------------ */
 
 /* `v' takes [addr, addr + npages pages) in `vm': whatever held any of

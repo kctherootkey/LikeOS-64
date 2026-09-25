@@ -154,8 +154,32 @@ int sched_rr_get_interval(pid_t pid, struct timespec *tp)
 #define FUTEX_WAKE 1
 #define FUTEX_PRIVATE_FLAG 128
 
-// SYS_FUTEX - fast userspace mutex operations
+/* SYS_FUTEX - fast userspace mutex operations.
+ *
+ * The libc's own locks -- mutexes, condition variables, rwlocks,
+ * semaphores, once controls, malloc's arena lock -- live in memory that
+ * belongs to one process, so they take the private form: the kernel keys
+ * the word by the process and the address and never has to look at the
+ * mapping.  A word that another process can see must use the shared form
+ * below, or the kernel's page rule cannot pair the waiter with its waker. */
 int futex_wait(volatile int *uaddr, int val, const struct timespec *timeout)
+{
+	long ret = syscall4(SYS_FUTEX, (long)uaddr,
+			    FUTEX_WAIT | FUTEX_PRIVATE_FLAG, val,
+			    (long)timeout);
+	if (ret < 0) {
+		errno = -ret;
+		return -1;
+	}
+	return 0;
+}
+
+/* The shared form: the word is keyed by the memory it lives in when that
+ * memory is shared with another process.  pthread_join sleeps this way on
+ * the thread's tid word, because the kernel's wake of that word at thread
+ * exit is a shared one, as it is in the reference. */
+int futex_wait_shared(volatile int *uaddr, int val,
+		      const struct timespec *timeout)
 {
 	long ret = syscall4(SYS_FUTEX, (long)uaddr, FUTEX_WAIT, val,
 			    (long)timeout);
@@ -247,7 +271,8 @@ int __futex_wait_until(volatile int *uaddr, int val,
 
 int futex_wake(volatile int *uaddr, int count)
 {
-	long ret = syscall3(SYS_FUTEX, (long)uaddr, FUTEX_WAKE, count);
+	long ret = syscall3(SYS_FUTEX, (long)uaddr,
+			    FUTEX_WAKE | FUTEX_PRIVATE_FLAG, count);
 	if (ret < 0) {
 		errno = -ret;
 		return -1;

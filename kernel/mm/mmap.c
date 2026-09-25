@@ -315,8 +315,14 @@ int64_t sys_brk(uint64_t new_brk)
 }
 
 // SYS_MMAP - map memory
-static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
-			       uint64_t flags, uint64_t fd, uint64_t offset)
+/* `given' is a backing file named by the KERNEL rather than by a
+ * descriptor: a driver mapping one of its own objects into the calling
+ * process from an ioctl (the graphics driver's legacy object-mapping
+ * call returns an address rather than an offset).  With `given' set, `fd'
+ * is ignored and the record carries no descriptor number. */
+static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
+			   uint64_t flags, uint64_t fd, uint64_t offset,
+			   vfs_file_t *given)
 {
 	/* One exit, so the backing file's hold is released however this
 	 * answers.  Anonymous mappings leave it NULL and release nothing. */
@@ -485,12 +491,19 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		page_flags |= PAGE_NO_EXECUTE;
 	}
 
-	bool is_anonymous = (flags & MAP_ANONYMOUS) || (int64_t)fd == -1;
+	bool is_anonymous = !given &&
+			    ((flags & MAP_ANONYMOUS) || (int64_t)fd == -1);
 
 	/* Resolve and validate the backing file up front (also needed for the
 	 * lazy path).  Only real VFS files can back a mapping — socket/pipe/
 	 * epoll fd markers and stdio placeholders cannot. */
-	if (!is_anonymous) {
+	if (given) {
+		/* Held for the rest of the call like a looked-up one; fdput
+		 * releases the hold either way. */
+		vfs_incref(given);
+		backing = given;
+		fd = (uint64_t)-1;
+	} else if (!is_anonymous) {
 		/* Held for the rest of the call.  The region records built
 		 * below take their own reference, but between this lookup and
 		 * that point the descriptor can be closed by a sibling thread
@@ -666,11 +679,37 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			dm.prot = prot;
 			dm.flags = flags;
 			rc = dops->mmap(backing, &dm);
-			if (rc < 0 || !dm.page_phys) {
+			/* a lazy mapping names its pages at fault time instead */
+			if (rc < 0 || (!dm.page_phys && !(dm.lazy && dm.fault))) {
 				ret = rc < 0 ? rc : -ENODEV;
 				goto out;
 			}
 			uint64_t dflags = page_flags | PAGE_DEVICE | dm.pte_extra;
+			/* A lazy device mapping: entries are made at first
+			 * touch by the demand-fault path, which asks the driver
+			 * for each page; the record carries what it needs. */
+			if (dm.lazy && dm.fault) {
+				vfs_incref(backing);
+				region->start = vaddr;
+				region->length = length;
+				region->prot = prot;
+				region->flags = flags | MAP_SHARED;
+				region->fd = (int)fd;
+				region->offset = offset;
+				region->lazy = true;
+				region->file = backing;
+				region->device = true;
+				region->device_phys = 0;
+				region->dev_obj = dm.obj;
+				region->dev_get = dm.get;
+				region->dev_put = dm.put;
+				region->dev_dirty = NULL;
+				region->dev_fault = dm.fault;
+				region->dev_pte_extra = dm.pte_extra;
+				region->in_use = true;
+				ret = (int64_t)vaddr;
+				goto out;
+			}
 			/* A tracked object's new entries are born with the
 			 * write bit withheld, so the first write to each page
 			 * faults and is recorded; see mm_dirty_ops. */
@@ -710,6 +749,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			region->dev_get = dm.get;
 			region->dev_put = dm.put;
 			region->dev_dirty = dm.dirty_ops;
+			region->dev_fault = NULL;
+			region->dev_pte_extra = dm.pte_extra;
 			region->in_use = true;
 			/* The driver handed over its own reference above, so
 			 * this record takes no dev_get -- but it is still a
@@ -833,7 +874,7 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	int64_t ret;
 
 	RUN_WRITE_LOCKED_RET(
-		ret, sys_mmap_locked(addr, length, prot, flags, fd, offset));
+		ret, mmap_locked(addr, length, prot, flags, fd, offset, NULL));
 
 	/* MAP_POPULATE: touch every page now.  Done after the address-space
 	 * lock is dropped because the fault handlers take it for reading
@@ -842,6 +883,22 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	if (ret >= 0 && (flags & MAP_POPULATE))
 		mm_prefault_user_range((uint64_t)ret, PAGE_ALIGN(length),
 				       (prot & PROT_WRITE) != 0);
+	return ret;
+}
+
+/* A mapping of `file' made on the caller's behalf from inside the kernel
+ * (a driver ioctl that answers with an address): the same as mmap(2) of
+ * that file with no address hint, except that no descriptor is named.
+ * Returns the address or a negative errno. */
+int64_t mm_mmap_file(vfs_file_t *file, uint64_t length, uint64_t prot,
+		     uint64_t flags, uint64_t offset)
+{
+	int64_t ret;
+
+	if (!file)
+		return -EBADF;
+	RUN_WRITE_LOCKED_RET(ret, mmap_locked(0, length, prot, flags,
+					      (uint64_t)-1, offset, file));
 	return ret;
 }
 

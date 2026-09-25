@@ -390,6 +390,20 @@
 # VP8/VP9 decoders through gst-libav.  Loaded by GStreamer at run time: none
 # of these needs WebKit rebuilt.
 -         gst-plugins-good   1.24.13  https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-%VERSION%.tar.xz
+# Hardware video decoding on Intel graphics: the video acceleration
+# interface (libva), the driver for Gen4 to Gen9.5 parts (intel-vaapi-driver,
+# installed as /usr/lib/dri/i965_drv_video.so on the older libdrm buffer
+# manager), and vainfo to ask what the driver offers.  gst-plugins-bad's va
+# plugin below is built against libva, so these come first.
+-         libva              2.22.0   https://github.com/intel/libva/releases/download/%VERSION%/libva-%VERSION%.tar.bz2
+-         intel-vaapi-driver 2.4.1    https://github.com/intel/intel-vaapi-driver/releases/download/%VERSION%/intel-vaapi-driver-%VERSION%.tar.bz2
+# The driver for Gen8 and newer parts (intel-media-driver, installed as
+# /usr/lib/dri/iHD_drv_video.so, which libva prefers over i965 where both
+# exist), on its graphics memory management library.  Both are GitHub tag
+# archives: they unpack to <project>-<tag>/ and unpack.sh renames them.
+-         gmmlib             22.5.2   https://github.com/intel/gmmlib/archive/refs/tags/intel-gmmlib-%VERSION%.tar.gz
+-         intel-media-driver 24.3.4   https://github.com/intel/media-driver/archive/refs/tags/intel-media-%VERSION%.tar.gz
+-         libva-utils        2.22.0   https://github.com/intel/libva-utils/releases/download/%VERSION%/libva-utils-%VERSION%.tar.bz2
 -         gst-plugins-bad    1.24.13  https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-%VERSION%.tar.xz
 -         ffmpeg             7.1.1    https://ffmpeg.org/releases/ffmpeg-%VERSION%.tar.xz
 -         gst-libav          1.24.13  https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-%VERSION%.tar.xz

@@ -1,0 +1,42 @@
+.\" vainfo's manual page, from the Debian packaging of libva-utils (the
+.\" program publishes none of its own), with the options of the 2.22 line.
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH VAINFO "1" "September 2026" "vainfo" "User Commands"
+.SH NAME
+vainfo \- display information from the VA-API driver
+.SH SYNOPSIS
+.B vainfo
+[\fI\-\-display\fR \fIdrm\fR|\fIx11\fR]
+[\fI\-\-device\fR \fIpath\fR]
+[\fI\-a\fR]
+.SH DESCRIPTION
+This program displays information about the VA-API (video acceleration)
+driver installed in the system: the library version, the driver it loaded
+and every profile and entrypoint (decode, encode, video processing) the
+driver offers for the graphics device.
+.SH OPTIONS
+.TP
+\fB\-\-display\fR \fIdrm\fR|\fIx11\fR
+The back end to open the device through.  \fIdrm\fR opens the render node
+directly and needs no X server; \fIx11\fR asks the running X server for
+the device.  Without the option the X11 back end is tried when DISPLAY is
+set, the DRM one otherwise.
+.TP
+\fB\-\-device\fR \fIpath\fR
+The render node for the DRM back end, /dev/dri/renderD128 by default.
+.TP
+\fB\-a\fR, \fB\-\-all\fR
+Print every attribute of every configuration as well.
+.SH ENVIRONMENT
+.TP
+.B LIBVA_DRIVER_NAME
+The driver to load in place of the one chosen from the graphics device's
+kernel driver (for Intel graphics: iHD, then i965).
+.TP
+.B LIBVA_DRIVERS_PATH
+Where the drivers are looked for, /usr/lib/dri by default.
+.SH SEE ALSO
+.BR ffmpeg (1),
+.BR gst-inspect-1.0 (1),
+.BR drminfo (1)

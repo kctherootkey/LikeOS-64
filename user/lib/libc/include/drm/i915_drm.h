@@ -269,6 +269,9 @@ typedef struct drm_i915_vblank_swap {
 #define I915_PARAM_HAS_GEN7_SOL_RESET 16
 #define I915_PARAM_HAS_LLC 17
 #define I915_PARAM_HAS_ALIASING_PPGTT 18
+#define I915_GEM_PPGTT_NONE 0
+#define I915_GEM_PPGTT_ALIASING 1
+#define I915_GEM_PPGTT_FULL 2
 #define I915_PARAM_HAS_WAIT_TIMEOUT 19
 #define I915_PARAM_HAS_SEMAPHORES 20
 #define I915_PARAM_HAS_PRIME_VMAP_FLUSH 21
@@ -313,9 +316,10 @@ typedef struct drm_i915_vblank_swap {
 #define I915_PARAM_HAS_EXEC_TIMELINE_FENCES 55
 #define I915_PARAM_PERF_REVISION 54
 #define I915_PARAM_HAS_USERPTR_PROBE 56
+/* the frequency the observation-architecture timestamps tick at */
+#define I915_PARAM_OA_TIMESTAMP_FREQUENCY 57
 #define I915_PARAM_PXP_STATUS 58
 #define I915_PARAM_HAS_CONTEXT_FREQ_HINT 59
-/* 57 was reserved and never used */
 
 struct drm_i915_getparam {
 	__s32 param;
@@ -720,20 +724,33 @@ struct drm_i915_gem_context_param {
 	__u64 value;
 };
 
-/* SSEU: which slices/subslices/EUs a context's render engine may use. */
-struct drm_i915_gem_context_param_sseu {
-	struct i915_engine_class_instance {
-		__u16 engine_class;
-#define I915_ENGINE_CLASS_RENDER 0
-#define I915_ENGINE_CLASS_COPY 1
-#define I915_ENGINE_CLASS_VIDEO 2
-#define I915_ENGINE_CLASS_VIDEO_ENHANCE 3
-#define I915_ENGINE_CLASS_COMPUTE 4
-#define I915_ENGINE_CLASS_INVALID -1
-		__u16 engine_instance;
+/* Engines are named by class and instance. */
+enum drm_i915_gem_engine_class {
+	I915_ENGINE_CLASS_RENDER = 0,
+	I915_ENGINE_CLASS_COPY = 1,
+	I915_ENGINE_CLASS_VIDEO = 2,
+	I915_ENGINE_CLASS_VIDEO_ENHANCE = 3,
+	I915_ENGINE_CLASS_COMPUTE = 4,
+	I915_ENGINE_CLASS_INVALID = -1
+};
+
+struct i915_engine_class_instance {
+	__u16 engine_class;
+	__u16 engine_instance;
 #define I915_ENGINE_CLASS_INVALID_NONE -1
 #define I915_ENGINE_CLASS_INVALID_VIRTUAL -2
-	} engine;
+};
+
+/* The cache-control table entries every generation from Gen9 has. */
+enum i915_mocs_table_index {
+	I915_MOCS_UNCACHED,
+	I915_MOCS_PTE,
+	I915_MOCS_CACHED,
+};
+
+/* SSEU: which slices/subslices/EUs a context's render engine may use. */
+struct drm_i915_gem_context_param_sseu {
+	struct i915_engine_class_instance engine;
 	__u32 flags;
 #define I915_CONTEXT_SSEU_FLAG_ENGINE_INDEX (1u << 0)
 	__u64 slice_mask;
@@ -832,7 +849,8 @@ struct drm_i915_gem_context_create_ext_setparam {
 	struct i915_user_extension base;
 	struct drm_i915_gem_context_param param;
 };
-/* 1 was CLONE, withdrawn */
+/* CLONE was withdrawn; the number is never reused */
+#define I915_CONTEXT_CREATE_EXT_CLONE 1
 
 struct drm_i915_gem_context_destroy {
 	__u32 ctx_id;

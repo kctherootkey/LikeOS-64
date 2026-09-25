@@ -11,6 +11,14 @@ extern "C" {
 
 #include <sys/types.h>  /* mode_t, off_t */
 
+/* The whence values of lseek(2) and of struct flock's l_whence (POSIX
+ * puts them in this header too). */
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+
 // File open flags
 #define O_RDONLY    0x0000
 #define O_WRONLY    0x0001

@@ -66,7 +66,9 @@ long i915_getparam(struct i915_device *i915, void *kb)
 	case I915_PARAM_HAS_SCHEDULER:
 		value = I915_SCHEDULER_CAP_ENABLED | I915_SCHEDULER_CAP_PRIORITY;
 		break;
-	case I915_PARAM_HUC_STATUS: value = 0; break;
+	/* the media firmware: loaded and authenticated, or not (a part on
+	 * which the driver does not load it answers 0 like one without) */
+	case I915_PARAM_HUC_STATUS: value = i915->guc.huc_authenticated ? 1 : 0; break;
 	case I915_PARAM_HAS_EXEC_ASYNC: value = 1; break;
 	case I915_PARAM_HAS_EXEC_FENCE: value = 1; break;
 	case I915_PARAM_HAS_EXEC_CAPTURE: value = 0; break;
@@ -76,6 +78,9 @@ long i915_getparam(struct i915_device *i915, void *kb)
 	case I915_PARAM_HAS_EXEC_FENCE_ARRAY: value = 1; break;
 	case I915_PARAM_HAS_CONTEXT_ISOLATION: value = 1; break; /* render */
 	case I915_PARAM_CS_TIMESTAMP_FREQUENCY: value = (int)i915->cs_timestamp_hz; break;
+	/* the observation timestamps tick at the command streamer's rate on
+	 * every part this driver runs */
+	case I915_PARAM_OA_TIMESTAMP_FREQUENCY: value = (int)i915->cs_timestamp_hz; break;
 	case I915_PARAM_MMAP_GTT_COHERENT: value = 1; break;
 	case I915_PARAM_HAS_EXEC_SUBMIT_FENCE: value = 0; break;
 	case I915_PARAM_HAS_EXEC_TIMELINE_FENCES: value = 1; break;
@@ -177,9 +182,6 @@ static long ctx_set_engines(struct i915_device *i915, struct i915_gem_context *c
 	uint8_t buf[8 + 16 * 4];
 	if (copy_user_bounded(buf, p->value, p->size))
 		return -EFAULT;
-	uint64_t ext = *(uint64_t *)buf;
-	if (ext)
-		return -EINVAL; /* load balancing / bonding: not offered */
 	struct i915_engine *map[16];
 	for (uint32_t i = 0; i < n; i++) {
 		int16_t cls = (int16_t)(buf[8 + i * 4] | (buf[9 + i * 4] << 8));
@@ -191,6 +193,57 @@ static long ctx_set_engines(struct i915_device *i915, struct i915_gem_context *c
 		map[i] = i915_engine_by_class(i915, cls, inst);
 		if (!map[i])
 			return -ENOENT;
+	}
+	/* The extensions.  A balanced engine stands in an empty slot for a
+	 * set of siblings of one class; the reference spreads its work over
+	 * them, this driver runs it on the first sibling, which on a part
+	 * with one video engine is the same thing.  Bonds only say which
+	 * sibling a parallel submission pairs with, and parallel submission
+	 * is not offered, so a bond is accepted and means nothing. */
+	uint64_t ext = *(uint64_t *)buf;
+	for (int depth = 0; ext; depth++) {
+		if (depth >= 16)
+			return -EINVAL;
+		struct i915_user_extension ue;
+		if (copy_user_bounded(&ue, ext, sizeof(ue)))
+			return -EFAULT;
+		if (ue.flags)
+			return -EINVAL;
+		switch (ue.name) {
+		case I915_CONTEXT_ENGINES_EXT_LOAD_BALANCE: {
+			struct i915_context_engines_load_balance lb;
+			struct i915_engine_class_instance sib[16];
+			if (copy_user_bounded(&lb, ext, sizeof(lb)))
+				return -EFAULT;
+			if (lb.flags || lb.mbz64)
+				return -EINVAL;
+			if (lb.engine_index >= n || map[lb.engine_index])
+				return -EINVAL;
+			if (lb.num_siblings == 0 || lb.num_siblings > 16)
+				return -EINVAL;
+			if (copy_user_bounded(sib, ext + sizeof(lb),
+					      (uint64_t)lb.num_siblings * sizeof(sib[0])))
+				return -EFAULT;
+			struct i915_engine *first = NULL;
+			for (uint32_t k = 0; k < lb.num_siblings; k++) {
+				struct i915_engine *se = i915_engine_by_class(
+					i915, sib[k].engine_class, sib[k].engine_instance);
+				if (!se)
+					return -ENOENT;
+				if (first && se->class != first->class)
+					return -EINVAL;
+				if (!first)
+					first = se;
+			}
+			map[lb.engine_index] = first;
+			break;
+		}
+		case I915_CONTEXT_ENGINES_EXT_BOND:
+			break;
+		default:
+			return -EINVAL;
+		}
+		ext = ue.next_extension;
 	}
 	for (uint32_t i = 0; i < n; i++)
 		ctx->engines[i] = map[i];

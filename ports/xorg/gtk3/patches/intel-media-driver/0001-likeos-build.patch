@@ -1,0 +1,166 @@
+The media driver builds for LikeOS.
+
+The toolchain names this system by its own macro and undefines the other
+one, and the driver's build had been defining that other one itself; it no
+longer does.  Its bundled copies of the kernel interface headers get a
+branch for this system (the standard integer types and the ioctl encoding
+from the C library), the two guards that chose the POSIX flavour accept
+LikeOS, and the decoder's look at the framebuffer for a default display
+size reads the C library's framebuffer header.  A thread's identifier
+is a pointer here, so the number the driver makes of it goes through an
+integer of the pointer's size.  The bundled copy of the device
+enumeration code takes the paths of the first kind of system, since this
+kernel serves the same device and bus directories.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/cmrtlib/linux/hardware/drm_device.h
++++ b/cmrtlib/linux/hardware/drm_device.h
+@@ -257,7 +257,7 @@
+ 
+ static bool drmNodeIsDRM(int maj, int min)
+ {
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+     char path[64];
+     struct stat sbuf;
+ 
+@@ -698,7 +698,7 @@
+     drmPciDeviceInfoPtr device,
+     uint32_t flags)
+ {
+-//#ifdef __linux__
++//#if defined(__linux__) || defined(__LIKEOS__)
+     if (!(flags & DRM_DEVICE_GET_PCI_REVISION))
+         return parse_separate_sysfs_files(maj, min, device, true);
+ 
+@@ -937,7 +937,7 @@
+ 
+ static int drmParseSubsystemType(int maj, int min)
+ {
+-#ifdef __linux__
++#if defined(__linux__) || defined(__LIKEOS__)
+     char path[PATH_MAX + 1];
+     char link[PATH_MAX + 1] = "";
+     char *name;
+--- a/media_driver/cmake/linux/media_compile_flags_linux.cmake
++++ b/media_driver/cmake/linux/media_compile_flags_linux.cmake
+@@ -92,7 +92,6 @@
+ if(NOT ${PLATFORM} STREQUAL "android")
+     set(MEDIA_COMPILER_FLAGS_COMMON
+         ${MEDIA_COMPILER_FLAGS_COMMON}
+-        -D__linux__
+             -fno-tree-pre
+         -fPIC
+             -Wl,--no-as-needed
+--- a/media_driver/linux/common/codec/ddi/media_libva_decoder.cpp
++++ b/media_driver/linux/common/codec/ddi/media_libva_decoder.cpp
+@@ -47,7 +47,11 @@
+ #include <X11/Xutil.h>
+ #endif
+ 
++#ifdef __LIKEOS__
++#include <sys/fb.h>
++#else
+ #include <linux/fb.h>
++#endif
+ 
+ typedef MediaDdiFactory<DdiMediaDecode, DDI_DECODE_CONFIG_ATTR> DdiDecodeFactory;
+ 
+--- a/media_driver/linux/common/ddi/media_libva.cpp
++++ b/media_driver/linux/common/ddi/media_libva.cpp
+@@ -36,7 +36,11 @@
+ #include <X11/Xutil.h>
+ #endif
+ 
++#ifdef __LIKEOS__
++#include <sys/fb.h>
++#else
+ #include <linux/fb.h>
++#endif
+ 
+ #include "media_libva.h"
+ 
+--- a/media_softlet/cmake/linux/media_compile_flags_linux.cmake
++++ b/media_softlet/cmake/linux/media_compile_flags_linux.cmake
+@@ -86,7 +86,6 @@
+ if(NOT ${PLATFORM} STREQUAL "android")
+     set(MEDIA_COMPILER_FLAGS_COMMON
+         ${MEDIA_COMPILER_FLAGS_COMMON}
+-        -D__linux__
+             -fno-tree-pre
+         -fPIC
+             -Wl,--no-as-needed
+--- a/media_softlet/linux/common/codec/ddi/dec/ddi_decode_functions.cpp
++++ b/media_softlet/linux/common/codec/ddi/dec/ddi_decode_functions.cpp
+@@ -26,7 +26,11 @@
+ 
+ #include <sys/ioctl.h>
+ #include <fcntl.h>
++#ifdef __LIKEOS__
++#include <sys/fb.h>
++#else
+ #include <linux/fb.h>
++#endif
+ 
+ #include "ddi_decode_functions.h"
+ #include "media_libva_util_next.h"
+--- a/media_softlet/linux/common/os/i915/include/uapi/drm.h
++++ b/media_softlet/linux/common/os/i915/include/uapi/drm.h
+@@ -35,7 +35,23 @@
+ #ifndef _DRM_H_
+ #define _DRM_H_
+ 
+-#if   defined(__linux__)
++#if defined(__LIKEOS__)
++
++#include <stdint.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++typedef int8_t   __s8;
++typedef uint8_t  __u8;
++typedef int16_t  __s16;
++typedef uint16_t __u16;
++typedef int32_t  __s32;
++typedef uint32_t __u32;
++typedef int64_t  __s64;
++typedef uint64_t __u64;
++typedef size_t   __kernel_size_t;
++typedef unsigned int drm_handle_t;
++
++#elif defined(__linux__)
+ 
+ #include <linux/types.h>
+ #include <asm/ioctl.h>
+--- a/media_softlet/linux/common/os/i915/include/xf86drm.h
++++ b/media_softlet/linux/common/os/i915/include/xf86drm.h
+@@ -47,7 +47,7 @@
+ #define DRM_MAX_MINOR   16
+ #endif
+ 
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__LIKEOS__)
+ 
+ #define DRM_IOCTL_NR(n)        _IOC_NR(n)
+ #define DRM_IOC_VOID        _IOC_NONE
+--- a/media_softlet/linux/common/os/linux_skuwa_debug.h
++++ b/media_softlet/linux/common/os/linux_skuwa_debug.h
+@@ -35,7 +35,7 @@
+ #define DEVINFO_WARNING(msg) ALOGW(msg)
+ #define DEVINFO_ERROR(msg) ALOGE(msg)
+ 
+-#elif defined(__linux__) // Linux libskuwa
++#elif defined(__linux__) || defined(__LIKEOS__)
+ #include <stdio.h>
+ #include <assert.h>
+ 
+--- a/media_softlet/linux/common/os/osservice/mos_utilities_specific.cpp
++++ b/media_softlet/linux/common/os/osservice/mos_utilities_specific.cpp
+@@ -2144,7 +2144,7 @@
+ 
+ uint32_t MosUtilities::MosGetCurrentThreadId()
+ {
+-    return (uint32_t)pthread_self();
++    return (uint32_t)(uintptr_t)pthread_self();
+ }
+ 
+ MOS_STATUS MosUtilities::MosWaitThread(

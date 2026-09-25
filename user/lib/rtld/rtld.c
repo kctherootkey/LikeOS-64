@@ -556,6 +556,21 @@ static void rtld_unlock(void)
 	}
 }
 
+/* The libc wrappers hold the loader lock across one dl call AND the fetch of
+ * the error it left, so that another thread's dlopen/dlsym -- every one of
+ * which clears the process-wide buffer above on entry -- cannot wipe it in
+ * between.  Recursive, like the lock itself. */
+void _rtld_lock(void) __attribute__((visibility("default")));
+void _rtld_unlock(void) __attribute__((visibility("default")));
+void _rtld_lock(void)
+{
+	rtld_lock();
+}
+void _rtld_unlock(void)
+{
+	rtld_unlock();
+}
+
 static void rtld_set_error(const char *msg)
 {
 	size_t i = 0;

@@ -1,0 +1,39 @@
+A video frame shown straight from the decoder's memory stays referenced
+while the compositor shows it.
+
+With DMA-BUF import the compositor's layer buffer held only duplicated file
+descriptors of the frame's memory, not the GstBuffer.  The player drops its
+sample as soon as the next frame arrives, the buffer goes back to the
+decoder's pool, and the decoder fills that memory with a later frame while
+the compositor still draws from it -- frames out of their place in the
+timeline, worst on streams with B-frames, and constant when the compositor
+lags the player by a frame or two.  The layer buffer now holds the
+GstBuffer for its lifetime.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferVideo.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferVideo.h
+@@ -53,6 +53,13 @@
+ #endif
+ 
+     std::optional<GstMappedFrame> m_videoFrame;
++#if USE(GBM)
++    // A frame shown straight from the decoder's memory stays the decoder's
++    // for as long as it is shown: the buffer is held here, so its memory
++    // does not go back to the decoder's pool to be filled with a later
++    // frame while the compositor still draws from it.
++    GRefPtr<GstBuffer> m_gstBuffer;
++#endif
+     std::optional<GstVideoDecoderPlatform> m_videoDecoderPlatform;
+     std::unique_ptr<CoordinatedPlatformLayerBuffer> m_buffer;
+ };
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferVideo.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferVideo.cpp
+@@ -158,6 +158,7 @@
+     if (GST_VIDEO_INFO_HAS_ALPHA(videoInfo))
+         m_flags.add({ TextureMapperFlags::ShouldBlend, TextureMapperFlags::ShouldPremultiply });
+ 
++    m_gstBuffer = buffer;
+     static GQuark dmabufQuark = g_quark_from_static_string("wk-dmabuf-buffer");
+     auto* memory = gst_buffer_peek_memory(buffer, 0);
+     RefPtr<DMABufBuffer> dmabuf = static_cast<DMABufBuffer*>(gst_mini_object_get_qdata(GST_MINI_OBJECT_CAST(memory), dmabufQuark));

@@ -140,6 +140,12 @@ host_tools() {
 pkg_opts() {
 	case "$1" in
 	xorgproto) echo "--disable-specs" ;;
+	# The older Intel VA-API driver (Gen4 to Gen9.5): its DRI2 output
+	# path through X, no Wayland, no tests.
+	intel-vaapi-driver) echo "--enable-x11 --disable-wayland --disable-tests --disable-hybrid-codec" ;;
+	# vainfo and the sample programs, on the DRM and X11 back ends.
+	libva-utils) echo "--enable-drm --enable-x11 --disable-wayland --disable-tests" ;;
+	xvinfo) echo "" ;;
 	xtrans) echo "--disable-docs" ;;
 	libXau | libXdmcp) echo "--disable-docs --without-xmlto --without-fop" ;;
 	libxcb) echo "--disable-docs --without-doxygen --enable-xinput --enable-xkb" ;;
@@ -628,6 +634,13 @@ pkg_env() {
 	common="gt_cv_locale_fake=yes"
 
 	case "$1" in
+	intel-vaapi-driver)
+		# Where the driver installs: configure asks libva's pkg-config
+		# file, which the port's pkg-config answers with the sysroot
+		# already prefixed, and `make install DESTDIR=' would then
+		# prefix it AGAIN.  The path on the image is what is wanted.
+		echo "$common LIBVA_DRIVERS_PATH=/usr/lib/dri"
+		;;
 	startup-notification)
 		# "Does realloc(NULL, n) behave as malloc(n)?"  Answered by
 		# RUNNING a test program, which a cross build cannot do, and
@@ -703,10 +716,11 @@ meson_opts() {
 	# fence files in /dev/shm.
 	libxshmfence) echo "--enable-futex --with-shared-memory-dir=/dev/shm" ;;
 	xkeyboard-config) echo "-Dcompat-rules=true -Dxorg-rules-symlinks=true" ;;
-	# libdrm: only the driver this kernel has (vmwgfx); the test programs
-	# (modetest, vbltest, proptest) are installed as the display driver's
-	# diagnostics; no udev here.
-	libdrm) echo "-Dvmwgfx=enabled -Dintel=disabled -Dradeon=disabled \
+	# libdrm: the drivers this kernel has (vmwgfx, and the Intel buffer
+	# manager the older VA-API driver is written against); the test
+	# programs (modetest, vbltest, proptest) are installed as the display
+	# driver's diagnostics; no udev here.
+	libdrm) echo "-Dvmwgfx=enabled -Dintel=enabled -Dradeon=disabled \
 		      -Damdgpu=disabled -Dnouveau=disabled -Domap=disabled \
 		      -Dexynos=disabled -Dfreedreno=disabled -Dtegra=disabled \
 		      -Detnaviv=disabled -Dudev=false -Dvalgrind=disabled \
@@ -1082,6 +1096,15 @@ meson_opts() {
 		      -Ddoc=disabled -Dnls=disabled -Dorc=disabled \
 		      -Dqt5=disabled -Dqt6=disabled"
 		;;
+	# libva: the video acceleration interface.  The DRM back end is what
+	# GStreamer and FFmpeg open (a render node, no display needed); the
+	# X11 back end is what vainfo and the older driver's DRI2 output
+	# path use.  Drivers are looked up in /usr/lib/dri next to Mesa's.
+	libva)
+		echo "-Dwith_x11=yes -Dwith_glx=no -Dwith_wayland=no \
+		      -Dwith_win32=no -Ddriverdir=/usr/lib/dri \
+		      -Denable_docs=false"
+		;;
 	gst-plugins-bad)
 		# Every plugin whose dependencies are in the sysroot.  Named:
 		#   videoparsers  h264parse, h265parse, vp9parse... -- WebKit's
@@ -1089,8 +1112,17 @@ meson_opts() {
 		#             H.264/H.265 only when a parser exists
 		#   debugutils    fakevideosink, which WebKit's player asks for
 		#   subenc        webvttenc, WebKit's subtitle handling
+		#   va            the VA-API decoders (vah264dec, vah265dec,
+		#             vavp8dec, vavp9dec, vaav1dec, vajpegdec) and the
+		#             post-processor, on libva -- hardware decoding on
+		#             Intel graphics.  The plugin's build only knows
+		#             one Unix by name; patch 0001 lets it recognise
+		#             this one.
+		#   kms           kmssink, video straight to a display manager
+		#             plane without X -- the test sink for the decoders
 		echo "-Dvideoparsers=enabled -Ddebugutils=enabled \
-		      -Dsubenc=enabled -Dexamples=disabled -Dtests=disabled \
+		      -Dsubenc=enabled -Dva=enabled -Dkms=enabled \
+		      -Dexamples=disabled -Dtests=disabled \
 		      -Ddoc=disabled -Dnls=disabled -Dorc=disabled \
 		      -Dintrospection=disabled"
 		;;
@@ -1104,6 +1136,31 @@ meson_opts() {
 # Per-package CMake options.
 cmake_opts() {
 	case "$1" in
+	gmmlib)
+		# Only the library: the test suite would have to run on the
+		# target.
+		echo "-DRUN_TEST_SUITE=OFF"
+		;;
+	intel-media-driver)
+		# The shaders (kernels) the codecs run on the execution units,
+		# including the ones under Intel's own licence, without which
+		# most codecs are missing.  Off: the C for Media runtime, the
+		# test suite (target-only), the driver's system configuration
+		# file, the newer kernel interface (the driver here is i915),
+		# and every part newer than Gen9 -- the parts this driver
+		# serves are Gen8 and Gen9 (Broadwell through Comet Lake); the
+		# rest is most of the driver's compile time.  The driver
+		# directory is libva's, /usr/lib/dri, as for the i965 driver.
+		echo "-DENABLE_KERNELS=ON -DENABLE_NONFREE_KERNELS=ON \
+		      -DBUILD_CMRTLIB=OFF -DMEDIA_RUN_TEST_SUITE=OFF \
+		      -DINSTALL_DRIVER_SYSCONF=OFF \
+		      -DLIBVA_DRIVERS_PATH=/usr/lib/dri \
+		      -DENABLE_XE_KMD=OFF \
+		      -DGEN11=OFF -DGEN12=OFF -DMTL=OFF -DARL=OFF -DLNL=OFF \
+		      -DBMG=OFF -DXE_LPG=OFF -DXE2_HPG=OFF \
+		      -DXE_LPM_PLUS_SUPPORT=OFF -DXE2_HPM_SUPPORT=OFF \
+		      -DXE2_LPM_SUPPORT=OFF"
+		;;
 	libjpeg-turbo)
 		# The version-8 API and soname: that is what everything here
 		# links against (see packages.list).  The TurboJPEG wrapper is
@@ -1277,6 +1334,16 @@ build_subdirs() {
 # Anything a restricted build (see make_dirs) would otherwise leave behind.
 post_install() {
 	case "$1" in
+	libva-utils)
+		# vainfo publishes no manual page of its own; the port carries
+		# one (ports/xorg/gtk3/man/vainfo.1), installed into the
+		# sysroot's man1 so the repository's gtk3-manpages target
+		# renders it like the pages that came from a source tree.
+		if [ -f "$port/man/vainfo.1" ]; then
+			mkdir -p "$SYSROOT/usr/share/man/man1" || return 1
+			cp -f "$port/man/vainfo.1" "$SYSROOT/usr/share/man/man1/" || return 1
+		fi
+		;;
 	mesa)
 		# Mesa's libEGL/libGL are real now.  The marker tells
 		# import-egl-headers.sh to stop installing the stub libEGL the
@@ -1369,7 +1436,7 @@ is_meson() {
 # no longer builds several of its own subdirectories.
 prefers_meson() {
 	case "$1" in
-	gtk | harfbuzz | fribidi) return 0 ;;
+	gtk | harfbuzz | fribidi | libva) return 0 ;;
 	esac
 	return 1
 }
@@ -1377,6 +1444,17 @@ prefers_meson() {
 is_cmake() {
 	[ -f "$2/CMakeLists.txt" ] && [ ! -f "$2/meson.build" ] &&
 		[ ! -f "$2/configure" ] && [ ! -f "$2/autogen.sh" ]
+}
+
+# How many compilers a cmake package may run at once.  The default is one
+# per processor; a package whose translation units are large enough that
+# several of them together would exhaust the host's memory gets fewer.
+cmake_jobs() {
+	case "$1" in
+	gmmlib) echo 2 ;;
+	intel-media-driver) echo 2 ;;
+	*) nproc ;;
+	esac
 }
 
 # Packages whose build produces programs that packages ABOVE them have to RUN.
@@ -1629,6 +1707,10 @@ install_data() {
 keeps_generated_sources() {
 	case "$1" in
 	enchant) return 0 ;;
+	# The Intel VA-API driver ships its media kernels as assembled
+	# include files; its distclean deletes them, and the assembler that
+	# makes them is not here.
+	intel-vaapi-driver) return 0 ;;
 	esac
 	return 1
 }
@@ -1739,6 +1821,36 @@ relativise_sysroot_symlinks() {
 	done
 }
 
+# The sysroot's headers, before and after a package installs.
+#
+# Every port's build tracks its dependencies by mtime.  A package that
+# reinstalls its headers rewrites every one of them, changed or not, and
+# every object in every tree above it that includes one is stale from then
+# on: rebuilding libdrm for one option cost a two-hour WebKit rebuild for
+# nothing.  So the headers are copied aside before a package builds, and
+# afterwards every header whose bytes did not change gets its old mtime
+# back.  A header that really changed keeps the new one, as it must.
+headers_save() {
+	rm -rf "$SYSROOT/.headers-before"
+	[ -d "$SYSROOT/usr/include" ] || return 0
+	cp -a "$SYSROOT/usr/include" "$SYSROOT/.headers-before" 2>/dev/null || true
+}
+
+headers_restore_mtimes() {
+	[ -d "$SYSROOT/.headers-before" ] || return 0
+	kept=0
+	(cd "$SYSROOT/.headers-before" && find . -type f) | while read -r f; do
+		old="$SYSROOT/.headers-before/$f"
+		new="$SYSROOT/usr/include/$f"
+		[ -f "$new" ] || continue
+		[ "$new" -nt "$old" ] || continue
+		if cmp -s "$old" "$new"; then
+			touch -r "$old" "$new"
+		fi
+	done
+	rm -rf "$SYSROOT/.headers-before"
+}
+
 build_one() {
 	name=$1
 	dir=$2
@@ -1746,6 +1858,7 @@ build_one() {
 
 	printf '%-22s ' "$name"
 	relativise_sysroot_symlinks
+	headers_save
 
 	# meson install builds only what installation needs.  Running
 	# `meson compile` first would also build the test programs, which
@@ -1955,6 +2068,33 @@ build_one() {
 			DESTDIR="$SYSROOT" cmake --install .likeos-build &&
 			post_install "$name"
 		) >"$log" 2>&1
+	elif [ "$name" = intel-media-driver ]; then
+		# The largest C++ build here after WebKit, and configured and
+		# driven the same way: Ninja, a build directory that survives
+		# between runs so an interrupted build continues where it
+		# stopped (-f starts over), few compilers at once, one link at
+		# a time.
+		(
+			cd "$dir" || exit 1
+			[ "$force" = "1" ] && rm -rf .likeos-build
+			if [ ! -f .likeos-build/build.ninja ]; then
+				rm -rf .likeos-build
+				LIKEOS_TOOLCHAIN="$here/toolchain" \
+					PATH="$here/toolchain:$PATH" \
+					cmake -S . -B .likeos-build -G Ninja \
+					-DCMAKE_TOOLCHAIN_FILE="$here/toolchain/likeos-toolchain.cmake" \
+					-DCMAKE_INSTALL_PREFIX=/usr \
+					-DCMAKE_INSTALL_LIBDIR=lib \
+					-DCMAKE_BUILD_TYPE=Release \
+					-DCMAKE_JOB_POOLS="link=1" \
+					-DCMAKE_JOB_POOL_LINK=link \
+					$(cmake_opts "$name") || exit 1
+			fi
+			PATH="$here/toolchain:$PATH" \
+				cmake --build .likeos-build -j"$(cmake_jobs "$name")" &&
+				DESTDIR="$SYSROOT" cmake --install .likeos-build &&
+				post_install "$name"
+		) >"$log" 2>&1
 	elif is_cmake "$name" "$dir"; then
 		(
 			cd "$dir" || exit 1
@@ -1966,7 +2106,7 @@ build_one() {
 				-DCMAKE_INSTALL_PREFIX=/usr \
 				-DCMAKE_BUILD_TYPE=Release \
 				$(cmake_opts "$name") &&
-				cmake --build .likeos-build -j"$(nproc)" &&
+				cmake --build .likeos-build -j"$(cmake_jobs "$name")" &&
 				DESTDIR="$SYSROOT" cmake --install .likeos-build &&
 				post_install "$name"
 		) >"$log" 2>&1
@@ -2164,31 +2304,49 @@ build_one() {
 		# an arm of its own, the way sqlite's autosetup does.
 		#
 		# --disable-everything, then only what WebKit's video path
-		# asks for.  No programs, no network, no devices, no scaling
-		# or resampling libraries; libavfilter stays because gst-libav
-		# links it.  --target-os=none is configure's generic POSIX
-		# target; the compiler it is given is the port's own driver.
-		# nasm (a build-host tool) assembles the SIMD decoding loops,
-		# without which H.264 decodes several times slower.
+		# asks for, plus the ffmpeg and ffprobe programs with the
+		# little a command line needs to play a file through them:
+		# the MP4/Matroska/transport-stream demuxers, a handful of
+		# muxers, the scaler and resampler the programs link, and the
+		# filters that move frames between the processor and the
+		# graphics device.  Decoding can go to the graphics device
+		# through VA-API (the hwaccels), which is how hardware decode
+		# is checked from a shell: ffmpeg -hwaccel vaapi -i x.mp4 -f
+		# null -.  No network, no devices.  --target-os=none is
+		# configure's generic POSIX target; the compiler it is given
+		# is the port's own driver.  nasm (a build-host tool) assembles
+		# the SIMD decoding loops, without which H.264 decodes several
+		# times slower.  The two manual pages are written by the
+		# build host's pod2man from the tree's own texinfo.
 		(
 			cd "$dir" || exit 1
 			[ -f ffbuild/config.mak ] && make distclean >/dev/null 2>&1
 			PATH="$HOSTTOOLS/bin:$PATH"
 			export PATH
 			./configure --prefix=/usr --libdir=/usr/lib \
-				--shlibdir=/usr/lib \
+				--shlibdir=/usr/lib --mandir=/usr/share/man \
 				--enable-cross-compile --target-os=none --arch=x86_64 \
 				--cc="$here/toolchain/likeos-cc" \
 				--cxx="$here/toolchain/likeos-c++" \
 				--ld="$here/toolchain/likeos-cc" \
 				--pkg-config="$here/toolchain/likeos-pkg-config" \
 				--enable-shared --disable-static --enable-pic \
-				--disable-programs --disable-doc --disable-network \
+				--enable-ffmpeg --enable-ffprobe --disable-ffplay \
+				--enable-manpages --disable-htmlpages \
+				--disable-podpages --disable-txtpages \
+				--disable-network \
 				--disable-autodetect --disable-everything \
-				--disable-avdevice --disable-swscale \
-				--disable-swresample --disable-postproc \
-				--enable-decoder=h264,hevc,vp8,vp9,aac \
+				--disable-avdevice --enable-swscale \
+				--enable-swresample --disable-postproc \
+				--enable-vaapi --enable-libdrm \
+				--enable-hwaccel=h264_vaapi,hevc_vaapi,vp8_vaapi,vp9_vaapi \
+				--enable-decoder=h264,hevc,vp8,vp9,aac,rawvideo \
 				--enable-parser=h264,hevc,vp8,vp9,aac \
+				--enable-encoder=rawvideo,wrapped_avframe,pcm_s16le \
+				--enable-demuxer=mov,matroska,mpegts,rawvideo \
+				--enable-muxer=null,rawvideo,mp4,matroska \
+				--enable-protocol=file,pipe \
+				--enable-filter=scale,format,hwupload,hwdownload,hwmap,null,anull,aformat,copy \
 				--x86asmexe=nasm &&
 				make -j"$(nproc)" &&
 				make install DESTDIR="$SYSROOT" &&
@@ -2610,10 +2768,12 @@ LUAPC
 		rm -f "$SYSROOT"/usr/lib/*.la
 
 		relativise_sysroot_symlinks
+		headers_restore_mtimes
 		echo "ok"
 		: >"$stamps/$name"
 		return 0
 	fi
+	headers_restore_mtimes
 	echo "FAILED  (see .logs/$name.log)"
 	return 1
 }

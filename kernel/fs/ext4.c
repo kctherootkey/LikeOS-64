@@ -3075,15 +3075,52 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 	return (long)out_off;
 }
 
+/* The last close of an inode unlinked while open (IC_ORPHAN, see
+ * ext4_unlink_impl): now nothing can reach it any more, so its blocks and
+ * its number go back, exactly the sequence unlink runs for a file nobody
+ * had open.  Under the I/O lock like every other metadata change; a
+ * read-only mount leaves the orphan for fsck, which is what the reference
+ * does too. */
+static void ext4_orphan_reap(ext4_fs_t *fs, unsigned long ino)
+{
+	ext4_inode in;
+
+	if (!fs || ino == 0 || ext4_is_ro())
+		return;
+	ext4_io_lock();
+	if (ext4_read_inode_loc(fs, ino, &in, 0, 0) == ST_OK &&
+	    in.i_links_count == 0 && in.i_dtime == 0) {
+		pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
+		ext4_free_blocks_from(fs, ino, &in, 0);
+		in.i_dtime = (uint32_t)timer_get_epoch();
+		in.i_size_lo = 0;
+		in.i_size_high = 0;
+		ext4_di_clear(ino);
+		ext4_write_inode_struct(fs, ino, &in);
+		ext4_free_inode(fs, ino, 0);
+		icache_remove(EXT4_BID_ENC(ino, 0));
+		pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
+		ext4_inode_cache_flush();
+		ext4_flush_meta(fs);
+	}
+	ext4_io_unlock();
+}
+
 static int ext4_close_impl(vfs_file_t *f)
 {
 	if (!f)
 		return ST_INVALID;
 	ext4_file_t *ef = (ext4_file_t *)f->fs_private;
 	if (ef) {
+		ext4_fs_t *fs = ef->fs;
+		unsigned long ino = ef->ino;
+		int reap = 0;
 		if (ef->inode)
-			icache_unref((ic_inode_t *)ef->inode);
+			reap = icache_unref_flagged((ic_inode_t *)ef->inode,
+						    IC_ORPHAN);
 		kfree(ef);
+		if (reap)
+			ext4_orphan_reap(fs, ino);
 	}
 	return ST_OK;
 }
@@ -7058,7 +7095,19 @@ static int ext4_unlink_impl(const char *path)
 
 	if (cin.i_links_count > 0)
 		cin.i_links_count--;
-	if (cin.i_links_count == 0) {
+	if (cin.i_links_count == 0 &&
+	    icache_flag_if_referenced(EXT4_BID_ENC(child, 0), IC_ORPHAN)) {
+		/* Still open somewhere.  The name is gone, but the inode and
+		 * its blocks stay until the last close (ext4_orphan_reap):
+		 * freeing them now hands the number to the next mkdir or
+		 * creat, and the open handle's later writes then land in
+		 * THAT file -- seen as a fresh directory whose size fell
+		 * back to zero because a temp file's writer outlived its
+		 * unlink.  The reference keeps such inodes on its orphan
+		 * list for the same reason. */
+		cin.i_ctime = (uint32_t)timer_get_epoch();
+		ext4_write_inode_struct(fs, child, &cin);
+	} else if (cin.i_links_count == 0) {
 		/* Cache before blocks -- see ext4_truncate_impl().  An unlinked
 		 * file can still have dirty pages: a writer that closed without
 		 * fsync, or a reader still holding it open. */
@@ -7458,7 +7507,13 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 		ext4_dir_del(fs, np, nname, nnl, 0, 0);
 		if (din.i_links_count > 0)
 			din.i_links_count--;
-		if (din.i_links_count == 0) {
+		if (din.i_links_count == 0 &&
+		    icache_flag_if_referenced(EXT4_BID_ENC(dst, 0), IC_ORPHAN)) {
+			/* Open somewhere: kept until its last close, as in
+			 * ext4_unlink_impl(). */
+			din.i_ctime = (uint32_t)timer_get_epoch();
+			ext4_write_inode_struct(fs, dst, &din);
+		} else if (din.i_links_count == 0) {
 			/* Cache before blocks -- see ext4_truncate_impl().
 			 * The file being replaced is an ordinary one and may
 			 * well have dirty pages of its own. */

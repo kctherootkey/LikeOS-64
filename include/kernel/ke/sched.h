@@ -431,6 +431,11 @@ typedef struct mmap_region {
 	void *dev_obj;
 	void (*dev_get)(void *obj);
 	void (*dev_put)(void *obj);
+	/* A lazy device mapping: the page for an index is asked of the
+	 * driver at first touch (see device_mmap.fault); dev_pte_extra
+	 * carries the cache attribute its entries get. */
+	uint64_t (*dev_fault)(void *obj, uint64_t index);
+	uint64_t dev_pte_extra;
 	/* Dirty tracking for the mapping, when the driver asked for it: the
 	 * device holds a second copy of these pages and has to be told what
 	 * the processor wrote.  Carried on EVERY record describing the

@@ -253,11 +253,12 @@ for l in libgstreamer-1.0 libgstbase-1.0 libgstcontroller-1.0 libgstnet-1.0 \
 	libgstallocators-1.0 libgstapp-1.0 libgstaudio-1.0 libgstfft-1.0 \
 	libgstgl-1.0 libgstpbutils-1.0 libgstriff-1.0 libgstrtp-1.0 \
 	libgstrtsp-1.0 libgstsdp-1.0 libgsttag-1.0 libgstvideo-1.0 \
-	libgstcodecparsers-1.0; do
+	libgstcodecparsers-1.0 libgstcodecs-1.0 libgstva-1.0; do
 	stage_lib "$l"
 done
 # FFmpeg, whose decoders gst-libav's plugin wraps (H.264, H.265, VP8, VP9).
-for l in libavutil libavcodec libavformat libavfilter; do stage_lib "$l"; done
+# the scaler and resampler are what the ffmpeg/ffprobe programs link
+for l in libavutil libavcodec libavformat libavfilter libswscale libswresample; do stage_lib "$l"; done
 stage_lib libjavascriptcoregtk-4.1
 stage_lib libwebkit2gtk-4.1
 
@@ -321,9 +322,12 @@ done
 # The GLib and fontconfig command-line tools.  Small, and each answers a
 # question that is otherwise unanswerable on a running system: what settings a
 # schema holds, what a font name resolves to, what a URI scheme maps to.
+# vainfo asks the VA-API driver what it decodes; ffmpeg and ffprobe are the
+# command-line way to run a decode (ffmpeg -hwaccel vaapi -i x.mp4 -f null -)
+# and to read what a file holds.
 for b in gio gsettings gdbus gapplication fc-list fc-match fc-cache \
 	gst-launch-1.0 gst-inspect-1.0 gst-discoverer-1.0 gst-typefind-1.0 \
-	gst-device-monitor-1.0 gst-play-1.0; do
+	gst-device-monitor-1.0 gst-play-1.0 vainfo ffmpeg ffprobe; do
 	[ -f "$SYSROOT/usr/bin/$b" ] || continue
 	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 	staged=$((staged + 1))

@@ -99,9 +99,11 @@ uint32_t i915_fw_domains_for(struct i915_device *i915, uint32_t reg)
 		return I915_FW_MEDIA; /* VCS0 */
 	if (reg >= 0x14000 && reg < 0x1a000)
 		return I915_FW_GT;
-	if (info->gen < 11 && reg >= 0x1a000 && reg < 0x1c000)
-		return I915_FW_MEDIA; /* VECS0 */
-	if (reg >= 0x1c000 && reg < 0x22000)
+	if (info->gen < 11 && reg >= 0x1a000 && reg < 0x1ea00)
+		return I915_FW_MEDIA; /* VECS0, and VCS1 on the GT3 parts */
+	if (info->gen >= 11 && reg >= 0x1c000 && reg < 0x1ea00)
+		return I915_FW_GT;
+	if (reg >= 0x1ea00 && reg < 0x22000)
 		return I915_FW_GT;
 	if (reg >= 0x22000 && reg < 0x24000)
 		return I915_FW_GT; /* BCS0 */

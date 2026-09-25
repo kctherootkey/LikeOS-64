@@ -99,26 +99,67 @@ void i915_gem_object_free(struct drm_gem_object *o)
 		i915_vm_put(v->vm);
 		kfree(v);
 	}
+	i915_fence_object_free(&g_i915, o);
 	if (bo->bound)
 		i915_ggtt_unbind(&g_i915, bo->ggtt, (uint32_t)(o->npages * 4096));
-	if (bo->write_fence)
-		drm_fence_put(bo->write_fence);
-	if (bo->read_fence)
-		drm_fence_put(bo->read_fence);
+	{
+		/* out from under the lock first: a submission may be reading
+		 * them; dropped after, since dropping may free */
+		struct drm_fence *olds[1 + I915_ENGINE_CLASSES];
+		unsigned no = 0;
+		uint64_t fl;
+		spin_lock_irqsave(&g_i915.sync_lock, &fl);
+		if (bo->write_fence)
+			olds[no++] = bo->write_fence;
+		bo->write_fence = NULL;
+		for (int c = 0; c < I915_ENGINE_CLASSES; c++) {
+			if (bo->read_fence[c])
+				olds[no++] = bo->read_fence[c];
+			bo->read_fence[c] = NULL;
+		}
+		spin_unlock_irqrestore(&g_i915.sync_lock, fl);
+		for (unsigned i = 0; i < no; i++)
+			drm_fence_put(olds[i]);
+	}
 	kfree(bo);
 	o->priv = NULL;
 }
 
-int i915_gem_object_wait(struct drm_gem_object *o, int write, uint64_t timeout_ns)
+void i915_gem_object_fences(struct drm_gem_object *o, int write, uint64_t skip_context,
+			    struct drm_fence **out, unsigned *n)
 {
 	struct i915_bo *bo = o->priv;
-	int rc = 0;
+	struct i915_device *i915 = &g_i915;
+	uint64_t fl;
 	if (!bo)
-		return 0;
-	if (bo->write_fence && !bo->write_fence->signaled)
-		rc = drm_fence_wait_flags(bo->write_fence, timeout_ns, 1);
-	if (rc == 0 && write && bo->read_fence && !bo->read_fence->signaled)
-		rc = drm_fence_wait_flags(bo->read_fence, timeout_ns, 1);
+		return;
+	spin_lock_irqsave(&i915->sync_lock, &fl);
+	struct drm_fence *f = bo->write_fence;
+	if (f && !f->signaled && (!skip_context || f->context != skip_context)) {
+		drm_fence_get(f);
+		out[(*n)++] = f;
+	}
+	for (int c = 0; write && c < I915_ENGINE_CLASSES; c++) {
+		f = bo->read_fence[c];
+		if (f && !f->signaled && (!skip_context || f->context != skip_context)) {
+			drm_fence_get(f);
+			out[(*n)++] = f;
+		}
+	}
+	spin_unlock_irqrestore(&i915->sync_lock, fl);
+}
+
+int i915_gem_object_wait(struct drm_gem_object *o, int write, uint64_t timeout_ns)
+{
+	struct drm_fence *waits[1 + I915_ENGINE_CLASSES];
+	unsigned nw = 0;
+	int rc = 0;
+	i915_gem_object_fences(o, write, 0, waits, &nw);
+	for (unsigned i = 0; i < nw; i++) {
+		if (rc == 0)
+			rc = drm_fence_wait_flags(waits[i], timeout_ns, 1);
+		drm_fence_put(waits[i]);
+	}
 	if (rc == -ETIMEDOUT || rc == -ETIME) {
 		static int said;
 		task_t *cur = sched_current();
@@ -422,6 +463,10 @@ static long gem_mmap_offset(struct i915_device *i915, struct drm_file *fp,
 			(i915->info->flags & I915_INFO_HAS_LLC)) ? 2 : 1;
 		break;
 	case I915_MMAP_OFFSET_GTT:
+		/* through the aperture, detiled by a fence, where the device
+		 * has one; otherwise the pages as they are */
+		kind = i915->bar_aperture.size ? I915_MMAP_KIND_GTT : 1;
+		break;
 	case I915_MMAP_OFFSET_WC:
 	default:
 		kind = 1; /* write-combining through system memory */
@@ -445,6 +490,10 @@ static long gem_set_domain(struct i915_device *i915, struct drm_file *fp,
 	if (rc == 0 && bo) {
 		if (!bo_is_coherent(i915, bo) && (a->read_domains & I915_GEM_DOMAIN_CPU))
 			bo_clflush(o); /* drop stale lines before the CPU reads */
+		/* the aperture reads memory: what the processor cached must
+		 * be there first */
+		if (!bo_is_coherent(i915, bo) && (a->read_domains & I915_GEM_DOMAIN_GTT))
+			bo_clflush(o);
 		bo->read_domains = a->read_domains;
 		bo->write_domain = a->write_domain;
 	}
@@ -550,12 +599,56 @@ static long gem_busy(struct drm_file *fp, struct drm_i915_gem_busy *a)
 		return -ENOENT;
 	struct i915_bo *bo = o->priv;
 	uint32_t busy = 0;
-	if (bo->write_fence && !bo->write_fence->signaled)
-		busy |= 1;
-	if (bo->read_fence && !bo->read_fence->signaled)
-		busy |= 1u << 16; /* a reader of the render class */
+	uint64_t fl;
+	/* The interface's encoding: the low half names the class of the
+	 * engine writing the object, plus one (0 = no writer); the high half
+	 * has one bit per engine class with a reader, the writer among them. */
+	spin_lock_irqsave(&g_i915.sync_lock, &fl);
+	if (bo && bo->write_fence && !bo->write_fence->signaled)
+		busy |= ((uint32_t)bo->write_class + 1) | (0x10000u << bo->write_class);
+	for (int c = 0; bo && c < I915_ENGINE_CLASSES; c++)
+		if (bo->read_fence[c] && !bo->read_fence[c]->signaled)
+			busy |= 0x10000u << c;
+	spin_unlock_irqrestore(&g_i915.sync_lock, fl);
 	a->busy = busy;
 	drm_gem_put(o);
+	return 0;
+}
+
+/* The legacy mapping call: the kernel maps the object into the caller
+ * and answers with the address, write-back or write-combining.  The
+ * mapping is the same one mmap(2) of the node's offset would make; only
+ * the way it is asked for differs.  A client of the older buffer-manager
+ * library maps every buffer this way. */
+static long gem_mmap_legacy(struct drm_file *fp, struct drm_i915_gem_mmap *a,
+			    unsigned size)
+{
+	uint64_t flags = size >= sizeof(*a) ? a->flags : 0;
+	if (flags & ~(uint64_t)I915_MMAP_WC)
+		return -EINVAL;
+	struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
+	if (!o)
+		return -ENOENT;
+	struct i915_bo *bo = o->priv;
+	if (a->size == 0 || (a->offset & 0xfff) || a->offset + a->size < a->offset ||
+	    a->offset + a->size > o->size || a->offset >= (1ULL << 32)) {
+		drm_gem_put(o);
+		return -EINVAL;
+	}
+	/* an object over a client's own pages is mapped by the client already */
+	if (bo && bo->userptr) {
+		drm_gem_put(o);
+		return -EINVAL;
+	}
+	unsigned kind = (flags & I915_MMAP_WC) ? 1 : 2;
+	uint64_t off = drm_gem_mmap_offset_kind(o, kind) + a->offset;
+	drm_gem_put(o);
+	if (!fp->vfs)
+		return -ENODEV;
+	int64_t va = mm_mmap_file(fp->vfs, a->size, PROT_READ | PROT_WRITE, MAP_SHARED, off);
+	if (va < 0)
+		return (long)va;
+	a->addr_ptr = (uint64_t)va;
 	return 0;
 }
 
@@ -653,9 +746,10 @@ long i915_gem_ioctl(struct i915_device *i915, struct drm_file *fp, unsigned nr,
 			return -EINVAL;
 		return gem_create_ext(i915, fp, kb);
 	case DRM_I915_GEM_MMAP:
-		/* the legacy call returns a mapping the kernel makes; every
-		 * current client uses MMAP_OFFSET and mmap(2) */
-		return -EOPNOTSUPP;
+		/* the older form, without the flags word, is 32 bytes */
+		if (size < 32)
+			return -EINVAL;
+		return gem_mmap_legacy(fp, kb, size);
 	case DRM_I915_GEM_MMAP_GTT:
 		if (size >= sizeof(struct drm_i915_gem_mmap_offset))
 			return gem_mmap_offset(i915, fp, kb);
@@ -664,7 +758,7 @@ long i915_gem_ioctl(struct i915_device *i915, struct drm_file *fp, unsigned nr,
 			struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
 			if (!o)
 				return -ENOENT;
-			a->offset = drm_gem_mmap_offset_kind(o, 1);
+			a->offset = drm_gem_mmap_offset_kind(o, i915->bar_aperture.size ? I915_MMAP_KIND_GTT : 1);
 			drm_gem_put(o);
 			return 0;
 		}

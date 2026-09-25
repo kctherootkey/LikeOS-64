@@ -359,6 +359,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/i915_request.o \
               $(BUILD_DIR)/i915_gem_context.o \
               $(BUILD_DIR)/i915_gem.o \
+              $(BUILD_DIR)/i915_fence.o \
               $(BUILD_DIR)/i915_gem_execbuf.o \
               $(BUILD_DIR)/i915_query.o \
               $(BUILD_DIR)/i915_ioctl.o \
@@ -371,6 +372,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/vmw_execbuf.o \
               $(BUILD_DIR)/vmw_stdu.o \
               $(BUILD_DIR)/vmw_msg.o \
+              $(BUILD_DIR)/vmw_overlay.o \
               $(BUILD_DIR)/evdev.o \
               $(BUILD_DIR)/interrupt.o \
               $(BUILD_DIR)/interrupt_c.o \
@@ -381,7 +383,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/mouse.o \
               $(BUILD_DIR)/memory.o \
 			  $(BUILD_DIR)/stack_switch.o \
-			  $(BUILD_DIR)/slab.o $(BUILD_DIR)/shm.o \
+			  $(BUILD_DIR)/slab.o $(BUILD_DIR)/shm.o $(BUILD_DIR)/sysv_sem.o \
 			  $(BUILD_DIR)/mm_rwsem.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
@@ -739,6 +741,9 @@ $(BUILD_DIR)/vmw_stdu.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_stdu.c | $(BUILD_DIR)
 $(BUILD_DIR)/vmw_msg.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_msg.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/vmw_overlay.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_overlay.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/evdev.o: $(KERNEL_DIR)/dev/input/evdev.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -773,6 +778,9 @@ $(BUILD_DIR)/slab.o: $(KERNEL_DIR)/mm/slab.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/shm.o: $(KERNEL_DIR)/mm/shm.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/sysv_sem.o: $(KERNEL_DIR)/mm/sysv_sem.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mm_rwsem.o: $(KERNEL_DIR)/mm/rwsem.c | $(BUILD_DIR)
@@ -2855,7 +2863,11 @@ check-naming:
 XORG_MAN_SKIP = bdftruncate ucs2any libevdev-tweak-device mouse-dpi-tool \
 		touchpad-edge-detector koi8rxterm gtf \
 		icu-config derb genbrk gencfu gencnval gendict genrb \
-		makeconv pkgdata uconv icupkg gensprep icuexportdata
+		makeconv pkgdata uconv icupkg gensprep icuexportdata \
+		ffmpeg-all ffmpeg-bitstream-filters ffmpeg-codecs ffmpeg-filters \
+		ffmpeg-formats ffmpeg-protocols ffmpeg-resampler ffmpeg-scaler \
+		ffmpeg-utils ffprobe-all gst-stats-1.0 \
+		jpgicc linkicc psicc tificc transicc metaflac out123
 
 .PHONY: xorg-manpages
 xorg-manpages:
@@ -2929,7 +2941,8 @@ GTK3_MAN_PROGS = claws-mail pcmanfm mousepad libfm-pref-apps lxshortcut \
 		 galculator xfce4-terminal hexchat \
 		 luakit lua luac sqlite3 \
 		 gio gsettings gdbus gapplication \
-		 fc-list fc-match fc-cache
+		 fc-list fc-match fc-cache \
+		 vainfo ffmpeg ffprobe
 
 .PHONY: gtk3-manpages
 gtk3-manpages:

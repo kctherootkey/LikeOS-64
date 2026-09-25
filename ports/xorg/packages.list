@@ -159,6 +159,7 @@ app       xterm              400      xterm
 # ---- extras (Phase 5) ----
 app       xset               1.2.5    -  xorg/app/xset
 app       xrandr             1.5.3    -  xorg/app/xrandr
+app       xvinfo             1.1.5    -  xorg/app/xvinfo
 app       xclock             1.1.1    -  xorg/app/xclock
 # xload draws a load-average graph.  It reads the figures through getloadavg(),
 # which this system's libc now provides on top of sysinfo(2) -- its other

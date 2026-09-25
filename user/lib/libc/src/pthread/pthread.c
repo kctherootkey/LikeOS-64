@@ -294,6 +294,8 @@ static inline int __atomic_cas(volatile int *ptr, int old_val, int new_val)
 extern int futex_wait(volatile int *uaddr, int val,
 		      const struct timespec *timeout);
 extern int futex_wake(volatile int *uaddr, int count);
+extern int futex_wait_shared(volatile int *uaddr, int val,
+			     const struct timespec *timeout);
 
 // Get current thread's TCB
 static inline struct __pthread *__get_tcb(void)
@@ -891,7 +893,7 @@ int pthread_join(pthread_t thread, void **retval)
 			break;
 
 		// Futex wait until tid_futex changes
-		futex_wait(&tcb->tid_futex, val, NULL);
+		futex_wait_shared(&tcb->tid_futex, val, NULL);
 	}
 
 	// Full memory barrier to ensure we see the retval stored by the exiting thread

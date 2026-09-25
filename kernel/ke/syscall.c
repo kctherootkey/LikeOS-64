@@ -98,6 +98,12 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_shmdt(a1);
 	case SYS_SHMCTL:
 		return sys_shmctl(a1, a2, a3);
+	case SYS_SEMGET:
+		return sys_semget(a1, a2, a3);
+	case SYS_SEMOP:
+		return sys_semop(a1, a2, a3);
+	case SYS_SEMCTL:
+		return sys_semctl(a1, a2, a3, a4);
 
 	case SYS_CHROOT:
 		return sys_chroot(a1);

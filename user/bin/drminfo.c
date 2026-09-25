@@ -124,6 +124,7 @@ static const struct name_map caps[] = {
 static const struct name_map vmw_params[] = {
 	{ DRM_VMW_PARAM_NUM_STREAMS, "NUM_STREAMS" },
 	{ DRM_VMW_PARAM_NUM_FREE_STREAMS, "NUM_FREE_STREAMS" },
+	{ DRM_VMW_PARAM_NUM_FREE_STREAMS, "NUM_FREE_STREAMS" },
 	{ DRM_VMW_PARAM_3D, "3D" },
 	{ DRM_VMW_PARAM_HW_CAPS, "HW_CAPS" },
 	{ DRM_VMW_PARAM_FIFO_CAPS, "FIFO_CAPS" },
@@ -506,6 +507,12 @@ static void print_i915(int fd)
 		{ I915_PARAM_HAS_CONTEXT_ISOLATION, "context isolation", 0 },
 		{ I915_PARAM_HAS_GPU_RESET, "gpu reset", 0 },
 		{ I915_PARAM_HAS_SCHEDULER, "scheduler caps", 1 },
+		{ I915_PARAM_HAS_BSD, "video engine", 0 },
+		{ I915_PARAM_HAS_BSD2, "second video engine", 0 },
+		{ I915_PARAM_HAS_VEBOX, "video enhance engine", 0 },
+		{ I915_PARAM_HUC_STATUS, "media firmware (HuC)", 0 },
+		{ I915_PARAM_NUM_FENCES_AVAIL, "fence registers", 0 },
+		{ I915_PARAM_MMAP_VERSION, "legacy mmap version", 0 },
 	};
 	printf("  i915 parameters:\n");
 	for (unsigned i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
@@ -597,11 +604,17 @@ static void print_i915(int fd)
 					struct drm_i915_query_engine_info *ei = (void *)buf;
 					static const char *cls[] = { "render", "copy", "video", "video-enhance", "compute" };
 					printf("    engines             ");
-					for (unsigned k = 0; k < ei->num_engines; k++)
-						printf(" %s%u",
+					for (unsigned k = 0; k < ei->num_engines; k++) {
+						uint64_t caps = ei->engines[k].capabilities;
+						printf(" %s%u%s%s",
 						       ei->engines[k].engine.engine_class < 5 ?
 							       cls[ei->engines[k].engine.engine_class] : "?",
-						       ei->engines[k].engine.engine_instance);
+						       ei->engines[k].engine.engine_instance,
+						       (caps & I915_VIDEO_CLASS_CAPABILITY_HEVC) ? "(hevc" : "",
+						       (caps & I915_VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC) ?
+							       ((caps & I915_VIDEO_CLASS_CAPABILITY_HEVC) ? ",sfc)" : "(sfc)") :
+							       ((caps & I915_VIDEO_CLASS_CAPABILITY_HEVC) ? ")" : ""));
+					}
 					printf("\n");
 				}
 				free(buf);

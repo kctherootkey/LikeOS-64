@@ -45,6 +45,9 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 	 * folder through a GThreadPool that does exactly this, and hung.
 	 */
 	int cmd = op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+	/* Without the private flag the word may be shared with another
+	 * process: waiter and waker then meet on the page it lives in. */
+	bool shared = !(op & FUTEX_PRIVATE_FLAG);
 	int abs_realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
 
 	if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
@@ -80,7 +83,7 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 		 * refused the equivalent case; this one did not. */
 		if (have_timeout && timeout_ns == 0)
 			return -ETIMEDOUT;
-		return futex_wait(uaddr, (uint32_t)val, timeout_ns);
+		return futex_wait(uaddr, (uint32_t)val, timeout_ns, shared);
 	}
 
 	case FUTEX_WAIT_BITSET: {
@@ -128,14 +131,14 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 			}
 		}
 		return futex_wait_bitset(uaddr, (uint32_t)val, timeout_ns,
-					 (uint32_t)val3);
+					 (uint32_t)val3, shared);
 	}
 
 	case FUTEX_WAKE:
-		return futex_wake(uaddr, (int)val);
+		return futex_wake(uaddr, (int)val, shared);
 
 	case FUTEX_WAKE_BITSET:
-		return futex_wake_bitset(uaddr, (int)val, (uint32_t)val3);
+		return futex_wake_bitset(uaddr, (int)val, (uint32_t)val3, shared);
 
 	case FUTEX_WAKE_OP: {
 		/* Atomically apply an operation to *uaddr2, wake `val'
@@ -211,9 +214,9 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 			break;
 		}
 
-		int woken = futex_wake(uaddr, (int)val);
+		int woken = futex_wake(uaddr, (int)val, shared);
 		if (hit)
-			woken += futex_wake(uaddr2, (int)timeout);
+			woken += futex_wake(uaddr2, (int)timeout, shared);
 		return woken;
 	}
 
@@ -232,7 +235,7 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 			}
 		}
 		// val = nr_wake, timeout = nr_requeue (reusing timeout arg)
-		return futex_requeue(uaddr, uaddr2, (int)val, (int)timeout);
+		return futex_requeue(uaddr, uaddr2, (int)val, (int)timeout, shared);
 
 	default:
 		return -ENOSYS;

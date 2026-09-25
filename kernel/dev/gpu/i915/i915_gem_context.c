@@ -297,7 +297,10 @@ int i915_gt_golden_init(struct i915_device *i915)
 			mm_free_physical_page(page);
 			continue;
 		}
-		if (i915_request_submit(rq, batch_addr, batch_len) != 0) {
+		mm_write_lock(&i915->submit_lock);
+		int src = i915_request_submit(rq, batch_addr, batch_len);
+		mm_write_unlock(&i915->submit_lock);
+		if (src != 0) {
 			i915_request_put(rq);
 			mm_free_physical_page(page);
 			continue;

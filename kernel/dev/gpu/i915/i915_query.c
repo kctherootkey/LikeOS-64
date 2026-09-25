@@ -77,7 +77,23 @@ static long query_engines(struct i915_device *i915, struct drm_i915_query_item *
 		q->engines[n].engine.engine_instance = e->instance;
 		q->engines[n].flags = I915_ENGINE_INFO_HAS_LOGICAL_INSTANCE;
 		q->engines[n].logical_instance = e->instance;
-		q->engines[n].capabilities = 0;
+		/* What a video engine can do beyond the common set: HEVC on
+		 * the first video engine from Gen9 and on all of them from
+		 * Gen11; the scaler/format converter on every Gen9/10 video
+		 * and enhancement engine and on the even-numbered ones from
+		 * Gen11. */
+		uint64_t caps = 0;
+		int gen = i915->info->gen;
+		if (e->class == I915_ENGINE_CLASS_VIDEO) {
+			if (gen >= 11 || (gen >= 9 && e->instance == 0))
+				caps |= I915_VIDEO_CLASS_CAPABILITY_HEVC;
+			if (gen >= 9 && (gen < 11 || (e->instance & 1) == 0))
+				caps |= I915_VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC;
+		} else if (e->class == I915_ENGINE_CLASS_VIDEO_ENHANCE) {
+			if (gen >= 9 && (gen < 11 || (e->instance & 1) == 0))
+				caps |= I915_VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC;
+		}
+		q->engines[n].capabilities = caps;
 		n++;
 	}
 	q->num_engines = n;

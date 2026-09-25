@@ -5,8 +5,18 @@
  */
 
 #include <sys/shm.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include "syscall.h"
+
+key_t ftok(const char *path, int id)
+{
+	struct stat st;
+	if (stat(path, &st) != 0)
+		return (key_t)-1;
+	return (key_t)(((unsigned)id & 0xffu) << 24 | ((unsigned)st.st_dev & 0xffu) << 16 |
+		       ((unsigned)st.st_ino & 0xffffu));
+}
 
 int shmget(key_t key, size_t size, int shmflg)
 {

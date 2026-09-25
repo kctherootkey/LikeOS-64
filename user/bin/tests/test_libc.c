@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <sys/sem.h>
 #include <malloc.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -1441,6 +1442,466 @@ out:
 	}
 }
 
+/* MI_STORE_DWORD_IMM on Gen8+: four dwords -- the command, the address
+ * (low, high) in the context's space, the value. */
+#define I915_MI_STORE_DWORD_IMM_GEN8 ((0x20u << 23) | 2)
+#define I915_MI_BATCH_BUFFER_END (0x0au << 23)
+
+/* One batch that stores a dword into a target object, run on the engine
+ * named by `ring_flags' under `ctx'; the target is read back through
+ * PREAD.  Returns 1 when the store landed, 0 when the submission was
+ * refused (errno kept), -1 on any other failure. */
+static int i915_store_dword_on(int fd, uint32_t ctx, uint64_t ring_flags, uint32_t value,
+			       uint32_t *busy_out)
+{
+	struct drm_i915_gem_create tc, bc;
+	struct drm_i915_gem_mmap_offset bm;
+	struct drm_i915_gem_exec_object2 obj[2];
+	struct drm_i915_gem_execbuffer2 eb;
+	uint32_t *b;
+	int ret = -1;
+
+	memset(&tc, 0, sizeof(tc));
+	tc.size = 4096;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &tc) != 0)
+		return -1;
+	memset(&bc, 0, sizeof(bc));
+	bc.size = 4096;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &bc) != 0)
+		goto out_t;
+	memset(&bm, 0, sizeof(bm));
+	bm.handle = bc.handle;
+	bm.flags = I915_MMAP_OFFSET_WB;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &bm) != 0)
+		goto out_b;
+	b = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)bm.offset);
+	if (b == MAP_FAILED)
+		goto out_b;
+	b[0] = I915_MI_STORE_DWORD_IMM_GEN8;
+	b[1] = 0x20000000u + 0x40; /* the target's address, low */
+	b[2] = 0;
+	b[3] = value;
+	b[4] = I915_MI_BATCH_BUFFER_END;
+	b[5] = 0;
+	munmap(b, 4096);
+	{
+		struct drm_i915_gem_set_domain bsd = { .handle = bc.handle, .read_domains = I915_GEM_DOMAIN_CPU, .write_domain = I915_GEM_DOMAIN_CPU };
+		ioctl(fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &bsd);
+	}
+	memset(obj, 0, sizeof(obj));
+	obj[0].handle = bc.handle;
+	obj[0].offset = 0x10000000;
+	obj[0].flags = EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+	obj[1].handle = tc.handle;
+	obj[1].offset = 0x20000000;
+	obj[1].flags = EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS | EXEC_OBJECT_WRITE;
+	memset(&eb, 0, sizeof(eb));
+	eb.buffers_ptr = (uint64_t)(uintptr_t)obj;
+	eb.buffer_count = 2;
+	eb.batch_len = 24;
+	eb.flags = ring_flags | I915_EXEC_NO_RELOC | I915_EXEC_HANDLE_LUT | I915_EXEC_BATCH_FIRST;
+	eb.rsvd1 = ctx;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_EXECBUFFER2, &eb) != 0) {
+		ret = 0;
+		goto out_b;
+	}
+	if (busy_out) {
+		struct drm_i915_gem_busy busy = { .handle = tc.handle };
+		*busy_out = ioctl(fd, DRM_IOCTL_I915_GEM_BUSY, &busy) == 0 ? busy.busy : 0xffffffffu;
+	}
+	{
+		struct drm_i915_gem_wait w = { .bo_handle = tc.handle, .timeout_ns = 2000000000LL };
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_WAIT, &w) != 0)
+			goto out_b;
+	}
+	{
+		struct drm_i915_gem_pread pr;
+		uint32_t back = 0;
+		memset(&pr, 0, sizeof(pr));
+		pr.handle = tc.handle;
+		pr.offset = 0x40;
+		pr.size = 4;
+		pr.data_ptr = (uint64_t)(uintptr_t)&back;
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) != 0)
+			goto out_b;
+		ret = (back == value) ? 1 : -1;
+	}
+out_b: {
+	struct drm_gem_close gcb = { .handle = bc.handle };
+	int saved = errno;
+	ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gcb);
+	errno = saved;
+	}
+out_t: {
+	struct drm_gem_close gct = { .handle = tc.handle };
+	int saved = errno;
+	ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gct);
+	errno = saved;
+	}
+	return ret;
+}
+
+/* Where byte (x, y) of a Y-tiled image with `stride' bytes per row lies in
+ * the object's pages: Y tiles are 128 bytes by 32 rows, in 16-byte columns.
+ * The same arithmetic the kernel's host test pins (i915_fence_layout.h). */
+static uint64_t i915_y_tiled_offset(uint32_t x, uint32_t y, uint32_t stride)
+{
+	uint64_t tile = (uint64_t)(y / 32) * (stride / 128) + x / 128;
+	uint32_t tx = x % 128, ty = y % 32;
+	return tile * 4096 + (tx / 16) * 512 + ty * 16 + (tx % 16);
+}
+
+static sigjmp_buf i915_gtt_jmp;
+static void i915_gtt_fault_handler(int sig)
+{
+	(void)sig;
+	siglongjmp(i915_gtt_jmp, 1);
+}
+
+/* The "GTT" mapping kind: the object seen through the graphics aperture,
+ * so a tiled object reads and writes as the linear image a program
+ * expects while its pages hold the tiled layout the engines use.  An
+ * access the kernel cannot serve (no fence free) is a fault, so the test
+ * catches SIGSEGV/SIGBUS rather than dying. */
+static void test_drm_i915_gtt_mapping(int fd)
+{
+	int fences = 0;
+	struct drm_i915_getparam gp = { .param = I915_PARAM_NUM_FENCES_AVAIL, .value = &fences };
+	ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp);
+	printf("  (fence registers: %d)\n", fences);
+	struct drm_i915_gem_create c;
+	memset(&c, 0, sizeof(c));
+	c.size = 65536; /* 128 rows of a 512-byte stride: 16 Y tiles */
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &c) != 0) {
+		test_fail("i915 GTT mapping: object create");
+		return;
+	}
+	struct drm_i915_gem_set_tiling st;
+	memset(&st, 0, sizeof(st));
+	st.handle = c.handle;
+	st.tiling_mode = I915_TILING_Y;
+	st.stride = 512;
+	test_result("i915 SET_TILING Y, stride 512", ioctl(fd, DRM_IOCTL_I915_GEM_SET_TILING, &st) == 0);
+	struct drm_i915_gem_mmap_offset mo;
+	memset(&mo, 0, sizeof(mo));
+	mo.handle = c.handle;
+	mo.flags = I915_MMAP_OFFSET_GTT;
+	int orc = ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &mo);
+	test_result("i915 MMAP_OFFSET GTT", orc == 0 && mo.offset != 0);
+	struct drm_i915_gem_mmap_offset wc;
+	memset(&wc, 0, sizeof(wc));
+	wc.handle = c.handle;
+	wc.flags = I915_MMAP_OFFSET_WC;
+	ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &wc);
+	int aperture = orc == 0 && mo.offset != wc.offset;
+	printf("  (aperture mappings: %s)\n", aperture ? "yes" : "no -- the device has no aperture, pages mapped as they are");
+	if (orc == 0) {
+		struct drm_i915_gem_set_domain sd = { .handle = c.handle, .read_domains = I915_GEM_DOMAIN_GTT, .write_domain = I915_GEM_DOMAIN_GTT };
+		test_result("i915 SET_DOMAIN GTT", ioctl(fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &sd) == 0);
+		volatile uint8_t *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)mo.offset);
+		test_result("i915 GTT mmap", p != MAP_FAILED);
+		if (p != MAP_FAILED) {
+			struct sigaction sa, old_segv, old_bus;
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = i915_gtt_fault_handler;
+			sigaction(SIGSEGV, &sa, &old_segv);
+			sigaction(SIGBUS, &sa, &old_bus);
+			int faulted = 0;
+			if (sigsetjmp(i915_gtt_jmp, 1) == 0) {
+				/* a linear image: byte (x, y) = (x * 7 + y * 3) & 0xff */
+				for (uint32_t y = 0; y < 128; y++)
+					for (uint32_t x = 0; x < 512; x++)
+						p[y * 512 + x] = (uint8_t)(x * 7 + y * 3);
+				faulted = 0;
+			} else {
+				faulted = 1;
+			}
+			sigaction(SIGSEGV, &old_segv, NULL);
+			sigaction(SIGBUS, &old_bus, NULL);
+			test_result("i915 writes through the GTT mapping do not fault", !faulted);
+			if (!faulted) {
+				struct drm_i915_gem_set_domain sc = { .handle = c.handle, .read_domains = I915_GEM_DOMAIN_CPU, .write_domain = 0 };
+				ioctl(fd, DRM_IOCTL_I915_GEM_SET_DOMAIN, &sc);
+				uint8_t raw[65536];
+				struct drm_i915_gem_pread pr;
+				memset(&pr, 0, sizeof(pr));
+				pr.handle = c.handle;
+				pr.offset = 0;
+				pr.size = 65536;
+				pr.data_ptr = (uint64_t)(uintptr_t)raw;
+				int prc = ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr);
+				test_result("i915 PREAD of the tiled object", prc == 0);
+				if (prc == 0) {
+					int tiled_ok = 1, linear_ok = 1;
+					for (uint32_t y = 0; y < 128 && (tiled_ok || linear_ok); y++)
+						for (uint32_t x = 0; x < 512; x++) {
+							uint8_t want = (uint8_t)(x * 7 + y * 3);
+							if (raw[i915_y_tiled_offset(x, y, 512)] != want)
+								tiled_ok = 0;
+							if (raw[y * 512 + x] != want)
+								linear_ok = 0;
+						}
+					if (aperture)
+						test_result("i915 the pages hold the Y-tiled layout (the aperture detiled the writes)", tiled_ok);
+					else
+						test_result("i915 without an aperture the pages hold the linear image", linear_ok);
+				}
+			}
+			munmap((void *)p, 65536);
+		}
+	}
+	/* an untiled object through the same kind of mapping is plain memory */
+	struct drm_i915_gem_create l;
+	memset(&l, 0, sizeof(l));
+	l.size = 8192;
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &l) == 0) {
+		struct drm_i915_gem_mmap_offset lo;
+		memset(&lo, 0, sizeof(lo));
+		lo.handle = l.handle;
+		lo.flags = I915_MMAP_OFFSET_GTT;
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &lo) == 0) {
+			volatile uint32_t *q = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)lo.offset);
+			if (q != MAP_FAILED) {
+				q[1024 + 1] = 0x600df00d;
+				struct drm_i915_gem_pread pr;
+				uint32_t back = 0;
+				memset(&pr, 0, sizeof(pr));
+				pr.handle = l.handle;
+				pr.offset = 4096 + 4;
+				pr.size = 4;
+				pr.data_ptr = (uint64_t)(uintptr_t)&back;
+				test_result("i915 GTT mapping of an untiled object is the object",
+					    ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) == 0 && back == 0x600df00d);
+				munmap((void *)q, 8192);
+			}
+		}
+		struct drm_gem_close gl = { .handle = l.handle };
+		ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gl);
+	}
+	struct drm_gem_close gc = { .handle = c.handle };
+	test_result("i915 tiled object close (fence released)", ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc) == 0);
+}
+
+/* The media side of the interface: the video and enhancement engines
+ * take batches, the video ring flags are honoured the way the interface
+ * says, the legacy mapping call answers with an address, relocations
+ * are patched and land below 4 GB, the busy call names the engine
+ * class, and the firmware parameter answers rather than fails. */
+static void test_drm_i915_media(int fd)
+{
+	int has_bsd = 0, has_bsd2 = 0, has_vebox = 0, huc = -1;
+	struct drm_i915_getparam gp;
+
+	printf("\n--- Intel graphics (i915) media engines and the older interface ---\n");
+	gp.param = I915_PARAM_HAS_BSD;
+	gp.value = &has_bsd;
+	ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp);
+	gp.param = I915_PARAM_HAS_BSD2;
+	gp.value = &has_bsd2;
+	ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp);
+	gp.param = I915_PARAM_HAS_VEBOX;
+	gp.value = &has_vebox;
+	ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp);
+	gp.param = I915_PARAM_HUC_STATUS;
+	gp.value = &huc;
+	test_result("i915 GETPARAM HUC_STATUS answers 0 or 1",
+		    ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0 && (huc == 0 || huc == 1));
+	int oa = 0;
+	gp.param = I915_PARAM_OA_TIMESTAMP_FREQUENCY;
+	gp.value = &oa;
+	test_result("i915 GETPARAM OA_TIMESTAMP_FREQUENCY", ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0 && oa > 0);
+	printf("  video engines: %d%s, video enhance: %d, media firmware: %d\n",
+	       has_bsd, has_bsd2 ? " + a second" : "", has_vebox, huc);
+
+	struct drm_i915_gem_context_create cc;
+	memset(&cc, 0, sizeof(cc));
+	if (ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_CREATE, &cc) != 0) {
+		test_fail("i915 media: context create");
+		return;
+	}
+	if (has_bsd) {
+		uint32_t busy = 0;
+		int rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_BSD, 0x5ba7c0de, &busy);
+		test_result("i915 store on the video engine lands", rc == 1);
+		/* the busy call, if it caught the batch in flight, names the video class */
+		test_result("i915 BUSY names the video class (or the batch was already done)",
+			    busy == 0 || ((busy & 0xffff) == I915_ENGINE_CLASS_VIDEO + 1 &&
+					  (busy & (0x10000u << I915_ENGINE_CLASS_VIDEO))));
+		rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_BSD | I915_EXEC_BSD_RING1, 0x1111beef, NULL);
+		test_result("i915 BSD ring 1 accepted", rc == 1);
+		rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_BSD | I915_EXEC_BSD_RING2, 0x2222beef, NULL);
+		if (has_bsd2)
+			test_result("i915 BSD ring 2 lands on the second video engine", rc == 1);
+		else
+			test_result("i915 BSD ring 2 on a one-engine part: the flag is ignored", rc == 1);
+		rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_BSD | I915_EXEC_BSD_MASK, 0x3333beef, NULL);
+		if (has_bsd2)
+			test_result("i915 BSD ring 3 -> EINVAL", rc == 0 && errno == EINVAL);
+		else
+			test_result("i915 BSD ring 3 on a one-engine part: ignored too", rc == 1);
+		rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_RENDER | I915_EXEC_BSD_RING1, 0x4444beef, NULL);
+		test_result("i915 a video ring flag on the render engine -> EINVAL", rc == 0 && errno == EINVAL);
+	} else {
+		int rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_BSD, 0x5ba7c0de, NULL);
+		test_result("i915 BSD without a video engine -> EINVAL", rc == 0 && errno == EINVAL);
+	}
+	if (has_vebox) {
+		int rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_VEBOX, 0x7eb0c0de, NULL);
+		test_result("i915 store on the video enhancement engine lands", rc == 1);
+	}
+	{
+		int rc = i915_store_dword_on(fd, cc.ctx_id, I915_EXEC_BLT, 0xb17c0de5, NULL);
+		test_result("i915 store on the copy engine lands", rc == 1);
+	}
+
+	/* the legacy mapping call: an address, not an offset */
+	{
+		struct drm_i915_gem_create c;
+		memset(&c, 0, sizeof(c));
+		c.size = 8192;
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &c) == 0) {
+			struct drm_i915_gem_mmap m;
+			memset(&m, 0, sizeof(m));
+			m.handle = c.handle;
+			m.offset = 0;
+			m.size = 8192;
+			int mrc = ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &m);
+			test_result("i915 legacy GEM_MMAP answers an address", mrc == 0 && m.addr_ptr != 0);
+			if (mrc == 0) {
+				volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)m.addr_ptr;
+				p[1024 + 3] = 0xfeedf00d;
+				struct drm_i915_gem_pread pr;
+				uint32_t back = 0;
+				memset(&pr, 0, sizeof(pr));
+				pr.handle = c.handle;
+				pr.offset = 4096 + 12;
+				pr.size = 4;
+				pr.data_ptr = (uint64_t)(uintptr_t)&back;
+				test_result("i915 legacy mapping's write is the object's",
+					    ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) == 0 && back == 0xfeedf00d);
+				test_result("i915 legacy mapping unmaps", munmap((void *)(uintptr_t)m.addr_ptr, 8192) == 0);
+			}
+			memset(&m, 0, sizeof(m));
+			m.handle = c.handle;
+			m.offset = 4096;
+			m.size = 4096;
+			m.flags = I915_MMAP_WC;
+			mrc = ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &m);
+			test_result("i915 legacy GEM_MMAP write-combining at an offset", mrc == 0 && m.addr_ptr != 0);
+			if (mrc == 0) {
+				volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)m.addr_ptr;
+				p[0] = 0x0ff5e7ed;
+				struct drm_i915_gem_pread pr;
+				uint32_t back = 0;
+				memset(&pr, 0, sizeof(pr));
+				pr.handle = c.handle;
+				pr.offset = 4096;
+				pr.size = 4;
+				pr.data_ptr = (uint64_t)(uintptr_t)&back;
+				test_result("i915 legacy mapping honours the offset",
+					    ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) == 0 && back == 0x0ff5e7ed);
+				munmap((void *)(uintptr_t)m.addr_ptr, 4096);
+			}
+			m.offset = 4096;
+			m.size = 8192;
+			m.flags = 0;
+			test_result("i915 legacy GEM_MMAP past the object -> EINVAL",
+				    ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &m) == -1 && errno == EINVAL);
+			m.offset = 0;
+			m.size = 4096;
+			m.flags = 0x10;
+			test_result("i915 legacy GEM_MMAP unknown flag -> EINVAL",
+				    ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &m) == -1 && errno == EINVAL);
+			struct drm_gem_close gc = { .handle = c.handle };
+			ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+		}
+	}
+
+	/* relocations: the kernel places both objects and patches the
+	 * batch's address dwords; neither object asked for 48-bit addresses,
+	 * so both land below 4 GB */
+	{
+		struct drm_i915_gem_create tc, bc;
+		memset(&tc, 0, sizeof(tc));
+		tc.size = 4096;
+		memset(&bc, 0, sizeof(bc));
+		bc.size = 4096;
+		if (ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &tc) == 0 &&
+		    ioctl(fd, DRM_IOCTL_I915_GEM_CREATE, &bc) == 0) {
+			struct drm_i915_gem_mmap bm;
+			memset(&bm, 0, sizeof(bm));
+			bm.handle = bc.handle;
+			bm.size = 4096;
+			if (ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &bm) == 0) {
+				uint32_t *b = (uint32_t *)(uintptr_t)bm.addr_ptr;
+				b[0] = I915_MI_STORE_DWORD_IMM_GEN8;
+				b[1] = 0; /* patched: the target's address + 0x80 */
+				b[2] = 0;
+				b[3] = 0x4e10ca7e;
+				b[4] = I915_MI_BATCH_BUFFER_END;
+				b[5] = 0;
+				munmap(b, 4096);
+				struct drm_i915_gem_relocation_entry rel;
+				memset(&rel, 0, sizeof(rel));
+				rel.target_handle = tc.handle;
+				rel.delta = 0x80;
+				rel.offset = 4; /* dword 1 of the batch */
+				rel.presumed_offset = 0;
+				rel.read_domains = I915_GEM_DOMAIN_RENDER;
+				rel.write_domain = I915_GEM_DOMAIN_RENDER;
+				struct drm_i915_gem_exec_object2 obj[2];
+				memset(obj, 0, sizeof(obj));
+				obj[0].handle = tc.handle;
+				obj[0].flags = EXEC_OBJECT_WRITE;
+				obj[1].handle = bc.handle;
+				obj[1].relocation_count = 1;
+				obj[1].relocs_ptr = (uint64_t)(uintptr_t)&rel;
+				struct drm_i915_gem_execbuffer2 eb;
+				memset(&eb, 0, sizeof(eb));
+				eb.buffers_ptr = (uint64_t)(uintptr_t)obj;
+				eb.buffer_count = 2;
+				eb.batch_len = 24;
+				eb.flags = I915_EXEC_RENDER;
+				eb.rsvd1 = cc.ctx_id;
+				int erc = ioctl(fd, DRM_IOCTL_I915_GEM_EXECBUFFER2, &eb);
+				test_result("i915 relocation submission accepted", erc == 0);
+				if (erc == 0) {
+					test_result("i915 objects without the 48-bit flag sit below 4 GB",
+						    obj[0].offset < (1ULL << 32) && obj[1].offset < (1ULL << 32) &&
+							    obj[0].offset != 0 && obj[1].offset != 0);
+					test_result("i915 the two objects do not overlap",
+						    obj[0].offset != obj[1].offset);
+					test_result("i915 presumed offset written back", rel.presumed_offset == obj[0].offset);
+					struct drm_i915_gem_wait w = { .bo_handle = tc.handle, .timeout_ns = 2000000000LL };
+					int wrc = ioctl(fd, DRM_IOCTL_I915_GEM_WAIT, &w);
+					struct drm_i915_gem_pread pr;
+					uint32_t back = 0;
+					memset(&pr, 0, sizeof(pr));
+					pr.handle = tc.handle;
+					pr.offset = 0x80;
+					pr.size = 4;
+					pr.data_ptr = (uint64_t)(uintptr_t)&back;
+					test_result("i915 the relocated store landed",
+						    wrc == 0 && ioctl(fd, DRM_IOCTL_I915_GEM_PREAD, &pr) == 0 && back == 0x4e10ca7e);
+					/* the same again with the presumed offsets: nothing moves */
+					uint64_t t_off = obj[0].offset, b_off = obj[1].offset;
+					rel.presumed_offset = t_off;
+					erc = ioctl(fd, DRM_IOCTL_I915_GEM_EXECBUFFER2, &eb);
+					test_result("i915 a second submission keeps the addresses",
+						    erc == 0 && obj[0].offset == t_off && obj[1].offset == b_off);
+				}
+			}
+		}
+		struct drm_gem_close gcb = { .handle = bc.handle };
+		ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gcb);
+		struct drm_gem_close gct = { .handle = tc.handle };
+		ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gct);
+	}
+	struct drm_i915_gem_context_destroy cd = { .ctx_id = cc.ctx_id };
+	ioctl(fd, DRM_IOCTL_I915_GEM_CONTEXT_DESTROY, &cd);
+	test_drm_i915_gtt_mapping(fd);
+}
+
 static void test_drm_i915(void)
 {
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
@@ -1660,6 +2121,7 @@ static void test_drm_i915(void)
 	}
 	struct drm_gem_close gc = { .handle = c.handle };
 	test_result("GEM_CLOSE", ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc) == 0);
+	test_drm_i915_media(fd);
 	close(fd);
 }
 
@@ -5513,6 +5975,132 @@ static void test_shm(void)
  * a segment and attaches it, hands the IDENTIFIER (not a descriptor, not an
  * address) to another process, and that one attaches the same memory.
  */
+static void test_sysv_sem(void)
+{
+	printf("\n[TEST] System V semaphores (semget/semop/semctl)\n");
+
+	int id = semget(IPC_PRIVATE, 2, IPC_CREAT | 0600);
+	test_result("semget creates a set of two", id >= 0);
+	if (id < 0)
+		return;
+
+	union {
+		int val;
+		struct semid_ds *buf;
+		unsigned short *array;
+	} arg;
+	arg.val = 3;
+	test_result("SETVAL sets a value", semctl(id, 0, SETVAL, arg) == 0);
+	test_result("GETVAL reads it back", semctl(id, 0, GETVAL) == 3);
+
+	struct semid_ds ds;
+	memset(&ds, 0, sizeof(ds));
+	arg.buf = &ds;
+	test_result("IPC_STAT counts the two semaphores",
+		    semctl(id, 0, IPC_STAT, arg) == 0 && ds.sem_nsems == 2 &&
+			    (ds.sem_perm.mode & 0777) == 0600);
+
+	struct sembuf op = { 0, -2, 0 };
+	test_result("semop takes two", semop(id, &op, 1) == 0 && semctl(id, 0, GETVAL) == 1);
+	op.sem_flg = IPC_NOWAIT;
+	errno = 0;
+	test_result("IPC_NOWAIT on too small a value gives EAGAIN",
+		    semop(id, &op, 1) == -1 && errno == EAGAIN);
+	test_result("and leaves the value alone", semctl(id, 0, GETVAL) == 1);
+
+	unsigned short vals[2] = { 0, 5 };
+	arg.array = vals;
+	test_result("SETALL sets both", semctl(id, 0, SETALL, arg) == 0 &&
+					   semctl(id, 0, GETVAL) == 0 && semctl(id, 1, GETVAL) == 5);
+	unsigned short back[2] = { 9, 9 };
+	arg.array = back;
+	test_result("GETALL reads both", semctl(id, 0, GETALL, arg) == 0 && back[0] == 0 && back[1] == 5);
+
+	/* A child blocks on the first semaphore, which is zero, with SEM_UNDO;
+	 * the parent sees it waiting, releases it, and after the child's exit
+	 * finds both values put back by the undo. */
+	pid_t kid = fork();
+	if (kid == 0) {
+		struct sembuf take = { 0, -1, SEM_UNDO };
+		if (semop(id, &take, 1) != 0)
+			_exit(30);
+		struct sembuf take5 = { 1, -5, SEM_UNDO };
+		if (semop(id, &take5, 1) != 0)
+			_exit(31);
+		if (semctl(id, 1, GETVAL) != 0)
+			_exit(32);
+		_exit(0);
+	} else if (kid > 0) {
+		int ncnt = 0;
+		for (int i = 0; i < 400 && ncnt < 1; i++) {
+			usleep(5000);
+			ncnt = semctl(id, 0, GETNCNT);
+		}
+		test_result("GETNCNT counts the blocked child", ncnt == 1);
+		struct sembuf give = { 0, 1, 0 };
+		test_result("a V operation wakes it", semop(id, &give, 1) == 0);
+		int st = 0;
+		waitpid(kid, &st, 0);
+		test_result("the child took both semaphores", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+		test_result("SEM_UNDO put the values back when it ended",
+			    semctl(id, 0, GETVAL) == 1 && semctl(id, 1, GETVAL) == 5);
+	} else {
+		test_result("fork for the semaphore test", 0);
+	}
+
+	op.sem_num = 1;
+	op.sem_op = 0;
+	op.sem_flg = IPC_NOWAIT;
+	errno = 0;
+	test_result("a wait-for-zero on a set semaphore gives EAGAIN",
+		    semop(id, &op, 1) == -1 && errno == EAGAIN);
+	op.sem_num = 5;
+	errno = 0;
+	test_result("a semaphore beyond the set gives EFBIG",
+		    semop(id, &op, 1) == -1 && errno == EFBIG);
+
+	/* Removal under a waiter: the child sleeps on the set, the parent
+	 * removes it, the child's call fails with EIDRM. */
+	kid = fork();
+	if (kid == 0) {
+		struct sembuf wait0 = { 0, -5, 0 };
+		errno = 0;
+		int r = semop(id, &wait0, 1);
+		_exit(r == -1 && errno == EIDRM ? 0 : 40);
+	} else if (kid > 0) {
+		int ncnt = 0;
+		for (int i = 0; i < 400 && ncnt < 1; i++) {
+			usleep(5000);
+			ncnt = semctl(id, 0, GETNCNT);
+		}
+		test_result("IPC_RMID removes the set", semctl(id, 0, IPC_RMID) == 0);
+		int st = 0;
+		waitpid(kid, &st, 0);
+		test_result("a waiter on a removed set gets EIDRM", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+	}
+	errno = 0;
+	test_result("a removed identifier is refused",
+		    semctl(id, 0, GETVAL) == -1 && errno == EINVAL);
+
+	/* keys: two callers meet on one set */
+	key_t key = ftok("/", 'S');
+	test_result("ftok makes a key of a path", key != (key_t)-1);
+	int a = semget(key, 1, IPC_CREAT | 0600);
+	int b = semget(key, 1, 0);
+	test_result("the same key names the same set", a >= 0 && a == b);
+	errno = 0;
+	test_result("IPC_EXCL on an existing key gives EEXIST",
+		    semget(key, 1, IPC_CREAT | IPC_EXCL | 0600) == -1 && errno == EEXIST);
+	errno = 0;
+	test_result("asking for more semaphores than the set has gives EINVAL",
+		    semget(key, 2, 0) == -1 && errno == EINVAL);
+	if (a >= 0)
+		semctl(a, 0, IPC_RMID);
+	errno = 0;
+	test_result("a missing key without IPC_CREAT gives ENOENT",
+		    semget(key, 1, 0) == -1 && errno == ENOENT);
+}
+
 static void test_sysv_shm(void)
 {
 	const size_t sz = 4096;
@@ -9349,6 +9937,149 @@ static void test_futex_ops(void)
 	test_result("FUTEX_WAKE_BITSET with no waiters returns 0", r == 0);
 }
 
+/* A futex word in memory two processes share, waited on and woken WITHOUT
+ * the private flag.  That is how the X server and its DRI3 clients meet
+ * on a fence in shared memory: the client sleeps on the word, the server
+ * triggers it.  The kernel keyed every futex by the calling process, so
+ * the wake never found the waiter and the client slept until its
+ * timeout -- seconds during which the screen did not update. */
+static void test_futex_shared(void)
+{
+	volatile int *word;
+	struct timespec t0;
+	int status = -1;
+	pid_t pid;
+	long r;
+
+	printf("\n[TEST] Shared futex across processes\n");
+
+	word = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+		    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	test_result("a shared anonymous page for the futex word",
+		    word != MAP_FAILED);
+	if (word == MAP_FAILED)
+		return;
+	*word = 0;
+
+	pid = fork();
+	if (pid == 0) {
+		/* the client: park on the word until the other process
+		 * posts it, with a timeout that tells a lost wake apart */
+		struct timespec rel = { 5, 0 };
+		long ms;
+		int rc = 2;
+
+		mono_now(&t0);
+		while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 0) {
+			r = syscall(SYS_FUTEX, (long)word, FUTEX_WAIT_OP, 0,
+				    (long)&rel, 0, 0);
+			if (r < 0 && errno == ETIMEDOUT)
+				break;
+		}
+		ms = mono_elapsed_ms(&t0);
+		if (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 1)
+			rc = ms < 2000 ? 0 : 1;
+		_exit(rc);
+	}
+	test_result("the waiting process forks", pid > 0);
+	if (pid < 0) {
+		munmap((void *)word, 4096);
+		return;
+	}
+
+	/* give it time to park, then post the word and wake -- shared */
+	usleep(300 * 1000);
+	__atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
+	r = syscall(SYS_FUTEX, (long)word, FUTEX_WAKE_OP, 1, 0, 0, 0);
+	test_result("a shared FUTEX_WAKE finds the waiter in the other process",
+		    r == 1);
+
+	test_result("the waiter is reaped", waitpid(pid, &status, 0) == pid);
+	test_result("it woke on the post, not on its timeout",
+		    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* the other direction: this process sleeps, the child wakes it */
+	*word = 0;
+	pid = fork();
+	if (pid == 0) {
+		usleep(300 * 1000);
+		__atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
+		r = syscall(SYS_FUTEX, (long)word, FUTEX_WAKE_OP, 1, 0, 0, 0);
+		_exit(r == 1 ? 0 : 3);
+	}
+	if (pid > 0) {
+		struct timespec rel = { 5, 0 };
+		long ms;
+
+		mono_now(&t0);
+		while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 0) {
+			r = syscall(SYS_FUTEX, (long)word, FUTEX_WAIT_OP, 0,
+				    (long)&rel, 0, 0);
+			if (r < 0 && errno == ETIMEDOUT)
+				break;
+		}
+		ms = mono_elapsed_ms(&t0);
+		test_result("a shared FUTEX_WAIT is woken from the other process",
+			    __atomic_load_n(word, __ATOMIC_SEQ_CST) == 1 &&
+				    ms < 2000);
+		status = -1;
+		waitpid(pid, &status, 0);
+		test_result("...and that wake counted one waiter",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+
+	/* a word in PRIVATE memory stays the process's own even without the
+	 * flag: a child of a fork sees a copy of the page, and its wake must
+	 * not reach a waiter here (nor could it once the page is copied) */
+	futex_word = 0;
+	pid = fork();
+	if (pid == 0) {
+		usleep(300 * 1000);
+		r = syscall(SYS_FUTEX, (long)&futex_word, FUTEX_WAKE_OP, 1, 0, 0,
+			    0);
+		_exit(r == 0 ? 0 : 5);
+	}
+	if (pid > 0) {
+		struct timespec rel = { 0, 800 * 1000 * 1000 };
+
+		errno = 0;
+		r = syscall(SYS_FUTEX, (long)&futex_word, FUTEX_WAIT_OP, 0,
+			    (long)&rel, 0, 0);
+		test_result("a no-flag futex in private memory is not shared across a fork",
+			    r < 0 && errno == ETIMEDOUT);
+		status = -1;
+		waitpid(pid, &status, 0);
+		test_result("...and the child's wake found nobody",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+
+	/* a PRIVATE wake on the same word must not reach across: it is
+	 * keyed by the process, not by the page */
+	*word = 0;
+	pid = fork();
+	if (pid == 0) {
+		usleep(300 * 1000);
+		r = syscall(SYS_FUTEX, (long)word, FUTEX_WAKE_OP | FUTEX_PRIVATE,
+			    1, 0, 0, 0);
+		_exit(r == 0 ? 0 : 4);
+	}
+	if (pid > 0) {
+		struct timespec rel = { 0, 800 * 1000 * 1000 };
+
+		errno = 0;
+		r = syscall(SYS_FUTEX, (long)word, FUTEX_WAIT_OP, 0, (long)&rel,
+			    0, 0);
+		test_result("a private wake from another process does not wake a shared waiter",
+			    r < 0 && errno == ETIMEDOUT);
+		status = -1;
+		waitpid(pid, &status, 0);
+		test_result("...and it woke nobody",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+
+	munmap((void *)word, 4096);
+}
+
 static void test_resolver(void)
 {
 	unsigned char msg[NS_PACKETSZ];
@@ -11854,6 +12585,124 @@ static const char *gb_xfer_name(int cls)
 	default:
 		return "a mix (corruption)";
 	}
+}
+
+/* The video overlay streams of the virtual display adapter: claimed by
+ * the display's owner, fed whole register sets per frame, given up.  The
+ * X server's overlay video adaptor is the client; this is the same
+ * conversation from a test program on the primary node. */
+static void test_drm_vmw_overlay(void)
+{
+	printf("\n[TEST] display-manager device: video overlay streams (vmwgfx)\n");
+	int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		printf("  (no primary node, skipped)\n");
+		return;
+	}
+	struct drm_version v;
+	char name[16];
+	memset(&v, 0, sizeof(v));
+	memset(name, 0, sizeof(name));
+	v.name = name;
+	v.name_len = sizeof(name) - 1;
+	if (ioctl(fd, DRM_IOCTL_VERSION, &v) != 0 || strcmp(name, "vmwgfx") != 0) {
+		printf("  (driver is '%s', not vmwgfx: skipped)\n", name);
+		close(fd);
+		return;
+	}
+	struct drm_vmw_getparam_arg gp = { .param = DRM_VMW_PARAM_NUM_STREAMS };
+	test_result("vmw NUM_STREAMS answers", vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp)) == 0);
+	int nstreams = (int)gp.value;
+	gp.param = DRM_VMW_PARAM_NUM_FREE_STREAMS;
+	vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp));
+	printf("  (streams: %d, free: %d)\n", nstreams, (int)gp.value);
+	struct drm_vmw_stream_arg sa;
+	memset(&sa, 0, sizeof(sa));
+	if (nstreams == 0) {
+		test_result("vmw CLAIM_STREAM without overlay -> ENOSYS",
+			    vmw_cmd(fd, DRM_VMW_CLAIM_STREAM, _IOC_READ, &sa, sizeof(sa)) == -1 && errno == ENOSYS);
+		close(fd);
+		return;
+	}
+	sa.stream_id = 0xffffffffu;
+	int crc = vmw_cmd(fd, DRM_VMW_CLAIM_STREAM, _IOC_READ, &sa, sizeof(sa));
+	if (crc == -1 && errno == EACCES) {
+		printf("  (another client owns the display: skipped)\n");
+		close(fd);
+		return;
+	}
+	test_result("vmw CLAIM_STREAM", crc == 0 && sa.stream_id == 0);
+	gp.param = DRM_VMW_PARAM_NUM_FREE_STREAMS;
+	vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp));
+	test_result("vmw a claimed stream is not free", gp.value == 0);
+	struct drm_vmw_stream_arg sb;
+	memset(&sb, 0, sizeof(sb));
+	test_result("vmw a second CLAIM_STREAM -> ESRCH",
+		    vmw_cmd(fd, DRM_VMW_CLAIM_STREAM, _IOC_READ, &sb, sizeof(sb)) == -1 && errno == ESRCH);
+
+	/* a 64x64 YUY2 frame: two bytes per pixel */
+	union drm_vmw_alloc_bo_arg bo;
+	memset(&bo, 0, sizeof(bo));
+	bo.req.size = 64 * 64 * 2;
+	int brc = vmw_cmd(fd, DRM_VMW_ALLOC_BO, _IOC_READ | _IOC_WRITE, &bo, sizeof(bo));
+	test_result("vmw overlay frame buffer", brc == 0 && bo.rep.handle);
+	if (brc == 0) {
+		uint8_t *fr = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)bo.rep.map_handle);
+		if (fr != MAP_FAILED) {
+			/* grey with full chroma: Y 0x80, U/V 0x80 */
+			memset(fr, 0x80, 8192);
+			munmap(fr, 8192);
+		}
+		struct drm_vmw_control_stream_arg cs;
+		memset(&cs, 0, sizeof(cs));
+		cs.stream_id = 0;
+		cs.enabled = 1;
+		cs.flags = 0;
+		cs.color_key = 0;
+		cs.handle = bo.rep.handle;
+		cs.offset = 0;
+		cs.format = 0x32595559; /* YUY2 */
+		cs.size = 8192;
+		cs.width = 64;
+		cs.height = 64;
+		cs.pitch[0] = 128;
+		cs.src.x = 0; cs.src.y = 0; cs.src.w = 64; cs.src.h = 64;
+		cs.dst.x = 0; cs.dst.y = 0; cs.dst.w = 128; cs.dst.h = 128;
+		test_result("vmw CONTROL_STREAM shows a frame",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == 0);
+		cs.dst.x = 16;
+		test_result("vmw CONTROL_STREAM again with the same buffer",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == 0);
+		cs.format = 0x12345678;
+		test_result("vmw CONTROL_STREAM unknown format -> EINVAL",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == -1 && errno == EINVAL);
+		cs.format = 0x32595559;
+		cs.size = 8192 + 4096;
+		test_result("vmw CONTROL_STREAM past the buffer -> EINVAL",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == -1 && errno == EINVAL);
+		cs.size = 8192;
+		cs.stream_id = 1;
+		test_result("vmw CONTROL_STREAM of a stream that is not there -> EINVAL",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == -1 && errno == EINVAL);
+		cs.stream_id = 0;
+		cs.enabled = 0;
+		test_result("vmw CONTROL_STREAM stops the stream",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == 0);
+		cs.enabled = 1;
+		test_result("vmw CONTROL_STREAM starts it again",
+			    vmw_cmd(fd, DRM_VMW_CONTROL_STREAM, _IOC_WRITE, &cs, sizeof(cs)) == 0);
+	}
+	test_result("vmw UNREF_STREAM", vmw_cmd(fd, DRM_VMW_UNREF_STREAM, _IOC_WRITE, &sa, sizeof(sa)) == 0);
+	test_result("vmw UNREF_STREAM twice -> EINVAL",
+		    vmw_cmd(fd, DRM_VMW_UNREF_STREAM, _IOC_WRITE, &sa, sizeof(sa)) == -1 && errno == EINVAL);
+	gp.param = DRM_VMW_PARAM_NUM_FREE_STREAMS;
+	vmw_cmd(fd, DRM_VMW_GET_PARAM, _IOC_READ | _IOC_WRITE, &gp, sizeof(gp));
+	test_result("vmw the stream is free again", gp.value == nstreams);
+	if (brc == 0) {
+		struct drm_vmw_unref_dmabuf_arg ub = { .handle = bo.rep.handle };
+		vmw_cmd(fd, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &ub, sizeof(ub));
+	}
+	close(fd);
 }
 
 static void test_drm_3d(void)
@@ -20206,6 +21055,42 @@ int main(int argc, char **argv)
 		test_result("getopt_long: unknown --unknown returns '?'",
 			    ch == '?');
 		opterr = 1;
+
+		/* getopt_long_only: a single dash introduces a long option
+		 * too, a lone short letter stays short, and what matches no
+		 * long option falls back to the short options */
+		struct option longopts8[] = { { "width", required_argument, NULL, 'w' },
+					      { "help", no_argument, NULL, 'h' },
+					      { "verbose", no_argument, NULL, 'V' },
+					      { NULL, 0, NULL, 0 } };
+		char *argv8[] = { "prog", "-width", "640", "-help", "--verbose", "-v", "-hv", NULL };
+		int argc8 = 7;
+		char order[16];
+		int nord = 0;
+		char *w_arg = NULL;
+		optind = 1;
+		while ((ch = getopt_long_only(argc8, argv8, "hv", longopts8, &longidx)) != -1) {
+			if (ch == 'w')
+				w_arg = optarg;
+			if (nord < 15)
+				order[nord++] = (char)ch;
+		}
+		order[nord] = '\0';
+		test_result("getopt_long_only: -width 640 is the long option",
+			    order[0] == 'w' && w_arg && strcmp(w_arg, "640") == 0);
+		test_result("getopt_long_only: -help is the long option", order[1] == 'h');
+		test_result("getopt_long_only: --verbose still works", order[2] == 'V');
+		test_result("getopt_long_only: -v stays a short option", order[3] == 'v');
+		test_result("getopt_long_only: -hv is the short run h,v",
+			    strcmp(order, "whVvhv") == 0);
+		test_result("getopt_long_only: everything consumed", optind == argc8);
+		char *argv9[] = { "prog", "-nosuch", NULL };
+		optind = 1;
+		opterr = 0;
+		ch = getopt_long_only(2, argv9, "hv", longopts8, &longidx);
+		test_result("getopt_long_only: -nosuch returns '?'", ch == '?');
+		opterr = 1;
+		optind = 1;
 	}
 
 	// ========================================
@@ -20258,7 +21143,17 @@ int main(int argc, char **argv)
 		test_result("gmtime(2000-06-15 12:30:45): sec=45",
 			    tm2.tm_sec == 45);
 
-		/* Test 4: mktime round-trip */
+		/* Test 4: mktime round-trip.  mktime() reads the local zone,
+		 * and the numbers below are the UTC ones, so the zone is
+		 * pinned for these two calls and put back afterwards. */
+		const char *saved_tz = getenv("TZ");
+		char saved_tz_buf[128];
+		if (saved_tz) {
+			strncpy(saved_tz_buf, saved_tz, sizeof(saved_tz_buf) - 1);
+			saved_tz_buf[sizeof(saved_tz_buf) - 1] = '\0';
+		}
+		setenv("TZ", "UTC0", 1);
+		tzset();
 		struct tm tm_rt;
 		tm_rt.tm_year = 124; /* 2024 */
 		tm_rt.tm_mon = 0; /* January */
@@ -20283,6 +21178,11 @@ int main(int argc, char **argv)
 		time_t rt2 = mktime(&tm_rt2);
 		test_result("mktime(2000-06-15 12:30:45) == 961072245",
 			    rt2 == 961072245);
+		if (saved_tz)
+			setenv("TZ", saved_tz_buf, 1);
+		else
+			unsetenv("TZ");
+		tzset();
 
 		/* Test 6: strftime basic formatting */
 		char buf[128];
@@ -20986,6 +21886,7 @@ int main(int argc, char **argv)
 	test_rtld_debug_rendezvous();
 	test_shm();
 	test_sysv_shm();
+	test_sysv_sem();
 	test_tls();
 	test_xorg_libc_additions();
 	test_gtk3_libc_additions();
@@ -30287,6 +31188,7 @@ network_skip:;
 	test_orphan_reaping();
 	test_printf_conversions();
 	test_futex_ops();
+	test_futex_shared();
 	test_resolver();
 	test_mincore();
 	test_c99_math_additions();
@@ -30313,6 +31215,7 @@ gpu_section:
 		test_drm_i915();
 	test_drm();
 	test_drm_3d();
+	test_drm_vmw_overlay();
 	test_gpu_userland();
 
 	// ========================================

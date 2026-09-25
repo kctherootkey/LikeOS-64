@@ -399,6 +399,7 @@ struct drm_file {
 	int pending_vblank; /* WAIT_VBLANK events queued */
 	uint64_t client_caps; /* bit n = DRM_CLIENT_CAP_n */
 	void *priv; /* backend per-file state */
+	struct vfs_file *vfs; /* the open file this is the state of */
 	struct drm_file *next; /* device list */
 };
 
@@ -580,6 +581,13 @@ struct drm_driver {
 	 * PAGE_WRITE_THROUGH alone is write-combining; with
 	 * PAGE_CACHE_DISABLE, uncached; 0 write-back. */
 	uint64_t (*gem_mmap_pte)(struct drm_gem_object *o, unsigned kind);
+	/* Optional: a mapping kind the driver serves itself (a graphics
+	 * aperture rather than the object's pages).  `first_page' is where
+	 * the mapping starts in the object.  Returns 1 with `m' filled in
+	 * (the driver took its own reference on the object for the
+	 * mapping), 0 to let the core map the pages, or a negative errno. */
+	int (*gem_mmap_kind)(struct drm_gem_object *o, unsigned kind,
+			     uint64_t first_page, struct device_mmap *m);
 	/* Optional: called once the root filesystem is mounted, for the
 	 * parts of bring-up that need a file (firmware) or a thread. */
 	int (*late_init)(struct drm_device *dev);

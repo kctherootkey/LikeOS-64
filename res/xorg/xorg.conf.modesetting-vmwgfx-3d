@@ -123,6 +123,12 @@ Section "Device"
 	Option		"AccelMethod"	"glamor"
 	Option		"DRI"	"3"
 	Option		"PageFlip"	"true"
+
+	# XVideo: the display adapter's own video overlay stream (colour-keyed
+	# into the screen, composited by the host) is registered as the first
+	# adaptor, glamor's textured video as the second.  Off drops the
+	# overlay adaptor, leaving the textured one.
+	#Option		"VideoOverlay"	"off"
 EndSection
 
 Section "Screen"

@@ -185,16 +185,19 @@ void i915_execlists_process_csb(struct i915_engine *e)
 	int left = 0, preempted = 0;
 
 	spin_lock_irqsave(&e->lock, &fl);
-	int write = (int)(e->hwsp[csb_write_index(e)] & 0xff);
+	int write = (int)(i915_hwsp_read(e, csb_write_index(e)) & 0xff);
 	if (write >= e->csb_entries)
 		write = e->csb_entries - 1;
 	int head = e->csb_head;
 	while (head != write) {
 		head = (head + 1) % e->csb_entries;
-		uint32_t status = e->hwsp[I915_HWS_CSB_BUF0_INDEX + head * 2];
-		uint32_t ctxid = e->hwsp[I915_HWS_CSB_BUF0_INDEX + head * 2 + 1];
-		if (status == 0xffffffffu)
-			break; /* not yet written */
+		uint32_t status = i915_hwsp_read(e, I915_HWS_CSB_BUF0_INDEX + head * 2);
+		uint32_t ctxid = i915_hwsp_read(e, I915_HWS_CSB_BUF0_INDEX + head * 2 + 1);
+		if (status == 0xffffffffu) {
+			/* not written yet: looked at again next time */
+			head = (head + e->csb_entries - 1) % e->csb_entries;
+			break;
+		}
 		e->hwsp[I915_HWS_CSB_BUF0_INDEX + head * 2] = 0xffffffffu;
 		/* Only the context in the port matters.  A context that went
 		 * idle stays resident until the next one is loaded, and its
@@ -270,7 +273,7 @@ static void gt_worker_pass(struct i915_device *i915)
 			continue;
 		}
 		/* Progress is the sequence number or the active head moving. */
-		uint32_t seqno = e->hwsp[I915_HWS_SEQNO_INDEX];
+		uint32_t seqno = i915_hwsp_read(e, I915_HWS_SEQNO_INDEX);
 		uint32_t acthd = i915_read32(i915, RING_ACTHD(e->mmio_base));
 		if (seqno != e->hang_seqno || acthd != e->hang_acthd) {
 			e->hang_seqno = seqno;

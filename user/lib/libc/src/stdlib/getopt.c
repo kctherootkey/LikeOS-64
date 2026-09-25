@@ -91,8 +91,16 @@ int getopt(int argc, char *const argv[], const char *optstring)
 	return optopt;
 }
 
-int getopt_long(int argc, char *const argv[], const char *optstring,
-		const struct option *longopts, int *longindex)
+/* The long-option scanner behind getopt_long() and getopt_long_only().
+ *
+ * With `long_only' set, an argument with a single dash is tried as a long
+ * option first ("-name" or "-name=value") and falls back to the short
+ * options only when no long option matches: the GNU getopt_long_only()
+ * rule, which programs use so that "-help" and "--help" both work.  A
+ * lone "-x" whose letter is a short option stays a short option. */
+static int getopt_long_common(int argc, char *const argv[], const char *optstring,
+			      const struct option *longopts, int *longindex,
+			      int long_only)
 {
 	optarg = NULL;
 
@@ -102,10 +110,19 @@ int getopt_long(int argc, char *const argv[], const char *optstring,
 	if (argv[optind] == NULL)
 		return -1;
 
-	/* Check for long option (--name or --name=value) */
+	/* Check for long option (--name or --name=value; with long_only
+	 * also -name, unless it is a short option letter on its own) */
+	int dashes = 0;
 	if (argv[optind][0] == '-' && argv[optind][1] == '-' &&
-	    argv[optind][2] != '\0') {
-		const char *arg = &argv[optind][2];
+	    argv[optind][2] != '\0')
+		dashes = 2;
+	else if (long_only && _optpos == 0 && argv[optind][0] == '-' &&
+		 argv[optind][1] != '-' && argv[optind][1] != '\0' &&
+		 !(argv[optind][2] == '\0' && optstring &&
+		   argv[optind][1] != ':' && strchr(optstring, argv[optind][1])))
+		dashes = 1;
+	if (dashes) {
+		const char *arg = &argv[optind][dashes];
 		size_t namelen;
 		const char *eq = strchr(arg, '=');
 
@@ -180,14 +197,30 @@ int getopt_long(int argc, char *const argv[], const char *optstring,
 			return o->val;
 		}
 
-		/* Unknown long option */
+		/* Unknown long option: with a single dash the argument may
+		 * still be a run of short options */
+		if (dashes == 1 && optstring && arg[0] != ':' &&
+		    strchr(optstring, arg[0]))
+			return getopt(argc, argv, optstring);
 		if (opterr)
-			fprintf(stderr, "%s: unrecognized option '--%.*s'\n",
-				argv[0], (int)namelen, arg);
+			fprintf(stderr, "%s: unrecognized option '%s%.*s'\n",
+				argv[0], dashes == 2 ? "--" : "-", (int)namelen, arg);
 		optind++;
 		return '?';
 	}
 
 	/* Fall through to short option processing */
 	return getopt(argc, argv, optstring);
+}
+
+int getopt_long(int argc, char *const argv[], const char *optstring,
+		const struct option *longopts, int *longindex)
+{
+	return getopt_long_common(argc, argv, optstring, longopts, longindex, 0);
+}
+
+int getopt_long_only(int argc, char *const argv[], const char *optstring,
+		     const struct option *longopts, int *longindex)
+{
+	return getopt_long_common(argc, argv, optstring, longopts, longindex, 1);
 }

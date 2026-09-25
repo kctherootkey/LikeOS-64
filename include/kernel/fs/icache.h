@@ -46,6 +46,10 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 	0x08 // No set-user/-group-ID bits left to strip on \
 		// a non-privileged modify (write-path fast \
 		// path); cleared whenever the mode changes.
+#define IC_ORPHAN                                          \
+	0x10 // Unlinked while a handle still referenced it: \
+		// the filesystem keeps the inode and its blocks \
+		// until the last icache_unref_flagged() says so.
 
 // ============================================================================
 // Structures
@@ -120,6 +124,17 @@ void icache_ref(ic_inode_t *inode);
 
 // Decrement reference count (inode stays cached even at refcount 0)
 void icache_unref(ic_inode_t *inode);
+
+// Set `flag' on the cached inode for this key if a handle still references
+// it.  Test and mark are one step under the cache's lock, so a close racing
+// with the caller either sees the flag or has already been counted out.
+// Returns 1 if marked (something holds the inode), 0 otherwise.
+int icache_flag_if_referenced(unsigned long start_cluster, uint32_t flag);
+
+// icache_unref() that also answers whether this was the LAST reference to
+// an inode carrying `flag': returns 1 in that case (the flag is cleared and
+// the caller owns what it stood for), 0 otherwise.
+int icache_unref_flagged(ic_inode_t *inode, uint32_t flag);
 
 // Update inode metadata (e.g., after write changes file size)
 void icache_update_size(ic_inode_t *inode, unsigned long new_size);

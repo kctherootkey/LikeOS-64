@@ -15,9 +15,11 @@ extern "C" {
 
 #define EOF (-1)
 
+#ifndef SEEK_SET
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
+#endif
 
 #define BUFSIZ 4096
 
@@ -44,7 +46,7 @@ extern "C" {
  * they cannot drift apart unnoticed.
  */
 #define FILENAME_MAX 4096
-#define FOPEN_MAX 1024
+#define FOPEN_MAX 4096 /* OPEN_MAX of <limits.h>: a stream per descriptor */
 #define TMP_MAX 10000
 
 /* Buffering modes for setvbuf */

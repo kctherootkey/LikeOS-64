@@ -58,8 +58,9 @@ static const struct intel_device_info info_broadwell = {
 	.flags = I915_INFO_HAS_DDI | I915_INFO_HAS_EXECLISTS |
 		 I915_INFO_HAS_LLC | I915_INFO_HAS_FULL_PPGTT |
 		 I915_INFO_HAS_PCH | I915_INFO_HAS_DP_MST,
+	/* the second video engine is the GT3 parts' (i915_engines_init) */
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
-		       I915_ENGINE_VCS1 | I915_ENGINE_VECS0,
+		       I915_ENGINE_VECS0,
 };
 
 static const struct intel_device_info info_cherryview = {

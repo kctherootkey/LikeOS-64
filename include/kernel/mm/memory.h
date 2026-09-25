@@ -222,6 +222,14 @@ int mm_dirty_clean_mappings(struct mm_dirty_walk *w);
  * called unconditionally from the read/write/send/recv entry points. */
 void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write);
 
+/* Map `file' into the calling process from kernel context (a driver
+ * answering an ioctl with an address): mmap(2) semantics with no address
+ * hint and no descriptor number recorded.  Returns the address or a
+ * negative errno.  The caller must not hold the address-space lock. */
+struct vfs_file;
+int64_t mm_mmap_file(struct vfs_file *file, uint64_t length, uint64_t prot,
+		     uint64_t flags, uint64_t offset);
+
 // Page flags for virtual memory
 #define PAGE_PRESENT 0x001
 #define PAGE_WRITABLE 0x002

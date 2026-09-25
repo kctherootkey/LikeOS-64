@@ -802,6 +802,7 @@ static void vmw_postclose(struct drm_device *dev, struct drm_file *fp)
 	/* Anything this file asked to be told about is dropped here: the
 	 * event would be queued onto a file that no longer exists. */
 	vmw_fence_events_release(fp);
+	vmw_overlay_file_release(dev->priv, fp);
 	vmw_file_release(dev->priv, fp);
 }
 
@@ -869,8 +870,10 @@ static long vmw_ioctl_get_param(struct vmw_device *v, struct drm_vmw_getparam_ar
 {
 	switch (a->param) {
 	case DRM_VMW_PARAM_NUM_STREAMS:
+		a->value = vmw_overlay_num_streams(v);
+		return 0;
 	case DRM_VMW_PARAM_NUM_FREE_STREAMS:
-		a->value = 0;
+		a->value = vmw_overlay_num_free_streams(v);
 		return 0;
 	case DRM_VMW_PARAM_3D:
 		a->value = v->has_3d;
@@ -1313,6 +1316,15 @@ static long vmw_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
 		return vmw_ioctl_update_layout(v, kb);
 	case DRM_VMW_MSG:
 		return vmw_ioctl_msg(v, kb);
+	/* the video overlay streams: the display's owner only */
+	case DRM_VMW_CONTROL_STREAM:
+		if (size < sizeof(struct drm_vmw_control_stream_arg))
+			return -EINVAL;
+		return vmw_ioctl_control_stream(v, fp, kb);
+	case DRM_VMW_CLAIM_STREAM:
+		return vmw_ioctl_claim_stream(v, fp, kb);
+	case DRM_VMW_UNREF_STREAM:
+		return vmw_ioctl_unref_stream(v, fp, kb);
 	default:
 		return v->has_3d ? -ENOSYS : -ENODEV;
 	}
@@ -1746,7 +1758,8 @@ void vmwgfx_init(void)
 		sw = v->screen_w;
 		sh = v->screen_h;
 	}
-	kprintf("[drm] vmwgfx: %ux%u, %s scan-out, gmr %s, 3d %s, gb %s, dx %s (sm4.1 %s, sm5 %s), cmdbuf %s, irq %s\n",
+	vmw_overlay_init(v);
+	kprintf("[drm] vmwgfx: %ux%u, %s scan-out, gmr %s, 3d %s, gb %s, dx %s (sm4.1 %s, sm5 %s), cmdbuf %s, irq %s, overlay streams %d\n",
 		sw, sh,
 		vmw_stdu_available(v)   ? "screen-target" :
 		v->has_screen_object	? "screen-object" : "legacy",
@@ -1754,5 +1767,6 @@ void vmwgfx_init(void)
 		v->has_gb ? "yes" : "no", v->has_dx ? "yes" : "no",
 		v->has_sm41 ? "yes" : "no", v->has_sm5 ? "yes" : "no",
 		v->has_cmdbuf ? "yes" : "no",
-		v->hw.irq_enabled ? "yes" : "polled");
+		v->hw.irq_enabled ? "yes" : "polled",
+		vmw_overlay_num_streams(v));
 }

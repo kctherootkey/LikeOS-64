@@ -335,6 +335,7 @@ typedef struct procmapinfo {
  * few operations the MIT-SHM extension uses are implemented. */
 #define IPC_PRIVATE 0
 #define IPC_CREAT 01000
+#define IPC_NOWAIT 04000
 #define IPC_EXCL 02000
 #define IPC_RMID 0
 #define IPC_SET 1
@@ -360,6 +361,9 @@ struct k_shmid_ds {
 #define SYS_SHMAT 402
 #define SYS_SHMDT 403
 #define SYS_SHMCTL 404 // (path) root-only: confine textual path resolution to a subtree
+#define SYS_SEMGET 421
+#define SYS_SEMOP 422
+#define SYS_SEMCTL 423
 
 // rusage who values
 #define RUSAGE_SELF 0
@@ -581,6 +585,8 @@ typedef struct k_flock {
 #define EHOSTUNREACH 113 // No route to host
 #define EPROTO 71 // Protocol error
 #define ERANGE 34 // Math result not representable
+#define ENOMSG 42 // No message of desired type
+#define EIDRM 43 // Identifier removed
 #define ELOOP 40 // Too many symbolic links
 #define ENFILE 23 // File table overflow
 #define EMSGSIZE 90 // Message too long

@@ -68,6 +68,13 @@ struct device_mmap {
 	 * record made of the mapping and consulted by the write-fault and
 	 * unmap paths.  NULL for the ordinary case.  See mm_dirty_ops. */
 	const struct mm_dirty_ops *dirty_ops;
+	/* A lazy mapping: no entry is made at mmap time; each page is asked
+	 * for at its first touch through `fault' (the physical page, or 0 to
+	 * fail the access).  For a driver that has to set something up on the
+	 * device before the pages can be reached -- a graphics aperture whose
+	 * pages exist only while the object is bound behind it. */
+	int lazy;
+	uint64_t (*fault)(void *obj, uint64_t index);
 };
 
 /* Every operation is optional; a NULL slot answers the conventional way

@@ -165,10 +165,47 @@ struct i915_vm *i915_vm_create(struct i915_device *i915)
 	table_flush(i915, vm->scratch_pd);
 	table_flush(i915, vm->scratch_pdp);
 	table_flush(i915, vm->pml4);
-	/* relocation clients get addresses from 4 GB up, clear of anything
-	 * a 32-bit-minded client pins low */
-	vm->alloc_next = 1ULL << 32;
+	/* relocation clients: objects that must stay below 4 GB start at
+	 * 1 MB (nothing lands on the null page), the rest from 4 GB up */
+	vm->alloc_low = 1ULL << 20;
+	vm->alloc_high = 1ULL << 32;
 	return vm;
+}
+
+/* An address for an object the client did not place: next fit from the
+ * zone's cursor, wrapping to the zone's start once, and the binding
+ * attached under the same hold of the lock so nothing else can take the
+ * gap in between.  The zone below 4 GB is for objects without the 48-bit
+ * flag -- the contract a relocation client relies on when it writes a
+ * 32-bit address into a command -- and it stays clear of the other zone
+ * so that it is never eaten by objects that could go anywhere. */
+int i915_vm_vma_alloc(struct i915_vm *vm, struct i915_vma *v, uint32_t npages,
+		      uint64_t align, int low)
+{
+	uint64_t zone_start = low ? (1ULL << 20) : (1ULL << 32);
+	uint64_t zone_end = low ? (1ULL << 32) : I915_VM_SIZE;
+	uint64_t *cursor = low ? &vm->alloc_low : &vm->alloc_high;
+	uint64_t fl, a;
+
+	if (align < 4096)
+		align = 4096;
+	if (align & (align - 1))
+		return -EINVAL;
+	spin_lock_irqsave(&vm->lock, &fl);
+	if (v->attached)
+		i915_vma_list_detach(&vm->vmas, v);
+	a = i915_vma_list_find_gap(vm->vmas, *cursor, zone_end, npages, align);
+	if (!a)
+		a = i915_vma_list_find_gap(vm->vmas, zone_start, zone_end, npages, align);
+	if (a) {
+		*cursor = a + (uint64_t)npages * 4096;
+		v->addr = a;
+		v->npages = npages;
+		v->allocated = 1;
+		i915_vma_list_attach(&vm->vmas, v);
+	}
+	spin_unlock_irqrestore(&vm->lock, fl);
+	return a ? 0 : -ENOSPC;
 }
 
 void i915_vm_get(struct i915_vm *vm)

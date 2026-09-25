@@ -119,6 +119,12 @@ Section "Device"
 	#     Option "DRI"         "3"       hand clients buffers by descriptor
 	#     Option "PageFlip"    "true"    flip, not copy, on a full-screen present
 	Option		"AccelMethod"	"none"
+
+	# XVideo on VMware: with no GPU to render with, the display adapter's
+	# own video overlay stream (colour-keyed, composited by the host) is the
+	# one accelerated video path, registered when the display manager
+	# offers a stream.  Off leaves the server with no XVideo adaptor.
+	#Option		"VideoOverlay"	"off"
 EndSection
 
 Section "Screen"

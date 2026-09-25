@@ -2862,8 +2862,14 @@ static mmap_region_t *mm_region_at_or_after(task_t *task, uint64_t *addr)
 		 * by the region's extent -- returning one would leave them
 		 * exactly where they were, forever.  Nothing should produce
 		 * one, so say so rather than just stepping over it. */
-		if (WARN_ON(r->length == 0))
+		if (r->length == 0) {
+			WARN_RATELIMIT(1,
+				       "mmap: %s (pid %d) region slot %u at %llx is in use with no length",
+				       task->comm[0] ? task->comm : "?",
+				       task->id, i,
+				       (unsigned long long)r->start);
 			continue;
+		}
 		if (!best || r->start < best->start)
 			best = r;
 	}
@@ -2905,6 +2911,10 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 	if (a->prot != b->prot || a->flags != b->flags)
 		return false;
 	if (a->lazy != b->lazy || a->device != b->device)
+		return false;
+	/* a lazy device mapping's pages come from its own driver object
+	 * with its own index base; two records are two mappings */
+	if (a->device && a->lazy)
 		return false;
 	/* Device mappings carry a physical base as well as a virtual one, and
 	 * two that abut in virtual space need not abut in physical space.
@@ -5801,6 +5811,10 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 	struct vfs_file *file = NULL;
 	uint64_t file_off = 0;
 	int found = 0;
+	/* a lazy device mapping: the driver names the page */
+	uint64_t (*dev_fault)(void *, uint64_t) = NULL;
+	void *dev_obj = NULL;
+	uint64_t dev_index = 0, dev_extra = 0;
 
 	// brk heap: everything in [brk_start, page-aligned brk) is lazy zeros
 	if (mm->brk_start && page >= mm->brk_start &&
@@ -5839,6 +5853,15 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 				map_flags |= PAGE_WRITABLE;
 			if (!(r->prot & PROT_EXEC))
 				map_flags |= PAGE_NO_EXECUTE;
+			if (r->device && r->dev_fault) {
+				dev_fault = r->dev_fault;
+				dev_obj = r->dev_obj;
+				dev_index = ((r->offset & 0xFFFFFFFFULL) +
+					     (page - r->start)) / PAGE_SIZE;
+				dev_extra = r->dev_pte_extra;
+				found = 1;
+				break;
+			}
 			file = r->file;
 			file_off = r->offset + (page - r->start);
 			found = 1;
@@ -5847,6 +5870,26 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 	}
 	if (!found)
 		return 0;
+
+	if (dev_fault) {
+		/* The driver's page, mapped as a device page the address
+		 * space does not own.  A refusal is a genuine fault. */
+		uint64_t dphys = dev_fault(dev_obj, dev_index);
+		if (!dphys)
+			return 0;
+		uint64_t lf2;
+		spin_lock_irqsave(&g_lazy_map_lock, &lf2);
+		uint64_t *dpte = mm_get_page_table_from_pml4(mm->pml4, page, false);
+		if (dpte && (*dpte & PAGE_PRESENT)) {
+			spin_unlock_irqrestore(&g_lazy_map_lock, lf2);
+			return 1;
+		}
+		bool dok = mm->pml4 && mm_map_page_in_address_space(
+					     mm->pml4, page, dphys,
+					     map_flags | PAGE_DEVICE | dev_extra);
+		spin_unlock_irqrestore(&g_lazy_map_lock, lf2);
+		return dok ? 1 : 0;
+	}
 
 	uint64_t phys = mm_alloc_page_for_fault();
 	if (!phys) {

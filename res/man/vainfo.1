@@ -1,0 +1,40 @@
+VAINFO(1)                        User Commands                       VAINFO(1)
+
+NAME
+       vainfo - display information from the VA-API driver
+
+SYNOPSIS
+       vainfo [--display drm|x11] [--device path] [-a]
+
+DESCRIPTION
+       This program displays information about the VA-API (video acceleration)
+       driver  installed  in  the  system:  the library version, the driver it
+       loaded and every profile and entrypoint (decode, encode, video process-
+       ing) the driver offers for the graphics device.
+
+OPTIONS
+       --display drm|x11
+              The back end to open the device through.  drm opens  the  render
+              node  directly  and  needs  no  X server; x11 asks the running X
+              server for the device.  Without the option the X11 back  end  is
+              tried when DISPLAY is set, the DRM one otherwise.
+
+       --device path
+              The render node for the DRM back end, /dev/dri/renderD128 by de-
+              fault.
+
+       -a, --all
+              Print every attribute of every configuration as well.
+
+ENVIRONMENT
+       LIBVA_DRIVER_NAME
+              The  driver to load in place of the one chosen from the graphics
+              device's kernel driver (for Intel graphics: iHD, then i965).
+
+       LIBVA_DRIVERS_PATH
+              Where the drivers are looked for, /usr/lib/dri by default.
+
+SEE ALSO
+       ffmpeg(1), gst-inspect-1.0(1), drminfo(1)
+
+vainfo                          September 2026                       VAINFO(1)

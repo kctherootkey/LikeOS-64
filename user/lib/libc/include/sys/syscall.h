@@ -192,6 +192,9 @@
 #define SYS_SHMAT       402
 #define SYS_SHMDT       403
 #define SYS_SHMCTL      404
+#define SYS_SEMGET      421
+#define SYS_SEMOP       422
+#define SYS_SEMCTL      423
 #define SYS_GETPROCMAPS 407   /* (pid, procmapinfo*, procmap*, max) */
 #define SYS_MINCORE     409   /* (addr, length, vec) page residency, one byte per page */
 #define SYS_CLOCK_NANOSLEEP 410 /* (clockid, flags, req, rem) */
