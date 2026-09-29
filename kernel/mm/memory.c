@@ -15,6 +15,8 @@
 #include <kernel/fs/vfs.h> // demand paging: file-backed page-in
 #include <kernel/ke/syscall.h> // PROT_* for lazy region protection
 #include <kernel/ke/timer.h> // timer_get_precise_us: the slow-fault detector
+#include <kernel/ke/hrtimer.h> // hrtimer_sleep_until: waiting for a killed process's memory
+#include <kernel/ke/signal.h> // signal_pending: the allocation's owner may be the victim
 
 // Enable SLAB allocator (comment out to use legacy fixed-size heap)
 #define USE_SLAB_ALLOCATOR
@@ -3261,6 +3263,20 @@ void mm_region_harvest_dirty(uint64_t *pml4, const mmap_region_t *r,
 	region_harvest_obj(pml4, r, r->dev_obj, from, to);
 }
 
+void mm_zap_range(task_t *task, uint64_t start, uint64_t end)
+{
+	struct mm_tlb_gather gather;
+
+	if (!task || !task->pml4 || end <= start)
+		return;
+	mm_assert_write_locked(&task->mmap_lock);
+	WARN_ON(irqs_disabled());
+	mm_tlb_gather_init(&gather, task->pml4);
+	for (uint64_t va = start; va < end; va += PAGE_SIZE)
+		mm_unmap_page_gathered(task->pml4, va, &gather);
+	mm_tlb_gather_flush(&gather);
+}
+
 int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 {
 	uint64_t cur_addr = addr;
@@ -5109,6 +5125,11 @@ static bool mm_phys_is_mappable(uint64_t phys)
  * pagecache_reclaim_if_needed() spells out.  Dropping the clean ones is what
  * relieves the pressure; the dirty ones become reclaimable once the writeback
  * thread has dealt with them. */
+/* How long an allocation waits for a killed process's memory to come back
+ * before it reports failure, and how long each wait is. */
+#define MM_OOM_WAIT_ROUNDS 150
+#define MM_OOM_NAP_NS (20ULL * 1000000ULL)
+
 static uint64_t mm_alloc_page_reclaim_do(void *caller)
 {
 	uint64_t phys = mm_alloc_page_do(caller);
@@ -5122,7 +5143,45 @@ static uint64_t mm_alloc_page_reclaim_do(void *caller)
 	 * work is paid for by whoever touched the page. */
 	pagecache_shrink(32, 0);
 	pagecache_request_writeback();
-	return mm_alloc_page_do(caller);
+	phys = mm_alloc_page_do(caller);
+	if (phys)
+		return phys;
+
+	/* Nothing to reclaim: the machine is out of memory.  The allocation
+	 * is not failed here: the process using the most memory is killed,
+	 * this waits for that memory to come back, and only an allocation
+	 * still unmet after that fails.  Failing at once instead
+	 * gave whoever happened to fault next -- the display server, the
+	 * browser's user interface, init -- a segmentation fault for a
+	 * shortage some other process caused, and a kernel allocation with no
+	 * failure branch took the machine down with it.
+	 *
+	 * Process context only, with interrupts on: the kill takes the task
+	 * list lock and the wait sleeps, neither of which a caller holding a
+	 * spinlock can afford; such a caller gets its failure as before. */
+	task_t *cur = sched_current();
+
+	if (!cur || !irqs_enabled())
+		return 0;
+	if (!sched_oom_kill())
+		return 0; /* nothing killable: a genuine failure */
+	for (int i = 0; i < MM_OOM_WAIT_ROUNDS; i++) {
+		/* The victim may be this very process; its own allocation
+		 * has nothing left to wait for. */
+		if (signal_pending(cur))
+			return 0;
+		hrtimer_sleep_until(hrtimer_now_ns() + MM_OOM_NAP_NS, NULL);
+		pagecache_shrink(32, 0);
+		phys = mm_alloc_page_do(caller);
+		if (phys)
+			return phys;
+		/* A second later and still nothing: the victim's memory has
+		 * not come back (it is still exiting, or was not the hog).
+		 * Ask again; the killer waits for its last victim itself. */
+		if ((i % 50) == 49 && !sched_oom_kill())
+			return 0;
+	}
+	return 0;
 }
 
 uint64_t mm_allocate_physical_page_reclaim(void)

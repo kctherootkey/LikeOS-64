@@ -1753,16 +1753,35 @@ void exception_handler(uint64_t *regs)
 				/* Already dead (killed mid-syscall, still
 				 * finishing kernel work): report nothing and
 				 * signal nothing — see task_is_dying. */
+				/* Fatal to the program: a kernel caller that
+				 * faults on a user address has been handed a bad
+				 * pointer, and without an exception table to turn
+				 * that into -EFAULT for the caller the process
+				 * ends instead -- and it ends HERE, the way the
+				 * user-mode fatal path below ends one.
+				 *
+				 * This used to queue SIGSEGV and park in a halt
+				 * loop "until the timer preempts us away".  A
+				 * signal is only ever delivered on a return to
+				 * user mode, which the loop never performs, so
+				 * nothing delivered it; and the scheduler took
+				 * the parked thread as runnable, so it ran the
+				 * loop again at every turn.  An immortal thread
+				 * at full processor load, with the address space
+				 * and every buffer of its process pinned behind
+				 * it -- even the SIGKILL its exiting leader sent
+				 * it stayed pending for ever.  A browser closing
+				 * a tab produced one per closed page. */
 				if (!task_is_dying(cur)) {
 					report_userspace_crash(cur, regs,
 							       SIGSEGV, "SIGSEGV",
 							       cr2, 14);
-					sched_signal_task(cur, SIGSEGV);
+					cur->exit_code = 128 + SIGSEGV;
+					cur->term_sig = SIGSEGV;
+					sched_kill_thread_group(cur, 128 + SIGSEGV);
+					sched_mark_task_exited(cur, 128 + SIGSEGV);
 				}
-				// Enable interrupts and halt - timer will preempt us to another task
-				for (;;) {
-					__asm__ volatile("sti; hlt");
-				}
+				sched_exit_park();
 			}
 		}
 	}
@@ -1773,8 +1792,11 @@ void exception_handler(uint64_t *regs)
 		 * (see task_is_dying).  No report, no signal on a half-torn-down
 		 * task: just park until the scheduler takes us away. */
 		if (task_is_dying(cur)) {
-			for (;;)
-				__asm__ volatile("sti; hlt");
+			/* Retire it now -- releasing what it holds -- rather
+			 * than halting until the scheduler "takes us away",
+			 * which it never does for a task it keeps finding
+			 * runnable. */
+			sched_exit_park();
 		}
 		/* A trap that belongs to a debugger rather than to the process.
 		 *

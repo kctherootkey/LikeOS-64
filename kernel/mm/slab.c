@@ -10,6 +10,7 @@
 #include <kernel/ke/sched.h> // For spinlock_t, sched_is_smp
 #include <kernel/ke/smp.h> // For smp_tlb_shootdown_sync
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/pagecache.h> // pagecache_shrink: reclaim when the free list is empty
 
 // External debug flag from memory.c
 extern int mm_debug_pt;
@@ -344,6 +345,16 @@ static slab_page_t *slab_alloc_page(slab_cache_t *cache)
 	BUG_ON(cache == NULL);
 	// Allocate a physical page
 	uint64_t phys_page = mm_allocate_physical_page();
+	if (phys_page == 0 && irqs_enabled()) {
+		/* The free list is empty.  With interrupts on the caller holds
+		 * no spinlock, so the page cache's own locks can be taken:
+		 * drop a batch of clean cache pages and ask again -- the
+		 * reference reclaims for kernel allocations too.  A caller
+		 * under a spinlock cannot be helped here and fails as before. */
+		pagecache_shrink(32, 0);
+		pagecache_request_writeback();
+		phys_page = mm_allocate_physical_page();
+	}
 	if (phys_page == 0) {
 		kprintf("SLAB: Failed to allocate physical page for cache size %u\n",
 			cache->object_size);

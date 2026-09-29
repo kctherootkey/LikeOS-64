@@ -1,8 +1,13 @@
 /*
  * LikeOS per-CPU preemptive scheduler
  *
- * Round-robin over per-CPU run queues, O(1) enqueue and dequeue, no priorities:
- * every runnable task gets SCHED_TIME_SLICE ticks before the timer preempts it.
+ * Fair scheduling over per-CPU run queues: every task is charged for the
+ * processor time it uses (task->vruntime), each queue is kept in that order,
+ * and the task that has run least runs next.  A task waking from sleep is
+ * placed just ahead of the runnable ones; a task that used its
+ * SCHED_TIME_SLICE ticks is requeued behind them.  There are no priorities.
+ * (Until 2026-09-29 the queues were first-in first-out, and a woken task
+ * waited behind every runnable one.)
  * task->rq_next links a task into one run queue; task->next links it into the
  * global task list, which is for lookup, signals and ps -- never scheduling.
  * The rule the whole file rests on: task->on_rq is protected by the run queue
@@ -963,7 +968,7 @@ sched_task_by_canary(uint64_t canary)
 
 /* ---- fair scheduling ------------------------------------------------------
  *
- * What the reference does, on this kernel's linked-list run queues: every
+ * Fair scheduling on this kernel's linked-list run queues: every
  * task carries the processor time it has consumed (vruntime, in TSC ticks),
  * the queue is kept ordered by it, and the next task to run is the one that
  * has had the least.  A task that wakes from sleep has a stale, small
@@ -980,8 +985,8 @@ sched_task_by_canary(uint64_t canary)
  * slices, and a thread doing many such exchanges a second stopped for
  * seconds at a time while the machine was nowhere near saturated. */
 
-#define SCHED_WAKEUP_GRAN_US 1000 /* the reference's wakeup granularity */
-#define SCHED_SLEEPER_BONUS_US 3000 /* half the reference's scheduling latency */
+#define SCHED_WAKEUP_GRAN_US 1000 /* how far ahead a runner may be before a wake preempts it */
+#define SCHED_SLEEPER_BONUS_US 3000 /* how far ahead of the floor a waking task is placed */
 
 static inline uint64_t sched_clock(void)
 {
@@ -1028,7 +1033,7 @@ void sched_tick_account(task_t *t)
 }
 
 /* Should the task just queued on `cpu' take the processor from what runs
- * there now?  The reference's wakeup preemption: yes when the processor is
+ * there now?  Yes when the processor is
  * idle or its task is due off anyway, or when that task has had more than
  * a wakeup granularity of processor time beyond the newcomer's.  Otherwise
  * the newcomer waits for the slice to end, which is what keeps two tasks
@@ -1532,7 +1537,7 @@ void sched_enqueue_ready(task_t *task)
 			if (dest != owner) {
 				/* vruntime is relative to a queue's floor:
 				 * carry the distance from one floor to the
-				 * other, as the reference does on migration. */
+				 * other when a task changes queues. */
 				task->vruntime += dest->min_vruntime -
 						  owner->min_vruntime;
 				task->on_cpu = dest_cpu;
@@ -2764,6 +2769,60 @@ task_t *sched_find_task_by_id_locked(uint32_t id)
 	return NULL;
 }
 
+/* ---- out of memory -------------------------------------------------------- */
+
+/* The one victim at a time.  While it is still exiting its memory is on its
+ * way back, and killing a second process for the same shortage would lose
+ * two processes to it. */
+static uint32_t g_oom_victim_id;
+
+int sched_oom_kill(void)
+{
+	task_t *victim = NULL, *dying = NULL;
+	uint64_t victim_pages = 0;
+	uint64_t fl;
+
+	spin_lock_irqsave(&g_task_list_lock, &fl);
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		if (t->id <= 1 || t->privilege != TASK_USER)
+			continue; /* never init, never a kernel thread */
+		if (t->group_leader && t->group_leader != t)
+			continue; /* one entry per process: its leader */
+		if (t->has_exited || t->state == TASK_ZOMBIE || !t->pml4)
+			continue;
+		if ((uint32_t)t->id == g_oom_victim_id) {
+			dying = t;
+			continue;
+		}
+		/* The measure of a candidate is what it has resident.  Read
+		 * under the task-list lock, which is what
+		 * keeps the tables from being torn down under the walk. */
+		uint64_t pages = mm_count_resident_pages(t->pml4);
+
+		if (pages > victim_pages) {
+			victim = t;
+			victim_pages = pages;
+		}
+	}
+	if (dying) {
+		spin_unlock_irqrestore(&g_task_list_lock, fl);
+		return 1; /* the last victim is still exiting: wait for it */
+	}
+	if (!victim || !sched_task_pin(victim)) {
+		spin_unlock_irqrestore(&g_task_list_lock, fl);
+		return 0;
+	}
+	g_oom_victim_id = (uint32_t)victim->id;
+	spin_unlock_irqrestore(&g_task_list_lock, fl);
+
+	kprintf("Out of memory: killed process %u (%s), %llu MB resident\n",
+		(unsigned)victim->id, victim->comm[0] ? victim->comm : "?",
+		(unsigned long long)(victim_pages * PAGE_SIZE / (1024 * 1024)));
+	signal_send(victim, SIGKILL, NULL);
+	sched_task_unpin(victim);
+	return 1;
+}
+
 /* The live task with the smallest id >= min_id, or NULL.  Lets a caller
  * walk the list in id order while dropping g_task_list_lock between steps:
  * a task's `next' pointer is worthless once the lock is gone, an id is not.
@@ -3615,8 +3674,8 @@ task_t *sched_fork_current(void)
 	child->fs_rdepth = 0; /* parent holds no fs lock during fork */
 	child->need_resched = 0;
 	child->remaining_ticks = SCHED_TIME_SLICE;
-	/* The child starts where the parent stands, as the reference has it:
-	 * neither ahead of everything runnable nor behind it. */
+	/* The child starts where the parent stands: neither ahead of
+	 * everything runnable nor behind it. */
 	{
 		task_t *fp = sched_current();
 

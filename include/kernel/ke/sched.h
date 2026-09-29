@@ -1327,6 +1327,11 @@ void sched_set_need_resched(task_t *t); // Mark task as needing reschedule
 /* From the timer tick: charge the running task for the time since it was
  * last charged, so wake-up placement compares against its true run time. */
 void sched_tick_account(task_t *t);
+/* Out of memory: kill the user process holding the most memory, measured
+ * by its resident set.  Returns 1 if a victim was
+ * killed or the last one is still on its way out -- memory is coming -- and
+ * 0 if there is nothing to kill.  Process context, interrupts on. */
+int sched_oom_kill(void);
 void sched_wake_expired_sleepers(
 	uint64_t current_tick); // Wake tasks whose sleep timer expired
 void sched_wake_channel(void *channel); // Wake all tasks waiting on a channel

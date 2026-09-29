@@ -562,6 +562,10 @@ uint64_t mmap_find_gap(struct task *cur, uint64_t length);
  * or trim the records covering them.  Returns 1 if anything was found.  Both
  * munmap and MAP_FIXED must use this -- freeing pages without releasing the
  * records leaks slots until every later mmap() fails with -ENOMEM. */
+/* Unmap and release [start, end) of a task's address space that has no
+ * region record -- the heap between two program breaks.  Address-space write
+ * lock held, interrupts on. */
+void mm_zap_range(struct task *task, uint64_t start, uint64_t end);
 int mm_unmap_range_and_regions(struct task *task, uint64_t addr,
 			       uint64_t length);
 /* Release the physical pages backing [addr, addr+length) but KEEP the mapping

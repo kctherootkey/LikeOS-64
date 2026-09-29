@@ -301,11 +301,25 @@ static int64_t sys_brk_locked(uint64_t new_brk)
 		return (int64_t)cur->brk; // Would collide with stack
 	}
 
-	/* Growing the heap: demand-paged — no pages are allocated here.  The
+	/* Growing the heap: demand-paged -- no pages are allocated here.  The
 	 * page-fault handler zero-fills anything in [brk_start, brk) on first
-	 * touch, so growing the break is just bookkeeping.  Shrinking keeps
-	 * the pages mapped (as before). */
+	 * touch, so growing the break is just bookkeeping.
+	 *
+	 * Shrinking gives the pages back: a break moved down is an unmap of
+	 * what lay above it.  It used to keep them mapped, which made the
+	 * C library's heap trim -- sbrk(-n), the only way the main arena
+	 * returns memory -- free nothing at all: a browser's memory monitor
+	 * trimmed and trimmed while the system sat at 92-94 % in use. */
+	uint64_t old_brk = cur->brk;
+
 	cur->brk = new_brk;
+	if (new_brk < old_brk) {
+		uint64_t from = PAGE_ALIGN(new_brk);
+		uint64_t to = PAGE_ALIGN(old_brk);
+
+		if (to > from)
+			mm_zap_range(cur, from, to);
+	}
 	return (int64_t)new_brk;
 }
 
