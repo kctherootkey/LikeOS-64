@@ -1150,6 +1150,14 @@ typedef struct task {
 	 * vfork_wait().  One flag is enough -- the thread sleeps for the whole
 	 * life of the borrowing child, so it never has two at once. */
 	volatile int vfork_done;
+
+	/* Fair scheduling (the reference's CFS core): the processor time this
+	 * task has consumed, in TSC ticks, and when it was last put on a
+	 * processor.  The run queue is ordered by vruntime; a task that slept
+	 * is placed just ahead of the runnable ones when it wakes, a task that
+	 * ran goes behind them. */
+	uint64_t vruntime;
+	uint64_t exec_start;
 } task_t;
 
 /* THE descriptor table of `t`.  A thread created with CLONE_FILES shares one
@@ -1316,6 +1324,9 @@ void sched_preempt(
 		*frame); // Called from timer IRQ, performs context switch
 int sched_need_resched(void); // Check if reschedule is needed
 void sched_set_need_resched(task_t *t); // Mark task as needing reschedule
+/* From the timer tick: charge the running task for the time since it was
+ * last charged, so wake-up placement compares against its true run time. */
+void sched_tick_account(task_t *t);
 void sched_wake_expired_sleepers(
 	uint64_t current_tick); // Wake tasks whose sleep timer expired
 void sched_wake_channel(void *channel); // Wake all tasks waiting on a channel

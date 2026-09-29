@@ -114,6 +114,9 @@ struct percpu {
 	task_t *runqueue_head; // Head of ready task list
 	task_t *runqueue_tail; // Tail for O(1) enqueue
 	uint32_t runqueue_length; // Number of tasks in queue
+	/* The smallest vruntime of anything runnable here, never decreasing:
+	 * the floor a waking task is placed against (see rq_enqueue_locked). */
+	uint64_t min_vruntime;
 	spinlock_t runqueue_lock; // Lock for this CPU's run queue
 
 	// Per-CPU statistics

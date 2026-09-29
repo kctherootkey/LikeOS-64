@@ -8,7 +8,9 @@
 // says when the hardware has switched out (idle or complete); then the
 // next context goes in.  Completion of the requests themselves is by
 // sequence number (i915_engine.c), which does not depend on the status
-// buffer -- so a missed status entry costs latency, never a lost fence.
+// buffer.  The port does: it is freed by a status entry and by nothing
+// else, so every entry is taken to mean what the reference driver takes it
+// to mean (i915_execlists_process_csb), and none is set aside.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -142,47 +144,50 @@ void i915_execlists_submit(struct i915_engine *e)
 	port_write(e, i915_lrc_descriptor(i915, lrc, e));
 }
 
-/* Put the requests of the context the hardware stopped short back at the
- * head of the queue: the image holds the head it stopped at, and the
- * next submission continues from there.  The last run of in-flight
- * requests is that context's, since a submission moves a whole run.
- * Caller holds e->lock. */
-static void requeue_preempted(struct i915_engine *e)
+/* One entry of the status buffer, both words in one read: the hardware
+ * writes them as one, and read as two they can straddle the write.  On a
+ * part without a shared last-level cache the processor's copy of the line
+ * is dropped first, as i915_hwsp_read() does. */
+static uint64_t csb_read(struct i915_engine *e, int index)
 {
-	struct i915_request *run = NULL, *prev = NULL;
+	const volatile uint64_t *p =
+		(const volatile uint64_t *)&e->hwsp[I915_HWS_CSB_BUF0_INDEX + index * 2];
+	if (!(e->i915->info->flags & I915_INFO_HAS_LLC))
+		__asm__ volatile("clflush (%0)" ::"r"(p) : "memory");
+	return *p;
+}
 
-	for (struct i915_request *r = e->inflight; r; prev = r, r = r->next) {
-		if (r->lrc == e->active_lrc && (!prev || prev->lrc != e->active_lrc))
-			run = r;
+/* Does this entry say a context is being handed the engine (as opposed to
+ * leaving it)?  The reference driver's reading of the buffer, and the only
+ * question asked of an entry.
+ *
+ * Gen8-11: a context starting (idle to active), or a preemption -- which
+ * hands the engine to the context that was just submitted, and which the
+ * hardware also reports for a lite restore of the running one.  Everything
+ * else is the running context leaving: done, or switched out.
+ *
+ * Gen12: the entry carries the context switching away and the one switching
+ * in.  No valid outgoing context, or a switch to a new queue, is a context
+ * being handed the engine; anything else is one leaving. */
+static int csb_promotes(struct i915_device *i915, uint64_t entry)
+{
+	uint32_t lower = (uint32_t)entry;
+	uint32_t upper = (uint32_t)(entry >> 32);
+
+	if (i915->info->gen >= 12) {
+		int away_valid = ((upper & GEN12_CSB_SW_CTX_ID_MASK) >> GEN12_CSB_SW_CTX_ID_SHIFT) !=
+				 GEN12_IDLE_CTX_ID;
+		int new_queue = !!(lower & GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE);
+		return !away_valid || new_queue;
 	}
-	if (!run)
-		return;
-	/* detach [run..inflight_tail] */
-	struct i915_request *before = NULL;
-	for (struct i915_request *r = e->inflight; r && r != run; r = r->next)
-		before = r;
-	if (before)
-		before->next = NULL;
-	else
-		e->inflight = NULL;
-	e->inflight_tail = before;
-	/* and put it in front of the queue */
-	struct i915_request *last = run;
-	while (last->next)
-		last = last->next;
-	last->next = e->queue;
-	e->queue = run;
-	if (!e->queue_tail)
-		e->queue_tail = last;
-	for (struct i915_request *r = run; r != last->next; r = r->next)
-		r->submitted = 0;
+	return !!(lower & (GEN8_CTX_STATUS_IDLE_ACTIVE | GEN8_CTX_STATUS_PREEMPTED));
 }
 
 void i915_execlists_process_csb(struct i915_engine *e)
 {
 	struct i915_device *i915 = e->i915;
 	uint64_t fl;
-	int left = 0, preempted = 0;
+	int left = 0;
 
 	spin_lock_irqsave(&e->lock, &fl);
 	int write = (int)(i915_hwsp_read(e, csb_write_index(e)) & 0xff);
@@ -191,32 +196,22 @@ void i915_execlists_process_csb(struct i915_engine *e)
 	int head = e->csb_head;
 	while (head != write) {
 		head = (head + 1) % e->csb_entries;
-		uint32_t status = i915_hwsp_read(e, I915_HWS_CSB_BUF0_INDEX + head * 2);
-		uint32_t ctxid = i915_hwsp_read(e, I915_HWS_CSB_BUF0_INDEX + head * 2 + 1);
-		if (status == 0xffffffffu) {
+		uint64_t entry = csb_read(e, head);
+		if ((uint32_t)entry == 0xffffffffu) {
 			/* not written yet: looked at again next time */
 			head = (head + e->csb_entries - 1) % e->csb_entries;
 			break;
 		}
 		e->hwsp[I915_HWS_CSB_BUF0_INDEX + head * 2] = 0xffffffffu;
-		/* Only the context in the port matters.  A context that went
-		 * idle stays resident until the next one is loaded, and its
-		 * "complete" arrives while that next one is already running:
-		 * taking it for the running context's would free the port
-		 * under a batch, and the next submission would stop that
-		 * batch short -- with its work half done and its sequence
-		 * number then passed by the batch that came after. */
-		if (i915->info->gen < 11 && ctxid != e->active_ctx_id)
-			continue;
-		if (status & GEN8_CTX_STATUS_IDLE_ACTIVE)
-			left = 0;
-		if (status & GEN8_CTX_STATUS_PREEMPTED)
-			preempted = 1;
-		if (status & (GEN8_CTX_STATUS_COMPLETE | GEN8_CTX_STATUS_ACTIVE_IDLE |
-			      GEN8_CTX_STATUS_PREEMPTED)) {
-			/* the context is done, or idle in the port */
-			left = 1;
-		}
+		/* Every entry is read as the reference driver reads it: the
+		 * context in the port is starting, or it has left.  Nothing
+		 * else about the entry decides -- not which other status
+		 * bits are set, not the context id it names.  The port is
+		 * freed here and nowhere else, so an entry set aside for any
+		 * reason is a port that stays busy with nothing running in
+		 * it: every request queued behind it waits for ever, and no
+		 * hang is ever seen, since nothing is in flight. */
+		left = csb_promotes(i915, entry) ? 0 : 1;
 	}
 	if (head != e->csb_head) {
 		e->csb_head = head;
@@ -224,8 +219,6 @@ void i915_execlists_process_csb(struct i915_engine *e)
 			     (GEN8_CSB_READ_PTR_MASK << 16) | ((uint32_t)head << 8));
 	}
 	if (left) {
-		if (preempted)
-			requeue_preempted(e);
 		e->port_busy = 0;
 		e->active_ctx = NULL;
 		e->active_lrc = NULL;

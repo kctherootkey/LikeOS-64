@@ -28,6 +28,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
+#include <kernel/hal/lapic.h> // lapic_get_tsc_freq: the fair scheduler's clock
 #include <kernel/ke/futex.h>
 #include <kernel/net/net.h>
 #include <kernel/mm/slab.h>
@@ -960,6 +961,101 @@ sched_task_by_canary(uint64_t canary)
 // Only READY tasks live in a run queue.
 // Caller MUST hold the target CPU's runqueue_lock.
 
+/* ---- fair scheduling ------------------------------------------------------
+ *
+ * What the reference does, on this kernel's linked-list run queues: every
+ * task carries the processor time it has consumed (vruntime, in TSC ticks),
+ * the queue is kept ordered by it, and the next task to run is the one that
+ * has had the least.  A task that wakes from sleep has a stale, small
+ * vruntime; it is placed at the queue's floor minus half a scheduling
+ * latency, so it runs almost at once but cannot then hold the processor
+ * against the tasks that were runnable all along.  A task that ran is
+ * requeued with its time charged and lands behind them.
+ *
+ * What this replaced: first-in first-out queues with a fixed slice, where a
+ * woken task went to the tail and nothing ran it before every task ahead of
+ * it had used its slice.  With a handful of processor-bound threads on one
+ * queue -- a browser decoding several videos in software -- each wake of a
+ * thread that does short request/reply work cost the whole queue's worth of
+ * slices, and a thread doing many such exchanges a second stopped for
+ * seconds at a time while the machine was nowhere near saturated. */
+
+#define SCHED_WAKEUP_GRAN_US 1000 /* the reference's wakeup granularity */
+#define SCHED_SLEEPER_BONUS_US 3000 /* half the reference's scheduling latency */
+
+static inline uint64_t sched_clock(void)
+{
+	return timer_rdtsc();
+}
+
+/* Microseconds in TSC ticks; the frequency is asked for once it is known. */
+static uint64_t sched_us_to_ticks(uint64_t us)
+{
+	static uint64_t per_us;
+
+	if (!per_us) {
+		uint64_t hz = lapic_get_tsc_freq();
+
+		per_us = hz ? hz / 1000000ULL : 1000ULL;
+		if (!per_us)
+			per_us = 1;
+	}
+	return per_us * us;
+}
+
+/* Charge `cur' for the time since it was last charged.  Only the processor
+ * running a task touches its vruntime while it runs, so no lock is needed
+ * for that; the queue floor is written by its own processor. */
+static void sched_update_curr(percpu_t *cpu, task_t *cur, uint64_t now)
+{
+	if (!cur || is_idle_task(cur))
+		return;
+	if (cur->exec_start && (int64_t)(now - cur->exec_start) > 0)
+		cur->vruntime += now - cur->exec_start;
+	cur->exec_start = now;
+	if ((int64_t)(cur->vruntime - cpu->min_vruntime) > 0)
+		__atomic_store_n(&cpu->min_vruntime, cur->vruntime,
+				 __ATOMIC_RELAXED);
+}
+
+void sched_tick_account(task_t *t)
+{
+	percpu_t *cpu = this_cpu();
+
+	if (!cpu || !t || cpu->current_task != t)
+		return;
+	sched_update_curr(cpu, t, sched_clock());
+}
+
+/* Should the task just queued on `cpu' take the processor from what runs
+ * there now?  The reference's wakeup preemption: yes when the processor is
+ * idle or its task is due off anyway, or when that task has had more than
+ * a wakeup granularity of processor time beyond the newcomer's.  Otherwise
+ * the newcomer waits for the slice to end, which is what keeps two tasks
+ * handing each other work from switching on every exchange. */
+static int sched_wakeup_preempts(percpu_t *cpu, task_t *task)
+{
+	task_t *cur;
+	uint64_t now, cur_v;
+
+	if (!cpu)
+		return 1;
+	cur = cpu->current_task;
+	if (!cur || is_idle_task(cur))
+		return 1;
+	if (cur == task)
+		return 0;
+	if (cur->remaining_ticks == 0 || cur->need_resched)
+		return 1;
+	now = sched_clock();
+	cur_v = cur->vruntime;
+	if (cur->exec_start && (int64_t)(now - cur->exec_start) > 0)
+		cur_v += now - cur->exec_start;
+	return (int64_t)(cur_v - task->vruntime) >
+	       (int64_t)sched_us_to_ticks(SCHED_WAKEUP_GRAN_US);
+}
+
+/* The run queue is ordered by vruntime (see above). */
 static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 {
 	lockdep_assert_held(&cpu->runqueue_lock);
@@ -1098,14 +1194,30 @@ static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 	 * which queue that was. */
 	task->on_cpu = cpu_id;
 
-	task->rq_next = NULL;
 	task->on_rq = true;
-	if (cpu->runqueue_tail) {
-		cpu->runqueue_tail->rq_next = task;
-	} else {
-		cpu->runqueue_head = task;
+	/* Placement: a task that has been off the processor comes back with
+	 * whatever vruntime it left with, which after a sleep is far below
+	 * the floor.  It is brought up to the floor minus the sleeper bonus:
+	 * ahead of everything runnable, but only by that much.  A task that
+	 * ran until now is already above the floor and is left alone. */
+	{
+		uint64_t floor = cpu->min_vruntime -
+				 sched_us_to_ticks(SCHED_SLEEPER_BONUS_US);
+
+		if ((int64_t)(task->vruntime - floor) < 0)
+			task->vruntime = floor;
 	}
-	cpu->runqueue_tail = task;
+	/* In vruntime order; equal keys go behind those already queued. */
+	{
+		task_t **pp = &cpu->runqueue_head;
+
+		while (*pp && (int64_t)((*pp)->vruntime - task->vruntime) <= 0)
+			pp = &(*pp)->rq_next;
+		task->rq_next = *pp;
+		*pp = task;
+		if (!task->rq_next)
+			cpu->runqueue_tail = task;
+	}
 	cpu->runqueue_length++;
 }
 
@@ -1122,6 +1234,10 @@ static task_t *rq_dequeue_locked(percpu_t *cpu)
 		task->rq_next = NULL;
 		task->on_rq = false;
 		cpu->runqueue_length--;
+		/* The least-run runnable task is leaving to run: the floor for
+		 * everything that wakes from here on is its time. */
+		if ((int64_t)(task->vruntime - cpu->min_vruntime) > 0)
+			cpu->min_vruntime = task->vruntime;
 		WARN_ON((long)cpu->runqueue_length <
 			0); /* runqueue underflow */
 
@@ -1413,8 +1529,14 @@ void sched_enqueue_ready(task_t *task)
 		}
 
 		if (!task->on_rq && task->state == TASK_READY) {
-			if (dest != owner)
+			if (dest != owner) {
+				/* vruntime is relative to a queue's floor:
+				 * carry the distance from one floor to the
+				 * other, as the reference does on migration. */
+				task->vruntime += dest->min_vruntime -
+						  owner->min_vruntime;
 				task->on_cpu = dest_cpu;
+			}
 			rq_enqueue_locked(dest, task);
 			target_cpu = dest_cpu;
 		} else {
@@ -1433,6 +1555,11 @@ void sched_enqueue_ready(task_t *task)
 		break;
 	}
 
+	/* Take the processor from the running task only when the newcomer
+	 * has earned it (sched_wakeup_preempts); otherwise it sits at the
+	 * front of the queue and runs when the slice ends. */
+	if (!sched_wakeup_preempts(percpu_get(target_cpu), task))
+		return;
 	// If enqueued to a remote CPU, send IPI to wake it from HLT
 	if (g_smp_initialized && target_cpu != this_cpu_id()) {
 		smp_send_reschedule(target_cpu);
@@ -1567,6 +1694,8 @@ static void task_init_common(task_t *t)
 	t->fs_rdepth = 0;
 	t->need_resched = 0;
 	t->remaining_ticks = SCHED_TIME_SLICE;
+	t->vruntime = 0;
+	t->exec_start = 0;
 	t->preempt_frame = NULL;
 	t->parent = NULL;
 	t->first_child = NULL;
@@ -2073,6 +2202,13 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	// Now enqueue current if it's runnable (voluntary yield).
 	// See rq_requeue_current_locked(): it may hand the task back for a
 	// remote enqueue that cannot be done under this lock.
+	/* Charge the outgoing task for its run, stamp the incoming one. */
+	{
+		uint64_t now = sched_clock();
+
+		sched_update_curr(cpu, cur, now);
+		next->exec_start = now;
+	}
 	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	task_t *prev = cur;
@@ -2293,6 +2429,13 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	/* We have a valid different task - now enqueue current if runnable.
 	 * The on_rq test this path was missing entirely, and the remote case
 	 * it implies, are both in rq_requeue_current_locked(). */
+	/* Charge the outgoing task for its run, stamp the incoming one. */
+	{
+		uint64_t now = sched_clock();
+
+		sched_update_curr(cpu, cur, now);
+		next->exec_start = now;
+	}
 	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	task_t *prev = cur;
@@ -3472,6 +3615,14 @@ task_t *sched_fork_current(void)
 	child->fs_rdepth = 0; /* parent holds no fs lock during fork */
 	child->need_resched = 0;
 	child->remaining_ticks = SCHED_TIME_SLICE;
+	/* The child starts where the parent stands, as the reference has it:
+	 * neither ahead of everything runnable nor behind it. */
+	{
+		task_t *fp = sched_current();
+
+		child->vruntime = fp ? fp->vruntime : 0;
+		child->exec_start = 0;
+	}
 	child->preempt_frame = NULL;
 	child->start_tick = timer_ticks();
 	child->utime_us = 0;
@@ -5919,6 +6070,13 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	// Now enqueue current if it's runnable (not idle, not exited).
 	// See rq_requeue_current_locked(): it may hand the task back for a
 	// remote enqueue that cannot be done under this lock.
+	/* Charge the outgoing task for its run, stamp the incoming one. */
+	{
+		uint64_t now = sched_clock();
+
+		sched_update_curr(cpu, cur, now);
+		next->exec_start = now;
+	}
 	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	next->remaining_ticks = SCHED_TIME_SLICE;
@@ -6270,6 +6428,7 @@ void sched_load_balance(void)
 	// Update on_cpu BEFORE adding to destination queue
 	// Both locks are held, so no race with scheduler
 	migrate->on_cpu = my_cpu;
+	migrate->vruntime += me->min_vruntime - src->min_vruntime;
 
 	// Add to our run queue
 	rq_enqueue_locked(me, migrate);

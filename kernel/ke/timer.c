@@ -1345,6 +1345,7 @@ void timer_irq_handler(int from_user)
 				cur->stime_us += delta_us;
 		}
 
+		sched_tick_account(cur);
 		if (cur->remaining_ticks > 0) {
 			cur->remaining_ticks--;
 		}

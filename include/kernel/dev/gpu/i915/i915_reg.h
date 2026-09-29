@@ -997,6 +997,12 @@
 #define GEN8_CTX_STATUS_ACTIVE_IDLE (1 << 3)
 #define GEN8_CTX_STATUS_COMPLETE (1 << 4)
 #define GEN8_CTX_STATUS_LITE_RESTORE (1 << 15)
+/* Gen12 entries: the low word's switch-to-new-queue bit, the high word's
+ * outgoing software context id (all ones when none was running). */
+#define GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE (1 << 1)
+#define GEN12_CSB_SW_CTX_ID_SHIFT 15
+#define GEN12_CSB_SW_CTX_ID_MASK (0x7ffu << GEN12_CSB_SW_CTX_ID_SHIFT)
+#define GEN12_IDLE_CTX_ID 0x7ffu
 #define GEN8_CTX_STATUS_COMPLETED_MASK (GEN8_CTX_STATUS_COMPLETE | GEN8_CTX_STATUS_PREEMPTED)
 
 /* context descriptors */
