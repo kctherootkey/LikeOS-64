@@ -1,0 +1,148 @@
+svga: send every constant buffer binding again before the device's copy
+of it can be recycled.
+
+VirtualBox's DX device does not read a constant buffer binding when a
+draw runs.  It copies the bound range out of the buffer at the moment
+SET_SINGLE_CONSTANT_BUFFER (or SET_*_CONSTANT_BUFFER_OFFSET) arrives,
+into a ring of 512 KB buffers of its own, and hands a ring buffer out
+again as soon as the GPU has finished with it -- whether or not a binding
+still points into it.
+
+A stage whose constants never change is bound once and never again.
+Another stage's per-draw offset changes keep filling the ring meanwhile
+(one copy per draw).  Once the ring has come round, the unchanged stage
+reads whatever was copied into its old place since.  WebKit's compositor
+is exactly that case: its vertex shader gets a new transform per tile,
+its pixel shader keeps one colour matrix for seconds on end, and when
+the matrix is overwritten by some tile's transform the whole web view
+turns yellow or pink (red and green constant, blue still the page) until
+the pixel shader's constants happen to change.
+
+The driver now counts the bytes the device copies (rounded as it rounds
+them) and, once half a ring buffer's worth has been copied, sends every
+binding again in full on the next state update.  A copy is recycled only
+after the rest of its buffer and the whole of the next one have been
+filled, so every live binding's copy stays newer than that.  Devices that
+read bindings at draw time just see the same binding once more.
+
+diff -Nur a/src/gallium/drivers/svga/svga_context.h b/src/gallium/drivers/svga/svga_context.h
+--- a/src/gallium/drivers/svga/svga_context.h	2026-09-30 15:17:51.348558918 +0200
++++ b/src/gallium/drivers/svga/svga_context.h	2026-09-30 15:17:51.349296206 +0200
+@@ -83,6 +83,12 @@
+ #define SVGA_MAX_CONST_BUF_SIZE (4096 * 4 * sizeof(int))
+ 
+ #define CONST0_UPLOAD_ALIGNMENT 256
++
++/* How a device that copies constant buffer data at binding time sizes each
++ * copy, and how much copying may go by before every binding is sent again
++ * (svga_resend_constbufs()): half of VirtualBox's 512 KB copy buffer. */
++#define SVGA_CONSTBUF_FETCH_ALIGN   256
++#define SVGA_CONSTBUF_RESEND_BYTES  (256 * 1024)
+ #define SVGA_MAX_UAVIEWS        SVGA3D_DX11_1_MAX_UAVIEWS
+ #define SVGA_MAX_IMAGES         SVGA3D_DX11_MAX_UAVIEWS
+ #define SVGA_MAX_SHADER_BUFFERS SVGA3D_DX11_MAX_UAVIEWS
+@@ -458,6 +464,13 @@
+    struct pipe_resource *const0_buffer;
+    struct svga_winsys_surface *const0_handle;
+ 
++   /**
++    * Bytes of constant data the device has been told to fetch since every
++    * constant buffer binding was last sent in full (see
++    * svga_resend_constbufs()).
++    */
++   unsigned constbuf_fetched_bytes;
++
+    /** VGPU10 HW state (used to prevent emitting redundant state) */
+    SVGA3dDepthStencilStateId depth_stencil_id;
+    unsigned stencil_ref;
+diff -Nur a/src/gallium/drivers/svga/svga_state.c b/src/gallium/drivers/svga/svga_state.c
+--- a/src/gallium/drivers/svga/svga_state.c	2026-09-30 15:17:51.352645551 +0200
++++ b/src/gallium/drivers/svga/svga_state.c	2026-09-30 15:17:51.354988183 +0200
+@@ -273,6 +273,10 @@
+       svga->dirty |= SVGA_NEW_TEXTURE;
+    }
+ 
++   if (svga_have_vgpu10(svga) &&
++       svga->state.hw_draw.constbuf_fetched_bytes >= SVGA_CONSTBUF_RESEND_BYTES)
++      svga_resend_constbufs(svga);
++
+    unsigned i;
+    for (i = 0; i <= max_level; i++) {
+       svga->dirty |= svga->state.dirty[i];
+diff -Nur a/src/gallium/drivers/svga/svga_state_constants.c b/src/gallium/drivers/svga/svga_state_constants.c
+--- a/src/gallium/drivers/svga/svga_state_constants.c	2026-09-30 15:17:51.360097618 +0200
++++ b/src/gallium/drivers/svga/svga_state_constants.c	2026-09-30 15:17:51.361577931 +0200
+@@ -851,6 +851,12 @@
+       return ret;
+    }
+ 
++   /* Both commands make a copying device copy this binding's data; count
++    * it the way such a device sizes the copy (see svga_resend_constbufs()). */
++   if (dst_handle)
++      svga->state.hw_draw.constbuf_fetched_bytes +=
++         align(MAX2(new_buf_size, 1), SVGA_CONSTBUF_FETCH_ALIGN);
++
+    /* save the upload buffer / handle for next time */
+    if (dst_buffer != buffer && dst_buffer) {
+       pipe_resource_reference(&svga->state.hw_draw.const0_buffer, dst_buffer);
+@@ -873,6 +879,47 @@
+ }
+ 
+ 
++/**
++ * Send every constant buffer binding again in full, on the next state
++ * update.
++ *
++ * A device may copy a binding's data out of the buffer when the binding
++ * command arrives, into storage of its own that it recycles as later
++ * bindings arrive.  VirtualBox's does: into a ring of 512 KB buffers that
++ * it hands out again as soon as the GPU has finished with them -- whether
++ * or not a binding still points into one.  A stage whose constants stay
++ * the same is bound once and never again, while another stage's per-draw
++ * offset change (one SET_*_CONSTANT_BUFFER_OFFSET per draw, each a fresh
++ * copy) keeps filling the ring.  Once the ring has come round, the
++ * unchanged stage reads whatever was copied there since: a compositor's
++ * pixel shader takes another draw's vertex transform for its colour
++ * matrix, and the page turns yellow or pink until its constants happen to
++ * change.
++ *
++ * A copy is overwritten only after the rest of its buffer and the whole
++ * of the next one have been filled.  Sending every binding again once
++ * half a buffer's worth has been copied keeps every live binding's copy
++ * newer than that.  Clearing the offset shortcut makes each stage send a
++ * full SetSingleConstantBuffer, which such a device copies anew; a device
++ * that reads bindings at draw time merely sees the same binding again.
++ */
++void
++svga_resend_constbufs(struct svga_context *svga)
++{
++   for (unsigned shader = 0; shader < MESA_SHADER_STAGES; shader++) {
++      for (unsigned slot = 0; slot < SVGA_MAX_CONST_BUFS; slot++)
++         svga->state.hw_draw.constbufoffsets[shader][slot].handle = NULL;
++   }
++
++   svga->dirty |= SVGA_NEW_VS_CONSTS | SVGA_NEW_FS_CONSTS |
++                  SVGA_NEW_GS_CONSTS | SVGA_NEW_TCS_CONSTS |
++                  SVGA_NEW_TES_CONSTS | SVGA_NEW_CS_CONSTS |
++                  SVGA_NEW_CONST_BUFFER;
++
++   svga->state.hw_draw.constbuf_fetched_bytes = 0;
++}
++
++
+ /* For constbuf 0 */
+ static enum pipe_error
+ emit_consts_vgpu10(struct svga_context *svga, mesa_shader_stage shader)
+diff -Nur a/src/gallium/drivers/svga/svga_state.h b/src/gallium/drivers/svga/svga_state.h
+--- a/src/gallium/drivers/svga/svga_state.h	2026-09-30 15:17:51.356667791 +0200
++++ b/src/gallium/drivers/svga/svga_state.h	2026-09-30 15:17:51.358155741 +0200
+@@ -93,6 +93,9 @@
+ #define SVGA_STATE_MAX               4
+ 
+ 
++void
++svga_resend_constbufs(struct svga_context *svga);
++
+ enum pipe_error
+ svga_update_state(struct svga_context *svga, unsigned level);
+ 
