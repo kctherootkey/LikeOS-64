@@ -121,6 +121,14 @@
 #     excludes the directory itself, so git still descends into these two.)
 !/ports/xorg/toolchain/
 !/ports/xorg/patches/
+#     And, for exactly that reason, the two EGL directories: egl-headers/
+#     holds the Khronos type headers vendored out of WebKitGTK's ANGLE copy
+#     (with their sha256s recorded in import-egl-headers.sh) and egl-stub/ the
+#     libEGL.so.1 stub generated from libepoxy's EGL registry.  No tarball in
+#     this directory puts either back, and ports/xorg/clean.sh keeps them for
+#     the same reason.
+!/ports/xorg/egl-headers/
+!/ports/xorg/egl-stub/
 #     Re-included for the same reasons: the GTK3 sub-port, which is a manifest
 #     and a set of wrapper scripts rather than a second build system, and then
 #     the same three rules again one level down for what IT derives.

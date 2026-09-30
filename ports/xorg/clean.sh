@@ -61,6 +61,17 @@ for d in "$port"/*/; do
 	[ -d "$d" ] || continue
 	case "$(basename "$d")" in
 	toolchain | patches | .stamps | .logs) continue ;;
+	# egl-headers/ and egl-stub/ are ours too, and neither is recoverable
+	# from a tarball in this directory: the headers are Khronos files
+	# vendored out of WebKitGTK's bundled ANGLE and the stub is generated
+	# from libepoxy's EGL registry (import-egl-headers.sh records both).
+	# Left off this list they were deleted by `make distclean', and the
+	# next build stopped in import-egl-headers.sh with
+	#
+	#     cp: cannot stat '.../egl-headers/EGL/eglplatform.h'
+	#
+	# which names a missing file and not the clean that removed it.
+	egl-headers | egl-stub) continue ;;
 	# man/ holds manual pages the port WRITES, for programs that publish
 	# none of their own (Mousepad).  Like patches/ it is ours and no tarball
 	# can put it back -- and losing it is quiet: the next build simply

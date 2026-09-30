@@ -611,6 +611,10 @@ meson_host_opts() {
 #
 # Only for answers that are TRUE here.  Setting one of these to defeat a test
 # that is telling the truth would hide a real gap rather than fill it.
+#
+# The other use, one entry below: naming a program configure must take from the
+# SYSROOT, where the package looks for it on $PATH or under its own --prefix and
+# so finds the build host's copy instead.
 pkg_env() {
 	# Answers that hold for EVERY package, because they are facts about this
 	# system rather than about any one of them.  A cache variable a package
@@ -640,6 +644,36 @@ pkg_env() {
 		# already prefixed, and `make install DESTDIR=' would then
 		# prefix it AGAIN.  The path on the image is what is wanted.
 		echo "$common LIBVA_DRIVERS_PATH=/usr/lib/dri"
+		;;
+	libgcrypt | claws-mail)
+		# Which gpgrt-config answers for libgpg-error.
+		#
+		# Both carry AM_PATH_GPG_ERROR, and it looks for the tool in
+		# "$prefix/bin:$PATH" -- where $prefix is the package's own
+		# INSTALL prefix, /usr, so the first hit is the build host's
+		# /usr/bin/gpgrt-config.  Being found, it wins: the macro
+		# prefers gpgrt-config over the gpg-error-config that
+		# --with-libgpg-error-prefix correctly pointed into the sysroot,
+		# derives a libdir from `$CC -print-search-dirs' (host paths),
+		# and then reports the HOST's libgpg-error version:
+		#
+		#   checking for gpgrt-config... /usr/bin/gpgrt-config
+		#   configure: Use gpgrt-config with /usr/lib/x86_64-linux-gnu
+		#   checking for GPG Error - version >= 1.56... no
+		#   configure: error: libgpg-error is needed.
+		#
+		# jammy's is 1.43, so libgcrypt stops -- on a machine where the
+		# sysroot holds the 1.61 this port just built, and on a machine
+		# with no libgpg-error-dev installed the same tree configures
+		# fine.  An absolute path in this variable is what the macro
+		# documents as the override ("Let the user override the test
+		# with a path"), and from it the macro derives the sysroot
+		# prefix and finds the gpg-error.pc beside it.
+		#
+		# claws-mail for the same macro, where it decides gpgme rather
+		# than gpg-error: asking the host about a library that is not
+		# in this sysroot can only produce a wrong yes.
+		echo "$common GPGRT_CONFIG=$SYSROOT/usr/bin/gpgrt-config"
 		;;
 	startup-notification)
 		# "Does realloc(NULL, n) behave as malloc(n)?"  Answered by
@@ -2015,6 +2049,29 @@ build_one() {
 			jobs=$((memkb / (3 * 1024 * 1024)))
 			[ "$jobs" -lt 1 ] && jobs=1
 			[ "$jobs" -gt "$(nproc)" ] && jobs=$(nproc)
+
+			# ...and then half of it, on purpose.
+			#
+			# This is the one package whose build owns the machine
+			# for hours, and the two limits above only bound what it
+			# takes at once -- they say nothing about what is left
+			# for whoever is using the machine meanwhile.  Half
+			# leaves cores and, more to the point, memory headroom:
+			# the 3 GB-per-job figure is an average, and WebKit has
+			# translation units well above it, so a full set of jobs
+			# hitting their peak together is what pushes a laptop
+			# into swap (or into the OOM killer, which reads as a
+			# mysterious "ninja: build stopped").
+			#
+			# Rounded UP, so a machine that was already down to one
+			# job still gets one.
+			#
+			# LIKEOS_WEBKIT_JOBS is taken literally, after the
+			# halving rather than before it: it is how to ask for an
+			# exact number, in either direction --
+			# LIKEOS_WEBKIT_JOBS=$(nproc) builds the old way.
+			jobs=$(((jobs + 1) / 2))
+
 			[ -n "${LIKEOS_WEBKIT_JOBS:-}" ] &&
 				jobs=$LIKEOS_WEBKIT_JOBS
 			echo "webkitgtk: $jobs compile job(s)" >&2

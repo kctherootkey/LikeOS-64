@@ -1954,6 +1954,38 @@ ports-gtk3: ports-xorg | $(BUILD_DIR)
 	ports/xorg/gtk3/fetch.sh
 	ports/xorg/gtk3/unpack.sh
 	ports/xorg/gtk3/build.sh
+	@# The X server, a SECOND time.
+	@#
+	@# Which server gets built is decided by what the sysroot holds when it
+	@# configures (see the xorg-server arm of ports/xorg/build.sh): libdrm
+	@# and Mesa's libgbm turn on DRI2/DRI3/Present, glamor and the
+	@# modesetting driver, and gl.pc turns on GLX.  All three are built
+	@# HERE, by the target above -- after the X.Org port has been and gone.
+	@#
+	@# So a build in manifest order gets the fbdev-only server, and that is
+	@# invisible until X starts: xserverrc picks a modesetting config when
+	@# /dev/dri/card0 exists, the server then cannot load `modesetting' or
+	@# `glamoregl' because neither was built, and it stops with
+	@#
+	@#     (EE) Failed to load module "modesetting" (module does not exist)
+	@#     (EE) No drivers available.
+	@#     Fatal server error: no screens found
+	@#
+	@# An incremental build hides it -- the sysroot still holds the previous
+	@# run's libdrm and Mesa when the server configures -- so it appears
+	@# only after `make distclean', on the machine that did the clean.
+	@#
+	@# Hence this pass, which is a no-op in every other case: it rebuilds
+	@# the server only when the pieces are now present AND the driver it
+	@# would have produced is not, so a second `make' does nothing and the
+	@# incremental build it already worked on does nothing either.
+	@if [ -f $(XORG_SYSROOT)/usr/lib/pkgconfig/libdrm.pc ] && \
+	   [ -f $(XORG_SYSROOT)/usr/lib/pkgconfig/gbm.pc ] && \
+	   [ ! -f $(XORG_SYSROOT)/usr/lib/xorg/modules/drivers/modesetting_drv.so ]; then \
+		echo "xorg-server: libdrm and Mesa are in the sysroot now --"; \
+		echo "  rebuilding it with glamor, the modesetting driver and GLX"; \
+		ports/xorg/build.sh -f xorg-server; \
+	fi
 
 # The desktop shell: the taskbar panel and the two widgets it shares its
 # drawing with.

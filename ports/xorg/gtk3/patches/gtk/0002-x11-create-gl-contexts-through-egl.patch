@@ -983,7 +983,7 @@ is what the upload was written for and what the Wayland backend paints into
  static gboolean
  gdk_x11_gl_context_realize (GdkGLContext  *context,
                              GError       **error)
-@@ -639,6 +1457,21 @@
+@@ -639,6 +1457,22 @@
    display_x11 = GDK_X11_DISPLAY (display);
    share = gdk_gl_context_get_shared_context (context);
 
@@ -1006,7 +1006,7 @@ is what the upload was written for and what the Wayland backend paints into
    gdk_gl_context_get_required_version (context, &major, &minor);
    debug_bit = gdk_gl_context_get_debug_enabled (context);
    compat_bit = gdk_gl_context_get_forward_compatible (context);
-@@ -807,6 +1640,21 @@
+@@ -807,6 +1641,21 @@
  {
    GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (gobject);
  
@@ -1028,7 +1028,7 @@ is what the upload was written for and what the Wayland backend paints into
    if (context_x11->glx_context != NULL)
      {
        GdkGLContext *context = GDK_GL_CONTEXT (gobject);
-@@ -841,6 +1689,7 @@
+@@ -841,6 +1690,7 @@
  gdk_x11_gl_context_init (GdkX11GLContext *self)
  {
    self->do_frame_sync = TRUE;
@@ -1036,7 +1036,7 @@ is what the upload was written for and what the Wayland backend paints into
  }
  
  gboolean
-@@ -852,12 +1701,16 @@
+@@ -852,12 +1702,16 @@
    int error_base, event_base;
    int screen_num;
  
@@ -1054,7 +1054,7 @@ is what the upload was written for and what the Wayland backend paints into
    dpy = gdk_x11_display_get_xdisplay (display);
  
    if (!epoxy_has_glx (dpy))
-@@ -1120,7 +1973,7 @@
+@@ -1120,7 +1974,7 @@
  }
  
  static gboolean
@@ -1063,7 +1063,7 @@ is what the upload was written for and what the Wayland backend paints into
  {
    gboolean found;
    Atom type_return;
-@@ -1136,7 +1989,7 @@
+@@ -1136,7 +1990,7 @@
  
    gdk_x11_display_error_trap_push (display);
    if (XGetWindowProperty (dpy, DefaultRootWindow (dpy),
@@ -1072,7 +1072,7 @@ is what the upload was written for and what the Wayland backend paints into
                            0, 2, False, XA_INTEGER, &type_return,
                            &format_return, &nitems_return,
                            &bytes_after_return, &data) == Success)
-@@ -1162,7 +2015,7 @@
+@@ -1162,7 +2016,7 @@
  }
  
  static void
@@ -1081,7 +1081,7 @@ is what the upload was written for and what the Wayland backend paints into
  {
    long visualdata[2];
    Display *dpy;
-@@ -1174,7 +2027,7 @@
+@@ -1174,7 +2028,7 @@
  
    gdk_x11_display_error_trap_push (display);
    XChangeProperty (dpy, DefaultRootWindow (dpy),
@@ -1090,7 +1090,7 @@ is what the upload was written for and what the Wayland backend paints into
                     XA_INTEGER, 32, PropModeReplace,
                     (unsigned char *)visualdata, 2);
    gdk_x11_display_error_trap_pop_ignored (display);
-@@ -1197,8 +2050,15 @@
+@@ -1197,8 +2051,15 @@
    dpy = gdk_x11_display_get_xdisplay (display);
  
    /* We save the default visuals as a property on the root window to avoid
@@ -1108,7 +1108,7 @@ is what the upload was written for and what the Wayland backend paints into
      {
        for (i = 0; i < x11_screen->nvisuals; i++)
          {
-@@ -1217,6 +2077,15 @@
+@@ -1217,6 +2078,15 @@
    if (!gdk_x11_screen_init_gl (screen))
      return;
  
@@ -1124,7 +1124,7 @@ is what the upload was written for and what the Wayland backend paints into
    gl_info = g_new0 (struct glvisualinfo, x11_screen->nvisuals);
  
    for (i = 0; i < x11_screen->nvisuals; i++)
-@@ -1256,11 +2125,49 @@
+@@ -1256,11 +2126,49 @@
  
    g_free (gl_info);
  
@@ -1175,7 +1175,7 @@ is what the upload was written for and what the Wayland backend paints into
  GdkGLContext *
  gdk_x11_window_create_gl_context (GdkWindow    *window,
                                    gboolean      attached,
-@@ -1282,6 +2189,25 @@
+@@ -1282,6 +2190,25 @@
        return NULL;
      }
  
@@ -1201,7 +1201,7 @@ is what the upload was written for and what the Wayland backend paints into
    visual = gdk_window_get_visual (window);
    if (!find_fbconfig_for_visual (display, visual, &config, error))
      return NULL;
-@@ -1304,6 +2230,9 @@
+@@ -1304,6 +2231,9 @@
  {
    GdkX11GLContext *context_x11 = GDK_X11_GL_CONTEXT (context);
  
@@ -1211,7 +1211,7 @@ is what the upload was written for and what the Wayland backend paints into
    return context_x11->glx_context == glXGetCurrentContext ();
  }
  
-@@ -1317,6 +2246,9 @@
+@@ -1317,6 +2247,9 @@
    GdkScreen *screen;
    gboolean do_frame_sync = FALSE;
  
@@ -1221,7 +1221,7 @@ is what the upload was written for and what the Wayland backend paints into
    if (context == NULL)
      {
        glXMakeContextCurrent (dpy, None, None, NULL);
-@@ -1393,6 +2325,11 @@
+@@ -1393,6 +2326,11 @@
    if (!gdk_x11_screen_init_gl (gdk_display_get_default_screen (display)))
      return FALSE;
  

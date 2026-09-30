@@ -133,14 +133,16 @@ static inline unsigned int arc4random_uniform(unsigned int upper_bound)
 }
 
 /* ------------------------------------------------------------------
- * explicit_bzero — zero memory in a way the compiler will not optimise away.
+ * explicit_bzero is NOT shimmed here: the libc has it, in <string.h> and
+ * string.c, and a second definition is not merely redundant but a hard error --
+ *
+ *   compat_likeos.h:138:20: error: static declaration of 'explicit_bzero'
+ *   follows non-static declaration
+ *
+ * because this file includes <string.h> above, so the libc's declaration is
+ * always already in scope by the time this point is reached.  Nothing in the
+ * port calls it directly in any case; it arrived with the rest of the shims.
  * ------------------------------------------------------------------ */
-static inline void explicit_bzero(void *s, size_t len)
-{
-    volatile unsigned char *p = (volatile unsigned char *)s;
-    while (len--)
-        *p++ = 0;
-}
 
 /* ------------------------------------------------------------------
  * asprintf / vasprintf

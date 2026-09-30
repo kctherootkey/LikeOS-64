@@ -117,7 +117,54 @@ while read -r section name version deb repo rest; do
 	# a re-unpack -- an in-place edit would be silently lost by the next one.
 	if [ -d "$port/patches/$name" ]; then
 		patched_ac=0
-		for p in "$port/patches/$name"/*.patch; do
+
+		# Which patches apply.  Everything directly in patches/<name>/,
+		# always -- that is the normal case and the one to use.
+		#
+		# A patches/<name>/gxx-lt-13/ beside it is for the other kind:
+		# a patch that works around something the BUILD HOST's compiler
+		# cannot do, and that a newer one does not need.  It is applied
+		# only when the C++ compiler this port will actually use -- the
+		# one toolchain/likeos-c++ selects, which is not necessarily the
+		# default g++ -- is older than GCC 13.
+		#
+		# That directory exists for exactly one thing so far: WebKit
+		# relies on C++23 relaxing the rule against a constexpr function
+		# containing a call that is never constant-evaluated (P2448R2),
+		# which GCC implements from 13 on.  Below that the source has to
+		# spell three <cmath> calls as GCC builtins instead, and above
+		# it the upstream spelling is the one to compile -- so the
+		# machine with the newer compiler builds untouched upstream
+		# source.  See patches/webkitgtk/gxx-lt-13/ for the details.
+		#
+		# Decided at UNPACK time, which is the only honest moment: the
+		# tree keeps whatever was applied when it was unpacked, and
+		# installing a different compiler afterwards changes nothing
+		# until the tree is unpacked again.
+		patches="$port/patches/$name/*.patch"
+		gxx_lt_13="$port/patches/$name/gxx-lt-13"
+		if [ -d "$gxx_lt_13" ]; then
+			cxxver=$("$here/toolchain/likeos-c++" \
+				-dumpfullversion -dumpversion 2>/dev/null |
+				head -1)
+			if [ -z "$cxxver" ]; then
+				# No answer from the wrapper: apply them.  The
+				# workaround compiles on every version, so the
+				# unknown case takes the one that always builds.
+				echo "  note $name: cannot tell the C++" \
+					"compiler's version -- applying" \
+					"patches/$name/gxx-lt-13"
+				patches="$patches $gxx_lt_13/*.patch"
+			elif [ "$(printf '%s\n%s\n' 13 "$cxxver" |
+				sort -V | head -1)" = 13 ]; then
+				echo "  note $name: g++ $cxxver, so" \
+					"patches/$name/gxx-lt-13 is not applied"
+			else
+				patches="$patches $gxx_lt_13/*.patch"
+			fi
+		fi
+
+		for p in $patches; do
 			[ -f "$p" ] || continue
 			if ! (cd "$dest" && patch -p1 --forward --silent <"$p"); then
 				echo "  FAIL $name-$have_ver (patch $(basename "$p"))" >&2

@@ -1,0 +1,105 @@
+Call GCC's math builtins from the three constexpr functions that need them.
+
+<cmath> is only half constexpr.  libstdc++ writes the float and long double
+overloads itself, as one-line wrappers over __builtin_floorf and friends, and
+those are constexpr; the DOUBLE overload is `using ::floor;', the C library's
+function, and a C declaration cannot be constexpr.  So a constexpr function
+that calls std::floor(double) contains a call to a non-constexpr function.
+
+C++23 made that legal as long as the call is never constant-evaluated (P2448R2,
+"Relaxing some constexpr restrictions"), and upstream relies on it -- the
+FIXME above WTF's fabsConstExpr says as much: "Replace with std::fabs() once
+std::fabs() is constexpr.  requires C++23".  GCC implements P2448R2 from 13
+onwards.  Built by a g++ 12, which is the newest Ubuntu 22.04 packages and is
+the version WebKit itself asks for (WebKitCompilerFlags.cmake wants >= 12.0.0),
+the same source stops at
+
+    Source/WTF/wtf/Seconds.h:216:36: error: call to non-'constexpr'
+    function 'double floor(double)'
+
+four objects into WTF.  Upstream never sees it because the diagnostic depends
+on the call NOT being foldable, and -fno-builtin is what stops the fold: with
+builtins on, gcc recognises floor() as its own and folds it, so the constexpr
+body is fine on any version.  This port compiles with -fno-builtin (see
+toolchain/likeos-cc), so the fold is off and the compiler is left with the
+declaration.
+
+Naming the builtin directly is what both halves of that sentence agree on:
+-fno-builtin only stops gcc from recognising a LIBRARY name as a builtin, so an
+explicit __builtin_floor still folds, and it is exactly what libstdc++'s own
+constexpr overloads call one line away.
+
+THE VALUES DO NOT CHANGE, which is the only thing that could reach rendering:
+
+  floor    is an exact operation -- the result is representable, so there is
+           nothing to round and no accuracy to lose.  gcc expands
+           __builtin_floor inline (cvttsd2si, then a fixup for the negative
+           case and for -0.0) instead of calling the libc, and the two agree
+           on every input, NaN and infinity included: those take the
+           |x| >= 2^52 arm and come back unchanged.  Cheaper, too -- the call
+           is gone -- so nothing here can get slower.
+  fmod     is not expanded inline at all.  Both spellings compile to the same
+           call to the same function; verified by diffing the assembly, which
+           is identical but for a label name.
+
+A fourth candidate was left alone deliberately.  WebCore's computeDeltaEOK
+(ColorConversion.h) calls the THREE-argument std::hypot, which is not
+constexpr either -- but libstdc++ implements that one itself, by scaling on
+the largest component, and hypot(hypot(a, b), c) is a different computation
+that disagrees with it in the last bit of the float for about 40% of inputs
+(measured over 6.2M sample points).  It also needs no fix: the function is a
+template with no caller anywhere in the tree, so it is never instantiated and
+the diagnostic never fires.  Colour difference is exactly where a last-bit
+difference could change a gamut-mapping step, so it keeps upstream's arithmetic
+untouched.
+
+The fifth, WTF's isIntegral(float), is fine as it stands -- std::isinf(float)
+and std::trunc(float) are the overloads libstdc++ writes, not the ones it
+inherits from the C library.
+
+These are every such site in the tree: found by walking each constexpr function
+body in Source/ (ThirdParty included) for a std:: math call, then compiling
+each candidate with the port's own flags.
+
+--- a/Source/WTF/wtf/Seconds.h
++++ b/Source/WTF/wtf/Seconds.h
+@@ -213,7 +213,9 @@
+ 
+     constexpr Seconds reduceTimeResolution(Seconds resolution)
+     {
+-        double reduced = std::floor(seconds() / resolution.seconds()) * resolution.seconds();
++        // __builtin_floor, not std::floor: libstdc++ leaves the double
++        // overload as the C library's floor(), which is not constexpr.
++        double reduced = __builtin_floor(seconds() / resolution.seconds()) * resolution.seconds();
+         return Seconds(reduced);
+     }
+ 
+
+--- a/Source/JavaScriptCore/runtime/DateConstructor.h
++++ b/Source/JavaScriptCore/runtime/DateConstructor.h
+@@ -55,7 +55,9 @@
+ // https://tc39.es/ecma262/#sec-makeday
+ constexpr static inline double makeDay(double year, double month, double date)
+ {
+-    double additionalYears = std::floor(month / 12);
++    // __builtin_floor, not std::floor: the double overload is the C
++    // library's floor() and is not constexpr.
++    double additionalYears = __builtin_floor(month / 12);
+     double ym = year + additionalYears;
+     if (!std::isfinite(ym))
+         return PNaN;
+
+--- a/Source/WebCore/platform/graphics/ColorTypes.h
++++ b/Source/WebCore/platform/graphics/ColorTypes.h
+@@ -75,8 +75,10 @@
+ {
+     constexpr auto componentInfo = ColorType::Model::componentInfo[Index];
+ 
++    // __builtin_fmod, not std::fmod: the double overload is the C library's
++    // fmod() and is not constexpr.  Kept in double, as the literals were.
+     if constexpr (componentInfo.type == ColorComponentType::Angle)
+-        return std::fmod(std::fmod(c, 360.0) + 360.0, 360.0);
++        return __builtin_fmod(__builtin_fmod(c, 360.0) + 360.0, 360.0);
+ 
+     if constexpr (componentInfo.min == -std::numeric_limits<float>::infinity() && componentInfo.max == std::numeric_limits<float>::infinity())
+         return c;
