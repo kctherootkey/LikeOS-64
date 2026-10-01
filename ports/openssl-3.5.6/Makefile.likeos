@@ -31,6 +31,25 @@ ABS_BUILD   := $(ABS_ROOT)/build
 
 CONFIGURE_STAMP := .likeos-configured
 
+# Configure writes this tree's ABSOLUTE path into what it generates --
+# configdata.pm opens with `use lib '<tree>/util/perl'', and the Makefile it
+# produces names it thousands of times.  Both files are tracked, so a commit
+# made on one machine carries that machine's path to every other: pulled onto
+# a tree that lives somewhere else, the very first header generation stops
+# with
+#
+#     Can't locate OpenSSL/fallback.pm in @INC (... /home/<other>/...)
+#
+# and the stamps cannot notice, because they are only ever compared against
+# Configure, which did not change.  So the stamps are honoured only while
+# configdata.pm was configured for THIS tree; otherwise both are dropped and
+# the next build configures again, which rewrites both files for here.
+# realpath, as Configure resolves symlinks in the path it records.
+THIS_TREE := $(realpath .)
+ifneq ($(shell grep -qF "use lib '$(THIS_TREE)/util/perl'" configdata.pm 2>/dev/null && echo here),here)
+$(shell rm -f $(CONFIGURE_STAMP) $(CONFIGURE_STAMP).built)
+endif
+
 # ----------------------------------------------------------------------------
 # Top-level targets
 # ----------------------------------------------------------------------------

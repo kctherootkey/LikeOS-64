@@ -1532,9 +1532,26 @@ host_llvm_config() {
 
 mesa_iris_wanted() {
 	[ "${LIKEOS_MESA_IRIS:-auto}" = 0 ] && return 1
-	if host_llvm_config >/dev/null 2>&1 &&
-	   pkg-config --exists SPIRV-Tools 2>/dev/null &&
-	   pkg-config --exists LLVMSPIRVLib 2>/dev/null &&
+	# Present is not enough: Mesa's CLC needs LLVM >= 15 and an
+	# LLVMSPIRVLib of the same major version, and meson stops the whole
+	# Mesa build when they are not -- so an old pair (Ubuntu 22.04's
+	# unversioned llvm-dev 14 + libllvmspirvlib-dev 13) has to count as
+	# "not there", not as "there".  meson takes the first llvm-config
+	# in this order that satisfies >= 15, so that one is what to compare.
+	spirv_major=$(pkg-config --modversion LLVMSPIRVLib 2>/dev/null | cut -d. -f1)
+	llvm_ok=0
+	for c in llvm-config llvm-config-21 llvm-config-20 llvm-config-19 \
+		llvm-config-18 llvm-config-17 llvm-config-16 llvm-config-15; do
+		command -v "$c" >/dev/null 2>&1 || continue
+		m=$("$c" --version 2>/dev/null | cut -d. -f1)
+		[ -n "$m" ] && [ "$m" -ge 15 ] || continue
+		# The first one >= 15 is meson's pick; it alone has to match.
+		[ "$m" = "$spirv_major" ] && llvm_ok=1
+		break
+	done
+	# SPIRV-Tools is not checked here: an old or missing one is built by
+	# host_spirv_tools_for_mesa() below, right before it is needed.
+	if [ "$llvm_ok" = 1 ] &&
 	   { pkg-config --exists libclc 2>/dev/null || [ -d /usr/lib/clc ]; }; then
 		return 0
 	fi
@@ -1542,8 +1559,98 @@ mesa_iris_wanted() {
 		echo "mesa: LIKEOS_MESA_IRIS=1 but the host lacks clang/libclc/SPIRV-Tools/LLVMSPIRVLib (run: make deps)" >&2
 		exit 1
 	fi
-	echo "mesa: NOTE: the Intel driver (iris) is LEFT OUT -- the host lacks clang/libclc/SPIRV-Tools/LLVMSPIRVLib; run 'make deps' and rebuild mesa" >&2
+	echo "mesa: NOTE: the Intel driver (iris) is LEFT OUT -- the host lacks LLVM >= 15 with a matching LLVMSPIRVLib, clang or libclc; run 'make deps' and rebuild mesa (ports/xorg/gtk3/build.sh -f mesa)" >&2
 	return 1
+}
+
+# SPIRV-Tools for the native half of Mesa, built here ONLY when the build
+# host's is too old.
+#
+# Mesa's CLC (mesa_clc, vtn_bindgen2 -- what the Intel driver's build runs)
+# asks for SPIRV-Tools >= 2024.1, and meson stops the whole Mesa build when
+# the host's is older.  Ubuntu 24.04's is new enough and this does nothing
+# there.  Ubuntu 22.04 has 2022.1 and nothing newer, so on such a host the
+# library is built from source, for THIS machine, into $HOSTTOOLS -- the same
+# place GLib's code generators go and for the same reason: it is a build tool
+# of the port, never a candidate for the image.
+#
+# Static and position-independent: mesa_clc links it in and runs straight out
+# of $HOSTTOOLS/bin during the cross build, so there is no shared library to
+# go looking for at run time.
+#
+# The tarballs sit beside the manifest like every other source here (so this
+# needs no network), and are checked against the hashes below either way.
+# SPIRV-Headers is only what SPIRV-Tools compiles against; it is not
+# installed.  Both are Khronos' vulkan-sdk-1.4.309.0 tag, a matched pair --
+# SPIRV-Tools v2025.1.
+#
+# Prints the pkg-config directory to put in front for the native meson run,
+# or nothing when the host's own SPIRV-Tools will do.
+SPIRV_SDK=1.4.309.0
+SPIRV_HEADERS_SHA256=a96f8b4f2dfb18f7432e5c523e220ab0075372a9509e0c25fbff21c76af0de7c
+SPIRV_TOOLS_SHA256=6b8577054c575573ead3ad71cb6a2c0b3397b64c746cc3c99e48cc5e324c1b55
+SPIRV_TOOLS_MIN=2024.1
+
+spirv_new_enough() {
+	[ -n "$1" ] &&
+		[ "$(printf '%s\n%s\n' "$SPIRV_TOOLS_MIN" "$1" | sort -V | head -1)" = "$SPIRV_TOOLS_MIN" ]
+}
+
+host_spirv_tools_for_mesa() {
+	# The host's own, when it is new enough: nothing to do.
+	if spirv_new_enough "$(pkg-config --modversion SPIRV-Tools 2>/dev/null)"; then
+		echo "mesa: host SPIRV-Tools $(pkg-config --modversion SPIRV-Tools) is new enough" >&2
+		return 0
+	fi
+	# Built by an earlier run: reuse it.
+	pcdir="$HOSTTOOLS/lib/pkgconfig"
+	if spirv_new_enough "$(PKG_CONFIG_PATH="$pcdir" pkg-config --modversion SPIRV-Tools 2>/dev/null)"; then
+		echo "$pcdir"
+		return 0
+	fi
+
+	echo "mesa: host SPIRV-Tools is $(pkg-config --modversion SPIRV-Tools 2>/dev/null || echo absent)," \
+		"Mesa needs >= $SPIRV_TOOLS_MIN -- building $SPIRV_SDK into $HOSTTOOLS" >&2
+	src="$HOSTTOOLS/src"
+	mkdir -p "$src" || return 1
+	for pkg in headers tools; do
+		tb="$port/spirv-$pkg-$SPIRV_SDK.tar.gz"
+		case $pkg in
+		headers) repo=SPIRV-Headers sum=$SPIRV_HEADERS_SHA256 ;;
+		tools) repo=SPIRV-Tools sum=$SPIRV_TOOLS_SHA256 ;;
+		esac
+		if [ ! -f "$tb" ]; then
+			curl -fL --retry 3 -o "$tb.part" \
+				"https://github.com/KhronosGroup/$repo/archive/refs/tags/vulkan-sdk-$SPIRV_SDK.tar.gz" &&
+				mv "$tb.part" "$tb" || { rm -f "$tb.part"; return 1; }
+		fi
+		echo "$sum  $tb" | sha256sum -c --quiet - || {
+			echo "mesa: checksum mismatch on $tb" >&2
+			return 1
+		}
+		rm -rf "$src/$repo-vulkan-sdk-$SPIRV_SDK"
+		tar xzf "$tb" -C "$src" || return 1
+	done
+
+	hdrs="$src/SPIRV-Headers-vulkan-sdk-$SPIRV_SDK"
+	tsrc="$src/SPIRV-Tools-vulkan-sdk-$SPIRV_SDK"
+	cmake -S "$tsrc" -B "$tsrc/build" -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX="$HOSTTOOLS" \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DSPIRV-Headers_SOURCE_DIR="$hdrs" \
+		-DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON \
+		-DSPIRV_WERROR=OFF >&2 &&
+		ninja -C "$tsrc/build" >&2 &&
+		ninja -C "$tsrc/build" install >&2 || return 1
+
+	spirv_new_enough "$(PKG_CONFIG_PATH="$pcdir" pkg-config --modversion SPIRV-Tools 2>/dev/null)" || {
+		echo "mesa: SPIRV-Tools built but $pcdir does not report >= $SPIRV_TOOLS_MIN" >&2
+		return 1
+	}
+	echo "$pcdir"
 }
 
 needs_host_build() {
@@ -2725,10 +2832,18 @@ LUAPC
 			# machine and must never be a candidate for the image.
 			if needs_host_build "$name"; then
 				rm -rf .likeos-host
+				# Mesa's CLC needs a newer SPIRV-Tools than some
+				# hosts have; this builds one only then, and
+				# names its pkg-config directory when it did.
+				hostpc=""
+				if [ "$name" = mesa ]; then
+					hostpc=$(host_spirv_tools_for_mesa) || exit 1
+				fi
 				# Same PATH as the cross half below: it is
 				# what finds the port's own meson, which on a
 				# distribution that refuses a system-wide pip
 				# install is the only one new enough.
+				PKG_CONFIG_PATH="${hostpc:+$hostpc:}${PKG_CONFIG_PATH:-}" \
 				PATH="$HOSTTOOLS/bin:$PATH" \
 					meson setup .likeos-host \
 					--prefix="$HOSTTOOLS" \

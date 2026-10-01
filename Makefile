@@ -3054,8 +3054,20 @@ deps:
 	# in; mesa_clc links the OpenCL builtins from it, so it is named here.
 	# The versioned names first: a release that ships only llvm-NN-dev
 	# has no unversioned llvm-dev/clang metapackages.
+	#
+	# Three tiers, newest first, and the middle one is not optional.
+	# Mesa's CLC needs LLVM >= 15 AND an LLVMSPIRVLib of the SAME major
+	# version.  Ubuntu 22.04 has no -18 packages, so the first line fails
+	# there -- and its UNVERSIONED names are the trap: llvm-dev is 14,
+	# libllvmspirvlib-dev is 13 and libclc-dev a 2019 snapshot, all of which
+	# install happily and none of which Mesa can use.  The -15 set is the
+	# newest 22.04 carries with a matching LLVMSPIRVLib (15.0.0), so it is
+	# named explicitly, ahead of the unversioned fallback.
 	sudo apt install -y llvm-18-dev clang-18 libclang-18-dev libclang-cpp18-dev \
 		libclc-18 libclc-18-dev spirv-tools libllvmspirvlib-18-dev \
+		python3-mako python3-yaml || \
+	sudo apt install -y llvm-15-dev clang-15 libclang-15-dev libclang-cpp15-dev \
+		libclc-15 libclc-15-dev spirv-tools libllvmspirvlib-15-dev \
 		python3-mako python3-yaml || \
 	sudo apt install -y llvm-dev clang libclang-dev libclc-dev spirv-tools \
 		libllvmspirvlib-dev python3-mako python3-yaml || true
