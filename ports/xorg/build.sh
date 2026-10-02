@@ -1180,20 +1180,21 @@ cmake_opts() {
 		# including the ones under Intel's own licence, without which
 		# most codecs are missing.  Off: the C for Media runtime, the
 		# test suite (target-only), the driver's system configuration
-		# file, the newer kernel interface (the driver here is i915),
-		# and every part newer than Gen9 -- the parts this driver
-		# serves are Gen8 and Gen9 (Broadwell through Comet Lake); the
-		# rest is most of the driver's compile time.  The driver
-		# directory is libva's, /usr/lib/dri, as for the i965 driver.
+		# file and the newer kernel interface (the driver here is i915).
+		# Every GPU generation the kernel drives is built in -- Gen8/9,
+		# Ice Lake, Tiger/Alder/Raptor Lake, DG1/DG2, Meteor/Arrow Lake,
+		# Lunar Lake, Battlemage -- and named ON explicitly, so a build
+		# directory configured earlier with them off is corrected too.
+		# The driver directory is libva's, /usr/lib/dri, as for i965.
 		echo "-DENABLE_KERNELS=ON -DENABLE_NONFREE_KERNELS=ON \
 		      -DBUILD_CMRTLIB=OFF -DMEDIA_RUN_TEST_SUITE=OFF \
 		      -DINSTALL_DRIVER_SYSCONF=OFF \
 		      -DLIBVA_DRIVERS_PATH=/usr/lib/dri \
 		      -DENABLE_XE_KMD=OFF \
-		      -DGEN11=OFF -DGEN12=OFF -DMTL=OFF -DARL=OFF -DLNL=OFF \
-		      -DBMG=OFF -DXE_LPG=OFF -DXE2_HPG=OFF \
-		      -DXE_LPM_PLUS_SUPPORT=OFF -DXE2_HPM_SUPPORT=OFF \
-		      -DXE2_LPM_SUPPORT=OFF"
+		      -DGEN8=ON -DGEN9=ON -DGEN11=ON -DGEN12=ON -DMTL=ON -DARL=ON \
+		      -DLNL=ON -DBMG=ON -DXE_LPG=ON -DXE2_HPG=ON \
+		      -DXE_LPM_PLUS_SUPPORT=ON -DXE2_HPM_SUPPORT=ON \
+		      -DXE2_LPM_SUPPORT=ON"
 		;;
 	libjpeg-turbo)
 		# The version-8 API and soname: that is what everything here

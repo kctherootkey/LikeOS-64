@@ -19,6 +19,7 @@
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_fence_layout.h>
+#include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
@@ -42,7 +43,15 @@ static void fence_write(struct i915_device *i915, int id, uint64_t val)
 
 int i915_fences_init(struct i915_device *i915)
 {
-	i915->num_fences = i915->info->gen >= 6 ? I915_NUM_FENCES_GEN6 : 0;
+	/* before Broadwell: the register layouts of each generation */
+	if (i915_is_legacy(i915))
+		return i915_legacy_fences_init(i915);
+	/* fence registers detile accesses through the aperture: a part
+	 * without one (Meteor Lake on, the discrete parts) has none */
+	i915->num_fences = (i915->info->gen >= 6 && i915->bar_aperture.size &&
+			    !(i915->info->flags & I915_INFO_IS_DGFX)) ?
+				   I915_NUM_FENCES_GEN6 :
+				   0;
 	spinlock_init(&i915->fence_lock, "i915_fence");
 	for (int i = 0; i < I915_NUM_FENCES_GEN6; i++)
 		i915->fence_obj[i] = NULL;
@@ -58,6 +67,10 @@ int i915_fences_init(struct i915_device *i915)
 void i915_fences_restore(struct i915_device *i915)
 {
 	uint64_t fl;
+	if (i915_is_legacy(i915)) {
+		i915_legacy_fences_restore(i915);
+		return;
+	}
 	spin_lock_irqsave(&i915->fence_lock, &fl);
 	for (int i = 0; i < i915->num_fences; i++) {
 		struct drm_gem_object *o = i915->fence_obj[i];
@@ -148,6 +161,10 @@ static int object_map_in(struct i915_device *i915, struct drm_gem_object *o)
 static void object_map_out(struct i915_device *i915, struct drm_gem_object *o)
 {
 	struct i915_bo *bo = o->priv;
+	if (i915_is_legacy(i915)) {
+		i915_legacy_gtt_map_out(i915, o);
+		return;
+	}
 	fence_drop(i915, o);
 	if (bo->gtt_map_bound && bo->gtt_map_own) {
 		i915_ggtt_unbind(i915, bo->gtt_map_ggtt, (uint32_t)(o->npages * 4096));
@@ -165,12 +182,18 @@ static uint64_t gtt_map_fault(void *ctx, uint64_t index)
 	struct i915_device *i915 = &g_i915;
 	uint64_t page = m->first_page + index;
 	uint64_t fl;
+	uint32_t base;
+	int rc;
 
 	if (!bo || page >= o->npages)
 		return 0;
 	spin_lock_irqsave(&i915->fence_lock, &fl);
-	int rc = object_map_in(i915, o);
-	uint32_t base = bo->gtt_map_own ? bo->gtt_map_ggtt : bo->ggtt;
+	if (i915_is_legacy(i915)) {
+		rc = i915_legacy_gtt_map_in(i915, o, &base);
+	} else {
+		rc = object_map_in(i915, o);
+		base = bo->gtt_map_own ? bo->gtt_map_ggtt : bo->ggtt;
+	}
 	spin_unlock_irqrestore(&i915->fence_lock, fl);
 	if (rc)
 		return 0;

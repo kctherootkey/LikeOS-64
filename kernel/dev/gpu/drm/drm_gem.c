@@ -306,6 +306,26 @@ static void gem_reap_one_blocking(struct drm_device *dev)
 		 * signal almost continuously, so the interruptible form
 		 * returned at once nearly every time it was called. */
 		drm_fence_wait_flags(o->fence, 2000000000ULL, 0);
+		if (!o->fence->signaled) {
+			/* Still not done after two seconds: a device that
+			 * hangs.  Freeing now would hand pages the device
+			 * may still write to the next caller of the
+			 * allocator, so the object goes back on the queue,
+			 * and is freed once its fence passes (a hung
+			 * engine's reset signals it). */
+			static int said;
+			if (said < 4) {
+				said++;
+				kprintf("[drm] an object's fence did not pass in 2 s; its memory stays queued\n");
+			}
+			spin_lock_irqsave(&dev->lock, &fl);
+			o->dead_next = dev->dead;
+			dev->dead = o;
+			dev->dead_n++;
+			spin_unlock_irqrestore(&dev->lock, fl);
+			__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+			return;
+		}
 		drm_fence_put(o->fence);
 		o->fence = NULL;
 	}
@@ -795,23 +815,56 @@ static int dmabuf_mmap(vfs_file_t *f, struct device_mmap *m)
 	return 0;
 }
 
+/* What a user of the buffer must wait for, referenced (NULL: idle): every
+ * user's work for a writer, the writers' for a reader.  The driver knows
+ * the buffer's readers and writers; without it, the last fence recorded
+ * on the object stands for all of them. */
+static struct drm_fence *dmabuf_busy_fence(struct drm_gem_object *o, int write)
+{
+	struct drm_fence *f;
+
+	if (o->dev->drv->gem_busy_fence)
+		return o->dev->drv->gem_busy_fence(o, write);
+	f = o->fence;
+	if (f)
+		drm_fence_get(f);
+	return f;
+}
+
+/* POLLIN once the writers are done, POLLOUT once every user is.  The
+ * sleep is on the device's queue, which every signalled fence wakes:
+ * a fence's own queue may be freed under a poll that is still parked
+ * on it. */
 static short dmabuf_poll(vfs_file_t *f, short events, struct poll_table *pt)
 {
 	struct dmabuf_ctx *c = device_file_priv(f);
-	struct drm_fence *fence = c->obj->fence;
+	struct drm_gem_object *o = c->obj;
+	short ready = 0;
 
-	if (fence) {
-		poll_wait(pt, f, &fence->wq);
-		if (!fence->signaled)
-			return 0;
+	if (events & POLLIN) {
+		struct drm_fence *w = dmabuf_busy_fence(o, 0);
+		if (!w || w->signaled)
+			ready |= POLLIN;
+		if (w)
+			drm_fence_put(w);
 	}
-	return events & (POLLIN | POLLOUT);
+	if (events & POLLOUT) {
+		struct drm_fence *a = dmabuf_busy_fence(o, 1);
+		if (!a || a->signaled)
+			ready |= POLLOUT;
+		if (a)
+			drm_fence_put(a);
+	}
+	if ((ready & events & (POLLIN | POLLOUT)) != (events & (POLLIN | POLLOUT)))
+		poll_wait(pt, f, &o->dev->vbl_wq);
+	return ready;
 }
 
 static long dmabuf_ioctl(vfs_file_t *f, unsigned long req, void *argp,
 			 struct task *cur)
 {
 	struct dmabuf_ctx *c = device_file_priv(f);
+	struct drm_gem_object *o = c->obj;
 	(void)cur;
 
 	if (_IOC_TYPE(req) != DMA_BUF_BASE)
@@ -821,16 +874,59 @@ static long dmabuf_ioctl(vfs_file_t *f, unsigned long req, void *argp,
 		struct dma_buf_sync s;
 		if (copy_from_user(&s, argp, sizeof(s)) != 0)
 			return -EFAULT;
+		if (s.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
+			return -EINVAL;
 		/* Uninterruptible: this ioctl exists to promise the caller the
 		 * device is finished before it touches the mapping, and it
 		 * reports nothing back.  Returning early on a signal would
-		 * hand back that promise unkept. */
-		if (!(s.flags & DMA_BUF_SYNC_END) && c->obj->fence)
-			drm_fence_wait_flags(c->obj->fence, 2000000000ULL, 0);
+		 * hand back that promise unkept.  A CPU writer waits for
+		 * every user, a reader for the writers. */
+		if (!(s.flags & DMA_BUF_SYNC_END)) {
+			struct drm_fence *w = dmabuf_busy_fence(o, !!(s.flags & DMA_BUF_SYNC_WRITE));
+			if (w) {
+				drm_fence_wait_flags(w, 2000000000ULL, 0);
+				drm_fence_put(w);
+			}
+		}
 		return 0;
 	}
 	case 1: /* DMA_BUF_SET_NAME */
 		return 0;
+	case 2: { /* DMA_BUF_IOCTL_EXPORT_SYNC_FILE */
+		struct dma_buf_export_sync_file a;
+		if (copy_from_user(&a, argp, sizeof(a)) != 0)
+			return -EFAULT;
+		if (!(a.flags & DMA_BUF_SYNC_RW) || (a.flags & ~DMA_BUF_SYNC_RW))
+			return -EINVAL;
+		struct drm_fence *w = dmabuf_busy_fence(o, !!(a.flags & DMA_BUF_SYNC_WRITE));
+		if (!w)
+			w = drm_fence_signalled(o->dev);
+		if (!w)
+			return -ENOMEM;
+		int fd = drm_fence_export_fd(w, 1);
+		drm_fence_put(w);
+		if (fd < 0)
+			return fd;
+		a.fd = fd;
+		if (copy_to_user(argp, &a, sizeof(a)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case 3: { /* DMA_BUF_IOCTL_IMPORT_SYNC_FILE */
+		struct dma_buf_import_sync_file a;
+		if (copy_from_user(&a, argp, sizeof(a)) != 0)
+			return -EFAULT;
+		if (!(a.flags & DMA_BUF_SYNC_RW) || (a.flags & ~DMA_BUF_SYNC_RW))
+			return -EINVAL;
+		if (!o->dev->drv->gem_attach_fence)
+			return -ENOTTY;
+		struct drm_fence *w = drm_fence_from_fd(a.fd);
+		if (!w)
+			return -EINVAL;
+		int rc = o->dev->drv->gem_attach_fence(o, w, !!(a.flags & DMA_BUF_SYNC_WRITE));
+		drm_fence_put(w);
+		return rc;
+	}
 	default:
 		return -ENOTTY;
 	}

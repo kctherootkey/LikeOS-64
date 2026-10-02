@@ -58,6 +58,9 @@ struct drm_fence {
 	struct wait_queue_head wq;
 	struct drm_fence *next; /* device's list of live fences */
 	char name[16];
+	/* A merged fence (SYNC_IOC_MERGE): signalled once both of these
+	 * are; each is referenced while the merged one lives. */
+	struct drm_fence *deps[2];
 };
 
 struct drm_fence *drm_fence_create(struct drm_device *dev, uint32_t seqno,
@@ -65,6 +68,12 @@ struct drm_fence *drm_fence_create(struct drm_device *dev, uint32_t seqno,
 void drm_fence_get(struct drm_fence *f);
 void drm_fence_put(struct drm_fence *f);
 void drm_fence_signal(struct drm_fence *f);
+/* A fence that signals once both have (one of them, referenced, when
+ * the other has already); NULL without memory. */
+struct drm_fence *drm_fence_merge(struct drm_fence *a, struct drm_fence *b);
+/* Say (rate-limited) that the caller has waited `waited_ns' in `how' for
+ * a fence that has not signalled, and let the driver say why. */
+void drm_fence_report_stuck(struct drm_fence *f, uint64_t waited_ns, const char *how);
 /* Signal every fence with seqno <= passed (wrap-safe). */
 void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed);
 /* A fence on stream `context' at position `seqno64' (never zero); it is
@@ -558,6 +567,10 @@ struct drm_driver {
 	 * an unrelated thread to ask on its behalf.  This is how it asks for
 	 * itself. */
 	void (*fence_poll)(struct drm_device *dev);
+	/* Optional: say what the work behind a fence that has been waited
+	 * for for seconds is doing (which engine, how far it got).  Called
+	 * from thread context, rate-limited by the core. */
+	void (*fence_stuck)(struct drm_device *dev, struct drm_fence *f);
 	/* Release the object's backing pages.
 	 *
 	 * Optional, and the reason it exists is that a driver may have given
@@ -573,6 +586,15 @@ struct drm_driver {
 	 * tell the device to let go; this is where it waits for that to have
 	 * taken effect.  The pages array itself stays the core's to free. */
 	void (*gem_release_pages)(struct drm_gem_object *o);
+	/* Optional: the fence the object's users stand behind, referenced,
+	 * NULL when it is idle -- every user's (write: what a writer must
+	 * wait for) or the writers' only (what a reader must wait for).
+	 * Without it the core takes the object's last fence. */
+	struct drm_fence *(*gem_busy_fence)(struct drm_gem_object *o, int write);
+	/* Optional: a fence from outside (DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
+	 * that the object's next implicitly synchronised users wait for --
+	 * every one of them (write), or the writers only. */
+	int (*gem_attach_fence)(struct drm_gem_object *o, struct drm_fence *f, int write);
 	/* the pages of an object for mmap, or -1 if not mappable */
 	uint64_t (*gem_page_phys)(struct drm_gem_object *o, uint64_t index);
 	uint64_t gem_mmap_pte_extra;
@@ -654,6 +676,11 @@ struct drm_driver {
 	int (*resume)(struct drm_device *dev);
 	/* 1 when the backend delivers vblanks itself (drm_vblank_tick) */
 	int hw_vblank;
+	/* Optional, with hw_vblank: the core's watchdog found the crtc on
+	 * and no vblank for several periods while somebody waits; the
+	 * backend says why (and may repair it).  Called from the timer
+	 * (interrupt context), each time the timer starts standing in. */
+	void (*vblank_report)(struct drm_device *dev, int crtc);
 
 	/* driver ioctls: nr is the DRM_COMMAND_BASE-relative number */
 	long (*ioctl)(struct drm_device *dev, struct drm_file *fp, unsigned nr,
@@ -749,6 +776,13 @@ struct drm_device {
 		 * timer runs while the CRTC is active OR this is non-zero, so
 		 * that turning a CRTC off cannot strand someone mid-wait. */
 		int refs;
+		/* Where the backend counts (hw_vblank): when its last vblank
+		 * arrived, whether the timer is standing in for it (no
+		 * vblank for several periods while someone waits), and how
+		 * often that was said */
+		uint64_t hw_last_ns;
+		int soft;
+		uint32_t soft_said;
 	} vbl[DRM_MAX_CONNECTORS];
 	struct wait_queue_head vbl_wq;
 	uint32_t refresh_hz;

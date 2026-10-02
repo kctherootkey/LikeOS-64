@@ -9,8 +9,12 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
+#include <kernel/dev/gpu/i915/intel_display_legacy.h>
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/i915_xe2_reg.h>
+#include <kernel/dev/gpu/i915/i915_lmem.h>
+#include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/uapi/ioctl.h>
 #include <kernel/io/console.h>
@@ -29,6 +33,9 @@ struct pch_id {
 };
 
 static const struct pch_id pch_ids[] = {
+	{ 0x3b00, 0xff00, I915_PCH_IBX, "Ibex Peak" },
+	{ 0x1c00, 0xff00, I915_PCH_CPT, "Cougar Point" },
+	{ 0x1e00, 0xff00, I915_PCH_PPT, "Panther Point" },
 	{ 0x8c00, 0xff00, I915_PCH_LPT, "Lynx Point" },
 	{ 0x9c00, 0xff00, I915_PCH_LPT, "Lynx Point LP" },
 	{ 0x8c80, 0xff80, I915_PCH_WPT, "Wildcat Point" },
@@ -40,9 +47,12 @@ static const struct pch_id pch_ids[] = {
 	{ 0x9d80, 0xff80, I915_PCH_CNP, "Cannon Point LP" },
 	{ 0x0280, 0xff80, I915_PCH_CMP, "Comet Point LP" },
 	{ 0x0680, 0xff80, I915_PCH_CMP, "Comet Point" },
-	{ 0x4b00, 0xff80, I915_PCH_CMP, "Comet Point V" },
+	/* Comet Point-V is a Kaby Point underneath */
+	{ 0xa380, 0xff80, I915_PCH_KBP, "Comet Point V" },
 	{ 0x3480, 0xff80, I915_PCH_ICP, "Ice Point" },
-	{ 0x3880, 0xff80, I915_PCH_ICP, "Mule Creek Canyon" },
+	{ 0x3880, 0xff80, I915_PCH_ICP, "Ice Point" },
+	/* Elkhart Lake's south display: Jasper Point's ports and pins */
+	{ 0x4b00, 0xff80, I915_PCH_JSP, "Mule Creek Canyon" },
 	{ 0x4d80, 0xff80, I915_PCH_JSP, "Jasper Point" },
 	{ 0xa080, 0xff80, I915_PCH_TGP, "Tiger Point" },
 	{ 0x4380, 0xff80, I915_PCH_TGP, "Tiger Point" },
@@ -61,6 +71,26 @@ static const char *i915_pch_detect(struct i915_device *i915)
 
 	i915->pch = I915_PCH_NONE;
 	i915->pch_devid = 0;
+	/* Where the south display sits on the same die (or card) as the
+	 * north one, the ISA bridge says nothing about it: the platform
+	 * decides. */
+	if (i915->info->display_ver >= 20) {
+		i915->pch = I915_PCH_LNL;
+		return "on the SoC (Lunar Lake kind)";
+	}
+	if (i915->info->platform == I915_PLATFORM_METEORLAKE ||
+	    i915->info->platform == I915_PLATFORM_BATTLEMAGE) {
+		i915->pch = I915_PCH_MTP;
+		return "on the SoC (Meteor Point kind)";
+	}
+	if (i915->info->platform == I915_PLATFORM_DG2) {
+		i915->pch = I915_PCH_DG2;
+		return "on the card (DG2)";
+	}
+	if (i915->info->platform == I915_PLATFORM_DG1) {
+		i915->pch = I915_PCH_DG1;
+		return "on the card (DG1)";
+	}
 	if (!(i915->info->flags & I915_INFO_HAS_PCH))
 		return "none";
 	if (!isa || isa->vendor_id != 0x8086) {
@@ -87,7 +117,20 @@ static int i915_gem_init_obj(struct drm_gem_object *o)
 		return -ENOMEM;
 	mm_memset(bo, 0, sizeof(*bo));
 	bo->fence_id = -1;
+	/* A new object's pages were cleared by the processor, through its
+	 * cache: it starts in the CPU domain.  On a part without a shared
+	 * last-level cache the first submission that uses it then writes
+	 * those lines back (i915_gem_object_flush_for_gpu); left dirty, they
+	 * are evicted later right over what an engine has written there --
+	 * a decoder's freshly decoded frame turning into green blocks of
+	 * zeros until the buffer pool has been through the cache once. */
+	bo->read_domains = I915_GEM_DOMAIN_CPU;
+	bo->write_domain = I915_GEM_DOMAIN_CPU;
 	o->priv = bo;
+	/* a discrete part's display reads only its local memory: a buffer
+	 * made for scanout moves there before anything maps it */
+	if (o->scanout && i915_lmem_present(&g_i915) && !o->pages_borrowed)
+		(void)i915_lmem_migrate(&g_i915, o, I915_LMEM_ALLOC_CPU_ACCESS);
 	return 0;
 }
 
@@ -112,15 +155,29 @@ static void i915_fence_poll(struct drm_device *dev)
 		struct i915_engine *e = &i915->engines[i];
 		if (!e->present)
 			continue;
+		if (i915_is_legacy(i915)) {
+			i915_legacy_engine_retire(e);
+			continue;
+		}
 		if (!i915->guc.submission)
 			i915_execlists_process_csb(e);
 		i915_engine_retire(e);
 	}
 }
 
+static void i915_fence_stuck(struct drm_device *dev, struct drm_fence *f)
+{
+	(void)dev;
+	if (!g_i915.gt_ready || !f->context)
+		return;
+	i915_engine_report_stuck(&g_i915, f->context, f->seqno64);
+}
+
 static uint64_t i915_gem_mmap_pte(struct drm_gem_object *o, unsigned kind)
 {
-	(void)o;
+	/* local memory through BAR2: write-combining whatever was asked */
+	if (i915_lmem_object(o))
+		return PAGE_WRITE_THROUGH;
 	switch (kind) {
 	case 2: /* write-back */
 		return 0;
@@ -135,6 +192,8 @@ static uint64_t i915_gem_page_phys(struct drm_gem_object *o, uint64_t index)
 {
 	if (!o->pages || index >= o->npages)
 		return (uint64_t)-1;
+	if (i915_lmem_page(o->pages[index]))
+		return i915_lmem_page_cpu_phys(&g_i915, o->pages[index]);
 	return o->pages[index];
 }
 
@@ -238,7 +297,11 @@ static int i915_suspend(struct drm_device *dev)
 		}
 		i915_gt_reset_all(i915);
 	}
-	intel_display_suspend(i915);
+	if (intel_legacy_display_active(i915))
+		intel_legacy_display_suspend(i915);
+	else
+		intel_display_suspend(i915);
+	(void)i915_lmem_suspend(i915);
 	i915_irq_suspend(i915);
 	i915_uncore_fini(i915);
 	return 0;
@@ -254,10 +317,12 @@ static int i915_resume(struct drm_device *dev)
 		kprintf("[drm] i915: forcewake did not answer after resume\n");
 		return rc;
 	}
+	i915_lmem_resume(i915);
 	i915_ggtt_program_pat(i915);
 	i915_ggtt_rewrite_all(i915);
 	i915_irq_resume(i915);
-	rc = intel_display_resume(i915);
+	rc = intel_legacy_display_active(i915) ? intel_legacy_display_resume(i915) :
+						      intel_display_resume(i915);
 	if (rc)
 		return rc;
 	if (i915->nengines) {
@@ -271,11 +336,19 @@ static int i915_resume(struct drm_device *dev)
 static int i915_late_init(struct drm_device *dev)
 {
 	struct i915_device *i915 = to_i915(dev);
-	if (i915->display.ready)
+	int legacy = intel_legacy_display_active(i915);
+	if (i915->display.ready && !legacy)
 		(void)intel_dmc_load(i915);
-	if (i915_guc_wants_load(i915)) {
+	if (i915->info->flags & I915_INFO_GT_UNSUPPORTED) {
+		/* display only: no firmware for the GT */
+	} else if (i915_guc_wants_load(i915)) {
 		/* Where the GuC is the only way to submit, the engines come
-		 * up after it and run their first batch through it. */
+		 * up after it and run their first batch through it.  The GT
+		 * is reset and set up first: the firmware's own memory
+		 * traffic goes through the tables, and a reset after the
+		 * load would take it down. */
+		if (i915->info->flags & I915_INFO_GUC_MANDATORY)
+			i915_gt_init_hw(i915);
 		if (i915_guc_init(i915) == 0 && (i915->info->flags & I915_INFO_GUC_MANDATORY) &&
 		    i915_engines_init(i915) == 0) {
 			i915_fences_init(i915);
@@ -284,12 +357,20 @@ static int i915_late_init(struct drm_device *dev)
 				kprintf("[drm] i915: no engine executed its first batch through the GuC; rendering disabled\n");
 				i915->gt_ready = 0;
 				i915_engines_fini(i915);
+			} else {
+				/* what the GuC restores an engine's context
+				 * from after it resets one */
+				i915_guc_ads_update_golden(i915);
+				i915_gt_lmem_ready(i915);
 			}
 		}
 	} else {
 		i915_uc_firmware_describe(i915);
 	}
-	(void)intel_hpd_start(i915);
+	if (legacy)
+		(void)intel_legacy_hpd_start(i915);
+	else
+		(void)intel_hpd_start(i915);
 	return i915_gt_workers_start(i915);
 }
 
@@ -308,6 +389,8 @@ static const struct drm_driver i915_driver = {
 	.gem_init = i915_gem_init_obj,
 	.gem_free = i915_gem_free_obj,
 	.gem_release_pages = i915_gem_release_pages,
+	.gem_busy_fence = i915_gem_busy_fence,
+	.gem_attach_fence = i915_gem_attach_fence,
 	.gem_page_phys = i915_gem_page_phys,
 	.gem_mmap_pte_extra = PAGE_WRITE_THROUGH,
 	.gem_mmap_pte = i915_gem_mmap_pte,
@@ -326,12 +409,52 @@ static const struct drm_driver i915_driver = {
 	.detect = intel_detect,
 	.get_modes = intel_get_modes,
 	.hw_vblank = 1,
+	.vblank_report = intel_display_vblank_report,
 	.fence_poll = i915_fence_poll,
+	.fence_stuck = i915_fence_stuck,
 	.display_verify = intel_display_verify,
 	.display_fallback = intel_display_fallback,
 	.ioctl = i915_ioctl,
 	.render_allowed = i915_render_allowed,
 };
+
+/* Is this a part whose display is not the DDI kind: everything before
+ * Haswell, and Valleyview/Cherryview whatever their generation? */
+static int legacy_display_part(const struct i915_device *i915)
+{
+	if (i915->info->platform == I915_PLATFORM_HASWELL)
+		return 0;
+	return i915->info->gen < 8 || i915->info->platform == I915_PLATFORM_VALLEYVIEW ||
+	       i915->info->platform == I915_PLATFORM_CHERRYVIEW;
+}
+
+/* Those parts offer what their planes take: linear and X layouts only,
+ * their own pixel formats, and 64-pixel cursors on the oldest. */
+static const struct drm_driver *i915_driver_for(struct i915_device *i915)
+{
+	static struct drm_driver legacy;
+	if (!legacy_display_part(i915))
+		return &i915_driver;
+	legacy = i915_driver;
+	switch (i915->info->platform) {
+	case I915_PLATFORM_I830:
+	case I915_PLATFORM_I845G:
+	case I915_PLATFORM_I85X:
+	case I915_PLATFORM_I865G:
+	case I915_PLATFORM_I915G:
+	case I915_PLATFORM_I915GM:
+		legacy.cursor_w = legacy.cursor_h = 64;
+		break;
+	default:
+		legacy.cursor_w = legacy.cursor_h = 256;
+		break;
+	}
+	legacy.fb_formats = intel_legacy_fb_formats;
+	legacy.nfb_formats = intel_legacy_nfb_formats;
+	legacy.fb_modifiers = intel_legacy_fb_modifiers;
+	legacy.nfb_modifiers = intel_legacy_nfb_modifiers;
+	return &legacy;
+}
 
 /* ---- probe ---------------------------------------------------------------- */
 
@@ -363,9 +486,12 @@ static void i915_teardown(struct i915_device *i915)
 		i915->gt_ready = 0;
 		i915_engines_fini(i915);
 	}
-	if (i915->display.ready)
+	if (intel_legacy_display_active(i915))
+		intel_legacy_display_fini(i915);
+	else if (i915->display.ready)
 		intel_display_fini(i915);
 	i915_irq_fini(i915);
+	i915_lmem_fini(i915);
 	i915_gtt_fini(i915);
 	i915_uncore_fini(i915);
 	if (i915->mmio_virt) {
@@ -391,7 +517,9 @@ int i915_init(void)
 	}
 	mm_memset(i915, 0, sizeof(*i915));
 	mm_rwsem_init(&i915->submit_lock, "i915_submit");
+	mm_rwsem_init(&i915->clear_lock, "i915_clear");
 	spinlock_init(&i915->sync_lock, "i915_sync");
+	spinlock_init(&i915->ggtt_lock, "i915_ggtt");
 	i915->pci = pci;
 	i915->id = id;
 	i915->info = id->info;
@@ -410,41 +538,51 @@ int i915_init(void)
 		i915->info->gen_x10 / 10, i915->info->gen_x10 % 10,
 		pci->device_id, i915->revid);
 
-	/* The register window and the aperture. */
-	if (pci_bar_decode(pci, 0, &i915->bar_mmio) != 0 ||
-	    (i915->bar_mmio.flags & PCI_BAR_IO)) {
-		kprintf("[drm] i915: no register window (BAR0)\n");
-		return -ENODEV;
-	}
-	if (pci_bar_decode(pci, 2, &i915->bar_aperture) != 0)
-		i915->bar_aperture.size = 0;
-	if (pci_bar_decode(pci, 4, &i915->bar_io) != 0)
-		i915->bar_io.size = 0;
-	i915_dbg("[drm] i915: registers at %llx (%llu MB), aperture at %llx (%llu MB)\n",
-		(unsigned long long)i915->bar_mmio.base,
-		(unsigned long long)(i915->bar_mmio.size >> 20),
-		(unsigned long long)i915->bar_aperture.base,
-		(unsigned long long)(i915->bar_aperture.size >> 20));
+	/* The register window and the aperture: where they are depends
+	 * on the generation before Broadwell. */
+	if (i915_is_legacy(i915)) {
+		rc = i915_legacy_mmio_map(i915);
+		if (rc)
+			return rc;
+	} else {
+		if (pci_bar_decode(pci, 0, &i915->bar_mmio) != 0 ||
+		    (i915->bar_mmio.flags & PCI_BAR_IO)) {
+			kprintf("[drm] i915: no register window (BAR0)\n");
+			return -ENODEV;
+		}
+		if (pci_bar_decode(pci, 2, &i915->bar_aperture) != 0)
+			i915->bar_aperture.size = 0;
+		if (pci_bar_decode(pci, 4, &i915->bar_io) != 0)
+			i915->bar_io.size = 0;
+		i915_dbg("[drm] i915: registers at %llx (%llu MB), aperture at %llx (%llu MB)\n",
+			(unsigned long long)i915->bar_mmio.base,
+			(unsigned long long)(i915->bar_mmio.size >> 20),
+			(unsigned long long)i915->bar_aperture.base,
+			(unsigned long long)(i915->bar_aperture.size >> 20));
 
-	pci_enable_busmaster_mem(pci);
+		pci_enable_busmaster_mem(pci);
 
-	/* Registers are the lower half of BAR0 on every part driven here;
-	 * the upper half is the GTT (i915_gtt.c). */
-	i915->mmio_size = i915->bar_mmio.size / 2;
-	if (i915->mmio_size < (2u << 20)) {
-		kprintf("[drm] i915: register window too small\n");
-		return -ENODEV;
-	}
-	i915->mmio_virt = mm_map_mmio_flags(i915->bar_mmio.base,
-					    i915->mmio_size / 4096, MM_MMIO_UC);
-	if (!i915->mmio_virt) {
-		kprintf("[drm] i915: cannot map the registers\n");
-		return -ENOMEM;
+		/* Registers are the lower half of BAR0 on every part driven here;
+		 * the upper half is the GTT (i915_gtt.c). */
+		i915->mmio_size = i915->bar_mmio.size / 2;
+		if (i915->mmio_size < (2u << 20)) {
+			kprintf("[drm] i915: register window too small\n");
+			return -ENODEV;
+		}
+		i915->mmio_virt = mm_map_mmio_flags(i915->bar_mmio.base,
+						    i915->mmio_size / 4096, MM_MMIO_UC);
+		if (!i915->mmio_virt) {
+			kprintf("[drm] i915: cannot map the registers\n");
+			return -ENOMEM;
+		}
 	}
 
 	const char *pch = i915_pch_detect(i915);
 	i915_dbg("[drm] i915: PCH %s (%04x)\n", pch, i915->pch_devid);
 
+	/* which variant and stepping, and whether the media engines are a
+	 * GT of their own: the forcewake domains depend on it */
+	i915_step_init(i915);
 	rc = i915_uncore_init(i915);
 	if (rc) {
 		kprintf("[drm] i915: forcewake did not answer; keeping the boot framebuffer\n");
@@ -452,19 +590,36 @@ int i915_init(void)
 		return rc;
 	}
 	i915_read_topology(i915);
+	i915_mcr_init(i915);
+	/* Xe2 on: the firmware may have switched the flat compression
+	 * metadata off */
+	if (i915->gt_ip >= I915_IP(20, 0))
+		i915->has_flat_ccs = !!(i915_mcr_read(i915, XE2_FLAT_CCS_BASE_RANGE_LOWER) &
+					XE2_FLAT_CCS_ENABLE);
 	i915->cs_timestamp_hz = i915_timestamp_hz(i915);
-	i915_dbg("[drm] i915: slices %x, subslices %x, %u EUs, timestamp %u Hz\n",
-		i915->slice_mask, i915->subslice_mask[0], i915->eu_total,
-		i915->cs_timestamp_hz);
+	if (i915->info->gen_x10 >= 120)
+		kprintf("[drm] i915: slices %x, subslices %x, %u EUs, timestamp %u Hz\n",
+			i915->slice_mask, i915->subslice_mask[0], i915->eu_total,
+			i915->cs_timestamp_hz);
+	else
+		i915_dbg("[drm] i915: slices %x, subslices %x, %u EUs, timestamp %u Hz\n",
+			 i915->slice_mask, i915->subslice_mask[0], i915->eu_total,
+			 i915->cs_timestamp_hz);
 
 	rc = i915_gtt_probe(i915);
 	if (rc) {
 		i915_teardown(i915);
 		return rc;
 	}
+	rc = i915_lmem_probe(i915);
+	if (rc) {
+		kprintf("[drm] i915: local memory not usable (%d); keeping the boot framebuffer\n", rc);
+		i915_teardown(i915);
+		return rc;
+	}
 	(void)i915_irq_init(i915); /* without one the driver still works */
 
-	rc = drm_dev_register(&i915->drm, &i915_driver, pci, i915);
+	rc = drm_dev_register(&i915->drm, i915_driver_for(i915), pci, i915);
 	if (rc) {
 		kprintf("[drm] i915: device registration failed (%d)\n", rc);
 		i915_teardown(i915);
@@ -474,7 +629,11 @@ int i915_init(void)
 	/* The display: outputs, the panel, its modes.  Failure here leaves
 	 * the node registered (the render side does not need a screen) and
 	 * the console on the boot framebuffer. */
-	rc = intel_display_init(i915);
+	/* The parts before the DDI display (and Valleyview/Cherryview)
+	 * have a display backend of their own. */
+	rc = intel_legacy_display_init(i915);
+	if (rc == -ENODEV)
+		rc = intel_display_init(i915);
 	if (rc) {
 		kprintf("[drm] i915: display not brought up (%d); console stays on the boot framebuffer\n",
 			rc);
@@ -495,13 +654,14 @@ int i915_init(void)
 		mm_get_memory_stats(&st);
 		i915->total_ram_bytes = st.total_memory;
 	}
-	if (i915->info->flags & I915_INFO_GUC_MANDATORY) {
+	if (i915->info->flags & I915_INFO_GT_UNSUPPORTED) {
+		/* the display is driven; the GT is not (rendering off) */
+		kprintf("[drm] i915: %s: graphics IP %u.%02u is not driven; display only, rendering disabled\n",
+			i915->info->name, i915->gt_ip / 100, i915->gt_ip % 100);
+	} else if (i915->info->flags & I915_INFO_GUC_MANDATORY) {
 		/* the GT waits for the firmware, which needs the root
 		 * filesystem: the late-init hook brings it up */
 		kprintf("[drm] i915: %s submits through the GuC; the GT comes up after the firmware loads\n",
-			i915->info->name);
-	} else if (i915->info->gen_x10 >= 120) {
-		kprintf("[drm] i915: execution lists on %s are not brought up yet; display only\n",
 			i915->info->name);
 	} else if (i915_engines_init(i915) == 0) {
 		i915_fences_init(i915);
@@ -510,6 +670,8 @@ int i915_init(void)
 			kprintf("[drm] i915: no engine executed its first batch; rendering disabled\n");
 			i915->gt_ready = 0;
 			i915_engines_fini(i915);
+		} else {
+			i915_gt_lmem_ready(i915);
 		}
 	}
 	return 0;

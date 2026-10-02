@@ -6,13 +6,22 @@
 // channel with a control register and five data registers; a
 // transaction is written into the data registers as a header plus
 // payload, started with the busy bit, and its reply read back the same
-// way.
+// way.  Tiger Lake numbers its Type-C ports' channels after A-C (USBC1
+// is the fourth); Meteor Lake moved them into PICA, 0x200 apart, and powers
+// every channel through a request bit in its control register, which a
+// transfer must therefore keep set when it writes the register.  Display
+// version 20 (Lunar Lake on) renumbered PICA's blocks so that the Type-C
+// channels come first and A and B follow USBC4; Nova Lake's channels
+// also report when their power is up.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2020-2023 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_xelpdp_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
@@ -47,15 +56,61 @@ static void unpack_be(uint32_t v, uint8_t *b, unsigned n)
 		b[i] = (uint8_t)(v >> (24 - 8 * i));
 }
 
+static int aux_is_xelpdp(struct intel_dp_aux *aux)
+{
+	return aux->i915->display.model == INTEL_DISPLAY_MTL;
+}
+
+/* The sync pulses a transfer starts with: 16 precharge plus 16 preamble
+ * clocks for an ordinary transfer, 10 plus 8 for a fast-wake one. */
+#define AUX_SYNC_LEN (16 + 16)
+#define AUX_FW_SYNC_LEN (10 + 8)
+
 static uint32_t aux_ctl_value(struct intel_dp_aux *aux, unsigned send_bytes)
 {
-	(void)aux;
-	return DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE |
-	       DP_AUX_CH_CTL_INTERRUPT | DP_AUX_CH_CTL_TIME_OUT_ERROR |
-	       DP_AUX_CH_CTL_TIME_OUT_MAX | DP_AUX_CH_CTL_RECEIVE_ERROR |
-	       (send_bytes << DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT) |
-	       DP_AUX_CH_CTL_FW_SYNC_PULSE_SKL(32) |
-	       DP_AUX_CH_CTL_SYNC_PULSE_SKL(32);
+	uint32_t v = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE |
+		     DP_AUX_CH_CTL_INTERRUPT | DP_AUX_CH_CTL_TIME_OUT_ERROR |
+		     DP_AUX_CH_CTL_TIME_OUT_MAX | DP_AUX_CH_CTL_RECEIVE_ERROR |
+		     (send_bytes << DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT) |
+		     DP_AUX_CH_CTL_FW_SYNC_PULSE_SKL(AUX_FW_SYNC_LEN) |
+		     DP_AUX_CH_CTL_SYNC_PULSE_SKL(AUX_SYNC_LEN);
+
+	/* a Type-C port in Thunderbolt mode talks through the TBT I/O */
+	if (aux->tbt_io)
+		v |= DP_AUX_CH_CTL_TBT_IO;
+	/* the channel's power request lives in this register too */
+	if (aux_is_xelpdp(aux))
+		v |= XELPDP_DP_AUX_CH_CTL_POWER_REQUEST;
+	return v;
+}
+
+/* Meteor Lake: the channel must be powered before it is used.  The
+ * power domain normally keeps the request up; a transfer made without
+ * it (a probe before the output is enabled) raises it here and gives
+ * the channel the fixed 600 us it needs to come up. */
+static void aux_power_up(struct intel_dp_aux *aux)
+{
+	struct i915_device *i915 = aux->i915;
+	uint32_t v;
+
+	if (!aux_is_xelpdp(aux))
+		return;
+	v = i915_read32(i915, aux->ctl_reg);
+	if (v & XELPDP_DP_AUX_CH_CTL_POWER_REQUEST)
+		return;
+	i915_write32(i915, aux->ctl_reg, v | XELPDP_DP_AUX_CH_CTL_POWER_REQUEST);
+	/* Nova Lake's LT PHYs report the channel up (within 2 ms); before
+	 * them the status bit means nothing and the wait is fixed. */
+	if (intel_has_lt_phy(i915)) {
+		for (int t = 0; t < 200; t++) {
+			if (i915_read32(i915, aux->ctl_reg) & XELPDP_DP_AUX_CH_CTL_POWER_STATUS)
+				return;
+			lapic_delay_us(10);
+		}
+		kprintf("[drm] i915: AUX %s: channel power did not come up\n", aux->i2c.name);
+		return;
+	}
+	lapic_delay_us(600);
 }
 
 /* One transaction: `send' bytes (header + payload) out, the reply back
@@ -69,6 +124,7 @@ static int aux_xfer(struct intel_dp_aux *aux, const uint8_t *send,
 
 	if (send_bytes > 20 || recv_cap > 20)
 		return -EINVAL;
+	aux_power_up(aux);
 	/* The channel must be idle. */
 	for (int t = 0; t < 1000; t++) {
 		status = i915_read32(i915, aux->ctl_reg);
@@ -281,18 +337,40 @@ void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
 	mm_memset(aux, 0, sizeof(*aux));
 	aux->i915 = i915;
 	aux->port = port;
-	if (i915->display.model == INTEL_DISPLAY_TGL && port >= PORT_TC1) {
-		aux->ctl_reg = TGL_DP_AUX_CH_CTL(port - PORT_TC1);
-		aux->data_reg = TGL_DP_AUX_CH_DATA(port - PORT_TC1, 0);
+	if (i915->display.model == INTEL_DISPLAY_MTL) {
+		/* A, B and USBC1-4 (channel 3..6) */
+		if (port == 2 || port > 6)
+			kprintf("[drm] i915: AUX channel %d does not exist here; using A\n", port);
+		int ch = (port == 2 || port > 6) ? 0 : port;
+		int ver = i915->info->display_ver;
+		aux->ctl_reg = XELPDP_DP_AUX_CH_CTL_VER(ver, ch);
+		aux->data_reg = XELPDP_DP_AUX_CH_DATA_VER(ver, ch, 0);
 	} else {
-		aux->ctl_reg = DP_AUX_CH_CTL(port);
-		aux->data_reg = DP_AUX_CH_DATA(port, 0);
+		/* Skylake has a DDI E but no AUX E: it shares A.  From Tiger
+		 * Lake the Type-C channels (USBC1.., index 3..) follow A-C at
+		 * the same stride. */
+		int ch = port;
+		if (i915->info->display_ver == 9 && port == PORT_E)
+			ch = PORT_A;
+		aux->ctl_reg = DP_AUX_CH_CTL(ch);
+		aux->data_reg = DP_AUX_CH_DATA(ch, 0);
 	}
 	aux->i2c.xfer = aux_i2c_xfer;
 	aux->i2c.priv = aux;
 	aux->i2c.name[0] = 'A';
 	aux->i2c.name[1] = 'U';
 	aux->i2c.name[2] = 'X';
-	aux->i2c.name[3] = (char)('A' + port);
-	aux->i2c.name[4] = 0;
+	if ((i915->display.model == INTEL_DISPLAY_TGL ||
+	     i915->display.model == INTEL_DISPLAY_MTL) && port >= PORT_TC1) {
+		/* "AUX USBC1" .. */
+		const char *u = " USBC";
+		int i = 3;
+		for (; *u; u++)
+			aux->i2c.name[i++] = *u;
+		aux->i2c.name[i++] = (char)('1' + port - PORT_TC1);
+		aux->i2c.name[i] = 0;
+	} else {
+		aux->i2c.name[3] = (char)('A' + port);
+		aux->i2c.name[4] = 0;
+	}
 }

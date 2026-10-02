@@ -2,15 +2,22 @@
 //
 // A 48-bit address space of the same shape as the CPU's: a page map
 // level 4 of 512 entries to page directory pointers, to page directories,
-// to page tables, to 4 KB pages.  Unmapped ranges point at scratch tables
+// to page tables, to 4 KB pages.  Xe2 and later walk five levels: a
+// fifth table above, whose first entry leads to the 48 bits a client
+// has.  Unmapped ranges point at scratch tables
 // that lead to one scratch page, so the hardware never walks into an
 // absent entry (which it treats as a fault and stops on).  Tables are
 // allocated as ranges are bound and kept until the space dies.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2021-2025 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/i915_xe2_reg.h>
+#include <kernel/dev/gpu/i915/i915_lmem.h>
+#include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -107,23 +114,49 @@ static void table_fill(uint64_t table_phys, uint64_t entry)
 		t[i] = entry;
 }
 
+/* A directory entry.  Xe2 on: with the attributes the hardware reads the
+ * table below through -- the cached, coherent entry (2) for the system
+ * memory the tables are in -- in its two index bits. */
 static inline uint64_t pde_encode(uint64_t phys)
 {
-	return (phys & ADDR_MASK) | GEN8_PDE_PRESENT | GEN8_PDE_RW;
+	uint64_t pde = (phys & ADDR_MASK) | GEN8_PDE_PRESENT | GEN8_PDE_RW;
+
+	if (g_i915.gt_ip >= I915_IP(20, 0)) {
+		uint32_t pat = i915_pat_index(&g_i915, 0);
+		if (pat & 1)
+			pde |= GEN12_PPGTT_PTE_PAT0;
+		if (pat & 2)
+			pde |= GEN12_PPGTT_PTE_PAT1;
+	}
+	return pde;
 }
 
-static inline uint64_t pte_encode(struct i915_device *i915, uint64_t phys,
-				  int uncached)
+/* A page's entry names its page attribute table entry by index: Gen12
+ * spreads the index over bits 3, 4 and 7 (and Meteor Lake's fourth bit
+ * over bit 62); before Gen12 the same bits are the PWT, PCD and PAT
+ * bits whose combination is the index -- uncached at 3, the display's
+ * write-through at 2. */
+static inline uint64_t pte_encode(struct i915_device *i915, uint64_t phys, uint32_t pat)
 {
 	uint64_t pte = (phys & ADDR_MASK) | GEN8_PDE_PRESENT | GEN8_PDE_RW;
+
 	if (i915->info->gen_x10 >= 120) {
-		/* PAT index in bits 3,4,7 (index 3 = uncached) */
-		if (uncached)
-			pte |= GEN8_PTE_CACHE_PWT | GEN8_PTE_CACHE_PCD;
+		if (pat & 1)
+			pte |= GEN12_PPGTT_PTE_PAT0;
+		if (pat & 2)
+			pte |= GEN12_PPGTT_PTE_PAT1;
+		if (pat & 4)
+			pte |= GEN12_PPGTT_PTE_PAT2;
+		if ((pat & 8) && i915->gt_ip >= I915_IP(12, 70))
+			pte |= MTL_PPGTT_PTE_PAT3;
+		if ((pat & 16) && i915->gt_ip >= I915_IP(20, 0))
+			pte |= XE2_PPGTT_PTE_PAT4;
 		return pte;
 	}
-	if (uncached)
+	if (pat == 3)
 		pte |= GEN8_PTE_CACHE_PWT | GEN8_PTE_CACHE_PCD;
+	else if (pat == 2)
+		pte |= GEN8_PTE_CACHE_PCD;
 	return pte;
 }
 
@@ -141,6 +174,9 @@ static void table_flush(struct i915_device *i915, uint64_t phys)
 
 struct i915_vm *i915_vm_create(struct i915_device *i915)
 {
+	/* before Broadwell every context shares one space */
+	if (i915_is_legacy(i915))
+		return i915_legacy_vm_create(i915);
 	struct i915_vm *vm = kalloc(sizeof(*vm));
 	if (!vm)
 		return NULL;
@@ -157,14 +193,59 @@ struct i915_vm *i915_vm_create(struct i915_device *i915)
 		i915_vm_put(vm);
 		return NULL;
 	}
-	table_fill(vm->scratch_pt, pte_encode(i915, vm->scratch_page, 0));
+	table_fill(vm->scratch_pt, pte_encode(i915, vm->scratch_page, i915_pat_index(i915, 0)));
 	table_fill(vm->scratch_pd, pde_encode(vm->scratch_pt));
 	table_fill(vm->scratch_pdp, pde_encode(vm->scratch_pd));
 	table_fill(vm->pml4, pde_encode(vm->scratch_pdp));
 	table_flush(i915, vm->scratch_pt);
 	table_flush(i915, vm->scratch_pd);
 	table_flush(i915, vm->scratch_pdp);
+	if (i915_vm_3lvl(i915)) {
+		/* the 4 GB a three-level space has: its directories now,
+		 * since the contexts' registers name them and nothing
+		 * rewrites those later */
+		uint64_t pdp = table_alloc(vm);
+		uint64_t *pml4 = phys_to_virt(vm->pml4), *pdpv;
+		if (!pdp) {
+			i915_vm_put(vm);
+			return NULL;
+		}
+		table_fill(pdp, pde_encode(vm->scratch_pd));
+		pdpv = phys_to_virt(pdp);
+		for (int i = 0; i < 4; i++) {
+			vm->pd32[i] = table_alloc(vm);
+			if (!vm->pd32[i]) {
+				i915_vm_put(vm);
+				return NULL;
+			}
+			table_fill(vm->pd32[i], pde_encode(vm->scratch_pt));
+			table_flush(i915, vm->pd32[i]);
+			pdpv[i] = pde_encode(vm->pd32[i]);
+		}
+		table_flush(i915, pdp);
+		pml4[0] = pde_encode(pdp);
+	}
 	table_flush(i915, vm->pml4);
+	if (i915->gt_ip >= I915_IP(20, 0)) {
+		/* the fifth level: the 48-bit space at its first entry */
+		uint64_t *top;
+		vm->scratch_pml4 = table_alloc(vm);
+		vm->pml5 = table_alloc(vm);
+		if (!vm->scratch_pml4 || !vm->pml5) {
+			i915_vm_put(vm);
+			return NULL;
+		}
+		table_fill(vm->scratch_pml4, pde_encode(vm->scratch_pdp));
+		table_fill(vm->pml5, pde_encode(vm->scratch_pml4));
+		top = phys_to_virt(vm->pml5);
+		top[0] = pde_encode(vm->pml4);
+		/* an address with bit 47 set reaches the engine sign-extended
+		 * (bits 56:48 all set): the last entry leads to the same
+		 * fourth level, so either form finds the same page */
+		top[ENTRIES - 1] = pde_encode(vm->pml4);
+		table_flush(i915, vm->scratch_pml4);
+		table_flush(i915, vm->pml5);
+	}
 	/* relocation clients: objects that must stay below 4 GB start at
 	 * 1 MB (nothing lands on the null page), the rest from 4 GB up */
 	vm->alloc_low = 1ULL << 20;
@@ -183,10 +264,18 @@ int i915_vm_vma_alloc(struct i915_vm *vm, struct i915_vma *v, uint32_t npages,
 		      uint64_t align, int low)
 {
 	uint64_t zone_start = low ? (1ULL << 20) : (1ULL << 32);
-	uint64_t zone_end = low ? (1ULL << 32) : I915_VM_SIZE;
+	uint64_t zone_end = low ? (1ULL << 32) : i915_vm_total(&g_i915);
 	uint64_t *cursor = low ? &vm->alloc_low : &vm->alloc_high;
 	uint64_t fl, a;
 
+	if (i915_is_legacy(&g_i915))
+		return i915_legacy_vm_vma_alloc(vm, v, npages, align, low);
+	if (i915_vm_3lvl(&g_i915) && !low) {
+		/* nothing above 4 GB in a three-level space */
+		zone_start = 1ULL << 20;
+		zone_end = 1ULL << 32;
+		cursor = &vm->alloc_low;
+	}
 	if (align < 4096)
 		align = 4096;
 	if (align & (align - 1))
@@ -206,6 +295,13 @@ int i915_vm_vma_alloc(struct i915_vm *vm, struct i915_vma *v, uint32_t npages,
 	}
 	spin_unlock_irqrestore(&vm->lock, fl);
 	return a ? 0 : -ENOSPC;
+}
+
+uint64_t i915_vm_root(struct i915_vm *vm)
+{
+	if (vm->pml5)
+		return pde_encode(vm->pml5);
+	return vm->pml4;
 }
 
 void i915_vm_get(struct i915_vm *vm)
@@ -271,7 +367,7 @@ static uint64_t *pt_for(struct i915_vm *vm, uint64_t addr, int create,
 		pt_phys = table_take(vm, sp);
 		if (!pt_phys)
 			return NULL;
-		table_fill(pt_phys, pte_encode(i915, vm->scratch_page, 0));
+		table_fill(pt_phys, pte_encode(i915, vm->scratch_page, i915_pat_index(i915, 0)));
 		pd[i2] = pde_encode(pt_phys);
 		table_flush(i915, pt_phys);
 		table_flush(i915, pd_phys);
@@ -283,6 +379,8 @@ static uint64_t *pt_for(struct i915_vm *vm, uint64_t addr, int create,
  * diagnosis: reads the tables without the lock, as the engine does. */
 uint64_t i915_vm_lookup(struct i915_vm *vm, uint64_t addr)
 {
+	if (i915_is_legacy(&g_i915))
+		return i915_legacy_vm_lookup(vm, addr);
 	uint64_t *pt = pt_for(vm, addr & 0x0000FFFFFFFFF000ULL, 0, NULL);
 	if (!pt)
 		return 0;
@@ -298,10 +396,21 @@ uint64_t i915_vm_lookup(struct i915_vm *vm, uint64_t addr)
 int i915_vm_bind(struct i915_vm *vm, uint64_t addr, const uint64_t *pages,
 		 uint32_t npages, int uncached)
 {
+	if (i915_is_legacy(&g_i915))
+		return i915_legacy_vm_bind(vm, addr, pages, npages, uncached);
+	return i915_vm_bind_pat(vm, addr, pages, npages, i915_pat_index(&g_i915, uncached));
+}
+
+int i915_vm_bind_pat(struct i915_vm *vm, uint64_t addr, const uint64_t *pages,
+		     uint32_t npages, uint32_t pat)
+{
 	struct i915_device *i915 = &g_i915;
 	uint64_t fl;
 
-	if (addr & 0xfff || addr + (uint64_t)npages * 4096 > I915_VM_SIZE)
+	if (i915_is_legacy(i915))
+		return i915_legacy_vm_bind(vm, addr, pages, npages, i915_pat_is_uncached(i915, pat));
+	if (addr & 0xfff ||
+	    addr + (uint64_t)npages * 4096 > (i915_vm_3lvl(i915) ? 1ULL << 32 : I915_VM_SIZE))
 		return -EINVAL;
 	/* One run per page table: every page of a run shares its table, so
 	 * the three pages reserved before each run cover everything the
@@ -324,8 +433,9 @@ int i915_vm_bind(struct i915_vm *vm, uint64_t addr, const uint64_t *pages,
 		}
 		for (uint32_t i = 0; i < run; i++) {
 			uint64_t p = a + (uint64_t)i * 4096;
-			pt[(p >> 12) & 0x1ff] =
-				pte_encode(i915, pages[done + i], uncached);
+			pt[(p >> 12) & 0x1ff] = pte_encode(i915, pages[done + i], pat) |
+						i915_lmem_ppgtt_pte_bits(i915, pages, done + i,
+									 npages, p);
 		}
 		table_flush(i915, virt_to_phys(pt));
 		vm->tlb_dirty = 1;
@@ -341,13 +451,17 @@ void i915_vm_unbind(struct i915_vm *vm, uint64_t addr, uint32_t npages)
 	struct i915_device *i915 = &g_i915;
 	uint64_t fl;
 
+	if (i915_is_legacy(i915)) {
+		i915_legacy_vm_unbind(vm, addr, npages);
+		return;
+	}
 	spin_lock_irqsave(&vm->lock, &fl);
 	for (uint32_t i = 0; i < npages; i++) {
 		uint64_t a = addr + (uint64_t)i * 4096;
 		uint64_t *pt = pt_for(vm, a, 0, NULL);
 		if (!pt)
 			continue;
-		pt[(a >> 12) & 0x1ff] = pte_encode(i915, vm->scratch_page, 0);
+		pt[(a >> 12) & 0x1ff] = pte_encode(i915, vm->scratch_page, i915_pat_index(i915, 0));
 		if (((a >> 12) & 0x1ff) == 0x1ff || i == npages - 1)
 			table_flush(i915, virt_to_phys(pt));
 	}

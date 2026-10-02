@@ -6,6 +6,8 @@
 // and not necessarily aligned in memory.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2014 Intel Corporation
 
 #include <kernel/dev/gpu/i915/intel_dmc.h>
 
@@ -47,6 +49,14 @@ static uint32_t rd32(const uint8_t *p)
 int intel_dmc_parse(const uint8_t *fw, unsigned len, char stepping, char substepping,
 		    uint32_t max_fw_dwords, uint32_t mmio_lo, uint32_t mmio_hi,
 		    uint32_t v1_start, struct intel_dmc_image *out)
+{
+	return intel_dmc_parse_id(fw, len, stepping, substepping, INTEL_DMC_ID_MAIN, max_fw_dwords,
+				  mmio_lo, mmio_hi, v1_start, out);
+}
+
+int intel_dmc_parse_id(const uint8_t *fw, unsigned len, char stepping, char substepping,
+		       int dmc_id, uint32_t max_fw_dwords, uint32_t mmio_lo,
+		       uint32_t mmio_hi, uint32_t v1_start, struct intel_dmc_image *out)
 {
 	unsigned pos = 0;
 
@@ -92,10 +102,12 @@ int intel_dmc_parse(const uint8_t *fw, unsigned len, char stepping, char substep
 		const uint8_t *e = entries + i * FW_INFO_SIZE;
 		char st, sub;
 		if (pkg_ver == 1) {
+			if (dmc_id != INTEL_DMC_ID_MAIN)
+				continue;
 			st = (char)e[2];
 			sub = (char)e[3];
 		} else {
-			if (e[1] != 0) /* dmc_id: 0 is the main controller */
+			if (e[1] != dmc_id) /* 0 the main controller, 1.. the pipes' */
 				continue;
 			st = (char)e[2];
 			sub = (char)e[3];
@@ -164,7 +176,8 @@ int intel_dmc_parse(const uint8_t *fw, unsigned len, char stepping, char substep
 			out->mmioaddr[i] = rd32(h + 96 + i * 4);
 			out->mmiodata[i] = rd32(h + 176 + i * 4);
 		}
-		if (out->start_mmioaddr < mmio_lo || out->start_mmioaddr > mmio_hi)
+		if (dmc_id == INTEL_DMC_ID_MAIN &&
+		    (out->start_mmioaddr < mmio_lo || out->start_mmioaddr > mmio_hi))
 			return INTEL_DMC_EBAD_MMIO;
 	} else {
 		return INTEL_DMC_EBAD_HEADER;

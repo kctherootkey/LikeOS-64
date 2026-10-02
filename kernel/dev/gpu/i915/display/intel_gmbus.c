@@ -10,20 +10,33 @@
 // "stop" cycle ends the transfer.  A write-then-read pair with a one-byte
 // index (the DDC offset) folds into a single "index" cycle.
 //
+// Which pins exist, which pin the VBT means by the number it gives (from
+// Cannon Point on it counts DDC buses, not pins), and which pin a port
+// uses when the VBT says nothing, all depend on the PCH and the
+// platform's port-to-PHY wiring.  Lunar Lake and the parts after it (the
+// south display on the SoC, the "Lunar Lake" kind) and Battlemage keep
+// Meteor Point's pins and bus numbering.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2006-2025 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_xelpdp_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
 
-/* register base: south display (PCH) or the north one on parts without */
+/* The registers are at the south display's offsets on every part this
+ * driver drives, Broxton (which has no PCH) and the discrete cards
+ * included. */
 static uint32_t gmbus_base(struct i915_device *i915)
 {
-	return (i915->info->flags & I915_INFO_HAS_PCH) ? 0xC5100 : 0x5100;
+	(void)i915;
+	return 0xC5100;
 }
 #define GMBUS0(i915) (gmbus_base(i915) + 0x00)
 #define GMBUS1(i915) (gmbus_base(i915) + 0x04)
@@ -37,65 +50,214 @@ static uint32_t gmbus_base(struct i915_device *i915)
 
 /* ---- pins --------------------------------------------------------------------- */
 
+static int plat(struct i915_device *i915, int p)
+{
+	return i915->info->platform == p;
+}
+
+static int pch_is_mcc(struct i915_device *i915)
+{
+	return (i915->pch_devid & 0xff80) == 0x4b00;
+}
+
+/* Meteor Point's pins and bus numbering: Meteor Lake, Battlemage, and
+ * Lunar Lake's kind of south display (every part from display 20). */
+static int pch_mtp_kind(struct i915_device *i915)
+{
+	return i915->pch == I915_PCH_MTP || i915->pch == I915_PCH_LNL;
+}
+
+/* The GMBUS pins the part has. */
 static int pin_valid(struct i915_device *i915, uint8_t pin)
 {
 	switch (i915->pch) {
+	case I915_PCH_MTP:
+	case I915_PCH_LNL:
+		return (pin >= 1 && pin <= 5) || (pin >= 9 && pin <= 12);
+	case I915_PCH_DG2:
+		return (pin >= 1 && pin <= 4) || pin == 9;
+	case I915_PCH_DG1:
+		return pin >= 1 && pin <= 4;
 	case I915_PCH_ICP:
 	case I915_PCH_JSP:
 	case I915_PCH_TGP:
 	case I915_PCH_ADP:
-		return pin >= 1 && pin <= 14 && pin != 4 && pin != 5 && pin != 6 && pin != 7 && pin != 8;
+		return (pin >= 1 && pin <= 3) || (pin >= 9 && pin <= 14);
 	case I915_PCH_CNP:
 	case I915_PCH_CMP:
 		return pin >= 1 && pin <= 4;
 	case I915_PCH_NONE:
 		/* the low-power Gen9 parts: three pins */
 		return pin >= 1 && pin <= 3;
-	default:
-		/* Lynx Point through Kaby Point: the panel's and the analogue
-		 * connector's pins exist alongside the three digital ones. */
+	case I915_PCH_LPT:
+	case I915_PCH_WPT:
+		/* the panel's and the analogue connector's pins exist
+		 * alongside the three digital ones on the H parts */
 		return pin >= GMBUS_PIN_SSC && pin <= GMBUS_PIN_DPD;
+	default:
+		/* Sunrise/Kaby Point: the three digital pins */
+		return pin >= GMBUS_PIN_DPC && pin <= GMBUS_PIN_DPD;
 	}
+}
+
+/* From Cannon Point the VBT names a DDC bus, which is a pin only through
+ * a per-platform table (the pin is the table's index of the bus).
+ * Returns the pin, 0 when the bus does not exist here. */
+static uint8_t map_vbt_ddc_pin(struct i915_device *i915, uint8_t vbt)
+{
+	static const uint8_t adlp[] = { 0, 1, 2, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6 };
+	static const uint8_t adls[] = { 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 3, 4, 5 };
+	static const uint8_t rkl_tgp[] = { 0, 1, 2, 0, 0, 0, 0, 0, 0, 3, 4 };
+	static const uint8_t gen9_tgp[] = { 0, 0, 1, 0, 0, 0, 0, 0, 0, 2, 3 };
+	static const uint8_t icp[] = { 0, 1, 2, 3, 0, 0, 0, 0, 0, 4, 5, 6, 7, 8, 9 };
+	static const uint8_t cnp[] = { 0, 1, 2, 4, 3 };
+	const uint8_t *map;
+	unsigned n;
+
+	if (pch_mtp_kind(i915) || plat(i915, I915_PLATFORM_ALDERLAKE_P)) {
+		map = adlp;
+		n = sizeof(adlp);
+	} else if (plat(i915, I915_PLATFORM_ALDERLAKE_S)) {
+		map = adls;
+		n = sizeof(adls);
+	} else if (i915->pch == I915_PCH_DG1 || i915->pch == I915_PCH_DG2) {
+		return vbt;
+	} else if (plat(i915, I915_PLATFORM_ROCKETLAKE) && i915->pch == I915_PCH_TGP) {
+		map = rkl_tgp;
+		n = sizeof(rkl_tgp);
+	} else if (i915->pch == I915_PCH_TGP && i915->info->display_ver == 9) {
+		map = gen9_tgp;
+		n = sizeof(gen9_tgp);
+	} else if (i915->pch >= I915_PCH_ICP && i915->pch <= I915_PCH_ADP) {
+		map = icp;
+		n = sizeof(icp);
+	} else if (i915->pch == I915_PCH_CNP || i915->pch == I915_PCH_CMP) {
+		map = cnp;
+		n = sizeof(cnp);
+	} else {
+		return vbt;
+	}
+	for (unsigned i = 1; i < n; i++)
+		if (map[i] == vbt)
+			return (uint8_t)i;
+	return 0;
+}
+
+/* The PHY a port is wired to (index, A = 0). */
+static int port_phy(struct i915_device *i915, int port)
+{
+	int ver = i915->info->display_ver;
+
+	if (ver >= 13 && port >= PORT_H)
+		return PORT_D + port - PORT_H;
+	if (ver >= 13 && port >= PORT_TC1)
+		return PORT_F + port - PORT_TC1;
+	if (plat(i915, I915_PLATFORM_ALDERLAKE_S) && port >= PORT_TC1)
+		return PORT_B + port - PORT_TC1;
+	if ((plat(i915, I915_PLATFORM_DG1) || plat(i915, I915_PLATFORM_ROCKETLAKE)) &&
+	    port >= PORT_TC1)
+		return PORT_C + port - PORT_TC1;
+	if ((plat(i915, I915_PLATFORM_JASPERLAKE) || plat(i915, I915_PLATFORM_ELKHARTLAKE)) &&
+	    port == PORT_D)
+		return PORT_A;
+	return port;
+}
+
+/* Is that PHY a Type-C one? */
+static int phy_is_tc(struct i915_device *i915, int phy)
+{
+	if (i915->info->flags & I915_INFO_IS_DGFX)
+		return 0;
+	if (i915->info->display_ver >= 13)
+		return phy >= PORT_F && phy <= PORT_I;
+	if (plat(i915, I915_PLATFORM_TIGERLAKE))
+		return phy >= PORT_D && phy <= PORT_I;
+	if (plat(i915, I915_PLATFORM_ICELAKE))
+		return phy >= PORT_C && phy <= PORT_F;
+	return 0;
 }
 
 static uint8_t default_pin(struct i915_device *i915, int port)
 {
-	switch (i915->pch) {
-	case I915_PCH_ICP:
-	case I915_PCH_JSP:
-	case I915_PCH_TGP:
-	case I915_PCH_ADP:
-		/* combo ports A/B on 1/2, Type-C ports from 9 */
-		return port <= PORT_B ? (uint8_t)(1 + port) : (uint8_t)(GMBUS_PIN_9_TC1_ICP + (port - PORT_C));
-	case I915_PCH_CNP:
-	case I915_PCH_CMP:
+	int ver = i915->info->display_ver;
+	int phy = port_phy(i915, port);
+
+	if (plat(i915, I915_PLATFORM_ALDERLAKE_S))
+		return phy == PORT_A ? 1 : (uint8_t)(GMBUS_PIN_9_TC1_ICP + phy - PORT_B);
+	if (pch_mtp_kind(i915) && port >= PORT_TC1 && port < PORT_H)
+		/* Meteor Point's Type-C pins are 9-12 (the table names them
+		 * after the ports) */
+		return (uint8_t)(GMBUS_PIN_9_TC1_ICP + port - PORT_TC1);
+	if (plat(i915, I915_PLATFORM_DG2) && port == PORT_TC1)
+		return GMBUS_PIN_9_TC1_ICP;
+	if (i915->pch == I915_PCH_DG1 || i915->pch == I915_PCH_DG2 || pch_mtp_kind(i915))
+		return (uint8_t)(phy + 1);
+	if (plat(i915, I915_PLATFORM_ROCKETLAKE) ||
+	    (ver == 9 && i915->pch == I915_PCH_TGP)) {
+		if (i915->pch == I915_PCH_TGP && phy >= PORT_C)
+			return (uint8_t)(GMBUS_PIN_9_TC1_ICP + phy - PORT_C);
+		return (uint8_t)(1 + phy);
+	}
+	if ((plat(i915, I915_PLATFORM_JASPERLAKE) || plat(i915, I915_PLATFORM_ELKHARTLAKE)) &&
+	    pch_is_mcc(i915)) {
+		switch (phy) {
+		case PORT_A: return 1;
+		case PORT_B: return 2;
+		case PORT_C: return GMBUS_PIN_9_TC1_ICP;
+		default: return 1;
+		}
+	}
+	if (i915->pch >= I915_PCH_ICP && i915->pch <= I915_PCH_ADP) {
+		/* combo ports from pin 1, Type-C ports from 9 */
+		if (phy_is_tc(i915, phy))
+			return (uint8_t)(GMBUS_PIN_9_TC1_ICP +
+					 (ver >= 12 ? port - PORT_TC1 : port - PORT_C));
+		return (uint8_t)(1 + port);
+	}
+	if (i915->pch == I915_PCH_CNP || i915->pch == I915_PCH_CMP) {
 		switch (port) {
 		case PORT_B: return GMBUS_PIN_1_BXT;
 		case PORT_C: return GMBUS_PIN_2_BXT;
 		case PORT_D: return GMBUS_PIN_4_CNP;
-		default: return GMBUS_PIN_3_BXT;
+		default: return GMBUS_PIN_1_BXT;
 		}
-	case I915_PCH_NONE:
-		return port == PORT_B ? GMBUS_PIN_1_BXT : GMBUS_PIN_2_BXT;
-	default:
-		switch (port) {
-		case PORT_B: return GMBUS_PIN_DPB;
-		case PORT_C: return GMBUS_PIN_DPC;
-		case PORT_D: return GMBUS_PIN_DPD;
-		default: return GMBUS_PIN_DISABLED;
-		}
+	}
+	if (i915->display.model == INTEL_DISPLAY_BXT || i915->pch == I915_PCH_NONE)
+		return port == PORT_C ? GMBUS_PIN_2_BXT : GMBUS_PIN_1_BXT;
+	switch (port) {
+	case PORT_B: return GMBUS_PIN_DPB;
+	case PORT_C: return GMBUS_PIN_DPC;
+	case PORT_D: return GMBUS_PIN_DPD;
+	default: return GMBUS_PIN_DPB;
 	}
 }
 
 uint8_t intel_gmbus_pin_for_port(struct i915_device *i915, int port, uint8_t vbt_pin)
 {
-	if (vbt_pin && pin_valid(i915, vbt_pin))
-		return vbt_pin;
-	uint8_t pin = default_pin(i915, port);
+	uint8_t pin = vbt_pin ? map_vbt_ddc_pin(i915, vbt_pin) : 0;
+	if (pin && pin_valid(i915, pin))
+		return pin;
+	uint8_t def = default_pin(i915, port);
 	if (vbt_pin)
-		kprintf("[drm] i915: port %c: VBT DDC pin %u unknown here, using %u\n",
-			'A' + port, vbt_pin, pin);
-	return pin;
+		kprintf("[drm] i915: port %s: VBT DDC bus %u is no pin here, using %u\n",
+			intel_port_name(i915, port), vbt_pin, def);
+	return def;
+}
+
+/* Display WA #0868 (Skylake to Gemini Lake): the GMBUS unit's clock
+ * gating is held off while a transfer runs. */
+static void gmbus_clock_gating(struct i915_device *i915, int enable)
+{
+	if (i915->display.model == INTEL_DISPLAY_BXT) {
+		uint32_t v = i915_read32(i915, GEN9_CLKGATE_DIS_4);
+		i915_write32(i915, GEN9_CLKGATE_DIS_4,
+			     enable ? (v & ~BXT_GMBUS_GATING_DIS) : (v | BXT_GMBUS_GATING_DIS));
+	} else if (i915->pch >= I915_PCH_SPT && i915->pch <= I915_PCH_CMP) {
+		uint32_t v = i915_read32(i915, SOUTH_DSPCLK_GATE_D);
+		i915_write32(i915, SOUTH_DSPCLK_GATE_D,
+			     enable ? (v & ~PCH_GMBUSUNIT_CLOCK_GATE_DISABLE) :
+				      (v | PCH_GMBUSUNIT_CLOCK_GATE_DISABLE));
+	}
 }
 
 /* ---- transfers ---------------------------------------------------------------- */
@@ -263,7 +425,9 @@ static int gmbus_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int n)
 	while (__sync_lock_test_and_set(&d->gmbus_busy, 1))
 		sched_yield_in_kernel();
 	intel_power_get(i915, INTEL_PW_GMBUS);
+	gmbus_clock_gating(i915, 0);
 	int rc = gmbus_xfer_locked(i915, pv->pin, msgs, n);
+	gmbus_clock_gating(i915, 1);
 	intel_power_put(i915, INTEL_PW_GMBUS);
 	__sync_lock_release(&d->gmbus_busy);
 	return rc;

@@ -1,41 +1,72 @@
-# Firmware blobs the Intel graphics driver may load, one per line, as named
-# under /lib/firmware/i915 in the vendor firmware package.  The image build
-# copies each that exists in FIRMWARE_SRC (decompressing a .zst copy) into
-# /lib/firmware/i915 on the image; a missing file is skipped with a note,
-# since the display never depends on firmware -- only display power saving
-# (DMC) and, on the newest parts, engine scheduling (GuC/HuC) do.
+# Firmware blobs the Intel graphics driver asks for, one per line, as paths
+# under /lib/firmware.  All of res/firmware/i915 and res/firmware/xe goes
+# onto the image anyway; this list is what the build checks is there (and
+# fetches from FIRMWARE_SRC when the bundle lacks it), so every blob a
+# device descriptor in i915_pci.c names belongs here.
 #
 # Display microcode (DMC), one per platform, the version the driver asks for:
-skl_dmc_ver1_27.bin
-kbl_dmc_ver1_04.bin
-bxt_dmc_ver1_07.bin
-glk_dmc_ver1_04.bin
-icl_dmc_ver1_09.bin
-tgl_dmc_ver2_12.bin
-rkl_dmc_ver2_03.bin
-dg1_dmc_ver2_02.bin
-adls_dmc_ver2_01.bin
-adlp_dmc_ver2_16.bin
-dg2_dmc_ver2_08.bin
+i915/skl_dmc_ver1_27.bin
+i915/kbl_dmc_ver1_04.bin
+i915/bxt_dmc_ver1_07.bin
+i915/glk_dmc_ver1_04.bin
+i915/icl_dmc_ver1_09.bin
+i915/tgl_dmc_ver2_12.bin
+i915/rkl_dmc_ver2_03.bin
+i915/dg1_dmc_ver2_02.bin
+i915/adls_dmc_ver2_01.bin
+i915/adlp_dmc_ver2_16.bin
+i915/dg2_dmc_ver2_08.bin
 # Scheduling firmware (GuC) and media firmware (HuC), Gen11 and later:
-icl_guc_70.1.1.bin
-icl_huc_9.0.0.bin
-tgl_guc_70.1.1.bin
-tgl_huc_7.9.3.bin
-dg1_guc_70.1.1.bin
-dg1_huc_7.9.3.bin
-adlp_guc_70.1.1.bin
-adlp_guc_70.bin
-dg2_guc_70.bin
-dg2_huc_gsc.bin
+i915/icl_guc_70.1.1.bin
+i915/icl_huc_9.0.0.bin
+i915/tgl_guc_70.1.1.bin
+i915/tgl_huc_7.9.3.bin
+i915/dg1_guc_70.1.1.bin
+i915/dg1_huc_7.9.3.bin
+i915/adlp_guc_70.1.1.bin
+i915/adlp_guc_70.bin
+i915/dg2_guc_70.bin
+i915/dg2_huc_gsc.bin
 # Skylake-generation GuC/HuC (optional; execlists run without them):
-skl_guc_70.1.1.bin
-skl_huc_2.0.0.bin
-kbl_guc_70.1.1.bin
-kbl_huc_4.0.0.bin
-cml_guc_70.1.1.bin
-cml_huc_4.0.0.bin
-glk_guc_70.1.1.bin
-glk_huc_4.0.0.bin
-bxt_guc_70.1.1.bin
-bxt_huc_2.0.0.bin
+i915/skl_guc_70.1.1.bin
+i915/skl_huc_2.0.0.bin
+i915/kbl_guc_70.1.1.bin
+i915/kbl_huc_4.0.0.bin
+i915/cml_guc_70.1.1.bin
+i915/cml_huc_4.0.0.bin
+i915/glk_guc_70.1.1.bin
+i915/glk_huc_4.0.0.bin
+i915/bxt_guc_70.1.1.bin
+i915/bxt_huc_2.0.0.bin
+# Meteor Lake / Arrow Lake: display microcode, GuC, and the HuC image the
+# GSC authenticates (the GSC's own firmware with it):
+i915/mtl_dmc.bin
+i915/mtl_guc_70.bin
+i915/mtl_huc_gsc.bin
+i915/mtl_gsc_1.bin
+# Lunar Lake, Battlemage, Panther Lake, Nova Lake: display microcode under
+# i915/, the GT's GuC/HuC/GSC under xe/:
+i915/xe2lpd_dmc.bin
+i915/bmg_dmc.bin
+i915/xe3lpd_dmc.bin
+i915/xe3lpd_3002_dmc.bin
+i915/xe3p_lpd_dmc.bin
+xe/lnl_guc_70.bin
+xe/lnl_huc.bin
+xe/lnl_gsc_1.bin
+xe/bmg_guc_70.bin
+xe/bmg_huc.bin
+xe/ptl_guc_70.bin
+xe/ptl_huc.bin
+xe/ptl_gsc_1.bin
+xe/nvl_guc_70.bin
+# Cannon Lake display microcode, Elkhart/Jasper Lake GuC/HuC, the
+# unversioned names the newer parts ask for first:
+i915/cnl_dmc_ver1_07.bin
+i915/ehl_guc_70.1.1.bin
+i915/ehl_huc_9.0.0.bin
+i915/adlp_dmc.bin
+i915/tgl_guc_70.bin
+i915/tgl_huc.bin
+i915/dg1_guc_70.bin
+i915/dg1_huc.bin

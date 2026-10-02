@@ -9,14 +9,16 @@
 // next context goes in.  Completion of the requests themselves is by
 // sequence number (i915_engine.c), which does not depend on the status
 // buffer.  The port does: it is freed by a status entry and by nothing
-// else, so every entry is taken to mean what the reference driver takes it
-// to mean (i915_execlists_process_csb), and none is set aside.
+// else, so every entry is taken to mean what the hardware documentation
+// says it means (i915_execlists_process_csb), and none is set aside.
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/hal/lapic.h>
+#include <kernel/ke/timer.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -87,6 +89,8 @@ void i915_execlists_submit(struct i915_engine *e)
 {
 	struct i915_device *i915 = e->i915;
 
+	if (i915_is_legacy(i915))
+		return; /* the ring takes requests as they are made */
 	if (i915->guc.submission) {
 		i915_guc_submit(e);
 		return;
@@ -134,7 +138,7 @@ void i915_execlists_submit(struct i915_engine *e)
 		e->resident[0] = ctx;
 		i915_context_get(ctx);
 		if (gone) {
-			if (e->nstale < 4)
+			if (e->nstale < (int)(sizeof(e->stale) / sizeof(e->stale[0])))
 				e->stale[e->nstale++] = gone;
 			else
 				i915_context_put(gone);
@@ -158,7 +162,7 @@ static uint64_t csb_read(struct i915_engine *e, int index)
 }
 
 /* Does this entry say a context is being handed the engine (as opposed to
- * leaving it)?  The reference driver's reading of the buffer, and the only
+ * leaving it)?  The documented reading of the buffer, and the only
  * question asked of an entry.
  *
  * Gen8-11: a context starting (idle to active), or a preemption -- which
@@ -183,7 +187,8 @@ static int csb_promotes(struct i915_device *i915, uint64_t entry)
 	return !!(lower & (GEN8_CTX_STATUS_IDLE_ACTIVE | GEN8_CTX_STATUS_PREEMPTED));
 }
 
-void i915_execlists_process_csb(struct i915_engine *e)
+/* Returns whether the port was freed. */
+static int csb_process(struct i915_engine *e)
 {
 	struct i915_device *i915 = e->i915;
 	uint64_t fl;
@@ -203,7 +208,7 @@ void i915_execlists_process_csb(struct i915_engine *e)
 			break;
 		}
 		e->hwsp[I915_HWS_CSB_BUF0_INDEX + head * 2] = 0xffffffffu;
-		/* Every entry is read as the reference driver reads it: the
+		/* Every entry is read as the documentation reads it: the
 		 * context in the port is starting, or it has left.  Nothing
 		 * else about the entry decides -- not which other status
 		 * bits are set, not the context id it names.  The port is
@@ -226,14 +231,35 @@ void i915_execlists_process_csb(struct i915_engine *e)
 		i915_execlists_submit(e);
 	}
 	spin_unlock_irqrestore(&e->lock, fl);
+	return left;
+}
+
+void i915_execlists_process_csb(struct i915_engine *e)
+{
+	if (i915_is_legacy(e->i915))
+		return;
+	int left = csb_process(e);
 	i915_engine_drop_stale(e);
 	if (left)
 		i915_engine_retire(e);
 }
 
+void i915_execlists_process_csb_irq(struct i915_engine *e)
+{
+	if (i915_is_legacy(e->i915))
+		return;
+	(void)csb_process(e);
+}
+
 /* ---- the GT worker: hang detection and a safety net for lost interrupts -- */
 
 #define HANGCHECK_NS 1500000000ULL
+/* The longest the worker sleeps whatever it was told: a wake from
+ * another processor that lands between its last look at the work flag
+ * and its sleep is lost, and nothing else would wake it. */
+#define GT_WORKER_NAP_MS 100
+/* How soon the worker looks again while the engines have work. */
+#define GT_WORKER_POLL_NS 4000000ULL
 
 static void hangcheck_fire(hrtimer_t *t)
 {
@@ -245,7 +271,17 @@ static void hangcheck_fire(hrtimer_t *t)
 
 static void gt_worker_pass(struct i915_device *i915)
 {
-	i915_gt_check_faults(i915);
+	/* The engines are judged for progress once per period, however
+	 * often the worker runs: it also runs for every completion and
+	 * every message of the GuCs, and three passes in a row that come
+	 * in a burst say nothing about whether an engine is stuck. */
+	uint64_t now = hrtimer_now_ns();
+	int judge = now - i915->hangcheck_last_ns >= HANGCHECK_NS - HANGCHECK_NS / 8;
+
+	if (judge) {
+		i915->hangcheck_last_ns = now;
+		i915_gt_check_faults(i915);
+	}
 	i915_guc_ct_process(i915);
 	for (int i = 0; i < I915_NUM_ENGINES; i++) {
 		struct i915_engine *e = &i915->engines[i];
@@ -257,17 +293,38 @@ static void gt_worker_pass(struct i915_device *i915)
 			spin_lock_irqsave(&e->lock, &fl);
 			i915_guc_submit(e);
 			spin_unlock_irqrestore(&e->lock, fl);
+		} else if (i915_is_legacy(i915)) {
+			i915_legacy_engine_retire(e);
 		} else {
 			i915_execlists_process_csb(e);
 		}
+		i915_engine_drop_stale(e);
 		i915_engine_retire(e);
+		if (judge) {
+			/* Requests completed since the last look and not one
+			 * user interrupt: completion is being found by polling
+			 * alone (every waiter and this worker poll, so nothing
+			 * hangs, but every wait is late).  Said a few times. */
+			if (e->last_retired != e->watch_retired && e->user_irqs == e->watch_irqs &&
+			    e->noirq_said < 3) {
+				e->noirq_said++;
+				kprintf("[drm] i915: %s: requests up to seqno %u completed without a user interrupt (found by polling); %llu interrupts taken in all, vector %d, last master %08x\n",
+					e->name, e->last_retired, (unsigned long long)i915->irq_count,
+					i915->irq_vector, i915->irq_last_master);
+			}
+			e->watch_retired = e->last_retired;
+			e->watch_irqs = e->user_irqs;
+		}
 		if (!e->inflight) {
 			e->hang_strikes = 0;
 			continue;
 		}
+		if (!judge)
+			continue;
 		/* Progress is the sequence number or the active head moving. */
 		uint32_t seqno = i915_hwsp_read(e, I915_HWS_SEQNO_INDEX);
-		uint32_t acthd = i915_read32(i915, RING_ACTHD(e->mmio_base));
+		uint32_t acthd = i915_is_legacy(i915) ? i915_legacy_engine_acthd(e) :
+							i915_read32(i915, RING_ACTHD(e->mmio_base));
 		if (seqno != e->hang_seqno || acthd != e->hang_acthd) {
 			e->hang_seqno = seqno;
 			e->hang_acthd = acthd;
@@ -276,12 +333,31 @@ static void gt_worker_pass(struct i915_device *i915)
 		}
 		if (++e->hang_strikes >= 3) {
 			e->hang_strikes = 0;
-			if (i915->guc.submission)
-				/* the GuC's own preemption timeout resets a
-				 * stuck context; the host only says so */
-				kprintf("[drm] i915: %s: no progress under the GuC (seqno %u/%u)\n",
-					e->name, seqno, e->next_seqno - 1);
-			else
+			if (i915->guc.submission) {
+				/* the GuC resets a context that does not
+				 * yield to a preemption: the host asks for one */
+				static int said;
+				if (said < 16) {
+					uint32_t want = 0, id = 0;
+					int more;
+					uint64_t fl2;
+					spin_lock_irqsave(&e->lock, &fl2);
+					if (e->inflight) {
+						want = e->inflight->seqno;
+						id = e->inflight->lrc ? e->inflight->lrc->guc_id : 0;
+					}
+					more = e->queue != NULL;
+					spin_unlock_irqrestore(&e->lock, fl2);
+					said++;
+					kprintf("[drm] i915: %s: no progress under the GuC (seqno %u/%u, waiting for %u, context id %u, %s queued)\n",
+						e->name, seqno, e->next_seqno - 1, want, id,
+						more ? "more" : "nothing");
+				}
+				int hrc = i915_guc_engine_hang(e);
+				if (hrc && said < 16)
+					kprintf("[drm] i915: %s: the GuC could not be asked to preempt (%d)\n",
+						e->name, hrc);
+			} else
 				i915_engine_reset(e, "no progress");
 		}
 	}
@@ -289,19 +365,41 @@ static void gt_worker_pass(struct i915_device *i915)
 
 static uint8_t g_gt_stack[16384] __attribute__((aligned(16)));
 
+/* Anything handed to an engine and not yet retired, or waiting to be
+ * handed to one? */
+static int gt_busy(struct i915_device *i915)
+{
+	for (int i = 0; i < I915_NUM_ENGINES; i++) {
+		struct i915_engine *e = &i915->engines[i];
+		if (e->present && (e->inflight || e->queue))
+			return 1;
+	}
+	return 0;
+}
+
 static void gt_worker(void *arg)
 {
 	struct i915_device *i915 = arg;
 	task_t *cur = sched_current();
 
-	i915->gt_worker_ready = 1;
+	i915->hangcheck_last_ns = hrtimer_now_ns();
 	hrtimer_init(&i915->hangcheck_timer, hangcheck_fire, i915);
+	hrtimer_init(&i915->gt_poll_timer, hangcheck_fire, i915);
 	hrtimer_start_rel(&i915->hangcheck_timer, HANGCHECK_NS);
+	i915->gt_worker_ready = 1;
 	for (;;) {
 		if (i915->hangcheck_pending) {
 			i915->hangcheck_pending = 0;
 			gt_worker_pass(i915);
 			hrtimer_start_rel(&i915->hangcheck_timer, HANGCHECK_NS);
+			/* While the engines have work, the worker looks again
+			 * within a few milliseconds whatever happens: a
+			 * completion whose interrupt is lost (or never
+			 * enabled) is retired -- and, under the GuC, the next
+			 * context submitted, which waits for that -- that
+			 * soon, not at the next nap's end. */
+			if (gt_busy(i915))
+				hrtimer_start_rel(&i915->gt_poll_timer, GT_WORKER_POLL_NS);
 		}
 		struct wait_queue_entry we;
 		uint64_t fl = local_irq_save();
@@ -313,11 +411,17 @@ static void gt_worker(void *arg)
 			continue;
 		}
 		cur->wait_channel = &i915->gt_wq;
+		cur->wakeup_tick = timer_ticks() + timer_ms_to_ticks(GT_WORKER_NAP_MS) + 1;
 		cur->state = TASK_BLOCKED;
 		local_irq_restore(fl);
 		sched_schedule();
+		cur->wakeup_tick = 0;
 		cur->wait_channel = NULL;
 		wq_remove(&i915->gt_wq, &we);
+		/* woken by the deadline: whatever a lost wake was for, and
+		 * the progress check if its period is up */
+		if (i915->gt_ready)
+			i915->hangcheck_pending = 1;
 	}
 }
 

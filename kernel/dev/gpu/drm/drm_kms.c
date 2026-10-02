@@ -462,28 +462,135 @@ static void vbl_deliver(struct drm_device *dev, int crtc);
  * runs at most one period past its last use. */
 static spinlock_t g_vbl_lock = SPINLOCK_INIT("drm_vbl");
 
+/* Pending vblank-event requests: kept on the device, delivered to the
+ * requesting file when the counter reaches the target. */
+struct vbl_waiter {
+	struct vbl_waiter *next;
+	struct drm_file *fp;
+	int crtc;
+	uint64_t target;
+	uint64_t user_data;
+	int is_seq; /* drm_event_crtc_sequence rather than vblank */
+	int is_flip; /* DRM_EVENT_FLIP_COMPLETE */
+	uint64_t queued_ns; /* when it was asked for */
+	uint64_t due_ns; /* when its vblank should have come */
+	int late_said; /* reported as overdue */
+};
+static struct vbl_waiter *g_vbl_waiters;
+
+/* Somebody waits for this crtc's counter (an event on the list).  Caller
+ * holds g_vbl_lock. */
+static int vbl_has_waiters_locked(struct drm_device *dev, int crtc)
+{
+	for (struct vbl_waiter *w = g_vbl_waiters; w; w = w->next)
+		if (w->fp->dev == dev && w->crtc == crtc)
+			return 1;
+	return 0;
+}
+
+/* Does the timer have to keep running for this crtc?  Where the core
+ * counts, while the crtc runs or a sync waiter needs it.  Where the
+ * backend counts (hw_vblank), only while somebody waits: then it is a
+ * watchdog that stands in for vblanks the hardware stopped reporting.
+ * Caller holds g_vbl_lock. */
+static int vbl_timer_needed_locked(struct drm_device *dev, int i)
+{
+	if (dev->drv->hw_vblank)
+		return dev->vbl[i].refs > 0 || vbl_has_waiters_locked(dev, i);
+	return dev->crtc[i].active || dev->vbl[i].refs > 0;
+}
+
+/* An event request that has been pending for a second or more is said
+ * (once per request, a few per boot): a client waiting for a flip or a
+ * vblank that never comes is frozen on screen. */
+static void vbl_report_late(struct drm_device *dev, int crtc, uint64_t now)
+{
+	static uint32_t said;
+	struct vbl_waiter *late = NULL;
+	struct vbl_waiter copy;
+	uint64_t fl;
+
+	if (said >= 8)
+		return;
+	spin_lock_irqsave(&g_vbl_lock, &fl);
+	for (struct vbl_waiter *w = g_vbl_waiters; w; w = w->next) {
+		if (w->fp->dev == dev && w->crtc == crtc && !w->late_said &&
+		    (int64_t)(now - w->due_ns) >= 1000000000LL) {
+			w->late_said = 1;
+			copy = *w;
+			late = &copy;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_vbl_lock, fl);
+	if (!late)
+		return;
+	said++;
+	kprintf("[drm] %s: crtc %d: a %s event asked for %u ms ago (for vblank %llu) is still not delivered a second after its vblank was due; the counter is at %llu, the crtc is %s, the last hardware vblank was %u ms ago\n",
+		dev->drv->name, crtc,
+		late->is_flip ? "flip-complete" : late->is_seq ? "crtc-sequence" : "vblank",
+		(unsigned)((now - late->queued_ns) / 1000000ULL),
+		(unsigned long long)late->target, (unsigned long long)dev->vbl[crtc].count,
+		dev->crtc[crtc].active ? "on" : "off",
+		dev->vbl[crtc].hw_last_ns ?
+			(unsigned)((now - dev->vbl[crtc].hw_last_ns) / 1000000ULL) : 0u);
+}
+
 static void vbl_timer_fire(hrtimer_t *t)
 {
 	struct drm_device *dev = t->arg;
-	int i = (int)(t - &dev->vbl[0].timer) / (int)((char *)&dev->vbl[1] - (char *)&dev->vbl[0]);
+	/* which crtc's timer: in bytes, since the timers are a whole
+	 * element apart (an hrtimer_t difference divided by the element
+	 * size named crtc 0 for every crtc) */
+	int i = (int)(((char *)t - (char *)&dev->vbl[0].timer) /
+		      ((char *)&dev->vbl[1] - (char *)&dev->vbl[0]));
 
 	if (i < 0 || (uint32_t)i >= dev->ncrtc)
 		return;
-	vbl_deliver(dev, i);
+	uint64_t now = hrtimer_now_ns();
+	uint64_t period = dev->vbl[i].period_ns ? dev->vbl[i].period_ns : 16666666ULL;
+	if (!dev->drv->hw_vblank) {
+		vbl_deliver(dev, i);
+	} else if (dev->crtc[i].active && now - dev->vbl[i].hw_last_ns >= 3 * period) {
+		/* The backend counts, and has not for three periods while
+		 * somebody waits: a vblank interrupt that does not arrive
+		 * (a masked pipe interrupt, a power well that came back
+		 * without its enables) must not freeze every client that
+		 * presents.  The timer counts until the hardware does again. */
+		if (!dev->vbl[i].soft) {
+			dev->vbl[i].soft = 1;
+			if (dev->drv->vblank_report)
+				dev->drv->vblank_report(dev, i);
+			if (dev->vbl[i].soft_said < 4) {
+				dev->vbl[i].soft_said++;
+				kprintf("[drm] %s: crtc %d is on but no vblank interrupt came for %u ms while a client waits; vblanks are counted from a timer until one arrives\n",
+					dev->drv->name, i,
+					dev->vbl[i].hw_last_ns ?
+						(unsigned)((now - dev->vbl[i].hw_last_ns) / 1000000ULL) :
+						0u);
+			}
+		}
+		vbl_deliver(dev, i);
+	}
+	if (dev->drv->hw_vblank)
+		vbl_report_late(dev, i, now);
 	{
 		uint64_t fl;
 		int keep;
 
 		spin_lock_irqsave(&g_vbl_lock, &fl);
-		keep = dev->crtc[i].active || dev->vbl[i].refs > 0;
+		keep = vbl_timer_needed_locked(dev, i);
 		if (!keep)
 			dev->vbl[i].running = 0;
 		spin_unlock_irqrestore(&g_vbl_lock, fl);
 		if (keep)
 			hrtimer_start(&dev->vbl[i].timer,
-				      dev->vbl[i].last_ns + dev->vbl[i].period_ns);
+				      dev->drv->hw_vblank ? now + period :
+							    dev->vbl[i].last_ns + period);
 	}
 }
+
+static void vbl_flush_inactive(struct drm_device *dev, int crtc);
 
 /* Make the counter run if anything needs it.  Idempotent, callable from any
  * process context; the timer itself was initialised once at drm_kms_init and
@@ -494,19 +601,26 @@ void drm_kms_vbl_sync(struct drm_device *dev, int i)
 	uint64_t fl;
 	int arm = 0;
 
-	if (dev->drv->hw_vblank)
-		return;
+	/* a crtc that goes off takes no more vblanks: what waits for one
+	 * is answered now, with the count as it stands */
+	if (!dev->crtc[i].active)
+		vbl_flush_inactive(dev, i);
 	spin_lock_irqsave(&g_vbl_lock, &fl);
-	if (!dev->vbl[i].running &&
-	    (dev->crtc[i].active || dev->vbl[i].refs > 0)) {
+	if (!dev->vbl[i].running && vbl_timer_needed_locked(dev, i)) {
 		dev->vbl[i].running = 1;
-		dev->vbl[i].last_ns = hrtimer_now_ns();
+		if (!dev->drv->hw_vblank)
+			dev->vbl[i].last_ns = hrtimer_now_ns();
+		else if (!dev->vbl[i].hw_last_ns)
+			dev->vbl[i].hw_last_ns = hrtimer_now_ns();
 		arm = 1;
 	}
 	spin_unlock_irqrestore(&g_vbl_lock, fl);
-	if (arm)
+	if (arm) {
+		uint64_t period = dev->vbl[i].period_ns ? dev->vbl[i].period_ns : 16666666ULL;
 		hrtimer_start(&dev->vbl[i].timer,
-			      dev->vbl[i].last_ns + dev->vbl[i].period_ns);
+			      dev->drv->hw_vblank ? hrtimer_now_ns() + period :
+						    dev->vbl[i].last_ns + period);
+	}
 }
 
 static void vbl_get(struct drm_device *dev, int i)
@@ -531,18 +645,35 @@ static void vbl_put(struct drm_device *dev, int i)
 	 * next fire and lets the timer die there. */
 }
 
-/* Pending vblank-event requests: kept on the device, delivered to the
- * requesting file when the counter reaches the target. */
-struct vbl_waiter {
-	struct vbl_waiter *next;
-	struct drm_file *fp;
-	int crtc;
-	uint64_t target;
-	uint64_t user_data;
-	int is_seq; /* drm_event_crtc_sequence rather than vblank */
-	int is_flip; /* DRM_EVENT_FLIP_COMPLETE */
-};
-static struct vbl_waiter *g_vbl_waiters;
+/* One event out to its file, with the count and time it is answered at;
+ * the request is freed. */
+static void vbl_send(struct drm_device *dev, struct vbl_waiter *w, uint64_t count,
+		     uint64_t now)
+{
+	if (w->is_seq) {
+		struct drm_event_crtc_sequence ev;
+		mm_memset(&ev, 0, sizeof(ev));
+		ev.base.type = DRM_EVENT_CRTC_SEQUENCE;
+		ev.base.length = sizeof(ev);
+		ev.user_data = w->user_data;
+		ev.time_ns = (int64_t)now;
+		ev.sequence = count;
+		drm_event_queue(w->fp, &ev, sizeof(ev));
+	} else {
+		struct drm_event_vblank ev;
+		mm_memset(&ev, 0, sizeof(ev));
+		ev.base.type = w->is_flip ? DRM_EVENT_FLIP_COMPLETE : DRM_EVENT_VBLANK;
+		ev.base.length = sizeof(ev);
+		ev.user_data = w->user_data;
+		ev.tv_sec = (uint32_t)(now / 1000000000ULL);
+		ev.tv_usec = (uint32_t)((now % 1000000000ULL) / 1000);
+		ev.sequence = (uint32_t)count;
+		ev.crtc_id = dev->crtc[w->crtc].id;
+		drm_event_queue(w->fp, &ev, sizeof(ev));
+	}
+	kfree(w);
+}
+
 static void vbl_deliver(struct drm_device *dev, int crtc)
 {
 	uint64_t fl;
@@ -569,37 +700,51 @@ static void vbl_deliver(struct drm_device *dev, int crtc)
 	while (due) {
 		struct vbl_waiter *w = due;
 		due = w->next;
-		if (w->is_seq) {
-			struct drm_event_crtc_sequence ev;
-			mm_memset(&ev, 0, sizeof(ev));
-			ev.base.type = DRM_EVENT_CRTC_SEQUENCE;
-			ev.base.length = sizeof(ev);
-			ev.user_data = w->user_data;
-			ev.time_ns = (int64_t)now;
-			ev.sequence = count;
-			drm_event_queue(w->fp, &ev, sizeof(ev));
-		} else {
-			struct drm_event_vblank ev;
-			mm_memset(&ev, 0, sizeof(ev));
-			ev.base.type = w->is_flip ? DRM_EVENT_FLIP_COMPLETE :
-						    DRM_EVENT_VBLANK;
-			ev.base.length = sizeof(ev);
-			ev.user_data = w->user_data;
-			ev.tv_sec = (uint32_t)(now / 1000000000ULL);
-			ev.tv_usec = (uint32_t)((now % 1000000000ULL) / 1000);
-			ev.sequence = (uint32_t)count;
-			ev.crtc_id = dev->crtc[crtc].id;
-			drm_event_queue(w->fp, &ev, sizeof(ev));
+		vbl_send(dev, w, count, now);
+	}
+	poll_notify_wq(&dev->vbl_wq);
+}
+
+/* Every request of a crtc that is off: answered now. */
+static void vbl_flush_inactive(struct drm_device *dev, int crtc)
+{
+	uint64_t fl;
+	struct vbl_waiter **pp, *due = NULL;
+
+	spin_lock_irqsave(&g_vbl_lock, &fl);
+	pp = &g_vbl_waiters;
+	while (*pp) {
+		struct vbl_waiter *w = *pp;
+		if (w->fp->dev == dev && w->crtc == crtc) {
+			*pp = w->next;
+			w->next = due;
+			due = w;
+			continue;
 		}
-		kfree(w);
+		pp = &w->next;
+	}
+	uint64_t count = dev->vbl[crtc].count;
+	spin_unlock_irqrestore(&g_vbl_lock, fl);
+	uint64_t now = hrtimer_now_ns();
+	while (due) {
+		struct vbl_waiter *w = due;
+		due = w->next;
+		vbl_send(dev, w, count, now);
 	}
 	poll_notify_wq(&dev->vbl_wq);
 }
 
 void drm_vblank_tick(struct drm_device *dev, int crtc)
 {
-	if (crtc >= 0 && (uint32_t)crtc < dev->ncrtc)
-		vbl_deliver(dev, crtc);
+	if (crtc < 0 || (uint32_t)crtc >= dev->ncrtc)
+		return;
+	dev->vbl[crtc].hw_last_ns = hrtimer_now_ns();
+	if (dev->vbl[crtc].soft) {
+		/* the hardware counts again; the timer stands down (said
+		 * from the next timer pass, not from this interrupt) */
+		dev->vbl[crtc].soft = 0;
+	}
+	vbl_deliver(dev, crtc);
 }
 
 static int vbl_queue_event(struct drm_device *dev, struct drm_file *fp, int crtc,
@@ -617,7 +762,27 @@ static int vbl_queue_event(struct drm_device *dev, struct drm_file *fp, int crtc
 	w->user_data = user_data;
 	w->is_seq = is_seq;
 	w->is_flip = is_flip;
+	w->queued_ns = hrtimer_now_ns();
+	w->late_said = 0;
 	spin_lock_irqsave(&g_vbl_lock, &fl);
+	uint64_t count = dev->vbl[crtc].count;
+	{
+		uint64_t period = dev->vbl[crtc].period_ns ? dev->vbl[crtc].period_ns : 16666666ULL;
+		uint64_t ahead = (int64_t)(target - count) > 0 ? target - count : 0;
+		if (ahead > 1000000)
+			ahead = 1000000;
+		w->due_ns = w->queued_ns + ahead * period;
+	}
+	/* A vblank already passed (an absolute target behind the counter),
+	 * or a crtc that is off and will count no more: answered at once,
+	 * as the interface promises -- queued, it would wait for a vblank
+	 * that is never going to match. */
+	if ((int64_t)(count - target) >= 0 || !dev->crtc[crtc].active) {
+		uint64_t at = dev->vbl[crtc].last_ns ? dev->vbl[crtc].last_ns : w->queued_ns;
+		spin_unlock_irqrestore(&g_vbl_lock, fl);
+		vbl_send(dev, w, count, at);
+		return 0;
+	}
 	w->next = g_vbl_waiters;
 	g_vbl_waiters = w;
 	spin_unlock_irqrestore(&g_vbl_lock, fl);
@@ -1110,6 +1275,16 @@ long drm_kms_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
 		c->gamma_size = dev->drv->gamma_size ? dev->drv->gamma_size : 256;
 		c->mode_valid = cr->active;
 		c->mode = cr->mode;
+		/* a client may have set the timing without its rate */
+		if (c->mode_valid && !c->mode.vrefresh && c->mode.htotal && c->mode.vtotal) {
+			uint64_t den = (uint64_t)c->mode.htotal * c->mode.vtotal;
+			uint64_t num = (uint64_t)c->mode.clock * 1000;
+			if (c->mode.flags & DRM_MODE_FLAG_INTERLACE)
+				num *= 2;
+			if (c->mode.flags & DRM_MODE_FLAG_DBLSCAN)
+				den *= 2;
+			c->mode.vrefresh = (uint32_t)((num + den / 2) / den);
+		}
 		c->count_connectors = 0;
 		return 0;
 	}

@@ -41,6 +41,7 @@ struct syncobj_point {
 
 struct drm_syncobj {
 	int refs;
+	struct drm_device *dev; /* the device it was made on */
 	spinlock_t lock;
 	struct drm_fence *fence; /* binary payload, point 0 */
 	struct syncobj_point pts[SYNCOBJ_MAX_POINTS]; /* ascending */
@@ -62,7 +63,7 @@ static void syncobj_notify(void)
 
 /* ---- objects ------------------------------------------------------------ */
 
-static struct drm_syncobj *syncobj_new(void)
+static struct drm_syncobj *syncobj_new(struct drm_device *dev)
 {
 	struct drm_syncobj *so = kalloc(sizeof(*so));
 
@@ -70,6 +71,7 @@ static struct drm_syncobj *syncobj_new(void)
 		return NULL;
 	mm_memset(so, 0, sizeof(*so));
 	so->refs = 1;
+	so->dev = dev;
 	spinlock_init(&so->lock, "syncobj");
 	if (!g_syncobj_wq_ready) {
 		wq_head_init(&g_syncobj_wq, "syncobj");
@@ -218,8 +220,13 @@ int drm_syncobj_find_fence(struct drm_syncobj *so, uint64_t point,
 	}
 	syncobj_gc_locked(so);
 	if (point <= so->signaled_point) {
+		/* a timeline has no binary fence to name the device by:
+		 * the object knows its own */
+		struct drm_device *dev = so->fence ? so->fence->dev : so->dev;
 		spin_unlock_irqrestore(&so->lock, fl);
-		*out = drm_fence_signalled(so->fence ? so->fence->dev : NULL);
+		if (!dev)
+			return -ENOENT;
+		*out = drm_fence_signalled(dev);
 		return *out ? 0 : -ENOMEM;
 	}
 	for (int i = 0; i < so->npts; i++) {
@@ -459,12 +466,30 @@ static int syncobj_wait_check(struct drm_syncobj **sos, const uint64_t *pts,
 	return 0;
 }
 
-static int syncobj_wait(struct drm_syncobj **sos, const uint64_t *pts,
+/* The first fence of the wait that has not signalled, referenced (for
+ * the report of a wait that does not end), or NULL. */
+static struct drm_fence *syncobj_first_pending(struct drm_syncobj **sos, const uint64_t *pts,
+					       uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		struct drm_fence *f = NULL;
+		if (drm_syncobj_find_fence(sos[i], pts ? pts[i] : 0, &f) == 0 && f) {
+			if (!f->signaled)
+				return f;
+			drm_fence_put(f);
+		}
+	}
+	return NULL;
+}
+
+static int syncobj_wait(struct drm_device *dev, struct drm_syncobj **sos, const uint64_t *pts,
 			uint32_t n, uint32_t flags, int64_t timeout_abs_ns,
 			uint32_t *first)
 {
 	task_t *cur = sched_current();
 	uint64_t poll_ns = SYNCOBJ_POLL_NS;
+	uint64_t start = hrtimer_now_ns();
+	int stuck_said = 0;
 
 	for (;;) {
 		int rc = syncobj_wait_check(sos, pts, n, flags, first);
@@ -475,6 +500,23 @@ static int syncobj_wait(struct drm_syncobj **sos, const uint64_t *pts,
 		uint64_t now = hrtimer_now_ns();
 		if (timeout_abs_ns <= 0 || (int64_t)now >= timeout_abs_ns)
 			return -ETIME;
+		/* Whatever noticed the device's progress has not told the
+		 * fences yet (an interrupt that did not come, a worker that
+		 * sleeps): ask the device, as a fence wait does. */
+		if (dev && dev->drv && dev->drv->fence_poll) {
+			dev->drv->fence_poll(dev);
+			rc = syncobj_wait_check(sos, pts, n, flags, first);
+			if (rc)
+				return rc < 0 ? rc : 0;
+		}
+		if (!stuck_said && now - start >= 5ULL * 1000000000ULL) {
+			struct drm_fence *f = syncobj_first_pending(sos, pts, n);
+			stuck_said = 1;
+			if (f) {
+				drm_fence_report_stuck(f, now - start, "a syncobj wait");
+				drm_fence_put(f);
+			}
+		}
 
 		struct wait_queue_entry we;
 		hrtimer_t poll_timer;
@@ -599,7 +641,7 @@ long drm_syncobj_ioctl(struct drm_device *dev, struct drm_file *fp,
 		struct drm_syncobj_create *a = kb;
 		if (a->flags & ~DRM_SYNCOBJ_CREATE_SIGNALED)
 			return -EINVAL;
-		struct drm_syncobj *so = syncobj_new();
+		struct drm_syncobj *so = syncobj_new(dev);
 		if (!so)
 			return -ENOMEM;
 		if (a->flags & DRM_SYNCOBJ_CREATE_SIGNALED) {
@@ -684,7 +726,7 @@ long drm_syncobj_ioctl(struct drm_device *dev, struct drm_file *fp,
 		if (rc)
 			return rc;
 		a->first_signaled = 0;
-		rc = syncobj_wait(sos, NULL, a->count_handles, a->flags,
+		rc = syncobj_wait(dev, sos, NULL, a->count_handles, a->flags,
 				  a->timeout_nsec, &a->first_signaled);
 		put_array(sos, a->count_handles);
 		return rc;
@@ -741,7 +783,7 @@ long drm_syncobj_ioctl(struct drm_device *dev, struct drm_file *fp,
 			return rc;
 		}
 		a->first_signaled = 0;
-		rc = syncobj_wait(sos, points, a->count_handles, a->flags,
+		rc = syncobj_wait(dev, sos, points, a->count_handles, a->flags,
 				  a->timeout_nsec, &a->first_signaled);
 		put_array(sos, a->count_handles);
 		kfree(points);

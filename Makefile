@@ -336,8 +336,13 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/intel_infoframe.o \
               $(BUILD_DIR)/intel_hdmi.o \
               $(BUILD_DIR)/intel_hotplug.o \
+              $(BUILD_DIR)/intel_pmdemand.o \
               $(BUILD_DIR)/intel_dmc_parse.o \
               $(BUILD_DIR)/intel_dmc.o \
+              $(BUILD_DIR)/intel_skl_wm.o \
+              $(BUILD_DIR)/intel_hsw_wm.o \
+              $(BUILD_DIR)/intel_cdclk_set.o \
+              $(BUILD_DIR)/intel_bw.o \
               $(BUILD_DIR)/i915_firmware.o \
               $(BUILD_DIR)/i915_workarounds.o \
               $(BUILD_DIR)/i915_mocs.o \
@@ -350,9 +355,42 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/intel_dpll_icl.o \
               $(BUILD_DIR)/intel_dpll_bxt.o \
               $(BUILD_DIR)/intel_dpll_hsw.o \
+              $(BUILD_DIR)/intel_snps_phy.o \
+              $(BUILD_DIR)/i915_lmem.o \
               $(BUILD_DIR)/intel_tc.o \
+              $(BUILD_DIR)/intel_cx0_phy.o \
+              $(BUILD_DIR)/intel_lt_phy.o \
+              $(BUILD_DIR)/intel_legacy_display.o \
+              $(BUILD_DIR)/intel_legacy_clock.o \
+              $(BUILD_DIR)/intel_legacy_dpll.o \
+              $(BUILD_DIR)/intel_legacy_plane.o \
+              $(BUILD_DIR)/intel_legacy_wm.o \
+              $(BUILD_DIR)/intel_legacy_fdi.o \
+              $(BUILD_DIR)/intel_legacy_vlv.o \
+              $(BUILD_DIR)/intel_legacy_gmbus.o \
+              $(BUILD_DIR)/intel_legacy_vbt.o \
+              $(BUILD_DIR)/intel_legacy_panel.o \
+              $(BUILD_DIR)/intel_legacy_lvds.o \
+              $(BUILD_DIR)/intel_legacy_crt.o \
+              $(BUILD_DIR)/intel_legacy_hdmi.o \
+              $(BUILD_DIR)/intel_legacy_dp.o \
+              $(BUILD_DIR)/intel_legacy_sdvo.o \
+              $(BUILD_DIR)/intel_legacy_dvo.o \
+              $(BUILD_DIR)/intel_legacy_tv.o \
+              $(BUILD_DIR)/intel_legacy_dsi.o \
               $(BUILD_DIR)/i915_ppgtt.o \
+              $(BUILD_DIR)/i915_legacy_uncore.o \
+              $(BUILD_DIR)/i915_legacy_gtt.o \
+              $(BUILD_DIR)/i915_legacy_fence.o \
+              $(BUILD_DIR)/i915_legacy_ring.o \
+              $(BUILD_DIR)/i915_legacy_renderstate.o \
+              $(BUILD_DIR)/i915_legacy_wa.o \
+              $(BUILD_DIR)/i915_legacy_irq.o \
+              $(BUILD_DIR)/i915_legacy_rps.o \
               $(BUILD_DIR)/i915_lrc.o \
+              $(BUILD_DIR)/i915_step.o \
+              $(BUILD_DIR)/i915_wa_lists.o \
+              $(BUILD_DIR)/i915_mcr.o \
               $(BUILD_DIR)/i915_renderstate_gen9.o \
               $(BUILD_DIR)/i915_engine.o \
               $(BUILD_DIR)/i915_execlists.o \
@@ -497,11 +535,11 @@ BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
 # The bootloader reads /boot/kernel.elf straight from the ext4 partition, so
 # the complete OS lives on one stick with no FAT data filesystem anywhere.
 EXT4_STAGING  = $(BUILD_DIR)/ext4_staging
-# Where the Intel graphics firmware blobs come from at image-build time: the
-# vendor firmware package as the build host has it installed (plain or
-# zstd-compressed files).  res/firmware/i915.list names what is wanted;
-# whatever is absent is skipped with a note, never an error.  Point this at
-# a directory of your own to build from an unpacked copy of the package.
+# The Intel graphics firmware ships in res/firmware (i915/ and xe/, with
+# LICENSE.i915 and LICENSE.xe) and all of it is staged.  FIRMWARE_SRC, the
+# vendor package as the build host has it (plain or zstd-compressed), only
+# fills in an i915/ blob res/firmware/i915.list names that the bundle
+# lacks; whatever is still absent is reported, never an error.
 FIRMWARE_SRC ?= /lib/firmware/i915
 # Where the host keeps the firmware licence texts (the package documents them
 # separately from the blobs).
@@ -564,6 +602,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
 	res/firmware/i915.list \
+	$(wildcard res/firmware/i915/*.bin res/firmware/xe/*.bin) \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
 	host/gen-cursors.c \
 	user/bin/tests/apnews-urls.txt
@@ -2298,29 +2337,31 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
 	cp res/man/*.1           $(EXT4_STAGING)/usr/share/man/man1/
-	# Intel graphics firmware (see FIRMWARE_SRC above): only the blobs
-	# the list names, decompressed where the host keeps them compressed.
-	mkdir -p $(EXT4_STAGING)/lib/firmware/i915
+	# Intel graphics firmware.  Every blob the driver can ask for ships in
+	# res/firmware (i915/ for the display microcode and the GuC/HuC/GSC of
+	# the parts up to Meteor Lake and the newer display microcode, xe/ for
+	# the GT firmware of Lunar Lake and later), with its licence; all of it
+	# goes onto the image so any supported machine finds what it needs.
+	# FIRMWARE_SRC (the host's package) only fills in a listed blob the
+	# bundle lacks, decompressed where the host keeps it compressed.
+	mkdir -p $(EXT4_STAGING)/lib/firmware/i915 $(EXT4_STAGING)/lib/firmware/xe
+	cp res/firmware/i915/*.bin $(EXT4_STAGING)/lib/firmware/i915/
+	cp res/firmware/xe/*.bin $(EXT4_STAGING)/lib/firmware/xe/
+	mkdir -p $(EXT4_STAGING)/usr/share/doc/firmware
+	cp res/firmware/LICENSE.i915 res/firmware/LICENSE.xe $(EXT4_STAGING)/usr/share/doc/firmware/
 	@n=0; missing=0; \
 	for f in $$(grep -v '^#' res/firmware/i915.list | grep -v '^$$'); do \
-		if [ -f "$(FIRMWARE_SRC)/$$f" ]; then \
-			cp "$(FIRMWARE_SRC)/$$f" $(EXT4_STAGING)/lib/firmware/i915/$$f; n=$$((n+1)); \
-		elif [ -f "$(FIRMWARE_SRC)/$$f.zst" ]; then \
-			zstd -q -d -f "$(FIRMWARE_SRC)/$$f.zst" -o $(EXT4_STAGING)/lib/firmware/i915/$$f; n=$$((n+1)); \
+		if [ -f "$(EXT4_STAGING)/lib/firmware/$$f" ]; then \
+			n=$$((n+1)); \
+		elif [ -f "$(FIRMWARE_SRC)/$${f#i915/}" ]; then \
+			cp "$(FIRMWARE_SRC)/$${f#i915/}" $(EXT4_STAGING)/lib/firmware/$$f; n=$$((n+1)); \
+		elif [ -f "$(FIRMWARE_SRC)/$${f#i915/}.zst" ]; then \
+			zstd -q -d -f "$(FIRMWARE_SRC)/$${f#i915/}.zst" -o $(EXT4_STAGING)/lib/firmware/$$f; n=$$((n+1)); \
 		else \
-			missing=$$((missing+1)); \
+			missing=$$((missing+1)); echo "firmware: $$f is neither bundled nor in $(FIRMWARE_SRC)"; \
 		fi; \
 	done; \
-	for l in $(FIRMWARE_SRC)/../LICENSE.i915 $(FIRMWARE_SRC)/../LICENSE.i915.zst \
-		 $(FIRMWARE_LICENSE_DIR)/LICENSE.i915 $(FIRMWARE_LICENSE_DIR)/LICENSE.i915.gz; do \
-		[ -f "$$l" ] || continue; \
-		mkdir -p $(EXT4_STAGING)/usr/share/doc/firmware; \
-		case $$l in *.zst) zstd -q -d -f "$$l" -o $(EXT4_STAGING)/usr/share/doc/firmware/LICENSE.i915;; \
-			*.gz) gzip -c -d "$$l" > $(EXT4_STAGING)/usr/share/doc/firmware/LICENSE.i915;; \
-			*) cp "$$l" $(EXT4_STAGING)/usr/share/doc/firmware/LICENSE.i915;; esac; \
-		break; \
-	done; \
-	echo "firmware: $$n Intel graphics blobs staged, $$missing not found in $(FIRMWARE_SRC)"
+	echo "firmware: $$(ls $(EXT4_STAGING)/lib/firmware/i915 $(EXT4_STAGING)/lib/firmware/xe | grep -c bin) Intel graphics blobs staged ($$n of the driver's list present, $$missing missing)"
 	# X cursor theme.
 	#
 	# Generated, not committed: the artwork is geometry, so it lives as the

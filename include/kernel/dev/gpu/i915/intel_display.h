@@ -45,6 +45,19 @@ struct intel_vbt_port {
 	uint8_t ddc_pin; /* GMBUS pin (VBT numbering), 0 none */
 	uint8_t hdmi_level_shift; /* 0xff = default */
 	uint8_t lane_reversal;
+	/* The hotplug pin's polarity is inverted on the board (BDB 196+). */
+	uint8_t hpd_invert;
+	/* A Type-C port: the connector carries USB-C DP-alt (BDB 195+) or
+	 * Thunderbolt (209+); neither on a port behind a Type-C PHY makes
+	 * it a legacy (fixed DP/HDMI) connector.  typec_valid says the
+	 * table is new enough to tell. */
+	uint8_t dp_usb_type_c;
+	uint8_t tbt;
+	uint8_t typec_valid;
+	/* BDB 264+: the port's PHY sits outside the Type-C subsystem (a
+	 * dedicated, external one), so it is no Type-C port whatever its
+	 * index; the Type-C bits are cleared for it. */
+	uint8_t dedicated_external;
 };
 
 struct intel_vbt_pps {
@@ -97,6 +110,9 @@ struct intel_opregion {
 	void *rvda_virt; /* the extended VBT mapping, if any */
 	uint32_t rvda_pages;
 	uint8_t asle_present;
+	/* A discrete part has no OpRegion: its VBT is copied out of the
+	 * option ROM in the card's SPI flash into this (vbt points here). */
+	uint8_t *rom_vbt;
 };
 
 int intel_opregion_init(struct i915_device *i915);
@@ -176,6 +192,9 @@ struct intel_dp_aux {
 	uint32_t ctl_reg, data_reg;
 	struct i2c_adapter i2c; /* I2C over AUX, for the EDID */
 	uint32_t errors;
+	/* The channel runs through the Thunderbolt controller (a Type-C
+	 * port in Thunderbolt mode): set by intel_tc_connect(). */
+	int tbt_io;
 };
 
 void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
@@ -237,6 +256,8 @@ enum intel_display_model {
 	INTEL_DISPLAY_BXT, /* Broxton, Gemini Lake */
 	INTEL_DISPLAY_ICL, /* Ice Lake, Elkhart/Jasper Lake */
 	INTEL_DISPLAY_TGL, /* Tiger/Rocket/Alder/Raptor Lake */
+	INTEL_DISPLAY_MTL, /* Meteor/Arrow Lake: C10 and C20 PHYs, PICA */
+	INTEL_DISPLAY_DG2, /* DG2 (Arc): Synopsys PHYs with their own PLLs */
 };
 
 int intel_power_init(struct i915_device *i915);
@@ -337,6 +358,34 @@ void intel_tc_program_dp_mode(struct i915_device *i915, struct intel_output *o, 
 void intel_tc_set_signal_level(struct i915_device *i915, struct intel_output *o, int level);
 void intel_tc_clock_gating(struct i915_device *i915, struct intel_output *o, int enable);
 
+/* Meteor Lake's port PHYs (intel_cx0_phy.c): a C10 PHY on DDI A and B, a
+ * C20 PHY on each Type-C port.  Every PHY has its own PLL, so a port's
+ * PLL id is the port itself; a Type-C port in Thunderbolt mode runs from
+ * the Thunderbolt clock instead (programmed through the same port clock
+ * control).  The sequences take the output because the lanes the port
+ * owns, its reversal and its Type-C mode all decide what is written. */
+int mtl_phy_rate_supported(struct i915_device *i915, int port, uint32_t link_rate_khz);
+int mtl_phy_pll_get_dp(struct i915_device *i915, struct intel_output *o,
+		       uint32_t link_rate_khz, int ssc);
+int mtl_phy_pll_get_hdmi(struct i915_device *i915, struct intel_output *o, uint32_t clock_khz);
+void mtl_phy_pll_put(struct i915_device *i915, int pll);
+/* Port clock muxes, PHY out of reset and to the ready state, PLL
+ * programmed and locked, the owned lanes' transmitters enabled; `lanes'
+ * is the link width (4 for HDMI). */
+int mtl_phy_pll_enable(struct i915_device *i915, struct intel_output *o, int lanes);
+void mtl_phy_pll_disable(struct i915_device *i915, struct intel_output *o);
+/* The port clock now running, in kHz (DP: the link rate), 0 when off. */
+uint32_t mtl_phy_port_link_rate(struct i915_device *i915, struct intel_output *o);
+/* Voltage swing and pre-emphasis: `level' is intel_ddi_dp_level_for()'s
+ * index for DP, the HDMI table's for TMDS (-1: the default). */
+void mtl_phy_set_signal_level(struct i915_device *i915, struct intel_output *o, int level);
+/* The port buffer: width, reversal, Thunderbolt I/O select, the
+ * die-to-die link, DDI_BUF_CTL; and back off. */
+void mtl_ddi_buf_enable(struct i915_device *i915, struct intel_output *o, int lanes);
+void mtl_ddi_buf_disable(struct i915_device *i915, struct intel_output *o);
+/* Once at display init: what the PHYs are left in. */
+int mtl_phy_init(struct i915_device *i915);
+
 /* ---- outputs (intel_ddi.c, intel_dp.c, intel_hdmi.c) ---------------------- */
 
 struct intel_output {
@@ -400,6 +449,12 @@ struct intel_output {
 	int tc_fia_idx; /* the port's index within it */
 	int tc_owned;
 	uint32_t tc_lanes; /* lanes the FIA grants */
+	/* Meteor Lake: a Type-C port wired to a fixed connector (from the
+	 * VBT, corrected by what the live state shows), and the DP-alt pin
+	 * assignment the PHY was found in (0 none, 1 = A .. 6 = F). */
+	int tc_legacy;
+	int tc_legacy_known;
+	int tc_pin_assignment;
 };
 
 int intel_ddi_init(struct i915_device *i915);
@@ -469,6 +524,7 @@ struct intel_pipe {
 	uint32_t format;   /* DRM_FORMAT_* of the plane as programmed */
 	uint64_t modifier; /* its layout (DRM_FORMAT_MOD_LINEAR, X or Y tiled) */
 	int vblank_enabled;
+	uint32_t vblank_irqs; /* vblank interrupts taken */
 	/* a pending flip: the plane was reprogrammed, the event goes out
 	 * at the next vblank */
 	int flip_pending;
@@ -526,6 +582,39 @@ struct intel_display {
 	int dmc_loaded;
 	uint32_t dmc_version;
 	int ready; /* display code initialised */
+	/* --- appended for display version 14 and the shared fixes --- */
+	/* The panel power sequencer instance the panel is on (the VBT's
+	 * backlight controller where the part has two). */
+	int pps_idx;
+	/* The DBUF slices powered (bit per slice). */
+	uint8_t dbuf_slices;
+	/* CDCLK as read out: the PLL's VCO and reference, and the voltage
+	 * level it needs. */
+	uint32_t cdclk_vco_khz, cdclk_ref_khz;
+	uint8_t cdclk_voltage_level;
+	/* The display IP stepping (GMD_ID on version 14), 0xff unknown. */
+	uint8_t display_step;
+	/* PM demand (intel_pmdemand.c): set up, and the clock each pipe's
+	 * port runs at as the last request accounted it. */
+	int pmdemand_ready;
+	uint32_t pmdemand_ddiclk_khz[INTEL_MAX_PIPES];
+	/* The display microcontrollers loaded: bit 0 the main one, bit
+	 * 1+pipe the pipe DMCs. */
+	uint32_t dmc_ids_loaded;
+	/* Tiger Lake: holders of the Type-C cold block (intel_tc.c). */
+	int tc_cold_refs;
+	/* PM demand: the peak bandwidth (100 MB/s units) of the memory
+	 * point to hold; 0 = none chosen, which asks for all ones ("do not
+	 * change the memory frequency"). */
+	uint16_t pmdemand_qgv_peakbw;
+	/* --- appended for display versions 20, 30, 35 and Battlemage --- */
+	/* The display IP as version * 100 + release (1401 Battlemage, 2000
+	 * Lunar Lake, 3002 Wildcat Lake), from GMD_ID where the part has it
+	 * (intel_power_init()); intel_display_verx100() reads it. */
+	uint16_t display_verx100;
+	/* Display version 30+: the embedded panel sits on a Type-C (C20)
+	 * PHY (the strap PICA reports), read at mtl_phy_init(). */
+	uint8_t edp_on_typec;
 };
 
 /* ---- the display microcontroller (intel_dmc.c) ----------------------------- */
@@ -588,14 +677,27 @@ uint32_t intel_fb_tile_width(uint64_t modifier);
 uint32_t intel_fb_tile_height(uint64_t modifier);
 extern const uint32_t intel_fb_formats[];
 extern const uint32_t intel_nfb_formats;
-extern const uint64_t intel_fb_modifiers[];
+/* linear, X, and the platform's third layout: Y up to Alder Lake, Tile4 on
+ * the parts that replaced Y with it (set at display init) */
+extern uint64_t intel_fb_modifiers[];
 extern const uint32_t intel_nfb_modifiers;
 int intel_detect(struct drm_device *dev, struct drm_connector *c);
 int intel_get_modes(struct drm_device *dev, struct drm_connector *c);
 int intel_display_verify(struct drm_device *dev);
 void intel_display_fallback(struct drm_device *dev);
+/* One thread at a time in the mode-setting and probing paths (the entry
+ * points above and the hotplug worker): they share the AUX channels, the
+ * panel power sequencer and the power-well counts.  Process context
+ * only; the holder may take it again (it nests). */
+void intel_display_lock(struct i915_device *i915);
+void intel_display_unlock(struct i915_device *i915);
 /* Called from the interrupt handler with the DE pipe IIR bits. */
 void intel_display_irq(struct i915_device *i915, int pipe, uint32_t iir);
+/* The core's vblank watchdog found a crtc that is on with no vblank
+ * interrupt for several periods: say what the pipe's interrupt
+ * registers hold, and put back an enable that was lost.  Interrupt
+ * context (the core's timer). */
+void intel_display_vblank_report(struct drm_device *dev, int crtc);
 void intel_display_hpd_irq(struct i915_device *i915, uint32_t de_port_iir,
 			   uint32_t pch_iir, uint32_t de_hpd_iir);
 /* Which of the three the port's DisplayPort transport control lives in. */
@@ -614,5 +716,85 @@ int i915_ggtt_bind_obj(struct i915_device *i915, struct drm_gem_object *o,
 		       int uncached, uint32_t *ggtt_offset);
 void i915_ggtt_unbind(struct i915_device *i915, uint32_t ggtt_offset,
 		      uint32_t size);
+
+/* ---- display version 14 (Meteor/Arrow Lake) and shared additions ---------- */
+
+/* The VBT parsed for a platform: the port, AUX channel and DDC mapping
+ * of the child devices depends on the display version and, on a few
+ * Gen12 parts, the platform (enum i915_platform).  intel_vbt_parse() is
+ * this with the direct (pre-Alder Lake) mapping. */
+int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
+			     int platform, struct intel_vbt *out);
+
+/* Hotplug interrupt bank of the north display, for the interrupt handler
+ * (i915_irq.c).  Before display version 14 that is GEN11_DE_HPD_IIR; on
+ * 14 it is PICA's, whose summary arrives as SDEIIR bit 31: the ack does
+ * the PICA IER/IIR/SDEIIR handshake itself.  Returns the IIR bits for
+ * intel_display_hpd_irq()'s de_hpd_iir. */
+uint32_t intel_hpd_de_hpd_ack(struct i915_device *i915);
+/* Masked, disabled and cleared, at interrupt reset. */
+void intel_hpd_de_hpd_reset(struct i915_device *i915);
+
+/* PM demand (display version 14): the display's requirements as told to
+ * the Punit.  intel_pmdemand_init() reads what the firmware asked for
+ * (intel_power_init() calls it).  Before a port's PLL/PHY is enabled,
+ * intel_pmdemand_pre_enable() raises the request to cover the output on
+ * `pipe' at `port_clock_khz' (the DP link rate, or the TMDS clock) on top
+ * of everything already running; after an output has been enabled or
+ * disabled (o->active and the pipe's state updated),
+ * intel_pmdemand_update() sets the request to what is running.  All are
+ * no-ops on other platforms. */
+int intel_pmdemand_init(struct i915_device *i915);
+void intel_pmdemand_pre_enable(struct i915_device *i915, const struct intel_output *o,
+			       int pipe, uint32_t port_clock_khz);
+void intel_pmdemand_update(struct i915_device *i915);
+/* The DBUF slice count in the request (display init sequence). */
+void intel_pmdemand_program_dbuf(struct i915_device *i915, uint8_t slices);
+/* The memory point's peak bandwidth the next request carries (from the
+ * bandwidth code, intel_bw_qgv_peakbw()); 0 or 0xffff: keep the memory
+ * frequency where it is. */
+void intel_pmdemand_set_qgv_peakbw(struct i915_device *i915, uint16_t peakbw);
+
+/* The pipe DMC of a pipe (Gen12+), after the pipe is enabled / before it
+ * is disabled. */
+void intel_dmc_enable_pipe(struct i915_device *i915, int pipe);
+void intel_dmc_disable_pipe(struct i915_device *i915, int pipe);
+
+/* The DP-alt pin assignment of a connected Type-C port (0 none, 1 = A ..
+ * 6 = F), for the PHY code's lane setup.  On Meteor Lake the PHY's mode,
+ * lanes and ownership are intel_tc.c's, the PLL, clock and levels
+ * intel_cx0_phy.c's. */
+int intel_tc_pin_assignment(struct i915_device *i915, struct intel_output *o);
+/* Is a sink on a Type-C port now, in any of its modes (DP-alt,
+ * Thunderbolt, legacy)?  intel_hpd_live() asks this for Type-C ports. */
+int intel_tc_hpd_live(struct i915_device *i915, struct intel_output *o);
+
+/* ---- display versions 20, 30 and 35 (Lunar/Panther/Wildcat/Nova Lake) and
+ * Battlemage ------------------------------------------------------------------ */
+
+/* Nova Lake's port PHYs (intel_lt_phy.c): every DDI has an "LT" PHY, its
+ * PLL programmed through the PHY's vendor registers over the same PICA
+ * message bus as the C10/C20 PHYs.  intel_cx0_phy.c's mtl_phy_* entry
+ * points hand over to these when intel_has_lt_phy() says so, so the
+ * callers stay the same.  The arguments and returns are those of the
+ * mtl_phy_* functions of the same name. */
+int intel_has_lt_phy(struct i915_device *i915);
+int lt_phy_rate_supported(struct i915_device *i915, int port, uint32_t link_rate_khz);
+int lt_phy_pll_get_dp(struct i915_device *i915, struct intel_output *o,
+		      uint32_t link_rate_khz, int ssc);
+int lt_phy_pll_get_hdmi(struct i915_device *i915, struct intel_output *o, uint32_t clock_khz);
+void lt_phy_pll_put(struct i915_device *i915, int pll);
+int lt_phy_pll_enable(struct i915_device *i915, struct intel_output *o, int lanes);
+void lt_phy_pll_disable(struct i915_device *i915, struct intel_output *o);
+uint32_t lt_phy_port_link_rate(struct i915_device *i915, struct intel_output *o);
+void lt_phy_set_signal_level(struct i915_device *i915, struct intel_output *o, int level);
+int lt_phy_init(struct i915_device *i915);
+
+/* The display IP version * 100 + release (intel_power.c): 1400 Meteor
+ * Lake, 1401 Battlemage, 2000 Lunar Lake, 3000 Panther Lake, 3002
+ * Wildcat Lake, 3500 Nova Lake; version * 100 before version 14. */
+int intel_display_verx100(struct i915_device *i915);
+
+#include <kernel/dev/gpu/i915/intel_snps_phy.h>
 
 #endif

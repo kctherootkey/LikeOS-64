@@ -123,6 +123,9 @@ static inline uint64_t vmware_get_tsc_freq_hz(void)
 // Delay Functions (for IPI timing)
 // ============================================================================
 
+// Set once PIT channel 2 has been seen not to count (see below).
+static bool pit_stuck = false;
+
 // Microsecond delay using PIT channel 2
 static void pit_delay_us(uint32_t us)
 {
@@ -133,6 +136,20 @@ static void pit_delay_us(uint32_t us)
 		ticks = 1;
 	if (ticks > 65535)
 		ticks = 65535;
+
+	// Recent Intel platforms (Meteor/Arrow Lake laptops among them)
+	// clock-gate the 8254 by default: the counter never reaches terminal
+	// count and OUT2 never rises.  Bound the wait by TSC cycles instead:
+	// 8400 cycles per tick is at least one tick's 838 ns for any TSC up to
+	// 10 GHz, so giving up never makes the delay shorter than asked.
+	uint64_t tsc_limit = (uint64_t)ticks * 8400ULL;
+	uint64_t tsc_start = rdtsc();
+
+	if (pit_stuck) {
+		while ((rdtsc() - tsc_start) < tsc_limit)
+			__asm__ volatile("pause");
+		return;
+	}
 
 	// Reset PIT channel 2 output latch:
 	// 1. Disable gate (bit 0 = 0) to stop the counter and reset OUT2 low
@@ -148,6 +165,11 @@ static void pit_delay_us(uint32_t us)
 
 	// Wait for OUT2 to go high (bit 5 of port 0x61)
 	while ((inb(0x61) & 0x20) == 0) {
+		if ((rdtsc() - tsc_start) >= tsc_limit) {
+			pit_stuck = true;
+			kprintf("LAPIC: PIT channel 2 does not count; delays fall back to TSC cycles\n");
+			return;
+		}
 		__asm__ volatile("pause" ::: "memory");
 	}
 }
@@ -160,12 +182,61 @@ static void pit_delay_ms(uint32_t ms)
 	}
 }
 
+// TSC frequency from CPUID leaf 0x15 (crystal * numerator / denominator),
+// or leaf 0x16's base frequency when the crystal is not enumerated; 0 when
+// neither is there.
+static uint64_t tsc_freq_from_cpuid(void)
+{
+	uint32_t eax, ebx, ecx, edx;
+	uint32_t denom, numer, crystal;
+
+	cpuid(0, &eax, &ebx, &ecx, &edx);
+	if (eax < 0x15)
+		return 0;
+	cpuid(0x15, &denom, &numer, &crystal, &edx);
+	if (denom == 0 || numer == 0)
+		return 0;
+	if (crystal != 0)
+		return ((uint64_t)crystal * numer) / denom;
+	if (eax >= 0x16) {
+		uint32_t base_mhz;
+		cpuid(0x16, &base_mhz, &ebx, &ecx, &edx);
+		return (uint64_t)base_mhz * 1000000ULL;
+	}
+	return 0;
+}
+
+// The TSC frequency for delays.  Drivers probed before smp_init() (the
+// Intel graphics driver, xHCI) delay before lapic_timer_calibrate() has
+// set tsc_freq_hz; on bare metal, CPUID gives the frequency without
+// touching the PIT.  Under a hypervisor the PIT works and CPUID 0x15 is
+// not always trustworthy, so the PIT stays the fallback there.  Kept out
+// of tsc_freq_hz so the timekeeping code's view does not change.
+static uint64_t delay_tsc_freq(void)
+{
+	static bool probed = false;
+	static uint64_t early_hz = 0;
+	uint32_t eax, ebx, ecx, edx;
+
+	if (tsc_freq_hz > 0)
+		return tsc_freq_hz;
+	if (!probed) {
+		probed = true;
+		cpuid(1, &eax, &ebx, &ecx, &edx);
+		if (!(ecx & (1U << 31)))
+			early_hz = tsc_freq_from_cpuid();
+	}
+	return early_hz;
+}
+
 // TSC-based microsecond delay (exported for use by smp.c etc.)
 // Falls back to PIT if TSC frequency is not known.
 void lapic_delay_us(uint32_t us)
 {
-	if (tsc_freq_hz > 0) {
-		uint64_t tsc_target = ((uint64_t)us * tsc_freq_hz) / 1000000ULL;
+	uint64_t hz = delay_tsc_freq();
+
+	if (hz > 0) {
+		uint64_t tsc_target = ((uint64_t)us * hz) / 1000000ULL;
 		uint64_t tsc_start = rdtsc();
 		while ((rdtsc() - tsc_start) < tsc_target)
 			__asm__ volatile("pause");
@@ -176,8 +247,10 @@ void lapic_delay_us(uint32_t us)
 
 void lapic_delay_ms(uint32_t ms)
 {
-	if (tsc_freq_hz > 0) {
-		uint64_t tsc_target = ((uint64_t)ms * tsc_freq_hz) / 1000ULL;
+	uint64_t hz = delay_tsc_freq();
+
+	if (hz > 0) {
+		uint64_t tsc_target = ((uint64_t)ms * hz) / 1000ULL;
 		uint64_t tsc_start = rdtsc();
 		while ((rdtsc() - tsc_start) < tsc_target)
 			__asm__ volatile("pause");

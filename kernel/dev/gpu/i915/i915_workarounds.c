@@ -18,7 +18,16 @@
 // only changed where the matching mask bit is set, so two drivers can
 // own different bits of one register.
 //
+// From Gen12 on the settings are kept as lists (i915_wa_lists.c builds
+// them): one for the GT, written once after the GT is reset; one per
+// engine, written at engine init and after every engine reset; one per
+// context, loaded from the ring ahead of a context's first batch; and the
+// whitelist of registers a client batch may write.  This file applies
+// them.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2014-2024 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>
@@ -102,9 +111,125 @@ static void whitelist_build(struct i915_device *i915, struct i915_engine *e)
 	}
 }
 
+/* ---- Gen12 and later: the lists ---------------------------------------------- */
+
+#define WA_LIST_CAP 96
+
+static uint32_t wa_read(struct i915_device *i915, const struct i915_wa *wa, uint32_t reg)
+{
+	return (wa->flags & I915_WA_MCR) ? i915_mcr_read(i915, reg) : i915_read32(i915, reg);
+}
+
+/* Write a list into the registers of the GT at `gsi': read, clear, set,
+ * write -- a masked register without the read, and a register whose
+ * value would not change is left alone. */
+static void wa_list_apply(struct i915_device *i915, const struct i915_wa_list *wal, uint32_t gsi)
+{
+	for (unsigned i = 0; i < wal->count; i++) {
+		const struct i915_wa *wa = &wal->list[i];
+		uint32_t reg = i915_gt_reg(gsi, wa->reg);
+		uint32_t old = 0, val;
+
+		if (wa->clr)
+			old = wa_read(i915, wa, reg);
+		val = (old & ~wa->clr) | wa->set;
+		if (val == old && wa->clr)
+			continue;
+		if (wa->flags & I915_WA_MCR)
+			i915_mcr_write(i915, reg, val);
+		else
+			i915_write32(i915, reg, val);
+	}
+	if (wal->dropped)
+		kprintf("[drm] i915: %u %s settings did not fit the list\n", wal->dropped,
+			wal->name);
+}
+
+/* Read the list back; a setting that did not take is said, once a list. */
+static void wa_list_verify(struct i915_device *i915, const struct i915_wa_list *wal, uint32_t gsi)
+{
+	for (unsigned i = 0; i < wal->count; i++) {
+		const struct i915_wa *wa = &wal->list[i];
+		uint32_t reg = i915_gt_reg(gsi, wa->reg);
+
+		if (!wa->read)
+			continue;
+		uint32_t cur = wa_read(i915, wa, reg);
+		if ((cur ^ wa->set) & wa->read) {
+			i915_dbg("[drm] i915: %s setting lost at %05x: %08x, wanted %08x in %08x\n",
+				 wal->name, reg, cur, wa->set & wa->read, wa->read);
+			return;
+		}
+	}
+}
+
+/* The GT-wide settings: the primary GT's, and the media GT's where the
+ * part has one.  Once after every GT reset. */
+void i915_gt_apply_gt_workarounds(struct i915_device *i915)
+{
+	struct i915_wa *storage;
+	struct i915_wa_list wal;
+
+	if (i915->info->gen_x10 < 120)
+		return;
+	storage = kalloc(WA_LIST_CAP * sizeof(*storage));
+	if (!storage)
+		return;
+	i915_wa_list_init(&wal, "GT", storage, WA_LIST_CAP);
+	i915_wa_gt_list(i915, 0, &wal);
+	wa_list_apply(i915, &wal, 0);
+	wa_list_verify(i915, &wal, 0);
+	unsigned n = wal.count;
+	if (i915->has_media_gt) {
+		i915_wa_list_init(&wal, "media GT", storage, WA_LIST_CAP);
+		i915_wa_gt_list(i915, 1, &wal);
+		wa_list_apply(i915, &wal, I915_MEDIA_GT_BASE);
+		wa_list_verify(i915, &wal, I915_MEDIA_GT_BASE);
+	}
+	i915_dbg("[drm] i915: %u GT settings, %u media GT settings\n", n,
+		 i915->has_media_gt ? wal.count : 0);
+	kfree(storage);
+}
+
+/* The registers a client's batch may reach on this engine, the rest of
+ * the slots pointed at the engine's no-op id register. */
+static void gen12_whitelist_apply(struct i915_device *i915, struct i915_engine *e,
+				  struct i915_wa *storage)
+{
+	struct i915_wa_list wal;
+	unsigned n = 0;
+
+	i915_wa_list_init(&wal, "whitelist", storage, RING_FORCE_TO_NONPRIV_COUNT);
+	i915_wa_whitelist(i915, e, &wal);
+	for (; n < wal.count; n++)
+		i915_write32(i915, RING_FORCE_TO_NONPRIV(e->mmio_base, (int)n), wal.list[n].reg);
+	for (; n < RING_FORCE_TO_NONPRIV_COUNT; n++)
+		i915_write32(i915, RING_FORCE_TO_NONPRIV(e->mmio_base, (int)n),
+			     RING_NOPID(e->mmio_base));
+}
+
+static void gen12_engine_workarounds(struct i915_device *i915, struct i915_engine *e)
+{
+	struct i915_wa *storage = kalloc(WA_LIST_CAP * sizeof(*storage));
+	struct i915_wa_list wal;
+
+	if (!storage)
+		return;
+	i915_wa_list_init(&wal, e->name, storage, WA_LIST_CAP);
+	i915_wa_engine_list(i915, e, &wal);
+	wa_list_apply(i915, &wal, e->gsi_offset);
+	wa_list_verify(i915, &wal, e->gsi_offset);
+	gen12_whitelist_apply(i915, e, storage);
+	kfree(storage);
+}
+
 /* Settings that belong to the engine, not to a context. */
 void i915_gt_apply_workarounds(struct i915_device *i915, struct i915_engine *e)
 {
+	if (i915->info->gen_x10 >= 120) {
+		gen12_engine_workarounds(i915, e);
+		return;
+	}
 	if (i915->info->gen != 9)
 		return;
 
@@ -213,6 +338,49 @@ static unsigned gen9_ctx_workarounds(struct i915_device *i915, struct wa_ctx_ent
 
 /* Write the context settings into `ring' as register loads.  Returns the
  * number of dwords emitted. */
+/* Gen12 on: the context list as one register load.  A register that is
+ * neither masked nor written whole is read now, and its bits merged, as
+ * the value the context will carry. */
+static uint32_t gen12_ctx_workarounds_emit(struct i915_device *i915, struct i915_engine *e,
+					   uint32_t *ring, uint32_t max_dwords)
+{
+	struct i915_wa *storage = kalloc(WA_LIST_CAP * sizeof(*storage));
+	struct i915_wa_list wal;
+	uint32_t n = 0;
+	unsigned ip = i915->gt_ip;
+
+	if (!storage)
+		return 0;
+	i915_wa_list_init(&wal, "context", storage, WA_LIST_CAP);
+	i915_wa_ctx_list(i915, e, &wal);
+	if (wal.count && max_dwords >= 2 + wal.count * 2 + 4) {
+		ring[n++] = MI_LOAD_REGISTER_IMM(wal.count);
+		for (unsigned i = 0; i < wal.count; i++) {
+			const struct i915_wa *wa = &wal.list[i];
+			uint32_t val = wa->set;
+			if (!(wa->flags & I915_WA_MASKED) && (wa->clr | wa->set) != ~0u)
+				val = (wa_read(i915, wa, i915_gt_reg(e->gsi_offset, wa->reg)) &
+				       ~wa->clr) |
+				      wa->set;
+			ring[n++] = wa->reg;
+			ring[n++] = val;
+		}
+		ring[n++] = MI_NOOP;
+		/* Wa_14019789679 */
+		if (e->class == 0 && ((ip >= I915_IP(12, 70) && ip <= I915_IP(12, 74)) ||
+				      i915->info->platform == I915_PLATFORM_DG2)) {
+			ring[n++] = CMD_3DSTATE_MESH_CONTROL;
+			ring[n++] = 0;
+			ring[n++] = 0;
+			ring[n++] = MI_NOOP;
+		}
+		if (n & 1)
+			ring[n++] = MI_NOOP;
+	}
+	kfree(storage);
+	return n;
+}
+
 uint32_t i915_ctx_workarounds_emit(struct i915_device *i915, int engine_class,
 				   uint32_t *ring, uint32_t max_dwords)
 {
@@ -256,6 +424,8 @@ uint32_t i915_ctx_settings_emit(struct i915_device *i915, struct i915_engine *e,
 {
 	uint32_t n;
 
+	if (i915->info->gen_x10 >= 120)
+		return gen12_ctx_workarounds_emit(i915, e, ring, max_dwords);
 	if (i915->info->gen != 9 || e->class != 0)
 		return 0;
 	n = i915_ctx_workarounds_emit(i915, e->class, ring, max_dwords);
@@ -278,22 +448,38 @@ uint32_t i915_ctx_settings_emit(struct i915_device *i915, struct i915_engine *e,
  * once per fault; the register keeps the first until it is cleared. */
 void i915_gt_check_faults(struct i915_device *i915)
 {
-	uint32_t fault;
+	uint32_t fault, fault_reg = GEN8_RING_FAULT_REG;
+	uint32_t data0 = GEN8_FAULT_TLB_DATA0, data1 = GEN8_FAULT_TLB_DATA1;
 
-	if (i915->info->gen < 8 || i915->info->gen >= 11)
+	if (i915->info->gen < 8)
 		return;
-	fault = i915_read32(i915, GEN8_RING_FAULT_REG);
+	/* Gen12 moved the one register all engines report through; from
+	 * Xe_HP on it has a copy per unit and is read through steering */
+	if (i915->info->gen >= 12) {
+		fault_reg = GEN12_RING_FAULT_REG;
+		data0 = GEN12_FAULT_TLB_DATA0;
+		data1 = GEN12_FAULT_TLB_DATA1;
+	}
+	fault = i915->gt_ip >= I915_IP(12, 55) ? i915_mcr_read(i915, fault_reg) :
+						 i915_read32(i915, fault_reg);
 	if (!(fault & RING_FAULT_VALID))
 		return;
-	uint32_t d0 = i915_read32(i915, GEN8_FAULT_TLB_DATA0);
-	uint32_t d1 = i915_read32(i915, GEN8_FAULT_TLB_DATA1);
+	uint32_t d0 = i915_read32(i915, data0);
+	uint32_t d1 = i915_read32(i915, data1);
 	uint64_t addr = ((uint64_t)(d1 & FAULT_VA_HIGH_BITS) << 44) | ((uint64_t)d0 << 12);
 	i915->gt_faults++;
-	kprintf("[drm] i915: the engine could not reach %llx in the %s (type %u, source %u, engine %u); fault %u\n",
-		(unsigned long long)addr, (d1 & FAULT_GTT_SEL) ? "global address space" : "a client's address space",
-		RING_FAULT_TYPE(fault), RING_FAULT_SRCID(fault),
-		GEN8_RING_FAULT_ENGINE_ID(fault), (unsigned)i915->gt_faults);
-	i915_write32(i915, GEN8_RING_FAULT_REG, fault & ~RING_FAULT_VALID);
+	/* the first few, then one in 256: a client that faults on every
+	 * batch must not turn the console into the bottleneck */
+	if (i915->gt_faults <= 16 || !(i915->gt_faults & 255))
+		kprintf("[drm] i915: the engine could not reach %llx in the %s (type %u, source %u, engine %u); fault %u\n",
+			(unsigned long long)addr,
+			(d1 & FAULT_GTT_SEL) ? "global address space" : "a client's address space",
+			RING_FAULT_TYPE(fault), RING_FAULT_SRCID(fault),
+			GEN8_RING_FAULT_ENGINE_ID(fault), (unsigned)i915->gt_faults);
+	if (i915->gt_ip >= I915_IP(12, 55))
+		i915_mcr_write(i915, fault_reg, fault & ~RING_FAULT_VALID);
+	else
+		i915_write32(i915, fault_reg, fault & ~RING_FAULT_VALID);
 }
 
 /* ---- the batch every context restore runs ---------------------------------- */
@@ -335,4 +521,53 @@ void i915_wa_bb_fini(struct i915_engine *e)
 		e->wa_bb_obj = NULL;
 	}
 	e->wa_bb_ggtt = e->wa_bb_bytes = 0;
+}
+
+/* ---- workaround lists ---------------------------------------------------------- */
+
+void i915_wa_list_init(struct i915_wa_list *wal, const char *name,
+		       struct i915_wa *storage, unsigned cap)
+{
+	wal->name = name;
+	wal->list = storage;
+	wal->count = 0;
+	wal->cap = cap;
+	wal->dropped = 0;
+}
+
+/* Kept sorted by register so that two entries for one register become
+ * one: the register is written once, with every bit both asked for.  A
+ * later entry that clears bits an earlier one set wins over it. */
+void i915_wa_add(struct i915_wa_list *wal, uint32_t reg, uint32_t clr, uint32_t set,
+		 uint32_t read, uint32_t flags)
+{
+	unsigned i;
+
+	for (i = 0; i < wal->count; i++) {
+		struct i915_wa *w = &wal->list[i];
+		if (w->reg < reg)
+			continue;
+		if (w->reg == reg) {
+			if ((clr | w->clr) && !(clr & ~w->clr))
+				w->set &= ~clr;
+			w->set |= set;
+			w->clr |= clr;
+			w->read |= read;
+			w->flags |= flags;
+			return;
+		}
+		break;
+	}
+	if (wal->count >= wal->cap) {
+		wal->dropped++;
+		return;
+	}
+	for (unsigned k = wal->count; k > i; k--)
+		wal->list[k] = wal->list[k - 1];
+	wal->list[i].reg = reg;
+	wal->list[i].clr = clr;
+	wal->list[i].set = set;
+	wal->list[i].read = read;
+	wal->list[i].flags = flags;
+	wal->count++;
 }

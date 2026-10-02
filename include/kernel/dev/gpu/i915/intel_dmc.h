@@ -3,11 +3,15 @@
 // The DMC firmware package: a CSS header (the signed-module wrapper),
 // a package header listing one image per silicon stepping, and per
 // image a DMC header (program size, a few register writes to make after
-// loading) followed by the program.  intel_dmc_parse() picks the image
-// for a stepping and checks it; intel_dmc.c writes it into the
-// controller's memory.
+// loading) followed by the program.  From Tiger Lake a package carries
+// one image per controller -- the main DMC and one per pipe -- each with
+// its own stepping entries.  intel_dmc_parse_id() picks the image of a
+// controller for a stepping and checks it; intel_dmc.c writes it into
+// the controller's memory.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2014-2022 Intel Corporation
 
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DMC_H
 #define KERNEL_DEV_GPU_I915_INTEL_DMC_H
@@ -16,6 +20,10 @@
 
 #define INTEL_DMC_MAX_MMIO 20
 #define INTEL_DMC_ANY_STEPPING '*'
+/* The controllers a package may carry images for. */
+#define INTEL_DMC_ID_MAIN 0
+#define INTEL_DMC_ID_PIPE(pipe) (1 + (pipe))
+#define INTEL_DMC_MAX_IDS 5
 
 struct intel_dmc_image {
 	uint32_t version; /* major << 16 | minor */
@@ -45,5 +53,11 @@ struct intel_dmc_image {
 int intel_dmc_parse(const uint8_t *fw, unsigned len, char stepping, char substepping,
 		    uint32_t max_fw_dwords, uint32_t mmio_lo, uint32_t mmio_hi,
 		    uint32_t v1_start, struct intel_dmc_image *out);
+/* The same for controller `dmc_id' (INTEL_DMC_ID_*).  A version-1
+ * package only has the main controller.  The program's own load
+ * address is only checked against the window for the main controller. */
+int intel_dmc_parse_id(const uint8_t *fw, unsigned len, char stepping, char substepping,
+		       int dmc_id, uint32_t max_fw_dwords, uint32_t mmio_lo,
+		       uint32_t mmio_hi, uint32_t v1_start, struct intel_dmc_image *out);
 
 #endif

@@ -308,6 +308,18 @@ static int plane_takes(const struct drm_plane *p, uint32_t format, uint64_t modi
 	return 0;
 }
 
+/* A state refused, said in the log (the first few times): a client only
+ * sees the errno, and a display server that dies of it names nothing. */
+static int check_fail(const char *why, int rc)
+{
+	static unsigned said;
+	if (said < 8) {
+		said++;
+		kprintf("[drm] atomic check refused: %s\n", why);
+	}
+	return rc;
+}
+
 int drm_atomic_check(struct drm_atomic_state *st)
 {
 	struct drm_device *dev = st->dev;
@@ -325,7 +337,7 @@ int drm_atomic_check(struct drm_atomic_state *st)
 				was = cr->index;
 		}
 		if (ns->crtc >= (int)dev->ncrtc)
-			return -EINVAL;
+			return check_fail("a connector names no crtc", -EINVAL);
 		if (ns->crtc >= 0)
 			st->crtcs[ns->crtc].connector_mask |= 1u << i;
 		if (was != ns->crtc) {
@@ -344,20 +356,20 @@ int drm_atomic_check(struct drm_atomic_state *st)
 	for (i = 0; i < dev->ncrtc; i++) {
 		struct drm_crtc_state *cs = &st->crtcs[i];
 		if (cs->active && !cs->mode_valid)
-			return -EINVAL;
+			return check_fail("an active crtc has no mode", -EINVAL);
 		if (cs->active && !cs->connector_mask)
-			return -EINVAL;
+			return check_fail("an active crtc has no connector", -EINVAL);
 		if (cs->mode_valid) {
 			const struct drm_mode_modeinfo *m = &cs->mode;
 			if (!m->hdisplay || !m->vdisplay || !m->htotal || !m->vtotal ||
 			    !m->clock || m->hdisplay > m->htotal ||
 			    m->vdisplay > m->vtotal ||
 			    m->hdisplay > dev->max_width || m->vdisplay > dev->max_height)
-				return -EINVAL;
+				return check_fail("the mode's timings are not possible", -EINVAL);
 		}
 		if (cs->mode_changed || cs->active_changed || cs->connectors_changed) {
 			if (!st->allow_modeset)
-				return -EINVAL;
+				return check_fail("a mode set without ALLOW_MODESET", -EINVAL);
 			cs->changed = 1;
 		}
 	}
@@ -366,12 +378,12 @@ int drm_atomic_check(struct drm_atomic_state *st)
 		struct drm_plane_state *ps = &st->planes[i];
 		struct drm_plane *p = ps->plane;
 		if (ps->crtc >= (int)dev->ncrtc)
-			return -EINVAL;
+			return check_fail("a plane names no crtc", -EINVAL);
 		if (ps->crtc >= 0 && !(p->possible_crtcs & (1u << ps->crtc)))
-			return -EINVAL;
+			return check_fail("a plane on a crtc it cannot be on", -EINVAL);
 		/* a framebuffer needs a crtc and a crtc a framebuffer */
 		if ((ps->fb != NULL) != (ps->crtc >= 0))
-			return -EINVAL;
+			return check_fail("a plane with a framebuffer and no crtc, or the reverse", -EINVAL);
 		if (ps->changed && ps->crtc >= 0)
 			st->crtcs[ps->crtc].changed = 1;
 		if (ps->crtc_changed && p->crtc >= 0 && p->crtc != ps->crtc)
@@ -380,22 +392,22 @@ int drm_atomic_check(struct drm_atomic_state *st)
 			continue;
 		struct drm_crtc_state *cs = &st->crtcs[ps->crtc];
 		if (!cs->active)
-			return -EINVAL;
+			return check_fail("a plane on a crtc that is off", -EINVAL);
 		if (!plane_takes(p, ps->fb->format, ps->fb->modifier))
-			return -EINVAL;
+			return check_fail("the plane does not take the framebuffer's format or layout", -EINVAL);
 		/* the source rectangle inside the framebuffer (16.16) */
 		if (!ps->src_w || !ps->src_h || !ps->crtc_w || !ps->crtc_h)
-			return -EINVAL;
+			return check_fail("a plane rectangle of size zero", -EINVAL);
 		if ((uint64_t)ps->src_x + ps->src_w > ((uint64_t)ps->fb->width << 16) ||
 		    (uint64_t)ps->src_y + ps->src_h > ((uint64_t)ps->fb->height << 16))
-			return -ENOSPC;
+			return check_fail("the source rectangle is outside the framebuffer", -ENOSPC);
 		/* no scaling inside a plane: the source and the destination
 		 * are the same size (the pipe scaler is a crtc matter) */
 		if ((ps->src_w >> 16) != ps->crtc_w || (ps->src_h >> 16) != ps->crtc_h)
-			return -EINVAL;
+			return check_fail("a plane would have to scale", -EINVAL);
 		if (p->type == DRM_PLANE_TYPE_CURSOR && dev->drv->cursor_w &&
 		    (ps->crtc_w > dev->drv->cursor_w || ps->crtc_h > dev->drv->cursor_h))
-			return -EINVAL;
+			return check_fail("the cursor is larger than the device's", -EINVAL);
 	}
 	if (dev->drv->atomic_check)
 		return dev->drv->atomic_check(dev, st);

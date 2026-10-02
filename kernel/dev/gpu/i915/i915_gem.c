@@ -10,6 +10,8 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
+#include <kernel/dev/gpu/i915/i915_lmem.h>
+#include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/hal/lapic.h>
@@ -79,6 +81,24 @@ struct i915_gem_context *i915_file_context(struct drm_file *fp, uint32_t id)
 	if (ctx)
 		i915_context_get(ctx);
 	spin_unlock_irqrestore(&f->lock, fl);
+	if (ctx || id != 0 || !g_i915.gt_ready)
+		return ctx;
+	/* A file opened before the GT was up has no default context yet:
+	 * it is made on first use, as if it had been there from the open. */
+	struct i915_gem_context *made = i915_context_create(&g_i915, fp, NULL);
+	if (!made)
+		return NULL;
+	made->id = 0;
+	spin_lock_irqsave(&f->lock, &fl);
+	if (!f->ctx[0]) {
+		f->ctx[0] = made;
+		made = NULL;
+	}
+	ctx = f->ctx[0];
+	i915_context_get(ctx);
+	spin_unlock_irqrestore(&f->lock, fl);
+	if (made)
+		i915_context_put(made);
 	return ctx;
 }
 
@@ -101,7 +121,8 @@ void i915_gem_object_free(struct drm_gem_object *o)
 	}
 	i915_fence_object_free(&g_i915, o);
 	if (bo->bound)
-		i915_ggtt_unbind(&g_i915, bo->ggtt, (uint32_t)(o->npages * 4096));
+		i915_ggtt_unbind(&g_i915, bo->ggtt,
+				 bo->ggtt_size ? bo->ggtt_size : (uint32_t)(o->npages * 4096));
 	{
 		/* out from under the lock first: a submission may be reading
 		 * them; dropped after, since dropping may free */
@@ -121,6 +142,7 @@ void i915_gem_object_free(struct drm_gem_object *o)
 		for (unsigned i = 0; i < no; i++)
 			drm_fence_put(olds[i]);
 	}
+	i915_lmem_object_free(&g_i915, o);
 	kfree(bo);
 	o->priv = NULL;
 }
@@ -149,6 +171,92 @@ void i915_gem_object_fences(struct drm_gem_object *o, int write, uint64_t skip_c
 	spin_unlock_irqrestore(&i915->sync_lock, fl);
 }
 
+/* What a user of the object must wait for, as one fence (merged), or
+ * NULL when the object is idle: every engine's use for a writer, the
+ * writer's for a reader.  The dma-buf's poll, sync and fence export. */
+struct drm_fence *i915_gem_busy_fence(struct drm_gem_object *o, int write)
+{
+	struct drm_fence *fs[1 + I915_ENGINE_CLASSES];
+	unsigned n = 0;
+
+	i915_gem_object_fences(o, write, 0, fs, &n);
+	if (!n)
+		return NULL;
+	struct drm_fence *m = fs[0];
+	for (unsigned i = 1; i < n; i++) {
+		struct drm_fence *both = drm_fence_merge(m, fs[i]);
+		if (both) {
+			drm_fence_put(m);
+			drm_fence_put(fs[i]);
+			m = both;
+		} else {
+			/* no memory: the later of the two is the better half */
+			drm_fence_put(m);
+			m = fs[i];
+		}
+	}
+	return m;
+}
+
+/* A fence from outside (a sync file the client attached to the shared
+ * buffer): the next submissions that touch the object wait for it -- as
+ * they wait for a writer's when `write', else only those that write.
+ * It joins what the slot already holds rather than replacing it. */
+int i915_gem_attach_fence(struct drm_gem_object *o, struct drm_fence *f, int write)
+{
+	struct i915_bo *bo = o->priv;
+	struct i915_device *i915 = &g_i915;
+	unsigned cls = I915_ENGINE_CLASS_RENDER;
+	uint64_t fl;
+
+	if (!bo)
+		return -EINVAL;
+	for (int i = 0; i < I915_NUM_ENGINES; i++)
+		if (i915->engines[i].present && i915->engines[i].fence_context == f->context &&
+		    i915->engines[i].class < I915_ENGINE_CLASSES)
+			cls = i915->engines[i].class;
+	for (int attempt = 0; attempt < 8; attempt++) {
+		struct drm_fence **slot, *old, *merged;
+		spin_lock_irqsave(&i915->sync_lock, &fl);
+		slot = write ? &bo->write_fence : &bo->read_fence[cls];
+		old = *slot;
+		if (old)
+			drm_fence_get(old);
+		spin_unlock_irqrestore(&i915->sync_lock, fl);
+		if (old && !old->signaled) {
+			merged = drm_fence_merge(old, f);
+			if (!merged) {
+				drm_fence_put(old);
+				return -ENOMEM;
+			}
+		} else {
+			drm_fence_get(f);
+			merged = f;
+		}
+		int done = 0;
+		spin_lock_irqsave(&i915->sync_lock, &fl);
+		if (*slot == old) {
+			*slot = merged;
+			if (write)
+				bo->write_class = (uint8_t)cls;
+			done = 1;
+		}
+		spin_unlock_irqrestore(&i915->sync_lock, fl);
+		if (done) {
+			/* the slot's reference to the old one goes with it */
+			if (old)
+				drm_fence_put(old);
+			if (old)
+				drm_fence_put(old);
+			return 0;
+		}
+		drm_fence_put(merged);
+		if (old)
+			drm_fence_put(old);
+	}
+	return -EAGAIN;
+}
+
 int i915_gem_object_wait(struct drm_gem_object *o, int write, uint64_t timeout_ns)
 {
 	struct drm_fence *waits[1 + I915_ENGINE_CLASSES];
@@ -175,6 +283,10 @@ int i915_gem_object_wait(struct drm_gem_object *o, int write, uint64_t timeout_n
 
 static int bo_is_coherent(struct i915_device *i915, struct i915_bo *bo)
 {
+	/* a discrete card snoops system memory, and local memory is
+	 * mapped write-combining: nothing to flush either way */
+	if (i915->info->flags & I915_INFO_IS_DGFX)
+		return 1;
 	if (!(i915->info->flags & I915_INFO_HAS_LLC))
 		return 0;
 	return bo->caching != I915_CACHING_NONE;
@@ -184,6 +296,10 @@ static void bo_clflush(struct drm_gem_object *o)
 {
 	if (!o->pages)
 		return;
+	if (g_i915.info->flags & I915_INFO_IS_DGFX) {
+		__asm__ volatile("sfence" ::: "memory");
+		return;
+	}
 	for (uint32_t p = 0; p < o->npages; p++) {
 		uint8_t *va = phys_to_virt(o->pages[p]);
 		for (int i = 0; i < 4096; i += 64)
@@ -214,6 +330,7 @@ void i915_gem_object_set_display(struct i915_device *i915, struct drm_gem_object
 	if (!bo || bo->caching == I915_CACHING_NONE)
 		return;
 	bo->caching = I915_CACHING_NONE;
+	bo->pat_set = 0;
 	bo_clflush(o);
 	for (struct i915_vma *v = bo->vmas; v; v = v->next) {
 		if (!v->vm || !v->attached)
@@ -356,6 +473,10 @@ static long gem_userptr(struct i915_device *i915, struct drm_file *fp, void *kb)
  * allocated is read from the object, never from that state. */
 void i915_gem_release_pages(struct drm_gem_object *o)
 {
+	if (i915_lmem_object(o)) {
+		i915_lmem_free_pages(&g_i915, o);
+		return;
+	}
 	if (!o->pages)
 		return;
 	if (o->pages_borrowed) {
@@ -382,6 +503,7 @@ static long gem_create_ext(struct i915_device *i915, struct drm_file *fp,
 	uint32_t pat = 0;
 	int have_pat = 0;
 	uint64_t next = a->extensions;
+	struct i915_lmem_placement pl = { 0 };
 
 	if (a->flags & ~I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS)
 		return -EINVAL;
@@ -396,22 +518,21 @@ static long gem_create_ext(struct i915_device *i915, struct drm_file *fp,
 				return -EFAULT;
 			if (mr.num_regions == 0 || mr.num_regions > 4)
 				return -EINVAL;
-			struct drm_i915_gem_memory_class_instance r[4];
-			if (copy_user_bounded(r, mr.regions, mr.num_regions * sizeof(r[0])))
-				return -EFAULT;
-			int sys = 0;
-			for (uint32_t i = 0; i < mr.num_regions; i++)
-				if (r[i].memory_class == I915_MEMORY_CLASS_SYSTEM &&
-				    r[i].memory_instance == 0)
-					sys = 1;
-			if (!sys)
-				return -EINVAL;
+			int rc = i915_lmem_parse_regions(i915, &mr, &pl);
+			if (rc)
+				return rc;
 			break;
 		}
 		case I915_GEM_CREATE_EXT_SET_PAT: {
 			struct drm_i915_gem_create_ext_set_pat sp;
+			/* Meteor Lake on: the table is the client's to choose
+			 * from, within the entries it may use */
+			if (i915->gt_ip < I915_IP(12, 70))
+				return -ENODEV;
 			if (copy_user_bounded(&sp, next, sizeof(sp)))
 				return -EFAULT;
+			if (!i915_pat_index_valid(i915, sp.pat_index))
+				return -EINVAL;
 			pat = sp.pat_index;
 			have_pat = 1;
 			break;
@@ -424,14 +545,38 @@ static long gem_create_ext(struct i915_device *i915, struct drm_file *fp,
 		next = ext.next_extension;
 	}
 	uint32_t handle;
-	struct drm_gem_object *o = gem_create(i915, fp, a->size, &handle);
+	int err;
+	struct drm_gem_object *o =
+		i915_lmem_object_create(i915, a->size, &pl,
+					!!(a->flags & I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS), &err);
 	if (!o)
-		return -ENOMEM;
+		return err;
 	struct i915_bo *bo = o->priv;
+	bo->caching = (i915->info->flags & I915_INFO_HAS_LLC) ? I915_CACHING_CACHED :
+								  I915_CACHING_NONE;
+	bo->madv = I915_MADV_WILLNEED;
+	bo->user_size = a->size;
+	/* compressed from the first access: the state the pages' last user
+	 * left goes before the client sees them */
+	if (have_pat && i915_pat_compressed(i915, pat)) {
+		int crc = i915_gt_clear_ccs(i915, o);
+		if (crc) {
+			drm_gem_put(o);
+			return crc;
+		}
+	}
+	if (drm_gem_handle_create(fp, o, &handle) != 0) {
+		drm_gem_put(o);
+		return -ENOMEM;
+	}
 	if (have_pat) {
+		/* the client's choice of page attribute table entry stands for
+		 * its bindings; whether that entry is the uncached one decides
+		 * how the processor's side is kept in step */
 		bo->pat_index = pat;
-		/* index 3 is uncached in the tables the driver programs */
-		bo->caching = (pat == 3) ? I915_CACHING_NONE : I915_CACHING_CACHED;
+		bo->pat_set = 1;
+		bo->caching = i915_pat_is_uncached(i915, pat) ? I915_CACHING_NONE :
+								 I915_CACHING_CACHED;
 	}
 	a->handle = handle;
 	a->size = o->size;
@@ -442,16 +587,24 @@ static long gem_create_ext(struct i915_device *i915, struct drm_file *fp,
 static long gem_mmap_offset(struct i915_device *i915, struct drm_file *fp,
 			    struct drm_i915_gem_mmap_offset *a)
 {
-	struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
-	if (!o)
-		return -ENOENT;
-	struct i915_bo *bo = o->priv;
 	unsigned kind;
-	if (a->extensions) {
-		drm_gem_put(o);
+
+	/* The older MMAP_GTT call is this one with the flags word zero:
+	 * a mapping through the aperture.  What is asked is checked before
+	 * the object is looked at: an unknown mode is invalid, the aperture
+	 * on a part without one (Meteor Lake on, the discrete parts) is
+	 * not there. */
+	if (a->extensions)
 		return -EINVAL;
-	}
 	switch (a->flags) {
+	case I915_MMAP_OFFSET_GTT:
+		if (!i915->bar_aperture.size)
+			return -ENODEV;
+		kind = I915_MMAP_KIND_GTT;
+		break;
+	case I915_MMAP_OFFSET_WC:
+		kind = 1;
+		break;
 	case I915_MMAP_OFFSET_WB:
 		kind = 2;
 		break;
@@ -459,22 +612,34 @@ static long gem_mmap_offset(struct i915_device *i915, struct drm_file *fp,
 		kind = 3;
 		break;
 	case I915_MMAP_OFFSET_FIXED:
-		kind = (bo && bo->caching != I915_CACHING_NONE &&
-			(i915->info->flags & I915_INFO_HAS_LLC)) ? 2 : 1;
+		kind = 0; /* below: only where local memory decides */
 		break;
-	case I915_MMAP_OFFSET_GTT:
-		/* through the aperture, detiled by a fence, where the device
-		 * has one; otherwise the pages as they are */
-		kind = i915->bar_aperture.size ? I915_MMAP_KIND_GTT : 1;
-		break;
-	case I915_MMAP_OFFSET_WC:
 	default:
-		kind = 1; /* write-combining through system memory */
-		break;
+		return -EINVAL;
 	}
-	a->offset = drm_gem_mmap_offset_kind(o, kind);
+	struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
+	if (!o)
+		return -ENOENT;
+	struct i915_bo *bo = o->priv;
+	long rc = 0;
+	if (bo && bo->userptr) {
+		/* a client's own pages are mapped by the client already */
+		rc = -ENODEV;
+	} else if (i915_lmem_present(i915)) {
+		/* a part with local memory has one kind of mapping: the one
+		 * the object's memory wants, and only that */
+		if (a->flags != I915_MMAP_OFFSET_FIXED)
+			rc = -ENODEV;
+		else
+			kind = i915_lmem_mmap_kind(o);
+	} else if (a->flags == I915_MMAP_OFFSET_FIXED) {
+		/* without local memory the caller chooses the mode */
+		rc = -ENODEV;
+	}
+	if (rc == 0)
+		a->offset = drm_gem_mmap_offset_kind(o, kind);
 	drm_gem_put(o);
-	return 0;
+	return rc;
 }
 
 static long gem_set_domain(struct i915_device *i915, struct drm_file *fp,
@@ -503,7 +668,12 @@ static long gem_set_domain(struct i915_device *i915, struct drm_file *fp,
 
 static long gem_tiling(struct i915_device *i915, struct drm_file *fp, void *kb, int set)
 {
-	(void)i915;
+	int legacy = i915_is_legacy(i915);
+
+	/* tiling is a property of a fence: without fence registers there
+	 * is nothing to set or report */
+	if (!i915->num_fences)
+		return -EOPNOTSUPP;
 	if (set) {
 		struct drm_i915_gem_set_tiling *a = kb;
 		struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
@@ -515,11 +685,13 @@ static long gem_tiling(struct i915_device *i915, struct drm_file *fp, void *kb, 
 			return -EINVAL;
 		}
 		/* a tiled stride is whole tiles: X tiles are 512 bytes wide,
-		 * Y tiles 128 */
+		 * Y tiles 128; before Broadwell the generation's own limits
+		 * (tile sizes, fence pitch) */
 		uint32_t tw = a->tiling_mode == I915_TILING_X ? 512 :
 			      a->tiling_mode == I915_TILING_Y ? 128 : 1;
-		if (a->tiling_mode != I915_TILING_NONE &&
-		    (a->stride == 0 || (a->stride % tw))) {
+		if (legacy ? !i915_legacy_tiling_ok(i915, a->tiling_mode, a->stride) :
+			     (a->tiling_mode != I915_TILING_NONE &&
+			      (a->stride == 0 || (a->stride % tw)))) {
 			drm_gem_put(o);
 			return -EINVAL;
 		}
@@ -527,6 +699,8 @@ static long gem_tiling(struct i915_device *i915, struct drm_file *fp, void *kb, 
 		bo->stride = a->tiling_mode == I915_TILING_NONE ? 0 : a->stride;
 		a->stride = bo->stride;
 		a->swizzle_mode = I915_BIT_6_SWIZZLE_NONE;
+		if (legacy)
+			i915_legacy_swizzle(i915, bo->tiling, &a->swizzle_mode, NULL);
 		drm_gem_put(o);
 		return 0;
 	}
@@ -538,6 +712,8 @@ static long gem_tiling(struct i915_device *i915, struct drm_file *fp, void *kb, 
 	a->tiling_mode = bo->tiling;
 	a->swizzle_mode = I915_BIT_6_SWIZZLE_NONE;
 	a->phys_swizzle_mode = I915_BIT_6_SWIZZLE_NONE;
+	if (legacy)
+		i915_legacy_swizzle(i915, bo->tiling, &a->swizzle_mode, &a->phys_swizzle_mode);
 	drm_gem_put(o);
 	return 0;
 }
@@ -554,17 +730,22 @@ static long gem_caching(struct i915_device *i915, struct drm_file *fp,
 			drm_gem_put(o);
 			return -EINVAL;
 		}
-		if (!(i915->info->flags & I915_INFO_HAS_LLC) && a->caching == I915_CACHING_CACHED) {
+		/* cached without a shared cache is the snooped kind */
+		if (!(i915->info->flags & (I915_INFO_HAS_LLC | I915_INFO_HAS_SNOOP)) &&
+		    a->caching == I915_CACHING_CACHED) {
 			drm_gem_put(o);
 			return -ENODEV;
 		}
 		if (bo->caching != a->caching) {
-			/* the bindings change attribute: rebind each */
+			/* the bindings change attribute: rebind each (a
+			 * binding may reserve more than the object has, the
+			 * pages are the object's) */
 			bo->caching = a->caching;
+			bo->pat_set = 0;
 			int unc = (a->caching == I915_CACHING_NONE);
 			for (struct i915_vma *v = bo->vmas; v; v = v->next)
 				if (v->attached)
-					i915_vm_bind(v->vm, v->addr, o->pages, v->npages, unc);
+					i915_vm_bind(v->vm, v->addr, o->pages, o->npages, unc);
 			bo_clflush(o);
 		}
 	} else {
@@ -600,6 +781,20 @@ static long gem_busy(struct drm_file *fp, struct drm_i915_gem_busy *a)
 	struct i915_bo *bo = o->priv;
 	uint32_t busy = 0;
 	uint64_t fl;
+	int open_fence = 0;
+	/* Anything still open is looked at against the engines first: a
+	 * client that polls BUSY (a display server waiting for a client's
+	 * shared buffer) must not see "busy" for as long as it takes the
+	 * next interrupt or the worker to notice a completion. */
+	spin_lock_irqsave(&g_i915.sync_lock, &fl);
+	if (bo && bo->write_fence && !bo->write_fence->signaled)
+		open_fence = 1;
+	for (int c = 0; bo && c < I915_ENGINE_CLASSES; c++)
+		if (bo->read_fence[c] && !bo->read_fence[c]->signaled)
+			open_fence = 1;
+	spin_unlock_irqrestore(&g_i915.sync_lock, fl);
+	if (open_fence && g_i915.drm.drv && g_i915.drm.drv->fence_poll)
+		g_i915.drm.drv->fence_poll(&g_i915.drm);
 	/* The interface's encoding: the low half names the class of the
 	 * engine writing the object, plus one (0 = no writer); the high half
 	 * has one bit per engine class with a reader, the writer among them. */
@@ -623,6 +818,10 @@ static long gem_busy(struct drm_file *fp, struct drm_i915_gem_busy *a)
 static long gem_mmap_legacy(struct drm_file *fp, struct drm_i915_gem_mmap *a,
 			    unsigned size)
 {
+	/* not on the discrete parts, nor past Gen12's first version:
+	 * those have MMAP_OFFSET only */
+	if ((g_i915.info->flags & I915_INFO_IS_DGFX) || g_i915.gt_ip > I915_IP(12, 0))
+		return -EOPNOTSUPP;
 	uint64_t flags = size >= sizeof(*a) ? a->flags : 0;
 	if (flags & ~(uint64_t)I915_MMAP_WC)
 		return -EINVAL;
@@ -751,18 +950,14 @@ long i915_gem_ioctl(struct i915_device *i915, struct drm_file *fp, unsigned nr,
 			return -EINVAL;
 		return gem_mmap_legacy(fp, kb, size);
 	case DRM_I915_GEM_MMAP_GTT:
-		if (size >= sizeof(struct drm_i915_gem_mmap_offset))
-			return gem_mmap_offset(i915, fp, kb);
-		{
-			struct drm_i915_gem_mmap_gtt *a = kb;
-			struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
-			if (!o)
-				return -ENOENT;
-			a->offset = drm_gem_mmap_offset_kind(o, i915->bar_aperture.size ? I915_MMAP_KIND_GTT : 1);
-			drm_gem_put(o);
-			return 0;
-		}
+		/* MMAP_OFFSET shares the number: the shorter MMAP_GTT arrives
+		 * zero-extended, so with the flags of a GTT mapping */
+		if (size < sizeof(struct drm_i915_gem_mmap_gtt))
+			return -EINVAL;
+		return gem_mmap_offset(i915, fp, kb);
 	case DRM_I915_GEM_SET_DOMAIN:
+		if (i915->info->flags & I915_INFO_IS_DGFX)
+			return -ENODEV;
 		return gem_set_domain(i915, fp, kb);
 	case DRM_I915_GEM_SW_FINISH: {
 		struct drm_i915_gem_sw_finish *a = kb;
@@ -780,9 +975,10 @@ long i915_gem_ioctl(struct i915_device *i915, struct drm_file *fp, unsigned nr,
 	case DRM_I915_GEM_GET_TILING:
 		return gem_tiling(i915, fp, kb, 0);
 	case DRM_I915_GEM_SET_CACHING:
-		return gem_caching(i915, fp, kb, 1);
 	case DRM_I915_GEM_GET_CACHING:
-		return gem_caching(i915, fp, kb, 0);
+		if (i915->info->flags & I915_INFO_IS_DGFX)
+			return -ENODEV;
+		return gem_caching(i915, fp, kb, nr == DRM_I915_GEM_SET_CACHING);
 	case DRM_I915_GEM_MADVISE:
 		return gem_madvise(fp, kb);
 	case DRM_I915_GEM_BUSY:
@@ -794,13 +990,19 @@ long i915_gem_ioctl(struct i915_device *i915, struct drm_file *fp, unsigned nr,
 	case DRM_I915_GEM_GET_APERTURE: {
 		struct drm_i915_gem_get_aperture *a = kb;
 		a->aper_size = i915->ggtt_bytes;
-		a->aper_available_size = i915->ggtt_bytes - (256u << 20);
+		if (i915_is_legacy(i915))
+			a->aper_available_size = i915_legacy_aperture_available(i915);
+		else
+			a->aper_available_size = i915->ggtt_bytes > (256u << 20) ?
+							 i915->ggtt_bytes - (256u << 20) :
+							 0;
 		return 0;
 	}
 	case DRM_I915_GEM_PREAD:
-		return gem_pread_pwrite(i915, fp, kb, 0);
 	case DRM_I915_GEM_PWRITE:
-		return gem_pread_pwrite(i915, fp, kb, 1);
+		if (i915->info->flags & I915_INFO_IS_DGFX)
+			return -EOPNOTSUPP;
+		return gem_pread_pwrite(i915, fp, kb, nr == DRM_I915_GEM_PWRITE);
 	case DRM_I915_GEM_USERPTR:
 		if (size < sizeof(struct drm_i915_gem_userptr))
 			return -EINVAL;

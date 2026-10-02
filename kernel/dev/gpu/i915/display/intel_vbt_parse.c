@@ -8,9 +8,23 @@
 // several blocks changed with the BDB version, which the parser honours
 // where the fields it needs moved.
 //
+// What a child device's port and AUX channel codes mean depends on the
+// platform: Rocket Lake and DG1 name their PHYs (A, B, then the two
+// "Type-C" combo ports as C and D), Alder Lake-S its ports A and TC1-4 as
+// A-E, and from Alder Lake-P on the Type-C ports are F to I (and AUX F
+// to I) while D and E are the extra combo ports.  The parser maps them
+// onto the driver's port numbers (PORT_TC1.. for the Type-C ports from
+// Tiger Lake on) and AUX channel indices (USBC1.. after A-C).  Display
+// versions 14 to 35 (Meteor Lake to Nova Lake, Battlemage included) keep
+// Alder Lake-P's numbering; BDB 264 adds the flag for a port whose PHY
+// is a dedicated external one rather than a Type-C subsystem's.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2006-2025 Intel Corporation
 
 #include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/i915_device_info.h>
 #include <kernel/dev/gpu/drm_edid.h>
 
 #ifndef EINVAL
@@ -41,13 +55,14 @@ static uint32_t rd32(const uint8_t *p)
 
 /* Child device types (device_type field bits) */
 #define DEVICE_TYPE_INTERNAL_CONNECTOR (1 << 12)
-#define DEVICE_TYPE_DISPLAYPORT_OUTPUT (1 << 2)
-#define DEVICE_TYPE_DIGITAL_OUTPUT (1 << 9)
-#define DEVICE_TYPE_TMDS_DVI_SIGNALING (1 << 4)
-#define DEVICE_TYPE_MIPI_OUTPUT (1 << 6)
-#define DEVICE_TYPE_ANALOG_OUTPUT (1 << 0)
-#define DEVICE_TYPE_DUAL_CHANNEL (1 << 10)
 #define DEVICE_TYPE_NOT_HDMI_OUTPUT (1 << 11)
+#define DEVICE_TYPE_MIPI_OUTPUT (1 << 10)
+#define DEVICE_TYPE_COMPOSITE_OUTPUT (1 << 9)
+#define DEVICE_TYPE_DUAL_CHANNEL (1 << 8)
+#define DEVICE_TYPE_TMDS_DVI_SIGNALING (1 << 4)
+#define DEVICE_TYPE_DISPLAYPORT_OUTPUT (1 << 2)
+#define DEVICE_TYPE_DIGITAL_OUTPUT (1 << 1)
+#define DEVICE_TYPE_ANALOG_OUTPUT (1 << 0)
 
 /* DVO port codes in the child device */
 #define DVO_PORT_HDMIA 0
@@ -72,48 +87,111 @@ static uint32_t rd32(const uint8_t *p)
 #define DVO_PORT_DPI 19
 #define DVO_PORT_HDMII 20
 
-static int dvo_port_to_ddi(uint8_t dvo, int *is_dp)
+/* The platform the table is read for. */
+struct vbt_ctx {
+	int display_ver;
+	int platform;
+};
+
+/* The DVO port codes each driver port answers to (HDMI, DP), by
+ * platform. */
+static const int8_t port_map_direct[][2] = {
+	{ DVO_PORT_HDMIA, DVO_PORT_DPA }, { DVO_PORT_HDMIB, DVO_PORT_DPB },
+	{ DVO_PORT_HDMIC, DVO_PORT_DPC }, { DVO_PORT_HDMID, DVO_PORT_DPD },
+	{ DVO_PORT_HDMIE, DVO_PORT_DPE }, { DVO_PORT_HDMIF, DVO_PORT_DPF },
+	{ DVO_PORT_HDMIG, DVO_PORT_DPG }, { DVO_PORT_HDMIH, DVO_PORT_DPH },
+	{ DVO_PORT_HDMII, DVO_PORT_DPI },
+};
+/* Rocket Lake, DG1: PHYs A-D are ports A, B, TC1, TC2. */
+static const int8_t port_map_rkl[][2] = {
+	{ DVO_PORT_HDMIA, DVO_PORT_DPA }, { DVO_PORT_HDMIB, DVO_PORT_DPB },
+	{ -1, -1 }, { DVO_PORT_HDMIC, DVO_PORT_DPC }, { DVO_PORT_HDMID, DVO_PORT_DPD },
+	{ -1, -1 }, { -1, -1 }, { -1, -1 }, { -1, -1 },
+};
+/* Alder Lake-S: ports A, TC1-TC4. */
+static const int8_t port_map_adls[][2] = {
+	{ DVO_PORT_HDMIA, DVO_PORT_DPA }, { -1, -1 }, { -1, -1 },
+	{ DVO_PORT_HDMIB, DVO_PORT_DPB }, { DVO_PORT_HDMIC, DVO_PORT_DPC },
+	{ DVO_PORT_HDMID, DVO_PORT_DPD }, { DVO_PORT_HDMIE, DVO_PORT_DPE },
+	{ -1, -1 }, { -1, -1 },
+};
+/* Display version 13+: A-C, TC1-TC4 (F-I), and D/E after them. */
+static const int8_t port_map_xelpd[][2] = {
+	{ DVO_PORT_HDMIA, DVO_PORT_DPA }, { DVO_PORT_HDMIB, DVO_PORT_DPB },
+	{ DVO_PORT_HDMIC, DVO_PORT_DPC }, { DVO_PORT_HDMIF, DVO_PORT_DPF },
+	{ DVO_PORT_HDMIG, DVO_PORT_DPG }, { DVO_PORT_HDMIH, DVO_PORT_DPH },
+	{ DVO_PORT_HDMII, DVO_PORT_DPI }, { DVO_PORT_HDMID, DVO_PORT_DPD },
+	{ DVO_PORT_HDMIE, DVO_PORT_DPE },
+};
+
+static int dvo_port_to_ddi(const struct vbt_ctx *ctx, uint8_t dvo, int *is_dp)
 {
+	const int8_t (*map)[2] = port_map_direct;
+
+	if (ctx->display_ver >= 13)
+		map = port_map_xelpd;
+	else if (ctx->platform == I915_PLATFORM_ALDERLAKE_S)
+		map = port_map_adls;
+	else if (ctx->platform == I915_PLATFORM_DG1 || ctx->platform == I915_PLATFORM_ROCKETLAKE)
+		map = port_map_rkl;
 	*is_dp = 0;
-	switch (dvo) {
-	case DVO_PORT_HDMIA: return 0;
-	case DVO_PORT_HDMIB: return 1;
-	case DVO_PORT_HDMIC: return 2;
-	case DVO_PORT_HDMID: return 3;
-	case DVO_PORT_HDMIE: return 4;
-	case DVO_PORT_DPA: *is_dp = 1; return 0;
-	case DVO_PORT_DPB: *is_dp = 1; return 1;
-	case DVO_PORT_DPC: *is_dp = 1; return 2;
-	case DVO_PORT_DPD: *is_dp = 1; return 3;
-	case DVO_PORT_DPE: *is_dp = 1; return 4;
-	case DVO_PORT_HDMIF: return 5;
-	case DVO_PORT_HDMIG: return 6;
-	case DVO_PORT_HDMIH: return 7;
-	case DVO_PORT_HDMII: return 8;
-	case DVO_PORT_DPF: *is_dp = 1; return 5;
-	case DVO_PORT_DPG: *is_dp = 1; return 6;
-	case DVO_PORT_DPH: *is_dp = 1; return 7;
-	case DVO_PORT_DPI: *is_dp = 1; return 8;
-	default: return -1;
+	for (int port = 0; port < 9; port++) {
+		if (map[port][0] >= 0 && dvo == (uint8_t)map[port][0])
+			return port;
+		if (map[port][1] >= 0 && dvo == (uint8_t)map[port][1]) {
+			*is_dp = 1;
+			return port;
+		}
 	}
+	return -1;
 }
 
-static uint8_t aux_ch_to_index(uint8_t aux)
+/* VBT AUX channel codes */
+#define DP_AUX_A 0x40
+#define DP_AUX_B 0x10
+#define DP_AUX_C 0x20
+#define DP_AUX_D 0x30
+#define DP_AUX_E 0x50
+#define DP_AUX_F 0x60
+#define DP_AUX_G 0x70
+#define DP_AUX_H 0x80
+#define DP_AUX_I 0x90
+
+/* The channel index (0 = A, 3.. = USBC1.. from Tiger Lake on) a code
+ * names on this platform; 0xff for none. */
+static uint8_t aux_ch_to_index(const struct vbt_ctx *ctx, uint8_t aux)
 {
-	/* VBT: 0x40 = A, 0x10 = B, 0x20 = C, 0x30 = D, 0x50 = E */
-	switch (aux) {
-	case 0x40: return 0;
-	case 0x10: return 1;
-	case 0x20: return 2;
-	case 0x30: return 3;
-	case 0x50: return 4;
-	default: return 0xff;
+	static const uint8_t direct[] = { DP_AUX_A, DP_AUX_B, DP_AUX_C, DP_AUX_D, DP_AUX_E,
+					  DP_AUX_F, DP_AUX_G, DP_AUX_H, DP_AUX_I };
+	/* A, B, C, USBC1-4, then D and E (display 13+) */
+	static const uint8_t adlp[] = { DP_AUX_A, DP_AUX_B, DP_AUX_C, DP_AUX_F, DP_AUX_G,
+					DP_AUX_H, DP_AUX_I, DP_AUX_D, DP_AUX_E };
+	/* A, then USBC1-4 */
+	static const uint8_t adls[] = { DP_AUX_A, 0, 0, DP_AUX_B, DP_AUX_C, DP_AUX_D, DP_AUX_E };
+	/* A, B, then USBC1-2 */
+	static const uint8_t rkl[] = { DP_AUX_A, DP_AUX_B, 0, DP_AUX_C, DP_AUX_D };
+	const uint8_t *map = direct;
+	unsigned n = sizeof(direct);
+
+	if (ctx->display_ver >= 13) {
+		map = adlp;
+		n = sizeof(adlp);
+	} else if (ctx->platform == I915_PLATFORM_ALDERLAKE_S) {
+		map = adls;
+		n = sizeof(adls);
+	} else if (ctx->platform == I915_PLATFORM_DG1 || ctx->platform == I915_PLATFORM_ROCKETLAKE) {
+		map = rkl;
+		n = sizeof(rkl);
 	}
+	for (unsigned i = 0; i < n; i++)
+		if (map[i] && map[i] == aux)
+			return (uint8_t)i;
+	return 0xff;
 }
 
 /* One child device, laid out per BDB version. */
-static void parse_child(const uint8_t *c, unsigned size, uint16_t version,
-			struct intel_vbt *out)
+static void parse_child(const struct vbt_ctx *ctx, const uint8_t *c, unsigned size,
+			uint16_t version, struct intel_vbt *out)
 {
 	uint16_t handle = rd16(c + 0);
 	uint16_t device_type = rd16(c + 2);
@@ -135,7 +213,7 @@ static void parse_child(const uint8_t *c, unsigned size, uint16_t version,
 	uint8_t flags1 = (version >= 158 && size > 23) ? c[23] : 0;
 	uint8_t signalling = (version >= 158 && size > 24) ? c[24] : 0;
 	int is_dp;
-	int ddi = dvo_port_to_ddi(dvo_port, &is_dp);
+	int ddi = dvo_port_to_ddi(ctx, dvo_port, &is_dp);
 	if (ddi < 0 || ddi >= INTEL_MAX_PORTS)
 		return;
 	struct intel_vbt_port *p = &out->port[ddi];
@@ -169,18 +247,33 @@ static void parse_child(const uint8_t *c, unsigned size, uint16_t version,
 	}
 	if (version >= 184)
 		p->lane_reversal = (flags1 >> 1) & 1;
+	if (version >= 196)
+		p->hpd_invert = (flags1 >> 4) & 1;
+	/* byte 33: bit 0 the port is USB-C (195+), bit 1 Thunderbolt (209+),
+	 * bit 2 the PHY is a dedicated external one, outside the Type-C
+	 * subsystem (264+), for which the other two mean nothing */
+	if (version >= 195 && size > 33) {
+		p->dp_usb_type_c = c[33] & 1;
+		p->tbt = version >= 209 ? (c[33] >> 1) & 1 : 0;
+		p->typec_valid = 1;
+		p->dedicated_external = version >= 264 ? (c[33] >> 2) & 1 : 0;
+		if (p->dedicated_external) {
+			p->dp_usb_type_c = 0;
+			p->tbt = 0;
+		}
+	}
 	if (ddc_pin)
 		p->ddc_pin = ddc_pin;
 	if (aux_ch)
-		p->aux_ch = aux_ch_to_index(aux_ch);
+		p->aux_ch = aux_ch_to_index(ctx, aux_ch);
 	else if (!p->aux_ch && (p->supports_dp || p->supports_edp))
 		p->aux_ch = (uint8_t)ddi; /* the port's own channel */
 	p->hdmi_level_shift = hdmi_level;
 	out->nchildren++;
 }
 
-static void parse_general_definitions(const uint8_t *b, unsigned len,
-				      uint16_t version, struct intel_vbt *out)
+static void parse_general_definitions(const struct vbt_ctx *ctx, const uint8_t *b,
+				      unsigned len, uint16_t version, struct intel_vbt *out)
 {
 	/* byte 0: crt_ddc_gmbus_pin; 1: dpms bits; 2: boot display[2];
 	 * 4: child_dev_size; 5..: children */
@@ -190,7 +283,7 @@ static void parse_general_definitions(const uint8_t *b, unsigned len,
 	if (csize < 22)
 		return;
 	for (unsigned off = 5; off + csize <= len; off += csize)
-		parse_child(b + off, csize, version, out);
+		parse_child(ctx, b + off, csize, version, out);
 	out->int_crt_support = 0;
 }
 
@@ -247,33 +340,53 @@ static void parse_lvds_options(const uint8_t *b, unsigned len,
 {
 	if (len < 2)
 		return;
-	/* byte 0: panel_type; byte 1: bits: pfit, dither... */
-	out->panel_type = b[0] & 0x0f;
+	/* byte 0: panel_type; byte 1: bits: pfit, dither...  A type of 0xff
+	 * asks for the panel to be matched by its EDID's PnP id, which
+	 * cannot be done here: the first entry is the fallback then, as
+	 * it is for an out-of-range type. */
+	out->panel_type = b[0] <= 0x0f ? b[0] : 0;
 	out->lvds_dither = !!(b[1] & 0x01);
 }
 
 /* The LFP data pointers block gives, per panel type, where the DTD of
  * that panel sits in the LFP data block. */
-static void parse_lfp_data(const uint8_t *ptrs, unsigned ptrs_len,
+static void parse_lfp_data(const uint8_t *bdb, const uint8_t *ptrs, unsigned ptrs_len,
 			   const uint8_t *data, unsigned data_len,
 			   struct intel_vbt *out)
 {
 	int pt = out->panel_type;
-	if (pt < 0 || pt > 15 || !ptrs || !data)
+	const uint8_t *d = 0;
+	if (pt < 0 || pt > 15 || !data)
 		return;
-	/* ptrs: byte 0 = lvds_entries; then 16 x (3 x (u16 offset, u8 size))
-	 * for fp_timing, dvo_timing, panel_pnp_id; offsets are into the
-	 * whole block including the BDB block header (3 bytes). */
-	if (ptrs_len < 1 + 16 * 9)
-		return;
-	const uint8_t *e = ptrs + 1 + pt * 9;
-	uint16_t dvo_off = rd16(e + 3);
-	uint8_t dvo_size = e[5];
-	if (dvo_size < 18)
-		return;
-	if (dvo_off < 3 || (unsigned)dvo_off - 3 + 18 > data_len)
-		return;
-	const uint8_t *d = data + dvo_off - 3;
+	if (ptrs) {
+		/* ptrs: byte 0 = lvds_entries; then 16 x (3 x (u16 offset,
+		 * u8 size)) for fp_timing, dvo_timing, panel_pnp_id.  The
+		 * offsets count from the start of the BIOS data block; some
+		 * tables (and this driver's tests) count them from the LFP
+		 * data block's header instead, which is tried when the first
+		 * reading falls outside the block. */
+		if (ptrs_len < 1 + 16 * 9)
+			return;
+		const uint8_t *e = ptrs + 1 + pt * 9;
+		uint32_t dvo_off = rd16(e + 3);
+		uint8_t dvo_size = e[5];
+		uint32_t data_off = (uint32_t)(data - bdb);
+		if (dvo_size < 18)
+			return;
+		if (dvo_off >= data_off && dvo_off - data_off + 18 <= data_len)
+			d = data + (dvo_off - data_off);
+		else if (dvo_off >= 3 && dvo_off - 3 + 18 <= data_len)
+			d = data + dvo_off - 3;
+		else
+			return;
+	} else {
+		/* Modern tables have no pointer block: the entries are 38
+		 * bytes of panel timing, the 18-byte DTD and the 10-byte PnP
+		 * id, sixteen of them in a row. */
+		if (out->version < 155 || 16 * (38 + 18 + 10) > data_len)
+			return;
+		d = data + (unsigned)pt * (38 + 18 + 10) + 38;
+	}
 	/* the same 18-byte detailed timing layout as an EDID descriptor */
 	uint32_t clock = (uint32_t)rd16(d) * 10;
 	uint32_t hactive = d[2] | ((d[4] & 0xf0) << 4);
@@ -340,6 +453,13 @@ static void parse_backlight(const uint8_t *b, unsigned len,
 
 int intel_vbt_parse(const uint8_t *vbt, unsigned len, struct intel_vbt *out)
 {
+	return intel_vbt_parse_platform(vbt, len, 0, 0, out);
+}
+
+int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
+			     int platform, struct intel_vbt *out)
+{
+	struct vbt_ctx ctx = { display_ver, platform };
 	for (unsigned i = 0; i < sizeof(*out); i++)
 		((uint8_t *)out)[i] = 0;
 	out->panel_type = -1;
@@ -390,7 +510,7 @@ int intel_vbt_parse(const uint8_t *vbt, unsigned len, struct intel_vbt *out)
 			break;
 		switch (id) {
 		case BDB_GENERAL_DEFINITIONS:
-			parse_general_definitions(body, blen, out->version, out);
+			parse_general_definitions(&ctx, body, blen, out->version, out);
 			break;
 		case BDB_LVDS_OPTIONS:
 			parse_lvds_options(body, blen, out);
@@ -418,8 +538,8 @@ int intel_vbt_parse(const uint8_t *vbt, unsigned len, struct intel_vbt *out)
 	}
 	if (out->panel_type < 0)
 		out->panel_type = 0;
-	if (ptrs_blk && data_blk)
-		parse_lfp_data(ptrs_blk, ptrs_len, data_blk, data_len, out);
+	if (data_blk)
+		parse_lfp_data(bdb, ptrs_blk, ptrs_len, data_blk, data_len, out);
 	if (edp_blk)
 		parse_edp(edp_blk, edp_len, out);
 	if (bl_blk)

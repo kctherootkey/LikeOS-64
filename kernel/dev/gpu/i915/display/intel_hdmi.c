@@ -13,6 +13,7 @@
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/intel_dpll_regs.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/dev/gpu/i915/intel_infoframe.h>
@@ -21,9 +22,6 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
 
-#define HDMI_MAX_CLOCK_KHZ 300000 /* Gen9 TMDS without scrambling */
-#define DVI_MAX_CLOCK_KHZ 165000 /* single-link */
-#define HDMI_MIN_CLOCK_KHZ 25000
 
 /* ---- detection ---------------------------------------------------------------- */
 
@@ -59,10 +57,14 @@ int intel_hdmi_detect(struct i915_device *i915, struct intel_output *o)
 int intel_hdmi_mode_valid(struct i915_device *i915, struct intel_output *o,
 			  const struct drm_mode_modeinfo *m)
 {
-	(void)i915;
-	uint32_t max = (o->type == INTEL_OUTPUT_HDMI && o->hdmi_sink) ? HDMI_MAX_CLOCK_KHZ :
-									  DVI_MAX_CLOCK_KHZ;
-	if (m->clock < HDMI_MIN_CLOCK_KHZ || m->clock > max)
+	/* the platform's TMDS ceiling, without the scrambling HDMI 2.0
+	 * needs above 340 MHz; a DVI sink stops at single link */
+	uint32_t max = intel_dpll_hdmi_max_tmds_khz(i915);
+	if (max > 340000)
+		max = 340000;
+	if (!(o->type == INTEL_OUTPUT_HDMI && o->hdmi_sink) && max > 165000)
+		max = 165000;
+	if (m->clock < 25000 || m->clock > max || intel_dpll_hdmi_clock_valid(i915, o, m->clock))
 		return -EINVAL;
 	if (m->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_DBLSCAN))
 		return -EINVAL;
@@ -99,6 +101,11 @@ int intel_hdmi_pre_enable(struct i915_device *i915, struct intel_output *o,
 			'A' + o->port, m->clock);
 		return -EIO;
 	}
+	/* A Type-C PHY carrying TMDS is set up for all four lanes first, the
+	 * way it is for a DisplayPort link. */
+	if ((i915->display.model == INTEL_DISPLAY_ICL || i915->display.model == INTEL_DISPLAY_TGL) &&
+	    o->is_tc)
+		intel_tc_program_dp_mode(i915, o, 4);
 	intel_dpll_route_port(i915, o->port, o->pll);
 	/* the transmitter's swing: the VBT's level shifter value, else the
 	 * platform default */
@@ -120,6 +127,15 @@ int intel_hdmi_pre_enable(struct i915_device *i915, struct intel_output *o,
 
 void intel_hdmi_enable(struct i915_device *i915, struct intel_output *o)
 {
+	/* Meteor Lake's buffer is the PHY's as much as the port's. */
+	if (i915->display.model == INTEL_DISPLAY_MTL) {
+		mtl_ddi_buf_enable(i915, o, 4);
+		return;
+	}
+	if (i915->display.model == INTEL_DISPLAY_DG2) {
+		dg2_ddi_buf_enable(i915, o, 4);
+		return;
+	}
 	/* In TMDS mode the port width and swing selects are not used;
 	 * enabling the buffer is all. */
 	uint32_t v = i915_read32(i915, DDI_BUF_CTL(o->port));

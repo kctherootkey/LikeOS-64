@@ -6,7 +6,15 @@
 // mailboxes carry the firmware's requests (backlight, display switch)
 // and the driver's declaration that it owns the display.
 //
+// A discrete card (DG2, Battlemage) has no OpRegion; its VBT is in the
+// option ROM image in the card's SPI flash, which the display reads one
+// dword at a time through a pair of registers: an address within the
+// option ROM's region, then a read of the trigger register returns the
+// dword there.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2024-2026 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
@@ -22,7 +30,6 @@
 #define OPREGION_ASLE_OFFSET 0x300 /* mailbox 3 */
 #define OPREGION_VBT_OFFSET 0x400 /* mailbox 4: the VBT, 6 KB */
 #define OPREGION_ASLE_EXT_OFFSET 0x1C00 /* mailbox 5 */
-#define OPREGION_VBT_SIZE (OPREGION_ASLE_EXT_OFFSET - OPREGION_VBT_OFFSET)
 
 /* header fields */
 #define OPREGION_H_SIGNATURE 0x00 /* "IntelGraphicsMem" */
@@ -30,10 +37,12 @@
 #define OPREGION_H_OVER 0x14 /* version */
 #define OPREGION_H_MBOXES 0x58 /* supported mailboxes */
 #define OPREGION_H_DVER 0x5C
-#define OPREGION_H_RVDA 0xBA /* extended VBT address (2.0+), u64 */
-#define OPREGION_H_RVDS 0xC2 /* its size, u32 */
-#define OPREGION_MBOX_VBT (1 << 3)
+/* The raw VBT's address (2.0+) and size, in the ASLE mailbox (#3) --
+ * not in the header. */
+#define ASLE_RVDA 0xBA /* u64: physical (2.0) or from the OpRegion (2.1+) */
+#define ASLE_RVDS 0xC2 /* u32 */
 #define OPREGION_MBOX_ASLE (1 << 2)
+#define OPREGION_MBOX_ASLE_EXT (1 << 4) /* mailbox 5 in use: the VBT ends before it */
 
 /* mailbox 1 (ACPI) */
 #define ACPI_DRDY 0x00 /* driver ready */
@@ -64,6 +73,26 @@
 #define ASLE_ARDY_READY 1
 #define ASLE_TCHE_BLC_EN (1 << 1)
 
+/* The card's SPI flash: the region the option ROM is in, its offset
+ * there, and the address/trigger pair that reads a dword of it. */
+#define PRIMARY_SPI_TRIGGER 0x102040
+#define PRIMARY_SPI_ADDRESS 0x102080
+#define PRIMARY_SPI_REGIONID 0x102084
+#define SPI_STATIC_REGIONS 0x102090
+#define OPTIONROM_SPI_REGIONID_MASK 0xffu
+#define OROM_OFFSET 0x1020c0
+#define OROM_OFFSET_MASK (0x1fu << 16)
+#define SPI_OROM_SIZE 0x200000u
+
+/* The VBT header: "$VBT" and the name (20 bytes), version, header size,
+ * the VBT's size (u16 at 24), checksum, reserved, the BDB's offset (u32
+ * at 28); the BDB header is 22 bytes. */
+#define VBT_SIGNATURE_LE 0x54425624u /* "$VBT" */
+#define VBT_H_SIZE 24
+#define VBT_H_BDB_OFFSET 28
+#define VBT_HEADER_LEN 48
+#define BDB_HEADER_LEN 22
+
 static uint32_t rd32(const void *base, uint32_t off)
 {
 	return *(volatile const uint32_t *)((const uint8_t *)base + off);
@@ -74,11 +103,58 @@ static void wr32(void *base, uint32_t off, uint32_t v)
 	*(volatile uint32_t *)((uint8_t *)base + off) = v;
 }
 
-int intel_opregion_init(struct i915_device *i915)
+static uint32_t spi_read32(struct i915_device *i915, uint32_t rom_offset, uint32_t off)
+{
+	i915_write32(i915, PRIMARY_SPI_ADDRESS, rom_offset + off);
+	return i915_read32(i915, PRIMARY_SPI_TRIGGER);
+}
+
+/* A discrete card's VBT from the option ROM in its SPI flash: the first
+ * "$VBT" in the image, checked to be whole before it is copied. */
+static void vbt_from_spi(struct i915_device *i915)
+{
+	struct intel_opregion *op = &i915->display.opregion;
+	uint32_t region = i915_read32(i915, SPI_STATIC_REGIONS) & OPTIONROM_SPI_REGIONID_MASK;
+	uint32_t rom, off, size, bdb;
+
+	i915_write32(i915, PRIMARY_SPI_REGIONID, region);
+	rom = i915_read32(i915, OROM_OFFSET) & OROM_OFFSET_MASK;
+	for (off = 0; off < SPI_OROM_SIZE; off += 4)
+		if (spi_read32(i915, rom, off) == VBT_SIGNATURE_LE)
+			break;
+	if (off >= SPI_OROM_SIZE) {
+		kprintf("[drm] i915: no VBT in the card's option ROM\n");
+		return;
+	}
+	if (VBT_HEADER_LEN > SPI_OROM_SIZE - off) {
+		kprintf("[drm] i915: the option ROM's VBT header is incomplete\n");
+		return;
+	}
+	size = spi_read32(i915, rom, off + VBT_H_SIZE) & 0xffff;
+	bdb = spi_read32(i915, rom, off + VBT_H_BDB_OFFSET);
+	if (size < VBT_HEADER_LEN || size > SPI_OROM_SIZE - off || bdb > size ||
+	    BDB_HEADER_LEN > size - bdb) {
+		kprintf("[drm] i915: the option ROM's VBT is incomplete (%u bytes, BDB at %u)\n",
+			size, bdb);
+		return;
+	}
+	op->rom_vbt = kalloc((size + 3) & ~3u);
+	if (!op->rom_vbt)
+		return;
+	for (uint32_t i = 0; i < size; i += 4) {
+		uint32_t v = spi_read32(i915, rom, off + i);
+		for (uint32_t b = 0; b < 4 && i + b < size; b++)
+			op->rom_vbt[i + b] = (uint8_t)(v >> (8 * b));
+	}
+	op->vbt = op->rom_vbt;
+	op->vbt_size = size;
+	i915_dbg("[drm] i915: VBT from the SPI flash's option ROM (%u bytes)\n", size);
+}
+
+static int opregion_map(struct i915_device *i915)
 {
 	struct intel_opregion *op = &i915->display.opregion;
 
-	mm_memset(op, 0, sizeof(*op));
 	uint32_t asls = pci_cfg_read32_dev(i915->pci, I915_PCI_ASLS);
 	if (!asls) {
 		kprintf("[drm] i915: no ACPI OpRegion (ASLS is zero)\n");
@@ -112,10 +188,13 @@ int intel_opregion_init(struct i915_device *i915)
 	uint32_t major = (over >> 24) & 0xff;
 	uint32_t minor = (over >> 16) & 0xff;
 
-	/* The VBT: in mailbox 4 unless the header (2.0+) points elsewhere. */
-	if (major >= 2) {
-		uint64_t rvda = *(volatile const uint64_t *)(hdr + OPREGION_H_RVDA);
-		uint32_t rvds = rd32(hdr, OPREGION_H_RVDS);
+	/* The VBT: where the ASLE mailbox (2.0+) points, when it does and
+	 * what is there is a VBT; else mailbox 4. */
+	if (major >= 2 && op->asle_present) {
+		const uint8_t *asle = hdr + OPREGION_ASLE_OFFSET;
+		uint64_t rvda = (uint64_t)rd32(asle, ASLE_RVDA) |
+				((uint64_t)rd32(asle, ASLE_RVDA + 4) << 32);
+		uint32_t rvds = rd32(asle, ASLE_RVDS);
 		if (rvda && rvds) {
 			/* 2.1+: relative to the OpRegion; 2.0: absolute */
 			uint64_t phys = (major > 2 || minor >= 1) ? op->phys + rvda : rvda;
@@ -123,26 +202,51 @@ int intel_opregion_init(struct i915_device *i915)
 			op->rvda_virt = (void *)mm_map_mmio_flags(phys, pages,
 								  MM_MMIO_UC);
 			if (op->rvda_virt) {
-				op->rvda_pages = pages;
-				op->vbt = op->rvda_virt;
-				op->vbt_size = rvds;
+				/* (the mapping keeps the address's offset in its page) */
+				const uint8_t *v = (const uint8_t *)op->rvda_virt;
+				if (v[0] == '$' && v[1] == 'V' && v[2] == 'B' && v[3] == 'T') {
+					op->rvda_pages = pages;
+					op->vbt = v;
+					op->vbt_size = rvds;
+				} else {
+					kprintf("[drm] i915: the VBT the OpRegion points at (%llx, %u bytes) is not one\n",
+						(unsigned long long)phys, rvds);
+					mm_unmap_mmio((uint64_t)op->rvda_virt, pages);
+					op->rvda_virt = NULL;
+				}
 			}
 		}
 	}
-	if (!op->vbt && (mboxes & OPREGION_MBOX_VBT)) {
-		op->vbt = hdr + OPREGION_VBT_OFFSET;
-		op->vbt_size = OPREGION_VBT_SIZE;
-	}
-	if (op->vbt && !(op->vbt[0] == '$' && op->vbt[1] == 'V' &&
-			 op->vbt[2] == 'B' && op->vbt[3] == 'T')) {
-		kprintf("[drm] i915: OpRegion VBT has no signature\n");
-		op->vbt = NULL;
-		op->vbt_size = 0;
+	if (!op->vbt) {
+		/* mailbox 4, up to mailbox 5 when that is in use (some boards'
+		 * VBT runs on into it when it is not) */
+		const uint8_t *v = hdr + OPREGION_VBT_OFFSET;
+		if (v[0] == '$' && v[1] == 'V' && v[2] == 'B' && v[3] == 'T') {
+			op->vbt = v;
+			op->vbt_size = ((mboxes & OPREGION_MBOX_ASLE_EXT) ? OPREGION_ASLE_EXT_OFFSET :
+									  OPREGION_SIZE) -
+				       OPREGION_VBT_OFFSET;
+		} else {
+			kprintf("[drm] i915: the OpRegion carries no VBT\n");
+		}
 	}
 	i915_dbg("[drm] i915: OpRegion %u.%u at %llx, mailboxes %x%s%s\n",
 		major, minor, (unsigned long long)op->phys, mboxes,
 		op->vbt ? ", VBT" : ", no VBT", op->asle_present ? ", ASLE" : "");
 	return 0;
+}
+
+int intel_opregion_init(struct i915_device *i915)
+{
+	struct intel_opregion *op = &i915->display.opregion;
+	int rc;
+
+	mm_memset(op, 0, sizeof(*op));
+	rc = opregion_map(i915);
+	/* without the OpRegion's, a discrete card's own VBT */
+	if (!op->vbt && (i915->info->flags & I915_INFO_IS_DGFX))
+		vbt_from_spi(i915);
+	return rc;
 }
 
 void intel_opregion_fini(struct i915_device *i915)
@@ -158,6 +262,10 @@ void intel_opregion_fini(struct i915_device *i915)
 		op->virt = NULL;
 	}
 	op->vbt = NULL;
+	if (op->rom_vbt) {
+		kfree(op->rom_vbt);
+		op->rom_vbt = NULL;
+	}
 }
 
 void intel_opregion_driver_ready(struct i915_device *i915)

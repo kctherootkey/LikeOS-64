@@ -12,6 +12,7 @@
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 
@@ -29,6 +30,10 @@ int i915_rps_init(struct i915_device *i915)
 		return 0;
 	if (i915->info->flags & I915_INFO_GUC_MANDATORY)
 		return 0; /* the GuC's SLPC runs the clocks there */
+	/* Cherryview's requests go to the P-unit over the sideband, not
+	 * to these registers: its clock stays as the firmware set it */
+	if (i915->info->platform == I915_PLATFORM_CHERRYVIEW)
+		return 0;
 	uint32_t cap = i915_read32(i915, GEN6_RP_STATE_CAP);
 	uint32_t rp0 = cap & 0xff;
 	uint32_t rp1 = (cap >> 8) & 0xff;
@@ -61,8 +66,18 @@ int i915_rps_init(struct i915_device *i915)
 /* What the GT is running at right now, in MHz (0 when unknown). */
 uint32_t i915_rps_current_mhz(struct i915_device *i915)
 {
-	if (i915->info->gen < 9 || i915->info->gen > 12)
+	if (i915_is_legacy(i915))
+		return i915_legacy_rps_current_mhz(i915);
+	if (i915->info->gen < 9)
 		return 0;
+	/* Gen12 moved the status (and reads zero while the GT sleeps);
+	 * Meteor Lake and every part after it report the frequency in a
+	 * mirror of its own */
+	if (i915->gt_ip >= I915_IP(12, 70))
+		return rps_mhz(i915, i915_read32(i915, MTL_MIRROR_TARGET_WP1) & MTL_CAGF_MASK);
+	if (i915->info->gen_x10 >= 120)
+		return rps_mhz(i915, (i915_read32(i915, GEN12_RPSTAT1) & GEN12_CAGF_MASK) >>
+					     GEN12_CAGF_SHIFT);
 	uint32_t st = i915_read32(i915, GEN6_RPSTAT1);
 	return rps_mhz(i915, (st & GEN9_CAGF_MASK) >> GEN9_CAGF_SHIFT);
 }

@@ -63,10 +63,19 @@ enum i915_platform {
 	I915_PLATFORM_ALDERLAKE_P,
 	I915_PLATFORM_DG2,
 	I915_PLATFORM_METEORLAKE,
-	/* Xe2 / Xe3 (named, not driven) */
+	/* Xe2 / Xe3 / Xe3P */
 	I915_PLATFORM_LUNARLAKE,
 	I915_PLATFORM_BATTLEMAGE,
 	I915_PLATFORM_PANTHERLAKE,
+	I915_PLATFORM_WILDCATLAKE,
+	I915_PLATFORM_NOVALAKE_S,
+	I915_PLATFORM_NOVALAKE_P,
+	/* data-centre compute parts, no display (named, not driven) */
+	I915_PLATFORM_PONTEVECCHIO,
+	I915_PLATFORM_CRESCENTISLAND,
+	/* generation 1 (named, not driven) */
+	I915_PLATFORM_I810,
+	I915_PLATFORM_I815,
 	I915_PLATFORM_COUNT
 };
 
@@ -88,11 +97,14 @@ enum i915_platform {
 #define I915_INFO_HAS_SNOOP (1u << 14) /* no LLC but snooped system memory */
 #define I915_INFO_HAS_PCH (1u << 15) /* south display in a PCH */
 #define I915_INFO_HAS_DP_MST (1u << 16)
+/* The display is driven, the GT is not: no firmware or no support for
+ * its GT yet, rendering stays off (a "display only" device). */
+#define I915_INFO_GT_UNSUPPORTED (1u << 17)
 
 /* DPLL models the display code chooses between. */
 enum i915_dpll_model {
 	I915_DPLL_NONE = 0,
-	I915_DPLL_LEGACY, /* pre-Gen9 (not driven) */
+	I915_DPLL_LEGACY, /* pre-Gen9: per-pipe PLLs, Haswell/Broadwell WRPLL/SPLL */
 	I915_DPLL_SKL, /* DPLL0..3, LCPLL/WRPLL dividers */
 	I915_DPLL_BXT, /* per-port PHY PLLs */
 	I915_DPLL_CNL, /* combo PLLs, DCO */
@@ -115,12 +127,52 @@ enum i915_dpll_model {
 #define I915_ENGINE_CCS2 (1u << 10)
 #define I915_ENGINE_CCS3 (1u << 11)
 
+/* Variants of a platform the workarounds and the stepping tables tell
+ * apart, by device id (i915_step.c). */
+enum i915_subplatform {
+	I915_SUBPLATFORM_NONE = 0,
+	I915_SUBPLATFORM_TGL_UY, /* Tiger Lake UP3/UP4 (the GT2 ids) */
+	I915_SUBPLATFORM_ADL_N, /* Alder Lake-N */
+	I915_SUBPLATFORM_RPL_S, /* Raptor Lake-S (Alder Lake-S graphics) */
+	I915_SUBPLATFORM_RPL_P, /* Raptor Lake-P (Alder Lake-P graphics) */
+	I915_SUBPLATFORM_RPL_U, /* Raptor Lake-U (Alder Lake-P graphics) */
+	I915_SUBPLATFORM_DG2_G10,
+	I915_SUBPLATFORM_DG2_G11,
+	I915_SUBPLATFORM_DG2_G12,
+	I915_SUBPLATFORM_BMG_G21, /* Battlemage G21 */
+};
+
+/* Silicon steppings: A0, A1, A2, A3, B0 ... J3, four to a letter, in the
+ * order the hardware was revised.  0 means unknown; FUTURE is a revision
+ * newer than any the tables name. */
+#define I915_STEP_NONE 0
+#define I915_STEP(letter, n) (1 + ((letter) - 'A') * 4 + (n))
+#define I915_STEP_A0 I915_STEP('A', 0)
+#define I915_STEP_A1 I915_STEP('A', 1)
+#define I915_STEP_A2 I915_STEP('A', 2)
+#define I915_STEP_B0 I915_STEP('B', 0)
+#define I915_STEP_B1 I915_STEP('B', 1)
+#define I915_STEP_C0 I915_STEP('C', 0)
+#define I915_STEP_D0 I915_STEP('D', 0)
+#define I915_STEP_D1 I915_STEP('D', 1)
+#define I915_STEP_E0 I915_STEP('E', 0)
+#define I915_STEP_F0 I915_STEP('F', 0)
+#define I915_STEP_G0 I915_STEP('G', 0)
+#define I915_STEP_H0 I915_STEP('H', 0)
+#define I915_STEP_I1 I915_STEP('I', 1)
+#define I915_STEP_J0 I915_STEP('J', 0)
+#define I915_STEP_FUTURE I915_STEP('K', 0)
+#define I915_STEP_FOREVER (I915_STEP_FUTURE + 1)
+
+/* An IP version as one number: version * 100 + release (12.70 = 1270). */
+#define I915_IP(ver, rel) ((ver) * 100 + (rel))
+
 struct intel_device_info {
 	const char *name; /* platform name, "Skylake" */
 	uint8_t platform; /* enum i915_platform */
-	uint8_t gen; /* 2..30 */
-	uint16_t gen_x10; /* 80, 90, 100, 110, 120, 125, 127, 200, 300 */
-	uint8_t display_ver; /* 9, 10, 11, 12, 13, 14, 20 */
+	uint8_t gen; /* 2..35 */
+	uint16_t gen_x10; /* 80, 90, 100, 110, 120, 125, 127, 200, 201, 300, 351 */
+	uint8_t display_ver; /* 9, 10, 11, 12, 13, 14, 20, 30, 35 */
 	uint8_t gt; /* GT level as sold, 0 when it does not apply */
 	uint8_t num_pipes; /* display pipes */
 	uint8_t ppgtt_bits; /* 32 or 48 */
@@ -130,10 +182,11 @@ struct intel_device_info {
 	uint8_t pad;
 	uint32_t flags; /* I915_INFO_* */
 	uint32_t engine_mask; /* I915_ENGINE_* */
-	uint32_t dma_mask_bits; /* 39 on Gen8/9, 48 on Gen11+ */
-	const char *dmc_fw; /* firmware file names under /lib/firmware/i915 */
+	uint32_t dma_mask_bits; /* 39 on Gen8/9, 46 from Xe_HP on */
+	const char *dmc_fw; /* firmware file names, relative to /lib/firmware */
 	const char *guc_fw;
 	const char *huc_fw;
+	const char *gsc_fw; /* the GSC's own firmware, where the part has one */
 };
 
 struct i915_pci_id {

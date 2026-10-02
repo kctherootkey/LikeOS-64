@@ -1,19 +1,30 @@
-// LikeOS -- the display PLLs of Skylake.
+// LikeOS -- the display PLLs of Skylake (and Kaby, Coffee, Comet Lake),
+// and the dispatcher that picks each generation's PLL code.
 //
-// Four of them.  DPLL0 belongs to CDCLK (the firmware programmed it and
-// it is not touched); DPLL1-3 are shared between ports.  For DisplayPort a
-// PLL is programmed with a link rate from a fixed list; for HDMI with
-// dividers computed from the pixel clock.  A port is then routed to its
-// PLL through DPLL_CTRL2.  PLLs are refcounted so two ports at the same
-// DP link rate share one.
+// Four of them.  DPLL0 belongs to CDCLK: it runs at a VCO of 8100 or
+// 8640 MHz the CDCLK code chose, and is never switched off here.  Its
+// link-rate field can still be changed while it runs, as long as the
+// new rate comes from the same VCO, and that is how an embedded panel is
+// clocked: from DPLL0.  DPLL1-3 serve the other ports; for DisplayPort
+// a PLL is given a link rate from a fixed list, for HDMI it runs in
+// "HDMI mode" with dividers worked out from the pixel clock
+// (intel_dpll_calc.c).  A port is routed to its PLL through DPLL_CTRL2.
+// Two ports asking for the same configuration share one PLL.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2006-2023 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_dpll_calc.h>
+#include <kernel/dev/gpu/i915/intel_dpll_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
+
+#define SKL_NUM_DPLLS 4
 
 static uint32_t dpll_ctl_reg(int pll)
 {
@@ -60,9 +71,23 @@ static uint32_t link_rate_of_code(uint32_t code)
 	}
 }
 
+/* The two VCOs DPLL0 runs at: 8640 MHz for the 2.16 and 4.32 GHz rates,
+ * 8100 MHz for the others. */
+static int rate_needs_vco_8640(uint32_t link_rate_khz)
+{
+	return link_rate_khz / 2 == 108000 || link_rate_khz / 2 == 216000;
+}
+
 int skl_dpll_rate_supported(uint32_t link_rate_khz)
 {
 	return link_rate_code(link_rate_khz) >= 0;
+}
+
+/* The WRPLL's reference clock in HDMI mode: CDCLK's (24 MHz on Skylake;
+ * Gen11+ combo PLLs take theirs from DSSM, which the CDCLK code reads). */
+static uint32_t skl_ref_khz(struct i915_device *i915)
+{
+	return i915->display.cdclk_ref_khz ? i915->display.cdclk_ref_khz : 24000;
 }
 
 int skl_dpll_init(struct i915_device *i915)
@@ -73,14 +98,15 @@ int skl_dpll_init(struct i915_device *i915)
 	for (int i = 0; i < INTEL_MAX_DPLLS; i++) {
 		d->dpll[i].in_use = 0;
 		d->dpll[i].is_hdmi = 0;
+		d->dpll[i].ssc = 0;
 		d->dpll[i].link_rate_khz = 0;
+		d->dpll[i].cfgcr1 = d->dpll[i].cfgcr2 = 0;
 	}
-	/* DPLL0 is CDCLK's: reserved.  Its rate field is the CDCLK source
-	 * frequency; as a link rate it is twice that. */
-	d->dpll[0].in_use = 1;
-	d->dpll[0].link_rate_khz = d->dpll0_link_rate_khz * 2;
+	/* DPLL0 is CDCLK's and always on; in_use counts the panels on it. */
+	d->dpll[0].link_rate_khz =
+		link_rate_of_code((ctrl1 & DPLL_CTRL1_LINK_RATE_MASK(0)) >> DPLL_CTRL1_LINK_RATE_SHIFT(0));
 	i915_dbg("[drm] i915: DPLL_CTRL1 %08x, DPLL_CTRL2 %08x, status %08x\n",
-		ctrl1, i915_read32(i915, DPLL_CTRL2), i915_read32(i915, DPLL_STATUS));
+		 ctrl1, i915_read32(i915, DPLL_CTRL2), i915_read32(i915, DPLL_STATUS));
 	return 0;
 }
 
@@ -107,9 +133,30 @@ static void dpll_disable(struct i915_device *i915, int pll)
 	kprintf("[drm] i915: DPLL%d still locked after being switched off\n", pll);
 }
 
-static int dpll_enable_wait(struct i915_device *i915, int pll)
+/* The PLL's six bits of DPLL_CTRL1: override, link rate, SSC, HDMI
+ * mode.  Spread spectrum is never asked of these PLLs. */
+static void write_ctrl1(struct i915_device *i915, int pll, uint32_t bits)
+{
+	uint32_t v = i915_read32(i915, DPLL_CTRL1);
+	v &= ~(DPLL_CTRL1_HDMI_MODE(pll) | DPLL_CTRL1_SSC(pll) | DPLL_CTRL1_LINK_RATE_MASK(pll));
+	v |= bits;
+	i915_write32(i915, DPLL_CTRL1, v);
+	(void)i915_read32(i915, DPLL_CTRL1);
+}
+
+/* DPLL1-3: CTRL1, the configuration words (zero for DisplayPort), on,
+ * lock within 5 ms. */
+static int dpll_enable(struct i915_device *i915, int pll, uint32_t ctrl1_bits, uint32_t cfgcr1,
+		       uint32_t cfgcr2)
 {
 	uint32_t reg = dpll_ctl_reg(pll);
+
+	dpll_disable(i915, pll);
+	write_ctrl1(i915, pll, ctrl1_bits);
+	i915_write32(i915, DPLL_CFGCR1(pll), cfgcr1);
+	i915_write32(i915, DPLL_CFGCR2(pll), cfgcr2);
+	(void)i915_read32(i915, DPLL_CFGCR1(pll));
+	(void)i915_read32(i915, DPLL_CFGCR2(pll));
 	i915_write32(i915, reg, i915_read32(i915, reg) | LCPLL_PLL_ENABLE);
 	for (int t = 0; t < 500; t++) {
 		if (i915_read32(i915, DPLL_STATUS) & DPLL_LOCK(pll))
@@ -120,51 +167,73 @@ static int dpll_enable_wait(struct i915_device *i915, int pll)
 	return -ETIMEDOUT;
 }
 
-int skl_dpll_get_dp(struct i915_device *i915, int port, uint32_t link_rate_khz,
-		     int ssc)
+/* The embedded panel's output on a port, if that is what is there. */
+static struct intel_output *edp_output(struct i915_device *i915, int port)
+{
+	for (int i = 0; i < i915->display.nout; i++)
+		if (i915->display.outputs[i].port == port && i915->display.outputs[i].is_edp)
+			return &i915->display.outputs[i];
+	return NULL;
+}
+
+/* An embedded panel is clocked from DPLL0: the link-rate field is set
+ * for the panel's rate while the PLL keeps running at CDCLK's VCO.  That
+ * only works for a rate from the same VCO; the CDCLK code picked the
+ * VCO, and a panel at a rate of the other one goes on a shared PLL
+ * instead. */
+static int skl_edp_on_dpll0(struct i915_device *i915, uint32_t link_rate_khz, int code)
+{
+	struct intel_display *d = &i915->display;
+	uint32_t ctrl1 = i915_read32(i915, DPLL_CTRL1);
+	uint32_t cur = (ctrl1 & DPLL_CTRL1_LINK_RATE_MASK(0)) >> DPLL_CTRL1_LINK_RATE_SHIFT(0);
+	int vco_8640 = cur == DPLL_CTRL1_LINK_RATE_1080 || cur == DPLL_CTRL1_LINK_RATE_2160;
+
+	if (!(i915_read32(i915, LCPLL1_CTL) & LCPLL_PLL_ENABLE))
+		return -ENODEV;
+	if (vco_8640 != rate_needs_vco_8640(link_rate_khz)) {
+		i915_dbg("[drm] i915: DPLL0 runs at a %s MHz VCO; the panel's %u kHz takes a shared PLL\n",
+			 vco_8640 ? "8640" : "8100", link_rate_khz);
+		return -ERANGE;
+	}
+	if (d->dpll[0].in_use && d->dpll[0].link_rate_khz != link_rate_khz)
+		return -EBUSY;
+	write_ctrl1(i915, 0, DPLL_CTRL1_OVERRIDE(0) | DPLL_CTRL1_LINK_RATE((uint32_t)code, 0));
+	d->dpll[0].in_use++;
+	d->dpll[0].is_hdmi = 0;
+	d->dpll[0].link_rate_khz = link_rate_khz;
+	return 0;
+}
+
+int skl_dpll_get_dp(struct i915_device *i915, int port, uint32_t link_rate_khz, int ssc)
 {
 	struct intel_display *d = &i915->display;
 	int code = link_rate_code(link_rate_khz);
-	(void)port;
+	(void)ssc; /* these PLLs are not spread */
 
 	if (code < 0)
 		return -EINVAL;
-	/* DPLL0 serves a panel too when CDCLK's source happens to be this
-	 * link rate -- its rate field is half the link, like every other. */
-	if (d->dpll[0].link_rate_khz == link_rate_khz && !ssc) {
-		d->dpll[0].in_use++;
+	if (edp_output(i915, port) && skl_edp_on_dpll0(i915, link_rate_khz, code) == 0)
 		return 0;
-	}
-	/* A shared PLL already at this rate? */
-	for (int i = 1; i < INTEL_MAX_DPLLS; i++) {
+	/* a shared PLL already at this rate? */
+	for (int i = 1; i < SKL_NUM_DPLLS; i++) {
 		if (d->dpll[i].in_use && !d->dpll[i].is_hdmi &&
-		    d->dpll[i].link_rate_khz == link_rate_khz &&
-		    d->dpll[i].ssc == ssc) {
+		    d->dpll[i].link_rate_khz == link_rate_khz) {
 			d->dpll[i].in_use++;
 			return i;
 		}
 	}
-	for (int i = 1; i < INTEL_MAX_DPLLS; i++) {
+	for (int i = 1; i < SKL_NUM_DPLLS; i++) {
 		if (d->dpll[i].in_use)
 			continue;
-		dpll_disable(i915, i);
-		uint32_t ctrl1 = i915_read32(i915, DPLL_CTRL1);
-		ctrl1 &= ~(DPLL_CTRL1_HDMI_MODE(i) | DPLL_CTRL1_SSC(i) |
-			   DPLL_CTRL1_LINK_RATE_MASK(i));
-		ctrl1 |= DPLL_CTRL1_OVERRIDE(i) |
-			 DPLL_CTRL1_LINK_RATE((uint32_t)code, i);
-		if (ssc)
-			ctrl1 |= DPLL_CTRL1_SSC(i);
-		i915_write32(i915, DPLL_CTRL1, ctrl1);
-		(void)i915_read32(i915, DPLL_CTRL1);
-		if (dpll_enable_wait(i915, i) != 0)
+		if (dpll_enable(i915, i, DPLL_CTRL1_OVERRIDE(i) | DPLL_CTRL1_LINK_RATE((uint32_t)code, i),
+				0, 0) != 0)
 			return -EIO;
 		d->dpll[i].in_use = 1;
 		d->dpll[i].is_hdmi = 0;
-		d->dpll[i].ssc = ssc;
+		d->dpll[i].ssc = 0;
 		d->dpll[i].link_rate_khz = link_rate_khz;
-		i915_dbg("[drm] i915: DPLL%d at %u kHz%s for port %c\n", i, link_rate_khz,
-			ssc ? " with spread spectrum" : "", 'A' + port);
+		d->dpll[i].cfgcr1 = d->dpll[i].cfgcr2 = 0;
+		i915_dbg("[drm] i915: DPLL%d at %u kHz for port %c\n", i, link_rate_khz, 'A' + port);
 		return i;
 	}
 	return -ENOSPC;
@@ -177,13 +246,12 @@ uint32_t skl_dpll_port_link_rate(struct i915_device *i915, int port)
 	uint32_t ctrl1;
 	uint32_t pll;
 
-	if (ctrl2 & DPLL_CTRL2_DDI_CLK_OFF(port))
+	if (!(ctrl2 & DPLL_CTRL2_DDI_SEL_OVERRIDE(port)) || (ctrl2 & DPLL_CTRL2_DDI_CLK_OFF(port)))
 		return 0;
-	pll = (ctrl2 & DPLL_CTRL2_DDI_CLK_SEL_MASK(port)) >>
-	      DPLL_CTRL2_DDI_CLK_SEL_SHIFT(port);
-	if (pll >= INTEL_MAX_DPLLS)
+	pll = (ctrl2 & DPLL_CTRL2_DDI_CLK_SEL_MASK(port)) >> DPLL_CTRL2_DDI_CLK_SEL_SHIFT(port);
+	if (pll >= SKL_NUM_DPLLS)
 		return 0;
-	if (!(i915_read32(i915, DPLL_STATUS) & DPLL_LOCK((int)pll)))
+	if (!(i915_read32(i915, dpll_ctl_reg((int)pll)) & LCPLL_PLL_ENABLE))
 		return 0;
 	ctrl1 = i915_read32(i915, DPLL_CTRL1);
 	if (ctrl1 & DPLL_CTRL1_HDMI_MODE(pll))
@@ -192,141 +260,42 @@ uint32_t skl_dpll_port_link_rate(struct i915_device *i915, int port)
 				 DPLL_CTRL1_LINK_RATE_SHIFT(pll));
 }
 
-/* HDMI: the WRPLL divider search.  The DCO must land between 8400 and
- * 9600 MHz with one of three central frequencies; the AFE clock (5x the
- * pixel clock) is the DCO over p0*p1*p2.  Dividers as the hardware
- * accepts them: p0 in {1,2,3,7}, p2 in {1,2,3,5}, p1 = 1..255, product
- * even from 4 to 98 (or 1, 2, 3, 5, 7 with p1 = 1). */
-static const uint32_t dco_central[3] = { 8400000, 9000000, 9600000 };
-
-struct wrpll_params {
-	uint32_t dco_freq; /* kHz */
-	uint32_t central;
-	uint32_t p0, p1, p2;
-	uint64_t deviation;
-};
-
-static int split_divider(uint32_t div, uint32_t *p0, uint32_t *p1, uint32_t *p2)
-{
-	static const uint32_t even[] = { 4, 6, 8, 10, 12, 14, 16, 18, 20,
-					 24, 28, 30, 32, 36, 40, 42, 44,
-					 48, 52, 54, 56, 60, 64, 66, 68,
-					 70, 72, 76, 78, 80, 84, 88, 90,
-					 92, 96, 98 };
-	(void)even;
-	if (div == 3) { *p0 = 3; *p1 = 1; *p2 = 1; return 1; }
-	if (div == 5) { *p0 = 5 ; *p1 = 1; *p2 = 1; return 1; }
-	if (div == 7) { *p0 = 7; *p1 = 1; *p2 = 1; return 1; }
-	if (div == 1 || div == 2)
-		return 0;
-	if (div % 2)
-		return 0;
-	uint32_t half = div / 2;
-	if (half == 1) { *p0 = 2; *p1 = 1; *p2 = 1; return 1; }
-	if (half == 2) { *p0 = 2; *p1 = 1; *p2 = 2; return 1; }
-	if (half == 3) { *p0 = 3; *p1 = 1; *p2 = 2; return 1; }
-	if (half == 5) { *p0 = 5; *p1 = 1; *p2 = 2; return 1; }
-	if (half == 7) { *p0 = 7; *p1 = 1; *p2 = 2; return 1; }
-	if (half % 2 == 0) { *p0 = 2; *p1 = half / 2; *p2 = 2; return 1; }
-	if (half % 3 == 0) { *p0 = 3; *p1 = half / 3; *p2 = 2; return 1; }
-	if (half % 7 == 0) { *p0 = 7; *p1 = half / 7; *p2 = 2; return 1; }
-	return 0;
-}
-
-static int wrpll_compute(uint32_t clock_khz, struct wrpll_params *best)
-{
-	uint32_t afe = clock_khz * 5;
-	static const uint32_t dividers[] = { 3, 5, 7, 4, 6, 8, 10, 12, 14, 16, 18,
-					     20, 24, 28, 30, 32, 36, 40, 42, 44,
-					     48, 52, 54, 56, 60, 64, 66, 68, 70,
-					     72, 76, 78, 80, 84, 88, 90, 92, 96,
-					     98 };
-	best->deviation = ~0ULL;
-	for (unsigned c = 0; c < 3; c++) {
-		for (unsigned i = 0; i < sizeof(dividers) / sizeof(dividers[0]); i++) {
-			uint32_t div = dividers[i];
-			uint32_t p0, p1, p2;
-			uint64_t dco = (uint64_t)afe * div;
-			if (dco < 8400000 || dco > 9600000)
-				continue;
-			if (!split_divider(div, &p0, &p1, &p2))
-				continue;
-			uint64_t dev = dco > dco_central[c] ? dco - dco_central[c] :
-							       dco_central[c] - dco;
-			/* allowed: +1% / -6% of the central frequency */
-			if (dco > dco_central[c] && dev * 100 > dco_central[c])
-				continue;
-			if (dco < dco_central[c] && dev * 100 > (uint64_t)dco_central[c] * 6)
-				continue;
-			if (dev < best->deviation) {
-				best->deviation = dev;
-				best->dco_freq = (uint32_t)dco;
-				best->central = c;
-				best->p0 = p0;
-				best->p1 = p1;
-				best->p2 = p2;
-			}
-		}
-	}
-	return best->deviation == ~0ULL ? -1 : 0;
-}
-
+/* HDMI: the WRPLL in HDMI mode, dividers from skl_wrpll_calc(). */
 int skl_dpll_get_hdmi(struct i915_device *i915, int port, uint32_t clock_khz)
 {
 	struct intel_display *d = &i915->display;
-	struct wrpll_params p;
-	(void)port;
+	struct skl_wrpll_params p;
 
-	if (wrpll_compute(clock_khz, &p) != 0) {
+	if (skl_wrpll_calc(clock_khz, skl_ref_khz(i915), &p) != 0) {
 		kprintf("[drm] i915: no WRPLL dividers for %u kHz\n", clock_khz);
 		return -EINVAL;
 	}
-	for (int i = 1; i < INTEL_MAX_DPLLS; i++) {
+	uint32_t cfgcr1 = DPLL_CFGCR1_FREQ_ENABLE | DPLL_CFGCR1_DCO_FRACTION(p.dco_fraction) |
+			  p.dco_integer;
+	uint32_t cfgcr2 = DPLL_CFGCR2_QDIV_RATIO(p.qdiv_ratio) | DPLL_CFGCR2_QDIV_MODE(p.qdiv_mode) |
+			  DPLL_CFGCR2_KDIV(p.kdiv) | DPLL_CFGCR2_PDIV(p.pdiv) | p.central_freq;
+
+	for (int i = 1; i < SKL_NUM_DPLLS; i++) {
+		if (d->dpll[i].in_use && d->dpll[i].is_hdmi && d->dpll[i].cfgcr1 == cfgcr1 &&
+		    d->dpll[i].cfgcr2 == cfgcr2) {
+			d->dpll[i].in_use++;
+			return i;
+		}
+	}
+	for (int i = 1; i < SKL_NUM_DPLLS; i++) {
 		if (d->dpll[i].in_use)
 			continue;
-		dpll_disable(i915, i);
-		/* DCO integer and fractional parts of dco/24MHz */
-		uint32_t dco_int = p.dco_freq / 24000;
-		uint32_t dco_frac = (uint32_t)(((uint64_t)(p.dco_freq % 24000) << 15) / 24000);
-		uint32_t cfgcr1 = DPLL_CFGCR1_FREQ_ENABLE |
-				  DPLL_CFGCR1_DCO_FRACTION(dco_frac) | dco_int;
-		uint32_t pdiv, kdiv, qdiv_mode = 0, qdiv = 1;
-		switch (p.p0) {
-		case 1: pdiv = 0; break;
-		case 2: pdiv = 1; break;
-		case 3: pdiv = 2; break;
-		case 7: pdiv = 4; break;
-		default: pdiv = 1; break;
-		}
-		switch (p.p2) {
-		case 5: kdiv = 0; break;
-		case 2: kdiv = 1; break;
-		case 3: kdiv = 2; break;
-		default: kdiv = 3; break;
-		}
-		if (p.p1 != 1) {
-			qdiv_mode = 1;
-			qdiv = p.p1;
-		}
-		uint32_t cfgcr2 = DPLL_CFGCR2_QDIV_RATIO(qdiv) |
-				  DPLL_CFGCR2_QDIV_MODE(qdiv_mode) |
-				  DPLL_CFGCR2_KDIV(kdiv) | DPLL_CFGCR2_PDIV(pdiv) |
-				  p.central;
-		uint32_t ctrl1 = i915_read32(i915, DPLL_CTRL1);
-		ctrl1 &= ~(DPLL_CTRL1_SSC(i) | DPLL_CTRL1_LINK_RATE_MASK(i));
-		ctrl1 |= DPLL_CTRL1_OVERRIDE(i) | DPLL_CTRL1_HDMI_MODE(i);
-		i915_write32(i915, DPLL_CTRL1, ctrl1);
-		i915_write32(i915, DPLL_CFGCR1(i), cfgcr1);
-		i915_write32(i915, DPLL_CFGCR2(i), cfgcr2);
-		(void)i915_read32(i915, DPLL_CFGCR2(i));
-		if (dpll_enable_wait(i915, i) != 0)
+		if (dpll_enable(i915, i, DPLL_CTRL1_OVERRIDE(i) | DPLL_CTRL1_HDMI_MODE(i), cfgcr1,
+				cfgcr2) != 0)
 			return -EIO;
 		d->dpll[i].in_use = 1;
 		d->dpll[i].is_hdmi = 1;
 		d->dpll[i].ssc = 0;
-		d->dpll[i].link_rate_khz = clock_khz;
+		d->dpll[i].link_rate_khz = skl_wrpll_khz(cfgcr1, cfgcr2, skl_ref_khz(i915));
 		d->dpll[i].cfgcr1 = cfgcr1;
 		d->dpll[i].cfgcr2 = cfgcr2;
+		i915_dbg("[drm] i915: DPLL%d in HDMI mode at %u kHz for port %c (%08x/%08x)\n", i,
+			 d->dpll[i].link_rate_khz, 'A' + port, cfgcr1, cfgcr2);
 		return i;
 	}
 	return -ENOSPC;
@@ -336,10 +305,11 @@ void skl_dpll_put(struct i915_device *i915, int pll)
 {
 	struct intel_display *d = &i915->display;
 
-	if (pll < 0 || pll >= INTEL_MAX_DPLLS)
+	if (pll < 0 || pll >= SKL_NUM_DPLLS)
 		return;
 	if (d->dpll[pll].in_use > 0)
 		d->dpll[pll].in_use--;
+	/* DPLL0 keeps running for CDCLK */
 	if (pll == 0 || d->dpll[pll].in_use)
 		return;
 	uint32_t reg = dpll_ctl_reg(pll);
@@ -368,22 +338,184 @@ void skl_dpll_unroute_port(struct i915_device *i915, int port)
 /* ---- the model dispatcher ------------------------------------------------------ */
 /*
  * The display code above is Skylake's.  The other generations have their
- * PLLs in intel_dpll_bxt.c (Broxton/Gemini Lake), intel_dpll_icl.c (Ice
- * Lake and Tiger Lake's combo ports) and intel_dpll_hsw.c
- * (Haswell/Broadwell); a Type-C port's clock is intel_tc.c's.  These
- * entry points pick by the display model so the pipe code
- * (intel_display.c) calls one thing.
+ * PLLs in intel_dpll_bxt.c (Broxton/Gemini Lake), intel_dpll_icl.c (the
+ * combo ports of Ice Lake and later) and intel_dpll_hsw.c
+ * (Haswell/Broadwell); a Type-C port's clock is intel_tc.c's, Meteor
+ * Lake's and DG2's are the PHYs' own.  These entry points pick by the
+ * display model so the pipe code (intel_display.c) calls one thing.
  */
-#include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_snps_phy.h>
+
+/* Meteor Lake, DG2: every port has its PHY's own PLL, found through the
+ * output on the port. */
+static struct intel_output *port_output(struct i915_device *i915, int port)
+{
+	for (int i = 0; i < i915->display.nout; i++)
+		if (i915->display.outputs[i].port == port)
+			return &i915->display.outputs[i];
+	return NULL;
+}
+
+static int is_icl_tgl(struct i915_device *i915)
+{
+	return i915->display.model == INTEL_DISPLAY_ICL || i915->display.model == INTEL_DISPLAY_TGL;
+}
+
+/* Haswell ULX parts stop at 2.7 GHz. */
+static int is_hsw_ulx(struct i915_device *i915)
+{
+	return i915->info->platform == I915_PLATFORM_HASWELL &&
+	       (i915->devid == 0x0A0E || i915->devid == 0x0A1E);
+}
 
 int intel_dpll_rate_supported(struct i915_device *i915, uint32_t link_rate_khz)
 {
 	switch (i915->display.model) {
-	case INTEL_DISPLAY_BDW: return hsw_dpll_rate_supported(link_rate_khz);
+	case INTEL_DISPLAY_MTL:
+		/* the C10 ports' list; the C20 ones are a superset */
+		return mtl_phy_rate_supported(i915, PORT_A, link_rate_khz);
+	case INTEL_DISPLAY_DG2:
+		return dg2_phy_rate_supported(i915, PORT_A, link_rate_khz);
+	case INTEL_DISPLAY_BDW:
+		if (is_hsw_ulx(i915) && link_rate_khz > 270000)
+			return 0;
+		return hsw_dpll_rate_supported(link_rate_khz);
 	case INTEL_DISPLAY_BXT: return bxt_dpll_rate_supported(link_rate_khz);
 	case INTEL_DISPLAY_ICL:
 	case INTEL_DISPLAY_TGL: return icl_dpll_rate_supported(link_rate_khz);
 	default: return skl_dpll_rate_supported(link_rate_khz);
+	}
+}
+
+/* The fastest DisplayPort link a port of these generations takes: Ice
+ * and Tiger Lake drive 8.1 GHz from a combo PHY only for an embedded
+ * panel, Elkhart/Jasper Lake only for an external sink; Rocket Lake,
+ * Alder Lake and DG1 everywhere. */
+static uint32_t icl_max_link_rate(struct i915_device *i915, const struct intel_output *o)
+{
+	int platform = i915->info->platform;
+
+	if (platform == I915_PLATFORM_ROCKETLAKE || platform == I915_PLATFORM_ALDERLAKE_S ||
+	    platform == I915_PLATFORM_ALDERLAKE_P || platform == I915_PLATFORM_DG1)
+		return 810000;
+	if (platform == I915_PLATFORM_ELKHARTLAKE || platform == I915_PLATFORM_JASPERLAKE)
+		return o->is_edp ? 540000 : 810000;
+	if (!o->is_tc && !o->is_edp)
+		return 540000;
+	return 810000;
+}
+
+int intel_dpll_output_rate_supported(struct i915_device *i915, const struct intel_output *o,
+				     uint32_t link_rate_khz)
+{
+	if (!o)
+		return intel_dpll_rate_supported(i915, link_rate_khz);
+	switch (i915->display.model) {
+	case INTEL_DISPLAY_MTL:
+		return mtl_phy_rate_supported(i915, o->port, link_rate_khz);
+	case INTEL_DISPLAY_DG2:
+		return dg2_phy_rate_supported(i915, o->port, link_rate_khz);
+	case INTEL_DISPLAY_ICL:
+	case INTEL_DISPLAY_TGL:
+		if (link_rate_khz > icl_max_link_rate(i915, o))
+			return 0;
+		/* A Type-C port's own PLL keeps its DCO at 8.1 GHz for
+		 * DisplayPort, and the Thunderbolt PLL has four outputs:
+		 * the four standard rates, no intermediate ones. */
+		if (o->is_tc)
+			return link_rate_khz == 162000 || link_rate_khz == 270000 ||
+			       link_rate_khz == 540000 || link_rate_khz == 810000;
+		return icl_dpll_rate_supported(link_rate_khz);
+	default:
+		return intel_dpll_rate_supported(i915, link_rate_khz);
+	}
+}
+
+/* The PHY's code for a link rate in DDI_BUF_CTL (Alder Lake-P). */
+static uint32_t ddi_buf_phy_link_rate(uint32_t link_rate_khz)
+{
+	switch (link_rate_khz) {
+	case 216000: return GEN11_DDI_BUF_PHY_LINK_RATE(4);
+	case 243000: return GEN11_DDI_BUF_PHY_LINK_RATE(5);
+	case 270000: return GEN11_DDI_BUF_PHY_LINK_RATE(1);
+	case 324000: return GEN11_DDI_BUF_PHY_LINK_RATE(6);
+	case 432000: return GEN11_DDI_BUF_PHY_LINK_RATE(7);
+	case 540000: return GEN11_DDI_BUF_PHY_LINK_RATE(2);
+	case 810000: return GEN11_DDI_BUF_PHY_LINK_RATE(3);
+	default: return GEN11_DDI_BUF_PHY_LINK_RATE(0); /* 1.62 GHz */
+	}
+}
+
+uint32_t intel_dpll_ddi_buf_ctl_bits(struct i915_device *i915, const struct intel_output *o,
+				     uint32_t *mask)
+{
+	uint32_t v = 0;
+
+	*mask = 0;
+	if (!o->is_tc || i915->info->display_ver < 11 || i915->info->display_ver > 13 ||
+	    !is_icl_tgl(i915))
+		return 0;
+	if (i915->info->platform == I915_PLATFORM_ALDERLAKE_P) {
+		*mask |= GEN11_DDI_BUF_PHY_LINK_RATE_MASK;
+		v |= ddi_buf_phy_link_rate(o->link_rate_khz);
+		/* the PHY is the display's, outside Thunderbolt mode */
+		if (o->tc_mode != INTEL_TC_TBT_ALT)
+			v |= GEN11_DDI_BUF_CTL_TC_PHY_OWNERSHIP;
+	}
+	/* The lane enables are staggered by at least 100 ns: the link
+	 * symbols (10 bits each) in 100 ns at this rate, rounded up. */
+	*mask |= GEN11_DDI_BUF_LANE_STAGGER_DELAY_MASK;
+	v |= GEN11_DDI_BUF_LANE_STAGGER_DELAY((o->link_rate_khz + 10 * 1000 - 1) / (10 * 1000));
+	return v;
+}
+
+/* ---- HDMI: what the PLLs and PHYs can carry -------------------------------------- */
+
+uint32_t intel_dpll_hdmi_max_tmds_khz(struct i915_device *i915)
+{
+	if (i915->info->display_ver >= 13 || i915->info->platform == I915_PLATFORM_ALDERLAKE_S)
+		return 600000;
+	if (i915->info->display_ver >= 10)
+		return 594000;
+	return 300000; /* Haswell to Skylake and Broxton */
+}
+
+int intel_dpll_hdmi_clock_valid(struct i915_device *i915, const struct intel_output *o,
+				uint32_t clock_khz)
+{
+	int platform = i915->info->platform;
+
+	if (clock_khz < 25000 || clock_khz > intel_dpll_hdmi_max_tmds_khz(i915))
+		return -ERANGE;
+	/* the frequencies each PLL cannot synthesise */
+	if (platform == I915_PLATFORM_GEMINILAKE && clock_khz > 446666 && clock_khz < 480000)
+		return -ERANGE;
+	if ((platform == I915_PLATFORM_GEMINILAKE || platform == I915_PLATFORM_BROXTON) &&
+	    clock_khz > 223333 && clock_khz < 240000)
+		return -ERANGE;
+	if (is_icl_tgl(i915) && o && !o->is_tc && clock_khz > 500000 && clock_khz < 533200)
+		return -ERANGE;
+	if (is_icl_tgl(i915) && o && o->is_tc && clock_khz > 500000 && clock_khz < 532800)
+		return -ERANGE;
+	/* and the divider search has to come up with something */
+	switch (i915->display.model) {
+	case INTEL_DISPLAY_SKL: {
+		struct skl_wrpll_params p;
+		return skl_wrpll_calc(clock_khz, skl_ref_khz(i915), &p) ? -ERANGE : 0;
+	}
+	case INTEL_DISPLAY_BXT: {
+		struct bxt_pll_dividers b;
+		return bxt_hdmi_dividers(clock_khz, &b) ? -ERANGE : 0;
+	}
+	case INTEL_DISPLAY_ICL:
+	case INTEL_DISPLAY_TGL: {
+		struct icl_pll_params p;
+		if (o && o->is_tc)
+			return intel_tc_pll_clock_ok(i915, clock_khz, 0) ? 0 : -ERANGE;
+		return icl_combo_hdmi_params(clock_khz, skl_ref_khz(i915), &p) ? -ERANGE : 0;
+	}
+	default:
+		return 0;
 	}
 }
 
@@ -394,6 +526,8 @@ int intel_dpll_init(struct i915_device *i915)
 	case INTEL_DISPLAY_BXT: return bxt_dpll_init(i915);
 	case INTEL_DISPLAY_ICL:
 	case INTEL_DISPLAY_TGL: return icl_dpll_init(i915);
+	case INTEL_DISPLAY_MTL: return 0; /* the PHYs: mtl_phy_init() */
+	case INTEL_DISPLAY_DG2: return 0; /* the PHYs: dg2_phy_init() */
 	default: return skl_dpll_init(i915);
 	}
 }
@@ -407,13 +541,26 @@ static struct intel_output *tc_output(struct i915_device *i915, int port)
 	return NULL;
 }
 
-static int is_tc_pll(int pll)
+/* A PLL id handed out by intel_tc.c: the Thunderbolt PLL, or a Type-C
+ * port's own (slots after the combo PLLs; only parts with Type-C PHYs
+ * have them -- on the others those slots are combo PLLs). */
+static int is_tc_pll(struct i915_device *i915, int pll)
 {
+	if (!(i915->info->flags & I915_INFO_HAS_TC_PHY))
+		return 0;
 	return pll == INTEL_TBT_PLL_ID || (pll >= INTEL_TC_PLL_BASE && pll < INTEL_MAX_DPLLS);
 }
 
 int intel_dpll_get_dp(struct i915_device *i915, int port, uint32_t link_rate_khz, int ssc)
 {
+	if (i915->display.model == INTEL_DISPLAY_MTL) {
+		struct intel_output *po = port_output(i915, port);
+		return po ? mtl_phy_pll_get_dp(i915, po, link_rate_khz, ssc) : -ENODEV;
+	}
+	if (i915->display.model == INTEL_DISPLAY_DG2) {
+		struct intel_output *po = port_output(i915, port);
+		return po ? dg2_phy_pll_get_dp(i915, po, link_rate_khz, ssc) : -ENODEV;
+	}
 	struct intel_output *o = tc_output(i915, port);
 	if (o)
 		return intel_tc_dpll_get_dp(i915, o, link_rate_khz, ssc);
@@ -428,6 +575,14 @@ int intel_dpll_get_dp(struct i915_device *i915, int port, uint32_t link_rate_khz
 
 int intel_dpll_get_hdmi(struct i915_device *i915, int port, uint32_t clock_khz)
 {
+	if (i915->display.model == INTEL_DISPLAY_MTL) {
+		struct intel_output *po = port_output(i915, port);
+		return po ? mtl_phy_pll_get_hdmi(i915, po, clock_khz) : -ENODEV;
+	}
+	if (i915->display.model == INTEL_DISPLAY_DG2) {
+		struct intel_output *po = port_output(i915, port);
+		return po ? dg2_phy_pll_get_hdmi(i915, po, clock_khz) : -ENODEV;
+	}
 	struct intel_output *o = tc_output(i915, port);
 	if (o)
 		return intel_tc_dpll_get_hdmi(i915, o, clock_khz);
@@ -442,8 +597,15 @@ int intel_dpll_get_hdmi(struct i915_device *i915, int port, uint32_t clock_khz)
 
 void intel_dpll_put(struct i915_device *i915, int pll)
 {
-	if ((i915->display.model == INTEL_DISPLAY_ICL || i915->display.model == INTEL_DISPLAY_TGL) &&
-	    is_tc_pll(pll)) {
+	if (i915->display.model == INTEL_DISPLAY_MTL) {
+		mtl_phy_pll_put(i915, pll);
+		return;
+	}
+	if (i915->display.model == INTEL_DISPLAY_DG2) {
+		dg2_phy_pll_put(i915, pll);
+		return;
+	}
+	if (is_icl_tgl(i915) && is_tc_pll(i915, pll)) {
 		intel_tc_dpll_put(i915, pll);
 		return;
 	}
@@ -458,6 +620,21 @@ void intel_dpll_put(struct i915_device *i915, int pll)
 
 void intel_dpll_route_port(struct i915_device *i915, int port, int pll)
 {
+	if (i915->display.model == INTEL_DISPLAY_MTL || i915->display.model == INTEL_DISPLAY_DG2) {
+		/* enabling the PHY's PLL is what clocks the port */
+		struct intel_output *po = port_output(i915, port);
+		int lanes = 4;
+		(void)pll;
+		if (!po)
+			return;
+		if (po->type == INTEL_OUTPUT_DP || po->type == INTEL_OUTPUT_EDP)
+			lanes = po->lane_count ? po->lane_count : 4;
+		if ((i915->display.model == INTEL_DISPLAY_MTL ? mtl_phy_pll_enable(i915, po, lanes) :
+								dg2_phy_pll_enable(i915, po, lanes)))
+			kprintf("[drm] i915: port %s: the PHY's PLL did not lock\n",
+				intel_port_name(i915, port));
+		return;
+	}
 	struct intel_output *o = tc_output(i915, port);
 	if (o) {
 		intel_tc_route_port(i915, o, pll);
@@ -474,6 +651,14 @@ void intel_dpll_route_port(struct i915_device *i915, int port, int pll)
 
 void intel_dpll_unroute_port(struct i915_device *i915, int port)
 {
+	if (i915->display.model == INTEL_DISPLAY_MTL || i915->display.model == INTEL_DISPLAY_DG2) {
+		struct intel_output *po = port_output(i915, port);
+		if (po && i915->display.model == INTEL_DISPLAY_MTL)
+			mtl_phy_pll_disable(i915, po);
+		else if (po)
+			dg2_phy_pll_disable(i915, po);
+		return;
+	}
 	struct intel_output *o = tc_output(i915, port);
 	if (o) {
 		intel_tc_unroute_port(i915, o);
@@ -490,6 +675,14 @@ void intel_dpll_unroute_port(struct i915_device *i915, int port)
 
 uint32_t intel_dpll_port_link_rate(struct i915_device *i915, int port)
 {
+	if (i915->display.model == INTEL_DISPLAY_MTL) {
+		struct intel_output *po = port_output(i915, port);
+		return po ? mtl_phy_port_link_rate(i915, po) : 0;
+	}
+	if (i915->display.model == INTEL_DISPLAY_DG2) {
+		struct intel_output *po = port_output(i915, port);
+		return po ? dg2_phy_port_link_rate(i915, po) : 0;
+	}
 	struct intel_output *o = tc_output(i915, port);
 	if (o)
 		return intel_tc_port_link_rate(i915, o);

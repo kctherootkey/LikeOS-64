@@ -6,11 +6,20 @@
 // VBT's minimum keeps the panel from being turned all the way off by a
 // low setting.
 //
+// Broxton and the PCHs from Cannon Point on (Meteor Point and the south
+// display of Lunar Lake and later parts included) have the Broxton kind
+// of PWM, two controllers where the part has two panel sequencers; the
+// VBT names the panel's.  Broxton's second controller
+// comes out on the utility pin.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2021-2025 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_xelpdp_regs.h>
 #include <kernel/fs/sysfs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
@@ -23,7 +32,20 @@
 static int bl_controller(struct i915_device *i915)
 {
 	struct intel_vbt *vbt = &i915->display.vbt;
-	return (vbt->backlight_valid && vbt->backlight_controller == 1) ? 1 : 0;
+	int c = vbt->backlight_valid ? vbt->backlight_controller : 0;
+
+	if (i915->display.model == INTEL_DISPLAY_BXT)
+		return c == 1 ? 1 : 0;
+	/* Cannon Point and DG1/DG2 have one; Ice Point to Alder Point a
+	 * second where the board wired the second sequencer's pins out;
+	 * Meteor Point and Lunar Lake's kind two */
+	if (c != 1)
+		return 0;
+	if (i915->pch == I915_PCH_MTP || i915->pch == I915_PCH_LNL)
+		return 1;
+	if (i915->pch >= I915_PCH_ICP && i915->pch <= I915_PCH_ADP)
+		return (i915_read32(i915, SOUTH_CHICKEN1) & ICP_SECOND_PPS_IO_SELECT) ? 1 : 0;
+	return 0;
 }
 
 /* The level the panel comes up at.
@@ -92,12 +114,22 @@ int intel_backlight_init(struct i915_device *i915)
 	uint32_t freq = ctl2 >> 16;
 	uint32_t duty = ctl2 & 0xffff;
 
-	/* The PWM period in raw-clock cycles: what the firmware set, else
-	 * from the VBT frequency (the PCH counts 128 or 16 raw clocks per
-	 * unit, chosen by the granularity chicken bit). */
+	/* The PWM period in units of 16 or 128 clocks of the PWM's own
+	 * clock: what the firmware set, else from the VBT frequency.  Sunrise
+	 * and Kaby Point count a 24 MHz clock, by 128 when the chicken bit
+	 * asks for the alternate increment; Lynx/Wildcat Point count by 16
+	 * when theirs does, 135 MHz on the H parts and 24 MHz on LP. */
 	if (!freq && vbt->backlight_valid && vbt->backlight_pwm_hz) {
-		uint32_t gran = (i915_read32(i915, SOUTH_CHICKEN2) & LPT_PWM_GRANULARITY) ? 16 : 128;
-		freq = d->rawclk_khz * 1000 / (gran * vbt->backlight_pwm_hz);
+		uint32_t clock_khz = 24000, gran;
+		if (i915->pch == I915_PCH_LPT || i915->pch == I915_PCH_WPT) {
+			gran = (i915_read32(i915, SOUTH_CHICKEN2) & LPT_PWM_GRANULARITY) ? 16 : 128;
+			if ((i915->pch_devid & 0xff00) != 0x9c00)
+				clock_khz = 135000;
+		} else {
+			gran = (i915_read32(i915, SOUTH_CHICKEN1) & SPT_PWM_GRANULARITY) ? 128 : 16;
+		}
+		freq = (clock_khz * 1000 + gran * vbt->backlight_pwm_hz / 2) /
+		       (gran * vbt->backlight_pwm_hz);
 	}
 	if (!freq)
 		freq = 1000; /* something sane if the VBT says nothing */
@@ -146,10 +178,20 @@ void intel_backlight_enable(struct i915_device *i915, struct intel_output *o)
 {
 	struct intel_display *d = &i915->display;
 	struct intel_vbt *vbt = &d->vbt;
-	(void)o;
 
 	if (d->bl_bxt) {
 		int c = bl_controller(i915);
+		if (d->model == INTEL_DISPLAY_BXT && c == 1) {
+			/* the second controller drives the utility pin, which
+			 * follows the panel's pipe */
+			uint32_t u = i915_read32(i915, UTIL_PIN_CTL);
+			if (u & UTIL_PIN_ENABLE)
+				i915_write32(i915, UTIL_PIN_CTL, u & ~UTIL_PIN_ENABLE);
+			u = (vbt->backlight_valid && vbt->backlight_active_low) ? UTIL_PIN_POLARITY : 0;
+			i915_write32(i915, UTIL_PIN_CTL,
+				     u | UTIL_PIN_PIPE(o && o->pipe >= 0 ? o->pipe : 0) |
+					     UTIL_PIN_MODE_PWM | UTIL_PIN_ENABLE);
+		}
 		uint32_t ctl = i915_read32(i915, BXT_BLC_PWM_CTL(c));
 		if (ctl & BXT_BLC_PWM_ENABLE)
 			i915_write32(i915, BXT_BLC_PWM_CTL(c), ctl & ~BXT_BLC_PWM_ENABLE);
@@ -197,6 +239,9 @@ void intel_backlight_disable(struct i915_device *i915, struct intel_output *o)
 		uint32_t ctl = i915_read32(i915, BXT_BLC_PWM_CTL(c));
 		i915_write32(i915, BXT_BLC_PWM_CTL(c), ctl & ~BXT_BLC_PWM_ENABLE);
 		(void)i915_read32(i915, BXT_BLC_PWM_CTL(c));
+		if (d->model == INTEL_DISPLAY_BXT && c == 1)
+			i915_write32(i915, UTIL_PIN_CTL,
+				     i915_read32(i915, UTIL_PIN_CTL) & ~UTIL_PIN_ENABLE);
 		d->bl_enabled = 0;
 		return;
 	}

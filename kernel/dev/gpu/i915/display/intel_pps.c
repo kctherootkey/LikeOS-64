@@ -6,11 +6,20 @@
 // wrong is a panel that shows nothing or one that is damaged, so the
 // VBT values are used when present and conservative ones otherwise.
 //
+// Broxton and the PCHs from Ice Point on (Meteor Point, and the south
+// display of Lunar Lake and the parts after it, included; Battlemage has
+// Meteor Point's) have a second sequencer, 0x100 above the first, for a
+// second panel; the VBT says which one the panel is on by naming its
+// backlight controller.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2020-2025 Intel Corporation
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_xelpdp_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
@@ -50,9 +59,59 @@ static void delay_100us(uint32_t units)
 		lapic_delay_us(units * 100);
 }
 
+/* How many sequencers the part has. */
+static int num_pps(struct i915_device *i915)
+{
+	if (i915->display.model == INTEL_DISPLAY_BXT)
+		return 2;
+	if (i915->pch == I915_PCH_MTP || i915->pch == I915_PCH_LNL)
+		return 2;
+	if (i915->pch == I915_PCH_DG1 || i915->pch == I915_PCH_DG2)
+		return 1;
+	if (i915->pch >= I915_PCH_ICP && i915->pch <= I915_PCH_ADP)
+		return 2;
+	return 1;
+}
+
+/* The second sequencer of the Ice Point family is only wired out when
+ * the board muxed its pins that way. */
+static int pps_valid(struct i915_device *i915, int idx)
+{
+	if (idx == 1 && i915->pch >= I915_PCH_ICP && i915->pch <= I915_PCH_ADP)
+		return !!(i915_read32(i915, SOUTH_CHICKEN1) & ICP_SECOND_PPS_IO_SELECT);
+	return idx >= 0 && idx < num_pps(i915);
+}
+
+/* The sequencer the panel is on: the VBT's (its backlight controller),
+ * else the one with the panel on, else the one with VDD forced, else
+ * the first. */
+static void pick_pps(struct i915_device *i915)
+{
+	struct intel_display *d = &i915->display;
+	uint32_t base = d->model == INTEL_DISPLAY_BXT ? BXT_PP_BASE : PCH_PP_BASE;
+	int n = num_pps(i915), idx = -1;
+
+	if (n > 1 && d->vbt.valid && d->vbt.backlight_valid)
+		idx = d->vbt.backlight_controller;
+	if (idx >= 0 && !pps_valid(i915, idx))
+		idx = -1;
+	for (int i = 0; idx < 0 && i < n; i++)
+		if (pps_valid(i915, i) && (i915_read32(i915, base + i * 0x100) & PP_ON))
+			idx = i;
+	for (int i = 0; idx < 0 && i < n; i++)
+		if (pps_valid(i915, i) &&
+		    (i915_read32(i915, base + i * 0x100 + 4) & EDP_FORCE_VDD))
+			idx = i;
+	if (idx < 0)
+		idx = 0;
+	d->pps_idx = idx;
+	d->pps_base = base + (uint32_t)idx * 0x100;
+}
+
 int intel_pps_init(struct i915_device *i915)
 {
 	struct intel_vbt *vbt = &i915->display.vbt;
+	pick_pps(i915);
 	uint32_t on = i915_read32(i915, PPS(i915, 8));
 	uint32_t off = i915_read32(i915, PPS(i915, 0xc));
 
@@ -114,8 +173,8 @@ int intel_pps_init(struct i915_device *i915)
 		div |= cycle & PANEL_POWER_CYCLE_DELAY_MASK;
 		i915_write32(i915, PPS(i915, 0x10), div);
 	}
-	i915_dbg("[drm] i915: panel power delays T1+T3 %u.%u ms, T8 %u.%u, T9 %u.%u, T10 %u.%u, T12 %u.%u\n",
-		g_pps.t1_t3 / 10, g_pps.t1_t3 % 10, g_pps.t8 / 10, g_pps.t8 % 10,
+	i915_dbg("[drm] i915: panel power sequencer %d: delays T1+T3 %u.%u ms, T8 %u.%u, T9 %u.%u, T10 %u.%u, T12 %u.%u\n",
+		i915->display.pps_idx, g_pps.t1_t3 / 10, g_pps.t1_t3 % 10, g_pps.t8 / 10, g_pps.t8 % 10,
 		g_pps.t9 / 10, g_pps.t9 % 10, g_pps.t10 / 10, g_pps.t10 % 10,
 		g_pps.t11_t12 / 10, g_pps.t11_t12 % 10);
 	return 0;

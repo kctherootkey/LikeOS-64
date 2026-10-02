@@ -71,6 +71,87 @@ struct drm_fence *drm_fence_create_ctx(struct drm_device *dev,
 	return f;
 }
 
+/* ---- merged fences ------------------------------------------------------ */
+
+/* How many merged fences are alive anywhere: while there are none, no
+ * signalling pays for looking for them. */
+static int g_merged_live;
+
+/* Merged fences whose parts have both signalled are signalled, and
+ * their waiters woken; a merged fence of merged fences settles over the
+ * passes.  Called after anything on the device was signalled. */
+static void fence_merged_update(struct drm_device *dev)
+{
+	if (!dev || !__atomic_load_n(&g_merged_live, __ATOMIC_ACQUIRE))
+		return;
+	for (int pass = 0; pass < 16; pass++) {
+		struct drm_fence *wake[64];
+		int nw = 0;
+		uint64_t fl;
+
+		spin_lock_irqsave(&dev->lock, &fl);
+		for (struct drm_fence *f = dev->fences; f && nw < 64; f = f->next) {
+			struct drm_fence *a = f->deps[0], *b = f->deps[1];
+			if (f->signaled || !a)
+				continue;
+			if (!a->signaled || (b && !b->signaled))
+				continue;
+			f->error = a->error ? a->error : (b ? b->error : 0);
+			f->signaled = 1;
+			f->signal_ns = hrtimer_now_ns();
+			drm_fence_get(f);
+			wake[nw++] = f;
+		}
+		spin_unlock_irqrestore(&dev->lock, fl);
+		for (int i = 0; i < nw; i++) {
+			poll_notify_wq(&wake[i]->wq);
+			drm_fence_put(wake[i]);
+		}
+		if (nw == 0)
+			break;
+	}
+}
+
+/* A fence that signals once both `a' and `b' have: one of them when the
+ * other has signalled already, else a new fence that holds both. */
+struct drm_fence *drm_fence_merge(struct drm_fence *a, struct drm_fence *b)
+{
+	struct drm_device *dev = a->dev;
+	uint64_t fl;
+
+	if (a == b || (b->signaled && !b->error)) {
+		drm_fence_get(a);
+		return a;
+	}
+	if (a->signaled && !a->error) {
+		drm_fence_get(b);
+		return b;
+	}
+	struct drm_fence *m = kalloc(sizeof(*m));
+	if (!m)
+		return NULL;
+	mm_memset(m, 0, sizeof(*m));
+	m->refs = 1;
+	m->dev = dev;
+	m->flags = a->flags | b->flags;
+	/* no stream of its own: nothing but its parts signal it */
+	m->context = 0;
+	m->seqno = dev->fence_passed;
+	drm_fence_get(a);
+	drm_fence_get(b);
+	m->deps[0] = a;
+	m->deps[1] = b;
+	wq_head_init(&m->wq, "drm_fence");
+	__atomic_fetch_add(&g_merged_live, 1, __ATOMIC_ACQ_REL);
+	spin_lock_irqsave(&dev->lock, &fl);
+	m->next = dev->fences;
+	dev->fences = m;
+	spin_unlock_irqrestore(&dev->lock, fl);
+	/* both may have signalled meanwhile */
+	fence_merged_update(dev);
+	return m;
+}
+
 void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
 			       uint64_t passed)
 {
@@ -102,6 +183,7 @@ void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
 			break;
 		spin_lock_irqsave(&dev->lock, &fl);
 	}
+	fence_merged_update(dev);
 	poll_notify_wq(&dev->vbl_wq);
 }
 
@@ -160,6 +242,13 @@ void drm_fence_put(struct drm_fence *f)
 		pp = &(*pp)->next;
 	}
 	spin_unlock_irqrestore(&dev->lock, fl);
+	if (f->deps[0]) {
+		/* a merged fence lets go of its parts, outside the lock
+		 * (dropping them takes it) */
+		__atomic_fetch_sub(&g_merged_live, 1, __ATOMIC_ACQ_REL);
+		drm_fence_put(f->deps[0]);
+		drm_fence_put(f->deps[1]);
+	}
 	kfree(f);
 }
 
@@ -170,6 +259,10 @@ void drm_fence_signal(struct drm_fence *f)
 	f->signaled = 1;
 	f->signal_ns = hrtimer_now_ns();
 	poll_notify_wq(&f->wq);
+	fence_merged_update(f->dev);
+	/* whoever waits for "anything on the device" (a buffer's poll) */
+	if (f->dev)
+		poll_notify_wq(&f->dev->vbl_wq);
 }
 
 void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
@@ -216,7 +309,10 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 		nw = 0;
 		for (struct drm_fence *f = dev->fences; f && nw < 64;
 		     f = f->next) {
-			if (!f->signaled && (int32_t)(passed - f->seqno) >= 0) {
+			/* the device-wide sequence only: a stream's fence
+			 * and a merged one are signalled by their own */
+			if (!f->signaled && !f->context && !f->deps[0] &&
+			    (int32_t)(passed - f->seqno) >= 0) {
 				f->signaled = 1;
 				f->signal_ns = hrtimer_now_ns();
 				drm_fence_get(f);
@@ -232,6 +328,7 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 			break;
 		spin_lock_irqsave(&dev->lock, &fl);
 	}
+	fence_merged_update(dev);
 	poll_notify_wq(&dev->vbl_wq); /* SYNCCPU / execbuf throttles */
 }
 
@@ -278,12 +375,42 @@ static void drm_fence_poll(struct drm_fence *f)
  * atomics: a lost sample would skew a diagnostic and nothing else, and this
  * sits on the path whose cost is being measured. */
 
+/* A wait still open after this long is said, with what the driver can
+ * tell about the work behind the fence. */
+#define DRM_FENCE_STUCK_NS (5ULL * 1000000000ULL)
+
+void drm_fence_report_stuck(struct drm_fence *f, uint64_t waited_ns, const char *how)
+{
+	static uint32_t said;
+	task_t *cur = sched_current();
+	struct drm_device *dev = f->dev;
+
+	if (said >= 12)
+		return;
+	said++;
+	kprintf("[drm] %s: process %d (%s) has waited %u s in %s for a fence (stream %llx, seqno %llu%s), still not signalled\n",
+		dev && dev->drv ? dev->drv->name : "drm", cur ? (int)cur->tgid : -1,
+		cur ? cur->comm : "?", (unsigned)(waited_ns / 1000000000ULL), how,
+		(unsigned long long)f->context,
+		(unsigned long long)(f->context ? f->seqno64 : f->seqno),
+		f->deps[0] ? ", merged" : "");
+	if (f->deps[0]) {
+		struct drm_fence *part = !f->deps[0]->signaled ? f->deps[0] : f->deps[1];
+		if (part && !part->signaled)
+			f = part;
+	}
+	if (dev && dev->drv && dev->drv->fence_stuck)
+		dev->drv->fence_stuck(dev, f);
+}
+
 static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 {
 	task_t *cur = sched_current();
-	uint64_t deadline = hrtimer_now_ns() + timeout_ns;
-	uint64_t spin_until = hrtimer_now_ns() + DRM_FENCE_SPIN_NS;
+	uint64_t start = hrtimer_now_ns();
+	uint64_t deadline = start + timeout_ns;
+	uint64_t spin_until = start + DRM_FENCE_SPIN_NS;
 	uint64_t poll_ns = DRM_FENCE_POLL_NS;
+	int stuck_said = 0;
 
 	/* Before anything is decided: the fence may already have passed and
 	 * nobody have noticed. */
@@ -300,6 +427,10 @@ static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 		uint64_t now = hrtimer_now_ns();
 		if (now >= deadline)
 			return -ETIMEDOUT;
+		if (!stuck_said && now - start >= DRM_FENCE_STUCK_NS) {
+			stuck_said = 1;
+			drm_fence_report_stuck(f, now - start, "a fence wait");
+		}
 		if (now < spin_until) {
 			/* Still inside the window where asking is cheaper than
 			 * sleeping. */
@@ -394,20 +525,16 @@ static long sync_file_ioctl(vfs_file_t *f, unsigned long req, void *argp,
 		struct drm_fence *other = drm_fence_from_fd(md.fd2);
 		if (!other)
 			return -EINVAL;
-		/* The merged fence: the later of the two seqnos on one
-		 * device (the only case here), signalled when both are. */
-		struct drm_fence *a = c->fence;
-		struct drm_fence *later = a;
-		if (other->dev == a->dev && (int32_t)(other->seqno - a->seqno) > 0)
-			later = other;
-		struct drm_fence *m = drm_fence_create(later->dev, later->seqno,
-						       a->flags | other->flags);
+		/* The merged fence: signalled when both are.  (Taking the
+		 * later of two sequence numbers is no answer: an engine's
+		 * fences number a stream of their own, and two engines'
+		 * streams say nothing about each other -- a fence made that
+		 * way was signalled from the start.) */
+		struct drm_fence *m = drm_fence_merge(c->fence, other);
 		if (!m) {
 			drm_fence_put(other);
 			return -ENOMEM;
 		}
-		if (a->signaled && other->signaled)
-			drm_fence_signal(m);
 		int fd = drm_fence_export_fd(m, (md.flags & 1) ? 1 : 0);
 		drm_fence_put(m);
 		drm_fence_put(other);

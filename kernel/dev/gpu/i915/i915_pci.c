@@ -1,11 +1,17 @@
 // LikeOS -- the Intel graphics device table.
 //
-// Every integrated and discrete Intel graphics device from the i830 to
-// Panther Lake, by PCI device id, with the descriptor that says which
-// generation it is and what the driver can do with it.  The driver runs
-// generation 8 (Broadwell) through 12 (Alder/Raptor Lake, DG2, Meteor
-// Lake); everything older and the Xe2/Xe3 parts are named in the log and
-// left on the boot framebuffer.
+// Every integrated and discrete Intel graphics device from the i810 to
+// Nova Lake, and the data-centre Ponte Vecchio and Crescent Island parts,
+// by PCI device id, with the descriptor that says which generation it is
+// and what the driver can do with it.  The driver runs generation 2
+// (i830) through Xe3 (Lunar Lake, Battlemage, Panther Lake, Wildcat Lake,
+// Nova Lake-S); Nova Lake-P's display is driven and its GT left off; the
+// i810/i815 and the compute-only parts are named in the log and left on
+// the boot framebuffer.
+//
+// Firmware names are relative to /lib/firmware: "i915/..." for the parts
+// up to Meteor Lake and for every display microcode, "xe/..." for the GuC,
+// HuC and GSC images of Lunar Lake and later.
 //
 // The table is ours: ids and names from the public product lists, in a
 // layout that carries the SKU's GT level and a marketing name where one
@@ -21,27 +27,170 @@
 		.gen_x10 = (gen_) * 10, .flags = I915_INFO_NAME_ONLY,      \
 	}
 
-/* ---- generations 2-7: identified only ---------------------------------- */
+/* ---- generation 1: identified only -------------------------------------- */
 
-static const struct intel_device_info info_i830 = NAME_ONLY(I915_PLATFORM_I830, "i830", 2);
-static const struct intel_device_info info_i845g = NAME_ONLY(I915_PLATFORM_I845G, "i845G", 2);
-static const struct intel_device_info info_i85x = NAME_ONLY(I915_PLATFORM_I85X, "i85x", 2);
-static const struct intel_device_info info_i865g = NAME_ONLY(I915_PLATFORM_I865G, "i865G", 2);
-static const struct intel_device_info info_i915g = NAME_ONLY(I915_PLATFORM_I915G, "i915G", 3);
-static const struct intel_device_info info_i915gm = NAME_ONLY(I915_PLATFORM_I915GM, "i915GM", 3);
-static const struct intel_device_info info_i945g = NAME_ONLY(I915_PLATFORM_I945G, "i945G", 3);
-static const struct intel_device_info info_i945gm = NAME_ONLY(I915_PLATFORM_I945GM, "i945GM", 3);
-static const struct intel_device_info info_g33 = NAME_ONLY(I915_PLATFORM_G33, "G33", 3);
-static const struct intel_device_info info_pineview = NAME_ONLY(I915_PLATFORM_PINEVIEW, "Pineview", 3);
-static const struct intel_device_info info_i965g = NAME_ONLY(I915_PLATFORM_I965G, "i965G", 4);
-static const struct intel_device_info info_i965gm = NAME_ONLY(I915_PLATFORM_I965GM, "i965GM", 4);
-static const struct intel_device_info info_g45 = NAME_ONLY(I915_PLATFORM_G45, "G45", 4);
-static const struct intel_device_info info_gm45 = NAME_ONLY(I915_PLATFORM_GM45, "GM45", 4);
-static const struct intel_device_info info_ironlake = NAME_ONLY(I915_PLATFORM_IRONLAKE, "Ironlake", 5);
-static const struct intel_device_info info_sandybridge = NAME_ONLY(I915_PLATFORM_SANDYBRIDGE, "Sandy Bridge", 6);
-static const struct intel_device_info info_ivybridge = NAME_ONLY(I915_PLATFORM_IVYBRIDGE, "Ivy Bridge", 7);
-static const struct intel_device_info info_valleyview = NAME_ONLY(I915_PLATFORM_VALLEYVIEW, "Valleyview", 7);
-static const struct intel_device_info info_haswell = NAME_ONLY(I915_PLATFORM_HASWELL, "Haswell", 7);
+static const struct intel_device_info info_i810 = NAME_ONLY(I915_PLATFORM_I810, "i810", 1);
+static const struct intel_device_info info_i815 = NAME_ONLY(I915_PLATFORM_I815, "i815", 1);
+
+/* ---- generations 2-7 ----------------------------------------------------
+ *
+ * Ring buffers instead of execution lists, the global GTT (and on Gen6/7
+ * one PPGTT every context shares) instead of per-context spaces: the GT
+ * of these is i915_legacy_*.c, the display intel_legacy_*.c (Haswell's
+ * is the DDI display, with Broadwell's model). */
+
+#define LEGACY_GEN(gen_, x10_, dv_)                                         \
+	.gen = gen_, .gen_x10 = x10_, .display_ver = dv_,                    \
+	.dpll_model = I915_DPLL_LEGACY
+
+static const struct intel_device_info info_i830 = {
+	.name = "i830",
+	.platform = I915_PLATFORM_I830,
+	LEGACY_GEN(2, 20, 2),
+	.num_pipes = 2,
+	.flags = I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0,
+	.dma_mask_bits = 32,
+};
+
+static const struct intel_device_info info_i845g = {
+	.name = "i845G",
+	.platform = I915_PLATFORM_I845G,
+	LEGACY_GEN(2, 20, 2),
+	.num_pipes = 1,
+	.flags = I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0,
+	.dma_mask_bits = 32,
+};
+
+static const struct intel_device_info info_i85x = {
+	.name = "i85x",
+	.platform = I915_PLATFORM_I85X,
+	LEGACY_GEN(2, 20, 2),
+	.num_pipes = 2,
+	.flags = I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0,
+	.dma_mask_bits = 32,
+};
+
+static const struct intel_device_info info_i865g = {
+	.name = "i865G",
+	.platform = I915_PLATFORM_I865G,
+	LEGACY_GEN(2, 20, 2),
+	.num_pipes = 1,
+	.flags = I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0,
+	.dma_mask_bits = 32,
+};
+
+#define GEN3_INFO(platform_, name_, dma_)                                   \
+	{                                                                    \
+		.name = name_, .platform = platform_, LEGACY_GEN(3, 30, 3),  \
+		.num_pipes = 2, .flags = I915_INFO_HAS_SNOOP,                \
+		.engine_mask = I915_ENGINE_RCS0, .dma_mask_bits = dma_,      \
+	}
+
+static const struct intel_device_info info_i915g = GEN3_INFO(I915_PLATFORM_I915G, "i915G", 32);
+static const struct intel_device_info info_i915gm = GEN3_INFO(I915_PLATFORM_I915GM, "i915GM", 32);
+static const struct intel_device_info info_i945g = GEN3_INFO(I915_PLATFORM_I945G, "i945G", 32);
+static const struct intel_device_info info_i945gm = GEN3_INFO(I915_PLATFORM_I945GM, "i945GM", 32);
+static const struct intel_device_info info_g33 = GEN3_INFO(I915_PLATFORM_G33, "G33", 36);
+static const struct intel_device_info info_pineview = GEN3_INFO(I915_PLATFORM_PINEVIEW, "Pineview", 36);
+
+static const struct intel_device_info info_i965g = {
+	.name = "i965G",
+	.platform = I915_PLATFORM_I965G,
+	LEGACY_GEN(4, 40, 4),
+	.num_pipes = 2,
+	.engine_mask = I915_ENGINE_RCS0,
+	.dma_mask_bits = 36,
+};
+
+static const struct intel_device_info info_i965gm = {
+	.name = "i965GM",
+	.platform = I915_PLATFORM_I965GM,
+	LEGACY_GEN(4, 40, 4),
+	.num_pipes = 2,
+	.engine_mask = I915_ENGINE_RCS0,
+	.dma_mask_bits = 36,
+};
+
+static const struct intel_device_info info_g45 = {
+	.name = "G45",
+	.platform = I915_PLATFORM_G45,
+	LEGACY_GEN(4, 40, 4),
+	.num_pipes = 2,
+	.flags = I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0,
+	.dma_mask_bits = 36,
+};
+
+static const struct intel_device_info info_gm45 = {
+	.name = "GM45",
+	.platform = I915_PLATFORM_GM45,
+	LEGACY_GEN(4, 40, 4),
+	.num_pipes = 2,
+	.flags = I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0,
+	.dma_mask_bits = 36,
+};
+
+static const struct intel_device_info info_ironlake = {
+	.name = "Ironlake",
+	.platform = I915_PLATFORM_IRONLAKE,
+	LEGACY_GEN(5, 50, 5),
+	.num_pipes = 2,
+	.flags = I915_INFO_HAS_SNOOP | I915_INFO_HAS_PCH,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0,
+	.dma_mask_bits = 36,
+};
+
+static const struct intel_device_info info_sandybridge = {
+	.name = "Sandy Bridge",
+	.platform = I915_PLATFORM_SANDYBRIDGE,
+	LEGACY_GEN(6, 60, 6),
+	.num_pipes = 2,
+	.ppgtt_bits = 31,
+	.flags = I915_INFO_HAS_LLC | I915_INFO_HAS_PCH,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0 | I915_ENGINE_BCS0,
+	.dma_mask_bits = 40,
+};
+
+static const struct intel_device_info info_ivybridge = {
+	.name = "Ivy Bridge",
+	.platform = I915_PLATFORM_IVYBRIDGE,
+	LEGACY_GEN(7, 70, 7),
+	.num_pipes = 3,
+	.ppgtt_bits = 31,
+	.flags = I915_INFO_HAS_LLC | I915_INFO_HAS_PCH,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0 | I915_ENGINE_BCS0,
+	.dma_mask_bits = 40,
+};
+
+static const struct intel_device_info info_valleyview = {
+	.name = "Valleyview",
+	.platform = I915_PLATFORM_VALLEYVIEW,
+	LEGACY_GEN(7, 70, 7),
+	.num_pipes = 2,
+	.ppgtt_bits = 31,
+	.flags = I915_INFO_IS_LP | I915_INFO_HAS_SNOOP,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0 | I915_ENGINE_BCS0,
+	.dma_mask_bits = 40,
+};
+
+/* The GT of generation 7.5, the DDI display of Broadwell (its DPLLs too:
+ * intel_display.c gives Haswell Broadwell's display model). */
+static const struct intel_device_info info_haswell = {
+	.name = "Haswell",
+	.platform = I915_PLATFORM_HASWELL,
+	LEGACY_GEN(7, 75, 7),
+	.num_pipes = 3,
+	.ppgtt_bits = 31,
+	.flags = I915_INFO_HAS_DDI | I915_INFO_HAS_LLC | I915_INFO_HAS_PCH,
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_VCS0 | I915_ENGINE_BCS0 |
+		       I915_ENGINE_VECS0,
+	.dma_mask_bits = 39,
+};
 
 /* ---- generation 8 ------------------------------------------------------ */
 
@@ -174,6 +323,7 @@ static const struct intel_device_info info_cannonlake = {
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VECS0,
 	.flags = GEN9_CORE_FLAGS | I915_INFO_HAS_COMBO_PHY,
+	.dmc_fw = "i915/cnl_dmc_ver1_07.bin",
 };
 
 /* ---- generation 11 ----------------------------------------------------- */
@@ -204,6 +354,8 @@ static const struct intel_device_info info_elkhartlake = {
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VECS0,
 	.dmc_fw = "i915/icl_dmc_ver1_09.bin",
+	.guc_fw = "i915/ehl_guc_70.1.1.bin",
+	.huc_fw = "i915/ehl_huc_9.0.0.bin",
 };
 
 static const struct intel_device_info info_jasperlake = {
@@ -214,6 +366,9 @@ static const struct intel_device_info info_jasperlake = {
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VECS0,
 	.dmc_fw = "i915/icl_dmc_ver1_09.bin",
+	/* Jasper Lake loads Elkhart Lake's GuC and HuC */
+	.guc_fw = "i915/ehl_guc_70.1.1.bin",
+	.huc_fw = "i915/ehl_huc_9.0.0.bin",
 };
 
 /* ---- generation 12 ----------------------------------------------------- */
@@ -266,8 +421,8 @@ static const struct intel_device_info info_dg1 = {
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VCS2 | I915_ENGINE_VECS0,
 	.dmc_fw = "i915/dg1_dmc_ver2_02.bin",
-	.guc_fw = "i915/dg1_guc_70.1.1.bin",
-	.huc_fw = "i915/dg1_huc_7.9.3.bin",
+	.guc_fw = "i915/dg1_guc_70.bin",
+	.huc_fw = "i915/dg1_huc.bin",
 };
 
 static const struct intel_device_info info_alderlake_s = {
@@ -280,8 +435,9 @@ static const struct intel_device_info info_alderlake_s = {
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VCS2 | I915_ENGINE_VECS0,
 	.dmc_fw = "i915/adls_dmc_ver2_01.bin",
-	.guc_fw = "i915/tgl_guc_70.1.1.bin",
-	.huc_fw = "i915/tgl_huc_7.9.3.bin",
+	/* Alder Lake-S loads Tiger Lake's GuC and HuC */
+	.guc_fw = "i915/tgl_guc_70.bin",
+	.huc_fw = "i915/tgl_huc.bin",
 };
 
 static const struct intel_device_info info_alderlake_p = {
@@ -293,9 +449,10 @@ static const struct intel_device_info info_alderlake_p = {
 	.flags = GEN12_FLAGS | I915_INFO_HAS_TC_PHY,
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VCS2 | I915_ENGINE_VECS0,
-	.dmc_fw = "i915/adlp_dmc_ver2_16.bin",
-	.guc_fw = "i915/adlp_guc_70.1.1.bin",
-	.huc_fw = "i915/tgl_huc_7.9.3.bin",
+	.dmc_fw = "i915/adlp_dmc.bin",
+	/* its own GuC, Tiger Lake's HuC */
+	.guc_fw = "i915/adlp_guc_70.bin",
+	.huc_fw = "i915/tgl_huc.bin",
 };
 
 static const struct intel_device_info info_dg2 = {
@@ -331,19 +488,151 @@ static const struct intel_device_info info_meteorlake = {
 	.dmc_fw = "i915/mtl_dmc.bin",
 	.guc_fw = "i915/mtl_guc_70.bin",
 	.huc_fw = "i915/mtl_huc_gsc.bin",
+	.gsc_fw = "i915/mtl_gsc_1.bin",
 };
 
-/* ---- Xe2 / Xe3: named only --------------------------------------------- */
+/* ---- Xe2, Xe3 and Xe3P ---------------------------------------------------
+ *
+ * The GT submits through the GuC as Meteor Lake's does; its IP versions,
+ * steppings and media GT come from the GMD_ID registers.  Every display
+ * of these is a DDI display with display microcode, Tile4 scanout and MST.
+ * The video engines sit on a standalone media GT where the part has one;
+ * which of the engines named here exist is the fuses' to say. */
 
-static const struct intel_device_info info_lunarlake = NAME_ONLY(I915_PLATFORM_LUNARLAKE, "Lunar Lake", 20);
-static const struct intel_device_info info_battlemage = NAME_ONLY(I915_PLATFORM_BATTLEMAGE, "Battlemage", 20);
-static const struct intel_device_info info_pantherlake = NAME_ONLY(I915_PLATFORM_PANTHERLAKE, "Panther Lake", 30);
+#define XE_DISPLAY_FLAGS                                                   \
+	(I915_INFO_HAS_DDI | I915_INFO_HAS_DMC | I915_INFO_HAS_4TILE |      \
+	 I915_INFO_HAS_DP_MST)
+
+#define XE2_GT_FLAGS                                                       \
+	(I915_INFO_HAS_EXECLISTS | I915_INFO_HAS_GUC |                      \
+	 I915_INFO_GUC_MANDATORY | I915_INFO_HAS_FULL_PPGTT |              \
+	 I915_INFO_HAS_SNOOP)
+
+#define XE2_COMMON                                                         \
+	.ppgtt_bits = 48, .csb_entries = 12, .dpll_model = I915_DPLL_MTL,   \
+	.max_dpll = 8, .dma_mask_bits = 46,                                 \
+	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 |                \
+		       I915_ENGINE_VCS0 | I915_ENGINE_VCS1 |                \
+		       I915_ENGINE_VCS2 | I915_ENGINE_VCS3 |                \
+		       I915_ENGINE_VECS0 | I915_ENGINE_VECS1 |              \
+		       I915_ENGINE_CCS0 | I915_ENGINE_CCS1 |                \
+		       I915_ENGINE_CCS2 | I915_ENGINE_CCS3
+
+/* Lunar Lake: graphics 20.04, media 20.00, display 20.00 */
+static const struct intel_device_info info_lunarlake = {
+	.name = "Lunar Lake",
+	.platform = I915_PLATFORM_LUNARLAKE,
+	.gen = 20, .gen_x10 = 200, .display_ver = 20, .num_pipes = 4,
+	XE2_COMMON,
+	.flags = XE_DISPLAY_FLAGS | I915_INFO_HAS_TC_PHY | I915_INFO_HAS_PCH |
+		 XE2_GT_FLAGS,
+	.dmc_fw = "i915/xe2lpd_dmc.bin",
+	.guc_fw = "xe/lnl_guc_70.bin",
+	.huc_fw = "xe/lnl_huc.bin",
+	.gsc_fw = "xe/lnl_gsc_1.bin",
+};
+
+/* Battlemage: graphics 20.01, media 13.01, display 14.01; discrete, its
+ * own memory, no Type-C PHYs and no south display of a PCH; no GSC
+ * image to load */
+static const struct intel_device_info info_battlemage = {
+	.name = "Battlemage",
+	.platform = I915_PLATFORM_BATTLEMAGE,
+	.gen = 20, .gen_x10 = 201, .display_ver = 14, .num_pipes = 4,
+	XE2_COMMON,
+	.flags = XE_DISPLAY_FLAGS | I915_INFO_IS_DGFX | XE2_GT_FLAGS,
+	.dmc_fw = "i915/bmg_dmc.bin",
+	.guc_fw = "xe/bmg_guc_70.bin",
+	.huc_fw = "xe/bmg_huc.bin",
+};
+
+/* Panther Lake: graphics 30.00/30.01, media 30.00, display 30.00 */
+static const struct intel_device_info info_pantherlake = {
+	.name = "Panther Lake",
+	.platform = I915_PLATFORM_PANTHERLAKE,
+	.gen = 30, .gen_x10 = 300, .display_ver = 30, .num_pipes = 4,
+	XE2_COMMON,
+	.flags = XE_DISPLAY_FLAGS | I915_INFO_HAS_TC_PHY | I915_INFO_HAS_PCH |
+		 XE2_GT_FLAGS,
+	.dmc_fw = "i915/xe3lpd_dmc.bin",
+	.guc_fw = "xe/ptl_guc_70.bin",
+	.huc_fw = "xe/ptl_huc.bin",
+	.gsc_fw = "xe/ptl_gsc_1.bin",
+};
+
+/* Wildcat Lake: Panther Lake's graphics (30.03) and media (30.02) and
+ * GuC/HuC/GSC images, three pipes, its own display release (30.02) with
+ * its own display microcode */
+static const struct intel_device_info info_wildcatlake = {
+	.name = "Wildcat Lake",
+	.platform = I915_PLATFORM_WILDCATLAKE,
+	.gen = 30, .gen_x10 = 300, .display_ver = 30, .num_pipes = 3,
+	XE2_COMMON,
+	.flags = XE_DISPLAY_FLAGS | I915_INFO_HAS_TC_PHY | I915_INFO_HAS_PCH |
+		 XE2_GT_FLAGS,
+	.dmc_fw = "i915/xe3lpd_3002_dmc.bin",
+	.guc_fw = "xe/ptl_guc_70.bin",
+	.huc_fw = "xe/ptl_huc.bin",
+	.gsc_fw = "xe/ptl_gsc_1.bin",
+};
+
+/* Nova Lake-S: Xe3 graphics (30.05) beside the Xe3P display (35.00) and
+ * media (35.00); a GuC image, no HuC or GSC image */
+static const struct intel_device_info info_novalake_s = {
+	.name = "Nova Lake-S",
+	.platform = I915_PLATFORM_NOVALAKE_S,
+	.gen = 30, .gen_x10 = 300, .display_ver = 35, .num_pipes = 4,
+	XE2_COMMON,
+	.flags = XE_DISPLAY_FLAGS | I915_INFO_HAS_TC_PHY | I915_INFO_HAS_PCH |
+		 XE2_GT_FLAGS,
+	.dmc_fw = "i915/xe3p_lpd_dmc.bin",
+	.guc_fw = "xe/nvl_guc_70.bin",
+};
+
+/* Nova Lake-P: Xe3P graphics (35.10) and display (35.00).  No GuC image
+ * is published for it, and its GT keeps its ring state outside the
+ * context image (indirect ring state), which nothing here drives: the
+ * display is driven, rendering stays off. */
+static const struct intel_device_info info_novalake_p = {
+	.name = "Nova Lake-P",
+	.platform = I915_PLATFORM_NOVALAKE_P,
+	.gen = 35, .gen_x10 = 351, .display_ver = 35, .num_pipes = 4,
+	XE2_COMMON,
+	.flags = XE_DISPLAY_FLAGS | I915_INFO_HAS_TC_PHY | I915_INFO_HAS_PCH |
+		 XE2_GT_FLAGS | I915_INFO_GT_UNSUPPORTED,
+	.dmc_fw = "i915/xe3p_lpd_dmc.bin",
+};
+
+/* ---- named only: the data-centre parts ----------------------------------- */
+
+/* A part the driver names but does not drive, with its real graphics IP
+ * (gen_x10 is the version times ten plus the first digit of the release:
+ * 20.01 is 201) and its display IP (0 where it has no display). */
+#define NAMED_IP(platform_, name_, gen_, gen_x10_, display_ver_)           \
+	.name = name_, .platform = platform_, .gen = gen_,                 \
+	.gen_x10 = gen_x10_, .display_ver = display_ver_,                  \
+	.flags = I915_INFO_NAME_ONLY
+
+/* Ponte Vecchio: graphics 12.60, compute only */
+static const struct intel_device_info info_pontevecchio = {
+	NAMED_IP(I915_PLATFORM_PONTEVECCHIO, "Ponte Vecchio", 12, 126, 0),
+};
+
+/* Crescent Island: Xe3P compute graphics (35.11), no display */
+static const struct intel_device_info info_crescentisland = {
+	NAMED_IP(I915_PLATFORM_CRESCENTISLAND, "Crescent Island", 35, 351, 0),
+};
 
 /* ---- the table -------------------------------------------------------- */
 
 #define ID(id_, gt_, name_, info_) { .id = id_, .gt = gt_, .name = name_, .info = &info_ }
 
 static const struct i915_pci_id i915_ids[] = {
+	/* generation 1 */
+	ID(0x7121, 0, "82810", info_i810),
+	ID(0x7123, 0, "82810-DC100", info_i810),
+	ID(0x7125, 0, "82810E", info_i810),
+	ID(0x1132, 0, "82815", info_i815),
 	/* generation 2 */
 	ID(0x3577, 0, "82830M", info_i830),
 	ID(0x2562, 0, "82845G", info_i845g),
@@ -750,11 +1039,28 @@ static const struct i915_pci_id i915_ids[] = {
 	ID(0x7d51, 0, "Arc Graphics", info_meteorlake),
 	ID(0x7d67, 0, "Graphics", info_meteorlake),
 	ID(0x7dd1, 0, "Arc Graphics", info_meteorlake),
-	/* Xe2: Lunar Lake / Battlemage; Xe3: Panther Lake -- named only */
+	ID(0xb640, 0, "Graphics", info_meteorlake),
+	/* generation 12.6: Ponte Vecchio -- named only */
+	ID(0x0b69, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0b6e, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0bd4, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0bd5, 0, "Data Center GPU Max 1550", info_pontevecchio),
+	ID(0x0bd6, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0bd7, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0bd8, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0bd9, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0bda, 0, "Data Center GPU Max 1100", info_pontevecchio),
+	ID(0x0bdb, 0, "Data Center GPU Max 1100", info_pontevecchio),
+	ID(0x0be0, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0be1, 0, "Data Center GPU Max", info_pontevecchio),
+	ID(0x0be5, 0, "Data Center GPU Max", info_pontevecchio),
+	/* Xe2: Lunar Lake / Battlemage; Xe3: Panther Lake / Wildcat Lake;
+	 * Xe3/Xe3P: Nova Lake; Xe3P: Crescent Island -- named only */
 	ID(0x6420, 0, "Arc Graphics", info_lunarlake),
 	ID(0x64a0, 0, "Arc Graphics 140V", info_lunarlake),
 	ID(0x64b0, 0, "Arc Graphics 130V", info_lunarlake),
 	ID(0xe202, 0, "Arc Graphics", info_battlemage),
+	ID(0xe209, 0, "Arc Graphics", info_battlemage),
 	ID(0xe20b, 0, "Arc B580", info_battlemage),
 	ID(0xe20c, 0, "Arc B570", info_battlemage),
 	ID(0xe20d, 0, "Arc Graphics", info_battlemage),
@@ -770,10 +1076,37 @@ static const struct i915_pci_id i915_ids[] = {
 	ID(0xb081, 0, "Arc Graphics", info_pantherlake),
 	ID(0xb082, 0, "Arc Graphics", info_pantherlake),
 	ID(0xb083, 0, "Arc Graphics", info_pantherlake),
+	ID(0xb084, 0, "Graphics", info_pantherlake),
+	ID(0xb085, 0, "Graphics", info_pantherlake),
+	ID(0xb086, 0, "Graphics", info_pantherlake),
+	ID(0xb087, 0, "Graphics", info_pantherlake),
 	ID(0xb08f, 0, "Arc Graphics", info_pantherlake),
 	ID(0xb090, 0, "Arc Graphics", info_pantherlake),
 	ID(0xb0a0, 0, "Arc Graphics", info_pantherlake),
 	ID(0xb0b0, 0, "Arc Graphics", info_pantherlake),
+	ID(0xfd80, 0, "Graphics", info_wildcatlake),
+	ID(0xfd81, 0, "Graphics", info_wildcatlake),
+	ID(0xd740, 0, "Graphics", info_novalake_s),
+	ID(0xd741, 0, "Graphics", info_novalake_s),
+	ID(0xd742, 0, "Graphics", info_novalake_s),
+	ID(0xd743, 0, "Graphics", info_novalake_s),
+	ID(0xd745, 0, "Graphics", info_novalake_s),
+	ID(0xd74a, 0, "Graphics", info_novalake_s),
+	ID(0xd74b, 0, "Graphics", info_novalake_s),
+	ID(0xd750, 0, "Graphics", info_novalake_p),
+	ID(0xd751, 0, "Graphics", info_novalake_p),
+	ID(0xd752, 0, "Graphics", info_novalake_p),
+	ID(0xd753, 0, "Graphics", info_novalake_p),
+	ID(0xd754, 0, "Graphics", info_novalake_p),
+	ID(0xd755, 0, "Graphics", info_novalake_p),
+	ID(0xd756, 0, "Graphics", info_novalake_p),
+	ID(0xd757, 0, "Graphics", info_novalake_p),
+	ID(0xd75f, 0, "Graphics", info_novalake_p),
+	ID(0x674c, 0, "Data Center GPU", info_crescentisland),
+	ID(0x674d, 0, "Data Center GPU", info_crescentisland),
+	ID(0x674e, 0, "Data Center GPU", info_crescentisland),
+	ID(0x674f, 0, "Data Center GPU", info_crescentisland),
+	ID(0x6750, 0, "Data Center GPU", info_crescentisland),
 };
 
 const struct i915_pci_id *i915_pci_lookup(uint16_t device_id)

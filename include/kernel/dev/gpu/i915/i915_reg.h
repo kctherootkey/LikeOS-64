@@ -30,6 +30,12 @@
 #define GGC_GGMS_MASK 0x3 /* GTT size: 1=2MB 2=4MB 3=8MB */
 
 /* ---- identification / fuses --------------------------------------------- */
+/* Cherryview: the GT fuses live in the Gunit -- two subslices, each of
+ * two rows of four units */
+#define CHV_FUSE_GT 0x182168
+#define CHV_FGT_DISABLE_SS0 (1 << 10)
+#define CHV_FGT_DISABLE_SS1 (1 << 11)
+#define CHV_FGT_EU_DIS_SS_SHIFT(ss) (16 + (ss) * 8) /* 8 bits: row 0, then row 1 */
 #define GEN8_FUSE2 0x9120
 #define GEN8_F2_SS_DIS_SHIFT 21
 #define GEN8_F2_SS_DIS_MASK (0x7 << GEN8_F2_SS_DIS_SHIFT)
@@ -94,7 +100,17 @@
 #define FORCEWAKE_MEDIA_VEBOX_GEN11(n) (0xa560 + (n) * 4)
 #define FORCEWAKE_ACK_MEDIA_VEBOX_GEN11(n) (0x0d70 + (n) * 4)
 #define FORCEWAKE_GT_GEN12 0xa188
-#define FORCEWAKE_ACK_GT_MTL 0x0d84 /* Meteor Lake moved the GT ack */
+#define FORCEWAKE_ACK_GT_MTL 0x0dfc /* Meteor Lake moved the GT ack */
+#define FORCEWAKE_REQ_GSC 0xa618 /* Meteor Lake's media GT: the security controller */
+#define FORCEWAKE_ACK_GSC 0x0df8
+/* Cherryview: Valleyview's two domains, render and media */
+#define FORCEWAKE_VLV 0x1300b0
+#define FORCEWAKE_ACK_VLV 0x1300b4
+#define FORCEWAKE_MEDIA_VLV 0x1300b8
+#define FORCEWAKE_ACK_MEDIA_VLV 0x1300bc
+#define GTFIFOCTL 0x120008
+#define GT_FIFO_CTL_BLOCK_ALL_POLICY_STALL (1 << 12)
+#define GT_FIFO_CTL_RC6_POLICY_STALL (1 << 11)
 #define FPGA_DBG 0x42300
 #define FPGA_DBG_RM_NOCLAIM (1 << 31)
 
@@ -635,11 +651,11 @@
 /* ---- hotplug (Sunrise Point family) ------------------------------------------ */
 #define PCH_PORT_HOTPLUG 0xC4030
 #define PORTA_HOTPLUG_ENABLE (1 << 28)
-#define PORTB_HOTPLUG_ENABLE (1 << 12)
-#define PORTC_HOTPLUG_ENABLE (1 << 4)
+#define PORTB_HOTPLUG_ENABLE (1 << 4)
+#define PORTC_HOTPLUG_ENABLE (1 << 12)
 #define PORTD_HOTPLUG_ENABLE (1 << 20)
-#define PORTB_HOTPLUG_STATUS_MASK (3 << 8)
-#define PORTC_HOTPLUG_STATUS_MASK (3 << 0)
+#define PORTB_HOTPLUG_STATUS_MASK (3 << 0)
+#define PORTC_HOTPLUG_STATUS_MASK (3 << 8)
 #define PORTD_HOTPLUG_STATUS_MASK (3 << 16)
 #define PORTA_HOTPLUG_STATUS_MASK (3 << 24)
 #define PCH_PORT_HOTPLUG2 0xC403C
@@ -678,8 +694,8 @@
 #define DDI_BUF_BALANCE_LEG_ENABLE (1u << 31)
 
 /* hotplug pulse filters (PCH_PORT_HOTPLUG); 0 = 2 ms */
-#define PORTB_PULSE_DURATION_MASK (3 << 10)
-#define PORTC_PULSE_DURATION_MASK (3 << 2)
+#define PORTB_PULSE_DURATION_MASK (3 << 2)
+#define PORTC_PULSE_DURATION_MASK (3 << 10)
 #define PORTD_PULSE_DURATION_MASK (3 << 18)
 #define PORT_HOTPLUG_LONG_DETECT(shift) (2u << (shift))
 #define PORT_HOTPLUG_SHORT_DETECT(shift) (1u << (shift))
@@ -1010,7 +1026,7 @@
 #define GEN8_CTX_FORCE_PD_RESTORE (1 << 1)
 #define GEN8_CTX_FORCE_RESTORE (1 << 2)
 #define GEN8_CTX_ADDRESSING_MODE_SHIFT 3
-#define GEN8_CTX_ADDRESSING_MODE_LEGACY32 (0 << 3)
+#define GEN8_CTX_ADDRESSING_MODE_LEGACY32 (1 << 3)
 #define GEN8_CTX_ADDRESSING_MODE_LEGACY64 (3 << 3)
 #define GEN8_CTX_L3LLC_COHERENT (1 << 5)
 #define GEN8_CTX_PRIVILEGE (1 << 8)
@@ -1024,7 +1040,7 @@
 /* the hardware status page: dword indices */
 #define I915_HWS_CSB_BUF0_INDEX 0x10
 #define I915_HWS_CSB_WRITE_INDEX 0x1f
-#define ICL_HWS_CSB_WRITE_INDEX 0x3f
+#define ICL_HWS_CSB_WRITE_INDEX 0x2f /* Gen11 on: after twelve entries */
 #define I915_HWS_SEQNO_INDEX 0x40 /* byte 0x100 */
 #define I915_HWS_SCRATCH_INDEX 0x80
 
@@ -1126,20 +1142,7 @@
 #define ICL_PW_CTL_IDX_AUX_TBT(tc) (8 + (tc))
 /* Haswell/Broadwell: one well for everything but pipe A and DDI A. */
 #define HSW_PW_CTL_IDX_GLOBAL 15
-/* Broxton/Gemini Lake: PW1/PW2 at the Skylake indices; the two DPIO
- * PHYs are powered through the GT display power-on register. */
-#define BXT_P_CR_GT_DISP_PWRON 0x138090
-#define GT_DISPLAY_POWER_ON(phy) (1u << (phy))
-#define BXT_PHY_CTL_FAMILY(phy) ((phy) == 0 ? 0x64C10 : 0x64C00)
-#define COMMON_RESET_DIS (1u << 31)
-#define BXT_PHY_BASE(phy) ((phy) == 0 ? 0x6C000 : 0x162000)
-#define BXT_PORT_CL1CM_DW0(phy) (BXT_PHY_BASE(phy) + 0x0)
-#define PHY_POWER_GOOD (1u << 6)
-#define PHY_RESERVED (1u << 7)
-#define BXT_PHY_CTL(port) (0x64C00 + (port) * 4)
-#define BXT_PHY_CMNLANE_POWERDOWN_ACK (1u << 10)
-#define BXT_PHY_LANE_POWERDOWN_ACK (1u << 9)
-#define BXT_PHY_LANE_ENABLED (1u << 8)
+/* Broxton/Gemini Lake: PW1/PW2 at the Skylake indices. */
 
 /* Hotplug, Ice Point and later PCHs: one register for the DDI pins, one
  * for the Type-C pins, four bits per pin (status low two, enable bit 3). */
@@ -1147,8 +1150,6 @@
 #define SHOTPLUG_CTL_TC 0xC4034
 #define ICP_HPD_ENABLE(pin) (0x8u << ((pin) * 4))
 #define ICP_HPD_STATUS_MASK(pin) (0x3u << ((pin) * 4))
-#define SDE_DDI_HOTPLUG_ICP(pin) (1u << (pin))
-#define SDE_TC_HOTPLUG_ICP(tc) (1u << ((tc) + 16))
 /* ...and the north display's Type-C pins (Gen11+). */
 #define GEN11_TBT_HOTPLUG_CTL 0x44030
 #define GEN11_TC_HOTPLUG_CTL 0x44038
@@ -1157,14 +1158,9 @@
 #define GEN11_TC_HOTPLUG(tc) (1u << ((tc) + 16))
 #define GEN11_TBT_HOTPLUG(tc) (1u << (tc))
 /* Broxton: the pins are in the north display, with the enables in the
- * register at the PCH hotplug address. */
+ * register at the PCH hotplug address (the PORTA/B/C_HOTPLUG_ENABLE
+ * layout). */
 #define BXT_HOTPLUG_CTL 0xC4030
-#define BXT_DDIA_HPD_ENABLE (1u << 27)
-#define BXT_DDIA_HPD_STATUS_MASK (3u << 24)
-#define BXT_DDIC_HPD_ENABLE (1u << 11)
-#define BXT_DDIC_HPD_STATUS_MASK (3u << 8)
-#define BXT_DDIB_HPD_ENABLE (1u << 3)
-#define BXT_DDIB_HPD_STATUS_MASK (3u << 0)
 #define BXT_DE_PORT_HP_DDIA (1u << 3)
 #define BXT_DE_PORT_HP_DDIB (1u << 4)
 #define BXT_DE_PORT_HP_DDIC (1u << 5)
@@ -1180,10 +1176,6 @@
 #define BXT_PP_BASE 0x61200
 #define PCH_PP_BASE 0xC7200
 #define PCH_PP_BASE2 0xC7300 /* Tiger Point: a second panel */
-
-/* AUX channels of the Type-C ports on Tiger Lake and later. */
-#define TGL_DP_AUX_CH_CTL(tc) (0x16F110 + (tc) * 0x100)
-#define TGL_DP_AUX_CH_DATA(tc, i) (0x16F114 + (tc) * 0x100 + (i) * 4)
 
 /* CDCLK sources: Haswell/Broadwell's LCPLL, Broxton's DE PLL, the CDCLK
  * PLL of Gen11+ with its reference from DSSM. */
@@ -1287,7 +1279,8 @@
 #define PIPE_WM_LINETIME(pipe) (0x45270 + (pipe) * 4)
 
 /* ---- Ice Lake / Tiger Lake combo PHY PLLs and PHYs ---------------------------- */
-#define ICL_DPLL_ENABLE(pll) (0x46010 + (pll) * 4) /* DPLL0, DPLL1 */
+/* DPLL0, DPLL1 (and Alder Lake-S DPLL2); Alder Lake-S DPLL3 sits apart */
+#define ICL_DPLL_ENABLE(pll) ((pll) < 3 ? 0x46010 + (pll) * 4 : 0x46030)
 #define PLL_ENABLE (1u << 31)
 #define PLL_LOCK (1u << 30)
 #define PLL_POWER_ENABLE (1u << 27)
@@ -1296,19 +1289,11 @@
 #define MG_PLL_ENABLE(tc) (0x46030 + (tc) * 4)
 #define ICL_DPLL_CFGCR0(pll) (0x164000 + (pll) * 0x80)
 #define ICL_DPLL_CFGCR1(pll) (0x164004 + (pll) * 0x80)
-#define TGL_DPLL_CFGCR0(pll) (0x164284 + (pll) * 8)
-#define TGL_DPLL_CFGCR1(pll) (0x164288 + (pll) * 8)
+/* DPLL0, DPLL1; from 2 on, the Thunderbolt PLL */
+#define TGL_DPLL_CFGCR0(pll) ((pll) < 2 ? 0x164284 + (pll) * 8 : 0x16429C)
+#define TGL_DPLL_CFGCR1(pll) ((pll) < 2 ? 0x164288 + (pll) * 8 : 0x1642A0)
 #define DPLL_CFGCR0_HDMI_MODE (1u << 30)
 #define DPLL_CFGCR0_SSC_ENABLE_ICL (1u << 25)
-#define DPLL_CFGCR0_LINK_RATE_MASK (0xfu << 25)
-#define DPLL_CFGCR0_LINK_RATE_2700 (0u << 25)
-#define DPLL_CFGCR0_LINK_RATE_1350 (1u << 25)
-#define DPLL_CFGCR0_LINK_RATE_810 (2u << 25)
-#define DPLL_CFGCR0_LINK_RATE_1620 (3u << 25)
-#define DPLL_CFGCR0_LINK_RATE_1080 (4u << 25)
-#define DPLL_CFGCR0_LINK_RATE_2160 (5u << 25)
-#define DPLL_CFGCR0_LINK_RATE_3240 (6u << 25)
-#define DPLL_CFGCR0_LINK_RATE_4050 (7u << 25)
 #define DPLL_CFGCR0_DCO_FRACTION_MASK (0x7fffu << 10)
 #define DPLL_CFGCR0_DCO_FRACTION(x) ((uint32_t)(x) << 10)
 #define DPLL_CFGCR0_DCO_INTEGER_MASK 0x3ffu
@@ -1322,11 +1307,14 @@
 #define DPLL_CFGCR1_CENTRAL_FREQ_8400 (3u << 0)
 #define TGL_DPLL_CFGCR1_CFSELOVRD_NORMAL_XTAL (0u << 0)
 #define ICL_DPCLKA_CFGCR0 0x164280
-#define ICL_DPCLKA_CFGCR0_DDI_CLK_OFF(phy) (1u << ((phy) + 10))
-#define ICL_DPCLKA_CFGCR0_TC_CLK_OFF(tc) (1u << ((tc) + 12))
+/* the gates are not in PHY order: A 10, B 11, C 24, D 4, E 5; TC1-3 at
+ * 12.., TC4-6 at 21.. */
+#define ICL_DPCLKA_CFGCR0_DDI_CLK_OFF(phy) \
+	(1u << ((phy) == 0 ? 10 : (phy) == 1 ? 11 : (phy) == 2 ? 24 : (phy) == 3 ? 4 : 5))
+#define ICL_DPCLKA_CFGCR0_TC_CLK_OFF(tc) (1u << ((tc) < 3 ? (tc) + 12 : (tc) - 3 + 21))
 #define ICL_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy) (3u << ((phy) * 2))
 #define ICL_DPCLKA_CFGCR0_DDI_CLK_SEL(pll, phy) ((uint32_t)(pll) << ((phy) * 2))
-#define ICL_DDI_CLK_SEL(port) (0x4610C + (port) * 4)
+#define ICL_DDI_CLK_SEL(port) (0x46100 + (port) * 4)
 #define ICL_DDI_CLK_SEL_NONE (0x0u << 28)
 #define ICL_DDI_CLK_SEL_MG (0x8u << 28)
 #define ICL_DDI_CLK_SEL_TBT_162 (0xCu << 28)
@@ -1348,7 +1336,7 @@
 #define ICL_PHY_MISC(port) (0x64C00 + (port) * 4)
 #define ICL_PHY_MISC_DE_IO_COMP_PWR_DOWN (1u << 23)
 #define COMP_INIT (1u << 31)
-#define PROCESS_INFO_MASK (3u << 26)
+#define PROCESS_INFO_MASK (7u << 26)
 #define PROCESS_INFO_SHIFT 26
 #define VOLTAGE_INFO_MASK (3u << 24)
 #define VOLTAGE_INFO_SHIFT 24
@@ -1389,25 +1377,6 @@
 #define PORT_PLL_REF_SEL (1u << 27)
 #define PORT_PLL_POWER_ENABLE (1u << 26)
 #define PORT_PLL_POWER_STATE (1u << 25)
-/* PHY0 (base 0x6C000) carries ports B (channel 0) and C (channel 1);
- * PHY1 (base 0x162000) carries port A on its channel 0. */
-#define BXT_PORT_PHY(port) ((port) == PORT_A ? 1 : 0)
-#define BXT_PORT_CH(port) ((port) == PORT_C ? 1 : 0)
-#define BXT_PORT_PLL_EBB_0(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x34 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_PLL_EBB_4(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x38 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_PLL(port, n) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x100 + BXT_PORT_CH(port) * 0x300 + (n) * 4)
-#define BXT_PORT_PCS_DW12_LN01(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x430 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_PCS_DW12_LN23(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x630 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_PCS_DW12_GRP(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x7030 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_PCS_DW10_LN01(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x428 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_PCS_DW10_GRP(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x7028 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW2_LN0(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x508 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW2_GRP(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x7108 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW3_LN0(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x50C + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW3_GRP(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x710C + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW4_LN0(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x510 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW4_GRP(port) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x7110 + BXT_PORT_CH(port) * 0x300)
-#define BXT_PORT_TX_DW14_LN(port, ln) (BXT_PHY_BASE(BXT_PORT_PHY(port)) + 0x538 + (ln) * 0x80 + BXT_PORT_CH(port) * 0x300)
 #define PORT_PLL_P1(x) ((uint32_t)(x) << 13)
 #define PORT_PLL_P1_MASK (7u << 13)
 #define PORT_PLL_P2(x) ((uint32_t)(x) << 8)
@@ -1427,7 +1396,7 @@
 #define PORT_PLL_GAIN_CTL_MASK (7u << 16)
 #define PORT_PLL_TARGET_CNT_MASK 0x3ffu
 #define PORT_PLL_LOCK_THRESHOLD(x) ((uint32_t)(x) << 1)
-#define PORT_PLL_LOCK_THRESHOLD_MASK (0xfu << 1)
+#define PORT_PLL_LOCK_THRESHOLD_MASK (7u << 1)
 #define PORT_PLL_DCO_AMP_OVR_EN_H (1u << 27)
 #define PORT_PLL_DCO_AMP(x) ((uint32_t)(x) << 10)
 #define PORT_PLL_DCO_AMP_MASK (0xfu << 10)
@@ -1492,15 +1461,15 @@
 #define DKL_TX_DPCNTL1(tc) (DKL_BASE(tc) + 0x2C4)
 #define DKL_TX_DPCNTL2(tc) (DKL_BASE(tc) + 0x2C8)
 #define DKL_TX_PRESHOOT_COEFF(x) ((uint32_t)(x) << 13)
-#define DKL_TX_DE_EMPAHSIS_COEFF(x) ((uint32_t)(x) << 7)
+#define DKL_TX_DE_EMPHASIS_COEFF(x) ((uint32_t)(x) << 8)
 #define DKL_TX_VSWING_CONTROL(x) ((uint32_t)(x) << 0)
 #define DKL_TX_DP20BITMODE (1u << 2)
 #define DKL_TX_LOADGEN_SHARING_PMD_DISABLE (1u << 12)
 /* the shared clock-top words used by both MG and DKL */
 #define MG_REFCLKIN_CTL_OD_2_MUX(x) ((uint32_t)(x) << 8)
 #define MG_CLKTOP2_CORECLKCTL1_A_DIVRATIO(x) ((uint32_t)(x) << 8)
-#define MG_CLKTOP2_HSCLKCTL_TLINEDRV_CLKSEL(x) ((uint32_t)(x) << 16)
-#define MG_CLKTOP2_HSCLKCTL_CORE_INPUTSEL(x) ((uint32_t)(x) << 14)
+#define MG_CLKTOP2_HSCLKCTL_CORE_INPUTSEL(x) ((uint32_t)(x) << 16)
+#define MG_CLKTOP2_HSCLKCTL_TLINEDRV_CLKSEL(x) ((uint32_t)(x) << 14)
 #define MG_CLKTOP2_HSCLKCTL_HSDIV_RATIO_2 (0u << 12)
 #define MG_CLKTOP2_HSCLKCTL_HSDIV_RATIO_3 (1u << 12)
 #define MG_CLKTOP2_HSCLKCTL_HSDIV_RATIO_5 (2u << 12)
@@ -1531,7 +1500,7 @@
 #define MG_PLL_FRAC_LOCK_EARLYLOCK_CRIT_32 (1u << 16)
 #define MG_PLL_FRAC_LOCK_LOCKTHRESH(x) ((uint32_t)(x) << 11)
 #define MG_PLL_FRAC_LOCK_DCODITHEREN (1u << 10)
-#define MG_PLL_FRAC_LOCK_FEEDFWRDCAL_EN (1u << 9)
+#define MG_PLL_FRAC_LOCK_FEEDFWRDCAL_EN (1u << 8)
 #define MG_PLL_FRAC_LOCK_FEEDFWRDGAIN(x) ((uint32_t)(x) << 0)
 #define MG_PLL_SSC(tc) (MG_BASE(tc) + 0xA10)
 #define MG_PLL_BIAS(tc) (MG_BASE(tc) + 0xA14)
@@ -1572,7 +1541,7 @@
 #define CRI_TXDEEMPH_OVERRIDE_EN (1u << 22)
 #define CRI_TXDEEMPH_OVERRIDE_5_0(x) ((uint32_t)(x) << 16)
 #define CRI_TXDEEMPH_OVERRIDE_5_0_MASK (0x3Fu << 16)
-#define MG_CLKHUB(tc, ln) (MG_LN(tc, ln) + 0x79C)
+#define MG_CLKHUB(tc, ln) (MG_LN(tc, ln) + 0x39C)
 #define CFG_LOW_RATE_LKREN_EN (1u << 11)
 #define MG_TX1_DCC(tc, ln) (MG_LN(tc, ln) + 0x110)
 #define MG_TX2_DCC(tc, ln) (MG_LN(tc, ln) + 0x090)
@@ -1606,13 +1575,13 @@
 #define MG_PLL_TDC_TDCSEL(x) ((uint32_t)(x) << 0)
 #define MG_REFCLKIN_CTL_OD_2_MUX_MASK (7u << 8)
 #define MG_CLKTOP2_CORECLKCTL1_A_DIVRATIO_MASK (0xffu << 8)
-#define MG_CLKTOP2_HSCLKCTL_TLINEDRV_CLKSEL_MASK (3u << 16)
-#define MG_CLKTOP2_HSCLKCTL_CORE_INPUTSEL_MASK (1u << 14)
+#define MG_CLKTOP2_HSCLKCTL_CORE_INPUTSEL_MASK (1u << 16)
+#define MG_CLKTOP2_HSCLKCTL_TLINEDRV_CLKSEL_MASK (3u << 14)
 #define MG_CLKTOP2_HSCLKCTL_HSDIV_RATIO_MASK (3u << 12)
 #define MG_CLKTOP2_HSCLKCTL_DSDIV_RATIO_MASK (0xfu << 8)
 #define DKL_DP_MODE(tc) (DKL_BASE(tc) + 0xA0)
-#define DKL_PLL_DIV0_MASK 0x1ffffffu
-#define DKL_PLL_DIV1_IREF_TRIM_MASK (0x7fu << 16)
+#define DKL_PLL_DIV0_MASK 0x1fffffu /* INTEG_COEFF | PROP_COEFF | FBPREDIV | FBDIV_INT */
+#define DKL_PLL_DIV1_IREF_TRIM_MASK (0x1fu << 16)
 #define DKL_PLL_DIV1_TDC_TARGET_CNT_MASK 0xffu
 #define DKL_PLL_SSC_IREF_NDIV_RATIO_MASK (7u << 29)
 #define DKL_PLL_SSC_STEP_LEN_MASK (0xffu << 16)
@@ -1621,7 +1590,7 @@
 #define DKL_PLL_TDC_SSC_STEP_SIZE_MASK (0xffu << 8)
 #define DKL_PLL_TDC_FEED_FWD_GAIN_MASK 0xffu
 #define DKL_TX_PRESHOOT_COEFF_MASK (0x1fu << 13)
-#define DKL_TX_DE_EMPAHSIS_COEFF_MASK (0x1fu << 7)
+#define DKL_TX_DE_EMPAHSIS_COEFF_MASK (0x1fu << 8)
 #define DKL_TX_VSWING_CONTROL_MASK (7u << 0)
 
 /* ---- the GuC and HuC ------------------------------------------------------------ */
@@ -1687,3 +1656,209 @@
 #define GEN12_GUC_TLB_INV_CR 0xcee8
 #define GEN12_GUC_TLB_INV_CR_INVALIDATE (1u << 0)
 #define GEN11_GRDOM_GUC (1u << 3)
+
+/* ---- Gen12 and later GT ---------------------------------------------------- */
+#ifndef KERNEL_DEV_GPU_I915_REG_GT12_H
+#define KERNEL_DEV_GPU_I915_REG_GT12_H
+
+/* Meteor Lake's standalone media GT: its registers are the primary GT's
+ * offsets plus this. */
+#define I915_MEDIA_GT_BASE 0x380000
+
+/* The IP version registers (Meteor Lake on): architecture, release,
+ * stepping. */
+#define GMD_ID_GRAPHICS 0xd8c
+#define GMD_ID_MEDIA (I915_MEDIA_GT_BASE + 0xd8c)
+#define GMD_ID_ARCH(v) (((v) >> 22) & 0x3ff)
+#define GMD_ID_RELEASE(v) (((v) >> 14) & 0xff)
+#define GMD_ID_STEP(v) ((v) & 0x3f)
+
+/* Commands (Gen11 on unless named otherwise). */
+#define MI_LRI_LRM_CS_MMIO (1u << 19) /* the offset is relative to the engine */
+#define MI_LRI_MMIO_REMAP_EN (1u << 17)
+#define MI_LOAD_REGISTER_REG MI_INSTR(0x2a, 1)
+#define MI_LRR_SOURCE_CS_MMIO (1u << 18)
+#define MI_SET_PREDICATE MI_INSTR(0x01, 0)
+#define MI_SET_PREDICATE_DISABLE (0u << 0)
+#define MI_SEMAPHORE_WAIT MI_INSTR(0x1c, 2)
+#define MI_SEMAPHORE_WAIT_TOKEN MI_INSTR(0x1c, 3) /* Gen12 */
+#define MI_SEMAPHORE_GLOBAL_GTT (1u << 22)
+#define MI_SEMAPHORE_REGISTER_POLL (1u << 16)
+#define MI_SEMAPHORE_POLL (1u << 15)
+#define MI_SEMAPHORE_SAD_EQ_SDD (4u << 12)
+#define MI_ATOMIC_INLINE_DATA (1u << 18)
+#define MI_ATOMIC_INLINE (MI_INSTR(0x2f, 9) | MI_ATOMIC_INLINE_DATA)
+#define MI_ATOMIC_GLOBAL_GTT (1u << 22)
+#define MI_ATOMIC_CS_STALL (1u << 17)
+#define MI_ATOMIC_MOVE (0x4u << 8)
+#define MI_FLUSH_DW_CCS (1u << 16)
+#define MI_PREPARSER_DISABLE(on) (MI_ARB_CHECK | (1u << 8) | (on)) /* Gen12 */
+#define CMD_3DSTATE_MESH_CONTROL ((0x3u << 29) | (0x3u << 27) | (0x0u << 24) | (0x77u << 16) | 0x3u)
+#define XY_FAST_COLOR_BLT_CMD ((2u << 29) | (0x44u << 22))
+#define XY_FAST_COLOR_BLT_MOCS(x) (((uint32_t)(x) & 0x7f) << 21)
+#define PIPE_CONTROL0_HDC_PIPELINE_FLUSH (1u << 9) /* in the header dword */
+#define PIPE_CONTROL0_L3_READ_ONLY_CACHE_INVALIDATE (1u << 10) /* header dword */
+#define PIPE_CONTROL0_UNTYPED_DATAPORT_CACHE_FLUSH (1u << 11) /* header dword, Xe2 on */
+#define PIPE_CONTROL_AMFS_FLUSH (1u << 25)
+#define PIPE_CONTROL_GLOBAL_SNAPSHOT_RESET (1u << 19)
+#define PIPE_CONTROL_PSD_SYNC (1u << 17)
+#define PIPE_CONTROL_CCS_FLUSH (1u << 13) /* Meteor Lake on */
+/* what an engine without the 3D pipeline (a compute engine) must not ask */
+#define PIPE_CONTROL_3D_ENGINE_FLAGS                                              \
+	(PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH | PIPE_CONTROL_DEPTH_CACHE_FLUSH | \
+	 PIPE_CONTROL_TILE_CACHE_FLUSH | PIPE_CONTROL_DEPTH_STALL |              \
+	 PIPE_CONTROL_STALL_AT_SCOREBOARD | PIPE_CONTROL_PSD_SYNC |              \
+	 PIPE_CONTROL_AMFS_FLUSH | PIPE_CONTROL_VF_CACHE_INVALIDATE |            \
+	 PIPE_CONTROL_GLOBAL_SNAPSHOT_RESET)
+
+/* Engine registers, Gen12 on. */
+#define RING_NOPID(base) ((base) + 0x94)
+#define RING_CMD_BUF_CCTL(base) ((base) + 0x84)
+#define RING_BB_OFFSET(base) ((base) + 0x158)
+#define RING_CCID(base) ((base) + 0x180)
+#define RING_PREDICATE_RESULT(base) ((base) + 0x3b8)
+#define PER_CTX_BB_FORCE (1u << 2)
+#define PER_CTX_BB_VALID (1u << 0)
+#define GEN11_GFX_DISABLE_LEGACY_MODE (1u << 3) /* RING_MODE: execution lists */
+#define GEN12_GFX_PREFETCH_DISABLE (1u << 10)
+#define GEN12_CTX_CTRL_RUNALONE_MODE (1u << 7)
+#define GEN12_CS_DEBUG_MODE2 0x20d8
+#define INSTRUCTION_STATE_CACHE_INVALIDATE (1u << 6)
+#define DRAW_WATERMARK 0x26c0
+#define VERT_WM_VAL 0x3ffu
+/* The AUX table invalidation register of each engine that has one. */
+#define GEN12_CCS_AUX_INV 0x4208
+#define GEN12_VD0_AUX_INV 0x4218
+#define GEN12_VE0_AUX_INV 0x4238
+#define GEN12_BCS0_AUX_INV 0x4248
+#define GEN12_VD2_AUX_INV 0x4298
+#define GEN12_CCS0_AUX_INV 0x42c8
+#define AUX_INV (1u << 0)
+
+/* The per-process status page: dword 0x34 is scratch the flushes write. */
+#define LRC_PPHWSP_SCRATCH 0x34
+/* Xe_HP's context descriptor: the context id moved up. */
+#define GEN11_RPCS_S_CNT_MASK (0x3fu << 12)
+#define XEHP_SW_CTX_ID_SHIFT 39
+#define XEHP_SW_CTX_ID_WIDTH 16
+/* Gen12 context status: the switch detail field. */
+#define GEN12_CTX_SWITCH_DETAIL(dw) ((dw) & 0xf)
+
+/* Registers with one copy per slice, subslice or bank: the selector
+ * that steers a read (Gen11-12.60: GEN8_MCR_SELECTOR with these fields;
+ * Meteor Lake: its own selector, shared with the firmware through a
+ * semaphore). */
+#define GEN11_MCR_MULTICAST (1u << 31)
+#define GEN11_MCR_SLICE(slice) (((uint32_t)(slice) & 0xf) << 27)
+#define GEN11_MCR_SLICE_MASK GEN11_MCR_SLICE(0xf)
+#define GEN11_MCR_SUBSLICE(subslice) (((uint32_t)(subslice) & 0x7) << 24)
+#define GEN11_MCR_SUBSLICE_MASK GEN11_MCR_SUBSLICE(0x7)
+#define MTL_STEER_SEMAPHORE 0xfd0
+#define MCFG_MCR_SELECTOR 0xfd0 /* Xe_HP: same offset as Meteor Lake's semaphore */
+#define SF_MCR_SELECTOR 0xfd8
+#define GAM_MCR_SELECTOR 0xfe0
+#define MTL_MCR_SELECTOR 0xfd4
+#define MTL_MCR_GROUPID(g) (((uint32_t)(g) & 0xf) << 8)
+#define MTL_MCR_INSTANCEID(i) ((uint32_t)(i) & 0xf)
+#define XEHP_FUSE4 0x9114
+#define GT_L3_EXC_MASK(v) (((v) >> 4) & 0x7)
+#define GEN12_MEML3_EN_MASK 0xfu
+#define HSW_PAVP_FUSE1 0x911c
+#define XEHP_SFC_ENABLE(v) (((v) >> 24) & 0xf)
+#define MTL_GT_ACTIVITY_FACTOR 0x138010
+#define MTL_GT_L3_EXC_MASK(v) (((v) >> 3) & 0x7)
+#define XEHP_EU_ENABLE 0x9134
+#define XEHP_EU_ENA_MASK 0xffu
+#define GEN12_RCU_MODE 0x14800
+#define GEN12_RCU_MODE_CCS_ENABLE (1u << 0)
+/* SFC (scaler and format converter) locks of the video engines */
+#define GEN11_VCS_SFC_FORCED_LOCK(base) ((base) + 0x88c)
+#define GEN11_VCS_SFC_FORCED_LOCK_BIT (1u << 0)
+#define GEN11_VCS_SFC_LOCK_STATUS(base) ((base) + 0x890)
+#define GEN11_VCS_SFC_USAGE_BIT (1u << 0)
+#define GEN11_VCS_SFC_LOCK_ACK_BIT (1u << 1)
+#define GEN11_VECS_SFC_FORCED_LOCK(base) ((base) + 0x201c)
+#define GEN11_VECS_SFC_FORCED_LOCK_BIT (1u << 0)
+#define GEN11_VECS_SFC_LOCK_ACK(base) ((base) + 0x2018)
+#define GEN11_VECS_SFC_LOCK_ACK_BIT (1u << 0)
+#define GEN11_VECS_SFC_USAGE(base) ((base) + 0x2014)
+#define GEN11_VECS_SFC_USAGE_BIT (1u << 0)
+#define GEN12_HCP_SFC_LOCK_STATUS(base) ((base) + 0x2914)
+#define GEN12_HCP_SFC_USAGE_BIT (1u << 0)
+
+#define GEN12_GLOBAL_MOCS(i) (0x4000 + (i) * 4)
+/* Page attribute tables: Gen11's (one register an entry), Xe_HP's and
+ * Meteor Lake's (copies per unit; the media GT's at its offset), and
+ * Meteor Lake's encodings. */
+#define GEN10_PAT_INDEX(i) (0x40e0 + (i) * 4)
+#define XEHP_PAT_INDEX(i) ((i) < 8 ? 0x4800 + (i) * 4 : 0x4848 + ((i) - 8) * 4)
+#define MTL_PPAT_L4_0_WB (0u << 2)
+#define MTL_PPAT_L4_1_WT (1u << 2)
+#define MTL_PPAT_L4_3_UC (3u << 2)
+#define MTL_2_COH_1W (2u << 0)
+#define MTL_3_COH_2W (3u << 0)
+/* page table entries' PAT index bits, Gen12 on */
+#define GEN12_PPGTT_PTE_PAT0 (1ULL << 3)
+#define GEN12_PPGTT_PTE_PAT1 (1ULL << 4)
+#define GEN12_PPGTT_PTE_PAT2 (1ULL << 7)
+#define MTL_PPGTT_PTE_PAT3 (1ULL << 62)
+#define MTL_GGTT_PTE_PAT0 (1ULL << 52)
+#define MTL_GGTT_PTE_PAT1 (1ULL << 53)
+/* the GuC cannot reach the global space at or above this */
+#define GUC_GGTT_TOP 0xfee00000u
+/* Meteor Lake: the stolen memory's size and base, as MMIO */
+#define MTL_GGC 0x108040
+#define MTL_GGC_GMS(v) (((v) >> 8) & 0xff)
+#define MTL_GGC_GGMS(v) (((v) >> 6) & 0x3)
+#define GEN6_DSMBASE 0x1080c0
+#define GEN6_GSMBASE 0x108100
+#define GEN11_BDSM_MASK 0xfffffffffff00000ULL
+#define GEN12_CCS_RSVD_INTR_ENABLE 0x190048
+#define MTL_GUC_MGUC_INTR_MASK 0x1900e8 /* Meteor Lake: high half the GuC's, low the media GuC's */
+
+/* The power management unit's view of the command streamers' own
+ * forcewake requests (MI_FORCE_WAKEUP): pending ones in bits 13:9, with
+ * their mask in bits 29:25; and the domains it has woken. */
+#define MSG_IDLE_CS 0x8000
+#define MSG_IDLE_VCS0 0x8004
+#define MSG_IDLE_VCS1 0x8008
+#define MSG_IDLE_BCS 0x800c
+#define MSG_IDLE_VECS0 0x8010
+#define MSG_IDLE_VCS2 0x80c0
+#define MSG_IDLE_VCS3 0x80c4
+#define MSG_IDLE_VECS1 0x80d8
+#define MSG_IDLE_FW_MASK (0x1fu << 9)
+#define MSG_IDLE_FW_SHIFT 9
+#define GEN9_PWRGT_DOMAIN_STATUS 0xa2a0
+
+/* The fault every engine reports through, Gen12 on */
+#define GEN12_RING_FAULT_REG 0xcec4
+#define GEN12_FAULT_TLB_DATA0 0xceb8
+#define GEN12_FAULT_TLB_DATA1 0xcebc
+
+/* The GT's frequency, Gen12 and Meteor Lake. */
+#define GEN12_RPSTAT1 0x1381b4
+#define GEN12_CAGF_SHIFT 11
+#define GEN12_CAGF_MASK (0x1ffu << 11)
+#define MTL_MIRROR_TARGET_WP1 0xc60
+#define MTL_CAGF_MASK 0x1ffu
+#define MTL_RP_STATE_CAP 0x138000
+#define MTL_RP0_CAP(v) ((v) & 0x1ff)
+#define MTL_RPN_CAP(v) (((v) >> 16) & 0x1ff)
+
+/* Engine reset domains (Gen11 on). */
+#define GEN11_GRDOM_FULL (1u << 0)
+#define GEN11_GRDOM_RENDER (1u << 1)
+#define GEN11_GRDOM_BLT (1u << 2)
+#define GEN11_GRDOM_MEDIA (1u << 5)
+#define GEN11_GRDOM_MEDIA2 (1u << 6)
+#define GEN11_GRDOM_MEDIA3 (1u << 7)
+#define GEN11_GRDOM_MEDIA4 (1u << 8)
+#define GEN11_GRDOM_VECS (1u << 13)
+#define GEN11_GRDOM_VECS2 (1u << 14)
+#define GEN11_GRDOM_SFC0 (1u << 17)
+#define GEN12_GRDOM_GSC (1u << 21)
+#define GEN11_VCS_SFC_RESET_BIT(instance) (GEN11_GRDOM_SFC0 << ((instance) >> 1))
+#define GEN11_VECS_SFC_RESET_BIT(instance) (GEN11_GRDOM_SFC0 << (instance))
+
+#endif

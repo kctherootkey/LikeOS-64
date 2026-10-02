@@ -137,8 +137,9 @@ static void console_push(void)
 	g_con.dirty = 0;
 	spin_unlock_irqrestore(&g_con.lock, fl);
 
+	/* a fallback on another processor clears the device behind us */
 	struct drm_device *dev = g_con.dev;
-	struct drm_framebuffer *fb = drm_fb_lookup(dev, g_con.fb_id);
+	struct drm_framebuffer *fb = dev ? drm_fb_lookup(dev, g_con.fb_id) : NULL;
 	if (fb && dev->ncrtc && dev->drv->fb_dirty)
 		dev->drv->fb_dirty(dev, &dev->crtc[0], fb, &r, 1);
 	__atomic_clear(&g_pushing, __ATOMIC_RELEASE);
@@ -292,6 +293,18 @@ static void drm_console_fallback(struct drm_device *dev, const char *why)
 		dev->drv->display_fallback(dev);
 	else if (g_con.have_saved)
 		console_reinit_framebuffer(&g_con.saved);
+	/* A driver whose fallback puts the device back on the framebuffer
+	 * but leaves the console where it was (the Intel driver restores the
+	 * firmware's plane, which scans out THAT framebuffer) would otherwise
+	 * have the console go on drawing into the buffer object, which
+	 * nothing shows any more. */
+	if (g_con.have_saved && g_con.obj && g_con.obj->pages) {
+		framebuffer_info_t cur;
+		if (console_get_framebuffer_info(&cur) == 0 &&
+		    cur.framebuffer_base == phys_to_virt(g_con.obj->pages[0]))
+			console_reinit_framebuffer(&g_con.saved);
+	}
+	kprintf("[drm] %s: console fallback done\n", dev->drv->name);
 	g_con.dev = NULL;
 }
 
@@ -445,8 +458,24 @@ void drm_console_suspend(struct drm_device *dev)
 
 void drm_console_resume(struct drm_device *dev)
 {
-	if (!g_con.taken || g_con.dev != dev)
+	/* Said the first few times: where the screen goes when a display
+	 * manager lets go of it is the moment a machine looks dead if it
+	 * goes wrong, and the log is all there is to say what happened. */
+	static unsigned said;
+
+	if (!g_con.taken || g_con.dev != dev) {
+		if (said < 4) {
+			said++;
+			kprintf("[drm] %s: display manager left; the console is not on KMS (stays where it is)\n",
+				dev->drv->name);
+		}
 		return;
+	}
+	if (said < 4) {
+		said++;
+		kprintf("[drm] %s: display manager left; setting the console's mode again\n",
+			dev->drv->name);
+	}
 	/* The master left the CRTC on a framebuffer of its own, which is
 	 * being torn down behind it -- so this is a fresh mode set, not just
 	 * a redraw.  What the console has to show is still in its buffer:
@@ -461,7 +490,11 @@ void drm_console_resume(struct drm_device *dev)
 		return;
 	}
 	console_push_all();
-	(void)drm_console_verify(dev);
+	if (drm_console_verify(dev) == 0 && said < 8) {
+		said++;
+		kprintf("[drm] %s: console back on KMS after the display manager\n",
+			dev->drv->name);
+	}
 }
 
 void drm_console_resume_pushes(struct drm_device *dev)

@@ -12,6 +12,7 @@
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
+#include <kernel/dev/gpu/i915/intel_dpll_regs.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/hal/lapic.h>
@@ -47,7 +48,9 @@ static int read_dpcd(struct i915_device *i915, struct intel_output *o)
 	if (o->is_edp) {
 		intel_dp_aux_native_read(&o->aux, DP_EDP_DPCD_REV, o->edp_dpcd,
 					 sizeof(o->edp_dpcd));
-		/* eDP 1.4: a table of rates in 200 kHz units */
+		/* eDP 1.4: a table of rates in 200 kHz units of the bit rate;
+		 * the driver counts the link in symbol clock (a tenth of it),
+		 * so 13500 (2.7 Gbit/s) is 270000 */
 		if (o->dpcd[DP_DPCD_REV] >= 0x13 || o->edp_dpcd[0] >= 0x03) {
 			uint8_t r[16];
 			if (intel_dp_aux_native_read(&o->aux, DP_SUPPORTED_LINK_RATES,
@@ -57,7 +60,7 @@ static int read_dpcd(struct i915_device *i915, struct intel_output *o)
 						     ((uint32_t)r[i * 2 + 1] << 8);
 					if (!v)
 						break;
-					o->sink_rates_khz[o->nsink_rates++] = v * 200;
+					o->sink_rates_khz[o->nsink_rates++] = v * 20;
 				}
 			}
 		}
@@ -77,10 +80,14 @@ static int read_dpcd(struct i915_device *i915, struct intel_output *o)
 int intel_dp_detect(struct i915_device *i915, struct intel_output *o)
 {
 	if (o->is_edp) {
-		/* The panel is wired; power its logic and ask. */
-		intel_power_get(i915, INTEL_PW_AUX_A);
+		/* The panel is wired; power its logic and its AUX channel's
+		 * well, and ask. */
+		int ch = o->aux.port >= 0 && o->aux.port < 9 ? o->aux.port : 0;
+		enum intel_power_domain aux = (enum intel_power_domain)(INTEL_PW_AUX_A + ch);
+		intel_power_get(i915, aux);
 		intel_pps_vdd_on(i915, o);
 		int rc = read_dpcd(i915, o);
+		intel_power_put(i915, aux);
 		o->detected = (rc == 0);
 		if (rc)
 			kprintf("[drm] i915: eDP panel does not answer on AUX %c\n",
@@ -114,9 +121,11 @@ int intel_dp_read_edid(struct i915_device *i915, struct intel_output *o)
  * pixel at 8 bpc.  The mode needs clock * 3 bytes/s, with some margin. */
 static int link_carries(uint32_t rate_khz, int lanes, uint32_t pixel_khz, int bpp)
 {
-	uint64_t link = (uint64_t)rate_khz * lanes * 8 / 10; /* kbyte/s... */
+	/* The rate is the symbol clock (a tenth of the bit rate), and with
+	 * 8b/10b each symbol carries one byte: a lane moves rate_khz kB/s. */
+	uint64_t link = (uint64_t)rate_khz * lanes;
 	uint64_t need = (uint64_t)pixel_khz * bpp / 8;
-	/* both in "kB/s" units; keep 1% headroom */
+	/* both in kB/s; keep 1% headroom */
 	return link * 99 >= need * 100;
 }
 
@@ -133,21 +142,23 @@ int intel_dp_choose_link(struct i915_device *i915, struct intel_output *o,
 		max_lanes = 4;
 	if (o->port == PORT_A && !o->four_lane_strap && max_lanes > 2)
 		max_lanes = 2; /* DDI A strapped to two lanes (E takes the rest) */
-	if (i915->display.vbt.edp_lanes && o->is_edp &&
-	    i915->display.vbt.edp_lanes < max_lanes)
-		max_lanes = i915->display.vbt.edp_lanes;
+	/* (The VBT's eDP lane count is the firmware's fast-training hint,
+	 * not a limit: the panel's DPCD says what it takes.) */
 	if (o->is_tc && o->tc_owned && intel_tc_max_lanes(i915, o) < max_lanes)
 		max_lanes = intel_tc_max_lanes(i915, o); /* what the FIA granted */
 	/* Spread spectrum where the sink takes it: an embedded panel's link
 	 * normally runs with it, and the source's PLL has to agree with what
 	 * the sink is told. */
-	o->ssc = o->is_edp && (o->dpcd[DP_MAX_DOWNSPREAD] & 1);
+	/* (only the PHY PLLs of Meteor Lake and DG2 can spread: the
+	 * Gen9-13 port PLLs never do) */
+	o->ssc = o->is_edp && (o->dpcd[DP_MAX_DOWNSPREAD] & 1) &&
+		 (i915->display.model == INTEL_DISPLAY_MTL || i915->display.model == INTEL_DISPLAY_DG2);
 
 	/* The configuration the firmware had this port running at, if it
 	 * carries the mode: the panel demonstrably trains at it, and
 	 * nothing about the board is being guessed. */
 	if (o->fw_link_rate_khz && o->fw_lanes >= 1 && o->fw_lanes <= max_lanes &&
-	    intel_dpll_rate_supported(i915, o->fw_link_rate_khz) &&
+	    intel_dpll_output_rate_supported(i915, o, o->fw_link_rate_khz) &&
 	    link_carries(o->fw_link_rate_khz, o->fw_lanes, mode->clock, bpp)) {
 		for (int r = 0; r < o->nsink_rates; r++) {
 			if (o->sink_rates_khz[r] != o->fw_link_rate_khz)
@@ -162,7 +173,7 @@ int intel_dp_choose_link(struct i915_device *i915, struct intel_output *o,
 	for (int lanes = 1; lanes <= max_lanes; lanes *= 2) {
 		for (int r = 0; r < o->nsink_rates; r++) {
 			uint32_t rate = o->sink_rates_khz[r];
-			if (!intel_dpll_rate_supported(i915, rate))
+			if (!intel_dpll_output_rate_supported(i915, o, rate))
 				continue;
 			if (link_carries(rate, lanes, mode->clock, bpp)) {
 				o->link_rate_khz = rate;
@@ -174,7 +185,7 @@ int intel_dp_choose_link(struct i915_device *i915, struct intel_output *o,
 	/* Nothing fits: the fastest rate the port can drive, all lanes. */
 	for (int r = o->nsink_rates - 1; r >= 0; r--) {
 		uint32_t rate = o->sink_rates_khz[r];
-		if (intel_dpll_rate_supported(i915, rate)) {
+		if (intel_dpll_output_rate_supported(i915, o, rate)) {
 			o->link_rate_khz = rate;
 			o->lane_count = max_lanes;
 			if (link_carries(rate, max_lanes, mode->clock, bpp))
@@ -186,7 +197,7 @@ int intel_dp_choose_link(struct i915_device *i915, struct intel_output *o,
 	 * carried this very picture, so take it: what it used is a fact
 	 * about the board, while the limits above are read from tables. */
 	if (o->fw_link_rate_khz && o->fw_lanes >= 1 && o->fw_lanes <= 4 &&
-	    intel_dpll_rate_supported(i915, o->fw_link_rate_khz) &&
+	    intel_dpll_output_rate_supported(i915, o, o->fw_link_rate_khz) &&
 	    link_carries(o->fw_link_rate_khz, o->fw_lanes, mode->clock, bpp)) {
 		kprintf("[drm] i915: port %c: no link fits the limits read here; using the one the firmware ran (%u kHz x%d)\n",
 			'A' + o->port, o->fw_link_rate_khz, o->fw_lanes);
@@ -358,9 +369,12 @@ int intel_dp_link_train(struct i915_device *i915, struct intel_output *o)
 		kprintf("[drm] i915:   DDI_BUF_CTL %08x, DP_TP_CTL %08x, train set %02x, adjust %02x %02x\n",
 			i915_read32(i915, DDI_BUF_CTL(o->port)),
 			i915_read32(i915, intel_dp_tp_ctl_reg(i915, o)), o->train_set[0], adj[0], adj[1]);
-		kprintf("[drm] i915:   DPLL%d, DPLL_CTRL1 %08x, DPLL_CTRL2 %08x, status %08x, AUX errors %u\n",
-			o->pll, i915_read32(i915, DPLL_CTRL1), i915_read32(i915, DPLL_CTRL2),
-			i915_read32(i915, DPLL_STATUS), o->aux.errors);
+		if (i915->display.model == INTEL_DISPLAY_SKL)
+			kprintf("[drm] i915:   DPLL%d, DPLL_CTRL1 %08x, DPLL_CTRL2 %08x, status %08x, AUX errors %u\n",
+				o->pll, i915_read32(i915, DPLL_CTRL1), i915_read32(i915, DPLL_CTRL2),
+				i915_read32(i915, DPLL_STATUS), o->aux.errors);
+		else
+			kprintf("[drm] i915:   PLL %d, AUX errors %u\n", o->pll, o->aux.errors);
 		apply_train_set(i915, o, DP_TRAINING_PATTERN_DISABLE);
 		return -EIO;
 	}
