@@ -563,6 +563,10 @@ static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
 		fdput(file);
 		return -EBADF;
 	}
+	/* Demand paging shield, as in sys_read/sys_write: the buffer's pages
+	 * present (and, for a read, writable) before the filesystem takes any
+	 * lock -- see mm_prefault_user_range. */
+	mm_prefault_user_range(buf, count, !write);
 
 	if (!write) {
 		/* A positional read is exactly what vfs_pread() is: it uses

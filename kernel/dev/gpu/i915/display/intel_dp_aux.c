@@ -14,6 +14,15 @@
 // channels come first and A and B follow USBC4; Nova Lake's channels
 // also report when their power is up.
 //
+// With I915_FEAT_DP_HELPERS the channel is the transfer hook of a struct
+// drm_dp_aux: it runs exactly one transaction and reports the sink's
+// reply code, and the DisplayPort helper library above it retries
+// DEFERs and failures, splits DPCD accesses into 16-byte transactions and
+// tunnels I2C (the EDID) over the channel.  The driver's own request and
+// I2C code (I915_FEAT_DP_HELPERS 0) runs on the same transaction routine.
+// Outputs that share one hardware channel take its lock around each
+// transaction.
+//
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2020-2023 Intel Corporation
@@ -26,6 +35,8 @@
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/rwsem.h>
+#include <kernel/uapi/bug.h>
 
 #define AUX_NATIVE_WRITE 0x8
 #define AUX_NATIVE_READ 0x9
@@ -186,6 +197,8 @@ static int aux_xfer(struct intel_dp_aux *aux, const uint8_t *send,
 	return rc;
 }
 
+#if !I915_FEAT_DP_HELPERS
+
 /* A request with retries on DEFER (the sink is busy) and short replies. */
 static int aux_request(struct intel_dp_aux *aux, uint8_t cmd, uint32_t addr,
 		       const uint8_t *wbuf, unsigned wlen, uint8_t *rbuf,
@@ -331,6 +344,179 @@ static int aux_i2c_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int n)
 	return done;
 }
 
+#else /* I915_FEAT_DP_HELPERS */
+
+/* ---- the helper library's transfer hook ----------------------------------- */
+
+/* The hardware channels' locks: one per channel of each device, shared
+ * by every output whose AUX is that channel.  Filled at display init
+ * (one thread); a channel set up again (resume) finds its lock. */
+#define AUX_HW_LOCKS 16
+
+static struct {
+	struct i915_device *i915;
+	uint32_t ctl_reg;
+	mm_rwsem_t lock;
+} g_aux_hw_locks[AUX_HW_LOCKS];
+static int g_aux_hw_nlocks;
+
+static mm_rwsem_t *aux_hw_lock_for(struct i915_device *i915, uint32_t ctl_reg)
+{
+	for (int i = 0; i < g_aux_hw_nlocks; i++)
+		if (g_aux_hw_locks[i].i915 == i915 && g_aux_hw_locks[i].ctl_reg == ctl_reg)
+			return &g_aux_hw_locks[i].lock;
+	if (g_aux_hw_nlocks == AUX_HW_LOCKS) {
+		kprintf("[drm] i915: out of AUX channel locks; channel %05x unshared\n", ctl_reg);
+		return NULL;
+	}
+	int i = g_aux_hw_nlocks++;
+	g_aux_hw_locks[i].i915 = i915;
+	g_aux_hw_locks[i].ctl_reg = ctl_reg;
+	mm_rwsem_init(&g_aux_hw_locks[i].lock, "i915_aux_hw");
+	return &g_aux_hw_locks[i].lock;
+}
+
+/* An external sink that is not there does not answer: a transfer to it
+ * would only wait out the channel's timeouts, again on every retry, so
+ * it is refused (DP link CTS 4.2.1.5 asks for that too).  A hotplug line
+ * that dropped for a moment is given up to 4 ms to come back, so a
+ * glitch does not fail an EDID read.  A panel is wired and always asked.
+ * Every channel is an output's (intel_display.c sets them up inside
+ * struct intel_output). */
+static int aux_sink_gone(struct intel_dp_aux *aux)
+{
+	struct intel_output *o = container_of(aux, struct intel_output, aux);
+
+	if (o->is_edp)
+		return 0;
+	for (int t = 0; t < 4000; t += 30) {
+		if (intel_hpd_live(aux->i915, o->port))
+			return 0;
+		lapic_delay_us(30);
+	}
+	return !intel_hpd_live(aux->i915, o->port);
+}
+
+#define BARE_ADDRESS_SIZE 3
+#define HEADER_SIZE (BARE_ADDRESS_SIZE + 1)
+
+static void aux_msg_header(uint8_t txbuf[HEADER_SIZE], const struct drm_dp_aux_msg *msg)
+{
+	txbuf[0] = (uint8_t)((msg->request << 4) | ((msg->address >> 16) & 0xf));
+	txbuf[1] = (uint8_t)((msg->address >> 8) & 0xff);
+	txbuf[2] = (uint8_t)(msg->address & 0xff);
+	txbuf[3] = (uint8_t)(msg->size - 1);
+}
+
+static int aux_xfer_locked(struct intel_dp_aux *aux, const uint8_t *send,
+			   unsigned send_bytes, uint8_t *recv, unsigned recv_cap)
+{
+	int ret;
+
+	if (aux->hw_lock)
+		mm_write_lock(aux->hw_lock);
+	ret = aux_xfer(aux, send, send_bytes, recv, recv_cap);
+	if (aux->hw_lock)
+		mm_write_unlock(aux->hw_lock);
+	return ret;
+}
+
+/*
+ * One AUX transaction for the helper library.  The reply code goes into
+ * msg->reply (native bits 1:0, I2C bits 3:2) whatever it is -- ACK, NACK
+ * and DEFER are the library's to act on -- and the return value is the
+ * payload moved: the bytes read, or for a write the size (or the count a
+ * short-write reply carries).  A zero-size message is an address-only
+ * I2C transaction (no length byte).  Failures of the channel itself are
+ * negative errnos, which the library retries.
+ */
+static ssize_t intel_dp_aux_transfer(struct drm_dp_aux *dp, struct drm_dp_aux_msg *msg)
+{
+	struct intel_dp_aux *aux = container_of(dp, struct intel_dp_aux, dp);
+	uint8_t txbuf[20], rxbuf[20];
+	unsigned txsize, rxsize;
+	int ret;
+
+	if (aux_sink_gone(aux))
+		return -ENXIO;
+	aux_msg_header(txbuf, msg);
+	switch (msg->request & ~DP_AUX_I2C_MOT) {
+	case DP_AUX_NATIVE_WRITE:
+	case DP_AUX_I2C_WRITE:
+	case DP_AUX_I2C_WRITE_STATUS_UPDATE:
+		txsize = msg->size ? HEADER_SIZE + (unsigned)msg->size : BARE_ADDRESS_SIZE;
+		rxsize = 2; /* the reply, and a short write's count */
+		if (txsize > 20)
+			return -E2BIG;
+		WARN_ON_ONCE(!msg->buffer != !msg->size);
+		if (msg->buffer && msg->size)
+			mm_memcpy(txbuf + HEADER_SIZE, msg->buffer, msg->size);
+		ret = aux_xfer_locked(aux, txbuf, txsize, rxbuf, rxsize);
+		if (ret > 0) {
+			msg->reply = rxbuf[0] >> 4;
+			if (ret > 1) {
+				/* the bytes a short write got through */
+				ret = rxbuf[1];
+				if (ret > (int)msg->size)
+					ret = (int)msg->size;
+			} else {
+				ret = (int)msg->size;
+			}
+		}
+		break;
+	case DP_AUX_NATIVE_READ:
+	case DP_AUX_I2C_READ:
+		txsize = msg->size ? HEADER_SIZE : BARE_ADDRESS_SIZE;
+		rxsize = (unsigned)msg->size + 1;
+		if (rxsize > 20)
+			return -E2BIG;
+		ret = aux_xfer_locked(aux, txbuf, txsize, rxbuf, rxsize);
+		if (ret > 0) {
+			msg->reply = rxbuf[0] >> 4;
+			/* The payload is copied whatever the reply: the
+			 * library reads it only after an ACK. */
+			ret--;
+			if (ret > (int)msg->size)
+				ret = (int)msg->size;
+			if (ret > 0)
+				mm_memcpy(msg->buffer, rxbuf + 1, (size_t)ret);
+		}
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+	return ret;
+}
+
+int intel_dp_aux_native_read(struct intel_dp_aux *aux, uint32_t addr,
+			     uint8_t *buf, unsigned len)
+{
+	if (!len)
+		return 0;
+	return (int)drm_dp_dpcd_read(&aux->dp, addr, buf, len);
+}
+
+int intel_dp_aux_native_write(struct intel_dp_aux *aux, uint32_t addr,
+			      const uint8_t *buf, unsigned len)
+{
+	if (!len)
+		return 0;
+	/* the library takes a plain pointer; a write only reads it */
+	return (int)drm_dp_dpcd_write(&aux->dp, addr, (void *)(uintptr_t)buf, len);
+}
+
+/* The output's I2C adapter hands its transfers to the library's tunnel,
+ * so whoever holds o->aux.i2c reads through the helpers too. */
+static int aux_i2c_forward(struct i2c_adapter *a, struct i2c_msg *msgs, int n)
+{
+	struct intel_dp_aux *aux = a->priv;
+
+	return i2c_transfer(&aux->dp.ddc, msgs, n);
+}
+
+#endif /* I915_FEAT_DP_HELPERS */
+
 void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
 		       int port)
 {
@@ -355,7 +541,9 @@ void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
 		aux->ctl_reg = DP_AUX_CH_CTL(ch);
 		aux->data_reg = DP_AUX_CH_DATA(ch, 0);
 	}
+#if !I915_FEAT_DP_HELPERS
 	aux->i2c.xfer = aux_i2c_xfer;
+#endif
 	aux->i2c.priv = aux;
 	aux->i2c.name[0] = 'A';
 	aux->i2c.name[1] = 'U';
@@ -373,4 +561,15 @@ void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
 		aux->i2c.name[3] = (char)('A' + port);
 		aux->i2c.name[4] = 0;
 	}
+#if I915_FEAT_DP_HELPERS
+	/* The library's channel: this transfer hook, the name for its
+	 * messages and its I2C adapter, the hardware channel's lock; the
+	 * output's own adapter forwards to the library's. */
+	aux->dp.name = aux->i2c.name;
+	aux->dp.drm_dev = &i915->drm;
+	aux->dp.transfer = intel_dp_aux_transfer;
+	drm_dp_aux_register(&aux->dp);
+	aux->i2c.xfer = aux_i2c_forward;
+	aux->hw_lock = aux_hw_lock_for(i915, aux->ctl_reg);
+#endif
 }

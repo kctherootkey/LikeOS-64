@@ -13,7 +13,12 @@
 // a stream of faults cannot starve an munmap for ever.  The exception is a task
 // that ALREADY holds a shared reference (task->mm_rdepth > 0): its nested
 // acquisition must jump the queue, because the writer it would queue behind is
-// itself waiting for that first reference to drain.  Recursion under one's own
+// itself waiting for that first reference to drain.  So is a task holding a
+// filesystem lock (task->fs_held > 0), faulting on a user buffer it copies
+// under that lock: the readers the queued writer waits for can be page-ins
+// waiting for that same filesystem lock, and queuing would close the cycle --
+// every faulting thread of the process stopped, and with them everything else
+// that pages in from that filesystem.  Recursion under one's own
 // EXCLUSIVE hold is granted as a depth increment for the same reason -- mmap()
 // holds the lock for writing and then copies its arguments from user memory,
 // which can fault straight back into a reader.
@@ -21,6 +26,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/mm/rwsem.h>
+#include <kernel/mm/memory.h>
 #include <kernel/uapi/bug.h>
 
 void mm_rwsem_init(mm_rwsem_t *sem, const char *name)
@@ -71,7 +77,8 @@ void mm_read_lock(mm_rwsem_t *sem)
 			return;
 		}
 		{
-			int defer = sem->w_wait && !(cur && cur->mm_rdepth);
+			/* ...nor one holding a filesystem lock: see fs_held. */
+			int defer = sem->w_wait && !(cur && (cur->mm_rdepth || cur->fs_held));
 
 			if (!sem->writer && !defer) {
 				sem->readers++;
@@ -111,7 +118,7 @@ bool mm_read_trylock(mm_rwsem_t *sem)
 		return true;
 	}
 	{
-		int defer = sem->w_wait && !(cur && cur->mm_rdepth);
+		int defer = sem->w_wait && !(cur && (cur->mm_rdepth || cur->fs_held));
 
 		if (!sem->writer && !defer) {
 			sem->readers++;
@@ -209,6 +216,14 @@ void mm_write_unlock(mm_rwsem_t *sem)
 	sem->wdepth = 0;
 	spin_unlock_irqrestore(&sem->lock, flags);
 	sched_wake_channel((void *)sem);
+	/* the files retired under this address space's lock, closed now
+	 * that it is released (mm_region_retire) */
+	{
+		task_t *cur = sched_current();
+
+		if (cur && cur->mm_close_later && sem == &task_mm_owner(cur)->mmap_lock)
+			mm_close_deferred(cur);
+	}
 }
 
 bool mm_rwsem_is_locked(const mm_rwsem_t *sem)

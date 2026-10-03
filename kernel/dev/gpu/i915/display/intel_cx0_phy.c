@@ -1849,6 +1849,28 @@ int mtl_phy_pll_get_hdmi(struct i915_device *i915, struct intel_output *o, uint3
 	return o->port;
 }
 
+int mtl_phy_hdmi_clock_ok(struct i915_device *i915, const struct intel_output *o,
+			  uint32_t clock_khz)
+{
+	struct cx0 c;
+	struct c20_pll s;
+
+	/* the LT PHYs decide when their PLL is asked for */
+	if (intel_has_lt_phy(i915))
+		return 1;
+	if (!o || !port_ok(o->port) || !clock_khz)
+		return 0;
+	cx0_setup(&c, i915, o->port, o);
+	if (c.tbt)
+		return 0; /* no TMDS through Thunderbolt */
+	/* the C10's settings are computed for any clock its table lacks */
+	if (c.c10)
+		return 1;
+	if (c20_find(c20_tables(&c, 0), clock_khz))
+		return 1;
+	return c20_compute_hdmi(i915, clock_khz, &s) == 0;
+}
+
 void mtl_phy_pll_put(struct i915_device *i915, int pll)
 {
 	if (intel_has_lt_phy(i915)) {

@@ -438,7 +438,8 @@ void intel_ddi_buf_disable(struct i915_device *i915, struct intel_output *o)
 tp_off:;
 	uint32_t tp = i915_read32(i915, intel_dp_tp_ctl_reg(i915, o));
 	if (tp & DP_TP_CTL_ENABLE) {
-		tp &= ~(DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_MASK);
+		/* FEC goes off with the link: the next one may not want it */
+		tp &= ~(DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_MASK | DP_TP_CTL_FEC_ENABLE);
 		tp |= DP_TP_CTL_LINK_TRAIN_PAT1;
 		i915_write32(i915, intel_dp_tp_ctl_reg(i915, o), tp);
 		(void)i915_read32(i915, intel_dp_tp_ctl_reg(i915, o));

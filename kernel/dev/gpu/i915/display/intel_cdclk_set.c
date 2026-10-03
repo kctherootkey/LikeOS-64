@@ -177,11 +177,6 @@ static int hweight16(uint32_t v)
 	return n;
 }
 
-static int is_power_of_2(uint32_t v)
-{
-	return v && !(v & (v - 1));
-}
-
 static int plat_is(struct i915_device *i915, int platform)
 {
 	return i915->info->platform == platform;
@@ -1496,6 +1491,8 @@ static uint32_t crtc_min_cdclk(struct i915_device *i915, const struct intel_wm_p
 		if (g_cd.ver >= 9)
 			min_cdclk = umax(min_cdclk, 2 * 96000);
 	}
+	/* the stream compression engines, a pixel a clock each */
+	min_cdclk = umax(min_cdclk, c->dsc_min_cdclk);
 	return min_cdclk;
 }
 
@@ -1511,6 +1508,7 @@ uint32_t intel_cdclk_required_khz(struct i915_device *i915, const struct intel_w
 
 	if (!cfg) {
 		intel_wm_cfg_from_hw(i915, g_req_cfg);
+		intel_wm_cfg_dsc_from_hw(i915, g_req_cfg);
 		cfg = g_req_cfg;
 	}
 	/* the DBUF bandwidth (counted even for a configuration that does

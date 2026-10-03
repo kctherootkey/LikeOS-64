@@ -1020,6 +1020,8 @@ long devfs_write(vfs_file_t *f, const void *buf, long bytes)
 			df->fpos += (uint64_t)r;
 		return r;
 	}
+	if (df->type == DEVFS_TYPE_EVDEV)
+		return evdev_write(df->evdev_id, buf, bytes);
 	return -EINVAL;
 }
 

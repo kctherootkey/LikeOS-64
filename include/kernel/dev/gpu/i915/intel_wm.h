@@ -50,6 +50,9 @@ struct intel_wm_pipe_cfg {
 	uint16_t plane_src_x; /* where in the surface the plane starts (panning) */
 	uint64_t modifier;
 	uint16_t cursor_w;
+	/* The CDCLK (kHz) the stream compression engines of the pipe need;
+	 * 0 without compression. */
+	uint32_t dsc_min_cdclk;
 };
 
 /* What is running now, from display.pipes[] and their outputs.  A pipe
@@ -59,6 +62,10 @@ struct intel_wm_pipe_cfg {
  * non-zero. */
 void intel_wm_cfg_from_hw(struct i915_device *i915,
 			  struct intel_wm_pipe_cfg cfg[INTEL_MAX_PIPES]);
+/* And the compression engines' CDCLK of the running pipes into such a
+ * configuration (intel_display.c). */
+void intel_wm_cfg_dsc_from_hw(struct i915_device *i915,
+			      struct intel_wm_pipe_cfg cfg[INTEL_MAX_PIPES]);
 /* One pipe's timing and output, from the mode about to be set: `m' is
  * the transcoder's timing, src_w x src_h the client's picture,
  * `port_clock_khz' the link rate (DP) or TMDS clock (HDMI) as far as it

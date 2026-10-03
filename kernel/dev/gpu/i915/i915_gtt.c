@@ -24,6 +24,7 @@
 #include <kernel/dev/gpu/i915/i915_gt.h>
 #include <kernel/dev/gpu/i915/i915_lmem.h>
 #include <kernel/dev/gpu/i915/i915_legacy.h>
+#include <kernel/dev/gpu/i915/i915_ggtt_view.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -932,6 +933,34 @@ void i915_ggtt_program_pat(struct i915_device *i915)
  * as the display engine wants; everything else is page aligned. */
 #define SCANOUT_ALIGN_PAGES 64u
 
+/* Where the firmware's framebuffer ends in the global space, 0 when the
+ * firmware left nothing scanning out.  The surface plus its stride times
+ * its height, the height rounded up to a whole tile row (32 lines covers
+ * every tiling) and the stride taken in the largest unit the register may
+ * count in, so the range is never short. */
+static uint64_t boot_scanout_end(const struct i915_device *i915)
+{
+	if (i915->boot_scanout.pipe < 0)
+		return 0;
+	uint64_t surf = i915->boot_scanout.surf & ~0xfffu;
+	uint64_t stride, height;
+
+	if (i915->info->display_ver < 9) {
+		/* DSPSTRIDE counts bytes; the height is the pipe's */
+		stride = i915->boot_scanout.stride & 0x1ffc0;
+		height = (i915->boot_scanout.size & 0xfff) + 1;
+	} else {
+		/* PLANE_STRIDE counts 64-byte units for a linear surface and
+		 * whole tiles (up to 512 bytes wide) for a tiled one */
+		uint32_t units = i915->boot_scanout.stride & 0x7ff;
+		uint32_t tiled = i915->boot_scanout.plane_ctl & PLANE_CTL_TILED_MASK;
+		stride = (uint64_t)units * (tiled ? 512 : 64);
+		height = ((i915->boot_scanout.size >> 16) & 0xfff) + 1;
+	}
+	height = (height + 31) & ~31ull;
+	return surf + stride * height;
+}
+
 static int ggtt_map_init(struct i915_device *i915)
 {
 	uint64_t top = i915->ggtt_bytes;
@@ -955,6 +984,26 @@ static int ggtt_map_init(struct i915_device *i915)
 	if (!i915->ggtt_map) {
 		i915->ggtt_map_pages = pages;
 		i915->ggtt_map_first = (uint32_t)((i915->stolen_size + (64u << 20)) / 4096);
+		/* Bindings the CPU reaches through the aperture (MMAP_GTT) must
+		 * lie in its first bar_aperture.size bytes, which the reservation
+		 * above can cover entirely (352 MB of stolen memory behind a 256 MB
+		 * aperture).  Only the firmware's framebuffer has to stay as the
+		 * firmware mapped it -- the console falls back to it -- so the
+		 * aperture's bindings start right after it; with nothing scanning
+		 * out, after a quarter of the aperture or the stolen range,
+		 * whichever is less. */
+		uint64_t keep = boot_scanout_end(i915);
+		if (!keep) {
+			keep = i915->stolen_size;
+			if (keep > i915->bar_aperture.size / 4)
+				keep = i915->bar_aperture.size / 4;
+		}
+		if (keep < (64u << 10))
+			keep = 64u << 10;
+		keep = (keep + (256u << 10) - 1) & ~(uint64_t)((256u << 10) - 1);
+		if (keep / 4096 > i915->ggtt_map_first)
+			keep = (uint64_t)i915->ggtt_map_first * 4096;
+		i915->ggtt_mappable_first = (uint32_t)(keep / 4096);
 		i915->ggtt_map = map;
 		map = NULL;
 	}
@@ -1068,7 +1117,7 @@ int i915_ggtt_bind_obj_mappable(struct i915_device *i915, struct drm_gem_object 
 		limit = i915->ggtt_map_pages;
 	if (o->npages > limit)
 		return -ENOSPC;
-	uint32_t start = i915->ggtt_map_first;
+	uint32_t start = i915->ggtt_mappable_first;
 	uint64_t fl;
 	spin_lock_irqsave(&i915->ggtt_lock, &fl);
 	while (start + o->npages <= limit) {
@@ -1098,6 +1147,60 @@ int i915_ggtt_bind_obj_mappable(struct i915_device *i915, struct drm_gem_object 
 	return -ENOSPC;
 }
 
+/* ---- ranges whose entries the caller writes (rotated views) -------------------- */
+
+int i915_ggtt_reserve(struct i915_device *i915, uint32_t npages, uint32_t align_pages,
+		      uint32_t *ggtt)
+{
+	uint64_t fl;
+	uint32_t start;
+
+	if (i915_is_legacy(i915))
+		return -EOPNOTSUPP;
+	if (!i915->gtt_virt || !npages || !align_pages || (align_pages & (align_pages - 1)))
+		return -EINVAL;
+	if (ggtt_map_init(i915) != 0)
+		return -ENOMEM;
+	/* found and taken under the map's lock, as every binding is */
+	spin_lock_irqsave(&i915->ggtt_lock, &fl);
+	start = ggtt_map_find(i915, npages, align_pages);
+	if (start)
+		for (uint32_t i = 0; i < npages; i++)
+			ggtt_map_set(i915, start + i, 1);
+	spin_unlock_irqrestore(&i915->ggtt_lock, fl);
+	if (!start) {
+		static int said;
+		if (said < 4) {
+			said++;
+			kprintf("[drm] i915: no room in the global address space for a view of %u pages\n",
+				npages);
+		}
+		return -ENOSPC;
+	}
+	*ggtt = start * 4096;
+	return 0;
+}
+
+void i915_ggtt_fill(struct i915_device *i915, uint32_t ggtt, uint32_t npages,
+		    i915_ggtt_page_fn page_of, void *ctx, int uncached)
+{
+	uint32_t first = ggtt / 4096;
+	/* what an unbound entry maps: the display skips a view's padding
+	 * pages, and anything that does read one finds zeroes */
+	uint64_t scratch = i915->ggtt_scratch_phys ?
+				   ggtt_pte_encode(i915, i915->ggtt_scratch_phys, 1) : 0;
+
+	if (!i915->gtt_virt)
+		return;
+	for (uint32_t i = 0; i < npages; i++) {
+		uint64_t entry = page_of(ctx, i);
+		ggtt_write_pte(i915, first + i,
+			       entry == I915_ROTATION_PADDING ? scratch :
+								ggtt_pte_encode(i915, entry, uncached));
+	}
+	ggtt_flush(i915);
+}
+
 void i915_ggtt_rewrite_all(struct i915_device *i915)
 {
 	struct drm_device *dev = &i915->drm;
@@ -1120,6 +1223,8 @@ void i915_ggtt_rewrite_all(struct i915_device *i915)
 		n++;
 	}
 	ggtt_flush(i915);
+	/* the rotated views of the objects (each flushes itself) */
+	n += i915_ggtt_views_rewrite(i915);
 	i915_dbg("[drm] i915: %u global bindings written again\n", n);
 }
 

@@ -4,6 +4,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/gpu/drm.h>
+#include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/uapi/drm/dma-buf.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/timer.h>
@@ -160,18 +161,73 @@ void drm_gem_get(struct drm_gem_object *o)
 
 static void gem_destroy_final(struct drm_gem_object *o);
 
+/* The power gate around a teardown.
+ *
+ * Destroying an object reaches the device -- a surface's DESTROY command,
+ * a MOB unbound, a fence poll -- and none of that may happen while the
+ * device is suspended or on its way down or up.  The callers here must not
+ * wait for it either: the last reference often goes from munmap with the
+ * address space locked for writing, and the reaper has nothing better to
+ * do than come back later.  So the gate is only tried; an object that
+ * cannot be finished now stays on the dead list, and the first reap after
+ * the resume collects it (drm_gem_pm_resumed).
+ *
+ * GEM_PM_REFUSED: the device is not running, leave the work.
+ * GEM_PM_ENTERED: inside the gate, pair with gem_pm_exit().
+ * GEM_PM_UNGATED: no gate to pass -- switched off, or a device that has
+ * not been registered yet (its backend may build and drop objects of its
+ * own before that, and nothing can suspend it then). */
+#define GEM_PM_REFUSED 0
+#define GEM_PM_ENTERED 1
+#define GEM_PM_UNGATED 2
+
+static int gem_pm_tryenter(struct drm_device *dev)
+{
+	if (!DRM_PM_GATE || !dev->drv)
+		return GEM_PM_UNGATED;
+	return drm_pm_gate_tryenter(dev) ? GEM_PM_ENTERED : GEM_PM_REFUSED;
+}
+
+static void gem_pm_exit(struct drm_device *dev, int pm)
+{
+	if (pm == GEM_PM_ENTERED)
+		drm_pm_gate_exit(dev);
+}
+
+/* Queue an object on the dead list: the new length. */
+static int gem_dead_push(struct drm_device *dev, struct drm_gem_object *o)
+{
+	uint64_t fl;
+	int n;
+
+	spin_lock_irqsave(&dev->lock, &fl);
+	o->dead_next = dev->dead;
+	dev->dead = o;
+	n = ++dev->dead_n;
+	spin_unlock_irqrestore(&dev->lock, fl);
+	return n;
+}
+
 static void gem_reap(struct drm_device *dev, int poll)
 {
 	uint64_t fl;
+	int pm;
 
 	if (!dev || !__atomic_load_n(&dev->dead_n, __ATOMIC_RELAXED))
+		return;
+	/* Not while the device is down: the queue keeps, see
+	 * gem_pm_tryenter(). */
+	pm = gem_pm_tryenter(dev);
+	if (pm == GEM_PM_REFUSED)
 		return;
 	/* Not from inside another reap: see dev->reaping.  What this one
 	 * leaves behind, the walk already running collects on its next turn,
 	 * and failing that the next submission does -- there are hundreds of
 	 * those a second. */
-	if (__atomic_exchange_n(&dev->reaping, 1, __ATOMIC_ACQUIRE))
+	if (__atomic_exchange_n(&dev->reaping, 1, __ATOMIC_ACQUIRE)) {
+		gem_pm_exit(dev, pm);
 		return;
+	}
 
 	/* Asking the device costs a walk of every command-buffer slot through
 	 * uncached memory, so it is done by the caller that is between frames
@@ -206,6 +262,7 @@ static void gem_reap(struct drm_device *dev, int poll)
 		gem_destroy_final(o);
 	}
 	__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+	gem_pm_exit(dev, pm);
 }
 
 /* The reaper thread.
@@ -244,8 +301,19 @@ static void gem_reap_thread(void *arg)
 			if (self->state != TASK_RUNNING)
 				self->state = TASK_RUNNING;
 		}
-		if (g_reap_dev)
+		if (g_reap_dev) {
 			gem_reap(g_reap_dev, 0);
+			if (g_reap_dev->drv && g_reap_dev->drv->idle_reclaim) {
+				/* Not while the device is down: see
+				 * gem_pm_tryenter(). */
+				int pm = gem_pm_tryenter(g_reap_dev);
+
+				if (pm != GEM_PM_REFUSED) {
+					g_reap_dev->drv->idle_reclaim(g_reap_dev);
+					gem_pm_exit(g_reap_dev, pm);
+				}
+			}
+		}
 	}
 }
 
@@ -276,15 +344,39 @@ void drm_gem_reap(struct drm_device *dev)
 	gem_reap(dev, 0);
 }
 
+/* The device runs again after a suspend (or a suspend that was given up):
+ * whatever was dropped meanwhile sits on the dead list, its teardown
+ * refused at the gate.  Finish what the device is done with now, asking
+ * the device this once -- its fences may have moved while nothing polled
+ * -- and wake the reaper thread for the rest instead of leaving it to its
+ * next tick.  Process context, called with the gate open. */
+void drm_gem_pm_resumed(struct drm_device *dev)
+{
+	if (!dev)
+		return;
+	gem_reap(dev, 1);
+	if (g_reap_dev == dev)
+		sched_wake_channel((void *)&g_reap_dev);
+}
+
 /* Wait for the oldest queued object and finish it, however long that takes.
  * Only for the cap above and for teardown; the ordinary path never waits. */
 static void gem_reap_one_blocking(struct drm_device *dev)
 {
 	struct drm_gem_object *o;
 	uint64_t fl;
+	int pm;
 
-	if (__atomic_exchange_n(&dev->reaping, 1, __ATOMIC_ACQUIRE))
+	/* Not while the device is down, and without waiting for it to come
+	 * back: the cap is for a client outrunning the device, and while the
+	 * device is suspended nobody submits anything. */
+	pm = gem_pm_tryenter(dev);
+	if (pm == GEM_PM_REFUSED)
+		return;
+	if (__atomic_exchange_n(&dev->reaping, 1, __ATOMIC_ACQUIRE)) {
+		gem_pm_exit(dev, pm);
 		return; /* someone is already emptying it */
+	}
 	spin_lock_irqsave(&dev->lock, &fl);
 	o = dev->dead;
 	if (o) {
@@ -294,6 +386,7 @@ static void gem_reap_one_blocking(struct drm_device *dev)
 	spin_unlock_irqrestore(&dev->lock, fl);
 	if (!o) {
 		__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+		gem_pm_exit(dev, pm);
 		return;
 	}
 	if (o->fence) {
@@ -318,12 +411,9 @@ static void gem_reap_one_blocking(struct drm_device *dev)
 				said++;
 				kprintf("[drm] an object's fence did not pass in 2 s; its memory stays queued\n");
 			}
-			spin_lock_irqsave(&dev->lock, &fl);
-			o->dead_next = dev->dead;
-			dev->dead = o;
-			dev->dead_n++;
-			spin_unlock_irqrestore(&dev->lock, fl);
+			(void)gem_dead_push(dev, o);
 			__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+			gem_pm_exit(dev, pm);
 			return;
 		}
 		drm_fence_put(o->fence);
@@ -331,6 +421,7 @@ static void gem_reap_one_blocking(struct drm_device *dev)
 	}
 	gem_destroy_final(o);
 	__atomic_store_n(&dev->reaping, 0, __ATOMIC_RELEASE);
+	gem_pm_exit(dev, pm);
 }
 
 void drm_gem_put(struct drm_gem_object *o)
@@ -340,7 +431,7 @@ void drm_gem_put(struct drm_gem_object *o)
 	if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) != 0)
 		return;
 	struct drm_device *dev = o->dev;
-	uint64_t fl;
+	int pm;
 
 	/* Whatever the device is already known to have finished with goes now,
 	 * in this caller's time rather than in the time of the thread that
@@ -354,14 +445,20 @@ void drm_gem_put(struct drm_gem_object *o)
 	 * is what named it: nothing about destroying an object needs the
 	 * thread that destroys it to stop drawing. */
 	if (o->fence && !o->fence->signaled) {
-		spin_lock_irqsave(&dev->lock, &fl);
-		o->dead_next = dev->dead;
-		dev->dead = o;
-		dev->dead_n++;
-		int over = dev->dead_n > DRM_GEM_DEAD_MAX;
-		spin_unlock_irqrestore(&dev->lock, fl);
+		int over = gem_dead_push(dev, o) > DRM_GEM_DEAD_MAX;
 		if (over)
 			gem_reap_one_blocking(dev);
+		return;
+	}
+	/* Done with, but the device is down (or going down, or coming up):
+	 * its teardown waits on the dead list for the resume rather than
+	 * reaching the device now, and this caller -- munmap, perhaps, with
+	 * the address space locked -- does not wait for it.  No cap here:
+	 * nothing is submitted while the device is suspended, so the list
+	 * cannot run away. */
+	pm = gem_pm_tryenter(dev);
+	if (pm == GEM_PM_REFUSED) {
+		(void)gem_dead_push(dev, o);
 		return;
 	}
 	if (o->fence) {
@@ -369,6 +466,7 @@ void drm_gem_put(struct drm_gem_object *o)
 		o->fence = NULL;
 	}
 	gem_destroy_final(o);
+	gem_pm_exit(dev, pm);
 }
 
 static void gem_destroy_final(struct drm_gem_object *o)

@@ -334,9 +334,75 @@ int64_t sys_brk(uint64_t new_brk)
  * process from an ioctl (the graphics driver's legacy object-mapping
  * call returns an address rather than an offset).  With `given' set, `fd'
  * is ignored and the record carries no descriptor number. */
+/* The contents of a shared mapping of a plain file, read BEFORE the address
+ * space is locked.  Reading a file takes the filesystem's locks, and a thread
+ * holding one of those may be faulting on this address space -- waiting for
+ * the very lock mmap holds for writing.  So the pages are filled first and
+ * the locked part only maps them; what it does not use is freed afterwards
+ * (mmap_prefill_release).  Read by position, so the descriptor's own offset
+ * -- which belongs to the program -- is left where it was. */
+struct mmap_prefill {
+	uint64_t *pages;
+	uint64_t n;
+};
+
+static void mmap_prefill(struct mmap_prefill *pre, uint64_t fd, uint64_t length,
+			 uint64_t offset)
+{
+	task_t *cur = sched_current();
+	vfs_file_t *file;
+	uint64_t n = length / PAGE_SIZE;
+
+	pre->pages = NULL;
+	pre->n = 0;
+	if (!cur || !n || (offset & (PAGE_SIZE - 1)))
+		return;
+	file = fdget(cur, (int)fd);
+	if (!file)
+		return;
+	if (fd_is_special(file) || devfs_shm_object(file) || devfs_is_fb0(file) ||
+	    device_file_ops(file)) {
+		fdput(file);
+		return;
+	}
+	pre->pages = kalloc(n * sizeof(uint64_t));
+	if (!pre->pages) {
+		fdput(file);
+		return;
+	}
+	for (uint64_t i = 0; i < n; i++) {
+		uint64_t phys = mm_allocate_physical_page();
+
+		if (!phys)
+			break;
+#if DEBUG
+		mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+#endif
+		long got = vfs_pread(file, phys_to_virt(phys), PAGE_SIZE,
+				     (long)(offset + i * PAGE_SIZE));
+		if (got < (long)PAGE_SIZE)
+			mm_memset((uint8_t *)phys_to_virt(phys) + (got > 0 ? got : 0), 0,
+				  PAGE_SIZE - (uint64_t)(got > 0 ? got : 0));
+		pre->pages[pre->n++] = phys;
+	}
+	fdput(file);
+}
+
+static void mmap_prefill_release(struct mmap_prefill *pre)
+{
+	if (!pre->pages)
+		return;
+	for (uint64_t i = 0; i < pre->n; i++)
+		if (pre->pages[i])
+			mm_free_physical_page(pre->pages[i]);
+	kfree(pre->pages);
+	pre->pages = NULL;
+	pre->n = 0;
+}
+
 static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			   uint64_t flags, uint64_t fd, uint64_t offset,
-			   vfs_file_t *given)
+			   vfs_file_t *given, struct mmap_prefill *pre)
 {
 	/* One exit, so the backing file's hold is released however this
 	 * answers.  Anonymous mappings leave it NULL and release nothing. */
@@ -815,7 +881,17 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	uint64_t pages_mapped = 0;
 
 	for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
-		uint64_t phys = mm_allocate_physical_page();
+		uint64_t phys = 0;
+		int filled = 0;
+
+		/* read before the lock was taken (mmap_prefill) */
+		if (backing && pre && pre->pages && off / PAGE_SIZE < pre->n) {
+			phys = pre->pages[off / PAGE_SIZE];
+			pre->pages[off / PAGE_SIZE] = 0;
+			filled = 1;
+		}
+		if (!phys)
+			phys = mm_allocate_physical_page();
 		if (!phys) {
 			// Unmap already-mapped pages on failure
 			for (uint64_t cleanup = 0; cleanup < off;
@@ -833,18 +909,17 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		 * DEBUG builds poison on alloc, so zero explicitly there:
 		 * anon mmap pages must read as zero in userspace. */
 #if DEBUG
-		mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+		if (!filled)
+			mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
 #endif
 
-		// For file-backed mappings, read content from file
-		if (backing) {
-			// Seek to the correct position and read into direct-mapped address
-			long file_off = (long)(offset + off);
-			if (vfs_seek(backing, file_off, SEEK_SET) >= 0) {
-				vfs_read(backing, phys_to_virt(phys),
-					 PAGE_SIZE);
-			}
-		}
+		/* For file-backed mappings, the content -- read by position,
+		 * leaving the descriptor's offset alone.  Normally done
+		 * already, before the lock (mmap_prefill); here only when that
+		 * could not be. */
+		if (backing && !filled)
+			(void)vfs_pread(backing, phys_to_virt(phys), PAGE_SIZE,
+					(long)(offset + off));
 
 		if (!mm_map_page_in_address_space(cur->pml4, vaddr + off, phys,
 						  page_flags)) {
@@ -886,9 +961,15 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		 uint64_t flags, uint64_t fd, uint64_t offset)
 {
 	int64_t ret;
+	struct mmap_prefill pre = { NULL, 0 };
 
+	if ((flags & MAP_SHARED) && !(flags & MAP_ANONYMOUS) &&
+	    (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) && length &&
+	    length <= (1ULL << 30))
+		mmap_prefill(&pre, fd, PAGE_ALIGN(length), offset);
 	RUN_WRITE_LOCKED_RET(
-		ret, mmap_locked(addr, length, prot, flags, fd, offset, NULL));
+		ret, mmap_locked(addr, length, prot, flags, fd, offset, NULL, &pre));
+	mmap_prefill_release(&pre);
 
 	/* MAP_POPULATE: touch every page now.  Done after the address-space
 	 * lock is dropped because the fault handlers take it for reading
@@ -912,7 +993,7 @@ int64_t mm_mmap_file(vfs_file_t *file, uint64_t length, uint64_t prot,
 	if (!file)
 		return -EBADF;
 	RUN_WRITE_LOCKED_RET(ret, mmap_locked(0, length, prot, flags,
-					      (uint64_t)-1, offset, file));
+					      (uint64_t)-1, offset, file, NULL));
 	return ret;
 }
 

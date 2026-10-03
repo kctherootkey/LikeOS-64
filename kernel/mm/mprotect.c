@@ -21,8 +21,22 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 		return -EINVAL;
 	}
 
-	// Round up length to page boundary
+	/* Nothing to change.  Carried on, an empty range at an address inside
+	 * a region still counted as overlapping it: the region was split there
+	 * and the "covered" middle part became a record of length zero -- one
+	 * that holds a reference to the region's file or buffer and that no
+	 * unmap can ever find again.  JavaScriptCore asks for exactly this
+	 * (protecting the unused tail of a reservation whose initial size is
+	 * its maximum). */
+	if (len == 0)
+		return 0;
+	/* Round up length to page boundary; a range that wraps past the top
+	 * of the address space describes nothing. */
+	if (len > ~0ULL - (PAGE_SIZE - 1))
+		return -ENOMEM;
 	uint64_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+	if (addr + pages * PAGE_SIZE <= addr)
+		return -ENOMEM;
 
 	// Build page flags
 	uint64_t flags = PAGE_PRESENT | PAGE_USER;

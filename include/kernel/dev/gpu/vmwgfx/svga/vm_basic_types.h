@@ -23,6 +23,9 @@
 #ifndef INT32_MAX
 #define INT32_MAX 0x7FFFFFFF
 #endif
+#ifndef UINT16_MAX
+#define UINT16_MAX 0xFFFFu
+#endif
 #else
 #include <stdbool.h>
 #include <stdint.h>
@@ -54,6 +57,16 @@ typedef bool Bool;
 #endif
 #ifndef MBYTES_2_BYTES
 #define MBYTES_2_BYTES(_nbytes) ((uint64)(_nbytes) << MBYTES_SHIFT)
+#endif
+#ifndef GBYTES_SHIFT
+#define GBYTES_SHIFT 30
+#endif
+#ifndef GBYTES_2_BYTES
+#define GBYTES_2_BYTES(_nbytes) ((uint64)(_nbytes) << GBYTES_SHIFT)
+#endif
+
+#ifndef INVALID_PPN64
+#define INVALID_PPN64 ((PPN64)0x000fffffffffffffULL)
 #endif
 
 #define INLINE inline

@@ -10,6 +10,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/device.h>
+#include <kernel/fs/eventfd.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
@@ -20,6 +21,10 @@
 #include <kernel/net/net.h>
 
 struct eventfd_ctx {
+	/* The descriptor's reference plus one per kernel user holding the
+	 * counter (eventfd_ctx_fdget()): a kernel user may signal it after
+	 * the descriptor is closed. */
+	int refs;
 	spinlock_t lock;
 	uint64_t count;
 	int semaphore;
@@ -132,11 +137,15 @@ static short eventfd_poll(vfs_file_t *f, short events, struct poll_table *pt)
 	return rev;
 }
 
+void eventfd_ctx_put(struct eventfd_ctx *c)
+{
+	if (c && __atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL) == 0)
+		kfree(c);
+}
+
 static void eventfd_release(vfs_file_t *f)
 {
-	struct eventfd_ctx *c = device_file_priv(f);
-	if (c)
-		kfree(c);
+	eventfd_ctx_put(device_file_priv(f));
 }
 
 static const struct device_ops eventfd_ops = {
@@ -145,6 +154,38 @@ static const struct device_ops eventfd_ops = {
 	.poll = eventfd_poll,
 	.release = eventfd_release,
 };
+
+int eventfd_ctx_fdget(int fd, struct eventfd_ctx **out)
+{
+	task_t *cur = sched_current();
+	vfs_file_t *f = cur ? fdget(cur, fd) : NULL;
+	struct eventfd_ctx *c;
+
+	if (!f)
+		return -EBADF;
+	if (device_file_ops(f) != &eventfd_ops) {
+		fdput(f);
+		return -EINVAL;
+	}
+	c = device_file_priv(f);
+	__atomic_fetch_add(&c->refs, 1, __ATOMIC_ACQ_REL);
+	fdput(f);
+	*out = c;
+	return 0;
+}
+
+/* From any context, interrupts off included: the counter saturates rather
+ * than blocking, since a kernel signaller cannot wait for a reader. */
+void eventfd_signal(struct eventfd_ctx *c)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&c->lock, &fl);
+	if (c->count < EVENTFD_MAX)
+		c->count++;
+	spin_unlock_irqrestore(&c->lock, fl);
+	poll_notify_wq(&c->wq);
+}
 
 int64_t sys_eventfd2(uint64_t initval, uint64_t flags)
 {
@@ -158,6 +199,7 @@ int64_t sys_eventfd2(uint64_t initval, uint64_t flags)
 	if (!c)
 		return -ENOMEM;
 	mm_memset(c, 0, sizeof(*c));
+	c->refs = 1;
 	spinlock_init(&c->lock, "eventfd");
 	wq_head_init(&c->wq, "eventfd");
 	c->count = (uint32_t)initval;

@@ -258,7 +258,11 @@
 #define PIPE_B 1
 #define PIPE_C 2
 #define PIPE_D 3
-#define TRANSCODER_EDP 3
+/* Transcoders A-D are numbered as the pipes they belong to (index 3 is
+ * transcoder D, at 0x63000, on the parts that have four pipes); the
+ * embedded-panel transcoder of Haswell up to Ice Lake is a separate one
+ * at 0x6F000 that any of the first three pipes can feed. */
+#define TRANSCODER_EDP 4
 
 #define PIPECONF(pipe) (0x70008 + (pipe) * 0x1000)
 #define PIPECONF_ENABLE (1u << 31)
@@ -403,6 +407,9 @@
 #define DDI_BUF_BALANCE_LEG_ENABLE (1u << 31)
 #define DP_TP_CTL(port) (0x64040 + (port) * 0x100)
 #define DP_TP_CTL_ENABLE (1u << 31)
+#ifndef DP_TP_CTL_FEC_ENABLE
+#define DP_TP_CTL_FEC_ENABLE (1u << 30)
+#endif
 #define DP_TP_CTL_MODE_SST (0 << 27)
 #define DP_TP_CTL_MODE_MST (1 << 27)
 #define DP_TP_CTL_FORCE_ACT (1 << 25)
@@ -495,6 +502,9 @@
 #define TRANS_DDI_PORT_WIDTH_MASK (7 << 1)
 #define TRANS_DDI_PORT_WIDTH(width) (((width) - 1) << 1)
 #define TRANS_DDI_HDMI_SCRAMBLING (1 << 0)
+/* HDMI: the TMDS character rate is above 340 MHz (the clock lane runs at
+ * 1/40 of the bit rate) */
+#define TRANS_DDI_HIGH_TMDS_CHAR_RATE (1 << 4)
 #define TRANS_CONF(trans) ((trans) == TRANSCODER_EDP ? 0x7F008 : 0x70008 + (trans) * 0x1000)
 #define TRANS_CONF_ENABLE (1u << 31)
 #define TRANS_CONF_STATE_ENABLE (1 << 30)

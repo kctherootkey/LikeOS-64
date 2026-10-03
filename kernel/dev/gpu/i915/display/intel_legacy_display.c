@@ -17,12 +17,28 @@
 // behind it on Ironlake to Ivy Bridge, and the hotplug pins on both.  The
 // hotplug interrupt only notes the pins; a worker probes them.
 //
+// Vblank: a crtc's vblank is handed to the core's reference-counted
+// interface once its pipe runs (drm_crtc_vblank_on) and taken back before
+// the pipe stops (drm_crtc_vblank_off).  In between the core switches the
+// pipe's vblank interrupt on and off as clients need it, reads the pipe's
+// hardware frame counter -- 32 bits from G4X and Ironlake on, 24 bits on
+// gen3/4 (assembled from PIPEFRAME and PIPEFRAMEPIXEL), none on gen2 --
+// and dates each vblank from the scanout position.  The interrupt enables
+// (PIPESTAT, DEIMR) are changed under one lock, as the interrupt handler
+// rewrites them too.
+//
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2026 Intel Corporation
+// Portions Copyright (C) 2022-2023 Intel Corporation
+// Portions Copyright (C) 2023 Intel Corporation
+// Portions Copyright (C) 2020 Intel Corporation
 
 #include <kernel/dev/gpu/i915/intel_legacy.h>
 #include <kernel/dev/gpu/i915/intel_display_legacy.h>
+#include <kernel/dev/gpu/i915/intel_legacy_color.h>
+#include <kernel/dev/gpu/i915/intel_features.h>
+#include <kernel/dev/gpu/drm_vblank.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/dev/gpu/drm_internal.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
@@ -409,6 +425,10 @@ static void i9xx_set_pipeconf(struct lg_display *d, const struct lg_config *cfg)
 	if ((d->is_vlv || d->is_chv) && cfg->limited_color_range)
 		val |= PIPECONF_COLOR_RANGE_SELECT;
 	val |= cfg->gamma_mode;
+#if I915_FEAT_LEGACY_COLOR_MGMT
+	/* the Valleyview WGC matrix */
+	val |= lg_color_pipeconf_bits(d, cfg->pipe);
+#endif
 	lg_wr(d, PIPECONF(d, cfg->pipe), val);
 	lg_posting_read(d, PIPECONF(d, cfg->pipe));
 }
@@ -467,11 +487,21 @@ static void disable_pipe(struct lg_display *d, const struct lg_config *cfg)
 
 /* ---- vblank interrupts ------------------------------------------------------------- */
 
+/* The display's interrupt enables -- each pipe's PIPESTAT enables, DEIMR
+ * -- are read, changed and written back by the mode set, by the core's
+ * vblank hooks (on any processor) and by the interrupt handler, which
+ * writes the PIPESTAT enables again with every acknowledgement.  Masking
+ * the local processor's interrupts keeps only the handler on the same
+ * processor out: one lock for all of them.  Nothing that takes it calls
+ * into the vblank core while holding it. */
+static spinlock_t g_irq_lock = SPINLOCK_INIT("i915_lg_irq");
+
 static uint32_t pipestat_vblank_bit(struct lg_display *d)
 {
 	return d->ver >= 4 ? PIPE_START_VBLANK_INTERRUPT_STATUS : PIPE_VBLANK_INTERRUPT_STATUS;
 }
 
+/* Caller holds g_irq_lock. */
 static void pipestat_write(struct lg_display *d, int pipe)
 {
 	uint32_t status = d->pipes[pipe].pipestat_enable;
@@ -484,9 +514,11 @@ static void pipestat_write(struct lg_display *d, int pipe)
 
 static void ilk_update_de_imr(struct lg_display *d, uint32_t mask, uint32_t enabled)
 {
-	uint64_t fl = local_irq_save();
-	uint32_t imr = d->de_imr;
+	uint64_t fl;
+	uint32_t imr;
 
+	spin_lock_irqsave(&g_irq_lock, &fl);
+	imr = d->de_imr;
 	imr &= ~mask;
 	imr |= ~enabled & mask;
 	d->de_imr = imr;
@@ -494,7 +526,7 @@ static void ilk_update_de_imr(struct lg_display *d, uint32_t mask, uint32_t enab
 		lg_wr_fw(d, DEIMR, imr);
 		(void)lg_rd_fw(d, DEIMR);
 	}
-	local_irq_restore(fl);
+	spin_unlock_irqrestore(&g_irq_lock, fl);
 }
 
 static uint32_t de_vblank_bit(struct lg_display *d, int pipe)
@@ -506,20 +538,329 @@ static void vblank_enable(struct lg_display *d, int pipe, int on)
 {
 	struct lg_pipe *p = &d->pipes[pipe];
 
-	p->vblank_enabled = on;
 	if (d->gmch) {
-		uint64_t fl = local_irq_save();
+		uint64_t fl;
+		spin_lock_irqsave(&g_irq_lock, &fl);
+		p->vblank_enabled = on;
 		if (on)
 			p->pipestat_enable |= pipestat_vblank_bit(d);
 		else
 			p->pipestat_enable &= ~pipestat_vblank_bit(d);
 		if (d->irq_enabled)
 			pipestat_write(d, pipe);
-		local_irq_restore(fl);
+		spin_unlock_irqrestore(&g_irq_lock, fl);
 		return;
 	}
+	p->vblank_enabled = on;
 	ilk_update_de_imr(d, de_vblank_bit(d, pipe), on ? de_vblank_bit(d, pipe) : 0);
 }
+
+#if I915_FEAT_LEGACY_VBLANK_HW
+/* ---- the vblank hardware, for the core's vblank interface -------------------------- */
+
+/* Which pipe serves each crtc's vblank between drm_crtc_vblank_on and
+ * drm_crtc_vblank_off (-1 outside), and which crtc each pipe serves.
+ * Written by the mode set while the core keeps the crtc's vblank off, read
+ * by the hooks below (under the core's vblank lock). */
+static volatile int g_vbl_pipe[DRM_MAX_CRTCS] = { [0 ... DRM_MAX_CRTCS - 1] = -1 };
+static int g_vbl_crtc[LG_MAX_PIPES] = { [0 ... LG_MAX_PIPES - 1] = -1 };
+/* i915GM / i945GM: pipes whose vblank interrupt is on (the C-state
+ * workaround below is on while there are any) */
+static uint32_t g_cstate_wa_users;
+
+static void vbl_maps_reset(void)
+{
+	for (int i = 0; i < DRM_MAX_CRTCS; i++)
+		g_vbl_pipe[i] = -1;
+	for (int p = 0; p < LG_MAX_PIPES; p++)
+		g_vbl_crtc[p] = -1;
+}
+
+static int vbl_pipe_of(struct lg_display *d, struct drm_device *dev, int crtc)
+{
+	int pipe;
+
+	if (!d || d->drm != dev || crtc < 0 || crtc >= DRM_MAX_CRTCS)
+		return -1;
+	pipe = g_vbl_pipe[crtc];
+	if (pipe < 0 || pipe >= d->num_pipes)
+		return -1;
+	return pipe;
+}
+
+/* The hardware timing of an interlaced mode counts frames; the pipe's
+ * counters count fields. */
+static int mode_vblank_start(const struct drm_display_mode *m)
+{
+	int v = m->crtc_vblank_start;
+
+	if (m->flags & DRM_MODE_FLAG_INTERLACE)
+		v = DIV_ROUND_UP(v, 2);
+	return v;
+}
+
+static int mode_vblank_end(const struct drm_display_mode *m)
+{
+	int v = m->crtc_vblank_end;
+
+	if (m->flags & DRM_MODE_FLAG_INTERLACE)
+		v /= 2;
+	return v;
+}
+
+static int mode_vtotal(const struct drm_display_mode *m)
+{
+	int v = m->crtc_vtotal;
+
+	if (m->flags & DRM_MODE_FLAG_INTERLACE)
+		v /= 2;
+	return v;
+}
+
+/* The width of the pipe's frame counter: 32 bits from G4X and Ironlake
+ * on, 24 on gen3/4, none on gen2 -- and none on the i965GM while its TV
+ * encoder runs, where the counter reads zero. */
+static uint32_t max_vblank_count(struct lg_display *d, const struct lg_config *cfg)
+{
+	if (d->is_i965gm && lg_cfg_has(cfg, LG_OUTPUT_TVOUT))
+		return 0;
+	if (d->ver >= 5 || d->is_g4x)
+		return 0xffffffffu;
+	if (d->ver >= 3)
+		return 0xffffff;
+	return 0;
+}
+
+/* gen3/4: the frame counter's high 16 bits are in PIPEFRAME, its low 8
+ * bits with the pixel counter in PIPEFRAMEPIXEL; the two do not change
+ * together, so the low word is taken between two equal readings of the
+ * high one. */
+static uint64_t read_frame_pixel(struct lg_display *d, int pipe)
+{
+	uint32_t upper, old_upper, lower;
+	int i = 0;
+
+	upper = lg_rd_fw(d, PIPEFRAME(d, pipe));
+	do {
+		old_upper = upper;
+		lower = lg_rd_fw(d, PIPEFRAMEPIXEL(d, pipe));
+		upper = lg_rd_fw(d, PIPEFRAME(d, pipe));
+	} while (upper != old_upper && i++ < 2);
+	return (uint64_t)upper << 32 | lower;
+}
+
+static uint32_t lg_get_vblank_counter(struct drm_device *dev, int crtc)
+{
+	struct lg_display *d = lg_get();
+	int pipe = vbl_pipe_of(d, dev, crtc);
+	const struct drm_display_mode *mode;
+	uint32_t pixel, vbl_start, hsync_start, htotal;
+	uint64_t frame;
+
+	/* A crtc said to have no counter returns none: the core must not
+	 * see one move. */
+	if (pipe < 0 || !dev->vbl[crtc].max_vblank_count)
+		return 0;
+	if (d->is_g4x || d->ver >= 5)
+		return lg_rd_fw(d, PIPE_FRMCOUNT_G4X(d, pipe));
+
+	mode = &dev->vbl[crtc].hwmode;
+	htotal = mode->crtc_htotal;
+	hsync_start = mode->crtc_hsync_start;
+	vbl_start = (uint32_t)mode_vblank_start(mode);
+	/* in pixels; the start of vblank is at the start of hsync */
+	vbl_start *= htotal;
+	vbl_start -= htotal - hsync_start;
+	frame = read_frame_pixel(d, pipe);
+	pixel = (uint32_t)frame & PIPE_PIXEL_MASK;
+	frame = (frame >> PIPE_FRAME_LOW_SHIFT) & 0xffffff;
+	/* The counter moves at the start of active; past the start of
+	 * vblank the frame counts as the next one already. */
+	return ((uint32_t)frame + (pixel >= vbl_start)) & 0xffffff;
+}
+
+/* The scan line, as the line the vblank timestamps count from: the
+ * counter reads one line behind (gen3 on), or one ahead (gen2, which
+ * counts from 1). */
+static int crtc_scanline(struct lg_display *d, int pipe, const struct drm_display_mode *mode)
+{
+	int vtotal = mode_vtotal(mode);
+	int position, offset = d->ver == 2 ? -1 : 1;
+
+	if (!d->pipes[pipe].active || vtotal <= 0)
+		return 0;
+	position = (int)(lg_rd_fw(d, PIPEDSL(d, pipe)) &
+			 (d->ver == 2 ? PIPEDSL_LINE_MASK_GEN2 : PIPEDSL_LINE_MASK));
+	return (position + vtotal + offset) % vtotal;
+}
+
+static bool lg_get_scanout_position(struct drm_device *dev, int crtc, bool in_vblank_irq,
+				    int *vpos, int *hpos, uint64_t *stime_ns,
+				    uint64_t *etime_ns, const struct drm_display_mode *mode)
+{
+	struct lg_display *d = lg_get();
+	int pipe = vbl_pipe_of(d, dev, crtc);
+	int position, vbl_start, vbl_end, hsync_start, htotal, vtotal;
+	int use_scanline_counter;
+
+	(void)in_vblank_irq;
+	if (pipe < 0 || !mode->crtc_clock || !mode->crtc_htotal)
+		return false;
+	/* gen3/4 have a pixel counter; the others the scan line only */
+	use_scanline_counter = d->ver >= 5 || d->is_g4x || d->ver == 2;
+	htotal = mode->crtc_htotal;
+	hsync_start = mode->crtc_hsync_start;
+	vtotal = mode_vtotal(mode);
+	vbl_start = mode_vblank_start(mode);
+	vbl_end = mode_vblank_end(mode);
+	if (vtotal <= 0)
+		return false;
+
+	if (stime_ns)
+		*stime_ns = hrtimer_now_ns();
+	if (use_scanline_counter) {
+		position = crtc_scanline(d, pipe, mode);
+	} else {
+		/* the pixels since the start of the frame, split into the
+		 * line and the pixel below */
+		position = (int)(lg_rd_fw(d, PIPEFRAMEPIXEL(d, pipe)) & PIPE_PIXEL_MASK);
+		vbl_start *= htotal;
+		vbl_end *= htotal;
+		vtotal *= htotal;
+		/* the longer field of an interlaced mode counts htotal
+		 * pixels more: clamped, so the position never jumps back */
+		if (position > vtotal - 1)
+			position = vtotal - 1;
+		/* The start of vblank interrupt comes at the start of hsync,
+		 * before the first line of vblank; lines start at the
+		 * leading edge of horizontal active here. */
+		position = (position + htotal - hsync_start) % vtotal;
+	}
+	if (etime_ns)
+		*etime_ns = hrtimer_now_ns();
+
+	/* inside vblank negative and counting up to 0 at its end, outside
+	 * positive and counting from its end */
+	if (position >= vbl_start)
+		position -= vbl_end;
+	else
+		position += vtotal - vbl_end;
+	if (use_scanline_counter) {
+		*vpos = position;
+		*hpos = 0;
+	} else {
+		*vpos = position / htotal;
+		*hpos = position - *vpos * htotal;
+	}
+	return true;
+}
+
+/* i915GM / i945GM: vblank interrupts do not wake the part from C2 and
+ * deeper while the render clock is gated in them; the gating is off
+ * while any vblank interrupt is on.  Called under the core's vblank
+ * lock. */
+#define LGD_SCPD0 0x209cu /* outside the display block */
+#define LGD_CSTATE_RENDER_CLOCK_GATE_DISABLE (1u << 5)
+
+static void cstate_wa(struct lg_display *d, int on)
+{
+	if (!d->is_i915gm && !d->is_i945gm)
+		return;
+	if (on) {
+		if (g_cstate_wa_users++ == 0)
+			lg_wr_abs(d, LGD_SCPD0, LG_MASKED_ENABLE(LGD_CSTATE_RENDER_CLOCK_GATE_DISABLE));
+	} else if (g_cstate_wa_users && --g_cstate_wa_users == 0) {
+		lg_wr_abs(d, LGD_SCPD0, LGD_CSTATE_RENDER_CLOCK_GATE_DISABLE << 16);
+	}
+}
+
+static int lg_enable_vblank(struct drm_device *dev, int crtc)
+{
+	struct lg_display *d = lg_get();
+	int pipe = vbl_pipe_of(d, dev, crtc);
+
+	if (pipe < 0)
+		return -EINVAL;
+	cstate_wa(d, 1);
+	vblank_enable(d, pipe, 1);
+	return 0;
+}
+
+static void lg_disable_vblank(struct drm_device *dev, int crtc)
+{
+	struct lg_display *d = lg_get();
+	int pipe = vbl_pipe_of(d, dev, crtc);
+
+	if (pipe < 0)
+		return;
+	vblank_enable(d, pipe, 0);
+	cstate_wa(d, 0);
+}
+
+/* The mode the pipe's generator runs, in the form the core's timestamp
+ * code takes: the hardware timing with interlaced modes' vertical values
+ * as frames. */
+static void vbl_mode_from_timings(struct drm_display_mode *m, const struct lg_timings *t)
+{
+	int sh = (t->flags & DRM_MODE_FLAG_INTERLACE) ? 1 : 0;
+
+	mm_memset(m, 0, sizeof(*m));
+	m->clock = m->crtc_clock = (int)t->clock;
+	m->hdisplay = m->crtc_hdisplay = t->hdisplay;
+	m->hsync_start = m->crtc_hsync_start = t->hsync_start;
+	m->hsync_end = m->crtc_hsync_end = t->hsync_end;
+	m->htotal = m->crtc_htotal = t->htotal;
+	m->crtc_hblank_start = t->hblank_start;
+	m->crtc_hblank_end = t->hblank_end;
+	m->vdisplay = m->crtc_vdisplay = (uint16_t)(t->vdisplay << sh);
+	m->vsync_start = m->crtc_vsync_start = (uint16_t)(t->vsync_start << sh);
+	m->vsync_end = m->crtc_vsync_end = (uint16_t)(t->vsync_end << sh);
+	m->vtotal = m->crtc_vtotal = (uint16_t)(t->vtotal << sh);
+	m->crtc_vblank_start = (uint16_t)(t->vblank_start << sh);
+	m->crtc_vblank_end = (uint16_t)(t->vblank_end << sh);
+	m->flags = t->flags;
+}
+
+/* Pipe `pipe' runs for crtc `crtc': the crtc's vblank handed to the core,
+ * with the pipe's timing and counter width.  Process context. */
+static void vblank_crtc_on(struct lg_display *d, int pipe, int crtc)
+{
+	const struct drm_vblank_crtc_config config = {
+		.offdelay_ms = DRM_VBLANK_OFFDELAY_MS,
+		/* exact across an off and on (the counter, or the scanout
+		 * position where there is none): off at the vblank after
+		 * the last user */
+		.disable_immediate = true,
+	};
+	struct drm_display_mode m;
+
+	if (pipe < 0 || pipe >= d->num_pipes || crtc < 0 || crtc >= DRM_MAX_CRTCS ||
+	    (uint32_t)crtc >= d->drm->ncrtc)
+		return;
+	if (g_vbl_crtc[pipe] >= 0)
+		return;
+	vbl_mode_from_timings(&m, &d->pipes[pipe].cfg.t);
+	drm_calc_timestamping_constants(d->drm, crtc, &m);
+	drm_crtc_set_max_vblank_count(d->drm, crtc, max_vblank_count(d, &d->pipes[pipe].cfg));
+	g_vbl_pipe[crtc] = pipe;
+	g_vbl_crtc[pipe] = crtc;
+	drm_crtc_vblank_on_config(d->drm, crtc, &config);
+}
+
+/* The pipe is about to stop: its crtc's vblank taken back from the core
+ * (what waits is answered) before the interrupt goes off for good.
+ * Process context. */
+static void vblank_crtc_off(struct lg_display *d, int pipe)
+{
+	int crtc = g_vbl_crtc[pipe];
+
+	if (crtc < 0)
+		return;
+	drm_crtc_vblank_off(d->drm, crtc);
+	g_vbl_pipe[crtc] = -1;
+	g_vbl_crtc[pipe] = -1;
+}
+#endif /* I915_FEAT_LEGACY_VBLANK_HW */
 
 /* ---- the enable and disable sequences --------------------------------------------- */
 
@@ -542,6 +883,11 @@ static void output_disable(struct lg_display *d, struct lg_output *o)
 		lg_wait_for_vblank(d, pipe);
 	if (f->disable)
 		f->disable(d, o, cfg);
+#if I915_FEAT_LEGACY_VBLANK_HW
+	/* the crtc's vblank back from the core while the pipe still runs
+	 * (the counter is read one last time) */
+	vblank_crtc_off(d, pipe);
+#endif
 	vblank_enable(d, pipe, 0);
 	disable_pipe(d, cfg);
 	lg_pfit_disable(d, cfg);
@@ -569,6 +915,9 @@ static void output_disable(struct lg_display *d, struct lg_output *o)
 	p->plane_enabled = 0;
 	p->cursor_enabled = 0;
 	p->flip_pending = 0;
+#if I915_FEAT_LEGACY_COLOR_MGMT
+	lg_color_pipe_reset(d, pipe);
+#endif
 	lg_wm_update(d);
 	/* the i830 keeps the pipe running at 640x480 */
 	if (d->is_i830)
@@ -644,7 +993,10 @@ static int output_enable(struct lg_display *d, struct lg_output *o, const struct
 	enable_pipe(d, pipe);
 	if (cfg->has_pch_encoder)
 		lg_pch_enable(d, cfg);
+#if !I915_FEAT_LEGACY_VBLANK_HW
+	/* the vblank interrupt on for as long as the pipe runs */
 	vblank_enable(d, pipe, 1);
+#endif
 	o->active = 1;
 	if (f->enable)
 		f->enable(d, o, cfg);
@@ -1031,6 +1383,11 @@ int intel_legacy_atomic_check(struct drm_device *dev, struct drm_atomic_state *s
 		rc = lg_cursor_check(d, drm_atomic_plane_state(st, cur));
 		if (rc)
 			return rc;
+#if I915_FEAT_LEGACY_COLOR_MGMT
+		rc = lg_color_check(d, cs);
+		if (rc)
+			return rc;
+#endif
 	}
 	return 0;
 }
@@ -1044,6 +1401,9 @@ static int primary_update(struct lg_display *d, int pipe, const struct drm_plane
 		lg_plane_disable(d, pipe);
 		return 0;
 	}
+#if I915_FEAT_LEGACY_PLANE_PROPS
+	lg_plane_set_rotation(d, pipe, ps->rotation);
+#endif
 	if (full)
 		return lg_plane_update(d, pipe, ps->fb, ps->src_x >> 16, ps->src_y >> 16);
 	return lg_plane_flip(d, pipe, ps->fb, ps->src_x >> 16, ps->src_y >> 16);
@@ -1106,13 +1466,23 @@ int intel_legacy_atomic_commit(struct drm_device *dev, struct drm_atomic_state *
 		ps = drm_atomic_plane_state(st, drm_crtc_primary(dev, (int)i));
 		cps = drm_atomic_plane_state(st, drm_crtc_cursor(dev, (int)i));
 		if (!pl->modeset) {
+			int replane = 0;
 			p = &d->pipes[pl->pipe];
 			if (!cs->changed)
 				continue;
+#if I915_FEAT_LEGACY_COLOR_MGMT
+			/* the colour stages first; when the enables the planes
+			 * carry change, the planes are programmed again */
+			if (cs->gamma_changed || cs->color_mgmt_changed)
+				replane = lg_color_update(d, pl->pipe, cs);
+#else
 			if (cs->gamma_changed)
 				lg_gamma_load(d, pl->pipe, cs->gamma);
-			if (ps->changed) {
-				int full = ps->geometry_changed || !p->plane_enabled;
+#endif
+			/* (a plane that is off keeps the enables too: they
+			 * colour the pipe's background) */
+			if (ps->changed || replane) {
+				int full = ps->geometry_changed || !p->plane_enabled || replane;
 				if (ps->fb && p->plane_enabled && !full &&
 				    (ps->fb->pitch != p->stride || ps->fb->format != p->format ||
 				     ps->fb->modifier != p->modifier))
@@ -1127,7 +1497,7 @@ int intel_legacy_atomic_commit(struct drm_device *dev, struct drm_atomic_state *
 				if (full)
 					lg_wm_update(d);
 			}
-			if (cps->changed) {
+			if (cps->changed || (replane && p->cursor_enabled)) {
 				uint32_t w = p->cursor_w;
 				rc = lg_cursor_update(d, pl->pipe, cps);
 				if (rc)
@@ -1146,12 +1516,23 @@ int intel_legacy_atomic_commit(struct drm_device *dev, struct drm_atomic_state *
 		if (o->sibling >= 0 && d->out[o->sibling].active)
 			output_disable(d, &d->out[o->sibling]);
 		predict_planes(d, pl, ps, cps);
+#if I915_FEAT_LEGACY_COLOR_MGMT
+		/* the colour state before PIPECONF is written with its mode */
+		lg_color_prepare(d, pl->pipe, cs, &pl->cfg);
+#endif
 		rc = output_enable(d, o, &pl->cfg);
 		if (rc)
 			return rc;
 		o->crtc = (int)i;
 		p->crtc = (int)i;
+#if I915_FEAT_LEGACY_VBLANK_HW
+		vblank_crtc_on(d, pl->pipe, (int)i);
+#endif
+#if I915_FEAT_LEGACY_COLOR_MGMT
+		lg_color_load(d, pl->pipe, cs);
+#else
 		lg_gamma_load(d, pl->pipe, cs->gamma);
+#endif
 		rc = primary_update(d, pl->pipe, ps, 1);
 		if (rc) {
 			output_disable(d, o);
@@ -1556,14 +1937,22 @@ void intel_legacy_irq_reset(struct i915_device *i915)
 
 	if (!d || d->i915 != i915)
 		return;
-	d->irq_enabled = 0;
+	{
+		uint64_t fl;
+		spin_lock_irqsave(&g_irq_lock, &fl);
+		d->irq_enabled = 0;
+		spin_unlock_irqrestore(&g_irq_lock, fl);
+	}
 	if (d->gmch) {
+		uint64_t fl;
 		if (has_hotplug(d)) {
 			lg_rmw(d, PORT_HOTPLUG_EN, 0xffffffffu, 0);
 			lg_wr(d, PORT_HOTPLUG_STAT, lg_rd(d, PORT_HOTPLUG_STAT));
 		}
+		spin_lock_irqsave(&g_irq_lock, &fl);
 		for (int p = 0; p < d->num_pipes; p++)
 			lg_wr(d, PIPESTAT(d, p), PIPESTAT_INT_STATUS_MASK | PIPE_FIFO_UNDERRUN_STATUS);
+		spin_unlock_irqrestore(&g_irq_lock, fl);
 		return;
 	}
 	lg_wr(d, SDEIMR, 0xffffffffu);
@@ -1583,9 +1972,12 @@ void intel_legacy_irq_postinstall(struct i915_device *i915)
 	if (!d || d->i915 != i915)
 		return;
 	if (d->gmch) {
+		uint64_t fl;
+		spin_lock_irqsave(&g_irq_lock, &fl);
 		d->irq_enabled = 1;
 		for (int p = 0; p < d->num_pipes; p++)
 			pipestat_write(d, p);
+		spin_unlock_irqrestore(&g_irq_lock, fl);
 		hpd_setup(d);
 		return;
 	}
@@ -1604,8 +1996,10 @@ void intel_legacy_irq_postinstall(struct i915_device *i915)
 		uint32_t ier_only;
 		uint32_t on = intel_legacy_irq_enable_bits(i915, &ier_only);
 		uint32_t master = lg_rd(d, DEIER) & DE_MASTER_IRQ_CONTROL;
+		uint64_t fl;
 		if (i915->irq_vector >= 0)
 			master = DE_MASTER_IRQ_CONTROL;
+		spin_lock_irqsave(&g_irq_lock, &fl);
 		d->de_imr = ~on;
 		for (int p = 0; p < d->num_pipes; p++)
 			if (d->pipes[p].vblank_enabled)
@@ -1614,8 +2008,9 @@ void intel_legacy_irq_postinstall(struct i915_device *i915)
 		lg_wr(d, DEIIR, (on | ier_only) & ~DE_MASTER_IRQ_CONTROL);
 		lg_wr(d, DEIER, ((on | ier_only) & ~DE_MASTER_IRQ_CONTROL) | master);
 		lg_posting_read(d, DEIER);
+		d->irq_enabled = 1;
+		spin_unlock_irqrestore(&g_irq_lock, fl);
 	}
-	d->irq_enabled = 1;
 	hpd_setup(d);
 }
 
@@ -1659,19 +2054,26 @@ static void gmch_irq(struct lg_display *d, uint32_t iir)
 			lg_wr_fw(d, PORT_HOTPLUG_STAT, hotplug_status);
 		}
 	}
-	/* the pipe status before the IIR: clearing them makes the edge */
-	for (int p = 0; p < d->num_pipes; p++) {
-		struct lg_pipe *pp = &d->pipes[p];
-		uint32_t status = PIPE_FIFO_UNDERRUN_STATUS;
-		if (iir & gmch_pipe_event_bit(p))
-			status |= pp->pipestat_enable;
-		stats[p] = lg_rd_fw(d, PIPESTAT(d, p)) & status;
-		if (stats[p]) {
-			uint32_t enable = (pp->pipestat_enable << 16) & PIPESTAT_INT_ENABLE_MASK &
-					  ~PIPE_FIFO_UNDERRUN_STATUS;
-			lg_wr_fw(d, PIPESTAT(d, p), stats[p]);
-			lg_wr_fw(d, PIPESTAT(d, p), enable);
+	/* the pipe status before the IIR: clearing them makes the edge
+	 * (under the enables' lock: the write puts the enables back) */
+	{
+		uint64_t fl;
+		spin_lock_irqsave(&g_irq_lock, &fl);
+		for (int p = 0; p < d->num_pipes; p++) {
+			struct lg_pipe *pp = &d->pipes[p];
+			uint32_t status = PIPE_FIFO_UNDERRUN_STATUS;
+			if (iir & gmch_pipe_event_bit(p))
+				status |= pp->pipestat_enable;
+			stats[p] = lg_rd_fw(d, PIPESTAT(d, p)) & status;
+			if (stats[p]) {
+				uint32_t enable = (pp->pipestat_enable << 16) &
+						  PIPESTAT_INT_ENABLE_MASK &
+						  ~PIPE_FIFO_UNDERRUN_STATUS;
+				lg_wr_fw(d, PIPESTAT(d, p), stats[p]);
+				lg_wr_fw(d, PIPESTAT(d, p), enable);
+			}
 		}
+		spin_unlock_irqrestore(&g_irq_lock, fl);
 	}
 	for (int p = 0; p < d->num_pipes; p++) {
 		if (stats[p] & pipestat_vblank_bit(d))
@@ -2193,6 +2595,33 @@ static int output_rank(struct lg_output *o)
 	return 2;
 }
 
+/* What a crtc (made with connector `crtc') offers beyond the core's own:
+ * its vblank handed to the driver (off until its pipe runs), the plane
+ * properties, the colour management sizes. */
+static void crtc_features_init(struct lg_display *d, int crtc)
+{
+#if I915_FEAT_LEGACY_VBLANK_HW
+	if (crtc >= 0 && (uint32_t)crtc < d->drm->ncrtc)
+		drm_crtc_vblank_reset(d->drm, crtc);
+#endif
+#if I915_FEAT_LEGACY_PLANE_PROPS
+	{
+		int rc = lg_plane_props_init(d, crtc);
+		if (rc)
+			kprintf("[drm] i915: crtc %d: plane properties incomplete (%d)\n", crtc, rc);
+	}
+#endif
+#if I915_FEAT_LEGACY_COLOR_MGMT
+	{
+		int rc = lg_color_crtc_init(d, crtc);
+		if (rc)
+			kprintf("[drm] i915: crtc %d: colour management incomplete (%d)\n", crtc, rc);
+	}
+#endif
+	(void)d;
+	(void)crtc;
+}
+
 static void add_connectors(struct lg_display *d)
 {
 	struct drm_device *dev = d->drm;
@@ -2215,6 +2644,7 @@ static void add_connectors(struct lg_display *d)
 			dev->enc[conn].type = o->enc_type;
 			dev->conn[conn].priv = o;
 			dev->conn[conn].connected = o->detected;
+			crtc_features_init(d, conn);
 			if (o->detected)
 				intel_legacy_get_modes(dev, &dev->conn[conn]);
 			kprintf("[drm] i915: connector %d: %s, %s, %u modes\n", conn, o->name,
@@ -2254,7 +2684,14 @@ int intel_legacy_display_init(struct i915_device *i915)
 		d->pipes[p].pipe = p;
 		d->pipes[p].output = -1;
 		d->pipes[p].crtc = -1;
+#if I915_FEAT_LEGACY_COLOR_MGMT
+		lg_color_pipe_reset(d, p);
+#endif
 	}
+#if I915_FEAT_LEGACY_VBLANK_HW
+	vbl_maps_reset();
+	g_cstate_wa_users = 0;
+#endif
 	wq_head_init(&d->hpd_wq, "i915_lg_hpd");
 	g_lg_active = 1;
 	g_fw_released = 0;
@@ -2403,4 +2840,32 @@ uint32_t intel_legacy_cursor_max(struct i915_device *i915)
 	if (!d || d->i915 != i915)
 		return 64;
 	return lg_cursor_max_size(d);
+}
+
+/* ---- the driver table ----------------------------------------------------------------- */
+
+void intel_legacy_driver_setup_features(struct i915_device *i915, struct drm_driver *drv)
+{
+#if I915_FEAT_LEGACY_VBLANK_HW
+	/* the pipes' frame counters (their width set per crtc at each mode
+	 * set), scanout positions and vblank interrupt switches */
+	drv->get_vblank_counter = lg_get_vblank_counter;
+	drv->max_vblank_count = 0;
+	drv->get_scanout_position = lg_get_scanout_position;
+	drv->enable_vblank = lg_enable_vblank;
+	drv->disable_vblank = lg_disable_vblank;
+#else
+	/* the core counts the vblank interrupts, which run with the pipe */
+	drv->get_vblank_counter = NULL;
+	drv->max_vblank_count = 0;
+	drv->get_scanout_position = NULL;
+	drv->enable_vblank = NULL;
+	drv->disable_vblank = NULL;
+#endif
+#if I915_FEAT_LEGACY_PLANE_PROPS
+	/* the planes carry their own rotation, blend mode and zpos
+	 * (lg_plane_props_init), not the core's minimal set */
+	drv->features &= ~DRM_FEATURE_BLEND;
+#endif
+	lg_color_driver_setup(i915, drv);
 }

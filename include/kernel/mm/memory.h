@@ -612,6 +612,9 @@ void mm_region_ref_drop(struct mmap_region *r);
  * is given: for the exit walk, where the entries are still in place and are
  * about to go with the page tables rather than through munmap. */
 void mm_region_retire(struct mmap_region *r, uint64_t *pml4);
+/* Close the files mm_region_retire() set aside for `t' while it held its
+ * mmap_lock for writing.  Called by mm_write_unlock() once it is released. */
+void mm_close_deferred(struct task *t);
 /* Pages this address space actually has resident -- the real resident set,
  * as opposed to how much address space has been reserved. */
 uint64_t mm_count_resident_pages(uint64_t *pml4);

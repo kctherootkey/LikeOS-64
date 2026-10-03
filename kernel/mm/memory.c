@@ -2582,13 +2582,56 @@ static void region_harvest_obj(uint64_t *pml4, const mmap_region_t *r,
  * through a watched mapping, so they are read here, by the one thread that
  * took the object and therefore knows it is still alive, before the object is
  * released.  munmap harvests before it clears its entries and passes NULL. */
+/* A file set aside to be closed after the address space is released. */
+struct mm_close_node {
+	vfs_file_t *f;
+	struct mm_close_node *next;
+};
+
+void mm_close_deferred(task_t *t)
+{
+	struct mm_close_node *n;
+
+	if (!t)
+		return;
+	n = t->mm_close_later;
+	t->mm_close_later = NULL;
+	while (n) {
+		struct mm_close_node *next = n->next;
+
+		vfs_close(n->f);
+		kfree(n);
+		n = next;
+	}
+}
+
 void mm_region_retire(mmap_region_t *r, uint64_t *pml4)
 {
 	vfs_file_t *f = __atomic_exchange_n(&r->file, NULL, __ATOMIC_ACQ_REL);
 	void *obj = __atomic_exchange_n(&r->dev_obj, NULL, __ATOMIC_ACQ_REL);
 
-	if (f)
-		vfs_close(f);
+	if (f) {
+		/* Not while this task holds its address space for writing
+		 * (munmap, mmap over a range, exec): the last close of a file
+		 * enters the filesystem, which takes its own locks, and a
+		 * thread holding one of those may be faulting on this very
+		 * address space -- waiting for the lock held here.  The close
+		 * waits until mm_write_unlock(); only if no note can be
+		 * allocated is it done now. */
+		task_t *cur = sched_current();
+		task_t *mm = cur ? task_mm_owner(cur) : NULL;
+		struct mm_close_node *n = NULL;
+
+		if (mm && mm->mmap_lock.writer && mm->mmap_lock.owner == (uint64_t)cur->id)
+			n = kalloc(sizeof(*n));
+		if (n) {
+			n->f = f;
+			n->next = cur->mm_close_later;
+			cur->mm_close_later = n;
+		} else {
+			vfs_close(f);
+		}
+	}
 	if (!obj)
 		return;
 	if (pml4)

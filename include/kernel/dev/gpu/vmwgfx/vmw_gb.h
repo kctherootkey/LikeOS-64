@@ -7,7 +7,16 @@
 // through command buffers (which can name a DX context) or, on hosts
 // without them, the FIFO.
 //
+// This is the driver's one internal header: it defines the device, the
+// buffer, surface and context objects, and pulls in the per-subsystem
+// headers (command submission, fences, display, cursor, resources and
+// bindings, views, command-buffer resources, blits, id accounting,
+// capabilities), so every file of the driver includes just this.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Broadcom's code: GPL-2.0 OR MIT
+// Portions Copyright (c) 2009-2025 Broadcom. All Rights Reserved. The term
+// “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
@@ -19,13 +28,32 @@
 #include <kernel/dev/gpu/vmwgfx/svga/svga3d_surfacedefs.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 
-/* Object counts (OTable sizes). */
+#include <kernel/dev/gpu/vmwgfx/vmw_compat.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_resource.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_cmdbuf.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_binding.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_so.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_cmdbuf_res.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_fence.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_kms.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_cursor.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_blit.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_gmrid.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_surface_cache.h>
+
+/* Object counts (OTable sizes).
+ *
+ * Contexts and DX contexts share one id space (vmw_device.context_ids), so
+ * a DX context's id is below VMW_NUM_CONTEXTS and the two tables must be
+ * the same size.  Each entry of either table is 8 bytes: 256 of them are
+ * one page of OTable, and 256 per-file context pointers are 2 KB of the
+ * file's vmw_file. */
 #define VMW_NUM_MOBS (64 * 1024)
 #define VMW_NUM_SURFACES (32 * 1024)
-#define VMW_NUM_CONTEXTS 64
+#define VMW_NUM_CONTEXTS 256
 #define VMW_NUM_SHADERS (16 * 1024)
 #define VMW_NUM_SCREENTARGETS 64
-#define VMW_NUM_DXCONTEXTS 64
+#define VMW_NUM_DXCONTEXTS 256
 
 /* A MOB: the device's view of a page array. */
 struct vmw_mob {
@@ -39,37 +67,16 @@ struct vmw_mob {
 };
 
 struct vmw_device;
+/* private to vmw_mob.c. */
+struct vmw_otable_batch;
 
-/* ---- command buffers / FIFO ---- */
-/* Submit `bytes' of SVGA3D commands from a kernel buffer, on DX context
- * `dx_cid' (SVGA3D_INVALID_ID for none).  Returns 0 or -errno; the
- * caller emits its own fence afterwards. */
-int vmw_cmd_submit(struct vmw_device *v, const void *cmds, uint32_t bytes,
-		   uint32_t dx_cid);
-/* One command with a fixed header; body is copied. */
-int vmw_cmd_one(struct vmw_device *v, uint32_t id, const void *body,
-		uint32_t body_size);
-int vmw_cmd_one_sync(struct vmw_device *v, uint32_t id, const void *body,
-		     uint32_t body_size);
-int vmw_cmd_one_async(struct vmw_device *v, uint32_t id, const void *body,
-		      uint32_t body_size);
-int vmw_cmd_submit_async(struct vmw_device *v, const void *cmds, uint32_t bytes,
-			 uint32_t dx_cid);
-/* Emit a fence for everything queued so far and return its sequence, or 0.
- * The number is allocated and submitted under one claim, so the order the
- * numbers are handed out is the order the device is told about them. */
-uint32_t vmw_cmd_fence_emit(struct vmw_device *v);
-/* Device-format bytes (SVGA_CMD_*) down whichever channel the driver owns:
- * the command-buffer one while it is up, the FIFO otherwise.  `ring' = 0
- * queues without announcing, for a run finished by a ring = 1 call or by
- * vmw_cmd_flush(). */
-int vmw_cmd_raw(struct vmw_device *v, const void *cmds, uint32_t bytes, int ring);
-void vmw_cmdbuf_poll(struct vmw_device *v);
-void vmw_cmd_flush(struct vmw_device *v);
-void vmw_cmd_drain(struct vmw_device *v);
-
+/* ---- command buffers / FIFO: vmw_cmdbuf.h ---- */
 
 /* ---- MOBs and OTables ---- */
+/* an id with no pages accounted (-1 when none is free); a buffer
+ * object's MOB uses vmw_gmrid_man_get_node/put_node(VMW_PL_MOB, npages)
+ * instead.  vmw_mob_bind() takes the id from mob->id and, on failure,
+ * leaves nothing behind but the id. */
 int vmw_mob_alloc_id(struct vmw_device *v);
 void vmw_mob_free_id(struct vmw_device *v, uint32_t id);
 /* Build the page tables for `pages' and send DEFINE_GB_MOB64. */
@@ -77,15 +84,22 @@ int vmw_mob_bind(struct vmw_device *v, struct vmw_mob *mob, const uint64_t *page
 		 uint32_t npages, uint32_t size_bytes);
 /* DESTROY_GB_MOB and release the page tables. */
 void vmw_mob_unbind(struct vmw_device *v, struct vmw_mob *mob);
-/* Hand a buffer object's backing pages back, once the device is done walking
- * the MOB page table that names them.  See the definition in vmw_mob.c. */
-void vmw_defer_free_pages(struct vmw_device *v, const uint64_t *pages,
-			  uint32_t n);
+/* After the device lost its MOBs (power management): send DEFINE_GB_MOB64
+ * again from the recorded id, depth, root and size (0 for a MOB never
+ * defined; on a submission error the MOB is marked undefined), or mark one
+ * undefined without sending anything (its object is going away). */
+int vmw_mob_redefine(struct vmw_device *v, struct vmw_mob *mob);
+void vmw_mob_forget(struct vmw_mob *mob);
+/* (vmw_defer_free_pages(): vmw_cmdbuf.h) */
 int vmw_otables_setup(struct vmw_device *v);
 void vmw_otables_takedown(struct vmw_device *v);
 
 /* ---- surfaces ---- */
 struct vmw_surface {
+	/* The device-object base: reference count, bindings that point at
+	 * this surface.  `res.id' is `sid'.  Set up by vmw_surface_res_init();
+	 * the surface is freed by the last vmw_resource_unreference(). */
+	struct vmw_resource res;
 	uint32_t sid;
 	uint64_t flags; /* SVGA3dSurfaceAllFlags */
 	uint32_t format;
@@ -123,7 +137,37 @@ struct vmw_surface {
 	 * It is destroyed with a different command, which is the only place
 	 * the rest of the driver has to care. */
 	int legacy;
+	/* The DX views of this surface (vmw_so.c), destroyed before the
+	 * surface is. */
+	struct list_head view_list;
+	/* The snooped image of a legacy cursor surface (vmw_cursor.c). */
+	struct vmw_cursor_snooper snooper;
 };
+
+static inline struct vmw_surface *vmw_res_to_srf(struct vmw_resource *res)
+{
+	return container_of(res, struct vmw_surface, res);
+}
+
+static inline struct vmw_surface *vmw_surface_reference(struct vmw_surface *srf)
+{
+	(void)vmw_resource_reference(&srf->res);
+	return srf;
+}
+
+static inline void vmw_surface_unreference(struct vmw_surface **srf)
+{
+	struct vmw_surface *tmp_srf = *srf;
+	struct vmw_resource *res = &tmp_srf->res;
+
+	*srf = NULL;
+	vmw_resource_unreference(&res);
+}
+
+/* Set up the base of a newly allocated surface whose sid and `legacy' flag
+ * are filled in: one reference (the surface object's), an empty view list.
+ * From here on the surface is released through vmw_surface_destroy(). */
+void vmw_surface_res_init(struct vmw_device *v, struct vmw_surface *s);
 
 /* Serialized size of a surface with these parameters. */
 /* Bytes of backing a surface needs.  `flags' carries SVGA3D_SURFACE_CUBEMAP,
@@ -172,9 +216,14 @@ struct drm_gem_object *vmw_surface_object_create(struct vmw_device *v,
 struct vmw_cotable {
 	struct drm_gem_object *bo; /* MOB-backed */
 	uint32_t size; /* bytes */
+	/* The objects with an entry in this table (views, DX shaders, stream
+	 * output), so they can be destroyed with the table. */
+	struct list_head resource_list;
 };
 
 struct vmw_context {
+	/* The device-object base.  `res.id' is `cid'. */
+	struct vmw_resource res;
 	uint32_t cid;
 	int dx;
 	struct drm_gem_object *state_bo; /* BIND_GB_CONTEXT / DX_BIND_CONTEXT */
@@ -182,7 +231,20 @@ struct vmw_context {
 	struct drm_gem_object *shader_bo; /* DX_BIND_ALL_SHADER (unused) */
 	int defined;
 	struct drm_file *owner;
+	/* What this context has bound (vmw_binding.c); NULL until set up. */
+	struct vmw_ctx_binding_state *cbs;
+	/* The views and shaders its command streams defined
+	 * (vmw_cmdbuf_res.c); NULL until set up. */
+	struct vmw_cmdbuf_res_manager *man;
+	/* The client's DX query MOB, as named by DX_BIND_QUERY; one
+	 * reference, or NULL. */
+	struct drm_gem_object *dx_query_mob;
 };
+
+static inline struct vmw_context *vmw_res_to_ctx(struct vmw_resource *res)
+{
+	return container_of(res, struct vmw_context, res);
+}
 
 int vmw_context_create(struct vmw_device *v, struct drm_file *fp, int dx,
 		       struct vmw_context **out);
@@ -190,12 +252,45 @@ void vmw_context_destroy(struct vmw_device *v, struct vmw_context *c);
 /* Make sure COTable `type' can hold entry `id'. */
 int vmw_context_cotable_reserve(struct vmw_device *v, struct vmw_context *c,
 				int type, uint32_t id);
+/* The context with device id `cid' among this file's, or NULL. */
+struct vmw_context *vmw_file_context(struct drm_file *fp, uint32_t cid);
+/* Accessors on a context's base. */
+struct list_head *vmw_context_binding_list(struct vmw_resource *ctx);
+struct vmw_cmdbuf_res_manager *vmw_context_res_man(struct vmw_resource *ctx);
+struct vmw_ctx_binding_state *vmw_context_binding_state(struct vmw_resource *ctx);
+/* The object list of COTable `cotable_type' of a DX context. */
+struct list_head *vmw_context_cotable_list(struct vmw_resource *ctx,
+					   SVGACOTableType cotable_type);
+/* Remember `mob' (NULL to forget) as the context's DX query MOB.  0 or
+ * -errno. */
+int vmw_context_bind_dx_query(struct vmw_resource *ctx_res,
+			      struct drm_gem_object *mob);
+struct drm_gem_object *vmw_context_get_dx_query_mob(struct vmw_resource *ctx_res);
 
 /* Object handle namespaces of the file: contexts live in fp->priv. */
 struct vmw_file {
-	struct vmw_context *contexts[64];
+	struct vmw_context *contexts[VMW_NUM_CONTEXTS];
 	uint32_t shaders[256]; /* legacy GB shader ids owned */
+	/* The client asked for DRM_VMW_PARAM_MAX_MOB_MEMORY, which is how a
+	 * client that knows about guest-backed objects identifies itself;
+	 * DRM_VMW_GET_3D_CAP then answers in the device's own format. */
+	int gb_aware;
 };
+
+/* ---- legacy file hooks (vmw_context.c, vmw_surface.c) ---- */
+long vmw_ioctl_gb_surface_create(struct vmw_device *v, struct drm_file *fp,
+				 void *kb, int ext);
+long vmw_ioctl_gb_surface_ref(struct vmw_device *v, struct drm_file *fp,
+			      void *kb, int ext);
+long vmw_ioctl_unref_surface(struct vmw_device *v, struct drm_file *fp, void *kb);
+void vmw_surface_gem_free(struct vmw_device *v, struct drm_gem_object *o);
+long vmw_ioctl_create_context(struct vmw_device *v, struct drm_file *fp,
+			      int dx, int32_t *cid_out);
+long vmw_ioctl_unref_context(struct vmw_device *v, struct drm_file *fp, uint32_t cid);
+void vmw_file_release(struct vmw_device *v, struct drm_file *fp);
+long vmw_ioctl_create_shader(struct vmw_device *v, struct drm_file *fp,
+			     struct drm_vmw_shader_create_arg *a);
+long vmw_ioctl_unref_shader(struct vmw_device *v, struct drm_file *fp, uint32_t shid);
 
 /* ---- execbuf ---- */
 int vmw_execbuf(struct vmw_device *v, struct drm_file *fp,
@@ -208,41 +303,11 @@ struct vmw_bo {
 };
 
 /* the device */
-/* One command buffer in flight: its header page, its payload, and the
- * bookkeeping needed to reap or repair it after the submitter has moved on. */
-struct vmw_cb_slot {
-	volatile SVGACBHeader *hdr;
-	uint64_t hdr_phys;
-	uint8_t *buf;
-	uint64_t buf_phys;
-	uint32_t bytes;
-	uint32_t flags;
-	uint32_t dx;
-	uint32_t ctx;
-	uint64_t submitted_us;
-	/* Submission order.  A device error is repaired by handing the
-	 * buffers back to the device, and they have to go back in the order
-	 * they were given -- a define that follows the command that uses it
-	 * is a second error.  The slots themselves say nothing about order,
-	 * so each records the ticket it was rung with. */
-	uint64_t seq;
-	/* The SVGA_CMD_FENCE sequence this buffer carries, or 0.
-	 *
-	 * A fence submitted through this channel has passed when the BUFFER
-	 * carrying it completes -- that is the only evidence there is.  The
-	 * device's fence register cannot be used for it: that register
-	 * belongs to the FIFO, which the console writes to independently and
-	 * out of the same counter, so a console fence completing there says
-	 * nothing whatever about a command-buffer context. */
-	uint32_t fence_seq;
-	int retried;
-	/* The device's verdict on the payload this slot carried, kept for a
-	 * synchronous submitter: a repaired buffer COMPLETES (without the
-	 * command the device refused), and a caller that acts on the answer
-	 * -- the COTable resize does -- must not read that as success. */
-	int err_rc;
-	volatile int state;
-};
+/* (struct vmw_cb_slot, one command buffer in flight: vmw_cmdbuf.h) */
+
+/* Per-unit screen-target state beyond the first unit; private to
+ * vmw_stdu.c. */
+struct vmw_stdu_state;
 
 struct vmw_device {
 	struct drm_device drm;
@@ -357,7 +422,8 @@ struct vmw_device {
 	 * which survives two threads doing it at once. */
 	uint64_t cb_next_seq;
 	volatile unsigned char cb_recover_busy;
-	/* screen target scan-out (vmw_stdu.c) */
+	/* screen target scan-out: a mirror of screen-target unit 0, written
+	 * only by vmw_stdu.c */
 	int st_defined;
 	uint32_t st_w, st_h;
 	uint32_t st_bound_sid;		/* what the target currently shows */
@@ -376,7 +442,118 @@ struct vmw_device {
 	struct vmw_surface *st_surface;	/* the driver's display surface */
 	struct drm_gem_object *st_bo;	/* its MOB backing */
 	void *overlay_priv;		/* the video overlay streams (vmw_overlay.c) */
+	/* All screen-target units, unit 0 included (vmw_stdu.c); NULL until
+	 * the first target is set up. */
+	struct vmw_stdu_state *stdu;
+	/* The context binding records: every vmw_resource.binding_head and
+	 * the trackers that link into them (vmw_binding.c).  A sleeping lock,
+	 * taken inside execbuf_lock when both are held, and never held across
+	 * drm_gem_put() -- dropping the last reference to a surface destroys
+	 * it, and that scrubs bindings. */
+	mm_rwsem_t binding_lock;
+	/* The open VMW_CMD_RESERVE reservation (vmw_cmd_reserve.c). */
+	struct vmw_cmd_reserve_state cmd_reserve;
+	/* Fence event and action lists (vmw_fence.c); NULL until set up. */
+	struct vmw_fence_manager *fman;
+	/* MOB cursors and their recycling (vmw_cursor.c); NULL until set up. */
+	struct vmw_cursor_state *cursor;
+	/* Id and page accounting per id space (vmw_gmrid.c); NULL where not
+	 * set up, which means unaccounted. */
+	struct vmw_gmrid_man *gmrid_man[VMW_PL_MAX];
+	/* What the device can scan out of guest memory:
+	 * SVGA_REG_MAX_PRIMARY_MEM on a guest-backed device (0 where it does
+	 * not say), the VRAM size on an older device. */
+	uint64_t max_primary_mem;
+	/* the object tables -- one buffer holding all of them and each
+	 * table's page tables (vmw_mob.c); NULL until vmw_otables_setup()
+	 * and after vmw_otables_takedown(). */
+	struct vmw_otable_batch *otable_batch;
+	/* the binding state a submission stages its context's new
+	 * bindings in (vmw_execbuf.c).  Tens of kilobytes, so it is allocated
+	 * once, on first use, and reset after every submission rather than
+	 * allocated per call; owned by whoever holds execbuf_lock. */
+	struct vmw_ctx_binding_state *execbuf_staged;
+	/* the surface memory the device grants a client that does not
+	 * use guest-backed objects (DRM_VMW_PARAM_MAX_SURF_MEMORY):
+	 * SVGA_REG_MEMORY_SIZE less VRAM with second-generation regions,
+	 * otherwise a fixed 512 MB. */
+	uint64_t memory_size;
+	/* The display units, one per head (vmw_kms.c; struct
+	 * vmw_display_unit in vmw_kms.h).  Unit 0's screen object is also
+	 * published in screen_defined / screen_w / screen_h / scan_gmr. */
+	struct vmw_display_unit du[VMW_MAX_HEADS];
 };
+
+/* Which shader model the device runs, from the has_* flags.  Each level
+ * implies the ones below it. */
+enum vmw_sm_type {
+	VMW_SM_LEGACY = 0,
+	VMW_SM_4,
+	VMW_SM_4_1,
+	VMW_SM_5,
+	VMW_SM_5_1X,
+	VMW_SM_MAX
+};
+
+static inline enum vmw_sm_type vmw_sm_type(const struct vmw_device *v)
+{
+	if (v->has_gl43)
+		return VMW_SM_5_1X;
+	if (v->has_sm5)
+		return VMW_SM_5;
+	if (v->has_sm41)
+		return VMW_SM_4_1;
+	if (v->has_dx)
+		return VMW_SM_4;
+	return VMW_SM_LEGACY;
+}
+
+static inline bool has_sm4_context(const struct vmw_device *v)
+{
+	return vmw_sm_type(v) >= VMW_SM_4;
+}
+
+static inline bool has_sm4_1_context(const struct vmw_device *v)
+{
+	return vmw_sm_type(v) >= VMW_SM_4_1;
+}
+
+static inline bool has_sm5_context(const struct vmw_device *v)
+{
+	return vmw_sm_type(v) >= VMW_SM_5;
+}
+
+static inline bool has_gl43_context(const struct vmw_device *v)
+{
+	return vmw_sm_type(v) >= VMW_SM_5_1X;
+}
+
+static inline u32 vmw_max_num_uavs(const struct vmw_device *v)
+{
+	return has_gl43_context(v) ? SVGA3D_DX11_1_MAX_UAVIEWS :
+				     SVGA3D_MAX_UAVIEWS;
+}
+
+static inline bool vmw_shadertype_is_valid(enum vmw_sm_type shader_model,
+					   u32 shader_type)
+{
+	SVGA3dShaderType max_allowed = SVGA3D_SHADERTYPE_PREDX_MAX;
+
+	if (shader_model >= VMW_SM_5)
+		max_allowed = SVGA3D_SHADERTYPE_MAX;
+	else if (shader_model >= VMW_SM_4)
+		max_allowed = SVGA3D_SHADERTYPE_DX10_MAX;
+	return shader_type >= SVGA3D_SHADERTYPE_MIN && shader_type < max_allowed;
+}
+
+/* Does the device signal fences at all?  (QEMU's does not.) */
+static inline bool vmw_has_fences(const struct vmw_device *v)
+{
+	if ((v->hw.caps & (SVGA_CAP_COMMAND_BUFFERS |
+			   SVGA_CAP_CMD_BUFFERS_2)) != 0)
+		return true;
+	return vmsvga2_hw_has_fifo_cap(SVGA_FIFO_CAP_FENCE) != 0;
+}
 
 /* ---- video overlay streams (vmw_overlay.c) ---- */
 int vmw_overlay_init(struct vmw_device *v);
@@ -391,20 +568,7 @@ long vmw_ioctl_claim_stream(struct vmw_device *v, struct drm_file *fp,
 long vmw_ioctl_unref_stream(struct vmw_device *v, struct drm_file *fp,
 			    struct drm_vmw_stream_arg *arg);
 
-/* ---- screen-target scan-out ---- */
-struct drm_framebuffer;
-/* Is this the device's scan-out path?  (Guest-backed objects up, and the
- * device advertises screen targets.) */
-int vmw_stdu_available(struct vmw_device *v);
-int vmw_stdu_set_mode(struct vmw_device *v, uint32_t w, uint32_t h,
-		      struct drm_framebuffer *fb);
-/* Bring a screen target of this size up if there is not one already. */
-int vmw_stdu_ensure(struct vmw_device *v, uint32_t w, uint32_t h);
-/* Formats a screen target can scan out. */
-int vmw_format_is_screen_target(uint32_t format);
-int vmw_stdu_present(struct vmw_device *v, struct drm_framebuffer *fb, int x1,
-		     int y1, int x2, int y2, int full);
-void vmw_stdu_teardown(struct vmw_device *v);
+/* ---- screen-target scan-out: vmw_kms.h ---- */
 
 /* ---- legacy (non-guest-backed) surfaces ---- */
 long vmw_ioctl_create_surface(struct vmw_device *v, struct drm_file *fp, void *kb);
@@ -416,9 +580,32 @@ int vmw_msg_probe(void);
 int vmw_host_log(const char *line);
 long vmw_ioctl_msg(struct vmw_device *v, struct drm_vmw_msg_arg *a);
 
+/* Host messaging and overlay streams. */
+/* Probe the channel into v->has_msg and log the driver version to the host. */
+void vmw_msg_init(struct vmw_device *v);
+/* A line for the hypervisor's log (cut at a page); -ENODEV without a host. */
+__attribute__((format(printf, 1, 2)))
+int vmw_host_printf(const char *fmt, ...);
+/* A guestinfo.* variable: *length in = buffer size, out = bytes stored. */
+int vmw_host_get_guestinfo(const char *guest_info_param, char *buffer,
+			   size_t *length);
+/* Stop every running overlay stream around a scan-out change, and start the
+ * paused ones again with their last register set afterwards. */
+int vmw_overlay_pause_all(struct vmw_device *v);
+int vmw_overlay_resume_all(struct vmw_device *v);
+
 int vmw_gb_init(struct vmw_device *v);
-struct drm_fence *vmw_fence_emit(struct vmw_device *v, uint32_t flags);
-void vmw_fence_check(struct vmw_device *v);
+/* undo the guest-backed half of vmw_gb_init() (object tables, MOB
+ * accounting) once no buffer object's MOB is left. */
+void vmw_gb_takedown(struct vmw_device *v);
+/* (vmw_fence_emit(), vmw_fence_check(): vmw_fence.h) */
+
+/* ---- the driver (vmw_drv.c) and its ioctls (vmw_ioctl.c) ---- */
+/* drm_driver.gem_init: a buffer object's MOB and region. */
+int vmw_gem_init(struct drm_gem_object *o);
+long vmw_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
+	       unsigned dir, void *kb, unsigned size, int *handled);
+int vmw_render_allowed(unsigned nr);
 
 /* Sanitised fixed-format helpers. */
 static inline int vmw_id_alloc(uint8_t *bm, uint32_t n)
@@ -435,5 +622,8 @@ static inline void vmw_id_free(uint8_t *bm, uint32_t i)
 {
 	bm[i / 8] &= (uint8_t)~(1u << (i % 8));
 }
+
+/* Needs struct vmw_device. */
+#include <kernel/dev/gpu/vmwgfx/vmw_devcaps.h>
 
 #endif

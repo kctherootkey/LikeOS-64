@@ -432,6 +432,13 @@ static int icl_family_wells(struct i915_device *i915, enum intel_power_domain d,
 	out[n++] = W(HSW_PWR_WELL_CTL2, ICL_PW_CTL_IDX_PW_1);
 	if (d == INTEL_PW_DISPLAY_CORE || d == INTEL_PW_GMBUS || d == INTEL_PW_TRANSCODER_EDP)
 		return n;
+	/* the compression engines of power well 2: that well alone on top
+	 * of PW1 (Rocket Lake has none there) */
+	if (d == INTEL_PW_VDSC) {
+		if (!rkl)
+			out[n++] = W(HSW_PWR_WELL_CTL2, ICL_PW_CTL_IDX_PW_2);
+		return n;
+	}
 	if (ver >= 13) {
 		/* PW1 -> PW_A; PW1 -> PW2 -> PW_B/C/D */
 		if (pipe == 0) {

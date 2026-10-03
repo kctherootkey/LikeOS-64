@@ -38,6 +38,11 @@ int dg2_phy_pll_get_dp(struct i915_device *i915, struct intel_output *o,
 		       uint32_t link_rate_khz, int ssc);
 int dg2_phy_pll_get_hdmi(struct i915_device *i915, struct intel_output *o, uint32_t clock_khz);
 void dg2_phy_pll_put(struct i915_device *i915, int pll);
+/* Whether the PHY's PLL can be set for TMDS clock `clock_khz' (a table
+ * entry, or computed settings within half a percent of it), asked at
+ * check time without touching the PLL bookkeeping: 1 yes, 0 no. */
+int dg2_phy_hdmi_clock_ok(struct i915_device *i915, const struct intel_output *o,
+			  uint32_t clock_khz);
 
 /* The PLL programmed, enabled, forced on and locked (the port then has
  * its clock); `lanes' is the link width (4 for HDMI), recorded for the

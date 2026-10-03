@@ -26,7 +26,7 @@
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2010 Intel Corporation
-// Portions Copyright (C) 2006 Dave Airlie
+// Portions Copyright (C) 2006 Dave Airlie <airlied@linux.ie>
 
 #include <kernel/dev/gpu/i915/intel_legacy.h>
 #include <kernel/io/console.h>

@@ -15,6 +15,14 @@
 #include <kernel/dev/i2c.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/waitq.h>
+/* The per-feature state embedded in the pipes and outputs below; each
+ * header documents its own calls. */
+#include <kernel/dev/gpu/i915/intel_plane.h>
+#include <kernel/dev/gpu/i915/intel_color.h>
+#include <kernel/dev/gpu/i915/intel_vblank.h>
+#include <kernel/dev/gpu/i915/intel_vrr.h>
+#include <kernel/dev/gpu/i915/intel_hdmi_feat.h>
+#include <kernel/dev/gpu/i915/intel_dsc.h>
 
 struct i915_device;
 
@@ -37,6 +45,21 @@ enum intel_output_type {
 
 /* ---- what the VBT says about a port (intel_vbt_parse.c, pure) ------------- */
 
+/* One entry of the compression parameters block (BDB 198+), as the table
+ * holds it: the encoded fields are kept raw (see the comments for how
+ * they decode). */
+struct intel_vbt_dsc {
+	uint8_t version_major, version_minor;
+	uint8_t rc_buffer_block_size; /* 0..3: 1, 4, 16, 64 KB blocks */
+	uint8_t rc_buffer_size; /* blocks - 1 */
+	uint32_t slices_per_line; /* bit n: 1 << n slices allowed */
+	uint8_t line_buffer_depth; /* bits - 8 */
+	uint8_t block_prediction_enable;
+	uint8_t max_bpp; /* bits per pixel = 6 + 2 * max_bpp */
+	uint8_t support_8bpc, support_10bpc, support_12bpc;
+	uint16_t slice_height;
+};
+
 struct intel_vbt_port {
 	int present; /* a child device names this port */
 	int supports_dp, supports_hdmi, supports_dvi, supports_edp;
@@ -58,6 +81,27 @@ struct intel_vbt_port {
 	 * dedicated, external one), so it is no Type-C port whatever its
 	 * index; the Type-C bits are cleared for it. */
 	uint8_t dedicated_external;
+	/* BDB 204+: the highest TMDS clock the board lets the port run, in
+	 * kHz; 0 leaves it to the platform's limit. */
+	uint32_t hdmi_max_tmds_khz;
+	/* A DP++ (dual-mode) connector: DisplayPort and HDMI on one, named
+	 * as a DP port or as an HDMI port with an AUX channel. */
+	uint8_t dp_dual_mode;
+	/* BDB 216+: the highest DisplayPort link rate the port is wired
+	 * for, in kHz; 0 for no limit from the board. */
+	uint32_t dp_max_link_rate_khz;
+	/* BDB 244+: the most DisplayPort lanes the port is wired for; 0 for
+	 * no limit from the board. */
+	uint8_t dp_max_lanes;
+	/* BDB 198+: the child asks for stream compression, with entry
+	 * dsc_index of the compression parameters block (dsc_cps: by the
+	 * "CPS" method, which is not VESA DSC).  dsc_valid once that entry
+	 * was found and copied into dsc. */
+	uint8_t compression_enable;
+	uint8_t dsc_cps;
+	uint8_t dsc_index;
+	uint8_t dsc_valid;
+	struct intel_vbt_dsc dsc;
 };
 
 struct intel_vbt_pps {
@@ -84,6 +128,8 @@ struct intel_vbt {
 	uint8_t edp_lanes; /* 1, 2, 4 */
 	uint8_t edp_vswing_preemph; /* VBT table index */
 	uint8_t edp_low_vswing;
+	/* BDB 251+: the panel must not be driven with a compressed stream */
+	uint8_t edp_dsc_disable;
 	/* backlight */
 	int backlight_valid;
 	uint16_t backlight_pwm_hz;
@@ -93,6 +139,9 @@ struct intel_vbt {
 	int panel_bpc; /* from the LFP data block, 0 unknown */
 	int int_crt_support, int_lvds_support;
 	int lvds_dither;
+	/* The panel may run variable refresh (the LFP power block, BDB 233+);
+	 * 1 where the table does not say. */
+	int lfp_vrr;
 };
 
 /* Parse a VBT image.  `len' bytes starting at the "$VBT" signature.
@@ -123,98 +172,11 @@ void intel_opregion_driver_ready(struct i915_device *i915);
 
 /* ---- DisplayPort: AUX and DPCD (intel_dp_aux.c) --------------------------- */
 
-#define DP_DPCD_REV 0x000
-#define DP_MAX_LINK_RATE 0x001
-#define DP_MAX_LANE_COUNT 0x002
-#define DP_MAX_LANE_COUNT_MASK 0x1f
-#define DP_TPS3_SUPPORTED (1 << 6)
-#define DP_ENHANCED_FRAME_CAP (1 << 7)
-#define DP_MAX_DOWNSPREAD 0x003
-#define DP_TPS4_SUPPORTED (1 << 7)
-#define DP_NORP 0x004
-#define DP_DOWNSTREAMPORT_PRESENT 0x005
-#define DP_MAIN_LINK_CHANNEL_CODING 0x006
-#define DP_EDP_CONFIGURATION_CAP 0x00d
-#define DP_TRAINING_AUX_RD_INTERVAL 0x00e
-#define DP_SUPPORTED_LINK_RATES 0x010 /* eDP 1.4: 8 x 16-bit, 200 kHz units */
-#define DP_LINK_BW_SET 0x100
-#define DP_LINK_BW_1_62 0x06
-#define DP_LINK_BW_2_7 0x0a
-#define DP_LINK_BW_5_4 0x14
-#define DP_LINK_BW_8_1 0x1e
-#define DP_LANE_COUNT_SET 0x101
-#define DP_LANE_COUNT_ENHANCED_FRAME_EN (1 << 7)
-#define DP_TRAINING_PATTERN_SET 0x102
-#define DP_TRAINING_PATTERN_DISABLE 0
-#define DP_TRAINING_PATTERN_1 1
-#define DP_TRAINING_PATTERN_2 2
-#define DP_TRAINING_PATTERN_3 3
-#define DP_TRAINING_PATTERN_4 7
-#define DP_LINK_SCRAMBLING_DISABLE (1 << 5)
-#define DP_TRAINING_LANE0_SET 0x103
-#define DP_TRAIN_VOLTAGE_SWING_MASK 0x3
-#define DP_TRAIN_VOLTAGE_SWING_SHIFT 0
-#define DP_TRAIN_MAX_SWING_REACHED (1 << 2)
-#define DP_TRAIN_PRE_EMPHASIS_MASK (3 << 3)
-#define DP_TRAIN_PRE_EMPHASIS_SHIFT 3
-#define DP_TRAIN_MAX_PRE_EMPHASIS_REACHED (1 << 5)
-#define DP_DOWNSPREAD_CTRL 0x107
-#define DP_SPREAD_AMP_0_5 (1 << 4)
-#define DP_MAIN_LINK_CHANNEL_CODING_SET 0x108
-#define DP_SET_ANSI_8B10B (1 << 0)
-#define DP_LINK_RATE_SET 0x115 /* eDP 1.4: index into SUPPORTED_LINK_RATES */
-#define DP_EDP_CONFIGURATION_SET 0x10a
-#define DP_SET_POWER 0x600
-#define DP_SET_POWER_D0 0x1
-#define DP_SET_POWER_D3 0x2
-#define DP_LANE0_1_STATUS 0x202
-#define DP_LANE2_3_STATUS 0x203
-#define DP_LANE_CR_DONE (1 << 0)
-#define DP_LANE_CHANNEL_EQ_DONE (1 << 1)
-#define DP_LANE_SYMBOL_LOCKED (1 << 2)
-#define DP_LANE_ALIGN_STATUS_UPDATED 0x204
-#define DP_INTERLANE_ALIGN_DONE (1 << 0)
-#define DP_SINK_STATUS 0x205
-#define DP_ADJUST_REQUEST_LANE0_1 0x206
-#define DP_ADJUST_REQUEST_LANE2_3 0x207
-#define DP_EDP_DPCD_REV 0x700
-#define DP_EDP_GENERAL_CAP_1 0x701
-#define DP_EDP_BACKLIGHT_MODE_SET_REGISTER 0x721
-#define DP_EDP_DISPLAY_CONTROL_REGISTER 0x720
-#define DP_EDP_BACKLIGHT_BRIGHTNESS_MSB 0x722
-#define DP_EDP_BACKLIGHT_BRIGHTNESS_LSB 0x723
-#define DP_SINK_COUNT 0x200
-#define DP_RECEIVER_CAP_SIZE 15
-
-struct intel_dp_aux {
-	struct i915_device *i915;
-	int port; /* DDI port, which names the AUX channel on Skylake */
-	uint32_t ctl_reg, data_reg;
-	struct i2c_adapter i2c; /* I2C over AUX, for the EDID */
-	uint32_t errors;
-	/* The channel runs through the Thunderbolt controller (a Type-C
-	 * port in Thunderbolt mode): set by intel_tc_connect(). */
-	int tbt_io;
-};
-
-void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
-		       int port);
-/* Native AUX: read/write `len' (1..16) bytes at DPCD `addr'.  Returns
- * the byte count or a negative errno. */
-int intel_dp_aux_native_read(struct intel_dp_aux *aux, uint32_t addr,
-			     uint8_t *buf, unsigned len);
-int intel_dp_aux_native_write(struct intel_dp_aux *aux, uint32_t addr,
-			      const uint8_t *buf, unsigned len);
-static inline int intel_dp_dpcd_read8(struct intel_dp_aux *aux, uint32_t addr,
-				      uint8_t *v)
-{
-	return intel_dp_aux_native_read(aux, addr, v, 1) == 1 ? 0 : -1;
-}
-static inline int intel_dp_dpcd_write8(struct intel_dp_aux *aux, uint32_t addr,
-				       uint8_t v)
-{
-	return intel_dp_aux_native_write(aux, addr, &v, 1) == 1 ? 0 : -1;
-}
+/* The DPCD addresses (drm_dp.h) and the per-output AUX channel (struct
+ * intel_dp_aux, intel_dp_aux_native_read/write, intel_dp_dpcd_read8/
+ * write8); the DSC capabilities of the source and of a sink. */
+#include <kernel/dev/gpu/i915/intel_dp_aux.h>
+#include <kernel/dev/gpu/i915/intel_dsc_caps.h>
 
 /* ---- power wells (intel_power.c) ----------------------------------------- */
 
@@ -244,6 +206,10 @@ enum intel_power_domain {
 	INTEL_PW_AUX_I,
 	INTEL_PW_GMBUS,
 	INTEL_PW_DISPLAY_CORE,
+	/* The stream compression engines in power well 2 (Ice Lake's
+	 * embedded-panel transcoder pair, Tiger Lake's pipe A pair): power
+	 * wells 1 and 2. */
+	INTEL_PW_VDSC,
 	INTEL_PW_COUNT
 };
 
@@ -368,6 +334,12 @@ int mtl_phy_rate_supported(struct i915_device *i915, int port, uint32_t link_rat
 int mtl_phy_pll_get_dp(struct i915_device *i915, struct intel_output *o,
 		       uint32_t link_rate_khz, int ssc);
 int mtl_phy_pll_get_hdmi(struct i915_device *i915, struct intel_output *o, uint32_t clock_khz);
+/* Whether the port's PHY PLL can be set for TMDS clock `clock_khz' (a
+ * table entry, or settings computed for it), asked at check time without
+ * touching the PLL bookkeeping: 1 yes, 0 no.  The LT PHYs are not asked
+ * here (1). */
+int mtl_phy_hdmi_clock_ok(struct i915_device *i915, const struct intel_output *o,
+			  uint32_t clock_khz);
 void mtl_phy_pll_put(struct i915_device *i915, int pll);
 /* Port clock muxes, PHY out of reset and to the ready state, PLL
  * programmed and locked, the owned lanes' transmitters enabled; `lanes'
@@ -420,6 +392,11 @@ struct intel_output {
 	 * and is read once: enabling the buffer for a two-lane link clears
 	 * the bit, so later reads would understate the port. */
 	int four_lane_strap;
+	/* The board's DisplayPort limits from the VBT (I915_FEAT_DP_VBT_LIMITS):
+	 * the highest link rate in kHz and the most lanes the port is wired
+	 * for; 0 for no limit.  Set once from the VBT at display init. */
+	uint32_t vbt_max_link_rate_khz;
+	uint8_t vbt_max_lanes;
 	uint8_t train_set[4];
 	int is_edp;
 	int panel_powered;
@@ -455,6 +432,41 @@ struct intel_output {
 	int tc_legacy;
 	int tc_legacy_known;
 	int tc_pin_assignment;
+	/* --- per-feature state (all zero: the feature is off) --- */
+	struct intel_vrr_output_state vrr; /* intel_vrr.h */
+	struct intel_hdmi_link_state hdmi_link; /* intel_hdmi_feat.h */
+	/* --- DisplayPort, as the helper library reads it (intel_dp.c,
+	 * intel_dp_link_training.c; I915_FEAT_DP_HELPERS) --- */
+	struct drm_dp_desc dp_desc; /* sink / branch identification, quirks */
+	uint8_t downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
+	int sink_count; /* a branch device's SINK_COUNT, -1 not read */
+	/* eDP 1.4: the link rate is chosen by index into the sink's table
+	 * (DP_LINK_RATE_SET) instead of by DP_LINK_BW_SET. */
+	int use_rate_select;
+	/* A branch device's limits on what it passes on (0: none). */
+	struct {
+		int max_bpc;
+		int max_dotclock; /* kHz */
+		int min_tmds_clock, max_tmds_clock; /* kHz */
+		int pcon_max_frl_bw; /* Gbit/s */
+	} dfp;
+	/* Link-training tunable PHY repeaters between the port and the
+	 * sink: their common and per-PHY capabilities, and how many are
+	 * trained one by one (non-transparent mode; 0 = none, or all
+	 * transparent). */
+	uint8_t lttpr_common_caps[DP_LTTPR_COMMON_CAP_SIZE];
+	uint8_t lttpr_phy_caps[DP_MAX_LTTPR_COUNT][DP_LTTPR_PHY_CAP_SIZE];
+	int lttpr_count;
+	/* The sink ignores the MSA timing parameters (variable refresh):
+	 * DP_MSA_TIMING_PAR_IGNORE_EN in DP_DOWNSPREAD_CTRL. */
+	int msa_timing_par_ignore;
+	/* The hotplug link check found the sink not answering: how often
+	 * it asked to be looked at again. */
+	int hpd_check_retries;
+	/* The sink's DSC/FEC capabilities (intel_dsc_caps.h), read at
+	 * detect, and a digest of the last ones logged. */
+	struct intel_dsc_sink_caps dsc_caps;
+	uint32_t dsc_caps_logged;
 };
 
 int intel_ddi_init(struct i915_device *i915);
@@ -485,6 +497,44 @@ int intel_dp_link_train(struct i915_device *i915, struct intel_output *o);
 void intel_dp_link_off(struct i915_device *i915, struct intel_output *o);
 void intel_dp_sink_power(struct i915_device *i915, struct intel_output *o, int on);
 uint32_t intel_dp_link_bw_khz(uint8_t bw);
+/* The widest link the sink and the port allow. */
+int intel_dp_max_lanes(const struct intel_output *o);
+/* Can the sink's link carry the mode at all (the fastest rate the port
+ * and the sink share, every lane)?  1 also while the rates are unknown:
+ * the enable path decides then. */
+int intel_dp_link_carries(struct i915_device *i915, const struct intel_output *o,
+			  const struct drm_mode_modeinfo *m);
+/* The hotplug worker re-probed DisplayPort output `o' after a pulse on
+ * its pin (display lock held): a link still lit is checked and retrained
+ * when the sink lost it.  0, or 1 to have the port looked at again after
+ * another debounce period. */
+int intel_dp_hpd_check(struct i915_device *i915, struct intel_output *o);
+/* Can a branch device (DP-to-HDMI/DVI/VGA adaptor, protocol converter)
+ * in front of the sink pass `mode' on: its dot clock, TMDS clock (at 8
+ * bpc) and FRL limits.  MODE_OK when there is no branch device or it
+ * states no limit; for intel_mode_valid(). */
+enum drm_mode_status intel_dp_mode_valid_downstream(struct i915_device *i915,
+						    const struct intel_output *o,
+						    const struct drm_display_mode *mode);
+/* The source's DSC capabilities (i915->display.dsc_src): read the fuses
+ * once; later calls do nothing.  Display init, or the first detect. */
+void intel_dp_dsc_source_init(struct i915_device *i915);
+/* Variable refresh: have the sink ignore (or use again) the MSA timing
+ * parameters, DP_MSA_TIMING_PAR_IGNORE_EN in DP_DOWNSPREAD_CTRL.  Kept
+ * for every later link training; written at once when the link is up.
+ * 0 or a negative errno (the write failed). */
+int intel_dp_set_msa_timing_par_ignore(struct intel_output *o, bool enable);
+/* Link training through the repeaters (intel_dp_link_training.c): read
+ * the repeaters' capabilities and the receiver's (DPCD 0x000..), and put
+ * the repeaters into the training mode I915_FEAT_DP_LTTPR asks for --
+ * unless `link_active', when the mode they are in is kept.  The number of
+ * repeaters to train one by one, or a negative errno when the receiver
+ * capabilities could not be read. */
+int intel_dp_init_lttpr_and_dprx_caps(struct i915_device *i915, struct intel_output *o,
+				      bool link_active);
+/* Retrain the link of active output `o' at its current rate and width
+ * while its pipe keeps running; 0 or a negative errno. */
+int intel_dp_retrain_link(struct i915_device *i915, struct intel_output *o);
 
 /* eDP panel power and backlight (intel_pps.c, intel_backlight.c) */
 int intel_pps_init(struct i915_device *i915);
@@ -531,6 +581,12 @@ struct intel_pipe {
 	uint64_t underruns;
 	int underrun_reported; /* the interrupt is masked after the first */
 	uint32_t cursor_w; /* what the client set, for the watermark */
+	/* --- per-feature state (all zero: the feature is off) --- */
+	struct intel_plane_pipe_state planes; /* intel_plane.h */
+	struct intel_color_pipe_state color; /* intel_color.h */
+	struct intel_vblank_pipe_state vbl; /* intel_vblank.h */
+	struct intel_vrr_pipe_state vrr; /* intel_vrr.h */
+	struct intel_dsc_config dsc; /* intel_dsc.h */
 };
 
 /* How a Type-C connector was found (intel_tc.c). */
@@ -615,6 +671,10 @@ struct intel_display {
 	/* Display version 30+: the embedded panel sits on a Type-C (C20)
 	 * PHY (the strap PICA reports), read at mtl_phy_init(). */
 	uint8_t edp_on_typec;
+	/* --- display stream compression --- */
+	/* What the source's engines can do (intel_dsc_caps.h); filled by
+	 * intel_dp_dsc_source_init(), display_ver 0 until then. */
+	struct intel_dsc_source_caps dsc_src;
 };
 
 /* ---- the display microcontroller (intel_dmc.c) ----------------------------- */
@@ -655,6 +715,15 @@ int intel_hpd_live(struct i915_device *i915, int port);
 int intel_hpd_init(struct i915_device *i915);
 int intel_hpd_start(struct i915_device *i915);
 
+/* The device's own copy of the driver table, made by i915_driver_for()
+ * before registration, completed per platform: feature bits, hooks and
+ * sizes of every display feature (intel_display_driver.c). */
+void intel_display_driver_setup(struct i915_device *i915, struct drm_driver *drv);
+/* Is the display of this part not the DDI kind: everything before
+ * Haswell, and Valleyview/Cherryview whatever their generation?  (Those
+ * have the backend in intel_legacy_*.c.) */
+int intel_display_legacy_part(const struct i915_device *i915);
+
 int intel_display_init(struct i915_device *i915);
 void intel_display_fini(struct i915_device *i915);
 /* Every output off and the wells released (suspend); the display core,
@@ -681,8 +750,21 @@ extern const uint32_t intel_nfb_formats;
  * the parts that replaced Y with it (set at display init) */
 extern uint64_t intel_fb_modifiers[];
 extern const uint32_t intel_nfb_modifiers;
+/* drm_driver.detect / get_modes (intel_connector.c). */
 int intel_detect(struct drm_device *dev, struct drm_connector *c);
 int intel_get_modes(struct drm_device *dev, struct drm_connector *c);
+/* The output crtc `crtc' drives, and the one connector `c' drives -- the
+ * same thing, since a crtc's index is its connector's; NULL for none. */
+struct intel_output *intel_output_for_crtc(struct i915_device *i915, int crtc);
+struct intel_output *intel_output_for_conn(struct i915_device *i915, struct drm_connector *c);
+/* A configuration refused by the atomic check, said in the log (the
+ * first few times; a client only sees the error): returns -EINVAL. */
+int intel_display_check_reject(struct i915_device *i915, const char *why);
+/* Is `format' one of intel_fb_formats[]? */
+int intel_fb_format_supported(uint32_t format);
+/* Lines between the end of the active area and the pipe's vblank (the
+ * transcoder's set context latency). */
+uint32_t intel_set_context_latency(struct i915_device *i915);
 int intel_display_verify(struct drm_device *dev);
 void intel_display_fallback(struct drm_device *dev);
 /* One thread at a time in the mode-setting and probing paths (the entry

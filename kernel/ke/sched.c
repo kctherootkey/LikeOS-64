@@ -1008,9 +1008,44 @@ static uint64_t sched_us_to_ticks(uint64_t us)
 	return per_us * us;
 }
 
+/* The queue's floor: the least vruntime among what competes for this
+ * processor -- the running task and the first one queued -- and never
+ * lower than it already was.  A floor that followed the running task alone
+ * ran ahead of everything waiting, so a task waking under load was placed
+ * behind all of them and waited out their slices as if the queue were
+ * first-in first-out.
+ *
+ * The running task counts only while its vruntime is measured against this
+ * queue: a wakeup on another processor may already have moved it to that
+ * queue (and onto that queue's scale) in the moment between its blocking and
+ * its switching away, and its value then says nothing about this floor.
+ * Caller holds the run queue lock. */
+static void sched_update_min_vruntime_locked(percpu_t *cpu, task_t *cur)
+{
+	uint64_t floor = cpu->min_vruntime;
+	uint64_t v = floor;
+	task_t *head = cpu->runqueue_head;
+	int have_cur = cur && !is_idle_task(cur) && cur->on_cpu == cpu->cpu_id;
+
+	lockdep_assert_held(&cpu->runqueue_lock);
+	if (have_cur)
+		v = cur->vruntime;
+	if (head) {
+		if (!have_cur || (int64_t)(head->vruntime - v) < 0)
+			v = head->vruntime;
+	} else if (!have_cur) {
+		return;
+	}
+	/* never back: a floor that moved down would let a waking task in
+	 * ahead of time it has not waited for */
+	if ((int64_t)(v - floor) > 0)
+		__atomic_store_n(&cpu->min_vruntime, v, __ATOMIC_RELAXED);
+}
+
 /* Charge `cur' for the time since it was last charged.  Only the processor
  * running a task touches its vruntime while it runs, so no lock is needed
- * for that; the queue floor is written by its own processor. */
+ * for that; the floor follows under the run queue lock, which the caller
+ * holds. */
 static void sched_update_curr(percpu_t *cpu, task_t *cur, uint64_t now)
 {
 	if (!cur || is_idle_task(cur))
@@ -1018,18 +1053,31 @@ static void sched_update_curr(percpu_t *cpu, task_t *cur, uint64_t now)
 	if (cur->exec_start && (int64_t)(now - cur->exec_start) > 0)
 		cur->vruntime += now - cur->exec_start;
 	cur->exec_start = now;
-	if ((int64_t)(cur->vruntime - cpu->min_vruntime) > 0)
-		__atomic_store_n(&cpu->min_vruntime, cur->vruntime,
-				 __ATOMIC_RELAXED);
+	sched_update_min_vruntime_locked(cpu, cur);
 }
 
+/* From the timer interrupt.  The run queue lock is only tried: this
+ * processor may have been interrupted holding it, and a tick whose floor
+ * update is skipped loses nothing the next one does not make up. */
 void sched_tick_account(task_t *t)
 {
 	percpu_t *cpu = this_cpu();
+	uint64_t flags;
 
-	if (!cpu || !t || cpu->current_task != t)
+	if (!cpu || !t || cpu->current_task != t || is_idle_task(t))
 		return;
-	sched_update_curr(cpu, t, sched_clock());
+	flags = local_irq_save();
+	if (spin_trylock(&cpu->runqueue_lock)) {
+		sched_update_curr(cpu, t, sched_clock());
+		spin_unlock(&cpu->runqueue_lock);
+	} else {
+		uint64_t now = sched_clock();
+
+		if (t->exec_start && (int64_t)(now - t->exec_start) > 0)
+			t->vruntime += now - t->exec_start;
+		t->exec_start = now;
+	}
+	local_irq_restore(flags);
 }
 
 /* Should the task just queued on `cpu' take the processor from what runs
@@ -1461,7 +1509,18 @@ void sched_enqueue_ready(task_t *task)
 		uint32_t dest_cpu = owner_cpu;
 		percpu_t *dest = owner;
 
-		if (g_smp_initialized && !task->on_rq && attempt < 16) {
+		/* A task woken while it is still on its processor -- between
+		 * publishing its blocked state and switching away -- stays
+		 * there.  It has not left: queued on its own processor it is
+		 * found again by the very switch it is about to make and keeps
+		 * running, with nothing to migrate.  Moved elsewhere, it would
+		 * be queued on another processor while still executing here,
+		 * its vruntime carried onto that queue's scale while this
+		 * processor still charges it, and every processor that picked
+		 * it before the switch finished would have to refuse it. */
+		int still_on_cpu = owner->current_task == task || task->sp == 0;
+
+		if (g_smp_initialized && !task->on_rq && !still_on_cpu && attempt < 16) {
 			/* "Free" means nothing queued AND nothing running but
 			 * the idle task.  A running task is not on its own run
 			 * queue, so queue length alone calls a fully occupied
@@ -1674,6 +1733,26 @@ static task_t *rq_requeue_current_locked(percpu_t *cpu, task_t *cur)
 	return cur;
 }
 
+/* Can the task that is switching away keep running?  One that is ready or
+ * running can, an exited one cannot.  For a preemption also a task finishing
+ * its exit path (rq_requeue_current_locked puts it back whatever its state
+ * says), and one that has published a blocked state but not yet switched
+ * away: being preempted is not its going to sleep -- it is still on its way
+ * to the scheduler, and the wait it is entering re-checks its condition when
+ * it gets there. */
+static int sched_prev_runnable(const task_t *cur, int preempt)
+{
+	if (!cur || is_idle_task(cur))
+		return 0;
+	if (preempt && (cur->in_exit_path || cur->in_exit_teardown))
+		return 1;
+	if (cur->has_exited)
+		return 0;
+	if (cur->state == TASK_READY || cur->state == TASK_RUNNING)
+		return 1;
+	return preempt && cur->state == TASK_BLOCKED;
+}
+
 // ============================================================================
 // TASK INITIALIZER HELPER
 // ============================================================================
@@ -1697,6 +1776,7 @@ static void task_init_common(task_t *t)
 	t->wait_channel = NULL;
 	t->wakeup_tick = 0;
 	t->fs_rdepth = 0;
+	t->fs_held = 0;
 	t->need_resched = 0;
 	t->remaining_ticks = SCHED_TIME_SLICE;
 	t->vruntime = 0;
@@ -1783,6 +1863,7 @@ static void task_init_common(task_t *t)
 	 * one so a thread that is later promoted to leader has a valid lock. */
 	mm_rwsem_init(&t->mmap_lock, "mmap_lock");
 	t->mm_rdepth = 0;
+	t->mm_close_later = NULL;
 
 	// Thread group support
 	t->tgid = t->id; // Will be set properly after id is assigned
@@ -2137,29 +2218,13 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 		return;
 	}
 
-	// If we got nothing, try idle task
-	if (!next) {
-		next = cpu->idle_task;
-	}
-
-	// If still nothing or same as cur, stay on current
-	if (!next || next == cur) {
-		if (cur && !cur->has_exited) {
-			cur->state = TASK_RUNNING;
-			cur->remaining_ticks = SCHED_TIME_SLICE;
-			cur->need_resched = 0;
-		}
-		spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
-		return;
-	}
-
 	// Check sp BEFORE enqueueing cur — if next is unusable, fall through
 	// to the idle task instead of bailing out entirely.  The old code
 	// returned immediately, which left zombie/exited tasks stuck as
 	// current_task because the only alternative (e.g. bootstrap, sp=0)
 	// was always rejected.
-	if (next->sp == 0 ||
-	    (next->state == TASK_ZOMBIE && !next->in_exit_path)) {
+	if (next && (next->sp == 0 ||
+		     (next->state == TASK_ZOMBIE && !next->in_exit_path))) {
 		WARN_ON(next->state == TASK_ZOMBIE &&
 			!is_idle_task(next)); /* zombie dequeued onto CPU */
 		/* Never put a DYING task back on the queue.
@@ -2189,8 +2254,23 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
 		}
+		next = NULL;
+	}
+
+	/* Nothing else can run here.  A task that is still runnable -- one
+	 * that yielded -- keeps the processor: the idle task is what runs
+	 * when nothing else can, not an alternative to a runnable task, and
+	 * switching to it would leave this one queued behind a halt until the
+	 * next tick. */
+	if (!next) {
+		if (sched_prev_runnable(cur, 0)) {
+			cur->state = TASK_RUNNING;
+			cur->remaining_ticks = SCHED_TIME_SLICE;
+			cur->need_resched = 0;
+			spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
+			return;
+		}
 		next = cpu->idle_task;
-		// idle_task might be cur (e.g. idle calling schedule) — handle below
 	}
 
 	// Final sanity: if next is still cur or NULL or invalid, stay on current
@@ -3570,6 +3650,7 @@ task_t *sched_fork_current(void)
 	 * another thread in the group may have held at that instant. */
 	mm_rwsem_init(&child->mmap_lock, "mmap_lock");
 	child->mm_rdepth = 0;
+	child->mm_close_later = NULL;
 
 	/* A new task, and a new occupant of its pid: stamp it so a tracer link
 	 * naming the parent cannot be mistaken for one naming the child. */
@@ -3672,6 +3753,7 @@ task_t *sched_fork_current(void)
 	child->wait_channel = NULL;
 	child->wakeup_tick = 0;
 	child->fs_rdepth = 0; /* parent holds no fs lock during fork */
+	child->fs_held = 0;
 	child->need_resched = 0;
 	child->remaining_ticks = SCHED_TIME_SLICE;
 	/* The child starts where the parent stands: neither ahead of
@@ -6086,8 +6168,32 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 		return;
 	}
 
-	// If queue was empty, try idle task
+	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
+	if (next && (next->sp == 0 ||
+		     (next->state == TASK_ZOMBIE && !next->in_exit_path))) {
+		if (!is_idle_task(next) &&
+		    (next->in_exit_teardown ||
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
+			rq_note_sp0_refusal(next);
+			rq_enqueue_locked(cpu, next);
+		}
+		next = NULL;
+	}
+
+	/* Nothing else to run: the running task carries on with a fresh slice,
+	 * whatever it was doing -- including publishing a blocked state on its
+	 * way to the scheduler, which it then reaches by itself.  The idle task
+	 * runs only when nothing else can. */
 	if (!next) {
+		if (sched_prev_runnable(cur, 1)) {
+			if (cur->state == TASK_READY)
+				cur->state = TASK_RUNNING;
+			cur->remaining_ticks = SCHED_TIME_SLICE;
+			cur->preempt_frame = NULL;
+			spin_unlock(&cpu->runqueue_lock);
+			local_irq_restore(flags);
+			return;
+		}
 		next = cpu->idle_task;
 	}
 
@@ -6103,16 +6209,19 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 		return;
 	}
 
-	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
-	if (next->sp == 0 ||
-	    (next->state == TASK_ZOMBIE && !next->in_exit_path)) {
-		if (!is_idle_task(next) &&
-		    (next->in_exit_teardown ||
-		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
-			rq_note_sp0_refusal(next);
-			rq_enqueue_locked(cpu, next);
-		}
-		next = cpu->idle_task;
+	/* Preempted between publishing a blocked state and switching away:
+	 * the task is still runnable -- a preemption takes the processor, it
+	 * does not put the task to sleep -- so it goes back on the queue like
+	 * any preempted task and finishes entering its wait when it next runs.
+	 * Left off the queue it slept with nothing guaranteed to wake it: the
+	 * event its wait re-checks for may already have come and gone while it
+	 * was still publishing.  A waker that claimed it first has made it
+	 * ready already. */
+	if (cur->state == TASK_BLOCKED && sched_prev_runnable(cur, 1)) {
+		task_state_t expected = TASK_BLOCKED;
+
+		(void)__atomic_compare_exchange_n(&cur->state, &expected, TASK_READY, false,
+						  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 	}
 
 	if (!next || next == cur || next->sp == 0) {

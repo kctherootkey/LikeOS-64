@@ -11,6 +11,7 @@
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_lmem.h>
+#include <kernel/dev/gpu/i915/i915_ggtt_view.h>
 #include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/uapi/drm/i915_drm.h>
@@ -120,6 +121,7 @@ void i915_gem_object_free(struct drm_gem_object *o)
 		kfree(v);
 	}
 	i915_fence_object_free(&g_i915, o);
+	i915_ggtt_views_release(&g_i915, o);
 	if (bo->bound)
 		i915_ggtt_unbind(&g_i915, bo->ggtt,
 				 bo->ggtt_size ? bo->ggtt_size : (uint32_t)(o->npages * 4096));

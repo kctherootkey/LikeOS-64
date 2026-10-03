@@ -190,8 +190,10 @@ static uint64_t i915_gem_mmap_pte(struct drm_gem_object *o, unsigned kind)
 
 static uint64_t i915_gem_page_phys(struct drm_gem_object *o, uint64_t index)
 {
+	/* 0 is "no page" to every mapper (mmap.c, the dma-buf file): -1 was
+	 * taken for an address and mapped with every reserved bit set */
 	if (!o->pages || index >= o->npages)
-		return (uint64_t)-1;
+		return 0;
 	if (i915_lmem_page(o->pages[index]))
 		return i915_lmem_page_cpu_phys(&g_i915, o->pages[index]);
 	return o->pages[index];
@@ -418,42 +420,16 @@ static const struct drm_driver i915_driver = {
 	.render_allowed = i915_render_allowed,
 };
 
-/* Is this a part whose display is not the DDI kind: everything before
- * Haswell, and Valleyview/Cherryview whatever their generation? */
-static int legacy_display_part(const struct i915_device *i915)
-{
-	if (i915->info->platform == I915_PLATFORM_HASWELL)
-		return 0;
-	return i915->info->gen < 8 || i915->info->platform == I915_PLATFORM_VALLEYVIEW ||
-	       i915->info->platform == I915_PLATFORM_CHERRYVIEW;
-}
-
-/* Those parts offer what their planes take: linear and X layouts only,
- * their own pixel formats, and 64-pixel cursors on the oldest. */
+/* The device's own copy of the table, completed for its platform by the
+ * display (intel_display_driver_setup(): feature bits, hooks, sizes, and
+ * the older displays' formats and cursors).  The core keeps the pointer
+ * for as long as the device is registered; there is one device. */
 static const struct drm_driver *i915_driver_for(struct i915_device *i915)
 {
-	static struct drm_driver legacy;
-	if (!legacy_display_part(i915))
-		return &i915_driver;
-	legacy = i915_driver;
-	switch (i915->info->platform) {
-	case I915_PLATFORM_I830:
-	case I915_PLATFORM_I845G:
-	case I915_PLATFORM_I85X:
-	case I915_PLATFORM_I865G:
-	case I915_PLATFORM_I915G:
-	case I915_PLATFORM_I915GM:
-		legacy.cursor_w = legacy.cursor_h = 64;
-		break;
-	default:
-		legacy.cursor_w = legacy.cursor_h = 256;
-		break;
-	}
-	legacy.fb_formats = intel_legacy_fb_formats;
-	legacy.nfb_formats = intel_legacy_nfb_formats;
-	legacy.fb_modifiers = intel_legacy_fb_modifiers;
-	legacy.nfb_modifiers = intel_legacy_nfb_modifiers;
-	return &legacy;
+	static struct drm_driver drv;
+	drv = i915_driver;
+	intel_display_driver_setup(i915, &drv);
+	return &drv;
 }
 
 /* ---- probe ---------------------------------------------------------------- */

@@ -20,11 +20,18 @@
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/hal/pci.h>
+#include <kernel/dev/gpu/drm_modes.h>
+#include <kernel/dev/gpu/drm_mode_object.h>
+#include <kernel/dev/gpu/drm_display_info.h>
+#include <kernel/dev/gpu/drm_rect.h>
+#include <kernel/dev/gpu/drm_vblank.h>
 
 struct drm_device;
 struct drm_file;
 struct drm_gem_object;
 struct drm_fence;
+struct drm_format_info;
+struct drm_atomic_state;
 struct task;
 
 /* Values the mode-setting ioctls report that the UAPI headers leave to the
@@ -38,6 +45,32 @@ struct task;
 #define DRM_MODE_SUBPIXEL_UNKNOWN 1
 
 /* ---- fences ------------------------------------------------------------ */
+
+struct drm_fence_cb;
+struct drm_fence_ops;
+
+/* Called once, when the fence the callback was added to signals.
+ *
+ * Callbacks run in whatever context signalled the fence: the device
+ * interrupt, the driver's poll timer, or a task.  They run with the fence
+ * lock (the device's `lock') dropped but with local interrupts DISABLED, so
+ * a callback must be short, must not sleep, must not wait for a fence, and
+ * may take only interrupt-safe locks.  It may take and drop fence
+ * references, signal other fences and add callbacks to other fences. */
+typedef void (*drm_fence_func_t)(struct drm_fence *f, struct drm_fence_cb *cb);
+
+/* The links of a fence's callback list (a circular list with the fence's
+ * own node as the head; a node that points at itself is on no list). */
+struct drm_fence_cb_node {
+	struct drm_fence_cb_node *next, *prev;
+};
+
+/* Embedded in whatever wants to know: initialised by
+ * drm_fence_add_callback(), never by the caller. */
+struct drm_fence_cb {
+	struct drm_fence_cb_node node;
+	drm_fence_func_t func;
+};
 
 struct drm_fence {
 	int refs;
@@ -61,6 +94,48 @@ struct drm_fence {
 	/* A merged fence (SYNC_IOC_MERGE): signalled once both of these
 	 * are; each is referenced while the merged one lives. */
 	struct drm_fence *deps[2];
+
+	/* Callbacks and fence containers.
+	 *
+	 * `ops' is NULL for a device's own fences (and for merged ones):
+	 * those are signalled by the driver through drm_fence_signal*().  A
+	 * container -- an array, a chain link, a private signalled stub --
+	 * has ops of its own and is NOT on the device's list: it lives by
+	 * its reference count alone (DRM_FENCE_SF_UNLISTED), and `dev' is
+	 * the device of a fence it contains, which lends it its lock.
+	 *
+	 * `cb_list' holds the callbacks to run when the fence signals, under
+	 * dev->lock; `cb_running' is the one being run right now (with the
+	 * lock dropped), so that drm_fence_remove_callback() can wait for it
+	 * to finish instead of letting its caller free it under the runner. */
+	const struct drm_fence_ops *ops;
+	struct drm_fence_cb_node cb_list;
+	struct drm_fence_cb *volatile cb_running;
+	uint32_t sflags; /* DRM_FENCE_SF_*, changed atomically */
+};
+
+/* drm_fence.sflags */
+#define DRM_FENCE_SF_UNLISTED (1u << 0) /* not on dev->fences */
+#define DRM_FENCE_SF_ENABLE_SIGNAL (1u << 1) /* enable_signaling done */
+
+/* What a fence that is not one of a device's own does differently.  Every
+ * hook is optional. */
+struct drm_fence_ops {
+	const char *(*get_driver_name)(struct drm_fence *f);
+	const char *(*get_timeline_name)(struct drm_fence *f);
+	/* Someone wants to know when the fence signals: start watching what
+	 * it is made of.  Called once, without any fence lock held.  Returns
+	 * false when the fence turned out to be complete already; the core
+	 * then signals it. */
+	bool (*enable_signaling)(struct drm_fence *f);
+	/* Is it complete?  Must not sleep; may be called in any context.
+	 * The core signals the fence when this says yes. */
+	bool (*signaled)(struct drm_fence *f);
+	/* The last reference went: free the fence (default: kfree). */
+	void (*release)(struct drm_fence *f);
+	/* A waiter would like the fence signalled by `deadline_ns'
+	 * (hrtimer_now_ns() time base). */
+	void (*set_deadline)(struct drm_fence *f, uint64_t deadline_ns);
 };
 
 struct drm_fence *drm_fence_create(struct drm_device *dev, uint32_t seqno,
@@ -113,6 +188,87 @@ int drm_fence_handle_create(struct drm_file *fp, struct drm_fence *f,
 struct drm_fence *drm_fence_handle_lookup(struct drm_file *fp, uint32_t handle);
 int drm_fence_handle_delete(struct drm_file *fp, uint32_t handle);
 void drm_fence_handles_release(struct drm_file *fp);
+
+/* ---- callbacks, status, deadlines, containers (drm_fence.c) ------ */
+
+/* Run `func' when `f' signals.  0 when added; -ENOENT when the fence has
+ * signalled already (the callback is NOT called); -EINVAL on bad
+ * arguments.  The caller keeps a reference to `f' while the callback is
+ * added.  A callback is on at most one fence at a time.  See
+ * drm_fence_func_t for the context callbacks run in. */
+int drm_fence_add_callback(struct drm_fence *f, struct drm_fence_cb *cb,
+			   drm_fence_func_t func);
+/* Take a callback off again: true when it was removed before running
+ * (it will not run); false when the fence has signalled and the callback
+ * has run -- if it was running on another processor, this waits for it
+ * to return.  Never call it on a callback from inside that callback. */
+bool drm_fence_remove_callback(struct drm_fence *f, struct drm_fence_cb *cb);
+/* Ask a container to start watching its parts (once); nothing for a
+ * device's own fences, which the driver signals anyway. */
+void drm_fence_enable_signaling(struct drm_fence *f);
+/* Has the fence signalled?  For a container, also asks whether its parts
+ * have (and signals it if so).  Never asks the driver, never sleeps: safe
+ * in any context. */
+bool drm_fence_is_signaled(struct drm_fence *f);
+/* The same, after asking the driver to bring its idea of completed work
+ * up to date (drv->fence_poll) -- process context only, no locks held. */
+bool drm_fence_poll_signaled(struct drm_fence *f);
+/* 0 still pending, 1 signalled without error, the negative error the work
+ * failed with otherwise. */
+int drm_fence_get_status(struct drm_fence *f);
+/* Mark the work behind an unsignalled fence as failed (-Exxx), before it
+ * is signalled. */
+void drm_fence_set_error(struct drm_fence *f, int error);
+/* Signal with an explicit completion time (hrtimer_now_ns() base);
+ * -EINVAL when it had signalled already. */
+int drm_fence_signal_timestamp(struct drm_fence *f, uint64_t timestamp_ns);
+/* When it signalled (only meaningful once it has). */
+static inline uint64_t drm_fence_timestamp(const struct drm_fence *f)
+{
+	return f->signal_ns;
+}
+/* A hint: the waiter would like the fence signalled by `deadline_ns'.
+ * Forwarded to the container's parts, or to drv->fence_set_deadline. */
+void drm_fence_set_deadline(struct drm_fence *f, uint64_t deadline_ns);
+/* Wait until any one of `fences' signals.  0 with *idx (if given) the
+ * index of a signalled one; -ETIMEDOUT, -ERESTARTSYS when `intr' and a
+ * signal is pending, -EINVAL, -ENOMEM.  A zero timeout only checks.  The
+ * caller holds references to every fence. */
+int drm_fence_wait_any_timeout(struct drm_fence **fences, uint32_t count,
+			       int intr, uint64_t timeout_ns, uint32_t *idx);
+/* `num' consecutive fresh stream numbers for fences that are not a
+ * device's own (containers, software timelines); never zero and never
+ * one an engine of this kernel uses. */
+uint64_t drm_fence_context_alloc(unsigned num);
+/* The timeline a fence orders on, for comparing and de-duplicating: its
+ * stream when it has one, the device-wide sequence of its device, or a
+ * timeline of its own for a merged fence. */
+uint64_t drm_fence_timeline(const struct drm_fence *f);
+/* Is `a' after `b' on their (common) timeline? */
+bool drm_fence_is_later(const struct drm_fence *a, const struct drm_fence *b);
+bool drm_fence_is_later_or_same(const struct drm_fence *a, const struct drm_fence *b);
+/* Names for reports and the sync_file listing. */
+const char *drm_fence_driver_name(struct drm_fence *f);
+void drm_fence_timeline_name(struct drm_fence *f, char *buf, unsigned len);
+/* A private fence, signalled at `timestamp_ns', for "nothing to wait
+ * for" results that should still say when that became true. */
+struct drm_fence *drm_fence_signalled_at(struct drm_device *dev,
+					 uint64_t timestamp_ns);
+/* For container implementations: set up `f' (zeroed by the caller) as a
+ * fence of no device list, lent `dev''s lock, with `ops', on stream
+ * `context' at `seqno64'. */
+void drm_fence_init_unlisted(struct drm_fence *f, struct drm_device *dev,
+			     const struct drm_fence_ops *ops, uint64_t context,
+			     uint64_t seqno64);
+/* Is the fence a container (array or chain link)? */
+bool drm_fence_is_container(struct drm_fence *f);
+/* drm_fence_get() as an expression: `f' (may be NULL), referenced. */
+static inline struct drm_fence *drm_fence_ref(struct drm_fence *f)
+{
+	if (f)
+		drm_fence_get(f);
+	return f;
+}
 
 /* ---- objects (buffers, surfaces) ---------------------------------------- */
 
@@ -232,6 +388,9 @@ void drm_gem_reap(struct drm_device *dev);
 /* Start the thread that does the above, so that no client's ioctl has to.
  * Called once, from drm_dev_register(). */
 void drm_gem_reap_start(struct drm_device *dev);
+/* The device runs again after a suspend: finish the objects whose
+ * teardown waited at the power gate meanwhile.  Process context. */
+void drm_gem_pm_resumed(struct drm_device *dev);
 
 /* Take a reference only if the object still has one; see the definition. */
 int drm_gem_get_unless_zero(struct drm_gem_object *o);
@@ -260,8 +419,12 @@ void *drm_gem_page_virt(struct drm_gem_object *o, uint32_t page);
 #define DRM_MAX_CRTCS DRM_MAX_CONNECTORS
 #define DRM_MAX_PLANES 32
 #define DRM_MAX_MODES 128
-#define DRM_MAX_PROPS 96
-#define DRM_MAX_BLOBS 128
+/* Room for the properties a driver attaches per object (rotation, zpos,
+ * colour, connector properties) besides the global ones, and for the blobs
+ * clients create per mode set and per frame (modes, lookup tables, damage
+ * rectangles) on top of the kernel's own (EDIDs, format lists). */
+#define DRM_MAX_PROPS 192
+#define DRM_MAX_BLOBS 256
 #define DRM_MAX_FBS 1024
 /* Handles per file.  The slot half of a handle is 16 bits wide (see
  * drm_gem.c), so this is the most the encoding can name; it was 4096, and a
@@ -280,6 +443,18 @@ struct drm_prop {
 	uint64_t values[2]; /* range: min,max */
 	struct drm_mode_property_enum enums[8];
 	uint32_t nenums;
+	/* An enum or bitmask property with more entries than enums[] holds
+	 * keeps its whole list here instead, allocated by drm_property.c
+	 * (enum_list_cap entries of room); NULL while enums[] suffices.
+	 * nenums counts the entries either way. */
+	struct drm_mode_property_enum *enum_list;
+	uint32_t enum_list_cap;
+	/* The device the property belongs to (for the
+	 * blob and object lookups a value check needs), and the number of
+	 * values it was created with -- for an enum or bitmask the most
+	 * entries it takes, -1 when it was made without a bound. */
+	struct drm_device *dev;
+	int num_values;
 };
 
 struct drm_blob {
@@ -287,6 +462,13 @@ struct drm_blob {
 	uint32_t length;
 	void *data;
 	int in_use;
+	/* Reference counted (drm_property.h): the creator holds one, every
+	 * state or object that refers to the blob holds one.  `owner' is the
+	 * file that created it through CREATEPROPBLOB (NULL: the kernel);
+	 * its reference goes when that file destroys the blob or closes. */
+	struct drm_device *dev;
+	int refs;
+	struct drm_file *owner;
 };
 
 struct drm_framebuffer {
@@ -296,12 +478,39 @@ struct drm_framebuffer {
 	struct drm_gem_object *obj;
 	uint32_t offset;
 	struct drm_file *owner;
+	/* The format's description (drm_fourcc.h); NULL where the framebuffer
+	 * was made without one. */
+	const struct drm_format_info *format_info;
+	/* Per plane of the format: pitch, offset and object.  Plane 0 is the
+	 * same as pitch / offset / obj above, which stay the single-plane
+	 * view everything else reads; objs[0] is `obj' (no second reference),
+	 * objs[1..3] hold a reference each.  Unused planes are 0 / NULL. */
+	uint32_t pitches[4];
+	uint32_t offsets[4];
+	struct drm_gem_object *objs[4];
+	/* Framebuffers carry no properties: always NULL.  (A pointer rather
+	 * than an embedded list: the device keeps DRM_MAX_FBS of these.) */
+	struct drm_object_properties *properties;
+	/* The owning file let go of it (CLOSEFB) while something still
+	 * showed it.  Owner NULL from then on; drm_framebuffer.c frees it
+	 * once no plane or crtc shows it any more. */
+	int closed;
 };
 
 struct drm_crtc {
 	uint32_t id;
 	int index;
 	int active;
+	/* A mode is set on the crtc (MODE_ID names one).  A crtc can be enabled
+	 * and not active: DPMS off keeps its mode, its planes and its
+	 * connectors and only stops the pipe, so that switching it back on
+	 * shows what it showed.  active implies enabled. */
+	int enabled;
+	/* Entries of the legacy gamma table (GETCRTC's gamma_size, SETGAMMA,
+	 * GETGAMMA), at most 256; 0 reads as 256.  Independent of the
+	 * GAMMA_LUT_SIZE an atomic client sees.  drm_mode_crtc_set_gamma_size()
+	 * sets it. */
+	uint32_t gamma_size;
 	struct drm_mode_modeinfo mode;
 	uint32_t mode_blob; /* MODE_ID: the mode above as a blob, 0 when off */
 	uint32_t fb_id;
@@ -312,10 +521,25 @@ struct drm_crtc {
 	uint32_t cursor_handle_w, cursor_handle_h;
 	int cursor_x, cursor_y;
 	struct drm_gem_object *cursor_obj;
+	/* The legacy cursor's hot spot (CURSOR2), for a driver without atomic
+	 * entry points: what a resume sets the cursor with again. */
+	int32_t cursor_hot_x, cursor_hot_y;
 	/* The framebuffer the core wraps a legacy cursor object in, so that
 	 * the cursor is a plane like any other (atomic drivers). */
 	uint32_t cursor_fb_id;
 	uint32_t primary_plane_id, cursor_plane_id;
+	/* the properties attached to it (drm_mode_object.h) */
+	struct drm_object_properties properties;
+
+	/* The committed colour management (DEGAMMA_LUT, CTM,
+	 * GAMMA_LUT as blobs, each referenced while the crtc shows it, NULL
+	 * for none) and VRR_ENABLED -- what the next request starts from. */
+	struct drm_blob *degamma_lut, *ctm, *gamma_lut;
+	int vrr_enabled;
+	/* The stream the crtc's OUT_FENCE_PTR fences are numbered on (0
+	 * until the first one) and the last number handed out. */
+	uint64_t fence_context;
+	uint64_t fence_seqno;
 };
 
 /* A plane: a source rectangle of a framebuffer shown on a rectangle of a
@@ -340,6 +564,34 @@ struct drm_plane {
 	uint32_t nmodifiers;
 	uint32_t in_formats_blob;
 	void *priv; /* the driver's per-plane state */
+	/* the properties attached to it (drm_mode_object.h) */
+	struct drm_object_properties properties;
+
+	/* The committed values of the optional plane properties
+	 * (meaning as in struct drm_plane_state).  drm_plane_add sets the
+	 * defaults: rotation DRM_MODE_ROTATE_0, alpha 0xffff (opaque),
+	 * pixel_blend_mode 0 (pre-multiplied), the rest 0; whoever attaches
+	 * a property with another initial value sets the field too. */
+	uint32_t rotation;
+	uint32_t zpos, normalized_zpos;
+	uint16_t alpha;
+	uint16_t pixel_blend_mode;
+	uint32_t color_encoding;
+	uint32_t color_range;
+	/* The plane's own instance of each optional property, NULL where
+	 * the plane does not have it.  Set by whoever creates and attaches
+	 * the property (drm_blend.c, drm_color_mgmt.c); the atomic core
+	 * routes a write of that property into the state field above. */
+	struct drm_prop *rotation_property;
+	struct drm_prop *zpos_property;
+	struct drm_prop *alpha_property;
+	struct drm_prop *blend_mode_property;
+	struct drm_prop *color_encoding_property;
+	struct drm_prop *color_range_property;
+	/* HOTSPOT_X / HOTSPOT_Y of a cursor plane (DRM_FEATURE_CURSOR_HOTSPOT),
+	 * NULL elsewhere; a write goes to the state's hot_x / hot_y. */
+	struct drm_prop *hotspot_x_property;
+	struct drm_prop *hotspot_y_property;
 };
 
 struct drm_connector {
@@ -361,6 +613,73 @@ struct drm_connector {
 	int is_hdmi;
 	char sink_name[14];
 	void *priv; /* the driver's per-connector state */
+	/* What the sink can do, from its EDID (drm_display_info.h); zero
+	 * without one. */
+	struct drm_display_info display_info;
+	/* The sink's EDID-Like Data for the audio driver (drm_eld.h), all
+	 * zero when there is none. */
+	uint8_t eld[128];
+	/* the properties attached to it (drm_mode_object.h) */
+	struct drm_object_properties properties;
+
+	/* The committed values of the optional connector properties
+	 * (meaning as in struct drm_connector_state); hdr_output_metadata is
+	 * referenced while committed, NULL none. */
+	uint32_t max_requested_bpc;
+	uint32_t colorspace;
+	uint32_t broadcast_rgb;
+	uint32_t content_type;
+	uint32_t scaling_mode;
+	struct drm_blob *hdr_output_metadata;
+	/* The connector's own instance of each optional property, NULL where
+	 * it does not have it; set by whoever creates and attaches it.  (The
+	 * device-wide ones are dev->prop_content_type and
+	 * dev->prop_hdr_output_metadata.) */
+	struct drm_prop *max_bpc_property;
+	struct drm_prop *colorspace_property;
+	struct drm_prop *broadcast_rgb_property;
+	struct drm_prop *scaling_mode_property;
+
+	/* Probing and the connector's EDID-derived state (drm_connector.c,
+	 * drm_probe_helper.c).  drm_connector_add sets them. */
+	struct drm_device *dev; /* the device it belongs to */
+	/* Bumped whenever the status or the EDID changes; a probe compares
+	 * it to tell whether to say so. */
+	uint64_t epoch_counter;
+	/* What the source behind the connector can send.  The probe refuses
+	 * the modes needing what is not allowed; the defaults are what the
+	 * drivers have always been offered (interlace and double scan yes,
+	 * stereo and 4:2:0-only no). */
+	bool interlace_allowed;
+	bool doublescan_allowed;
+	bool stereo_allowed;
+	bool ycbcr_420_allowed;
+	/* The EDID, PATH and TILE blobs (each referenced while installed;
+	 * edid_blob_id is the EDID's id, 0 none). */
+	struct drm_blob *edid_blob_ptr;
+	struct drm_blob *path_blob_ptr;
+	struct drm_blob *tile_blob_ptr;
+	/* A tile of a monitor shown over several connectors (from the
+	 * EDID's DisplayID block): the group (tile_group_id, 0 none, names
+	 * it), the grid and this tile's place and size in it. */
+	bool has_tile;
+	bool tile_is_single_monitor;
+	uint8_t num_h_tile, num_v_tile;
+	uint8_t tile_h_loc, tile_v_loc;
+	uint16_t tile_h_size, tile_v_size;
+	uint32_t tile_group_id;
+	/* The sink's audio/video latencies from its HDMI block (ms),
+	 * progressive and interlaced. */
+	bool latency_present[2];
+	int video_latency[2];
+	int audio_latency[2];
+	/* "link-status": DRM_MODE_LINK_STATUS_GOOD / _BAD, set by the driver
+	 * when the link failed and a client should set the mode again. */
+	uint64_t link_status;
+	/* The bpc the driver settled on under "max bpc". */
+	uint32_t max_bpc;
+	/* "vrr_capable", immutable, NULL when the connector does not have it. */
+	struct drm_prop *vrr_capable_property;
 };
 
 struct drm_encoder {
@@ -407,6 +726,9 @@ struct drm_file {
 	struct wait_queue_head wq;
 	int pending_vblank; /* WAIT_VBLANK events queued */
 	uint64_t client_caps; /* bit n = DRM_CLIENT_CAP_n */
+	/* Bytes of the blobs this file created and still owns (CREATEPROPBLOB),
+	 * bounded per file (drm_property.c); under the blob lock. */
+	uint64_t blob_bytes;
 	void *priv; /* backend per-file state */
 	struct vfs_file *vfs; /* the open file this is the state of */
 	struct drm_file *next; /* device list */
@@ -444,6 +766,40 @@ struct drm_plane_state {
 	int fb_changed; /* a different framebuffer (or none) */
 	int crtc_changed; /* moved between crtcs or switched on/off */
 	int geometry_changed;
+	/* The request this state belongs to. */
+	struct drm_atomic_state *state;
+	/* DRM_MODE_ROTATE_* | DRM_MODE_REFLECT_* */
+	uint32_t rotation;
+	/* stacking position as asked, and as normalised to 0..n-1 over the
+	 * planes of the crtc */
+	uint32_t zpos, normalized_zpos;
+	/* plane opacity, 0 transparent .. 0xffff opaque */
+	uint16_t alpha;
+	/* DRM_MODE_BLEND_* (drm_blend.h) */
+	uint16_t pixel_blend_mode;
+	/* YCbCr to RGB conversion: enum drm_color_encoding / drm_color_range
+	 * values (drm_color_mgmt.h) */
+	uint32_t color_encoding;
+	uint32_t color_range;
+	/* FB_DAMAGE_CLIPS: the blob id (0 none), and its rectangles as the
+	 * atomic core resolved them (pointing into the blob, valid for the
+	 * request); ignore_damage_clips: the driver redraws everything */
+	uint32_t fb_damage_clips;
+	struct drm_mode_rect *damage_clips;
+	uint32_t num_damage_clips;
+	int ignore_damage_clips;
+	/* After the plane check: the source (16.16) and destination (crtc
+	 * pixels) clipped to the crtc, and whether anything of the plane is
+	 * visible at all. */
+	struct drm_rect src, dst;
+	int visible;
+	/* IN_FENCE_FD: what the update waits for before it is shown
+	 * (referenced; NULL none). */
+	struct drm_fence *in_fence;
+	/* The FB_DAMAGE_CLIPS blob itself, referenced until the state
+	 * is freed (damage_clips points into it; clearing fb_damage_clips /
+	 * damage_clips does not drop it). */
+	struct drm_blob *fb_damage_clips_blob;
 };
 
 struct drm_crtc_state {
@@ -465,6 +821,32 @@ struct drm_crtc_state {
 	int connectors_changed;
 	uint32_t connector_mask; /* connectors on this crtc in this state */
 	int event; /* a flip event was asked for */
+	/* The request this state belongs to. */
+	struct drm_atomic_state *state;
+	/* planes on this crtc in this state (bit = plane index) */
+	uint32_t plane_mask;
+	/* Colour management as blobs, each referenced by the state until it
+	 * is freed (NULL = none, bypass): DEGAMMA_LUT and GAMMA_LUT of
+	 * struct drm_color_lut, CTM of struct drm_color_ctm;
+	 * color_mgmt_changed when one of them was replaced in the request.
+	 * (The legacy 256-entry table above stays what drivers program; the
+	 * core keeps it in step with GAMMA_LUT.) */
+	struct drm_blob *degamma_lut, *ctm, *gamma_lut;
+	int color_mgmt_changed;
+	/* VRR_ENABLED: variable refresh asked for */
+	int vrr_enabled;
+	/* the flip may happen outside vblank (DRM_MODE_PAGE_FLIP_ASYNC) */
+	int async_flip;
+	/* OUT_FENCE_PTR: the client's s32 the request's fence descriptor
+	 * goes to (a user address, 0 = none) */
+	uint64_t out_fence_ptr;
+	/* The MODE_ID blob the request named, referenced until the
+	 * state is freed (NULL: the mode is the committed one or none); and
+	 * the out-fence made for out_fence_ptr with its descriptor (-1),
+	 * between the ATOMIC ioctl's preparation and its end. */
+	struct drm_blob *mode_blob;
+	struct drm_fence *out_fence;
+	int out_fence_fd;
 };
 
 struct drm_connector_state {
@@ -472,6 +854,29 @@ struct drm_connector_state {
 	int crtc; /* crtc index, -1 */
 	int dpms;
 	int changed;
+	/* The request set DPMS (the legacy property); dpms is what it set. */
+	int dpms_changed;
+	/* The request this state belongs to. */
+	struct drm_atomic_state *state;
+	/* "max bpc" as asked, and what the driver settled on */
+	uint32_t max_requested_bpc, max_bpc;
+	/* "Colorspace": DRM_MODE_COLORIMETRY_* */
+	uint32_t colorspace;
+	/* "Broadcast RGB": automatic / full / limited range */
+	uint32_t broadcast_rgb;
+	/* "content type": DRM_MODE_CONTENT_TYPE_* */
+	uint32_t content_type;
+	/* HDR_OUTPUT_METADATA: blob of struct hdr_output_metadata, referenced
+	 * by the state until it is freed, NULL none */
+	struct drm_blob *hdr_output_metadata;
+	/* "scaling mode": DRM_MODE_SCALE_* */
+	uint32_t scaling_mode;
+	/* "link-status" (DRM_MODE_LINK_STATUS_*): what the request leaves
+	 * it at, and what it was when the state was made.  A request only
+	 * ever sets a BAD link GOOD; one that does is a full mode set of the
+	 * connector's crtc. */
+	uint64_t link_status;
+	uint64_t old_link_status;
 };
 
 struct drm_atomic_state {
@@ -497,6 +902,25 @@ int drm_atomic_crtc_set(struct drm_atomic_state *st, struct drm_crtc *c,
 			uint32_t prop, uint64_t val);
 int drm_atomic_conn_set(struct drm_atomic_state *st, struct drm_connector *c,
 			uint32_t prop, uint64_t val);
+/* The same by property (the ATOMIC ioctl's routing).  The value is not
+ * checked against the property here: drm_atomic_set_property() does that,
+ * and a kernel caller knows what it writes. */
+struct drm_prop;
+int drm_atomic_plane_set_property(struct drm_atomic_state *st,
+				  struct drm_plane *p,
+				  struct drm_prop *prop, uint64_t val);
+int drm_atomic_crtc_set_property(struct drm_atomic_state *st,
+				 struct drm_crtc *c,
+				 struct drm_prop *prop, uint64_t val);
+int drm_atomic_conn_set_property(struct drm_atomic_state *st,
+				 struct drm_connector *c,
+				 struct drm_prop *prop, uint64_t val);
+/* A client's write of `prop' on object `obj' of type `type'
+ * (DRM_MODE_OBJECT_CRTC / PLANE / CONNECTOR), the property attached to it:
+ * the value is checked against the property (-EINVAL), what it names kept
+ * alive for the write, and the write routed to the object's state. */
+int drm_atomic_set_property(struct drm_atomic_state *st, uint32_t type,
+			    void *obj, struct drm_prop *prop, uint64_t val);
 /* The core's consistency checks, then the driver's. */
 int drm_atomic_check(struct drm_atomic_state *st);
 /* Apply: the driver programs the hardware, then the objects take the
@@ -522,6 +946,42 @@ static inline int drm_crtc_state_needs_modeset(const struct drm_crtc_state *cs)
 struct drm_mode_rect_k {
 	int32_t x1, y1, x2, y2;
 };
+
+/* drm_driver.features: behaviour of the core a driver opts into, so that a
+ * change in what the core does reaches only the drivers that asked for it.
+ *
+ * ATOMIC_PLANE_CHECK: the atomic check clips each plane against its crtc
+ * (drm_atomic_helper_check_plane_state) instead of requiring the plane to
+ * lie inside its framebuffer and on the crtc.
+ * PROBE_HELPER: a connector's mode list is built by the probe helper from
+ * the EDID and the standard table, validated (mode_valid), pruned, de-
+ * duplicated and sorted, rather than taken as the driver filled it.
+ * DAMAGE_CLIPS: planes advertise FB_DAMAGE_CLIPS.
+ * BLEND: planes advertise rotation, zpos, alpha and pixel blend mode (the
+ * core's minimal set, see drm_plane_add; a driver that can do more makes
+ * its own with drm_blend.h and leaves the bit off).
+ * COLOR_MGMT: crtcs advertise DEGAMMA_LUT (when degamma_size below is not
+ * 0) and CTM (when color_has_ctm is set) besides GAMMA_LUT.
+ * ATOMIC_FENCES: IN_FENCE_FD on planes and OUT_FENCE_PTR on crtcs.
+ * VRR: crtcs advertise VRR_ENABLED.
+ * CURSOR_HOTSPOT: see its definition.
+ *
+ * Every one of these that adds properties creates them in drm_kms_init,
+ * after the core's own, so a driver without the bit sees the same
+ * property ids and listings as before. */
+#define DRM_FEATURE_ATOMIC_PLANE_CHECK (1u << 0)
+#define DRM_FEATURE_PROBE_HELPER (1u << 1)
+#define DRM_FEATURE_DAMAGE_CLIPS (1u << 2)
+#define DRM_FEATURE_BLEND (1u << 3)
+#define DRM_FEATURE_COLOR_MGMT (1u << 4)
+#define DRM_FEATURE_ATOMIC_FENCES (1u << 5)
+#define DRM_FEATURE_VRR (1u << 6)
+/* CURSOR_HOTSPOT: cursor planes advertise HOTSPOT_X / HOTSPOT_Y (the
+ * pointer's hot spot inside the image, for a display that draws the cursor
+ * itself -- a virtual machine's host), and an atomic client that has not
+ * set DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT does not see the cursor planes
+ * at all, since it would leave the hot spot unset. */
+#define DRM_FEATURE_CURSOR_HOTSPOT (1u << 7)
 
 struct drm_driver {
 	const char *name; /* "vmwgfx" */
@@ -567,6 +1027,11 @@ struct drm_driver {
 	 * an unrelated thread to ask on its behalf.  This is how it asks for
 	 * itself. */
 	void (*fence_poll)(struct drm_device *dev);
+	/* Optional, thread context, no locks held: called on every tick of
+	 * the core's reaper thread (a few milliseconds apart) so that memory
+	 * the driver holds back until the device has caught up is returned
+	 * when it has, even with no client submitting any more. */
+	void (*idle_reclaim)(struct drm_device *dev);
 	/* Optional: say what the work behind a fence that has been waited
 	 * for for seconds is doing (which engine, how far it got).  Called
 	 * from thread context, rate-limited by the core. */
@@ -653,6 +1118,14 @@ struct drm_driver {
 			  int32_t hot_x, int32_t hot_y);
 	int (*cursor_move)(struct drm_device *dev, struct drm_crtc *crtc,
 			   int x, int y);
+	/* Optional: may `o' be shown as a w x h ARGB8888 cursor (the legacy
+	 * CURSOR / CURSOR2 call on an atomic driver)?  0 or -Exxx.  Without it
+	 * the core requires a plain buffer (DRM_GEM_BO) to hold w * h * 4
+	 * bytes and lets any other kind of object through for the driver's
+	 * own check -- a surface's size is that of its backing store, not of
+	 * the image. */
+	int (*cursor_obj_check)(struct drm_device *dev, struct drm_gem_object *o,
+				uint32_t w, uint32_t h);
 	int (*dpms)(struct drm_device *dev, struct drm_connector *c, int mode);
 	/* Atomic mode setting.  A driver with these two never sees mode_set,
 	 * crtc_disable, page_flip, cursor_set/move or dpms: every change
@@ -664,18 +1137,59 @@ struct drm_driver {
 	int (*atomic_check)(struct drm_device *dev, struct drm_atomic_state *st);
 	int (*atomic_commit)(struct drm_device *dev, struct drm_atomic_state *st);
 	/* Entries in the CRTC's gamma table (0: no table).  With atomic ops
-	 * the core advertises GAMMA_LUT / GAMMA_LUT_SIZE and hands the table
-	 * over in the crtc state; SETGAMMA arrives the same way. */
+	 * the core advertises GAMMA_LUT / GAMMA_LUT_SIZE (this many entries,
+	 * each crtc's own value changeable with drm_crtc_enable_color_mgmt)
+	 * and hands the table over in the crtc state; SETGAMMA arrives the
+	 * same way.  The legacy table SETGAMMA / GETGAMMA / GETCRTC speak of is
+	 * the crtc's gamma_size (256), not this. */
 	uint32_t gamma_size;
 	/* Power.  suspend takes the hardware down -- outputs, engines,
 	 * interrupts -- without touching the core's idea of what is shown;
 	 * resume brings the hardware back to where a mode set can be made,
-	 * after which the core replays the committed state through
-	 * atomic_commit.  Atomic drivers only. */
+	 * after which the core shows the committed state again: through
+	 * atomic_commit for an atomic driver, else through mode_set,
+	 * cursor_set / cursor_move and dpms.  Every ioctl waits while the
+	 * device is down (drm_pm_gate_enter). */
 	int (*suspend)(struct drm_device *dev);
 	int (*resume)(struct drm_device *dev);
 	/* 1 when the backend delivers vblanks itself (drm_vblank_tick) */
 	int hw_vblank;
+	/* Optional, with hw_vblank: the vblank hardware itself.
+	 * get_vblank_counter reads the crtc's hardware frame counter, which
+	 * wraps at max_vblank_count (0: there is no counter, the core counts
+	 * interrupts).  get_scanout_position says where the scanout is
+	 * (lines, pixels; negative inside vertical blanking) with the
+	 * time the reading was taken between *stime_ns and *etime_ns, for
+	 * vblank timestamps that do not depend on interrupt latency; false
+	 * when it cannot.  enable_vblank / disable_vblank switch the crtc's
+	 * vblank interrupt while somebody needs it.
+	 *
+	 * All four are called with the vblank lock held and interrupts off
+	 * (get_scanout_position also from the vblank interrupt itself): they
+	 * must not sleep, and must not call back into the vblank core or
+	 * take a lock that is held while calling into it. */
+	uint32_t (*get_vblank_counter)(struct drm_device *dev, int crtc);
+	uint32_t max_vblank_count;
+	bool (*get_scanout_position)(struct drm_device *dev, int crtc,
+				     bool in_vblank_irq, int *vpos, int *hpos,
+				     uint64_t *stime_ns, uint64_t *etime_ns,
+				     const struct drm_display_mode *mode);
+	int (*enable_vblank)(struct drm_device *dev, int crtc);
+	void (*disable_vblank)(struct drm_device *dev, int crtc);
+	/* Optional: can the hardware behind this connector show the mode?
+	 * MODE_OK or the reason it cannot; asked while the connector's mode
+	 * list is built and when a client sets a mode. */
+	enum drm_mode_status (*mode_valid)(struct drm_device *dev,
+					   struct drm_connector *c,
+					   const struct drm_display_mode *mode);
+	/* DRM_FEATURE_*: core behaviour the driver opts into. */
+	uint32_t features;
+	/* With DRM_FEATURE_COLOR_MGMT: entries in the crtc's degamma table
+	 * (0: none -- the crtc then advertises CTM and GAMMA_LUT only). */
+	uint32_t degamma_size;
+	/* With DRM_FEATURE_COLOR_MGMT: the crtcs have a colour transformation
+	 * matrix, and the core attaches CTM to them.  0: no CTM listed. */
+	int color_has_ctm;
 	/* Optional, with hw_vblank: the core's watchdog found the crtc on
 	 * and no vblank for several periods while somebody waits; the
 	 * backend says why (and may repair it).  Called from the timer
@@ -703,6 +1217,20 @@ struct drm_driver {
 	 * restored the flush hook it had before. */
 	int (*display_verify)(struct drm_device *dev);
 	void (*display_fallback)(struct drm_device *dev);
+
+	/* Optional: the description of a format in one of the driver's
+	 * own layouts (`modifier') where it differs from the generic table,
+	 * e.g. a compressed layout with an extra plane; NULL to use the
+	 * table.  Asked by drm_get_format_info() on every ADDFB2. */
+	const struct drm_format_info *(*get_format_info)(uint32_t format,
+							 uint64_t modifier);
+
+	/* Optional: a waiter would like fence `f' (one of this
+	 * device's own) signalled by `deadline_ns' (hrtimer_now_ns() base) --
+	 * a hint, e.g. to raise the clocks.  May be called in any context,
+	 * with no fence lock held; must not sleep. */
+	void (*fence_set_deadline)(struct drm_device *dev, struct drm_fence *f,
+				   uint64_t deadline_ns);
 };
 
 struct drm_device {
@@ -765,25 +1293,9 @@ struct drm_device {
 	 * what /sys reports so a client can tell whether to look again. */
 	uint32_t hotplug_epoch;
 
-	/* vblank: one counter per crtc, driven by hrtimer or the backend */
-	struct {
-		uint64_t count;
-		uint64_t last_ns;
-		uint64_t period_ns;
-		hrtimer_t timer;
-		int running;
-		/* How many waiters need the counter to keep advancing.  The
-		 * timer runs while the CRTC is active OR this is non-zero, so
-		 * that turning a CRTC off cannot strand someone mid-wait. */
-		int refs;
-		/* Where the backend counts (hw_vblank): when its last vblank
-		 * arrived, whether the timer is standing in for it (no
-		 * vblank for several periods while someone waits), and how
-		 * often that was said */
-		uint64_t hw_last_ns;
-		int soft;
-		uint32_t soft_said;
-	} vbl[DRM_MAX_CONNECTORS];
+	/* vblank: one counter per crtc, driven by hrtimer or the backend
+	 * (drm_vblank.h) */
+	struct drm_vblank_crtc vbl[DRM_MAX_CONNECTORS];
 	struct wait_queue_head vbl_wq;
 	uint32_t refresh_hz;
 
@@ -794,6 +1306,23 @@ struct drm_device {
 	struct drm_device *next_dev;
 	int late_init_done;
 	int suspended; /* drm_suspend() done, drm_resume() not yet */
+	/* The power gate (drm_drv.c): pm_state is DRM_PM_RUNNING, _SUSPENDING,
+	 * _SUSPENDED or _RESUMING, pm_active the gated calls in flight; both
+	 * under pm_lock.  Callers sleep on &pm_state (the wait channel) for the
+	 * device to run again, a suspend on it for the calls in flight to
+	 * leave. */
+	spinlock_t pm_lock;
+	int pm_state;
+	int pm_active;
+
+	/* Ids of the device-wide optional properties, 0 where they
+	 * were not created (see the DRM_FEATURE_* bits).  drm_kms_init
+	 * creates the crtc and plane ones; the connector ones
+	 * (content type, HDR_OUTPUT_METADATA) belong to the connector code. */
+	uint32_t prop_degamma_lut, prop_degamma_lut_size, prop_ctm,
+		prop_vrr_enabled, prop_fb_damage_clips, prop_in_fence_fd,
+		prop_out_fence_ptr, prop_content_type,
+		prop_hdr_output_metadata;
 };
 
 /* Registration: creates the nodes and the sysfs entries. */
@@ -822,6 +1351,22 @@ int drm_resume(struct drm_device *dev);
 /* Every registered device, in registration order. */
 int drm_suspend_all(void);
 int drm_resume_all(void);
+/* The power gate around everything that reaches the hardware from a
+ * client's side.  enter: 0 once the device runs (waiting, interruptibly,
+ * while it is suspended or being suspended or resumed), or -ERESTARTSYS when
+ * a signal came first; every 0 is paired with drm_pm_gate_exit().
+ * tryenter: the same without waiting -- false while the device is not
+ * running (for threads that must not block, such as the object reaper:
+ * the work is simply left for later).  A suspend waits for the callers
+ * inside to leave, and gives up with -EBUSY if they do not within a few
+ * seconds.  Process context only. */
+#define DRM_PM_RUNNING 0
+#define DRM_PM_SUSPENDING 1
+#define DRM_PM_SUSPENDED 2
+#define DRM_PM_RESUMING 3
+int drm_pm_gate_enter(struct drm_device *dev);
+bool drm_pm_gate_tryenter(struct drm_device *dev);
+void drm_pm_gate_exit(struct drm_device *dev);
 /* Once storage is up: every registered driver's late_init, once. */
 void drm_late_init(void);
 
@@ -839,19 +1384,45 @@ void drm_syncobj_file_release(struct drm_file *fp);
 struct drm_syncobj *drm_syncobj_lookup(struct drm_file *fp, uint32_t handle);
 void drm_syncobj_get(struct drm_syncobj *so);
 void drm_syncobj_put(struct drm_syncobj *so);
-/* The binary payload (a reference), NULL when none. */
+/* The object's fence (a reference), NULL when none: a binary object's
+ * payload, or the newest link of a timeline's fence chain. */
 struct drm_fence *drm_syncobj_fence_get(struct drm_syncobj *so);
-/* Replace the binary payload (NULL = reset). */
+/* Replace the fence (NULL = reset); a timeline is dropped whole. */
 void drm_syncobj_replace_fence(struct drm_syncobj *so, struct drm_fence *f);
-/* Attach a fence at a timeline point (point 0 = the binary payload). */
+/* Attach a fence at a timeline point (point 0: replace the fence, the
+ * binary form).  0, or -ENOMEM; any number of points may be pending. */
 int drm_syncobj_add_point(struct drm_syncobj *so, struct drm_fence *f,
 			  uint64_t point);
-/* The fence that stands for `point' (a reference): the binary payload for
- * 0, else the earliest submitted point at or beyond it.  -ENOENT when
- * nothing has been submitted for it yet; an always-signalled fence when
- * the timeline has already passed it. */
+/* The fence that stands for `point' (a reference): the fence itself for 0,
+ * else the link of the oldest submitted point still covering it.  -ENOENT
+ * when nothing has been submitted for it yet (or a point of a binary
+ * object is asked for); a signalled fence when the timeline has already
+ * passed it; -ENOMEM. */
 int drm_syncobj_find_fence(struct drm_syncobj *so, uint64_t point,
 			   struct drm_fence **out);
+/* The same by handle, with the ioctl's error codes: -ENOENT for an unknown
+ * handle, -EINVAL when nothing stands for the point.  `flags' may hold
+ * DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: wait (sleeping, interruptibly,
+ * no locks held) up to five seconds for the point to be submitted, then
+ * -ETIME or -ERESTARTSYS. */
+int drm_syncobj_find_fence_handle(struct drm_file *fp, uint32_t handle,
+				  uint64_t point, uint64_t flags,
+				  struct drm_fence **fence);
+/* Make `chain' (drm_fence_chain_alloc()) the link for `point', holding
+ * `fence' (a plain fence or an array, referenced by the call). */
+struct drm_fence_chain;
+void drm_syncobj_add_point_chain(struct drm_syncobj *so,
+				 struct drm_fence_chain *chain,
+				 struct drm_fence *fence, uint64_t point);
+/* A new object on `dev' (DRM_SYNCOBJ_CREATE_SIGNALED: holding a signalled
+ * fence; `fence' non-NULL: holding that), one reference to the caller. */
+int drm_syncobj_create(struct drm_device *dev, struct drm_syncobj **out,
+		       uint32_t flags, struct drm_fence *fence);
+/* A handle of `fp' for the object (it takes a reference of its own). */
+int drm_syncobj_get_handle(struct drm_file *fp, struct drm_syncobj *so,
+			   uint32_t *handle);
+/* A close-on-exec descriptor of the caller for the object. */
+int drm_syncobj_get_fd(struct drm_syncobj *so, int *p_fd);
 
 /* KMS helpers for backends. */
 void drm_mode_fill(struct drm_mode_modeinfo *m, uint32_t w, uint32_t h,
@@ -888,6 +1459,11 @@ struct i2c_adapter;
  * the display did not answer, negative on a bad base block. */
 int drm_edid_read(struct i2c_adapter *adapter, uint8_t *buf, int max_blocks);
 struct drm_framebuffer *drm_fb_lookup(struct drm_device *dev, uint32_t id);
+/* Is the source rectangle (16.16) inside the framebuffer?  0, or -ENOSPC.
+ * (drm_plane.c) */
+int drm_framebuffer_check_src_coords(uint32_t src_x, uint32_t src_y,
+				     uint32_t src_w, uint32_t src_h,
+				     const struct drm_framebuffer *fb);
 /* Deliver a vblank from hardware (when drv->hw_vblank). */
 void drm_vblank_tick(struct drm_device *dev, int crtc);
 /* The current scanout framebuffer object of a crtc (no reference). */
@@ -902,5 +1478,95 @@ static inline int drm_file_is_master(struct drm_file *fp)
 {
 	return fp->is_master;
 }
+
+/* ---- connector names and optional properties (drm_connector.c) ----
+ *
+ * The optional connector properties a driver attaches to the connectors
+ * that have what they control.  None is attached unless a driver asks, so
+ * a driver that attaches none lists what it always listed. */
+
+/* "Colorspace" values. */
+enum drm_colorspace {
+	DRM_MODE_COLORIMETRY_DEFAULT = 0, /* the driver chooses */
+	DRM_MODE_COLORIMETRY_NO_DATA = 0,
+	DRM_MODE_COLORIMETRY_SMPTE_170M_YCC = 1,
+	DRM_MODE_COLORIMETRY_BT709_YCC = 2,
+	DRM_MODE_COLORIMETRY_XVYCC_601 = 3,
+	DRM_MODE_COLORIMETRY_XVYCC_709 = 4,
+	DRM_MODE_COLORIMETRY_SYCC_601 = 5,
+	DRM_MODE_COLORIMETRY_OPYCC_601 = 6,
+	DRM_MODE_COLORIMETRY_OPRGB = 7,
+	DRM_MODE_COLORIMETRY_BT2020_CYCC = 8,
+	DRM_MODE_COLORIMETRY_BT2020_RGB = 9,
+	DRM_MODE_COLORIMETRY_BT2020_YCC = 10,
+	DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65 = 11,
+	DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER = 12,
+	DRM_MODE_COLORIMETRY_RGB_WIDE_FIXED = 13,
+	DRM_MODE_COLORIMETRY_RGB_WIDE_FLOAT = 14,
+	DRM_MODE_COLORIMETRY_BT601_YCC = 15,
+	DRM_MODE_COLORIMETRY_COUNT
+};
+
+/* "Broadcast RGB" values: the RGB quantisation range sent to the sink. */
+enum drm_hdmi_broadcast_rgb {
+	DRM_HDMI_BROADCAST_RGB_AUTO, /* as the mode and the sink say */
+	DRM_HDMI_BROADCAST_RGB_FULL,
+	DRM_HDMI_BROADCAST_RGB_LIMITED,
+};
+
+/* "panel orientation": how the panel is mounted (display_info). */
+enum drm_panel_orientation {
+	DRM_MODE_PANEL_ORIENTATION_UNKNOWN = -1,
+	DRM_MODE_PANEL_ORIENTATION_NORMAL = 0,
+	DRM_MODE_PANEL_ORIENTATION_BOTTOM_UP,
+	DRM_MODE_PANEL_ORIENTATION_LEFT_UP,
+	DRM_MODE_PANEL_ORIENTATION_RIGHT_UP,
+};
+
+/* Names, for logs and enum properties ("(null)" / NULL when unknown). */
+const char *drm_get_connector_type_name(unsigned int type);
+const char *drm_get_connector_status_name(int status);
+const char *drm_get_subpixel_order_name(int order);
+const char *drm_get_dpms_name(int val);
+const char *drm_get_colorspace_name(enum drm_colorspace colorspace);
+const char *drm_hdmi_connector_get_broadcast_rgb_name(enum drm_hdmi_broadcast_rgb broadcast_rgb);
+
+/* The device-wide connector properties that exist before any driver
+ * attaches them (PATH, TILE, HDR_OUTPUT_METADATA); see drm_connector.c
+ * for when they are made.  0 or -ENOMEM. */
+int drm_connector_create_standard_properties(struct drm_device *dev);
+/* Each returns 0 or a negative errno; c->dev must be set (it is, for a
+ * connector from drm_connector_add). */
+int drm_mode_create_content_type_property(struct drm_device *dev);
+int drm_connector_attach_content_type_property(struct drm_connector *c);
+int drm_connector_attach_scaling_mode_property(struct drm_connector *c,
+					       uint32_t scaling_mode_mask);
+int drm_connector_attach_vrr_capable_property(struct drm_connector *c);
+void drm_connector_set_vrr_capable_property(struct drm_connector *c, bool capable);
+/* "Colorspace" with the given DRM_MODE_COLORIMETRY_* bits (0: all that
+ * HDMI / DisplayPort can signal), then attached. */
+int drm_mode_create_hdmi_colorspace_property(struct drm_connector *c,
+					     uint32_t supported_colorspaces);
+int drm_mode_create_dp_colorspace_property(struct drm_connector *c,
+					   uint32_t supported_colorspaces);
+int drm_connector_attach_colorspace_property(struct drm_connector *c);
+int drm_connector_attach_max_bpc_property(struct drm_connector *c, int min, int max);
+int drm_connector_attach_hdr_output_metadata_property(struct drm_connector *c);
+bool drm_connector_atomic_hdr_metadata_equal(const struct drm_connector_state *old_state,
+					     const struct drm_connector_state *new_state);
+int drm_connector_attach_broadcast_rgb_property(struct drm_connector *c);
+/* The panel's mounting: recorded in display_info and shown as the
+ * immutable "panel orientation" property (once; UNKNOWN attaches nothing). */
+int drm_connector_set_panel_orientation(struct drm_connector *c,
+					enum drm_panel_orientation panel_orientation);
+/* PATH (a connector behind a DisplayPort branch) and TILE blobs: attach
+ * first, then set (TILE follows the EDID by itself once attached). */
+int drm_connector_attach_path_property(struct drm_connector *c);
+int drm_connector_attach_tile_property(struct drm_connector *c);
+int drm_connector_set_path_property(struct drm_connector *c, const char *path);
+int drm_connector_set_tile_property(struct drm_connector *c);
+/* The link failed (BAD) or works again (GOOD). */
+void drm_connector_set_link_status_property(struct drm_connector *c,
+					    uint64_t link_status);
 
 #endif

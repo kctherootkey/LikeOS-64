@@ -87,7 +87,7 @@ typedef void (*sigaction_handler_t)(int, void *,
 
 // signalfd flags
 #define SFD_CLOEXEC 02000000
-#define SFD_NONBLOCK 00004000
+#define SFD_NONBLOCK 04000
 
 // siginfo_t structure
 typedef struct siginfo {

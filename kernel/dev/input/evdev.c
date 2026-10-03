@@ -610,6 +610,10 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
 			return evdev_copy_bits(argp, dev->relbits,
 					       sizeof(dev->relbits),
 					       user_len);
+		if (ev == EV_LED)
+			return evdev_copy_bits(argp, dev->ledbits,
+					       sizeof(dev->ledbits),
+					       user_len);
 		// Unsupported event class: report an empty bitmap.
 		{
 			static const uint8_t none[8];
@@ -703,4 +707,72 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
 		return rc;
 	}
 	return -EINVAL;
+}
+
+// ---------------------------------------------------------------------------
+// write interface
+// ---------------------------------------------------------------------------
+
+/* One event a client injects; caller holds dev->lock.  Only what the device
+ * reports is taken, the rest is dropped without complaint: a display server
+ * writes the lock LEDs of every keyboard it drives, including LEDs the
+ * keyboard does not have (Kana, Compose).  A lock LED that changes is passed
+ * on to the readers, as are the frame ends after such changes; *pending says
+ * whether a frame has changes not yet ended. */
+static void evdev_inject_locked(evdev_dev_t *dev, const struct input_event *ev,
+				int *pending)
+{
+	if (ev->type == EV_LED) {
+		int lit;
+
+		if (ev->code >= LED_CNT || !bit_test(dev->evbits, EV_LED) ||
+		    !bit_test(dev->ledbits, ev->code))
+			return;
+		lit = ev->value != 0;
+		if (bit_test(dev->led_state, ev->code) == lit)
+			return;
+		if (lit)
+			bit_set(dev->led_state, ev->code);
+		else
+			bit_clear(dev->led_state, ev->code);
+		evdev_queue_locked(dev, EV_LED, ev->code, lit);
+		*pending = 1;
+		return;
+	}
+	if (ev->type == EV_SYN && ev->code == SYN_REPORT && *pending) {
+		evdev_queue_locked(dev, EV_SYN, SYN_REPORT, 0);
+		*pending = 0;
+	}
+}
+
+long evdev_write(int unit, const void *user_buf, long bytes)
+{
+	evdev_dev_t *dev = evdev_get(unit);
+	struct input_event ev;
+	long done = 0;
+	int pending = 0, queued = 0;
+	uint64_t f;
+
+	if (!dev || bytes < 0)
+		return -EINVAL;
+	if (bytes == 0)
+		return 0;
+	/* Whole records only, at least one. */
+	if (bytes < (long)sizeof(struct input_event))
+		return -EINVAL;
+
+	while (done + (long)sizeof(ev) <= bytes) {
+		if (evdev_copy_in(&ev, (const uint8_t *)user_buf + done,
+				  sizeof(ev)) != 0)
+			return -EFAULT;
+		done += (long)sizeof(ev);
+		spin_lock_irqsave(&dev->lock, &f);
+		evdev_inject_locked(dev, &ev, &pending);
+		if (pending)
+			queued = 1;
+		spin_unlock_irqrestore(&dev->lock, f);
+	}
+	if (queued)
+		evdev_wake_readers(dev);
+	return done;
 }

@@ -2025,13 +2025,37 @@ int asprintf(char **strp, const char *format, ...)
 	return ret;
 }
 
+/* vsnprintf() returns the length the output WOULD have had, not what fit, so
+ * a line longer than the stack buffer is formatted again into one of its own
+ * size.  Writing `len' bytes from the stack buffer regardless put whatever
+ * lay past its end on the stack into the output: a browser logging a long
+ * URL wrote binary garbage to the log after its first 4 KB. */
 int vfprintf(FILE *stream, const char *format, va_list ap)
 {
-	char buf[4096];
-	int len = vsnprintf(buf, sizeof(buf), format, ap);
-	if (len > 0) {
-		fwrite(buf, 1, len, stream);
+	char stackbuf[4096];
+	char *buf = stackbuf;
+	va_list ap2;
+	int len;
+
+	va_copy(ap2, ap);
+	len = vsnprintf(stackbuf, sizeof(stackbuf), format, ap2);
+	va_end(ap2);
+	if (len < 0)
+		return len;
+	if ((size_t)len >= sizeof(stackbuf)) {
+		buf = (char *)malloc((size_t)len + 1);
+		if (!buf) {
+			errno = ENOMEM;
+			return -1;
+		}
+		va_copy(ap2, ap);
+		vsnprintf(buf, (size_t)len + 1, format, ap2);
+		va_end(ap2);
 	}
+	if (len > 0)
+		fwrite(buf, 1, (size_t)len, stream);
+	if (buf != stackbuf)
+		free(buf);
 	return len;
 }
 

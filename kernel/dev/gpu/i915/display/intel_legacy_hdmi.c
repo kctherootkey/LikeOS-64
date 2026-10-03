@@ -12,18 +12,46 @@
 // past G4X, the general control packet -- written through the video DIP
 // buffer: one buffer for the whole chip on G4X, one per pipe elsewhere.  A
 // DVI sink gets the same stream with no packets.  Sinks are found by their
-// EDID on the port's DDC pin.
+// EDID on the port's DDC pin.  A DP++ port may have a dual-mode adaptor
+// between it and the sink: its type and TMDS limit are read over the same
+// DDC bus, and a type 2 adaptor's TMDS output is switched with the port.
 //
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2020 Intel Corporation
-// Portions Copyright (C) 2006 Dave Airlie
+// Portions Copyright (C) 2006 Dave Airlie <airlied@linux.ie>
 
+#include <kernel/dev/gpu/i915/intel_features.h>
 #include <kernel/dev/gpu/i915/intel_legacy.h>
+#include <kernel/dev/gpu/drm_dp_dual_mode_helper.h>
 #include <kernel/dev/gpu/drm_edid.h>
+#include <kernel/dev/gpu/drm_modes.h>
+#include <kernel/dev/gpu/hdmi.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
+
+/* ---- compile-time switches ---------------------------------------------------- */
+
+/* DP++ (dual-mode) adaptors on these HDMI ports: the adaptor's type read
+ * over DDC at every detection (a silent one taken for a type 1 DVI
+ * adaptor when the VBT calls the port DP++), its TMDS limit honoured by
+ * the mode checks, and a type 2 adaptor's TMDS output switched on and
+ * off with the port.  0: an adaptor is treated as a plain HDMI sink, as
+ * before. */
+#ifndef I915_FEAT_LEGACY_HDMI_DUAL_MODE
+#define I915_FEAT_LEGACY_HDMI_DUAL_MODE 1
+#endif
+
+/* The AVI, SPD and HDMI vendor infoframes built and packed by the HDMI
+ * infoframe library from the mode and the sink's EDID (CEA-861-F codes
+ * for sinks that list them, the quantisation fields the sink takes, the
+ * vendor frame only for a sink with the HDMI vendor block, a mode whose
+ * AVI frame cannot be built refused).  0: the driver's own packing, as
+ * before. */
+#ifndef I915_FEAT_LEGACY_HDMI_INFOFRAME_LIB
+#define I915_FEAT_LEGACY_HDMI_INFOFRAME_LIB 1
+#endif
 
 /* ---- the video DIP (data island packet) buffer ------------------------------ */
 
@@ -80,6 +108,13 @@
 struct lg_hdmi {
 	uint32_t max_tmds_khz; /* what the source can send */
 	int dvi_only; /* the VBT calls the port DVI */
+	/* the VBT calls the port DP++ (a DisplayPort port that drives
+	 * HDMI through a dual-mode adaptor) */
+	int vbt_dp_dual_mode;
+	/* the dual-mode adaptor found at the last detection and the TMDS
+	 * clock it passes (kHz, 0 = no limit) */
+	enum drm_dp_dual_mode_type dp_dual_mode_type;
+	uint32_t dp_dual_mode_max_tmds_khz;
 };
 
 static char port_name(int port)
@@ -115,6 +150,10 @@ static uint32_t hdmi_port_clock_limit(struct lg_display *d, struct lg_output *o,
 	struct lg_hdmi *h = o->priv;
 	uint32_t max = h ? h->max_tmds_khz : hdmi_source_max_tmds(d);
 
+	/* an adaptor between port and sink passes no more than it says */
+	if (respect_downstream && h && h->dp_dual_mode_max_tmds_khz &&
+	    max > h->dp_dual_mode_max_tmds_khz)
+		max = h->dp_dual_mode_max_tmds_khz;
 	if (respect_downstream && !has_hdmi_sink && max > HDMI_DVI_MAX_TMDS_KHZ)
 		max = HDMI_DVI_MAX_TMDS_KHZ;
 	return max;
@@ -326,6 +365,92 @@ static int hdmi_vendor_frame(const struct lg_config *cfg, uint8_t out[HDMI_DIP_D
 	return hdmi_pack(HDMI_IF_VENDOR, 1, pb, 4, out);
 }
 
+/* ---- infoframes from the HDMI infoframe library ------------------------------ */
+
+static const struct drm_connector *hdmi_connector(const struct lg_display *d,
+						  const struct lg_output *o)
+{
+	if (!d->drm || o->conn < 0)
+		return NULL;
+	return &d->drm->conn[o->conn];
+}
+
+/* The AVI frame of cfg's mode for the sink behind `o': RGB, the
+ * quantisation range sent (cfg->limited_color_range).  0, or a negative
+ * errno when the frame cannot describe the mode. */
+static int hdmi_lib_avi_frame(const struct lg_display *d, const struct lg_output *o,
+			      const struct lg_config *cfg, union hdmi_infoframe *frame)
+{
+	const struct drm_connector *c = hdmi_connector(d, o);
+	struct drm_display_mode mode;
+	int ret;
+
+	/* the quantisation fields depend on what the sink's EDID said */
+	if (!c)
+		return -ENODEV;
+	if (drm_mode_from_umode(&mode, &cfg->mode))
+		return -EINVAL;
+	ret = drm_hdmi_avi_infoframe_from_display_mode(&frame->avi, c, &mode);
+	if (ret)
+		return ret;
+	frame->avi.colorspace = HDMI_COLORSPACE_RGB;
+	drm_hdmi_avi_infoframe_quant_range(&frame->avi, c, &mode,
+					   cfg->limited_color_range ?
+						   HDMI_QUANTIZATION_RANGE_LIMITED :
+						   HDMI_QUANTIZATION_RANGE_FULL);
+	return hdmi_avi_infoframe_check(&frame->avi);
+}
+
+static int hdmi_lib_spd_frame(union hdmi_infoframe *frame)
+{
+	int ret = hdmi_spd_infoframe_init(&frame->spd, "Intel", "Integrated gfx");
+
+	if (ret)
+		return ret;
+	frame->spd.sdi = HDMI_SPD_SDI_PC;
+	return hdmi_spd_infoframe_check(&frame->spd);
+}
+
+/* The HDMI vendor frame: 1 when built, 0 when the sink has no HDMI vendor
+ * block (no frame is sent), a negative errno. */
+static int hdmi_lib_vendor_frame(const struct lg_display *d, const struct lg_output *o,
+				 const struct lg_config *cfg, union hdmi_infoframe *frame)
+{
+	const struct drm_connector *c = hdmi_connector(d, o);
+	struct drm_display_mode mode;
+	int ret;
+
+	if (!c || !c->display_info.has_hdmi_infoframe)
+		return 0;
+	if (drm_mode_from_umode(&mode, &cfg->mode))
+		return -EINVAL;
+	ret = drm_hdmi_vendor_infoframe_from_display_mode(&frame->vendor.hdmi, c, &mode);
+	if (ret)
+		return ret;
+	ret = hdmi_vendor_infoframe_check(&frame->vendor.hdmi);
+	return ret ? ret : 1;
+}
+
+/* A frame packed the way the DIP buffer wants it: the library packs the
+ * header (type, version, length), the checksum and the payload; the
+ * buffer keeps a byte after the three header bytes for the header's ECC,
+ * which the hardware fills in.  Returns the bytes used of the zeroed
+ * 32-byte buffer, or a negative errno. */
+static int hdmi_lib_pack(const union hdmi_infoframe *frame, uint8_t out[HDMI_DIP_DATA_SIZE])
+{
+	ssize_t len;
+
+	mm_memset(out, 0, HDMI_DIP_DATA_SIZE);
+	len = hdmi_infoframe_pack_only(frame, out + 1, HDMI_DIP_DATA_SIZE - 1);
+	if (len < 0)
+		return (int)len;
+	out[0] = out[1];
+	out[1] = out[2];
+	out[2] = out[3];
+	out[3] = 0;
+	return (int)len + 1;
+}
+
 static uint32_t dip_ctl_reg(struct lg_display *d, int pipe)
 {
 	if (hdmi_is_vlv(d))
@@ -457,11 +582,41 @@ static int hdmi_set_gcp(struct lg_display *d, const struct lg_config *cfg)
 	return 1;
 }
 
-static void hdmi_write_frames(struct lg_display *d, const struct lg_config *cfg)
+/* The frames from the library: AVI and SPD always, the vendor frame for
+ * a sink with the HDMI vendor block.  A frame left out keeps its slot
+ * disabled. */
+static void hdmi_write_frames_lib(struct lg_display *d, struct lg_output *o,
+				  const struct lg_config *cfg)
+{
+	union hdmi_infoframe frame;
+	uint8_t buf[HDMI_DIP_DATA_SIZE];
+	int n;
+
+	mm_memset(&frame, 0, sizeof(frame));
+	if (hdmi_lib_avi_frame(d, o, cfg, &frame) == 0 && (n = hdmi_lib_pack(&frame, buf)) > 0)
+		dip_write(d, cfg->pipe, HDMI_IF_AVI, buf, n);
+	else
+		kprintf("[drm] i915: %s: no AVI infoframe for the mode\n", o->name);
+
+	mm_memset(&frame, 0, sizeof(frame));
+	if (hdmi_lib_spd_frame(&frame) == 0 && (n = hdmi_lib_pack(&frame, buf)) > 0)
+		dip_write(d, cfg->pipe, HDMI_IF_SPD, buf, n);
+
+	mm_memset(&frame, 0, sizeof(frame));
+	if (hdmi_lib_vendor_frame(d, o, cfg, &frame) > 0 && (n = hdmi_lib_pack(&frame, buf)) > 0)
+		dip_write(d, cfg->pipe, HDMI_IF_VENDOR, buf, n);
+}
+
+static void hdmi_write_frames(struct lg_display *d, struct lg_output *o,
+			      const struct lg_config *cfg)
 {
 	uint8_t buf[HDMI_DIP_DATA_SIZE];
 	int n;
 
+	if (I915_FEAT_LEGACY_HDMI_INFOFRAME_LIB) {
+		hdmi_write_frames_lib(d, o, cfg);
+		return;
+	}
 	/* has_infoframe implies an HDMI sink, which takes the vendor frame */
 	n = hdmi_avi_frame(cfg, 1, buf);
 	dip_write(d, cfg->pipe, HDMI_IF_AVI, buf, n);
@@ -542,7 +697,98 @@ static void hdmi_set_infoframes(struct lg_display *d, struct lg_output *o,
 	lg_wr(d, reg, val);
 	lg_posting_read(d, reg);
 
-	hdmi_write_frames(d, cfg);
+	hdmi_write_frames(d, o, cfg);
+}
+
+/* ---- DP++ (dual-mode) adaptors ------------------------------------------------ */
+
+/* The VBT's dvo_port codes of the integrated ports (HDMI A..D are 0..3,
+ * DP B..D 7..9, DP A 10). */
+#define LGHDMI_VBT_DVO_PORT_HDMID 3
+#define LGHDMI_VBT_DVO_PORT_DPB 7
+#define LGHDMI_VBT_DVO_PORT_DPA 10
+
+/* Does the VBT call the port DP++: DisplayPort and HDMI on a DP port, or
+ * on an HDMI port with an AUX channel? */
+static int hdmi_vbt_supports_dp_dual_mode(const struct lg_vbt_child *child)
+{
+	if (!child || !child->supports_dp || !child->supports_hdmi)
+		return 0;
+	if (child->dvo_port >= LGHDMI_VBT_DVO_PORT_DPB &&
+	    child->dvo_port <= LGHDMI_VBT_DVO_PORT_DPA)
+		return 1;
+	/* HDMI A (code 0) to HDMI D */
+	if (child->dvo_port <= LGHDMI_VBT_DVO_PORT_HDMID)
+		return child->aux_ch != 0xff;
+	return 0;
+}
+
+static void hdmi_unset_dp_dual_mode(struct lg_output *o)
+{
+	struct lg_hdmi *h = o->priv;
+
+	if (!h)
+		return;
+	h->dp_dual_mode_type = DRM_DP_DUAL_MODE_NONE;
+	h->dp_dual_mode_max_tmds_khz = 0;
+}
+
+/* What sits between the port and a sink whose EDID was just read. */
+static void hdmi_dp_dual_mode_detect(struct lg_display *d, struct lg_output *o)
+{
+	struct lg_hdmi *h = o->priv;
+	enum drm_dp_dual_mode_type type;
+
+	if (!I915_FEAT_LEGACY_HDMI_DUAL_MODE || !h || !o->ddc)
+		return;
+	type = drm_dp_dual_mode_detect(d->drm, o->ddc);
+
+	/* A type 1 DVI adaptor need not answer at all, and the CONFIG1 pin
+	 * that would tell is not readable here: on a port the VBT calls
+	 * DP++ a silent adaptor is taken for one. */
+	if (type == DRM_DP_DUAL_MODE_UNKNOWN) {
+		if (h->vbt_dp_dual_mode) {
+			i915_dbg("[drm] i915: %s: assuming a DP dual mode adaptor (VBT)\n",
+				 o->name);
+			type = DRM_DP_DUAL_MODE_TYPE1_DVI;
+		} else {
+			type = DRM_DP_DUAL_MODE_NONE;
+		}
+	}
+	if (type == DRM_DP_DUAL_MODE_NONE)
+		return;
+
+	h->dp_dual_mode_type = type;
+	h->dp_dual_mode_max_tmds_khz =
+		(uint32_t)drm_dp_dual_mode_max_tmds_clock(d->drm, type, o->ddc);
+	i915_dbg("[drm] i915: %s: DP dual mode adaptor (%s), max TMDS clock %u kHz\n", o->name,
+		 drm_dp_get_dual_mode_type_name(type), h->dp_dual_mode_max_tmds_khz);
+
+	/* From display version 8 on (Cherryview here) a port the VBT does
+	 * not call DP++ is a native HDMI port: whatever answered on DDC,
+	 * its limit is not the port's.  Older VBTs are too often wrong
+	 * about the port kind for the rule to go further back. */
+	if (d->ver >= 8 && !h->vbt_dp_dual_mode) {
+		i915_dbg("[drm] i915: %s: ignoring the adaptor's TMDS limit on a native HDMI port\n",
+			 o->name);
+		h->dp_dual_mode_max_tmds_khz = 0;
+	}
+}
+
+/* A type 2 adaptor's TMDS output buffers follow the port (type 1 ones
+ * have none to switch). */
+static void hdmi_dp_dual_mode_set_tmds_output(struct lg_display *d, struct lg_output *o,
+					      int enable)
+{
+	struct lg_hdmi *h = o->priv;
+
+	if (!I915_FEAT_LEGACY_HDMI_DUAL_MODE || !h ||
+	    h->dp_dual_mode_type < DRM_DP_DUAL_MODE_TYPE2_DVI)
+		return;
+	i915_dbg("[drm] i915: %s: %s the DP dual mode adaptor's TMDS output\n", o->name,
+		 enable ? "enabling" : "disabling");
+	(void)drm_dp_dual_mode_set_tmds_output(d->drm, h->dp_dual_mode_type, o->ddc,
+					       enable != 0);
 }
 
 /* ---- the port ---------------------------------------------------------------- */
@@ -551,6 +797,8 @@ static void hdmi_set_infoframes(struct lg_display *d, struct lg_output *o,
 static void hdmi_prepare(struct lg_display *d, struct lg_output *o, const struct lg_config *cfg)
 {
 	uint32_t val = SDVO_ENCODING_HDMI;
+
+	hdmi_dp_dual_mode_set_tmds_output(d, o, 1);
 
 	if (d->pch == LG_PCH_NONE && cfg->limited_color_range)
 		val |= HDMI_COLOR_RANGE_16_235;
@@ -715,6 +963,8 @@ static void hdmi_disable_port(struct lg_display *d, struct lg_output *o, const s
 	}
 
 	hdmi_set_infoframes(d, o, cfg, 0);
+
+	hdmi_dp_dual_mode_set_tmds_output(d, o, 0);
 }
 
 /* GMCH (and Valleyview/Cherryview): off right after the plane. */
@@ -818,9 +1068,12 @@ static int hdmi_detect(struct lg_display *d, struct lg_output *o)
 	o->edid_len = 0;
 	o->hdmi_sink = 0;
 	o->has_audio = 0;
+	hdmi_unset_dp_dual_mode(o);
 	if (o->ddc && hdmi_read_edid(d, o) == 0 && o->edid_len >= 128 &&
-	    (o->edid[20] & 0x80))
+	    (o->edid[20] & 0x80)) {
 		connected = 1;
+		hdmi_dp_dual_mode_detect(d, o);
+	}
 	if (!connected) {
 		o->hdmi_sink = 0;
 		o->has_audio = 0;
@@ -909,6 +1162,18 @@ static int hdmi_compute_config(struct lg_display *d, struct lg_output *o, struct
 	 * sink, full range otherwise */
 	cfg->limited_color_range = cfg->has_hdmi_sink && hdmi_default_range_limited(m);
 	cfg->has_audio = 0;
+
+	/* the AVI frame must be able to describe the mode */
+	if (I915_FEAT_LEGACY_HDMI_INFOFRAME_LIB && cfg->has_infoframe) {
+		union hdmi_infoframe frame;
+
+		mm_memset(&frame, 0, sizeof(frame));
+		if (hdmi_lib_avi_frame(d, o, cfg, &frame)) {
+			i915_dbg("[drm] i915: HDMI-%c: bad AVI infoframe, rejecting mode\n",
+				 port_name(o->port));
+			return -EINVAL;
+		}
+	}
 	return 0;
 }
 
@@ -1048,6 +1313,8 @@ void lg_hdmi_init(struct lg_display *d, uint32_t reg, int port)
 	mm_memset(h, 0, sizeof(*h));
 	h->max_tmds_khz = hdmi_source_max_tmds(d);
 	h->dvi_only = child && child->supports_dvi && !child->supports_hdmi;
+	h->vbt_dp_dual_mode = hdmi_vbt_supports_dp_dual_mode(child);
+	h->dp_dual_mode_type = DRM_DP_DUAL_MODE_NONE;
 
 	o = lg_output_new(d);
 	if (!o) {

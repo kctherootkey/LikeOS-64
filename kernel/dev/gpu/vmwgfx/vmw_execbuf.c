@@ -9,9 +9,21 @@
 // the fence the submission ends with has passed.  A command not in the
 // table is refused: the stream is untrusted input.
 //
+// The table and the per-command checks live in vmw_execbuf_cmds.c.  This
+// file walks the stream, owns the pinning and relocation helpers the checks
+// use, and keeps the books a stream changes: the bindings it gives its
+// contexts (staged while the stream is verified, committed to each
+// context's tracker only once the stream has gone to the device) and the
+// views it defines and destroys (staged in the context's manager the same
+// way, reverted when the stream is refused).
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Broadcom's code: GPL-2.0 OR MIT
+// Portions Copyright (c) 2009-2025 Broadcom. All Rights Reserved. The term
+// “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_execbuf.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
@@ -53,22 +65,7 @@
 #define VMW_REFS_INITIAL 64
 #define VMW_MAX_REFS 4096
 
-struct vmw_val {
-	struct vmw_device *v;
-	struct drm_file *fp;
-	struct vmw_context *ctx; /* DX context of the stream, or NULL */
-	struct drm_gem_object **refs;
-	uint32_t nrefs;
-	uint32_t refs_cap;
-	/* Set of what refs[] already holds, so the duplicate check below is
-	 * not a walk of it.  Open addressing, power-of-two, always twice
-	 * refs_cap -- a load factor of one half, which both keeps the probe
-	 * short and is what guarantees the loops terminate: the table can
-	 * never fill, so an empty slot is always found. */
-	struct drm_gem_object **htab;
-	uint32_t hmask; /* size - 1 */
-	uint32_t cid_seen; /* for legacy per-command cid */
-};
+/* struct vmw_val: vmw_execbuf.h */
 
 /* Objects come from the slab allocator, so the low bits are alignment and
  * carry nothing; the rest goes through a multiply by the 64-bit golden
@@ -165,9 +162,13 @@ static struct drm_gem_object *val_obj(struct vmw_val *val, uint32_t handle,
 	return o;
 }
 
-/* Rewrite a surface handle field to the device sid. */
-static int reloc_sid(struct vmw_val *val, uint32_t *field)
+/* Rewrite a surface handle field to the device sid; *srf_out (when asked
+ * for) is the surface, or NULL for SVGA3D_INVALID_ID. */
+static int reloc_sid(struct vmw_val *val, uint32_t *field,
+		     struct vmw_surface **srf_out)
 {
+	if (srf_out)
+		*srf_out = NULL;
 	if (*field == SVGA3D_INVALID_ID)
 		return 0;
 	struct drm_gem_object *o = val_obj(val, *field, DRM_GEM_SURFACE);
@@ -177,12 +178,17 @@ static int reloc_sid(struct vmw_val *val, uint32_t *field)
 	if (!s->bound && s->backup)
 		vmw_surface_bind(val->v, s);
 	*field = s->sid;
+	if (srf_out)
+		*srf_out = s;
 	return 0;
 }
 
 /* Rewrite a buffer handle field to the MOB id. */
-static int reloc_mob(struct vmw_val *val, uint32_t *field)
+static int reloc_mob(struct vmw_val *val, uint32_t *field,
+		     struct drm_gem_object **obj_out)
 {
+	if (obj_out)
+		*obj_out = NULL;
 	if (*field == SVGA3D_INVALID_ID)
 		return 0;
 	struct drm_gem_object *o = val_obj(val, *field, DRM_GEM_BO);
@@ -192,12 +198,17 @@ static int reloc_mob(struct vmw_val *val, uint32_t *field)
 	if (!b || b->mob.id == SVGA3D_INVALID_ID)
 		return -EINVAL;
 	*field = b->mob.id;
+	if (obj_out)
+		*obj_out = o;
 	return 0;
 }
 
 /* Rewrite a buffer handle in a guest pointer to the GMR id. */
-static int reloc_gmr(struct vmw_val *val, uint32_t *gmr_field)
+static int reloc_gmr(struct vmw_val *val, uint32_t *gmr_field,
+		     struct drm_gem_object **obj_out)
 {
+	if (obj_out)
+		*obj_out = NULL;
 	if (*gmr_field == SVGA_GMR_NULL || *gmr_field == SVGA_GMR_FRAMEBUFFER)
 		return 0;
 	struct drm_gem_object *o = val_obj(val, *gmr_field, DRM_GEM_BO);
@@ -207,6 +218,8 @@ static int reloc_gmr(struct vmw_val *val, uint32_t *gmr_field)
 	if (!b || b->gmr_id < 0)
 		return -EINVAL;
 	*gmr_field = (uint32_t)b->gmr_id;
+	if (obj_out)
+		*obj_out = o;
 	return 0;
 }
 
@@ -216,7 +229,6 @@ static int check_cid(struct vmw_val *val, uint32_t cid)
 	 * file's.  DX streams carry it in the buffer header instead. */
 	if (val->ctx)
 		return 0;
-	extern struct vmw_context *vmw_file_context(struct drm_file *fp, uint32_t cid);
 	return vmw_file_context(val->fp, cid) ? 0 : -EINVAL;
 }
 
@@ -231,474 +243,238 @@ static int cot(struct vmw_val *val, int type, uint32_t id)
 	return vmw_context_cotable_reserve(val->v, val->ctx, type, id);
 }
 
-#define BODY(T) T *b = (T *)body; if (size < sizeof(T)) return -EINVAL
-
-static int validate_one(struct vmw_val *val, uint32_t id, uint8_t *body,
-			uint32_t size)
+/* The helpers above, for the command table in vmw_execbuf_cmds.c. */
+struct drm_gem_object *vmw_val_obj(struct vmw_val *val, uint32_t handle,
+				   enum drm_gem_kind kind)
 {
-	int rc = 0;
+	return val_obj(val, handle, kind);
+}
 
-	switch (id) {
-	/* ---- legacy (non-GB) ---- */
-	case SVGA_3D_CMD_SURFACE_DMA: {
-		BODY(SVGA3dCmdSurfaceDMA);
-		rc = reloc_gmr(val, &b->guest.ptr.gmrId);
-		if (!rc)
-			rc = reloc_sid(val, &b->host.sid);
-		return rc;
-	}
-	case SVGA_3D_CMD_SURFACE_COPY: {
-		BODY(SVGA3dCmdSurfaceCopy);
-		rc = reloc_sid(val, &b->src.sid);
-		return rc ? rc : reloc_sid(val, &b->dest.sid);
-	}
-	case SVGA_3D_CMD_SURFACE_STRETCHBLT: {
-		BODY(SVGA3dCmdSurfaceStretchBlt);
-		rc = reloc_sid(val, &b->src.sid);
-		return rc ? rc : reloc_sid(val, &b->dest.sid);
-	}
-	case SVGA_3D_CMD_INTRA_SURFACE_COPY: {
-		BODY(SVGA3dCmdIntraSurfaceCopy);
-		return reloc_sid(val, &b->surface.sid);
-	}
-	case SVGA_3D_CMD_WHOLE_SURFACE_COPY: {
-		BODY(SVGA3dCmdWholeSurfaceCopy);
-		rc = reloc_sid(val, &b->srcSid);
-		return rc ? rc : reloc_sid(val, &b->destSid);
-	}
-	case SVGA_3D_CMD_PRESENT: {
-		BODY(SVGA3dCmdPresent);
-		return reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_GENERATE_MIPMAPS: {
-		BODY(SVGA3dCmdGenerateMipmaps);
-		return reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_BLIT_SURFACE_TO_SCREEN: {
-		BODY(SVGA3dCmdBlitSurfaceToScreen);
-		return reloc_sid(val, &b->srcImage.sid);
-	}
-	case SVGA_3D_CMD_SETRENDERTARGET: {
-		BODY(SVGA3dCmdSetRenderTarget);
-		rc = check_cid(val, b->cid);
-		return rc ? rc : reloc_sid(val, &b->target.sid);
-	}
-	case SVGA_3D_CMD_SETTEXTURESTATE: {
-		BODY(SVGA3dCmdSetTextureState);
-		rc = check_cid(val, b->cid);
-		if (rc)
-			return rc;
-		/* Followed by SVGA3dTextureState[]: {stage, name, value}; a
-		 * value for SVGA3D_TS_BIND_TEXTURE is a surface handle. */
-		uint32_t n = (size - sizeof(*b)) / sizeof(SVGA3dTextureState);
-		SVGA3dTextureState *ts = (SVGA3dTextureState *)(body + sizeof(*b));
-		for (uint32_t i = 0; i < n; i++)
-			if (ts[i].name == SVGA3D_TS_BIND_TEXTURE) {
-				rc = reloc_sid(val, &ts[i].value);
-				if (rc)
-					return rc;
-			}
-		return 0;
-	}
-	case SVGA_3D_CMD_DRAW_PRIMITIVES: {
-		BODY(SVGA3dCmdDrawPrimitives);
-		rc = check_cid(val, b->cid);
-		if (rc)
-			return rc;
-		uint32_t nd = b->numVertexDecls, nr = b->numRanges;
-		if (nd > 32 || nr > 32)
-			return -EINVAL;
-		if (size < sizeof(*b) + nd * sizeof(SVGA3dVertexDecl) + nr * sizeof(SVGA3dPrimitiveRange))
-			return -EINVAL;
-		SVGA3dVertexDecl *d = (SVGA3dVertexDecl *)(body + sizeof(*b));
-		for (uint32_t i = 0; i < nd; i++) {
-			rc = reloc_sid(val, &d[i].array.surfaceId);
-			if (rc)
-				return rc;
-		}
-		SVGA3dPrimitiveRange *r = (SVGA3dPrimitiveRange *)(d + nd);
-		for (uint32_t i = 0; i < nr; i++) {
-			rc = reloc_sid(val, &r[i].indexArray.surfaceId);
-			if (rc)
-				return rc;
-		}
-		return 0;
-	}
-	case SVGA_3D_CMD_SET_VERTEX_STREAMS: {
-		BODY(SVGA3dCmdSetVertexStreams);
-		rc = check_cid(val, b->cid);
-		if (rc)
-			return rc;
-		uint32_t n = b->numStreams;
-		if (size < sizeof(*b) + n * sizeof(SVGA3dVertexStream))
-			return -EINVAL;
-		SVGA3dVertexStream *s = (SVGA3dVertexStream *)(body + sizeof(*b));
-		for (uint32_t i = 0; i < n; i++) {
-			rc = reloc_sid(val, &s[i].sid);
-			if (rc)
-				return rc;
-		}
-		return 0;
-	}
-	case SVGA_3D_CMD_DRAW_INDEXED: {
-		BODY(SVGA3dCmdDrawIndexed);
-		rc = check_cid(val, b->cid);
-		return rc ? rc : reloc_sid(val, &b->indexBufferSid);
-	}
-	/* Context-id-only legacy state commands: check the cid, pass. */
-	case SVGA_3D_CMD_SETTRANSFORM:
-	case SVGA_3D_CMD_SETZRANGE:
-	case SVGA_3D_CMD_SETRENDERSTATE:
-	case SVGA_3D_CMD_SETMATERIAL:
-	case SVGA_3D_CMD_SETLIGHTDATA:
-	case SVGA_3D_CMD_SETLIGHTENABLED:
-	case SVGA_3D_CMD_SETVIEWPORT:
-	case SVGA_3D_CMD_SETCLIPPLANE:
-	case SVGA_3D_CMD_CLEAR:
-	case SVGA_3D_CMD_SET_SHADER:
-	case SVGA_3D_CMD_SET_SHADER_CONST:
-	case SVGA_3D_CMD_SETSCISSORRECT:
-	case SVGA_3D_CMD_BEGIN_QUERY:
-	case SVGA_3D_CMD_SET_VERTEX_DECLS:
-	case SVGA_3D_CMD_SET_VERTEX_DIVISORS:
-	case SVGA_3D_CMD_DRAW:
-	case SVGA_3D_CMD_SET_GB_SHADERCONSTS_INLINE:
-	case SVGA_3D_CMD_BEGIN_GB_QUERY: {
-		if (size < 4)
-			return -EINVAL;
-		return check_cid(val, *(uint32_t *)body);
-	}
-	case SVGA_3D_CMD_END_QUERY:
-	case SVGA_3D_CMD_WAIT_FOR_QUERY: {
-		/* {cid, type, SVGAGuestPtr guestResult} */
-		if (size < 16)
-			return -EINVAL;
-		rc = check_cid(val, *(uint32_t *)body);
-		return rc ? rc : reloc_gmr(val, (uint32_t *)(body + 8));
-	}
-	case SVGA_3D_CMD_END_GB_QUERY:
-	case SVGA_3D_CMD_WAIT_FOR_GB_QUERY: {
-		BODY(SVGA3dCmdEndGBQuery);
-		rc = check_cid(val, b->cid);
-		return rc ? rc : reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_SHADER_DEFINE:
-	case SVGA_3D_CMD_SHADER_DESTROY: {
-		if (size < 4)
-			return -EINVAL;
-		return check_cid(val, *(uint32_t *)body);
-	}
+int vmw_val_reloc_sid(struct vmw_val *val, uint32_t *field)
+{
+	return reloc_sid(val, field, NULL);
+}
 
-	/* ---- guest-backed ---- */
-	case SVGA_3D_CMD_BIND_GB_SURFACE:
-	case SVGA_3D_CMD_COND_BIND_GB_SURFACE: {
-		BODY(SVGA3dCmdBindGBSurface);
-		rc = reloc_sid(val, &b->sid);
-		return rc ? rc : reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_BIND_GB_SURFACE_WITH_PITCH: {
-		BODY(SVGA3dCmdBindGBSurfaceWithPitch);
-		rc = reloc_sid(val, &b->sid);
-		return rc ? rc : reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_UPDATE_GB_IMAGE:
-	case SVGA_3D_CMD_READBACK_GB_IMAGE:
-	case SVGA_3D_CMD_INVALIDATE_GB_IMAGE:
-	case SVGA_3D_CMD_READBACK_GB_IMAGE_PARTIAL:
-	case SVGA_3D_CMD_INVALIDATE_GB_IMAGE_PARTIAL: {
-		if (size < sizeof(SVGA3dSurfaceImageId))
-			return -EINVAL;
-		return reloc_sid(val, &((SVGA3dSurfaceImageId *)body)->sid);
-	}
-	case SVGA_3D_CMD_UPDATE_GB_SURFACE:
-	case SVGA_3D_CMD_READBACK_GB_SURFACE:
-	case SVGA_3D_CMD_INVALIDATE_GB_SURFACE: {
-		if (size < 4)
-			return -EINVAL;
-		return reloc_sid(val, (uint32_t *)body);
-	}
-	case SVGA_3D_CMD_BIND_GB_SHADER: {
-		BODY(SVGA3dCmdBindGBShader);
-		return reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_GB_MOB_FENCE: {
-		BODY(SVGA3dCmdGBMobFence);
-		return reloc_mob(val, &b->mobId);
-	}
-	case SVGA_3D_CMD_NOP:
-	case SVGA_3D_CMD_NOP_ERROR:
-		return 0;
+int vmw_val_reloc_mob(struct vmw_val *val, uint32_t *field)
+{
+	return reloc_mob(val, field, NULL);
+}
 
-	/* ---- DX ---- */
-	case SVGA_3D_CMD_DX_SET_SINGLE_CONSTANT_BUFFER: {
-		BODY(SVGA3dCmdDXSetSingleConstantBuffer);
-		return reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_DX_SET_SHADER_RESOURCES:
-	case SVGA_3D_CMD_DX_SET_SAMPLERS:
-	case SVGA_3D_CMD_DX_SET_RENDERTARGETS:
-	case SVGA_3D_CMD_DX_SET_SHADER:
-	case SVGA_3D_CMD_DX_DRAW:
-	case SVGA_3D_CMD_DX_DRAW_INDEXED:
-	case SVGA_3D_CMD_DX_DRAW_INSTANCED:
-	case SVGA_3D_CMD_DX_DRAW_INDEXED_INSTANCED:
-	case SVGA_3D_CMD_DX_DRAW_AUTO:
-	case SVGA_3D_CMD_DX_SET_INPUT_LAYOUT:
-	case SVGA_3D_CMD_DX_SET_TOPOLOGY:
-	case SVGA_3D_CMD_DX_SET_BLEND_STATE:
-	case SVGA_3D_CMD_DX_SET_DEPTHSTENCIL_STATE:
-	case SVGA_3D_CMD_DX_SET_RASTERIZER_STATE:
-	case SVGA_3D_CMD_DX_SET_PREDICATION:
-	case SVGA_3D_CMD_DX_SET_VIEWPORTS:
-	case SVGA_3D_CMD_DX_SET_SCISSORRECTS:
-	case SVGA_3D_CMD_DX_CLEAR_RENDERTARGET_VIEW:
-	case SVGA_3D_CMD_DX_CLEAR_DEPTHSTENCIL_VIEW:
-	case SVGA_3D_CMD_DX_GENMIPS:
-	case SVGA_3D_CMD_DX_DESTROY_SHADERRESOURCE_VIEW:
-	case SVGA_3D_CMD_DX_DESTROY_RENDERTARGET_VIEW:
-	case SVGA_3D_CMD_DX_DESTROY_DEPTHSTENCIL_VIEW:
-	case SVGA_3D_CMD_DX_DESTROY_ELEMENTLAYOUT:
-	case SVGA_3D_CMD_DX_DESTROY_BLEND_STATE:
-	case SVGA_3D_CMD_DX_DESTROY_DEPTHSTENCIL_STATE:
-	case SVGA_3D_CMD_DX_DESTROY_RASTERIZER_STATE:
-	case SVGA_3D_CMD_DX_DESTROY_SAMPLER_STATE:
-	case SVGA_3D_CMD_DX_DESTROY_SHADER:
-	case SVGA_3D_CMD_DX_DESTROY_STREAMOUTPUT:
-	case SVGA_3D_CMD_DX_SET_STREAMOUTPUT:
-	case SVGA_3D_CMD_DX_DESTROY_QUERY:
-	case SVGA_3D_CMD_DX_BEGIN_QUERY:
-	case SVGA_3D_CMD_DX_END_QUERY:
-	case SVGA_3D_CMD_DX_READBACK_QUERY:
-	case SVGA_3D_CMD_DX_SET_QUERY_OFFSET:
-	case SVGA_3D_CMD_DX_READBACK_ALL_QUERY:
-	case SVGA_3D_CMD_DX_HINT:
-	case SVGA_3D_CMD_DX_SET_VS_CONSTANT_BUFFER_OFFSET:
-	case SVGA_3D_CMD_DX_SET_PS_CONSTANT_BUFFER_OFFSET:
-	case SVGA_3D_CMD_DX_SET_GS_CONSTANT_BUFFER_OFFSET:
-	case SVGA_3D_CMD_DX_SET_HS_CONSTANT_BUFFER_OFFSET:
-	case SVGA_3D_CMD_DX_SET_DS_CONSTANT_BUFFER_OFFSET:
-	case SVGA_3D_CMD_DX_SET_CS_CONSTANT_BUFFER_OFFSET:
-	case SVGA_3D_CMD_DX_DESTROY_UA_VIEW:
-	case SVGA_3D_CMD_DX_CLEAR_UA_VIEW_UINT:
-	case SVGA_3D_CMD_DX_CLEAR_UA_VIEW_FLOAT:
-	case SVGA_3D_CMD_DX_SET_UA_VIEWS:
-	case SVGA_3D_CMD_DX_SET_CS_UA_VIEWS:
-	case SVGA_3D_CMD_DX_DISPATCH:
-	case SVGA_3D_CMD_DX_SET_SHADER_IFACE:
-		return val->ctx ? 0 : -EINVAL;
-	case SVGA_3D_CMD_DX_SET_VERTEX_BUFFERS: {
-		BODY(SVGA3dCmdDXSetVertexBuffers);
-		uint32_t n = (size - sizeof(*b)) / sizeof(SVGA3dVertexBuffer);
-		SVGA3dVertexBuffer *vb = (SVGA3dVertexBuffer *)(body + sizeof(*b));
-		for (uint32_t i = 0; i < n; i++) {
-			rc = reloc_sid(val, &vb[i].sid);
-			if (rc)
-				return rc;
+int vmw_val_reloc_gmr(struct vmw_val *val, uint32_t *gmr_field)
+{
+	return reloc_gmr(val, gmr_field, NULL);
+}
+
+int vmw_val_reloc_sid_srf(struct vmw_val *val, uint32_t *field,
+			  struct vmw_surface **srf_out)
+{
+	return reloc_sid(val, field, srf_out);
+}
+
+int vmw_val_reloc_mob_obj(struct vmw_val *val, uint32_t *field,
+			  struct drm_gem_object **obj_out)
+{
+	return reloc_mob(val, field, obj_out);
+}
+
+int vmw_val_reloc_gmr_obj(struct vmw_val *val, uint32_t *gmr_field,
+			  struct drm_gem_object **obj_out)
+{
+	return reloc_gmr(val, gmr_field, obj_out);
+}
+
+int vmw_val_check_cid(struct vmw_val *val, uint32_t cid)
+{
+	return check_cid(val, cid);
+}
+
+int vmw_val_cotable(struct vmw_val *val, int type, uint32_t id)
+{
+	return cot(val, type, id);
+}
+
+/* ---- the books a stream keeps --------------------------------------------
+ *
+ * Bindings.  Every context the stream touches gets a node, and a node whose
+ * context has a binding tracker gets a STAGED binding state: the commands
+ * record what they bind there, and only a stream that actually went to the
+ * device has its staged bindings moved into the context's tracker
+ * (vmw_execbuf_commit_bindings()).  A refused stream resets the staged
+ * state and leaves the tracker as it was.
+ *
+ * A staged state is tens of kilobytes, and nearly every submission stages
+ * into exactly one context, so the device keeps ONE, allocated on first
+ * use and lent to the first node of each submission under execbuf_lock;
+ * only a stream that touches several tracked contexts (a legacy stream
+ * naming more than one context id) allocates more, for the extra nodes.
+ *
+ * Views.  Defines and destroys are staged in the DX context's manager on
+ * val->staged_cmd_res, committed after a successful submission, reverted
+ * on every other path.
+ *
+ * Destroys of views that the device may have lost in the meantime: a view
+ * is destroyed by the driver itself when its surface goes, and the client
+ * does not know that.  Its own destroy of the same view is then a second
+ * destroy the device refuses -- so such a command is noted here and turned
+ * into a NOP at submission if, by then, the view's id has been given up
+ * (vmw_execbuf_apply_nops()). */
+
+/* The device's staged state for the first node, or a fresh one. */
+static struct vmw_ctx_binding_state *val_staged_get(struct vmw_val *val,
+						    bool *owned)
+{
+	struct vmw_device *v = val->v;
+	struct vmw_ctx_binding_state *s;
+
+	*owned = false;
+	if (!val->staged_inuse) {
+		if (!v->execbuf_staged) {
+			s = vmw_binding_state_alloc(v);
+			if (IS_ERR_OR_NULL(s))
+				return NULL;
+			v->execbuf_staged = s;
 		}
-		return val->ctx ? 0 : -EINVAL;
+		val->staged_inuse = true;
+		return v->execbuf_staged;
 	}
-	case SVGA_3D_CMD_DX_SET_VERTEX_BUFFERS_V2: {
-		BODY(SVGA3dCmdDXSetVertexBuffers_v2);
-		uint32_t n = (size - sizeof(*b)) / sizeof(SVGA3dVertexBuffer_v2);
-		SVGA3dVertexBuffer_v2 *vb = (SVGA3dVertexBuffer_v2 *)(body + sizeof(*b));
-		for (uint32_t i = 0; i < n; i++) {
-			rc = reloc_sid(val, &vb[i].sid);
-			if (rc)
-				return rc;
+	s = vmw_binding_state_alloc(v);
+	if (IS_ERR_OR_NULL(s))
+		return NULL;
+	*owned = true;
+	return s;
+}
+
+struct vmw_val_ctx *vmw_val_ctx_node(struct vmw_val *val,
+				     struct vmw_context *ctx)
+{
+	struct vmw_val_ctx *node;
+
+	if (!ctx)
+		return NULL;
+	list_for_each_entry(node, &val->ctx_list, head)
+		if (node->ctx == ctx)
+			return node;
+
+	/* The context is looked up without a lock; one that is already on
+	 * its way out gets no node, and the stream goes as it always did. */
+	if (!vmw_resource_reference_unless_doomed(&ctx->res))
+		return NULL;
+
+	if (!val->dx_node_storage.ctx) {
+		node = &val->dx_node_storage;
+	} else {
+		node = kalloc(sizeof(*node));
+		if (!node) {
+			struct vmw_resource *res = &ctx->res;
+
+			vmw_resource_unreference(&res);
+			return NULL;
 		}
-		return val->ctx ? 0 : -EINVAL;
 	}
-	case SVGA_3D_CMD_DX_SET_INDEX_BUFFER: {
-		BODY(SVGA3dCmdDXSetIndexBuffer);
-		return reloc_sid(val, &b->sid);
+	mm_memset(node, 0, sizeof(*node));
+	node->ctx = ctx;
+#if VMW_TRACK_VIEWS
+	/* Only a context with a tracker has bindings worth staging; without
+	 * one the stream is verified and submitted exactly as before.  A
+	 * staged state that cannot be had is the same as no tracker: the
+	 * submission is not refused for the driver's own bookkeeping. */
+	if (val->v->has_gb && !IS_ERR_OR_NULL(ctx->cbs))
+		node->staged = val_staged_get(val, &node->staged_owned);
+#endif
+	list_add_tail(&node->head, &val->ctx_list);
+	return node;
+}
+
+int vmw_val_cond_nop_add(struct vmw_val *val, uint32_t *id_loc,
+			 struct vmw_resource *res)
+{
+	if (val->nnops == val->nops_cap) {
+		uint32_t cap = val->nops_cap ? val->nops_cap * 2 : 8;
+		struct vmw_val_nop *n =
+			krealloc(val->nops, (size_t)cap * sizeof(*n));
+
+		if (!n)
+			return -ENOMEM;
+		val->nops = n;
+		val->nops_cap = cap;
 	}
-	case SVGA_3D_CMD_DX_SET_INDEX_BUFFER_V2: {
-		BODY(SVGA3dCmdDXSetIndexBuffer_v2);
-		return reloc_sid(val, &b->sid);
+	val->nops[val->nnops].offset =
+		(uint32_t)((uint8_t *)id_loc - val->buf_start);
+	val->nops[val->nnops].res = res;
+	val->nnops++;
+	return 0;
+}
+
+/* Does this submission have any books to commit under the binding lock? */
+static bool val_needs_binding_lock(const struct vmw_val *val)
+{
+	const struct vmw_val_ctx *node;
+
+	if (val->nnops || !list_empty(&val->staged_cmd_res))
+		return true;
+	list_for_each_entry(node, &val->ctx_list, head)
+		if (node->staged)
+			return true;
+	return false;
+}
+
+/* Turn the conditional destroys into NOPs where the object is gone.
+ * `stream' is where the client's commands start in the buffer about to be
+ * submitted.  Caller holds binding_lock, which is what destroying a view
+ * takes to give up its id, so the answer holds until the stream is in. */
+static void vmw_execbuf_apply_nops(struct vmw_val *val, uint8_t *stream)
+{
+	for (uint32_t i = 0; i < val->nnops; i++) {
+		struct vmw_val_nop *n = &val->nops[i];
+
+		if (n->res->id == -1)
+			*(uint32_t *)(stream + n->offset) = SVGA_3D_CMD_NOP;
 	}
-	case SVGA_3D_CMD_DX_SET_SOTARGETS: {
-		BODY(SVGA3dCmdDXSetSOTargets);
-		uint32_t n = (size - sizeof(*b)) / sizeof(SVGA3dSoTarget);
-		SVGA3dSoTarget *t = (SVGA3dSoTarget *)(body + sizeof(*b));
-		for (uint32_t i = 0; i < n; i++) {
-			rc = reloc_sid(val, &t[i].sid);
-			if (rc)
-				return rc;
+}
+
+/* The stream is in: move every node's staged bindings into its context's
+ * tracker.  Caller holds binding_lock for writing.  The tracker is read
+ * here, under the lock, because a context being destroyed gives it up
+ * under the same lock. */
+static void vmw_execbuf_commit_bindings(struct vmw_val *val)
+{
+	struct vmw_val_ctx *node;
+
+	list_for_each_entry(node, &val->ctx_list, head) {
+		struct vmw_ctx_binding_state *cbs;
+
+		if (!node->staged)
+			continue;
+		cbs = node->ctx->cbs;
+		if (!IS_ERR_OR_NULL(cbs))
+			vmw_binding_state_commit(cbs, node->staged);
+	}
+}
+
+/* End of the submission, committed or not: give back the staged states
+ * (reset, so what a refused stream staged goes nowhere) and the context
+ * references.  Not under binding_lock: dropping a context's last
+ * reference releases it, and that takes the lock. */
+static void vmw_execbuf_release_nodes(struct vmw_val *val)
+{
+	struct vmw_val_ctx *node, *next;
+
+	list_for_each_entry_safe(node, next, &val->ctx_list, head) {
+		struct vmw_resource *res = &node->ctx->res;
+
+		list_del(&node->head);
+		if (node->staged) {
+			if (node->staged_owned)
+				vmw_binding_state_free(node->staged);
+			else
+				vmw_binding_state_reset(node->staged);
 		}
-		return val->ctx ? 0 : -EINVAL;
+		vmw_resource_unreference(&res);
+		if (node != &val->dx_node_storage)
+			kfree(node);
 	}
-	case SVGA_3D_CMD_DX_DEFINE_SHADERRESOURCE_VIEW: {
-		BODY(SVGA3dCmdDXDefineShaderResourceView);
-		rc = cot(val, SVGA_COTABLE_SRVIEW, b->shaderResourceViewId);
-		return rc ? rc : reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_DX_DEFINE_RENDERTARGET_VIEW: {
-		BODY(SVGA3dCmdDXDefineRenderTargetView);
-		rc = cot(val, SVGA_COTABLE_RTVIEW, b->renderTargetViewId);
-		return rc ? rc : reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_DX_DEFINE_DEPTHSTENCIL_VIEW:
-	case SVGA_3D_CMD_DX_DEFINE_DEPTHSTENCIL_VIEW_V2: {
-		BODY(SVGA3dCmdDXDefineDepthStencilView);
-		rc = cot(val, SVGA_COTABLE_DSVIEW, b->depthStencilViewId);
-		return rc ? rc : reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_DX_DEFINE_UA_VIEW: {
-		BODY(SVGA3dCmdDXDefineUAView);
-		rc = cot(val, SVGA_COTABLE_UAVIEW, b->uaViewId);
-		return rc ? rc : reloc_sid(val, &b->sid);
-	}
-	case SVGA_3D_CMD_DX_DEFINE_ELEMENTLAYOUT:
-		if (size < 4)
-			return -EINVAL;
-		return cot(val, SVGA_COTABLE_ELEMENTLAYOUT, *(uint32_t *)body);
-	case SVGA_3D_CMD_DX_DEFINE_BLEND_STATE:
-		if (size < 4)
-			return -EINVAL;
-		return cot(val, SVGA_COTABLE_BLENDSTATE, *(uint32_t *)body);
-	case SVGA_3D_CMD_DX_DEFINE_DEPTHSTENCIL_STATE:
-		if (size < 4)
-			return -EINVAL;
-		return cot(val, SVGA_COTABLE_DEPTHSTENCIL, *(uint32_t *)body);
-	case SVGA_3D_CMD_DX_DEFINE_RASTERIZER_STATE:
-	case SVGA_3D_CMD_DX_DEFINE_RASTERIZER_STATE_V2:
-		if (size < 4)
-			return -EINVAL;
-		return cot(val, SVGA_COTABLE_RASTERIZERSTATE, *(uint32_t *)body);
-	case SVGA_3D_CMD_DX_DEFINE_SAMPLER_STATE:
-		if (size < 4)
-			return -EINVAL;
-		return cot(val, SVGA_COTABLE_SAMPLER, *(uint32_t *)body);
-	case SVGA_3D_CMD_DX_DEFINE_SHADER: {
-		BODY(SVGA3dCmdDXDefineShader);
-		return cot(val, SVGA_COTABLE_DXSHADER, b->shaderId);
-	}
-	case SVGA_3D_CMD_DX_BIND_SHADER: {
-		BODY(SVGA3dCmdDXBindShader);
-		rc = cot(val, SVGA_COTABLE_DXSHADER, b->shid);
-		return rc ? rc : reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_DX_BIND_ALL_SHADER: {
-		BODY(SVGA3dCmdDXBindAllShader);
-		return reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_DX_DEFINE_STREAMOUTPUT:
-	case SVGA_3D_CMD_DX_DEFINE_STREAMOUTPUT_WITH_MOB:
-		if (size < 4)
-			return -EINVAL;
-		return cot(val, SVGA_COTABLE_STREAMOUTPUT, *(uint32_t *)body);
-	case SVGA_3D_CMD_DX_BIND_STREAMOUTPUT: {
-		BODY(SVGA3dCmdDXBindStreamOutput);
-		rc = cot(val, SVGA_COTABLE_STREAMOUTPUT, b->soid);
-		return rc ? rc : reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_DX_DEFINE_QUERY: {
-		BODY(SVGA3dCmdDXDefineQuery);
-		return cot(val, SVGA_COTABLE_DXQUERY, b->queryId);
-	}
-	case SVGA_3D_CMD_DX_BIND_QUERY: {
-		BODY(SVGA3dCmdDXBindQuery);
-		rc = cot(val, SVGA_COTABLE_DXQUERY, b->queryId);
-		return rc ? rc : reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_DX_BIND_ALL_QUERY: {
-		BODY(SVGA3dCmdDXBindAllQuery);
-		return reloc_mob(val, &b->mobid);
-	}
-	case SVGA_3D_CMD_DX_MOVE_QUERY:
-		return val->ctx ? 0 : -EINVAL;
-	case SVGA_3D_CMD_DX_PRED_COPY_REGION: {
-		BODY(SVGA3dCmdDXPredCopyRegion);
-		rc = reloc_sid(val, &b->dstSid);
-		return rc ? rc : reloc_sid(val, &b->srcSid);
-	}
-	case SVGA_3D_CMD_DX_PRED_COPY:
-	case SVGA_3D_CMD_DX_PRED_CONVERT: {
-		BODY(SVGA3dCmdDXPredCopy);
-		rc = reloc_sid(val, &b->dstSid);
-		return rc ? rc : reloc_sid(val, &b->srcSid);
-	}
-	case SVGA_3D_CMD_DX_PRED_CONVERT_REGION: {
-		BODY(SVGA3dCmdDXPredConvertRegion);
-		rc = reloc_sid(val, &b->dstSid);
-		return rc ? rc : reloc_sid(val, &b->srcSid);
-	}
-	case SVGA_3D_CMD_DX_PRESENTBLT: {
-		BODY(SVGA3dCmdDXPresentBlt);
-		rc = reloc_sid(val, &b->srcSid);
-		return rc ? rc : reloc_sid(val, &b->dstSid);
-	}
-	case SVGA_3D_CMD_DX_UPDATE_SUBRESOURCE:
-	case SVGA_3D_CMD_DX_READBACK_SUBRESOURCE:
-	case SVGA_3D_CMD_DX_INVALIDATE_SUBRESOURCE:
-	case SVGA_3D_CMD_DX_BUFFER_UPDATE:
-	case SVGA_3D_CMD_DX_SET_MIN_LOD:
-		if (size < 4)
-			return -EINVAL;
-		return reloc_sid(val, (uint32_t *)body);
-	case SVGA_3D_CMD_DX_TRANSFER_FROM_BUFFER:
-	case SVGA_3D_CMD_DX_PRED_TRANSFER_FROM_BUFFER: {
-		BODY(SVGA3dCmdDXTransferFromBuffer);
-		rc = reloc_sid(val, &b->srcSid);
-		return rc ? rc : reloc_sid(val, &b->destSid);
-	}
-	case SVGA_3D_CMD_DX_TRANSFER_TO_BUFFER: {
-		BODY(SVGA3dCmdDXTransferToBuffer);
-		rc = reloc_sid(val, &b->srcSid);
-		return rc ? rc : reloc_sid(val, &b->destSid);
-	}
-	case SVGA_3D_CMD_DX_BUFFER_COPY:
-	case SVGA_3D_CMD_DX_STAGING_BUFFER_COPY: {
-		BODY(SVGA3dCmdDXBufferCopy);
-		rc = reloc_sid(val, &b->dest);
-		return rc ? rc : reloc_sid(val, &b->src);
-	}
-	case SVGA_3D_CMD_DX_SURFACE_COPY_AND_READBACK: {
-		BODY(SVGA3dCmdDXSurfaceCopyAndReadback);
-		rc = reloc_sid(val, &b->srcSid);
-		return rc ? rc : reloc_sid(val, &b->destSid);
-	}
-	case SVGA_3D_CMD_DX_RESOLVE_COPY:
-	case SVGA_3D_CMD_DX_PRED_RESOLVE_COPY: {
-		BODY(SVGA3dCmdDXResolveCopy);
-		rc = reloc_sid(val, &b->dstSid);
-		return rc ? rc : reloc_sid(val, &b->srcSid);
-	}
-	case SVGA_3D_CMD_DX_STAGING_COPY:
-	case SVGA_3D_CMD_DX_PRED_STAGING_COPY: {
-		BODY(SVGA3dCmdDXStagingCopy);
-		rc = reloc_sid(val, &b->dstSid);
-		return rc ? rc : reloc_sid(val, &b->srcSid);
-	}
-	case SVGA_3D_CMD_DX_PRED_STAGING_COPY_REGION: {
-		BODY(SVGA3dCmdDXPredStagingCopyRegion);
-		rc = reloc_sid(val, &b->dstSid);
-		return rc ? rc : reloc_sid(val, &b->srcSid);
-	}
-	case SVGA_3D_CMD_DX_DRAW_INDEXED_INSTANCED_INDIRECT:
-	case SVGA_3D_CMD_DX_DRAW_INSTANCED_INDIRECT:
-	case SVGA_3D_CMD_DX_DISPATCH_INDIRECT: {
-		BODY(SVGA3dCmdDXDrawIndexedInstancedIndirect);
-		return reloc_sid(val, &b->argsBufferSid);
-	}
-	case SVGA_3D_CMD_DX_COPY_STRUCTURE_COUNT: {
-		BODY(SVGA3dCmdDXCopyStructureCount);
-		return reloc_sid(val, &b->destSid);
-	}
-	case SVGA_3D_CMD_DX_MOB_FENCE_64: {
-		BODY(SVGA3dCmdDXMobFence64);
-		return reloc_mob(val, &b->mobId);
-	}
-	case SVGA_3D_CMD_DX_BIND_SHADER_IFACE: {
-		BODY(SVGA3dCmdDXBindShaderIface);
-		return reloc_mob(val, &b->mobid);
-	}
-	default:
-		/* Object-table commands (define/destroy/bind of surfaces,
-		 * contexts, MOBs, OTables, screen targets) belong to the
-		 * kernel; everything else is unknown. */
-		return -EINVAL;
-	}
+	val->dx_node = NULL;
+	val->staged_inuse = false;
 }
 
 /* Name a rejected command, once per (command, error).
@@ -706,7 +482,7 @@ static int validate_one(struct vmw_val *val, uint32_t id, uint8_t *body,
  * The refusal itself stays where client errors belong -- in the ioctl's
  * return value -- and the walk below still does not log per call.  But a
  * bare EINVAL out of a stream of a hundred commands says only that ONE of
- * some thirty checks in validate_one() fired, and Mesa answers it by
+ * some thirty checks in the verifier fired, and Mesa answers it by
  * abandoning the submission ("vmw_ioctl_command error Invalid argument")
  * and carrying on with state the device never received, so the crash that
  * follows is somewhere else entirely and names nothing.
@@ -756,6 +532,9 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 {
 	struct drm_vmw_fence_rep rep;
 	int rc = 0;
+	/* Whether the stream's staged books were made permanent; every path
+	 * that leaves without doing so reverts them at `out'. */
+	bool committed = false;
 
 	if (a->command_size > 1024 * 1024)
 		return -EINVAL;
@@ -775,15 +554,16 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 	 * acceleration and the browser's web process at once -- takes turns
 	 * through it, and a queue here is invisible in every other stage. */
 	{
-	
+
 		mm_write_lock(&v->execbuf_lock);
 	}
 	mm_memset(val, 0, sizeof(*val));
 	val->v = v;
 	val->fp = fp;
+	INIT_LIST_HEAD(&val->ctx_list);
+	INIT_LIST_HEAD(&val->staged_cmd_res);
 	uint32_t dx_cid = SVGA3D_INVALID_ID;
 	if (a->version >= 2 && a->context_handle != SVGA3D_INVALID_ID) {
-		extern struct vmw_context *vmw_file_context(struct drm_file *fp, uint32_t cid);
 		val->ctx = vmw_file_context(fp, a->context_handle);
 		if (!val->ctx || !val->ctx->dx) {
 			mm_write_unlock(&v->execbuf_lock);
@@ -791,6 +571,13 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 			return -EINVAL;
 		}
 		dx_cid = val->ctx->cid;
+		/* The stream's DX context: its bindings are staged on this
+		 * node, its views in its manager. */
+		val->dx_node = vmw_val_ctx_node(val, val->ctx);
+#if VMW_TRACK_VIEWS
+		if (val->dx_node && !IS_ERR_OR_NULL(val->ctx->man))
+			val->man = val->ctx->man;
+#endif
 	}
 
 	uint8_t *cmds = NULL;  /* the client's stream, rewritten in place */
@@ -798,9 +585,8 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 	if (a->command_size) {
 		cmds = kalloc(a->command_size);
 		if (!cmds) {
-			mm_write_unlock(&v->execbuf_lock);
-			kfree(val);
-			return -ENOMEM;
+			rc = -ENOMEM;
+			goto out;
 		}
 		if (!validate_user_ptr(a->commands, a->command_size) ||
 		    copy_from_user(cmds, (void *)(uintptr_t)a->commands,
@@ -812,20 +598,14 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 		 * whether the cost is the copy of the stream or the walk of
 		 * it, and those have completely different answers. */
 		/* Walk and rewrite. */
+		val->buf_start = cmds;
 		uint32_t off = 0;
 		while (off < a->command_size) {
-			if (a->command_size - off < sizeof(SVGA3dCmdHeader)) {
-				rc = -EINVAL;
-				goto out;
-			}
-			SVGA3dCmdHeader *h = (SVGA3dCmdHeader *)(cmds + off);
-			uint32_t bsize = h->size;
-			if (bsize & 3 || bsize > a->command_size - off - sizeof(*h)) {
-				rc = -EINVAL;
-				goto out;
-			}
-			rc = validate_one(val, h->id, cmds + off + sizeof(*h),
-					  bsize);
+			uint32_t csize = 0;
+
+			rc = vmw_execbuf_cmd_check(val, cmds + off,
+						   a->command_size - off,
+						   &csize);
 			if (rc) {
 				/* The refusal is a CLIENT error and is
 				 * reported where those belong, in the ioctl's
@@ -835,10 +615,17 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 				 * reporter.  Logging every rejected handle
 				 * filled the console the moment anything
 				 * probed the interface; this cannot. */
-				vmw_execbuf_note_reject(h->id, bsize, rc);
+				if (a->command_size - off >=
+				    sizeof(SVGA3dCmdHeader)) {
+					SVGA3dCmdHeader *h =
+						(SVGA3dCmdHeader *)(cmds + off);
+
+					vmw_execbuf_note_reject(h->id, h->size,
+								rc);
+				}
 				goto out;
 			}
-			off += sizeof(*h) + bsize;
+			off += csize;
 		}
 	}
 
@@ -935,6 +722,20 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 		start = batch;
 	}
 
+	/* The books this stream keeps are committed under binding_lock,
+	 * taken around the hand-over itself: what the conditional NOPs
+	 * decide about a view (gone or not) must still be true when the
+	 * stream reaches the device, and a surface destroyed meanwhile gives
+	 * up its views under this lock.  Only a stream that has such books
+	 * takes it at all. */
+	bool locked_bindings = val_needs_binding_lock(val);
+
+	if (locked_bindings) {
+		mm_write_lock(&v->binding_lock);
+		if (a->command_size)
+			vmw_execbuf_apply_nops(val, start + pre);
+	}
+
 	/* Asynchronous: the caller's fence is what tells it when the work is
 	 * done, and it is submitted through the same channel just below, so
 	 * it cannot pass before this batch.  Waiting here instead put every
@@ -954,7 +755,40 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 	 * which the log records, and the client draws on.  The kernel's OWN
 	 * validation failures above still fail the ioctl -- those mean the
 	 * stream never reached the device at all. */
-	if (rc == -EINVAL || rc == -EIO) {
+	bool device_rejected = (rc == -EINVAL || rc == -EIO);
+
+	/* The device's verdict on a verified stream is asynchronous in
+	 * principle -- whatever of it ran, ran with the bindings and views it
+	 * declared -- so the books follow the stream whenever it was handed
+	 * over, rejected or not; only a stream that never left (a kernel
+	 * error below) is reverted. */
+	if (locked_bindings) {
+		if (rc == 0 || device_rejected) {
+			vmw_execbuf_commit_bindings(val);
+			/* In the same hold as the hand-over.  A view this
+			 * stream destroyed must be dead (id -1, off its
+			 * surface) before binding_lock is let go: a surface
+			 * freed right after -- by another thread, or by the
+			 * display server dropping a shared buffer -- destroys
+			 * the views still on it, and found this one alive,
+			 * queueing a second destroy of the same id behind the
+			 * client's.  The device rejected that whole command
+			 * buffer. */
+			vmw_cmdbuf_res_commit_notify(&val->staged_cmd_res);
+		}
+		mm_write_unlock(&v->binding_lock);
+	}
+	if (rc == 0 || device_rejected) {
+		/* Not under binding_lock: a removed view may be released
+		 * here, and its release takes that lock. */
+		vmw_cmdbuf_res_commit(&val->staged_cmd_res);
+		committed = true;
+		if (val->dx_query_mob && val->dx_query_ctx)
+			(void)vmw_context_bind_dx_query(&val->dx_query_ctx->res,
+							val->dx_query_mob);
+	}
+
+	if (device_rejected) {
 		static int reported;
 		if (reported < 8) {
 			reported++;
@@ -1035,16 +869,32 @@ static int vmw_execbuf_do(struct vmw_device *v, struct drm_file *fp,
 out:
 	;
 
+	/* A stream that never reached the device takes back what it staged:
+	 * the views it defined or removed go back to how they were (this can
+	 * release a view, so it is done without binding_lock), and the
+	 * staged bindings are dropped with the nodes just below. */
+	if (!committed)
+		vmw_cmdbuf_res_revert(&val->staged_cmd_res);
+	vmw_execbuf_release_nodes(val);
+	/* binding_lock is NOT held here, and must not be: the last reference
+	 * to a surface can go with the puts below, and destroying it scrubs
+	 * its bindings under that lock. */
 	for (uint32_t i = 0; i < val->nrefs; i++)
 		drm_gem_put(val->refs[i]);
 	if (cmds)
 		kfree(cmds);
 	if (batch)
 		kfree(batch);
+	kfree(val->nops);
 	kfree(val->refs);
 	kfree(val->htab);
 	kfree(val);
 	mm_write_unlock(&v->execbuf_lock);
+	/* A legacy cursor surface the stream wrote into (its SURFACE_DMA was
+	 * snooped by the verifier) gets its new image defined now that the
+	 * stream is in.  Outside execbuf_lock: it needs only the cursor lock. */
+	if (committed && rc == 0)
+		vmw_kms_cursor_post_execbuf(v);
 	return rc;
 }
 

@@ -170,11 +170,6 @@ static int fls8(uint32_t v)
 	return 0;
 }
 
-static int is_power_of_2(uint32_t v)
-{
-	return v && !(v & (v - 1));
-}
-
 /* 16.16 fixed point, as the watermark arithmetic is specified. */
 #define FP_MAX U32_MAX_
 

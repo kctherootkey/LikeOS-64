@@ -11,7 +11,15 @@
 // Fences come from the FIFO fence register; the fence interrupt signals
 // them where the host has one, a short timer polls where it has not.
 //
+// This file: the probe and initialisation, the buffer-object hooks and the
+// driver table.  The display paths are in vmw_kms.c and vmw_stdu.c, the
+// cursor in vmw_cursor.c, fences in vmw_fence.c, the ioctls in vmw_ioctl.c,
+// command submission in vmw_cmdbuf.c.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Broadcom's code: GPL-2.0 OR MIT
+// Portions Copyright (c) 2009-2025 Broadcom. All Rights Reserved. The term
+// “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_internal.h>
@@ -28,132 +36,23 @@
 #include <kernel/io/console.h>
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
-
-#define VMW_FENCE_TIMEOUT_NS 2000000000ULL
+#include <kernel/dev/gpu/vmwgfx/vmw_pm.h>
+#include <kernel/dev/gpu/vmwgfx/vmw_connector.h>
 
 static struct vmw_device g_vmw;
 
-/* vmw_surface.c / vmw_context.c */
-long vmw_ioctl_gb_surface_create(struct vmw_device *v, struct drm_file *fp,
-				 void *kb, int ext);
-long vmw_ioctl_gb_surface_ref(struct vmw_device *v, struct drm_file *fp,
-			      void *kb, int ext);
-long vmw_ioctl_unref_surface(struct vmw_device *v, struct drm_file *fp, void *kb);
-void vmw_surface_gem_free(struct vmw_device *v, struct drm_gem_object *o);
-long vmw_ioctl_create_context(struct vmw_device *v, struct drm_file *fp,
-			      int dx, int32_t *cid_out);
-long vmw_ioctl_unref_context(struct vmw_device *v, struct drm_file *fp, uint32_t cid);
-void vmw_file_release(struct vmw_device *v, struct drm_file *fp);
-long vmw_ioctl_create_shader(struct vmw_device *v, struct drm_file *fp,
-			     struct drm_vmw_shader_create_arg *a);
-long vmw_ioctl_unref_shader(struct vmw_device *v, struct drm_file *fp, uint32_t shid);
-
-/* ---- fences ---------------------------------------------------------- */
-
-static void vmw_fence_events_check(void);
-
-void vmw_fence_check(struct vmw_device *v)
-{
-	if (v->cb_ready) {
-		/* Collecting the finished command buffers IS the fence check.
-		 *
-		 * A fence emitted through the command-buffer channel is a
-		 * command inside one of those buffers, and it has passed when
-		 * the buffer completes -- which is what cb_slot_completed()
-		 * reports.  The device's fence REGISTER must not be consulted
-		 * here: it belongs to the FIFO, and the console writes
-		 * SVGA_CMD_FENCE into the FIFO out of the same counter these
-		 * numbers come from.  The FIFO drains on its own, so that
-		 * register runs ahead of anything a command-buffer context has
-		 * executed, and reading it as "fences up to here have passed"
-		 * signalled every client fence the moment it was created.
-		 *
-		 * Nothing failed when it did.  Every wait returned at once, so
-		 * a client mapped a surface before the device had written it
-		 * and read the frame before -- rendering that had plainly
-		 * worked, arriving one frame late for ever.  Under X that is
-		 * text and window content one repaint behind, which mostly
-		 * means blank. */
-		vmw_cmdbuf_poll(v);
-	} else {
-		/* No command buffers: the work IS the FIFO, and the FIFO's
-		 * fence register is exactly the right answer. */
-		uint32_t cur = vmsvga2_hw_fence_current();
-
-		if (cur)
-			drm_fence_signal_upto(&v->drm, cur);
-	}
-	vmw_fence_events_check();
-}
-
-static void vmw_fence_poll_fire(hrtimer_t *t)
-{
-	struct vmw_device *v = t->arg;
-
-	vmw_fence_check(v);
-	if (v->drm.fences)
-		hrtimer_start_rel(&v->fence_poll, 2000000);
-	else
-		v->fence_poll_running = 0;
-}
-
-static void vmw_irq_cb(uint32_t status)
-{
-	(void)status;
-	vmw_fence_check(&g_vmw);
-}
-
-static void vmw_drm_fence_poll(struct drm_device *dev)
-{
-	(void)dev;
-	vmw_fence_check(&g_vmw);
-}
-
-/* Insert a fence after whatever was just submitted; returns it. */
-struct drm_fence *vmw_fence_emit(struct vmw_device *v, uint32_t flags)
-{
-	uint32_t seq;
-
-	/* Down the channel the work went.  With command buffers carrying the
-	 * commands, a fence written to the FIFO is in a different queue from
-	 * the batches it is supposed to follow and can pass while they are
-	 * still running -- so the fence would promise completion that has
-	 * not happened.  Command buffers take FIFO-format commands, and one
-	 * context executes strictly in submission order. */
-	if (v->cb_ready) {
-		/* Allocated and submitted together: see vmw_cmd_fence_emit().
-		 * Handing out the number first and submitting afterwards lets
-		 * two threads swap, and then the higher number completes first
-		 * and signals the lower -- whose work has not run. */
-		seq = vmw_cmd_fence_emit(v);
-	} else {
-		seq = vmsvga2_fence_insert();
-	}
-
-	if (!seq) {
-		/* No fence support (QEMU): everything completes in order
-		 * with the doorbell, so a signalled fence is the truth. */
-		vmsvga2_fifo_flush();
-		return drm_fence_signalled(&v->drm);
-	}
-	v->drm.fence_seq = seq;
-	struct drm_fence *f = drm_fence_create(&v->drm, seq, flags);
-	if (f && !f->signaled) {
-		if (v->hw.irq_enabled)
-			vmsvga2_hw_set_fence_goal(seq);
-		if (!v->fence_poll_running) {
-			v->fence_poll_running = 1;
-			hrtimer_start_rel(&v->fence_poll, 2000000);
-		}
-	}
-	return f;
-}
-
 /* ---- buffer objects --------------------------------------------------- */
 
-static int vmw_gem_init(struct drm_gem_object *o)
+/* A buffer object's id and pages are accounted (vmw_gmrid.c) before the
+ * device hears of it, so a buffer the device's pool cannot hold is refused
+ * here rather than by the device, which would halt the command-buffer
+ * context over it.  Both ends use the object's page count, which does not
+ * change while it lives. */
+int vmw_gem_init(struct drm_gem_object *o)
 {
 	struct vmw_bo *b = kalloc(sizeof(*b));
+	uint32_t npages;
+	int rc;
 
 	if (!b)
 		return -ENOMEM;
@@ -163,30 +62,50 @@ static int vmw_gem_init(struct drm_gem_object *o)
 	o->priv = b;
 	if (!o->pages)
 		return 0;
+	npages = o->npages;
 	/* Guest-backed hosts: every buffer is a MOB (what surfaces bind to
-	 * and what DX commands name).  A GMR as well where the host has
-	 * them, for the 2D scan-out and legacy DMA paths. */
+	 * and what DX commands name), so a buffer without one is refused,
+	 * not handed out.  It used to be returned anyway with no MOB behind
+	 * it -- and the first command naming it then carried an invalid MOB
+	 * id to the device.  A GMR as well where the host has them, for the
+	 * 2D scan-out and legacy DMA paths. */
 	if (g_vmw.has_gb && g_vmw.otables_ready) {
-		int id = vmw_mob_alloc_id(&g_vmw);
-		if (id >= 0) {
-			b->mob.id = (uint32_t)id;
-			if (vmw_mob_bind(&g_vmw, &b->mob, o->pages, o->npages,
-					 (uint32_t)o->size) != 0) {
-				vmw_mob_free_id(&g_vmw, (uint32_t)id);
+		uint32_t id = SVGA3D_INVALID_ID;
+
+		rc = vmw_gmrid_man_get_node(&g_vmw, VMW_PL_MOB, npages, &id);
+		if (rc == 0) {
+			b->mob.id = id;
+			/* On failure the bind leaves nothing behind but the
+			 * id, which goes back with its pages. */
+			rc = vmw_mob_bind(&g_vmw, &b->mob, o->pages, npages,
+					  (uint32_t)o->size);
+			if (rc) {
+				vmw_gmrid_man_put_node(&g_vmw, VMW_PL_MOB, id,
+						       npages);
 				b->mob.id = SVGA3D_INVALID_ID;
-			} else {
-				o->backend_id = (uint32_t)id;
 			}
 		}
+		if (rc) {
+			o->priv = NULL;
+			kfree(b);
+			return rc;
+		}
+		o->backend_id = id;
 	}
 	if (g_vmw.has_gmr && (b->mob.id == SVGA3D_INVALID_ID || o->scanout)) {
-		int id = vmsvga2_gmr_alloc(o->npages);
-		if (id >= 0 && vmsvga2_gmr_bind(id, o->pages, o->npages) == 0) {
-			b->gmr_id = id;
-			if (b->mob.id == SVGA3D_INVALID_ID)
-				o->backend_id = (uint32_t)id;
-		} else if (id >= 0) {
-			vmsvga2_gmr_free(id);
+		uint32_t id = SVGA3D_INVALID_ID;
+
+		/* A region is optional, as it always was: without one the
+		 * buffer keeps whatever else it has. */
+		if (vmw_gmrid_man_get_node(&g_vmw, VMW_PL_GMR, npages, &id) == 0) {
+			if (vmsvga2_gmr_bind((int)id, o->pages, npages) == 0) {
+				b->gmr_id = (int)id;
+				if (b->mob.id == SVGA3D_INVALID_ID)
+					o->backend_id = id;
+			} else {
+				vmw_gmrid_man_put_node(&g_vmw, VMW_PL_GMR, id,
+						       npages);
+			}
 		}
 	}
 	return 0;
@@ -204,11 +123,13 @@ static void vmw_gem_free(struct drm_gem_object *o)
 		return;
 	if (b->mob.id != SVGA3D_INVALID_ID) {
 		vmw_mob_unbind(&g_vmw, &b->mob);
-		vmw_mob_free_id(&g_vmw, b->mob.id);
+		vmw_gmrid_man_put_node(&g_vmw, VMW_PL_MOB, b->mob.id, o->npages);
 		b->mob.id = SVGA3D_INVALID_ID;
 	}
+	/* Unbinds and frees the region as well. */
 	if (b->gmr_id >= 0)
-		vmsvga2_gmr_free(b->gmr_id);
+		vmw_gmrid_man_put_node(&g_vmw, VMW_PL_GMR, (uint32_t)b->gmr_id,
+				       o->npages);
 	kfree(b);
 	o->priv = NULL;
 }
@@ -229,1108 +150,42 @@ static uint64_t vmw_gem_page_phys(struct drm_gem_object *o, uint64_t index)
 	return o->pages[index];
 }
 
-/* ---- scan-out ---------------------------------------------------------- */
-
-/* Define screen object 0.
- *
- * With a buffer object the screen's backing store -- the host's copy of
- * what is on it -- is the framebuffer aperture, and the image is carried
- * onto it with BLIT_GMRFB_TO_SCREEN from the object's guest memory region.
- * That is the reference driver's arrangement (its screen-object unit pins a
- * backing buffer in VRAM and names SVGA_GMR_FRAMEBUFFER here), and the one
- * the host is known to take.  Naming the object's own region as the backing
- * store instead was never seen accepted: VMware with 3D off refused the
- * definition outright.  It also means the aperture has to hold the screen,
- * which is what bounds the mode -- see vmw_scanout_limits().
- *
- * With a surface (a rendered image, which lives in host memory) the screen
- * has no backing store and the image is blitted onto it with
- * BLIT_SURFACE_TO_SCREEN. */
-static int vmw_define_screen(struct vmw_device *v, uint32_t w, uint32_t h,
-			     struct drm_gem_object *o)
+/* The file's own state, there from the open on: DRM_VMW_GET_PARAM records
+ * in it what kind of client this is before anything else is created, and
+ * having it from the start means two threads of a fresh client cannot
+ * both find it missing and each allocate one. */
+static int vmw_driver_open(struct drm_device *dev, struct drm_file *fp)
 {
-	struct vmw_bo *b = (o && o->kind == DRM_GEM_BO) ? o->priv : NULL;
-	uint32_t cmd[12];
-	int backed = b && b->gmr_id >= 0;
+	struct vmw_file *f;
 
-	if (!backed && !(o && o->kind == DRM_GEM_SURFACE))
-		return -ENODEV;
-	if (backed && (uint64_t)w * h * 4 > v->hw.vram_size)
-		return -ENOSPC; /* the aperture cannot hold the backing store */
-	cmd[0] = SVGA_CMD_DEFINE_SCREEN;
-	cmd[1] = 11 * 4; /* structSize */
-	cmd[2] = 0; /* id */
-	cmd[3] = SVGA_SCREEN_MUST_BE_SET | SVGA_SCREEN_HAS_ROOT | (1 << 1) /* IS_PRIMARY */;
-	cmd[4] = w;
-	cmd[5] = h;
-	cmd[6] = 0; /* root x */
-	cmd[7] = 0; /* root y */
-	cmd[8] = backed ? SVGA_GMR_FRAMEBUFFER : SVGA_GMR_NULL;
-	cmd[9] = 0; /* offset */
-	cmd[10] = backed ? w * 4 : 0; /* pitch */
-	cmd[11] = 0; /* cloneCount */
-	if (vmw_cmd_raw(v, cmd, sizeof(cmd), 1) != 0)
-		return -EIO;
-	v->screen_defined = 1;
-	v->screen_w = w;
-	v->screen_h = h;
-	v->scan_gmr = backed ? (uint32_t)b->gmr_id : SVGA_GMR_NULL;
-	return 0;
-}
-
-/* A rendered surface onto the screen: one 3D command. */
-static int vmw_surface_blit_screen(struct vmw_device *v, struct drm_gem_object *o,
-				   int x1, int y1, int x2, int y2)
-{
-	struct vmw_surface *s = o->priv;
-	struct {
-		SVGA3dCmdHeader h;
-		SVGA3dCmdBlitSurfaceToScreen b;
-	} __attribute__((packed)) cmd;
-
-	if (!s)
-		return -ENODEV;
-	cmd.h.id = SVGA_3D_CMD_BLIT_SURFACE_TO_SCREEN;
-	cmd.h.size = sizeof(cmd.b);
-	cmd.b.srcImage.sid = s->sid;
-	cmd.b.srcImage.face = 0;
-	cmd.b.srcImage.mipmap = 0;
-	cmd.b.srcRect.left = x1;
-	cmd.b.srcRect.top = y1;
-	cmd.b.srcRect.right = x2;
-	cmd.b.srcRect.bottom = y2;
-	cmd.b.destScreenId = 0;
-	cmd.b.destRect = cmd.b.srcRect;
-	int rc = vmw_cmd_submit(v, &cmd, sizeof(cmd), SVGA3D_INVALID_ID);
-	if (rc == 0) {
-		/* Let the host consume it promptly. */
-		struct drm_fence *f = vmw_fence_emit(v, 0);
-		if (f)
-			drm_fence_put(f);
-	}
-	return rc;
-}
-
-static int fb_is_surface(struct drm_framebuffer *fb)
-{
-	return fb->obj && fb->obj->kind == DRM_GEM_SURFACE;
-}
-
-/* A buffer object the host can scan out of directly: bound to a guest
- * memory region, and the image starts where the region does. */
-static int fb_is_gmr_scanout(struct drm_framebuffer *fb)
-{
-	return !fb_is_surface(fb) && fb->obj && fb->obj->priv &&
-	       ((struct vmw_bo *)fb->obj->priv)->gmr_id >= 0 &&
-	       fb->offset == 0;
-}
-
-/* One screen blit.  `ring' announces it to the host; a caller queueing a run
- * of them passes 0 and rings once at the end (see vmw_fb_dirty). */
-static int vmw_sou_blit_ex(struct vmw_device *v, struct drm_gem_object *o,
-			   uint32_t pitch, int x1, int y1, int x2, int y2,
-			   int ring)
-{
-	struct vmw_bo *b = o->priv;
-	uint32_t cmd[5 + 8];
-
-	if (!b || b->gmr_id < 0)
-		return -ENODEV;
-	cmd[0] = SVGA_CMD_DEFINE_GMRFB;
-	cmd[1] = (uint32_t)b->gmr_id;
-	cmd[2] = 0;
-	cmd[3] = pitch;
-	cmd[4] = 32 | (24 << 8);
-	cmd[5] = SVGA_CMD_BLIT_GMRFB_TO_SCREEN;
-	cmd[6] = (uint32_t)x1;
-	cmd[7] = (uint32_t)y1;
-	cmd[8] = (uint32_t)x1;
-	cmd[9] = (uint32_t)y1;
-	cmd[10] = (uint32_t)x2;
-	cmd[11] = (uint32_t)y2;
-	cmd[12] = 0; /* screen id */
-	/* Down the driver's own channel, not straight into the FIFO: this
-	 * blit shows a region the command-buffer channel has been filling,
-	 * and two streams have no order between them.  See vmw_cmd_raw(). */
-	return vmw_cmd_raw(v, cmd, sizeof(cmd), ring);
-}
-
-static int vmw_sou_blit(struct vmw_device *v, struct drm_gem_object *o,
-			uint32_t pitch, int x1, int y1, int x2, int y2)
-{
-	return vmw_sou_blit_ex(v, o, pitch, x1, y1, x2, y2, 1);
-}
-
-/* Legacy: copy rows of the object into VRAM, then announce them. */
-static int vmw_ldu_copy(struct vmw_device *v, struct drm_framebuffer *fb,
-			int x1, int y1, int x2, int y2)
-{
-	struct drm_gem_object *o = fb->obj;
-	uint32_t bpp = fb->bpp / 8;
-
-	if (o->kind != DRM_GEM_BO)
-		return -ENODEV;
-
-	if (x1 < 0)
-		x1 = 0;
-	if (y1 < 0)
-		y1 = 0;
-	if (x2 > (int)v->hw.width)
-		x2 = (int)v->hw.width;
-	if (y2 > (int)v->hw.height)
-		y2 = (int)v->hw.height;
-	if (x2 > (int)fb->width)
-		x2 = (int)fb->width;
-	if (y2 > (int)fb->height)
-		y2 = (int)fb->height;
-	if (x1 >= x2 || y1 >= y2)
-		return 0;
-	uint8_t *vram = v->hw.fb_virt + v->hw.fb_offset;
-	for (int y = y1; y < y2; y++) {
-		uint64_t src_off = fb->offset + (uint64_t)y * fb->pitch + (uint64_t)x1 * bpp;
-		uint64_t bytes = (uint64_t)(x2 - x1) * bpp;
-		uint8_t *dst = vram + (uint64_t)y * v->hw.pitch + (uint64_t)x1 * bpp;
-		/* The object is page-backed; a row may cross pages. */
-		while (bytes) {
-			uint32_t page = (uint32_t)(src_off / PAGE_SIZE);
-			uint32_t in = (uint32_t)(src_off % PAGE_SIZE);
-			uint32_t chunk = (uint32_t)(PAGE_SIZE - in);
-			if (chunk > bytes)
-				chunk = (uint32_t)bytes;
-			uint8_t *src = drm_gem_page_virt(o, page);
-			if (!src)
-				return -EIO;
-			kmemcpy(dst, src + in, chunk);
-			dst += chunk;
-			src_off += chunk;
-			bytes -= chunk;
-		}
-	}
-	vmsvga2_update_rect((uint32_t)x1, (uint32_t)y1, (uint32_t)(x2 - x1),
-			    (uint32_t)(y2 - y1));
-	return 0;
-}
-
-/* The legacy display path, retired before a screen target takes the screen.
- *
- * Until here the boot console showed itself the old way: pixels in the
- * framebuffer aperture, an SVGA_CMD_UPDATE through the FIFO for every
- * changed rectangle, and SVGA_REG_TRACES on so the host also noticed writes
- * that announced nothing.  The screen target that follows is a different
- * mechanism on the host, fed from a different queue, and the two were left
- * to race: updates of the legacy framebuffer still sitting in the FIFO
- * could be consumed AFTER the target had been defined and painted, and the
- * host then showed that framebuffer -- black, the console having moved out
- * of it -- rather than the target.  Which of the two won depended on how
- * far the host had got with the FIFO at that moment, so the screen came up
- * black on some boots and not on others.
- *
- * So: no more tracing (it belongs to the legacy path; a device driven
- * through command buffers has no use for it), and the FIFO drained --
- * SVGA_REG_SYNC until
- * SVGA_REG_BUSY clears -- so that everything the legacy path ever said has
- * been heard before the target says anything.  Free when nothing is queued,
- * which is every mode set after the first. */
-static void vmw_legacy_display_retire(struct vmw_device *v)
-{
-	(void)v;
-	vmsvga2_set_traces(0);
-	vmsvga2_fifo_flush();
-}
-
-static int vmw_mode_set(struct drm_device *dev, struct drm_crtc *crtc,
-			const struct drm_mode_modeinfo *mode,
-			struct drm_framebuffer *fb, int x, int y)
-{
-	struct vmw_device *v = dev->priv;
-	(void)crtc;
-	(void)x;
-	(void)y;
-
-	/* For vmw_display_verify(): refusals from before this mode set are
-	 * somebody else's -- a display server's, typically. */
-	v->cb_errors_seen = v->cb_errors;
-
-	/* Will a screen object or a screen target carry this mode?  Then its
-	 * geometry comes from the command that defines it, and the mode
-	 * registers below have no say in it -- and must not be given a veto,
-	 * because the limits the device enforces on them are derived from the
-	 * framebuffer aperture that this scan-out never reads. */
-	int by_screen = vmw_stdu_available(v) ||
-			(v->has_screen_object &&
-			 (fb_is_surface(fb) ? v->has_3d : fb_is_gmr_scanout(fb)));
-
-	/* On a device driven through command buffers the mode registers are
-	 * not merely redundant beside a screen target -- programming them
-	 * cycles SVGA_REG_ENABLE, and disabling the device resets it, which
-	 * stops the command-buffer contexts: the very next screen-target
-	 * command comes back SVGA_CB_STATUS_CB_HEADER_ERROR.  These
-	 * registers are never touched again after bring-up on such a
-	 * device.  (cb_submit_raw() can restart a stopped context
-	 * now, but not resetting the device at all is strictly better than
-	 * recovering from it.)  The aperture path cannot need them either:
-	 * it is only reached when the screen paths are refused, and it
-	 * refuses a geometry the registers do not already carry. */
-	if (!(by_screen && v->cb_ready) &&
-	    (v->hw.width != mode->hdisplay || v->hw.height != mode->vdisplay ||
-	     v->hw.bpp != 32)) {
-		/* Where the console scans out of a buffer object of its own,
-		 * this mode belongs to the client that asked for it and the
-		 * console keeps its framebuffer and its geometry; it gets its
-		 * own mode back when that client drops the display. */
-		int rc = drm_console_active(dev) ?
-				 vmsvga2_hw_set_mode_device(mode->hdisplay,
-							    mode->vdisplay) :
-				 vmsvga2_hw_set_mode(mode->hdisplay,
-						     mode->vdisplay);
-		if (rc != 0 && !by_screen)
-			return -EINVAL;
-	}
-	vmsvga2_hw_geometry(&v->hw);
-	/* Screen targets first: on a device with guest-backed objects this is
-	 * the path the host expects, and the two below may be refused. */
-	if (vmw_stdu_available(v)) {
-		vmw_legacy_display_retire(v);
-		if (vmw_stdu_set_mode(v, mode->hdisplay, mode->vdisplay, fb) == 0) {
-			v->screen_defined = 0;
-			return 0;
-		}
-		/* Not fatal: fall through to the older paths, which is what a
-		 * device that reports screen targets but refuses to define one
-		 * leaves as the only way to show anything. */
-		vmw_stdu_teardown(v);
-	}
-	/* Screen objects carry a surface only on a device WITHOUT guest-backed
-	 * objects.  Where there are GB surfaces, BLIT_SURFACE_TO_SCREEN takes
-	 * the command and shows nothing -- a silent success that reads as a
-	 * black screen -- so the screen target above is the only path, and if
-	 * it could not carry the mode the caller must hear about it. */
-	if (v->has_screen_object && fb_is_surface(fb) && v->has_3d && !v->has_gb) {
-		vmw_legacy_display_retire(v);
-		if (vmw_define_screen(v, mode->hdisplay, mode->vdisplay, fb->obj) == 0)
-			return vmw_surface_blit_screen(v, fb->obj, 0, 0,
-						       mode->hdisplay, mode->vdisplay);
-	}
-	if (v->has_screen_object && fb_is_gmr_scanout(fb)) {
-		/* The same two queues as for a screen target: the legacy
-		 * console's updates are still in the FIFO, the screen goes
-		 * down the command-buffer channel.  Drain the one before the
-		 * other says anything. */
-		vmw_legacy_display_retire(v);
-		if (vmw_define_screen(v, mode->hdisplay, mode->vdisplay, fb->obj) == 0)
-			return vmw_sou_blit(v, fb->obj, fb->pitch, 0, 0,
-					    mode->hdisplay, mode->vdisplay);
-	}
-	if (fb_is_surface(fb))
-		return -ENODEV; /* no way to show a surface without screen objects */
-	v->screen_defined = 0;
-	/* The last path copies into the framebuffer aperture, which is still
-	 * whatever geometry the mode registers accepted.  If they would not
-	 * take this mode and no screen carried it either, copying anyway
-	 * would put the top-left corner of the image on the screen and call
-	 * it success.  Refuse instead, and the caller keeps the display it
-	 * already had. */
-	if (v->hw.width != mode->hdisplay || v->hw.height != mode->vdisplay)
-		return -EINVAL;
-	/* Legacy: the host reads VRAM; disable its own dirty tracking of
-	 * VRAM writes, the copies below announce themselves. */
-	vmsvga2_set_traces(0);
-	return vmw_ldu_copy(v, fb, 0, 0, (int)fb->width, (int)fb->height);
-}
-
-static int vmw_crtc_disable(struct drm_device *dev, struct drm_crtc *crtc)
-{
-	struct vmw_device *v = dev->priv;
-	(void)crtc;
-	if (v->st_defined)
-		vmw_stdu_teardown(v);
-	v->screen_defined = 0;
-	return 0;
-}
-
-/* Did the console's screen come up?  See drm_driver.display_verify.
- *
- * Everything on the screen-target path is queued and executed later, and
- * a buffer the device refuses is repaired by dropping the one command it
- * did not like -- so a define, a bind or an update can vanish without any
- * caller hearing of it, and the first anyone knows is a screen that stays
- * black.  Waiting for the device to finish and then asking whether it
- * refused anything since the mode set is the only test that sees that.  A
- * device that has stopped answering shows up the same way: the wait gives
- * up on it and the buffers it never took are counted as refused. */
-static int vmw_display_verify(struct drm_device *dev)
-{
-	struct vmw_device *v = dev->priv;
-
-	if (vmw_stdu_available(v)) {
-		vmw_cmd_drain(v);
-		if (!v->st_defined) {
-			kprintf("[drm] vmwgfx: no screen target after the console's mode set\n");
-			return -ENODEV;
-		}
-	} else if (v->screen_defined && v->cb_ready) {
-		/* A screen object over the command-buffer channel is just as
-		 * silent: the define and the blits are queued, and a refused
-		 * one is dropped.  Ask the same question. */
-		vmw_cmd_drain(v);
-	} else {
-		return 0; /* the legacy path answers as it goes */
-	}
-	if (v->cb_errors != v->cb_errors_seen) {
-		kprintf("[drm] vmwgfx: the device refused %u command buffer(s) while the console's screen was set up\n",
-			v->cb_errors - v->cb_errors_seen);
-		return -EIO;
-	}
-	return 0;
-}
-
-/* The screen-target path cannot be trusted: put the display back the way
- * the boot console had it.  See drm_driver.display_fallback.  The console
- * has already stopped drawing into its buffer object and has its old flush
- * hook back, so everything painted from here on goes into the aperture and
- * is announced through the FIFO, exactly as before this driver initialised.
- *
- * The legacy mode set is what makes it certain.  Cycling SVGA_REG_ENABLE
- * resets the device: whatever screen target the host still holds -- an
- * empty one, if the refused command was the update that should have
- * filled it -- goes with the reset, and the host is back to showing the
- * framebuffer aperture, which no queued command can take away again.  The
- * reset also drops the guest-backed state (object tables, contexts), so
- * the driver stops offering it: screen-target scan-out is off for good and
- * 3D with it, and a display server finds the device as it was before 3D
- * was detected -- the framebuffer and screen-object paths, which need
- * nothing of what was lost. */
-static void vmw_display_fallback(struct drm_device *dev)
-{
-	struct vmw_device *v = dev->priv;
-
-	if (v->st_defined)
-		vmw_stdu_teardown(v);
-	if (vmw_stdu_available(v)) {
-		v->st_refused = 1;
-		v->has_gb = 0;
-		v->has_dx = 0;
-		v->has_3d = 0;
-		v->has_sm41 = 0;
-		v->has_sm5 = 0;
-		v->has_gl43 = 0;
-		v->otables_ready = 0;
-		v->devcaps[SVGA3D_DEVCAP_DXCONTEXT] = 0;
-		v->devcaps[SVGA3D_DEVCAP_SM41] = 0;
-		v->devcaps[SVGA3D_DEVCAP_SM5] = 0;
-		v->devcaps[SVGA3D_DEVCAP_GL43] = 0;
-		kprintf("[drm] vmwgfx: screen-target display refused; console and scan-out back on the framebuffer, 3D off\n");
-	} else {
-		/* The screen object was refused: not offered again, so a
-		 * display server's mode set takes the aperture path the
-		 * console is going back to, rather than repeating this. */
-		v->has_screen_object = 0;
-		kprintf("[drm] vmwgfx: screen-object display refused; console and scan-out back on the framebuffer\n");
-	}
-	v->screen_defined = 0;
-	vmsvga2_set_traces(1);
-	if (vmsvga2_hw_set_mode(v->hw.width, v->hw.height) != 0)
-		kprintf("[drm] vmwgfx: legacy mode set %ux%u failed as well\n",
-			v->hw.width, v->hw.height);
-	vmsvga2_hw_geometry(&v->hw);
-	vmsvga2_update_rect(0, 0, v->hw.width, v->hw.height);
-}
-
-static int vmw_fb_dirty(struct drm_device *dev, struct drm_crtc *crtc,
-			struct drm_framebuffer *fb,
-			const struct drm_mode_rect_k *rects, uint32_t n)
-{
-	struct vmw_device *v = dev->priv;
-	int queued = 0;
-	(void)crtc;
-
-	/* A guest-backed surface is only displayable through a screen target;
-	 * if the mode set did not leave one up, bring it up now. */
-	if (!v->st_defined && fb && fb_is_surface(fb) && vmw_stdu_available(v))
-		vmw_stdu_ensure(v, fb->width, fb->height);
-
-	for (uint32_t i = 0; i < n; i++) {
-		int rc;
-		if (v->st_defined)
-			rc = vmw_stdu_present(v, fb, rects[i].x1, rects[i].y1,
-					      rects[i].x2, rects[i].y2, 0);
-		else if (v->screen_defined && fb_is_surface(fb) && !v->has_gb)
-			rc = vmw_surface_blit_screen(v, fb->obj, rects[i].x1, rects[i].y1,
-						     rects[i].x2, rects[i].y2);
-		else if (v->screen_defined && !fb_is_surface(fb) && fb->obj->priv &&
-			 ((struct vmw_bo *)fb->obj->priv)->gmr_id == (int)v->scan_gmr) {
-			/* Queued, not announced: a window drag arrives here as
-			 * a run of rectangles, and ringing the doorbell for
-			 * each one traps out of the virtual machine that many
-			 * times.  One ring covers the whole run. */
-			rc = vmw_sou_blit_ex(v, fb->obj, fb->pitch, rects[i].x1,
-					     rects[i].y1, rects[i].x2,
-					     rects[i].y2, 0);
-			if (rc == 0)
-				queued = 1;
-		} else
-			rc = vmw_ldu_copy(v, fb, rects[i].x1, rects[i].y1,
-					  rects[i].x2, rects[i].y2);
-		if (rc) {
-			/* Report it, but never hand it back.  The X
-			 * modesetting driver answers ONE failed DIRTYFB by
-			 * unregistering its damage tracking for the rest of
-			 * the session ("Disabling kernel dirty updates, not
-			 * required." -- X_INFO, easy to miss), after which
-			 * nothing asks for an update again and the screen is
-			 * frozen whatever the driver does.  A rectangle that
-			 * could not be shown is worth far less than the next
-			 * one that could. */
-			static int budget = 12;
-			static int last_rc;
-			if (rc != last_rc && budget > 0) {
-				budget--;
-				last_rc = rc;
-				kprintf("[drm] vmwgfx: dirty rectangle %d,%d-%d,%d not shown (%d)\n",
-					rects[i].x1, rects[i].y1, rects[i].x2,
-					rects[i].y2, rc);
-			}
-		}
-	}
-	if (queued) {
-		/* Announce the run.  With the command-buffer channel up the
-		 * blits were gathered rather than written to the FIFO, so
-		 * handing the gathered batch over IS the announcement. */
-		if (v->cb_ready)
-			vmw_cmd_flush(v);
-		else
-			vmsvga2_hw_doorbell();
-	}
-	return 0;
-}
-
-static int vmw_page_flip(struct drm_device *dev, struct drm_crtc *crtc,
-			 struct drm_framebuffer *fb)
-{
-	struct vmw_device *v = dev->priv;
-
-	if (!v->st_defined && fb && fb_is_surface(fb) && vmw_stdu_available(v))
-		vmw_stdu_ensure(v, crtc->mode.hdisplay, crtc->mode.vdisplay);
-	if (v->st_defined)
-		return vmw_stdu_present(v, fb, 0, 0, (int)crtc->mode.hdisplay,
-					(int)crtc->mode.vdisplay, 1);
-	if (v->screen_defined && fb_is_surface(fb) && !v->has_gb) {
-		if (v->scan_gmr != SVGA_GMR_NULL)
-			vmw_define_screen(v, crtc->mode.hdisplay, crtc->mode.vdisplay,
-					  fb->obj);
-		return vmw_surface_blit_screen(v, fb->obj, 0, 0,
-					       crtc->mode.hdisplay, crtc->mode.vdisplay);
-	}
-	if (fb_is_surface(fb))
-		return -ENODEV;
-	if (v->screen_defined && fb->obj->priv &&
-	    ((struct vmw_bo *)fb->obj->priv)->gmr_id >= 0 && fb->offset == 0) {
-		/* The screen's backing store is the aperture, not the buffer,
-		 * so a flip is one blit from the new buffer's region; the
-		 * screen stays as defined.  Remember which region is on it
-		 * for vmw_fb_dirty(). */
-		v->scan_gmr = (uint32_t)((struct vmw_bo *)fb->obj->priv)->gmr_id;
-		return vmw_sou_blit(v, fb->obj, fb->pitch, 0, 0,
-				    crtc->mode.hdisplay, crtc->mode.vdisplay);
-	}
-	return vmw_ldu_copy(v, fb, 0, 0, (int)fb->width, (int)fb->height);
-}
-
-static int vmw_cursor_set(struct drm_device *dev, struct drm_crtc *crtc,
-			  struct drm_gem_object *o, uint32_t w, uint32_t h,
-			  int32_t hot_x, int32_t hot_y)
-{
 	(void)dev;
-	(void)crtc;
-	if (!o) {
-		vmsvga2_cursor_show(0);
-		return 0;
-	}
-	if (w > 64 || h > 64 || !o->pages)
-		return -EINVAL;
-	/* The object is ARGB at w*4 pitch; gather it into one buffer. */
-	static uint32_t argb[64 * 64];
-	for (uint32_t y = 0; y < h; y++) {
-		uint64_t off = (uint64_t)y * w * 4;
-		uint8_t *src = drm_gem_page_virt(o, (uint32_t)(off / PAGE_SIZE));
-		if (!src)
-			return -EIO;
-		uint32_t in = (uint32_t)(off % PAGE_SIZE);
-		uint32_t bytes = w * 4;
-		uint8_t *dst = (uint8_t *)&argb[y * w];
-		while (bytes) {
-			uint32_t chunk = (uint32_t)(PAGE_SIZE - in);
-			if (chunk > bytes)
-				chunk = bytes;
-			kmemcpy(dst, src + in, chunk);
-			bytes -= chunk;
-			dst += chunk;
-			off += chunk;
-			src = drm_gem_page_virt(o, (uint32_t)(off / PAGE_SIZE));
-			in = 0;
-			if (!src && bytes)
-				return -EIO;
-		}
-	}
-	if (vmsvga2_cursor_define_alpha(w, h, (uint32_t)(hot_x < 0 ? 0 : hot_x),
-					(uint32_t)(hot_y < 0 ? 0 : hot_y), argb) != 0)
-		return -ENODEV;
-	vmsvga2_cursor_show(1);
+	f = kalloc(sizeof(*f));
+	if (!f)
+		return -ENOMEM;
+	mm_memset(f, 0, sizeof(*f));
+	fp->priv = f;
 	return 0;
 }
-
-static int vmw_cursor_move(struct drm_device *dev, struct drm_crtc *crtc, int x,
-			   int y)
-{
-	(void)dev;
-	(void)crtc;
-	return vmsvga2_cursor_move(x, y, 1) == 0 ? 0 : -ENODEV;
-}
-
-static int vmw_dpms(struct drm_device *dev, struct drm_connector *c, int mode)
-{
-	(void)dev;
-	(void)c;
-	vmsvga2_display_enable(mode == 0);
-	return 0;
-}
-
-static void vmw_fence_events_release(struct drm_file *fp);
 
 static void vmw_postclose(struct drm_device *dev, struct drm_file *fp)
 {
 	/* Anything this file asked to be told about is dropped here: the
 	 * event would be queued onto a file that no longer exists. */
-	vmw_fence_events_release(fp);
+	vmw_fence_file_release(dev->priv, fp);
 	vmw_overlay_file_release(dev->priv, fp);
 	vmw_file_release(dev->priv, fp);
 }
 
-static void vmw_master_set(struct drm_device *dev, struct drm_file *fp)
-{
-	(void)dev;
-	(void)fp;
-	/* The console stops painting here rather than at the first mode set.
-	 * It is a client of this device itself now (drm_console.c), and its
-	 * own mode set is a mode set like any other -- taking the display
-	 * away there would silence the console on behalf of the console. */
-	vmsvga2_hw_display_take();
-}
-
-static void vmw_master_drop(struct drm_device *dev, struct drm_file *fp)
-{
-	struct vmw_device *v = dev->priv;
-	(void)fp;
-	v->screen_defined = 0;
-	vmsvga2_cursor_show(0);
-	vmsvga2_hw_display_release();
-	vmsvga2_hw_geometry(&v->hw);
-}
-
-/* ---- driver ioctls ----------------------------------------------------- */
-
-static int vmw_render_allowed(unsigned nr)
-{
-	switch (nr) {
-	case DRM_VMW_GET_PARAM:
-	case DRM_VMW_ALLOC_BO:
-	case DRM_VMW_UNREF_DMABUF:
-	case DRM_VMW_CREATE_CONTEXT:
-	case DRM_VMW_UNREF_CONTEXT:
-	case DRM_VMW_CREATE_SURFACE:
-	case DRM_VMW_UNREF_SURFACE:
-	case DRM_VMW_REF_SURFACE:
-	case DRM_VMW_EXECBUF:
-	case DRM_VMW_GET_3D_CAP:
-	case DRM_VMW_FENCE_WAIT:
-	case DRM_VMW_FENCE_SIGNALED:
-	case DRM_VMW_FENCE_UNREF:
-	case DRM_VMW_CREATE_SHADER:
-	case DRM_VMW_UNREF_SHADER:
-	case DRM_VMW_GB_SURFACE_CREATE:
-	case DRM_VMW_GB_SURFACE_REF:
-	case DRM_VMW_SYNCCPU:
-	case DRM_VMW_CREATE_EXTENDED_CONTEXT:
-	case DRM_VMW_GB_SURFACE_CREATE_EXT:
-	case DRM_VMW_GB_SURFACE_REF_EXT:
-	case DRM_VMW_MSG:
-	/* Waiting for a fence through an event rather than an ioctl is the
-	 * same operation with a different way of being told, so a render
-	 * node may do it too.  UPDATE_LAYOUT is not here: it changes what
-	 * the display advertises, which belongs to whoever holds the
-	 * display. */
-	case DRM_VMW_FENCE_EVENT:
-		return 1;
-	default:
-		return 0;
-	}
-}
-
-static long vmw_ioctl_get_param(struct vmw_device *v, struct drm_vmw_getparam_arg *a)
-{
-	switch (a->param) {
-	case DRM_VMW_PARAM_NUM_STREAMS:
-		a->value = vmw_overlay_num_streams(v);
-		return 0;
-	case DRM_VMW_PARAM_NUM_FREE_STREAMS:
-		a->value = vmw_overlay_num_free_streams(v);
-		return 0;
-	case DRM_VMW_PARAM_3D:
-		a->value = v->has_3d;
-		return 0;
-	case DRM_VMW_PARAM_HW_CAPS:
-		a->value = v->hw.caps;
-		return 0;
-	case DRM_VMW_PARAM_FIFO_CAPS:
-		a->value = v->hw.fifo_caps;
-		return 0;
-	case DRM_VMW_PARAM_MAX_FB_SIZE:
-		a->value = v->hw.vram_size;
-		return 0;
-	case DRM_VMW_PARAM_FIFO_HW_VERSION:
-		a->value = vmsvga2_hw_has_fifo_reg(SVGA_FIFO_3D_HWVERSION_REVISED) ?
-				   vmsvga2_hw_fifo_reg(SVGA_FIFO_3D_HWVERSION_REVISED) :
-				   vmsvga2_hw_fifo_reg(SVGA_FIFO_3D_HWVERSION);
-		return 0;
-	case DRM_VMW_PARAM_MAX_SURF_MEMORY:
-		a->value = 0x30000000;
-		return 0;
-	case DRM_VMW_PARAM_3D_CAPS_SIZE:
-		if (v->has_gb)
-			a->value = (SVGA3D_DEVCAP_MAX + 1) * 4;
-		else
-			a->value = v->has_3d ? (SVGA_FIFO_3D_CAPS_LAST - SVGA_FIFO_3D_CAPS + 1) * 4 : 0;
-		return 0;
-	case DRM_VMW_PARAM_MAX_MOB_MEMORY:
-		a->value = v->max_mob_memory;
-		return 0;
-	case DRM_VMW_PARAM_MAX_MOB_SIZE:
-		a->value = v->max_mob_size;
-		return 0;
-	case DRM_VMW_PARAM_SCREEN_TARGET:
-		/* Whether the screen target is the display unit in use, not
-		 * whether a size register answered. */
-		a->value = vmw_stdu_available(v);
-		return 0;
-	case DRM_VMW_PARAM_DX:
-		a->value = v->has_dx;
-		return 0;
-	case DRM_VMW_PARAM_HW_CAPS2:
-		a->value = v->cap2;
-		return 0;
-	case DRM_VMW_PARAM_SM4_1:
-		a->value = v->has_sm41;
-		return 0;
-	case DRM_VMW_PARAM_SM5:
-		a->value = v->has_sm5;
-		return 0;
-	case DRM_VMW_PARAM_GL43:
-		a->value = v->has_gl43;
-		return 0;
-	case DRM_VMW_PARAM_DEVICE_ID:
-		a->value = v->drm.pci ? v->drm.pci->device_id : 0x0405;
-		return 0;
-	case DRM_VMW_PARAM_USER_SRF:
-		a->value = 0;
-		return 0;
-	default:
-		return -EINVAL;
-	}
-}
-
-/* ---- fence events ------------------------------------------------------
- *
- * DRM_VMW_FENCE_EVENT asks for a DRM event when a fence signals, so that a
- * client can wait in its own poll() loop on the device rather than blocking
- * in an ioctl.  The fences here have no callback list, so the request is
- * parked in a small table that the fence check walks -- which already runs
- * from the device's interrupt and from the poll timer, so the event is
- * delivered as soon as the sequence passes with nothing else to arrange.
- *
- * The table is small on purpose: one pending event per in-flight frame is
- * the shape of every user of this, and a client that asks for more than
- * this many at once is told so rather than being allowed to pin memory. */
-#define VMW_MAX_FENCE_EVENTS 32
-
-struct vmw_fence_event {
-	struct drm_fence *fence; /* NULL: slot free */
-	struct drm_file *fp;
-	uint64_t user_data;
-	int want_time;
-};
-
-static struct vmw_fence_event g_fence_events[VMW_MAX_FENCE_EVENTS];
-/* Taken from an interrupt handler -- vmw_irq_cb() -> vmw_fence_check() ->
- * vmw_fence_events_check() -- so EVERY acquisition of it disables interrupts
- * first, process-context ones included.
- *
- * With the plain spin_lock() that stood here, the DRM_VMW_FENCE_WAIT ioctl
- * (which calls vmw_fence_check() itself, in process context with interrupts
- * on) held this lock while the SVGA interrupt arrived on the same processor,
- * and the handler then spun for that same lock -- against a holder that could
- * not make progress until the handler returned.  A hard hang of that CPU, at
- * 500 million spins per report, with the interrupted ioctl frame still on the
- * stack underneath the handler's.
- *
- * In an interrupt handler the save/restore costs nothing (IF is already
- * clear); the guarantee it buys in process context is the whole point. */
-static spinlock_t g_fence_event_lock;
-
-static void vmw_fence_event_deliver(struct vmw_fence_event *e)
-{
-	struct drm_vmw_event_fence ev;
-
-	mm_memset(&ev, 0, sizeof(ev));
-	ev.base.type = DRM_VMW_EVENT_FENCE_SIGNALED;
-	ev.base.length = sizeof(ev);
-	ev.user_data = e->user_data;
-	if (e->want_time) {
-		uint64_t ns = e->fence->signal_ns;
-		ev.tv_sec = (uint32_t)(ns / 1000000000ULL);
-		ev.tv_usec = (uint32_t)((ns % 1000000000ULL) / 1000ULL);
-	}
-	drm_event_queue(e->fp, &ev, sizeof(ev));
-}
-
-/* Called after every fence signal sweep. */
-static void vmw_fence_events_check(void)
-{
-	for (int i = 0; i < VMW_MAX_FENCE_EVENTS; i++) {
-		struct vmw_fence_event *e = &g_fence_events[i];
-		struct drm_fence *f;
-		struct vmw_fence_event local;
-		uint64_t fl;
-
-		spin_lock_irqsave(&g_fence_event_lock, &fl);
-		f = e->fence;
-		if (!f || !f->signaled) {
-			spin_unlock_irqrestore(&g_fence_event_lock, fl);
-			continue;
-		}
-		local = *e;
-		e->fence = NULL;
-		spin_unlock_irqrestore(&g_fence_event_lock, fl);
-
-		vmw_fence_event_deliver(&local);
-		drm_fence_put(local.fence);
-	}
-}
-
-/* Drop anything this file was waiting for; called when it closes. */
-static void vmw_fence_events_release(struct drm_file *fp)
-{
-	for (int i = 0; i < VMW_MAX_FENCE_EVENTS; i++) {
-		struct drm_fence *f = NULL;
-		uint64_t fl;
-
-		spin_lock_irqsave(&g_fence_event_lock, &fl);
-		if (g_fence_events[i].fence && g_fence_events[i].fp == fp) {
-			f = g_fence_events[i].fence;
-			g_fence_events[i].fence = NULL;
-		}
-		spin_unlock_irqrestore(&g_fence_event_lock, fl);
-		if (f)
-			drm_fence_put(f);
-	}
-}
-
-static long vmw_ioctl_fence_event(struct vmw_device *v, struct drm_file *fp,
-				  struct drm_vmw_fence_event_arg *a)
-{
-	struct drm_fence *f;
-
-	if (a->handle)
-		f = drm_fence_handle_lookup(fp, a->handle);
-	else
-		f = vmw_fence_emit(v, 0); /* a fence for what has been queued */
-	if (!f)
-		return -EINVAL;
-
-	/* Already done: the event is still owed, so it is delivered at once
-	 * rather than the caller being left waiting for a signal that has
-	 * already happened. */
-	if (f->signaled) {
-		struct vmw_fence_event e = { f, fp, a->user_data,
-					     (a->flags & DRM_VMW_FE_FLAG_REQ_TIME) != 0 };
-		vmw_fence_event_deliver(&e);
-		if (!a->handle)
-			drm_fence_put(f);
-		return 0;
-	}
-
-	if (a->handle)
-		drm_fence_get(f); /* the table holds its own reference */
-
-	uint64_t fl;
-
-	spin_lock_irqsave(&g_fence_event_lock, &fl);
-	int slot = -1;
-	for (int i = 0; i < VMW_MAX_FENCE_EVENTS; i++)
-		if (!g_fence_events[i].fence) {
-			slot = i;
-			break;
-		}
-	if (slot >= 0) {
-		g_fence_events[slot].fence = f;
-		g_fence_events[slot].fp = fp;
-		g_fence_events[slot].user_data = a->user_data;
-		g_fence_events[slot].want_time =
-			(a->flags & DRM_VMW_FE_FLAG_REQ_TIME) != 0;
-	}
-	spin_unlock_irqrestore(&g_fence_event_lock, fl);
-	if (slot < 0) {
-		drm_fence_put(f);
-		return -EBUSY;
-	}
-	return 0;
-}
-
-/* ---- host-driven layout ------------------------------------------------
- *
- * The hypervisor resizes its window and tells the guest what geometry it
- * would like; a client that owns the display (an X server, or the tool that
- * follows the window size) passes those rectangles here.  What the driver
- * does with them is make the first one the connector's PREFERRED mode, so
- * that the next time anything asks the connector what it wants -- which is
- * what a mode-setting client does on a hot-plug event -- it is told the
- * size the host is actually showing.
- *
- * One output for now: the device allows several screen targets and this
- * driver exposes one connector.  The loop reads them all so that a caller
- * passing more is not an error, and the extras are ignored rather than
- * silently changing the one head that exists. */
-static long vmw_ioctl_update_layout(struct vmw_device *v,
-				    struct drm_vmw_update_layout_arg *a)
-{
-	struct drm_vmw_rect r;
-
-	if (a->num_outputs == 0 || !a->rects)
-		return -EINVAL;
-	if (drm_copy_from_user(&r, (const void *)(uintptr_t)a->rects, sizeof(r)) != 0)
-		return -EFAULT;
-	if (!r.w || !r.h || r.w > v->drm.max_width || r.h > v->drm.max_height)
-		return -EINVAL;
-
-	struct drm_connector *c = &v->drm.conn[0];
-	struct drm_mode_modeinfo m;
-
-	drm_mode_fill(&m, r.w, r.h, 60, 1);
-	/* Preferred is a property of exactly one mode. */
-	for (uint32_t i = 0; i < c->nmodes; i++)
-		c->modes[i].type &= (uint32_t)~DRM_MODE_TYPE_PREFERRED;
-	/* Replace an existing entry of the same size, or add one. */
-	for (uint32_t i = 0; i < c->nmodes; i++)
-		if (c->modes[i].hdisplay == r.w && c->modes[i].vdisplay == r.h) {
-			c->modes[i] = m;
-			return 0;
-		}
-	if (drm_connector_add_mode(&v->drm, 0, &m) != 0)
-		return -ENOSPC;
-	return 0;
-}
-
-static long vmw_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
-		      unsigned dir, void *kb, unsigned size, int *handled)
-{
-	struct vmw_device *v = dev->priv;
-	(void)dir;
-	*handled = 1;
-
-
-	switch (nr) {
-	case DRM_VMW_GET_PARAM:
-		return vmw_ioctl_get_param(v, kb);
-	case DRM_VMW_ALLOC_BO: {
-		union drm_vmw_alloc_bo_arg *a = kb;
-		uint32_t req_size = a->req.size;
-		if (req_size == 0 || req_size > (512u << 20))
-			return -EINVAL;
-		struct drm_gem_object *o = drm_gem_alloc(dev, DRM_GEM_BO, req_size);
-		if (!o)
-			return -ENOMEM;
-		int rc = drm_gem_alloc_pages(o);
-		if (rc == 0)
-			rc = vmw_gem_init(o);
-		if (rc) {
-			drm_gem_put(o);
-			return rc;
-		}
-		uint32_t h;
-		rc = drm_gem_handle_create(fp, o, &h);
-		if (rc) {
-			drm_gem_put(o);
-			return rc;
-		}
-		struct vmw_bo *b = o->priv;
-		a->rep.handle = h;
-		a->rep.map_handle = drm_gem_mmap_offset(o);
-		a->rep.cur_gmr_id = b->gmr_id >= 0 ? (uint32_t)b->gmr_id : 0;
-		a->rep.cur_gmr_offset = 0;
-		drm_gem_put(o);
-		return 0;
-	}
-	case DRM_VMW_UNREF_DMABUF: {
-		struct drm_vmw_handle_close_arg *a = kb;
-		return drm_gem_handle_delete(fp, a->handle);
-	}
-	case DRM_VMW_SYNCCPU: {
-		struct drm_vmw_synccpu_arg *a = kb;
-		struct drm_gem_object *o = drm_gem_lookup(fp, a->handle);
-		if (!o)
-			return -ENOENT;
-		int rc = 0;
-		/* Ask the device first, exactly as DRM_VMW_FENCE_WAIT does.
-		 * Without it this tests a flag only an interrupt or an
-		 * unrelated thread would have set, so a fence that passed long
-		 * ago still looks pending and the map sleeps for a tick.  This
-		 * call is on the display path: gbm_bo_map() reaches it once
-		 * per frame. */
-		vmw_fence_check(v);
-		if (a->op == drm_vmw_synccpu_grab && o->fence && !o->fence->signaled) {
-			if (a->flags & drm_vmw_synccpu_dontblock)
-				rc = -EBUSY;
-			else
-				rc = drm_fence_wait(o->fence,
-						    VMW_FENCE_TIMEOUT_NS);
-		}
-		drm_gem_put(o);
-		return rc;
-	}
-	case DRM_VMW_FENCE_WAIT: {
-		struct drm_vmw_fence_wait_arg *a = kb;
-		struct drm_fence *f = drm_fence_handle_lookup(fp, a->handle);
-		if (!f)
-			return -EINVAL;
-		uint64_t to = a->timeout_us ? a->timeout_us * 1000ULL : VMW_FENCE_TIMEOUT_NS;
-		vmw_fence_check(v);
-		int rc = drm_fence_wait(f, to);
-		drm_fence_put(f);
-		if (rc == 0 && (a->wait_options & DRM_VMW_WAIT_OPTION_UNREF))
-			drm_fence_handle_delete(fp, a->handle);
-		return rc;
-	}
-	case DRM_VMW_FENCE_SIGNALED: {
-		struct drm_vmw_fence_signaled_arg *a = kb;
-		struct drm_fence *f = drm_fence_handle_lookup(fp, a->handle);
-		if (!f)
-			return -EINVAL;
-		vmw_fence_check(v);
-		a->signaled = f->signaled;
-		a->signaled_flags = f->signaled ? f->flags : 0;
-		a->passed_seqno = dev->fence_passed;
-		drm_fence_put(f);
-		return 0;
-	}
-	case DRM_VMW_FENCE_UNREF: {
-		struct drm_vmw_fence_arg *a = kb;
-		return drm_fence_handle_delete(fp, a->handle);
-	}
-	case DRM_VMW_GET_3D_CAP: {
-		struct drm_vmw_get_3d_cap_arg *a = kb;
-		if (!v->has_3d)
-			return -ENODEV;
-		if (v->has_gb) {
-			uint32_t bytes = (SVGA3D_DEVCAP_MAX + 1) * 4;
-			if (bytes > a->max_size)
-				bytes = a->max_size;
-			if (!validate_user_ptr(a->buffer, bytes) ||
-			    copy_to_user((void *)(uintptr_t)a->buffer, v->devcaps, bytes) != 0)
-				return -EFAULT;
-			return 0;
-		}
-		uint32_t n = SVGA_FIFO_3D_CAPS_LAST - SVGA_FIFO_3D_CAPS + 1;
-		uint32_t bytes = n * 4;
-		if (bytes > a->max_size)
-			bytes = a->max_size;
-		if (!validate_user_ptr(a->buffer, bytes))
-			return -EFAULT;
-		for (uint32_t i = 0; i < bytes / 4; i++) {
-			uint32_t w = vmsvga2_hw_fifo_reg(SVGA_FIFO_3D_CAPS + i);
-			if (copy_to_user((void *)(uintptr_t)(a->buffer + i * 4), &w, 4) != 0)
-				return -EFAULT;
-		}
-		return 0;
-	}
-	/* The legacy surface pair: what a host without guest-backed objects
-	 * offers, and the only 3D path there. */
-	case DRM_VMW_CREATE_SURFACE:
-		return vmw_ioctl_create_surface(v, fp, kb);
-	case DRM_VMW_REF_SURFACE:
-		return vmw_ioctl_ref_surface(v, fp, kb);
-	case DRM_VMW_GB_SURFACE_CREATE:
-		if (!v->has_gb)
-			return -ENODEV;
-		return vmw_ioctl_gb_surface_create(v, fp, kb, 0);
-	case DRM_VMW_GB_SURFACE_CREATE_EXT:
-		if (!v->has_gb)
-			return -ENODEV;
-		return vmw_ioctl_gb_surface_create(v, fp, kb, 1);
-	case DRM_VMW_GB_SURFACE_REF:
-		if (!v->has_gb)
-			return -ENODEV;
-		return vmw_ioctl_gb_surface_ref(v, fp, kb, 0);
-	case DRM_VMW_GB_SURFACE_REF_EXT:
-		if (!v->has_gb)
-			return -ENODEV;
-		return vmw_ioctl_gb_surface_ref(v, fp, kb, 1);
-	case DRM_VMW_UNREF_SURFACE:
-		return vmw_ioctl_unref_surface(v, fp, kb);
-	case DRM_VMW_CREATE_CONTEXT: {
-		struct drm_vmw_context_arg *a = kb;
-		if (!v->has_3d)
-			return -ENODEV;
-		return vmw_ioctl_create_context(v, fp, 0, &a->cid);
-	}
-	case DRM_VMW_CREATE_EXTENDED_CONTEXT: {
-		union drm_vmw_extended_context_arg *a = kb;
-		int dx = a->req == drm_vmw_context_dx;
-		if (!v->has_3d || (dx && !v->has_dx))
-			return -ENODEV;
-		return vmw_ioctl_create_context(v, fp, dx, &a->rep.cid);
-	}
-	case DRM_VMW_UNREF_CONTEXT: {
-		struct drm_vmw_context_arg *a = kb;
-		return vmw_ioctl_unref_context(v, fp, (uint32_t)a->cid);
-	}
-	case DRM_VMW_CREATE_SHADER:
-		return vmw_ioctl_create_shader(v, fp, kb);
-	case DRM_VMW_UNREF_SHADER: {
-		struct drm_vmw_shader_arg *a = kb;
-		return vmw_ioctl_unref_shader(v, fp, a->handle);
-	}
-	case DRM_VMW_EXECBUF: {
-		struct drm_vmw_execbuf_arg arg;
-		mm_memset(&arg, 0, sizeof(arg));
-		/* Version 1 callers pass 24 bytes: no context, no fence fd. */
-		mm_memcpy(&arg, kb, size < sizeof(arg) ? size : sizeof(arg));
-		if (size < sizeof(arg)) {
-			arg.context_handle = SVGA3D_INVALID_ID;
-			arg.imported_fence_fd = -1;
-			arg.flags = 0;
-		}
-		return vmw_execbuf(v, fp, &arg);
-	}
-	case DRM_VMW_FENCE_EVENT:
-		return vmw_ioctl_fence_event(v, fp, kb);
-	case DRM_VMW_UPDATE_LAYOUT:
-		return vmw_ioctl_update_layout(v, kb);
-	case DRM_VMW_MSG:
-		return vmw_ioctl_msg(v, kb);
-	/* the video overlay streams: the display's owner only */
-	case DRM_VMW_CONTROL_STREAM:
-		if (size < sizeof(struct drm_vmw_control_stream_arg))
-			return -EINVAL;
-		return vmw_ioctl_control_stream(v, fp, kb);
-	case DRM_VMW_CLAIM_STREAM:
-		return vmw_ioctl_claim_stream(v, fp, kb);
-	case DRM_VMW_UNREF_STREAM:
-		return vmw_ioctl_unref_stream(v, fp, kb);
-	default:
-		return v->has_3d ? -ENOSYS : -ENODEV;
-	}
-}
-
 /* ---- probe ---------------------------------------------------------- */
+
+/* The hooks of the per-call display interface; vmw_driver_table() derives
+ * the table that is registered from it. */
+/* The core's reaper tick: pages held for the device go back once it has
+ * caught up (vmw_cmdbuf_idle_reclaim()). */
+static void vmw_drm_idle_reclaim(struct drm_device *dev)
+{
+	vmw_cmdbuf_idle_reclaim(dev->priv);
+}
 
 static const struct drm_driver vmw_driver = {
 	.name = "vmwgfx",
@@ -1345,12 +200,18 @@ static const struct drm_driver vmw_driver = {
 	 * GB_SURFACE_REF on the client's own file), so a handle must name one
 	 * object device-wide.  See struct drm_driver. */
 	.global_handles = 1,
+	.open = vmw_driver_open,
 	.postclose = vmw_postclose,
+#if VMW_PM
+	.suspend = vmw_pm_suspend,
+	.resume = vmw_pm_resume,
+#endif
 	.master_set = vmw_master_set,
 	.master_drop = vmw_master_drop,
 	.gem_init = vmw_gem_init,
 	.gem_free = vmw_gem_free,
 	.fence_poll = vmw_drm_fence_poll,
+	.idle_reclaim = vmw_drm_idle_reclaim,
 	.gem_release_pages = vmw_gem_release_pages,
 	.gem_page_phys = vmw_gem_page_phys,
 	.gem_mmap_pte_extra = 0,
@@ -1367,6 +228,45 @@ static const struct drm_driver vmw_driver = {
 	.ioctl = vmw_ioctl,
 	.render_allowed = vmw_render_allowed,
 };
+
+/* The table registered with the display-manager core.
+ *
+ * With VMW_ATOMIC (vmw_kms.h) the display is driven through atomic
+ * requests: the core checks a request, vmw_atomic_check() checks it against
+ * the display units, vmw_atomic_commit() carries it out, and the per-call
+ * hooks are not used -- the core turns the per-call ioctls into requests.
+ * The features are what an atomic SVGA driver offers: the generic plane
+ * check, damage clips on the planes, in- and out-fences and the cursor
+ * hotspot; no blending, colour management or variable refresh.  The
+ * connectors probe through the core's probe helper either way
+ * (vmw_connector_driver_setup()).  Without VMW_ATOMIC the per-call table is
+ * registered as it is. */
+static struct drm_driver vmw_registered_driver;
+
+static const struct drm_driver *vmw_driver_table(void)
+{
+	struct drm_driver *d = &vmw_registered_driver;
+
+	*d = vmw_driver;
+#if VMW_ATOMIC
+	d->atomic_check = vmw_atomic_check;
+	d->atomic_commit = vmw_atomic_commit;
+	d->cursor_obj_check = vmw_cursor_obj_check;
+	d->features |= DRM_FEATURE_ATOMIC_PLANE_CHECK | DRM_FEATURE_DAMAGE_CLIPS |
+		       DRM_FEATURE_ATOMIC_FENCES | DRM_FEATURE_CURSOR_HOTSPOT;
+	d->gamma_size = 0;
+	d->degamma_size = 0;
+	d->color_has_ctm = 0;
+	d->mode_set = NULL;
+	d->crtc_disable = NULL;
+	d->page_flip = NULL;
+	d->cursor_set = NULL;
+	d->cursor_move = NULL;
+	d->dpms = NULL;
+#endif
+	vmw_connector_driver_setup(d);
+	return d;
+}
 
 /* Does the host offer 3D?
  *
@@ -1406,6 +306,86 @@ static int vmw_probe_3d(const struct vmw_device *v)
 	    vmsvga2_hw_has_fifo_reg(SVGA_FIFO_3D_HWVERSION_REVISED))
 		return vmsvga2_hw_fifo_reg(SVGA_FIFO_3D_HWVERSION_REVISED) != 0;
 	return vmsvga2_hw_fifo_reg(SVGA_FIFO_3D_HWVERSION) != 0;
+}
+
+/* ---- memory limits, driver identity, shader model ------------------------ */
+
+/* What the device lets the driver use beyond the guest-backed pool (that
+ * one is read with the capability table, below):
+ *   - max_primary_mem: how large a primary surface may be.  A device with
+ *     guest-backed objects states it in SVGA_REG_MAX_PRIMARY_MEM; anything
+ *     older shows its primary from VRAM, which bounds it.  A guest-backed
+ *     device that answers 0 is left at 0 ("does not say"); the scan-out
+ *     limits and DRM_VMW_PARAM_MAX_FB_SIZE fall back to VRAM themselves.
+ *   - memory_size: the surface memory a client without guest-backed
+ *     objects may use -- what SVGA_REG_MEMORY_SIZE counts beyond VRAM on
+ *     a device with second-generation regions, and an arbitrary 512 MB on
+ *     one without (every 3D-capable device has them anyway) or where that
+ *     register leaves nothing. */
+static void vmw_memory_limits(struct vmw_device *v)
+{
+	if (v->hw.caps & SVGA_CAP_GMR2) {
+		uint64_t mem = vmsvga2_hw_read_reg(SVGA_REG_MEMORY_SIZE);
+
+		/* A host answering no more than VRAM leaves nothing rather
+		 * than wrapping -- and nothing is not an answer a client can
+		 * budget against (the GL stack would flush after every
+		 * surface), so it gets the fixed size instead. */
+		v->memory_size = mem > v->hw.vram_size ? mem - v->hw.vram_size :
+							 0;
+	}
+	if (!v->memory_size)
+		v->memory_size = 512ULL * 1024 * 1024;
+	if (v->hw.caps & SVGA_CAP_GBOBJECTS)
+		v->max_primary_mem = vmsvga2_hw_read_reg(SVGA_REG_MAX_PRIMARY_MEM);
+	else
+		v->max_primary_mem = v->hw.vram_size;
+}
+
+/* Which guest driver the host is talking to, for the host's own logs and
+ * for any behaviour it keys on the driver: the registers exist on devices
+ * with CAP2_DX2.  The id is written first, then the three version words,
+ * and SUBMIT latches them.
+ *
+ * The id says "unknown": the defined ids name other drivers, and a host
+ * that keys behaviour on one of them would apply it to this driver, with
+ * version numbers that mean nothing in that driver's history.  Version 2 is
+ * this driver's own version (as DRM_IOCTL_VERSION reports it); there is no
+ * kernel version to put in version 1. */
+#define VMW_GUEST_DRIVER_ID SVGA_REG_GUEST_DRIVER_ID_UNKNOWN
+
+void vmw_write_driver_id(const struct vmw_device *v,
+				const struct drm_driver *drv)
+{
+	if (!(v->cap2 & SVGA_CAP2_DX2))
+		return;
+	vmsvga2_hw_write_reg(SVGA_REG_GUEST_DRIVER_ID, VMW_GUEST_DRIVER_ID);
+	vmsvga2_hw_write_reg(SVGA_REG_GUEST_DRIVER_VERSION1, 0);
+	vmsvga2_hw_write_reg(SVGA_REG_GUEST_DRIVER_VERSION2,
+			     (uint32_t)drv->major << 24 |
+			     (uint32_t)drv->minor << 16 |
+			     (uint32_t)drv->patch);
+	vmsvga2_hw_write_reg(SVGA_REG_GUEST_DRIVER_VERSION3, 0);
+	vmsvga2_hw_write_reg(SVGA_REG_GUEST_DRIVER_ID,
+			     SVGA_REG_GUEST_DRIVER_ID_SUBMIT);
+}
+
+/* The device's capability bits are logged by the hardware layer at probe;
+ * what is this driver's own conclusion is the shader model it offers. */
+static void vmw_print_sm_type(const struct vmw_device *v)
+{
+	static const char *const names[] = {
+		[VMW_SM_LEGACY] = "Legacy",
+		[VMW_SM_4] = "SM4",
+		[VMW_SM_4_1] = "SM4_1",
+		[VMW_SM_5] = "SM_5",
+		[VMW_SM_5_1X] = "SM_5_1X",
+		[VMW_SM_MAX] = "Invalid"
+	};
+
+	BUILD_BUG_ON(ARRAY_SIZE(names) != (VMW_SM_MAX + 1));
+	kprintf("[drm] vmwgfx: available shader model: %s\n",
+		names[vmw_sm_type(v)]);
 }
 
 /* ---- scan-out limits ---------------------------------------------------- */
@@ -1477,10 +457,10 @@ static void vmw_scanout_limits(struct vmw_device *v)
 		uint32_t reg;
 
 		/* A screen target reads guest memory only; the memory that
-		 * bounds it is the primary-surface memory the device states. */
-		reg = vmsvga2_hw_read_reg(SVGA_REG_MAX_PRIMARY_MEM);
-		if ((uint64_t)reg > mem)
-			mem = reg;
+		 * bounds it is the primary-surface memory the device states
+		 * (vmw_device.max_primary_mem, read at init). */
+		if (v->max_primary_mem > mem)
+			mem = v->max_primary_mem;
 		reg = v->devcaps[SVGA3D_DEVCAP_MAX_TEXTURE_WIDTH];
 		if (reg > w)
 			w = reg;
@@ -1500,12 +480,11 @@ static void vmw_scanout_limits(struct vmw_device *v)
 
 		/* A screen object's image is in guest memory, but its backing
 		 * store is in the aperture (vmw_define_screen()), so the
-		 * memory bound stays the aperture's -- the reference driver
-		 * bounds its screen-object modes by VRAM too.  The geometry
-		 * bound does not: MAX_WIDTH/MAX_HEIGHT are the device's
-		 * statement about scanning the aperture out directly, and a
-		 * screen object is not that; the reference driver allows
-		 * 8192 either way and lets the memory decide.  On 4 MB that
+		 * memory bound stays the aperture's: screen-object modes are
+		 * bounded by VRAM.  The geometry bound does not: MAX_WIDTH/
+		 * MAX_HEIGHT are the device's statement about scanning the
+		 * aperture out directly, and a screen object is not that; it
+		 * is allowed 8192 either way and the memory decides.  On 4 MB that
 		 * is the difference between 1152x864 and 1280x800. */
 		w = VMW_SCANOUT_MAX_DIM;
 		h = VMW_SCANOUT_MAX_DIM;
@@ -1562,7 +541,9 @@ void vmwgfx_init(void)
 	v->has_screen_object = v->has_gmr &&
 			       vmsvga2_hw_has_fifo_cap(SVGA_FIFO_CAP_SCREEN_OBJECT_2);
 	v->has_3d = vmw_probe_3d(v);
-	hrtimer_init(&v->fence_poll, vmw_fence_poll_fire, v);
+	vmw_fence_manager_init(v);
+	mm_rwsem_init(&v->binding_lock, "vmw_binding");
+	vmw_cmd_reserve_init(v);
 
 	/* Guest-backed objects and the DX (VGPU10) command set. */
 	v->has_gb = v->has_3d && (v->hw.caps & SVGA_CAP_GBOBJECTS) != 0;
@@ -1570,11 +551,9 @@ void vmwgfx_init(void)
 	v->has_dx = v->has_gb && v->has_cmdbuf && (v->hw.caps & SVGA_CAP_DX) != 0;
 	if (v->hw.caps & SVGA_CAP_CAP2_REGISTER)
 		v->cap2 = vmsvga2_hw_read_reg(SVGA_REG_CAP2);
+	vmw_memory_limits(v);
 	if (v->has_gb) {
-		for (uint32_t i = 0; i <= SVGA3D_DEVCAP_MAX; i++) {
-			vmsvga2_hw_write_reg(SVGA_REG_DEV_CAP, i);
-			v->devcaps[i] = vmsvga2_hw_read_reg(SVGA_REG_DEV_CAP);
-		}
+		vmw_devcaps_create(v);
 		/* Which register carries the guest-backed memory pool is
 		 * decided by a capability, not by trying one and seeing
 		 * whether it answers: on a device without CAP2_GB_MEMSIZE_2
@@ -1642,7 +621,7 @@ void vmwgfx_init(void)
 					     "the framebuffer aperture",
 		v->scanout_max_width, v->scanout_max_height,
 		(uint32_t)(v->scanout_max_mem / 1024));
-	if (drm_dev_register(&v->drm, &vmw_driver, vmsvga2_hw_pci(), v) != 0)
+	if (drm_dev_register(&v->drm, vmw_driver_table(), vmsvga2_hw_pci(), v) != 0)
 		return;
 
 	/* Guest-backed objects come AFTER the device is registered: the object
@@ -1673,6 +652,14 @@ void vmwgfx_init(void)
 		v->has_sm5 = 0;
 		v->has_gl43 = 0;
 	}
+	/* The cursor state (MOB cursors where the device has them); a
+	 * failure leaves the register/FIFO cursor working. */
+	(void)vmw_cursor_init(v);
+	/* The device is up: say what it runs, introduce the driver in the
+	 * host's log and tell the device which driver it is talking to. */
+	vmw_print_sm_type(v);
+	vmw_msg_init(v);
+	vmw_write_driver_id(v, v->drm.drv);
 
 	/* One virtual connector.  The mode list is the standard set bounded by
 	 * what this device can actually scan out, largest first, and the
@@ -1698,10 +685,8 @@ void vmwgfx_init(void)
 			ph = vmw_builtin_modes[i][1];
 		}
 	}
-	if (!pw) {
-		pw = v->hw.width;
-		ph = v->hw.height;
-	}
+	if (!pw)
+		vmw_kms_initial_size(v, &pw, &ph);
 	/* A size in millimetres at 96 dpi for the preferred mode. */
 	uint32_t mm_w = pw * 254 / 960, mm_h = ph * 254 / 960;
 	int c = drm_connector_add(&v->drm, DRM_MODE_CONNECTOR_VIRTUAL, mm_w, mm_h);
@@ -1728,6 +713,12 @@ void vmwgfx_init(void)
 			drm_connector_add_mode(&v->drm, c, &m);
 		}
 	}
+	/* The display units: their initial state and, with more than one
+	 * head, the connectors of the further units. */
+	vmw_kms_init_display(v);
+	/* The connectors' probe hooks and their properties; before the console
+	 * takes the display, whose mode set changes what the device reports. */
+	vmw_connector_init_all(v);
 	mm_rwsem_init(&v->execbuf_lock, "vmw_execbuf");
 	vmsvga2_hw_set_irq_callback(vmw_irq_cb);
 

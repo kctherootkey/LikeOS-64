@@ -7,12 +7,16 @@
 // creation parameters travel with it: GB_SURFACE_REF returns them).
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Broadcom's code: GPL-2.0 OR MIT
+// Portions Copyright (c) 2009-2025 Broadcom. All Rights Reserved. The term
+// “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/rwsem.h>
 #include <kernel/io/console.h>
 
 /* ---- size of a surface, as the device serialises it ------------------ */
@@ -71,8 +75,8 @@ uint32_t vmw_surface_size(uint32_t format, const SVGA3dSize *size,
 	uint64_t total = 0;
 	/* A cubemap carries no array size and six faces.  Counting it as one
 	 * layer sized the backing buffer at a sixth of what the surface needs,
-	 * while the dirty tracker's layout -- which applies the same rule the
-	 * reference does -- addressed all six.  The device, told the surface
+	 * while the dirty tracker's layout -- which applies the cubemap rule
+	 * correctly -- addressed all six.  The device, told the surface
 	 * is a cubemap, reads the same six.  See vmw_surface_dirty_alloc(). */
 	uint32_t layers = array_size ? array_size :
 			  ((flags & SVGA3D_SURFACE_CUBEMAP) ?
@@ -119,6 +123,38 @@ void vmw_surface_free_id(struct vmw_device *v, uint32_t sid)
 	spin_lock_irqsave(&v->id_lock, &fl);
 	vmw_id_free(v->surface_ids, sid);
 	spin_unlock_irqrestore(&v->id_lock, fl);
+}
+
+/* ---- the device-object base -------------------------------------------- */
+
+static const struct vmw_res_func vmw_gb_surface_func = {
+	.res_type = vmw_res_surface,
+	.needs_guest_memory = true,
+	.type_name = "guest backed surfaces",
+};
+
+static const struct vmw_res_func vmw_legacy_surface_func = {
+	.res_type = vmw_res_surface,
+	.needs_guest_memory = false,
+	.type_name = "legacy surfaces",
+};
+
+/* The last reference is gone: the device object went in
+ * vmw_surface_destroy(), so only the memory is left. */
+static void vmw_surface_res_free(struct vmw_resource *res)
+{
+	struct vmw_surface *s = vmw_res_to_srf(res);
+
+	kfree(s->snooper.image);
+	kfree(s);
+}
+
+void vmw_surface_res_init(struct vmw_device *v, struct vmw_surface *s)
+{
+	vmw_resource_init(v, &s->res, (int)s->sid, vmw_surface_res_free,
+			  s->legacy ? &vmw_legacy_surface_func :
+				      &vmw_gb_surface_func);
+	INIT_LIST_HEAD(&s->view_list);
 }
 
 /* ---- device commands ----------------------------------------------------- */
@@ -227,8 +263,42 @@ int vmw_surface_bind(struct vmw_device *v, struct vmw_surface *s)
 	return 0;
 }
 
+/* Everything that names this surface goes before the surface does.
+ *
+ * The device refuses DESTROY_GB_SURFACE while a DX view still points at
+ * the surface.  A refused command halts the command-buffer context; error
+ * recovery then skips it, the id is handed back here regardless, and the
+ * next surface created inherits an id the device still considers in use --
+ * so one forgotten view turned into a cascade of rejected defines.  Every
+ * view of the surface is therefore destroyed first, each in its own DX
+ * context (the device knows views per context), and the surface is
+ * unbound from every context that binds it directly (vertex, index,
+ * constant buffers, stream-output targets, legacy render targets and
+ * textures).  The binding records are dropped as well, not merely
+ * scrubbed: the id is about to be reused, and a record re-emitted later
+ * would bind the surface that inherits it.
+ *
+ * All of it is queued on command-buffer context 0 ahead of the surface
+ * destroy, which keeps the order.  binding_lock is held only for the
+ * walk: nothing in here drops a buffer reference.  With VMW_TRACK_VIEWS 0
+ * the records are dropped without any command (see vmw_so.h). */
+static void vmw_surface_scrub_users(struct vmw_device *v, struct vmw_surface *s)
+{
+	mm_write_lock(&v->binding_lock);
+	vmw_view_surface_list_destroy(v, &s->view_list);
+#if VMW_TRACK_VIEWS
+	vmw_binding_res_list_kill(&s->res.binding_head);
+#else
+	vmw_binding_res_list_forget(&s->res.binding_head);
+#endif
+	mm_write_unlock(&v->binding_lock);
+}
+
 void vmw_surface_destroy(struct vmw_device *v, struct vmw_surface *s)
 {
+	/* Before the destroy -- and also for a surface that never reached
+	 * the device, whose records must not outlive it either. */
+	vmw_surface_scrub_users(v, s);
 	if (s->defined) {
 		/* Guest-backed and legacy surfaces are torn down by different
 		 * commands; the bodies are the same single id. */
@@ -270,11 +340,17 @@ void vmw_surface_destroy(struct vmw_device *v, struct vmw_surface *s)
 		 * simply stops changing.  X and glamor recycle pixmap
 		 * surfaces constantly, so this happens within moments of the
 		 * first frame. */
-		if (v->st_bound_sid == s->sid)
-			v->st_bound_sid = SVGA3D_INVALID_ID;
+		vmw_stdu_forget_sid(v, s->sid);
 		vmw_surface_free_id(v, s->sid);
 	}
-	kfree(s);
+	/* The device has no such surface any more; anything still holding
+	 * the object (a view) must not name the id again. */
+	s->res.id = -1;
+	/* The surface object's reference.  Normally the last one, and the
+	 * memory goes with it (vmw_surface_res_free()). */
+	struct vmw_resource *res = &s->res;
+
+	vmw_resource_unreference(&res);
 }
 
 /* A surface's drm object: kind SURFACE, priv = vmw_surface.  Its pages
@@ -400,6 +476,7 @@ static int surface_create_common(struct vmw_device *v, struct drm_file *fp,
 	 * reads data the device never received and renders nothing --
 	 * silently.  vmw_execbuf() carries the sync (see there). */
 	s->coherent = (b->drm_surface_flags & drm_vmw_surface_flag_coherent) != 0;
+	vmw_surface_res_init(v, s);
 
 	/* Backup buffer: the caller's, or a new one. */
 	if (b->buffer_handle != SVGA3D_INVALID_ID) {
@@ -740,6 +817,18 @@ long vmw_ioctl_create_surface(struct vmw_device *v, struct drm_file *fp, void *k
 	s->backup = NULL;
 	s->backup_size = 0;
 	s->legacy = 1;
+	vmw_surface_res_init(v, s);
+	/* A legacy cursor surface keeps a guest copy of its image, filled
+	 * from the SURFACE_DMAs into it (vmw_cursor.c); every other surface
+	 * gets none and this returns 0.  The error paths below free that
+	 * image along with `s'. */
+	rc = vmw_cursor_snooper_create(fp, s);
+	if (rc) {
+		vmw_surface_free_id(v, s->sid);
+		kfree(s->snooper.image);
+		kfree(s);
+		return rc;
+	}
 
 	/* DEFINE_SURFACE carries the face table and then one SVGA3dSize per
 	 * mip level, in the same order the caller flattened them. */
@@ -747,6 +836,7 @@ long vmw_ioctl_create_surface(struct vmw_device *v, struct drm_file *fp, void *k
 	uint8_t *cmd = kalloc(body);
 	if (!cmd) {
 		vmw_surface_free_id(v, s->sid);
+		kfree(s->snooper.image);
 		kfree(s);
 		return -ENOMEM;
 	}
@@ -767,6 +857,7 @@ long vmw_ioctl_create_surface(struct vmw_device *v, struct drm_file *fp, void *k
 	kfree(cmd);
 	if (rc) {
 		vmw_surface_free_id(v, s->sid);
+		kfree(s->snooper.image);
 		kfree(s);
 		return rc;
 	}

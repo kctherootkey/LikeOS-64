@@ -120,6 +120,9 @@ struct i915_device {
 	uint8_t *ggtt_map;
 	uint32_t ggtt_map_pages;
 	uint32_t ggtt_map_first; /* the first page the map may hand out */
+	/* the first page a binding behind the CPU aperture may take: past
+	 * the firmware's framebuffer only (see ggtt_map_init()) */
+	uint32_t ggtt_mappable_first;
 	uint64_t gtt_size; /* bytes of entries */
 	uint64_t ggtt_bytes; /* address space the GTT covers */
 	uint64_t stolen_base, stolen_size; /* data stolen memory (DSM) */
@@ -316,6 +319,8 @@ int i915_vm_vma_alloc(struct i915_vm *vm, struct i915_vma *v, uint32_t npages,
  * enhancement, compute. */
 #define I915_ENGINE_CLASSES 5
 
+struct i915_ggtt_view;
+
 /* Per-object driver state (drm_gem_object.priv): where the object sits in
  * the GGTT (scanout, rings, context images) and in the address spaces
  * that have it bound; what the client said about it. */
@@ -353,6 +358,9 @@ struct i915_bo {
 	uint32_t gtt_map_ggtt;
 	int fence_id; /* -1 = none */
 	int pat_set; /* the client named a page attribute table entry (pat_index) */
+	/* Rotated views of the object made for 90/270-degree scanout
+	 * (i915_ggtt_view.c), unbound with the object. */
+	struct i915_ggtt_view *views;
 };
 
 /* Per-file driver state (drm_file.priv): the contexts and address

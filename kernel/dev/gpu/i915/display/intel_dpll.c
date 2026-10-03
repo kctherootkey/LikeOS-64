@@ -471,13 +471,24 @@ uint32_t intel_dpll_ddi_buf_ctl_bits(struct i915_device *i915, const struct inte
 
 /* ---- HDMI: what the PLLs and PHYs can carry -------------------------------------- */
 
+/* The source's TMDS ceiling by generation: HDMI 2.0 rates (594 MHz, and
+ * the 600 MHz of HDMI 2.0's top character rate from display version 13
+ * and on Alder Lake-S) from version 10 on -- Gemini Lake included,
+ * Broxton not --, 300 MHz from Haswell to Skylake.  A board can lower it
+ * per port (the VBT's HDMI data rate, intel_hdmi_source_max_tmds_khz()). */
 uint32_t intel_dpll_hdmi_max_tmds_khz(struct i915_device *i915)
 {
-	if (i915->info->display_ver >= 13 || i915->info->platform == I915_PLATFORM_ALDERLAKE_S)
+	int ver = i915->info->display_ver;
+
+	if (ver >= 13 || i915->info->platform == I915_PLATFORM_ALDERLAKE_S)
 		return 600000;
-	if (i915->info->display_ver >= 10)
+	if (ver >= 10)
 		return 594000;
-	return 300000; /* Haswell to Skylake and Broxton */
+	if (ver >= 8 || i915->info->platform == I915_PLATFORM_HASWELL)
+		return 300000; /* Haswell to Skylake and Broxton */
+	if (ver >= 5)
+		return 225000;
+	return 165000;
 }
 
 int intel_dpll_hdmi_clock_valid(struct i915_device *i915, const struct intel_output *o,
@@ -493,9 +504,11 @@ int intel_dpll_hdmi_clock_valid(struct i915_device *i915, const struct intel_out
 	if ((platform == I915_PLATFORM_GEMINILAKE || platform == I915_PLATFORM_BROXTON) &&
 	    clock_khz > 223333 && clock_khz < 240000)
 		return -ERANGE;
+	/* the combo PHYs' PLLs (Ice Lake to Alder Lake), and the Type-C
+	 * PHYs' from Ice Lake on (Meteor Lake's included) */
 	if (is_icl_tgl(i915) && o && !o->is_tc && clock_khz > 500000 && clock_khz < 533200)
 		return -ERANGE;
-	if (is_icl_tgl(i915) && o && o->is_tc && clock_khz > 500000 && clock_khz < 532800)
+	if (o && o->is_tc && clock_khz > 500000 && clock_khz < 532800)
 		return -ERANGE;
 	/* and the divider search has to come up with something */
 	switch (i915->display.model) {
@@ -514,6 +527,11 @@ int intel_dpll_hdmi_clock_valid(struct i915_device *i915, const struct intel_out
 			return intel_tc_pll_clock_ok(i915, clock_khz, 0) ? 0 : -ERANGE;
 		return icl_combo_hdmi_params(clock_khz, skl_ref_khz(i915), &p) ? -ERANGE : 0;
 	}
+	/* the port PHYs' own PLLs: asked without taking them */
+	case INTEL_DISPLAY_MTL:
+		return mtl_phy_hdmi_clock_ok(i915, o, clock_khz) ? 0 : -ERANGE;
+	case INTEL_DISPLAY_DG2:
+		return dg2_phy_hdmi_clock_ok(i915, o, clock_khz) ? 0 : -ERANGE;
 	default:
 		return 0;
 	}

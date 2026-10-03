@@ -18,8 +18,9 @@
 // Meteor Point's pins and bus numbering.
 //
 // Copyright (C) 2026 The LikeOS Project
-// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// SPDX-License-Identifier for the portions derived from Intel's and Dave Airlie's code: MIT
 // Portions Copyright (C) 2006-2025 Intel Corporation
+// Portions Copyright (c) 2006 Dave Airlie <airlied@linux.ie>
 
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>

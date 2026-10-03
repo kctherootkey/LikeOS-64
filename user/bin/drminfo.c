@@ -124,7 +124,6 @@ static const struct name_map caps[] = {
 static const struct name_map vmw_params[] = {
 	{ DRM_VMW_PARAM_NUM_STREAMS, "NUM_STREAMS" },
 	{ DRM_VMW_PARAM_NUM_FREE_STREAMS, "NUM_FREE_STREAMS" },
-	{ DRM_VMW_PARAM_NUM_FREE_STREAMS, "NUM_FREE_STREAMS" },
 	{ DRM_VMW_PARAM_3D, "3D" },
 	{ DRM_VMW_PARAM_HW_CAPS, "HW_CAPS" },
 	{ DRM_VMW_PARAM_FIFO_CAPS, "FIFO_CAPS" },
@@ -326,6 +325,17 @@ static void print_planes(int fd)
 	unsigned int *ids;
 	unsigned int i;
 
+	/* Every plane, the primary and cursor planes included: without this a
+	 * client is shown only the overlay planes, and a driver with none
+	 * would read as having no planes at all. */
+	{
+		struct drm_set_client_cap cap = {
+			.capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+			.value = 1,
+		};
+
+		(void)drm_ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap);
+	}
 	memset(&r, 0, sizeof(r));
 	if (drm_ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &r) == -1)
 		return;

@@ -5,7 +5,18 @@
 // the driver grows as userspace's ids climb.  Legacy GB contexts and
 // shaders exist for hosts without DX.
 //
+// A guest-backed context also carries what its command streams created
+// and bound: a binding tracker (vmw_binding.c) and a command-buffer
+// resource manager holding its views (vmw_cmdbuf_res.c, vmw_so.c).  Both
+// are torn down, and the device told, before the context itself is
+// destroyed: a view or binding that outlived its context would be named
+// later in a command for a context id the device no longer has -- or that
+// by then belongs to another process's context.
+//
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from VMware's code: GPL-2.0 OR MIT
+// Portions Copyright 2009-2023 VMware, Inc., Palo Alto, CA., USA
+// Portions Copyright 2014-2023 VMware, Inc., Palo Alto, CA., USA
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
@@ -28,6 +39,123 @@ static const uint32_t cotable_entry_size[SVGA_COTABLE_MAX] = {
 	[SVGA_COTABLE_DXSHADER] = sizeof(SVGACOTableDXShaderEntry),
 	[SVGA_COTABLE_UAVIEW] = sizeof(SVGACOTableDXUAViewEntry),
 };
+
+/* ---- the device-object base -------------------------------------------- */
+
+static const struct vmw_res_func vmw_legacy_context_func = {
+	.res_type = vmw_res_context,
+	.needs_guest_memory = false,
+	.type_name = "legacy contexts",
+};
+
+static const struct vmw_res_func vmw_gb_context_func = {
+	.res_type = vmw_res_context,
+	.needs_guest_memory = true,
+	.type_name = "guest backed contexts",
+};
+
+static const struct vmw_res_func vmw_dx_context_func = {
+	.res_type = vmw_res_dx_context,
+	.needs_guest_memory = true,
+	.type_name = "dx contexts",
+};
+
+/* The last reference is gone: the device object went in
+ * vmw_context_destroy(), so only the memory is left -- and the binding
+ * tracker, which is freed here rather than at destroy because a binding
+ * record reaches its context's tracker through the context
+ * (vmw_context_binding_state()); the destroy killed every record, so
+ * nothing links into it any more. */
+static void vmw_context_res_free(struct vmw_resource *res)
+{
+	struct vmw_context *c = vmw_res_to_ctx(res);
+
+	if (c->cbs)
+		vmw_binding_state_free(c->cbs);
+	c->cbs = NULL;
+	(void)vmw_context_bind_dx_query(res, NULL);
+	kfree(c);
+}
+
+struct list_head *vmw_context_binding_list(struct vmw_resource *ctx)
+{
+	struct vmw_context *c = vmw_res_to_ctx(ctx);
+
+	return c->cbs ? vmw_binding_state_list(c->cbs) : NULL;
+}
+
+struct vmw_cmdbuf_res_manager *vmw_context_res_man(struct vmw_resource *ctx)
+{
+	return vmw_res_to_ctx(ctx)->man;
+}
+
+struct vmw_ctx_binding_state *vmw_context_binding_state(struct vmw_resource *ctx)
+{
+	return vmw_res_to_ctx(ctx)->cbs;
+}
+
+struct list_head *vmw_context_cotable_list(struct vmw_resource *ctx,
+					   SVGACOTableType cotable_type)
+{
+	struct vmw_context *c = vmw_res_to_ctx(ctx);
+
+	if ((unsigned)cotable_type >= SVGA_COTABLE_MAX)
+		return NULL;
+	return &c->cot[cotable_type].resource_list;
+}
+
+/**
+ * vmw_context_bind_dx_query -
+ * Sets query MOB for the context.  If @mob is NULL, then this function will
+ * remove the association between the MOB and the context.  Called under
+ * execbuf_lock (or with the context unreachable by any submitter); never
+ * under binding_lock, since forgetting the MOB drops a buffer reference.
+ *
+ * @ctx_res: The context resource
+ * @mob: the query MOB; the context takes its own reference.
+ *
+ * Returns -EINVAL if a MOB has already been set and does not match the one
+ * specified in the parameter.  0 otherwise.
+ *
+ * Only the association is kept: every buffer of this driver stays resident
+ * with its MOB, so the context's queries never have to be read back and
+ * re-bound to a moved buffer.  See also "No query MOB here" in
+ * vmw_context_create().
+ */
+int vmw_context_bind_dx_query(struct vmw_resource *ctx_res,
+			      struct drm_gem_object *mob)
+{
+	struct vmw_context *c = vmw_res_to_ctx(ctx_res);
+
+	if (mob == NULL) {
+		if (c->dx_query_mob) {
+			struct drm_gem_object *old = c->dx_query_mob;
+
+			c->dx_query_mob = NULL;
+			drm_gem_put(old);
+		}
+
+		return 0;
+	}
+
+	/* Can only have one MOB per context for queries */
+	if (c->dx_query_mob && c->dx_query_mob != mob)
+		return -EINVAL;
+
+	if (!c->dx_query_mob) {
+		drm_gem_get(mob);
+		c->dx_query_mob = mob;
+	}
+
+	return 0;
+}
+
+struct drm_gem_object *vmw_context_get_dx_query_mob(struct vmw_resource *ctx_res)
+{
+	return vmw_res_to_ctx(ctx_res)->dx_query_mob;
+}
+
+/* ---- device objects ---------------------------------------------------- */
 
 static struct drm_gem_object *mob_bo_alloc(struct vmw_device *v, uint32_t size)
 {
@@ -205,8 +333,32 @@ int vmw_context_create(struct vmw_device *v, struct drm_file *fp, int dx,
 	c->cid = (uint32_t)cid;
 	c->dx = dx;
 	c->owner = fp;
+	vmw_resource_init(v, &c->res, cid, vmw_context_res_free,
+			  dx ? &vmw_dx_context_func :
+			  v->has_gb ? &vmw_gb_context_func :
+				      &vmw_legacy_context_func);
+	for (int t = 0; t < SVGA_COTABLE_MAX; t++)
+		INIT_LIST_HEAD(&c->cot[t].resource_list);
 	int rc;
 	if (v->has_gb) {
+		/* What its command streams create and bind.  Only a
+		 * guest-backed context has either: a legacy context's state
+		 * is the device's business alone.  The tracker is large
+		 * (tens of kilobytes) and there can be hundreds of contexts,
+		 * which is the other reason not to give it to contexts that
+		 * cannot use it. */
+		c->man = vmw_cmdbuf_res_man_create(v);
+		if (IS_ERR(c->man)) {
+			rc = (int)PTR_ERR(c->man);
+			c->man = NULL;
+			goto fail;
+		}
+		c->cbs = vmw_binding_state_alloc(v);
+		if (IS_ERR(c->cbs)) {
+			rc = (int)PTR_ERR(c->cbs);
+			c->cbs = NULL;
+			goto fail;
+		}
 		/* Context state storage: 16 KB is what the device uses for
 		 * a bound context on this device family. */
 		c->state_bo = mob_bo_alloc(v, 16384);
@@ -283,8 +435,71 @@ fail:
 	return rc;
 }
 
+#if !VMW_TRACK_VIEWS
+/* VMW_TRACK_VIEWS 0: drop every binding record of the context without the
+ * commands that would unbind them on the device (see vmw_so.h). */
+static void vmw_context_bindings_forget(struct vmw_ctx_binding_state *cbs)
+{
+	struct vmw_ctx_bindinfo *entry;
+
+	list_for_each_entry(entry, vmw_binding_state_list(cbs), ctx_list)
+		entry->scrubbed = true;
+	vmw_binding_state_kill(cbs);
+}
+#endif
+
+/* Tear down what the context's command streams left behind, before the
+ * context itself goes.
+ *
+ * First the command-buffer resources: dropping the manager drops the last
+ * reference to each view, and a view's release unbinds it from every
+ * context and destroys it on the device -- in THIS context, which still
+ * exists.  A view somebody else still holds a reference to is destroyed
+ * through the object-table lists instead, so that no view is left on its
+ * surface's view_list naming a context that is about to disappear: the
+ * surface's destroy would otherwise emit a view destroy for a dead (or
+ * reused) context id.  Then everything the context has bound is unbound
+ * and the records dropped, so that no object's binding list still leads
+ * here.
+ *
+ * Called under execbuf_lock, so no submission is staging against the
+ * manager or recording bindings on the tracker meanwhile.  The manager is
+ * destroyed outside binding_lock, because a view's release takes it. */
+static void vmw_context_scrub_objects(struct vmw_device *v,
+				      struct vmw_context *c)
+{
+	if (c->man) {
+		vmw_cmdbuf_res_man_destroy(c->man);
+		c->man = NULL;
+	}
+
+	mm_write_lock(&v->binding_lock);
+	for (int t = 0; t < (int)vmw_view_max; t++)
+		vmw_view_cotable_list_destroy(v,
+			&c->cot[vmw_view_cotables[t]].resource_list, false);
+	/* Only views are put on an object table's list; anything else
+	 * there would be left pointing into freed memory. */
+	for (int t = 0; t < SVGA_COTABLE_MAX; t++)
+		WARN_ON_ONCE(!list_empty(&c->cot[t].resource_list));
+	if (c->cbs) {
+#if VMW_TRACK_VIEWS
+		vmw_binding_state_kill(c->cbs);
+#else
+		vmw_context_bindings_forget(c->cbs);
+#endif
+	}
+	mm_write_unlock(&v->binding_lock);
+}
+
 void vmw_context_destroy(struct vmw_device *v, struct vmw_context *c)
 {
+	/* No submission may be using the context while it is torn down:
+	 * a stream in flight holds a pointer to it, stages views on its
+	 * manager and records bindings on its tracker.  Submissions look the
+	 * context up under this lock, so once it is held nobody else can
+	 * reach the context. */
+	mm_write_lock(&v->execbuf_lock);
+	vmw_context_scrub_objects(v, c);
 	if (c->defined) {
 		if (c->dx) {
 			SVGA3dCmdDXDestroyContext d = { .cid = c->cid };
@@ -296,19 +511,35 @@ void vmw_context_destroy(struct vmw_device *v, struct vmw_context *c)
 			SVGA3dCmdDestroyContext d = { .cid = c->cid };
 			vmw_cmd_one(v, SVGA_3D_CMD_CONTEXT_DESTROY, &d, sizeof(d));
 		}
+		c->defined = 0;
 	}
+	/* From here the device has no such context.  A view that is still
+	 * referenced somewhere sees this and does not name it again. */
+	c->res.id = -1;
+	(void)vmw_context_bind_dx_query(&c->res, NULL);
+	mm_write_unlock(&v->execbuf_lock);
 	for (int t = 0; t < SVGA_COTABLE_MAX; t++)
-		if (c->cot[t].bo)
+		if (c->cot[t].bo) {
 			drm_gem_put(c->cot[t].bo);
-	if (c->shader_bo)
+			c->cot[t].bo = NULL;
+		}
+	if (c->shader_bo) {
 		drm_gem_put(c->shader_bo);
-	if (c->state_bo)
+		c->shader_bo = NULL;
+	}
+	if (c->state_bo) {
 		drm_gem_put(c->state_bo);
+		c->state_bo = NULL;
+	}
 	uint64_t fl;
 	spin_lock_irqsave(&v->id_lock, &fl);
 	vmw_id_free(v->context_ids, c->cid);
 	spin_unlock_irqrestore(&v->id_lock, fl);
-	kfree(c);
+	/* The file's reference.  Normally the last one, and the memory goes
+	 * with it (vmw_context_res_free()). */
+	struct vmw_resource *res = &c->res;
+
+	vmw_resource_unreference(&res);
 }
 
 /* ---- per-file context / shader tables ----------------------------------- */
@@ -330,7 +561,7 @@ struct vmw_context *vmw_file_context(struct drm_file *fp, uint32_t cid)
 	struct vmw_file *f = fp->priv;
 	if (!f)
 		return NULL;
-	for (int i = 0; i < 64; i++)
+	for (uint32_t i = 0; i < ARRAY_SIZE(f->contexts); i++)
 		if (f->contexts[i] && f->contexts[i]->cid == cid)
 			return f->contexts[i];
 	return NULL;
@@ -343,7 +574,7 @@ long vmw_ioctl_create_context(struct vmw_device *v, struct drm_file *fp,
 	if (!f)
 		return -ENOMEM;
 	int slot = -1;
-	for (int i = 0; i < 64; i++)
+	for (int i = 0; i < (int)ARRAY_SIZE(f->contexts); i++)
 		if (!f->contexts[i]) {
 			slot = i;
 			break;
@@ -364,7 +595,7 @@ long vmw_ioctl_unref_context(struct vmw_device *v, struct drm_file *fp, uint32_t
 	struct vmw_file *f = fp->priv;
 	if (!f)
 		return -EINVAL;
-	for (int i = 0; i < 64; i++) {
+	for (uint32_t i = 0; i < ARRAY_SIZE(f->contexts); i++) {
 		if (f->contexts[i] && f->contexts[i]->cid == cid) {
 			struct vmw_context *c = f->contexts[i];
 			f->contexts[i] = NULL;
@@ -380,13 +611,13 @@ void vmw_file_release(struct vmw_device *v, struct drm_file *fp)
 	struct vmw_file *f = fp->priv;
 	if (!f)
 		return;
-	for (int i = 0; i < 64; i++)
+	for (uint32_t i = 0; i < ARRAY_SIZE(f->contexts); i++)
 		if (f->contexts[i]) {
 			struct vmw_context *c = f->contexts[i];
 			f->contexts[i] = NULL;
 			vmw_context_destroy(v, c);
 		}
-	for (int i = 0; i < 256; i++)
+	for (int i = 0; i < (int)ARRAY_SIZE(f->shaders); i++)
 		if (f->shaders[i]) {
 			SVGA3dCmdDestroyGBShader d = { .shid = f->shaders[i] };
 			vmw_cmd_one(v, SVGA_3D_CMD_DESTROY_GB_SHADER, &d, sizeof(d));
@@ -409,38 +640,91 @@ long vmw_ioctl_create_shader(struct vmw_device *v, struct drm_file *fp,
 		return -ENOMEM;
 	if (!v->has_gb)
 		return -ENODEV;
+
+	SVGA3dShaderType shader_type;
+
+	switch (a->shader_type) {
+	case drm_vmw_shader_type_vs:
+		shader_type = SVGA3D_SHADERTYPE_VS;
+		break;
+	case drm_vmw_shader_type_ps:
+		shader_type = SVGA3D_SHADERTYPE_PS;
+		break;
+	default:
+		VMW_DEBUG_USER("Illegal shader type.\n");
+		return -EINVAL;
+	}
+
+	/* The code has to lie inside the buffer it is said to be in: the
+	 * device reads `size' bytes from `offset' of that MOB. */
+	struct drm_gem_object *bo = NULL;
+
+	if (a->buffer_handle != SVGA3D_INVALID_ID) {
+		uint64_t end = (uint64_t)a->size + a->offset;
+
+		bo = drm_gem_lookup(fp, a->buffer_handle);
+		if (!bo || bo->kind != DRM_GEM_BO) {
+			VMW_DEBUG_USER("Couldn't find buffer for shader creation.\n");
+			if (bo)
+				drm_gem_put(bo);
+			return -EINVAL;
+		}
+		if (end < a->offset || end > bo->size) {
+			VMW_DEBUG_USER("Illegal buffer- or shader size.\n");
+			drm_gem_put(bo);
+			return -EINVAL;
+		}
+	}
+
+	/* A slot in the file's table first: a shader the file cannot record
+	 * is one nothing would ever destroy, and its id would be lost to the
+	 * device for good. */
+	int slot = -1;
+
+	for (int i = 0; i < (int)ARRAY_SIZE(f->shaders); i++)
+		if (!f->shaders[i]) {
+			slot = i;
+			break;
+		}
+	if (slot < 0) {
+		if (bo)
+			drm_gem_put(bo);
+		return -ENOSPC;
+	}
+
 	uint64_t fl;
 	spin_lock_irqsave(&v->id_lock, &fl);
 	int shid = vmw_id_alloc(v->shader_ids, VMW_NUM_SHADERS);
 	spin_unlock_irqrestore(&v->id_lock, fl);
-	if (shid < 0)
+	if (shid < 0) {
+		if (bo)
+			drm_gem_put(bo);
 		return -ENOSPC;
+	}
 	SVGA3dCmdDefineGBShader d;
 	d.shid = (uint32_t)shid;
-	d.type = a->shader_type == drm_vmw_shader_type_vs ? SVGA3D_SHADERTYPE_VS :
-							   SVGA3D_SHADERTYPE_PS;
+	d.type = shader_type;
 	d.sizeInBytes = a->size;
 	int rc = vmw_cmd_one(v, SVGA_3D_CMD_DEFINE_GB_SHADER, &d, sizeof(d));
 	if (rc) {
+		spin_lock_irqsave(&v->id_lock, &fl);
 		vmw_id_free(v->shader_ids, (uint32_t)shid);
+		spin_unlock_irqrestore(&v->id_lock, fl);
+		if (bo)
+			drm_gem_put(bo);
 		return rc;
 	}
-	if (a->buffer_handle != SVGA3D_INVALID_ID) {
-		struct drm_gem_object *bo = drm_gem_lookup(fp, a->buffer_handle);
-		if (bo) {
-			SVGA3dCmdBindGBShader b;
-			b.shid = (uint32_t)shid;
-			b.mobid = bo_mobid(bo);
-			b.offsetInBytes = (uint32_t)a->offset;
-			vmw_cmd_one(v, SVGA_3D_CMD_BIND_GB_SHADER, &b, sizeof(b));
-			drm_gem_put(bo);
-		}
+	if (bo) {
+		SVGA3dCmdBindGBShader b;
+		b.shid = (uint32_t)shid;
+		b.mobid = bo_mobid(bo);
+		b.offsetInBytes = (uint32_t)a->offset;
+		vmw_cmd_one(v, SVGA_3D_CMD_BIND_GB_SHADER, &b, sizeof(b));
+		drm_gem_put(bo);
 	}
-	for (int i = 0; i < 256; i++)
-		if (!f->shaders[i]) {
-			f->shaders[i] = (uint32_t)shid;
-			break;
-		}
+	/* Shader id 0 is reserved at bring-up (vmw_mob.c), so 0 can mark a
+	 * free slot. */
+	f->shaders[slot] = (uint32_t)shid;
 	a->shader_handle = (uint32_t)shid;
 	return 0;
 }
@@ -450,7 +734,9 @@ long vmw_ioctl_unref_shader(struct vmw_device *v, struct drm_file *fp, uint32_t 
 	struct vmw_file *f = fp->priv;
 	if (!f)
 		return -EINVAL;
-	for (int i = 0; i < 256; i++) {
+	if (shid == 0)
+		return -EINVAL;
+	for (int i = 0; i < (int)ARRAY_SIZE(f->shaders); i++) {
 		if (f->shaders[i] == shid) {
 			SVGA3dCmdDestroyGBShader d = { .shid = shid };
 			vmw_cmd_one(v, SVGA_3D_CMD_DESTROY_GB_SHADER, &d, sizeof(d));

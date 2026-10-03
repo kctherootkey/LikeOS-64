@@ -19,6 +19,13 @@
 // Alder Lake-P's numbering; BDB 264 adds the flag for a port whose PHY
 // is a dedicated external one rather than a Type-C subsystem's.
 //
+// Besides the wiring, a child device can limit its port (the TMDS clock
+// from BDB 204, the DisplayPort link rate from 216 and lanes from 244),
+// mark it as a DP++ connector, and ask for stream compression with one
+// of the sixteen entries of the compression parameters block (BDB 198+);
+// the LFP power block says whether the panel may run variable refresh
+// (BDB 233+).  These are parsed for the features that use them.
+//
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2025 Intel Corporation
@@ -51,6 +58,8 @@ static uint32_t rd32(const uint8_t *p)
 #define BDB_LVDS_LFP_DATA_PTRS 41
 #define BDB_LVDS_LFP_DATA 42
 #define BDB_LFP_BACKLIGHT 43
+#define BDB_LFP_POWER 44
+#define BDB_COMPRESSION_PARAMETERS 56 /* BDB 213+; the earlier id is not read */
 #define BDB_GENERIC_DTD 58
 
 /* Child device types (device_type field bits) */
@@ -189,6 +198,89 @@ static uint8_t aux_ch_to_index(const struct vbt_ctx *ctx, uint8_t aux)
 	return 0xff;
 }
 
+/* The TMDS limit a child's HDMI max data rate code (BDB 204+) names, in
+ * kHz; 0 for "the platform's" (and for a code this parser does not know). */
+#define HDMI_MAX_DATA_RATE_PLATFORM 0
+#define HDMI_MAX_DATA_RATE_297 1
+#define HDMI_MAX_DATA_RATE_165 2
+#define HDMI_MAX_DATA_RATE_594 3 /* 249+ */
+#define HDMI_MAX_DATA_RATE_340 4 /* 249+ */
+#define HDMI_MAX_DATA_RATE_300 5 /* 249+ */
+
+static uint32_t hdmi_max_tmds_khz(uint8_t code)
+{
+	switch (code) {
+	default:
+	case HDMI_MAX_DATA_RATE_PLATFORM:
+		return 0;
+	case HDMI_MAX_DATA_RATE_594:
+		return 594000;
+	case HDMI_MAX_DATA_RATE_340:
+		return 340000;
+	case HDMI_MAX_DATA_RATE_300:
+		return 300000;
+	case HDMI_MAX_DATA_RATE_297:
+		return 297000;
+	case HDMI_MAX_DATA_RATE_165:
+		return 165000;
+	}
+}
+
+/* A child's DP max link rate code: from BDB 230 zero means no limit and
+ * the codes count up from RBR; from 216 to 229 they count down from
+ * HBR3, which zero names. */
+#define BDB_216_VBT_DP_MAX_LINK_RATE_HBR3 0
+#define BDB_216_VBT_DP_MAX_LINK_RATE_HBR2 1
+#define BDB_216_VBT_DP_MAX_LINK_RATE_HBR 2
+#define BDB_216_VBT_DP_MAX_LINK_RATE_LBR 3
+
+#define BDB_230_VBT_DP_MAX_LINK_RATE_DEF 0
+#define BDB_230_VBT_DP_MAX_LINK_RATE_LBR 1
+#define BDB_230_VBT_DP_MAX_LINK_RATE_HBR 2
+#define BDB_230_VBT_DP_MAX_LINK_RATE_HBR2 3
+#define BDB_230_VBT_DP_MAX_LINK_RATE_HBR3 4
+#define BDB_230_VBT_DP_MAX_LINK_RATE_UHBR10 5
+#define BDB_230_VBT_DP_MAX_LINK_RATE_UHBR13P5 6
+#define BDB_230_VBT_DP_MAX_LINK_RATE_UHBR20 7
+
+static uint32_t dp_max_link_rate_230(uint8_t code)
+{
+	switch (code) {
+	default:
+	case BDB_230_VBT_DP_MAX_LINK_RATE_DEF:
+		return 0;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_UHBR20:
+		return 2000000;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_UHBR13P5:
+		return 1350000;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_UHBR10:
+		return 1000000;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_HBR3:
+		return 810000;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_HBR2:
+		return 540000;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_HBR:
+		return 270000;
+	case BDB_230_VBT_DP_MAX_LINK_RATE_LBR:
+		return 162000;
+	}
+}
+
+static uint32_t dp_max_link_rate_216(uint8_t code)
+{
+	switch (code) {
+	default:
+	case BDB_216_VBT_DP_MAX_LINK_RATE_HBR3:
+		return 810000;
+	case BDB_216_VBT_DP_MAX_LINK_RATE_HBR2:
+		return 540000;
+	case BDB_216_VBT_DP_MAX_LINK_RATE_HBR:
+		return 270000;
+	case BDB_216_VBT_DP_MAX_LINK_RATE_LBR:
+		return 162000;
+	}
+}
+
 /* One child device, laid out per BDB version. */
 static void parse_child(const struct vbt_ctx *ctx, const uint8_t *c, unsigned size,
 			uint16_t version, struct intel_vbt *out)
@@ -205,7 +297,12 @@ static void parse_child(const struct vbt_ctx *ctx, const uint8_t *c, unsigned si
 	 * port's wiring on old tables and, from version 158, flags (23:
 	 * bit 1 lane reversal, from 184), the supported signalling (24:
 	 * bits 0/1/2 HDMI, DisplayPort, TMDS), the AUX channel (25) and
-	 * dongle detection (26). */
+	 * dongle detection (26).  Byte 7's top three bits are the HDMI max
+	 * data rate (204+); byte 10 carries the compression flags (198+:
+	 * bit 1 enable, bit 2 the CPS method) and byte 11 the compression
+	 * parameters entry in its low nibble; byte 23's top two bits the DP
+	 * lane limit (244+) and byte 38's low three the DP link rate limit
+	 * (216+). */
 	uint8_t dvo_port = c[16];
 	uint8_t ddc_pin = size > 19 ? c[19] : 0;
 	uint8_t aux_ch = (version >= 158 && size > 25) ? c[25] : 0;
@@ -244,6 +341,25 @@ static void parse_child(const struct vbt_ctx *ctx, const uint8_t *c, unsigned si
 			p->supports_hdmi = 1;
 		else if (signalling & 0x04)
 			p->supports_dvi = 1;
+	}
+	/* DP++: DisplayPort and HDMI both, named as a DP port, or as an
+	 * HDMI port that has an AUX channel. */
+	if (dp && tmds && !not_hdmi && (is_dp || aux_ch))
+		p->dp_dual_mode = 1;
+	if (version >= 204 && size > 7) {
+		uint32_t khz = hdmi_max_tmds_khz((uint8_t)(c[7] >> 5));
+		if (khz)
+			p->hdmi_max_tmds_khz = khz;
+	}
+	if (version >= 216 && size > 38)
+		p->dp_max_link_rate_khz = version >= 230 ? dp_max_link_rate_230(c[38] & 7) :
+							     dp_max_link_rate_216(c[38] & 7);
+	if (version >= 244)
+		p->dp_max_lanes = (uint8_t)(((flags1 >> 6) & 3) + 1);
+	if (version >= 198 && size > 11 && (c[10] & 0x02)) {
+		p->compression_enable = 1;
+		p->dsc_cps = (c[10] >> 2) & 1;
+		p->dsc_index = c[11] & 0x0f;
 	}
 	if (version >= 184)
 		p->lane_reversal = (flags1 >> 1) & 1;
@@ -333,6 +449,14 @@ static void parse_edp(const uint8_t *b, unsigned len, struct intel_vbt *out)
 		uint32_t nib = pt < 8 ? (lo >> (pt * 4)) : (hi >> ((pt - 8) * 4));
 		out->edp_low_vswing = (nib & 0xf) == 0;
 	}
+	/* Further on, past the PWM delays (16 x 4 bytes from 216), the full
+	 * link parameters (a word at 280, 16 bytes), the Apical block (a
+	 * word at 298, 16 x 28 bytes), the fast training rates (16 words
+	 * from 748) and the maximum port link rates (16 words from 780): a
+	 * word at 812 with a bit per panel that forbids stream compression
+	 * on it. */
+	if (out->version >= 251 && len >= 814)
+		out->edp_dsc_disable = (uint8_t)((rd16(b + 812) >> pt) & 1);
 }
 
 static void parse_lvds_options(const uint8_t *b, unsigned len,
@@ -451,6 +575,60 @@ static void parse_backlight(const uint8_t *b, unsigned len,
 		out->backlight_controller = (b[ctl_off + pt] >> 4) & 0xf;
 }
 
+/* The LFP power block: from BDB 233 a bit per panel type saying whether
+ * the panel may run variable refresh, a u16 at byte 56 (after the
+ * feature byte, five ambient light entries, a profile byte, eight u16
+ * feature masks and sixteen aggressiveness bytes).  A block too short to
+ * hold it says no. */
+static void parse_lfp_power(const uint8_t *b, unsigned len, struct intel_vbt *out)
+{
+	int pt = out->panel_type;
+	if (out->version < 233 || pt < 0 || pt > 15)
+		return;
+	uint16_t vrr = len >= 58 ? rd16(b + 56) : 0;
+	out->lfp_vrr = (vrr >> pt) & 1;
+}
+
+/* The compression parameters block: a u16 entry size, then sixteen
+ * entries of 13 bytes -- version (major in the low nibble), the rate
+ * buffer's block size (two bits) and size, a u32 of allowed slice counts,
+ * the line buffer depth (four bits), the block prediction flag (bit 0),
+ * the maximum bits per pixel code, the supported component depths (bits
+ * 1, 2, 3: 8, 10, 12 bpc) and a u16 slice height.  Each child that asks
+ * for compression (and not by the CPS method) gets a copy of its entry. */
+#define VBT_DSC_ENTRY_SIZE 13
+
+static void parse_compression_parameters(const uint8_t *b, unsigned len,
+					 struct intel_vbt *out)
+{
+	if (out->version < 198 || !b)
+		return;
+	if (len < 2 || rd16(b) != VBT_DSC_ENTRY_SIZE)
+		return;
+	if (len < 2 + 16 * VBT_DSC_ENTRY_SIZE)
+		return;
+	for (int i = 0; i < INTEL_MAX_PORTS; i++) {
+		struct intel_vbt_port *p = &out->port[i];
+		if (!p->present || !p->compression_enable || p->dsc_cps)
+			continue;
+		const uint8_t *e = b + 2 + (unsigned)p->dsc_index * VBT_DSC_ENTRY_SIZE;
+		struct intel_vbt_dsc *d = &p->dsc;
+		d->version_major = e[0] & 0x0f;
+		d->version_minor = (uint8_t)(e[0] >> 4);
+		d->rc_buffer_block_size = e[1] & 0x03;
+		d->rc_buffer_size = e[2];
+		d->slices_per_line = rd32(e + 3);
+		d->line_buffer_depth = e[7] & 0x0f;
+		d->block_prediction_enable = e[8] & 0x01;
+		d->max_bpp = e[9];
+		d->support_8bpc = (e[10] >> 1) & 1;
+		d->support_10bpc = (e[10] >> 2) & 1;
+		d->support_12bpc = (e[10] >> 3) & 1;
+		d->slice_height = rd16(e + 11);
+		p->dsc_valid = 1;
+	}
+}
+
 int intel_vbt_parse(const uint8_t *vbt, unsigned len, struct intel_vbt *out)
 {
 	return intel_vbt_parse_platform(vbt, len, 0, 0, out);
@@ -463,6 +641,7 @@ int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
 	for (unsigned i = 0; i < sizeof(*out); i++)
 		((uint8_t *)out)[i] = 0;
 	out->panel_type = -1;
+	out->lfp_vrr = 1;
 	for (int i = 0; i < INTEL_MAX_PORTS; i++) {
 		out->port[i].aux_ch = 0xff;
 		out->port[i].hdmi_level_shift = 0xff;
@@ -501,6 +680,10 @@ int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
 	unsigned edp_len = 0;
 	const uint8_t *bl_blk = 0;
 	unsigned bl_len = 0;
+	const uint8_t *power_blk = 0;
+	unsigned power_len = 0;
+	const uint8_t *dsc_blk = 0;
+	unsigned dsc_len = 0;
 	/* first pass: everything that does not depend on the panel type */
 	for (unsigned off = hsize; off + 3 <= bsize;) {
 		uint8_t id = bdb[off];
@@ -531,6 +714,14 @@ int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
 			bl_blk = body;
 			bl_len = blen;
 			break;
+		case BDB_LFP_POWER:
+			power_blk = body;
+			power_len = blen;
+			break;
+		case BDB_COMPRESSION_PARAMETERS:
+			dsc_blk = body;
+			dsc_len = blen;
+			break;
 		default:
 			break;
 		}
@@ -544,6 +735,9 @@ int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
 		parse_edp(edp_blk, edp_len, out);
 	if (bl_blk)
 		parse_backlight(bl_blk, bl_len, out);
+	if (power_blk)
+		parse_lfp_power(power_blk, power_len, out);
+	parse_compression_parameters(dsc_blk, dsc_len, out);
 	out->valid = 1;
 	return 0;
 }

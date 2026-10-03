@@ -23,6 +23,7 @@
 #include <kernel/dev/gpu/i915/i915_drv.h>
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/gpu/i915/intel_hdmi_feat.h>
 #include <kernel/dev/gpu/i915/intel_xelpdp_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
@@ -553,6 +554,17 @@ static void hpd_worker(void *arg)
 				o->detected = 0;
 				o->edid_len = 0;
 				drm_connector_hotplug(&i915->drm, o->conn);
+				/* The link of an output still lit may need
+				 * repairing after its sink went away and came
+				 * back; a port whose sink is not settled yet is
+				 * looked at again after another debounce. */
+				int again = 0;
+				if (o->type == INTEL_OUTPUT_DP)
+					again = intel_dp_hpd_check(i915, o);
+				else if (o->type == INTEL_OUTPUT_HDMI || o->type == INTEL_OUTPUT_DVI)
+					again = intel_hdmi_hpd_check(i915, o);
+				if (again)
+					__sync_fetch_and_or(&d->hpd_pending, 1u << o->port);
 			}
 			intel_display_unlock(i915);
 			continue;

@@ -8,6 +8,7 @@
 #include <kernel/ke/interrupt.h>
 #include <kernel/dev/video/fb.h>
 #include <kernel/dev/video/vmsvga2.h>
+#include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/dev/input/evdev.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -209,6 +210,14 @@ static int mouse_hw_cursor_define(void)
  *
  * The real shape is dropped with it, so it is uploaded again when the screen
  * comes back.
+ *
+ * Not on a host with the CURSOR4 position block (VMware): its hide is one
+ * published register block, which that host honours, and the device has a
+ * single cursor image.  The program taking the display sets its pointer
+ * through the display manager's driver, which on such a host hands the device
+ * its image through a cursor MOB, not through a define command.  A transparent
+ * define left there is what the device shows wherever the driver's image does
+ * not replace it -- an X pointer that clicks but is never drawn.
  */
 static void mouse_hw_cursor_hide(void)
 {
@@ -218,7 +227,8 @@ static void mouse_hw_cursor_hide(void)
 
 	vmsvga2_cursor_show(0);
 
-	if (vmsvga2_get_caps() & SVGA_CAP_ALPHA_CURSOR) {
+	if ((vmsvga2_get_caps() & SVGA_CAP_ALPHA_CURSOR) &&
+	    vmsvga2_hw_cursor_path() != VMSVGA2_CURSOR_PATH_CURSOR4) {
 		int w = mouse_state.cursor_w;
 		int h = mouse_state.cursor_h;
 

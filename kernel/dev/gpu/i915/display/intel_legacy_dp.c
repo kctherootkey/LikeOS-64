@@ -16,15 +16,55 @@
 // for more swing or pre-emphasis.  An eDP panel needs its power
 // sequencer for everything, including AUX before it is switched on.
 //
+// The AUX channel is the transfer hook of a struct drm_dp_aux: the
+// DisplayPort helper library above it retries, splits DPCD accesses,
+// tunnels the EDID's I2C, reads the receiver capabilities, the sink's
+// identification, sink count and downstream ports, and decodes the link
+// status the training here acts on (I915_FEAT_LEGACY_DP_HELPERS; the
+// driver's own versions of all that stay for the switch's 0).
+//
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2008-2021 Intel Corporation
 
+#include <kernel/dev/gpu/i915/intel_features.h>
 #include <kernel/dev/gpu/i915/intel_legacy.h>
+
+/* The DPCD names come from the DisplayPort header.  The display header
+ * included above may still carry a private copy of some of them, which
+ * spells the receiver capability size differently (15 for 0xf): that one
+ * definition gives way to the DisplayPort header's own. */
+#if defined(DP_RECEIVER_CAP_SIZE) && !defined(KERNEL_DEV_GPU_DRM_DP_H)
+#undef DP_RECEIVER_CAP_SIZE
+#endif
+#include <kernel/dev/gpu/drm_dp_helper.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
+
+/* ---- compile-time switches ------------------------------------------------------- */
+
+/* The DisplayPort helper library underneath these ports: the AUX channel
+ * as a struct drm_dp_aux (DPCD access with the library's retries and
+ * probe read, I2C over AUX for the EDID through the library's adapter),
+ * the receiver capabilities, sink identification and quirks, sink count
+ * and downstream port information through the library, link status and
+ * training decisions through its decoders, and the short-pulse handling
+ * that reads and acknowledges the sink's service interrupt vectors and
+ * reprobes when the sink count or capabilities change.  0: the driver's
+ * own AUX, I2C and training code, as before. */
+#ifndef I915_FEAT_LEGACY_DP_HELPERS
+#define I915_FEAT_LEGACY_DP_HELPERS 1
+#endif
+
+/* After a passed training, grant a DPCD 1.3+ sink that asks for it
+ * (POST_LT_ADJ_REQ_SUPPORTED) its post-training swing and pre-emphasis
+ * adjustments while the link sends the idle pattern.  0: no grant, as
+ * before.  Only meaningful with I915_FEAT_LEGACY_DP_HELPERS. */
+#ifndef I915_FEAT_LEGACY_DP_POST_LT_ADJ_REQ
+#define I915_FEAT_LEGACY_DP_POST_LT_ADJ_REQ 1
+#endif
 
 /* ---- AUX channel registers ------------------------------------------------------- */
 
@@ -47,51 +87,17 @@
 #define LGDP_AUX_CTL_PRECHARGE_2US_MASK (0xfu << 16)
 #define LGDP_AUX_CTL_BIT_CLOCK_2X_MASK 0x7ffu
 
-/* ---- AUX protocol --------------------------------------------------------------- */
-
-#define LGDP_AUX_I2C_WRITE 0x0
-#define LGDP_AUX_I2C_READ 0x1
-#define LGDP_AUX_I2C_WRITE_STATUS_UPDATE 0x2
-#define LGDP_AUX_I2C_MOT 0x4
-#define LGDP_AUX_NATIVE_WRITE 0x8
-#define LGDP_AUX_NATIVE_READ 0x9
-#define LGDP_AUX_NATIVE_REPLY_ACK 0x0
-#define LGDP_AUX_NATIVE_REPLY_NACK 0x1
-#define LGDP_AUX_NATIVE_REPLY_DEFER 0x2
-#define LGDP_AUX_NATIVE_REPLY_MASK 0x3
-#define LGDP_AUX_I2C_REPLY_ACK 0x0
-#define LGDP_AUX_I2C_REPLY_NACK 0x4
-#define LGDP_AUX_I2C_REPLY_DEFER 0x8
-#define LGDP_AUX_I2C_REPLY_MASK 0xc
-#define LGDP_AUX_MAX_PAYLOAD 16
+/* The pause between attempts the specification wants after a NACK or a
+ * DEFER (the driver's own AUX code; the library keeps the same). */
 #define LGDP_AUX_RETRY_INTERVAL_US 500
 
-/* ---- DPCD fields not in the shared headers --------------------------------------- */
+/* eDP 1.4 lists at most this many link rates (DP_SUPPORTED_LINK_RATES). */
+#define LGDP_MAX_RATES DP_MAX_SUPPORTED_RATES
 
-#define LGDP_DPCD_REV_11 0x11
-#define LGDP_DPCD_REV_14 0x14
-#define LGDP_EDP_14 0x03
-#define LGDP_DWN_STRM_PORT_PRESENT 0x01
-#define LGDP_DWN_STRM_PORT_TYPE_MASK 0x06
-#define LGDP_DWN_STRM_PORT_TYPE_ANALOG (1u << 1)
-#define LGDP_DWN_STRM_PORT_TYPE_OTHER (3u << 1)
-#define LGDP_DETAILED_CAP_INFO_AVAILABLE 0x10
-#define LGDP_TRAINING_AUX_RD_MASK 0x7f
-#define LGDP_EXT_RECEIVER_CAP_PRESENT 0x80
-#define LGDP_DP13_DPCD_REV 0x2200
-#define LGDP_DEVICE_SERVICE_IRQ_VECTOR 0x201
-#define LGDP_DOWNSTREAM_PORT_0 0x80
-#define LGDP_DS_PORT_TYPE_MASK 0x7
-#define LGDP_DS_PORT_TYPE_VGA 1
-#define LGDP_DS_PORT_TYPE_NON_EDID 4
-#define LGDP_DS_PORT_HPD (1u << 3)
-#define LGDP_LINK_STATUS_SIZE 6
-#define LGDP_EDP_DPCD_SIZE 5
-#define LGDP_MAX_RATES 8
-
-/* Swing and pre-emphasis levels as DP_TRAINING_LANEx_SET carries them. */
-#define LGDP_SWING(n) ((uint8_t)(n))
-#define LGDP_PREEMPH(n) ((uint8_t)((n) << DP_TRAIN_PRE_EMPHASIS_SHIFT))
+/* The longest wait between a training pattern change and the status
+ * read: a sink naming more than the specification's 16 ms
+ * (TRAINING_AUX_RD_INTERVAL above 4) gets 16 ms. */
+#define LGDP_MAX_TRAINING_DELAY_US 16000u
 
 /* ---- per-output state ------------------------------------------------------------- */
 
@@ -106,11 +112,21 @@ struct lg_dp {
 	int aux_ch;
 	uint32_t aux_ctl;
 	uint32_t aux_busy_last_status;
+	/* The channel as the DisplayPort helpers drive it (its I2C adapter
+	 * carries the EDID), or the driver's own I2C-over-AUX adapter. */
+	struct drm_dp_aux aux;
 	struct i2c_adapter ddc;
+	char aux_name[24];
 	/* the sink's capabilities */
 	uint8_t dpcd[DP_RECEIVER_CAP_SIZE];
-	uint8_t edp_dpcd[LGDP_EDP_DPCD_SIZE];
-	uint8_t ds_port[4]; /* first downstream port of a branch device */
+	uint8_t edp_dpcd[EDP_DISPLAY_CTL_CAP_SIZE];
+	/* a branch device's downstream ports (the first one's bytes are all
+	 * the driver's own code reads) */
+	uint8_t downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
+	/* the sink's (or branch's) identification and its quirks */
+	struct drm_dp_desc desc;
+	/* a link status read saw DOWNSTREAM_PORT_STATUS_CHANGED */
+	int downstream_port_changed;
 	int has_dpcd;
 	int sink_count;
 	int sink_rates[LGDP_MAX_RATES];
@@ -374,10 +390,10 @@ static int aux_transfer(struct lg_dp *dp, uint8_t request, uint32_t address,
 	txbuf[2] = (uint8_t)address;
 	txbuf[3] = (uint8_t)(size - 1);
 
-	switch (request & ~LGDP_AUX_I2C_MOT) {
-	case LGDP_AUX_NATIVE_WRITE:
-	case LGDP_AUX_I2C_WRITE:
-	case LGDP_AUX_I2C_WRITE_STATUS_UPDATE:
+	switch (request & ~DP_AUX_I2C_MOT) {
+	case DP_AUX_NATIVE_WRITE:
+	case DP_AUX_I2C_WRITE:
+	case DP_AUX_I2C_WRITE_STATUS_UPDATE:
 		txsize = size ? 4 + size : 3;
 		rxsize = 2; /* 0 or 1 data bytes */
 		if (txsize > 20)
@@ -397,8 +413,8 @@ static int aux_transfer(struct lg_dp *dp, uint8_t request, uint32_t address,
 			}
 		}
 		break;
-	case LGDP_AUX_NATIVE_READ:
-	case LGDP_AUX_I2C_READ:
+	case DP_AUX_NATIVE_READ:
+	case DP_AUX_I2C_READ:
 		txsize = size ? 4 : 3;
 		rxsize = size + 1;
 		if (rxsize > 20)
@@ -418,10 +434,34 @@ static int aux_transfer(struct lg_dp *dp, uint8_t request, uint32_t address,
 	return ret;
 }
 
-/* A native DPCD access of up to 16 bytes, retried while the sink defers
- * or the channel hiccups.  The first error seen is the one returned. */
-static int dpcd_access_chunk(struct lg_dp *dp, uint8_t request, uint32_t addr,
-			     uint8_t *buf, int size)
+/* The transfer hook of the channel's struct drm_dp_aux: one AUX
+ * transaction of at most 16 payload bytes through aux_transfer(), the
+ * sink's raw reply code (native bits 1:0, I2C bits 3:2) in msg->reply.
+ * Address-only I2C messages (no buffer, size 0) start and stop the I2C
+ * transactions the library sends; they go out as bare addresses.  Only
+ * msg->reply is changed (and, for a read, the bytes at msg->buffer). */
+static ssize_t dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
+{
+	struct lg_dp *dp = container_of(aux, struct lg_dp, aux);
+	uint8_t reply = 0;
+	int ret;
+
+	if (msg->size > DP_AUX_MAX_PAYLOAD_BYTES)
+		return -E2BIG;
+	if (!msg->buffer != !msg->size)
+		return -EINVAL;
+	ret = aux_transfer(dp, msg->request, msg->address, msg->buffer, (int)msg->size,
+			   &reply);
+	if (ret >= 0)
+		msg->reply = reply;
+	return ret;
+}
+
+/* The driver's own native DPCD access of up to 16 bytes, retried while
+ * the sink defers or the channel hiccups.  The first error seen is the
+ * one returned. */
+static int lgdp_dpcd_access_chunk(struct lg_dp *dp, uint8_t request, uint32_t addr,
+				  uint8_t *buf, int size)
 {
 	int ret = 0, err = 0;
 
@@ -434,7 +474,7 @@ static int dpcd_access_chunk(struct lg_dp *dp, uint8_t request, uint32_t addr,
 		if (ret == -ENXIO)
 			return ret;
 		if (ret >= 0) {
-			if ((reply & LGDP_AUX_NATIVE_REPLY_MASK) == LGDP_AUX_NATIVE_REPLY_ACK) {
+			if ((reply & DP_AUX_NATIVE_REPLY_MASK) == DP_AUX_NATIVE_REPLY_ACK) {
 				if (ret == size)
 					return ret;
 				ret = -EPROTO;
@@ -448,14 +488,14 @@ static int dpcd_access_chunk(struct lg_dp *dp, uint8_t request, uint32_t addr,
 	return err;
 }
 
-static int dpcd_read(struct lg_dp *dp, uint32_t addr, uint8_t *buf, int len)
+static int lgdp_dpcd_read(struct lg_dp *dp, uint32_t addr, uint8_t *buf, int len)
 {
 	int done = 0;
 
 	while (done < len) {
-		int chunk = len - done > LGDP_AUX_MAX_PAYLOAD ? LGDP_AUX_MAX_PAYLOAD : len - done;
-		int ret = dpcd_access_chunk(dp, LGDP_AUX_NATIVE_READ, addr + (uint32_t)done,
-					    buf + done, chunk);
+		int chunk = len - done > DP_AUX_MAX_PAYLOAD_BYTES ? DP_AUX_MAX_PAYLOAD_BYTES : len - done;
+		int ret = lgdp_dpcd_access_chunk(dp, DP_AUX_NATIVE_READ, addr + (uint32_t)done,
+						 buf + done, chunk);
 		if (ret < 0)
 			return ret;
 		done += ret;
@@ -463,23 +503,39 @@ static int dpcd_read(struct lg_dp *dp, uint32_t addr, uint8_t *buf, int len)
 	return done;
 }
 
-static int dpcd_write(struct lg_dp *dp, uint32_t addr, const uint8_t *buf, int len)
+static int lgdp_dpcd_write(struct lg_dp *dp, uint32_t addr, const uint8_t *buf, int len)
 {
-	uint8_t tmp[LGDP_AUX_MAX_PAYLOAD];
+	uint8_t tmp[DP_AUX_MAX_PAYLOAD_BYTES];
 	int done = 0;
 
 	while (done < len) {
-		int chunk = len - done > LGDP_AUX_MAX_PAYLOAD ? LGDP_AUX_MAX_PAYLOAD : len - done;
+		int chunk = len - done > DP_AUX_MAX_PAYLOAD_BYTES ? DP_AUX_MAX_PAYLOAD_BYTES : len - done;
 		int ret;
 
 		mm_memcpy(tmp, buf + done, (size_t)chunk);
-		ret = dpcd_access_chunk(dp, LGDP_AUX_NATIVE_WRITE, addr + (uint32_t)done,
-					tmp, chunk);
+		ret = lgdp_dpcd_access_chunk(dp, DP_AUX_NATIVE_WRITE, addr + (uint32_t)done,
+					     tmp, chunk);
 		if (ret < 0)
 			return ret;
 		done += ret;
 	}
 	return done;
+}
+
+/* DPCD reads and writes: the byte count, or a negative errno. */
+static int dpcd_read(struct lg_dp *dp, uint32_t addr, uint8_t *buf, int len)
+{
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return (int)drm_dp_dpcd_read(&dp->aux, addr, buf, (size_t)len);
+	return lgdp_dpcd_read(dp, addr, buf, len);
+}
+
+static int dpcd_write(struct lg_dp *dp, uint32_t addr, const uint8_t *buf, int len)
+{
+	/* the library only reads the bytes it sends */
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return (int)drm_dp_dpcd_write(&dp->aux, addr, (void *)buf, (size_t)len);
+	return lgdp_dpcd_write(dp, addr, buf, len);
 }
 
 static int dpcd_writeb(struct lg_dp *dp, uint32_t addr, uint8_t v)
@@ -487,20 +543,41 @@ static int dpcd_writeb(struct lg_dp *dp, uint32_t addr, uint8_t v)
 	return dpcd_write(dp, addr, &v, 1);
 }
 
-/* ---- I2C over AUX ------------------------------------------------------------------- */
+/* The throw-away read before every DPCD read (some sinks corrupt the
+ * first access after their power saving): on for an external sink while
+ * it is being probed (and after a long pulse), afterwards only for a sink
+ * whose EDID asks for it; never for a panel. */
+static void dp_set_dpcd_probe(struct lg_dp *dp, int force_on_external)
+{
+	struct lg_display *d = dp->d;
+	int needs = 0;
+
+	if (!I915_FEAT_LEGACY_DP_HELPERS)
+		return;
+	if (dp->is_edp)
+		needs = 0;
+	else if (force_on_external)
+		needs = 1;
+	else if (d->drm && dp->o->conn >= 0)
+		needs = drm_edid_has_quirk(&d->drm->conn[dp->o->conn].display_info,
+					   DRM_EDID_QUIRK_DP_DPCD_PROBE);
+	drm_dp_dpcd_set_probe(&dp->aux, needs);
+}
+
+/* ---- I2C over AUX (the driver's own adapter) ------------------------------------------------------------------- */
 
 static void i2c_set_request(uint8_t *request, const struct i2c_msg *m)
 {
-	*request = (uint8_t)(((m->flags & I2C_M_RD) ? LGDP_AUX_I2C_READ : LGDP_AUX_I2C_WRITE) |
-			     LGDP_AUX_I2C_MOT);
+	*request = (uint8_t)(((m->flags & I2C_M_RD) ? DP_AUX_I2C_READ : DP_AUX_I2C_WRITE) |
+			     DP_AUX_I2C_MOT);
 }
 
 /* After a short or deferred write the sink is asked how far it got. */
 static void i2c_write_status_update(uint8_t *request)
 {
-	if ((*request & ~LGDP_AUX_I2C_MOT) == LGDP_AUX_I2C_WRITE)
-		*request = (uint8_t)((*request & LGDP_AUX_I2C_MOT) |
-				     LGDP_AUX_I2C_WRITE_STATUS_UPDATE);
+	if ((*request & ~DP_AUX_I2C_MOT) == DP_AUX_I2C_WRITE)
+		*request = (uint8_t)((*request & DP_AUX_I2C_MOT) |
+				     DP_AUX_I2C_WRITE_STATUS_UPDATE);
 }
 
 /* One I2C-over-AUX message with its native and I2C level retries. */
@@ -519,25 +596,25 @@ static int i2c_do_msg(struct lg_dp *dp, uint8_t *request, uint16_t addr,
 			/* timeouts and the rest are not retried here */
 			return ret;
 		}
-		switch (reply & LGDP_AUX_NATIVE_REPLY_MASK) {
-		case LGDP_AUX_NATIVE_REPLY_ACK:
+		switch (reply & DP_AUX_NATIVE_REPLY_MASK) {
+		case DP_AUX_NATIVE_REPLY_ACK:
 			break;
-		case LGDP_AUX_NATIVE_REPLY_NACK:
+		case DP_AUX_NATIVE_REPLY_NACK:
 			return -EIO;
-		case LGDP_AUX_NATIVE_REPLY_DEFER:
+		case DP_AUX_NATIVE_REPLY_DEFER:
 			lg_udelay(LGDP_AUX_RETRY_INTERVAL_US);
 			continue;
 		default:
 			return -EIO;
 		}
-		switch (reply & LGDP_AUX_I2C_REPLY_MASK) {
-		case LGDP_AUX_I2C_REPLY_ACK:
+		switch (reply & DP_AUX_I2C_REPLY_MASK) {
+		case DP_AUX_I2C_REPLY_ACK:
 			if (ret != size)
 				i2c_write_status_update(request);
 			return ret;
-		case LGDP_AUX_I2C_REPLY_NACK:
+		case DP_AUX_I2C_REPLY_NACK:
 			return -EIO;
-		case LGDP_AUX_I2C_REPLY_DEFER:
+		case DP_AUX_I2C_REPLY_DEFER:
 			/* The sink's I2C side is slow: grant it more
 			 * attempts than a native defer gets. */
 			if (defer_i2c < 7)
@@ -569,7 +646,7 @@ static int i2c_drain_msg(struct lg_dp *dp, uint8_t *request, uint16_t addr,
 	return done;
 }
 
-static int dp_i2c_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int num)
+static int lgdp_i2c_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int num)
 {
 	struct lg_dp *dp = a->priv;
 	uint8_t request = 0;
@@ -578,7 +655,7 @@ static int dp_i2c_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int num)
 
 	edp_vdd_get(dp);
 	for (int i = 0; i < num; i++) {
-		int transfer_size = LGDP_AUX_MAX_PAYLOAD;
+		int transfer_size = DP_AUX_MAX_PAYLOAD_BYTES;
 
 		addr = msgs[i].addr;
 		i2c_set_request(&request, &msgs[i]);
@@ -620,7 +697,7 @@ static int dp_i2c_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int num)
 	if (err >= 0)
 		err = num;
 	/* a bare address without MOT closes the transaction */
-	request &= (uint8_t)~LGDP_AUX_I2C_MOT;
+	request &= (uint8_t)~DP_AUX_I2C_MOT;
 	(void)i2c_do_msg(dp, &request, addr, NULL, 0);
 	edp_vdd_put(dp);
 	return err;
@@ -630,18 +707,40 @@ static int dp_i2c_xfer(struct i2c_adapter *a, struct i2c_msg *msgs, int num)
 
 static int dp_branch(const struct lg_dp *dp)
 {
-	return dp->dpcd[DP_DOWNSTREAMPORT_PRESENT] & LGDP_DWN_STRM_PORT_PRESENT;
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return drm_dp_is_branch(dp->dpcd);
+	return dp->dpcd[DP_DOWNSTREAMPORT_PRESENT] & DP_DWN_STRM_PORT_PRESENT;
 }
 
 static int dp_enhanced_frame_cap(const struct lg_dp *dp)
 {
-	return dp->dpcd[DP_DPCD_REV] >= LGDP_DPCD_REV_11 &&
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return drm_dp_enhanced_frame_cap(dp->dpcd);
+	return dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_11 &&
 	       (dp->dpcd[DP_MAX_LANE_COUNT] & DP_ENHANCED_FRAME_CAP);
 }
 
+static struct drm_connector *dp_connector(const struct lg_dp *dp)
+{
+	if (!dp->d->drm || dp->o->conn < 0)
+		return NULL;
+	return &dp->d->drm->conn[dp->o->conn];
+}
+
+/* Is SINK_COUNT worth reading: a DPCD 1.1+ branch device (never a
+ * panel, whose sink count need not be valid), unless the device is known
+ * to leave it at zero. */
 static int dp_has_sink_count(const struct lg_dp *dp)
 {
-	return dp->dpcd[DP_DPCD_REV] >= LGDP_DPCD_REV_11 && dp_branch(dp);
+	struct drm_connector *c;
+
+	if (!I915_FEAT_LEGACY_DP_HELPERS)
+		return dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_11 && dp_branch(dp);
+	c = dp_connector(dp);
+	if (c)
+		return drm_dp_read_sink_count_cap(c, dp->dpcd, &dp->desc);
+	return !dp->is_edp && dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_11 && dp_branch(dp) &&
+	       !drm_dp_has_quirk(&dp->desc, DP_DPCD_QUIRK_NO_SINK_COUNT);
 }
 
 /* The receiver capabilities, the extended copy at 0x2200 preferred when
@@ -651,24 +750,44 @@ static int dp_read_dpcd_caps(struct lg_dp *dp)
 	uint8_t dpcd[DP_RECEIVER_CAP_SIZE], ext[DP_RECEIVER_CAP_SIZE];
 	uint8_t probe;
 
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		/* the library's probe read wakes the sink's AUX side */
+		if (drm_dp_read_dpcd_caps(&dp->aux, dpcd))
+			return -EIO;
+		mm_memcpy(dp->dpcd, dpcd, sizeof(dpcd));
+		return 0;
+	}
+
 	/* Some sinks need a first access to wake their AUX side up. */
 	(void)dpcd_read(dp, DP_DPCD_REV, &probe, 1);
 	if (dpcd_read(dp, DP_DPCD_REV, dpcd, DP_RECEIVER_CAP_SIZE) != DP_RECEIVER_CAP_SIZE)
 		return -EIO;
 	if (dpcd[DP_DPCD_REV] == 0)
 		return -EIO;
-	if ((dpcd[DP_TRAINING_AUX_RD_INTERVAL] & LGDP_EXT_RECEIVER_CAP_PRESENT) &&
-	    dpcd_read(dp, LGDP_DP13_DPCD_REV, ext, DP_RECEIVER_CAP_SIZE) == DP_RECEIVER_CAP_SIZE &&
+	if ((dpcd[DP_TRAINING_AUX_RD_INTERVAL] & DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT) &&
+	    dpcd_read(dp, DP_DP13_DPCD_REV, ext, DP_RECEIVER_CAP_SIZE) == DP_RECEIVER_CAP_SIZE &&
 	    ext[DP_DPCD_REV] >= dpcd[DP_DPCD_REV])
 		mm_memcpy(dpcd, ext, sizeof(dpcd));
 	mm_memcpy(dp->dpcd, dpcd, sizeof(dpcd));
 	return 0;
 }
 
+/* The sink's (or branch device's) identification and the quirks the
+ * library knows for it. */
+static void dp_read_desc(struct lg_dp *dp)
+{
+	if (!I915_FEAT_LEGACY_DP_HELPERS)
+		return;
+	mm_memset(&dp->desc, 0, sizeof(dp->desc));
+	if (drm_dp_read_desc(&dp->aux, &dp->desc, drm_dp_is_branch(dp->dpcd)))
+		mm_memset(&dp->desc, 0, sizeof(dp->desc));
+}
+
 static void dp_set_sink_rates(struct lg_dp *dp)
 {
 	static const int dp_rates[] = { 162000, 270000, 540000, 810000 };
-	int max_rate = dp->dpcd[DP_MAX_LINK_RATE] * 27000;
+	int max_rate = I915_FEAT_LEGACY_DP_HELPERS ? drm_dp_max_link_rate(dp->dpcd) :
+						     dp->dpcd[DP_MAX_LINK_RATE] * 27000;
 	int i;
 
 	dp->num_sink_rates = 0;
@@ -691,7 +810,7 @@ static void edp_set_sink_rates(struct lg_dp *dp)
 {
 	dp->use_rate_select = 0;
 	dp->num_sink_rates = 0;
-	if (dp->edp_dpcd[0] >= LGDP_EDP_14) {
+	if (dp->edp_dpcd[0] >= DP_EDP_14) {
 		uint8_t raw[16];
 
 		if (dpcd_read(dp, DP_SUPPORTED_LINK_RATES, raw, sizeof(raw)) == (int)sizeof(raw)) {
@@ -714,7 +833,8 @@ static void edp_set_sink_rates(struct lg_dp *dp)
 
 static void dp_set_max_sink_lanes(struct lg_dp *dp)
 {
-	int lanes = dp->dpcd[DP_MAX_LANE_COUNT] & DP_MAX_LANE_COUNT_MASK;
+	int lanes = I915_FEAT_LEGACY_DP_HELPERS ? drm_dp_max_lane_count(dp->dpcd) :
+						  dp->dpcd[DP_MAX_LANE_COUNT] & DP_MAX_LANE_COUNT_MASK;
 
 	if (lanes != 1 && lanes != 2 && lanes != 4) {
 		kprintf("[drm] i915: %s: DPCD names %d lanes, assuming 1\n", dp->o->name, lanes);
@@ -793,7 +913,7 @@ static void dp_reset_link_params(struct lg_dp *dp)
 {
 	dp->fb_max_rate = 0;
 	dp->fb_max_lanes = 0;
-	dp->use_max_params = dp->is_edp && dp->edp_dpcd[0] < LGDP_EDP_14;
+	dp->use_max_params = dp->is_edp && dp->edp_dpcd[0] < DP_EDP_14;
 }
 
 /* The receiver capabilities of an external sink, and what follows from
@@ -801,14 +921,33 @@ static void dp_reset_link_params(struct lg_dp *dp)
 static int dp_get_dpcd(struct lg_dp *dp)
 {
 	uint8_t count;
+	int ret;
 
 	if (dp_read_dpcd_caps(dp))
 		return -EIO;
+	dp_read_desc(dp);
 	dp_set_sink_rates(dp);
 	dp_set_max_sink_lanes(dp);
 	dp_set_common_link_params(dp);
 
-	mm_memset(dp->ds_port, 0, sizeof(dp->ds_port));
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		if (dp_has_sink_count(dp)) {
+			ret = drm_dp_read_sink_count(&dp->aux);
+			if (ret < 0)
+				return -EIO;
+			/* Kept to notice a change between short pulses. */
+			dp->sink_count = ret;
+			/* A dongle with nothing behind it: nothing more
+			 * to read. */
+			if (!dp->sink_count)
+				return -ENODEV;
+		}
+		if (drm_dp_read_downstream_info(&dp->aux, dp->dpcd, dp->downstream_ports))
+			return -EIO;
+		return 0;
+	}
+
+	mm_memset(dp->downstream_ports, 0, sizeof(dp->downstream_ports));
 	if (dp_has_sink_count(dp)) {
 		if (dpcd_read(dp, DP_SINK_COUNT, &count, 1) != 1)
 			return -EIO;
@@ -819,9 +958,9 @@ static int dp_get_dpcd(struct lg_dp *dp)
 			return -ENODEV;
 	}
 	if (dp_branch(dp)) {
-		int len = (dp->dpcd[DP_DOWNSTREAMPORT_PRESENT] & LGDP_DETAILED_CAP_INFO_AVAILABLE) ?
+		int len = (dp->dpcd[DP_DOWNSTREAMPORT_PRESENT] & DP_DETAILED_CAP_INFO_AVAILABLE) ?
 				  4 : 1;
-		if (dpcd_read(dp, LGDP_DOWNSTREAM_PORT_0, dp->ds_port, len) != len)
+		if (dpcd_read(dp, DP_DOWNSTREAM_PORT_0, dp->downstream_ports, len) != len)
 			return -EIO;
 	}
 	return 0;
@@ -849,15 +988,15 @@ static int dp_downstream_hpd_needs_d0(const struct lg_dp *dp)
 {
 	/* DPCD 1.2 branch devices signal downstream changes with a long
 	 * pulse even in D3; 1.1 ones with HPD-aware ports must stay up. */
-	return dp->dpcd[DP_DPCD_REV] == LGDP_DPCD_REV_11 && dp_branch(dp) &&
-	       (dp->ds_port[0] & LGDP_DS_PORT_HPD);
+	return dp->dpcd[DP_DPCD_REV] == DP_DPCD_REV_11 && dp_branch(dp) &&
+	       (dp->downstream_ports[0] & DP_DS_PORT_HPD);
 }
 
 static void dp_set_power(struct lg_dp *dp, uint8_t mode)
 {
 	int ret = 0;
 
-	if (dp->dpcd[DP_DPCD_REV] < LGDP_DPCD_REV_11)
+	if (dp->dpcd[DP_DPCD_REV] < DP_DPCD_REV_11)
 		return;
 	if (mode != DP_SET_POWER_D0) {
 		if (dp_downstream_hpd_needs_d0(dp))
@@ -1090,32 +1229,32 @@ static uint32_t g4x_signal_levels(uint8_t train_set)
 	uint32_t signal_levels = 0;
 
 	switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-	case LGDP_SWING(0):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 	default:
 		signal_levels |= DP_VOLTAGE_0_4;
 		break;
-	case LGDP_SWING(1):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 		signal_levels |= DP_VOLTAGE_0_6;
 		break;
-	case LGDP_SWING(2):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2:
 		signal_levels |= DP_VOLTAGE_0_8;
 		break;
-	case LGDP_SWING(3):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_3:
 		signal_levels |= DP_VOLTAGE_1_2;
 		break;
 	}
 	switch (train_set & DP_TRAIN_PRE_EMPHASIS_MASK) {
-	case LGDP_PREEMPH(0):
+	case DP_TRAIN_PRE_EMPH_LEVEL_0:
 	default:
 		signal_levels |= DP_PRE_EMPHASIS_0;
 		break;
-	case LGDP_PREEMPH(1):
+	case DP_TRAIN_PRE_EMPH_LEVEL_1:
 		signal_levels |= DP_PRE_EMPHASIS_3_5;
 		break;
-	case LGDP_PREEMPH(2):
+	case DP_TRAIN_PRE_EMPH_LEVEL_2:
 		signal_levels |= DP_PRE_EMPHASIS_6;
 		break;
-	case LGDP_PREEMPH(3):
+	case DP_TRAIN_PRE_EMPH_LEVEL_3:
 		signal_levels |= DP_PRE_EMPHASIS_9_5;
 		break;
 	}
@@ -1128,19 +1267,19 @@ static uint32_t snb_cpu_edp_signal_levels(uint8_t train_set)
 	uint8_t signal_levels = train_set & (DP_TRAIN_VOLTAGE_SWING_MASK | DP_TRAIN_PRE_EMPHASIS_MASK);
 
 	switch (signal_levels) {
-	case LGDP_SWING(0) | LGDP_PREEMPH(0):
-	case LGDP_SWING(1) | LGDP_PREEMPH(0):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_0:
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_0:
 		return EDP_LINK_TRAIN_400_600MV_0DB_SNB_B;
-	case LGDP_SWING(0) | LGDP_PREEMPH(1):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_1:
 		return EDP_LINK_TRAIN_400MV_3_5DB_SNB_B;
-	case LGDP_SWING(0) | LGDP_PREEMPH(2):
-	case LGDP_SWING(1) | LGDP_PREEMPH(2):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_2:
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_2:
 		return EDP_LINK_TRAIN_400_600MV_6DB_SNB_B;
-	case LGDP_SWING(1) | LGDP_PREEMPH(1):
-	case LGDP_SWING(2) | LGDP_PREEMPH(1):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_1:
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2 | DP_TRAIN_PRE_EMPH_LEVEL_1:
 		return EDP_LINK_TRAIN_600_800MV_3_5DB_SNB_B;
-	case LGDP_SWING(2) | LGDP_PREEMPH(0):
-	case LGDP_SWING(3) | LGDP_PREEMPH(0):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2 | DP_TRAIN_PRE_EMPH_LEVEL_0:
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_3 | DP_TRAIN_PRE_EMPH_LEVEL_0:
 		return EDP_LINK_TRAIN_800_1200MV_0DB_SNB_B;
 	default:
 		i915_dbg("[drm] i915: unsupported SNB eDP signal levels 0x%x\n", signal_levels);
@@ -1154,20 +1293,20 @@ static uint32_t ivb_cpu_edp_signal_levels(uint8_t train_set)
 	uint8_t signal_levels = train_set & (DP_TRAIN_VOLTAGE_SWING_MASK | DP_TRAIN_PRE_EMPHASIS_MASK);
 
 	switch (signal_levels) {
-	case LGDP_SWING(0) | LGDP_PREEMPH(0):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_0:
 		return EDP_LINK_TRAIN_400MV_0DB_IVB;
-	case LGDP_SWING(0) | LGDP_PREEMPH(1):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_1:
 		return EDP_LINK_TRAIN_400MV_3_5DB_IVB;
-	case LGDP_SWING(0) | LGDP_PREEMPH(2):
-	case LGDP_SWING(1) | LGDP_PREEMPH(2):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_2:
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_2:
 		return EDP_LINK_TRAIN_400MV_6DB_IVB;
-	case LGDP_SWING(1) | LGDP_PREEMPH(0):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_0:
 		return EDP_LINK_TRAIN_600MV_0DB_IVB;
-	case LGDP_SWING(1) | LGDP_PREEMPH(1):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_1:
 		return EDP_LINK_TRAIN_600MV_3_5DB_IVB;
-	case LGDP_SWING(2) | LGDP_PREEMPH(0):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2 | DP_TRAIN_PRE_EMPH_LEVEL_0:
 		return EDP_LINK_TRAIN_800MV_0DB_IVB;
-	case LGDP_SWING(2) | LGDP_PREEMPH(1):
+	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2 | DP_TRAIN_PRE_EMPH_LEVEL_1:
 		return EDP_LINK_TRAIN_800MV_3_5DB_IVB;
 	default:
 		i915_dbg("[drm] i915: unsupported IVB eDP signal levels 0x%x\n", signal_levels);
@@ -1183,22 +1322,22 @@ static void vlv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 	uint8_t train_set = dp->train_set[0];
 
 	switch (train_set & DP_TRAIN_PRE_EMPHASIS_MASK) {
-	case LGDP_PREEMPH(0):
+	case DP_TRAIN_PRE_EMPH_LEVEL_0:
 		preemph_reg_value = 0x0004000;
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			demph_reg_value = 0x2B405555;
 			uniqtranscale_reg_value = 0x552AB83A;
 			break;
-		case LGDP_SWING(1):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 			demph_reg_value = 0x2B404040;
 			uniqtranscale_reg_value = 0x5548B83A;
 			break;
-		case LGDP_SWING(2):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_2:
 			demph_reg_value = 0x2B245555;
 			uniqtranscale_reg_value = 0x5560B83A;
 			break;
-		case LGDP_SWING(3):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_3:
 			demph_reg_value = 0x2B405555;
 			uniqtranscale_reg_value = 0x5598DA3A;
 			break;
@@ -1206,18 +1345,18 @@ static void vlv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 			return;
 		}
 		break;
-	case LGDP_PREEMPH(1):
+	case DP_TRAIN_PRE_EMPH_LEVEL_1:
 		preemph_reg_value = 0x0002000;
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			demph_reg_value = 0x2B404040;
 			uniqtranscale_reg_value = 0x5552B83A;
 			break;
-		case LGDP_SWING(1):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 			demph_reg_value = 0x2B404848;
 			uniqtranscale_reg_value = 0x5580B83A;
 			break;
-		case LGDP_SWING(2):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_2:
 			demph_reg_value = 0x2B404040;
 			uniqtranscale_reg_value = 0x55ADDA3A;
 			break;
@@ -1225,14 +1364,14 @@ static void vlv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 			return;
 		}
 		break;
-	case LGDP_PREEMPH(2):
+	case DP_TRAIN_PRE_EMPH_LEVEL_2:
 		preemph_reg_value = 0x0000000;
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			demph_reg_value = 0x2B305555;
 			uniqtranscale_reg_value = 0x5570B83A;
 			break;
-		case LGDP_SWING(1):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 			demph_reg_value = 0x2B2B4040;
 			uniqtranscale_reg_value = 0x55ADDA3A;
 			break;
@@ -1240,10 +1379,10 @@ static void vlv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 			return;
 		}
 		break;
-	case LGDP_PREEMPH(3):
+	case DP_TRAIN_PRE_EMPH_LEVEL_3:
 		preemph_reg_value = 0x0006000;
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			demph_reg_value = 0x1B405555;
 			uniqtranscale_reg_value = 0x55ADDA3A;
 			break;
@@ -1266,21 +1405,21 @@ static void chv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 	uint8_t train_set = dp->train_set[0];
 
 	switch (train_set & DP_TRAIN_PRE_EMPHASIS_MASK) {
-	case LGDP_PREEMPH(0):
+	case DP_TRAIN_PRE_EMPH_LEVEL_0:
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			deemph_reg_value = 128;
 			margin_reg_value = 52;
 			break;
-		case LGDP_SWING(1):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 			deemph_reg_value = 128;
 			margin_reg_value = 77;
 			break;
-		case LGDP_SWING(2):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_2:
 			deemph_reg_value = 128;
 			margin_reg_value = 102;
 			break;
-		case LGDP_SWING(3):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_3:
 			deemph_reg_value = 128;
 			margin_reg_value = 154;
 			uniq_trans_scale = 1;
@@ -1289,17 +1428,17 @@ static void chv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 			return;
 		}
 		break;
-	case LGDP_PREEMPH(1):
+	case DP_TRAIN_PRE_EMPH_LEVEL_1:
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			deemph_reg_value = 85;
 			margin_reg_value = 78;
 			break;
-		case LGDP_SWING(1):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 			deemph_reg_value = 85;
 			margin_reg_value = 116;
 			break;
-		case LGDP_SWING(2):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_2:
 			deemph_reg_value = 85;
 			margin_reg_value = 154;
 			break;
@@ -1307,13 +1446,13 @@ static void chv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 			return;
 		}
 		break;
-	case LGDP_PREEMPH(2):
+	case DP_TRAIN_PRE_EMPH_LEVEL_2:
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			deemph_reg_value = 64;
 			margin_reg_value = 104;
 			break;
-		case LGDP_SWING(1):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_1:
 			deemph_reg_value = 64;
 			margin_reg_value = 154;
 			break;
@@ -1321,9 +1460,9 @@ static void chv_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 			return;
 		}
 		break;
-	case LGDP_PREEMPH(3):
+	case DP_TRAIN_PRE_EMPH_LEVEL_3:
 		switch (train_set & DP_TRAIN_VOLTAGE_SWING_MASK) {
-		case LGDP_SWING(0):
+		case DP_TRAIN_VOLTAGE_SWING_LEVEL_0:
 			deemph_reg_value = 43;
 			margin_reg_value = 154;
 			break;
@@ -1376,6 +1515,9 @@ static void dp_set_signal_levels(struct lg_dp *dp, const struct lg_config *cfg)
 
 /* ---- link training ------------------------------------------------------------------ */
 
+/* The driver's own decoders of the link status bytes (DP_LANE0_1_STATUS
+ * to DP_ADJUST_REQUEST_LANE2_3); the DisplayPort helpers carry the same
+ * decoders, which the lt_* functions below pick. */
 static uint8_t lane_status(const uint8_t *link_status, int lane)
 {
 	return (uint8_t)((link_status[lane >> 1] >> ((lane & 1) * 4)) & 0xf);
@@ -1418,11 +1560,49 @@ static uint8_t adjust_request_pre_emphasis(const uint8_t *link_status, int lane)
 	return (uint8_t)(((l >> s) & 0xc) << 1);
 }
 
+static int lt_clock_recovery_ok(const uint8_t *ls, int lanes)
+{
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return drm_dp_clock_recovery_ok(ls, lanes);
+	return clock_recovery_ok(ls, lanes);
+}
+
+static int lt_channel_eq_ok(const uint8_t *ls, int lanes)
+{
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return drm_dp_channel_eq_ok(ls, lanes);
+	return channel_eq_ok(ls, lanes);
+}
+
+static uint8_t lt_adjust_voltage(const uint8_t *ls, int lane)
+{
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return drm_dp_get_adjust_request_voltage(ls, lane);
+	return adjust_request_voltage(ls, lane);
+}
+
+static uint8_t lt_adjust_pre_emphasis(const uint8_t *ls, int lane)
+{
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return drm_dp_get_adjust_request_pre_emphasis(ls, lane);
+	return adjust_request_pre_emphasis(ls, lane);
+}
+
+/* The sink's link status.  A branch device reporting a change on one of
+ * its downstream ports is noted for the short-pulse handler. */
 static int dp_read_link_status(struct lg_dp *dp, uint8_t *link_status)
 {
-	mm_memset(link_status, 0, LGDP_LINK_STATUS_SIZE);
-	if (dpcd_read(dp, DP_LANE0_1_STATUS, link_status, LGDP_LINK_STATUS_SIZE) !=
-	    LGDP_LINK_STATUS_SIZE)
+	mm_memset(link_status, 0, DP_LINK_STATUS_SIZE);
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		if (drm_dp_dpcd_read_phy_link_status(&dp->aux, DP_PHY_DPRX, link_status) < 0)
+			return -EIO;
+		if (link_status[DP_LANE_ALIGN_STATUS_UPDATED - DP_LANE0_1_STATUS] &
+		    DP_DOWNSTREAM_PORT_STATUS_CHANGED)
+			dp->downstream_port_changed = 1;
+		return 0;
+	}
+	if (dpcd_read(dp, DP_LANE0_1_STATUS, link_status, DP_LINK_STATUS_SIZE) !=
+	    DP_LINK_STATUS_SIZE)
 		return -EIO;
 	return 0;
 }
@@ -1439,28 +1619,28 @@ static void dp_dump_link_status(const struct lg_dp *dp, const uint8_t *ls)
 static uint8_t dp_voltage_max_for(uint8_t preemph)
 {
 	switch (preemph & DP_TRAIN_PRE_EMPHASIS_MASK) {
-	case LGDP_PREEMPH(0):
-		return LGDP_SWING(3);
-	case LGDP_PREEMPH(1):
-		return LGDP_SWING(2);
-	case LGDP_PREEMPH(2):
-		return LGDP_SWING(1);
-	case LGDP_PREEMPH(3):
+	case DP_TRAIN_PRE_EMPH_LEVEL_0:
+		return DP_TRAIN_VOLTAGE_SWING_LEVEL_3;
+	case DP_TRAIN_PRE_EMPH_LEVEL_1:
+		return DP_TRAIN_VOLTAGE_SWING_LEVEL_2;
+	case DP_TRAIN_PRE_EMPH_LEVEL_2:
+		return DP_TRAIN_VOLTAGE_SWING_LEVEL_1;
+	case DP_TRAIN_PRE_EMPH_LEVEL_3:
 	default:
-		return LGDP_SWING(0);
+		return DP_TRAIN_VOLTAGE_SWING_LEVEL_0;
 	}
 }
 
 /* These ports drive one level on every lane: the highest any lane asks
  * for, within what the port can do. */
-static int dp_get_adjust_train(struct lg_dp *dp, const uint8_t *link_status)
+static uint8_t dp_get_lane_adjust_vswing_preemph(const struct lg_dp *dp,
+						 const uint8_t *link_status)
 {
-	uint8_t v = 0, p = 0, newset;
-	int changed = 0;
+	uint8_t v = 0, p = 0;
 
 	for (int lane = 0; lane < dp->lane_count; lane++) {
-		uint8_t lv = adjust_request_voltage(link_status, lane);
-		uint8_t lp = adjust_request_pre_emphasis(link_status, lane);
+		uint8_t lv = lt_adjust_voltage(link_status, lane);
+		uint8_t lp = lt_adjust_pre_emphasis(link_status, lane);
 
 		if (lv > v)
 			v = lv;
@@ -1473,7 +1653,14 @@ static int dp_get_adjust_train(struct lg_dp *dp, const uint8_t *link_status)
 		v = dp_voltage_max_for(p);
 	if (v >= dp->voltage_max)
 		v = dp->voltage_max | DP_TRAIN_MAX_SWING_REACHED;
-	newset = v | p;
+	return v | p;
+}
+
+/* 1 when the levels of any lane changed. */
+static int dp_get_adjust_train(struct lg_dp *dp, const uint8_t *link_status)
+{
+	uint8_t newset = dp_get_lane_adjust_vswing_preemph(dp, link_status);
+	int changed = 0;
 
 	for (int lane = 0; lane < 4; lane++) {
 		if (dp->train_set[lane] == newset)
@@ -1492,6 +1679,7 @@ static int dp_set_link_train_dpcd(struct lg_dp *dp, uint8_t dp_train_pat)
 
 	dp_set_link_train(dp, dp_train_pat);
 	buf[0] = dp_train_pat;
+	/* DP_TRAINING_LANEx_SET follow DP_TRAINING_PATTERN_SET */
 	mm_memcpy(buf + 1, dp->train_set, (size_t)dp->lane_count);
 	return dpcd_write(dp, DP_TRAINING_PATTERN_SET, buf, len) == len;
 }
@@ -1511,9 +1699,11 @@ static int dp_update_link_train(struct lg_dp *dp, const struct lg_config *cfg)
 	       dp->lane_count;
 }
 
+/* The highest swing with the pre-emphasis it allows (2+1 or 3+0): where
+ * clock recovery stops raising the levels. */
 static int dp_lane_max_vswing_reached(uint8_t train_set_lane)
 {
-	uint8_t v = train_set_lane & DP_TRAIN_VOLTAGE_SWING_MASK;
+	uint8_t v = (train_set_lane & DP_TRAIN_VOLTAGE_SWING_MASK) >> DP_TRAIN_VOLTAGE_SWING_SHIFT;
 	uint8_t p = (train_set_lane & DP_TRAIN_PRE_EMPHASIS_MASK) >> DP_TRAIN_PRE_EMPHASIS_SHIFT;
 
 	if (!(train_set_lane & DP_TRAIN_MAX_SWING_REACHED))
@@ -1533,10 +1723,9 @@ static int dp_adjust_request_changed(const struct lg_dp *dp, const uint8_t *old_
 				     const uint8_t *new_ls)
 {
 	for (int lane = 0; lane < dp->lane_count; lane++) {
-		uint8_t o = adjust_request_voltage(old_ls, lane) |
-			    adjust_request_pre_emphasis(old_ls, lane);
-		uint8_t n = adjust_request_voltage(new_ls, lane) |
-			    adjust_request_pre_emphasis(new_ls, lane);
+		uint8_t o = lt_adjust_voltage(old_ls, lane) | lt_adjust_pre_emphasis(old_ls, lane);
+		uint8_t n = lt_adjust_voltage(new_ls, lane) | lt_adjust_pre_emphasis(new_ls, lane);
+
 		if (o != n)
 			return 1;
 	}
@@ -1546,27 +1735,41 @@ static int dp_adjust_request_changed(const struct lg_dp *dp, const uint8_t *old_
 /* How long the sink wants between a pattern change and the status read. */
 static uint32_t dp_rd_interval(const struct lg_dp *dp)
 {
-	uint32_t rd = dp->dpcd[DP_TRAINING_AUX_RD_INTERVAL] & LGDP_TRAINING_AUX_RD_MASK;
+	uint32_t rd = dp->dpcd[DP_TRAINING_AUX_RD_INTERVAL] & DP_TRAINING_AUX_RD_MASK;
 
 	if (rd > 4)
 		rd = 4;
 	return rd;
 }
 
-static uint32_t dp_cr_delay_us(const struct lg_dp *dp)
+/* Clock recovery: 100 us for DPCD 1.4 and for a sink naming no interval,
+ * else the interval (in 4 ms units).  The wait never exceeds 16 ms, the
+ * longest interval the specification defines. */
+static uint32_t dp_cr_delay_us(struct lg_dp *dp)
 {
 	uint32_t rd = dp_rd_interval(dp);
 
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		int us = drm_dp_read_clock_recovery_delay(&dp->aux, dp->dpcd, DP_PHY_DPRX, false);
+
+		return min((uint32_t)us, LGDP_MAX_TRAINING_DELAY_US);
+	}
 	/* DPCD 1.4 fixes the clock recovery interval at 100 us */
-	if (dp->dpcd[DP_DPCD_REV] >= LGDP_DPCD_REV_14 || rd == 0)
+	if (dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_14 || rd == 0)
 		return 100;
 	return rd * 4000;
 }
 
-static uint32_t dp_eq_delay_us(const struct lg_dp *dp)
+/* Channel equalisation: the interval, 400 us when the sink names none. */
+static uint32_t dp_eq_delay_us(struct lg_dp *dp)
 {
 	uint32_t rd = dp_rd_interval(dp);
 
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		int us = drm_dp_read_channel_eq_delay(&dp->aux, dp->dpcd, DP_PHY_DPRX, false);
+
+		return min((uint32_t)us, LGDP_MAX_TRAINING_DELAY_US);
+	}
 	return rd ? rd * 4000 : 400;
 }
 
@@ -1576,6 +1779,16 @@ static void dp_delay_us(uint32_t us)
 		lg_mdelay(us / 1000);
 	if (us % 1000)
 		lg_udelay(us % 1000);
+}
+
+/* The sink adjusts the levels after the training passed, while the port
+ * sends the idle pattern: a DPCD 1.3+ sink that says it wants to.  These
+ * ports train channel equalisation with pattern 2 only, which permits
+ * it. */
+static int dp_use_post_lt_adj_req(const struct lg_dp *dp)
+{
+	return I915_FEAT_LEGACY_DP_HELPERS && I915_FEAT_LEGACY_DP_POST_LT_ADJ_REQ &&
+	       drm_dp_post_lt_adj_req_supported(dp->dpcd);
 }
 
 /* Tell the sink the rate, the width and the coding. */
@@ -1589,6 +1802,8 @@ static void dp_prepare_link_train(struct lg_dp *dp, const struct lg_config *cfg)
 		for (int i = 0; i < dp->num_sink_rates; i++)
 			if (dp->sink_rates[i] == dp->link_rate)
 				rate_select = (uint8_t)i;
+	} else if (I915_FEAT_LEGACY_DP_HELPERS) {
+		link_bw = drm_dp_link_rate_to_bw_code(dp->link_rate);
 	} else {
 		link_bw = (uint8_t)(dp->link_rate / 27000);
 	}
@@ -1607,6 +1822,8 @@ static void dp_prepare_link_train(struct lg_dp *dp, const struct lg_config *cfg)
 
 	if (cfg->enhanced_framing)
 		lane_count |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
+	if (dp_use_post_lt_adj_req(dp))
+		lane_count |= DP_POST_LT_ADJ_REQ_GRANTED;
 	if (link_bw) {
 		link_config[0] = link_bw;
 		link_config[1] = lane_count;
@@ -1622,7 +1839,7 @@ static void dp_prepare_link_train(struct lg_dp *dp, const struct lg_config *cfg)
 /* Pattern 1 until every lane has recovered the clock. */
 static int dp_link_training_clock_recovery(struct lg_dp *dp, const struct lg_config *cfg)
 {
-	uint8_t old_ls[LGDP_LINK_STATUS_SIZE], ls[LGDP_LINK_STATUS_SIZE];
+	uint8_t old_ls[DP_LINK_STATUS_SIZE], ls[DP_LINK_STATUS_SIZE];
 	uint32_t delay_us = dp_cr_delay_us(dp);
 	int voltage_tries, max_cr_tries, max_vswing_reached = 0;
 
@@ -1634,7 +1851,7 @@ static int dp_link_training_clock_recovery(struct lg_dp *dp, const struct lg_con
 	}
 	/* DPCD 1.4 limits clock recovery to ten rounds; older sinks get a
 	 * tolerant 80 (four swings, four emphases, five repeats each). */
-	max_cr_tries = dp->dpcd[DP_DPCD_REV] >= LGDP_DPCD_REV_14 ? 10 : 80;
+	max_cr_tries = dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_14 ? 10 : 80;
 	voltage_tries = 1;
 	for (int cr_tries = 0; cr_tries < max_cr_tries; cr_tries++) {
 		dp_delay_us(delay_us);
@@ -1642,7 +1859,7 @@ static int dp_link_training_clock_recovery(struct lg_dp *dp, const struct lg_con
 			kprintf("[drm] i915: %s: failed to get link status\n", dp->o->name);
 			return 0;
 		}
-		if (clock_recovery_ok(ls, dp->lane_count)) {
+		if (lt_clock_recovery_ok(ls, dp->lane_count)) {
 			i915_dbg("[drm] i915: %s: clock recovery OK\n", dp->o->name);
 			return 1;
 		}
@@ -1679,7 +1896,7 @@ static int dp_link_training_clock_recovery(struct lg_dp *dp, const struct lg_con
  * equalised, symbol locked and aligned. */
 static int dp_link_training_channel_equalization(struct lg_dp *dp, const struct lg_config *cfg)
 {
-	uint8_t ls[LGDP_LINK_STATUS_SIZE];
+	uint8_t ls[DP_LINK_STATUS_SIZE];
 	uint32_t delay_us = dp_eq_delay_us(dp);
 	int tries, channel_eq = 0;
 
@@ -1694,13 +1911,13 @@ static int dp_link_training_channel_equalization(struct lg_dp *dp, const struct 
 			kprintf("[drm] i915: %s: failed to get link status\n", dp->o->name);
 			break;
 		}
-		if (!clock_recovery_ok(ls, dp->lane_count)) {
+		if (!lt_clock_recovery_ok(ls, dp->lane_count)) {
 			dp_dump_link_status(dp, ls);
 			i915_dbg("[drm] i915: %s: clock recovery lost during equalisation\n",
 				 dp->o->name);
 			break;
 		}
-		if (channel_eq_ok(ls, dp->lane_count)) {
+		if (lt_channel_eq_ok(ls, dp->lane_count)) {
 			channel_eq = 1;
 			i915_dbg("[drm] i915: %s: channel equalisation done\n", dp->o->name);
 			break;
@@ -1716,6 +1933,72 @@ static int dp_link_training_channel_equalization(struct lg_dp *dp, const struct 
 		i915_dbg("[drm] i915: %s: channel equalisation failed 5 times\n", dp->o->name);
 	}
 	return channel_eq;
+}
+
+/* The post-training adjustments the sink asked for: the levels it
+ * requests are applied until it stops asking, six changes were made, or
+ * 200 ms passed without a change.  Clock recovery and equalisation must
+ * hold throughout.  1 when the link is still good. */
+static int dp_post_lt_adj_req(struct lg_dp *dp, const struct lg_config *cfg)
+{
+	uint8_t ls[DP_LINK_STATUS_SIZE];
+	uint64_t deadline;
+	int timeout = 0, changes = 0;
+
+	if (!dp_use_post_lt_adj_req(dp))
+		return 1;
+	if (dp_read_link_status(dp, ls)) {
+		kprintf("[drm] i915: %s: failed to get link status\n", dp->o->name);
+		return 0;
+	}
+	deadline = hrtimer_now_ns() + 200ull * 1000000ull;
+	for (;;) {
+		if (!lt_clock_recovery_ok(ls, dp->lane_count)) {
+			dp_dump_link_status(dp, ls);
+			i915_dbg("[drm] i915: %s: clock recovery lost during post-training adjustment\n",
+				 dp->o->name);
+			return 0;
+		}
+		if (!lt_channel_eq_ok(ls, dp->lane_count)) {
+			dp_dump_link_status(dp, ls);
+			i915_dbg("[drm] i915: %s: equalisation lost during post-training adjustment\n",
+				 dp->o->name);
+			return 0;
+		}
+		if (!drm_dp_post_lt_adj_req_in_progress(ls) || changes == 6 || timeout) {
+			i915_dbg("[drm] i915: %s: post-training adjustment done (%d changes%s)\n",
+				 dp->o->name, changes, timeout ? ", timed out" : "");
+			return 1;
+		}
+		lg_mdelay(5);
+		if (dp_read_link_status(dp, ls)) {
+			kprintf("[drm] i915: %s: failed to get link status\n", dp->o->name);
+			return 0;
+		}
+		if (dp_get_adjust_train(dp, ls)) {
+			deadline = hrtimer_now_ns() + 200ull * 1000000ull;
+			changes++;
+			if (!dp_update_link_train(dp, cfg)) {
+				kprintf("[drm] i915: %s: failed to update link training\n",
+					dp->o->name);
+				return 0;
+			}
+		} else if (hrtimer_now_ns() > deadline) {
+			timeout = 1;
+		}
+	}
+}
+
+/* Withdraw the grant (LANE_COUNT_SET without POST_LT_ADJ_REQ_GRANTED). */
+static void dp_stop_post_lt_adj_req(struct lg_dp *dp, const struct lg_config *cfg)
+{
+	uint8_t lane_count = (uint8_t)dp->lane_count;
+
+	if (!dp_use_post_lt_adj_req(dp))
+		return;
+	if (cfg->enhanced_framing)
+		lane_count |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
+	(void)dpcd_writeb(dp, DP_LANE_COUNT_SET, lane_count);
 }
 
 /* One full training at the link parameters of the last prepare; the
@@ -1738,6 +2021,9 @@ static int dp_link_train(struct lg_dp *dp, const struct lg_config *cfg)
 
 	(void)dpcd_write(dp, DP_TRAINING_PATTERN_SET, &off, 1);
 	dp_set_idle_link_train(dp);
+	if (passed)
+		passed = dp_post_lt_adj_req(dp, cfg);
+	dp_stop_post_lt_adj_req(dp, cfg);
 	return passed;
 }
 
@@ -2206,20 +2492,41 @@ static int dp_compute_config(struct lg_display *d, struct lg_output *o, struct l
 
 /* ---- detection ---------------------------------------------------------------------- */
 
+/* The link the last training brought up still within what the sink and
+ * the port can do (a sink whose capabilities changed since may not
+ * carry it any more). */
+static int dp_link_params_valid(const struct lg_dp *dp)
+{
+	if (dp->link_rate <= 0 || dp->lane_count <= 0)
+		return 0;
+	if (!I915_FEAT_LEGACY_DP_HELPERS)
+		return 1;
+	return dp->link_rate <= dp->common_rates[dp->num_common_rates - 1] &&
+	       dp->lane_count <= dp->max_lanes;
+}
+
+static int dp_link_ok(const struct lg_dp *dp, const uint8_t *ls)
+{
+	if (lt_channel_eq_ok(ls, dp->lane_count))
+		return 1;
+	dp_dump_link_status(dp, ls);
+	return 0;
+}
+
+/* A running link that lost its equalisation is trained again in place. */
 static void dp_check_link_state(struct lg_dp *dp)
 {
 	struct lg_output *o = dp->o;
-	uint8_t ls[LGDP_LINK_STATUS_SIZE];
+	uint8_t ls[DP_LINK_STATUS_SIZE];
 
 	if (!o->active || !dp->link_active)
 		return;
-	if (dp->link_rate <= 0 || dp->lane_count <= 0)
+	if (!dp_link_params_valid(dp))
 		return;
 	if (!(lg_rd(dp->d, o->reg) & DP_PORT_EN))
 		return;
 	edp_vdd_get(dp);
-	if (dp_read_link_status(dp, ls) == 0 && !channel_eq_ok(ls, dp->lane_count)) {
-		dp_dump_link_status(dp, ls);
+	if (dp_read_link_status(dp, ls) == 0 && !dp_link_ok(dp, ls)) {
 		kprintf("[drm] i915: %s: link lost, retraining\n", o->name);
 		dp_start_and_stop_link_train(dp, &o->cfg);
 	}
@@ -2243,21 +2550,26 @@ static int dp_detect(struct lg_display *d, struct lg_output *o)
 		goto out;
 	connected = 1;
 
-	if (dp_branch(dp) && !(dp_has_sink_count(dp) && (dp->ds_port[0] & LGDP_DS_PORT_HPD))) {
+	/* the compliance counters cover this probe's EDID read only */
+	dp->aux.i2c_nack_count = 0;
+	dp->aux.i2c_defer_count = 0;
+
+	if (dp_branch(dp) &&
+	    !(dp_has_sink_count(dp) && (dp->downstream_ports[0] & DP_DS_PORT_HPD))) {
 		/* A branch device without downstream HPD: a display behind
 		 * it answers on DDC. */
 		if (lg_read_edid(d, o) != 0) {
 			uint8_t type;
 
-			if (dp->dpcd[DP_DPCD_REV] >= LGDP_DPCD_REV_11) {
-				type = dp->ds_port[0] & LGDP_DS_PORT_TYPE_MASK;
-				connected = type == LGDP_DS_PORT_TYPE_VGA ||
-					    type == LGDP_DS_PORT_TYPE_NON_EDID;
+			if (dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_11) {
+				type = dp->downstream_ports[0] & DP_DS_PORT_TYPE_MASK;
+				connected = type == DP_DS_PORT_TYPE_VGA ||
+					    type == DP_DS_PORT_TYPE_NON_EDID;
 			} else {
 				type = dp->dpcd[DP_DOWNSTREAMPORT_PRESENT] &
-				       LGDP_DWN_STRM_PORT_TYPE_MASK;
-				connected = type == LGDP_DWN_STRM_PORT_TYPE_ANALOG ||
-					    type == LGDP_DWN_STRM_PORT_TYPE_OTHER;
+				       DP_DWN_STRM_PORT_TYPE_MASK;
+				connected = type == DP_DWN_STRM_PORT_TYPE_ANALOG ||
+					    type == DP_DWN_STRM_PORT_TYPE_OTHER;
 			}
 			if (!connected)
 				i915_dbg("[drm] i915: %s: broken branch device, ignoring\n", o->name);
@@ -2276,6 +2588,7 @@ out:
 	}
 	dp->has_dpcd = connected;
 	o->detected = connected;
+	dp_set_dpcd_probe(dp, 0);
 	return connected;
 }
 
@@ -2291,7 +2604,10 @@ static int dp_get_modes(struct lg_display *d, struct lg_output *o, int conn)
 		max_clock = (uint32_t)((uint64_t)max_rate * (uint64_t)max_lanes * 8u / 24u);
 		if (d->max_dotclk_khz && max_clock > d->max_dotclk_khz)
 			max_clock = d->max_dotclk_khz;
-		return lg_get_modes_edid(d, o, conn, max_clock);
+		n = lg_get_modes_edid(d, o, conn, max_clock);
+		/* the connector now knows the sink's EDID quirks */
+		dp_set_dpcd_probe(dp, 0);
+		return n;
 	}
 
 	if (o->edid_len) {
@@ -2318,18 +2634,106 @@ static int dp_get_modes(struct lg_display *d, struct lg_output *o, int conn)
 	return n;
 }
 
+/* The device service interrupts these ports do not act on (automated
+ * test requests, content protection, sink specific). */
+#define LGDP_DEVICE_SERVICE_IRQ_MASK_SST \
+	(DP_AUTOMATED_TEST_REQUEST | DP_CP_IRQ | DP_SINK_SPECIFIC_IRQ)
+/* The link service interrupts of a single-stream sink. */
+#define LGDP_LINK_SERVICE_IRQ_MASK_SST \
+	(RX_CAP_CHANGED | LINK_STATUS_CHANGED | HDMI_LINK_STATUS_CHANGED | \
+	 CONNECTED_OFF_ENTRY_REQUESTED | DP_TUNNELING_IRQ)
+
+/* The sink's event vectors: esi[0] SINK_COUNT, esi[1] the device service
+ * vector, esi[3] (DPCD 1.2) the link service vector.  1 when read. */
+static int dp_get_sink_irq_esi_sst(struct lg_dp *dp, uint8_t esi[4])
+{
+	mm_memset(esi, 0, 4);
+	if (drm_dp_dpcd_read_data(&dp->aux, DP_SINK_COUNT, esi, 2) != 0)
+		return 0;
+	if (dp->dpcd[DP_DPCD_REV] < DP_DPCD_REV_12)
+		return 1;
+	return drm_dp_dpcd_read_byte(&dp->aux, DP_LINK_SERVICE_IRQ_VECTOR_ESI0, &esi[3]) == 0;
+}
+
+/* Write back the events taken, which clears them at the sink. */
+static int dp_ack_sink_irq_esi_sst(struct lg_dp *dp, const uint8_t esi[4])
+{
+	if (drm_dp_dpcd_write_byte(&dp->aux, DP_DEVICE_SERVICE_IRQ_VECTOR, esi[1]) != 0)
+		return 0;
+	if (dp->dpcd[DP_DPCD_REV] < DP_DPCD_REV_12)
+		return 1;
+	return drm_dp_dpcd_write_byte(&dp->aux, DP_LINK_SERVICE_IRQ_VECTOR_ESI0, esi[3]) == 0;
+}
+
+static int dp_get_and_ack_sink_irq_esi_sst(struct lg_dp *dp, uint8_t esi[4])
+{
+	if (!dp_get_sink_irq_esi_sst(dp, esi))
+		return 0;
+	esi[1] &= LGDP_DEVICE_SERVICE_IRQ_MASK_SST;
+	esi[3] &= LGDP_LINK_SERVICE_IRQ_MASK_SST;
+	if (!esi[1] && !esi[2] && !esi[3])
+		return 1;
+	return dp_ack_sink_irq_esi_sst(dp, esi);
+}
+
+/* 1 when the connector must be probed again. */
+static int dp_handle_link_service_irq(struct lg_dp *dp, uint8_t irq_mask)
+{
+	int reprobe = 0;
+
+	if (irq_mask & RX_CAP_CHANGED) {
+		dp_reset_link_params(dp);
+		reprobe = 1;
+	}
+	if (irq_mask & LINK_STATUS_CHANGED)
+		dp_check_link_state(dp);
+	if (irq_mask & CONNECTED_OFF_ENTRY_REQUESTED)
+		i915_dbg("[drm] i915: %s: allowing connected off request\n", dp->o->name);
+	return reprobe;
+}
+
+/* A short pulse: the sink reports an event.  1 when it was handled, 0
+ * when the connector needs a full probe (the sink count or the sink's
+ * capabilities changed, a downstream port changed, the vectors could not
+ * be read). */
+static int dp_short_pulse(struct lg_dp *dp)
+{
+	uint8_t esi[4];
+	int reprobe = 0;
+
+	if (!dp_get_and_ack_sink_irq_esi_sst(dp, esi))
+		return 0;
+	/* a changed sink count needs the full detection */
+	if (dp_has_sink_count(dp) && DP_GET_SINK_COUNT(esi[0]) != dp->sink_count)
+		return 0;
+	if (esi[1])
+		i915_dbg("[drm] i915: %s: device service IRQ 0x%02x not handled\n", dp->o->name,
+			 esi[1]);
+	/* The link status is checked on every short pulse, whatever the
+	 * vector says: sinks before DPCD 1.2 have no LINK_STATUS_CHANGED. */
+	esi[3] |= LINK_STATUS_CHANGED;
+	if (dp_handle_link_service_irq(dp, esi[3]))
+		reprobe = 1;
+	if (dp->downstream_port_changed) {
+		dp->downstream_port_changed = 0;
+		reprobe = 1;
+	}
+	return !reprobe;
+}
+
 static void dp_hpd_event(struct lg_display *d, struct lg_output *o, int long_pulse)
 {
 	struct lg_dp *dp = to_dp(o);
 	uint8_t vector = 0, count;
+	int handled;
 
-	(void)d;
 	/* A panel's pulses come from its VDD going on and off; acting on
 	 * them would only raise VDD again. */
 	if (dp->is_edp && (long_pulse || !o->active))
 		return;
 	if (long_pulse) {
 		/* the core probes the port again; the sink may be new */
+		dp_set_dpcd_probe(dp, 1);
 		dp_reset_link_params(dp);
 		return;
 	}
@@ -2337,12 +2741,21 @@ static void dp_hpd_event(struct lg_display *d, struct lg_output *o, int long_pul
 		return;
 
 	edp_vdd_get(dp);
-	if (dp->dpcd[DP_DPCD_REV] >= LGDP_DPCD_REV_11) {
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		handled = dp_short_pulse(dp);
+		edp_vdd_put(dp);
+		if (!handled && !dp->is_edp && o->conn >= 0) {
+			i915_dbg("[drm] i915: %s: short pulse needs a full probe\n", o->name);
+			drm_connector_hotplug(d->drm, o->conn);
+		}
+		return;
+	}
+	if (dp->dpcd[DP_DPCD_REV] >= DP_DPCD_REV_11) {
 		if (dp_has_sink_count(dp) && dpcd_read(dp, DP_SINK_COUNT, &count, 1) == 1)
 			dp->sink_count = ((count & 0x80) >> 1) | (count & 0x3f);
 		/* acknowledge what the sink raised */
-		if (dpcd_read(dp, LGDP_DEVICE_SERVICE_IRQ_VECTOR, &vector, 1) == 1 && vector)
-			(void)dpcd_writeb(dp, LGDP_DEVICE_SERVICE_IRQ_VECTOR, vector);
+		if (dpcd_read(dp, DP_DEVICE_SERVICE_IRQ_VECTOR, &vector, 1) == 1 && vector)
+			(void)dpcd_writeb(dp, DP_DEVICE_SERVICE_IRQ_VECTOR, vector);
 	}
 	/* the short pulse is how a sink reports a lost link */
 	dp_check_link_state(dp);
@@ -2425,10 +2838,33 @@ static void dp_aux_init(struct lg_dp *dp)
 		dp->aux_ctl = LGDP_PCH_AUX_CH_CTL(dp->aux_ch);
 	else
 		dp->aux_ctl = LGDP_AUX_CH_CTL(dp->aux_ch);
-	dp->ddc.xfer = dp_i2c_xfer;
-	dp->ddc.priv = dp;
-	ksnprintf(dp->ddc.name, sizeof(dp->ddc.name), "AUX %c/DP %c", port_name(dp->aux_ch),
+	ksnprintf(dp->aux_name, sizeof(dp->aux_name), "AUX %c/DP %c", port_name(dp->aux_ch),
 		  port_name(dp->o->port));
+
+	if (I915_FEAT_LEGACY_DP_HELPERS) {
+		/* The channel's lock serialises its transactions; no two
+		 * outputs here share a channel (lg_dp_init refuses a
+		 * second claim). */
+		dp->aux.name = dp->aux_name;
+		dp->aux.drm_dev = d->drm;
+		dp->aux.transfer = dp_aux_transfer;
+		drm_dp_aux_init(&dp->aux);
+		/* names the I2C adapter after the channel */
+		(void)drm_dp_aux_register(&dp->aux);
+		dp_set_dpcd_probe(dp, 1);
+		return;
+	}
+	dp->ddc.xfer = lgdp_i2c_xfer;
+	dp->ddc.priv = dp;
+	ksnprintf(dp->ddc.name, sizeof(dp->ddc.name), "%s", dp->aux_name);
+}
+
+/* The I2C adapter the sink's EDID is read through. */
+static struct i2c_adapter *dp_ddc(struct lg_dp *dp)
+{
+	if (I915_FEAT_LEGACY_DP_HELPERS)
+		return &dp->aux.ddc;
+	return &dp->ddc;
 }
 
 static void dp_output_release(struct lg_display *d, struct lg_output *o)
@@ -2474,8 +2910,11 @@ static int edp_init(struct lg_dp *dp)
 		kprintf("[drm] i915: %s: failed to retrieve link info, disabling eDP\n", o->name);
 		return -ENODEV;
 	}
-	/* the eDP display control registers (zero when absent) */
-	if (dpcd_read(dp, DP_EDP_DPCD_REV, dp->edp_dpcd, LGDP_EDP_DPCD_SIZE) != LGDP_EDP_DPCD_SIZE)
+	dp_read_desc(dp);
+	/* The eDP display control registers (zero when absent), read
+	 * whatever DP_EDP_CONFIGURATION_CAP says: some panels need the eDP
+	 * 1.4 rate table without setting the capability bit. */
+	if (dpcd_read(dp, DP_EDP_DPCD_REV, dp->edp_dpcd, EDP_DISPLAY_CTL_CAP_SIZE) != EDP_DISPLAY_CTL_CAP_SIZE)
 		mm_memset(dp->edp_dpcd, 0, sizeof(dp->edp_dpcd));
 	i915_dbg("[drm] i915: %s: eDP DPCD %02x %02x %02x\n", o->name, dp->edp_dpcd[0],
 		 dp->edp_dpcd[1], dp->edp_dpcd[2]);
@@ -2594,11 +3033,11 @@ int lg_dp_init(struct lg_display *d, uint32_t reg, int port)
 	/* G4X and the CPU eDP port reach 0.8 V and 6 dB; the PCH ports,
 	 * Valleyview and Cherryview go to 1.2 V and 9.5 dB. */
 	if (d->is_vlv || d->is_chv || (dp_pch_split(d) && port != LG_PORT_A)) {
-		dp->voltage_max = LGDP_SWING(3);
-		dp->preemph_max = LGDP_PREEMPH(3);
+		dp->voltage_max = DP_TRAIN_VOLTAGE_SWING_LEVEL_3;
+		dp->preemph_max = DP_TRAIN_PRE_EMPH_LEVEL_3;
 	} else {
-		dp->voltage_max = LGDP_SWING(2);
-		dp->preemph_max = LGDP_PREEMPH(2);
+		dp->voltage_max = DP_TRAIN_VOLTAGE_SWING_LEVEL_2;
+		dp->preemph_max = DP_TRAIN_PRE_EMPH_LEVEL_2;
 	}
 
 	/* until a sink says otherwise: one lane at 1.62 Gbit/s */
@@ -2607,7 +3046,7 @@ int lg_dp_init(struct lg_display *d, uint32_t reg, int port)
 	dp->max_sink_lanes = 1;
 
 	dp_aux_init(dp);
-	o->ddc = &dp->ddc;
+	o->ddc = dp_ddc(dp);
 
 	if (is_edp && edp_init(dp)) {
 		dp_output_release(d, o);

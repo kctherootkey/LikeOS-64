@@ -751,6 +751,15 @@ typedef struct task {
 	 * writers, or it deadlocks against them; a positive count bypasses
 	 * writer-preference in the fs rwsem slow path. */
 	int fs_rdepth;
+	/* Count of filesystem rw-semaphore holds of either mode (recursion
+	 * included).  A task holding any of them may still touch user memory
+	 * -- a copy whose page was not resident, or became copy-on-write again
+	 * after the pre-fault -- and the fault takes the address space's
+	 * mmap_lock for reading.  Such a reader must not queue behind a waiting
+	 * mmap_lock writer: the writer waits for the readers already inside,
+	 * and those may be page-ins waiting for the very filesystem lock this
+	 * task holds.  A positive count bypasses writer preference there. */
+	int fs_held;
 
 	// Timer-based sleep support
 	uint64_t
@@ -922,6 +931,11 @@ typedef struct task {
 	 * the writer waits for the first hold to drain and the first hold
 	 * waits behind the writer.  Mirrors fs_rdepth above. */
 	int mm_rdepth;
+	/* Files whose mappings this task retired while holding its address
+	 * space for writing, closed once it lets go (mm_close_deferred): a
+	 * final close can enter the filesystem and take its locks, and must
+	 * not do so under mmap_lock. */
+	void *mm_close_later;
 
 	// ========================================================================
 	// THREAD GROUP SUPPORT (POSIX threads / clone)

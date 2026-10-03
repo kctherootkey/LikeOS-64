@@ -502,6 +502,7 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * resetting it unconditionally costs nothing.) */
 	mm_rwsem_init(&child->mmap_lock, "mmap_lock");
 	child->mm_rdepth = 0;
+	child->mm_close_later = NULL;
 
 	/* Fresh kernel-stack canary — same rationale as sched_fork_current:
 	 * the wholesale copy duplicated the parent's canary; the child's only
@@ -788,6 +789,7 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 		child->ptrace_signal_injected = 0;
 		child->syscall_unix_ref = NULL;
 		child->fs_rdepth = 0;
+		child->fs_held = 0;
 	}
 
 	// Handle CLONE_SETTLS

@@ -157,31 +157,87 @@ static int bind_object(struct i915_vm *vm, struct drm_gem_object *o,
 	return 0;
 }
 
+/* The relocation arrays of a submission, copied into kernel memory before
+ * the submission lock is taken (one array per object, NULL where an object
+ * has none).
+ *
+ * The lock is every client's: the display server's, the browser's and the
+ * video decoder's submissions all pass through it.  Touching user memory
+ * under it -- a page of the array not yet faulted in, swapped to the page
+ * cache, or behind an address-space lock another thread of the client is
+ * queued on -- held every other client's submission for as long as that
+ * one fault took, and a fault that ended the thread instead of returning
+ * left the lock held for good.  So the arrays are read here, with nothing
+ * held, and the presumed offsets go back after the lock is released
+ * (relocs_write_back). */
+static int relocs_copy_in(struct drm_i915_gem_exec_object2 *exs, uint32_t n,
+			  struct drm_i915_gem_relocation_entry ***out)
+{
+	struct drm_i915_gem_relocation_entry **rel = NULL;
+
+	*out = NULL;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t cnt = exs[i].relocation_count;
+		if (cnt == 0)
+			continue;
+		/* relocations are not taken on the discrete parts */
+		if ((g_i915.info->flags & I915_INFO_IS_DGFX) || cnt > EXEC_MAX_RELOCS)
+			goto inval;
+		if (!rel) {
+			rel = kalloc(n * sizeof(*rel));
+			if (!rel)
+				return -ENOMEM;
+			mm_memset(rel, 0, n * sizeof(*rel));
+			*out = rel;
+		}
+		rel[i] = kalloc((size_t)cnt * sizeof(**rel));
+		if (!rel[i])
+			return -ENOMEM;
+		if (copy_user_bounded(rel[i], exs[i].relocs_ptr, (size_t)cnt * sizeof(**rel)))
+			return -EFAULT;
+	}
+	return 0;
+inval:
+	return -EINVAL;
+}
+
+/* The presumed offsets back to the client, with no lock held.  What the
+ * client reads there is a hint for its next submission; a copy that fails
+ * changes nothing about this one. */
+static void relocs_write_back(struct drm_i915_gem_exec_object2 *exs, uint32_t n,
+			      struct drm_i915_gem_relocation_entry **rel)
+{
+	if (!rel)
+		return;
+	for (uint32_t i = 0; i < n; i++)
+		if (rel[i])
+			(void)copy_to_user((void *)(uintptr_t)exs[i].relocs_ptr, rel[i],
+					   (size_t)exs[i].relocation_count * sizeof(*rel[i]));
+}
+
+static void relocs_free(struct drm_i915_gem_relocation_entry **rel, uint32_t n)
+{
+	if (!rel)
+		return;
+	for (uint32_t i = 0; i < n; i++)
+		if (rel[i])
+			kfree(rel[i]);
+	kfree(rel);
+}
+
 /* Relocations of a client without softpin: each names a target object
- * and where in this object the target's address goes. */
-static int apply_relocs(struct drm_file *fp, struct drm_gem_object *o,
-			struct drm_i915_gem_exec_object2 *ex,
-			struct drm_gem_object **objs,
-			struct drm_i915_gem_exec_object2 *exs, uint32_t nobjs,
-			int lut)
+ * and where in this object the target's address goes.  `r' is the
+ * kernel's copy of the object's array (relocs_copy_in); its presumed
+ * offsets are updated here and go back to the client later. */
+static int apply_relocs(struct drm_gem_object *o, struct drm_i915_gem_exec_object2 *ex,
+			struct drm_i915_gem_relocation_entry *r,
+			struct drm_i915_gem_exec_object2 *exs, uint32_t nobjs, int lut)
 {
 	uint32_t n = ex->relocation_count;
-	if (n == 0)
+	if (n == 0 || !r)
 		return 0;
-	/* relocations are not taken on the discrete parts */
-	if (g_i915.info->flags & I915_INFO_IS_DGFX)
-		return -EINVAL;
-	if (n > EXEC_MAX_RELOCS)
-		return -EINVAL;
 	/* The processor writes into the object; the caller has made sure
 	 * no engine is still using it. */
-	struct drm_i915_gem_relocation_entry *r = kalloc(n * sizeof(*r));
-	if (!r)
-		return -ENOMEM;
-	if (copy_user_bounded(r, ex->relocs_ptr, n * sizeof(*r))) {
-		kfree(r);
-		return -EFAULT;
-	}
 	int legacy = i915_is_legacy(&g_i915);
 	int rc = 0;
 	for (uint32_t i = 0; i < n; i++) {
@@ -249,11 +305,6 @@ static int apply_relocs(struct drm_file *fp, struct drm_gem_object *o,
 	}
 	if (legacy)
 		__asm__ volatile("mfence" ::: "memory");
-	if (rc == 0)
-		copy_to_user((void *)(uintptr_t)ex->relocs_ptr, r, n * sizeof(*r));
-	kfree(r);
-	(void)fp;
-	(void)objs;
 	return rc;
 }
 
@@ -358,6 +409,7 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 	uint64_t *tl_handles = NULL, *tl_values = NULL;
 	uint32_t ntl = 0;
 	const char *why = "";
+	struct drm_i915_gem_relocation_entry **relocs = NULL;
 
 	if (!i915->gt_ready)
 		return -ENODEV;
@@ -498,6 +550,15 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 			goto out;
 		}
 	}
+	/* the relocation arrays, read while nothing is held */
+	if (!(a->flags & I915_EXEC_NO_RELOC)) {
+		rc = relocs_copy_in(exs, n, &relocs);
+		if (rc) {
+			why = rc == -ENOMEM ? "memory for the relocations" :
+			      rc == -EFAULT ? "relocation array copy" : "relocation count";
+			goto out;
+		}
+	}
 	waits = kalloc((size_t)n * (1 + I915_ENGINE_CLASSES) * sizeof(*waits));
 	if (!waits) {
 		why = "memory for the waits";
@@ -599,7 +660,9 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 					i915_gem_object_fences(objs[i], 1, 0, waits, &nwait);
 			if (nwait == 0) {
 				for (uint32_t i = 0; i < n; i++) {
-					if ((rc = apply_relocs(fp, objs[i], &exs[i], objs, exs, n, lut))) {
+					if ((rc = apply_relocs(objs[i], &exs[i],
+							       relocs ? relocs[i] : NULL, exs, n,
+							       lut))) {
 						why = "relocations";
 						goto out;
 					}
@@ -753,6 +816,7 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 	for (uint32_t i = 0; i < n; i++)
 		exs[i].offset = addr_to_user(exs[i].offset);
 	copy_to_user((void *)(uintptr_t)a->buffers_ptr, exs, n * sizeof(*exs));
+	relocs_write_back(exs, n, relocs);
 	rc = 0;
 	/* rq keeps the caller's reference until `out', where it is dropped:
 	 * the engine holds its own, so the request stays whole through the
@@ -792,6 +856,7 @@ out:
 		kfree(fences);
 	if (tl_values)
 		kfree(tl_values);
+	relocs_free(relocs, n);
 	if (tl_handles)
 		kfree(tl_handles);
 	if (exs)

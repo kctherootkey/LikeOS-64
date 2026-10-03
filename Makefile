@@ -306,6 +306,11 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/cursor.o \
               $(BUILD_DIR)/fb.o \
               $(BUILD_DIR)/vmsvga2.o \
+              $(BUILD_DIR)/vmsvga2_hw.o \
+              $(BUILD_DIR)/vmsvga2_fifo.o \
+              $(BUILD_DIR)/vmsvga2_irq.o \
+              $(BUILD_DIR)/vmsvga2_gmr.o \
+              $(BUILD_DIR)/vmsvga2_cursor.o \
               $(BUILD_DIR)/fbdev.o \
               $(BUILD_DIR)/drm_drv.o \
               $(BUILD_DIR)/drm_console.o \
@@ -317,10 +322,43 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/drm_edid.o \
               $(BUILD_DIR)/drm_edid_parse.o \
               $(BUILD_DIR)/drm_modes.o \
+              $(BUILD_DIR)/drm_mode_object.o \
+              $(BUILD_DIR)/drm_property.o \
+              $(BUILD_DIR)/drm_plane.o \
+              $(BUILD_DIR)/drm_framebuffer.o \
+              $(BUILD_DIR)/drm_connector.o \
+              $(BUILD_DIR)/drm_probe_helper.o \
+              $(BUILD_DIR)/drm_crtc.o \
+              $(BUILD_DIR)/drm_vblank.o \
+              $(BUILD_DIR)/drm_vblank_work.o \
+              $(BUILD_DIR)/drm_dumb_buffers.o \
+              $(BUILD_DIR)/drm_lease.o \
+              $(BUILD_DIR)/drm_edid_core.o \
+              $(BUILD_DIR)/drm_displayid.o \
+              $(BUILD_DIR)/drm_eld.o \
+              $(BUILD_DIR)/drm_edid_tables.o \
+              $(BUILD_DIR)/drm_fourcc.o \
+              $(BUILD_DIR)/drm_rect.o \
+              $(BUILD_DIR)/drm_damage_helper.o \
+              $(BUILD_DIR)/drm_atomic_helper.o \
+              $(BUILD_DIR)/drm_fence_array.o \
+              $(BUILD_DIR)/drm_fence_chain.o \
+              $(BUILD_DIR)/drm_fence_unwrap.o \
+              $(BUILD_DIR)/drm_sync_file.o \
+              $(BUILD_DIR)/drm_resv.o \
+              $(BUILD_DIR)/drm_blend.o \
+              $(BUILD_DIR)/drm_color_mgmt.o \
+              $(BUILD_DIR)/drm_hdmi_infoframe.o \
+              $(BUILD_DIR)/drm_hdmi_helper.o \
+              $(BUILD_DIR)/drm_scdc_helper.o \
+              $(BUILD_DIR)/drm_dp_dual_mode_helper.o \
+              $(BUILD_DIR)/drm_dp_helper.o \
+              $(BUILD_DIR)/drm_dsc_helper.o \
               $(BUILD_DIR)/i915_pci.o \
               $(BUILD_DIR)/i915_drv.o \
               $(BUILD_DIR)/i915_uncore.o \
               $(BUILD_DIR)/i915_gtt.o \
+              $(BUILD_DIR)/i915_ggtt_view.o \
               $(BUILD_DIR)/i915_irq.o \
               $(BUILD_DIR)/intel_vbt_parse.o \
               $(BUILD_DIR)/intel_opregion.o \
@@ -348,6 +386,20 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/i915_mocs.o \
               $(BUILD_DIR)/i915_vma.o \
               $(BUILD_DIR)/intel_display.o \
+              $(BUILD_DIR)/intel_display_driver.o \
+              $(BUILD_DIR)/intel_plane.o \
+              $(BUILD_DIR)/intel_plane_props.o \
+              $(BUILD_DIR)/intel_dp_link_training.o \
+              $(BUILD_DIR)/intel_legacy_color.o \
+              $(BUILD_DIR)/intel_connector.o \
+              $(BUILD_DIR)/intel_vrr.o \
+              $(BUILD_DIR)/intel_color.o \
+              $(BUILD_DIR)/intel_vblank.o \
+              $(BUILD_DIR)/intel_hdmi_feat.o \
+              $(BUILD_DIR)/intel_vdsc.o \
+              $(BUILD_DIR)/intel_qp_tables.o \
+              $(BUILD_DIR)/intel_dsc_caps.o \
+              $(BUILD_DIR)/intel_dp_dsc.o \
               $(BUILD_DIR)/drm_atomic.o \
               $(BUILD_DIR)/i915_rps.o \
               $(BUILD_DIR)/i915_guc.o \
@@ -411,6 +463,25 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/vmw_stdu.o \
               $(BUILD_DIR)/vmw_msg.o \
               $(BUILD_DIR)/vmw_overlay.o \
+              $(BUILD_DIR)/vmw_kms.o \
+              $(BUILD_DIR)/vmw_fence.o \
+              $(BUILD_DIR)/vmw_ioctl.o \
+              $(BUILD_DIR)/vmw_cursor.o \
+              $(BUILD_DIR)/vmw_cmdbuf.o \
+              $(BUILD_DIR)/vmw_resource.o \
+              $(BUILD_DIR)/vmw_cmd_reserve.o \
+              $(BUILD_DIR)/vmw_binding.o \
+              $(BUILD_DIR)/vmw_so.o \
+              $(BUILD_DIR)/vmw_cmdbuf_res.o \
+              $(BUILD_DIR)/vmw_execbuf_cmds.o \
+              $(BUILD_DIR)/vmw_blit.o \
+              $(BUILD_DIR)/vmw_devcaps.o \
+              $(BUILD_DIR)/vmw_gmrid.o \
+              $(BUILD_DIR)/vmw_scrn.o \
+              $(BUILD_DIR)/vmw_ldu.o \
+              $(BUILD_DIR)/vmw_connector.o \
+              $(BUILD_DIR)/vmw_pm.o \
+              $(BUILD_DIR)/vmw_kms_atomic.o \
               $(BUILD_DIR)/evdev.o \
               $(BUILD_DIR)/interrupt.o \
               $(BUILD_DIR)/interrupt_c.o \
@@ -747,6 +818,18 @@ $(BUILD_DIR)/drm_edid_parse.o: $(KERNEL_DIR)/dev/gpu/drm/drm_edid_parse.c | $(BU
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/drm_modes.o: $(KERNEL_DIR)/dev/gpu/drm/drm_modes.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The rest of the display-manager core, the VMware SVGA driver and the SVGA II
+# hardware layer: one pattern rule per directory, so a new source file needs
+# only its object in KERNEL_OBJS.  The explicit rules above take precedence.
+$(BUILD_DIR)/drm_%.o: $(KERNEL_DIR)/dev/gpu/drm/drm_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmw_%.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmsvga2_%.o: $(KERNEL_DIR)/dev/video/vmsvga2_%.c $(SCREEN_STAMP) | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # The Intel graphics driver (kernel/dev/gpu/i915): one rule per object.

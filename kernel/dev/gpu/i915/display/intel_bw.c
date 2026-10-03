@@ -90,11 +90,6 @@ static uint32_t div_round_closest(uint32_t a, uint32_t b)
 	return b ? (a + b / 2) / b : 0;
 }
 
-static int is_power_of_2(uint32_t v)
-{
-	return v && !(v & (v - 1));
-}
-
 static int plat_is(struct i915_device *i915, int platform)
 {
 	return i915->info->platform == platform;

@@ -17,7 +17,7 @@
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2007 Intel Corporation
-// Portions Copyright (C) 2006 Dave Airlie
+// Portions Copyright (C) 2006 Dave Airlie <airlied@linux.ie>
 // Portions Copyright (C) 2006 Eric Anholt
 // Portions Copyright (C) 2007 Dave Mueller
 // Portions Copyright (C) 2012 Gilles Dartiguelongue, Thomas Richter

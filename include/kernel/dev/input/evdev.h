@@ -24,6 +24,9 @@ struct task;
 
 // Device-file interface (devfs dispatch)
 long evdev_read(int unit, void *user_buf, long bytes, int nonblock);
+/* Events a client injects (whole input_event records): the lock LEDs the
+ * device has; anything else is accepted and ignored. */
+long evdev_write(int unit, const void *user_buf, long bytes);
 int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
 		void *owner);
 /* Release a grab taken through a particular descriptor.  Keyed on the handle

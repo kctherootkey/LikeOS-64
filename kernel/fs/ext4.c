@@ -830,6 +830,7 @@ static void ext4_rwsem_read_lock(ext4_rwsem_t *sem)
 			/* Nested acquisition under our own exclusive hold:
 			 * treat as exclusive recursion. */
 			sem->wdepth++;
+			cur->fs_held++;
 			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
@@ -839,8 +840,10 @@ static void ext4_rwsem_read_lock(ext4_rwsem_t *sem)
 				       !(cur && cur->fs_rdepth);
 		if (!sem->writer && !defer_to_writers) {
 			sem->readers++;
-			if (cur)
+			if (cur) {
 				cur->fs_rdepth++;
+				cur->fs_held++;
+			}
 			if (queued) {
 				sem->r_wait--;
 				/* Cohort drained: the phase is over and the
@@ -869,6 +872,8 @@ static void ext4_rwsem_read_unlock(ext4_rwsem_t *sem)
 		/* matching nested-under-exclusive acquisition */
 		WARN_ON(sem->wdepth <= 1);
 		sem->wdepth--;
+		if (cur->fs_held > 0)
+			cur->fs_held--;
 		spin_unlock_irqrestore(&sem->lock, flags);
 		return;
 	}
@@ -876,6 +881,8 @@ static void ext4_rwsem_read_unlock(ext4_rwsem_t *sem)
 	sem->readers--;
 	if (cur && cur->fs_rdepth > 0)
 		cur->fs_rdepth--;
+	if (cur && cur->fs_held > 0)
+		cur->fs_held--;
 	int wake = (sem->readers == 0);
 	spin_unlock_irqrestore(&sem->lock, flags);
 	if (wake)
@@ -895,6 +902,8 @@ static void ext4_rwsem_write_lock(ext4_rwsem_t *sem)
 			sem->wdepth++; /* reentrant exclusive */
 			if (queued)
 				sem->w_wait--;
+			if (cur)
+				cur->fs_held++;
 			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
@@ -909,6 +918,8 @@ static void ext4_rwsem_write_lock(ext4_rwsem_t *sem)
 			sem->wdepth = 1;
 			if (queued)
 				sem->w_wait--;
+			if (cur)
+				cur->fs_held++;
 			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
@@ -922,9 +933,12 @@ static void ext4_rwsem_write_lock(ext4_rwsem_t *sem)
 
 static void ext4_rwsem_write_unlock(ext4_rwsem_t *sem)
 {
+	task_t *cur = sched_current();
 	uint64_t flags;
 	spin_lock_irqsave(&sem->lock, &flags);
 	WARN_ON(!sem->writer || sem->wdepth <= 0);
+	if (cur && cur->fs_held > 0)
+		cur->fs_held--;
 	if (sem->wdepth > 1) {
 		sem->wdepth--;
 		spin_unlock_irqrestore(&sem->lock, flags);
@@ -6607,35 +6621,27 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	 * previous owner left, so the parts of it this write does NOT cover
 	 * have to be cleared -- see the zeroing below. */
 	int head_created = 0, tail_created = 0;
-	unsigned long have = (cur_size + fs->block_size - 1) / fs->block_size;
-	unsigned long need = (end + fs->block_size - 1) / fs->block_size;
-	if (need > have) {
-		allocated_blocks = 1;
-		unsigned got = ext4_alloc_blocks_for_file(
-			fs, ef->ino, &in, have, (unsigned)(need - have));
-		if (got == 0) {
-			ext4_flush_meta(fs);
-			return -ENOSPC;
-		}
-		have += got;
-		unsigned long max_end = have * fs->block_size;
-		if (end > max_end) {
-			end = max_end;
-			bytes = (long)(end - ef->pos);
-		}
-	}
 
-	/* Blocks inside the file that the write lands on but the file does not
-	 * actually have.
+	/* A write past the end of the file is given blocks for the range it
+	 * covers and nothing else: the stretch between the old end and the
+	 * write stays a hole, which reads as zeros without owning a block.
 	 *
-	 * `have` counts blocks by SIZE, which equals the number of blocks a
-	 * file owns only when it has no holes.  A file extended by ftruncate
-	 * has a size and no blocks at all: a later write inside that range
-	 * found `need <= have`, allocated nothing, and then failed with -EIO
-	 * on a block that was never there.  A hole left by an earlier
-	 * seek-and-write is the same story.
+	 * This used to allocate every block from the old end up to the new
+	 * one.  A small write at a large offset -- a cache or database file
+	 * written sparsely -- then owned the whole gap, and since a block that
+	 * is mapped must not show its previous owner's data, the hole clearing
+	 * below wrote zeros over all of it: gigabytes, synchronously, through
+	 * the page cache to the device, inside a single write() and with the
+	 * filesystem's metadata lock held the whole time.  Every other process
+	 * that needed a page from this filesystem waited behind it.
 	 *
-	 * So the range this write actually covers is checked block by block,
+	 * The loop below creates exactly the blocks the write lands on, inside
+	 * the file or past its end alike. */
+
+	/* The blocks the write lands on that the file does not have -- past
+	 * its end, or in a hole inside it (a file extended by ftruncate has a
+	 * size and no blocks at all; an earlier seek-and-write leaves a hole
+	 * behind it).  The range this write covers is checked block by block,
 	 * and whatever is missing is created.  Only that range -- the rest of
 	 * the file stays sparse, which is what it is for.
 	 */
@@ -6796,26 +6802,20 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	 * cache while writes went past it, so a file could be read back as its
 	 * old contents until something dropped the page. */
 
-	/* A write that starts past the end of the file leaves a hole behind it,
-	 * and the hole must read as zeros.
+	/* A write that starts past the end of the file leaves a gap behind it,
+	 * and the gap must read as zeros.
 	 *
-	 * Nothing was making it do so.  Allocation reserves blocks in the
-	 * bitmap and maps them into the extent tree; it does not clear them,
-	 * so a block handed to this file still holds what its previous owner
-	 * put there.  The write covers only its own range, so every block
-	 * between the old end of file and the start of the new data keeps that
-	 * content -- and a read of the hole returns it.  That is not merely
-	 * wrong bytes: those blocks belonged to somebody else's file, and this
-	 * hands them to whoever can read this one.
+	 * Most of it does by itself: the blocks between the old end and the
+	 * write are not allocated (see above), and a hole reads as zeros.  What
+	 * does not is the part of the old last block beyond the old end of
+	 * file -- that block is mapped, and its tail holds whatever was there
+	 * before (a previous owner's data, or bytes a truncate cut off).  So
+	 * the gap is cleared through the same cache the data goes through,
+	 * and ext4_zero_range skips every block the file does not have: only
+	 * that tail, at most one block, is written.
 	 *
-	 * So the hole is written, as zeros, through the same cache the data
-	 * goes through -- which means a read sees zeros at once rather than
-	 * after a writeback, and a whole page of hole costs no device read on
-	 * the way in.
-	 *
-	 * The cost falls only where the hole is.  An ordinary append starts at
-	 * exactly the old end of file, so there is no hole and this does
-	 * nothing at all. */
+	 * An ordinary append starts at exactly the old end of file, so there
+	 * is no gap and this does nothing at all. */
 	if (write_start > cur_size) {
 		unsigned long hend = (write_start < end) ? write_start : end;
 
@@ -9343,41 +9343,89 @@ static unsigned s_ord_cap;
 /* Set when an inode could not be recorded.  The set is then incomplete, so the
  * commit falls back to storing everything -- slower, never wrong. */
 static int s_ord_overflow;
+/* The array and its count are changed under the I/O lock as described above,
+ * and also under this, so that the commit thread can read the set before it
+ * takes the I/O lock (ext4_ordered_writeback). */
+static spinlock_t s_ord_lock = SPINLOCK_INIT("ext4_ordered");
 
 static void ext4_ordered_add(unsigned long ino)
 {
+	uint64_t fl;
+
 	if (ino == 0)
 		return;
 
-	for (unsigned i = 0; i < s_ord_n; i++)
-		if (s_ord_ino[i] == ino)
+	spin_lock_irqsave(&s_ord_lock, &fl);
+	for (unsigned i = 0; i < s_ord_n; i++) {
+		if (s_ord_ino[i] == ino) {
+			spin_unlock_irqrestore(&s_ord_lock, fl);
 			return; /* already recorded */
-
-	if (s_ord_n == s_ord_cap) {
-		unsigned ncap = s_ord_cap ? s_ord_cap * 2 :
-					    EXT4_ORDERED_INIT_CAP;
-		unsigned long *n =
-			(unsigned long *)kalloc(ncap * sizeof(unsigned long));
-
-		if (!n) {
-			/* Cannot record it, so the set no longer describes the
-			 * transaction.  Say so; the commit will store
-			 * everything rather than miss this inode. */
-			s_ord_overflow = 1;
-			return;
 		}
-		for (unsigned i = 0; i < s_ord_n; i++)
-			n[i] = s_ord_ino[i];
-		if (s_ord_ino)
-			kfree(s_ord_ino);
-		s_ord_ino = n;
-		s_ord_cap = ncap;
 	}
+	if (s_ord_n < s_ord_cap) {
+		s_ord_ino[s_ord_n++] = ino;
+		spin_unlock_irqrestore(&s_ord_lock, fl);
+		return;
+	}
+	spin_unlock_irqrestore(&s_ord_lock, fl);
+
+	/* Grown outside the spinlock (allocation may sleep).  Nothing else
+	 * adds meanwhile: every writer holds the I/O lock exclusively. */
+	unsigned ncap = s_ord_cap ? s_ord_cap * 2 : EXT4_ORDERED_INIT_CAP;
+	unsigned long *n = (unsigned long *)kalloc(ncap * sizeof(unsigned long));
+	unsigned long *old;
+
+	if (!n) {
+		/* Cannot record it, so the set no longer describes the
+		 * transaction.  Say so; the commit will store everything
+		 * rather than miss this inode. */
+		s_ord_overflow = 1;
+		return;
+	}
+	spin_lock_irqsave(&s_ord_lock, &fl);
+	for (unsigned i = 0; i < s_ord_n; i++)
+		n[i] = s_ord_ino[i];
+	old = s_ord_ino;
+	s_ord_ino = n;
+	s_ord_cap = ncap;
 	s_ord_ino[s_ord_n++] = ino;
+	spin_unlock_irqrestore(&s_ord_lock, fl);
+	if (old)
+		kfree(old);
+}
+
+/* The set as it stands, as cache ids, in a fresh array the caller frees;
+ * NULL when it is empty (or there is no memory for the copy). */
+static unsigned long *ext4_ordered_snapshot(unsigned *count)
+{
+	uint64_t fl;
+	unsigned want, n = 0;
+	unsigned long *copy;
+
+	*count = 0;
+	spin_lock_irqsave(&s_ord_lock, &fl);
+	want = s_ord_n;
+	spin_unlock_irqrestore(&s_ord_lock, fl);
+	if (!want)
+		return NULL;
+	copy = (unsigned long *)kalloc((want + 16) * sizeof(unsigned long));
+	if (!copy)
+		return NULL;
+	spin_lock_irqsave(&s_ord_lock, &fl);
+	for (unsigned i = 0; i < s_ord_n && n < want + 16; i++)
+		copy[n++] = EXT4_BID_ENC(s_ord_ino[i], 0);
+	spin_unlock_irqrestore(&s_ord_lock, fl);
+	if (!n) {
+		kfree(copy);
+		return NULL;
+	}
+	*count = n;
+	return copy;
 }
 
 /*
  * Store the data this transaction is responsible for, and forget it.
+ * Caller holds the I/O lock.
  *
  * Returns non-zero if anything was written, so the caller knows whether a
  * barrier is needed before the commit.
@@ -9385,6 +9433,9 @@ static void ext4_ordered_add(unsigned long ino)
 static int ext4_ordered_flush(void)
 {
 	int wrote = 0;
+	unsigned n;
+	unsigned long *ids;
+	uint64_t fl;
 
 	might_sleep();
 
@@ -9394,18 +9445,51 @@ static int ext4_ordered_flush(void)
 		WARN_ON_ONCE(1);
 		wrote = pagecache_flush_all();
 		s_ord_overflow = 0;
+		spin_lock_irqsave(&s_ord_lock, &fl);
 		s_ord_n = 0;
+		spin_unlock_irqrestore(&s_ord_lock, fl);
 		return wrote;
 	}
 
 	/* One pass over the dirty list for the whole set, not one per file. */
-	if (s_ord_n) {
-		for (unsigned i = 0; i < s_ord_n; i++)
-			s_ord_ino[i] = EXT4_BID_ENC(s_ord_ino[i], 0);
-		wrote = pagecache_flush_fileset(s_ord_ino, s_ord_n);
+	ids = ext4_ordered_snapshot(&n);
+	if (ids) {
+		wrote = pagecache_flush_fileset(ids, n);
+		kfree(ids);
+	} else if (s_ord_n) {
+		/* no memory for the copy: store everything */
+		wrote = pagecache_flush_all();
 	}
+	spin_lock_irqsave(&s_ord_lock, &fl);
 	s_ord_n = 0;
+	spin_unlock_irqrestore(&s_ord_lock, fl);
 	return wrote;
+}
+
+/*
+ * The same data, stored by the commit thread BEFORE it takes the I/O lock.
+ *
+ * The commit holds the I/O lock -- the metadata lock, exclusively -- from the
+ * moment it starts until the transaction is on the device, and every lookup,
+ * stat and page-in on the filesystem waits for it meanwhile.  Storing the
+ * transaction's file data inside that hold made it as long as the data took to
+ * reach the device: after a browser had cached a few hundred megabytes of
+ * video, tens of seconds on a USB stick, with every program that needed a page
+ * from disk frozen.  Written here first, a batch at a time (each batch takes
+ * the lock only around its own device writes, so readers get their turn in
+ * between), the commit is left with only what was written in the last moment.
+ * The order the commit promises -- data before the metadata that refers to it
+ * -- is kept: the commit still stores whatever is dirty, under the lock.
+ */
+static void ext4_ordered_writeback(void)
+{
+	unsigned n;
+	unsigned long *ids = ext4_ordered_snapshot(&n);
+
+	if (!ids)
+		return;
+	(void)pagecache_flush_fileset(ids, n);
+	kfree(ids);
 }
 
 static void ext4_journal_flush(ext4_fs_t *fs)
@@ -10050,6 +10134,8 @@ static void ext4_flush_thread(void *arg)
 		 * otherwise skip this whole block -- still stores the sizes
 		 * write() left in memory on a timer. */
 		if (g_ext4_fs && (g_ext4_fs->j_enabled || s_di_n)) {
+			if (g_ext4_fs->j_enabled)
+				ext4_ordered_writeback();
 			ext4_io_lock();
 			/* Sizes and timestamps that write() left in memory get
 			 * stored here, on the same schedule and for the same

@@ -1,24 +1,116 @@
-// LikeOS -- display-manager fences and sync_file descriptors.
+// LikeOS -- display-manager fences.
 //
 // A fence is a point in the GPU's command stream; it signals when the
 // device has passed it.  Userspace waits on it by handle (the backend's
-// fence ioctls) or as a sync_file descriptor: poll() readable when
-// signalled, mergeable with another into a fence for both.
+// fence ioctls) or as a sync_file descriptor (drm_sync_file.c): poll()
+// readable when signalled, mergeable with others into one fence for all.
+//
+// Inside the kernel a fence can also call back: drm_fence_add_callback()
+// runs a function when it signals, which is what fence containers are made
+// of -- an array (drm_fence_array.c) signals when its parts have, a chain
+// link (drm_fence_chain.c) when its fence and every earlier point have.
+// Containers are not on the device's list of live fences; they live by
+// their reference count and borrow the lock of a device they wait on.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Canonical's and
+// Texas Instruments' code: GPL-2.0-only
+// Portions Copyright (C) 2012 Canonical Ltd
+// Portions Copyright (C) 2012 Texas Instruments
 
 #include <kernel/dev/gpu/drm.h>
-#include <kernel/uapi/drm/sync_file.h>
-#include <kernel/uapi/ioctl.h>
+#include <kernel/dev/gpu/drm_fence_unwrap.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/hrtimer.h>
-#include <kernel/ke/uaccess.h>
-#include <kernel/fs/file.h>
 #include <kernel/mm/memory.h>
 #include <kernel/net/net.h>
+#include <kernel/uapi/bug.h>
+
+/* ---- the callback list ------------------------------------------------- */
+
+static inline void cbl_init(struct drm_fence_cb_node *n)
+{
+	n->next = n;
+	n->prev = n;
+}
+
+static inline int cbl_empty(const struct drm_fence_cb_node *n)
+{
+	return n->next == n;
+}
+
+static inline void cbl_add_tail(struct drm_fence_cb_node *n,
+				struct drm_fence_cb_node *head)
+{
+	n->prev = head->prev;
+	n->next = head;
+	head->prev->next = n;
+	head->prev = n;
+}
+
+static inline void cbl_del_init(struct drm_fence_cb_node *n)
+{
+	n->prev->next = n->next;
+	n->next->prev = n->prev;
+	cbl_init(n);
+}
+
+/* What every fence starts as; `f' is zeroed by the caller. */
+static void fence_init_common(struct drm_fence *f, struct drm_device *dev)
+{
+	f->refs = 1;
+	f->dev = dev;
+	wq_head_init(&f->wq, "drm_fence");
+	cbl_init(&f->cb_list);
+}
+
+/* Mark signalled, under dev->lock.  The time is written before the flag,
+ * so whoever sees the flag also sees when. */
+static inline void fence_mark_signaled_locked(struct drm_fence *f, uint64_t ts)
+{
+	f->signal_ns = ts;
+	__atomic_store_n(&f->signaled, 1, __ATOMIC_RELEASE);
+}
+
+/* Run the callbacks of a fence that has just been marked signalled, by
+ * whoever marked it (and holds a reference to it).
+ *
+ * One at a time, each taken off the list under the lock and called with
+ * the lock dropped: a callback drops references (drm_fence_put() takes this
+ * lock) and signals other fences (which takes it too) -- under the lock,
+ * the first array whose last part signalled would deadlock.  Interrupts
+ * stay off around each call, so a callback is never preempted half-way and
+ * drm_fence_remove_callback() waiting for it on another processor waits
+ * for a few instructions, not for a time slice.
+ *
+ * The unlocked look at the list first is safe: once the flag is set no
+ * callback is added any more (drm_fence_add_callback() checks it under the
+ * lock), and a callback being removed concurrently is found or not found
+ * under the lock below. */
+static void fence_run_callbacks(struct drm_fence *f)
+{
+	struct drm_device *dev = f->dev;
+	uint64_t fl;
+
+	if (cbl_empty(&f->cb_list))
+		return;
+	spin_lock_irqsave(&dev->lock, &fl);
+	while (!cbl_empty(&f->cb_list)) {
+		struct drm_fence_cb *cb = (struct drm_fence_cb *)f->cb_list.next;
+		drm_fence_func_t fn = cb->func;
+
+		cbl_del_init(&cb->node);
+		f->cb_running = cb;
+		spin_unlock(&dev->lock); /* interrupts stay disabled */
+		fn(f, cb);
+		spin_lock(&dev->lock);
+		f->cb_running = NULL;
+	}
+	spin_unlock_irqrestore(&dev->lock, fl);
+}
 
 struct drm_fence *drm_fence_create(struct drm_device *dev, uint32_t seqno,
 				   uint32_t flags)
@@ -29,20 +121,16 @@ struct drm_fence *drm_fence_create(struct drm_device *dev, uint32_t seqno,
 	if (!f)
 		return NULL;
 	mm_memset(f, 0, sizeof(*f));
-	f->refs = 1;
-	f->dev = dev;
+	fence_init_common(f, dev);
 	f->seqno = seqno;
 	f->flags = flags;
-	wq_head_init(&f->wq, "drm_fence");
 	spin_lock_irqsave(&dev->lock, &fl);
 	f->next = dev->fences;
 	dev->fences = f;
 	/* Already passed?  (A fence created for a seqno the device has
 	 * been seen to pass, or a signalled placeholder.) */
-	if ((int32_t)(dev->fence_passed - seqno) >= 0) {
-		f->signaled = 1;
-		f->signal_ns = hrtimer_now_ns();
-	}
+	if ((int32_t)(dev->fence_passed - seqno) >= 0)
+		fence_mark_signaled_locked(f, hrtimer_now_ns());
 	spin_unlock_irqrestore(&dev->lock, fl);
 	return f;
 }
@@ -56,14 +144,12 @@ struct drm_fence *drm_fence_create_ctx(struct drm_device *dev,
 	if (!f)
 		return NULL;
 	mm_memset(f, 0, sizeof(*f));
-	f->refs = 1;
-	f->dev = dev;
+	fence_init_common(f, dev);
 	f->context = context;
 	f->seqno64 = seqno64;
 	/* Out of the device-wide sequence's way: a stream fence is never
 	 * "already passed" by that numbering. */
 	f->seqno = dev->fence_passed;
-	wq_head_init(&f->wq, "drm_fence");
 	spin_lock_irqsave(&dev->lock, &fl);
 	f->next = dev->fences;
 	dev->fences = f;
@@ -97,14 +183,14 @@ static void fence_merged_update(struct drm_device *dev)
 			if (!a->signaled || (b && !b->signaled))
 				continue;
 			f->error = a->error ? a->error : (b ? b->error : 0);
-			f->signaled = 1;
-			f->signal_ns = hrtimer_now_ns();
+			fence_mark_signaled_locked(f, hrtimer_now_ns());
 			drm_fence_get(f);
 			wake[nw++] = f;
 		}
 		spin_unlock_irqrestore(&dev->lock, fl);
 		for (int i = 0; i < nw; i++) {
 			poll_notify_wq(&wake[i]->wq);
+			fence_run_callbacks(wake[i]);
 			drm_fence_put(wake[i]);
 		}
 		if (nw == 0)
@@ -119,6 +205,11 @@ struct drm_fence *drm_fence_merge(struct drm_fence *a, struct drm_fence *b)
 	struct drm_device *dev = a->dev;
 	uint64_t fl;
 
+	/* A container among the parts must be watching its own parts, or
+	 * nothing would ever mark it signalled for the walk below to see.
+	 * (Nothing to do for a device's own fences.) */
+	drm_fence_enable_signaling(a);
+	drm_fence_enable_signaling(b);
 	if (a == b || (b->signaled && !b->error)) {
 		drm_fence_get(a);
 		return a;
@@ -131,8 +222,7 @@ struct drm_fence *drm_fence_merge(struct drm_fence *a, struct drm_fence *b)
 	if (!m)
 		return NULL;
 	mm_memset(m, 0, sizeof(*m));
-	m->refs = 1;
-	m->dev = dev;
+	fence_init_common(m, dev);
 	m->flags = a->flags | b->flags;
 	/* no stream of its own: nothing but its parts signal it */
 	m->context = 0;
@@ -141,7 +231,6 @@ struct drm_fence *drm_fence_merge(struct drm_fence *a, struct drm_fence *b)
 	drm_fence_get(b);
 	m->deps[0] = a;
 	m->deps[1] = b;
-	wq_head_init(&m->wq, "drm_fence");
 	__atomic_fetch_add(&g_merged_live, 1, __ATOMIC_ACQ_REL);
 	spin_lock_irqsave(&dev->lock, &fl);
 	m->next = dev->fences;
@@ -168,8 +257,7 @@ void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
 		     f = f->next) {
 			if (!f->signaled && f->context == context &&
 			    f->seqno64 <= passed) {
-				f->signaled = 1;
-				f->signal_ns = hrtimer_now_ns();
+				fence_mark_signaled_locked(f, hrtimer_now_ns());
 				drm_fence_get(f);
 				wake[nw++] = f;
 			}
@@ -177,6 +265,7 @@ void drm_fence_signal_upto_ctx(struct drm_device *dev, uint64_t context,
 		spin_unlock_irqrestore(&dev->lock, fl);
 		for (int i = 0; i < nw; i++) {
 			poll_notify_wq(&wake[i]->wq);
+			fence_run_callbacks(wake[i]);
 			drm_fence_put(wake[i]);
 		}
 		if (nw < 64)
@@ -200,6 +289,18 @@ struct drm_fence *drm_fence_signalled(struct drm_device *dev)
 void drm_fence_get(struct drm_fence *f)
 {
 	__atomic_fetch_add(&f->refs, 1, __ATOMIC_ACQ_REL);
+}
+
+/* The end of a fence nobody refers to any more.  A callback still queued
+ * on it means somebody added one without holding a reference, as the
+ * contract asks: say so, since that somebody is about to be called never. */
+static void fence_release(struct drm_fence *f)
+{
+	WARN_ON(!cbl_empty(&f->cb_list));
+	if (f->ops && f->ops->release)
+		f->ops->release(f);
+	else
+		kfree(f);
 }
 
 /* The last reference is dropped UNDER dev->lock, not before taking it.
@@ -228,6 +329,15 @@ void drm_fence_put(struct drm_fence *f)
 	struct drm_device *dev = f->dev;
 	uint64_t fl;
 
+	/* A fence on no list (a container, a private stub) cannot be found
+	 * by a walker with its count at zero, so the count alone decides --
+	 * no lock, which also lets a callback drop the last reference to
+	 * the container it belongs to. */
+	if (__atomic_load_n(&f->sflags, __ATOMIC_ACQUIRE) & DRM_FENCE_SF_UNLISTED) {
+		if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) == 0)
+			fence_release(f);
+		return;
+	}
 	spin_lock_irqsave(&dev->lock, &fl);
 	if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) != 0) {
 		spin_unlock_irqrestore(&dev->lock, fl);
@@ -249,20 +359,44 @@ void drm_fence_put(struct drm_fence *f)
 		drm_fence_put(f->deps[0]);
 		drm_fence_put(f->deps[1]);
 	}
-	kfree(f);
+	fence_release(f);
+}
+
+/* Signal one fence at `ts': -EINVAL when it had signalled already.  The
+ * caller holds a reference.  The flag is set under the lock, so exactly
+ * one signaller gets to run the callbacks. */
+static int fence_signal_ts(struct drm_fence *f, uint64_t ts)
+{
+	struct drm_device *dev = f->dev;
+	uint64_t fl;
+
+	spin_lock_irqsave(&dev->lock, &fl);
+	if (f->signaled) {
+		spin_unlock_irqrestore(&dev->lock, fl);
+		return -EINVAL;
+	}
+	fence_mark_signaled_locked(f, ts);
+	spin_unlock_irqrestore(&dev->lock, fl);
+	poll_notify_wq(&f->wq);
+	fence_run_callbacks(f);
+	fence_merged_update(dev);
+	/* whoever waits for "anything on the device" (a buffer's poll) */
+	poll_notify_wq(&dev->vbl_wq);
+	return 0;
 }
 
 void drm_fence_signal(struct drm_fence *f)
 {
 	if (f->signaled)
 		return;
-	f->signaled = 1;
-	f->signal_ns = hrtimer_now_ns();
-	poll_notify_wq(&f->wq);
-	fence_merged_update(f->dev);
-	/* whoever waits for "anything on the device" (a buffer's poll) */
-	if (f->dev)
-		poll_notify_wq(&f->dev->vbl_wq);
+	fence_signal_ts(f, hrtimer_now_ns());
+}
+
+int drm_fence_signal_timestamp(struct drm_fence *f, uint64_t timestamp_ns)
+{
+	if (WARN_ON(!f))
+		return -EINVAL;
+	return fence_signal_ts(f, timestamp_ns);
 }
 
 void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
@@ -313,8 +447,7 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 			 * and a merged one are signalled by their own */
 			if (!f->signaled && !f->context && !f->deps[0] &&
 			    (int32_t)(passed - f->seqno) >= 0) {
-				f->signaled = 1;
-				f->signal_ns = hrtimer_now_ns();
+				fence_mark_signaled_locked(f, hrtimer_now_ns());
 				drm_fence_get(f);
 				wake[nw++] = f;
 			}
@@ -322,6 +455,7 @@ void drm_fence_signal_upto(struct drm_device *dev, uint32_t passed)
 		spin_unlock_irqrestore(&dev->lock, fl);
 		for (int i = 0; i < nw; i++) {
 			poll_notify_wq(&wake[i]->wq);
+			fence_run_callbacks(wake[i]);
 			drm_fence_put(wake[i]);
 		}
 		if (nw < 64)
@@ -363,10 +497,39 @@ static void fence_poll_wake(hrtimer_t *t)
 	}
 }
 
+/* A container's parts may be on any device: ask the device of each part
+ * still pending, once per run of parts on the same device and for at most
+ * a few devices, then let the container look at its parts. */
+static void fence_poll_parts(struct drm_fence *f)
+{
+	struct drm_fence_unwrap it;
+	struct drm_fence *p;
+	struct drm_device *last = NULL;
+	int asked = 0;
+
+	drm_fence_unwrap_for_each(p, &it, f) {
+		if (p->signaled || p->dev == last)
+			continue;
+		last = p->dev;
+		if (last && last->drv && last->drv->fence_poll)
+			last->drv->fence_poll(last);
+		if (++asked >= 4) {
+			drm_fence_unwrap_end(&it);
+			break;
+		}
+	}
+	drm_fence_is_signaled(f);
+}
+
 static void drm_fence_poll(struct drm_fence *f)
 {
 	struct drm_device *dev = f->dev;
 
+	if (f->ops) {
+		if (!f->signaled)
+			fence_poll_parts(f);
+		return;
+	}
 	if (!f->signaled && dev && dev->drv && dev->drv->fence_poll)
 		dev->drv->fence_poll(dev);
 }
@@ -398,6 +561,28 @@ void drm_fence_report_stuck(struct drm_fence *f, uint64_t waited_ns, const char 
 		struct drm_fence *part = !f->deps[0]->signaled ? f->deps[0] : f->deps[1];
 		if (part && !part->signaled)
 			f = part;
+	}
+	if (f->ops) {
+		/* a container: the driver can only speak for one of its
+		 * parts -- the first still pending */
+		struct drm_fence_unwrap it;
+		struct drm_fence *p, *leaf = NULL;
+
+		drm_fence_unwrap_for_each(p, &it, f) {
+			if (!p->signaled) {
+				drm_fence_get(p);
+				leaf = p;
+				drm_fence_unwrap_end(&it);
+				break;
+			}
+		}
+		if (!leaf)
+			return;
+		dev = leaf->dev;
+		if (dev && dev->drv && dev->drv->fence_stuck)
+			dev->drv->fence_stuck(dev, leaf);
+		drm_fence_put(leaf);
+		return;
 	}
 	if (dev && dev->drv && dev->drv->fence_stuck)
 		dev->drv->fence_stuck(dev, f);
@@ -499,153 +684,346 @@ int drm_fence_wait_flags(struct drm_fence *f, uint64_t timeout_ns, int intr)
 {
 	if (f->signaled)
 		return 0;
+	/* A container is signalled by its parts' callbacks, once it has
+	 * been asked to watch them; the wait below then sleeps on its queue
+	 * exactly as on a device's fence. */
+	if (f->ops)
+		drm_fence_enable_signaling(f);
 	return fence_wait_do(f, timeout_ns, intr);
 }
 
-/* ---- sync_file ------------------------------------------------------- */
+/* ---- callbacks, status, deadlines -------------------------------------- */
 
-struct sync_file_ctx {
-	struct drm_fence *fence;
-	char name[32];
+void drm_fence_enable_signaling(struct drm_fence *f)
+{
+	if (!f || !f->ops || !f->ops->enable_signaling)
+		return;
+	/* Once: whoever sets the bit does the arming. */
+	if (__atomic_fetch_or(&f->sflags, DRM_FENCE_SF_ENABLE_SIGNAL,
+			      __ATOMIC_ACQ_REL) & DRM_FENCE_SF_ENABLE_SIGNAL)
+		return;
+	if (f->signaled)
+		return;
+	/* Without the lock: arming adds callbacks to the parts, and the
+	 * parts may share this fence's lock (one device's lock for all its
+	 * fences). */
+	if (!f->ops->enable_signaling(f))
+		fence_signal_ts(f, hrtimer_now_ns());
+}
+
+int drm_fence_add_callback(struct drm_fence *f, struct drm_fence_cb *cb,
+			   drm_fence_func_t func)
+{
+	uint64_t fl;
+	int ret = 0;
+
+	if (WARN_ON(!f || !cb || !func))
+		return -EINVAL;
+	if (f->signaled) {
+		cbl_init(&cb->node);
+		return -ENOENT;
+	}
+	drm_fence_enable_signaling(f);
+	spin_lock_irqsave(&f->dev->lock, &fl);
+	if (f->signaled) {
+		cbl_init(&cb->node);
+		ret = -ENOENT;
+	} else {
+		cb->func = func;
+		cbl_add_tail(&cb->node, &f->cb_list);
+	}
+	spin_unlock_irqrestore(&f->dev->lock, fl);
+	return ret;
+}
+
+bool drm_fence_remove_callback(struct drm_fence *f, struct drm_fence_cb *cb)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&f->dev->lock, &fl);
+	if (!cbl_empty(&cb->node)) {
+		cbl_del_init(&cb->node);
+		spin_unlock_irqrestore(&f->dev->lock, fl);
+		return true;
+	}
+	/* Off the list because it is being run: the caller is about to free
+	 * or reuse it, so not before the runner is done with it.  The runner
+	 * has interrupts off, so this is a matter of instructions. */
+	while (f->cb_running == cb) {
+		spin_unlock_irqrestore(&f->dev->lock, fl);
+		for (int i = 0; i < 64; i++)
+			__asm__ volatile("pause" ::: "memory");
+		spin_lock_irqsave(&f->dev->lock, &fl);
+	}
+	spin_unlock_irqrestore(&f->dev->lock, fl);
+	return false;
+}
+
+bool drm_fence_is_signaled(struct drm_fence *f)
+{
+	if (f->signaled)
+		return true;
+	if (f->ops && f->ops->signaled && f->ops->signaled(f)) {
+		fence_signal_ts(f, hrtimer_now_ns());
+		return true;
+	}
+	return false;
+}
+
+bool drm_fence_poll_signaled(struct drm_fence *f)
+{
+	if (f->signaled)
+		return true;
+	drm_fence_poll(f);
+	return drm_fence_is_signaled(f);
+}
+
+int drm_fence_get_status(struct drm_fence *f)
+{
+	if (!drm_fence_is_signaled(f))
+		return 0;
+	return f->error < 0 ? f->error : 1;
+}
+
+void drm_fence_set_error(struct drm_fence *f, int error)
+{
+	WARN_ON(f->signaled);
+	WARN_ON(error >= 0 || error < -4095);
+	f->error = error;
+}
+
+void drm_fence_set_deadline(struct drm_fence *f, uint64_t deadline_ns)
+{
+	struct drm_device *dev = f->dev;
+
+	if (drm_fence_is_signaled(f))
+		return;
+	if (f->ops) {
+		if (f->ops->set_deadline)
+			f->ops->set_deadline(f, deadline_ns);
+		return;
+	}
+	if (f->deps[0]) {
+		/* a merged fence: both halves are what is waited for */
+		drm_fence_set_deadline(f->deps[0], deadline_ns);
+		if (f->deps[1])
+			drm_fence_set_deadline(f->deps[1], deadline_ns);
+		return;
+	}
+	if (dev && dev->drv && dev->drv->fence_set_deadline)
+		dev->drv->fence_set_deadline(dev, f, deadline_ns);
+}
+
+/* Stream numbers for fences that are not an engine's.  Engines number
+ * their own streams from small values; these start far above them. */
+static uint64_t g_fence_context_next = 1ULL << 32;
+
+uint64_t drm_fence_context_alloc(unsigned num)
+{
+	WARN_ON(!num);
+	return __atomic_fetch_add(&g_fence_context_next, num ? num : 1,
+				  __ATOMIC_RELAXED);
+}
+
+/* Timelines derived from an address are tagged in the top bits, where no
+ * allocated stream number reaches: bit 63 alone for a merged fence (a
+ * timeline of its own), bits 63 and 62 for a device's device-wide
+ * sequence. */
+#define FENCE_TL_ADDR_MASK 0x0000FFFFFFFFFFFFULL
+#define FENCE_TL_OWN (1ULL << 63)
+#define FENCE_TL_DEVICE ((1ULL << 63) | (1ULL << 62))
+
+uint64_t drm_fence_timeline(const struct drm_fence *f)
+{
+	if (f->context)
+		return f->context;
+	if (f->deps[0])
+		return FENCE_TL_OWN | ((uint64_t)(uintptr_t)f & FENCE_TL_ADDR_MASK);
+	return FENCE_TL_DEVICE | ((uint64_t)(uintptr_t)f->dev & FENCE_TL_ADDR_MASK);
+}
+
+/* On a stream the position is 64 bits and only grows; the device-wide
+ * sequence is 32 bits and compared the way drm_fence_signal_upto()
+ * compares it, across the wrap. */
+bool drm_fence_is_later(const struct drm_fence *a, const struct drm_fence *b)
+{
+	if (a->context)
+		return a->seqno64 > b->seqno64;
+	if (a->deps[0])
+		return false;
+	return (int32_t)(a->seqno - b->seqno) > 0;
+}
+
+bool drm_fence_is_later_or_same(const struct drm_fence *a, const struct drm_fence *b)
+{
+	return a == b || !drm_fence_is_later(b, a);
+}
+
+const char *drm_fence_driver_name(struct drm_fence *f)
+{
+	if (f->ops && f->ops->get_driver_name)
+		return f->ops->get_driver_name(f);
+	if (f->dev && f->dev->drv && f->dev->drv->name)
+		return f->dev->drv->name;
+	return "drm";
+}
+
+void drm_fence_timeline_name(struct drm_fence *f, char *buf, unsigned len)
+{
+	if (!len)
+		return;
+	if (f->ops && f->ops->get_timeline_name)
+		ksnprintf(buf, len, "%s", f->ops->get_timeline_name(f));
+	else if (f->name[0])
+		ksnprintf(buf, len, "%s", f->name);
+	else if (f->deps[0])
+		ksnprintf(buf, len, "merged");
+	else if (f->context)
+		ksnprintf(buf, len, "stream-%llx", (unsigned long long)f->context);
+	else
+		ksnprintf(buf, len, "%s", drm_fence_driver_name(f));
+}
+
+void drm_fence_init_unlisted(struct drm_fence *f, struct drm_device *dev,
+			     const struct drm_fence_ops *ops, uint64_t context,
+			     uint64_t seqno64)
+{
+	fence_init_common(f, dev);
+	f->ops = ops;
+	f->context = context;
+	f->seqno64 = seqno64;
+	f->seqno = (uint32_t)seqno64;
+	f->sflags = DRM_FENCE_SF_UNLISTED;
+}
+
+static const char *fence_stub_name(struct drm_fence *f)
+{
+	(void)f;
+	return "stub";
+}
+
+static const struct drm_fence_ops fence_stub_ops = {
+	.get_driver_name = fence_stub_name,
+	.get_timeline_name = fence_stub_name,
 };
 
-static long sync_file_ioctl(vfs_file_t *f, unsigned long req, void *argp,
-			    struct task *cur)
+struct drm_fence *drm_fence_signalled_at(struct drm_device *dev,
+					 uint64_t timestamp_ns)
 {
-	struct sync_file_ctx *c = device_file_priv(f);
-	(void)cur;
-
-	if (_IOC_TYPE(req) != SYNC_IOC_MAGIC)
-		return -ENOTTY;
-	if (_IOC_NR(req) == 3) { /* SYNC_IOC_MERGE */
-		struct sync_merge_data md;
-
-		if (copy_from_user(&md, argp, sizeof(md)) != 0)
-			return -EFAULT;
-		struct drm_fence *other = drm_fence_from_fd(md.fd2);
-		if (!other)
-			return -EINVAL;
-		/* The merged fence: signalled when both are.  (Taking the
-		 * later of two sequence numbers is no answer: an engine's
-		 * fences number a stream of their own, and two engines'
-		 * streams say nothing about each other -- a fence made that
-		 * way was signalled from the start.) */
-		struct drm_fence *m = drm_fence_merge(c->fence, other);
-		if (!m) {
-			drm_fence_put(other);
-			return -ENOMEM;
-		}
-		int fd = drm_fence_export_fd(m, (md.flags & 1) ? 1 : 0);
-		drm_fence_put(m);
-		drm_fence_put(other);
-		if (fd < 0)
-			return fd;
-		md.fence = fd;
-		if (copy_to_user(argp, &md, sizeof(md)) != 0)
-			return -EFAULT;
-		return 0;
-	}
-	if (_IOC_NR(req) == 4) { /* SYNC_IOC_FILE_INFO */
-		struct sync_file_info info;
-
-		if (copy_from_user(&info, argp, sizeof(info)) != 0)
-			return -EFAULT;
-		mm_memset(info.name, 0, sizeof(info.name));
-		for (int i = 0; c->name[i] && i < 31; i++)
-			info.name[i] = c->name[i];
-		info.status = c->fence->signaled ? 1 : 0;
-		info.flags = 0;
-		if (info.num_fences >= 1 && info.sync_fence_info) {
-			struct sync_fence_info fi;
-
-			mm_memset(&fi, 0, sizeof(fi));
-			for (int i = 0; c->name[i] && i < 31; i++)
-				fi.obj_name[i] = c->name[i];
-			fi.driver_name[0] = 'd';
-			fi.driver_name[1] = 'r';
-			fi.driver_name[2] = 'm';
-			fi.status = info.status;
-			fi.timestamp_ns = c->fence->signal_ns;
-			if (copy_to_user((void *)(uintptr_t)info.sync_fence_info,
-					 &fi, sizeof(fi)) != 0)
-				return -EFAULT;
-		}
-		info.num_fences = 1;
-		if (copy_to_user(argp, &info, sizeof(info)) != 0)
-			return -EFAULT;
-		return 0;
-	}
-	return -ENOTTY;
-}
-
-static short sync_file_poll(vfs_file_t *f, short events, struct poll_table *pt)
-{
-	struct sync_file_ctx *c = device_file_priv(f);
-
-	poll_wait(pt, f, &c->fence->wq);
-	return (events & POLLIN) && c->fence->signaled ? POLLIN : 0;
-}
-
-static void sync_file_release(vfs_file_t *f)
-{
-	struct sync_file_ctx *c = device_file_priv(f);
-
-	if (c) {
-		drm_fence_put(c->fence);
-		kfree(c);
-	}
-}
-
-static const struct device_ops sync_file_ops = {
-	.ioctl = sync_file_ioctl,
-	.poll = sync_file_poll,
-	.release = sync_file_release,
-};
-
-int drm_fence_export_fd(struct drm_fence *f, int cloexec)
-{
-	task_t *cur = sched_current();
-	struct sync_file_ctx *c = kalloc(sizeof(*c));
-
-	if (!c)
-		return -ENOMEM;
-	mm_memset(c, 0, sizeof(*c));
-	drm_fence_get(f);
-	c->fence = f;
-	ksnprintf(c->name, sizeof(c->name), "%s:%u", f->dev->drv->name, f->seqno);
-	vfs_file_t *file = device_anon_file(&sync_file_ops, c, "sync_file", O_RDWR);
-	if (!file) {
-		drm_fence_put(f);
-		kfree(c);
-		return -ENOMEM;
-	}
-	file->refcount = 1;
-	int fd = fd_install(cur, file);
-	if (fd < 0) {
-		vfs_close(file);
-		return fd;
-	}
-	if (cloexec)
-		task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
-	return fd;
-}
-
-struct drm_fence *drm_fence_from_fd(int fd)
-{
-	task_t *cur = sched_current();
-	vfs_file_t *f = fdget(cur, fd);
+	struct drm_fence *f = kalloc(sizeof(*f));
 
 	if (!f)
 		return NULL;
-	if (device_file_ops(f) != &sync_file_ops) {
-		fdput(f);
-		return NULL;
+	mm_memset(f, 0, sizeof(*f));
+	drm_fence_init_unlisted(f, dev, &fence_stub_ops, 0, 0);
+	fence_mark_signaled_locked(f, timestamp_ns); /* nobody else sees it yet */
+	return f;
+}
+
+/* ---- waiting for any of several ---------------------------------------- */
+
+static int fence_any_signaled(struct drm_fence **fences, uint32_t count,
+			      uint32_t *idx, int poll)
+{
+	for (uint32_t i = 0; i < count; i++) {
+		if (poll ? drm_fence_poll_signaled(fences[i]) :
+			   drm_fence_is_signaled(fences[i])) {
+			if (idx)
+				*idx = i;
+			return 1;
+		}
 	}
-	struct sync_file_ctx *c = device_file_priv(f);
-	struct drm_fence *fence = c->fence;
-	drm_fence_get(fence);
-	fdput(f);
-	return fence;
+	return 0;
+}
+
+/* The shape of fence_wait_do(), over several fences: a short spin asking
+ * the devices, then sleeps on every fence's queue at once with a backing-
+ * off poll deadline, since not every device interrupts. */
+int drm_fence_wait_any_timeout(struct drm_fence **fences, uint32_t count,
+			       int intr, uint64_t timeout_ns, uint32_t *idx)
+{
+	task_t *cur = sched_current();
+	struct wait_queue_entry *we;
+	uint64_t start, deadline, spin_until, poll_ns = DRM_FENCE_POLL_NS;
+	int stuck_said = 0, ret = 0;
+
+	if (WARN_ON(!fences || !count))
+		return -EINVAL;
+	if (fence_any_signaled(fences, count, idx, 0))
+		return 0;
+	if (!timeout_ns)
+		return fence_any_signaled(fences, count, idx, 1) ? 0 : -ETIMEDOUT;
+	for (uint32_t i = 0; i < count; i++)
+		drm_fence_enable_signaling(fences[i]);
+	we = kcalloc(count, sizeof(*we));
+	if (!we)
+		return -ENOMEM;
+	start = hrtimer_now_ns();
+	deadline = start + timeout_ns;
+	spin_until = start + DRM_FENCE_SPIN_NS;
+	for (;;) {
+		if (fence_any_signaled(fences, count, idx, 1))
+			break;
+		if (intr && signal_pending(cur)) {
+			ret = -ERESTARTSYS;
+			break;
+		}
+		uint64_t now = hrtimer_now_ns();
+		if (now >= deadline) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (!stuck_said && now - start >= DRM_FENCE_STUCK_NS) {
+			stuck_said = 1;
+			drm_fence_report_stuck(fences[0], now - start, "a wait for any fence");
+		}
+		if (now < spin_until) {
+			for (int i = 0; i < 64; i++)
+				__asm__ volatile("pause" ::: "memory");
+			continue;
+		}
+		hrtimer_t poll_timer;
+		int highres = hrtimer_is_highres();
+		int done = 0;
+		uint64_t fl;
+
+		if (highres)
+			hrtimer_init(&poll_timer, fence_poll_wake, cur);
+		fl = local_irq_save();
+		for (uint32_t i = 0; i < count; i++) {
+			wq_entry_init(&we[i], cur);
+			wq_add(&fences[i]->wq, &we[i]);
+		}
+		for (uint32_t i = 0; i < count && !done; i++)
+			if (fences[i]->signaled)
+				done = 1;
+		if (done) {
+			local_irq_restore(fl);
+			for (uint32_t i = 0; i < count; i++)
+				wq_remove(&fences[i]->wq, &we[i]);
+			continue;
+		}
+		cur->wait_channel = fences[0];
+		if (highres) {
+			hrtimer_start(&poll_timer, now + poll_ns);
+			if (poll_ns < DRM_FENCE_POLL_MAX_NS)
+				poll_ns *= 2;
+		} else {
+			cur->wakeup_tick = timer_ticks() + 1;
+		}
+		cur->state = TASK_BLOCKED;
+		local_irq_restore(fl);
+		sched_schedule();
+		if (highres)
+			hrtimer_cancel(&poll_timer);
+		/* see fence_wait_do(): this deadline belongs to this poll */
+		cur->wakeup_tick = 0;
+		cur->wait_channel = NULL;
+		for (uint32_t i = 0; i < count; i++)
+			wq_remove(&fences[i]->wq, &we[i]);
+	}
+	kfree(we);
+	return ret;
 }
 
 /* ---- per-file fence handles ------------------------------------------- */

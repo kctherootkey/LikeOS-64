@@ -1,7 +1,14 @@
 // LikeOS -- display-manager core: devices, files, ioctl dispatch,
-// events, the primary/render nodes.
+// events, the primary/render nodes, and taking a device down and up again
+// (suspend / resume) with the gate that keeps clients off the hardware
+// meanwhile.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: HPND-sell-variant
+// Portions Copyright (c) 2016 Intel Corporation
+// SPDX-License-Identifier for the portions derived from the DRM ioctl code: MIT
+// Portions Copyright 1999 Precision Insight, Inc., Cedar Park, Texas.
+// Portions Copyright 2000 VA Linux Systems, Inc., Sunnyvale, California.
 
 #include <kernel/dev/gpu/drm.h>
 #include <kernel/dev/gpu/drm_internal.h>
@@ -11,6 +18,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/cred.h>
+#include <kernel/ke/timer.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 #include <kernel/fs/sysfs.h>
@@ -52,6 +60,12 @@ static int drm_open(struct devfs_node *node, vfs_file_t *file, int flags,
 
 	if (!fp)
 		return -ENOMEM;
+	/* The driver's per-file state and taking the display may reach the
+	 * hardware: not while the device is down. */
+	if (drm_pm_gate_enter_flags(dev, 1)) {
+		kfree(fp);
+		return -EINTR;
+	}
 	mm_memset(fp, 0, sizeof(*fp));
 	fp->dev = dev;
 	/* Every handle this file hands out carries this number, so an id
@@ -76,6 +90,7 @@ static int drm_open(struct devfs_node *node, vfs_file_t *file, int flags,
 		int rc = dev->drv->open(dev, fp);
 		if (rc) {
 			kfree(fp);
+			drm_pm_gate_exit(dev);
 			return rc;
 		}
 	}
@@ -99,6 +114,7 @@ static int drm_open(struct devfs_node *node, vfs_file_t *file, int flags,
 	 * Render nodes never carry the display and never become master. */
 	if (!fp->is_render && !dev->master)
 		(void)drm_master_set(dev, fp);
+	drm_pm_gate_exit(dev);
 	return 0;
 }
 
@@ -111,6 +127,11 @@ static void drm_release(vfs_file_t *file)
 	if (!fp)
 		return;
 	dev = fp->dev;
+	/* What follows hands objects back to the driver and may give the
+	 * screen back to the console: not while the device is down.  Not
+	 * interruptible -- a close cannot fail -- and a suspend only waits so
+	 * long for it (drm_suspend). */
+	(void)drm_pm_gate_enter_flags(dev, 0);
 	if (fp->is_master)
 		drm_master_drop(dev, fp);
 	/* Every handle this file held. */
@@ -147,6 +168,7 @@ static void drm_release(vfs_file_t *file)
 		kfree(e);
 	}
 	kfree(fp);
+	drm_pm_gate_exit(dev);
 }
 
 /* ---- master / auth ------------------------------------------------------ */
@@ -278,14 +300,29 @@ static long drm_read(vfs_file_t *file, void *buf, long bytes, int nonblock)
 		fl = local_irq_save();
 		wq_entry_init(&we, cur);
 		wq_add(&fp->wq, &we);
-		if (!fp->events) {
-			cur->wait_channel = fp;
-			cur->state = TASK_BLOCKED;
-			local_irq_restore(fl);
-			sched_schedule();
-		} else {
-			local_irq_restore(fl);
+		/* Blocked first, the queue looked at second: an event queued
+		 * on another processor between a look and the state store
+		 * would find this task still running, wake nothing, and leave
+		 * it asleep with the event pending.  Looked at after, the
+		 * event is either seen here or its wake finds the task
+		 * blocked.  Undone with a compare-and-swap, since a waker may
+		 * already have claimed the task. */
+		cur->wait_channel = fp;
+		cur->state = TASK_BLOCKED;
+		if (__atomic_load_n(&fp->events, __ATOMIC_ACQUIRE)) {
+			task_state_t expected = TASK_BLOCKED;
+			if (__atomic_compare_exchange_n(&cur->state, &expected, TASK_RUNNING,
+							false, __ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				cur->wait_channel = NULL;
+				local_irq_restore(fl);
+				wq_remove(&fp->wq, &we);
+				continue;
+			}
 		}
+		local_irq_restore(fl);
+		sched_schedule();
+		cur->wait_channel = NULL;
 		wq_remove(&fp->wq, &we);
 	}
 }
@@ -427,6 +464,34 @@ static int drm_is_render_only_ok(unsigned nr)
 		return 1;
 	default:
 		return drm_syncobj_is_ioctl(nr);
+	}
+}
+
+/* The calls that never reach the hardware and do not wait for it: the
+ * version and capability queries, authentication, and waiting for a
+ * vblank (the counter is the core's; a crtc that is down answers at
+ * once).  Everything else -- every driver command, every mode-setting call
+ * (a probe talks to the sink), handle and object calls (a destroyed object
+ * is handed back to the driver) -- goes through the power gate. */
+static int drm_ioctl_is_gated(unsigned nr, int is_driver_ioctl)
+{
+	if (!DRM_PM_GATE)
+		return 0;
+	if (is_driver_ioctl)
+		return 1;
+	switch (nr) {
+	case 0x00: /* VERSION */
+	case 0x01: /* GET_UNIQUE */
+	case 0x02: /* GET_MAGIC */
+	case 0x07: /* SET_VERSION */
+	case 0x0c: /* GET_CAP */
+	case 0x0d: /* SET_CLIENT_CAP */
+	case 0x11: /* AUTH_MAGIC */
+	case 0x3a: /* WAIT_VBLANK */
+	case 0x3b: /* CRTC_GET_SEQUENCE */
+		return 0;
+	default:
+		return 1;
 	}
 }
 
@@ -576,11 +641,29 @@ static long drm_core_ioctl(struct drm_device *dev, struct drm_file *fp,
 	case 0x0d: { /* SET_CLIENT_CAP */
 		struct drm_set_client_cap *c = kb;
 		switch (c->capability) {
+#if DRM_CURSOR_HOTSPOT
+		case DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT:
+			/* "I set the cursor's hot spot": only meaningful where
+			 * the cursor planes have one, and only for an atomic
+			 * client (it unhides them, drm_mode_getplane_res). */
+			if (!(dev->drv->features & DRM_FEATURE_CURSOR_HOTSPOT))
+				return -EOPNOTSUPP;
+			if (!((fp->client_caps >> DRM_CLIENT_CAP_ATOMIC) & 1))
+				return -EINVAL;
+			if (c->value > 1)
+				return -EINVAL;
+			if (c->value)
+				fp->client_caps |= 1ULL << c->capability;
+			else
+				fp->client_caps &= ~(1ULL << c->capability);
+			return 0;
+#else
+		case DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT:
+#endif
 		case DRM_CLIENT_CAP_UNIVERSAL_PLANES:
 		case DRM_CLIENT_CAP_ATOMIC:
 		case DRM_CLIENT_CAP_ASPECT_RATIO:
 		case DRM_CLIENT_CAP_WRITEBACK_CONNECTORS:
-		case DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT:
 			if (c->value)
 				fp->client_caps |= 1ULL << c->capability;
 			else
@@ -732,6 +815,15 @@ static long drm_ioctl(vfs_file_t *file, unsigned long req, void *argp,
 			return -EACCES;
 	}
 
+	/* While the device is down (or going down, or coming back) a call
+	 * that may reach it waits here; see drm_pm_gate_enter(). */
+	int gated = drm_ioctl_is_gated(nr, is_driver_ioctl);
+	if (gated) {
+		rc = drm_pm_gate_enter(dev);
+		if (rc)
+			return rc;
+	}
+
 	if (is_driver_ioctl) {
 		rc = dev->drv->ioctl ? dev->drv->ioctl(dev, fp,
 						       nr - DRM_COMMAND_BASE, dir,
@@ -750,6 +842,8 @@ static long drm_ioctl(vfs_file_t *file, unsigned long req, void *argp,
 		if (!handled)
 			rc = -ENOTTY;
 	}
+	if (gated)
+		drm_pm_gate_exit(dev);
 
 	/* A refused ioctl is a client error and belongs in the return value,
 	 * not on the console -- except that the client here is a driver stack
@@ -787,7 +881,13 @@ static long drm_ioctl(vfs_file_t *file, unsigned long req, void *argp,
 		}
 	}
 
-	if (rc == 0 && (dir & _IOC_READ) && size) {
+	/* The argument goes back on success, and also when a signal cut the
+	 * call short: the waits record their progress in it (WAIT_VBLANK
+	 * turns a relative target into an absolute one, FENCE_WAIT keeps its
+	 * deadline in kernel_cookie), and the restarted call must see that,
+	 * not the original request, or every restart starts the wait over. */
+	if ((rc == 0 || rc == -ERESTARTSYS || rc == -EINTR) &&
+	    (dir & _IOC_READ) && size) {
 		if (!argp || !validate_user_ptr((uint64_t)argp, size))
 			return -EFAULT;
 		if (copy_to_user(argp, kbuf, size) != 0)
@@ -1000,23 +1100,195 @@ static long drm_show_gem_stats(struct pfs_node *n, char *buf, long cap)
 
 /* ---- power ---------------------------------------------------------------- */
 
+/*
+ * The power gate.
+ *
+ * Between a driver's suspend and its resume nothing may reach the
+ * hardware: no command submitted, no fence polled, no object handed back
+ * to the driver for destruction, no mode set.  Every caller that may do one
+ * of those -- the ioctls, a closing file, the object reaper -- passes the
+ * gate first and leaves it when done.  A suspend closes the gate, waits
+ * for the callers inside to leave, and only then takes the hardware down;
+ * a resume brings it back and shows the committed state again with the gate
+ * still closed, and opens it only after that.
+ *
+ * It is a count and a state under a spinlock rather than a sleeping
+ * reader/writer lock, for two reasons.  A caller may be inside for a long
+ * time -- a client waiting on a fence with no timeout -- and a writer that
+ * queues behind it would hold every other caller of the device behind
+ * itself for as long: the suspend here gives up after a few seconds
+ * instead and the device runs on.  And callers that may not block (the
+ * reaper, an object's last reference dropped while an address space is
+ * locked) get a plain answer from drm_pm_gate_tryenter() and leave their
+ * work for later.
+ */
+
+/* How long a suspend waits for the calls inside the gate to leave. */
+#define DRM_PM_DRAIN_TIMEOUT_MS 3000
+/* How often a waiter looks again, should a wake-up be missed. */
+#define DRM_PM_WAIT_SLICE_MS 10
+
+/* Sleep on the gate's channel for at most `ms'.  Process context, no
+ * spinlock held. */
+static void pm_sleep(struct drm_device *dev, unsigned ms)
+{
+	task_t *self = sched_current();
+
+	if (!self)
+		return;
+	self->wait_channel = (void *)&dev->pm_state;
+	self->wakeup_tick = timer_ticks() + timer_ms_to_ticks(ms) + 1;
+	self->state = TASK_BLOCKED;
+	sched_schedule();
+	self->wakeup_tick = 0;
+	self->wait_channel = NULL;
+	if (self->state != TASK_RUNNING)
+		self->state = TASK_RUNNING;
+}
+
+static void pm_set_state(struct drm_device *dev, int state)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&dev->pm_lock, &fl);
+	dev->pm_state = state;
+	spin_unlock_irqrestore(&dev->pm_lock, fl);
+	sched_wake_channel((void *)&dev->pm_state);
+}
+
+int drm_pm_gate_enter_flags(struct drm_device *dev, int intr)
+{
+	task_t *cur = sched_current();
+
+	for (;;) {
+		uint64_t fl;
+
+		spin_lock_irqsave(&dev->pm_lock, &fl);
+		if (!DRM_PM_GATE || dev->pm_state == DRM_PM_RUNNING) {
+			dev->pm_active++;
+			spin_unlock_irqrestore(&dev->pm_lock, fl);
+			return 0;
+		}
+		spin_unlock_irqrestore(&dev->pm_lock, fl);
+		/* Nothing has been done yet: the call can start again. */
+		if (intr && cur && signal_pending(cur))
+			return -ERESTARTSYS;
+		pm_sleep(dev, DRM_PM_WAIT_SLICE_MS);
+	}
+}
+
+int drm_pm_gate_enter(struct drm_device *dev)
+{
+	return drm_pm_gate_enter_flags(dev, 1);
+}
+
+bool drm_pm_gate_tryenter(struct drm_device *dev)
+{
+	uint64_t fl;
+	bool ok;
+
+	spin_lock_irqsave(&dev->pm_lock, &fl);
+	ok = !DRM_PM_GATE || dev->pm_state == DRM_PM_RUNNING;
+	if (ok)
+		dev->pm_active++;
+	spin_unlock_irqrestore(&dev->pm_lock, fl);
+	return ok;
+}
+
+void drm_pm_gate_exit(struct drm_device *dev)
+{
+	uint64_t fl;
+	int wake;
+
+	spin_lock_irqsave(&dev->pm_lock, &fl);
+	if (WARN_ON(dev->pm_active <= 0))
+		dev->pm_active = 1;
+	dev->pm_active--;
+	wake = dev->pm_active == 0 && dev->pm_state == DRM_PM_SUSPENDING;
+	spin_unlock_irqrestore(&dev->pm_lock, fl);
+	if (wake)
+		sched_wake_channel((void *)&dev->pm_state);
+}
+
+/* Close the gate and wait for whoever is inside: 0, or -EBUSY when they
+ * did not leave in time (the gate is open again). */
+static int pm_drain(struct drm_device *dev)
+{
+	uint64_t deadline = timer_ticks() + timer_ms_to_ticks(DRM_PM_DRAIN_TIMEOUT_MS) + 1;
+
+	if (!DRM_PM_GATE)
+		return 0;
+	for (;;) {
+		uint64_t fl;
+		int inside;
+
+		spin_lock_irqsave(&dev->pm_lock, &fl);
+		inside = dev->pm_active;
+		spin_unlock_irqrestore(&dev->pm_lock, fl);
+		if (!inside)
+			return 0;
+		if (timer_ticks() >= deadline) {
+			kprintf("[drm] %s: suspend refused: %d call(s) still inside after %u ms\n",
+				dev->drv->name, inside, DRM_PM_DRAIN_TIMEOUT_MS);
+			return -EBUSY;
+		}
+		pm_sleep(dev, DRM_PM_WAIT_SLICE_MS);
+	}
+}
+
+/* Claim a transition from `from' to `to': 0, 1 when the device is in
+ * `done' already (nothing to do), -EBUSY while another one runs. */
+static int pm_claim(struct drm_device *dev, int from, int to, int done)
+{
+	uint64_t fl;
+	int rc;
+
+	spin_lock_irqsave(&dev->pm_lock, &fl);
+	if (dev->pm_state == from) {
+		dev->pm_state = to;
+		rc = 0;
+	} else {
+		rc = dev->pm_state == done ? 1 : -EBUSY;
+	}
+	spin_unlock_irqrestore(&dev->pm_lock, fl);
+	return rc;
+}
+
+static int pm_supported(const struct drm_driver *drv, int resume)
+{
+	if (resume ? !drv->resume : !drv->suspend)
+		return 0;
+	return DRM_PM_ANY_DRIVER || drv->atomic_commit;
+}
+
 int drm_suspend(struct drm_device *dev)
 {
 	int rc;
 
-	if (!dev->drv->suspend || !dev->drv->atomic_commit)
+	if (!pm_supported(dev->drv, 0))
 		return -ENODEV;
-	if (dev->suspended)
-		return 0;
+	rc = pm_claim(dev, DRM_PM_RUNNING, DRM_PM_SUSPENDING, DRM_PM_SUSPENDED);
+	if (rc)
+		return rc > 0 ? 0 : rc;
+	rc = pm_drain(dev);
+	if (rc) {
+		pm_set_state(dev, DRM_PM_RUNNING);
+		/* objects freed while the gate was closing were parked */
+		drm_gem_pm_resumed(dev);
+		return rc;
+	}
 	/* The console keeps drawing into its buffer; nothing pushes it
 	 * while the device is down. */
 	drm_console_suspend(dev);
 	rc = dev->drv->suspend(dev);
 	if (rc) {
 		drm_console_resume(dev);
+		pm_set_state(dev, DRM_PM_RUNNING);
+		drm_gem_pm_resumed(dev);
 		return rc;
 	}
 	dev->suspended = 1;
+	pm_set_state(dev, DRM_PM_SUSPENDED);
 	kprintf("[drm] %s: suspended\n", dev->drv->name);
 	return 0;
 }
@@ -1025,25 +1297,32 @@ int drm_resume(struct drm_device *dev)
 {
 	int rc;
 
-	if (!dev->drv->resume || !dev->drv->atomic_commit)
+	if (!pm_supported(dev->drv, 1))
 		return -ENODEV;
-	if (!dev->suspended)
-		return 0;
+	rc = pm_claim(dev, DRM_PM_SUSPENDED, DRM_PM_RESUMING, DRM_PM_RUNNING);
+	if (rc)
+		return rc > 0 ? 0 : rc;
 	rc = dev->drv->resume(dev);
 	if (rc) {
 		kprintf("[drm] %s: resume failed (%d)\n", dev->drv->name, rc);
+		pm_set_state(dev, DRM_PM_SUSPENDED);
 		return rc;
 	}
 	dev->suspended = 0;
-	/* What was shown before is shown again: the committed state, every
-	 * active crtc as a fresh mode set. */
-	rc = drm_atomic_replay(dev);
+	/* What was shown before is shown again, with the gate still closed
+	 * so that nothing a client does (or an object freed meanwhile) runs
+	 * into the middle of it: the committed state with every active crtc
+	 * as a fresh mode set, or the legacy calls that made it. */
+	rc = dev->drv->atomic_commit ? drm_atomic_replay(dev) : drm_legacy_replay(dev);
 	if (rc)
 		kprintf("[drm] %s: the display did not come back (%d)\n",
 			dev->drv->name, rc);
 	/* the console's pushes resume; its mode was part of the replay
 	 * when it owns the screen, so no second mode set */
 	drm_console_resume_pushes(dev);
+	pm_set_state(dev, DRM_PM_RUNNING);
+	/* the objects whose teardown waited at the gate meanwhile */
+	drm_gem_pm_resumed(dev);
 	kprintf("[drm] %s: resumed\n", dev->drv->name);
 	return rc;
 }
@@ -1102,6 +1381,9 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 	dev->pci = pci;
 	dev->index = next_index++;
 	spinlock_init(&dev->lock, "drm_dev");
+	spinlock_init(&dev->pm_lock, "drm_pm");
+	dev->pm_state = DRM_PM_RUNNING;
+	dev->pm_active = 0;
 	wq_head_init(&dev->vbl_wq, "drm_vbl");
 	dev->next_mode_id = 32;
 	if (pci)
@@ -1170,7 +1452,7 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 		 * drm_show_gem_stats(). */
 		sysfs_add_attr(base, "gem_stats", drm_show_gem_stats, NULL, dev,
 			       0);
-		if (drv->suspend && drv->resume && drv->atomic_commit)
+		if (pm_supported(drv, 0) && pm_supported(drv, 1))
 			sysfs_add_attr(base, "power_state", drm_show_power_state,
 				       drm_store_power_state, dev, 0);
 	}

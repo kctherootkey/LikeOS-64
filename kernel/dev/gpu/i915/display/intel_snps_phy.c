@@ -1382,6 +1382,25 @@ int dg2_phy_pll_get_hdmi(struct i915_device *i915, struct intel_output *o, uint3
 	return o->port;
 }
 
+int dg2_phy_hdmi_clock_ok(struct i915_device *i915, const struct intel_output *o,
+			  uint32_t clock_khz)
+{
+	struct mpllb_state st;
+	uint32_t got;
+
+	(void)i915;
+	if (!o || !port_ok(o->port) || !clock_khz)
+		return 0;
+	if (table_find(dg2_hdmi_tables, clock_khz))
+		return 1;
+	/* computed settings: the same half-percent bound as when the PLL
+	 * is taken (dg2_phy_pll_get_hdmi()) */
+	mm_memset(&st, 0, sizeof(st));
+	mpllb_compute_hdmi(&st, clock_khz);
+	got = mpllb_port_clock(&st);
+	return (got > clock_khz ? got - clock_khz : clock_khz - got) <= clock_khz / 200;
+}
+
 void dg2_phy_pll_put(struct i915_device *i915, int pll)
 {
 	if (!port_ok(pll))

@@ -23,6 +23,7 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
+ * Copyright (C) 2026 The LikeOS Project
  */
 
 /*
@@ -1511,6 +1512,7 @@ typedef enum SVGAMobFormat {
 
    SVGA3D_MOBFMT_MAX,
 
+   SVGA3D_MOBFMT_HB,
 } SVGAMobFormat;
 
 #define SVGA3D_MOB_EMPTY_BASE 1

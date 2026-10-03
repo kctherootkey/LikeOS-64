@@ -21,13 +21,27 @@
 // 64, 128 or 256.  Several gen2/3 parts fetch the cursor by physical
 // address, so its image is copied into a contiguous buffer of our own.
 //
+// From gen4 the primary plane and the cursor scan out rotated by 180
+// degrees (the plane then starts at the last pixel of its window: the
+// offsets point there, and a GMCH cursor's base does too), and the primary
+// plane of Cherryview's pipe B also reflects along x.  The primary planes
+// sit at the immutable zpos 0, the cursors above them; the cursors, and
+// Valleyview's and Cherryview's primary planes, blend pre-multiplied.  The
+// pipe gamma and CSC enables each control register carries are the
+// pipe's colour state's (intel_legacy_color.c).
+//
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2020-2025 Intel Corporation
+// Portions Copyright (C) 2020 Intel Corporation
+// Portions Copyright (C) 2024 Intel Corporation
 
 #include <kernel/dev/gpu/i915/intel_legacy.h>
 #include <kernel/dev/gpu/i915/intel_display_legacy.h>
 #include <kernel/dev/gpu/i915/i915_legacy.h>
+#include <kernel/dev/gpu/i915/intel_legacy_color.h>
+#include <kernel/dev/gpu/i915/intel_features.h>
+#include <kernel/dev/gpu/drm_blend.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/ke/interrupt.h>
@@ -307,15 +321,128 @@ void lg_plane_init(struct lg_display *d)
 		d->pipes[p].plane = cross ? !p : p;
 }
 
+/* ---- plane properties ------------------------------------------------------------- */
+
+/* The rotation each primary plane is asked for (lg_plane_set_rotation),
+ * and the one its control register and offsets were last written with. */
+static uint32_t g_rotation[LG_MAX_PIPES];
+static uint32_t g_rotation_hw[LG_MAX_PIPES];
+
+void lg_plane_set_rotation(struct lg_display *d, int pipe, uint32_t rotation)
+{
+	(void)d;
+	if (pipe >= 0 && pipe < LG_MAX_PIPES)
+		g_rotation[pipe] = rotation;
+}
+
+/* What a primary plane on `pipe' can do: from gen4 rotation by 180
+ * degrees, on Cherryview's pipe B also the reflection along x. */
+static uint32_t primary_rotations(struct lg_display *d, int pipe)
+{
+	uint32_t rot = DRM_MODE_ROTATE_0;
+
+#if I915_FEAT_LEGACY_PLANE_PROPS
+	if (d->ver >= 4)
+		rot |= DRM_MODE_ROTATE_180;
+	if (d->is_chv && pipe == 1)
+		rot |= DRM_MODE_REFLECT_X;
+#else
+	(void)d;
+	(void)pipe;
+#endif
+	return rot;
+}
+
+/* The primary plane's rotation as programmed: none where the property is
+ * not offered. */
+static uint32_t primary_rotation(struct lg_display *d, int pipe)
+{
+	uint32_t rot = pipe >= 0 && pipe < LG_MAX_PIPES ? g_rotation[pipe] : 0;
+
+	if (rot & ~primary_rotations(d, pipe))
+		return DRM_MODE_ROTATE_0;
+	return rot;
+}
+
+/* The pipe's colour enables in the primary plane's or the cursor's
+ * control register: the pipe gamma always, before colour management. */
+static uint32_t pipe_color_bits(struct lg_display *d, int pipe, int cursor)
+{
+#if I915_FEAT_LEGACY_COLOR_MGMT
+	return lg_color_plane_bits(d, pipe, cursor);
+#else
+	(void)pipe;
+	if (cursor)
+		return (d->is_i845 || d->is_i865) ? CURSOR_PIPE_GAMMA_ENABLE :
+						    MCURSOR_PIPE_GAMMA_ENABLE;
+	return DISP_PIPE_GAMMA_ENABLE;
+#endif
+}
+
+int lg_plane_props_init(struct lg_display *d, int crtc)
+{
+#if I915_FEAT_LEGACY_PLANE_PROPS
+	struct drm_device *dev = d->drm;
+	struct drm_plane *prim = drm_crtc_primary(dev, crtc);
+	struct drm_plane *cur = drm_crtc_cursor(dev, crtc);
+	uint32_t rot = DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180;
+	int rc = 0, r;
+
+	if (!prim || !cur)
+		return -ENODEV;
+	if (d->ver >= 4) {
+		/* A crtc is not a pipe here: crtc 1 is the one that gets
+		 * pipe B whenever it is free, and the check refuses the
+		 * reflection on any other pipe. */
+		if (d->is_chv && crtc == 1)
+			rot |= DRM_MODE_REFLECT_X;
+		r = drm_plane_create_rotation_property(dev, prim, DRM_MODE_ROTATE_0, rot);
+		if (r && !rc)
+			rc = r;
+	}
+	if (d->is_vlv || d->is_chv) {
+		r = drm_plane_create_blend_mode_property(dev, prim, 1u << DRM_MODE_BLEND_PREMULTI);
+		if (r && !rc)
+			rc = r;
+	}
+	r = drm_plane_create_zpos_immutable_property(dev, prim, 0);
+	if (r && !rc)
+		rc = r;
+	if (d->ver >= 4) {
+		r = drm_plane_create_rotation_property(dev, cur, DRM_MODE_ROTATE_0,
+						       DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180);
+		if (r && !rc)
+			rc = r;
+	}
+	r = drm_plane_create_blend_mode_property(dev, cur, 1u << DRM_MODE_BLEND_PREMULTI);
+	if (r && !rc)
+		rc = r;
+	/* above the primary plane (the sprites are not offered) */
+	r = drm_plane_create_zpos_immutable_property(dev, cur, 1);
+	if (r && !rc)
+		rc = r;
+	return rc;
+#else
+	(void)d;
+	(void)crtc;
+	return 0;
+#endif
+}
+
 static uint32_t plane_ctl(struct lg_display *d, int pipe, const struct drm_framebuffer *fb)
 {
-	uint32_t ctl = DISP_ENABLE | DISP_PIPE_GAMMA_ENABLE;
+	uint32_t ctl = DISP_ENABLE | pipe_color_bits(d, pipe, 0);
+	uint32_t rot = primary_rotation(d, pipe);
 
 	if (d->is_g4x || d->is_ilk || d->is_snb || d->is_ivb)
 		ctl |= DISP_TRICKLE_FEED_DISABLE;
 	ctl |= format_bits(fb->format);
 	if (d->ver >= 4 && fb->modifier == I915_FORMAT_MOD_X_TILED)
 		ctl |= DISP_TILED;
+	if (rot & DRM_MODE_ROTATE_180)
+		ctl |= DISP_ROTATE_180;
+	if (rot & DRM_MODE_REFLECT_X)
+		ctl |= DISP_MIRROR;
 	if (d->ver < 5)
 		ctl |= DISP_PIPE_SEL(pipe);
 	return ctl;
@@ -324,7 +451,19 @@ static uint32_t plane_ctl(struct lg_display *d, int pipe, const struct drm_frame
 static void plane_write(struct lg_display *d, struct lg_pipe *p, uint32_t ctl, int full)
 {
 	int pl = p->plane;
-	uint32_t lin = p->y * p->stride + p->x * p->cpp;
+	uint32_t x = p->x, y = p->y;
+	uint32_t rot = primary_rotation(d, p->pipe);
+	uint32_t lin;
+
+	/* Rotated, the plane starts at the last pixel of its window (the
+	 * last of the first line when only reflected). */
+	if (rot & DRM_MODE_ROTATE_180) {
+		x += p->width - 1;
+		y += p->height - 1;
+	} else if (rot & DRM_MODE_REFLECT_X) {
+		x += p->width - 1;
+	}
+	lin = y * p->stride + x * p->cpp;
 
 	if (full) {
 		lg_wr(d, DSPSTRIDE(d, pl), p->stride);
@@ -341,7 +480,7 @@ static void plane_write(struct lg_display *d, struct lg_pipe *p, uint32_t ctl, i
 	}
 	if (d->ver >= 4) {
 		lg_wr(d, DSPLINOFF(d, pl), lin);
-		lg_wr(d, DSPTILEOFF(d, pl), (p->y << 16) | p->x);
+		lg_wr(d, DSPTILEOFF(d, pl), (y << 16) | x);
 	}
 	/* the control register right before the surface, so that an enable
 	 * and its address arm together */
@@ -381,6 +520,7 @@ int lg_plane_update(struct lg_display *d, int pipe, struct drm_framebuffer *fb, 
 	p->modifier = fb->modifier;
 	p->x = x;
 	p->y = y;
+	g_rotation_hw[pipe] = primary_rotation(d, pipe);
 	plane_write(d, p, plane_ctl(d, pipe, fb), 1);
 	p->plane_enabled = 1;
 	scanout_fence_put(d, pipe, old_fence);
@@ -399,7 +539,7 @@ int lg_plane_flip(struct lg_display *d, int pipe, struct drm_framebuffer *fb, ui
 	int rc;
 
 	if (!fb || !p->plane_enabled || fb->pitch != p->stride || fb->format != p->format ||
-	    fb->modifier != p->modifier)
+	    fb->modifier != p->modifier || primary_rotation(d, pipe) != g_rotation_hw[pipe])
 		return lg_plane_update(d, pipe, fb, x, y);
 	rc = bo_bind(d, fb->obj, &ggtt);
 	if (rc)
@@ -420,8 +560,9 @@ void lg_plane_disable(struct lg_display *d, int pipe)
 {
 	struct lg_pipe *p = &d->pipes[pipe];
 	int pl = p->plane;
-	/* the pipe gamma bit also colours the pipe's background: keep it */
-	uint32_t ctl = DISP_PIPE_GAMMA_ENABLE | (d->ver < 5 ? DISP_PIPE_SEL(pipe) : 0);
+	/* the pipe gamma bit (and the CSC bit) also colour the pipe's
+	 * background: keep them */
+	uint32_t ctl = pipe_color_bits(d, pipe, 0) | (d->ver < 5 ? DISP_PIPE_SEL(pipe) : 0);
 
 	lg_wr(d, DSPCNTR(d, pl), ctl);
 	if (d->ver >= 4) {
@@ -455,12 +596,19 @@ int lg_plane_check(struct lg_display *d, const struct drm_plane_state *ps,
 		   const struct lg_config *cfg)
 {
 	const struct drm_framebuffer *fb = ps->fb;
+	uint32_t rot = ps->rotation ? ps->rotation : DRM_MODE_ROTATE_0;
 
 	if (!fb)
 		return 0;
 	if (!format_ok(d, fb->format))
 		return -EINVAL;
 	if (fb->modifier != DRM_FORMAT_MOD_LINEAR && fb->modifier != I915_FORMAT_MOD_X_TILED)
+		return -EINVAL;
+	/* what the plane on the pipe chosen can do; Cherryview ignores the
+	 * mirror bit while it rotates */
+	if (rot & ~primary_rotations(d, cfg->pipe))
+		return -EINVAL;
+	if ((rot & DRM_MODE_ROTATE_180) && (rot & DRM_MODE_REFLECT_X))
 		return -EINVAL;
 	/* gen2/3: through a fence, which takes the object's layout */
 	if (fb->modifier == I915_FORMAT_MOD_X_TILED && d->ver < 4 &&
@@ -476,6 +624,13 @@ int lg_plane_check(struct lg_display *d, const struct drm_plane_state *ps,
 	uint32_t x = ps->src_x >> 16, y = ps->src_y >> 16;
 	if (x + ps->crtc_w > fb->width || y + ps->crtc_h > fb->height)
 		return -EINVAL;
+	/* the offsets the plane is given: those of the last pixel of the
+	 * window when rotated (of its first line when reflected) */
+	uint32_t ox = x, oy = y;
+	if (rot & (DRM_MODE_ROTATE_180 | DRM_MODE_REFLECT_X))
+		ox = x + ps->crtc_w - 1;
+	if (rot & DRM_MODE_ROTATE_180)
+		oy = y + ps->crtc_h - 1;
 	int cpp = format_cpp(fb->format);
 	if (fb->pitch > max_stride(d, fb->modifier, cpp))
 		return -EINVAL;
@@ -484,11 +639,11 @@ int lg_plane_check(struct lg_display *d, const struct drm_plane_state *ps,
 	if (fb->modifier == I915_FORMAT_MOD_X_TILED) {
 		if ((x + ps->crtc_w) * (uint32_t)cpp > fb->pitch)
 			return -EINVAL;
-		if (x > 4095 || y > 4095)
+		if (ox > 4095 || oy > 4095)
 			return -EINVAL;
 	}
 	/* the gen4+ linear offset register and DSPADDR are 32-bit sums */
-	if ((uint64_t)y * fb->pitch + (uint64_t)x * cpp + fb->offset > 0xffffffffull)
+	if ((uint64_t)oy * fb->pitch + (uint64_t)ox * cpp + fb->offset > 0xffffffffull)
 		return -EINVAL;
 	return 0;
 }
@@ -570,10 +725,15 @@ int lg_cursor_check(struct lg_display *d, const struct drm_plane_state *ps)
 {
 	const struct drm_framebuffer *fb = ps->fb;
 	uint32_t w = ps->crtc_w, h = ps->crtc_h;
+	uint32_t rot = ps->rotation ? ps->rotation : DRM_MODE_ROTATE_0;
 
 	if (!fb)
 		return 0;
 	if (fb->format != DRM_FORMAT_ARGB8888 || fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		return -EINVAL;
+	/* from gen4 the cursor rotates by 180 degrees, nothing else */
+	if (rot != DRM_MODE_ROTATE_0 &&
+	    !(I915_FEAT_LEGACY_PLANE_PROPS && d->ver >= 4 && rot == DRM_MODE_ROTATE_180))
 		return -EINVAL;
 	/* no panning or scaling of a cursor */
 	if (ps->src_x || ps->src_y || (ps->src_w >> 16) != w || (ps->src_h >> 16) != h)
@@ -720,6 +880,8 @@ int lg_cursor_update(struct lg_display *d, int pipe, const struct drm_plane_stat
 		return 0;
 	}
 	uint32_t w = ps->crtc_w, h = ps->crtc_h;
+	int rotate = I915_FEAT_LEGACY_PLANE_PROPS && d->ver >= 4 &&
+		     (ps->rotation & DRM_MODE_ROTATE_180);
 	if (cursor_needs_physical(d)) {
 		/* a new image (or size) is copied; a move keeps the copy */
 		if (ps->fb_changed || !p->cursor_enabled || p->cursor_w != w || p->cursor_h != h) {
@@ -735,16 +897,22 @@ int lg_cursor_update(struct lg_display *d, int pipe, const struct drm_plane_stat
 		if (rc)
 			return rc;
 		base = ggtt + fb->offset;
+		/* A GMCH cursor rotated by 180 degrees starts at its last
+		 * pixel; from Ironlake the hardware does that itself. */
+		if (rotate && d->gmch)
+			base += (h * w - 1) * 4;
 	}
 	if (is_845_cursor(d)) {
 		uint32_t stride_bits = 0;
 		for (uint32_t s = fb->pitch; s > 256; s >>= 1)
 			stride_bits++;
-		cntl = CURSOR_ENABLE | CURSOR_FORMAT_ARGB | CURSOR_PIPE_GAMMA_ENABLE |
+		cntl = CURSOR_ENABLE | CURSOR_FORMAT_ARGB | pipe_color_bits(d, pipe, 1) |
 		       (stride_bits << CURSOR_STRIDE_SHIFT);
 		size = CURSOR_HEIGHT(h) | CURSOR_WIDTH(w);
 	} else {
-		cntl = MCURSOR_PIPE_GAMMA_ENABLE;
+		cntl = pipe_color_bits(d, pipe, 1);
+		if (rotate)
+			cntl |= MCURSOR_ROTATE_180;
 		if (d->is_snb || d->is_ivb)
 			cntl |= MCURSOR_TRICKLE_FEED_DISABLE;
 		cntl |= w == 64 ? MCURSOR_MODE_64_ARGB_AX :
