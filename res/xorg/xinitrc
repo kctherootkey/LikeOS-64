@@ -162,9 +162,9 @@ export XCURSOR_THEME XCURSOR_SIZE
 # It is back on because the compositor is what the rest of the engine expects:
 # with it off, WebKit's non-composited paths -- which upstream barely
 # exercises -- drop wheel events and crashed the web process on a null
-# overflow-controls host layer.  Scrolling no longer depends on which way this
-# goes: luakit binds the wheel itself now (res/xorg/gtk3/luakit-userconf.lua),
-# so the wheel behaves the same either way.
+# overflow-controls host layer.  With it on, the wheel goes to the engine,
+# which scrolls on its own thread; with it off the wheel needs a <Scroll> bind
+# in luakit, which this image no longer carries.
 #
 # Reverse this the day WebKit is built against GTK4 (webkit2gtk-6.0): the
 # display is shared there, the map disappears, and the accelerated path is

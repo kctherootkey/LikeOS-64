@@ -231,6 +231,33 @@ static void sleep_fire(hrtimer_t *t)
 	}
 }
 
+static void wait_timer_fire(hrtimer_t *t)
+{
+	task_t *task = (task_t *)t->arg;
+
+	/* Only a task still parked: claimed by CAS, as every waker does, and
+	 * enqueued only if claimed. */
+	if (sched_claim_wake(task, TASK_BLOCKED)) {
+		task->wait_channel = NULL;
+		task->wakeup_tick = 0;
+		sched_enqueue_ready(task);
+	}
+}
+
+void hrtimer_wait_arm(struct task *task, uint64_t abs_ns)
+{
+	/* A queued timer must never be initialised again: off the queue
+	 * first.  Normally a no-op -- every wait disarms on its way out. */
+	hrtimer_cancel(&task->wait_timer);
+	hrtimer_init(&task->wait_timer, wait_timer_fire, task);
+	hrtimer_start(&task->wait_timer, abs_ns);
+}
+
+void hrtimer_wait_disarm(struct task *task)
+{
+	hrtimer_cancel(&task->wait_timer);
+}
+
 int hrtimer_sleep_until(uint64_t abs_ns, uint64_t *remaining_ns)
 {
 	task_t *cur = sched_current();
@@ -314,24 +341,45 @@ void hrtimer_init_hw(void)
 		g_regs = NULL;
 		return;
 	}
-	/* Timers 0 and 1 are the ones legacy-replacement mode would take;
-	 * leave them alone where a third exists. */
-	g_timer_idx = ntimers >= 3 ? ntimers - 1 : (ntimers == 2 ? 1 : 0);
+	/* A comparator that can raise an interrupt on an I/O APIC line that
+	 * is not one of the ISA lines (0-15), which other devices already use.
+	 * Not simply the last one: on Intel chipsets only the first three
+	 * comparators can be routed to the I/O APIC at all -- the rest report
+	 * an empty route capability and are meant for MSI delivery -- and
+	 * taking the last of eight left the ThinkPad P50 on the tick, where
+	 * every timed wait ended up to a whole tick late.  Timers 0 and 1 are
+	 * the ones legacy-replacement mode would take, so they are the last
+	 * resort, used only where no other comparator can be routed. */
+	uint64_t tcfg = 0;
+	uint32_t route_cap = 0;
+	static const int order_fallback[] = { 1, 0 };
 
-	uint64_t tcfg = rd(HPET_TN_CONFIG(g_timer_idx));
-	uint32_t route_cap = (uint32_t)(tcfg >> 32);
+	/* Legacy replacement routes timers 0 and 1 to IRQ 0 and 8 whatever
+	 * their own route says: then they are not candidates at all. */
+	int legacy_rt = (rd(HPET_GEN_CONFIG) & 0x2) != 0;
 
-	/* Pick a GSI this comparator can drive that is not one of the ISA
-	 * lines (0-15), which other devices already use. */
-	for (int g = 31; g >= 16; g--) {
-		if (route_cap & (1u << g)) {
-			g_gsi = g;
-			break;
+	for (int pass = 0; pass < (legacy_rt ? 1 : 2) && g_gsi < 0; pass++) {
+		int count = pass == 0 ? ntimers - 2 : 2;
+
+		for (int k = 0; k < count && g_gsi < 0; k++) {
+			int idx = pass == 0 ? ntimers - 1 - k : order_fallback[k];
+
+			if (idx < 0 || idx >= ntimers)
+				continue;
+			tcfg = rd(HPET_TN_CONFIG(idx));
+			route_cap = (uint32_t)(tcfg >> 32);
+			for (int g = 31; g >= 16; g--) {
+				if (route_cap & (1u << g)) {
+					g_gsi = g;
+					g_timer_idx = idx;
+					break;
+				}
+			}
 		}
 	}
 	if (g_gsi < 0) {
-		kprintf("hrtimer: HPET timer %d has no free interrupt route (cap 0x%x), tick fallback\n",
-			g_timer_idx, route_cap);
+		kprintf("hrtimer: no HPET comparator of %d can be routed to an I/O APIC line above 15, tick fallback\n",
+			ntimers);
 		g_regs = NULL;
 		return;
 	}

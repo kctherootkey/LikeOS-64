@@ -59,7 +59,11 @@ settings.webview.enable_webgl = true
 --
 -- WebKitGTK has two real rendering modes for this toolkit: "always" runs every
 -- page through the accelerated compositor, "never" paints with cairo.
--- ("on-demand" is accepted and treated as "always".)  The compositor is what
+-- ("on-demand" composites only the pages that need it and paints the rest
+-- without the compositor, the paths "never" uses.)  Wheel scrolling runs on
+-- the main thread either way in this image's WebKit (webkitgtk patch 0025):
+-- threaded scrolling, which "always" switches on upstream, shook sticky
+-- headers by the scroll distance on every wheel step.  The compositor is what
 -- WebGL, the accelerated 2D canvas and CSS 3D transforms need, and it is also
 -- what the rest of the engine assumes: with it off, WebKit's non-composited
 -- paths -- which upstream barely exercises -- crashed the web process on a
@@ -71,8 +75,9 @@ settings.webview.enable_webgl = true
 -- unscrollable that way).  It is on everywhere now, the ThinkPad on /dev/fb0
 -- included, so that both kinds of machine run the same engine paths; the
 -- GL underneath is llvmpipe there and the svga driver on a VMware guest with
--- 3D.  Scrolling does not depend on this either way: luakit binds the wheel
--- itself and it never reaches the engine.
+-- 3D.  The wheel goes to the engine, which scrolls on its own thread with
+-- the compositor on (a <Scroll> bind in luakit was only needed while it was
+-- off, and is gone).
 --
 -- Measured, so that it is not re-discovered from scratch: on the GTK3 API line
 -- the accelerated path does NOT end on the GPU even where there is one.

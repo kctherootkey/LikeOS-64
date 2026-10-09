@@ -7,6 +7,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/timer.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/ke/pipe.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/io/tty.h>
@@ -244,7 +245,17 @@ void poll_notify_io_ready(void)
 // signal_pending() regardless of the deadline.  The one-tick re-scan is kept
 // only for a poller that could not register on every object it asked about
 // (pt->unregistered), since nothing else can be relied on to wake that one.
+/* A timeout's absolute deadline on the nanosecond clock; one too large to
+ * add is as good as forever. */
+static uint64_t poll_deadline_ns(uint64_t timeout_ns)
+{
+	uint64_t now = hrtimer_now_ns();
+
+	return timeout_ns > ~0ULL - now ? ~0ULL : now + timeout_ns;
+}
+
 static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
+				       uint64_t deadline_ns,
 				       int have_deadline, uint64_t seq_before,
 				       const struct poll_table *pt)
 {
@@ -294,7 +305,15 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 		}
 	}
 
+	/* The timeout's own deadline, to the microsecond; the tick deadline
+	 * above only backs it up.  On its own it ended every timeout at the
+	 * next scheduler tick, so an event loop's short timers -- a browser's
+	 * frame scheduling among them -- all ran up to a tick late. */
+	if (have_deadline)
+		hrtimer_wait_arm(cur, deadline_ns);
 	sched_schedule();
+	if (have_deadline)
+		hrtimer_wait_disarm(cur);
 	__atomic_fetch_sub(&g_poll_sleepers, 1, __ATOMIC_ACQ_REL);
 	cur->wakeup_tick = 0;
 	cur->wait_channel = NULL;
@@ -507,7 +526,7 @@ out:
 // ============================================================================
 // sys_select_internal - select() implementation
 // Scans readfds/writefds/exceptfds for ready file descriptors.
-// timeout_ticks: 0 = poll (non-blocking), (uint64_t)-1 = block forever
+// timeout_ns (nanoseconds): 0 = poll (non-blocking), (uint64_t)-1 = block forever
 // Returns number of ready fds, or negative errno.
 // ============================================================================
 /* The body runs with a poll table; this wrapper owns it.
@@ -516,11 +535,11 @@ out:
  * dozen points, and a queue left holding a pointer into a freed table is a use
  * after free on the next wakeup. */
 static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
-			     fd_set *exceptfds, uint64_t timeout_ticks,
+			     fd_set *exceptfds, uint64_t timeout_ns,
 			     struct poll_table *pt);
 
 int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
-			fd_set *exceptfds, uint64_t timeout_ticks)
+			fd_set *exceptfds, uint64_t timeout_ns)
 {
 	struct poll_table pt;
 	int r;
@@ -531,14 +550,14 @@ int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
 	 * descriptor is only ever registered once per scan, so nfds is the
 	 * bound. */
 	poll_table_init(&pt, nfds);
-	r = sys_select_locked(nfds, readfds, writefds, exceptfds, timeout_ticks,
+	r = sys_select_locked(nfds, readfds, writefds, exceptfds, timeout_ns,
 			      &pt);
 	poll_table_free(&pt);
 	return r;
 }
 
 static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
-			     fd_set *exceptfds, uint64_t timeout_ticks,
+			     fd_set *exceptfds, uint64_t timeout_ns,
 			     struct poll_table *pt)
 {
 
@@ -556,17 +575,18 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 	else
 		FD_ZERO(&e_in);
 
-	uint64_t deadline = 0;
-	if (timeout_ticks == 0) {
+	uint64_t deadline = 0, deadline_ns = 0;
+	if (timeout_ns == 0) {
 		// Non-blocking poll
-	} else if (timeout_ticks != (uint64_t)-1) {
+	} else if (timeout_ns != (uint64_t)-1) {
 		/* +1 for the tick already in progress: timer_ticks() was read
 		 * at some unknown fraction into the current tick, so without it
 		 * the wake lands up to one tick early and the timeout expires
 		 * short of what was asked for.  A timeout may fire late, never
 		 * early; the futex and sleep paths arm their deadlines the same
 		 * way. */
-		deadline = timer_ticks() + timeout_ticks + 1;
+		deadline_ns = poll_deadline_ns(timeout_ns);
+		deadline = timer_ticks() + timer_ns_to_ticks(timeout_ns) + 1;
 	}
 
 	while (1) {
@@ -618,7 +638,7 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 			}
 		}
 
-		if (count > 0 || timeout_ticks == 0) {
+		if (count > 0 || timeout_ns == 0) {
 			if (readfds)
 				*readfds = r_out;
 			if (writefds)
@@ -629,8 +649,8 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 		}
 
 		// Block until deadline or forever
-		if (timeout_ticks != (uint64_t)-1 &&
-		    timer_ticks() >= deadline) {
+		if (timeout_ns != (uint64_t)-1 &&
+		    hrtimer_now_ns() >= deadline_ns) {
 			if (readfds)
 				FD_ZERO(readfds);
 			if (writefds)
@@ -654,8 +674,8 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 				return -EINTR;
 		}
 
-		poll_sleep_until_next_tick(deadline,
-					   timeout_ticks != (uint64_t)-1,
+		poll_sleep_until_next_tick(deadline, deadline_ns,
+					   timeout_ns != (uint64_t)-1,
 					   seq_before, pt);
 	}
 }
@@ -663,7 +683,7 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 // ============================================================================
 // sys_poll_internal - poll() implementation
 // Scans array of pollfd structs for ready fds.
-// timeout_ticks: 0 = non-blocking, (uint64_t)-1 = block forever
+// timeout_ns (nanoseconds): 0 = non-blocking, (uint64_t)-1 = block forever
 // Returns number of ready fds, or negative errno.
 // ============================================================================
 /* The body runs with a poll table; this wrapper owns it.
@@ -672,9 +692,9 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
  * dozen points, and a queue left holding a pointer into a freed table is a use
  * after free on the next wakeup. */
 static int sys_poll_locked(struct pollfd *fds, int nfds,
-			   uint64_t timeout_ticks, struct poll_table *pt);
+			   uint64_t timeout_ns, struct poll_table *pt);
 
-int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks)
+int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ns)
 {
 	struct poll_table pt;
 	int r;
@@ -682,28 +702,29 @@ int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks)
 	if (nfds < 0 || !fds)
 		return -EINVAL;
 	poll_table_init(&pt, nfds);
-	r = sys_poll_locked(fds, nfds, timeout_ticks, &pt);
+	r = sys_poll_locked(fds, nfds, timeout_ns, &pt);
 	poll_table_free(&pt);
 	return r;
 }
 
 static int sys_poll_locked(struct pollfd *fds, int nfds,
-			   uint64_t timeout_ticks, struct poll_table *pt)
+			   uint64_t timeout_ns, struct poll_table *pt)
 {
 	WARN_ON(nfds >
 		TASK_MAX_FDS); /* poll() with nfds > TASK_MAX_FDS: kernel cannot have that many open fds */
 
-	uint64_t deadline = 0;
-	if (timeout_ticks == 0) {
+	uint64_t deadline = 0, deadline_ns = 0;
+	if (timeout_ns == 0) {
 		// Non-blocking poll
-	} else if (timeout_ticks != (uint64_t)-1) {
+	} else if (timeout_ns != (uint64_t)-1) {
 		/* +1 for the tick already in progress: timer_ticks() was read
 		 * at some unknown fraction into the current tick, so without it
 		 * the wake lands up to one tick early and the timeout expires
 		 * short of what was asked for.  A timeout may fire late, never
 		 * early; the futex and sleep paths arm their deadlines the same
 		 * way. */
-		deadline = timer_ticks() + timeout_ticks + 1;
+		deadline_ns = poll_deadline_ns(timeout_ns);
+		deadline = timer_ticks() + timer_ns_to_ticks(timeout_ns) + 1;
 	}
 
 	while (1) {
@@ -726,10 +747,10 @@ static int sys_poll_locked(struct pollfd *fds, int nfds,
 				count++;
 		}
 
-		if (count > 0 || timeout_ticks == 0)
+		if (count > 0 || timeout_ns == 0)
 			return count;
 
-		if (timeout_ticks != (uint64_t)-1 && timer_ticks() >= deadline)
+		if (timeout_ns != (uint64_t)-1 && hrtimer_now_ns() >= deadline_ns)
 			return 0;
 
 		/* A deliverable signal must break the wait: a signal handler only
@@ -746,8 +767,8 @@ static int sys_poll_locked(struct pollfd *fds, int nfds,
 				return -EINTR;
 		}
 
-		poll_sleep_until_next_tick(deadline,
-					   timeout_ticks != (uint64_t)-1,
+		poll_sleep_until_next_tick(deadline, deadline_ns,
+					   timeout_ns != (uint64_t)-1,
 					   seq_before, pt);
 	}
 }
@@ -910,11 +931,11 @@ int epoll_ctl_internal(int epfd_idx, int op, int fd, struct epoll_event *event)
 /* The body runs with a poll table; this wrapper owns it -- see the note on
  * sys_select_internal() for why the split. */
 static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
-			     int maxevents, uint64_t timeout_ticks,
+			     int maxevents, uint64_t timeout_ns,
 			     struct poll_table *pt);
 
 int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
-			uint64_t timeout_ticks)
+			uint64_t timeout_ns)
 {
 	struct poll_table pt;
 	int r;
@@ -931,27 +952,28 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 	 * registers on every watched descriptor, not just the ones it will
 	 * report. */
 	poll_table_init(&pt, ep->nentries > 0 ? ep->nentries : 1);
-	r = epoll_wait_locked(ep, events, maxevents, timeout_ticks, &pt);
+	r = epoll_wait_locked(ep, events, maxevents, timeout_ns, &pt);
 	poll_table_free(&pt);
 	return r;
 }
 
 static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
-			     int maxevents, uint64_t timeout_ticks,
+			     int maxevents, uint64_t timeout_ns,
 			     struct poll_table *pt)
 {
 
-	uint64_t deadline = 0;
-	if (timeout_ticks == 0) {
+	uint64_t deadline = 0, deadline_ns = 0;
+	if (timeout_ns == 0) {
 		// Non-blocking
-	} else if (timeout_ticks != (uint64_t)-1) {
+	} else if (timeout_ns != (uint64_t)-1) {
 		/* +1 for the tick already in progress: timer_ticks() was read
 		 * at some unknown fraction into the current tick, so without it
 		 * the wake lands up to one tick early and the timeout expires
 		 * short of what was asked for.  A timeout may fire late, never
 		 * early; the futex and sleep paths arm their deadlines the same
 		 * way. */
-		deadline = timer_ticks() + timeout_ticks + 1;
+		deadline_ns = poll_deadline_ns(timeout_ns);
+		deadline = timer_ticks() + timer_ns_to_ticks(timeout_ns) + 1;
 	}
 
 	while (1) {
@@ -1017,10 +1039,10 @@ static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
 
 		WARN_ON(count >
 			maxevents); /* epoll_wait returned more events than maxevents - loop bound violated */
-		if (count > 0 || timeout_ticks == 0)
+		if (count > 0 || timeout_ns == 0)
 			return count;
 
-		if (timeout_ticks != (uint64_t)-1 && timer_ticks() >= deadline)
+		if (timeout_ns != (uint64_t)-1 && hrtimer_now_ns() >= deadline_ns)
 			return 0;
 
 		/* A deliverable signal must break the wait: a signal handler only
@@ -1037,8 +1059,8 @@ static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
 				return -EINTR;
 		}
 
-		poll_sleep_until_next_tick(deadline,
-					   timeout_ticks != (uint64_t)-1,
+		poll_sleep_until_next_tick(deadline, deadline_ns,
+					   timeout_ns != (uint64_t)-1,
 					   seq_before, pt);
 	}
 }
@@ -1145,7 +1167,7 @@ sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		copy_from_user(&ke, (void *)a4, sizeof(fd_set));
 		ep = &ke;
 	}
-	uint64_t timeout_ticks = (uint64_t)-1;
+	uint64_t timeout_ns = (uint64_t)-1;
 	if (a5 && validate_user_ptr(a5, 16)) {
 		uint64_t tv_sec = 0, tv_usec = 0;
 		copy_from_user(&tv_sec, (void *)a5, 8);
@@ -1153,12 +1175,11 @@ sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		/* Converted at the measured tick rate.  This used to assume
 		 * 100Hz, so on a machine whose calibrated rate is ~200Hz every
 		 * select() timeout expired in half the requested time. */
-		timeout_ticks =
-			timer_us_to_ticks(tv_sec * 1000000ULL + tv_usec);
+		timeout_ns = (tv_sec * 1000000ULL + tv_usec) * 1000ULL;
 		if (tv_sec == 0 && tv_usec == 0)
-			timeout_ticks = 0;
+			timeout_ns = 0;
 	}
-	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ns);
 	if (rp && a2)
 		copy_to_user((void *)a2, rp, sizeof(fd_set));
 	if (wp && a3)
@@ -1186,7 +1207,7 @@ sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		copy_from_user(&ke, (void *)a4, sizeof(fd_set));
 		ep = &ke;
 	}
-	uint64_t timeout_ticks = (uint64_t)-1;
+	uint64_t timeout_ns = (uint64_t)-1;
 	if (a5 && validate_user_ptr(a5, 16)) {
 		uint64_t tv_sec = 0;
 		long tv_nsec = 0;
@@ -1195,16 +1216,15 @@ sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
 		 * assumed a 10ms tick and truncated the remainder, so this
 		 * expired early on both counts. */
-		timeout_ticks = timer_ns_to_ticks(tv_sec * 1000000000ULL +
-						  (uint64_t)tv_nsec);
+		timeout_ns = tv_sec * 1000000000ULL + (uint64_t)tv_nsec;
 		if (tv_sec == 0 && tv_nsec == 0)
-			timeout_ticks = 0;
+			timeout_ns = 0;
 	}
 	kernel_sigset_t saved_mask;
 	int have_mask = poll_sigmask_install(a6, &saved_mask);
 	if (have_mask < 0)
 		return have_mask;
-	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ns);
 	/* Mask restored after signal delivery — see the ppoll wrapper. */
 	(void)saved_mask;
 	if (rp && a2)
@@ -1273,17 +1293,17 @@ sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
 	if (r < 0)
 		return r;
 	int timeout_ms = (int)(int64_t)a3;
-	uint64_t timeout_ticks;
+	uint64_t timeout_ns;
 	if (timeout_ms < 0)
-		timeout_ticks = (uint64_t)-1;
+		timeout_ns = (uint64_t)-1;
 	else if (timeout_ms == 0)
-		timeout_ticks = 0;
+		timeout_ns = 0;
 	else
 		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
 		 * AND discarded the remainder, so this returned early twice
 		 * over -- a 200ms poll() came back in about 129ms. */
-		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
-	int ret = sys_poll_internal(pf.fds, nfds, timeout_ticks);
+		timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
+	int ret = sys_poll_internal(pf.fds, nfds, timeout_ns);
 	poll_fds_put(&pf, a1);
 	return ret;
 }
@@ -1296,7 +1316,7 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	int r = poll_fds_get(&pf, a1, nfds);
 	if (r < 0)
 		return r;
-	uint64_t timeout_ticks = (uint64_t)-1;
+	uint64_t timeout_ns = (uint64_t)-1;
 	if (a3 && validate_user_ptr(a3, 16)) {
 		uint64_t tv_sec = 0;
 		long tv_nsec = 0;
@@ -1305,10 +1325,9 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
 		 * assumed a 10ms tick and truncated the remainder, so this
 		 * expired early on both counts. */
-		timeout_ticks = timer_ns_to_ticks(tv_sec * 1000000000ULL +
-						  (uint64_t)tv_nsec);
+		timeout_ns = tv_sec * 1000000000ULL + (uint64_t)tv_nsec;
 		if (tv_sec == 0 && tv_nsec == 0)
-			timeout_ticks = 0;
+			timeout_ns = 0;
 	}
 	kernel_sigset_t saved_mask;
 	int have_mask = poll_sigmask_install(a4, &saved_mask);
@@ -1316,7 +1335,7 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		kfree(pf.heap);
 		return have_mask;
 	}
-	int ret = sys_poll_internal(pf.fds, nfds, timeout_ticks);
+	int ret = sys_poll_internal(pf.fds, nfds, timeout_ns);
 	/* The mask stays installed on purpose; it is put back after signal
 	 * delivery (poll_sigmask_restore_pending). */
 	(void)saved_mask;
@@ -1348,17 +1367,17 @@ sys_epoll_wait(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	}
 	struct epoll_event kevs[256];
 	int timeout_ms = (int)(int64_t)a4;
-	uint64_t timeout_ticks;
+	uint64_t timeout_ns;
 	if (timeout_ms < 0)
-		timeout_ticks = (uint64_t)-1;
+		timeout_ns = (uint64_t)-1;
 	else if (timeout_ms == 0)
-		timeout_ticks = 0;
+		timeout_ns = 0;
 	else
 		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
 		 * AND discarded the remainder, so this returned early twice
 		 * over -- a 200ms poll() came back in about 129ms. */
-		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
-	int got = epoll_wait_internal(ep_idx, kevs, maxevents, timeout_ticks);
+		timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
+	int got = epoll_wait_internal(ep_idx, kevs, maxevents, timeout_ns);
 
 	if (got > 0)
 		copy_to_user((void *)a2, kevs,

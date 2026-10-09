@@ -52,6 +52,16 @@ static inline int hrtimer_is_armed(const hrtimer_t *t)
 	return t->armed;
 }
 
+/* The precise end of a timed wait that parks the task some other way (a
+ * futex, a poll): armed after the task has published TASK_BLOCKED, it wakes
+ * the task at `abs_ns' as any waker would; disarmed when the wait is over.
+ * The wait keeps its tick deadline as a backstop.  Without this a timeout
+ * ended at the scheduler tick after its deadline, plus one: an 8 ms wait took
+ * 10-15 ms at 200 Hz. */
+struct task;
+void hrtimer_wait_arm(struct task *task, uint64_t abs_ns);
+void hrtimer_wait_disarm(struct task *task);
+
 /* Sleep the calling task until `abs_ns' (monotonic) or a signal.
  * Returns 0 when the deadline passed, -EINTR when a signal cut it short
  * (with *remaining_ns, if non-NULL, set to what was left). */

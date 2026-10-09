@@ -10,6 +10,7 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/cred.h>
+#include <kernel/ke/hrtimer.h>
 
 // Forward declaration
 struct vfs_file;
@@ -1172,6 +1173,12 @@ typedef struct task {
 	 * ran goes behind them. */
 	uint64_t vruntime;
 	uint64_t exec_start;
+
+	/* The deadline of the timed wait this task is parked in (a futex or a
+	 * poll timeout): hrtimer_wait_arm() / hrtimer_wait_disarm().  One per
+	 * task, because a task waits for one thing at a time, and part of the
+	 * task so that it outlives any callback still running for it. */
+	hrtimer_t wait_timer;
 } task_t;
 
 /* THE descriptor table of `t`.  A thread created with CLONE_FILES shares one

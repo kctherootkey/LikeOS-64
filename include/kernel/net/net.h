@@ -1411,16 +1411,17 @@ net_socket_t *sock_get(int sockfd);
 // Poll / Select / Epoll API (kernel-side)
 // ============================================================================
 int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
-			fd_set *exceptfds, uint64_t timeout_ticks);
-int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks);
+			fd_set *exceptfds, uint64_t timeout_ns);
+int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ns);
 int epoll_create_internal(int flags);
 /* Descriptor-lifetime references on an epoll instance: fork and dup take one,
  * close and exec drop one.  See the ref_count comment on epoll_instance_t. */
 void epoll_get(int idx);
 void epoll_put(int idx);
 int epoll_ctl_internal(int epfd_idx, int op, int fd, struct epoll_event *event);
+/* Timeouts in nanoseconds: 0 = do not block, (uint64_t)-1 = block forever. */
 int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
-			uint64_t timeout_ticks);
+			uint64_t timeout_ns);
 int net_ioctl(unsigned long request, void *argp);
 
 // ============================================================================

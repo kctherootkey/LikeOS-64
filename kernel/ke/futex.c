@@ -16,6 +16,7 @@
 
 #include <kernel/ke/futex.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/mm/memory.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/ke/timer.h>
@@ -432,7 +433,14 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 
 	// Set wakeup time if timeout specified
 	uint64_t deadline_tick = 0;
+	uint64_t deadline_ns = 0;
 	if (timeout_ns > 0) {
+		/* The deadline itself, on the nanosecond clock, armed once the
+		 * task is parked (below); the tick deadline only backs it up.
+		 * On its own it ended every timeout one to two ticks late. */
+		uint64_t now_ns = hrtimer_now_ns();
+
+		deadline_ns = timeout_ns > ~0ULL - now_ns ? ~0ULL : now_ns + timeout_ns;
 		/* Against the MEASURED tick rate, not an assumed 10ms one: the
 		 * boot calibration routinely settles near 200Hz on a virtual
 		 * machine, and dividing by a hardcoded 10ms then expired every
@@ -459,6 +467,8 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 
 	// Block the task
 	cur->state = TASK_BLOCKED;
+	if (deadline_ns)
+		hrtimer_wait_arm(cur, deadline_ns);
 
 	ftrace_log_key(FT_WAIT_BLOCK, uaddr, expected_val, (uint32_t)cur->id,
 		       key, bucket_idx, bucket_count(bucket->head));
@@ -467,6 +477,8 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 
 	// Schedule away - will return when woken or timed out
 	sched_schedule();
+	if (deadline_ns)
+		hrtimer_wait_disarm(cur);
 
 	// We've been woken up - but we might have been woken by:
 	// 1. futex_wake() - waiter->removed_by_wake is set, waiter unlinked from bucket
@@ -525,7 +537,8 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 	 * wakes are not distinguished from each other because the caller must
 	 * do the same thing for both, and every futex user here already does.
 	 */
-	if (deadline_tick != 0 && timer_ticks() >= deadline_tick)
+	if ((deadline_ns != 0 && hrtimer_now_ns() >= deadline_ns) ||
+	    (deadline_tick != 0 && timer_ticks() >= deadline_tick))
 		return -ETIMEDOUT;
 
 	return -EINTR;
