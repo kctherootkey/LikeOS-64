@@ -2199,7 +2199,14 @@ void *_rtld_dlopen(const char *filename, int flags)
 static void *rtld_dlsym_locked(void *handle, const char *symbol)
 {
 	g_dlerror_set = 0;
-	if (handle == RTLD_DEFAULT || !handle) {
+	/* The program's own handle -- what dlopen(NULL) returns -- stands for
+	 * the whole global scope, not for the executable's symbol table: the
+	 * program, everything it depends on, and everything opened since.  A
+	 * program that looks itself up for a name one of its libraries
+	 * defines (a GtkBuilder signal handler such as gtk_widget_destroy)
+	 * holds only an undefined reference to it; the definition it asks for
+	 * is the library's. */
+	if (handle == RTLD_DEFAULT || !handle || ((dso_t *)handle)->is_main) {
 		sym_result_t sr = rtld_lookup_symbol(symbol, NULL);
 		if (sr.sym && sr.dso)
 			return (void *)(sr.dso->base + sr.sym->st_value);

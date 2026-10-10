@@ -1,0 +1,75 @@
+New toplevel windows are filled with their theme background until the first
+frame is drawn.
+
+GDK creates a toplevel's X window with no background, so until the program
+draws its first frame the server leaves whatever was on the screen there.  A
+program that takes a moment to start -- a browser setting up its web
+process -- appeared for half a second as an empty frame you could see
+through.  At realize the window's X background is set to the window's own
+background colour from the theme (when it is opaque, the window is not
+app-paintable and uses the default visual), so the server fills it the
+moment it is mapped; after the first frame it goes back to none, and later
+exposures are repainted the way they always were.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/gtk/gtkwindow.c
++++ b/gtk/gtkwindow.c
+@@ -259,6 +259,7 @@
+   guint    maximized                 : 1;
+   guint    fullscreen                : 1;
+   guint    tiled                     : 1;
++  guint    initial_background        : 1; /* server fills it until the first frame */
+   guint    unlimited_guessed_size_x  : 1;
+   guint    unlimited_guessed_size_y  : 1;
+   guint    force_resize              : 1;
+@@ -7538,6 +7539,32 @@
+   gtk_widget_register_window (widget, gdk_window);
+   gtk_widget_set_realized (widget, TRUE);
+ 
++  /* A toplevel's X window has no background of its own: until the program
++   * draws its first frame, the server leaves whatever was on the screen
++   * there, and a program that takes a moment to start -- a browser setting
++   * up its web process -- appears as an empty frame you can see through.
++   * Until that first frame the server fills the window with the window's
++   * own background colour from the theme; then it goes back to none, so
++   * later exposures are not cleared to it before they are repainted. */
++  if (!gtk_widget_get_parent_window (widget) &&
++      !gtk_widget_get_app_paintable (widget) &&
++      gdk_window_get_visual (gdk_window) ==
++        gdk_screen_get_system_visual (gtk_widget_get_screen (widget)))
++    {
++      GdkRGBA bg;
++
++G_GNUC_BEGIN_IGNORE_DEPRECATIONS
++      gtk_style_context_get_background_color (gtk_widget_get_style_context (widget),
++                                              gtk_widget_get_state_flags (widget),
++                                              &bg);
++      if (bg.alpha >= 1.0)
++        {
++          gdk_window_set_background_rgba (gdk_window, &bg);
++          priv->initial_background = TRUE;
++        }
++G_GNUC_END_IGNORE_DEPRECATIONS
++    }
++
+   attributes.x = allocation.x;
+   attributes.y = allocation.y;
+   attributes.width = allocation.width;
+@@ -10526,6 +10553,16 @@
+   if (GTK_WIDGET_CLASS (gtk_window_parent_class)->draw)
+     ret = GTK_WIDGET_CLASS (gtk_window_parent_class)->draw (widget, cr);
+ 
++  /* The first frame is drawn: no server-side background from here on (see
++   * gtk_window_realize). */
++  if (priv->initial_background)
++    {
++      priv->initial_background = FALSE;
++G_GNUC_BEGIN_IGNORE_DEPRECATIONS
++      gdk_window_set_background_pattern (_gtk_widget_get_window (widget), NULL);
++G_GNUC_END_IGNORE_DEPRECATIONS
++    }
++
+   return ret;
+ }
+ 

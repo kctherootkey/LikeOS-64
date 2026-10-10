@@ -1,0 +1,20 @@
+The main window starts maximised.
+
+A new configuration opened the main window at 800x600; the default is now
+maximised, which the user can restore and which is then remembered as
+before (mainwin_maximised follows the window's state).
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/prefs_common.c
++++ b/src/prefs_common.c
+@@ -670,7 +670,8 @@
+ 	 NULL, NULL, NULL},
+ 	{"mainwin_y", "64", &prefs_common.mainwin_y, P_INT,
+ 	 NULL, NULL, NULL},
+-	{"mainwin_maximised", "FALSE", &prefs_common.mainwin_maximised, P_BOOL,
++	/* LikeOS: the main window starts maximised until the user restores it. */
++	{"mainwin_maximised", "TRUE", &prefs_common.mainwin_maximised, P_BOOL,
+ 	 NULL, NULL, NULL},
+ 	{"mainwin_fullscreen", "FALSE", &prefs_common.mainwin_fullscreen, P_BOOL,
+ 	 NULL, NULL, NULL},

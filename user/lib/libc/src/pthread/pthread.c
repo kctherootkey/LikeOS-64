@@ -688,9 +688,16 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 	return 0;
 }
 
+static void __pthread_run_cleanup(struct __pthread *tcb);
+
 void pthread_exit(void *retval)
 {
 	struct __pthread *tcb = __get_tcb();
+
+	/* Cleanup handlers first, before thread_local and key destructors:
+	 * they may still use that data. */
+	if (tcb)
+		__pthread_run_cleanup(tcb);
 
 	if (!tcb || tcb == __main_tcb || tcb == &__main_thread) {
 		// Main thread exiting - exit the entire process
@@ -1389,6 +1396,40 @@ int pthread_setcanceltype(int type, int *oldtype)
 		*oldtype = tcb->cancel_type;
 	tcb->cancel_type = type;
 	return 0;
+}
+
+void _pthread_cleanup_push(struct __ptcb *cb, void (*f)(void *), void *x)
+{
+	struct __pthread *tcb = __get_tcb();
+
+	cb->__f = f;
+	cb->__x = x;
+	cb->__next = tcb ? tcb->cleanup : NULL;
+	if (tcb)
+		tcb->cleanup = cb;
+}
+
+void _pthread_cleanup_pop(struct __ptcb *cb, int run)
+{
+	struct __pthread *tcb = __get_tcb();
+
+	if (tcb && tcb->cleanup == cb)
+		tcb->cleanup = cb->__next;
+	if (run)
+		cb->__f(cb->__x);
+}
+
+/* The handlers still pushed when the thread leaves, innermost first.  Each
+ * is unlinked before it runs, so a handler that itself calls pthread_exit()
+ * does not run again. */
+static void __pthread_run_cleanup(struct __pthread *tcb)
+{
+	while (tcb->cleanup) {
+		struct __ptcb *cb = tcb->cleanup;
+
+		tcb->cleanup = cb->__next;
+		cb->__f(cb->__x);
+	}
 }
 
 void pthread_testcancel(void)

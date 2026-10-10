@@ -216,6 +216,28 @@ int pthread_setcancelstate(int state, int* oldstate);
 int pthread_setcanceltype(int type, int* oldtype);
 void pthread_testcancel(void);
 
+/* Cleanup handlers.  pthread_cleanup_push() and pthread_cleanup_pop() are a
+ * matched pair of macros opening and closing one block, as POSIX allows:
+ * the record is a local of that block, chained onto the calling thread, so
+ * pushing allocates nothing and cannot fail.  A thread that leaves through
+ * pthread_exit() -- which is also how a cancellation acts -- runs the
+ * handlers still pushed, innermost first; pthread_cleanup_pop(n) removes
+ * the innermost one and runs it when n is non-zero. */
+struct __ptcb {
+	void (*__f)(void *);
+	void *__x;
+	struct __ptcb *__next;
+};
+void _pthread_cleanup_push(struct __ptcb *cb, void (*f)(void *), void *x);
+void _pthread_cleanup_pop(struct __ptcb *cb, int run);
+#define pthread_cleanup_push(f, x) \
+	do { \
+		struct __ptcb __likeos_cb; \
+		_pthread_cleanup_push(&__likeos_cb, (f), (x));
+#define pthread_cleanup_pop(r) \
+		_pthread_cleanup_pop(&__likeos_cb, (r)); \
+	} while (0)
+
 #include <signal.h>
 /* Per-thread signal mask (threads are tasks here, so this is the calling
  * thread's own mask, reported the pthread way: return value, not errno). */

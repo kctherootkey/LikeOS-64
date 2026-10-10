@@ -1,0 +1,31 @@
+Show the root of the local file system as the computer in the path bar.
+
+The first segment of a file dialog's location is the file system root, and
+GTK gives it the icon of the volume it is on -- drive-harddisk-symbolic, a
+square with a hole in it that reads as nothing in particular.  Windows
+begins every address with "This PC" and its monitor icon; the local root is
+shown that way here (computer-symbolic).  Other roots -- a mounted volume, a
+network share -- keep their volume's icon.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/gtk/gtkpathbar.c
++++ b/gtk/gtkpathbar.c
+@@ -1384,6 +1384,17 @@
+ 	  break;
+ 	}
+ 
++      /* The root of the local file system is shown as the computer, the
++       * way Windows begins every address with "This PC", rather than as
++       * the icon of the disk it happens to live on.  Other roots (a
++       * mounted volume, a network share) keep their volume's icon. */
++      if (g_file_has_uri_scheme (path_bar->priv->root_file, "file"))
++        {
++          path_bar->priv->root_icon = g_themed_icon_new ("computer-symbolic");
++          gtk_image_set_from_gicon (GTK_IMAGE (button_data->image), path_bar->priv->root_icon, GTK_ICON_SIZE_BUTTON);
++          break;
++        }
++
+       volume = _gtk_file_system_get_volume_for_file (path_bar->priv->file_system, path_bar->priv->root_file);
+       if (volume == NULL)
+ 	return;

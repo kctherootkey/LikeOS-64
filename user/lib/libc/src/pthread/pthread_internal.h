@@ -119,6 +119,11 @@ struct __pthread {
 	 * is ABI (self at %fs:0, the canary at %fs:0x28 -- the static asserts
 	 * below guard exactly that). */
 	char name[16];
+
+	/* The handlers pthread_cleanup_push() installed and pthread_cleanup_pop()
+	 * has not yet removed, innermost first; pthread_exit() runs them.  Each
+	 * record lives in the frame of the block that pushed it. */
+	struct __ptcb *cleanup;
 };
 
 /* The calling thread's kernel id, from its TCB.

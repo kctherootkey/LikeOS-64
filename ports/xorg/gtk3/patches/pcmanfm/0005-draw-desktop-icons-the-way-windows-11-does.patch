@@ -1,0 +1,191 @@
+Draw desktop icons the way Windows 11 does.
+
+A selected item gets a translucent light-blue box around the whole of it --
+icon and label together -- and an item under the pointer a fainter one,
+instead of a solid box in the theme's selection colour behind the label
+alone.  The label stays white over its shadow in every state, and the shadow
+is soft (two offset copies at falling opacity) rather than a hard one-pixel
+copy.  Keyboard focus on an unselected item is a thin light frame instead of
+the theme's focus ring, which is meant for widgets on a window background and
+sits heavily on a wallpaper; like Windows, it shows only once the keyboard
+has been used to move around.  Leaving the desktop clears the hover box.
+
+Everything is drawn inside the item's own rectangle (icon and label
+together).  That rectangle is what redraw_item() repaints when an item's
+state changes and what the expose handler tests an item against, so a box
+drawn even a pixel outside it was never erased: hovering or selecting an
+icon left a thin outline on the wallpaper.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -1862,17 +1862,10 @@
+ 
+ static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRectangle* expose_area, GdkPixbuf* icon)
+ {
+-#if GTK_CHECK_VERSION(3, 0, 0)
+-    GtkStyleContext* style;
+-#else
+-    GtkStyle* style;
+-#endif
+     GtkWidget* widget = (GtkWidget*)self;
+     GtkCellRendererState state = 0;
+-#if GTK_CHECK_VERSION(3, 0, 0)
+-    GdkRGBA rgba;
+-#else
+-    GdkWindow* window;
++#if !GTK_CHECK_VERSION(3, 0, 0)
++    GdkWindow* window = gtk_widget_get_window(widget);
+ #endif
+     int text_x, text_y;
+ 
+@@ -1880,13 +1873,6 @@
+     if (item->is_selected && self->dragging)
+         return;
+ 
+-#if GTK_CHECK_VERSION(3, 0, 0)
+-    style = gtk_widget_get_style_context(widget);
+-#else
+-    style = gtk_widget_get_style(widget);
+-    window = gtk_widget_get_window(widget);
+-#endif
+-
+     pango_layout_set_text(self->pl, NULL, 0);
+     pango_layout_set_width(self->pl, self->pango_text_w);
+     pango_layout_set_height(self->pl, self->pango_text_h);
+@@ -1897,50 +1883,83 @@
+     text_x = item->area.x + (self->cell_w - self->text_w)/2 + 2;
+     text_y = item->text_rect.y + 2;
+ 
+-    if(item->is_selected || item == self->drop_hilight) /* draw background for text label */
+-    {
+-        state = GTK_CELL_RENDERER_SELECTED;
+-
++    /* The look of a Windows 11 desktop icon.  A selected or pointed-at item
++     * gets a translucent light-blue box around the whole of it, icon and
++     * label together; the label itself stays white over its shadow in every
++     * state, so it reads the same against any wallpaper. */
++    if(item->is_selected || item == self->drop_hilight || item == self->hover_item)
++    {
++        GdkRectangle box;
++        double fill, edge;
++
++        gdk_rectangle_union(&item->icon_rect, &item->text_rect, &box);
++        if(item->is_selected || item == self->drop_hilight)
++        {
++            state = GTK_CELL_RENDERER_SELECTED;
++            fill = (item == self->hover_item) ? 0.45 : 0.35;
++            edge = 0.60;
++        }
++        else
++        {
++            fill = 0.18;
++            edge = 0.32;
++        }
++        /* Exactly the item's rectangle, edge inside it: that is all
++         * redraw_item() repaints and all the expose handler tests an item
++         * against, so anything drawn outside it is never erased again. */
+         cairo_save(cr);
+-        gdk_cairo_rectangle(cr, &item->text_rect);
+-#if GTK_CHECK_VERSION(3, 0, 0)
+-        gtk_style_context_get_background_color(style, GTK_STATE_FLAG_SELECTED, &rgba);
+-        gdk_cairo_set_source_rgba(cr, &rgba);
+-#else
+-        gdk_cairo_set_source_color(cr, &style->bg[GTK_STATE_SELECTED]);
+-#endif
+-        cairo_clip(cr);
+-        cairo_paint(cr);
++        cairo_set_source_rgba(cr, 204/255.0, 232/255.0, 1.0, fill);
++        gdk_cairo_rectangle(cr, &box);
++        cairo_fill(cr);
++        cairo_set_line_width(cr, 1.0);
++        cairo_set_source_rgba(cr, 204/255.0, 232/255.0, 1.0, edge);
++        cairo_rectangle(cr, box.x + 0.5, box.y + 0.5, box.width - 1, box.height - 1);
++        cairo_stroke(cr);
+         cairo_restore(cr);
+-#if GTK_CHECK_VERSION(3, 0, 0)
+-        gtk_style_context_get_color(style, GTK_STATE_FLAG_SELECTED, &rgba);
+-        gdk_cairo_set_source_rgba(cr, &rgba);
+-#else
+-        gdk_cairo_set_source_color(cr, &style->fg[GTK_STATE_SELECTED]);
+-#endif
+-    }
+-    else
+-    {
+-        /* the shadow */
+-        gdk_cairo_set_source_color(cr, &self->conf.desktop_shadow);
+-        cairo_move_to(cr, text_x + 1, text_y + 1);
+-        pango_cairo_show_layout(cr, self->pl);
+-        gdk_cairo_set_source_color(cr, &self->conf.desktop_fg);
+     }
++
++    /* The shadow: soft rather than a hard copy of the text -- a dark copy
++     * one pixel down and right, and a fainter one a pixel further, which
++     * is roughly the blurred shadow Windows draws under desktop labels. */
++    cairo_save(cr);
++    cairo_set_source_rgba(cr, self->conf.desktop_shadow.red / 65535.0,
++                          self->conf.desktop_shadow.green / 65535.0,
++                          self->conf.desktop_shadow.blue / 65535.0, 0.30);
++    cairo_move_to(cr, text_x + 2, text_y + 2);
++    pango_cairo_show_layout(cr, self->pl);
++    cairo_set_source_rgba(cr, self->conf.desktop_shadow.red / 65535.0,
++                          self->conf.desktop_shadow.green / 65535.0,
++                          self->conf.desktop_shadow.blue / 65535.0, 0.85);
++    cairo_move_to(cr, text_x + 1, text_y + 1);
++    pango_cairo_show_layout(cr, self->pl);
++    cairo_restore(cr);
++    gdk_cairo_set_source_color(cr, &self->conf.desktop_fg);
++
+     /* real text */
+     cairo_move_to(cr, text_x, text_y);
+     /* FIXME: should we check if pango is 1.10 at least? */
+     pango_cairo_show_layout(cr, self->pl);
+     pango_layout_set_text(self->pl, NULL, 0);
+ 
+-    if(item == self->focus && gtk_widget_has_focus(widget))
+-#if GTK_CHECK_VERSION(3, 0, 0)
+-        gtk_render_focus(style, cr,
+-#else
+-        gtk_paint_focus(style, window, gtk_widget_get_state(widget),
+-                        expose_area, widget, "icon_view",
+-#endif
+-                        item->text_rect.x, item->text_rect.y, item->text_rect.width, item->text_rect.height);
++    /* Keyboard focus on an item that is not selected: a thin light frame,
++     * shown -- as Windows shows it -- only once the keyboard has been used
++     * to move around (the window's focus-visible flag), not left behind on
++     * the last item clicked.  A selected item's box already marks it, and
++     * the theme's focus ring -- drawn for widgets on a window background --
++     * is a heavy dark outline that would sit on the wallpaper. */
++    if(item == self->focus && gtk_widget_has_focus(widget) && !item->is_selected &&
++       gtk_window_get_focus_visible(GTK_WINDOW(self)))
++    {
++        GdkRectangle box;
++
++        gdk_rectangle_union(&item->icon_rect, &item->text_rect, &box);
++        cairo_save(cr);
++        cairo_set_line_width(cr, 1.0);
++        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.55);
++        cairo_rectangle(cr, box.x + 0.5, box.y + 0.5, box.width - 1, box.height - 1);
++        cairo_stroke(cr);
++        cairo_restore(cr);
++    }
+ 
+     if(item == self->hover_item) /* hovered */
+         g_object_set(G_OBJECT(self), "tooltip-text", fm_file_info_get_disp_name(item->fi), NULL);
+@@ -3717,6 +3736,15 @@
+         g_source_remove(self->single_click_timeout_handler);
+         self->single_click_timeout_handler = 0;
+     }
++    /* The pointer went onto a window or the panel: the item it was over is
++     * no longer hovered, and its hover box has to go. */
++    if(self->hover_item && evt->mode == GDK_CROSSING_NORMAL)
++    {
++        FmDesktopItem *hover_item = self->hover_item;
++
++        self->hover_item = NULL;
++        redraw_item(self, hover_item);
++    }
+     return TRUE;
+ }
+ 

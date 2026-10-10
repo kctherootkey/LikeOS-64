@@ -1484,6 +1484,27 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			continue;
 		}
 
+		/* ---- the count of characters produced so far ----
+		 * Stored, not printed: the number the call would have
+		 * written up to this point, truncated characters included.
+		 * Programs build a buffer with it and continue writing where
+		 * the formatted part ended (xnc assembles its request to the
+		 * XNEdit server that way); printed as a letter, the count was
+		 * never stored and the caller went on from garbage. */
+		case 'n':
+			if (lng == 2)
+				*va_arg(ap, long long *) = (long long)pos;
+			else if (lng == 1)
+				*va_arg(ap, long *) = (long)pos;
+			else if (sht == 2)
+				*va_arg(ap, signed char *) = (signed char)pos;
+			else if (sht == 1)
+				*va_arg(ap, short *) = (short)pos;
+			else
+				*va_arg(ap, int *) = (int)pos;
+			format++;
+			continue;
+
 		/* ---- character ---- */
 		case 'c': {
 			/* %lc takes a wint_t and writes the multibyte encoding

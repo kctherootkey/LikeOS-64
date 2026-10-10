@@ -1,0 +1,139 @@
+svga: change the screen's resource counters atomically.
+
+hud.num_resources, hud.total_resource_bytes and hud.num_failed_allocations
+belong to the screen, but every context of the screen creates and destroys
+resources -- and a WebKit web process has several, on as many threads: the
+main thread, the compositor and the Skia GPU workers, all sharing one
+screen.  The counters were plain ++ and --, so two threads updating them at
+once lose an update.  A lost increment leaves num_resources one short; when
+the last resources are destroyed (a web process shutting down destroys its
+GL contexts while a worker thread releases its Skia context) the count
+reaches zero early and the next destroy fails
+
+  svga_resource_destroy: Assertion `ss->hud.num_resources > 0' failed.
+
+which aborts the process.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -Nur a/src/gallium/drivers/svga/svga_resource_buffer.c b/src/gallium/drivers/svga/svga_resource_buffer.c
+--- a/src/gallium/drivers/svga/svga_resource_buffer.c
++++ b/src/gallium/drivers/svga/svga_resource_buffer.c
+@@ -422,10 +422,12 @@
+ 
+       pipe_resource_reference(&sbuf->translated_indices.buffer, NULL);
+ 
+-      ss->hud.total_resource_bytes -= sbuf->size;
+-      assert(ss->hud.num_resources > 0);
+-      if (ss->hud.num_resources > 0)
+-         ss->hud.num_resources--;
++      p_atomic_add(&ss->hud.total_resource_bytes, -(int64_t)sbuf->size);
++      {
++         ASSERTED uint64_t remaining =
++            p_atomic_dec_return(&ss->hud.num_resources);
++         assert(remaining != UINT64_MAX);
++      }
+ 
+       FREE(sbuf);
+    } else {
+@@ -448,16 +450,18 @@
+       if (tex->backed_handle)
+          svga_screen_surface_destroy(ss, &tex->backed_key, to_invalidate, &tex->backed_handle);
+ 
+-      ss->hud.total_resource_bytes -= tex->size;
++      p_atomic_add(&ss->hud.total_resource_bytes, -(int64_t)tex->size);
+ 
+       FREE(tex->defined);
+       FREE(tex->rendered_to);
+       FREE(tex->dirty);
+       FREE(tex);
+ 
+-      assert(ss->hud.num_resources > 0);
+-      if (ss->hud.num_resources > 0)
+-         ss->hud.num_resources--;
++      {
++         ASSERTED uint64_t remaining =
++            p_atomic_dec_return(&ss->hud.num_resources);
++         assert(remaining != UINT64_MAX);
++      }
+    }
+ }
+ 
+@@ -542,9 +546,9 @@
+ 
+    sbuf->bind_flags = bind_flags;
+    sbuf->size = util_resource_size(&sbuf->b);
+-   ss->hud.total_resource_bytes += sbuf->size;
++   p_atomic_add(&ss->hud.total_resource_bytes, sbuf->size);
+ 
+-   ss->hud.num_resources++;
++   p_atomic_inc(&ss->hud.num_resources);
+    SVGA_STATS_TIME_POP(ss->sws);
+ 
+    return &sbuf->b;
+@@ -587,7 +591,7 @@
+    debug_reference(&sbuf->b.reference,
+                    (debug_reference_descriptor)debug_describe_resource, 0);
+ 
+-   ss->hud.num_resources++;
++   p_atomic_inc(&ss->hud.num_resources);
+ 
+    return &sbuf->b;
+ 
+diff -Nur a/src/gallium/drivers/svga/svga_resource.c b/src/gallium/drivers/svga/svga_resource.c
+--- a/src/gallium/drivers/svga/svga_resource.c
++++ b/src/gallium/drivers/svga/svga_resource.c
+@@ -7,6 +7,7 @@
+ 
+ #include <inttypes.h>
+ #include "util/u_debug.h"
++#include "util/u_atomic.h"
+ 
+ #include "svga_resource.h"
+ #include "svga_resource_buffer.h"
+@@ -33,7 +34,7 @@
+ 
+    if (!r) {
+       struct svga_screen *svgascreen = svga_screen(screen);
+-      svgascreen->hud.num_failed_allocations++;
++      p_atomic_inc(&svgascreen->hud.num_failed_allocations);
+    }
+ 
+    return r;
+diff -Nur a/src/gallium/drivers/svga/svga_resource_texture.c b/src/gallium/drivers/svga/svga_resource_texture.c
+--- a/src/gallium/drivers/svga/svga_resource_texture.c
++++ b/src/gallium/drivers/svga/svga_resource_texture.c
+@@ -1105,8 +1105,8 @@
+    /* Initialize the backing resource cache */
+    tex->backed_handle = NULL;
+ 
+-   svgascreen->hud.total_resource_bytes += tex->size;
+-   svgascreen->hud.num_resources++;
++   p_atomic_add(&svgascreen->hud.total_resource_bytes, tex->size);
++   p_atomic_inc(&svgascreen->hud.num_resources);
+ 
+    SVGA_STATS_TIME_POP(svgascreen->sws);
+ 
+@@ -1195,7 +1195,7 @@
+ 
+    tex->imported = true;
+ 
+-   ss->hud.num_resources++;
++   p_atomic_inc(&ss->hud.num_resources);
+ 
+    return &tex->b;
+ 
+diff -Nur a/src/gallium/drivers/svga/svga_screen.h b/src/gallium/drivers/svga/svga_screen.h
+--- a/src/gallium/drivers/svga/svga_screen.h
++++ b/src/gallium/drivers/svga/svga_screen.h
+@@ -73,7 +73,9 @@
+ 
+    struct svga_host_surface_cache cache;
+ 
+-   /** HUD counters */
++   /** HUD counters.  Every context of this screen -- on whatever thread it
++    * runs -- creates and destroys resources, so they are only ever changed
++    * with p_atomic_*. */
+    struct {
+       /** Memory used by all resources (buffers and surfaces) */
+       uint64_t total_resource_bytes;

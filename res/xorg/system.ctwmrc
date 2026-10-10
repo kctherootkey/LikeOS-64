@@ -8,29 +8,53 @@
 # users were accustomed to uwm, the defaults could be set up not to decorate
 # any windows and to use meta-keys.
 #
+# LikeOS changes: Copyright (C) 2026 The LikeOS Project
+#
 
-TitleFont	"-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
-ResizeFont	"-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
-MenuFont	"-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
-IconFont	"-adobe-helvetica-bold-r-normal--*-100-*-*-*-*-*-*"
-IconManagerFont	"-adobe-helvetica-bold-r-normal--*-100-*-*-*"
+#
+# Fonts: Selawik, the desktop's interface font (the open substitute for
+# Segoe UI), at Windows 11's 9 points.  The "xft:" prefix makes ctwm draw it
+# anti-aliased through Xft -- a LikeOS addition (ports/xorg/patches/ctwm,
+# 0003); the part after it is a fontconfig pattern.
+#
+TitleFont	"xft:Selawik:size=9"
+ResizeFont	"xft:Selawik:size=9"
+MenuFont	"xft:Selawik:size=9"
+IconFont	"xft:Selawik:size=9"
+IconManagerFont	"xft:Selawik:size=9"
 # ShowWorkSpaceManager is deliberately absent.  The workspace switcher is the
 # four numbered buttons in taskbar(1), which drives ctwm through
 # _NET_CURRENT_DESKTOP; ctwm still owns the workspaces themselves (see the
 # WorkSpaces block below, which is what makes there be four of them and what
 # ctwm advertises as _NET_NUMBER_OF_DESKTOPS).  Without this keyword the
 # manager window is created but never mapped.
-UseThreeDMenus
-UseThreeDTitles
-UseThreeDIconManagers
-UseThreeDBorders
-UseThreeDWMap
 #
-# SunkFocusWindowTitle is deliberately NOT set (upstream had it).  It draws the
-# FOCUSED window's title bar and its buttons pressed-in, so the active window
-# looked like its controls were being held down while every other window looked
-# normal.  Focus is still visible -- the title bar highlights and the taskbar
-# entry takes IconManagerHighlight -- without the decoration changing shape.
+# Windows 11 title bars (FluentTitles, a LikeOS addition -- see
+# ports/xorg/patches/ctwm/0003).  A flat caption 30 pixels tall: the
+# application's icon and its title on the left, minimise, maximise and close
+# on the right as 46-pixel-wide buttons with thin glyphs that highlight under
+# the pointer, close in red.  The caption is #f0f3f9 with black text when the
+# window has the focus and #f3f3f3 with grey text when it does not -- Windows
+# 11's own colours; they are built into the mode, so TitleBackground and
+# TitleForeground below do not change them.
+#
+# Everything three-dimensional is off: Windows 11 draws no bevels anywhere.
+# The window border is one flat pixel (BorderWidth, colours in the Color
+# block), and the padding and indents that space out classic title buttons are
+# zero, since the caption buttons sit flush against each other and the corner.
+# NoTitleHighlight drops the striped "this window has the focus" band classic
+# ctwm draws in the title; the colour change says it instead.
+#
+FluentTitles
+TitleBarHeight		30
+TitleButtonWidth	46
+TitleButtonBorderWidth	0
+FramePadding		0
+TitlePadding		0
+ButtonIndent		0
+BorderWidth		1
+NoTitleHighlight
+TitleJustification	"left"
 #
 #
 # Focus and stacking, the way a Windows user expects: pressing a mouse button
@@ -216,41 +240,42 @@ OccupyAll
 }
 
 #
-# Solaris/CDE palette.  Three colours do all the work:
+# Windows 11 light colours.
 #
-#   #c6c6c6  light grey  - every frame, title bar, menu and the taskbar
-#   #ae5c8c  dusty pink  - "this one is active": focused border, menu titles
-#   #40408c  dark blue   - the window blocks drawn inside the workspace map
+# The window border is one pixel of grey, a shade darker on the window that
+# has the focus: ctwm paints the FOCUSED window's border in BorderColor and
+# every other one from the BorderTile pair (the same colour twice, so the
+# tile is solid).  #afafaf and #c8c8c8 are what Windows 11 draws, measured
+# over a white background.
 #
-# The greys are flat rather than saturated on purpose: UseThreeD* shades its
-# bevels FROM the base colour, so a strong colour there produces harsh edges.
-#
-# Focus is shown by BorderColor alone.  ctwm paints the border of the FOCUSED
-# window in BorderColor and fills every other window's border from the
-# BorderTile pair, so pink borders mark the active window while the rest stay
-# grey -- and the title bar itself does not change shape (see the note about
-# SunkFocusWindowTitle at the top of this file).
+# Menus are Windows 11's light context menus: near-white, dark text, and a
+# grey wash under the pointer (the "fore":"back" pair after each menu name
+# below sets that).  Menu titles are quiet grey text rather than a coloured
+# band; Windows menus have no titles at all.  With FluentTitles the menu's
+# border and its separator lines are drawn in MenuShadowColor, a light grey
+# (the drop shadow it is otherwise for is switched off, see NoMenuShadows).
 #
 Color
 {
-    BorderColor           "#ae5c8c"
-    DefaultBackground     "#c6c6c6"
-    DefaultForeground     "black"
-    BorderTileBackground  "#c6c6c6"
-    BorderTileForeground  "#8c8c8c"
-    TitleBackground       "#c6c6c6"
+    BorderColor           "#afafaf"
+    DefaultBackground     "#f9f9f9"
+    DefaultForeground     "#1b1b1b"
+    BorderTileBackground  "#c8c8c8"
+    BorderTileForeground  "#c8c8c8"
+    TitleBackground       "#f3f3f3"
     TitleForeground       "black"
-    MenuBackground        "#c6c6c6"
-    MenuForeground        "black"
-    MenuTitleBackground   "#ae5c8c"
-    MenuTitleForeground   "white"
-    IconBackground        "#c6c6c6"
-    IconForeground        "black"
-    IconBorderColor       "#8c8c8c"
-    IconManagerBackground "#c6c6c6"
-    IconManagerForeground "black"
-    IconManagerHighlight  "#ae5c8c"
-    MapWindowBackground   "#40408c"
+    MenuBackground        "#f9f9f9"
+    MenuForeground        "#1b1b1b"
+    MenuTitleBackground   "#f9f9f9"
+    MenuTitleForeground   "#616161"
+    MenuShadowColor       "#d0d0d0"
+    IconBackground        "#f3f3f3"
+    IconForeground        "#1b1b1b"
+    IconBorderColor       "#c8c8c8"
+    IconManagerBackground "#f3f3f3"
+    IconManagerForeground "#1b1b1b"
+    IconManagerHighlight  "#cce8ff"
+    MapWindowBackground   "#0078d4"
     MapWindowForeground   "white"
 }
 
@@ -306,6 +331,12 @@ Function "move-or-iconify" { f.move f.deltastop f.iconify }
 # what you want from Alt+F1, where the menu is asked for deliberately.
 #
 StayUpMenus
+
+#
+# No drop shadow under menus.  ctwm's is a solid black copy of the menu
+# offset by a few pixels, which reads as a hard dark slab beside a Windows 11
+# menu; Windows' own shadow is a soft blur that needs a compositor.
+NoMenuShadows
 
 #
 # PCManFM's desktop, named explicitly.
@@ -389,7 +420,7 @@ Button2 =	: frame		: f.raiselower
 # The browser is named the way res/xorg/applications/renames names it:
 # program and role together, so the entry says what it opens.
 #
-menu "defops"
+menu "defops" ("#1b1b1b":"#e9e9e9")
 {
     "LikeOS"		f.title
     "Xterm"		!"xterm&"
@@ -412,7 +443,7 @@ menu "defops"
 # on from a menu after the fact.
 #
 
-menu "windowops" {
+menu "windowops" ("#1b1b1b":"#e9e9e9") {
     "Windows"		f.title
     "Occupy"		f.occupy
     "Occupy All"	f.occupyall

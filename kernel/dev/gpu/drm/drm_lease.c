@@ -1,9 +1,9 @@
 // LikeOS -- display-manager core: leases.
 //
 // Leasing hands a subset of the mode objects to another file as its own
-// master.  Not supported: every lease ioctl is refused with -EINVAL, which
-// is what a client that probes for leasing expects from a device without
-// it.
+// master.  Not supported: creating, reading and revoking a lease are
+// refused with -EINVAL, which is what a client that probes for leasing
+// expects from a device without it; the list of lessees is simply empty.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -30,14 +30,20 @@ int drm_mode_create_lease_ioctl(struct drm_device *dev, void *kb,
 	return -EINVAL;
 }
 
-/* LIST_LESSEES */
+/* LIST_LESSEES: no lease is ever granted (CREATE_LEASE refuses), so every
+ * master's list is empty -- an answer, not a refusal.  The X server asks at
+ * start-up to validate its leases. */
 int drm_mode_list_lessees_ioctl(struct drm_device *dev, void *kb,
 				struct drm_file *fp)
 {
+	struct drm_mode_list_lessees *arg = kb;
+
 	(void)dev;
-	(void)kb;
 	(void)fp;
-	return -EINVAL;
+	if (arg->pad)
+		return -EINVAL;
+	arg->count_lessees = 0;
+	return 0;
 }
 
 /* GET_LEASE */

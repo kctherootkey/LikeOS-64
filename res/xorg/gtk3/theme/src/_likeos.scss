@@ -1,0 +1,1030 @@
+// LikeOS theme: the Windows 11 look, widget by widget.
+//
+// Everything above this file is Adwaita's widget structure with the Windows 11
+// palette (_colors.scss) and flat Fluent drawing (_drawing.scss).  This file
+// sets what neither of those reaches: Windows 11's sizes, radii and spacing,
+// and the controls whose shape differs from Adwaita's -- check boxes, radio
+// buttons, toggle switches, sliders, progress bars, scroll bars, menus, tabs,
+// list selection and message boxes.
+//
+// Sizes are Windows 11's at 100% scale (96 dpi): 32-pixel buttons and text
+// fields, 20-pixel check boxes, 4-pixel corner radius on controls.
+//
+// Menus and tooltips are square-cornered on purpose.  They are separate X
+// windows, and without a compositing manager a window has no transparency, so
+// a rounded corner would be drawn over a black square.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+$control_radius: 4px;
+$overlay_radius: 8px;
+$focus_ring: rgba(0, 0, 0, 0.894);
+
+/*********************
+ * Keyboard focus     *
+ *********************/
+// A two-pixel near-black ring, as Windows draws for keyboard focus.  GTK only
+// shows it after keyboard navigation, as Windows does.
+* {
+  outline-color: $focus_ring;
+  outline-style: solid;
+  outline-width: 2px;
+  outline-offset: -2px;
+  -gtk-outline-radius: $control_radius;
+}
+
+/**************
+ * Typography *
+ **************/
+.title, .large-title { font-weight: 600; }
+.dim-label, label.separator { color: $secondary_text_color; opacity: 1; }
+
+/***********
+ * Buttons *
+ ***********/
+button {
+  min-height: 20px;
+  min-width: 20px;
+  padding: 5px 11px;
+  border-radius: $control_radius;
+  transition: none;
+
+  &.text-button { padding-left: 11px; padding-right: 11px; }
+  &.image-button { padding-left: 5px; padding-right: 5px; }
+  &.text-button.image-button {
+    padding-left: 8px;
+    padding-right: 8px;
+    label { padding-left: 4px; padding-right: 4px; }
+  }
+
+  // Toolbar and flat buttons: nothing at rest, a grey wash when pointed at.
+  &.flat {
+    &:hover {
+      background-image: image($subtle_hover_color);
+      border-color: transparent;
+      transition: none;
+    }
+    &:active, &:checked {
+      background-image: image($subtle_active_color);
+      border-color: transparent;
+      color: $control_active_text_color;
+    }
+    &:checked { background-image: image(rgba(0, 0, 0, 0.0578)); color: $fg_color; }
+    &:disabled { color: $insensitive_fg_color; }
+  }
+
+  // A toggle button that is on is drawn as an accent button, as a Windows
+  // ToggleButton is.
+  &:checked:not(.flat):not(.image-button) {
+    @include button(normal, $accent_color, white);
+    &:hover { @include button(hover, $accent_color, white); }
+    &:active { @include button(active, $accent_color, white); }
+    &:disabled { @include button(insensitive, $accent_color, white); }
+  }
+}
+
+// The default button of a dialog, and a "suggested" action: an accent button,
+// which is how Windows marks the button Enter presses.
+button.suggested-action,
+button.default:not(.flat),
+dialog .dialog-action-area button.default,
+messagedialog .dialog-action-area button.default {
+  @include button(normal, $accent_color, white);
+  &:hover { @include button(hover, $accent_color, white); }
+  &:active, &:checked { @include button(active, $accent_color, white); }
+  &:disabled { @include button(insensitive, $accent_color, white); }
+  outline-color: $focus_ring;
+}
+
+button.destructive-action {
+  @include button(normal, $destructive_color, white);
+  &:hover { @include button(hover, $destructive_color, white); }
+  &:active, &:checked { @include button(active, $destructive_color, white); }
+  &:disabled { @include button(insensitive, $destructive_color, white); }
+}
+
+// Buttons joined into one control share their inner edges.
+.linked:not(.vertical) > button:not(:first-child) { border-left-color: $borders_color; }
+
+/****************
+ * Text entries *
+ ****************/
+entry {
+  min-height: 30px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: $control_radius;
+  transition: none;
+
+  &:hover:not(:focus):not(:disabled) { background-color: $control_hover_color; }
+
+  image { color: $secondary_text_color; }
+  image.left { margin-right: 8px; }
+  image.right { margin-left: 8px; }
+
+  // Text selected inside a field is highlighted in the accent colour.
+  selection, selection:focus {
+    background-color: $accent_light_color;
+    color: white;
+  }
+
+  progress {
+    border-bottom: 2px solid $accent_color;
+    background: none;
+    margin: 0 -10px -1px;
+  }
+
+  // A field in a header bar or tool bar looks the same as anywhere else.
+  &.search { border-radius: $control_radius; }
+}
+
+// Selected text anywhere else (labels, text views).
+label selection, textview text selection {
+  background-color: $accent_light_color;
+  color: white;
+}
+
+textview text { background-color: $base_color; color: $text_color; }
+textview border { background-color: $bg_color; }
+
+/***************
+ * Spin button *
+ ***************/
+// A number box: one field, with its two step buttons drawn flat inside it.
+spinbutton:not(.vertical) {
+  padding: 0;
+  border-radius: $control_radius;
+
+  entry { min-width: 32px; }
+
+  > button.image-button.up:not(.flat),
+  > button.image-button.down:not(.flat) {
+    @include button(undecorated);
+    min-height: 20px;
+    min-width: 20px;
+    margin: 4px 2px;
+    padding: 1px 4px;
+    border: none;
+    border-radius: $control_radius;
+    color: $secondary_text_color;
+
+    &:hover { background-image: image($subtle_hover_color); color: $fg_color; }
+    &:active { background-image: image($subtle_active_color); }
+    &:disabled { color: $insensitive_fg_color; background-image: none; }
+    &:dir(ltr):last-child { margin-right: 4px; border-radius: $control_radius; }
+  }
+}
+
+spinbutton:not(.vertical) button,
+spinbutton:not(.vertical) button:dir(rtl),
+spinbutton:not(.vertical) button:backdrop {
+  border-style: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/**************
+ * Combo boxes *
+ **************/
+// The drop-down mark is a chevron, as Windows 11 draws it, not a triangle.
+combobox {
+  arrow {
+    -gtk-icon-source: -gtk-icontheme('go-down-symbolic');
+    color: $secondary_text_color;
+    min-height: 16px;
+    min-width: 16px;
+  }
+  button.combo { padding-left: 11px; padding-right: 8px; }
+  menu menuitem { min-height: 20px; }
+}
+
+/***************
+ * Header bars *
+ ***************/
+headerbar {
+  min-height: 32px;
+  padding: 0 6px;
+  background: $bg_color;
+  border-width: 0 0 1px;
+  border-style: solid;
+  border-color: $borders_color;
+  box-shadow: none;
+
+  &:backdrop { background: $bg_color; }
+
+  .title { font-weight: normal; }
+  .subtitle { color: $secondary_text_color; }
+
+  button:not(.suggested-action):not(.destructive-action) {
+    @include button(undecorated);
+    &:hover { background-image: image($subtle_hover_color); }
+    &:active, &:checked { background-image: image($subtle_active_color); }
+  }
+}
+
+/************
+ * Toolbars *
+ ************/
+toolbar {
+  padding: 4px;
+  background-color: $bg_color;
+  border: none;
+
+  button { padding: 5px 6px; }
+  separator { margin: 4px 6px; background-color: $borders_color; }
+}
+
+/*********
+ * Menus *
+ *********/
+menubar, .menubar {
+  padding: 0 4px;
+  background-color: $bg_color;
+  box-shadow: none;
+
+  > menuitem {
+    min-height: 20px;
+    padding: 4px 10px;
+    margin: 2px 0;
+    border-radius: $control_radius;
+    color: $fg_color;
+
+    &:hover {
+      box-shadow: none;
+      background-color: $subtle_hover_color;
+      color: $fg_color;
+    }
+    &:disabled { color: $insensitive_fg_color; }
+  }
+}
+
+menu, .menu, .context-menu {
+  margin: 0;
+  padding: 4px 0;
+  background-color: $menu_color;
+  border: 1px solid #d0d0d0;
+  border-radius: 0;
+
+  &:backdrop { background-color: $menu_color; }
+
+  menuitem {
+    min-height: 20px;
+    min-width: 120px;
+    padding: 5px 12px;
+    margin: 0 4px;
+    border-radius: $control_radius;
+    color: $fg_color;
+
+    &:hover {
+      color: $fg_color;
+      background-color: rgba(0, 0, 0, 0.0578);
+    }
+    &:disabled { color: $insensitive_fg_color; }
+    &:backdrop, &:backdrop:hover { color: $fg_color; }
+    &:backdrop:hover { background-color: rgba(0, 0, 0, 0.0578); }
+
+    accelerator { color: $secondary_text_color; margin-left: 24px; }
+    arrow { color: $secondary_text_color; }
+  }
+
+  separator { margin: 4px 0; background-color: $borders_color; min-height: 1px; }
+}
+
+// Check and radio marks in menus are plain glyphs, as in a Windows menu.
+menu menuitem {
+  check, radio {
+    &, &:checked, &:indeterminate {
+      &, &:hover, &:disabled {
+        min-height: 16px;
+        min-width: 16px;
+        border: none;
+        box-shadow: none;
+        background-image: none;
+        color: inherit;
+      }
+    }
+  }
+}
+
+/************
+ * Popovers *
+ ************/
+popover.background {
+  padding: 4px;
+  background-color: $popover_bg_color;
+  border: 1px solid #d0d0d0;
+  border-radius: $overlay_radius;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.14);
+
+  &:backdrop { background-color: $popover_bg_color; box-shadow: none; }
+
+  modelbutton.flat, .menuitem.button.flat {
+    min-height: 20px;
+    padding: 5px 12px;
+    border-radius: $control_radius;
+    &:hover { background-color: rgba(0, 0, 0, 0.0578); color: $fg_color; }
+  }
+}
+
+/************
+ * Tooltips *
+ ************/
+// White, with grey text and a light grey hairline.
+tooltip, tooltip.background {
+  padding: 4px 8px;
+  background-color: #ffffff;
+  color: #505050;
+  border: 1px solid $tooltip_borders_color;
+  border-radius: 0;
+  text-shadow: none;
+  box-shadow: none;
+}
+
+tooltip decoration { background-color: transparent; border-radius: 0; }
+
+tooltip * {
+  padding: 0;
+  background-color: transparent;
+  color: #505050;
+  text-shadow: none;
+}
+
+/*************
+ * Notebooks *
+ *************/
+// Document tabs, as Windows 11's tab view draws them: the selected tab is a
+// white card joined to the page below it; the others are text on the window
+// background, washed grey under the pointer.
+notebook {
+  > header {
+    background-color: $bg_color;
+    border-color: $borders_color;
+    padding: 0;
+
+    &.top { box-shadow: inset 0 -1px $borders_color; }
+    &.bottom { box-shadow: inset 0 1px $borders_color; }
+    &.left { box-shadow: inset -1px 0 $borders_color; }
+    &.right { box-shadow: inset 1px 0 $borders_color; }
+
+    tabs { margin: 4px 4px 0; }
+
+    tab {
+      min-height: 20px;
+      min-width: 20px;
+      padding: 6px 12px;
+      color: $secondary_text_color;
+      border: 1px solid transparent;
+      box-shadow: none;
+      outline-offset: -4px;
+
+      &:hover {
+        color: $fg_color;
+        background-color: $subtle_hover_color;
+        box-shadow: none;
+      }
+
+      &:checked {
+        color: $fg_color;
+        background-color: $base_color;
+        border-color: $borders_color;
+        box-shadow: none;
+
+        &:hover { background-color: $base_color; }
+      }
+
+      button.flat {
+        min-height: 16px;
+        min-width: 16px;
+        padding: 2px;
+        margin: 0 -4px 0 4px;
+        color: $secondary_text_color;
+        &:hover { color: $fg_color; background-image: image($subtle_hover_color); }
+      }
+    }
+
+    &.top tab { border-radius: $control_radius $control_radius 0 0; border-bottom-color: transparent; }
+    &.top tab:checked { border-bottom-color: $base_color; }
+    &.bottom tab { border-radius: 0 0 $control_radius $control_radius; border-top-color: transparent; }
+    &.bottom tab:checked { border-top-color: $base_color; }
+    &.left tab { border-radius: $control_radius 0 0 $control_radius; border-right-color: transparent; }
+    &.right tab { border-radius: 0 $control_radius $control_radius 0; border-left-color: transparent; }
+  }
+
+  > stack:not(:only-child) { background-color: $base_color; }
+}
+
+// Adwaita marks the selected tab with an inset underline, on selectors more
+// specific than the ones above; the card replaces it.
+@each $side in top, bottom, left, right {
+  notebook > header.#{$side} > tabs {
+    margin: 0;
+    > tab, > tab:hover, > tab:backdrop, > tab:checked, > tab:checked:hover {
+      box-shadow: none;
+    }
+  }
+}
+notebook > header.top > tabs { margin-bottom: -1px; }
+notebook > header.bottom > tabs { margin-top: -1px; }
+notebook > header.left > tabs { margin-right: -1px; }
+notebook > header.right > tabs { margin-left: -1px; }
+
+/**************
+ * Scrollbars *
+ **************/
+// Windows 11's thin scroll bars: a two-pixel line at rest that widens to six
+// pixels, over a pale track, when the pointer comes near it.
+scrollbar {
+  background-color: transparent;
+  border: none;
+  transition: none;
+
+  &.vertical { border-left: none; }
+  &.horizontal { border-top: none; }
+
+  slider {
+    min-width: 6px;
+    min-height: 6px;
+    margin: 0;
+    border: 4px solid transparent;
+    border-radius: 7px;
+    background-clip: padding-box;
+    background-color: $scrollbar_slider_color;
+
+    &:hover { background-color: $scrollbar_slider_hover_color; }
+    &:hover:active { background-color: $scrollbar_slider_active_color; }
+    &:disabled { background-color: transparent; }
+  }
+
+  &:not(.overlay-indicator) trough { background-color: $bg_color; }
+
+  &.overlay-indicator {
+    &:not(.dragging):not(.hovering) {
+      background-color: transparent;
+
+      slider {
+        margin: 2px;
+        min-width: 2px;
+        min-height: 2px;
+        border: none;
+        border-radius: 1px;
+        background-color: $scrollbar_slider_color;
+      }
+
+      button { min-width: 2px; min-height: 2px; border: none; background: none; -gtk-icon-source: none; }
+    }
+
+    &.dragging, &.hovering {
+      background-color: $scrollbar_bg_color;
+      border-radius: 6px;
+    }
+  }
+
+  button {
+    @include button(undecorated);
+    color: $scrollbar_slider_color;
+    &:hover { color: $scrollbar_slider_hover_color; }
+    &:active { color: $scrollbar_slider_active_color; }
+  }
+}
+
+/**********
+ * Switch *
+ **********/
+// A Windows 11 toggle switch: a 40x20 pill.  Off, a grey rim and a dark knob;
+// on, filled with the accent colour and a white knob.
+switch {
+  min-height: 18px;
+  padding: 0;
+  font-size: 0;
+  border: 1px solid $strong_borders_color;
+  border-radius: 10px;
+  background-color: rgba(0, 0, 0, 0.0241);
+  background-image: none;
+  box-shadow: none;
+  color: transparent;
+  outline-offset: -1px;
+  -gtk-outline-radius: 10px;
+
+  &:hover { background-color: rgba(0, 0, 0, 0.0578); }
+
+  image { color: transparent; }
+
+  slider {
+    min-width: 12px;
+    min-height: 12px;
+    margin: 3px 4px;
+    border: none;
+    border-radius: 50%;
+    background-image: none;
+    background-color: #5d5d5d;
+    box-shadow: none;
+    transition: none;
+  }
+
+  &:checked {
+    border-color: $accent_color;
+    background-color: $accent_color;
+    color: transparent;
+
+    &:hover { border-color: $accent_hover_color; background-color: $accent_hover_color; }
+    slider { background-color: white; }
+  }
+
+  &:disabled {
+    border-color: rgba(0, 0, 0, 0.2169);
+    background-color: transparent;
+    slider { background-color: rgba(0, 0, 0, 0.3614); }
+
+    &:checked {
+      border-color: transparent;
+      background-color: rgba(0, 0, 0, 0.2169);
+      slider { background-color: white; }
+    }
+  }
+
+  &:backdrop, &:backdrop:checked { transition: none; }
+}
+
+/*************************
+ * Check and Radio items *
+ *************************/
+check, radio {
+  min-width: 18px;
+  min-height: 18px;
+  margin: 0 8px 0 0;
+
+  &:only-child { margin: 0; }
+}
+
+check { border-radius: $control_radius; }
+
+// A selected radio button is an accent ring around a white dot: the ring is
+// the inset shadow, so the dot grows on hover and shrinks while pressed, as
+// Windows draws it.
+radio {
+  border-radius: 50%;
+
+  &:checked, &:indeterminate {
+    -gtk-icon-source: none;
+    background-image: image(white);
+    border-color: $accent_color;
+    box-shadow: inset 0 0 0 3px $accent_color;
+
+    &:hover {
+      background-image: image(white);
+      border-color: $accent_hover_color;
+      box-shadow: inset 0 0 0 2px $accent_hover_color;
+    }
+    &:active {
+      background-image: image(white);
+      border-color: $accent_active_color;
+      box-shadow: inset 0 0 0 4px $accent_active_color;
+    }
+    &:disabled {
+      background-image: image(white);
+      border-color: rgba(0, 0, 0, 0.2169);
+      box-shadow: inset 0 0 0 3px rgba(0, 0, 0, 0.2169);
+    }
+  }
+}
+
+checkbutton, radiobutton {
+  &.text-button { padding: 4px 0; }
+  label { color: $fg_color; }
+  &:disabled label { color: $insensitive_fg_color; }
+}
+
+/************
+ * GtkScale *
+ ************/
+// A Windows 11 slider: a four-pixel track, accent where it is filled, and a
+// round white thumb with an accent centre that swells under the pointer.
+scale {
+  min-height: 10px;
+  min-width: 10px;
+  padding: 12px;
+
+  trough {
+    min-height: 4px;
+    min-width: 4px;
+    border: none;
+    border-radius: 2px;
+    background-color: $strong_borders_color;
+    outline-offset: 2px;
+    -gtk-outline-radius: 6px;
+  }
+
+  highlight {
+    border: none;
+    border-radius: 2px;
+    background-image: image($accent_color);
+    background-color: $accent_color;
+  }
+
+  fill { background-color: transparentize($accent_color, 0.6); border: none; }
+
+  slider {
+    min-width: 20px;
+    min-height: 20px;
+    margin: -8px;
+    border: 1px solid $borders_color;
+    border-radius: 50%;
+    background-image: none;
+    background-color: $accent_color;
+    box-shadow: inset 0 0 0 5px white;
+    transition: none;
+
+    &:hover { background-color: $accent_hover_color; box-shadow: inset 0 0 0 4px white; }
+    &:active { background-color: $accent_active_color; box-shadow: inset 0 0 0 6px white; }
+    &:disabled {
+      background-color: rgba(0, 0, 0, 0.3614);
+      box-shadow: inset 0 0 0 5px white;
+    }
+  }
+
+  &:disabled trough { background-color: rgba(0, 0, 0, 0.2169); }
+  &:disabled highlight { background-image: image(rgba(0, 0, 0, 0.2169)); }
+
+  // Scales with marks keep the same thumb rather than Adwaita's pointed one.
+  &.marks-before slider, &.marks-after slider {
+    background-image: none;
+    border-radius: 50%;
+    min-width: 20px;
+    min-height: 20px;
+    margin: -8px;
+  }
+
+  value { color: $secondary_text_color; }
+  marks { color: $strong_borders_color; }
+}
+
+/*****************
+ * Progress bars *
+ *****************/
+// A three-pixel accent bar over a one-pixel grey line.
+progressbar {
+  color: $secondary_text_color;
+  font-size: smaller;
+
+  trough {
+    min-height: 3px;
+    min-width: 3px;
+    border: none;
+    border-radius: 2px;
+    background-color: transparent;
+  }
+
+  &.horizontal trough {
+    background-image: linear-gradient(to bottom, transparent 1px,
+                                      $strong_borders_color 1px,
+                                      $strong_borders_color 2px,
+                                      transparent 2px);
+  }
+  &.vertical trough {
+    background-image: linear-gradient(to right, transparent 1px,
+                                      $strong_borders_color 1px,
+                                      $strong_borders_color 2px,
+                                      transparent 2px);
+  }
+
+  progress {
+    min-height: 3px;
+    min-width: 3px;
+    border: none;
+    border-radius: 2px;
+    background-image: none;
+    background-color: $accent_color;
+    box-shadow: none;
+  }
+
+  &.osd progress { background-color: $accent_color; }
+}
+
+levelbar {
+  block {
+    border: none;
+    border-radius: 2px;
+    &.filled, &.high { background-color: $accent_color; }
+    &.low { background-color: $warning_color; }
+    &.full { background-color: $success_color; }
+    &.empty { background-color: rgba(0, 0, 0, 0.0578); }
+  }
+  trough { border: none; background-color: transparent; padding: 0; }
+}
+
+/**************
+ * Tree views *
+ **************/
+// File lists: the light blue selection Windows has always used for selected
+// items in a list of files, with the text left dark.
+treeview.view {
+  border-left-color: $borders_color;
+  border-top-color: $borders_color;
+
+  &:hover { background-color: $list_hover_color; }
+
+  &:selected, &:selected:focus {
+    background-color: $list_selected_color;
+    color: $fg_color;
+    border-radius: 0;
+  }
+  &:selected:hover { background-color: $list_selected_hover_color; }
+  &:backdrop:selected { background-color: $list_selected_color; color: $fg_color; }
+
+  &.separator { color: $borders_color; }
+
+  &.expander { color: $secondary_text_color; }
+  &.expander:hover { color: $fg_color; }
+  &.expander:selected { color: $secondary_text_color; }
+
+  &:drop(active) { box-shadow: inset 0 0 0 1px $accent_light_color; }
+
+  header button {
+    padding: 4px 8px;
+    border: none;
+    border-right: 1px solid $borders_color;
+    border-radius: 0;
+    background-image: none;
+    background-color: $base_color;
+    color: $secondary_text_color;
+    box-shadow: none;
+    font-weight: normal;
+
+    &:hover { background-color: $list_hover_color; color: $fg_color; }
+    &:active { background-color: $list_selected_color; }
+    &:last-child { border-right: none; }
+  }
+
+  &.rubberband, rubberband {
+    border: 1px solid $accent_light_color;
+    background-color: rgba(0, 120, 212, 0.15);
+  }
+}
+
+// Column titles of lists that are not GtkTreeViews: Claws Mail's folder and
+// message lists (GtkCMCList) are the ones here.  Such a widget has no CSS
+// name of its own, so its node is plain "widget", and its titles are ordinary
+// buttons inside it.  They get the tree view's header look.  The sides are
+// narrower than a push button's 11 pixels so that a 17-pixel flag column
+// (read, marked, attachment) fits its 12-pixel picture; with the push-button
+// padding GTK warned "Negative content width" at every redraw of the list.
+widget > button {
+  padding: 2px 4px;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  border-right: 1px solid $borders_color;
+  border-bottom: 1px solid $borders_color;
+  border-radius: 0;
+  background-image: none;
+  background-color: $base_color;
+  color: $secondary_text_color;
+  box-shadow: none;
+  font-weight: normal;
+
+  &:hover { background-color: $list_hover_color; color: $fg_color; }
+  &:active { background-color: $list_selected_color; color: $fg_color; }
+}
+
+iconview {
+  &:selected, &:selected:focus, &:backdrop:selected {
+    background-color: $list_selected_color;
+    color: $fg_color;
+    border-radius: $control_radius;
+  }
+}
+
+.view:selected, .view text:selected, .view:selected:focus,
+flowbox flowboxchild:selected {
+  background-color: $list_selected_color;
+  color: $fg_color;
+}
+
+rubberband, .rubberband {
+  border: 1px solid $accent_light_color;
+  background-color: rgba(0, 120, 212, 0.15);
+}
+
+/*********
+ * Lists *
+ *********/
+list {
+  background-color: $base_color;
+  border-color: $borders_color;
+
+  row {
+    &:hover { background-color: $subtle_hover_color; }
+    &:selected, &:selected:focus, &:selected:backdrop {
+      background-color: rgba(0, 0, 0, 0.0578);
+      color: $fg_color;
+      box-shadow: inset 3px 0 $accent_color;
+
+      label { color: $fg_color; }
+      image { color: $fg_color; }
+    }
+  }
+}
+
+row.activatable:hover { background-color: $subtle_hover_color; }
+
+/***********
+ * Sidebar *
+ ***********/
+// Navigation panes: the selected place is a grey wash with an accent bar at
+// its left edge, as in the Windows 11 navigation pane.
+.sidebar, placessidebar, stacksidebar {
+  background-color: $bg_color;
+  border-style: none;
+
+  row {
+    min-height: 30px;
+    padding: 0 8px;
+    margin: 1px 4px;
+    border-radius: $control_radius;
+
+    label { color: $fg_color; }
+    image { color: $secondary_text_color; }
+
+    &:hover { background-color: $subtle_hover_color; }
+    &:selected, &:selected:hover, &:selected:backdrop, &:selected:focus {
+      background-color: rgba(0, 0, 0, 0.0578);
+      color: $fg_color;
+      box-shadow: inset 3px 0 $accent_color;
+      label, image { color: $fg_color; }
+    }
+  }
+}
+
+placessidebar row.sidebar-row .sidebar-icon { color: $secondary_text_color; }
+paned > separator.sidebar, separator.sidebar { background-color: $borders_color; }
+
+/**********
+ * Frames *
+ **********/
+frame > border, .frame {
+  border: 1px solid $borders_color;
+  border-radius: 0;
+}
+
+scrolledwindow {
+  viewport.frame { border-style: none; }
+  > undershoot, > overshoot { background: none; }
+  junction { background-color: $bg_color; border: none; }
+}
+
+separator {
+  background-color: $borders_color;
+  min-width: 1px;
+  min-height: 1px;
+}
+
+paned > separator {
+  background-color: $borders_color;
+  background-image: none;
+  min-width: 1px;
+  min-height: 1px;
+}
+
+/************
+ * Pathbars *
+ ************/
+// The segments of the location in a file dialog: plain text and icons, a grey
+// wash under the pointer, as Windows 11 draws its address bar.  They are
+// toggle buttons -- the current folder is the one that is "on" -- so the two
+// :not()s are there to outweigh the accent fill a checked toggle gets above;
+// without them the current folder came out white on a white field.
+.path-bar button:not(.likeos-a):not(.likeos-b),
+filechooser .path-bar.linked > button:not(.likeos-a):not(.likeos-b) {
+  @include button(undecorated);
+  color: $fg_color;
+  padding: 5px 8px;
+  border-radius: $control_radius;
+
+  &:hover { background-image: image($subtle_hover_color); color: $fg_color; }
+  &:active { background-image: image($subtle_active_color); color: $fg_color; }
+  &:checked {
+    @include button(undecorated);
+    color: $fg_color;
+    font-weight: normal;
+    &:hover { background-image: image($subtle_hover_color); }
+    &:active { background-image: image($subtle_active_color); }
+  }
+  &:disabled { color: $insensitive_fg_color; }
+  &.slider-button { padding: 5px 4px; color: $secondary_text_color; }
+}
+
+/*********
+ * Links *
+ *********/
+*:link, button:link, button:visited {
+  color: $link_color;
+  &:hover { color: $accent_hover_color; }
+  &:active { color: $accent_active_color; }
+}
+*:visited { color: $link_visited_color; }
+
+/**************
+ * Expanders  *
+ **************/
+expander title arrow { color: $secondary_text_color; }
+expander title:hover arrow { color: $fg_color; }
+
+/*************
+ * InfoBars  *
+ *************/
+// Windows 11's InfoBar colours: pale fills with dark text.
+infobar {
+  border: none;
+  text-shadow: none;
+
+  &.info, &.question {
+    &, & > revealer > box { background-color: #f6f6f6; color: $fg_color; border: 1px solid $borders_color; }
+  }
+  &.warning {
+    &, & > revealer > box { background-color: #fff4ce; color: $fg_color; border: 1px solid $borders_color; }
+  }
+  &.error {
+    &, & > revealer > box { background-color: #fde7e9; color: $fg_color; border: 1px solid $borders_color; }
+  }
+  label, label:backdrop { color: $fg_color; }
+  button { @include button(normal); &:hover { @include button(hover); } }
+}
+
+/***********
+ * Dialogs *
+ ***********/
+// Eight pixels between dialog buttons (a GTK 3 style property, read by
+// GtkDialog for its button box).
+dialog, messagedialog { -GtkDialog-button-spacing: 8; }
+
+// A message box laid out as Windows lays one out: the message on white, the
+// buttons on a grey strip along the bottom, right-aligned, the main
+// instruction in the darker blue Windows uses for it.
+messagedialog {
+  &.background { background-color: $base_color; }
+
+  .titlebar {
+    background-color: $base_color;
+    min-height: 0;
+  }
+
+  // The primary text: Windows' "main instruction".
+  .dialog-vbox > box > box > label:first-child { color: #003399; }
+
+  .dialog-action-box {
+    margin: 0;
+    padding: 11px 12px;
+    background-color: #f0f0f0;
+    border-top: 1px solid #dfdfdf;
+  }
+
+  .dialog-action-area {
+    button {
+      min-width: 64px;
+      padding: 3px 12px;
+      border-radius: $control_radius;
+      border-style: solid;
+      border-width: 1px;
+      -gtk-outline-radius: $control_radius;
+
+      &:first-child, &:last-child {
+        border-left-style: solid;
+        border-radius: $control_radius;
+        -gtk-outline-radius: $control_radius;
+      }
+    }
+  }
+}
+
+dialog {
+  .dialog-action-box { margin: 0; padding: 12px; }
+  .dialog-action-area button { min-width: 64px; }
+}
+
+/************
+ * Calendar *
+ ************/
+calendar {
+  border: 1px solid $borders_color;
+  color: $fg_color;
+
+  &:selected {
+    background-color: $accent_color;
+    color: white;
+    border-radius: 50%;
+  }
+  &.header { border: none; border-bottom: 1px solid $borders_color; }
+  &.button { color: $secondary_text_color; &:hover { color: $fg_color; } }
+  &.highlight { color: $accent_color; }
+}
+
+/*****************
+ * Color chooser *
+ *****************/
+colorswatch { border-radius: $control_radius; }
+
+/*********************
+ * Window background *
+ *********************/
+window.background, .background { background-color: $bg_color; color: $fg_color; }
+window.background:backdrop, .background:backdrop { background-color: $bg_color; color: $fg_color; }

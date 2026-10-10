@@ -1,0 +1,76 @@
+The GBM devices and the shared display outlive the exit handlers.
+
+DRMDeviceManager::singleton() was a function-local std::unique_ptr, so its
+destructor ran from the exit handlers -- and it owns the GBM devices, each of
+which owns the driver screen that every EGL display and GL context on it
+renders through.  A web process ending while one of Skia's GPU painting
+threads was still tearing down its thread_local GL context crashed in the
+driver: the main thread had freed the screen (gbm_device_destroy) and the
+worker's glDeleteProgram read the freed buffer manager (SIGSEGV at 0x229 in
+vmw_dma_buffer_unmap).  Both singletons are now never destroyed; the shared
+display's EGL display is still terminated by its own exit handler.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/Source/WebCore/platform/graphics/gbm/DRMDeviceManager.cpp
++++ b/Source/WebCore/platform/graphics/gbm/DRMDeviceManager.cpp
+@@ -28,17 +28,24 @@
+ 
+ #if USE(GBM)
+ #include "GBMDevice.h"
++#include <wtf/NeverDestroyed.h>
+ 
+ namespace WebCore {
+ 
++// Never destroyed.  It owns the GBM devices, and a GBM device owns the
++// driver screen every EGL display and GL context on it renders through:
++// destroying it from an exit handler freed that screen while worker threads
++// (Skia's GPU painting threads, whose thread_local GL contexts are torn down
++// as they exit) were still deleting GL objects on it, a use-after-free in the
++// driver at process exit.  The process is ending; the memory goes with it.
+ DRMDeviceManager& DRMDeviceManager::singleton()
+ {
+-    static std::unique_ptr<DRMDeviceManager> s_manager;
++    static LazyNeverDestroyed<DRMDeviceManager> s_manager;
+     static std::once_flag s_onceFlag;
+     std::call_once(s_onceFlag, [] {
+-        s_manager = makeUnique<DRMDeviceManager>();
++        s_manager.construct();
+     });
+-    return *s_manager;
++    return s_manager.get();
+ }
+ 
+ DRMDeviceManager::~DRMDeviceManager() = default;
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.cpp
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.cpp
+@@ -56,14 +56,16 @@
+     return *display;
+ }
+ #else
+-IGNORE_CLANG_WARNINGS_BEGIN("exit-time-destructors")
+-static std::unique_ptr<PlatformDisplay> s_sharedDisplay;
+-IGNORE_CLANG_WARNINGS_END
++// The shared display is never destroyed: worker threads with GL contexts on
++// it may still be tearing them down while the exit handlers run.  Its EGL
++// display is still terminated by the exit handler registered in the
++// constructor.
++static PlatformDisplay* s_sharedDisplay;
+ 
+ void PlatformDisplay::setSharedDisplay(std::unique_ptr<PlatformDisplay>&& display)
+ {
+     RELEASE_ASSERT(!s_sharedDisplay);
+-    s_sharedDisplay = WTF::move(display);
++    s_sharedDisplay = display.release();
+ }
+ 
+ PlatformDisplay& PlatformDisplay::sharedDisplay()
+@@ -74,7 +76,7 @@
+ 
+ PlatformDisplay* PlatformDisplay::sharedDisplayIfExists()
+ {
+-    return s_sharedDisplay.get();
++    return s_sharedDisplay;
+ }
+ #endif
+ 

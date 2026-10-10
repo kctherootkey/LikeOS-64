@@ -1,0 +1,2251 @@
+Windows 11 title bars (FluentTitles) and anti-aliased Xft fonts.
+
+Additions, all switched on from the configuration and inert otherwise.
+
+1. "xft:<fontconfig pattern>" as a font name (TitleFont, MenuFont, ...).
+   ctwm draws every string through XmbTextExtents/XmbDrawString on a MyFont's
+   fontset.  ctwm.h redirects those two calls to wrappers in util.c, which
+   send a fontset that stands for an Xft font to Xft (UTF-8; the colour comes
+   from the GC's foreground) and everything else to Xlib unchanged.  The
+   fontset is still created, from "fixed", so code that only knows fontsets
+   keeps a valid one; the MyFont's metrics are the Xft font's.  cursor.c
+   opts out: string cursors are drawn into a one-bit bitmap.
+
+2. FluentTitles, with TitleBarHeight and TitleButtonWidth: title bars drawn
+   the way Windows 11 draws a desktop application's caption (win_fluent.c).
+   A flat band, #f0f3f9 with black text when the window has the focus and
+   #f3f3f3 with grey text when not; the application's icon (_NET_WM_ICON at
+   16 pixels) and its title, ellipsised, on the left; caption buttons
+   TitleButtonWidth wide and the full title height, flush in the corner,
+   with one-pixel anti-aliased glyphs chosen by the button's function --
+   minimise for f.iconify, maximise (restore while zoomed) for the zoom
+   functions, a cross for f.delete/f.destroy -- that wash grey under the
+   pointer, the close button red with a white cross.  Buttons bound to
+   anything else keep their images.  The title window's bottom border, the
+   only part of it the frame does not clip, takes the title colour, so no
+   line separates the caption from the window contents.  Menus get Windows'
+   row height and text inset, and their border and separator lines are drawn
+   in MenuShadowColor (a light grey in the LikeOS configuration, which turns
+   the drop shadow itself off) rather than in the text colour.
+
+   Glyphs and icons are rendered client-side into XImages, blended against
+   the known caption colour; TrueColor visuals only (anything else keeps the
+   classic decorations).
+
+3. With FluentTitles, a resize border like Windows 11's: the band a few
+   pixels OUTSIDE a window's one-pixel edge, invisible, where the pointer
+   turns into a double arrow (diagonal at the corners) and a drag resizes
+   the window from that edge or corner (win_fluent.c, "The resize border").
+   It is an InputOnly window 6 pixels larger than the frame on every side,
+   stacked directly beneath it, so the frame covers its middle and every
+   window above the frame covers it too.  Not for maximised windows,
+   windows of fixed size, borderless windows or ctwm's own.  A press on it
+   (or on the frame's own edge) has the frame's bindings, raises and focuses
+   the window, and StartResize() moves exactly the edges under the pointer,
+   keeping their distance from it.  To follow its frame through every move,
+   resize, restack, map, unmap and reparent -- some thirty places in ctwm --
+   ctwm.h routes those Xlib calls through wrappers in win_fluent.c, which
+   bring the border along when the window is a frame that has one.
+   Before a frame is restacked its border is lowered out of the way: ctwm
+   raises a window by placing it directly above the next frame down, which
+   would otherwise put it under its own border for a moment -- the
+   application was told the pointer left and came back on every click
+   (the wheel included), and GDK, taking that as a new scroll gesture,
+   dropped the smooth-scrolling position: the wheel did nothing.
+
+4. With FluentTitles, maximised windows behave as on Windows: a client's
+   request to move or resize a zoomed window is answered with its current
+   geometry instead of being carried out (which also unzoomed it) -- Claws
+   Mail sized its window from saved settings at start and shrank the window
+   the user had just maximised; and restoring a window no longer warps the
+   pointer into it (it jumped to the window's left edge after the restore
+   button had shrunk the window away from under it).
+   A double click on a caption maximises the window or restores it (same
+   window, within ConstrainedMoveTime and 4 pixels of the first press);
+   ctwm's constrained move, which a double click started and which warped
+   the pointer to the middle of the window, is off in this mode.
+
+Hooks: the focus change repaints the caption (win_ops.c, after
+hasfocusvisible is set -- and not the buttons before AddWindow has created
+them); Enter/Leave on a caption button set its hover state (event_handlers.c;
+the buttons now select those events); SetupFrame repaints the buttons, since
+zooming moves them by gravity without an Expose; a _NET_WM_ICON change drops
+the cached title icon (ewmh.c); window teardown frees it and destroys the
+resize border; AddWindow creates the border once the frame's contexts are
+saved; a press on the border is a frame press (event_handlers.c), motion over
+it picks its cursor.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -Nur a/add_window.c b/add_window.c
+--- a/add_window.c
++++ b/add_window.c
+@@ -65,6 +65,7 @@
+ #include "windowbox.h"
+ #endif
+ #include "win_decorations.h"
++#include "win_fluent.h"
+ #include "win_ops.h"
+ #include "win_regions.h"
+ #include "win_resize.h"
+@@ -1809,6 +1810,9 @@
+ 
+ #undef SETCTXS
+ 
++	/* The invisible resize border around the frame (FluentTitles). */
++	FluentGripCreate(tmp_win);
++
+ 	/*
+ 	 * OK, that's all we need to do while the server's grabbed.  After
+ 	 * this point, other clients might sneak in stuff between our
+diff -Nur a/cmake_files/basic_vars.cmake b/cmake_files/basic_vars.cmake
+--- a/cmake_files/basic_vars.cmake
++++ b/cmake_files/basic_vars.cmake
+@@ -63,6 +63,7 @@
+ 	vscreen.c
+ 	win_decorations.c
+ 	win_decorations_init.c
++	win_fluent.c
+ 	win_iconify.c
+ 	win_ops.c
+ 	win_regions.c
+diff -Nur a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -78,6 +78,18 @@
+ 	list(APPEND CTWMLIBS ${X11_${VEXT}})
+ endforeach()
+ 
++# Xft, for anti-aliased fonts ("xft:" font names) and FluentTitles.  Its
++# header pulls in FreeType's, which lives in a freetype2/ subdirectory.
++if(NOT X11_Xft_FOUND)
++	message(FATAL_ERROR "Can't find Xft; missing lib or -devel package?")
++endif()
++find_path(FREETYPE2_INCLUDE_DIR ft2build.h PATH_SUFFIXES freetype2)
++if(NOT FREETYPE2_INCLUDE_DIR)
++	message(FATAL_ERROR "Can't find ft2build.h (FreeType headers)")
++endif()
++include_directories(${X11_Xft_INCLUDE_PATH} ${FREETYPE2_INCLUDE_DIR})
++list(APPEND CTWMLIBS ${X11_Xft_LIB} m)
++
+ 
+ #
+ # Setup some search paths
+diff -Nur a/ctwm.h b/ctwm.h
+--- a/ctwm.h
++++ b/ctwm.h
+@@ -135,6 +135,11 @@
+ 	unsigned int avg_height;
+ 	float       avg_fheight;
+ 	unsigned int avg_count;
++	/* An anti-aliased Xft font, for a name given as "xft:<pattern>".
++	 * font_set then holds a core fallback, so that code which only knows
++	 * fontsets keeps working; text measured and drawn through it is routed
++	 * to the Xft font (see XmbTextExtents/XmbDrawString below). */
++	struct _XftFont *xft;
+ };
+ 
+ struct ColorPair {
+@@ -165,6 +170,7 @@
+ 	Window window;                      /* which window in this frame */
+ 	Image *image;                       /* image to display in button */
+ 	TitleButton *info;                  /* description of this window */
++	bool hover;                         /* pointer is over it (FluentTitles) */
+ };
+ 
+ 
+@@ -415,4 +421,63 @@
+ extern ctwm_cl_args CLarg;
+ 
+ 
++/*
++ * Text through fontsets, routed to Xft for fonts named "xft:...".
++ *
++ * Every piece of text ctwm draws goes through these two Xlib calls on a
++ * MyFont's font_set, so redirecting them here gives every title, menu and
++ * label anti-aliased text without touching each caller.  A fontset that has
++ * no Xft font behind it goes to Xlib unchanged.  util.c holds the
++ * implementations, and #undef's these to reach the real calls.
++ */
++int ctwm_XmbTextExtents(XFontSet fs, const char *text, int len,
++                        XRectangle *ink, XRectangle *logical);
++void ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
++                        int x, int y, const char *text, int len);
++#ifndef CTWM_NO_XFT_REDIRECT
++#define XmbTextExtents(fs, t, n, i, l) ctwm_XmbTextExtents(fs, t, n, i, l)
++#define XmbDrawString(d, w, fs, gc, x, y, t, n) \
++	ctwm_XmbDrawString(d, w, fs, gc, x, y, t, n)
++#endif
++
++/*
++ * Window operations, routed through win_fluent.c so that a frame's resize
++ * border (FluentTitles; see win_fluent.h) follows the frame wherever ctwm
++ * moves, sizes, stacks, shows, hides or reparents it.  For every window that
++ * is not such a frame -- and for all of them while FluentTitles is off --
++ * the wrappers are the plain Xlib calls.  win_fluent.c, which implements
++ * them, opts out.
++ */
++int ctwm_XMapWindow(Display *d, Window w);
++int ctwm_XMapRaised(Display *d, Window w);
++int ctwm_XUnmapWindow(Display *d, Window w);
++int ctwm_XMoveWindow(Display *d, Window w, int x, int y);
++int ctwm_XResizeWindow(Display *d, Window w, unsigned int width,
++                       unsigned int height);
++int ctwm_XMoveResizeWindow(Display *d, Window w, int x, int y,
++                           unsigned int width, unsigned int height);
++int ctwm_XConfigureWindow(Display *d, Window w, unsigned int mask,
++                          XWindowChanges *xwc);
++int ctwm_XSetWindowBorderWidth(Display *d, Window w, unsigned int width);
++int ctwm_XRaiseWindow(Display *d, Window w);
++int ctwm_XLowerWindow(Display *d, Window w);
++int ctwm_XRestackWindows(Display *d, Window *ws, int n);
++int ctwm_XReparentWindow(Display *d, Window w, Window parent, int x, int y);
++#ifndef CTWM_NO_FRAME_REDIRECT
++#define XMapWindow(d, w)                ctwm_XMapWindow(d, w)
++#define XMapRaised(d, w)                ctwm_XMapRaised(d, w)
++#define XUnmapWindow(d, w)              ctwm_XUnmapWindow(d, w)
++#define XMoveWindow(d, w, x, y)         ctwm_XMoveWindow(d, w, x, y)
++#define XResizeWindow(d, w, wd, ht)     ctwm_XResizeWindow(d, w, wd, ht)
++#define XMoveResizeWindow(d, w, x, y, wd, ht) \
++	ctwm_XMoveResizeWindow(d, w, x, y, wd, ht)
++#define XConfigureWindow(d, w, m, c)    ctwm_XConfigureWindow(d, w, m, c)
++#define XSetWindowBorderWidth(d, w, b)  ctwm_XSetWindowBorderWidth(d, w, b)
++#define XRaiseWindow(d, w)              ctwm_XRaiseWindow(d, w)
++#define XLowerWindow(d, w)              ctwm_XLowerWindow(d, w)
++#define XRestackWindows(d, ws, n)       ctwm_XRestackWindows(d, ws, n)
++#define XReparentWindow(d, w, p, x, y)  ctwm_XReparentWindow(d, w, p, x, y)
++#endif
++
++
+ #endif /* _CTWM_CTWM_H */
+diff -Nur a/ctwm_main.c b/ctwm_main.c
+--- a/ctwm_main.c
++++ b/ctwm_main.c
+@@ -829,6 +829,15 @@
+ 		if(!(Scr->TitleHeight & 1)) {
+ 			Scr->TitleHeight++;
+ 		}
++		/* TitleBarHeight states the height outright, whatever the font:
++		 * Windows' caption is a fixed height, and its text is centred in
++		 * it rather than sizing it. */
++		if(Scr->TitleBarHeight > 0) {
++			Scr->TitleBarFont.y = (Scr->TitleBarHeight
++			                       - Scr->TitleBarFont.height) / 2
++			                      + Scr->TitleBarFont.ascent;
++			Scr->TitleHeight = Scr->TitleBarHeight;
++		}
+ 
+ 
+ 
+@@ -1258,6 +1267,9 @@
+ 	scr->use3Dborders = false;
+ 	scr->use3Dwmap = false;
+ 	scr->SunkFocusWindowTitle = false;
++	scr->FluentTitles = false;
++	scr->TitleBarHeight = 0;
++	scr->TitleButtonWidth = 0;
+ 	scr->ClearShadowContrast = 50;
+ 	scr->DarkShadowContrast  = 40;
+ 	scr->BeNiceToColormap = false;
+diff -Nur a/cursor.c b/cursor.c
+--- a/cursor.c
++++ b/cursor.c
+@@ -19,6 +19,9 @@
+  *
+  ***********************************************************************/
+ 
++/* String cursors are drawn into a one-bit bitmap, which Xft cannot draw
++ * into with the screen's visual: keep the core fontset path here. */
++#define CTWM_NO_XFT_REDIRECT
+ #include "ctwm.h"
+ 
+ #include <stdio.h>
+diff -Nur a/event_handlers.c b/event_handlers.c
+--- a/event_handlers.c
++++ b/event_handlers.c
+@@ -56,6 +56,7 @@
+ #include "util.h"
+ #include "vscreen.h"
+ #include "win_decorations.h"
++#include "win_fluent.h"
+ #include "win_iconify.h"
+ #include "win_ops.h"
+ #include "win_regions.h"
+@@ -1880,6 +1881,7 @@
+ 		free(Tmp_win->titlebuttons);
+ 		Tmp_win->titlebuttons = NULL;
+ 	}
++	FluentForgetWindow(Tmp_win);
+ 
+ 	remove_window_from_ring(Tmp_win);                           /* 11 */
+ 	if(Tmp_win->squeeze_info_copied) {                          /* 12 */
+@@ -2242,6 +2244,10 @@
+ 	else if(Scr->BorderCursors && Tmp_win && Event.xany.window == Tmp_win->frame) {
+ 		SetBorderCursor(Tmp_win, Event.xmotion.x, Event.xmotion.y);
+ 	}
++	else if(Tmp_win && Tmp_win->fluent_grip != None &&
++	                Event.xany.window == Tmp_win->fluent_grip) {
++		FluentGripMotion(Tmp_win, Event.xmotion.x, Event.xmotion.y);
++	}
+ }
+ 
+ 
+@@ -2813,6 +2819,20 @@
+ 		else if(Tmp_win->icon && (Event.xany.window == Tmp_win->icon->w)) {
+ 			Context = C_ICON;
+ 		}
++		else if(Tmp_win->fluent_grip != None &&
++		                Event.xany.window == Tmp_win->fluent_grip) {
++			/* The resize border outside the frame (FluentTitles): the
++			 * frame's bindings apply, and -- as a press anywhere on a
++			 * Windows window does -- the window comes forward. */
++			if(Scr->ClickToFocus && Tmp_win->wmhints->input) {
++				SetFocus(Tmp_win, CurrentTime);
++			}
++			if(Scr->RaiseOnClick) {
++				OtpRaise(Tmp_win, WinWin);
++				WMapRaise(Tmp_win);
++			}
++			Context = C_FRAME;
++		}
+ 		else if(Event.xany.window == Tmp_win->frame) {
+ 			Window chwin;
+ 
+@@ -3078,6 +3098,12 @@
+ 	XEvent dummy;
+ 	VirtualScreen *vs;
+ 
++	/* FluentTitles: the pointer came onto a caption button. */
++	if(!ActiveMenu && ewp->mode == NotifyNormal &&
++	                FluentButtonCrossing(Tmp_win, ewp->window, true)) {
++		return;
++	}
++
+ 	/*
+ 	 * if we aren't in the middle of menu processing
+ 	 */
+@@ -3507,6 +3533,12 @@
+ 		return;
+ 	}
+ 
++	/* FluentTitles: the pointer left a caption button.  Any mode -- a grab
++	 * taking the pointer away must clear the highlight as well. */
++	if(FluentButtonCrossing(Tmp_win, Event.xcrossing.window, false)) {
++		return;
++	}
++
+ 	/*
+ 	 * We're not interested in pseudo Enter/Leave events generated
+ 	 * from grab initiations and terminations.
+@@ -3766,6 +3798,21 @@
+ 	}
+ 
+ 
++	/*
++	 * FluentTitles: a maximised window keeps its place and size, as on
++	 * Windows.  A program that moves or sizes itself from settings it
++	 * saved -- Claws Mail does at start and on every layout change -- would
++	 * otherwise shrink the window the user had just maximised, and the
++	 * resize below unzooms it on top.  The program is told the geometry it
++	 * actually has (the synthetic ConfigureNotify).  Leaving the maximised
++	 * state goes through the caption button or _NET_WM_STATE.
++	 */
++	if(Scr->FluentTitles && Tmp_win->zoomed != ZOOM_NONE &&
++	                (cre->value_mask & (CWX | CWY | CWWidth | CWHeight))) {
++		cre->value_mask &= ~(CWX | CWY | CWWidth | CWHeight);
++		sendEvent = true;
++	}
++
+ 	/* Don't modify frame_XXX fields before calling SetupWindow! */
+ 	x = Tmp_win->frame_x;
+ 	y = Tmp_win->frame_y;
+diff -Nur a/ewmh.c b/ewmh.c
+--- a/ewmh.c
++++ b/ewmh.c
+@@ -53,6 +53,7 @@
+ #include "win_iconify.h"
+ #include "win_ops.h"
+ #include "win_resize.h"
++#include "win_fluent.h"
+ #include "win_utils.h"
+ #include "workspace_utils.h"
+ 
+@@ -955,6 +956,11 @@
+ #ifdef DEBUG_EWMH
+ 	fprintf(stderr, "EwmhHandlePropertyNotify: NET_WM_ICON\n");
+ #endif /* DEBUG_EWMH */
++
++	/* The title bar shows the icon too (FluentTitles). */
++	if(Scr->FluentTitles) {
++		FluentIconChanged(twm_win);
++	}
+ 	/*
+ 	 * If there is no icon yet, we'll look at this property
+ 	 * later, if and when we do create an icon.
+diff -Nur a/functions_win_moveresize.c b/functions_win_moveresize.c
+--- a/functions_win_moveresize.c
++++ b/functions_win_moveresize.c
+@@ -124,6 +124,33 @@
+ 	/* Better not be a menu open */
+ 	PopDownMenu();
+ 
++	/*
++	 * FluentTitles: a double click on a caption maximises the window, or
++	 * restores it when it is maximised, as on Windows.  The second press
++	 * has to come on the same window's caption within the double-click
++	 * time (ConstrainedMoveTime) and a few pixels of the first; it then
++	 * does nothing else -- no move, and the pointer stays where it is.
++	 */
++	if(Scr->FluentTitles && context == C_TITLE &&
++	                eventp->type == ButtonPress) {
++		static TwmWindow *dbl_win;
++		static Time dbl_time;
++		static int dbl_x, dbl_y;
++		const int x = eventp->xbutton.x_root, y = eventp->xbutton.y_root;
++
++		if(dbl_win == tmp_win && ConstrainedMoveTime &&
++		                eventp->xbutton.time - dbl_time < (Time)ConstrainedMoveTime &&
++		                abs(x - dbl_x) <= 4 && abs(y - dbl_y) <= 4) {
++			dbl_win = NULL;
++			fullzoom(tmp_win, F_FULLZOOM);
++			return;
++		}
++		dbl_win = tmp_win;
++		dbl_time = eventp->xbutton.time;
++		dbl_x = x;
++		dbl_y = y;
++	}
++
+ 	/* Stash up just which f.move* variant we are */
+ 	MoveFunction = func;
+ 
+@@ -261,7 +288,9 @@
+ 	 * Only do the constrained move if timer is set; need to check it
+ 	 * in case of stupid or wicked fast servers
+ 	 */
+-	if(ConstrainedMoveTime &&
++	/* (Not with FluentTitles: there a double click on the caption
++	 * maximises, above, and the pointer is never moved.) */
++	if(!Scr->FluentTitles && ConstrainedMoveTime &&
+ 	                (eventp->xbutton.time - last_time) < ConstrainedMoveTime) {
+ 		int width, height;
+ 
+diff -Nur a/menus.c b/menus.c
+--- a/menus.c
++++ b/menus.c
+@@ -373,9 +373,14 @@
+ 			}
+ 			XmbDrawString(dpy, mr->w, Scr->MenuFont.font_set, gc, mi->x,
+ 			              text_y, mi->item, mi->strlen);
+-			if(mi->separated)
++			if(mi->separated) {
++				if(Scr->FluentTitles) {
++					gc = Scr->NormalGC;
++					XSetForeground(dpy, gc, Scr->MenuShadowColor);
++				}
+ 				XDrawLine(dpy, mr->w, gc, 0, y_offset + Scr->EntryHeight - 1,
+ 				          mr->width, y_offset + Scr->EntryHeight - 1);
++			}
+ 		}
+ 
+ 		if(mi->func == F_MENU) {
+@@ -400,7 +405,8 @@
+ 		               mr->width, Scr->EntryHeight);
+ 
+ 		{
+-			XSetForeground(dpy, Scr->NormalGC, mi->normal.fore);
++			XSetForeground(dpy, Scr->NormalGC, Scr->FluentTitles
++			               ? Scr->MenuShadowColor : mi->normal.fore);
+ 			/* now draw the dividing lines */
+ 			if(y_offset)
+ 				XDrawLine(dpy, mr->w, Scr->NormalGC, 0, y_offset,
+@@ -879,7 +885,8 @@
+ 			max_entry_height = MAX(max_entry_height, logical_rect.height);
+ 
+ 			if(cur->func != F_TITLE) {
+-				cur->x = 5;
++				/* FluentTitles: Windows 11 sets menu text 12 pixels in. */
++				cur->x = Scr->FluentTitles ? 12 : 5;
+ 			}
+ 			else {
+ 				cur->x = width - logical_rect.width;
+@@ -887,6 +894,13 @@
+ 			}
+ 		}
+ 		Scr->EntryHeight = max_entry_height + ENTRY_SPACING;
++		/* FluentTitles: a Windows 11 menu row is about 28 pixels tall
++		 * at the 9-point interface font, and the text has room after it
++		 * as well as before. */
++		if(Scr->FluentTitles) {
++			Scr->EntryHeight = max_entry_height + 12;
++			mr->width += 24;
++		}
+ 		mr->height = mr->items * Scr->EntryHeight;
+ 		mr->width += 10;
+ 		if(Scr->use3Dmenus) {
+@@ -917,7 +931,11 @@
+ 
+ 		valuemask = (CWBackPixel | CWBorderPixel | CWEventMask);
+ 		attributes.background_pixel = Scr->MenuC.back;
+-		attributes.border_pixel = Scr->MenuC.fore;
++		/* FluentTitles: the border and the separator lines are light grey,
++		 * as Windows draws them, in MenuShadowColor -- not the text
++		 * colour. */
++		attributes.border_pixel = Scr->FluentTitles ? Scr->MenuShadowColor
++		                          : Scr->MenuC.fore;
+ 		if(mr->pinned) {
+ 			attributes.event_mask = (ExposureMask | EnterWindowMask
+ 			                         | LeaveWindowMask | ButtonPressMask
+diff -Nur a/parse_be.c b/parse_be.c
+--- a/parse_be.c
++++ b/parse_be.c
+@@ -131,6 +131,7 @@
+ #define kw0_GrabServer                  76
+ #define kw0_DontNameDecorations         77
+ #define kw0_StrictWinNameEncoding       78
++#define kw0_FluentTitles                79
+ 
+ #define kws_UsePPosition                1
+ #define kws_IconFont                    2
+@@ -193,6 +194,8 @@
+ #define kwn_BorderBottom                34
+ #define kwn_BorderLeft                  35
+ #define kwn_BorderRight                 36
++#define kwn_TitleBarHeight              37
++#define kwn_TitleButtonWidth            38
+ 
+ #define kwcl_BorderColor                1
+ #define kwcl_IconManagerHighlight       2
+@@ -284,6 +287,7 @@
+ 	{ "east",                   GRAVITY, GRAV_EAST },
+ 	{ "ewmhignore",             EWMH_IGNORE, 0 },
+ 	{ "f",                      FRAME, 0 },
++	{ "fluenttitles",           KEYWORD, kw0_FluentTitles },
+ 	{ "forcefocus",             FORCE_FOCUS, 0 },
+ 	{ "forceicons",             KEYWORD, kw0_ForceIcons },
+ 	{ "frame",                  FRAME, 0 },
+@@ -436,8 +440,10 @@
+ 	{ "threedborderwidth",      NKEYWORD, kwn_ThreeDBorderWidth },
+ 	{ "title",                  TITLE, 0 },
+ 	{ "titlebackground",        CLKEYWORD, kwcl_TitleBackground },
++	{ "titlebarheight",         NKEYWORD, kwn_TitleBarHeight },
+ 	{ "titlebuttonborderwidth", NKEYWORD, kwn_TitleButtonBorderWidth },
+ 	{ "titlebuttonshadowdepth", NKEYWORD, kwn_TitleButtonShadowDepth },
++	{ "titlebuttonwidth",       NKEYWORD, kwn_TitleButtonWidth },
+ 	{ "titlefont",              SKEYWORD, kws_TitleFont },
+ 	{ "titleforeground",        CLKEYWORD, kwcl_TitleForeground },
+ 	{ "titlehighlight",         TITLE_HILITE, 0 },
+@@ -756,6 +762,10 @@
+ 			Scr->SunkFocusWindowTitle = true;
+ 			return true;
+ 
++		case kw0_FluentTitles:
++			Scr->FluentTitles = true;
++			return true;
++
+ 		case kw0_BeNiceToColormap:
+ 			Scr->BeNiceToColormap = true;
+ 			return true;
+@@ -1371,6 +1381,18 @@
+ 			}
+ 			return true;
+ 
++		case kwn_TitleBarHeight:
++			if(Scr->FirstTime) {
++				Scr->TitleBarHeight = (num > 0) ? num : 0;
++			}
++			return true;
++
++		case kwn_TitleButtonWidth:
++			if(Scr->FirstTime) {
++				Scr->TitleButtonWidth = (num > 0) ? num : 0;
++			}
++			return true;
++
+ 		case kwn_BorderTop:
+ 			if(Scr->FirstTime) {
+ 				Scr->BorderTop = num;
+diff -Nur a/screen.h b/screen.h
+--- a/screen.h
++++ b/screen.h
+@@ -530,6 +530,9 @@
+ 	bool  use3Dborders;      ///< UseThreeDBorders config var
+ 	bool  use3Dwmap;         ///< UseThreeDWMap config var
+ 	bool  SunkFocusWindowTitle;  ///< SunkFocusWindowTitle config var
++	bool  FluentTitles;          ///< FluentTitles config var (win_fluent.c)
++	int   TitleBarHeight;        ///< TitleBarHeight config var, 0 = from font
++	int   TitleButtonWidth;      ///< TitleButtonWidth config var, 0 = square
+ 	short WMgrVertButtonIndent;  ///< WMgrVertButtonIndent config var
+ 	short WMgrHorizButtonIndent; ///< WMgrHorizButtonIndent config var
+ 	short WMgrButtonShadowDepth; ///< WMgrButtonShadowDepth config var
+diff -Nur a/twm_window_struct.h b/twm_window_struct.h
+--- a/twm_window_struct.h
++++ b/twm_window_struct.h
+@@ -210,6 +210,23 @@
+ 	Colormaps cmaps;           ///< colormaps for this application
+ 	/// Button windows in the titlebar.  \ingroup win_frame
+ 	TBWindow *titlebuttons;
++	/// The application icon at title size (FluentTitles), and whether it
++	/// has been looked for yet.  See win_fluent.c.
++	struct fluent_icon *fluent_icon;
++	bool fluent_icon_tried;
++	/// The invisible resize border around the frame (FluentTitles): an
++	/// InputOnly sibling of the frame, stacked right under it, and the
++	/// frame geometry it follows.  None when the window has no border.
++	/// See win_fluent.c.
++	Window fluent_grip;
++	Window fluent_grip_parent;
++	int fluent_fx, fluent_fy;
++	unsigned int fluent_fw, fluent_fh, fluent_fbw;
++	int fluent_gx, fluent_gy;   ///< the border's own geometry, as last set
++	unsigned int fluent_gw, fluent_gh;
++	int fluent_grip_edges;      ///< edges under the pointer, for its cursor
++	bool fluent_frame_mapped;
++	bool fluent_grip_mapped;
+ 	SqueezeInfo *squeeze_info;  ///< Control info for title squeezing
+ 	bool squeeze_info_copied;   ///< Should ->squeeze_info be free()'d?
+ 
+diff -Nur a/util.c b/util.c
+--- a/util.c
++++ b/util.c
+@@ -54,6 +54,13 @@
+ #include "win_decorations.h"
+ #include "win_resize.h"
+ 
++#include <X11/Xft/Xft.h>
++
++/* This file implements the Xft routing of the two fontset calls (see the end
++ * of ctwm.h), so it needs the real Xlib functions. */
++#undef XmbTextExtents
++#undef XmbDrawString
++
+ 
+ /* Handle for debug tracing */
+ FILE *tracefile = NULL;
+@@ -307,6 +314,8 @@
+ }
+ 
+ 
++static void xft_register(MyFont *font);
++
+ /**
+  * Load up fontsets from the X server.  Only used by CreateFonts() below.
+  */
+@@ -337,8 +346,28 @@
+ 	if(font->font_set != NULL) {
+ 		XFreeFontSet(dpy, font->font_set);
+ 	}
++	if(font->xft != NULL) {
++		XftFontClose(dpy, font->xft);
++		font->xft = NULL;
++	}
++
++	/*
++	 * "xft:<fontconfig pattern>" names an anti-aliased Xft font, e.g.
++	 * "xft:Selawik:size=9".  The fontset is still created, from the
++	 * default font, so that everything that measures or draws through
++	 * font_set keeps a valid one; ctwm_XmbTextExtents/ctwm_XmbDrawString
++	 * below send it to the Xft font instead.
++	 */
++	if(strncmp(font->basename, "xft:", 4) == 0) {
++		font->xft = XftFontOpenName(dpy, Scr->screen, font->basename + 4);
++		if(font->xft == NULL) {
++			fprintf(stderr, "%s:  unable to open Xft font \"%s\"\n",
++			        ProgramName, font->basename + 4);
++		}
++		xft_register(font);
++	}
+ 
+-	asprintf(&basename2, "%s,*", font->basename);
++	asprintf(&basename2, "%s,*", font->xft ? "fixed" : font->basename);
+ 	if((font->font_set = XCreateFontSet(dpy, basename2,
+ 	                                    &missing_charset_list_return,
+ 	                                    &missing_charset_count_return,
+@@ -370,12 +399,138 @@
+ 	font->y = ascent;
+ 	font->ascent = ascent;
+ 	font->descent = descent;
++	if(font->xft) {
++		font->ascent = font->xft->ascent;
++		font->descent = font->xft->descent;
++		font->height = font->xft->ascent + font->xft->descent;
++		font->y = font->xft->ascent;
++		xft_register(font);
++	}
+ 	font->avg_height = 0;
+ 	font->avg_fheight = 0.0;
+ 	font->avg_count = 0;
+ }
+ 
+ 
++/*
++ * Which fontsets stand for an Xft font.  A handful at most -- one per font
++ * keyword -- so a linear table is all it needs.  Keyed on the MyFont, whose
++ * font_set changes when the font is reloaded.
++ */
++#define XFT_FONTS_MAX 16
++static MyFont *xft_fonts[XFT_FONTS_MAX];
++
++static void
++xft_register(MyFont *font)
++{
++	int free_slot = -1;
++
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
++		if(xft_fonts[i] == font) {
++			return;
++		}
++		if(xft_fonts[i] == NULL && free_slot < 0) {
++			free_slot = i;
++		}
++	}
++	if(free_slot >= 0) {
++		xft_fonts[free_slot] = font;
++	}
++}
++
++static XftFont *
++xft_for(XFontSet fs)
++{
++	if(fs == NULL) {
++		return NULL;
++	}
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
++		if(xft_fonts[i] && xft_fonts[i]->font_set == fs) {
++			return xft_fonts[i]->xft;
++		}
++	}
++	return NULL;
++}
++
++int
++ctwm_XmbTextExtents(XFontSet fs, const char *text, int len,
++                    XRectangle *ink, XRectangle *logical)
++{
++	XftFont *xf = xft_for(fs);
++	XGlyphInfo gi;
++
++	if(xf == NULL) {
++		return XmbTextExtents(fs, text, len, ink, logical);
++	}
++	XftTextExtentsUtf8(dpy, xf, (const FcChar8 *)text, len, &gi);
++	if(ink) {
++		ink->x = -gi.x;
++		ink->y = -gi.y;
++		ink->width = gi.width;
++		ink->height = gi.height;
++	}
++	if(logical) {
++		logical->x = 0;
++		logical->y = -xf->ascent;
++		logical->width = gi.xOff;
++		logical->height = xf->ascent + xf->descent;
++	}
++	return gi.xOff;
++}
++
++/*
++ * The colour comes from the GC's foreground, which is how every caller sets
++ * it; the last pixel is cached, since a run of draws usually shares one.
++ */
++void
++ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
++                   int x, int y, const char *text, int len)
++{
++	static Pixel last_pixel;
++	static XftColor last_color;
++	static bool have_color = false;
++	XftFont *xf = xft_for(fs);
++	XGCValues gv;
++	XftDraw *draw;
++
++	if(xf == NULL) {
++		XmbDrawString(d, w, fs, gc, x, y, text, len);
++		return;
++	}
++
++	XGetGCValues(d, gc, GCForeground, &gv);
++	if(!have_color || gv.foreground != last_pixel) {
++		XColor xc;
++		XRenderColor rc;
++
++		xc.pixel = gv.foreground;
++		XQueryColor(d, DefaultColormap(d, Scr->screen), &xc);
++		rc.red = xc.red;
++		rc.green = xc.green;
++		rc.blue = xc.blue;
++		rc.alpha = 0xffff;
++		if(have_color) {
++			XftColorFree(d, Scr->d_visual, DefaultColormap(d, Scr->screen),
++			             &last_color);
++		}
++		have_color = XftColorAllocValue(d, Scr->d_visual,
++		                                DefaultColormap(d, Scr->screen),
++		                                &rc, &last_color);
++		last_pixel = gv.foreground;
++		if(!have_color) {
++			return;
++		}
++	}
++
++	draw = XftDrawCreate(d, w, Scr->d_visual, DefaultColormap(d, Scr->screen));
++	if(draw) {
++		XftDrawStringUtf8(draw, &last_color, xf, x, y, (const FcChar8 *)text,
++		                  len);
++		XftDrawDestroy(draw);
++	}
++}
++
++
+ /**
+  * Load up our various defined fonts
+  */
+diff -Nur a/win_decorations.c b/win_decorations.c
+--- a/win_decorations.c
++++ b/win_decorations.c
+@@ -23,6 +23,7 @@
+ #include "workspace_manager.h"
+ 
+ #include "win_decorations.h"
++#include "win_fluent.h"
+ 
+ 
+ /* Internal bits */
+@@ -450,6 +451,16 @@
+ 	WMapSetupWindow(tmp_win, x, y, w, h);
+ 
+ 	/*
++	 * FluentTitles: the maximise button shows the restore glyph while the
++	 * window is zoomed, and zooming always comes through here.  The buttons
++	 * keep their contents when the frame resizes (they move by gravity), so
++	 * no Expose would redraw them.
++	 */
++	if(Scr->FluentTitles && tmp_win->title_w && tmp_win->titlebuttons) {
++		PaintTitleButtons(tmp_win);
++	}
++
++	/*
+ 	 * And send Configure notification to the (real) window if we decided
+ 	 * we have to, telling it about what all has happened.
+ 	 */
+@@ -694,6 +705,10 @@
+ 	attributes.border_pixel = tmp_win->title.fore;
+ 	attributes.event_mask = (ButtonPressMask | ButtonReleaseMask |
+ 	                         ExposureMask);
++	/* FluentTitles highlights a caption button under the pointer. */
++	if(Scr->FluentTitles) {
++		attributes.event_mask |= (EnterWindowMask | LeaveWindowMask);
++	}
+ 	attributes.cursor = Scr->ButtonCursor;
+ 	valuemask = (CWWinGravity | CWBackPixel | CWBorderPixel | CWEventMask |
+ 	             CWCursor);
+@@ -719,6 +734,15 @@
+ 			TBWindow *tbw;
+ 			int boxwidth = (Scr->TBInfo.width + Scr->TBInfo.pad);
+ 			unsigned int h = (Scr->TBInfo.width - Scr->TBInfo.border * 2);
++			unsigned int bw = h;
++
++			/* FluentTitles: a rectangle the full height of the title,
++			 * from the top edge. */
++			if(Scr->FluentTitles) {
++				bw = Scr->TBInfo.width;
++				h = Scr->TitleHeight;
++				y = 0;
++			}
+ 
+ 			for(tb = Scr->TBInfo.head, tbw = tmp_win->titlebuttons; tb;
+ 			                tb = tb->next, tbw++) {
+@@ -733,7 +757,7 @@
+ 					leftx += boxwidth;
+ 					attributes.win_gravity = NorthWestGravity;
+ 				}
+-				tbw->window = XCreateWindow(dpy, tmp_win->title_w, x, y, h, h,
++				tbw->window = XCreateWindow(dpy, tmp_win->title_w, x, y, bw, h,
+ 				                            Scr->TBInfo.border,
+ 				                            0, CopyFromParent,
+ 				                            CopyFromParent,
+@@ -1188,6 +1212,11 @@
+ void
+ PaintTitle(TwmWindow *tmp_win)
+ {
++	if(Scr->FluentTitles && Scr->d_visual->class == TrueColor) {
++		FluentPaintTitle(tmp_win);
++		return;
++	}
++
+ 	/* Draw 3d border around title bits */
+ 	if(Scr->use3Dtitles) {
+ 		/*
+@@ -1298,6 +1327,9 @@
+ {
+ 	TitleButton *tb = tbw->info;
+ 
++	if(FluentPaintTitleButton(tmp_win, tbw)) {
++		return;
++	}
+ 	XCopyArea(dpy, tbw->image->pixmap, tbw->window, Scr->NormalGC,
+ 	          tb->srcx, tb->srcy, tb->width, tb->height,
+ 	          tb->dstx, tb->dsty);
+diff -Nur a/win_decorations_init.c b/win_decorations_init.c
+--- a/win_decorations_init.c
++++ b/win_decorations_init.c
+@@ -54,6 +54,17 @@
+ 	else
+ 		Scr->TBInfo.pad = ((Scr->TitlePadding > 1)
+ 		                   ? ((Scr->TitlePadding + 1) / 2) : 1);
++	/*
++	 * FluentTitles: caption buttons are TitleButtonWidth wide and the full
++	 * title height tall, and sit flush against each other and the corner,
++	 * as Windows' do.
++	 */
++	if(Scr->FluentTitles) {
++		Scr->TBInfo.width = (Scr->TitleButtonWidth > 0)
++		                    ? Scr->TitleButtonWidth : Scr->TitleHeight;
++		Scr->TBInfo.pad = 0;
++		Scr->TBInfo.border = 0;
++	}
+ 	h = Scr->TBInfo.width - 2 * Scr->TBInfo.border;
+ 
+ 	/*
+diff -Nur a/win_fluent.c b/win_fluent.c
+--- a/win_fluent.c
++++ b/win_fluent.c
+@@ -0,0 +1,1144 @@
++/*
++ * LikeOS -- Windows 11 style title bars for ctwm ("FluentTitles").
++ *
++ * See win_fluent.h for what this draws.  Everything is drawn client-side into
++ * small XImages and blitted, rather than with core X lines: Windows 11's
++ * caption glyphs are one-pixel strokes with anti-aliased diagonals, and the
++ * application icon is blended onto the title colour, neither of which the
++ * core protocol can draw.  Blending against a known, opaque background is all
++ * that is needed -- the title bar is a solid colour -- so no compositing or
++ * Render extension is involved.
++ *
++ * The colours are Windows 11's light caption colours, measured from the real
++ * desktop: a focused title is #f0f3f9 with black text, an unfocused one
++ * #f3f3f3 with grey text and glyphs.  A caption button under the pointer is
++ * washed 6% darker, or for close, filled with Windows' close red (#c42b1c)
++ * with a white glyph.
++ *
++ * The resize border at the end of this file is the other half of a Windows
++ * window's frame: the band outside the visible edge that resizes it.
++ *
++ * Copyright (C) 2026 The LikeOS Project
++ */
++
++/* This file implements the frame-call wrappers ctwm.h routes everything
++ * else through, so it has to see the real Xlib calls. */
++#define CTWM_NO_FRAME_REDIRECT
++#include "ctwm.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#include <X11/Xatom.h>
++#include <X11/Xutil.h>
++#include <X11/Xft/Xft.h>
++
++#include "functions_defs.h"
++#include "screen.h"
++#include "win_decorations.h"
++#include "win_fluent.h"
++
++#define FL_ACTIVE_BG     0xf0f3f9
++#define FL_INACTIVE_BG   0xf3f3f3
++#define FL_ACTIVE_FG     0x000000
++#define FL_INACTIVE_FG   0x8f8f8f
++#define FL_HOVER_ALPHA   0.06
++#define FL_CLOSE_BG      0xc42b1c
++#define FL_CLOSE_FG      0xffffff
++
++#define FL_GLYPH         10   /* caption glyph box, pixels */
++#define FL_ICON          16   /* title icon, pixels */
++#define FL_LEFT_PAD      8    /* title bar edge to the icon or the text */
++#define FL_ICON_ADVANCE  22   /* icon's left edge to the text */
++#define FL_RIGHT_PAD     8    /* text to the first caption button */
++
++typedef enum { FL_NONE, FL_MINIMIZE, FL_MAXIMIZE, FL_CLOSE } FluentKind;
++
++/* The application icon at title size, kept per window: 16x16 ARGB. */
++struct fluent_icon {
++	unsigned int px[FL_ICON * FL_ICON];
++};
++
++/* ------------------------------------------------------------------------ */
++/* Colour helpers                                                           */
++/* ------------------------------------------------------------------------ */
++
++static unsigned long
++chan(unsigned int c8, unsigned long mask)
++{
++	int shift = 0, bits = 0;
++	unsigned long v;
++
++	if(mask == 0) {
++		return 0;
++	}
++	while(!(mask & 1)) {
++		mask >>= 1;
++		shift++;
++	}
++	while(mask & 1) {
++		mask >>= 1;
++		bits++;
++	}
++	v = (bits >= 8) ? ((unsigned long)c8 << (bits - 8)) : (c8 >> (8 - bits));
++	return v << shift;
++}
++
++static unsigned long
++fl_pixel(unsigned int rgb)
++{
++	Visual *v = Scr->d_visual;
++
++	return chan((rgb >> 16) & 0xff, v->red_mask) |
++	       chan((rgb >> 8) & 0xff, v->green_mask) |
++	       chan(rgb & 0xff, v->blue_mask);
++}
++
++/* `a' of `fg' over `bg', both 0xRRGGBB. */
++static unsigned int
++fl_blend(unsigned int bg, unsigned int fg, double a)
++{
++	unsigned int out = 0;
++
++	if(a <= 0) {
++		return bg;
++	}
++	if(a >= 1) {
++		return fg;
++	}
++	for(int s = 0; s <= 16; s += 8) {
++		double b = (bg >> s) & 0xff, f = (fg >> s) & 0xff;
++		unsigned int c = (unsigned int)(b + (f - b) * a + 0.5);
++
++		out |= (c > 255 ? 255 : c) << s;
++	}
++	return out;
++}
++
++/* Everything here assumes a TrueColor screen, which is what every modern
++ * server offers; on anything else the classic decorations are used. */
++static bool
++fl_usable(void)
++{
++	return Scr->FluentTitles && Scr->d_visual &&
++	       Scr->d_visual->class == TrueColor;
++}
++
++static XImage *
++fl_image(int w, int h)
++{
++	char *data = malloc((size_t)w * h * 4);
++	XImage *img;
++
++	if(!data) {
++		return NULL;
++	}
++	img = XCreateImage(dpy, Scr->d_visual, Scr->d_depth, ZPixmap, 0, data,
++	                   w, h, 32, 0);
++	if(!img) {
++		free(data);
++	}
++	return img;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Caption glyphs                                                           */
++/* ------------------------------------------------------------------------ */
++
++/* Distance from (px, py) to the segment (ax, ay)-(bx, by). */
++static double
++seg_dist(double px, double py, double ax, double ay, double bx, double by)
++{
++	double dx = bx - ax, dy = by - ay;
++	double t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
++
++	if(t < 0) {
++		t = 0;
++	}
++	if(t > 1) {
++		t = 1;
++	}
++	dx = px - (ax + t * dx);
++	dy = py - (ay + t * dy);
++	return sqrt(dx * dx + dy * dy);
++}
++
++/* Signed distance to the outline of the rounded square centred on (cx, cy)
++ * with half-size `h' and corner radius `r'. */
++static double
++rbox_dist(double px, double py, double cx, double cy, double h, double r)
++{
++	double qx = fabs(px - cx) - (h - r), qy = fabs(py - cy) - (h - r);
++	double ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
++	double in = (qx > qy ? qx : qy);
++
++	return sqrt(ox * ox + oy * oy) + (in < 0 ? in : 0) - r;
++}
++
++/* Is glyph-space point (x, y) on the stroke of the glyph?  The glyph box is
++ * FL_GLYPH square, pixel (i, j) covering [i, i+1) x [j, j+1), and strokes are
++ * one pixel wide and laid along pixel centres so that the straight ones come
++ * out crisp. */
++static bool
++glyph_hit(FluentKind kind, bool restore, double x, double y)
++{
++	const double lo = 0.5, hi = FL_GLYPH - 0.5;
++
++	switch(kind) {
++		case FL_MINIMIZE:
++			return x >= 0 && x < FL_GLYPH && y >= 5 && y < 6;
++
++		case FL_CLOSE:
++			return seg_dist(x, y, lo, lo, hi, hi) <= 0.5 ||
++			       seg_dist(x, y, lo, hi, hi, lo) <= 0.5;
++
++		case FL_MAXIMIZE:
++			if(!restore) {
++				return fabs(rbox_dist(x, y, FL_GLYPH / 2.0, FL_GLYPH / 2.0,
++				                      (hi - lo) / 2, 1.0)) <= 0.5;
++			}
++			/* Restore: an 8-pixel square at the bottom left, and the top
++			 * and right edges of a second one behind it. */
++			if(fabs(rbox_dist(x, y, lo + 3.5, hi - 3.5, 3.5, 1.0)) <= 0.5) {
++				return true;
++			}
++			if(x >= lo + 2 && y <= hi - 2 &&
++			                fabs(rbox_dist(x, y, hi - 3.5, lo + 3.5, 3.5, 1.0)) <= 0.5) {
++				/* only the part not hidden by the front square */
++				return !(x <= lo + 7.5 && y >= lo + 2);
++			}
++			return false;
++
++		default:
++			return false;
++	}
++}
++
++/* Coverage of pixel (i, j) of the glyph, 0..1, by 4x4 supersampling. */
++static double
++glyph_cover(FluentKind kind, bool restore, int i, int j)
++{
++	int n = 0;
++
++	for(int sy = 0; sy < 4; sy++) {
++		for(int sx = 0; sx < 4; sx++) {
++			if(glyph_hit(kind, restore, i + (sx + 0.5) / 4.0,
++			                j + (sy + 0.5) / 4.0)) {
++				n++;
++			}
++		}
++	}
++	return n / 16.0;
++}
++
++static FluentKind
++fl_kind(TitleButton *tb)
++{
++	TitleButtonFunc *tbf;
++
++	if(!tb) {
++		return FL_NONE;
++	}
++	for(tbf = tb->funs; tbf; tbf = tbf->next) {
++		switch(tbf->func) {
++			case F_ICONIFY:
++				return FL_MINIMIZE;
++			case F_ZOOM: case F_HORIZOOM: case F_FULLZOOM:
++			case F_FULLSCREENZOOM: case F_LEFTZOOM: case F_RIGHTZOOM:
++			case F_TOPZOOM: case F_BOTTOMZOOM: case F_XZOOM:
++			case F_XHORIZOOM: case F_XFULLZOOM: case F_XFULLSCREENZOOM:
++			case F_XLEFTZOOM: case F_XRIGHTZOOM: case F_XTOPZOOM:
++			case F_XBOTTOMZOOM:
++				return FL_MAXIMIZE;
++			case F_DELETE: case F_DESTROY: case F_DELETEORDESTROY:
++				return FL_CLOSE;
++			default:
++				break;
++		}
++	}
++	return FL_NONE;
++}
++
++bool
++FluentPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
++{
++	FluentKind kind;
++	bool focus, restore;
++	unsigned int bg, fg;
++	int w, h, gx, gy;
++	XImage *img;
++
++	if(!fl_usable() || !tbw || !tbw->window) {
++		return false;
++	}
++	kind = fl_kind(tbw->info);
++	if(kind == FL_NONE) {
++		return false;
++	}
++
++	focus = tmp_win->hasfocusvisible;
++	restore = (tmp_win->zoomed != ZOOM_NONE);
++	bg = focus ? FL_ACTIVE_BG : FL_INACTIVE_BG;
++	fg = focus ? FL_ACTIVE_FG : FL_INACTIVE_FG;
++	if(tbw->hover) {
++		if(kind == FL_CLOSE) {
++			bg = FL_CLOSE_BG;
++			fg = FL_CLOSE_FG;
++		}
++		else {
++			bg = fl_blend(bg, 0x000000, FL_HOVER_ALPHA);
++			fg = FL_ACTIVE_FG;
++		}
++	}
++
++	w = Scr->TBInfo.width;
++	h = Scr->TitleHeight;
++	img = fl_image(w, h);
++	if(!img) {
++		return false;
++	}
++
++	unsigned long bgpix = fl_pixel(bg);
++
++	for(int y = 0; y < h; y++) {
++		for(int x = 0; x < w; x++) {
++			XPutPixel(img, x, y, bgpix);
++		}
++	}
++
++	gx = (w - FL_GLYPH) / 2;
++	gy = (h - FL_GLYPH) / 2;
++	for(int j = 0; j < FL_GLYPH; j++) {
++		for(int i = 0; i < FL_GLYPH; i++) {
++			double c = glyph_cover(kind, restore, i, j);
++
++			if(c > 0 && gx + i >= 0 && gx + i < w && gy + j >= 0 && gy + j < h) {
++				XPutPixel(img, gx + i, gy + j, fl_pixel(fl_blend(bg, fg, c)));
++			}
++		}
++	}
++
++	XPutImage(dpy, tbw->window, Scr->NormalGC, img, 0, 0, 0, 0, w, h);
++	XDestroyImage(img);
++	return true;
++}
++
++bool
++FluentButtonCrossing(TwmWindow *tmp_win, Window w, bool entered)
++{
++	TBWindow *tbw;
++	int nb;
++
++	if(!fl_usable() || !tmp_win || !tmp_win->titlebuttons) {
++		return false;
++	}
++	nb = Scr->TBInfo.nleft + Scr->TBInfo.nright;
++	tbw = tmp_win->titlebuttons;
++	for(int i = 0; i < nb; i++, tbw++) {
++		if(tbw->window == w) {
++			tbw->hover = entered;
++			if(!FluentPaintTitleButton(tmp_win, tbw)) {
++				PaintTitleButton(tmp_win, tbw);
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Title icon                                                               */
++/* ------------------------------------------------------------------------ */
++
++/* The application's icon at 16x16, from _NET_WM_ICON.
++ *
++ * The property holds a list of (width, height, ARGB pixels...) images.  The
++ * smallest that is at least 16 pixels is taken -- downsampling a 256-pixel
++ * icon to 16 turns detail into mud -- and box-filtered down to size, in
++ * premultiplied alpha so that transparent pixels do not darken the edges. */
++static struct fluent_icon *
++fl_load_icon(TwmWindow *tmp_win)
++{
++	static Atom net_wm_icon = None;
++	Atom type;
++	int fmt;
++	unsigned long n, after;
++	unsigned char *data = NULL;
++	struct fluent_icon *ic = NULL;
++
++	if(net_wm_icon == None) {
++		net_wm_icon = XInternAtom(dpy, "_NET_WM_ICON", False);
++	}
++	if(XGetWindowProperty(dpy, tmp_win->w, net_wm_icon, 0, 1 << 20, False,
++	                      XA_CARDINAL, &type, &fmt, &n, &after,
++	                      &data) != Success || !data) {
++		return NULL;
++	}
++	if(type != XA_CARDINAL || fmt != 32) {
++		XFree(data);
++		return NULL;
++	}
++
++	/* Format-32 properties come back as an array of longs. */
++	unsigned long *p = (unsigned long *)data;
++	unsigned long i = 0, best = 0, bw = 0, bh = 0;
++
++	while(i + 2 <= n) {
++		unsigned long iw = p[i], ih = p[i + 1];
++
++		if(iw == 0 || ih == 0 || iw > 4096 || ih > 4096 ||
++		                i + 2 + iw * ih > n) {
++			break;
++		}
++		if((iw >= FL_ICON && (bw < FL_ICON || iw < bw)) ||
++		                (bw < FL_ICON && iw > bw)) {
++			best = i + 2;
++			bw = iw;
++			bh = ih;
++		}
++		i += 2 + iw * ih;
++	}
++
++	if(bw > 0 && (ic = calloc(1, sizeof(*ic)))) {
++		for(int y = 0; y < FL_ICON; y++) {
++			for(int x = 0; x < FL_ICON; x++) {
++				unsigned long x0 = x * bw / FL_ICON, x1 = (x + 1) * bw / FL_ICON;
++				unsigned long y0 = y * bh / FL_ICON, y1 = (y + 1) * bh / FL_ICON;
++				double a = 0, r = 0, g = 0, b = 0;
++				unsigned long cnt = 0;
++
++				if(x1 <= x0) {
++					x1 = x0 + 1;
++				}
++				if(y1 <= y0) {
++					y1 = y0 + 1;
++				}
++				for(unsigned long yy = y0; yy < y1 && yy < bh; yy++) {
++					for(unsigned long xx = x0; xx < x1 && xx < bw; xx++) {
++						unsigned long v = p[best + yy * bw + xx];
++						double al = ((v >> 24) & 0xff) / 255.0;
++
++						a += al;
++						r += ((v >> 16) & 0xff) * al;
++						g += ((v >> 8) & 0xff) * al;
++						b += (v & 0xff) * al;
++						cnt++;
++					}
++				}
++				if(cnt == 0 || a <= 0) {
++					continue;
++				}
++				r /= a;
++				g /= a;
++				b /= a;
++				a /= cnt;
++				ic->px[y * FL_ICON + x] =
++				        ((unsigned int)(a * 255 + 0.5) << 24) |
++				        ((unsigned int)(r + 0.5) << 16) |
++				        ((unsigned int)(g + 0.5) << 8) |
++				        (unsigned int)(b + 0.5);
++			}
++		}
++	}
++	XFree(data);
++	return ic;
++}
++
++void
++FluentIconChanged(TwmWindow *tmp_win)
++{
++	if(!tmp_win) {
++		return;
++	}
++	free(tmp_win->fluent_icon);
++	tmp_win->fluent_icon = NULL;
++	tmp_win->fluent_icon_tried = false;
++	if(fl_usable() && tmp_win->title_w) {
++		FluentPaintTitle(tmp_win);
++	}
++}
++
++static void fl_grip_destroy(TwmWindow *tmp_win);
++
++void
++FluentForgetWindow(TwmWindow *tmp_win)
++{
++	if(!tmp_win) {
++		return;
++	}
++	free(tmp_win->fluent_icon);
++	tmp_win->fluent_icon = NULL;
++	tmp_win->fluent_icon_tried = false;
++	fl_grip_destroy(tmp_win);
++}
++
++/* ------------------------------------------------------------------------ */
++/* Title bar                                                                */
++/* ------------------------------------------------------------------------ */
++
++/* Shorten `s' (UTF-8) so that it and an ellipsis fit in `avail' pixels. */
++static char *
++fl_fit(XftFont *font, const char *s, int avail)
++{
++	XGlyphInfo gi;
++	size_t len = strlen(s);
++	char *out;
++
++	XftTextExtentsUtf8(dpy, font, (const FcChar8 *)s, (int)len, &gi);
++	if(gi.xOff <= avail) {
++		return strdup(s);
++	}
++	out = malloc(len + 4);
++	if(!out) {
++		return NULL;
++	}
++	while(len > 0) {
++		/* step back one whole UTF-8 character */
++		do {
++			len--;
++		}
++		while(len > 0 && ((unsigned char)s[len] & 0xc0) == 0x80);
++		memcpy(out, s, len);
++		memcpy(out + len, "\xe2\x80\xa6", 4);
++		XftTextExtentsUtf8(dpy, font, (const FcChar8 *)out, (int)len + 3, &gi);
++		if(gi.xOff <= avail) {
++			return out;
++		}
++	}
++	free(out);
++	return NULL;
++}
++
++void
++FluentPaintTitle(TwmWindow *tmp_win)
++{
++	bool focus;
++	unsigned int bg, fg;
++	int x, h, avail;
++	MyFont *font = &Scr->TitleBarFont;
++
++	if(!tmp_win->title_w) {
++		return;
++	}
++	focus = tmp_win->hasfocusvisible;
++	bg = focus ? FL_ACTIVE_BG : FL_INACTIVE_BG;
++	fg = focus ? FL_ACTIVE_FG : FL_INACTIVE_FG;
++	h = Scr->TitleHeight;
++
++	XSetForeground(dpy, Scr->NormalGC, fl_pixel(bg));
++	XFillRectangle(dpy, tmp_win->title_w, Scr->NormalGC, 0, 0,
++	               tmp_win->title_width, h);
++
++	/*
++	 * The title window has a border as wide as the frame's, and the frame
++	 * clips all of it except the bottom edge -- which would draw a line in
++	 * the border colour between the title and the window contents.  Windows
++	 * has no such line, so that edge takes the title's own colour.  (The
++	 * focus code sets the border colour on every change; this runs after
++	 * it.)
++	 */
++	if(tmp_win->frame_bw > 0) {
++		XSetWindowBorder(dpy, tmp_win->title_w, fl_pixel(bg));
++	}
++
++	x = FL_LEFT_PAD + Scr->TBInfo.titlex;
++
++	if(!tmp_win->fluent_icon_tried) {
++		tmp_win->fluent_icon = fl_load_icon(tmp_win);
++		tmp_win->fluent_icon_tried = true;
++	}
++	if(tmp_win->fluent_icon && h >= FL_ICON) {
++		XImage *img = fl_image(FL_ICON, FL_ICON);
++
++		if(img) {
++			for(int y = 0; y < FL_ICON; y++) {
++				for(int xx = 0; xx < FL_ICON; xx++) {
++					unsigned int v = tmp_win->fluent_icon->px[y * FL_ICON + xx];
++					double a = ((v >> 24) & 0xff) / 255.0;
++
++					XPutPixel(img, xx, y,
++					          fl_pixel(fl_blend(bg, v & 0xffffff, a)));
++				}
++			}
++			XPutImage(dpy, tmp_win->title_w, Scr->NormalGC, img, 0, 0,
++			          x, (h - FL_ICON) / 2, FL_ICON, FL_ICON);
++			XDestroyImage(img);
++		}
++		x += FL_ICON_ADVANCE;
++	}
++
++	if(!tmp_win->name || !*tmp_win->name) {
++		return;
++	}
++	avail = (int)tmp_win->title_width - Scr->TBInfo.rightoff - FL_RIGHT_PAD - x;
++	if(avail <= 0) {
++		return;
++	}
++
++	if(font->xft) {
++		XftDraw *d = XftDrawCreate(dpy, tmp_win->title_w, Scr->d_visual,
++		                           DefaultColormap(dpy, Scr->screen));
++		XRenderColor rc = {
++			.red = ((fg >> 16) & 0xff) * 257,
++			.green = ((fg >> 8) & 0xff) * 257,
++			.blue = (fg & 0xff) * 257,
++			.alpha = 0xffff,
++		};
++		XftColor col;
++		char *text = fl_fit(font->xft, tmp_win->name, avail);
++
++		if(d && text && XftColorAllocValue(dpy, Scr->d_visual,
++		                                   DefaultColormap(dpy, Scr->screen),
++		                                   &rc, &col)) {
++			int base = (h - (font->xft->ascent + font->xft->descent)) / 2 +
++			           font->xft->ascent;
++
++			XftDrawStringUtf8(d, &col, font->xft, x, base,
++			                  (const FcChar8 *)text, (int)strlen(text));
++			XftColorFree(dpy, Scr->d_visual,
++			             DefaultColormap(dpy, Scr->screen), &col);
++		}
++		free(text);
++		if(d) {
++			XftDrawDestroy(d);
++		}
++	}
++	else {
++		XRectangle ink, logical;
++		int len = (int)strlen(tmp_win->name);
++
++		XSetForeground(dpy, Scr->NormalGC, fl_pixel(fg));
++		XmbTextExtents(font->font_set, tmp_win->name, len, &ink, &logical);
++		while(len > 0 && logical.width > avail) {
++			len--;
++			XmbTextExtents(font->font_set, tmp_win->name, len, &ink, &logical);
++		}
++		XmbDrawString(dpy, tmp_win->title_w, font->font_set, Scr->NormalGC, x,
++		              (h - logical.height) / 2 - logical.y, tmp_win->name, len);
++	}
++}
++
++void
++FluentFocusChanged(TwmWindow *tmp_win, bool focus)
++{
++	(void)focus;
++	if(!fl_usable() || !tmp_win || !tmp_win->title_w) {
++		return;
++	}
++	FluentPaintTitle(tmp_win);
++	/* AddWindow sets the focus look before the buttons exist. */
++	if(tmp_win->titlebuttons) {
++		PaintTitleButtons(tmp_win);
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* The resize border                                                        */
++/* ------------------------------------------------------------------------ */
++
++#define FL_GRIP          6    /* the band outside the frame, pixels */
++#define FL_GRIP_CORNER   16   /* along an edge from a corner: the corner */
++
++/* Borders in existence; the frame-call wrappers do nothing extra while it
++ * is 0, which it is whenever FluentTitles is off. */
++static int fl_grips;
++
++/* Does the window get a border at all?  Not without a frame edge (docks,
++ * the desktop, NoBorder windows), and not for a window whose size is fixed
++ * -- Windows draws no resize border on those either. */
++static bool
++fl_resizable(TwmWindow *t)
++{
++	const XSizeHints *h = &t->hints;
++
++	if((h->flags & PMinSize) && (h->flags & PMaxSize) &&
++	                h->min_width == h->max_width &&
++	                h->min_height == h->max_height) {
++		return false;
++	}
++	return true;
++}
++
++/* Show the border while the frame is shown, the window is not maximised
++ * (a maximised Windows window cannot be resized by its edges) and its size
++ * is not fixed; bring it to the frame's geometry and, when the frame was
++ * restacked, put it back directly beneath the frame. */
++static void
++fl_grip_sync(TwmWindow *t, bool restack)
++{
++	bool want;
++
++	int gx, gy;
++	unsigned int gw, gh;
++
++	if(t->fluent_grip == None) {
++		return;
++	}
++	/* Only when it changed: this runs for every move step and every
++	 * restack, and a configure request is never free. */
++	gx = t->fluent_fx - FL_GRIP;
++	gy = t->fluent_fy - FL_GRIP;
++	gw = t->fluent_fw + 2 * t->fluent_fbw + 2 * FL_GRIP;
++	gh = t->fluent_fh + 2 * t->fluent_fbw + 2 * FL_GRIP;
++	if(gx != t->fluent_gx || gy != t->fluent_gy || gw != t->fluent_gw ||
++	                gh != t->fluent_gh) {
++		XMoveResizeWindow(dpy, t->fluent_grip, gx, gy, gw, gh);
++		t->fluent_gx = gx;
++		t->fluent_gy = gy;
++		t->fluent_gw = gw;
++		t->fluent_gh = gh;
++	}
++	if(restack) {
++		XWindowChanges xwc;
++
++		xwc.sibling = t->frame;
++		xwc.stack_mode = Below;
++		XConfigureWindow(dpy, t->fluent_grip, CWSibling | CWStackMode, &xwc);
++	}
++	want = t->fluent_frame_mapped && t->zoomed == ZOOM_NONE &&
++	       fl_resizable(t);
++	if(want && !t->fluent_grip_mapped) {
++		if(!restack) {
++			XWindowChanges xwc;
++
++			xwc.sibling = t->frame;
++			xwc.stack_mode = Below;
++			XConfigureWindow(dpy, t->fluent_grip, CWSibling | CWStackMode,
++			                 &xwc);
++		}
++		XMapWindow(dpy, t->fluent_grip);
++		t->fluent_grip_mapped = true;
++	}
++	else if(!want && t->fluent_grip_mapped) {
++		XUnmapWindow(dpy, t->fluent_grip);
++		t->fluent_grip_mapped = false;
++	}
++}
++
++void
++FluentGripCreate(TwmWindow *tmp_win)
++{
++	XSetWindowAttributes attr;
++	XWindowAttributes wa;
++	Window root, parent, *kids = NULL;
++	unsigned int nkids;
++
++	if(!fl_usable() || !tmp_win || tmp_win->frame == None ||
++	                tmp_win->frame_bw <= 0 || tmp_win->fluent_grip != None) {
++		return;
++	}
++	/* ctwm's own windows (icon and workspace managers, the occupy
++	 * dialog) are not resized by hand. */
++	if(tmp_win->isiconmgr || tmp_win->iswspmgr || tmp_win->isoccupy) {
++		return;
++	}
++	/* Where the frame really is: the placement code may have moved it
++	 * since it was created. */
++	if(!XGetWindowAttributes(dpy, tmp_win->frame, &wa) ||
++	                !XQueryTree(dpy, tmp_win->frame, &root, &parent, &kids,
++	                            &nkids)) {
++		return;
++	}
++	if(kids) {
++		XFree(kids);
++	}
++	tmp_win->fluent_grip_parent = parent;
++	tmp_win->fluent_gx = wa.x - FL_GRIP;
++	tmp_win->fluent_gy = wa.y - FL_GRIP;
++	tmp_win->fluent_gw = (unsigned int)wa.width + 2 * (unsigned int)wa.border_width + 2 * FL_GRIP;
++	tmp_win->fluent_gh = (unsigned int)wa.height + 2 * (unsigned int)wa.border_width + 2 * FL_GRIP;
++	tmp_win->fluent_fx = wa.x;
++	tmp_win->fluent_fy = wa.y;
++	tmp_win->fluent_fw = (unsigned int)wa.width;
++	tmp_win->fluent_fh = (unsigned int)wa.height;
++	tmp_win->fluent_fbw = (unsigned int)wa.border_width;
++	tmp_win->fluent_frame_mapped = (wa.map_state != IsUnmapped);
++	tmp_win->fluent_grip_edges = -1;
++
++	/* Override-redirect: it is ctwm's own furniture, not a window for
++	 * anyone to manage or list. */
++	attr.override_redirect = True;
++	attr.event_mask = ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
++	attr.cursor = Scr->FrameCursor;
++	tmp_win->fluent_grip = XCreateWindow(dpy, parent,
++	                                     wa.x - FL_GRIP, wa.y - FL_GRIP,
++	                                     (unsigned int)wa.width + 2 * (unsigned int)wa.border_width + 2 * FL_GRIP,
++	                                     (unsigned int)wa.height + 2 * (unsigned int)wa.border_width + 2 * FL_GRIP,
++	                                     0, 0, InputOnly, CopyFromParent,
++	                                     CWOverrideRedirect | CWEventMask | CWCursor,
++	                                     &attr);
++	if(tmp_win->fluent_grip == None) {
++		return;
++	}
++	if(Scr->NameDecorations) {
++		XStoreName(dpy, tmp_win->fluent_grip, "CTWM resize border");
++	}
++	XSaveContext(dpy, tmp_win->fluent_grip, TwmContext, (XPointer) tmp_win);
++	XSaveContext(dpy, tmp_win->fluent_grip, ScreenContext, (XPointer) Scr);
++	fl_grips++;
++	fl_grip_sync(tmp_win, true);
++}
++
++static void
++fl_grip_destroy(TwmWindow *tmp_win)
++{
++	if(tmp_win->fluent_grip == None) {
++		return;
++	}
++	XDeleteContext(dpy, tmp_win->fluent_grip, TwmContext);
++	XDeleteContext(dpy, tmp_win->fluent_grip, ScreenContext);
++	XDestroyWindow(dpy, tmp_win->fluent_grip);
++	tmp_win->fluent_grip = None;
++	tmp_win->fluent_grip_mapped = false;
++	fl_grips--;
++}
++
++/* The edges at (x, y), frame coordinates (the frame's outer top-left corner
++ * is 0,0, so the band around it is negative or beyond its size): the frame's
++ * own one-pixel edge counts, the band outside it, and near a corner the
++ * corner -- FL_GRIP_CORNER pixels along either edge, as on Windows. */
++static int
++fl_edges_at(TwmWindow *t, int x, int y)
++{
++	int w = (int)(t->fluent_fw + 2 * t->fluent_fbw);
++	int h = (int)(t->fluent_fh + 2 * t->fluent_fbw);
++	int bw = (int)t->fluent_fbw;
++	int e = 0;
++
++	if(x < bw) {
++		e |= FLUENT_EDGE_LEFT;
++	}
++	else if(x >= w - bw) {
++		e |= FLUENT_EDGE_RIGHT;
++	}
++	if(y < bw) {
++		e |= FLUENT_EDGE_TOP;
++	}
++	else if(y >= h - bw) {
++		e |= FLUENT_EDGE_BOTTOM;
++	}
++	if(e & (FLUENT_EDGE_TOP | FLUENT_EDGE_BOTTOM)) {
++		if(x < FL_GRIP_CORNER) {
++			e |= FLUENT_EDGE_LEFT;
++		}
++		else if(x >= w - FL_GRIP_CORNER) {
++			e |= FLUENT_EDGE_RIGHT;
++		}
++	}
++	if(e & (FLUENT_EDGE_LEFT | FLUENT_EDGE_RIGHT)) {
++		if(y < FL_GRIP_CORNER) {
++			e |= FLUENT_EDGE_TOP;
++		}
++		else if(y >= h - FL_GRIP_CORNER) {
++			e |= FLUENT_EDGE_BOTTOM;
++		}
++	}
++	return e;
++}
++
++Cursor
++FluentEdgeCursor(int edges)
++{
++	switch(edges) {
++		case FLUENT_EDGE_TOP | FLUENT_EDGE_LEFT:
++			return TopLeftCursor;
++		case FLUENT_EDGE_TOP | FLUENT_EDGE_RIGHT:
++			return TopRightCursor;
++		case FLUENT_EDGE_BOTTOM | FLUENT_EDGE_LEFT:
++			return BottomLeftCursor;
++		case FLUENT_EDGE_BOTTOM | FLUENT_EDGE_RIGHT:
++			return BottomRightCursor;
++		case FLUENT_EDGE_TOP:
++			return TopCursor;
++		case FLUENT_EDGE_BOTTOM:
++			return BottomCursor;
++		case FLUENT_EDGE_LEFT:
++			return LeftCursor;
++		case FLUENT_EDGE_RIGHT:
++			return RightCursor;
++		default:
++			return Scr->FrameCursor;
++	}
++}
++
++void
++FluentGripMotion(TwmWindow *tmp_win, int x, int y)
++{
++	int e;
++
++	if(!tmp_win || tmp_win->fluent_grip == None) {
++		return;
++	}
++	e = fl_edges_at(tmp_win, x - FL_GRIP, y - FL_GRIP);
++	if(e != tmp_win->fluent_grip_edges) {
++		XDefineCursor(dpy, tmp_win->fluent_grip, FluentEdgeCursor(e));
++		tmp_win->fluent_grip_edges = e;
++	}
++}
++
++int
++FluentResizeEdges(TwmWindow *tmp_win, XEvent *evp, int fx, int fy, int fw,
++                  int fh)
++{
++	int bw;
++
++	if(!fl_usable() || !tmp_win || evp->type != ButtonPress) {
++		return 0;
++	}
++	if(evp->xbutton.window != tmp_win->frame &&
++	                (tmp_win->fluent_grip == None ||
++	                 evp->xbutton.window != tmp_win->fluent_grip)) {
++		return 0;
++	}
++	/* fx..fh are the inner geometry; the edges are measured from the
++	 * outer corner, where the frame's border begins. */
++	bw = tmp_win->frame_bw;
++	(void)fw;
++	(void)fh;
++	return fl_edges_at(tmp_win, evp->xbutton.x_root - (fx - bw),
++	                   evp->xbutton.y_root - (fy - bw));
++}
++
++/* ---- The frame-call wrappers (see ctwm.h) -------------------------------- */
++
++/*
++ * Before the frame itself is restacked, its border goes to the bottom of the
++ * stack, out of everything's way; fl_grip_sync() puts it back under the frame
++ * afterwards.
++ *
++ * Without this the restack passes through a state where the border is ABOVE
++ * its own frame: ctwm raises a window by placing it directly above the next
++ * frame down ("Above sibling"), which lands it underneath its border still
++ * sitting there.  For the moment between that request and the border's own
++ * restack the pointer is over the border, not the application -- and the
++ * application is told it left its window and came back.  ctwm raises on every
++ * click, the wheel included, and GDK takes each such re-entry as a new
++ * scrolling gesture and drops the scroll position it measures smooth scrolling
++ * from: the wheel did nothing in most GTK programs.
++ */
++static void
++fl_grip_out_of_the_way(Display *d, TwmWindow *t)
++{
++	if(t->fluent_grip_mapped) {
++		XLowerWindow(d, t->fluent_grip);
++	}
++}
++
++/* The window `w' is a frame that has a border: its TwmWindow, else NULL. */
++static TwmWindow *
++fl_frame_owner(Display *d, Window w)
++{
++	TwmWindow *t;
++
++	if(fl_grips == 0 ||
++	                XFindContext(d, w, TwmContext, (XPointer *)&t) != XCSUCCESS) {
++		return NULL;
++	}
++	return (t && t->frame == w && t->fluent_grip != None) ? t : NULL;
++}
++
++int
++ctwm_XMapWindow(Display *d, Window w)
++{
++	int r = XMapWindow(d, w);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_frame_mapped = true;
++		fl_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XMapRaised(Display *d, Window w)
++{
++	int r = XMapRaised(d, w);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_frame_mapped = true;
++		fl_grip_sync(t, true);
++	}
++	return r;
++}
++
++int
++ctwm_XUnmapWindow(Display *d, Window w)
++{
++	int r = XUnmapWindow(d, w);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_frame_mapped = false;
++		fl_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XMoveWindow(Display *d, Window w, int x, int y)
++{
++	int r = XMoveWindow(d, w, x, y);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_fx = x;
++		t->fluent_fy = y;
++		fl_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XResizeWindow(Display *d, Window w, unsigned int width,
++                   unsigned int height)
++{
++	int r = XResizeWindow(d, w, width, height);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_fw = width;
++		t->fluent_fh = height;
++		fl_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XMoveResizeWindow(Display *d, Window w, int x, int y,
++                       unsigned int width, unsigned int height)
++{
++	int r = XMoveResizeWindow(d, w, x, y, width, height);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_fx = x;
++		t->fluent_fy = y;
++		t->fluent_fw = width;
++		t->fluent_fh = height;
++		fl_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XConfigureWindow(Display *d, Window w, unsigned int mask,
++                      XWindowChanges *xwc)
++{
++	TwmWindow *t = fl_frame_owner(d, w);
++	int r;
++
++	if(t && (mask & CWStackMode)) {
++		fl_grip_out_of_the_way(d, t);
++	}
++	r = XConfigureWindow(d, w, mask, xwc);
++
++	if(t) {
++		if(mask & CWX) {
++			t->fluent_fx = xwc->x;
++		}
++		if(mask & CWY) {
++			t->fluent_fy = xwc->y;
++		}
++		if(mask & CWWidth) {
++			t->fluent_fw = (unsigned int)xwc->width;
++		}
++		if(mask & CWHeight) {
++			t->fluent_fh = (unsigned int)xwc->height;
++		}
++		if(mask & CWBorderWidth) {
++			t->fluent_fbw = (unsigned int)xwc->border_width;
++		}
++		fl_grip_sync(t, (mask & CWStackMode) != 0);
++	}
++	return r;
++}
++
++int
++ctwm_XSetWindowBorderWidth(Display *d, Window w, unsigned int width)
++{
++	int r = XSetWindowBorderWidth(d, w, width);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		t->fluent_fbw = width;
++		fl_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XRaiseWindow(Display *d, Window w)
++{
++	int r = XRaiseWindow(d, w);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		fl_grip_sync(t, true);
++	}
++	return r;
++}
++
++int
++ctwm_XLowerWindow(Display *d, Window w)
++{
++	TwmWindow *t = fl_frame_owner(d, w);
++	int r;
++
++	if(t) {
++		fl_grip_out_of_the_way(d, t);
++	}
++	r = XLowerWindow(d, w);
++
++	if(t) {
++		fl_grip_sync(t, true);
++	}
++	return r;
++}
++
++int
++ctwm_XRestackWindows(Display *d, Window *ws, int n)
++{
++	int r;
++
++	for(int i = 0; i < n; i++) {
++		TwmWindow *t = fl_frame_owner(d, ws[i]);
++
++		if(t) {
++			fl_grip_out_of_the_way(d, t);
++		}
++	}
++	r = XRestackWindows(d, ws, n);
++
++	for(int i = 0; i < n; i++) {
++		TwmWindow *t = fl_frame_owner(d, ws[i]);
++
++		if(t) {
++			fl_grip_sync(t, true);
++		}
++	}
++	return r;
++}
++
++int
++ctwm_XReparentWindow(Display *d, Window w, Window parent, int x, int y)
++{
++	int r = XReparentWindow(d, w, parent, x, y);
++	TwmWindow *t = fl_frame_owner(d, w);
++
++	if(t) {
++		/* Reparenting unmaps and remaps a mapped window; the border
++		 * goes along the same way, into the same parent. */
++		XReparentWindow(d, t->fluent_grip, parent, x - FL_GRIP, y - FL_GRIP);
++		t->fluent_grip_parent = parent;
++		t->fluent_fx = x;
++		t->fluent_fy = y;
++		t->fluent_gx = x - FL_GRIP;
++		t->fluent_gy = y - FL_GRIP;
++		fl_grip_sync(t, true);
++	}
++	return r;
++}
+diff -Nur a/win_fluent.h b/win_fluent.h
+--- a/win_fluent.h
++++ b/win_fluent.h
+@@ -0,0 +1,87 @@
++/*
++ * LikeOS -- Windows 11 style title bars for ctwm ("FluentTitles").
++ *
++ * With the FluentTitles keyword set, ctwm draws its title bars the way
++ * Windows 11 draws a desktop application's caption: a flat band whose colour
++ * says whether the window has the focus, the application's icon and its title
++ * on the left in an anti-aliased font, and caption buttons on the right that
++ * are 46 pixels wide, carry thin anti-aliased glyphs instead of bitmaps, and
++ * highlight under the pointer -- the close button in red.
++ *
++ * The glyph a button gets follows from the function bound to it: f.iconify
++ * draws the minimise line, the zoom functions the maximise square (or the
++ * restore glyph while the window is zoomed), f.delete and f.destroy the cross.
++ * A button bound to anything else keeps its configured image.
++ *
++ * Copyright (C) 2026 The LikeOS Project
++ */
++
++#ifndef _CTWM_WIN_FLUENT_H
++#define _CTWM_WIN_FLUENT_H
++
++/* Draw the whole title bar band: background, icon and name. */
++void FluentPaintTitle(TwmWindow *tmp_win);
++
++/* Draw one caption button in its current state.  Returns false for a button
++ * whose function has no Windows glyph, which the caller then draws the
++ * classic way. */
++bool FluentPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw);
++
++/* The window gained or lost the focus: redraw the title and its buttons in
++ * the colours for the new state. */
++void FluentFocusChanged(TwmWindow *tmp_win, bool focus);
++
++/* An EnterNotify or LeaveNotify on window `w'.  Returns true when `w' is one
++ * of tmp_win's caption buttons, which have then been redrawn hovered or not;
++ * false means the event is for somebody else. */
++bool FluentButtonCrossing(TwmWindow *tmp_win, Window w, bool entered);
++
++/* The window's _NET_WM_ICON changed: forget the cached title icon. */
++void FluentIconChanged(TwmWindow *tmp_win);
++
++/* The window is going away: free what FluentPaintTitle cached for it, and
++ * its resize border. */
++void FluentForgetWindow(TwmWindow *tmp_win);
++
++/*
++ * The resize border.
++ *
++ * A Windows 11 window has a one-pixel visible edge, and the band that resizes
++ * it lies OUTSIDE that edge, where nothing is drawn: the pointer turns into a
++ * double arrow a few pixels short of the window, and a drag there resizes it.
++ * Without a compositor nothing can be drawn transparently, so the band is an
++ * InputOnly window -- invisible by definition -- a few pixels larger than the
++ * frame on every side and stacked directly beneath it.  The frame covers its
++ * middle; the ring around the frame is the band.  Being directly beneath its
++ * own frame, it is covered by every window above that frame, exactly as the
++ * window itself is.
++ *
++ * It has to follow the frame through every move, resize, restack, map, unmap
++ * and reparent.  ctwm does those in some thirty places, so rather than hook
++ * each one, ctwm.h routes the Xlib calls that do them through the wrappers
++ * below, which make the call and then bring the border along when the window
++ * is a frame that has one.
++ */
++
++/* Create the border for a newly managed window (frame already created). */
++void FluentGripCreate(TwmWindow *tmp_win);
++
++/* Pointer motion over the border, in its coordinates: set the cursor for the
++ * edge or corner the pointer is on. */
++void FluentGripMotion(TwmWindow *tmp_win, int x, int y);
++
++/* Edges a resize started by `evp' moves, as FLUENT_EDGE_* bits: the edges
++ * nearest the pointer when the press was on the border (or on the frame's
++ * own one-pixel edge), 0 otherwise.  fx..fh are the frame's inner geometry,
++ * as StartResize() has it. */
++#define FLUENT_EDGE_TOP    1
++#define FLUENT_EDGE_BOTTOM 2
++#define FLUENT_EDGE_LEFT   4
++#define FLUENT_EDGE_RIGHT  8
++int FluentResizeEdges(TwmWindow *tmp_win, XEvent *evp, int fx, int fy,
++                      int fw, int fh);
++
++/* The cursor for a set of FLUENT_EDGE_* bits. */
++Cursor FluentEdgeCursor(int edges);
++
++#endif /* _CTWM_WIN_FLUENT_H */
+diff -Nur a/win_ops.c b/win_ops.c
+--- a/win_ops.c
++++ b/win_ops.c
+@@ -15,6 +15,7 @@
+ #include "otp.h"
+ #include "screen.h"
+ #include "win_decorations.h"
++#include "win_fluent.h"
+ #include "win_iconify.h"
+ #include "win_ops.h"
+ #include "win_utils.h"
+@@ -115,6 +116,11 @@
+ 		             tmp_win->title, bs, false, false);
+ 	}
+ 	tmp_win->hasfocusvisible = focus;
++
++	/* FluentTitles: the title bar's colours follow the focus. */
++	if(Scr->FluentTitles && tmp_win->title_height) {
++		FluentFocusChanged(tmp_win, focus);
++	}
+ }
+ 
+ 
+diff -Nur a/win_resize.c b/win_resize.c
+--- a/win_resize.c
++++ b/win_resize.c
+@@ -40,6 +40,7 @@
+ #include "r_area_list.h"
+ #include "r_layout.h"
+ #include "win_decorations.h"
++#include "win_fluent.h"
+ #include "win_ops.h"
+ #include "win_resize.h"
+ #include "win_utils.h"
+@@ -216,7 +217,35 @@
+ 	origHeight = dragHeight;
+ 	clampTop = clampBottom = clampLeft = clampRight = clampDX = clampDY = 0;
+ 
+-	if(Scr->AutoRelativeResize && (from3dborder || !fromtitlebar)) {
++	/* Started on the window's edge (FluentTitles' resize border): the edges
++	 * under the pointer move, and only those, keeping their distance from
++	 * the pointer -- so the window does not jump to it -- and the pointer
++	 * keeps the edge's double arrow for the whole drag. */
++	int edges = FluentResizeEdges(tmp_win, evp, dragx, dragy, (int)dragWidth,
++	                              (int)dragHeight);
++	if(edges) {
++		int x = evp->xbutton.x_root, y = evp->xbutton.y_root;
++
++		if(edges & FLUENT_EDGE_LEFT) {
++			clampLeft = 1;
++			clampDX = x - dragx;
++		}
++		else if(edges & FLUENT_EDGE_RIGHT) {
++			clampRight = 1;
++			clampDX = x - dragx - (int)dragWidth;
++		}
++		if(edges & FLUENT_EDGE_TOP) {
++			clampTop = 1;
++			clampDY = y - dragy;
++		}
++		else if(edges & FLUENT_EDGE_BOTTOM) {
++			clampBottom = 1;
++			clampDY = y - dragy - (int)dragHeight;
++		}
++		XChangeActivePointerGrab(dpy, resizeGrabMask, FluentEdgeCursor(edges),
++		                         CurrentTime);
++	}
++	else if(Scr->AutoRelativeResize && (from3dborder || !fromtitlebar)) {
+ 		do_auto_clamp(tmp_win, evp);
+ 	}
+ 
+@@ -1108,15 +1137,22 @@
+ 	*/
+ 	XUngrabServer(dpy);
+ 
+-	XQueryPointer(dpy,
+-	              tmp_win->w,
+-	              &junkRoot, &junkRoot,
+-	              &tmpX, &tmpY, &tmpW, &tmpH, &junkDepth);
+-	if(tmp_win->frame_x > tmpX ||
+-	                tmp_win->frame_x + tmp_win->frame_width < tmpX ||
+-	                tmp_win->frame_y > tmpY ||
+-	                tmp_win->frame_y + tmp_win->frame_height < tmpY) {
+-		XWarpPointer(dpy, Scr->Root, tmp_win->w, 0, 0, 0, 0, 0, 0);
++	/* Classic ctwm moves the pointer into the window when the window no
++	 * longer contains it -- to its top-left corner.  With FluentTitles the
++	 * pointer stays where it is, as on Windows: restoring a maximised
++	 * window from its caption button shrinks the window away from the
++	 * button, and the pointer jumped to the window's left edge. */
++	if(!Scr->FluentTitles) {
++		XQueryPointer(dpy,
++		              tmp_win->w,
++		              &junkRoot, &junkRoot,
++		              &tmpX, &tmpY, &tmpW, &tmpH, &junkDepth);
++		if(tmp_win->frame_x > tmpX ||
++		                tmp_win->frame_x + tmp_win->frame_width < tmpX ||
++		                tmp_win->frame_y > tmpY ||
++		                tmp_win->frame_y + tmp_win->frame_height < tmpY) {
++			XWarpPointer(dpy, Scr->Root, tmp_win->w, 0, 0, 0, 0, 0, 0);
++		}
+ 	}
+ 
+ #ifdef EWMH

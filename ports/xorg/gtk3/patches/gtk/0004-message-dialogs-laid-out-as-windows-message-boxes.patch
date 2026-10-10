@@ -1,0 +1,41 @@
+Lay message dialogs out the way Windows lays out a message box.
+
+The buttons go together at the right of the action area at their own width
+(GTK_BUTTONBOX_END) instead of being stretched across the dialog, and the
+primary text -- Windows' "main instruction" -- is set in regular weight a
+third larger than the body text rather than in bold.  The LikeOS theme gives
+it its colour and puts the buttons on a grey strip along the bottom.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/gtk/gtkmessagedialog.c
++++ b/gtk/gtkmessagedialog.c
+@@ -327,7 +327,10 @@
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   action_area = gtk_dialog_get_action_area (GTK_DIALOG (dialog));
+ G_GNUC_END_IGNORE_DEPRECATIONS
+-  gtk_button_box_set_layout (GTK_BUTTON_BOX (action_area), GTK_BUTTONBOX_EXPAND);
++  /* The buttons sit together at the right of the action area, at their own
++   * width, the way a Windows message box lays them out -- not stretched
++   * across the whole dialog. */
++  gtk_button_box_set_layout (GTK_BUTTON_BOX (action_area), GTK_BUTTONBOX_END);
+ 
+   settings = gtk_widget_get_settings (GTK_WIDGET (dialog));
+   g_object_get (settings, "gtk-keynav-use-caret", &use_caret, NULL);
+@@ -347,12 +350,12 @@
+ 
+       attributes = pango_attr_list_new ();
+ 
+-      attr = pango_attr_weight_new (PANGO_WEIGHT_BOLD);
+-      pango_attr_list_insert (attributes, attr);
+-
++      /* The primary text is Windows' "main instruction": regular weight,
++       * a third larger than the body text (12pt over 9pt).  Its colour comes
++       * from the theme. */
+       if (priv->has_secondary_text)
+         {
+-          attr = pango_attr_scale_new (PANGO_SCALE_LARGE);
++          attr = pango_attr_scale_new (4.0 / 3.0);
+           pango_attr_list_insert (attributes, attr);
+         }
+ 

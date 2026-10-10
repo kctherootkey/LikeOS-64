@@ -65,11 +65,17 @@
 
 #include <kernel/dev/gpu/vmwgfx/vmw_gb.h>
 
-/* Cursor images on a host with SVGA_CAP2_CURSOR_MOB go to the device as a
- * MOB named through SVGA_REG_CURSOR_MOBID, which is what lets an image be
- * larger than 64x64.  Off: every image is a define command (64x64 at most),
- * the only route before. */
-#define VMW_CURSOR_MOB 1
+/* On: cursor images on a host with SVGA_CAP2_CURSOR_MOB go to the device as
+ * a MOB named through SVGA_REG_CURSOR_MOBID, which is what lets an image be
+ * larger than 64x64.  Off: every image is a define command (64x64 at most).
+ *
+ * Off, because on the VMware host this runs on the MOB image is never what
+ * the device shows: the pointer on the screen stayed the image the console
+ * had defined at boot -- moving, but never changing shape for any program
+ * (no I-beam, no resize arrows, no busy pointer).  The define command is the
+ * route that host demonstrably shows, and every pointer X uses fits in
+ * 64x64 (its cursor buffer is that size). */
+#define VMW_CURSOR_MOB 0
 
 /* The position registers name where the device puts the image's hotspot,
  * while the DRM cursor position is the image's top-left corner: the hotspot

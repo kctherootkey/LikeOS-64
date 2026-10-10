@@ -208,6 +208,15 @@ done
 [ -d "$SYSROOT/usr/share/X11/locale" ] &&
 	cp -a "$SYSROOT/usr/share/X11/locale" "$DEST/usr/share/X11/locale"
 
+# The classic X bitmaps.  Xmu's String-to-Bitmap converter resolves a bare
+# name -- xcalc's icon "calculator", window-manager icons -- in
+# /usr/include/X11/bitmaps when no bitmapFilePath is set; xbitmaps installs
+# them there.  Without them xcalc warned it could not convert "calculator".
+if [ -d "$SYSROOT/usr/include/X11/bitmaps" ]; then
+	mkdir -p "$DEST/usr/include/X11"
+	cp -a "$SYSROOT/usr/include/X11/bitmaps" "$DEST/usr/include/X11/"
+fi
+
 # ---------------------------------------------------------------------------
 # fontconfig.
 #

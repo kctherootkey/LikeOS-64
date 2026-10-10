@@ -2454,8 +2454,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	#
 	# Without a theme installed libXcursor falls back to the X core cursor
 	# font, whose "watch" is a 1-bit wristwatch; this replaces the busy
-	# cursors with an animated hourglass and leaves every other cursor to
-	# the fallback, which is why the theme is under a megabyte.
+	# cursors with an animated hourglass, adds the resize and link pointers
+	# GTK asks for by names the core font does not have, and leaves every
+	# other cursor to the fallback, which is why the theme is under a
+	# megabyte.
 	mkdir -p $(BUILD_DIR)/hosttools
 	$(GCC) -O2 -o $(BUILD_DIR)/hosttools/gen-cursors host/gen-cursors.c -lm
 	mkdir -p $(EXT4_STAGING)/usr/share/icons/LikeOS/cursors
@@ -2528,6 +2530,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# which matters because there is no librsvg here and the SVG variants
 	# would not render.
 	mkdir -p $(EXT4_STAGING)/etc/skel/Desktop $(EXT4_STAGING)/root/Desktop
+	# The file manager's "Create New" templates live in ~/Templates, and it
+	# warns at every start when the folder is missing.
+	mkdir -p $(EXT4_STAGING)/etc/skel/Templates $(EXT4_STAGING)/root/Templates
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/etc/skel/Desktop/
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/root/Desktop/
 	# The icons appear in modification-time order, oldest first: PCManFM's

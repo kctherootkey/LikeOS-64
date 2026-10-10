@@ -1,8 +1,16 @@
 // LikeOS -- taskbar, the desktop shell's panel.
 //
-// A Windows 2000-style bar across the bottom of the screen:
+// A Windows 11 style bar across the bottom of the screen:
 //
-//   [LikeOS] [Load|Mem] [ task buttons .......... ] [1][2][3][4] [date time]
+//   [load]          [LikeOS] [task] [task] [task] ...          [1][2][3][4] [time]
+//                                                                           [date]
+//
+// The start button and the window buttons sit together in the middle, the
+// load monitor where Windows keeps its widgets, the workspace switcher and
+// the clock at the right.  Each window keeps a button with its icon and title
+// (Windows 11's "never combine" arrangement), lit for the window that has the
+// focus and marked with the short indicator bars Windows draws under the
+// buttons of running programs.
 //
 // It replaces ctwm's icon manager (which was the task list) and ctwm's
 // workspace manager (which was the workspace switcher).  Both are switched off
@@ -24,17 +32,19 @@
 // message for it, which is a gap in the spec rather than in ctwm.
 //
 // Drawn as one GtkDrawingArea with manual hit-testing rather than as a box of
-// GtkButtons.  The look wanted here is a specific one -- two-pixel bevels,
-// exact greys, no rounding, no animation -- and every one of those is a fight
-// with a GTK theme that has its own ideas.  Drawing it directly is less code
-// than overriding all of that, and the hit-testing is a handful of rectangle
-// comparisons because the layout is computed in one place (layout()).
+// GtkButtons.  The look wanted here is a specific one -- exact colours, tiles
+// that only appear under the pointer, indicator bars -- and every one of those
+// is a fight with a GTK theme that has its own ideas.  Drawing it directly is
+// less code than overriding all of that, and the hit-testing is a handful of
+// rectangle comparisons because the layout is computed in one place
+// (layout()).
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include "panel.h"
 
 #include <gdk/gdkx.h>
+#include <math.h>
 #include <signal.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -42,12 +52,14 @@
 
 /* --- layout constants ---------------------------------------------------- */
 
-#define START_W 78	/* the LikeOS button */
-#define LOADMON_W 176	/* the load/memory tray */
-#define WS_BTN_W 22	/* one workspace button */
-#define TASK_MAX_W 160	/* a task button never grows past this */
-#define TASK_MIN_W 40	/* ... nor shrinks below it; past that they scroll */
-#define GAP 3		/* between the panel's groups */
+#define TILE_H 40	/* every button: Windows 11's 40-pixel taskbar tile */
+#define START_W 40	/* the LikeOS button, square */
+#define TASK_MAX_W 160	/* a window button never grows past this */
+#define TASK_MIN_W 40	/* ... nor shrinks below it; past that they drop off */
+#define TASK_LABEL_MIN 96 /* narrower than this, a button shows only its icon */
+#define TASK_GAP 4	/* between buttons */
+#define WS_BTN_W 32	/* one workspace button */
+#define ICON_SIZE 24	/* window icons, as on the Windows 11 taskbar */
 
 /* The atoms this program uses.  Interned once at start-up; X round-trips are
  * the expensive part of talking to the server and these are used on every
@@ -65,7 +77,7 @@ struct task {
 	char *title;
 	gboolean iconic;
 	long desktop;
-	GdkPixbuf *icon; /* from _NET_WM_ICON, or NULL */
+	GdkPixbuf *icon; /* from _NET_WM_ICON at ICON_SIZE, or NULL */
 	/* Where layout() put it, so the click handler can find it again. */
 	double x, w;
 };
@@ -216,11 +228,12 @@ static gboolean win_iconic(Window w)
 	return ic;
 }
 
-/* The smallest _NET_WM_ICON that is still at least 16x16, scaled to 16.
+/* The smallest _NET_WM_ICON that is still at least ICON_SIZE square, scaled
+ * to ICON_SIZE.
  *
  * The property is a list of (width, height, ARGB pixels...) runs.  Picking the
  * smallest adequate one rather than the first keeps a 256x256 icon from being
- * downsampled to 16 pixels, which turns detailed artwork into mud. */
+ * downsampled to 24 pixels, which turns detailed artwork into mud. */
 static GdkPixbuf *win_icon(Window w)
 {
 	unsigned long n = 0;
@@ -238,12 +251,29 @@ static GdkPixbuf *win_icon(Window w)
 
 		if (iw == 0 || ih == 0 || i + 2 + iw * ih > n)
 			break;
-		if (iw >= 16 && (best_w == 0 || iw < best_w)) {
+		if (iw >= ICON_SIZE && (best_w == 0 || iw < best_w)) {
 			best_w = iw;
 			best_h = ih;
 			best_off = i + 2;
 		}
 		i += 2 + iw * ih;
+	}
+	/* Nothing big enough: take the largest there is, rather than no
+	 * icon at all. */
+	if (best_w == 0) {
+		i = 0;
+		while (i + 2 <= n) {
+			unsigned long iw = p[i], ih = p[i + 1];
+
+			if (iw == 0 || ih == 0 || i + 2 + iw * ih > n)
+				break;
+			if (iw > best_w) {
+				best_w = iw;
+				best_h = ih;
+				best_off = i + 2;
+			}
+			i += 2 + iw * ih;
+		}
 	}
 	if (best_w == 0) {
 		XFree(d);
@@ -277,7 +307,7 @@ static GdkPixbuf *win_icon(Window w)
 	}
 	XFree(d);
 
-	GdkPixbuf *small = gdk_pixbuf_scale_simple(pb, 16, 16,
+	GdkPixbuf *small = gdk_pixbuf_scale_simple(pb, ICON_SIZE, ICON_SIZE,
 						   GDK_INTERP_BILINEAR);
 
 	g_object_unref(pb);
@@ -430,11 +460,12 @@ out:
  * handler, so the two cannot disagree about what is where -- which is the only
  * real hazard in hit-testing a hand-drawn widget. */
 struct layout {
-	double start_x, start_w;
 	double load_x, load_w;
-	double task_x, task_w;
-	double ws_x, ws_w, ws_btn_w;
+	double start_x;
+	double task_x, task_bw, task_end;
+	double ws_x, ws_w;
 	double clock_x, clock_w;
+	double tile_y;
 };
 
 /* The measured width of the clock text, cached from the last draw.
@@ -450,147 +481,139 @@ static double g_clock_w;
 static void layout(cairo_t *cr, int width, struct layout *L)
 {
 	if (cr)
-		g_clock_w = panel_clock_width(cr) + 14;
+		g_clock_w = panel_clock_width(cr);
 
-	double clock_w = g_clock_w;
+	double clock_w = g_clock_w < 80 ? 80 : g_clock_w;
 
-	if (clock_w < 100)
-		clock_w = 100;
+	L->tile_y = (PANEL_HEIGHT - TILE_H) / 2;
 
-	double ws_btn = WS_BTN_W;
-	double ws_w = g_ndesktops * ws_btn + 6;
-
-	/* Inset from the frame on both sides, the same as the top and bottom. */
-	L->start_x = PANEL_BORDER + GAP;
-	L->start_w = START_W;
-	L->load_x = L->start_x + L->start_w + GAP;
-	L->load_w = LOADMON_W;
+	/* The two ends: the load monitor at the left, where Windows keeps its
+	 * widgets; the clock at the right, with the workspace buttons beside
+	 * it where the notification area would be. */
+	L->load_x = 4;
+	L->load_w = PANEL_LOAD_W;
 	L->clock_w = clock_w;
-	L->clock_x = width - PANEL_BORDER - GAP - clock_w;
-	L->ws_w = ws_w;
-	L->ws_btn_w = ws_btn;
-	L->ws_x = L->clock_x - GAP - ws_w;
-	L->task_x = L->load_x + L->load_w + GAP;
-	L->task_w = L->ws_x - GAP - L->task_x;
+	L->clock_x = width - 8 - clock_w;
+	L->ws_w = g_ndesktops * WS_BTN_W;
+	L->ws_x = L->clock_x - 4 - L->ws_w;
 
-	/* On a narrow screen the tray groups can eat the whole bar.  The task
-	 * area is the one that gives: it is the only part whose contents can
-	 * scroll, and a negative width would otherwise be handed to Cairo. */
-	if (L->task_w < 0)
-		L->task_w = 0;
+	/* The middle: the start button and the window buttons, centred on the
+	 * screen as one group.  When there are too many windows for that, the
+	 * buttons narrow, and the group slides left until it meets the load
+	 * monitor. */
+	double left = L->load_x + L->load_w + 8;
+	double right = L->ws_x - 8;
+	int n = (int)g_tasks->len;
+	double bw = TASK_MAX_W;
+	double group = START_W + n * (TASK_GAP + bw);
+
+	if (n > 0 && group > right - left) {
+		bw = (right - left - START_W) / n - TASK_GAP;
+		if (bw < TASK_MIN_W)
+			bw = TASK_MIN_W;
+		group = START_W + n * (TASK_GAP + bw);
+	}
+
+	double gx = floor((width - group) / 2);
+
+	if (gx + group > right)
+		gx = right - group;
+	if (gx < left)
+		gx = left;
+
+	L->start_x = gx;
+	L->task_x = gx + START_W + TASK_GAP;
+	L->task_bw = floor(bw);
+	L->task_end = right;
 }
 
 /* --- drawing ---------------------------------------------------------------- */
 
-static void draw_start(cairo_t *cr, struct layout *L, double y, double h)
+/* How a control is lit: held down, pointed at, or neither. */
+static enum panel_tile tile_state(int hit, gboolean lit)
 {
-	gboolean pressed = (g_pressed == HIT_START) || g_menu_up;
-
-	/* Drawn by panel.c: the outline, the bevel and the engraved lettering
-	 * are one look and belong together.  It shifts a pixel down and right
-	 * while held, which is how every button in this style showed it. */
-	panel_start_button(cr, L->start_x, y, L->start_w, h, pressed);
+	if (g_pressed == hit && g_hover == hit)
+		return PANEL_TILE_DOWN;
+	if (lit || g_hover == hit)
+		return PANEL_TILE_LIT;
+	return PANEL_TILE_NONE;
 }
 
-static void draw_tasks(cairo_t *cr, struct layout *L, double y, double h)
+/* The icon for a window that has none of its own. */
+static GdkPixbuf *fallback_icon(void)
 {
-	panel_fill_face(cr, L->task_x, y, L->task_w, h);
-	panel_bevel(cr, L->task_x, y, L->task_w, h, FALSE, FALSE);
+	static GdkPixbuf *pb;
 
-	if (g_tasks->len == 0 || L->task_w < TASK_MIN_W)
-		return;
+	if (!pb) {
+		GtkIconTheme *th = gtk_icon_theme_get_default();
 
-	double avail = L->task_w - 6;
-	double bw = avail / g_tasks->len;
+		pb = gtk_icon_theme_load_icon(th, "application-x-executable",
+					      ICON_SIZE,
+					      GTK_ICON_LOOKUP_FORCE_SIZE, NULL);
+	}
+	return pb;
+}
 
-	if (bw > TASK_MAX_W)
-		bw = TASK_MAX_W;
-	if (bw < TASK_MIN_W)
-		bw = TASK_MIN_W;
-
-	double bx = L->task_x + 3;
-	double by = y + 3;
-	double bh = h - 6;
+static void draw_tasks(cairo_t *cr, struct layout *L)
+{
+	double bw = L->task_bw;
+	double ty = L->tile_y;
+	gboolean labels = bw >= TASK_LABEL_MIN;
 
 	for (guint i = 0; i < g_tasks->len; i++) {
 		struct task *t = &g_array_index(g_tasks, struct task, i);
 
-		t->x = bx;
-		t->w = bw - 2;
-		if (bx + t->w > L->task_x + L->task_w - 3) {
+		t->x = L->task_x + i * (bw + TASK_GAP);
+		t->w = bw;
+		if (t->x + t->w > L->task_end) {
 			/* Ran out of bar.  Mark the rest as unplaced so the
 			 * click handler does not match them. */
 			t->w = 0;
-			bx += bw;
 			continue;
 		}
 
 		gboolean active = (t->win == g_active) && !t->iconic;
-		gboolean down = (g_pressed == (int)i) || active;
 
-		panel_fill_face(cr, t->x, by, t->w, bh);
-		panel_bevel(cr, t->x, by, t->w, bh, !down, FALSE);
+		panel_tile(cr, t->x, ty, t->w, TILE_H,
+			   tile_state((int)i, active));
 
-		/* The active window's button is not merely sunken: it also
-		 * gets a dotted fill, which is how the classic shell told a
-		 * pressed button apart from the focused one. */
-		if (active) {
-			cairo_set_source_rgb(cr, PANEL_LIGHT_R, PANEL_LIGHT_G,
-					     PANEL_LIGHT_B);
-			for (int yy = (int)by + 3; yy < by + bh - 2; yy++)
-				for (int xx = (int)t->x + 3 + (yy & 1);
-				     xx < t->x + t->w - 2; xx += 2)
-					cairo_rectangle(cr, xx, yy, 1, 1);
-			cairo_fill(cr);
-		}
+		GdkPixbuf *icon = t->icon ? t->icon : fallback_icon();
+		double ix = labels ? t->x + 10 : t->x + (t->w - ICON_SIZE) / 2;
+		double iy = ty + (TILE_H - ICON_SIZE) / 2 - 1;
 
-		double tx = t->x + 5 + (down ? 1 : 0);
-		double tw = t->w - 10;
-
-		if (t->icon && tw > 22) {
-			gdk_cairo_set_source_pixbuf(cr, t->icon, tx,
-						    by + (bh - 16) / 2);
+		if (g_pressed == (int)i && g_hover == (int)i)
+			iy += 1;
+		if (icon) {
+			gdk_cairo_set_source_pixbuf(cr, icon, ix, iy);
 			cairo_paint(cr);
-			tx += 19;
-			tw -= 19;
 		}
-		cairo_set_source_rgb(cr, 0, 0, 0);
-		if (tw > 0) {
-			/* A minimised window's title is bracketed, the way
-			 * iconified titles have always been shown on X. */
-			char *label = t->iconic ?
-					      g_strdup_printf("[%s]", t->title) :
-					      g_strdup(t->title);
+		if (labels) {
+			double lx = ix + ICON_SIZE + 8;
 
-			panel_text(cr, tx, by + (bh - 15) / 2 + (down ? 1 : 0),
-				   tw, label, FALSE, 0);
-			g_free(label);
+			panel_text(cr, lx, ty + TILE_H / 2 - 1,
+				   t->x + t->w - 8 - lx, t->title, FALSE, 0);
 		}
-		bx += bw;
+
+		/* Every window that exists gets an indicator; the focused
+		 * one's is long and blue. */
+		panel_indicator(cr, t->x + t->w / 2, ty + TILE_H - 1, active);
 	}
 }
 
-static void draw_workspaces(cairo_t *cr, struct layout *L, double y, double h)
+static void draw_workspaces(cairo_t *cr, struct layout *L)
 {
-	panel_fill_face(cr, L->ws_x, y, L->ws_w, h);
-	panel_bevel(cr, L->ws_x, y, L->ws_w, h, FALSE, FALSE);
-
-	double by = y + 3;
-	double bh = h - 6;
-
 	for (long i = 0; i < g_ndesktops; i++) {
-		double bx = L->ws_x + 3 + i * L->ws_btn_w;
-		double bw = L->ws_btn_w - 2;
+		double bx = L->ws_x + i * WS_BTN_W;
 		gboolean cur = (i == g_desktop);
-		gboolean down = cur || (g_pressed == HIT_WS_BASE - (int)i);
-		char num[8];
+		char num[24];
 
-		panel_fill_face(cr, bx, by, bw, bh);
-		panel_bevel(cr, bx, by, bw, bh, !down, FALSE);
+		panel_tile(cr, bx + 2, L->tile_y, WS_BTN_W - 4, TILE_H,
+			   tile_state(HIT_WS_BASE - (int)i, cur));
 		snprintf(num, sizeof(num), "%ld", i + 1);
-		cairo_set_source_rgb(cr, 0, 0, 0);
-		panel_text(cr, bx + (down ? 1 : 0), by + (bh - 15) / 2 +
-				       (down ? 1 : 0), bw, num, cur, 1);
+		panel_text(cr, bx, PANEL_HEIGHT / 2 - 1, WS_BTN_W, num, cur, 1);
+		if (cur)
+			panel_indicator(cr, bx + WS_BTN_W / 2,
+					L->tile_y + TILE_H - 1, TRUE);
 	}
 }
 
@@ -604,32 +627,19 @@ static gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 	g_panel_w = width;
 	layout(cr, width, &L);
 
+	/* The bar: one flat colour, and a hairline along the top where it
+	 * meets the desktop. */
 	panel_fill_face(cr, 0, 0, width, height);
+	panel_color(cr, PANEL_EDGE);
+	cairo_rectangle(cr, 0, 0, width, 1);
+	cairo_fill(cr);
 
-	/* The bar's own frame: a raised band all the way round, the same shape
-	 * and the same shading ctwm gives every window it manages.  The panel
-	 * is a window on this desktop and should look like one.
-	 *
-	 * Drawn round the whole rectangle rather than just the top edge even
-	 * though three of its sides are against the screen edge: a band that
-	 * stopped short would leave the corners unmitred, and the mitre is
-	 * half of what makes it read as a ctwm frame. */
-	panel_bevel_n(cr, 0, 0, width, height, PANEL_BORDER, TRUE);
-
-	/* Everything inside the frame.  CY/CH are the content band -- the row
-	 * the controls share -- so the frame width is named once here rather
-	 * than being spelled out at each of the five call sites. */
-	double cy = PANEL_BORDER;
-	double ch = height - PANEL_BORDER * 2;
-
-	draw_start(cr, &L, cy, ch);
-	panel_load_draw(cr, &g_load, L.load_x, cy, L.load_w, ch);
-	draw_tasks(cr, &L, cy, ch);
-	draw_workspaces(cr, &L, cy, ch);
-
-	panel_fill_face(cr, L.clock_x, cy, L.clock_w, ch);
-	panel_bevel(cr, L.clock_x, cy, L.clock_w, ch, FALSE, FALSE);
-	panel_clock_draw(cr, L.clock_x, cy, L.clock_w, ch, FALSE);
+	panel_load_draw(cr, &g_load, L.load_x, 0, L.load_w, height);
+	panel_start_button(cr, L.start_x, L.tile_y, START_W, TILE_H,
+			   tile_state(HIT_START, g_menu_up));
+	draw_tasks(cr, &L);
+	draw_workspaces(cr, &L);
+	panel_clock_draw(cr, L.clock_x, 0, L.clock_w, height, TRUE);
 	return TRUE;
 }
 
@@ -958,7 +968,7 @@ static void show_start_menu(void)
 
 	layout(NULL, g_panel_w, &L);
 
-	GdkRectangle r = { (int)L.start_x, 0, (int)L.start_w, PANEL_HEIGHT };
+	GdkRectangle r = { (int)L.start_x, 0, START_W, PANEL_HEIGHT };
 
 	g_menu_up = TRUE;
 	gtk_widget_queue_draw(g_area);
@@ -1010,13 +1020,13 @@ static int hit_test(double x, double y)
 	(void)y;
 	layout(NULL, g_panel_w, &L);
 
-	if (x >= L.start_x && x < L.start_x + L.start_w)
+	if (x >= L.start_x && x < L.start_x + START_W)
 		return HIT_START;
 
 	for (long i = 0; i < g_ndesktops; i++) {
-		double bx = L.ws_x + 3 + i * L.ws_btn_w;
+		double bx = L.ws_x + i * WS_BTN_W;
 
-		if (x >= bx && x < bx + L.ws_btn_w - 2)
+		if (x >= bx && x < bx + WS_BTN_W)
 			return HIT_WS_BASE - (int)i;
 	}
 
@@ -1086,6 +1096,8 @@ static gboolean on_motion(GtkWidget *w, GdkEventMotion *ev, gpointer d)
 
 	if (hit != g_hover) {
 		g_hover = hit;
+		/* The tile under the pointer lights up. */
+		gtk_widget_queue_draw(g_area);
 		/* Tooltip carries the full title, which a narrow button will
 		 * have ellipsised. */
 		if (hit >= 0 && (guint)hit < g_tasks->len)
@@ -1260,71 +1272,12 @@ static void intern_atoms(void)
 #undef IA
 }
 
-/* Classic colours for the menus.
- *
- * The menu is the one part of this that is real GTK widgets rather than
- * Cairo -- submenus, keyboard navigation and icon rows are a great deal of
- * machinery to reimplement -- so it is styled instead of drawn.  Without this
- * the panel is 2000 and its menu is 2014. */
-static void apply_menu_css(void)
-{
-	static const char *css =
-		"menu, .menu {"
-		"  background-color: #d4d0c8;"
-		"  border: 1px solid #808080;"
-		"  padding: 2px;"
-		"}"
-		"menu menuitem, .menu menuitem {"
-		"  color: #000000;"
-		"  padding: 3px 8px;"
-		"  font-family: 'DejaVu Sans';"
-		"  font-size: 8pt;"
-		"}"
-		"menu menuitem:hover, .menu menuitem:hover {"
-		"  background-color: #0a246a;"
-		"  color: #ffffff;"
-		"}"
-		"menu menuitem:disabled, .menu menuitem:disabled {"
-		"  color: #808080;"
-		"}"
-		"menu separator, .menu separator {"
-		"  background-color: #808080;"
-		"  margin: 2px 1px;"
-		"  min-height: 1px;"
-		"}"
-		/* The tooltips match the system theme's: grey text on white
-		 * with a light grey border.  The theme colours the tooltip's
-		 * label itself ("tooltip *"), so the text colour is set there
-		 * too -- on the tooltip alone it would never reach the text. */
-		"tooltip, tooltip.background {"
-		"  background-color: #ffffff;"
-		"  color: #505050;"
-		"  border: 1px solid #d3d3d3;"
-		"  border-radius: 0;"
-		"  text-shadow: none;"
-		"  box-shadow: none;"
-		"}"
-		"tooltip * {"
-		"  background-color: transparent;"
-		"  color: #505050;"
-		"  text-shadow: none;"
-		"}";
-	GtkCssProvider *p = gtk_css_provider_new();
-
-	gtk_css_provider_load_from_data(p, css, -1, NULL);
-	gtk_style_context_add_provider_for_screen(
-		gdk_screen_get_default(), GTK_STYLE_PROVIDER(p),
-		GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-	g_object_unref(p);
-}
-
 int main(int argc, char **argv)
 {
 	g_set_prgname("taskbar");
 	gdk_set_program_class("taskbar");
 
 	gtk_init(&argc, &argv);
-	apply_menu_css();
 
 	GdkDisplay *disp = gdk_display_get_default();
 
@@ -1388,34 +1341,6 @@ int main(int argc, char **argv)
 	gtk_window_set_title(GTK_WINDOW(win), "taskbar");
 	gtk_window_set_default_size(GTK_WINDOW(win), sw, PANEL_HEIGHT);
 
-	/* Pinned to the bottom edge of the monitor -- and pinned in the way
-	 * ctwm actually honours.
-	 *
-	 * gtk_window_move() states a position as PPosition, "the program
-	 * chose this", and ctwm ignores PPosition unless UsePPosition is
-	 * turned on, which this desktop does not turn on.  So ctwm considered
-	 * itself free to place the bar wherever it liked, and the bar only
-	 * reached the bottom because GTK re-issued the move after the window
-	 * was mapped and ctwm honoured that as an ordinary ConfigureRequest.
-	 * That is a race being won, not a position being set, and it stopped
-	 * being won.
-	 *
-	 * parse_geometry states it as USPosition instead, "the user chose
-	 * this", which ctwm takes as final before it places the window at all.
-	 * It is the only call in GTK 3 that sets that hint -- deprecated with
-	 * no replacement, which is why load(1) and datetime(1) use it too.
-	 *
-	 * geo.y matters as well as geo.height: on a second monitor stacked
-	 * below the first, the bottom of the screen is not the bottom of the
-	 * desktop. */
-	char geom[32];
-
-	g_snprintf(geom, sizeof(geom), "+%d+%d", geo.x,
-		   geo.y + geo.height - PANEL_HEIGHT);
-	G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-	gtk_window_parse_geometry(GTK_WINDOW(win), geom);
-	G_GNUC_END_IGNORE_DEPRECATIONS
-
 	g_area = gtk_drawing_area_new();
 	gtk_widget_set_size_request(g_area, sw, PANEL_HEIGHT);
 	gtk_widget_add_events(g_area, GDK_BUTTON_PRESS_MASK |
@@ -1434,6 +1359,39 @@ int main(int argc, char **argv)
 	g_signal_connect(g_area, "leave-notify-event", G_CALLBACK(on_leave),
 			 NULL);
 	g_signal_connect(win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+	gtk_widget_show(g_area);
+
+	/* Pinned to the bottom edge of the monitor -- and pinned in the way
+	 * ctwm actually honours.
+	 *
+	 * gtk_window_move() states a position as PPosition, "the program
+	 * chose this", and ctwm ignores PPosition unless UsePPosition is
+	 * turned on, which this desktop does not turn on.  So ctwm considered
+	 * itself free to place the bar wherever it liked, and the bar only
+	 * reached the bottom because GTK re-issued the move after the window
+	 * was mapped and ctwm honoured that as an ordinary ConfigureRequest.
+	 * That is a race being won, not a position being set, and it stopped
+	 * being won.
+	 *
+	 * parse_geometry states it as USPosition instead, "the user chose
+	 * this", which ctwm takes as final before it places the window at all.
+	 * It is the only call in GTK 3 that sets that hint -- deprecated with
+	 * no replacement, which is why load(1) and datetime(1) use it too.
+	 *
+	 * It comes after the drawing area is added and shown: GTK sizes the
+	 * geometry from the window's visible children, and warns when it has
+	 * none yet.
+	 *
+	 * geo.y matters as well as geo.height: on a second monitor stacked
+	 * below the first, the bottom of the screen is not the bottom of the
+	 * desktop. */
+	char geom[32];
+
+	g_snprintf(geom, sizeof(geom), "+%d+%d", geo.x,
+		   geo.y + geo.height - PANEL_HEIGHT);
+	G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+	gtk_window_parse_geometry(GTK_WINDOW(win), geom);
+	G_GNUC_END_IGNORE_DEPRECATIONS
 
 	gtk_widget_show_all(win);
 	g_gdkwin = gtk_widget_get_window(win);

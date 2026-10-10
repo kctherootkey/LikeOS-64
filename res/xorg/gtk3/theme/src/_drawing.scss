@@ -1,0 +1,425 @@
+// Drawing mixins
+
+// generic drawing of more complex things
+
+@function _widget_edge($c:$borders_edge) {
+// outer highlight "used" on most widgets
+  @if $c == none { @return none; }
+  @else { @return 0 1px $c; }
+}
+
+@mixin _shadows($list...) {
+//
+// Helper mixin to stack up to box-shadows;
+//
+  $shadows: null;
+
+  @each $shadow in $list {
+    @if $shadow!=none { $shadows: $shadows, $shadow; }
+  }
+
+  box-shadow: $shadows;
+}
+
+// entries
+//
+// A Windows 11 text field: a near-white fill, a hairline grey frame, and a
+// darker line along the bottom edge only.  Focus turns that bottom line into a
+// two-pixel accent bar (the second pixel is the inset shadow) and the fill to
+// pure white -- the frame itself never changes colour.
+
+@function entry_focus_border($fc:$accent_color) { @return $fc; }
+
+@function entry_focus_shadow($fc:$accent_color) { @return inset 0 -1px $fc; }
+
+@mixin entry($t, $fc:$accent_color, $edge: none) {
+//
+// $t: normal, focus, insensitive, backdrop, backdrop-insensitive,
+//     osd, osd-focus, osd-insensitive, osd-backdrop
+//
+  @if $t==normal {
+    color: $text_color;
+    border-color: $borders_color;
+    border-bottom-color: $strong_borders_color;
+    background-color: $control_color;
+    box-shadow: entry_focus_shadow(transparentize($fc, 1));
+  }
+  @if $t==focus {
+    border-color: $borders_color;
+    border-bottom-color: entry_focus_border($fc);
+    background-color: $base_color;
+    box-shadow: entry_focus_shadow($fc);
+  }
+  @if $t==insensitive {
+    color: $insensitive_fg_color;
+    border-color: $borders_color;
+    background-color: $control_disabled_color;
+    box-shadow: none;
+  }
+  @if $t==backdrop {
+    color: $text_color;
+    border-color: $borders_color;
+    border-bottom-color: $strong_borders_color;
+    background-color: $control_color;
+    box-shadow: entry_focus_shadow(transparentize($fc, 1));
+  }
+  @if $t==backdrop-insensitive {
+    color: $insensitive_fg_color;
+    border-color: $borders_color;
+    background-color: $control_disabled_color;
+    box-shadow: none;
+  }
+  @if $t==osd {
+    color: $osd_text_color;
+    border-color: $osd_borders_color;
+    background-color: transparentize(opacify($osd_borders_color, 1), 0.5);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+  @if $t==osd-focus {
+    color: $osd_text_color;
+    border-color: $accent_light_color;
+    background-color: transparentize(opacify($osd_borders_color, 1), 0.5);
+    background-clip: padding-box;
+    box-shadow: entry_focus_shadow($accent_light_color);
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+  @if $t==osd-insensitive {
+    color: $osd_insensitive_fg_color;
+    border-color: $osd_borders_color;
+    background-color: $osd_insensitive_bg_color;
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+  @if $t==osd-backdrop {
+    color: $osd_text_color;
+    border-color: $osd_borders_color;
+    background-color: transparentize(opacify($osd_borders_color, 1), 0.5);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+}
+
+// buttons
+//
+// Windows 11 buttons are flat: no gradient, no inner highlight, no text
+// emboss.  A standard button is a near-white face in a hairline frame whose
+// bottom edge is a shade darker, which is all the "elevation" there is.  It
+// greys slightly under the pointer, and pressing it drops the darker bottom
+// edge and dims the label.  A coloured button (the accent "suggested" one, or
+// destructive) is filled with its colour and lightens on hover and press.
+
+@function _border_color($c, $darker: false) {
+  @if $darker == true { @return darken($c, 12%); }
+  @else { @return $c; }
+}
+
+@function _text_shadow_color ($tc: $fg_color, $bg: $bg_color) {
+  @return transparent;
+}
+
+@function _button_hilight_color($c) {
+  @return transparent;
+}
+
+@mixin _button_text_shadow ($tc:$fg_color, $bg:$bg_color) {
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+}
+
+@mixin button($t, $c:$bg_color, $tc:$fg_color, $edge: none, $backimage: null) {
+//
+// $t: normal, hover, active, insensitive, insensitive-active,
+//     backdrop, backdrop-active, backdrop-insensitive,
+//     backdrop-insensitive-active, normal-alt, hover-alt,
+//     osd, osd-hover, osd-active, osd-insensitive, osd-backdrop, undecorated
+//
+// A button counts as "coloured" when it is given a base colour other than the
+// window background or the header bar colour (which is the same colour here).
+//
+  $_colored: ($c != $bg_color and $c != $headerbar_color);
+
+  @if $t==normal or $t==backdrop or $t==normal-alt {
+    @if $_colored {
+      color: $tc;
+      outline-color: transparentize($tc, 0.3);
+      border-color: $c;
+      border-bottom-color: _border_color($c, true);
+      background-image: image($c), $backimage;
+    }
+    @else {
+      color: $fg_color;
+      outline-color: transparentize($fg_color, 0.1);
+      border-color: $borders_color;
+      border-bottom-color: $alt_borders_color;
+      background-image: image($control_color), $backimage;
+    }
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    box-shadow: none;
+  }
+
+  @else if $t==hover or $t==hover-alt {
+    @if $_colored {
+      color: $tc;
+      border-color: mix($c, white, 90%);
+      border-bottom-color: _border_color($c, true);
+      background-image: image(mix($c, white, 90%)), $backimage;
+    }
+    @else {
+      color: $fg_color;
+      border-color: $borders_color;
+      border-bottom-color: $alt_borders_color;
+      background-image: image($control_hover_color), $backimage;
+    }
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    box-shadow: none;
+  }
+
+  @else if $t==active or $t==backdrop-active {
+    @if $_colored {
+      color: transparentize($tc, 0.2);
+      border-color: mix($c, white, 80%);
+      background-image: image(mix($c, white, 80%));
+    }
+    @else {
+      color: $control_active_text_color;
+      border-color: $borders_color;
+      background-image: image($control_active_color);
+    }
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+
+  @else if $t==insensitive or $t==backdrop-insensitive or
+           $t==insensitive-active or $t==backdrop-insensitive-active {
+    @if $_colored {
+      color: white;
+      border-color: transparent;
+      background-image: image(#c8c8c8);
+    }
+    @else {
+      color: $insensitive_fg_color;
+      border-color: $borders_color;
+      background-image: image($control_disabled_color);
+    }
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    box-shadow: none;
+  }
+
+  @else if $t==osd {
+    $_bg: if($c != $bg_color, transparentize($c, 0.5), $osd_bg_color);
+
+    color: $osd_fg_color;
+    border-color: $osd_borders_color;
+    background-color: transparent;
+    background-image: image($_bg);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    outline-color: transparentize($osd_fg_color, 0.7);
+  }
+
+  @else if $t==osd-hover {
+    $_bg: if($c != $bg_color, transparentize($c, 0.3), lighten($osd_bg_color, 12%));
+
+    color: white;
+    border-color: $osd_borders_color;
+    background-color: transparent;
+    background-image: image($_bg);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    outline-color: transparentize($osd_fg_color, 0.7);
+  }
+
+  @else if $t==osd-active {
+    $_bg: if($c != $bg_color, $c, $osd_borders_color);
+
+    color: white;
+    border-color: $osd_borders_color;
+    background-color: transparent;
+    background-image: image($_bg);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    outline-color: transparentize($osd_fg_color, 0.7);
+  }
+
+  @else if $t==osd-insensitive {
+    color: $osd_insensitive_fg_color;
+    border-color: $osd_borders_color;
+    background-color: transparent;
+    background-image: image($osd_insensitive_bg_color);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+
+  @else if $t==osd-backdrop {
+    $_bg: if($c != $bg_color, transparentize($c, 0.5), $osd_bg_color);
+
+    color: $osd_fg_color;
+    border-color: $osd_borders_color;
+    background-color: transparent;
+    background-image: image($_bg);
+    background-clip: padding-box;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+
+  @else if $t==undecorated {
+    border-color: transparent;
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+  }
+}
+
+@mixin headerbar_fill($c:$headerbar_color, $hc:$top_hilight, $ov: none) {
+//
+// header bars are a flat band of the window colour, as a Windows 11 title
+// area is.
+//
+  @if $ov != none { background: $c $ov; }
+  @else { background: $c; }
+
+  box-shadow: none;
+}
+
+@mixin overshoot($p, $t:normal, $c:$fg_color) {
+//
+// overshoot
+//
+// $p: position
+// $t: type
+// $c: base color
+//
+// possible $p values:
+// top, bottom, right, left
+//
+// possible $t values:
+// normal, backdrop
+//
+
+  $_small_gradient_length: 5%;
+  $_big_gradient_length: 100%;
+
+  $_position: center top;
+  $_small_gradient_size: 100% $_small_gradient_length;
+  $_big_gradient_size: 100% $_big_gradient_length;
+
+  @if $p==bottom {
+    $_position: center bottom;
+    $_linear_gradient_direction: to top;
+  }
+
+  @else if $p==right {
+    $_position: right center;
+    $_small_gradient_size: $_small_gradient_length 100%;
+    $_big_gradient_size: $_big_gradient_length 100%;
+  }
+
+  @else if $p==left {
+    $_position: left center;
+    $_small_gradient_size: $_small_gradient_length 100%;
+    $_big_gradient_size: $_big_gradient_length 100%;
+  }
+
+  $_small_gradient_color: $c;
+  $_big_gradient_color: $c;
+
+  @if $c==$fg_color {
+    $_small_gradient_color: darken($borders_color, 10%);
+    $_big_gradient_color: $fg_color;
+
+    @if $t==backdrop { $_small_gradient_color: $backdrop_borders_color; }
+  }
+
+  $_small_gradient: -gtk-gradient(radial,
+                                  $_position, 0,
+                                  $_position, 0.5,
+                                  to($_small_gradient_color),
+                                  to(transparentize($_small_gradient_color, 1)));
+
+  $_big_gradient: -gtk-gradient(radial,
+                                $_position, 0,
+                                $_position, 0.6,
+                                from(transparentize($_big_gradient_color, 0.93)),
+                                to(transparentize($_big_gradient_color, 1)));
+
+  @if $t==normal {
+    background-image: $_small_gradient, $_big_gradient;
+    background-size: $_small_gradient_size, $_big_gradient_size;
+  }
+
+  @else if $t==backdrop {
+    background-image: $_small_gradient;
+    background-size: $_small_gradient_size;
+  }
+
+  background-repeat: no-repeat;
+  background-position: $_position;
+
+  background-color: transparent; // reset some properties to be sure to not inherit them somehow
+  border: none;                  //
+  box-shadow: none;              //
+}
+
+/***************************
+ * Check and Radio buttons *
+ ***************************/
+
+ @mixin check($t, $c:$bg_color, $tc:$fg_color, $checked: false) {
+  // Windows 11 check boxes and radio buttons.
+  //
+  // Unchecked: a faint grey wash inside a strong grey rim, deepening on
+  // hover and press.  Checked: filled with the accent colour (rim and all),
+  // the glyph white, lightening on hover and press.  Disabled: the rim and
+  // the fill go to a pale grey.
+  //
+  // $t: normal, hover, active, insensitive, backdrop, backdrop-insensitive
+
+  @if $t==normal or $t==backdrop {
+    background-clip: border-box;
+    background-image: if($checked, image($accent_color), image(rgba(0, 0, 0, 0.0241)));
+    border-color: if($checked, $accent_color, $strong_borders_color);
+    box-shadow: none;
+    color: if($checked, $tc, $fg_color);
+  }
+
+  @if $t==hover {
+    background-image: if($checked, image($accent_hover_color), image(rgba(0, 0, 0, 0.0578)));
+    border-color: if($checked, $accent_hover_color, $strong_borders_color);
+  }
+
+  @if $t==active {
+    background-image: if($checked, image($accent_active_color), image(rgba(0, 0, 0, 0.0924)));
+    border-color: if($checked, $accent_active_color, rgba(0, 0, 0, 0.2169));
+    box-shadow: none;
+  }
+
+  @if $t==insensitive or $t==backdrop-insensitive {
+    box-shadow: none;
+    background-image: if($checked, image(rgba(0, 0, 0, 0.2169)), none);
+    border-color: if($checked, transparent, rgba(0, 0, 0, 0.2169));
+    color: if($checked, white, $insensitive_fg_color);
+  }
+}

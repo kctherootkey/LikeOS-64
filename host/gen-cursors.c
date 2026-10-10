@@ -3,12 +3,26 @@
  *
  * Writes Xcursor-format files for the BUSY cursors: an animated hourglass in
  * the style of the one Windows XP used, and the pointer-with-hourglass that
- * means "starting, but you can still click".
+ * means "starting, but you can still click".  And for the RESIZE and LINK
+ * pointers, in the core font's own black-on-white style (see build_bitmap).
  *
  * Why this exists: with no cursor theme installed, libXcursor falls back to the
  * X core cursor font, whose "watch" is a 1-bit black-and-white wristwatch from
  * the 1980s.  Xcursor's format is ARGB and supports animation, so the busy
  * cursor can be something a person recognises.
+ *
+ * The resize and link pointers exist for a different reason: GTK asks for
+ * them by CSS name ("col-resize", "nwse-resize") and, when a theme does not
+ * have that name, by an old theme name ("h_double_arrow", "bd_double_arrow")
+ * -- neither of which is in the core font.  With nothing answering, GDK
+ * settles for the plain arrow, so the divider between two panes and a list's
+ * column edge looked like nothing could be done there.
+ *
+ * The link pointer is the plain arrow: every name a hand is asked for by --
+ * "pointer" and "hand" from GTK and WebKit, the core font's "hand1" and
+ * "hand2", which libX11 also looks up in the theme -- gets the core arrow
+ * itself, so pointing at a link, a button or an attachment does not change
+ * the pointer.  The core font's hand looked out of place over a web page.
  *
  * Why GENERATED rather than committed as binaries: the artwork is geometry --
  * two funnels, a neck, and a sand level that moves -- so it is shorter and far
@@ -426,6 +440,14 @@ static const char CORE_PTR[PTR_H][PTR_W + 1] = {
 	"      ..  ",
 };
 
+/* The same rows, in the form the one-image cursors below take. */
+static const char *const CORE_PTR_ROWS[PTR_H] = {
+	CORE_PTR[0], CORE_PTR[1], CORE_PTR[2], CORE_PTR[3],
+	CORE_PTR[4], CORE_PTR[5], CORE_PTR[6], CORE_PTR[7],
+	CORE_PTR[8], CORE_PTR[9], CORE_PTR[10], CORE_PTR[11],
+	CORE_PTR[12], CORE_PTR[13], CORE_PTR[14], CORE_PTR[15],
+};
+
 /* ---- Palette ------------------------------------------------------------ */
 
 /*
@@ -683,6 +705,132 @@ static void build_ptr_watch(const char *dir, const char *name)
 		free(fr[i].px);
 }
 
+/* ---- The resize and link pointers ----------------------------------------- */
+
+/*
+ * One-image cursors in the core font's construction: black body ('#') on a
+ * one-pixel white surround ('.'), shown at one fixed size like the core arrow
+ * they sit beside (see build_ptr_watch on why such a cursor must not come in
+ * sizes).
+ *
+ * The horizontal and vertical double arrows are the core glyphs, transcribed
+ * from ports/xorg/font-cursor-misc-1.0.4/cursor.bdf as CORE_PTR is
+ * (sb_h_double_arrow and sb_v_double_arrow, each over its mask).  The core font has no diagonal double arrow -- its corner cursors
+ * are an arrow into a bracket -- so that one is drawn here in the same
+ * weight: two solid heads with five-pixel legs, a two-pixel stair-step shaft
+ * between them, and the white surround grown around the lot (diag_arrow).
+ */
+typedef struct {
+	int w, h, xhot, yhot;
+	const char *const *rows;
+} bitmap_cursor;
+
+static const char *const H_ARROW_ROWS[] = {
+	"   ..     ..   ",
+	"  .#.     .#.  ",
+	" .##.......##. ",
+	".#############.",
+	"####.......####",
+	".#############.",
+	" .##.......##. ",
+	"  .#.     .#.  ",
+	"   ..     ..   ",
+};
+static const bitmap_cursor H_ARROW = { 15, 9, 7, 4, H_ARROW_ROWS };
+
+static const char *const V_ARROW_ROWS[] = {
+	"   .#.   ",
+	"  .###.  ",
+	" .#####. ",
+	".#######.",
+	"...#.#...",
+	"  .#.#.  ",
+	"  .#.#.  ",
+	"  .#.#.  ",
+	"  .#.#.  ",
+	"  .#.#.  ",
+	"...#.#...",
+	".#######.",
+	" .#####. ",
+	"  .###.  ",
+	"   .#.   ",
+};
+static const bitmap_cursor V_ARROW = { 9, 15, 4, 7, V_ARROW_ROWS };
+
+/* The core arrow, for the names a link pointer goes by. */
+static const bitmap_cursor LINK_ARROW = { PTR_W, PTR_H, PTR_XHOT, PTR_YHOT,
+					  CORE_PTR_ROWS };
+
+#define DIAG_N 15
+
+/* The diagonal double arrow from the top-left corner to the bottom-right one
+ * ("\"), or mirrored left to right ("/").  Rows are written into `buf'. */
+static bitmap_cursor diag_arrow(char buf[DIAG_N][DIAG_N + 1],
+				const char *rows[DIAG_N], int mirror)
+{
+	const int n = DIAG_N, leg = 5;
+	static int body[DIAG_N][DIAG_N];
+
+	for (int y = 0; y < n; y++)
+		for (int x = 0; x < n; x++) {
+			int X = n - 1 - x, Y = n - 1 - y;
+
+			body[y][x] =
+				(x >= 1 && y >= 1 && x + y <= leg + 1) ||
+				(X >= 1 && Y >= 1 && X + Y <= leg + 1) ||
+				((x - y == 0 || x - y == 1) && x >= 1 &&
+				 x <= n - 2 && y >= 1 && y <= n - 2);
+		}
+	for (int y = 0; y < n; y++) {
+		for (int x = 0; x < n; x++) {
+			int edge = 0;
+
+			for (int dy = -1; dy <= 1; dy++)
+				for (int dx = -1; dx <= 1; dx++) {
+					int yy = y + dy, xx = x + dx;
+
+					if (yy >= 0 && yy < n && xx >= 0 &&
+					    xx < n && body[yy][xx])
+						edge = 1;
+				}
+			buf[y][mirror ? n - 1 - x : x] =
+				body[y][x] ? '#' : (edge ? '.' : ' ');
+		}
+		buf[y][n] = '\0';
+		rows[y] = buf[y];
+	}
+	return (bitmap_cursor){ n, n, n / 2, n / 2, rows };
+}
+
+static void build_bitmap(const char *dir, const char *name,
+			 const bitmap_cursor *bc)
+{
+	canvas *c = canvas_new(bc->w, bc->h);
+	frame fr;
+
+	for (int y = 0; y < bc->h; y++)
+		for (int x = 0; x < bc->w; x++) {
+			char ch = bc->rows[y][x];
+
+			if (ch != ' ')
+				blend(&c->p[(size_t)y * c->w + x],
+				      ch == '#' ? OUTLINE : HILITE, 1.0);
+		}
+	fr.size = 32;
+	fr.w = bc->w;
+	fr.h = bc->h;
+	fr.xhot = bc->xhot;
+	fr.yhot = bc->yhot;
+	fr.delay = 0;
+	fr.px = canvas_argb(c);
+	canvas_free(c);
+
+	char path[1024];
+	snprintf(path, sizeof path, "%s/cursors/%s", dir, name);
+	write_xcursor(path, &fr, 1);
+	free(fr.px);
+}
+
 /* Aliases are written as copies rather than symlinks: the image is built into
  * an ext4 filesystem by a tool that need not preserve links, and the files are
  * small. */
@@ -733,6 +881,53 @@ int main(int argc, char **argv)
 	copy_file(dir, "watch", "wait");
 	copy_file(dir, "left_ptr_watch", "progress");
 	copy_file(dir, "left_ptr_watch", "half-busy");
+
+	/* The resize pointers, under every name they are asked for by: the
+	 * core font's (which libX11 looks up in the theme too, so ctwm's
+	 * window-edge cursors are these), GTK's CSS names, and the older
+	 * theme names GTK falls back to.  Edges get the double arrow across
+	 * them and corners the diagonal one, as on Windows -- not the core
+	 * font's arrow-into-a-bracket. */
+	static const char *const h_names[] = {
+		"h_double_arrow", "col-resize", "ew-resize", "e-resize",
+		"w-resize", "left_side", "right_side", "size_hor", NULL
+	};
+	static const char *const v_names[] = {
+		"v_double_arrow", "row-resize", "ns-resize", "n-resize",
+		"s-resize", "top_side", "bottom_side", "size_ver", NULL
+	};
+	static const char *const nwse_names[] = {
+		"nwse-resize", "nw-resize", "se-resize", "top_left_corner",
+		"bottom_right_corner", "size_fdiag", NULL
+	};
+	static const char *const nesw_names[] = {
+		"nesw-resize", "ne-resize", "sw-resize", "top_right_corner",
+		"bottom_left_corner", "size_bdiag", NULL
+	};
+	static const char *const link_names[] = {
+		"pointer", "pointing_hand", "hand", "hand1", "hand2", NULL
+	};
+	char diag_buf[DIAG_N][DIAG_N + 1];
+	const char *diag_rows[DIAG_N];
+	bitmap_cursor diag;
+
+	build_bitmap(dir, "sb_h_double_arrow", &H_ARROW);
+	for (int i = 0; h_names[i]; i++)
+		copy_file(dir, "sb_h_double_arrow", h_names[i]);
+	build_bitmap(dir, "sb_v_double_arrow", &V_ARROW);
+	for (int i = 0; v_names[i]; i++)
+		copy_file(dir, "sb_v_double_arrow", v_names[i]);
+	diag = diag_arrow(diag_buf, diag_rows, 0);
+	build_bitmap(dir, "bd_double_arrow", &diag);
+	for (int i = 0; nwse_names[i]; i++)
+		copy_file(dir, "bd_double_arrow", nwse_names[i]);
+	diag = diag_arrow(diag_buf, diag_rows, 1);
+	build_bitmap(dir, "fd_double_arrow", &diag);
+	for (int i = 0; nesw_names[i]; i++)
+		copy_file(dir, "fd_double_arrow", nesw_names[i]);
+	build_bitmap(dir, link_names[0], &LINK_ARROW);
+	for (int i = 1; link_names[i]; i++)
+		copy_file(dir, link_names[0], link_names[i]);
 
 	snprintf(path, sizeof path, "%s/index.theme", dir);
 	f = fopen(path, "w");

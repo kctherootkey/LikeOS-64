@@ -1,0 +1,439 @@
+Fancy on the WebKitGTK 4 API, the compose header built before its signals
+fire, and the file chooser treated as the native dialog it is.
+
+1. The Fancy HTML viewer still connected two signals of the old WebKit API
+   ("resource-request-starting", "resource-load-failed") that a
+   WebKitWebView no longer has -- GObject criticals on every message.  Remote
+   content is already filtered by the web extension's send-request handler
+   and cid: parts are served by the "cid" URI scheme, so the request handler
+   goes; load errors are now taken from each resource's "failed" signal.
+
+2. Its context-menu handler walked WebKit's menu with gtk_container_foreach()
+   and appended a GtkMenuItem to it, but the menu is a WebKitContextMenu, not
+   a GtkMenu: a critical on every right-click, and none of it ever worked.
+   The viewer's entries are now WebKitContextMenuItems made from GActions:
+   links open in the browser and download with the viewer's own download,
+   "Open Link" in the view only while remote content may be loaded, and
+   RSSyl's "Import feed".  The link is copied, since the hit-test result it
+   comes from does not outlive the signal.  The never-implemented image
+   stubs are gone; WebKit's own image entries stay.
+
+3. The web extension set G_MESSAGES_DEBUG for its own log domain at start-up,
+   printing its debug messages from every web process; they now show only
+   when asked for (G_MESSAGES_DEBUG=Fancy-Web-Ext).
+
+4. Opening a compose window: the From name's "changed" handler was connected
+   before the name was filled in, and retitled the window from a subject
+   entry and a window that did not exist yet (criticals from
+   gtk_editable_get_chars and gtk_window_set_title).  Connected afterwards.
+
+5. filesel.c made a GtkFileChooserNative transient and modal with the
+   GtkWindow calls (criticals at every attach/save); it uses the native
+   dialog calls now.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/compose.c
++++ b/src/compose.c
+@@ -8435,13 +8435,6 @@
+ 	hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, HSPACING_NARROW);
+ 	from_name = gtk_entry_new();
+ 	
+-	g_signal_connect_after(G_OBJECT(from_name), "grab_focus",
+-			 G_CALLBACK(compose_grab_focus_cb), compose);
+-	g_signal_connect_after(G_OBJECT(from_name), "changed",
+-			 G_CALLBACK(compose_changed_cb), compose);
+-	g_signal_connect_after(G_OBJECT(from_name), "activate",
+-			 G_CALLBACK(from_name_activate_cb), optmenu);
+-
+ 	for (; accounts != NULL; accounts = accounts->next, num++) {
+ 		PrefsAccount *ac = (PrefsAccount *)accounts->data;
+ 		gchar *name, *from = NULL;
+@@ -8481,6 +8474,16 @@
+ 		g_free(from);
+ 	}
+ 
++	/* Connected only now: filling in the From name above emits "changed",
++	 * and compose_changed_cb() retitles the window from the subject entry
++	 * -- neither of which exists yet while the header is being built. */
++	g_signal_connect_after(G_OBJECT(from_name), "grab_focus",
++			 G_CALLBACK(compose_grab_focus_cb), compose);
++	g_signal_connect_after(G_OBJECT(from_name), "changed",
++			 G_CALLBACK(compose_changed_cb), compose);
++	g_signal_connect_after(G_OBJECT(from_name), "activate",
++			 G_CALLBACK(from_name_activate_cb), optmenu);
++
+ 	gtk_combo_box_set_active(GTK_COMBO_BOX(optmenu), def_menu);
+ 
+ 	g_signal_connect(G_OBJECT(optmenu), "changed",
+--- a/src/gtk/filesel.c
++++ b/src/gtk/filesel.c
+@@ -105,12 +105,13 @@
+ 
+ 	}
+ 
+-	if (action == GTK_FILE_CHOOSER_ACTION_SAVE) {
+-		gtk_dialog_set_default_response(GTK_DIALOG(chooser), GTK_RESPONSE_ACCEPT);
+-	}
+-
+-	manage_window_set_transient(GTK_WINDOW(chooser));
+-	gtk_window_set_modal(GTK_WINDOW(chooser), TRUE);
++	/* A GtkFileChooserNative is not a window: it is made transient and
++	 * modal through the native-dialog calls, and its accept button is the
++	 * default already. */
++	if (focus_window)
++		gtk_native_dialog_set_transient_for(GTK_NATIVE_DIALOG(chooser),
++						    GTK_WINDOW(focus_window));
++	gtk_native_dialog_set_modal(GTK_NATIVE_DIALOG(chooser), TRUE);
+ 
+ 	gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(chooser), multiple_files);
+ 
+--- a/src/plugins/fancy/fancy_viewer.c
++++ b/src/plugins/fancy/fancy_viewer.c
+@@ -55,8 +55,6 @@
+ 		  gboolean case_sens);
+ */
+ 
+-static void
+-viewer_menu_handler(GtkWidget *menuitem, FancyViewer *viewer);
+ 
+ static gint keypress_events_cb (GtkWidget *widget, GdkEventKey *event,
+ 								FancyViewer *viewer);
+@@ -443,6 +441,7 @@
+ 	FancyViewer *viewer = (FancyViewer *) _viewer;
+ 	fancy_prefs.zoom_level = (int) webkit_web_view_get_zoom_level(viewer->view) * 100;
+ 	debug_print("fancy_destroy_viewer\n");
++	g_free(viewer->menu_link);
+ 	g_free(viewer->filename);
+ 	g_free(viewer);
+ }
+@@ -515,52 +514,6 @@
+ 	g_free(image);
+ }
+ 
+-static void resource_request_starting_cb(WebKitWebView		*view,
+-					 WebKitWebResource	*resource,
+-					 WebKitURIRequest	*request,
+-					 WebKitURIResponse	*response,
+-					 FancyViewer		*viewer)
+-{
+-	const gchar *uri = webkit_uri_request_get_uri(request);
+-	gchar *filename;
+-	gchar *image;
+-	gint err;
+-	MimeInfo *partinfo = viewer->to_load;
+-
+-	filename = viewer->filename;
+-	if ((!g_ascii_strncasecmp(uri, "cid:", 4)) || (!g_ascii_strncasecmp(uri, "mid:", 4))) {
+-		image = g_strconcat("<", uri + 4, ">", NULL);
+-		while ((partinfo = procmime_mimeinfo_next(partinfo)) != NULL) {
+-			if (partinfo->id && !g_ascii_strcasecmp(image, partinfo->id)) {
+-				filename = procmime_get_tmp_file_name(partinfo);
+-				if (!filename) {
+-					g_free(image);
+-					return;
+-				}
+-				if ((err = procmime_get_part(filename, partinfo)) < 0)
+-					alertpanel_error(_("Couldn't save the part of multipart message: %s"),
+-										g_strerror(-err));
+-				gchar *file_uri = g_filename_to_uri(filename, NULL, NULL);
+-				webkit_uri_request_set_uri(request, file_uri);
+-				g_free(file_uri);
+-				g_free(filename);
+-				break;
+-			}
+-		}
+-		g_free(image);
+-	}
+-	
+-	/* refresh URI that may have changed */
+-	uri = webkit_uri_request_get_uri(request);
+-	if (!viewer->override_prefs_remote_content
+-	    && strncmp(uri, "file://", 7) && strncmp(uri, "data:", 5)) {
+-		debug_print("Preventing load of %s\n", uri);
+-		webkit_uri_request_set_uri(request, "about:blank");
+-	}
+-	else
+-		debug_print("Starting request of %"G_GSIZE_FORMAT" %s\n", strlen(uri), uri);
+-}
+-
+ /*static gboolean fancy_text_search(MimeViewer *_viewer, gboolean backward,
+ 				  const gchar *str, gboolean case_sens)
+ {
+@@ -835,107 +788,44 @@
+ #endif
+ }
+ 
+-static void save_image_cb(GtkWidget *widget, FancyViewer *viewer)
+-{
+-	debug_print("Not Yet Implemented\n");
+-}
+-
+-static void open_image_cb(GtkWidget *widget, FancyViewer *viewer)
+-{
+-	debug_print("Not Yet Implemented\n");
+-}
+-
+-static void copy_image_cb(GtkWidget *widget, FancyViewer *viewer)
+-{
+-	debug_print("Not Yet Implemented\n");
+-}
+ static void import_feed_cb(GtkWidget *widget, FancyViewer *viewer)
+ {
+ 	if (!folder_subscribe(viewer->cur_link))
+ 		alertpanel_error(_("%s is a malformed or not supported feed"), viewer->cur_link);
+ }
+-static void viewer_menu_handler(GtkWidget *menuitem, FancyViewer *viewer)
++/* The viewer's own entries in WebKit's context menu.  WebKit's menu is a
++ * WebKitContextMenu of WebKitContextMenuItems, not a GtkMenu: an entry is
++ * replaced by an item made from a GAction, and the link it acts on is kept
++ * here because the hit-test result it came from does not outlive the menu
++ * signal. */
++static void fancy_menu_action_cb(GSimpleAction *action, GVariant *parameter,
++				 gpointer data)
+ {
+-	const gchar *g_name = gtk_widget_get_name(GTK_WIDGET(menuitem));
+-	if (!g_ascii_strcasecmp(g_name, "GtkMenuItem")) {
+-
+-		GtkWidget *menul = gtk_bin_get_child(GTK_BIN(menuitem));
+-/*
+-        	if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-					"Search the Web")) {
+-				gtk_label_set_text(GTK_LABEL(menul), _("Search the Web"));
+-				viewer->cur_link = NULL;
+-				GtkMenuItem *m_search = GTK_MENU_ITEM(menuitem);
+-				g_signal_connect(G_OBJECT(m_search), "activate",
+-						 G_CALLBACK(search_the_web_cb),
+-						 (gpointer *) viewer);
+-		}
+-*/
+-		if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-					"Open Link" )) {
+-
+-			gtk_label_set_text(GTK_LABEL(menul), _("Open in Viewer"));
+-
+-			GtkMenuItem *m_new = GTK_MENU_ITEM(menuitem);
+-			gtk_widget_set_sensitive(GTK_WIDGET(m_new), viewer->override_prefs_remote_content);
+-		}
+-
+-		if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-								"Open Link in New Window" )) {
+-
+-			gtk_label_set_text(GTK_LABEL(menul), _("Open in Browser"));
+-
+-			GtkMenuItem *m_new = GTK_MENU_ITEM(menuitem);
+-			g_signal_connect(G_OBJECT(m_new), "activate",
+-					 G_CALLBACK(open_in_browser_cb),
+-					 (gpointer *) viewer);
+-		}
+-
+-		if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-					"Open Image in New Window" )) {
+-			gtk_label_set_text(GTK_LABEL(menul), _("Open Image"));
+-			GtkMenuItem *m_image = GTK_MENU_ITEM(menuitem);
+-			g_signal_connect(G_OBJECT(m_image), "activate",
+-					 G_CALLBACK(open_image_cb),
+-					 (gpointer *) viewer);
+-		}
+-
+-		if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-					"Copy Link Location" )) {
+-			gtk_label_set_text(GTK_LABEL(menul), _("Copy Link"));
+-		}
+-
+-        	if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-				"Download Linked File" )) {
+-			gtk_label_set_text(GTK_LABEL(menul), _("Download Link"));
+-
+-			GtkMenuItem *m_dlink = GTK_MENU_ITEM(menuitem);
+-			g_signal_connect(G_OBJECT(m_dlink), "activate",
+-					 G_CALLBACK(download_file_cb),
+-					 (gpointer *) viewer);
+-		}
+-
+-		if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-					"Save Image As" )) {
+-
+-			gtk_label_set_text(GTK_LABEL(menul), _("Save Image As"));
+-
+-			GtkMenuItem *m_simage = GTK_MENU_ITEM(menuitem);
+-			g_signal_connect(G_OBJECT(m_simage), "activate",
+-					 G_CALLBACK(save_image_cb),
+-					 (gpointer *) viewer);
+-		}
+-
+-		if (!g_ascii_strcasecmp(gtk_label_get_text(GTK_LABEL(menul)),
+-					"Copy Image" )) {
+-			gtk_label_set_text(GTK_LABEL(menul), _("Copy Image"));
+-			GtkMenuItem *m_cimage = GTK_MENU_ITEM(menuitem);
+-			g_signal_connect(G_OBJECT(m_cimage), "activate",
+-					 G_CALLBACK(copy_image_cb),
+-					 (gpointer *) viewer);
+-		}
++	FancyViewer *viewer = (FancyViewer *)data;
++	const gchar *name = g_action_get_name(G_ACTION(action));
+ 
+-	}
++	viewer->cur_link = viewer->menu_link;
++	if (!strcmp(name, "open-in-browser"))
++		open_in_browser_cb(NULL, viewer);
++	else if (!strcmp(name, "download-link"))
++		download_file_cb(NULL, viewer);
++	else if (!strcmp(name, "import-feed"))
++		import_feed_cb(NULL, viewer);
++}
++
++static WebKitContextMenuItem *fancy_menu_item(FancyViewer *viewer,
++					      const gchar *action_name,
++					      const gchar *label)
++{
++	GSimpleAction *action = g_simple_action_new(action_name, NULL);
++	WebKitContextMenuItem *item;
++
++	g_signal_connect(action, "activate", G_CALLBACK(fancy_menu_action_cb),
++			 viewer);
++	item = webkit_context_menu_item_new_from_gaction(G_ACTION(action),
++							 label, NULL);
++	g_object_unref(action);
++	return item;
+ }
+ 
+ static gboolean context_menu_cb (WebKitWebView *view, WebKitContextMenu *menu,
+@@ -953,26 +843,47 @@
+ 
+ 	debug_print("context %d, link-uri '%s'\n", context,
+ 			(link_uri != NULL ? link_uri : "(null)"));
++	g_free(viewer->menu_link);
++	viewer->menu_link = NULL;
+ 	if (context & WEBKIT_HIT_TEST_RESULT_CONTEXT_LINK &&
+-			link_uri != NULL) {
+-		if (viewer != NULL && viewer->cur_link != NULL) {
+-            /* g_object_get() already made a copy, no need to strdup() here */
+-            viewer->cur_link = link_uri;
+-        }
+-	}
++			link_uri != NULL)
++		viewer->menu_link = g_strdup(link_uri);
+ 
+-	gtk_container_foreach(GTK_CONTAINER(menu),
+-			      (GtkCallback)viewer_menu_handler,
+-			      viewer);
+-
+-	if (plugin) {
+-		GtkWidget *rssyl = gtk_menu_item_new_with_label(_("Import feed"));
+-		gtk_widget_show(GTK_WIDGET(rssyl));
+-		gtk_menu_shell_append(GTK_MENU_SHELL(menu), rssyl);
+-		g_signal_connect(G_OBJECT(rssyl), "activate",
+-				 G_CALLBACK(import_feed_cb),
+-				 (gpointer *) viewer);
+-	}
++	/* Links open in the browser and download with the viewer's own
++	 * download, as the viewer's menu always did, rather than in a new
++	 * web view window; "Open Link" (in this view) only while remote
++	 * content may be loaded. */
++	GList *items = g_list_copy(webkit_context_menu_get_items(menu));
++	for (GList *l = items; l != NULL; l = l->next) {
++		WebKitContextMenuItem *item = l->data;
++		WebKitContextMenuItem *mine = NULL;
++		gint pos;
++
++		switch (webkit_context_menu_item_get_stock_action(item)) {
++		case WEBKIT_CONTEXT_MENU_ACTION_OPEN_LINK_IN_NEW_WINDOW:
++			mine = fancy_menu_item(viewer, "open-in-browser",
++					       _("Open in Browser"));
++			break;
++		case WEBKIT_CONTEXT_MENU_ACTION_DOWNLOAD_LINK_TO_DISK:
++			mine = fancy_menu_item(viewer, "download-link",
++					       _("Download Link"));
++			break;
++		case WEBKIT_CONTEXT_MENU_ACTION_OPEN_LINK:
++			if (!viewer->override_prefs_remote_content)
++				webkit_context_menu_remove(menu, item);
++			continue;
++		default:
++			continue;
++		}
++		pos = g_list_index(webkit_context_menu_get_items(menu), item);
++		webkit_context_menu_insert(menu, mine, pos);
++		webkit_context_menu_remove(menu, item);
++	}
++	g_list_free(items);
++
++	if (plugin && viewer->menu_link != NULL)
++		webkit_context_menu_append(menu,
++			fancy_menu_item(viewer, "import-feed", _("Import feed")));
+ 
+ 	return FALSE;
+ }
+@@ -1078,14 +989,24 @@
+         webkit_web_view_set_zoom_level(viewer->view, zoom_level);
+ }
+ 
+-static void resource_load_failed_cb(WebKitWebView     *web_view,
+-				    WebKitWebResource *web_resource,
++static void resource_load_failed_cb(WebKitWebResource *web_resource,
+ 				    GError            *error,
+ 				    FancyViewer	      *viewer)
+ {
+ 	debug_print("Loading error: %s\n", error->message);
+ }
+ 
++/* Load errors are reported per resource ("failed" on the resource) in this
++ * WebKit; there is no view-wide signal for them. */
++static void resource_load_started_cb(WebKitWebView *web_view,
++				     WebKitWebResource *web_resource,
++				     WebKitURIRequest *request,
++				     FancyViewer *viewer)
++{
++	g_signal_connect(G_OBJECT(web_resource), "failed",
++			 G_CALLBACK(resource_load_failed_cb), viewer);
++}
++
+ static MimeViewer *fancy_viewer_create(void)
+ {
+ 	FancyViewer    *viewer;
+@@ -1196,8 +1117,6 @@
+ 	g_signal_connect(G_OBJECT(viewer->view), "decide-policy",
+ 			 G_CALLBACK(navigation_policy_cb), viewer);
+ 
+-	g_signal_connect(G_OBJECT(viewer->view), "resource-request-starting",
+-			G_CALLBACK(resource_request_starting_cb), viewer);
+ 	g_signal_connect(G_OBJECT(viewer->view), "context-menu",
+ 			G_CALLBACK(context_menu_cb), viewer);
+ /*	g_signal_connect(G_OBJECT(viewer->view), "button-press-event",
+@@ -1217,8 +1136,8 @@
+ 	g_signal_connect(G_OBJECT(viewer->view), "key_press_event",
+ 			 G_CALLBACK(keypress_events_cb), viewer);
+ 
+-	g_signal_connect(G_OBJECT(viewer->view), "resource-load-failed",
+-			 G_CALLBACK(resource_load_failed_cb), viewer);
++	g_signal_connect(G_OBJECT(viewer->view), "resource-load-started",
++			 G_CALLBACK(resource_load_started_cb), viewer);
+ 
+ 	webkit_web_context_register_uri_scheme(webkit_web_context_get_default(),
+ 			"cid", load_content_cb, viewer, NULL);
+--- a/src/plugins/fancy/fancy_viewer.h
++++ b/src/plugins/fancy/fancy_viewer.h
+@@ -102,6 +102,7 @@
+ 	FILE              *stream;
+ 
+ 	const gchar       *cur_link;
++	gchar             *menu_link;  /* the link a context menu was opened on */
+ 	gchar             *filename;
+ 	MimeInfo          *to_load;
+ 	gulong            doc_handle;
+--- a/src/plugins/fancy/fancy_web_extension.c
++++ b/src/plugins/fancy/fancy_web_extension.c
+@@ -116,9 +116,9 @@
+ 
+ G_MODULE_EXPORT void webkit_web_extension_initialize(WebKitWebExtension *extension)
+ {
+-	if (!g_setenv("G_MESSAGES_DEBUG", G_LOG_DOMAIN, FALSE))
+-		g_warning("could not set G_MESSAGES_DEBUG\n");
+-
++	/* The extension's g_debug() output is shown only when asked for
++	 * (G_MESSAGES_DEBUG=Fancy-Web-Ext); it no longer switches itself on
++	 * in every web process. */
+ 	g_debug("Initializing Fancy web process extension");
+ 
+ 	g_signal_connect(extension,

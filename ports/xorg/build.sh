@@ -190,7 +190,7 @@ pkg_opts() {
 	xkeyboard-config) echo "--disable-runtime-deps --with-xkb-rules-symlink=xorg" ;;
 	xkbcomp) echo "--disable-docs" ;;
 	font-util) echo "--with-fontrootdir=/usr/share/fonts/X11" ;;
-	font-misc-misc | font-cursor-misc)
+	font-misc-misc | font-cursor-misc | font-daewoo-misc | font-isas-misc)
 		# Uncompressed .pcf, because libXfont2 here is built without zlib
 		# ("checking for zlib... no") and cannot read a .pcf.gz.  The
 		# failure that causes is not obvious from the other end: the
@@ -519,6 +519,14 @@ pkg_opts() {
 		      --enable-gnutls --enable-enchant --enable-libetpan \
 		      --enable-fancy-plugin"
 		;;
+	pcre2)
+		# The JIT on, as distributions ship it: GRegex and VTE compile
+		# their patterns to machine code, and VTE reports a library
+		# without it ("PCRE2 library was built without JIT support")
+		# every time a terminal starts.  It needs nothing but anonymous
+		# executable mappings, which JavaScriptCore's JIT already uses.
+		echo "--enable-jit"
+		;;
 	gettext)
 		# The bindings for languages this system has no runtime for, and
 		# the pieces of the tools that would otherwise be configured.
@@ -725,7 +733,16 @@ meson_opts() {
 			drivers="svga,llvmpipe,softpipe"
 			iris=""
 		fi
-		echo "-Dgallium-drivers=$drivers -Dvulkan-drivers=[] $iris \
+		#
+		# b_ndebug=true: assert() compiled out, as in the distribution
+		# builds (Debian/Ubuntu configure Mesa with -Db_ndebug=true).
+		# Mesa's own default (debugoptimized, b_ndebug=if-release) keeps
+		# the debug-only checks, and several of them abort a web process
+		# over state its release code paths handle -- the svga surface
+		# cache, for one, when GL contexts are torn down on two threads
+		# at once during shutdown.
+		echo "-Db_ndebug=true \
+		      -Dgallium-drivers=$drivers -Dvulkan-drivers=[] $iris \
 		      -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=enabled \
 		      -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
 		      -Dllvm=enabled -Dshared-llvm=enabled -Ddraw-use-llvm=true \
@@ -1672,6 +1689,7 @@ is_dataonly() {
 	dejavu-fonts-ttf) return 0 ;;
 	liberation-fonts-ttf) return 0 ;;
 	NotoSans) return 0 ;;
+	Selawik) return 0 ;;
 	hunspell-en_US) return 0 ;;
 	shared-mime-info) return 0 ;;
 	esac
@@ -1749,6 +1767,17 @@ install_data() {
 			[ -f "$f" ] || continue
 			cp -f "$f" \
 				"$SYSROOT/usr/share/fonts/truetype/noto/" ||
+				return 1
+		done
+		;;
+	Selawik)
+		# The five weights as TrueType: regular, bold, light, semibold
+		# and semilight.  The archive's EOT, WOFF and SVG copies are web
+		# formats of the same faces and are left out.
+		mkdir -p "$SYSROOT/usr/share/fonts/truetype/selawik" || return 1
+		for f in selawk.ttf selawkb.ttf selawkl.ttf selawksb.ttf \
+			 selawksl.ttf; do
+			cp -f "$f" "$SYSROOT/usr/share/fonts/truetype/selawik/" ||
 				return 1
 		done
 		;;

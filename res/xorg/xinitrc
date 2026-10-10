@@ -5,6 +5,8 @@
 # session is over and the server shuts down -- so the LAST command runs in the
 # foreground and defines the session's lifetime, and everything before it is a
 # background helper that gets killed when that program ends.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 # System-wide X resources.  The toolkit reads the file named by $XENVIRONMENT as
 # this host's resource file, which gets these defaults to every toolkit client
@@ -112,7 +114,8 @@ fi
 # program that starts before resources are loaded -- or one that consults the
 # environment first, which Xcursor does -- needs it here too.  The theme is
 # generated at image-build time into /usr/share/icons/LikeOS and supplies the
-# busy cursors; everything else falls back to the X core cursor font.
+# busy cursors and the resize and link pointers; everything else falls back to
+# the X core cursor font.
 XCURSOR_THEME=LikeOS
 XCURSOR_SIZE=32
 export XCURSOR_THEME XCURSOR_SIZE

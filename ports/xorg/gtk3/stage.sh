@@ -187,6 +187,9 @@ stage_lib libstartup-notification-1
 stage_lib libxml2
 stage_lib libgtksourceview-4
 stage_lib libmousepad
+# Mousepad scans its plugin directory at start and says so when it is
+# missing; no plugin is built (see build.sh), so it is there and empty.
+mkdir -p "$DEST/usr/lib/mousepad/plugins"
 
 # PCManFM: the file-management library, its GTK half, the XML/string helpers
 # shared with menu-cache, and menu-cache itself.
@@ -575,6 +578,17 @@ if [ -d "$SYSROOT/usr/lib/libfm/modules" ]; then
 		staged=$((staged + 1))
 	done
 fi
+# PCManFM's own module directory.  pcmanfm registers /usr/lib/pcmanfm with
+# libfm at start-up and its install creates it, empty; libfm warns "modules
+# directory is not accessible" for every registered directory it cannot open.
+if [ -f "$SYSROOT/usr/bin/pcmanfm" ]; then
+	mkdir -p "$DEST/usr/lib/pcmanfm"
+	for m in "$SYSROOT"/usr/lib/pcmanfm/*.so; do
+		[ -e "$m" ] || continue
+		cp "$m" "$DEST/usr/lib/pcmanfm/"
+		staged=$((staged + 1))
+	done
+fi
 
 # ---------------------------------------------------------------------------
 # GTK's input modules.
@@ -661,6 +675,13 @@ if [ -d "$SYSROOT/usr/share/fonts/truetype" ]; then
 	cp -a "$SYSROOT/usr/share/fonts/truetype" "$DEST/usr/share/fonts/"
 	staged=$((staged + 1))
 fi
+# Selawik's licence travels with it, as the OFL requires; its release archive
+# carries none, so the text is kept in this repository.
+if [ -d "$DEST/usr/share/fonts/truetype/selawik" ] &&
+	[ -f "$root/res/xorg/gtk3/fonts/Selawik-LICENSE.txt" ]; then
+	cp "$root/res/xorg/gtk3/fonts/Selawik-LICENSE.txt" \
+		"$DEST/usr/share/fonts/truetype/selawik/LICENSE.txt"
+fi
 
 # ---------------------------------------------------------------------------
 # Icon themes.
@@ -669,8 +690,11 @@ fi
 # where the icons actually come from, and is 42MB shipped whole -- so it is
 # not shipped whole:
 #
-#   cursors/          12MB.  A complete X cursor theme, which the X server and
-#                     ctwm already provide; GTK does not read it.
+#   cursors/          12MB.  A complete X cursor theme in Adwaita's style.
+#                     The pointers come from the X core cursor font instead,
+#                     and the ones that font lacks -- the busy, resize and
+#                     link pointers GTK asks for by name -- from the small
+#                     LikeOS theme host/gen-cursors.c generates.
 #   scalable/         SVG, which needs librsvg to render.  That is not ported
 #                     (it would bring a Rust toolchain with it), so gdk-pixbuf
 #                     cannot load a single one of these files.
@@ -933,6 +957,12 @@ if [ -d "$SYSROOT/etc/xdg/luakit" ]; then
 	cp -a "$SYSROOT/etc/xdg/luakit" "$DEST/etc/xdg/"
 	staged=$((staged + 1))
 fi
+# The LikeOS theme (Windows 11 light) over the upstream default theme.lua
+# copied just above -- so it has to come after it.
+if [ -f "$root/res/xorg/gtk3/luakit-theme.lua" ]; then
+	mkdir -p "$DEST/etc/xdg/luakit"
+	cp "$root/res/xorg/gtk3/luakit-theme.lua" "$DEST/etc/xdg/luakit/theme.lua"
+fi
 # The PNG only: the SVG beside it would need librsvg, which is not ported,
 # and the icon lookup falls back to /usr/share/pixmaps by exactly this name.
 if [ -f "$SYSROOT/usr/share/pixmaps/luakit.png" ]; then
@@ -961,7 +991,8 @@ if [ -f "$root/res/xorg/gtk3/settings.ini" ]; then
 	mkdir -p "$DEST/etc/gtk-3.0"
 	cp "$root/res/xorg/gtk3/settings.ini" "$DEST/etc/gtk-3.0/settings.ini"
 fi
-# The theme settings.ini names: Adwaita with light tooltips.
+# The theme settings.ini names: the Windows 11 look, compiled from
+# res/xorg/gtk3/theme/src by res/xorg/gtk3/theme/build.py.
 if [ -f "$root/res/xorg/gtk3/theme/gtk-3.0/gtk.css" ]; then
 	mkdir -p "$DEST/usr/share/themes/LikeOS/gtk-3.0"
 	cp "$root/res/xorg/gtk3/theme/gtk-3.0/gtk.css" \

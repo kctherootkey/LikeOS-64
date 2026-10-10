@@ -1,0 +1,16 @@
+// LikeOS GTK 3 theme: Windows 11, built on Adwaita's widget structure.
+//
+// Compiled to ../gtk-3.0/gtk.css by build.py (any Sass compiler will do:
+// `sassc -t expanded gtk-contained.scss ../gtk-3.0/gtk.css').  Only the light
+// variant exists.
+//
+// Copyright (C) 2026 The LikeOS Project
+// Portions from GTK's Adwaita theme, LGPL-2.1-or-later.
+
+$variant: 'light';
+
+@import 'colors';
+@import 'drawing';
+@import 'common';
+@import 'likeos';
+@import 'colors-public';

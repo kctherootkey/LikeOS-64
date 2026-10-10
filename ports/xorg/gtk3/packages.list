@@ -113,6 +113,14 @@
 # by a growing number of sites.  This is the Latin/Greek/Cyrillic release only
 # -- the full Noto set is hundreds of megabytes of scripts nothing here renders.
 -         NotoSans           v2.015   https://github.com/notofonts/latin-greek-cyrillic/releases/download/NotoSans-%VERSION%/NotoSans-%VERSION%.zip
+
+# Selawik is the desktop's interface font: Microsoft's open-source (SIL OFL 1.1)
+# stand-in for Segoe UI, drawn to Segoe UI's metrics so text set for that face
+# takes the same room.  The GTK theme, the window titles, the taskbar and the
+# desktop labels all use it, and fontconfig answers "Segoe UI" with it (see
+# res/xorg/gtk3/local.conf).  The release zip carries no licence text; the OFL
+# is shipped beside the fonts from res/xorg/gtk3/fonts.
+-         Selawik            1.01     https://github.com/microsoft/Selawik/releases/download/%VERSION%/Selawik_Release.zip
 -         hicolor-icon-theme 0.18     https://icon-theme.freedesktop.org/releases/hicolor-icon-theme-%VERSION%.tar.xz
 -         adwaita-icon-theme 3.38.0   https://download.gnome.org/sources/adwaita-icon-theme/3.38/adwaita-icon-theme-%VERSION%.tar.xz
 

@@ -1,0 +1,134 @@
+// LikeOS theme colours: the Windows 11 light palette.
+//
+// The structure is Adwaita's (these are the names its widget rules use); the
+// values are Windows 11's, taken from the Fluent design tokens of the light
+// theme and checked against screenshots of the real desktop:
+//
+//   Mica window background        #f3f3f3
+//   Layer / control fill          #fbfbfb  (white at 70% over Mica)
+//   Card / text field / list      #ffffff
+//   Text primary                  #1b1b1b  (black at 89.6%)
+//   Text secondary                #616161  (black at 60.6%)
+//   Text disabled                 #a0a0a0  (black at 36.1%)
+//   Control stroke                #e5e5e5  (black at 5.8%)
+//   Control stroke, bottom edge   #cccccc  (black at 16.2%)
+//   Strong stroke                 #868686  (black at 44.6%) - text field edge,
+//                                          check box rim, slider track
+//   Accent (default blue)         #005fb8  (SystemAccentColorDark1, the fill
+//                                          of an accent button)
+//   Accent, as a highlight        #0078d4  (SystemAccentColor: text
+//                                          selection, focus indicators)
+//   Subtle fill, hover            #000000 at 3.7%
+//   Subtle fill, pressed          #000000 at 2.4%
+//
+// Copyright (C) 2026 The LikeOS Project
+// Portions from GTK's Adwaita theme, LGPL-2.1-or-later.
+
+$base_color: #ffffff;
+$text_color: #1b1b1b;
+$caret_color: #1b1b1b;
+$bg_color: #f3f3f3;
+$fg_color: #1b1b1b;
+
+// Accent.  $selected_bg_color is what Adwaita fills selected and "checked"
+// things with; Windows fills an accent button with the darker #005fb8 and
+// highlights selected text with #0078d4.
+$accent_color: #005fb8;
+$accent_hover_color: #1a6ebd;     // accent at 90% over white
+$accent_active_color: #337fc6;    // accent at 80% over white
+$accent_light_color: #0078d4;
+
+$selected_fg_color: #ffffff;
+$selected_bg_color: $accent_light_color;
+$selected_borders_color: $accent_color;
+
+$borders_color: #e5e5e5;
+$alt_borders_color: #cccccc;
+$strong_borders_color: #868686;
+$borders_edge: transparent;
+$link_color: $accent_color;
+$link_visited_color: #003e92;
+$top_hilight: transparent;
+$dark_fill: #ebebeb;
+$headerbar_color: $bg_color;
+$menu_color: #f9f9f9;
+$popover_bg_color: #f9f9f9;
+$popover_hover_color: #f0f0f0;
+
+// Fills for "subtle" controls -- flat buttons, list rows, menu items -- which
+// show no fill at rest and a faint grey wash when pointed at or pressed.
+$subtle_hover_color: rgba(0, 0, 0, 0.0373);
+$subtle_active_color: rgba(0, 0, 0, 0.0241);
+
+// Raised controls (buttons, combo boxes, spin buttons): white at 70% over
+// Mica at rest, a shade darker on hover, and the pressed look.
+$control_color: #fbfbfb;
+$control_hover_color: #f6f6f6;
+$control_active_color: #f5f5f5;
+$control_disabled_color: #f9f9f9;
+$secondary_text_color: #616161;
+$control_active_text_color: #5d5d5d;
+
+// File-manager style list selection: the light blue Windows has always used
+// for selected items in a file list, with the text left dark.
+$list_hover_color: #e5f3ff;
+$list_selected_color: #cce8ff;
+$list_selected_hover_color: #c4e1fa;
+
+$scrollbar_bg_color: rgba(249, 249, 249, 0.96);
+$scrollbar_slider_color: #8a8a8a;
+$scrollbar_slider_hover_color: #6d6d6d;
+$scrollbar_slider_active_color: #5d5d5d;
+
+// Windows 11's status colours (InfoBar, validation).
+$warning_color: #9d5d00;
+$error_color: #c42b1c;
+$success_color: #0f7b0f;
+$destructive_color: #c42b1c;
+
+$osd_fg_color: #eeeeec;
+$osd_text_color: white;
+$osd_bg_color: rgba(32, 32, 32, 0.9);
+$osd_insensitive_bg_color: transparentize(mix($osd_fg_color, opacify($osd_bg_color, 1), 10%), 0.5);
+$osd_insensitive_fg_color: mix($osd_fg_color, opacify($osd_bg_color, 1), 50%);
+$osd_borders_color: transparentize(black, 0.3);
+
+$sidebar_bg_color: $bg_color;
+$base_hover_color: $subtle_hover_color;
+
+$tooltip_borders_color: #d3d3d3;
+$shadow_color: rgba(0, 0, 0, 0.14);
+
+$drop_target_color: $accent_light_color;
+
+//insensitive state derived colors
+$insensitive_fg_color: #a0a0a0;
+$insensitive_bg_color: $control_disabled_color;
+$insensitive_borders_color: $borders_color;
+
+// Windows does not dim an unfocused window's content: a window behind
+// another looks exactly like the one in front, apart from its title bar.
+// So the "backdrop" colours are the normal ones.
+$backdrop_base_color: $base_color;
+$backdrop_text_color: $text_color;
+$backdrop_bg_color: $bg_color;
+$backdrop_fg_color: $fg_color;
+$backdrop_insensitive_color: $insensitive_fg_color;
+$backdrop_selected_fg_color: $selected_fg_color;
+$backdrop_borders_color: $borders_color;
+$backdrop_dark_fill: $dark_fill;
+$backdrop_sidebar_bg_color: $sidebar_bg_color;
+
+$backdrop_scrollbar_bg_color: $scrollbar_bg_color;
+$backdrop_scrollbar_slider_color: $scrollbar_slider_color;
+
+$backdrop_menu_color: $menu_color;
+
+//special cased widget colors
+$suggested_bg_color: $accent_color;
+$suggested_border_color: $accent_color;
+$progress_bg_color: $accent_color;
+$progress_border_color: $accent_color;
+$checkradio_bg_color: $accent_color;
+$checkradio_fg_color: $selected_fg_color;
+$checkradio_borders_color: $accent_color;

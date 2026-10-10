@@ -92,6 +92,9 @@ int main(int argc, char **argv)
 	g_timeout_add_seconds(PANEL_LOAD_SECS, on_tick, area);
 
 	gtk_widget_set_size_request(area, 176, PANEL_HEIGHT);
+	/* Shown before the geometry is parsed: GTK sizes it from the window's
+	 * visible children and warns when there are none. */
+	gtk_widget_show(area);
 	apply_geometry(GTK_WINDOW(win), argc, argv);
 
 	gtk_widget_show_all(win);
