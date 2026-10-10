@@ -1292,10 +1292,22 @@ static void apply_menu_css(void)
 		"  margin: 2px 1px;"
 		"  min-height: 1px;"
 		"}"
+		/* The tooltips match the system theme's: grey text on white
+		 * with a light grey border.  The theme colours the tooltip's
+		 * label itself ("tooltip *"), so the text colour is set there
+		 * too -- on the tooltip alone it would never reach the text. */
 		"tooltip, tooltip.background {"
-		"  background-color: #ffffe1;"
-		"  color: #000000;"
-		"  border: 1px solid #000000;"
+		"  background-color: #ffffff;"
+		"  color: #505050;"
+		"  border: 1px solid #d3d3d3;"
+		"  border-radius: 0;"
+		"  text-shadow: none;"
+		"  box-shadow: none;"
+		"}"
+		"tooltip * {"
+		"  background-color: transparent;"
+		"  color: #505050;"
+		"  text-shadow: none;"
 		"}";
 	GtkCssProvider *p = gtk_css_provider_new();
 

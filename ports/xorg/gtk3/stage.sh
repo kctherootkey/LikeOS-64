@@ -961,6 +961,12 @@ if [ -f "$root/res/xorg/gtk3/settings.ini" ]; then
 	mkdir -p "$DEST/etc/gtk-3.0"
 	cp "$root/res/xorg/gtk3/settings.ini" "$DEST/etc/gtk-3.0/settings.ini"
 fi
+# The theme settings.ini names: Adwaita with light tooltips.
+if [ -f "$root/res/xorg/gtk3/theme/gtk-3.0/gtk.css" ]; then
+	mkdir -p "$DEST/usr/share/themes/LikeOS/gtk-3.0"
+	cp "$root/res/xorg/gtk3/theme/gtk-3.0/gtk.css" \
+		"$DEST/usr/share/themes/LikeOS/gtk-3.0/gtk.css"
+fi
 if [ -f "$root/res/xorg/gtk3/local.conf" ]; then
 	mkdir -p "$DEST/etc/fonts"
 	cp "$root/res/xorg/gtk3/local.conf" "$DEST/etc/fonts/local.conf"

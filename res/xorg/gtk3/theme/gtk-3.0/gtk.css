@@ -1,0 +1,35 @@
+/* LikeOS GTK 3 theme: Adwaita with light tooltips.
+ *
+ * Everything comes from the Adwaita theme compiled into libgtk; only the
+ * tooltips differ.  Adwaita draws them as white text on 80% black, with the
+ * text colour set on the tooltip's children ("tooltip *"), so the colour has
+ * to be overridden there as well as on the tooltip itself.
+ *
+ * Square corners: there is no compositing manager, so a rounded tooltip
+ * window would show its unpainted corners.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
+@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained.css");
+
+tooltip,
+tooltip.background {
+	background-color: #ffffff;
+	color: #505050;
+	border: 1px solid #d3d3d3;
+	border-radius: 0;
+	text-shadow: none;
+	box-shadow: none;
+}
+
+tooltip decoration {
+	background-color: transparent;
+	border-radius: 0;
+}
+
+tooltip * {
+	background-color: transparent;
+	color: #505050;
+	text-shadow: none;
+}
