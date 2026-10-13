@@ -2045,7 +2045,12 @@ void irq_handler(uint64_t *regs)
 	 * the fixed arms below, so a registered device may share a line with
 	 * one of them. */
 	if (irq_dispatch(int_no))
-		return;
+		goto exit;
+	/* Every arm below that handled its interrupt leaves through the
+	 * common exit too: a wake it caused -- a fence signalled by the GPU,
+	 * a timer that expired, input from a USB device -- may want this CPU,
+	 * and returning straight to the interrupted task left the woken one
+	 * queued until the next tick or until that task blocked. */
 
 	// Legacy INTx dispatch for E1000 / e1000e NICs (when MSI is not
 	// available, e.g. VirtualBox).  These MUST be checked BEFORE any
@@ -2062,7 +2067,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_e1000_legacy_irq) {
 			e1000_irq_handler();
 			softirq_drain(); // process queued RX skbs in deferred context
-			return; // e1000_irq_handler calls lapic_eoi()
+			goto exit; // e1000_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2073,7 +2078,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_e1000e_legacy_irq) {
 			e1000e_irq_handler();
 			softirq_drain();
-			return; // e1000e_irq_handler calls lapic_eoi()
+			goto exit; // e1000e_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2084,7 +2089,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_rtl8139_legacy_irq) {
 			rtl8139_irq_handler();
 			softirq_drain();
-			return; // rtl8139_irq_handler calls lapic_eoi()
+			goto exit; // rtl8139_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2095,7 +2100,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_pcnet_legacy_irq) {
 			pcnet32_irq_handler();
 			softirq_drain();
-			return; // pcnet32_irq_handler calls lapic_eoi()
+			goto exit; // pcnet32_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2106,7 +2111,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_ne2k_legacy_irq) {
 			ne2k_irq_handler();
 			softirq_drain();
-			return; // ne2k_irq_handler calls lapic_eoi()
+			goto exit; // ne2k_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2117,7 +2122,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_vmxnet3_legacy_irq) {
 			vmxnet3_irq_handler();
 			softirq_drain();
-			return; // vmxnet3_irq_handler calls lapic_eoi()
+			goto exit; // vmxnet3_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2128,7 +2133,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_eepro100_legacy_irq) {
 			eepro100_irq_handler();
 			softirq_drain();
-			return; // eepro100_irq_handler calls lapic_eoi()
+			goto exit; // eepro100_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2139,7 +2144,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_igb_legacy_irq) {
 			igb_irq_handler();
 			softirq_drain();
-			return; // igb_irq_handler calls lapic_eoi()
+			goto exit; // igb_irq_handler calls lapic_eoi()
 		}
 	}
 	{
@@ -2150,7 +2155,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_tulip_legacy_irq) {
 			tulip_irq_handler();
 			softirq_drain();
-			return; // tulip_irq_handler calls lapic_eoi()
+			goto exit; // tulip_irq_handler calls lapic_eoi()
 		}
 	}
 
@@ -2165,7 +2170,7 @@ void irq_handler(uint64_t *regs)
 		    irq == g_vmsvga_legacy_irq) {
 			if (vmsvga2_irq()) {
 				lapic_eoi();
-				return;
+				goto exit;
 			}
 		}
 	}
@@ -2174,7 +2179,7 @@ void irq_handler(uint64_t *regs)
 	if (int_no == HRTIMER_VECTOR) {
 		hrtimer_irq();
 		lapic_eoi();
-		return;
+		goto exit;
 	}
 
 	// MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
@@ -2185,7 +2190,7 @@ void irq_handler(uint64_t *regs)
 			xhci_irq_service(&g_xhci);
 		}
 		lapic_eoi();
-		return; // Do NOT send PIC EOI for MSI interrupts
+		goto exit; // Do NOT send PIC EOI for MSI interrupts
 	}
 
 	// MSI vector for second xHCI USB controller — vector 49.
@@ -2195,7 +2200,7 @@ void irq_handler(uint64_t *regs)
 			xhci_irq_service(&g_xhci_hid);
 		}
 		lapic_eoi();
-		return;
+		goto exit;
 	}
 
 	// (Legacy NIC dispatch was moved above — see top of irq_handler.)
@@ -2204,28 +2209,28 @@ void irq_handler(uint64_t *regs)
 	if (int_no >= 50 && int_no <= 53) {
 		i2c_hid_irq_handler((uint8_t)int_no);
 		// i2c_hid_irq_handler calls lapic_eoi() internally
-		return;
+		goto exit;
 	}
 
 	// GPIO interrupt vectors for I2C HID devices (vectors 54-57)
 	if (int_no >= 54 && int_no <= 57) {
 		i2c_hid_gpio_irq_handler((uint8_t)int_no);
 		// i2c_hid_gpio_irq_handler calls lapic_eoi() internally
-		return;
+		goto exit;
 	}
 
 	// ACPI SCI interrupt (vector 58) — level-triggered via IOAPIC
 	if (int_no == ACPI_SCI_VECTOR) {
 		acpi_sci_dispatch();
 		lapic_eoi();
-		return;
+		goto exit;
 	}
 
 	// E1000 NIC MSI interrupt (vector 59)
 	if (int_no == E1000_MSI_VECTOR) {
 		e1000_irq_handler();
 		softirq_drain();
-		return; // e1000_irq_handler calls lapic_eoi()
+		goto exit; // e1000_irq_handler calls lapic_eoi()
 	}
 
 	// e1000e NIC MSI interrupt (vector 60)
@@ -2233,7 +2238,7 @@ void irq_handler(uint64_t *regs)
 		extern void e1000e_irq_handler(void);
 		e1000e_irq_handler();
 		softirq_drain();
-		return; // e1000e_irq_handler calls lapic_eoi()
+		goto exit; // e1000e_irq_handler calls lapic_eoi()
 	}
 
 	// vmxnet3 paravirt NIC MSI interrupt (vector 61)
@@ -2241,7 +2246,7 @@ void irq_handler(uint64_t *regs)
 		extern void vmxnet3_irq_handler(void);
 		vmxnet3_irq_handler();
 		softirq_drain();
-		return; // vmxnet3_irq_handler calls lapic_eoi()
+		goto exit; // vmxnet3_irq_handler calls lapic_eoi()
 	}
 
 	// Check for spurious IRQ7 (from master PIC)
@@ -2325,6 +2330,7 @@ void irq_handler(uint64_t *regs)
 	 * Placed after softirq_drain so a wakeup raised by a softirq (e.g. a
 	 * NIC rx that made a polled task runnable) is seen by the preempt
 	 * check. */
+exit:
 	irqentry_exit(regs, 1);
 }
 

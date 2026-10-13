@@ -350,20 +350,34 @@ __no_stack_protector void continue_system_startup(void)
 	// can actually receive the OFFER response.
 	net_start_dhcp();
 
-	timer_init(100);
+	/* The boot CPU's tick: 200 Hz.  That is the rate the system has in fact
+	 * been running at -- the PIT and the LAPIC timer used to fire 100 Hz
+	 * each, on the same vector -- and what everything timed has been tuned
+	 * against; now one source produces it, evenly spaced. */
+	timer_init(200);
 
 	// Use LAPIC timer when available — it was already calibrated in smp_init()
 	// and is 100% reliable on all platforms (QEMU, VMware, bare metal).
 	// PIT delivery via virtual wire (ExtINT→LINT0) is unreliable: VMware
 	// may deliver it sporadically (just enough to pass a tick-detection test,
 	// then nearly stop), causing g_ticks to crawl and all sleeps to hang.
+	//
+	// The PIT is MASKED once the LAPIC timer runs.  Its IRQ0 was unmasked
+	// early in boot and never masked again, and it arrives on the LAPIC
+	// timer's own vector (0x20), so both drove the tick: twice the rate
+	// the timer was set to, from two sources that drift apart.  VMware
+	// measured exactly 200 and the calibration accepted it; a ThinkPad
+	// measured 201, every calibration (HPET, CMOS, TSC) rejected it as
+	// more than twice the expected 100 Hz, and the kernel kept counting
+	// 201 interrupts a second as if they were 100.
 	if (lapic_is_available()) {
-		lapic_timer_start(100);
-		kprintf("Timer: using LAPIC timer at 100 Hz\n");
+		lapic_timer_start(200);
+		timer_stop();
+		kprintf("Timer: using LAPIC timer at 200 Hz\n");
 	} else {
 		// No LAPIC — legacy PIT IRQ0 (old hardware / single-CPU)
 		timer_start();
-		kprintf("Timer: using PIT at 100 Hz\n");
+		kprintf("Timer: using PIT at 200 Hz\n");
 	}
 
 	// Measure the actual tick rate against the CMOS RTC second boundary.

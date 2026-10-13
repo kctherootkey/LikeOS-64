@@ -606,10 +606,12 @@ static int fw_domain_wait_ack(struct i915_device *i915,
 {
 	uint32_t want = on ? FORCEWAKE_KERNEL : 0;
 
-	for (uint32_t t = 0; t < FW_ACK_TIMEOUT_US; t += 10) {
+	/* the acknowledge usually comes within a few microseconds: polled
+	 * in single ones, so a wake costs what it takes and no more */
+	for (uint32_t t = 0; t < FW_ACK_TIMEOUT_US; t++) {
 		if ((i915_read32_fw(i915, d->reg_ack) & FORCEWAKE_KERNEL) == want)
 			return 0;
-		lapic_delay_us(10);
+		lapic_delay_us(1);
 	}
 	d->timeouts++;
 	if (d->timeouts == 1)
@@ -619,6 +621,15 @@ static int fw_domain_wait_ack(struct i915_device *i915,
 	return -ETIMEDOUT;
 }
 
+/* A domain whose last get was put stays awake for one more period of
+ * the release timer, and is released only when the timer finds it was
+ * not taken again in that time.  Waking a domain is a request and a
+ * handshake with the power controller; every register access in it --
+ * the four port writes of a submission, the status pointer in the
+ * interrupt -- paid one, with interrupts off.  A busy engine now keeps
+ * its domain awake and pays nothing. */
+#define FW_RELEASE_NS 1000000ULL
+
 /* Caller holds fw_lock. */
 static void fw_domains_get_locked(struct i915_device *i915, uint32_t mask)
 {
@@ -627,6 +638,11 @@ static void fw_domains_get_locked(struct i915_device *i915, uint32_t mask)
 		if (!(mask & d->mask))
 			continue;
 		if (d->count++ == 0) {
+			if (d->lingering) {
+				d->lingering = 0;
+				d->used = 1;
+				continue;
+			}
 			if (i915_is_legacy(i915)) {
 				i915_legacy_fw_wake(i915, d);
 			} else {
@@ -638,6 +654,18 @@ static void fw_domains_get_locked(struct i915_device *i915, uint32_t mask)
 	}
 }
 
+static void fw_domain_release_locked(struct i915_device *i915,
+				     struct i915_fw_domain *d)
+{
+	d->lingering = 0;
+	d->used = 0;
+	if (i915_is_legacy(i915))
+		i915_legacy_fw_sleep(i915, d);
+	else
+		fw_domain_set(i915, d, 0);
+	i915->fw_held &= ~d->mask;
+}
+
 static void fw_domains_put_locked(struct i915_device *i915, uint32_t mask)
 {
 	for (int i = 0; i < I915_FW_DOMAINS; i++) {
@@ -645,13 +673,64 @@ static void fw_domains_put_locked(struct i915_device *i915, uint32_t mask)
 		if (!(mask & d->mask))
 			continue;
 		if (d->count > 0 && --d->count == 0) {
-			if (i915_is_legacy(i915))
-				i915_legacy_fw_sleep(i915, d);
-			else
-				fw_domain_set(i915, d, 0);
-			i915->fw_held &= ~d->mask;
+			if (!i915->fw_timer_ready || i915_is_legacy(i915)) {
+				fw_domain_release_locked(i915, d);
+				continue;
+			}
+			d->lingering = 1;
+			if (!hrtimer_is_armed(&i915->fw_timer)) {
+				d->used = 0;
+				hrtimer_start_rel(&i915->fw_timer, FW_RELEASE_NS);
+			}
 		}
 	}
+}
+
+/* The release timer: interrupt context, interrupts off. */
+static void fw_release_timer(hrtimer_t *t)
+{
+	struct i915_device *i915 = t->arg;
+	uint64_t fl;
+	int again = 0;
+
+	spin_lock_irqsave(&i915->fw_lock, &fl);
+	for (int i = 0; i < I915_FW_DOMAINS; i++) {
+		struct i915_fw_domain *d = &i915->fw[i];
+		if (!d->mask || !d->lingering)
+			continue;
+		if (d->used) {
+			d->used = 0;
+			again = 1;
+			continue;
+		}
+		fw_domain_release_locked(i915, d);
+	}
+	/* a domain taken and put again in this period gets another one */
+	for (int i = 0; i < I915_FW_DOMAINS && !again; i++)
+		if (i915->fw[i].lingering)
+			again = 1;
+	if (again && i915->fw_timer_ready && !hrtimer_is_armed(&i915->fw_timer))
+		hrtimer_start_rel(&i915->fw_timer, FW_RELEASE_NS);
+	spin_unlock_irqrestore(&i915->fw_lock, fl);
+}
+
+/* Every lingering domain released now and the timer stopped: before the
+ * device goes away or to sleep, and before the domains are reset. */
+static void fw_release_all_lingering(struct i915_device *i915)
+{
+	uint64_t fl;
+
+	if (!i915->fw_timer_ready)
+		return;
+	spin_lock_irqsave(&i915->fw_lock, &fl);
+	i915->fw_timer_ready = 0;
+	spin_unlock_irqrestore(&i915->fw_lock, fl);
+	(void)hrtimer_cancel(&i915->fw_timer);
+	spin_lock_irqsave(&i915->fw_lock, &fl);
+	for (int i = 0; i < I915_FW_DOMAINS; i++)
+		if (i915->fw[i].mask && i915->fw[i].lingering)
+			fw_domain_release_locked(i915, &i915->fw[i]);
+	spin_unlock_irqrestore(&i915->fw_lock, fl);
 }
 
 void i915_fw_get(struct i915_device *i915, uint32_t mask)
@@ -822,6 +901,8 @@ int i915_uncore_init(struct i915_device *i915)
 
 	if (i915_is_legacy(i915))
 		return i915_legacy_uncore_init(i915);
+	/* again on resume: whatever lingered is released first */
+	fw_release_all_lingering(i915);
 	spinlock_init(&i915->fw_lock, "i915_fw");
 	i915->fw_present = 0;
 	for (int i = 0; i < I915_FW_DOMAINS; i++)
@@ -926,6 +1007,14 @@ int i915_uncore_init(struct i915_device *i915)
 		if (rc)
 			return rc;
 	}
+	for (int i = 0; i < I915_FW_DOMAINS; i++) {
+		i915->fw[i].count = 0;
+		i915->fw[i].lingering = 0;
+		i915->fw[i].used = 0;
+	}
+	i915->fw_held = 0;
+	hrtimer_init(&i915->fw_timer, fw_release_timer, i915);
+	i915->fw_timer_ready = 1;
 	return 0;
 }
 
@@ -935,6 +1024,7 @@ void i915_uncore_fini(struct i915_device *i915)
 		i915_legacy_uncore_fini(i915);
 		return;
 	}
+	fw_release_all_lingering(i915);
 	for (int i = 0; i < I915_FW_DOMAINS; i++)
 		if (i915->fw[i].mask)
 			i915_write32_fw(i915, i915->fw[i].reg_set, 0xffff0000u);

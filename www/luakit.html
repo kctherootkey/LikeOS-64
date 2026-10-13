@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Luakit Web-Browser Cheatsheet &mdash; LikeOS</title>
+<meta name="description" content="A cheatsheet for luakit, the keyboard-driven web browser of LikeOS: modes, navigation, tabs, link hints, search, bookmarks and commands.">
+<meta name="author" content="Nikolaos Rangos">
+<meta name="theme-color" content="#23801a">
+<link rel="canonical" href="https://likeos.systemtrap.com/luakit.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="LikeOS">
+<meta property="og:title" content="Luakit Web-Browser Cheatsheet &mdash; LikeOS">
+<meta property="og:description" content="A cheatsheet for luakit, the keyboard-driven web browser of LikeOS: modes, navigation, tabs, link hints, search, bookmarks and commands.">
+<meta property="og:url" content="https://likeos.systemtrap.com/luakit.html">
+<meta property="og:image" content="https://likeos.systemtrap.com/assets/og-image.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="512x512" href="assets/icon-512.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+<!--
+  LikeOS website.
+  Copyright (C) 2026 The LikeOS Project
+  Web page copyright (C) 2026 Nikolaos Rangos.
+-->
+</head>
+<body data-page="luakit">
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="topbar">
+  <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+  <div class="actions">
+    <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span class="label">Donate</span></a>
+    <button class="menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open the menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  </div>
+</header>
+<div class="backdrop" aria-hidden="true"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar" aria-label="Site menu">
+    <div class="brand-meta">
+      <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD &middot; dev branch</span>
+    </div>
+    <nav class="nav" aria-label="Main">
+      <div class="nav-label">Menu</div>
+      <a href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg><span>Home</span></a>
+      <a href="technical.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg><span>Technical Details</span></a>
+      <a href="luakit.html" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg><span>Luakit Web-Browser Cheatsheet</span></a>
+      <a href="screenshots.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5.5-5.5L5 20"/></svg><span>Screenshots and Videos</span></a>
+      <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></svg><span>Source Code</span><svg class="ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a>
+      <a href="running.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg><span>Running</span></a>
+      <a href="about.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>About</span></a>
+      <a href="donate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7-4.3-9-8.7C1.6 8 3.6 4.5 6.9 4.5c2 0 3.4 1 5.1 3 1.7-2 3.1-3 5.1-3 3.3 0 5.3 3.5 3.9 6.8C19 15.7 12 20 12 20z"/></svg><span>Donate</span></a>
+    </nav>
+    <div class="sidebar-donate">
+      <a class="btn btn-donate btn-block" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate to LikeOS</span></a>
+      <p>Every donation buys test hardware and brings a paid team closer.</p>
+    </div>
+  </aside>
+
+  <div class="main">
+<main class="content" id="content">
+  <header class="page-head">
+    <div>
+      <span class="eyebrow">Web browser</span>
+      <h1>Luakit Web-Browser Cheatsheet</h1>
+      <p class="lede">luakit is the web browser of LikeOS: the WebKit engine, driven from the keyboard. These are the keys and commands worth knowing.</p>
+    </div>
+    <aside class="donate-cta" aria-label="Support LikeOS">
+      <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate</span></a>
+      <small>Help fund test hardware and a paid development team.</small>
+    </aside>
+  </header>
+<nav class="toc"><h2>On this page</h2><ol>
+<li><a href="#intro">Getting started</a></li>
+<li><a href="#modes">Modes</a></li>
+<li><a href="#scrolling">Navigation, scrolling &amp; zoom</a></li>
+<li><a href="#opening">Opening pages, searching &amp; history</a></li>
+<li><a href="#tabs">Tabs &amp; windows</a></li>
+<li><a href="#hints">Link hints (follow mode)</a></li>
+<li><a href="#yank">Yank &amp; paste</a></li>
+<li><a href="#find">Search in page</a></li>
+<li><a href="#marks">Bookmarks, quickmarks, history &amp; downloads</a></li>
+<li><a href="#commands">Useful commands &amp; internal pages</a></li>
+<li><a href="#likeos">LikeOS-specific notes</a></li>
+</ol></nav>
+
+<section class="card intro" id="intro">
+<h2>Luakit at a glance</h2>
+<p>luakit is the default web browser on LikeOS. It is built on WebKitGTK and driven from the keyboard: like the <em>vi</em> editor, it has <b>modes</b>, single-key commands in normal mode and a <code>:</code> command line at the bottom of the window. You can still use the mouse for everything. Start it from the window manager menu (<em>Luakit Web Browser</em>) or the desktop icon, or type <code>luakit</code> in a terminal. LikeOS also opens web pages, http/https links, images and PDF files in luakit.</p>
+<p>Five things to learn first:</p>
+<ol class="steps">
+<li><kbd>o</kbd> opens a page: type an address or some search words, then press <kbd>Enter</kbd>. <kbd>t</kbd> does the same in a new tab.</li>
+<li><kbd>f</kbd> labels every link and button with a number. Type the number, or part of the link text, to click it. <kbd>F</kbd> opens the link in a background tab instead.</li>
+<li><kbd>j</kbd> / <kbd>k</kbd> scroll down and up, <kbd>H</kbd> / <kbd>L</kbd> go back and forward, <kbd>r</kbd> reloads.</li>
+<li><kbd>d</kbd> closes the tab and <kbd>u</kbd> brings it back. <kbd>g</kbd><kbd>t</kbd> and <kbd>g</kbd><kbd>T</kbd> (or <kbd>J</kbd> / <kbd>K</kbd>) switch tabs.</li>
+<li><kbd>Esc</kbd> always returns to normal mode. If keys stop doing what you expect, press it. <kbd>F1</kbd> or <code>:help</code> opens the built-in help, and <code>:binds</code> lists every key binding.</li>
+</ol>
+</section>
+
+<section class="card" id="modes">
+<h2>Modes</h2>
+<p>The mode you are in is shown in the bottom-left corner of the window. In normal mode (no label) keys are browser commands. In the other modes they are text, hint labels or commands.</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>Esc</kbd> or <kbd>Ctrl</kbd>+<kbd>[</kbd></td><td>Go back to <b>normal</b> mode from any other mode. This is the mode luakit starts in.</td></tr>
+<tr><td><kbd>i</kbd></td><td>Enter <b>insert</b> mode (<code>-- INSERT --</code>). Your keys go to the page, so you can type into forms. Clicking a text field, or choosing one with <kbd>f</kbd> or <kbd>g</kbd><kbd>i</kbd>, enters insert mode automatically.</td></tr>
+<tr><td><kbd>g</kbd><kbd>i</kbd></td><td>Focus the first text field on the page and enter insert mode. Use a count to pick another field, for example <kbd>2</kbd><kbd>g</kbd><kbd>i</kbd>.</td></tr>
+<tr><td><kbd>:</kbd></td><td>Enter <b>command</b> mode. This opens the <code>:</code> command line at the bottom. <kbd>Enter</kbd> runs the command and <kbd>Esc</kbd> cancels it.</td></tr>
+<tr><td><kbd>f</kbd>, <kbd>F</kbd>, <kbd>;</kbd></td><td>Enter <b>follow</b> (link hint) mode. See <a href="#hints">Link hints</a>.</td></tr>
+<tr><td><kbd>/</kbd>, <kbd>?</kbd></td><td>Enter <b>search</b> mode to find text on the page.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>z</kbd></td><td>Enter <b>passthrough</b> mode (<code>-- PASS THROUGH --</code>). luakit ignores all its own bindings and sends every key to the page. This is useful for web apps with their own shortcuts. <kbd>Esc</kbd> leaves it. Works from normal and insert mode.</td></tr>
+</tbody></table>
+<p><b>On the command line</b> (command mode), these keys help:</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd></td><td>Open the completion menu and step through commands, history and bookmarks. <kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd> also move, and <kbd>Esc</kbd> restores what you typed.</td></tr>
+<tr><td><kbd>Up</kbd> / <kbd>Down</kbd></td><td>Step through earlier commands.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>w</kbd> / <kbd>Ctrl</kbd>+<kbd>u</kbd></td><td>Delete the previous word / the whole line.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>a</kbd> / <kbd>Ctrl</kbd>+<kbd>e</kbd></td><td>Jump to the start / end of the line.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>Expand <code>:open example</code> to <code>:open www.example.com</code> and open it. This also works for <code>:tabopen</code> and <code>:winopen</code>.</td></tr>
+</tbody></table>
+<div class="tip">Many normal-mode keys take a <b>count</b> typed before them: <kbd>5</kbd><kbd>j</kbd> scrolls five steps, <kbd>3</kbd><kbd>g</kbd><kbd>t</kbd> goes to tab 3, and <kbd>5</kbd><kbd>0</kbd><kbd>%</kbd> jumps to the middle of the page.</div>
+</section>
+
+<section class="card" id="scrolling">
+<h2>Navigation, scrolling &amp; zoom</h2>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Scroll down / up one step (also <kbd>Down</kbd> / <kbd>Up</kbd>, <kbd>Ctrl</kbd>+<kbd>e</kbd> / <kbd>Ctrl</kbd>+<kbd>y</kbd>).</td></tr>
+<tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>Scroll left / right (also <kbd>Left</kbd> / <kbd>Right</kbd>, or <kbd>Shift</kbd>+mouse wheel).</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>d</kbd> / <kbd>Ctrl</kbd>+<kbd>u</kbd></td><td>Scroll down / up half a page.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>f</kbd> / <kbd>Ctrl</kbd>+<kbd>b</kbd></td><td>Scroll down / up a full page (also <kbd>Space</kbd> / <kbd>Shift</kbd>+<kbd>Space</kbd>, <kbd>Page Down</kbd> / <kbd>Page Up</kbd>; <kbd>Backspace</kbd> scrolls up).</td></tr>
+<tr><td><kbd>g</kbd><kbd>g</kbd> / <kbd>G</kbd></td><td>Go to the top / bottom of the page (also <kbd>Home</kbd> / <kbd>End</kbd>; <kbd>0</kbd> also goes to the top).</td></tr>
+<tr><td><em>N</em><kbd>%</kbd></td><td>Go to <em>N</em> percent of the page, for example <kbd>2</kbd><kbd>5</kbd><kbd>%</kbd>.</td></tr>
+<tr><td><kbd>^</kbd> / <kbd>$</kbd></td><td>Scroll to the far left / far right.</td></tr>
+<tr><td><kbd>]</kbd><kbd>]</kbd> / <kbd>[</kbd><kbd>[</kbd></td><td>Open the page's "next" / "previous" page, for example the next page of search results.</td></tr>
+<tr><td><kbd>g</kbd><kbd>u</kbd> / <kbd>g</kbd><kbd>U</kbd></td><td>Go one level up in the address path / go to the site's root.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>a</kbd> / <kbd>Ctrl</kbd>+<kbd>x</kbd></td><td>Increase / decrease the last number in the address (<code>page=4</code> → <code>page=5</code>).</td></tr>
+<tr><td><kbd>Enter</kbd></td><td>Follow the link that contains the selected text. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> opens it in a new tab, <kbd>Shift</kbd>+<kbd>Enter</kbd> in a new window, and <kbd>Alt</kbd>+<kbd>Enter</kbd> downloads it.</td></tr>
+<tr><td><kbd>z</kbd><kbd>i</kbd> / <kbd>z</kbd><kbd>o</kbd></td><td>Zoom in / out (also <kbd>+</kbd> / <kbd>-</kbd>, or <kbd>Ctrl</kbd>+mouse wheel).</td></tr>
+<tr><td><kbd>z</kbd><kbd>z</kbd> or <kbd>=</kbd></td><td>Reset the zoom. With a count, set the zoom to that percentage: <kbd>1</kbd><kbd>5</kbd><kbd>0</kbd><kbd>z</kbd><kbd>z</kbd> = 150 %.</td></tr>
+<tr><td><kbd>F11</kbd></td><td>Toggle full screen.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="opening">
+<h2>Opening pages, searching &amp; history</h2>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>o</kbd></td><td>Open an address or search in the current tab (fills in <code>:open </code>).</td></tr>
+<tr><td><kbd>t</kbd></td><td>Open in a new tab (<code>:tabopen </code>).</td></tr>
+<tr><td><kbd>w</kbd></td><td>Open in a new window (<code>:winopen </code>).</td></tr>
+<tr><td><kbd>O</kbd> / <kbd>T</kbd> / <kbd>W</kbd></td><td>Same as <kbd>o</kbd> / <kbd>t</kbd> / <kbd>w</kbd>, but the command line starts with the current address, so you can edit it.</td></tr>
+<tr><td><kbd>H</kbd> / <kbd>L</kbd></td><td>Go back / forward in this tab's history (also <kbd>Ctrl</kbd>+<kbd>o</kbd> / <kbd>Ctrl</kbd>+<kbd>i</kbd>, and the Back/Forward keys on keyboards that have them). A count goes back several pages: <kbd>3</kbd><kbd>H</kbd>.</td></tr>
+<tr><td><kbd>r</kbd> / <kbd>R</kbd></td><td>Reload / reload without using the cache.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>c</kbd></td><td>Stop loading.</td></tr>
+<tr><td><kbd>g</kbd><kbd>h</kbd> / <kbd>g</kbd><kbd>H</kbd></td><td>Open the home page in this tab / in a new tab.</td></tr>
+</tbody></table>
+<p><b>How <code>:open</code> reads what you type:</b></p>
+<p>A single word that looks like an address (<code>likeos.systemtrap.com</code>) is opened as a web page. On LikeOS a bare host name gets <code>https://</code> (see <a href="#likeos">LikeOS notes</a>).</p>
+<p>A path to an existing local file is opened as <code>file://</code>.</p>
+<p>Anything else is a <b>web search</b> with the default engine (Google): <code>o luakit key bindings</code>.</p>
+<p>To use another engine, start with its name: <code>o duckduckgo likeos</code>, <code>o wikipedia WebKit</code>, <code>o github luakit</code>, <code>o imdb some film</code>. These engines are built in: <code>duckduckgo</code>, <code>github</code>, <code>google</code>, <code>imdb</code>, <code>wikipedia</code>.</p>
+<div class="tip">Press <kbd>Tab</kbd> after <kbd>o</kbd> to choose from your history and bookmarks.</div>
+</section>
+
+<section class="card" id="tabs">
+<h2>Tabs &amp; windows</h2>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>g</kbd><kbd>t</kbd> / <kbd>g</kbd><kbd>T</kbd></td><td>Next / previous tab (also <kbd>J</kbd> / <kbd>K</kbd>, <kbd>Ctrl</kbd>+<kbd>Tab</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd>, <kbd>Ctrl</kbd>+<kbd>Page Down</kbd> / <kbd>Ctrl</kbd>+<kbd>Page Up</kbd>).</td></tr>
+<tr><td><em>N</em><kbd>g</kbd><kbd>t</kbd></td><td>Go to tab number <em>N</em>.</td></tr>
+<tr><td><kbd>Alt</kbd>+<kbd>1</kbd> … <kbd>Alt</kbd>+<kbd>9</kbd>, <kbd>Alt</kbd>+<kbd>0</kbd></td><td>Jump to tabs 1 to 9, and to tab 10.</td></tr>
+<tr><td><kbd>g</kbd><kbd>0</kbd> / <kbd>g</kbd><kbd>$</kbd></td><td>Go to the first / last tab.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>t</kbd></td><td>Open a new, empty tab.</td></tr>
+<tr><td><kbd>d</kbd> or <kbd>Ctrl</kbd>+<kbd>w</kbd></td><td>Close the current tab. <kbd>3</kbd><kbd>d</kbd> closes three tabs.</td></tr>
+<tr><td><kbd>u</kbd></td><td>Reopen the last closed tab, with its history. Closed tabs are kept in the session, so this also works after a restart.</td></tr>
+<tr><td><code>:undolist</code></td><td>Menu of closed tabs. <kbd>Enter</kbd> reopens in the current tab, <kbd>u</kbd> in a background tab, <kbd>w</kbd> in a new window, <kbd>d</kbd> forgets the entry.</td></tr>
+<tr><td><kbd>&lt;</kbd> / <kbd>&gt;</kbd></td><td>Move the tab one place left / right (with a count, several places).</td></tr>
+<tr><td><kbd>g</kbd><kbd>y</kbd></td><td>Duplicate the current tab, with its history.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+click or middle-click a link</td><td>Open the link in a background tab.</td></tr>
+<tr><td><code>:tabdetach</code></td><td>Move the current tab into a new window.</td></tr>
+<tr><td><code>:tabmenu</code></td><td>Menu of all open tabs. <kbd>Enter</kbd> switches to one and <kbd>Delete</kbd> closes it.</td></tr>
+<tr><td><code>:tabhistory</code></td><td>Menu of the back/forward history of this tab.</td></tr>
+<tr><td><code>:tabdo</code> <em>command</em></td><td>Run a command in every tab, for example <code>:tabdo reload</code>.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="hints">
+<h2>Link hints (follow mode)</h2>
+<p>Hint modes label the elements on the page with numbers. Type a label number, or a few letters of the element's text (case does not matter), and luakit acts on the match. <kbd>Esc</kbd> cancels.</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>f</kbd></td><td>Hint everything clickable (links, buttons, fields) and click the one you choose. A text field gets focus and insert mode.</td></tr>
+<tr><td><kbd>F</kbd></td><td>Hint links and open the chosen one in a background tab.</td></tr>
+<tr><td><kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd></td><td>(in hint mode) Move the focus to the next / previous hint.</td></tr>
+<tr><td><kbd>Enter</kbd></td><td>(in hint mode) Activate the focused hint.</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>Enter</kbd></td><td>(in hint mode) Activate all visible hints at once.</td></tr>
+</tbody></table>
+<p><b>Extended hints:</b> press <kbd>;</kbd>, then one of these keys. <kbd>g</kbd><kbd>;</kbd> does the same, but stays in extended-hint mode until you press <kbd>Esc</kbd>.</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>;</kbd><kbd>o</kbd></td><td>Open the link in the current tab.</td></tr>
+<tr><td><kbd>;</kbd><kbd>t</kbd></td><td>Open the link in a new tab and switch to it.</td></tr>
+<tr><td><kbd>;</kbd><kbd>b</kbd></td><td>Open the link in a background tab.</td></tr>
+<tr><td><kbd>;</kbd><kbd>w</kbd></td><td>Open the link in a new window.</td></tr>
+<tr><td><kbd>;</kbd><kbd>O</kbd> / <kbd>;</kbd><kbd>T</kbd> / <kbd>;</kbd><kbd>W</kbd></td><td>Put the link into a <code>:open</code> / <code>:tabopen</code> / <code>:winopen</code> command line so you can edit it first.</td></tr>
+<tr><td><kbd>;</kbd><kbd>y</kbd></td><td>Copy (yank) the link address to the primary selection.</td></tr>
+<tr><td><kbd>;</kbd><kbd>Y</kbd></td><td>Copy an element's description (title or alt text) to the primary selection.</td></tr>
+<tr><td><kbd>;</kbd><kbd>i</kbd> / <kbd>;</kbd><kbd>I</kbd></td><td>Open an image itself in this tab / in a new tab.</td></tr>
+<tr><td><kbd>;</kbd><kbd>x</kbd> / <kbd>;</kbd><kbd>X</kbd></td><td>Open the link behind a thumbnail image in this tab / in a background tab.</td></tr>
+<tr><td><kbd>;</kbd><kbd>;</kbd></td><td>Focus an element (a link, button or form field) without clicking it.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="yank">
+<h2>Yank &amp; paste</h2>
+<p>X has two places to copy to: the <b>primary selection</b> (whatever you last highlighted, pasted with the middle mouse button) and the <b>clipboard</b> (<kbd>Ctrl</kbd>+<kbd>c</kbd> / <kbd>Ctrl</kbd>+<kbd>v</kbd> in other programs). Lower-case keys use the primary selection and upper-case keys use the clipboard.</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>y</kbd></td><td>Copy the current page address to the primary selection.</td></tr>
+<tr><td><kbd>Y</kbd></td><td>Copy the current page address to the clipboard.</td></tr>
+<tr><td><kbd>p</kbd><kbd>p</kbd> / <kbd>p</kbd><kbd>t</kbd> / <kbd>p</kbd><kbd>w</kbd></td><td>Open the address(es) in the primary selection in this tab / new tabs / a new window.</td></tr>
+<tr><td><kbd>P</kbd><kbd>P</kbd> / <kbd>P</kbd><kbd>T</kbd> / <kbd>P</kbd><kbd>W</kbd></td><td>Open the address(es) in the clipboard in this tab / new tabs / a new window.</td></tr>
+<tr><td>Middle-click on the page (not on a link)</td><td>Open the address in the primary selection in this tab.</td></tr>
+<tr><td><kbd>;</kbd><kbd>y</kbd></td><td>Copy a link's address using a hint (see <a href="#hints">Link hints</a>).</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>Insert</kbd></td><td>(on the command line) Paste the primary selection. <kbd>Ctrl</kbd>+<kbd>y</kbd> puts back the text you last deleted with <kbd>Ctrl</kbd>+<kbd>w</kbd> or <kbd>Ctrl</kbd>+<kbd>u</kbd>.</td></tr>
+</tbody></table>
+<div class="note">There is no single-key <kbd>p</kbd> or <kbd>P</kbd>. The paste keys are always two letters. In a web form (insert mode) the usual <kbd>Ctrl</kbd>+<kbd>v</kbd> works.</div>
+</section>
+
+<section class="card" id="find">
+<h2>Search in page</h2>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>/</kbd></td><td>Search forward. Type the text and press <kbd>Enter</kbd>.</td></tr>
+<tr><td><kbd>?</kbd></td><td>Search backward.</td></tr>
+<tr><td><kbd>n</kbd> / <kbd>N</kbd></td><td>Next / previous match.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd></td><td>(while typing the search) Jump to the next / previous match.</td></tr>
+<tr><td><code>:nohlsearch</code> (<code>:noh</code>)</td><td>Remove the match highlighting.</td></tr>
+</tbody></table>
+<div class="tip">After a search, press <kbd>Enter</kbd> to follow the link that contains the match. Searching for a link's text and pressing <kbd>Enter</kbd> is a quick way to click it.</div>
+</section>
+
+<section class="card" id="marks">
+<h2>Bookmarks, quickmarks, history &amp; downloads</h2>
+<p><b>Bookmarks</b> are kept in a database and managed from a page in the browser.</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>B</kbd></td><td>Bookmark the current page. This opens the bookmark manager with a form already filled in, where you can add tags.</td></tr>
+<tr><td><kbd>g</kbd><kbd>b</kbd> / <kbd>g</kbd><kbd>B</kbd></td><td>Open the bookmark manager (<code>luakit://bookmarks/</code>) in this tab / a new tab.</td></tr>
+<tr><td><code>:bookmarks</code></td><td>Open the bookmark manager, or switch to its tab if it is already open.</td></tr>
+<tr><td><code>:bookmark</code> <em>[address tags…]</em></td><td>Bookmark the current page, or a given address with tags.</td></tr>
+</tbody></table>
+<p><b>Quickmarks</b> are one-letter shortcuts to your favourite sites.</p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><kbd>M</kbd><em>x</em></td><td>Save the current page as quickmark <em>x</em> (a letter or digit), for example <kbd>M</kbd><kbd>n</kbd>.</td></tr>
+<tr><td><kbd>g</kbd><kbd>o</kbd><em>x</em></td><td>Open quickmark <em>x</em> in this tab.</td></tr>
+<tr><td><kbd>g</kbd><kbd>n</kbd><em>x</em></td><td>Open quickmark <em>x</em> in a new tab.</td></tr>
+<tr><td><kbd>g</kbd><kbd>w</kbd><em>x</em></td><td>Open quickmark <em>x</em> in a new window.</td></tr>
+<tr><td><code>:qmark</code> <em>x address, address…</em></td><td>Set a quickmark by hand. Several addresses open together.</td></tr>
+<tr><td><code>:qmarks</code></td><td>List the quickmarks. <kbd>Enter</kbd> / <kbd>t</kbd> / <kbd>w</kbd> open one, <kbd>e</kbd> edits it, <kbd>d</kbd> deletes it.</td></tr>
+<tr><td><code>:qmarkedit</code> <em>x</em> / <code>:delqmarks</code> <em>x</em></td><td>Edit / delete a quickmark. <code>:delqmarks!</code> deletes all of them.</td></tr>
+</tbody></table>
+<p><b>History and downloads</b></p>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>:history</code> <em>[words]</em></td><td>Open the searchable history page (<code>luakit://history/</code>) in a new tab, already filtered if you give words.</td></tr>
+<tr><td><kbd>g</kbd><kbd>d</kbd> / <kbd>g</kbd><kbd>D</kbd></td><td>Open the downloads page (<code>luakit://downloads/</code>) in this tab / a new tab. <code>:downloads</code> does the same.</td></tr>
+<tr><td><code>:download</code> <em>[address]</em></td><td>Download an address, or the current page.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd></td><td>Put <code>:download</code> and the current address on the command line.</td></tr>
+<tr><td><kbd>Alt</kbd>+<kbd>Enter</kbd></td><td>Download the link that contains the selected text.</td></tr>
+</tbody></table>
+<div class="note">A finished download opened from the downloads page is passed to <code>xdg-open</code>, which picks the matching LikeOS application.</div>
+</section>
+
+<section class="card" id="commands">
+<h2>Useful commands &amp; internal pages</h2>
+<table class="table keys"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>:adblock</code>, <kbd>g</kbd><kbd>a</kbd> / <kbd>g</kbd><kbd>A</kbd></td><td>Open the ad blocker page (<code>luakit://adblock/</code>). There you can switch blocking on or off and enable or disable each filter list.</td></tr>
+<tr><td><code>:adblock-enable</code> (<code>:abe</code>) / <code>:adblock-disable</code> (<code>:abd</code>)</td><td>Turn ad blocking on / off for every tab. This is useful to check whether the blocker is breaking a site. Blocking is on again after luakit restarts.</td></tr>
+<tr><td><code>:adblock-reload</code> (<code>:abr</code>)</td><td>Reload the filter lists from disk, for example after adding a new list.</td></tr>
+<tr><td><code>:adblock-list-enable</code> <em>N</em> (<code>:able</code>) / <code>:adblock-list-disable</code> <em>N</em> (<code>:abld</code>)</td><td>Enable / disable filter list number <em>N</em>. The adblock page does the same with a click.</td></tr>
+<tr><td><kbd>F12</kbd>, <code>:inspect</code></td><td>Open the WebKit web inspector (developer tools). <kbd>F12</kbd> and <code>:inspect!</code> toggle it.</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd>, <code>:view-source</code> (<code>:vs</code>)</td><td>Show the page source in a new tab.</td></tr>
+<tr><td><code>:print</code></td><td>Print the page.</td></tr>
+<tr><td><code>:save</code> <em>[file]</em></td><td>Save the page as shown, as an <code>.mhtml</code> file.</td></tr>
+<tr><td><code>:dump</code> <em>[file]</em></td><td>Save the page's HTML.</td></tr>
+<tr><td><code>:priv-tabopen</code> <em>address</em></td><td>Open a <b>private tab</b>: it is not written to history, and links opened from it stay private.</td></tr>
+<tr><td><code>:clear-data</code></td><td>Menu to delete cookies, caches, local storage and similar data, per site or for all sites.</td></tr>
+<tr><td><code>:set</code> <em>setting value</em></td><td>Change a setting, for example <code>:set window.home_page https://example.org</code>. <kbd>Tab</kbd> completes setting names.</td></tr>
+<tr><td><code>:seton</code> <em>domain setting value</em></td><td>Change a setting for one site only.</td></tr>
+<tr><td><code>:settings</code></td><td>Open <code>luakit://settings/</code>, where you can view and edit every setting.</td></tr>
+<tr><td><code>:q</code> / <code>:q!</code></td><td>Close the window / close it even if something objects (for example a running download).</td></tr>
+<tr><td><code>:wq</code>, <kbd>Z</kbd><kbd>Z</kbd></td><td>Save the session (all open tabs) and quit. The tabs come back the next time luakit starts.</td></tr>
+<tr><td><kbd>Z</kbd><kbd>Q</kbd></td><td>Quit without saving the session.</td></tr>
+<tr><td><code>:write</code></td><td>Save the session now, without quitting.</td></tr>
+<tr><td><code>:restart</code>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></td><td>Restart luakit and reload its configuration. Your tabs are kept.</td></tr>
+<tr><td><kbd>F1</kbd>, <code>:help</code> / <code>:binds</code></td><td>Built-in help (<code>luakit://help/</code>) / list of every key binding and command (<code>luakit://binds/</code>).</td></tr>
+<tr><td><code>:log</code></td><td>luakit's own message log (<code>luakit://log/</code>).</td></tr>
+<tr><td><code>:js</code> <em>code</em> / <code>:lua</code> <em>code</em></td><td>Run JavaScript in the page / Lua inside luakit.</td></tr>
+</tbody></table>
+<p><b>Internal pages</b> you can open with <kbd>o</kbd>: <code>luakit://settings/</code>, <code>luakit://help/</code>, <code>luakit://binds/</code>, <code>luakit://history/</code>, <code>luakit://bookmarks/</code>, <code>luakit://downloads/</code>, <code>luakit://adblock/</code>, <code>luakit://log/</code>, and WebKit's own <code>webkit://gpu</code>, which shows how pages are rendered and composited.</p>
+<div class="note">If luakit crashes or the machine goes down, it restores your tabs on the next start from a recovery session. This session is saved about 30 seconds after you browse.</div>
+</section>
+
+<section class="card" id="likeos">
+<h2>LikeOS-specific notes</h2>
+<p>LikeOS ships luakit with its own settings in <code>/etc/xdg/luakit/userconf.lua</code> and a launcher in <code>/usr/local/bin/luakit</code>. This is what differs from a stock luakit:</p>
+<p><b>Home page and window size.</b> The home page (<kbd>g</kbd><kbd>h</kbd>) is <code>https://likeos.systemtrap.com</code>. New windows are sized one step below the screen: 1280×1024 on a 1920-wide screen, 1024×768 on 1280-wide, and 800×600 on smaller screens.</p>
+<p><b>HTTPS by default.</b> A bare host name typed after <kbd>o</kbd> (<code>example.org</code>) opens as <code>https://example.org</code>. <code>localhost</code> and numeric IP addresses stay as typed. Type <code>http://</code> yourself for the rare site that has no HTTPS.</p>
+<p><b>A fresh web process per site.</b> When you go to a <em>different site</em> in the same tab (typed, clicked or opened by a script), luakit opens the page in a new tab in the same place and closes the old one. This keeps memory down and scrolling smooth. As a result, <kbd>H</kbd> cannot go back to the previous site: press <kbd>u</kbd> to get the old tab back. Reloads, back/forward and form submissions are not affected. You can switch this off in <code>luakit://settings/</code> (setting <code>webview.fresh_process_per_site</code>). The change is remembered and applies from the next page load.</p>
+<p><b>Media is restricted.</b> Media Source Extensions and Web Audio are off. Most streamed video, which uses Media Source, will not play. Plain video files still play, but only when you click them.</p>
+<p><b>WebGL is on</b>, and every page is drawn by WebKit's accelerated compositor (<code>hardware_acceleration_policy = "always"</code>), with or without a GPU.</p>
+<p><b>Ad blocking with regional lists.</b> 27 filter lists come pre-installed in <code>~/.local/share/luakit/adblock/</code> for every new account and for root: EasyList, EasyPrivacy and Peter Lowe's list, plus 24 regional lists (German, French, Italian, Spanish, Portuguese, Dutch, Polish, Czech/Slovak, Hebrew, Arabic, Chinese, Russian, Indian, Bulgarian, Latvian, Hungarian, Romanian, Greek, Nordic, Indonesian, Vietnamese, Korean, Japanese and Turkish). The LikeOS ad blocker understands filter options and indexes rules, so all 27 lists together cost about as much as two. It blocks <em>requests</em> only: element-hiding rules (<code>##</code>) are not supported. To add a list, copy any Adblock Plus <code>.txt</code> file into that folder and run <code>:abr</code>. The lists are snapshots from when the image was built, so you can replace them with newer copies the same way.</p>
+<p><b>The browser profile is kept in RAM.</b> The <code>luakit</code> command runs a launcher that moves luakit's data (cookies, history, bookmarks, session, settings) and cache to a private <code>/ram/&lt;user&gt;</code> directory (mode 0700) for the current boot. The data is copied back to <code>~/.local/share/luakit</code> each time luakit exits. The cache is not copied back unless you start luakit with <code>LUAKIT_RAM_SAVE_CACHE=1 luakit</code>.</p>
+<div class="note">With the RAM launcher, changes reach the disk only when luakit exits. A hard reset or power loss loses anything changed since the last time you closed luakit, including new bookmarks and cookies. Quit with <code>:wq</code> or <kbd>Z</kbd><kbd>Z</kbd> before switching off.</div>
+<div class="tip">To run luakit from the disk instead, start it once with <code>LUAKIT_RAM=0 luakit</code>, or make it permanent for your account with <code>touch ~/.config/luakit/use-disk</code>.</div>
+<div class="tip">To change the LikeOS defaults for your account, copy <code>/etc/xdg/luakit/userconf.lua</code> to <code>~/.config/luakit/userconf.lua</code> and edit the copy. luakit loads your file <em>instead of</em> the system one, so start from a copy to keep the other LikeOS settings.</div>
+<div class="tip">Does a site misbehave? Start X with <code>LIKEOS_WEB_CONSOLE=1 startx</code>. Every page's JavaScript console messages are then printed in the terminal you started X from.</div>
+</section>
+
+</main>
+    <footer class="footer">
+      <div class="footer-inner">
+        <div>
+          <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+        </div>
+        <nav aria-label="Footer">
+          <a href="technical.html">Technical Details</a>
+          <a href="screenshots.html">Screenshots</a>
+          <a href="running.html">Running</a>
+          <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener">GitHub</a>
+          <a href="about.html">About</a>
+          <a href="donate.html">Donate</a>
+        </nav>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>

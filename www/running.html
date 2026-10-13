@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Running LikeOS &mdash; LikeOS</title>
+<meta name="description" content="How to build LikeOS from source, write it to a USB stick and boot it on real hardware or in VMware, VirtualBox or QEMU.">
+<meta name="author" content="Nikolaos Rangos">
+<meta name="theme-color" content="#23801a">
+<link rel="canonical" href="https://likeos.systemtrap.com/running.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="LikeOS">
+<meta property="og:title" content="Running LikeOS &mdash; LikeOS">
+<meta property="og:description" content="How to build LikeOS from source, write it to a USB stick and boot it on real hardware or in VMware, VirtualBox or QEMU.">
+<meta property="og:url" content="https://likeos.systemtrap.com/running.html">
+<meta property="og:image" content="https://likeos.systemtrap.com/assets/og-image.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="512x512" href="assets/icon-512.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+<!--
+  LikeOS website.
+  Copyright (C) 2026 The LikeOS Project
+  Web page copyright (C) 2026 Nikolaos Rangos.
+-->
+</head>
+<body data-page="running">
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="topbar">
+  <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+  <div class="actions">
+    <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span class="label">Donate</span></a>
+    <button class="menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open the menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  </div>
+</header>
+<div class="backdrop" aria-hidden="true"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar" aria-label="Site menu">
+    <div class="brand-meta">
+      <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD &middot; dev branch</span>
+    </div>
+    <nav class="nav" aria-label="Main">
+      <div class="nav-label">Menu</div>
+      <a href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg><span>Home</span></a>
+      <a href="technical.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg><span>Technical Details</span></a>
+      <a href="luakit.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg><span>Luakit Web-Browser Cheatsheet</span></a>
+      <a href="screenshots.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5.5-5.5L5 20"/></svg><span>Screenshots and Videos</span></a>
+      <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></svg><span>Source Code</span><svg class="ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a>
+      <a href="running.html" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg><span>Running</span></a>
+      <a href="about.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>About</span></a>
+      <a href="donate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7-4.3-9-8.7C1.6 8 3.6 4.5 6.9 4.5c2 0 3.4 1 5.1 3 1.7-2 3.1-3 5.1-3 3.3 0 5.3 3.5 3.9 6.8C19 15.7 12 20 12 20z"/></svg><span>Donate</span></a>
+    </nav>
+    <div class="sidebar-donate">
+      <a class="btn btn-donate btn-block" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate to LikeOS</span></a>
+      <p>Every donation buys test hardware and brings a paid team closer.</p>
+    </div>
+  </aside>
+
+  <div class="main">
+<main class="content" id="content">
+  <header class="page-head">
+    <div>
+      <span class="eyebrow">Build &amp; boot</span>
+      <h1>Running LikeOS</h1>
+      <p class="lede">How to build LikeOS from source, put it on a USB stick and boot it &mdash; on a real notebook or in a virtual machine.</p>
+    </div>
+    <aside class="donate-cta" aria-label="Support LikeOS">
+      <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate</span></a>
+      <small>Help fund test hardware and a paid development team.</small>
+    </aside>
+  </header>
+<nav class="toc">
+  <h2>On this page</h2>
+  <ol>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#requirements">Requirements</a></li>
+    <li><a href="#source">Getting the source</a></li>
+    <li><a href="#dependencies">Installing the build dependencies</a></li>
+    <li><a href="#building">Building LikeOS</a></li>
+    <li><a href="#usb">Writing the USB stick</a></li>
+    <li><a href="#booting">Booting LikeOS</a></li>
+    <li><a href="#first-steps">First steps after boot</a></li>
+    <li><a href="#troubleshooting">Troubleshooting</a></li>
+  </ol>
+</nav>
+
+<div class="callout warn"><strong>No downloadable images yet.</strong> Pre-built LikeOS images are not available for download at the moment. They will be published once there is a major release. Until then LikeOS is built from source, and this page walks you through every step: preparing an Ubuntu build host, building the whole system with one <code>make</code>, writing it to a USB stick and booting it.</div>
+
+<section class="card" id="overview">
+  <h2>1. Overview</h2>
+  <p>LikeOS is a 64-bit operating system written from scratch: its own kernel, C library, dynamic linker and core utilities, with bash, OpenSSH, an X.Org desktop, GTK3 applications, the WebKit-based <b>luakit</b> web browser and the <b>Claws Mail</b> client ported on top. The current development line is <code>0.2.7-HEAD</code> on the <code>dev</code> branch.</p>
+  <p>Everything is built from source on a build host by the top-level <code>Makefile</code>, including the third-party ports under <code>ports/</code>. The result is a single file, <code>build/likeos-ext4.img</code>, which is a complete bootable GPT disk:</p>
+  <dl class="specs">
+    <dt>Partition 1</dt>
+    <dd>A small FAT EFI System Partition (64 MB by default) that holds only the UEFI bootloader, <code>/EFI/BOOT/BOOTX64.EFI</code>.</dd>
+    <dt>Partition 2</dt>
+    <dd>The ext4 root filesystem with the kernel (<code>/boot/kernel.elf</code>) and the whole userland. The bootloader reads the kernel straight out of ext4.</dd>
+  </dl>
+  <p>That image is written to a USB stick, and LikeOS runs <em>from the stick</em> &mdash; on real hardware, or in VMware or VirtualBox with the stick passed through to the virtual machine. UEFI boot is required; there is no legacy BIOS boot path.</p>
+  <p>The short version, for the impatient:</p>
+  <pre class="code"><code>$ git clone https://github.com/kctherootkey/LikeOS-64 LikeOS
+$ cd LikeOS
+$ git checkout dev
+$ sudo apt-get update
+$ sudo make deps
+$ make
+$ lsblk
+$ make usb-write USB_DEVICE=/dev/sdX</code></pre>
+  <p>The rest of this page explains each of those steps in detail, together with the build options, the ways to boot, and what to do once LikeOS is running.</p>
+</section>
+
+<section class="card" id="requirements">
+  <h2>2. Requirements</h2>
+  <p>Building LikeOS means cross-compiling a full desktop stack, including WebKitGTK, Mesa, LLVM and GCC's C++ runtime. The kernel alone builds in minutes; the ports are what make the first build long and large.</p>
+  <dl class="specs">
+    <dt>Build host</dt>
+    <dd>An x86-64 machine running <b>Ubuntu</b>. Building has been tested with <b>Ubuntu 24.04.3 LTS (Noble Numbat)</b>. Ubuntu is currently required; other distributions are likely to need work on the dependency list and on the host tools the ports drive.</dd>
+    <dt>Privileges</dt>
+    <dd>An account with <code>sudo</code>: installing the dependencies and writing the USB stick both need it. The build itself runs as your normal user (the root filesystem image is populated under <code>fakeroot</code>).</dd>
+    <dt>Disk space</dt>
+    <dd>Plan for <b>at least 40 GB free</b>. A fully built tree occupies roughly 26 GB: the unpacked and built X.Org/GTK3 ports account for about 19 GB of it, <code>build/</code> (objects, the cross-compiled sysroot and the image) for about 5 GB.</dd>
+    <dt>Memory</dt>
+    <dd><b>8 GB of RAM is the practical minimum</b>; the port was developed on an 8-core machine with 7.9 GB. More is better: the WebKitGTK build sizes its parallelism from your RAM (about 3 GB per compile job, then halved to leave headroom), LLVM allows about 1.5 GB per job, and the final link of <code>libWebKit.so</code> is the high-water mark of the whole build. Some swap space is a sensible safety net.</dd>
+    <dt>CPU time</dt>
+    <dd>The first full build takes <b>several hours</b>. WebKitGTK alone is, in the words of its build script, the one package whose build &ldquo;owns the machine for hours&rdquo;; LLVM, GCC's libstdc++, Mesa, GStreamer and FFmpeg add to that. Later builds are incremental: every port package leaves a stamp, so a re-run continues where it left off and only rebuilds what changed.</dd>
+    <dt>Internet access</dt>
+    <dd>Needed to clone the repository (its git history is roughly three quarters of a gigabyte, because most third-party source tarballs are checked in), to install the Ubuntu packages, and for the ports' <code>fetch.sh</code> scripts, which download any source tarball not in the repository (LLVM and the Noto Sans fonts, for example) and verify every archive against a recorded SHA-256 checksum.</dd>
+    <dt>USB stick</dt>
+    <dd>The image is sized automatically to its contents (currently about 1.8 GB). Use a stick of <b>at least 4 GB; 8 GB or more is recommended</b>, because writing it grows the root filesystem to fill the whole stick, and that space is what you have for your files once LikeOS is running. A USB 3 stick makes a noticeable difference, since the entire system &mdash; X server, libraries, fonts &mdash; is read from it. <b>The stick is completely erased.</b></dd>
+    <dt>Target machine</dt>
+    <dd>An x86-64 PC with <b>UEFI firmware</b> (required). LikeOS has been tested successfully on the <b>Lenovo ThinkPad P50</b> and the <b>Dell Pro 16 Plus</b> notebooks. Alternatively, a virtual machine in <b>VMware</b> or <b>VirtualBox</b>; <b>QEMU</b> works too, through legacy targets.</dd>
+  </dl>
+</section>
+
+<section class="card" id="source">
+  <h2>3. Getting the source</h2>
+  <p>The source lives on GitHub. Clone it (into a directory called <code>LikeOS</code> here) and switch to the <code>dev</code> branch, which is where development happens:</p>
+  <ol class="steps">
+    <li>Install git if the build host does not have it yet:
+      <pre class="code"><code>$ sudo apt-get install git</code></pre></li>
+    <li>Clone the repository:
+      <pre class="code"><code>$ git clone https://github.com/kctherootkey/LikeOS-64 LikeOS</code></pre></li>
+    <li>Enter it and check out the development branch:
+      <pre class="code"><code>$ cd LikeOS
+$ git checkout dev</code></pre></li>
+  </ol>
+  <p>All commands on the rest of this page are run from the top of this directory. Later, <code>git pull</code> on the <code>dev</code> branch followed by <code>make</code> brings your build up to date; only what changed is rebuilt.</p>
+  <div class="callout info"><strong>Where things are.</strong> <code>boot/</code> is the UEFI bootloader, <code>kernel/</code> and <code>include/kernel/</code> the kernel, <code>user/</code> the C library, dynamic linker and programs, <code>res/</code> the files staged into the image (configuration, fonts, wallpaper, desktop launchers), <code>host/</code> build-host tools and tests, and <code>ports/</code> the third-party software &mdash; <code>ports/xorg</code> for the X Window System and <code>ports/xorg/gtk3</code> for GTK3 and the applications on it.</div>
+</section>
+
+<section class="card" id="dependencies">
+  <h2>4. Installing the build dependencies</h2>
+  <p>The repository's <code>deps</code> target installs everything the build needs. Run it exactly like this:</p>
+  <pre class="code"><code>$ sudo apt-get update
+$ sudo make deps</code></pre>
+  <div class="callout info"><strong>Use <code>make deps</code>, not a hand-made package list.</strong> It is the requirement. Besides the compiler and the image tools it installs what the X.Org and GTK3 ports need on the build host, and it checks versions that a plain package install would get wrong.</div>
+  <p>What it takes care of, so you know what to expect:</p>
+  <dl class="specs">
+    <dt>Kernel and image tools</dt>
+    <dd><code>gcc</code>, <code>nasm</code>, GNU-EFI (for the bootloader), <code>mtools</code>, <code>dosfstools</code>, <code>e2fsprogs</code>, <code>fakeroot</code>, <code>gdisk</code>/<code>parted</code>, and QEMU with the OVMF UEFI firmware.</dd>
+    <dt>Port build tooling</dt>
+    <dd><code>meson</code>, <code>ninja</code>, <code>cmake</code>, <code>libtool</code>, <code>gperf</code>, <code>xsltproc</code>, <code>bison</code>, <code>flex</code>, <code>xfonts-utils</code>, <code>shared-mime-info</code>, <code>gettext</code>, the DocBook stylesheets, <code>zstd</code> (for the Intel graphics firmware) and <code>ruby</code> (JavaScriptCore's code generators).</dd>
+    <dt>Mesa's Intel driver</dt>
+    <dd>LLVM and clang with libclc and the SPIR-V tools, preferring version 18 and falling back to 15. Without them Mesa is built without its Intel (iris) driver.</dd>
+    <dt>A new enough g++</dt>
+    <dd>The terminal emulator (VTE) needs g++ 12.1 or newer. If the default compiler is older, a versioned <code>g++-12</code> or later is installed beside it and used automatically for the target's C++ code.</dd>
+    <dt>A new enough meson</dt>
+    <dd>GLib needs meson 1.4.0 or newer, and Ubuntu 24.04 ships 1.3.2. A current meson is then installed into a Python virtual environment inside the port (<code>ports/xorg/.hosttools</code>), not system-wide &mdash; nothing outside the source tree is changed.</dd>
+  </dl>
+  <p>If <code>make deps</code> stops with &ldquo;python3 -m venv failed&rdquo;, install the venv module and run it again:</p>
+  <pre class="code"><code>$ sudo apt-get install python3-venv
+$ sudo make deps</code></pre>
+</section>
+
+<section class="card" id="building">
+  <h2>5. Building LikeOS</h2>
+  <p>One command builds everything &mdash; bootloader, kernel, C library, every program and port, the X.Org and GTK3 stacks, and finally the bootable image:</p>
+  <pre class="code"><code>$ make</code></pre>
+  <p><code>make</code> and <code>make all</code> are the same thing. Because the first build runs for hours, it is worth keeping a log and running it somewhere that survives a closed terminal (inside <code>tmux</code>, for example):</p>
+  <pre class="code"><code>$ make 2&gt;&amp;1 | tee build.log</code></pre>
+
+  <p><b>What happens, in order.</b></p>
+  <ol class="steps">
+    <li>The UEFI bootloader (<code>build/bootloader.efi</code>) and the kernel (<code>build/kernel.elf</code>) are compiled.</li>
+    <li>The C library, the dynamic linker (<code>ld-likeos.so</code>), PAM and crypt libraries and the user programs are built into <code>build/</code>.</li>
+    <li>The smaller ports are built: ncurses, bash, nano, tmux, libevent, zlib, nghttp2, OpenSSL, curl, OpenSSH, netcat and gdb.</li>
+    <li>The X.Org port (<code>make ports-xorg</code>) fetches and verifies its source tarballs, unpacks them, and cross-compiles its packages in dependency order into the shared sysroot <code>build/xorg-sysroot</code>.</li>
+    <li>The GTK3 port (<code>make ports-gtk3</code>) does the same for its larger manifest: GLib, GTK 3.24, Cairo, Pango, HarfBuzz, GCC's libstdc++, LLVM and Mesa, GStreamer and FFmpeg, libva and the Intel media drivers, WebKitGTK, luakit, PCManFM, Claws Mail, Mousepad, xfce4-terminal and the rest. When Mesa and libdrm have arrived in the sysroot, the X server is rebuilt once more with glamor, the modesetting driver and GLX.</li>
+    <li>Everything is staged into an ext4 root tree, turned into a filesystem with <code>mkfs.ext4 -d</code> under <code>fakeroot</code>, and combined with the EFI System Partition into <code>build/likeos-ext4.img</code>.</li>
+  </ol>
+  <p>If the build is interrupted, simply run <code>make</code> again: each port package records a stamp when it finishes, and WebKitGTK in particular continues an interrupted compile instead of starting over.</p>
+
+  <p><b>Make targets.</b> <code>make help</code> prints the complete list. The ones you are likely to use:</p>
+  <table class="table">
+    <thead>
+      <tr><th>Target</th><th>Default</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>all</code></td><td>yes (plain <code>make</code>)</td><td>Build everything and produce the single bootable GPT disk <code>build/likeos-ext4.img</code>.</td></tr>
+      <tr><td><code>usb</code></td><td>&mdash;</td><td>Alias for the image; same result as <code>all</code>.</td></tr>
+      <tr><td><code>kernel</code></td><td>&mdash;</td><td>Build only <code>build/kernel.elf</code>.</td></tr>
+      <tr><td><code>bootloader</code></td><td>&mdash;</td><td>Build only <code>build/bootloader.efi</code>.</td></tr>
+      <tr><td><code>ports-xorg</code></td><td>&mdash;</td><td>Fetch, unpack and build the X.Org port into <code>build/xorg-sysroot</code>.</td></tr>
+      <tr><td><code>ports-gtk3</code></td><td>&mdash;</td><td>Fetch, unpack and build the GTK3 port (depends on <code>ports-xorg</code>).</td></tr>
+      <tr><td><code>usb-write</code></td><td>needs <code>USB_DEVICE</code></td><td>Build the image if it is not current, write it to a USB stick and grow the root filesystem to fill it. See <a href="#usb">Writing the USB stick</a>.</td></tr>
+      <tr><td><code>qemu</code>, <code>qemu-usb</code></td><td>&mdash;</td><td>Legacy: boot the image file in QEMU. See <a href="#booting">Booting</a>.</td></tr>
+      <tr><td><code>qemu-realusb</code></td><td>needs <code>USB_DEVICE</code></td><td>Boot a stick written by <code>usb-write</code> in QEMU (console only).</td></tr>
+      <tr><td><code>clean</code></td><td>&mdash;</td><td>Remove build output but keep the ports and the X.Org/GTK3 sysroot, for a fast incremental rebuild.</td></tr>
+      <tr><td><code>distclean</code></td><td>&mdash;</td><td>Clean everything, ports included; the next build is a full one. Downloaded tarballs are kept, so no network is needed for it.</td></tr>
+      <tr><td><code>deps</code></td><td>&mdash;</td><td>Install the build dependencies (see above).</td></tr>
+      <tr><td><code>help</code></td><td>&mdash;</td><td>List every target and build variable.</td></tr>
+    </tbody>
+  </table>
+
+  <p><b>Build variables.</b> Pass them on the <code>make</code> command line, for example <code>make SCREEN_SIZE=medium</code>. They can be combined.</p>
+  <table class="table">
+    <thead>
+      <tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>SCREEN_SIZE</code></td><td>unset (large)</td><td>Preferred resolution. Unset or <code>large</code>: 1920&times;1200, falling back to 1920&times;1080, 1280&times;800, 1280&times;768, 1024&times;768. <code>medium</code>: 1280&times;800, falling back to 1280&times;768, 1024&times;768. Used by both the bootloader and the kernel's SVGA driver.</td></tr>
+      <tr><td><code>MAX_SCREEN_SIZE</code></td><td>no ceiling</td><td>A ceiling on that list, written <code>WIDTHxHEIGHT</code>, e.g. <code>MAX_SCREEN_SIZE=1920x1080</code>. Modes above it are skipped. Mainly for virtual machines on a 1920&times;1080 host (see <a href="#troubleshooting">Troubleshooting</a>).</td></tr>
+      <tr><td><code>LIKEOS_VERSION</code></td><td><code>0.2.7-HEAD</code></td><td>Version string shown in the boot banner and by <code>uname</code>.</td></tr>
+      <tr><td><code>DEBUG</code></td><td><code>0</code></td><td><code>DEBUG=1</code>: full debug build &mdash; kernel memory poisoning, DWARF symbols, an unstripped kernel, detailed libc stack-smash reports and byte dumps around a faulting instruction. Implies <code>CRASH_VERBOSE=1</code>, <code>NO_STRIP=1</code> and <code>NO_STRIP_USER=1</code>.</td></tr>
+      <tr><td><code>CRASH_VERBOSE</code></td><td><code>0</code></td><td><code>CRASH_VERBOSE=1</code>: detailed kernel and userspace crash reports (registers, decoded fault, page-table walk, mapping list) in an otherwise normal, stripped build without memory poisoning.</td></tr>
+      <tr><td><code>NO_STRIP</code></td><td>unset</td><td>Keep the kernel's symbol table so a crash trace can be resolved to function names.</td></tr>
+      <tr><td><code>NO_STRIP_USER</code></td><td>unset</td><td>Keep symbol tables in userspace programs and libraries, for gdb on LikeOS.</td></tr>
+      <tr><td><code>SERIAL</code></td><td>unset</td><td><code>SERIAL=1</code>: mirror the kernel log to the first serial port (COM1); the QEMU targets then show it on the terminal.</td></tr>
+      <tr><td><code>USB_SERIAL</code></td><td>unset</td><td><code>USB_SERIAL=1</code>: detect a USB CDC ACM serial device on real hardware and mirror the log to it.</td></tr>
+      <tr><td><code>I915_DEBUG</code></td><td><code>0</code></td><td><code>I915_DEBUG=1</code>: detailed log from the Intel graphics driver (every mode set and flip).</td></tr>
+      <tr><td><code>EXT4_MB</code></td><td>auto</td><td>Force the size of the ext4 root partition in the image, in MB. By default it is sized to the content plus 50% slack. <code>usb-write</code> grows it to the stick anyway.</td></tr>
+      <tr><td><code>ESP_MB</code></td><td><code>64</code></td><td>Size of the FAT EFI System Partition in MB.</td></tr>
+      <tr><td><code>LIKEOS_WEBKIT_JOBS</code></td><td>from RAM</td><td>An environment variable read by the GTK3 port: the exact number of parallel WebKitGTK compile jobs, overriding the memory-based estimate.</td></tr>
+      <tr><td><code>QEMU_MEM</code>, <code>NUM_CPUS</code>, <code>NO_SMP</code>, <code>USB_HID</code>, <code>NIC_DEVICE</code></td><td><code>1024M</code>, <code>4</code>, unset, unset, <code>e1000</code></td><td>QEMU targets only: guest memory, number of CPUs, no <code>-smp</code> at all, add a USB keyboard and mouse, and the emulated network card (e.g. <code>NIC_DEVICE=e1000e</code>).</td></tr>
+    </tbody>
+  </table>
+  <p>Examples:</p>
+  <pre class="code"><code>$ make SCREEN_SIZE=medium
+$ make MAX_SCREEN_SIZE=1920x1080
+$ make LIKEOS_VERSION=0.2.7
+$ make CRASH_VERBOSE=1
+$ make DEBUG=1</code></pre>
+  <div class="callout info"><strong>Changing options needs no clean.</strong> <code>SCREEN_SIZE</code> and <code>MAX_SCREEN_SIZE</code> are recorded in a stamp, and changing them rebuilds just the bootloader and the SVGA driver on the next <code>make</code>. Switching <code>DEBUG</code> or <code>CRASH_VERBOSE</code> removes the kernel's objects automatically, so a kernel is never linked from a mix of debug and non-debug objects.</div>
+
+  <p><b>Rebuilding a single port package.</b> The X.Org and GTK3 ports are driven by <code>build.sh</code> scripts that can also be run on their own. Given package names, they rebuild just those; <code>-f</code> ignores the stamps and builds from scratch. Afterwards, run <code>make</code> to put the result into the image:</p>
+  <pre class="code"><code>$ ports/xorg/build.sh libX11 libXext
+$ ports/xorg/gtk3/build.sh claws-mail
+$ ports/xorg/gtk3/build.sh -f webkitgtk
+$ make</code></pre>
+  <p>Package names are the ones in <code>ports/xorg/packages.list</code> and <code>ports/xorg/gtk3/packages.list</code>. Each package's build output goes to <code>ports/xorg/.logs/&lt;package&gt;.log</code> or <code>ports/xorg/gtk3/.logs/&lt;package&gt;.log</code>. The smaller ports have their own targets, such as <code>make ports-bash</code>, <code>make ports-openssh</code> or <code>make ports-curl</code>.</p>
+  <p>To return a port to its checked-in state, <code>ports/xorg/clean.sh</code> and <code>ports/xorg/gtk3/clean.sh</code> remove the unpacked trees, stamps and logs (the GTK3 one leaves the shared sysroot alone); the next <code>make</code> rebuilds them.</p>
+  <div class="callout info"><strong>Protecting your desktop during the WebKit build.</strong> If the build host is also your workstation, you can cap the memory the WebKitGTK build may use with a systemd scope, which is what its build script suggests:
+  <pre class="code"><code>$ systemd-run --user --scope -p MemoryHigh=4000M -p MemoryMax=5000M ports/xorg/gtk3/build.sh webkitgtk</code></pre>
+  Leave the desktop room: a cap set too close to the total memory only pins the build at its limit while the host swaps anyway.</div>
+</section>
+
+<section class="card" id="usb">
+  <h2>6. Writing the USB stick</h2>
+  <div class="callout warn"><strong>This erases the whole target device.</strong> <code>usb-write</code> runs <code>dd</code> with <code>sudo</code> over the device you name, then repartitions it. If you name the wrong device &mdash; your system disk, a backup drive &mdash; its contents are gone, and nothing can bring them back. Identify the stick with <code>lsblk</code> before and after plugging it in, name the <em>whole disk</em> (<code>/dev/sdb</code>, not <code>/dev/sdb1</code>), and read the device name twice before you press <kbd>Enter</kbd>.</div>
+  <ol class="steps">
+    <li>Plug in the USB stick and find its device name. It is the disk that appears when you plug it in, with the size of your stick:
+      <pre class="code"><code>$ lsblk -d -o NAME,SIZE,MODEL,TRAN</code></pre></li>
+    <li>Write the image, replacing <code>/dev/sdX</code> with your stick:
+      <pre class="code"><code>$ make usb-write USB_DEVICE=/dev/sdX</code></pre>
+      If the image is not current, it is built first. If you leave out <code>USB_DEVICE</code>, the target refuses and lists the available disks instead.</li>
+    <li>The target prints <em>&ldquo;WARNING: This will completely erase /dev/sdX&hellip;&rdquo;</em> and waits. Press <kbd>Enter</kbd> to continue, or <kbd>Ctrl</kbd>+<kbd>C</kbd> to cancel.</li>
+    <li>It unmounts any mounted partitions of the stick, writes the image with <code>dd</code> (<code>bs=4M</code>, synchronised), and then <b>grows the ext4 root partition and filesystem to fill the whole stick</b> (<code>sgdisk</code>, <code>e2fsck</code>, <code>resize2fs</code>), so the running system has the stick's full capacity.</li>
+    <li>When it reports <em>&ldquo;UEFI bootable USB drive created successfully&rdquo;</em>, the stick is ready. Eject it before unplugging.</li>
+  </ol>
+  <p>Writing an image from a previous build is just as quick: <code>usb-write</code> only rebuilds when something changed, and an edited configuration file under <code>res/</code> counts as a change.</p>
+  <div class="callout info"><strong>If the stick did not grow.</strong> Occasionally the build host does not re-read the new partition table in time and <code>usb-write</code> says so. Unplug and replug the stick, then finish the job by hand (partition 2 of your stick, e.g. <code>/dev/sdX2</code>):
+  <pre class="code"><code>$ sudo e2fsck -fy /dev/sdX2
+$ sudo resize2fs /dev/sdX2</code></pre></div>
+</section>
+
+<section class="card" id="booting">
+  <h2>7. Booting LikeOS</h2>
+  <p>The supported way to run LikeOS is from a written stick: on real hardware, or in VMware or VirtualBox with the stick attached to the virtual machine. The QEMU targets still work and are handy for a quick look at the console.</p>
+
+  <p><b>Real hardware (UEFI USB boot).</b> Tested successfully on the <b>Lenovo ThinkPad P50</b> and the <b>Dell Pro 16 Plus</b>.</p>
+  <ol class="steps">
+    <li>In the firmware setup, make sure the machine boots in <b>UEFI</b> mode and that <b>Secure Boot is disabled</b> &mdash; the LikeOS bootloader is not signed.</li>
+    <li>Plug in the stick and switch the machine on. Open the firmware's one-time boot menu (on ThinkPad and Dell notebooks usually <kbd>F12</kbd>) and choose the USB stick's UEFI entry.</li>
+    <li>The bootloader sets the screen mode, loads <code>/boot/kernel.elf</code> from the stick's ext4 partition and starts the kernel. After the boot messages you get a login prompt on the console.</li>
+  </ol>
+  <p>LikeOS reads and writes only the stick: its storage drivers are USB mass storage over xHCI (AHCI and NVMe are planned), so the machine's internal disks are left untouched. Networking is wired Ethernet with the Intel e1000/e1000e/igb, eepro100, AMD PCnet32, NE2000, Realtek RTL8139, DEC Tulip and VMware vmxnet3 drivers; the kernel requests an address over DHCP while it boots.</p>
+
+  <p><b>VMware.</b> VMware boots the stick over its USB 3.1 controller, with X and the desktop fully working.</p>
+  <ol class="steps">
+    <li>Create a virtual machine for a 64-bit guest without a virtual hard disk; LikeOS lives on the stick.</li>
+    <li>Set the firmware type to <b>UEFI</b>, and the USB controller's compatibility to <b>USB 3.1</b>.</li>
+    <li>Under <b>Display</b>, decide on <b>Accelerate 3D graphics</b>: with it on, X and GL clients (the web browser included) render on the virtual GPU; with it off, LikeOS renders in software. Both work.</li>
+    <li>For networking, the e1000, e1000e and vmxnet3 adapter types all have drivers.</li>
+    <li>Plug in the stick, connect it to the virtual machine (VMware's removable-devices menu), and power the VM on, choosing the USB device in the firmware's boot manager if it does not boot from it on its own.</li>
+  </ol>
+
+  <p><b>VirtualBox.</b> VirtualBox works with its xHCI (USB 3) controller and the VMSVGA graphics adapter.</p>
+  <ol class="steps">
+    <li>Create a 64-bit virtual machine without a hard disk, and enable <b>EFI</b> in its system settings.</li>
+    <li>Under <b>Display</b>, choose the <b>VMSVGA</b> graphics controller. Enabling 3D acceleration lets X and GL clients use the virtual GPU, as on VMware.</li>
+    <li>Under <b>USB</b>, select the <b>USB 3.0 (xHCI)</b> controller and add a device filter for your stick, so it is attached to the virtual machine.</li>
+    <li>Choose an Intel PRO/1000 (e1000) or PCnet network adapter, then start the machine with the stick plugged in.</li>
+  </ol>
+
+  <p><b>QEMU (legacy targets).</b> These boot the image file (or a written stick) directly. They use OVMF as the UEFI firmware, an xHCI USB controller and an e1000 network card with user-mode networking. Under QEMU, LikeOS draws on the <b>UEFI framebuffer</b>: there is no VMware SVGA support there, so the desktop runs without GPU acceleration.</p>
+  <pre class="code"><code>$ make qemu
+$ make qemu-usb
+$ make qemu-realusb USB_DEVICE=/dev/sdX</code></pre>
+  <p><code>make qemu</code> boots <code>build/likeos-ext4.img</code> as a USB stick. <code>make qemu-usb</code> does the same through <code>sudo</code>, so that <code>ping</code> to outside hosts works. <code>make qemu-realusb</code> boots a stick written by <code>usb-write</code>, which is the way to check that the stick really boots; it is console only &mdash; do not run <code>startx</code> under it, because every disk read goes to physical USB hardware through an emulated controller and X is far too slow that way. The QEMU targets give the guest 1024 MB by default; raise it with <code>QEMU_MEM=2G</code>, and add <code>SERIAL=1</code> to see the kernel log on your terminal.</p>
+  <p>To run X from a real stick under QEMU, drive it through <b>virt-manager</b> with KVM. This configuration is known to work:</p>
+  <ol class="steps">
+    <li>Create a new virtual machine in virt-manager and select manual installation.</li>
+    <li>Choose <em>Debian 13</em> as the operating system.</li>
+    <li>Give it 2048 MB of RAM and, for example, 4 CPUs.</li>
+    <li>Tick <em>Customize configuration before install</em>.</li>
+    <li>Under <em>Overview</em>, set the firmware to UEFI with <code>OVMF_CODE_4M.fd</code>.</li>
+    <li>For the NIC, select <em>Bridge</em> and enter your bridge device (for example <code>virbr0</code>).</li>
+    <li>Select <code>e1000e</code> as the NIC model first, then change the model to <code>e1000</code> in the XML.</li>
+    <li>Set <em>Video</em> to VGA.</li>
+    <li>Boot the machine, connect the USB stick to it, and type <code>exit</code> at the UEFI prompt. LikeOS then boots from the stick.</li>
+  </ol>
+
+  <p><b>Graphics: chosen automatically at run time.</b> Nothing has to be configured for the graphics. When you start X, its start-up scripts (<code>xserverrc</code> and <code>xinitrc</code>) ask the display driver what it is and what it can do, using <code>drminfo</code>, and pick the configuration to match. The X server and the GL clients always make the same choice:</p>
+  <table class="table">
+    <thead>
+      <tr><th>Machine</th><th>X configuration</th><th>Rendering</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Intel graphics (i915 driver; Broadwell through Meteor Lake, fully driven on Skylake-class parts such as the ThinkPad P50's HD Graphics 530)</td><td><code>xorg.conf.modesetting-i915</code>: modesetting with glamor, DRI3, page flipping</td><td>GPU, through Mesa's iris driver; video decoding through VA-API</td></tr>
+      <tr><td>VMware (and VirtualBox VMSVGA) with 3D acceleration on</td><td><code>xorg.conf.modesetting-vmwgfx-3d</code>: modesetting with glamor</td><td>GPU, through Mesa's svga driver on the SVGA3D device</td></tr>
+      <tr><td>VMware with 3D acceleration off, or any other display driver</td><td><code>xorg.conf.modesetting</code></td><td>Software (Mesa's llvmpipe for GL)</td></tr>
+      <tr><td>No display driver at all</td><td><code>xorg.conf</code>: fbdev on <code>/dev/fb0</code>, the UEFI framebuffer</td><td>Software</td></tr>
+    </tbody>
+  </table>
+  <p>Older Intel generations and the newest Xe2+ parts are recognised and left to the firmware framebuffer, which is the software path in the last row.</p>
+</section>
+
+<section class="card" id="first-steps">
+  <h2>8. First steps after boot</h2>
+  <ol class="steps">
+    <li><b>Log in as root.</b> At the console login prompt:
+      <pre class="code"><code>login: root
+password: toor</code></pre></li>
+    <li><b>Change the root password</b> straight away:
+      <pre class="code"><code># passwd</code></pre></li>
+    <li><b>Create an ordinary account.</b> LikeOS is multi-user and file permissions are enforced, so you do not want to be root all the time. The desktop is meant to be used from an ordinary account: <code>adduser</code> asks for the new password, creates the home directory under <code>/home</code> and copies the desktop launchers into it from <code>/etc/skel</code>. Replace <code>alice</code> with the name you want:
+      <pre class="code"><code># adduser alice</code></pre></li>
+    <li><b>Log out and log in as the new user:</b>
+      <pre class="code"><code># exit</code></pre></li>
+    <li><b>Start the graphical desktop:</b>
+      <pre class="code"><code>$ startx</code></pre>
+      Any user can run <code>startx</code>: the X server is installed setuid root and gives root up as soon as it has opened the display and input devices, so no group membership is needed. The GTK applications expect to be run this way rather than as root &mdash; Claws Mail, for example, keeps its mailboxes and account settings in your home directory.</li>
+  </ol>
+
+  <p><b>The desktop.</b> X starts with the <b>ctwm</b> window manager, the <b>PCManFM</b> desktop (wallpaper and icons) and the LikeOS taskbar:</p>
+  <dl class="specs">
+    <dt>Desktop icons</dt>
+    <dd>Launchers from your <code>~/Desktop</code>: <em>Files</em> (PCManFM), <em>Terminal</em> (xfce4-terminal), <em>Xterm</em>, <em>Luakit Web Browser</em>, <em>Mail</em> (Claws Mail), <em>Text Editor</em> (Mousepad), <em>XNEdit</em>, <em>Calculator</em> (galculator), <em>X Calculator</em> and <em>Hexchat IRC Client</em>. Double-click one to start it.</dd>
+    <dt>Taskbar</dt>
+    <dd>A Windows 11-style bar across the bottom of the screen: the load and memory monitor on the left; the <b>LikeOS</b> start button and one button per open window in the middle (click to switch to or minimise a window, right-click for <em>Close</em>); the four workspace buttons and the clock with the date on the right.</dd>
+    <dt>Start menu</dt>
+    <dd>The LikeOS button opens <em>Programs</em>, built from the launchers on your desktop, plus <em>Restart ctwm</em> and <em>Exit ctwm</em>.</dd>
+    <dt>Keyboard menus</dt>
+    <dd>All three mouse buttons over the desktop belong to PCManFM, so the window manager's menus are on the keyboard. <kbd>Alt</kbd>+<kbd>F1</kbd> opens the root menu &mdash; Xterm, Explorer, Editor, Xnedit, Mail, Luakit Web Browser, Calculator, <em>Restart ctwm</em> and <em>Exit session</em>. <kbd>Alt</kbd>+<kbd>F2</kbd> opens the window operations menu (move, resize, raise, lower, occupy workspaces, close, kill).</dd>
+  </dl>
+
+  <p><b>Starting programs.</b> Use the desktop icons, the start menu or <kbd>Alt</kbd>+<kbd>F1</kbd>, or type the command in a terminal:</p>
+  <pre class="code"><code>$ luakit &amp;
+$ claws-mail &amp;
+$ xfce4-terminal &amp;
+$ pcmanfm &amp;
+$ mousepad &amp;</code></pre>
+  <p><b>luakit</b> is the web browser, built on WebKitGTK. <b>Claws Mail</b> reads and sends mail over IMAP, POP3 and SMTP with TLS, with spell checking; set up your mail account in it the first time you start it. The <b>Terminal</b> (xfce4-terminal) and <b>Xterm</b> give you a shell inside the desktop. The X keyboard layout is US.</p>
+  <p>Before you start the browser or mail client, you can check the network from a terminal &mdash; the kernel configures wired Ethernet over DHCP while it boots:</p>
+  <pre class="code"><code>$ ifconfig
+$ ping -c 3 example.com</code></pre>
+
+  <p><b>Leaving the desktop.</b> Choose <em>Exit ctwm</em> in the start menu or <em>Exit session</em> in the <kbd>Alt</kbd>+<kbd>F1</kbd> menu; you return to the console.</p>
+  <p><b>Shutting down and rebooting.</b> These need root. From the console as root:</p>
+  <pre class="code"><code># poweroff
+# reboot
+# shutdown -h now
+# shutdown -r now</code></pre>
+  <p>From an ordinary account, become root first with <code>su</code>, or run a single command as root:</p>
+  <pre class="code"><code>$ su -c poweroff</code></pre>
+  <p><code>shutdown</code> also accepts a delay (<code>+m</code> minutes, or a time as <code>hh:mm</code>); without one it waits a minute. <code>halt</code> stops the machine without powering it off.</p>
+</section>
+
+<section class="card" id="troubleshooting">
+  <h2>9. Troubleshooting</h2>
+
+  <p><b>The build stops at GLib with &ldquo;Meson version is 1.3.2 but project requires &gt;= 1.4.0&rdquo;.</b> Run <code>sudo make deps</code> again: it installs a current meson into the port's own environment. The GTK3 target checks for this before it starts and tells you so.</p>
+
+  <p><b>A port package fails to build.</b> Look at its log in <code>ports/xorg/.logs/</code> or <code>ports/xorg/gtk3/.logs/</code>; the last lines usually name the problem. After fixing it, <code>make</code> continues from that package.</p>
+
+  <p><b>The WebKitGTK build dies with &ldquo;ninja: build stopped&rdquo;, or the build host swaps heavily.</b> That is usually memory. Run it with fewer jobs (one is always safe), and see the memory-capping tip in <a href="#building">Building</a>:</p>
+  <pre class="code"><code>$ LIKEOS_WEBKIT_JOBS=1 make</code></pre>
+
+  <p><b>The build says the X server or the GTK3 stack is missing although the stamps say it was built.</b> The sysroot was removed under the stamps. Rebuild that port as the error message suggests:</p>
+  <pre class="code"><code>$ ports/xorg/clean.sh &amp;&amp; make</code></pre>
+
+  <p><b>The machine does not boot from the stick.</b> Check that the firmware boots in UEFI mode (there is no legacy BIOS path), that Secure Boot is off, and that you picked the stick's UEFI entry in the boot menu. In a virtual machine, check that the firmware is set to UEFI/EFI and that the stick is actually attached to the VM.</p>
+
+  <p><b>Screen resolution.</b> The resolution is chosen at build time. A default build prefers 1920&times;1200 and falls back to 1920&times;1080, 1280&times;800, 1280&times;768 and 1024&times;768; <code>SCREEN_SIZE=medium</code> prefers 1280&times;800. A virtual machine, though, advertises the modes its emulated adapter can scan out, not the ones the host's panel can show: on a 1920&times;1080 notebook VirtualBox, VMware and QEMU all offer 1920&times;1200, a default build takes it, and the host then has to shrink the guest's screen, which makes full-screen mode awkward. Put a ceiling on the list to say what the display really is, and write the stick again:</p>
+  <pre class="code"><code>$ make MAX_SCREEN_SIZE=1920x1080
+$ make usb-write USB_DEVICE=/dev/sdX</code></pre>
+  <p>The ceiling need not be in the list: with <code>MAX_SCREEN_SIZE=1600x900</code> a default build settles on 1280&times;800. On a VMware-family adapter the SVGA driver also asks the hypervisor for the resolution it recommends (the host's own screen) and uses it when it fits; a ceiling bounds that as well, so leave <code>MAX_SCREEN_SIZE</code> unset when the guest should simply match the host's display. Below 1024&times;768 nothing in the list is selectable, and the firmware's own default is kept.</p>
+
+  <p><b>Which graphics path am I on?</b> <code>drminfo</code> opens the graphics device nodes and reports the display driver, its outputs and what it can do; <code>drminfo --driver</code> prints just the driver's name. The device nodes belong to root, so run it as root (for example <code>su -c drminfo</code>). The X server writes its log to <code>/var/log/Xorg.0.log</code>, which names the configuration file it was started with.</p>
+
+  <p><b>Logs and crash reports.</b> <code>dmesg</code> shows the kernel log. For more detail, rebuild with one of these and write the stick again:</p>
+  <dl class="specs">
+    <dt><code>CRASH_VERBOSE=1</code></dt>
+    <dd>Detailed kernel and userspace crash reports (registers, decoded fault, page-table walk) in an otherwise normal build.</dd>
+    <dt><code>DEBUG=1</code></dt>
+    <dd>A full debug build with symbols and kernel memory poisoning.</dd>
+    <dt><code>SERIAL=1</code></dt>
+    <dd>Mirror the kernel log to the first serial port (COM1). Under the QEMU targets it appears in your terminal.</dd>
+    <dt><code>USB_SERIAL=1</code></dt>
+    <dd>On real hardware, mirror the kernel log to a USB CDC ACM serial device.</dd>
+    <dt><code>I915_DEBUG=1</code></dt>
+    <dd>Detailed log from the Intel graphics driver.</dd>
+  </dl>
+
+  <p><b>Reporting problems.</b> Please report bugs and build failures on GitHub at <a href="https://github.com/kctherootkey/LikeOS-64">github.com/kctherootkey/LikeOS-64</a>, or write to the author, Nikolaos Rangos, at <a href="mailto:niko@systemtrap.com">niko@systemtrap.com</a>. Say which machine or virtual machine you used (and, for a VM, whether 3D acceleration was on), which commit you built, and include the crash report, the relevant lines of <code>dmesg</code>, or the failing port's log.</p>
+</section>
+
+</main>
+    <footer class="footer">
+      <div class="footer-inner">
+        <div>
+          <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+        </div>
+        <nav aria-label="Footer">
+          <a href="technical.html">Technical Details</a>
+          <a href="screenshots.html">Screenshots</a>
+          <a href="running.html">Running</a>
+          <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener">GitHub</a>
+          <a href="about.html">About</a>
+          <a href="donate.html">Donate</a>
+        </nav>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>

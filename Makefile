@@ -50,7 +50,7 @@ KERNEL_DEBUG_CFLAGS += -DI915_DEBUG=$(I915_DEBUG)
 CODENAME = blessed kitty
 
 # Version string: override on command line with LIKEOS_VERSION=x.y.z
-LIKEOS_VERSION ?= 0.2.5-HEAD
+LIKEOS_VERSION ?= 0.2.7-HEAD
 
 # Tools
 GCC = gcc
@@ -2560,11 +2560,12 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# good as the filter lists it finds: it reads every *.txt in the
 	# adblock/ subdirectory of its per-user data directory,
 	# ~/.local/share/luakit/adblock, and with none there it is enabled and
-	# blocks nothing.  EasyList and EasyPrivacy go into the skeleton, so
-	# every account adduser creates gets them, and into /root, which adduser
-	# never creates.  The snapshots live in res/xorg/gtk3/adblock/ and go
-	# stale (EasyList expects an update every few days); refresh.sh there
-	# fetches the current ones.  Per user, because luakit writes its
+	# blocks nothing.  EasyList, EasyPrivacy, Peter Lowe's list and the
+	# regional lists (refresh.sh names them) go into the skeleton, so every
+	# account adduser creates gets them, and into /root, which adduser never
+	# creates.  The snapshots live in res/xorg/gtk3/adblock/ and go stale
+	# (EasyList expects an update every few days); refresh.sh there fetches
+	# the current ones.  Per user, because luakit writes its
 	# `subscriptions' bookkeeping file next to the lists.
 	for d in $(EXT4_STAGING)/etc/skel $(EXT4_STAGING)/root; do \
 		mkdir -p "$$d/.local/share/luakit/adblock"; \

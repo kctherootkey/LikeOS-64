@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Technical Details &mdash; LikeOS</title>
+<meta name="description" content="The technical details of LikeOS 0.2.7-HEAD: kernel, memory management, filesystems, drivers, graphics, desktop, web browser and C library.">
+<meta name="author" content="Nikolaos Rangos">
+<meta name="theme-color" content="#23801a">
+<link rel="canonical" href="https://likeos.systemtrap.com/technical.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="LikeOS">
+<meta property="og:title" content="Technical Details &mdash; LikeOS">
+<meta property="og:description" content="The technical details of LikeOS 0.2.7-HEAD: kernel, memory management, filesystems, drivers, graphics, desktop, web browser and C library.">
+<meta property="og:url" content="https://likeos.systemtrap.com/technical.html">
+<meta property="og:image" content="https://likeos.systemtrap.com/assets/og-image.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="512x512" href="assets/icon-512.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+<!--
+  LikeOS website.
+  Copyright (C) 2026 The LikeOS Project
+  Web page copyright (C) 2026 Nikolaos Rangos.
+-->
+</head>
+<body data-page="technical">
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="topbar">
+  <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+  <div class="actions">
+    <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span class="label">Donate</span></a>
+    <button class="menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open the menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  </div>
+</header>
+<div class="backdrop" aria-hidden="true"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar" aria-label="Site menu">
+    <div class="brand-meta">
+      <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD &middot; dev branch</span>
+    </div>
+    <nav class="nav" aria-label="Main">
+      <div class="nav-label">Menu</div>
+      <a href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg><span>Home</span></a>
+      <a href="technical.html" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg><span>Technical Details</span></a>
+      <a href="luakit.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg><span>Luakit Web-Browser Cheatsheet</span></a>
+      <a href="screenshots.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5.5-5.5L5 20"/></svg><span>Screenshots and Videos</span></a>
+      <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></svg><span>Source Code</span><svg class="ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a>
+      <a href="running.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg><span>Running</span></a>
+      <a href="about.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>About</span></a>
+      <a href="donate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7-4.3-9-8.7C1.6 8 3.6 4.5 6.9 4.5c2 0 3.4 1 5.1 3 1.7-2 3.1-3 5.1-3 3.3 0 5.3 3.5 3.9 6.8C19 15.7 12 20 12 20z"/></svg><span>Donate</span></a>
+    </nav>
+    <div class="sidebar-donate">
+      <a class="btn btn-donate btn-block" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate to LikeOS</span></a>
+      <p>Every donation buys test hardware and brings a paid team closer.</p>
+    </div>
+  </aside>
+
+  <div class="main">
+<main class="content" id="content">
+  <header class="page-head">
+    <div>
+      <span class="eyebrow">Under the hood</span>
+      <h1>Technical Details</h1>
+      <p class="lede">Everything inside LikeOS 0.2.7-HEAD (dev branch) &mdash; from the kernel to the web browser.</p>
+    </div>
+    <aside class="donate-cta" aria-label="Support LikeOS">
+      <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate</span></a>
+      <small>Help fund test hardware and a paid development team.</small>
+    </aside>
+  </header>
+<section class="card intro" id="at-a-glance">
+  <h2>At a glance</h2>
+  <p>
+    LikeOS is a 64-bit operating system written from scratch: its own kernel, its own
+    C library and dynamic linker, and a Unix-like userland, with a large set of
+    unmodified upstream programs ported on top &mdash; from bash and OpenSSH up to an
+    X.Org desktop, GTK applications and a WebKit web browser. This page is an inventory
+    of what the current development tree contains.
+  </p>
+  <dl class="specs">
+    <dt>Architecture</dt><dd>x86-64 (long mode), higher-half kernel, up to 64 CPUs</dd>
+    <dt>Boot</dt><dd>UEFI only; own GNU-EFI bootloader that loads the ELF64 kernel straight from the ext4 root filesystem</dd>
+    <dt>Kernel</dt><dd>Monolithic, preemptive, SMP; 199 system calls with a POSIX-style interface; ACPI through ACPICA 20251212</dd>
+    <dt>Root filesystem</dt><dd>ext4 (read/write, journalled), on a single GPT USB disk image: FAT32 EFI System Partition + ext4 root</dd>
+    <dt>Graphics</dt><dd>Own DRM/KMS core with GEM, sync objects and DMA-BUF; native Intel i915 and VMware SVGA (vmwgfx) drivers; UEFI framebuffer fallback</dd>
+    <dt>Desktop</dt><dd>X.Org server 21.1 (modesetting + glamor), ctwm with a Windows&nbsp;11-style look, a LikeOS taskbar, PCManFM desktop, GTK 3.24</dd>
+    <dt>Web browser</dt><dd>luakit 2.4.0 on WebKitGTK 2.52.6</dd>
+    <dt>Shell</dt><dd>bash 5.2 as <code>/bin/sh</code></dd>
+    <dt>License</dt><dd>GNU General Public License version 2 (GPLv2)</dd>
+    <dt>Current release</dt><dd>0.2.7-HEAD (dev branch)</dd>
+  </dl>
+</section>
+
+<nav class="toc">
+  <h2>On this page</h2>
+  <ol>
+    <li><a href="#kernel">Kernel core</a></li>
+    <li><a href="#memory">Memory management</a></li>
+    <li><a href="#scheduling">Scheduling and processes</a></li>
+    <li><a href="#filesystems">Filesystems and storage</a></li>
+    <li><a href="#devices">Devices and buses</a></li>
+    <li><a href="#networking">Networking</a></li>
+    <li><a href="#graphics">Graphics and GPU drivers</a></li>
+    <li><a href="#desktop">Desktop and applications</a></li>
+    <li><a href="#browser">Web browser and multimedia</a></li>
+    <li><a href="#libc">C library and runtime</a></li>
+    <li><a href="#security">Security and users</a></li>
+    <li><a href="#devtools">Developer tools</a></li>
+    <li><a href="#hardware">Supported hardware and virtual machines</a></li>
+  </ol>
+</nav>
+
+<section class="card" id="kernel">
+  <h2>Kernel core</h2>
+  <p>
+    The kernel is organised into subsystems for the executive (<code>ke</code>), the
+    hardware abstraction layer (<code>hal</code>), memory management (<code>mm</code>),
+    filesystems (<code>fs</code>), console and terminals (<code>io</code>), device
+    drivers (<code>dev</code>) and networking (<code>net</code>).
+  </p>
+  <dl class="specs">
+    <dt>Mode</dt><dd>64-bit long mode, higher-half mapping, four-level paging</dd>
+    <dt>Boot path</dt><dd>UEFI bootloader with framebuffer (GOP) and memory-map handoff</dd>
+    <dt>CPUs</dt><dd>Up to 64; AP start-up via INIT-SIPI-SIPI and a real-mode trampoline</dd>
+    <dt>Interrupts</dt><dd>IDT, Local APIC (xAPIC and x2APIC), IOAPIC routing, PCI MSI</dd>
+    <dt>Timekeeping</dt><dd>LAPIC timer tick, TSC-based precise time, HPET comparator for high-resolution timers</dd>
+    <dt>System calls</dt><dd>199, entered through the <code>SYSCALL</code> instruction</dd>
+    <dt>ACPI</dt><dd>ACPICA 20251212 (table parsing, AML interpreter, namespace enumeration)</dd>
+  </dl>
+  <h3>Core features</h3>
+  <ul class="checklist">
+    <li>SMP with per-CPU data via the GS base, per-CPU run queues, IPIs and TLB shootdown.</li>
+    <li>Per-task extended processor state (x87/SSE/AVX through <code>XSAVE</code>), saved and restored across context switches and in signal frames.</li>
+    <li>High-resolution timers on an HPET comparator, giving precise <code>nanosleep</code>, <code>clock_nanosleep</code>, futex and poll timeouts.</li>
+    <li>Clocks: <code>CLOCK_REALTIME</code>, <code>MONOTONIC</code>, <code>MONOTONIC_RAW</code>, <code>BOOTTIME</code>, the coarse variants and per-process/per-thread CPU-time clocks.</li>
+    <li>POSIX interval timers (<code>timer_create</code> family), <code>setitimer</code> and <code>alarm</code>.</li>
+    <li>CPU performance: HWP with the energy-performance preference set to maximum performance on each core, and Enhanced SpeedStep on older Intel CPUs.</li>
+    <li>ACPI power management: S5 poweroff and the ACPI reset register.</li>
+    <li>Firmware loader that reads blobs (Intel GPU DMC, GuC and HuC images) from <code>/lib/firmware</code>.</li>
+    <li>ChaCha20-based CSPRNG with an entropy pool, <code>/dev/random</code>, <code>/dev/urandom</code> and <code>getrandom</code>.</li>
+    <li>Assertion framework (<code>BUG_ON</code>, <code>WARN_ON</code>, <code>WARN_ON_ONCE</code>, <code>VM_BUG_ON</code>, <code>BUILD_BUG_ON</code>) and full crash dumps for kernel and user faults.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Console and terminals</h3>
+  <ul class="checklist">
+    <li>Framebuffer console with double buffering, write-combining, scrollback, a scrollbar and a mouse pointer.</li>
+    <li>Virtual terminals with an ANSI/VT100/VT220/xterm emulator: 256-colour and true-colour SGR, scroll regions, alternate screen, mouse reporting and terminal query replies.</li>
+    <li>POSIX TTY line discipline, job-control signals, and pseudo-terminals (<code>/dev/ptmx</code>, <code>/dev/pts</code>).</li>
+    <li>UTF-8 end to end; a PSF console font (Terminus) with a Unicode table.</li>
+    <li>Serial and USB-serial logging back ends.</li>
+  </ul>
+</section>
+
+<section class="card" id="memory">
+  <h2>Memory management</h2>
+  <ul class="checklist">
+    <li>Physical page allocator with a bitmap and per-page reference counts; a RAM-sized direct map.</li>
+    <li>SLAB allocator for kernel objects; memory poisoning in debug builds.</li>
+    <li><strong>Demand paging</strong>: anonymous memory, <code>brk</code>, BSS and file-backed mappings are populated on first touch, not at exec.</li>
+    <li><strong>Copy-on-write</strong> <code>fork</code>, plus a real <code>vfork</code> that shares the address space.</li>
+    <li><code>mmap</code>/<code>munmap</code> (anonymous, private and shared file mappings), <code>mprotect</code>, <code>mremap</code>, <code>madvise</code>, <code>mincore</code>, and <code>brk</code> that returns memory when the heap shrinks.</li>
+    <li>A per-process mapping table that grows on demand, up to 65,530 mappings &mdash; enough for large GTK and WebKit processes.</li>
+    <li>Guard-paged stacks; no-execute (NX) mappings, with kernel sections remapped by permission.</li>
+    <li>System V shared memory and semaphores, POSIX shared memory (<code>/dev/shm</code>) and <code>memfd_create</code>.</li>
+    <li>Unified page cache with read-ahead and CLOCK eviction, shared by ext4 and FAT32.</li>
+    <li><strong>OOM killer</strong>: when reclaim cannot satisfy an allocation, a victim process is chosen and killed instead of the machine stalling.</li>
+    <li>Diagnostics: <code>memstat</code> (system and per-process accounting) and <code>pmap</code> (one process's address space, with a watch mode).</li>
+  </ul>
+</section>
+
+<section class="card" id="scheduling">
+  <h2>Scheduling and processes</h2>
+  <h3>Scheduler</h3>
+  <ul class="checklist">
+    <li>Preemptive, <strong>fair</strong> scheduler: every task is charged the CPU time it uses (<code>vruntime</code>), and the task that has run least runs next.</li>
+    <li>Per-CPU run queues kept in <code>vruntime</code> order; woken tasks are placed just ahead of the runnable ones.</li>
+    <li>Periodic load balancing between CPUs, and CPU affinity (<code>sched_setaffinity</code>/<code>sched_getaffinity</code>).</li>
+    <li>The standard <code>sched_*</code> calls are accepted; there are no priority classes.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Processes and threads</h3>
+  <ul class="checklist">
+    <li><code>fork</code>, <code>vfork</code>, <code>clone</code> (threads, TLS, child TID set/clear, shared files, FS and signal handlers), <code>execve</code>, <code>exit_group</code>, <code>wait4</code>.</li>
+    <li>ELF64 loading of static and dynamically linked programs, and <code>#!</code> scripts.</li>
+    <li>Process groups, sessions and job control.</li>
+    <li>Signals: <code>rt_sigaction</code> with <code>SA_SIGINFO</code>, real-time queued signals, <code>sigaltstack</code>, <code>sigsuspend</code>, <code>sigtimedwait</code>, <code>tgkill</code>, and syscall restart.</li>
+    <li>Futexes: wait/wake, requeue and compare-requeue, wake-op, bitsets, priority-inheritance locks, and robust lists; process-private and shared keys.</li>
+    <li>Event interfaces: <code>poll</code>, <code>ppoll</code>, <code>select</code>, <code>pselect6</code>, <code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>signalfd</code>, pipes.</li>
+    <li><code>ptrace</code>: attach/trace-me, peek/poke memory and user area, general and FP registers, single-step, syscall tracing, fork/vfork/clone/exec/exit events, and hardware watchpoints through the debug registers.</li>
+    <li><code>/proc</code>: <code>self</code>, <code>&lt;pid&gt;/maps</code>, <code>cmdline</code>, <code>comm</code>, <code>exe</code>, <code>cwd</code>, <code>fd</code>, <code>stat</code>, <code>statm</code>, <code>status</code>, <code>auxv</code>, <code>mem</code>, plus <code>cpuinfo</code>, <code>meminfo</code>, <code>mounts</code>, <code>uptime</code>, <code>version</code>.</li>
+    <li><code>ps</code> shows what a blocked task is waiting on (WCHAN); <code>top</code>, <code>kdump</code> (kernel TCP, AF_UNIX, PTY and task tables).</li>
+  </ul>
+</section>
+
+<section class="card" id="filesystems">
+  <h2>Filesystems and storage</h2>
+  <h3>ext4 &mdash; the root filesystem</h3>
+  <ul class="checklist">
+    <li>Full read <em>and</em> write support: extent trees (with growth) and indirect block mapping.</li>
+    <li>Hash-indexed (htree) directories, including directory hashing on write.</li>
+    <li>JBD2 journal in ordered-data mode, with replay after an unclean shutdown.</li>
+    <li>64-bit, <code>flex_bg</code> and <code>metadata_csum</code> (CRC32C) filesystems.</li>
+    <li>Extended attributes, symbolic and hard links, <code>fallocate</code>.</li>
+    <li>Correct unlink-while-open semantics: an orphaned inode lives until its last close.</li>
+    <li>The bootloader reads <code>/boot/kernel.elf</code> straight out of ext4.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Other filesystems</h3>
+  <ul class="checklist">
+    <li><strong>FAT32</strong> with long file names, used for the EFI System Partition.</li>
+    <li><strong>tmpfs</strong> mounted at <code>/ram</code>, with hard links (used to run the browser's cache in RAM).</li>
+    <li><strong>devfs</strong>: <code>/dev/null</code>, <code>zero</code>, <code>random</code>, <code>urandom</code>, <code>tty</code>, <code>console</code>, <code>ptmx</code>, <code>pts/*</code>, <code>fb0</code>, <code>input/event*</code>, <code>dri/card*</code>, <code>dri/renderD*</code>, <code>shm</code>, <code>fd</code> and the disk nodes.</li>
+    <li><strong>procfs</strong> (<code>/proc</code>) and <strong>sysfs</strong> (<code>/sys/bus/pci/devices</code> and device classes such as the backlight).</li>
+  </ul>
+  <hr class="soft">
+  <h3>VFS and caching</h3>
+  <ul class="checklist">
+    <li>VFS with symlinks, hard links, <code>*at()</code> calls, <code>chroot</code>, <code>statfs</code>, <code>utimensat</code>, <code>sync</code>/<code>fsync</code>/<code>fdatasync</code>.</li>
+    <li>POSIX advisory record locks (<code>F_GETLK</code>/<code>F_SETLK</code>/<code>F_SETLKW</code>).</li>
+    <li>Dentry cache (positive and negative entries), inode cache, and the unified page cache with dirty writeback.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Storage</h3>
+  <ul class="checklist">
+    <li>Block device layer over USB mass storage (Bulk-Only Transport) on xHCI; 1&nbsp;MiB write coalescing for USB throughput.</li>
+    <li>Disk image: one GPT USB disk &mdash; partition 1 is the FAT EFI System Partition (bootloader only), partition 2 the ext4 root; <code>make usb-write</code> grows the root to the full drive.</li>
+  </ul>
+  <div class="note">AHCI/SATA and NVMe controllers are not yet supported, and mounting removable media is still pending; LikeOS runs from a USB drive.</div>
+</section>
+
+<section class="card" id="devices">
+  <h2>Devices and buses</h2>
+  <table class="table">
+    <thead>
+      <tr><th>Area</th><th>Support</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>PCI</td><td>Configuration-space enumeration, capabilities, MSI; exported in <code>/sys/bus/pci</code></td></tr>
+      <tr><td>ACPI</td><td>ACPICA 20251212: tables (RSDP/XSDT/MADT/FADT), AML, device enumeration, S5 poweroff, reset</td></tr>
+      <tr><td>Interrupt controllers</td><td>Local APIC (xAPIC and x2APIC), IOAPIC; HPET</td></tr>
+      <tr><td>USB host</td><td>xHCI (USB 3.x) host controller driver, interrupt-driven</td></tr>
+      <tr><td>USB classes</td><td>Mass storage (Bulk-Only Transport); HID boot keyboards and mice, report-protocol mice with scroll wheel; USB-serial logging</td></tr>
+      <tr><td>Legacy input</td><td>PS/2 keyboard and mouse</td></tr>
+      <tr><td>I2C-HID</td><td>Intel LPSS DesignWare I2C controller with HID-over-I2C touchpads, found through ACPI (experimental)</td></tr>
+      <tr><td>Input interface</td><td>evdev (<code>/dev/input/event*</code>), used by the X server</td></tr>
+      <tr><td>Display</td><td>Intel i915, VMware SVGA II/SVGA3D (vmwgfx), UEFI GOP framebuffer, <code>/dev/fb0</code> (fbdev)</td></tr>
+      <tr><td>Backlight</td><td>Intel PWM backlight in <code>/sys/class/backlight/intel_backlight</code> and the <code>backlight</code> tool</td></tr>
+      <tr><td>Network</td><td>Nine Ethernet drivers &mdash; see <a href="#networking">Networking</a></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="card" id="networking">
+  <h2>Networking</h2>
+  <h3>Protocol stack</h3>
+  <ul class="checklist">
+    <li>Ethernet, ARP, IPv4, ICMP, IGMP, UDP and TCP, with a routing table and softirq-based receive processing.</li>
+    <li>In-kernel DHCP client and DNS resolver (forward and reverse).</li>
+    <li>BSD socket API: <code>sendmsg</code>/<code>recvmsg</code>, <code>accept4</code>, <code>sendfile</code>, <code>shutdown</code> half-close, raw sockets for <code>ping</code> and <code>traceroute</code>.</li>
+    <li>Socket options including <code>SO_REUSEADDR</code>, <code>SO_REUSEPORT</code>, <code>SO_KEEPALIVE</code>, <code>SO_LINGER</code>, buffer sizes and timeouts, <code>TCP_NODELAY</code> and the keepalive tunables.</li>
+  </ul>
+  <h3>TCP</h3>
+  <ul class="checklist">
+    <li>Window scaling and timestamps (RFC 7323), selective acknowledgements (RFC 2018).</li>
+    <li>NewReno congestion control (RFC 5681), RTO computation (RFC 6298), initial window of ten segments (RFC 6928).</li>
+    <li>SYN cookies (RFC 4987), SipHash-based initial sequence numbers (RFC 6528), challenge ACKs (RFC 5961), path-MTU handling (RFC 1191).</li>
+  </ul>
+  <h3>Unix domain sockets</h3>
+  <ul class="checklist">
+    <li>Stream, datagram and sequenced-packet sockets; filesystem and abstract names.</li>
+    <li>File-descriptor passing (<code>SCM_RIGHTS</code>) and peer credentials (<code>SO_PEERCRED</code>) &mdash; what D-Bus, the X server and DRI3 rely on.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Network drivers</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Driver</th><th>Hardware</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>e1000</td><td>Intel 82540EM, 82545EM (QEMU, VMware default, VirtualBox PRO/1000)</td></tr>
+      <tr><td>e1000e</td><td>Intel 82574L, 82583V, I217, I218 and the I219 family (generations 1&ndash;23); verified on the ThinkPad P50</td></tr>
+      <tr><td>igb</td><td>Intel 82575, 82576, I350, I210, I211</td></tr>
+      <tr><td>eepro100</td><td>Intel 8255x</td></tr>
+      <tr><td>pcnet32</td><td>AMD PCnet-PCI II / PCnet-FAST III</td></tr>
+      <tr><td>ne2k</td><td>NE2000-compatible PCI (Realtek RTL8029AS)</td></tr>
+      <tr><td>rtl8139</td><td>Realtek RTL8139 / RTL8139C+</td></tr>
+      <tr><td>tulip</td><td>DEC 21040, 21041, 21140, 21142, 21143</td></tr>
+      <tr><td>vmxnet3</td><td>VMware paravirtual NIC (ESXi, Workstation, Fusion, QEMU)</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Command-line tools: <code>ifconfig</code>, <code>route</code>, <code>arp</code>, <code>arping</code>,
+    <code>ping</code>, <code>traceroute</code>, <code>netstat</code>, <code>dhclient</code>, <code>host</code>,
+    <code>dig</code>, <code>nslookup</code>, <code>hostname</code>, plus the ported curl, netcat and OpenSSH.
+  </p>
+  <div class="note">The stack is IPv4-only.</div>
+</section>
+
+<section class="card" id="graphics">
+  <h2>Graphics and GPU drivers</h2>
+  <h3>DRM/KMS core</h3>
+  <p>
+    A display-manager core written for LikeOS, offering the standard DRM ioctl interface
+    that libdrm, Mesa and the X server's modesetting driver use.
+  </p>
+  <ul class="checklist">
+    <li>Primary nodes (<code>/dev/dri/card*</code>) and render nodes (<code>/dev/dri/renderD*</code>), DRM master handling.</li>
+    <li>Atomic and legacy mode setting: CRTCs, planes (primary, overlay, cursor), connectors, properties, blending, colour management and damage clips.</li>
+    <li>Vblank counters and events, page flips, CRTC sequence queries.</li>
+    <li>GEM buffer objects, dumb buffers, and PRIME/DMA-BUF sharing between processes.</li>
+    <li>Fences, fence arrays and chains, reservation objects, <strong>sync files</strong>, and binary and timeline <strong>sync objects</strong>.</li>
+    <li>Dirty tracking of coherently mapped buffers through the page tables.</li>
+    <li>EDID, DisplayID and ELD parsing; DisplayPort, dual-mode, DSC, HDMI infoframe and SCDC helpers.</li>
+    <li>Device suspend/resume with a gate that holds clients off the hardware.</li>
+    <li>The kernel console becomes a DRM client when a driver is present, and hands the screen to the X server and takes it back.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Intel i915 driver</h3>
+  <p>
+    A native driver whose device table covers Intel graphics from the i830 (generation 2)
+    through Xe3 (Lunar Lake, Battlemage, Panther Lake, Wildcat Lake, Nova Lake).
+    The Skylake-class HD Graphics 530 of the ThinkPad P50 is the reference machine.
+  </p>
+  <ul class="checklist">
+    <li>Command submission: ring buffers on generations 2&ndash;7; execution lists with per-context 48-bit address spaces from Broadwell; GuC firmware submission (interface version 70) on the parts that require it (DG2, Meteor Lake and later), including the separate media GT.</li>
+    <li>Engines: render, blitter, video decode, video enhancement and compute.</li>
+    <li>Global GTT, per-process GTT (4-level, 5-level on Xe2+), stolen memory, and device-local memory on the discrete DG1, DG2 and Battlemage cards.</li>
+    <li>Render P-states (RPS), and SLPC frequency management through the GuC.</li>
+    <li>Firmware: DMC display microcode, GuC and HuC images from <code>/lib/firmware/i915</code> and <code>/lib/firmware/xe</code>.</li>
+    <li>Hang detection and engine reset; workarounds and MOCS tables per platform.</li>
+    <li>The i915 uAPI Mesa's iris driver and the VA-API media drivers use: GEM objects, contexts and VMs, <code>execbuffer2</code> with soft-pin and sync objects, queries.</li>
+  </ul>
+  <h3>Intel display engine</h3>
+  <ul class="checklist">
+    <li>Embedded DisplayPort panels from the VBT and EDID: link training, panel power sequencing, PWM backlight, ACPI OpRegion.</li>
+    <li>DisplayPort, HDMI and DVI outputs with hotplug detection; Type-C ports (Ice Lake to Meteor Lake).</li>
+    <li>Display stream compression (DSC), variable refresh timing, colour management, X- and Y-tiled scan-out.</li>
+    <li>PLLs and PHYs across generations: combo PHYs, Synopsys PHYs (DG2), C10/C20 PHYs (Meteor Lake and Arrow Lake), LT PHY (Nova Lake).</li>
+    <li>Legacy outputs of older generations: VGA, LVDS, SDVO, DVO, the TV encoder, and MIPI DSI panels on Bay Trail and Cherry Trail.</li>
+    <li>Display bandwidth, watermarks, CDCLK and power-well management.</li>
+  </ul>
+  <hr class="soft">
+  <h3>VMware SVGA (vmwgfx)</h3>
+  <ul class="checklist">
+    <li>A hardware layer for the SVGA II adapter found in VMware and VirtualBox (VMSVGA) &mdash; not used under QEMU, where LikeOS draws on the UEFI framebuffer; every optional feature is gated on what the host advertises.</li>
+    <li>Three scan-out paths chosen by device capability: legacy VRAM, screen objects and screen targets.</li>
+    <li>SVGA3D with guest-backed objects (MOBs, GB surfaces), DX (VGPU10) contexts, views and shaders, and command buffers.</li>
+    <li>Command-stream validation and handle translation, so no process can name another's objects.</li>
+    <li>FIFO and interrupt-driven fences, a hardware cursor, and the video overlay stream offered to X as an XVideo adaptor.</li>
+    <li>Suspend/resume, and the guest-to-host message channel.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Userspace graphics stack</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Component</th><th>Version</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Mesa</td><td>25.3.6</td><td>Gallium drivers: <b>iris</b> (Intel, Broadwell and later), <b>svga</b> (VMware/VirtualBox SVGA3D), <b>llvmpipe</b>, softpipe. OpenGL, OpenGL ES 2, GLX (DRI), EGL and GBM on X11</td></tr>
+      <tr><td>LLVM</td><td>23.1.0</td><td>Built for LikeOS (x86 back end) as llvmpipe's JIT</td></tr>
+      <tr><td>libdrm</td><td>2.4.124</td><td>DRM userspace interface</td></tr>
+      <tr><td>libepoxy</td><td>1.5.10</td><td>GL dispatch for GTK</td></tr>
+      <tr><td>GLU / Mesa demos</td><td>9.0.3 / 9.0.0</td><td></td></tr>
+    </tbody>
+  </table>
+  <p>
+    The X server runs glamor (OpenGL-accelerated 2D), DRI3 and Present on Intel graphics
+    and on VMware or VirtualBox with 3D enabled; clients such as WebKit render on the GPU
+    through the render node. Elsewhere it draws in software and GL falls back to llvmpipe.
+    <code>drminfo</code> reports the driver and its capabilities.
+  </p>
+</section>
+
+<section class="card" id="desktop">
+  <h2>Desktop and applications</h2>
+  <h3>Session</h3>
+  <ul class="checklist">
+    <li><code>startx</code> from any account: the X server is installed setuid root and drops privileges once its devices are open.</li>
+    <li>The server configuration is chosen at start-up from the detected GPU (i915, VMware 3D, other DRM driver, or plain fbdev).</li>
+    <li>A D-Bus session bus is started with the session.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Windows&nbsp;11-style look</h3>
+  <ul class="checklist">
+    <li><strong>ctwm</strong> window manager with LikeOS additions: flat, 30-pixel "Fluent" title bars with the application icon, wide minimise/maximise/close buttons (close in red), anti-aliased Xft title fonts, click-to-focus and raise-on-click.</li>
+    <li><strong>taskbar</strong>, a LikeOS GTK panel along the bottom: start button with a menu built from the installed <code>.desktop</code> files, a button per window with focus highlight and running indicators, a four-workspace switcher, a load and memory monitor, and a clock &mdash; driven purely through the EWMH and ICCCM standards.</li>
+    <li>A LikeOS GTK 3 theme compiled from SCSS, Windows-style message dialogs, and the LikeOS cursor theme generated at build time.</li>
+    <li>Fonts: Selawik as the interface font, plus Noto Sans, DejaVu, Liberation and the X core fonts.</li>
+    <li>PCManFM draws the wallpaper and desktop icons; new accounts receive launchers in <code>~/Desktop</code>.</li>
+  </ul>
+  <hr class="soft">
+  <h3>X Window System and toolkits</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Component</th><th>Version</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>X.Org server</td><td>21.1.23</td><td>modesetting driver with glamor, DRI2/DRI3, Present, GLX; XVideo</td></tr>
+      <tr><td>xf86-video-fbdev / xf86-input-evdev</td><td>0.5.0 / 2.11.0</td><td>Software fallback and input</td></tr>
+      <tr><td>libX11 / libxcb</td><td>1.8.13 / 1.17.0</td><td>Plus the usual X extension libraries</td></tr>
+      <tr><td>libxkbcommon / xkeyboard-config</td><td>1.13.1 / 2.47</td><td>Keyboard handling</td></tr>
+      <tr><td>Mesa</td><td>25.3.6</td><td>See <a href="#graphics">Graphics</a></td></tr>
+      <tr><td>FreeType / fontconfig / pixman</td><td>2.13.3 / 2.15.0 / 0.46.4</td><td>Font rendering and pixel compositing</td></tr>
+      <tr><td>Motif</td><td>2.3.8</td><td>Toolkit for XNEdit</td></tr>
+      <tr><td>GTK</td><td>3.24.52</td><td>Main toolkit; GTK 2.24.33 is also built for HexChat</td></tr>
+      <tr><td>GLib</td><td>2.88.3</td><td>GObject, GIO; glib-networking 2.80.1</td></tr>
+      <tr><td>Cairo / Pango / HarfBuzz</td><td>1.18.4 / 1.58.0 / 14.3.0</td><td>With FriBidi 1.0.16</td></tr>
+      <tr><td>gdk-pixbuf / ATK</td><td>2.44.7 / 2.38.0</td><td></td></tr>
+      <tr><td>GtkSourceView / VTE</td><td>4.8.4 / 0.84.1</td><td>Editor and terminal widgets</td></tr>
+      <tr><td>D-Bus</td><td>1.16.2</td><td>Session bus</td></tr>
+      <tr><td>libstdc++</td><td>GCC 13.3.0</td><td>C++ runtime for the C++ ports</td></tr>
+      <tr><td>Adwaita / hicolor icons, shared-mime-info</td><td>3.38.0 / 0.18 / 2.5.1</td><td></td></tr>
+    </tbody>
+  </table>
+  <h3>Applications</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Application</th><th>Version</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>ctwm</td><td>4.1.0</td><td>Window manager (with LikeOS patches)</td></tr>
+      <tr><td>PCManFM</td><td>1.4.0</td><td>File manager and desktop (libfm 1.4.1, menu-cache 1.1.1)</td></tr>
+      <tr><td>Claws Mail</td><td>4.4.0</td><td>IMAP, POP3 and SMTP over TLS (libetpan, GnuTLS 3.8.13), spell checking via Enchant and Hunspell</td></tr>
+      <tr><td>Mousepad</td><td>0.7.0</td><td>GTK text editor</td></tr>
+      <tr><td>xfce4-terminal</td><td>1.2.0</td><td>VTE-based terminal (libxfce4ui 4.20.2, xfconf 4.20.0)</td></tr>
+      <tr><td>HexChat</td><td>2.16.2</td><td>IRC client</td></tr>
+      <tr><td>galculator</td><td>2.1.4</td><td>Calculator</td></tr>
+      <tr><td>luakit</td><td>2.4.0</td><td>Web browser &mdash; see <a href="#browser">below</a></td></tr>
+      <tr><td>xterm</td><td>410</td><td>UTF-8, 256 colours</td></tr>
+      <tr><td>XNEdit</td><td>1.6.3</td><td>Motif text editor</td></tr>
+      <tr><td>X clients</td><td>&ndash;</td><td>xcalc, xclock, xload, xsetroot, xrandr, xset, xauth, xvinfo, twm</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="card" id="browser">
+  <h2>Web browser and multimedia</h2>
+  <h3>WebKitGTK 2.52.6</h3>
+  <ul class="checklist">
+    <li>The GTK&nbsp;3 API (webkit2gtk-4.1) on the X11 target, with feature options matching a mainstream desktop distribution build.</li>
+    <li>Skia rendering with its GPU back end on Mesa, a GPU process, and frames passed between processes as DMA-BUF descriptors via GBM; CPU rendering where there is no GPU.</li>
+    <li>JavaScriptCore with all JIT tiers, WebAssembly and the sampling profiler.</li>
+    <li>GStreamer media: video, Web Audio, Media Source Extensions, MediaStream, MediaRecorder, WebCodecs and GStreamer GL.</li>
+    <li>Gamepads (libmanette), WebDriver, colour management (LCMS), hyphenation, libsecret, MiniBrowser.</li>
+    <li>Networking through libsoup 3.6.6 with GnuTLS, HTTP/2 (nghttp2), the public suffix list (libpsl); ICU 78.3, SQLite, WOFF2/Brotli and WebP.</li>
+  </ul>
+  <hr class="soft">
+  <h3>luakit 2.4.0</h3>
+  <ul class="checklist">
+    <li>Keyboard-driven browser scripted in Lua 5.1.5 (with LuaFileSystem 1.9.0).</li>
+    <li>Hardware acceleration always on; window size chosen from the screen size.</li>
+    <li>Built-in ad blocking with option-aware filter rules and a keyword index, shipping EasyList, EasyPrivacy, Peter Lowe's list and more than twenty regional lists.</li>
+    <li>An optional launcher keeps the browser's profile and caches in RAM (<code>/ram</code>).</li>
+  </ul>
+  <hr class="soft">
+  <h3>Multimedia</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Component</th><th>Version</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GStreamer</td><td>1.24.13</td><td>Core with base, good, bad and libav plugins</td></tr>
+      <tr><td>FFmpeg</td><td>7.1.1</td><td>Codecs, <code>ffmpeg</code>/<code>ffprobe</code>, VA-API hardware acceleration</td></tr>
+      <tr><td>libva / libva-utils</td><td>2.22.0</td><td>VA-API, <code>vainfo</code></td></tr>
+      <tr><td>Intel media driver (iHD)</td><td>24.3.4</td><td>With gmmlib 22.5.2</td></tr>
+      <tr><td>Intel VA-API driver (i965)</td><td>2.4.1</td><td>Fallback driver</td></tr>
+    </tbody>
+  </table>
+  <p>
+    On Intel graphics, video is decoded on the GPU's video engines through VA-API
+    (GStreamer's <code>va</code> decoders for H.264, H.265, VP8, VP9 and AV1, and FFmpeg's
+    VA-API hwaccels). On VMware, the adapter's overlay is offered as the
+    "VMware Overlay Video Engine" XVideo adaptor next to glamor's textured adaptor.
+  </p>
+</section>
+
+<section class="card" id="libc">
+  <h2>C library and runtime</h2>
+  <p>
+    LikeOS has its own C library (<code>libc.so</code> and <code>libc.a</code>) and its own
+    dynamic linker, <code>ld-likeos.so</code>, both written for the system.
+  </p>
+  <ul class="checklist">
+    <li><strong>Dynamic linker</strong>: <code>dlopen</code>/<code>dlsym</code>, GNU hash tables, static and dynamic TLS (<code>__tls_get_addr</code>), constructors and <code>DT_INIT_ARRAY</code>, RELRO.</li>
+    <li><strong>Threads</strong>: POSIX threads (mutexes including robust ones, condition variables, barriers, read-write locks, thread-specific data), POSIX semaphores, and C11 <code>&lt;threads.h&gt;</code>.</li>
+    <li><strong>malloc</strong>: bin-based allocator with per-thread caches and multiple arenas.</li>
+    <li><strong>Math</strong>: correctly rounded <code>double</code> and <code>float</code> functions from LLVM libc, plus <code>fenv</code>.</li>
+    <li><strong>Unicode and locales</strong>: UTF-8 locale, the full multibyte and wide-character interface, <code>wcwidth</code>, <code>&lt;uchar.h&gt;</code>, generated Unicode tables.</li>
+    <li><strong>iconv</strong>: UTF-8, UTF-16, UTF-32, ISO-8859-1, ISO-8859-15 and ASCII.</li>
+    <li><strong>POSIX regular expressions</strong> (BRE and ERE, leftmost-longest), <code>fnmatch</code>, <code>glob</code>, <code>ftw</code>.</li>
+    <li><strong>Time zones</strong> from POSIX <code>TZ</code> rules or common Olson names.</li>
+    <li>Networking: <code>getaddrinfo</code>, resolver, <code>getifaddrs</code>; users and groups: <code>passwd</code>, <code>group</code>, <code>shadow</code>.</li>
+    <li><code>posix_spawn</code> built on <code>clone(CLONE_VM|CLONE_VFORK)</code>, <code>popen</code>, <code>makecontext</code>/<code>swapcontext</code>, PTY helpers, termios, System V IPC.</li>
+    <li>Stack-smashing protection in libc and in every program built against it.</li>
+  </ul>
+  <hr class="soft">
+  <h3>Base system ports</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Component</th><th>Version</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>bash</td><td>5.2.37</td><td>The system shell, installed as <code>/bin/sh</code></td></tr>
+      <tr><td>OpenSSH</td><td>10.4p1</td><td>Client tools and the <code>sshd</code> server</td></tr>
+      <tr><td>OpenSSL</td><td>3.5.6</td><td>TLS and crypto library and toolkit</td></tr>
+      <tr><td>curl</td><td>8.14.1</td><td>With nghttp2 1.65.0</td></tr>
+      <tr><td>tmux</td><td>3.6a</td><td>Terminal multiplexer (libevent 2.1.12)</td></tr>
+      <tr><td>nano</td><td>8.3</td><td>Text editor with syntax highlighting</td></tr>
+      <tr><td>netcat</td><td>OpenBSD</td><td>Networking utility</td></tr>
+      <tr><td>zlib</td><td>1.3.1</td><td>Compression</td></tr>
+      <tr><td>ncurses API</td><td>LikeOS</td><td>A LikeOS implementation of the curses interface</td></tr>
+    </tbody>
+  </table>
+  <h3>Core utilities</h3>
+  <p>
+    Written for LikeOS: <code>ls</code>, <code>cat</code>, <code>cp</code>, <code>mv</code>, <code>rm</code>,
+    <code>mkdir</code>, <code>rmdir</code>, <code>ln</code>, <code>touch</code>, <code>chmod</code>,
+    <code>stat</code>, <code>file</code>, <code>find</code>, <code>readlink</code>, <code>cmp</code>,
+    <code>grep</code>, <code>sed</code>, <code>expr</code>, <code>wc</code>, <code>sort</code>, <code>uniq</code>,
+    <code>cut</code>, <code>tr</code>, <code>head</code>, <code>tail</code>, <code>more</code>, <code>less</code>,
+    <code>strings</code>, <code>hexdump</code>, <code>uname</code>, <code>uptime</code>, <code>date</code>,
+    <code>time</code>, <code>ps</code>, <code>top</code>, <code>df</code>, <code>du</code>, <code>free</code>,
+    <code>dmesg</code>, <code>nproc</code>, <code>kill</code>, <code>sleep</code>, <code>env</code>,
+    <code>which</code>, <code>echo</code>, <code>printf</code>, <code>man</code>, <code>tty</code>,
+    <code>shutdown</code>, <code>poweroff</code>, <code>reboot</code>, <code>halt</code> and more.
+  </p>
+</section>
+
+<section class="card" id="security">
+  <h2>Security and users</h2>
+  <ul class="checklist">
+    <li>Multi-user login: <code>init</code> &rarr; <code>getty</code> &rarr; <code>login</code> driven by <code>/etc/inittab</code>.</li>
+    <li>PAM with a yescrypt-based <code>crypt(3)</code>; <code>/etc/passwd</code>, <code>/etc/shadow</code>, <code>/etc/group</code>.</li>
+    <li>Real, effective and saved user and group IDs, supplementary groups and set-user-ID execution.</li>
+    <li>Discretionary access control enforced in the VFS through a single privilege check, so permissions apply to every path that opens a file.</li>
+    <li>Device permissions by group (video, render); <code>/proc/&lt;pid&gt;/mem</code> and process maps restricted to the owner and root.</li>
+    <li><code>ptrace</code> and process inspection subject to the same access check.</li>
+    <li>SMEP and SMAP where the CPU supports them, NX mappings, ring&nbsp;3 isolation.</li>
+    <li>Stack canaries in the kernel and userland; RELRO in the dynamic linker.</li>
+    <li>ChaCha20 CSPRNG, SYN cookies and SipHash TCP sequence numbers.</li>
+    <li><code>chroot</code>; OpenSSH server for remote logins.</li>
+    <li>Account tools: <code>id</code>, <code>whoami</code>, <code>groups</code>, <code>su</code>, <code>passwd</code>, <code>adduser</code>, <code>addgroup</code>, <code>deluser</code>, <code>delgroup</code>.</li>
+  </ul>
+</section>
+
+<section class="card" id="devtools">
+  <h2>Developer tools</h2>
+  <ul class="checklist">
+    <li><strong>GDB 17.2</strong> and <code>gdbserver</code> running on LikeOS, on top of the kernel's <code>ptrace</code> with hardware watchpoints.</li>
+    <li>User crash reports that name the faulting mapping and offset and recover a probable call chain, resolvable with <code>addr2line</code> even for stripped libraries.</li>
+    <li>Kernel crash dumps and the assertion framework; debug builds with symbols and memory poisoning.</li>
+    <li>Diagnostics: <code>memstat</code>, <code>pmap</code>, <code>kdump</code>, <code>ps</code> with WCHAN, <code>dmesg</code>, <code>drminfo</code>.</li>
+    <li>On-target test programs: system-call, libc, memory, fork, network, OpenSSL and ext4 tests.</li>
+    <li>Host-side unit tests for libc (malloc, printf, strings, math, time zones, Unicode) and for the DRM and i915 code (EDID, VBT, DisplayPort, DSC, fences, sync objects, atomic checks, watermarks, colour, PLLs).</li>
+  </ul>
+  <hr class="soft">
+  <h3>Build system</h3>
+  <dl class="specs">
+    <dt>Build host</dt><dd>Ubuntu 24.04 LTS; <code>make deps</code> installs the prerequisites</dd>
+    <dt>Kernel and userland</dt><dd>GCC, cross-built; <code>make all</code></dd>
+    <dt>Ports</dt><dd>Upstream sources kept byte-identical; LikeOS changes live as patches and build files beside each port; cross toolchain wrappers for autotools, Meson and CMake</dd>
+    <dt>Output</dt><dd><code>build/likeos-ext4.img</code>, a bootable GPT USB disk image</dd>
+    <dt>Install</dt><dd><code>make usb-write USB_DEVICE=/dev/sdX</code></dd>
+    <dt>Screen size</dt><dd>Build-time preferred resolution (<code>SCREEN_SIZE</code>) and ceiling (<code>MAX_SCREEN_SIZE</code>)</dd>
+  </dl>
+</section>
+
+<section class="card" id="hardware">
+  <h2>Supported hardware and virtual machines</h2>
+  <table class="table">
+    <thead>
+      <tr><th>Platform</th><th>Status</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Lenovo ThinkPad P50</td><td>Tested</td><td>Reference machine: Intel HD Graphics 530 on the i915 driver with GPU acceleration, I219 Ethernet, USB boot</td></tr>
+      <tr><td>Dell Pro 16 Plus</td><td>Tested</td><td>USB boot</td></tr>
+      <tr><td>VMware</td><td>Supported</td><td>USB 3.1 boot; vmwgfx with 3D acceleration, overlay video, vmxnet3 or e1000</td></tr>
+      <tr><td>VirtualBox</td><td>Supported</td><td>xHCI (USB 3) and the VMSVGA adapter, with 3D when enabled</td></tr>
+      <tr><td>QEMU</td><td>Supported</td><td>USB image targets with xHCI; graphics on the UEFI framebuffer &mdash; there is no VMware SVGA support under QEMU; KVM recommended for the desktop</td></tr>
+    </tbody>
+  </table>
+  <dl class="specs">
+    <dt>Firmware</dt><dd>UEFI required</dd>
+    <dt>Boot medium</dt><dd>USB drive (xHCI)</dd>
+    <dt>Graphics</dt><dd>Intel integrated and discrete GPUs (i915), VMware/VirtualBox SVGA, or any UEFI GOP framebuffer</dd>
+    <dt>Default login</dt><dd><code>root</code> / <code>toor</code> (change it with <code>passwd</code>)</dd>
+  </dl>
+  <div class="note">
+    The i915 driver's device table reaches far beyond the machines it has been verified on;
+    real-hardware testing so far has been on the two notebooks above.
+  </div>
+</section>
+
+</main>
+    <footer class="footer">
+      <div class="footer-inner">
+        <div>
+          <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+        </div>
+        <nav aria-label="Footer">
+          <a href="technical.html">Technical Details</a>
+          <a href="screenshots.html">Screenshots</a>
+          <a href="running.html">Running</a>
+          <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener">GitHub</a>
+          <a href="about.html">About</a>
+          <a href="donate.html">Donate</a>
+        </nav>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<script src="assets/site.js" defer></script>
+</body>
+</html>

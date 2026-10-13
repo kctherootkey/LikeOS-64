@@ -1,0 +1,513 @@
+Ad blocking that honours filter options and scales to regional lists.
+
+The shipped parser reads only `$domain=' and `$third-party' and treats every
+`||host^' rule as two Lua patterns that are tried against the whole URI of
+each request.  That has three consequences once the regional EasyList
+variants are added next to EasyList and EasyPrivacy:
+
+ - Rules for the same pattern with different options were de-duplicated by
+   pattern alone, so `||googlesyndication.com^$third-party,domain=x' could
+   replace the unrestricted rule and let the ad server through everywhere
+   else.  Rules are now keyed by pattern and options; a pattern that comes
+   with several option sets keeps all of them.
+
+ - Exceptions limited to a resource type (`@@...$script', `$xmlhttprequest')
+   were applied to every request, which is how Google Ad Manager requests on
+   German news sites slipped past the block list.  The request handler has
+   no reliable resource type, so such exceptions are skipped; resource types
+   on block rules are ignored, so the rule applies to everything.
+
+ - Every request walked every pattern.  `||host' rules now go into a table
+   keyed by host and are matched against the part of the URI after the host;
+   the other rules are indexed by their longest literal keyword and only the
+   buckets whose keyword occurs in the URI are tried.  Matching 27 lists
+   costs about the same per request as the two default lists did before,
+   and the rule tables sent to each web process are smaller.
+
+`$domain=' now also covers the subdomains of the listed domain, and
+`$third-party' compares registrable sites rather than exact host names.
+
+Element hiding rules (`##') remain unsupported.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/lib/adblock.lua
++++ b/lib/adblock.lua
+@@ -110,7 +110,20 @@
+     msg.info("found " .. #filterfiles .. " filter list" .. (#filterfiles == 1 and "" or "s"))
+ end
+ 
+-local function get_abp_opts(s)
++-- Resource types a rule can be limited to; see get_abp_opts().
++local resource_types = {
++    script = true, image = true, stylesheet = true, css = true,
++    subdocument = true, frame = true, xmlhttprequest = true, xhr = true,
++    object = true, ["object-subrequest"] = true, media = true, font = true,
++    ping = true, beacon = true, websocket = true, webrtc = true,
++    other = true, all = true,
++}
++-- Options that only tune matching in ways that make no difference here.
++local ignored_options = {
++    ["match-case"] = true, important = true, ["_"] = true,
++}
++
++local function get_abp_opts(s, exception)
+     local opts = {}
+     local pos = string.find(s, "%$")
+     if pos then
+@@ -130,15 +143,36 @@
+                 key = string.sub(key, 2)
+             end
+ 
+-            if key == "domain" and val then
++            if (key == "domain" or key == "from") and val then
+                 local domains = {}
+                 for v in string.gmatch(val, "[^|]+") do
+-                    table.insert(domains, v)
++                    table.insert(domains, string.lower(v))
+                 end
+                 if #domains > 0 then opts["domain"] = domains end
+-            elseif key == "third-party" then
++            elseif key == "third-party" or key == "3p" then
+                 opts["third-party"] = not negative
++            elseif key == "first-party" or key == "1p" then
++                opts["third-party"] = negative
++            elseif resource_types[key] and exception then
++                -- An EXCEPTION limited to resource types cannot be applied
++                -- to only those types (send-request carries only the URI),
++                -- and applied to all it lets ads through: lists allow a
++                -- site's ad requests of one type and leave the ads to be
++                -- hidden by element-hiding rules, which this blocker does
++                -- not have.  Such exceptions are skipped.
++                opts["unknown"] = true
++            elseif resource_types[key] or ignored_options[key] then
++                -- A request's resource type is not known where requests
++                -- are filtered, so a BLOCKING rule limited to, or excepting,
++                -- types blocks every request it matches.  Dropping such
++                -- rules instead -- what was done before -- lost about one
++                -- in eight of EasyList's, among them many of its ad-server
++                -- rules.
+             else
++                -- Options that change what a rule does rather than which
++                -- requests it matches ($popup, $document, $csp=,
++                -- $redirect=, $removeparam=, $badfilter, ...) cannot be
++                -- carried out here: the rule is skipped.
+                 opts["unknown"] = true
+             end
+         end
+@@ -148,10 +182,10 @@
+ 
+ -- Convert Adblock Plus filter description to lua string pattern
+ -- See http://adblockplus.org/en/filters for more information
+-local abp_to_pattern = function (s)
++local abp_to_pattern = function (s, exception)
+     -- Strip filter options
+     local opts
+-    s, opts = get_abp_opts(s)
++    s, opts = get_abp_opts(s, exception)
+     if opts and opts.unknown == true then return {} end -- Skip rules with unknown options
+ 
+     local domain = nil
+@@ -162,7 +196,9 @@
+         local has_caret = string.find(s, "^", 1, true)
+         local domain_anchor = string.match(s, "^||")
+         if not has_star and not has_caret and not domain_anchor then
+-            return {s}, opts, nil, true
++            -- Lowercase like every other pattern: URIs are matched in
++            -- lower case, so a rule with a capital letter never matched.
++            return {string.lower(s)}, opts, nil, true
+         end
+ 
+         -- Optimize for domain anchor rules
+@@ -171,10 +207,23 @@
+             local d = string.sub(s, 3)
+             d = string.gsub(d, "/.*", "")
+             d = string.gsub(d, "%^.*", "")
++            d = string.gsub(d, "|.*", "")
+ 
+-            -- We don't bother with wildcard domains since they aren't frequent enough
+-            if not string.find(d, "*") then
+-                domain = d
++            -- A whole host name ("||ads.example.com^"): filed under it,
++            -- and the pattern is only what must follow the host -- the
++            -- index lookup (by the request host and its parent domains)
++            -- has already established that the host is this domain or a
++            -- subdomain of it.  One pattern per rule, where there were two
++            -- (bare host, subdomain), and it is the larger part of every
++            -- list.  Partial names ("||ads.", "||adserver*.com") take the
++            -- general path below.
++            if string.match(d, "^[%w%-]+%.[%w%-%.]*[%w%-]$") then
++                local rest = string.sub(s, 3 + #d)
++                rest = string.gsub(rest, "([%%%.%+%-%?])", "%%%1")
++                rest = string.gsub(rest, "%*", "%.%*")
++                rest = string.gsub(rest, "%^", "[^%%w%%-%%.%%%%]")
++                rest = string.gsub(rest, "|$", "%$")
++                return { "^" .. string.lower(rest) }, opts, string.lower(d), false
+             end
+         end
+ 
+@@ -210,14 +259,42 @@
+     return s, opts, domain, false
+ end
+ 
+-local add_unique_cached = function (pattern, opts, tab, cache_tab)
+-    if cache_tab[pattern] then
++-- A rule's restrictions as a string, so that the same pattern with other
++-- restrictions is told apart from a true duplicate.
++local opts_key = function (opts)
++    if opts == true or not opts then return "" end
++    return tostring(opts["third-party"]) .. "|" ..
++        table.concat(opts["domain"] or {}, ",")
++end
++
++-- File `pattern' with `opts' in bucket `tab'.  The same pattern can come
++-- with different restrictions from different lists -- say
++-- "||googlesyndication.com^" once with $domain=autobild.de and once
++-- unrestricted -- and each set has to be kept: keeping only the first, as
++-- was done, made a domain-limited copy in one list switch the rule off for
++-- every other site.  A pattern with more than one set holds them as
++-- { multi = { opts, opts, ... } }.
++local add_unique_cached = function (pattern, opts, tab, cache_tab, scope)
++    -- A rule without restrictions is filed as `true' rather than an empty
++    -- table: most rules have none, and the whole set is copied to every new
++    -- web process.
++    if opts == nil or next(opts) == nil then opts = true end
++    -- `scope' is the domain a domain rule is filed under: its pattern is
++    -- only what follows the host, the same for most of them.
++    local key = (scope or "") .. "\0" .. pattern .. "\0" .. opts_key(opts)
++    if cache_tab[key] then
+         return false
++    end
++    cache_tab[key] = true
++    local cur = tab[pattern]
++    if cur == nil then
++        tab[pattern] = opts
++    elseif cur ~= true and cur.multi then
++        table.insert(cur.multi, opts)
+     else
+-        --cache_tab[pattern], tab[pattern] = true, pattern
+-        cache_tab[pattern], tab[pattern] = true, opts
+-        return true
++        tab[pattern] = { multi = { cur, opts } }
+     end
++    return true
+ end
+ 
+ local list_new = function ()
+@@ -227,28 +304,85 @@
+         plain       = {},
+         ad_plain    = {},
+         domains     = {},
++        -- Rules indexed by a keyword: a run of at least three letters,
++        -- digits or "%" that any URI the rule matches must contain as a
++        -- whole token.  A request is then tested only against the rules
++        -- filed under the tokens of its own URI, instead of against every
++        -- rule of every list -- which ran tens of thousands of Lua pattern
++        -- matches per request on the page's own main thread, the thread
++        -- that also scrolls it.
++        kw_plain    = {},
++        kw_patterns = {},
+         length      = 0,
+         ignored     = 0,
+     }
+ end
+ 
+-local list_add = function(list, line, cache, pat_exclude)
+-    local pats, opts, domain, plain = abp_to_pattern(line)
++-- The keyword of a rule (its text without options), or nil.  A run of token
++-- characters qualifies when nothing in the rule can extend it in the URI: it
++-- is preceded by a separator or by the start anchor "|", and followed by a
++-- separator or the end anchor -- never by a wildcard, never at an unanchored
++-- end.  Of those, the longest is taken: long tokens are rarer -- except
++-- that tokens nearly every URI contains are taken only when there is
++-- nothing else, or the bucket they name would hold half the rules.
++local common_tokens = {
++    http = true, https = true, www = true, com = true, net = true,
++    org = true, html = true, php = true,
++}
++local abp_keyword = function (s)
++    s = string.lower(s)
++    local best, best_common
++    local pos = 1
++    while true do
++        local a, b = string.find(s, "[%w%%]+", pos)
++        if not a then break end
++        if b - a + 1 >= 3 then
++            local before = a > 1 and string.sub(s, a - 1, a - 1) or nil
++            local after = b < #s and string.sub(s, b + 1, b + 1) or nil
++            if before and before ~= "*" and after and after ~= "*" then
++                local tok = string.sub(s, a, b)
++                if common_tokens[tok] then
++                    best_common = best_common or tok
++                elseif not best or #tok > #best then
++                    best = tok
++                end
++            end
++        end
++        pos = b + 1
++    end
++    return best or best_common
++end
++
++local list_add = function(list, line, cache, pat_exclude, exception)
++    local pats, opts, domain, plain = abp_to_pattern(line, exception)
+     local contains_ad = string.find(line, "ad", 1, true)
++    local keyword = not domain and abp_keyword((string.gsub(line, "%$.*", "")))
+ 
+     for _, pat in ipairs(pats) do
+         local new
+         if plain then
+-            local bucket = contains_ad and list.ad_plain or list.plain
++            local bucket
++            if keyword then
++                list.kw_plain[keyword] = list.kw_plain[keyword] or {}
++                bucket = list.kw_plain[keyword]
++            else
++                bucket = contains_ad and list.ad_plain or list.plain
++            end
+             new = add_unique_cached(pat, opts, bucket, cache)
+         elseif pat ~= "^http:" and pat ~= pat_exclude then
+             if domain then
+                 if not list.domains[domain] then
+                     list.domains[domain] = {}
+                 end
+-                new = add_unique_cached(pat, opts, list.domains[domain], cache)
++                new = add_unique_cached(pat, opts, list.domains[domain], cache, domain)
+             else
+-                local bucket = contains_ad and list.ad_patterns or list.patterns
++                local bucket
++                if keyword then
++                    list.kw_patterns[keyword] = list.kw_patterns[keyword] or {}
++                    bucket = list.kw_patterns[keyword]
++                else
++                    bucket = contains_ad and list.ad_patterns or list.patterns
++                end
+                 new = add_unique_cached(pat, opts, bucket, cache)
+             end
+         end
+@@ -278,7 +412,7 @@
+         elseif line:match("##") or line:match("#@#") then
+             --icnt = icnt + 1
+         elseif line:match("^@@") then
+-            list_add(white, string.sub(line, 3), cache.white)
++            list_add(white, string.sub(line, 3), cache.white, nil, true)
+         else
+             list_add(black, line, cache.black, ".*")
+         end
+--- a/lib/adblock_wm.lua
++++ b/lib/adblock_wm.lua
+@@ -25,6 +25,15 @@
+     enabled_rules[list] = enable and rules[list] or nil
+ end)
+ 
++-- Is `domain' the domain `d' itself or one of its subdomains?  A rule's
++-- $domain=example.com covers www.example.com and m.example.com too.
++local function domain_is_or_under(domain, d)
++    if domain == d then return true end
++    local n = #d
++    return #domain > n and string.sub(domain, -n) == d and
++        string.sub(domain, -n - 1, -n - 1) == "."
++end
++
+ local function domain_match(domain, opts)
+     local res = false
+     local cnt = 0
+@@ -33,10 +42,14 @@
+         for _, s in pairs(dlist) do
+             if string.len(s) > 0 then
+                 if string.sub(s, 1, 1) == "~" then
+-                    if domain == string.sub(s, 2) then return false end
++                    if domain_is_or_under(domain, string.sub(s, 2)) then
++                        return false
++                    end
+                 else
+                     cnt = cnt + 1
+-                    if not res and domain == s then res = true end
++                    if not res and domain_is_or_under(domain, s) then
++                        res = true
++                    end
+                 end
+             end
+         end
+@@ -44,15 +57,43 @@
+     return cnt == 0 or res
+ end
+ 
++-- The site a host belongs to: its last two labels, or three when the second
++-- to last is a short second-level label (example.co.uk, example.com.au).
++-- Third-party means a different site, not a different host: a page's own
++-- cdn.example.com is first-party to www.example.com.
++local function site_of(domain)
++    local a, b, c = string.match(domain, "([^.]+)%.([^.]+)%.([^.]+)$")
++    if a and #b <= 3 and #c == 2 then return a .. "." .. b .. "." .. c end
++    return string.match(domain, "[^.]+%.[^.]+$") or domain
++end
++
+ local function third_party_match(domain1, domain2, opts)
+     local thp = opts["third-party"]
+     if thp ~= nil then
+-        if thp == true then return domain1 ~= domain2 end
+-        return domain1 == domain2
++        local third = site_of(domain1) ~= site_of(domain2)
++        if thp == true then return third end
++        return not third
+     end
+     return true
+ end
+ 
++-- Does a rule with restrictions `opts' (or several sets of them, see
++-- add_unique_cached() in adblock.lua) apply to this request?
++local function opts_ok(page_domain, uri_domain, opts)
++    if opts == true then return true end -- no restrictions
++    if opts.multi then
++        for _, o in ipairs(opts.multi) do
++            if o == true or (third_party_match(page_domain, uri_domain, o) and
++                domain_match(page_domain, o)) then
++                return true
++            end
++        end
++        return false
++    end
++    return third_party_match(page_domain, uri_domain, opts) and
++        domain_match(page_domain, opts)
++end
++
+ local function domain_from_uri(uri)
+     local domain = (uri and string.match(string.lower(uri), "^%a+://([^/]*)/?"))
+     -- Strip leading www. www2. etc
+@@ -60,12 +101,33 @@
+     return domain or ""
+ end
+ 
+-local match_list = function (list, uri, uri_domains, page_domain, uri_domain)
+-    -- First, check for domain name anchor (||) rules
++-- Returned for a bucket that does not exist, rather than a new {} each time.
++local EMPTY = {}
++
++local match_list = function (list, uri, uri_domains, page_domain, uri_domain, uri_tokens, uri_rest)
++    -- First, check for domain name anchor (||) rules: filed under the host
++    -- they name, their pattern is what follows the host (adblock.lua,
++    -- abp_to_pattern()).
+     for domain, _ in pairs(uri_domains) do
+-        for pattern, opts in pairs(list.domains[domain] or {}) do
+-            if third_party_match(page_domain, uri_domain, opts) then
+-                if domain_match(page_domain, opts) and string.match(uri, pattern) then
++        for pattern, opts in pairs(list.domains[domain] or EMPTY) do
++            if opts_ok(page_domain, uri_domain, opts) and string.match(uri_rest, pattern) then
++                return true, pattern
++            end
++        end
++    end
++
++    -- Rules filed under a keyword: only the buckets of the URI's own tokens
++    -- (see list_new() in adblock.lua).
++    local kw_plain, kw_patterns = list.kw_plain, list.kw_patterns
++    if kw_plain or kw_patterns then
++        for _, tok in ipairs(uri_tokens) do
++            for pattern, opts in pairs(kw_plain and kw_plain[tok] or EMPTY) do
++                if opts_ok(page_domain, uri_domain, opts) and string.find(uri, pattern, 1, true) then
++                    return true, pattern
++                end
++            end
++            for pattern, opts in pairs(kw_patterns and kw_patterns[tok] or EMPTY) do
++                if opts_ok(page_domain, uri_domain, opts) and string.match(uri, pattern) then
+                     return true, pattern
+                 end
+             end
+@@ -73,40 +135,32 @@
+     end
+ 
+     -- Next, match against plain text strings
+-    for pattern, opts in pairs(list.plain or {}) do
+-        if third_party_match(page_domain, uri_domain, opts) then
+-            if domain_match(page_domain, opts) and string.find(uri, pattern, 1, true) then
+-                return true, pattern
+-            end
++    for pattern, opts in pairs(list.plain or EMPTY) do
++        if opts_ok(page_domain, uri_domain, opts) and string.find(uri, pattern, 1, true) then
++            return true, pattern
+         end
+     end
+ 
+     -- If the URI contains "ad", check those buckets as well
+     if string.find(uri, "ad", 1, true) then
+         -- Check plain strings with "ad" in them
+-        for pattern, opts in pairs(list.ad_plain or {}) do
+-            if third_party_match(page_domain, uri_domain, opts) then
+-                if domain_match(page_domain, opts) and string.find(uri, pattern, 1, true) then
+-                    return true, pattern
+-                end
++        for pattern, opts in pairs(list.ad_plain or EMPTY) do
++            if opts_ok(page_domain, uri_domain, opts) and string.find(uri, pattern, 1, true) then
++                return true, pattern
+             end
+         end
+         -- Check patterns with "ad" in them
+-        for pattern, opts in pairs(list.ad_patterns or {}) do
+-            if third_party_match(page_domain, uri_domain, opts) then
+-                if domain_match(page_domain, opts) and string.match(uri, pattern) then
+-                    return true, pattern
+-                end
++        for pattern, opts in pairs(list.ad_patterns or EMPTY) do
++            if opts_ok(page_domain, uri_domain, opts) and string.match(uri, pattern) then
++                return true, pattern
+             end
+         end
+     end
+ 
+     -- Finally, check for a general match
+-    for pattern, opts in pairs(list.patterns or {}) do
+-        if third_party_match(page_domain, uri_domain, opts) then
+-            if domain_match(page_domain, opts) and string.match(uri, pattern) then
+-                return true, pattern
+-            end
++    for pattern, opts in pairs(list.patterns or EMPTY) do
++        if opts_ok(page_domain, uri_domain, opts) and string.match(uri, pattern) then
++            return true, pattern
+         end
+     end
+ end
+@@ -125,19 +179,31 @@
+     local src_domain = domain_from_uri(src)
+     local dst_domain = domain_from_uri(dst)
+ 
+-    -- Build a table of all domains this URI falls under
++    -- Build a table of all domains this URI falls under: from the full host,
++    -- "www." included, so that a rule for www.example.com is found too
+     local dst_domains = {}
++    local dst_host, dst_rest = string.match(dst, "^%a+://([^/:]*)(.*)$")
++    dst_rest = dst_rest or ""
+     do
+-        local d = dst_domain
++        local d = dst_host or dst_domain
+         while d do
+             dst_domains[d] = true
+             d = string.match(d, "%.(.+)")
+         end
+     end
+ 
++    -- Its tokens, once for every list (the keyword buckets' keys)
++    local dst_tokens, seen = {}, {}
++    for tok in string.gmatch(dst, "[%w%%]+") do
++        if #tok >= 3 and not seen[tok] then
++            seen[tok] = true
++            dst_tokens[#dst_tokens + 1] = tok
++        end
++    end
++
+     -- Test against each list's whitelist rules first
+     for _, list in pairs(enabled_rules) do
+-        local found, pattern = match_list(list.whitelist, dst, dst_domains, src_domain, dst_domain)
++        local found, pattern = match_list(list.whitelist, dst, dst_domains, src_domain, dst_domain, dst_tokens, dst_rest)
+         if found then
+             msg.debug("allowing request as pattern %q matched to uri %s", pattern, dst)
+             return true
+@@ -146,7 +212,7 @@
+ 
+     -- Test against each list's blacklist rules
+     for _, list in pairs(enabled_rules) do
+-        local found, pattern = match_list(list.blacklist, dst, dst_domains, src_domain, dst_domain)
++        local found, pattern = match_list(list.blacklist, dst, dst_domains, src_domain, dst_domain, dst_tokens, dst_rest)
+         if found then
+             msg.debug("blocking request as pattern %q matched to uri %s", pattern, dst)
+             return false

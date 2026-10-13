@@ -987,7 +987,8 @@ static const char *layout_name(uint64_t modifier)
 }
 
 /* The CPU wrote into the framebuffer through write-back memory; the
- * display reads DRAM.  Flush the lines of the rectangles. */
+ * display reads DRAM.  Flush the lines of the rectangles (a linear
+ * surface), or the object if the processor wrote it (a tiled one). */
 int intel_fb_dirty(struct drm_device *dev, struct drm_crtc *crtc,
 		   struct drm_framebuffer *fb, const struct drm_mode_rect_k *rects,
 		   uint32_t n)
@@ -1004,19 +1005,16 @@ int intel_fb_dirty(struct drm_device *dev, struct drm_crtc *crtc,
 	if (!cpp)
 		cpp = 4;
 	if (fb->modifier != DRM_FORMAT_MOD_LINEAR) {
-		/* Rectangles are in pixel space; a tiled surface interleaves
-		 * them across the whole allocation, so flush all of it. */
-		uint64_t off = fb->offset & ~63ULL;
-		uint64_t end = (uint64_t)fb->offset + (uint64_t)fb->pitch * fb->height;
-		while (off < end) {
-			uint32_t page = (uint32_t)(off / 4096);
-			if (page >= fb->obj->npages)
-				break;
-			uint8_t *va = (uint8_t *)phys_to_virt(fb->obj->pages[page]) + (off & 4095);
-			__asm__ volatile("clflush (%0)" ::"r"(va) : "memory");
-			off += 64;
-		}
-		__asm__ volatile("mfence" ::: "memory");
+		/* A tiled surface is drawn by the GPU, which writes past the
+		 * cache of a surface on the display.  Only what the processor
+		 * wrote through the cache -- in the CPU domain, by the
+		 * domain protocol -- needs flushing, and then all of it, since
+		 * tiling scatters the rectangles over the whole allocation.
+		 * The X server reports damage here every time it goes idle
+		 * with something drawn, so flushing the whole surface on
+		 * each call cost its main thread milliseconds per frame,
+		 * for nothing. */
+		i915_gem_object_flush_for_gpu(to_i915(dev), fb->obj);
 		return 0;
 	}
 	for (uint32_t r = 0; r < n; r++) {

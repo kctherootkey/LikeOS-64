@@ -826,18 +826,35 @@
 /* render standby (RC6) and frequency control */
 #define GEN6_RP_CONTROL 0xa024
 /* Render P-states: the frequency the driver asks for, and what the part
- * can do.  Gen8 counts in 50 MHz steps at bit 25; Gen9 onwards in 50/3
- * MHz steps at bit 23. */
+ * can do.  Broadwell counts in 50 MHz steps at bit 24; Gen9 onwards in
+ * 50/3 MHz steps at bit 23. */
 #define GEN6_RPNSWREQ 0xa008
 #define GEN6_FREQUENCY(x) ((uint32_t)(x) << 25)
+#define BDW_FREQUENCY(x) ((uint32_t)(x) << 24)
 #define GEN9_FREQUENCY(x) ((uint32_t)(x) << 23)
-#define GEN6_RP_STATE_CAP 0x145998 /* RP0 7:0, RP1 15:8, RPn 23:16 */
+/* RP0 7:0, RP1 15:8, RPn 23:16; in 50 MHz steps on the big-core Gen9
+ * parts and Gen10 onwards (GEN9_FREQ_SCALER request steps each) */
+#define GEN6_RP_STATE_CAP 0x145998
+#define GEN9_FREQ_SCALER 3
+#define BXT_RP_STATE_CAP 0x138170 /* RPn 7:0, RP1 15:8, RP0 23:16 */
 #define GEN6_RP_MEDIA_HW_NORMAL_MODE (2u << 9)
 #define GEN6_RP_MEDIA_IS_GFX (1u << 8)
 #define GEN6_RP_ENABLE (1u << 7)
 #define GEN6_RP_DOWN_IDLE_AVG (0x2u << 0)
 #define GEN6_RP_UP_BUSY_AVG (0x2u << 3)
 #define GEN6_RP_INTERRUPT_LIMITS 0xa014
+/* the evaluation the P-unit runs: busy/idle over an interval, in
+ * units of 16 command-streamer timestamp ticks */
+#define GEN6_RC_VIDEO_FREQ 0xa00c
+#define GEN6_RP_DOWN_TIMEOUT 0xa010
+#define GEN6_RP_MEDIA_TURBO (1u << 11)
+#define GEN6_RP_UP_THRESHOLD 0xa02c
+#define GEN6_RP_DOWN_THRESHOLD 0xa030
+#define GEN6_RP_UP_EI 0xa068
+#define GEN6_RP_DOWN_EI 0xa06c
+#define GEN6_RP_IDLE_HYSTERSIS 0xa070
+#define GEN6_PMINTRMSK 0xa168
+#define GEN8_PMINTR_DISABLE_REDIRECT_TO_GUC (1u << 31)
 #define GEN6_RP_CUR_UP_EI 0xa050
 #define GEN6_RPSTAT1 0xa01c
 #define GEN9_CAGF_MASK (0x1ffu << 23)

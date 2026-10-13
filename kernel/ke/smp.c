@@ -171,8 +171,11 @@ __no_stack_protector void ap_entry(void)
 	// Enable interrupts
 	__asm__ volatile("sti");
 
-	// Start LAPIC timer for this CPU
-	lapic_timer_start(100); // 100 Hz
+	/* This CPU's tick, at the boot CPU's rate.  A time slice is counted
+	 * in ticks, so at the 100 Hz these processors used to run while the
+	 * boot CPU ran 200 Hz, a task woken behind another here waited up to
+	 * 20 ms for its turn instead of 10. */
+	lapic_timer_start(200);
 
 	// Enter idle loop - the scheduler/timer will preempt us when work arrives.
 	// When a task is enqueued to our run queue (by fork, wake, or load balance),

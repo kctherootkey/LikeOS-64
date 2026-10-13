@@ -25,8 +25,6 @@
 #define EXEC_MAX_RELOCS 65536
 #define EXEC_WAIT_NS (10ULL * 1000000000ULL)
 
-void i915_gem_object_flush_for_gpu(struct i915_device *i915, struct drm_gem_object *o);
-
 static int copy_user_bounded(void *dst, uint64_t uptr, size_t len)
 {
 	if (!uptr || !validate_user_ptr(uptr, len))
@@ -386,6 +384,31 @@ static int wait_fence(struct drm_fence *f)
 	}
 }
 
+/* Whether a fence the client asks this batch to wait for is ordered
+ * before it already, by the engine: one of the engine's own requests
+ * (or a merge of nothing but those).  An engine fed by execlists or a
+ * ring runs its requests in the order they were queued, each batch
+ * starts with the caches invalidated behind the previous one's flush,
+ * and the batch behind any of its fences is queued before the fence is
+ * handed out -- so such a wait costs the client a round trip through
+ * the device and buys nothing.  Waiting for it in the call is what put
+ * every GL client in step with the GPU: the next batch was built only
+ * after the last one had finished.  A container (array, chain), another
+ * engine's or another device's fence, and anything under the GuC, which
+ * schedules contexts as it likes, are still waited for. */
+static int fence_ordered_by_engine(struct i915_device *i915, struct i915_engine *e,
+				   struct drm_fence *f, int depth)
+{
+	if (!f || f->signaled)
+		return 1;
+	if (i915->guc.submission || depth > 8 || f->ops)
+		return 0;
+	if (f->deps[0] || f->deps[1])
+		return fence_ordered_by_engine(i915, e, f->deps[0], depth + 1) &&
+		       fence_ordered_by_engine(i915, e, f->deps[1], depth + 1);
+	return f->dev == &i915->drm && f->context == e->fence_context;
+}
+
 long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 			  void *kb, int wr)
 {
@@ -574,7 +597,8 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 			rc = -EINVAL;
 			goto out;
 		}
-		if ((rc = wait_fence(in_fence))) {
+		if (!fence_ordered_by_engine(i915, e, in_fence, 0) &&
+		    (rc = wait_fence(in_fence))) {
 			why = "waiting for the in fence";
 			goto out;
 		}
@@ -612,7 +636,7 @@ long i915_gem_execbuffer2(struct i915_device *i915, struct drm_file *fp,
 		int frc = drm_syncobj_find_fence(so, ntl ? tl_values[i] : 0, &f);
 		drm_syncobj_put(so);
 		if (frc == 0) {
-			rc = wait_fence(f);
+			rc = fence_ordered_by_engine(i915, e, f, 0) ? 0 : wait_fence(f);
 			drm_fence_put(f);
 			if (rc) {
 				why = "waiting for a fence of the array";

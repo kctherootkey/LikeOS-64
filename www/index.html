@@ -1,435 +1,220 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LikeOS Home Site</title>
-<style>
-  /* Reset and base */
-  *, *::before, *::after {
-    box-sizing: border-box;
-  }
-  body {
-    background-color: #ffffff;
-    color: #000000;
-    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-    margin: 0;
-    padding: 0;
-    line-height: 1.6;
-  }
-  a:link { color: #0000ff; }
-  a:visited { color: #00a000; }
-  a:hover { color: #0066cc; }
-
-  /* Main container */
-  .container {
-    max-width: 800px;
-    margin: 0 auto;
-    padding: 20px 24px;
-  }
-
-  /* Logo section */
-  .logo-section {
-    text-align: center;
-    margin-bottom: 10px;
-  }
-  .logo-section img {
-    max-width: 300px;
-    width: 80%;
-    height: auto;
-  }
-
-  /* Title */
-  .fancy-title {
-    text-align: center;
-    font-size: 1.3em;
-    margin: 0.4em 0 0.6em 0;
-    font-weight: normal;
-    color: #333;
-  }
-
-  /* Horizontal rule */
-  hr {
-    border: none;
-    border-top: 1px solid #999;
-    margin: 1.2em 0;
-  }
-
-  /* Welcome text */
-  p {
-    margin-bottom: 0.6em;
-  }
-
-  /* Release block */
-  .release-block {
-    text-align: center;
-    margin: 1em 0;
-  }
-  .release-name {
-    font-size: 1.5em;
-    font-weight: bold;
-  }
-
-  /* Feature list */
-  ul {
-    margin-top: 0.4em;
-    padding-left: 2em;
-  }
-  ul li {
-    margin-bottom: 0.3em;
-  }
-
-  /* Screenshot gallery.
-     Deliberately wider than .container: the shots are 1920x1200, and shrinking
-     them into an 800px column would make the desktop unreadable.  It breaks
-     out with a negative margin on wide viewports and falls back to the column
-     width on narrow ones. */
-  .shots {
-    margin: 1.6em 0;
-  }
-  .shots-grid {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 18px;
-  }
-  .shot {
-    display: block;
-    text-decoration: none;
-    border: 1px solid #999;
-    background: #f4f4f4;
-    padding: 6px 6px 0 6px;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-  }
-  .shot:hover, .shot:focus {
-    border-color: #0066cc;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
-  }
-  .shot img {
-    display: block;
-    width: 100%;
-    height: auto;
-  }
-  .shot .caption {
-    display: block;
-    padding: 6px 2px;
-    font-size: 0.82em;
-    color: #333;
-    text-align: center;
-  }
-  .shots-note {
-    font-size: 0.85em;
-    color: #555;
-    text-align: center;
-    margin-top: 0.6em;
-  }
-
-  /* Canonical URL */
-  .canonical {
-    margin: 0.8em 0;
-  }
-
-  /* Footer area */
-  .footer-comments {
-    font-style: italic;
-  }
-  .footer-updated {
-    font-style: italic;
-  }
-  .footer-copyright {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    font-size: 0.85em;
-    gap: 0.5em;
-  }
-  .footer-copyright .left {
-    flex: 1 1 auto;
-  }
-
-  /* Responsive adjustments */
-  @media (max-width: 600px) {
-    .container {
-      padding: 14px 16px;
-    }
-    .logo-section img {
-      max-width: 220px;
-    }
-    .fancy-title {
-      font-size: 1.1em;
-    }
-    .release-name {
-      font-size: 1.3em;
-    }
-    .footer-copyright {
-      flex-direction: column;
-    }
-  }
-
-  @media (min-width: 601px) and (max-width: 1024px) {
-    .container {
-      max-width: 700px;
-      padding: 20px 28px;
-    }
-    .logo-section img {
-      max-width: 260px;
-    }
-  }
-
-  /* Wide enough to be worth breaking the shots out of the text column.
-     The width is capped against the viewport as well as at 1180px: a fixed
-     1180 would hang off both edges at viewports just over this breakpoint,
-     and the 56px inset leaves room for a scrollbar so nothing overflows
-     horizontally. */
-  @media (min-width: 1100px) {
-    .shots {
-      --shots-width: min(1180px, calc(100vw - 56px));
-      width: var(--shots-width);
-      margin-left: calc((var(--shots-width) - 100%) / -2);
-      margin-right: calc((var(--shots-width) - 100%) / -2);
-    }
-    .shots-grid {
-      grid-template-columns: 1fr 1fr;
-    }
-  }
-</style>
-<!-- Copyright (c) 2026 Nikolaos Rangos. -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LikeOS &mdash; A 64-bit operating system built from scratch</title>
+<meta name="description" content="LikeOS is a modern 64-bit operating system built from scratch: its own kernel, drivers and C library, with a graphical desktop, mail, chat and a modern web browser.">
+<meta name="author" content="Nikolaos Rangos">
+<meta name="theme-color" content="#23801a">
+<link rel="canonical" href="https://likeos.systemtrap.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="LikeOS">
+<meta property="og:title" content="Home &mdash; LikeOS">
+<meta property="og:description" content="LikeOS is a modern 64-bit operating system built from scratch: its own kernel, drivers and C library, with a graphical desktop, mail, chat and a modern web browser.">
+<meta property="og:url" content="https://likeos.systemtrap.com/">
+<meta property="og:image" content="https://likeos.systemtrap.com/assets/og-image.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="512x512" href="assets/icon-512.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+<!--
+  LikeOS website.
+  Copyright (C) 2026 The LikeOS Project
+  Web page copyright (C) 2026 Nikolaos Rangos.
+-->
 </head>
+<body data-page="index">
+<a class="skip" href="#content">Skip to content</a>
 
-<body>
+<header class="topbar">
+  <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+  <div class="actions">
+    <a class="btn btn-donate" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span class="label">Donate</span></a>
+    <button class="menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open the menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  </div>
+</header>
+<div class="backdrop" aria-hidden="true"></div>
 
-<div class="container">
+<div class="layout">
+  <aside class="sidebar" id="sidebar" aria-label="Site menu">
+    <div class="brand-meta">
+      <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
+      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD &middot; dev branch</span>
+    </div>
+    <nav class="nav" aria-label="Main">
+      <div class="nav-label">Menu</div>
+      <a href="index.html" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg><span>Home</span></a>
+      <a href="technical.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg><span>Technical Details</span></a>
+      <a href="luakit.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg><span>Luakit Web-Browser Cheatsheet</span></a>
+      <a href="screenshots.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5.5-5.5L5 20"/></svg><span>Screenshots and Videos</span></a>
+      <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></svg><span>Source Code</span><svg class="ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a>
+      <a href="running.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg><span>Running</span></a>
+      <a href="about.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>About</span></a>
+      <a href="donate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7-4.3-9-8.7C1.6 8 3.6 4.5 6.9 4.5c2 0 3.4 1 5.1 3 1.7-2 3.1-3 5.1-3 3.3 0 5.3 3.5 3.9 6.8C19 15.7 12 20 12 20z"/></svg><span>Donate</span></a>
+    </nav>
+    <div class="sidebar-donate">
+      <a class="btn btn-donate btn-block" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate to LikeOS</span></a>
+      <p>Every donation buys test hardware and brings a paid team closer.</p>
+    </div>
+  </aside>
 
-  <!-- Logo -->
-  <div class="logo-section">
-    <img src="likeos-logo.png" alt="LikeOS">
+  <div class="main">
+<main class="content" id="content">
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="hero-top">
+      <h1 id="hero-title" class="visually-hidden">LikeOS</h1>
+      <img class="hero-logo" src="assets/likeos-logo.png" alt="LikeOS" width="900" height="335">
+      <p class="tagline">A modern 64-bit operating system, written from scratch.</p>
+      <p class="sub">
+        Its own kernel, its own drivers and its own C library &mdash; and on top of them a
+        complete graphical desktop on which you can read your mail, chat, manage files and
+        browse today&rsquo;s web.
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary btn-lg" href="screenshots.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5.5-5.5L5 20"/></svg><span>See it in action</span></a>
+        <a class="btn btn-ghost btn-lg" href="technical.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg><span>Technical details</span></a>
+        <a class="btn btn-donate btn-lg" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Donate</span></a>
+      </div>
+    </div>
+    <a class="hero-shot" href="screenshots.html" aria-label="Open the screenshot gallery">
+      <img src="assets/hero-desktop.jpg" width="1800" height="1000"
+           alt="Three LikeOS desktops: the luakit web browser on ChatGPT, a Google Maps train route, and the HexChat IRC client">
+    </a>
+  </section>
+
+  <div class="release-banner">
+    <div>
+      <div class="label">Current development release</div>
+      <div class="version">LikeOS 0.2.7-HEAD</div>
+      <div class="meta">Developed in the <b style="color:#fff">dev</b> branch &middot; built from source, images follow with the first major release</div>
+    </div>
+    <a class="btn btn-ghost" href="https://github.com/kctherootkey/LikeOS-64/tree/dev" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2a10 10 0 0 0-3.2 19.5c.5.1.7-.2.7-.5v-1.7c-2.8.6-3.4-1.3-3.4-1.3-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.6 2.4 1.1 3 .9.1-.7.4-1.1.6-1.4-2.2-.3-4.6-1.1-4.6-5 0-1.1.4-2 1-2.7-.1-.3-.4-1.3.1-2.7 0 0 .8-.3 2.8 1a9.6 9.6 0 0 1 5 0c1.9-1.3 2.8-1 2.8-1 .5 1.4.2 2.4.1 2.7.6.7 1 1.6 1 2.7 0 3.9-2.3 4.7-4.6 5 .4.3.7.9.7 1.9V21c0 .3.2.6.7.5A10 10 0 0 0 12 2z"/></svg><span>Browse the source</span></a>
   </div>
 
-  <!-- Fancy title -->
-  <h3 class="fancy-title">
-    A Modern 64-Bit Operating System Built from Scratch
-  </h3>
+  <div class="stat-row">
+    <div class="stat"><div class="num">From scratch</div><div class="lbl">kernel, drivers &amp; C library</div></div>
+    <div class="stat"><div class="num">x86-64</div><div class="lbl">UEFI &middot; multi-core</div></div>
+    <div class="stat"><div class="num">Full desktop</div><div class="lbl">X.Org &middot; GTK3 &middot; WebKit</div></div>
+    <div class="stat"><div class="num">GPLv2</div><div class="lbl">free software</div></div>
+  </div>
 
-  <hr>
-
-  <!-- Welcome -->
-  <p>
-    Welcome to the <b>LikeOS</b> home page.
-    LikeOS is a modern 64-bit operating system built entirely from scratch, demonstrating
-    contemporary OS development with a complete Unix-like userland.
-  </p>
-
-  <p>
-    <b>LikeOS</b> was written by Nikolaos Rangos.
-  </p>
-
-  <!-- Current release -->
-  <div class="release-block">
-    Current development release:
+  <section class="card intro">
+    <h2>What is LikeOS?</h2>
     <p>
-      <span class="release-name">LikeOS 0.2.5-HEAD</span>
+      <b>LikeOS</b> is an independent operating system for 64-bit PCs. It is not a
+      distribution of an existing system and not a re-skin of one: the kernel that starts
+      when the machine boots, the drivers that talk to the hardware and the C library that
+      every program is linked against were all written for LikeOS.
     </p>
-  </div>
-
-  <p>
-    Version 0.2.5 has these key features:
-  </p>
-  <ul>
-    <li>64-bit long mode kernel with higher-half mapping.</li>
-    <li>UEFI boot path with framebuffer and memory map handoff.</li>
-    <li>Interrupt and exception handling with IDT and PIC/APIC integration.</li>
-    <li>SMP support for up to 64 CPUs with AP startup using INIT-SIPI-SIPI.</li>
-    <li>Per-CPU data structures, run queues, and scheduler accounting.</li>
-    <li>LAPIC timer setup, IOAPIC routing, TLB shootdown, and SMP-aware locking.</li>
-    <li>Preemptive multitasking scheduler with fork, execve, exit, wait4, signals, and pipes.</li>
-    <li>User mode execution in ring 3 with ELF64 binary loading and <tt>#!</tt> scripts.</li>
-    <li><b>ext4 as the root filesystem</b> &mdash; read and write, with extents,
-        hash-indexed directories, extended attributes and a journal &mdash; plus FAT32,
-        VFS and devfs layers.</li>
-    <li><b>Demand paging</b>: anonymous memory, brk, BSS and private file mappings are
-        populated on first touch rather than at exec, alongside copy-on-write fork.</li>
-    <li>Dentry cache, inode cache, and page cache with read-ahead and CLOCK-style eviction.</li>
-    <li><b>Multi-user login</b>: init, getty and login with PAM and yescrypt, users and
-        groups, and file permissions enforced in the VFS.</li>
-    <li>POSIX threads, System V and POSIX shared memory, poll/select/epoll, and PTYs,
-        with per-task x87/SSE state carried across context switches.</li>
-    <li><b>UTF-8 throughout</b>: the console decodes it and addresses glyphs by code point,
-        and the C library implements the full multibyte and wide-character interface.</li>
-    <li>xHCI USB 3.0 stack and USB mass storage driver.</li>
-    <li>PS/2, I2C-HID, PCI, APIC, and ACPI hardware support; VMware SVGA II graphics
-        with a hardware cursor.</li>
-    <li>TCP/IP networking stack with BSD-style sockets and multiple NIC drivers.</li>
-    <li>Physical and virtual memory management with SLAB allocator, stack canaries, and security protections.</li>
-    <li>Virtual terminals (VTs) with POSIX-like TTY, xterm-compatible escape handling, and signal handling.</li>
-    <li>Userland libc with dynamic runtime linker, dlopen, POSIX regular expressions and iconv.</li>
-    <li>Framebuffer console with scrollback, a scrollbar and a mouse pointer.</li>
-    <li>Core utilities: ls, cat, cp, mv, rm, grep, sed, find, top, ps, and many more.</li>
-    <li><b>Ported applications</b>: <b>bash</b> 5.2 as the system shell,
-        <b>OpenSSH</b> 10.4 (client and server), OpenSSL, curl, tmux, nano, and netcat.</li>
-    <li><b>An X.Org desktop</b>: the X server on the framebuffer with the ctwm window
-        manager, <b>xterm</b>, the <b>XNEdit</b> editor,
-        xcalc, xclock and xload.</li>
-    <li><b>GTK3</b>: GTK 3.24 and the stack under it &mdash; GLib, Cairo, Pango, HarfBuzz,
-        gdk-pixbuf and libepoxy &mdash; with the Adwaita icon theme, the DejaVu fonts and
-        the shared MIME database.</li>
-    <li><b>GTK3 applications</b>: <b>PCManFM</b>, which draws the desktop and manages
-        files, the <b>Claws Mail</b> client speaking IMAP, POP3 and SMTP over TLS, and
-        the <b>Mousepad</b> text editor.</li>
-    <li>Runs on VMware, VirtualBox and QEMU, and on real hardware &mdash; though the only
-        machines it has been tested successfully on so far are the
-        <b>Lenovo ThinkPad P50</b> and <b>Dell Pro 16 Plus</b> notebooks.</li>
-  </ul>
-
-  <hr>
-
-  <!-- Screenshots -->
-  <div class="shots">
-    <div class="shots-grid">
-      <a class="shot" target="_blank" rel="noopener"
-         href="screenshots/LikeOS-64%20bootstrapper-2026-07-30-12-54-19.png">
-        <img src="screenshots/LikeOS-64%20bootstrapper-2026-07-30-12-54-19.png"
-             width="1920" height="1200" loading="lazy"
-             alt="The LikeOS X.Org desktop: ctwm with a desktop bar, xterm, XNEdit and nano">
-        <span class="caption">LikeOS 0.2.4-HEAD running X.Org, ctwm, xterm, XNEdit, bash and nano
-          &mdash; click for full size</span>
-      </a>
-      <a class="shot" target="_blank" rel="noopener"
-         href="screenshots/LikeOS-64%20bootstrapper-2026-07-31-17-05-17.png">
-        <img src="screenshots/LikeOS-64%20bootstrapper-2026-07-31-17-05-17.png"
-             width="1920" height="1200" loading="lazy"
-             alt="LikeOS running the NetSurf web browser and an SSH session to a remote Ubuntu system">
-        <span class="caption">LikeOS 0.2.4-HEAD running the NetSurf browser and logged in to a
-          remote Ubuntu system over SSH &mdash; click for full size</span>
-      </a>
-      <a class="shot" target="_blank" rel="noopener"
-         href="screenshots/LikeOS-64%20bootstrapper-2026-08-13-17-33-40.png">
-        <img src="screenshots/LikeOS-64%20bootstrapper-2026-08-13-17-33-40.png"
-             width="1920" height="1200" loading="lazy"
-             alt="LikeOS running GTK3: the PCManFM desktop and file manager, and the Mousepad editor">
-        <span class="caption">LikeOS 0.2.5-HEAD has GTK3 ported &mdash; here the PCManFM desktop
-          and file manager, and the Mousepad editor &mdash; click for full size</span>
-      </a>
-      <a class="shot" target="_blank" rel="noopener"
-         href="screenshots/LikeOS-64%20bootstrapper-2026-08-13-18-08-44.png">
-        <img src="screenshots/LikeOS-64%20bootstrapper-2026-08-13-18-08-44.png"
-             width="1920" height="1200" loading="lazy"
-             alt="LikeOS running the Claws Mail client, connected to an IMAP inbox">
-        <span class="caption">LikeOS 0.2.5-HEAD running Claws Mail as an ordinary user, sending
-          mail and connected to the author's IMAP inbox &mdash; click for full size</span>
-      </a>
-      <a class="shot" target="_blank" rel="noopener"
-         href="screenshots/LikeOS-64%20bootstrapper-2026-08-20-18-32-04.png">
-        <img src="screenshots/LikeOS-64%20bootstrapper-2026-08-20-18-32-04.png"
-             width="1920" height="1200" loading="lazy"
-             alt="LikeOS running the HexChat IRC client, xfce4-terminal and galculator, with the new taskbar at the bottom">
-        <span class="caption">LikeOS 0.2.5-HEAD running the HexChat IRC client joined into a channel,
-          xfce4-terminal and galculator, with the new taskbar at the bottom &mdash; click for full size</span>
-      </a>
-    </div>
-    <p class="shots-note">
-      Shown at 1920&times;1200, which is what a default build asks the firmware for.
+    <p>
+      What makes it unusual for a hobby system is how far it has come. LikeOS boots on real
+      notebooks as well as in virtual machines, logs you in as an ordinary user, and starts a
+      <b>graphical desktop</b> with a taskbar, desktop icons and familiar applications. Its web
+      browser renders the same complex sites you use every day &mdash; maps, web shops,
+      search, AI chat &mdash; and, on Intel graphics, draws them with the <b>GPU</b>.
     </p>
-  </div>
+    <blockquote class="quote">
+      An operating system is only real once you can use it. LikeOS is built to be used.
+    </blockquote>
+    <p>
+      LikeOS is free software, published under the <b>GNU General Public License, version 2</b>.
+      Its complete source code is <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener">on GitHub</a>.
+    </p>
+  </section>
 
-  <hr>
-
-  <!-- Trying it -->
-  <p>
-    <b>Trying it.</b> At the login prompt, log in as <b>root</b> with the password
-    <b>toor</b>, create an ordinary account with <tt>adduser</tt>, and type
-    <b>startx</b> to bring up the desktop. PCManFM draws the wallpaper, the icons and
-    the launchers in <tt>~/Desktop</tt>, so all three mouse buttons over the background
-    belong to it; the window manager's menus are on <b>Alt+F1</b> (Xterm, Explorer,
-    Editor, Xnedit, Mail, Browser, Calculator, and &ldquo;Exit session&rdquo; to return
-    to the console) and <b>Alt+F2</b>. Any user can run <tt>startx</tt>: the X server is
-    installed setuid root and gives root up as soon as it has opened the framebuffer and
-    the input devices, so no group membership is needed.
-  </p>
-
-  <p>
-    <b>Building.</b> Ubuntu is currently required as the build host &mdash; building has
-    been tested with Ubuntu 24.04.3 LTS (Noble Numbat). Install the dependencies with
-    <tt>sudo apt-get update</tt> and <tt>sudo make deps</tt>, then write a USB stick with
-    <tt>make usb-write USB_DEVICE=/dev/sdb</tt> and boot it, on real hardware or by
-    pointing VMware or VirtualBox at the USB device. The QEMU targets, <tt>make qemu</tt>
-    and <tt>make qemu-usb</tt>, are legacy.
-  </p>
-
-  <p>
-    A default build asks for a 1920&times;1200 screen and falls back through the usual
-    modes if the display cannot do it. <tt>make SCREEN_SIZE=medium</tt> prefers
-    1280&times;800 instead, and <tt>make MAX_SCREEN_SIZE=1920x1080</tt> puts a ceiling on
-    the list. The ceiling is what a virtual machine on a 1920&times;1080 notebook needs:
-    it advertises 1920&times;1200 whatever the host's panel can actually show, and a
-    build with no ceiling takes it.
-  </p>
-
-  <hr>
-
-  <!-- Canonical URL -->
-  <p class="canonical">
-    Canonical URL: <a href="https://likeos.systemtrap.com">https://likeos.systemtrap.com</a>
-  </p>
-
-  <hr>
-
-  <!-- Introduction / About -->
-  <p>
-    <b>LikeOS</b> is a Unix-like operating system designed to demonstrate modern OS development
-    from the ground up. It features a complete userland with process management, syscalls,
-    preemptive multitasking, symmetric multi-processing (SMP), a multi-user login, and
-    bash as the interactive shell. The system boots via UEFI from an ext4 root filesystem,
-    runs on (some) real hardware as well as virtual machines (QEMU, VMware, VirtualBox),
-    and includes a rich set of core utilities, a C library with dynamic linking support,
-    TCP/IP networking with OpenSSH, and an X.Org desktop running GTK3 applications.
-  </p>
-
-  <p>
-    The author, Nikolaos Rangos, can be reached at
-    <a href="mailto:niko@systemtrap.com">niko@systemtrap.com</a>.
-  </p>
-
-  <p>
-    The git repository is available at:
-    <a href="https://github.com/kctherootkey/LikeOS-64">https://github.com/kctherootkey/LikeOS-64</a>
-  </p>
-
-  <p>
-    LikeOS is released under the <b>GNU General Public License version 2</b>.
-    See the COPYING file in the repository for the full license text.
-  </p>
-
-  <hr>
-
-  <!-- Current development version -->
-  <p>
-    The current development version is available on GitHub:<br>
-    <a href="https://github.com/kctherootkey/LikeOS-64">https://github.com/kctherootkey/LikeOS-64</a>
-  </p>
-
-  <hr>
-
-  <!-- Footer comments -->
-  <p class="footer-comments">
-    Send comments or questions about <b>LikeOS</b> to the author at
-    <a href="mailto:niko@systemtrap.com">niko@systemtrap.com</a>&nbsp;
-    after checking the
-    <a href="https://github.com/kctherootkey/LikeOS-64/blob/master/README"><b>README</b></a>.
-  </p>
-
-  <p class="footer-updated">
-    This page last updated <b>August 14<sup>th</sup>, 2026</b>.
-  </p>
-
-  <hr>
-
-  <div class="footer-copyright">
-    <div class="left">
-      Web page copyright &copy; 2026 Nikolaos Rangos.<br>
-      LikeOS software copyright &copy; 2026 Nikolaos Rangos.
+  <section class="card">
+    <h2>What you can do with it today</h2>
+    <div class="grid-3">
+      <a class="tile" href="luakit.html">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg></div>
+        <h3>Browse the web</h3>
+        <p>The <b>luakit</b> browser with the WebKit engine, an ad blocker with filter lists for every region.</p>
+      </a>
+      <div class="tile">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 6.5L12 13l8.5-6.5"/></svg></div>
+        <h3>Read and send mail</h3>
+        <p><b>Claws Mail</b> over IMAP, POP3 and SMTP, encrypted with TLS.</p>
+      </div>
+      <div class="tile">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/><path d="M8 9.5h8M8 12.5h5"/></svg></div>
+        <h3>Chat</h3>
+        <p>The <b>HexChat</b> IRC client &mdash; and the web&rsquo;s chat services in the browser.</p>
+      </div>
+      <div class="tile">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <h3>Manage files</h3>
+        <p><b>PCManFM</b> draws the desktop and manages files; <b>Mousepad</b> edits text.</p>
+      </div>
+      <div class="tile">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12.5 15H17"/></svg></div>
+        <h3>Work in a terminal</h3>
+        <p><b>bash</b>, <b>tmux</b>, <b>OpenSSH</b>, curl and a full set of Unix tools.</p>
+      </div>
+      <div class="tile">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20"/></svg></div>
+        <h3>Run it on real machines</h3>
+        <p>Tested on the <b>Lenovo ThinkPad P50</b> and <b>Dell Pro 16 Plus</b>, plus VMware, VirtualBox and QEMU.</p>
+      </div>
     </div>
-  </div>
+  </section>
 
+  <section class="card">
+    <h2>Who makes LikeOS</h2>
+    <div class="person">
+      <div class="avatar" aria-hidden="true">NR</div>
+      <div>
+        <p>
+          LikeOS is created and developed by <b>Nikolaos Rangos</b>. As the project&rsquo;s
+          <code>AUTHORS</code> file records, it is co-authored with the AI assistants
+          <b>Anthropic Claude</b> and <b>OpenAI GPT</b>, which work on the code under his
+          direction.
+        </p>
+        <p>
+          Questions and comments are welcome at
+          <a href="mailto:niko@systemtrap.com">niko@systemtrap.com</a>.
+          More about the project and its author is on the <a href="about.html">About</a> page.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="card plain" style="text-align:center">
+    <h2 style="justify-content:center">Help LikeOS grow</h2>
+    <p style="max-width:40em;margin:0 auto 1.1em;color:var(--muted)">
+      LikeOS is developed by one person today. Donations pay for the test hardware every new
+      driver needs and are the first step towards a <b>paid development team</b> &mdash; and
+      towards the first major release with downloadable images.
+    </p>
+    <a class="btn btn-donate btn-lg" href="donate.html"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3 4.5 6.6 4.5c2.1 0 3.6 1.1 5.4 3.1 1.8-2 3.3-3.1 5.4-3.1 3.6 0 5.7 3.7 4.2 7.2C19.5 16.4 12 21 12 21z"/></svg><span>Support LikeOS with a donation</span></a>
+  </section>
+
+  <p style="text-align:center;color:var(--muted);font-size:.9rem">
+    Canonical address: <a href="https://likeos.systemtrap.com">likeos.systemtrap.com</a>
+  </p>
+
+</main>
+    <footer class="footer">
+      <div class="footer-inner">
+        <div>
+          <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+        </div>
+        <nav aria-label="Footer">
+          <a href="technical.html">Technical Details</a>
+          <a href="screenshots.html">Screenshots</a>
+          <a href="running.html">Running</a>
+          <a href="https://github.com/kctherootkey/LikeOS-64" target="_blank" rel="noopener">GitHub</a>
+          <a href="about.html">About</a>
+          <a href="donate.html">Donate</a>
+        </nav>
+      </div>
+    </footer>
+  </div>
 </div>
 
+<script src="assets/site.js" defer></script>
 </body>
 </html>

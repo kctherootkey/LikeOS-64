@@ -9,6 +9,7 @@
 #include <kernel/dev/gpu/i915/i915_device_info.h>
 #include <kernel/hal/pci.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/dev/gpu/i915/intel_display.h>
 #include <kernel/dev/gpu/i915/i915_gt.h>
@@ -76,6 +77,10 @@ struct i915_fw_domain {
 	uint32_t reg_ack; /* the acknowledge register */
 	int count; /* outstanding gets */
 	uint32_t timeouts; /* acks that never came */
+	/* released by nobody yet: awake with no gets outstanding until the
+	 * release timer finds it unused for a whole period */
+	int lingering;
+	int used; /* taken again since the release timer was armed */
 };
 
 struct i915_device {
@@ -139,6 +144,8 @@ struct i915_device {
 	struct i915_fw_domain fw[I915_FW_DOMAINS];
 	uint32_t fw_present; /* mask of domains this device has */
 	uint32_t fw_held; /* mask currently awake */
+	hrtimer_t fw_timer; /* releases the lingering domains */
+	int fw_timer_ready;
 	int unclaimed_warned;
 
 	/* topology, from the fuse registers */
@@ -260,6 +267,9 @@ void i915_bind_failed_once(struct i915_device *i915, uint64_t addr, uint64_t siz
  * processor's cache, nor written into it afterwards */
 void i915_gem_object_set_display(struct i915_device *i915,
 				 struct drm_gem_object *o);
+/* i915_gem.c: what the processor wrote through the cache, flushed for a
+ * reader past it (the GPU, the display) */
+void i915_gem_object_flush_for_gpu(struct i915_device *i915, struct drm_gem_object *o);
 /* i915_gem.c: the object's pages go back to where they came from */
 void i915_gem_release_pages(struct drm_gem_object *o);
 /* i915_firmware.c: look for the GT's firmware images and say what is there */
