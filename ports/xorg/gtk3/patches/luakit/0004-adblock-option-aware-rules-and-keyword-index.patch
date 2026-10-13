@@ -27,13 +27,23 @@ variants are added next to EasyList and EasyPrivacy:
 `$domain=' now also covers the subdomains of the listed domain, and
 `$third-party' compares registrable sites rather than exact host names.
 
-Element hiding rules (`##') remain unsupported.
+Element hiding ("##" rules) stays unsupported: applied as user stylesheets it
+made every page parse half a megabyte of selectors and loading noticeably
+slower.  Its rules and the extended syntaxes beside them ("#?#", "#$#",
+scriptlets) are skipped instead of ending up as network rules.
+
+"@@||host^$document" exempts a site's pages from blocking.
+
+A page the user navigates to is blocked only by a rule against its whole
+host.  Rules for a path or limited to resource types describe what pages
+load, and applied to the page itself they stopped a mail's tracking link
+(an image rule for "/gp/r.html?") from reaching the parcel status.
 
 Copyright (C) 2026 The LikeOS Project
 
 --- a/lib/adblock.lua
 +++ b/lib/adblock.lua
-@@ -110,7 +110,20 @@
+@@ -110,8 +110,26 @@
      msg.info("found " .. #filterfiles .. " filter list" .. (#filterfiles == 1 and "" or "s"))
  end
  
@@ -51,11 +61,17 @@ Copyright (C) 2026 The LikeOS Project
 +    ["match-case"] = true, important = true, ["_"] = true,
 +}
 +
++-- What the last get_abp_opts() saw besides the options it returns: whether
++-- the rule is limited to resource types, and whether it names $document.
++local rule_typed, rule_document = false, false
++
 +local function get_abp_opts(s, exception)
      local opts = {}
++    rule_typed, rule_document = false, false
      local pos = string.find(s, "%$")
      if pos then
-@@ -130,15 +143,36 @@
+         local op = string.sub(s, pos+1)
+@@ -130,15 +148,40 @@
                  key = string.sub(key, 2)
              end
  
@@ -72,6 +88,9 @@ Copyright (C) 2026 The LikeOS Project
                  opts["third-party"] = not negative
 +            elseif key == "first-party" or key == "1p" then
 +                opts["third-party"] = negative
++            elseif (key == "document" or key == "doc") and not exception then
++                -- the site itself is unwanted: its pages are blocked too
++                rule_document = true
 +            elseif resource_types[key] and exception then
 +                -- An EXCEPTION limited to resource types cannot be applied
 +                -- to only those types (send-request carries only the URI),
@@ -81,6 +100,7 @@ Copyright (C) 2026 The LikeOS Project
 +                -- not have.  Such exceptions are skipped.
 +                opts["unknown"] = true
 +            elseif resource_types[key] or ignored_options[key] then
++                if resource_types[key] then rule_typed = true end
 +                -- A request's resource type is not known where requests
 +                -- are filtered, so a BLOCKING rule limited to, or excepting,
 +                -- types blocks every request it matches.  Dropping such
@@ -95,7 +115,7 @@ Copyright (C) 2026 The LikeOS Project
                  opts["unknown"] = true
              end
          end
-@@ -148,10 +182,10 @@
+@@ -148,10 +191,10 @@
  
  -- Convert Adblock Plus filter description to lua string pattern
  -- See http://adblockplus.org/en/filters for more information
@@ -108,7 +128,7 @@ Copyright (C) 2026 The LikeOS Project
      if opts and opts.unknown == true then return {} end -- Skip rules with unknown options
  
      local domain = nil
-@@ -162,7 +196,9 @@
+@@ -162,7 +205,9 @@
          local has_caret = string.find(s, "^", 1, true)
          local domain_anchor = string.match(s, "^||")
          if not has_star and not has_caret and not domain_anchor then
@@ -119,7 +139,7 @@ Copyright (C) 2026 The LikeOS Project
          end
  
          -- Optimize for domain anchor rules
-@@ -171,10 +207,23 @@
+@@ -171,10 +216,23 @@
              local d = string.sub(s, 3)
              d = string.gsub(d, "/.*", "")
              d = string.gsub(d, "%^.*", "")
@@ -146,7 +166,7 @@ Copyright (C) 2026 The LikeOS Project
              end
          end
  
-@@ -210,14 +259,42 @@
+@@ -210,45 +268,151 @@
      return s, opts, domain, false
  end
  
@@ -194,7 +214,14 @@ Copyright (C) 2026 The LikeOS Project
  end
  
  local list_new = function ()
-@@ -227,28 +304,85 @@
+     return {
++        -- Sites whose pages are exempt from blocking altogether
++        -- ("@@||example.com^$document"), by host
++        doc         = {},
++        -- Whole hosts to block even as the page navigated to, by host
++        strict      = {},
+         patterns    = {},
+         ad_patterns = {},
          plain       = {},
          ad_plain    = {},
          domains     = {},
@@ -249,8 +276,24 @@ Copyright (C) 2026 The LikeOS Project
 +    return best or best_common
 +end
 +
++-- The pattern of a "||host^" rule: nothing after the host but a separator.
++local host_only = { ["^"] = true, ["^[^%w%-%.%%]"] = true }
++
 +local list_add = function(list, line, cache, pat_exclude, exception)
 +    local pats, opts, domain, plain = abp_to_pattern(line, exception)
++    -- A page the user navigates to is blocked only by a rule against its
++    -- whole host, as other blockers do it: a rule for some path, or one
++    -- limited to images or scripts, describes the ads and trackers a page
++    -- loads, not the pages a user opens -- a mail's tracking link that
++    -- redirects to the parcel status is the typical victim.  Those rules
++    -- are filed again here, under the host, for the navigation check.
++    if domain and not exception and (not rule_typed or rule_document)
++       and pats[1] and host_only[pats[1]] then
++        local unrestricted = next(opts) == nil
++        if unrestricted or list.strict[domain] == nil then
++            list.strict[domain] = unrestricted and true or opts
++        end
++    end
      local contains_ad = string.find(line, "ad", 1, true)
 +    local keyword = not domain and abp_keyword((string.gsub(line, "%$.*", "")))
  
@@ -285,15 +328,76 @@ Copyright (C) 2026 The LikeOS Project
                  new = add_unique_cached(pat, opts, bucket, cache)
              end
          end
-@@ -278,7 +412,7 @@
-         elseif line:match("##") or line:match("#@#") then
-             --icnt = icnt + 1
+@@ -260,6 +424,29 @@
+     end
+ end
+ 
++-- "@@||host^$document" exempts the host's pages from all blocking.  The
++-- element-hiding exceptions beside it ($elemhide, $generichide) concern
++-- rules this blocker does not apply; they are recognised and dropped
++-- rather than taken for network exceptions.
++local page_options = {
++    document = "document", doc = "document",
++    elemhide = "elemhide", ehide = "elemhide",
++    generichide = "generichide", ghide = "generichide",
++}
++local function page_exception_add(white, rule)
++    local host, ops = string.match(rule, "^||([%w%-%.]+)[%^/]?%$(.+)$")
++    if not host then return false end
++    local found = false
++    for key in string.gmatch(ops, "[^,]+") do
++        local what = page_options[key]
++        if what == "document" then
++            white.doc[string.lower(host)] = true
++        end
++        found = found or what ~= nil
++    end
++    return found
++end
++
+ -- Parses an Adblock Plus compatible filter list
+ local parse_abpfilterlist = function (filters_dir, filename, cache)
+     if os.exists(filters_dir .. filename) then
+@@ -274,11 +461,17 @@
+         -- Ignore comments, header and blank lines
+         if line:match("^[![]") or line:match("^$") or line:match("^# ") or line:match("^#$") then
+             -- dammitwhydoesntluahaveacontinuestatement
+-        -- Ignore element hiding
+-        elseif line:match("##") or line:match("#@#") then
+-            --icnt = icnt + 1
++        -- Element hiding is not applied: every page would parse the
++        -- lists' selectors as a stylesheet, which made loading noticeably
++        -- slower.  Its rules, and the extended syntaxes beside them ("#?#",
++        -- "#$#", "#@?#", "#%#", AdGuard's "$$" HTML rules), which used to
++        -- end up as network rules, are skipped.
++        elseif line:match("#[@?$%%]*#") or line:match("%$%$") then
++            -- skipped
          elseif line:match("^@@") then
 -            list_add(white, string.sub(line, 3), cache.white)
-+            list_add(white, string.sub(line, 3), cache.white, nil, true)
++            if not page_exception_add(white, string.sub(line, 3)) then
++                list_add(white, string.sub(line, 3), cache.white, nil, true)
++            end
          else
              list_add(black, line, cache.black, ".*")
          end
+@@ -330,6 +523,8 @@
+         end
+     end
+ 
++    list.opts = opts
++
+     -- Manage list's rules
+     if util.table.hasitem(opt_inc, "Enabled") then
+         adblock_wm:emit_signal("list_set_enabled", list.title, true)
+@@ -338,8 +533,6 @@
+         adblock_wm:emit_signal("list_set_enabled", list.title, false)
+         _M.refresh_views()
+     end
+-
+-    list.opts = opts
+     write_subscriptions()
+ end
+ 
 --- a/lib/adblock_wm.lua
 +++ b/lib/adblock_wm.lua
 @@ -25,6 +25,15 @@
@@ -414,7 +518,7 @@ Copyright (C) 2026 The LikeOS Project
                      return true, pattern
                  end
              end
-@@ -73,40 +135,32 @@
+@@ -73,46 +135,63 @@
      end
  
      -- Next, match against plain text strings
@@ -460,14 +564,46 @@ Copyright (C) 2026 The LikeOS Project
 -        if third_party_match(page_domain, uri_domain, opts) then
 -            if domain_match(page_domain, opts) and string.match(uri, pattern) then
 -                return true, pattern
--            end
 +    for pattern, opts in pairs(list.patterns or EMPTY) do
 +        if opts_ok(page_domain, uri_domain, opts) and string.match(uri, pattern) then
 +            return true, pattern
++        end
++    end
++end
++
++-- Whether a page is exempt from blocking ("@@||host^$document")
++local function page_exempt(page_domains)
++    for _, list in pairs(enabled_rules) do
++        local doc = list.whitelist and list.whitelist.doc
++        if doc then
++            for d in pairs(page_domains) do
++                if doc[d] then return true end
+             end
          end
      end
++    return false
  end
-@@ -125,19 +179,31 @@
+ 
+--- Tests URI against user-defined filter functions, then whitelist, then blacklist
+-local match = function (src, dst)
++local function domains_of(uri)
++    local out = {}
++    local d = uri and string.match(string.lower(uri), "^%a+://([^/:?#]*)")
++    while d and d ~= "" do
++        out[d] = true
++        d = string.match(d, "%.(.+)")
++    end
++    return out
++end
++
++-- Tests URI against user-defined filter functions, then whitelist, then blacklist.
++-- `document`: dst is the page being navigated to, which only a rule against
++-- its whole host blocks (adblock.lua, list_add()).
++local match = function (src, dst, document)
+     -- Always allow data: URIs
+     if string.sub(dst, 1, 5) == "data:" then
+         msg.debug("allowing data URI")
+@@ -125,19 +204,36 @@
      local src_domain = domain_from_uri(src)
      local dst_domain = domain_from_uri(dst)
  
@@ -495,6 +631,11 @@ Copyright (C) 2026 The LikeOS Project
 +        end
 +    end
 +
++    if page_exempt(domains_of(src)) or (document and page_exempt(dst_domains)) then
++        msg.debug("allowing request on an exempt page: %s", dst)
++        return true
++    end
++
      -- Test against each list's whitelist rules first
      for _, list in pairs(enabled_rules) do
 -        local found, pattern = match_list(list.whitelist, dst, dst_domains, src_domain, dst_domain)
@@ -502,12 +643,48 @@ Copyright (C) 2026 The LikeOS Project
          if found then
              msg.debug("allowing request as pattern %q matched to uri %s", pattern, dst)
              return true
-@@ -146,7 +212,7 @@
+@@ -146,7 +242,19 @@
  
      -- Test against each list's blacklist rules
      for _, list in pairs(enabled_rules) do
 -        local found, pattern = match_list(list.blacklist, dst, dst_domains, src_domain, dst_domain)
-+        local found, pattern = match_list(list.blacklist, dst, dst_domains, src_domain, dst_domain, dst_tokens, dst_rest)
++        local found, pattern
++        if document then
++            local strict = list.blacklist.strict or EMPTY
++            for d in pairs(dst_domains) do
++                local opts = strict[d]
++                if opts ~= nil and opts_ok(src_domain, dst_domain, opts) then
++                    found, pattern = true, "||" .. d .. "^"
++                    break
++                end
++            end
++        else
++            found, pattern = match_list(list.blacklist, dst, dst_domains, src_domain, dst_domain, dst_tokens, dst_rest)
++        end
          if found then
              msg.debug("blocking request as pattern %q matched to uri %s", pattern, dst)
              return false
+@@ -156,12 +264,12 @@
+ 
+ 
+ -- Direct requests to match function
+-local filter = function (src, dst)
++local filter = function (src, dst, document)
+     -- Don't adblock on local files
+     local file_uri = src and string.sub(src, 1, 7) == "file://"
+ 
+     if enabled and not file_uri then
+-        return match(src, dst)
++        return match(src, dst, document)
+     end
+ end
+ 
+@@ -170,7 +278,7 @@
+         -- Prevent adblock-blocked: pages from being blocked themselves
+         if uri:match("^adblock%-blocked:") then return end
+ 
+-        local allow = filter(p.uri, uri)
++        local allow = filter(p.uri, uri, p.uri == uri)
+         if allow == false and p.uri == uri then
+             if not lousy.util.table.hasitem(page_whitelist, lousy.uri.parse(uri).host) then
+                 return "adblock-blocked:" .. uri
