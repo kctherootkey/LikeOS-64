@@ -63,11 +63,17 @@
     if (s.type === "video") {
       /* Nothing is fetched from YouTube until the visitor asks for the
        * video: a local poster with a play button stands in for it. */
-      media.innerHTML = '<button type="button" class="video-poster" aria-label="Play the video: ' + esc(s.title) + '">' +
+      /* the note's class must not be "consent": that is the cookie
+       * banner's, whose fixed position took the note out of the poster */
+      media.innerHTML = '<div class="video-poster" role="button" tabindex="0" aria-label="Play the video: ' + esc(s.title) + '">' +
         '<img src="' + esc(s.poster || s.thumb) + '" alt="">' +
         '<span class="big-play">' + ICON_PLAY + '</span>' +
-        '<span class="consent">Plays from YouTube (youtube-nocookie.com) when you click.</span></button>';
-      media.querySelector(".video-poster").addEventListener("click", function () {
+        '<span class="poster-note">Plays from YouTube (youtube-nocookie.com) when you click.</span></div>';
+      var poster = media.querySelector(".video-poster");
+      poster.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); poster.click(); }
+      });
+      poster.addEventListener("click", function () {
         media.innerHTML = '<iframe src="https://www.youtube-nocookie.com/embed/' + esc(s.youtube) +
           '?rel=0&amp;playsinline=1&amp;modestbranding=1&amp;autoplay=1" title="' + esc(s.title) + '"' +
           ' allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share; fullscreen"' +
