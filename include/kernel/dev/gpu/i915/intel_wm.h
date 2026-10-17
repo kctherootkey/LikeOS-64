@@ -38,7 +38,7 @@ struct intel_wm_pipe_cfg {
 	uint8_t scaled;
 	uint8_t is_edp; /* the output is the panel (Skylake: DPLL0's VCO) */
 	uint8_t is_dp; /* DisplayPort (eDP included) */
-	uint8_t has_audio; /* never set by this driver yet */
+	uint8_t has_audio; /* the sink plays audio (intel_audio.c) */
 	uint8_t lanes; /* DisplayPort lanes */
 	uint16_t hdisplay, htotal, vdisplay, vtotal;
 	uint16_t src_w, src_h;

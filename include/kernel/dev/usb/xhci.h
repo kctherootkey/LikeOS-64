@@ -423,8 +423,7 @@ extern xhci_controller_t g_xhci; // Primary (mass storage)
 extern xhci_controller_t g_xhci_hid; // Secondary (HID devices, if present)
 
 // Core functions
-int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev,
-	      uint8_t msi_vector);
+int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev);
 void xhci_shutdown(xhci_controller_t *ctrl);
 int xhci_reset(xhci_controller_t *ctrl);
 int xhci_start(xhci_controller_t *ctrl);

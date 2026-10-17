@@ -47,24 +47,21 @@ Copyright (C) 2026 The LikeOS Project
      {-1, NULL, OPTV_NONE, {0}, FALSE}
  };
  
-@@ -1973,6 +1976,34 @@
+@@ -1973,6 +1976,36 @@
      else
          xf86DPMSInit(pScreen, xf86DPMSSet, 0);
  
 +#ifdef __LIKEOS__
-+    /* XVideo: the display manager's own overlay stream first (vmwgfx,
-+     * unless Option "VideoOverlay" "off"), then glamor's textured
-+     * adaptor.  Registered together so port numbering is stable; the
-+     * overlay comes first as it does in the VMware display driver. */
++    /* XVideo: glamor's textured adaptor first, then the display device's
++     * own overlay stream (vmwgfx, unless Option "VideoOverlay" "off").
++     * That is the VMware display driver's order whenever 3D is up: a
++     * client taking the first port gets textured video, and the overlay
++     * serves where there is no glamor.  Registered together so port
++     * numbering is stable. */
 +    {
 +        XF86VideoAdaptorPtr adaptors[2];
 +        int n = 0;
 +
-+        if (xf86ReturnOptValBool(ms->drmmode.Options, OPTION_VIDEO_OVERLAY, TRUE)) {
-+            adaptors[n] = likeos_vmw_overlay_init(pScrn);
-+            if (adaptors[n])
-+                n++;
-+        }
 +#ifdef GLAMOR_HAS_GBM
 +        if (ms->drmmode.glamor) {
 +            adaptors[n] = ms->glamor.xv_init(pScreen, 16);
@@ -75,6 +72,11 @@ Copyright (C) 2026 The LikeOS Project
 +                           "Failed to initialize XV support.\n");
 +        }
 +#endif
++        if (xf86ReturnOptValBool(ms->drmmode.Options, OPTION_VIDEO_OVERLAY, TRUE)) {
++            adaptors[n] = likeos_vmw_overlay_init(pScrn);
++            if (adaptors[n])
++                n++;
++        }
 +        if (n)
 +            xf86XVScreenInit(pScreen, adaptors, n);
 +    }
@@ -82,7 +84,7 @@ Copyright (C) 2026 The LikeOS Project
  #ifdef GLAMOR_HAS_GBM
      if (ms->drmmode.glamor) {
          XF86VideoAdaptorPtr     glamor_adaptor;
-@@ -1985,6 +2016,7 @@
+@@ -1985,6 +2018,7 @@
                         "Failed to initialize XV support.\n");
      }
  #endif

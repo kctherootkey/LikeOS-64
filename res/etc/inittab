@@ -37,3 +37,8 @@ respawn	/sbin/getty /dev/console
 # again and again.  Add "console" after "respawn" to see what it logs.
 # Comment this line out to stop starting sshd at boot.
 # respawn	/usr/sbin/sshd -D
+
+# Audio service: mixes the sound of every program and plays it on the sound
+# card.  -f keeps it in the foreground for init.  It starts as root to open
+# /dev/audio0, then runs as the unprivileged user `audiod'.
+respawn	/usr/sbin/audiod -f

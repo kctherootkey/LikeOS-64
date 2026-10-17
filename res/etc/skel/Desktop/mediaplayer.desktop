@@ -1,0 +1,7 @@
+# A Type=Link shortcut to the media player (music and video), which also
+# puts it in the taskbar's Programs menu.
+[Desktop Entry]
+Type=Link
+Name=Media Player
+Icon=multimedia-player
+URL=/usr/share/applications/mediaplayer.desktop

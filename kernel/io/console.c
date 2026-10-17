@@ -2513,6 +2513,20 @@ char *kstrcpy(char *dest, const char *src)
 	return orig_dest;
 }
 
+/* Copies at most n bytes and pads the rest of dest with zeros; like the
+ * C library's strncpy, dest is not terminated when src is n bytes or
+ * longer. */
+char *kstrncpy(char *dest, const char *src, size_t n)
+{
+	size_t i = 0;
+
+	for (; i < n && src[i]; i++)
+		dest[i] = src[i];
+	for (; i < n; i++)
+		dest[i] = '\0';
+	return dest;
+}
+
 int kstrncmp(const char *s1, const char *s2, size_t n)
 {
 	while (n && *s1 && (*s1 == *s2)) {

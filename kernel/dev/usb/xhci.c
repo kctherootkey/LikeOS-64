@@ -16,6 +16,7 @@
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/interrupt.h>
+#include <kernel/ke/irq.h>
 #include <kernel/hal/ioapic.h>
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>
@@ -862,11 +863,19 @@ int xhci_halt(xhci_controller_t *ctrl)
 // Controller Initialization
 //=============================================================================
 
-int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev,
-	      uint8_t msi_vector)
+// MSI handler: the vector is the controller's alone, so it is always claimed.
+static int xhci_msi_irq(void *arg)
+{
+	xhci_controller_t *ctrl = arg;
+
+	if (ctrl->initialized && ctrl->irq_enabled)
+		xhci_irq_service(ctrl);
+	return 1;
+}
+
+int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev)
 {
 	xhci_memset(ctrl, 0, sizeof(*ctrl));
-	ctrl->irq = msi_vector; // Store desired MSI vector for later use
 
 	// Store PCI IDs for quirk detection
 	ctrl->pci_vendor = dev->vendor_id;
@@ -1183,8 +1192,15 @@ int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev,
 
 	// Enable interrupts — prefer MSI, fall back to legacy INTx, then polling.
 #if XHCI_USE_INTERRUPTS
-	// Try MSI first (required for most modern hardware)
-	if (pci_enable_msi(dev, ctrl->irq) == 0) {
+	// Try MSI first (required for most modern hardware).  The vector is
+	// allocated, not fixed: a fixed one inside 32..55 is also some I/O APIC
+	// line's vector, and that level-triggered line stops interrupting once
+	// an MSI lands on its vector while it is in service.
+	int msi_vector;
+
+	if (irq_request_msi(dev, 0, xhci_msi_irq, ctrl, "xhci",
+			    &msi_vector) == 0) {
+		ctrl->irq = (uint8_t)msi_vector;
 		ctrl->msi_enabled = 1;
 
 		// Configure interrupter 0

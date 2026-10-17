@@ -61,6 +61,8 @@
 #include <ifaddrs.h>
 #include <poll.h>
 #include <sys/fb.h>
+#include <sys/audio.h>
+#include <sys/soundcard.h>
 #include <sys/input.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
@@ -2171,6 +2173,1860 @@ static void test_fbdev(void)
 		test_result("munmap(framebuffer)", munmap(fb, maplen) == 0);
 	}
 	close(fd);
+}
+
+// ============================================================================
+// Sound devices: /dev/audio0 (native PCM), /dev/dsp (OSS PCM), /dev/mixer
+//
+// Everything here is silent: the only samples ever played are silence (zero
+// bytes, or 0x80 for unsigned 8-bit, whose midpoint is 0x80), so the suite can
+// run on a machine with speakers on and nobody notices.  Every setting the
+// tests change (volumes, mutes, output routing) is read first and put back.
+//
+// The audio service keeps /dev/audio0 open while it runs, and a PCM device has
+// one opener at a time, so with the service up the PCM sections report
+// themselves skipped; the node, control, mixer and permission checks still
+// run.  Without a sound card at all the whole section is skipped.
+//
+// Blocking calls (write into a full ring, AUDIO_DRAIN, SNDCTL_DSP_SYNC) run
+// under an alarm without SA_RESTART, so a stream that never moves makes a
+// test fail with EINTR instead of hanging the suite.
+// ============================================================================
+
+#define AU_GID_AUDIO 29
+#define AU_NOBODY 65534
+#define AU_BAD_KPTR ((void *)0xffff800000001000UL) /* kernel half */
+#define AU_BAD_UPTR ((void *)0x10UL) /* the unmapped first page */
+
+static volatile int g_au_alarm;
+
+static void au_alarm_handler(int sig)
+{
+	(void)sig;
+	g_au_alarm = 1;
+}
+
+/* Arm a watchdog for one blocking call; au_unguard() disarms it. */
+static void au_guard(struct sigaction *old, unsigned seconds)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = au_alarm_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0; /* no SA_RESTART: the blocked call returns EINTR */
+	g_au_alarm = 0;
+	sigaction(SIGALRM, &sa, old);
+	alarm(seconds);
+}
+
+static void au_unguard(const struct sigaction *old)
+{
+	alarm(0);
+	sigaction(SIGALRM, old, NULL);
+}
+
+static uint64_t au_now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void au_sleep_ms(unsigned ms)
+{
+	struct timespec ts;
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
+		;
+}
+
+/* A fixed-size string field holds a terminated string. */
+static int au_strz(const char *s, size_t n)
+{
+	return memchr(s, '\0', n) != NULL;
+}
+
+static int au_absdiff(uint32_t a, uint32_t b)
+{
+	return a > b ? (int)(a - b) : (int)(b - a);
+}
+
+/* The byte value of silence for a format. */
+static int au_silence_byte(uint32_t fmt)
+{
+	return fmt == AUDIO_FMT_U8 ? 0x80 : 0x00;
+}
+
+/* ---- device nodes ---------------------------------------------------------- */
+
+static void au_check_node(const char *path, unsigned want_minor)
+{
+	struct stat st;
+	char name[96];
+
+	memset(&st, 0, sizeof(st));
+	int r = stat(path, &st);
+	snprintf(name, sizeof(name), "%s exists", path);
+	test_result(name, r == 0);
+	if (r != 0)
+		return;
+	snprintf(name, sizeof(name), "%s is a character device", path);
+	test_result(name, S_ISCHR(st.st_mode));
+	snprintf(name, sizeof(name), "%s is major %d minor %u", path,
+		 AUDIO_MAJOR, want_minor);
+	test_result(name, major(st.st_rdev) == AUDIO_MAJOR &&
+				  minor(st.st_rdev) == want_minor);
+	snprintf(name, sizeof(name), "%s has mode 0660", path);
+	test_result(name, (st.st_mode & 07777) == 0660);
+	snprintf(name, sizeof(name), "%s is owned by root:audio (gid %d)",
+		 path, AU_GID_AUDIO);
+	test_result(name, st.st_uid == 0 && st.st_gid == AU_GID_AUDIO);
+}
+
+/* ---- AUDIO_GETINFO ----------------------------------------------------------- */
+
+static int au_info_sane(const struct audio_info *in)
+{
+	const uint32_t fmt_ok = ((1u << (AUDIO_FMT_MAX + 1)) - 1) & ~1u;
+	const uint32_t rate_ok = (AUDIO_RATE_384000 << 1) - 1;
+
+	if (in->version != AUDIO_API_VERSION)
+		return 0;
+	if (!(in->flags & AUDIO_INFO_PLAYBACK))
+		return 0;
+	if (in->formats == 0 || (in->formats & ~fmt_ok))
+		return 0;
+	if (in->rates == 0 || (in->rates & ~rate_ok))
+		return 0;
+	if (in->min_channels == 0 || in->min_channels > in->max_channels)
+		return 0;
+	if (in->min_period_bytes == 0 ||
+	    in->min_period_bytes > in->max_period_bytes)
+		return 0;
+	if (in->min_periods == 0 || in->min_periods > in->max_periods)
+		return 0;
+	if ((uint64_t)in->max_buffer_bytes <
+	    (uint64_t)in->min_period_bytes * in->min_periods)
+		return 0;
+	if (in->num_outputs > AUDIO_MAX_OUTPUTS ||
+	    in->num_inputs > AUDIO_MAX_OUTPUTS)
+		return 0;
+	if (in->flags & AUDIO_INFO_CAPTURE) {
+		if (in->capture_formats == 0 ||
+		    (in->capture_formats & ~fmt_ok) ||
+		    in->capture_rates == 0 ||
+		    (in->capture_rates & ~rate_ok) ||
+		    in->capture_min_channels == 0 ||
+		    in->capture_min_channels > in->capture_max_channels)
+			return 0;
+	}
+	return 1;
+}
+
+static void au_check_info(int fd, const char *node, struct audio_info *out)
+{
+	char name[128];
+	struct audio_info in;
+
+	memset(&in, 0xA5, sizeof(in));
+	int r = ioctl(fd, AUDIO_GETINFO, &in);
+	snprintf(name, sizeof(name), "%s: AUDIO_GETINFO", node);
+	test_result(name, r == 0);
+	if (r != 0) {
+		memset(out, 0, sizeof(*out));
+		return;
+	}
+	snprintf(name, sizeof(name), "%s: info strings are terminated", node);
+	test_result(name, au_strz(in.card_name, sizeof(in.card_name)) &&
+				  au_strz(in.driver, sizeof(in.driver)) &&
+				  au_strz(in.codec, sizeof(in.codec)) &&
+				  au_strz(in.bus, sizeof(in.bus)));
+	snprintf(name, sizeof(name), "%s: card and driver are named", node);
+	test_result(name, in.card_name[0] != '\0' && in.driver[0] != '\0');
+	snprintf(name, sizeof(name),
+		 "%s: version, formats, rates, channel/period ranges sane",
+		 node);
+	test_result(name, au_info_sane(&in));
+	snprintf(name, sizeof(name), "%s: card index is 0", node);
+	test_result(name, in.card == 0);
+	snprintf(name, sizeof(name), "%s: reserved words are zero", node);
+	{
+		int z = 1;
+		for (unsigned i = 0; i < sizeof(in.reserved) / 4; i++)
+			if (in.reserved[i])
+				z = 0;
+		test_result(name, z);
+	}
+	*out = in;
+}
+
+/* ---- parameter helpers ------------------------------------------------------ */
+
+static uint32_t au_pick_format(const struct audio_info *in)
+{
+	if (in->formats & AUDIO_FMT_BIT(AUDIO_FMT_S16_LE))
+		return AUDIO_FMT_S16_LE;
+	for (uint32_t f = 1; f <= AUDIO_FMT_MAX; f++)
+		if (in->formats & AUDIO_FMT_BIT(f))
+			return f;
+	return AUDIO_FMT_S16_LE;
+}
+
+static uint32_t au_pick_rate(const struct audio_info *in, uint32_t want)
+{
+	static const uint32_t rates[] = { 8000,	  11025,  16000,  22050,
+					  32000,  44100,  48000,  88200,
+					  96000,  176400, 192000, 384000 };
+	if (audio_rate_bit(want) & in->rates)
+		return want;
+	if (audio_rate_bit(48000) & in->rates)
+		return 48000;
+	if (audio_rate_bit(44100) & in->rates)
+		return 44100;
+	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++)
+		if (audio_rate_bit(rates[i]) & in->rates)
+			return rates[i];
+	return 48000;
+}
+
+static uint32_t au_pick_channels(const struct audio_info *in)
+{
+	if (in->min_channels <= 2 && in->max_channels >= 2)
+		return 2;
+	return in->min_channels ? in->min_channels : 2;
+}
+
+/* The rate range the card advertises, from its lowest to its highest bit. */
+static int au_rate_in_range(const struct audio_info *in, uint32_t rate)
+{
+	static const uint32_t rates[] = { 8000,	  11025,  16000,  22050,
+					  32000,  44100,  48000,  88200,
+					  96000,  176400, 192000, 384000 };
+	uint32_t lo = 0, hi = 0;
+	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+		if (in->rates & (1u << i)) {
+			if (!lo)
+				lo = rates[i];
+			hi = rates[i];
+		}
+	}
+	if (audio_rate_bit(rate) & in->rates)
+		return 1;
+	/* Continuous-rate hardware may grant a rate between the bits. */
+	return lo && rate >= lo && rate <= hi;
+}
+
+/* What SETPARAMS granted is something the card can do, and the derived
+ * sizes agree with each other. */
+static int au_params_valid(const struct audio_params *p,
+			   const struct audio_info *in)
+{
+	uint32_t fb = audio_format_bytes(p->format);
+
+	if (p->direction != AUDIO_DIR_PLAYBACK)
+		return 0;
+	if (p->format == 0 || p->format > AUDIO_FMT_MAX ||
+	    !(in->formats & AUDIO_FMT_BIT(p->format)) || fb == 0)
+		return 0;
+	if (!au_rate_in_range(in, p->rate))
+		return 0;
+	if (p->channels < in->min_channels || p->channels > in->max_channels)
+		return 0;
+	if (p->frame_bytes != fb * p->channels)
+		return 0;
+	if (p->period_frames == 0 || p->periods < in->min_periods ||
+	    p->periods > in->max_periods)
+		return 0;
+	uint64_t pb = (uint64_t)p->period_frames * p->frame_bytes;
+	if (pb < in->min_period_bytes || pb > in->max_period_bytes)
+		return 0;
+	if ((uint64_t)p->buffer_bytes != pb * p->periods)
+		return 0;
+	if (p->buffer_bytes > in->max_buffer_bytes)
+		return 0;
+	return 1;
+}
+
+static int au_setparams(int fd, uint32_t fmt, uint32_t rate, uint32_t ch,
+			uint32_t period_frames, uint32_t periods,
+			uint32_t flags, struct audio_params *out)
+{
+	struct audio_params p;
+	memset(&p, 0, sizeof(p));
+	p.direction = AUDIO_DIR_PLAYBACK;
+	p.format = fmt;
+	p.rate = rate;
+	p.channels = ch;
+	p.period_frames = period_frames;
+	p.periods = periods;
+	p.flags = flags;
+	int r = ioctl(fd, AUDIO_SETPARAMS, &p);
+	*out = p;
+	return r;
+}
+
+/* A request with out-of-range values must either be refused with EINVAL or
+ * be clamped to something the card really does. */
+static void au_check_nonsense(int fd, const struct audio_info *in,
+			      const char *what, struct audio_params *req)
+{
+	char name[128];
+	errno = 0;
+	int r = ioctl(fd, AUDIO_SETPARAMS, req);
+	int e = errno;
+	snprintf(name, sizeof(name),
+		 "SETPARAMS %s: EINVAL or clamped to a valid setting", what);
+	test_result(name, (r == -1 && e == EINVAL) ||
+				  (r == 0 && au_params_valid(req, in)));
+}
+
+static int au_getpos(int fd, struct audio_pos *pos)
+{
+	memset(pos, 0, sizeof(*pos));
+	return ioctl(fd, AUDIO_GETPOS, pos);
+}
+
+/* write() all of `len' bytes (blocking fd), under a watchdog. */
+static long au_write_all(int fd, const void *buf, size_t len)
+{
+	struct sigaction old;
+	size_t done = 0;
+	au_guard(&old, 8);
+	while (done < len) {
+		long w = write(fd, (const char *)buf + done, len - done);
+		if (w <= 0) {
+			if (w == -1 && errno == EINTR && !g_au_alarm)
+				continue;
+			break;
+		}
+		done += (size_t)w;
+	}
+	au_unguard(&old);
+	return (long)done;
+}
+
+static int au_set_nonblock(int fd, int on)
+{
+	int fl = fcntl(fd, F_GETFL);
+	if (fl < 0)
+		return -1;
+	fl = on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
+	return fcntl(fd, F_SETFL, fl);
+}
+
+/* ---- native PCM: parameters --------------------------------------------- */
+
+static void au_test_params(int fd, const struct audio_info *in)
+{
+	struct audio_params p, g;
+	uint32_t fmt = au_pick_format(in);
+	uint32_t ch = au_pick_channels(in);
+
+	printf("  -- parameters --\n");
+
+	/* The two common rates, each where the card can do it. */
+	static const uint32_t try_rates[] = { 48000, 44100 };
+	for (unsigned i = 0; i < 2; i++) {
+		char name[128];
+		uint32_t rate = try_rates[i];
+		if (!(audio_rate_bit(rate) & in->rates)) {
+			printf("  [SKIP] %u Hz not offered by the card\n", rate);
+			continue;
+		}
+		int r = au_setparams(fd, fmt, rate, ch, 0, 0, 0, &p);
+		snprintf(name, sizeof(name), "SETPARAMS fmt %u, %u ch, %u Hz",
+			 fmt, ch, rate);
+		test_result(name, r == 0);
+		if (r != 0)
+			continue;
+		snprintf(name, sizeof(name),
+			 "SETPARAMS %u Hz: granted exactly what was asked",
+			 rate);
+		test_result(name, p.format == fmt && p.channels == ch &&
+					  p.rate == rate);
+		snprintf(name, sizeof(name),
+			 "SETPARAMS %u Hz: defaults are within the card's limits",
+			 rate);
+		test_result(name, au_params_valid(&p, in));
+		snprintf(name, sizeof(name),
+			 "SETPARAMS %u Hz: frame_bytes and buffer_bytes agree",
+			 rate);
+		test_result(name,
+			    p.frame_bytes ==
+					    audio_format_bytes(p.format) *
+						    p.channels &&
+				    (uint64_t)p.buffer_bytes ==
+					    (uint64_t)p.period_frames *
+						    p.periods * p.frame_bytes);
+		memset(&g, 0, sizeof(g));
+		snprintf(name, sizeof(name),
+			 "GETPARAMS %u Hz: matches what SETPARAMS granted", rate);
+		test_result(name, ioctl(fd, AUDIO_GETPARAMS, &g) == 0 &&
+					  g.direction == p.direction &&
+					  g.format == p.format &&
+					  g.rate == p.rate &&
+					  g.channels == p.channels &&
+					  g.period_frames == p.period_frames &&
+					  g.periods == p.periods &&
+					  g.buffer_bytes == p.buffer_bytes &&
+					  g.frame_bytes == p.frame_bytes);
+	}
+
+	/* An explicit period geometry inside the card's limits is honoured
+	 * (up to the hardware's alignment). */
+	{
+		uint32_t fbytes = audio_format_bytes(fmt) * ch;
+		uint32_t want_pf = 1024, want_np = 4;
+		uint64_t pb = (uint64_t)want_pf * fbytes;
+		if (pb < in->min_period_bytes || pb > in->max_period_bytes ||
+		    want_np < in->min_periods || want_np > in->max_periods ||
+		    pb * want_np > in->max_buffer_bytes) {
+			printf("  [SKIP] 1024x4 period geometry outside the card's limits\n");
+		} else {
+			int r = au_setparams(fd, fmt, au_pick_rate(in, 48000),
+					     ch, want_pf, want_np, 0, &p);
+			test_result("SETPARAMS period 1024 frames x 4", r == 0);
+			if (r == 0) {
+				test_result("period count honoured",
+					    p.periods == want_np);
+				test_result("period size honoured (within alignment)",
+					    p.period_frames >= want_pf / 2 &&
+						    p.period_frames <=
+							    want_pf * 2);
+				test_result("granted geometry is valid",
+					    au_params_valid(&p, in));
+			}
+		}
+	}
+
+	/* The smallest and the largest geometry: clamped or refused. */
+	struct audio_params q;
+	uint32_t rate = au_pick_rate(in, 48000);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = rate;
+	q.channels = ch;
+	q.period_frames = 1;
+	q.periods = 1;
+	au_check_nonsense(fd, in, "1-frame period x 1", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = rate;
+	q.channels = ch;
+	q.period_frames = 0x7fffffff;
+	q.periods = 0x7fffffff;
+	au_check_nonsense(fd, in, "overflowing period x periods", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = rate;
+	q.channels = ch;
+	q.period_frames = 0xffffffffu;
+	q.periods = 2;
+	au_check_nonsense(fd, in, "period 0xffffffff frames", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = 99;
+	q.rate = rate;
+	q.channels = ch;
+	au_check_nonsense(fd, in, "format 99", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = 0;
+	q.rate = rate;
+	q.channels = ch;
+	au_check_nonsense(fd, in, "format 0", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = 1;
+	q.channels = ch;
+	au_check_nonsense(fd, in, "rate 1 Hz", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = 0xffffffffu;
+	q.channels = ch;
+	au_check_nonsense(fd, in, "rate 0xffffffff", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = rate;
+	q.channels = 0;
+	au_check_nonsense(fd, in, "0 channels", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = AUDIO_DIR_PLAYBACK;
+	q.format = fmt;
+	q.rate = rate;
+	q.channels = 1000;
+	au_check_nonsense(fd, in, "1000 channels", &q);
+
+	memset(&q, 0, sizeof(q));
+	q.direction = 7;
+	q.format = fmt;
+	q.rate = rate;
+	q.channels = ch;
+	errno = 0;
+	test_result("SETPARAMS direction 7 -> EINVAL",
+		    ioctl(fd, AUDIO_SETPARAMS, &q) == -1 && errno == EINVAL);
+
+	/* After all of that the stream still accepts a normal setting. */
+	test_result("SETPARAMS still works after rejected requests",
+		    au_setparams(fd, fmt, rate, ch, 0, 0, 0, &p) == 0 &&
+			    au_params_valid(&p, in));
+}
+
+/* ---- native PCM: write, poll, position, drain, drop ------------------------ */
+
+static void au_test_playback(int fd, const struct audio_info *in)
+{
+	struct audio_params p;
+	struct audio_pos pos, pos2;
+	uint32_t fmt = au_pick_format(in);
+	uint32_t ch = au_pick_channels(in);
+	uint32_t rate = au_pick_rate(in, 48000);
+
+	printf("  -- playback (silence) --\n");
+
+	/* Ask for ~40 ms periods so the timing checks below have slack;
+	 * whatever the card grants is used from here on. */
+	uint32_t want_pf = rate / 25;
+	int r = au_setparams(fd, fmt, rate, ch, want_pf, 4, 0, &p);
+	if (r != 0)
+		r = au_setparams(fd, fmt, rate, ch, 0, 0, 0, &p);
+	test_result("SETPARAMS for playback", r == 0 && au_params_valid(&p, in));
+	if (r != 0 || p.frame_bytes == 0 || p.periods < 2)
+		return;
+
+	uint32_t period_bytes = p.period_frames * p.frame_bytes;
+	uint32_t buffer_frames = p.buffer_bytes / p.frame_bytes;
+	char *sil = malloc(period_bytes);
+	if (!sil) {
+		test_fail("malloc(period)");
+		return;
+	}
+	memset(sil, au_silence_byte(p.format), period_bytes);
+
+	test_result("GETPOS after SETPARAMS", au_getpos(fd, &pos) == 0);
+	test_result("fresh stream: nothing written, nothing played",
+		    pos.appl_frames == 0 && pos.hw_frames == 0);
+	test_result("fresh stream: state SETUP or PREPARED",
+		    pos.state == AUDIO_STATE_SETUP ||
+			    pos.state == AUDIO_STATE_PREPARED);
+	test_result("fresh stream: the whole ring is writable",
+		    pos.avail_frames == buffer_frames);
+
+	/* EFAULT before anything is queued. */
+	errno = 0;
+	test_result("write() from an unmapped user address -> EFAULT",
+		    write(fd, AU_BAD_UPTR, period_bytes) == -1 &&
+			    errno == EFAULT);
+	errno = 0;
+	test_result("write() from a kernel address -> EFAULT",
+		    write(fd, AU_BAD_KPTR, period_bytes) == -1 &&
+			    errno == EFAULT);
+	test_result("a refused write queued nothing",
+		    au_getpos(fd, &pos) == 0 && pos.appl_frames == 0);
+
+	/* Two periods, blocking: they fit, so this returns at once. */
+	long w = au_write_all(fd, sil, period_bytes);
+	w += au_write_all(fd, sil, period_bytes);
+	test_result("write() two periods of silence",
+		    w == (long)(2 * period_bytes));
+	test_result("GETPOS: appl_frames counts what was written",
+		    au_getpos(fd, &pos) == 0 &&
+			    pos.appl_frames == 2ull * p.period_frames);
+	test_result("write() started the stream",
+		    pos.state == AUDIO_STATE_RUNNING ||
+			    pos.state == AUDIO_STATE_PREPARED);
+
+	/* Fill the ring without blocking until it refuses. */
+	test_result("O_NONBLOCK on the PCM fd", au_set_nonblock(fd, 1) == 0);
+	uint64_t written = (uint64_t)w;
+	int got_eagain = 0, other_err = 0;
+	for (int i = 0; i < 4096; i++) {
+		long n = write(fd, sil, period_bytes);
+		if (n > 0) {
+			written += (uint64_t)n;
+			continue;
+		}
+		if (n == -1 && errno == EAGAIN)
+			got_eagain = 1;
+		else
+			other_err = 1;
+		break;
+	}
+	test_result("nonblocking write into a full ring -> EAGAIN",
+		    got_eagain && !other_err);
+
+	r = au_getpos(fd, &pos);
+	test_result("GETPOS on a full ring", r == 0);
+	test_result("full ring: stream is running",
+		    pos.state == AUDIO_STATE_RUNNING);
+	test_result("full ring: appl_frames equals bytes written / frame",
+		    pos.appl_frames == written / p.frame_bytes);
+	test_result("full ring: hw_frames <= appl_frames",
+		    pos.hw_frames <= pos.appl_frames);
+	test_result("full ring: delay_frames <= buffer",
+		    pos.delay_frames <= buffer_frames + p.period_frames);
+	test_result("full ring: at most one period free",
+		    pos.avail_frames <= p.period_frames);
+	test_result("full ring: DMA offset inside the ring",
+		    pos.hw_offset_bytes < p.buffer_bytes);
+
+	/* Parameters cannot change under a running stream. */
+	{
+		struct audio_params x;
+		errno = 0;
+		r = au_setparams(fd, fmt, rate, ch, 0, 0, 0, &x);
+		test_result("SETPARAMS while running -> EBUSY",
+			    r == -1 && (errno == EBUSY || errno == EINVAL));
+	}
+
+	/* The ring drains, so poll reports writable within a period or two. */
+	{
+		struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+		uint64_t t0 = au_now_ns();
+		int pr = poll(&pfd, 1, 3000);
+		uint64_t dt = au_now_ns() - t0;
+		test_result("poll(POLLOUT) on a draining ring",
+			    pr == 1 && (pfd.revents & POLLOUT));
+		test_result("POLLOUT arrived within 2 s", dt < 2000000000ull);
+		test_result("no POLLERR/POLLHUP on a healthy stream",
+			    !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL)));
+	}
+
+	/* hw_frames only moves forward, and does move, while we keep the ring
+	 * fed (a nonblocking top-up between samples). */
+	{
+		int mono = 1, ts_mono = 1;
+		struct audio_pos first, prev;
+		au_getpos(fd, &first);
+		prev = first;
+		for (int i = 0; i < 6; i++) {
+			au_sleep_ms(15);
+			for (int k = 0; k < 8; k++) {
+				long n = write(fd, sil, period_bytes);
+				if (n <= 0)
+					break;
+				written += (uint64_t)n;
+			}
+			struct audio_pos cur;
+			if (au_getpos(fd, &cur) != 0) {
+				mono = 0;
+				break;
+			}
+			if (cur.hw_frames < prev.hw_frames)
+				mono = 0;
+			if (cur.timestamp_ns < prev.timestamp_ns)
+				ts_mono = 0;
+			if (cur.delay_frames > buffer_frames + p.period_frames)
+				mono = 0;
+			prev = cur;
+		}
+		test_result("GETPOS: hw_frames is monotonic", mono);
+		test_result("GETPOS: hw_frames advances while playing",
+			    prev.hw_frames > first.hw_frames);
+		test_result("GETPOS: timestamp_ns is monotonic and set",
+			    ts_mono && prev.timestamp_ns != 0);
+		test_result("GETPOS: no underrun while fed",
+			    prev.xruns == first.xruns);
+		uint64_t ms = (prev.hw_frames - first.hw_frames) * 1000ull /
+			      (p.rate ? p.rate : 1);
+		uint64_t wall = (prev.timestamp_ns - first.timestamp_ns) /
+				1000000ull;
+		/* Generous: a slow emulated card and 10 ms timer ticks. */
+		test_result("GETPOS: playback runs at roughly the set rate",
+			    wall == 0 || (ms * 3 >= wall && ms <= wall * 3 + 50));
+	}
+
+	/* DRAIN blocks until everything queued has played. */
+	test_result("clear O_NONBLOCK", au_set_nonblock(fd, 0) == 0);
+	{
+		struct sigaction old;
+		uint64_t t0 = au_now_ns();
+		au_guard(&old, 8);
+		r = ioctl(fd, AUDIO_DRAIN);
+		int e = errno;
+		au_unguard(&old);
+		uint64_t dt = au_now_ns() - t0;
+		errno = e;
+		test_result("AUDIO_DRAIN returns", r == 0);
+		/* What was queued lasts at most buffer + one top-up period. */
+		uint64_t limit_ns = ((uint64_t)buffer_frames * 4 *
+				     1000000000ull) / (p.rate ? p.rate : 1) +
+				    1000000000ull;
+		test_result("AUDIO_DRAIN took no longer than the queued audio",
+			    dt <= limit_ns);
+		test_result("after DRAIN: GETPOS",
+			    au_getpos(fd, &pos2) == 0);
+		test_result("after DRAIN: stream stopped",
+			    pos2.state != AUDIO_STATE_RUNNING &&
+				    pos2.state != AUDIO_STATE_DRAINING);
+		test_result("after DRAIN: everything written was played",
+			    pos2.hw_frames >= pos2.appl_frames &&
+				    pos2.delay_frames == 0);
+	}
+
+	/* DROP discards, PREPARE makes the stream usable again. */
+	test_result("PREPARE after DRAIN", ioctl(fd, AUDIO_PREPARE) == 0);
+	w = au_write_all(fd, sil, period_bytes);
+	w += au_write_all(fd, sil, period_bytes);
+	test_result("write() after PREPARE", w == (long)(2 * period_bytes));
+	test_result("AUDIO_DROP", ioctl(fd, AUDIO_DROP) == 0);
+	test_result("after DROP: stream not running",
+		    au_getpos(fd, &pos) == 0 &&
+			    pos.state != AUDIO_STATE_RUNNING &&
+			    pos.state != AUDIO_STATE_DRAINING);
+	test_result("AUDIO_PREPARE after DROP",
+		    ioctl(fd, AUDIO_PREPARE) == 0);
+	test_result("after PREPARE: state PREPARED and the ring empty",
+		    au_getpos(fd, &pos) == 0 &&
+			    pos.state == AUDIO_STATE_PREPARED &&
+			    pos.avail_frames == buffer_frames);
+	test_result("write() after DROP+PREPARE",
+		    au_write_all(fd, sil, period_bytes) ==
+			    (long)period_bytes);
+	test_result("AUDIO_DROP again", ioctl(fd, AUDIO_DROP) == 0);
+	test_result("DROP on a stopped stream is harmless",
+		    ioctl(fd, AUDIO_DROP) == 0);
+
+	/* Explicit start/pause/resume with NO_AUTOSTART. */
+	r = au_setparams(fd, fmt, rate, ch, p.period_frames, p.periods,
+			 AUDIO_PARAM_NO_AUTOSTART, &p);
+	test_result("SETPARAMS with AUDIO_PARAM_NO_AUTOSTART", r == 0);
+	if (r == 0) {
+		uint32_t np = p.periods > 1 ? p.periods - 1 : 1;
+		w = 0;
+		for (uint32_t i = 0; i < np; i++)
+			w += au_write_all(fd, sil, period_bytes);
+		test_result("NO_AUTOSTART: write() queues",
+			    w == (long)(np * period_bytes));
+		au_sleep_ms(30);
+		test_result("NO_AUTOSTART: write() did not start the stream",
+			    au_getpos(fd, &pos) == 0 &&
+				    (pos.state == AUDIO_STATE_PREPARED ||
+				     pos.state == AUDIO_STATE_SETUP) &&
+				    pos.hw_frames == 0);
+		test_result("AUDIO_START", ioctl(fd, AUDIO_START) == 0);
+		au_sleep_ms(20);
+		test_result("after START: running",
+			    au_getpos(fd, &pos) == 0 &&
+				    pos.state == AUDIO_STATE_RUNNING);
+		r = ioctl(fd, AUDIO_PAUSE);
+		if (r == -1 && (errno == ENOSYS || errno == EOPNOTSUPP)) {
+			printf("  [SKIP] the card cannot pause\n");
+		} else {
+			test_result("AUDIO_PAUSE", r == 0);
+			au_getpos(fd, &pos);
+			test_result("after PAUSE: state PAUSED",
+				    pos.state == AUDIO_STATE_PAUSED);
+			au_sleep_ms(40);
+			au_getpos(fd, &pos2);
+			test_result("paused: hw_frames does not move",
+				    pos2.hw_frames == pos.hw_frames);
+			test_result("AUDIO_RESUME",
+				    ioctl(fd, AUDIO_RESUME) == 0);
+			test_result("after RESUME: running again",
+				    au_getpos(fd, &pos) == 0 &&
+					    (pos.state == AUDIO_STATE_RUNNING ||
+					     pos.state == AUDIO_STATE_XRUN));
+		}
+		test_result("DROP ends the started stream",
+			    ioctl(fd, AUDIO_DROP) == 0);
+	}
+
+	/* Back to plain defaults for whatever follows. */
+	au_setparams(fd, fmt, rate, ch, 0, 0, 0, &p);
+	free(sil);
+}
+
+/* ---- native PCM: mmap + COMMIT ------------------------------------------------ */
+
+static void au_test_mmap(int fd, const struct audio_info *in)
+{
+	struct audio_params p;
+	struct audio_pos pos;
+
+	printf("  -- mmap --\n");
+	if (!(in->flags & AUDIO_INFO_MMAP)) {
+		printf("  [SKIP] the card does not offer an mmap ring\n");
+		return;
+	}
+	ioctl(fd, AUDIO_DROP);
+	int r = au_setparams(fd, au_pick_format(in), au_pick_rate(in, 48000),
+			     au_pick_channels(in), 0, 0,
+			     AUDIO_PARAM_MMAP | AUDIO_PARAM_NO_AUTOSTART, &p);
+	test_result("SETPARAMS with AUDIO_PARAM_MMAP", r == 0);
+	if (r != 0 || p.frame_bytes == 0)
+		return;
+	uint32_t buffer_frames = p.buffer_bytes / p.frame_bytes;
+
+	void *ring = mmap(NULL, p.buffer_bytes, PROT_READ | PROT_WRITE,
+			  MAP_SHARED, fd, 0);
+	test_result("mmap() the ring, length == buffer_bytes",
+		    ring != MAP_FAILED);
+	if (ring == MAP_FAILED)
+		return;
+
+	/* The kernel zeroes the ring before it can be mapped: no stale data. */
+	{
+		const unsigned char *b = ring;
+		int clean = 1;
+		int sb = au_silence_byte(p.format);
+		for (uint32_t i = 0; i < p.buffer_bytes; i++)
+			if (b[i] != 0 && b[i] != sb) {
+				clean = 0;
+				break;
+			}
+		test_result("a fresh ring holds only silence", clean);
+	}
+	memset(ring, au_silence_byte(p.format), p.buffer_bytes);
+	test_result("the mapped ring reads back what was stored",
+		    ((volatile unsigned char *)ring)[p.buffer_bytes - 1] ==
+			    (unsigned char)au_silence_byte(p.format));
+
+	uint32_t half = buffer_frames / 2;
+	test_result("AUDIO_COMMIT half the ring",
+		    ioctl(fd, AUDIO_COMMIT, &half) == 0);
+	test_result("COMMIT: appl_frames and avail_frames follow",
+		    au_getpos(fd, &pos) == 0 && pos.appl_frames == half &&
+			    pos.avail_frames == buffer_frames - half);
+	uint32_t too_many = buffer_frames;
+	errno = 0;
+	test_result("COMMIT of more than is free -> EINVAL",
+		    ioctl(fd, AUDIO_COMMIT, &too_many) == -1 &&
+			    errno == EINVAL);
+	errno = 0;
+	test_result("COMMIT with a bad pointer -> EFAULT",
+		    ioctl(fd, AUDIO_COMMIT, AU_BAD_UPTR) == -1 &&
+			    errno == EFAULT);
+	test_result("START an mmap stream", ioctl(fd, AUDIO_START) == 0);
+	au_sleep_ms(30);
+	test_result("mmap stream: the hardware consumes the ring",
+		    au_getpos(fd, &pos) == 0 && pos.hw_frames > 0);
+	test_result("DROP the mmap stream", ioctl(fd, AUDIO_DROP) == 0);
+	test_result("munmap(ring)", munmap(ring, p.buffer_bytes) == 0);
+
+	/* The mapping never reaches past the ring. */
+	size_t pg = 4096;
+	size_t past = ((size_t)p.buffer_bytes + pg - 1) / pg * pg + pg;
+	void *m = mmap(NULL, past, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	test_result("mmap() longer than the ring is refused",
+		    m == MAP_FAILED);
+	if (m != MAP_FAILED)
+		munmap(m, past);
+	m = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+		 (off_t)(((size_t)p.buffer_bytes + pg - 1) / pg * pg));
+	test_result("mmap() at an offset past the ring is refused",
+		    m == MAP_FAILED);
+	if (m != MAP_FAILED)
+		munmap(m, pg);
+
+	au_setparams(fd, au_pick_format(in), au_pick_rate(in, 48000),
+		     au_pick_channels(in), 0, 0, 0, &p);
+}
+
+/* ---- errors common to every node ------------------------------------------------- */
+
+/* `ctl_node': the node answers the control requests (volume, outputs). */
+static void au_test_bad_requests(int fd, const char *node, int ctl_node)
+{
+	char name[128];
+	int dummy = 0;
+
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: unknown 'A' request -> ENOTTY", node);
+	test_result(name, ioctl(fd, _IO('A', 0x7f)) == -1 && errno == ENOTTY);
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: foreign request type -> ENOTTY",
+		 node);
+	test_result(name, ioctl(fd, _IOR('Z', 3, int), &dummy) == -1 &&
+				  errno == ENOTTY);
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: terminal request -> ENOTTY", node);
+	{
+		struct termios t;
+		test_result(name,
+			    ioctl(fd, TCGETS, &t) == -1 && errno == ENOTTY);
+	}
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: GETINFO into NULL -> EFAULT", node);
+	test_result(name,
+		    ioctl(fd, AUDIO_GETINFO, NULL) == -1 && errno == EFAULT);
+	errno = 0;
+	snprintf(name, sizeof(name),
+		 "%s: GETINFO into a kernel address -> EFAULT", node);
+	test_result(name, ioctl(fd, AUDIO_GETINFO, AU_BAD_KPTR) == -1 &&
+				  errno == EFAULT);
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: GETVERSION into NULL -> EFAULT",
+		 node);
+	test_result(name, ioctl(fd, AUDIO_GETVERSION, NULL) == -1 &&
+				  errno == EFAULT);
+	if (!ctl_node)
+		return;
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: GETVOL from a bad pointer -> EFAULT",
+		 node);
+	test_result(name, ioctl(fd, AUDIO_GETVOL, AU_BAD_UPTR) == -1 &&
+				  errno == EFAULT);
+	errno = 0;
+	snprintf(name, sizeof(name),
+		 "%s: GETOUTPUTS into a kernel address -> EFAULT", node);
+	test_result(name, ioctl(fd, AUDIO_GETOUTPUTS, AU_BAD_KPTR) == -1 &&
+				  errno == EFAULT);
+}
+
+static void au_test_pcm_bad_pointers(int fd)
+{
+	errno = 0;
+	test_result("SETPARAMS from a bad pointer -> EFAULT",
+		    ioctl(fd, AUDIO_SETPARAMS, AU_BAD_UPTR) == -1 &&
+			    errno == EFAULT);
+	errno = 0;
+	test_result("SETPARAMS from a kernel address -> EFAULT",
+		    ioctl(fd, AUDIO_SETPARAMS, AU_BAD_KPTR) == -1 &&
+			    errno == EFAULT);
+	errno = 0;
+	test_result("GETPOS into NULL -> EFAULT",
+		    ioctl(fd, AUDIO_GETPOS, NULL) == -1 && errno == EFAULT);
+	errno = 0;
+	test_result("GETPARAMS into a kernel address -> EFAULT",
+		    ioctl(fd, AUDIO_GETPARAMS, AU_BAD_KPTR) == -1 &&
+			    errno == EFAULT);
+	errno = 0;
+	test_result("SNDCTL_DSP_SPEED from a bad pointer -> EFAULT",
+		    ioctl(fd, SNDCTL_DSP_SPEED, AU_BAD_UPTR) == -1 &&
+			    errno == EFAULT);
+	errno = 0;
+	test_result("SNDCTL_DSP_GETOSPACE into a kernel address -> EFAULT",
+		    ioctl(fd, SNDCTL_DSP_GETOSPACE, AU_BAD_KPTR) == -1 &&
+			    errno == EFAULT);
+}
+
+/* ---- OSS /dev/dsp ------------------------------------------------------------------ */
+
+static void au_test_oss_dsp(const struct audio_info *in)
+{
+	printf("  -- OSS /dev/dsp --\n");
+	int fd = open("/dev/dsp", O_WRONLY);
+	if (fd < 0 && errno == EBUSY) {
+		printf("  [SKIP] /dev/dsp is in use (audio service running)\n");
+		return;
+	}
+	test_result("open(/dev/dsp, O_WRONLY)", fd >= 0);
+	if (fd < 0)
+		return;
+
+	int caps = 0;
+	test_result("SNDCTL_DSP_GETCAPS",
+		    ioctl(fd, SNDCTL_DSP_GETCAPS, &caps) == 0);
+
+	/* Fragments are requested before the format, as OSS programs do:
+	 * 4 fragments of 2^12 bytes. */
+	int frag = (4 << 16) | 12;
+	test_result("SNDCTL_DSP_SETFRAGMENT 4 x 4096",
+		    ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &frag) == 0);
+
+	int fmts = 0;
+	test_result("SNDCTL_DSP_GETFMTS",
+		    ioctl(fd, SNDCTL_DSP_GETFMTS, &fmts) == 0 && fmts != 0);
+	int want = (in->formats & AUDIO_FMT_BIT(AUDIO_FMT_S16_LE)) ?
+			   AFMT_S16_LE :
+			   AFMT_U8;
+	test_result("GETFMTS lists the card's 16-bit (or 8-bit) format",
+		    (fmts & want) != 0);
+	int fmt = want;
+	test_result("SNDCTL_DSP_SETFMT", ioctl(fd, SNDCTL_DSP_SETFMT, &fmt) == 0);
+	test_result("SETFMT granted the requested format", fmt == want);
+	int q = AFMT_QUERY;
+	test_result("SETFMT(AFMT_QUERY) reports the current format",
+		    ioctl(fd, SNDCTL_DSP_SETFMT, &q) == 0 && q == fmt);
+
+	int chans = (int)au_pick_channels(in);
+	int c = chans;
+	test_result("SNDCTL_DSP_CHANNELS",
+		    ioctl(fd, SNDCTL_DSP_CHANNELS, &c) == 0 && c == chans);
+	c = 1000;
+	test_result("CHANNELS 1000 is clamped to the card's maximum",
+		    ioctl(fd, SNDCTL_DSP_CHANNELS, &c) == 0 && c >= 1 &&
+			    (uint32_t)c <= in->max_channels);
+	c = chans;
+	ioctl(fd, SNDCTL_DSP_CHANNELS, &c);
+	int st = chans >= 2 ? 1 : 0;
+	test_result("SNDCTL_DSP_STEREO",
+		    ioctl(fd, SNDCTL_DSP_STEREO, &st) == 0 &&
+			    st == (chans >= 2 ? 1 : 0));
+
+	static const int rates[] = { 48000, 44100 };
+	for (unsigned i = 0; i < 2; i++) {
+		char name[96];
+		int sp = rates[i];
+		if (!(audio_rate_bit((uint32_t)sp) & in->rates))
+			continue;
+		snprintf(name, sizeof(name), "SNDCTL_DSP_SPEED %d", rates[i]);
+		test_result(name, ioctl(fd, SNDCTL_DSP_SPEED, &sp) == 0 &&
+					  sp == rates[i]);
+	}
+	int odd = 12345;
+	test_result("SPEED 12345 answers a rate the card can do",
+		    ioctl(fd, SNDCTL_DSP_SPEED, &odd) == 0 && odd > 0 &&
+			    au_rate_in_range(in, (uint32_t)odd));
+	int sp = (int)au_pick_rate(in, 48000);
+	ioctl(fd, SNDCTL_DSP_SPEED, &sp);
+
+	int blk = 0;
+	test_result("SNDCTL_DSP_GETBLKSIZE",
+		    ioctl(fd, SNDCTL_DSP_GETBLKSIZE, &blk) == 0 && blk > 0);
+
+	audio_buf_info bi;
+	memset(&bi, 0, sizeof(bi));
+	test_result("SNDCTL_DSP_GETOSPACE",
+		    ioctl(fd, SNDCTL_DSP_GETOSPACE, &bi) == 0);
+	test_result("GETOSPACE: fragment geometry sane",
+		    bi.fragsize > 0 && bi.fragstotal >= 2 &&
+			    bi.bytes > 0 &&
+			    bi.bytes <= bi.fragsize * bi.fragstotal &&
+			    bi.fragments == bi.bytes / bi.fragsize);
+	test_result("GETOSPACE: an idle buffer is all free",
+		    bi.bytes == bi.fragsize * bi.fragstotal);
+
+	int delay = -1;
+	test_result("SNDCTL_DSP_GETODELAY on an idle stream is 0",
+		    ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) == 0 &&
+			    delay == 0);
+
+	if (bi.fragsize > 0 && bi.fragsize <= (1 << 20)) {
+		char *sil = malloc((size_t)bi.fragsize);
+		if (sil) {
+			memset(sil, fmt == AFMT_U8 ? 0x80 : 0, (size_t)bi.fragsize);
+			test_result("write() one fragment of silence to /dev/dsp",
+				    au_write_all(fd, sil, (size_t)bi.fragsize) ==
+					    bi.fragsize);
+			delay = -1;
+			test_result("GETODELAY counts the queued fragment",
+				    ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) == 0 &&
+					    delay > 0 &&
+					    delay <= bi.fragsize * bi.fragstotal);
+			audio_buf_info b2;
+			memset(&b2, 0, sizeof(b2));
+			test_result("GETOSPACE shrinks while data is queued",
+				    ioctl(fd, SNDCTL_DSP_GETOSPACE, &b2) == 0 &&
+					    b2.bytes < bi.fragsize * bi.fragstotal);
+			count_info ci;
+			memset(&ci, 0, sizeof(ci));
+			test_result("SNDCTL_DSP_GETOPTR",
+				    ioctl(fd, SNDCTL_DSP_GETOPTR, &ci) == 0 &&
+					    ci.ptr >= 0 &&
+					    ci.ptr < bi.fragsize * bi.fragstotal &&
+					    ci.bytes >= 0 && ci.blocks >= 0);
+			test_result("SNDCTL_DSP_RESET",
+				    ioctl(fd, SNDCTL_DSP_RESET) == 0);
+			delay = -1;
+			test_result("GETODELAY is 0 after RESET",
+				    ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) == 0 &&
+					    delay == 0);
+			memset(&b2, 0, sizeof(b2));
+			test_result("GETOSPACE: all free again after RESET",
+				    ioctl(fd, SNDCTL_DSP_GETOSPACE, &b2) == 0 &&
+					    b2.bytes == b2.fragsize * b2.fragstotal);
+
+			/* POST then SYNC: queue, kick, wait until played. */
+			test_result("write() after RESET",
+				    au_write_all(fd, sil, (size_t)bi.fragsize) ==
+					    bi.fragsize);
+			test_result("SNDCTL_DSP_POST",
+				    ioctl(fd, SNDCTL_DSP_POST) == 0);
+			struct sigaction old;
+			au_guard(&old, 8);
+			int sr = ioctl(fd, SNDCTL_DSP_SYNC);
+			au_unguard(&old);
+			test_result("SNDCTL_DSP_SYNC waits for playback to end",
+				    sr == 0);
+			delay = -1;
+			test_result("GETODELAY is 0 after SYNC",
+				    ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) == 0 &&
+					    delay == 0);
+			free(sil);
+		}
+	}
+	test_result("SNDCTL_DSP_HALT", ioctl(fd, SNDCTL_DSP_HALT) == 0);
+	test_result("close(/dev/dsp)", close(fd) == 0);
+}
+
+/* ---- OSS /dev/mixer -------------------------------------------------------------- */
+
+static void au_mixer_roundtrip(int fd, int dev, const char *label)
+{
+	char name[128];
+	int orig = -1;
+
+	snprintf(name, sizeof(name), "MIXER_READ(%s)", label);
+	test_result(name, ioctl(fd, MIXER_READ(dev), &orig) == 0);
+	if (orig < 0)
+		return;
+	uint32_t l = (uint32_t)orig & 0xff, r = ((uint32_t)orig >> 8) & 0xff;
+	snprintf(name, sizeof(name), "MIXER_READ(%s): levels 0..100", label);
+	test_result(name, l <= 100 && r <= 100 && ((uint32_t)orig >> 16) == 0);
+
+	uint32_t tl = l >= 50 ? l - 20 : l + 20;
+	uint32_t tr = r >= 50 ? r - 20 : r + 20;
+	int val = SOUND_MIXER_LEVEL(tl, tr);
+	snprintf(name, sizeof(name), "MIXER_WRITE(%s)", label);
+	test_result(name, ioctl(fd, MIXER_WRITE(dev), &val) == 0);
+	int back = -1;
+	ioctl(fd, MIXER_READ(dev), &back);
+	snprintf(name, sizeof(name), "MIXER_WRITE(%s) reads back", label);
+	test_result(name, back >= 0 &&
+				  au_absdiff((uint32_t)back & 0xff, tl) <= 4 &&
+				  au_absdiff(((uint32_t)back >> 8) & 0xff, tr) <=
+					  4);
+
+	/* Out-of-range levels: refused, or clamped to 100. */
+	int big = SOUND_MIXER_LEVEL(255, 255);
+	errno = 0;
+	int br = ioctl(fd, MIXER_WRITE(dev), &big);
+	int be = errno;
+	int after = -1;
+	ioctl(fd, MIXER_READ(dev), &after);
+	snprintf(name, sizeof(name),
+		 "MIXER_WRITE(%s) 255/255: EINVAL or clamped to 100", label);
+	test_result(name, (br == -1 && be == EINVAL) ||
+				  (br == 0 && after >= 0 &&
+				   ((uint32_t)after & 0xff) <= 100 &&
+				   (((uint32_t)after >> 8) & 0xff) <= 100));
+
+	val = orig;
+	ioctl(fd, MIXER_WRITE(dev), &val);
+	back = -1;
+	ioctl(fd, MIXER_READ(dev), &back);
+	snprintf(name, sizeof(name), "MIXER(%s) restored", label);
+	test_result(name, back >= 0 &&
+				  au_absdiff((uint32_t)back & 0xff, l) <= 2 &&
+				  au_absdiff(((uint32_t)back >> 8) & 0xff, r) <=
+					  2);
+}
+
+static void au_test_oss_mixer(int fd)
+{
+	printf("  -- OSS /dev/mixer --\n");
+
+	int v = 0;
+	test_result("OSS_GETVERSION",
+		    ioctl(fd, OSS_GETVERSION, &v) == 0 && v >= 0x030000);
+
+	mixer_info mi;
+	memset(&mi, 0xA5, sizeof(mi));
+	test_result("SOUND_MIXER_INFO",
+		    ioctl(fd, SOUND_MIXER_INFO, &mi) == 0 &&
+			    au_strz(mi.id, sizeof(mi.id)) &&
+			    au_strz(mi.name, sizeof(mi.name)) &&
+			    mi.name[0] != '\0');
+
+	int devmask = 0;
+	test_result("SOUND_MIXER_READ_DEVMASK",
+		    ioctl(fd, SOUND_MIXER_READ_DEVMASK, &devmask) == 0);
+	test_result("DEVMASK has a volume or pcm control",
+		    (devmask & (SOUND_MASK_VOLUME | SOUND_MASK_PCM)) != 0);
+	int stereo = 0;
+	test_result("SOUND_MIXER_READ_STEREODEVS within DEVMASK",
+		    ioctl(fd, SOUND_MIXER_READ_STEREODEVS, &stereo) == 0 &&
+			    (stereo & ~devmask) == 0);
+
+	if (devmask & SOUND_MASK_VOLUME)
+		au_mixer_roundtrip(fd, SOUND_MIXER_VOLUME, "volume");
+	if (devmask & SOUND_MASK_PCM)
+		au_mixer_roundtrip(fd, SOUND_MIXER_PCM, "pcm");
+
+	/* A control the card does not have. */
+	for (int d = 0; d < SOUND_MIXER_NRDEVICES; d++) {
+		if (devmask & (1 << d))
+			continue;
+		int x = 0;
+		errno = 0;
+		test_result("MIXER_READ of an absent control -> EINVAL",
+			    ioctl(fd, MIXER_READ(d), &x) == -1 &&
+				    errno == EINVAL);
+		break;
+	}
+}
+
+/* ---- native controls: volume, mute, outputs, events, diagnostics --------------- */
+
+static void au_test_volume(int fd)
+{
+	char name[128];
+	int have = 0;
+	int done_rt = 0;
+
+	printf("  -- volume / mute --\n");
+	for (uint32_t ctl = 0; ctl <= AUDIO_CTL_MAX; ctl++) {
+		struct audio_volume v;
+		memset(&v, 0, sizeof(v));
+		v.control = ctl;
+		errno = 0;
+		int r = ioctl(fd, AUDIO_GETVOL, &v);
+		if (r == -1) {
+			snprintf(name, sizeof(name),
+				 "GETVOL control %u: absent -> ENOENT", ctl);
+			test_result(name, errno == ENOENT);
+			continue;
+		}
+		have++;
+		snprintf(name, sizeof(name), "GETVOL control %u: sane", ctl);
+		test_result(name,
+			    v.control == ctl && v.left <= 100 &&
+				    v.right <= 100 && v.db_min <= v.db_max &&
+				    (v.db_min == v.db_max ||
+				     (v.db_left >= v.db_min &&
+				      v.db_left <= v.db_max &&
+				      v.db_right >= v.db_min &&
+				      v.db_right <= v.db_max)));
+
+		/* One round trip on the first playback level control. */
+		if (done_rt || ctl == AUDIO_CTL_CAPTURE ||
+		    ctl == AUDIO_CTL_MIC_BOOST)
+			continue;
+		done_rt = 1;
+		struct audio_volume orig = v;
+		int tol = v.steps ? (int)(100 / v.steps) + 2 : 1;
+		struct audio_volume s;
+		memset(&s, 0, sizeof(s));
+		s.control = ctl;
+		s.left = orig.left >= 50 ? orig.left - 25 : orig.left + 25;
+		s.right = orig.right >= 50 ? orig.right - 25 : orig.right + 25;
+		uint32_t tl = s.left, tr = s.right;
+		snprintf(name, sizeof(name), "SETVOL control %u", ctl);
+		test_result(name, ioctl(fd, AUDIO_SETVOL, &s) == 0);
+		memset(&v, 0, sizeof(v));
+		v.control = ctl;
+		snprintf(name, sizeof(name), "SETVOL control %u reads back",
+			 ctl);
+		test_result(name, ioctl(fd, AUDIO_GETVOL, &v) == 0 &&
+					  au_absdiff(v.left, tl) <= tol &&
+					  au_absdiff(v.right, tr) <= tol);
+		memset(&s, 0, sizeof(s));
+		s.control = ctl;
+		s.left = 101;
+		s.right = 0xffffffffu;
+		errno = 0;
+		r = ioctl(fd, AUDIO_SETVOL, &s);
+		int e = errno;
+		memset(&v, 0, sizeof(v));
+		v.control = ctl;
+		ioctl(fd, AUDIO_GETVOL, &v);
+		snprintf(name, sizeof(name),
+			 "SETVOL control %u out of range: EINVAL or clamped",
+			 ctl);
+		test_result(name, (r == -1 && e == EINVAL) ||
+					  (r == 0 && v.left <= 100 &&
+					   v.right <= 100));
+		memset(&s, 0, sizeof(s));
+		s.control = ctl;
+		s.left = orig.left;
+		s.right = orig.right;
+		ioctl(fd, AUDIO_SETVOL, &s);
+		memset(&v, 0, sizeof(v));
+		v.control = ctl;
+		snprintf(name, sizeof(name), "SETVOL control %u restored", ctl);
+		test_result(name, ioctl(fd, AUDIO_GETVOL, &v) == 0 &&
+					  au_absdiff(v.left, orig.left) <= 1 &&
+					  au_absdiff(v.right, orig.right) <= 1);
+	}
+	test_result("the card has at least one volume control", have > 0);
+
+	struct audio_volume bad;
+	memset(&bad, 0, sizeof(bad));
+	bad.control = 99;
+	errno = 0;
+	test_result("GETVOL of control 99 -> EINVAL or ENOENT",
+		    ioctl(fd, AUDIO_GETVOL, &bad) == -1 &&
+			    (errno == EINVAL || errno == ENOENT));
+	bad.control = 99;
+	bad.left = bad.right = 50;
+	errno = 0;
+	test_result("SETVOL of control 99 -> EINVAL or ENOENT",
+		    ioctl(fd, AUDIO_SETVOL, &bad) == -1 &&
+			    (errno == EINVAL || errno == ENOENT));
+
+	/* Mute: toggle and restore (silent either way). */
+	struct audio_mute m;
+	memset(&m, 0, sizeof(m));
+	m.control = AUDIO_CTL_MASTER;
+	errno = 0;
+	int r = ioctl(fd, AUDIO_GETMUTE, &m);
+	if (r == -1 && errno == ENOENT) {
+		printf("  [SKIP] no master mute switch\n");
+	} else {
+		test_result("GETMUTE master", r == 0 && m.mute <= 1);
+		uint32_t orig = m.mute;
+		struct audio_mute s;
+		memset(&s, 0, sizeof(s));
+		s.control = AUDIO_CTL_MASTER;
+		s.mute = !orig;
+		test_result("SETMUTE master toggled",
+			    ioctl(fd, AUDIO_SETMUTE, &s) == 0);
+		memset(&m, 0, sizeof(m));
+		m.control = AUDIO_CTL_MASTER;
+		test_result("GETMUTE sees the toggle",
+			    ioctl(fd, AUDIO_GETMUTE, &m) == 0 &&
+				    m.mute == (uint32_t)!orig);
+		s.mute = orig;
+		test_result("SETMUTE master restored",
+			    ioctl(fd, AUDIO_SETMUTE, &s) == 0);
+		memset(&m, 0, sizeof(m));
+		m.control = AUDIO_CTL_MASTER;
+		test_result("GETMUTE back to the original",
+			    ioctl(fd, AUDIO_GETMUTE, &m) == 0 &&
+				    m.mute == orig);
+		s.mute = 7;
+		errno = 0;
+		r = ioctl(fd, AUDIO_SETMUTE, &s);
+		if (r == 0) {
+			/* Accepted as "muted": put it back. */
+			s.mute = orig;
+			ioctl(fd, AUDIO_SETMUTE, &s);
+		}
+		test_result("SETMUTE 7: EINVAL or taken as a boolean",
+			    (r == -1 && errno == EINVAL) || r == 0);
+	}
+}
+
+static int au_outputs_sane(const struct audio_outputs *o)
+{
+	if (o->count > AUDIO_MAX_OUTPUTS || o->mode > AUDIO_OUTSEL_ALL)
+		return 0;
+	for (uint32_t i = 0; i < o->count; i++) {
+		const struct audio_output_desc *d = &o->out[i];
+		if (!au_strz(d->name, sizeof(d->name)) || d->name[0] == '\0')
+			return 0;
+		if (!au_strz(d->monitor, sizeof(d->monitor)))
+			return 0;
+		if (d->type < AUDIO_OUT_SPEAKER || d->type > AUDIO_OUT_HEADSET)
+			return 0;
+		if (d->present > 1 || d->active > 1)
+			return 0;
+		if ((d->flags & AUDIO_OUTF_FIXED) && !d->present)
+			return 0;
+		for (uint32_t j = 0; j < i; j++)
+			if (o->out[j].id == d->id)
+				return 0;
+	}
+	return 1;
+}
+
+static void au_test_outputs(int fd, const struct audio_info *in)
+{
+	struct audio_outputs o;
+
+	printf("  -- outputs --\n");
+	memset(&o, 0xA5, sizeof(o));
+	int r = ioctl(fd, AUDIO_GETOUTPUTS, &o);
+	test_result("AUDIO_GETOUTPUTS", r == 0);
+	if (r != 0)
+		return;
+	test_result("GETOUTPUTS: count <= AUDIO_MAX_OUTPUTS",
+		    o.count <= AUDIO_MAX_OUTPUTS);
+	test_result("GETOUTPUTS: count matches GETINFO",
+		    o.count == in->num_outputs);
+	test_result("GETOUTPUTS: entries well formed", au_outputs_sane(&o));
+	{
+		int z = 1;
+		/* Entries past `count' come back cleared, not as stale
+		 * kernel memory. */
+		for (uint32_t i = o.count; i < AUDIO_MAX_OUTPUTS && z; i++) {
+			const unsigned char *b =
+				(const unsigned char *)&o.out[i];
+			for (size_t k = 0; k < sizeof(o.out[i]); k++)
+				if (b[k] != 0) {
+					z = 0;
+					break;
+				}
+		}
+		test_result("GETOUTPUTS: unused entries are zeroed", z);
+	}
+
+	struct audio_outputs inp;
+	memset(&inp, 0, sizeof(inp));
+	r = ioctl(fd, AUDIO_GETINPUTS, &inp);
+	test_result("AUDIO_GETINPUTS",
+		    r == 0 && inp.count <= AUDIO_MAX_OUTPUTS &&
+			    inp.count == in->num_inputs);
+
+	/* Re-applying the routing in force changes nothing. */
+	struct audio_setoutput so;
+	memset(&so, 0, sizeof(so));
+	so.mode = o.mode;
+	so.id = o.selected;
+	test_result("SETOUTPUT with the current routing",
+		    ioctl(fd, AUDIO_SETOUTPUT, &so) == 0);
+
+	memset(&so, 0, sizeof(so));
+	so.mode = 99;
+	errno = 0;
+	test_result("SETOUTPUT mode 99 -> EINVAL",
+		    ioctl(fd, AUDIO_SETOUTPUT, &so) == -1 && errno == EINVAL);
+	memset(&so, 0, sizeof(so));
+	so.mode = AUDIO_OUTSEL_ID;
+	so.id = 0xdead;
+	errno = 0;
+	test_result("SETOUTPUT to a nonexistent id -> EINVAL or ENOENT",
+		    ioctl(fd, AUDIO_SETOUTPUT, &so) == -1 &&
+			    (errno == EINVAL || errno == ENOENT));
+
+	/* Put the routing back exactly in case anything above took. */
+	memset(&so, 0, sizeof(so));
+	so.mode = o.mode;
+	so.id = o.selected;
+	ioctl(fd, AUDIO_SETOUTPUT, &so);
+	struct audio_outputs o2;
+	memset(&o2, 0, sizeof(o2));
+	test_result("routing unchanged afterwards",
+		    ioctl(fd, AUDIO_GETOUTPUTS, &o2) == 0 &&
+			    o2.mode == o.mode &&
+			    (o.mode != AUDIO_OUTSEL_ID ||
+			     o2.selected == o.selected));
+}
+
+static void au_test_events(int may_drain)
+{
+	printf("  -- events --\n");
+	int fd = open("/dev/mixer", O_RDONLY | O_NONBLOCK);
+	test_result("open(/dev/mixer, O_RDONLY|O_NONBLOCK)", fd >= 0);
+	if (fd < 0)
+		return;
+	if (!may_drain) {
+		/* The audio service consumes these; do not take them away. */
+		printf("  [SKIP] event drain (audio service running)\n");
+		close(fd);
+		return;
+	}
+	int ok_types = 1, got_eagain = 0;
+	for (int i = 0; i < 256; i++) {
+		struct audio_event ev;
+		memset(&ev, 0, sizeof(ev));
+		errno = 0;
+		if (ioctl(fd, AUDIO_GETEVENT, &ev) == 0) {
+			if (ev.type < AUDIO_EV_JACK ||
+			    ev.type > AUDIO_EV_DISCONNECT)
+				ok_types = 0;
+			continue;
+		}
+		got_eagain = errno == EAGAIN;
+		break;
+	}
+	test_result("queued events have known types", ok_types);
+	test_result("GETEVENT on an empty queue -> EAGAIN", got_eagain);
+	struct pollfd pfd = { .fd = fd, .events = POLLPRI };
+	test_result("poll: no POLLPRI with the queue empty",
+		    poll(&pfd, 1, 0) == 0 && !(pfd.revents & POLLPRI));
+	errno = 0;
+	test_result("GETEVENT into a kernel address -> EFAULT",
+		    ioctl(fd, AUDIO_GETEVENT, AU_BAD_KPTR) == -1 &&
+			    (errno == EFAULT || errno == EAGAIN));
+	close(fd);
+}
+
+static void au_test_diag(int fd)
+{
+	enum { LEN = 4096, GUARD = 64 };
+	unsigned char *buf = malloc(LEN + GUARD);
+	struct audio_diag d;
+
+	printf("  -- diagnostics --\n");
+	if (!buf) {
+		test_fail("malloc(diag)");
+		return;
+	}
+
+	static const uint32_t whats[] = { AUDIO_DIAG_SUMMARY, AUDIO_DIAG_CODECS,
+					  AUDIO_DIAG_STREAMS };
+	for (unsigned i = 0; i < 3; i++) {
+		char name[96];
+		memset(buf, 0xA5, LEN + GUARD);
+		memset(&d, 0, sizeof(d));
+		d.buf = (uint64_t)(uintptr_t)buf;
+		d.len = LEN;
+		d.what = whats[i];
+		int r = ioctl(fd, AUDIO_DIAG, &d);
+		snprintf(name, sizeof(name), "AUDIO_DIAG what=%u", whats[i]);
+		test_result(name, r == 0 && d.written > 0 && d.written <= LEN);
+		int guard_ok = 1;
+		for (int k = LEN; k < LEN + GUARD; k++)
+			if (buf[k] != 0xA5)
+				guard_ok = 0;
+		snprintf(name, sizeof(name),
+			 "AUDIO_DIAG what=%u stays inside len", whats[i]);
+		test_result(name, guard_ok);
+	}
+
+	/* A tiny buffer: truncated, never overrun. */
+	memset(buf, 0xA5, LEN + GUARD);
+	memset(&d, 0, sizeof(d));
+	d.buf = (uint64_t)(uintptr_t)buf;
+	d.len = 16;
+	d.what = AUDIO_DIAG_CODECS;
+	int r = ioctl(fd, AUDIO_DIAG, &d);
+	int guard_ok = 1;
+	for (int k = 16; k < LEN + GUARD; k++)
+		if (buf[k] != 0xA5)
+			guard_ok = 0;
+	test_result("AUDIO_DIAG len 16: truncated to the buffer",
+		    r == 0 && d.written <= 16 && guard_ok);
+
+	memset(&d, 0, sizeof(d));
+	d.buf = (uint64_t)(uintptr_t)buf;
+	d.len = 0;
+	r = ioctl(fd, AUDIO_DIAG, &d);
+	test_result("AUDIO_DIAG len 0 writes nothing",
+		    (r == 0 && d.written == 0) || (r == -1 && errno == EINVAL));
+
+	memset(&d, 0, sizeof(d));
+	d.buf = (uint64_t)(uintptr_t)AU_BAD_UPTR;
+	d.len = 256;
+	errno = 0;
+	test_result("AUDIO_DIAG into an unmapped address -> EFAULT",
+		    ioctl(fd, AUDIO_DIAG, &d) == -1 && errno == EFAULT);
+	memset(&d, 0, sizeof(d));
+	d.buf = (uint64_t)(uintptr_t)AU_BAD_KPTR;
+	d.len = 256;
+	errno = 0;
+	test_result("AUDIO_DIAG into a kernel address -> EFAULT",
+		    ioctl(fd, AUDIO_DIAG, &d) == -1 && errno == EFAULT);
+	memset(&d, 0, sizeof(d));
+	d.buf = (uint64_t)(uintptr_t)buf;
+	d.len = 256;
+	d.what = 99;
+	errno = 0;
+	test_result("AUDIO_DIAG unknown `what' -> EINVAL",
+		    ioctl(fd, AUDIO_DIAG, &d) == -1 && errno == EINVAL);
+	free(buf);
+}
+
+/* ---- permissions --------------------------------------------------------------- */
+
+#define AU_P_DROPPED 0x01 /* the child changed identity as asked */
+#define AU_P_AUDIO 0x02 /* /dev/audio0 */
+#define AU_P_DSP 0x04 /* /dev/dsp */
+#define AU_P_MIXER 0x08 /* /dev/mixer */
+
+/* Child: become uid `uid' with primary group `gid' and the given
+ * supplementary groups, then report, per node, whether the open came out as
+ * `want_denied' expects (EACCES), or as allowed (success, or EBUSY when the
+ * audio service holds the PCM -- the permission check passed then). */
+static int au_perm_child(uid_t uid, gid_t gid, const int *groups, int ngroups,
+			 int want_denied)
+{
+	static const struct {
+		const char *path;
+		int flags;
+		int bit;
+	} nodes[] = { { "/dev/audio0", O_WRONLY, AU_P_AUDIO },
+		      { "/dev/dsp", O_WRONLY, AU_P_DSP },
+		      { "/dev/mixer", O_RDWR, AU_P_MIXER } };
+	int res = 0;
+
+	if (setgroups(ngroups, groups) != 0)
+		return 0;
+	if (setgid(gid) != 0 || setuid(uid) != 0)
+		return 0;
+	/* The libc declares the id getters as returning int. */
+	if ((uid_t)getuid() != uid || (uid_t)geteuid() != uid ||
+	    (gid_t)getgid() != gid || (gid_t)getegid() != gid)
+		return 0;
+	res |= AU_P_DROPPED;
+
+	for (unsigned i = 0; i < 3; i++) {
+		errno = 0;
+		int fd = open(nodes[i].path, nodes[i].flags | O_NONBLOCK);
+		int e = errno;
+		if (fd >= 0)
+			close(fd);
+		if (want_denied) {
+			if (fd < 0 && e == EACCES)
+				res |= nodes[i].bit;
+		} else {
+			if (fd >= 0 || (e == EBUSY && nodes[i].bit != AU_P_MIXER))
+				res |= nodes[i].bit;
+		}
+	}
+	return res;
+}
+
+static int au_run_perm_child(uid_t uid, gid_t gid, const int *groups,
+			     int ngroups, int want_denied)
+{
+	fflush(stdout);
+	fflush(stderr);
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0)
+		_exit(au_perm_child(uid, gid, groups, ngroups, want_denied));
+	int st = 0;
+	if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+		return -1;
+	return WEXITSTATUS(st);
+}
+
+static void au_test_permissions(void)
+{
+	const int all = AU_P_DROPPED | AU_P_AUDIO | AU_P_DSP | AU_P_MIXER;
+
+	printf("  -- permissions --\n");
+	if (geteuid() != 0) {
+		printf("  [SKIP] not root: cannot drop privilege to test denial\n");
+		return;
+	}
+
+	/* An ordinary user in no group that matters: refused. */
+	int r = au_run_perm_child(AU_NOBODY, AU_NOBODY, NULL, 0, 1);
+	test_result("non-member child dropped privileges",
+		    r >= 0 && (r & AU_P_DROPPED));
+	test_result("non-member: open(/dev/audio0) -> EACCES",
+		    r >= 0 && (r & AU_P_AUDIO));
+	test_result("non-member: open(/dev/dsp) -> EACCES",
+		    r >= 0 && (r & AU_P_DSP));
+	test_result("non-member: open(/dev/mixer) -> EACCES",
+		    r >= 0 && (r & AU_P_MIXER));
+
+	/* The same user with `audio' as a supplementary group: allowed. */
+	int g = AU_GID_AUDIO;
+	r = au_run_perm_child(AU_NOBODY, AU_NOBODY, &g, 1, 0);
+	test_result("supplementary audio member may open all three nodes",
+		    r == all);
+
+	/* ... and with `audio' as the primary group. */
+	r = au_run_perm_child(AU_NOBODY, AU_GID_AUDIO, NULL, 0, 0);
+	test_result("primary-group audio member may open all three nodes",
+		    r == all);
+}
+
+/* ---- the section ---------------------------------------------------------------- */
+
+/* The card's PCM devices (analog, HDMI n) and moving a handle between them. */
+static void au_test_pcm_devices(int fd, int mfd)
+{
+	struct audio_pcm_info pi;
+	uint32_t idx, count, cur = 0;
+
+	printf("  -- PCM devices --\n");
+	(void)ioctl(fd, AUDIO_DROP, 0);
+	memset(&pi, 0xA5, sizeof(pi));
+	pi.index = 0;
+	int r = ioctl(fd, AUDIO_GETPCMINFO, &pi);
+	test_result("AUDIO_GETPCMINFO(0)", r == 0);
+	if (r != 0)
+		return;
+	count = pi.count;
+	test_result("GETPCMINFO: at least one device, name terminated",
+		    count >= 1 && pi.index == 0 &&
+			    memchr(pi.name, 0, sizeof(pi.name)) != NULL);
+	for (idx = 0; idx < count; idx++) {
+		memset(&pi, 0, sizeof(pi));
+		pi.index = idx;
+		if (ioctl(fd, AUDIO_GETPCMINFO, &pi) == 0 &&
+		    (pi.flags & AUDIO_PCM_SELECTED))
+			cur = idx;
+	}
+	memset(&pi, 0, sizeof(pi));
+	pi.index = cur;
+	test_result("GETPCMINFO: the handle's device is SELECTED with playback",
+		    ioctl(fd, AUDIO_GETPCMINFO, &pi) == 0 &&
+			    (pi.flags & AUDIO_PCM_SELECTED) &&
+			    (pi.flags & AUDIO_PCM_PLAYBACK) &&
+			    !(pi.flags & AUDIO_PCM_BUSY));
+	memset(&pi, 0, sizeof(pi));
+	pi.index = count;
+	errno = 0;
+	test_result("GETPCMINFO past the last device -> EINVAL",
+		    ioctl(fd, AUDIO_GETPCMINFO, &pi) == -1 && errno == EINVAL);
+	errno = 0;
+	idx = count;
+	test_result("SELECTPCM past the last device -> EINVAL",
+		    ioctl(fd, AUDIO_SELECTPCM, &idx) == -1 && errno == EINVAL);
+	errno = 0;
+	test_result("SELECTPCM with a bad pointer -> EFAULT",
+		    ioctl(fd, AUDIO_SELECTPCM, AU_BAD_KPTR) == -1 &&
+			    errno == EFAULT);
+	test_result("SELECTPCM to the current device is a no-op",
+		    ioctl(fd, AUDIO_SELECTPCM, &cur) == 0);
+	errno = 0;
+	idx = 0;
+	test_result("SELECTPCM on /dev/mixer -> ENOTTY",
+		    ioctl(mfd, AUDIO_SELECTPCM, &idx) == -1 && errno == ENOTTY);
+
+	/* Move to another free playback device and back. */
+	for (idx = 0; idx < count; idx++) {
+		if (idx == cur)
+			continue;
+		memset(&pi, 0, sizeof(pi));
+		pi.index = idx;
+		if (ioctl(fd, AUDIO_GETPCMINFO, &pi) != 0 ||
+		    !(pi.flags & AUDIO_PCM_PLAYBACK) ||
+		    (pi.flags & AUDIO_PCM_BUSY))
+			continue;
+		struct audio_pos pos;
+		test_result("SELECTPCM to another playback device",
+			    ioctl(fd, AUDIO_SELECTPCM, &idx) == 0);
+		memset(&pi, 0, sizeof(pi));
+		pi.index = idx;
+		test_result("GETPCMINFO: the new device is SELECTED",
+			    ioctl(fd, AUDIO_GETPCMINFO, &pi) == 0 &&
+				    (pi.flags & AUDIO_PCM_SELECTED));
+		test_result("the moved handle starts unconfigured",
+			    au_getpos(fd, &pos) == 0 &&
+				    pos.state == AUDIO_STATE_OPEN);
+		test_result("SELECTPCM back to the first device",
+			    ioctl(fd, AUDIO_SELECTPCM, &cur) == 0);
+		break;
+	}
+	if (idx >= count)
+		printf("  [SKIP] no second free playback device to move to\n");
+}
+
+static void test_audio(void)
+{
+	struct stat st;
+	struct audio_info info;
+
+	printf("\n--- Sound Device Tests (/dev/audio0, /dev/dsp, /dev/mixer) ---\n");
+
+	if (stat("/dev/audio0", &st) != 0 && errno == ENOENT) {
+		printf("  [SKIP] no sound card (/dev/audio0 absent)\n");
+		return;
+	}
+	if (access("/dev/mixer", R_OK | W_OK) != 0 && errno == EACCES) {
+		/* Run by a user outside the audio group: only the node
+		 * attributes can be checked. */
+		au_check_node("/dev/audio0", AUDIO_MINOR_AUDIO);
+		au_check_node("/dev/dsp", AUDIO_MINOR_DSP);
+		au_check_node("/dev/mixer", AUDIO_MINOR_MIXER);
+		printf("  [SKIP] not root and not in the audio group: device tests\n");
+		return;
+	}
+
+	au_check_node("/dev/audio0", AUDIO_MINOR_AUDIO);
+	au_check_node("/dev/dsp", AUDIO_MINOR_DSP);
+	au_check_node("/dev/mixer", AUDIO_MINOR_MIXER);
+
+	memset(&info, 0, sizeof(info));
+	int pcm_free = 0;
+
+	int fd = open("/dev/audio0", O_WRONLY);
+	if (fd < 0 && errno == EBUSY) {
+		printf("  [SKIP] /dev/audio0 is in use (audio service running): PCM tests\n");
+	} else {
+		test_result("open(/dev/audio0, O_WRONLY)", fd >= 0);
+	}
+
+	if (fd >= 0) {
+		pcm_free = 1;
+		uint32_t ver = 0;
+		test_result("AUDIO_GETVERSION",
+			    ioctl(fd, AUDIO_GETVERSION, &ver) == 0 &&
+				    ver == AUDIO_API_VERSION);
+		au_check_info(fd, "/dev/audio0", &info);
+
+		struct audio_pos pos;
+		test_result("GETPOS on a fresh open",
+			    au_getpos(fd, &pos) == 0 &&
+				    (pos.state == AUDIO_STATE_OPEN ||
+				     pos.state == AUDIO_STATE_SETUP) &&
+				    pos.hw_frames == 0 && pos.appl_frames == 0);
+
+		/* One opener per PCM, through either name. */
+		errno = 0;
+		int fd2 = open("/dev/audio0", O_WRONLY);
+		test_result("second open(/dev/audio0) -> EBUSY",
+			    fd2 == -1 && errno == EBUSY);
+		if (fd2 >= 0)
+			close(fd2);
+		errno = 0;
+		fd2 = open("/dev/dsp", O_WRONLY);
+		test_result("open(/dev/dsp) while /dev/audio0 is open -> EBUSY",
+			    fd2 == -1 && errno == EBUSY);
+		if (fd2 >= 0)
+			close(fd2);
+
+		if (info.version == AUDIO_API_VERSION) {
+			au_test_params(fd, &info);
+			au_test_playback(fd, &info);
+			au_test_mmap(fd, &info);
+		}
+		au_test_pcm_bad_pointers(fd);
+		au_test_bad_requests(fd, "/dev/audio0", 0);
+		{
+			int pmfd = open("/dev/mixer", O_RDONLY);
+			if (pmfd >= 0) {
+				au_test_pcm_devices(fd, pmfd);
+				close(pmfd);
+			}
+		}
+
+		test_result("close(/dev/audio0)", close(fd) == 0);
+		/* The opener slot is released on close. */
+		fd = open("/dev/audio0", O_WRONLY);
+		test_result("reopen after close", fd >= 0);
+		if (fd >= 0) {
+			struct audio_pos p2;
+			test_result("reopen starts from a clean stream",
+				    au_getpos(fd, &p2) == 0 &&
+					    p2.appl_frames == 0 &&
+					    p2.hw_frames == 0);
+			close(fd);
+		}
+
+		if (info.version == AUDIO_API_VERSION)
+			au_test_oss_dsp(&info);
+	}
+
+	int mfd = open("/dev/mixer", O_RDWR);
+	test_result("open(/dev/mixer, O_RDWR)", mfd >= 0);
+	if (mfd >= 0) {
+		struct audio_info minfo;
+		uint32_t ver = 0;
+		test_result("AUDIO_GETVERSION on /dev/mixer",
+			    ioctl(mfd, AUDIO_GETVERSION, &ver) == 0 &&
+				    ver == AUDIO_API_VERSION);
+		au_check_info(mfd, "/dev/mixer", &minfo);
+		if (pcm_free)
+			test_result("/dev/mixer and /dev/audio0 describe the same card",
+				    strcmp(minfo.card_name, info.card_name) == 0 &&
+					    strcmp(minfo.driver, info.driver) == 0);
+		else
+			info = minfo;
+		test_result("a second open(/dev/mixer) is allowed",
+			    (fd = open("/dev/mixer", O_RDONLY)) >= 0);
+		if (fd >= 0)
+			close(fd);
+		errno = 0;
+		test_result("mmap(/dev/mixer) is refused",
+			    mmap(NULL, 4096, PROT_READ, MAP_SHARED, mfd, 0) ==
+				    MAP_FAILED);
+
+		au_test_oss_mixer(mfd);
+		au_test_volume(mfd);
+		au_test_outputs(mfd, &info);
+		au_test_diag(mfd);
+		au_test_bad_requests(mfd, "/dev/mixer", 1);
+		close(mfd);
+	}
+	au_test_events(pcm_free);
+	au_test_permissions();
 }
 
 // ============================================================================
@@ -14274,12 +16130,15 @@ int main(int argc, char **argv)
 	int net_only = (argc > 1 && strcmp(argv[1], "network") == 0);
 	/*   testlibc gpu      -- run only the display-manager and GPU sections */
 	int gpu_only = (argc > 1 && strcmp(argv[1], "gpu") == 0);
+	/*   testlibc audio    -- run only the sound device section */
+	int audio_only = (argc > 1 && strcmp(argv[1], "audio") == 0);
 	int skip_network =
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
 	printf("\n========================================\n");
 	printf("  LikeOS Libc Tests%s\n", net_only     ? " (network only)" :
 					     gpu_only     ? " (graphics only)" :
+					     audio_only   ? " (audio only)" :
 					     skip_network ? " (no network)" :
 							    " (all)");
 	printf("========================================\n\n");
@@ -14338,6 +16197,8 @@ int main(int argc, char **argv)
 		goto network_section;
 	if (gpu_only)
 		goto gpu_section;
+	if (audio_only)
+		goto audio_section;
 
 	// ========================================
 	// Test: malloc/free
@@ -21855,6 +23716,7 @@ int main(int argc, char **argv)
 	test_pipe2_prctl();
 	test_drm_i915();
 	test_fbdev();
+	test_audio();
 	test_evdev();
 	test_shebang();
 	test_devfd();
@@ -31217,6 +33079,12 @@ gpu_section:
 	test_drm_3d();
 	test_drm_vmw_overlay();
 	test_gpu_userland();
+
+	/* Reached only by `testlibc audio'; a full run covers the sound
+	 * devices in the device-node section above. */
+audio_section:
+	if (audio_only)
+		test_audio();
 
 	// ========================================
 	// Summary

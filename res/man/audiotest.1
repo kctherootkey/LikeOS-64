@@ -1,0 +1,152 @@
+AUDIOTEST(1)                    User Commands                     AUDIOTEST(1)
+
+NAME
+       audiotest - play test signals and measure audio latency
+
+SYNOPSIS
+       audiotest [MODE] [-f HZ] [-F HZ] [-a LEVEL] [-t SECONDS] [-c CHANNEL]
+                 [-n CHANNELS] [-r RATE] [-L ROUNDS] [-v VOLUME] [-b MS]
+                 [--linear] [--s16] [-q]
+
+DESCRIPTION
+       audiotest generates the signals that answer the usual questions about a
+       sound setup -- does anything come out, is left left, are  the  surround
+       speakers in the right places, does the bass reach the  subwoofer,  what
+       does the room do to a sweep, how long does sound take to  come  out  --
+       and plays them through the audio service,  audiod(1),  like  any  other
+       program.
+
+       The signal is synthesised in floating point and sent as  32-bit  float,
+       or as 16-bit with triangular  dither  with  --s16.  Signals  of  finite
+       length fade in and out over 15 ms so they  start  and  stop  without  a
+       click. The default level is -12 dBFS: clearly audible, never painful at
+       a sensible master volume.
+
+MODES
+       The mode is the first word on the command line or the argument of -m.
+
+       sine   A sine tone, 440 Hz unless -f says  otherwise,  for  5  seconds.
+              Also tone.
+
+       channels
+              Speaker identification. Each  channel  in  turn  makes  a  short
+              voice-like call of its own while its name is printed:  the  left
+              speakers a falling melody, the right  ones  a  rising  one,  the
+              centre a level one, and the front, side and rear positions  each
+              a different vowel and register, so a swapped pair  is  heard  as
+              wrong without looking at the screen. The subwoofer channel (LFE)
+              gives two low thumps instead. The channel order is the usual one
+              for the count: mono; FL FR; FL FR FC; FL FR BL BR; FL FR  FC  BL
+              BR; FL FR FC LFE BL BR (5.1); FL FR FC LFE BC SL SR (6.1); FL FR
+              FC LFE BL BR SL SR (7.1). Each name is printed when its call  is
+              actually heard. Also speakers.
+
+       sweep  A sine sweep from 20 Hz (or -f) to 20 kHz (or -F, at  most  just
+              under half the rate), logarithmic so each octave takes the  same
+              time, or linear  with  --linear;  10  seconds  by  default.  The
+              current frequency is shown. Useful for finding  the  lowest  and
+              highest tones a speaker reproduces and for rattles.
+
+       white  White noise: equal energy per hertz. Also noise.
+
+       pink   Pink noise: equal energy per octave, which sounds  even  to  the
+              ear; the usual signal for setting speaker  levels  against  each
+              other.
+
+       square, saw, triangle
+              The classic waveforms at -f, band-limited so they do  not  alias
+              at high frequencies.
+
+       silence
+              Digital silence: keeps a stream open, for example to check  what
+              an idle stream costs.
+
+       latency
+              Measures instead of testing the ear. For -t seconds (default  5)
+              a quiet 1 kHz tone plays while the latency the  service  reports
+              is sampled every 50  ms  and  the  frames  actually  played  are
+              compared with the system clock. Then a 10 ms  click  is  written
+              into an empty stream  several  times  and  the  time  until  the
+              service reports it heard  is  measured.  The  result  shows  the
+              reported latency (minimum, average, maximum), the write-to-heard
+              time, and the rate the device really plays at with its deviation
+              from the nominal rate in parts per million; more than  0.2%  off
+              is flagged. With -b the effect of the stream's buffering can  be
+              compared.
+
+OPTIONS
+       -m, --mode MODE
+              The signal, as above.
+
+       -f, --freq HZ
+              Frequency of sine, square, saw and triangle  (default  440),  or
+              the start of a sweep (default 20). 1k is 1000.
+
+       -F, --to HZ
+              End frequency of a sweep (default 20000).
+
+       --linear
+              Sweep linearly in frequency.
+
+       -a, --amplitude LEVEL
+              Peak level: a fraction 0..1,  a  percentage  (50%)  or  decibels
+              below full scale (-6dB). Default -12 dB.
+
+       -t, --time SECONDS
+              Duration; fractions allowed; 0 plays until  Ctrl-C  (not  for  a
+              sweep). Defaults: 5 seconds, 10 for a sweep. The  channels  mode
+              counts rounds instead (-L).
+
+       -c, --channel CHANNEL
+              Play only on one channel, the others silent: a number from 1, or
+              a position name of the layout (FL, FR, FC, LFE, BL, BR, SL,  SR,
+              BC), or left or right.  In  channels  mode,  only  that  channel
+              calls.
+
+       -n, --channels N
+              Channels of the stream, 1..8 (default 2). The service maps  them
+              to the speakers that exist.
+
+       -r, --rate HZ
+              Sample rate of the stream, 8000..384000 (default 48000).
+
+       -L, --rounds N
+              Channels mode: how many times to go round all  speakers;  0  for
+              ever. Default 1.
+
+       -v, --volume N
+              The stream's volume, 0..100.
+
+       -b, --buffer MS
+              Buffering asked of the service, 1..10000 ms.
+
+       --s16  Send 16-bit samples with dither instead of float.
+
+       -q, --quiet
+              No messages (the latency results are still printed).
+
+       -h, --help
+              A summary of the options.
+
+EXAMPLES
+       audiotest                          440 Hz for 5 seconds
+       audiotest channels                 which speaker is which
+       audiotest channels -n 6 -L 0       5.1 setup, round and round
+       audiotest pink -c FR -t 0          level one speaker by ear
+       audiotest sine -f 50 -c LFE -n 6   is the subwoofer connected?
+       audiotest sweep -t 20 -a -20dB     slow, quiet sweep
+       audiotest latency -b 20            how low can the latency go?
+
+EXIT STATUS
+       0      The signal played (or the measurement finished).
+
+       1      The audio service could not be reached or failed.
+
+       2      A bad option.
+
+       130    Interrupted by Ctrl-C; the buffered sound is dropped.
+
+SEE ALSO
+       audioctl(1), audioplay(1), audioinfo(1), audiod(1)
+
+LikeOS                        October 2026                        AUDIOTEST(1)

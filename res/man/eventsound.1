@@ -1,0 +1,84 @@
+EVENTSOUND(1)                   User Commands                    EVENTSOUND(1)
+
+NAME
+       eventsound - play a system event sound
+
+SYNOPSIS
+       eventsound NAME [-w] [-t SECONDS] [-v VOLUME] [-q]
+       eventsound --list
+
+DESCRIPTION
+       eventsound asks the audio service, audiod(1), to play the system  sound
+       NAME, the  file  /usr/share/sounds/likeos/NAME.wav:  startup  when  the
+       desktop starts, logout when it ends, shutdown, login,  notify,  error,
+       volume, and whatever else has been put there.
+
+       Only the name travels to the service,  which  opens  the  file  itself.
+       Names are a single word of letters, digits, '-', '_' and '.',  at  most
+       31 characters, and can never reach outside that directory.  A  trailing
+       .wav is ignored.
+
+       eventsound is made for scripts and is careful never to make  one  fail:
+       when the audio service is not running, there is no  sound  card,  event
+       sounds are switched off in the service's configuration,  or  the  sound
+       does not exist, it exits with status 0 without printing anything.  Only
+       a malformed name or option is an error. Without -w it returns  as  soon
+       as the service has accepted the request, so a script does not wait  for
+       the sound to finish.
+
+       The whole run is bounded: connecting and asking  take  at  most  a  few
+       seconds, and with -w the wait ends after the timeout even if the  sound
+       has not finished (it still plays to its end). A  shut-down  that  plays
+       its sound with -w can therefore never hang on it.
+
+OPTIONS
+       -w, --wait
+              Return only once the sound has been played, or when the  timeout
+              runs out.
+
+       -t, --timeout SECONDS
+              The longest wait, 0..3600 seconds; 0 waits as long as it  takes.
+              Default 10.
+
+       -v, --volume N
+              Volume of this sound, 0..100 (default 100), on top of the master
+              volume.
+
+       -q, --quiet
+              No error messages at all.
+
+       -l, --list
+              List the sounds in /usr/share/sounds/likeos with  their  length,
+              and exit.
+
+       -h, --help
+              A summary of the options.
+
+EXAMPLES
+       eventsound startup                 when a desktop has finished loading
+       eventsound logout                  as the desktop session ends
+       eventsound notify -v 50
+       make && eventsound notify || eventsound error
+       eventsound --list
+
+EXIT STATUS
+       0      The sound was handed to the service -- or could not be,  because
+              there is no service, no sound card or no such sound.
+
+       2      A malformed name or a bad option, or the  service  rejected  the
+              name as invalid.
+
+FILES
+       /usr/share/sounds/likeos/*.wav
+              The system sounds (48 kHz, 16-bit stereo WAV).
+
+       /etc/audiod.conf
+              event_sounds=no switches all event sounds off.
+
+       /var/run/audiod/socket
+              The audio service's socket.
+
+SEE ALSO
+       audioplay(1), audioctl(1), audiod(1)
+
+LikeOS                       October 2026                        EVENTSOUND(1)

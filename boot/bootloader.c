@@ -102,7 +102,12 @@ typedef struct {
     uint64_t smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
     uint64_t boot_epoch;          // Unix epoch seconds at boot (from UEFI GetTime before ExitBootServices)
     uint64_t direct_map_bytes;    // Bytes of physical RAM covered by the PML4[272] direct map
+    uint64_t smbios_magic;        // BOOT_SMBIOS_MAGIC when the two fields below are valid
+    uint64_t smbios_address;      // SMBIOS 2.x entry point ("_SM_") from UEFI, 0 = none
+    uint64_t smbios3_address;     // SMBIOS 3.x entry point ("_SM3_") from UEFI, 0 = none
 } boot_info_t;
+
+#define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
 
 // Global boot info to pass to kernel
 static boot_info_t g_boot_info;
@@ -1649,6 +1654,49 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         if (g_boot_info.rsdp_address == 0) {
             serial_puts("WARNING: ACPI RSDP not found in UEFI tables!\n");
             Print(L"WARNING: ACPI RSDP not found in UEFI tables!\r\n");
+        }
+    }
+
+    // SMBIOS entry points from the UEFI configuration tables: on machines
+    // without a legacy BIOS area they are the only way to find the
+    // firmware's identification (vendor, product), which drivers use to
+    // pick per-machine settings.
+    g_boot_info.smbios_address = 0;
+    g_boot_info.smbios3_address = 0;
+    {
+        // SMBIOS: eb9d2d31-2d88-11d3-9a16-0090273fc14d
+        EFI_GUID smbios_guid = {0xeb9d2d31, 0x2d88, 0x11d3, {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}};
+        // SMBIOS 3: f2fd1544-9794-4a2c-992e-e5bbcf20e394
+        EFI_GUID smbios3_guid = {0xf2fd1544, 0x9794, 0x4a2c, {0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94}};
+
+        for (UINTN i = 0; i < ST->NumberOfTableEntries; i++) {
+            EFI_CONFIGURATION_TABLE *table = &ST->ConfigurationTable[i];
+            EFI_GUID *g = &table->VendorGuid;
+            int is_smbios = 1, is_smbios3 = 1;
+
+            for (int b = 0; b < 8; b++) {
+                if (g->Data4[b] != smbios_guid.Data4[b])
+                    is_smbios = 0;
+                if (g->Data4[b] != smbios3_guid.Data4[b])
+                    is_smbios3 = 0;
+            }
+            if (g->Data1 != smbios_guid.Data1 || g->Data2 != smbios_guid.Data2 ||
+                g->Data3 != smbios_guid.Data3)
+                is_smbios = 0;
+            if (g->Data1 != smbios3_guid.Data1 || g->Data2 != smbios3_guid.Data2 ||
+                g->Data3 != smbios3_guid.Data3)
+                is_smbios3 = 0;
+            if (is_smbios)
+                g_boot_info.smbios_address = (uint64_t)table->VendorTable;
+            if (is_smbios3)
+                g_boot_info.smbios3_address = (uint64_t)table->VendorTable;
+        }
+        g_boot_info.smbios_magic = BOOT_SMBIOS_MAGIC;
+        if (g_boot_info.smbios3_address || g_boot_info.smbios_address) {
+            serial_puts("Found SMBIOS entry point at 0x");
+            serial_puthex(g_boot_info.smbios3_address ? g_boot_info.smbios3_address :
+                                                        g_boot_info.smbios_address);
+            serial_puts("\n");
         }
     }
     

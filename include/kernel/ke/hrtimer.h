@@ -7,10 +7,13 @@
 // nanosecond deadline.
 //
 // A timer here is a deadline on the monotonic nanosecond clock and a
-// callback.  The queue is programmed into an HPET comparator in one-shot
-// mode when the platform has one; otherwise it is scanned from the periodic
-// tick, which keeps every user working at tick granularity.  Callbacks run
-// in interrupt context on the CPU that took the timer interrupt, with
+// callback.  Each CPU keeps its own queue and its local timer, running
+// one-shot, is armed for the earlier of its next tick and the head of that
+// queue (lapic.c): a timer goes on the queue of the CPU that arms it and its
+// callback runs there.  Until the local timers run one-shot -- and on a
+// machine where they cannot -- one queue is served by an HPET comparator,
+// or scanned from the periodic tick without one.  Callbacks run in
+// interrupt context on the CPU that took the timer interrupt, with
 // interrupts disabled: they may wake tasks (sched_claim_wake +
 // sched_enqueue_ready, poll_notify_wq) and re-arm timers, and nothing else.
 //
@@ -30,6 +33,7 @@ typedef struct hrtimer {
 	void *arg;
 	struct hrtimer *next; /* queue link, valid while armed */
 	volatile int armed;
+	int cpu; /* whose queue it is on, valid while armed */
 } hrtimer_t;
 
 /* Monotonic time in nanoseconds (the CLOCK_MONOTONIC the timers run on). */
@@ -71,6 +75,13 @@ int hrtimer_sleep_until(uint64_t abs_ns, uint64_t *remaining_ns);
 void hrtimer_init_hw(void); /* after timer_init_hpet(), before use */
 void hrtimer_irq(void); /* the HPET comparator interrupt */
 void hrtimer_tick(void); /* from the periodic tick (fallback + safety net) */
+/* One-shot local timers (lapic.c): this CPU's expired timers run, and the
+ * deadline of the next one queued here comes back (0: none).  Interrupts
+ * off, from the local timer's interrupt. */
+uint64_t hrtimer_run_local(void);
+/* The boot CPU's local timer has gone one-shot: timers move off the HPET
+ * comparator onto the CPUs' own local timers from here on. */
+void hrtimer_clockevent_started(void);
 int hrtimer_is_highres(void); /* 1 when an HPET comparator drives it */
 
 #endif

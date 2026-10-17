@@ -817,7 +817,28 @@ static void tlb_shootdown_send_and_wait(uint64_t pml4_phys,
 		}
 	}
 
-	lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
+	/* Interrupt only the CPUs that have to answer.  The argument above
+	 * that makes a non-holder provably clean makes interrupting it
+	 * pointless too, and on a hypervisor every interrupt to a halted
+	 * virtual CPU is a wake-up the host has to schedule: a multi-threaded
+	 * process unmapping memory woke every idle CPU of the machine each
+	 * time.  A request with no particular address space still goes to
+	 * everyone. */
+	if (wait_mask == ~0ULL) {
+		lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
+	} else {
+		uint32_t self = this_cpu_id();
+
+		for (uint32_t c = 0; c < online && c < 64; c++) {
+			percpu_t *p;
+
+			if (c == self || !(wait_mask & (1ULL << c)))
+				continue;
+			p = percpu_get(c);
+			if (p)
+				lapic_send_ipi(p->apic_id, IPI_TLB_SHOOTDOWN);
+		}
+	}
 
 	// CRITICAL FIX: Release the lock and re-enable IRQs BEFORE the wait loop.
 	//

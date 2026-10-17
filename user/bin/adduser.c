@@ -643,7 +643,9 @@ int main(int argc, char **argv)
 
 	/* extra groups */
 	if (add_extra) {
-		const char *extras[] = { "users", NULL };
+		/* `audio' lets the account use the sound devices directly (most
+		 * programs play through the audio service and do not need it). */
+		const char *extras[] = { "users", "audio", NULL };
 		for (int i = 0; extras[i]; i++)
 			if (getgrnam(extras[i]))
 				add_member(extras[i], name);

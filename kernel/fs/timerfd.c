@@ -232,9 +232,9 @@ int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_ptr,
 		if (flags & TFD_TIMER_ABSTIME) {
 			if (c->clockid == CLOCK_REALTIME ||
 			    c->clockid == CLOCK_REALTIME_COARSE) {
-				uint64_t epoch_ns =
-					timer_get_boot_epoch() * 1000000000ULL;
-				value = value > epoch_ns ? value - epoch_ns : 0;
+				uint64_t off = timer_realtime_offset_ns(
+					hrtimer_now_ns());
+				value = value > off ? value - off : 0;
 			}
 			c->expires_ns = value;
 		} else {

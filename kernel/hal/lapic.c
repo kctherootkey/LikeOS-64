@@ -9,6 +9,9 @@
 #include <kernel/mm/memory.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/ke/smp.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/ke/hrtimer.h>
+#include <kernel/ke/timer.h>
 #include <kernel/uapi/bug.h>
 
 // ============================================================================
@@ -98,25 +101,76 @@ static inline bool vmware_hypervisor_present(void)
 	       edx == VMWARE_SIG_EDX;
 }
 
+/* The local timer's input clock as the hypervisor states it (GETHZ's
+ * ECX), in Hz; 0 when it did not say.  The count-down timer runs at this
+ * divided by the divide register, so no calibration against the TSC is
+ * needed -- or wanted: the TSC is the guest's apparent time, which can lag
+ * the timer's own. */
+static uint64_t vmware_bus_hz;
+
 static inline uint64_t vmware_get_tsc_freq_hz(void)
 {
-	uint32_t lo, hi, cmd;
+	uint32_t lo, hi, cmd, port;
 
 	lo = VMWARE_HYPERVISOR_MAGIC;
 	hi = 0xFFFFFFFFU;
 	cmd = VMWARE_CMD_GETHZ;
+	port = VMWARE_HYPERVISOR_PORT;
 
-	__asm__ volatile("movw %[port], %%dx\n\t"
-			 "inl (%%dx), %%eax"
-			 : "+a"(lo), "+b"(hi), "+c"(cmd)
-			 : [port] "i"(VMWARE_HYPERVISOR_PORT), "d"(0)
+	__asm__ volatile("inl (%%dx), %%eax"
+			 : "+a"(lo), "+b"(hi), "+c"(cmd), "+d"(port)
+			 :
 			 : "cc", "memory");
 
 	if (hi == 0xFFFFFFFFU) {
 		return 0;
 	}
+	vmware_bus_hz = cmd;
 
 	return ((uint64_t)hi << 32) | lo;
+}
+
+/* The host's wall clock in microseconds since the epoch (UTC), through the
+ * hypervisor's GETTIMEFULL call (46): real time as the host keeps it, which
+ * the guest's own clocks cannot be relied on to match (timer.c keeps the
+ * wall clock to it).  0 when not on VMware or the call is refused. */
+#define VMWARE_CMD_GETTIMEFULL 46U
+
+uint64_t lapic_host_time_us(void)
+{
+	uint32_t a = VMWARE_HYPERVISOR_MAGIC, b = 0xFFFFFFFFU,
+		 c = VMWARE_CMD_GETTIMEFULL, d = VMWARE_HYPERVISOR_PORT, si = 0;
+
+	if (!vmware_hypervisor_present())
+		return 0;
+	__asm__ volatile("inl (%%dx), %%eax"
+			 : "+a"(a), "+b"(b), "+c"(c), "+d"(d), "+S"(si)
+			 :
+			 : "cc", "memory");
+	if (a != VMWARE_HYPERVISOR_MAGIC)
+		return 0;
+	return ((((uint64_t)si << 32) | d) * 1000000ULL) + b;
+}
+
+#define VMWARE_CMD_STOPCATCHUP 24U
+
+/* Tell the hypervisor to stop catching up: whatever backlog of timer
+ * interrupts it still holds against the guest is dropped, and apparent
+ * time is no longer held back for it (STOPCATCHUP, 24).  For whoever has
+ * just set the guest's clock to the host's: that corrected the lag
+ * already, and a catch-up on top of it would run the clock ahead.  A no-op
+ * where there is no such hypervisor. */
+void lapic_host_stop_catchup(void)
+{
+	uint32_t a = VMWARE_HYPERVISOR_MAGIC, b = 0, c = VMWARE_CMD_STOPCATCHUP,
+		 d = VMWARE_HYPERVISOR_PORT;
+
+	if (!vmware_hypervisor_present())
+		return;
+	__asm__ volatile("inl (%%dx), %%eax"
+			 : "+a"(a), "+b"(b), "+c"(c), "+d"(d)
+			 :
+			 : "cc", "memory");
 }
 
 // ============================================================================
@@ -517,6 +571,11 @@ void lapic_timer_calibrate(void)
 			lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
 
 			lapic_timer_freq = (uint64_t)elapsed * 10;
+			/* The hypervisor's own figure wins over the measurement:
+			 * both clocks of the measurement are virtual, and the
+			 * TSC is the one that can fall behind. */
+			if (vmware_bus_hz >= 1000000ULL)
+				lapic_timer_freq = vmware_bus_hz / 16;
 			smp_dbg("LAPIC: VMware TSC-calibrated timer_freq=%lu Hz\n",
 				lapic_timer_freq);
 
@@ -642,10 +701,412 @@ void lapic_timer_calibrate(void)
 	}
 }
 
+/* ---- the tick and the high-resolution timers: the local timer, one-shot --
+ *
+ * A periodic timer is a promise of one interrupt per period, and a
+ * hypervisor keeps that promise even when it could not: when the virtual
+ * machine was not running for a while it delivers every period it owes
+ * afterwards, several times faster than real time, until it has caught up.
+ * Measured on VMware right after boot: 2600-3800 timer interrupts per CPU
+ * in five seconds instead of 1000, gaps of up to 240 ms in between, for
+ * some twenty seconds -- and everything timed by the tick stuttered.
+ *
+ * So the local timer runs one-shot and is armed for whichever comes first:
+ * the CPU's next tick or the earliest high-resolution timer on its queue
+ * (hrtimer.c keeps one per CPU).  It is the CPU's one event source.  Two
+ * ways to arm it:
+ *
+ *  - TSC deadline (CPUID.1:ECX[24]): the timer fires when the TSC reaches
+ *    a value written to IA32_TSC_DEADLINE.  The tick is kept on a grid of
+ *    TSC boundaries; when it fires, the next one is the first boundary after
+ *    now, so periods that went by while the machine was stopped are skipped,
+ *    not replayed.  Deadline and clock are the same counter, so they cannot
+ *    disagree.  Used wherever the CPU offers it and its microcode is known
+ *    good (lapic_tsc_deadline_usable).
+ *
+ *  - The count-down timer in one-shot mode, everywhere else.  Here the timer
+ *    and the TSC are two different clocks, and on a hypervisor they do not
+ *    run at the same rate: the count-down follows real time, the TSC follows
+ *    the guest's "apparent time", which falls behind when the machine is not
+ *    run.  Converting TSC distances into counts therefore makes the timer
+ *    fire before the TSC has reached the point it was armed for; re-armed for
+ *    the remainder it fires early again, thousands of times a second, and
+ *    every one of those interrupts is a trip through the hypervisor that
+ *    puts the guest further behind.  Measured on VMware: 2550 local timer
+ *    interrupts a second on one CPU, the TSC advancing 99 ms per real
+ *    second, the boot stalled for a minute and a half.
+ *
+ *    So in this mode the timer keeps its own time.  Every load of the
+ *    initial-count register and every read of the current count is added up
+ *    into a per-CPU count-down clock (g_lc_now), and the tick is a fixed
+ *    number of counts on that clock -- one period of the timer's own time,
+ *    never derived from the TSC.  A stall costs the ticks it covered; none is
+ *    replayed, and nothing can loop.  Timekeeping does not depend on it: the
+ *    tick resynchronises the tick count to the clock (timer.c).
+ *
+ *    A high-resolution timer's deadline is on the clock, so its distance has
+ *    to be converted after all.  If the timer comes back with that deadline
+ *    still ahead, it is re-armed for the remainder once; coming back early a
+ *    second time for the same deadline means the clocks disagree, and that
+ *    deadline is left to the tick instead of chased.  At most two extra
+ *    interrupts per timer, however far apart the clocks are.
+ *
+ * Periodic mode is left only for a machine whose TSC frequency is unknown. */
+#ifndef LAPIC_TICK_TSC_DEADLINE
+#define LAPIC_TICK_TSC_DEADLINE 1
+#endif
+
+#define MSR_IA32_TSC_DEADLINE 0x6E0
+#define MSR_IA32_UCODE_REV 0x8B
+
+/* The fewest counts the count-down is ever loaded with: below this the
+ * load and the expiry overlap. */
+#define LC_MIN_COUNTS 16
+
+enum lapic_tick_mode {
+	TICK_PERIODIC = 0,
+	TICK_TSC_DEADLINE,
+	TICK_ONESHOT,
+};
+
+static int g_tick_mode = TICK_PERIODIC;
+static uint64_t g_tick_period_tsc;
+static uint32_t g_tick_hz; /* the rate the tick was started with */
+/* Per CPU: the local timer is running as this CPU's event source. */
+static volatile int g_ce_running[MAX_CPUS];
+
+/* TSC-deadline mode: the next tick, a TSC value. */
+static uint64_t g_tick_next_tsc[MAX_CPUS];
+
+/* Count-down mode: the timer's own clock, in counts (see above), what the
+ * register was last loaded with and has not been accounted for yet, and the
+ * tick on that clock. */
+static uint64_t g_lc_period;
+static uint64_t g_lc_now[MAX_CPUS];
+static uint32_t g_lc_armed[MAX_CPUS];
+static uint64_t g_lc_tick_next[MAX_CPUS];
+/* The high-resolution deadline the current load is for (0: the tick), how
+ * often it came back early, and a deadline given up on (left to the tick). */
+static uint64_t g_hrt_target[MAX_CPUS];
+static uint32_t g_hrt_early[MAX_CPUS];
+static uint64_t g_hrt_gaveup[MAX_CPUS];
+
+/* Processors whose TSC-deadline timer misbehaves below a microcode
+ * revision: family 6 model, stepping range, first good revision (0: every
+ * revision of those steppings is bad). */
+static const struct {
+	uint8_t model, step_lo, step_hi;
+	uint32_t min_rev;
+} g_deadline_ucode[] = {
+	{ 0x3F, 0x2, 0x2, 0x3a }, /* Haswell server EP */
+	{ 0x3F, 0x4, 0x4, 0x0f }, /* Haswell server EX */
+	{ 0x4F, 0x0, 0xf, 0x0b000020 }, /* Broadwell server */
+	{ 0x56, 0x2, 0x2, 0x00000011 }, /* Broadwell-DE */
+	{ 0x56, 0x3, 0x3, 0x0700000e },
+	{ 0x56, 0x4, 0x4, 0x0f00000c },
+	{ 0x56, 0x5, 0x5, 0x0e000003 },
+	{ 0x55, 0x3, 0x3, 0x01000136 }, /* Skylake server */
+	{ 0x55, 0x4, 0x4, 0x02000014 },
+	{ 0x55, 0x5, 0xf, 0 },
+	{ 0x3C, 0x0, 0xf, 0x22 }, /* Haswell */
+	{ 0x45, 0x0, 0xf, 0x20 }, /* Haswell mobile */
+	{ 0x46, 0x0, 0xf, 0x17 }, /* Haswell with eDRAM */
+	{ 0x3D, 0x0, 0xf, 0x25 }, /* Broadwell */
+	{ 0x47, 0x0, 0xf, 0x17 }, /* Broadwell with eDRAM */
+	{ 0x4E, 0x0, 0xf, 0xb2 }, /* Skylake mobile */
+	{ 0x5E, 0x0, 0xf, 0xb2 }, /* Skylake desktop / H */
+	{ 0x8E, 0x0, 0xf, 0x52 }, /* Kaby Lake mobile */
+	{ 0x9E, 0x0, 0xf, 0x52 }, /* Kaby Lake desktop / H */
+};
+
+static uint32_t lapic_ucode_rev(void)
+{
+	uint32_t eax, ebx, ecx, edx;
+
+	/* The revision is latched into the MSR by CPUID(1) after it has been
+	 * cleared. */
+	wrmsr(MSR_IA32_UCODE_REV, 0);
+	cpuid(1, &eax, &ebx, &ecx, &edx);
+	return (uint32_t)(rdmsr(MSR_IA32_UCODE_REV) >> 32);
+}
+
+/* May the TSC-deadline timer be used?  When the CPU offers it, the TSC
+ * frequency is known, and -- on real Intel hardware -- the microcode is at
+ * least the revision that fixed it on this model.  A hypervisor's deadline
+ * timer is its own and is taken as offered. */
+static bool lapic_tsc_deadline_usable(void)
+{
+	uint32_t eax, ebx, ecx, edx, family, model, stepping, rev;
+	uint32_t vendor[3];
+
+	if (!LAPIC_TICK_TSC_DEADLINE || tsc_freq_hz == 0)
+		return false;
+	cpuid(1, &eax, &ebx, &ecx, &edx);
+	if (!(ecx & (1U << 24)))
+		return false;
+	if (ecx & (1U << 31))
+		return true; /* a hypervisor's */
+
+	/* "GenuineIntel": EBX, EDX, ECX */
+	cpuid(0, &eax, &vendor[0], &vendor[2], &vendor[1]);
+	if (kmemcmp(vendor, "GenuineIntel", 12) != 0)
+		return true;
+	cpuid(1, &eax, &ebx, &ecx, &edx);
+	family = (eax >> 8) & 0xF;
+	model = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
+	stepping = eax & 0xF;
+	if (family != 6)
+		return true;
+	for (size_t i = 0; i < sizeof(g_deadline_ucode) / sizeof(g_deadline_ucode[0]); i++) {
+		if (g_deadline_ucode[i].model != model ||
+		    stepping < g_deadline_ucode[i].step_lo ||
+		    stepping > g_deadline_ucode[i].step_hi)
+			continue;
+		rev = lapic_ucode_rev();
+		if (g_deadline_ucode[i].min_rev == 0 ||
+		    rev < g_deadline_ucode[i].min_rev) {
+			kprintf("LAPIC: TSC-deadline timer disabled: microcode revision 0x%x on model 0x%x stepping %u (needs 0x%x)\n",
+				rev, model, stepping, g_deadline_ucode[i].min_rev);
+			return false;
+		}
+		return true;
+	}
+	return true;
+}
+
+/* This CPU's slot.  Callers run after the per-CPU areas exist. */
+static uint32_t lapic_tick_slot(void)
+{
+	uint32_t c = this_cpu_id();
+
+	return c < MAX_CPUS ? c : 0;
+}
+
+/* Is this CPU's local timer running one-shot (the clock-event device)? */
+bool lapic_clockevent_ready(uint32_t cpu)
+{
+	return g_tick_mode != TICK_PERIODIC && cpu < MAX_CPUS &&
+	       g_ce_running[cpu];
+}
+
+/* ---- TSC-deadline mode ---- */
+
+/* The TSC value at which the nanosecond deadline `ns' falls, or 0 when it
+ * lies beyond the next tick anyway (the tick then comes first). */
+static uint64_t lapic_ns_to_tsc_deadline(uint64_t ns, uint64_t now_tsc)
+{
+	uint64_t now_ns = timer_get_precise_ns();
+	uint64_t d;
+
+	if (ns <= now_ns)
+		return now_tsc;
+	d = ns - now_ns;
+	if (d > 1000000000ULL)
+		return 0;
+	return now_tsc + d * (tsc_freq_hz / 1000ULL) / 1000000ULL;
+}
+
+static void tscdl_program(uint32_t c, uint64_t hrt_ns)
+{
+	uint64_t now = rdtsc(), next = g_tick_next_tsc[c];
+
+	if (hrt_ns) {
+		uint64_t h = lapic_ns_to_tsc_deadline(hrt_ns, now);
+
+		if (h && (int64_t)(h - next) < 0)
+			next = h;
+	}
+	wrmsr(MSR_IA32_TSC_DEADLINE, next);
+}
+
+static int tscdl_interrupt(uint32_t c, uint64_t hnext)
+{
+	uint64_t now = rdtsc(), next = g_tick_next_tsc[c];
+	uint64_t p = g_tick_period_tsc;
+
+	if ((int64_t)(now - next) < 0) {
+		tscdl_program(c, hnext);
+		return 0; /* a high-resolution timer's turn */
+	}
+	/* The first boundary after now: whatever lies between was missed and
+	 * is not owed. */
+	g_tick_next_tsc[c] = next + ((now - next) / p + 1) * p;
+	tscdl_program(c, hnext);
+	return 1;
+}
+
+/* ---- count-down mode ---- */
+
+/* Account for what has run off the counter since it was last loaded or
+ * looked at.  Interrupts off. */
+static void lc_sync(uint32_t c)
+{
+	uint32_t armed = g_lc_armed[c], ccr;
+
+	if (!armed)
+		return;
+	ccr = lapic_read(LAPIC_TIMER_CCR);
+	if (ccr > armed)
+		ccr = armed;
+	g_lc_now[c] += armed - ccr;
+	g_lc_armed[c] = ccr;
+}
+
+/* Load the counter for the earlier of the tick and `hrt_ns'. */
+static void lc_program(uint32_t c, uint64_t hrt_ns)
+{
+	uint64_t cnt, d, now_ns, hc;
+
+	lc_sync(c);
+	cnt = g_lc_tick_next[c] > g_lc_now[c] ?
+		      g_lc_tick_next[c] - g_lc_now[c] :
+		      1;
+	g_hrt_target[c] = 0;
+	if (hrt_ns && hrt_ns != g_hrt_gaveup[c]) {
+		now_ns = timer_get_precise_ns();
+		d = hrt_ns > now_ns ? hrt_ns - now_ns : 0;
+		if (d < 1000000000ULL) {
+			hc = d * lapic_timer_freq / 1000000000ULL;
+			if (hc < LC_MIN_COUNTS)
+				hc = LC_MIN_COUNTS;
+			if (hc < cnt) {
+				cnt = hc;
+				g_hrt_target[c] = hrt_ns;
+			}
+		}
+	}
+	if (cnt < LC_MIN_COUNTS && g_hrt_target[c])
+		cnt = LC_MIN_COUNTS;
+	if (cnt == 0)
+		cnt = 1;
+	if (cnt > 0xFFFFFFFFULL)
+		cnt = 0xFFFFFFFFULL;
+	g_lc_armed[c] = (uint32_t)cnt;
+	lapic_write(LAPIC_TIMER_ICR, (uint32_t)cnt);
+}
+
+static int lc_interrupt(uint32_t c, uint64_t hnext)
+{
+	uint64_t armed_for = g_hrt_target[c];
+	int tick = 0;
+
+	/* What ran off the counter -- all of the load when it expired, less
+	 * when the interrupt was already pending as the counter was loaded
+	 * again (a timer armed with interrupts off): then only the new load's
+	 * elapsed part counts, and the rest of it is still running. */
+	lc_sync(c);
+	if (g_lc_now[c] >= g_lc_tick_next[c]) {
+		tick = 1;
+		g_lc_tick_next[c] += g_lc_period;
+		if (g_lc_tick_next[c] <= g_lc_now[c])
+			g_lc_tick_next[c] = g_lc_now[c] + g_lc_period;
+	}
+	/* Armed for a high-resolution deadline that is still the queue's head
+	 * after the queue was run: it came back early. */
+	if (armed_for && hnext == armed_for) {
+		if (++g_hrt_early[c] >= 2) {
+			g_hrt_gaveup[c] = armed_for; /* the tick will do */
+			g_hrt_early[c] = 0;
+		}
+	} else {
+		g_hrt_early[c] = 0;
+	}
+	lc_program(c, hnext);
+	return tick;
+}
+
+/* ---- both ---- */
+
+/* Arm this CPU's local timer for the earlier of its next tick and
+ * `hrtimer_next_ns' (0: no high-resolution timer queued here).  Interrupts
+ * off, on the CPU concerned. */
+void lapic_clockevent_program(uint64_t hrtimer_next_ns)
+{
+	uint32_t c;
+
+	if (g_tick_mode == TICK_PERIODIC)
+		return;
+	c = lapic_tick_slot();
+	if (!g_ce_running[c])
+		return; /* not running on this CPU yet */
+	if (g_tick_mode == TICK_TSC_DEADLINE) {
+		tscdl_program(c, hrtimer_next_ns);
+		return;
+	}
+	if (hrtimer_next_ns != g_hrt_target[c])
+		g_hrt_early[c] = 0;
+	lc_program(c, hrtimer_next_ns);
+}
+
+/* The local timer's interrupt.  Runs this CPU's expired high-resolution
+ * timers, advances the tick when it is due, and arms the timer for the
+ * next event.  Returns 1 when the tick is due (the caller then does the
+ * tick's work), 0 when only high-resolution timers were.  In periodic mode,
+ * and before this CPU's timer runs one-shot, every interrupt is a tick. */
+int lapic_timer_interrupt(void)
+{
+	uint32_t c;
+	uint64_t hnext;
+
+	if (g_tick_mode == TICK_PERIODIC)
+		return 1;
+	c = lapic_tick_slot();
+	if (!g_ce_running[c])
+		return 1; /* not this CPU's one-shot timer: the legacy tick */
+	hnext = hrtimer_run_local();
+	if (g_tick_mode == TICK_TSC_DEADLINE)
+		return tscdl_interrupt(c, hnext);
+	return lc_interrupt(c, hnext);
+}
+
 void lapic_timer_start(uint32_t frequency)
 {
+	uint32_t c;
+
 	if (lapic_timer_freq == 0) {
 		lapic_timer_calibrate();
+	}
+
+	if (frequency && tsc_freq_hz) {
+		c = lapic_tick_slot();
+		g_tick_hz = frequency;
+		g_tick_period_tsc = tsc_freq_hz / frequency;
+		if (!g_tick_period_tsc)
+			g_tick_period_tsc = 1;
+		if (lapic_tsc_deadline_usable()) {
+			lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR |
+							     LAPIC_TIMER_TSC_DEADLINE);
+			/* The mode switch must reach the timer before the
+			 * deadline does, or the write to the MSR is ignored. */
+			__asm__ volatile("mfence" ::: "memory");
+			g_tick_next_tsc[c] = rdtsc() + g_tick_period_tsc;
+			g_tick_mode = TICK_TSC_DEADLINE;
+			g_ce_running[c] = 1;
+			wrmsr(MSR_IA32_TSC_DEADLINE, g_tick_next_tsc[c]);
+			hrtimer_clockevent_started();
+			smp_dbg("LAPIC: tick at %u Hz on TSC deadlines (period %llu cycles)\n",
+				frequency, (unsigned long long)g_tick_period_tsc);
+			return;
+		}
+		g_lc_period = lapic_timer_freq / frequency;
+		if (!g_lc_period)
+			g_lc_period = 1;
+		lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
+		lapic_write(LAPIC_LVT_TIMER,
+			    LAPIC_TIMER_VECTOR | LAPIC_TIMER_ONESHOT);
+		g_lc_now[c] = 0;
+		g_lc_armed[c] = 0;
+		g_lc_tick_next[c] = g_lc_period;
+		g_hrt_target[c] = 0;
+		g_hrt_early[c] = 0;
+		g_hrt_gaveup[c] = 0;
+		g_tick_mode = TICK_ONESHOT;
+		g_ce_running[c] = 1;
+		lc_program(c, 0);
+		hrtimer_clockevent_started();
+		smp_dbg("LAPIC: tick at %u Hz, one-shot count-down (period %llu counts)\n",
+			frequency, (unsigned long long)g_lc_period);
+		return;
 	}
 
 	// Calculate initial count for desired frequency
@@ -663,8 +1124,14 @@ void lapic_timer_start(uint32_t frequency)
 
 void lapic_timer_stop(void)
 {
+	uint32_t c = lapic_tick_slot();
+
+	g_ce_running[c] = 0;
 	lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
 	lapic_write(LAPIC_TIMER_ICR, 0);
+	g_lc_armed[c] = 0;
+	if (g_tick_mode == TICK_TSC_DEADLINE)
+		wrmsr(MSR_IA32_TSC_DEADLINE, 0);
 }
 
 uint64_t lapic_timer_get_frequency(void)
@@ -685,6 +1152,10 @@ bool lapic_tsc_is_reliable(void)
 void lapic_set_tsc_freq(uint64_t hz)
 {
 	tsc_freq_hz = hz;
+	/* A tick on TSC deadlines is a number of TSC cycles: keep it the same
+	 * length of time. */
+	if (g_tick_hz && hz)
+		g_tick_period_tsc = hz / g_tick_hz;
 }
 
 // ============================================================================

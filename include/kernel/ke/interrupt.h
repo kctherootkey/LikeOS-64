@@ -207,16 +207,16 @@ extern void irq44(void);
 extern void irq45(void);
 extern void irq46(void);
 extern void irq47(void);
-extern void irq16(void); // MSI: xHCI USB controller 0 (vector 48)
-extern void irq17(void); // MSI: xHCI USB controller 1 (vector 49)
+extern void irq16(void); // IOAPIC GSI 16 (vector 48)
+extern void irq17(void); // IOAPIC GSI 17 (vector 49)
 extern void irq27(void); // MSI: E1000 NIC (vector 59)
 extern void irq28(void); // MSI: e1000e NIC (vector 60)
 extern void irq29(void); // MSI: vmxnet3 NIC (vector 61)
 extern void irq30(void); // HPET comparator: high-resolution timers (vector 62)
 
-// MSI vector assignment
-#define XHCI_MSI_VECTOR 48 // IDT vector for xHCI USB controller 0
-#define XHCI_MSI_VECTOR_2 49 // IDT vector for xHCI USB controller 1
+// MSI vector assignment.  Never below 56: vectors 32..55 are the I/O APIC
+// lines (32 + GSI), and an edge-triggered MSI sharing a vector with a
+// level-triggered line can leave that line masked for good.
 #define E1000_MSI_VECTOR 59 // IDT vector for E1000 NIC
 #define E1000E_MSI_VECTOR 60 // IDT vector for e1000e (82574L/82583V) NIC
 #define VMXNET3_MSI_VECTOR 61 // IDT vector for vmxnet3 paravirt NIC

@@ -141,6 +141,16 @@
 #     `*/` rule above would drop it -- the build would then quietly produce an
 #     image whose only missing piece is one manual page.
 !/ports/xorg/gtk3/man/
+#     And the in-tree packages, which are our own source rather than an
+#     unpacked tarball ("in-tree" in packages.list; clean.sh keeps them).
+#     build.sh configures every package inside its own tree, so their
+#     build directories are ignored again one level down.
+!/ports/xorg/gtk3/gst-likeos-audio-1.0/
+/ports/xorg/gtk3/gst-likeos-audio-1.0/.likeos-build/
+/ports/xorg/gtk3/gst-likeos-audio-1.0/.likeos-host/
+!/ports/xorg/gtk3/likeos-mediaplayer-1.0/
+/ports/xorg/gtk3/likeos-mediaplayer-1.0/.likeos-build/
+/ports/xorg/gtk3/likeos-mediaplayer-1.0/.likeos-host/
 #     The one tarball that is NOT tracked: LLVM (~171 MB), which is over
 #     GitHub's 100 MB hard limit for a single file -- the push is refused, not
 #     warned about.  Its sha256 is in checksums.sha256 like every other one, so

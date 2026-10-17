@@ -17,11 +17,18 @@
 # anti-aliased through Xft -- a LikeOS addition (ports/xorg/patches/ctwm,
 # 0003); the part after it is a fontconfig pattern.
 #
-TitleFont	"xft:Selawik:size=9"
-ResizeFont	"xft:Selawik:size=9"
-MenuFont	"xft:Selawik:size=9"
-IconFont	"xft:Selawik:size=9"
-IconManagerFont	"xft:Selawik:size=9"
+# Selawik covers Latin only.  A character it has no glyph for -- a Greek or
+# Cyrillic window title, say -- is drawn from the next font in fontconfig's
+# order for the pattern that has one (patch 0004).  Noto Sans is named second
+# so that this is a humanist sans like Segoe UI's own Greek and Cyrillic,
+# rather than whatever the generic sans-serif happens to be; scripts Noto
+# Sans lacks fall through to the fonts after it (DejaVu Sans and the rest).
+#
+TitleFont	"xft:Selawik,Noto Sans:size=9"
+ResizeFont	"xft:Selawik,Noto Sans:size=9"
+MenuFont	"xft:Selawik,Noto Sans:size=9"
+IconFont	"xft:Selawik,Noto Sans:size=9"
+IconManagerFont	"xft:Selawik,Noto Sans:size=9"
 # ShowWorkSpaceManager is deliberately absent.  The workspace switcher is the
 # four numbered buttons in taskbar(1), which drives ctwm through
 # _NET_CURRENT_DESKTOP; ctwm still owns the workspaces themselves (see the
@@ -429,10 +436,22 @@ menu "defops" ("#1b1b1b":"#e9e9e9")
     "Xnedit"	!"xnedit &"
     "Mail"		!"claws-mail &"
     "Luakit Web Browser"	!"luakit &"
+    "Media Player"	!"mediaplayer &"
     "Calculator"	!"xcalc &"
     ""			f.separator
-    "Restart ctwm"	f.restart
-    "Exit session"	f.quit
+    "Restart session"	f.restart
+    "Exit session"	f.function "exit-session"
+}
+
+#
+# Leaving the desktop goes through likeos-logout, as the taskbar and the
+# desktop menu do: it starts the log-out sound and sends ctwm SIGTERM, on
+# which it shuts down.  (f.exec starts commands in the background, so a sound
+# and an f.quit in one function would race; the helper keeps the order.)
+#
+Function "exit-session"
+{
+    f.exec "likeos-logout &"
 }
 
 #

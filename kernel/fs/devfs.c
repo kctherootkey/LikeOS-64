@@ -217,6 +217,7 @@ static int devfs_register_common(struct devfs_node *node, int is_dir)
 	if (!is_dir && !node->ops)
 		return -EINVAL;
 	node->is_dir = is_dir;
+	node->ctime = timer_get_epoch();
 	spin_lock_irqsave(&g_nodes_lock, &fl);
 	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
 		if (g_nodes[i] && kstrcmp(g_nodes[i]->path, node->path) == 0) {
@@ -399,7 +400,28 @@ static int devfs_open_device(struct devfs_node *node, int flags,
 		int rc = node->ops->open(node, &df->vfs, flags, cur);
 		if (rc < 0) {
 			kfree(df);
-			return rc == -ENOMEM ? ST_NOMEM : (rc == -EACCES ? ST_ACCESS : ST_IO);
+			/* A driver's refusal keeps its meaning: "in use" and "no
+			 * such device" are answers a program acts on (another
+			 * opener, a missing capture side), not I/O errors. */
+			switch (rc) {
+			case -ENOMEM:
+				return ST_NOMEM;
+			case -EACCES:
+				return ST_ACCESS;
+			case -EPERM:
+				return ST_PERM;
+			case -EBUSY:
+				return ST_BUSY;
+			case -EAGAIN:
+				return ST_AGAIN;
+			case -EINVAL:
+				return ST_INVALID;
+			case -ENODEV:
+			case -ENXIO:
+				return ST_NO_DEVICE;
+			default:
+				return ST_IO;
+			}
 		}
 	}
 	*out = &df->vfs;
@@ -771,20 +793,40 @@ static int devfs_parse_unit(const char *p)
  * group-restricted (tty/input/video, conventional Unix modes and
  * major:minor numbers); the pseudo devices stay world-accessible and the
  * /dev directories world-searchable (0755). */
+/* The times a device node or directory reports.
+ *
+ * They say when the node appeared and do not move after that: the built-in
+ * nodes and directories exist from boot, a registered node from its
+ * registration.  Reporting the current time instead made every node look
+ * modified at every look, and anything that decides from timestamps
+ * whether what it cached about a device is still valid -- the multimedia
+ * framework's plugin registry checks /dev/dri this way -- concluded on
+ * every start that it was not, and rebuilt it.  A node registered before
+ * the clock was known carries 0 and is dated to the boot as well. */
+static uint64_t devfs_node_time(const struct devfs_node *n)
+{
+	if (n && n->ctime)
+		return n->ctime;
+	return timer_get_boot_epoch();
+}
+
 int devfs_stat(const char *path, struct kstat *st)
 {
 	if (!path || !st)
 		return ST_INVALID;
 	mm_memset(st, 0, sizeof(*st));
-	uint64_t now = timer_get_epoch(); /* real wall-clock seconds */
+	/* Built-in nodes and directories: there since boot.  Registered
+	 * nodes overwrite this with their own time below. */
+	uint64_t t = devfs_node_time(NULL);
+	uint64_t now = timer_get_epoch(); /* /dev/shm objects: no times of their own */
 	/* The shared memory namespace: world-writable and sticky like /tmp, so
 	 * any user can create an object but only its owner can remove it. */
 	if (is_path(path, "/dev/shm") || is_path(path, "/dev/shm/")) {
 		st->st_mode = S_IFDIR | 01777;
 		st->st_nlink = 1;
-		st->st_atime = now;
-		st->st_mtime = now;
-		st->st_ctime = now;
+		st->st_atime = t;
+		st->st_mtime = t;
+		st->st_ctime = t;
 		return ST_OK;
 	}
 	/* An individual object: a regular file whose length is how much memory
@@ -816,9 +858,9 @@ int devfs_stat(const char *path, struct kstat *st)
 		st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
 					 S_IXGRP | S_IROTH | S_IXOTH);
 		st->st_nlink = 1;
-		st->st_atime = now;
-		st->st_mtime = now;
-		st->st_ctime = now;
+		st->st_atime = t;
+		st->st_mtime = t;
+		st->st_ctime = t;
 		return ST_OK;
 	}
 	uint32_t perm, uid = 0, gid = 0, rmaj, rmin;
@@ -866,9 +908,9 @@ int devfs_stat(const char *path, struct kstat *st)
 			st->st_uid = d->uid;
 			st->st_gid = d->gid;
 			st->st_nlink = 1;
-			st->st_atime = now;
-			st->st_mtime = now;
-			st->st_ctime = now;
+			st->st_atime = devfs_node_time(d);
+			st->st_mtime = devfs_node_time(d);
+			st->st_ctime = devfs_node_time(d);
 			return ST_OK;
 		}
 		struct devfs_node *n = devfs_node_lookup(path);
@@ -879,9 +921,9 @@ int devfs_stat(const char *path, struct kstat *st)
 		st->st_gid = n->gid;
 		st->st_rdev = ((uint64_t)n->major << 8) | n->minor;
 		st->st_nlink = 1;
-		st->st_atime = now;
-		st->st_mtime = now;
-		st->st_ctime = now;
+		st->st_atime = devfs_node_time(n);
+		st->st_mtime = devfs_node_time(n);
+		st->st_ctime = devfs_node_time(n);
 		return ST_OK;
 	}
 	st->st_mode = S_IFCHR | perm;
@@ -889,9 +931,9 @@ int devfs_stat(const char *path, struct kstat *st)
 	st->st_gid = gid;
 	st->st_rdev = ((uint64_t)rmaj << 8) | rmin;
 	st->st_nlink = 1;
-	st->st_atime = now;
-	st->st_mtime = now;
-	st->st_ctime = now;
+	st->st_atime = t;
+	st->st_mtime = t;
+	st->st_ctime = t;
 	return ST_OK;
 }
 
@@ -1565,6 +1607,9 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 			      df->node->minor;
 		st->st_nlink = 1;
 		st->st_blksize = 4096;
+		st->st_atime = devfs_node_time(df->node);
+		st->st_mtime = st->st_atime;
+		st->st_ctime = st->st_atime;
 		if (ops && ops->fstat)
 			return ops->fstat(f, st);
 		return 0;

@@ -31,14 +31,12 @@ int64_t sys_gettimeofday(uint64_t tv, uint64_t tz)
 	if (!validate_user_ptr(tv, sizeof(k_timeval_t)))
 		return -EFAULT;
 	k_timeval_t kv;
-	// Use timer_get_precise_us() which atomically reads g_ticks and the
-	// ACPI PM Timer via a seqlock, eliminating the race where a BSP tick
-	// fires between reading the two values and corrupts the sub-tick delta.
-	uint64_t total_us = timer_get_precise_us();
-	uint64_t boot_epoch = timer_get_boot_epoch();
+	/* The wall clock: the monotonic clock plus its offset, both taken
+	 * at once (timer_get_realtime_ns). */
+	uint64_t rt_ns = timer_get_realtime_ns();
 
-	kv.tv_sec = (long)(boot_epoch + total_us / 1000000ULL);
-	kv.tv_usec = (long)(total_us % 1000000ULL);
+	kv.tv_sec = (long)(rt_ns / 1000000000ULL);
+	kv.tv_usec = (long)((rt_ns % 1000000000ULL) / 1000ULL);
 
 	if (copy_to_user((void *)tv, &kv, sizeof(kv)) < 0) {
 		return -EFAULT;
@@ -350,9 +348,9 @@ int64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_ptr,
 		/* Translate a REALTIME deadline into the monotonic clock the
 		 * timers run on; the two differ by the boot epoch. */
 		if (clk_id == CLOCK_REALTIME || clk_id == CLOCK_REALTIME_COARSE) {
-			uint64_t epoch_ns =
-				timer_get_boot_epoch() * 1000000000ULL;
-			abs_ns = req_ns > epoch_ns ? req_ns - epoch_ns : 0;
+			uint64_t off =
+				timer_realtime_offset_ns(hrtimer_now_ns());
+			abs_ns = req_ns > off ? req_ns - off : 0;
 		} else {
 			abs_ns = req_ns;
 		}
@@ -371,17 +369,20 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 	}
 
 	struct k_timespec tp;
-	uint64_t total_us = timer_get_precise_us();
+	uint64_t mono_ns = timer_get_precise_ns();
 
-	uint64_t total_secs = total_us / 1000000ULL;
-	uint64_t frac_ns = (total_us % 1000000ULL) * 1000ULL;
+	uint64_t total_secs = mono_ns / 1000000000ULL;
+	uint64_t frac_ns = mono_ns % 1000000000ULL;
 
 	switch (clk_id) {
 	case CLOCK_REALTIME:
-	case CLOCK_REALTIME_COARSE:
-		tp.tv_sec = timer_get_boot_epoch() + total_secs;
-		tp.tv_nsec = frac_ns;
+	case CLOCK_REALTIME_COARSE: {
+		uint64_t rt_ns = mono_ns + timer_realtime_offset_ns(mono_ns);
+
+		tp.tv_sec = rt_ns / 1000000000ULL;
+		tp.tv_nsec = rt_ns % 1000000000ULL;
 		break;
+	}
 	case CLOCK_MONOTONIC:
 	case CLOCK_MONOTONIC_RAW:
 	case CLOCK_MONOTONIC_COARSE:

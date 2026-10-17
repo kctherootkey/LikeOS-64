@@ -116,7 +116,10 @@ settings.webview.hardware_acceleration_policy = "always"
 -- happens they are what actually turns media off in this image.
 settings.webview.enable_mediasource = false
 settings.webview.media_playback_requires_gesture = true
-settings.webview.enable_webaudio = false
+-- WebAudio is on now that the system has sound: pages that make their sound
+-- with it (games, players, notification chimes) are otherwise silent.  It
+-- only does work while a page actually plays something.
+settings.webview.enable_webaudio = true
 
 -- A web process of its own for a new site: ON, switchable at run time.
 --

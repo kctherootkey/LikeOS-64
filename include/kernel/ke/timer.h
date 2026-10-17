@@ -57,6 +57,11 @@ uint64_t timer_get_tsc_at_tick(void); // (legacy, returns 0)
 uint64_t timer_get_ticks_at_cpu_tick(void); // Same as timer_ticks()
 uint64_t
 timer_get_precise_us(void); // Microseconds since boot (tick + PM Timer)
+uint64_t timer_get_precise_ns(void); // The same clock in nanoseconds
+/* CLOCK_REALTIME in ns, and its offset from the monotonic clock at the
+ * monotonic time `mono' (for converting absolute REALTIME deadlines). */
+uint64_t timer_get_realtime_ns(void);
+uint64_t timer_realtime_offset_ns(uint64_t mono);
 void timer_init_hpet(void); // Probe and enable HPET for precise timing
 void timer_init_pmtimer(void); // Probe and enable ACPI PM Timer
 uint32_t timer_pmtimer_read_raw(void); // Raw PM Timer counter value

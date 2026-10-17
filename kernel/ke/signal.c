@@ -185,6 +185,12 @@ static void sigframe_commit(const signal_frame_t *kf, uint64_t frame_addr,
 	mm_memcpy((void *)frame_addr, kf, sizeof(*kf));
 	smap_enable();
 	sigframe_fpu_capture(fpu_addr);
+	/* The handler starts from the default floating-point state, not from
+	 * the interrupted code's: a handler compiled for the default MXCSR and
+	 * control word would otherwise run with whatever rounding mode,
+	 * exception masks and denormal flags it happened to land in.  The
+	 * interrupted state is in the frame and comes back at sigreturn. */
+	task_fpu_reset_current();
 }
 
 /* Mask update on handler entry, and SA_RESETHAND. */

@@ -250,26 +250,21 @@ int shm_set_size(shm_object_t *obj, unsigned long size)
 	}
 	for (i = 0; i < want; i++)
 		np[i] = 0;
+
+	/* No memory is committed here.  A slot stays empty until the first
+	 * access to that page faults it in (shm_fault_page()), zeroed -- the
+	 * contents an object starts with are zeros either way.  A segment is
+	 * typically sized for the largest thing it may ever hold and written
+	 * only as far as it needs; allocating, zeroing and mapping all of it
+	 * up front cost a frame's worth of pages for every frame a video sink
+	 * sent, and memory nobody touched for everything else.
+	 *
+	 * The existing entries are carried over under the lock: a fault may be
+	 * filling a slot of the old array right now, and a copy taken without
+	 * the lock would lose that page. */
+	spin_lock_irqsave(&g_shm_lock, &f);
 	for (i = 0; i < have; i++)
 		np[i] = obj->pages ? obj->pages[i] : 0;
-
-	/* New pages must read as zero: their contents become visible to anyone
-	 * who opens the object by name. */
-	for (i = have; i < want; i++) {
-		uint64_t p = mm_allocate_physical_page();
-		if (!p) {
-			for (unsigned long j = have; j < i; j++)
-				mm_free_physical_page(np[j]);
-			kfree(np);
-			np = NULL;
-			rc = -ENOMEM;
-			goto out;
-		}
-		mm_memset(phys_to_virt(p), 0, PAGE_SIZE);
-		np[i] = p;
-	}
-
-	spin_lock_irqsave(&g_shm_lock, &f);
 	old_pages = obj->pages;
 	obj->pages = np;
 	obj->npages = want;
@@ -298,6 +293,60 @@ uint64_t shm_page_phys(shm_object_t *obj, unsigned long index)
 	if (obj->pages && index < obj->npages)
 		p = obj->pages[index];
 	spin_unlock_irqrestore(&g_shm_lock, f);
+	return p;
+}
+
+/* The page at `index', allocated on first use.
+ *
+ * The demand-fault path of a shared-memory mapping calls this for each page
+ * the first time an address space touches it (the mapping is a lazy device
+ * mapping: see mmap.c).  The first access by ANY sharer allocates the page;
+ * everyone after that gets the same one.  Past the object's pages it
+ * refuses, and the access is a genuine fault.
+ *
+ * The page is taken with the lock dropped -- the allocator has its own --
+ * and installed only if the slot is still empty; a sharer that raced and
+ * lost gives its page back. */
+uint64_t shm_fault_page(void *o, uint64_t index)
+{
+	shm_object_t *obj = (shm_object_t *)o;
+	uint64_t p, mine;
+	uint64_t f;
+
+	if (!obj)
+		return 0;
+	spin_lock_irqsave(&g_shm_lock, &f);
+	if (!obj->in_use || !obj->pages || index >= obj->npages) {
+		spin_unlock_irqrestore(&g_shm_lock, f);
+		return 0;
+	}
+	p = obj->pages[index];
+	spin_unlock_irqrestore(&g_shm_lock, f);
+	if (p)
+		return p;
+
+	mine = mm_allocate_physical_page();
+	if (!mine)
+		return 0;
+#if DEBUG
+	/* A debug build hands pages out poisoned, not zeroed. */
+	mm_memset(phys_to_virt(mine), 0, PAGE_SIZE);
+#endif
+
+	spin_lock_irqsave(&g_shm_lock, &f);
+	if (obj->in_use && obj->pages && index < obj->npages) {
+		p = obj->pages[index];
+		if (!p) {
+			obj->pages[index] = mine;
+			p = mine;
+			mine = 0;
+		}
+	} else {
+		p = 0;
+	}
+	spin_unlock_irqrestore(&g_shm_lock, f);
+	if (mine)
+		mm_free_physical_page(mine);
 	return p;
 }
 

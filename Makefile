@@ -189,6 +189,25 @@ KERNEL_SCREEN_CFLAGS = $(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)
 # kernel driver is exercised; the GOP framebuffer remains the fallback path.
 QEMU_VGA = -vga vmware
 
+# Sound for the QEMU run targets: an Intel HD Audio controller with a
+# duplex codec (the hda driver), played through the desktop's sound server.
+# The server socket is named explicitly so the targets that run QEMU under
+# sudo still reach the invoking user's session.
+#   QEMU_SOUND=hda (default) | ac97 | es1370 | none
+#   QEMU_AUDIODEV=<backend options>, e.g. QEMU_AUDIODEV=alsa or =none
+QEMU_SOUND ?= hda
+QEMU_AUDIODEV ?= pa,server=unix:/run/user/$(shell id -u)/pulse/native
+ifeq ($(QEMU_SOUND),hda)
+  QEMU_SOUND_ARGS = -audiodev $(QEMU_AUDIODEV),id=snd0 -device intel-hda,id=hda0 \
+	-device hda-duplex,bus=hda0.0,audiodev=snd0
+else ifeq ($(QEMU_SOUND),ac97)
+  QEMU_SOUND_ARGS = -audiodev $(QEMU_AUDIODEV),id=snd0 -device AC97,audiodev=snd0
+else ifeq ($(QEMU_SOUND),es1370)
+  QEMU_SOUND_ARGS = -audiodev $(QEMU_AUDIODEV),id=snd0 -device ES1370,audiodev=snd0
+else
+  QEMU_SOUND_ARGS =
+endif
+
 MKFS_FAT = mkfs.fat
 MTOOLS = mcopy
 
@@ -372,6 +391,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/intel_backlight.o \
               $(BUILD_DIR)/intel_gmbus.o \
               $(BUILD_DIR)/intel_infoframe.o \
+              $(BUILD_DIR)/intel_audio.o \
               $(BUILD_DIR)/intel_hdmi.o \
               $(BUILD_DIR)/intel_hotplug.o \
               $(BUILD_DIR)/intel_pmdemand.o \
@@ -595,6 +615,47 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/softirq.o \
 			  $(BUILD_DIR)/ratelimit.o \
 			  $(BUILD_DIR)/netstats.o
+
+# Intel audio DSP (cAVS/ACE, IPC4 firmware, topology) and SoundWire.
+SOF_OBJS = $(BUILD_DIR)/sof_pci.o \
+	   $(BUILD_DIR)/sof_dsp.o \
+	   $(BUILD_DIR)/sof_loader.o \
+	   $(BUILD_DIR)/sof_ipc4.o \
+	   $(BUILD_DIR)/sof_pcm.o \
+	   $(BUILD_DIR)/sof_topology.o \
+	   $(BUILD_DIR)/sof_acpi.o \
+	   $(BUILD_DIR)/sdw_intel.o \
+	   $(BUILD_DIR)/sdw_bus.o \
+	   $(BUILD_DIR)/sdw_cs42l43.o \
+	   $(BUILD_DIR)/sdca.o
+
+# Sound (kernel/dev/sound): the PCM/mixer core behind /dev/audioN, /dev/dsp
+# and /dev/mixer, the HD Audio controller with its codec drivers, AC'97,
+# the Ensoniq AudioPCI and the Intel audio DSP with SoundWire.
+SOUND_OBJS = $(BUILD_DIR)/snd_core.o \
+	     $(BUILD_DIR)/snd_pcm.o \
+	     $(BUILD_DIR)/snd_ctl.o \
+	     $(BUILD_DIR)/snd_oss.o \
+	     $(BUILD_DIR)/hda_controller.o \
+	     $(BUILD_DIR)/hda_stream.o \
+	     $(BUILD_DIR)/hda_pci_ids.o \
+	     $(BUILD_DIR)/hda_codec.o \
+	     $(BUILD_DIR)/hda_parse.o \
+	     $(BUILD_DIR)/hda_generic.o \
+	     $(BUILD_DIR)/hda_realtek.o \
+	     $(BUILD_DIR)/hda_conexant.o \
+	     $(BUILD_DIR)/hda_idt.o \
+	     $(BUILD_DIR)/hda_analog.o \
+	     $(BUILD_DIR)/hda_cirrus.o \
+	     $(BUILD_DIR)/hda_via.o \
+	     $(BUILD_DIR)/hda_ca0132.o \
+	     $(BUILD_DIR)/hda_vm.o \
+	     $(BUILD_DIR)/hda_hdmi.o \
+	     $(BUILD_DIR)/ac97_codec.o \
+	     $(BUILD_DIR)/ac97_ich.o \
+	     $(BUILD_DIR)/es1371.o \
+	     $(SOF_OBJS)
+KERNEL_OBJS += $(SOUND_OBJS)
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -612,6 +673,9 @@ EXT4_STAGING  = $(BUILD_DIR)/ext4_staging
 # fills in an i915/ blob res/firmware/i915.list names that the bundle
 # lacks; whatever is still absent is reported, never an error.
 FIRMWARE_SRC ?= /lib/firmware/i915
+# Fallback for the Intel audio DSP firmware: a file res/firmware/sof.list
+# names that the bundle in res/firmware/intel lacks is taken from here.
+SOF_FIRMWARE_SRC ?= /lib/firmware
 # Where the host keeps the firmware licence texts (the package documents them
 # separately from the blobs).
 FIRMWARE_LICENSE_DIR ?= $(firstword $(wildcard /usr/share/doc/*-firmware/licenses))
@@ -650,7 +714,10 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
-	libdlbase.so libdlchain.so
+	libdlbase.so libdlchain.so libaudio.so
+# Audio tools -> /usr/bin, the audio service -> /usr/sbin
+USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
+USR_SBIN_PROGS = audiod
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
@@ -665,15 +732,18 @@ ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat tests
 RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	res/LikeOS.png \
 	res/etc/skel/.profile res/etc/skel/.bashrc \
-	$(wildcard res/etc/skel/Desktop/*.desktop) \
+	$(wildcard res/etc/skel/Desktop/*.desktop) res/videos \
 	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
 	$(wildcard res/etc/ssl/certs/*) $(wildcard res/xorg/*) \
 	$(wildcard res/xorg/applications/*) \
 	$(wildcard res/xorg/gtk3/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
-	res/firmware/i915.list \
+	res/firmware/i915.list res/firmware/sof.list \
 	$(wildcard res/firmware/i915/*.bin res/firmware/xe/*.bin) \
+	$(shell find res/firmware/intel -type f 2>/dev/null) \
+	res/firmware/cs42l43.bin res/firmware/LICENCE.sof res/firmware/LICENSE.cirrus \
+	$(wildcard res/sounds/likeos/*.wav) \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
 	host/gen-cursors.c \
 	user/bin/tests/apnews-urls.txt
@@ -716,6 +786,7 @@ GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
+	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_SBIN_PROGS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
 	$(GTK3_SENTINEL) \
@@ -837,6 +908,28 @@ $(BUILD_DIR)/i915_%.o: $(KERNEL_DIR)/dev/gpu/i915/i915_%.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/intel_%.o: $(KERNEL_DIR)/dev/gpu/i915/display/intel_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# Sound drivers (kernel/dev/sound): one rule per file-name prefix.
+$(BUILD_DIR)/snd_%.o: $(KERNEL_DIR)/dev/sound/snd_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hda_%.o: $(KERNEL_DIR)/dev/sound/hda_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ac97_%.o: $(KERNEL_DIR)/dev/sound/ac97_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/sof_%.o: $(KERNEL_DIR)/dev/sound/sof_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/sdw_%.o: $(KERNEL_DIR)/dev/sound/sdw_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/es1371.o: $(KERNEL_DIR)/dev/sound/es1371.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/sdca.o: $(KERNEL_DIR)/dev/sound/sdca.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/firmware.o: $(KERNEL_DIR)/ke/firmware.c | $(BUILD_DIR)
@@ -1241,6 +1334,11 @@ userland-dlchain:
 userland-libcrypt: userland-libc
 	$(MAKE) -C user/lib/libcrypt
 
+# The audio client library (programs talk to audiod through it).
+.PHONY: userland-libaudio
+userland-libaudio: userland-libc
+	$(MAKE) -C user/lib/libaudio
+
 # Build minimal PAM library (depends on libcrypt for crypt())
 .PHONY: userland-libpam
 userland-libpam: userland-libc userland-libcrypt
@@ -1269,6 +1367,21 @@ $(BUILD_DIR)/libdlchain.so: userland-dlchain | $(BUILD_DIR)
 
 $(BUILD_DIR)/libcrypt.so: userland-libcrypt | $(BUILD_DIR)
 	cp user/lib/libcrypt/libcrypt.so $@
+	$(USER_STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/libaudio.so: userland-libaudio | $(BUILD_DIR)
+	cp user/lib/libaudio/libaudio.so $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# Audio tools (user/bin, linked against libaudio) and the audio service.
+$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS)): $(BUILD_DIR)/%: userland-libc userland-rtld userland-libaudio | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) $*
+	cp $(USER_DIR)/$* $@
+	$(USER_STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/audiod: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C user/sbin/audiod
+	cp user/sbin/audiod/audiod $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libpam.so: userland-libpam | $(BUILD_DIR)
@@ -2056,7 +2169,7 @@ ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
 # Ordered after ports-xorg for the same reason its own manifest is ordered:
 # GTK's X11 backend cannot be configured until the X libraries are installed.
 .PHONY: ports-gtk3
-ports-gtk3: ports-xorg | $(BUILD_DIR)
+ports-gtk3: ports-xorg $(BUILD_DIR)/libaudio.so | $(BUILD_DIR)
 	@# Checked HERE rather than left to the package that needs it.  GLib is
 	@# the fifth thing this target builds and the first to require a meson
 	@# newer than Ubuntu 24.04 ships, so without this the build spends
@@ -2075,6 +2188,8 @@ ports-gtk3: ports-xorg | $(BUILD_DIR)
 	fi
 	ports/xorg/gtk3/fetch.sh
 	ports/xorg/gtk3/unpack.sh
+	@# libaudio (headers, library, .pc) for the GStreamer audio sink.
+	ports/xorg/import-libaudio.sh
 	ports/xorg/gtk3/build.sh
 	@# The X server, a SECOND time.
 	@#
@@ -2151,10 +2266,16 @@ $(BUILD_DIR)/load: user/bin/shell/load.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD
 	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
 		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS)
 
+# taskbar also links libaudio, for its volume control and the start-up sound;
+# the GTK3 port imports it into the sysroot, so the sentinel covers it too.
 $(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
 	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
-		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS)
+		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+		   ports/xorg/toolchain/likeos-pkg-config --cflags libaudio) \
+		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS) \
+		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+		   ports/xorg/toolchain/likeos-pkg-config --libs libaudio)
 
 # The C++ runtime's own test program.
 #
@@ -2372,6 +2493,22 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/datetime $(EXT4_STAGING)/usr/bin/datetime
 	cp $(BUILD_DIR)/load     $(EXT4_STAGING)/usr/bin/load
 	cp $(BUILD_DIR)/taskbar  $(EXT4_STAGING)/usr/bin/taskbar
+	# Sound: the tools -> /usr/bin, audiod -> /usr/sbin (started by init
+	# from inittab; it creates /var/run/audiod and /var/lib/audiod with
+	# their owners itself), the system sounds -> /usr/share/sounds/likeos.
+	for b in $(USR_BIN_AUDIO_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/bin/$$b; \
+		chmod 0755 $(EXT4_STAGING)/usr/bin/$$b; done
+	for b in $(USR_SBIN_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/sbin/$$b; \
+		chmod 0755 $(EXT4_STAGING)/usr/sbin/$$b; done
+	# Ends the desktop session with the log-out sound (menus and taskbar).
+	cp res/xorg/likeos-logout.sh $(EXT4_STAGING)/usr/bin/likeos-logout
+	chmod 0755 $(EXT4_STAGING)/usr/bin/likeos-logout
+	mkdir -p $(EXT4_STAGING)/usr/share/sounds/likeos
+	cp res/sounds/likeos/*.wav $(EXT4_STAGING)/usr/share/sounds/likeos/
+	chmod 0755 $(EXT4_STAGING)/usr/share/sounds $(EXT4_STAGING)/usr/share/sounds/likeos
+	chmod 0644 $(EXT4_STAGING)/usr/share/sounds/likeos/*.wav
+	cp res/etc/audiod.conf $(EXT4_STAGING)/etc/audiod.conf
+	chmod 0644 $(EXT4_STAGING)/etc/audiod.conf
 	# Tests and demos -> /usr/local/bin (a few are renamed)
 	cp $(BUILD_DIR)/user_test.elf $(EXT4_STAGING)/usr/local/bin/tests
 	cp $(BUILD_DIR)/test_libc     $(EXT4_STAGING)/usr/local/bin/testlibc
@@ -2445,6 +2582,34 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 		fi; \
 	done; \
 	echo "firmware: $$(ls $(EXT4_STAGING)/lib/firmware/i915 $(EXT4_STAGING)/lib/firmware/xe | grep -c bin) Intel graphics blobs staged ($$n of the driver's list present, $$missing missing)"
+	# Sound firmware.  The Intel audio DSP firmware, its loadable libraries
+	# and topologies (res/firmware/intel, every file res/firmware/sof.list
+	# names) and the CS42L43 codec's patch ship in res/firmware with their
+	# licences, and all of it goes onto the image, as with the graphics
+	# firmware.  SOF_FIRMWARE_SRC (the host's package) only fills in a
+	# listed file the bundle lacks, decompressed where the host keeps it
+	# compressed.  Machines without the DSP never ask for any of it.
+	mkdir -p $(EXT4_STAGING)/lib/firmware/intel
+	cp -R res/firmware/intel/. $(EXT4_STAGING)/lib/firmware/intel/
+	cp res/firmware/cs42l43.bin $(EXT4_STAGING)/lib/firmware/cs42l43.bin
+	cp res/firmware/LICENCE.sof res/firmware/LICENSE.cirrus $(EXT4_STAGING)/usr/share/doc/firmware/
+	find $(EXT4_STAGING)/lib/firmware/intel -type d -exec chmod 0755 {} +
+	find $(EXT4_STAGING)/lib/firmware/intel -type f -exec chmod 0644 {} +
+	@n=0; missing=0; \
+	for f in $$(grep -v '^#' res/firmware/sof.list | grep -v '^$$'); do \
+		if [ -f "$(EXT4_STAGING)/lib/firmware/$$f" ]; then \
+			n=$$((n+1)); continue; \
+		fi; \
+		mkdir -p "$$(dirname $(EXT4_STAGING)/lib/firmware/$$f)"; \
+		if [ -f "$(SOF_FIRMWARE_SRC)/$$f" ]; then \
+			cp -L "$(SOF_FIRMWARE_SRC)/$$f" $(EXT4_STAGING)/lib/firmware/$$f; n=$$((n+1)); \
+		elif [ -f "$(SOF_FIRMWARE_SRC)/$$f.zst" ]; then \
+			zstd -q -d -f "$(SOF_FIRMWARE_SRC)/$$f.zst" -o $(EXT4_STAGING)/lib/firmware/$$f; n=$$((n+1)); \
+		else \
+			missing=$$((missing+1)); echo "firmware: $$f is neither bundled nor in $(SOF_FIRMWARE_SRC)"; \
+		fi; \
+	done; \
+	echo "firmware: $$n audio DSP files staged ($$missing of the driver's list missing)"
 	# X cursor theme.
 	#
 	# Generated, not committed: the artwork is geometry, so it lives as the
@@ -2533,6 +2698,13 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# The file manager's "Create New" templates live in ~/Templates, and it
 	# warns at every start when the folder is missing.
 	mkdir -p $(EXT4_STAGING)/etc/skel/Templates $(EXT4_STAGING)/root/Templates
+	# ~/Videos, with the sample videos from res/videos/ (named with spaces,
+	# so the directory, not each file, is what the image depends on).
+	for d in $(EXT4_STAGING)/etc/skel $(EXT4_STAGING)/root; do \
+		mkdir -p "$$d/Videos"; \
+		cp res/videos/* "$$d/Videos/"; \
+		chmod 0644 "$$d"/Videos/*; \
+	done
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/etc/skel/Desktop/
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/root/Desktop/
 	# The icons appear in modification-time order, oldest first: PCManFM's
@@ -2545,7 +2717,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# do the same job are kept together and the newer one first: Terminal
 	# before Xterm, Calculator before X Calculator.
 	i=0; for f in pcmanfm xfce4-terminal xterm mousepad xnedit luakit \
-	              hexchat claws-mail galculator xcalc; do \
+	              hexchat claws-mail mediaplayer galculator xcalc; do \
 		for d in $(EXT4_STAGING)/etc/skel/Desktop \
 		         $(EXT4_STAGING)/root/Desktop; do \
 			[ -f "$$d/$$f.desktop" ] && \
@@ -2671,7 +2843,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 # bootloader, which then loads /boot/kernel.elf from the ext4 root partition.
 qemu: $(GPT_DISK)
 	@echo "Running LikeOS from the ext4 GPT USB disk in QEMU..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
@@ -2689,7 +2861,7 @@ qemu-usb: $(GPT_DISK)
 	@# sudo is required so SLIRP can open a raw ICMP socket on the host;
 	@# without it, external `ping` (e.g. ping 8.8.8.8) is silently dropped
 	@# while the synthetic gateway reply (10.0.2.2) still works.
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
@@ -2704,7 +2876,7 @@ qemu-usb-gdb:
 	@echo "Running LikeOS from the ext4 GPT USB disk + $(NIC_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	@# sudo: see qemu-usb target above (SLIRP raw ICMP socket).
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
@@ -2718,7 +2890,7 @@ ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
 	@echo "Running LikeOS in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
@@ -2735,7 +2907,7 @@ endif
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
 	@echo "Running LikeOS in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
@@ -2761,7 +2933,7 @@ qemu-usb-passthrough: $(GPT_DISK)
 	if [ -z "$$devices" ]; then echo "(No host USB devices selected for passthrough. Set PASSTHROUGH_FILTER=vid:pid to choose explicitly.)"; fi; \
 	echo "Passing through devices:$$devices"; \
 	set -x; \
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off -device usb-storage,drive=ext4disk,bootindex=0 $$devices || echo "QEMU exited with status $$?"; \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off -device usb-storage,drive=ext4disk,bootindex=0 $$devices || echo "QEMU exited with status $$?"; \
 	set +x || true
 
 # Write the single ext4 GPT USB disk to a real USB device (like Rufus, but the
@@ -2864,6 +3036,8 @@ clean:
 	$(MAKE) -C user/lib/testlib clean
 	$(MAKE) -C user/lib/libcrypt clean
 	$(MAKE) -C user/lib/libpam clean
+	$(MAKE) -C user/lib/libaudio clean
+	$(MAKE) -C user/sbin/audiod clean
 	$(MAKE) -C $(USER_DIR) clean
 
 distclean: clean

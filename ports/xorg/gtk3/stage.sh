@@ -284,13 +284,13 @@ for b in pcmanfm mousepad libfm-pref-apps lxshortcut; do
 	staged=$((staged + 1))
 done
 
-# The three desktop applications this port exists for beside Claws: a
-# calculator, a terminal emulator and an IRC client.
+# The desktop applications this port exists for beside Claws: a
+# calculator, a terminal emulator, an IRC client and the media player.
 #
 # xfconf-query is the settings store's command-line face -- the only way to
 # read or set a preference without the dialog that owns it, and the first
 # thing to reach for when a setting does not stick.
-for b in galculator xfce4-terminal hexchat xfconf-query; do
+for b in galculator xfce4-terminal hexchat xfconf-query mediaplayer; do
 	[ -f "$SYSROOT/usr/bin/$b" ] || continue
 	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 	staged=$((staged + 1))

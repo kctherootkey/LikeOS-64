@@ -27,6 +27,7 @@
 #include <kernel/dev/gpu/i915/intel_display.h>
 #include <kernel/dev/gpu/i915/intel_wm.h>
 #include <kernel/dev/gpu/i915/intel_wm_regs.h>
+#include <kernel/dev/gpu/i915/intel_audio.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/hal/lapic.h>
@@ -386,6 +387,8 @@ void intel_wm_cfg_from_hw(struct i915_device *i915, struct intel_wm_pipe_cfg cfg
 		port_clock = dp && o->link_rate_khz ? o->link_rate_khz : p->mode.clock;
 		intel_wm_cfg_set_mode(c, &p->mode, p->src_w, p->src_h, port_clock, dp,
 				      o && o->is_edp, o ? o->lane_count : 0);
+		/* audio running on the pipe keeps its CDCLK rule (intel_audio.c) */
+		c->has_audio = (uint8_t)(o && intel_audio_output_active(i915, o));
 		intel_wm_cfg_set_planes(c, p->surf_ggtt != 0, p->width, p->height, p->format,
 					p->modifier, p->cursor_w);
 		c->plane_src_x = (uint16_t)p->off_x;

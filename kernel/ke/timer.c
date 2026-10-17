@@ -17,6 +17,12 @@
 #include <kernel/uapi/bug.h>
 
 static volatile uint64_t g_ticks = 0;
+/* Timer interrupts the boot CPU has taken.  Not g_ticks: that one is
+ * resynchronised to the clock on every tick (see timer_irq_handler), so it
+ * says how much time passed, not how often the timer fired -- and the
+ * first tick after the timer starts jumps it over all the time since the
+ * clock started.  Calibrating the tick rate needs the plain count. */
+static volatile uint64_t g_tick_irqs = 0;
 /* PM Timer-based wall-clock microsecond counter.
  * g_total_us accumulates real wall-clock microseconds by summing PM Timer
  * deltas between consecutive BSP ticks.  Unlike ticks*1e6/freq, this is
@@ -98,6 +104,9 @@ static int g_cmos_failed = 0;
 #define RTC_SET 0x80 /* Inhibit updates for clock setting */
 #define RTC_DM_BINARY 0x04 /* Data mode: 1=binary, 0=BCD */
 #define RTC_24H 0x02 /* 24-hour mode */
+#define RTC_PIE 0x40 /* Periodic interrupt enable */
+#define RTC_AIE 0x20 /* Alarm interrupt enable */
+#define RTC_UIE 0x10 /* Update-ended interrupt enable */
 
 /*
  * io_delay — small I/O delay for CMOS RTC timing.
@@ -138,6 +147,11 @@ typedef struct __attribute__((packed)) {
 #define HPET_GEN_CONFIG_OFFSET 0x010
 #define HPET_MAIN_COUNTER_OFFSET 0x0F0
 #define HPET_GEN_CONFIG_ENABLE (1ULL << 0)
+#define HPET_GEN_CONFIG_LEGACY (1ULL << 1)
+#define HPET_TN_CONFIG_OFFSET(n) (0x100 + 0x20 * (n))
+#define HPET_TN_CFG_LEVEL (1ULL << 1)
+#define HPET_TN_CFG_INT_ENB (1ULL << 2)
+#define HPET_TN_CFG_FSB_EN (1ULL << 14)
 
 /* The HPET mapping, for the high-resolution timer layer that borrows one
  * of its comparators (kernel/ke/hrtimer.c). */
@@ -212,6 +226,8 @@ static uint64_t timer_get_fallback_precise_us(void)
 	return g_ticks * 1000000ULL / g_frequency;
 }
 
+static void timer_host_time_sync(int announce);
+
 static void timer_enable_reliable_tsc_precise_time(void)
 {
 	if (!lapic_tsc_is_reliable() || lapic_get_tsc_freq() == 0 ||
@@ -222,6 +238,7 @@ static void timer_enable_reliable_tsc_precise_time(void)
 	g_tsc_precise_available = 1;
 
 	kprintf("Timer: using reliable TSC for precise timekeeping\n");
+	timer_host_time_sync(1);
 }
 
 /* Public raw PM Timer read — returns masked counter value (0 if unavailable). */
@@ -407,6 +424,21 @@ static void rtc_read_boot_time(void)
 		goto try_uefi_fallback;
 	}
 
+	/* Nothing here takes the RTC's interrupts: turn off the periodic,
+	 * alarm and update-ended interrupts whatever the firmware left on,
+	 * and read register C to drop a flag already raised.  Left on, the
+	 * periodic one is a timer interrupting with nobody acknowledging it
+	 * -- and a hypervisor that sees a timer programmed periodic has to
+	 * assume the guest counts its interrupts as time. */
+	{
+		uint8_t b = cmos_read(RTC_REG_B);
+
+		if (b & (RTC_PIE | RTC_AIE | RTC_UIE))
+			cmos_write(RTC_REG_B,
+				   b & (uint8_t)~(RTC_PIE | RTC_AIE | RTC_UIE));
+		(void)cmos_read(RTC_REG_C);
+	}
+
 	/* Read all RTC registers with UIP-avoidance (1000ms timeout) */
 	if (!rtc_read_consistent(1000, &sec, &min, &hour, &day, &month, &year,
 				 &century, &ctrl)) {
@@ -469,9 +501,7 @@ try_uefi_fallback:
 
 uint64_t timer_get_epoch(void)
 {
-	if (g_pmtimer_available)
-		return g_boot_epoch + timer_get_precise_us() / 1000000ULL;
-	return g_boot_epoch + g_ticks / g_frequency;
+	return timer_get_realtime_ns() / 1000000000ULL;
 }
 
 uint32_t timer_get_frequency(void)
@@ -625,6 +655,28 @@ static uint64_t g_tsc_base_cycles = 0;
 static volatile int g_tsc_base_ready = 0;
 static spinlock_t g_tsc_base_lock = SPINLOCK_INIT("tsc_base");
 
+/* The same clock in nanoseconds.  From the TSC when it is the clock, with
+ * the sub-microsecond part kept: a deadline that is a few hundred
+ * nanoseconds away must not read as "not yet" for up to a whole microsecond
+ * after the timer that was armed for it has fired. */
+uint64_t timer_get_precise_ns(void)
+{
+	if (g_tsc_precise_available &&
+	    __atomic_load_n(&g_tsc_base_ready, __ATOMIC_ACQUIRE)) {
+		uint64_t tsc_hz = lapic_get_tsc_freq();
+		uint64_t delta = rdtsc() - g_tsc_base_cycles;
+
+		if (tsc_hz) {
+			uint64_t whole = delta / tsc_hz;
+			uint64_t rem = delta % tsc_hz;
+
+			return g_tsc_base_us * 1000ULL + whole * 1000000000ULL +
+			       rem * 1000000000ULL / tsc_hz;
+		}
+	}
+	return timer_get_precise_us() * 1000ULL;
+}
+
 uint64_t timer_get_precise_us(void)
 {
 	if (g_tsc_precise_available) {
@@ -654,6 +706,173 @@ uint64_t timer_get_precise_us(void)
 	return timer_get_fallback_precise_us();
 }
 
+/* ---- the wall clock --------------------------------------------------------
+ *
+ * CLOCK_REALTIME is the monotonic clock plus an offset: the boot time read
+ * from the firmware or the RTC (g_boot_epoch, which stays as read -- device
+ * nodes are dated by it, see devfs) plus a correction (g_rt_adj_ns).
+ *
+ * The correction is what keeps the wall clock right where the monotonic
+ * clock cannot be trusted to have kept real time.  On VMware the guest's
+ * TSC is the hypervisor's "apparent time": while the machine is not run --
+ * heavily, during boot -- it falls behind real time and never makes the
+ * time up, and a wall clock computed from it ends up as far behind as all
+ * those stalls together (a minute, measured).  So, the way the hypervisor's
+ * guest tools keep a guest's clock, the host's own wall clock is read
+ * through its backdoor (lapic_host_time_us) right after the clock is set
+ * up and every 2 seconds after that:
+ *
+ *  - a difference of a second or more, or the first reading, is stepped;
+ *    the check runs every 2 seconds of TICK time -- the tick follows real
+ *    time while the TSC lags, so a lag cannot stretch the interval too;
+ *  - anything smaller is slewed in at 500 parts per million, so the clock
+ *    never jumps, never runs backwards, and a correction of a few
+ *    milliseconds takes a few seconds.
+ *
+ * CLOCK_MONOTONIC is never touched.  Without a hypervisor clock the
+ * correction stays zero, as before.  settimeofday() sets it too.
+ *
+ * The three values are published under a sequence counter: a reader takes
+ * a consistent snapshot without a lock, from any context. */
+#define RT_SLEW_PPM 500ULL
+#define RT_SYNC_INTERVAL_S 2ULL
+
+static volatile uint32_t g_rt_seq;
+static int64_t g_rt_adj_ns;
+static int64_t g_rt_slew_ns; /* still being slewed in, signed */
+static uint64_t g_rt_slew_start_ns; /* monotonic, when the slew began */
+static int g_rt_synced;
+static spinlock_t g_rt_lock = SPINLOCK_INIT("realtime");
+
+/* How much of the pending slew is in effect at monotonic time `mono'. */
+static int64_t rt_slewed(int64_t slew, uint64_t start, uint64_t mono)
+{
+	uint64_t el, max, mag;
+
+	if (!slew)
+		return 0;
+	el = mono > start ? mono - start : 0;
+	max = el / 1000000ULL * RT_SLEW_PPM + (el % 1000000ULL) * RT_SLEW_PPM / 1000000ULL;
+	mag = slew < 0 ? (uint64_t)(-slew) : (uint64_t)slew;
+	if (max >= mag)
+		return slew;
+	return slew < 0 ? -(int64_t)max : (int64_t)max;
+}
+
+/* CLOCK_REALTIME minus CLOCK_MONOTONIC, in ns, at monotonic time `mono'. */
+uint64_t timer_realtime_offset_ns(uint64_t mono)
+{
+	uint32_t seq;
+	int64_t adj, slew;
+	uint64_t start, boot;
+
+	do {
+		seq = __atomic_load_n(&g_rt_seq, __ATOMIC_ACQUIRE);
+		boot = g_boot_epoch;
+		adj = g_rt_adj_ns;
+		slew = g_rt_slew_ns;
+		start = g_rt_slew_start_ns;
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+	} while ((seq & 1) || seq != __atomic_load_n(&g_rt_seq, __ATOMIC_ACQUIRE));
+	return (uint64_t)((int64_t)(boot * 1000000000ULL) + adj +
+			  rt_slewed(slew, start, mono));
+}
+
+uint64_t timer_get_realtime_ns(void)
+{
+	uint64_t mono = timer_get_precise_ns();
+
+	return mono + timer_realtime_offset_ns(mono);
+}
+
+/* Write side: `fn' runs with the sequence odd and the lock held. */
+static void rt_update(int64_t new_adj, int64_t new_slew, uint64_t start)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&g_rt_lock, &fl);
+	__atomic_add_fetch(&g_rt_seq, 1, __ATOMIC_ACQ_REL);
+	g_rt_adj_ns = new_adj;
+	g_rt_slew_ns = new_slew;
+	g_rt_slew_start_ns = start;
+	__atomic_add_fetch(&g_rt_seq, 1, __ATOMIC_ACQ_REL);
+	spin_unlock_irqrestore(&g_rt_lock, fl);
+}
+
+/* Set the wall clock to `epoch_ns' now. */
+static void rt_set_now(uint64_t epoch_ns)
+{
+	uint64_t mono = timer_get_precise_ns();
+	int64_t adj = (int64_t)epoch_ns -
+		      (int64_t)(g_boot_epoch * 1000000000ULL + mono);
+
+	rt_update(adj, 0, mono);
+}
+
+/* Compare the wall clock with the host's and correct it (see above).
+ * Any context; a no-op where no hypervisor states its time. */
+static void timer_host_time_sync(int announce)
+{
+	uint64_t host_us = lapic_host_time_us();
+	uint64_t mono, rt;
+	int64_t diff, mag, adj, slew;
+
+	if (!host_us || !g_tsc_precise_available)
+		return;
+	mono = timer_get_precise_ns();
+	rt = mono + timer_realtime_offset_ns(mono);
+	diff = (int64_t)(host_us * 1000ULL) - (int64_t)rt;
+	mag = diff < 0 ? -diff : diff;
+	if (mag > 86400LL * 1000000000LL)
+		return; /* not a clock this one can be compared with */
+	/* The firmware's boot time is never that far off: a first difference
+	 * of more than half an hour means the host answered in some other
+	 * time scale (a local zone), and it is not taken. */
+	if (!g_rt_synced && mag > 1800LL * 1000000000LL) {
+		kprintf("Timer: hypervisor time differs by %lld s from the boot time; not used\n",
+			(long long)(diff / 1000000000LL));
+		g_rt_synced = -1;
+		return;
+	}
+	if (g_rt_synced < 0)
+		return;
+	/* Fold what has been slewed in so far into the fixed part. */
+	adj = g_rt_adj_ns + rt_slewed(g_rt_slew_ns, g_rt_slew_start_ns, mono);
+	if (!g_rt_synced || mag >= 1000000000LL) {
+		rt_update(adj + diff, 0, mono);
+		/* The step has corrected the clock, including whatever part
+		 * of the difference was the hypervisor holding the guest's
+		 * time back for timer interrupts it still owes.  So that
+		 * backlog is dropped now, the way the hypervisor's own guest
+		 * tools do it after a step: kept, it goes on holding the
+		 * guest's time back -- for a minute after boot, measured,
+		 * until the hypervisor gave up on it by itself -- and a
+		 * catch-up of it would run the clock ahead of the host. */
+		lapic_host_stop_catchup();
+		if (announce || g_rt_synced)
+			kprintf("Timer: wall clock set from the hypervisor (was %s by %lld ms)\n",
+				diff > 0 ? "behind" : "ahead",
+				(long long)(mag / 1000000LL));
+		g_rt_synced = 1;
+		return;
+	}
+	slew = diff;
+	rt_update(adj, slew, mono);
+}
+
+/* From the boot CPU's tick, counted in ticks (see above). */
+static void timer_host_time_sync_tick(void)
+{
+	static uint64_t next_sync_tick;
+
+	if (!g_tsc_precise_available)
+		return;
+	if (g_ticks < next_sync_tick)
+		return;
+	next_sync_tick = g_ticks + RT_SYNC_INTERVAL_S * g_frequency;
+	timer_host_time_sync(0);
+}
+
 void timer_init_hpet(void)
 {
 	acpi_hpet_t *hpet = (acpi_hpet_t *)acpi_find_table(ACPI_SIG_HPET);
@@ -679,7 +898,29 @@ void timer_init_hpet(void)
 		return;
 	}
 
+	/* Take the block over in a known state rather than as the firmware
+	 * left it: the counter stopped while the comparators are set up,
+	 * legacy replacement off (it takes IRQ 0 and 8 away from the PIT and
+	 * the RTC), and no comparator raising interrupts -- not level
+	 * triggered, not delivered as a message either.  A comparator the
+	 * firmware left running would go on interrupting, periodically
+	 * perhaps, with nothing here expecting it; and a hypervisor that sees
+	 * any timer programmed to interrupt periodically has to assume the
+	 * guest counts those interrupts as time.  hrtimer_init_hw() enables
+	 * the one comparator it takes. */
 	uint64_t cfg = hpet_read_reg(HPET_GEN_CONFIG_OFFSET);
+	int nchan = (int)((cap >> 8) & 0x1F) + 1;
+
+	hpet_write_reg(HPET_GEN_CONFIG_OFFSET,
+		       cfg & ~(HPET_GEN_CONFIG_ENABLE | HPET_GEN_CONFIG_LEGACY));
+	for (int i = 0; i < nchan; i++) {
+		uint64_t tcfg = hpet_read_reg(HPET_TN_CONFIG_OFFSET(i));
+
+		tcfg &= ~(HPET_TN_CFG_INT_ENB | HPET_TN_CFG_LEVEL |
+			  HPET_TN_CFG_FSB_EN);
+		hpet_write_reg(HPET_TN_CONFIG_OFFSET(i), tcfg);
+	}
+	cfg &= ~HPET_GEN_CONFIG_LEGACY;
 	hpet_write_reg(HPET_GEN_CONFIG_OFFSET, cfg | HPET_GEN_CONFIG_ENABLE);
 	g_hpet_start = hpet_read_counter();
 	g_hpet_available = 1;
@@ -857,8 +1098,7 @@ void timer_set_time(uint64_t epoch)
      *   => boot_epoch = epoch_now - ticks/frequency
      * But the caller gives us the desired epoch_now, so:
      */
-	uint64_t uptime = g_ticks / g_frequency;
-	g_boot_epoch = epoch - uptime;
+	rt_set_now(epoch * 1000000000ULL);
 
 	/* Sync the hardware CMOS RTC to the new wall-clock time */
 	cmos_write_datetime(epoch);
@@ -897,14 +1137,14 @@ static int timer_calibrate_tsc(void)
 	/* Measure timer ticks over exactly 1 second using TSC */
 	uint64_t tsc_one_second = tsc_hz;
 
-	uint64_t t0 = g_ticks;
+	uint64_t t0 = g_tick_irqs;
 	uint64_t tsc_start = rdtsc();
 
 	/* Spin until 1 second has elapsed according to TSC */
 	while ((rdtsc() - tsc_start) < tsc_one_second)
 		__asm__ volatile("pause");
 
-	uint64_t t1 = g_ticks;
+	uint64_t t1 = g_tick_irqs;
 	uint64_t measured = t1 - t0;
 
 	/* Sanity bounds: must be within 0.5x..2x of the configured rate.
@@ -951,7 +1191,7 @@ static int timer_calibrate_hpet(void)
 		return 0;
 	}
 
-	uint64_t t0 = g_ticks;
+	uint64_t t0 = g_tick_irqs;
 	uint64_t hpet_start = hpet_read_counter();
 	uint64_t tsc_start = rdtsc();
 
@@ -959,7 +1199,7 @@ static int timer_calibrate_hpet(void)
 	while ((hpet_read_counter() - hpet_start) < hpet_one_second)
 		__asm__ volatile("pause");
 
-	uint64_t t1 = g_ticks;
+	uint64_t t1 = g_tick_irqs;
 	uint64_t tsc_end = rdtsc();
 	uint64_t measured = t1 - t0;
 
@@ -998,8 +1238,49 @@ static int timer_calibrate_hpet(void)
  *
  * Must be called AFTER the timer interrupt is running (PIT or LAPIC).
  */
+/* The TSC frequency from one HPET second, for a machine where neither the
+ * hypervisor nor CPUID states it.  Returns 1 when it was set. */
+static int timer_calibrate_tsc_hz_from_hpet(void)
+{
+	if (!g_hpet_available || !g_hpet_period_fs)
+		return 0;
+	uint64_t hpet_one_second =
+		1000000000000000ULL / (uint64_t)g_hpet_period_fs;
+	uint64_t hpet_start = hpet_read_counter();
+	uint64_t tsc_start = rdtsc();
+
+	while ((hpet_read_counter() - hpet_start) < hpet_one_second)
+		__asm__ volatile("pause");
+
+	uint64_t tsc_delta = rdtsc() - tsc_start;
+
+	if (tsc_delta <= 100000000ULL || tsc_delta >= 20000000000ULL)
+		return 0;
+	lapic_set_tsc_freq(tsc_delta);
+	kprintf("Timer: HPET-calibrated TSC freq = %lu Hz\n",
+		(unsigned long)tsc_delta);
+	return 1;
+}
+
 void timer_calibrate_frequency(void)
 {
+	/* A one-shot local timer ticks at exactly the rate it was started
+	 * with: each tick is armed one period after the last, on the timer's
+	 * own clock or on the TSC (lapic.c).  The rate is a setting, not a
+	 * measurement.  Measuring it against the HPET or the TSC -- which on a
+	 * hypervisor run in the guest's apparent time, and that can lag real
+	 * time -- put 356 here for a tick that runs at 200 a second, and every
+	 * timeout counted in ticks came out 1.8 times too long.  Only the TSC
+	 * frequency may still need the HPET, where nothing states it. */
+	if (lapic_clockevent_ready(0)) {
+		kprintf("Timer: tick at %u Hz (one-shot local timer; set, not measured)\n",
+			g_frequency);
+		if (!lapic_tsc_is_reliable())
+			(void)timer_calibrate_tsc_hz_from_hpet();
+		timer_enable_reliable_tsc_precise_time();
+		return;
+	}
+
 	/* Method 1: HPET — gold standard when present. */
 	if (timer_calibrate_hpet()) {
 		return;
@@ -1062,6 +1343,7 @@ void timer_calibrate_frequency(void)
 		}
 	}
 	uint64_t t0 = g_ticks;
+	uint64_t irq0 = g_tick_irqs;
 	uint64_t tsc0 = rdtsc(); /* TSC at first RTC second boundary */
 
 	/* Wait for the second to change again (second boundary = exactly 1s later) */
@@ -1085,10 +1367,9 @@ void timer_calibrate_frequency(void)
 			return;
 		}
 	}
-	uint64_t t1 = g_ticks;
 	uint64_t tsc1 = rdtsc(); /* TSC at second RTC second boundary */
 
-	uint64_t measured = t1 - t0;
+	uint64_t measured = g_tick_irqs - irq0;
 	/* Sanity bounds: configured rate ± 50 %. Some virtualized RTCs
      * (notably VirtualBox) miss UIP transitions, so the "1 s" window
      * between two second-boundary detections can actually be many
@@ -1161,8 +1442,37 @@ void timer_start(void)
 	irq_enable(0); // Enable IRQ0
 }
 
+/* The PIT is not the tick any more (the LAPIC timer is): mask IRQ0 and stop
+ * channel 0 counting.  Masking alone is not enough under a hypervisor: the
+ * virtual PIT keeps generating its 200 interrupts a second whether the guest
+ * takes them or not, and a hypervisor that keeps time by the interrupts it
+ * delivered (VMware's catch-up) may run the machine's apparent time ahead
+ * to make up for the "missed" ones, and every emulated device paced by that
+ * time with it.
+ *
+ * Writing the mode register stops the counter by the datasheet, but some
+ * emulations act on it only once a count is loaded, or at the next
+ * interrupt.  So: mode 0, a count (which stops the interrupt on those), and
+ * mode 0 AGAIN.  That last write is the one that matters everywhere: it
+ * leaves the counter waiting for a count that never comes, with no
+ * countdown running.  Without it, the count just loaded starts one: 65536
+ * counts later (55 ms) the PIT raises IRQ0 once more -- with IRQ0 masked,
+ * an interrupt the guest can never take.
+ *
+ * Stopped first, masked second, so an interrupt raised while the counter
+ * was still running is taken as usual rather than left pending behind the
+ * mask. */
 void timer_stop(void)
 {
+	uint64_t flags;
+
+	__asm__ volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
+	outb(PIT_CMD, 0x30); /* channel 0, lobyte/hibyte, mode 0 */
+	outb(PIT_CHANNEL0_DATA, 0);
+	outb(PIT_CHANNEL0_DATA, 0);
+	outb(PIT_CMD, 0x30); /* mode 0 again: no count, no countdown */
+	__asm__ volatile("push %0; popfq" ::"r"(flags) : "memory");
+
 	irq_disable(0); // Disable IRQ0
 }
 
@@ -1227,6 +1537,7 @@ void timer_irq_handler(int from_user)
 			g_ticks = want_ticks;
 		else
 			g_ticks++;
+		g_tick_irqs++;
 
 		/* Accumulate real wall-clock microseconds from PM Timer deltas.
          * Each delta represents actual elapsed time since last BSP tick,
@@ -1267,8 +1578,7 @@ void timer_irq_handler(int from_user)
 		 * load) are still counted every time; tasks woken by I/O and
 		 * not yet run are still READY and still counted.
 		 *
-		 * The interval is 501 ticks rather than 500 for the same
-		 * reason the reference kernel uses 5*HZ+1: a period that
+		 * The interval is 501 ticks rather than 500: a period that
 		 * shares a factor with other periodic work samples the system
 		 * in lockstep with it, measuring the phase instead of the
 		 * load. */
@@ -1279,6 +1589,8 @@ void timer_irq_handler(int from_user)
 		// Wake any tasks whose sleep timer has expired and check signal timers
 		// This handles alarm(), itimer, and wakes sleeping tasks
 		sched_wake_expired_sleepers(g_ticks);
+		/* The wall clock against the host's, every half minute. */
+		timer_host_time_sync_tick();
 		/* High-resolution timers: the only expiry path without an HPET
 		 * comparator, and the safety net with one. */
 		hrtimer_tick();

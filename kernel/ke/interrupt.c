@@ -482,10 +482,8 @@ void idt_init()
 	idt_set_entry(45, (uint64_t)irq13, 0x08, 0x8E);
 	idt_set_entry(46, (uint64_t)irq14, 0x08, 0x8E);
 	idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
-	idt_set_entry(48, (uint64_t)irq16, 0x08,
-		      0x8E); // MSI: xHCI USB controller 0
-	idt_set_entry(49, (uint64_t)irq17, 0x08,
-		      0x8E); // MSI: xHCI USB controller 1
+	idt_set_entry(48, (uint64_t)irq16, 0x08, 0x8E); // IOAPIC GSI 16
+	idt_set_entry(49, (uint64_t)irq17, 0x08, 0x8E); // IOAPIC GSI 17
 
 	// I2C LPSS interrupt vectors
 	idt_set_entry(50, (uint64_t)irq18, 0x08, 0x8E); // I2C LPSS 0
@@ -2055,11 +2053,11 @@ void irq_handler(uint64_t *regs)
 	// Legacy INTx dispatch for E1000 / e1000e NICs (when MSI is not
 	// available, e.g. VirtualBox).  These MUST be checked BEFORE any
 	// fixed-vector branches below, because the IOAPIC may map the NIC's
-	// PCI INTA pin to a GSI whose vector collides with one we reserve
-	// for an MSI device (e.g. VBox routes 82545EM INTA -> GSI 17 ->
-	// vector 49, which is XHCI_MSI_VECTOR_2).  The level-triggered NIC
-	// line would otherwise be ACK'd by the wrong handler and assert
-	// forever, hanging the system in an IRQ storm.
+	// PCI INTA pin to a GSI whose vector one of the fixed arms below
+	// also answers (e.g. GSI 18..21 -> vectors 50..53, the I2C LPSS
+	// vectors).  The level-triggered NIC line would otherwise be ACK'd by
+	// the wrong handler and assert forever, hanging the system in an IRQ
+	// storm.
 	{
 		extern int g_e1000_initialized;
 		extern int g_e1000_legacy_irq;
@@ -2182,27 +2180,6 @@ void irq_handler(uint64_t *regs)
 		goto exit;
 	}
 
-	// MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
-	// MSI bypasses the PIC entirely; requires LAPIC EOI, not PIC EOI.
-	if (int_no == XHCI_MSI_VECTOR) {
-		extern xhci_controller_t g_xhci;
-		if (g_xhci.initialized && g_xhci.irq_enabled) {
-			xhci_irq_service(&g_xhci);
-		}
-		lapic_eoi();
-		goto exit; // Do NOT send PIC EOI for MSI interrupts
-	}
-
-	// MSI vector for second xHCI USB controller — vector 49.
-	if (int_no == XHCI_MSI_VECTOR_2) {
-		extern xhci_controller_t g_xhci_hid;
-		if (g_xhci_hid.initialized && g_xhci_hid.irq_enabled) {
-			xhci_irq_service(&g_xhci_hid);
-		}
-		lapic_eoi();
-		goto exit;
-	}
-
 	// (Legacy NIC dispatch was moved above — see top of irq_handler.)
 
 	// MSI/IOAPIC vectors for I2C LPSS controllers (vectors 50-53)
@@ -2281,9 +2258,14 @@ void irq_handler(uint64_t *regs)
 	switch (int_no) {
 	case 32: {
 		g_irq0_count++;
-
-		timer_irq_handler((regs[REGS_CS] & 3) == 3);
-		net_timer_tick();
+		/* In one-shot mode the local timer carries this CPU's
+		 * high-resolution timers too: those run here, the timer is
+		 * re-armed for the next event, and the tick's own work is
+		 * done only when its boundary has come. */
+		if (lapic_timer_interrupt()) {
+			timer_irq_handler((regs[REGS_CS] & 3) == 3);
+			net_timer_tick();
+		}
 		// Send EOI before preemption to avoid missing ticks
 		pic_send_eoi(irq);
 

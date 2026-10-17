@@ -110,14 +110,10 @@ int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 				uint64_t deadline_ns =
 					(uint64_t)ts.tv_sec * 1000000000ULL +
 					(uint64_t)ts.tv_nsec;
-				uint64_t now_ns =
-					timer_get_precise_us() * 1000ULL;
+				uint64_t now_ns = timer_get_precise_ns();
 
 				if (abs_realtime)
-					now_ns +=
-						(uint64_t)
-							timer_get_boot_epoch() *
-						1000000000ULL;
+					now_ns += timer_realtime_offset_ns(now_ns);
 
 				/* Absolute -> relative, which is what
 				 * futex_wait takes.  An already-past deadline

@@ -138,12 +138,34 @@ void lapic_timer_calibrate(void);
 void lapic_delay_us(uint32_t us);
 void lapic_delay_ms(uint32_t ms);
 
-// Start LAPIC timer in periodic mode
-// frequency: desired interrupt frequency in Hz
+// Start this CPU's tick at `frequency' Hz (one-shot, see lapic.c; periodic
+// only when the TSC frequency is unknown)
 void lapic_timer_start(uint32_t frequency);
 
 // Stop LAPIC timer
 void lapic_timer_stop(void);
+
+/* The local timer's interrupt in one-shot mode (TSC deadline on a
+ * hypervisor, the count-down timer elsewhere): runs this CPU's expired
+ * high-resolution timers, re-arms for the next event, and returns 1 when
+ * the tick is due.  Always 1 in the periodic fallback. */
+int lapic_timer_interrupt(void);
+
+/* Arm this CPU's local timer for the earlier of its next tick and the
+ * given high-resolution deadline (0: none).  Interrupts off. */
+void lapic_clockevent_program(uint64_t hrtimer_next_ns);
+
+/* Is `cpu''s local timer running one-shot (high-resolution timers go to
+ * its own queue)? */
+bool lapic_clockevent_ready(uint32_t cpu);
+
+/* The host's wall clock in us since the epoch (UTC) via the VMware
+ * backdoor, 0 if unavailable. */
+uint64_t lapic_host_time_us(void);
+
+/* Have the hypervisor drop any backlog of timer interrupts it holds against
+ * the guest (after the clock was set). */
+void lapic_host_stop_catchup(void);
 
 // Get LAPIC timer ticks per second (after calibration)
 uint64_t lapic_timer_get_frequency(void);

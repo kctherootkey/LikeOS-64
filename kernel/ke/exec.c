@@ -272,6 +272,12 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			 * gained privilege they would be a window into a
 			 * program the tracer is no longer entitled to watch. */
 			task_debugreg_clear(cur);
+			/* The same for the floating-point state: the new image
+			 * starts with the default control words and MXCSR and
+			 * clean registers, not with whatever the old one left
+			 * in them -- a rounding mode, flushed denormals, an
+			 * unmasked exception, dirty AVX upper halves. */
+			task_fpu_reset_current();
 			cur->syscall_rip = entry_point;
 			cur->syscall_rsp = new_stack_ptr;
 			cur->syscall_rflags = new_rflags;

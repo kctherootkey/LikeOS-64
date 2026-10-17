@@ -334,7 +334,17 @@ typedef struct {
 		boot_epoch; // Unix epoch seconds at boot (from UEFI GetTime before ExitBootServices)
 	uint64_t
 		direct_map_bytes; // Bytes of physical RAM covered by the PML4[272] direct map (0 = legacy bootloader, assume 16 GB)
+	uint64_t smbios_magic; // BOOT_SMBIOS_MAGIC when the two fields below are valid
+	uint64_t smbios_address; // SMBIOS 2.x entry point ("_SM_") from UEFI, 0 = none
+	uint64_t smbios3_address; // SMBIOS 3.x entry point ("_SM3_") from UEFI, 0 = none
 } boot_info_t;
+
+#define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
+
+// The SMBIOS entry points the bootloader found (0 = none or an older
+// bootloader); saved by kernel_main before the identity map goes away.
+extern uint64_t g_boot_smbios_entry;
+extern uint64_t g_boot_smbios3_entry;
 
 // Memory regions
 typedef struct {

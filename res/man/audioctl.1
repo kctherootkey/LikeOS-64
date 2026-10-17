@@ -1,0 +1,176 @@
+AUDIOCTL(1)                     User Commands                      AUDIOCTL(1)
+
+NAME
+       audioctl - control the volume, outputs and streams of the audio service
+
+SYNOPSIS
+       audioctl [-q] [--json] [status]
+       audioctl [-q] [--json] volume [N|+N|-N|N%|L,R|up|down|max|min]
+       audioctl [-q] [--json] mute | unmute | toggle
+       audioctl [-q] [--json] output [auto|all|TYPE|ID|NAME]
+       audioctl [--json] outputs | streams | cards | info
+       audioctl [-q] [--json] stream-volume ID N[,R]
+       audioctl [-q] kill ID...
+       audioctl [-q] card N
+       audioctl [--json] watch [COUNT]
+
+DESCRIPTION
+       audioctl talks to the audio service, audiod(1), which mixes  the  sound
+       of every program and drives the sound card. With it the  master  volume
+       and mute are set,  the  output  is  chosen  --  the  built-in  speaker,
+       headphones, a line output or an HDMI or DisplayPort monitor -- and  the
+       streams that are playing now are listed, made  louder  or  quieter,  or
+       ended.
+
+       It never opens the sound device itself.  Everything  goes  through  the
+       service's socket, which every local user may use, so audioctl needs  no
+       privilege; the service decides what a request may change. Any user  may
+       set the master volume, the mute and the output. A stream may be changed
+       or ended by the user who opened it and by root. Only  root  may  switch
+       the service to another sound card.
+
+       When the volume, the mute or the output  changes,  audioctl  plays  the
+       short system sound "volume" so the new level can be heard at  once.  -q
+       suppresses it.
+
+       Without a command audioctl prints a summary: the card  and  codec,  the
+       format the mixer runs in, the master volume and mute, the outputs  with
+       their jack state and the streams.
+
+COMMANDS
+       status
+              The summary described above. This is the default.
+
+       volume [VALUE]
+              Without VALUE, print the master volume. Otherwise set it.  VALUE
+              is a number 0..100 (a trailing % is allowed), +N or -N to change
+              it relative to the current level, L,R (or L:R) to  set  the  two
+              sides apart, up or down for a step of 5, and max or min for  100
+              and 0. A relative change moves both sides by the same amount, so
+              a balance set with L,R is kept until one side reaches an end.
+
+              Turning the volume up while the output is muted also unmutes it.
+
+       mute, unmute, toggle
+              Mute or unmute the master output, or flip the current state. The
+              volume setting is kept while muted.
+
+       output [CHOICE]
+              Without CHOICE, print  the  output  mode  and  which  output  is
+              active. Otherwise choose where sound goes:
+
+              auto -- the headphones while something  is  plugged  into  their
+              jack, the speaker  otherwise.  This  is  the  default,  and  the
+              service follows the jack by itself.
+
+              all -- every output that is present at once.
+
+              speaker, headphone, line, hdmi, dp, spdif, headset -- the  first
+              output of that kind that has  something  plugged  in,  else  the
+              first of that kind. hdmi also takes a DisplayPort  monitor  when
+              there is no HDMI one, since both are  simply  "the  monitor"  to
+              most people.
+
+              An output ID or NAME as listed by audioctl outputs, for  example
+              2 or "HDMI 1".
+
+              Choosing an output with nothing plugged in is  allowed,  with  a
+              warning: the jack may not report a device that is there.
+
+       outputs
+              List the outputs: an asterisk marks the active  ones;  then  the
+              id, the name, the kind, whether something is plugged in  ("built
+              in" for a speaker) and, for HDMI and DisplayPort, the  monitor's
+              own name when the monitor reported one.
+
+       streams
+              List the streams playing now:  their  id,  role  (music,  video,
+              game,  event,  phone,  web,  other),  state  (playing,   paused,
+              draining, underrun), format, volume, how long they have  played,
+              their name, the program that opened them, its user  and  process
+              id.
+
+       stream-volume ID N[,R]
+              Set the volume of one stream, 0..100, with  the  same  forms  as
+              volume (+N and -N are relative to the stream's current  volume).
+              The stream keeps playing; only its share of the mix changes.
+
+       kill ID...
+              End one or more streams. The program that owned the stream  sees
+              its connection closed.
+
+       cards  List the sound cards the service knows. An  asterisk  marks  the
+              one in use.
+
+       card [N]
+              Without N, print the card in use. With N, make the service drive
+              card N instead. Only root may do this: it changes the  sound  of
+              every user.
+
+       info   Everything the service reports about itself:  protocol  version,
+              uptime, the number of streams, the  device  underruns  since  it
+              started, the rate, channel count and format the mixer  runs  at,
+              the period size and count of the device buffer and  the  latency
+              they make, and the card in use.
+
+       watch [COUNT]
+              Subscribe to the service's change notifications and  print  each
+              as it arrives, with the time: volume and  mute  changes,  output
+              changes (also those the jack causes),  streams  that  start  and
+              end,  and  cards  that  come   and   go.   Stops   after   COUNT
+              notifications, on Ctrl-C, or when the service  goes  away  (exit
+              status 1).
+
+OPTIONS
+       Options go before the command; everything after the command belongs  to
+       it, so that audioctl volume -5 means "5 quieter".
+
+       -q, --quiet
+              Print nothing on success and play no feedback sound. Errors  are
+              still reported.
+
+       -j, --json
+              Print the result as one line of JSON instead of text: an  object
+              for status, volume, output and info, an array  for  streams  and
+              cards, and one object per line for watch. Strings  are  escaped;
+              names come from other programs  and  are  never  trusted  to  be
+              printable. Text output replaces control characters in names with
+              ?.
+
+       -h, --help
+              Print a summary of the commands.
+
+       -V, --version
+              Print the version of the library and protocol.
+
+EXAMPLES
+       audioctl volume 40          set the master volume to 40%
+       audioctl volume +10         ten louder
+       audioctl -q volume down     quieter by 5, silently (for key bindings)
+       audioctl toggle             mute or unmute
+       audioctl output hdmi        sound to the monitor
+       audioctl output auto        back to following the headphone jack
+       audioctl streams            what is playing
+       audioctl stream-volume 12 30
+
+EXIT STATUS
+       0      Success.
+
+       1      The service could not  be  reached,  refused  the  request  (for
+              example a stream that belongs to another user, or a card  change
+              by a user other than root), or the stream, output or  card  does
+              not exist.
+
+       2      A bad command or argument.
+
+FILES
+       /var/run/audiod/socket
+              The service's socket.
+
+       /usr/share/sounds/likeos/volume.wav
+              The feedback sound.
+
+SEE ALSO
+       audiod(1), audioplay(1), audiotest(1), audioinfo(1), eventsound(1)
+
+LikeOS                        October 2026                         AUDIOCTL(1)

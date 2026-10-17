@@ -1,0 +1,716 @@
+Unicode window titles: Xft font fallback, and a UTF-8 character type.
+
+A window titled in Greek or Cyrillic -- luakit on a Greek page, the media
+player playing a file with a Greek name -- showed only its spaces, digits and
+punctuation in the title bar, the window list and the icon manager.
+
+The title itself arrived intact: ctwm reads _NET_WM_NAME (UTF8_STRING) first,
+converts it with XmbTextPropertyToTextList in the UTF-8 locale the session runs
+in, and hands the UTF-8 string to Xft (patch 0003).  What dropped the
+characters is the font.  An XftFont is ONE face, and Xft draws a character the
+face has no glyph for with that face's .notdef.  The configured font, Selawik,
+covers Latin only, and its .notdef is blank -- so every Greek and Cyrillic
+letter was drawn as an empty advance.  Inside the application the same title
+was complete, because Pango takes each character from the first font in
+fontconfig's list that has it.
+
+1. Font fallback for "xft:" fonts (util.c).  Text is laid out a character at a
+   time: from the configured font when it has the glyph, otherwise from the
+   first font in fontconfig's sorted list for the same pattern (FcFontSort,
+   prepared as XftFontMatch prepares its match) whose coverage includes it.
+   Fallback fonts are opened on first use and kept with the MyFont until it
+   is reloaded.  The result is drawn with XftDrawCharFontSpec, and measured
+   the same way, so widths, ellipsis and centring agree with what is drawn.
+   The MyFont's metrics stay those of the configured font.  A byte that does
+   not start a valid UTF-8 sequence is skipped instead of ending the string
+   (Xft stops there), so a name cut inside a character loses one character.
+   win_fluent.c measures and draws its title through the same layout.
+
+2. The fontset redirections are object-like macros, and XmbDrawImageString is
+   redirected too (ctwm.h).  ctwm names XmbDrawString without calling it, in
+   "(cond ? XmbDrawImageString : XmbDrawString)(...)" (icon manager, classic
+   title bars); a function-like macro does not expand there, so that text
+   went to the core "fixed" fontset with the Xft font's metrics.
+   XmbDrawImageString -- the size and position window, some menu modes -- was
+   not redirected at all.  ctwm_XmbDrawImageString fills the logical
+   rectangle with the GC's background and draws through Xft.
+
+3. A UTF-8 character type whatever LANG says (ctwm_main.c, __LIKEOS__).  The
+   C library's one encoding is UTF-8 whatever the locale is called, but Xlib
+   chooses its converters by the locale NAME, and under "C" or "POSIX" (LANG
+   unset) it converts titles to ISO 8859-1: every character outside it is
+   dropped, and the Latin-1 bytes it keeps are not UTF-8 for Xft.  When
+   LC_CTYPE does not name UTF-8, or Xlib does not support it, ctwm sets
+   LC_CTYPE to "C.UTF-8" (Xlib's locale.alias maps it to en_US.UTF-8).
+
+fontconfig is now linked directly (CMakeLists.txt).
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -Nur a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -90,6 +90,14 @@
+ include_directories(${X11_Xft_INCLUDE_PATH} ${FREETYPE2_INCLUDE_DIR})
+ list(APPEND CTWMLIBS ${X11_Xft_LIB} m)
+ 
++# fontconfig, called directly for Xft font fallback (util.c): the fonts
++# that draw the characters an "xft:" font has no glyph for.
++find_library(FONTCONFIG_LIB fontconfig)
++if(NOT FONTCONFIG_LIB)
++	message(FATAL_ERROR "Can't find libfontconfig")
++endif()
++list(APPEND CTWMLIBS ${FONTCONFIG_LIB})
++
+ 
+ #
+ # Setup some search paths
+diff -Nur a/ctwm.h b/ctwm.h
+--- a/ctwm.h
++++ b/ctwm.h
+@@ -434,13 +434,34 @@
+                         XRectangle *ink, XRectangle *logical);
+ void ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
+                         int x, int y, const char *text, int len);
++void ctwm_XmbDrawImageString(Display *d, Drawable w, XFontSet fs, GC gc,
++                             int x, int y, const char *text, int len);
++/*
++ * Object-like, not function-like: ctwm also names these functions without
++ * calling them -- "(cond ? XmbDrawImageString : XmbDrawString)(...)" in the
++ * icon manager and the classic title bar -- and a function-like macro does
++ * not expand there, which sent that text to the core fontset.
++ * XmbDrawImageString is used by the size and position window and by menus.
++ */
+ #ifndef CTWM_NO_XFT_REDIRECT
+-#define XmbTextExtents(fs, t, n, i, l) ctwm_XmbTextExtents(fs, t, n, i, l)
+-#define XmbDrawString(d, w, fs, gc, x, y, t, n) \
+-	ctwm_XmbDrawString(d, w, fs, gc, x, y, t, n)
++#define XmbTextExtents ctwm_XmbTextExtents
++#define XmbDrawString ctwm_XmbDrawString
++#define XmbDrawImageString ctwm_XmbDrawImageString
+ #endif
+ 
+ /*
++ * For code that draws with an Xft font directly (win_fluent.c): width and
++ * drawing of UTF-8 text with the font's fallbacks for the characters it has
++ * no glyph for, exactly as the calls above lay it out.
++ */
++struct _XftDraw;
++struct _XftColor;
++int ctwm_XftTextWidth(const MyFont *font, const char *text, int len);
++void ctwm_XftDrawText(struct _XftDraw *draw, const struct _XftColor *color,
++                      const MyFont *font, int x, int y, const char *text,
++                      int len);
++
++/*
+  * Window operations, routed through win_fluent.c so that a frame's resize
+  * border (FluentTitles; see win_fluent.h) follows the frame wherever ctwm
+  * moves, sizes, stacks, shows, hides or reparents it.  For every window that
+diff -Nur a/ctwm_main.c b/ctwm_main.c
+--- a/ctwm_main.c
++++ b/ctwm_main.c
+@@ -25,6 +25,7 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <locale.h>
++#include <strings.h>
+ 
+ #include <fcntl.h>
+ #include <X11/Xatom.h>
+@@ -175,6 +176,32 @@
+ 	bool nodpyok = false;
+ 
+ 	setlocale(LC_ALL, "");
++#ifdef __LIKEOS__
++	/*
++	 * Window titles reach ctwm converted to the locale's multibyte
++	 * encoding (XmbTextPropertyToTextList), and ctwm takes that text to be
++	 * UTF-8 from there on: Xft draws it as UTF-8 and _NET_WM_VISIBLE_NAME
++	 * publishes it as UTF8_STRING.  The C library's one encoding is UTF-8
++	 * whatever the locale is called, but Xlib picks its converters by the
++	 * locale NAME: under "C" or "POSIX" -- LANG unset -- it converts every
++	 * title to ISO 8859-1, which drops each character outside it (all of
++	 * Greek and Cyrillic) and hands Xft bytes that are not UTF-8.  So the
++	 * character type is always one Xlib knows as UTF-8; the other
++	 * categories keep what the environment asked for.
++	 */
++	{
++		const char *ctype = setlocale(LC_CTYPE, NULL);
++		bool utf8 = false;
++
++		for(const char *p = ctype; p && *p && !utf8; p++) {
++			utf8 = strncasecmp(p, "UTF-8", 5) == 0
++			       || strncasecmp(p, "UTF8", 4) == 0;
++		}
++		if(!utf8 || !XSupportsLocale()) {
++			setlocale(LC_CTYPE, "C.UTF-8");
++		}
++	}
++#endif
+ 
+ 	ProgramName = argv[0];
+ 	ProgramNameLen = strlen(ProgramName);
+diff -Nur a/util.c b/util.c
+--- a/util.c
++++ b/util.c
+@@ -60,6 +60,7 @@
+  * of ctwm.h), so it needs the real Xlib functions. */
+ #undef XmbTextExtents
+ #undef XmbDrawString
++#undef XmbDrawImageString
+ 
+ 
+ /* Handle for debug tracing */
+@@ -315,6 +316,7 @@
+ 
+ 
+ static void xft_register(MyFont *font);
++static void xft_fallback_forget(MyFont *font);
+ 
+ /**
+  * Load up fontsets from the X server.  Only used by CreateFonts() below.
+@@ -347,6 +349,7 @@
+ 		XFreeFontSet(dpy, font->font_set);
+ 	}
+ 	if(font->xft != NULL) {
++		xft_fallback_forget(font);
+ 		XftFontClose(dpy, font->xft);
+ 		font->xft = NULL;
+ 	}
+@@ -420,6 +423,35 @@
+ #define XFT_FONTS_MAX 16
+ static MyFont *xft_fonts[XFT_FONTS_MAX];
+ 
++/*
++ * Font fallback: the fonts that draw the characters an Xft font has no glyph
++ * for.
++ *
++ * An XftFont is a single face, and Xft draws a character that face lacks
++ * with the face's .notdef glyph.  Selawik, the desktop's interface font,
++ * covers Latin only and its .notdef is blank, so a window titled in Greek or
++ * Cyrillic showed its spaces and punctuation and nothing else -- while the
++ * same title inside the application, set by Pango, was complete, because a
++ * toolkit takes each character from the first font in fontconfig's list for
++ * the request that has it.  ctwm now does the same: fontconfig sorts every
++ * font against the configured pattern (FcFontSort, so the families named in
++ * it come first and the configuration's generic fallbacks after them), and a
++ * character the primary font lacks is drawn from the first font in that
++ * order whose coverage has it.  Fonts are opened when a character first
++ * needs them, and kept with the MyFont they serve until it is reloaded.
++ *
++ * One entry per registered MyFont, at the same index as in xft_fonts[].
++ */
++struct xft_fallback {
++	XftFont *primary;       /* the font the list below was made for */
++	bool built;             /* the list was made (successfully or not) */
++	FcPattern *pattern;     /* the request, substituted as for its match */
++	FcFontSet *set;         /* every candidate, most preferred first */
++	XftFont **open;         /* set->nfont fonts, opened on first use */
++	char *tried;            /* set->nfont flags: opening was attempted */
++};
++static struct xft_fallback xft_fallbacks[XFT_FONTS_MAX];
++
+ static void
+ xft_register(MyFont *font)
+ {
+@@ -438,98 +470,396 @@
+ 	}
+ }
+ 
+-static XftFont *
+-xft_for(XFontSet fs)
++/* The registry index of the MyFont behind a fontset, or -1. */
++static int
++xft_slot(XFontSet fs)
+ {
+ 	if(fs == NULL) {
+-		return NULL;
++		return -1;
++	}
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
++		if(xft_fonts[i] && xft_fonts[i]->font_set == fs
++		                && xft_fonts[i]->xft != NULL) {
++			return i;
++		}
+ 	}
++	return -1;
++}
++
++/* The same for a MyFont, which may be a copy of the registered one. */
++static int
++xft_slot_font(const MyFont *font)
++{
+ 	for(int i = 0; i < XFT_FONTS_MAX; i++) {
+-		if(xft_fonts[i] && xft_fonts[i]->font_set == fs) {
+-			return xft_fonts[i]->xft;
++		if(xft_fonts[i] == font && font->xft != NULL) {
++			return i;
++		}
++	}
++	return xft_slot(font->font_set);
++}
++
++static void
++xft_fallback_drop(struct xft_fallback *fb)
++{
++	if(fb->set) {
++		for(int i = 0; i < fb->set->nfont; i++) {
++			if(fb->open && fb->open[i]) {
++				XftFontClose(dpy, fb->open[i]);
++			}
++		}
++		FcFontSetDestroy(fb->set);
++	}
++	if(fb->pattern) {
++		FcPatternDestroy(fb->pattern);
++	}
++	free(fb->open);
++	free(fb->tried);
++	memset(fb, 0, sizeof(*fb));
++}
++
++/* Called before a MyFont's Xft font is closed (GetFont reloads it). */
++static void
++xft_fallback_forget(MyFont *font)
++{
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
++		if(xft_fonts[i] == font) {
++			xft_fallback_drop(&xft_fallbacks[i]);
++		}
++	}
++}
++
++/*
++ * Sort the fonts for `name' (the pattern after "xft:") the way XftFontMatch
++ * would match it: the configuration's pattern substitutions, then Xft's
++ * defaults (size in pixels from the screen's resolution, rendering options).
++ * Trimmed, so a font that adds no coverage to those before it is left out.
++ */
++static void
++xft_fallback_build(struct xft_fallback *fb, const char *name)
++{
++	FcPattern *pat;
++	FcResult res;
++
++	pat = FcNameParse((const FcChar8 *)name);
++	if(pat == NULL) {
++		return;
++	}
++	FcConfigSubstitute(NULL, pat, FcMatchPattern);
++	XftDefaultSubstitute(dpy, Scr->screen, pat);
++	fb->set = FcFontSort(NULL, pat, FcTrue, NULL, &res);
++	if(fb->set == NULL || fb->set->nfont == 0) {
++		FcPatternDestroy(pat);
++		xft_fallback_drop(fb);
++		return;
++	}
++	fb->pattern = pat;
++	fb->open = calloc(fb->set->nfont, sizeof(XftFont *));
++	fb->tried = calloc(fb->set->nfont, 1);
++	if(fb->open == NULL || fb->tried == NULL) {
++		xft_fallback_drop(fb);
++	}
++}
++
++/*
++ * The font to draw `ucs4' with: the slot's own font when it has the glyph,
++ * otherwise the first font in the sorted list that does.  A character no
++ * font has stays with the primary font, which draws its .notdef.
++ */
++static XftFont *
++xft_font_for_char(int slot, FcChar32 ucs4)
++{
++	MyFont *mf = xft_fonts[slot];
++	struct xft_fallback *fb = &xft_fallbacks[slot];
++	XftFont *xf = mf->xft;
++
++	if(XftCharExists(dpy, xf, ucs4)) {
++		return xf;
++	}
++	if(fb->primary != xf) {
++		xft_fallback_drop(fb);
++		fb->primary = xf;
++	}
++	if(!fb->built) {
++		fb->built = true;
++		xft_fallback_build(fb, mf->basename + 4);
++	}
++	if(fb->set == NULL) {
++		return xf;
++	}
++	for(int i = 0; i < fb->set->nfont; i++) {
++		FcCharSet *cs;
++
++		if(FcPatternGetCharSet(fb->set->fonts[i], FC_CHARSET, 0, &cs)
++		                != FcResultMatch || !FcCharSetHasChar(cs, ucs4)) {
++			continue;
++		}
++		if(!fb->tried[i]) {
++			FcPattern *p = FcFontRenderPrepare(NULL, fb->pattern,
++			                                   fb->set->fonts[i]);
++
++			fb->tried[i] = 1;
++			if(p != NULL) {
++				/* On success the font owns the pattern. */
++				fb->open[i] = XftFontOpenPattern(dpy, p);
++				if(fb->open[i] == NULL) {
++					FcPatternDestroy(p);
++				}
++			}
++		}
++		if(fb->open[i] != NULL) {
++			return fb->open[i];
+ 		}
+ 	}
+-	return NULL;
++	return xf;
++}
++
++/*
++ * Lay out `len' bytes of UTF-8 for the slot's font: each character with the
++ * font that has its glyph, on one baseline, from (x, y).  Fills `specs'
++ * (room for `len' entries) when it is not NULL and `*nspecs' with their
++ * number; returns the advance, and the union of the glyphs' ink, relative
++ * to the origin, in `ink' when that is not NULL.  A byte that does not
++ * start a valid UTF-8 sequence is skipped -- a name cut short in the middle
++ * of a character loses that character, not the rest of the string.
++ */
++static int
++xft_layout(int slot, const char *text, int len, int x, int y,
++           XftCharFontSpec *specs, int *nspecs, XRectangle *ink)
++{
++	const FcChar8 *s = (const FcChar8 *)text;
++	int pen = 0, n = 0;
++	int ix0 = 0, iy0 = 0, ix1 = 0, iy1 = 0;
++	bool have_ink = false;
++
++	while(len > 0) {
++		FcChar32 ucs4;
++		XGlyphInfo gi;
++		XftFont *f;
++		int used = FcUtf8ToUcs4(s, &ucs4, len);
++
++		if(used <= 0) {
++			s++;
++			len--;
++			continue;
++		}
++		s += used;
++		len -= used;
++
++		f = xft_font_for_char(slot, ucs4);
++		XftTextExtents32(dpy, f, &ucs4, 1, &gi);
++		if(specs) {
++			specs[n].font = f;
++			specs[n].ucs4 = ucs4;
++			specs[n].x = (short)(x + pen);
++			specs[n].y = (short)y;
++		}
++		n++;
++		if(gi.width > 0 && gi.height > 0) {
++			int gx0 = pen - gi.x, gy0 = -gi.y;
++			int gx1 = gx0 + gi.width, gy1 = gy0 + gi.height;
++
++			if(!have_ink) {
++				ix0 = gx0;
++				iy0 = gy0;
++				ix1 = gx1;
++				iy1 = gy1;
++				have_ink = true;
++			}
++			else {
++				ix0 = MinSize(ix0, gx0);
++				iy0 = MinSize(iy0, gy0);
++				ix1 = MaxSize(ix1, gx1);
++				iy1 = MaxSize(iy1, gy1);
++			}
++		}
++		pen += gi.xOff;
++	}
++	if(nspecs) {
++		*nspecs = n;
++	}
++	if(ink) {
++		ink->x = ix0;
++		ink->y = iy0;
++		ink->width = ix1 - ix0;
++		ink->height = iy1 - iy0;
++	}
++	return pen;
++}
++
++/* Draw UTF-8 text with the slot's font and its fallbacks. */
++static void
++xft_draw(int slot, XftDraw *draw, const XftColor *color, int x, int y,
++         const char *text, int len)
++{
++	XftCharFontSpec local[128];
++	XftCharFontSpec *specs = local;
++	int n;
++
++	if(len <= 0) {
++		return;
++	}
++	if(len > (int)(sizeof(local) / sizeof(local[0]))) {
++		specs = malloc(len * sizeof(*specs));
++		if(specs == NULL) {
++			return;
++		}
++	}
++	xft_layout(slot, text, len, x, y, specs, &n, NULL);
++	if(n > 0) {
++		XftDrawCharFontSpec(draw, color, specs, n);
++	}
++	if(specs != local) {
++		free(specs);
++	}
+ }
+ 
+ int
+ ctwm_XmbTextExtents(XFontSet fs, const char *text, int len,
+                     XRectangle *ink, XRectangle *logical)
+ {
+-	XftFont *xf = xft_for(fs);
+-	XGlyphInfo gi;
++	int slot = xft_slot(fs);
++	XftFont *xf;
++	int width;
+ 
+-	if(xf == NULL) {
++	if(slot < 0) {
+ 		return XmbTextExtents(fs, text, len, ink, logical);
+ 	}
+-	XftTextExtentsUtf8(dpy, xf, (const FcChar8 *)text, len, &gi);
+-	if(ink) {
+-		ink->x = -gi.x;
+-		ink->y = -gi.y;
+-		ink->width = gi.width;
+-		ink->height = gi.height;
+-	}
++	xf = xft_fonts[slot]->xft;
++	width = xft_layout(slot, text, len, 0, 0, NULL, NULL, ink);
+ 	if(logical) {
+ 		logical->x = 0;
+ 		logical->y = -xf->ascent;
+-		logical->width = gi.xOff;
++		logical->width = width;
+ 		logical->height = xf->ascent + xf->descent;
+ 	}
+-	return gi.xOff;
++	return width;
++}
++
++/*
++ * An XftColor for a pixel.  The last one is kept, since a run of draws
++ * usually shares a colour.
++ */
++static XftColor *
++xft_color_for(Display *d, Pixel pixel)
++{
++	static Pixel last_pixel;
++	static XftColor last_color;
++	static bool have_color = false;
++	XColor xc;
++	XRenderColor rc;
++
++	if(have_color && pixel == last_pixel) {
++		return &last_color;
++	}
++	xc.pixel = pixel;
++	XQueryColor(d, DefaultColormap(d, Scr->screen), &xc);
++	rc.red = xc.red;
++	rc.green = xc.green;
++	rc.blue = xc.blue;
++	rc.alpha = 0xffff;
++	if(have_color) {
++		XftColorFree(d, Scr->d_visual, DefaultColormap(d, Scr->screen),
++		             &last_color);
++	}
++	have_color = XftColorAllocValue(d, Scr->d_visual,
++	                                DefaultColormap(d, Scr->screen),
++	                                &rc, &last_color);
++	last_pixel = pixel;
++	return have_color ? &last_color : NULL;
+ }
+ 
+ /*
+  * The colour comes from the GC's foreground, which is how every caller sets
+- * it; the last pixel is cached, since a run of draws usually shares one.
++ * it.
+  */
+ void
+ ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
+                    int x, int y, const char *text, int len)
+ {
+-	static Pixel last_pixel;
+-	static XftColor last_color;
+-	static bool have_color = false;
+-	XftFont *xf = xft_for(fs);
++	int slot = xft_slot(fs);
+ 	XGCValues gv;
++	XftColor *color;
+ 	XftDraw *draw;
+ 
+-	if(xf == NULL) {
++	if(slot < 0) {
+ 		XmbDrawString(d, w, fs, gc, x, y, text, len);
+ 		return;
+ 	}
+ 
+ 	XGetGCValues(d, gc, GCForeground, &gv);
+-	if(!have_color || gv.foreground != last_pixel) {
+-		XColor xc;
+-		XRenderColor rc;
+-
+-		xc.pixel = gv.foreground;
+-		XQueryColor(d, DefaultColormap(d, Scr->screen), &xc);
+-		rc.red = xc.red;
+-		rc.green = xc.green;
+-		rc.blue = xc.blue;
+-		rc.alpha = 0xffff;
+-		if(have_color) {
+-			XftColorFree(d, Scr->d_visual, DefaultColormap(d, Scr->screen),
+-			             &last_color);
+-		}
+-		have_color = XftColorAllocValue(d, Scr->d_visual,
+-		                                DefaultColormap(d, Scr->screen),
+-		                                &rc, &last_color);
+-		last_pixel = gv.foreground;
+-		if(!have_color) {
+-			return;
+-		}
++	color = xft_color_for(d, gv.foreground);
++	if(color == NULL) {
++		return;
+ 	}
+-
+ 	draw = XftDrawCreate(d, w, Scr->d_visual, DefaultColormap(d, Scr->screen));
+ 	if(draw) {
+-		XftDrawStringUtf8(draw, &last_color, xf, x, y, (const FcChar8 *)text,
+-		                  len);
++		xft_draw(slot, draw, color, x, y, text, len);
+ 		XftDrawDestroy(draw);
+ 	}
+ }
+ 
++/*
++ * XmbDrawImageString: the text's logical rectangle filled with the GC's
++ * background, then the text in its foreground.  The size and position
++ * window draws this way, and so do menus in some modes.
++ */
++void
++ctwm_XmbDrawImageString(Display *d, Drawable w, XFontSet fs, GC gc,
++                        int x, int y, const char *text, int len)
++{
++	XRectangle logical;
++	XGCValues gv;
++
++	if(xft_slot(fs) < 0) {
++		XmbDrawImageString(d, w, fs, gc, x, y, text, len);
++		return;
++	}
++	ctwm_XmbTextExtents(fs, text, len, NULL, &logical);
++	XGetGCValues(d, gc, GCForeground | GCBackground, &gv);
++	XSetForeground(d, gc, gv.background);
++	XFillRectangle(d, w, gc, x + logical.x, y + logical.y,
++	               logical.width, logical.height);
++	XSetForeground(d, gc, gv.foreground);
++	ctwm_XmbDrawString(d, w, fs, gc, x, y, text, len);
++}
++
++/*
++ * For code that draws with a MyFont's Xft font itself (win_fluent.c): the
++ * same layout, fallback fonts included, as the fontset calls above.
++ */
++int
++ctwm_XftTextWidth(const MyFont *font, const char *text, int len)
++{
++	int slot = xft_slot_font(font);
++
++	if(slot < 0) {
++		XGlyphInfo gi;
++
++		if(font->xft == NULL) {
++			return 0;
++		}
++		XftTextExtentsUtf8(dpy, font->xft, (const FcChar8 *)text, len, &gi);
++		return gi.xOff;
++	}
++	return xft_layout(slot, text, len, 0, 0, NULL, NULL, NULL);
++}
++
++void
++ctwm_XftDrawText(XftDraw *draw, const XftColor *color, const MyFont *font,
++                 int x, int y, const char *text, int len)
++{
++	int slot = xft_slot_font(font);
++
++	if(slot < 0) {
++		if(font->xft != NULL) {
++			XftDrawStringUtf8(draw, color, font->xft, x, y,
++			                  (const FcChar8 *)text, len);
++		}
++		return;
++	}
++	xft_draw(slot, draw, color, x, y, text, len);
++}
++
+ 
+ /**
+  * Load up our various defined fonts
+diff -Nur a/win_fluent.c b/win_fluent.c
+--- a/win_fluent.c
++++ b/win_fluent.c
+@@ -478,16 +478,18 @@
+ /* Title bar                                                                */
+ /* ------------------------------------------------------------------------ */
+ 
+-/* Shorten `s' (UTF-8) so that it and an ellipsis fit in `avail' pixels. */
++/*
++ * Shorten `s' (UTF-8) so that it and an ellipsis fit in `avail' pixels.
++ * Measured as it is drawn: with the font's fallbacks for characters it has
++ * no glyph for (ctwm_XftTextWidth, util.c).
++ */
+ static char *
+-fl_fit(XftFont *font, const char *s, int avail)
++fl_fit(const MyFont *font, const char *s, int avail)
+ {
+-	XGlyphInfo gi;
+ 	size_t len = strlen(s);
+ 	char *out;
+ 
+-	XftTextExtentsUtf8(dpy, font, (const FcChar8 *)s, (int)len, &gi);
+-	if(gi.xOff <= avail) {
++	if(ctwm_XftTextWidth(font, s, (int)len) <= avail) {
+ 		return strdup(s);
+ 	}
+ 	out = malloc(len + 4);
+@@ -502,8 +504,7 @@
+ 		while(len > 0 && ((unsigned char)s[len] & 0xc0) == 0x80);
+ 		memcpy(out, s, len);
+ 		memcpy(out + len, "\xe2\x80\xa6", 4);
+-		XftTextExtentsUtf8(dpy, font, (const FcChar8 *)out, (int)len + 3, &gi);
+-		if(gi.xOff <= avail) {
++		if(ctwm_XftTextWidth(font, out, (int)len + 3) <= avail) {
+ 			return out;
+ 		}
+ 	}
+@@ -587,7 +588,7 @@
+ 			.alpha = 0xffff,
+ 		};
+ 		XftColor col;
+-		char *text = fl_fit(font->xft, tmp_win->name, avail);
++		char *text = fl_fit(font, tmp_win->name, avail);
+ 
+ 		if(d && text && XftColorAllocValue(dpy, Scr->d_visual,
+ 		                                   DefaultColormap(dpy, Scr->screen),
+@@ -595,8 +596,7 @@
+ 			int base = (h - (font->xft->ascent + font->xft->descent)) / 2 +
+ 			           font->xft->ascent;
+ 
+-			XftDrawStringUtf8(d, &col, font->xft, x, base,
+-			                  (const FcChar8 *)text, (int)strlen(text));
++			ctwm_XftDrawText(d, &col, font, x, base, text, (int)strlen(text));
+ 			XftColorFree(dpy, Scr->d_visual,
+ 			             DefaultColormap(dpy, Scr->screen), &col);
+ 		}

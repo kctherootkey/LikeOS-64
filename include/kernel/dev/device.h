@@ -33,6 +33,8 @@ struct devfs_node;
  * user so devfs's built-in nodes and a driver's registered ones cannot drift
  * apart -- the DRM driver used to carry its own copy of DEVFS_GID_VIDEO. */
 #define DEVFS_GID_TTY 5
+/* Sound devices (/dev/audioN, /dev/dsp, /dev/mixer). */
+#define DEVFS_GID_AUDIO 29
 #define DEVFS_GID_VIDEO 44
 #define DEVFS_GID_INPUT 104
 /* Render nodes are a separate group from `video' by de-facto Unix convention:
@@ -117,6 +119,9 @@ struct devfs_node {
 	void *priv; /* driver's node context */
 	int is_dir; /* a directory (ops unused) */
 	int registered;
+	/* When the node appeared, in epoch seconds: what stat() reports as
+	 * its access, modification and change times.  Set at registration. */
+	uint64_t ctime;
 };
 
 /* Register / unregister.  A path whose parent directory is not one of the

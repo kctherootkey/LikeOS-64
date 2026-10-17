@@ -634,7 +634,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			 * rounded up to whole pages, but ftruncate() records
 			 * the exact byte size the caller set -- so comparing
 			 * the two refused every object whose size was not a
-			 * page multiple.  shm_set_size() allocates
+			 * page multiple.  shm_set_size() makes room for
 			 * ceil(size / PAGE_SIZE) pages, so the partial last
 			 * page is real, and POSIX maps it (zero tail included).
 			 * WebKit sizes its IPC message bodies to the byte,
@@ -647,33 +647,24 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			if (offset + length > obj_span)
 				return -EINVAL; /* past the object's pages */
 
-			/* PAGE_DEVICE marks these as pages this address space
-			 * does not own: teardown must not hand them back to the
-			 * physical allocator, and fork shares rather than copies
-			 * them.  They belong to the shm object and are released
-			 * only when it is destroyed.  Without this bit every
-			 * munmap frees memory the object still owns — the pages
-			 * get reused underneath it and are freed a second time
-			 * later. */
-			uint64_t shm_flags = page_flags | PAGE_DEVICE;
-
-			for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
-				uint64_t phys = shm_page_phys(
-					sobj, (offset + off) / PAGE_SIZE);
-				if (!phys || !mm_map_page_in_address_space(
-						     cur->pml4, vaddr + off,
-						     phys, shm_flags)) {
-					for (uint64_t cl = 0; cl < off;
-					     cl += PAGE_SIZE)
-						mm_unmap_page_in_address_space(
-							cur->pml4, vaddr + cl);
-					ret = -ENOMEM;
-					goto out;
-				}
-			}
-			/* Pin the object for the life of the mapping: the
-			 * region holds a vfs reference, and unmapping releases
-			 * it through the normal file teardown. */
+			/* Nothing is mapped here: the mapping is a lazy device
+			 * mapping, and each page is entered by the demand-fault
+			 * path the first time this address space touches it --
+			 * shm_fault_page() hands out the object's page, creating
+			 * it (zeroed) on the first touch by anyone.  Mapping
+			 * every page up front required every page to exist up
+			 * front, which is what made a segment cost all of its
+			 * memory, zeroed, the moment it was created.
+			 *
+			 * PAGE_DEVICE (added by the fault path for device
+			 * records) marks the pages as ones this address space
+			 * does not own: teardown never hands them back to the
+			 * physical allocator and fork shares rather than copies
+			 * them.  They belong to the object and are released only
+			 * when it is destroyed.
+			 *
+			 * The record pins the object through the file, as every
+			 * file mapping does; no separate object reference. */
 			vfs_incref(backing);
 			region->start = vaddr;
 			region->length = length;
@@ -681,17 +672,17 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			region->flags = flags | MAP_SHARED;
 			region->fd = (int)fd;
 			region->offset = offset;
-			region->lazy = false;
+			region->lazy = true;
 			region->file = backing;
-			/* Marked as a device mapping so fork() shares the pages
-			 * instead of copying them, and teardown never hands
-			 * them back to the physical allocator — they belong to
-			 * the shm object, not to this address space. */
 			region->device = true;
-			region->device_phys =
-				shm_page_phys(sobj, offset / PAGE_SIZE);
+			region->device_phys = 0;
+			region->dev_obj = sobj;
+			region->dev_get = NULL;
+			region->dev_put = NULL;
+			region->dev_dirty = NULL;
+			region->dev_fault = shm_fault_page;
+			region->dev_pte_extra = 0;
 			region->in_use = true;
-			mm_merge_region_neighbours(cur, region);
 			ret = (int64_t)vaddr;
 			goto out;
 		}

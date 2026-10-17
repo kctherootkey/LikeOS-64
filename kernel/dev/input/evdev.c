@@ -215,17 +215,15 @@ static void evdev_init_devices(void)
 
 static void evdev_timestamp(evdev_dev_t *dev, struct input_event *ev)
 {
-	uint64_t us = timer_get_precise_us();
+	uint64_t ns = timer_get_precise_ns();
 
-	/* CLOCK_MONOTONIC is time since boot; CLOCK_REALTIME adds the boot
-	 * epoch.  Both come from the same counter, so events stay ordered
-	 * whichever a client picks. */
-	if (dev && dev->clock_id == CLOCK_MONOTONIC)
-		ev->time.tv_sec = (int64_t)(us / 1000000);
-	else
-		ev->time.tv_sec =
-			(int64_t)(timer_get_boot_epoch() + us / 1000000);
-	ev->time.tv_usec = (int64_t)(us % 1000000);
+	/* CLOCK_MONOTONIC is time since boot; CLOCK_REALTIME adds the wall
+	 * clock's offset.  Both come from the same counter, so events stay
+	 * ordered whichever a client picks. */
+	if (!dev || dev->clock_id != CLOCK_MONOTONIC)
+		ns += timer_realtime_offset_ns(ns);
+	ev->time.tv_sec = (int64_t)(ns / 1000000000ULL);
+	ev->time.tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
 }
 
 // Queue one event; caller holds dev->lock.  Interrupt-context safe:

@@ -1,0 +1,214 @@
+# Copyright (C) 2026 The LikeOS Project
+#
+# Firmware the sound drivers (kernel/dev/sound) ask for, one per line, as
+# paths under /lib/firmware: every file the Intel audio DSP driver
+# (sof_pci.c, sof_loader.c, sof_acpi.c) can request on the platforms it
+# boots, cAVS 2.5 (Tiger/Elkhart/Alder/Raptor Lake) and ACE 1.x-3.x
+# (Meteor/Arrow/Lunar/Panther/Wildcat Lake), plus the CS42L43 codec patch.
+# All of it ships uncompressed in res/firmware (intel/ mirrors
+# /lib/firmware/intel), from the SOF binary release sof-bin v2026.09.2
+# (firmware v2.12 for cAVS 2.5, v2.15 for ACE, topologies v2.15.1);
+# licence in LICENCE.sof, LICENSE.cirrus for cs42l43.bin.
+#
+# Base firmware, Intel-signed (DSPs fused with the Intel production key,
+# every retail machine).  The machine scan's name comes first
+# (sof-ipc4/<plat>/sof-<plat>.ri), then the PCI table's directory:
+intel/sof-ipc4/tgl/sof-tgl.ri
+intel/sof-ipc4/tgl-h/sof-tgl-h.ri
+intel/sof-ipc4/adl/sof-adl.ri
+intel/sof-ipc4/adl-s/sof-adl-s.ri
+intel/sof-ipc4/adl-n/sof-adl-n.ri
+intel/sof-ipc4/rpl/sof-rpl.ri
+intel/sof-ipc4/rpl-s/sof-rpl-s.ri
+intel/sof-ipc4/mtl/sof-mtl.ri
+intel/sof-ipc4/arl/sof-arl.ri
+intel/sof-ipc4/arl-s/sof-arl-s.ri
+intel/sof-ipc4/lnl/sof-lnl.ri
+intel/sof-ipc4/ptl/sof-ptl.ri
+intel/sof-ipc4/wcl/sof-wcl.ri
+# Base firmware, community-signed (DSPs fused with the community key:
+# Chromebooks and UP boards, recognised from SMBIOS; asked for first
+# there, and as the last resort elsewhere).  Elkhart Lake has only this
+# build:
+intel/sof-ipc4/tgl/community/sof-tgl.ri
+intel/sof-ipc4/tgl-h/community/sof-tgl-h.ri
+intel/sof-ipc4/ehl/community/sof-ehl.ri
+intel/sof-ipc4/adl/community/sof-adl.ri
+intel/sof-ipc4/adl-s/community/sof-adl-s.ri
+intel/sof-ipc4/adl-n/community/sof-adl-n.ri
+intel/sof-ipc4/rpl/community/sof-rpl.ri
+intel/sof-ipc4/rpl-s/community/sof-rpl-s.ri
+intel/sof-ipc4/mtl/community/sof-mtl.ri
+intel/sof-ipc4/arl/community/sof-arl.ri
+intel/sof-ipc4/arl-s/community/sof-arl-s.ri
+intel/sof-ipc4/lnl/community/sof-lnl.ri
+intel/sof-ipc4/ptl/community/sof-ptl.ri
+intel/sof-ipc4/wcl/community/sof-wcl.ri
+# Split releases (ACE 3.x): the open modules, loaded as a library next to
+# the base image once it runs:
+intel/sof-ipc4/ptl/sof-ptl-openmodules.ri
+intel/sof-ipc4/ptl/community/sof-ptl-openmodules.ri
+intel/sof-ipc4/wcl/sof-wcl-openmodules.ri
+intel/sof-ipc4/wcl/community/sof-wcl-openmodules.ri
+#
+# Loadable libraries, named after the module UUID they provide
+# (sof-ipc4-lib/<plat>[/community]/<UUID>.bin), for a module a loaded
+# topology uses that the base firmware lacks.  Of all the topologies below
+# only Lunar Lake needs one: DRC, used by its HDA generic and SoundWire
+# topologies.
+intel/sof-ipc4-lib/lnl/B36EE4DA-006F-47F9-A06D-FECBE2D8B6CE.bin
+intel/sof-ipc4-lib/lnl/community/B36EE4DA-006F-47F9-A06D-FECBE2D8B6CE.bin
+#
+# Topologies, all in sof-ipc4-tplg.
+#
+# Function topologies (ACE SoundWire machines, sof_pci.c), one per audio
+# function: SDCA jack, amplifiers by number of amplifier links, SoundWire
+# microphones, PCH DMICs by platform and count (two or four), HDMI.
+intel/sof-ipc4-tplg/sof-arl-dmic-2ch-id4.tplg
+intel/sof-ipc4-tplg/sof-arl-dmic-4ch-id4.tplg
+intel/sof-ipc4-tplg/sof-hdmi-pcm5-id5.tplg
+intel/sof-ipc4-tplg/sof-lnl-dmic-2ch-id4.tplg
+intel/sof-ipc4-tplg/sof-lnl-dmic-4ch-id4.tplg
+intel/sof-ipc4-tplg/sof-mtl-dmic-2ch-id4.tplg
+intel/sof-ipc4-tplg/sof-mtl-dmic-4ch-id4.tplg
+intel/sof-ipc4-tplg/sof-ptl-dmic-2ch-id4.tplg
+intel/sof-ipc4-tplg/sof-ptl-dmic-4ch-id4.tplg
+intel/sof-ipc4-tplg/sof-sdca-1amp-id2.tplg
+intel/sof-ipc4-tplg/sof-sdca-2amp-id2.tplg
+intel/sof-ipc4-tplg/sof-sdca-3amp-id2.tplg
+intel/sof-ipc4-tplg/sof-sdca-4amp-id2.tplg
+intel/sof-ipc4-tplg/sof-sdca-jack-id0.tplg
+intel/sof-ipc4-tplg/sof-sdca-mic-id4.tplg
+intel/sof-ipc4-tplg/sof-wcl-dmic-2ch-id4.tplg
+intel/sof-ipc4-tplg/sof-wcl-dmic-4ch-id4.tplg
+#
+# HDA generic topologies (HDMI and/or an analog HDA codec): plain, -idisp
+# when only display codecs answer, -1ch/-2ch/-4ch with PCH DMICs; the
+# -cavs25, -ace1 (ACE 1.x/2.x) and -ace3 ones carry their DMIC settings.
+intel/sof-ipc4-tplg/sof-hda-generic-1ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace1-1ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace1-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace1-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace1-idisp-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace1-idisp-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace3-1ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace3-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace3-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace3-idisp-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-ace3-idisp-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-cavs25-1ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-cavs25-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-cavs25-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-cavs25-idisp-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-cavs25-idisp-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-idisp-2ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-idisp-4ch.tplg
+intel/sof-ipc4-tplg/sof-hda-generic-idisp.tplg
+intel/sof-ipc4-tplg/sof-hda-generic.tplg
+#
+# Machine topologies (SoundWire machine table, sof_acpi.c), by family;
+# Wildcat Lake uses the Panther Lake ones.  "-2ch"/"-4ch" are the
+# variants for two or four PCH DMICs.
+intel/sof-ipc4-tplg/sof-tgl-cs35l56-l01-fb8.tplg
+intel/sof-ipc4-tplg/sof-tgl-cs42l43-l3-cs35l56-l01.tplg
+intel/sof-ipc4-tplg/sof-tgl-rt711-rt1308-4ch.tplg
+intel/sof-ipc4-tplg/sof-tgl-rt711-rt1308-rt715.tplg
+intel/sof-ipc4-tplg/sof-tgl-rt711-rt1316-rt714.tplg
+intel/sof-ipc4-tplg/sof-tgl-rt712.tplg
+intel/sof-ipc4-tplg/sof-tgl-rt715-rt711-rt1308-mono.tplg
+intel/sof-ipc4-tplg/sof-adl-cs42l43-l0-cs35l56-l23.tplg
+intel/sof-ipc4-tplg/sof-adl-rt711-4ch.tplg
+intel/sof-ipc4-tplg/sof-adl-rt711-l0-rt1308-l12-rt715-l3.tplg
+intel/sof-ipc4-tplg/sof-adl-rt711-l0-rt1316-l12-rt714-l3.tplg
+intel/sof-ipc4-tplg/sof-adl-rt711-l0-rt1316-l13-rt714-l2.tplg
+intel/sof-ipc4-tplg/sof-rpl-cs42l43-l0.tplg
+intel/sof-ipc4-tplg/sof-mtl-cs35l56-l01-fb6.tplg
+intel/sof-ipc4-tplg/sof-mtl-cs35l56-l01-fb8.tplg
+intel/sof-ipc4-tplg/sof-mtl-cs42l43-l0-cs35l56-l12.tplg
+intel/sof-ipc4-tplg/sof-mtl-cs42l43-l0-cs35l56-l23.tplg
+intel/sof-ipc4-tplg/sof-mtl-cs42l43-l0.tplg
+intel/sof-ipc4-tplg/sof-mtl-cs42l43-l3-cs35l56-l01-spkagg.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt1318-l12-rt714-l0.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt711-2ch.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt711-4ch.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt711-l0-rt1316-l23-rt714-l1.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt711-l0-rt1316-l3-2ch.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt711-l0-rt1316-l3-4ch.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt711-l0-rt1316-l3.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt712-l0-2ch.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt712-l0-4ch.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt712-l0-rt1712-l3.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt712-l0.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt713-l0-rt1316-l12-rt1713-l3.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt713-l0-rt1316-l12.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt713-l0-rt1318-l1-rt1713-l3.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt713-l0-rt1318-l12-rt1713-l3.tplg
+intel/sof-ipc4-tplg/sof-mtl-rt722-l0.tplg
+intel/sof-ipc4-tplg/sof-mtl-sdw-cs42l42-l0-max98363-l2.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l0-cs35l56-l2-2ch.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l0-cs35l56-l2.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l0-cs35l56-l23.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l0.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l2-cs35l56-l3-2ch.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l2-cs35l56-l3.tplg
+intel/sof-ipc4-tplg/sof-arl-cs42l43-l2.tplg
+intel/sof-ipc4-tplg/sof-arl-rt711-l0-2ch.tplg
+intel/sof-ipc4-tplg/sof-arl-rt711-l0-4ch.tplg
+intel/sof-ipc4-tplg/sof-arl-rt711-l0-rt1316-l3-2ch.tplg
+intel/sof-ipc4-tplg/sof-arl-rt711-l0-rt1316-l3-4ch.tplg
+intel/sof-ipc4-tplg/sof-arl-rt711-l0-rt1316-l3.tplg
+intel/sof-ipc4-tplg/sof-arl-rt711-l0.tplg
+intel/sof-ipc4-tplg/sof-arl-rt722-l0_rt1320-l2.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-2ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-4ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-cs35l56-l23-2ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-cs35l56-l23-4ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-cs35l56-l23.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-cs35l56-l3-2ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0-cs35l56-l3.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l0.tplg
+intel/sof-ipc4-tplg/sof-lnl-cs42l43-l2-cs35l56x6-l13.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt1318-l12-rt714-l0.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt1320-l12-rt714-l0.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt711-4ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt711-l0-rt1316-l23-rt714-l1.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt712-l2-rt1320-l1.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt712-l2-rt1712-l3.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt713-l0-rt1318-l1-2ch.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt713-l0-rt1318-l1.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt713-l2-rt1320-l13.tplg
+intel/sof-ipc4-tplg/sof-lnl-rt722-l0.tplg
+intel/sof-ipc4-tplg/sof-ptl-cs42l43-agg-l3-cs35l56-l2-4ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-cs42l43-agg-l3-cs35l56-l2.tplg
+intel/sof-ipc4-tplg/sof-ptl-cs42l43-l2-cs35l56x6-l13.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt711-2ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt711-4ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt711-rt1308-mono-rt715.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt711-rt1308-rt715.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt711.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt712-l2-rt1320-l1.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt712-l3-rt1320-l2.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt712-l3-rt1320-l3-4ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt712-l3-rt1320-l3.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt713-l2-rt1320-l13.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt713-l3-rt1320-l1-2ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt713-l3-rt1320-l12.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt715-rt711-rt1308-mono.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt721-4ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt721.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt722-2ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt722-4ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt722-l0-rt1320-l23-2ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt722-l0-rt1320-l23-4ch.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt722-l0-rt1320-l23.tplg
+intel/sof-ipc4-tplg/sof-ptl-rt722.tplg
+#
+# CS42L43 microcontroller patch (sdw_cs42l43.c), from the upstream kernel
+# firmware collection (Cirrus Logic licence, LICENSE.cirrus):
+cs42l43.bin
+#
+# not published upstream: asked for only as the last resort, when the
+# file before it is missing:
+#   intel/sof-ipc4/ehl/sof-ehl.ri  (no Intel-signed Elkhart Lake build)

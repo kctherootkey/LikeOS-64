@@ -6,12 +6,16 @@ which ends the session because the manager runs in the foreground of the
 startup script -- have no route from the mouse at all.  Alt+F1 reaches them
 from the keyboard; this puts them on the menu the desktop does own.
 
-By signal rather than by asking over the X connection: this manager restarts
-on SIGHUP and shuts down on SIGTERM, and it advertises no window a client
-could address -- it sets _NET_SUPPORTING_WM_CHECK but no _NET_WM_PID, so
+Quitting goes through likeos-logout, the same helper the taskbar and the
+manager's own menu use, so the log-out sound starts before the session
+ends; the manager is signalled directly only when the helper cannot be
+started.
+
+Restarting is by signal rather than by asking over the X connection: this
+manager restarts on SIGHUP and shuts down on SIGTERM, and it advertises no
+window a client could address -- it sets _NET_SUPPORTING_WM_CHECK but no _NET_WM_PID, so
 there is nothing on the connection to talk to.  The startup script records
-the pid instead, before it execs the manager (exec keeps the pid, which is
-what makes a file written beforehand correct).
+the pid instead, and removes the file once the manager has gone.
 
 The entries land in the CustomCommonOps placeholder, which is the last
 extension point libfm's folder-view menu offers: below "Desktop
@@ -29,20 +33,18 @@ the menu can be extended without rewriting libfm's own definition.
  #include <math.h>
  
  #include <cairo-xlib.h>
-@@ -148,6 +149,43 @@
+@@ -148,6 +149,49 @@
  static void on_disable(GtkAction* act, gpointer user_data);
  #endif
  
 +/* Signal the window manager, whose pid the startup script left behind.
 + *
-+ * A missing or stale file does nothing at all, deliberately.  The file is
-+ * only there when the session was started the normal way, and a pid that has
-+ * since been recycled onto some other process must not be signalled: the
-+ * manager runs in the foreground of the startup script, so it is a process
-+ * group leader, and getpgid() answering with the pid itself is as much
-+ * confirmation that it is still the same process as is available here.  It
-+ * also answers ESRCH for a pid that no longer exists, which is what makes a
-+ * stale file harmless rather than dangerous.
++ * A missing file does nothing at all, deliberately: it is only there when the
++ * session was started the normal way.  The script removes it as soon as the
++ * manager has gone, so it does not outlive the process it names.  The pid is
++ * not checked further: the manager is started in the background of the
++ * script, so it is no process group leader and getpgid() says nothing about
++ * it; kill() itself refuses a process of another user.
 + */
 +static void desktop_signal_wm(int sig)
 +{
@@ -53,7 +55,7 @@ the menu can be extended without rewriting libfm's own definition.
 +    {
 +        pid_t pid = (pid_t)strtol(buf, NULL, 10);
 +
-+        if(pid > 1 && getpgid(pid) == pid)
++        if(pid > 1)
 +            kill(pid, sig);
 +        g_free(buf);
 +    }
@@ -65,9 +67,17 @@ the menu can be extended without rewriting libfm's own definition.
 +    desktop_signal_wm(SIGHUP);
 +}
 +
++/* Leave the session the way the taskbar and the window manager's own menu do:
++ * through likeos-logout, which starts the log-out sound and asks the manager
++ * to quit.  The manager is signalled directly only when the helper cannot be
++ * started, so the session still ends, just without the sound.
++ */
 +static void on_wm_quit(GtkAction* act, gpointer user_data)
 +{
-+    desktop_signal_wm(SIGTERM);
++    char *argv[] = { (char *)"/usr/bin/likeos-logout", NULL };
++
++    if(!g_spawn_async(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, NULL))
++        desktop_signal_wm(SIGTERM);
 +}
 +
  /* insert GtkUIManager XML definitions */
@@ -89,8 +99,8 @@ the menu can be extended without rewriting libfm's own definition.
  {
 -    {"DeskPref", GTK_STOCK_PROPERTIES, N_("Desktop Preferences"), "", NULL, G_CALLBACK(fm_desktop_preference)}
 +    {"DeskPref", GTK_STOCK_PROPERTIES, N_("Desktop Preferences"), "", NULL, G_CALLBACK(fm_desktop_preference)},
-+    {"WMRestart", GTK_STOCK_REFRESH, N_("Restart ctwm"), "", NULL, G_CALLBACK(on_wm_restart)},
-+    {"WMQuit", GTK_STOCK_QUIT, N_("Exit ctwm"), "", NULL, G_CALLBACK(on_wm_quit)}
++    {"WMRestart", GTK_STOCK_REFRESH, N_("Restart session"), "", NULL, G_CALLBACK(on_wm_restart)},
++    {"WMQuit", GTK_STOCK_QUIT, N_("Exit session"), "", NULL, G_CALLBACK(on_wm_quit)}
  };
  
  /* FmFileMenu extension for single folder */

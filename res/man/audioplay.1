@@ -1,0 +1,170 @@
+AUDIOPLAY(1)                    User Commands                     AUDIOPLAY(1)
+
+NAME
+       audioplay - play sound files through the audio service
+
+SYNOPSIS
+       audioplay [options] [FILE...]
+       audioplay -l FILE...
+       audioplay --raw -r RATE -c CHANNELS -f FORMAT [FILE|-]
+
+DESCRIPTION
+       audioplay plays each FILE in turn through the audio service, audiod(1),
+       which mixes it with the sound of every other program. With no FILE,  or
+       with -, it plays standard input.
+
+       The uncompressed and simply coded  formats  are  decoded  by  audioplay
+       itself:
+
+       WAV -- RIFF, big-endian RIFX and RF64/BW64 for files over 4 GB; integer
+       PCM of 8, 16, 24 and 32 bits (and 12 or 20 bits in  wider  containers),
+       IEEE float of 32 and 64 bits, G.711 mu-law and  A-law,  IMA  ADPCM  and
+       Microsoft ADPCM; all of these also inside WAVE_FORMAT_EXTENSIBLE, whose
+       speaker mask -l shows.
+
+       Sun/NeXT AU (.au, .snd) -- linear 8, 16, 24 and 32 bit, float,  double,
+       mu-law and A-law.
+
+       AIFF and AIFF-C -- big-endian PCM of 8  to  32  bits,  and  the  AIFF-C
+       codings NONE, twos, sowt (little-endian), raw (unsigned),  in24,  in32,
+       fl32, fl64, ulaw and alaw.
+
+       CAF (Core Audio) -- linear PCM in either byte order, float, mu-law  and
+       A-law.
+
+       Raw PCM without a header, described with -r, -c and -f.
+
+       Files may have 1 to 8 channels at any rate  from  4000  to  384000  Hz.
+       audioplay only changes how the samples  are  represented  (byte  order,
+       sign, G.711 and ADPCM expansion);  the  service  converts  the  format,
+       resamples to the rate of the sound card and maps  the  channels,  so  a
+       24-bit or 96 kHz file reaches the mixer with all its resolution.
+
+       The type of a file is taken from its contents, not its name. A WAV file
+       whose header gives no length, as written by programs that record into a
+       pipe, plays to its end. A file that claims  more  data  than  it  holds
+       plays what is there.
+
+       Compressed formats -- MP3, Ogg Vorbis and Opus, FLAC, AAC and M4A, WMA,
+       Matroska and WebM, and WAV or CAF files that carry one of those --  are
+       not  decoded  here.  When  GStreamer's  gst-play-1.0(1)  is  installed,
+       audioplay runs it on such a file (it replaces  itself  with  it  for  a
+       single file); otherwise it says what the file is and how to convert it.
+
+       Successive files of the same format play through one stream  without  a
+       gap, as an album should.
+
+       Ctrl-C stops playback: what is still buffered is dropped, the stream is
+       closed and audioplay exits with status 130. A second  Ctrl-C  exits  at
+       once.
+
+OPTIONS
+       -v, --volume N
+              The stream's  volume,  0..100  (100,  the  default,  leaves  the
+              samples as they are). It applies on top of the master volume and
+              can be changed while playing with audioctl stream-volume.
+
+       -R, --role ROLE
+              What the sound is for: music (the default), video, game,  event,
+              phone, web or other. audioctl streams shows it.
+
+       -L N, --loop[=N]
+              Play each file N times in all; --loop without  N,  and  N  =  0,
+              repeat until interrupted. Standard input and pipes cannot loop.
+
+       -s, --start TIME
+              Begin TIME into each file. TIME is seconds (90,  12.5),  minutes
+              and seconds  (1:30,  1:30.25)  or  hours,  minutes  and  seconds
+              (1:02:03). On a pipe the samples before the start are  read  and
+              dropped.
+
+       -t, --duration TIME
+              Play at most TIME of each file (with --loop: of each pass).
+
+       -p, --progress
+              Show the position, the length and a bar on standard error  while
+              playing. The position is what has been heard, not what has  been
+              sent. Ignored when standard error is not a terminal.
+
+       -l, --list
+              Print what each file is -- container, coding, rate, channels and
+              speaker layout, length, data size and bit rate, what is sent  to
+              the service, and the title, artist, album, date, genre,  comment
+              and copyright found in it -- and play nothing.
+
+       -n, --name NAME
+              The stream's name as audioctl streams shows it. By default it is
+              "artist - title" from the file's tags, or the title, or the file
+              name.
+
+       -b, --buffer MS
+              How much sound the service should hold for the stream,  1..10000
+              milliseconds. Larger survives a busy system  better  and  reacts
+              later to pause and volume; the default is the  service's  (about
+              100 ms).
+
+       -q, --quiet
+              No messages except errors.
+
+       --no-gst
+              Never hand a file to gst-play-1.0.
+
+       -h, --help
+              A summary of the options.
+
+       -V, --version
+              The version.
+
+RAW PCM
+       A file with no header audioplay recognises is played as  raw  PCM  when
+       any of the following is given; --raw forces it even when the file has a
+       header.
+
+       --raw  Treat every input as headerless PCM.
+
+       -r, --rate HZ
+              Sample rate, 4000..384000; 44.1k and 48k are  accepted.  Default
+              48000.
+
+       -c, --channels N
+              Interleaved channels, 1..8. Default 2.
+
+       -f, --format FMT
+              Sample format: u8, s8, s16le (s16), s16be, u16le,  u16be,  s24le
+              (packed 3 bytes), s24be, s24_32le (24 bits in the  low  bits  of
+              32), s32le, s32be, f32le (float), f32be, f64le (double),  f64be,
+              ulaw, alaw.  The  service's  names  (S16_LE,  F32_LE,  ...)  are
+              accepted too. Default s16le.
+
+EXAMPLES
+       audioplay /usr/share/sounds/likeos/startup.wav
+       audioplay -p *.wav                 an album, gapless, with progress
+       audioplay -L 0 -v 30 rain.aiff     loop quietly until Ctrl-C
+       audioplay -s 1:30 -t 20 song.wav   20 seconds from 1:30
+       audioplay -l recording.wav         what is it?
+       cat voice.raw | audioplay -r 16k -c 1 -f s16le
+       audioplay song.mp3                 played with gst-play-1.0
+
+EXIT STATUS
+       0      Everything played.
+
+       1      A file could not be opened or  decoded,  or  the  audio  service
+              could not be reached or failed during  playback.  Further  files
+              are still played.
+
+       2      A bad option.
+
+       130    Interrupted by Ctrl-C (128 plus  the  signal  number  for  other
+              signals).
+
+FILES
+       /var/run/audiod/socket
+              The audio service's socket.
+
+       /usr/share/sounds/likeos
+              The system sounds; see eventsound(1).
+
+SEE ALSO
+       audioctl(1), audiotest(1), eventsound(1), gst-play-1.0(1), audiod(1)
+
+LikeOS                        October 2026                        AUDIOPLAY(1)

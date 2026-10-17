@@ -1281,6 +1281,10 @@ int sched_has_user_tasks(void); // Check if any user tasks are running
 
 /* Give a forked child its own copy of the parent's FPU state. */
 void task_fpu_fork(task_t *child, task_t *parent);
+/* The calling task's FPU/SSE/AVX state back to the fresh-thread defaults
+ * (exec, and a signal handler's entry). */
+void task_fpu_reset_current(void);
+
 
 /* Hand the hardware debug registers over as part of a context switch.  Does
  * nothing at all unless one of the two tasks actually has a watchpoint set. */

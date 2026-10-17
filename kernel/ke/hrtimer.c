@@ -3,6 +3,8 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/hrtimer.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/hal/lapic.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/timer.h>
@@ -60,11 +62,23 @@ static inline uint64_t ns_to_hpet(uint64_t ns)
 /* ---- Queue --------------------------------------------------------------- */
 
 static spinlock_t g_lock;
-static hrtimer_t *g_head; /* sorted by expires_ns, earliest first */
+/* One queue per CPU, each sorted by expires_ns, earliest first.
+ *
+ * With the local timers one-shot (g_lapic_ce), a timer goes on the queue of
+ * the CPU that armed it, and that CPU's local timer is armed for it: its
+ * callback runs there, in the local timer's interrupt.  Before that -- and
+ * on a machine whose local timer cannot run one-shot -- everything is on
+ * queue 0 and the HPET comparator serves it, as it always did.
+ *
+ * One lock for all of them: what it protects is short (a sorted insert or
+ * an unlink), and a timer re-armed from another CPU moves between two
+ * queues in one step under it. */
+static hrtimer_t *g_cpu_head[MAX_CPUS];
+static int g_lapic_ce;
 
 uint64_t hrtimer_now_ns(void)
 {
-	return timer_get_precise_us() * 1000ULL;
+	return timer_get_precise_ns();
 }
 
 int hrtimer_is_highres(void)
@@ -72,22 +86,37 @@ int hrtimer_is_highres(void)
 	return g_highres;
 }
 
-/* Program the comparator for the head of the queue.  Caller holds g_lock
- * with interrupts off.  A deadline that has already passed, or passes
- * while the comparator is being written (the classic one-shot race), is
- * caught by re-reading the counter afterwards and pulling the comparator
- * in to "now + a little" until it is safely ahead. */
+/* Which queue a timer armed now goes on.  Caller holds g_lock. */
+static int queue_for_new_timer(void)
+{
+	uint32_t c;
+
+	if (!g_lapic_ce)
+		return 0;
+	c = this_cpu_id();
+	if (c >= MAX_CPUS || !lapic_clockevent_ready(c))
+		return 0; /* this CPU's local timer is not running yet */
+	return (int)c;
+}
+
+/* Program the comparator for the head of queue 0 (HPET mode).  Caller holds
+ * g_lock with interrupts off.  A deadline that has already passed, or
+ * passes while the comparator is being written (the classic one-shot race),
+ * is caught by re-reading the counter afterwards and pulling the
+ * comparator in to "now + a little" until it is safely ahead. */
 static void hw_program(void)
 {
-	if (!g_highres)
+	hrtimer_t *head = g_cpu_head[0];
+
+	if (!g_highres || g_lapic_ce)
 		return;
-	if (!g_head)
+	if (!head)
 		return; /* nothing to wait for; a stale comparator fires at
 			 * most once into an empty queue, harmlessly */
 
 	uint64_t now_ns = hrtimer_now_ns();
-	uint64_t delta_ns = g_head->expires_ns > now_ns ?
-				    g_head->expires_ns - now_ns :
+	uint64_t delta_ns = head->expires_ns > now_ns ?
+				    head->expires_ns - now_ns :
 				    0;
 	/* Never closer than 5 us: below that the write itself loses the
 	 * race and the interrupt is missed for a full counter wrap. */
@@ -100,9 +129,27 @@ static void hw_program(void)
 
 		wr(HPET_TN_COMPARATOR(g_timer_idx), target);
 		if ((int64_t)(target - rd(HPET_MAIN_COUNTER)) > 0)
-			return; /* comparator is ahead of the counter */
+			break; /* comparator is ahead of the counter */
 		delta_ns *= 2; /* lost the race; aim further out */
 	}
+}
+
+/* After queue `q''s head changed: point the device serving it at the new
+ * head.  Caller holds g_lock with interrupts off.  A local timer can only
+ * be programmed from its own CPU; a remote queue whose head became LATER
+ * (a cancel) is left alone -- its timer fires early into nothing and is
+ * re-armed then -- and timers are only ever added to the arming CPU's own
+ * queue, so a head that became EARLIER is always local. */
+static void queue_head_changed(int q)
+{
+	if (!g_lapic_ce) {
+		hw_program();
+		return;
+	}
+	if ((uint32_t)q == this_cpu_id())
+		lapic_clockevent_program(g_cpu_head[q] ?
+						 g_cpu_head[q]->expires_ns :
+						 0);
 }
 
 void hrtimer_init(hrtimer_t *t, hrtimer_fn_t fn, void *arg)
@@ -112,41 +159,55 @@ void hrtimer_init(hrtimer_t *t, hrtimer_fn_t fn, void *arg)
 	t->arg = arg;
 	t->next = NULL;
 	t->armed = 0;
+	t->cpu = 0;
 }
 
-static void queue_remove_locked(hrtimer_t *t)
+/* Unlink `t' from the queue it is on.  Returns 1 if it was that queue's
+ * head.  Caller holds g_lock. */
+static int queue_remove_locked(hrtimer_t *t)
 {
-	hrtimer_t **pp = &g_head;
+	int q = t->cpu;
+	hrtimer_t **pp;
 
+	if (q < 0 || q >= MAX_CPUS)
+		q = 0;
+	pp = &g_cpu_head[q];
 	while (*pp) {
 		if (*pp == t) {
+			int was_head = (pp == &g_cpu_head[q]);
+
 			*pp = t->next;
 			t->next = NULL;
 			t->armed = 0;
-			return;
+			return was_head;
 		}
 		pp = &(*pp)->next;
 	}
+	t->armed = 0;
+	return 0;
 }
 
 void hrtimer_start(hrtimer_t *t, uint64_t abs_ns)
 {
 	uint64_t flags;
+	int q;
 
 	spin_lock_irqsave(&g_lock, &flags);
 	if (t->armed)
-		queue_remove_locked(t);
+		(void)queue_remove_locked(t);
+	q = queue_for_new_timer();
 	t->expires_ns = abs_ns;
 	t->armed = 1;
+	t->cpu = q;
 
-	hrtimer_t **pp = &g_head;
+	hrtimer_t **pp = &g_cpu_head[q];
 	while (*pp && (*pp)->expires_ns <= abs_ns)
 		pp = &(*pp)->next;
 	t->next = *pp;
 	*pp = t;
 
-	if (g_head == t)
-		hw_program();
+	if (g_cpu_head[q] == t)
+		queue_head_changed(q);
 	spin_unlock_irqrestore(&g_lock, flags);
 }
 
@@ -158,56 +219,96 @@ int hrtimer_cancel(hrtimer_t *t)
 	spin_lock_irqsave(&g_lock, &flags);
 	was_armed = t->armed;
 	if (was_armed)
-		queue_remove_locked(t);
+		(void)queue_remove_locked(t);
 	spin_unlock_irqrestore(&g_lock, flags);
 	return was_armed;
 }
 
-/* Fire everything that is due.  Callbacks run without the queue lock so
- * they may re-arm; a timer is unlinked and marked unarmed BEFORE its
- * callback runs, so hrtimer_cancel() from another CPU that observes
- * armed == 0 knows the callback is either done or about to run without
- * touching the queue -- which is the guarantee documented in the header
- * only when the caller has also excluded its own callback's effects, as
- * every user here does by checking its own state after cancel. */
-static void hrtimer_run_expired(void)
+/* Fire everything that is due on queue `q'.  Callbacks run without the
+ * queue lock so they may re-arm; a timer is unlinked and marked unarmed
+ * BEFORE its callback runs, so hrtimer_cancel() from another CPU that
+ * observes armed == 0 knows the callback is either done or about to run
+ * without touching the queue -- which is the guarantee documented in the
+ * header only when the caller has also excluded its own callback's effects,
+ * as every user here does by checking its own state after cancel.
+ * Returns the deadline of the next timer left on the queue (0: none). */
+static uint64_t hrtimer_run_queue(int q)
 {
-	uint64_t flags;
+	uint64_t flags, next;
 
 	spin_lock_irqsave(&g_lock, &flags);
 	for (;;) {
-		hrtimer_t *t = g_head;
+		hrtimer_t *t = g_cpu_head[q];
 		uint64_t now = hrtimer_now_ns();
 
 		if (!t || t->expires_ns > now)
 			break;
-		g_head = t->next;
+		g_cpu_head[q] = t->next;
 		t->next = NULL;
 		t->armed = 0;
 		spin_unlock_irqrestore(&g_lock, flags);
 		t->fn(t);
 		spin_lock_irqsave(&g_lock, &flags);
 	}
-	hw_program();
+	next = g_cpu_head[q] ? g_cpu_head[q]->expires_ns : 0;
+	if (!g_lapic_ce)
+		hw_program();
+	spin_unlock_irqrestore(&g_lock, flags);
+	return next;
+}
+
+uint64_t hrtimer_run_local(void)
+{
+	uint32_t c = this_cpu_id();
+
+	if (c >= MAX_CPUS)
+		return 0;
+	return hrtimer_run_queue((int)c);
+}
+
+void hrtimer_clockevent_started(void)
+{
+	uint64_t flags;
+	uint32_t c = this_cpu_id();
+
+	spin_lock_irqsave(&g_lock, &flags);
+	if (!g_lapic_ce && c == 0) {
+		/* The boot CPU's local timer serves queue 0 from now on; the
+		 * comparator is parked and its interrupt left masked off. */
+		g_lapic_ce = 1;
+		if (g_regs) {
+			wr(HPET_TN_COMPARATOR(g_timer_idx),
+			   rd(HPET_MAIN_COUNTER) + ~0ULL / 4);
+			wr(HPET_TN_CONFIG(g_timer_idx),
+			   rd(HPET_TN_CONFIG(g_timer_idx)) & ~HPET_TN_INT_ENB);
+		}
+		g_highres = 1;
+		kprintf("hrtimer: on the CPUs' local timers (HPET comparator retired)\n");
+	}
+	if (g_lapic_ce && c < MAX_CPUS)
+		lapic_clockevent_program(g_cpu_head[c] ?
+						 g_cpu_head[c]->expires_ns : 0);
 	spin_unlock_irqrestore(&g_lock, flags);
 }
 
 void hrtimer_irq(void)
 {
-	if (g_regs) {
-		/* Edge-triggered: nothing to acknowledge in the ISR register
-		 * (that is for level mode); the comparator simply fired. */
-	}
-	hrtimer_run_expired();
+	/* Edge-triggered: nothing to acknowledge in the ISR register (that is
+	 * for level mode); the comparator simply fired.  Once the local timers
+	 * carry the queues the comparator is retired, and a late interrupt
+	 * from it finds nothing to do. */
+	if (!g_lapic_ce)
+		(void)hrtimer_run_queue(0);
 }
 
 void hrtimer_tick(void)
 {
-	/* In high-resolution mode this is a safety net for a comparator
-	 * write that lost its race after all; in fallback mode it is the
-	 * only expiry path. */
-	if (g_head)
-		hrtimer_run_expired();
+	/* In HPET mode this is a safety net for a comparator write that lost
+	 * its race after all; without a comparator it is the only expiry
+	 * path.  With the local timers in charge every CPU's own timer
+	 * interrupt runs its queue, so there is nothing to do here. */
+	if (!g_lapic_ce && g_cpu_head[0])
+		(void)hrtimer_run_queue(0);
 }
 
 /* ---- Sleeping ------------------------------------------------------------ */

@@ -100,7 +100,7 @@ void xhci_boot_init(xhci_boot_state_t *state)
 		xhci_pci->vendor_id, xhci_pci->device_id, bar0_full);
 
 	// Initialize the primary xHCI controller
-	int st = xhci_init(&g_xhci, xhci_pci, XHCI_MSI_VECTOR);
+	int st = xhci_init(&g_xhci, xhci_pci);
 	if (st != ST_OK) {
 		kprintf("[XHCI BOOT] Controller 0 initialization failed: %d\n",
 			st);
@@ -137,7 +137,7 @@ void xhci_boot_init(xhci_boot_state_t *state)
 			xhci_pci2->bus, xhci_pci2->device, xhci_pci2->function,
 			xhci_pci2->vendor_id, xhci_pci2->device_id, bar0_full2);
 
-		st = xhci_init(&g_xhci_hid, xhci_pci2, XHCI_MSI_VECTOR_2);
+		st = xhci_init(&g_xhci_hid, xhci_pci2);
 		if (st == ST_OK) {
 			state->ctrl_hid = &g_xhci_hid;
 			xhci_power_ports(&g_xhci_hid);

@@ -137,10 +137,39 @@ void task_debugreg_clear(task_t *t)
 		task_debugreg_disable();
 }
 
+/* Kernel FPU sections that begin inside a context switch.
+ *
+ * Between a switch publishing `next' as current and handing the registers
+ * over (task_fpu_save(prev); task_fpu_restore(next)), the registers in the
+ * CPU are prev's, while sched_current() already answers next.  An interrupt
+ * in that window that blits with SSE (fb.c) would save prev's registers into
+ * NEXT's area and mark it authoritative -- next then resumes with prev's
+ * whole register file, control words included.  Such a section keeps what
+ * the CPU holds in a per-CPU area instead and puts it back unchanged, never
+ * touching either task's image.  Sections nest; interrupts are off while
+ * the depth and the area are touched. */
+static uint8_t g_kfpu_switch_area[MAX_CPUS][FPU_STATE_MAX]
+	__attribute__((aligned(FPU_STATE_ALIGN)));
+static int g_kfpu_switch_depth[MAX_CPUS];
+extern int g_smp_initialized; /* below: the per-CPU areas exist */
+
 void kernel_fpu_begin(void)
 {
+	/* The per-CPU area only once it exists: before that GS is whatever
+	 * the firmware left in it (on a ThinkPad P50 a pointer to nothing --
+	 * the first framebuffer copy of the boot console faulted on it), and
+	 * no context switch can be under way anyway. */
+	percpu_t *c = g_smp_initialized ? this_cpu() : NULL;
 	task_t *t = sched_current();
 
+	if (c && (c->in_context_switch || g_kfpu_switch_depth[c->cpu_id])) {
+		uint64_t f = local_irq_save();
+
+		if (g_kfpu_switch_depth[c->cpu_id]++ == 0)
+			fpu_save(g_kfpu_switch_area[c->cpu_id]);
+		local_irq_restore(f);
+		return;
+	}
 	if (!t || !t->fpu_state)
 		return;
 	if (t->fpu_kdepth++ == 0) {
@@ -151,14 +180,43 @@ void kernel_fpu_begin(void)
 
 void kernel_fpu_end(void)
 {
+	percpu_t *c = g_smp_initialized ? this_cpu() : NULL; /* as above */
 	task_t *t = sched_current();
 
+	if (c && g_kfpu_switch_depth[c->cpu_id]) {
+		uint64_t f = local_irq_save();
+
+		if (--g_kfpu_switch_depth[c->cpu_id] == 0)
+			fpu_restore(g_kfpu_switch_area[c->cpu_id]);
+		local_irq_restore(f);
+		return;
+	}
 	if (!t || !t->fpu_state || t->fpu_kdepth == 0)
 		return;
 	if (--t->fpu_kdepth == 0) {
 		fpu_restore(t->fpu_state);
 		t->fpu_saved = 0;
 	}
+}
+
+/* Put the calling task's FPU, SSE and AVX state back to what a fresh thread
+ * starts with -- control words, MXCSR, every register -- in its save area
+ * and in the CPU.  For exec: the new program must not start with the
+ * rounding mode, the denormal flags, the exception masks or the dirty upper
+ * halves of the program it replaces.  Interrupts are off so that a switch
+ * cannot save the old live registers over the fresh image in between. */
+void task_fpu_reset_current(void)
+{
+	task_t *t = sched_current();
+	uint64_t f;
+
+	if (!t || !t->fpu_state || t->fpu_kdepth)
+		return;
+	f = local_irq_save();
+	fpu_init_state(t->fpu_state);
+	fpu_restore(t->fpu_state);
+	t->fpu_saved = 0;
+	local_irq_restore(f);
 }
 
 /* Give `child` its own copy of `parent`'s live FPU state.

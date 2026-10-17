@@ -1,0 +1,20 @@
+[Desktop Entry]
+# Media Player, the system's own GTK3 player (ports/xorg/gtk3/
+# likeos-mediaplayer-1.0).  The MIME types are the audio and video formats
+# GStreamer's installed plug-ins handle, plus the playlist formats the
+# program reads itself; %U hands over several files or URLs at once.
+#
+# Copyright (C) 2026 The LikeOS Project
+Type=Application
+Version=1.0
+Name=Media Player
+GenericName=Music and Video Player
+Comment=Play music, videos and internet streams
+Exec=mediaplayer %U
+TryExec=mediaplayer
+Icon=multimedia-player
+Terminal=false
+StartupNotify=false
+Categories=AudioVideo;Audio;Video;Player;GTK;
+Keywords=music;video;audio;movie;film;song;playlist;stream;radio;mp3;mp4;
+MimeType=audio/x-wav;audio/wav;audio/vnd.wave;audio/x-aiff;audio/aiff;audio/basic;audio/mpeg;audio/x-mp3;audio/mp4;audio/x-m4a;audio/m4a;audio/aac;audio/x-aac;audio/ogg;audio/x-vorbis+ogg;audio/x-opus+ogg;audio/opus;audio/flac;audio/x-flac;audio/x-matroska;audio/webm;audio/x-ms-wma;audio/ac3;audio/x-musepack;audio/x-wavpack;audio/x-speex+ogg;audio/midi;video/mp4;video/x-m4v;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/avi;video/ogg;video/x-ogm+ogg;video/mpeg;video/mp2t;video/x-flv;video/x-ms-wmv;video/x-ms-asf;video/3gpp;video/3gpp2;video/x-theora+ogg;video/dv;audio/x-mpegurl;audio/mpegurl;application/vnd.apple.mpegurl;audio/x-scpls;

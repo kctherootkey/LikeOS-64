@@ -36,6 +36,7 @@
 #include <kernel/dev/gpu/i915/intel_dsc.h>
 #include <kernel/dev/gpu/i915/intel_connector.h>
 #include <kernel/dev/gpu/i915/intel_features.h>
+#include <kernel/dev/gpu/i915/intel_audio.h>
 #include <kernel/dev/gpu/drm_edid.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
@@ -597,6 +598,9 @@ static void firmware_state_release(struct i915_device *i915, struct intel_output
 		'A' + o->port);
 	intel_plane_disable(i915, &tmp);
 	i915_write32(i915, CUR_CTL(pipe), 0);
+	/* display audio: any the firmware left on that transcoder goes off
+	 * before it (intel_audio.c) */
+	intel_audio_release_transcoder(i915, t);
 	transcoder_disable(i915, &tmp);
 	/* an engine the firmware left compressing for that transcoder */
 	intel_dsc_disable(i915, o, &tmp);
@@ -633,6 +637,8 @@ static void output_disable(struct i915_device *i915, struct intel_output *o)
 	if (o->is_edp)
 		intel_backlight_disable(i915, o);
 	if (p) {
+		/* display audio off before the transcoder goes (intel_audio.c) */
+		intel_audio_codec_disable(i915, o, p);
 		intel_vrr_disable(i915, o, p, NULL);
 		if (tmds)
 			intel_hdmi_disable(i915, o, p->transcoder);
@@ -870,6 +876,8 @@ static void crtc_wm_cfg(struct i915_device *i915, struct intel_output *o,
 	mm_memset(c, 0, sizeof(*c));
 	intel_wm_cfg_set_mode(c, hw, cs->mode.hdisplay, cs->mode.vdisplay, port_clock, dp,
 			      o->is_edp, 4);
+	/* a sink with audio: CDCLK at least twice the audio bit clock */
+	c->has_audio = (uint8_t)intel_audio_output_wants_audio(i915, o);
 	/* a mode the uncompressed link cannot carry runs compressed: the
 	 * engines' clock, from the configuration the check and the enable
 	 * work out the same way */
@@ -1211,6 +1219,8 @@ static int crtc_modeset(struct i915_device *i915, struct drm_atomic_state *st,
 	if (o->type == INTEL_OUTPUT_HDMI || o->type == INTEL_OUTPUT_DVI)
 		intel_hdmi_post_enable(i915, o, p);
 	intel_vrr_enable(i915, o, p, cs);
+	/* display audio, now that transcoder, port and link run (intel_audio.c) */
+	intel_audio_codec_enable(i915, o, p);
 	kprintf("[drm] i915: pipe %c on port %c: %ux%u@%u (%u kHz)%s, plane at %08x\n",
 		'A' + p->pipe, 'A' + o->port, hw->hdisplay, hw->vdisplay, hw->vrefresh,
 		hw->clock, cs->use_scaler ? " (scaled)" : "", p->surf_ggtt);

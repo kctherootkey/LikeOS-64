@@ -14,6 +14,7 @@
 #include <kernel/dev/gpu/i915/i915_reg.h>
 #include <kernel/dev/gpu/i915/i915_xe2_reg.h>
 #include <kernel/dev/gpu/i915/i915_lmem.h>
+#include <kernel/dev/gpu/i915/intel_audio.h>
 #include <kernel/dev/gpu/i915/i915_legacy.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/uapi/ioctl.h>
@@ -299,10 +300,12 @@ static int i915_suspend(struct drm_device *dev)
 		}
 		i915_gt_reset_all(i915);
 	}
-	if (intel_legacy_display_active(i915))
+	if (intel_legacy_display_active(i915)) {
 		intel_legacy_display_suspend(i915);
-	else
+	} else {
 		intel_display_suspend(i915);
+		intel_audio_suspend(i915); /* display audio (intel_audio.c) */
+	}
 	(void)i915_lmem_suspend(i915);
 	i915_irq_suspend(i915);
 	i915_uncore_fini(i915);
@@ -327,6 +330,7 @@ static int i915_resume(struct drm_device *dev)
 						      intel_display_resume(i915);
 	if (rc)
 		return rc;
+	intel_audio_resume(i915); /* display audio's power references again */
 	if (i915->nengines) {
 		i915_engines_resume(i915);
 		i915_fences_restore(i915);
@@ -462,10 +466,12 @@ static void i915_teardown(struct i915_device *i915)
 		i915->gt_ready = 0;
 		i915_engines_fini(i915);
 	}
-	if (intel_legacy_display_active(i915))
+	if (intel_legacy_display_active(i915)) {
 		intel_legacy_display_fini(i915);
-	else if (i915->display.ready)
+	} else if (i915->display.ready) {
+		intel_audio_fini(i915);
 		intel_display_fini(i915);
+	}
 	i915_irq_fini(i915);
 	i915_lmem_fini(i915);
 	i915_gtt_fini(i915);
@@ -615,6 +621,10 @@ int i915_init(void)
 			rc);
 		return 0;
 	}
+	/* Display audio (HDMI/DP through the HD Audio display codec): the
+	 * hooks the sound core uses, before the first mode set lights a
+	 * port (intel_audio.c; nothing on the legacy displays). */
+	intel_audio_init(i915);
 	/* The console onto the panel's own mode.  The core refuses when the
 	 * first connector has no modes; a refusal or a verify failure puts
 	 * the boot framebuffer back (drm_console.c). */

@@ -82,6 +82,8 @@ int vfs_status_to_errno(int st)
 		return -EPERM;
 	case ST_XDEV:
 		return -EXDEV;
+	case ST_NO_DEVICE:
+		return -ENODEV;
 	default:
 		return -EACCES;
 	}

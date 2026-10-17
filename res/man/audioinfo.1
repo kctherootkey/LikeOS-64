@@ -1,0 +1,109 @@
+AUDIOINFO(1)                    User Commands                     AUDIOINFO(1)
+
+NAME
+       audioinfo - report the sound hardware the kernel found
+
+SYNOPSIS
+       audioinfo [-d DEVICE|N] [-a] [-v] [-s] [-p] [-e] [-n]
+
+DESCRIPTION
+       audioinfo asks the kernel's sound driver directly  what  it  found  and
+       what it can do: the card, its driver and codec and the bus address; the
+       sample formats, rates and channel counts  it  plays  and  records;  the
+       period and buffer sizes it  accepts;  every  volume  control  with  its
+       setting in percent and  in  decibels,  its  range  and  the  number  of
+       hardware steps; the mute switches; the outputs and inputs,  with  their
+       kind, their jack state and, for HDMI  and  DisplayPort,  the  monitor's
+       name; and the driver's own summary of the controller and its streams.
+
+       It uses the card's control node (/dev/mixer for card 0, /dev/mixerN for
+       card N), because opening that claims nothing: the audio service,  which
+       holds the playback device, keeps playing  while  audioinfo  runs.  Only
+       --probe opens the playback node itself.
+
+       The sound devices are owned by root and the group audio with mode 0660,
+       so audioinfo works for root and for members of that group.  For  anyone
+       else it explains why it cannot look and what to  do,  and  then  prints
+       what the audio service reports instead -- the card and  codec  in  use,
+       the mixer format, the master volume, the outputs and the cards -- which
+       needs no privilege. Ordinary programs never need the device; they  play
+       through the service.
+
+       Without -d, card 0 is shown.
+
+OPTIONS
+       -d, --device DEVICE
+              The card to examine: a card number, or any of  its  nodes,  e.g.
+              /dev/audio1, /dev/dsp1 or /dev/mixer1. A bare argument means the
+              same.
+
+       -a, --all
+              Every card, one after the other.
+
+       -v, --verbose
+              Also the driver's full codec dump. For a High  Definition  Audio
+              card this lists every codec on the  link  with  its  vendor  and
+              revision, every widget of its  function  groups  --  converters,
+              mixers, selectors, pin complexes, power and volume knobs -- with
+              capabilities, amplifier ranges, connection lists and  the  pins'
+              default configuration  (location,  device,  connector,  colour),
+              which is what the driver's automatic path finding works from and
+              what a missing sound usually comes down to.
+
+       -s, --streams
+              Also the driver's stream dump: each  hardware  stream  with  its
+              state, format, buffer and position.
+
+       -p, --probe
+              Open the playback node and ask which parameters it  grants:  its
+              defaults, then each standard rate, each format and each  channel
+              count. Nothing is played and the parameters are put  back.  This
+              only works while no one else holds the device  --  normally  the
+              audio service does, and audioinfo  says  so;  stop  the  service
+              first.
+
+       -e, --events
+              After the report, print the card's events as they  happen  until
+              Ctrl-C: jacks plugged  and  unplugged,  playback  underruns  and
+              capture overruns, volume changes, monitors with audio coming and
+              going, and the card disappearing. Plug the headphones in and out
+              to see whether the jack is sensed.
+
+       -n, --no-summary
+              Leave out the driver's summary.
+
+       -h, --help
+              A summary of the options.
+
+OUTPUT
+       Volumes are shown as 0..100 and,  where  the  hardware  has  a  decibel
+       scale, as the gain at the current setting and the control's range, e.g.
+       -12.75 dB, range -65.25 dB .. 0.00 dB,  87  steps.  A  control  without
+       hardware steps is  applied  in  software.  An  output  marked  with  an
+       asterisk is active; "built in" outputs are always present, and "no jack
+       sense" means the hardware cannot tell whether something is plugged in.
+
+EXIT STATUS
+       0      The  card  was  examined  (or,  without  access,   the   service
+              answered).
+
+       1      There is no such card --  the  kernel  has  no  driver  for  the
+              machine's sound hardware, or there is none  --  or  neither  the
+              device nor the service could be asked.
+
+       2      A bad argument.
+
+FILES
+       /dev/audioN
+              The native PCM node of card N (crw-rw---- root audio).
+
+       /dev/dsp, /dev/dspN
+              The OSS-compatible PCM node of the same card.
+
+       /dev/mixer, /dev/mixerN
+              The control node, used for everything except --probe.
+
+SEE ALSO
+       audioctl(1), audiotest(1), audiod(1), adduser(8), dmesg(1)
+
+LikeOS                        October 2026                        AUDIOINFO(1)

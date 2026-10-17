@@ -79,6 +79,16 @@ for d in "$port"/*/; do
 	man) continue ;;
 	esac
 	[ -f "$d/packages.list" ] && continue
+	# In-tree packages ("in-tree" as the source in packages.list, e.g.
+	# gtk3/gst-likeos-audio-1.0) are our own checked-in source: keep the
+	# tree, remove only the build directories build.sh made inside it.
+	if [ -f "$port/packages.list" ] &&
+		awk -v d="$(basename "$d")" '$1 !~ /^#/ && $4 == "in-tree" &&
+			$2 "-" $3 == d { f = 1 } END { exit !f }' \
+			"$port/packages.list"; then
+		rm -rf "$d.likeos-build" "$d.likeos-host"
+		continue
+	fi
 	rm -rf "$d"
 	n=$((n + 1))
 done

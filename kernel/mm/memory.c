@@ -3625,17 +3625,33 @@ void mm_free_guarded_kstack(void *stack_base, size_t usable_size)
 	uint64_t slot_base = stack_va - PAGE_SIZE;
 	size_t num_pages = usable_size / PAGE_SIZE;
 
-	for (size_t i = 0; i < num_pages; i++) {
-		uint64_t va = stack_va + i * PAGE_SIZE;
-		uint64_t phys = mm_get_physical_address(va);
-		mm_unmap_page_no_shootdown(va);
-		if (phys)
-			mm_free_physical_page(phys);
-	}
+	/* The frames go back to the allocator only once no processor can
+	 * still reach them through a cached translation: unmap everything,
+	 * shoot the translations down once, and only then free.  Freeing
+	 * first let another processor write through its stale entry into a
+	 * page the allocator had already handed to someone else.  A stack
+	 * larger than the batch below is done in batches, each with its own
+	 * shootdown. */
+	enum { KSTACK_FREE_BATCH = 16 };
+	uint64_t phys[KSTACK_FREE_BATCH];
 
-	// One shootdown covers all unmapped pages.
-	if (sched_is_smp()) {
-		smp_tlb_shootdown_sync();
+	for (size_t done = 0; done < num_pages;) {
+		size_t n = num_pages - done;
+
+		if (n > KSTACK_FREE_BATCH)
+			n = KSTACK_FREE_BATCH;
+		for (size_t i = 0; i < n; i++) {
+			uint64_t va = stack_va + (done + i) * PAGE_SIZE;
+
+			phys[i] = mm_get_physical_address(va);
+			mm_unmap_page_no_shootdown(va);
+		}
+		if (sched_is_smp())
+			smp_tlb_shootdown_sync();
+		for (size_t i = 0; i < n; i++)
+			if (phys[i])
+				mm_free_physical_page(phys[i]);
+		done += n;
 	}
 
 	// Return the slot so it can be reused.

@@ -1,0 +1,230 @@
+MEDIAPLAYER(1)                   User Commands                  MEDIAPLAYER(1)
+
+NAME
+       mediaplayer - play music, videos and internet streams
+
+SYNOPSIS
+       mediaplayer  [--fullscreen]  [--no-video]  [--shuffle]  [--repeat=mode]
+       [--video-sink=name] [file|folder|playlist|URL...]
+       mediaplayer --version
+
+DESCRIPTION
+       mediaplayer is the desktop's music and video player, the program behind
+       Media Player in the Programs menu and the one a double-clicked song  or
+       film  opens in.  It plays whatever the installed GStreamer plug-ins can
+       decode: WAV, AIFF and AU sound, AAC and M4A,  MP4,  Matroska  and  WebM
+       video  with  H.264,  H.265, VP8 and VP9 pictures, and MP3, Vorbis, Opus
+       and FLAC where the FFmpeg decoders  are  enabled.   Streams  play  from
+       http,  https and every other kind of address a GStreamer source element
+       is installed for, including HLS and DASH.
+
+       The window shows the picture (or, for music, the album  cover)  with  a
+       control  bar  below  it,  and  the play queue at the right.  Sound goes
+       through autoaudiosink, which picks the system's sound service,  so  the
+       player mixes with everything else that is making a sound.
+
+       Each  file,  folder,  playlist  or address given on the command line is
+       added to the queue, and the first  one  starts  playing.   Folders  are
+       searched  recursively  for  media files, which are queued in name order
+       ("Track 2" before "Track 10"), each folder's files before its sub-fold-
+       ers.  Hidden  files  and  folders  are  skipped.   M3U,  M3U8  and  PLS
+       playlists are read and their entries queued; relative entries are taken
+       relative  to the playlist, and Windows-style backslash paths are under-
+       stood.
+
+OPTIONS
+       -f, --fullscreen
+              Start in full screen.
+
+       -a, --no-video
+              Play the sound only.  Video streams  are  not  decoded  at  all,
+              which saves the processor time a film's pictures would cost; the
+              cover-art page is shown instead.
+
+       -s, --shuffle
+              Turn  shuffle  on.   Like the button, this is remembered for the
+              next start.
+
+       -r, --repeat=mode
+              Set the repeat mode: none (or off), all (start the queue over at
+              its end) or one (play the current entry again and  again).   Re-
+              membered like the button.
+
+       --video-sink=name
+              Choose how pictures reach the screen, for this run only:
+
+              auto    The default: the first of xv, gtk and x11 that works.
+
+              xv      The  X  video extension.  The X server (and the graphics
+                      hardware behind it) converts  and  scales  the  picture,
+                      which  makes  it the cheapest by far.  Needs an Xv adap-
+                      tor; xvinfo(1) lists them.
+
+              gtk     Pictures drawn by GTK.   Works  on  every  display,  but
+                      scales in software.
+
+              x11     Plain  X  images.  Cannot scale, so the picture is shown
+                      at its own size.
+
+              gl      GTK's OpenGL area.  Never chosen automatically.
+
+              If the chosen output cannot be opened, the  automatic  order  is
+              tried.
+
+       --version
+              Print the program's and GStreamer's versions and exit.
+
+       The standard GTK and GStreamer options are accepted as well (--display,
+       --gst-debug-level, and so on); see mediaplayer --help-all.
+
+THE WINDOW
+       Seek bar
+              Drag  it,  click  it,  or scroll on it.  While it is dragged the
+              picture follows  in  key-frame  steps;  the  final  position  is
+              reached  exactly  when  it  is let go.  Clicking the time at its
+              right switches between the length of the entry and the time  re-
+              maining.
+
+       Transport
+              Shuffle,  previous, play/pause, next, repeat and stop.  Previous
+              restarts the current entry when more than three  seconds  of  it
+              have played, and goes to the entry before otherwise.  The repeat
+              button cycles through off, all and "this one".
+
+       Volume The slider follows the way loudness is heard (a cubic scale), so
+              its  middle sounds like half.  It controls this program's stream
+              only; the system volume is audioctl(1).  Turning the  volume  up
+              also unmutes.
+
+       Play queue
+              Double-click an entry, or select it and press Enter, to play it.
+              Entries  are  reordered by dragging them, or with the arrow but-
+              tons below the list; Delete removes the  selected  ones.   Files
+              and  folders  dropped  on the list are inserted where they fall;
+              dropped on the picture they are added and played at  once.   Ti-
+              tles,  artists and lengths of queued local files are read in the
+              background before they play.  The right  mouse  button  opens  a
+              menu with the same actions.
+
+       Menu   Open  files, folders, locations and playlists; save the queue as
+              a playlist; choose the audio track and the subtitles of  a  film
+              with  several;  set the playback speed (the pitch is kept); show
+              the media information window, the  keyboard  shortcuts  and  the
+              version.
+
+       Full screen
+              Double-click  the  picture,  press  F or F11, or use the button.
+              The control bar slides away while the pointer  rests  and  comes
+              back when it moves; Esc leaves full screen.
+
+       The  middle  mouse button on the picture plays or pauses, the right one
+       opens the menu, and the scroll wheel changes the volume.
+
+KEYBOARD
+       Space                 Play or pause.
+
+       N, P                  Next  or  previous  entry  (also  Ctrl+Right  and
+                             Ctrl+Left, and the media keys).
+
+       Left, Right           Back  or  forward  5  seconds;  with  Shift,  one
+                             minute.
+
+       Home                  Back to the beginning.
+
+       0 ... 9               Jump to 0 %, 10 % ... 90 % of the entry.
+
+       Up, Down              Volume up or down by 5 %; also + and -.
+
+       M                     Mute or unmute.
+
+       S                     Shuffle on or off.
+
+       R                     Repeat: off, all, this one.
+
+       [, ]                  Slower or faster (0.5x to 2x); Backspace  returns
+                             to normal speed.
+
+       F, F11                Full screen on or off.
+
+       Esc                   Leave full screen.
+
+       T                     Show the length or the time remaining.
+
+       I, Ctrl+I             Media  information:  tags,  codecs, picture size,
+                             sample rate, and which video  and  sound  outputs
+                             are in use.
+
+       F9                    Show or hide the play queue.
+
+       Delete                Remove  the  selected  queue  entries  (while the
+                             queue has the keyboard).
+
+       Ctrl+O                Open files; Ctrl+Shift+O opens a folder.
+
+       Ctrl+L                Open a location (an internet address).
+
+       Ctrl+S                Save the queue as a playlist.
+
+       F1                    The list of shortcuts.
+
+       Ctrl+Q                Quit.
+
+       While the queue has the keyboard (after it is clicked), the arrow  keys
+       move  through  it;  clicking the picture gives them back to seeking and
+       the volume.
+
+ERRORS
+       An entry that cannot be played is marked in the queue and explained  in
+       a  dialog,  with  the  technical  details  folded  away  beneath.  When
+       GStreamer reports that it needs a plug-in that is  not  installed,  the
+       dialog names it -- "MPEG-1 Layer 3 (MP3) decoder", for example.  A film
+       whose  pictures  play  but whose sound (or subtitles) cannot be decoded
+       keeps playing, with a note above the picture.
+
+       When the queue moves on by itself and the next entry fails, that  entry
+       is  skipped with a note instead of stopping everything behind a dialog,
+       unless every entry in turn has failed.
+
+FILES
+       ~/.config/mediaplayer/settings
+              What is remembered between runs: volume and  mute,  shuffle  and
+              repeat,  the window and queue sizes, whether the queue is shown,
+              the folder the file chooser last opened, and the keys below.   A
+              key  file with one [Player] group, written with mode 0600.  Keys
+              that are missing, mistyped or out of range fall  back  to  their
+              defaults one by one.
+
+              video-sink          The default for --video-sink.
+
+              gapless             true  (the  default)  to run consecutive en-
+                                  tries together without a pause.
+
+              discover-metadata   false to stop titles and lengths  of  queued
+                                  files from being read ahead.
+
+              subtitles           false to start with subtitles hidden.
+
+       /usr/share/applications/mediaplayer.desktop
+              The desktop entry: the applications menu, and the file manager's
+              "Open With" list.
+
+ENVIRONMENT
+       MEDIAPLAYER_VIDEO_SINK
+              Used  instead  of the remembered video-sink when no --video-sink
+              is given.
+
+       GST_DEBUG
+              GStreamer's own diagnostics, as for every GStreamer program.
+
+EXIT STATUS
+       0      The window was closed.
+
+       1      The display could not be opened, or GStreamer  (or  its  playbin
+              element) is missing.
+
+       2      A bad option.
+
+SEE ALSO
+       audioplay(1), audioctl(1), eventsound(1), xvinfo(1)
+
+LikeOS                           October 2026                   MEDIAPLAYER(1)

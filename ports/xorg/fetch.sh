@@ -99,6 +99,19 @@ fetch_one() {
 	deb=$4
 	repo=$5
 
+	# No source at all: "in-tree" in the URL column marks a package whose
+	# tree is checked in beside the manifest as <name>-<version>/ (our own
+	# code, e.g. the GTK3 port's gst-likeos-audio).  Nothing to download;
+	# only make sure the tree is really there.
+	if [ "$deb" = "in-tree" ]; then
+		if [ -d "$port/$name-$version" ]; then
+			echo "  have $name-$version/  [in-tree]"
+			return 0
+		fi
+		echo "  FAIL $name-$version (in-tree source missing)" >&2
+		return 1
+	fi
+
 	# A fourth source: an explicit URL, given where the Debian source-package
 	# field would go and recognised by its scheme.  %VERSION% in it expands to
 	# the version column.

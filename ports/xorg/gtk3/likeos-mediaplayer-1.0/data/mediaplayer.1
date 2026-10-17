@@ -1,0 +1,295 @@
+.\" mediaplayer.1 - manual page for Media Player.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages, so
+.\" the installed copy is res/man/mediaplayer.1, rendered from this file with
+.\"   GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+.\"     data/mediaplayer.1 | col -bx > res/man/mediaplayer.1
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH MEDIAPLAYER 1 "October 2026" "LikeOS" "User Commands"
+.SH NAME
+mediaplayer \- play music, videos and internet streams
+.SH SYNOPSIS
+.B mediaplayer
+.RB [ \-\-fullscreen ]
+.RB [ \-\-no\-video ]
+.RB [ \-\-shuffle ]
+.RB [ \-\-repeat =\c
+.IR mode ]
+.RB [ \-\-video\-sink =\c
+.IR name ]
+.RI [ file | folder | playlist | URL ...]
+.br
+.B mediaplayer \-\-version
+.SH DESCRIPTION
+.B mediaplayer
+is the desktop's music and video player, the program behind
+.B Media Player
+in the Programs menu and the one a double-clicked song or film opens in.
+It plays whatever the installed GStreamer plug-ins can decode: WAV, AIFF and
+AU sound, AAC and M4A, MP4, Matroska and WebM video with H.264, H.265, VP8 and
+VP9 pictures, and MP3, Vorbis, Opus and FLAC where the FFmpeg decoders are
+enabled.  Streams play from
+.BR http ,
+.B https
+and every other kind of address a GStreamer source element is installed for,
+including HLS and DASH.
+.PP
+The window shows the picture (or, for music, the album cover) with a control
+bar below it, and the play queue at the right.  Sound goes through
+.BR autoaudiosink ,
+which picks the system's sound service, so the player mixes with everything
+else that is making a sound.
+.PP
+Each file, folder, playlist or address given on the command line is added to
+the queue, and the first one starts playing.  Folders are searched
+recursively for media files, which are queued in name order (\(lqTrack 2\(rq
+before \(lqTrack 10\(rq), each folder's files before its sub-folders.
+Hidden files and folders are skipped.  M3U, M3U8 and PLS playlists are read
+and their entries queued; relative entries are taken relative to the
+playlist, and Windows-style backslash paths are understood.
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-fullscreen
+Start in full screen.
+.TP
+.BR \-a ", " \-\-no\-video
+Play the sound only.  Video streams are not decoded at all, which saves the
+processor time a film's pictures would cost; the cover-art page is shown
+instead.
+.TP
+.BR \-s ", " \-\-shuffle
+Turn shuffle on.  Like the button, this is remembered for the next start.
+.TP
+.BR \-r ", " \-\-repeat =\c
+.I mode
+Set the repeat mode:
+.B none
+(or
+.BR off ),
+.B all
+(start the queue over at its end) or
+.B one
+(play the current entry again and again).  Remembered like the button.
+.TP
+.BR \-\-video\-sink =\c
+.I name
+Choose how pictures reach the screen, for this run only:
+.RS
+.TP 8
+.B auto
+The default: the first of
+.BR xv ,
+.B gtk
+and
+.B x11
+that works.
+.TP
+.B xv
+The X video extension.  The X server (and the graphics hardware behind it)
+converts and scales the picture, which makes it the cheapest by far.  Needs
+an Xv adaptor;
+.BR xvinfo (1)
+lists them.
+.TP
+.B gtk
+Pictures drawn by GTK.  Works on every display, but scales in software.
+.TP
+.B x11
+Plain X images.  Cannot scale, so the picture is shown at its own size.
+.TP
+.B gl
+GTK's OpenGL area.  Never chosen automatically.
+.RE
+.IP
+If the chosen output cannot be opened, the automatic order is tried.
+.TP
+.B \-\-version
+Print the program's and GStreamer's versions and exit.
+.PP
+The standard GTK and GStreamer options are accepted as well
+.RB ( \-\-display ,
+.BR \-\-gst\-debug\-level ,
+and so on); see
+.BR "mediaplayer \-\-help\-all" .
+.SH THE WINDOW
+.TP
+.B Seek bar
+Drag it, click it, or scroll on it.  While it is dragged the picture follows
+in key-frame steps; the final position is reached exactly when it is let go.
+Clicking the time at its right switches between the length of the entry and
+the time remaining.
+.TP
+.B Transport
+Shuffle, previous, play/pause, next, repeat and stop.  Previous restarts the
+current entry when more than three seconds of it have played, and goes to the
+entry before otherwise.  The repeat button cycles through off, all and
+\(lqthis one\(rq.
+.TP
+.B Volume
+The slider follows the way loudness is heard (a cubic scale), so its middle
+sounds like half.  It controls this program's stream only; the system volume
+is
+.BR audioctl (1).
+Turning the volume up also unmutes.
+.TP
+.B Play queue
+Double-click an entry, or select it and press Enter, to play it.  Entries are
+reordered by dragging them, or with the arrow buttons below the list; Delete
+removes the selected ones.  Files and folders dropped on the list are inserted
+where they fall; dropped on the picture they are added and played at once.
+Titles, artists and lengths of queued local files are read in the background
+before they play.  The right mouse button opens a menu with the same actions.
+.TP
+.B Menu
+Open files, folders, locations and playlists; save the queue as a playlist;
+choose the audio track and the subtitles of a film with several; set the
+playback speed (the pitch is kept); show the media information window, the
+keyboard shortcuts and the version.
+.TP
+.B Full screen
+Double-click the picture, press
+.B F
+or F11, or use the button.  The control bar slides away while the pointer
+rests and comes back when it moves; Esc leaves full screen.
+.PP
+The middle mouse button on the picture plays or pauses, the right one opens
+the menu, and the scroll wheel changes the volume.
+.SH KEYBOARD
+.TP 22
+.B Space
+Play or pause.
+.TP
+.B N\fR,\fP P
+Next or previous entry (also Ctrl+Right and Ctrl+Left, and the media keys).
+.TP
+.B Left\fR,\fP Right
+Back or forward 5 seconds; with Shift, one minute.
+.TP
+.B Home
+Back to the beginning.
+.TP
+.B 0 \fR...\fP 9
+Jump to 0 %, 10 % ... 90 % of the entry.
+.TP
+.B Up\fR,\fP Down
+Volume up or down by 5 %; also + and \-.
+.TP
+.B M
+Mute or unmute.
+.TP
+.B S
+Shuffle on or off.
+.TP
+.B R
+Repeat: off, all, this one.
+.TP
+.B [\fR,\fP ]
+Slower or faster (0.5\(mu to 2\(mu); Backspace returns to normal speed.
+.TP
+.B F\fR,\fP F11
+Full screen on or off.
+.TP
+.B Esc
+Leave full screen.
+.TP
+.B T
+Show the length or the time remaining.
+.TP
+.B I\fR,\fP Ctrl+I
+Media information: tags, codecs, picture size, sample rate, and which video
+and sound outputs are in use.
+.TP
+.B F9
+Show or hide the play queue.
+.TP
+.B Delete
+Remove the selected queue entries (while the queue has the keyboard).
+.TP
+.B Ctrl+O
+Open files; Ctrl+Shift+O opens a folder.
+.TP
+.B Ctrl+L
+Open a location (an internet address).
+.TP
+.B Ctrl+S
+Save the queue as a playlist.
+.TP
+.B F1
+The list of shortcuts.
+.TP
+.B Ctrl+Q
+Quit.
+.PP
+While the queue has the keyboard (after it is clicked), the arrow keys move
+through it; clicking the picture gives them back to seeking and the volume.
+.SH ERRORS
+An entry that cannot be played is marked in the queue and explained in a
+dialog, with the technical details folded away beneath.  When GStreamer
+reports that it needs a plug-in that is not installed, the dialog names it
+\(em \(lqMPEG-1 Layer 3 (MP3) decoder\(rq, for example.  A film whose
+pictures play but whose sound (or subtitles) cannot be decoded keeps playing,
+with a note above the picture.
+.PP
+When the queue moves on by itself and the next entry fails, that entry is
+skipped with a note instead of stopping everything behind a dialog, unless
+every entry in turn has failed.
+.SH FILES
+.TP
+.I ~/.config/mediaplayer/settings
+What is remembered between runs: volume and mute, shuffle and repeat, the
+window and queue sizes, whether the queue is shown, the folder the file
+chooser last opened, and the keys below.  A key file with one
+.B [Player]
+group, written with mode 0600.  Keys that are missing, mistyped or out of
+range fall back to their defaults one by one.
+.RS
+.TP 20
+.B video-sink
+The default for
+.BR \-\-video\-sink .
+.TP
+.B gapless
+.B true
+(the default) to run consecutive entries together without a pause.
+.TP
+.B discover-metadata
+.B false
+to stop titles and lengths of queued files from being read ahead.
+.TP
+.B subtitles
+.B false
+to start with subtitles hidden.
+.RE
+.TP
+.I /usr/share/applications/mediaplayer.desktop
+The desktop entry: the applications menu, and the file manager's \(lqOpen
+With\(rq list.
+.SH ENVIRONMENT
+.TP
+.B MEDIAPLAYER_VIDEO_SINK
+Used instead of the remembered
+.B video-sink
+when no
+.B \-\-video\-sink
+is given.
+.TP
+.B GST_DEBUG
+GStreamer's own diagnostics, as for every GStreamer program.
+.SH EXIT STATUS
+.TP
+.B 0
+The window was closed.
+.TP
+.B 1
+The display could not be opened, or GStreamer (or its
+.B playbin
+element) is missing.
+.TP
+.B 2
+A bad option.
+.SH SEE ALSO
+.BR audioplay (1),
+.BR audioctl (1),
+.BR eventsound (1),
+.BR xvinfo (1)

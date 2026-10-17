@@ -36,6 +36,19 @@ while read -r section name version deb repo rest; do
 	esac
 	[ -n "${want}" ] && case " $want " in *" $name "*) ;; *) continue ;; esac
 
+	# An in-tree package (see fetch.sh) is already a source tree, and never
+	# patched: it is our own code, changed in place.
+	if [ "${deb:-}" = "in-tree" ]; then
+		if [ -d "$port/$name-$version" ]; then
+			echo "  have $name-$version/  (in-tree)"
+			done_n=$((done_n + 1))
+		else
+			echo "  FAIL $name-$version (in-tree source missing)" >&2
+			fail_n=$((fail_n + 1))
+		fi
+		continue
+	fi
+
 	# Take whatever version is actually on disk rather than insisting on the
 	# pinned one: when the x.org archive is unreachable the Debian fallback
 	# often supplies an older release, and the tree should still be

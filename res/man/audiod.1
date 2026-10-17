@@ -1,0 +1,217 @@
+AUDIOD(1)                        User Commands                       AUDIOD(1)
+
+NAME
+       audiod - the LikeOS audio service: mixes every program's sound onto the
+       sound card
+
+SYNOPSIS
+       audiod [-f] [-v]...  [-c config] [-d device]
+       audiod -t [-c config]
+       audiod -V
+
+DESCRIPTION
+       audiod  owns  the  sound  card.  Programs do not open /dev/audio0 them-
+       selves; they connect to the service  through  the  socket  /var/run/au-
+       diod/socket  (with  libaudio, the GStreamer element likeosaudiosink, or
+       the tools audioplay(1),  eventsound(1)  and  audioctl(1)),  and  audiod
+       mixes  all of them into one stream for the hardware.  That is what lets
+       a browser video, a music player and a notification sound  play  at  the
+       same time, each at its own volume.
+
+       Each program sends its sound in whatever format it has: 8, 16, 24 or 32
+       bit integer, 32 or 64 bit float, 1 to 8 channels, any rate from 4000 to
+       384000  Hz.  audiod converts it to the card's format, resamples it with
+       a windowed-sinc polyphase filter whose ratio is exact (a  stream  never
+       drifts  against the card, however long it plays), up- or down-mixes the
+       channels with the usual downmix coefficients (centre and surround chan-
+       nels folded in at -3 dB, LFE dropped on cards without one), applies the
+       stream's volume and the master volume with short ramps so changes never
+       click, and limits the sum softly so that  many  loud  streams  together
+       compress instead of distorting.
+
+       The card is driven with 25 ms periods by default, 4 of  them,  which
+       keeps  the  service's own latency around 100 ms.  After a  few  sec-
+       onds  of  silence the card is stopped, so an idle system has no wakeups
+       for sound; it starts again the moment a program plays.
+
+       Headphone and line jacks, HDMI and DisplayPort monitors  are  followed:
+       when  the card reports a jack or a monitor coming or going, the outputs
+       are read again and subscribed clients (audioctl(1) and  desktop  volume
+       controls) are told.  An HDMI or DisplayPort output with its own PCM de-
+       vice  on the card is selected by moving the stream to that device; when
+       its monitor goes away audiod falls back to the analog outputs  and  re-
+       turns  once  it is back.  If the card disappears altogether the service
+       carries on with a silent output paced by the clock,  so  programs  keep
+       playing at the right speed, and looks for the card again every few sec-
+       onds.
+
+       The master volume, mute, the chosen output and card survive restarts in
+       /var/lib/audiod/state.
+
+OPTIONS
+       -f     Stay  in  the  foreground.   This is how init(8) starts it, from
+              /etc/inittab: respawn /usr/sbin/audiod -f .  Without it the ser-
+              vice detaches and logs to the console.
+
+       -v     Log more: once for informational messages, twice for  debugging.
+              By default only warnings and errors are logged.
+
+       -c config
+              Read the configuration from config instead of /etc/audiod.conf.
+
+       -d device
+              Use  this  sound  device,  overriding the configuration: auto, a
+              card number 0 to 7, or a path /dev/audioN or /dev/dsp[N].
+
+       -t     Check the configuration file, print what it sets, and exit: sta-
+              tus 0 when it is valid, 1 when it is not.
+
+       -V     Print the version and exit.
+
+CONFIGURATION
+       /etc/audiod.conf holds lines of the form key  =  value,  with  comments
+       starting  with  # or ;.  Parsing is strict: an unknown key, a key given
+       twice, or a value that is not exactly what the key expects rejects  the
+       whole  file  with the line number, and the service keeps what it had --
+       the built-in defaults at start, the previous configuration  on  SIGHUP.
+       The file must belong to root and must not be writable by others, nor by
+       a group other than root.
+
+       device auto  (the  first card that plays, preferring the one remembered
+              in the state file), a  card  number,  or  /dev/audioN.   Default
+              auto.
+
+       rate   The  card's  sample rate, 8000 to 192000, or auto: 48000 Hz when
+              the card can, 44100 Hz otherwise.  Default auto.
+
+       format auto, s16, s24, s24_3, s20, s32, float or u8.  Auto takes 16 bit
+              when the card has it.
+
+       channels
+              1 to 8, or auto (stereo).
+
+       period_ms
+              Length of one period, 1 to 100 ms.  Default 25.  Keep it above
+              about 16 ms: an emulated card in a virtual machine may  advance
+              only one period per host timer tick (often 15.6 ms).
+
+       periods
+              Periods in the card's ring, 2 to 32.   Default  4.   The  card's
+              buffer, and so the latency it adds, is period_ms times periods.
+
+       default_volume
+              Master  volume, 0 to 100, when there is no saved state.  Default
+              75.
+
+       resample_quality
+              best (64-tap filter, about 100 dB of stop-band rejection),  good
+              (32  taps,  about 80 dB; the default) or fast (linear interpola-
+              tion, for very slow machines).
+
+       event_sounds
+              yes or no: whether event sounds  (start-up,  notifications)  are
+              played at all.
+
+       event_rate
+              How many event sounds one user may start in 10 seconds.  Default
+              10.
+
+       max_streams_per_user
+              Streams one user may have open, 1 to 64.  Default 16.
+
+       max_clients
+              Connections at once, 1 to 256.  Default 64.  One user may use at
+              most three quarters of them.
+
+       max_buffer_kb_per_user
+              Stream buffer memory one user may hold, in KiB.  Default 16384.
+
+       default_buffer_ms
+              Buffer  of a stream that does not ask for a size, 10 to 2000 ms.
+              Default 40.
+
+       suspend_ms
+              Stop the card after this much silence; 0 keeps it running.   De-
+              fault 5000.
+
+       hw_volume
+              auto,  yes or no: whether the master volume moves the card's am-
+              plifier (when it has one) or is applied to the samples.  Default
+              auto.
+
+       log_level
+              error, warning, info or debug.  Default warning.
+
+SECURITY
+       audiod starts as root only to create /var/run/audiod (mode 0755,  owner
+       audiod:audio)  and /var/lib/audiod (0700), and to open the card and the
+       socket.  Then it reduces its groups to audio, sets its group  and  user
+       ids  to audio and audiod for good, checks that root cannot be regained,
+       changes to / and sets its umask to 077.  It refuses to continue if  any
+       of that fails.
+
+       The  socket  is mode 0666: every local user may play sound.  The kernel
+       names the user on the other end of every connection (SO_PEERCRED),  and
+       that is what decides what a client may do:
+
+       o  anyone  may  play, and may change the master volume, mute and output
+          -- it is the person at the machine who turns the sound down;
+
+       o  the volume of another program's  stream  can  be  changed,  and  the
+          stream stopped, only by the user who owns it, or by root;
+
+       o  only root may switch to another card;
+
+       o  everyone  sees  the  list of streams, but the titles of other users'
+          streams are left out.
+
+       Every message is checked against the protocol before its body is  read;
+       a  malformed message, an unknown request, or sound data beyond what the
+       service asked for closes that connection.  Connections, streams, buffer
+       memory and event sounds are limited per user.  Event sounds are  played
+       by    name    only    (letters    a-z,    digits,   _   and   -)   from
+       /usr/share/sounds/likeos; no path a client sends is ever opened.
+
+SIGNALS
+       SIGTERM
+              Fade out over 60 ms, let the card play that, close it, save  the
+              state and exit.
+
+       SIGHUP Read  the  configuration again.  When the card settings changed,
+              the card is reopened with them; playing streams continue.
+
+       SIGUSR1
+              Log the state of the card and of every stream, at warning  level
+              so it appears without -v.
+
+FILES
+       /etc/audiod.conf
+              The configuration.
+
+       /var/run/audiod/socket
+              Where clients connect.
+
+       /var/lib/audiod/state
+              Master volume, mute, output and card, written atomically.
+
+       /usr/share/sounds/likeos/*.wav
+              The event sounds.
+
+       /dev/audio0 /dev/mixer
+              The first card; further cards are /dev/audioN and /dev/mixerN.
+
+EXIT STATUS
+       0      Stopped  by  SIGTERM  or  SIGINT,  or -t found the configuration
+              valid.
+
+       1      Could not start: another audiod is running, the socket directory
+              or the socket could not be created, or privileges could  not  be
+              dropped.  With -t: the configuration is not valid.
+
+       2      A bad argument.
+
+SEE ALSO
+       audioctl(1),  audioplay(1),  audiotest(1), audioinfo(1), eventsound(1),
+       mediaplayer(1), init(8)
+
+LikeOS                           October 2026                        AUDIOD(1)

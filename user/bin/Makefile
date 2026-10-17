@@ -7,6 +7,7 @@ LIBC_DIR = ../lib/libc
 RTLD_DIR = ../lib/rtld
 LIBPAM_DIR = ../lib/libpam
 LIBCRYPT_DIR = ../lib/libcrypt
+LIBAUDIO_DIR = ../lib/libaudio
 
 # Header dependencies: without them a change to a libc header rebuilt none of
 # these programs, so a binary could be linked against a libc whose structures
@@ -16,7 +17,7 @@ DEPFLAGS = -MMD -MP
 CFLAGS = $(DEPFLAGS) -Wall -Wextra -Werror=implicit-function-declaration \
 	-Werror=misleading-indentation -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include \
-         -I$(LIBPAM_DIR)/include \
+         -I$(LIBPAM_DIR)/include -I$(LIBAUDIO_DIR)/include \
          -fno-tree-vectorize -fno-strict-aliasing
 
 # Dynamic PIE linking against libc.so (includes pthread)
@@ -61,7 +62,12 @@ TESTS = test_syscalls testmem teststress netstress openssltest usbtest ext4test 
 	forkstress wkstress codecheck
 TEST_BINS = $(addprefix tests/,$(TESTS))
 
-all: $(PROGRAMS) $(TEST_BINS) tests/test_libc login passwd su addgroup delgroup reboot halt
+# The audio tools talk to audiod through libaudio (custom rule below).
+AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
+AUDIO_LDFLAGS = -L$(LIBAUDIO_DIR) -rpath-link $(LIBC_DIR):$(LIBAUDIO_DIR):$(RTLD_DIR)
+
+all: $(PROGRAMS) $(TEST_BINS) tests/test_libc login passwd su addgroup delgroup reboot halt \
+	$(AUDIO_PROGS)
 
 # Generic link rule: crt1.o + program.o → PIE binary linked against libc.so + libpthread.so
 define LINK_RULE
@@ -78,6 +84,13 @@ login: $(CRT1) login.o $(LDSCRIPT)
 
 su: $(CRT1) su.o $(LDSCRIPT)
 	$(LD) $(LDFLAGS) $(AUTH_LDFLAGS) $(CRT1) su.o -lpam $(LIBS) -o $@
+
+define AUDIO_LINK_RULE
+$(1): $(CRT1) $(1).o $(LDSCRIPT)
+	$$(LD) $$(LDFLAGS) $$(AUDIO_LDFLAGS) $$(CRT1) $(1).o -laudio $$(LIBS) -o $$@
+endef
+
+$(foreach prog,$(AUDIO_PROGS),$(eval $(call AUDIO_LINK_RULE,$(prog))))
 
 # passwd hashes with libcrypt (crypt + crypt_gensalt) directly.
 passwd: $(CRT1) passwd.o $(LDSCRIPT)
@@ -109,6 +122,7 @@ halt: poweroff
 
 clean:
 	rm -f *.o $(PROGRAMS) login passwd su addgroup delgroup reboot halt tests/*.o $(TEST_BINS) tests/test_libc
+	rm -f $(AUDIO_PROGS)
 	rm -f *.d tests/*.d shell/*.d
 
 .PHONY: all clean

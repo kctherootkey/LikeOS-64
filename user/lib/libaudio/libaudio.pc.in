@@ -1,0 +1,16 @@
+# pkg-config metadata for libaudio, the LikeOS audio client library.
+# @VERSION@ is filled in by ports/xorg/import-libaudio.sh.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libaudio
+Description: LikeOS audio client library (plays through audiod)
+Version: @VERSION@
+Requires:
+Libs: -L${libdir} -laudio
+Cflags: -I${includedir}

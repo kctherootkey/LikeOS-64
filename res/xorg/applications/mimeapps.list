@@ -76,3 +76,18 @@ x-scheme-handler/mailto=claws-mail.desktop
 
 # A .desktop file is a launcher, and editing one is what lxshortcut does.
 application/x-desktop=lxshortcut.desktop
+
+# Music, video and playlists play in the media player.
+audio/mpeg=mediaplayer.desktop
+audio/flac=mediaplayer.desktop
+audio/ogg=mediaplayer.desktop
+audio/x-vorbis+ogg=mediaplayer.desktop
+audio/x-opus+ogg=mediaplayer.desktop
+audio/x-wav=mediaplayer.desktop
+audio/mp4=mediaplayer.desktop
+audio/x-mpegurl=mediaplayer.desktop
+audio/x-scpls=mediaplayer.desktop
+video/mp4=mediaplayer.desktop
+video/x-matroska=mediaplayer.desktop
+video/webm=mediaplayer.desktop
+video/ogg=mediaplayer.desktop

@@ -6,6 +6,7 @@ void vmwgfx_init(void);
 int i915_init(void);
 void drm_console_start_worker(void);
 #include <kernel/fs/sysfs.h>
+#include <kernel/dev/sound/snd.h>
 void procfs_init(void);
 #include <kernel/fs/tmpfs.h>
 #include <kernel/ke/hrtimer.h>
@@ -51,6 +52,8 @@ static storage_fs_state_t g_storage_state;
 static boot_info_t *g_boot_info;
 static uint64_t
 	g_rsdp_address; // Saved RSDP address (copied before identity unmap)
+uint64_t g_boot_smbios_entry; // SMBIOS entry points from the bootloader
+uint64_t g_boot_smbios3_entry;
 static uint64_t
 	g_smp_trampoline_address; // Saved SMP trampoline address from bootloader
 static uint64_t g_boot_epoch_saved; // Saved boot epoch from UEFI GetTime
@@ -198,6 +201,13 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 	// Save RSDP address before identity mapping is removed (boot_info is in low memory)
 	g_rsdp_address = boot_info->rsdp_address;
 
+	// The SMBIOS entry points, when the bootloader is new enough to report
+	// them (the magic says the fields exist).
+	if (boot_info->smbios_magic == BOOT_SMBIOS_MAGIC) {
+		g_boot_smbios_entry = boot_info->smbios_address;
+		g_boot_smbios3_entry = boot_info->smbios3_address;
+	}
+
 	// Save SMP trampoline address from bootloader
 	g_smp_trampoline_address = boot_info->smp_trampoline_addr;
 
@@ -282,6 +292,12 @@ __no_stack_protector void continue_system_startup(void)
 		 * any point leaves the GOP framebuffer path as it is. */
 		(void)i915_init();
 	}
+
+	/* Sound cards (HD Audio, AC'97, AudioPCI, the audio DSP): after the
+	 * display drivers, so an HDMI codec finds the display side already
+	 * registered.  Probing only; firmware and the worker thread come with
+	 * snd_late_init() once the root filesystem is mounted. */
+	snd_init();
 
 	xhci_boot_init(&g_xhci_boot);
 	usbhid_init();

@@ -1,0 +1,46 @@
+LikeOS system sounds
+Copyright (C) 2026 The LikeOS Project
+
+These are the event sounds audiod plays by name (eventsound <name>,
+la_play_event(), PLAY_EVENT).  They are installed to
+/usr/share/sounds/likeos.
+
+All of them are synthesized by host/gen-sounds.c: FM electric-piano and
+struck-bar (vibraphone, marimba, glass bell) voices, a filtered sawtooth
+pad, band-passed noise, and an algorithmic reverb.  No recordings or
+samples are used.  The files are committed, so building LikeOS does not
+need to run the generator.  To change a sound, edit its build_*() function
+and regenerate:
+
+    gcc -O2 host/gen-sounds.c -lm -o gen-sounds
+    ./gen-sounds res/sounds/likeos
+
+The output is deterministic: the same source gives byte-identical files.
+
+Format: RIFF WAVE, PCM, 48000 Hz, 16-bit, stereo, canonical 44-byte header
+(the samples always start at offset 44).  Each file starts and ends on
+digital silence, has no DC offset, and is TPDF-dithered.  Every sound is in
+D-flat major and uses the same family of timbres.
+
+  file                 length  peak dBFS  loudness  what it is
+  startup.wav          4.00 s     -3.1    -15.6 LUFS  Db major 9 rolled upward as a chime
+                                                      arpeggio (Ab3 to Eb5, crowned by F5)
+                                                      over a swelling pad, with a hall tail
+  shutdown.wav         1.40 s     -7.2    -17.4 LUFS  descending Eb5 C5 Ab4 F4, resolving to
+                                                      Db; the pad darkens and fades
+  login.wav            1.20 s     -7.5    -20.0 LUFS  rising fourth Ab4 to Db5
+  logout.wav           0.75 s    -11.5    -21.0 LUFS  falling fourth Db5 to Ab4
+  notify.wav           0.60 s    -13.3    -21.0 LUFS  glass "ding-dong", C6 to Ab5
+  message.wav          0.70 s    -11.5    -21.0 LUFS  marimba triad Db5 F5 Ab5
+  error.wav            0.50 s    -12.0    -21.0 LUFS  soft falling minor third Eb4 to C4
+  device-added.wav     0.40 s    -12.4    -22.0 LUFS  upward pluck Db5 to Ab5 with a rising
+                                                      noise sweep
+  device-removed.wav   0.40 s    -13.9    -22.0 LUFS  downward pluck Ab5 to Db5 with a
+                                                      falling noise sweep
+  volume.wav           0.08 s    -14.0    -26.2 LUFS  soft tick played when the volume changes
+
+The start-up chime is the loudest sound.  The event sounds are 4 to 10 LU
+quieter, so they stay below whatever else is playing.
+
+License: these sounds are part of LikeOS and are distributed under the same
+license as the rest of LikeOS.

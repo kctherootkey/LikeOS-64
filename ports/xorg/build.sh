@@ -1135,15 +1135,17 @@ meson_opts() {
 		# build instead of silently dropping them:
 		#   isomp4    qtdemux -- MP4/MOV, what most sites serve
 		#   matroska  matroskademux -- WebM, what YouTube serves
-		#   autodetect  autoaudiosink.  NOT for sound: there is no audio
-		#             device here, and WebKit's player RELEASE_ASSERTs
-		#             that it got an audio sink.  With no real sink to
-		#             choose, autoaudiosink plugs a fakesink, so a video
+		#   autodetect  autoaudiosink, which picks likeosaudiosink (the
+		#             audio service) first.  When the service is not
+		#             running it falls back to a fakesink, so a video
 		#             with a soundtrack plays silently instead of taking
-		#             the web process down.
+		#             the web process down (WebKit's player
+		#             RELEASE_ASSERTs that it got an audio sink).
 		#   audiofx   scaletempo, which WebKit's player asks for.
+		#   oss       osssink/osssrc on /dev/dsp (<sys/soundcard.h>), for
+		#             gst-launch pipelines that want the device itself.
 		echo "-Disomp4=enabled -Dmatroska=enabled -Dautodetect=enabled \
-		      -Daudiofx=enabled -Dexamples=disabled -Dtests=disabled \
+		      -Daudiofx=enabled -Doss=enabled -Dexamples=disabled -Dtests=disabled \
 		      -Ddoc=disabled -Dnls=disabled -Dorc=disabled \
 		      -Dqt5=disabled -Dqt6=disabled"
 		;;
@@ -1179,6 +1181,15 @@ meson_opts() {
 		;;
 	gst-libav)
 		echo "-Ddoc=disabled -Dtests=disabled"
+		;;
+	gst-likeos-audio)
+		# Our own plugin (in-tree, gtk3/gst-likeos-audio-1.0): the
+		# likeosaudiosink element over libaudio.  It has no options of
+		# its own; its project() defaults set the build type and
+		# warnings, and libaudio is found through the libaudio.pc that
+		# import-base-libs.sh published.  Named here so the package is
+		# not mistaken for one that was forgotten.
+		echo ""
 		;;
 	*) echo "" ;;
 	esac
@@ -2488,11 +2499,13 @@ build_one() {
 		) >"$log" 2>&1
 	elif [ "$name" = ffmpeg ]; then
 		# The video decoders behind gst-libav: H.264, H.265, VP8, VP9 --
-		# plus ONE audio decoder, AAC.  Not for sound (there is no audio
-		# device, and what it decodes goes to a fakesink): sites like
-		# YouTube only start a video when the browser also claims the
-		# soundtrack's codec, and WebKit's Media Source path claims AAC
-		# as soon as an AAC decoder exists.
+		# and the audio decoders the sound system plays through audiod
+		# (likeosaudiosink): AAC, MP3, Vorbis, Opus, FLAC, ALAC and the
+		# plain PCM variants, with the parsers and the Ogg, MP3, FLAC,
+		# WAV and ADTS demuxers a music file needs.  Sites like YouTube
+		# only start a video when the browser also claims the
+		# soundtrack's codec; WebKit's Media Source path claims each one
+		# as soon as its decoder exists.
 		# FFmpeg's configure is its own, not autoconf -- it refuses
 		# --host and every other option it does not know -- so it gets
 		# an arm of its own, the way sqlite's autosetup does.
@@ -2535,12 +2548,16 @@ build_one() {
 				--enable-vaapi --enable-libdrm \
 				--enable-hwaccel=h264_vaapi,hevc_vaapi,vp8_vaapi,vp9_vaapi \
 				--enable-decoder=h264,hevc,vp8,vp9,aac,rawvideo \
+				--enable-decoder=mp3float,mp3,mp2float,vorbis,opus,flac,alac \
+				--enable-decoder=pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8,pcm_alaw,pcm_mulaw \
 				--enable-parser=h264,hevc,vp8,vp9,aac \
+				--enable-parser=mpegaudio,vorbis,opus,flac \
 				--enable-encoder=rawvideo,wrapped_avframe,pcm_s16le \
 				--enable-demuxer=mov,matroska,mpegts,rawvideo \
+				--enable-demuxer=ogg,mp3,flac,wav,aac \
 				--enable-muxer=null,rawvideo,mp4,matroska \
 				--enable-protocol=file,pipe \
-				--enable-filter=scale,format,hwupload,hwdownload,hwmap,null,anull,aformat,copy \
+				--enable-filter=scale,format,hwupload,hwdownload,hwmap,null,anull,aformat,aresample,copy \
 				--x86asmexe=nasm &&
 				make -j"$(nproc)" &&
 				make install DESTDIR="$SYSROOT" &&

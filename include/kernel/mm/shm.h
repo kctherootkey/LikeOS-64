@@ -93,6 +93,10 @@ int shm_set_size(shm_object_t *obj, unsigned long size);
 
 /* Physical address of one page, or 0 if the index is past the end. */
 uint64_t shm_page_phys(shm_object_t *obj, unsigned long index);
+/* The page at `index', allocated (zeroed) on first use; 0 past the end.
+ * The fault handler of a shared-memory mapping (device_mmap-style
+ * dev_fault: `obj' is the shm_object_t). */
+uint64_t shm_fault_page(void *obj, uint64_t index);
 
 /* Enumeration for /dev/shm readdir: fills `name` for the idx'th live object
  * and returns 1, or returns 0 when idx is past the end. */

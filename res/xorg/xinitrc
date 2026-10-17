@@ -258,17 +258,31 @@ fi
 # behind every other window instead of covering them.
 pcmanfm --desktop &
 
-# The window manager's pid, recorded so the desktop menu can reach it.
-#
-# exec does not change the pid, so $$ here IS what ctwm will be running as a
-# line further down.  That is the whole reason this can be written in advance:
-# ctwm advertises no window a client could ask to restart or quit -- it sets
-# _NET_SUPPORTING_WM_CHECK but no _NET_WM_PID -- and it restarts on SIGHUP and
-# shuts down on SIGTERM, so a pid is all a menu entry needs.  Written before
-# the exec rather than after, because there is no after.
-echo $$ > "$HOME/.ctwm.pid"
+# The start-up sound is not played here: at this point the screen is still
+# black.  The taskbar plays it once the desktop is really up -- its own bar
+# drawn, the window manager running and the desktop window mapped.
 
-# The window manager runs in the FOREGROUND, which is the conventional
-# arrangement for twm and its relatives: "Exit" on the root menu then ends the
-# session and stops the server, rather than merely removing the decorations.
-exec ctwm
+# The window manager runs in the foreground of this script, which is the
+# conventional arrangement for twm and its relatives: when it exits the session
+# ends and xinit stops the server.  It is started in the background and
+# waited for rather than exec'd, so that its pid can be recorded below.  The
+# log-out sound is not played here but by likeos-logout, before the window
+# manager is told to quit: played here, it would come after the desktop had
+# already gone.
+ctwm &
+ctwm_pid=$!
+
+# The window manager's pid, recorded so the desktop can reach it: ctwm
+# advertises no window a client could ask to restart or quit -- it sets
+# _NET_SUPPORTING_WM_CHECK but no _NET_WM_PID -- and it restarts on SIGHUP and
+# shuts down on SIGTERM, so a pid is all the taskbar's menu and likeos-logout
+# need.  A restart re-executes ctwm in the same process, so the pid stays
+# valid for the whole session.
+echo "$ctwm_pid" > "$HOME/.ctwm.pid"
+
+# wait returns early when this shell receives a signal; keep waiting until
+# the window manager is really gone.
+while kill -0 "$ctwm_pid" 2>/dev/null; do
+	wait "$ctwm_pid"
+done
+rm -f "$HOME/.ctwm.pid"
