@@ -23,7 +23,7 @@
 #include <kernel/dev/video/gpu/drm/drm_modes.h>
 #include <kernel/dev/video/gpu/drm/drm_display_info.h>
 #include <kernel/dev/video/gpu/drm/drm_dp.h>
-#include <kernel/dev/i2c.h>
+#include <kernel/dev/video/gpu/drm/i2c.h>
 #include <kernel/ke/syscall.h>
 #include "test-edid-corpus.h"
 

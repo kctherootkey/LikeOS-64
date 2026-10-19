@@ -22,7 +22,7 @@
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/display/intel_legacy_regs.h>
 #include <kernel/dev/video/gpu/drm/drm.h>
-#include <kernel/dev/i2c.h>
+#include <kernel/dev/video/gpu/drm/i2c.h>
 #include <kernel/hal/lapic.h>
 
 #define LG_MAX_PIPES 3

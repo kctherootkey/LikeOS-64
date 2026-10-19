@@ -16,7 +16,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/uapi/drm/drm.h>
 #include <kernel/uapi/drm/drm_mode.h>
-#include <kernel/dev/device.h>
+#include <kernel/fs/device.h>
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/hal/pci.h>

@@ -22,7 +22,7 @@
 
 #include <kernel/dev/video/gpu/drm/drm_scdc_helper.h>
 #include <kernel/dev/video/gpu/drm/gpu_util.h>
-#include <kernel/dev/i2c.h>
+#include <kernel/dev/video/gpu/drm/i2c.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

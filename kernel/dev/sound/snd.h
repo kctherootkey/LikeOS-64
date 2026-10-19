@@ -24,7 +24,7 @@
 #include <kernel/hal/pci.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/waitq.h>
-#include <kernel/dev/device.h>
+#include <kernel/fs/device.h>
 #include <kernel/io/console.h>
 
 /* Group owning the sound device nodes (must match res/etc/group). */

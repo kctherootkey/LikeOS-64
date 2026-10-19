@@ -2,7 +2,7 @@
 //
 // The Status and Control Data Channel lives at I2C address 0x54 of the
 // sink's DDC bus.  A driver passes the I2C adapter of that bus (the GMBUS
-// pin pair of the port, say, <kernel/dev/i2c.h>): a connector here does
+// pin pair of the port, say, <kernel/dev/video/gpu/drm/i2c.h>): a connector here does
 // not carry one of its own.  The register map is drm_scdc.h.
 //
 // What is written to SCDC does not survive the sink going away: a cable

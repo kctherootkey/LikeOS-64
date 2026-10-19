@@ -31,7 +31,7 @@
 
 #define DRM_MAJOR 226
 #define DRM_RENDER_MINOR_BASE 128
-/* DEVFS_GID_VIDEO / DEVFS_GID_RENDER: <kernel/dev/device.h>, via drm.h. */
+/* DEVFS_GID_VIDEO / DEVFS_GID_RENDER: <kernel/fs/device.h>, via drm.h. */
 
 int drm_copy_from_user(void *dst, const void *user, size_t n)
 {

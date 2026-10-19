@@ -12,7 +12,7 @@
 #include <kernel/dev/rand/random.h>
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/input/evdev.h>
-#include <kernel/dev/device.h>
+#include <kernel/fs/device.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
@@ -39,7 +39,7 @@
 #define DEVFS_TYPE_ANON 18 /* anonymous device file; ops in `aops`     */
 #define DEVFS_TYPE_MAX DEVFS_TYPE_ANON
 
-/* DEVFS_GID_TTY / _VIDEO / _INPUT / _RENDER come from <kernel/dev/device.h>,
+/* DEVFS_GID_TTY / _VIDEO / _INPUT / _RENDER come from <kernel/fs/device.h>,
  * shared with the drivers that register their own nodes. */
 
 typedef struct {

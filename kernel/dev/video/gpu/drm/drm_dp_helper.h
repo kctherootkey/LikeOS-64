@@ -34,7 +34,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/dev/video/gpu/drm/drm_dp.h>
-#include <kernel/dev/i2c.h>
+#include <kernel/dev/video/gpu/drm/i2c.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/ke/syscall.h> /* errno values; after rwsem.h (FD_CLOEXEC) */
 #include <kernel/uapi/drm/drm_mode.h>

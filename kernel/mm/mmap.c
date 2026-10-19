@@ -2,7 +2,7 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
-#include <kernel/dev/device.h>
+#include <kernel/fs/device.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

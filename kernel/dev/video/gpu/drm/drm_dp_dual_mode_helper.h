@@ -12,7 +12,7 @@
 // to HDMI (PCON).
 //
 // The I2C adapter is the port's DDC bus (GMBUS) or, for an LSPCON, the
-// I2C-over-AUX tunnel of its DisplayPort side (<kernel/dev/i2c.h>).  The
+// I2C-over-AUX tunnel of its DisplayPort side (<kernel/dev/video/gpu/drm/i2c.h>).  The
 // device argument only names the device in the log and may be NULL.
 //
 // Copyright (C) 2026 The LikeOS Project

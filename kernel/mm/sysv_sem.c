@@ -23,7 +23,7 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/hrtimer.h>
-#include <kernel/dev/device.h> /* poll_notify_wq */
+#include <kernel/fs/device.h> /* poll_notify_wq */
 
 struct sem_undo {
 	struct sem_undo *next;
