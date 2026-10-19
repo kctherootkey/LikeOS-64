@@ -544,6 +544,80 @@ void lapic_init(void)
 // LAPIC Timer Functions
 // ============================================================================
 
+/* One read of the calibration reference with the TSC right before and
+ * after it.  A read the CPU was stopped in the middle of -- an SMI, the
+ * hypervisor descheduling the virtual CPU -- shows as a wide bracket and is
+ * taken again; 50000 cycles is a few tens of microseconds on anything
+ * current.  The TSC value returned is the bracket's start. */
+static bool lapic_ref_read(uint64_t *tsc, uint64_t *ref, uint64_t *mask)
+{
+	for (int i = 0; i < 5; i++) {
+		uint64_t t0 = rdtsc();
+
+		if (!timer_calib_ref_read(ref, mask))
+			return false;
+		uint64_t t1 = rdtsc();
+
+		if (t1 - t0 < 50000ULL) {
+			*tsc = t0;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* The TSC's rate and the local timer's, measured together over 50 ms of the
+ * HPET or the ACPI PM timer.  False when the platform has neither or the
+ * reference could not be read cleanly; nothing is changed then. */
+static bool lapic_calibrate_against_reference(void)
+{
+	uint64_t tsc0, tsc1, ref0, ref1, mask, hz, want, d;
+	uint32_t elapsed;
+
+	hz = timer_calib_ref_read(&ref0, &mask);
+	if (!hz)
+		return false;
+	want = hz / 20; /* 50 ms */
+
+	lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
+	lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_TIMER_ONESHOT);
+	lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
+	if (!lapic_ref_read(&tsc0, &ref0, &mask)) {
+		lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+		return false;
+	}
+	uint32_t ccr0 = lapic_read(LAPIC_TIMER_CCR);
+
+	do {
+		__asm__ volatile("pause");
+		if (!lapic_ref_read(&tsc1, &ref1, &mask)) {
+			lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+			return false;
+		}
+		d = (ref1 - ref0) & mask;
+	} while (d < want);
+	elapsed = ccr0 - lapic_read(LAPIC_TIMER_CCR);
+	lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+
+	uint64_t tsc_hz = (tsc1 - tsc0) * hz / d;
+	uint64_t timer_hz = (uint64_t)elapsed * hz / d;
+
+	if (tsc_hz < 100000000ULL || timer_hz < 100000 ||
+	    timer_hz > 500000000ULL) {
+		kprintf("LAPIC: calibration against the %s out of range (TSC %llu Hz, timer %llu Hz)\n",
+			hz == 3579545ULL ? "ACPI PM timer" : "HPET",
+			(unsigned long long)tsc_hz,
+			(unsigned long long)timer_hz);
+		return false;
+	}
+	tsc_freq_hz = tsc_hz;
+	lapic_timer_freq = timer_hz;
+	kprintf("LAPIC: TSC %llu Hz, timer %llu Hz (measured against the %s)\n",
+		(unsigned long long)tsc_hz, (unsigned long long)timer_hz,
+		hz == 3579545ULL ? "ACPI PM timer" : "HPET");
+	return true;
+}
+
 void lapic_timer_calibrate(void)
 {
 	uint32_t eax, ebx, ecx, edx;
@@ -673,6 +747,16 @@ void lapic_timer_calibrate(void)
 			}
 		}
 	}
+
+	// =========================================================================
+	// Method 2: against the HPET or the ACPI PM timer.  Where neither CPUID
+	// nor a hypervisor states the TSC's rate (VirtualBox among others), the
+	// TSC and the local timer are both measured against a counter whose rate
+	// the platform does state -- the PIT below is only the last resort: some
+	// machines and hypervisors never let its channel 2 count.
+	// =========================================================================
+	if (lapic_calibrate_against_reference())
+		return;
 
 	// =========================================================================
 	// Method 2 (fallback): PIT channel 2 direct measurement

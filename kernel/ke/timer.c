@@ -967,6 +967,30 @@ void timer_init_pmtimer(void)
 		port, (g_pmtimer_mask == 0xFFFFFFFFU) ? 32 : 24);
 }
 
+/* The calibration reference: a free-running counter whose rate the
+ * platform states, independent of the CPU's own timers -- the HPET's main
+ * counter, else the ACPI PM timer.  Stores the current count and the
+ * counter's width mask, returns its rate in Hz; 0 when there is neither.
+ * The PM timer wraps (every 4.7 s at 24 bits): a caller's window stays far
+ * below that and takes differences under the mask. */
+uint64_t timer_calib_ref_read(uint64_t *count, uint64_t *mask)
+{
+	if (g_hpet_available && g_hpet_period_fs) {
+		*count = hpet_read_counter();
+		/* a main counter without the 64-bit capability wraps at 32 */
+		*mask = (hpet_read_reg(HPET_GEN_CAP_ID_OFFSET) & (1ULL << 13)) ?
+				~0ULL :
+				0xFFFFFFFFULL;
+		return 1000000000000000ULL / g_hpet_period_fs;
+	}
+	if (g_pmtimer_available) {
+		*count = pmtimer_read();
+		*mask = g_pmtimer_mask;
+		return 3579545ULL;
+	}
+	return 0;
+}
+
 /*
  * timer_set_boot_epoch - Set the boot epoch from bootloader.
  *

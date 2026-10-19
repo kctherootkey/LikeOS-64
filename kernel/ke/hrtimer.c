@@ -459,6 +459,13 @@ void hrtimer_init_hw(void)
 	 * their own route says: then they are not candidates at all. */
 	int legacy_rt = (rd(HPET_GEN_CONFIG) & 0x2) != 0;
 
+	/* Only a line the I/O APIC has: the comparator may offer lines up to
+	 * 31 that this machine's I/O APIC does not reach (VirtualBox: 24
+	 * lines, comparator offering 20-31). */
+	int max_gsi = (int)ioapic_max_gsi();
+
+	if (max_gsi > 31)
+		max_gsi = 31;
 	for (int pass = 0; pass < (legacy_rt ? 1 : 2) && g_gsi < 0; pass++) {
 		int count = pass == 0 ? ntimers - 2 : 2;
 
@@ -469,7 +476,7 @@ void hrtimer_init_hw(void)
 				continue;
 			tcfg = rd(HPET_TN_CONFIG(idx));
 			route_cap = (uint32_t)(tcfg >> 32);
-			for (int g = 31; g >= 16; g--) {
+			for (int g = max_gsi; g >= 16; g--) {
 				if (route_cap & (1u << g)) {
 					g_gsi = g;
 					g_timer_idx = idx;

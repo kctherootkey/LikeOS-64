@@ -58,6 +58,9 @@ uint64_t timer_get_ticks_at_cpu_tick(void); // Same as timer_ticks()
 uint64_t
 timer_get_precise_us(void); // Microseconds since boot (tick + PM Timer)
 uint64_t timer_get_precise_ns(void); // The same clock in nanoseconds
+/* The HPET's or the ACPI PM timer's count and width mask; returns its rate
+ * in Hz, 0 when the platform has neither (TSC/APIC timer calibration). */
+uint64_t timer_calib_ref_read(uint64_t *count, uint64_t *mask);
 /* CLOCK_REALTIME in ns, and its offset from the monotonic clock at the
  * monotonic time `mono' (for converting absolute REALTIME deadlines). */
 uint64_t timer_get_realtime_ns(void);
