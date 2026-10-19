@@ -19,7 +19,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
 <title>Technical Details &mdash; LikeOS</title>
 <meta name="description" content="The technical details of LikeOS 0.2.7-HEAD: kernel, memory management, filesystems, drivers, graphics, desktop, web browser and C library.">
 <meta name="author" content="Nikolaos Rangos">
-<meta name="theme-color" content="#23801a">
+<meta name="theme-color" content="#3a4256">
 <link rel="canonical" href="https://likeos.systemtrap.com/technical.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="LikeOS">
@@ -98,7 +98,8 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <dt>Kernel</dt><dd>Monolithic, preemptive, SMP; 199 system calls with a POSIX-style interface; ACPI through ACPICA 20251212</dd>
     <dt>Root filesystem</dt><dd>ext4 (read/write, journalled), on a single GPT USB disk image: FAT32 EFI System Partition + ext4 root</dd>
     <dt>Graphics</dt><dd>Own DRM/KMS core with GEM, sync objects and DMA-BUF; native Intel i915 and VMware SVGA (vmwgfx) drivers; UEFI framebuffer fallback</dd>
-    <dt>Desktop</dt><dd>X.Org server 21.1 (modesetting + glamor), ctwm with a Windows&nbsp;11-style look, a LikeOS taskbar, PCManFM desktop, GTK 3.24</dd>
+    <dt>Sound</dt><dd>Own sound drivers for Intel HD Audio (with HDMI and DisplayPort audio), the Intel audio DSP with SoundWire, AC'97 and the Ensoniq AudioPCI; the <code>audiod</code> sound service mixes the sound of every program</dd>
+    <dt>Desktop</dt><dd>X.Org server 21.1 (modesetting + glamor), ctwm with a Windows&nbsp;11-style look, a LikeOS taskbar with a volume control, PCManFM desktop, GTK 3.24, a media player</dd>
     <dt>Web browser</dt><dd>luakit 2.4.0 on WebKitGTK 2.52.6</dd>
     <dt>Shell</dt><dd>bash 5.2 as <code>/bin/sh</code></dd>
     <dt>License</dt><dd>GNU General Public License version 2 (GPLv2)</dd>
@@ -114,6 +115,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <li><a href="#scheduling">Scheduling and processes</a></li>
     <li><a href="#filesystems">Filesystems and storage</a></li>
     <li><a href="#devices">Devices and buses</a></li>
+    <li><a href="#sound">Sound</a></li>
     <li><a href="#networking">Networking</a></li>
     <li><a href="#graphics">Graphics and GPU drivers</a></li>
     <li><a href="#desktop">Desktop and applications</a></li>
@@ -259,10 +261,49 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
       <tr><td>I2C-HID</td><td>Intel LPSS DesignWare I2C controller with HID-over-I2C touchpads, found through ACPI (experimental)</td></tr>
       <tr><td>Input interface</td><td>evdev (<code>/dev/input/event*</code>), used by the X server</td></tr>
       <tr><td>Display</td><td>Intel i915, VMware SVGA II/SVGA3D (vmwgfx), UEFI GOP framebuffer, <code>/dev/fb0</code> (fbdev)</td></tr>
+      <tr><td>Sound</td><td>Intel HD Audio, HDMI/DisplayPort audio, Intel audio DSP with SoundWire, AC'97, Ensoniq AudioPCI &mdash; see <a href="#sound">Sound</a></td></tr>
       <tr><td>Backlight</td><td>Intel PWM backlight in <code>/sys/class/backlight/intel_backlight</code> and the <code>backlight</code> tool</td></tr>
       <tr><td>Network</td><td>Nine Ethernet drivers &mdash; see <a href="#networking">Networking</a></td></tr>
     </tbody>
   </table>
+</section>
+
+<section class="card" id="sound">
+  <h2>Sound</h2>
+  <p>
+    LikeOS has its own sound stack, from the kernel drivers up to the desktop: drivers for the
+    common kinds of PC sound hardware, a sound service that mixes the sound of every program,
+    and the GStreamer output that the web browser and the media player play through.
+  </p>
+  <h3>Kernel drivers</h3>
+  <table class="table">
+    <thead>
+      <tr><th>Hardware</th><th>Support</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Intel High Definition Audio</td><td>HD Audio controllers from Intel's ICH6 through current platforms, NVIDIA, AMD/ATI and other vendors. A generic codec parser works from the board's pin configuration, with codec drivers for Realtek, Conexant, SigmaTel/IDT, Analog Devices SoundMAX, Cirrus Logic, VIA and Creative CA0132, and for the emulated codecs of QEMU and other hypervisors. Headphone auto-mute and jack detection.</td></tr>
+      <tr><td>HDMI and DisplayPort audio</td><td>The display codecs of Intel, NVIDIA and AMD graphics; monitors are identified from their ELD; on Intel graphics the i915 display driver and the sound driver work together.</td></tr>
+      <tr><td>Intel audio DSP</td><td>cAVS 2.5 and ACE platforms with SOF IPC4 firmware and topology, the Intel SoundWire controller (Cannon Lake to Panther Lake) and the Cirrus Logic CS42L43 jack codec of recent laptops.</td></tr>
+      <tr><td>AC'97</td><td>Intel ICH AC'97 controllers and register-compatible parts, with AC'97 codecs.</td></tr>
+      <tr><td>Ensoniq AudioPCI</td><td>ES1370, ES1371, ES1373, Creative CT5880 (&ldquo;Sound Blaster PCI 64/128&rdquo;) &mdash; also the sound card VMware and QEMU emulate.</td></tr>
+      <tr><td>Device interface</td><td><code>/dev/audioN</code> for playback and recording with jack and monitor events, plus OSS-compatible <code>/dev/dsp</code> and <code>/dev/mixer</code>; owned by root and the group <code>audio</code>.</td></tr>
+    </tbody>
+  </table>
+  <h3>The sound service</h3>
+  <ul class="checklist">
+    <li><b>audiod</b> owns the sound card and mixes the sound of every program into one stream, so a video in the browser, the media player and a notification sound can play at the same time, each at its own volume.</li>
+    <li>Programs send sound in whatever format they have &mdash; 8 to 32-bit integer or 32/64-bit float, 1 to 8 channels, 4&nbsp;kHz to 384&nbsp;kHz. The service resamples with an exact-ratio windowed-sinc filter, maps the channels to the card, ramps volume changes so they never click, and limits the sum softly so that many loud streams do not distort.</li>
+    <li>Headphone and line jacks and HDMI/DisplayPort monitors are followed as they come and go; when the monitor that sound was sent to goes away, it falls back to the speakers and returns once the monitor is back.</li>
+    <li>After a few seconds of silence the card is stopped, so an idle system has no wake-ups for sound. Volume, mute and the chosen output survive restarts.</li>
+    <li>Programs connect through <b>libaudio</b>; GStreamer's <code>likeosaudiosink</code> is picked automatically, so WebKit and the media player play through the service.</li>
+  </ul>
+  <h3>On the desktop and in the terminal</h3>
+  <ul class="checklist">
+    <li>A <b>volume control</b> in the taskbar: the speaker opens a slider with a mute button; the mouse wheel over the speaker changes the volume, and a middle click mutes.</li>
+    <li><b>Media Player</b> for music and video: WAV, AIFF, AU, AAC/M4A, MP3, Ogg Vorbis, Opus and FLAC; MP4, Matroska and WebM video with H.264, H.265, VP8 and VP9; internet streams including HLS and DASH; a play queue and M3U/PLS playlists.</li>
+    <li>System sounds when the desktop starts and when you leave it, from a sound set synthesized for LikeOS.</li>
+    <li>Command-line tools: <code>audioplay</code> (WAV, AIFF, AU, CAF and raw PCM), <code>audioctl</code> (volume, mute, outputs and streams), <code>audiotest</code> (test signals and latency), <code>audioinfo</code> (what the sound hardware can do) and <code>eventsound</code>.</li>
+  </ul>
 </section>
 
 <section class="card" id="networking">
@@ -393,12 +434,13 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <li><code>startx</code> from any account: the X server is installed setuid root and drops privileges once its devices are open.</li>
     <li>The server configuration is chosen at start-up from the detected GPU (i915, VMware 3D, other DRM driver, or plain fbdev).</li>
     <li>A D-Bus session bus is started with the session.</li>
+    <li>A start-up sound when the desktop comes up, and a sound when you leave it.</li>
   </ul>
   <hr class="soft">
   <h3>Windows&nbsp;11-style look</h3>
   <ul class="checklist">
     <li><strong>ctwm</strong> window manager with LikeOS additions: flat, 30-pixel "Fluent" title bars with the application icon, wide minimise/maximise/close buttons (close in red), anti-aliased Xft title fonts, click-to-focus and raise-on-click.</li>
-    <li><strong>taskbar</strong>, a LikeOS GTK panel along the bottom: start button with a menu built from the installed <code>.desktop</code> files, a button per window with focus highlight and running indicators, a four-workspace switcher, a load and memory monitor, and a clock &mdash; driven purely through the EWMH and ICCCM standards.</li>
+    <li><strong>taskbar</strong>, a LikeOS GTK panel along the bottom: start button with a menu built from the installed <code>.desktop</code> files, a button per window with focus highlight and running indicators, a four-workspace switcher, a load and memory monitor, a volume control and a clock &mdash; driven purely through the EWMH and ICCCM standards.</li>
     <li>A LikeOS GTK 3 theme compiled from SCSS, Windows-style message dialogs, and the LikeOS cursor theme generated at build time.</li>
     <li>Fonts: Selawik as the interface font, plus Noto Sans, DejaVu, Liberation and the X core fonts.</li>
     <li>PCManFM draws the wallpaper and desktop icons; new accounts receive launchers in <code>~/Desktop</code>.</li>
@@ -440,6 +482,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
       <tr><td>xfce4-terminal</td><td>1.2.0</td><td>VTE-based terminal (libxfce4ui 4.20.2, xfconf 4.20.0)</td></tr>
       <tr><td>HexChat</td><td>2.16.2</td><td>IRC client</td></tr>
       <tr><td>galculator</td><td>2.1.4</td><td>Calculator</td></tr>
+      <tr><td>Media Player</td><td>1.0</td><td>LikeOS music and video player on GStreamer &mdash; see <a href="#sound">Sound</a></td></tr>
       <tr><td>luakit</td><td>2.4.0</td><td>Web browser &mdash; see <a href="#browser">below</a></td></tr>
       <tr><td>xterm</td><td>410</td><td>UTF-8, 256 colours</td></tr>
       <tr><td>XNEdit</td><td>1.6.3</td><td>Motif text editor</td></tr>
@@ -464,6 +507,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
   <ul class="checklist">
     <li>Keyboard-driven browser scripted in Lua 5.1.5 (with LuaFileSystem 1.9.0).</li>
     <li>Hardware acceleration always on; window size chosen from the screen size.</li>
+    <li>Sound from web pages through the system sound service, with Web Audio on; videos start only when clicked.</li>
     <li>Built-in ad blocking with option-aware filter rules and a keyword index, shipping EasyList, EasyPrivacy, Peter Lowe's list and more than twenty regional lists.</li>
     <li>An optional launcher keeps the browser's profile and caches in RAM (<code>/ram</code>).</li>
   </ul>
@@ -475,7 +519,8 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     </thead>
     <tbody>
       <tr><td>GStreamer</td><td>1.24.13</td><td>Core with base, good, bad and libav plugins</td></tr>
-      <tr><td>FFmpeg</td><td>7.1.1</td><td>Codecs, <code>ffmpeg</code>/<code>ffprobe</code>, VA-API hardware acceleration</td></tr>
+      <tr><td>FFmpeg</td><td>7.1.1</td><td>Codecs (H.264, H.265, VP8, VP9; AAC, MP3, Vorbis, Opus, FLAC, ALAC), <code>ffmpeg</code>/<code>ffprobe</code>, VA-API hardware acceleration</td></tr>
+      <tr><td>likeosaudiosink</td><td>1.0</td><td>GStreamer sound output to the <code>audiod</code> service, chosen automatically</td></tr>
       <tr><td>libva / libva-utils</td><td>2.22.0</td><td>VA-API, <code>vainfo</code></td></tr>
       <tr><td>Intel media driver (iHD)</td><td>24.3.4</td><td>With gmmlib 22.5.2</td></tr>
       <tr><td>Intel VA-API driver (i965)</td><td>2.4.1</td><td>Fallback driver</td></tr>
@@ -548,7 +593,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <li>PAM with a yescrypt-based <code>crypt(3)</code>; <code>/etc/passwd</code>, <code>/etc/shadow</code>, <code>/etc/group</code>.</li>
     <li>Real, effective and saved user and group IDs, supplementary groups and set-user-ID execution.</li>
     <li>Discretionary access control enforced in the VFS through a single privilege check, so permissions apply to every path that opens a file.</li>
-    <li>Device permissions by group (video, render); <code>/proc/&lt;pid&gt;/mem</code> and process maps restricted to the owner and root.</li>
+    <li>Device permissions by group (audio, video, render); <code>/proc/&lt;pid&gt;/mem</code> and process maps restricted to the owner and root.</li>
     <li><code>ptrace</code> and process inspection subject to the same access check.</li>
     <li>SMEP and SMAP where the CPU supports them, NX mappings, ring&nbsp;3 isolation.</li>
     <li>Stack canaries in the kernel and userland; RELRO in the dynamic linker.</li>
@@ -587,11 +632,11 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
       <tr><th>Platform</th><th>Status</th><th>Notes</th></tr>
     </thead>
     <tbody>
-      <tr><td>Lenovo ThinkPad P50</td><td>Tested</td><td>Reference machine: Intel HD Graphics 530 on the i915 driver with GPU acceleration, I219 Ethernet, USB boot</td></tr>
+      <tr><td>Lenovo ThinkPad P50</td><td>Tested</td><td>Reference machine: Intel HD Graphics 530 on the i915 driver with GPU acceleration, HD Audio sound (Realtek ALC298), I219 Ethernet, USB boot</td></tr>
       <tr><td>Dell Pro 16 Plus</td><td>Tested</td><td>USB boot</td></tr>
-      <tr><td>VMware</td><td>Supported</td><td>USB 3.1 boot; vmwgfx with 3D acceleration, overlay video, vmxnet3 or e1000</td></tr>
-      <tr><td>VirtualBox</td><td>Supported</td><td>xHCI (USB 3) and the VMSVGA adapter, with 3D when enabled</td></tr>
-      <tr><td>QEMU</td><td>Supported</td><td>USB image targets with xHCI; graphics on the UEFI framebuffer &mdash; there is no VMware SVGA support under QEMU; KVM recommended for the desktop</td></tr>
+      <tr><td>VMware</td><td>Supported</td><td>USB 3.1 boot; vmwgfx with 3D acceleration, overlay video, Sound Blaster PCI (es1371) sound, vmxnet3 or e1000</td></tr>
+      <tr><td>VirtualBox</td><td>Supported</td><td>xHCI (USB 3) and the VMSVGA adapter, with 3D when enabled; ICH AC'97 sound</td></tr>
+      <tr><td>QEMU</td><td>Supported</td><td>USB image targets with xHCI; graphics on the UEFI framebuffer &mdash; there is no VMware SVGA support under QEMU; KVM recommended for the desktop; Intel HD Audio sound</td></tr>
     </tbody>
   </table>
   <dl class="specs">
@@ -611,7 +656,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
       <div class="footer-inner">
         <div>
           <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
-          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 19<sup>th</sup>, 2026.
         </div>
         <nav aria-label="Footer">
           <a href="technical.html">Technical Details</a>
@@ -625,6 +670,13 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     </footer>
   </div>
 </div>
+
+<!-- desktop furniture: the button stacks and the pager (wide screens only; decorative, the menu is the navigation) -->
+<nav class="e-iconbar" aria-hidden="true">
+  <div class="grp" data-title="Pages"><a href="index.html" tabindex="-1">home</a><a href="technical.html" tabindex="-1" aria-current="page">tech</a><a href="luakit.html" tabindex="-1">luakit</a><a href="screenshots.html" tabindex="-1">shots</a></div>
+  <div class="grp" data-title="More"><a href="https://github.com/kctherootkey/LikeOS-64" tabindex="-1" target="_blank" rel="noopener">source</a><a href="running.html" tabindex="-1">run</a><a href="about.html" tabindex="-1">about</a><a href="donate.html" tabindex="-1">donate</a></div>
+</nav>
+<div class="e-pager" aria-hidden="true"><div class="desks"><a href="screenshots.html" tabindex="-1" class="cur"><img src="screenshots/thumbs/shot-2026-10-13-17-49-18.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-09-05-21-13-50.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-10-13-17-52-35.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-08-20-18-32-04.jpg" alt="" loading="lazy" decoding="async"></a></div></div>
 
 <script src="assets/site.js" defer></script>
 <script src="assets/consent.js" defer></script>

@@ -19,7 +19,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
 <title>Running LikeOS &mdash; LikeOS</title>
 <meta name="description" content="How to build LikeOS from source, write it to a USB stick and boot it on real hardware or in VMware, VirtualBox or QEMU.">
 <meta name="author" content="Nikolaos Rangos">
-<meta name="theme-color" content="#23801a">
+<meta name="theme-color" content="#3a4256">
 <link rel="canonical" href="https://likeos.systemtrap.com/running.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="LikeOS">
@@ -245,6 +245,7 @@ $ sudo make deps</code></pre>
       <tr><td><code>EXT4_MB</code></td><td>auto</td><td>Force the size of the ext4 root partition in the image, in MB. By default it is sized to the content plus 50% slack. <code>usb-write</code> grows it to the stick anyway.</td></tr>
       <tr><td><code>ESP_MB</code></td><td><code>64</code></td><td>Size of the FAT EFI System Partition in MB.</td></tr>
       <tr><td><code>LIKEOS_WEBKIT_JOBS</code></td><td>from RAM</td><td>An environment variable read by the GTK3 port: the exact number of parallel WebKitGTK compile jobs, overriding the memory-based estimate.</td></tr>
+      <tr><td><code>QEMU_SOUND</code>, <code>QEMU_AUDIODEV</code></td><td><code>hda</code>, PulseAudio</td><td>QEMU targets only: the emulated sound card (<code>hda</code>, <code>ac97</code>, <code>es1370</code> or <code>none</code>), and the host back end it plays through (e.g. <code>QEMU_AUDIODEV=alsa</code>).</td></tr>
       <tr><td><code>QEMU_MEM</code>, <code>NUM_CPUS</code>, <code>NO_SMP</code>, <code>USB_HID</code>, <code>NIC_DEVICE</code></td><td><code>1024M</code>, <code>4</code>, unset, unset, <code>e1000</code></td><td>QEMU targets only: guest memory, number of CPUs, no <code>-smp</code> at all, add a USB keyboard and mouse, and the emulated network card (e.g. <code>NIC_DEVICE=e1000e</code>).</td></tr>
     </tbody>
   </table>
@@ -305,6 +306,7 @@ $ sudo resize2fs /dev/sdX2</code></pre></div>
     <li>Set the firmware type to <b>UEFI</b>, and the USB controller's compatibility to <b>USB 3.1</b>.</li>
     <li>Under <b>Display</b>, decide on <b>Accelerate 3D graphics</b>: with it on, X and GL clients (the web browser included) render on the virtual GPU; with it off, LikeOS renders in software. Both work.</li>
     <li>For networking, the e1000, e1000e and vmxnet3 adapter types all have drivers.</li>
+    <li>Keep the <b>sound card</b> in the virtual machine's hardware: LikeOS plays through VMware's Sound Blaster PCI (es1371) device.</li>
     <li>Plug in the stick, connect it to the virtual machine (VMware's removable-devices menu), and power the VM on, choosing the USB device in the firmware's boot manager if it does not boot from it on its own.</li>
   </ol>
 
@@ -313,10 +315,11 @@ $ sudo resize2fs /dev/sdX2</code></pre></div>
     <li>Create a 64-bit virtual machine without a hard disk, and enable <b>EFI</b> in its system settings.</li>
     <li>Under <b>Display</b>, choose the <b>VMSVGA</b> graphics controller. Enabling 3D acceleration lets X and GL clients use the virtual GPU, as on VMware.</li>
     <li>Under <b>USB</b>, select the <b>USB 3.0 (xHCI)</b> controller and add a device filter for your stick, so it is attached to the virtual machine.</li>
+    <li>Under <b>Audio</b>, enable audio output and choose the <b>ICH AC97</b> controller.</li>
     <li>Choose an Intel PRO/1000 (e1000) or PCnet network adapter, then start the machine with the stick plugged in.</li>
   </ol>
 
-  <p><b>QEMU (legacy targets).</b> These boot the image file (or a written stick) directly. They use OVMF as the UEFI firmware, an xHCI USB controller and an e1000 network card with user-mode networking. Under QEMU, LikeOS draws on the <b>UEFI framebuffer</b>: there is no VMware SVGA support there, so the desktop runs without GPU acceleration.</p>
+  <p><b>QEMU (legacy targets).</b> These boot the image file (or a written stick) directly. They use OVMF as the UEFI firmware, an xHCI USB controller, an e1000 network card with user-mode networking, and an Intel HD Audio controller whose sound plays through your desktop's PulseAudio (or PipeWire) server. Under QEMU, LikeOS draws on the <b>UEFI framebuffer</b>: there is no VMware SVGA support there, so the desktop runs without GPU acceleration.</p>
   <pre class="code"><code>$ make qemu
 $ make qemu-usb
 $ make qemu-realusb USB_DEVICE=/dev/sdX</code></pre>
@@ -369,13 +372,13 @@ password: toor</code></pre></li>
   <p><b>The desktop.</b> X starts with the <b>ctwm</b> window manager, the <b>PCManFM</b> desktop (wallpaper and icons) and the LikeOS taskbar:</p>
   <dl class="specs">
     <dt>Desktop icons</dt>
-    <dd>Launchers from your <code>~/Desktop</code>: <em>Files</em> (PCManFM), <em>Terminal</em> (xfce4-terminal), <em>Xterm</em>, <em>Luakit Web Browser</em>, <em>Mail</em> (Claws Mail), <em>Text Editor</em> (Mousepad), <em>XNEdit</em>, <em>Calculator</em> (galculator), <em>X Calculator</em> and <em>Hexchat IRC Client</em>. Double-click one to start it.</dd>
+    <dd>Launchers from your <code>~/Desktop</code>: <em>Files</em> (PCManFM), <em>Terminal</em> (xfce4-terminal), <em>Xterm</em>, <em>Luakit Web Browser</em>, <em>Mail</em> (Claws Mail), <em>Text Editor</em> (Mousepad), <em>XNEdit</em>, <em>Calculator</em> (galculator), <em>X Calculator</em>, <em>Hexchat IRC Client</em> and <em>Media Player</em>. Double-click one to start it.</dd>
     <dt>Taskbar</dt>
-    <dd>A Windows 11-style bar across the bottom of the screen: the load and memory monitor on the left; the <b>LikeOS</b> start button and one button per open window in the middle (click to switch to or minimise a window, right-click for <em>Close</em>); the four workspace buttons and the clock with the date on the right.</dd>
+    <dd>A Windows 11-style bar across the bottom of the screen: the load and memory monitor on the left; the <b>LikeOS</b> start button and one button per open window in the middle (click to switch to or minimise a window, right-click for <em>Close</em>); the four workspace buttons, the speaker of the volume control and the clock with the date on the right.</dd>
     <dt>Start menu</dt>
     <dd>The LikeOS button opens <em>Programs</em>, built from the launchers on your desktop, plus <em>Restart session</em> and <em>Exit session</em>.</dd>
     <dt>Keyboard menus</dt>
-    <dd>All three mouse buttons over the desktop belong to PCManFM, so the window manager's menus are on the keyboard. <kbd>Alt</kbd>+<kbd>F1</kbd> opens the root menu &mdash; Xterm, Explorer, Editor, Xnedit, Mail, Luakit Web Browser, Calculator, <em>Restart session</em> and <em>Exit session</em>. <kbd>Alt</kbd>+<kbd>F2</kbd> opens the window operations menu (move, resize, raise, lower, occupy workspaces, close, kill).</dd>
+    <dd>All three mouse buttons over the desktop belong to PCManFM, so the window manager's menus are on the keyboard. <kbd>Alt</kbd>+<kbd>F1</kbd> opens the root menu &mdash; Xterm, Explorer, Editor, Xnedit, Mail, Luakit Web Browser, Media Player, Calculator, <em>Restart session</em> and <em>Exit session</em>. <kbd>Alt</kbd>+<kbd>F2</kbd> opens the window operations menu (move, resize, raise, lower, occupy workspaces, close, kill).</dd>
   </dl>
 
   <p><b>Starting programs.</b> Use the desktop icons, the start menu or <kbd>Alt</kbd>+<kbd>F1</kbd>, or type the command in a terminal:</p>
@@ -383,8 +386,13 @@ password: toor</code></pre></li>
 $ claws-mail &amp;
 $ xfce4-terminal &amp;
 $ pcmanfm &amp;
-$ mousepad &amp;</code></pre>
-  <p><b>luakit</b> is the web browser, built on WebKitGTK. <b>Claws Mail</b> reads and sends mail over IMAP, POP3 and SMTP with TLS, with spell checking; set up your mail account in it the first time you start it. The <b>Terminal</b> (xfce4-terminal) and <b>Xterm</b> give you a shell inside the desktop. The X keyboard layout is US.</p>
+$ mousepad &amp;
+$ mediaplayer &amp;</code></pre>
+  <p><b>luakit</b> is the web browser, built on WebKitGTK. <b>Claws Mail</b> reads and sends mail over IMAP, POP3 and SMTP with TLS, with spell checking; set up your mail account in it the first time you start it. The <b>Media Player</b> plays music and video files and internet streams. The <b>Terminal</b> (xfce4-terminal) and <b>Xterm</b> give you a shell inside the desktop. The X keyboard layout is US.</p>
+  <p><b>Sound.</b> Sound works without any setup: the sound service <code>audiod</code> starts at boot and plays the sound of every program together, and the desktop greets you with its start-up sound. Click the speaker in the taskbar for the volume slider and the mute button, or turn the mouse wheel over it. Every account has a sample video in <code>~/Videos</code> to try the Media Player with. In a terminal, <code>audioctl</code> sets the volume and the output and lists what is playing, and <code>audioplay</code> plays sound files:</p>
+  <pre class="code"><code>$ audioctl volume 60
+$ audioplay /usr/share/sounds/likeos/startup.wav
+$ audioinfo</code></pre>
   <p>Before you start the browser or mail client, you can check the network from a terminal &mdash; the kernel configures wired Ethernet over DHCP while it boots:</p>
   <pre class="code"><code>$ ifconfig
 $ ping -c 3 example.com</code></pre>
@@ -444,7 +452,7 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
       <div class="footer-inner">
         <div>
           <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
-          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 19<sup>th</sup>, 2026.
         </div>
         <nav aria-label="Footer">
           <a href="technical.html">Technical Details</a>
@@ -458,6 +466,13 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
     </footer>
   </div>
 </div>
+
+<!-- desktop furniture: the button stacks and the pager (wide screens only; decorative, the menu is the navigation) -->
+<nav class="e-iconbar" aria-hidden="true">
+  <div class="grp" data-title="Pages"><a href="index.html" tabindex="-1">home</a><a href="technical.html" tabindex="-1">tech</a><a href="luakit.html" tabindex="-1">luakit</a><a href="screenshots.html" tabindex="-1">shots</a></div>
+  <div class="grp" data-title="More"><a href="https://github.com/kctherootkey/LikeOS-64" tabindex="-1" target="_blank" rel="noopener">source</a><a href="running.html" tabindex="-1" aria-current="page">run</a><a href="about.html" tabindex="-1">about</a><a href="donate.html" tabindex="-1">donate</a></div>
+</nav>
+<div class="e-pager" aria-hidden="true"><div class="desks"><a href="screenshots.html" tabindex="-1" class="cur"><img src="screenshots/thumbs/shot-2026-10-13-17-49-18.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-09-05-21-13-50.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-10-13-17-52-35.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-08-20-18-32-04.jpg" alt="" loading="lazy" decoding="async"></a></div></div>
 
 <script src="assets/site.js" defer></script>
 <script src="assets/consent.js" defer></script>

@@ -19,7 +19,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
 <title>Luakit Web-Browser Cheatsheet &mdash; LikeOS</title>
 <meta name="description" content="A cheatsheet for luakit, the keyboard-driven web browser of LikeOS: modes, navigation, tabs, link hints, search, bookmarks and commands.">
 <meta name="author" content="Nikolaos Rangos">
-<meta name="theme-color" content="#23801a">
+<meta name="theme-color" content="#3a4256">
 <link rel="canonical" href="https://likeos.systemtrap.com/luakit.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="LikeOS">
@@ -312,7 +312,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
 <p><b>Home page and window size.</b> The home page (<kbd>g</kbd><kbd>h</kbd>) is <code>https://likeos.systemtrap.com</code>. New windows are sized one step below the screen: 1280×1024 on a 1920-wide screen, 1024×768 on 1280-wide, and 800×600 on smaller screens.</p>
 <p><b>HTTPS by default.</b> A bare host name typed after <kbd>o</kbd> (<code>example.org</code>) opens as <code>https://example.org</code>. <code>localhost</code> and numeric IP addresses stay as typed. Type <code>http://</code> yourself for the rare site that has no HTTPS.</p>
 <p><b>A fresh web process per site.</b> When you go to a <em>different site</em> in the same tab (typed, clicked or opened by a script), luakit opens the page in a new tab in the same place and closes the old one. This keeps memory down and scrolling smooth. As a result, <kbd>H</kbd> cannot go back to the previous site: press <kbd>u</kbd> to get the old tab back. Reloads, back/forward and form submissions are not affected. You can switch this off in <code>luakit://settings/</code> (setting <code>webview.fresh_process_per_site</code>). The change is remembered and applies from the next page load.</p>
-<p><b>Media is restricted.</b> Media Source Extensions and Web Audio are off. Most streamed video, which uses Media Source, will not play. Plain video files still play, but only when you click them.</p>
+<p><b>Sound is on, streamed video is restricted.</b> Web pages play sound through the system sound service, so they mix with every other program and follow the taskbar's volume control; Web Audio is on, so games, players and notification chimes that make their sound with it are heard. Media Source Extensions are off: most streamed video, which uses Media Source, will not play. Plain video files still play, with sound, but only when you click them.</p>
 <p><b>WebGL is on</b>, and every page is drawn by WebKit's accelerated compositor (<code>hardware_acceleration_policy = "always"</code>), with or without a GPU.</p>
 <p><b>Ad blocking with regional lists.</b> 27 filter lists come pre-installed in <code>~/.local/share/luakit/adblock/</code> for every new account and for root: EasyList, EasyPrivacy and Peter Lowe's list, plus 24 regional lists (German, French, Italian, Spanish, Portuguese, Dutch, Polish, Czech/Slovak, Hebrew, Arabic, Chinese, Russian, Indian, Bulgarian, Latvian, Hungarian, Romanian, Greek, Nordic, Indonesian, Vietnamese, Korean, Japanese and Turkish). The LikeOS ad blocker understands filter options and indexes rules, so all 27 lists together cost about as much as two. It blocks <em>requests</em> only: element-hiding rules (<code>##</code>) are not supported. To add a list, copy any Adblock Plus <code>.txt</code> file into that folder and run <code>:abr</code>. The lists are snapshots from when the image was built, so you can replace them with newer copies the same way.</p>
 <p><b>The browser profile is kept in RAM.</b> The <code>luakit</code> command runs a launcher that moves luakit's data (cookies, history, bookmarks, session, settings) and cache to a private <code>/ram/&lt;user&gt;</code> directory (mode 0700) for the current boot. The data is copied back to <code>~/.local/share/luakit</code> each time luakit exits. The cache is not copied back unless you start luakit with <code>LUAKIT_RAM_SAVE_CACHE=1 luakit</code>.</p>
@@ -327,7 +327,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
       <div class="footer-inner">
         <div>
           <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
-          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 13<sup>th</sup>, 2026.
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 19<sup>th</sup>, 2026.
         </div>
         <nav aria-label="Footer">
           <a href="technical.html">Technical Details</a>
@@ -341,6 +341,13 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     </footer>
   </div>
 </div>
+
+<!-- desktop furniture: the button stacks and the pager (wide screens only; decorative, the menu is the navigation) -->
+<nav class="e-iconbar" aria-hidden="true">
+  <div class="grp" data-title="Pages"><a href="index.html" tabindex="-1">home</a><a href="technical.html" tabindex="-1">tech</a><a href="luakit.html" tabindex="-1" aria-current="page">luakit</a><a href="screenshots.html" tabindex="-1">shots</a></div>
+  <div class="grp" data-title="More"><a href="https://github.com/kctherootkey/LikeOS-64" tabindex="-1" target="_blank" rel="noopener">source</a><a href="running.html" tabindex="-1">run</a><a href="about.html" tabindex="-1">about</a><a href="donate.html" tabindex="-1">donate</a></div>
+</nav>
+<div class="e-pager" aria-hidden="true"><div class="desks"><a href="screenshots.html" tabindex="-1" class="cur"><img src="screenshots/thumbs/shot-2026-10-13-17-49-18.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-09-05-21-13-50.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-10-13-17-52-35.jpg" alt="" loading="lazy" decoding="async"></a><a href="screenshots.html" tabindex="-1"><img src="screenshots/thumbs/shot-2026-08-20-18-32-04.jpg" alt="" loading="lazy" decoding="async"></a></div></div>
 
 <script src="assets/site.js" defer></script>
 <script src="assets/consent.js" defer></script>
