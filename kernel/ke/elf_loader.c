@@ -1069,7 +1069,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	 * fraction of everything the session allocated -- stayed referenced
 	 * by nothing that any process could still close, hundreds of
 	 * megabytes of them after an hour, while their pages, handles and
-	 * descriptors were all correctly gone.  (kernel/dev/gpu/drm
+	 * descriptors were all correctly gone.  (kernel/dev/video/gpu/drm
 	 * gem_stats: objects-live climbing with handles-held flat.)
 	 *
 	 * Under the address-space lock, because munmap() releases exactly the

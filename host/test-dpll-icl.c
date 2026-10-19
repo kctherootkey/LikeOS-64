@@ -8,7 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "../include/kernel/dev/gpu/i915/intel_dpll_calc.h"
+#include "../kernel/dev/video/gpu/i915/intel_dpll_calc.h"
 
 static int fail;
 

@@ -1,6 +1,6 @@
 /*
  * Tests for the HDMI library: the infoframe packer, checker, unpacker and
- * logger (kernel/dev/gpu/drm/drm_hdmi_infoframe.c), the AVI and vendor
+ * logger (kernel/dev/video/gpu/drm/drm_hdmi_infoframe.c), the AVI and vendor
  * infoframes of a mode on a connector whose display info comes from real
  * EDIDs (the EDID parser and its corpus), the HDMI helpers
  * (drm_hdmi_helper.c: colorimetry, content type, HDR metadata, TMDS
@@ -14,15 +14,15 @@
  * SPDX-License-Identifier for the portions derived from the connector unit tests: GPL-2.0
  */
 
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/hdmi.h>
-#include <kernel/dev/gpu/drm_hdmi_helper.h>
-#include <kernel/dev/gpu/drm_scdc_helper.h>
-#include <kernel/dev/gpu/drm_dp_dual_mode_helper.h>
-#include <kernel/dev/gpu/drm_edid.h>
-#include <kernel/dev/gpu/drm_modes.h>
-#include <kernel/dev/gpu/drm_display_info.h>
-#include <kernel/dev/gpu/drm_dp.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/hdmi.h>
+#include <kernel/dev/video/gpu/drm_hdmi_helper.h>
+#include <kernel/dev/video/gpu/drm_scdc_helper.h>
+#include <kernel/dev/video/gpu/drm_dp_dual_mode_helper.h>
+#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm_modes.h>
+#include <kernel/dev/video/gpu/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm_dp.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/ke/syscall.h>
 #include "test-edid-corpus.h"

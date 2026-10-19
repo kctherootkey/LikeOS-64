@@ -1,4 +1,4 @@
-/* Host test for the connector probe (kernel/dev/gpu/drm/drm_probe_helper.c)
+/* Host test for the connector probe (kernel/dev/video/gpu/drm/drm_probe_helper.c)
  * on the EDID library: the mode list a connector gets from an EDID, the
  * checks every mode passes, the preferred mode at modes[0], the probe's
  * fallbacks, and the epoch / hotplug counting.
@@ -6,10 +6,10 @@
  * Run by host/test-drm-probe.sh from the repository root.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_edid.h>
-#include <kernel/dev/gpu/drm_modes.h>
-#include <kernel/dev/gpu/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm_modes.h>
+#include <kernel/dev/video/gpu/drm_probe_helper.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include "test-edid-corpus.h"

@@ -1,5 +1,5 @@
 /* Host test for the Intel display's stream compression engine and its
- * DisplayPort/eDP configuration (kernel/dev/gpu/i915/display/
+ * DisplayPort/eDP configuration (kernel/dev/video/gpu/i915/display/
  * intel_vdsc.c, intel_dp_dsc.c), with the DSC library underneath
  * (drm_dsc_helper.c, intel_dsc_caps.c, intel_qp_tables.c) and the DP
  * helper library compiled in.
@@ -43,9 +43,9 @@ extern int memcmp(const void *, const void *, unsigned long);
 
 int sched_task_hidden(const task_t *t);
 
-#include "../kernel/dev/gpu/drm/drm_dp_helper.c"
-#include "../kernel/dev/gpu/i915/display/intel_dp_dsc.c"
-#include "../kernel/dev/gpu/i915/display/intel_vdsc.c"
+#include "../kernel/dev/video/gpu/drm/drm_dp_helper.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_dp_dsc.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_vdsc.c"
 
 /* ---- what the code calls of the kernel ------------------------------------- */
 

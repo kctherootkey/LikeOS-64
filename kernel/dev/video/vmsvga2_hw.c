@@ -1,5 +1,5 @@
 // LikeOS VMware SVGA II display driver -- register access, and the hardware
-// exports for the display-manager (DRM-style) driver in kernel/dev/gpu.
+// exports for the display-manager (DRM-style) driver in kernel/dev/video/gpu.
 //
 // That driver owns the device's 3D/KMS interface to userspace; this driver
 // keeps owning the hardware access primitives (register file, FIFO, fence

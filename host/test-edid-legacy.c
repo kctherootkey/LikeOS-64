@@ -9,7 +9,7 @@
 
 #define drm_edid_parse legacy_edid_parse
 #define drm_edid_block_valid legacy_edid_block_valid
-#include <kernel/dev/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm_edid.h>
 
 #ifndef EINVAL
 #define EINVAL 22

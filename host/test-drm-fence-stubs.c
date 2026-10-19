@@ -1,7 +1,7 @@
 /* Kernel services the fence library calls, for the host test.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/timer.h>

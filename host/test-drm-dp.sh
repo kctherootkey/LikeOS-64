@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host test for the DisplayPort helpers (kernel/dev/gpu/drm/drm_dp_helper.c):
+# Host test for the DisplayPort helpers (kernel/dev/video/gpu/drm/drm_dp_helper.c):
 # link status and training delays, link rate codes, DPCD access with its
 # retries, the extended receiver caps, I2C over AUX against a scripted fake
 # sink (DEFER, NACK, short replies, bare address packets), identification
@@ -16,11 +16,11 @@ ulimit -v 2000000
 TMP=${TMPDIR:-/tmp}/likeos-drm-dp-test.$$
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
-D=kernel/dev/gpu/drm
+D=kernel/dev/video/gpu/drm
 for opts in "-DDRM_DP_DEBUG=0 -DDRM_DP_SLEEPING_DELAYS=1" \
 	    "-DDRM_DP_DEBUG=1 -DDRM_DP_SLEEPING_DELAYS=0"; do
 	timeout 120 nice -n 19 cc -std=gnu11 -Wall -Wextra -Werror -O1 -g $opts \
-		-include host/test-drm-fence-prelude.h -Iinclude -o "$TMP/test" \
+		-include host/test-drm-fence-prelude.h -I. -o "$TMP/test" \
 		host/test-drm-dp.c \
 		$D/drm_edid_core.c $D/drm_edid_parse.c $D/drm_displayid.c \
 		$D/drm_eld.c $D/drm_edid_tables.c $D/drm_modes.c

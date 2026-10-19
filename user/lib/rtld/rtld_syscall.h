@@ -34,7 +34,7 @@ typedef signed long        ssize_t;
 #define __NR_futex      315
 #define __NR_arch_prctl 318
 
-// futex operations (see include/kernel/ke/futex.h)
+// futex operations (see kernel/ke/futex.h)
 #define FUTEX_WAIT          0
 #define FUTEX_WAKE          1
 #define FUTEX_PRIVATE_FLAG  128

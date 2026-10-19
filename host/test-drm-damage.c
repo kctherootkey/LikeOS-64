@@ -1,7 +1,7 @@
 /*
  * Tests for the display-manager core's damage iterator
- * (kernel/dev/gpu/drm/drm_damage_helper.c) and plane-state checks
- * (kernel/dev/gpu/drm/drm_atomic_helper.c): clipping damage to the plane
+ * (kernel/dev/video/gpu/drm/drm_damage_helper.c) and plane-state checks
+ * (kernel/dev/video/gpu/drm/drm_atomic_helper.c): clipping damage to the plane
  * source and the full-update fallbacks; clipping a plane to its crtc with
  * scaling limits, positioning and rotation; dropping damage on a mode set;
  * the primary-plane check; the committed plane as an old state.  See
@@ -14,10 +14,10 @@
 
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_damage_helper.h>
-#include <kernel/dev/gpu/drm_atomic_helper.h>
-#include <kernel/dev/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_damage_helper.h>
+#include <kernel/dev/video/gpu/drm_atomic_helper.h>
+#include <kernel/dev/video/gpu/drm_rect.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>

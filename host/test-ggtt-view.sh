@@ -1,6 +1,6 @@
 #!/bin/sh
 # Host test for the page order of a rotated GGTT view
-# (kernel/dev/gpu/i915/i915_ggtt_view.c): the view's pages against a
+# (kernel/dev/video/gpu/i915/i915_ggtt_view.c): the view's pages against a
 # model built from mapping runs, the turned geometry, and the checks of
 # what an object can hold.  The file's pure functions are cut out with
 # sed and compiled with the build host's compiler.
@@ -13,8 +13,8 @@ ulimit -v 2000000
 TMP=${TMPDIR:-/tmp}/likeos-ggtt-view-test.$$
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
-H=include/kernel/dev/gpu/i915/i915_ggtt_view.h
-C=kernel/dev/gpu/i915/i915_ggtt_view.c
+H=kernel/dev/video/gpu/i915/i915_ggtt_view.h
+C=kernel/dev/video/gpu/i915/i915_ggtt_view.c
 {
 	echo '#include <stdint.h>'
 	sed -n '/^struct i915_rotation_plane {/,/^};/p' $H

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Host test for the colour management of the Intel display pipes
-# (kernel/dev/gpu/i915/display/intel_color.c), compiled into the test over
+# (kernel/dev/video/gpu/i915/display/intel_color.c), compiled into the test over
 # a recorded register file.  The kernel's locking header is replaced by
 # the fence test's prelude.  Runs three times: the defaults, the
 # multi-segmented gamma off, colour management off.  Extra compiler
@@ -16,7 +16,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
 run() {
 	timeout 120 nice -n 19 cc -std=gnu11 -Wall -Wextra -Werror -O1 -g "$@" \
-		-include host/test-drm-fence-prelude.h -Iinclude -o "$TMP/test" \
+		-include host/test-drm-fence-prelude.h -I. -o "$TMP/test" \
 		host/test-intel-color.c
 	timeout 120 nice -n 19 "$TMP/test"
 }

@@ -1,6 +1,6 @@
 /*
  * Tests for the Intel display's plane arithmetic
- * (kernel/dev/gpu/i915/display/intel_plane.c): PLANE_CTL rotation and flip
+ * (kernel/dev/video/gpu/i915/display/intel_plane.c): PLANE_CTL rotation and flip
  * encodings, tile-aligned surface offsets, the rotated GGTT view layout,
  * and the clipping of rotated planes with the rectangle helpers.  See
  * test-intel-plane.sh.
@@ -10,16 +10,16 @@
 
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
-#include <kernel/dev/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm_rect.h>
 #include <kernel/uapi/drm/drm_mode.h>
 #include <kernel/uapi/bug.h>
-#include <kernel/dev/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/gpu_util.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
 
 #define PLANE_CTL_ROTATE_180 0x2u
-#include <kernel/dev/gpu/i915/skl_universal_plane_regs.h>
+#include <kernel/dev/video/gpu/i915/skl_universal_plane_regs.h>
 
 static int fails, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)

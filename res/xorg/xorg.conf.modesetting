@@ -2,7 +2,7 @@
 #
 # Selected by /etc/X11/xinit/xserverrc when /dev/dri/card0 exists and its
 # driver does NOT render 3D on the device: VMware with the VM's 3D
-# acceleration switched off (kernel/dev/gpu/vmwgfx, drminfo --has-3d answers
+# acceleration switched off (kernel/dev/video/gpu/vmwgfx, drminfo --has-3d answers
 # no), or any other display driver.  Intel graphics and VMware with 3D on get
 # xorg.conf.modesetting-i915 / -vmwgfx-3d instead, which run glamor.  Without
 # the node the server is started with the plain /etc/X11/xorg.conf, which

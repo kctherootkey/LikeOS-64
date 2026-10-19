@@ -13,7 +13,7 @@
 // interrupt in vmsvga2_irq.c, guest memory regions in vmsvga2_gmr.c and the
 // hardware cursor in vmsvga2_cursor.c.
 //
-// See include/kernel/dev/video/vmsvga2.h for the architecture and locking
+// See kernel/dev/video/vmsvga2.h for the architecture and locking
 // model overview.
 //
 // Copyright (C) 2026 The LikeOS Project
@@ -848,8 +848,8 @@ uint32_t vmsvga2_get_max_height(void)
 // answers in one of two ways:
 //
 //   1. The backdoor: a port-I/O protocol on 0x5658 entered with 'VMXh' in
-//      EAX (include/kernel/hal/vmware_backdoor.h; the same channel
-//      kernel/dev/gpu/vmwgfx/vmw_msg.c speaks for RPCI, here in its
+//      EAX (kernel/hal/vmware_backdoor.h; the same channel
+//      kernel/dev/video/gpu/vmwgfx/vmw_msg.c speaks for RPCI, here in its
 //      simplest single-command form).  Command 15 returns
 //      the host's screen size packed into EAX -- width in the high half,
 //      height in the low.  This is the size the VMware tools call the
@@ -1403,7 +1403,7 @@ int vmsvga2_init(void)
 // the honest limit here, and a small graphics-memory setting shows up as a
 // small screen no matter what the panel in front of the user can do.  (The
 // display manager scans out of guest memory instead and is bounded by
-// something else entirely; see kernel/dev/gpu/vmwgfx/vmw_drv.c.)
+// something else entirely; see kernel/dev/video/gpu/vmwgfx/vmw_drv.c.)
 static const char *svga_mode_reject(uint32_t w, uint32_t h)
 {
 	if (w == 0 || h == 0)

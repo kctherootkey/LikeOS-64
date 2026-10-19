@@ -1,4 +1,4 @@
-/* LikeOS POSIX shared memory objects — see include/kernel/mm/shm.h.
+/* LikeOS POSIX shared memory objects — see kernel/mm/shm.h.
  *
  * Locking: one spinlock covers the table and every object's fields.  Nothing is
  * allocated or freed while it is held — the page array is large enough to take

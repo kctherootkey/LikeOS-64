@@ -1,6 +1,6 @@
 /* <sys/syscall.h> -- system call numbers, for syscall(2).
  *
- * The numbers the kernel dispatches on (include/kernel/ke/syscall.h).  The
+ * The numbers the kernel dispatches on (kernel/ke/syscall.h).  The
  * libc's own wrappers use them through src/syscalls/syscall.h; a program
  * that needs a call the libc does not wrap yet uses syscall(SYS_xxx, ...).
  *

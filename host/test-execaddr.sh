@@ -15,9 +15,9 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
 {
 	sed -n '/^#define I915_ADDR_BITS/,/^}/p' \
-		kernel/dev/gpu/i915/i915_gem_execbuf.c
+		kernel/dev/video/gpu/i915/i915_gem_execbuf.c
 	sed -n '/^static uint64_t addr_to_user/,/^}/p' \
-		kernel/dev/gpu/i915/i915_gem_execbuf.c
+		kernel/dev/video/gpu/i915/i915_gem_execbuf.c
 	cat host/test-execaddr.c
 } > "$TMP/test.c"
 cc -std=gnu11 -Wall -Wextra -O1 -include stdint.h -o "$TMP/test" "$TMP/test.c"

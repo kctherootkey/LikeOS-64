@@ -480,8 +480,10 @@ Project structure
 -----------------
 
 - boot/: UEFI bootloader and trampoline.
-- kernel/: kernel subsystems (ke, hal, mm, fs, io, dev, net).
-- include/kernel/: public kernel headers.
+- kernel/: the kernel, by subsystem (ke, hal, mm, fs, io, dev, net), each
+  header beside the sources it belongs to (kernel/ke/sched.h next to
+  kernel/ke/sched.c); kernel/uapi/ holds the interfaces shared with user
+  space, kernel/dev/video/gpu/ the display drivers (drm, i915, vmwgfx).
 - user/bin/: user programs (core utilities and tests).
 - user/lib/libc/: C library and runtime pieces.
 - user/lib/rtld/: dynamic linker.

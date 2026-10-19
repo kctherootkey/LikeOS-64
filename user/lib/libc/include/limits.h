@@ -78,7 +78,7 @@ extern "C" {
 #define LINE_MAX    2048
 #define PIPE_BUF    4096
 /* Descriptors per process.  This is the KERNEL's limit, TASK_MAX_FDS in
- * include/kernel/ke/sched.h -- the two must agree, and they did not: the
+ * kernel/ke/sched.h -- the two must agree, and they did not: the
  * kernel has handed out 1024 for a long time while this said 256, so every
  * program that sized an fd table or a poll array by OPEN_MAX, sysconf() or
  * getdtablesize() believed it could hold a quarter of what it really could.

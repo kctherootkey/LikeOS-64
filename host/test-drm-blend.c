@@ -1,6 +1,6 @@
 /*
  * Tests for the display-manager core's plane blending and colour
- * management helpers (kernel/dev/gpu/drm/drm_blend.c, drm_color_mgmt.c),
+ * management helpers (kernel/dev/video/gpu/drm/drm_blend.c, drm_color_mgmt.c),
  * run over the real property table (drm_property.c, drm_mode_object.c):
  * rotation simplification against a model of the transforms, zpos
  * normalisation, the plane properties and their sharing, attaching the
@@ -11,12 +11,12 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_internal.h>
-#include <kernel/dev/gpu/drm_property.h>
-#include <kernel/dev/gpu/drm_mode_object.h>
-#include <kernel/dev/gpu/drm_blend.h>
-#include <kernel/dev/gpu/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm_property.h>
+#include <kernel/dev/video/gpu/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm_blend.h>
+#include <kernel/dev/video/gpu/drm_color_mgmt.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

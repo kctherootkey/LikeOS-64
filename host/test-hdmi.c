@@ -5,11 +5,11 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_edid.h>
-#include <kernel/dev/gpu/drm_display_info.h>
-#include <kernel/dev/gpu/hdmi.h>
-#include <kernel/dev/gpu/i915/intel_infoframe.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm_display_info.h>
+#include <kernel/dev/video/gpu/hdmi.h>
+#include <kernel/dev/video/gpu/i915/intel_infoframe.h>
 #include "test-edid-corpus.h"
 #include <stdio.h>
 #include <stdarg.h>

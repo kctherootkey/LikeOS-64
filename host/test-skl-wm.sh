@@ -1,6 +1,6 @@
 #!/bin/sh
 # Host test for the Skylake-and-later watermark arithmetic
-# (kernel/dev/gpu/i915/display/intel_skl_wm.c): the per-plane parameters,
+# (kernel/dev/video/gpu/i915/display/intel_skl_wm.c): the per-plane parameters,
 # the two latency methods and the level computation, run against hand
 # worked numbers for the panel of the machine this was written for and
 # for a display version 12 part.  A tiled surface is fetched in whole
@@ -14,7 +14,7 @@
 # Copyright (C) 2026 The LikeOS Project
 
 set -e
-SRC=kernel/dev/gpu/i915/display/intel_skl_wm.c
+SRC=kernel/dev/video/gpu/i915/display/intel_skl_wm.c
 TMP=${TMPDIR:-/tmp}/likeos-sklwm-test.$$
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"

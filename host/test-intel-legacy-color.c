@@ -1,6 +1,6 @@
 /*
  * Tests for the colour arithmetic of the Intel displays before DDI
- * (kernel/dev/gpu/i915/display/intel_legacy_color.c): CSC coefficient
+ * (kernel/dev/video/gpu/i915/display/intel_legacy_color.c): CSC coefficient
  * formats and palette entry formats.  See test-intel-legacy-color.sh.
  *
  * Copyright (C) 2026 The LikeOS Project

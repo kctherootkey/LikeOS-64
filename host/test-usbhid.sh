@@ -16,7 +16,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # The two layout typedefs from the header ...
 awk '/Report Protocol mouse layout \(parsed/{f=1} f{print} /} usbhid_mouse_layout_t;/{f=0}' \
-    include/kernel/dev/hid/usb_hid.h > "$TMP/usbhid-types-under-test.h"
+    kernel/dev/hid/usb_hid.h > "$TMP/usbhid-types-under-test.h"
 # ... and the parser + decoder from the driver, up to the first function that
 # needs the xHCI stack (hid_mouse_fetch_layout).
 awk '/^\/\/ HID Report Descriptor Parser \(mouse\)/{f=1} /^\/\/ Fetch and parse the mouse.s report descriptor/{f=0} f{print}' \

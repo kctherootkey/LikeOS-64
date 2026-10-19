@@ -1,4 +1,4 @@
-/* Host test for the DisplayPort helpers (kernel/dev/gpu/drm/drm_dp_helper.c).
+/* Host test for the DisplayPort helpers (kernel/dev/video/gpu/drm/drm_dp_helper.c).
  *
  * The helper file is compiled into this one, so its static parts (the
  * I2C retry estimate) can be checked too.  A fake sink stands behind the
@@ -32,7 +32,7 @@ extern int strcmp(const char *, const char *);
  * in the scheduler header the prelude replaces. */
 int sched_task_hidden(const task_t *t);
 
-#include "../kernel/dev/gpu/drm/drm_dp_helper.c"
+#include "../kernel/dev/video/gpu/drm/drm_dp_helper.c"
 
 /* ---- what the helpers call of the kernel ---------------------------------- */
 

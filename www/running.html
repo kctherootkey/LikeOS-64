@@ -159,7 +159,7 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
 $ git checkout dev</code></pre></li>
   </ol>
   <p>All commands on the rest of this page are run from the top of this directory. Later, <code>git pull</code> on the <code>dev</code> branch followed by <code>make</code> brings your build up to date; only what changed is rebuilt.</p>
-  <div class="callout info"><strong>Where things are.</strong> <code>boot/</code> is the UEFI bootloader, <code>kernel/</code> and <code>include/kernel/</code> the kernel, <code>user/</code> the C library, dynamic linker and programs, <code>res/</code> the files staged into the image (configuration, fonts, wallpaper, desktop launchers), <code>host/</code> build-host tools and tests, and <code>ports/</code> the third-party software &mdash; <code>ports/xorg</code> for the X Window System and <code>ports/xorg/gtk3</code> for GTK3 and the applications on it.</div>
+  <div class="callout info"><strong>Where things are.</strong> <code>boot/</code> is the UEFI bootloader, <code>kernel/</code> the kernel (headers beside their sources), <code>user/</code> the C library, dynamic linker and programs, <code>res/</code> the files staged into the image (configuration, fonts, wallpaper, desktop launchers), <code>host/</code> build-host tools and tests, and <code>ports/</code> the third-party software &mdash; <code>ports/xorg</code> for the X Window System and <code>ports/xorg/gtk3</code> for GTK3 and the applications on it.</div>
 </section>
 
 <section class="card" id="dependencies">

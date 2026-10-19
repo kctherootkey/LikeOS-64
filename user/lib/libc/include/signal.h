@@ -146,7 +146,7 @@ typedef unsigned long sigset_t;
  * and copies it verbatim: into the signal frame for an SA_SIGINFO handler, and
  * out through PTRACE_GETSIGINFO for a debugger.  Nothing negotiates a size or
  * a field position, so this declaration has to be byte-identical to the
- * kernel's (include/kernel/ke/signal.h) or every field past the third is read
+ * kernel's (kernel/ke/signal.h) or every field past the third is read
  * from the wrong offset.
  *
  * It was NOT identical: this used to be a flat struct of 120 bytes with

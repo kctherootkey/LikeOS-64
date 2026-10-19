@@ -1,4 +1,4 @@
-/* Host test of synchronisation objects (kernel/dev/gpu/drm/drm_syncobj.c):
+/* Host test of synchronisation objects (kernel/dev/video/gpu/drm/drm_syncobj.c):
  * timelines on fence chains with no limit on pending points, lookups,
  * WAIT / TIMELINE_WAIT with WAIT_ALL, WAIT_FOR_SUBMIT, WAIT_AVAILABLE and
  * deadlines, the device-poll fallback, timeouts, QUERY, TRANSFER,
@@ -10,8 +10,8 @@
  * counted, so each case ends by checking that everything was freed.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_fence_chain.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 

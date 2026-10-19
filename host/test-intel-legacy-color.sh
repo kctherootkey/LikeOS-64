@@ -1,6 +1,6 @@
 #!/bin/sh
 # Host test for the colour arithmetic of the Intel displays before DDI
-# (kernel/dev/gpu/i915/display/intel_legacy_color.c): the pipe CSC
+# (kernel/dev/video/gpu/i915/display/intel_legacy_color.c): the pipe CSC
 # coefficient format of Ironlake to Ivy Bridge, the two's complement
 # matrices of Valleyview (WGC) and Cherryview (CGM), and the entry formats
 # of the 10-bit palettes (gen2/3 slope format, gen4 10.6, Ironlake's
@@ -15,7 +15,7 @@ ulimit -v 2000000
 TMP=${TMPDIR:-/tmp}/likeos-intel-legacy-color-test.$$
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
-C=kernel/dev/gpu/i915/display/intel_legacy_color.c
+C=kernel/dev/video/gpu/i915/display/intel_legacy_color.c
 {
 	sed -n '/^#define LCOL_PALETTE_RED_SHIFT/,/^#define LCOL_PALETTE_BLUE_SHIFT/p' $C
 	sed -n '/^#define LCOL_PREC_10_RED_SHIFT/,/^#define LCOL_PREC_10_BLUE_SHIFT/p' $C
@@ -34,6 +34,6 @@ C=kernel/dev/gpu/i915/display/intel_legacy_color.c
 	sed -n '/^static uint32_t i965_lut_10p6_udw/,/^}/p' $C
 	sed -n '/^static uint32_t ilk_lut_10(/,/^}/p' $C
 } > "$TMP/color_cut.h"
-timeout 120 nice -n 19 cc -std=gnu11 -Wall -Wextra -Werror -O1 -Iinclude -I"$TMP" -o "$TMP/test" \
+timeout 120 nice -n 19 cc -std=gnu11 -Wall -Wextra -Werror -O1 -I. -I"$TMP" -o "$TMP/test" \
 	host/test-intel-legacy-color.c
 timeout 120 nice -n 19 "$TMP/test"

@@ -1,0 +1,511 @@
+// LikeOS -- the kernel console as a display-manager client.
+//
+// Who owns the screen while the machine boots.
+//
+// Without a display-manager driver the console owns the hardware outright:
+// it writes pixels into whatever framebuffer the firmware or the video
+// driver handed it and tells that driver which rectangle changed.  That is
+// still what happens on a machine with no driver for its display -- a
+// ThinkPad on the UEFI framebuffer, say -- and nothing here runs.
+//
+// With one, that arrangement stops working the moment the driver takes the
+// device somewhere the console cannot follow.  The scan-out moves (on the
+// VMware device, to guest-backed screen targets), and the framebuffer the
+// console is still faithfully painting is simply no longer what reaches the
+// screen: the display goes black midway through boot on a machine that is
+// otherwise running perfectly, all the way to a login prompt nobody can see.
+//
+// So where there IS a driver, the console becomes a client of it, exactly
+// like the X server is: it gets a buffer object of its own, a framebuffer
+// made from it, and a mode set that puts it on the screen; and its dirty
+// rectangles go out through the driver's own dirty path, whatever that
+// happens to be on this device.  One code path drives the display, and the
+// console is above it rather than beside it.
+//
+// Handing the screen over and getting it back.  While a userspace master
+// holds the device the console must not paint at all -- the pixels are not
+// its own any more -- and when that master leaves, the CRTC is pointing at
+// a framebuffer that has gone away, so the mode has to be set again to the
+// console's own before anything it draws can appear.  drm_console_suspend()
+// and drm_console_resume() are those two moments; the DRM core calls them
+// when a master is set and dropped.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/fb.h>
+#include <kernel/dev/video/fbdev.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/ke/timer.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+
+/* One console, whichever device claims it first. */
+static struct {
+	struct drm_device *dev;
+	struct drm_gem_object *obj;
+	uint32_t fb_id;
+	struct drm_mode_modeinfo mode;
+	uint32_t w, h, pitch;
+
+	int taken; /* the console is drawing into our buffer */
+	int suspended; /* a userspace master holds the display */
+
+	/* The rectangle the console has dirtied since the last push, and the
+	 * lock that covers it.  Coalesced rather than queued: the console
+	 * flushes per line, and one union is what the driver would end up
+	 * doing with a queue of them anyway. */
+	spinlock_t lock;
+	int32_t x1, y1, x2, y2;
+	int dirty;
+
+	/* The thread that pushes.  Everything below is why it exists. */
+	task_t *worker;
+	volatile int worker_ready;
+
+	/* The display as the console had it before the takeover: the
+	 * framebuffer it drew into and the flush hook that announced its
+	 * rectangles.  What drm_console_fallback() goes back to. */
+	framebuffer_info_t saved;
+	int have_saved;
+	fb_flush_hook_t legacy_hook;
+	/* 1 while /dev/fb0 is served from the console's buffer object (a
+	 * device with no framebuffer driver of its own registered none). */
+	int fbdev_registered;
+} g_con;
+
+/* ---- /dev/fb0 on the console's buffer ----------------------------------- */
+
+static int drm_console_fb_get_info(framebuffer_info_t *out)
+{
+	if (!g_con.taken)
+		return -1;
+	return console_get_framebuffer_info(out);
+}
+
+static uint64_t drm_console_fb_get_phys(uint64_t *size_out)
+{
+	if (!g_con.taken || !g_con.obj || !g_con.obj->npages)
+		return 0;
+	if (size_out)
+		*size_out = g_con.obj->size;
+	/* Contiguous by construction (drm_gem_alloc_pages_contig). */
+	return g_con.obj->pages[0];
+}
+
+static const struct fbdev_backend drm_console_fbdev = {
+	.id = "drmfb",
+	.get_info = drm_console_fb_get_info,
+	.get_phys = drm_console_fb_get_phys,
+};
+
+static uint8_t g_con_stack[16384] __attribute__((aligned(16)));
+
+/* ---- pushing --------------------------------------------------------- */
+
+/* Take whatever is dirty and hand it to the driver.
+ *
+ * One at a time: the push thread and whoever calls this directly (a mode
+ * set, a resume, boot) would otherwise be inside the driver's dirty path
+ * together, and that path has device state of its own -- a display surface,
+ * a command buffer -- that is not written for two callers.  A push that
+ * finds one in flight leaves the rectangle dirty; the thread's next tick
+ * carries it. */
+static volatile unsigned char g_pushing;
+
+static void console_push(void)
+{
+	struct drm_mode_rect_k r;
+	uint64_t fl;
+
+	if (!g_con.taken || g_con.suspended)
+		return;
+	if (__atomic_test_and_set(&g_pushing, __ATOMIC_ACQUIRE))
+		return;
+	spin_lock_irqsave(&g_con.lock, &fl);
+	if (!g_con.dirty) {
+		spin_unlock_irqrestore(&g_con.lock, fl);
+		__atomic_clear(&g_pushing, __ATOMIC_RELEASE);
+		return;
+	}
+	r.x1 = g_con.x1;
+	r.y1 = g_con.y1;
+	r.x2 = g_con.x2;
+	r.y2 = g_con.y2;
+	g_con.dirty = 0;
+	spin_unlock_irqrestore(&g_con.lock, fl);
+
+	/* a fallback on another processor clears the device behind us */
+	struct drm_device *dev = g_con.dev;
+	struct drm_framebuffer *fb = dev ? drm_fb_lookup(dev, g_con.fb_id) : NULL;
+	if (fb && dev->ncrtc && dev->drv->fb_dirty)
+		dev->drv->fb_dirty(dev, &dev->crtc[0], fb, &r, 1);
+	__atomic_clear(&g_pushing, __ATOMIC_RELEASE);
+}
+
+/* The console's flush hook.  Runs wherever kprintf() does -- which is
+ * everywhere, including interrupt handlers and code holding a spinlock with
+ * interrupts off -- so it must not do anything that can sleep.
+ *
+ * The driver's dirty path can: on a guest-backed device it copies into a
+ * mapped object and waits for the device to acknowledge a command buffer.
+ * Doing that from a print under a spinlock is the deadlock this system
+ * already learned about the hard way, so once there is a thread to do the
+ * work, this only records what changed and wakes it.
+ *
+ * Before that thread runs -- which is most of boot, and every message
+ * printed during it -- nothing else can run either, so the push happens
+ * here and the output appears immediately.  That is the property that
+ * matters for a boot log: it is worth nothing if it arrives after the
+ * fault it was describing. */
+static void console_flush_hook(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	uint64_t fl;
+
+	if (!g_con.taken || w == 0 || h == 0)
+		return;
+	int32_t x1 = (int32_t)x, y1 = (int32_t)y;
+	int32_t x2 = (int32_t)(x + w), y2 = (int32_t)(y + h);
+
+	spin_lock_irqsave(&g_con.lock, &fl);
+	if (!g_con.dirty) {
+		g_con.x1 = x1;
+		g_con.y1 = y1;
+		g_con.x2 = x2;
+		g_con.y2 = y2;
+		g_con.dirty = 1;
+	} else {
+		if (x1 < g_con.x1)
+			g_con.x1 = x1;
+		if (y1 < g_con.y1)
+			g_con.y1 = y1;
+		if (x2 > g_con.x2)
+			g_con.x2 = x2;
+		if (y2 > g_con.y2)
+			g_con.y2 = y2;
+	}
+	spin_unlock_irqrestore(&g_con.lock, fl);
+
+	if (g_con.worker_ready)
+		sched_wake_channel_once(&g_con, 1);
+	else
+		console_push();
+}
+
+/* Mark the whole screen and get it on the display. */
+static void console_push_all(void)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&g_con.lock, &fl);
+	g_con.x1 = 0;
+	g_con.y1 = 0;
+	g_con.x2 = (int32_t)g_con.w;
+	g_con.y2 = (int32_t)g_con.h;
+	g_con.dirty = 1;
+	spin_unlock_irqrestore(&g_con.lock, fl);
+	console_push();
+}
+
+/* The pushing thread.
+ *
+ * It also wakes on a timer rather than only on the flush hook: a wake that
+ * arrives while it is already running would otherwise be lost, and the
+ * screen would sit one rectangle behind until the next print.  Fifty
+ * milliseconds is below what an eye reads as lag and costs nothing when
+ * there is nothing dirty. */
+static void drm_console_worker(void *arg)
+{
+	int first = 1;
+
+	(void)arg;
+	g_con.worker_ready = 1;
+	for (;;) {
+		task_t *self = sched_current();
+
+		/* Once, when the machine is up enough to have a thread for
+		 * this: the whole screen again.  Everything the boot pushed
+		 * inline was submitted before there was a scheduler, and one
+		 * full present from a running system costs a few
+		 * milliseconds against a screen that might otherwise stay
+		 * behind whatever the device made of those. */
+		if (first) {
+			first = 0;
+			if (!g_con.suspended)
+				console_push_all();
+		}
+
+		if (self) {
+			self->wait_channel = (void *)&g_con;
+			self->wakeup_tick =
+				timer_ticks() + (timer_get_frequency() / 20);
+			self->state = TASK_BLOCKED;
+			sched_schedule();
+			self->wakeup_tick = 0;
+			self->wait_channel = NULL;
+			if (self->state != TASK_RUNNING)
+				self->state = TASK_RUNNING;
+		}
+		/* A program that has /dev/fb0 open writes through its own
+		 * mapping of this same buffer, so nothing marks a rectangle
+		 * dirty and there is nothing for the loop above to find.  On
+		 * a framebuffer in video memory the device noticed those
+		 * writes by itself; a buffer object in RAM has no such
+		 * mechanism, so the whole screen goes out on each tick for as
+		 * long as the descriptor is open, and only then. */
+		if (fbdev_display_owned() && !g_con.suspended)
+			console_push_all();
+		else
+			console_push();
+	}
+}
+
+/* ---- taking the console over ----------------------------------------- */
+
+/* Give the screen back to the display the console had before.
+ *
+ * For a screen-target path that did not come up -- the mode set failed, or
+ * it succeeded and the device then refused what was painted into it (see
+ * drm_driver.display_verify).  The console stops drawing into the buffer
+ * object first and gets its old flush hook back, THEN the driver puts the
+ * device back on its legacy path: the repaint the driver's fallback does
+ * must already be announced the old way.  Without the driver's help, the
+ * console at least draws into the framebuffer it had; with it, the device
+ * is reset to showing that framebuffer, which is the one state of this
+ * device that no queued command can take away. */
+static void drm_console_fallback(struct drm_device *dev, const char *why)
+{
+	kprintf("[drm] %s: console display %s; back on the framebuffer\n",
+		dev->drv->name, why);
+	g_con.taken = 0;
+	g_con.suspended = 0;
+	if (g_con.fbdev_registered) {
+		fbdev_register_backend(NULL);
+		g_con.fbdev_registered = 0;
+	}
+	fb_set_flush_hook(g_con.legacy_hook);
+	/* The CRTC off its buffer: on this device that tears the screen
+	 * target down, so the aperture is what is left to show. */
+	drm_kms_crtc_set_kernel(dev, 0, NULL, 0);
+	if (dev->drv->display_fallback)
+		dev->drv->display_fallback(dev);
+	else if (g_con.have_saved)
+		console_reinit_framebuffer(&g_con.saved);
+	/* A driver whose fallback puts the device back on the framebuffer
+	 * but leaves the console where it was (the Intel driver restores the
+	 * firmware's plane, which scans out THAT framebuffer) would otherwise
+	 * have the console go on drawing into the buffer object, which
+	 * nothing shows any more. */
+	if (g_con.have_saved && g_con.obj && g_con.obj->pages) {
+		framebuffer_info_t cur;
+		if (console_get_framebuffer_info(&cur) == 0 &&
+		    cur.framebuffer_base == phys_to_virt(g_con.obj->pages[0]))
+			console_reinit_framebuffer(&g_con.saved);
+	}
+	kprintf("[drm] %s: console fallback done\n", dev->drv->name);
+	g_con.dev = NULL;
+}
+
+/* The console's screen, as the device sees it.  After a mode set and a full
+ * paint: has the device accepted all of it?  Falls back if not, and says
+ * so.  Returns 0 when the console is on the display, -EIO when it has been
+ * moved back to the framebuffer. */
+static int drm_console_verify(struct drm_device *dev)
+{
+	if (!dev->drv->display_verify)
+		return 0;
+	if (dev->drv->display_verify(dev) == 0)
+		return 0;
+	drm_console_fallback(dev, "did not come up");
+	return -EIO;
+}
+
+int drm_console_takeover(struct drm_device *dev)
+{
+	framebuffer_info_t fi;
+
+	if (g_con.taken)
+		return -EBUSY;
+	/* Both halves of the display path have to exist: something to set the
+	 * mode with, and something to push a changed rectangle through. */
+	if ((!dev->drv->mode_set && !dev->drv->atomic_commit) || !dev->drv->fb_dirty)
+		return -ENODEV;
+	if (dev->ncrtc == 0 || dev->nconn == 0 || dev->conn[0].nmodes == 0)
+		return -ENODEV;
+
+	spinlock_init(&g_con.lock, "drm_console");
+	const struct drm_mode_modeinfo *mode = &dev->conn[0].modes[0];
+	uint32_t w = mode->hdisplay, h = mode->vdisplay;
+	uint32_t pitch = w * 4;
+
+	if (w == 0 || h == 0)
+		return -ENODEV;
+
+	struct drm_gem_object *o =
+		drm_gem_alloc(dev, DRM_GEM_BO, (uint64_t)pitch * h);
+	if (!o)
+		return -ENOMEM;
+	if (drm_gem_alloc_pages_contig(o) != 0) {
+		drm_gem_put(o);
+		return -ENOMEM;
+	}
+	/* The backend's own view of the object -- a MOB, a GMR, whatever this
+	 * device scans out of.  The ioctl paths do this for a client's
+	 * buffers; there is no ioctl here. */
+	if (dev->drv->gem_init && dev->drv->gem_init(o) != 0) {
+		drm_gem_put(o);
+		return -EIO;
+	}
+
+	uint32_t fb_id;
+	if (drm_kms_fb_add_kernel(dev, o, w, h, pitch, &fb_id) != 0) {
+		drm_gem_put(o);
+		return -ENOSPC;
+	}
+	/* The framebuffer holds its own reference now. */
+	drm_gem_put(o);
+
+	g_con.dev = dev;
+	g_con.obj = o;
+	g_con.fb_id = fb_id;
+	g_con.mode = *mode;
+	g_con.w = w;
+	g_con.h = h;
+	g_con.pitch = pitch;
+
+	g_con.have_saved = console_get_framebuffer_info(&g_con.saved) == 0;
+	g_con.legacy_hook = fb_get_flush_hook();
+
+	if (drm_kms_crtc_set_kernel(dev, 0, mode, fb_id) != 0) {
+		/* Not merely "no takeover": the mode set may have got as far
+		 * as putting the device on a screen target that now shows
+		 * nothing, and the framebuffer the console still draws into
+		 * would then never reach the screen again. */
+		drm_console_fallback(dev, "mode set failed");
+		return -EIO;
+	}
+
+	/* Where the console draws from here on. */
+	fi.framebuffer_base = phys_to_virt(o->pages[0]);
+	fi.framebuffer_size = pitch * h;
+	fi.horizontal_resolution = w;
+	fi.vertical_resolution = h;
+	fi.pixels_per_scanline = pitch / 4;
+	fi.bytes_per_pixel = 4;
+
+	fb_set_flush_hook(console_flush_hook);
+	g_con.taken = 1;
+	if (console_reinit_framebuffer(&fi) != 0) {
+		drm_console_fallback(dev, "could not be set up");
+		return -EIO;
+	}
+	/* The mode is set and the console draws into this buffer now: paint
+	 * every cell again from the console's own state and send the whole
+	 * screen, so what the display shows from here on is that and not
+	 * what the mode change left behind -- the previous mode's pixels, or
+	 * the cursor's record of them. */
+	console_repaint();
+	console_push_all();
+
+	/* Everything above was queued to the device.  Before this is called
+	 * a success, the device has to have accepted all of it -- see
+	 * drm_console_verify(): a refused define or update is a black screen
+	 * that nothing else would ever report. */
+	if (drm_console_verify(dev) != 0)
+		return -EIO;
+
+	/* Where the display driver has no framebuffer driver beneath it,
+	 * /dev/fb0 shows this buffer: a program that maps the framebuffer
+	 * draws into what the console scans out, and its rows reach the
+	 * device through the flush hook like the console's own. */
+	if (!fbdev_backend()) {
+		fbdev_register_backend(&drm_console_fbdev);
+		g_con.fbdev_registered = 1;
+	}
+
+	kprintf("[drm] %s: console on KMS, %ux%u\n", dev->drv->name, w, h);
+	return 0;
+}
+
+/* The thread cannot be created by the takeover above: the console goes onto
+ * KMS while the machine is still bringing its devices up, which is before
+ * there is a scheduler to add a task to.  The startup code calls this the
+ * moment there is one.
+ *
+ * Everything printed in between is pushed inline, and that is safe for the
+ * same reason it is necessary: nothing else is running yet. */
+void drm_console_start_worker(void)
+{
+	if (!g_con.taken || g_con.worker)
+		return;
+	g_con.worker = sched_add_task(drm_console_worker, 0, g_con_stack,
+				      sizeof(g_con_stack));
+	if (!g_con.worker)
+		kprintf("[drm] console push thread not started; "
+			"pushing inline\n");
+}
+
+/* ---- handing the screen to a master and taking it back ---------------- */
+
+void drm_console_suspend(struct drm_device *dev)
+{
+	if (!g_con.taken || g_con.dev != dev)
+		return;
+	g_con.suspended = 1;
+}
+
+void drm_console_resume(struct drm_device *dev)
+{
+	/* Said the first few times: where the screen goes when a display
+	 * manager lets go of it is the moment a machine looks dead if it
+	 * goes wrong, and the log is all there is to say what happened. */
+	static unsigned said;
+
+	if (!g_con.taken || g_con.dev != dev) {
+		if (said < 4) {
+			said++;
+			kprintf("[drm] %s: display manager left; the console is not on KMS (stays where it is)\n",
+				dev->drv->name);
+		}
+		return;
+	}
+	if (said < 4) {
+		said++;
+		kprintf("[drm] %s: display manager left; setting the console's mode again\n",
+			dev->drv->name);
+	}
+	/* The master left the CRTC on a framebuffer of its own, which is
+	 * being torn down behind it -- so this is a fresh mode set, not just
+	 * a redraw.  What the console has to show is still in its buffer:
+	 * nothing else could write there. */
+	g_con.suspended = 0;
+	if (drm_kms_crtc_set_kernel(dev, 0, &g_con.mode, g_con.fb_id) != 0) {
+		/* Not a message and a black screen: the display the manager
+		 * left is gone with it, so the console has to be put
+		 * SOMEWHERE that shows, and the framebuffer aperture is the
+		 * one place this device can always be made to show. */
+		drm_console_fallback(dev, "mode set failed after the display manager exited");
+		return;
+	}
+	console_push_all();
+	if (drm_console_verify(dev) == 0 && said < 8) {
+		said++;
+		kprintf("[drm] %s: console back on KMS after the display manager\n",
+			dev->drv->name);
+	}
+}
+
+void drm_console_resume_pushes(struct drm_device *dev)
+{
+	if (!g_con.taken || g_con.dev != dev)
+		return;
+	g_con.suspended = 0;
+	console_push_all();
+}
+
+int drm_console_active(const struct drm_device *dev)
+{
+	return g_con.taken && g_con.dev == dev;
+}

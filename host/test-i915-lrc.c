@@ -4,9 +4,9 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include <kernel/dev/gpu/i915/i915_lrc_layout.h>
-#include <kernel/dev/gpu/i915/i915_reg.h>
-#include <kernel/dev/gpu/i915/i915_renderstate.h>
+#include <kernel/dev/video/gpu/i915/i915_lrc_layout.h>
+#include <kernel/dev/video/gpu/i915/i915_reg.h>
+#include <kernel/dev/video/gpu/i915/i915_renderstate.h>
 #include <stdio.h>
 #include <string.h>
 

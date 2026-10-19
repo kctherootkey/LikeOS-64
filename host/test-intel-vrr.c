@@ -1,6 +1,6 @@
 /*
  * Tests for the variable refresh timing generator of the Intel display
- * transcoders (kernel/dev/gpu/i915/display/intel_vrr.c), compiled into
+ * transcoders (kernel/dev/video/gpu/i915/display/intel_vrr.c), compiled into
  * this file and run over a recorded register file: the range, guard band
  * and pipeline-full arithmetic against an independent restatement of the
  * generator's rules and against worked numbers, the capability verdict,
@@ -14,7 +14,7 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include "../kernel/dev/gpu/i915/display/intel_vrr.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_vrr.c"
 
 /* The host C library's declarations, spelled out: its headers disagree
  * with the kernel's fixed-width types, which come first. */

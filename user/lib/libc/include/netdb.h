@@ -23,7 +23,7 @@ extern "C" {
 #define NET_DNS_QUERY         6
 #define NET_GET_STATS         7
 
-/* DHCP_CONTROL sub-commands — must match kernel include/kernel/ke/syscall.h */
+/* DHCP_CONTROL sub-commands — must match kernel kernel/ke/syscall.h */
 #define DHCP_CMD_DISCOVER     1
 #define DHCP_CMD_RELEASE      2
 #define DHCP_CMD_RENEW        3
@@ -43,7 +43,7 @@ extern "C" {
 #define ICMP_DEST_UNREACH     3
 #define ICMP_TIME_EXCEEDED    11
 
-/* Info structures for NET_GETINFO — must match kernel include/kernel/net/net.h */
+/* Info structures for NET_GETINFO — must match kernel kernel/net/net.h */
 typedef struct {
     uint32_t ip;
     uint8_t  mac[6];
@@ -98,7 +98,7 @@ typedef struct {
 } net_iface_info_t;
 
 /* Aggregate protocol counters — must match kernel net_stats_info in
- * include/kernel/net/net.h */
+ * kernel/net/net.h */
 typedef struct {
     uint64_t ip_in_receives;
     uint64_t ip_in_hdr_errors;

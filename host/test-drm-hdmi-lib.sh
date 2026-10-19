@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host test for the HDMI library: infoframes (kernel/dev/gpu/drm/
+# Host test for the HDMI library: infoframes (kernel/dev/video/gpu/drm/
 # drm_hdmi_infoframe.c), the HDMI helpers (drm_hdmi_helper.c), SCDC
 # (drm_scdc_helper.c) and DP dual-mode adaptors (drm_dp_dual_mode_helper.c),
 # with the EDID parser and its corpus filling the connectors' display info
@@ -14,9 +14,9 @@ ulimit -v 2000000
 TMP=${TMPDIR:-/tmp}/likeos-drm-hdmi-lib-test.$$
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
-D=kernel/dev/gpu/drm
+D=kernel/dev/video/gpu/drm
 timeout 120 nice -n 19 cc -std=gnu11 -Wall -Wextra -Werror -O1 -g \
-	-include host/test-drm-fence-prelude.h -Iinclude -o "$TMP/test" \
+	-include host/test-drm-fence-prelude.h -I. -o "$TMP/test" \
 	host/test-drm-hdmi-lib.c host/test-edid-corpus.c \
 	$D/drm_hdmi_infoframe.c $D/drm_hdmi_helper.c $D/drm_scdc_helper.c \
 	$D/drm_dp_dual_mode_helper.c \

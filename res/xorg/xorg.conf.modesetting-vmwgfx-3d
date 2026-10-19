@@ -15,7 +15,7 @@
 #
 # Selected by /etc/X11/xinit/xserverrc when /dev/dri/card0 exists, i.e. when
 # the kernel found a display device it has a driver for (today the VMware
-# SVGA II / SVGA3D device, through kernel/dev/gpu/vmwgfx).  Without that node
+# SVGA II / SVGA3D device, through kernel/dev/video/gpu/vmwgfx).  Without that node
 # the server is started with the plain /etc/X11/xorg.conf instead, which
 # drives /dev/fb0 through the fbdev driver and renders in software; that
 # remains the fallback and nothing here changes it.

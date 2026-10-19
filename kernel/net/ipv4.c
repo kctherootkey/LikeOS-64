@@ -14,7 +14,7 @@
 
 // TX path uses per-fragment sk_buff allocations from the size-classed pool;
 // no global TX spinlock is held across the lower-layer send.  See
-// include/kernel/skb.h for the deadlock + TLB-IPI rationale.
+// kernel/net/skb.h for the deadlock + TLB-IPI rationale.
 
 // ============================================================================
 // RFC 1191 Path-MTU Discovery cache (LRU)

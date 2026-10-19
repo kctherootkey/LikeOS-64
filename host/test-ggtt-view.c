@@ -1,6 +1,6 @@
 /*
  * Host test for the page order of a rotated GGTT view
- * (kernel/dev/gpu/i915/i915_ggtt_view.c), run by host/test-ggtt-view.sh,
+ * (kernel/dev/video/gpu/i915/i915_ggtt_view.c), run by host/test-ggtt-view.sh,
  * which puts the file's pure functions in front of this one.
  *
  * Each view is compared page by page with a model that builds the view

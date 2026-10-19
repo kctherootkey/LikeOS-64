@@ -3,7 +3,7 @@
  * The third argument of an SA_SIGINFO handler points at a ucontext_t: the
  * registers the interrupted code was running with, its signal mask and its
  * alternate-stack state.  The layout is the one the kernel writes into the
- * signal frame (include/kernel/ke/signal.h) and MUST match it field for
+ * signal frame (kernel/ke/signal.h) and MUST match it field for
  * field; the kernel reads it back at sigreturn, so a handler that edits
  * uc_mcontext.gregs[REG_RIP] changes where the interrupted code resumes.
  * That is the documented use of it -- a runtime recovering from a fault it

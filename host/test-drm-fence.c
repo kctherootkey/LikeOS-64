@@ -1,5 +1,5 @@
 /* Host test of the fence library: callbacks, arrays, chains, unwrapping
- * and merging, reservation objects (kernel/dev/gpu/drm/drm_fence.c,
+ * and merging, reservation objects (kernel/dev/video/gpu/drm/drm_fence.c,
  * drm_fence_array.c, drm_fence_chain.c, drm_fence_unwrap.c, drm_resv.c).
  *
  * Every allocation is counted, so each case ends by checking that
@@ -7,11 +7,11 @@
  * prelude abort on recursion, which in the kernel would be a deadlock.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_fence_array.h>
-#include <kernel/dev/gpu/drm_fence_chain.h>
-#include <kernel/dev/gpu/drm_fence_unwrap.h>
-#include <kernel/dev/gpu/drm_resv.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_fence_array.h>
+#include <kernel/dev/video/gpu/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm_fence_unwrap.h>
+#include <kernel/dev/video/gpu/drm_resv.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 

@@ -231,7 +231,6 @@ MODE_STAMP := $(BUILD_DIR)/.build-mode
 $(shell mkdir -p $(BUILD_DIR);   if [ ! -f $(MODE_STAMP) ] || [ "$$(cat $(MODE_STAMP) 2>/dev/null)" != "$(BUILD_MODE)" ]; then     if ls $(BUILD_DIR)/*.o >/dev/null 2>&1; then       echo "build mode changed to $(BUILD_MODE): cleaning kernel objects" >&2;       rm -f $(BUILD_DIR)/*.o; rm -rf $(BUILD_DIR)/acpica;     fi;     printf '%s' "$(BUILD_MODE)" > $(MODE_STAMP);   fi)
 
 KERNEL_DIR = kernel
-INCLUDE_DIR = include
 BOOT_DIR = boot
 USER_DIR = user/bin
 
@@ -275,7 +274,7 @@ KERNEL_CFLAGS = $(DEPFLAGS) \
 			-mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-Werror=implicit-function-declaration \
 			-Werror=misleading-indentation \
-			-I$(INCLUDE_DIR) -I$(KERNEL_DIR)/hal/acpica/include \
+			-I. -I$(KERNEL_DIR)/hal/acpica/include \
 			-D__LIKEOS__ -D__LIKEOS_KERNEL__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
 			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) $(USB_SERIAL_CFLAGS) \
@@ -855,59 +854,59 @@ $(BUILD_DIR)/vmsvga2.o: $(KERNEL_DIR)/dev/video/vmsvga2.c $(SCREEN_STAMP) | $(BU
 $(BUILD_DIR)/fbdev.o: $(KERNEL_DIR)/dev/video/fbdev.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_drv.o: $(KERNEL_DIR)/dev/gpu/drm/drm_drv.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_drv.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_drv.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_console.o: $(KERNEL_DIR)/dev/gpu/drm/drm_console.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_console.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_console.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_gem.o: $(KERNEL_DIR)/dev/gpu/drm/drm_gem.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_gem.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_gem.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_dirty.o: $(KERNEL_DIR)/dev/gpu/drm/drm_dirty.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_dirty.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_dirty.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_dirty.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_dirty.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_dirty.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_dirty.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_fence.o: $(KERNEL_DIR)/dev/gpu/drm/drm_fence.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_fence.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_fence.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_kms.o: $(KERNEL_DIR)/dev/gpu/drm/drm_kms.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_kms.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_kms.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_atomic.o: $(KERNEL_DIR)/dev/gpu/drm/drm_atomic.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_atomic.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_atomic.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_syncobj.o: $(KERNEL_DIR)/dev/gpu/drm/drm_syncobj.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_syncobj.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_syncobj.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_edid.o: $(KERNEL_DIR)/dev/gpu/drm/drm_edid.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_edid.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_edid.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_edid_parse.o: $(KERNEL_DIR)/dev/gpu/drm/drm_edid_parse.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_edid_parse.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_edid_parse.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/drm_modes.o: $(KERNEL_DIR)/dev/gpu/drm/drm_modes.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_modes.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_modes.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # The rest of the display-manager core, the VMware SVGA driver and the SVGA II
 # hardware layer: one pattern rule per directory, so a new source file needs
 # only its object in KERNEL_OBJS.  The explicit rules above take precedence.
-$(BUILD_DIR)/drm_%.o: $(KERNEL_DIR)/dev/gpu/drm/drm_%.c | $(BUILD_DIR)
+$(BUILD_DIR)/drm_%.o: $(KERNEL_DIR)/dev/video/gpu/drm/drm_%.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_%.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_%.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_%.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_%.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vmsvga2_%.o: $(KERNEL_DIR)/dev/video/vmsvga2_%.c $(SCREEN_STAMP) | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-# The Intel graphics driver (kernel/dev/gpu/i915): one rule per object.
-$(BUILD_DIR)/i915_%.o: $(KERNEL_DIR)/dev/gpu/i915/i915_%.c | $(BUILD_DIR)
+# The Intel graphics driver (kernel/dev/video/gpu/i915): one rule per object.
+$(BUILD_DIR)/i915_%.o: $(KERNEL_DIR)/dev/video/gpu/i915/i915_%.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/intel_%.o: $(KERNEL_DIR)/dev/gpu/i915/display/intel_%.c | $(BUILD_DIR)
+$(BUILD_DIR)/intel_%.o: $(KERNEL_DIR)/dev/video/gpu/i915/display/intel_%.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Sound drivers (kernel/dev/sound): one rule per file-name prefix.
@@ -935,28 +934,28 @@ $(BUILD_DIR)/sdca.o: $(KERNEL_DIR)/dev/sound/sdca.c | $(BUILD_DIR)
 $(BUILD_DIR)/firmware.o: $(KERNEL_DIR)/ke/firmware.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_drv.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_drv.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_drv.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_drv.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_mob.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_mob.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_mob.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_mob.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_surface.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_surface.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_surface.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_surface.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_context.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_context.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_context.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_context.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_execbuf.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_execbuf.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_execbuf.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_execbuf.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_stdu.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_stdu.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_stdu.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_stdu.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_msg.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_msg.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_msg.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_msg.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_overlay.o: $(KERNEL_DIR)/dev/gpu/vmwgfx/vmw_overlay.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_overlay.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_overlay.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/evdev.o: $(KERNEL_DIR)/dev/input/evdev.c | $(BUILD_DIR)
@@ -3142,9 +3141,9 @@ openssh-manpages:
 #
 # Not wired into the build: a failing grep in the middle of an image build
 # would be a poor way to learn this, and the check costs nothing to run.
-NAMING_DIRS = kernel include user res
+NAMING_DIRS = kernel user res
 # ...except the interface headers copied in verbatim.  The display manager's
-# ioctl definitions (include/kernel/uapi/drm, user/lib/libc/include/drm) and
+# ioctl definitions (kernel/uapi/drm, user/lib/libc/include/drm) and
 # the device's own SVGA3D headers are UPSTREAM FILES, kept byte-faithful so
 # that a program built against them here and one built elsewhere agree about
 # the interface; their copyright and licence lines are not this tree's prose

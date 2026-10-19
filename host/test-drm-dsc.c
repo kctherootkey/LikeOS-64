@@ -1,8 +1,8 @@
 /*
  * Tests for the Display Stream Compression library
- * (kernel/dev/gpu/drm/drm_dsc_helper.c), the display engine's QP tables
- * (kernel/dev/gpu/i915/display/intel_qp_tables.c) and the DSC capability,
- * verdict and configuration code (kernel/dev/gpu/i915/display/
+ * (kernel/dev/video/gpu/drm/drm_dsc_helper.c), the display engine's QP tables
+ * (kernel/dev/video/gpu/i915/display/intel_qp_tables.c) and the DSC capability,
+ * verdict and configuration code (kernel/dev/video/gpu/i915/display/
  * intel_dsc_caps.c): PPS header and payload packing, RC buffer sizes, the
  * recommended RC parameter sets, the derived rate-control values for
  * standard configurations (8 bpc / 8 bpp, 10 bpc / 10 bpp, 12 bpc /
@@ -23,10 +23,10 @@
 
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
-#include <kernel/dev/gpu/drm_dsc_helper.h>
-#include <kernel/dev/gpu/drm_dp_helper.h>
-#include <kernel/dev/gpu/i915/intel_qp_tables.h>
-#include <kernel/dev/gpu/i915/intel_dsc_caps.h>
+#include <kernel/dev/video/gpu/drm_dsc_helper.h>
+#include <kernel/dev/video/gpu/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/i915/intel_qp_tables.h>
+#include <kernel/dev/video/gpu/i915/intel_dsc_caps.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -62,7 +62,7 @@ void panic(const char *fmt, ...)
 
 /*
  * The helper library's DSC capability decoders and link bandwidth
- * arithmetic (kernel/dev/gpu/drm/drm_dp_helper.c), restated for the host:
+ * arithmetic (kernel/dev/video/gpu/drm/drm_dp_helper.c), restated for the host:
  * that file also carries the AUX channel, which needs the kernel.
  */
 ssize_t drm_dp_dpcd_read(struct drm_dp_aux *aux, unsigned int offset,

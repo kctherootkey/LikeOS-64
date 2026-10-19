@@ -1,5 +1,5 @@
 /* Host test for the Intel display's DisplayPort channel and link training
- * on the DisplayPort helper library (kernel/dev/gpu/i915/display/
+ * on the DisplayPort helper library (kernel/dev/video/gpu/i915/display/
  * intel_dp_aux.c, intel_dp_link_training.c).
  *
  * The three files are compiled into this one.  Behind the i915 register
@@ -41,12 +41,12 @@ extern int strcmp(const char *, const char *);
 
 int sched_task_hidden(const task_t *t);
 
-#include "../kernel/dev/gpu/drm/drm_dp_helper.c"
+#include "../kernel/dev/video/gpu/drm/drm_dp_helper.c"
 /* file-local in each, one translation unit here */
 #undef AUX_SYNC_LEN
-#include "../kernel/dev/gpu/i915/display/intel_dp_aux.c"
-#include "../kernel/dev/gpu/i915/display/intel_dp_link_training.c"
-#include "../kernel/dev/gpu/i915/display/intel_dp.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_dp_aux.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_dp_link_training.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_dp.c"
 
 /* ---- what the code calls of the kernel ------------------------------------- */
 

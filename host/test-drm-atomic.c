@@ -1,6 +1,6 @@
 /*
  * Tests for the display-manager core's atomic mode setting
- * (kernel/dev/gpu/drm/drm_atomic.c) and plane handling (drm_plane.c), run
+ * (kernel/dev/video/gpu/drm/drm_atomic.c) and plane handling (drm_plane.c), run
  * over the real property, mode-object, blending, colour and plane-check
  * code: a crtc that DPMS switches off keeps its mode, its planes and its
  * connectors (and takes cursor updates meanwhile), the checks that tie a
@@ -17,12 +17,12 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include <kernel/dev/gpu/drm.h>
-#include <kernel/dev/gpu/drm_internal.h>
-#include <kernel/dev/gpu/drm_property.h>
-#include <kernel/dev/gpu/drm_mode_object.h>
-#include <kernel/dev/gpu/drm_blend.h>
-#include <kernel/dev/gpu/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm_property.h>
+#include <kernel/dev/video/gpu/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm_blend.h>
+#include <kernel/dev/video/gpu/drm_color_mgmt.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/syscall.h>

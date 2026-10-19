@@ -10,7 +10,7 @@
 // handle ops, vfs_sb_ops_t for the cache's block plumbing) are filled in.
 //
 // The block-chain integration uses self-describing block ids — see the
-// big comment in include/kernel/fs/ext4.h.
+// big comment in kernel/fs/ext4.h.
 //
 // Copyright (C) 2026 The LikeOS Project
 

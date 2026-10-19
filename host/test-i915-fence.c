@@ -1,9 +1,9 @@
 /* Host test of the fence register encoding and the tiled address
- * arithmetic (include/kernel/dev/gpu/i915/i915_fence_layout.h).
+ * arithmetic (kernel/dev/video/gpu/i915/i915_fence_layout.h).
  *
  * Copyright (C) 2026 The LikeOS Project */
 #include <stdio.h>
-#include <kernel/dev/gpu/i915/i915_fence_layout.h>
+#include <kernel/dev/video/gpu/i915/i915_fence_layout.h>
 
 static int fails;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } } while (0)

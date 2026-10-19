@@ -1,6 +1,6 @@
 /*
  * Tests for the colour management of the Intel display pipes
- * (kernel/dev/gpu/i915/display/intel_color.c), compiled into this file
+ * (kernel/dev/video/gpu/i915/display/intel_color.c), compiled into this file
  * and run over a recorded register file: the entry formats and the CTM
  * coefficient conversion against independent arithmetic, the sizes each
  * platform offers, the checks, what the pipe gets written for each
@@ -11,7 +11,7 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include "../kernel/dev/gpu/i915/display/intel_color.c"
+#include "../kernel/dev/video/gpu/i915/display/intel_color.c"
 
 /* The host C library's declarations, spelled out: its headers disagree
  * with the kernel's fixed-width types, which come first. */

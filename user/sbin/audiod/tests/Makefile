@@ -41,7 +41,7 @@ clean:
 
 # (a socket path must fit in 108 bytes: keep this directory short)
 ITEST_DIR ?= $(abspath $(OUT))/itest
-UAPI = $(abspath ../../../../include/kernel/uapi/sound.h)
+UAPI = $(abspath ../../../../kernel/uapi/sound.h)
 DAEMON_SRCS = $(wildcard $(SRC_DIR)/*.c)
 
 $(OUT)/shim/sys/audio.h: $(UAPI)

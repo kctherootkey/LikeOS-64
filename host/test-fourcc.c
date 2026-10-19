@@ -1,4 +1,4 @@
-// Host test: the pixel format table (kernel/dev/gpu/drm/drm_fourcc.c).
+// Host test: the pixel format table (kernel/dev/video/gpu/drm/drm_fourcc.c).
 //
 // The block size, minimum pitch and lookup vectors of the format test
 // suite, run against the kernel's table as it is, plus the checks the
@@ -10,7 +10,7 @@
 // SPDX-License-Identifier for the portions derived from Maíra Canal's code: GPL-2.0
 // Portions Copyright (c) 2022 Maíra Canal <mairacanal@riseup.net>
 
-#include <kernel/dev/gpu/drm_fourcc.h>
+#include <kernel/dev/video/gpu/drm_fourcc.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <limits.h>

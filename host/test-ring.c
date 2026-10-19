@@ -1,4 +1,4 @@
-/* Host test: the ring reservation rule of kernel/dev/gpu/i915/i915_request.c.
+/* Host test: the ring reservation rule of kernel/dev/video/gpu/i915/i915_request.c.
  *
  * The rule under test, stated independently of the driver's plumbing:
  * with a head H (the point the engine has read up to) and a tail T (the

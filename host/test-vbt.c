@@ -4,7 +4,7 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include <kernel/dev/gpu/i915/intel_display.h>
+#include <kernel/dev/video/gpu/i915/intel_display.h>
 #include <stdio.h>
 #include <string.h>
 
