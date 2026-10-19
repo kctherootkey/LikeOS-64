@@ -11,7 +11,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/mm/rwsem.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
 #include <kernel/dev/video/gpu/i915/i915_gt.h>
 #include <kernel/dev/video/gpu/i915/i915_guc.h>
 #include <kernel/io/console.h>

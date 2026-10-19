@@ -14,7 +14,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DP_LINK_TRAINING_H
 #define KERNEL_DEV_GPU_I915_INTEL_DP_LINK_TRAINING_H
 
-#include <kernel/dev/video/gpu/i915/intel_dp_aux.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dp_aux.h>
 
 struct i915_device;
 struct intel_output;

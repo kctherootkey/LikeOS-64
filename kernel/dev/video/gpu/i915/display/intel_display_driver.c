@@ -14,17 +14,17 @@
 // Portions Copyright (C) 2022-2023 Intel Corporation
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
-#include <kernel/dev/video/gpu/i915/intel_plane.h>
-#include <kernel/dev/video/gpu/i915/intel_color.h>
-#include <kernel/dev/video/gpu/i915/intel_vblank.h>
-#include <kernel/dev/video/gpu/i915/intel_vrr.h>
-#include <kernel/dev/video/gpu/i915/intel_connector.h>
-#include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
-#include <kernel/dev/video/gpu/i915/intel_dsc.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/i915/intel_legacy_color.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_plane.h>
+#include <kernel/dev/video/gpu/i915/display/intel_color.h>
+#include <kernel/dev/video/gpu/i915/display/intel_vblank.h>
+#include <kernel/dev/video/gpu/i915/display/intel_vrr.h>
+#include <kernel/dev/video/gpu/i915/display/intel_connector.h>
+#include <kernel/dev/video/gpu/i915/display/intel_hdmi_feat.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dsc.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy_color.h>
 
 int intel_display_legacy_part(const struct i915_device *i915)
 {

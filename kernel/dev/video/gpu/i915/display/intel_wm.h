@@ -20,7 +20,7 @@
 #define KERNEL_DEV_GPU_I915_INTEL_WM_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
 
 struct i915_device;
 

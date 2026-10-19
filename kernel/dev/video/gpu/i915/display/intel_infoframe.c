@@ -27,7 +27,7 @@
 #include <kernel/dev/video/gpu/drm/drm_modes.h>
 #include <kernel/dev/video/gpu/drm/hdmi.h>
 #include <kernel/dev/video/gpu/drm/drm.h>
-#include <kernel/dev/video/gpu/i915/intel_infoframe.h>
+#include <kernel/dev/video/gpu/i915/display/intel_infoframe.h>
 
 uint8_t intel_hdmi_vic_for_mode(const struct drm_mode_modeinfo *m)
 {

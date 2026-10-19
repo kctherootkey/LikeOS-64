@@ -17,12 +17,12 @@
 #include <kernel/ke/waitq.h>
 /* The per-feature state embedded in the pipes and outputs below; each
  * header documents its own calls. */
-#include <kernel/dev/video/gpu/i915/intel_plane.h>
-#include <kernel/dev/video/gpu/i915/intel_color.h>
-#include <kernel/dev/video/gpu/i915/intel_vblank.h>
-#include <kernel/dev/video/gpu/i915/intel_vrr.h>
-#include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
-#include <kernel/dev/video/gpu/i915/intel_dsc.h>
+#include <kernel/dev/video/gpu/i915/display/intel_plane.h>
+#include <kernel/dev/video/gpu/i915/display/intel_color.h>
+#include <kernel/dev/video/gpu/i915/display/intel_vblank.h>
+#include <kernel/dev/video/gpu/i915/display/intel_vrr.h>
+#include <kernel/dev/video/gpu/i915/display/intel_hdmi_feat.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dsc.h>
 
 struct i915_device;
 
@@ -175,8 +175,8 @@ void intel_opregion_driver_ready(struct i915_device *i915);
 /* The DPCD addresses (drm_dp.h) and the per-output AUX channel (struct
  * intel_dp_aux, intel_dp_aux_native_read/write, intel_dp_dpcd_read8/
  * write8); the DSC capabilities of the source and of a sink. */
-#include <kernel/dev/video/gpu/i915/intel_dp_aux.h>
-#include <kernel/dev/video/gpu/i915/intel_dsc_caps.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dp_aux.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dsc_caps.h>
 
 /* ---- power wells (intel_power.c) ----------------------------------------- */
 
@@ -877,6 +877,6 @@ int lt_phy_init(struct i915_device *i915);
  * Wildcat Lake, 3500 Nova Lake; version * 100 before version 14. */
 int intel_display_verx100(struct i915_device *i915);
 
-#include <kernel/dev/video/gpu/i915/intel_snps_phy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_snps_phy.h>
 
 #endif

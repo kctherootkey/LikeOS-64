@@ -34,9 +34,9 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_cx0_phy_regs.h>
-#include <kernel/dev/video/gpu/i915/intel_lt_phy_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_cx0_phy_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_lt_phy_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

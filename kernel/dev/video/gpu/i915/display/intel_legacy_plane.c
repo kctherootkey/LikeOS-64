@@ -36,11 +36,11 @@
 // Portions Copyright (C) 2020 Intel Corporation
 // Portions Copyright (C) 2024 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_legacy.h>
-#include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display_legacy.h>
 #include <kernel/dev/video/gpu/i915/i915_legacy.h>
-#include <kernel/dev/video/gpu/i915/intel_legacy_color.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy_color.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
 #include <kernel/dev/video/gpu/drm/drm_blend.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>

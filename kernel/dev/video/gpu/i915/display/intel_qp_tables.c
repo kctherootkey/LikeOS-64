@@ -20,7 +20,7 @@
 // Portions Copyright (C) 2021 Intel Corporation
 // Portions Copyright (C) 2018 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_qp_tables.h>
+#include <kernel/dev/video/gpu/i915/display/intel_qp_tables.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
 

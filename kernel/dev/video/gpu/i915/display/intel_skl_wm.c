@@ -24,10 +24,10 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_wm.h>
-#include <kernel/dev/video/gpu/i915/intel_wm_regs.h>
-#include <kernel/dev/video/gpu/i915/intel_audio.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_wm.h>
+#include <kernel/dev/video/gpu/i915/display/intel_wm_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_audio.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/hal/lapic.h>

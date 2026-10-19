@@ -9,12 +9,12 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
-#include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display_legacy.h>
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
 #include <kernel/dev/video/gpu/i915/i915_xe2_reg.h>
 #include <kernel/dev/video/gpu/i915/i915_lmem.h>
-#include <kernel/dev/video/gpu/i915/intel_audio.h>
+#include <kernel/dev/video/gpu/i915/display/intel_audio.h>
 #include <kernel/dev/video/gpu/i915/i915_legacy.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/uapi/ioctl.h>

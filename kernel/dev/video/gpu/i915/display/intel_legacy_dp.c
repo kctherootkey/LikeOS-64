@@ -27,8 +27,8 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2008-2021 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/i915/intel_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy.h>
 
 /* The DPCD names come from the DisplayPort header.  The display header
  * included above may still carry a private copy of some of them, which

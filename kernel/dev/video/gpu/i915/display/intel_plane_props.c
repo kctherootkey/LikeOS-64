@@ -25,9 +25,9 @@
 // Portions Copyright (C) 2020 Intel Corporation
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/i915/intel_plane.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_plane.h>
 #include <kernel/dev/video/gpu/drm/drm_blend.h>
 #include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
 #include <kernel/io/console.h>

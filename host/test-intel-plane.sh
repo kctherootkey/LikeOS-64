@@ -17,7 +17,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
 P=kernel/dev/video/gpu/i915/display/intel_plane.c
 {
-	sed -n '/^struct intel_rotated_view_info {/,/^};/p' kernel/dev/video/gpu/i915/intel_plane.h
+	sed -n '/^struct intel_rotated_view_info {/,/^};/p' kernel/dev/video/gpu/i915/display/intel_plane.h
 	sed -n '/^#define Y_TILE_BYTES/p;/^#define Y_TILE_ROWS/p;/^#define TILE_SIZE/p' $P
 	sed -n '/^static uint32_t skl_plane_ctl_rotate/,/^}/p' $P
 	sed -n '/^static uint32_t icl_plane_ctl_flip/,/^}/p' $P

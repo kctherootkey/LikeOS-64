@@ -25,8 +25,8 @@
  * whose typedefs differ in spelling (long vs long long) on the host. */
 #include <kernel/dev/video/gpu/drm/drm_dsc_helper.h>
 #include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
-#include <kernel/dev/video/gpu/i915/intel_qp_tables.h>
-#include <kernel/dev/video/gpu/i915/intel_dsc_caps.h>
+#include <kernel/dev/video/gpu/i915/display/intel_qp_tables.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dsc_caps.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>

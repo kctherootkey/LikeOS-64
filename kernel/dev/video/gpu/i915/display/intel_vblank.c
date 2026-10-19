@@ -34,10 +34,10 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
-#include <kernel/dev/video/gpu/i915/intel_vblank.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_vblank.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
 #include <kernel/dev/video/gpu/drm/drm_vblank.h>
 #include <kernel/dev/video/gpu/drm/drm_modes.h>
 #include <kernel/dev/video/gpu/drm/gpu_util.h>

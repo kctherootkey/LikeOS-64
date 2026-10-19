@@ -22,7 +22,7 @@
 // Portions Copyright (C) 2007 Dave Mueller
 // Portions Copyright (C) 2012 Gilles Dartiguelongue, Thomas Richter
 
-#include <kernel/dev/video/gpu/i915/intel_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

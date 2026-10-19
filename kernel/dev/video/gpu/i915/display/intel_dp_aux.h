@@ -18,7 +18,7 @@
 #define KERNEL_DEV_GPU_I915_INTEL_DP_AUX_H
 
 #include <kernel/dev/i2c.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
 #include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
 
 struct i915_device;

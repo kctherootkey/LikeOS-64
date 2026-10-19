@@ -20,7 +20,7 @@
 #define KERNEL_DEV_GPU_I915_INTEL_WM_REGS_H
 
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_xelpdp_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_xelpdp_regs.h>
 
 /* ---- universal plane and cursor watermarks (Gen9+) -------------------------- */
 

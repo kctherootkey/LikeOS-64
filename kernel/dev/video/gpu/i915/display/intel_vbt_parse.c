@@ -30,7 +30,7 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2025 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
 #include <kernel/dev/video/gpu/i915/i915_device_info.h>
 #include <kernel/dev/video/gpu/drm/drm_edid.h>
 

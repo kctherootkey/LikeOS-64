@@ -7,7 +7,7 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2023 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_dpll_calc.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dpll_calc.h>
 
 static uint64_t udiff(uint64_t a, uint64_t b)
 {

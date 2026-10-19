@@ -20,7 +20,7 @@
 // Portions Copyright (C) 2006-2010 Intel Corporation
 // Portions Copyright (C) 2006 Dave Airlie <airlied@linux.ie>
 
-#include <kernel/dev/video/gpu/i915/intel_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy.h>
 #include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

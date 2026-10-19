@@ -19,7 +19,7 @@
 #include <stdarg.h>
 
 #define PLANE_CTL_ROTATE_180 0x2u
-#include <kernel/dev/video/gpu/i915/skl_universal_plane_regs.h>
+#include <kernel/dev/video/gpu/i915/display/skl_universal_plane_regs.h>
 
 static int fails, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)

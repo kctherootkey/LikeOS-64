@@ -32,13 +32,13 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
-#include <kernel/dev/video/gpu/i915/intel_connector.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
-#include <kernel/dev/video/gpu/i915/intel_vrr.h>
-#include <kernel/dev/video/gpu/i915/intel_wm.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_connector.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_hdmi_feat.h>
+#include <kernel/dev/video/gpu/i915/display/intel_vrr.h>
+#include <kernel/dev/video/gpu/i915/display/intel_wm.h>
 #include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/dev/video/gpu/drm/drm_modes.h>
 #include <kernel/dev/video/gpu/drm/drm_probe_helper.h>

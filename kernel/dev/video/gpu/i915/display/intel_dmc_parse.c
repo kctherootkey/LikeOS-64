@@ -9,7 +9,7 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2014 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_dmc.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dmc.h>
 
 #define CSS_HEADER_SIZE 128
 #define CSS_MODULE_TYPE_DMC 0x09

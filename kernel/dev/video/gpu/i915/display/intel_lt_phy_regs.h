@@ -23,7 +23,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_LT_PHY_REGS_H
 #define KERNEL_DEV_GPU_I915_INTEL_LT_PHY_REGS_H
 
-#include <kernel/dev/video/gpu/i915/intel_cx0_phy_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_cx0_phy_regs.h>
 
 /* ---- latencies of the port sequences --------------------------------------- */
 

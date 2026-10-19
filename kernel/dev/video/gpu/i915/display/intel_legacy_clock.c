@@ -17,7 +17,7 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2026 Intel Corporation
 
-#include <kernel/dev/video/gpu/i915/intel_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy.h>
 #include <kernel/hal/pci.h>
 #include <kernel/io/console.h>
 

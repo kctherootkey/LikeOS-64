@@ -37,9 +37,9 @@
 
 #include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
 #include <kernel/dev/video/gpu/drm/drm_internal.h>
-#include <kernel/dev/video/gpu/i915/intel_legacy.h>
-#include <kernel/dev/video/gpu/i915/intel_legacy_color.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_legacy_color.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>
 

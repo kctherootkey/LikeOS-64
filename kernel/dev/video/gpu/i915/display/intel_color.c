@@ -45,10 +45,10 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_color.h>
-#include <kernel/dev/video/gpu/i915/intel_color_regs.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_color.h>
+#include <kernel/dev/video/gpu/i915/display/intel_color_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
 #include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
 #include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/gpu/drm/drm_property.h>

@@ -17,9 +17,9 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_dpll_calc.h>
-#include <kernel/dev/video/gpu/i915/intel_dpll_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dpll_calc.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dpll_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
@@ -344,7 +344,7 @@ void skl_dpll_unroute_port(struct i915_device *i915, int port)
  * Lake's and DG2's are the PHYs' own.  These entry points pick by the
  * display model so the pipe code (intel_display.c) calls one thing.
  */
-#include <kernel/dev/video/gpu/i915/intel_snps_phy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_snps_phy.h>
 
 /* Meteor Lake, DG2: every port has its PHY's own PLL, found through the
  * output on the port. */

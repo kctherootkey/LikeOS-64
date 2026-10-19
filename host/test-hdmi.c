@@ -9,7 +9,7 @@
 #include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/dev/video/gpu/drm/drm_display_info.h>
 #include <kernel/dev/video/gpu/drm/hdmi.h>
-#include <kernel/dev/video/gpu/i915/intel_infoframe.h>
+#include <kernel/dev/video/gpu/i915/display/intel_infoframe.h>
 #include "test-edid-corpus.h"
 #include <stdio.h>
 #include <stdarg.h>

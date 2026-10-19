@@ -22,12 +22,12 @@
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
-#include <kernel/dev/video/gpu/i915/intel_dpll_regs.h>
-#include <kernel/dev/video/gpu/i915/intel_display.h>
-#include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dpll_regs.h>
+#include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_features.h>
+#include <kernel/dev/video/gpu/i915/display/intel_hdmi_feat.h>
 #include <kernel/dev/video/gpu/drm/drm_edid.h>
-#include <kernel/dev/video/gpu/i915/intel_infoframe.h>
+#include <kernel/dev/video/gpu/i915/display/intel_infoframe.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
