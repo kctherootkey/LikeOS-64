@@ -16,7 +16,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DISPLAY_LEGACY_H
 #define KERNEL_DEV_GPU_I915_INTEL_DISPLAY_LEGACY_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct i915_device;
 

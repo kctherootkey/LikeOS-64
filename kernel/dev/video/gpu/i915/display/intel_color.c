@@ -49,10 +49,10 @@
 #include <kernel/dev/video/gpu/i915/intel_color.h>
 #include <kernel/dev/video/gpu/i915/intel_color_regs.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/drm_color_mgmt.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_property.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_property.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

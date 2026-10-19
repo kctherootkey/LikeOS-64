@@ -19,12 +19,12 @@
 #ifndef KERNEL_DEV_GPU_DRM_DRM_EDID_INTERNAL_H
 #define KERNEL_DEV_GPU_DRM_DRM_EDID_INTERNAL_H
 
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/drm_displayid.h>
-#include <kernel/dev/video/gpu/drm_eld.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_displayid.h>
+#include <kernel/dev/video/gpu/drm/drm_eld.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 #ifndef EINVAL
 #define EINVAL 22

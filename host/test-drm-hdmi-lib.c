@@ -14,15 +14,15 @@
  * SPDX-License-Identifier for the portions derived from the connector unit tests: GPL-2.0
  */
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/hdmi.h>
-#include <kernel/dev/video/gpu/drm_hdmi_helper.h>
-#include <kernel/dev/video/gpu/drm_scdc_helper.h>
-#include <kernel/dev/video/gpu/drm_dp_dual_mode_helper.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/drm_dp.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/hdmi.h>
+#include <kernel/dev/video/gpu/drm/drm_hdmi_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_scdc_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_dual_mode_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_dp.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/ke/syscall.h>
 #include "test-edid-corpus.h"

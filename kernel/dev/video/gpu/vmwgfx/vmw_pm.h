@@ -24,7 +24,7 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_PM_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_PM_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 /* 1: the driver table carries vmw_pm_suspend / vmw_pm_resume (and the DRM
  * core offers the device's power_state file).  0: no power management, as

@@ -21,9 +21,9 @@
 // SPDX-License-Identifier for the portions derived from the DRM vblank work code: MIT
 // (the files those portions derive from carry no copyright line)
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_vblank.h>
-#include <kernel/dev/video/gpu/drm_vblank_work.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_vblank.h>
+#include <kernel/dev/video/gpu/drm/drm_vblank_work.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/waitq.h>

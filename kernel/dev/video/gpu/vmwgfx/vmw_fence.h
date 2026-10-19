@@ -20,7 +20,7 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_FENCE_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_FENCE_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 
 /* How long an in-kernel wait that nobody bounded waits by default. */

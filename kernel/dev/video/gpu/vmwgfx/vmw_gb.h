@@ -22,7 +22,7 @@
 #define KERNEL_DEV_GPU_VMWGFX_VMW_GB_H
 
 #include <kernel/mm/rwsem.h>
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/dev/video/gpu/vmwgfx/svga/svga3d_reg.h>
 #include <kernel/dev/video/gpu/vmwgfx/svga/svga3d_surfacedefs.h>

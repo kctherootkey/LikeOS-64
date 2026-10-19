@@ -33,13 +33,13 @@
 // Portions Copyright (C) 2007-2008 Intel Corporation
 // Portions Copyright (C) 2010 Red Hat, Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_mode_object.h>
-#include <kernel/dev/video/gpu/drm_probe_helper.h>
-#include <kernel/dev/video/gpu/drm_property.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_property.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>

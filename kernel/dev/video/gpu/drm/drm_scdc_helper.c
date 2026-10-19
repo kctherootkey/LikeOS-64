@@ -20,8 +20,8 @@
 // SPDX-License-Identifier for the portions derived from NVIDIA's code: MIT
 // Portions Copyright (c) 2015 NVIDIA Corporation. All rights reserved.
 
-#include <kernel/dev/video/gpu/drm_scdc_helper.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_scdc_helper.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>

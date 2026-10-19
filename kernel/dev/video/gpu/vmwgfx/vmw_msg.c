@@ -47,7 +47,7 @@
 // “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
 #include <kernel/dev/video/gpu/vmwgfx/vmw_gb.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/hal/vmware_backdoor.h>
 #include <kernel/ke/sched.h>

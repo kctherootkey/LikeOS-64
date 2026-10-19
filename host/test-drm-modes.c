@@ -9,9 +9,9 @@
  */
 
 /* The kernel's fixed-width types come first and stand in for stdint.h. */
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
 #include <stdio.h>
 #include <string.h>
 

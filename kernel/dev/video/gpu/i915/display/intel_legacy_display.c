@@ -38,9 +38,9 @@
 #include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
 #include <kernel/dev/video/gpu/i915/intel_legacy_color.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/drm_vblank.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_vblank.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/io/console.h>

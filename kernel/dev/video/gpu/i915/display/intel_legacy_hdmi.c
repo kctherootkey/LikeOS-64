@@ -23,10 +23,10 @@
 
 #include <kernel/dev/video/gpu/i915/intel_features.h>
 #include <kernel/dev/video/gpu/i915/intel_legacy.h>
-#include <kernel/dev/video/gpu/drm_dp_dual_mode_helper.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/hdmi.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_dual_mode_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/hdmi.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

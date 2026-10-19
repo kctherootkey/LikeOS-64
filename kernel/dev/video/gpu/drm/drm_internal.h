@@ -5,7 +5,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_INTERNAL_H
 #define KERNEL_DEV_GPU_DRM_INTERNAL_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 /* ---- behaviour switches of the core ---------------------------------------
  *

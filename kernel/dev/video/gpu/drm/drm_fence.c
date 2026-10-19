@@ -18,8 +18,8 @@
 // Portions Copyright (C) 2012 Canonical Ltd
 // Portions Copyright (C) 2012 Texas Instruments
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_fence_unwrap.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_unwrap.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/signal.h>

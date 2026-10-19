@@ -9,8 +9,8 @@
 // SPDX-License-Identifier for the portions derived from VMware's code: GPL-2.0 OR MIT
 // Portions Copyright 2009-2022 VMware, Inc., Palo Alto, CA., USA
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/uapi/drm/drm_fourcc.h>

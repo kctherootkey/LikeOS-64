@@ -40,8 +40,8 @@
 #include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
 #include <kernel/dev/video/gpu/i915/intel_wm.h>
 #include <kernel/dev/video/gpu/i915/intel_audio.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_eld.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_eld.h>
 #include <kernel/dev/sound/snd.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>

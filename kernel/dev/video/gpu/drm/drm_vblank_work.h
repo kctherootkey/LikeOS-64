@@ -16,7 +16,7 @@
 #define KERNEL_DEV_GPU_DRM_VBLANK_WORK_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 struct drm_device;
 struct drm_vblank_work;

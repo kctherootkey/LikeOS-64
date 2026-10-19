@@ -33,10 +33,10 @@
 // Portions Copyright (C) 2010 Red Hat, Inc.
 // Portions Copyright (C) 2006 Dennis Munsie
 
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 #ifdef __LIKEOS_KERNEL__
 #include <kernel/io/console.h>

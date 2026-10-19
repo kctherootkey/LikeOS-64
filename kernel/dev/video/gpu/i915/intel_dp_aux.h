@@ -19,7 +19,7 @@
 
 #include <kernel/dev/i2c.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
 
 struct i915_device;
 

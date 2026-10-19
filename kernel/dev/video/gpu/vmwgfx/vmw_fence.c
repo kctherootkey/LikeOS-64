@@ -24,9 +24,9 @@
 // Portions Copyright 2011-2012 VMware, Inc., Palo Alto, CA., USA
 // Portions Copyright 2009-2015 VMware, Inc., Palo Alto, CA., USA
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/uapi/drm/drm_fourcc.h>

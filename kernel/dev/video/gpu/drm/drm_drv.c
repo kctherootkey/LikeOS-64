@@ -10,8 +10,8 @@
 // Portions Copyright 1999 Precision Insight, Inc., Cedar Park, Texas.
 // Portions Copyright 2000 VA Linux Systems, Inc., Sunnyvale, California.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/uapi/ioctl.h>
 #include <kernel/uapi/stat.h>
 #include <kernel/ke/sched.h>

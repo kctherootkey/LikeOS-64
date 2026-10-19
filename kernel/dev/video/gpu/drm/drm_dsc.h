@@ -18,9 +18,9 @@
 #ifndef KERNEL_DEV_GPU_DRM_DSC_H
 #define KERNEL_DEV_GPU_DRM_DSC_H
 
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 /* struct dp_sdp_header, DP_SDP_PPS, DP_DSC_RC_BUF_BLK_SIZE_* */
-#include <kernel/dev/video/gpu/drm_dp.h>
+#include <kernel/dev/video/gpu/drm/drm_dp.h>
 
 /* The PPS stores multi-byte fields big endian; the CPU is little endian. */
 static inline u16 drm_dsc_cpu_to_be16(u16 v)

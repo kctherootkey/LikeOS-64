@@ -11,11 +11,11 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2011-2013 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
 #include <kernel/uapi/drm/drm_mode.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 bool drm_rect_intersect(struct drm_rect *r1, const struct drm_rect *r2)
 {

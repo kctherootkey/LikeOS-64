@@ -26,8 +26,8 @@
 #ifndef KERNEL_DEV_GPU_DRM_ATOMIC_HELPER_H
 #define KERNEL_DEV_GPU_DRM_ATOMIC_HELPER_H
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
 
 /* min_scale = max_scale = this: the plane cannot scale.  Scale factors are
  * 16.16 source pixels per destination pixel. */

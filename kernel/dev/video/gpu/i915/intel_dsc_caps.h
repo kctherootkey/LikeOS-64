@@ -35,8 +35,8 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DSC_CAPS_H
 #define KERNEL_DEV_GPU_I915_INTEL_DSC_CAPS_H
 
-#include <kernel/dev/video/gpu/drm_dsc.h>
-#include <kernel/dev/video/gpu/drm_dp.h>
+#include <kernel/dev/video/gpu/drm/drm_dsc.h>
+#include <kernel/dev/video/gpu/drm/drm_dp.h>
 
 struct drm_dp_aux;
 struct drm_dp_desc;

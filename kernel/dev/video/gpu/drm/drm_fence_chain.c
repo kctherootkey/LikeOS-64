@@ -15,14 +15,14 @@
 // Devices' code: GPL-2.0-only
 // Portions Copyright (C) 2018 Advanced Micro Devices, Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_chain.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* Guards every link's `prev' pointer: held only to read-and-reference or
  * to swap it, never across anything else (interrupt-safe: walks happen

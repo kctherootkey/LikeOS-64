@@ -11,7 +11,7 @@
 
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
-#include <kernel/dev/video/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
 #include <kernel/uapi/drm/drm_mode.h>
 #include <stdio.h>
 #include <string.h>

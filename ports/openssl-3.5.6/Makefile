@@ -35406,6 +35406,8 @@ apps/openssl-bin-x509.o : \
  include/openssl/x509_vfy.h include/openssl/lhash.h \
  include/openssl/x509v3.h include/openssl/x509v3err.h
 crypto/aes/libcrypto-lib-aes_cfb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -35516,6 +35518,8 @@ crypto/aes/libcrypto-lib-aes_misc.o : \
  include/openssl/opensslconf.h include/openssl/configuration.h \
  include/openssl/opensslv.h include/openssl/macros.h os-dep/likeos.h
 crypto/aes/libcrypto-lib-aes_ofb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -35574,6 +35578,8 @@ crypto/aes/libcrypto-lib-aes_wrap.o : \
  include/openssl/symhacks.h include/openssl/cryptoerr_legacy.h \
  include/openssl/types.h include/openssl/cryptoerr.h os-dep/likeos.h
 crypto/aes/libcrypto-shlib-aes_cfb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -35685,6 +35691,8 @@ crypto/aes/libcrypto-shlib-aes_misc.o : \
  include/openssl/opensslconf.h include/openssl/configuration.h \
  include/openssl/opensslv.h include/openssl/macros.h os-dep/likeos.h
 crypto/aes/libcrypto-shlib-aes_ofb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -35745,6 +35753,8 @@ crypto/aes/libcrypto-shlib-aes_wrap.o : \
  include/openssl/types.h include/openssl/cryptoerr.h os-dep/likeos.h
 crypto/aria/libcrypto-lib-aria.o : \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/assert.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -35764,6 +35774,8 @@ crypto/aria/libcrypto-lib-aria.o : \
  include/openssl/opensslv.h
 crypto/aria/libcrypto-shlib-aria.o : \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/assert.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -41929,6 +41941,8 @@ crypto/async/libcrypto-shlib-async_wait.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h
 crypto/bf/libcrypto-lib-bf_cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -41946,6 +41960,8 @@ crypto/bf/libcrypto-lib-bf_cfb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/blowfish.h
 crypto/bf/libcrypto-lib-bf_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -41963,6 +41979,8 @@ crypto/bf/libcrypto-lib-bf_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/blowfish.h
 crypto/bf/libcrypto-lib-bf_enc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -41980,6 +41998,8 @@ crypto/bf/libcrypto-lib-bf_enc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/blowfish.h
 crypto/bf/libcrypto-lib-bf_ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -42020,6 +42040,8 @@ crypto/bf/libcrypto-lib-bf_skey.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h
 crypto/bf/libcrypto-shlib-bf_cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -42037,6 +42059,8 @@ crypto/bf/libcrypto-shlib-bf_cfb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/blowfish.h os-dep/likeos.h
 crypto/bf/libcrypto-shlib-bf_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -42054,6 +42078,8 @@ crypto/bf/libcrypto-shlib-bf_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/blowfish.h
 crypto/bf/libcrypto-shlib-bf_enc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -42071,6 +42097,8 @@ crypto/bf/libcrypto-shlib-bf_enc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/blowfish.h
 crypto/bf/libcrypto-shlib-bf_ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -47793,6 +47821,8 @@ crypto/buffer/libcrypto-shlib-buffer.o : \
  include/openssl/opensslv.h include/openssl/e_os2.h \
  include/openssl/stack.h include/openssl/types.h os-dep/likeos.h
 crypto/camellia/libcrypto-lib-cmll_cfb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -47813,6 +47843,8 @@ crypto/camellia/libcrypto-lib-cmll_cfb.o : \
  include/openssl/opensslv.h include/openssl/camellia.h \
  include/openssl/safestack.h include/openssl/stack.h os-dep/likeos.h
 crypto/camellia/libcrypto-lib-cmll_ctr.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -47833,6 +47865,8 @@ crypto/camellia/libcrypto-lib-cmll_ctr.o : \
  include/openssl/opensslv.h include/openssl/camellia.h \
  include/openssl/safestack.h include/openssl/stack.h os-dep/likeos.h
 crypto/camellia/libcrypto-lib-cmll_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -47848,6 +47882,8 @@ crypto/camellia/libcrypto-lib-cmll_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/camellia.h os-dep/likeos.h
 crypto/camellia/libcrypto-lib-cmll_misc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -47863,6 +47899,8 @@ crypto/camellia/libcrypto-lib-cmll_misc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/camellia.h os-dep/likeos.h
 crypto/camellia/libcrypto-lib-cmll_ofb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -47883,6 +47921,8 @@ crypto/camellia/libcrypto-lib-cmll_ofb.o : \
  include/openssl/opensslv.h include/openssl/camellia.h \
  include/openssl/safestack.h include/openssl/stack.h os-dep/likeos.h
 crypto/camellia/libcrypto-shlib-cmll_cfb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -47903,6 +47943,8 @@ crypto/camellia/libcrypto-shlib-cmll_cfb.o : \
  include/openssl/opensslv.h include/openssl/camellia.h \
  include/openssl/safestack.h include/openssl/stack.h os-dep/likeos.h
 crypto/camellia/libcrypto-shlib-cmll_ctr.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -47923,6 +47965,8 @@ crypto/camellia/libcrypto-shlib-cmll_ctr.o : \
  include/openssl/opensslv.h include/openssl/camellia.h \
  include/openssl/safestack.h include/openssl/stack.h os-dep/likeos.h
 crypto/camellia/libcrypto-shlib-cmll_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -47938,6 +47982,8 @@ crypto/camellia/libcrypto-shlib-cmll_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/camellia.h os-dep/likeos.h
 crypto/camellia/libcrypto-shlib-cmll_misc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -47953,6 +47999,8 @@ crypto/camellia/libcrypto-shlib-cmll_misc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/camellia.h os-dep/likeos.h
 crypto/camellia/libcrypto-shlib-cmll_ofb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -47973,6 +48021,8 @@ crypto/camellia/libcrypto-shlib-cmll_ofb.o : \
  include/openssl/opensslv.h include/openssl/camellia.h \
  include/openssl/safestack.h include/openssl/stack.h os-dep/likeos.h
 crypto/cast/libcrypto-lib-c_cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -47988,6 +48038,8 @@ crypto/cast/libcrypto-lib-c_cfb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h os-dep/likeos.h
 crypto/cast/libcrypto-lib-c_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48003,6 +48055,8 @@ crypto/cast/libcrypto-lib-c_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h
 crypto/cast/libcrypto-lib-c_enc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48018,6 +48072,8 @@ crypto/cast/libcrypto-lib-c_enc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h
 crypto/cast/libcrypto-lib-c_ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48033,6 +48089,8 @@ crypto/cast/libcrypto-lib-c_ofb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h os-dep/likeos.h
 crypto/cast/libcrypto-lib-c_skey.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48049,6 +48107,8 @@ crypto/cast/libcrypto-lib-c_skey.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h
 crypto/cast/libcrypto-shlib-c_cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48064,6 +48124,8 @@ crypto/cast/libcrypto-shlib-c_cfb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h os-dep/likeos.h
 crypto/cast/libcrypto-shlib-c_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48079,6 +48141,8 @@ crypto/cast/libcrypto-shlib-c_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h
 crypto/cast/libcrypto-shlib-c_enc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48094,6 +48158,8 @@ crypto/cast/libcrypto-shlib-c_enc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h
 crypto/cast/libcrypto-shlib-c_ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -48109,6 +48175,8 @@ crypto/cast/libcrypto-shlib-c_ofb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/cast.h os-dep/likeos.h
 crypto/cast/libcrypto-shlib-c_skey.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -58582,6 +58650,8 @@ crypto/ec/curve448/libcrypto-lib-curve448_tables.o : \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/alloca.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/assert.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/multibyte.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -58659,6 +58729,8 @@ crypto/ec/curve448/libcrypto-lib-f_generic.o : \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/alloca.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/assert.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/multibyte.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -58767,6 +58839,8 @@ crypto/ec/curve448/libcrypto-shlib-curve448_tables.o : \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/alloca.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/assert.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/multibyte.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -58844,6 +58918,8 @@ crypto/ec/curve448/libcrypto-shlib-f_generic.o : \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/alloca.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/assert.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/multibyte.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -65068,6 +65144,8 @@ crypto/err/libcrypto-lib-err_all.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  providers/common/include/prov/proverr.h
 crypto/err/libcrypto-lib-err_all_legacy.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -65328,6 +65406,8 @@ crypto/err/libcrypto-shlib-err_all.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h providers/common/include/prov/proverr.h
 crypto/err/libcrypto-shlib-err_all_legacy.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -73975,6 +74055,8 @@ crypto/ffc/libcrypto-shlib-ffc_params_validate.o : \
  include/openssl/params.h include/openssl/evperr.h \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h
 crypto/hashtable/libcrypto-lib-hashfunc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -74034,6 +74116,8 @@ crypto/hashtable/libcrypto-lib-hashtable.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h
 crypto/hashtable/libcrypto-shlib-hashfunc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -74092,6 +74176,8 @@ crypto/hashtable/libcrypto-shlib-hashtable.o : \
  include/openssl/rand.h include/openssl/randerr.h include/openssl/symhacks.h \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h
 crypto/hashtable/libssl-shlib-hashfunc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -74658,6 +74744,8 @@ crypto/http/libcrypto-shlib-http_lib.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h
 crypto/idea/libcrypto-lib-i_cbc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74673,6 +74761,8 @@ crypto/idea/libcrypto-lib-i_cbc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h
 crypto/idea/libcrypto-lib-i_cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74688,6 +74778,8 @@ crypto/idea/libcrypto-lib-i_cfb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h os-dep/likeos.h
 crypto/idea/libcrypto-lib-i_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74703,6 +74795,8 @@ crypto/idea/libcrypto-lib-i_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h
 crypto/idea/libcrypto-lib-i_ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74718,6 +74812,8 @@ crypto/idea/libcrypto-lib-i_ofb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h os-dep/likeos.h
 crypto/idea/libcrypto-lib-i_skey.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74733,6 +74829,8 @@ crypto/idea/libcrypto-lib-i_skey.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h
 crypto/idea/libcrypto-shlib-i_cbc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74748,6 +74846,8 @@ crypto/idea/libcrypto-shlib-i_cbc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h
 crypto/idea/libcrypto-shlib-i_cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74763,6 +74863,8 @@ crypto/idea/libcrypto-shlib-i_cfb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h os-dep/likeos.h
 crypto/idea/libcrypto-shlib-i_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74778,6 +74880,8 @@ crypto/idea/libcrypto-shlib-i_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h
 crypto/idea/libcrypto-shlib-i_ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -74793,6 +74897,8 @@ crypto/idea/libcrypto-shlib-i_ofb64.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/idea.h os-dep/likeos.h
 crypto/idea/libcrypto-shlib-i_skey.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -75678,6 +75784,8 @@ crypto/libcrypto-lib-deterministic_nonce.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h
 crypto/libcrypto-lib-ebcdic.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -76754,6 +76862,8 @@ crypto/libcrypto-lib-provider_core.o : \
  include/openssl/x509.h include/openssl/ec.h include/openssl/ecerr.h \
  include/openssl/x509_vfy.h include/openssl/pkcs7.h os-dep/likeos.h
 crypto/libcrypto-lib-provider_predefined.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -77841,6 +77951,8 @@ crypto/libcrypto-shlib-deterministic_nonce.o : \
  include/openssl/params.h include/openssl/bio.h include/openssl/bioerr.h \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h
 crypto/libcrypto-shlib-ebcdic.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -78917,6 +79029,8 @@ crypto/libcrypto-shlib-provider_core.o : \
  include/openssl/x509.h include/openssl/ec.h include/openssl/ecerr.h \
  include/openssl/x509_vfy.h include/openssl/pkcs7.h os-dep/likeos.h
 crypto/libcrypto-shlib-provider_predefined.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/limits.h \
@@ -88058,6 +88172,8 @@ crypto/rand/libcrypto-shlib-randfile.o : \
  include/openssl/symhacks.h include/openssl/cryptoerr_legacy.h \
  include/openssl/types.h include/openssl/cryptoerr.h os-dep/likeos.h
 crypto/rc2/libcrypto-lib-rc2_cbc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88073,6 +88189,8 @@ crypto/rc2/libcrypto-lib-rc2_cbc.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h
 crypto/rc2/libcrypto-lib-rc2_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88088,6 +88206,8 @@ crypto/rc2/libcrypto-lib-rc2_ecb.o : \
  include/openssl/macros.h include/openssl/opensslconf.h \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h
 crypto/rc2/libcrypto-lib-rc2_skey.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88104,6 +88224,8 @@ crypto/rc2/libcrypto-lib-rc2_skey.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-lib-rc2cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88120,6 +88242,8 @@ crypto/rc2/libcrypto-lib-rc2cfb64.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-lib-rc2ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88136,6 +88260,8 @@ crypto/rc2/libcrypto-lib-rc2ofb64.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-shlib-rc2_cbc.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88152,6 +88278,8 @@ crypto/rc2/libcrypto-shlib-rc2_cbc.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-shlib-rc2_ecb.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88168,6 +88296,8 @@ crypto/rc2/libcrypto-shlib-rc2_ecb.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-shlib-rc2_skey.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88184,6 +88314,8 @@ crypto/rc2/libcrypto-shlib-rc2_skey.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-shlib-rc2cfb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -88200,6 +88332,8 @@ crypto/rc2/libcrypto-shlib-rc2cfb64.o : \
  include/openssl/opensslv.h include/openssl/rc2.h crypto/rc2/rc2_local.h \
  os-dep/likeos.h
 crypto/rc2/libcrypto-shlib-rc2ofb64.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stdint.h \
@@ -91079,6 +91213,8 @@ crypto/sha/libcrypto-lib-sha256.o : \
  include/openssl/sha.h include/internal/endian.h include/crypto/sha.h \
  include/openssl/types.h
 crypto/sha/libcrypto-lib-sha3.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -91254,6 +91390,8 @@ crypto/sha/libcrypto-shlib-sha256.o : \
  include/openssl/sha.h include/internal/endian.h include/crypto/sha.h \
  include/openssl/types.h
 crypto/sha/libcrypto-shlib-sha3.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -91411,6 +91549,8 @@ crypto/siphash/libssl-shlib-siphash.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h
 crypto/slh_dsa/libcrypto-lib-slh_adrs.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -91688,6 +91828,8 @@ crypto/slh_dsa/libcrypto-lib-slh_hypertree.o : \
  include/openssl/opensslv.h \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h
 crypto/slh_dsa/libcrypto-lib-slh_params.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -91785,6 +91927,8 @@ crypto/slh_dsa/libcrypto-lib-slh_xmss.o : \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h \
  os-dep/likeos.h
 crypto/slh_dsa/libcrypto-shlib-slh_adrs.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -92061,6 +92205,8 @@ crypto/slh_dsa/libcrypto-shlib-slh_hypertree.o : \
  include/openssl/opensslv.h \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h
 crypto/slh_dsa/libcrypto-shlib-slh_params.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -92613,6 +92759,8 @@ crypto/sm3/libcrypto-shlib-sm3.o : \
  include/openssl/opensslv.h \
  include/openssl/safestack.h include/openssl/stack.h include/openssl/types.h
 crypto/sm4/libcrypto-lib-sm4.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \
@@ -92629,6 +92777,8 @@ crypto/sm4/libcrypto-lib-sm4.o : \
  include/openssl/opensslconf.h include/openssl/configuration.h \
  include/openssl/opensslv.h
 crypto/sm4/libcrypto-shlib-sm4.o : \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/pthreadtypes.h \
+ /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/bits/sched_param.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/errno.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/inttypes.h \
  /home/kcope/Dokumente/LikeOS-64/user/lib/libc/include/stddef.h \

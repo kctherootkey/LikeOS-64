@@ -6,10 +6,10 @@
  * Run by host/test-drm-probe.sh from the repository root.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include "test-edid-corpus.h"

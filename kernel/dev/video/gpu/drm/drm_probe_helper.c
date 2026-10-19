@@ -35,9 +35,9 @@
 // Portions Copyright (C) 2006-2008 Intel Corporation
 // Portions Copyright (C) 2007 Dave Airlie <airlied@linux.ie>
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>

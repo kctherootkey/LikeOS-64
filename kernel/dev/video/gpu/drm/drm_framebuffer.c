@@ -18,10 +18,10 @@
 // Portions Copyright (c) 2016 Intel Corporation
 // Portions Copyright (C) 2016 Laurent Pinchart <laurent.pinchart@ideasonboard.com>
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_fourcc.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_fourcc.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

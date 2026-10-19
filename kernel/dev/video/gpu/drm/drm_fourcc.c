@@ -16,8 +16,8 @@
 // SPDX-License-Identifier for the portions derived from Laurent Pinchart's code: HPND-sell-variant
 // Portions Copyright (C) 2016 Laurent Pinchart <laurent.pinchart@ideasonboard.com>
 
-#include <kernel/dev/video/gpu/drm_fourcc.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_fourcc.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/bug.h>
 
 /* The format code the legacy ADDFB means by bits per pixel and colour

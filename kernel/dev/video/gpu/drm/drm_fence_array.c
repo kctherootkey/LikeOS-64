@@ -16,15 +16,15 @@
 // Portions Copyright (C) 2016 Collabora Ltd
 // Portions Copyright (C) 2016 Advanced Micro Devices, Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_fence_array.h>
-#include <kernel/dev/video/gpu/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_array.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_chain.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* base.error while the array has not signalled: "no error yet".  The
  * first part that fails replaces it; signalling clears what is left. */

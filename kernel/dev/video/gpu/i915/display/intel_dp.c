@@ -26,7 +26,7 @@
 #include <kernel/dev/video/gpu/i915/intel_dpll_regs.h>
 #include <kernel/dev/video/gpu/i915/intel_display.h>
 #include <kernel/dev/video/gpu/i915/intel_dp_link_training.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

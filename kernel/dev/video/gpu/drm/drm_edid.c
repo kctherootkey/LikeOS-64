@@ -20,7 +20,7 @@
 // Portions Copyright (C) 2010 Red Hat, Inc.
 // Portions Copyright (C) 2006 Dennis Munsie <dmunsie@cecropia.com>
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>

@@ -10,15 +10,15 @@
 // Devices' code: GPL-2.0-only
 // Portions Copyright (C) 2022 Advanced Micro Devices, Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_fence_array.h>
-#include <kernel/dev/video/gpu/drm_fence_chain.h>
-#include <kernel/dev/video/gpu/drm_fence_unwrap.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_array.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_unwrap.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/uapi/bug.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* Start on the link the cursor stands at: what it holds, from the top. */
 static struct drm_fence *unwrap_array(struct drm_fence_unwrap *cursor)

@@ -15,7 +15,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_DSC_HELPER_H
 #define KERNEL_DEV_GPU_DRM_DSC_HELPER_H
 
-#include <kernel/dev/video/gpu/drm_dsc.h>
+#include <kernel/dev/video/gpu/drm/drm_dsc.h>
 
 enum drm_dsc_params_type {
 	DRM_DSC_1_2_444,

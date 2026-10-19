@@ -28,10 +28,10 @@
 // Portions Copyright (c) 2009-2025 Broadcom. All Rights Reserved. The term
 // “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_mode_object.h>
-#include <kernel/dev/video/gpu/drm_probe_helper.h>
-#include <kernel/dev/video/gpu/drm_property.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_property.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/mm/memory.h>

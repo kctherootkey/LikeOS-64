@@ -16,7 +16,7 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_BLIT_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_BLIT_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/video/gpu/vmwgfx/vmw_compat.h>
 
 /**

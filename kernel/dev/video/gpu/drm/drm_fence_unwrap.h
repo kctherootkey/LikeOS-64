@@ -12,7 +12,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_FENCE_UNWRAP_H
 #define KERNEL_DEV_GPU_DRM_FENCE_UNWRAP_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct drm_fence_unwrap {
 	struct drm_fence *chain; /* the link being looked through, referenced */

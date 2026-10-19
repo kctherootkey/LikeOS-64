@@ -25,8 +25,8 @@
 #ifndef KERNEL_DEV_GPU_DRM_DAMAGE_HELPER_H
 #define KERNEL_DEV_GPU_DRM_DAMAGE_HELPER_H
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
 
 /* Every damage rectangle of the update in turn, clipped to the plane
  * source, in whole framebuffer pixels:

@@ -24,7 +24,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_PROBE_HELPER_H
 #define KERNEL_DEV_GPU_DRM_PROBE_HELPER_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 /* The most modes one probe works on before the list is cut to the
  * connector's DRM_MAX_MODES: an EDID with a range descriptor and a long

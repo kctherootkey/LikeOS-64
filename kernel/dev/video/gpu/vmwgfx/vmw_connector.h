@@ -29,7 +29,7 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_CONNECTOR_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_CONNECTOR_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct vmw_device;
 

@@ -23,7 +23,7 @@
 #define KERNEL_DEV_GPU_DRM_DP_DUAL_MODE_HELPER_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* Optional for type 1 DVI adaptors, mandatory for type 1 HDMI and type 2
  * adaptors. */

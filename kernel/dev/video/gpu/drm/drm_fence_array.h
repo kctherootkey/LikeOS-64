@@ -14,7 +14,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_FENCE_ARRAY_H
 #define KERNEL_DEV_GPU_DRM_FENCE_ARRAY_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct drm_fence_array;
 

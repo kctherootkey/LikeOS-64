@@ -10,7 +10,7 @@
 // SPDX-License-Identifier for the portions derived from Maíra Canal's code: GPL-2.0
 // Portions Copyright (c) 2022 Maíra Canal <mairacanal@riseup.net>
 
-#include <kernel/dev/video/gpu/drm_fourcc.h>
+#include <kernel/dev/video/gpu/drm/drm_fourcc.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <limits.h>

@@ -41,7 +41,7 @@
 #include <kernel/dev/video/gpu/i915/i915_legacy.h>
 #include <kernel/dev/video/gpu/i915/intel_legacy_color.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/drm_blend.h>
+#include <kernel/dev/video/gpu/drm/drm_blend.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/ke/interrupt.h>

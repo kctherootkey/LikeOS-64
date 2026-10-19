@@ -21,12 +21,12 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: HPND-sell-variant
 // Portions Copyright (c) 2016 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_blend.h>
-#include <kernel/dev/video/gpu/drm_property.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_blend.h>
+#include <kernel/dev/video/gpu/drm/drm_property.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/ke/sched.h>

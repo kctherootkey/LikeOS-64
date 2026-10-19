@@ -19,7 +19,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_PROPERTY_H
 #define KERNEL_DEV_GPU_DRM_PROPERTY_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 /* One enum or bitmask entry to create a property from: the value (for a
  * bitmask, the bit number) and its name. */

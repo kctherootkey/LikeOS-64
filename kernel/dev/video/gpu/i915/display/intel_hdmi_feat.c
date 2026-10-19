@@ -43,10 +43,10 @@
 #include <kernel/dev/video/gpu/i915/intel_display.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
 #include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/drm_scdc_helper.h>
-#include <kernel/dev/video/gpu/drm_dp_dual_mode_helper.h>
-#include <kernel/dev/video/gpu/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_scdc_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_dual_mode_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 

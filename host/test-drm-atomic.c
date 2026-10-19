@@ -17,12 +17,12 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_property.h>
-#include <kernel/dev/video/gpu/drm_mode_object.h>
-#include <kernel/dev/video/gpu/drm_blend.h>
-#include <kernel/dev/video/gpu/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_property.h>
+#include <kernel/dev/video/gpu/drm/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm/drm_blend.h>
+#include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/syscall.h>

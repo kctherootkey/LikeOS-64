@@ -39,10 +39,10 @@
 #include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
 #include <kernel/dev/video/gpu/i915/intel_vrr.h>
 #include <kernel/dev/video/gpu/i915/intel_wm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_probe_helper.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 static int detect_locked(struct drm_device *dev, struct drm_connector *c)
 {

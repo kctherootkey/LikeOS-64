@@ -35,8 +35,8 @@
 #ifndef KERNEL_DEV_GPU_DRM_COLOR_MGMT_H
 #define KERNEL_DEV_GPU_DRM_COLOR_MGMT_H
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* A table entry (16 bits, 0xffff = 1.0) rounded to the hardware's
  * `bit_precision' bits, the way an integer colour is converted to and from

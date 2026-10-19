@@ -19,11 +19,11 @@
 // Portions Copyright (c) 2016 Intel Corporation
 // Portions Copyright (C) 2007-2008 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_atomic_helper.h>
-#include <kernel/dev/video/gpu/drm_rect.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_atomic_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>

@@ -21,7 +21,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_DP_H
 #define KERNEL_DEV_GPU_DRM_DP_H
 
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 #ifndef __packed
 #define __packed __attribute__((packed))

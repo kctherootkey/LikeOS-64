@@ -42,8 +42,8 @@
 #include <kernel/dev/video/gpu/i915/intel_features.h>
 #include <kernel/dev/video/gpu/i915/intel_vrr.h>
 #include <kernel/dev/video/gpu/i915/intel_vrr_regs.h>
-#include <kernel/dev/video/gpu/drm_dp_helper.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 

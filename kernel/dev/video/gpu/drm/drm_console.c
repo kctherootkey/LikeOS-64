@@ -32,8 +32,8 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/fb.h>
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/ke/sched.h>

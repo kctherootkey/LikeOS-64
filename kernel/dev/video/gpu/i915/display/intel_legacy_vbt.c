@@ -24,7 +24,7 @@
 // Portions Copyright (C) 2006-2024 Intel Corporation
 
 #include <kernel/dev/video/gpu/i915/intel_legacy.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

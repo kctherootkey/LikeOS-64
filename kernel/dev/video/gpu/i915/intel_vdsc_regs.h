@@ -20,7 +20,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_VDSC_REGS_H
 #define KERNEL_DEV_GPU_I915_INTEL_VDSC_REGS_H
 
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* pipe-level register: pipe B's address, 0x200 apart */
 #define INTEL_VDSC_PIPE_REG(pb, pipe) ((uint32_t)((int)(pb) + ((int)(pipe) - 1) * 0x200))

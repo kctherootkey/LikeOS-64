@@ -38,9 +38,9 @@
 #include <kernel/dev/video/gpu/i915/intel_display_legacy.h>
 #include <kernel/dev/video/gpu/i915/intel_vblank.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
-#include <kernel/dev/video/gpu/drm_vblank.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_vblank.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/sched.h>

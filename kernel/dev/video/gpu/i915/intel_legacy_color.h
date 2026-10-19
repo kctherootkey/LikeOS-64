@@ -23,7 +23,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_LEGACY_COLOR_H
 #define KERNEL_DEV_GPU_I915_INTEL_LEGACY_COLOR_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct i915_device;
 struct lg_display;

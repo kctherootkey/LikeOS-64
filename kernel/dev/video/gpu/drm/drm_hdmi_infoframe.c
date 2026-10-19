@@ -2,7 +2,7 @@
 // the AVI and vendor infoframes of a mode on a connector.
 //
 // The structured form of each infoframe and what its fields mean are in
-// <kernel/dev/video/gpu/hdmi.h>.  Packing writes the 4-byte header (type,
+// <kernel/dev/video/gpu/drm/hdmi.h>.  Packing writes the 4-byte header (type,
 // version, payload length, checksum) and the payload into a zeroed buffer,
 // then sets the checksum so that the packet sums to zero modulo 256 (HDMI
 // 1.4 section 5.3.5); unpacking verifies it.  A frame is checked before it
@@ -27,13 +27,13 @@
 // Portions Copyright 2010 Red Hat, Inc.
 // Portions Copyright (C) 2006 Dennis Munsie <dmunsie@cecropia.com>
 
-#include <kernel/dev/video/gpu/hdmi.h>
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/drm_dp.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/hdmi.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_dp.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/drm_mode.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>

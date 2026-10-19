@@ -10,8 +10,8 @@
  * counted, so each case ends by checking that everything was freed.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_chain.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 

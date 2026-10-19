@@ -18,16 +18,16 @@
 // Portions Copyright (C) 2012-2014 Canonical Ltd (Maarten Lankhorst)
 // Portions Copyright (c) 2006-2009 VMware, Inc., Palo Alto, CA., USA
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_resv.h>
-#include <kernel/dev/video/gpu/drm_fence_array.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_resv.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_array.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/hrtimer.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* Mask for the lower fence pointer bits */
 #define DRM_RESV_LIST_MASK 0x3UL

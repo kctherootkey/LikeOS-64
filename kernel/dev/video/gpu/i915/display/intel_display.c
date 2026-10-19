@@ -37,7 +37,7 @@
 #include <kernel/dev/video/gpu/i915/intel_connector.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
 #include <kernel/dev/video/gpu/i915/intel_audio.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/hal/lapic.h>

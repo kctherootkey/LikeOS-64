@@ -28,7 +28,7 @@
 #define KERNEL_DEV_GPU_I915_LMEM_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct i915_device;
 struct drm_i915_memory_region_info;

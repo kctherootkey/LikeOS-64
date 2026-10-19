@@ -27,7 +27,7 @@
 
 #include <kernel/uapi/types.h>
 #include <kernel/ke/hrtimer.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
 
 struct drm_device;
 struct drm_file;

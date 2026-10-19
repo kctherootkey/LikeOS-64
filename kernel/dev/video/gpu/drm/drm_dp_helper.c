@@ -33,10 +33,10 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2008 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm_dp_helper.h>
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/hrtimer.h>

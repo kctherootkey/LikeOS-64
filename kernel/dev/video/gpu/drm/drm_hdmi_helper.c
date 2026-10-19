@@ -15,12 +15,12 @@
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from the HDMI helper code: MIT
 
-#include <kernel/dev/video/gpu/drm_hdmi_helper.h>
-#include <kernel/dev/video/gpu/hdmi.h>
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_hdmi_helper.h>
+#include <kernel/dev/video/gpu/drm/hdmi.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/drm_mode.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>

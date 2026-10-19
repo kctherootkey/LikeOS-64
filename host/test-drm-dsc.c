@@ -23,8 +23,8 @@
 
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
-#include <kernel/dev/video/gpu/drm_dsc_helper.h>
-#include <kernel/dev/video/gpu/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dsc_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
 #include <kernel/dev/video/gpu/i915/intel_qp_tables.h>
 #include <kernel/dev/video/gpu/i915/intel_dsc_caps.h>
 #include <stdio.h>

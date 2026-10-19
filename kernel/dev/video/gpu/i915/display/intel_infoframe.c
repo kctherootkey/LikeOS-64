@@ -23,10 +23,10 @@
 // Portions Copyright (C) 2006 Dave Airlie <airlied@linux.ie>
 // Portions Copyright (C) 2006-2009 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/hdmi.h>
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/hdmi.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/video/gpu/i915/intel_infoframe.h>
 
 uint8_t intel_hdmi_vic_for_mode(const struct drm_mode_modeinfo *m)

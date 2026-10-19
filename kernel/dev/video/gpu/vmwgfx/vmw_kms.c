@@ -23,8 +23,8 @@
 // Portions Copyright (c) 2009-2025 Broadcom. All Rights Reserved. The term
 // “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/uapi/drm/drm_fourcc.h>

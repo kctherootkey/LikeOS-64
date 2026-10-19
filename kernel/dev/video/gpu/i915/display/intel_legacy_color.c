@@ -35,8 +35,8 @@
 // Portions Copyright (C) 2016 Intel Corporation
 // Portions Copyright (C) 2023 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm_color_mgmt.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/gpu/i915/intel_legacy.h>
 #include <kernel/dev/video/gpu/i915/intel_legacy_color.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>

@@ -18,8 +18,8 @@
 #define KERNEL_DEV_GPU_DRM_SCDC_HELPER_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
-#include <kernel/dev/video/gpu/drm_scdc.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_scdc.h>
 
 struct i2c_adapter;
 

@@ -7,11 +7,11 @@
  * prelude abort on recursion, which in the kernel would be a deadlock.
  *
  * Copyright (C) 2026 The LikeOS Project */
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_fence_array.h>
-#include <kernel/dev/video/gpu/drm_fence_chain.h>
-#include <kernel/dev/video/gpu/drm_fence_unwrap.h>
-#include <kernel/dev/video/gpu/drm_resv.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_array.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_unwrap.h>
+#include <kernel/dev/video/gpu/drm/drm_resv.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 

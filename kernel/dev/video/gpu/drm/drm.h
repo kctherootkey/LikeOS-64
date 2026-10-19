@@ -20,11 +20,11 @@
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/hal/pci.h>
-#include <kernel/dev/video/gpu/drm_modes.h>
-#include <kernel/dev/video/gpu/drm_mode_object.h>
-#include <kernel/dev/video/gpu/drm_display_info.h>
-#include <kernel/dev/video/gpu/drm_rect.h>
-#include <kernel/dev/video/gpu/drm_vblank.h>
+#include <kernel/dev/video/gpu/drm/drm_modes.h>
+#include <kernel/dev/video/gpu/drm/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/drm_vblank.h>
 
 struct drm_device;
 struct drm_file;

@@ -27,7 +27,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_RESV_H
 #define KERNEL_DEV_GPU_DRM_RESV_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/ke/sched.h>
 #include <kernel/mm/rwsem.h>
 

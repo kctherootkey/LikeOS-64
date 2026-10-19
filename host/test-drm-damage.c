@@ -14,10 +14,10 @@
 
 /* The kernel's fixed-width types come first and stand in for stdint.h,
  * whose typedefs differ in spelling (long vs long long) on the host. */
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_damage_helper.h>
-#include <kernel/dev/video/gpu/drm_atomic_helper.h>
-#include <kernel/dev/video/gpu/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_damage_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_atomic_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>

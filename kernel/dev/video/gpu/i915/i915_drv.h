@@ -5,7 +5,7 @@
 #ifndef KERNEL_DEV_GPU_I915_DRV_H
 #define KERNEL_DEV_GPU_I915_DRV_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/video/gpu/i915/i915_device_info.h>
 #include <kernel/hal/pci.h>
 #include <kernel/ke/sched.h>

@@ -30,10 +30,10 @@
 // Portions Copyright 2017 Red Hat
 // Portions Copyright 2016 Advanced Micro Devices, Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_fence_chain.h>
-#include <kernel/dev/video/gpu/drm_fence_unwrap.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_chain.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_unwrap.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

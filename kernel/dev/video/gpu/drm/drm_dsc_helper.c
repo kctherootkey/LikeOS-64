@@ -25,7 +25,7 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2018 Intel Corp
 
-#include <kernel/dev/video/gpu/drm_dsc_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dsc_helper.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
 

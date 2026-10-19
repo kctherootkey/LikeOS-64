@@ -32,8 +32,8 @@
 #define KERNEL_DEV_GPU_DRM_DP_HELPER_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
-#include <kernel/dev/video/gpu/drm_dp.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_dp.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/ke/syscall.h> /* errno values; after rwsem.h (FD_CLOEXEC) */

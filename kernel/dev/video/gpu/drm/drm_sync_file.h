@@ -12,7 +12,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_SYNC_FILE_H
 #define KERNEL_DEV_GPU_DRM_SYNC_FILE_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct drm_sync_file {
 	struct drm_fence *fence; /* referenced */

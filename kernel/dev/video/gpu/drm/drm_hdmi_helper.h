@@ -9,7 +9,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_HDMI_HELPER_H
 #define KERNEL_DEV_GPU_DRM_HDMI_HELPER_H
 
-#include <kernel/dev/video/gpu/hdmi.h>
+#include <kernel/dev/video/gpu/drm/hdmi.h>
 
 struct drm_connector;
 struct drm_connector_state;

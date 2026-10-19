@@ -14,7 +14,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_QP_TABLES_H
 #define KERNEL_DEV_GPU_I915_INTEL_QP_TABLES_H
 
-#include <kernel/dev/video/gpu/drm_dsc.h>
+#include <kernel/dev/video/gpu/drm/drm_dsc.h>
 
 u8 intel_lookup_range_min_qp(int bpc, int buf_i, int bpp_i, bool is_420);
 u8 intel_lookup_range_max_qp(int bpc, int buf_i, int bpp_i, bool is_420);

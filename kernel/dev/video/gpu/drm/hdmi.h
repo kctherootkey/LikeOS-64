@@ -30,12 +30,12 @@
 #define KERNEL_DEV_GPU_HDMI_H
 
 #include <kernel/uapi/types.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 /* enum hdmi_quantization_range (the EDID code reports the default range
  * of a mode in it) */
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 /* struct hdr_static_metadata, struct hdr_sink_metadata */
-#include <kernel/dev/video/gpu/drm_display_info.h>
+#include <kernel/dev/video/gpu/drm/drm_display_info.h>
 
 /* The pack functions return a byte count or a negative errno. */
 typedef long ssize_t;

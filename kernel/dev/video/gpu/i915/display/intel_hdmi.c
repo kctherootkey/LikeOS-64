@@ -26,7 +26,7 @@
 #include <kernel/dev/video/gpu/i915/intel_display.h>
 #include <kernel/dev/video/gpu/i915/intel_features.h>
 #include <kernel/dev/video/gpu/i915/intel_hdmi_feat.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/dev/video/gpu/i915/intel_infoframe.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>

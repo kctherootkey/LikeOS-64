@@ -11,7 +11,7 @@
 #ifndef KERNEL_DEV_GPU_I915_INTEL_DISPLAY_H
 #define KERNEL_DEV_GPU_I915_INTEL_DISPLAY_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/waitq.h>

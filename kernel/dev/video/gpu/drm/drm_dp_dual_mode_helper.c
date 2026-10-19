@@ -19,8 +19,8 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright © 2016 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm_dp_dual_mode_helper.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_dual_mode_helper.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/dev/i2c.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>

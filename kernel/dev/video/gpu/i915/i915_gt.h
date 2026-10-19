@@ -14,7 +14,7 @@
 #ifndef KERNEL_DEV_GPU_I915_GT_H
 #define KERNEL_DEV_GPU_I915_GT_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/waitq.h>

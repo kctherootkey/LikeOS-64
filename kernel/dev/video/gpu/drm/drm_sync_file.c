@@ -14,10 +14,10 @@
 // GPL-2.0-only
 // Portions Copyright (C) 2012 Google, Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_sync_file.h>
-#include <kernel/dev/video/gpu/drm_fence_unwrap.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_sync_file.h>
+#include <kernel/dev/video/gpu/drm/drm_fence_unwrap.h>
 #include <kernel/uapi/drm/sync_file.h>
 #include <kernel/uapi/ioctl.h>
 #include <kernel/ke/sched.h>
@@ -27,7 +27,7 @@
 #include <kernel/fs/file.h>
 #include <kernel/mm/memory.h>
 #include <kernel/net/net.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* SYNC_IOC_MERGE builds its fence by flattening both sides and keeping the
  * latest fence of each timeline (an array when several remain).  0 goes

@@ -26,8 +26,8 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_KMS_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_KMS_H
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 
 struct vmw_device;

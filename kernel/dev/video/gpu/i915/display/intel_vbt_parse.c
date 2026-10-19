@@ -32,7 +32,7 @@
 
 #include <kernel/dev/video/gpu/i915/intel_display.h>
 #include <kernel/dev/video/gpu/i915/i915_device_info.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 
 #ifndef EINVAL
 #define EINVAL 22

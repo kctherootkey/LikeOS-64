@@ -18,10 +18,10 @@
 // Portions Copyright (c) 2007 Dave Airlie <airlied@linux.ie>
 // Portions Copyright (c) 2008 Red Hat Inc.
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>

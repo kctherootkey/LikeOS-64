@@ -15,7 +15,7 @@
 #ifndef KERNEL_DEV_GPU_DRM_FENCE_CHAIN_H
 #define KERNEL_DEV_GPU_DRM_FENCE_CHAIN_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 
 struct drm_fence_chain {
 	struct drm_fence base; /* first: the link IS a fence */

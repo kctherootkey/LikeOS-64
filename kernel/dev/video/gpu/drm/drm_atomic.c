@@ -36,18 +36,18 @@
 // Portions Copyright (C) 2018 Intel Corp.
 // Portions Copyright (c) 2016 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_internal.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
-#include <kernel/dev/video/gpu/drm_property.h>
-#include <kernel/dev/video/gpu/drm_mode_object.h>
-#include <kernel/dev/video/gpu/drm_atomic_helper.h>
-#include <kernel/dev/video/gpu/drm_damage_helper.h>
-#include <kernel/dev/video/gpu/drm_sync_file.h>
-#include <kernel/dev/video/gpu/drm_color_mgmt.h>
-#include <kernel/dev/video/gpu/drm_blend.h>
-#include <kernel/dev/video/gpu/drm_vblank.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_internal.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_property.h>
+#include <kernel/dev/video/gpu/drm/drm_mode_object.h>
+#include <kernel/dev/video/gpu/drm/drm_atomic_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_damage_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_sync_file.h>
+#include <kernel/dev/video/gpu/drm/drm_color_mgmt.h>
+#include <kernel/dev/video/gpu/drm/drm_blend.h>
+#include <kernel/dev/video/gpu/drm/drm_vblank.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/uaccess.h>

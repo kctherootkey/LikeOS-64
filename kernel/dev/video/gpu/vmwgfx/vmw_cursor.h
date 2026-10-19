@@ -19,7 +19,7 @@
 #ifndef KERNEL_DEV_GPU_VMWGFX_VMW_CURSOR_H
 #define KERNEL_DEV_GPU_VMWGFX_VMW_CURSOR_H
 
-#include <kernel/dev/video/gpu/drm.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/dev/video/gpu/vmwgfx/svga/svga3d_reg.h>
 

@@ -30,8 +30,8 @@
 
 #include <kernel/dev/video/gpu/i915/intel_dsc_caps.h>
 #include <kernel/dev/video/gpu/i915/intel_qp_tables.h>
-#include <kernel/dev/video/gpu/drm_dsc_helper.h>
-#include <kernel/dev/video/gpu/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dsc_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
 

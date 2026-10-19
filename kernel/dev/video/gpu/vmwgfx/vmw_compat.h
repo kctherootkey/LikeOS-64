@@ -21,7 +21,7 @@
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h> /* errno values */
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 
 /* ---- numeric limits ---------------------------------------------------- */
 

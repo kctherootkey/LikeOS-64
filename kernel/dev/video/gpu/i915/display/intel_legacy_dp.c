@@ -37,8 +37,8 @@
 #if defined(DP_RECEIVER_CAP_SIZE) && !defined(KERNEL_DEV_GPU_DRM_DP_H)
 #undef DP_RECEIVER_CAP_SIZE
 #endif
-#include <kernel/dev/video/gpu/drm_dp_helper.h>
-#include <kernel/dev/video/gpu/drm_edid.h>
+#include <kernel/dev/video/gpu/drm/drm_dp_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>

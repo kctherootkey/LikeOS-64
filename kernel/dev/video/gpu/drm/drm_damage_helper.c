@@ -18,11 +18,11 @@
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (c) 2016 Intel Corporation
 
-#include <kernel/dev/video/gpu/drm.h>
-#include <kernel/dev/video/gpu/drm_damage_helper.h>
-#include <kernel/dev/video/gpu/drm_atomic_helper.h>
-#include <kernel/dev/video/gpu/drm_rect.h>
-#include <kernel/dev/video/gpu/gpu_util.h>
+#include <kernel/dev/video/gpu/drm/drm.h>
+#include <kernel/dev/video/gpu/drm/drm_damage_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_atomic_helper.h>
+#include <kernel/dev/video/gpu/drm/drm_rect.h>
+#include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/bug.h>
 
 /* struct drm_mode_rect (the blob's element) is read as struct drm_rect. */
