@@ -2257,17 +2257,28 @@ void irq_handler(uint64_t *regs)
 	// Handle known IRQs
 	switch (int_no) {
 	case 32: {
+		int tick;
+
 		g_irq0_count++;
 		/* In one-shot mode the local timer carries this CPU's
 		 * high-resolution timers too: those run here, the timer is
 		 * re-armed for the next event, and the tick's own work is
 		 * done only when its boundary has come. */
-		if (lapic_timer_interrupt()) {
+		tick = lapic_timer_interrupt();
+		if (tick) {
 			timer_irq_handler((regs[REGS_CS] & 3) == 3);
 			net_timer_tick();
 		}
-		// Send EOI before preemption to avoid missing ticks
-		pic_send_eoi(irq);
+		/* Send EOI before preemption to avoid missing ticks.  From
+		 * the one-shot local timer it is the local APIC's alone;
+		 * pic_send_eoi() would first read the in-service registers of
+		 * the local APIC and, on the boot CPU, of the 8259 -- three
+		 * register accesses more on every timer interrupt, each one a
+		 * trap where a hypervisor emulates them. */
+		if (lapic_timer_is_event_source())
+			lapic_eoi();
+		else
+			pic_send_eoi(irq);
 
 		/* Common return-to-user work: deliver a pending signal (on the
 		 * IRETQ frame, not the SYSRET state — timer returns via iretq)

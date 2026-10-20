@@ -1565,8 +1565,13 @@ void timer_irq_handler(int from_user)
 
 		/* Accumulate real wall-clock microseconds from PM Timer deltas.
          * Each delta represents actual elapsed time since last BSP tick,
-         * immune to virtual LAPIC timer jitter on VMware. */
-		if (g_pmtimer_available) {
+         * immune to virtual LAPIC timer jitter on VMware.  Only the PM
+         * timer arm of the fallback clock reads the sum: not with an
+         * HPET, and not once the TSC is the clock.  A hypervisor traps
+         * every read of the port, a hundred thousand cycles and more
+         * under Hyper-V, and this one was on every tick. */
+		if (g_pmtimer_available && !g_hpet_available &&
+		    !__atomic_load_n(&g_tsc_base_ready, __ATOMIC_ACQUIRE)) {
 			uint32_t pm_now = pmtimer_read();
 			uint32_t delta = (pm_now - g_pm_last) & g_pmtimer_mask;
 			g_total_us += (uint64_t)delta * 1000000ULL / 3579545ULL;

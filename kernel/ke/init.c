@@ -387,8 +387,12 @@ __no_stack_protector void continue_system_startup(void)
 	// more than twice the expected 100 Hz, and the kernel kept counting
 	// 201 interrupts a second as if they were 100.
 	if (lapic_is_available()) {
-		lapic_timer_start(200);
+		/* PIT first: once this CPU's local timer runs one-shot, every
+		 * interrupt on the shared vector is taken for the local
+		 * timer's, and only the local APIC is acknowledged
+		 * (interrupt.c). */
 		timer_stop();
+		lapic_timer_start(200);
 		kprintf("Timer: using LAPIC timer at 200 Hz\n");
 	} else {
 		// No LAPIC — legacy PIT IRQ0 (old hardware / single-CPU)
