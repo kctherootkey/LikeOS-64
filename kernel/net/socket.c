@@ -199,13 +199,11 @@ int sock_create(int domain, int type, int protocol)
 		if (!sockets[i].active) {
 			net_socket_t *s = &sockets[i];
 			// Zero the entire struct first so any new fields default to 0.
-			/* The poll queue survives the slot being reused --
-			 * see wq_head_init_once(). */
-			struct wait_queue_head saved_wq = s->poll_wq;
+			/* All but the poll queue, which survives the slot
+			 * being reused -- see wq_zero_around(). */
+			struct wait_queue_head *keep[] = { &s->poll_wq };
 
-			for (size_t b = 0; b < sizeof(*s); b++)
-				((uint8_t *)s)[b] = 0;
-			s->poll_wq = saved_wq;
+			wq_zero_around(s, sizeof(*s), keep, 1);
 			wq_head_init_once(&s->poll_wq, "sock-poll");
 			s->type = type;
 			if (type == SOCK_STREAM)

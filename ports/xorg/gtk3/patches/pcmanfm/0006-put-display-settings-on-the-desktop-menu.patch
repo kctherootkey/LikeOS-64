@@ -1,0 +1,52 @@
+Put Display settings on the desktop menu.
+
+The resolution dialog, likeos-display-settings, lists the sizes the screen
+can be set to and sets the one picked -- at once where the display driver
+can switch, at the next start where the screen is the boot framebuffer.  The
+desktop's right-click menu is where it is reached from, next to "Desktop
+Preferences", the other entry about how the desktop looks.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -192,6 +192,21 @@
+         desktop_signal_wm(SIGTERM);
+ }
+ 
++/* The resolution dialog (likeos-display-settings): the sizes the screen can
++ * be set to, set at once or saved for the next start.
++ */
++static void on_display_settings(GtkAction* act, gpointer user_data)
++{
++    char *argv[] = { (char *)"/usr/bin/likeos-display-settings", NULL };
++    GError *err = NULL;
++
++    if(!g_spawn_async(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, &err))
++    {
++        fm_show_error(GTK_WINDOW(user_data), NULL, err->message);
++        g_error_free(err);
++    }
++}
++
+ /* insert GtkUIManager XML definitions */
+ #include "desktop-ui.c"
+ 
+--- a/src/desktop-ui.c
++++ b/src/desktop-ui.c
+@@ -27,6 +27,7 @@
+ "<popup>"
+   "<placeholder name='CustomCommonOps'>"
+     "<menuitem action='DeskPref'/>"
++    "<menuitem action='DisplaySettings'/>"
+     "<separator/>"
+     "<menuitem action='WMRestart'/>"
+     "<menuitem action='WMQuit'/>"
+@@ -36,6 +37,7 @@
+ static const GtkActionEntry desktop_actions[]=
+ {
+     {"DeskPref", GTK_STOCK_PROPERTIES, N_("Desktop Preferences"), "", NULL, G_CALLBACK(fm_desktop_preference)},
++    {"DisplaySettings", "preferences-desktop-display", N_("Display settings"), "", NULL, G_CALLBACK(on_display_settings)},
+     {"WMRestart", GTK_STOCK_REFRESH, N_("Restart session"), "", NULL, G_CALLBACK(on_wm_restart)},
+     {"WMQuit", GTK_STOCK_QUIT, N_("Exit session"), "", NULL, G_CALLBACK(on_wm_quit)}
+ };

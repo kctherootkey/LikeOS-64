@@ -17,6 +17,7 @@ void procfs_init(void);
 #include <kernel/dev/input/keyboard.h>
 #include <kernel/dev/input/mouse.h>
 #include <kernel/mm/memory.h>
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/mm/slab.h>
 #include <kernel/io/scrollbar.h>
 #include <kernel/dev/video/fb.h>
@@ -208,6 +209,9 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 		g_boot_smbios3_entry = boot_info->smbios3_address;
 	}
 
+	// The saved display setting and the firmware's display modes.
+	fbdev_boot_display_init(boot_info);
+
 	// Save SMP trampoline address from bootloader
 	g_smp_trampoline_address = boot_info->smp_trampoline_addr;
 
@@ -248,6 +252,7 @@ __no_stack_protector void continue_system_startup(void)
 	 * PCI table and the task list. */
 	sysfs_init();
 	procfs_init();
+	fbdev_boot_display_sysfs();
 	/* /ram: a filesystem that lives in memory, for whatever should not
 	 * touch the disk (luakit's caches and databases, see
 	 * res/xorg/luakit-ram.sh). */

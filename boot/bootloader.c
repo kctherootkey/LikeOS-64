@@ -75,6 +75,12 @@ typedef struct {
 #define SCREEN_MAX_HEIGHT 0xFFFFFFFFU
 #endif
 
+// The standard list of screen sizes, shared with the kernel's display drivers.
+#include "../kernel/dev/video/screen_modes.h"
+
+// The display setting the Display settings dialog saves, on the ext4 root.
+#define DISPLAY_CONF_PATH "/etc/likeos/display.conf"
+
 // UEFI memory map entry (matching EFI_MEMORY_DESCRIPTOR)
 typedef struct {
     uint32_t type;
@@ -94,6 +100,9 @@ typedef struct {
     memory_map_entry_t entries[MAX_MEMORY_MAP_ENTRIES];
 } memory_map_info_t;
 
+// The firmware's display modes passed on to the kernel (32 bpp, distinct sizes)
+#define BOOT_GOP_MODES_MAX 64
+
 // Boot information passed to kernel
 typedef struct {
     framebuffer_info_t fb_info;
@@ -105,9 +114,16 @@ typedef struct {
     uint64_t smbios_magic;        // BOOT_SMBIOS_MAGIC when the two fields below are valid
     uint64_t smbios_address;      // SMBIOS 2.x entry point ("_SM_") from UEFI, 0 = none
     uint64_t smbios3_address;     // SMBIOS 3.x entry point ("_SM3_") from UEFI, 0 = none
+    uint64_t display_magic;       // BOOT_DISPLAY_MAGIC when the fields below are valid
+    uint32_t display_saved_width; // the saved display setting, 0 = none
+    uint32_t display_saved_height;
+    uint32_t hypervisor;          // 1 when CPUID reports a hypervisor
+    uint32_t gop_mode_count;      // entries used in gop_modes[]
+    struct { uint32_t width; uint32_t height; } gop_modes[BOOT_GOP_MODES_MAX];
 } boot_info_t;
 
 #define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
+#define BOOT_DISPLAY_MAGIC 0x5953494459414c50ULL
 
 // Global boot info to pass to kernel
 static boot_info_t g_boot_info;
@@ -914,6 +930,7 @@ static BOOLEAN validate_elf64(Elf64_Ehdr *elf_header) {
 #define E4_EXT_MAGIC        0xF30A
 #define E4_NDIR_BLOCKS      12
 #define E4_EXTENTS_FL       0x00080000u
+#define E4_INLINE_DATA_FL   0x10000000u
 #define E4_INCOMPAT_64BIT   0x0080u
 
 static UINT16 e4_rd16(const UINT8 *p) { return (UINT16)(p[0] | (p[1] << 8)); }
@@ -1096,9 +1113,11 @@ static UINT32 e4_resolve(e4_ctx *c, const char *path, UINT8 *inode_out) {
     return ino;
 }
 
-/* Identify an ext4 partition among all EFI_BLOCK_IO handles and load
- * /boot/kernel.elf into a freshly allocated pool buffer. */
-static EFI_STATUS try_load_kernel_ext4(VOID **out_buf, UINTN *out_size) {
+/* Identify an ext4 partition among all EFI_BLOCK_IO handles and load the
+ * file at `path' (at most `max_size' bytes) into a freshly allocated pool
+ * buffer: /boot/kernel.elf, and the saved display setting before it. */
+static EFI_STATUS try_load_file_ext4(const char *path, UINT64 max_size,
+                                     VOID **out_buf, UINTN *out_size) {
     EFI_GUID blk_guid = BLOCK_IO_PROTOCOL;
     EFI_HANDLE *handles = NULL;
     UINTN nhandles = 0;
@@ -1172,14 +1191,27 @@ static EFI_STATUS try_load_kernel_ext4(VOID **out_buf, UINTN *out_size) {
             continue;
         }
 
-        /* Resolve the kernel from its single canonical location. */
-        static const char *paths[] = { "/boot/kernel.elf" };
         UINT8 inode[256];
-        for (UINTN pi = 0; pi < sizeof(paths) / sizeof(paths[0]); pi++) {
-            UINT32 ino = e4_resolve(&c, paths[pi], inode);
+        do {
+            UINT32 ino = e4_resolve(&c, path, inode);
             if (!ino) continue;
             UINT64 size = e4_isize(inode);
-            if (size == 0 || size > 0x10000000ULL) continue;   /* sanity: <256MB */
+            if (size == 0 || size > max_size) continue;
+
+            /* A file small enough to live in the inode itself (inline
+             * data): its bytes are where the block map would be. */
+            if ((e4_rd32(inode + 32) & E4_INLINE_DATA_FL) && size <= 60) {
+                VOID *ibuf = NULL;
+                if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                                (UINTN)size, &ibuf)) || !ibuf)
+                    continue;
+                for (UINT64 z = 0; z < size; z++)
+                    ((UINT8 *)ibuf)[z] = inode[40 + z];
+                *out_buf = ibuf;
+                *out_size = (UINTN)size;
+                result = EFI_SUCCESS;
+                continue;
+            }
 
             /* Allocate rounded up to whole blocks so bulk reads of full blocks
              * never overflow (the ELF loader only consumes `size` bytes). */
@@ -1216,8 +1248,7 @@ static EFI_STATUS try_load_kernel_ext4(VOID **out_buf, UINTN *out_size) {
             *out_buf = kbuf;
             *out_size = (UINTN)size;
             result = EFI_SUCCESS;
-            break;
-        }
+        } while (0);
 
         uefi_call_wrapper(BS->FreePool, 1, c.scratch);
         uefi_call_wrapper(BS->FreePool, 1, c.node);
@@ -1225,6 +1256,102 @@ static EFI_STATUS try_load_kernel_ext4(VOID **out_buf, UINTN *out_size) {
 
     uefi_call_wrapper(BS->FreePool, 1, handles);
     return result;
+}
+
+/* ===========================================================================
+ *  Display mode selection
+ * =========================================================================== */
+
+/* CPUID.1:ECX[31]: the processor is a hypervisor's virtual one. */
+static BOOLEAN under_hypervisor(void) {
+    UINT32 a = 1, b, c = 0, d;
+
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    (void)b; (void)d;
+    return (c >> 31) & 1;
+}
+
+/* Parse decimal digits at *p (before end); 0 digits gives FALSE. */
+static BOOLEAN parse_dec(const char **p, const char *end, UINT32 *out) {
+    UINT32 v = 0;
+    int digits = 0;
+
+    while (*p < end && **p >= '0' && **p <= '9' && digits < 6) {
+        v = v * 10 + (UINT32)(**p - '0');
+        (*p)++;
+        digits++;
+    }
+    *out = v;
+    return digits > 0;
+}
+
+/* The saved display setting: the "resolution=WIDTHxHEIGHT" line of
+ * DISPLAY_CONF_PATH, written by the Display settings dialog.  FALSE when
+ * there is no such file or line, or the size is implausible. */
+static BOOLEAN read_saved_resolution(UINT32 *w, UINT32 *h) {
+    static const char key[] = "resolution=";
+    VOID *buf = NULL;
+    UINTN size = 0;
+    BOOLEAN ok = FALSE;
+
+    if (EFI_ERROR(try_load_file_ext4(DISPLAY_CONF_PATH, 4096, &buf, &size)) || !buf)
+        return FALSE;
+    const char *p = (const char *)buf, *end = p + size;
+    while (p < end && !ok) {
+        const char *line = p, *le;
+        UINT32 vw, vh;
+        UINTN k = 0;
+
+        while (p < end && *p != '\n') p++;
+        le = p;
+        if (p < end) p++;
+        while (key[k] && line + k < le && line[k] == key[k]) k++;
+        if (key[k]) continue;
+        const char *q = line + k;
+        if (!parse_dec(&q, le, &vw) || q >= le || (*q != 'x' && *q != 'X')) continue;
+        q++;
+        if (!parse_dec(&q, le, &vh)) continue;
+        if (vw < 640 || vh < 480 || vw > 16384 || vh > 16384) continue;
+        *w = vw;
+        *h = vh;
+        ok = TRUE;
+    }
+    uefi_call_wrapper(BS->FreePool, 1, buf);
+    return ok;
+}
+
+/* A GOP mode this can hand on: a 32-bit pixel format.  Some firmware (VMware
+ * SVGA, for one) exposes its larger modes only as PixelBitMask with
+ * ReservedMask=0, so the channel masks need not cover all 32 bits; any
+ * bitmask mode whose three color channels are non-zero and do not overlap
+ * is taken. */
+static BOOLEAN gop_mode_usable(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi) {
+    if (mi->PixelFormat == PixelBlueGreenRedReserved8BitPerColor ||
+        mi->PixelFormat == PixelRedGreenBlueReserved8BitPerColor)
+        return TRUE;
+    if (mi->PixelFormat == PixelBitMask) {
+        UINT32 r = mi->PixelInformation.RedMask;
+        UINT32 g = mi->PixelInformation.GreenMask;
+        UINT32 b = mi->PixelInformation.BlueMask;
+
+        return r && g && b && !(r & g) && !(r & b) && !(g & b);
+    }
+    return FALSE;
+}
+
+/* The number of the GOP mode of exactly w x h, or -1. */
+static INT32 gop_find_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT32 w, UINT32 h) {
+    for (UINT32 mode = 0; mode < gop->Mode->MaxMode; mode++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi;
+        UINTN mi_size;
+
+        if (EFI_ERROR(uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &mi_size, &mi)))
+            continue;
+        if (gop_mode_usable(mi) && mi->HorizontalResolution == w &&
+            mi->VerticalResolution == h)
+            return (INT32)mode;
+    }
+    return -1;
 }
 
 // UEFI bootloader entry point
@@ -1269,33 +1396,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_boot_info.fb_info.pixels_per_scanline = 80;
         g_boot_info.fb_info.bytes_per_pixel = 2;
     } else {
-#if defined(SCREEN_LARGE)
-        // Preferred resolutions in priority order: 1920x1200, 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768
-        struct { UINT32 width; UINT32 height; } preferred[] = {
-            {1920, 1200},
-            {1920, 1080},
-            {1280, 800},
-            {1280, 768},
-            {1024, 768}
-        };
-#else
-        // Preferred resolutions in priority order: 1280x800, 1280x768, 1024x768
-        struct { UINT32 width; UINT32 height; } preferred[] = {
-            {1280, 800},
-            {1280, 768},
-            {1024, 768}
-        };
-#endif
-        UINTN num_preferred = sizeof(preferred) / sizeof(preferred[0]);
+        UINT32 saved_w = 0, saved_h = 0;
+        BOOLEAN have_saved = read_saved_resolution(&saved_w, &saved_h);
+        BOOLEAN vm = under_hypervisor();
         UINT32 selected_mode = gop->Mode->Mode;  // Default to current mode
-        BOOLEAN found_preferred = FALSE;
-        
+        INT32 pick = -1;
+
         Print(L"Enumerating %d GOP modes for preferred resolution...\r\n", gop->Mode->MaxMode);
         serial_puts("GOP modes:\n");
 
-        // Log every mode once.  This is a pass of its own rather than a rider on
-        // the first preference, so the log stays complete when the resolution
-        // ceiling skips the leading entries of the table.
+        // Log every mode once, and note the distinct 32-bpp sizes for the
+        // kernel: they are what a saved setting can name when no display
+        // driver takes over from this framebuffer.
+        g_boot_info.gop_mode_count = 0;
         for (UINT32 mode = 0; mode < gop->Mode->MaxMode; mode++) {
             EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode_info;
             UINTN mode_info_size;
@@ -1314,61 +1427,101 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 serial_puts(" X="); serial_puthex(mode_info->PixelInformation.ReservedMask);
             }
             serial_putc('\n');
+
+            if (gop_mode_usable(mode_info)) {
+                UINT32 n = g_boot_info.gop_mode_count, k;
+
+                for (k = 0; k < n; k++)
+                    if (g_boot_info.gop_modes[k].width == mode_info->HorizontalResolution &&
+                        g_boot_info.gop_modes[k].height == mode_info->VerticalResolution)
+                        break;
+                if (k == n && n < BOOT_GOP_MODES_MAX) {
+                    g_boot_info.gop_modes[n].width = mode_info->HorizontalResolution;
+                    g_boot_info.gop_modes[n].height = mode_info->VerticalResolution;
+                    g_boot_info.gop_mode_count = n + 1;
+                }
+            }
         }
 
-        // Search for preferred resolutions in priority order, skipping the ones
-        // the build-time ceiling (MAX_SCREEN_SIZE) rules out
-        for (UINTN pref = 0; pref < num_preferred && !found_preferred; pref++) {
-            if (preferred[pref].width > SCREEN_MAX_WIDTH ||
-                preferred[pref].height > SCREEN_MAX_HEIGHT) {
-                serial_puts("  skipping "); serial_putdec(preferred[pref].width);
-                serial_putc('x'); serial_putdec(preferred[pref].height);
-                serial_puts(": above MAX_SCREEN_SIZE\n");
-                continue;
+        // The size the user chose in Display settings comes first, wherever
+        // this runs, and above any build-time ceiling: it was asked for.
+        if (have_saved) {
+            pick = gop_find_mode(gop, saved_w, saved_h);
+            serial_puts("GOP: saved setting "); serial_putdec(saved_w);
+            serial_putc('x'); serial_putdec(saved_h);
+            serial_puts(pick >= 0 ? " offered\n" : " not offered\n");
+        }
+
+        if (pick < 0 && vm) {
+            // Under a hypervisor nothing tells the guest how large the
+            // display in front of the user is, and the firmware offers
+            // whatever its device can scan out -- up to 7680x4320 on some.
+            // So a fixed size the window is expected to hold, the one a
+            // virtual machine's display driver comes up in as well
+            // (kernel/dev/video/vmsvga2.c, gpu/vmwgfx/vmw_drv.c).
+            pick = gop_find_mode(gop, SCREEN_VM_WIDTH, SCREEN_VM_HEIGHT);
+            serial_puts(pick >= 0 ? "GOP: hypervisor, fixed size\n"
+                                  : "GOP: hypervisor, fixed size not offered\n");
+        } else if (pick < 0) {
+            // Real hardware: a preference table, largest first.  The large
+            // build tries every standard size above 1920x1200 first, so a
+            // panel that can show more gets it, then the sizes this always
+            // preferred.
+            static const struct { UINT32 width; UINT32 height; } base[] = {
+#if defined(SCREEN_LARGE)
+                {1920, 1200},
+                {1920, 1080},
+#endif
+                {1280, 800},
+                {1280, 768},
+                {1024, 768}
+            };
+            struct { UINT32 width; UINT32 height; } preferred[SCREEN_MODE_COUNT + 5];
+            UINTN num_preferred = 0;
+
+#if defined(SCREEN_LARGE)
+            for (UINTN i = 0; i < SCREEN_MODE_COUNT; i++) {
+                if ((UINT64)screen_mode_list[i].width * screen_mode_list[i].height <=
+                    1920ULL * 1200ULL)
+                    continue;
+                preferred[num_preferred].width = screen_mode_list[i].width;
+                preferred[num_preferred].height = screen_mode_list[i].height;
+                num_preferred++;
             }
-            for (UINT32 mode = 0; mode < gop->Mode->MaxMode; mode++) {
-                EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode_info;
-                UINTN mode_info_size;
+#endif
+            for (UINTN i = 0; i < sizeof(base) / sizeof(base[0]); i++) {
+                preferred[num_preferred].width = base[i].width;
+                preferred[num_preferred].height = base[i].height;
+                num_preferred++;
+            }
 
-                status = uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &mode_info_size, &mode_info);
-                if (EFI_ERROR(status)) continue;
-
-                // Only consider 32-bit pixel formats (BGR, RGB, or bitmask-based 32bpp).
-                // Some firmware (e.g. VMware SVGA) exposes higher resolutions only via
-                // PixelBitMask with ReservedMask=0, so the channel masks need not cover
-                // all 32 bits.  Accept any PixelBitMask mode where the three color channels
-                // are non-zero and do not overlap each other.
-                if (mode_info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor ||
-                    mode_info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {
-                    // standard 32-bit packed formats — always acceptable
-                } else if (mode_info->PixelFormat == PixelBitMask) {
-                    UINT32 r = mode_info->PixelInformation.RedMask;
-                    UINT32 g = mode_info->PixelInformation.GreenMask;
-                    UINT32 b = mode_info->PixelInformation.BlueMask;
-                    // Require each channel to be non-zero and no two channels to overlap
-                    if (!r || !g || !b || (r & g) || (r & b) || (g & b)) continue;
-                } else {
+            // Search for preferred resolutions in priority order, skipping the ones
+            // the build-time ceiling (MAX_SCREEN_SIZE) rules out
+            for (UINTN pref = 0; pref < num_preferred && pick < 0; pref++) {
+                if (preferred[pref].width > SCREEN_MAX_WIDTH ||
+                    preferred[pref].height > SCREEN_MAX_HEIGHT) {
+                    serial_puts("  skipping "); serial_putdec(preferred[pref].width);
+                    serial_putc('x'); serial_putdec(preferred[pref].height);
+                    serial_puts(": above MAX_SCREEN_SIZE\n");
                     continue;
                 }
-                
-                // Check for exact match with current preferred resolution
-                if (mode_info->HorizontalResolution == preferred[pref].width &&
-                    mode_info->VerticalResolution == preferred[pref].height) {
-                    selected_mode = mode;
-                    found_preferred = TRUE;
-                    Print(L"Found preferred resolution %dx%d (mode %d)\r\n",
-                          preferred[pref].width, preferred[pref].height, mode);
-                    break;
-                }
+                pick = gop_find_mode(gop, preferred[pref].width, preferred[pref].height);
             }
         }
-        
-        if (!found_preferred) {
+
+        if (pick < 0) {
             Print(L"No preferred resolution found, using firmware default\r\n");
             serial_puts("GOP: no preferred resolution found, using firmware default\n");
         } else {
+            selected_mode = (UINT32)pick;
+            Print(L"Found preferred resolution (mode %d)\r\n", selected_mode);
             serial_puts("GOP: selected mode "); serial_putdec(selected_mode); serial_putc('\n');
         }
+
+        g_boot_info.display_magic = BOOT_DISPLAY_MAGIC;
+        g_boot_info.display_saved_width = have_saved ? saved_w : 0;
+        g_boot_info.display_saved_height = have_saved ? saved_h : 0;
+        g_boot_info.hypervisor = vm ? 1 : 0;
         
         // Set the selected mode if different from current
         if (selected_mode != gop->Mode->Mode) {
@@ -1409,7 +1562,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * disk).  This is the only supported path — there is no FAT fallback. */
     kernel_buffer = NULL;
     kernel_size = 0;
-    status = try_load_kernel_ext4(&kernel_buffer, &kernel_size);
+    status = try_load_file_ext4("/boot/kernel.elf", 0x10000000ULL, /* <256MB */
+                                &kernel_buffer, &kernel_size);
     if (EFI_ERROR(status) || !kernel_buffer) {
         Print(L"ERROR: Could not load /boot/kernel.elf from ext4 root: %r\r\n", status);
         serial_puts("boot: FATAL - ext4 kernel load failed (no FAT fallback)\n");

@@ -79,6 +79,17 @@ fi
 # set in the Cursors block in system.ctwmrc.
 xsetroot -solid "#000000" -cursor_name left_ptr
 
+# The resolution saved in Display settings (/etc/likeos/display.conf).  The
+# display drivers of a virtual machine already come up in it; a panel's
+# driver (i915) comes up in the panel's own mode, and this sets the saved one
+# where the driver offers it.  In the foreground and before the desktop bar,
+# the desktop and the window manager, which all measure the screen when they
+# start.  On the boot framebuffer it does nothing: the bootloader set the
+# saved size already, and the fbdev driver cannot change it.
+if [ -x /usr/bin/likeos-display-settings ]; then
+	likeos-display-settings --restore
+fi
+
 # The desktop bar.
 #
 # taskbar(1) is this system's own program (user/bin/shell/taskbar.c): a

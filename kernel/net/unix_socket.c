@@ -364,14 +364,11 @@ int unix_create(int type, unix_socket_t **out)
 	// Zero out the struct, then re-establish active=1 (claimed by alloc).
 	// The zeroing is done while we still hold unix_table_lock so that no
 	// other allocator/finder can observe the half-zeroed state.
-	/* The poll queue survives the slot being reused -- see
-	 * wq_head_init_once(). */
-	struct wait_queue_head saved_wq = us->poll_wq;
-	uint8_t *p = (uint8_t *)us;
+	/* All but the poll queue, which survives the slot being reused and is
+	 * never written here -- see wq_zero_around(). */
+	struct wait_queue_head *keep[] = { &us->poll_wq };
 
-	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
-		p[i] = 0;
-	us->poll_wq = saved_wq;
+	wq_zero_around(us, sizeof(*us), keep, 1);
 
 	us->active = 1;
 	us->type = type;
@@ -735,10 +732,14 @@ int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 			return -ENOMEM;
 		}
 		server = &unix_sockets[new_idx];
-		uint8_t *p = (uint8_t *)server;
+		/* All but the poll queue: a poller of the connection that had
+		 * this slot before may still be on it, and clearing the head
+		 * would orphan that entry -- its unlink would then write into
+		 * this socket's queue.  See wq_zero_around(). */
+		struct wait_queue_head *keep[] = { &server->poll_wq };
 
-		for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
-			p[i] = 0;
+		wq_zero_around(server, sizeof(*server), keep, 1);
+		wq_head_init_once(&server->poll_wq, "unix-poll");
 		server->active = 1;
 		/* The child speaks whatever the listener speaks: an accepted
 		 * SEQPACKET connection keeps its record boundaries. */
@@ -2030,13 +2031,10 @@ int unix_socketpair(int type, unix_socket_t *sv[2])
 	unix_socket_t *s0 = &unix_sockets[idx0];
 	unix_socket_t *s1 = &unix_sockets[idx1];
 
-	// Initialize s0
-	struct wait_queue_head saved_s0_wq = s0->poll_wq;
-	uint8_t *p = (uint8_t *)s0;
+	// Initialize s0 (all but its poll queue -- see wq_zero_around())
+	struct wait_queue_head *keep0[] = { &s0->poll_wq };
 
-	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
-		p[i] = 0;
-	s0->poll_wq = saved_s0_wq; /* survives slot reuse */
+	wq_zero_around(s0, sizeof(*s0), keep0, 1);
 	s0->active = 1;
 	s0->type = type;
 	s0->connected = 1;
@@ -2047,13 +2045,10 @@ int unix_socketpair(int type, unix_socket_t *sv[2])
 	spinlock_init(&s0->lock, "unix_sock");
 	wq_head_init_once(&s0->poll_wq, "unix-poll");
 
-	// Initialize s1
-	struct wait_queue_head saved_s1_wq = s1->poll_wq;
+	// Initialize s1 (likewise)
+	struct wait_queue_head *keep1[] = { &s1->poll_wq };
 
-	p = (uint8_t *)s1;
-	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
-		p[i] = 0;
-	s1->poll_wq = saved_s1_wq; /* survives slot reuse */
+	wq_zero_around(s1, sizeof(*s1), keep1, 1);
 	s1->active = 1;
 	s1->type = type;
 	s1->connected = 1;

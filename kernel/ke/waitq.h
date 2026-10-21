@@ -85,6 +85,35 @@ static inline void wq_head_init_once(struct wait_queue_head *h,
 		spinlock_init(&h->lock, name);
 }
 
+/* Zero `size' bytes at `obj' -- a slot that gets recycled -- except the
+ * `nkeep' wait-queue heads in `keep', which are not written at all.
+ *
+ * Copying a head out and back in around a plain clear is not the same
+ * thing.  A stale waiter can unlink itself from the head in between (the
+ * case wq_head_init_once() is about), and it does so under the head's own
+ * lock, which a copy does not take: the copy-back then undoes the unlink,
+ * and the head points at an entry that is no longer on it -- and before long
+ * at memory that is no longer an entry at all, which the next wake walks
+ * into. */
+static inline void wq_zero_around(void *obj, uint64_t size,
+				  struct wait_queue_head *const *keep,
+				  int nkeep)
+{
+	uint8_t *p = (uint8_t *)obj;
+
+	for (uint64_t i = 0; i < size; i++) {
+		int inside = 0;
+
+		for (int k = 0; k < nkeep && !inside; k++) {
+			uint8_t *h = (uint8_t *)keep[k];
+
+			inside = p + i >= h && p + i < h + sizeof(*keep[k]);
+		}
+		if (!inside)
+			p[i] = 0;
+	}
+}
+
 static inline void wq_entry_init(struct wait_queue_entry *e, task_t *t)
 {
 	e->next = NULL;

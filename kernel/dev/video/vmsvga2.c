@@ -26,6 +26,7 @@
 #include "vmsvga2_priv.h"
 #include <kernel/dev/video/fb.h>
 #include <kernel/dev/video/fbdev.h>
+#include <kernel/dev/video/screen_modes.h>
 #include <kernel/hal/vmware_backdoor.h>
 #include <kernel/ke/timer.h>
 #include <kernel/mm/memory.h>
@@ -46,11 +47,10 @@ static const struct fbdev_backend vmsvga2_fbdev_backend;
 #define VMSVGA2_ENABLE_TOGGLE 0
 #endif
 
-// Size the display manager falls back to when the host recommends nothing
-// and the mode registers hold something smaller: what a virtual machine
-// window can be expected to hold.
-#define SVGA_MIN_INITIAL_WIDTH 1280U
-#define SVGA_MIN_INITIAL_HEIGHT 800U
+// The smallest size this comes up in when the mode registers hold something
+// smaller: what a virtual machine window can be expected to hold.
+#define SVGA_MIN_INITIAL_WIDTH SCREEN_VM_WIDTH
+#define SVGA_MIN_INITIAL_HEIGHT SCREEN_VM_HEIGHT
 
 // ===========================================================================
 // Sleeping mutex (the kernel has no generic sleeping mutex; modesetting is
@@ -1368,12 +1368,11 @@ int vmsvga2_init(void)
 	return 0;
 }
 
-// Build-time ceiling on the preferred-resolution search (make MAX_SCREEN_SIZE=WxH).
-// The device's reported maximum is what the emulated adapter can scan out, not
-// what the panel behind it can show, so a virtual machine on a 1920x1080
-// notebook happily offers 1920x1200 and the guest ends up on a screen the host
-// then has to shrink.  This is the second bound: unset means no ceiling, and
-// the bootloader applies the same one to the same table (boot/bootloader.c).
+// Build-time ceiling (make MAX_SCREEN_SIZE=WxH): the largest size this comes
+// up in on its own.  The device's reported maximum is what the emulated
+// adapter can scan out, not what the panel behind it can show.  A size the
+// user saved in Display settings is not held to it.  Unset means no ceiling;
+// the bootloader applies the same one (boot/bootloader.c).
 #ifndef SCREEN_MAX_WIDTH
 #define SCREEN_MAX_WIDTH  0xFFFFFFFFU
 #endif
@@ -1381,20 +1380,8 @@ int vmsvga2_init(void)
 #define SCREEN_MAX_HEIGHT 0xFFFFFFFFU
 #endif
 
-// What SCREEN_SIZE asks for: the top of the mode list, not the whole of it.
-// The list below reaches higher than either of these so that a device which
-// can only do a little still finds the best it can do; the ceiling is what
-// keeps a device which can do a lot from coming up larger than the build
-// asked for.
-#if defined(SCREEN_LARGE)
-#define SCREEN_PREF_MAX_WIDTH 1920U
-#define SCREEN_PREF_MAX_HEIGHT 1200U
-#else
-#define SCREEN_PREF_MAX_WIDTH 1280U
-#define SCREEN_PREF_MAX_HEIGHT 800U
-#endif
-
-// Why a mode cannot be used, or NULL when it can.
+// Why a mode cannot be used, or NULL when it can.  `ceiling' applies the
+// build-time ceiling as well.
 //
 // The bounds are the ones that hold for this device: the
 // geometry the adapter reports it can scan out, and the memory the scan-out
@@ -1404,11 +1391,11 @@ int vmsvga2_init(void)
 // small screen no matter what the panel in front of the user can do.  (The
 // display manager scans out of guest memory instead and is bounded by
 // something else entirely; see kernel/dev/video/gpu/vmwgfx/vmw_drv.c.)
-static const char *svga_mode_reject(uint32_t w, uint32_t h)
+static const char *svga_mode_reject(uint32_t w, uint32_t h, int ceiling)
 {
 	if (w == 0 || h == 0)
 		return "empty";
-	if (w > SCREEN_MAX_WIDTH || h > SCREEN_MAX_HEIGHT)
+	if (ceiling && (w > SCREEN_MAX_WIDTH || h > SCREEN_MAX_HEIGHT))
 		return "above the build's MAX_SCREEN_SIZE";
 	if (w > g_svga.max_width || h > g_svga.max_height)
 		return "beyond the geometry the adapter reports";
@@ -1416,109 +1403,59 @@ static const char *svga_mode_reject(uint32_t w, uint32_t h)
 				     g_svga.crtc.fb_offset);
 }
 
-static int svga_mode_usable(uint32_t w, uint32_t h)
-{
-	return svga_mode_reject(w, h) == NULL;
-}
-
-// ...and is one the build would pick on its own.  SCREEN_SIZE bounds what
-// the mode list may offer; it does not overrule the host, which knows what
-// it is showing this guest on.  MAX_SCREEN_SIZE, which does overrule it, is
-// checked in svga_mode_reject() above and so applies to both.
-static int svga_mode_preferable(uint32_t w, uint32_t h)
-{
-	return svga_mode_usable(w, h) && w <= SCREEN_PREF_MAX_WIDTH &&
-	       h <= SCREEN_PREF_MAX_HEIGHT;
-}
-
-// Boot-time mode selection.  The host's own recommendation comes first --
-// see the host-preferred section above -- so the mode the guest comes up in
-// is the one the display in front of the user actually wants, whether or not
-// the boot firmware ever advertised it: the GOP mode list bounds what the
-// bootloader could pick, and nothing here.  Only when the hypervisor has no
-// answer does this fall back to the built-in preference table, which is the
-// same one (and the same SCREEN_LARGE build define) the bootloader walks.
+// Boot-time mode selection.  Nothing a virtual machine's device reports says
+// how large the display in front of the user is, so this comes up in a
+// fixed size and leaves the rest to the user:
 //
-// Either way the choice is bounded by the build-time ceiling, the device's
-// maximum geometry and VRAM.  Takes over the display from the GOP
-// framebuffer: console rendering continues through the same fb double-buffer
-// path, with dirty flushes forwarded to the host as screen-update commands
-// via the fb flush hook.
+//  1. the size saved in Display settings (the bootloader passes it on, and
+//     sets the firmware's mode to it where the firmware offers it);
+//  2. otherwise the firmware's mode -- which the bootloader set to 1280x800
+//     -- raised to at least 1280x800, as worked out at probe
+//     (svga_get_initial_size());
+//  3. 640x480 as the last resort.
+//
+// Bounded by the device's maximum geometry and VRAM, the second also by the
+// build-time ceiling.  Takes over the display from the GOP framebuffer:
+// console rendering continues through the same fb double-buffer path, with
+// dirty flushes forwarded to the host as screen-update commands via the fb
+// flush hook.
 void vmsvga2_setup_boot_mode(void)
 {
-	// The standard mode list, largest first: the standard set of modes a
-	// connector of this device offers, rather than the
-	// handful of sizes the boot firmware happened to advertise.  The
-	// first entry that clears svga_mode_reject() wins, so a device that
-	// can only do a little still gets the best it can do -- which on a
-	// machine with little graphics memory is a mode no short list would
-	// have contained.
-	static const struct {
-		uint32_t width;
-		uint32_t height;
-	} builtin[] = {
-		{ 2560, 1600 }, { 2560, 1440 }, { 1920, 1440 },
-		{ 1920, 1200 }, { 1920, 1080 }, { 1856, 1392 },
-		{ 1792, 1344 }, { 1680, 1050 }, { 1600, 1200 },
-		{ 1600, 900 },	{ 1440, 900 },	{ 1400, 1050 },
-		{ 1366, 768 },	{ 1360, 768 },	{ 1280, 1024 },
-		{ 1280, 960 },	{ 1280, 800 },	{ 1280, 768 },
-		{ 1280, 720 },	{ 1152, 864 },	{ 1024, 768 },
-		{ 800, 600 },	{ 640, 480 },
-	};
 	framebuffer_info_t fi;
 	uint32_t w = 0, h = 0;
 	const char *source = "fallback";
 	uint32_t fence;
-	unsigned int i;
 
 	if (!g_svga.present)
 		return;
 
-	// What the host recommends, if it said and if it fits.  A ceiling the
-	// build asked for still wins: MAX_SCREEN_SIZE is an explicit "never
-	// above this", not a guess for the host to correct.
-	if (vmsvga2_get_host_preferred(&w, &h) == 0) {
-		const char *why = svga_mode_reject(w, h);
+	if (fbdev_boot_saved_size(&w, &h)) {
+		const char *why = svga_mode_reject(w, h, 0);
+
 		if (!why) {
-			source = g_svga.pref_source;
+			source = "saved setting";
 		} else {
-			kprintf("svga2: host recommends %ux%u, declined: %s\n",
-				w, h, why);
+			kprintf("svga2: saved size %ux%u declined: %s\n", w, h,
+				why);
 			w = 0;
 			h = 0;
 		}
 	}
-
-	for (i = 0; w == 0 && i < sizeof(builtin) / sizeof(builtin[0]); i++) {
-		if (svga_mode_preferable(builtin[i].width, builtin[i].height)) {
-			w = builtin[i].width;
-			h = builtin[i].height;
-			source = "mode list";
-		}
-	}
-	// Nothing on the list the build would pick: the fallback size worked
-	// out at probe (the firmware's mode, raised to 1280x800), if the
-	// device can carry it.  After the list, not before it -- the list is
-	// where the build's SCREEN_SIZE applies, and the firmware's mode is
-	// not to overrule that (see the host-preferred section).
 	if (w == 0 && vmsvga2_get_initial_size(&w, &h) == 0) {
-		if (svga_mode_usable(w, h)) {
-			source = "fallback size";
+		if (!svga_mode_reject(w, h, 1)) {
+			source = "firmware mode";
 		} else {
 			w = 0;
 			h = 0;
 		}
 	}
 	if (w == 0) {
-		// Nothing in the list fits (tiny VRAM, or a ceiling below every
-		// entry): last resort, and small enough that the ceiling is not
+		// Nothing fits (tiny VRAM, or a ceiling below the firmware's
+		// mode): last resort, and small enough that the ceiling is not
 		// worth honouring at the price of having no display at all.
 		w = 640;
 		h = 480;
-		if (w > g_svga.max_width || h > g_svga.max_height ||
-		    svga_mode_vram_reject((uint64_t)w * 4, h,
-					  g_svga.crtc.fb_offset)) {
+		if (svga_mode_reject(w, h, 0)) {
 			kprintf("svga2: no usable mode, staying on GOP\n");
 			return;
 		}

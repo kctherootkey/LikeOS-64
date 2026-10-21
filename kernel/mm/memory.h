@@ -323,6 +323,9 @@ typedef struct {
 	uint32_t bytes_per_pixel;
 } boot_framebuffer_info_t;
 
+// The firmware's display modes the bootloader passes on (distinct sizes)
+#define BOOT_GOP_MODES_MAX 64
+
 // Boot information passed from bootloader
 typedef struct {
 	boot_framebuffer_info_t fb_info;
@@ -337,9 +340,19 @@ typedef struct {
 	uint64_t smbios_magic; // BOOT_SMBIOS_MAGIC when the two fields below are valid
 	uint64_t smbios_address; // SMBIOS 2.x entry point ("_SM_") from UEFI, 0 = none
 	uint64_t smbios3_address; // SMBIOS 3.x entry point ("_SM3_") from UEFI, 0 = none
+	uint64_t display_magic; // BOOT_DISPLAY_MAGIC when the fields below are valid
+	uint32_t display_saved_width; // the saved display setting, 0 = none
+	uint32_t display_saved_height;
+	uint32_t hypervisor; // 1 when CPUID reports a hypervisor
+	uint32_t gop_mode_count; // entries used in gop_modes[]
+	struct {
+		uint32_t width;
+		uint32_t height;
+	} gop_modes[BOOT_GOP_MODES_MAX]; // the firmware's 32 bpp sizes
 } boot_info_t;
 
 #define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
+#define BOOT_DISPLAY_MAGIC 0x5953494459414c50ULL
 
 // The SMBIOS entry points the bootloader found (0 = none or an older
 // bootloader); saved by kernel_main before the identity map goes away.

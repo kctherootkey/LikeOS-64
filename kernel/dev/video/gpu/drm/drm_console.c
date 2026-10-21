@@ -322,6 +322,66 @@ static int drm_console_verify(struct drm_device *dev)
 	return -EIO;
 }
 
+/* The connector's first mode of the size saved in Display settings, or NULL
+ * when none was saved or the connector does not offer it. */
+static const struct drm_mode_modeinfo *drm_console_saved_mode(
+	struct drm_device *dev)
+{
+	uint32_t sw, sh;
+
+	if (!fbdev_boot_saved_size(&sw, &sh))
+		return NULL;
+	for (uint32_t i = 0; i < dev->conn[0].nmodes; i++)
+		if (dev->conn[0].modes[i].hdisplay == sw &&
+		    dev->conn[0].modes[i].vdisplay == sh)
+			return &dev->conn[0].modes[i];
+	return NULL;
+}
+
+/* A buffer object for a w x h console screen and a framebuffer on it. */
+static int drm_console_fb_create(struct drm_device *dev, uint32_t w,
+				 uint32_t h, struct drm_gem_object **obj_out,
+				 uint32_t *fb_id_out)
+{
+	uint32_t pitch = w * 4;
+	struct drm_gem_object *o =
+		drm_gem_alloc(dev, DRM_GEM_BO, (uint64_t)pitch * h);
+
+	if (!o)
+		return -ENOMEM;
+	if (drm_gem_alloc_pages_contig(o) != 0) {
+		drm_gem_put(o);
+		return -ENOMEM;
+	}
+	/* The backend's own view of the object -- a MOB, a GMR, whatever this
+	 * device scans out of.  The ioctl paths do this for a client's
+	 * buffers; there is no ioctl here. */
+	if (dev->drv->gem_init && dev->drv->gem_init(o) != 0) {
+		drm_gem_put(o);
+		return -EIO;
+	}
+	if (drm_kms_fb_add_kernel(dev, o, w, h, pitch, fb_id_out) != 0) {
+		drm_gem_put(o);
+		return -ENOSPC;
+	}
+	/* The framebuffer holds its own reference now. */
+	drm_gem_put(o);
+	*obj_out = o;
+	return 0;
+}
+
+/* Where the console draws for a buffer object of w x h. */
+static void drm_console_fb_info(struct drm_gem_object *o, uint32_t w,
+				uint32_t h, framebuffer_info_t *fi)
+{
+	fi->framebuffer_base = phys_to_virt(o->pages[0]);
+	fi->framebuffer_size = w * 4 * h;
+	fi->horizontal_resolution = w;
+	fi->vertical_resolution = h;
+	fi->pixels_per_scanline = w;
+	fi->bytes_per_pixel = 4;
+}
+
 int drm_console_takeover(struct drm_device *dev)
 {
 	framebuffer_info_t fi;
@@ -336,36 +396,25 @@ int drm_console_takeover(struct drm_device *dev)
 		return -ENODEV;
 
 	spinlock_init(&g_con.lock, "drm_console");
-	const struct drm_mode_modeinfo *mode = &dev->conn[0].modes[0];
+	/* The connector's first mode -- the panel's own, or whatever the
+	 * driver put first -- unless a size was saved in Display settings and
+	 * the connector offers it: then the first mode of that size. */
+	const struct drm_mode_modeinfo *mode = drm_console_saved_mode(dev);
+
+	if (!mode)
+		mode = &dev->conn[0].modes[0];
 	uint32_t w = mode->hdisplay, h = mode->vdisplay;
 	uint32_t pitch = w * 4;
 
 	if (w == 0 || h == 0)
 		return -ENODEV;
 
-	struct drm_gem_object *o =
-		drm_gem_alloc(dev, DRM_GEM_BO, (uint64_t)pitch * h);
-	if (!o)
-		return -ENOMEM;
-	if (drm_gem_alloc_pages_contig(o) != 0) {
-		drm_gem_put(o);
-		return -ENOMEM;
-	}
-	/* The backend's own view of the object -- a MOB, a GMR, whatever this
-	 * device scans out of.  The ioctl paths do this for a client's
-	 * buffers; there is no ioctl here. */
-	if (dev->drv->gem_init && dev->drv->gem_init(o) != 0) {
-		drm_gem_put(o);
-		return -EIO;
-	}
-
+	struct drm_gem_object *o;
 	uint32_t fb_id;
-	if (drm_kms_fb_add_kernel(dev, o, w, h, pitch, &fb_id) != 0) {
-		drm_gem_put(o);
-		return -ENOSPC;
-	}
-	/* The framebuffer holds its own reference now. */
-	drm_gem_put(o);
+	int err = drm_console_fb_create(dev, w, h, &o, &fb_id);
+
+	if (err)
+		return err;
 
 	g_con.dev = dev;
 	g_con.obj = o;
@@ -388,12 +437,7 @@ int drm_console_takeover(struct drm_device *dev)
 	}
 
 	/* Where the console draws from here on. */
-	fi.framebuffer_base = phys_to_virt(o->pages[0]);
-	fi.framebuffer_size = pitch * h;
-	fi.horizontal_resolution = w;
-	fi.vertical_resolution = h;
-	fi.pixels_per_scanline = pitch / 4;
-	fi.bytes_per_pixel = 4;
+	drm_console_fb_info(o, w, h, &fi);
 
 	fb_set_flush_hook(console_flush_hook);
 	g_con.taken = 1;
@@ -456,6 +500,46 @@ void drm_console_suspend(struct drm_device *dev)
 	g_con.suspended = 1;
 }
 
+/* Move the console to `mode': a buffer of that size, the mode set on it,
+ * the console's text laid out again for it.  The display manager has let go
+ * of the CRTC, so nothing else is setting a mode.  0 on success; otherwise
+ * the console is as it was and the caller sets its old mode again. */
+static int drm_console_resize(struct drm_device *dev,
+			      const struct drm_mode_modeinfo *mode)
+{
+	uint32_t w = mode->hdisplay, h = mode->vdisplay;
+	struct drm_gem_object *o;
+	uint32_t fb_id, old_fb = g_con.fb_id;
+	framebuffer_info_t fi, old_fi;
+
+	if (drm_console_fb_create(dev, w, h, &o, &fb_id) != 0)
+		return -ENOMEM;
+	if (drm_kms_crtc_set_kernel(dev, 0, mode, fb_id) != 0) {
+		drm_kms_fb_remove_internal(dev, fb_id);
+		return -EIO;
+	}
+	drm_console_fb_info(g_con.obj, g_con.w, g_con.h, &old_fi);
+	drm_console_fb_info(o, w, h, &fi);
+	if (console_reinit_framebuffer(&fi) != 0) {
+		console_reinit_framebuffer(&old_fi);
+		drm_kms_fb_remove_internal(dev, fb_id);
+		return -EIO;
+	}
+	g_con.obj = o;
+	g_con.fb_id = fb_id;
+	g_con.mode = *mode;
+	g_con.w = w;
+	g_con.h = h;
+	g_con.pitch = w * 4;
+	/* The old buffer goes -- unless /dev/fb0 is served from it: a program
+	 * may still have it mapped, and its pages must not go back to the
+	 * allocator under that mapping. */
+	if (!g_con.fbdev_registered)
+		drm_kms_fb_remove_internal(dev, old_fb);
+	console_repaint();
+	return 0;
+}
+
 void drm_console_resume(struct drm_device *dev)
 {
 	/* Said the first few times: where the screen goes when a display
@@ -479,7 +563,22 @@ void drm_console_resume(struct drm_device *dev)
 	/* The master left the CRTC on a framebuffer of its own, which is
 	 * being torn down behind it -- so this is a fresh mode set, not just
 	 * a redraw.  What the console has to show is still in its buffer:
-	 * nothing else could write there. */
+	 * nothing else could write there.
+	 *
+	 * Unless a different size was saved in Display settings while the
+	 * display manager ran: then the console follows it, as the display
+	 * manager did. */
+	const struct drm_mode_modeinfo *want = drm_console_saved_mode(dev);
+
+	if (want && (want->hdisplay != g_con.w || want->vdisplay != g_con.h) &&
+	    drm_console_resize(dev, want) == 0) {
+		g_con.suspended = 0;
+		console_push_all();
+		if (drm_console_verify(dev) == 0)
+			kprintf("[drm] %s: console back on KMS at the saved %ux%u\n",
+				dev->drv->name, g_con.w, g_con.h);
+		return;
+	}
 	g_con.suspended = 0;
 	if (drm_kms_crtc_set_kernel(dev, 0, &g_con.mode, g_con.fb_id) != 0) {
 		/* Not a message and a black screen: the display the manager

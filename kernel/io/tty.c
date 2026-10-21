@@ -1286,14 +1286,12 @@ int tty_pty_allocate(int *out_id)
 	for (int i = 0; i < TTY_MAX_PTYS; ++i) {
 		if (g_ptys[i].id == -1) {
 			pty_t *pty = &g_ptys[i];
-			/* Both poll queues survive the slot being reused --
-			 * see wq_head_init_once(). */
-			struct wait_queue_head saved_mwq = pty->poll_wq;
-			struct wait_queue_head saved_swq = pty->slave.poll_wq;
+			/* All but the two poll queues, which survive the slot
+			 * being reused -- see wq_zero_around(). */
+			struct wait_queue_head *keep[] = { &pty->poll_wq,
+							   &pty->slave.poll_wq };
 
-			mm_memset(pty, 0, sizeof(pty_t));
-			pty->poll_wq = saved_mwq;
-			pty->slave.poll_wq = saved_swq;
+			wq_zero_around(pty, sizeof(*pty), keep, 2);
 			spinlock_init(&pty->lock, "pty");
 			/* Both directions get their own queue: the master's
 			 * here, the slave's on the tty below. */

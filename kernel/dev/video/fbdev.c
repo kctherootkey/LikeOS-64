@@ -18,6 +18,7 @@
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
+#include <kernel/fs/sysfs.h>
 
 // SMAP-aware user copies (argp/user_buf are raw user pointers)
 static int fbdev_copy_to_user(void *user_dst, const void *src, size_t len)
@@ -360,4 +361,109 @@ long fbdev_write(uint64_t pos, const void *user_buf, long bytes)
 		fb_flush_rect(0, y0, fi.horizontal_resolution, y1 - y0 + 1);
 	}
 	return bytes;
+}
+
+// ---- The boot display: the saved setting and the firmware's modes ----
+
+static uint32_t g_boot_saved_w, g_boot_saved_h;
+static uint32_t g_boot_gop_count;
+static struct {
+	uint32_t width;
+	uint32_t height;
+} g_boot_gop[BOOT_GOP_MODES_MAX];
+
+void fbdev_boot_display_init(const void *boot_info)
+{
+	const boot_info_t *bi = boot_info;
+	uint32_t n;
+
+	if (!bi || bi->display_magic != BOOT_DISPLAY_MAGIC)
+		return; /* an older bootloader */
+	g_boot_saved_w = bi->display_saved_width;
+	g_boot_saved_h = bi->display_saved_height;
+	n = bi->gop_mode_count;
+	if (n > BOOT_GOP_MODES_MAX)
+		n = BOOT_GOP_MODES_MAX;
+	for (uint32_t i = 0; i < n; i++) {
+		g_boot_gop[i].width = bi->gop_modes[i].width;
+		g_boot_gop[i].height = bi->gop_modes[i].height;
+	}
+	g_boot_gop_count = n;
+}
+
+int fbdev_boot_saved_size(uint32_t *w, uint32_t *h)
+{
+	/* A word each, read without a lock: a reader that sees a width from
+	 * one save and a height from the next gets a size the connector does
+	 * not offer, which every caller treats as "none". */
+	if (!g_boot_saved_w || !g_boot_saved_h)
+		return 0;
+	*w = g_boot_saved_w;
+	*h = g_boot_saved_h;
+	return 1;
+}
+
+static long fbdev_show_gop_modes(struct pfs_node *n, char *buf, long cap)
+{
+	long pos = 0;
+
+	(void)n;
+	for (uint32_t i = 0; i < g_boot_gop_count; i++)
+		pos = pfs_printf(buf, cap, pos, "%ux%u\n", g_boot_gop[i].width,
+				 g_boot_gop[i].height);
+	return pos < cap ? pos : cap;
+}
+
+static long fbdev_show_saved_size(struct pfs_node *n, char *buf, long cap)
+{
+	long pos;
+
+	(void)n;
+	if (!g_boot_saved_w || !g_boot_saved_h)
+		return 0;
+	pos = pfs_printf(buf, cap, 0, "%ux%u\n", g_boot_saved_w,
+			 g_boot_saved_h);
+	return pos < cap ? pos : cap;
+}
+
+/* A new size saved while running ("WIDTHxHEIGHT", or "0x0" for none):
+ * what the console changes to when it next sets its mode.  Root only (the
+ * file is 0644), written by likeos-display-save. */
+static long fbdev_store_saved_size(struct pfs_node *n, const char *buf,
+				   long len)
+{
+	uint32_t v[2] = { 0, 0 };
+	int part = 0, digits = 0;
+	long i;
+
+	(void)n;
+	for (i = 0; i < len && buf[i] != '\n'; i++) {
+		char c = buf[i];
+
+		if (c >= '0' && c <= '9' && digits < 5) {
+			v[part] = v[part] * 10 + (uint32_t)(c - '0');
+			digits++;
+		} else if ((c == 'x' || c == 'X') && part == 0 && digits) {
+			part = 1;
+			digits = 0;
+		} else {
+			return -EINVAL;
+		}
+	}
+	if (part != 1 || !digits)
+		return -EINVAL;
+	if ((v[0] || v[1]) && (v[0] < 640 || v[1] < 480 || v[0] > 16384 ||
+			       v[1] > 16384))
+		return -EINVAL;
+	g_boot_saved_w = v[0];
+	g_boot_saved_h = v[1];
+	return len;
+}
+
+void fbdev_boot_display_sysfs(void)
+{
+	sysfs_add_attr("firmware/efi", "gop_modes", fbdev_show_gop_modes, NULL,
+		       NULL, 0);
+	sysfs_add_attr("kernel/display", "saved_size", fbdev_show_saved_size,
+		       fbdev_store_saved_size, NULL, 0);
 }

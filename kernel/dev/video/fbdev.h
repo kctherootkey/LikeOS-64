@@ -65,4 +65,16 @@ uint64_t fbdev_mmap_phys(uint64_t offset, uint64_t length);
 long fbdev_read(uint64_t pos, void *user_buf, long bytes);
 long fbdev_write(uint64_t pos, const void *user_buf, long bytes);
 
+// What the bootloader found out about the display: the size saved in
+// Display settings and the boot firmware's mode list.  Kept from boot_info
+// before the low mappings go away (boot_info is a `const boot_info_t *').
+void fbdev_boot_display_init(const void *boot_info);
+// The saved display size; 0 when none was saved.  Set at boot from the
+// bootloader's, and while running through /sys/kernel/display/saved_size.
+int fbdev_boot_saved_size(uint32_t *w, uint32_t *h);
+// /sys/firmware/efi/gop_modes: the sizes the bootloader can set, one
+// "WIDTHxHEIGHT" a line; /sys/kernel/display/saved_size: the saved size,
+// writable by root.  After sysfs_init().
+void fbdev_boot_display_sysfs(void);
+
 #endif // _KERNEL_DEV_VIDEO_FBDEV_H_

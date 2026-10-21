@@ -24,6 +24,8 @@
 #include <kernel/dev/video/gpu/drm/drm.h>
 #include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
+#include <kernel/dev/video/fbdev.h>
+#include <kernel/dev/video/screen_modes.h>
 #include <kernel/uapi/drm/vmwgfx_drm.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
 #include <kernel/uapi/ioctl.h>
@@ -390,37 +392,21 @@ static void vmw_print_sm_type(const struct vmw_device *v)
 
 /* ---- scan-out limits ---------------------------------------------------- */
 
-/* The standard mode list, largest first.  Shared with the boot console
- * (kernel/dev/video/vmsvga2.c), so the console and a display server agree
- * about what this device can show. */
-static const uint32_t vmw_builtin_modes[][2] = {
-	{ 2560, 1600 }, { 2560, 1440 }, { 1920, 1440 }, { 1920, 1200 },
-	{ 1920, 1080 }, { 1856, 1392 }, { 1792, 1344 }, { 1680, 1050 },
-	{ 1600, 1200 }, { 1600, 900 },	{ 1440, 900 },	{ 1400, 1050 },
-	{ 1366, 768 },	{ 1360, 768 },	{ 1280, 1024 }, { 1280, 960 },
-	{ 1280, 800 },	{ 1280, 768 },	{ 1280, 720 },	{ 1152, 864 },
-	{ 1024, 768 },	{ 800, 600 },	{ 640, 480 },
-};
+/* The mode list is the standard one (kernel/dev/video/screen_modes.h), the
+ * same the bootloader and the boot console use, bounded by what this device
+ * can scan out. */
 
 #define VMW_SCANOUT_MAX_DIM 8192U
 
-/* The build's screen-size preference (Makefile: SCREEN_SIZE,
- * MAX_SCREEN_SIZE), the same ceilings the boot console applies.  They bound
- * the mode this comes up in, not the mode list: a device that can scan out
- * more than the build asked for still offers those modes to a display
- * server that explicitly asks for one. */
+/* The build-time ceiling (Makefile: MAX_SCREEN_SIZE), the same the boot
+ * console applies.  It bounds the size this comes up in on its own, not the
+ * mode list and not a size the user saved: a device that can scan out more
+ * still offers those modes to whoever asks for one. */
 #ifndef SCREEN_MAX_WIDTH
 #define SCREEN_MAX_WIDTH 0xFFFFFFFFU
 #endif
 #ifndef SCREEN_MAX_HEIGHT
 #define SCREEN_MAX_HEIGHT 0xFFFFFFFFU
-#endif
-#if defined(SCREEN_LARGE)
-#define VMW_PREF_MAX_WIDTH 1920U
-#define VMW_PREF_MAX_HEIGHT 1200U
-#else
-#define VMW_PREF_MAX_WIDTH 1280U
-#define VMW_PREF_MAX_HEIGHT 800U
 #endif
 
 /* How large a screen this device can really show -- which is not what the
@@ -512,21 +498,11 @@ static int vmw_mode_fits(const struct vmw_device *v, uint32_t w, uint32_t h)
 	       (uint64_t)w * h * 4 <= v->scanout_max_mem;
 }
 
-/* ...and is one the build allows the machine to come up in.
- * MAX_SCREEN_SIZE overrules everyone, the host included. */
+/* ...and is one the build allows the machine to come up in on its own. */
 static int vmw_mode_allowed(const struct vmw_device *v, uint32_t w, uint32_t h)
 {
 	return vmw_mode_fits(v, w, h) && w <= SCREEN_MAX_WIDTH &&
 	       h <= SCREEN_MAX_HEIGHT;
-}
-
-/* ...and is one the build would pick on its own.  SCREEN_SIZE bounds what
- * the mode list may offer; it does not overrule the host. */
-static int vmw_mode_preferable(const struct vmw_device *v, uint32_t w,
-			       uint32_t h)
-{
-	return vmw_mode_allowed(v, w, h) && w <= VMW_PREF_MAX_WIDTH &&
-	       h <= VMW_PREF_MAX_HEIGHT;
 }
 
 void vmwgfx_init(void)
@@ -662,31 +638,26 @@ void vmwgfx_init(void)
 	vmw_write_driver_id(v, v->drm.drv);
 
 	/* One virtual connector.  The mode list is the standard set bounded by
-	 * what this device can actually scan out, largest first, and the
-	 * largest is the preferred one -- the console takes the first mode on
-	 * the list and a display server asks for the preferred one, so this
-	 * is where the resolution the machine comes up in is decided.  The
-	 * mode the boot console left behind is kept on the list too, so
+	 * what this device can actually scan out, largest first, behind the
+	 * preferred mode -- the console takes the first mode on the list and a
+	 * display server asks for the preferred one, so this is where the
+	 * resolution the machine comes up in is decided.  Nothing the device
+	 * reports says how large the display in front of the user is, so the
+	 * preferred mode is the size saved in Display settings, else the
+	 * firmware's mode raised to at least 1280x800 (vmw_kms_initial_size()).
+	 * The mode the boot console left behind is kept on the list too, so
 	 * falling back to it needs no modeset the device could refuse. */
 	uint32_t pw = 0, ph = 0;
-	/* What the host recommends, if it said and this scan-out can carry
-	 * it.  The console driver asked at probe; the answer applies here
-	 * rather than there, because here is where the aperture's limits
-	 * stop applying and the recommendation usually becomes reachable. */
-	if (vmsvga2_get_host_preferred(&pw, &ph) != 0 ||
-	    !vmw_mode_allowed(v, pw, ph))
+	if (!fbdev_boot_saved_size(&pw, &ph) || !vmw_mode_fits(v, pw, ph))
 		pw = 0;
-	for (unsigned i = 0;
-	     i < sizeof(vmw_builtin_modes) / sizeof(vmw_builtin_modes[0]) && !pw;
-	     i++) {
-		if (vmw_mode_preferable(v, vmw_builtin_modes[i][0],
-					vmw_builtin_modes[i][1])) {
-			pw = vmw_builtin_modes[i][0];
-			ph = vmw_builtin_modes[i][1];
+	if (!pw) {
+		vmw_kms_initial_size(v, &pw, &ph);
+		if (!vmw_mode_allowed(v, pw, ph) &&
+		    vmw_mode_allowed(v, v->hw.width, v->hw.height)) {
+			pw = v->hw.width;
+			ph = v->hw.height;
 		}
 	}
-	if (!pw)
-		vmw_kms_initial_size(v, &pw, &ph);
 	/* A size in millimetres at 96 dpi for the preferred mode. */
 	uint32_t mm_w = pw * 254 / 960, mm_h = ph * 254 / 960;
 	int c = drm_connector_add(&v->drm, DRM_MODE_CONNECTOR_VIRTUAL, mm_w, mm_h);
@@ -698,11 +669,9 @@ void vmwgfx_init(void)
 			drm_mode_fill(&m, v->hw.width, v->hw.height, 60, 0);
 			drm_connector_add_mode(&v->drm, c, &m);
 		}
-		for (unsigned i = 0;
-		     i < sizeof(vmw_builtin_modes) / sizeof(vmw_builtin_modes[0]);
-		     i++) {
-			uint32_t sw = vmw_builtin_modes[i][0];
-			uint32_t sh = vmw_builtin_modes[i][1];
+		for (unsigned i = 0; i < SCREEN_MODE_COUNT; i++) {
+			uint32_t sw = screen_mode_list[i].width;
+			uint32_t sh = screen_mode_list[i].height;
 			if (sw == pw && sh == ph)
 				continue;
 			if (sw == v->hw.width && sh == v->hw.height)

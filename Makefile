@@ -717,6 +717,8 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 # Audio tools -> /usr/bin, the audio service -> /usr/sbin
 USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
 USR_SBIN_PROGS = audiod
+# Helpers -> /usr/libexec/<name>
+USR_LIBEXEC_PROGS = likeos-display-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
@@ -782,10 +784,11 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/pcmanfm
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
-GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar
+GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
+	$(BUILD_DIR)/likeos-display-settings
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
-	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_SBIN_PROGS)) \
+	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_SBIN_PROGS) $(USR_LIBEXEC_PROGS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
 	$(GTK3_SENTINEL) \
@@ -934,7 +937,7 @@ $(BUILD_DIR)/sdca.o: $(KERNEL_DIR)/dev/sound/sdca.c | $(BUILD_DIR)
 $(BUILD_DIR)/firmware.o: $(KERNEL_DIR)/ke/firmware.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmw_drv.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_drv.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmw_drv.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_drv.c $(SCREEN_STAMP) | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vmw_mob.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_mob.c | $(BUILD_DIR)
@@ -1532,6 +1535,13 @@ $(BUILD_DIR)/drminfo: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/backlight: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) backlight
 	cp $(USER_DIR)/backlight $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# likeos-display-save: writes the display size Display settings saves
+# (/etc/likeos/display.conf); setuid root in /usr/libexec.
+$(BUILD_DIR)/likeos-display-save: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) likeos-display-save
+	cp $(USER_DIR)/likeos-display-save $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
@@ -2276,6 +2286,16 @@ $(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(GTK3_SENTINEL) | $
 		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 		   ports/xorg/toolchain/likeos-pkg-config --libs libaudio)
 
+# The Display settings dialog: GTK3 for the window, RandR for the switch.
+$(BUILD_DIR)/likeos-display-settings: user/bin/shell/display-settings.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+		   ports/xorg/toolchain/likeos-pkg-config --cflags xrandr) \
+		-o $@ $< $(GTK3_BAR_LIBS) \
+		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+		   ports/xorg/toolchain/likeos-pkg-config --libs xrandr)
+
 # The C++ runtime's own test program.
 #
 # Built with the port's C++ driver rather than the userland one, because it is
@@ -2420,7 +2440,7 @@ endif
 	@echo "LikeOS ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
-$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S $(SCREEN_STAMP) | $(BUILD_DIR)
+$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S $(KERNEL_DIR)/dev/video/screen_modes.h $(SCREEN_STAMP) | $(BUILD_DIR)
 	@echo "Building UEFI bootloader..."
 	# Compile bootloader C code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/bootloader.c -o $(BUILD_DIR)/bootloader.o
@@ -2492,6 +2512,13 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/datetime $(EXT4_STAGING)/usr/bin/datetime
 	cp $(BUILD_DIR)/load     $(EXT4_STAGING)/usr/bin/load
 	cp $(BUILD_DIR)/taskbar  $(EXT4_STAGING)/usr/bin/taskbar
+	# Display settings: the dialog -> /usr/bin (the desktop menu starts it,
+	# xinitrc runs it with --restore), its setuid-root helper ->
+	# /usr/libexec, and /etc/likeos, where the helper saves the setting.
+	cp $(BUILD_DIR)/likeos-display-settings $(EXT4_STAGING)/usr/bin/likeos-display-settings
+	for b in $(USR_LIBEXEC_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/libexec/$$b; done
+	chmod 4755 $(EXT4_STAGING)/usr/libexec/likeos-display-save
+	mkdir -p $(EXT4_STAGING)/etc/likeos
 	# Sound: the tools -> /usr/bin, audiod -> /usr/sbin (started by init
 	# from inittab; it creates /var/run/audiod and /var/lib/audiod with
 	# their owners itself), the system sounds -> /usr/share/sounds/likeos.

@@ -76,7 +76,7 @@ static struct {
 	Atom net_wm_state, skip_taskbar, close_window;
 	Atom window_type, type_dock, type_desktop, type_toolbar, type_splash;
 	Atom utf8, strut_partial, wm_icon;
-	Atom supporting_wm_check, startup_sound;
+	Atom supporting_wm_check, startup_sound, display_switch;
 } A;
 
 struct task {
@@ -2668,6 +2668,8 @@ static gboolean on_leave(GtkWidget *w, GdkEventCrossing *ev, gpointer d)
  * window list, the focus, the workspace, and each window's title and iconic
  * state.  GDK hands us the raw event before it decides it has no use for it,
  * which is what makes this possible without an X connection of our own. */
+static void display_switch(int state); /* below, with the panel's layout */
+
 static GdkFilterReturn event_filter(GdkXEvent *xev, GdkEvent *ev, gpointer data)
 {
 	XEvent *e = (XEvent *)xev;
@@ -2695,6 +2697,8 @@ static GdkFilterReturn event_filter(GdkXEvent *xev, GdkEvent *ev, gpointer data)
 			g_ndesktops = prop_card(g_root,
 						A.number_of_desktops, 4);
 			gtk_widget_queue_draw(g_area);
+		} else if (a == A.display_switch) {
+			display_switch(e->xproperty.state);
 		}
 		return GDK_FILTER_CONTINUE;
 	}
@@ -2940,7 +2944,127 @@ static void intern_atoms(void)
 	IA(wm_icon, "_NET_WM_ICON");
 	IA(supporting_wm_check, "_NET_SUPPORTING_WM_CHECK");
 	IA(startup_sound, "_LIKEOS_STARTUP_SOUND");
+	IA(display_switch, "_LIKEOS_DISPLAY_SWITCH");
 #undef IA
+}
+
+/* The panel's window and the monitor geometry it was laid out for. */
+static GtkWidget *g_win;
+static GdkRectangle g_layout_geo;
+
+/* The monitor the panel sits on: the primary one, else the first. */
+static gboolean monitor_geometry(GdkRectangle *geo)
+{
+	GdkDisplay *disp = gdk_display_get_default();
+	GdkMonitor *mon = gdk_display_get_primary_monitor(disp);
+
+	if (!mon)
+		mon = gdk_display_get_monitor(disp, 0);
+	if (!mon)
+		return FALSE;
+	gdk_monitor_get_geometry(mon, geo);
+	return TRUE;
+}
+
+/* Lay the panel out for `geo': as wide as the monitor, at its bottom edge,
+ * with the strut that keeps maximised windows clear of it.  The position is
+ * stated the way main() explains, as a user position. */
+static void panel_place(const GdkRectangle *geo)
+{
+	char geom[32];
+
+	g_layout_geo = *geo;
+	g_panel_w = geo->width;
+	gtk_widget_set_size_request(g_area, geo->width, PANEL_HEIGHT);
+	gtk_window_resize(GTK_WINDOW(g_win), geo->width, PANEL_HEIGHT);
+	g_snprintf(geom, sizeof(geom), "+%d+%d", geo->x,
+		   geo->y + geo->height - PANEL_HEIGHT);
+	G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+	gtk_window_parse_geometry(GTK_WINDOW(g_win), geom);
+	G_GNUC_END_IGNORE_DEPRECATIONS
+	if (g_gdkwin)
+		set_strut(GDK_WINDOW_XID(g_gdkwin), PANEL_HEIGHT, geo->x,
+			  geo->width);
+	gtk_widget_queue_draw(g_area);
+}
+
+/* Display settings changing the screen size.
+ *
+ * Followed as it happens, the change would show: the panel laid out for the
+ * old size on the new screen until it has caught up.  So the dialog asks
+ * first, through _LIKEOS_DISPLAY_SWITCH on the root window: 1 means "about to
+ * change the size", and the panel takes itself off the screen and answers 2
+ * once it is off; the dialog changes the size and deletes the property, and
+ * the panel lays itself out for the new size and comes back.  A dialog that
+ * never deletes it does not keep the panel away: it comes back after
+ * SWITCH_HIDE_MS regardless. */
+#define SWITCH_HIDE_MS 10000
+
+static gboolean g_switch_hidden;
+static guint g_switch_timeout;
+
+static gboolean display_switch_done(gpointer data)
+{
+	GdkRectangle geo;
+
+	(void)data;
+	if (g_switch_timeout) {
+		g_source_remove(g_switch_timeout);
+		g_switch_timeout = 0;
+	}
+	if (!g_switch_hidden)
+		return G_SOURCE_REMOVE;
+	g_switch_hidden = FALSE;
+	if (monitor_geometry(&geo))
+		panel_place(&geo);
+	gtk_widget_show(g_win);
+	return G_SOURCE_REMOVE;
+}
+
+static gboolean display_switch_expired(gpointer data)
+{
+	g_switch_timeout = 0;
+	return display_switch_done(data);
+}
+
+static void display_switch(int state)
+{
+	if (state == PropertyDelete) {
+		display_switch_done(NULL);
+		return;
+	}
+	if (prop_card(g_root, A.display_switch, 0) != 1)
+		return; /* our own answer, or nothing we know */
+	if (!g_switch_hidden) {
+		g_switch_hidden = TRUE;
+		gtk_widget_hide(g_win);
+	}
+	/* Off the screen before the answer goes out. */
+	gdk_display_sync(gdk_display_get_default());
+
+	long answer = 2;
+
+	XChangeProperty(g_dpy, g_root, A.display_switch, XA_CARDINAL, 32,
+			PropModeReplace, (unsigned char *)&answer, 1);
+	XFlush(g_dpy);
+	if (g_switch_timeout)
+		g_source_remove(g_switch_timeout);
+	g_switch_timeout =
+		g_timeout_add(SWITCH_HIDE_MS, display_switch_expired, NULL);
+}
+
+/* A screen size change made by some other program (xrandr): follow it. */
+static void on_monitors_changed(GdkScreen *screen, gpointer data)
+{
+	GdkRectangle geo;
+
+	(void)screen;
+	(void)data;
+	/* Hidden for Display settings: laid out when it comes back. */
+	if (g_switch_hidden || !monitor_geometry(&geo) ||
+	    gdk_rectangle_equal(&geo, &g_layout_geo))
+		return;
+	panel_place(&geo);
 }
 
 int main(int argc, char **argv)
@@ -2982,8 +3106,11 @@ int main(int argc, char **argv)
 	int sw = geo.width;
 
 	g_panel_w = sw;
+	g_layout_geo = geo;
 
 	GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+
+	g_win = win;
 
 	/* A dock, which is what this is: ctwm reads the type and stacks it
 	 * accordingly, and no sane window manager offers to decorate one. */
@@ -3090,6 +3217,11 @@ int main(int argc, char **argv)
 	 * that waits for the desktop. */
 	audio_start();
 	startup_sound_arm();
+
+	g_signal_connect(gdk_display_get_default_screen(disp), "monitors-changed",
+			 G_CALLBACK(on_monitors_changed), NULL);
+	g_signal_connect(gdk_display_get_default_screen(disp), "size-changed",
+			 G_CALLBACK(on_monitors_changed), NULL);
 
 	gtk_main();
 	return 0;
