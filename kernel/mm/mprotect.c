@@ -38,6 +38,22 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 	if (addr + pages * PAGE_SIZE <= addr)
 		return -ENOMEM;
 
+	/* A shared mapping of a descriptor not open for writing stays
+	 * unwritable (mmap: no_write).  Decided over the whole range before
+	 * anything changes. */
+	if (prot & 0x2) { // PROT_WRITE
+		task_t *mm = task_mm_owner(cur);
+		uint64_t end = addr + pages * PAGE_SIZE;
+
+		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+			mmap_region_t *r = &mm->mmap_regions[i];
+
+			if (r->in_use && r->no_write && end > r->start &&
+			    addr < r->start + r->length)
+				return -EACCES;
+		}
+	}
+
 	// Build page flags
 	uint64_t flags = PAGE_PRESENT | PAGE_USER;
 	if (prot & 0x2) { // PROT_WRITE

@@ -49,7 +49,7 @@ static void mm_rwsem_park(mm_rwsem_t *sem, uint64_t *flags)
 
 	if (cur) {
 		cur->wait_channel = (void *)sem;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 	}
 	spin_unlock_irqrestore(&sem->lock, *flags);
 	sched_schedule();

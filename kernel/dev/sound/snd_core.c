@@ -194,7 +194,7 @@ int snd_wait_event(struct wait_queue_head *wq, snd_cond_fn cond, void *arg,
 		 * it asleep with the condition true.  Undone with a
 		 * compare-and-swap, since a waker may already have claimed the
 		 * task. */
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		if (deadline)
 			hrtimer_wait_arm(cur, deadline);
 		if (cond(arg)) {

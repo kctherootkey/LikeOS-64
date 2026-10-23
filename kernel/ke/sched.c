@@ -2803,7 +2803,7 @@ void sched_bsp_park(void)
 	for (;;) {
 		self->wait_channel = NULL;
 		self->wakeup_tick = 0;
-		self->state = TASK_BLOCKED;
+		task_set_blocked(self);
 		sched_schedule();
 		/* Nothing holds a reference with which to wake this, so getting
 		 * here at all means something enqueued it by mistake.  Halting
@@ -2898,6 +2898,13 @@ task_t *sched_find_task_by_id(uint32_t id)
 }
 
 // Same but caller must hold g_task_list_lock
+void sched_session_drop_tty_locked(int sid, struct tty *tty)
+{
+	for (task_t *t = g_task_list_head; t; t = t->next)
+		if (t->sid == sid && t->ctty == tty)
+			t->ctty = NULL;
+}
+
 task_t *sched_find_task_by_id_locked(uint32_t id)
 {
 	for (task_t *t = g_task_list_head; t; t = t->next) {
@@ -5095,6 +5102,23 @@ void sched_mark_task_exited(task_t *task, int status)
 		if (task->ctty->sid == task->sid) {
 			task->ctty->sid = 0;
 			task->ctty->fg_pgid = 0;
+		}
+		/* ...and the session's other members lose it as their
+		 * controlling terminal.  A process left behind by a login
+		 * must not go on reaching the terminal through /dev/tty, nor
+		 * make itself its foreground -- the next login's keystrokes,
+		 * its password first, would be read there. */
+		{
+			tty_t *tty = task->ctty;
+			int sid = task->sid;
+			uint64_t tfl;
+
+			spin_lock_irqsave(&g_task_list_lock, &tfl);
+			for (task_t *t = g_task_list_head; t; t = t->next) {
+				if (t != task && t->sid == sid && t->ctty == tty)
+					t->ctty = NULL;
+			}
+			spin_unlock_irqrestore(&g_task_list_lock, tfl);
 		}
 	}
 

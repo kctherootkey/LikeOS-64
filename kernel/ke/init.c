@@ -87,6 +87,7 @@ static void devpoll_thread(void *arg)
 		xhci_hotplug_poll(&g_xhci_hid);
 		usbhid_poll();
 		storage_fs_poll(&g_storage_state);
+		timer_host_time_sync_poll();
 
 		if (!handled_input) {
 			task_t *self = sched_current();
@@ -94,7 +95,7 @@ static void devpoll_thread(void *arg)
 			if (self) {
 				self->wait_channel = (void *)&g_devpoll_stack;
 				self->wakeup_tick = timer_ticks() + 1;
-				self->state = TASK_BLOCKED;
+				task_set_blocked(self);
 				sched_schedule();
 				self->wakeup_tick = 0;
 				self->wait_channel = NULL;
@@ -253,6 +254,7 @@ __no_stack_protector void continue_system_startup(void)
 	sysfs_init();
 	procfs_init();
 	fbdev_boot_display_sysfs();
+	tty_sysfs_init();
 	/* /ram: a filesystem that lives in memory, for whatever should not
 	 * touch the disk (luakit's caches and databases, see
 	 * res/xorg/luakit-ram.sh). */

@@ -172,7 +172,7 @@ static void tfs_lock(void)
 		 * finds the task on the channel and wakes it. */
 		if (cur && irqs_enabled()) {
 			cur->wait_channel = (void *)&g_mtx;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			spin_unlock_irqrestore(&g_mtx.lock, fl);
 			sched_schedule();
 		} else {

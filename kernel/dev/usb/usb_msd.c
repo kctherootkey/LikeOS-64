@@ -454,7 +454,7 @@ static void msd_io_lock(usb_msd_device_t *msd)
 		// Device busy — sleep until the holder releases it.
 		if (cur) {
 			cur->wait_channel = &msd->io_locked;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 		}
 		spin_unlock_irqrestore(&msd->io_wait_lock, flags);
 		sched_schedule(); // yields with IRQs enabled

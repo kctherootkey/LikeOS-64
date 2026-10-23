@@ -570,7 +570,7 @@ int unix_accept(unix_socket_t *us, struct sockaddr_un *addr, socklen_t *addrlen,
 		if (us->accept_head == us->accept_tail && us->active &&
 		    !us->closed) {
 			acc_cur->wait_channel = us;
-			acc_cur->state = TASK_BLOCKED;
+			task_set_blocked(acc_cur);
 			spin_unlock_irqrestore(&us->lock, pf);
 			sched_schedule();
 			acc_cur->wait_channel = NULL;
@@ -1011,7 +1011,7 @@ static int unix_send_record(unix_socket_t *us, unix_socket_t *peer,
 		/* Park on the peer, exactly as the stream path does; the
 		 * reader wakes us after draining. */
 		snd_cur->wait_channel = peer;
-		snd_cur->state = TASK_BLOCKED;
+		task_set_blocked(snd_cur);
 		spin_unlock_irqrestore(&peer->lock, irqflags);
 		sched_schedule();
 		snd_cur->wait_channel = NULL;
@@ -1429,7 +1429,7 @@ int unix_send_fds(unix_socket_t *us, const void *buf, size_t len, int flags,
 					continue;
 				}
 				snd_cur->wait_channel = peer;
-				snd_cur->state = TASK_BLOCKED;
+				task_set_blocked(snd_cur);
 				spin_unlock_irqrestore(&peer->lock, irqflags);
 				sched_schedule();
 				spin_lock_irqsave(&peer->lock, &irqflags);
@@ -1531,7 +1531,7 @@ restart:
 			if (us->head == us->tail && !us->peer_closed &&
 			    !us->closed) {
 				rcv_cur->wait_channel = us;
-				rcv_cur->state = TASK_BLOCKED;
+				task_set_blocked(rcv_cur);
 				spin_unlock_irqrestore(&us->lock, rf);
 				sched_schedule();
 				rcv_cur->wait_channel = NULL;

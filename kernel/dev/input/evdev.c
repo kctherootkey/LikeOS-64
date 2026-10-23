@@ -439,7 +439,7 @@ long evdev_read(int unit, void *user_buf, long bytes, int nonblock)
 		// tty_read): publish BLOCKED + channel, re-check the ring
 		// under the lock, then schedule.
 		cur->wait_channel = (void *)&dev->wq;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_lock_irqsave(&dev->lock, &f);
 		if (dev->count > 0) {
 			cur->state = TASK_READY;

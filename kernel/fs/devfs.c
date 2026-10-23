@@ -6,6 +6,8 @@
 #include <kernel/mm/shm.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
+#include <kernel/io/tty.h>
+#include <kernel/ke/cred.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/uapi/dirent.h>
 #include <kernel/ke/timer.h>
@@ -122,6 +124,8 @@ int devfs_fd_alias_target(const char *path)
 	return -1;
 }
 
+static int devfs_permission(const char *path, unsigned long ino, int want);
+
 int devfs_init(void)
 {
 	g_devfs_ops.open = devfs_open;
@@ -137,6 +141,7 @@ int devfs_init(void)
 	g_devfs_ops.rmdir = NULL;
 	g_devfs_ops.chdir = devfs_chdir;
 	g_devfs_ops.close = devfs_close;
+	g_devfs_ops.permission = devfs_permission;
 	return 0;
 }
 
@@ -188,6 +193,39 @@ static struct devfs_node *devfs_node_lookup(const char *path)
 	}
 	spin_unlock_irqrestore(&g_nodes_lock, fl);
 	return found;
+}
+
+/* The VFS asks this before the mode bits (vfs_permission_st()).  It only
+ * ever grants: read and write on a uaccess node, for the user logged in on
+ * the console (tty_console_uid()), when every id the check could use is that
+ * user's -- so a set-id program run by that user gets no more than its ids
+ * would.  Everything else, including every refusal, is the ordinary
+ * mode-bit and ACL decision. */
+static int devfs_permission(const char *path, unsigned long ino, int want)
+{
+	cred_t *c = current_cred();
+	uint32_t owner;
+	uint64_t fl;
+	int uaccess = 0;
+
+	(void)ino;
+	if (!c || !want || (want & ~(MAY_READ | MAY_WRITE)))
+		return ST_UNSUPPORTED;
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		struct devfs_node *n = g_nodes[i];
+
+		if (n && !n->is_dir && kstrcmp(n->path, path) == 0) {
+			uaccess = n->uaccess;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	if (!uaccess || !tty_console_uid(&owner) || owner == 0)
+		return ST_UNSUPPORTED;
+	if (c->uid != owner || c->euid != owner || c->fsuid != owner)
+		return ST_UNSUPPORTED;
+	return ST_OK;
 }
 
 /* Does `path' name a registered directory, with or without a trailing
@@ -591,8 +629,11 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 				if (!*q)
 					cand = tty_get_pty_slave(pid);
 			}
-		} else if (is_path(path, "/dev/console") ||
-			   is_path(path, "/dev/tty0")) {
+		} else if ((is_path(path, "/dev/console") ||
+			    is_path(path, "/dev/tty0")) && capable()) {
+			/* The console becomes a session's terminal only
+			 * through getty (root): whose session it is decides
+			 * who the console user is (tty_console_uid()). */
 			cand = tty_get_console();
 		}
 		/* sid 0 means unclaimed; re-claiming our own session is a no-op. */
@@ -1635,8 +1676,18 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	}
 
 	switch (df->type) {
-	case DEVFS_TYPE_TTY: /* console opens: report the /dev/tty identity */
-		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 0;
+	case DEVFS_TYPE_TTY:
+		/* The identity of the name it was opened under, as
+		 * devfs_stat() gives it: /dev/console 5:1, /dev/tty0 4:0,
+		 * /dev/tty 5:0.  All three were 5:0, so a descriptor on the
+		 * console did not match stat("/dev/console") and ttyname()
+		 * could not name it. */
+		if (is_path(df->path, "/dev/console"))
+			perm = 0620, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 1;
+		else if (is_path(df->path, "/dev/tty0"))
+			perm = 0620, gid = DEVFS_GID_TTY, rmaj = 4, rmin = 0;
+		else
+			perm = 0666, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 0;
 		break;
 	case DEVFS_TYPE_PTY_MASTER:
 		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 2;

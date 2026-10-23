@@ -16,6 +16,7 @@
 #include <kernel/net/net.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/vfs.h> /* vfs_file refcount in the pty diagnostic dump */
+#include <kernel/fs/sysfs.h>
 
 #define TTY_MAX_PTYS 16
 
@@ -370,6 +371,56 @@ void tty_init(void)
 tty_t *tty_get_console(void)
 {
 	return &g_console_tty;
+}
+
+static long tty_show_console_user(struct pfs_node *n, char *buf, long cap);
+
+/* /sys/kernel/console_user: the uid of the user logged in on the console,
+ * empty when nobody is -- what `who' tells anyone on the machine.  The
+ * setuid X server reads it to start only for that user. */
+void tty_sysfs_init(void)
+{
+	sysfs_add_attr("kernel", "console_user", tty_show_console_user, NULL,
+		       NULL, 0);
+}
+
+/* The user logged in on the console: the real uid of the live leader of the
+ * session whose controlling terminal the console is.  getty takes the
+ * console for a new session and becomes login, which becomes the user's
+ * shell -- so the leader IS the user's login shell, and the session ends
+ * when it exits (sched.c clears the terminal's session then).  0 when the
+ * console has no live session.  What the seat's devices are granted to
+ * (devfs: uaccess nodes) and who may start the display server. */
+int tty_console_uid(uint32_t *uid)
+{
+	tty_t *tty = &g_console_tty;
+	int sid = __atomic_load_n(&tty->sid, __ATOMIC_ACQUIRE);
+	uint64_t fl;
+	int ok = 0;
+
+	if (sid <= 0)
+		return 0;
+	spin_lock_irqsave(&g_task_list_lock, &fl);
+	task_t *t = sched_find_task_by_id_locked((uint32_t)sid);
+
+	if (t && (int)t->id == sid && t->sid == sid && t->ctty == tty &&
+	    !t->has_exited && t->privilege == TASK_USER &&
+	    tty->sid == sid) {
+		*uid = t->cred.uid;
+		ok = 1;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, fl);
+	return ok;
+}
+
+static long tty_show_console_user(struct pfs_node *n, char *buf, long cap)
+{
+	uint32_t uid;
+
+	(void)n;
+	if (!tty_console_uid(&uid))
+		return 0;
+	return ksnprintf(buf, (size_t)cap, "%u\n", uid);
 }
 
 static void tty_signal_pgrp(tty_t *tty, int sig);
@@ -913,7 +964,7 @@ static long tty_read_inner(tty_t *tty, void *buf, long count, int nonblock)
 				uint64_t _f;
 				cur->wait_channel = (void *)&tty->read_waiters;
 				cur->wakeup_tick = vtime_deadline;
-				cur->state = TASK_BLOCKED;
+				task_set_blocked(cur);
 				spin_lock_irqsave(&tty_lock, &_f);
 				if (tty->read_count > 0) {
 					cur->state = TASK_READY;
@@ -956,7 +1007,7 @@ static long tty_read_inner(tty_t *tty, void *buf, long count, int nonblock)
                  * buffer in single large reads and rarely re-blocked. */
 				uint64_t _f;
 				cur->wait_channel = (void *)&tty->read_waiters;
-				cur->state = TASK_BLOCKED;
+				task_set_blocked(cur);
 				spin_lock_irqsave(&tty_lock, &_f);
 				if (tty->read_count > 0) {
 					cur->state = TASK_READY;
@@ -1195,7 +1246,8 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 			return ret;
 		/* Only a process whose controlling terminal is this tty (or the
 		 * privileged caller) may set the foreground process group. */
-		if (cur && !capable() && cur->ctty != tty)
+		if (cur && !capable() &&
+		    (cur->ctty != tty || tty->sid != cur->sid))
 			return -EPERM;
 		if (pgid < 0)
 			return -EINVAL;
@@ -1227,13 +1279,62 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 		tty->fg_pgid = pgid;
 		return 0;
 	}
-	case TIOCSCTTY:
+	case TIOCSCTTY: {
+		/* The argument is a value, not a pointer: 1 asks to take the
+		 * terminal from the session that has it. */
+		int steal = ((uintptr_t)argp == 1);
+		int owner_sid;
+
 		if (!cur)
 			return -EINVAL;
-		/* Only a session leader may acquire a controlling terminal; the
-		 * privileged caller is exempt. */
-		if (!capable() && cur->sid != (int)cur->id)
+		/* Already this session leader's terminal: nothing to do. */
+		if (cur->sid == (int)cur->id && tty->sid == cur->sid &&
+		    cur->ctty == tty)
+			return 0;
+		/* Only a session leader with no controlling terminal of its
+		 * own may acquire one -- root included.  A terminal that has
+		 * since gone to another session is no longer the caller's. */
+		if (cur->sid != (int)cur->id)
 			return -EPERM;
+		if (cur->ctty && cur->ctty->sid == cur->sid)
+			return -EPERM;
+		/* The console only through getty (root): whose session it is
+		 * decides who the console user is (tty_console_uid()), and a
+		 * descriptor left over from an earlier login must not make its
+		 * holder that user once the console is free. */
+		if (!capable() && tty == &g_console_tty)
+			return -EPERM;
+		/* ...and not one that is still another live session's.
+		 * Taking it would make the caller that session's successor on
+		 * the terminal -- on the console, the logged-in user as far as
+		 * the seat's devices go (tty_console_uid()).  Only root, and
+		 * only when it asks to (argument 1), takes it, and the session
+		 * it is taken from loses it. */
+		owner_sid = tty->sid;
+		if (owner_sid > 0 && owner_sid != cur->sid) {
+			/* Looked up and read under the task list's lock: the
+			 * owner can exit and be freed the moment it is let go
+			 * of. */
+			uint64_t tfl;
+			int live;
+
+			spin_lock_irqsave(&g_task_list_lock, &tfl);
+			task_t *owner =
+				sched_find_task_by_id_locked((uint32_t)owner_sid);
+
+			/* Live, and still that session's leader on this
+			 * terminal -- a reused pid is not the owner. */
+			live = owner && !owner->has_exited &&
+			       (int)owner->id == owner_sid &&
+			       owner->sid == owner_sid && owner->ctty == tty;
+			if (live && steal && capable()) {
+				sched_session_drop_tty_locked(owner_sid, tty);
+				live = 0;
+			}
+			spin_unlock_irqrestore(&g_task_list_lock, tfl);
+			if (live)
+				return -EPERM;
+		}
 		cur->ctty = tty;
 		tty->sid = cur->sid;
 		/* Claiming the terminal also makes the claimant's process group
@@ -1247,6 +1348,7 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 		if (cur->pgid > 0)
 			tty->fg_pgid = cur->pgid;
 		return 0;
+	}
 	case TIOCGWINSZ:
 		if (!argp)
 			return -EFAULT;
@@ -1479,7 +1581,7 @@ long tty_pty_master_read(int id, void *buf, long count, int nonblock)
 			return -EINTR;
 		}
 		cur->wait_channel = (void *)&pty->master_read_waiters;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_unlock_irqrestore(&pty->lock, flags);
 		sched_schedule();
 	}
@@ -1557,7 +1659,7 @@ long tty_pty_master_write(int id, const void *buf, long count, int nonblock)
 			 * us straight back. */
 			cur->wait_channel = (void *)&pty->slave_write_waiters;
 			__atomic_thread_fence(__ATOMIC_SEQ_CST);
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			__atomic_thread_fence(__ATOMIC_SEQ_CST);
 			spin_lock_irqsave(&tty_lock, &f);
 			if (tty_input_has_room_locked(&pty->slave)) {

@@ -515,7 +515,7 @@ static int sof_ipc_wait_flag(struct sof_host *h, volatile int *flag,
 			}
 			cur->wait_channel = &h->ipc_wq;
 			cur->wakeup_tick = timer_ticks() + 1;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			local_irq_restore(fl);
 			sched_schedule();
 			cur->wakeup_tick = 0;

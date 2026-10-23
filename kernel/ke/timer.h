@@ -21,6 +21,8 @@ void timer_init(uint32_t frequency_hz);
 void timer_start(void);
 void timer_stop(void);
 uint64_t timer_ticks(void);
+/* The wall clock against the hypervisor's, from a kernel thread. */
+void timer_host_time_sync_poll(void);
 uint64_t timer_get_epoch(void);
 uint32_t timer_get_frequency(void);
 

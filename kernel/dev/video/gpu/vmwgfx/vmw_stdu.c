@@ -123,6 +123,10 @@ struct vmw_stdu_unit {
 	uint32_t fb_id;
 	/* For stdu_report_path(). */
 	const char *last_path;
+	/* The two surfaces a dirty update flips between (stdu_flip_update()),
+	 * and which of them is shown. */
+	struct vmw_surface *flip[2];
+	int flip_shown;
 };
 
 struct vmw_stdu_state {
@@ -269,6 +273,19 @@ static void stdu_drop_surface(struct vmw_device *v, struct vmw_stdu_unit *u)
 	stdu_publish(v, u);
 }
 
+static void stdu_drop_flip(struct vmw_device *v, struct vmw_stdu_unit *u)
+{
+	for (int i = 0; i < 2; i++) {
+		if (u->flip[i]) {
+			struct vmw_surface *s = u->flip[i];
+
+			u->flip[i] = NULL;
+			vmw_surface_destroy(v, s);
+		}
+	}
+	u->flip_shown = 0;
+}
+
 /* Bind image `sid' to the target (SVGA3D_INVALID_ID unbinds it). */
 static int stdu_bind(struct vmw_device *v, struct vmw_stdu_unit *u,
 		     uint32_t sid)
@@ -289,6 +306,25 @@ static int stdu_bind(struct vmw_device *v, struct vmw_stdu_unit *u,
 	return rc;
 }
 
+/* The binding the target already has, said again and queued with the
+ * update that follows it: a dirty update goes to the host as BIND, UPDATE
+ * and the fence vmw_du_dirty() puts behind them, in one buffer, the way a
+ * screen is updated everywhere else -- an UPDATE alone, on a binding made
+ * once long before, is what a host renderer showed late and unevenly.
+ * Only for a target that is bound; asynchronous, like the update. */
+static int stdu_rebind_async(struct vmw_device *v, struct vmw_stdu_unit *u)
+{
+	SVGA3dCmdBindGBScreenTarget c;
+
+	if (u->bound_sid == SVGA3D_INVALID_ID)
+		return 0;
+	mm_memset(&c, 0, sizeof(c));
+	c.stid = (uint32_t)u->index;
+	c.image.sid = u->bound_sid;
+	return vmw_cmd_one_async(v, SVGA_3D_CMD_BIND_GB_SCREENTARGET, &c,
+				 sizeof(c));
+}
+
 static void stdu_unit_teardown(struct vmw_device *v, struct vmw_stdu_unit *u)
 {
 	if (!u->defined)
@@ -304,6 +340,7 @@ static void stdu_unit_teardown(struct vmw_device *v, struct vmw_stdu_unit *u)
 	u->fb = NULL;
 	u->fb_id = 0;
 	stdu_drop_surface(v, u);
+	stdu_drop_flip(v, u);
 	stdu_publish(v, u);
 }
 
@@ -631,6 +668,123 @@ static int stdu_surface_copy(struct vmw_device *v, struct vmw_stdu_unit *u,
 	return rc;
 }
 
+/* A scannable surface of this size and format for the flip pair: the same
+ * kind as the display surface, with no unit attached. */
+static struct vmw_surface *stdu_flip_surface(struct vmw_device *v, uint32_t w,
+					     uint32_t h, uint32_t format)
+{
+	struct vmw_surface *s = kalloc(sizeof(*s));
+	int sid, rc;
+
+	if (!s)
+		return NULL;
+	mm_memset(s, 0, sizeof(*s));
+	sid = vmw_surface_alloc_id(v);
+	if (sid < 0) {
+		kfree(s);
+		return NULL;
+	}
+	s->sid = (uint32_t)sid;
+	s->flags = SVGA3D_SURFACE_SCREENTARGET | SVGA3D_SURFACE_HINT_RENDERTARGET;
+	s->format = format;
+	s->mip_levels = 1;
+	s->array_size = 1;
+	s->base_size.width = w;
+	s->base_size.height = h;
+	s->base_size.depth = 1;
+	s->scanout = 1;
+	vmw_surface_res_init(v, s);
+	s->backup_size = vmw_surface_size(s->format, &s->base_size, 1, 1, 0,
+					  s->flags);
+	if (s->backup_size < w * h * 4)
+		s->backup_size = w * h * 4;
+	s->backup = stdu_mob_bo(v, s->backup_size);
+	if (!s->backup) {
+		vmw_surface_free_id(v, s->sid);
+		kfree(s);
+		return NULL;
+	}
+	rc = vmw_surface_define(v, s);
+	if (rc == 0)
+		rc = vmw_surface_bind(v, s);
+	if (rc) {
+		vmw_surface_destroy(v, s);
+		return NULL;
+	}
+	return s;
+}
+
+/* A dirty update of a surface-backed screen, shown the way a compositor
+ * shows a frame: the whole of the client's surface copied into the flip
+ * surface not on the screen, that surface bound to the target, the target
+ * updated in full, and the two swapped.  Updating rectangles of a surface
+ * that stays bound -- the client's own, or a display surface -- reached
+ * the screen late and unevenly on VMware's own monitor with 3D on, though
+ * the host had completed every command in milliseconds.  All of it is
+ * queued; the caller's fence hands it over (vmw_du_dirty()).  Returns 1 when
+ * shown, 0 when this path cannot be used (the caller takes the usual one),
+ * negative on a refused command. */
+static int stdu_flip_update(struct vmw_device *v, struct vmw_stdu_unit *u,
+			    struct vmw_surface *src)
+{
+	struct {
+		SVGA3dCmdSurfaceCopy c;
+		SVGA3dCopyBox box;
+	} __attribute__((packed)) cp;
+	SVGA3dCmdBindGBScreenTarget bind;
+	struct vmw_surface *back;
+	int rc;
+
+	if (u->crtc_x || u->crtc_y || src->base_size.width != u->w ||
+	    src->base_size.height != u->h ||
+	    !vmw_format_is_screen_target(src->format))
+		return 0;
+	for (int i = 0; i < 2; i++) {
+		struct vmw_surface *f = u->flip[i];
+
+		if (f && (f->base_size.width != u->w ||
+			  f->base_size.height != u->h ||
+			  f->format != src->format))
+			stdu_drop_flip(v, u);
+	}
+	for (int i = 0; i < 2; i++) {
+		if (!u->flip[i]) {
+			u->flip[i] = stdu_flip_surface(v, u->w, u->h,
+						       src->format);
+			if (!u->flip[i]) {
+				stdu_drop_flip(v, u);
+				return 0;
+			}
+		}
+	}
+	back = u->flip[u->flip_shown ^ 1];
+
+	mm_memset(&cp, 0, sizeof(cp));
+	cp.c.src.sid = src->sid;
+	cp.c.dest.sid = back->sid;
+	cp.box.w = u->w;
+	cp.box.h = u->h;
+	cp.box.d = 1;
+	rc = vmw_cmd_one_async(v, SVGA_3D_CMD_SURFACE_COPY, &cp.c, sizeof(cp));
+	if (rc)
+		return rc;
+
+	mm_memset(&bind, 0, sizeof(bind));
+	bind.stid = (uint32_t)u->index;
+	bind.image.sid = back->sid;
+	rc = vmw_cmd_one_async(v, SVGA_3D_CMD_BIND_GB_SCREENTARGET, &bind,
+			       sizeof(bind));
+	if (rc)
+		return rc;
+	u->bound_sid = back->sid;
+	u->bound_obj = (const void *)back;
+	u->flip_shown ^= 1;
+	stdu_publish(v, u);
+
+	rc = stdu_update_target(v, u, 0, 0, (int)u->w, (int)u->h);
+	return rc ? rc : 1;
+}
+
 /* Make sure a screen target of this size exists.  A guest-backed surface
  * has no other way onto the display -- the screen-object blit and the VRAM
  * copy both read guest pages, and a surface's pixels live host-side -- so if
@@ -775,10 +929,11 @@ static int vmw_stdu_present_do(struct vmw_device *v, struct vmw_stdu_unit *u,
 {
 	int rc;
 
-	/* Whether the call covers the whole framebuffer does not change
-	 * what is done: binding is decided by identity below, and an update
-	 * covers exactly the rectangle it was given. */
-	(void)full;
+	/* Whether the call covers the whole framebuffer decides two things
+	 * only: a dirty update (!full) says its binding again with the update,
+	 * and leaves the hand-over to the fence its caller puts behind it
+	 * (vmw_du_dirty()).  Binding is otherwise decided by identity below,
+	 * and an update covers exactly the rectangle it was given. */
 	if (!u->defined || !fb || !fb->obj)
 		return -ENODEV;
 	/* What the unit shows from here on, for operations addressed to
@@ -798,6 +953,20 @@ static int vmw_stdu_present_do(struct vmw_device *v, struct vmw_stdu_unit *u,
 		if (!s)
 			return -ENODEV;
 		int shown = 0;
+
+		/* A dirty update: shown by a flip (stdu_flip_update()). */
+		if (!full) {
+			rc = stdu_flip_update(v, u, s);
+			if (rc > 0) {
+				stdu_report_path(v, u, "flip", s);
+				return 0;
+			}
+			if (rc < 0) {
+				stdu_report_fail("flip", rc);
+				vmw_cmd_flush(v);
+				return rc;
+			}
+		}
 
 		if (stdu_surface_direct(u, s)) {
 			/* The client's own surface is the scan-out buffer:
@@ -820,6 +989,8 @@ static int vmw_stdu_present_do(struct vmw_device *v, struct vmw_stdu_unit *u,
 					u->bound_obj = (const void *)s;
 					stdu_publish(v, u);
 				}
+			} else if (!full) {
+				rc = stdu_rebind_async(v, u);
 			}
 			if (rc == 0)
 				rc = stdu_update_target(v, u, x1, y1, x2, y2);
@@ -878,7 +1049,10 @@ static int vmw_stdu_present_do(struct vmw_device *v, struct vmw_stdu_unit *u,
 			else
 				stdu_report_fail("surface copy", rc);
 		}
-		vmw_cmd_flush(v);
+		/* A dirty update that went through is handed over by the fence
+		 * its caller puts behind it, in the same buffer. */
+		if (full || rc)
+			vmw_cmd_flush(v);
 		return rc;
 	}
 

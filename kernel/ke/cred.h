@@ -115,6 +115,10 @@ int capable(void);
  *               Stricter -- see task_may_access(). */
 #define ACCESS_READ 0
 #define ACCESS_ATTACH 1
+/* Read its memory or layout (/proc/pid/mem, maps, auxv, fd): ACCESS_READ,
+ * and like ACCESS_ATTACH refused for a process whose privileges a set-id
+ * exec raised -- what it read while privileged is in that memory. */
+#define ACCESS_READ_MEM 2
 
 struct task;
 

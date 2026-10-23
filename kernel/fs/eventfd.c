@@ -56,7 +56,7 @@ static int eventfd_wait(struct eventfd_ctx *c, int want_read)
 		wq_entry_init(&we, cur);
 		wq_add(&c->wq, &we);
 		cur->wait_channel = c;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_unlock_irqrestore(&c->lock, fl);
 		sched_schedule();
 		wq_remove(&c->wq, &we);

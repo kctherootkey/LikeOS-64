@@ -112,6 +112,11 @@ typedef struct tty {
 
 void tty_init(void);
 tty_t *tty_get_console(void);
+/* The console's logged-in user (real uid of its live session leader); 0
+ * when there is none.  See tty.c. */
+int tty_console_uid(uint32_t *uid);
+/* /sys/kernel/console_user.  After sysfs_init(). */
+void tty_sysfs_init(void);
 void tty_console_resize(void); // after a runtime resolution change
 tty_t *tty_get_active(void); // active PTY slave (keyboard focus), or console
 void tty_reset_termios(tty_t *tty);

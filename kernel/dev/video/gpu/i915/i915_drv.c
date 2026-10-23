@@ -428,10 +428,18 @@ static const struct drm_driver i915_driver = {
  * display (intel_display_driver_setup(): feature bits, hooks, sizes, and
  * the older displays' formats and cursors).  The core keeps the pointer
  * for as long as the device is registered; there is one device. */
+/* An Intel GPU always renders 3D itself. */
+static int i915_has_3d(struct drm_device *dev)
+{
+	(void)dev;
+	return 1;
+}
+
 static const struct drm_driver *i915_driver_for(struct i915_device *i915)
 {
 	static struct drm_driver drv;
 	drv = i915_driver;
+	drv.has_3d = i915_has_3d;
 	intel_display_driver_setup(i915, &drv);
 	return &drv;
 }

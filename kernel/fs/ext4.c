@@ -811,7 +811,7 @@ static void ext4_rwsem_park(ext4_rwsem_t *sem, uint64_t *flags)
 	task_t *cur = sched_current();
 	if (cur) {
 		cur->wait_channel = (void *)sem;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 	}
 	spin_unlock_irqrestore(&sem->lock, *flags);
 	sched_schedule();
@@ -10112,7 +10112,7 @@ static void ext4_flush_thread(void *arg)
 			self->wakeup_tick = timer_ticks() +
 					    (uint64_t)EXT4_COMMIT_INTERVAL_SEC *
 						    timer_get_frequency();
-			self->state = TASK_BLOCKED;
+			task_set_blocked(self);
 			sched_schedule();
 			self->wakeup_tick = 0;
 			self->wait_channel = NULL;

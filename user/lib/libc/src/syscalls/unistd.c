@@ -32,6 +32,7 @@
 #include <sys/sysinfo.h>
 #include <sys/klog.h>
 #include <sys/xattr.h>
+#include <dirent.h>
 #include "syscall.h"
 
 /* Fallback errno for contexts with no thread control block: a statically
@@ -1582,8 +1583,9 @@ mode_t umask(mode_t mask)
 	return (mode_t)syscall1(SYS_UMASK, mask & 0777);
 }
 
-/* ttyname: walk /dev/pts and /dev to find the path of fd's tty.
- * Falls back to a fixed pseudo-name when the lookup fails. */
+/* ttyname: the name of the terminal `fd' refers to -- /dev/pts/N in a
+ * terminal window, an ssh session or a tmux pane, /dev/console on the
+ * console. */
 char *ttyname(int fd)
 {
 	static char buf[64];
@@ -1592,30 +1594,79 @@ char *ttyname(int fd)
 	return buf;
 }
 
-int ttyname_r(int fd, char *buf, size_t len)
+static int ttyname_copy(const char *name, char *buf, size_t len)
 {
-	if (!isatty(fd)) {
-		errno = ENOTTY;
-		return ENOTTY;
-	}
-	/* Best-effort: report the underlying console device, not the magic
-     * /dev/tty alias.  Some applications (e.g. tmux) refuse to use
-     * "/dev/tty" because that name resolves to whichever controlling
-     * terminal the calling process happens to have, rather than to a
-     * fixed device.  In LikeOS stdin/stdout/stderr of an interactive
-     * shell are the framebuffer console, which is exposed as
-     * /dev/console (and /dev/tty0). */
-	const char *name = "/dev/console";
-	size_t n = 0;
-	while (name[n])
-		n++;
+	size_t n = strlen(name);
+
 	if (n + 1 > len) {
 		errno = ERANGE;
 		return ERANGE;
 	}
-	for (size_t i = 0; i <= n; i++)
-		buf[i] = name[i];
+	memcpy(buf, name, n + 1);
 	return 0;
+}
+
+/* A character device in `dir' with device number `rdev'. */
+static int ttyname_scan(const char *dir, dev_t rdev, char *buf, size_t len)
+{
+	char path[256];
+	struct stat st;
+	struct dirent *d;
+	DIR *dp = opendir(dir);
+	int rc = -1;
+
+	if (!dp)
+		return -1;
+	while ((d = readdir(dp)) != NULL) {
+		if (d->d_name[0] == '.')
+			continue;
+		if ((size_t)snprintf(path, sizeof(path), "%s/%s", dir,
+				     d->d_name) >= sizeof(path))
+			continue;
+		if (stat(path, &st) == 0 && S_ISCHR(st.st_mode) &&
+		    st.st_rdev == rdev) {
+			rc = ttyname_copy(path, buf, len);
+			break;
+		}
+	}
+	closedir(dp);
+	return rc;
+}
+
+/* The descriptor's own name first (/proc/self/fd/N), taken only when the
+ * device under that name is the one the descriptor is open on; failing
+ * that, the terminal with the descriptor's device number among /dev/pts
+ * and /dev.  The answer was "/dev/console" for every terminal, so an ssh
+ * session or a terminal window named the machine's console as its own. */
+int ttyname_r(int fd, char *buf, size_t len)
+{
+	char link[32], name[256];
+	struct stat fst, st;
+	ssize_t n;
+	int rc;
+
+	if (!isatty(fd)) {
+		errno = ENOTTY;
+		return ENOTTY;
+	}
+	if (fstat(fd, &fst) != 0)
+		return errno;
+	snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+	n = readlink(link, name, sizeof(name) - 1);
+	if (n > 0) {
+		name[n] = '\0';
+		if (strncmp(name, "/dev/", 5) == 0 && stat(name, &st) == 0 &&
+		    S_ISCHR(st.st_mode) && st.st_rdev == fst.st_rdev)
+			return ttyname_copy(name, buf, len);
+	}
+	rc = ttyname_scan("/dev/pts", fst.st_rdev, buf, len);
+	if (rc < 0)
+		rc = ttyname_scan("/dev", fst.st_rdev, buf, len);
+	if (rc < 0) {
+		errno = ENODEV;
+		return ENODEV;
+	}
+	return rc;
 }
 
 /* getrandom: fill buf with up to buflen cryptographically secure random

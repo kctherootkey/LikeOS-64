@@ -118,6 +118,12 @@ struct devfs_node {
 	const struct device_ops *ops;
 	void *priv; /* driver's node context */
 	int is_dir; /* a directory (ops unused) */
+	/* Read and write for the user logged in on the console as well, the
+	 * seat's user, while that login lasts -- in addition to the mode
+	 * bits, never instead of them.  For a node meant for the person at
+	 * the machine (the GPU's render node), which an ordinary account
+	 * elsewhere -- over the network -- must not get. */
+	int uaccess;
 	int registered;
 	/* When the node appeared, in epoch seconds: what stat() reports as
 	 * its access, modification and change times.  Set at registration. */

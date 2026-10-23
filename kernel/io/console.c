@@ -2527,6 +2527,10 @@ char *kstrncpy(char *dest, const char *src, size_t n)
 	return dest;
 }
 
+/* Equal when the first n characters are.  This returned `n == (size_t)-1'
+ * there, which the loop never leaves n at: once all n matched it compared
+ * the characters AFTER them, so every prefix test of a longer string --
+ * kstrncmp(path, "/dev/", 5) and the rest -- came out unequal. */
 int kstrncmp(const char *s1, const char *s2, size_t n)
 {
 	while (n && *s1 && (*s1 == *s2)) {
@@ -2534,8 +2538,7 @@ int kstrncmp(const char *s1, const char *s2, size_t n)
 		++s2;
 		--n;
 	}
-	return n == (size_t)-1 ? 0 :
-				 *(unsigned char *)s1 - *(unsigned char *)s2;
+	return n == 0 ? 0 : *(unsigned char *)s1 - *(unsigned char *)s2;
 }
 
 int kstrcmp(const char *s1, const char *s2)

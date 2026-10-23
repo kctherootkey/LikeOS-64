@@ -415,6 +415,12 @@ int task_may_access(const task_t *target, int mode)
 		return 0; /* kernel context is privileged by definition */
 	if (capable())
 		return 0; /* root may observe and control anything */
+	/* A process reads its own memory and layout -- the C library finds
+	 * its main thread's stack in its own map -- whatever its set-id past:
+	 * it is the one place that memory is not someone else's. */
+	if (mode == ACCESS_READ_MEM &&
+	    task_mm_owner((task_t *)target) == task_mm_owner(cur))
+		return 0;
 
 	/* Taking control of a process whose privileges were raised by a set-id
 	 * exec is refused outright for the unprivileged caller.  The id
@@ -422,7 +428,8 @@ int task_may_access(const task_t *target, int mode)
 	 * binary that dropped back to the invoking user still holds whatever
 	 * it read while it was privileged, and its memory is what an attacker
 	 * is after. */
-	if (mode == ACCESS_ATTACH && !task_dumpable((task_t *)target))
+	if ((mode == ACCESS_ATTACH || mode == ACCESS_READ_MEM) &&
+	    !task_dumpable((task_t *)target))
 		return -EPERM;
 
 	/* Evaluated against EVERY thread of the target's group, strictest

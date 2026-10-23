@@ -241,7 +241,7 @@ static void drm_console_worker(void *arg)
 			self->wait_channel = (void *)&g_con;
 			self->wakeup_tick =
 				timer_ticks() + (timer_get_frequency() / 20);
-			self->state = TASK_BLOCKED;
+			task_set_blocked(self);
 			sched_schedule();
 			self->wakeup_tick = 0;
 			self->wait_channel = NULL;

@@ -243,6 +243,14 @@ static const struct drm_driver vmw_driver = {
  * connectors probe through the core's probe helper either way
  * (vmw_connector_driver_setup()).  Without VMW_ATOMIC the per-call table is
  * registered as it is. */
+/* The virtual device's 3D: the VM's "Accelerate 3D graphics" setting, the
+ * same answer DRM_VMW_PARAM_3D gives. */
+static int vmw_has_3d(struct drm_device *dev)
+{
+	(void)dev;
+	return g_vmw.has_3d;
+}
+
 static struct drm_driver vmw_registered_driver;
 
 static const struct drm_driver *vmw_driver_table(void)
@@ -250,6 +258,7 @@ static const struct drm_driver *vmw_driver_table(void)
 	struct drm_driver *d = &vmw_registered_driver;
 
 	*d = vmw_driver;
+	d->has_3d = vmw_has_3d;
 #if VMW_ATOMIC
 	d->atomic_check = vmw_atomic_check;
 	d->atomic_commit = vmw_atomic_commit;

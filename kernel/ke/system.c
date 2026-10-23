@@ -5,6 +5,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/rwsem.h>
 #include <kernel/ke/timer.h>
 #include <kernel/io/tty.h>
 #include <kernel/ke/smp.h>
@@ -198,26 +199,36 @@ int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 	{
 		task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
 		task_t *mm = t ? task_mm_owner(t) : NULL;
+		uint64_t gen;
 		int perm;
 
-		if (!t || !mm) {
+		/* Pinned, so it stays allocated once the lock is let go of
+		 * for the walk below. */
+		if (!t || !mm || !sched_task_pin(t)) {
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			if (kbuf)
 				kfree(kbuf);
 			return -ESRCH;
 		}
+		/* The image the decision below is about (exec_gen, sched.h). */
+		gen = __atomic_load_n(&mm->exec_gen, __ATOMIC_SEQ_CST);
 		/* Evaluated across the whole thread group rather than the one
 		 * thread named.  What is being handed out is the layout of an
 		 * address space every thread of the group shares, so the
 		 * weakest thread must not be the way in -- credentials here are
 		 * per-task, so they can differ between siblings (see cred.h). */
-		perm = task_may_access(t, ACCESS_READ);
+		perm = task_may_access(t, ACCESS_READ_MEM);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
 		if (perm != 0) {
-			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			sched_task_unpin(t);
 			if (kbuf)
 				kfree(kbuf);
 			return perm;
 		}
+		/* The walk under the address space's own lock: the region
+		 * table is reallocated -- moved -- when it grows, and its
+		 * records change, under the write side of it. */
+		mm_read_lock(&mm->mmap_lock);
 		kinfo.pid = (int)t->id;
 		kinfo.tgid = t->tgid;
 		kinfo.brk_start = mm->brk_start;
@@ -250,8 +261,19 @@ int64_t sys_getprocmaps(uint64_t pid, uint64_t info_ptr,
 				count++;
 			}
 		}
+		mm_read_unlock(&mm->mmap_lock);
+		/* An exec in between: the layout of an image the check was not
+		 * about.  None of it. */
+		perm = __atomic_load_n(&mm->exec_gen, __ATOMIC_SEQ_CST) != gen ?
+			       -EACCES :
+			       0;
+		sched_task_unpin(t);
+		if (perm != 0) {
+			if (kbuf)
+				kfree(kbuf);
+			return perm;
+		}
 	}
-	spin_unlock_irqrestore(&g_task_list_lock, flags);
 
 	ret = count;
 	if (copy_to_user((void *)info_ptr, &kinfo, sizeof(kinfo)) < 0)

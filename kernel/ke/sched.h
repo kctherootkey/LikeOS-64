@@ -445,6 +445,11 @@ typedef struct mmap_region {
 	 * tracker from whichever record they meet.  NULL for mappings
 	 * nothing watches.  See mm_dirty_ops in mm/memory.h. */
 	const struct mm_dirty_ops *dev_dirty;
+	/* A shared mapping of a descriptor that was not opened for writing:
+	 * it may never be made writable (mprotect refuses), as it could not
+	 * be mapped writable in the first place (mmap refuses).  Carried by
+	 * splits, forks and mremap with the rest of the record. */
+	bool no_write;
 } mmap_region_t;
 
 /* The user's registers as syscall_entry leaves them on the kernel stack.
@@ -696,6 +701,14 @@ typedef struct task {
 	uint64_t
 		kernel_stack_top; // Kernel stack for syscalls/interrupts (for user tasks)
 	void *kernel_stack_base; // Kernel stack allocation base (for freeing)
+
+	/* Which program image the address space holds: raised by exec before
+	 * the old image goes and before a new one -- or new credentials --
+	 * exist (exec.c).  On the address-space owner (task_mm_owner()).
+	 * Someone reading this process's memory from outside notes it before
+	 * deciding they may, and discards what they read if it moved: the
+	 * decision was about the image that was there (procfs). */
+	volatile uint64_t exec_gen;
 
 	// Process credentials: real/effective/saved uid+gid, fs ids, groups.
 	// Inherited across fork/clone via the task-struct memcpy; fresh tasks
@@ -1263,6 +1276,20 @@ void sched_run_ready(void);
  * Called once, at the end of init, and never returns. */
 void sched_bsp_park(void);
 task_t *sched_current(void);
+
+/* Mark `t' (the caller) as going to sleep, as a full memory barrier.
+ *
+ * Every sleeper publishes TASK_BLOCKED and THEN looks at the condition it
+ * waits for; every waker publishes the condition and THEN looks at the
+ * state.  On x86 a plain store may sit in the store buffer while the load
+ * after it is answered from memory, so both sides can read the other's old
+ * value: the sleeper sees no event, the waker sees a running task and wakes
+ * nobody, and the task sleeps through the event until something unrelated
+ * wakes it.  A sequentially consistent store (xchg) closes that window. */
+static inline void task_set_blocked(task_t *t)
+{
+	__atomic_store_n(&t->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+}
 int sched_has_user_tasks(void); // Check if any user tasks are running
 
 /* Owner of the address-space bookkeeping (mmap_regions, brk, mmap_base).
@@ -1434,6 +1461,9 @@ void sched_defer_reap(
 task_t *sched_find_task_by_id(uint32_t pid); // Find task by PID
 task_t *sched_find_task_by_id_locked(
 	uint32_t pid);
+/* Session `sid' loses `tty' as its controlling terminal: every member that
+ * has it.  Caller holds g_task_list_lock. */
+void sched_session_drop_tty_locked(int sid, struct tty *tty);
 task_t *sched_find_next_task_by_id_locked(uint32_t min_id); // Find task by PID (caller holds g_task_list_lock)
 task_t *sched_task_by_canary(
 	uint64_t canary); // Crash diagnostic: lock-free, __stack_chk_fail only

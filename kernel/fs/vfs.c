@@ -257,6 +257,17 @@ int vfs_check_access(const char *path, const struct kstat *st, int want,
 	return vfs_perm_access(path, st, want, use_real);
 }
 
+/* The owning filesystem's own access decision for `path' (its ->permission
+ * hook): ST_OK, a refusal, or ST_UNSUPPORTED when it has none or defers. */
+int vfs_fs_permission(const char *path, unsigned long ino, int want)
+{
+	const vfs_ops_t *o = vfs_ops_for_path(path);
+
+	if (!o || !o->permission)
+		return ST_UNSUPPORTED;
+	return o->permission(path, ino, want);
+}
+
 /* Return `path` made absolute in `buf` by joining the current task cwd when it
  * is relative (else `path` unchanged).  The VFS permission helpers below walk
  * the path textually and assume an absolute path; some syscalls hand the VFS a
@@ -614,9 +625,12 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 			return tr;
 		int acc = flags & 3;
 		int want = 0;
-		if (acc == O_RDONLY || acc == O_RDWR)
+		/* Access mode 3 opens for ioctls only, and needs read AND
+		 * write permission for it -- it is not a way around both:
+		 * read() and write() refuse such a descriptor (read_write.c). */
+		if (acc == O_RDONLY || acc == O_RDWR || acc == 3)
 			want |= MAY_READ;
-		if (acc == O_WRONLY || acc == O_RDWR)
+		if (acc == O_WRONLY || acc == O_RDWR || acc == 3)
 			want |= MAY_WRITE;
 		if (flags & O_TRUNC)
 			want |= MAY_WRITE;

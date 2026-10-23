@@ -70,7 +70,7 @@ static void vbw_wait(struct wait_queue_head *wq, int (*done)(void *), void *arg,
 	}
 	cur->wait_channel = wq;
 	cur->wakeup_tick = timer_ticks() + timer_ms_to_ticks(slice_ms) + 1;
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 	local_irq_restore(fl);
 	sched_schedule();
 	/* A deadline left armed is claimed by whatever this task waits on

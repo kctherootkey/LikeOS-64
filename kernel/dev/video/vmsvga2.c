@@ -101,7 +101,7 @@ static void svga_mutex_lock(svga_mutex_t *m)
 		// tty_read).
 		m->waiters++;
 		cur->wait_channel = (void *)m;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_unlock_irqrestore(&m->lock, f);
 		sched_schedule();
 		spin_lock_irqsave(&m->lock, &f);

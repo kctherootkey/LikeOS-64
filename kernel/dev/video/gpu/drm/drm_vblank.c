@@ -917,10 +917,21 @@ static int vbl_wait_until(struct drm_device *dev, int crtc, uint64_t target,
 		uint64_t fl = local_irq_save();
 		wq_entry_init(&we, cur);
 		wq_add(&dev->vbl_wq, &we);
-		if (vbl_still_waiting(dev, crtc, target)) {
-			cur->wait_channel = &dev->vbl_wq;
-			cur->wakeup_tick = timer_ticks() + timer_ms_to_ticks(50) + 1;
-			cur->state = TASK_BLOCKED;
+		/* Blocked first, the counter looked at second: a vblank
+		 * counted on another processor between a look and the state
+		 * store would find this task still running, wake nothing, and
+		 * leave it asleep until the 50ms cap.  Undone with a
+		 * compare-and-swap, since a waker may already have claimed
+		 * the task. */
+		cur->wait_channel = &dev->vbl_wq;
+		cur->wakeup_tick = timer_ticks() + timer_ms_to_ticks(50) + 1;
+		task_set_blocked(cur);
+		task_state_t expected = TASK_BLOCKED;
+		if (vbl_still_waiting(dev, crtc, target) ||
+		    !__atomic_compare_exchange_n(&cur->state, &expected,
+						 TASK_RUNNING, false,
+						 __ATOMIC_ACQ_REL,
+						 __ATOMIC_ACQUIRE)) {
 			local_irq_restore(fl);
 			sched_schedule();
 			/* Disarm.  A deadline outlives the wait that set it:
@@ -937,6 +948,8 @@ static int vbl_wait_until(struct drm_device *dev, int crtc, uint64_t target,
 			cur->wakeup_tick = 0;
 			cur->wait_channel = NULL;
 		} else {
+			cur->wakeup_tick = 0;
+			cur->wait_channel = NULL;
 			local_irq_restore(fl);
 		}
 		wq_remove(&dev->vbl_wq, &we);

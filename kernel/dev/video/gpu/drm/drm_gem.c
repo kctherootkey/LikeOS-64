@@ -294,7 +294,7 @@ static void gem_reap_thread(void *arg)
 			self->wait_channel = (void *)&g_reap_dev;
 			self->wakeup_tick = timer_ticks() +
 					    timer_ms_to_ticks(2) + 1;
-			self->state = TASK_BLOCKED;
+			task_set_blocked(self);
 			sched_schedule();
 			self->wakeup_tick = 0;
 			self->wait_channel = NULL;

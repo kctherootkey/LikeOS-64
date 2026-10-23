@@ -399,7 +399,7 @@ int hrtimer_sleep_until(uint64_t abs_ns, uint64_t *remaining_ns)
 		/* Belt and braces: the periodic tick wakes it too, one tick
 		 * late, should the comparator ever be missed. */
 		cur->wakeup_tick = timer_ticks() + timer_ns_to_ticks(abs_ns - now) + 2;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		hrtimer_start(&w.timer, abs_ns);
 		local_irq_restore(flags);
 

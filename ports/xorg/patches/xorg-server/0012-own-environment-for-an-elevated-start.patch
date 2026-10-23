@@ -1,0 +1,50 @@
+Start a setuid-root server with an environment of its own.
+
+The libraries the server loads while it is still root read the environment
+for debugging and tuning, and the C library's set-id protection covers only the
+loader's own variables: Mesa, loaded by glamor before the server drops root,
+opens the file GALLIUM_TRACE names for writing -- as root, so
+`GALLIUM_TRACE=/etc/shadow startx' truncated any file on the system.  The
+server needs nothing from the caller's environment; for an elevated start it
+is cleared before anything runs and PATH is set to the system's.  A server
+started by root is unchanged.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/dix/main.c
++++ b/dix/main.c
+@@ -155,6 +155,25 @@
+ }
+ 
+ /*
++ * A server started with root's rights by someone else runs with an
++ * environment of its own, not the caller's.  The libraries it loads while it
++ * is still root read the environment for debugging and tuning -- Mesa, loaded
++ * by glamor, opens the file GALLIUM_TRACE names for writing, as root -- and
++ * the C library's set-id protection covers only the loader's own variables.
++ * The server itself needs none of it: everything it reads comes from its
++ * command line and its configuration.  So all of it goes, before anything
++ * runs, and PATH is set to the system's.
++ */
++static void
++likeosSanitizeEnvironment(void)
++{
++    if (!likeosPrivsElevated())
++        return;
++    if (clearenv() != 0 || setenv("PATH", "/usr/bin:/bin", 1) != 0)
++        FatalError("cannot reset the environment\n");
++}
++
++/*
+  * Only the user logged in on the console may start the server with root's
+  * rights -- upstream's Xorg.wrap rule (allowed_users=console).  The server
+  * takes the keyboard, the mouse and the display, which belong to whoever is
+@@ -294,6 +313,8 @@
+ 
+     display = "0";
+ 
++    likeosSanitizeEnvironment();
++
+     InitRegions();
+ 
+     CheckUserParameters(argc, argv, envp);

@@ -412,7 +412,7 @@ static void gt_worker(void *arg)
 		}
 		cur->wait_channel = &i915->gt_wq;
 		cur->wakeup_tick = timer_ticks() + timer_ms_to_ticks(GT_WORKER_NAP_MS) + 1;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		local_irq_restore(fl);
 		sched_schedule();
 		cur->wakeup_tick = 0;

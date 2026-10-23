@@ -107,7 +107,7 @@ static long signalfd_read(vfs_file_t *f, void *buf, long bytes, int nonblock)
 		wq_add(wq, &we);
 		if (!signalfd_any_pending(cur, &c->mask)) {
 			cur->wait_channel = c;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			local_irq_restore(fl);
 			sched_schedule();
 		} else {

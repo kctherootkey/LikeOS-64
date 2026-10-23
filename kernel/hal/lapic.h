@@ -158,6 +158,8 @@ void lapic_clockevent_program(uint64_t hrtimer_next_ns);
 /* Is `cpu''s local timer running one-shot (high-resolution timers go to
  * its own queue)? */
 bool lapic_clockevent_ready(uint32_t cpu);
+/* Which local timer the one-shot tick runs on, for the boot log. */
+const char *lapic_tick_mode_name(void);
 /* The calling CPU's: a timer-vector interrupt is then its local timer's. */
 bool lapic_timer_is_event_source(void);
 

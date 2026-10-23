@@ -266,6 +266,14 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 	}
 	uint64_t now = timer_ticks();
 	uint64_t wake = 0; /* no deadline: sleep until notified */
+	/* The tick count is advanced by one processor's tick and can stand
+	 * behind the clock; a tick deadline taken from it then reads as passed
+	 * while the timeout itself is still ahead, and this poller would spin
+	 * through the rest of it instead of sleeping.  Only the nanosecond
+	 * deadline ends a wait early; the tick is its backstop. */
+	if (have_deadline && deadline_ticks <= now &&
+	    hrtimer_now_ns() < deadline_ns)
+		deadline_ticks = now + 1;
 	if (!pt || pt->unregistered)
 		wake = now + 1; /* fallback: re-scan next tick */
 	if (have_deadline && (wake == 0 || deadline_ticks < wake))
@@ -278,7 +286,7 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 	__atomic_fetch_add(&g_poll_sleepers, 1, __ATOMIC_ACQ_REL);
 	cur->wait_channel = (void *)&g_poll_io_ready;
 	cur->wakeup_tick = wake;
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 
 	/* Re-check AFTER publishing TASK_BLOCKED, which is the whole point of
 	 * the ordering: a producer that bumps the counter from here on finds

@@ -1,0 +1,107 @@
+Start a setuid-root server only for the user logged in on the console.
+
+Upstream's Xorg.wrap rule (allowed_users=console): the server takes the
+keyboard, the mouse and the display, which belong to whoever is at the
+machine.  Without it any account -- one logged in over the network included --
+could start the setuid server, grab the input devices and read what is typed
+at the console.  The kernel names the console user in /sys/kernel/console_user
+(the uid of the console session's login shell).  And, as the wrapper asks,
+the server has to be started from the console itself: one of its standard
+descriptors is the console.  Being the console user is not enough -- the same
+account logged in over the network as well could otherwise start a server on
+the machine's display from there.  A server started by root is not elevated
+and is not asked.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/dix/main.c
++++ b/dix/main.c
+@@ -139,6 +139,10 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
+ #include <string.h>
+ 
+ /*
+@@ -153,6 +157,68 @@
+ }
+ 
+ /*
++ * Only the user logged in on the console may start the server with root's
++ * rights -- upstream's Xorg.wrap rule (allowed_users=console).  The server
++ * takes the keyboard, the mouse and the display, which belong to whoever is
++ * at the machine; any other account -- one logged in over the network -- has
++ * no business grabbing them, and without this could, and could read every
++ * keystroke typed at the console while it held them.
++ *
++ * The kernel names that user: /sys/kernel/console_user holds the uid of the
++ * console session's login shell, and nothing when there is none.  A server
++ * started by root is not elevated and is not asked.
++ */
++/*
++ * Is `fd' the console: /dev/console (5:1) or a virtual console (major 4)?
++ */
++static int
++likeosOnConsole(int fd)
++{
++    struct stat st;
++
++    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
++        return 0;
++    return (major(st.st_rdev) == 5 && minor(st.st_rdev) == 1) ||
++        major(st.st_rdev) == 4;
++}
++
++static void
++likeosRequireConsoleUser(void)
++{
++    char buf[32];
++    char *end;
++    ssize_t n;
++    long uid;
++    int fd;
++
++    if (!likeosPrivsElevated())
++        return;
++    /* Started from the console itself, as upstream's wrapper asks: one of
++     * the standard descriptors is the console.  Being the user logged in
++     * there is not enough -- the same account logged in over the network
++     * as well would otherwise start a server on the machine's display. */
++    if (!likeosOnConsole(STDIN_FILENO) && !likeosOnConsole(STDOUT_FILENO) &&
++        !likeosOnConsole(STDERR_FILENO))
++        FatalError("Only console users are allowed to run the X server\n");
++    fd = open("/sys/kernel/console_user", O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        FatalError("cannot tell who is logged in on the console: %s\n",
++                   strerror(errno));
++    n = read(fd, buf, sizeof(buf) - 1);
++    close(fd);
++    if (n <= 0)
++        FatalError("Only the user logged in on the console may start "
++                   "the X server (nobody is)\n");
++    buf[n] = '\0';
++    errno = 0;
++    uid = strtol(buf, &end, 10);
++    if (errno != 0 || end == buf || (*end != '\0' && *end != '\n') ||
++        uid < 0 || (uid_t) uid != getuid())
++        FatalError("Only the user logged in on the console may start "
++                   "the X server\n");
++}
++
++/*
+  * Take on the invoking user's identity for one operation.  Returns whether it
+  * changed anything, which is what likeosEuidRestore() needs to know.
+  *
+@@ -257,6 +323,8 @@
+ 
+     CheckUserAuthorization();
+ 
++    likeosRequireConsoleUser();
++
+     ProcessCommandLine(argc, argv);
+ 
+     alwaysCheckForInput[0] = 0;

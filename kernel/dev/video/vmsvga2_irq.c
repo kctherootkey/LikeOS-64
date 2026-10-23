@@ -668,7 +668,7 @@ static void svga_irq_park(struct wait_queue_head *wq, int (*cond)(void *),
 	fl = local_irq_save();
 	cur->wait_channel = wq;
 	cur->wakeup_tick = timer_ticks() + ticks;
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 	done = cond(arg);
 	if (done) {
 		task_state_t expected = TASK_BLOCKED;

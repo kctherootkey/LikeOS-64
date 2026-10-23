@@ -218,6 +218,24 @@ struct vfs_file {
 	char *at_path;
 };
 
+/* What a descriptor was opened for, from its access mode alone: read with
+ * O_RDONLY or O_RDWR, write with O_WRONLY or O_RDWR.  Access mode 3 is for
+ * ioctls and gives neither; O_APPEND is where a write goes, not leave to
+ * write.  The open checked exactly this much (vfs_open_common()). */
+static inline int file_may_read(const struct vfs_file *f)
+{
+	int acc = f->flags & 3;
+
+	return acc == 0 /* O_RDONLY */ || acc == 2 /* O_RDWR */;
+}
+
+static inline int file_may_write(const struct vfs_file *f)
+{
+	int acc = f->flags & 3;
+
+	return acc == 1 /* O_WRONLY */ || acc == 2 /* O_RDWR */;
+}
+
 // File descriptor flags
 #define FD_CLOEXEC 0x1
 
@@ -336,6 +354,8 @@ int vfs_permission_remove(const char *path);
  * the ACL then the mode bits.  `use_real` selects real vs effective/fs ids. */
 int vfs_check_access(const char *path, const struct kstat *st, int want,
 		     int use_real);
+/* The owning filesystem's ->permission hook alone (ST_UNSUPPORTED: none). */
+int vfs_fs_permission(const char *path, unsigned long ino, int want);
 
 /* Flush the root filesystem's pending metadata + journal to disk (sync(2)).
  * No-op when the root fs provides no sync op.  fs-independent. */

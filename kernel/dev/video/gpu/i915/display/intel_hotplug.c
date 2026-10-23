@@ -579,7 +579,7 @@ static void hpd_worker(void *arg)
 			continue;
 		}
 		cur->wait_channel = &d->hpd_wq;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		local_irq_restore(fl);
 		sched_schedule();
 		cur->wait_channel = NULL;

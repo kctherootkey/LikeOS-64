@@ -8,6 +8,7 @@
 #include <kernel/io/console.h>
 #include <kernel/mm/slab.h>
 #include <kernel/ke/syscall.h>
+#include <kernel/fs/namei.h>
 #include <kernel/ke/timer.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/pipe.h>
@@ -739,7 +740,7 @@ int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 			udp_cur->wait_channel = (void *)&s->udp_rx_ready;
 			udp_cur->wakeup_tick = deadline; /* 0 = no timeout */
 			__atomic_thread_fence(__ATOMIC_SEQ_CST);
-			udp_cur->state = TASK_BLOCKED;
+			task_set_blocked(udp_cur);
 			__atomic_thread_fence(__ATOMIC_SEQ_CST);
 			if (s->udp_rx_ready) {
 				task_state_t expected = TASK_BLOCKED;
@@ -1059,7 +1060,7 @@ again:
 				 * peer went silent slept forever. */
 				cur->wakeup_tick = deadline;
 				__atomic_thread_fence(__ATOMIC_SEQ_CST);
-				cur->state = TASK_BLOCKED;
+				task_set_blocked(cur);
 				__atomic_thread_fence(__ATOMIC_SEQ_CST);
 				/* Re-check after marking blocked.  If the waker fired
                  * between the first check and now, rx_ready / state will
@@ -1787,8 +1788,10 @@ void raw_socket_deliver(uint32_t src_ip, uint32_t dst_ip, uint8_t protocol,
 		s->udp_rx_ready = 1;
 
 		spin_unlock_irqrestore(&s->lock, flags);
-		/* Wake a receiver parked on this RAW socket (see sock_recvfrom). */
+		/* Wake a receiver parked on this RAW socket (see sock_recvfrom),
+		 * and whoever polls it. */
 		sched_wake_channel((void *)&s->udp_rx_ready);
+		poll_notify_wq(&s->poll_wq);
 	}
 }
 
@@ -1874,6 +1877,9 @@ void sock_post_icmp_error(uint8_t proto, uint32_t src_ip, uint16_t src_port,
 		 * would sleep through the failure until its timeout. */
 		if (wanted_type == SOCK_DGRAM)
 			sched_wake_channel((void *)&s->udp_rx_ready);
+		/* ...and a poller: the socket is now readable and in error --
+		 * a non-blocking connect() waiting for POLLOUT included. */
+		poll_notify_wq(&s->poll_wq);
 	}
 }
 
@@ -2768,6 +2774,12 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 		ret = -EINVAL;
 		goto out;
 	}
+	/* A file is read through a descriptor opened for reading only: the
+	 * open checked the file's permissions for the mode it was asked. */
+	if (!file_may_read(in_file)) {
+		ret = -EBADF;
+		goto out;
+	}
 
 	// ---- Resolve out_fd ----
 	if (out_fd < 0 || out_fd >= TASK_MAX_FDS) {
@@ -2804,7 +2816,12 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 		   (!out_entry && (out_fd == 1 || out_fd == 2))) {
 		out_is_console = 1;
 	} else if (out_entry && out_marker > 3 && !IS_EPOLL_FD(out_entry)) {
-		// Regular file - handled by the else branch in the write loop
+		// Regular file - handled by the else branch in the write loop.
+		// Written only through a descriptor opened for writing.
+		if (!file_may_write(out_entry)) {
+			ret = -EBADF;
+			goto out;
+		}
 	} else {
 		ret = -EBADF;
 		goto out;
@@ -2895,6 +2912,7 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 					spin_unlock_irqrestore(&pp->lock,
 							       pflags);
 					sched_wake_channel(pp);
+					poll_notify_wq(&pp->poll_wq);
 					sched_schedule();
 					continue;
 				}
@@ -2913,6 +2931,7 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 				pp->used += todo;
 				spin_unlock_irqrestore(&pp->lock, pflags);
 				sched_wake_channel(pp);
+				poll_notify_wq(&pp->poll_wq);
 				nw = (long)todo;
 			} else if (out_is_console) {
 				tty_t *tty = cur->ctty ? cur->ctty :
@@ -2924,6 +2943,12 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 				nw = vfs_write(out_entry,
 					       sendfile_buf + written,
 					       (long)((size_t)nread - written));
+				/* Writing drops the set-user/-group-ID bits
+				 * for a non-privileged caller, as write()
+				 * does (read_write.c). */
+				if (nw > 0 && cur->cred.euid != 0 &&
+				    !vfs_setid_clean(out_entry))
+					strip_setid_file(out_entry);
 			}
 			if (nw <= 0) {
 				if (nw < 0)

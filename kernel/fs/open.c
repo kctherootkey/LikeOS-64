@@ -560,6 +560,11 @@ static int64_t ftruncate_held(task_t *cur, vfs_file_t *f, uint64_t length)
 	 * rest, and dereferencing a marker here would fault the kernel. */
 	if (fd_is_special(f))
 		return -EINVAL;
+	/* Truncating is writing: only through a descriptor opened for it.
+	 * The open checked the file's permissions for the mode asked, and a
+	 * descriptor opened for reading proves nothing about writing. */
+	if (!file_may_write(f))
+		return -EINVAL;
 	int r = vfs_truncate(f, (unsigned long)length);
 	/* Truncating contents drops set-id bits for a non-privileged caller,
      * same as write() (see strip_setid_file for the once-per-inode fast-path). */

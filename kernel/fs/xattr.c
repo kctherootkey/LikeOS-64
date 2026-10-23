@@ -268,6 +268,11 @@ static int64_t fsetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint6
 			if (vfs_fstat(f, &st) == ST_OK &&
 			    (uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
+		} else if (!file_may_write(f)) {
+			/* user.* and the rest want write permission on the
+			 * file (sys_setxattr); through a descriptor, that is
+			 * one opened for writing, which the open checked. */
+			return -EACCES;
 		}
 	}
 	uint8_t *kval = 0;
@@ -352,6 +357,9 @@ int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 
 static int64_t flistxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_list, uint64_t size)
 {
+	/* As fsetxattr_held(): a marker has no inode. */
+	if (fd_is_special(f))
+		return -EOPNOTSUPP;
 	if (size == 0) {
 		int r = vfs_flistxattr(f, 0, 0);
 		return (r >= 0) ? r : vfs_status_to_errno(r);
@@ -389,6 +397,10 @@ int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 
 static int64_t fremovexattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name)
 {
+	/* An extended attribute belongs to an inode; a marker has none, and
+	 * passing one to the VFS would dereference it. */
+	if (fd_is_special(f))
+		return -EOPNOTSUPP;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
 	if (c)
@@ -403,6 +415,8 @@ static int64_t fremovexattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name)
 			if (vfs_fstat(f, &st) == ST_OK &&
 			    (uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
+		} else if (!file_may_write(f)) {
+			return -EACCES; /* as fsetxattr_held() */
 		}
 	}
 	int r = vfs_fremovexattr(f, kname);

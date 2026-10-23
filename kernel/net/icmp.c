@@ -286,7 +286,7 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 			if (remaining > timeout_ticks)
 				remaining = 0; // underflow guard
 			cur->wakeup_tick = timer_ticks() + remaining;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			sched_schedule();
 			cur->wait_channel = NULL;
 			cur->wakeup_tick = 0;

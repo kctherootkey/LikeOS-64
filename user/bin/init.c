@@ -54,6 +54,7 @@
 #include <time.h>
 #include <sys/wait.h>
 #include <sys/reboot.h>
+#include <sys/stat.h>
 
 #define INITTAB      "/etc/inittab"
 #define GETTY_PATH   "/sbin/getty"
@@ -426,6 +427,131 @@ static void export_timezone(void)
 	fclose(f);
 }
 
+/* The machine id: 128 random bits naming this installation, written once
+ * as 32 lower-case hex digits to /etc/machine-id and kept for good.  D-Bus
+ * refuses to start a bus without one, and it has to be made by root: an
+ * account's first `startx' cannot write /etc or /var/lib.  So it is made
+ * here, at the first boot, as the image ships none.  An id D-Bus already
+ * recorded in /var/lib/dbus/machine-id is taken over rather than replaced,
+ * and that file becomes a link to /etc/machine-id, so there is one id. */
+#define MACHINE_ID      "/etc/machine-id"
+#define MACHINE_ID_TMP  "/etc/machine-id.tmp"
+#define DBUS_DIR        "/var/lib/dbus"
+#define DBUS_MACHINE_ID DBUS_DIR "/machine-id"
+
+/* 32 lower-case hex digits and a newline, or nothing else. */
+static int read_machine_id(const char *path, char id[33])
+{
+	char buf[40];
+	ssize_t n;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, sizeof(buf));
+	close(fd);
+	if (n != 33 || buf[32] != '\n')
+		return -1;
+	for (int i = 0; i < 32; i++)
+		if (!((buf[i] >= '0' && buf[i] <= '9') ||
+		      (buf[i] >= 'a' && buf[i] <= 'f')))
+			return -1;
+	/* All zeros is "no id", not an id. */
+	if (strspn(buf, "0") == 32)
+		return -1;
+	memcpy(id, buf, 32);
+	id[32] = '\0';
+	return 0;
+}
+
+static int new_machine_id(char id[33])
+{
+	static const char hex[] = "0123456789abcdef";
+	unsigned char b[16];
+	ssize_t n;
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, b, sizeof(b));
+	close(fd);
+	if (n != (ssize_t)sizeof(b))
+		return -1;
+	/* Formatted as a version 4 (random) UUID, like every other id of
+	 * its kind. */
+	b[6] = (unsigned char)((b[6] & 0x0f) | 0x40);
+	b[8] = (unsigned char)((b[8] & 0x3f) | 0x80);
+	for (int i = 0; i < 16; i++) {
+		id[2 * i] = hex[b[i] >> 4];
+		id[2 * i + 1] = hex[b[i] & 15];
+	}
+	id[32] = '\0';
+	return 0;
+}
+
+static int write_machine_id(const char id[33])
+{
+	char line[33];
+	int fd;
+
+	memcpy(line, id, 32);
+	line[32] = '\n';
+	unlink(MACHINE_ID_TMP);
+	fd = open(MACHINE_ID_TMP, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+		  0444);
+	if (fd < 0)
+		return -1;
+	if (write(fd, line, sizeof(line)) != (ssize_t)sizeof(line) ||
+	    fsync(fd) != 0) {
+		close(fd);
+		unlink(MACHINE_ID_TMP);
+		return -1;
+	}
+	close(fd);
+	if (rename(MACHINE_ID_TMP, MACHINE_ID) != 0) {
+		unlink(MACHINE_ID_TMP);
+		return -1;
+	}
+	return 0;
+}
+
+static void setup_machine_id(void)
+{
+	char id[33];
+	struct stat st;
+
+	if (read_machine_id(MACHINE_ID, id) != 0) {
+		if ((lstat(DBUS_MACHINE_ID, &st) != 0 || !S_ISREG(st.st_mode) ||
+		     read_machine_id(DBUS_MACHINE_ID, id) != 0) &&
+		    new_machine_id(id) != 0) {
+			fprintf(stderr, "init: no random bytes for %s\n",
+				MACHINE_ID);
+			return;
+		}
+		if (write_machine_id(id) != 0) {
+			fprintf(stderr, "init: cannot write %s: %s\n",
+				MACHINE_ID, strerror(errno));
+			return;
+		}
+	}
+	if (mkdir(DBUS_DIR, 0755) != 0 && errno != EEXIST)
+		return;
+	/* Not already the link, and not a different id of its own: D-Bus
+	 * must see the same id as everything reading /etc/machine-id. */
+	if (lstat(DBUS_MACHINE_ID, &st) == 0) {
+		char cur[33];
+
+		if (S_ISLNK(st.st_mode) ||
+		    (read_machine_id(DBUS_MACHINE_ID, cur) == 0 &&
+		     strcmp(cur, id) == 0))
+			return;
+		unlink(DBUS_MACHINE_ID);
+	}
+	if (symlink(MACHINE_ID, DBUS_MACHINE_ID) != 0)
+		fprintf(stderr, "init: cannot link %s: %s\n", DBUS_MACHINE_ID,
+			strerror(errno));
+}
+
 int main(void)
 {
 	int i;
@@ -438,6 +564,7 @@ int main(void)
 	setenv("PATH", PATH_DEFAULT, 1);
 	setenv("LANG", LANG_DEFAULT, 1);
 	export_timezone();
+	setup_machine_id();
 
 	load_inittab();
 

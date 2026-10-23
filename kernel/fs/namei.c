@@ -10,6 +10,7 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/namei.h>
 #include <kernel/fs/file.h>
+#include <kernel/io/tty.h>
 
 /*
  * Resolve a path against THIS task's working directory (and chroot), in place.
@@ -107,6 +108,14 @@ int perm_access(task_t *cur, const char *path, const struct kstat *st,
 		int want, int use_real)
 {
 	(void)cur; /* the VFS reads the current task's credentials itself */
+	/* A device node's own grant first: devfs gives the user logged in on
+	 * the console read and write on the seat's nodes (devfs_permission()).
+	 * It only ever grants, so it is asked here, on the path every open
+	 * and access() of a /dev node takes, and nowhere else -- every other
+	 * filesystem's decision stays the ACL and the mode bits. */
+	if (kstrncmp(path, "/dev/", 5) == 0 &&
+	    vfs_fs_permission(path, (unsigned long)st->st_ino, want) == ST_OK)
+		return 0;
 	return perm_st_errno(vfs_check_access(path, st, want, use_real));
 }
 
@@ -127,6 +136,24 @@ int perm_traverse_cred(const char *rawpath, int use_real)
 static int perm_check_parent(const char *rawpath, int want)
 {
 	return perm_st_errno(vfs_permission_parent(rawpath, want));
+}
+
+/* Creating a name: the ancestors must be searchable -- finding the name takes
+ * that -- then a name that is already there is EEXIST, and only then is write
+ * permission on the parent asked for.  Whether a name exists is not a
+ * question of being allowed to create it: `mkdir -p /var/lib/dbus' run by an
+ * account that may not write /var/lib has to learn that the directory is
+ * there, not that it may not make it. */
+static int perm_check_create(const char *rawpath)
+{
+	struct kstat st;
+	int tr = perm_traverse(rawpath);
+
+	if (tr < 0)
+		return tr;
+	if (vfs_lstat(rawpath, &st) == ST_OK)
+		return -EEXIST;
+	return perm_check_parent(rawpath, MAY_WRITE | MAY_EXEC);
 }
 
 /* Remove/rename gate: parent write+search plus the directory's sticky-bit rule.
@@ -160,13 +187,22 @@ int devfs_open_perm(task_t *cur, const char *path, uint64_t flags)
 {
 	if (cur->cred.euid == 0)
 		return 0;
+	/* /dev/tty is the caller's controlling terminal, and a caller without
+	 * one has none to open.  devfs falls back to the console for root;
+	 * for anyone else that fallback would be the console's keyboard and
+	 * screen, to a process the console has nothing to do with -- any
+	 * account's setsid()'d process, a network login's included. */
+	if (kstrcmp(path, "/dev/tty") == 0 &&
+	    (!cur->ctty || cur->ctty->sid != cur->sid))
+		return -ENXIO;
 	int tr = perm_traverse(path);
 	if (tr < 0)
 		return tr;
 	int want = 0, acc = (int)(flags & 3);
-	if (acc == O_RDONLY || acc == O_RDWR)
+	/* Access mode 3 (ioctls only) needs both, as in vfs_open_common(). */
+	if (acc == O_RDONLY || acc == O_RDWR || acc == 3)
 		want |= MAY_READ;
-	if (acc == O_WRONLY || acc == O_RDWR)
+	if (acc == O_WRONLY || acc == O_RDWR || acc == 3)
 		want |= MAY_WRITE;
 	if (flags & O_TRUNC)
 		want |= MAY_WRITE;
@@ -288,8 +324,7 @@ int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 	if (cret != 0)
 		return cret;
 
-	int pr = perm_check_parent(kpath,
-				   MAY_WRITE | MAY_EXEC); /* write the dir */
+	int pr = perm_check_create(kpath);
 	if (pr < 0)
 		return pr;
 	/* umask applies to directories too; the raw mode was being passed
@@ -403,8 +438,13 @@ int64_t sys_link(uint64_t oldpath, uint64_t newpath)
 	c = canon_task_path(knew, sizeof(knew));
 	if (c)
 		return c;
-	int pr = perm_check_parent(
-		knew, MAY_WRITE | MAY_EXEC); /* write the new dir */
+	/* The existing name is looked up first: a missing one is ENOENT
+	 * whatever the new name is. */
+	struct kstat ost;
+	int lr = vfs_lstat(kold, &ost);
+	if (lr != ST_OK)
+		return vfs_status_to_errno(lr);
+	int pr = perm_check_create(knew);
 	if (pr < 0)
 		return pr;
 	int r = vfs_link(kold, knew);
@@ -430,8 +470,7 @@ int64_t sys_symlink(uint64_t target, uint64_t linkpath)
 	c = canon_task_path(klink, sizeof(klink));
 	if (c)
 		return c;
-	int pr = perm_check_parent(
-		klink, MAY_WRITE | MAY_EXEC); /* write the new dir */
+	int pr = perm_check_create(klink);
 	if (pr < 0)
 		return pr;
 	int r = vfs_symlink(ktarget, klink);

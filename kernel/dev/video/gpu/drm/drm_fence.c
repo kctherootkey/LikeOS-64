@@ -635,11 +635,6 @@ static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 
 		wq_entry_init(&we, cur);
 		wq_add(&f->wq, &we);
-		if (f->signaled) {
-			local_irq_restore(fl);
-			wq_remove(&f->wq, &we);
-			break;
-		}
 		cur->wait_channel = f;
 		/* Sleep, and ask again on waking: the fence interrupt is not
 		 * available on every host, and where it is missing this is the
@@ -661,7 +656,29 @@ static int fence_wait_do(struct drm_fence *f, uint64_t timeout_ns, int intr)
 		} else {
 			cur->wakeup_tick = timer_ticks() + 1;
 		}
-		cur->state = TASK_BLOCKED;
+		/* Blocked first, the fence looked at second: a signalling on
+		 * another processor between a look and the state store would
+		 * find this task still running and wake nothing.  Undone with
+		 * a compare-and-swap, since a waker may already have claimed
+		 * the task. */
+		task_set_blocked(cur);
+		{
+			task_state_t expected = TASK_BLOCKED;
+
+			if (f->signaled &&
+			    __atomic_compare_exchange_n(&cur->state, &expected,
+							TASK_RUNNING, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				local_irq_restore(fl);
+				if (highres)
+					hrtimer_cancel(&poll_timer);
+				cur->wakeup_tick = 0;
+				cur->wait_channel = NULL;
+				wq_remove(&f->wq, &we);
+				break;
+			}
+		}
 		local_irq_restore(fl);
 		sched_schedule();
 		if (highres)
@@ -994,15 +1011,6 @@ int drm_fence_wait_any_timeout(struct drm_fence **fences, uint32_t count,
 			wq_entry_init(&we[i], cur);
 			wq_add(&fences[i]->wq, &we[i]);
 		}
-		for (uint32_t i = 0; i < count && !done; i++)
-			if (fences[i]->signaled)
-				done = 1;
-		if (done) {
-			local_irq_restore(fl);
-			for (uint32_t i = 0; i < count; i++)
-				wq_remove(&fences[i]->wq, &we[i]);
-			continue;
-		}
 		cur->wait_channel = fences[0];
 		if (highres) {
 			hrtimer_start(&poll_timer, now + poll_ns);
@@ -1011,7 +1019,29 @@ int drm_fence_wait_any_timeout(struct drm_fence **fences, uint32_t count,
 		} else {
 			cur->wakeup_tick = timer_ticks() + 1;
 		}
-		cur->state = TASK_BLOCKED;
+		/* Blocked first, the fences looked at second: see
+		 * fence_wait_do(). */
+		task_set_blocked(cur);
+		for (uint32_t i = 0; i < count && !done; i++)
+			if (fences[i]->signaled)
+				done = 1;
+		if (done) {
+			task_state_t expected = TASK_BLOCKED;
+
+			if (__atomic_compare_exchange_n(&cur->state, &expected,
+							TASK_RUNNING, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				local_irq_restore(fl);
+				if (highres)
+					hrtimer_cancel(&poll_timer);
+				cur->wakeup_tick = 0;
+				cur->wait_channel = NULL;
+				for (uint32_t i = 0; i < count; i++)
+					wq_remove(&fences[i]->wq, &we[i]);
+				continue;
+			}
+		}
 		local_irq_restore(fl);
 		sched_schedule();
 		if (highres)

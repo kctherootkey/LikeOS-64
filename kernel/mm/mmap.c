@@ -407,6 +407,8 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	/* One exit, so the backing file's hold is released however this
 	 * answers.  Anonymous mappings leave it NULL and release nothing. */
 	vfs_file_t *backing = NULL;
+	/* Shared, through a descriptor not open for writing: see below. */
+	bool shared_ro = false;
 	int64_t ret;
 
 	task_t *cur = sched_current();
@@ -462,6 +464,57 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		}
 	}
 
+	bool is_anonymous = !given &&
+			    ((flags & MAP_ANONYMOUS) || (int64_t)fd == -1);
+
+	/* Resolve and validate the backing file up front (also needed for the
+	 * lazy path) -- before a MAP_FIXED request tears down what is mapped
+	 * there, so a refused call leaves the old mapping alone.  Only real VFS files can back a mapping — socket/pipe/
+	 * epoll fd markers and stdio placeholders cannot. */
+	if (given) {
+		/* Held for the rest of the call like a looked-up one; fdput
+		 * releases the hold either way. */
+		vfs_incref(given);
+		backing = given;
+		fd = (uint64_t)-1;
+	} else if (!is_anonymous) {
+		/* Held for the rest of the call.  The region records built
+		 * below take their own reference, but between this lookup and
+		 * that point the descriptor can be closed by a sibling thread
+		 * -- and then the reference is taken on a file that has already
+		 * been released. */
+		backing = fdget(caller, (int)fd);
+		if (!backing) {
+			ret = -EBADF;
+			goto out;
+		}
+		if (fd_is_special(backing)) {
+			ret = -ENODEV;
+			goto out;
+		}
+		/* A mapping is access through the descriptor, and gets no
+		 * more than the descriptor was opened for: reading for any
+		 * mapping, writing for a shared one that may write -- its
+		 * stores reach the object every other opener sees.  Only the
+		 * open checked the file's permissions, and only for the mode
+		 * it was asked. */
+		/* Shared regardless of what was asked: a device, the
+		 * framebuffer and a shared-memory object are mapped by their
+		 * real pages, MAP_PRIVATE or not (below). */
+		bool really_shared = (flags & MAP_SHARED) ||
+				     devfs_shm_object(backing) ||
+				     devfs_is_fb0(backing) ||
+				     device_file_ops(backing);
+
+		if (!file_may_read(backing) ||
+		    (really_shared && (prot & PROT_WRITE) &&
+		     !file_may_write(backing))) {
+			ret = -EACCES;
+			goto out;
+		}
+		shared_ro = really_shared && !file_may_write(backing);
+	}
+
 	// Determine virtual address
 	uint64_t vaddr;
 	if (flags & MAP_FIXED_NOREPLACE) {
@@ -488,7 +541,8 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	}
 	if (flags & MAP_FIXED) {
 		if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
-			return -EINVAL; // Invalid fixed address
+			ret = -EINVAL; // Invalid fixed address
+			goto out;
 		}
 		// Security: Reject mappings below 64KB to prevent NULL deref exploits
 		if (addr < 0x10000) {
@@ -571,35 +625,6 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		page_flags |= PAGE_NO_EXECUTE;
 	}
 
-	bool is_anonymous = !given &&
-			    ((flags & MAP_ANONYMOUS) || (int64_t)fd == -1);
-
-	/* Resolve and validate the backing file up front (also needed for the
-	 * lazy path).  Only real VFS files can back a mapping — socket/pipe/
-	 * epoll fd markers and stdio placeholders cannot. */
-	if (given) {
-		/* Held for the rest of the call like a looked-up one; fdput
-		 * releases the hold either way. */
-		vfs_incref(given);
-		backing = given;
-		fd = (uint64_t)-1;
-	} else if (!is_anonymous) {
-		/* Held for the rest of the call.  The region records built
-		 * below take their own reference, but between this lookup and
-		 * that point the descriptor can be closed by a sibling thread
-		 * -- and then the reference is taken on a file that has already
-		 * been released. */
-		backing = fdget(caller, (int)fd);
-		if (!backing) {
-			ret = -EBADF;
-			goto out;
-		}
-		if (fd_is_special(backing)) {
-			ret = -ENODEV;
-			goto out;
-		}
-	}
-
 	/* Device mapping: /dev/fb0 maps the framebuffer BAR itself.  Pages
 	 * are mapped eagerly with PAGE_DEVICE PTEs (never freed back to the
 	 * physical allocator, shared across fork) and write-combining
@@ -644,8 +669,10 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			 * the inline limit and never touched this path. */
 			uint64_t obj_span = (sobj->size + PAGE_SIZE - 1) &
 					    ~(uint64_t)(PAGE_SIZE - 1);
-			if (offset + length > obj_span)
-				return -EINVAL; /* past the object's pages */
+			if (offset + length > obj_span) {
+				ret = -EINVAL; /* past the object's pages */
+				goto out;
+			}
 
 			/* Nothing is mapped here: the mapping is a lazy device
 			 * mapping, and each page is entered by the demand-fault
@@ -674,6 +701,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			region->offset = offset;
 			region->lazy = true;
 			region->file = backing;
+			region->no_write = shared_ro;
 			region->device = true;
 			region->device_phys = 0;
 			region->dev_obj = sobj;
@@ -719,6 +747,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->offset = offset;
 		region->lazy = false;
 		region->file = backing;
+		region->no_write = shared_ro;
 		region->device = true;
 		region->device_phys = dev_phys;
 		region->in_use = true;
@@ -769,6 +798,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 				region->offset = offset;
 				region->lazy = true;
 				region->file = backing;
+				region->no_write = shared_ro;
 				region->device = true;
 				region->device_phys = 0;
 				region->dev_obj = dm.obj;
@@ -814,6 +844,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			region->offset = offset;
 			region->lazy = false;
 			region->file = backing;
+			region->no_write = shared_ro;
 			region->device = true;
 			region->device_phys = dm.page_phys(dm.obj, 0);
 			region->dev_obj = dm.obj;
@@ -862,6 +893,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->offset = offset;
 		region->lazy = true;
 		region->file = backing;
+		region->no_write = shared_ro;
 		region->in_use = true;
 		mm_merge_region_neighbours(cur, region);
 		ret = (int64_t)vaddr;

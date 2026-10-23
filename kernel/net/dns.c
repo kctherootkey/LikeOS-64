@@ -136,7 +136,7 @@ static int dns_wait_reply(dns_slot_t *slot, uint64_t deadline)
 		cur->wait_channel = (void *)&slot->ready;
 		cur->wakeup_tick = deadline;
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
 		if (slot->ready) {
 			task_state_t expected = TASK_BLOCKED;

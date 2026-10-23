@@ -720,11 +720,9 @@ uint64_t timer_get_precise_us(void)
  * those stalls together (a minute, measured).  So, the way the hypervisor's
  * guest tools keep a guest's clock, the host's own wall clock is read
  * through its backdoor (lapic_host_time_us) right after the clock is set
- * up and every 2 seconds after that:
+ * up and every minute after that (timer_host_time_sync_poll()):
  *
  *  - a difference of a second or more, or the first reading, is stepped;
- *    the check runs every 2 seconds of TICK time -- the tick follows real
- *    time while the TSC lags, so a lag cannot stretch the interval too;
  *  - anything smaller is slewed in at 500 parts per million, so the clock
  *    never jumps, never runs backwards, and a correction of a few
  *    milliseconds takes a few seconds.
@@ -735,7 +733,7 @@ uint64_t timer_get_precise_us(void)
  * The three values are published under a sequence counter: a reader takes
  * a consistent snapshot without a lock, from any context. */
 #define RT_SLEW_PPM 500ULL
-#define RT_SYNC_INTERVAL_S 2ULL
+#define RT_SYNC_INTERVAL_S 60ULL
 
 static volatile uint32_t g_rt_seq;
 static int64_t g_rt_adj_ns;
@@ -825,17 +823,12 @@ static void timer_host_time_sync(int announce)
 	mag = diff < 0 ? -diff : diff;
 	if (mag > 86400LL * 1000000000LL)
 		return; /* not a clock this one can be compared with */
-	/* The firmware's boot time is never that far off: a first difference
-	 * of more than half an hour means the host answered in some other
-	 * time scale (a local zone), and it is not taken. */
-	if (!g_rt_synced && mag > 1800LL * 1000000000LL) {
-		kprintf("Timer: hypervisor time differs by %lld s from the boot time; not used\n",
-			(long long)(diff / 1000000000LL));
-		g_rt_synced = -1;
-		return;
-	}
-	if (g_rt_synced < 0)
-		return;
+	/* The host's clock is UTC (GETTIMEFULL is defined that way); the
+	 * boot time is the firmware's real-time clock read as UTC, which it
+	 * need not be: a virtual machine whose clock the hypervisor keeps in
+	 * the host's local time -- what VMware does for some guest types --
+	 * boots hours off.  So a large first difference is the firmware's
+	 * zone, and the host's time is taken like any other. */
 	/* Fold what has been slewed in so far into the fixed part. */
 	adj = g_rt_adj_ns + rt_slewed(g_rt_slew_ns, g_rt_slew_start_ns, mono);
 	if (!g_rt_synced || mag >= 1000000000LL) {
@@ -860,8 +853,15 @@ static void timer_host_time_sync(int announce)
 	rt_update(adj, slew, mono);
 }
 
-/* From the boot CPU's tick, counted in ticks (see above). */
-static void timer_host_time_sync_tick(void)
+/* Once a minute, from a kernel thread with interrupts on (kdevpoll), never
+ * from the timer interrupt: asking the host is a call into the hypervisor's
+ * own process, which on VMware's own monitor can be busy -- with the 3D
+ * renderer, for one -- and a processor held in that call with interrupts off
+ * took no timer interrupt and no device interrupt meanwhile.  Every two
+ * seconds that held the boot processor, which takes every device interrupt,
+ * often enough to put typed characters on the screen late.  A minute is the
+ * guest tools' own cadence; the slew corrects what drifts in between. */
+void timer_host_time_sync_poll(void)
 {
 	static uint64_t next_sync_tick;
 
@@ -1297,8 +1297,8 @@ void timer_calibrate_frequency(void)
 	 * timeout counted in ticks came out 1.8 times too long.  Only the TSC
 	 * frequency may still need the HPET, where nothing states it. */
 	if (lapic_clockevent_ready(0)) {
-		kprintf("Timer: tick at %u Hz (one-shot local timer; set, not measured)\n",
-			g_frequency);
+		kprintf("Timer: tick at %u Hz (one-shot local timer, %s; set, not measured)\n",
+			g_frequency, lapic_tick_mode_name());
 		if (!lapic_tsc_is_reliable())
 			(void)timer_calibrate_tsc_hz_from_hpet();
 		timer_enable_reliable_tsc_precise_time();
@@ -1618,8 +1618,6 @@ void timer_irq_handler(int from_user)
 		// Wake any tasks whose sleep timer has expired and check signal timers
 		// This handles alarm(), itimer, and wakes sleeping tasks
 		sched_wake_expired_sleepers(g_ticks);
-		/* The wall clock against the host's, every half minute. */
-		timer_host_time_sync_tick();
 		/* High-resolution timers: the only expiry path without an HPET
 		 * comparator, and the safety net with one. */
 		hrtimer_tick();

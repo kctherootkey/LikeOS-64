@@ -372,10 +372,18 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		if (pid == 0) {
-			int slave = open(slavename, O_RDWR);
-			if (opt_new_session)
-				setsid();
-			ioctl(slave, TIOCSCTTY, 0);
+			/* The pseudo-terminal is the shell's controlling
+			 * terminal, and only a session leader can have one:
+			 * a session of its own whatever -c asked for, as the
+			 * terminal is new and nothing else is in it. */
+			setsid();
+			int slave = open(slavename, O_RDWR | O_NOCTTY);
+			if (slave < 0 || ioctl(slave, TIOCSCTTY, 1) != 0) {
+				fprintf(stderr, "su: cannot take %s: %s\n",
+					slavename ? slavename : "pty",
+					strerror(errno));
+				_exit(127);
+			}
 			dup2(slave, 0);
 			dup2(slave, 1);
 			dup2(slave, 2);

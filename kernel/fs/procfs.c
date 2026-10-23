@@ -46,23 +46,61 @@ static int parse_pid(const char *s, int *out)
 }
 
 /* A process is listed when it is a thread-group leader the caller may see. */
+/* The task with id `pid', pinned (sched_task_pin()) so that it stays
+ * allocated while the caller reads it -- it can exit and be reaped the
+ * moment the task list's lock is let go of.  NULL when there is none or it
+ * is hidden.  Every caller declares its pointer with PROC_TASK, which unpins
+ * it however the caller returns. */
 static task_t *proc_task(int pid)
 {
-	task_t *t = sched_find_task_by_id(pid);
+	uint64_t fl;
+	task_t *t;
 
-	if (!t || sched_task_hidden(t))
-		return NULL;
+	spin_lock_irqsave(&g_task_list_lock, &fl);
+	t = sched_find_task_by_id_locked((uint32_t)pid);
+	if (t && (sched_task_hidden(t) || !sched_task_pin(t)))
+		t = NULL;
+	spin_unlock_irqrestore(&g_task_list_lock, fl);
 	return t;
+}
+
+static void proc_task_release(task_t **tp)
+{
+	if (*tp)
+		sched_task_unpin(*tp);
+}
+
+#define PROC_TASK(v) task_t *v __attribute__((cleanup(proc_task_release)))
+
+/* task_may_access() for a task from proc_task(), under the task list's
+ * lock: it walks the task's thread group, and the pin keeps the task and
+ * its leader, not the other threads. */
+static int proc_may_access(task_t *t, int mode)
+{
+	uint64_t fl;
+	int r;
+
+	spin_lock_irqsave(&g_task_list_lock, &fl);
+	r = task_may_access(t, mode);
+	spin_unlock_irqrestore(&g_task_list_lock, fl);
+	return r;
+}
+
+/* The image generation of t's address space, read before the access check
+ * (exec_gen, sched.h). */
+static uint64_t proc_exec_gen(task_t *t)
+{
+	return __atomic_load_n(&task_mm_owner(t)->exec_gen, __ATOMIC_SEQ_CST);
 }
 
 /* ---- /proc/<pid>/... files ---- */
 
 static long show_cmdline(struct pfs_node *n, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
 	long p = 0;
 
-	if (!t || task_may_access(t, ACCESS_READ) != 0)
+	if (!t || proc_may_access(t, ACCESS_READ) != 0)
 		return 0;
 	/* argv joined by spaces in the kernel; the file wants NUL
 	 * separators. */
@@ -78,7 +116,7 @@ static long show_cmdline(struct pfs_node *n, char *buf, long cap)
 
 static long show_comm(struct pfs_node *n, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
 
 	if (!t)
 		return 0;
@@ -104,7 +142,7 @@ static const char *state_letter(task_t *t)
 
 static long show_stat(struct pfs_node *n, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
 
 	if (!t)
 		return 0;
@@ -122,7 +160,7 @@ static long show_stat(struct pfs_node *n, char *buf, long cap)
 
 static long show_status(struct pfs_node *n, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
 	long p = 0;
 
 	if (!t)
@@ -143,14 +181,25 @@ static long show_status(struct pfs_node *n, char *buf, long cap)
 
 static long show_maps(struct pfs_node *n, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
 	long p = 0;
+	uint64_t gen;
 
-	if (!t || task_may_access(t, ACCESS_READ) != 0)
+	if (!t)
+		return 0;
+	gen = proc_exec_gen(t);
+	if (proc_may_access(t, ACCESS_READ_MEM) != 0)
 		return 0;
 	task_t *mm = task_mm_owner(t);
-	if (!mm || !mm->mmap_regions)
+	if (!mm)
 		return 0;
+	/* Under the address space's lock: the table is reallocated -- moved
+	 * -- when it grows, and its records change, under the write side. */
+	mm_read_lock(&mm->mmap_lock);
+	if (!mm->mmap_regions) {
+		mm_read_unlock(&mm->mmap_lock);
+		return 0;
+	}
 	for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
 		mmap_region_t *r = &mm->mmap_regions[i];
 
@@ -168,6 +217,10 @@ static long show_maps(struct pfs_node *n, char *buf, long cap)
 			       (r->flags & MAP_SHARED) ? 's' : 'p',
 			       (unsigned long long)r->offset, path);
 	}
+	mm_read_unlock(&mm->mmap_lock);
+	/* The layout of an image the check was not about: none of it. */
+	if (proc_exec_gen(t) != gen)
+		return 0;
 	return p;
 }
 
@@ -179,10 +232,10 @@ static long show_maps(struct pfs_node *n, char *buf, long cap)
  * second field, and its relief logger subtracts the third. */
 static long show_statm(struct pfs_node *n, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
 	uint64_t size = 0, resident;
 
-	if (!t || task_may_access(t, ACCESS_READ) != 0)
+	if (!t || proc_may_access(t, ACCESS_READ) != 0)
 		return 0;
 	task_t *mm = task_mm_owner(t);
 	if (!mm)
@@ -240,9 +293,13 @@ extern int64_t ptrace_xfer_mem(task_t *mm, uint64_t addr, void *kbuf,
  * This is the same data by the name a debugger actually looks for. */
 static long show_auxv(struct pfs_node *n, uint64_t off, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
+	uint64_t gen;
 
-	if (!t || task_may_access(t, ACCESS_READ) != 0)
+	if (!t)
+		return -EACCES;
+	gen = proc_exec_gen(t);
+	if (proc_may_access(t, ACCESS_READ_MEM) != 0)
 		return -EACCES;
 	task_t *mm = task_mm_owner(t);
 
@@ -257,19 +314,35 @@ static long show_auxv(struct pfs_node *n, uint64_t off, char *buf, long cap)
 
 	uint64_t avail = mm->auxv_len - off;
 	long want = (avail < (uint64_t)cap) ? (long)avail : cap;
+	/* Through a kernel bounce, so that what was read can still be thrown
+	 * away when the image changed under the read (exec_gen). */
+	char vec[512];
 
+	if (want > (long)sizeof(vec))
+		want = (long)sizeof(vec);
 	mm_read_lock(&mm->mmap_lock);
-	int64_t r = ptrace_xfer_mem(mm, mm->auxv_addr + off, buf, (size_t)want,
+	int64_t r = ptrace_xfer_mem(mm, mm->auxv_addr + off, vec, (size_t)want,
 				    false);
 	mm_read_unlock(&mm->mmap_lock);
-	return r == 0 ? want : -EIO;
+	if (r != 0)
+		return -EIO;
+	if (proc_exec_gen(t) != gen)
+		return -EACCES;
+	smap_disable();
+	mm_memcpy(buf, vec, (size_t)want);
+	smap_enable();
+	return want;
 }
 
 static long show_mem(struct pfs_node *n, uint64_t off, char *buf, long cap)
 {
-	task_t *t = proc_task((int)n->arg2);
+	PROC_TASK(t) = proc_task((int)n->arg2);
+	uint64_t gen;
 
-	if (!t || task_may_access(t, ACCESS_READ) != 0)
+	if (!t)
+		return -EACCES;
+	gen = proc_exec_gen(t);
+	if (proc_may_access(t, ACCESS_READ_MEM) != 0)
 		return -EACCES;
 	task_t *mm = task_mm_owner(t);
 
@@ -295,6 +368,11 @@ static long show_mem(struct pfs_node *n, uint64_t off, char *buf, long cap)
 					    (size_t)chunk, false);
 		mm_read_unlock(&mm->mmap_lock);
 		if (r != 0)
+			break;
+		/* Read across an exec: an image the check was not about --
+		 * a set-id program's, perhaps.  Thrown away unseen, and the
+		 * read ends here. */
+		if (proc_exec_gen(t) != gen)
 			break;
 		smap_disable();
 		mm_memcpy(buf + done, page, (size_t)chunk);
@@ -338,10 +416,11 @@ static void fd_target(task_t *t, int fd, char *out, size_t cap)
 static int fd_list(struct pfs_node *dir, unsigned index, char *name, long cap,
 		   int *type)
 {
-	task_t *t = proc_task((int)dir->arg2);
+	PROC_TASK(t) = proc_task((int)dir->arg2);
 	unsigned seen = 0;
 
-	if (!t)
+	/* What a process has open is its private state, as its memory is. */
+	if (!t || proc_may_access(t, ACCESS_READ_MEM) != 0)
 		return 0;
 	for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
 		if (!task_fds(t)[fd] && !task_fd_is_console(t, fd))
@@ -357,14 +436,14 @@ static int fd_list(struct pfs_node *dir, unsigned index, char *name, long cap,
 
 static struct pfs_node *fd_lookup(struct pfs_node *dir, const char *name)
 {
-	task_t *t = proc_task((int)dir->arg2);
+	PROC_TASK(t) = proc_task((int)dir->arg2);
 	int fd;
 
 	if (!t || !parse_pid(name, &fd) || fd >= TASK_MAX_FDS)
 		return NULL;
 	if (!task_fds(t)[fd] && !task_fd_is_console(t, fd))
 		return NULL;
-	if (task_may_access(t, ACCESS_READ) != 0)
+	if (proc_may_access(t, ACCESS_READ_MEM) != 0)
 		return NULL;
 	struct pfs_node *n = pfs_node_new(dir->fs, dir, name, PFS_LINK);
 	if (!n)
@@ -393,7 +472,7 @@ static int pid_list(struct pfs_node *dir, unsigned index, char *name,
 static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 {
 	int pid = (int)dir->arg2;
-	task_t *t = proc_task(pid);
+	PROC_TASK(t) = proc_task(pid);
 
 	if (!t)
 		return NULL;
@@ -402,9 +481,16 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 		n = pfs_node_new(dir->fs, dir, name, PFS_DIR);
 		if (n)
 			pfs_set_dynamic(n, fd_list, fd_lookup);
-	} else if (kstrcmp(name, "exe") == 0) {
+	} else if (kstrcmp(name, "exe") == 0 || kstrcmp(name, "cwd") == 0) {
+		/* Where a process runs from and what it runs: private, like
+		 * its memory, and only for those who may read that. */
+		if (proc_may_access(t, ACCESS_READ_MEM) != 0)
+			return NULL;
 		n = pfs_node_new(dir->fs, dir, name, PFS_LINK);
-		if (n) {
+		if (n && kstrcmp(name, "cwd") == 0) {
+			ksnprintf(n->link, sizeof(n->link), "%s",
+				  t->cwd[0] ? t->cwd : "/");
+		} else if (n) {
 			/* argv[0] is the best record of the image there is. */
 			size_t k = 0;
 			while (t->cmdline[k] && t->cmdline[k] != ' ' &&
@@ -414,11 +500,6 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 			}
 			n->link[k] = 0;
 		}
-	} else if (kstrcmp(name, "cwd") == 0) {
-		n = pfs_node_new(dir->fs, dir, name, PFS_LINK);
-		if (n)
-			ksnprintf(n->link, sizeof(n->link), "%s",
-				  t->cwd[0] ? t->cwd : "/");
 	} else if (kstrcmp(name, "cmdline") == 0) {
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n)
@@ -478,8 +559,17 @@ static int root_list(struct pfs_node *dir, unsigned index, char *name,
 	(void)dir;
 
 	for (int pid = 1; pid < g_next_id; pid++) {
-		task_t *t = sched_find_task_by_id(pid);
-		if (!t || sched_task_hidden(t) || t->tgid != t->id)
+		uint64_t fl;
+		int show;
+
+		/* Read under the lock: the task can be freed once it is let
+		 * go of. */
+		spin_lock_irqsave(&g_task_list_lock, &fl);
+		task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
+
+		show = t && !sched_task_hidden(t) && t->tgid == t->id;
+		spin_unlock_irqrestore(&g_task_list_lock, fl);
+		if (!show)
 			continue;
 		if (seen++ == index) {
 			ksnprintf(name, (size_t)cap, "%d", pid);
@@ -502,8 +592,14 @@ static struct pfs_node *root_lookup(struct pfs_node *dir, const char *name)
 				  kstrcmp(name, "self") == 0 ? cur->tgid : cur->id);
 		return n;
 	}
-	if (!parse_pid(name, &pid) || !proc_task(pid))
+	if (!parse_pid(name, &pid))
 		return NULL;
+	{
+		PROC_TASK(t) = proc_task(pid);
+
+		if (!t)
+			return NULL;
+	}
 	struct pfs_node *n = pfs_node_new(dir->fs, dir, name, PFS_DIR);
 	if (!n)
 		return NULL;

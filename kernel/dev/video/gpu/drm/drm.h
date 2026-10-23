@@ -1078,6 +1078,9 @@ struct drm_driver {
 	/* Optional: called once the root filesystem is mounted, for the
 	 * parts of bring-up that need a file (firmware) or a thread. */
 	int (*late_init)(struct drm_device *dev);
+	/* Optional: does the device render 3D itself (1) or not (0)?  What
+	 * /sys/class/drm/cardN/has_3d says.  Absent: not. */
+	int (*has_3d)(struct drm_device *dev);
 
 	/* KMS */
 	int (*mode_set)(struct drm_device *dev, struct drm_crtc *crtc,

@@ -58,7 +58,7 @@ void fat32_io_lock(void)
 		}
 		if (cur) {
 			cur->wait_channel = (void *)&fat32_io_locked;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 		}
 		spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
 		sched_schedule();

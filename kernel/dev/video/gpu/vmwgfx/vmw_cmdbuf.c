@@ -461,7 +461,7 @@ static void cb_slot_sleep(struct vmw_device *v)
 		hrtimer_start(&poll_timer, hrtimer_now_ns() + VMW_SLOT_POLL_NS);
 	else
 		cur->wakeup_tick = timer_ticks() + 1;
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 	local_irq_restore(fl);
 	sched_schedule();
 	if (highres)
@@ -1404,28 +1404,42 @@ uint32_t vmw_cmd_fence_emit(struct vmw_device *v)
 	seq = vmsvga2_fence_alloc();
 	if (seq) {
 		if (v->pend_len) {
-			/* TAG the buffer the work is already in, rather than
-			 * handing that buffer over and then a second one
-			 * carrying eight bytes of SVGA_CMD_FENCE.
+			/* The fence COMMAND goes into the stream after the
+			 * work it stands for, and the buffer it ends is tagged
+			 * with its sequence.
 			 *
-			 * Nothing here ever reads the device's fence
-			 * register -- vmw_fence_check() says why, at length --
-			 * so the FENCE COMMAND was never what told this driver
-			 * the fence had passed.  The COMPLETION of the buffer
-			 * is (cb_slot_completed), and the slot carries the
-			 * sequence out of band.  So the command was pure cost:
-			 * a whole second command buffer, a second pair of
-			 * doorbell register writes, and a second exit to the
-			 * host, for every submission -- and a submission is
-			 * every execbuf, eight to twelve a frame.
+			 * The tag alone is what this driver reads: completion
+			 * of the buffer is what tells it the fence has passed
+			 * (cb_slot_completed).  The command is for the host.
+			 * It was dropped here as pure cost -- and where VMware
+			 * runs its own monitor, with a renderer that does not
+			 * finish and show queued work until something asks for
+			 * its completion, a screen update then waited for
+			 * whatever command came next: typing showed late, by up
+			 * to a quarter of a second, and a blinking cursor
+			 * blinked unevenly.  Every fenced batch ends in one
+			 * again.
 			 *
-			 * It is also more accurate this way.  The fence now
-			 * passes when the batch it stands for completes,
-			 * instead of when a buffer queued behind that batch
-			 * does. */
-			v->pend_fence_seq = seq;
-			if (pend_flush_locked(v) != 0)
-				seq = 0;
+			 * A fence is no DX context's command, so a batch built
+			 * for one is handed over first; the context executes
+			 * its buffers in order, so the fence still passes only
+			 * after it. */
+			cmd[0] = SVGA_CMD_FENCE;
+			cmd[1] = seq;
+			if (v->pend_dx != SVGA3D_INVALID_ID ||
+			    v->pend_len + sizeof(cmd) > VMW_PEND_BYTES) {
+				if (pend_flush_locked(v) != 0)
+					seq = 0;
+			}
+			if (seq) {
+				mm_memcpy(v->pend + v->pend_len, cmd,
+					  sizeof(cmd));
+				v->pend_len += (uint32_t)sizeof(cmd);
+				v->pend_dx = SVGA3D_INVALID_ID;
+				v->pend_fence_seq = seq;
+				if (pend_flush_locked(v) != 0)
+					seq = 0;
+			}
 		} else {
 			/* Nothing gathered: everything this fence stands for
 			 * has already gone, so it needs a buffer of its own to

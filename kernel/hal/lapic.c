@@ -1016,6 +1016,18 @@ bool lapic_timer_is_event_source(void)
 	return g_tick_mode != TICK_PERIODIC && g_ce_running[lapic_tick_slot()];
 }
 
+const char *lapic_tick_mode_name(void)
+{
+	switch (g_tick_mode) {
+	case TICK_TSC_DEADLINE:
+		return "TSC deadline";
+	case TICK_PERIODIC:
+		return "periodic";
+	default:
+		return "count-down";
+	}
+}
+
 /* Is this CPU's local timer running one-shot (the clock-event device)? */
 bool lapic_clockevent_ready(uint32_t cpu)
 {

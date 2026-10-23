@@ -92,6 +92,15 @@ int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 	if (!tty) {
 		return -ENOTTY;
 	}
+	/* The rules of TIOCSPGRP (tty.c): the caller's own controlling
+	 * terminal, still its session's, and a group of that session. */
+	if (!capable() && (cur->ctty != tty || tty->sid != cur->sid))
+		return -EPERM;
+	if ((int64_t)pgrp < 0)
+		return -EINVAL;
+	if (pgrp > 0 && tty->sid > 0 &&
+	    sched_pgrp_in_session((int)pgrp, tty->sid) < 0)
+		return -EPERM;
 	tty->fg_pgid = (int)pgrp;
 	return 0;
 }

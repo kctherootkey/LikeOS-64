@@ -487,13 +487,43 @@ void vmw_du_dirty(struct vmw_device *v, struct vmw_display_unit *du,
 	/* Whatever fails below is reported (vmw_dirty_not_shown()), never
 	 * returned. */
 	if (vmw_stdu_unit_defined(v, unit, NULL, NULL)) {
-		for (uint32_t i = 0; i < n; i++) {
-			rc = vmw_stdu_unit_present(v, unit, fb, rects[i].x1,
-						   rects[i].y1, rects[i].x2,
-						   rects[i].y2, 0);
-			if (rc)
-				vmw_dirty_not_shown(&rects[i], rc);
+		/* One update of the rectangles' bounding box, not one per
+		 * rectangle.  Each update is a command buffer of its own and
+		 * a present on the host, in order, with a handful of buffers
+		 * in flight: a host that paces every present to its own
+		 * display refresh turned a redraw of a dozen rectangles into
+		 * a dozen refresh periods -- a quarter of a second before
+		 * the X server, waiting for a free buffer, read the next key
+		 * press. */
+		struct drm_mode_rect_k box;
+
+		if (n == 0)
+			return;
+		box = rects[0];
+		for (uint32_t i = 1; i < n; i++) {
+			if (rects[i].x1 < box.x1)
+				box.x1 = rects[i].x1;
+			if (rects[i].y1 < box.y1)
+				box.y1 = rects[i].y1;
+			if (rects[i].x2 > box.x2)
+				box.x2 = rects[i].x2;
+			if (rects[i].y2 > box.y2)
+				box.y2 = rects[i].y2;
 		}
+		uint32_t fseq = 0;
+
+		rc = vmw_stdu_unit_present(v, unit, fb, box.x1, box.y1,
+					   box.x2, box.y2, 0);
+		if (rc)
+			vmw_dirty_not_shown(&box, rc);
+		/* And a fence behind it, which hands the update over with it:
+		 * the host shows an update once it is asked for its completion,
+		 * not when it merely has it (see vmw_cmd_fence_emit()).  Without
+		 * a fence the update is handed over all the same. */
+		if (!rc)
+			fseq = vmw_cmd_fence_emit(v);
+		if (!fseq)
+			vmw_cmd_flush(v);
 		return;
 	}
 	if (n == 0)

@@ -817,6 +817,48 @@ $(SCREEN_STAMP): FORCE | $(BUILD_DIR)
 FORCE:
 .PHONY: FORCE
 
+# ---------------------------------------------------------------------------
+# make ADD_USER=<name>: the image comes with an ordinary account <name>,
+# password "likeos", made the way adduser(8) makes one on the running system:
+# the first free uid from 1000, a group of its own (gid = uid when free), no
+# further groups, /bin/bash, a home directory /home/<name> (0755) seeded from
+# the image's /etc/skel and owned by the account, and the password hashed as
+# passwd(1) hashes it -- yescrypt, by LikeOS's own libcrypt built for this
+# host (HOST_CRYPT), so the system checks it with the code that made it.
+# Change the password with passwd after the first login.
+# ---------------------------------------------------------------------------
+ADD_USER ?=
+ADD_USER_PASSWORD = likeos
+ifneq ($(strip $(ADD_USER)),)
+  ifneq ($(shell printf '%s' '$(strip $(ADD_USER))' | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$$' && echo ok),ok)
+    $(error ADD_USER must be a user name: lower-case letters, digits, '_' and '-', starting with a letter or '_', at most 32 characters)
+  endif
+  ifneq ($(shell cut -d: -f1 res/etc/passwd | grep -qx '$(strip $(ADD_USER))' && echo taken),)
+    $(error ADD_USER=$(strip $(ADD_USER)) is already an account of the image (res/etc/passwd))
+  endif
+endif
+
+# The image is rebuilt when ADD_USER changes, as for the screen flags.
+ADD_USER_STAMP = $(BUILD_DIR)/.add_user
+$(ADD_USER_STAMP): FORCE | $(BUILD_DIR)
+	@echo '$(strip $(ADD_USER))' | cmp -s - $@ || \
+		echo '$(strip $(ADD_USER))' > $@
+
+# The host-side password hasher (host/likeos-crypt.c):
+# LikeOS's yescrypt compiled for the build machine.  The include directory
+# holds LikeOS's crypt.h alone, so the host's own is not picked up in its
+# place; everything else comes from the host's C library.
+HOST_CRYPT = $(BUILD_DIR)/hosttools/likeos-crypt
+HOST_CRYPT_SRC = host/likeos-crypt.c user/lib/libcrypt/crypt.c \
+	user/lib/libcrypt/yescrypt-common.c user/lib/libcrypt/yescrypt-ref.c \
+	user/lib/libcrypt/sha256.c user/lib/libcrypt/insecure_memzero.c
+$(HOST_CRYPT): $(HOST_CRYPT_SRC) user/lib/libc/include/crypt.h | $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/hosttools/include
+	cp user/lib/libc/include/crypt.h $(BUILD_DIR)/hosttools/include/crypt.h
+	$(GCC) -O2 -Wall -Wno-cpp -include sys/random.h \
+		-I$(BUILD_DIR)/hosttools/include -Iuser/lib/libcrypt \
+		-o $@ $(HOST_CRYPT_SRC)
+
 # Compile kernel source files
 $(BUILD_DIR)/init.o: $(KERNEL_DIR)/ke/init.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -2469,7 +2511,8 @@ $(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_
 # fakeroot (root-owned).  The ext4 partition is auto-sized to the staged
 # content so the image stays small and builds fast; override with EXT4_MB=.
 # ---------------------------------------------------------------------------
-$(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
+$(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
+	$(if $(strip $(ADD_USER)),$(HOST_CRYPT)) | $(BUILD_DIR)
 	@echo "Assembling ext4 root staging tree from build artifacts..."
 	rm -rf $(EXT4_STAGING)
 	mkdir -p $(EXT4_STAGING)/boot $(EXT4_STAGING)/bin $(EXT4_STAGING)/sbin \
@@ -2834,6 +2877,32 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# Signature file selects this device as the OS root; sample text file
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(EXT4_STAGING)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(EXT4_STAGING)/HELLO.TXT
+	# make ADD_USER=<name>: the account adduser would make (see ADD_USER
+	# above), after everything else has gone into /etc/skel.  Its files
+	# are given to the account inside the fakeroot that builds the file
+	# system, below.
+	@set -e; \
+	if [ -n "$(strip $(ADD_USER))" ]; then \
+	  st=$(EXT4_STAGING); user="$(strip $(ADD_USER))"; \
+	  uid=1000; \
+	  while cut -d: -f3 $$st/etc/passwd | grep -qx $$uid; do uid=$$((uid + 1)); done; \
+	  gid=$$uid; \
+	  while cut -d: -f3 $$st/etc/group | grep -qx $$gid; do gid=$$((gid + 1)); done; \
+	  hash=$$(printf '%s' '$(ADD_USER_PASSWORD)' | $(HOST_CRYPT)); \
+	  case "$$hash" in '$$y$$'*) ;; *) echo "ADD_USER: hashing the password failed" >&2; exit 1;; esac; \
+	  echo "$$user:x:$$gid:" >> $$st/etc/group; \
+	  echo "$$user:x:$$uid:$$gid::/home/$$user:/bin/bash" >> $$st/etc/passwd; \
+	  echo "$$user:$$hash:$$(( $$(date +%s) / 86400 )):0:99999:7:::" >> $$st/etc/shadow; \
+	  mkdir -p $$st/home/$$user; chmod 0755 $$st/home/$$user; \
+	  ( cd $$st/etc/skel && find . -mindepth 1 -type d ) | while read -r d; do \
+	    mkdir -p "$$st/home/$$user/$$d"; \
+	    chmod --reference="$$st/etc/skel/$$d" "$$st/home/$$user/$$d"; \
+	  done; \
+	  ( cd $$st/etc/skel && find . -type f ) | while read -r f; do \
+	    cp -p "$$st/etc/skel/$$f" "$$st/home/$$user/$$f"; \
+	  done; \
+	  echo "ADD_USER: account $$user (uid $$uid, gid $$gid), password '$(ADD_USER_PASSWORD)'"; \
+	fi
 	@set -e; \
 	if [ -n "$(EXT4_MB)" ]; then ext4_mb=$(EXT4_MB); \
 	else \
@@ -2848,7 +2917,16 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	: "resize2fs can grow this small image to fill a large drive; the default"; \
 	: "headroom (~1024x = ~64GB) is too small for >64GB drives and aborts with"; \
 	: "an invalid-double-indirect-block error."; \
-	fakeroot mkfs.ext4 -F -q -b 4096 $${feat:+-O $$feat} -E root_owner=0:0,resize=536870912 \
+	owner=""; \
+	if [ -n "$(strip $(ADD_USER))" ]; then \
+	  owner=$$(awk -F: -v u="$(strip $(ADD_USER))" '$$1 == u { print $$3 ":" $$4 }' \
+		   $(EXT4_STAGING)/etc/passwd); \
+	fi; \
+	: "The account's home is its own: chowned inside the same fakeroot"; \
+	: "that builds the file system, which is what records the owner."; \
+	fakeroot sh -c 'if [ -n "$$1" ]; then chown -R "$$1" "$$2"; fi; shift 2; exec mkfs.ext4 "$$@"' \
+		sh "$$owner" "$(EXT4_STAGING)/home/$(strip $(ADD_USER))" \
+		-F -q -b 4096 $${feat:+-O $$feat} -E root_owner=0:0,resize=536870912 \
 		-d $(EXT4_STAGING) $(EXT4_ROOT_IMG) $${ext4_mb}M; \
 	e2fsck -fn $(EXT4_ROOT_IMG) || true; \
 	rm -f $(EXT4_ESP_IMG); \
@@ -3549,6 +3627,7 @@ help:
 	@echo "  SCREEN_SIZE=large or unset - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768)"
 	@echo "  SCREEN_SIZE=medium - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
 	@echo "  MAX_SCREEN_SIZE=WxH - Ceiling on the above list, e.g. MAX_SCREEN_SIZE=1920x1080 picks 1920x1080 instead of 1920x1200 (default: no ceiling)"
+	@echo "  ADD_USER=<name>     - Image ships an ordinary account <name> (password likeos), made as adduser makes one"
 	@echo "  LIKEOS_VERSION=x.y.z - Override the version in the boot banner and uname (default: $(LIKEOS_VERSION))"
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
 	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."

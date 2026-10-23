@@ -2140,7 +2140,7 @@ int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
 		    !(timed && timer_ticks() >= deadline)) {
 			cur->wait_channel = wq;
 			cur->wakeup_tick = timed ? deadline : 0;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			local_irq_restore(fl);
 			sched_schedule();
 		} else {
@@ -2235,7 +2235,7 @@ static void signal_wait_pending(task_t *cur)
 		}
 		if (!signal_pending(cur)) {
 			cur->wait_channel = wq;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			local_irq_restore(fl);
 			sched_schedule();
 		} else {

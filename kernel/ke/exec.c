@@ -177,6 +177,17 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 		}
 	}
 
+	/* A new image from here on, whatever becomes of the replace: anyone
+	 * reading this address space from outside decided they may read the
+	 * old one (exec_gen in sched.h). */
+	{
+		task_t *cur = sched_current();
+
+		if (cur)
+			__atomic_add_fetch(&task_mm_owner(cur)->exec_gen, 1,
+					   __ATOMIC_SEQ_CST);
+	}
+
 	uint64_t new_stack_ptr = 0;
 	uint64_t entry_point =
 		elf_exec_replace(kpath, kargv, kenvp, &new_stack_ptr,

@@ -338,7 +338,7 @@ int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		 * under the lock, so this only matters for the lock-free
 		 * glances other wakers take.) */
 		cur->wait_channel = cur; // Waiting for our own children
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_unlock_irqrestore(&g_wait_lock, irq_flags);
 
 		sched_schedule();

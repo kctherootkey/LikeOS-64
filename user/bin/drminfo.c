@@ -635,6 +635,39 @@ static void print_i915(int fd)
 	}
 }
 
+/* A line of the node's sysfs directory, /sys/class/drm/<name>/<file> for a
+ * node /dev/dri/<name>: 1 with the first line (newline cut) in `out', 0
+ * when there is no such file.
+ *
+ * The session start-up scripts ask their three questions this way first.
+ * They run as the user who starts the desktop, who cannot open the primary
+ * node (0660 root:video) -- and should not have to: opening it, even to ask,
+ * makes the opener the display's master while nobody else is.  The kernel
+ * publishes the answers world-readable instead; the ioctls below remain
+ * only for a kernel that does not. */
+static int sysfs_line(const char *node, const char *file, char *out,
+		      size_t cap)
+{
+	const char *base = strrchr(node, '/');
+	char path[128];
+	FILE *f;
+
+	base = base ? base + 1 : node;
+	if (!*base || strchr(base, '.'))
+		return 0;
+	snprintf(path, sizeof(path), "/sys/class/drm/%s/%s", base, file);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+	if (!fgets(out, (int)cap, f)) {
+		fclose(f);
+		return 0;
+	}
+	fclose(f);
+	out[strcspn(out, "\n")] = '\0';
+	return 1;
+}
+
 /* Does the node offer a display: at least one connector and one CRTC?
  * A driver that has found its device but not yet lit a screen (or a
  * render-only device) answers no, and the X server's start-up script then
@@ -642,8 +675,12 @@ static void print_i915(int fd)
 static int has_display(const char *node)
 {
 	struct drm_mode_card_res res;
-	int fd = open(node, O_RDWR);
+	char line[16];
+	int fd;
 
+	if (sysfs_line(node, "has_display", line, sizeof(line)))
+		return strcmp(line, "1") == 0 ? 0 : 1;
+	fd = open(node, O_RDWR);
 	if (fd < 0)
 		return 1;
 	memset(&res, 0, sizeof(res));
@@ -664,10 +701,12 @@ static int has_display(const char *node)
  * software rasteriser, so the two always agree. */
 static int has_3d(const char *node)
 {
-	char name[32];
-	int fd = open(node, O_RDWR);
-	int ret = 1;
+	char name[32], line[16];
+	int fd, ret = 1;
 
+	if (sysfs_line(node, "has_3d", line, sizeof(line)))
+		return strcmp(line, "1") == 0 ? 0 : 1;
+	fd = open(node, O_RDWR);
 	if (fd < 0)
 		return 1;
 	driver_name(fd, name, sizeof(name));
@@ -772,8 +811,33 @@ static int print_driver(const char *node)
 {
 	struct drm_version v;
 	char name[32];
-	int fd = open(node, O_RDWR);
+	int fd;
 
+	/* The device's uevent carries the bound driver as DRIVER=. */
+	{
+		const char *base = strrchr(node, '/');
+		char path[128], line[128];
+		FILE *f;
+
+		base = base ? base + 1 : node;
+		snprintf(path, sizeof(path), "/sys/class/drm/%s/device/uevent",
+			 base);
+		f = (*base && !strchr(base, '.')) ? fopen(path, "r") : NULL;
+		if (f) {
+			while (fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "DRIVER=", 7) == 0 &&
+				    line[7] && line[7] != '\n') {
+					fclose(f);
+					printf("%s", line + 7);
+					if (!strchr(line + 7, '\n'))
+						printf("\n");
+					return 0;
+				}
+			}
+			fclose(f);
+		}
+	}
+	fd = open(node, O_RDWR);
 	if (fd < 0)
 		return 1;
 	memset(&v, 0, sizeof(v));

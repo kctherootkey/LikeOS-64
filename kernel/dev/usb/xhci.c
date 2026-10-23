@@ -1632,9 +1632,13 @@ void xhci_process_events(xhci_controller_t *ctrl)
 		if (trb_cycle != ring->cycle) {
 			// Check if EINT is set but we have cycle mismatch - might need resync
 			// Only QEMU needs resync - other controllers set EINT spuriously
-			uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-			if (ctrl->quirk_resync && (usbsts & XHCI_STS_EINT) &&
-			    processed == 0) {
+			/* Read only where the answer is used: this runs on
+			 * every poll of an idle ring, and on a hypervisor each
+			 * read of the register is a trap into its device
+			 * model. */
+			if (ctrl->quirk_resync && processed == 0 &&
+			    (xhci_op_read32(ctrl, XHCI_OP_USBSTS) &
+			     XHCI_STS_EINT)) {
 				// EINT set but no events - try toggling cycle bit
 				ring->cycle ^= 1;
 				trb_cycle =

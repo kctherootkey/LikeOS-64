@@ -28,6 +28,12 @@ int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count)
 		fdput(file);
 		return -ENOTDIR;
 	}
+	/* Listing a directory is reading it: only through a descriptor opened
+	 * for reading, which is the one the open checked read permission for. */
+	if (!file_may_read(file)) {
+		fdput(file);
+		return -EBADF;
+	}
 	ret = vfs_readdir(file, (void *)dirp, (long)count);
 	fdput(file);
 	if (ret == ST_UNSUPPORTED)

@@ -173,7 +173,7 @@ static void syncobj_waiter_sleep(struct syncobj_waiter *w, uint64_t until)
 		/* no fine-grained timer: the tick is the poll */
 		cur->wakeup_tick = timer_ticks() + 1;
 	}
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 	spin_unlock_irqrestore(&w->lock, fl);
 	sched_schedule();
 	if (highres) {

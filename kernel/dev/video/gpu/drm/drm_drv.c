@@ -308,7 +308,7 @@ static long drm_read(vfs_file_t *file, void *buf, long bytes, int nonblock)
 		 * blocked.  Undone with a compare-and-swap, since a waker may
 		 * already have claimed the task. */
 		cur->wait_channel = fp;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		if (__atomic_load_n(&fp->events, __ATOMIC_ACQUIRE)) {
 			task_state_t expected = TASK_BLOCKED;
 			if (__atomic_compare_exchange_n(&cur->state, &expected, TASK_RUNNING,
@@ -932,6 +932,28 @@ static long drm_show_hotplug(struct pfs_node *n, char *buf, long cap)
 	return ksnprintf(buf, (size_t)cap, "%u\n", dev->hotplug_epoch);
 }
 
+/* What the session start-up decides from, readable by everyone: whether
+ * the device drives a display (a connector and a CRTC) and whether it
+ * renders 3D itself.  Facts about the hardware, not access to it -- the
+ * nodes stay 0660, and the scripts that start a desktop as an ordinary
+ * user no longer have to open one (and briefly become its master) to
+ * learn this. */
+static long drm_show_has_display(struct pfs_node *n, char *buf, long cap)
+{
+	struct drm_device *dev = n->arg;
+
+	return ksnprintf(buf, (size_t)cap, "%d\n",
+			 dev->ncrtc > 0 && dev->nconn > 0);
+}
+
+static long drm_show_has_3d(struct pfs_node *n, char *buf, long cap)
+{
+	struct drm_device *dev = n->arg;
+	int has = dev->drv->has_3d ? dev->drv->has_3d(dev) != 0 : 0;
+
+	return ksnprintf(buf, (size_t)cap, "%d\n", has);
+}
+
 /* Where the GPU's pages are, read before and after a run.
  *
  * `memstat -o' can say that drm_gem_alloc_pages() holds the memory, but not
@@ -1138,7 +1160,7 @@ static void pm_sleep(struct drm_device *dev, unsigned ms)
 		return;
 	self->wait_channel = (void *)&dev->pm_state;
 	self->wakeup_tick = timer_ticks() + timer_ms_to_ticks(ms) + 1;
-	self->state = TASK_BLOCKED;
+	task_set_blocked(self);
 	sched_schedule();
 	self->wakeup_tick = 0;
 	self->wait_channel = NULL;
@@ -1422,6 +1444,11 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 	n->mode = 0660;
 	n->uid = 0;
 	n->gid = DEVFS_GID_RENDER;
+	/* And the user logged in on the console gets it too, without a group,
+	 * for as long as that login lasts (devfs: uaccess) -- the desktop's
+	 * GL clients and the X server rendering for them run as that user.
+	 * The primary node does not: holding it is reading the screen. */
+	n->uaccess = 1;
 	n->major = DRM_MAJOR;
 	n->minor = (uint32_t)(DRM_RENDER_MINOR_BASE + dev->index);
 	n->ops = &drm_node_ops;
@@ -1447,6 +1474,9 @@ int drm_dev_register(struct drm_device *dev, const struct drm_driver *drv,
 		else
 			ksnprintf(base, sizeof(base), "devices/virtual/drm/card%d", dev->index);
 		sysfs_add_attr(base, "hotplug", drm_show_hotplug, NULL, dev, 0);
+		sysfs_add_attr(base, "has_display", drm_show_has_display, NULL,
+			       dev, 0);
+		sysfs_add_attr(base, "has_3d", drm_show_has_3d, NULL, dev, 0);
 		/* Read it before and after a run to see whether a client left
 		 * objects referenced or only left them queued: see
 		 * drm_show_gem_stats(). */

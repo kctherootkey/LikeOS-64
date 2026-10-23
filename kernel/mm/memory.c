@@ -2957,6 +2957,9 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 		return false;
 	if (a->lazy != b->lazy || a->device != b->device)
 		return false;
+	/* one that may never be made writable is not one that may */
+	if (a->no_write != b->no_write)
+		return false;
 	/* a lazy device mapping's pages come from its own driver object
 	 * with its own index base; two records are two mappings */
 	if (a->device && a->lazy)

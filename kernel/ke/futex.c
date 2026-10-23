@@ -466,7 +466,7 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 	WARN_ON(cur->on_rq);
 
 	// Block the task
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 	if (deadline_ns)
 		hrtimer_wait_arm(cur, deadline_ns);
 
@@ -537,8 +537,11 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 	 * wakes are not distinguished from each other because the caller must
 	 * do the same thing for both, and every futex user here already does.
 	 */
-	if ((deadline_ns != 0 && hrtimer_now_ns() >= deadline_ns) ||
-	    (deadline_tick != 0 && timer_ticks() >= deadline_tick))
+	/* The nanosecond deadline alone: the tick deadline is only a backstop
+	 * for the wake, and the tick count it was taken from can stand behind
+	 * the clock -- it read as passed with time still left, and the caller
+	 * was told it had timed out early. */
+	if (deadline_ns != 0 && hrtimer_now_ns() >= deadline_ns)
 		return -ETIMEDOUT;
 
 	return -EINTR;

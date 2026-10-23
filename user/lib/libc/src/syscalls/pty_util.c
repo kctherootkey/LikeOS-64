@@ -41,7 +41,14 @@ int openpty(int *amaster, int *aslave, char *name, const struct termios *termp,
 	if (!slave_name)
 		goto fail;
 
-	slave = open(slave_name, O_RDWR);
+	/* O_NOCTTY: the terminal is for the child that login_tty() makes its
+	 * session leader, not for whoever allocates it.  A caller that leads a
+	 * session of its own and has no terminal -- a daemonised server like
+	 * tmux's -- would otherwise take this one as its controlling terminal
+	 * at the open, and the child's TIOCSCTTY would then be refused: the
+	 * terminal is another live session's.  The pane came up with no shell
+	 * in it. */
+	slave = open(slave_name, O_RDWR | O_NOCTTY);
 	if (slave < 0)
 		goto fail;
 
@@ -73,9 +80,11 @@ fail: {
 int login_tty(int fd)
 {
 	(void)setsid();
-	if (ioctl(fd, TIOCSCTTY, 0) == -1) {
-		/* Not fatal on PTYs already without a controlling tty. */
-	}
+	/* A process that could not take the terminal would run in it without
+	 * a controlling terminal: no job control, no /dev/tty, no signals
+	 * from the keyboard.  The caller is told instead. */
+	if (ioctl(fd, TIOCSCTTY, 0) == -1)
+		return -1;
 	if (dup2(fd, 0) < 0)
 		return -1;
 	if (dup2(fd, 1) < 0)

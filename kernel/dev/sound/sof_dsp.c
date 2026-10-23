@@ -54,7 +54,7 @@ static void sof_nap_ticks(uint64_t ticks)
 	wq_add(&g_sof_nap_wq, &we);
 	cur->wait_channel = &g_sof_nap_wq;
 	cur->wakeup_tick = timer_ticks() + ticks;
-	cur->state = TASK_BLOCKED;
+	task_set_blocked(cur);
 	local_irq_restore(fl);
 	sched_schedule();
 	cur->wakeup_tick = 0;

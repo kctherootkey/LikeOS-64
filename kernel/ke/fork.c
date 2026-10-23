@@ -238,7 +238,7 @@ static void vfork_wait(task_t *cur, bool have_slot, uint64_t slot)
 			break;
 		}
 		cur->wait_channel = (void *)&cur->vfork_done;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_unlock_irqrestore(&g_vfork_lock, fl);
 		sched_schedule();
 	}

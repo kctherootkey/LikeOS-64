@@ -19,6 +19,69 @@ if [ -r /etc/X11/Xresources ]; then
 	export XENVIRONMENT
 fi
 
+# Mesa: the GPU where the machine has one that renders 3D, the software
+# rasteriser everywhere else.
+#
+#   Intel graphics (i915)          GPU: Mesa iris
+#   VMware, 3D acceleration on     GPU: Mesa svga on the SVGA3D device
+#   VMware, 3D acceleration off    llvmpipe
+#   anything else                  llvmpipe
+#
+# The GPU cases are exactly the ones where xserverrc starts X with glamor
+# (xorg.conf.modesetting-i915 / -vmwgfx-3d), which offers DRI3 so clients
+# reach the same device, and WebKit's frames travel as DMA-BUFs.  Both
+# scripts ask the same questions of the node -- drminfo --has-display and
+# --has-3d -- so the server and the clients always agree.
+#
+# Everywhere else LIBGL_ALWAYS_SOFTWARE is set: libGL and libEGL never load
+# a hardware driver, GLX and EGL on X11 render with llvmpipe and put pixels
+# up with PutImage/XShm, and EGL's surfaceless platform (WebKit's web
+# process) is llvmpipe as well.  On VMware with 3D off the device has
+# nothing to render with, so that is what would happen anyway -- the pin
+# only makes it certain and quick.
+#
+# Decided before any client starts -- the session bus included, which hands
+# its environment to the services it starts: everything in the session
+# inherits these variables, the browser opened from the desktop bar as well,
+# and a program started above this block would not.
+LIKEOS_GPU_DRIVER=$(drminfo --driver /dev/dri/card0 2>/dev/null)
+export LIKEOS_GPU_DRIVER
+#
+# The clients render on the GPU through its render node, /dev/dri/renderD128,
+# opened by themselves or handed to them by the X server (DRI3) -- in both
+# cases with this user's rights.  The node is 0660 root:render, and the user
+# logged in on the console may open it as well for as long as that login
+# lasts (the kernel's uaccess, as logind grants it elsewhere).  A user who can
+# open it gets the GPU; anyone else -- a session not started at the console --
+# renders with llvmpipe while the server still draws with glamor, decided
+# here so the clients never try the GPU and fail.  Root can always open it.
+LIKEOS_GPU_3D=0
+if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0 &&
+	drminfo --has-3d /dev/dri/card0 &&
+	[ -r /dev/dri/renderD128 ] && [ -w /dev/dri/renderD128 ]; then
+	LIKEOS_GPU_3D=1
+fi
+export LIKEOS_GPU_3D
+if [ "$LIKEOS_GPU_3D" != "1" ]; then
+	LIBGL_ALWAYS_SOFTWARE=1
+	export LIBGL_ALWAYS_SOFTWARE
+fi
+
+# WebKit's frames from the web process to the UI process: shared memory
+# wherever GL is pinned to llvmpipe above.  WebKit adds its "hardware"
+# transport (DMA-BUF through GBM) on top of shared memory whenever it finds
+# a display-manager render node, and with the rasteriser pinned to llvmpipe
+# that would mean software-rendered buffers exported as DMA-BUFs from the
+# render node -- a combination nothing here has run.  Shared memory is the
+# transport a machine without a GPU uses.  On the GPU machines (i915,
+# VMware with 3D) the frames travel as DMA-BUFs.  This is not
+# WEBKIT_DISABLE_DMABUF_RENDERER, which would switch acceleration off
+# altogether (see above).
+if [ "$LIKEOS_GPU_3D" != "1" ]; then
+	WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+	export WEBKIT_DMABUF_RENDERER_FORCE_SHM
+fi
+
 # Keyboard map.  The server already reads this from xorg.conf; setting it again
 # here is where to change it for a session without editing the configuration.
 if [ -x /usr/bin/setxkbmap ]; then
@@ -42,14 +105,10 @@ fi
 # second startx does not find a stale socket from the first.
 #
 # Guarded on the binary and on the address not already being set: a user who
-# has arranged their own bus keeps it.  The machine id is written first because
-# dbus-daemon refuses to start without one, and nothing else on the image
-# creates it.
+# has arranged their own bus keeps it.  The machine id dbus-daemon needs is
+# init's to make, at boot (/etc/machine-id): this script runs as whoever
+# typed startx, and an ordinary account cannot write it.
 if [ -x /usr/bin/dbus-launch ] && [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
-	if [ ! -s /var/lib/dbus/machine-id ] && [ -x /usr/bin/dbus-uuidgen ]; then
-		mkdir -p /var/lib/dbus
-		dbus-uuidgen > /var/lib/dbus/machine-id 2>/dev/null
-	fi
 	eval "$(dbus-launch --sh-syntax --exit-with-session)"
 	export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 fi
@@ -191,54 +250,6 @@ export XCURSOR_THEME XCURSOR_SIZE
 # variable at 0.  To go back to cairo on one machine, export the variable
 # from a shell before starting luakit and set the policy in a per-user
 # ~/.config/luakit/userconf.lua -- not here.
-
-# Mesa: the GPU where the machine has one that renders 3D, the software
-# rasteriser everywhere else.
-#
-#   Intel graphics (i915)          GPU: Mesa iris
-#   VMware, 3D acceleration on     GPU: Mesa svga on the SVGA3D device
-#   VMware, 3D acceleration off    llvmpipe
-#   anything else                  llvmpipe
-#
-# The GPU cases are exactly the ones where xserverrc starts X with glamor
-# (xorg.conf.modesetting-i915 / -vmwgfx-3d), which offers DRI3 so clients
-# reach the same device, and WebKit's frames travel as DMA-BUFs.  Both
-# scripts ask the same questions of the node -- drminfo --has-display and
-# --has-3d -- so the server and the clients always agree.
-#
-# Everywhere else LIBGL_ALWAYS_SOFTWARE is set: libGL and libEGL never load
-# a hardware driver, GLX and EGL on X11 render with llvmpipe and put pixels
-# up with PutImage/XShm, and EGL's surfaceless platform (WebKit's web
-# process) is llvmpipe as well.  On VMware with 3D off the device has
-# nothing to render with, so that is what would happen anyway -- the pin
-# only makes it certain and quick.
-LIKEOS_GPU_DRIVER=$(drminfo --driver /dev/dri/card0 2>/dev/null)
-export LIKEOS_GPU_DRIVER
-LIKEOS_GPU_3D=0
-if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0 &&
-	drminfo --has-3d /dev/dri/card0; then
-	LIKEOS_GPU_3D=1
-fi
-export LIKEOS_GPU_3D
-if [ "$LIKEOS_GPU_3D" != "1" ]; then
-	LIBGL_ALWAYS_SOFTWARE=1
-	export LIBGL_ALWAYS_SOFTWARE
-fi
-
-# WebKit's frames from the web process to the UI process: shared memory
-# wherever GL is pinned to llvmpipe above.  WebKit adds its "hardware"
-# transport (DMA-BUF through GBM) on top of shared memory whenever it finds
-# a display-manager render node, and with the rasteriser pinned to llvmpipe
-# that would mean software-rendered buffers exported as DMA-BUFs from the
-# render node -- a combination nothing here has run.  Shared memory is the
-# transport a machine without a GPU uses.  On the GPU machines (i915,
-# VMware with 3D) the frames travel as DMA-BUFs.  This is not
-# WEBKIT_DISABLE_DMABUF_RENDERER, which would switch acceleration off
-# altogether (see above).
-if [ "$LIKEOS_GPU_3D" != "1" ]; then
-	WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
-	export WEBKIT_DMABUF_RENDERER_FORCE_SHM
-fi
 
 # Video in the browser is decoded by GStreamer -- the VA-API decoders
 # (vah264dec ...) on Intel graphics, FFmpeg's on the processor elsewhere --

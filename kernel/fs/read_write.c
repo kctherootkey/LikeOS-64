@@ -62,7 +62,7 @@ static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
 		// Block waiting for data
 		if (cur) {
 			cur->wait_channel = pipe; // Wait on the pipe
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			spin_unlock_irqrestore(&pipe->lock, flags);
 			sched_schedule();
 			spin_lock_irqsave(&pipe->lock, &flags);
@@ -156,7 +156,7 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 		// Block waiting for space
 		if (cur) {
 			cur->wait_channel = pipe;
-			cur->state = TASK_BLOCKED;
+			task_set_blocked(cur);
 			spin_unlock_irqrestore(&pipe->lock, flags);
 			sched_schedule();
 			spin_lock_irqsave(&pipe->lock, &flags);
@@ -203,6 +203,10 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 
 	return (int64_t)to_write;
 }
+
+/* file_may_read()/file_may_write() (vfs.h) spell the access modes out. */
+_Static_assert(O_RDONLY == 0 && O_WRONLY == 1 && O_RDWR == 2,
+	       "access modes as file_may_read()/file_may_write() assume");
 
 static int64_t read_held(task_t *cur, vfs_file_t *file, uint64_t buf,
 			 uint64_t count);
@@ -308,8 +312,8 @@ static int64_t read_held(task_t *cur, vfs_file_t *file, uint64_t buf,
 		return pipe_read_to_user((pipe_end_t *)file, buf, count);
 	}
 
-	// Respect open flags (deny read on write-only)
-	if (file->flags & O_WRONLY) {
+	// Respect open flags: read only what was opened for reading
+	if (!file_may_read(file)) {
 		return -EBADF;
 	}
 
@@ -407,8 +411,10 @@ static int64_t write_held(task_t *cur, vfs_file_t *file, uint64_t buf,
 		return pipe_write_from_user((pipe_end_t *)file, buf, count);
 	}
 
-	// Respect open flags (deny write on read-only)
-	if ((file->flags & (O_WRONLY | O_RDWR | O_APPEND)) == 0) {
+	/* Respect open flags: write only what was opened for writing.
+	 * O_APPEND says where a write goes, not that one may write -- a
+	 * descriptor opened O_RDONLY|O_APPEND was checked for reading only. */
+	if (!file_may_write(file)) {
 		return -EBADF;
 	}
 
@@ -558,8 +564,7 @@ static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
 		fdput(file);
 		return -ESPIPE;
 	}
-	if (write ? (!(file->flags & (O_WRONLY | O_RDWR))) :
-		    (file->flags & O_WRONLY)) {
+	if (write ? !file_may_write(file) : !file_may_read(file)) {
 		fdput(file);
 		return -EBADF;
 	}
@@ -639,7 +644,7 @@ int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
 		fdput(file);
 		return -ENODEV;
 	}
-	if (!(file->flags & (O_WRONLY | O_RDWR))) {
+	if (!file_may_write(file)) {
 		fdput(file);
 		return -EBADF;
 	}

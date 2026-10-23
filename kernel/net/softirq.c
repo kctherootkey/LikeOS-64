@@ -193,7 +193,7 @@ static void ksoftirqd_main(void *arg)
 		// freezes when ksoftirqd holds runqueue locks contended cross-CPU).
 		task_t *cur = sched_current();
 		cur->wait_channel = (void *)&ksoftirqd_task[my_cpu];
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
 		if (softirq_pending_mask[my_cpu] != 0) {
 			/* Un-park by CLAIMING ourselves back with a CAS — the

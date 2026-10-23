@@ -1,0 +1,106 @@
+Hand DRI3 clients the render node when the primary node cannot be opened.
+
+glamor opens a new descriptor for each DRI3 client on the node the server
+drives, the primary node, and authenticates it.  A server that gave up root
+(0005) opens with the invoking user's rights, which do not reach the primary
+node (0660 root:video) -- so every DRI3 request failed for a desktop started by
+an ordinary user.  The render node is the one meant for clients and needs no
+authentication; it is opened with the same user rights, so a client gets it
+only where the user may open it themselves (the console user, or a member of
+`render').  A server started by root opens the primary node as before.
+
+Where the device's description does not name its render node, it is derived
+from the primary node's number.  The server says at start which nodes clients
+get, and the first time it cannot give a client one it says why: a client's
+own message ("could not get DRI3 device") names no reason.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/glamor/glamor_egl.c
++++ b/glamor/glamor_egl.c
+@@ -52,6 +52,7 @@
+     EGLDisplay display;
+     EGLContext context;
+     char *device_path;
++    char *render_path;
+ 
+     CreateScreenResourcesProcPtr CreateScreenResources;
+     CloseScreenProcPtr CloseScreen;
+@@ -838,9 +839,43 @@
+     int fd;
+     drm_magic_t magic;
+ 
+-    fd = open(glamor_egl->device_path, O_RDWR|O_CLOEXEC);
++    int primary_err = 0, render_err = 0;
++
++    fd = glamor_egl->device_path ?
++        open(glamor_egl->device_path, O_RDWR|O_CLOEXEC) : -1;
+     if (fd < 0)
++        primary_err = glamor_egl->device_path ? errno : ENOENT;
++    /* A server that gave up root once its devices were open (LikeOS: dix/
++     * main.c) opens with the invoking user's rights, and those do not
++     * reach the primary node -- nor should they: it is the display.  The
++     * render node is the one meant for clients and needs no
++     * authentication; it opens only where the user may open it themselves
++     * (the user at the console, or a member of `render').  A server
++     * started by root opens the primary node as before. */
++    if (fd < 0 && primary_err != EFAULT && glamor_egl->render_path) {
++        fd = open(glamor_egl->render_path, O_RDWR|O_CLOEXEC);
++        if (fd < 0)
++            render_err = errno;
++    }
++    if (fd < 0) {
++        /* Said once: every client after the first would only repeat it,
++         * and without it a client's "could not get DRI3 device" names no
++         * reason at all. */
++        static Bool said;
++
++        if (!said) {
++            said = TRUE;
++            xf86DrvMsg(scrn->scrnIndex, X_ERROR,
++                       "DRI3: no device for a client: %s: %s, render node %s: %s\n",
++                       glamor_egl->device_path ?
++                       glamor_egl->device_path : "(none)",
++                       strerror(primary_err),
++                       glamor_egl->render_path ?
++                       glamor_egl->render_path : "(none)",
++                       render_err ? strerror(render_err) : "not tried");
++        }
+         return BadAlloc;
++    }
+ 
+     /* Before FD passing in the X protocol with DRI3 (and increased
+      * security of rendering with per-process address spaces on the
+@@ -925,6 +960,24 @@
+          * to the same device we were handed in originally.
+          */
+         glamor_egl->device_path = drmGetDeviceNameFromFd2(glamor_egl->fd);
++        glamor_egl->render_path = drmGetRenderDeviceNameFromFd(glamor_egl->fd);
++        /* The render node of /dev/dri/cardN is /dev/dri/renderD(128+N)
++         * when the device's own description does not say. */
++        if (!glamor_egl->render_path && glamor_egl->device_path) {
++            unsigned n;
++            char tail;
++
++            if (sscanf(glamor_egl->device_path, "/dev/dri/card%u%c",
++                       &n, &tail) == 1)
++                (void) asprintf(&glamor_egl->render_path,
++                                "/dev/dri/renderD%u", 128 + n);
++        }
++        xf86DrvMsg(scrn->scrnIndex, X_INFO,
++                   "DRI3: clients get %s (render node %s)\n",
++                   glamor_egl->device_path ?
++                   glamor_egl->device_path : "(none)",
++                   glamor_egl->render_path ?
++                   glamor_egl->render_path : "(none)");
+ 
+         if (!dri3_screen_init(screen, &glamor_dri3_info)) {
+             xf86DrvMsg(scrn->scrnIndex, X_ERROR,
+@@ -949,6 +1002,7 @@
+     if (glamor_egl->gbm)
+         gbm_device_destroy(glamor_egl->gbm);
+     free(glamor_egl->device_path);
++    free(glamor_egl->render_path);
+     free(glamor_egl);
+ }
+ 

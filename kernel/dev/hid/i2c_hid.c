@@ -5154,7 +5154,7 @@ static void i2c_hid_worker_thread(void *arg)
 		// so sched_schedule() will return immediately.
 		task_t *self = sched_current();
 		self->wait_channel = (void *)ctrl;
-		self->state = TASK_BLOCKED;
+		task_set_blocked(self);
 		__asm__ volatile("" ::: "memory");
 
 		int any_pending = 0;

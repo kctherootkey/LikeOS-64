@@ -44,6 +44,21 @@ static void tcp_poll_notify(tcp_conn_t *conn)
 		poll_notify_io_ready();
 }
 
+/* A listener's accept queue just gained a connection: wake whoever polls
+ * the listening socket.  `owner' is the listener's owner_socket, read while
+ * its lock was held -- the listener can be closed the moment the lock is
+ * dropped, the socket slot it named cannot go away (see tcp_poll_notify()).
+ * Without this a server waiting in poll() on its listening socket -- sshd's
+ * accept loop -- slept through every connection while the peer, its
+ * handshake complete, waited for a banner that never came. */
+static void tcp_listener_notify(const tcp_conn_t *listener, void *owner)
+{
+	if (owner && owner != (const void *)listener)
+		poll_notify_wq(&((net_socket_t *)owner)->poll_wq);
+	else
+		poll_notify_io_ready();
+}
+
 // ---------------------------------------------------------------------------
 // IRQ-friendly blocking acquire of a per-connection spinlock.
 //
@@ -2594,6 +2609,8 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				// tcp_accept can still hand it to whichever LISTEN socket
 				// actually owns the local port.
 				uint64_t lflags;
+				void *lowner = NULL;
+				int queued = 0;
 				tcp_lock_acquire(&listener->lock, &lflags);
 				if (listener->active &&
 				    listener->state == TCP_STATE_LISTEN &&
@@ -2615,9 +2632,14 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 						listener->accept_tail =
 							next_tail;
 						listener->accept_ready = 1;
+						lowner = listener->owner_socket;
+						queued = 1;
 					}
 					tcp_lock_release(&listener->lock,
 							 lflags);
+					if (queued)
+						tcp_listener_notify(listener,
+								    lowner);
 				} else {
 					tcp_lock_release(&listener->lock,
 							 lflags);
@@ -2835,6 +2857,8 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				tcp_conn_t *p = conn->parent;
 				if (p) {
 					uint64_t pflags;
+					void *powner = NULL;
+					int pqueued = 0;
 					spin_lock_irqsave(&p->lock, &pflags);
 					if (p->active &&
 					    p->state == TCP_STATE_LISTEN &&
@@ -2853,6 +2877,8 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 								conn;
 							p->accept_tail = next;
 							p->accept_ready = 1;
+							powner = p->owner_socket;
+							pqueued = 1;
 						} else {
 							/* accept_queue (16 slots)
 							 * full: the just-established
@@ -2868,6 +2894,9 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 						}
 						spin_unlock_irqrestore(&p->lock,
 								       pflags);
+						if (pqueued)
+							tcp_listener_notify(
+								p, powner);
 					} else {
 						/* Parent is no longer a LISTEN conn
 						 * on our port — it was closed

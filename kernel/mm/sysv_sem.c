@@ -349,7 +349,7 @@ int64_t sys_semop(uint64_t semid_u, uint64_t sops_u, uint64_t nsops_u)
 		uint32_t seq = s->seq;
 		unsigned slot = (unsigned)(s - g_sets);
 		cur->wait_channel = s;
-		cur->state = TASK_BLOCKED;
+		task_set_blocked(cur);
 		spin_unlock_irqrestore(&g_sem_lock, fl);
 		sched_schedule();
 		cur->wait_channel = NULL;

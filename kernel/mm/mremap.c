@@ -165,6 +165,7 @@ static int64_t sys_mremap_locked(uint64_t old_addr, uint64_t old_size,
 	nr->offset = r->offset + (old_addr - r->start);
 	nr->lazy = true; /* any part not carried over faults on demand */
 	nr->file = r->file;
+	nr->no_write = r->no_write;
 	nr->device = false;
 	nr->device_phys = 0;
 	nr->dev_obj = NULL;

@@ -233,7 +233,9 @@ int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 	if (task_fd_is_console(cur, fd)) {
 		st.st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
 					S_IROTH | S_IWOTH);
-		st.st_rdev = ((uint64_t)5 << 8) | (fd & 0xff); /* tty major=5 */
+		/* The console's device, as stat("/dev/console") reports it
+		 * (5:1): ttyname() names a descriptor by matching the two. */
+		st.st_rdev = ((uint64_t)5 << 8) | 1;
 		st.st_size = 0;
 		// Security: Use SMAP-aware copy to user
 		ret = copy_to_user((void *)stat_buf, &st, sizeof(st));
