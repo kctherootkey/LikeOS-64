@@ -115,9 +115,10 @@ struct input_id {
 #define INPUT_PROP_MAX 0x1f
 #define INPUT_PROP_CNT (INPUT_PROP_MAX + 1)
 
-// Absolute axes (EV_ABS).  No device here reports absolute motion yet; the
-// codes exist so a driver can ask about them and be told "not supported"
-// rather than having the query rejected outright.
+// Absolute axes (EV_ABS).  The mouse reports ABS_X and ABS_Y where an
+// absolute pointing device drives it (VMware's); the other codes exist so a
+// driver can ask about them and be told "not supported" rather than having
+// the query rejected outright.
 #define ABS_X 0x00
 #define ABS_Y 0x01
 #define ABS_Z 0x02

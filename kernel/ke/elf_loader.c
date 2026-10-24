@@ -876,6 +876,8 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 		// sched_add_user_task which sets tty_get_console)
 		t->pgid = cur->pgid;
 		t->sid = cur->sid;
+		t->login_uid = cur->login_uid;
+		t->login_session = cur->login_session;
 		if (cur->ctty)
 			t->ctty = cur->ctty;
 		mm_memset(t->cwd, 0, sizeof(t->cwd));

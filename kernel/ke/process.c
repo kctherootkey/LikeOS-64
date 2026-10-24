@@ -121,6 +121,15 @@ int64_t sys_setsid(void)
 	cur->sid = (int)cur->id;
 	cur->pgid = (int)cur->id;
 	cur->ctty = NULL;
+	/* A privileged process starting a session starts something that is
+	 * not the login it ran in -- getty taking a terminal for the next
+	 * login, a server's per-connection child (sshd) -- so it leaves that
+	 * login, until a login sets one (/proc/self/loginuid).  A user's own
+	 * setsid() -- every terminal window does it -- stays in the login. */
+	if (capable()) {
+		cur->login_uid = TASK_LOGIN_UNSET;
+		cur->login_session = TASK_LOGIN_UNSET;
+	}
 	return cur->id;
 }
 

@@ -86,6 +86,7 @@ static void devpoll_thread(void *arg)
 		xhci_hotplug_poll(&g_xhci);
 		xhci_hotplug_poll(&g_xhci_hid);
 		usbhid_poll();
+		mouse_poll();
 		storage_fs_poll(&g_storage_state);
 		timer_host_time_sync_poll();
 

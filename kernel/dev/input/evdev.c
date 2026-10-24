@@ -57,6 +57,13 @@ typedef struct {
 	uint8_t evbits[EV_CNT / 8];
 	uint8_t keybits[KEY_CNT / 8];
 	uint8_t relbits[REL_CNT / 8];
+	uint8_t absbits[ABS_CNT / 8];
+	/* Absolute axes (evdev_mouse_set_absolute()): ABS_X and ABS_Y, their
+	 * range, and where the pointer is on them. */
+	struct input_absinfo abs[2];
+	/* Screen size the relative motion of another source is scaled by
+	 * while the axes are absolute. */
+	int abs_screen_w, abs_screen_h;
 	uint8_t propbits[INPUT_PROP_CNT / 8]; // device properties (EVIOCGPROP)
 	uint8_t ledbits[LED_CNT / 8]; // LEDs this device has
 	uint8_t led_state[LED_CNT / 8]; // which of them are lit
@@ -326,19 +333,13 @@ int evdev_feed_keyboard(uint8_t scan_code)
 	return evdev_kbd_grabbed();
 }
 
-int evdev_feed_mouse(int dx, int dy, uint8_t buttons, int wheel, int hwheel)
+// Button edges as EV_KEY events.  The state is the device's, whichever
+// source reports: the producers are serialised by the mouse driver.
+static void evdev_mouse_buttons(evdev_dev_t *dev, uint8_t buttons)
 {
-	static uint8_t last_buttons; // producer-side state (IRQ serialised)
-	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
-	uint64_t f;
-	uint8_t changed;
-	int queued = 0;
+	static uint8_t last_buttons;
+	uint8_t changed = buttons ^ last_buttons;
 
-	if (!g_evdev_initialized)
-		evdev_init_devices();
-
-	// Button edges as EV_KEY events
-	changed = buttons ^ last_buttons;
 	if (changed & 0x01)
 		evdev_report_key(dev, BTN_LEFT, buttons & 0x01);
 	if (changed & 0x02)
@@ -346,15 +347,132 @@ int evdev_feed_mouse(int dx, int dy, uint8_t buttons, int wheel, int hwheel)
 	if (changed & 0x04)
 		evdev_report_key(dev, BTN_MIDDLE, buttons & 0x04);
 	last_buttons = buttons;
+}
+
+// Move an absolute axis to `value' (clamped), queueing the event when it
+// changed; returns whether it did.  Caller holds dev->lock.
+static int evdev_abs_move_locked(evdev_dev_t *dev, unsigned axis,
+				 int64_t value)
+{
+	struct input_absinfo *a = &dev->abs[axis];
+
+	if (value < a->minimum)
+		value = a->minimum;
+	if (value > a->maximum)
+		value = a->maximum;
+	if ((int32_t)value == a->value)
+		return 0;
+	a->value = (int32_t)value;
+	evdev_queue_locked(dev, EV_ABS, (uint16_t)(ABS_X + axis), a->value);
+	return 1;
+}
+
+void evdev_mouse_set_absolute(int32_t max, int screen_w, int screen_h)
+{
+	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	uint64_t f;
+
+	if (!g_evdev_initialized)
+		evdev_init_devices();
+	spin_lock_irqsave(&dev->lock, &f);
+	/* An absolute pointer: positions on the screen, no relative motion
+	 * of its own, and so not INPUT_PROP_POINTER either.  The wheel stays
+	 * relative. */
+	bit_set(dev->evbits, EV_ABS);
+	bit_set(dev->absbits, ABS_X);
+	bit_set(dev->absbits, ABS_Y);
+	bit_clear(dev->relbits, REL_X);
+	bit_clear(dev->relbits, REL_Y);
+	bit_clear(dev->propbits, INPUT_PROP_POINTER);
+	for (unsigned i = 0; i < 2; i++) {
+		dev->abs[i].minimum = 0;
+		dev->abs[i].maximum = max;
+		dev->abs[i].value = max / 2;
+	}
+	dev->abs_screen_w = screen_w;
+	dev->abs_screen_h = screen_h;
+	spin_unlock_irqrestore(&dev->lock, f);
+}
+
+void evdev_mouse_set_abs_screen(int screen_w, int screen_h)
+{
+	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	uint64_t f;
+
+	if (!g_evdev_initialized)
+		evdev_init_devices();
+	spin_lock_irqsave(&dev->lock, &f);
+	dev->abs_screen_w = screen_w;
+	dev->abs_screen_h = screen_h;
+	spin_unlock_irqrestore(&dev->lock, f);
+}
+
+int evdev_feed_mouse_abs(uint32_t x, uint32_t y, uint8_t buttons, int wheel)
+{
+	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	uint64_t f;
+	int queued = 0;
+
+	if (!g_evdev_initialized)
+		evdev_init_devices();
+	evdev_mouse_buttons(dev, buttons);
 
 	spin_lock_irqsave(&dev->lock, &f);
-	if (dx) {
-		evdev_queue_locked(dev, EV_REL, REL_X, dx);
+	if (bit_test(dev->evbits, EV_ABS)) {
+		queued |= evdev_abs_move_locked(dev, 0, x);
+		queued |= evdev_abs_move_locked(dev, 1, y);
+	}
+	if (wheel) {
+		evdev_queue_locked(dev, EV_REL, REL_WHEEL, wheel);
 		queued = 1;
 	}
-	if (dy) {
-		evdev_queue_locked(dev, EV_REL, REL_Y, dy);
-		queued = 1;
+	if (queued)
+		evdev_queue_locked(dev, EV_SYN, SYN_REPORT, 0);
+	spin_unlock_irqrestore(&dev->lock, f);
+	if (queued)
+		evdev_wake_readers(dev);
+	return evdev_mouse_grabbed();
+}
+
+int evdev_feed_mouse(int dx, int dy, uint8_t buttons, int wheel, int hwheel)
+{
+	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	uint64_t f;
+	int queued = 0;
+
+	if (!g_evdev_initialized)
+		evdev_init_devices();
+
+	evdev_mouse_buttons(dev, buttons);
+
+	spin_lock_irqsave(&dev->lock, &f);
+	if (bit_test(dev->evbits, EV_ABS)) {
+		/* The axes are absolute: relative motion from another source
+		 * (the emulated mouse, before the absolute pointer has said
+		 * anything) moves the position by the same share of the
+		 * screen it would move a pointer. */
+		int w = dev->abs_screen_w > 0 ? dev->abs_screen_w : 1;
+		int h = dev->abs_screen_h > 0 ? dev->abs_screen_h : 1;
+
+		if (dx)
+			queued |= evdev_abs_move_locked(
+				dev, 0,
+				(int64_t)dev->abs[0].value +
+					(int64_t)dx * (dev->abs[0].maximum + 1) / w);
+		if (dy)
+			queued |= evdev_abs_move_locked(
+				dev, 1,
+				(int64_t)dev->abs[1].value +
+					(int64_t)dy * (dev->abs[1].maximum + 1) / h);
+	} else {
+		if (dx) {
+			evdev_queue_locked(dev, EV_REL, REL_X, dx);
+			queued = 1;
+		}
+		if (dy) {
+			evdev_queue_locked(dev, EV_REL, REL_Y, dy);
+			queued = 1;
+		}
 	}
 	if (wheel) {
 		evdev_queue_locked(dev, EV_REL, REL_WHEEL, wheel);
@@ -612,6 +730,10 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
 			return evdev_copy_bits(argp, dev->ledbits,
 					       sizeof(dev->ledbits),
 					       user_len);
+		if (ev == EV_ABS)
+			return evdev_copy_bits(argp, dev->absbits,
+					       sizeof(dev->absbits),
+					       user_len);
 		// Unsupported event class: report an empty bitmap.
 		{
 			static const uint8_t none[8];
@@ -654,11 +776,18 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
 		return evdev_copy_bits(argp, none, sizeof(none), user_len);
 	}
 	if (nr >= 0x40 && nr <= 0x40 + ABS_MAX) { // EVIOCGABS(abs)
-		/* No device here reports absolute motion.  A zeroed absinfo is
-		 * the conventional answer for an axis the device does not
-		 * have: the query succeeds and the ranges read as empty, which
-		 * is what a driver checks. */
+		/* An axis the device has: its range and position.  A zeroed
+		 * absinfo for one it does not have, the conventional answer:
+		 * the query succeeds and the range reads as empty, which is
+		 * what a driver checks. */
 		struct input_absinfo abs = { 0, 0, 0, 0, 0, 0 };
+		unsigned int axis = nr - 0x40;
+		uint64_t f;
+
+		spin_lock_irqsave(&dev->lock, &f);
+		if (axis <= ABS_Y && bit_test(dev->absbits, axis))
+			abs = dev->abs[axis];
+		spin_unlock_irqrestore(&dev->lock, f);
 		return evdev_copy_out(argp, &abs, sizeof(abs));
 	}
 	if (req == EVIOCSCLOCKID) { // select the clock used for timestamps

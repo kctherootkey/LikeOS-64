@@ -12,6 +12,9 @@
  *
  * If no TIME is given, "+1" is implied.
  *
+ * Installed setuid root, and acts only for root and for the user logged in
+ * at the console (power_policy.h); --help and --show are for everyone.
+ *
  * Copyright (C) 2026 The LikeOS Project
  */
 
@@ -24,8 +27,13 @@
 #include <time.h>
 #include <sys/reboot.h>
 
+#include "power_policy.h"
+
 /* Pending shutdown state file */
-#define SCHEDULED_FILE "/tmp/.shutdown_scheduled"
+/* Root's directory, not /tmp: the file is written with root's rights, and in
+ * a directory anyone may write, a link planted under this name would have
+ * had it written wherever the link pointed. */
+#define SCHEDULED_FILE "/var/run/shutdown.scheduled"
 
 enum action { ACTION_POWEROFF, ACTION_HALT, ACTION_REBOOT };
 
@@ -145,7 +153,8 @@ static long parse_time(const char *s)
  */
 static void write_schedule(enum action a, time_t when)
 {
-	int fd = open(SCHEDULED_FILE, O_WRONLY | O_CREAT, 0644);
+	int fd = open(SCHEDULED_FILE,
+		      O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
 	if (fd < 0)
 		return;
 	char buf[128];
@@ -241,6 +250,9 @@ int main(int argc, char *argv[])
 	char wall_msg[512] = { 0 };
 	int wall_off = 0;
 
+	/* Setuid root: an environment of its own (power_policy.h). */
+	power_sanitize_env();
+
 	/* Parse options and positional args */
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--help") == 0) {
@@ -324,6 +336,14 @@ int main(int argc, char *argv[])
 	if (show) {
 		show_schedule();
 		return 0;
+	}
+
+	/* Everything from here on acts on the machine, or on a shutdown that
+	 * has been scheduled: root and the user logged in at the console only. */
+	if (!power_caller_allowed()) {
+		fprintf(stderr,
+			"shutdown: permission denied: only root or the user logged in at the console may do this\n");
+		return 1;
 	}
 
 	/* -c (cancel) */

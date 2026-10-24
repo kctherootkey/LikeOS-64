@@ -22,7 +22,9 @@
 //        half for message calls), ESI/EDI further arguments (message cookie)
 //   out: every one of EAX..EDI may have been rewritten by the hypervisor.
 //
-// Only the generic call and the one query the display driver makes are here;
+// Only the generic call, the hypervisor check and the one query the display
+// driver makes are here (the absolute pointer's commands are numbered here
+// and spoken in kernel/dev/input/vmmouse.c);
 // the message channel keeps its own high-bandwidth helpers next to its
 // protocol state (kernel/dev/video/gpu/vmwgfx/vmw_msg.c).
 //
@@ -44,8 +46,12 @@
 #define VMWARE_BACKDOOR_CMD_GETHWVERSION 17
 #define VMWARE_BACKDOOR_CMD_GETMEMSIZE 20
 #define VMWARE_BACKDOOR_CMD_MESSAGE 30
+#define VMWARE_BACKDOOR_CMD_ABSPOINTER_DATA 39
+#define VMWARE_BACKDOOR_CMD_ABSPOINTER_STATUS 40
+#define VMWARE_BACKDOOR_CMD_ABSPOINTER_COMMAND 41
 #define VMWARE_BACKDOOR_CMD_GETHZ 45
 #define VMWARE_BACKDOOR_CMD_GET_VCPU_INFO 68
+#define VMWARE_BACKDOOR_CMD_ABSPOINTER_RESTRICT 86
 
 /* VMWARE_BACKDOOR_CMD_MESSAGE sub-commands (ECX, high half). */
 #define VMWARE_BACKDOOR_MSG_OPEN 0
@@ -88,6 +94,24 @@ static inline void vmware_backdoor_call(struct vmware_backdoor_regs *r)
 	r->edx = edx;
 	r->esi = esi;
 	r->edi = edi;
+}
+
+/* Is this a VMware hypervisor?  CPUID's hypervisor bit, then the vendor
+ * signature "VMwareVMware" in leaf 0x40000000 -- the precondition for using
+ * the backdoor at all where nothing else (a VMware device) has said so. */
+static inline int vmware_backdoor_hypervisor_present(void)
+{
+	uint32_t eax, ebx, ecx, edx;
+
+	__asm__ __volatile__("cpuid"
+			     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+			     : "a"(1U), "c"(0U));
+	if (!(ecx & (1U << 31)))
+		return 0;
+	__asm__ __volatile__("cpuid"
+			     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+			     : "a"(0x40000000U), "c"(0U));
+	return ebx == 0x61774D56U && ecx == 0x4D566572U && edx == 0x65726177U;
 }
 
 /* One plain command on the command port, channel 0: returns EAX, and EBX..EDX

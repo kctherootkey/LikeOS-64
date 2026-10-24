@@ -374,6 +374,10 @@ tty_t *tty_get_console(void)
 }
 
 static long tty_show_console_user(struct pfs_node *n, char *buf, long cap);
+static long tty_show_console_session(struct pfs_node *n, char *buf,
+				     long cap);
+static int tty_console_lookup(uint32_t *uid, uint32_t *session,
+			      bool need_login);
 
 /* /sys/kernel/console_user: the uid of the user logged in on the console,
  * empty when nobody is -- what `who' tells anyone on the machine.  The
@@ -382,6 +386,8 @@ void tty_sysfs_init(void)
 {
 	sysfs_add_attr("kernel", "console_user", tty_show_console_user, NULL,
 		       NULL, 0);
+	sysfs_add_attr("kernel", "console_session", tty_show_console_session,
+		       NULL, NULL, 0);
 }
 
 /* The user logged in on the console: the real uid of the live leader of the
@@ -392,6 +398,28 @@ void tty_sysfs_init(void)
  * console has no live session.  What the seat's devices are granted to
  * (devfs: uaccess nodes) and who may start the display server. */
 int tty_console_uid(uint32_t *uid)
+{
+	uint32_t session;
+
+	return tty_console_lookup(uid, &session, false);
+}
+
+/* The same, with the id of the login session the leader belongs to
+ * (task_t::login_session, set by login through /proc/self/loginuid): one
+ * lookup, so the two always describe the same login.  A process is part of
+ * that login when its own login session is this one -- it descends from the
+ * login, through terminal windows' setsid() and set-id programs alike, and
+ * no privileged setsid() (getty, sshd) came between.  Session ids are never
+ * handed out twice, so a process left behind by an earlier login can never
+ * match a later one.  0 also when the leader is not a recorded login of the
+ * user it runs as. */
+int tty_console_session(uint32_t *uid, uint32_t *session)
+{
+	return tty_console_lookup(uid, session, true);
+}
+
+static int tty_console_lookup(uint32_t *uid, uint32_t *session,
+			      bool need_login)
 {
 	tty_t *tty = &g_console_tty;
 	int sid = __atomic_load_n(&tty->sid, __ATOMIC_ACQUIRE);
@@ -406,8 +434,17 @@ int tty_console_uid(uint32_t *uid)
 	if (t && (int)t->id == sid && t->sid == sid && t->ctty == tty &&
 	    !t->has_exited && t->privilege == TASK_USER &&
 	    tty->sid == sid) {
-		*uid = t->cred.uid;
-		ok = 1;
+		uint32_t lsess = __atomic_load_n(&t->login_session,
+						 __ATOMIC_ACQUIRE);
+		uint32_t luid = __atomic_load_n(&t->login_uid,
+						__ATOMIC_ACQUIRE);
+
+		if (!need_login || (lsess != TASK_LOGIN_UNSET &&
+				    luid == t->cred.uid)) {
+			*uid = t->cred.uid;
+			*session = lsess;
+			ok = 1;
+		}
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, fl);
 	return ok;
@@ -421,6 +458,19 @@ static long tty_show_console_user(struct pfs_node *n, char *buf, long cap)
 	if (!tty_console_uid(&uid))
 		return 0;
 	return ksnprintf(buf, (size_t)cap, "%u\n", uid);
+}
+
+/* "<login session id> <uid>" of the console's login, nothing when there is
+ * none: what the power commands ask before they act (poweroff, shutdown),
+ * comparing it with their caller's /proc/self/sessionid. */
+static long tty_show_console_session(struct pfs_node *n, char *buf, long cap)
+{
+	uint32_t uid, session;
+
+	(void)n;
+	if (!tty_console_session(&uid, &session))
+		return 0;
+	return ksnprintf(buf, (size_t)cap, "%u %u\n", session, uid);
 }
 
 static void tty_signal_pgrp(tty_t *tty, int sig);

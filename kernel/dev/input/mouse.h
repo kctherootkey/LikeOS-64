@@ -143,6 +143,9 @@ void mouse_apply_cursor(void); // Apply loaded cursor from cursor.h
 // Inject a USB HID mouse movement/button/scroll event.
 // Called by the USB HID driver to feed events into the mouse subsystem.
 void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel);
+// From the device-poll loop: reports the VMware absolute pointer queued
+// (see mouse.c).
+void mouse_poll(void);
 
 
 /* Redraw the console pointer after another program gives the display back.

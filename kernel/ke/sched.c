@@ -1815,6 +1815,19 @@ static int sched_prev_runnable(const task_t *cur, int preempt)
 // TASK INITIALIZER HELPER
 // ============================================================================
 
+static uint32_t g_next_login_session = 1;
+
+uint32_t sched_new_login_session(void)
+{
+	uint32_t id;
+
+	do
+		id = __atomic_fetch_add(&g_next_login_session, 1,
+					__ATOMIC_RELAXED);
+	while (id == TASK_LOGIN_UNSET || id == 0);
+	return id;
+}
+
 static void task_init_common(task_t *t)
 {
 	BUG_ON(t == NULL);
@@ -1830,6 +1843,8 @@ static void task_init_common(task_t *t)
 	t->pgid = 0;
 	t->sid = 0;
 	t->ctty = NULL;
+	t->login_uid = TASK_LOGIN_UNSET;
+	t->login_session = TASK_LOGIN_UNSET;
 	t->wait_next = NULL;
 	t->wait_channel = NULL;
 	t->wakeup_tick = 0;

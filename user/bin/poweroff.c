@@ -6,6 +6,9 @@
  *
  * Implements the poweroff(8)/reboot(8)/halt(8) command per systemd manpage.
  *
+ * Installed setuid root, and acts only for root and for the user logged in
+ * at the console (power_policy.h).
+ *
  * Copyright (C) 2026 The LikeOS Project
  */
 
@@ -15,6 +18,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/reboot.h>
+
+#include "power_policy.h"
 
 enum action {
 	ACTION_POWEROFF,
@@ -64,6 +69,9 @@ int main(int argc, char *argv[])
 	int no_wtmp = 0; /* -d, --no-wtmp */
 	int no_sync = 0; /* -n, --no-sync */
 	int no_wall = 0; /* --no-wall */
+
+	/* Setuid root: an environment of its own (power_policy.h). */
+	power_sanitize_env();
 
 	/* Determine default action from program name */
 	if (strcmp(progname, "reboot") == 0) {
@@ -138,6 +146,15 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "%s: too many arguments.\n", progname);
 			return 1;
 		}
+	}
+
+	/* Only root and the user logged in at the console may go further:
+	 * everything below either acts on the machine or says it will. */
+	if (!power_caller_allowed()) {
+		fprintf(stderr,
+			"%s: permission denied: only root or the user logged in at the console may do this\n",
+			progname);
+		return 1;
 	}
 
 	/* wtmp_only: just pretend to write wtmp and exit */

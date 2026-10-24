@@ -10,6 +10,7 @@
 #include <kernel/dev/video/vmsvga2.h>
 #include <kernel/dev/video/vmsvga2_hw.h>
 #include <kernel/dev/input/evdev.h>
+#include <kernel/dev/input/vmmouse.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/sched.h>
@@ -34,6 +35,14 @@ static spinlock_t mouse_lock = SPINLOCK_INIT("mouse");
 
 // Forward declaration - internal cursor update (caller must hold mouse_lock)
 static void mouse_update_cursor_internal(void);
+
+/* VMware's absolute pointer (vmmouse.h).  Active: the host reports where its
+ * pointer is over the guest's screen, the emulated PS/2 mouse's interrupt is
+ * only the doorbell for it, and the event device reports absolute positions.
+ * Seen: it has delivered a report, after which the emulated USB mouse is not
+ * a second source of the same movements.  Both under mouse_lock. */
+static int g_vmmouse_active;
+static int g_vmmouse_seen;
 
 
 // Mouse cursor bitmap (11x19 Windows-style arrow cursor)
@@ -727,6 +736,125 @@ static void mouse_process_packet(void)
 	mouse_state.packet_index = 0;
 }
 
+/* One report of the absolute pointer, with the PS/2 and USB paths' effect:
+ * the event device, the console's pointer, scrollback and terminal mouse
+ * reporting.  Caller holds mouse_lock. */
+static void mouse_vmmouse_report_locked(const struct vmmouse_packet *p)
+{
+	uint8_t buttons = ((p->status & VMMOUSE_LEFT_BUTTON) ? 0x01 : 0) |
+			  ((p->status & VMMOUSE_RIGHT_BUTTON) ? 0x02 : 0) |
+			  ((p->status & VMMOUSE_MIDDLE_BUTTON) ? 0x04 : 0);
+	/* A signed byte, positive towards the user as on the PS/2 wheel. */
+	int z = (int8_t)(uint8_t)p->z;
+	int w = mouse_state.screen_width > 0 ? mouse_state.screen_width : 1;
+	int h = mouse_state.screen_height > 0 ? mouse_state.screen_height : 1;
+	uint32_t ax, ay;
+
+	mouse_state.last_x = mouse_state.x;
+	mouse_state.last_y = mouse_state.y;
+	if (p->status & VMMOUSE_RELATIVE_PACKET) {
+		/* The host is in relative mode: deltas, y up. */
+		mouse_state.x += (int32_t)p->x;
+		mouse_state.y -= (int32_t)p->y;
+		if (mouse_state.x < 0)
+			mouse_state.x = 0;
+		if (mouse_state.y < 0)
+			mouse_state.y = 0;
+		if (mouse_state.x > w - 1)
+			mouse_state.x = w - 1;
+		if (mouse_state.y > h - 1)
+			mouse_state.y = h - 1;
+		ax = w > 1 ? (uint32_t)((uint64_t)mouse_state.x * VMMOUSE_MAX /
+					(uint32_t)(w - 1)) : 0;
+		ay = h > 1 ? (uint32_t)((uint64_t)mouse_state.y * VMMOUSE_MAX /
+					(uint32_t)(h - 1)) : 0;
+	} else {
+		ax = p->x > VMMOUSE_MAX ? VMMOUSE_MAX : p->x;
+		ay = p->y > VMMOUSE_MAX ? VMMOUSE_MAX : p->y;
+		mouse_state.x = (int)((uint64_t)ax * (uint32_t)w /
+				      (VMMOUSE_MAX + 1));
+		mouse_state.y = (int)((uint64_t)ay * (uint32_t)h /
+				      (VMMOUSE_MAX + 1));
+	}
+
+	// Event device orientation: wheel positive away from the user.
+	if (evdev_feed_mouse_abs(ax, ay, buttons, -z))
+		return; // grabbed: no console pointer, no tty reporting
+
+	mouse_state.last_buttons =
+		(mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
+		(mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |
+		(mouse_state.middle_button ? MOUSE_MIDDLE_BUTTON : 0);
+	mouse_state.left_button = (buttons & 0x01) ? 1 : 0;
+	mouse_state.right_button = (buttons & 0x02) ? 1 : 0;
+	mouse_state.middle_button = (buttons & 0x04) ? 1 : 0;
+
+	if (z != 0) {
+		mouse_state.scroll_delta = z;
+		if (!fbdev_display_owned()) {
+			console_handle_mouse_wheel(z);
+			tty_mouse_report_scroll(mouse_state.x, mouse_state.y,
+						z);
+		}
+	}
+
+	if (mouse_state.x != mouse_state.last_x ||
+	    mouse_state.y != mouse_state.last_y)
+		mouse_update_cursor_internal();
+
+	// Same ownership rule as the PS/2 path (mouse_process_packet()).
+	if (!fbdev_display_owned()) {
+		uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
+				   (mouse_state.right_button ? 0x02 : 0) |
+				   (mouse_state.middle_button ? 0x04 : 0);
+
+		console_handle_mouse_event(mouse_state.x, mouse_state.y,
+					   mouse_state.left_button ? 1 : 0);
+		tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns,
+				 mouse_state.last_buttons);
+	}
+}
+
+/* Everything the absolute pointer has queued.  A failed device is enabled
+ * again once; if that fails too, the emulated mouse is the pointer again
+ * (its motion still moves the event device's absolute position).  Caller
+ * holds mouse_lock. */
+static void mouse_vmmouse_drain_locked(void)
+{
+	struct vmmouse_packet p;
+
+	for (int n = 0; n < 255; n++) {
+		int rc = vmmouse_read(&p);
+
+		if (rc == 0)
+			return;
+		if (rc < 0) {
+			vmmouse_disable();
+			if (vmmouse_enable() != 0)
+				g_vmmouse_active = 0;
+			return;
+		}
+		g_vmmouse_seen = 1;
+		mouse_vmmouse_report_locked(&p);
+	}
+}
+
+/* From the device-poll loop: what the absolute pointer queued without a
+ * doorbell reaching mouse_irq_handler() (the emulated PS/2 mouse is the
+ * doorbell, and its interrupt is not the only way the report can end up
+ * waiting). */
+void mouse_poll(void)
+{
+	uint64_t flags;
+
+	if (!__atomic_load_n(&g_vmmouse_active, __ATOMIC_RELAXED))
+		return;
+	spin_lock_irqsave(&mouse_lock, &flags);
+	if (g_vmmouse_active)
+		mouse_vmmouse_drain_locked();
+	spin_unlock_irqrestore(&mouse_lock, flags);
+}
+
 // Initialize mouse system
 // Update cursor clamping bounds after a runtime resolution change and pull
 // the cursor back inside the new screen if necessary.
@@ -736,6 +864,8 @@ void mouse_set_bounds(int width, int height)
 		return;
 	mouse_state.screen_width = width;
 	mouse_state.screen_height = height;
+	if (g_vmmouse_active)
+		evdev_mouse_set_abs_screen(width, height);
 	if (mouse_state.x >= width)
 		mouse_state.x = width - 1;
 	if (mouse_state.y >= height)
@@ -921,6 +1051,26 @@ void mouse_init(void)
 	mouse_write_controller_config(ctrl);
 	ioapic_unmask_gsi(1);
 
+	/* VMware's absolute pointer, where the host has one: the host then
+	 * shows its own pointer over the guest's screen, with the guest's
+	 * cursor image, instead of capturing it.  Decided here, at boot,
+	 * before any client has opened the event device -- which reports
+	 * absolute positions from now on. */
+	{
+		uint64_t flags;
+
+		spin_lock_irqsave(&mouse_lock, &flags);
+		if (vmmouse_enable() == 0) {
+			evdev_mouse_set_absolute((int32_t)VMMOUSE_MAX,
+						 mouse_state.screen_width,
+						 mouse_state.screen_height);
+			g_vmmouse_active = 1;
+		}
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		if (g_vmmouse_active)
+			kprintf("Mouse: VMware absolute pointer\n");
+	}
+
 	kprintf("Mouse initialized successfully\n");
 	kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
 	kprintf("  Screen size: %dx%d\n", mouse_state.screen_width,
@@ -945,6 +1095,13 @@ void mouse_irq_handler(void)
 	}
 
 	uint8_t data = inb(PS2_DATA_PORT);
+
+	// The absolute pointer's doorbell: the byte carries nothing.
+	if (g_vmmouse_active && !mouse_state.expecting_ack) {
+		mouse_vmmouse_drain_locked();
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		return;
+	}
 
 	// Handle ACK responses
 	if (mouse_state.expecting_ack) {
@@ -1161,6 +1318,13 @@ void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
 	// drawing anything.
 	if (!mouse_state.enabled) {
 		mouse_state.enabled = 1;
+	}
+
+	/* The absolute pointer reports these movements already: once it has,
+	 * the emulated USB mouse would be a second copy of them. */
+	if (g_vmmouse_active && g_vmmouse_seen) {
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		return;
 	}
 
 	// evdev tap (USB/I2C injected events use event-device orientation

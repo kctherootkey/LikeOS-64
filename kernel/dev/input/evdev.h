@@ -46,6 +46,16 @@ int evdev_feed_keyboard(uint8_t scan_code);
 // dy positive = down; wheel positive = away from user).  buttons bit0=left,
 // bit1=right, bit2=middle.  Returns 1 when the mouse is grabbed.
 int evdev_feed_mouse(int dx, int dy, uint8_t buttons, int wheel, int hwheel);
+// The mouse reports absolute positions from now on (an absolute pointing
+// device was found at boot, before any client opened the device): ABS_X and
+// ABS_Y from 0 to `max' replace REL_X and REL_Y.  Relative motion still fed
+// through evdev_feed_mouse() moves the position as on a screen_w x
+// screen_h screen.
+void evdev_mouse_set_absolute(int32_t max, int screen_w, int screen_h);
+void evdev_mouse_set_abs_screen(int screen_w, int screen_h);
+// Feed one absolute report: position on the axes, buttons as above, wheel
+// positive away from the user.  Returns 1 when the mouse is grabbed.
+int evdev_feed_mouse_abs(uint32_t x, uint32_t y, uint8_t buttons, int wheel);
 
 // Grab state (drivers use these to gate cursor drawing etc.)
 int evdev_kbd_grabbed(void);

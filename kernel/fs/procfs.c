@@ -179,6 +179,72 @@ static long show_status(struct pfs_node *n, char *buf, long cap)
 	return p;
 }
 
+/* /proc/<pid>/loginuid and sessionid: the login the process belongs to
+ * (task_t::login_uid), 4294967295 for none.  Anyone may read them, as they
+ * may read the uids in status. */
+static long show_loginuid(struct pfs_node *n, char *buf, long cap)
+{
+	PROC_TASK(t) = proc_task((int)n->arg2);
+
+	if (!t)
+		return 0;
+	return pfs_printf(buf, cap, 0, "%u",
+			  __atomic_load_n(&t->login_uid, __ATOMIC_ACQUIRE));
+}
+
+static long show_sessionid(struct pfs_node *n, char *buf, long cap)
+{
+	PROC_TASK(t) = proc_task((int)n->arg2);
+
+	if (!t)
+		return 0;
+	return pfs_printf(buf, cap, 0, "%u",
+			  __atomic_load_n(&t->login_session,
+					  __ATOMIC_ACQUIRE));
+}
+
+/* A login records itself: writing a uid to /proc/self/loginuid makes the
+ * writer that user's login, with a session id never used before, and every
+ * process it starts from then on belongs to it.  Only root may, and only
+ * for itself -- a login runs as root until it becomes the user.  Writing
+ * 4294967295 leaves the login. */
+static long store_loginuid(struct pfs_node *n, const char *buf, long len)
+{
+	task_t *cur = sched_current();
+	uint64_t v = 0;
+	long i = 0;
+
+	if (!cur || !capable())
+		return -EPERM;
+	{
+		PROC_TASK(t) = proc_task((int)n->arg2);
+
+		if (t != cur)
+			return -EPERM;
+	}
+	if (len <= 0)
+		return -EINVAL;
+	for (; i < len && buf[i] >= '0' && buf[i] <= '9'; i++) {
+		v = v * 10 + (uint64_t)(buf[i] - '0');
+		if (v > TASK_LOGIN_UNSET)
+			return -EINVAL;
+	}
+	if (i == 0 || (i < len && !(buf[i] == '\n' && i + 1 == len)))
+		return -EINVAL;
+	if (v == TASK_LOGIN_UNSET) {
+		__atomic_store_n(&cur->login_session, TASK_LOGIN_UNSET,
+				 __ATOMIC_RELEASE);
+		__atomic_store_n(&cur->login_uid, TASK_LOGIN_UNSET,
+				 __ATOMIC_RELEASE);
+	} else {
+		__atomic_store_n(&cur->login_uid, (uint32_t)v,
+				 __ATOMIC_RELEASE);
+		__atomic_store_n(&cur->login_session,
+				 sched_new_login_session(), __ATOMIC_RELEASE);
+	}
+	return len;
+}
+
 static long show_maps(struct pfs_node *n, char *buf, long cap)
 {
 	PROC_TASK(t) = proc_task((int)n->arg2);
@@ -457,15 +523,17 @@ static struct pfs_node *fd_lookup(struct pfs_node *dir, const char *name)
 static int pid_list(struct pfs_node *dir, unsigned index, char *name,
 		    long cap, int *type)
 {
-	static const char *const names[] = { "cmdline", "comm",	 "stat",
-					     "status",	"maps",	 "mem",
-					     "auxv",	"exe",	 "cwd",
-					     "fd",	"statm" };
+	static const char *const names[] = { "cmdline",	  "comm",  "stat",
+					     "status",	  "maps",  "mem",
+					     "auxv",	  "exe",   "cwd",
+					     "fd",	  "statm", "loginuid",
+					     "sessionid" };
 	(void)dir;
-	if (index >= 11)
+	if (index >= 13)
 		return 0;
 	ksnprintf(name, (size_t)cap, "%s", names[index]);
-	*type = index == 9 ? DT_DIR : (index >= 7 ? DT_LNK : DT_REG);
+	*type = index == 9 ? DT_DIR :
+			     (index >= 7 && index <= 8 ? DT_LNK : DT_REG);
 	return 1;
 }
 
@@ -524,6 +592,17 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n)
 			n->show = show_statm;
+	} else if (kstrcmp(name, "loginuid") == 0) {
+		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
+		if (n) {
+			n->show = show_loginuid;
+			n->store = store_loginuid;
+			n->mode = 0644;
+		}
+	} else if (kstrcmp(name, "sessionid") == 0) {
+		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
+		if (n)
+			n->show = show_sessionid;
 	} else if (kstrcmp(name, "mem") == 0) {
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n) {

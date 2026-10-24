@@ -509,6 +509,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/keyboard.o \
 			  $(BUILD_DIR)/serial.o \
               $(BUILD_DIR)/mouse.o \
+              $(BUILD_DIR)/vmmouse.o \
               $(BUILD_DIR)/memory.o \
 			  $(BUILD_DIR)/stack_switch.o \
 			  $(BUILD_DIR)/slab.o $(BUILD_DIR)/shm.o $(BUILD_DIR)/sysv_sem.o \
@@ -1025,6 +1026,9 @@ $(BUILD_DIR)/serial.o: $(KERNEL_DIR)/hal/serial.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/dev/input/mouse.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmmouse.o: $(KERNEL_DIR)/dev/input/vmmouse.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
@@ -2545,6 +2549,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# Each drops or confines privilege internally and decides on getuid().
 	# ping does NOT get setuid: it uses the unprivileged ICMP echo syscall.
 	chmod 4755 $(EXT4_STAGING)/bin/passwd $(EXT4_STAGING)/bin/su
+	# The power commands: setuid root, and they act only for root and the
+	# user logged in at the console (user/bin/power_policy.h).
+	chmod 4755 $(EXT4_STAGING)/bin/poweroff $(EXT4_STAGING)/bin/reboot \
+		$(EXT4_STAGING)/bin/halt $(EXT4_STAGING)/bin/shutdown
 	# Shared libraries -> /lib
 	for l in $(ROOT_LIBS); do cp $(BUILD_DIR)/$$l $(EXT4_STAGING)/lib/$$l; done
 	# /usr/bin/env so "#!/usr/bin/env <interp>" shebangs resolve (real copy;

@@ -1335,6 +1335,106 @@ static void on_exit_wm(GtkMenuItem *item, gpointer data)
 	}
 }
 
+/* Settings > Display: the dialog the desktop's own menu opens as well. */
+static void on_display_settings(GtkMenuItem *item, gpointer data)
+{
+	char *argv[] = { (char *)"/usr/bin/likeos-display-settings", NULL };
+	GError *err = NULL;
+
+	(void)item;
+	(void)data;
+	if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL,
+			   &err)) {
+		g_warning("display settings: cannot start %s: %s", argv[0],
+			  err ? err->message : "?");
+		g_clear_error(&err);
+	}
+}
+
+/* Reboot and Poweroff run the commands of the same names.  They decide
+ * themselves whether this user may (root, or the user logged in at the
+ * console -- which the desktop's user is); the menu only asks first, since
+ * a misplaced click must not take the machine down, and says so when the
+ * command refuses. */
+struct power_req {
+	const char *cmd;   /* /bin/reboot or /bin/poweroff */
+	const char *what;  /* "restarted" / "powered off", for the message */
+};
+
+static const struct power_req g_reboot_req = { "/bin/reboot", "restarted" };
+static const struct power_req g_poweroff_req = { "/bin/poweroff",
+						 "powered off" };
+
+static void power_failed(const struct power_req *req)
+{
+	GtkWidget *d = gtk_message_dialog_new(
+		NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+		"The computer could not be %s.", req->what);
+
+	gtk_message_dialog_format_secondary_text(
+		GTK_MESSAGE_DIALOG(d),
+		"Only root and the user logged in at the console may do this.");
+	gtk_dialog_run(GTK_DIALOG(d));
+	gtk_widget_destroy(d);
+}
+
+static void on_power_exit(GPid pid, gint status, gpointer data)
+{
+	const struct power_req *req = data;
+
+	g_spawn_close_pid(pid);
+	/* A command that succeeded does not come back: the machine goes
+	 * down.  One that exits has refused or failed. */
+	if (!g_spawn_check_wait_status(status, NULL))
+		power_failed(req);
+}
+
+static void power_request(const struct power_req *req, const char *question,
+			  const char *button)
+{
+	GtkWidget *d = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL,
+					      GTK_MESSAGE_QUESTION,
+					      GTK_BUTTONS_NONE, "%s", question);
+	gint answer;
+
+	gtk_dialog_add_buttons(GTK_DIALOG(d), "_Cancel", GTK_RESPONSE_CANCEL,
+			       button, GTK_RESPONSE_ACCEPT, NULL);
+	gtk_dialog_set_default_response(GTK_DIALOG(d), GTK_RESPONSE_CANCEL);
+	answer = gtk_dialog_run(GTK_DIALOG(d));
+	gtk_widget_destroy(d);
+	if (answer != GTK_RESPONSE_ACCEPT)
+		return;
+
+	char *argv[] = { (char *)req->cmd, NULL };
+	GError *err = NULL;
+	GPid pid;
+
+	if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD, NULL,
+			   NULL, &pid, &err)) {
+		g_warning("cannot start %s: %s", req->cmd,
+			  err ? err->message : "?");
+		g_clear_error(&err);
+		power_failed(req);
+		return;
+	}
+	g_child_watch_add(pid, on_power_exit, (gpointer)req);
+}
+
+static void on_reboot(GtkMenuItem *item, gpointer data)
+{
+	(void)item;
+	(void)data;
+	power_request(&g_reboot_req, "Restart the computer now?", "_Reboot");
+}
+
+static void on_poweroff(GtkMenuItem *item, gpointer data)
+{
+	(void)item;
+	(void)data;
+	power_request(&g_poweroff_req, "Power off the computer now?",
+		      "_Power off");
+}
+
 /* The icon for a menu entry, from the icon theme, at 16 pixels.
  *
  * Falls back to the generic executable icon: xnedit, for one, names an icon
@@ -1493,6 +1593,17 @@ static void show_start_menu(void)
 
 	gtk_menu_item_set_submenu(GTK_MENU_ITEM(programs), programs_menu());
 	gtk_menu_shell_append(GTK_MENU_SHELL(menu), programs);
+
+	GtkWidget *settings = gtk_menu_item_new_with_label("Settings");
+	GtkWidget *settings_menu = gtk_menu_new();
+	GtkWidget *display = icon_menu_item("preferences-desktop-display",
+					    "Display");
+
+	g_signal_connect(display, "activate", G_CALLBACK(on_display_settings),
+			 NULL);
+	gtk_menu_shell_append(GTK_MENU_SHELL(settings_menu), display);
+	gtk_menu_item_set_submenu(GTK_MENU_ITEM(settings), settings_menu);
+	gtk_menu_shell_append(GTK_MENU_SHELL(menu), settings);
 	gtk_menu_shell_append(GTK_MENU_SHELL(menu),
 			      gtk_separator_menu_item_new());
 
@@ -1503,6 +1614,15 @@ static void show_start_menu(void)
 	g_signal_connect(quit, "activate", G_CALLBACK(on_exit_wm), NULL);
 	gtk_menu_shell_append(GTK_MENU_SHELL(menu), restart);
 	gtk_menu_shell_append(GTK_MENU_SHELL(menu), quit);
+
+	GtkWidget *reboot_item = gtk_menu_item_new_with_label("Reboot");
+	GtkWidget *poweroff_item = gtk_menu_item_new_with_label("Poweroff");
+
+	g_signal_connect(reboot_item, "activate", G_CALLBACK(on_reboot), NULL);
+	g_signal_connect(poweroff_item, "activate", G_CALLBACK(on_poweroff),
+			 NULL);
+	gtk_menu_shell_append(GTK_MENU_SHELL(menu), reboot_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(menu), poweroff_item);
 
 	g_signal_connect(menu, "deactivate", G_CALLBACK(on_menu_done), NULL);
 	gtk_widget_show_all(menu);

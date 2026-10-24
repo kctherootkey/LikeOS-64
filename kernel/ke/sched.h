@@ -755,6 +755,17 @@ typedef struct task {
 	int sid;
 	struct tty *ctty;
 
+	/* The login this process belongs to: the uid that logged in and the
+	 * login session's id, TASK_LOGIN_UNSET until a login sets them
+	 * (/proc/self/loginuid, root only, which also starts a new session
+	 * id).  Unlike the POSIX session above they survive setsid() by an
+	 * unprivileged process, so a terminal window's shell is still part of
+	 * the console's login; a privileged setsid() clears them (sys_setsid).
+	 * Inherited across fork/clone by the task-struct copy and kept across
+	 * exec, set-id exec included. */
+	uint32_t login_uid;
+	uint32_t login_session;
+
 	// Wait linkage for blocking I/O
 	struct task *wait_next;
 	void *wait_channel;
@@ -1276,6 +1287,10 @@ void sched_run_ready(void);
  * Called once, at the end of init, and never returns. */
 void sched_bsp_park(void);
 task_t *sched_current(void);
+
+#define TASK_LOGIN_UNSET 0xffffffffu
+/* A login session id never handed out before (never TASK_LOGIN_UNSET). */
+uint32_t sched_new_login_session(void);
 
 /* Mark `t' (the caller) as going to sleep, as a full memory barrier.
  *

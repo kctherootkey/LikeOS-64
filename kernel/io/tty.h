@@ -115,6 +115,9 @@ tty_t *tty_get_console(void);
 /* The console's logged-in user (real uid of its live session leader); 0
  * when there is none.  See tty.c. */
 int tty_console_uid(uint32_t *uid);
+/* The same login's login session id (task_t::login_session) as well, from
+ * one lookup; 0 when the leader is no recorded login. */
+int tty_console_session(uint32_t *uid, uint32_t *session);
 /* /sys/kernel/console_user.  After sysfs_init(). */
 void tty_sysfs_init(void);
 void tty_console_resize(void); // after a runtime resolution change
