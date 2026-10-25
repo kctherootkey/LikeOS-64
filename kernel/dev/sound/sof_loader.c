@@ -716,8 +716,6 @@ int sof_fw_boot(struct sof_host *h)
 	rc = sof_ipc4_query_fw_config(h);
 	if (rc)
 		sof_log(h, "continuing without the firmware configuration\n");
-	/* errors the firmware reports for an IPC come with its reason */
-	(void)sof_ipc4_enable_fw_logs(h);
 	if (h->s.fw_version[0] || h->s.fw_version[1])
 		sof_log(h, "firmware %u.%u.%u.%u running after %u ms\n",
 			h->s.fw_version[0], h->s.fw_version[1],

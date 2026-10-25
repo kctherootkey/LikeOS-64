@@ -319,24 +319,6 @@ static void sof_panic_work(void *arg)
 		snd_card_event(h->s.card, AUDIO_EV_XRUN, 0, AUDIO_DIR_PLAYBACK);
 }
 
-/* Firmware log lines arriving on their own (warnings while streaming): a
- * bounded number per boot, the rest is consumed silently. */
-#define SOF_FW_LOG_NOTIFY_LINES 64
-
-static void sof_fw_log_work(void *arg)
-{
-	struct sof_host *h = arg;
-	int left = SOF_FW_LOG_NOTIFY_LINES - (int)h->fw_log_lines;
-
-	__atomic_store_n(&h->fw_log_work_queued, 0, __ATOMIC_RELEASE);
-	if (left < 0)
-		left = 0;
-	if (left > 16)
-		left = 16;
-	h->fw_log_lines += (uint32_t)left;
-	sof_dsp_fw_log_flush(h, left);
-}
-
 /* A notification with a payload: read the bits worth logging.  Called
  * with the IPC lock held; reads only a few words. */
 static void sof_ipc_notification(struct sof_host *h, uint32_t primary,
@@ -390,14 +372,8 @@ static void sof_ipc_notification(struct sof_host *h, uint32_t primary,
 				w[2]);
 		break;
 	case SOF_IPC4_NOTIFY_LOG_BUFFER_STATUS:
-		/* the firmware logged something (core in bits 15:12): print
-		 * it from the work thread, not under the IPC lock */
-		if (h->fw_log_on &&
-		    !__atomic_exchange_n(&h->fw_log_work_queued, 1,
-					 __ATOMIC_ACQ_REL) &&
-		    snd_schedule_work(sof_fw_log_work, h, 0) < 0)
-			__atomic_store_n(&h->fw_log_work_queued, 0,
-					 __ATOMIC_RELEASE);
+		/* firmware trace advanced (core in bits 15:12); the ring is
+		 * read only in crash dumps */
 		break;
 	default:
 		if (h->notif_unknown + (type < SOF_IPC4_NOTIFY_TYPE_LAST ?
@@ -668,7 +644,6 @@ static int sof_ipc_tx(struct sof_host *h, uint32_t primary, uint32_t ext,
 				rc == -EIO ? "aborted: firmware crashed" :
 					     "timed out");
 			sof_ipc4_dump_regs(h);
-			sof_dsp_fw_log_flush(h, 32);
 		}
 		if (sof_dsp_rom_status(h) & SOF_FSR_HALTED) {
 			h->crashed = 1;
@@ -689,8 +664,6 @@ static int sof_ipc_tx(struct sof_host *h, uint32_t primary, uint32_t ext,
 			sof_log(h, "IPC %#x|%#x failed: status %u (%s)\n",
 				primary, ext, status,
 				sof_ipc4_status_text(status));
-		/* the firmware says why in its log */
-		sof_dsp_fw_log_flush(h, 32);
 	} else if (reply && reply_max) {
 		size_t n = h->rx_len < reply_max ? h->rx_len : reply_max;
 
@@ -981,41 +954,6 @@ static void sof_parse_hw_config(struct sof_host *h, const uint8_t *p,
 		}
 		off += 8 + ((size + 3) & ~3u);
 	}
-}
-
-/* ENABLE_LOGS: how often the firmware reports new log lines (ms), and a
- * priority mask per core -- bit 0 critical, 1 error, 2 warning, 3 info. */
-struct sof_ipc4_log_state {
-	uint32_t aging_timer_period;
-	uint32_t fifo_full_timer_period;
-	uint32_t enable;
-	uint32_t logs_mask[8];
-};
-
-int sof_ipc4_enable_fw_logs(struct sof_host *h)
-{
-	struct sof_ipc4_log_state st;
-	int i, rc;
-
-	if (!h->debug_off)
-		return -ENODEV;
-	kmemset(&st, 0, sizeof(st));
-	st.aging_timer_period = 100;
-	st.fifo_full_timer_period = 100;
-	st.enable = 1;
-	for (i = 0; i < 8; i++)
-		st.logs_mask[i] = 0x7; /* critical, errors, warnings */
-	rc = sof_ipc4_large_config(h, SOF_IPC4_BASEFW_MODULE,
-				   SOF_IPC4_BASEFW_INSTANCE,
-				   SOF_IPC4_FW_PARAM_ENABLE_LOGS, &st, sizeof(st),
-				   1, NULL);
-	if (rc) {
-		sof_log(h, "firmware log not enabled (%d); IPC errors will not say why\n",
-			rc);
-		return rc;
-	}
-	h->fw_log_on = 1;
-	return 0;
 }
 
 int sof_ipc4_query_fw_config(struct sof_host *h)
