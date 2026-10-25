@@ -1588,11 +1588,18 @@ int sdw_intel_init(struct sof_dev *sdev)
 	ctx_generation(c);
 	snd_mutex_init(&c->ctl_lock, "sdw_ctl");
 	c->out_mode = AUDIO_OUTSEL_AUTO;
+	/* The codec's own stages start fully open (100 = the part's 0 dB
+	 * limit): the listening level is the audio service's, which scales in
+	 * software.  These values are applied over the codec's defaults once
+	 * it is up; anything below 100 here is an attenuation nobody ever
+	 * lifts -- 75 x 80 put the speaker at -26 dB for good. */
 	for (int i = 0; i <= AUDIO_CTL_MAX; i++) {
-		c->vol[i][0] = c->vol[i][1] = 75;
+		c->vol[i][0] = c->vol[i][1] = 100;
 		c->mute[i] = 0;
 	}
-	c->vol[AUDIO_CTL_MASTER][0] = c->vol[AUDIO_CTL_MASTER][1] = 80;
+	/* capture: about 0 dB on the decimators, as the codec probes it */
+	c->vol[AUDIO_CTL_CAPTURE][0] = c->vol[AUDIO_CTL_CAPTURE][1] = 67;
+	c->vol[AUDIO_CTL_MIC_BOOST][0] = c->vol[AUDIO_CTL_MIC_BOOST][1] = 75;
 
 	if (c->ace2) {
 		if (ml_discover(c)) {

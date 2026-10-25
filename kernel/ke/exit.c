@@ -72,6 +72,34 @@ __attribute__((noreturn)) void sys_exit(uint64_t status)
 
 // SYS_WAIT4/SYS_WAITPID - wait for child process
 // In a preemptive kernel, this BLOCKS until a child exits (unless WNOHANG)
+/* Does child `c' answer this waitpid()'s pid argument?  Under g_wait_lock.
+ * A child already claimed by another waiter (reaped) answers nobody. */
+static bool wait_pid_matches(const task_t *c, int64_t pid, const task_t *cur)
+{
+	if (c->reaped)
+		return false;
+	if (pid > 0 && c->id != (uint32_t)pid)
+		return false;
+	if (pid == 0 && c->pgid != cur->pgid)
+		return false;
+	if (pid < -1 && c->pgid != (int)(-pid))
+		return false;
+	return true;
+}
+
+/* Has child `c' finished, as far as its parent is concerned?  A group
+ * leader that exited while its other threads still run is a zombie, but the
+ * process is not over: it is reported when the last thread leaves (which is
+ * also when the parent is notified). */
+static bool wait_child_finished(const task_t *c)
+{
+	if (!c->has_exited)
+		return false;
+	if ((!c->group_leader || c->group_leader == c) && c->nr_threads > 0)
+		return false;
+	return true;
+}
+
 int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		    uint64_t rusage_ptr)
 {
@@ -121,14 +149,15 @@ int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 
 		spin_lock_irqsave(&g_wait_lock, &scan_flags);
 		for (task_t *c = owner->first_child; c; c = c->next_sibling) {
-			if (pid > 0 && c->id != (uint32_t)pid)
-				continue;
-			if (pid == 0 && c->pgid != cur->pgid)
-				continue;
-			if (pid < -1 && c->pgid != (int)(-pid))
+			if (!wait_pid_matches(c, pid, cur))
 				continue;
 			matched_any = 1;
-			if (c->has_exited) {
+			if (wait_child_finished(c)) {
+				/* Claimed here, under the lock: another thread
+				 * of this process waiting at the same time
+				 * must not report (and queue for freeing) the
+				 * same child a second time. */
+				c->reaped = true;
 				child = c;
 				break;
 			}
@@ -289,19 +318,35 @@ int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		uint64_t irq_flags;
 		spin_lock_irqsave(&g_wait_lock, &irq_flags);
 
-		bool found_zombie = false;
+		/* The same children the scan above looks at, and only those:
+		 * a zombie this call is not asking for (another child, one
+		 * outside the requested process group) is no reason to stay
+		 * awake.  Counting it sent a waitpid() for one running child
+		 * round this loop at full speed for as long as that child ran,
+		 * whenever a sibling sat unreaped -- which is every GLib
+		 * program between a child's exit and its child watch. */
+		bool found_zombie = false, any_match = false;
 		task_t *zombie_check = owner->first_child;
 		while (zombie_check) {
-			if (zombie_check->has_exited ||
-			    ((options & 2) && zombie_check->jc_stop_signo) ||
-			    ((options & 8) && zombie_check->jc_continued)) {
-				found_zombie = true;
-				break;
+			if (wait_pid_matches(zombie_check, pid, cur)) {
+				any_match = true;
+				if (wait_child_finished(zombie_check) ||
+				    ((options & 2) &&
+				     zombie_check->jc_stop_signo) ||
+				    ((options & 8) &&
+				     zombie_check->jc_continued)) {
+					found_zombie = true;
+					break;
+				}
 			}
 			zombie_check = zombie_check->next_sibling;
 		}
 
-		if (found_zombie || (!owner->first_child && !has_tracees)) {
+		/* `any_match': another thread of this process may have
+		 * claimed the last child we were waiting for since the scan;
+		 * then the top of the loop answers ECHILD rather than this
+		 * thread sleeping for a child that is no longer ours. */
+		if (found_zombie || (!any_match && !has_tracees)) {
 			/* Something to report, or nothing left to wait for:
 			 * either way the top of the loop decides, not us.
 			 *

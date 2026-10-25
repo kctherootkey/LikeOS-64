@@ -420,6 +420,30 @@ static void tasks_clear(void)
  * of windows and each one costs four properties; the alternative is tracking
  * additions and removals against a cache, which is more code and one more
  * thing that can disagree with the server. */
+/* Add `mask' to the events this program's X connection receives from `w'.
+ *
+ * Added, never set: an X client has ONE event mask per window, and the
+ * connection used here is GDK's own.  On the root and, above all, on this
+ * program's own windows -- its confirmation dialogs are managed windows on
+ * _NET_CLIENT_LIST like any other -- GDK has selected what it lives on, and
+ * XSelectInput() with a bare PropertyChangeMask threw that away.  For a new
+ * dialog that meant no MapNotify: GDK keeps a new toplevel's frame clock
+ * frozen until the window is mapped, so the dialog was never drawn (a white
+ * rectangle), and being modal it took every click on the bar with it.
+ * Whether it happened depended on whether this program or the window
+ * manager's map reached the server first. */
+static void select_more_input(Window w, long mask)
+{
+	GdkDisplay *disp = gdk_display_get_default();
+	XWindowAttributes wa;
+
+	gdk_x11_display_error_trap_push(disp);
+	if (XGetWindowAttributes(g_dpy, w, &wa) &&
+	    (wa.your_event_mask & mask) != mask)
+		XSelectInput(g_dpy, w, wa.your_event_mask | mask);
+	gdk_x11_display_error_trap_pop_ignored(disp);
+}
+
 static void tasks_refresh(void)
 {
 	unsigned long n = 0;
@@ -451,10 +475,7 @@ static void tasks_refresh(void)
 		 * a window that is minimised, renamed or restored would keep
 		 * its old button until something else happened to trigger a
 		 * refresh. */
-		gdk_x11_display_error_trap_push(gdk_display_get_default());
-		XSelectInput(g_dpy, wins[i], PropertyChangeMask);
-		gdk_x11_display_error_trap_pop_ignored(
-			gdk_display_get_default());
+		select_more_input(wins[i], PropertyChangeMask);
 	}
 	XFree(d);
 out:
@@ -3320,10 +3341,10 @@ int main(int argc, char **argv)
 
 	set_strut(xwin, PANEL_HEIGHT, geo.x, sw);
 
-	/* Watch the root for the four properties that describe the desktop. */
-	gdk_x11_display_error_trap_push(disp);
-	XSelectInput(g_dpy, g_root, PropertyChangeMask | SubstructureNotifyMask);
-	gdk_x11_display_error_trap_pop_ignored(disp);
+	/* Watch the root for the four properties that describe the desktop
+	 * (on top of what GDK selects there for itself: see
+	 * select_more_input()). */
+	select_more_input(g_root, PropertyChangeMask | SubstructureNotifyMask);
 	gdk_window_add_filter(NULL, event_filter, NULL);
 
 	g_ndesktops = prop_card(g_root, A.number_of_desktops, 4);

@@ -1107,6 +1107,11 @@ typedef struct task {
 	 * believe they own the task_t. */
 	volatile int pin_count;
 	volatile bool condemned;
+	/* Reaped: the parent collected the exit status (or nobody will), and
+	 * the task_t only waits for the dead-thread reaper to free it.  To
+	 * every lookup by pid it no longer exists -- kill(pid, 0) on it is
+	 * ESRCH, as a shell's `while kill -0 $pid; do wait $pid; done' needs. */
+	volatile bool reaped;
 
 	/* Set when a leader's destruction was postponed because group_ref was
 	 * still non-zero.  Tells the last thread to hand the leader back to

@@ -1806,6 +1806,8 @@ static void kill_task(task_t *t, int sig, task_t *sender)
 	sched_signal_task_from(t, sig, sender);
 }
 
+static int kill_one_pinned(task_t *self, task_t *t, uint64_t sig);
+
 int64_t sys_kill(uint64_t pid, uint64_t sig)
 {
 	if (sig > 64)
@@ -1846,9 +1848,34 @@ int64_t sys_kill(uint64_t pid, uint64_t sig)
 			return 0;
 		return sched_signal_all(self, (int)sig);
 	}
-	task_t *t = sched_find_task_by_id((uint32_t)pid);
+	/* Looked up and pinned under the task-list lock.  A reaped task is
+	 * gone, whatever is left of its task_t: its parent has collected it,
+	 * so kill(pid, 0) must say ESRCH -- a shell's
+	 * `while kill -0 $pid; do wait $pid; done' otherwise spins on
+	 * "not a child" until the reaper frees it.  The pin keeps the
+	 * task_t from being freed under the checks and the delivery below,
+	 * which the reaper on another CPU could otherwise do at any moment. */
+	task_t *t;
+	uint64_t lfl;
+
+	spin_lock_irqsave(&g_task_list_lock, &lfl);
+	t = sched_find_task_by_id_locked((uint32_t)pid);
+	if (t && (t->reaped || t->condemned))
+		t = NULL;
+	if (t && !sched_task_pin(t))
+		t = NULL;
+	spin_unlock_irqrestore(&g_task_list_lock, lfl);
 	if (!t)
 		return -ESRCH;
+	int rc = kill_one_pinned(self, t, sig);
+
+	sched_task_unpin(t);
+	return rc;
+}
+
+/* sys_kill() for one task the caller has pinned. */
+static int kill_one_pinned(task_t *self, task_t *t, uint64_t sig)
+{
 	// Kernel tasks (idle, init, kernel threads) cannot be signalled
 	if (t->privilege == TASK_KERNEL)
 		return -EPERM;

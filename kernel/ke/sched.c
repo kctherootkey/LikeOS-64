@@ -668,6 +668,8 @@ static void dead_thread_queue(task_t *task)
 {
 	if (!task)
 		return;
+	/* on its way to being freed: gone for every pid lookup */
+	task->reaped = true;
 	uint64_t flags;
 	spin_lock_irqsave(&g_dead_thread_lock, &flags);
 	/* Reject duplicate insertions.  Two paths can both try to queue the
@@ -752,6 +754,7 @@ void sched_defer_reap(task_t *child)
 {
 	if (!child)
 		return;
+	child->reaped = true;
 	if (child->parent) {
 		sched_remove_child(child->parent, child);
 		child->parent = NULL;

@@ -1342,64 +1342,6 @@ void sof_dsp_panic_dump(struct sof_host *h)
 	}
 }
 
-/* The firmware's log slots ({host read ptr, dsp write ptr, text ring}, one
- * per core): print what was written since the host last read, then hand
- * the space back.  The firmware drops new lines while its ring is full. */
-void sof_dsp_fw_log_flush(struct sof_host *h, int max_lines)
-{
-	const uint32_t ring = SOF_IPC4_DEBUG_SLOT_SIZE - 8;
-	int i, lines = 0;
-
-	if (!h->fw_log_on || !h->debug_off ||
-	    h->debug_off + SOF_IPC4_DEBUG_SLOT_SIZE * (SOF_IPC4_DEBUG_SLOTS + 1) >
-		    h->bar4_map_size)
-		return;
-	if (__atomic_exchange_n(&h->fw_log_busy, 1, __ATOMIC_ACQUIRE))
-		return; /* somebody is printing it already */
-	for (i = 0; i < SOF_IPC4_DEBUG_SLOTS; i++) {
-		uint32_t d = h->debug_off + SOF_IPC4_DEBUG_DESC_SIZE * (uint32_t)i;
-		uint32_t type = sof_dsp_r32(h, d + 4);
-		uint32_t slot = h->debug_off +
-				SOF_IPC4_DEBUG_SLOT_SIZE * (uint32_t)(i + 1);
-		uint32_t rp, wp;
-		char line[129];
-		uint32_t n = 0;
-
-		if ((type & SOF_IPC4_DEBUG_SLOT_TYPE_MASK) !=
-		    SOF_IPC4_DEBUG_SLOT_DEBUG_LOG)
-			continue;
-		rp = sof_dsp_r32(h, slot);
-		wp = sof_dsp_r32(h, slot + 4);
-		if (rp >= ring || wp >= ring)
-			continue;
-		while (rp != wp) {
-			uint32_t word = sof_dsp_r32(h, slot + 8 + (rp & ~3u));
-			char c = (char)(word >> ((rp & 3u) * 8));
-
-			rp = (rp + 1) % ring;
-			if (c == '\n' || c == '\0' || n == 128) {
-				line[n] = 0;
-				if (n && lines < max_lines) {
-					kprintf("[snd] sof: %s: fw core %u: %s\n",
-						h->id->tag, type & 0xffu, line);
-					lines++;
-				}
-				n = 0;
-				continue;
-			}
-			if (c >= 32 && c < 127)
-				line[n++] = c;
-		}
-		if (n && lines < max_lines) {
-			line[n] = 0;
-			kprintf("[snd] sof: %s: fw core %u: %s\n", h->id->tag,
-				type & 0xffu, line);
-		}
-		sof_dsp_w32(h, slot, wp); /* consumed */
-	}
-	__atomic_store_n(&h->fw_log_busy, 0, __ATOMIC_RELEASE);
-}
-
 long sof_dsp_diag(struct sof_host *h, char *buf, size_t len)
 {
 	size_t pos = 0;
@@ -1870,13 +1812,15 @@ uint32_t sof_stream_position(struct sof_hstream *st)
 		return 0;
 	pos = sof_hda_r32(h, SOF_HDA_VS_DPIB_BASE +
 				     SOF_HDA_VS_DPIB_STRIDE * (uint32_t)st->index);
-	if (pos == 0xffffffffu || pos >= st->buffer_bytes) {
-		pos = sof_hda_r32(h, st->sd_off + SOF_SD_LPIB);
-		if (pos == 0xffffffffu)
-			return 0;
-	}
+	if (pos == 0xffffffffu)
+		return 0;
+	/* DPIB reads the buffer length at the instant it wraps: that is the
+	 * start of the ring again.  Never LPIB instead: with the engine
+	 * decoupled LPIB is the link side's counter, which nothing keeps for
+	 * a DSP-fed stream: a stale value read at a wrap makes the position
+	 * jump, which the core takes for a lap of the ring. */
 	if (pos >= st->buffer_bytes)
-		pos %= st->buffer_bytes;
+		pos = 0;
 	return pos;
 }
 

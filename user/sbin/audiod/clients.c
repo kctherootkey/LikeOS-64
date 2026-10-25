@@ -529,6 +529,21 @@ static void stream_open(struct client *c, const struct aud_stream_open *o)
 							     : 10));
 	if (ring < min_ring)
 		ring = min_ring;
+	/* The engine renders up to two GRANTED device periods in one go
+	 * (engine_fill), and the kernel rounds the period up from what was
+	 * asked (1200 -> 1216 frames at 48 kHz); a resampled stream needs the
+	 * filter's taps of lookahead on top.  A ring smaller than that runs
+	 * dry on every such render and sits out a prebuffer of silence. */
+	if (srv.dev.rate && srv.dev.period_frames) {
+		uint64_t burst = 2ull * srv.dev.period_frames;
+		uint64_t src = (burst * rq.rate + srv.dev.rate - 1) /
+			       srv.dev.rate;
+
+		if (rq.rate != srv.dev.rate)
+			src += 64; /* the longest kernel, RS_QUALITY_BEST */
+		if (ring < src * fb)
+			ring = (size_t)(src * fb);
+	}
 	/* and at least one maximal DATA message, so a client that sends
 	 * full-size messages is never stuck below the credit it needs */
 	if (ring < AUDIOD_MAX_PAYLOAD / 4)
