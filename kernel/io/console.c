@@ -2624,67 +2624,6 @@ int kmemcmp(const void *s1, const void *s2, size_t n)
 	return 0;
 }
 
-// Convert integer to string
-static char *itoa(int64_t value, char *str, int base, int is_signed)
-{
-	char *ptr = str;
-	char *ptr1 = str;
-	char tmp_char;
-	int64_t tmp_value;
-
-	// Handle negative numbers for signed conversion
-	if (is_signed && value < 0) {
-		value = -value;
-		*ptr++ = '-';
-		ptr1++;
-	}
-
-	// Convert to string (reverse order)
-	do {
-		tmp_value = value;
-		value /= base;
-		*ptr++ = "0123456789abcdef"[tmp_value - value * base];
-	} while (value);
-
-	*ptr-- = '\0';
-
-	// Reverse string (except sign)
-	while (ptr1 < ptr) {
-		tmp_char = *ptr;
-		*ptr-- = *ptr1;
-		*ptr1++ = tmp_char;
-	}
-
-	return str;
-}
-
-// Convert unsigned integer to string
-static char *utoa(uint64_t value, char *str, int base)
-{
-	char *ptr = str;
-	char *ptr1 = str;
-	char tmp_char;
-	uint64_t tmp_value;
-
-	// Convert to string (reverse order)
-	do {
-		tmp_value = value;
-		value /= base;
-		*ptr++ = "0123456789ABCDEF"[tmp_value - value * base];
-	} while (value);
-
-	*ptr-- = '\0';
-
-	// Reverse string
-	while (ptr1 < ptr) {
-		tmp_char = *ptr;
-		*ptr-- = *ptr1;
-		*ptr1++ = tmp_char;
-	}
-
-	return str;
-}
-
 // Variable arguments support using GCC built-ins
 typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
@@ -2698,6 +2637,107 @@ int kvprintf(const char *format, va_list args)
 }
 
 // Internal printf implementation that can write to either console or buffer
+static void fmt_out(string_buffer_t *sb, char c)
+{
+	if (sb)
+		string_putchar(c, sb);
+	else
+		console_putchar_unlocked(c);
+}
+
+static int fmt_pad(string_buffer_t *sb, char c, int n)
+{
+	for (int i = 0; i < n; i++)
+		fmt_out(sb, c);
+	return n > 0 ? n : 0;
+}
+
+// Flags of one conversion
+#define FMT_LEFT (1u << 0) // '-'
+#define FMT_ZERO (1u << 1) // '0'
+#define FMT_PLUS (1u << 2) // '+'
+#define FMT_SPACE (1u << 3) // ' '
+#define FMT_ALT (1u << 4) // '#'
+#define FMT_UPPER (1u << 5) // %X
+#define FMT_PREFIX (1u << 6) // %p: "0x" even for 0
+
+// One integer conversion: the digits of `mag' in `base', with sign or
+// prefix, at least `precision' digits, in a field of `width'.
+static int fmt_integer(string_buffer_t *sb, uint64_t mag, int negative,
+		       unsigned base, unsigned flags, int width, int precision)
+{
+	const char *set = (flags & FMT_UPPER) ? "0123456789ABCDEF" :
+						"0123456789abcdef";
+	char digits[24];
+	char prefix[3];
+	int nd = 0, np = 0, zeros = 0, len, count = 0;
+	int nonzero = mag != 0;
+
+	// C: precision 0 and value 0 print no digits at all
+	if (nonzero || precision != 0) {
+		do {
+			digits[nd++] = set[mag % base];
+			mag /= base;
+		} while (mag);
+	}
+
+	if (negative)
+		prefix[np++] = '-';
+	else if (flags & FMT_PLUS)
+		prefix[np++] = '+';
+	else if (flags & FMT_SPACE)
+		prefix[np++] = ' ';
+	if (base == 16 && ((flags & FMT_PREFIX) ||
+			   ((flags & FMT_ALT) && nonzero))) {
+		prefix[np++] = '0';
+		prefix[np++] = (flags & FMT_UPPER) ? 'X' : 'x';
+	}
+
+	if (precision > nd)
+		zeros = precision - nd;
+	// '#' with %o: the first digit is a 0
+	if (base == 8 && (flags & FMT_ALT) && zeros == 0 &&
+	    (nd == 0 || digits[nd - 1] != '0'))
+		zeros = 1;
+
+	len = np + zeros + nd;
+	// '0' pads with zeros after the sign/prefix; not with '-' or a
+	// precision (C)
+	if (!(flags & FMT_LEFT) && (flags & FMT_ZERO) && precision < 0 &&
+	    width > len) {
+		zeros += width - len;
+		len = width;
+	}
+
+	if (!(flags & FMT_LEFT))
+		count += fmt_pad(sb, ' ', width - len);
+	for (int i = 0; i < np; i++)
+		fmt_out(sb, prefix[i]);
+	count += np;
+	count += fmt_pad(sb, '0', zeros);
+	for (int i = nd - 1; i >= 0; i--)
+		fmt_out(sb, digits[i]);
+	count += nd;
+	if (flags & FMT_LEFT)
+		count += fmt_pad(sb, ' ', width - len);
+	return count;
+}
+
+// Length modifiers
+enum fmt_len {
+	FMT_LEN_INT,
+	FMT_LEN_CHAR, // hh
+	FMT_LEN_SHORT, // h
+	FMT_LEN_LONG, // l
+	FMT_LEN_LLONG, // ll, L, q, j
+	FMT_LEN_SIZE, // z
+	FMT_LEN_PTRDIFF, // t
+};
+
+// Every conversion consumes exactly the argument C says it does: a flag,
+// width or length this parser did not know would otherwise leave its
+// argument behind, and every later conversion would read the one before
+// it -- a %s then dereferences a number.
 static int kvprintf_to_buffer(const char *format, va_list args,
 			      string_buffer_t *sb)
 {
@@ -2705,11 +2745,7 @@ static int kvprintf_to_buffer(const char *format, va_list args,
 
 	while (*format) {
 		if (*format != '%') {
-			if (sb) {
-				string_putchar(*format, sb);
-			} else {
-				console_putchar_unlocked(*format);
-			}
+			fmt_out(sb, *format);
 			count++;
 			format++;
 			continue;
@@ -2717,79 +2753,113 @@ static int kvprintf_to_buffer(const char *format, va_list args,
 
 		format++; // Skip '%'
 
-		// Parse flags
-		int left_align = 0;
-		int pad_zero = 0;
-
-		while (1) {
-			switch (*format) {
-			case '-':
-				left_align = 1;
-				format++;
-				continue;
-			case '0':
-				pad_zero = 1;
-				format++;
-				continue;
-			default:
+		// Flags, in any order
+		unsigned flags = 0;
+		for (;; format++) {
+			if (*format == '-')
+				flags |= FMT_LEFT;
+			else if (*format == '0')
+				flags |= FMT_ZERO;
+			else if (*format == '+')
+				flags |= FMT_PLUS;
+			else if (*format == ' ')
+				flags |= FMT_SPACE;
+			else if (*format == '#')
+				flags |= FMT_ALT;
+			else
 				break;
-			}
-			break;
 		}
 
-		// Parse width
+		// Width: digits, or '*' from the arguments
 		int width = 0;
-		while (*format >= '0' && *format <= '9') {
-			width = width * 10 + (*format - '0');
+		if (*format == '*') {
+			width = va_arg(args, int);
+			if (width < 0) {
+				flags |= FMT_LEFT;
+				width = -width;
+			}
 			format++;
+		} else {
+			while (*format >= '0' && *format <= '9') {
+				width = width * 10 + (*format - '0');
+				format++;
+			}
 		}
 
-		// Parse precision
+		// Precision: '.' and digits or '*'; a negative '*' is none
 		int precision = -1;
 		if (*format == '.') {
 			format++;
 			precision = 0;
-			while (*format >= '0' && *format <= '9') {
-				precision = precision * 10 + (*format - '0');
+			if (*format == '*') {
+				precision = va_arg(args, int);
+				if (precision < 0)
+					precision = -1;
 				format++;
+			} else {
+				while (*format >= '0' && *format <= '9') {
+					precision = precision * 10 +
+						    (*format - '0');
+					format++;
+				}
 			}
 		}
 
-		// Parse length modifiers
-		int is_long = 0;
-		int is_long_long = 0;
-		int is_size_t = 0;
-		if (*format == 'l') {
+		// Length modifiers
+		enum fmt_len lenmod = FMT_LEN_INT;
+		switch (*format) {
+		case 'h':
 			format++;
-			is_long = 1;
+			lenmod = FMT_LEN_SHORT;
+			if (*format == 'h') {
+				format++;
+				lenmod = FMT_LEN_CHAR;
+			}
+			break;
+		case 'l':
+			format++;
+			lenmod = FMT_LEN_LONG;
 			if (*format == 'l') {
 				format++;
-				is_long_long = 1;
+				lenmod = FMT_LEN_LLONG;
 			}
-		} else if (*format == 'z') {
+			break;
+		case 'L':
+		case 'q':
+		case 'j':
 			format++;
-			is_size_t = 1;
+			lenmod = FMT_LEN_LLONG;
+			break;
+		case 'z':
+			format++;
+			lenmod = FMT_LEN_SIZE;
+			break;
+		case 't':
+			format++;
+			lenmod = FMT_LEN_PTRDIFF;
+			break;
+		default:
+			break;
 		}
+
+		if (!*format)
+			break; // a lone '%' at the end: nothing to convert
 
 		// Handle format specifiers
 		switch (*format) {
 		case '%':
-			if (sb) {
-				string_putchar('%', sb);
-			} else {
-				console_putchar_unlocked('%');
-			}
+			fmt_out(sb, '%');
 			count++;
 			break;
 
 		case 'c': {
 			char c = (char)va_arg(args, int);
-			if (sb) {
-				string_putchar(c, sb);
-			} else {
-				console_putchar_unlocked(c);
-			}
+			if (!(flags & FMT_LEFT))
+				count += fmt_pad(sb, ' ', width - 1);
+			fmt_out(sb, c);
 			count++;
+			if (flags & FMT_LEFT)
+				count += fmt_pad(sb, ' ', width - 1);
 			break;
 		}
 
@@ -2797,261 +2867,110 @@ static int kvprintf_to_buffer(const char *format, va_list args,
 			char *str = va_arg(args, char *);
 			if (!str)
 				str = "(null)";
+			int len = 0;
+			// never read past the precision: the string need not
+			// be terminated within it
+			while (str[len] && (precision < 0 || len < precision))
+				len++;
 
-			int len = kstrlen(str);
-			if (precision >= 0 && len > precision) {
-				len = precision;
-			}
-
-			// Handle padding
-			if (!left_align && width > len) {
-				for (int i = 0; i < width - len; i++) {
-					if (sb) {
-						string_putchar(' ', sb);
-					} else {
-						console_putchar_unlocked(' ');
-					}
-					count++;
-				}
-			}
-
-			// Print string
-			for (int i = 0; i < len; i++) {
-				if (sb) {
-					string_putchar(str[i], sb);
-				} else {
-					console_putchar_unlocked(str[i]);
-				}
-				count++;
-			}
-
-			// Right padding
-			if (left_align && width > len) {
-				for (int i = 0; i < width - len; i++) {
-					if (sb) {
-						string_putchar(' ', sb);
-					} else {
-						console_putchar_unlocked(' ');
-					}
-					count++;
-				}
-			}
+			if (!(flags & FMT_LEFT))
+				count += fmt_pad(sb, ' ', width - len);
+			for (int i = 0; i < len; i++)
+				fmt_out(sb, str[i]);
+			count += len;
+			if (flags & FMT_LEFT)
+				count += fmt_pad(sb, ' ', width - len);
 			break;
 		}
 
 		case 'd':
 		case 'i': {
 			int64_t value;
-			if (is_long_long) {
-				value = va_arg(args, int64_t);
-			} else if (is_long) {
+			switch (lenmod) {
+			case FMT_LEN_CHAR:
+				value = (signed char)va_arg(args, int);
+				break;
+			case FMT_LEN_SHORT:
+				value = (short)va_arg(args, int);
+				break;
+			case FMT_LEN_LONG:
 				value = va_arg(args, long);
-			} else if (is_size_t) {
+				break;
+			case FMT_LEN_LLONG:
+				value = va_arg(args, long long);
+				break;
+			case FMT_LEN_SIZE:
 				value = (int64_t)va_arg(args, size_t);
-			} else {
+				break;
+			case FMT_LEN_PTRDIFF:
+				value = (int64_t)va_arg(args, long);
+				break;
+			default:
 				value = va_arg(args, int);
+				break;
 			}
-
-			char buffer[32];
-			itoa(value, buffer, 10, 1);
-
-			int len = kstrlen(buffer);
-
-			// Handle padding
-			if (!left_align && width > len) {
-				char pad_char = pad_zero ? '0' : ' ';
-				for (int i = 0; i < width - len; i++) {
-					if (sb) {
-						string_putchar(pad_char, sb);
-					} else {
-						console_putchar_unlocked(
-							pad_char);
-					}
-					count++;
-				}
-			}
-
-			// Print number
-			for (int i = 0; i < len; i++) {
-				if (sb) {
-					string_putchar(buffer[i], sb);
-				} else {
-					console_putchar_unlocked(buffer[i]);
-				}
-				count++;
-			}
-
-			// Right padding
-			if (left_align && width > len) {
-				for (int i = 0; i < width - len; i++) {
-					if (sb) {
-						string_putchar(' ', sb);
-					} else {
-						console_putchar_unlocked(' ');
-					}
-					count++;
-				}
-			}
+			uint64_t mag = value < 0 ? (uint64_t)(-(value + 1)) + 1 :
+						   (uint64_t)value;
+			count += fmt_integer(sb, mag, value < 0, 10,
+					     flags & ~FMT_ALT, width,
+					     precision);
 			break;
 		}
 
-		case 'u': {
-			uint64_t value;
-			if (is_long_long) {
-				value = va_arg(args, uint64_t);
-			} else if (is_long) {
-				value = va_arg(args, unsigned long);
-			} else if (is_size_t) {
-				value = va_arg(args, size_t);
-			} else {
-				value = va_arg(args, unsigned int);
-			}
-
-			char buffer[32];
-			utoa(value, buffer, 10);
-
-			int len = kstrlen(buffer);
-			for (int i = 0; i < len; i++) {
-				if (sb) {
-					string_putchar(buffer[i], sb);
-				} else {
-					console_putchar_unlocked(buffer[i]);
-				}
-				count++;
-			}
-			break;
-		}
-
-		case 'x': {
-			uint64_t value;
-			if (is_long_long) {
-				value = va_arg(args, uint64_t);
-			} else if (is_long) {
-				value = va_arg(args, unsigned long);
-			} else if (is_size_t) {
-				value = va_arg(args, size_t);
-			} else {
-				value = va_arg(args, unsigned int);
-			}
-
-			char buffer[32];
-			utoa(value, buffer, 16);
-
-			int len = kstrlen(buffer);
-			for (int i = 0; i < len; i++) {
-				char c = buffer[i];
-				// Convert to lowercase for %x
-				if (c >= 'A' && c <= 'F')
-					c = c - 'A' + 'a';
-				if (sb) {
-					string_putchar(c, sb);
-				} else {
-					console_putchar_unlocked(c);
-				}
-				count++;
-			}
-			break;
-		}
-
-		case 'X': {
-			uint64_t value;
-			if (is_long_long) {
-				value = va_arg(args, uint64_t);
-			} else if (is_long) {
-				value = va_arg(args, unsigned long);
-			} else if (is_size_t) {
-				value = va_arg(args, size_t);
-			} else {
-				value = va_arg(args, unsigned int);
-			}
-
-			char buffer[32];
-			utoa(value, buffer, 16);
-
-			int len = kstrlen(buffer);
-			for (int i = 0; i < len; i++) {
-				char c = buffer[i];
-				if (c >= 'a' && c <= 'f')
-					c = c - 'a' + 'A';
-				if (sb) {
-					string_putchar(c, sb);
-				} else {
-					console_putchar_unlocked(c);
-				}
-				count++;
-			}
-			break;
-		}
-
+		case 'u':
+		case 'x':
+		case 'X':
 		case 'o': {
 			uint64_t value;
-			if (is_long_long) {
-				value = va_arg(args, uint64_t);
-			} else if (is_long) {
+			switch (lenmod) {
+			case FMT_LEN_CHAR:
+				value = (unsigned char)va_arg(args, unsigned int);
+				break;
+			case FMT_LEN_SHORT:
+				value = (unsigned short)va_arg(args,
+							       unsigned int);
+				break;
+			case FMT_LEN_LONG:
 				value = va_arg(args, unsigned long);
-			} else if (is_size_t) {
+				break;
+			case FMT_LEN_LLONG:
+				value = va_arg(args, unsigned long long);
+				break;
+			case FMT_LEN_SIZE:
 				value = va_arg(args, size_t);
-			} else {
+				break;
+			case FMT_LEN_PTRDIFF:
+				value = (uint64_t)va_arg(args, long);
+				break;
+			default:
 				value = va_arg(args, unsigned int);
+				break;
 			}
-
-			char buffer[32];
-			utoa(value, buffer, 8);
-
-			int len = kstrlen(buffer);
-			for (int i = 0; i < len; i++) {
-				if (sb) {
-					string_putchar(buffer[i], sb);
-				} else {
-					console_putchar_unlocked(buffer[i]);
-				}
-				count++;
-			}
+			unsigned base = *format == 'u' ? 10 :
+					*format == 'o' ? 8 : 16;
+			unsigned f = flags & ~(FMT_PLUS | FMT_SPACE);
+			if (*format == 'X')
+				f |= FMT_UPPER;
+			if (base == 10)
+				f &= ~FMT_ALT;
+			count += fmt_integer(sb, value, 0, base, f, width,
+					     precision);
 			break;
 		}
 
 		case 'p': {
 			void *ptr = va_arg(args, void *);
-			uint64_t value = (uint64_t)ptr;
-
-			// Print "0x" prefix
-			if (sb) {
-				string_putchar('0', sb);
-				string_putchar('x', sb);
-			} else {
-				console_putchar_unlocked('0');
-				console_putchar_unlocked('x');
-			}
-			count += 2;
-
-			char buffer[32];
-			utoa(value, buffer, 16);
-
-			int len = kstrlen(buffer);
-			for (int i = 0; i < len; i++) {
-				char c = buffer[i];
-				// Convert to lowercase for pointers
-				if (c >= 'A' && c <= 'F')
-					c = c - 'A' + 'a';
-				if (sb) {
-					string_putchar(c, sb);
-				} else {
-					console_putchar_unlocked(c);
-				}
-				count++;
-			}
+			count += fmt_integer(sb, (uint64_t)ptr, 0, 16,
+					     (flags & FMT_LEFT) | FMT_PREFIX,
+					     width, -1);
 			break;
 		}
 
 		default:
-			// Unknown format specifier, just print it
-			if (sb) {
-				string_putchar('%', sb);
-				string_putchar(*format, sb);
-			} else {
-				console_putchar_unlocked('%');
-				console_putchar_unlocked(*format);
-			}
+			// Unknown conversion: show it as written.  Its
+			// argument, if any, cannot be known.
+			fmt_out(sb, '%');
+			fmt_out(sb, *format);
 			count += 2;
 			break;
 		}

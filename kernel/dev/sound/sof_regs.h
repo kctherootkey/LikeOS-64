@@ -747,6 +747,11 @@ struct sof_host {
 	uint32_t ipc_tx_count, ipc_err_count, ipc_timeouts;
 	uint32_t notif_count[SOF_IPC4_NOTIFY_TYPE_LAST];
 	uint32_t notif_unknown;
+	/* the firmware's own log (debug window), errors and warnings */
+	int fw_log_on;
+	volatile int fw_log_busy;
+	volatile int fw_log_work_queued;
+	uint32_t fw_log_lines; /* printed from notifications so far */
 	uint32_t last_error_status;
 	uint32_t last_error_primary;
 	uint32_t underruns, overruns;
@@ -901,6 +906,9 @@ const char *sof_fsr_state_name(struct sof_host *h, uint32_t fsr);
 const char *sof_rom_error_name(uint32_t code);
 void sof_dsp_dump(struct sof_host *h, const char *why);
 void sof_dsp_panic_dump(struct sof_host *h);
+/* Print what the firmware logged since the last call (at most `max_lines'
+ * lines; the rest is skipped).  Any context. */
+void sof_dsp_fw_log_flush(struct sof_host *h, int max_lines);
 long sof_dsp_diag(struct sof_host *h, char *buf, size_t len);
 
 /* ---- HDA DMA engines (sof_dsp.c) -------------------------------------- */
@@ -944,6 +952,8 @@ int sof_ipc4_large_config(struct sof_host *h, uint32_t module_id,
 			  uint32_t instance, uint32_t param, void *data,
 			  size_t len, int set, size_t *out_len);
 int sof_ipc4_query_fw_config(struct sof_host *h);
+/* Have the firmware log errors and warnings into its debug window. */
+int sof_ipc4_enable_fw_logs(struct sof_host *h);
 int sof_ipc4_set_pipeline_state(struct sof_host *h, uint32_t pipe,
 				uint32_t state);
 int sof_ipc4_glb(struct sof_host *h, uint32_t type, uint32_t primary_bits,

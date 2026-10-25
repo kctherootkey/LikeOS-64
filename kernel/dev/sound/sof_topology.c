@@ -3592,6 +3592,7 @@ static int build_init_payload(struct tplg_state *t, struct prep_ctx *pcx,
 		struct ipc4_copier_data cd;
 		uint32_t words[2 + 2 * IPC4_ALH_MAX_DEVICES];
 		uint32_t nwords = 0, blob_bytes = 0, tlv_count = 0, i, off, tag;
+		uint32_t pad;
 		const uint8_t *blob = NULL;
 		struct ipc4_dma_config_tlv d;
 
@@ -3633,10 +3634,17 @@ static int build_init_payload(struct tplg_state *t, struct prep_ctx *pcx,
 		cd.gtw_cfg.config_length =
 			nwords + blob_bytes / 4 +
 			tlv_count * (uint32_t)(sizeof(d) / 4);
+		/* The firmware's copier configuration ends in a one-word
+		 * gateway config array, and a payload shorter than that
+		 * structure is refused ("cfg size exceeds init payload"):
+		 * a copier without gateway config -- the module copier --
+		 * still sends the word, zero, with config_length 0. */
+		pad = cd.gtw_cfg.config_length ? 0 : 4;
 		n = sizeof(cd) + nwords * 4 + blob_bytes +
-		    tlv_count * (uint32_t)sizeof(d);
+		    tlv_count * (uint32_t)sizeof(d) + pad;
 		if (n > cap)
 			return -E2BIG;
+		kmemset(buf, 0, n);
 		kmemcpy(buf, &cd, sizeof(cd));
 		off = sizeof(cd);
 		kmemcpy(buf + off, words, nwords * 4);
