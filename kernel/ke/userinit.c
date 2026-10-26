@@ -13,6 +13,29 @@
 
 static int g_init_started = 0;
 
+/* Late boot work in flight, and whether any has started yet (before the
+ * root mount nothing has, and that is not "settled"). */
+static volatile int g_boot_jobs;
+static volatile int g_boot_late_started;
+
+void boot_work_begin(void)
+{
+	__atomic_add_fetch(&g_boot_jobs, 1, __ATOMIC_ACQ_REL);
+	__atomic_store_n(&g_boot_late_started, 1, __ATOMIC_RELEASE);
+}
+
+void boot_work_end(void)
+{
+	if (__atomic_sub_fetch(&g_boot_jobs, 1, __ATOMIC_ACQ_REL) < 0)
+		__atomic_store_n(&g_boot_jobs, 0, __ATOMIC_RELEASE);
+}
+
+int boot_settled(void)
+{
+	return __atomic_load_n(&g_boot_late_started, __ATOMIC_ACQUIRE) &&
+	       __atomic_load_n(&g_boot_jobs, __ATOMIC_ACQUIRE) == 0;
+}
+
 static int init_spawn(void)
 {
 	if (!vfs_root_ready()) {

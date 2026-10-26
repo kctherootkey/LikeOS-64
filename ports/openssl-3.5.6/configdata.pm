@@ -26,7 +26,7 @@ our %config = (
     "CPPDEFINES" => [],
     "CPPFLAGS" => [],
     "CPPINCLUDES" => [
-        "/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include"
+        "/home/computer/Dokumente/windows_vms/LikeOS-64/user/lib/libc/include"
     ],
     "CXX" => "g++",
     "CXXFLAGS" => [
@@ -240,7 +240,7 @@ our %config = (
         "OPENSSL_SYS_LIKEOS"
     ],
     "openssldir" => "/etc/ssl",
-    "options" => "--prefix=/usr --openssldir=/etc/ssl --libdir=lib -I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include no-acvp-tests no-afalgeng no-asan no-async no-brotli no-brotli-dynamic no-buildtest-c++ no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-devcryptoeng no-ec_nistp_64_gcc_128 no-egd no-external-tests no-fips no-fips-jitter no-fips-post no-fips-securitychecks no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-md2 no-msan no-pie no-rc5 no-sctp no-ssl3 no-ssl3-method no-sslkeylog no-tests no-tfo no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
+    "options" => "--prefix=/usr --openssldir=/etc/ssl --libdir=lib -I/home/computer/Dokumente/windows_vms/LikeOS-64/user/lib/libc/include no-acvp-tests no-afalgeng no-asan no-async no-brotli no-brotli-dynamic no-buildtest-c++ no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-devcryptoeng no-ec_nistp_64_gcc_128 no-egd no-external-tests no-fips no-fips-jitter no-fips-post no-fips-securitychecks no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-md2 no-msan no-pie no-rc5 no-sctp no-ssl3 no-ssl3-method no-sslkeylog no-tests no-tfo no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
     "patch" => "6",
     "perl_archname" => "x86_64-linux-gnu-thread-multi",
     "perl_cmd" => "/usr/bin/perl",
@@ -258,7 +258,7 @@ our %config = (
         "no-fuzz-afl",
         "no-ssl3",
         "no-ssl3-method",
-        "-I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include"
+        "-I/home/computer/Dokumente/windows_vms/LikeOS-64/user/lib/libc/include"
     ],
     "perlenv" => {
         "AR" => undef,
@@ -28757,8 +28757,8 @@ unless (caller) {
     use File::Copy;
     use Pod::Usage;
 
-    use lib '/home/kcope/Dokumente/LikeOS-64/ports/openssl-3.5.6/util/perl';
-    use OpenSSL::fallback '/home/kcope/Dokumente/LikeOS-64/ports/openssl-3.5.6/external/perl/MODULES.txt';
+    use lib '/home/computer/Dokumente/windows_vms/LikeOS-64/ports/openssl-3.5.6/util/perl';
+    use OpenSSL::fallback '/home/computer/Dokumente/windows_vms/LikeOS-64/ports/openssl-3.5.6/external/perl/MODULES.txt';
 
     my $here = dirname($0);
 
@@ -28785,7 +28785,7 @@ unless (caller) {
             );
 
         use lib '.';
-        use lib '/home/kcope/Dokumente/LikeOS-64/ports/openssl-3.5.6/Configurations';
+        use lib '/home/computer/Dokumente/windows_vms/LikeOS-64/ports/openssl-3.5.6/Configurations';
         use gentemplate;
 
         open my $buildfile_template_fh, ">$buildfile_template"
@@ -28802,8 +28802,8 @@ unless (caller) {
 
         my $prepend = <<'_____';
 use File::Spec::Functions;
-use lib '/home/kcope/Dokumente/LikeOS-64/ports/openssl-3.5.6/util/perl';
-use lib '/home/kcope/Dokumente/LikeOS-64/ports/openssl-3.5.6/Configurations';
+use lib '/home/computer/Dokumente/windows_vms/LikeOS-64/ports/openssl-3.5.6/util/perl';
+use lib '/home/computer/Dokumente/windows_vms/LikeOS-64/ports/openssl-3.5.6/Configurations';
 use lib '.';
 use platform;
 _____

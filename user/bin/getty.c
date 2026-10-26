@@ -57,6 +57,34 @@ static char *read_line(int fd)
 	return buf;
 }
 
+/* The boot goes on after init starts: the root mount is followed by firmware
+ * loads and device bring-up (graphics, sound) that keep printing to the
+ * console for a few seconds.  A prompt printed in the middle of that ends up
+ * buried under it, so the first one waits until the kernel reports the boot
+ * settled -- briefly, and never for good: a device that never finishes must
+ * not keep anyone from logging in.  A kernel without the file is taken as
+ * settled.  What is typed meanwhile stays in the terminal's input. */
+#define SETTLE_POLL_US 50000
+#define SETTLE_MAX_US (30 * 1000000)
+
+static void wait_boot_settled(void)
+{
+	for (long waited = 0; waited < SETTLE_MAX_US;
+	     waited += SETTLE_POLL_US) {
+		char c = '1';
+		int fd = open("/proc/boot_settled", O_RDONLY);
+
+		if (fd < 0)
+			return;
+		if (read(fd, &c, 1) != 1)
+			c = '1';
+		close(fd);
+		if (c != '0')
+			return;
+		usleep(SETTLE_POLL_US);
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	const char *tty = (argc > 1) ? argv[1] : DEFAULT_TTY;
@@ -117,6 +145,8 @@ int main(int argc, char *argv[])
 
 	if (gethostname(hostname, sizeof(hostname)) != 0)
 		strcpy(hostname, "likeos");
+
+	wait_boot_settled();
 
 	for (;;) {
 		char *name;

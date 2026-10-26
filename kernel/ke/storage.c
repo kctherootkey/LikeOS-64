@@ -113,8 +113,12 @@ void storage_fs_poll(storage_fs_state_t *state)
 				if (cursor_load("/res/left_ptr") == 0) {
 					mouse_apply_cursor();
 				}
+				/* firmware loads and device bring-up: the
+				 * first login prompt waits for them */
+				boot_work_begin();
 				drm_late_init();
 				snd_late_init();
+				boot_work_end();
 			} else {
 				kprintf("EXT4: signature not found on %s\n",
 					bdev->name);
@@ -150,8 +154,10 @@ void storage_fs_poll(storage_fs_state_t *state)
 				if (cursor_load("/res/left_ptr") == 0) {
 					mouse_apply_cursor();
 				}
+				boot_work_begin();
 				drm_late_init();
 				snd_late_init();
+				boot_work_end();
 
 				userinit_redisplay_prompt(); // Redisplay prompt after mount messages
 			} else {

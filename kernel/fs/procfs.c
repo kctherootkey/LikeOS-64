@@ -22,6 +22,7 @@
 #include <kernel/ke/smp.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
+#include <kernel/ke/userinit.h>
 #include <kernel/uapi/dirent.h>
 
 static struct pfs g_procfs;
@@ -761,6 +762,14 @@ static long show_cpuinfo(struct pfs_node *n, char *buf, long cap)
 	return p;
 }
 
+/* 1 once the late boot work (firmware loads, device bring-up) is done:
+ * getty holds the first login prompt back until then. */
+static long show_boot_settled(struct pfs_node *n, char *buf, long cap)
+{
+	(void)n;
+	return pfs_printf(buf, cap, 0, "%d\n", boot_settled() ? 1 : 0);
+}
+
 static long show_mounts(struct pfs_node *n, char *buf, long cap)
 {
 	(void)n;
@@ -777,5 +786,6 @@ void procfs_init(void)
 	pfs_add_file(&g_procfs, "meminfo", show_meminfo, NULL, 0);
 	pfs_add_file(&g_procfs, "cpuinfo", show_cpuinfo, NULL, 0);
 	pfs_add_file(&g_procfs, "mounts", show_mounts, NULL, 0);
+	pfs_add_file(&g_procfs, "boot_settled", show_boot_settled, NULL, 0);
 	vfs_register_mount("/proc", pfs_ops(&g_procfs));
 }

@@ -21,6 +21,7 @@
 #include <kernel/hal/lapic.h>
 #include <kernel/ke/irq.h>
 #include <kernel/mm/memory.h>
+#include <kernel/ke/userinit.h>
 
 /* ===================================================================== */
 /* platforms                                                              */
@@ -736,7 +737,7 @@ static int sof_load_topologies(struct sof_host *h)
 	return rc;
 }
 
-static void sof_boot_work(void *arg)
+static void sof_boot_run(void *arg)
 {
 	struct sof_host *h = arg;
 	int rc;
@@ -809,6 +810,14 @@ static void sof_boot_work(void *arg)
 	h->boot_state = SOF_BOOT_RUNNING;
 }
 
+/* The boot is late boot work the login prompt waits for (its firmware,
+ * topology, SoundWire and card lines all print after the root mount). */
+static void sof_boot_work(void *arg)
+{
+	sof_boot_run(arg);
+	boot_work_end();
+}
+
 void sof_late_init(void)
 {
 	struct sof_host *h;
@@ -817,6 +826,7 @@ void sof_late_init(void)
 	for (h = g_sof_hosts; h; h = h->next) {
 		if (h->boot_state != SOF_BOOT_PROBED)
 			continue;
+		boot_work_begin();
 		if (snd_schedule_work(sof_boot_work, h, 0) < 0)
 			sof_boot_work(h);
 	}

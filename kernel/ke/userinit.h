@@ -18,4 +18,14 @@ int userinit_tick(void);
 // currently a no-op kept for call-site compatibility.
 void userinit_redisplay_prompt(void);
 
+// Late boot work that still prints to the console after init is running:
+// the firmware loads and device bring-up that follow the root mount.  Each
+// begin is matched by one end, from any context.  The boot has settled once
+// that work has started and none of it is left; getty waits for this
+// (/proc/boot_settled) before its first login prompt, so the prompt is not
+// buried under the messages.
+void boot_work_begin(void);
+void boot_work_end(void);
+int boot_settled(void);
+
 #endif // _KERNEL_USERINIT_H_
