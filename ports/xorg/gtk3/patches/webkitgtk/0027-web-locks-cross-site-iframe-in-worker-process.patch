@@ -1,0 +1,38 @@
+A cross-site iframe that used Web Locks got its web process killed.
+
+When the iframe went away, the web process sent
+WebLockRegistryProxy::ClientIsGoingAway, and the UI process checked the
+iframe's ClientOrigin with WebProcessProxy::hasCommittedClientOrigin().  In a
+process that also runs a service or shared worker, that function never looked
+at the recorded commits: it only compared both origins with the process's
+site, the main frame's.  An iframe from another site failed that comparison,
+the message was treated as invalid, and the process was terminated -- luakit
+shows "Web process crashed", and nothing is printed (the invalid-message log
+is release logging, which this build does not have).  flaschenpost.de with
+its Cloudflare Turnstile iframe did this every time.
+
+The recorded commits are now checked first; the site comparison only covers
+what they do not.  Same change as WebKit 314641@main (bug 314863).
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/Source/WebKit/UIProcess/WebProcessProxy.cpp
++++ b/Source/WebKit/UIProcess/WebProcessProxy.cpp
+@@ -938,12 +938,16 @@
+ 
+ bool WebProcessProxy::hasCommittedClientOrigin(const WebCore::ClientOrigin& clientOrigin) const
+ {
++    if (m_committedClientOrigins.contains(clientOrigin))
++        return true;
++
+     if (isRunningWorkers()) {
+         if (!m_site)
+             return m_committedSites.contains(Site { clientOrigin.topOrigin }) && m_committedSites.contains(Site { clientOrigin.clientOrigin });
+         return Site { clientOrigin.topOrigin } == *m_site && Site { clientOrigin.clientOrigin } == *m_site;
+     }
+-    return m_committedClientOrigins.contains(clientOrigin);
++
++    return false;
+ }
+ 
+ void WebProcessProxy::didCommitLoadClientOrigin(WebCore::ClientOrigin&& clientOrigin)

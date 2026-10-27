@@ -1,0 +1,45 @@
+pad: recheck FLUSHING after the push probes before handing an item to the peer
+
+Probes run without the pad lock.  A FLUSH_START arriving meanwhile flushes
+only the peer the pad had at that moment; when a probe relinks the pad
+(decodebin3 builds the decoder output from its CAPS probe on the multiqueue
+source pad) the streaming thread then carried the event into the new,
+never-flushed chain, blocked in playsink's pad block, and the flushing
+thread waited forever in gst_pad_pause_task() for the stream lock that
+thread holds: the MSE seek hang in the web process.
+
+--- a/gst/gstpad.c
++++ b/gst/gstpad.c
+@@ -4759,6 +4759,11 @@
+   if (G_UNLIKELY ((ret = check_sticky (pad, NULL))) != GST_FLOW_OK)
+     goto events_error;
+ 
++  /* A flush may have started while the probes ran without the pad lock and
++   * missed a peer that a probe linked meanwhile; do not hand data to it. */
++  if (G_UNLIKELY (GST_PAD_IS_FLUSHING (pad)))
++    goto flushing;
++
+   if (G_UNLIKELY ((peer = GST_PAD_PEER (pad)) == NULL))
+     goto not_linked;
+ 
+@@ -5592,6 +5597,20 @@
+         pad->offset - old_pad_offset);
+   }
+ 
++  /* The probes ran without the pad lock.  A FLUSH_START that arrived
++   * meanwhile set FLUSHING here and went on to whatever peer the pad had
++   * at that moment; if a probe relinked the pad (decodebin3 does that from
++   * its CAPS probe), the new peer never saw the flush.  Forwarding the
++   * event anyway would carry this streaming thread into an unflushed
++   * downstream chain, where a blocking probe can hold it forever while the
++   * flushing thread waits for the stream lock that this thread owns.  The
++   * flushing check above only covers the moment before the probes, so
++   * repeat it now. */
++  if (event_type != GST_EVENT_FLUSH_START
++      && event_type != GST_EVENT_FLUSH_STOP
++      && G_UNLIKELY (GST_PAD_IS_FLUSHING (pad)))
++    goto flushed;
++
+   /* now check the peer pad */
+   peerpad = GST_PAD_PEER (pad);
+   if (peerpad == NULL)
