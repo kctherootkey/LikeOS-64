@@ -54,7 +54,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
   <aside class="sidebar" id="sidebar" aria-label="Site menu">
     <div class="brand-meta">
       <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
-      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD &middot; dev branch</span>
+      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD</span>
     </div>
     <nav class="nav" aria-label="Main">
       <div class="nav-label">Menu</div>
@@ -102,7 +102,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
 
 <section class="card" id="overview">
   <h2>1. Overview</h2>
-  <p>LikeOS is a 64-bit operating system written from scratch: its own kernel, C library, dynamic linker and core utilities, with bash, OpenSSH, an X.Org desktop, GTK3 applications, the WebKit-based <b>luakit</b> web browser and the <b>Claws Mail</b> client ported on top. The current development line is <code>0.2.7-HEAD</code> on the <code>dev</code> branch.</p>
+  <p>LikeOS is a 64-bit operating system written from scratch: its own kernel, C library, dynamic linker and core utilities, with bash, OpenSSH, an X.Org desktop, GTK3 applications, the WebKit-based <b>luakit</b> web browser and the <b>Claws Mail</b> client ported on top. The current development line is <code>0.2.7-HEAD</code>.</p>
   <p>Everything is built from source on a build host by the top-level <code>Makefile</code>, including the third-party ports under <code>ports/</code>. The result is a single file, <code>build/likeos-ext4.img</code>, which is a complete bootable GPT disk:</p>
   <dl class="specs">
     <dt>Partition 1</dt>
@@ -114,7 +114,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
   <p>The short version, for the impatient:</p>
   <pre class="code"><code>$ git clone https://github.com/kctherootkey/LikeOS-64 LikeOS
 $ cd LikeOS
-$ git checkout dev
+$ git checkout dev            # optional: unstable, probably with more features
 $ sudo apt-get update
 $ sudo make deps
 $ make
@@ -148,17 +148,18 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
 
 <section class="card" id="source">
   <h2>3. Getting the source</h2>
-  <p>The source lives on GitHub. Clone it (into a directory called <code>LikeOS</code> here) and switch to the <code>dev</code> branch, which is where development happens:</p>
+  <p>The source lives on GitHub. Clone it into a directory called <code>LikeOS</code> here. The clone starts on <code>master</code>, the stable branch; switching to the <code>dev</code> branch is optional &mdash; it is unstable, but probably has more features:</p>
   <ol class="steps">
     <li>Install git if the build host does not have it yet:
       <pre class="code"><code>$ sudo apt-get install git</code></pre></li>
     <li>Clone the repository:
       <pre class="code"><code>$ git clone https://github.com/kctherootkey/LikeOS-64 LikeOS</code></pre></li>
-    <li>Enter it and check out the development branch:
-      <pre class="code"><code>$ cd LikeOS
-$ git checkout dev</code></pre></li>
+    <li>Enter it:
+      <pre class="code"><code>$ cd LikeOS</code></pre></li>
+    <li>Optionally, check out the unstable <code>dev</code> branch instead of the stable <code>master</code>:
+      <pre class="code"><code>$ git checkout dev</code></pre></li>
   </ol>
-  <p>All commands on the rest of this page are run from the top of this directory. Later, <code>git pull</code> on the <code>dev</code> branch followed by <code>make</code> brings your build up to date; only what changed is rebuilt.</p>
+  <p>All commands on the rest of this page are run from the top of this directory. Later, <code>git pull</code> on the branch you are on followed by <code>make</code> brings your build up to date; only what changed is rebuilt.</p>
   <div class="callout info"><strong>Where things are.</strong> <code>boot/</code> is the UEFI bootloader, <code>kernel/</code> the kernel (headers beside their sources), <code>user/</code> the C library, dynamic linker and programs, <code>res/</code> the files staged into the image (configuration, fonts, wallpaper, desktop launchers), <code>host/</code> build-host tools and tests, and <code>ports/</code> the third-party software &mdash; <code>ports/xorg</code> for the X Window System and <code>ports/xorg/gtk3</code> for GTK3 and the applications on it.</div>
 </section>
 
@@ -232,8 +233,8 @@ $ sudo make deps</code></pre>
       <tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
     </thead>
     <tbody>
-      <tr><td><code>SCREEN_SIZE</code></td><td>unset (large)</td><td>Preferred resolution. Unset or <code>large</code>: 1920&times;1200, falling back to 1920&times;1080, 1280&times;800, 1280&times;768, 1024&times;768. <code>medium</code>: 1280&times;800, falling back to 1280&times;768, 1024&times;768. Used by both the bootloader and the kernel's SVGA driver.</td></tr>
-      <tr><td><code>MAX_SCREEN_SIZE</code></td><td>no ceiling</td><td>A ceiling on that list, written <code>WIDTHxHEIGHT</code>, e.g. <code>MAX_SCREEN_SIZE=1920x1080</code>. Modes above it are skipped. Mainly for virtual machines on a 1920&times;1080 host (see <a href="#troubleshooting">Troubleshooting</a>).</td></tr>
+      <tr><td><code>SCREEN_SIZE</code></td><td>unset (large)</td><td>The resolution real hardware starts in when no size has been saved in Display settings. Unset or <code>large</code>: every standard size above 1920&times;1200 that the firmware offers, then 1920&times;1200, 1920&times;1080, 1280&times;800, 1280&times;768, 1024&times;768. <code>medium</code>: 1280&times;800, falling back to 1280&times;768, 1024&times;768. Virtual machines start at 1280&times;800 either way (see <a href="#troubleshooting">Troubleshooting</a>).</td></tr>
+      <tr><td><code>MAX_SCREEN_SIZE</code></td><td>no ceiling</td><td>A ceiling on the size the machine starts in on its own, written <code>WIDTHxHEIGHT</code>, e.g. <code>MAX_SCREEN_SIZE=1920x1080</code>. Modes above it are skipped. A size saved in Display settings is not held to it.</td></tr>
       <tr><td><code>LIKEOS_VERSION</code></td><td><code>0.2.7-HEAD</code></td><td>Version string shown in the boot banner and by <code>uname</code>.</td></tr>
       <tr><td><code>DEBUG</code></td><td><code>0</code></td><td><code>DEBUG=1</code>: full debug build &mdash; kernel memory poisoning, DWARF symbols, an unstripped kernel, detailed libc stack-smash reports and byte dumps around a faulting instruction. Implies <code>CRASH_VERBOSE=1</code>, <code>NO_STRIP=1</code> and <code>NO_STRIP_USER=1</code>.</td></tr>
       <tr><td><code>CRASH_VERBOSE</code></td><td><code>0</code></td><td><code>CRASH_VERBOSE=1</code>: detailed kernel and userspace crash reports (registers, decoded fault, page-table walk, mapping list) in an otherwise normal, stripped build without memory poisoning.</td></tr>
@@ -255,7 +256,7 @@ $ make MAX_SCREEN_SIZE=1920x1080
 $ make LIKEOS_VERSION=0.2.7
 $ make CRASH_VERBOSE=1
 $ make DEBUG=1</code></pre>
-  <div class="callout info"><strong>Changing options needs no clean.</strong> <code>SCREEN_SIZE</code> and <code>MAX_SCREEN_SIZE</code> are recorded in a stamp, and changing them rebuilds just the bootloader and the SVGA driver on the next <code>make</code>. Switching <code>DEBUG</code> or <code>CRASH_VERBOSE</code> removes the kernel's objects automatically, so a kernel is never linked from a mix of debug and non-debug objects.</div>
+  <div class="callout info"><strong>Changing options needs no clean.</strong> <code>SCREEN_SIZE</code> and <code>MAX_SCREEN_SIZE</code> are recorded in a stamp, and changing them rebuilds just the bootloader and the VMware display drivers on the next <code>make</code>. Switching <code>DEBUG</code> or <code>CRASH_VERBOSE</code> removes the kernel's objects automatically, so a kernel is never linked from a mix of debug and non-debug objects.</div>
 
   <p><b>Rebuilding a single port package.</b> The X.Org and GTK3 ports are driven by <code>build.sh</code> scripts that can also be run on their own. Given package names, they rebuild just those; <code>-f</code> ignores the stamps and builds from scratch. Afterwards, run <code>make</code> to put the result into the image:</p>
   <pre class="code"><code>$ ports/xorg/build.sh libX11 libXext
@@ -376,7 +377,7 @@ password: toor</code></pre></li>
     <dt>Taskbar</dt>
     <dd>A Windows 11-style bar across the bottom of the screen: the load and memory monitor on the left; the <b>LikeOS</b> start button and one button per open window in the middle (click to switch to or minimise a window, right-click for <em>Close</em>); the four workspace buttons, the speaker of the volume control and the clock with the date on the right.</dd>
     <dt>Start menu</dt>
-    <dd>The LikeOS button opens <em>Programs</em>, built from the launchers on your desktop, plus <em>Restart session</em> and <em>Exit session</em>.</dd>
+    <dd>The LikeOS button opens <em>Programs</em>, built from the launchers on your desktop; <em>Settings</em> &gt; <em>Display</em> for the screen resolution; <em>Restart session</em> and <em>Exit session</em>; and <em>Reboot</em> and <em>Poweroff</em>, which ask for confirmation first.</dd>
     <dt>Keyboard menus</dt>
     <dd>All three mouse buttons over the desktop belong to PCManFM, so the window manager's menus are on the keyboard. <kbd>Alt</kbd>+<kbd>F1</kbd> opens the root menu &mdash; Xterm, Explorer, Editor, Xnedit, Mail, Luakit Web Browser, Media Player, Calculator, <em>Restart session</em> and <em>Exit session</em>. <kbd>Alt</kbd>+<kbd>F2</kbd> opens the window operations menu (move, resize, raise, lower, occupy workspaces, close, kill).</dd>
   </dl>
@@ -398,12 +399,12 @@ $ audioinfo</code></pre>
 $ ping -c 3 example.com</code></pre>
 
   <p><b>Leaving the desktop.</b> Choose <em>Exit session</em> in the start menu, the desktop menu or the <kbd>Alt</kbd>+<kbd>F1</kbd> menu; you return to the console.</p>
-  <p><b>Shutting down and rebooting.</b> These need root. From the console as root:</p>
-  <pre class="code"><code># poweroff
-# reboot
-# shutdown -h now
-# shutdown -r now</code></pre>
-  <p>From an ordinary account, become root first with <code>su</code>, or run a single command as root:</p>
+  <p><b>Shutting down and rebooting.</b> Choose <em>Reboot</em> or <em>Poweroff</em> in the start menu, or use the commands in a terminal or on the console:</p>
+  <pre class="code"><code>$ poweroff
+$ reboot
+$ shutdown -h now
+$ shutdown -r now</code></pre>
+  <p>Root may always use them, and so may the user logged in at the machine's own console &mdash; on the text console as well as in the desktop started from it. Other users, and every SSH session, are refused; become root first with <code>su</code>, or run a single command as root:</p>
   <pre class="code"><code>$ su -c poweroff</code></pre>
   <p><code>shutdown</code> also accepts a delay (<code>+m</code> minutes, or a time as <code>hh:mm</code>); without one it waits a minute. <code>halt</code> stops the machine without powering it off.</p>
 </section>
@@ -423,10 +424,10 @@ $ ping -c 3 example.com</code></pre>
 
   <p><b>The machine does not boot from the stick.</b> Check that the firmware boots in UEFI mode (there is no legacy BIOS path), that Secure Boot is off, and that you picked the stick's UEFI entry in the boot menu. In a virtual machine, check that the firmware is set to UEFI/EFI and that the stick is actually attached to the VM.</p>
 
-  <p><b>Screen resolution.</b> The resolution is chosen at build time. A default build prefers 1920&times;1200 and falls back to 1920&times;1080, 1280&times;800, 1280&times;768 and 1024&times;768; <code>SCREEN_SIZE=medium</code> prefers 1280&times;800. A virtual machine, though, advertises the modes its emulated adapter can scan out, not the ones the host's panel can show: on a 1920&times;1080 notebook VirtualBox, VMware and QEMU all offer 1920&times;1200, a default build takes it, and the host then has to shrink the guest's screen, which makes full-screen mode awkward. Put a ceiling on the list to say what the display really is, and write the stick again:</p>
+  <p><b>Screen resolution.</b> Choose <em>Settings</em> &gt; <em>Display</em> in the start menu (or run <code>likeos-display-settings</code>) and pick a size from the list. With a display driver (Intel graphics, or the VMware/VirtualBox SVGA adapter) the screen switches at once and you are asked whether to keep the new size; if nobody answers within 20 seconds it switches back, so a size the monitor cannot show does not stay on the screen. On the plain UEFI framebuffer the size cannot change while running, and the one you pick is used from the next start. The choice is saved in <code>/etc/likeos/display.conf</code> and applies everywhere: in the bootloader, on the console and in the X server.</p>
+  <p>Until a size is saved, a virtual machine starts at 1280&times;800: nothing the emulated adapter reports says how large the host's screen is, and that size fits a window on any common display. Real hardware starts in the first size from a build-time list that the firmware offers &mdash; with a default build every standard size above 1920&times;1200, then 1920&times;1200, 1920&times;1080, 1280&times;800, 1280&times;768 and 1024&times;768; with <code>SCREEN_SIZE=medium</code> from 1280&times;800 down. A build-time ceiling skips everything above it; a size saved in Display settings is not held to it:</p>
   <pre class="code"><code>$ make MAX_SCREEN_SIZE=1920x1080
 $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
-  <p>The ceiling need not be in the list: with <code>MAX_SCREEN_SIZE=1600x900</code> a default build settles on 1280&times;800. On a VMware-family adapter the SVGA driver also asks the hypervisor for the resolution it recommends (the host's own screen) and uses it when it fits; a ceiling bounds that as well, so leave <code>MAX_SCREEN_SIZE</code> unset when the guest should simply match the host's display. Below 1024&times;768 nothing in the list is selectable, and the firmware's own default is kept.</p>
 
   <p><b>Which graphics path am I on?</b> <code>drminfo</code> opens the graphics device nodes and reports the display driver, its outputs and what it can do; <code>drminfo --driver</code> prints just the driver's name. The device nodes belong to root, so run it as root (for example <code>su -c drminfo</code>). The X server writes its log to <code>/var/log/Xorg.0.log</code>, which names the configuration file it was started with.</p>
 
@@ -451,8 +452,8 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
     <footer class="footer">
       <div class="footer-inner">
         <div>
-          <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
-          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 19<sup>th</sup>, 2026.
+          <b>LikeOS</b> 0.2.7-HEAD &middot; free software under the GNU GPL version 2.<br>
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 30<sup>th</sup>, 2026.
         </div>
         <nav aria-label="Footer">
           <a href="technical.html">Technical Details</a>

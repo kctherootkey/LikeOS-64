@@ -54,7 +54,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
   <aside class="sidebar" id="sidebar" aria-label="Site menu">
     <div class="brand-meta">
       <a class="brand" href="index.html" aria-label="LikeOS home"><img src="assets/likeos-logo-small.png" alt="LikeOS" width="360" height="134"></a>
-      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD &middot; dev branch</span>
+      <span class="release-pill" title="Current development release"><span class="dot"></span>0.2.7-HEAD</span>
     </div>
     <nav class="nav" aria-label="Main">
       <div class="nav-label">Menu</div>
@@ -79,7 +79,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <div>
       <span class="eyebrow">Under the hood</span>
       <h1>Technical Details</h1>
-      <p class="lede">Everything inside LikeOS 0.2.7-HEAD (dev branch) &mdash; from the kernel to the web browser.</p>
+      <p class="lede">Everything inside LikeOS 0.2.7-HEAD &mdash; from the kernel to the web browser.</p>
     </div>
 
   </header>
@@ -103,7 +103,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <dt>Web browser</dt><dd>luakit 2.4.0 on WebKitGTK 2.52.6</dd>
     <dt>Shell</dt><dd>bash 5.2 as <code>/bin/sh</code></dd>
     <dt>License</dt><dd>GNU General Public License version 2 (GPLv2)</dd>
-    <dt>Current release</dt><dd>0.2.7-HEAD (dev branch)</dd>
+    <dt>Current release</dt><dd>0.2.7-HEAD</dd>
   </dl>
 </section>
 
@@ -440,7 +440,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
   <h3>Windows&nbsp;11-style look</h3>
   <ul class="checklist">
     <li><strong>ctwm</strong> window manager with LikeOS additions: flat, 30-pixel "Fluent" title bars with the application icon, wide minimise/maximise/close buttons (close in red), anti-aliased Xft title fonts, click-to-focus and raise-on-click.</li>
-    <li><strong>taskbar</strong>, a LikeOS GTK panel along the bottom: start button with a menu built from the installed <code>.desktop</code> files, a button per window with focus highlight and running indicators, a four-workspace switcher, a load and memory monitor, a volume control and a clock &mdash; driven purely through the EWMH and ICCCM standards.</li>
+    <li><strong>taskbar</strong>, a LikeOS GTK panel along the bottom: start button with a menu built from the installed <code>.desktop</code> files (plus <em>Settings</em> &gt; <em>Display</em>, <em>Reboot</em> and <em>Poweroff</em>), a button per window with focus highlight and running indicators, a four-workspace switcher, a load and memory monitor, a volume control and a clock &mdash; driven purely through the EWMH and ICCCM standards.</li>
     <li>A LikeOS GTK 3 theme compiled from SCSS, Windows-style message dialogs, and the LikeOS cursor theme generated at build time.</li>
     <li>Fonts: Selawik as the interface font, plus Noto Sans, DejaVu, Liberation and the X core fonts.</li>
     <li>PCManFM draws the wallpaper and desktop icons; new accounts receive launchers in <code>~/Desktop</code>.</li>
@@ -621,7 +621,7 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <dt>Ports</dt><dd>Upstream sources kept byte-identical; LikeOS changes live as patches and build files beside each port; cross toolchain wrappers for autotools, Meson and CMake</dd>
     <dt>Output</dt><dd><code>build/likeos-ext4.img</code>, a bootable GPT USB disk image</dd>
     <dt>Install</dt><dd><code>make usb-write USB_DEVICE=/dev/sdX</code></dd>
-    <dt>Screen size</dt><dd>Build-time preferred resolution (<code>SCREEN_SIZE</code>) and ceiling (<code>MAX_SCREEN_SIZE</code>)</dd>
+    <dt>Screen size</dt><dd>Chosen in the Display settings dialog and saved in <code>/etc/likeos/display.conf</code>; until then 1280&times;800 in virtual machines, and on real hardware a build-time preferred resolution (<code>SCREEN_SIZE</code>) with an optional ceiling (<code>MAX_SCREEN_SIZE</code>)</dd>
   </dl>
 </section>
 
@@ -655,8 +655,8 @@ try{if(localStorage.getItem('likeos-consent')==='granted')gtag('consent','update
     <footer class="footer">
       <div class="footer-inner">
         <div>
-          <b>LikeOS</b> 0.2.7-HEAD (dev branch) &middot; free software under the GNU GPL version 2.<br>
-          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 19<sup>th</sup>, 2026.
+          <b>LikeOS</b> 0.2.7-HEAD &middot; free software under the GNU GPL version 2.<br>
+          Web page &amp; LikeOS software copyright &copy; 2026 Nikolaos Rangos. Page last updated October 30<sup>th</sup>, 2026.
         </div>
         <nav aria-label="Footer">
           <a href="technical.html">Technical Details</a>

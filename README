@@ -1,480 +1,1002 @@
 LikeOS
-=========
+======
 
-A modern 64-bit operating system built from scratch, featuring a Unix-like
-userland with process management, syscalls, multitasking, SMP support, a
-multi-user login, bash as the shell, an ext4 root filesystem, TCP/IP
-networking with OpenSSH, and an X.Org desktop running GTK3 applications.
+A modern 64-bit operating system, written from scratch.
+
+Its own kernel, its own drivers and its own C library -- and on top of them a
+complete graphical desktop with sound, on which you can read your mail, chat,
+manage files, listen to music, watch videos and browse today's web.
+
+LikeOS is an independent operating system for 64-bit PCs.  It is not a
+distribution of an existing system and not a re-skin of one: the kernel that
+starts when the machine boots, the drivers that talk to the hardware and the C
+library that every program is linked against were all written for LikeOS.  A
+large set of unmodified upstream programs is ported on top -- from bash and
+OpenSSH up to an X.Org desktop, GTK applications and a WebKit web browser.
+
+LikeOS boots on real notebooks as well as in virtual machines, logs you in as
+an ordinary user, and starts a graphical desktop with a taskbar, desktop icons,
+sound and familiar applications.  Its web browser renders the same complex
+sites you use every day -- maps, web shops, search, AI chat -- and, on Intel
+graphics and on VMware or VirtualBox with 3D enabled, draws them with the GPU.
+
+  Web site:     https://likeos.systemtrap.com
+  Source:       https://github.com/kctherootkey/LikeOS-64
+  Version:      0.2.7-HEAD
+  License:      GNU General Public License, version 2
+
+Branches: master is the stable branch.  dev is unstable, but probably has more
+features; checking it out is optional.
+
+No downloadable images yet: pre-built images will be published with the first
+major release.  Until then LikeOS is built from source, as described below.
 
 Current state
 -------------
 
-- Real hardware support: tested on Lenovo and Dell notebooks with USB boot.
-- QEMU support: run with USB image targets, XHCI enabled and VMSVGA graphics.
-- VMware support: USB 3.1 boot.
-- VirtualBox support: xHCI (USB 3) and VMSVGA graphics.
-- UEFI boot is required.
-- GTK 3.24 is ported, and with it a desktop: PCManFM draws the desktop and
-  manages files, Claws Mail reads and sends mail over IMAP and SMTP, and
-  Mousepad edits text.
+- Lenovo ThinkPad P50: tested; the reference machine.  Intel HD Graphics 530
+  on the i915 driver with GPU acceleration, HD Audio sound (Realtek ALC298),
+  I219 Ethernet, USB boot.
+- Dell Pro 16 Plus: tested; USB boot.
+- VMware: supported.  USB 3.1 boot; vmwgfx with 3D acceleration, overlay
+  video, Sound Blaster PCI (es1371) sound, vmxnet3 or e1000 networking.
+- VirtualBox: supported.  xHCI (USB 3) and the VMSVGA adapter, with 3D when
+  enabled; ICH AC'97 sound.
+- QEMU: supported through the legacy targets.  xHCI, graphics on the UEFI
+  framebuffer (there is no VMware SVGA support under QEMU), Intel HD Audio
+  sound; KVM recommended for the desktop.
+- UEFI boot is required; there is no legacy BIOS boot path.
+- LikeOS runs from a USB drive.  AHCI/SATA and NVMe are not supported yet, so
+  the machine's internal disks are left untouched.
 
-Overview
---------
+The i915 driver's device table reaches far beyond the machines it has been
+verified on; real-hardware testing so far has been on the two notebooks above.
 
-LikeOS is a Unix-like operating system demonstrating modern OS development:
+What you can do with it today
+-----------------------------
 
-- Complete userland: ring 3 processes with syscall interface.
-- Process management: preemptive multitasking scheduler.
-- SMP support: BSP and AP startup with per-CPU scheduling data.
-- UEFI bootloader: GNU-EFI based ELF64 kernel loading.
-- Filesystems: ext4 (the root filesystem) and FAT32, with VFS and devfs.
-- Caching strategy: dentry cache, inode cache, and page cache.
-- Demand paging: pages are mapped when they are first touched, not at exec.
-- Multi-user: login with PAM and yescrypt, users, groups, and DAC permission
-  enforcement in the VFS.
-- Networking: TCP/IP stack with BSD-style sockets and multiple NIC drivers.
-- Graphics: X.Org server on the framebuffer, with a window manager, a desktop
-  with icons and a wallpaper, a terminal, text editors, a web browser, a file
-  manager and a mail client.
-- GTK3: the GTK 3.24 stack (GLib, Cairo, Pango, HarfBuzz, gdk-pixbuf) runs on
-  it, which is what the file manager, the mail client and the editor are.
-- Unicode: UTF-8 end to end -- console, C library, terminal emulator and X.
-- Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, I2C-HID (unfinished),
-  PCI, APIC, ACPI, and VMware SVGA II.
-- Memory: physical/virtual memory, SLAB allocator, stack canaries, and
-  security protections.
-- Virtual terminals, TTY, PTYs and signals: VTs with POSIX-like terminal
-  and signal handling.
-- Threads: POSIX threads with mutexes, condition variables and TLS.
-- Diagnostics: kernel and user crashlog printing with BUG_ON/WARN_ON asserts.
+- Browse the web: the luakit browser on WebKitGTK, with an ad blocker and
+  filter lists for every region.
+- Read and send mail: Claws Mail over IMAP, POP3 and SMTP, encrypted with TLS.
+- Chat: the HexChat IRC client -- and the web's chat services in the browser.
+- Manage files: PCManFM draws the desktop and manages files; Mousepad edits
+  text.
+- Work in a terminal: bash, tmux, OpenSSH, curl and a full set of Unix tools.
+- Listen and watch: the Media Player for music and video, sound from the web,
+  and a volume control in the taskbar -- on LikeOS's own sound drivers.
+
+At a glance
+-----------
+
+  Architecture      x86-64 (long mode), higher-half kernel, up to 64 CPUs
+  Boot              UEFI only; own GNU-EFI bootloader that loads the ELF64
+                    kernel straight from the ext4 root filesystem
+  Kernel            monolithic, preemptive, SMP; 199 system calls with a
+                    POSIX-style interface; ACPI through ACPICA 20251212
+  Root filesystem   ext4 (read/write, journalled), on a single GPT USB disk
+                    image: FAT32 EFI System Partition + ext4 root
+  Graphics          own DRM/KMS core with GEM, sync objects and DMA-BUF;
+                    native Intel i915 and VMware SVGA (vmwgfx) drivers; UEFI
+                    framebuffer fallback
+  Sound             own drivers for Intel HD Audio (with HDMI and DisplayPort
+                    audio), the Intel audio DSP with SoundWire, AC'97 and the
+                    Ensoniq AudioPCI; the audiod service mixes every program
+  Desktop           X.Org server 21.1 (modesetting + glamor), ctwm with a
+                    Windows 11-style look, the LikeOS taskbar with a volume
+                    control, PCManFM desktop, GTK 3.24, a media player
+  Web browser       luakit 2.4.0 on WebKitGTK 2.52.6
+  Shell             bash 5.2 as /bin/sh
 
 Feature summary
 ---------------
 
-Core OS
-~~~~~~~
-- 64-bit long mode kernel and higher-half mapping.
-- UEFI boot path with framebuffer and memory map handoff.
-- Interrupt and exception handling with IDT and PIC/APIC integration.
-- Per-task x87/SSE register state, saved and restored across context switches;
-  the kernel's own SSE use (the framebuffer blits) is bracketed by
-  kernel_fpu_begin/end, and kernel code is otherwise compiled without SSE.
-- CPU power management: HWP/EPP performance hints, set per core at bring-up.
-
-SMP (Symmetric Multi-Processing)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- Up to 64 CPUs.
-- AP startup using INIT-SIPI-SIPI and AP trampoline.
-- Per-CPU data structures via GS base.
-- Per-CPU run queues and scheduler accounting.
-- LAPIC timer setup and SMP IPI support.
-- IOAPIC routing for multi-core delivery.
-- TLB shootdown helpers and SMP-aware locking paths.
-
-Networking
-~~~~~~~~~~
-- TCP/IP stack: Ethernet, ARP, IPv4, ICMP, IGMP, UDP, and TCP.
-- BSD-style socket layer, plus Unix domain sockets.
-- DHCP client, DNS resolver, and routing table.
-- Softirq-based packet processing with rate limiting.
-- NIC drivers: Intel e1000/e1000e/igb, eepro100, AMD PCnet32, NE2000,
-  Realtek RTL8139, DEC Tulip, and VMware vmxnet3.
-- Networking utilities: ifconfig, route, arp, ping, traceroute, netstat,
-  dhclient, host, dig, nslookup, hostname, and arping.
-
-Filesystems
+Kernel core
 ~~~~~~~~~~~
-- ext4 is the root filesystem: extents, hash-indexed (htree) directories,
-  extended attributes, and a journal with ordered-data commits.  Both read and
-  write paths are implemented, including extent-tree growth and directory
-  hashing, and the bootloader reads /boot/kernel.elf straight out of it.
-- FAT32 for the EFI System Partition and removable media (mounting removable media is still a pending feature).
-- VFS layer with symlinks, hard links, file locking, and chroot.
-- devfs: /dev/null, /dev/zero, /dev/random, /dev/urandom, /dev/tty, /dev/pts,
-  /dev/fb0, /dev/input/event*, and the disk nodes.
+The kernel is organised into subsystems: the executive (ke), the hardware
+abstraction layer (hal), memory management (mm), filesystems (fs), console and
+terminals (io), device drivers (dev) and networking (net).
+
+- 64-bit long mode, higher-half mapping, four-level paging.
+- UEFI boot path with framebuffer (GOP) and memory-map handoff.
+- Up to 64 CPUs; AP start-up via INIT-SIPI-SIPI and a real-mode trampoline.
+- IDT, Local APIC (xAPIC and x2APIC), IOAPIC routing, PCI MSI.
+- SMP with per-CPU data via the GS base, per-CPU run queues, IPIs and TLB
+  shootdown.
+- 199 system calls, entered through the SYSCALL instruction.
+- Per-task extended processor state (x87/SSE/AVX through XSAVE), saved and
+  restored across context switches and in signal frames.
+- Timekeeping: LAPIC timer tick, TSC-based precise time, and high-resolution
+  timers on an HPET comparator, giving precise nanosleep, clock_nanosleep,
+  futex and poll timeouts.
+- Clocks: CLOCK_REALTIME, MONOTONIC, MONOTONIC_RAW, BOOTTIME, the coarse
+  variants and per-process/per-thread CPU-time clocks.  POSIX interval timers
+  (timer_create family), setitimer and alarm.
+- CPU performance: HWP with the energy-performance preference set to maximum
+  performance on each core, and Enhanced SpeedStep on older Intel CPUs.
+- ACPI through ACPICA 20251212: table parsing, AML interpreter, namespace
+  enumeration; S5 poweroff and the ACPI reset register.
+- Firmware loader that reads blobs (Intel GPU DMC, GuC and HuC images) from
+  /lib/firmware.
+- ChaCha20-based CSPRNG with an entropy pool, /dev/random, /dev/urandom and
+  getrandom.
+- Assertion framework (BUG_ON, WARN_ON, WARN_ON_ONCE, VM_BUG_ON, BUILD_BUG_ON)
+  and full crash dumps for kernel and user faults.
+
+Console and terminals
+~~~~~~~~~~~~~~~~~~~~~
+- Framebuffer console with double buffering, write-combining, scrollback, a
+  scrollbar and a mouse pointer.
+- Virtual terminals with an ANSI/VT100/VT220/xterm emulator: 256-colour and
+  true-colour SGR, scroll regions, alternate screen, mouse reporting and
+  terminal query replies, so full-screen programs work.
+- POSIX TTY line discipline, job-control signals, and pseudo-terminals
+  (/dev/ptmx, /dev/pts) -- what tmux, xterm and sshd sessions run on.
+- UTF-8 end to end: the console decodes it and addresses glyphs by code point,
+  the terminal emulator tracks character widths, and the C library implements
+  the full multibyte and wide-character interface.  The console font is a PSF
+  font (Terminus) with a Unicode table.
+- Serial and USB-serial logging back ends.
 
 Memory management
 ~~~~~~~~~~~~~~~~~
-- Physical page allocator with a bitmap and per-page reference counts.
-- Four-level paging, higher-half kernel, and a RAM-sized direct map.
-- SLAB allocator for kernel objects.
-- Demand paging: anonymous memory, brk, BSS and private file-backed mmap are
-  populated on first touch rather than at exec time, so a large program starts
-  without faulting in what it never reads.
-- Copy-on-write fork, mmap/munmap/mprotect, and guard-paged stacks.
-- A per-process mapping table that grows on demand, so a program with thousands
-  of mappings (a GTK application with its fonts, icons and libraries) is not
-  held to a fixed limit.
-- System V and POSIX shared memory (used by X clients through MIT-SHM).
+- Physical page allocator with a bitmap and per-page reference counts; a
+  RAM-sized direct map.
+- SLAB allocator for kernel objects; memory poisoning in debug builds.
+- Demand paging: anonymous memory, brk, BSS and file-backed mappings are
+  populated on first touch, not at exec.
+- Copy-on-write fork, plus a real vfork that shares the address space.
+- mmap/munmap (anonymous, private and shared file mappings), mprotect, mremap,
+  madvise, mincore, and brk that returns memory when the heap shrinks.
+- A per-process mapping table that grows on demand, up to 65,530 mappings --
+  enough for large GTK and WebKit processes.
+- Guard-paged stacks; no-execute (NX) mappings, with kernel sections remapped
+  by permission.
+- System V shared memory and semaphores, POSIX shared memory (/dev/shm) and
+  memfd_create.
+- Unified page cache with read-ahead and CLOCK eviction, shared by ext4 and
+  FAT32.
+- OOM killer: when reclaim cannot satisfy an allocation, a victim process is
+  chosen and killed instead of the machine stalling.
 
-Users, login and permissions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- init -> getty -> login, driven by /etc/inittab.
-- PAM stack with a yescrypt-based crypt(3); /etc/passwd, /etc/shadow,
-  /etc/group.
-- Real, effective and saved user and group IDs, supplementary groups, and
-  set-user-ID execution.
-- Discretionary access control enforced in the VFS, with a single privilege
-  chokepoint, so file permissions apply to every path that opens a file.
-- Account tools: id, whoami, groups, su, passwd, adduser, addgroup, deluser,
-  delgroup.
+Scheduling and processes
+~~~~~~~~~~~~~~~~~~~~~~~~
+- Preemptive, fair scheduler: every task is charged the CPU time it uses
+  (vruntime), and the task that has run least runs next.  Per-CPU run queues
+  kept in vruntime order; woken tasks are placed just ahead of the runnable
+  ones.
+- Periodic load balancing between CPUs, and CPU affinity
+  (sched_setaffinity/sched_getaffinity).  The standard sched_* calls are
+  accepted; there are no priority classes.
+- fork, vfork, clone (threads, TLS, child TID set/clear, shared files, FS and
+  signal handlers), execve, exit_group, wait4.
+- ELF64 loading of static and dynamically linked programs, and #! scripts.
+- Process groups, sessions and job control.
+- Signals: rt_sigaction with SA_SIGINFO, real-time queued signals,
+  sigaltstack, sigsuspend, sigtimedwait, tgkill, and syscall restart.
+- Futexes: wait/wake, requeue and compare-requeue, wake-op, bitsets,
+  priority-inheritance locks, and robust lists; process-private and shared
+  keys.
+- Event interfaces: poll, ppoll, select, pselect6, epoll, eventfd, timerfd,
+  signalfd, pipes.
+- ptrace: attach/trace-me, peek/poke memory and user area, general and FP
+  registers, single-step, syscall tracing, fork/vfork/clone/exec/exit events,
+  and hardware watchpoints through the debug registers.
+- /proc: self, <pid>/maps, cmdline, comm, exe, cwd, fd, stat, statm, status,
+  auxv, mem, plus cpuinfo, meminfo, mounts, uptime, version.
 
-Graphics and input
-~~~~~~~~~~~~~~~~~~
-- Framebuffer console with scrollback, a scrollbar, and a mouse pointer.
-- VMware SVGA II driver with mode setting and a hardware cursor; the UEFI GOP
-  framebuffer is the fallback on hardware without it.
-- Intel graphics (i915): a native driver for the integrated GPUs of the
-  Broadwell through Meteor Lake generations, fully driven on Skylake-class
-  parts (the ThinkPad P50's HD Graphics 530 is the reference machine):
-  eDP panel bring-up from the VBT and EDID (link training, panel power
-  sequencing, PWM backlight with /sys/class/backlight/intel_backlight and
-  the backlight(1) tool), HDMI/DVI and DisplayPort outputs with hotplug
-  re-detection, X-/Y-tiled scanout, execution-list command submission with
-  per-context 48-bit address spaces, hang detection and engine reset, the
-  i915 ioctl interface Mesa's iris driver uses (GEM objects, contexts,
-  execbuffer2, sync objects, queries), DMC firmware loading from
-  /lib/firmware/i915.  Older generations and the Xe2+ parts are identified
-  and left to the firmware framebuffer.  The X server picks
-  xorg.conf.modesetting-i915 (glamor, DRI3, page flipping) when it is the
-  driver; drminfo(1) reports it.
-- Hardware video: on Intel graphics the video engines decode through VA-API
-  (libva, the iHD driver -- intel-media-driver on gmmlib -- with the i965
-  driver as the fallback LIBVA_DRIVER_NAME=i965 selects, GStreamer's va
-  plugin -- vah264dec, vah265dec,
-  vavp8dec, vavp9dec, vaav1dec -- and FFmpeg's vaapi hwaccels; vainfo(1),
-  ffmpeg(1) and ffprobe(1) exercise it from a shell).  On VMware the display
-  adapter's video overlay stream is driven by the display manager's stream
-  ioctls and offered by the X server as the "VMware Overlay Video Engine"
-  XVideo adaptor, next to glamor's textured adaptor on the SVGA3D device;
-  xvinfo(1) lists them, and players that draw through XVideo (gst-play-1.0,
-  xvimagesink) use them.  The browser decodes with the VA-API decoders where
-  they exist and composites the frames with the page in its web process, as
-  on any desktop.
-- /dev/fb0 (fbdev) and /dev/input/event* (evdev), which is what the X server
-  drives.
-- PS/2 keyboard and mouse, USB HID, and I2C-HID touchpads.
-- A desktop: PCManFM paints the wallpaper and the icons on the root window,
-  and new accounts get launchers in ~/Desktop from /etc/skel.
-- Build-time preferred resolution, with a ceiling for displays that are
-  smaller than the modes a virtual machine advertises (see "Screen resolution").
-
-Unicode
-~~~~~~~
-- UTF-8 is the encoding everywhere: the console decodes it and addresses glyphs
-  by code point, the terminal emulator tracks character widths, and the C
-  library implements the full multibyte and wide-character interface.
-- Console font is PSF2-capable PSF1 with a Unicode table (Uni2-Terminus16,
-  512 glyphs covering 791 code points: Latin, Greek, Cyrillic, box drawing).
-- Character classification, case mapping and display widths come from tables
-  generated against a reference implementation, and are checked against it over
-  every code point (host/test-unicode.sh).
-
-Caching strategy
-~~~~~~~~~~~~~~~~
-- Dentry cache:
-  - Name lookup cache for directory entries.
-  - Positive and negative dentry entries.
-  - Hash buckets with LRU eviction.
-- Inode cache:
-  - Metadata cache keyed by inode number.
-  - Reference counting and dirty metadata writeback.
-  - Cached cluster chain acceleration for FAT32.
-- Page cache:
-  - File data pages (4 KiB) with hash-indexed lookup.
-  - Read-ahead and sequential access optimization.
-  - CLOCK-style eviction and dirty writeback handling.
-
-Process management and userland
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- fork, execve, exit, wait4, signals, pipes.
-- User mode execution in ring 3.
-- ELF64 user binary loading, plus #! script execution.
-- Userland libc and dynamic runtime linker (ld-likeos.so) with dlopen/dlsym.
-- POSIX threads: mutexes, condition variables, barriers, thread-local storage,
-  and futex-based blocking.
-- poll, select and epoll; PTYs for terminal multiplexers and remote logins.
-- POSIX regular expressions, iconv, and locale support.
-
-Virtual terminals and TTY
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-- POSIX-like TTY line discipline and job-control signals.
-- ANSI/VT100/VT220/xterm escape sequence emulation, including the alternate
-  screen, scroll regions and mouse reporting, so full-screen programs work.
-- Pseudo-terminals, which is what tmux, xterm and sshd sessions run on.
-- Per-task TTY output routing for clean crashlog and diagnostics printing.
-
-Security and hardening
+Filesystems and storage
 ~~~~~~~~~~~~~~~~~~~~~~~
-- Stack canaries (stack-smashing protection) in kernel and userland.
-- User/kernel address-space separation and ring 3 isolation.
-- Page-level memory protections.
-- SMEP and SMAP where the CPU has them, so a stray kernel dereference into
-  user memory faults instead of succeeding quietly.
-- RELRO honoured by the dynamic linker: the GOT is made read-only once the
-  relocations are done.
+- ext4 is the root filesystem, with full read and write support: extent trees
+  (with growth) and indirect block mapping, hash-indexed (htree) directories
+  including directory hashing on write, a JBD2 journal in ordered-data mode
+  with replay after an unclean shutdown, 64-bit, flex_bg and metadata_csum
+  (CRC32C) filesystems, extended attributes, symbolic and hard links, and
+  fallocate.
+- Correct unlink-while-open semantics: an orphaned inode lives until its last
+  close.
+- The bootloader reads /boot/kernel.elf straight out of ext4.
+- FAT32 with long file names, used for the EFI System Partition.
+- tmpfs mounted at /ram, with hard links (used to run the browser's cache in
+  RAM).
+- devfs: /dev/null, zero, random, urandom, tty, console, ptmx, pts/*, fb0,
+  input/event*, dri/card*, dri/renderD*, shm, fd and the disk nodes.
+- procfs (/proc) and sysfs (/sys/bus/pci/devices and device classes such as
+  the backlight).
+- VFS with symlinks, hard links, *at() calls, chroot, statfs, utimensat,
+  sync/fsync/fdatasync, and POSIX advisory record locks
+  (F_GETLK/F_SETLK/F_SETLKW).
+- Dentry cache (positive and negative entries), inode cache, and the unified
+  page cache with dirty writeback.
+- Block device layer over USB mass storage (Bulk-Only Transport) on xHCI, with
+  1 MiB write coalescing for USB throughput.
+- AHCI/SATA and NVMe controllers are not yet supported, and mounting removable
+  media is still pending.
 
-Reliability and diagnostics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- Proper crashlog printing for both kernel and user faults.
-- A userspace crash report names the faulting mapping and the offset into it,
-  and recovers a probable call chain by scanning the stack for return
-  addresses -- so a fault in a stripped shared library can still be resolved
-  to a function with addr2line.
-- In-kernel assertion framework: BUG_ON, WARN_ON, WARN_ON_ONCE,
-  VM_BUG_ON/VM_WARN_ON, and BUILD_BUG_ON.
-- Non-fatal warnings continue execution; fatal bugs print a full crash dump.
+Devices and buses
+~~~~~~~~~~~~~~~~~
+- PCI: configuration-space enumeration, capabilities, MSI; exported in
+  /sys/bus/pci.
+- ACPI: ACPICA 20251212 -- tables (RSDP/XSDT/MADT/FADT), AML, device
+  enumeration, S5 poweroff, reset.
+- Interrupt controllers: Local APIC (xAPIC and x2APIC), IOAPIC; HPET.
+- USB: xHCI (USB 3.x) host controller driver, interrupt-driven; mass storage
+  (Bulk-Only Transport); HID boot keyboards and mice, report-protocol mice with
+  scroll wheel; USB-serial logging.
+- Legacy input: PS/2 keyboard and mouse.
+- I2C-HID: Intel LPSS DesignWare I2C controller with HID-over-I2C touchpads,
+  found through ACPI (experimental).
+- Input interface: evdev (/dev/input/event*), used by the X server.
+- Display: Intel i915, VMware SVGA II/SVGA3D (vmwgfx), UEFI GOP framebuffer,
+  /dev/fb0 (fbdev).
+- Backlight: Intel PWM backlight in /sys/class/backlight/intel_backlight and
+  the backlight tool.
+- Sound and network: see the next sections.
 
-User core utilities
-~~~~~~~~~~~~~~~~~~~
-Included commands (selection):
+Sound
+~~~~~
+LikeOS has its own sound stack, from the kernel drivers up to the desktop.
 
-- Shell: bash 5.2 is /bin/sh -- job control, history, completion, globbing,
-  arrays and arithmetic, all of it.
-- Core navigation: ls, pwd, cd behavior in shell.
-- File tools: cat, cp, mv, rm, mkdir, rmdir, touch, stat, file, find, ln,
-  chmod, readlink, cmp.
-- Text tools: grep, sed, expr, wc, sort, uniq, cut, tr, head, tail, more, less,
-  strings, hexdump, nano.
-- System tools: uname, uptime, date, time, ps, top, df, du, free, dmesg, nproc.
-- Process tools: kill, sleep.
-- Diagnostics: memstat (system memory accounting and a per-process breakdown),
-  pmap (one process's address space, with a watch mode that reports what
-  changed), and kdump (the kernel's TCP, AF_UNIX, PTY and task tables, root
-  only).  memstat and pmap report your own processes; root sees every one.
-  ps shows what a blocked task is waiting on (WCHAN).
-- Environment tools: env, which, echo, printf.
-- Power tools: shutdown, poweroff, reboot, halt.
-- Network tools: ifconfig, route, arp, ping, traceroute, netstat, dhclient,
-  host, dig, nslookup, hostname, arping.
+Kernel drivers:
+
+- Intel High Definition Audio: HD Audio controllers from Intel's ICH6 through
+  current platforms, NVIDIA, AMD/ATI and other vendors.  A generic codec
+  parser works from the board's pin configuration, with codec drivers for
+  Realtek, Conexant, SigmaTel/IDT, Analog Devices SoundMAX, Cirrus Logic, VIA
+  and Creative CA0132, and for the emulated codecs of QEMU and other
+  hypervisors.  Headphone auto-mute and jack detection.
+- HDMI and DisplayPort audio: the display codecs of Intel, NVIDIA and AMD
+  graphics; monitors are identified from their ELD; on Intel graphics the i915
+  display driver and the sound driver work together.
+- Intel audio DSP: cAVS 2.5 and ACE platforms with SOF IPC4 firmware and
+  topology, the Intel SoundWire controller (Cannon Lake to Panther Lake) and
+  the Cirrus Logic CS42L43 jack codec of recent laptops.
+- AC'97: Intel ICH AC'97 controllers and register-compatible parts, with AC'97
+  codecs.
+- Ensoniq AudioPCI: ES1370, ES1371, ES1373, Creative CT5880 ("Sound Blaster
+  PCI 64/128") -- also the sound card VMware and QEMU emulate.
+- Device interface: /dev/audioN for playback and recording with jack and
+  monitor events, plus OSS-compatible /dev/dsp and /dev/mixer; owned by root
+  and the group audio.
+
+The sound service:
+
+- audiod owns the sound card and mixes the sound of every program into one
+  stream, so a video in the browser, the media player and a notification sound
+  can play at the same time, each at its own volume.
+- Programs send sound in whatever format they have -- 8 to 32-bit integer or
+  32/64-bit float, 1 to 8 channels, 4 kHz to 384 kHz.  The service resamples
+  with an exact-ratio windowed-sinc filter, maps the channels to the card,
+  ramps volume changes so they never click, and limits the sum softly so that
+  many loud streams do not distort.
+- Headphone and line jacks and HDMI/DisplayPort monitors are followed as they
+  come and go; when the monitor that sound was sent to goes away, it falls back
+  to the speakers and returns once the monitor is back.
+- After a few seconds of silence the card is stopped, so an idle system has no
+  wake-ups for sound.  Volume, mute and the chosen output survive restarts.
+- Programs connect through libaudio; GStreamer's likeosaudiosink is picked
+  automatically, so WebKit and the media player play through the service.
+
+On the desktop and in the terminal:
+
+- A volume control in the taskbar: the speaker opens a slider with a mute
+  button; the mouse wheel over the speaker changes the volume, and a middle
+  click mutes.
+- Media Player for music and video: WAV, AIFF, AU, AAC/M4A, MP3, Ogg Vorbis,
+  Opus and FLAC; MP4, Matroska and WebM video with H.264, H.265, VP8 and VP9;
+  internet streams including HLS and DASH; a play queue and M3U/PLS playlists.
+- System sounds when the desktop starts and when you leave it, from a sound
+  set synthesized for LikeOS.
+- Command-line tools: audioplay (WAV, AIFF, AU, CAF and raw PCM), audioctl
+  (volume, mute, outputs and streams), audiotest (test signals and latency),
+  audioinfo (what the sound hardware can do) and eventsound.
+
+Networking
+~~~~~~~~~~
+- Ethernet, ARP, IPv4, ICMP, IGMP, UDP and TCP, with a routing table and
+  softirq-based receive processing.  The stack is IPv4-only.
+- In-kernel DHCP client and DNS resolver (forward and reverse).
+- BSD socket API: sendmsg/recvmsg, accept4, sendfile, shutdown half-close, raw
+  sockets for ping and traceroute.
+- Socket options including SO_REUSEADDR, SO_REUSEPORT, SO_KEEPALIVE,
+  SO_LINGER, buffer sizes and timeouts, TCP_NODELAY and the keepalive
+  tunables.
+- TCP: window scaling and timestamps (RFC 7323), selective acknowledgements
+  (RFC 2018), NewReno congestion control (RFC 5681), RTO computation
+  (RFC 6298), initial window of ten segments (RFC 6928), SYN cookies
+  (RFC 4987), SipHash-based initial sequence numbers (RFC 6528), challenge
+  ACKs (RFC 5961), path-MTU handling (RFC 1191).
+- Unix domain sockets: stream, datagram and sequenced-packet sockets;
+  filesystem and abstract names; file-descriptor passing (SCM_RIGHTS) and peer
+  credentials (SO_PEERCRED) -- what D-Bus, the X server and DRI3 rely on.
+- Network drivers:
+
+    e1000      Intel 82540EM, 82545EM (QEMU, VMware default, VirtualBox
+               PRO/1000)
+    e1000e     Intel 82574L, 82583V, I217, I218 and the I219 family
+               (generations 1-23); verified on the ThinkPad P50
+    igb        Intel 82575, 82576, I350, I210, I211
+    eepro100   Intel 8255x
+    pcnet32    AMD PCnet-PCI II / PCnet-FAST III
+    ne2k       NE2000-compatible PCI (Realtek RTL8029AS)
+    rtl8139    Realtek RTL8139 / RTL8139C+
+    tulip      DEC 21040, 21041, 21140, 21142, 21143
+    vmxnet3    VMware paravirtual NIC (ESXi, Workstation, Fusion, QEMU)
+
+- Command-line tools: ifconfig, route, arp, arping, ping, traceroute, netstat,
+  dhclient, host, dig, nslookup, hostname, plus the ported curl, netcat and
+  OpenSSH.
+
+Graphics and GPU drivers
+~~~~~~~~~~~~~~~~~~~~~~~~
+DRM/KMS core -- a display-manager core written for LikeOS, offering the
+standard DRM ioctl interface that libdrm, Mesa and the X server's modesetting
+driver use:
+
+- Primary nodes (/dev/dri/card*) and render nodes (/dev/dri/renderD*), DRM
+  master handling.
+- Atomic and legacy mode setting: CRTCs, planes (primary, overlay, cursor),
+  connectors, properties, blending, colour management and damage clips.
+- Vblank counters and events, page flips, CRTC sequence queries.
+- GEM buffer objects, dumb buffers, and PRIME/DMA-BUF sharing between
+  processes.
+- Fences, fence arrays and chains, reservation objects, sync files, and binary
+  and timeline sync objects.
+- Dirty tracking of coherently mapped buffers through the page tables.
+- EDID, DisplayID and ELD parsing; DisplayPort, dual-mode, DSC, HDMI infoframe
+  and SCDC helpers.
+- Device suspend/resume with a gate that holds clients off the hardware.
+- The kernel console becomes a DRM client when a driver is present, and hands
+  the screen to the X server and takes it back.
+
+Intel i915 driver -- a native driver whose device table covers Intel graphics
+from the i830 (generation 2) through Xe3 (Lunar Lake, Battlemage, Panther
+Lake, Wildcat Lake, Nova Lake).  The Skylake-class HD Graphics 530 of the
+ThinkPad P50 is the reference machine.
+
+- Command submission: ring buffers on generations 2-7; execution lists with
+  per-context 48-bit address spaces from Broadwell; GuC firmware submission
+  (interface version 70) on the parts that require it (DG2, Meteor Lake and
+  later), including the separate media GT.
+- Engines: render, blitter, video decode, video enhancement and compute.
+- Global GTT, per-process GTT (4-level, 5-level on Xe2+), stolen memory, and
+  device-local memory on the discrete DG1, DG2 and Battlemage cards.
+- Render P-states (RPS), and SLPC frequency management through the GuC.
+- Firmware: DMC display microcode, GuC and HuC images from /lib/firmware/i915
+  and /lib/firmware/xe.
+- Hang detection and engine reset; workarounds and MOCS tables per platform.
+- The i915 uAPI Mesa's iris driver and the VA-API media drivers use: GEM
+  objects, contexts and VMs, execbuffer2 with soft-pin and sync objects,
+  queries.
+
+Intel display engine:
+
+- Embedded DisplayPort panels from the VBT and EDID: link training, panel
+  power sequencing, PWM backlight, ACPI OpRegion.
+- DisplayPort, HDMI and DVI outputs with hotplug detection; Type-C ports (Ice
+  Lake to Meteor Lake).
+- Display stream compression (DSC), variable refresh timing, colour
+  management, X- and Y-tiled scan-out.
+- PLLs and PHYs across generations: combo PHYs, Synopsys PHYs (DG2), C10/C20
+  PHYs (Meteor Lake and Arrow Lake), LT PHY (Nova Lake).
+- Legacy outputs of older generations: VGA, LVDS, SDVO, DVO, the TV encoder,
+  and MIPI DSI panels on Bay Trail and Cherry Trail.
+- Display bandwidth, watermarks, CDCLK and power-well management.
+
+VMware SVGA (vmwgfx):
+
+- A hardware layer for the SVGA II adapter found in VMware and VirtualBox
+  (VMSVGA) -- not used under QEMU, where LikeOS draws on the UEFI framebuffer;
+  every optional feature is gated on what the host advertises.
+- Three scan-out paths chosen by device capability: legacy VRAM, screen
+  objects and screen targets.
+- SVGA3D with guest-backed objects (MOBs, GB surfaces), DX (VGPU10) contexts,
+  views and shaders, and command buffers.
+- Command-stream validation and handle translation, so no process can name
+  another's objects.
+- FIFO and interrupt-driven fences, a hardware cursor, and the video overlay
+  stream offered to X as an XVideo adaptor.
+- Suspend/resume, and the guest-to-host message channel.
+
+Userspace graphics stack:
+
+    Mesa 25.3.6          Gallium drivers: iris (Intel, Broadwell and later),
+                         svga (VMware/VirtualBox SVGA3D), llvmpipe, softpipe.
+                         OpenGL, OpenGL ES 2, GLX (DRI), EGL and GBM on X11
+    LLVM 23.1.0          built for LikeOS (x86 back end) as llvmpipe's JIT
+    libdrm 2.4.124       DRM userspace interface
+    libepoxy 1.5.10      GL dispatch for GTK
+    GLU 9.0.3, Mesa demos 9.0.0
+
+The X server runs glamor (OpenGL-accelerated 2D), DRI3 and Present on Intel
+graphics and on VMware or VirtualBox with 3D enabled; clients such as WebKit
+render on the GPU through the render node.  Elsewhere it draws in software and
+GL falls back to llvmpipe.  drminfo reports the driver and its capabilities.
+
+Desktop and applications
+~~~~~~~~~~~~~~~~~~~~~~~~
+Session:
+
+- startx from any account: the X server is installed setuid root and drops
+  privileges once its devices are open.
+- The server configuration is chosen at start-up from the detected GPU (i915,
+  VMware 3D, other DRM driver, or plain fbdev).
+- A D-Bus session bus is started with the session.
+- A start-up sound when the desktop comes up, and a sound when you leave it.
+
+Windows 11-style look:
+
+- ctwm window manager with LikeOS additions: flat, 30-pixel "Fluent" title
+  bars with the application icon, wide minimise/maximise/close buttons (close
+  in red), anti-aliased Xft title fonts, click-to-focus and raise-on-click.
+- taskbar, a LikeOS GTK panel along the bottom: start button with a menu built
+  from the installed .desktop files, a button per window with focus highlight
+  and running indicators, a four-workspace switcher, a load and memory
+  monitor, a volume control and a clock -- driven purely through the EWMH and
+  ICCCM standards.
+- A LikeOS GTK 3 theme compiled from SCSS, Windows-style message dialogs, and
+  the LikeOS cursor theme generated at build time.
+- Fonts: Selawik as the interface font, plus Noto Sans, DejaVu, Liberation and
+  the X core fonts.
+- PCManFM draws the wallpaper and desktop icons; new accounts receive
+  launchers in ~/Desktop.
+
+X Window System and toolkits:
+
+    X.Org server 21.1.23          modesetting driver with glamor, DRI2/DRI3,
+                                  Present, GLX; XVideo
+    xf86-video-fbdev 0.5.0,       software fallback and input
+      xf86-input-evdev 2.11.0
+    libX11 1.8.13, libxcb 1.17.0  plus the usual X extension libraries
+    libxkbcommon 1.13.1,          keyboard handling
+      xkeyboard-config 2.47
+    FreeType 2.13.3, fontconfig   font rendering and pixel compositing
+      2.15.0, pixman 0.46.4
+    Motif 2.3.8                   toolkit for XNEdit
+    GTK 3.24.52                   main toolkit; GTK 2.24.33 is also built for
+                                  HexChat
+    GLib 2.88.3                   GObject, GIO; glib-networking 2.80.1
+    Cairo 1.18.4, Pango 1.58.0,   with FriBidi 1.0.16
+      HarfBuzz 14.3.0
+    gdk-pixbuf 2.44.7, ATK 2.38.0
+    GtkSourceView 4.8.4,          editor and terminal widgets
+      VTE 0.84.1
+    D-Bus 1.16.2                  session bus
+    libstdc++ (GCC 13.3.0)        C++ runtime for the C++ ports
+    Adwaita 3.38.0, hicolor 0.18,
+      shared-mime-info 2.5.1
+
+Applications:
+
+    ctwm 4.1.0              window manager (with LikeOS patches)
+    PCManFM 1.4.0           file manager and desktop (libfm 1.4.1,
+                            menu-cache 1.1.1)
+    Claws Mail 4.4.0        IMAP, POP3 and SMTP over TLS (libetpan,
+                            GnuTLS 3.8.13), spell checking via Enchant and
+                            Hunspell
+    Mousepad 0.7.0          GTK text editor
+    xfce4-terminal 1.2.0    VTE-based terminal (libxfce4ui 4.20.2,
+                            xfconf 4.20.0)
+    HexChat 2.16.2          IRC client
+    galculator 2.1.4        calculator
+    Media Player 1.0        LikeOS music and video player on GStreamer
+    luakit 2.4.0            web browser
+    xterm 410               UTF-8, 256 colours
+    XNEdit 1.6.3            Motif text editor
+    X clients               xcalc, xclock, xload, xsetroot, xrandr, xset,
+                            xauth, xvinfo, twm
+
+Web browser and multimedia
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+WebKitGTK 2.52.6:
+
+- The GTK 3 API (webkit2gtk-4.1) on the X11 target, with feature options
+  matching a mainstream desktop distribution build.
+- Skia rendering with its GPU back end on Mesa, a GPU process, and frames
+  passed between processes as DMA-BUF descriptors via GBM; CPU rendering where
+  there is no GPU.
+- JavaScriptCore with all JIT tiers, WebAssembly and the sampling profiler.
+- GStreamer media: video, Web Audio, Media Source Extensions, MediaStream,
+  MediaRecorder, WebCodecs and GStreamer GL.
+- Gamepads (libmanette), WebDriver, colour management (LCMS), hyphenation,
+  libsecret, MiniBrowser.
+- Networking through libsoup 3.6.6 with GnuTLS, HTTP/2 (nghttp2), the public
+  suffix list (libpsl); ICU 78.3, SQLite, WOFF2/Brotli and WebP.
+
+luakit 2.4.0:
+
+- Keyboard-driven browser scripted in Lua 5.1.5 (with LuaFileSystem 1.9.0).
+- Hardware acceleration always on; window size chosen from the screen size.
+- Sound from web pages through the system sound service, with Web Audio on;
+  videos start only when clicked.
+- Built-in ad blocking with option-aware filter rules and a keyword index,
+  shipping EasyList, EasyPrivacy, Peter Lowe's list and more than twenty
+  regional lists.
+- An optional launcher keeps the browser's profile and caches in RAM (/ram).
+- A cheat sheet of its key bindings and of the LikeOS-specific settings is on
+  the web site: https://likeos.systemtrap.com/luakit.html
+
+Multimedia:
+
+    GStreamer 1.24.13          core with base, good, bad and libav plugins
+    FFmpeg 7.1.1               codecs (H.264, H.265, VP8, VP9; AAC, MP3,
+                               Vorbis, Opus, FLAC, ALAC), ffmpeg/ffprobe,
+                               VA-API hardware acceleration
+    likeosaudiosink 1.0        GStreamer sound output to the audiod service,
+                               chosen automatically
+    libva / libva-utils 2.22.0 VA-API, vainfo
+    Intel media driver (iHD)   24.3.4, with gmmlib 22.5.2
+    Intel VA-API driver (i965) 2.4.1, fallback driver
+
+On Intel graphics, video is decoded on the GPU's video engines through VA-API
+(GStreamer's va decoders for H.264, H.265, VP8, VP9 and AV1, and FFmpeg's
+VA-API hwaccels).  On VMware, the adapter's overlay is offered as the "VMware
+Overlay Video Engine" XVideo adaptor next to glamor's textured adaptor.
+
+C library and runtime
+~~~~~~~~~~~~~~~~~~~~~
+LikeOS has its own C library (libc.so and libc.a) and its own dynamic linker,
+ld-likeos.so, both written for the system.
+
+- Dynamic linker: dlopen/dlsym, GNU hash tables, static and dynamic TLS
+  (__tls_get_addr), constructors and DT_INIT_ARRAY, RELRO.
+- Threads: POSIX threads (mutexes including robust ones, condition variables,
+  barriers, read-write locks, thread-specific data), POSIX semaphores, and C11
+  <threads.h>.
+- malloc: bin-based allocator with per-thread caches and multiple arenas.
+- Math: correctly rounded double and float functions from LLVM libc, plus
+  fenv.
+- Unicode and locales: UTF-8 locale, the full multibyte and wide-character
+  interface, wcwidth, <uchar.h>, generated Unicode tables.
+- iconv: UTF-8, UTF-16, UTF-32, ISO-8859-1, ISO-8859-15 and ASCII.
+- POSIX regular expressions (BRE and ERE, leftmost-longest), fnmatch, glob,
+  ftw.
+- Time zones from POSIX TZ rules or common Olson names.
+- Networking: getaddrinfo, resolver, getifaddrs; users and groups: passwd,
+  group, shadow.
+- posix_spawn built on clone(CLONE_VM|CLONE_VFORK), popen,
+  makecontext/swapcontext, PTY helpers, termios, System V IPC.
+- Stack-smashing protection in libc and in every program built against it.
+
+Base system ports:
+
+    bash 5.2.37        the system shell, installed as /bin/sh
+    OpenSSH 10.4p1     client tools and the sshd server
+    OpenSSL 3.5.6      TLS and crypto library and toolkit
+    curl 8.14.1        with nghttp2 1.65.0
+    tmux 3.6a          terminal multiplexer (libevent 2.1.12)
+    nano 8.3           text editor with syntax highlighting
+    netcat (OpenBSD)   networking utility
+    zlib 1.3.1         compression
+    ncurses API        a LikeOS implementation of the curses interface
+    GDB 17.2           debugger and gdbserver
+
+Core utilities, written for LikeOS: ls, cat, cp, mv, rm, mkdir, rmdir, ln,
+touch, chmod, stat, file, find, readlink, cmp, grep, sed, expr, wc, sort, uniq,
+cut, tr, head, tail, more, less, strings, hexdump, uname, uptime, date, time,
+ps, top, df, du, free, dmesg, nproc, kill, sleep, env, which, echo, printf,
+man, tty, shutdown, poweroff, reboot, halt and more.
+
+Security and users
+~~~~~~~~~~~~~~~~~~
+- Multi-user login: init -> getty -> login, driven by /etc/inittab.
+- PAM with a yescrypt-based crypt(3); /etc/passwd, /etc/shadow, /etc/group.
+- Real, effective and saved user and group IDs, supplementary groups and
+  set-user-ID execution.
+- Discretionary access control enforced in the VFS through a single privilege
+  check, so permissions apply to every path that opens a file.
+- Device permissions by group (audio, video, render); /proc/<pid>/mem and
+  process maps restricted to the owner and root.
+- ptrace and process inspection subject to the same access check.
+- SMEP and SMAP where the CPU supports them, NX mappings, ring 3 isolation.
+- Stack canaries in the kernel and userland; RELRO in the dynamic linker.
+- ChaCha20 CSPRNG, SYN cookies and SipHash TCP sequence numbers.
+- chroot; OpenSSH server for remote logins.
 - Account tools: id, whoami, groups, su, passwd, adduser, addgroup, deluser,
   delgroup.
-- Other utilities: clear, man, tty, yes, true, false.
-- Test programs: test_syscalls, test_libc, testmem, teststress, netstress,
-  ext4test, openssltest, pmap, progerr.
 
-Ported applications
-~~~~~~~~~~~~~~~~~~~
-Third-party software ported to LikeOS (under ports/).  Sources are kept
-byte-identical to upstream; everything that differs is a build file or a patch
-under the port's own directory.
+Developer tools
+~~~~~~~~~~~~~~~
+- GDB 17.2 and gdbserver running on LikeOS, on top of the kernel's ptrace with
+  hardware watchpoints.
+- User crash reports that name the faulting mapping and offset and recover a
+  probable call chain, resolvable with addr2line even for stripped libraries.
+- Kernel crash dumps and the assertion framework; debug builds with symbols
+  and memory poisoning.
+- Diagnostics: memstat (system and per-process memory accounting), pmap (one
+  process's address space, with a watch mode), kdump (the kernel's TCP,
+  AF_UNIX, PTY and task tables), ps with WCHAN, dmesg, drminfo.
+- On-target test programs: system-call, libc, memory, fork, network, OpenSSL
+  and ext4 tests.
+- Host-side unit tests for libc (malloc, printf, strings, math, time zones,
+  Unicode) and for the DRM and i915 code (EDID, VBT, DisplayPort, DSC, fences,
+  sync objects, atomic checks, watermarks, colour, PLLs).
 
-Shell and terminal:
+Building LikeOS
+---------------
 
-- bash 5.2: the system shell, installed as /bin/sh.
-- tmux: terminal multiplexer.
-- nano: text editor.
-- ncurses: terminal handling (a LikeOS implementation of the API).
+Everything is built from source on a build host by the top-level Makefile,
+including the third-party ports under ports/.  The result is a single file,
+build/likeos-ext4.img, a complete bootable GPT disk:
 
-Network and crypto:
+  Partition 1   a small FAT EFI System Partition (64 MB by default) that holds
+                only the UEFI bootloader, /EFI/BOOT/BOOTX64.EFI
+  Partition 2   the ext4 root filesystem with the kernel (/boot/kernel.elf)
+                and the whole userland; the bootloader reads the kernel
+                straight out of ext4
 
-- OpenSSH 10.4: ssh, scp, sftp, ssh-keygen, ssh-agent and the rest of the
-  client tools, plus sshd -- so the machine can be logged into over the
-  network as well as out from.
-- OpenSSL 3.5: TLS and crypto library and toolkit.
-- curl 8.14: HTTP/HTTPS and friends.
-- netcat (OpenBSD): networking utility.
-- libevent, zlib, nghttp2: supporting libraries.
+The short version:
 
-X Window System (ports/xorg, 79 packages):
+  git clone https://github.com/kctherootkey/LikeOS-64 LikeOS
+  cd LikeOS
+  git checkout dev            # optional: unstable, probably with more features
+  sudo apt-get update
+  sudo make deps
+  make
+  lsblk
+  make usb-write USB_DEVICE=/dev/sdX
 
-- X.Org server 21.1 on the framebuffer, with the evdev input driver and the
-  fbdev video driver.  Installed setuid root and drops privileges as soon as
-  its devices are open, so no user needs the video or input groups.
-- ctwm: window manager, with a desktop bar and keyboard-driven root menus.
-- xterm: terminal emulator (UTF-8, 256 colour).
-- XNEdit: Motif text editor.
-- xcalc, xclock, xload, xsetroot, xrandr, xset, xauth, xvinfo: the usual X
-  clients.
-- Toolkits and libraries: libX11, libXt, libXaw, libXft, Motif, freetype,
-  fontconfig, pixman, libpng, libjpeg, xkbcomp and xkeyboard-config.
+The full, step-by-step guide is on the web site:
+https://likeos.systemtrap.com/running.html
 
-GTK3 (ports/xorg/gtk3, 38 packages):
+Requirements
+~~~~~~~~~~~~
+- Build host: an x86-64 machine running Ubuntu.  Building has been tested with
+  Ubuntu 24.04.3 LTS (Noble Numbat).  Ubuntu is currently required; other
+  distributions are likely to need work on the dependency list and on the host
+  tools the ports drive.
+- Privileges: an account with sudo; installing the dependencies and writing
+  the USB stick both need it.  The build itself runs as your normal user (the
+  root filesystem image is populated under fakeroot).
+- Disk space: at least 40 GB free.  A fully built tree occupies roughly 26 GB.
+- Memory: 8 GB of RAM is the practical minimum; more is better.  The WebKitGTK
+  build sizes its parallelism from your RAM, and the final link of
+  libWebKit.so is the high-water mark of the whole build.  Some swap space is a
+  sensible safety net.
+- CPU time: the first full build takes several hours.  Later builds are
+  incremental: every port package leaves a stamp, so a re-run continues where
+  it left off and only rebuilds what changed.
+- Internet access: to clone the repository (its git history is roughly three
+  quarters of a gigabyte, because most third-party source tarballs are checked
+  in), to install the Ubuntu packages, and for the ports' fetch.sh scripts,
+  which download any source tarball not in the repository and verify every
+  archive against a recorded SHA-256 checksum.
+- USB stick: at least 4 GB; 8 GB or more is recommended (the image is about
+  1.8 GB, and writing it grows the root filesystem to fill the stick).  A USB 3
+  stick makes a noticeable difference.  The stick is completely erased.
+- Target machine: an x86-64 PC with UEFI firmware, or a virtual machine in
+  VMware or VirtualBox; QEMU works too, through legacy targets.
 
-- GTK 3.24 and the stack under it: GLib/GObject/GIO, Cairo, Pango, HarfBuzz,
-  FriBidi, gdk-pixbuf, ATK, libepoxy, GtkSourceView, libxml2 and PCRE2.
-- Its data files too, because a toolkit without them draws nothing: the
-  Adwaita and hicolor icon themes, the DejaVu fonts, and the shared MIME
-  database that gives the file manager its icons and its "open with".
-- libstdc++ from GCC 13.3, built for the target: HarfBuzz and Enchant are C++,
-  and the rest of the system is C.
-- PCManFM 1.4: the file manager, and the desktop itself (libfm, menu-cache,
-  lxmenu-data).
-- Claws Mail 4.4: mail client, speaking IMAP, POP3 and SMTP over TLS
-  (libetpan, GnuTLS, nettle, libtasn1), with spell checking through Enchant
-  and Hunspell.
-- Mousepad 0.7: GTK text editor.
+Getting the source
+~~~~~~~~~~~~~~~~~~
+  sudo apt-get install git
+  git clone https://github.com/kctherootkey/LikeOS-64 LikeOS
+  cd LikeOS
 
-Build
------
+The clone starts on master, the stable branch.  Optionally, check out the
+unstable dev branch instead, which probably has more features:
 
-Ubuntu is currently required as the build host.  Building has been tested with
-Ubuntu 24.04.3 LTS (Noble Numbat).  Other distributions are likely to need work
-on the dependency list and on the host tools the ports drive.
+  git checkout dev
 
-Prerequisites:
+Later, git pull on the branch you are on followed by make brings your build up
+to date; only what changed is rebuilt.
 
+Installing the build dependencies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   sudo apt-get update
   sudo make deps
 
 make deps is the requirement -- do not install the packages by hand.  Besides
-the compiler and the image tools it installs what the X.Org and GTK3 ports need
-on the host (meson, ninja, cmake, gettext, xfonts-utils, shared-mime-info and
-the rest), and where the distribution's version is too old to build a package
-it puts a current one in a virtual environment inside the port's own directory
-rather than on the system.
+the compiler and the image tools (gcc, nasm, GNU-EFI, mtools, dosfstools,
+e2fsprogs, fakeroot, gdisk/parted, QEMU with OVMF) it installs what the X.Org
+and GTK3 ports need on the host (meson, ninja, cmake, libtool, gperf, xsltproc,
+bison, flex, xfonts-utils, shared-mime-info, gettext, the DocBook stylesheets,
+zstd and ruby), LLVM and clang with libclc and the SPIR-V tools for Mesa's
+Intel driver, and a new enough g++ for the C++ ports.  Where the distribution's
+meson is too old for GLib, a current one is installed into a Python virtual
+environment inside the port (ports/xorg/.hosttools), not system-wide.
 
-Build all:
+If make deps stops with "python3 -m venv failed":
 
-  make all
+  sudo apt-get install python3-venv
+  sudo make deps
 
-Main build outputs:
+Building
+~~~~~~~~
+  make
 
-- build/bootloader.efi
-- build/kernel.elf
-- build/bin/* user programs
-- build/likeos-ext4.img   single bootable GPT USB disk:
-                          P1 = FAT EFI System Partition (bootloader only),
-                          P2 = ext4 root (/boot/kernel.elf + the whole userland).
-                          The bootloader loads the kernel straight from ext4;
-                          there is no FAT data filesystem anywhere else.
+make and make all are the same thing.  It builds the UEFI bootloader
+(build/bootloader.efi), the kernel (build/kernel.elf), the C library, the
+dynamic linker, PAM and crypt libraries and the user programs, the smaller
+ports (ncurses, bash, nano, tmux, libevent, zlib, nghttp2, OpenSSL, curl,
+OpenSSH, netcat and gdb), the X.Org port (make ports-xorg) and the GTK3 port
+(make ports-gtk3: GLib, GTK, Cairo, Pango, HarfBuzz, libstdc++, LLVM and Mesa,
+GStreamer and FFmpeg, libva and the Intel media drivers, WebKitGTK, luakit,
+PCManFM, Claws Mail, Mousepad, xfce4-terminal and the rest) into the shared
+sysroot build/xorg-sysroot, and finally stages everything into
+build/likeos-ext4.img.
 
-Run
----
+Because the first build runs for hours, keep a log and run it somewhere that
+survives a closed terminal (inside tmux, for example):
 
-Write a USB stick, and boot it -- on real hardware, or by pointing VMware or
-VirtualBox at the USB device:
+  make 2>&1 | tee build.log
 
-  make usb-write USB_DEVICE=/dev/sdb
+If the build is interrupted, simply run make again.
 
-That is the way to build and flash a drive: it builds the image if it is not
-current, writes it to the stick, and grows the ext4 root to the drive's full
-capacity.  Check the device name first (lsblk); the target is erased.
+Make targets (make help prints the complete list):
 
-The QEMU targets, make qemu and make qemu-usb, are legacy.  They still boot the
-same image and are useful for a quick look at the console, but the supported
-way to run LikeOS is from a written stick.
+  make all                  everything, ending in build/likeos-ext4.img
+  make usb                  alias for the image; same result as all
+  make kernel               only build/kernel.elf
+  make bootloader           only build/bootloader.efi
+  make ports-xorg           fetch, unpack and build the X.Org port
+  make ports-gtk3           fetch, unpack and build the GTK3 port
+  make usb-write USB_DEVICE=/dev/sdX
+                            build the image if it is not current, write it to
+                            a USB stick and grow the root filesystem to fill it
+  make qemu, make qemu-usb  legacy: boot the image file in QEMU
+  make qemu-realusb USB_DEVICE=/dev/sdX
+                            boot a stick written by usb-write in QEMU (console
+                            only)
+  make clean                remove build output but keep the ports and the
+                            sysroot, for a fast incremental rebuild
+  make distclean            clean everything, ports included (downloaded
+                            tarballs are kept)
+  make deps                 install the build dependencies
+  make help                 every target and build variable
 
-Logging in
-~~~~~~~~~~
-At the login prompt, log in as
+Build variables, passed on the make command line (they can be combined):
+
+  SCREEN_SIZE=medium        prefer 1280x800 on real hardware instead of the
+                            large default (see "Screen resolution")
+  MAX_SCREEN_SIZE=WxH       a ceiling on that list, e.g. 1920x1080
+  LIKEOS_VERSION=...        version string shown in the boot banner and by
+                            uname (default 0.2.7-HEAD)
+  DEBUG=1                   full debug build: kernel memory poisoning, DWARF
+                            symbols, unstripped kernel and userspace, detailed
+                            crash reports
+  CRASH_VERBOSE=1           detailed kernel and userspace crash reports in an
+                            otherwise normal, stripped build
+  NO_STRIP=1                keep the kernel's symbol table
+  NO_STRIP_USER=1           keep symbol tables in userspace, for gdb on LikeOS
+  SERIAL=1                  mirror the kernel log to COM1 (the QEMU targets
+                            show it on the terminal)
+  USB_SERIAL=1              mirror the kernel log to a USB CDC ACM serial
+                            device on real hardware
+  I915_DEBUG=1              detailed log from the Intel graphics driver
+  EXT4_MB=..., ESP_MB=...   force the root / EFI System Partition sizes in MB
+  LIKEOS_WEBKIT_JOBS=N      (environment) number of parallel WebKitGTK compile
+                            jobs, overriding the memory-based estimate
+  QEMU_SOUND, QEMU_AUDIODEV, QEMU_MEM, NUM_CPUS, NO_SMP, USB_HID, NIC_DEVICE
+                            QEMU targets only: sound card and host back end,
+                            memory, CPUs, USB keyboard/mouse, network card
+
+Changing options needs no clean.  SCREEN_SIZE and MAX_SCREEN_SIZE rebuild just
+the bootloader and the display drivers; switching DEBUG or CRASH_VERBOSE
+removes the kernel's objects automatically.
+
+Rebuilding a single port package: the X.Org and GTK3 ports are driven by
+build.sh scripts that rebuild just the packages named (-f ignores the stamps);
+run make afterwards to put the result into the image:
+
+  ports/xorg/build.sh libX11 libXext
+  ports/xorg/gtk3/build.sh claws-mail
+  ports/xorg/gtk3/build.sh -f webkitgtk
+  make
+
+Package names are the ones in ports/xorg/packages.list and
+ports/xorg/gtk3/packages.list; each package's log is in ports/xorg/.logs/ or
+ports/xorg/gtk3/.logs/.  The smaller ports have their own targets, such as
+make ports-bash, make ports-openssh or make ports-curl.  ports/xorg/clean.sh
+and ports/xorg/gtk3/clean.sh return a port to its checked-in state.
+
+If the build host is also your workstation, cap the memory the WebKitGTK build
+may use with a systemd scope:
+
+  systemd-run --user --scope -p MemoryHigh=4000M -p MemoryMax=5000M \
+      ports/xorg/gtk3/build.sh webkitgtk
+
+Writing the USB stick
+---------------------
+
+This erases the whole target device.  Identify the stick with lsblk before and
+after plugging it in, name the whole disk (/dev/sdb, not /dev/sdb1), and read
+the device name twice before you press Enter.
+
+  lsblk -d -o NAME,SIZE,MODEL,TRAN
+  make usb-write USB_DEVICE=/dev/sdX
+
+The target builds the image if it is not current, warns and waits for Enter,
+writes the image with dd, and then grows the ext4 root partition and
+filesystem to fill the whole stick.  When it reports "UEFI bootable USB drive
+created successfully", the stick is ready.  If it says the stick did not grow,
+unplug and replug it and finish by hand:
+
+  sudo e2fsck -fy /dev/sdX2
+  sudo resize2fs /dev/sdX2
+
+Booting LikeOS
+--------------
+
+The supported way to run LikeOS is from a written stick: on real hardware, or
+in VMware or VirtualBox with the stick attached to the virtual machine.
+
+Real hardware: boot in UEFI mode with Secure Boot disabled (the bootloader is
+not signed), and choose the stick's UEFI entry in the firmware's one-time boot
+menu (usually F12 on ThinkPad and Dell notebooks).  After the boot messages you
+get a login prompt on the console.  Networking is wired Ethernet; the kernel
+requests an address over DHCP while it boots.
+
+VMware: create a 64-bit virtual machine without a virtual hard disk, set the
+firmware type to UEFI and the USB controller's compatibility to USB 3.1.
+Accelerate 3D graphics on lets X and GL clients (the browser included) render
+on the virtual GPU; off, LikeOS renders in software -- both work.  The e1000,
+e1000e and vmxnet3 adapters all have drivers; keep the sound card (Sound
+Blaster PCI, es1371).  Connect the stick to the virtual machine and power it
+on.
+
+VirtualBox: create a 64-bit virtual machine without a hard disk and enable
+EFI.  Choose the VMSVGA graphics controller (enable 3D acceleration to use the
+virtual GPU), the USB 3.0 (xHCI) controller with a device filter for your
+stick, the ICH AC97 audio controller, and an Intel PRO/1000 (e1000) or PCnet
+network adapter.
+
+QEMU (legacy targets):
+
+  make qemu
+  make qemu-usb
+  make qemu-realusb USB_DEVICE=/dev/sdX
+
+These use OVMF, an xHCI controller, an e1000 card with user-mode networking
+and an Intel HD Audio controller.  LikeOS draws on the UEFI framebuffer there,
+without GPU acceleration.  make qemu boots build/likeos-ext4.img as a USB
+stick; make qemu-usb does the same through sudo, so that ping to outside hosts
+works; make qemu-realusb boots a stick written by usb-write and is console
+only -- do not run startx under it.  The guest gets 1024 MB by default; raise
+it with QEMU_MEM=2G.
+
+To run X from a real stick under QEMU, drive it through virt-manager with KVM.
+This configuration is known to work:
+
+  1.  Create a new virtual machine in virt-manager; select manual installation.
+  2.  Choose Debian 13 as the operating system.
+  3.  Give it 2048 MB of RAM and, for example, 4 CPUs.
+  4.  Tick "Customize configuration before install".
+  5.  Under Overview, set the firmware to UEFI with OVMF_CODE_4M.fd.
+  6.  For the NIC, select Bridge and enter your bridge device (e.g. virbr0).
+  7.  Select e1000e as the NIC model first, then change it to e1000 in the XML.
+  8.  Set Video to VGA.
+  9.  Boot the machine, connect the USB stick to it, and type exit at the UEFI
+      prompt.  LikeOS then boots from the stick.
+
+Graphics is chosen automatically when X starts: its start-up scripts ask the
+display driver what it is with drminfo and pick the configuration to match.
+
+  Intel graphics (i915)           xorg.conf.modesetting-i915: glamor, DRI3,
+                                  page flipping; GPU rendering through iris,
+                                  video decoding through VA-API
+  VMware / VirtualBox, 3D on      xorg.conf.modesetting-vmwgfx-3d: glamor;
+                                  GPU rendering through Mesa's svga driver
+  3D off, or another DRM driver   xorg.conf.modesetting; software (llvmpipe)
+  No display driver at all        xorg.conf: fbdev on /dev/fb0; software
+
+First steps after boot
+----------------------
+
+Log in as root at the console:
 
   login: root
   password: toor
 
-Change it with passwd, and create an ordinary account with adduser -- the
-system is multi-user and file permissions are enforced, so you do not always
-want to be root.  An ordinary account is also what the desktop is meant to be
-used from: adduser creates the home directory with the desktop launchers in it.
+Change the root password straight away with passwd, then create an ordinary
+account -- LikeOS is multi-user and file permissions are enforced, and the
+desktop is meant to be used from an ordinary account.  adduser creates the home
+directory under /home and copies the desktop launchers into it from /etc/skel:
 
-Starting the graphical desktop
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-From the shell, run
+  passwd
+  adduser alice
+  exit
+
+Log in as the new user and start the graphical desktop:
 
   startx
 
-That brings up the X.Org server with the ctwm window manager, a clock and a
-load graph in the desktop bar, and PCManFM drawing the desktop: the wallpaper,
-the icons on it, and the launchers in ~/Desktop.
+Any user can run startx: the X server is installed setuid root and gives root
+up as soon as it has opened the display and input devices, so no group
+membership is needed.
 
-All three mouse buttons over the desktop belong to PCManFM, so the window
-manager's menus are on the keyboard: Alt+F1 opens the root menu -- Xterm,
-Explorer, Editor, Xnedit, Mail, Browser, Calculator, and "Exit session" to come
-back to the console -- and Alt+F2 the window operations menu.
+The desktop: X starts with the ctwm window manager, the PCManFM desktop
+(wallpaper and icons) and the LikeOS taskbar.
 
-Any user can run startx -- the server is installed setuid root and gives root
-up as soon as it has opened the framebuffer and the input devices, so no group
-membership is needed.  The GTK applications expect to be run that way rather
-than as root: Claws Mail keeps its mailboxes and account settings in the user's
-home directory.
+- Desktop icons: Files (PCManFM), Terminal (xfce4-terminal), Xterm, Luakit Web
+  Browser, Mail (Claws Mail), Text Editor (Mousepad), XNEdit, Calculator
+  (galculator), X Calculator, Hexchat IRC Client and Media Player.
+- Taskbar: the load and memory monitor on the left; the start button and one
+  button per open window in the middle; the four workspace buttons, the volume
+  control and the clock with the date on the right.
+- Start menu: Programs, built from the launchers on your desktop; Settings >
+  Display; Restart session and Exit session; Reboot and Poweroff.
+- Keyboard menus: all three mouse buttons over the desktop belong to PCManFM,
+  so the window manager's menus are on the keyboard.  Alt+F1 opens the root
+  menu, Alt+F2 the window operations menu.
+
+From a terminal:
+
+  luakit &
+  claws-mail &
+  xfce4-terminal &
+  pcmanfm &
+  mousepad &
+  mediaplayer &
+
+Sound works without any setup: audiod starts at boot and the desktop greets
+you with its start-up sound.  Every account has a sample video in ~/Videos.
+
+  audioctl volume 60
+  audioplay /usr/share/sounds/likeos/startup.wav
+  audioinfo
+
+Check the network from a terminal before you start the browser or mail client:
+
+  ifconfig
+  ping -c 3 example.com
+
+Leaving the desktop: choose Exit session in the start menu or the Alt+F1 menu;
+you return to the console.
+
+Shutting down and rebooting: Reboot and Poweroff in the start menu, or
+poweroff, reboot, shutdown -h now and shutdown -r now in a terminal.  Root and
+the user logged in at the machine's own console may use them; from any other
+session (an SSH login, for example) become root first with su.  shutdown also
+accepts a delay (+m minutes, or hh:mm); halt stops the machine without powering
+it off.
 
 Screen resolution
-~~~~~~~~~~~~~~~~~
-The preferred resolution is chosen at build time:
+-----------------
 
-  make                         1920x1200 preferred (the default)
-                               (falls back to 1920x1080, 1280x800, 1280x768,
-                               1024x768)
+Settings > Display in the start menu (likeos-display-settings) lists the sizes
+the screen can be set to.  With a display driver (Intel or VMware/VirtualBox
+SVGA) the size changes at once and you are asked whether to keep it; nobody
+answering within 20 seconds switches back.  On the boot framebuffer the chosen
+size applies from the next start.  The choice is saved in
+/etc/likeos/display.conf and used everywhere: by the bootloader, the kernel's
+display drivers and the X server.
 
-  make SCREEN_SIZE=medium      1280x800 preferred
-                               (falls back to 1280x768, 1024x768)
+Without a saved size:
 
-Both ends of that list are a preference rather than a demand, which is why the
-larger one is the default: the fallback chain reaches down to 1024x768, so
-asking for a mode the display cannot do costs nothing, while asking for the
-smaller one on a display that can do better caps it there.
+- Virtual machines start at 1280x800.
+- Real hardware takes the first size the firmware offers from a build-time
+  list.  A default build tries every standard size above 1920x1200 first, then
+  1920x1200, 1920x1080, 1280x800, 1280x768 and 1024x768; make
+  SCREEN_SIZE=medium starts at 1280x800.  make MAX_SCREEN_SIZE=1920x1080 puts
+  a ceiling on the size the machine starts in on its own: anything above it
+  is skipped.  A size saved in Display settings is not held to it.
 
-Both the bootloader and the kernel's SVGA driver use the same table, so the
-setting applies whether the mode comes from UEFI or from a mode set later.
+Troubleshooting
+---------------
 
-A virtual machine, though, advertises the modes its emulated adapter can scan
-out rather than the ones the host's panel can show: on a 1920x1080 notebook,
-VirtualBox, VMware and QEMU all offer 1920x1200, a default build takes it, and
-the guest ends up on a screen the host has to shrink -- which is what makes
-full-screen mode awkward.  Put a ceiling on the list to say what the display
-really is:
+- The build stops at GLib with "Meson version is 1.3.2 but project requires
+  >= 1.4.0": run sudo make deps again.
+- A port package fails to build: look at its log in ports/xorg/.logs/ or
+  ports/xorg/gtk3/.logs/; after fixing it, make continues from that package.
+- The WebKitGTK build dies with "ninja: build stopped", or the host swaps
+  heavily: that is usually memory.  Run LIKEOS_WEBKIT_JOBS=1 make.
+- The build says the X server or the GTK3 stack is missing although the stamps
+  say it was built: the sysroot was removed under the stamps.  Run
+  ports/xorg/clean.sh && make.
+- The machine does not boot from the stick: check UEFI mode, Secure Boot off,
+  and the stick's UEFI entry; in a VM, that the firmware is UEFI/EFI and the
+  stick is attached.
+- Which graphics path am I on?  su -c drminfo reports the display driver, its
+  outputs and capabilities (drminfo --driver just the name).  The X server log
+  is /var/log/Xorg.0.log.
+- Logs and crash reports: dmesg shows the kernel log; rebuild with
+  CRASH_VERBOSE=1, DEBUG=1, SERIAL=1, USB_SERIAL=1 or I915_DEBUG=1 for more.
 
-  make MAX_SCREEN_SIZE=1920x1080
-
-Anything above the ceiling is skipped, so the mode chosen is the largest one
-that the SCREEN_SIZE list offers and the ceiling allows -- 1920x1080 here,
-never 1920x1200.  The ceiling need not name a mode from the list: with
-MAX_SCREEN_SIZE=1600x900 the default build settles on 1280x800.  It combines
-with SCREEN_SIZE, applies to the bootloader and the SVGA driver alike, and
-unset means no ceiling, which is the historical behaviour.
-
-Below 1024x768 nothing in either list is selectable; the build warns and the
-firmware's own default is kept.
-
-Changing either setting rebuilds the bootloader and the SVGA driver on the next
-make -- no clean needed.
-
-Other useful targets:
-
-  make usb-write USB_DEVICE=/dev/sdX      build and flash a USB drive
-  make qemu-realusb USB_DEVICE=/dev/sdb   boot a written stick in QEMU
-  make distclean                          clean everything, ports included
-
-  make SCREEN_SIZE=medium                 lower preferred resolution (see above)
-  make MAX_SCREEN_SIZE=1920x1080          cap the resolution (see above)
-  make help                               every target and build variable
-
-Booting a real USB stick in a virtual machine
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  make qemu-realusb USB_DEVICE=/dev/sdb
-
-boots QEMU straight from a stick written by usb-write, which is the way to
-check that the written stick really boots.
-
-This target is console only -- do not run startx under it.  Every disk read
-goes to physical USB hardware through an emulated controller, and X, which
-reads tens of megabytes of libraries, fonts and keymaps before it draws
-anything, is far too slow to be usable that way.
-
-QEMU is the awkward way to do this.  VMware and VirtualBox both boot a real
-stick with X working and need none of what follows -- point the VM at the USB
-device and go.  See "Current state" at the top of this file for what each of
-them supports.
-
-Under QEMU, running X against a real stick is a little tricky: it needs KVM,
-and it is worth driving QEMU through virt-manager rather than by hand.  This
-configuration is known to work:
-
-  1.  Create a new virtual machine in virt-manager.
-  2.  Select manual installation.
-  3.  Choose Debian 13 as the operating system.
-  4.  Give it 2048 MB of RAM and, for example, 4 CPUs.
-  5.  Tick "Customize configuration before install".
-  6.  Under Overview, set Firmware to UEFI with OVMF_CODE_4M.fd.
-  7.  For the NIC, select Bridge and enter your bridge device (virbr0 here).
-  8.  Select e1000e as the NIC model first, then edit the model to e1000 in
-      the XML.
-  9.  Set Video to VGA.
-  10. Boot the machine, connect the external USB device also in qemu, and type "exit" at
-      the UEFI boot prompt.
-
-LikeOS then boots from the stick.  Log in as root with the password toor and
-run startx.
+Reporting problems: please report bugs and build failures on GitHub, or write
+to the author at niko@systemtrap.com.  Say which machine or virtual machine you
+used (and, for a VM, whether 3D acceleration was on), which commit you built,
+and include the crash report, the relevant lines of dmesg, or the failing
+port's log.
 
 Project structure
 -----------------
@@ -484,48 +1006,32 @@ Project structure
   header beside the sources it belongs to (kernel/ke/sched.h next to
   kernel/ke/sched.c); kernel/uapi/ holds the interfaces shared with user
   space, kernel/dev/video/gpu/ the display drivers (drm, i915, vmwgfx).
-- user/bin/: user programs (core utilities and tests).
+- user/bin/: user programs (core utilities, the desktop shell programs and
+  tests).
 - user/lib/libc/: C library and runtime pieces.
 - user/lib/rtld/: dynamic linker.
-- res/: files staged into the image (fonts, wallpaper, /etc, X and GTK
-  configuration, the desktop launchers in /etc/skel).
-- host/: build-host tools (table generators and the libc test programs, which
-  run on the build machine as well as on LikeOS).
-- ports/: third-party ports -- ports/xorg for the X Window System and
-  ports/xorg/gtk3 for GTK3 and the applications on it.
+- res/: files staged into the image (configuration, fonts, wallpaper, desktop
+  launchers in /etc/skel).
+- host/: build-host tools (table generators and the host-side tests).
+- ports/: third-party software -- ports/xorg for the X Window System and
+  ports/xorg/gtk3 for GTK3 and the applications on it.  Upstream sources are
+  kept byte-identical; LikeOS changes live as patches and build files beside
+  each port.
 
-Implementation status
----------------------
+Planned work
+------------
 
-Completed:
-- UEFI bootloader and ELF64 loading.
-- Multitasking scheduler and userland process model.
-- SMP bring-up and per-CPU kernel infrastructure.
-- Syscall layer, signals, pipes, virtual terminals, TTY, and PTYs.
-- ext4 (read/write, journalled) as the root filesystem; FAT32; VFS; devfs;
-  and the caching layers.
-- Demand paging and copy-on-write fork.
-- Multi-user login: init/getty/login, PAM, yescrypt, and VFS-enforced DAC.
-- xHCI USB stack and USB mass storage.
-- TCP/IP networking stack, sockets, and multiple NIC drivers.
-- POSIX threads, shared memory, poll/select/epoll.
-- Per-task FPU state across context switches.
-- UTF-8 and Unicode throughout the console, the C library and X.
-- X.Org server on the framebuffer, with ctwm, xterm and XNEdit.
-- GTK3, and a desktop on it: PCManFM, Claws Mail and Mousepad.
-- Stack canaries and crashlog/assertion (BUG_ON/WARN_ON) infrastructure.
-- Framebuffer console optimizations and a VMware SVGA II driver.
-- Userland libc, dynamic linker, and the core utilities set.
-- Ports: bash, OpenSSH, OpenSSL, curl, tmux, nano, netcat, X.Org and GTK3.
-
-Planned/future work:
-- More drivers (AHCI/NVMe, more GPUs).
+- Storage drivers: AHCI/SATA and NVMe.
+- Mounting removable media.
 - Expanded POSIX coverage.
 - Package management.
-- Mounting removable media.
+- Pre-built images, with the first major release.
 
-Contributing
-------------
+Author
+------
+
+LikeOS is created and developed by Nikolaos Rangos.  Questions, comments, bug
+reports and offers of help are welcome at niko@systemtrap.com.
 
 Contributions are welcome for kernel subsystems, drivers, userland tools,
 performance tuning, and documentation.
@@ -533,5 +1039,17 @@ performance tuning, and documentation.
 License
 -------
 
-This project uses the GNU General Public License version 2.
-See the COPYING file for the full license text.
+LikeOS is free software, released under the GNU General Public License,
+version 2.  You may run it for any purpose, study and change its source code,
+and share it -- modified or not -- under the same terms.  It comes with no
+warranty, to the extent permitted by law.  See the COPYING file for the full
+license text.
+
+  LikeOS software: Copyright (C) 2026 Nikolaos Rangos
+  Source files:    Copyright (C) 2026 The LikeOS Project
+
+LikeOS includes and builds many free-software projects -- among them the X.Org
+server, Mesa, GTK, GLib, WebKitGTK, luakit, GStreamer, FFmpeg, OpenSSH,
+OpenSSL, bash, Claws Mail and HexChat.  Each remains under its own license and
+the copyright of its authors; LikeOS's changes to them are kept as patches in
+the repository, next to the original sources.

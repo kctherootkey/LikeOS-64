@@ -126,23 +126,27 @@ else
   QEMU_USB_HID =
 endif
 
-# Screen size: 1920x1200 preferred resolution by DEFAULT; pass
-# SCREEN_SIZE=medium for 1280x800.
-# The kernel gets the same define so the SVGA driver's boot-time best-fit
-# mode selection uses the identical preferred-resolution table.
+# Screen size: the resolution real hardware starts in when no size has been
+# saved in Display settings.  By DEFAULT the bootloader tries every standard
+# size above 1920x1200 that the firmware offers, then 1920x1200, 1920x1080,
+# 1280x800, 1280x768 and 1024x768; pass SCREEN_SIZE=medium to start the list
+# at 1280x800.
 #
-# The table is the fallback, not the first choice: on a VMware-family
-# adapter the SVGA driver asks the hypervisor for the resolution it
-# recommends -- the host's own screen -- and uses that when it fits, whether
-# or not it appears in this table or in the firmware's GOP mode list (see
-# kernel/dev/video/vmsvga2.c).  This table still decides the bootloader's
-# GOP mode, which is what the screen shows until the driver takes over.
+# The order in which the size is decided (boot/bootloader.c):
+#   1. the size saved in Display settings (/etc/likeos/display.conf), on any
+#      machine, when the firmware offers it;
+#   2. under a hypervisor, a fixed 1280x800 (SCREEN_VM_WIDTH/HEIGHT in
+#      kernel/dev/video/screen_modes.h): nothing an emulated adapter reports
+#      says how large the host's screen is, so the guest starts in a size its
+#      window is expected to hold, and the VMware display drivers
+#      (kernel/dev/video/vmsvga2.c, gpu/vmwgfx/vmw_drv.c) come up in the same;
+#   3. on real hardware, this table.
 #
-# Large is the default because both ends of the mode list are a preference
-# rather than a demand: the bootloader walks the fallback chain down to
-# 1024x768, so asking for 1920x1200 on a display that cannot do it costs
-# nothing, while asking for 1280x800 on one that can caps it there.  It also
-# matches the shipped wallpaper, which is 1920x1200.
+# Large is the default because the list is a preference rather than a demand:
+# the bootloader walks it down to 1024x768, so asking for a size the display
+# cannot do costs nothing, while starting at 1280x800 on one that can do
+# better caps it there.  It also matches the shipped wallpaper, which is
+# 1920x1200.
 ifeq ($(SCREEN_SIZE),medium)
   SCREEN_PREF_CFLAGS =
 else
@@ -150,22 +154,15 @@ else
 endif
 
 # Maximum screen size: pass MAX_SCREEN_SIZE=WIDTHxHEIGHT (for example
-# MAX_SCREEN_SIZE=1920x1080) to put a ceiling on that table.  Entries above the
+# MAX_SCREEN_SIZE=1920x1080) to put a ceiling on the size the machine starts
+# in on its own.  In the bootloader, entries of the SCREEN_SIZE list above the
 # ceiling are skipped, so the chosen mode is the largest one that both the
-# SCREEN_SIZE list offers and the ceiling allows -- 1920x1080 rather than
-# 1920x1200 for that example.  Unset means no ceiling (the previous behaviour).
+# list offers and the ceiling allows -- 1920x1080 rather than 1920x1200 for
+# that example.  The VMware display drivers apply the same ceiling to the size
+# they come up in.  Unset means no ceiling.
 #
-# This exists because a virtual machine advertises the modes its emulated
-# adapter can scan out, not the ones the host's panel can show: on a 1920x1080
-# notebook, VirtualBox, VMware and QEMU all offer 1920x1200 and a default build
-# takes it, leaving a guest screen the host has to shrink to fit -- which is
-# exactly what full-screen mode then cannot do cleanly.
-#
-# The ceiling also bounds the host's own recommendation, on the grounds that a
-# build that names a maximum means it: a hypervisor that recommends more than
-# MAX_SCREEN_SIZE is declined and the table is used instead.  A host that
-# answers is usually the better judge, so on a machine where the guest should
-# simply match the display, leave this unset.
+# A size the user saved in Display settings is not held to it: that was asked
+# for, and the mode list the drivers offer is not bounded by it either.
 ifdef MAX_SCREEN_SIZE
   MAX_SCREEN_W := $(word 1,$(subst x, ,$(subst X,x,$(strip $(MAX_SCREEN_SIZE)))))
   MAX_SCREEN_H := $(word 2,$(subst x, ,$(subst X,x,$(strip $(MAX_SCREEN_SIZE)))))
@@ -3632,9 +3629,9 @@ help:
 	@echo "  USB_HID=1         - Add USB keyboard and mouse to QEMU xHCI controller"
 	@echo "  EXT4_MB=N         - Force the ext4 root partition size in MB (default: auto-size to content)"
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
-	@echo "  SCREEN_SIZE=large or unset - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768)"
-	@echo "  SCREEN_SIZE=medium - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
-	@echo "  MAX_SCREEN_SIZE=WxH - Ceiling on the above list, e.g. MAX_SCREEN_SIZE=1920x1080 picks 1920x1080 instead of 1920x1200 (default: no ceiling)"
+	@echo "  SCREEN_SIZE=large or unset - Real-hardware start resolution when none is saved in Display settings: sizes above 1920x1200, then 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768); VMs start at 1280x800"
+	@echo "  SCREEN_SIZE=medium - Real-hardware start resolution 1280x800 (fallback: 1280x768, 1024x768)"
+	@echo "  MAX_SCREEN_SIZE=WxH - Ceiling on the size the machine starts in on its own, e.g. MAX_SCREEN_SIZE=1920x1080 picks 1920x1080 instead of 1920x1200; a saved Display setting is not held to it (default: no ceiling)"
 	@echo "  ADD_USER=<name>     - Image ships an ordinary account <name> (password likeos), made as adduser makes one"
 	@echo "  LIKEOS_VERSION=x.y.z - Override the version in the boot banner and uname (default: $(LIKEOS_VERSION))"
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
