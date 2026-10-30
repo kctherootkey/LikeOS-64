@@ -159,6 +159,7 @@ static void tfs_lock(void)
 			g_mtx.held = 1;
 			g_mtx.owner = me;
 			g_mtx.depth = 1;
+			task_sleep_lock_taken();
 			spin_unlock_irqrestore(&g_mtx.lock, fl);
 			return;
 		}
@@ -192,6 +193,7 @@ static void tfs_unlock(void)
 		g_mtx.held = 0;
 		g_mtx.owner = (uint64_t)-1;
 		released = 1;
+		task_sleep_lock_dropped();
 	}
 	spin_unlock_irqrestore(&g_mtx.lock, fl);
 	if (released)

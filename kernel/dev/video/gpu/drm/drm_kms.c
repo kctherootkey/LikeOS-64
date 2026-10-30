@@ -452,13 +452,25 @@ long drm_kms_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
 	(void)size;
 	*handled = 1;
 
-	/* Everything below needs mode-setting rights except the pure
-	 * queries, which any file on the primary node may use. */
-	int query = (nr == 0xA0 || nr == 0xA1 || nr == 0xA6 || nr == 0xA7 ||
-		     nr == 0xAA || nr == 0xAC || nr == 0xB5 || nr == 0xB9 ||
-		     nr == 0xB6 || nr == 0x3a || nr == 0x3b || nr == 0xB2 ||
-		     nr == 0xB3 || nr == 0xB4 || nr == 0xCE);
-	if (!query && !fp->is_master && nr != 0x3c)
+	/* Mode-setting rights are needed for what changes the display: the
+	 * crtcs, planes, cursors, gamma, properties, flips, dirty reports and
+	 * leases.  Everything else any file on the primary node may use --
+	 * the queries, and the calls that only touch the file's own objects:
+	 * framebuffers (ADDFB/ADDFB2 make them, RMFB/CLOSEFB drop only the
+	 * file's own), dumb buffers and property blobs (owner-checked).  A
+	 * client rendering to buffers it then hands to the display server
+	 * makes its framebuffers itself, without being master; refusing them
+	 * failed whenever another file held the display.  GETFB/GETFB2 are
+	 * open too, but hand out a buffer handle only to the master or root
+	 * (drm_framebuffer.c): another client's buffer is its screen. */
+	int open_to_all =
+		(nr == 0xA0 || nr == 0xA1 || nr == 0xA4 || nr == 0xA6 ||
+		 nr == 0xA7 || nr == 0xAA || nr == 0xAC || nr == 0xAD ||
+		 nr == 0xAE || nr == 0xAF || nr == 0xB2 || nr == 0xB3 ||
+		 nr == 0xB4 || nr == 0xB5 || nr == 0xB6 || nr == 0xB8 ||
+		 nr == 0xB9 || nr == 0xBD || nr == 0xBE || nr == 0xCE ||
+		 nr == 0xD0 || nr == 0x3a || nr == 0x3b || nr == 0x3c);
+	if (!open_to_all && !fp->is_master)
 		return -EACCES;
 
 	switch (nr) {
@@ -491,7 +503,7 @@ long drm_kms_ioctl(struct drm_device *dev, struct drm_file *fp, unsigned nr,
 		return drm_mode_addfb2_ioctl(dev, kb, fp);
 	case 0xAF: /* RMFB */
 		return drm_mode_rmfb_ioctl(dev, kb, fp);
-	case 0xD0: /* CLOSEFB: rights as RMFB (not a query) */
+	case 0xD0: /* CLOSEFB: rights as RMFB */
 		return drm_mode_closefb_ioctl(dev, kb, fp);
 	case 0xAD: /* GETFB */
 		return drm_mode_getfb(dev, kb, fp);

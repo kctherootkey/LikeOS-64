@@ -97,9 +97,15 @@
 #define LAPIC_TIMER_VECTOR 0x20 // Timer interrupt (same as legacy IRQ0)
 #define LAPIC_ERROR_VECTOR 0x2F // LAPIC error interrupt
 #define LAPIC_SPURIOUS_VECTOR 0xFF // Spurious interrupt
-#define IPI_RESCHEDULE_VECTOR 0xFE // IPI: Reschedule
+/* The local APIC delivers the highest pending vector first, so the order
+ * of these is a priority order.  The TLB shootdown must be the highest:
+ * a sender waits for its acknowledgement, and below the reschedule vector
+ * a steady stream of reschedules into one processor kept it from ever
+ * being taken there (each window with interrupts on found another
+ * reschedule pending).  A reschedule only asks for a switch; it can wait. */
+#define IPI_TLB_SHOOTDOWN 0xFE // IPI: TLB shootdown
 #define IPI_HALT_VECTOR 0xFD // IPI: Halt CPU
-#define IPI_TLB_SHOOTDOWN 0xFC // IPI: TLB shootdown
+#define IPI_RESCHEDULE_VECTOR 0xFC // IPI: Reschedule
 
 // ============================================================================
 // LAPIC Functions

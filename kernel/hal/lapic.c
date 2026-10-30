@@ -1297,6 +1297,24 @@ void lapic_ipi_wait(void)
 	}
 }
 
+/* One xAPIC send.  The destination and the command are two register
+ * writes, and an interrupt arriving between them whose handler sends an IPI
+ * of its own rewrites the destination: this one then goes to that
+ * handler's target instead -- a TLB shootdown request, or an NMI probe,
+ * lost to the processor that was waited for.  So the wait for the previous
+ * send to leave the register and both writes run with interrupts off. */
+static void xapic_icr_send(uint32_t high, uint32_t low)
+{
+	uint64_t f;
+
+	__asm__ volatile("pushfq; popq %0; cli" : "=r"(f)::"memory");
+	lapic_ipi_wait();
+	lapic_write(LAPIC_ICR_HIGH, high);
+	lapic_write(LAPIC_ICR_LOW, low);
+	lapic_ipi_wait();
+	__asm__ volatile("pushq %0; popfq" ::"r"(f) : "memory", "cc");
+}
+
 // x2APIC helper: write the single 64-bit ICR MSR (0x830)
 // dest is the full 32-bit APIC ID in bits 32-63, command in bits 0-31
 static inline void x2apic_write_icr(uint32_t dest, uint32_t cmd)
@@ -1313,15 +1331,10 @@ void lapic_send_ipi(uint32_t apic_id, uint32_t vector)
 					 LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
 		return;
 	}
-	// xAPIC: Set destination in high ICR
-	lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-
-	// Send IPI: fixed delivery, physical destination, edge triggered
-	lapic_write(LAPIC_ICR_LOW, vector | LAPIC_ICR_FIXED |
-					   LAPIC_ICR_PHYSICAL |
-					   LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
-
-	lapic_ipi_wait();
+	// xAPIC: fixed delivery, physical destination, edge triggered
+	xapic_icr_send(apic_id << 24, vector | LAPIC_ICR_FIXED |
+					      LAPIC_ICR_PHYSICAL |
+					      LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
 }
 
 /* NMI delivery: no vector — the receiving CPU dispatches to its INT 2
@@ -1335,10 +1348,8 @@ void lapic_send_nmi(uint32_t apic_id)
 						  LAPIC_ICR_EDGE);
 		return;
 	}
-	lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-	lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_NMI | LAPIC_ICR_PHYSICAL |
-					   LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
-	lapic_ipi_wait();
+	xapic_icr_send(apic_id << 24, LAPIC_ICR_NMI | LAPIC_ICR_PHYSICAL |
+					      LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
 }
 
 void lapic_send_init(uint32_t apic_id)
@@ -1396,12 +1407,9 @@ void lapic_send_ipi_all_excl_self(uint32_t vector)
 					    LAPIC_ICR_ALL_EXCL_SELF);
 		return;
 	}
-	lapic_write(LAPIC_ICR_HIGH, 0);
-	lapic_write(LAPIC_ICR_LOW, vector | LAPIC_ICR_FIXED |
-					   LAPIC_ICR_PHYSICAL |
-					   LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE |
-					   LAPIC_ICR_ALL_EXCL_SELF);
-	lapic_ipi_wait();
+	xapic_icr_send(0, vector | LAPIC_ICR_FIXED | LAPIC_ICR_PHYSICAL |
+				  LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE |
+				  LAPIC_ICR_ALL_EXCL_SELF);
 }
 
 void lapic_send_ipi_all_incl_self(uint32_t vector)
@@ -1413,12 +1421,9 @@ void lapic_send_ipi_all_incl_self(uint32_t vector)
 					    LAPIC_ICR_ALL_INCL_SELF);
 		return;
 	}
-	lapic_write(LAPIC_ICR_HIGH, 0);
-	lapic_write(LAPIC_ICR_LOW, vector | LAPIC_ICR_FIXED |
-					   LAPIC_ICR_PHYSICAL |
-					   LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE |
-					   LAPIC_ICR_ALL_INCL_SELF);
-	lapic_ipi_wait();
+	xapic_icr_send(0, vector | LAPIC_ICR_FIXED | LAPIC_ICR_PHYSICAL |
+				  LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE |
+				  LAPIC_ICR_ALL_INCL_SELF);
 }
 
 void lapic_send_ipi_self(uint32_t vector)
@@ -1430,9 +1435,7 @@ void lapic_send_ipi_self(uint32_t vector)
 					    LAPIC_ICR_SELF);
 		return;
 	}
-	lapic_write(LAPIC_ICR_HIGH, 0);
-	lapic_write(LAPIC_ICR_LOW,
-		    vector | LAPIC_ICR_FIXED | LAPIC_ICR_PHYSICAL |
-			    LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE | LAPIC_ICR_SELF);
-	lapic_ipi_wait();
+	xapic_icr_send(0, vector | LAPIC_ICR_FIXED | LAPIC_ICR_PHYSICAL |
+				  LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE |
+				  LAPIC_ICR_SELF);
 }

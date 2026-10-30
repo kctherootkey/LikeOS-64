@@ -17,6 +17,7 @@
 #include <kernel/ke/futex.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/hrtimer.h>
+#include <kernel/ke/signal.h>
 #include <kernel/mm/memory.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/ke/timer.h>
@@ -343,10 +344,9 @@ void futex_init(void)
 	futex_initialized = true;
 }
 
-static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
-			     uint64_t timeout_ns, uint32_t bitset, bool shared)
+static int futex_wait_once(uint64_t uaddr, uint32_t expected_val,
+			   uint64_t timeout_ns, uint32_t bitset, bool shared)
 {
-	might_sleep();
 	if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
 		return -EFAULT;
 	}
@@ -545,6 +545,48 @@ static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
 		return -ETIMEDOUT;
 
 	return -EINTR;
+}
+
+/* A wait ends in one of three ways: a FUTEX_WAKE (0), the deadline
+ * (-ETIMEDOUT), or a signal (-EINTR).  Anything else that sent the task
+ * back here -- a waker that lost the claim race, the preemption of a task
+ * between parking and switching away -- is not a reason to return: the
+ * caller is told nothing it can act on, and a caller that does not loop
+ * reads it as an interruption that never happened.  Such a wake goes back
+ * to sleep, against the same absolute deadline, re-checking the word on
+ * the way exactly as the first pass did. */
+static int futex_wait_common(uint64_t uaddr, uint32_t expected_val,
+			     uint64_t timeout_ns, uint32_t bitset, bool shared)
+{
+	uint64_t deadline_ns = 0;
+
+	might_sleep();
+	if (timeout_ns > 0) {
+		uint64_t now_ns = hrtimer_now_ns();
+
+		deadline_ns = timeout_ns > ~0ULL - now_ns ? ~0ULL :
+							    now_ns + timeout_ns;
+	}
+	for (;;) {
+		uint64_t left_ns = 0;
+		task_t *cur;
+		int r;
+
+		if (deadline_ns) {
+			uint64_t now_ns = hrtimer_now_ns();
+
+			if (now_ns >= deadline_ns)
+				return -ETIMEDOUT;
+			left_ns = deadline_ns - now_ns;
+		}
+		r = futex_wait_once(uaddr, expected_val, left_ns, bitset,
+				    shared);
+		if (r != -EINTR)
+			return r;
+		cur = sched_current();
+		if (!cur || signal_pending(cur))
+			return -EINTR;
+	}
 }
 
 static int futex_wake_common(uint64_t uaddr, int nr_wake, uint32_t bitset,

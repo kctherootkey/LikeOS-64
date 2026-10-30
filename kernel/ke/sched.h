@@ -515,6 +515,10 @@ typedef struct task {
 	int remaining_ticks; // Remaining time slice ticks
 	interrupt_frame_t *
 		preempt_frame; // Saved interrupt frame (NULL if cooperative switch)
+	/* The user-mode exception frame of a fault being handled, for as long
+	 * as its handler may sleep (demand paging): where a tracer finds this
+	 * thread's registers if it is stopped there.  NULL otherwise. */
+	interrupt_frame_t *user_fault_frame;
 
 	// Process hierarchy
 	struct task *parent; // Parent task (NULL for init)
@@ -604,9 +608,9 @@ typedef struct task {
 	 * the same signal would queue it afresh, stop for it again, and never
 	 * make progress.
 	 *
-	 * `ptrace_signal_injected' marks a signal the tracer asked for itself,
-	 * so the delivery stop lets that one through instead of stopping for it
-	 * again.  Without it a tracer passing a signal on resume would stop for
+	 * `ptrace_signal_injected' is the number of a signal the tracer asked
+	 * for itself (0: none), so the delivery stop lets that one through
+	 * instead of stopping for it again.  Without it a tracer passing a signal on resume would stop for
 	 * the signal it just asked to deliver, forever. */
 	volatile int ptrace_sig_delivery;
 	volatile int ptrace_signal_injected;
@@ -624,6 +628,9 @@ typedef struct task {
 	 * by task_ptrace_group_park at the next return to user, cleared for
 	 * the whole group by a resume. */
 	volatile int ptrace_group_stop;
+	/* Its values: */
+#define PTRACE_GSTOP_SILENT 1 /* park quietly: a sibling's event stopped the process */
+#define PTRACE_GSTOP_SIGSTOP 2 /* stop and REPORT SIGSTOP: attach/kill on a running tracee */
 
 	/* Set once this task has reported PTRACE_EVENT_EXIT and been released
 	 * from that stop: it is on its way out and must not stop again.
@@ -646,6 +653,15 @@ typedef struct task {
 	 * si_addr are what turn "stopped with SIGSEGV" into "wrote to 0x1",
 	 * and the fault handler is the only place that knows them. */
 	siginfo_t ptrace_siginfo;
+	/* Whether ptrace_siginfo describes the current trace stop.  A group
+	 * stop carries none -- PTRACE_GETSIGINFO answers EINVAL there, which is
+	 * how a tracer tells it from a signal-delivery stop. */
+	volatile int ptrace_stop_has_siginfo;
+	/* The current trace stop is a GROUP stop -- a traced task's
+	 * job-control stop: a signal given on its resume is ignored. */
+	volatile int ptrace_stop_is_group;
+	/* The siginfo an owed SIGSTOP (PTRACE_GSTOP_SIGSTOP) is reported with. */
+	siginfo_t ptrace_owed_siginfo;
 
 	/* This task's own incarnation, stamped at creation from a counter that
 	 * only ever increases.  PIDs are handed out monotonically today and so
@@ -785,6 +801,13 @@ typedef struct task {
 	 * and those may be page-ins waiting for the very filesystem lock this
 	 * task holds.  A positive count bypasses writer preference there. */
 	int fs_held;
+	/* Sleeping locks held besides those two counts: an mmap_lock held for
+	 * writing, the USB disk I/O lock.  A task holding any of them -- or a
+	 * filesystem lock, or an mmap_lock read hold -- is never frozen in place
+	 * by a trace stop, which would keep the lock for the whole stop and can
+	 * leave the tracer waiting on it (ptrace_may_freeze).  It stops at its
+	 * next return to user instead, as an uninterruptible sleeper does. */
+	int sleep_locks_held;
 
 	// Timer-based sleep support
 	uint64_t
@@ -847,6 +870,19 @@ typedef struct task {
 
 	// Process name (set from argv[0] basename on execve)
 	char comm[256];
+
+	/* Where this task was last put on a run queue, and when it last ran:
+	 * what rq_report_running_on_queue() prints when a task that is
+	 * running is found on a run queue -- the trace of the enqueue that
+	 * should never have happened.  Written by the scheduler only. */
+	uint64_t sched_enq_site;      /* caller of rq_enqueue_locked() */
+	uint64_t sched_enq_wake_site; /* caller of sched_enqueue_ready(), or 0 */
+	uint64_t sched_wake_site;     /* pending: set by sched_enqueue_ready() */
+	uint64_t sched_enq_tsc, sched_run_tsc, sched_off_tsc;
+	int32_t sched_enq_cpu, sched_run_cpu;
+	int32_t sched_enq_running_on; /* CPU it was current on then, or -1 */
+	uint8_t sched_enq_state;      /* its state at that enqueue */
+	uint8_t sched_enq_sp_zero;    /* its stack was in use then */
 
 	/* The executable this task is running, as an absolute path.
 	 *
@@ -1293,6 +1329,25 @@ void sched_run_ready(void);
 void sched_bsp_park(void);
 task_t *sched_current(void);
 
+/* A sleeping lock taken, or finally let go, by the current task: counted in
+ * sleep_locks_held so a trace stop does not freeze it while it holds one.
+ * Called on the outermost acquire and the last release only. */
+static inline void task_sleep_lock_taken(void)
+{
+	task_t *c = sched_current();
+
+	if (c)
+		c->sleep_locks_held++;
+}
+
+static inline void task_sleep_lock_dropped(void)
+{
+	task_t *c = sched_current();
+
+	if (c && c->sleep_locks_held > 0)
+		c->sleep_locks_held--;
+}
+
 #define TASK_LOGIN_UNSET 0xffffffffu
 /* A login session id never handed out before (never TASK_LOGIN_UNSET). */
 uint32_t sched_new_login_session(void);
@@ -1485,6 +1540,7 @@ task_t *sched_find_task_by_id_locked(
  * has it.  Caller holds g_task_list_lock. */
 void sched_session_drop_tty_locked(int sid, struct tty *tty);
 task_t *sched_find_next_task_by_id_locked(uint32_t min_id); // Find task by PID (caller holds g_task_list_lock)
+task_t *sched_find_next_process_by_id_locked(uint32_t min_id); // Lowest listed process >= min_id (caller holds g_task_list_lock)
 task_t *sched_task_by_canary(
 	uint64_t canary); // Crash diagnostic: lock-free, __stack_chk_fail only
 
@@ -1537,6 +1593,7 @@ void sched_set_init_task(task_t *t);
 // True for the kernel's swapper-class tasks (bootstrap + per-CPU idle), which
 // should be hidden from process listings.
 int sched_task_hidden(const task_t *t);
+int sched_task_released(const task_t *t);
 /* Kernel-originated group signal (tty job control, hangup): unconditional. */
 /* Does process group `pgid' have a member in session `sid'?  1 yes, 0 no
  * live member found at all, -1 the group exists only in another session.
@@ -1711,6 +1768,11 @@ bool task_traced_by_unprivileged(task_t *t);
  * for a plain signal-delivery stop, `msg' is the value PTRACE_GETEVENTMSG will
  * return.  Called by the task about to stop, in its own context. */
 void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg);
+int task_ptrace_stop_other(task_t *t, int signo);
+void task_ptrace_stop_info(task_t *t, int signo, int event, unsigned long msg,
+			   const siginfo_t *si);
+/* For task_ptrace_stop_info: a stop that carries no siginfo (a group stop). */
+#define PTRACE_STOP_NO_SIGINFO ((const siginfo_t *)1)
 
 /* Stop `t' because `signo' is about to be delivered to it, and report the
  * signal the tracer wants delivered instead -- `signo' if it said nothing,
@@ -1727,10 +1789,11 @@ int task_ptrace_signal_stop(task_t *t, int signo,
  * user mode, where stopping is safe; does nothing for a task that is not
  * traced or whose process is running. */
 void task_ptrace_group_park(task_t *t);
+void task_ptrace_group_park_sleeping(task_t *t);
+void task_ptrace_group_stop_siblings(task_t *t);
 
 /* Stop / resume every thread of `t`'s process.  The stop is silent for the
  * siblings -- only the thread that hit the event reports one. */
-void task_ptrace_group_stop_siblings(task_t *t);
 void task_ptrace_group_resume(task_t *t);
 
 /* Detach `t' from its tracer, resuming it if it is parked in a trace stop.

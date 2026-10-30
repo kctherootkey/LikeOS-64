@@ -47,6 +47,7 @@ void fat32_io_lock(void)
 			fat32_io_locked = 1;
 			fat32_io_owner = my_id;
 			fat32_io_depth = 1;
+			task_sleep_lock_taken();
 			spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
 			return;
 		}
@@ -80,6 +81,7 @@ void fat32_io_unlock(void)
 	fat32_io_locked = 0;
 	fat32_io_owner = (uint64_t)-1;
 	fat32_io_depth = 0;
+	task_sleep_lock_dropped();
 	spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
 	sched_wake_channel((void *)&fat32_io_locked);
 }

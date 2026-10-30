@@ -347,7 +347,7 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 			break;
 		}
 		next_id = (uint32_t)t->id + 1;
-		if (sched_task_hidden(t)) {
+		if (sched_task_hidden(t) || sched_task_released(t)) {
 			/* The kernel's swapper-class tasks (bootstrap + idle)
 			 * are not real processes. */
 			spin_unlock_irqrestore(&g_task_list_lock, flags);

@@ -1717,5 +1717,6 @@ void timer_irq_handler(int from_user)
 	if (is_bsp) {
 		sched_tick();
 		console_cursor_update(); /* cursor blink: called once per tick on BSP */
+		drm_console_tick(); /* a console wake a print had to defer */
 	}
 }

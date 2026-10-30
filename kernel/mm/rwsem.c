@@ -186,6 +186,7 @@ void mm_write_lock(mm_rwsem_t *sem)
 			sem->writer = 1;
 			sem->owner = my_id;
 			sem->wdepth = 1;
+			task_sleep_lock_taken();
 			if (queued)
 				sem->w_wait--;
 			spin_unlock_irqrestore(&sem->lock, flags);
@@ -210,6 +211,13 @@ void mm_write_unlock(mm_rwsem_t *sem)
 		sem->wdepth--;
 		spin_unlock_irqrestore(&sem->lock, flags);
 		return;
+	}
+	{
+		/* Counted against its holder only (see sleep_locks_held). */
+		task_t *wcur = sched_current();
+
+		if (wcur && sem->owner == (uint64_t)wcur->id)
+			task_sleep_lock_dropped();
 	}
 	sem->writer = 0;
 	sem->owner = (uint64_t)-1;

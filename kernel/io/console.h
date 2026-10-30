@@ -146,6 +146,9 @@ void console_get_dimensions(uint32_t *rows, uint32_t *cols);
 void console_cursor_enable(void);
 void console_cursor_disable(void);
 void console_cursor_update(void); // Call periodically to handle blinking
+/* The KMS console: deliver a worker wake a print could not make (from the
+ * tick; see drm_console.c). */
+void drm_console_tick(void);
 
 // Framebuffer optimization interface
 void console_show_fb_status(void);

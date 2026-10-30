@@ -35,12 +35,20 @@ void softirq_register(uint32_t nr, softirq_fn_t fn)
 	softirq_handlers[nr] = fn;
 }
 
+/* Wake the CPU's ksoftirqd if it is parked.  It is claimed directly, as
+ * every single-task waker does, instead of through sched_wake_channel(): that
+ * walks the whole task list under g_task_list_lock with interrupts off, and
+ * this runs for every raise.  The enqueue interrupts the target processor
+ * when ksoftirqd should take it over (see sched_enqueue_ready). */
 static inline void softirq_wake_local(uint32_t cpu)
 {
 	task_t *t = ksoftirqd_task[cpu];
-	if (t && t->state == TASK_BLOCKED &&
-	    t->wait_channel == (void *)&ksoftirqd_task[cpu]) {
-		sched_wake_channel((void *)&ksoftirqd_task[cpu]);
+
+	if (t && t->wait_channel == (void *)&ksoftirqd_task[cpu] &&
+	    sched_claim_wake(t, TASK_BLOCKED)) {
+		t->wait_channel = NULL;
+		t->wakeup_tick = 0;
+		sched_enqueue_ready(t);
 	}
 }
 
@@ -49,8 +57,12 @@ void softirq_raise(uint32_t nr)
 	if (nr >= NR_SOFTIRQ)
 		return;
 	uint32_t cpu = safe_cpu_id();
-	__atomic_fetch_or(&softirq_pending_mask[cpu], (1u << nr),
-			  __ATOMIC_ACQ_REL);
+	/* Already pending: whoever set the bit has done the wake, or found
+	 * ksoftirqd awake -- and then it re-reads the mask before it parks. */
+	if (__atomic_fetch_or(&softirq_pending_mask[cpu], (1u << nr),
+			      __ATOMIC_ACQ_REL) &
+	    (1u << nr))
+		return;
 	softirq_wake_local(cpu);
 }
 
@@ -60,18 +72,21 @@ void softirq_raise_on(uint32_t cpu, uint32_t nr)
 		       nr, NR_SOFTIRQ);
 	if (nr >= NR_SOFTIRQ || cpu >= MAX_CPUS)
 		return;
-	__atomic_fetch_or(&softirq_pending_mask[cpu], (1u << nr),
-			  __ATOMIC_ACQ_REL);
-	/* Wake ksoftirqd on the target CPU and force a reschedule there.
-     * Without the IPI, ksoftirqd just sits in the target CPU's run queue
-     * until the next 10 ms timer tick picks it up — which throttles
-     * network RX to ~100 pkt/s (the agent's analysis identified this
-     * as a primary cause of the 300 KB/s ceiling).  The IPI makes the
-     * target CPU exit halt/userspace immediately and run the scheduler. */
+	/* Already pending: nothing to do (see softirq_raise).
+	 *
+	 * No reschedule interrupt of its own either.  Waking ksoftirqd
+	 * interrupts the target when ksoftirqd should run there now, and a
+	 * ksoftirqd that is already running or queued gets nothing from one
+	 * but the loss of its processor.  Kernel wait loops raise this once
+	 * per pass (loopback_process_pending), and an unconditional interrupt
+	 * per raise reached a million a second into CPU0 -- one forced
+	 * context switch each, and the TLB-shootdown interrupt, which ranks
+	 * below the reschedule one, was never taken there at all. */
+	if (__atomic_fetch_or(&softirq_pending_mask[cpu], (1u << nr),
+			      __ATOMIC_ACQ_REL) &
+	    (1u << nr))
+		return;
 	softirq_wake_local(cpu);
-	if (cpu != safe_cpu_id() && smp_is_enabled()) {
-		smp_send_reschedule(cpu);
-	}
 }
 
 /* Read-only diagnostic accessors used by the Ctrl+N TCP/net dump

@@ -560,10 +560,21 @@ long evdev_read(int unit, void *user_buf, long bytes, int nonblock)
 		task_set_blocked(cur);
 		spin_lock_irqsave(&dev->lock, &f);
 		if (dev->count > 0) {
-			cur->state = TASK_READY;
-			cur->wait_channel = NULL;
-			spin_unlock_irqrestore(&dev->lock, f);
-			continue;
+			task_state_t asleep = TASK_BLOCKED;
+
+			/* Un-park by CAS, the way every waker claims: a trace
+			 * stop may have claimed this sleep meanwhile, and a
+			 * plain store ran on straight through it.  Claimed
+			 * first -- woken, or stopped -- the scheduler below
+			 * reconciles. */
+			if (__atomic_compare_exchange_n(&cur->state, &asleep,
+							TASK_READY, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				cur->wait_channel = NULL;
+				spin_unlock_irqrestore(&dev->lock, f);
+				continue;
+			}
 		}
 		spin_unlock_irqrestore(&dev->lock, f);
 		sched_schedule();

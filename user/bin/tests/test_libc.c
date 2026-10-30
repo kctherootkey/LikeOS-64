@@ -3,6 +3,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <sysexits.h>
 #include <sys/ipc.h>
 #include <assert.h>
@@ -99,6 +100,21 @@ int futex_wake(int *uaddr, int count);
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+/* --stress: the run is one of several under teststress, next to a desktop
+ * that owns the display.  Tests that draw to the screen or change its mode
+ * would fight the X server for it, so they are left out. */
+static int g_stress = 0;
+
+/* True, after saying so, when `what' must not run under --stress. */
+static int stress_skip(const char *what)
+{
+	if (!g_stress)
+		return 0;
+	printf("  (--stress: %s skipped, it draws to the screen or changes the display mode)\n",
+	       what);
+	return 1;
+}
+
 /* Names of failed tests, recorded so the end-of-run summary can list them in
  * one contiguous block emitted by the parent alone.  Individual "[FAIL] ..."
  * lines are printed inline as tests run, but under SMP a forked child writing
@@ -118,6 +134,61 @@ static void record_failure(const char *name)
 			 name ? name : "(unnamed)");
 	}
 	failed_names_count++; /* count past the cap too, so the total is honest */
+}
+
+/* Every failure is also appended to this file, with when, by which process
+ * and with which arguments, so the failures of a long run -- or of several
+ * runs at once under teststress -- can be read afterwards in one place.
+ *
+ * Several testlibc processes (and their forked children) write it at the
+ * same time, so each record is one write() on a descriptor opened with
+ * O_APPEND: the kernel puts every such write at the end of the file as a
+ * whole, so records never overwrite or split one another.  Opened per
+ * record, because tests close descriptors, change directory, chroot and
+ * fork; one held open would not survive them. */
+#define FAIL_LOG_PATH "/tmp/testlibc.log"
+static char g_run_args[256]; /* the command line after the program name */
+
+static void fail_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void fail_log(const char *fmt, ...)
+{
+	char rec[2048];
+	int saved_errno = errno;
+	struct timespec ts;
+	struct tm tm;
+	va_list ap;
+	int n, fd;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	localtime_r(&ts.tv_sec, &tm);
+	n = snprintf(rec, sizeof(rec),
+		     "%04d-%02d-%02d %02d:%02d:%02d.%03ld pid %d ppid %d [testlibc%s%s]: ",
+		     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+		     tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000L, (int)getpid(),
+		     (int)getppid(), g_run_args[0] ? " " : "", g_run_args);
+	if (n < 0)
+		n = 0;
+	if (n > (int)sizeof(rec) - 2)
+		n = (int)sizeof(rec) - 2;
+	va_start(ap, fmt);
+	int m = vsnprintf(rec + n, sizeof(rec) - (size_t)n - 1, fmt, ap);
+	va_end(ap);
+	if (m > 0)
+		n += m < (int)(sizeof(rec) - (size_t)n - 1) ?
+			     m :
+			     (int)(sizeof(rec) - (size_t)n - 2);
+	if (n == 0 || rec[n - 1] != '\n')
+		rec[n++] = '\n';
+
+	fd = open(FAIL_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+	if (fd >= 0) {
+		/* Writable by every run whatever its user or umask: the cred
+		 * tests drop privileges, and some tests change the umask. */
+		(void)fchmod(fd, 0666);
+		(void)write(fd, rec, (size_t)n);
+		close(fd);
+	}
+	errno = saved_errno;
 }
 
 static volatile int g_sigusr1_hit = 0;
@@ -314,9 +385,12 @@ static void exit_handler_check(void)
 	if (g_exit_order_n == 3 && g_exit_order[0] == 'b' &&
 	    g_exit_order[1] == 'x' && g_exit_order[2] == 'a')
 		printf("  [PASS] exit handlers ran in reverse registration order\n");
-	else
+	else {
 		printf("  [FAIL] exit handlers ran out of order (%.*s)\n",
 		       g_exit_order_n, g_exit_order);
+		fail_log("[FAIL] exit handlers ran out of order (%.*s)",
+			 g_exit_order_n, g_exit_order);
+	}
 }
 
 static void __test_fail_impl(const char *name, const char *file, int line,
@@ -327,8 +401,11 @@ static void __test_fail_impl(const char *name, const char *file, int line,
 	if (saved_errno != 0) {
 		printf("  [FAIL] %s (at %s:%d; errno=%d: %s)\n", name, file,
 		       line, saved_errno, strerror(saved_errno));
+		fail_log("[FAIL] %s (at %s:%d; errno=%d: %s)", name, file,
+			 line, saved_errno, strerror(saved_errno));
 	} else {
 		printf("  [FAIL] %s (at %s:%d)\n", name, file, line);
+		fail_log("[FAIL] %s (at %s:%d)", name, file, line);
 	}
 }
 
@@ -361,9 +438,14 @@ static void __test_result_impl(const char *name, int condition,
 			printf("  [FAIL] %s (at %s:%d: \"%s\" was false; errno=%d: %s)\n",
 			       name, file, line, expr, saved_errno,
 			       strerror(saved_errno));
+			fail_log("[FAIL] %s (at %s:%d: \"%s\" was false; errno=%d: %s)",
+				 name, file, line, expr, saved_errno,
+				 strerror(saved_errno));
 		} else {
 			printf("  [FAIL] %s (at %s:%d: \"%s\" was false)\n",
 			       name, file, line, expr);
+			fail_log("[FAIL] %s (at %s:%d: \"%s\" was false)",
+				 name, file, line, expr);
 		}
 	}
 }
@@ -639,6 +721,24 @@ static uint16_t bind_to_ephemeral(int fd, uint32_t local_ip)
 	if (getsockname(fd, (struct sockaddr *)&la, &la_len) < 0)
 		return 0;
 	return ntohs(la.sin_port);
+}
+
+/* A port nobody holds right now, for a test that binds an explicit number:
+ * the kernel picks it (bind to port 0) and it is let go at once.  Ports
+ * computed from the pid did not keep parallel testlibc runs apart: two pids
+ * equal in their low bits, or two tests whose ranges overlapped, met on one
+ * port.  The kernel hands ephemeral ports out in rotation, so this one is
+ * not given to anybody else before the caller binds it. */
+static uint16_t free_port(int type)
+{
+	int fd = socket(AF_INET, type, 0);
+	uint16_t port;
+
+	if (fd < 0)
+		return 0;
+	port = bind_to_ephemeral(fd, INADDR_ANY);
+	close(fd);
+	return port;
 }
 
 static int get_interface_ipv4(const char *ifname, uint32_t *ip_out)
@@ -1361,8 +1461,11 @@ static void test_drm_i915_unmap_other_cpu(int fd)
 {
 	struct drm_i915_gem_create ca, cb;
 	struct drm_i915_gem_mmap_offset ma, mb;
-	cpu_set_t zero;
+	cpu_set_t zero, saved_mask;
 	int stale = 0, rounds = 0, same_cpu = 0;
+	/* The pin below is for this test only: every test after it must run
+	 * with the affinity the suite had. */
+	int have_saved = sched_getaffinity(0, sizeof(saved_mask), &saved_mask) == 0;
 
 	memset(&ca, 0, sizeof(ca));
 	ca.size = 4096;
@@ -1434,6 +1537,8 @@ static void test_drm_i915_unmap_other_cpu(int fd)
 		printf("  (%d of %d rounds: the other processor wrote through the old translation)\n",
 		       stale, rounds);
 out:
+	if (have_saved)
+		sched_setaffinity(0, sizeof(saved_mask), &saved_mask);
 	{
 		struct drm_gem_close gc;
 		memset(&gc, 0, sizeof(gc));
@@ -2133,6 +2238,8 @@ static void test_drm_i915(void)
 static void test_fbdev(void)
 {
 	printf("\n--- Framebuffer Device Tests (/dev/fb0) ---\n");
+	if (stress_skip("the framebuffer section"))
+		return;
 
 	int fd = open("/dev/fb0", O_RDWR);
 	test_result("open(/dev/fb0, O_RDWR)", fd >= 0);
@@ -4150,15 +4257,43 @@ static void test_evdev(void)
 	fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
 	test_result("open(/dev/input/event1)", fd >= 0);
 	if (fd >= 0) {
+		/* Two legitimate shapes.  A relative mouse (PS/2, USB):
+		 * REL_X/REL_Y/REL_WHEEL and INPUT_PROP_POINTER.  An absolute
+		 * pointer (the VMware mouse once the hypervisor's absolute
+		 * channel is on): ABS_X/ABS_Y with a real range, the wheel
+		 * still relative, no relative axes and no INPUT_PROP_POINTER --
+		 * it reports screen positions, not motion. */
+		unsigned char absb1[(ABS_MAX + 7) / 8];
+		memset(absb1, 0, sizeof(absb1));
+		int abs_mode =
+			ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absb1)), absb1) > 0 &&
+			(absb1[ABS_X / 8] & (1 << (ABS_X % 8))) &&
+			(absb1[ABS_Y / 8] & (1 << (ABS_Y % 8)));
+		if (abs_mode)
+			printf("  (mouse is an absolute pointer: checking the absolute shape)\n");
+
 		unsigned char relb[(REL_MAX + 7) / 8];
 		memset(relb, 0, sizeof(relb));
 		int ok = ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relb)), relb) > 0;
-		test_result(
-			"mouse: EVIOCGBIT(EV_REL) has REL_X/REL_Y/REL_WHEEL",
-			ok && (relb[0] & (1 << REL_X)) &&
-				(relb[0] & (1 << REL_Y)) &&
-				(relb[REL_WHEEL / 8] &
-				 (1 << (REL_WHEEL % 8))));
+		if (abs_mode) {
+			struct input_absinfo mai;
+			memset(&mai, 0, sizeof(mai));
+			test_result(
+				"mouse: absolute pointer has ABS_X/ABS_Y with a range and REL_WHEEL, no REL_X/REL_Y",
+				ok && !(relb[0] & (1 << REL_X)) &&
+					!(relb[0] & (1 << REL_Y)) &&
+					(relb[REL_WHEEL / 8] &
+					 (1 << (REL_WHEEL % 8))) &&
+					ioctl(fd, EVIOCGABS(ABS_X), &mai) == 0 &&
+					mai.maximum > mai.minimum);
+		} else {
+			test_result(
+				"mouse: EVIOCGBIT(EV_REL) has REL_X/REL_Y/REL_WHEEL",
+				ok && (relb[0] & (1 << REL_X)) &&
+					(relb[0] & (1 << REL_Y)) &&
+					(relb[REL_WHEEL / 8] &
+					 (1 << (REL_WHEEL % 8))));
+		}
 
 		unsigned char evb1[(EV_MAX + 7) / 8];
 		memset(evb1, 0, sizeof(evb1));
@@ -4172,16 +4307,22 @@ static void test_evdev(void)
 		test_result("mouse: EVIOCGID distinct product",
 			    ioctl(fd, EVIOCGID, &id) == 0 && id.product == 2);
 
-		/* The mouse must advertise INPUT_PROP_POINTER: that is how a
-		 * driver tells relative motion driving a cursor apart from a
-		 * touchscreen that maps onto screen coordinates. */
+		/* A relative mouse must advertise INPUT_PROP_POINTER: that is
+		 * how a driver tells relative motion driving a cursor apart
+		 * from a device that maps onto screen coordinates -- which an
+		 * absolute pointer is, so it must not. */
 		unsigned char mprops[(INPUT_PROP_MAX + 7) / 8];
 		memset(mprops, 0, sizeof(mprops));
 		test_result("mouse: EVIOCGPROP returns a bitmap",
 			    ioctl(fd, EVIOCGPROP(sizeof(mprops)), mprops) > 0);
-		test_result("mouse: claims INPUT_PROP_POINTER",
-			    (mprops[INPUT_PROP_POINTER / 8] &
-			     (1 << (INPUT_PROP_POINTER % 8))) != 0);
+		if (abs_mode)
+			test_result("mouse: absolute pointer does not claim INPUT_PROP_POINTER",
+				    (mprops[INPUT_PROP_POINTER / 8] &
+				     (1 << (INPUT_PROP_POINTER % 8))) == 0);
+		else
+			test_result("mouse: claims INPUT_PROP_POINTER",
+				    (mprops[INPUT_PROP_POINTER / 8] &
+				     (1 << (INPUT_PROP_POINTER % 8))) != 0);
 
 		char mphys[64] = { 0 };
 		test_result("mouse: EVIOCGPHYS differs from the keyboard's",
@@ -5406,7 +5547,7 @@ static void test_cred_proc_visibility(void)
 		if (setuid(CRED_TEST_UID) != 0)
 			_exit(0); /* parent reports the resulting failures */
 
-		int max = 128;
+		int max = 4096; /* the kernel's limit, as ps uses */
 		procinfo_t *buf = (procinfo_t *)malloc((size_t)max *
 						       sizeof(procinfo_t));
 		if (!buf)
@@ -7938,8 +8079,17 @@ static void test_sysv_sem(void)
 	test_result("a removed identifier is refused",
 		    semctl(id, 0, GETVAL) == -1 && errno == EINVAL);
 
-	/* keys: two callers meet on one set */
-	key_t key = ftok("/", 'S');
+	/* keys: two callers meet on one set.  The key comes from a file of
+	 * this process's own: ftok("/") gave every parallel instance the same
+	 * set, and one removed it while another was still checking it. */
+	char keypath[48];
+	int kfd;
+
+	snprintf(keypath, sizeof(keypath), "/tmp/semkey.%d", (int)getpid());
+	kfd = open(keypath, O_CREAT | O_WRONLY, 0600);
+	if (kfd >= 0)
+		close(kfd);
+	key_t key = ftok(keypath, 'S');
 	test_result("ftok makes a key of a path", key != (key_t)-1);
 	int a = semget(key, 1, IPC_CREAT | 0600);
 	int b = semget(key, 1, 0);
@@ -7955,6 +8105,7 @@ static void test_sysv_sem(void)
 	errno = 0;
 	test_result("a missing key without IPC_CREAT gives ENOENT",
 		    semget(key, 1, 0) == -1 && errno == ENOENT);
+	unlink(keypath);
 }
 
 static void test_sysv_shm(void)
@@ -9524,8 +9675,13 @@ static void test_so_peercred(void)
 	/* connect/accept across a real socket, which is the path a bus client
 	 * takes.  The child connects; the parent accepts and asks who it is. */
 	{
-		const char *path = "/tmp/.likeos-peercred-test";
+		/* Per process: a second instance would unlink this one's
+		 * listener and connect into it. */
+		char path[64];
 		int ls, cs;
+
+		snprintf(path, sizeof(path), "/tmp/.likeos-peercred-test.%d",
+			 (int)getpid());
 		struct sockaddr_un sa;
 		pid_t child;
 
@@ -10646,6 +10802,10 @@ static void test_timed_blocking(void)
 			    elapsed_ms >= 100 && elapsed_ms < 2000);
 
 		pthread_join(th, NULL);
+		/* Taken after all (the deadline passed unnoticed): give it
+		 * back, or every check below fails on this one. */
+		if (r == 0)
+			pthread_mutex_unlock(&g_tb_mutex);
 
 		/* An uncontended timedlock takes the mutex at once. */
 		clock_gettime(CLOCK_REALTIME, &deadline);
@@ -11558,7 +11718,7 @@ static void test_orphan_reaping(void)
 	 * fails is exactly the signal wanted.
 	 */
 	if (orphan > 0) {
-		int max = 512;
+		int max = 4096; /* the kernel's limit, as ps uses */
 		procinfo_t *buf = malloc((size_t)max * sizeof(procinfo_t));
 		int gone = 0;
 		int zombie_seen = 0;
@@ -12750,24 +12910,33 @@ static void test_memstream_ftw_cpuclock(void)
 	}
 
 	/* nftw over a fabricated tree: 2 dirs (root + sub), 3 files; then
-	 * FTW_DEPTH must report the directory AFTER its contents. */
-	system("rm -rf /tmp/ftwtest");
-	mkdir("/tmp/ftwtest", 0755);
-	mkdir("/tmp/ftwtest/sub", 0755);
+	 * FTW_DEPTH must report the directory AFTER its contents.  The tree is
+	 * per process: a parallel instance removing or filling a shared one
+	 * changes the counts under the walk. */
+	char ftwroot[48], ftwp[64];
 	FILE *t;
-	t = fopen("/tmp/ftwtest/a", "w"); if (t) fclose(t);
-	t = fopen("/tmp/ftwtest/b", "w"); if (t) fclose(t);
-	t = fopen("/tmp/ftwtest/sub/c", "w"); if (t) fclose(t);
+
+	snprintf(ftwroot, sizeof(ftwroot), "/tmp/ftwtest.%d", (int)getpid());
+	rmtree(ftwroot);
+	mkdir(ftwroot, 0755);
+	snprintf(ftwp, sizeof(ftwp), "%s/sub", ftwroot);
+	mkdir(ftwp, 0755);
+	snprintf(ftwp, sizeof(ftwp), "%s/a", ftwroot);
+	t = fopen(ftwp, "w"); if (t) fclose(t);
+	snprintf(ftwp, sizeof(ftwp), "%s/b", ftwroot);
+	t = fopen(ftwp, "w"); if (t) fclose(t);
+	snprintf(ftwp, sizeof(ftwp), "%s/sub/c", ftwroot);
+	t = fopen(ftwp, "w"); if (t) fclose(t);
 
 	g_ftw_files = g_ftw_dirs = 0;
-	int r = nftw("/tmp/ftwtest", ftw_count_cb, 8, 0);
+	int r = nftw(ftwroot, ftw_count_cb, 8, 0);
 	test_result("nftw visits every entry",
 		    r == 0 && g_ftw_files == 3 && g_ftw_dirs == 2);
 	g_ftw_files = g_ftw_dirs = g_ftw_depth_last = 0;
-	r = nftw("/tmp/ftwtest", ftw_count_cb, 8, FTW_DEPTH);
+	r = nftw(ftwroot, ftw_count_cb, 8, FTW_DEPTH);
 	test_result("nftw FTW_DEPTH reports dirs post-order",
 		    r == 0 && g_ftw_dirs == 2 && g_ftw_depth_last == 1);
-	system("rm -rf /tmp/ftwtest");
+	rmtree(ftwroot);
 
 	/* pthread_getcpuclockid: another thread burns CPU; its clock must
 	 * advance while this thread mostly sleeps. */
@@ -14126,6 +14295,8 @@ static void test_posix_additions(void)
 static void test_drm(void)
 {
 	printf("\n[TEST] display-manager device (/dev/dri)\n");
+	if (stress_skip("the mode-setting section"))
+		return;
 	struct stat st;
 
 	if (stat("/dev/dri/card0", &st) != 0) {
@@ -14450,6 +14621,8 @@ static const char *gb_xfer_name(int cls)
 static void test_drm_vmw_overlay(void)
 {
 	printf("\n[TEST] display-manager device: video overlay streams (vmwgfx)\n");
+	if (stress_skip("the overlay section"))
+		return;
 	int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		printf("  (no primary node, skipped)\n");
@@ -14828,6 +15001,9 @@ static void test_drm_3d(void)
 		}
 		struct drm_vmw_get_3d_cap_arg cap;
 		static uint32_t caps[300];
+		/* Zeroed: pad64 must be 0, and the driver refuses anything
+		 * else -- left as stack garbage it failed at random. */
+		memset(&cap, 0, sizeof(cap));
 		cap.buffer = (uint64_t)(uintptr_t)caps;
 		cap.max_size = sizeof(caps);
 		test_result("GET_3D_CAP fills the devcap array",
@@ -14903,7 +15079,9 @@ static void test_drm_3d(void)
 				    rc == -EACCES || rc == -EINVAL || rc == -EPERM);
 			close(rfd);
 		}
-		int cfd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+		int cfd = stress_skip("UPDATE_LAYOUT on the card node") ?
+				  -1 :
+				  open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
 		if (cfd >= 0) {
 			/* The layout pushed here becomes the connector's
 			 * PREFERRED mode and OUTLIVES this process: the next
@@ -15907,7 +16085,8 @@ static void test_gpu_userland(void)
 				if (ar != 0)
 					printf("      (errno=%d handle=%u stride=%u)\n", errno,
 					       handle, stride);
-				if (ar == 0) {
+				if (ar == 0 &&
+				    !stress_skip("scanout of the glamor front buffer")) {
 					struct drm_mode_crtc sc2;
 					memset(&sc2, 0, sizeof(sc2));
 					sc2.crtc_id = crtcs2[0];
@@ -15949,8 +16128,9 @@ static void test_gpu_userland(void)
 					int pr2 = ioctl(cfd2, DRM_IOCTL_MODE_PAGE_FLIP, &pf2);
 					test_result("PAGE_FLIP to the surface framebuffer",
 						    pr2 == 0 || errno == EINVAL);
-					ioctl(cfd2, DRM_IOCTL_MODE_RMFB, &fbc.fb_id);
 				}
+				if (ar == 0)
+					ioctl(cfd2, DRM_IOCTL_MODE_RMFB, &fbc.fb_id);
 				if (bodestroy)
 					bodestroy(bo);
 			}
@@ -16106,6 +16286,15 @@ static void *spawn_from_thread(void *arg)
 int main(int argc, char **argv)
 {
 	g_ctor_saw_main_before = g_ctor_ran; /* constructors must precede main */
+	/* For the failure log: which run a record came from. */
+	for (int i = 1, off = 0; i < argc && off < (int)sizeof(g_run_args) - 1;
+	     i++) {
+		int w = snprintf(g_run_args + off, sizeof(g_run_args) - (size_t)off,
+				 "%s%s", i > 1 ? " " : "", argv[i]);
+		if (w < 0)
+			break;
+		off += w;
+	}
 	/* Hidden mode used by the shebang tests: when testlibc is itself the
 	 * shebang interpreter, dump the exact argv vector and exit. */
 	if (argc > 1 && strncmp(argv[1], "__argv", 6) == 0) {
@@ -16123,6 +16312,19 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	/* --stress, anywhere on the line: leave out what draws to the screen or
+	 * changes the display mode (see g_stress).  Taken out of argv so the
+	 * subcommand below is still argv[1]. */
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--stress") != 0)
+			continue;
+		g_stress = 1;
+		for (int j = i; j < argc; j++)
+			argv[j] = argv[j + 1];
+		argc--;
+		i--;
+	}
+
 	/* Subcommand selection:
      *   (no arg)          — run all sections except network
      *   testlibc all      — run all sections including network
@@ -16136,11 +16338,12 @@ int main(int argc, char **argv)
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
 	printf("\n========================================\n");
-	printf("  LikeOS Libc Tests%s\n", net_only     ? " (network only)" :
-					     gpu_only     ? " (graphics only)" :
-					     audio_only   ? " (audio only)" :
-					     skip_network ? " (no network)" :
-							    " (all)");
+	printf("  LikeOS Libc Tests%s%s\n", net_only     ? " (network only)" :
+					       gpu_only     ? " (graphics only)" :
+					       audio_only   ? " (audio only)" :
+					       skip_network ? " (no network)" :
+							      " (all)",
+	       g_stress ? " [--stress: no screen drawing or mode changes]" : "");
 	printf("========================================\n\n");
 
 	// ========================================
@@ -21358,6 +21561,10 @@ int main(int argc, char **argv)
 		printf("  CPU count in mask: %d\n", cpu_count);
 		test_result("At least one CPU in affinity mask", cpu_count > 0);
 
+		/* Pinned for this test only: the tests after it must run with
+		 * the affinity the suite had, not all on CPU 0. */
+		cpu_set_t saved_mask = mask;
+
 		// Try to set affinity to CPU 0
 		CPU_ZERO(&mask);
 		CPU_SET(0, &mask);
@@ -21370,6 +21577,10 @@ int main(int argc, char **argv)
 		sched_getaffinity(0, sizeof(mask), &mask);
 		test_result("CPU 0 is set after setaffinity",
 			    CPU_ISSET(0, &mask));
+
+		test_result("the previous affinity can be restored",
+			    sched_setaffinity(0, sizeof(saved_mask),
+					      &saved_mask) == 0);
 	}
 
 	// Test sched_getscheduler() / sched_setscheduler()
@@ -21473,12 +21684,28 @@ int main(int argc, char **argv)
 
 			pid_t child = fork();
 			if (child == 0) {
-				// Child: wait for parent to wake us
-				// Use busy loop with yield instead of blocking futex
-				// since blocking might not work perfectly
-				for (int i = 0; i < 1000 && *futex_val == 0;
-				     i++) {
-					sched_yield();
+				/* Child: sleep on the shared word until the
+				 * parent sets it and wakes us.  A real wait, not
+				 * a count of yields: how long a thousand yields
+				 * last depends on what else the machine is
+				 * running, and under teststress the parent can
+				 * take longer than that to get the processor.
+				 * Bounded at 10 s, so a lost wake fails the
+				 * test instead of hanging it.  Shared futex
+				 * calls (no private flag) -- the libc wrappers
+				 * are process-private and cannot signal across
+				 * a fork. */
+				struct timespec t0, now;
+
+				clock_gettime(CLOCK_MONOTONIC, &t0);
+				while (*futex_val == 0) {
+					struct timespec slice = { 0, 100000000L };
+
+					syscall(SYS_FUTEX, (long)futex_val,
+						FUTEX_WAIT_OP, 0, (long)&slice);
+					clock_gettime(CLOCK_MONOTONIC, &now);
+					if (now.tv_sec - t0.tv_sec >= 10)
+						break;
 				}
 				_exit(*futex_val == 1 ? 0 : 1);
 			} else if (child > 0) {
@@ -21487,14 +21714,16 @@ int main(int argc, char **argv)
 				*futex_val = 1;
 
 				// Wake any waiters (even if child is just spinning)
-				int woken = futex_wake((int *)futex_val, 1);
+				int woken = (int)syscall(SYS_FUTEX,
+							 (long)futex_val,
+							 FUTEX_WAKE_OP, 1);
 				printf("  futex_wake() woke %d waiters\n",
 				       woken);
 
-				int status;
-				waitpid(child, &status, 0);
+				int status = 0;
+				pid_t reaped = waitpid(child, &status, 0);
 				test_result("futex signaling works",
-					    WIFEXITED(status) &&
+					    reaped == child && WIFEXITED(status) &&
 						    WEXITSTATUS(status) == 0);
 			}
 
@@ -22332,6 +22561,9 @@ int main(int argc, char **argv)
 		CPU_ZERO(&new_cpuset);
 		CPU_SET(0, &new_cpuset);
 
+		/* Pinned for this test only (see "CPU affinity syscalls"). */
+		cpu_set_t saved_mask = cpuset;
+
 		ret = sched_setaffinity(0, sizeof(cpu_set_t), &new_cpuset);
 		// This might fail if system doesn't support it, but shouldn't crash
 		if (ret == 0) {
@@ -22342,6 +22574,7 @@ int main(int argc, char **argv)
 			sched_getaffinity(0, sizeof(cpu_set_t), &cpuset);
 			test_result("affinity was updated",
 				    CPU_ISSET(0, &cpuset));
+			sched_setaffinity(0, sizeof(cpu_set_t), &saved_mask);
 		} else {
 			printf("  sched_setaffinity returned %d (may not be supported)\n",
 			       ret);
@@ -22380,6 +22613,9 @@ int main(int argc, char **argv)
 						     &new_cpuset);
 			if (ret == 0) {
 				test_pass("pthread_setaffinity_np succeeds");
+				/* Pinned for this test only. */
+				pthread_setaffinity_np(self, sizeof(cpu_set_t),
+						       &cpuset);
 			} else {
 				printf("  pthread_setaffinity_np returned %d\n",
 				       ret);
@@ -23098,8 +23334,10 @@ int main(int argc, char **argv)
 	{
 		printf("\n--- SYS_GETPROCINFO tests ---\n");
 
-		/* Allocate buffer for up to 128 procs */
-		int max = 128;
+		/* As many entries as the kernel hands out at once, as ps and
+		 * top ask for: 128 was fewer tasks than a desktop running two
+		 * suites has below this process's id, so it was cut off. */
+		int max = 4096;
 		procinfo_t *buf =
 			(procinfo_t *)malloc(max * sizeof(procinfo_t));
 		test_result("getprocinfo: malloc ok", buf != NULL);
@@ -23785,9 +24023,8 @@ network_section:
 		test_result("socket(AF_INET, 99) == -1 (bad type)",
 			    bad_fd == -1);
 
-		/* Per-process port to avoid EADDRINUSE with parallel instances */
-		uint16_t sock_test_port =
-			(uint16_t)(12345 + (getpid() & 0x3FF));
+		/* A free port, so parallel instances never share one */
+		uint16_t sock_test_port = free_port(SOCK_DGRAM);
 
 		// Test bind (UDP)
 		if (udp_fd >= 0) {
@@ -23798,7 +24035,7 @@ network_section:
 			addr.sin_addr.s_addr = htonl(INADDR_ANY);
 			int ret = bind(udp_fd, (struct sockaddr *)&addr,
 				       sizeof(addr));
-			test_result("bind(udp, port 12345) == 0", ret == 0);
+			test_result("bind(udp, explicit port) == 0", ret == 0);
 
 			// Test getsockname after bind
 			struct sockaddr_in got_addr;
@@ -23806,7 +24043,7 @@ network_section:
 			ret = getsockname(udp_fd, (struct sockaddr *)&got_addr,
 					  &got_len);
 			test_result("getsockname(udp) == 0", ret == 0);
-			test_result("getsockname port == 12345",
+			test_result("getsockname port == the bound one",
 				    ntohs(got_addr.sin_port) == sock_test_port);
 		}
 
@@ -25088,8 +25325,7 @@ network_section:
 
 		if (sock >= 0) {
 			/* Per-process port to avoid EADDRINUSE with parallel instances */
-			uint16_t udp_lo_port =
-				(uint16_t)(19999 + (getpid() & 0x3FF));
+			uint16_t udp_lo_port = free_port(SOCK_DGRAM);
 
 			struct timeval udp_tv = { .tv_sec = 3, .tv_usec = 0 };
 			setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &udp_tv,
@@ -27654,7 +27890,9 @@ network_section:
 				 * never reclaimable at all, which shows up as
 				 * free memory that never recovers, not as a
 				 * few percent either way. */
-				if (have_si && sysinfo(&si) == 0) {
+				/* System-wide free memory says nothing about this
+				 * process when others run beside it (--stress). */
+				if (have_si && !g_stress && sysinfo(&si) == 0) {
 					free_after = (unsigned long)si.freeram;
 					printf("  free memory %lu KB before, %lu KB after 32 MB of writes\n",
 					       free_before / 1024,
@@ -29479,7 +29717,7 @@ network_section:
          * "[FAIL] recv 4096 bytes / client completed" seen when running
          * teststress all in two tmux panes.  Using a per-process port
          * keeps each instance's loopback session strictly isolated. */
-		uint16_t tcp_lb_port = (uint16_t)(20021 + (getpid() & 0x1FF));
+		uint16_t tcp_lb_port = free_port(SOCK_STREAM);
 
 		if (server_fd >= 0) {
 			struct sockaddr_in addr;
@@ -29637,7 +29875,9 @@ network_section:
 			struct sockaddr_in dst;
 			memset(&dst, 0, sizeof(dst));
 			dst.sin_family = AF_INET;
-			dst.sin_port = htons(20022);
+			/* A port nothing listens on: a fixed one could be
+			 * another instance's listener. */
+			dst.sin_port = htons(free_port(SOCK_STREAM));
 			dst.sin_addr.s_addr = htonl(0x7F000001);
 			int ret = connect(client_fd, (struct sockaddr *)&dst,
 					  sizeof(dst));
@@ -29686,8 +29926,7 @@ network_section:
 
 		if (rx_fd >= 0 && tx_fd >= 0) {
 			/* Use a per-process port to avoid conflicts with parallel instances */
-			uint16_t frag_port =
-				(uint16_t)(20031 + (getpid() & 0x1FF));
+			uint16_t frag_port = free_port(SOCK_DGRAM);
 
 			/* 3 s receive timeout so a lost packet doesn't hang the suite */
 			struct timeval frag_tv = { .tv_sec = 3, .tv_usec = 0 };
@@ -31608,11 +31847,8 @@ network_section:
 		int sync_pipe[2] = { -1, -1 };
 		pipe(sync_pipe);
 
-		/* Per-process port so two parallel testlibc instances don't collide.
-         * Use & 0x3FFF (16384 values, range 21100-37483) instead of % 1000
-         * to make port collisions practically impossible: two PIDs would
-         * need to differ by exactly 16384, vs. 1000 before. */
-		int tls_lb_port = 21100 + ((int)getpid() & 0x3FFF);
+		/* A free port, so two parallel testlibc instances don't collide. */
+		int tls_lb_port = free_port(SOCK_STREAM);
 
 		/* --- Listening socket (created before fork so child inherits it) --- */
 		int srv_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -32193,10 +32429,8 @@ tls_loopback_done:;
 		int e_sync[2] = { -1, -1 };
 		pipe(e_sync);
 
-		/* Per-process port so two parallel testlibc instances don't collide.
-         * & 0x3FFF gives 16384 possible values (vs 1000 with % 1000), making
-         * collisions between two PIDs practically impossible. */
-		int tls_eth_port = 23100 + ((int)getpid() & 0x3FFF);
+		/* A free port, so two parallel testlibc instances don't collide. */
+		int tls_eth_port = free_port(SOCK_STREAM);
 
 		/* Server listening socket bound to INADDR_ANY:tls_eth_port */
 		int e_srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -33112,6 +33346,8 @@ audio_section:
 		if (failed_names_count > shown)
 			printf("  >> (+%d more not listed)\n",
 			       failed_names_count - shown);
+		fail_log("run finished: %d passed, %d failed (details in the [FAIL] records of this pid above)",
+			 tests_passed, tests_failed);
 	}
 	printf("========================================\n");
 

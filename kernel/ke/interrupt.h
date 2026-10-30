@@ -223,9 +223,9 @@ extern void irq30(void); // HPET comparator: high-resolution timers (vector 62)
 #define HRTIMER_VECTOR 62 // IDT vector for the HPET comparator (hrtimer.c)
 
 // IPI stubs (SMP inter-processor interrupts)
-extern void ipi_vector_0xFC(void); // TLB shootdown
+extern void ipi_vector_0xFC(void); // Reschedule
 extern void ipi_vector_0xFD(void); // Halt CPU
-extern void ipi_vector_0xFE(void); // Reschedule
+extern void ipi_vector_0xFE(void); // TLB shootdown
 extern void ipi_vector_0xFF(void); // LAPIC spurious
 
 // IPI handler (called from assembly)

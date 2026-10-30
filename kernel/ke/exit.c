@@ -394,10 +394,14 @@ int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		// us on another CPU while we're still running → double scheduling.
 		cur->wait_channel = 0;
 
-		// Check if we were woken by a signal
-		if (signal_pending(cur)) {
-			return -EINTR;
-		}
+		/* No signal check here: back to the scan first.  A child that
+		 * finished while we slept is reported even if a signal arrived
+		 * meanwhile -- often the very wake that ended the sleep (the
+		 * exit and a timer, say, landing together).  Returning EINTR
+		 * straight from the wake handed the caller an interrupted call
+		 * with its child already reapable and the status unwritten.
+		 * With nothing to report, the check before blocking above
+		 * returns EINTR as before. */
 
 		// Check if we were terminated
 		if (cur->has_exited) {

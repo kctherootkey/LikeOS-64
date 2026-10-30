@@ -471,6 +471,18 @@ int sched_task_hidden(const task_t *t)
 	return t && (is_bootstrap_task(t) || is_idle_task(t));
 }
 
+/* Gone as far as anyone can observe: reaped by its parent's wait, or handed
+ * to the reaper (a thread that exited, a zombie whose parent did not wait).
+ * Only its memory is left to free, and that is the reaper's business -- it
+ * runs later, and under load much later.  Process listings and lookups do
+ * not show it: listed until the reaper got round to it, a child collected
+ * by waitpid() stayed visible as a zombie for seconds, and an orphan that
+ * init had long since reaped was "still there". */
+int sched_task_released(const task_t *t)
+{
+	return t && (t->reaped || t->on_dead_queue);
+}
+
 /* Close every open fd on `task`.  Extracted from sched_mark_task_exited so
  * the same code can be re-used by dead_thread_reap() when the exit-path
  * was entered from IRQ context and had to defer the close (see the
@@ -1306,7 +1318,33 @@ static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 	 * It must come AFTER the checks above: those diagnose a task that is
 	 * already queued somewhere, and repointing `on_cpu' first would hide
 	 * which queue that was. */
+	uint32_t prev_owner = task->on_cpu;
+
 	task->on_cpu = cpu_id;
+
+	/* Provenance, for rq_report_running_on_queue().  A handful of stores
+	 * and a TSC read; "was it running" is asked of the processor it was
+	 * recorded on and of this one only -- the two a task can be current
+	 * on here -- not of every processor, which on a hot path would be a
+	 * remote cache miss per CPU per enqueue. */
+	{
+		percpu_t *po = percpu_get(prev_owner);
+
+		task->sched_enq_site =
+			(uint64_t)(uintptr_t)__builtin_return_address(0);
+		task->sched_enq_wake_site = task->sched_wake_site;
+		task->sched_wake_site = 0;
+		task->sched_enq_tsc = timer_rdtsc();
+		task->sched_enq_cpu = (int32_t)cpu_id;
+		task->sched_enq_state = (uint8_t)task->state;
+		task->sched_enq_sp_zero = task->sp == 0;
+		if (po && po->current_task == task)
+			task->sched_enq_running_on = (int32_t)prev_owner;
+		else if (cpu->current_task == task)
+			task->sched_enq_running_on = (int32_t)cpu_id;
+		else
+			task->sched_enq_running_on = -1;
+	}
 
 	task->on_rq = true;
 	/* Placement: a task that has been off the processor comes back with
@@ -1385,6 +1423,53 @@ static task_t *rq_dequeue_locked(percpu_t *cpu)
  * silent version never gave anyone.
  */
 #define SCHED_SP0_REFUSAL_WARN 1000u
+
+/* A task that is RUNNING was found on `cpu''s run queue, which nothing may
+ * do: something queued it while it was executing.  Print what identifies
+ * that enqueue -- who made it, from where, on which CPU and when, what the
+ * task was doing then -- and where the task really is now.  Called with
+ * `cpu''s run-queue lock held; printing from here is safe (a print with
+ * interrupts off defers its console wake).  The first 16 in full, then
+ * every 1000th. */
+static void rq_report_running_on_queue(percpu_t *cpu, task_t *t)
+{
+	static int reports;
+	int n = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED);
+	uint64_t now, per_us;
+	int running_on = -1;
+	uint32_t ncpus = smp_get_cpu_count();
+
+	if (n >= 16 && (n % 1000) != 0)
+		return;
+	now = timer_rdtsc();
+	per_us = lapic_get_tsc_freq() / 1000000;
+	if (per_us == 0)
+		per_us = 1;
+	for (uint32_t i = 0; i < ncpus && i < MAX_CPUS; i++) {
+		percpu_t *p = percpu_get(i);
+
+		if (p && p->current_task == t) {
+			running_on = (int)i;
+			break;
+		}
+	}
+	kprintf("BUG: running task on a run queue (report %d): pid %d tgid %d '%s', dequeued by cpu %u; recorded on_cpu %u, current on cpu %d; state %d sp %s need_resched %d affinity %llx exiting %d\n",
+		n + 1, t->id, t->tgid, t->comm, cpu->cpu_id, t->on_cpu,
+		running_on, (int)t->state, t->sp ? "saved" : "0",
+		t->need_resched, (unsigned long long)t->cpu_affinity,
+		(int)t->has_exited);
+	kprintf("  enqueued %llu us ago onto cpu %d by %llx, woken via %llx; its state then %d, stack %s, current on cpu %d at that moment (-1: not on its recorded cpu or this one)\n",
+		(unsigned long long)((now - t->sched_enq_tsc) / per_us),
+		t->sched_enq_cpu, (unsigned long long)t->sched_enq_site,
+		(unsigned long long)t->sched_enq_wake_site,
+		(int)t->sched_enq_state,
+		t->sched_enq_sp_zero ? "in use" : "saved",
+		t->sched_enq_running_on);
+	kprintf("  last dispatched %llu us ago on cpu %d; last switched out %llu us ago\n",
+		(unsigned long long)((now - t->sched_run_tsc) / per_us),
+		t->sched_run_cpu,
+		(unsigned long long)((now - t->sched_off_tsc) / per_us));
+}
 
 static void rq_note_sp0_refusal(task_t *task)
 {
@@ -1501,12 +1586,54 @@ static void rq_remove(task_t *task)
 	 * dequeue finished after our first check).  Nothing to unlink. */
 }
 
+/* Does `t''s affinity mask bar it from processor `cpu'?  (0 = all allowed.) */
+static inline int sched_cpu_excluded(const task_t *t, uint32_t cpu)
+{
+	return t->cpu_affinity && !(t->cpu_affinity & (1ULL << cpu));
+}
+
+/* The least loaded processor `t' may run on, other than `not_cpu', or NULL.
+ * Queue lengths are read unlocked: a stale one costs a worse placement. */
+static percpu_t *sched_allowed_cpu(const task_t *t, uint32_t not_cpu,
+				   uint32_t *cpu_out)
+{
+	uint32_t ncpus = smp_get_cpu_count();
+	percpu_t *best = NULL;
+
+	for (uint32_t i = 0; i < ncpus && i < 64; i++) {
+		percpu_t *p;
+
+		if (i == not_cpu || sched_cpu_excluded(t, i))
+			continue;
+		p = percpu_get(i);
+		if (!p || !p->idle_task)
+			continue;
+		if (!best || p->runqueue_length < best->runqueue_length) {
+			best = p;
+			*cpu_out = i;
+		}
+	}
+	return best;
+}
+
+/* A task running where its affinity no longer allows it must leave at its
+ * next switch, even with nothing else to run here: the idle task takes the
+ * processor and rq_requeue_current_locked() hands the task on.  Not a task
+ * inside its exit path -- that one is finished where it is. */
+static inline int sched_must_leave(const task_t *t, uint32_t cpu)
+{
+	return sched_cpu_excluded(t, cpu) && !t->in_exit_path &&
+	       !t->in_exit_teardown && !is_idle_task(t);
+}
+
 // Enqueue a READY task to its assigned CPU's run queue.
 // If the target CPU is remote, send a reschedule IPI.
 void sched_enqueue_ready(task_t *task)
 {
 	if (!task || is_idle_task(task))
 		return;
+	/* Who asked: recorded with the enqueue (rq_enqueue_locked). */
+	task->sched_wake_site = (uint64_t)(uintptr_t)__builtin_return_address(0);
 
 	/* THE OWNERSHIP RULE, which everything below exists to obey:
 	 *
@@ -1591,8 +1718,12 @@ void sched_enqueue_ready(task_t *task)
 			task_t *src_cur = owner->current_task;
 			int src_busy = owner->runqueue_length > 0 ||
 				       (src_cur && !is_idle_task(src_cur));
+			/* Its affinity bars it from where it last ran (the
+			 * mask changed while it slept): it has to go, busy
+			 * or not. */
+			int barred = sched_cpu_excluded(task, owner_cpu);
 
-			if (src_busy) {
+			if (src_busy || barred) {
 				uint32_t ncpus = smp_get_cpu_count();
 
 				for (uint32_t i = 0; i < ncpus; i++) {
@@ -1615,6 +1746,18 @@ void sched_enqueue_ready(task_t *task)
 					dest_cpu = i;
 					dest = cand;
 					break;
+				}
+				if (barred && dest == owner) {
+					/* No free allowed processor: the
+					 * least loaded allowed one. */
+					uint32_t c = owner_cpu;
+					percpu_t *p = sched_allowed_cpu(
+						task, owner_cpu, &c);
+
+					if (p) {
+						dest_cpu = c;
+						dest = p;
+					}
 				}
 			}
 		}
@@ -1787,6 +1930,25 @@ static task_t *rq_requeue_current_locked(percpu_t *cpu, task_t *cur)
 		return NULL;
 
 	cur->state = TASK_READY;
+	if (cur->on_cpu == cpu->cpu_id && sched_must_leave(cur, cpu->cpu_id)) {
+		/* Its affinity bars it from this processor: hand it to one it
+		 * may use.  `on_cpu' may change here -- the lock it names is
+		 * held (see the ownership rule at sched_enqueue_ready) -- and
+		 * the vruntime moves from this queue's scale to that one's.
+		 * Its stack pointer is still 0 until the switch below saves
+		 * it, so the destination refuses it until then. */
+		uint32_t dest_cpu = cpu->cpu_id;
+		percpu_t *dest = sched_allowed_cpu(cur, cpu->cpu_id, &dest_cpu);
+
+		if (dest) {
+			cur->vruntime +=
+				__atomic_load_n(&dest->min_vruntime,
+						__ATOMIC_RELAXED) -
+				cpu->min_vruntime;
+			cur->on_cpu = dest_cpu;
+			return cur;
+		}
+	}
 	if (cur->on_cpu == cpu->cpu_id) {
 		rq_enqueue_locked(cpu, cur);
 		return NULL;
@@ -1853,6 +2015,10 @@ static void task_init_common(task_t *t)
 	t->wakeup_tick = 0;
 	t->fs_rdepth = 0;
 	t->fs_held = 0;
+	t->sleep_locks_held = 0;
+	t->user_fault_frame = NULL;
+	t->ptrace_stop_has_siginfo = 0;
+	t->ptrace_stop_is_group = 0;
 	t->need_resched = 0;
 	t->remaining_ticks = SCHED_TIME_SLICE;
 	t->vruntime = 0;
@@ -2261,6 +2427,23 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	 * the caller's address and not something from the switch itself. */
 	void *blocked_at = __builtin_return_address(0);
 
+	/* A thread whose process is in a trace stop, going to sleep in the
+	 * kernel: the sleep becomes its stop (task_ptrace_group_park_sleeping).
+	 * Before the run-queue lock -- it takes the task-list lock, which
+	 * nests outside it. */
+	{
+		task_t *me = sched_current();
+
+		/* The barrier pairs with the one where the mark is set
+		 * (task_ptrace_group_stop_siblings, sched_signal_task_from):
+		 * the state was published BEFORE this reads the mark. */
+		if (me && me->state == TASK_BLOCKED) {
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			if (me->ptrace_group_stop)
+				task_ptrace_group_park_sleeping(me);
+		}
+	}
+
 	uint64_t flags = local_irq_save();
 	percpu_t *cpu = this_cpu();
 	task_t *cur = cpu->current_task;
@@ -2326,9 +2509,19 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 		 * ever. */
 		if (!is_idle_task(next) &&
 		    (next->in_exit_teardown ||
-		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue)) &&
+		    /* Not one that is RUNNING: it has finished switching on
+		     * its own processor and is executing there, and it
+		     * queues itself again at its next switch.  Put back here
+		     * it was a running task on a run queue. */
+		    next->state != TASK_RUNNING) {
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
+		} else if (next->state == TASK_RUNNING) {
+			/* A running task was on this queue: an enqueue that
+			 * should not have happened.  Report where it came
+			 * from. */
+			rq_report_running_on_queue(cpu, next);
 		}
 		next = NULL;
 	}
@@ -2339,7 +2532,8 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	 * switching to it would leave this one queued behind a halt until the
 	 * next tick. */
 	if (!next) {
-		if (sched_prev_runnable(cur, 0)) {
+		if (sched_prev_runnable(cur, 0) &&
+		    !sched_must_leave(cur, cpu->cpu_id)) {
 			cur->state = TASK_RUNNING;
 			cur->remaining_ticks = SCHED_TIME_SLICE;
 			cur->need_resched = 0;
@@ -2373,6 +2567,11 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	task_t *prev = cur;
+
+	/* For rq_report_running_on_queue(). */
+	prev->sched_off_tsc = timer_rdtsc();
+	next->sched_run_tsc = prev->sched_off_tsc;
+	next->sched_run_cpu = (int32_t)cpu->cpu_id;
 
 	next->state = TASK_RUNNING;
 	next->remaining_ticks = SCHED_TIME_SLICE;
@@ -2572,9 +2771,19 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	    (next->state == TASK_ZOMBIE && !next->in_exit_path)) {
 		if (!is_idle_task(next) &&
 		    (next->in_exit_teardown ||
-		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue)) &&
+		    /* Not one that is RUNNING: it has finished switching on
+		     * its own processor and is executing there, and it
+		     * queues itself again at its next switch.  Put back here
+		     * it was a running task on a run queue. */
+		    next->state != TASK_RUNNING) {
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
+		} else if (next->state == TASK_RUNNING) {
+			/* A running task was on this queue: an enqueue that
+			 * should not have happened.  Report where it came
+			 * from. */
+			rq_report_running_on_queue(cpu, next);
 		}
 		next = cpu->idle_task;
 	}
@@ -2600,6 +2809,11 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	task_t *prev = cur;
+
+	/* For rq_report_running_on_queue(). */
+	prev->sched_off_tsc = timer_rdtsc();
+	next->sched_run_tsc = prev->sched_off_tsc;
+	next->sched_run_cpu = (int32_t)cpu->cpu_id;
 
 	if (prev->state == TASK_RUNNING)
 		prev->state = TASK_READY;
@@ -2691,9 +2905,13 @@ int sched_has_user_tasks(void)
 	uint64_t flags;
 	spin_lock_irqsave(&g_task_list_lock, &flags);
 	for (task_t *t = g_task_list_head; t; t = t->next) {
+		/* One read: a running task changes its state under us, and
+		 * three reads of it can match none of three live states. */
+		task_state_t st = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+
 		if (t->privilege == TASK_USER &&
-		    (t->state == TASK_READY || t->state == TASK_RUNNING ||
-		     t->state == TASK_BLOCKED) &&
+		    (st == TASK_READY || st == TASK_RUNNING ||
+		     st == TASK_BLOCKED) &&
 		    !t->has_exited && !is_idle_task(t)) {
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			return 1;
@@ -2995,6 +3213,22 @@ task_t *sched_find_next_task_by_id_locked(uint32_t min_id)
 	task_t *best = NULL;
 	for (task_t *t = g_task_list_head; t; t = t->next) {
 		if ((uint32_t)t->id < min_id)
+			continue;
+		if (!best || (uint32_t)t->id < (uint32_t)best->id)
+			best = t;
+	}
+	return best;
+}
+
+/* The same for processes as /proc lists them: the lowest thread-group leader
+ * at or past `min_id', the idle and bootstrap tasks left out.  One walk of the
+ * list whatever the threads in between.  Caller holds g_task_list_lock. */
+task_t *sched_find_next_process_by_id_locked(uint32_t min_id)
+{
+	task_t *best = NULL;
+	for (task_t *t = g_task_list_head; t; t = t->next) {
+		if ((uint32_t)t->id < min_id || t->tgid != t->id ||
+		    sched_task_hidden(t) || sched_task_released(t))
 			continue;
 		if (!best || (uint32_t)t->id < (uint32_t)best->id)
 			best = t;
@@ -3765,6 +3999,11 @@ task_t *sched_fork_current(void)
 	child->ptrace_stop_signo = 0;
 	child->ptrace_sig_delivery = 0;
 	child->ptrace_signal_injected = 0;
+	child->ptrace_stop_has_siginfo = 0;
+	child->ptrace_stop_is_group = 0;
+	child->ptrace_group_stop = 0;
+	child->user_fault_frame = NULL;
+	child->sleep_locks_held = 0;
 	child->ptrace_event = 0;
 	child->ptrace_msg = 0;
 	child->ptrace_exiting = 0;
@@ -4466,16 +4705,101 @@ bool task_traced_by_unprivileged(task_t *t)
  * some do it in the kernel and some in the debugger, and doing it in the
  * kernel is both simpler and race-free.
  *
- * The siblings are marked rather than parked from here: a task can only be
- * parked in its OWN context, at a point where it is safe to sleep.  The mark
- * is acted on at each one's next return to user (task_ptrace_group_park), and
- * they are woken so that they reach one promptly -- a thread blocked in a
- * read() would otherwise keep the process "running" for as long as its peer
- * stayed quiet.
+ * A sibling ASLEEP in the kernel is stopped where it sleeps: it is off its
+ * processor (or committed to leaving it), its registers are in the frame it
+ * entered the kernel with, and the claim that turns its sleep into a stop is
+ * the same compare-and-swap a waker uses, so the two cannot both win.  Its
+ * wait re-checks its condition when the stop ends, as after any wake.
+ *
+ * A sibling that is RUNNING, or runnable, is not touched: it is marked and
+ * stops itself, in its own context -- at its next return to user mode
+ * (task_ptrace_group_park), or, if it goes to sleep in the kernel first, at
+ * that sleep (task_ptrace_group_park_sleeping).  A running one is interrupted
+ * so that it gets there now.  Marking it stopped in place instead let it run
+ * on until its next switch with every observer believing it stopped: it
+ * could finish its syscall under a tracer reading its registers, or go to
+ * sleep and have the stop overwritten by its own blocked state -- and a later
+ * wake then ran it in the middle of the "stopped" process.
  *
  * Only the thread that hit the event carries a stop signal, so waitpid reports
  * the stop once rather than once per thread.
  */
+/* May a trace stop freeze this sleeping task where it sleeps?  Not while it
+ * holds a sleeping lock -- an mmap_lock, a filesystem lock, the disk I/O
+ * lock: it would keep it for as long as the stop lasts, and a tracer reading
+ * the binary, /proc or the tracee's memory waits on that lock while the
+ * tracee waits on the tracer.  Such a sleep is the uninterruptible kind; the
+ * task stops at its next return to user instead, once it has let go. */
+static inline int ptrace_may_freeze(const task_t *t)
+{
+	return !t->mm_rdepth && !t->fs_held && !t->sleep_locks_held;
+}
+
+/* Is the process tracing `t' its own parent (PTRACE_TRACEME, or a parent
+ * that attached)?  Tracers are recorded by their process -- the group
+ * leader's id. */
+static inline int ptrace_tracer_is_parent(const task_t *t)
+{
+	const task_t *p = t->parent;
+
+	if (!p)
+		return 0;
+	if (p->group_leader)
+		p = p->group_leader;
+	return t->tracer_pid != 0 && (int)p->id == t->tracer_pid;
+}
+
+/* sched_do_signal_stop: does this job-control stop become a trace stop? */
+static inline int current_traced_stop_allowed(task_t *t)
+{
+	return t->tracer_pid != 0 && !t->ptrace_exiting &&
+	       !sigismember_k(&t->signals.pending, SIGCONT);
+}
+
+/* Tell the tracer of a recorded trace stop of `t'.  CLD_TRAPPED is what
+ * distinguishes it from the job-control stop a shell would see.  No locks
+ * held. */
+static void ptrace_notify_tracer(task_t *tracer, task_t *t, int signo)
+{
+	siginfo_t ci;
+
+	mm_memset(&ci, 0, sizeof(ci));
+	ci.si_signo = SIGCHLD;
+	ci.si_code = CLD_TRAPPED;
+	ci.si_pid = t->id;
+	ci.si_status = signo;
+	signal_send(tracer, SIGCHLD, &ci);
+	sched_wake_wait_sleepers(tracer);
+}
+
+/* A sibling stopped where it is joins the trace stop.  Silently, with no
+ * event and no siginfo -- unless it owes a SIGSTOP report (attach or kill
+ * while it was running): then this stop IS that report, recorded here, and
+ * the tracer is returned for the caller to tell once the lock is dropped.
+ * Caller holds g_task_list_lock and has set TASK_STOPPED. */
+static task_t *ptrace_group_join_locked(task_t *w)
+{
+	task_t *tracer = NULL;
+
+	w->ptrace_stopped = 1;
+	w->ptrace_event = 0;
+	w->ptrace_msg = 0;
+	w->ptrace_stop_is_group = 0;
+	if (w->ptrace_group_stop == PTRACE_GSTOP_SIGSTOP &&
+	    (tracer = task_tracer_locked(w)) != NULL) {
+		w->ptrace_stop_signo = SIGSTOP;
+		mm_memcpy(&w->ptrace_siginfo, &w->ptrace_owed_siginfo,
+			  sizeof(w->ptrace_siginfo));
+		w->ptrace_stop_has_siginfo = 1;
+		tracer->ptrace_notify_seq++;
+	} else {
+		w->ptrace_stop_signo = 0;
+		w->ptrace_stop_has_siginfo = 0;
+	}
+	w->ptrace_group_stop = 0;
+	return tracer;
+}
+
 void task_ptrace_group_stop_siblings(task_t *t)
 {
 	task_t *leader;
@@ -4489,37 +4813,84 @@ void task_ptrace_group_stop_siblings(task_t *t)
 	if (!task_ptr_ok(leader))
 		return;
 
+	/* Under the task-list lock, like every other change to the trace
+	 * state: a register request, a resume and a thread parking itself all
+	 * decide under it, so each sees a sibling either before or after this,
+	 * never half-way. */
+	uint64_t flags;
+	task_t *notify = NULL, *notify_t = NULL;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
 	w = leader;
 	do {
 		if (w != t && !w->has_exited && w->privilege != TASK_KERNEL &&
 		    !w->ptrace_exiting && !w->ptrace_stopped) {
-			/* Stopped HERE, not asked to stop itself later.
-			 *
-			 * Marking a thread and waiting for it to park at its
-			 * next return to user does not work for the threads
-			 * that matter most: one blocked in futex_wait is woken,
-			 * finds no SIGNAL pending -- a group stop is not one --
-			 * and blocks again without ever reaching user mode.  It
-			 * never parks, so the debugger is told the process
-			 * stopped and then finds a live thread whose registers
-			 * it cannot read: "Couldn't get registers: No such
-			 * process" for a thread sitting plainly in the list.
-			 *
-			 * Stopping it in place is what SIGSTOP already does to
-			 * a task that is not the caller, a few lines above:
-			 * take it off its run queue and mark it stopped.  Its
-			 * registers are in the frame it entered the kernel
-			 * with, which is what PTRACE_GETREGS reads.
-			 *
-			 * ptrace_stop_signo stays 0: this thread has no event
-			 * of its own, so waitpid reports the stop once, for the
+			task_state_t asleep = TASK_BLOCKED;
+			task_t *tr = NULL;
+			/* The state is read ONCE and decided on.  A thread
+			 * that is running changes it under us without any
+			 * lock -- one spinning on sched_yield() flips READY
+			 * and RUNNING a million times a second -- so testing
+			 * "RUNNING or READY or BLOCKED" with three reads could
+			 * see READY when it asked for RUNNING and RUNNING when
+			 * it asked for READY, match none of them, and leave the
+			 * thread neither stopped nor marked: running on in a
+			 * process its tracer had been told was stopped, its
+			 * registers "No such process". */
+			task_state_t st =
+				__atomic_load_n(&w->state, __ATOMIC_ACQUIRE);
+
+			/* ptrace_stop_signo stays 0 throughout, unless the
+			 * thread owes a SIGSTOP report: it has no event of its
+			 * own, so waitpid reports the stop once, for the
 			 * thread that caused it. */
-			w->ptrace_group_stop = 0;
-			w->ptrace_stopped = 1;
-			w->ptrace_stop_signo = 0;
-			if (w->on_rq)
-				rq_remove(w);
-			w->state = TASK_STOPPED;
+			if (st == TASK_BLOCKED && ptrace_may_freeze(w) &&
+			    __atomic_compare_exchange_n(&w->state, &asleep,
+							TASK_STOPPED, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				/* Asleep in the kernel -- the thread blocked
+				 * in futex_wait that never reaches user mode
+				 * on its own: stopped where it sleeps. */
+				tr = ptrace_group_join_locked(w);
+			} else if (st == TASK_STOPPED) {
+				/* Already stopped by job control: off its
+				 * processor and going nowhere, so it joins
+				 * the trace stop as it stands. */
+				tr = ptrace_group_join_locked(w);
+			} else if (st != TASK_ZOMBIE) {
+				/* Running or runnable: it stops itself.  The
+				 * mark is published, with a full barrier,
+				 * BEFORE its state is looked at again: a
+				 * thread going to sleep publishes its state
+				 * and then reads the mark (sched_schedule), so
+				 * one of the two sees the other -- either it
+				 * parks itself, or the claim below finds it
+				 * asleep.  Either way it is not left asleep
+				 * with a mark it never read. */
+				int none = 0;
+
+				(void)__atomic_compare_exchange_n(
+					&w->ptrace_group_stop, &none,
+					PTRACE_GSTOP_SILENT, false,
+					__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+				asleep = TASK_BLOCKED;
+				if (ptrace_may_freeze(w) &&
+				    __atomic_compare_exchange_n(
+					    &w->state, &asleep, TASK_STOPPED,
+					    false, __ATOMIC_SEQ_CST,
+					    __ATOMIC_SEQ_CST))
+					tr = ptrace_group_join_locked(w);
+				else if (w->on_cpu != this_cpu_id())
+					/* Running, or about to: interrupt its
+					 * processor so it gets to a park point
+					 * now (harmless if it is not there). */
+					smp_send_reschedule(w->on_cpu);
+			}
+			if (tr && !notify) {
+				notify = tr;
+				notify_t = w;
+			}
 		}
 		w = w->thread_group_next;
 		if (!task_ptr_ok(w) || ++guard > TASK_GROUP_KILL_MAX * 4) {
@@ -4527,7 +4898,14 @@ void task_ptrace_group_stop_siblings(task_t *t)
 			break;
 		}
 	} while (w != leader);
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	/* A sibling that owed a SIGSTOP report made it by joining: tell the
+	 * tracer (once -- its waitpid scans every tracee it has). */
+	if (notify)
+		ptrace_notify_tracer(notify, notify_t, SIGSTOP);
 }
+
 
 /*
  * Release every thread of this task's process from a trace stop.
@@ -4553,15 +4931,23 @@ void task_ptrace_group_resume(task_t *t)
 	w = leader;
 	do {
 		if (w != t && !w->has_exited) {
-			w->ptrace_group_stop = 0;
+			/* The quiet mark ends with the stop; an owed SIGSTOP
+			 * report is still owed. */
+			if (w->ptrace_group_stop == PTRACE_GSTOP_SILENT)
+				w->ptrace_group_stop = 0;
 			if (w->ptrace_stopped && w->ptrace_stop_signo == 0) {
 				/* Parked silently by the group stop, so it has
 				 * no event of its own to collect: just let it
 				 * go.  A sibling holding a real event keeps it
 				 * -- the debugger has not been told yet. */
 				w->ptrace_stopped = 0;
-				if (sched_claim_wake(w, TASK_STOPPED))
+				if (sched_claim_wake(w, TASK_STOPPED)) {
+					/* As any waker: the sleep a stop was
+					 * claimed from is over. */
+					w->wait_channel = NULL;
+					w->wakeup_tick = 0;
 					sched_enqueue_ready(w);
+				}
 			}
 		}
 		w = w->thread_group_next;
@@ -4579,6 +4965,54 @@ void task_ptrace_group_resume(task_t *t)
  * parked safely.  Silent: no event is recorded, so the debugger's waitpid
  * still reports exactly one stop for the process -- the one that caused it.
  */
+/*
+ * The other place a marked thread stops itself: on its way to sleep in the
+ * kernel, before it reaches user mode -- the thread that was running a
+ * syscall when its process stopped and then blocks in it.  Its sleep becomes
+ * the stop, claimed from TASK_BLOCKED exactly as the group stop claims a
+ * sibling that was already asleep, and its wait re-checks its condition when
+ * the stop ends.  Called by sched_schedule() for the task going to sleep,
+ * which then switches away from it as from any task that cannot run.  A
+ * waker that claimed it first wins: it stays runnable and parks at its next
+ * return to user instead.
+ */
+static int task_ptrace_stop_common(task_t *t, int signo, int event,
+				   unsigned long msg, int other,
+				   const siginfo_t *si);
+
+void task_ptrace_group_park_sleeping(task_t *t)
+{
+	uint64_t flags;
+	task_state_t asleep = TASK_BLOCKED;
+
+	if (!t || !t->ptrace_group_stop || t->tracer_pid == 0 ||
+	    t->privilege == TASK_KERNEL || t->has_exited || t->ptrace_exiting)
+		return;
+
+	/* An owed SIGSTOP is a REPORTED stop: recorded and announced to the
+	 * tracer, claimed from this sleep. */
+	if (t->ptrace_group_stop == PTRACE_GSTOP_SIGSTOP) {
+		(void)task_ptrace_stop_common(t, SIGSTOP, 0, 0, 2, NULL);
+		return;
+	}
+
+	/* Not while it holds a sleeping lock: see ptrace_may_freeze. */
+	if (!ptrace_may_freeze(t))
+		return;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	if (t->ptrace_group_stop == PTRACE_GSTOP_SILENT && t->tracer_pid != 0 &&
+	    __atomic_compare_exchange_n(&t->state, &asleep, TASK_STOPPED, false,
+					__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		t->ptrace_group_stop = 0;
+		t->ptrace_stopped = 1;
+		t->ptrace_stop_signo = 0;
+		t->ptrace_stop_has_siginfo = 0;
+		t->ptrace_stop_is_group = 0;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+}
+
 void task_ptrace_group_park(task_t *t)
 {
 	uint64_t flags;
@@ -4586,14 +5020,23 @@ void task_ptrace_group_park(task_t *t)
 	if (!t || !t->ptrace_group_stop || t->tracer_pid == 0)
 		return;
 
+	/* Owed a SIGSTOP report (attach or kill while it ran): the stop the
+	 * tracer is waiting for, taken here in its own context. */
+	if (t->ptrace_group_stop == PTRACE_GSTOP_SIGSTOP) {
+		task_ptrace_stop(t, SIGSTOP, 0, 0);
+		return;
+	}
+
 	spin_lock_irqsave(&g_task_list_lock, &flags);
-	if (!t->ptrace_group_stop || t->tracer_pid == 0) {
+	if (t->ptrace_group_stop != PTRACE_GSTOP_SILENT || t->tracer_pid == 0) {
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
 		return;
 	}
 	t->ptrace_group_stop = 0;
 	t->ptrace_stopped = 1;
 	t->ptrace_stop_signo = 0; /* nothing to report: not this thread's event */
+	t->ptrace_stop_has_siginfo = 0;
+	t->ptrace_stop_is_group = 0;
 	if (t->on_rq)
 		rq_remove(t);
 	t->state = TASK_STOPPED;
@@ -4622,22 +5065,31 @@ int task_ptrace_signal_stop(task_t *t, int signo, const siginfo_t *info)
 	 * existed -- so without this flag the tracee would arrive here holding
 	 * the very signal its tracer just asked to deliver, stop to ask about
 	 * it, be told to deliver it again, and never get anywhere. */
-	if (t->ptrace_signal_injected) {
+	/* Only the signal that was injected: another one reaching this point
+	 * first still stops, and the mark waits for its own signal. */
+	if (t->ptrace_signal_injected && t->ptrace_signal_injected == signo) {
 		t->ptrace_signal_injected = 0;
 		return signo;
 	}
 
-	/* Recorded before parking, so a tracer that reads it the moment it is
-	 * told about the stop sees this signal's siginfo and not the previous
-	 * one's. */
-	if (info)
-		mm_memcpy(&t->ptrace_siginfo, info, sizeof(t->ptrace_siginfo));
+	/* Recorded with the stop, under its lock, so a tracer that reads it
+	 * the moment it is told about the stop sees this signal's siginfo and
+	 * not the previous one's. */
+	siginfo_t local;
+	const siginfo_t *si = info;
+
+	if (!si) {
+		mm_memset(&local, 0, sizeof(local));
+		local.si_signo = signo;
+		local.si_code = SI_KERNEL;
+		si = &local;
+	}
 
 	/* The process stops, not just this thread. */
 	task_ptrace_group_stop_siblings(t);
 
 	t->ptrace_sig_delivery = 1;
-	task_ptrace_stop(t, signo, 0, 0);
+	task_ptrace_stop_info(t, signo, 0, 0, si);
 	t->ptrace_sig_delivery = 0;
 
 
@@ -4648,20 +5100,74 @@ int task_ptrace_signal_stop(task_t *t, int signo, const siginfo_t *info)
 	return 0;
 }
 
+/* The stop itself.  `other' is 0 for the caller stopping itself, 1 for
+ * another task, 2 for the caller on its way to sleep (sched_schedule, which
+ * switches away afterwards).  For 1 and 2 the task is only stopped where it is
+ * if it is not running -- asleep, or already stopped -- and the claim on its
+ * state is the same compare-and-swap a waker uses.  Returns 0 when it was not
+ * stopped (untraced, or a task that is running or runnable and has to stop
+ * itself). */
+static int task_ptrace_stop_common(task_t *t, int signo, int event,
+				   unsigned long msg, int other,
+				   const siginfo_t *si);
+
+/* The siginfo a stop without one of its own reports, from the tracee
+ * itself: SIGTRAP, with the event in si_code the way waitpid() carries it
+ * in the status (signo | event << 8) -- except a syscall stop, which is
+ * plain SIGTRAP: the event it is reported with is this system's own, and
+ * si_code is not where a debugger looks for it. */
+static void ptrace_event_siginfo(task_t *t, int signo, int event)
+{
+	mm_memset(&t->ptrace_siginfo, 0, sizeof(t->ptrace_siginfo));
+	t->ptrace_siginfo.si_signo = SIGTRAP;
+	if (event == PTRACE_EVENT_SYSCALL_ENTRY ||
+	    event == PTRACE_EVENT_SYSCALL_EXIT)
+		t->ptrace_siginfo.si_code = SIGTRAP;
+	else
+		t->ptrace_siginfo.si_code = signo | (event << 8);
+	t->ptrace_siginfo.si_pid = t->id;
+	t->ptrace_siginfo.si_uid = t->cred.uid;
+}
+
 void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 {
+	(void)task_ptrace_stop_common(t, signo, event, msg, 0, NULL);
+}
+
+/* As task_ptrace_stop, reporting `si' for PTRACE_GETSIGINFO --
+ * PTRACE_STOP_NO_SIGINFO for a stop that has none (a group stop). */
+void task_ptrace_stop_info(task_t *t, int signo, int event, unsigned long msg,
+			   const siginfo_t *si)
+{
+	(void)task_ptrace_stop_common(t, signo, event, msg, 0, si);
+}
+
+/* Stop ANOTHER task for its tracer, if it can be stopped where it is: one
+ * asleep in the kernel, or already stopped.  Returns 0 -- and changes
+ * nothing -- for one that is running or runnable. */
+int task_ptrace_stop_other(task_t *t, int signo)
+{
+	return task_ptrace_stop_common(t, signo, 0, 0, 1, NULL);
+}
+
+static int task_ptrace_stop_common(task_t *t, int signo, int event,
+				   unsigned long msg, int other,
+				   const siginfo_t *si)
+{
+	int kept = 0;
+
 	uint64_t flags;
 	task_t *tracer_proc = NULL;
 
 	if (!t)
-		return;
+		return 0;
 
 	/* Once the exit event has been reported this task is on its way out and
 	 * has nothing left to stop for -- see ptrace_exiting in struct task.
 	 * The exit event itself is what sets the flag, so it is the one event
 	 * allowed through. */
 	if (t->ptrace_exiting && event != PTRACE_EVENT_EXIT)
-		return;
+		return 0;
 
 	/* Interrupts stay off from before the park until the tracer has been
 	 * woken.  The park below runs under the task-list lock, but the
@@ -4684,6 +5190,36 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 	spin_lock_irqsave(&g_task_list_lock, &flags);
 	{
 		task_t *tracer = task_tracer_locked(t);
+		task_state_t asleep = TASK_BLOCKED;
+		/* This stop pays an owed SIGSTOP report. */
+		int owed = t->ptrace_group_stop == PTRACE_GSTOP_SIGSTOP &&
+			   signo == SIGSTOP && event == 0;
+
+		/* Modes 1 and 2 take an owed SIGSTOP and nothing else, and
+		 * only once: decided here, under the lock every other payer
+		 * takes, so two of them cannot both record it.  A task is
+		 * stopped this way only if it is not running -- claimed from a
+		 * sleep it may be frozen in (mode 2: its own, which it must
+		 * win), or already stopped by job control (mode 1).  One that
+		 * is in a trace stop already keeps the SIGSTOP owed: it is
+		 * reported when that stop ends, as a queued signal would be.
+		 * Anything else stops itself (see the callers). */
+		if (tracer && other) {
+			if (!owed) {
+				tracer = NULL;
+			} else if (t->ptrace_stopped) {
+				tracer = NULL;
+				kept = 1;
+			} else if (!ptrace_may_freeze(t)) {
+				tracer = NULL;
+			} else if ((other == 2 || t->state != TASK_STOPPED) &&
+				   !__atomic_compare_exchange_n(
+					   &t->state, &asleep, TASK_STOPPED,
+					   false, __ATOMIC_ACQ_REL,
+					   __ATOMIC_ACQUIRE)) {
+				tracer = NULL;
+			}
+		}
 		if (tracer) {
 			/* Recorded before the task is parked so a tracer that
 			 * is deciding whether to sleep right now either sees
@@ -4696,6 +5232,40 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 			t->ptrace_event = event;
 			t->ptrace_msg = msg;
 			t->ptrace_stopped = 1;
+
+			/* A job-control stop of a traced task (the caller
+			 * passes no siginfo for those, and nothing else does). */
+			t->ptrace_stop_is_group =
+				!owed && si == PTRACE_STOP_NO_SIGINFO;
+
+			/* What PTRACE_GETSIGINFO reports for this stop. */
+			if (owed) {
+				mm_memcpy(&t->ptrace_siginfo,
+					  &t->ptrace_owed_siginfo,
+					  sizeof(t->ptrace_siginfo));
+				t->ptrace_stop_has_siginfo = 1;
+			} else if (si == PTRACE_STOP_NO_SIGINFO) {
+				t->ptrace_stop_has_siginfo = 0;
+			} else if (si) {
+				mm_memcpy(&t->ptrace_siginfo, si,
+					  sizeof(t->ptrace_siginfo));
+				t->ptrace_stop_has_siginfo = 1;
+			} else {
+				ptrace_event_siginfo(t, signo, event);
+				t->ptrace_stop_has_siginfo = 1;
+			}
+
+			/* A thread asked to stop with its process that stops
+			 * for an event of its own first has done what was
+			 * asked: left set, the mark said it was still on its
+			 * way, and every request on it waited for a park that
+			 * had already happened.  An owed SIGSTOP report is
+			 * different: only the stop that pays it clears it --
+			 * the tracer that attached is waiting for exactly that
+			 * one, and gets it after this stop, as a queued signal
+			 * would be reported after the event that came first. */
+			if (owed || t->ptrace_group_stop == PTRACE_GSTOP_SILENT)
+				t->ptrace_group_stop = 0;
 
 			/* Parked HERE, in the same breath as the event that
 			 * announces it, and not after the tracer has been told.
@@ -4738,9 +5308,10 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 
 	if (!tracer_proc) {
 		/* Untraced, or the tracer vanished between the caller's check
-		 * and here.  Nothing to stop for. */
+		 * and here, or a task that is running, or nothing owed.
+		 * Nothing stopped -- unless it was in a trace stop already. */
 		local_irq_restore(irqf);
-		return;
+		return kept;
 	}
 
 	/* Every trace stop stops the process, not just this thread -- a
@@ -4750,18 +5321,8 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 	task_ptrace_group_stop_siblings(t);
 
 
-	/* Tell the tracer.  CLD_TRAPPED is what distinguishes this from the
-	 * job-control stop a shell would see. */
-	{
-		siginfo_t ci;
-		mm_memset(&ci, 0, sizeof(ci));
-		ci.si_signo = SIGCHLD;
-		ci.si_code = CLD_TRAPPED;
-		ci.si_pid = t->id;
-		ci.si_status = signo;
-		signal_send(tracer_proc, SIGCHLD, &ci);
-	}
-	sched_wake_wait_sleepers(tracer_proc);
+	/* Tell the tracer. */
+	ptrace_notify_tracer(tracer_proc, t, signo);
 
 	/* Announced -- from here a preemption parks the task no worse than the
 	 * yield below would. */
@@ -4774,13 +5335,15 @@ void task_ptrace_stop(task_t *t, int signo, int event, unsigned long msg)
 	 * to give up the CPU; a resume that arrived while the notifications
 	 * above were running has already claimed this task and put it back on a
 	 * run queue, so it simply gets picked up again. */
-	if (t == sched_current())
+	if (other != 2 && t == sched_current())
 		sched_schedule();
+	return 1;
 }
 
 void task_ptrace_detach(task_t *t)
 {
 	bool resume = false;
+	bool owed = false;
 
 	if (!t)
 		return;
@@ -4795,6 +5358,17 @@ void task_ptrace_detach(task_t *t)
 		t->ptrace_in_syscall = 0;
 		t->ptrace_event = 0;
 		t->ptrace_msg = 0;
+		/* A stop asked of it by a group stop that it never reached is
+		 * void with the tracer gone; left set, a later attach would
+		 * park it silently in place of the stop that attach reports.
+		 * The same for a signal the tracer injected. */
+		/* An owed SIGSTOP report stood for a SIGSTOP that was sent;
+		 * with nobody left to report it to it is that signal again --
+		 * an attach's stop not yet taken stays pending past a detach,
+		 * as it does on every system with this interface. */
+		owed = t->ptrace_group_stop == PTRACE_GSTOP_SIGSTOP;
+		t->ptrace_group_stop = 0;
+		t->ptrace_signal_injected = 0;
 		if (t->ptrace_stopped) {
 			t->ptrace_stopped = 0;
 			t->ptrace_stop_signo = 0;
@@ -4808,6 +5382,8 @@ void task_ptrace_detach(task_t *t)
 	 * never run again and that no shell knows to continue. */
 	if (resume && sched_claim_wake(t, TASK_STOPPED))
 		sched_enqueue_ready(t);
+	if (owed)
+		sched_signal_task(t, SIGSTOP); /* untraced now: job control */
 
 	/* And the REST of its process, unconditionally.
 	 *
@@ -4822,7 +5398,17 @@ void task_ptrace_detach(task_t *t)
 	 * Done whether or not THIS thread was the one parked, because it is the
 	 * group's state that matters and the caller may have detached from any
 	 * member of it. */
-	task_ptrace_group_resume(t);
+	/* Under the task-list lock, like the resume a PTRACE_CONT does
+	 * (ptrace_resume): a sibling parking itself decides under it, so it
+	 * either is parked already and is released here, or sees its mark
+	 * cleared and never parks -- not marked, missed, then parked. */
+	{
+		uint64_t gflags;
+
+		spin_lock_irqsave(&g_task_list_lock, &gflags);
+		task_ptrace_group_resume(t);
+		spin_unlock_irqrestore(&g_task_list_lock, gflags);
+	}
 }
 
 /*
@@ -5102,6 +5688,10 @@ void sched_mark_task_exited(task_t *task, int status)
 		return; // Another CPU already started exit processing
 	}
 
+	/* A stop asked of it (with its process, or an owed SIGSTOP report)
+	 * will never be taken now: an exiting thread parks nowhere. */
+	task->ptrace_group_stop = 0;
+
 	task->exit_code = status;
 
 	/* POSIX hangup: when a session leader with a controlling terminal
@@ -5220,8 +5810,7 @@ void sched_mark_task_exited(task_t *task, int status)
 	 * reaches any code that would call it.
 	 *
 	 * Collected under the lock and detached outside it: task_ptrace_detach
-	 * takes the same lock, and it also enqueues, which must not happen with
-	 * the task list held. */
+	 * takes the same lock. */
 	if (task->privilege == TASK_USER) {
 		task_t *tracees[TASK_GROUP_KILL_MAX];
 		int nt = 0;
@@ -5427,6 +6016,24 @@ void sched_do_signal_stop(task_t *t, int signo)
 	if (!t)
 		return;
 
+	/* The parent's job-control notification is made below for an untraced
+	 * task, and for a traced one only if its tracer is someone else: a
+	 * parent that is also the tracer is told by the trace stop, and was
+	 * shown the one stop twice. */
+	if (current_traced_stop_allowed(t) && !ptrace_tracer_is_parent(t))
+		signal_notify_jobctl(t, signo, 1);
+
+	/* A traced task's job-control stop is a stop its TRACER is told
+	 * about and releases -- a group stop, with no siginfo (GETSIGINFO
+	 * answers EINVAL, which is how a tracer tells it from a signal stop)
+	 * -- and the whole process stops with it.  As a plain job-control
+	 * stop the tracer never heard of it, and a thread asked to join a
+	 * trace stop of its process parked in it instead and was waited for
+	 * in vain.  A continue already pending cancels it, as below. */
+	if (current_traced_stop_allowed(t)) {
+		task_ptrace_stop_info(t, signo, 0, 0, PTRACE_STOP_NO_SIGINFO);
+		return;
+	}
 	signal_notify_jobctl(t, signo, 1);
 
 	uint64_t irqf = local_irq_save();
@@ -5441,6 +6048,7 @@ void sched_do_signal_stop(task_t *t, int signo)
 		signal_notify_jobctl(t, SIGCONT, 0);
 		return;
 	}
+
 	local_irq_restore(irqf);
 
 	/* Giving up the CPU is not optional: returning through the delivery
@@ -5491,6 +6099,41 @@ void sched_do_signal_stop(task_t *t, int signo)
  * running on so it reaches its return-to-user quickly.  A signal the target
  * has blocked does not wake it -- signal_send() decides that -- and it stops
  * when it unblocks the signal, which is the conventional behaviour. */
+/* SIGKILL ends any stop, a trace stop included -- and a thread released
+ * from a trace stop is no longer in one.  Claimed and marked under the lock
+ * trace stops are recorded under: left marked, it ran to its exit with
+ * every tracer request treating it as stopped. */
+static int sched_kill_claim_stopped(task_t *task)
+{
+	uint64_t lf;
+	int woke;
+
+	spin_lock_irqsave(&g_task_list_lock, &lf);
+	woke = sched_claim_wake(task, TASK_STOPPED);
+	if (woke) {
+		task->ptrace_stopped = 0;
+		task->ptrace_stop_signo = 0;
+		task->ptrace_stop_is_group = 0;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, lf);
+	return woke;
+}
+
+/* Any other signal wakes a stopped task only out of a job-control stop: a
+ * trace stop is the tracer's to end, and the signal waits, pending, until
+ * it does -- then it is reported like any other.  Woken here instead, the
+ * tracee ran on while its tracer believed it stopped. */
+static int sched_claim_stopped_not_traced(task_t *task)
+{
+	uint64_t lf;
+	int woke;
+
+	spin_lock_irqsave(&g_task_list_lock, &lf);
+	woke = !task->ptrace_stopped && sched_claim_wake(task, TASK_STOPPED);
+	spin_unlock_irqrestore(&g_task_list_lock, lf);
+	return woke;
+}
+
 static void sched_signal_stop_request(task_t *task, int sig, siginfo_t *info)
 {
 	signal_send(task, sig, info);
@@ -5594,7 +6237,7 @@ void sched_signal_task_from(task_t *task, int sig, task_t *sender)
 		 * re-wakes it while blocked, and it exits at its own next
 		 * delivery point with all locks released. */
 		if (sched_claim_wake(task, TASK_BLOCKED) ||
-		    sched_claim_wake(task, TASK_STOPPED)) {
+		    sched_kill_claim_stopped(task)) {
 			sched_enqueue_ready(task);
 		} else if (task->state == TASK_READY) {
 			/* READY but not on a CPU right now.  Unlike a BLOCKED
@@ -5655,16 +6298,82 @@ void sched_signal_task_from(task_t *task, int sig, task_t *sender)
 		 * Routing an attach's SIGSTOP into the job-control path instead
 		 * would leave the tracer waiting for an event that was handed
 		 * to somebody else. */
-		if (task->tracer_pid != 0) {
-			task_ptrace_stop(task, SIGSTOP, 0, 0);
+		if (task->tracer_pid != 0 &&
+		    task->ptrace_signal_injected == SIGSTOP) {
+			/* The tracer passing a SIGSTOP on (PTRACE_CONT with
+			 * it): that is the signal delivered, a job-control
+			 * stop -- reported to the tracer as a group stop
+			 * (sched_do_signal_stop).  Taken as a trace stop again
+			 * instead, the tracee never stopped and the tracer was
+			 * shown the same SIGSTOP for ever. */
+			sched_signal_stop_request(task, sig, &info);
 			return;
+		}
+		if (task->tracer_pid != 0) {
+			if (task == sched_current()) {
+				task_ptrace_stop_info(task, SIGSTOP, 0, 0, &info);
+				return;
+			}
+			/* Another task -- PTRACE_ATTACH's stop, or a kill().
+			 * A task that is running, or about to, is not parked
+			 * from here: it would run on in the "stopped" state
+			 * until its next switch.  It is told it owes a SIGSTOP
+			 * stop and takes it itself -- at its next return to
+			 * user mode, or at its next sleep, which becomes the
+			 * stop with nothing interrupted (a queued SIGSTOP would
+			 * have cut that sleep short with EINTR).  An interrupt
+			 * gets a running one there now.
+			 *
+			 * The mark first, with a full barrier, then the claim:
+			 * paired with sched_schedule()'s, so a task going to
+			 * sleep meanwhile is either claimed here or parks
+			 * itself (see task_ptrace_group_stop_siblings). */
+			uint64_t lf;
+			int traced;
+
+			/* Owed only while it is traced: under the lock a
+			 * detach takes, so a detach either comes first (and
+			 * this is an ordinary SIGSTOP below) or finds the owed
+			 * stop and turns it back into the signal it stood for
+			 * (task_ptrace_detach). */
+			spin_lock_irqsave(&g_task_list_lock, &lf);
+			traced = task->tracer_pid != 0;
+			if (traced) {
+				mm_memcpy(&task->ptrace_owed_siginfo, &info,
+					  sizeof(info));
+				__atomic_store_n(&task->ptrace_group_stop,
+						 PTRACE_GSTOP_SIGSTOP,
+						 __ATOMIC_SEQ_CST);
+			}
+			spin_unlock_irqrestore(&g_task_list_lock, lf);
+			if (traced) {
+				if (task_ptrace_stop_other(task, SIGSTOP))
+					return; /* stopped now, or owed */
+				if (g_smp_initialized &&
+				    task->state == TASK_RUNNING &&
+				    task->on_cpu != this_cpu_id())
+					smp_send_reschedule(task->on_cpu);
+				return;
+			}
 		}
 		sched_signal_stop_request(task, sig, &info);
 		return;
 	}
 
 	if (sig == SIGCONT) {
-		if (sched_claim_wake(task, TASK_STOPPED)) {
+		/* A continue ends a job-control stop, never a trace stop: the
+		 * tracer releases those.  Decided under the lock trace stops
+		 * are recorded under, so a stop entered at this moment is seen
+		 * as one -- released by SIGCONT, a traced thread ran on with
+		 * its tracer believing it stopped. */
+		uint64_t lf;
+		int resumed;
+
+		spin_lock_irqsave(&g_task_list_lock, &lf);
+		resumed = !task->ptrace_stopped &&
+			  sched_claim_wake(task, TASK_STOPPED);
+		spin_unlock_irqrestore(&g_task_list_lock, lf);
+		if (resumed) {
 			sched_enqueue_ready(task);
 			signal_notify_jobctl(task, sig, 0);
 		}
@@ -5752,7 +6461,7 @@ void sched_signal_task_from(task_t *task, int sig, task_t *sender)
 		 * (syscall exit / IRQ return).  The timer sweep re-wakes
 		 * BLOCKED tasks with pending signals until that happens. */
 		if (sched_claim_wake(task, TASK_BLOCKED) ||
-		    sched_claim_wake(task, TASK_STOPPED)) {
+		    sched_claim_stopped_not_traced(task)) {
 			sched_enqueue_ready(task);
 		} else if (task->state == TASK_READY) {
 			/* READY: holds no sleeping-context kernel locks, so
@@ -5785,7 +6494,7 @@ void sched_signal_task_from(task_t *task, int sig, task_t *sender)
 	case SIG_DFL_IGN:
 		break;
 	case SIG_DFL_CONT:
-		if (sched_claim_wake(task, TASK_STOPPED))
+		if (sched_claim_stopped_not_traced(task))
 			sched_enqueue_ready(task);
 		break;
 	}
@@ -6273,9 +6982,19 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 		     (next->state == TASK_ZOMBIE && !next->in_exit_path))) {
 		if (!is_idle_task(next) &&
 		    (next->in_exit_teardown ||
-		     (next->state != TASK_ZOMBIE && !next->on_dead_queue))) {
+		     (next->state != TASK_ZOMBIE && !next->on_dead_queue)) &&
+		    /* Not one that is RUNNING: it has finished switching on
+		     * its own processor and is executing there, and it
+		     * queues itself again at its next switch.  Put back here
+		     * it was a running task on a run queue. */
+		    next->state != TASK_RUNNING) {
 			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
+		} else if (next->state == TASK_RUNNING) {
+			/* A running task was on this queue: an enqueue that
+			 * should not have happened.  Report where it came
+			 * from. */
+			rq_report_running_on_queue(cpu, next);
 		}
 		next = NULL;
 	}
@@ -6285,7 +7004,8 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	 * way to the scheduler, which it then reaches by itself.  The idle task
 	 * runs only when nothing else can. */
 	if (!next) {
-		if (sched_prev_runnable(cur, 1)) {
+		if (sched_prev_runnable(cur, 1) &&
+		    !sched_must_leave(cur, cpu->cpu_id)) {
 			if (cur->state == TASK_READY)
 				cur->state = TASK_RUNNING;
 			cur->remaining_ticks = SCHED_TIME_SLICE;
@@ -6348,8 +7068,21 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	next->remaining_ticks = SCHED_TIME_SLICE;
+	/* A request for a switch is about the task that was running when it
+	 * was made.  A task that asked for one on its way to sleep (a local
+	 * wake, then blocking) still carries it; resumed here with it, it
+	 * lost the processor at the very next interrupt, and every wakeup
+	 * aimed at it meanwhile counted it as due off (sched_wakeup_preempts)
+	 * and interrupted it again.  sched_schedule() and sched_run_ready()
+	 * clear it for the task they switch to; so does this. */
+	next->need_resched = 0;
 
 	task_t *prev = cur;
+
+	/* For rq_report_running_on_queue(). */
+	prev->sched_off_tsc = timer_rdtsc();
+	next->sched_run_tsc = prev->sched_off_tsc;
+	next->sched_run_cpu = (int32_t)cpu->cpu_id;
 
 	if (prev->state == TASK_RUNNING)
 		prev->state = TASK_READY;
@@ -6665,9 +7398,24 @@ void sched_load_balance(void)
 		bool affinity_ok = (t->cpu_affinity == 0) ||
 				   (t->cpu_affinity & (1ULL << my_cpu));
 
+		/* Never one still on its processor.  READY does not mean off
+		 * the CPU: a task woken while it is still on its processor --
+		 * between publishing a sleep and switching away -- is queued
+		 * there READY and is found again by the switch it is in the
+		 * middle of (sched_enqueue_ready).  Stolen from that queue it
+		 * was handed to this processor while still running on the
+		 * other one: its owner rewritten under it, a running task on
+		 * a foreign run queue, refused and requeued there until its
+		 * own processor set it RUNNING -- the "running task on a run
+		 * queue" report.  Current on the source, or its stack still in
+		 * use (sp == 0: running, or still switching off it), it stays
+		 * where it is. */
+		bool on_its_cpu = src->current_task == t ||
+				  __atomic_load_n(&t->sp, __ATOMIC_ACQUIRE) == 0;
+
 		if (!is_idle_task(t) && !is_bootstrap_task(t) &&
 		    t->privilege == TASK_USER && t->state == TASK_READY &&
-		    affinity_ok) {
+		    affinity_ok && !on_its_cpu) {
 			migrate = t;
 			break;
 		}

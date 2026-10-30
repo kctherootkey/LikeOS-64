@@ -485,7 +485,7 @@ ipi_vector_%1:
 %endmacro
 
 ; IPI vector stubs
-IPI_STUB 0xFC           ; TLB shootdown
+IPI_STUB 0xFC           ; Reschedule
 IPI_STUB 0xFD           ; Halt CPU
-IPI_STUB 0xFE           ; Reschedule
+IPI_STUB 0xFE           ; TLB shootdown
 IPI_STUB 0xFF           ; LAPIC spurious interrupt

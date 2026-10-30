@@ -680,6 +680,7 @@ void icache_io_lock(ic_inode_t *inode)
 		spin_lock_irqsave(&inode->io_wait_lock, &flags);
 		if (!inode->io_locked) {
 			inode->io_locked = 1;
+			task_sleep_lock_taken();
 			spin_unlock_irqrestore(&inode->io_wait_lock, flags);
 			return;
 		}
@@ -699,6 +700,8 @@ void icache_io_unlock(ic_inode_t *inode)
 		return;
 	uint64_t flags;
 	spin_lock_irqsave(&inode->io_wait_lock, &flags);
+	if (inode->io_locked)
+		task_sleep_lock_dropped();
 	inode->io_locked = 0;
 	spin_unlock_irqrestore(&inode->io_wait_lock, flags);
 	sched_wake_channel(&inode->io_locked);

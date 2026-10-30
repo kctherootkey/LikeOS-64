@@ -828,6 +828,13 @@ int signal_dequeue_wanted(task_t *task, const kernel_sigset_t *want,
 				kfree(ps);
 			}
 		}
+		/* Taken by a signalfd or sigwaitinfo() instead of being
+		 * delivered: a tracer's mark on it ("let this one through
+		 * its delivery stop") has nothing left to apply to, and left
+		 * set it would wave the next signal of this number past its
+		 * stop. */
+		if (task->ptrace_signal_injected == s)
+			task->ptrace_signal_injected = 0;
 		return s;
 	}
 	return 0;

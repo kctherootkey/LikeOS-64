@@ -214,8 +214,9 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 	__asm__ volatile("mov %0, %%cr3" : : "r"(virt_to_phys(pml4)));
 
 	// TLB shootdown: threads sharing this address space (CLONE_VM) may be running
-	// on other CPUs with stale TLB entries. Broadcast invalidation to all CPUs.
-	smp_tlb_shootdown_sync();
+	// on other CPUs with stale TLB entries.  Only those CPUs can be: wait
+	// for them, not for every CPU of the machine.
+	smp_tlb_shootdown_mm_sync(virt_to_phys(pml4));
 
 	return 0;
 }

@@ -442,6 +442,13 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * in-progress syscall. */
 	child->syscall_frame = NULL;
 	child->syscall_regs_valid = 0;
+	/* Same for the fault frame, and nothing the parent holds is the
+	 * child's: fork runs with the parent's mmap_lock held for writing. */
+	child->user_fault_frame = NULL;
+	child->sleep_locks_held = 0;
+	child->ptrace_stop_has_siginfo = 0;
+	child->ptrace_stop_is_group = 0;
+	child->ptrace_group_stop = 0;
 
 	/* vfork state, per child: cleared for every kind of clone -- the copy
 	 * duplicated the creator's, and a child of a vfork child must not

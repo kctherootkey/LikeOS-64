@@ -85,6 +85,7 @@ static void svga_mutex_lock(svga_mutex_t *m)
 		spin_lock_irqsave(&m->lock, &f);
 		if (!m->owner) {
 			m->owner = cur ? cur : SVGA_MUTEX_BOOT_OWNER;
+			task_sleep_lock_taken();
 			spin_unlock_irqrestore(&m->lock, f);
 			return;
 		}
@@ -119,6 +120,8 @@ static void svga_mutex_unlock(svga_mutex_t *m)
 	spin_lock_irqsave(&m->lock, &f);
 	WARN_ON_ONCE(m->owner != (cur ? cur : SVGA_MUTEX_BOOT_OWNER) &&
 		     m->owner != SVGA_MUTEX_BOOT_OWNER);
+	if (m->owner == cur && cur)
+		task_sleep_lock_dropped();
 	m->owner = NULL;
 	wake = m->waiters;
 	spin_unlock_irqrestore(&m->lock, f);

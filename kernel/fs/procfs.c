@@ -27,8 +27,6 @@
 
 static struct pfs g_procfs;
 
-extern int g_next_id;
-
 static int parse_pid(const char *s, int *out)
 {
 	int v = 0;
@@ -59,7 +57,8 @@ static task_t *proc_task(int pid)
 
 	spin_lock_irqsave(&g_task_list_lock, &fl);
 	t = sched_find_task_by_id_locked((uint32_t)pid);
-	if (t && (sched_task_hidden(t) || !sched_task_pin(t)))
+	if (t && (sched_task_hidden(t) || sched_task_released(t) ||
+		  !sched_task_pin(t)))
 		t = NULL;
 	spin_unlock_irqrestore(&g_task_list_lock, fl);
 	return t;
@@ -480,23 +479,22 @@ static void fd_target(task_t *t, int fd, char *out, size_t cap)
 	fdput(f);
 }
 
-static int fd_list(struct pfs_node *dir, unsigned index, char *name, long cap,
-		   int *type)
+static int fd_list(struct pfs_node *dir, unsigned *cursor, char *name,
+		   long cap, int *type)
 {
 	PROC_TASK(t) = proc_task((int)dir->arg2);
-	unsigned seen = 0;
 
 	/* What a process has open is its private state, as its memory is. */
 	if (!t || proc_may_access(t, ACCESS_READ_MEM) != 0)
 		return 0;
-	for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
+	/* Keyed by the descriptor number. */
+	for (int fd = (int)*cursor; fd < TASK_MAX_FDS; fd++) {
 		if (!task_fds(t)[fd] && !task_fd_is_console(t, fd))
 			continue;
-		if (seen++ == index) {
-			ksnprintf(name, (size_t)cap, "%d", fd);
-			*type = DT_LNK;
-			return 1;
-		}
+		ksnprintf(name, (size_t)cap, "%d", fd);
+		*type = DT_LNK;
+		*cursor = (unsigned)fd + 1;
+		return 1;
 	}
 	return 0;
 }
@@ -521,7 +519,7 @@ static struct pfs_node *fd_lookup(struct pfs_node *dir, const char *name)
 
 /* /proc/<pid>: a transient directory with static-looking children made
  * on lookup. */
-static int pid_list(struct pfs_node *dir, unsigned index, char *name,
+static int pid_list(struct pfs_node *dir, unsigned *cursor, char *name,
 		    long cap, int *type)
 {
 	static const char *const names[] = { "cmdline",	  "comm",  "stat",
@@ -529,12 +527,15 @@ static int pid_list(struct pfs_node *dir, unsigned index, char *name,
 					     "auxv",	  "exe",   "cwd",
 					     "fd",	  "statm", "loginuid",
 					     "sessionid" };
+	unsigned index = *cursor; /* a fixed set: its place is its key */
+
 	(void)dir;
 	if (index >= 13)
 		return 0;
 	ksnprintf(name, (size_t)cap, "%s", names[index]);
 	*type = index == 9 ? DT_DIR :
 			     (index >= 7 && index <= 8 ? DT_LNK : DT_REG);
+	*cursor = index + 1;
 	return 1;
 }
 
@@ -632,32 +633,35 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 }
 
 /* /proc root: dynamic pid directories + "self". */
-static int root_list(struct pfs_node *dir, unsigned index, char *name,
+static int root_list(struct pfs_node *dir, unsigned *cursor, char *name,
 		     long cap, int *type)
 {
-	unsigned seen = 0;
+	unsigned from = *cursor > 1 ? *cursor : 1;
+	int pid = 0;
+	uint64_t fl;
+
 	(void)dir;
 
-	for (int pid = 1; pid < g_next_id; pid++) {
-		uint64_t fl;
-		int show;
+	/* Keyed by the pid: a process that exits between two getdents calls
+	 * moves nobody else.  The next entry is the lowest process pid at or
+	 * past the cursor, found in one walk of the task list.  Pids are never
+	 * handed out twice, so stepping through the pid NUMBERS instead costs
+	 * every pid ever allocated -- a locked walk of the task list each --
+	 * which after a long uptime held the list lock away from the rest of
+	 * the machine for seconds per listing.  Read under the lock: a task
+	 * can be freed once it is let go of. */
+	spin_lock_irqsave(&g_task_list_lock, &fl);
+	task_t *t = sched_find_next_process_by_id_locked(from);
 
-		/* Read under the lock: the task can be freed once it is let
-		 * go of. */
-		spin_lock_irqsave(&g_task_list_lock, &fl);
-		task_t *t = sched_find_task_by_id_locked((uint32_t)pid);
-
-		show = t && !sched_task_hidden(t) && t->tgid == t->id;
-		spin_unlock_irqrestore(&g_task_list_lock, fl);
-		if (!show)
-			continue;
-		if (seen++ == index) {
-			ksnprintf(name, (size_t)cap, "%d", pid);
-			*type = DT_DIR;
-			return 1;
-		}
-	}
-	return 0;
+	if (t)
+		pid = t->id;
+	spin_unlock_irqrestore(&g_task_list_lock, fl);
+	if (pid <= 0)
+		return 0;
+	ksnprintf(name, (size_t)cap, "%d", pid);
+	*type = DT_DIR;
+	*cursor = (unsigned)pid + 1;
+	return 1;
 }
 
 static struct pfs_node *root_lookup(struct pfs_node *dir, const char *name)

@@ -9,6 +9,7 @@
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
+#include <kernel/ke/hrtimer.h>
 
 /* The rule that used to live here — may the caller read another process's
  * private state — is now task_may_access(target, ACCESS_READ) in cred.c, so
@@ -142,6 +143,27 @@ static uint64_t ptrace_sanitize_dr7(uint64_t dr7)
 	return out;
 }
 
+/* Is a tracee in a trace stop really OFF its processor?
+ *
+ * Stopped is not the same as switched off.  A thread that stops in its own
+ * context, and a sibling stopped where it sleeps (task_ptrace_group_stop_
+ * siblings), are marked stopped while still on their way off the processor.
+ * Their registers are only where a tracer looks for them once they have
+ * switched away, and `sp' says exactly that: the dispatcher zeroes it when a
+ * task starts running and the switch publishes it only once the task has
+ * left its stack. */
+static int ptrace_tracee_parked(const task_t *t)
+{
+	return t->ptrace_stopped && __atomic_load_n(&t->sp, __ATOMIC_ACQUIRE) != 0;
+}
+
+/* Wait for a tracee to finish entering its stop before a request acts on
+ * it: one marked stopped but still switching off its processor, or one
+ * asked to stop with its process and not there yet (still running, or
+ * finishing a sleep it holds a lock in).  Returns 0 to go on (the request
+ * re-checks everything under the lock), or an errno. */
+static int64_t ptrace_wait_parked(task_t *cur, uint64_t pid);
+
 /* Resolve a tracee for a request from `cur', enforcing the whole access
  * policy, and return it with g_task_list_lock HELD so the caller can act on it
  * without the answer going stale.  *flags receives the saved interrupt state.
@@ -193,6 +215,50 @@ static task_t *ptrace_lock_tracee(task_t *cur, uint64_t pid, uint64_t *flags,
 	return t;
 }
 
+static int64_t ptrace_wait_parked(task_t *cur, uint64_t pid)
+{
+	/* A backstop, not the expected case: a thread on its way to the stop
+	 * -- one finishing locked disk I/O (ptrace_may_freeze), say -- gets
+	 * there in milliseconds.  One that never does (a kernel loop that
+	 * never sleeps or returns) is reported as not stopped rather than
+	 * holding the tracer for ever. */
+	uint64_t until = hrtimer_now_ns() + 5000000000ULL;
+
+	for (;;) {
+		uint64_t flags;
+		int64_t err = 0;
+		task_t *t = ptrace_lock_tracee(cur, pid, &flags, &err);
+		int running;
+
+		if (!t)
+			return err;
+		/* Marked stopped but still on its processor -- the exit-event
+		 * stop included -- or marked to stop itself (a sibling that was
+		 * running when its process stopped) and not there yet.  A
+		 * thread on its way out takes no such stop: it parks nowhere,
+		 * and the request answers for it as it stands.  A dead one is
+		 * waited for in neither case. */
+		{
+			int dead = t->has_exited || t->state == TASK_ZOMBIE;
+			int exiting =
+				t->ptrace_exiting ||
+				__atomic_load_n(&t->exit_lock, __ATOMIC_ACQUIRE);
+
+			running = !dead && !ptrace_tracee_parked(t) &&
+				  (t->ptrace_stopped ||
+				   (t->ptrace_group_stop && !exiting));
+		}
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		if (!running)
+			return 0;
+		if (hrtimer_now_ns() >= until)
+			return -ESRCH;
+		/* Interruptible: the tracer's own signals end the wait. */
+		if (hrtimer_sleep_until(hrtimer_now_ns() + 200000ULL, NULL))
+			return -EINTR;
+	}
+}
+
 /* The register set handed to and taken from userspace.  Mirrors
  * `struct ptrace_regs' in user/lib/libc/include/sys/ptrace.h -- keep in step. */
 typedef struct {
@@ -240,13 +306,22 @@ _Static_assert(sizeof(ptrace_regs_t) == 26 * 8,
  * the syscall frame, which is what the fall-through reaches. */
 static inline const interrupt_frame_t *ptrace_user_frame(const task_t *t)
 {
-	const interrupt_frame_t *f = t->preempt_frame;
+	const interrupt_frame_t *f =
+		__atomic_load_n(&t->preempt_frame, __ATOMIC_ACQUIRE);
+
+	/* Not published by an interrupt exit: a thread stopped while its
+	 * fault handler slept (demand paging) has its user state in the
+	 * frame of that fault. */
+	if (!(f && (f->cs & 0x3) == 0x3))
+		f = __atomic_load_n(&t->user_fault_frame, __ATOMIC_ACQUIRE);
 
 	return (f && (f->cs & 0x3) == 0x3) ? f : NULL;
 }
 
 static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
 {
+	const syscall_user_frame_t *sf;
+
 	mm_memset(out, 0, sizeof(*out));
 
 	const interrupt_frame_t *f = ptrace_user_frame(t);
@@ -272,11 +347,14 @@ static void ptrace_read_regs(const task_t *t, ptrace_regs_t *out)
 		out->rflags = f->rflags;
 		out->rsp = f->rsp;
 		out->ss = f->ss;
-	} else if (t->syscall_frame) {
+	} else if ((sf = __atomic_load_n(&t->syscall_frame,
+					 __ATOMIC_ACQUIRE)) != NULL) {
 		/* Read from the live frame rather than the snapshot: it is what
 		 * the return path will actually restore from, so it is also
-		 * what a tracer must see if a write to it is to make sense. */
-		const syscall_user_frame_t *s = t->syscall_frame;
+		 * what a tracer must see if a write to it is to make sense.
+		 * The pointer is read ONCE: a second read can find it cleared
+		 * by a tracee leaving its syscall (see ptrace_tracee_parked). */
+		const syscall_user_frame_t *s = sf;
 
 		out->r15 = s->r15;
 		out->r14 = s->r14;
@@ -360,6 +438,7 @@ static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
 	 * user registers through a kernel-context frame would aim this task's
 	 * kernel resume point at them. */
 	interrupt_frame_t *f = (interrupt_frame_t *)ptrace_user_frame(t);
+	syscall_user_frame_t *sf;
 
 	if (f) {
 		f->r15 = in->r15;
@@ -383,12 +462,13 @@ static int64_t ptrace_write_regs(task_t *t, const ptrace_regs_t *in)
 		/* CS/SS are deliberately not writable: a tracee that returns
 		 * through a segment selector of the tracer's choosing is a way
 		 * out of user mode, not a debugging feature. */
-	} else if (t->syscall_frame) {
+	} else if ((sf = __atomic_load_n(&t->syscall_frame,
+					 __ATOMIC_ACQUIRE)) != NULL) {
 		/* Written into the live frame, because that is what the return
 		 * path restores from.  Writing the snapshot instead reads back
 		 * correctly and is then discarded on return -- the change
 		 * appears to have been made and simply does not happen. */
-		syscall_user_frame_t *s = t->syscall_frame;
+		syscall_user_frame_t *s = sf;
 
 		s->r15 = in->r15;
 		s->r14 = in->r14;
@@ -482,11 +562,13 @@ static int64_t ptrace_set_tf(task_t *t, bool on)
 	 * KERNEL frame here, and a trap flag written into that would
 	 * single-step kernel code the moment the task resumes. */
 	interrupt_frame_t *pf = (interrupt_frame_t *)ptrace_user_frame(t);
+	syscall_user_frame_t *sf =
+		__atomic_load_n(&t->syscall_frame, __ATOMIC_ACQUIRE);
 
 	if (pf)
 		rflags = &pf->rflags;
-	else if (t->syscall_frame)
-		rflags = &t->syscall_frame->rflags;
+	else if (sf)
+		rflags = &sf->rflags;
 
 	if (rflags) {
 		if (on)
@@ -716,7 +798,10 @@ static int64_t ptrace_resume(task_t *t)
 	t->ptrace_stopped = 0;
 	t->ptrace_stop_signo = 0;
 	t->ptrace_event = 0;
-	t->ptrace_group_stop = 0;
+	/* The quiet mark ends with this stop; an owed SIGSTOP report is still
+	 * owed and is taken at the tracee's return to user. */
+	if (t->ptrace_group_stop == PTRACE_GSTOP_SILENT)
+		t->ptrace_group_stop = 0;
 
 	/* The rest of the process goes too.  The siblings were parked by the
 	 * group stop and carry no event of their own, so nothing else would
@@ -724,6 +809,35 @@ static int64_t ptrace_resume(task_t *t)
 	 * aimed at them. */
 	task_ptrace_group_resume(t);
 	return 0;
+}
+
+/* The mark on an injected signal says "this one, when it is delivered".  A
+ * signal that was not queued at all -- discarded at sending because its
+ * disposition ignores it -- is never delivered, and a mark left behind would
+ * wave the NEXT signal of that number past its delivery stop.  Settled while
+ * the tracee is still stopped, so nothing can have consumed it yet. */
+static void ptrace_injected_settle(task_t *t, int signo)
+{
+	if (__atomic_load_n(&t->ptrace_signal_injected, __ATOMIC_ACQUIRE) ==
+		    signo &&
+	    !sigismember_k(&t->signals.pending, signo))
+		__atomic_store_n(&t->ptrace_signal_injected, 0,
+				 __ATOMIC_RELEASE);
+}
+
+/* The signal a resume (or detach) passes on.  A group stop -- a traced
+ * task's job-control stop -- passes none: a signal given there is ignored.
+ * (A thread stopped silently with its process is not one: a signal given
+ * to it is delivered, as a debugger asking for one expects.)  Sent instead, the SIGSTOP a
+ * debugger passes on by default job-stopped the tracee again, which was
+ * reported as the same group stop, which was resumed with SIGSTOP again:
+ * the program never ran another instruction.  Called with g_task_list_lock
+ * held. */
+static int ptrace_resume_signal(const task_t *t, int requested)
+{
+	if (requested != 0 && t->ptrace_stopped && t->ptrace_stop_is_group)
+		return 0;
+	return requested;
 }
 
 int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
@@ -824,6 +938,9 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 							(int)tracer->id;
 						w->tracer_incarnation =
 							tracer->incarnation;
+						/* Nothing from an earlier
+						 * trace carries over. */
+						w->ptrace_signal_injected = 0;
 					}
 					w = w->thread_group_next;
 					if (!task_ptr_ok(w) ||
@@ -835,6 +952,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 			} else {
 				t->tracer_pid = (int)tracer->id;
 				t->tracer_incarnation = tracer->incarnation;
+				t->ptrace_signal_injected = 0;
 			}
 		}
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -848,7 +966,14 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		return 0;
 	}
 
-	/* Everything else names a tracee this task is already tracing. */
+	/* Everything else names a tracee this task is already tracing, and
+	 * acts on it stopped -- so let one still switching off its processor
+	 * finish first.  PT_KILL needs no stopped tracee. */
+	if (request != PT_KILL) {
+		err = ptrace_wait_parked(cur, pid);
+		if (err)
+			return err;
+	}
 	task_t *t = ptrace_lock_tracee(cur, pid, &flags, &err);
 	if (!t)
 		return err;
@@ -857,7 +982,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 
 	switch (request) {
 	case PT_DETACH: {
-		int signo = (int)data;
+		int signo = ptrace_resume_signal(t, (int)data);
 
 		/* Same gate as PT_CONT: a signal requested here is still a
 		 * signal being sent, and must pass the check that applies to
@@ -882,7 +1007,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 	}
 
 	case PT_CONT: {
-		int signo = (int)data;
+		int signo = ptrace_resume_signal(t, (int)data);
 
 		/* A signal asked for on resume goes through the same gate as
 		 * kill(2).  The tracer is asking for a signal to be sent, and
@@ -911,7 +1036,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * than stopping to ask about the signal the tracer just asked
 		 * to deliver -- which would never terminate. */
 		if (signo != 0)
-			t->ptrace_signal_injected = 1;
+			t->ptrace_signal_injected = (int)signo;
 
 		ret = ptrace_resume(t);
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -928,8 +1053,10 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * to deliver is never delivered at all.  Sending first costs
 		 * nothing: a stopped task simply has the signal waiting when it
 		 * runs. */
-		if (signo != 0)
+		if (signo != 0) {
 			sched_signal_task(t, signo);
+			ptrace_injected_settle(t, (int)signo);
+		}
 		if (sched_claim_wake(t, TASK_STOPPED))
 			sched_enqueue_ready(t);
 		return 0;
@@ -1108,7 +1235,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 	case PT_GETREGS: {
 		ptrace_regs_t r;
 
-		if (!t->ptrace_stopped) {
+		if (!ptrace_tracee_parked(t)) {
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			return -ESRCH;
 		}
@@ -1136,7 +1263,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		t = ptrace_lock_tracee(cur, pid, &flags, &err);
 		if (!t)
 			return err;
-		if (!t->ptrace_stopped) {
+		if (!ptrace_tracee_parked(t)) {
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			return -ESRCH;
 		}
@@ -1230,7 +1357,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 	}
 
 	case PT_SYSCALL: {
-		int signo = (int)data;
+		int signo = ptrace_resume_signal(t, (int)data);
 
 		if (signo != 0) {
 			int64_t perm = signal_target_check(t, signo);
@@ -1253,7 +1380,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * than stopping to ask about the signal the tracer just asked
 		 * to deliver -- which would never terminate. */
 		if (signo != 0)
-			t->ptrace_signal_injected = 1;
+			t->ptrace_signal_injected = (int)signo;
 
 		ret = ptrace_resume(t);
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -1270,15 +1397,17 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * to deliver is never delivered at all.  Sending first costs
 		 * nothing: a stopped task simply has the signal waiting when it
 		 * runs. */
-		if (signo != 0)
+		if (signo != 0) {
 			sched_signal_task(t, signo);
+			ptrace_injected_settle(t, (int)signo);
+		}
 		if (sched_claim_wake(t, TASK_STOPPED))
 			sched_enqueue_ready(t);
 		return 0;
 	}
 
 	case PT_SINGLESTEP: {
-		int signo = (int)data;
+		int signo = ptrace_resume_signal(t, (int)data);
 
 		if (signo != 0) {
 			int64_t perm = signal_target_check(t, signo);
@@ -1306,7 +1435,7 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * than stopping to ask about the signal the tracer just asked
 		 * to deliver -- which would never terminate. */
 		if (signo != 0)
-			t->ptrace_signal_injected = 1;
+			t->ptrace_signal_injected = (int)signo;
 
 		ret = ptrace_resume(t);
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -1323,8 +1452,10 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 		 * to deliver is never delivered at all.  Sending first costs
 		 * nothing: a stopped task simply has the signal waiting when it
 		 * runs. */
-		if (signo != 0)
+		if (signo != 0) {
 			sched_signal_task(t, signo);
+			ptrace_injected_settle(t, (int)signo);
+		}
 		if (sched_claim_wake(t, TASK_STOPPED))
 			sched_enqueue_ready(t);
 		return 0;
@@ -1474,6 +1605,14 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 	}
 
 	case PT_GETSIGINFO: {
+		/* Only a stop that has one: a group stop has no siginfo, and
+		 * EINVAL is how a tracer tells it from a signal-delivery stop
+		 * -- shown a stale one, it took the group stop for the signal
+		 * and passed that signal on again. */
+		if (!t->ptrace_stopped || !t->ptrace_stop_has_siginfo) {
+			spin_unlock_irqrestore(&g_task_list_lock, flags);
+			return -EINVAL;
+		}
 		siginfo_t si = t->ptrace_siginfo;
 
 		spin_unlock_irqrestore(&g_task_list_lock, flags);

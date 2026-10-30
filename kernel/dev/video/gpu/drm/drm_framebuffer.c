@@ -23,6 +23,7 @@
 #include <kernel/dev/video/gpu/drm/drm_internal.h>
 #include <kernel/dev/video/gpu/drm/gpu_util.h>
 #include <kernel/uapi/drm/drm_fourcc.h>
+#include <kernel/ke/cred.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/signal.h>
@@ -572,6 +573,13 @@ int drm_mode_getfb(struct drm_device *dev, void *kb, struct drm_file *fp)
 	f->pitch = fb->pitch;
 	f->bpp = fb->bpp;
 	f->depth = fb->depth;
+	/* Open to every file, so the handle -- a way into whatever the
+	 * framebuffer shows -- only for the master or root.  Everyone else
+	 * gets the description and handle 0. */
+	if (!fp->is_master && !capable()) {
+		f->handle = 0;
+		return 0;
+	}
 	uint32_t h;
 	if (drm_gem_handle_create(fp, fb->obj, &h) != 0)
 		return -ENOMEM;
@@ -606,6 +614,9 @@ int drm_mode_getfb2_ioctl(struct drm_device *dev, void *kb, struct drm_file *fp)
 		r->offsets[i] = i ? fb->offsets[i] : fb->offset;
 		r->modifier[i] = fb->modifier;
 	}
+	/* Handles only for the master or root, as GETFB. */
+	if (!fp->is_master && !capable())
+		return 0;
 
 	for (i = 0; i < nplanes; i++) {
 		struct drm_gem_object *o = i ? fb->objs[i] : fb->obj;

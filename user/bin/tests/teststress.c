@@ -25,9 +25,12 @@ static unsigned int rand_simple(void)
 // Default mix — exercises libc/syscalls/memory (no network tests).
 // teststress "all"     — also runs network_commands[] in addition to this.
 // teststress "network" — runs only network_commands[].
+// testlibc always gets --stress: several copies run at once next to the
+// desktop, so its tests that draw to the screen or change the display mode
+// stay out.
 static const char *commands[] = {
 	"/bin/ls",
-	"/usr/local/bin/testlibc",
+	"/usr/local/bin/testlibc --stress",
 	"/usr/local/bin/tests",
 	"/usr/local/bin/testmem 100",
 	"/usr/local/bin/hello",
@@ -40,7 +43,7 @@ static const char *commands[] = {
 // Network-only command set, used both as the entire mix in `teststress
 // network` and as an extension of the default mix in `teststress` (no arg).
 static const char *network_commands[] = {
-	"/usr/local/bin/testlibc network",
+	"/usr/local/bin/testlibc --stress network",
 	"/ping -c 3 www.google.com",
 	"/route",
 	"/netstat",

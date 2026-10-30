@@ -24,9 +24,15 @@ typedef long (*pfs_show_t)(struct pfs_node *n, char *buf, long cap);
  * terminated) to a file that takes input -- a sysfs attribute that sets
  * something.  Return the bytes consumed or a negative errno. */
 typedef long (*pfs_store_t)(struct pfs_node *n, const char *buf, long len);
-/* Dynamic directory: list child `index' into name (return 1) or return 0
- * at the end; `type' receives DT_DIR / DT_REG / DT_LNK. */
-typedef int (*pfs_list_t)(struct pfs_node *dir, unsigned index, char *name,
+/* Dynamic directory: list the first child whose key is >= *cursor into name,
+ * set *cursor to that key + 1 and return 1; return 0 at the end.  `type'
+ * receives DT_DIR / DT_REG / DT_LNK.
+ *
+ * The key is what readdir resumes from between getdents calls, so it must
+ * name the entry itself (a pid, a descriptor number), not its place in the
+ * list: an entry that goes away before the next call would otherwise shift
+ * every later one down by one, and one of them would never be listed. */
+typedef int (*pfs_list_t)(struct pfs_node *dir, unsigned *cursor, char *name,
 			  long cap, int *type);
 /* Dynamic directory: resolve one child name to a node that the caller
  * owns until pfs_node_put(); NULL if there is no such child. */

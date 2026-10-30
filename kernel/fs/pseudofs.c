@@ -354,7 +354,7 @@ typedef struct {
 	long cap; /* bytes allocated at data */
 	long len;
 	long pos;
-	unsigned dirpos;
+	uint64_t dirpos; /* where the next getdents resumes: see pfs_readdir() */
 } pfs_file_t;
 
 /* Strip the mount prefix: "/sys/bus/pci" -> "bus/pci". */
@@ -599,6 +599,15 @@ static long pfs_seek(vfs_file_t *f, long offset, int whence)
 
 	if (!pf)
 		return -EINVAL;
+	/* A directory's offset is the resume position of pfs_readdir():
+	 * rewinddir() seeks to 0, seekdir() to a d_off it was handed. */
+	if (pf->node->type == PFS_DIR) {
+		if (whence == 0 && offset >= 0)
+			pf->dirpos = (uint64_t)offset;
+		else if (!(whence == 1 && offset == 0))
+			return -EINVAL;
+		return (long)pf->dirpos;
+	}
 	switch (whence) {
 	case 0:
 		np = offset;
@@ -619,7 +628,8 @@ static long pfs_seek(vfs_file_t *f, long offset, int whence)
 }
 
 static unsigned pfs_put_dirent(char *buf, unsigned cap, unsigned *off,
-			       const char *name, uint64_t ino, int type)
+			       const char *name, uint64_t ino, int type,
+			       uint64_t next)
 {
 	unsigned nl = 0;
 	while (name[nl])
@@ -630,7 +640,7 @@ static unsigned pfs_put_dirent(char *buf, unsigned cap, unsigned *off,
 	struct dirent64 *d = (struct dirent64 *)(buf + *off);
 	smap_disable();
 	d->d_ino = ino;
-	d->d_off = *off + reclen;
+	d->d_off = (int64_t)next;
 	d->d_reclen = (uint16_t)reclen;
 	d->d_type = (uint8_t)type;
 	mm_memcpy(d->d_name, name, nl + 1);
@@ -639,36 +649,82 @@ static unsigned pfs_put_dirent(char *buf, unsigned cap, unsigned *off,
 	return reclen;
 }
 
+/* Directory positions, as getdents resumes from them and d_off reports them:
+ *
+ *   0                 "."
+ *   1                 ".."
+ *   2                 the first static child
+ *   3 + ino           the static child after the one with inode `ino'
+ *   PFS_POS_DYN + k   the dynamic child with key >= k (pfs_list_t)
+ *
+ * Static children are visited in descending inode order, which is the order
+ * of the list (pfs_add prepends, inodes only grow, nothing is removed); a
+ * child added while a listing is under way has a higher inode and is simply
+ * not in that listing.  Nothing here counts entries, so nothing shifts when
+ * one comes or goes between two calls. */
+#define PFS_POS_STATIC 2ULL
+#define PFS_POS_DYN (1ULL << 32)
+
 static long pfs_readdir(vfs_file_t *f, void *buf, long bytes)
 {
 	pfs_file_t *pf = f->fs_private;
+	struct pfs_node *dir;
 	unsigned off = 0;
 
 	if (!pf || pf->node->type != PFS_DIR)
 		return -ENOTDIR;
-	if (pf->dirpos)
-		return 0; /* one shot: everything fits in one call */
-	if (!pfs_put_dirent(buf, (unsigned)bytes, &off, ".", pf->node->ino, DT_DIR))
-		return -EINVAL;
-	pfs_put_dirent(buf, (unsigned)bytes, &off, "..",
-		       pf->node->parent ? pf->node->parent->ino : pf->node->ino,
-		       DT_DIR);
-	for (struct pfs_node *c = pf->node->children; c; c = c->sibling) {
-		int t = c->type == PFS_DIR ? DT_DIR :
-			(c->type == PFS_LINK ? DT_LNK : DT_REG);
-		if (!pfs_put_dirent(buf, (unsigned)bytes, &off, c->name, c->ino, t))
-			break;
-	}
-	if (pf->node->list) {
+	dir = pf->node;
+	for (;;) {
+		uint64_t pos = pf->dirpos, next, ino;
+		const char *name;
 		char nm[64];
 		int t;
-		for (unsigned i = 0; pf->node->list(pf->node, i, nm, sizeof(nm), &t); i++) {
-			if (!pfs_put_dirent(buf, (unsigned)bytes, &off, nm,
-					    pf->node->ino * 1000 + i + 1, t))
+
+		if (pos == 0) {
+			name = ".";
+			ino = dir->ino;
+			t = DT_DIR;
+			next = 1;
+		} else if (pos == 1) {
+			name = "..";
+			ino = dir->parent ? dir->parent->ino : dir->ino;
+			t = DT_DIR;
+			next = PFS_POS_STATIC;
+		} else if (pos < PFS_POS_DYN) {
+			uint64_t bound = pos == PFS_POS_STATIC ? ~0ULL :
+								 pos - 3;
+			struct pfs_node *pick = NULL;
+
+			for (struct pfs_node *c = dir->children; c; c = c->sibling)
+				if (c->ino < bound && (!pick || c->ino > pick->ino))
+					pick = c;
+			if (!pick) {
+				pf->dirpos = PFS_POS_DYN;
+				continue;
+			}
+			name = pick->name;
+			ino = pick->ino;
+			t = pick->type == PFS_DIR ? DT_DIR :
+			    (pick->type == PFS_LINK ? DT_LNK : DT_REG);
+			next = 3 + pick->ino;
+		} else {
+			unsigned cursor = (unsigned)(pos - PFS_POS_DYN);
+
+			if (!dir->list || !dir->list(dir, &cursor, nm, sizeof(nm), &t))
 				break;
+			name = nm;
+			ino = dir->ino * 1000 + cursor;
+			next = PFS_POS_DYN + cursor;
 		}
+		if (!pfs_put_dirent(buf, (unsigned)bytes, &off, name, ino, t, next)) {
+			/* Not even one record fits: the caller's buffer is
+			 * too small, which is its error, not end of file. */
+			if (off == 0)
+				return -EINVAL;
+			break;
+		}
+		pf->dirpos = next;
 	}
-	pf->dirpos = 1;
 	return (long)off;
 }
 

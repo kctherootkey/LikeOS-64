@@ -66,6 +66,15 @@ int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 	if (mask == 0) {
 		return -EINVAL;
 	}
+	/* ...and at least one that exists: a task allowed nowhere would be
+	 * handed off at every switch with nowhere to go. */
+	{
+		uint32_t ncpus = smp_get_cpu_count();
+		uint64_t online = ncpus >= 64 ? ~0ULL : ((1ULL << ncpus) - 1);
+
+		if (ncpus && !(mask & online))
+			return -EINVAL;
+	}
 
 	/* Resolve, check and apply under the task-list lock.  sched_find_task_by_id
 	 * returns a bare pointer with the lock already dropped, so a target
@@ -118,14 +127,32 @@ int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 	 * that window lets two CPUs act on one context (observed as an idle
 	 * task IRET-ing into user code + shifted-frame kernel stack smashes).
 	 *
-	 * So: only record the mask and request a reschedule.  The load
-	 * balancer migrates the task lazily with both run-queue locks held,
-	 * honouring cpu_affinity — the one protocol that is safe.
+	 * So: only record the mask and request a reschedule.  The task moves
+	 * itself: its next switch away from a processor its mask bars hands
+	 * it to an allowed one (rq_requeue_current_locked), even when nothing
+	 * else is queued there; a sleeping task is placed on an allowed one
+	 * when it wakes (sched_enqueue_ready).  The request used to be all
+	 * there was, and nothing honoured it: a task stayed on the excluded
+	 * processor for as long as it kept running there.
 	 */
-	if (!(mask & (1ULL << target->on_cpu)))
+	int self = target == sched_current();
+	int kick = -1;
+
+	if (!(mask & (1ULL << target->on_cpu))) {
 		target->need_resched = 1;
+		if (!self)
+			kick = (int)target->on_cpu;
+	}
 
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	/* Running elsewhere: interrupt it so the switch happens now rather
+	 * than at the end of its slice.  The caller itself switches before
+	 * returning, so it comes back on a processor it is allowed. */
+	if (kick >= 0 && (uint32_t)kick != this_cpu_id())
+		smp_send_reschedule((uint32_t)kick);
+	if (self && !(mask & (1ULL << this_cpu_id())))
+		sched_yield_in_kernel();
 	return 0;
 }
 

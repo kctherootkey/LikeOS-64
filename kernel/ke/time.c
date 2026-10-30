@@ -399,13 +399,33 @@ int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 		 * (CLOCK_TID_CPUTIME_BASE | tid).  The same tick accounting
 		 * that answers CLOCK_THREAD_CPUTIME_ID for the caller answers
 		 * it for any live thread; a dead or unknown tid is EINVAL,
-		 * which is what POSIX says a dangling clockid earns. */
+		 * which is what POSIX says a dangling clockid earns.
+		 *
+		 * Dead starts when the thread enters its exit: exit_lock is
+		 * taken first thing in sched_mark_task_exited, before the tid
+		 * word is cleared and pthread_join() woken -- has_exited and
+		 * TASK_ZOMBIE only follow much later, and the task stays in
+		 * the list until the reaper frees it.  And only a thread of
+		 * the caller's own process: another process's threads are
+		 * not its to time.  Read under the list lock, which is what
+		 * keeps the task from being freed meanwhile. */
 		if (clk_id >= 0x40000000) {
 			uint32_t tid = (uint32_t)(clk_id & 0x3FFFFFFF);
-			task_t *t = sched_find_task_by_id(tid);
-			if (!t)
+			task_t *cur = sched_current();
+			uint64_t us = 0, fl;
+			int ok;
+
+			spin_lock_irqsave(&g_task_list_lock, &fl);
+			task_t *t = sched_find_task_by_id_locked(tid);
+			ok = t && cur &&
+			     !__atomic_load_n(&t->exit_lock, __ATOMIC_ACQUIRE) &&
+			     !t->has_exited && t->state != TASK_ZOMBIE &&
+			     t->tgid == cur->tgid;
+			if (ok)
+				us = t->utime_us + t->stime_us;
+			spin_unlock_irqrestore(&g_task_list_lock, fl);
+			if (!ok)
 				return -EINVAL;
-			uint64_t us = t->utime_us + t->stime_us;
 
 			tp.tv_sec = us / 1000000ULL;
 			tp.tv_nsec = (long)((us % 1000000ULL) * 1000ULL);

@@ -10,6 +10,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/fs/namei.h>
 #include <kernel/ke/timer.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/pipe.h>
 #include <kernel/mm/memory.h>
@@ -374,6 +375,85 @@ int sock_listen(int sockfd, int backlog)
 	return 0;
 }
 
+/* Sleep on the socket's poll queue until `ready(arg)' holds, a signal is
+ * pending, or the tick `deadline' (0: none) passes.  The caller re-checks
+ * its own condition afterwards; this may return early for any reason.
+ *
+ * The TCP layer notifies this queue on every event a blocking call here
+ * waits for -- a connection queued on a listener (tcp_listener_notify), a
+ * handshake finished or failed, send space opening (tcp_poll_notify) -- so
+ * the wait costs nothing until one happens.  These waits used to spin on
+ * sched_yield_in_kernel(), which with nothing else queued returns at once:
+ * a blocked accept() or connect() ran its loop a million times a second,
+ * and each pass poked the network softirq on CPU0.
+ *
+ * Registration comes before the state is published and the condition is
+ * re-checked after it, so an event between the caller's check and the park
+ * is seen either here or by the waker's claim (see sock_recv's park). */
+static void sock_wait_event(net_socket_t *s, int (*ready)(void *), void *arg,
+			    uint64_t deadline)
+{
+	task_t *cur = sched_current();
+	struct wait_queue_entry we;
+
+	if (!cur) {
+		sched_yield_in_kernel();
+		return;
+	}
+	wq_entry_init(&we, cur);
+	wq_add(&s->poll_wq, &we);
+	cur->wait_channel = (void *)&s->poll_wq;
+	cur->wakeup_tick = deadline;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	task_set_blocked(cur);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (ready(arg) || signal_pending(cur)) {
+		task_state_t expected = TASK_BLOCKED;
+
+		/* Un-park by CAS: if a waker claimed us first we are READY
+		 * and being enqueued, and sched_schedule() picks us back. */
+		if (__atomic_compare_exchange_n(&cur->state, &expected,
+						TASK_RUNNING, false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_ACQUIRE)) {
+			cur->wait_channel = NULL;
+			cur->wakeup_tick = 0;
+			wq_remove(&s->poll_wq, &we);
+			return;
+		}
+	}
+	sched_schedule();
+	cur->wait_channel = NULL;
+	cur->wakeup_tick = 0;
+	wq_remove(&s->poll_wq, &we);
+}
+
+static int sock_accept_ready(void *arg)
+{
+	tcp_conn_t *listener = arg;
+
+	return __atomic_load_n(&listener->accept_head, __ATOMIC_ACQUIRE) !=
+	       __atomic_load_n(&listener->accept_tail, __ATOMIC_ACQUIRE);
+}
+
+static int sock_connect_ready(void *arg)
+{
+	tcp_conn_t *conn = arg;
+
+	return __atomic_load_n(&conn->connect_done, __ATOMIC_ACQUIRE) != 0;
+}
+
+/* Send space, or a state in which sending is over. */
+static int sock_send_ready(void *arg)
+{
+	tcp_conn_t *conn = arg;
+	int st = __atomic_load_n(&conn->state, __ATOMIC_ACQUIRE);
+
+	return __atomic_load_n(&conn->tx_ready, __ATOMIC_ACQUIRE) ||
+	       conn->error ||
+	       (st != TCP_STATE_ESTABLISHED && st != TCP_STATE_CLOSE_WAIT);
+}
+
 // ============================================================================
 // sock_accept - Accept a connection (TCP only, blocking)
 // ============================================================================
@@ -404,7 +484,7 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 		if (acc_cur && signal_pending(acc_cur))
 			return -EINTR;
 		loopback_process_pending();
-		sched_yield_in_kernel();
+		sock_wait_event(s, sock_accept_ready, s->tcp, deadline);
 	}
 
 	// Create a new socket for the accepted connection.  tcp_accept returned
@@ -514,7 +594,7 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		if (con_cur && signal_pending(con_cur))
 			return -EINTR;
 		loopback_process_pending();
-		sched_yield_in_kernel();
+		sock_wait_event(s, sock_connect_ready, conn, deadline);
 	}
 
 	if (conn->error) {
@@ -915,27 +995,40 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 			int ret = tcp_send_data(
 				conn, (const uint8_t *)buf + total, to_send);
 			smap_enable();
-			tcp_conn_release(conn);
 
-			if (ret < 0)
+			if (ret < 0) {
+				tcp_conn_release(conn);
 				return total ? (int)total : ret;
+			}
 			if (ret > 0) {
+				tcp_conn_release(conn);
 				total += (size_t)ret;
 				continue;
 			}
 
 			/* Nothing fit: the window is closed or the inflight
 			 * ring is full. */
-			if (nonblock)
+			if (nonblock) {
+				tcp_conn_release(conn);
 				return total ? (int)total : -EAGAIN;
+			}
 
 			task_t *tx_cur = sched_current();
 
-			if (tx_cur && signal_pending(tx_cur))
+			if (tx_cur && signal_pending(tx_cur)) {
+				tcp_conn_release(conn);
 				return total ? (int)total : -EINTR;
+			}
 
 			loopback_process_pending();
-			sched_yield_in_kernel();
+			/* Sleep until the window opens: tx_ready rising is
+			 * notified.  A refusal with tx_ready still set has no
+			 * event to wait for, so that case only yields. */
+			if (__atomic_load_n(&conn->tx_ready, __ATOMIC_ACQUIRE))
+				sched_yield_in_kernel();
+			else
+				sock_wait_event(s, sock_send_ready, conn, 0);
+			tcp_conn_release(conn);
 		}
 
 		return (int)total;
@@ -1308,12 +1401,18 @@ int sock_close(int sockfd)
 						    (uint64_t)linger_secs * 100;
 				// We hold a reference, so the deref is always
 				// memory-safe.
+				/* The socket has let go of the connection, so
+				 * nothing notifies it any more: look again every
+				 * millisecond rather than spinning on a yield. */
 				while (tcp_to_teardown->state !=
 					       TCP_STATE_CLOSED &&
 				       tcp_to_teardown->state !=
 					       TCP_STATE_TIME_WAIT &&
 				       timer_ticks() < deadline) {
-					sched_yield_in_kernel();
+					if (hrtimer_sleep_until(hrtimer_now_ns() +
+								1000000ULL,
+								NULL))
+						break;
 				}
 			}
 		}

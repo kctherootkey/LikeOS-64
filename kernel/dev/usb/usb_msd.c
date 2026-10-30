@@ -448,6 +448,7 @@ static void msd_io_lock(usb_msd_device_t *msd)
 		if (!msd->io_locked) {
 			msd->io_locked = 1;
 			msd->io_owner = my_id;
+			task_sleep_lock_taken();
 			spin_unlock_irqrestore(&msd->io_wait_lock, flags);
 			return;
 		}
@@ -468,6 +469,7 @@ static void msd_io_unlock(usb_msd_device_t *msd)
 	msd->io_locked = 0;
 	msd->io_owner = (uint64_t)-1;
 	spin_unlock_irqrestore(&msd->io_wait_lock, flags);
+	task_sleep_lock_dropped();
 	sched_wake_channel(&msd->io_locked);
 }
 

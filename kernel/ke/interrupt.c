@@ -513,10 +513,10 @@ void idt_init()
 
 	// IPI vectors for SMP
 	idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08,
-		      0x8E); // TLB shootdown
+		      0x8E); // Reschedule (IPI_RESCHEDULE_VECTOR)
 	idt_set_entry(0xFD, (uint64_t)ipi_vector_0xFD, 0x08, 0x8E); // Halt CPU
 	idt_set_entry(0xFE, (uint64_t)ipi_vector_0xFE, 0x08,
-		      0x8E); // Reschedule
+		      0x8E); // TLB shootdown (IPI_TLB_SHOOTDOWN)
 	idt_set_entry(0xFF, (uint64_t)ipi_vector_0xFF, 0x08,
 		      0x8E); // LAPIC spurious
 
@@ -1614,11 +1614,44 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 	// critical section such as a held spinlock).  sched_preempt() applies
 	// its own in_context_switch / bootstrap / try-lock guards on top.
 	if (allow_preempt && sched_need_resched() &&
-	    (from_user || (regs[REGS_RFLAGS] & 0x200)))
+	    (from_user || (regs[REGS_RFLAGS] & 0x200))) {
 		sched_preempt((interrupt_frame_t *)regs);
+
+		/* Resumed here, on the way back to user: a trace stop marked
+		 * on this thread while it waited for the processor is acted on
+		 * now, not at its next interrupt.  The return-to-user work
+		 * above runs once more -- the park, then whatever signal the
+		 * stop left pending (one a tracer injected, a SIGKILL) -- with
+		 * no second preemption. */
+		task_t *cur = from_user ? sched_current() : NULL;
+
+		if (cur && cur->privilege == TASK_USER && cur->ptrace_group_stop)
+			irqentry_exit(regs, 0);
+	}
 }
 
+static void exception_handler_body(uint64_t *regs);
+
+/* Every exception, entered from the stub.  One taken from user mode
+ * publishes its frame for as long as it is being handled: a fault handler
+ * may sleep (demand paging, copy-on-write), and a thread stopped by its
+ * tracer while it sleeps there has its user registers in this frame and
+ * nowhere else (see ptrace_user_frame). */
 void exception_handler(uint64_t *regs)
+{
+	task_t *cur = (regs[REGS_CS] & 0x3) == 0x3 ? sched_current() : NULL;
+	interrupt_frame_t *outer = NULL;
+
+	if (cur) {
+		outer = cur->user_fault_frame;
+		cur->user_fault_frame = (interrupt_frame_t *)regs;
+	}
+	exception_handler_body(regs);
+	if (cur)
+		cur->user_fault_frame = outer;
+}
+
+static void exception_handler_body(uint64_t *regs)
 {
 	uint64_t int_no = regs[REGS_INTNO];
 	uint64_t err_code = regs[REGS_ERRC];
@@ -1840,7 +1873,31 @@ void exception_handler(uint64_t *regs)
 			 * task is parked inside this handler -- which is
 			 * exactly how long the stop lasts. */
 			cur->preempt_frame = frame;
-			task_ptrace_stop(cur, SIGTRAP, 0, 0);
+			{
+				/* What the trap was, for PTRACE_GETSIGINFO --
+				 * how a debugger tells a breakpoint from a
+				 * completed step from a watchpoint: TRAP_TRACE
+				 * for a step (DR6.BS), TRAP_HWBKPT for an
+				 * address register (B0..B3), and SI_KERNEL for
+				 * an int3. */
+				siginfo_t ti;
+
+				mm_memset(&ti, 0, sizeof(ti));
+				ti.si_signo = SIGTRAP;
+				if (int_no == 3)
+					ti.si_code = SI_KERNEL;
+				else if (cur->dr_status & 0x4000)
+					ti.si_code = TRAP_TRACE;
+				else if (cur->dr_status & 0xF)
+					ti.si_code = TRAP_HWBKPT;
+				else
+					ti.si_code = TRAP_BRKPT;
+				/* An address only for the debug traps; an int3
+				 * (SI_KERNEL) reports none. */
+				if (int_no == 1)
+					ti.si_addr = (void *)frame->rip;
+				task_ptrace_stop_info(cur, SIGTRAP, 0, 0, &ti);
+			}
 			cur->preempt_frame = NULL;
 			return;
 		}
@@ -2336,7 +2393,7 @@ void ipi_handler(uint64_t *regs)
 	uint64_t vector = regs[15]; // Vector number pushed by IPI stub
 
 	switch (vector) {
-	case 0xFE: // IPI_RESCHEDULE_VECTOR
+	case IPI_RESCHEDULE_VECTOR:
 		// Mark current task as needing reschedule; the actual signal
 		// delivery + preemption happen in the shared irqentry_exit()
 		// call at the tail of this handler.  (sched_remove_task sends
@@ -2351,7 +2408,7 @@ void ipi_handler(uint64_t *regs)
 		lapic_eoi();
 		break;
 
-	case 0xFD: // IPI_HALT_VECTOR
+	case IPI_HALT_VECTOR:
 		// Halt this CPU
 		lapic_eoi();
 		__asm__ volatile("cli");
@@ -2360,7 +2417,7 @@ void ipi_handler(uint64_t *regs)
 		}
 		break;
 
-	case 0xFC: // IPI_TLB_SHOOTDOWN
+	case IPI_TLB_SHOOTDOWN:
 		/* Apply the sender's invalidation request -- the named pages
 		 * when the request is provably current, a full reload for any
 		 * ambiguity -- and acknowledge it.  All of it lives beside the
@@ -2383,7 +2440,7 @@ void ipi_handler(uint64_t *regs)
 	/* Common return-to-user work — one shared path for every IPI vector
 	 * that returns (the halt vector loops forever and never reaches here).
 	 * Delivers a pending signal on return to user and performs the pending
-	 * reschedule (need_resched set by the 0xFE case above, or by a wakeup). */
+	 * reschedule (need_resched set by the reschedule case above, or by a wakeup). */
 	irqentry_exit(regs, 1);
 }
 

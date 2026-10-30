@@ -64,6 +64,9 @@ static struct {
 	/* The thread that pushes.  Everything below is why it exists. */
 	task_t *worker;
 	volatile int worker_ready;
+	/* A wake owed to the worker by a print made where waking is not
+	 * allowed (see console_flush_hook); paid by drm_console_tick(). */
+	volatile int wake_deferred;
 
 	/* The display as the console had it before the takeover: the
 	 * framebuffer it drew into and the flush hook that announced its
@@ -188,10 +191,34 @@ static void console_flush_hook(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 	}
 	spin_unlock_irqrestore(&g_con.lock, fl);
 
-	if (g_con.worker_ready)
-		sched_wake_channel_once(&g_con, 1);
-	else
+	/* Wake the worker -- but never from where a wake can deadlock.  A
+	 * print with interrupts off may come from inside the scheduler, with
+	 * a run-queue lock held (its own diagnostics do exactly that), and
+	 * the wake takes the task-list lock and a run-queue lock: possibly
+	 * the very one held, which hung the whole machine on its first
+	 * line of output.  There the wake is only recorded, and the next
+	 * timer tick -- a context that holds no lock -- delivers it, as the
+	 * console wake-ups of a print made in scheduler context always are
+	 * deferred.  The worker also wakes by itself every 50 ms. */
+	if (g_con.worker_ready) {
+		if (!irqs_enabled())
+			g_con.wake_deferred = 1;
+		else
+			sched_wake_channel_once(&g_con, 1);
+	} else {
 		console_push();
+	}
+}
+
+/* From the timer tick: deliver a wake that console_flush_hook() had to
+ * defer.  The tick interrupted code that had interrupts on, so this CPU
+ * holds no spinlock here. */
+void drm_console_tick(void)
+{
+	if (g_con.worker_ready && g_con.wake_deferred) {
+		g_con.wake_deferred = 0;
+		sched_wake_channel_once(&g_con, 1);
+	}
 }
 
 /* Mark the whole screen and get it on the display. */

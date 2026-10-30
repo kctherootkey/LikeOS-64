@@ -2320,7 +2320,13 @@ void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys, uint64_t vaddr)
  * that CAN shoot down -- gathers run on every COW fault, so the queue
  * drains within moments on any live system. */
 #define TLB_DEFER_RING 1024
-static uint64_t g_tlb_defer_pages[TLB_DEFER_RING];
+/* Each parked page with the address space it was unmapped from: only the
+ * CPUs holding that space can still translate to it. */
+struct tlb_deferred {
+	uint64_t pml4_phys; /* 0: unknown, every CPU must invalidate */
+	uint64_t page;
+};
+static struct tlb_deferred g_tlb_defer[TLB_DEFER_RING];
 static int g_tlb_defer_n;
 static spinlock_t g_tlb_defer_lock = SPINLOCK_INIT("tlbdefer");
 
@@ -2331,21 +2337,58 @@ void mm_tlb_deferred_drain(void)
 	/* Chunked: the batch buffer must stay small on the kernel stack, and
 	 * the take-then-shootdown-then-free order per chunk keeps the
 	 * invariant (no page freed before its stale translations die) even
-	 * against entries added concurrently. */
-	for (;;) {
+	 * against entries added concurrently.
+	 *
+	 * Bounded to what was parked on entry: entries parked meanwhile are
+	 * the next flush's, so one caller does not keep draining for every
+	 * other processor's interrupts-off faults.
+	 *
+	 * Each page is invalidated in its own address space only.  This used
+	 * to be a shootdown of every address space, which waits for EVERY
+	 * processor -- so whenever anything was parked, the next COW fault or
+	 * unmap of any process anywhere waited for the busiest processor of
+	 * the machine, whether it had ever run that process or not.  A CPU
+	 * that held the space at parking time and has left it since did a
+	 * full CR3 load on the way out, which dropped every translation of
+	 * it; the targeted request waits for exactly the CPUs still holding
+	 * it.  A root freed and reused by another process meanwhile only
+	 * makes the request wait for CPUs that did not need to answer. */
+	int budget = __atomic_load_n(&g_tlb_defer_n, __ATOMIC_ACQUIRE);
+
+	while (budget > 0) {
 		uint64_t local[64];
-		int n = 0;
+		uint64_t roots[64];
+		int n = 0, nroots = 0, global = 0;
 		uint64_t f;
 
 		spin_lock_irqsave(&g_tlb_defer_lock, &f);
-		while (g_tlb_defer_n > 0 && n < 64)
-			local[n++] = g_tlb_defer_pages[--g_tlb_defer_n];
+		while (g_tlb_defer_n > 0 && n < 64 && n < budget) {
+			struct tlb_deferred *d = &g_tlb_defer[--g_tlb_defer_n];
+			int k;
+
+			local[n++] = d->page;
+			if (!d->pml4_phys) {
+				global = 1;
+				continue;
+			}
+			for (k = 0; k < nroots; k++)
+				if (roots[k] == d->pml4_phys)
+					break;
+			if (k == nroots)
+				roots[nroots++] = d->pml4_phys;
+		}
 		spin_unlock_irqrestore(&g_tlb_defer_lock, f);
 		if (!n)
 			return;
-		/* Every CPU drops every stale translation, then the pages can
-		 * safely re-enter the allocator. */
-		smp_tlb_shootdown_sync();
+		budget -= n;
+		/* Every CPU that can hold a stale translation drops it, then
+		 * the pages can safely re-enter the allocator. */
+		if (global) {
+			smp_tlb_shootdown_sync();
+		} else {
+			for (int k = 0; k < nroots; k++)
+				smp_tlb_shootdown_mm_sync(roots[k]);
+		}
 		mm_put_pages_batch(local, (unsigned)n);
 	}
 }
@@ -2394,15 +2437,18 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 			/* Cannot shoot down from here: the ack-wait needs to
 			 * service the very interrupts it is waiting on.  Park
 			 * the pages; the next IRQs-on flush releases them
-			 * AFTER a proper shootdown.  See g_tlb_defer_pages. */
+			 * AFTER a proper shootdown.  See g_tlb_defer. */
 			uint64_t f;
 			unsigned parked = 0;
 
 			spin_lock_irqsave(&g_tlb_defer_lock, &f);
 			while (parked < g->n &&
-			       g_tlb_defer_n < TLB_DEFER_RING)
-				g_tlb_defer_pages[g_tlb_defer_n++] =
+			       g_tlb_defer_n < TLB_DEFER_RING) {
+				g_tlb_defer[g_tlb_defer_n].pml4_phys =
+					g->pml4_phys;
+				g_tlb_defer[g_tlb_defer_n++].page =
 					g->pages[parked++];
+			}
 			spin_unlock_irqrestore(&g_tlb_defer_lock, f);
 			if (parked < g->n) {
 				/* Ring full (would take a thousand IRQs-off
@@ -6371,12 +6417,16 @@ uint64_t *mm_clone_address_space(uint64_t *src_pml4)
 	// Flush TLB on this CPU (IRQs already enabled at this point)
 	mm_flush_all_tlb();
 
-	// CRITICAL: Flush TLB on ALL CPUs! We just marked the source (parent)
-	// pages as read-only/COW. If the parent is running on another CPU with
-	// stale TLB entries that still have write permission, it could write to
-	// pages without triggering a COW fault, corrupting shared memory.
+	// CRITICAL: Flush TLB on the other CPUs! We just marked the source
+	// (parent) pages as read-only/COW. If the parent is running on another
+	// CPU with stale TLB entries that still have write permission, it could
+	// write to pages without triggering a COW fault, corrupting shared
+	// memory.  Only the parent's entries changed, so only the CPUs holding
+	// its address space can be stale: asking every CPU made each fork wait
+	// for the busiest processor of the machine, holding the parent's
+	// mmap_lock for writing all the while.
 	if (sched_is_smp()) {
-		smp_tlb_shootdown_sync();
+		smp_tlb_shootdown_mm_sync(virt_to_phys(src_pml4));
 	}
 
 	return new_pml4;
@@ -6620,12 +6670,16 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 	// Flush TLB on this CPU (IRQs already enabled at this point)
 	mm_flush_all_tlb();
 
-	// CRITICAL: Flush TLB on ALL CPUs! We just marked the source (parent)
-	// pages as read-only/COW. If the parent is running on another CPU with
-	// stale TLB entries that still have write permission, it could write to
-	// pages without triggering a COW fault, corrupting shared memory.
+	// CRITICAL: Flush TLB on the other CPUs! We just marked the source
+	// (parent) pages as read-only/COW. If the parent is running on another
+	// CPU with stale TLB entries that still have write permission, it could
+	// write to pages without triggering a COW fault, corrupting shared
+	// memory.  Only the parent's entries changed, so only the CPUs holding
+	// its address space can be stale: asking every CPU made each fork wait
+	// for the busiest processor of the machine, holding the parent's
+	// mmap_lock for writing all the while.
 	if (sched_is_smp()) {
-		smp_tlb_shootdown_sync();
+		smp_tlb_shootdown_mm_sync(virt_to_phys(src_pml4));
 	}
 
 	return new_pml4;
