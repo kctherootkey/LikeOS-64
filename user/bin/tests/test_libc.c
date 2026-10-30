@@ -14556,10 +14556,28 @@ static void test_drm(void)
 #include <drm/vmwgfx_drm.h>
 #include <drm/sync_file.h>
 
+/* A vmwgfx command.  This is ioctl(): 0, or -1 with the code in errno --
+ * never a negative error code. */
 static long vmw_cmd(int fd, unsigned nr, unsigned dir, void *arg, size_t size)
 {
 	unsigned long req = _IOC(dir, 'd', 0x40 + nr, size);
 	return ioctl(fd, req, arg);
+}
+
+/* Is this a VMware hypervisor?  The hypervisor bit, then the vendor
+ * signature "VMwareVMware" in leaf 0x40000000.  Other hypervisors emulate
+ * the SVGA adapter (VirtualBox does) without the rest of what VMware offers
+ * next to it. */
+static int cpu_hypervisor_is_vmware(void)
+{
+	unsigned int a, b, c, d;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+			 : "a"(1), "c"(0));
+	if (!(c & (1u << 31)))
+		return 0;
+	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+			 : "a"(0x40000000u), "c"(0));
+	return b == 0x61774D56u && c == 0x4D566572u && d == 0x65726177u;
 }
 
 /* What does a buffer hold after a readback?  Four answers, four meanings.
@@ -15012,9 +15030,11 @@ static void test_drm_3d(void)
 	struct drm_vmw_handle_close_arg hc = { .handle = bo.rep.handle };
 	test_result("UNREF_DMABUF (handle close)", vmw_cmd(fd, DRM_VMW_UNREF_DMABUF, _IOC_WRITE, &hc, sizeof(hc)) == 0);
 
-	/* The host message channel.  Either the hypervisor answers it and a
-	 * log line is accepted, or it does not exist and the driver says
-	 * ENODEV -- both are correct, and a third answer is not. */
+	/* The host message channel.  Only a VMware hypervisor has one, and
+	 * there a log line is accepted.  Anywhere else -- VirtualBox's SVGA
+	 * adapter comes without it -- there is no channel to open and the
+	 * driver says EINVAL, its one answer for an exchange that did not
+	 * happen.  Anything else is wrong. */
 	{
 		char msg[] = "log LikeOS testlibc: display-manager message channel";
 		struct drm_vmw_msg_arg ma;
@@ -15022,10 +15042,11 @@ static void test_drm_3d(void)
 		ma.send = (uint64_t)(uintptr_t)msg;
 		ma.send_only = 1;
 		int rc = vmw_cmd(fd, DRM_VMW_MSG, _IOC_READ | _IOC_WRITE, &ma, sizeof(ma));
+		int err = rc ? errno : 0;
+		int vmware = cpu_hypervisor_is_vmware();
 		test_result("MSG: a host log line is accepted or refused cleanly",
-			    rc == 0 || rc == -ENODEV || rc == -EIO);
-		printf("      (message channel: %s)\n",
-		       rc == 0 ? "present" : rc == -ENODEV ? "absent" : "present, refused");
+			    vmware ? rc == 0 : (rc == -1 && err == EINVAL));
+		printf("      (message channel: %s)\n", rc == 0 ? "present" : "absent");
 	}
 
 	/* A fence event: the same wait as FENCE_WAIT, delivered as a
@@ -15076,7 +15097,7 @@ static void test_drm_3d(void)
 			int rc = vmw_cmd(rfd, DRM_VMW_UPDATE_LAYOUT, _IOC_WRITE, &ul,
 					 sizeof(ul));
 			test_result("UPDATE_LAYOUT is refused on the render node",
-				    rc == -EACCES || rc == -EINVAL || rc == -EPERM);
+				    rc == -1 && (errno == EACCES || errno == EINVAL || errno == EPERM));
 			close(rfd);
 		}
 		int cfd = stress_skip("UPDATE_LAYOUT on the card node") ?
@@ -15126,7 +15147,7 @@ static void test_drm_3d(void)
 					 sizeof(ul));
 			/* EACCES when an X server holds the display: also correct. */
 			test_result("UPDATE_LAYOUT is accepted on the card node",
-				    rc == 0 || rc == -EACCES);
+				    rc == 0 || (rc == -1 && errno == EACCES));
 			close(cfd);
 		}
 	}
