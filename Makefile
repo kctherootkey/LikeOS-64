@@ -263,8 +263,14 @@ BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
 # excluded (-MMD rather than -MD); with -nostdinc there are none anyway.
 DEPFLAGS = -MMD -MP
 
+# -fno-strict-aliasing: the kernel and our userland read structures through
+# other pointer types (checksums sum headers as 16-bit words, and more).  With
+# -O2's type-based alias analysis GCC is free to drop the stores before such
+# reads -- the UDP pseudo-header lost its addresses and every DHCP packet
+# carried a wrong checksum.  -O0 never did this, so the code was written
+# against these semantics.
 KERNEL_CFLAGS = $(DEPFLAGS) \
-			-m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+			-O2 -fno-strict-aliasing -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-mno-sse -mno-sse2 -mno-mmx -mno-80387 \
 			-fstack-protector-strong -mstack-protector-guard=tls \
 			-mstack-protector-guard-reg=gs -mstack-protector-guard-offset=104 \
@@ -297,7 +303,7 @@ ACPICA_SRCS = $(shell find $(ACPICA_DIR) -name '*.c' \
 ACPICA_OBJS = $(patsubst $(ACPICA_DIR)/%.c,$(BUILD_DIR)/acpica/%.o,$(ACPICA_SRCS))
 
 # Compiler flags for userspace programs
-USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+USER_CFLAGS = -O2 -fno-strict-aliasing -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fstack-protector-strong -mno-red-zone -mcmodel=small -fno-pic -Wall -Wextra \
 			-I$(USER_DIR)
 
