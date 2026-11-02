@@ -1381,8 +1381,53 @@ static int atomic_commit_locked(struct drm_device *dev, struct drm_atomic_state 
 	return 0;
 }
 
+/* How long a commit waits for the rendering of a framebuffer it shows. */
+#define COMMIT_RENDER_WAIT_NS (1000ULL * 1000000ULL)
+
+/* A framebuffer goes on the screen at the first vblank after its plane is
+ * programmed, and the display engine does not wait for the render engine:
+ * a buffer whose frame is still being drawn is scanned out half-finished.
+ * The display reads it from the top down, so what shows is the top of the
+ * screen with regions not yet drawn -- the cleared background, white --
+ * coming and going from frame to frame.  That is what a full-screen window
+ * whose buffers the X server flips onto the plane looked like (a window
+ * that does not cover the screen is copied into the server's own buffer by
+ * the GPU, in order behind the rendering, and was never affected).
+ *
+ * So the commit first waits for the last writer of every framebuffer it puts
+ * on a plane; nobody else orders the two engines for a client that attaches
+ * no in-fence.  Not interruptible: a signal to the caller must not let an
+ * unfinished frame onto the screen.  Bounded, so that a render engine that
+ * never finishes costs a late frame and not a stuck display; the object wait
+ * reports such a one. */
+static void commit_wait_for_rendering(struct drm_device *dev, struct drm_atomic_state *st)
+{
+	for (uint32_t i = 0; i < dev->nplanes; i++) {
+		struct drm_plane_state *ps = &st->planes[i];
+		struct drm_fence *waits[1 + I915_ENGINE_CLASSES];
+		unsigned nw = 0;
+
+		if (!ps->fb_changed || !ps->fb || !ps->fb->obj)
+			continue;
+		i915_gem_object_fences(ps->fb->obj, 0, 0, waits, &nw);
+		for (unsigned k = 0; k < nw; k++) {
+			int rc = drm_fence_wait_flags(waits[k], COMMIT_RENDER_WAIT_NS, 0);
+			if (rc) {
+				static unsigned said;
+				if (said < 4) {
+					said++;
+					kprintf("[drm] i915: framebuffer %u shown before its rendering finished (%d)\n",
+						ps->fb->id, rc);
+				}
+			}
+			drm_fence_put(waits[k]);
+		}
+	}
+}
+
 int intel_atomic_commit(struct drm_device *dev, struct drm_atomic_state *st)
 {
+	commit_wait_for_rendering(dev, st);
 	if (intel_legacy_display_active(to_i915(dev)))
 		return intel_legacy_atomic_commit(dev, st);
 	struct i915_device *i915 = to_i915(dev);
