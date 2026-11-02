@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: watching a folder for changes made elsewhere.
+// LikeOS Explorer: watching a folder for changes made elsewhere.
 //
 // Copyright (C) 2026 The LikeOS Project
 

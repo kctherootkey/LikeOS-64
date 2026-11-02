@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: computer-laptop, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="12" x2="0" y2="44"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="16" y1="40" x2="48" y2="16"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="44" x2="0" y2="52"><stop offset="0" stop-color="#e9edf3"/><stop offset="1" stop-color="#aab3c2"/></linearGradient></defs>
+<g transform="scale(0.25)">
+<path d="M16 12H48A4 4 0 0 1 52 16V40A4 4 0 0 1 48 44H16A4 4 0 0 1 12 40V16A4 4 0 0 1 16 12Z" fill="url(#g1)"/>
+<path d="M16 16H48V40H16Z" fill="url(#g2)"/>
+<path d="M12 44H52L60 48Q60 52 56 52H8Q4 52 4 48Z" fill="url(#g3)"/>
+</g>
+</svg>

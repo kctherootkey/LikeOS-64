@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: phone, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="20" y1="52" x2="44" y2="12"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M22 4H42A6 6 0 0 1 48 10V54A6 6 0 0 1 42 60H22A6 6 0 0 1 16 54V10A6 6 0 0 1 22 4Z" fill="url(#g1)"/>
+<path d="M22 12H42A2 2 0 0 1 44 14V50A2 2 0 0 1 42 52H22A2 2 0 0 1 20 50V14A2 2 0 0 1 22 12Z" fill="url(#g2)"/>
+</g>
+</svg>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: preferences-desktop-wallpaper, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="5.333" y1="5.333" x2="35.2" y2="58.667"><stop offset="0" stop-color="#7fb8ff"/><stop offset="1" stop-color="#3b74f0"/></linearGradient><clipPath id="c2"><path d="M17.333 5.333H46.667A12 12 0 0 1 58.667 17.333V46.667A12 12 0 0 1 46.667 58.667H17.333A12 12 0 0 1 5.333 46.667V17.333A12 12 0 0 1 17.333 5.333Z"/></clipPath><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="34" x2="0" y2="64"><stop offset="0" stop-color="#3fc283"/><stop offset="1" stop-color="#16834a"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="0" y1="46" x2="0" y2="64"><stop offset="0" stop-color="#21a067"/><stop offset="1" stop-color="#0f6b3d"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M17.333 5.333H46.667A12 12 0 0 1 58.667 17.333V46.667A12 12 0 0 1 46.667 58.667H17.333A12 12 0 0 1 5.333 46.667V17.333A12 12 0 0 1 17.333 5.333Z" fill="url(#g1)"/>
+<g clip-path="url(#c2)">
+<path d="M37.333 22A6.667 6.667 0 1 0 50.667 22A6.667 6.667 0 1 0 37.333 22Z" fill="#fff3c4"/>
+<path d="M0 46C14 34 26 34 40 44S58 48 64 42V64H0Z" fill="url(#g3)"/>
+<path d="M0 54C16 46 34 50 46 56S60 58 64 54V64H0Z" fill="url(#g4)"/>
+</g>
+</g>
+</svg>

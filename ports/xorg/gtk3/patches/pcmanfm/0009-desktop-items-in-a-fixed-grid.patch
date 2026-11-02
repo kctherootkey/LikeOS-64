@@ -1,0 +1,258 @@
+Desktop items in a fixed grid, with rounded boxes, a blurred label shadow and a shortcut badge.
+
+The grid is compact: 48-pixel icons in cells 76 pixels wide, names wrapped
+to two lines of about 70 pixels, a little air above the icon and between it
+and its name, and a few pixels between rows so that two selected items'
+boxes stay apart.  Upstream's cells were 116 pixels wide, which spread the
+icons out more than a desktop of shortcuts needs.
+
+Every item's box is the width of its cell, whatever the length of its name:
+the icon's rectangle now spans the cell from its top to the label, and the
+label's spans the cell's width.  Those two rectangles are what is drawn,
+repainted and hit-tested, so they stay one shape.  The boxes and the
+keyboard focus frame have 8-pixel rounded corners.
+
+The label's shadow is a soft blur -- the text laid down at low opacity in a
+small cloud of offsets, densest one pixel down and right -- rather than two
+hard copies.
+
+A shortcut is marked with a small badge over the icon's bottom-right
+corner: a disc in the LikeOS accent, ringed in white, with a white arrow
+pointing up and to the right.  libfm's cell renderer would draw its own
+black arrow in the top-left corner when given the file's info, so a
+shortcut's icon is rendered without it.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -50,9 +50,6 @@
+ # define FM_FOLDER_MODEL_COL_ICON COL_FILE_ICON
+ #endif
+ 
+-#define SPACING 2
+-#define PADDING 6
+-#define MARGIN  2
+ 
+ /* the search dialog timeout (in ms) */
+ #define DESKTOP_SEARCH_DIALOG_TIMEOUT (5000)
+@@ -298,9 +295,16 @@
+         item->icon_rect.width = fm_config->big_icon_size;
+         item->icon_rect.height = fm_config->big_icon_size;
+     }
+-    item->icon_rect.x = item->area.x + (desktop->cell_w - item->icon_rect.width) / 2;
+-    item->icon_rect.y = item->area.y + desktop->ypad + (fm_config->big_icon_size - item->icon_rect.height) / 2;
+-    item->icon_rect.height += desktop->spacing; // FIXME: this is probably wrong
++    /* Every desktop item gets a box of the same width -- the cell's, less
++     * a pixel either side so neighbours do not touch -- whatever the length
++     * of its name, so a selection reads as an even grid.  The icon's part
++     * of it reaches from the top of the cell to the label, and the icon
++     * renderer centres the picture in it; together with the label's part
++     * below, that is the box drawn, repainted and hit-tested. */
++    item->icon_rect.x = item->area.x + 1;
++    item->icon_rect.width = desktop->cell_w - 2;
++    item->icon_rect.y = item->area.y + 1;
++    item->icon_rect.height = desktop->ypad + fm_config->big_icon_size + desktop->spacing - 1;
+ 
+     /* text label rect */
+     pango_layout_set_text(desktop->pl, NULL, 0);
+@@ -312,10 +316,10 @@
+     pango_layout_set_text(desktop->pl, NULL, 0);
+ 
+     /* FIXME: RTL */
+-    item->text_rect.x = item->area.x + (desktop->cell_w - rc2.width - 4) / 2;
++    item->text_rect.x = item->area.x + 1;
+     item->text_rect.y = item->area.y + desktop->ypad + fm_config->big_icon_size + desktop->spacing;
+-    item->text_rect.width = rc2.width + 4;
+-    item->text_rect.height = rc2.y + rc2.height + 4;
++    item->text_rect.width = desktop->cell_w - 2;
++    item->text_rect.height = rc2.y + rc2.height + 6;
+     item->area.width = (desktop->cell_w + MAX(item->icon_rect.width, item->text_rect.width)) / 2;
+     item->area.height = item->text_rect.y + item->text_rect.height - item->area.y;
+ }
+@@ -1881,6 +1885,59 @@
+         desktop->idle_layout = gdk_threads_add_idle((GSourceFunc)on_idle_layout, desktop);
+ }
+ 
++/* A rounded rectangle path, inset half a pixel when `stroke' so a one-pixel
++ * line falls on whole pixels. */
++static void desktop_round_rect(cairo_t *cr, const GdkRectangle *r, double radius, gboolean stroke)
++{
++    double x = r->x, y = r->y, w = r->width, h = r->height;
++
++    if (stroke)
++    {
++        x += 0.5;
++        y += 0.5;
++        w -= 1;
++        h -= 1;
++        radius -= 0.5;
++    }
++    cairo_new_sub_path(cr);
++    cairo_arc(cr, x + w - radius, y + radius, radius, -G_PI / 2, 0);
++    cairo_arc(cr, x + w - radius, y + h - radius, radius, 0, G_PI / 2);
++    cairo_arc(cr, x + radius, y + h - radius, radius, G_PI / 2, G_PI);
++    cairo_arc(cr, x + radius, y + radius, radius, G_PI, 3 * G_PI / 2);
++    cairo_close_path(cr);
++}
++
++/* The mark of a shortcut: a small disc in the LikeOS accent, ringed in
++ * white so it stands off any icon, with a white arrow pointing up and to the
++ * right -- over the bottom-right corner of the icon, in place of libfm's
++ * black arrow in the top-left one.  (x, y) is the disc's top-left corner. */
++static void paint_link_mark(cairo_t *cr, double x, double y)
++{
++    const double r = 7, cx = x + r, cy = y + r;
++
++    cairo_save(cr);
++    cairo_new_sub_path(cr);
++    cairo_arc(cr, cx, cy, r, 0, 2 * G_PI);
++    cairo_set_source_rgb(cr, 1, 1, 1);
++    cairo_fill(cr);
++    cairo_new_sub_path(cr);
++    cairo_arc(cr, cx, cy, r - 1.25, 0, 2 * G_PI);
++    cairo_set_source_rgb(cr, 0x3f / 255.0, 0x74 / 255.0, 0xf2 / 255.0);
++    cairo_fill(cr);
++
++    cairo_set_source_rgb(cr, 1, 1, 1);
++    cairo_set_line_width(cr, 1.5);
++    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
++    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
++    cairo_move_to(cr, cx - 2.5, cy + 2.5);
++    cairo_line_to(cr, cx + 2.5, cy - 2.5);
++    cairo_move_to(cr, cx - 1.25, cy - 2.5);
++    cairo_line_to(cr, cx + 2.5, cy - 2.5);
++    cairo_line_to(cr, cx + 2.5, cy + 1.25);
++    cairo_stroke(cr);
++    cairo_restore(cr);
++}
++
+ static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRectangle* expose_area, GdkPixbuf* icon)
+ {
+     GtkWidget* widget = (GtkWidget*)self;
+@@ -1926,32 +1983,42 @@
+                                   (item == self->hover_item) ? 0.45 : 0.35);
+         else
+             cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.12);
+-        gdk_cairo_rectangle(cr, &box);
++        desktop_round_rect(cr, &box, 8, FALSE);
+         cairo_fill(cr);
+         if(selected)
+         {
+             cairo_set_line_width(cr, 1.0);
+             cairo_set_source_rgb(cr, 91/255.0, 143/255.0, 249/255.0);
+-            cairo_rectangle(cr, box.x + 0.5, box.y + 0.5, box.width - 1, box.height - 1);
++            desktop_round_rect(cr, &box, 8, TRUE);
+             cairo_stroke(cr);
+         }
+         cairo_restore(cr);
+     }
+ 
+-    /* The shadow: soft rather than a hard copy of the text -- a dark copy
+-     * one pixel down and right, and a fainter one a pixel further. */
+-    cairo_save(cr);
+-    cairo_set_source_rgba(cr, self->conf.desktop_shadow.red / 65535.0,
+-                          self->conf.desktop_shadow.green / 65535.0,
+-                          self->conf.desktop_shadow.blue / 65535.0, 0.30);
+-    cairo_move_to(cr, text_x + 2, text_y + 2);
+-    pango_cairo_show_layout(cr, self->pl);
+-    cairo_set_source_rgba(cr, self->conf.desktop_shadow.red / 65535.0,
+-                          self->conf.desktop_shadow.green / 65535.0,
+-                          self->conf.desktop_shadow.blue / 65535.0, 0.85);
+-    cairo_move_to(cr, text_x + 1, text_y + 1);
+-    pango_cairo_show_layout(cr, self->pl);
+-    cairo_restore(cr);
++    /* The shadow: a blur rather than a copy of the text -- the text laid
++     * down a few times at low opacity in a small cloud of offsets, densest
++     * one pixel down and right, which gives the label a soft dark glow
++     * that leans away from the light. */
++    {
++        static const struct { int dx, dy; double a; } blur[] = {
++            { 1, 1, 0.42 }, { 0, 1, 0.22 }, { 1, 0, 0.18 }, { 2, 2, 0.18 },
++            { 1, 2, 0.16 }, { 2, 1, 0.14 }, { -1, 1, 0.10 }, { 0, 2, 0.10 },
++            { 0, 0, 0.12 },
++        };
++        guint k;
++
++        cairo_save(cr);
++        for (k = 0; k < G_N_ELEMENTS(blur); k++)
++        {
++            cairo_set_source_rgba(cr, self->conf.desktop_shadow.red / 65535.0,
++                                  self->conf.desktop_shadow.green / 65535.0,
++                                  self->conf.desktop_shadow.blue / 65535.0,
++                                  blur[k].a);
++            cairo_move_to(cr, text_x + blur[k].dx, text_y + blur[k].dy);
++            pango_cairo_show_layout(cr, self->pl);
++        }
++        cairo_restore(cr);
++    }
+     gdk_cairo_set_source_color(cr, &self->conf.desktop_fg);
+ 
+     /* real text */
+@@ -1975,7 +2042,7 @@
+         cairo_save(cr);
+         cairo_set_line_width(cr, 1.0);
+         cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.55);
+-        cairo_rectangle(cr, box.x + 0.5, box.y + 0.5, box.width - 1, box.height - 1);
++        desktop_round_rect(cr, &box, 8, TRUE);
+         cairo_stroke(cr);
+         cairo_restore(cr);
+     }
+@@ -1985,13 +2052,24 @@
+     else
+         g_object_set(G_OBJECT(self), "tooltip-text", NULL, NULL);
+ 
+-    /* draw the icon */
+-    g_object_set(self->icon_render, "pixbuf", icon, "info", item->fi, NULL);
++    /* draw the icon; a shortcut's without the renderer's emblem, which
++     * is drawn here instead (paint_link_mark()) */
++    gboolean link = fm_file_info_is_symlink(item->fi) || fm_file_info_is_shortcut(item->fi);
++    g_object_set(self->icon_render, "pixbuf", icon, "info", link ? NULL : item->fi, NULL);
+ #if GTK_CHECK_VERSION(3, 0, 0)
+     gtk_cell_renderer_render(GTK_CELL_RENDERER(self->icon_render), cr, widget, &item->icon_rect, &item->icon_rect, state);
+ #else
+     gtk_cell_renderer_render(GTK_CELL_RENDERER(self->icon_render), window, widget, &item->icon_rect, &item->icon_rect, expose_area, state);
+ #endif
++    if (link)
++    {
++        int size = icon ? gdk_pixbuf_get_width(icon) : fm_config->big_icon_size;
++        int ih = icon ? gdk_pixbuf_get_height(icon) : fm_config->big_icon_size;
++        double ix = item->icon_rect.x + (item->icon_rect.width - size) / 2;
++        double iy = item->icon_rect.y + (item->icon_rect.height - ih) / 2;
++
++        paint_link_mark(cr, ix + size - 14, iy + ih - 14);
++    }
+ }
+ 
+ static void redraw_item(FmDesktop* desktop, FmDesktopItem* item)
+@@ -3405,11 +3483,17 @@
+ 
+     font_h /= PANGO_SCALE;
+ 
+-    self->spacing = SPACING;
+-    self->xpad = self->ypad = PADDING;
+-    self->xmargin = self->ymargin = MARGIN;
++    /* A compact grid: 48-pixel icons in cells about 76 pixels wide, the
++     * names wrapped to two lines of about 70 pixels, a little air above
++     * the icon and between it and its name, and a few pixels between rows
++     * so that two selected items' boxes stay apart. */
++    self->spacing = 4;
++    self->xpad = 1;
++    self->ypad = 5;
++    self->xmargin = 4;
++    self->ymargin = 2;
+     self->text_h = font_h * 2;
+-    self->text_w = 100;
++    self->text_w = 68;
+ #if FM_CHECK_VERSION(1, 2, 0)
+     if (fm_config->show_full_names)
+         self->pango_text_h = -1;
+@@ -3419,7 +3503,7 @@
+     self->pango_text_w = self->text_w * PANGO_SCALE;
+     self->text_h += 4;
+     self->text_w += 4; /* 4 is for drawing border */
+-    self->cell_h = fm_config->big_icon_size + self->spacing + self->text_h + self->ypad * 2;
++    self->cell_h = fm_config->big_icon_size + self->spacing + self->text_h + self->ypad * 2 + 6;
+     self->cell_w = MAX((gint)self->text_w, fm_config->big_icon_size) + self->xpad * 2;
+ 
+     update_working_area(self);

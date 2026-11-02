@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: cover art.
+// LikeOS -- LikeOS Media Player: cover art.
 //
 // Two sources, in order: a picture embedded in the file's tags (ID3 APIC,
 // MP4 covr, Vorbis METADATA_BLOCK_PICTURE, Matroska attachments -- GStreamer
@@ -11,12 +11,14 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
+#include <math.h>
 #include <string.h>
 
 #include <glib/gstdio.h>
 #include <gst/tag/tag.h>
 
 #include "mediaplayer.h"
+#include "ui.h"
 #include "util.h"
 
 #define COVER_MAX_BYTES (16 * 1024 * 1024)
@@ -148,7 +150,8 @@ static int folder_name_score(const char *name)
 		    g_ascii_strncasecmp(name, stems[i], stem_len) == 0)
 			return 100 - i;
 	}
-	/* "AlbumArt_{GUID}_Large.jpg", as Windows Media Player wrote them. */
+	/* "AlbumArt_{GUID}_Large.jpg", the names some older players left
+	 * beside the files they ripped. */
 	if (g_ascii_strncasecmp(name, "albumart", 8) == 0)
 		return 20;
 	return 0;
@@ -250,56 +253,26 @@ void mp_cover_draw(cairo_t *cr, GdkPixbuf *cover, double x, double y,
 		return;
 	}
 
-	/* No picture: a square tile in the accent colour with a large
-	 * symbolic note (or film strip) on it. */
+	/* No picture: a square tile in the LikeOS blues with a large note
+	 * (or film frame) drawn on it. */
 	double side = MIN(w, h);
 	double dx = x + (w - side) / 2, dy = y + (h - side) / 2;
 	cairo_pattern_t *g = cairo_pattern_create_linear(dx, dy, dx + side,
 							 dy + side);
-	cairo_pattern_add_color_stop_rgb(g, 0.0, 0.0, 0.47, 0.83);
-	cairo_pattern_add_color_stop_rgb(g, 1.0, 0.0, 0.30, 0.62);
+	cairo_pattern_add_color_stop_rgb(g, 0.0, 0x7f / 255.0, 0xb2 / 255.0,
+					 1.0);
+	cairo_pattern_add_color_stop_rgb(g, 1.0, 0x2a / 255.0, 0x5b / 255.0,
+					 0xd7 / 255.0);
 	rounded_rect(cr, dx, dy, side, side, radius);
 	cairo_set_source(cr, g);
 	cairo_fill(cr);
 	cairo_pattern_destroy(g);
 
-	if (fallback_icon != NULL && widget != NULL) {
-		/* The symbolic icons exist as pictures of a few fixed sizes
-		 * (there is no SVG loader to draw them at any size), so the
-		 * glyph takes the largest of those that fits -- drawn at its
-		 * own size, sharp, rather than stretched to 45% of the tile
-		 * and blurred.  On a large tile it is a little smaller than
-		 * that, which reads better than a blocky one. */
-		static const int sizes[] = { 96, 64, 48, 32, 24, 16 };
-		int want = (int)(side * 0.45), isz = 0;
-
-		for (gsize i = 0; i < G_N_ELEMENTS(sizes); i++)
-			if (sizes[i] <= want) {
-				isz = sizes[i];
-				break;
-			}
-		if (isz >= 16) {
-			GtkIconTheme *th = gtk_icon_theme_get_default();
-			GtkIconInfo *ii = gtk_icon_theme_lookup_icon(
-				th, fallback_icon, isz,
-				GTK_ICON_LOOKUP_FORCE_SIZE);
-			if (ii != NULL) {
-				GdkRGBA white = { 1, 1, 1, 0.92 };
-				GdkPixbuf *ip = gtk_icon_info_load_symbolic(
-					ii, &white, NULL, NULL, NULL, NULL,
-					NULL);
-				if (ip != NULL) {
-					int iw = gdk_pixbuf_get_width(ip);
-					int ih = gdk_pixbuf_get_height(ip);
-					gdk_cairo_set_source_pixbuf(
-						cr, ip, dx + (side - iw) / 2,
-						dy + (side - ih) / 2);
-					cairo_paint(cr);
-					g_object_unref(ip);
-				}
-				g_object_unref(ii);
-			}
-		}
+	(void)widget;
+	if (fallback_icon != NULL && side >= 24) {
+		cairo_set_source_rgba(cr, 1, 1, 1, 0.92);
+		mp_glyph_paint(cr, fallback_icon, dx + side / 2, dy + side / 2,
+			       round(side * 0.4));
 	}
 	cairo_restore(cr);
 }

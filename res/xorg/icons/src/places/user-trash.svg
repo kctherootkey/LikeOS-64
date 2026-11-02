@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: user-trash, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="13" y1="20" x2="51" y2="60"><stop offset="0" stop-color="#8e9ab0"/><stop offset="1" stop-color="#5a667d"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="13" y1="20" x2="51" y2="60"><stop offset="0" stop-color="#8e9ab0"/><stop offset="1" stop-color="#5a667d"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="0" y1="13" x2="0" y2="20"><stop offset="0" stop-color="#7d8aa1"/><stop offset="1" stop-color="#4f5b72"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M13 20L51 20L47 60L17 60Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M13 20L51 20L47 60L17 60Z" fill="url(#g2)" stroke="url(#g3)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M24.4 27V53M32 27V53M39.6 27V53" fill="none" stroke="#c3cad6" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.75"/>
+<g >
+<path d="M27 6H37A3 3 0 0 1 40 9V11A3 3 0 0 1 37 14H27A3 3 0 0 1 24 11V9A3 3 0 0 1 27 6Z" fill="none" stroke="#5a667d" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12 13H52A3 3 0 0 1 55 16V17A3 3 0 0 1 52 20H12A3 3 0 0 1 9 17V16A3 3 0 0 1 12 13Z" fill="url(#g4)"/>
+<path d="M12 13.5H52" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.35"/>
+</g>
+</g>
+</svg>

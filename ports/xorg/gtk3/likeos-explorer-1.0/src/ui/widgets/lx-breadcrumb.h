@@ -1,7 +1,7 @@
 // LikeOS -- breadcrumb address bar.
 //
 // A reusable LikeOS widget: the path as a row of buttons, one per place
-// ("This PC › Local Disk › usr › share"), each chevron opening a list of the
+// ("Computer › System disk › usr › share"), each chevron opening a list of the
 // folders inside that place; a click on the empty part of the bar -- or
 // lx_breadcrumb_edit() -- turns it into a text field holding the path, and
 // Escape or leaving it turns it back.  It knows nothing about files: the

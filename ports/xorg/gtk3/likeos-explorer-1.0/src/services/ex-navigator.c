@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: where a tab is and where it has been.
+// LikeOS Explorer: where a tab is and where it has been.
 //
 // Copyright (C) 2026 The LikeOS Project
 

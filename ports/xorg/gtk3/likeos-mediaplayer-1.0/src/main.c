@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: start-up.
+// LikeOS -- LikeOS Media Player: start-up.
 //
 //   mediaplayer [--fullscreen] [--no-video] [--shuffle] [--repeat=MODE]
 //               [--video-sink=NAME] [FILE|FOLDER|PLAYLIST|URL ...]

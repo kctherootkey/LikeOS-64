@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: go-home, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="26" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#e8edf5"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="32"><stop offset="0" stop-color="#5b8ff9"/><stop offset="1" stop-color="#2a5bd7"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="32"><stop offset="0" stop-color="#5b8ff9"/><stop offset="1" stop-color="#2a5bd7"/></linearGradient><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="40" x2="0" y2="60"><stop offset="0" stop-color="#4a82f0"/><stop offset="1" stop-color="#2a5bd7"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M12.5 26H51.5A2.5 2.5 0 0 1 54 28.5V57.5A2.5 2.5 0 0 1 51.5 60H12.5A2.5 2.5 0 0 1 10 57.5V28.5A2.5 2.5 0 0 1 12.5 26Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M12.5 26H51.5A2.5 2.5 0 0 1 54 28.5V57.5A2.5 2.5 0 0 1 51.5 60H12.5A2.5 2.5 0 0 1 10 57.5V28.5A2.5 2.5 0 0 1 12.5 26Z" fill="#b9c1ce"/>
+<path d="M12.5 26H51.5A1.5 1.5 0 0 1 53 27.5V57.5A1.5 1.5 0 0 1 51.5 59H12.5A1.5 1.5 0 0 1 11 57.5V27.5A1.5 1.5 0 0 1 12.5 26Z" fill="url(#g2)"/>
+<path d="M41.5 8H46.5A1.5 1.5 0 0 1 48 9.5V22.5A1.5 1.5 0 0 1 46.5 24H41.5A1.5 1.5 0 0 1 40 22.5V9.5A1.5 1.5 0 0 1 41.5 8Z" fill="#1f4fc9"/>
+<path d="M2 32L32 4L62 32Z" fill="url(#g3)" stroke="url(#g4)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M28 40H36A2 2 0 0 1 38 42V58A2 2 0 0 1 36 60H28A2 2 0 0 1 26 58V42A2 2 0 0 1 28 40Z" fill="url(#g5)"/>
+<path d="M6 31.5L32 7.5L58 31.5" fill="none" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.35"/>
+<path d="M34 51A1 1 0 1 0 36 51A1 1 0 1 0 34 51Z" fill="#ffffff" opacity="0.9"/>
+</g>
+</svg>

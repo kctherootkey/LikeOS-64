@@ -115,6 +115,18 @@ while read -r section name version deb repo rest; do
 	# Exactly one top-level directory is expected; take it whatever it is
 	# called, which is what absorbs the GitLab naming difference.
 	inner=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
+	# A tarball with its members at the archive root and no directory at
+	# all (the time zone database) gets the directory every other source
+	# arrives with, as a zip does above.
+	if [ -z "$inner" ] &&
+		[ -n "$(find "$tmp" -mindepth 1 -maxdepth 1 | head -1)" ]; then
+		mkdir "$tmp/.$name-$have_ver" &&
+			find "$tmp" -mindepth 1 -maxdepth 1 \
+				! -name ".$name-$have_ver" \
+				-exec mv {} "$tmp/.$name-$have_ver/" \; &&
+			mv "$tmp/.$name-$have_ver" "$tmp/$name-$have_ver" &&
+			inner="$tmp/$name-$have_ver"
+	fi
 	if [ -z "$inner" ]; then
 		echo "  FAIL $name-$have_ver (no directory inside the tarball)" >&2
 		rm -rf "$tmp"

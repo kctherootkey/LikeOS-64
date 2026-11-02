@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: likeos-logo, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="8" y1="56" x2="36.8" y2="8"><stop offset="0" stop-color="#2450c8"/><stop offset="1" stop-color="#4a80f2"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="29.6" y1="36.8" x2="56" y2="8"><stop offset="0" stop-color="#1f8ff0"/><stop offset="1" stop-color="#6cd4ff"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M8 12.5A4.5 4.5 0 0 1 17 12.5V44.75A2.25 2.25 0 0 0 19.25 47H51.5A4.5 4.5 0 0 1 51.5 56H16.1A8.1 8.1 0 0 1 8 47.9ZM23 24.5A16.5 16.5 0 1 0 56 24.5A16.5 16.5 0 1 0 23 24.5ZM31 24.5A8.5 8.5 0 1 1 48 24.5A8.5 8.5 0 1 1 31 24.5Z" fill="#0b1730" opacity="0.18" transform="translate(0 1)" filter="url(#f1)"/>
+<path d="M8 12.5A4.5 4.5 0 0 1 17 12.5V44.75A2.25 2.25 0 0 0 19.25 47H51.5A4.5 4.5 0 0 1 51.5 56H16.1A8.1 8.1 0 0 1 8 47.9Z" fill="url(#g2)"/>
+<path d="M23 24.5A16.5 16.5 0 1 0 56 24.5A16.5 16.5 0 1 0 23 24.5ZM31 24.5A8.5 8.5 0 1 1 48 24.5A8.5 8.5 0 1 1 31 24.5Z" fill="url(#g3)"/>
+<path d="M8 12.5A4.5 4.5 0 0 1 17 12.5V44.75A2.25 2.25 0 0 0 19.25 47H51.5A4.5 4.5 0 0 1 51.5 56H16.1A8.1 8.1 0 0 1 8 47.9Z" fill="none" stroke="#ffffff" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="0.18"/>
+</g>
+</svg>

@@ -8,8 +8,8 @@ after the drop until the next click.  The state now ends when the drag
 does.
 
 The drag image was the selected items' icons alone.  It is now each item
-as the desktop shows it selected -- the box, the icon and the name -- as
-Windows drags desktop items.
+as the desktop shows it selected -- the box, the icon and the name -- so
+what moves under the pointer is what was picked up.
 
 Copyright (C) 2026 The LikeOS Project
 
@@ -30,7 +30,7 @@ Copyright (C) 2026 The LikeOS Project
  
 -    /* determine the size of complete pixbuf */
 +    /* determine the size of complete pixbuf: every selected item, icon
-+     * and label, as Windows drags them */
++     * and label, as the desktop shows it */
      area.width = 0; /* mark it */
      do
      {

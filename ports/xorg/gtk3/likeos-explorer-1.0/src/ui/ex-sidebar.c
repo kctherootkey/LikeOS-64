@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the navigation pane.
+// LikeOS Explorer: the navigation pane.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -13,8 +13,8 @@
 
 #include <string.h>
 
-enum { C_ICON, C_LABEL, C_ID, C_KIND, C_TIP, N_C };
-enum { K_ITEM, K_HEADER, K_SEPARATOR };
+enum { C_ICON, C_LABEL, C_ID, C_KIND, C_TIP, C_PINNED, N_C };
+enum { K_ITEM, K_HEADER };
 
 struct _ExSidebar {
 	GtkScrolledWindow parent;
@@ -23,7 +23,7 @@ struct _ExSidebar {
 	char *current;
 	ExMonitor *trash_mon;
 	gboolean rebuilding;
-	gboolean pinned_open, pc_open;
+	GtkTreePath *cursor; /* where the keyboard cursor was last */
 };
 
 G_DEFINE_TYPE(ExSidebar, ex_sidebar, GTK_TYPE_SCROLLED_WINDOW)
@@ -47,25 +47,31 @@ static void add_row(ExSidebar *s, GtkTreeIter *parent, GtkTreeIter *out,
 }
 
 static void add_folder(ExSidebar *s, GtkTreeIter *parent, GFile *f,
-		       const char *label)
+		       const char *label, gboolean pinned)
 {
 	ExLocation *l = ex_location_new_folder(f);
 	char *name = label ? g_strdup(label) : ex_location_display_name(l);
 	char *tip = g_file_get_parse_name(f);
+	GtkTreeIter it;
 
-	add_row(s, parent, NULL, ex_location_icon_name(l), name,
+	add_row(s, parent, &it, ex_location_icon_name(l), name,
 		ex_location_id(l), K_ITEM, tip);
+	gtk_tree_store_set(s->store, &it, C_PINNED, pinned, -1);
 	g_free(tip);
 	g_free(name);
 	ex_location_unref(l);
 }
 
+static void add_header(ExSidebar *s, const char *title)
+{
+	add_row(s, NULL, NULL, NULL, title, NULL, K_HEADER, NULL);
+}
+
 static void rebuild(ExSidebar *s)
 {
-	GtkTreeIter it, grp;
 	static const GUserDirectory personal[] = {
-		G_USER_DIRECTORY_DESKTOP,   G_USER_DIRECTORY_DOWNLOAD,
-		G_USER_DIRECTORY_DOCUMENTS, G_USER_DIRECTORY_PICTURES,
+		G_USER_DIRECTORY_DESKTOP,   G_USER_DIRECTORY_DOCUMENTS,
+		G_USER_DIRECTORY_DOWNLOAD,  G_USER_DIRECTORY_PICTURES,
 		G_USER_DIRECTORY_MUSIC,	    G_USER_DIRECTORY_VIDEOS,
 	};
 	ExVolumes *vols = ex_volumes_get_default();
@@ -73,35 +79,42 @@ static void rebuild(ExSidebar *s)
 	s->rebuilding = TRUE;
 	gtk_tree_store_clear(s->store);
 
-	add_row(s, NULL, NULL, "go-home", "Home", "likeos:home", K_ITEM,
+	add_header(s, "Favorites");
+	add_row(s, NULL, NULL, "likeos-home-color", "Home", "likeos:home", K_ITEM,
 		"Pinned folders, favorites and recent files");
-	add_row(s, NULL, NULL, NULL, NULL, NULL, K_SEPARATOR, NULL);
+	add_row(s, NULL, NULL, "likeos-gallery-color", "Gallery", "likeos:gallery",
+		K_ITEM, "The pictures and videos of your collection");
 
-	/* The personal folders that exist, in Windows' order. */
+	/* The personal folders that exist, then the folders pinned (the
+	 * shared GTK bookmarks), all marked with a pin. */
+	GPtrArray *shown = g_ptr_array_new_with_free_func(g_object_unref);
 	for (gsize i = 0; i < G_N_ELEMENTS(personal); i++) {
 		const char *p = ex_user_dir(personal[i]);
 
 		if (!p || !g_file_test(p, G_FILE_TEST_IS_DIR))
 			continue;
 		GFile *f = g_file_new_for_path(p);
-		add_folder(s, NULL, f, NULL);
-		g_object_unref(f);
+		add_folder(s, NULL, f, NULL, TRUE);
+		g_ptr_array_add(shown, f);
 	}
 
 	GPtrArray *bm = ex_bookmarks_list(ex_bookmarks_get_default());
-	if (bm->len) {
-		add_row(s, NULL, &grp, "view-pin-symbolic", "Pinned", "", K_HEADER,
-			NULL);
-		for (guint i = 0; i < bm->len; i++) {
-			ExBookmark *b = g_ptr_array_index(bm, i);
+	for (guint i = 0; i < bm->len; i++) {
+		ExBookmark *b = g_ptr_array_index(bm, i);
+		gboolean dup = FALSE;
 
-			add_folder(s, &grp, b->file, b->label);
-		}
+		for (guint j = 0; j < shown->len && !dup; j++)
+			dup = g_file_equal(b->file, g_ptr_array_index(shown, j));
+		if (!dup)
+			add_folder(s, NULL, b->file, b->label, TRUE);
 	}
+	g_ptr_array_unref(shown);
+	add_row(s, NULL, NULL, !ex_trash_is_empty() ? "user-trash-full" : "user-trash",
+		"Trash", "likeos:trash", K_ITEM, "Deleted items");
 
-	add_row(s, NULL, NULL, NULL, NULL, NULL, K_SEPARATOR, NULL);
-	add_row(s, NULL, &grp, "computer", "This PC", "likeos:thispc", K_ITEM,
-		"Drives and personal folders");
+	add_header(s, "Devices");
+	add_row(s, NULL, NULL, "likeos-computer-color", "Computer",
+		"likeos:computer", K_ITEM, "Drives and personal folders");
 	GPtrArray *vl = ex_volumes_list(vols);
 	for (guint i = 0; vl && i < vl->len; i++) {
 		ExVolume *v = g_ptr_array_index(vl, i);
@@ -109,26 +122,23 @@ static void rebuild(ExSidebar *s)
 		char *tip = g_file_get_parse_name(v->root);
 
 		if (!v->network)
-			add_row(s, &grp, NULL, v->icon_name, v->name,
+			add_row(s, NULL, NULL, v->icon_name, v->name,
 				ex_location_id(l), K_ITEM, tip);
 		g_free(tip);
 		ex_location_unref(l);
 	}
 	if (ex_volumes_have_network(vols)) {
-		add_row(s, NULL, &grp, "network-workgroup", "Network",
+		add_header(s, "Network");
+		add_row(s, NULL, NULL, "likeos-network-color", "Network",
 			"network:///", K_ITEM, "Computers and shares on the network");
 		for (guint i = 0; vl && i < vl->len; i++) {
 			ExVolume *v = g_ptr_array_index(vl, i);
 
 			if (v->network)
-				add_folder(s, &grp, v->root, v->name);
+				add_folder(s, NULL, v->root, v->name, FALSE);
 		}
 	}
-	add_row(s, NULL, NULL, NULL, NULL, NULL, K_SEPARATOR, NULL);
-	add_row(s, NULL, &it, !ex_trash_is_empty() ? "user-trash-full" : "user-trash",
-		"Trash", "likeos:trash", K_ITEM, "Deleted items");
 
-	gtk_tree_view_expand_all(GTK_TREE_VIEW(s->tree));
 	s->rebuilding = FALSE;
 	if (s->current) {
 		char *cur = g_strdup(s->current);
@@ -142,12 +152,161 @@ static void rebuild(ExSidebar *s)
 	}
 }
 
-static gboolean row_sep(GtkTreeModel *m, GtkTreeIter *it, gpointer data)
+/* A group's heading: its name in small capitals of the secondary text
+ * colour, low in a row of its own -- a little taller above the later
+ * groups, which sets them apart.  The cell paints the whole row in the
+ * pane's colour first, so neither the pointer's wash nor a drag's marks
+ * show on a heading. */
+#define EX_HEAD_FIRST 28
+#define EX_HEAD_LATER 40
+
+typedef struct {
+	GtkCellRenderer parent;
+	char *text;
+} ExHeadCell;
+typedef GtkCellRendererClass ExHeadCellClass;
+
+static GType ex_head_cell_get_type(void);
+G_DEFINE_TYPE(ExHeadCell, ex_head_cell, GTK_TYPE_CELL_RENDERER)
+
+static void head_render(GtkCellRenderer *r, cairo_t *cr, GtkWidget *w,
+			const GdkRectangle *bg, const GdkRectangle *cell,
+			GtkCellRendererState flags)
 {
-	int kind;
+	ExHeadCell *h = (ExHeadCell *)r;
+	GtkStyleContext *sc = gtk_widget_get_style_context(w);
+	GdkRGBA *base = NULL, ink;
+	PangoLayout *pl;
+	PangoAttrList *attrs;
+	PangoFontDescription *fd;
+	int lw, lh;
+
+	gtk_style_context_save(sc);
+	gtk_style_context_set_state(sc, GTK_STATE_FLAG_NORMAL);
+	gtk_style_context_get(sc, GTK_STATE_FLAG_NORMAL, "background-color",
+			      &base, NULL);
+	if (!gtk_style_context_lookup_color(sc, "likeos_text_secondary", &ink))
+		gtk_style_context_get_color(sc, GTK_STATE_FLAG_INSENSITIVE, &ink);
+	fd = pango_font_description_copy(
+		pango_context_get_font_description(gtk_widget_get_pango_context(w)));
+	gtk_style_context_restore(sc);
+	gdk_cairo_set_source_rgba(cr, base);
+	cairo_rectangle(cr, bg->x, bg->y, bg->width, bg->height);
+	cairo_fill(cr);
+	gdk_rgba_free(base);
+	if (!h->text) {
+		pango_font_description_free(fd);
+		return;
+	}
+	pl = gtk_widget_create_pango_layout(w, h->text);
+	pango_font_description_set_size(
+		fd, pango_font_description_get_size(fd) * 5 / 6);
+	pango_font_description_set_weight(fd, PANGO_WEIGHT_SEMIBOLD);
+	pango_layout_set_font_description(pl, fd);
+	attrs = pango_attr_list_new();
+	pango_attr_list_insert(attrs, pango_attr_letter_spacing_new(
+					      PANGO_SCALE * 6 / 10));
+	pango_layout_set_attributes(pl, attrs);
+	pango_attr_list_unref(attrs);
+	pango_layout_get_pixel_size(pl, &lw, &lh);
+	gdk_cairo_set_source_rgba(cr, &ink);
+	cairo_move_to(cr, cell->x + 8, cell->y + cell->height - lh - 5);
+	pango_cairo_show_layout(cr, pl);
+	g_object_unref(pl);
+	pango_font_description_free(fd);
+}
+
+static void head_finalize(GObject *o)
+{
+	g_free(((ExHeadCell *)o)->text);
+	G_OBJECT_CLASS(ex_head_cell_parent_class)->finalize(o);
+}
+
+static void ex_head_cell_class_init(ExHeadCellClass *k)
+{
+	k->render = head_render;
+	G_OBJECT_CLASS(k)->finalize = head_finalize;
+}
+
+static void ex_head_cell_init(ExHeadCell *c)
+{
+}
+
+static int row_kind(GtkTreeModel *m, GtkTreeIter *it)
+{
+	int kind = K_HEADER;
 
 	gtk_tree_model_get(m, it, C_KIND, &kind, -1);
-	return kind == K_SEPARATOR;
+	return kind;
+}
+
+/* Each cell shows on the rows it belongs to: the heading on headings, the
+ * rest on the places. */
+static void cell_head(GtkTreeViewColumn *c, GtkCellRenderer *r,
+		      GtkTreeModel *m, GtkTreeIter *it, gpointer data)
+{
+	ExHeadCell *h = (ExHeadCell *)r;
+	gboolean head = row_kind(m, it) == K_HEADER;
+	GtkTreePath *p = gtk_tree_model_get_path(m, it);
+	gboolean first = gtk_tree_path_get_indices(p)[0] == 0;
+
+	gtk_tree_path_free(p);
+	g_free(h->text);
+	h->text = NULL;
+	if (head) {
+		char *label = NULL;
+
+		gtk_tree_model_get(m, it, C_LABEL, &label, -1);
+		h->text = label ? g_utf8_strup(label, -1) : NULL;
+		g_free(label);
+	}
+	/* Hidden, it still counts towards the row's height: none then. */
+	if (!head)
+		gtk_cell_renderer_set_fixed_size(r, 1, 1);
+	else
+		gtk_cell_renderer_set_fixed_size(r, 1, first ? EX_HEAD_FIRST :
+							       EX_HEAD_LATER);
+	gtk_cell_renderer_set_visible(r, head);
+}
+
+static void cell_icon(GtkTreeViewColumn *c, GtkCellRenderer *r, GtkTreeModel *m,
+		      GtkTreeIter *it, gpointer data)
+{
+	char *icon = NULL;
+
+	gtk_tree_model_get(m, it, C_ICON, &icon, -1);
+	g_object_set(r, "icon-name", icon, "visible",
+		     row_kind(m, it) == K_ITEM, NULL);
+	g_free(icon);
+}
+
+/* The keyboard steps over a heading: the cursor landing on one moves on
+ * in the direction it came from. */
+static void cursor_changed(GtkTreeView *tv, ExSidebar *s)
+{
+	GtkTreePath *p = NULL, *to;
+	GtkTreeIter it;
+	gboolean down;
+
+	gtk_tree_view_get_cursor(tv, &p, NULL);
+	if (!p)
+		return;
+	if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(s->store), &it, p) ||
+	    row_kind(GTK_TREE_MODEL(s->store), &it) == K_ITEM) {
+		g_clear_pointer(&s->cursor, gtk_tree_path_free);
+		s->cursor = p;
+		return;
+	}
+	down = !s->cursor || gtk_tree_path_compare(s->cursor, p) < 0;
+	to = gtk_tree_path_copy(p);
+	if (down)
+		gtk_tree_path_next(to);
+	else if (!gtk_tree_path_prev(to))
+		gtk_tree_path_next(to);
+	if (gtk_tree_model_get_iter(GTK_TREE_MODEL(s->store), &it, to))
+		gtk_tree_view_set_cursor(tv, to, NULL, FALSE);
+	gtk_tree_path_free(to);
+	gtk_tree_path_free(p);
 }
 
 static gboolean can_select(GtkTreeSelection *sel, GtkTreeModel *m,
@@ -168,9 +327,7 @@ static void cell_label(GtkTreeViewColumn *c, GtkCellRenderer *r,
 	char *label;
 
 	gtk_tree_model_get(m, it, C_KIND, &kind, C_LABEL, &label, -1);
-	g_object_set(r, "text", label, "weight",
-		     kind == K_HEADER ? PANGO_WEIGHT_SEMIBOLD : PANGO_WEIGHT_NORMAL,
-		     NULL);
+	g_object_set(r, "text", label, "visible", kind == K_ITEM, NULL);
 	g_free(label);
 }
 
@@ -178,7 +335,7 @@ static ExLocation *loc_at(ExSidebar *s, GtkTreePath *p)
 {
 	GtkTreeIter it;
 	char *id = NULL;
-	int kind = K_SEPARATOR;
+	int kind = K_HEADER;
 	ExLocation *l = NULL;
 
 	if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(s->store), &it, p))
@@ -345,6 +502,7 @@ static void ex_sidebar_finalize(GObject *o)
 	ExSidebar *s = EX_SIDEBAR(o);
 
 	g_clear_object(&s->store);
+	g_clear_pointer(&s->cursor, gtk_tree_path_free);
 	g_free(s->current);
 	G_OBJECT_CLASS(ex_sidebar_parent_class)->finalize(o);
 }
@@ -373,23 +531,48 @@ static void ex_sidebar_init(ExSidebar *s)
 	GtkCellRenderer *rt = gtk_cell_renderer_text_new();
 	GFile *tf;
 
+	GtkCellRenderer *rp = gtk_cell_renderer_pixbuf_new();
+	GtkCellRenderer *rh = g_object_new(ex_head_cell_get_type(), NULL);
+
 	s->store = gtk_tree_store_new(N_C, G_TYPE_STRING, G_TYPE_STRING,
-				      G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING);
+				      G_TYPE_STRING, G_TYPE_INT, G_TYPE_STRING,
+				      G_TYPE_BOOLEAN);
 	s->tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(s->store));
 	gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(s->tree), FALSE);
-	gtk_tree_view_set_row_separator_func(GTK_TREE_VIEW(s->tree), row_sep,
-					     NULL, NULL);
 	gtk_tree_view_set_tooltip_column(GTK_TREE_VIEW(s->tree), C_TIP);
 	gtk_tree_view_set_enable_search(GTK_TREE_VIEW(s->tree), FALSE);
 	gtk_tree_view_set_level_indentation(GTK_TREE_VIEW(s->tree), 0);
+	gtk_tree_view_set_show_expanders(GTK_TREE_VIEW(s->tree), FALSE);
 	atk_object_set_name(gtk_widget_get_accessible(s->tree),
 			    "Navigation pane");
+	/* The rows: 32 pixels tall, a 16-pixel picture, the name eight
+	 * pixels from it, and the pin at the right end of a pinned folder. */
+	gtk_tree_view_column_pack_start(col, rh, TRUE);
+	gtk_tree_view_column_set_cell_data_func(col, rh, cell_head, NULL, NULL);
 	gtk_tree_view_column_pack_start(col, ri, FALSE);
-	gtk_tree_view_column_add_attribute(col, ri, "icon-name", C_ICON);
-	g_object_set(ri, "xpad", 4, NULL);
+	gtk_tree_view_column_set_cell_data_func(col, ri, cell_icon, NULL, NULL);
+	gtk_cell_renderer_set_fixed_size(ri, 24, 32);
+	g_object_set(ri, "xpad", 4, "stock-size", GTK_ICON_SIZE_MENU, NULL);
 	gtk_tree_view_column_pack_start(col, rt, TRUE);
 	gtk_tree_view_column_set_cell_data_func(col, rt, cell_label, NULL, NULL);
-	g_object_set(rt, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+	g_object_set(rt, "ellipsize", PANGO_ELLIPSIZE_END, "xpad", 4, NULL);
+	gtk_tree_view_column_pack_end(col, rp, FALSE);
+	gtk_tree_view_column_add_attribute(col, rp, "visible", C_PINNED);
+	{
+		GIcon *pin = ex_style_gicon("likeos-pin-symbolic", "view-pin-symbolic");
+
+		/* Drawn as an insensitive cell, so the pin stays a quiet
+		 * grey mark. */
+		g_object_set(rp, "gicon", pin, "stock-size", GTK_ICON_SIZE_MENU,
+			     "xpad", 6, "sensitive", FALSE, NULL);
+		g_object_unref(pin);
+	}
+	gtk_style_context_add_class(gtk_widget_get_style_context(s->tree),
+				    "ex-nav-tree");
+	/* The rows stand clear of the window's edge and of the pane's. */
+	gtk_widget_set_margin_start(s->tree, 6);
+	gtk_widget_set_margin_end(s->tree, 4);
+	gtk_widget_set_margin_top(s->tree, 4);
 	gtk_tree_view_append_column(GTK_TREE_VIEW(s->tree), col);
 	gtk_tree_selection_set_select_function(
 		gtk_tree_view_get_selection(GTK_TREE_VIEW(s->tree)), can_select,
@@ -397,6 +580,7 @@ static void ex_sidebar_init(ExSidebar *s)
 	g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(s->tree)),
 			 "changed", G_CALLBACK(sel_changed), s);
 	g_signal_connect(s->tree, "button-press-event", G_CALLBACK(button), s);
+	g_signal_connect(s->tree, "cursor-changed", G_CALLBACK(cursor_changed), s);
 	gtk_drag_dest_set(s->tree, 0, drop_targets, 1,
 			  GDK_ACTION_COPY | GDK_ACTION_MOVE);
 	g_signal_connect(s->tree, "drag-motion", G_CALLBACK(drag_motion), s);

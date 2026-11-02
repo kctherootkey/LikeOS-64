@@ -9,12 +9,14 @@
  * caller-supplied rectangle.  Nothing owns a widget, a window or a timer; the
  * programs do that.
  *
- * The look is the Windows 11 taskbar's, light theme: a flat band of the pale
- * blue-grey Windows' Mica material takes on over a blue desktop, controls
- * that are invisible at rest and show as a lighter rounded tile under the
- * pointer, and short indicator bars under the buttons of running programs --
- * a blue one for the window that has the focus.  The colours were measured
- * from the real taskbar.
+ * The look is the LikeOS shell's: apps are light, the shell is dark.  The
+ * panel is the shell's deep blue-grey, tinted a little by the wallpaper under
+ * it when taskbar(1) can sample the desktop's root pixmap (see tint_* there);
+ * PANEL_BG is the solid colour used when it cannot, and by the widgets
+ * running as their own windows.  Controls are invisible at rest and show as a
+ * soft light tile under the pointer; the focused window's button keeps a
+ * brighter one, and small dots under a button count its program's windows --
+ * in the shell accent for the one that has the focus.
  *
  * Copyright (C) 2026 The LikeOS Project
  */
@@ -24,29 +26,31 @@
 
 #include <gtk/gtk.h>
 
-/* Colours, as 0xRRGGBB. */
-#define PANEL_BG            0xd6e0f6 /* the bar itself */
-#define PANEL_EDGE          0xaeb4c1 /* the hairline along its top */
-#define PANEL_TILE_HOVER    0xebf0fb /* a control under the pointer, and the
-					focused window's button */
-#define PANEL_TILE_PRESSED  0xe2e9f9 /* a control held down */
-#define PANEL_TILE_EDGE     0xc2cbdf /* the lower edge of a lit tile */
-#define PANEL_ACCENT        0x0078d4 /* the focused window's indicator */
-#define PANEL_INDICATOR     0x767c88 /* a running window's indicator */
-#define PANEL_TEXT          0x1b1b1b
-#define PANEL_TEXT_DIM      0x5c5f66
+/* The dark shell palette, as 0xRRGGBB (the same values as the GTK theme's
+ * $shell-* tokens, res/xorg/gtk3/theme/src/_colors.scss). */
+#define PANEL_BG            0x161c2a /* the panel and every flyout */
+#define PANEL_RAISED        0x1f2636 /* cards, fields and tiles on it */
+#define PANEL_BORDER        0x2c3446 /* the frame of a flyout */
+#define PANEL_TEXT          0xeef2fa
+#define PANEL_TEXT_DIM      0xa4adbf /* secondary text */
+#define PANEL_TEXT_DISABLED 0x6b7486
+#define PANEL_ACCENT        0x5b8ff9 /* indicators, focus, links */
+#define PANEL_ACCENT_FILL   0x3f74f2 /* switches on, slider fill, today */
 
-/* Panel height: Windows 11's taskbar, 48 pixels at 100% scale. */
+/* The panel is 48 pixels tall; every control on it is a 40-pixel tile. */
 #define PANEL_HEIGHT 48
 
-/* Fonts: Selawik (the open substitute for Segoe UI) at Windows' 9 points. */
+/* Fonts: Selawik, the system's interface face, at 9 points. */
 #define PANEL_FONT "Selawik 9"
 #define PANEL_FONT_BOLD "Selawik Semibold 9"
 
 /* Set the Cairo source to a 0xRRGGBB colour. */
 void panel_color(cairo_t *cr, unsigned int rgb);
 
-/* Fill a rectangle with the bar's colour. */
+/* Set the Cairo source to a 0xRRGGBB colour at alpha `a'. */
+void panel_color_a(cairo_t *cr, unsigned int rgb, double a);
+
+/* Fill a rectangle with the panel's colour. */
 void panel_fill_face(cairo_t *cr, double x, double y, double w, double h);
 
 /* A rounded rectangle path (radius r). */
@@ -56,22 +60,36 @@ void panel_round_rect(cairo_t *cr, double x, double y, double w, double h,
 /* Tile states: how a control is lit. */
 enum panel_tile {
 	PANEL_TILE_NONE,    /* at rest: nothing drawn */
-	PANEL_TILE_LIT,     /* under the pointer, or the focused window */
+	PANEL_TILE_HOVER,   /* under the pointer */
+	PANEL_TILE_LIT,     /* the focused window's button, or an open flyout's */
 	PANEL_TILE_DOWN,    /* held down */
 };
 
-/* The rounded tile behind a control in the given state. */
+/* Radius of every tile on the panel. */
+#define PANEL_TILE_RADIUS 8
+
+/* The rounded tile behind a control in the given state: white at a low
+ * alpha over the panel, so it reads the same over the solid colour and over
+ * the wallpaper tint. */
 void panel_tile(cairo_t *cr, double x, double y, double w, double h,
 		enum panel_tile state);
 
-/* The indicator bar under a running program's button, centred on cx with
- * its bottom at y: 16 pixels of accent for the focused window, 6 of grey
- * for the others. */
-void panel_indicator(cairo_t *cr, double cx, double y, gboolean active);
+/* The window count under a program's button: one 4-pixel dot per window, up
+ * to three, centred on cx with their centres on cy -- in the secondary text
+ * colour, or the accent when the program has the focus. */
+void panel_dots(cairo_t *cr, double cx, double cy, int count,
+		gboolean active);
 
-/* The start button: a tile and the LikeOS emblem. */
-void panel_start_button(cairo_t *cr, double x, double y, double w, double h,
-			enum panel_tile state);
+/* A plain glass orb of radius `r' centred on (cx, cy): a blue body lit from
+ * below with a gloss along its top.  `glow' (0..1) brightens it and lays a
+ * soft halo round it; `pressed' darkens it and shades it in from the top.
+ * The start button's artwork is the icon theme's likeos-start-orb; this is
+ * what the panel draws when the theme has none. */
+void panel_orb(cairo_t *cr, double cx, double cy, double r, double glow,
+	       gboolean pressed);
+
+/* The magnifier glyph, `s' pixels square (16 or 20), in the current source. */
+void panel_glyph_search(cairo_t *cr, double x, double y, double s);
 
 /* Text, clipped and ellipsised to `w', in PANEL_TEXT.
  *
@@ -81,11 +99,19 @@ void panel_start_button(cairo_t *cr, double x, double y, double w, double h,
 int panel_text(cairo_t *cr, double x, double cy, double w, const char *text,
 	       gboolean bold, int align);
 
+/* As panel_text(), in any font and in any colour, alpha included. */
+int panel_text_full(cairo_t *cr, double x, double cy, double w,
+		    const char *text, const char *font, const double rgba[4],
+		    int align);
+
+/* The width `text' takes in `font'. */
+int panel_text_width(cairo_t *cr, const char *text, const char *font);
+
 /* ---------------------------------------------------------------------------
  * The load and memory monitor.
  * ------------------------------------------------------------------------ */
 
-/* Samples in the load history, and so the number of bars drawn. */
+/* Samples in the load history, and so the points of the curve. */
 #define PANEL_LOAD_HISTORY 14
 
 /* Seconds between samples.  The load average is itself a decaying mean over a
@@ -105,28 +131,29 @@ void panel_load_init(struct panel_load *m);
 /* Take one sample.  Call every PANEL_LOAD_SECS seconds. */
 void panel_load_sample(struct panel_load *m);
 
-/* Draw the monitor in the given rectangle, laid out the way Windows 11 lays
- * out the widget at the left of its taskbar: a small picture -- here the load
- * history as a bar graph -- and two lines of text beside it, the processor
- * load and the memory in use.  This is the whole of what load(1) shows. */
+/* Draw the monitor in the given rectangle: the load history as a small
+ * curve over a soft accent fill on a raised card, and beside it two lines,
+ * the processor load and the memory in use.  This is the whole of what
+ * load(1) shows. */
 void panel_load_draw(cairo_t *cr, struct panel_load *m, double x, double y,
 		     double w, double h);
 
 /* The width panel_load_draw needs. */
-#define PANEL_LOAD_W 128
+#define PANEL_LOAD_W 116
 
 /* ---------------------------------------------------------------------------
  * The clock.
  * ------------------------------------------------------------------------ */
 
-/* Draw the time over the date, both right-aligned, as the Windows 11 tray
- * shows them, inside the given rectangle.  `stacked' clear puts them on one
- * line instead. */
+/* Draw the clock inside the given rectangle.  On the panel it is one line,
+ * the date in the secondary colour and the time after it: "Mon 2 Nov  14:32",
+ * right-aligned.  `stacked' puts the time over the date instead, centred --
+ * the form datetime(1) uses in a window of its own. */
 void panel_clock_draw(cairo_t *cr, double x, double y, double w, double h,
 		      gboolean stacked);
 
-/* The width the clock needs, measured against the widest date and time in
- * the panel font, so a caller can size a tray area to it. */
+/* The width the one-line clock needs, so a caller can size a tray area to
+ * it.  Measured with the widest digits, so it changes only with the date. */
 int panel_clock_width(cairo_t *cr);
 
 #endif /* _LIKEOS_PANEL_H */

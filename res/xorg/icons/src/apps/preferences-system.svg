@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: preferences-system, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.3"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#7a879e"/><stop offset="1" stop-color="#3b465c"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff" stop-opacity="0.45"/><stop offset="0.5" stop-color="#ffffff" stop-opacity="0.08"/><stop offset="1" stop-color="#000000" stop-opacity="0.12"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M17 4H47A13 13 0 0 1 60 17V47A13 13 0 0 1 47 60H17A13 13 0 0 1 4 47V17A13 13 0 0 1 17 4Z" fill="#0b1730" opacity="0.28" transform="translate(0 1.4)" filter="url(#f1)"/>
+<path d="M17 4H47A13 13 0 0 1 60 17V47A13 13 0 0 1 47 60H17A13 13 0 0 1 4 47V17A13 13 0 0 1 17 4Z" fill="url(#g2)"/>
+<path d="M17 4.5H47A12.5 12.5 0 0 1 59.5 17V47A12.5 12.5 0 0 1 47 59.5H17A12.5 12.5 0 0 1 4.5 47V17A12.5 12.5 0 0 1 17 4.5Z" fill="none" stroke="url(#g3)" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M17 4H47A13 13 0 0 1 60 17V26C44 22 20 32 4 30V17A13 13 0 0 1 17 4Z" fill="#ffffff" opacity="0.08"/>
+<path d="M45.992 33.378L50.182 37.515L48.757 40.957L42.869 40.92L40.92 42.869L40.957 48.757L37.515 50.182L33.378 45.992L30.622 45.992L26.485 50.182L23.043 48.757L23.08 42.869L21.131 40.92L15.243 40.957L13.818 37.515L18.008 33.378L18.008 30.622L13.818 26.485L15.243 23.043L21.131 23.08L23.08 21.131L23.043 15.243L26.485 13.818L30.622 18.008L33.378 18.008L37.515 13.818L40.957 15.243L40.92 21.131L42.869 23.08L48.757 23.043L50.182 26.485L45.992 30.622ZM25.54 32A6.46 6.46 0 1 0 38.46 32A6.46 6.46 0 1 0 25.54 32Z" fill="#ffffff" stroke="#ffffff" stroke-width="1.52" stroke-linecap="round" stroke-linejoin="round" fill-rule="evenodd"/>
+</g>
+</svg>

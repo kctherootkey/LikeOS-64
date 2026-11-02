@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: what is selected.
+// LikeOS Explorer: what is selected.
 //
 // Copyright (C) 2026 The LikeOS Project
 

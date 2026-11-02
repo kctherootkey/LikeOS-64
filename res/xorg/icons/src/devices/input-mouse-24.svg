@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: input-mouse, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="16" y1="5.333" x2="48" y2="58.667"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#c9d0dc"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M32 5.333H32A16 16 0 0 1 48 21.333V42.667A16 16 0 0 1 32 58.667H32A16 16 0 0 1 16 42.667V21.333A16 16 0 0 1 32 5.333Z" fill="url(#g1)"/>
+<path d="M32 6.667H32A14.667 14.667 0 0 1 46.667 21.333V42.667A14.667 14.667 0 0 1 32 57.333H32A14.667 14.667 0 0 1 17.333 42.667V21.333A14.667 14.667 0 0 1 32 6.667Z" fill="none" stroke="#8d97a8" stroke-width="2.667" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M33.333 5.333V28M16 28H48" fill="none" stroke="#8d97a8" stroke-width="2.667" stroke-linecap="butt" stroke-linejoin="round"/>
+<path d="M29.333 10.667H34.667V21.333H29.333Z" fill="#3b74f0"/>
+</g>
+</svg>

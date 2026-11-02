@@ -1,4 +1,5 @@
-# LikeOS -- Media Player, the system's own GTK3 music and video player.
+# LikeOS -- LikeOS Media Player, the system's own GTK3 music and video
+# player.
 #
 # An in-tree port: the sources live here rather than in a tarball, and the
 # GTK3 port driver builds it with meson like any other package, against the
@@ -57,13 +58,18 @@ sources = files(
   'src/cover.c',
   'src/dialogs.c',
   'src/discover.c',
+  'src/glyphs.c',
+  'src/library.c',
   'src/main.c',
+  'src/pages.c',
   'src/player.c',
   'src/playlist.c',
   'src/playlist_io.c',
   'src/scan.c',
   'src/settings.c',
   'src/style.c',
+  'src/thumbs.c',
+  'src/ui.c',
   'src/util.c',
   'src/window.c',
 )

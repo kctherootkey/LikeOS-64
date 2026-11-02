@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: gallery, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="40"><stop offset="0" stop-color="#c9dcff"/><stop offset="1" stop-color="#7fa6f0"/></linearGradient><clipPath id="c2"><path d="M10 24H42A2 2 0 0 1 44 26V54A2 2 0 0 1 42 56H10A2 2 0 0 1 8 54V26A2 2 0 0 1 10 24Z"/></clipPath><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="56"><stop offset="0" stop-color="#8fd3e6"/><stop offset="1" stop-color="#d7f1f3"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="0" y1="33.6" x2="0" y2="56"><stop offset="0" stop-color="#22b3a8"/><stop offset="1" stop-color="#1a9e9e"/></linearGradient><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="39.36" x2="0" y2="56"><stop offset="0" stop-color="#159088"/><stop offset="1" stop-color="#0e7470"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<g>
+<path d="M18 4H58A2 2 0 0 1 60 6V38A2 2 0 0 1 58 40H18A2 2 0 0 1 16 38V6A2 2 0 0 1 18 4Z" fill="#ffffff" stroke="#b9c1ce" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M20 8H56V36H20Z" fill="url(#g1)"/>
+</g>
+<g>
+<path d="M6 20H46A2 2 0 0 1 48 22V58A2 2 0 0 1 46 60H6A2 2 0 0 1 4 58V22A2 2 0 0 1 6 20Z" fill="#ffffff" stroke="#b9c1ce" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<g clip-path="url(#c2)">
+<path d="M8 24H44V56H8Z" fill="url(#g3)"/>
+<path d="M8 56L8 43.84L19.52 33.6L30.32 47.04L30.32 56Z" fill="url(#g4)"/>
+<path d="M20.6 56L33.2 39.36L44 48L44 56Z" fill="url(#g5)"/>
+</g>
+<path d="M31.52 32.64A3.84 3.84 0 1 0 39.2 32.64A3.84 3.84 0 1 0 31.52 32.64Z" fill="#ffd166"/>
+</g>
+</g>
+</svg>

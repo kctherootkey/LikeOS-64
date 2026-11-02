@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the look.
+// LikeOS Explorer: the look.
 //
 // Explorer's styling is part of the LikeOS GTK theme (res/xorg/gtk3/theme,
 // the .likeos-explorer and lx-* rules, built from the same design tokens as
@@ -30,6 +30,20 @@ G_BEGIN_DECLS
 #define EX_CLASS_COMPACT "ex-compact"
 #define EX_CLASS_PLACEHOLDER "ex-placeholder"
 #define EX_CLASS_EMPTY "ex-empty"
+#define EX_CLASS_TITLEBAR "ex-titlebar"
+#define EX_CLASS_CAPTION "ex-caption"
+#define EX_CLASS_SUBTLE "ex-subtle"
+
+/* Glyphs drawn as lines rather than taken from the icon theme: the window's
+ * own caption buttons and the tab row's small marks, in the same geometry
+ * as the window manager's title bars, whatever the theme. */
+typedef enum {
+	EX_GLYPH_MINIMIZE,
+	EX_GLYPH_MAXIMIZE,
+	EX_GLYPH_RESTORE,
+	EX_GLYPH_CLOSE,
+	EX_GLYPH_PLUS,
+} ExGlyph;
 
 /* Once per process. */
 void ex_style_init(void);
@@ -38,6 +52,23 @@ void ex_style_init(void);
  * understands (fixed size hints, and Motif functions of move and close). */
 void ex_style_fixed_dialog(GtkWidget *dialog);
 void ex_style_add(GtkWidget *w, const char *klass);
+
+/* A picture from the icon theme at `px' pixels: `name' (one of the LikeOS
+ * line icons, "likeos-cut" and so on), or `fallback' under a theme that has
+ * no such icon. */
+GtkWidget *ex_style_icon(const char *name, const char *fallback, int px);
+GIcon *ex_style_gicon(const char *name, const char *fallback);
+void ex_style_set_icon(GtkImage *img, const char *name, const char *fallback,
+		       int px);
+/* A `size'-pixel glyph in the text colour of whatever holds it (so a
+ * button's hover and pressed colours apply), changed with
+ * ex_style_set_glyph(). */
+GtkWidget *ex_style_glyph(ExGlyph glyph, int size);
+void ex_style_set_glyph(GtkWidget *glyph, ExGlyph kind);
+/* A flat button holding only `child', named `tip' for the tooltip and for
+ * assistive technology, triggering `action' (detailed name, or NULL). */
+GtkWidget *ex_style_icon_button(GtkWidget *child, const char *tip,
+				const char *action);
 
 G_END_DECLS
 

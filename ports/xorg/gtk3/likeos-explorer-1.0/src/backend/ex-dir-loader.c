@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: reading a folder.
+// LikeOS Explorer: reading a folder.
 //
 // Copyright (C) 2026 The LikeOS Project
 

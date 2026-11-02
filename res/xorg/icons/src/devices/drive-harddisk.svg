@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: drive-harddisk, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="28"><stop offset="0" stop-color="#f3f5f9"/><stop offset="1" stop-color="#c9d0dc"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="28" x2="0" y2="48"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r4" gradientUnits="userSpaceOnUse" cx="51" cy="38" r="4.5"><stop offset="0" stop-color="#4f8cff" stop-opacity="0.55"/><stop offset="1" stop-color="#4f8cff" stop-opacity="0"/></radialGradient></defs>
+<g transform="scale(1)">
+<path d="M9 16H55A5 5 0 0 1 60 21V43A5 5 0 0 1 55 48H9A5 5 0 0 1 4 43V21A5 5 0 0 1 9 16Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M9 16H55A5 5 0 0 1 60 21V43A5 5 0 0 1 55 48H9A5 5 0 0 1 4 43V21A5 5 0 0 1 9 16Z" fill="url(#g2)"/>
+<path d="M4 28H60V43A5 5 0 0 1 55 48H9A5 5 0 0 1 4 43Z" fill="url(#g3)"/>
+<path d="M4 28H60V43A5 5 0 0 1 55 48H9A5 5 0 0 1 4 43Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M9 28.5H55" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.2"/>
+<path d="M9 16.5H55" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.9"/>
+<path d="M46.5 38A4.5 4.5 0 1 0 55.5 38A4.5 4.5 0 1 0 46.5 38Z" fill="url(#r4)"/>
+<path d="M49 38A2 2 0 1 0 53 38A2 2 0 1 0 49 38Z" fill="#4f8cff"/>
+<path d="M49.8 37.5A0.7 0.7 0 1 0 51.2 37.5A0.7 0.7 0 1 0 49.8 37.5Z" fill="#ffffff" opacity="0.8"/>
+<path d="M9.6 35.6H27.52M9.6 40.4H27.52M9.6 45.2H27.52" fill="none" stroke="#8d97a8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

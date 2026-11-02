@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: document-open-recent, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="32" y1="2.667" x2="32" y2="61.333"><stop offset="0" stop-color="#5b8ff9"/><stop offset="1" stop-color="#2a5bd7"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="2.667" x2="0" y2="61.333"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#e8edf5"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M2.667 32A29.333 29.333 0 1 0 61.333 32A29.333 29.333 0 1 0 2.667 32Z" fill="url(#g1)"/>
+<path d="M8 32A24 24 0 1 0 56 32A24 24 0 1 0 8 32Z" fill="url(#g2)"/>
+<path d="M50.667 32L53.333 32" fill="none" stroke="#9aa4b5" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 50.667L32 53.333" fill="none" stroke="#9aa4b5" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M13.333 32L10.667 32" fill="none" stroke="#9aa4b5" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 13.333L32 10.667" fill="none" stroke="#9aa4b5" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 17.12V32L42.08 39.2" fill="none" stroke="#141a24" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M29.2 32A2.8 2.8 0 1 0 34.8 32A2.8 2.8 0 1 0 29.2 32Z" fill="#3b74f0"/>
+</g>
+</svg>

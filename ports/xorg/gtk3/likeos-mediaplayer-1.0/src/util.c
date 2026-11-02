@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: time formatting, URI and file-name helpers.
+// LikeOS -- LikeOS Media Player: time formatting, URI and file-name helpers.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -156,6 +156,18 @@ static const char *const media_exts[] = {
 	NULL
 };
 
+/* The video entries of the table above: the extensions a file of moving
+ * pictures has.  An audio-only file in such a container (a sound track
+ * ripped to .mkv, say) is told apart later, when its streams are read. */
+static const char *const video_exts[] = {
+	"mp4", "m4v", "mov", "qt", "mkv", "webm", "avi", "ogv", "ogm",
+	"mpg", "mpeg", "mpe", "m2v", "vob", "ts", "m2ts", "mts", "m2t",
+	"flv", "f4v", "wmv", "asf", "3gp", "3g2", "divx", "xvid", "h264",
+	"264", "h265", "265", "hevc", "ivf", "y4m", "dv", "mxf", "nut",
+	"rm", "rmvb", "mjpeg", "mjpg",
+	NULL
+};
+
 static const char *const playlist_exts[] = {
 	"m3u", "m3u8", "pls", NULL
 };
@@ -175,6 +187,11 @@ static gboolean has_ext(const char *name, const char *const *list)
 			return TRUE;
 	}
 	return FALSE;
+}
+
+gboolean mp_is_video_name(const char *name)
+{
+	return name != NULL && has_ext(name, video_exts);
 }
 
 gboolean mp_is_playlist_name(const char *name)

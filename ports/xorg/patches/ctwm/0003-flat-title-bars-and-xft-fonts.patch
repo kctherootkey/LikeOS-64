@@ -1,0 +1,2454 @@
+Flat LikeOS title bars (ModernTitles) and anti-aliased Xft fonts.
+
+Additions, all switched on from the configuration and inert otherwise.
+
+1. "xft:<fontconfig pattern>" as a font name (TitleFont, MenuFont, ...).
+   ctwm draws every string through XmbTextExtents/XmbDrawString on a MyFont's
+   fontset.  ctwm.h redirects those two calls to wrappers in util.c, which
+   send a fontset that stands for an Xft font to Xft (UTF-8; the colour comes
+   from the GC's foreground) and everything else to Xlib unchanged.  The
+   fontset is still created, from "fixed", so code that only knows fontsets
+   keeps a valid one; the MyFont's metrics are the Xft font's.  cursor.c
+   opts out: string cursors are drawn into a one-bit bitmap.
+
+2. ModernTitles, with TitleBarHeight and TitleButtonWidth: the LikeOS title
+   bar (win_modern.c).  A flat band, #eef2f9 with near-black text when the
+   window has the focus and #f5f7fb with slate text when not; the
+   application's icon (_NET_WM_ICON at 16 pixels) 12 pixels in, and its
+   title, ellipsised, after it; on the right the caption buttons, each
+   TitleButtonWidth wide, TitlePadding apart and FramePadding from the edge,
+   drawn as a rounded rectangle 26 pixels tall inset in the band (the whole
+   height of the band takes the click).  Each carries a small line glyph,
+   10x10 pixels with a 1.25-pixel stroke and round ends, chosen by the
+   button's function -- a line for f.iconify, a rounded square (two offset
+   ones while zoomed) for the zoom functions, a cross for f.delete and
+   f.destroy.  At rest the button is only its glyph; under the pointer the
+   rectangle fills with a faint blue-grey wash, the close button with coral
+   red and a white cross.  Buttons bound to anything else keep their images.
+   The title window's bottom border, the only part of it the frame does not
+   clip, takes the title colour, so no line separates the caption from the
+   window contents.
+
+   Menus get rows 30 pixels tall with the text 12 pixels in, the entry under
+   the pointer as a rounded rectangle inset 4 pixels in its row, a hairline
+   border in MenuShadowColor (a light blue-grey in the LikeOS configuration,
+   which turns the drop shadow itself off) rather than in the text colour,
+   and separators in a lighter shade of it, 10 pixels short of the edges.
+
+   Glyphs, buttons, highlights and icons are rendered client-side into
+   XImages, blended against the known background colour; TrueColor visuals
+   only (anything else keeps the classic decorations).
+
+3. With ModernTitles, a resize border: the band a few pixels OUTSIDE a
+   window's one-pixel edge, invisible, where the pointer turns into a
+   double arrow (diagonal at the corners) and a drag resizes the window
+   from that edge or corner (win_modern.c, "The resize border").
+   It is an InputOnly window 6 pixels larger than the frame on every side,
+   stacked directly beneath it, so the frame covers its middle and every
+   window above the frame covers it too.  Not for maximised windows,
+   windows of fixed size, borderless windows or ctwm's own.  A press on it
+   (or on the frame's own edge) has the frame's bindings, raises and focuses
+   the window, and StartResize() moves exactly the edges under the pointer,
+   keeping their distance from it.  To follow its frame through every move,
+   resize, restack, map, unmap and reparent -- some thirty places in ctwm --
+   ctwm.h routes those Xlib calls through wrappers in win_modern.c, which
+   bring the border along when the window is a frame that has one.
+   Before a frame is restacked its border is lowered out of the way: ctwm
+   raises a window by placing it directly above the next frame down, which
+   would otherwise put it under its own border for a moment -- the
+   application was told the pointer left and came back on every click
+   (the wheel included), and GDK, taking that as a new scroll gesture,
+   dropped the smooth-scrolling position: the wheel did nothing.
+
+4. With ModernTitles, a maximised window stays maximised until the user
+   restores it: a client's request to move or resize a zoomed window is
+   answered with its current geometry instead of being carried out (which
+   also unzoomed it) -- Claws Mail sized its window from saved settings at
+   start and shrank the window the user had just maximised; and restoring a
+   window no longer warps the pointer into it (it jumped to the window's
+   left edge after the restore button had shrunk the window away from under
+   it).
+   A double click on a caption maximises the window or restores it (same
+   window, within ConstrainedMoveTime and 4 pixels of the first press);
+   ctwm's constrained move, which a double click started and which warped
+   the pointer to the middle of the window, is off in this mode.
+
+Hooks: the focus change repaints the caption (win_ops.c, after
+hasfocusvisible is set -- and not the buttons before AddWindow has created
+them); Enter/Leave on a caption button set its hover state (event_handlers.c;
+the buttons now select those events); SetupFrame repaints the buttons, since
+zooming moves them by gravity without an Expose; a _NET_WM_ICON change drops
+the cached title icon (ewmh.c); window teardown frees it and destroys the
+resize border; AddWindow creates the border once the frame's contexts are
+saved; a press on the border is a frame press (event_handlers.c), motion over
+it picks its cursor.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -Nur a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -78,6 +78,18 @@ foreach(VEXT LIBRARIES Xmu_LIB Xt_LIB)
+ 	list(APPEND CTWMLIBS ${X11_${VEXT}})
+ endforeach()
+ 
++# Xft, for anti-aliased fonts ("xft:" font names) and ModernTitles.  Its
++# header pulls in FreeType's, which lives in a freetype2/ subdirectory.
++if(NOT X11_Xft_FOUND)
++	message(FATAL_ERROR "Can't find Xft; missing lib or -devel package?")
++endif()
++find_path(FREETYPE2_INCLUDE_DIR ft2build.h PATH_SUFFIXES freetype2)
++if(NOT FREETYPE2_INCLUDE_DIR)
++	message(FATAL_ERROR "Can't find ft2build.h (FreeType headers)")
++endif()
++include_directories(${X11_Xft_INCLUDE_PATH} ${FREETYPE2_INCLUDE_DIR})
++list(APPEND CTWMLIBS ${X11_Xft_LIB} m)
++
+ 
+ #
+ # Setup some search paths
+diff -Nur a/add_window.c b/add_window.c
+--- a/add_window.c
++++ b/add_window.c
+@@ -65,6 +65,7 @@
+ #include "windowbox.h"
+ #endif
+ #include "win_decorations.h"
++#include "win_modern.h"
+ #include "win_ops.h"
+ #include "win_regions.h"
+ #include "win_resize.h"
+@@ -1809,6 +1810,9 @@ AddWindow(Window w, AWType wtype, IconMgr *iconp, VirtualScreen *vs)
+ 
+ #undef SETCTXS
+ 
++	/* The invisible resize border around the frame (ModernTitles). */
++	ModernGripCreate(tmp_win);
++
+ 	/*
+ 	 * OK, that's all we need to do while the server's grabbed.  After
+ 	 * this point, other clients might sneak in stuff between our
+diff -Nur a/cmake_files/basic_vars.cmake b/cmake_files/basic_vars.cmake
+--- a/cmake_files/basic_vars.cmake
++++ b/cmake_files/basic_vars.cmake
+@@ -63,6 +63,7 @@ set(CTWMSRC
+ 	vscreen.c
+ 	win_decorations.c
+ 	win_decorations_init.c
++	win_modern.c
+ 	win_iconify.c
+ 	win_ops.c
+ 	win_regions.c
+diff -Nur a/ctwm.h b/ctwm.h
+--- a/ctwm.h
++++ b/ctwm.h
+@@ -135,6 +135,11 @@ struct MyFont {
+ 	unsigned int avg_height;
+ 	float       avg_fheight;
+ 	unsigned int avg_count;
++	/* An anti-aliased Xft font, for a name given as "xft:<pattern>".
++	 * font_set then holds a core fallback, so that code which only knows
++	 * fontsets keeps working; text measured and drawn through it is routed
++	 * to the Xft font (see XmbTextExtents/XmbDrawString below). */
++	struct _XftFont *xft;
+ };
+ 
+ struct ColorPair {
+@@ -165,6 +170,7 @@ struct TBWindow {
+ 	Window window;                      /* which window in this frame */
+ 	Image *image;                       /* image to display in button */
+ 	TitleButton *info;                  /* description of this window */
++	bool hover;                         /* pointer is over it (ModernTitles) */
+ };
+ 
+ 
+@@ -415,4 +421,63 @@ typedef struct _ctwm_cl_args {
+ extern ctwm_cl_args CLarg;
+ 
+ 
++/*
++ * Text through fontsets, routed to Xft for fonts named "xft:...".
++ *
++ * Every piece of text ctwm draws goes through these two Xlib calls on a
++ * MyFont's font_set, so redirecting them here gives every title, menu and
++ * label anti-aliased text without touching each caller.  A fontset that has
++ * no Xft font behind it goes to Xlib unchanged.  util.c holds the
++ * implementations, and #undef's these to reach the real calls.
++ */
++int ctwm_XmbTextExtents(XFontSet fs, const char *text, int len,
++                        XRectangle *ink, XRectangle *logical);
++void ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
++                        int x, int y, const char *text, int len);
++#ifndef CTWM_NO_XFT_REDIRECT
++#define XmbTextExtents(fs, t, n, i, l) ctwm_XmbTextExtents(fs, t, n, i, l)
++#define XmbDrawString(d, w, fs, gc, x, y, t, n) \
++	ctwm_XmbDrawString(d, w, fs, gc, x, y, t, n)
++#endif
++
++/*
++ * Window operations, routed through win_modern.c so that a frame's resize
++ * border (ModernTitles; see win_modern.h) follows the frame wherever ctwm
++ * moves, sizes, stacks, shows, hides or reparents it.  For every window that
++ * is not such a frame -- and for all of them while ModernTitles is off --
++ * the wrappers are the plain Xlib calls.  win_modern.c, which implements
++ * them, opts out.
++ */
++int ctwm_XMapWindow(Display *d, Window w);
++int ctwm_XMapRaised(Display *d, Window w);
++int ctwm_XUnmapWindow(Display *d, Window w);
++int ctwm_XMoveWindow(Display *d, Window w, int x, int y);
++int ctwm_XResizeWindow(Display *d, Window w, unsigned int width,
++                       unsigned int height);
++int ctwm_XMoveResizeWindow(Display *d, Window w, int x, int y,
++                           unsigned int width, unsigned int height);
++int ctwm_XConfigureWindow(Display *d, Window w, unsigned int mask,
++                          XWindowChanges *xwc);
++int ctwm_XSetWindowBorderWidth(Display *d, Window w, unsigned int width);
++int ctwm_XRaiseWindow(Display *d, Window w);
++int ctwm_XLowerWindow(Display *d, Window w);
++int ctwm_XRestackWindows(Display *d, Window *ws, int n);
++int ctwm_XReparentWindow(Display *d, Window w, Window parent, int x, int y);
++#ifndef CTWM_NO_FRAME_REDIRECT
++#define XMapWindow(d, w)                ctwm_XMapWindow(d, w)
++#define XMapRaised(d, w)                ctwm_XMapRaised(d, w)
++#define XUnmapWindow(d, w)              ctwm_XUnmapWindow(d, w)
++#define XMoveWindow(d, w, x, y)         ctwm_XMoveWindow(d, w, x, y)
++#define XResizeWindow(d, w, wd, ht)     ctwm_XResizeWindow(d, w, wd, ht)
++#define XMoveResizeWindow(d, w, x, y, wd, ht) \
++	ctwm_XMoveResizeWindow(d, w, x, y, wd, ht)
++#define XConfigureWindow(d, w, m, c)    ctwm_XConfigureWindow(d, w, m, c)
++#define XSetWindowBorderWidth(d, w, b)  ctwm_XSetWindowBorderWidth(d, w, b)
++#define XRaiseWindow(d, w)              ctwm_XRaiseWindow(d, w)
++#define XLowerWindow(d, w)              ctwm_XLowerWindow(d, w)
++#define XRestackWindows(d, ws, n)       ctwm_XRestackWindows(d, ws, n)
++#define XReparentWindow(d, w, p, x, y)  ctwm_XReparentWindow(d, w, p, x, y)
++#endif
++
++
+ #endif /* _CTWM_CTWM_H */
+diff -Nur a/ctwm_main.c b/ctwm_main.c
+--- a/ctwm_main.c
++++ b/ctwm_main.c
+@@ -829,6 +829,15 @@ ctwm_main(int argc, char *argv[])
+ 		if(!(Scr->TitleHeight & 1)) {
+ 			Scr->TitleHeight++;
+ 		}
++		/* TitleBarHeight states the height outright, whatever the font:
++		 * the caption is a fixed height, and its text is centred in it
++		 * rather than sizing it. */
++		if(Scr->TitleBarHeight > 0) {
++			Scr->TitleBarFont.y = (Scr->TitleBarHeight
++			                       - Scr->TitleBarFont.height) / 2
++			                      + Scr->TitleBarFont.ascent;
++			Scr->TitleHeight = Scr->TitleBarHeight;
++		}
+ 
+ 
+ 
+@@ -1258,6 +1267,9 @@ InitScreenInfo(int scrnum, Window croot, int crootx, int crooty,
+ 	scr->use3Dborders = false;
+ 	scr->use3Dwmap = false;
+ 	scr->SunkFocusWindowTitle = false;
++	scr->ModernTitles = false;
++	scr->TitleBarHeight = 0;
++	scr->TitleButtonWidth = 0;
+ 	scr->ClearShadowContrast = 50;
+ 	scr->DarkShadowContrast  = 40;
+ 	scr->BeNiceToColormap = false;
+diff -Nur a/cursor.c b/cursor.c
+--- a/cursor.c
++++ b/cursor.c
+@@ -19,6 +19,9 @@
+  *
+  ***********************************************************************/
+ 
++/* String cursors are drawn into a one-bit bitmap, which Xft cannot draw
++ * into with the screen's visual: keep the core fontset path here. */
++#define CTWM_NO_XFT_REDIRECT
+ #include "ctwm.h"
+ 
+ #include <stdio.h>
+diff -Nur a/event_handlers.c b/event_handlers.c
+--- a/event_handlers.c
++++ b/event_handlers.c
+@@ -56,6 +56,7 @@
+ #include "util.h"
+ #include "vscreen.h"
+ #include "win_decorations.h"
++#include "win_modern.h"
+ #include "win_iconify.h"
+ #include "win_ops.h"
+ #include "win_regions.h"
+@@ -1880,6 +1881,7 @@ void HandleDestroyNotify(void)
+ 		free(Tmp_win->titlebuttons);
+ 		Tmp_win->titlebuttons = NULL;
+ 	}
++	ModernForgetWindow(Tmp_win);
+ 
+ 	remove_window_from_ring(Tmp_win);                           /* 11 */
+ 	if(Tmp_win->squeeze_info_copied) {                          /* 12 */
+@@ -2242,6 +2244,10 @@ void HandleMotionNotify(void)
+ 	else if(Scr->BorderCursors && Tmp_win && Event.xany.window == Tmp_win->frame) {
+ 		SetBorderCursor(Tmp_win, Event.xmotion.x, Event.xmotion.y);
+ 	}
++	else if(Tmp_win && Tmp_win->modern_grip != None &&
++	                Event.xany.window == Tmp_win->modern_grip) {
++		ModernGripMotion(Tmp_win, Event.xmotion.x, Event.xmotion.y);
++	}
+ }
+ 
+ 
+@@ -2813,6 +2819,20 @@ void HandleButtonPress(void)
+ 		else if(Tmp_win->icon && (Event.xany.window == Tmp_win->icon->w)) {
+ 			Context = C_ICON;
+ 		}
++		else if(Tmp_win->modern_grip != None &&
++		                Event.xany.window == Tmp_win->modern_grip) {
++			/* The resize border outside the frame (ModernTitles): the
++			 * frame's bindings apply, and -- as a press anywhere else on
++			 * the window does -- the window comes forward. */
++			if(Scr->ClickToFocus && Tmp_win->wmhints->input) {
++				SetFocus(Tmp_win, CurrentTime);
++			}
++			if(Scr->RaiseOnClick) {
++				OtpRaise(Tmp_win, WinWin);
++				WMapRaise(Tmp_win);
++			}
++			Context = C_FRAME;
++		}
+ 		else if(Event.xany.window == Tmp_win->frame) {
+ 			Window chwin;
+ 
+@@ -3078,6 +3098,12 @@ void HandleEnterNotify(void)
+ 	XEvent dummy;
+ 	VirtualScreen *vs;
+ 
++	/* ModernTitles: the pointer came onto a caption button. */
++	if(!ActiveMenu && ewp->mode == NotifyNormal &&
++	                ModernButtonCrossing(Tmp_win, ewp->window, true)) {
++		return;
++	}
++
+ 	/*
+ 	 * if we aren't in the middle of menu processing
+ 	 */
+@@ -3507,6 +3533,12 @@ void HandleLeaveNotify(void)
+ 		return;
+ 	}
+ 
++	/* ModernTitles: the pointer left a caption button.  Any mode -- a grab
++	 * taking the pointer away must clear the highlight as well. */
++	if(ModernButtonCrossing(Tmp_win, Event.xcrossing.window, false)) {
++		return;
++	}
++
+ 	/*
+ 	 * We're not interested in pseudo Enter/Leave events generated
+ 	 * from grab initiations and terminations.
+@@ -3766,6 +3798,21 @@ void HandleConfigureRequest(void)
+ 	}
+ 
+ 
++	/*
++	 * ModernTitles: a maximised window keeps its place and size until the
++	 * user restores it.  A program that moves or sizes itself from
++	 * settings it saved -- Claws Mail does at start and on every layout
++	 * change -- would otherwise shrink the window the user had just
++	 * maximised, and the resize below unzooms it on top.  The program is told the geometry it
++	 * actually has (the synthetic ConfigureNotify).  Leaving the maximised
++	 * state goes through the caption button or _NET_WM_STATE.
++	 */
++	if(Scr->ModernTitles && Tmp_win->zoomed != ZOOM_NONE &&
++	                (cre->value_mask & (CWX | CWY | CWWidth | CWHeight))) {
++		cre->value_mask &= ~(CWX | CWY | CWWidth | CWHeight);
++		sendEvent = true;
++	}
++
+ 	/* Don't modify frame_XXX fields before calling SetupWindow! */
+ 	x = Tmp_win->frame_x;
+ 	y = Tmp_win->frame_y;
+diff -Nur a/ewmh.c b/ewmh.c
+--- a/ewmh.c
++++ b/ewmh.c
+@@ -53,6 +53,7 @@
+ #include "win_iconify.h"
+ #include "win_ops.h"
+ #include "win_resize.h"
++#include "win_modern.h"
+ #include "win_utils.h"
+ #include "workspace_utils.h"
+ 
+@@ -955,6 +956,11 @@ static void EwmhHandle_NET_WM_ICONNotify(XPropertyEvent *event,
+ #ifdef DEBUG_EWMH
+ 	fprintf(stderr, "EwmhHandlePropertyNotify: NET_WM_ICON\n");
+ #endif /* DEBUG_EWMH */
++
++	/* The title bar shows the icon too (ModernTitles). */
++	if(Scr->ModernTitles) {
++		ModernIconChanged(twm_win);
++	}
+ 	/*
+ 	 * If there is no icon yet, we'll look at this property
+ 	 * later, if and when we do create an icon.
+diff -Nur a/functions_win_moveresize.c b/functions_win_moveresize.c
+--- a/functions_win_moveresize.c
++++ b/functions_win_moveresize.c
+@@ -124,6 +124,33 @@ movewindow(EF_FULLPROTO)
+ 	/* Better not be a menu open */
+ 	PopDownMenu();
+ 
++	/*
++	 * ModernTitles: a double click on a caption maximises the window, or
++	 * restores it when it is maximised.  The second press
++	 * has to come on the same window's caption within the double-click
++	 * time (ConstrainedMoveTime) and a few pixels of the first; it then
++	 * does nothing else -- no move, and the pointer stays where it is.
++	 */
++	if(Scr->ModernTitles && context == C_TITLE &&
++	                eventp->type == ButtonPress) {
++		static TwmWindow *dbl_win;
++		static Time dbl_time;
++		static int dbl_x, dbl_y;
++		const int x = eventp->xbutton.x_root, y = eventp->xbutton.y_root;
++
++		if(dbl_win == tmp_win && ConstrainedMoveTime &&
++		                eventp->xbutton.time - dbl_time < (Time)ConstrainedMoveTime &&
++		                abs(x - dbl_x) <= 4 && abs(y - dbl_y) <= 4) {
++			dbl_win = NULL;
++			fullzoom(tmp_win, F_FULLZOOM);
++			return;
++		}
++		dbl_win = tmp_win;
++		dbl_time = eventp->xbutton.time;
++		dbl_x = x;
++		dbl_y = y;
++	}
++
+ 	/* Stash up just which f.move* variant we are */
+ 	MoveFunction = func;
+ 
+@@ -261,7 +288,9 @@ movewindow(EF_FULLPROTO)
+ 	 * Only do the constrained move if timer is set; need to check it
+ 	 * in case of stupid or wicked fast servers
+ 	 */
+-	if(ConstrainedMoveTime &&
++	/* (Not with ModernTitles: there a double click on the caption
++	 * maximises, above, and the pointer is never moved.) */
++	if(!Scr->ModernTitles && ConstrainedMoveTime &&
+ 	                (eventp->xbutton.time - last_time) < ConstrainedMoveTime) {
+ 		int width, height;
+ 
+diff -Nur a/menus.c b/menus.c
+--- a/menus.c
++++ b/menus.c
+@@ -51,6 +51,7 @@
+ #include "util.h"
+ #include "vscreen.h"
+ #include "win_iconify.h"
++#include "win_modern.h"
+ #include "win_resize.h"
+ #include "win_utils.h"
+ #include "workspace_manager.h"
+@@ -348,10 +349,15 @@ PaintNormalEntry(MenuRoot *mr, MenuItem *mi, bool exposure)
+ 		int x, y;
+ 
+ 		if(mi->state) {
+-			XSetForeground(dpy, Scr->NormalGC, mi->highlight.back);
++			/* ModernTitles: a rounded highlight inset in the row. */
++			if(!ModernMenuHighlight(mr->w, 0, y_offset, mr->width,
++			                        Scr->EntryHeight, mi->normal.back,
++			                        mi->highlight.back)) {
++				XSetForeground(dpy, Scr->NormalGC, mi->highlight.back);
+ 
+-			XFillRectangle(dpy, mr->w, Scr->NormalGC, 0, y_offset,
+-			               mr->width, Scr->EntryHeight);
++				XFillRectangle(dpy, mr->w, Scr->NormalGC, 0, y_offset,
++				               mr->width, Scr->EntryHeight);
++			}
+ 			FB(mi->highlight.fore, mi->highlight.back);
+ 			XmbDrawString(dpy, mr->w, Scr->MenuFont.font_set, Scr->NormalGC,
+ 			              mi->x, text_y, mi->item, mi->strlen);
+@@ -373,9 +379,18 @@ PaintNormalEntry(MenuRoot *mr, MenuItem *mi, bool exposure)
+ 			}
+ 			XmbDrawString(dpy, mr->w, Scr->MenuFont.font_set, gc, mi->x,
+ 			              text_y, mi->item, mi->strlen);
+-			if(mi->separated)
+-				XDrawLine(dpy, mr->w, gc, 0, y_offset + Scr->EntryHeight - 1,
+-				          mr->width, y_offset + Scr->EntryHeight - 1);
++			if(mi->separated) {
++				int inset = 0;
++
++				/* ModernTitles: a faint line, short of the edges. */
++				if(Scr->ModernTitles) {
++					gc = Scr->NormalGC;
++					XSetForeground(dpy, gc, ModernMenuSeparator());
++					inset = MODERN_MENU_SEPARATOR_INSET;
++				}
++				XDrawLine(dpy, mr->w, gc, inset, y_offset + Scr->EntryHeight - 1,
++				          mr->width - 1 - inset, y_offset + Scr->EntryHeight - 1);
++			}
+ 		}
+ 
+ 		if(mi->func == F_MENU) {
+@@ -400,13 +415,18 @@ PaintNormalEntry(MenuRoot *mr, MenuItem *mi, bool exposure)
+ 		               mr->width, Scr->EntryHeight);
+ 
+ 		{
+-			XSetForeground(dpy, Scr->NormalGC, mi->normal.fore);
++			/* ModernTitles: separator lines, short of the edges. */
++			int inset = Scr->ModernTitles ? MODERN_MENU_SEPARATOR_INSET : 0;
++
++			XSetForeground(dpy, Scr->NormalGC, Scr->ModernTitles
++			               ? ModernMenuSeparator() : mi->normal.fore);
+ 			/* now draw the dividing lines */
+ 			if(y_offset)
+-				XDrawLine(dpy, mr->w, Scr->NormalGC, 0, y_offset,
+-				          mr->width, y_offset);
++				XDrawLine(dpy, mr->w, Scr->NormalGC, inset, y_offset,
++				          mr->width - 1 - inset, y_offset);
+ 			y = ((mi->item_num + 1) * Scr->EntryHeight) - 1;
+-			XDrawLine(dpy, mr->w, Scr->NormalGC, 0, y, mr->width, y);
++			XDrawLine(dpy, mr->w, Scr->NormalGC, inset, y,
++			          mr->width - 1 - inset, y);
+ 		}
+ 
+ 		FB(mi->normal.fore, mi->normal.back);
+@@ -879,7 +899,9 @@ void MakeMenu(MenuRoot *mr)
+ 			max_entry_height = MAX(max_entry_height, logical_rect.height);
+ 
+ 			if(cur->func != F_TITLE) {
+-				cur->x = 5;
++				/* ModernTitles: text 12 pixels in, clear of the rounded
++				 * highlight's inset. */
++				cur->x = Scr->ModernTitles ? 12 : 5;
+ 			}
+ 			else {
+ 				cur->x = width - logical_rect.width;
+@@ -887,6 +909,12 @@ void MakeMenu(MenuRoot *mr)
+ 			}
+ 		}
+ 		Scr->EntryHeight = max_entry_height + ENTRY_SPACING;
++		/* ModernTitles: rows MODERN_MENU_ROW pixels tall, more for a large
++		 * font, and the text has room after it as well as before. */
++		if(Scr->ModernTitles) {
++			Scr->EntryHeight = MAX(max_entry_height + 8, MODERN_MENU_ROW);
++			mr->width += 24;
++		}
+ 		mr->height = mr->items * Scr->EntryHeight;
+ 		mr->width += 10;
+ 		if(Scr->use3Dmenus) {
+@@ -917,7 +945,11 @@ void MakeMenu(MenuRoot *mr)
+ 
+ 		valuemask = (CWBackPixel | CWBorderPixel | CWEventMask);
+ 		attributes.background_pixel = Scr->MenuC.back;
+-		attributes.border_pixel = Scr->MenuC.fore;
++		/* ModernTitles: the border is a light hairline in MenuShadowColor
++		 * (the separator lines a lighter shade of it), not the text
++		 * colour. */
++		attributes.border_pixel = Scr->ModernTitles ? Scr->MenuShadowColor
++		                          : Scr->MenuC.fore;
+ 		if(mr->pinned) {
+ 			attributes.event_mask = (ExposureMask | EnterWindowMask
+ 			                         | LeaveWindowMask | ButtonPressMask
+diff -Nur a/parse_be.c b/parse_be.c
+--- a/parse_be.c
++++ b/parse_be.c
+@@ -131,6 +131,7 @@ typedef struct _TwmKeyword {
+ #define kw0_GrabServer                  76
+ #define kw0_DontNameDecorations         77
+ #define kw0_StrictWinNameEncoding       78
++#define kw0_ModernTitles                79
+ 
+ #define kws_UsePPosition                1
+ #define kws_IconFont                    2
+@@ -193,6 +194,8 @@ typedef struct _TwmKeyword {
+ #define kwn_BorderBottom                34
+ #define kwn_BorderLeft                  35
+ #define kwn_BorderRight                 36
++#define kwn_TitleBarHeight              37
++#define kwn_TitleButtonWidth            38
+ 
+ #define kwcl_BorderColor                1
+ #define kwcl_IconManagerHighlight       2
+@@ -345,6 +348,7 @@ static const TwmKeyword keytable[] = {
+ 	{ "menutitleforeground",    CKEYWORD, kwc_MenuTitleForeground },
+ 	{ "meta",                   META, 0 },
+ 	{ "mod",                    META, 0 },  /* fake it */
++	{ "moderntitles",           KEYWORD, kw0_ModernTitles },
+ 	{ "monitorlayout",          MONITOR_LAYOUT, 0 },
+ 	{ "monochrome",             MONOCHROME, 0 },
+ 	{ "move",                   MOVE, 0 },
+@@ -436,8 +440,10 @@ static const TwmKeyword keytable[] = {
+ 	{ "threedborderwidth",      NKEYWORD, kwn_ThreeDBorderWidth },
+ 	{ "title",                  TITLE, 0 },
+ 	{ "titlebackground",        CLKEYWORD, kwcl_TitleBackground },
++	{ "titlebarheight",         NKEYWORD, kwn_TitleBarHeight },
+ 	{ "titlebuttonborderwidth", NKEYWORD, kwn_TitleButtonBorderWidth },
+ 	{ "titlebuttonshadowdepth", NKEYWORD, kwn_TitleButtonShadowDepth },
++	{ "titlebuttonwidth",       NKEYWORD, kwn_TitleButtonWidth },
+ 	{ "titlefont",              SKEYWORD, kws_TitleFont },
+ 	{ "titleforeground",        CLKEYWORD, kwcl_TitleForeground },
+ 	{ "titlehighlight",         TITLE_HILITE, 0 },
+@@ -756,6 +762,10 @@ do_single_keyword(int keyword)
+ 			Scr->SunkFocusWindowTitle = true;
+ 			return true;
+ 
++		case kw0_ModernTitles:
++			Scr->ModernTitles = true;
++			return true;
++
+ 		case kw0_BeNiceToColormap:
+ 			Scr->BeNiceToColormap = true;
+ 			return true;
+@@ -1371,6 +1381,18 @@ do_number_keyword(int keyword, int num)
+ 			}
+ 			return true;
+ 
++		case kwn_TitleBarHeight:
++			if(Scr->FirstTime) {
++				Scr->TitleBarHeight = (num > 0) ? num : 0;
++			}
++			return true;
++
++		case kwn_TitleButtonWidth:
++			if(Scr->FirstTime) {
++				Scr->TitleButtonWidth = (num > 0) ? num : 0;
++			}
++			return true;
++
+ 		case kwn_BorderTop:
+ 			if(Scr->FirstTime) {
+ 				Scr->BorderTop = num;
+diff -Nur a/screen.h b/screen.h
+--- a/screen.h
++++ b/screen.h
+@@ -530,6 +530,9 @@ struct ScreenInfo {
+ 	bool  use3Dborders;      ///< UseThreeDBorders config var
+ 	bool  use3Dwmap;         ///< UseThreeDWMap config var
+ 	bool  SunkFocusWindowTitle;  ///< SunkFocusWindowTitle config var
++	bool  ModernTitles;          ///< ModernTitles config var (win_modern.c)
++	int   TitleBarHeight;        ///< TitleBarHeight config var, 0 = from font
++	int   TitleButtonWidth;      ///< TitleButtonWidth config var, 0 = square
+ 	short WMgrVertButtonIndent;  ///< WMgrVertButtonIndent config var
+ 	short WMgrHorizButtonIndent; ///< WMgrHorizButtonIndent config var
+ 	short WMgrButtonShadowDepth; ///< WMgrButtonShadowDepth config var
+diff -Nur a/twm_window_struct.h b/twm_window_struct.h
+--- a/twm_window_struct.h
++++ b/twm_window_struct.h
+@@ -210,6 +210,23 @@ struct TwmWindow {
+ 	Colormaps cmaps;           ///< colormaps for this application
+ 	/// Button windows in the titlebar.  \ingroup win_frame
+ 	TBWindow *titlebuttons;
++	/// The application icon at title size (ModernTitles), and whether it
++	/// has been looked for yet.  See win_modern.c.
++	struct modern_icon *modern_icon;
++	bool modern_icon_tried;
++	/// The invisible resize border around the frame (ModernTitles): an
++	/// InputOnly sibling of the frame, stacked right under it, and the
++	/// frame geometry it follows.  None when the window has no border.
++	/// See win_modern.c.
++	Window modern_grip;
++	Window modern_grip_parent;
++	int modern_fx, modern_fy;
++	unsigned int modern_fw, modern_fh, modern_fbw;
++	int modern_gx, modern_gy;   ///< the border's own geometry, as last set
++	unsigned int modern_gw, modern_gh;
++	int modern_grip_edges;      ///< edges under the pointer, for its cursor
++	bool modern_frame_mapped;
++	bool modern_grip_mapped;
+ 	SqueezeInfo *squeeze_info;  ///< Control info for title squeezing
+ 	bool squeeze_info_copied;   ///< Should ->squeeze_info be free()'d?
+ 
+diff -Nur a/util.c b/util.c
+--- a/util.c
++++ b/util.c
+@@ -54,6 +54,13 @@
+ #include "win_decorations.h"
+ #include "win_resize.h"
+ 
++#include <X11/Xft/Xft.h>
++
++/* This file implements the Xft routing of the two fontset calls (see the end
++ * of ctwm.h), so it needs the real Xlib functions. */
++#undef XmbTextExtents
++#undef XmbDrawString
++
+ 
+ /* Handle for debug tracing */
+ FILE *tracefile = NULL;
+@@ -307,6 +314,8 @@ UpdateFont(MyFont *font, int height)
+ }
+ 
+ 
++static void xft_register(MyFont *font);
++
+ /**
+  * Load up fontsets from the X server.  Only used by CreateFonts() below.
+  */
+@@ -337,8 +346,28 @@ GetFont(MyFont *font)
+ 	if(font->font_set != NULL) {
+ 		XFreeFontSet(dpy, font->font_set);
+ 	}
++	if(font->xft != NULL) {
++		XftFontClose(dpy, font->xft);
++		font->xft = NULL;
++	}
++
++	/*
++	 * "xft:<fontconfig pattern>" names an anti-aliased Xft font, e.g.
++	 * "xft:Selawik:size=9".  The fontset is still created, from the
++	 * default font, so that everything that measures or draws through
++	 * font_set keeps a valid one; ctwm_XmbTextExtents/ctwm_XmbDrawString
++	 * below send it to the Xft font instead.
++	 */
++	if(strncmp(font->basename, "xft:", 4) == 0) {
++		font->xft = XftFontOpenName(dpy, Scr->screen, font->basename + 4);
++		if(font->xft == NULL) {
++			fprintf(stderr, "%s:  unable to open Xft font \"%s\"\n",
++			        ProgramName, font->basename + 4);
++		}
++		xft_register(font);
++	}
+ 
+-	asprintf(&basename2, "%s,*", font->basename);
++	asprintf(&basename2, "%s,*", font->xft ? "fixed" : font->basename);
+ 	if((font->font_set = XCreateFontSet(dpy, basename2,
+ 	                                    &missing_charset_list_return,
+ 	                                    &missing_charset_count_return,
+@@ -370,12 +399,138 @@ GetFont(MyFont *font)
+ 	font->y = ascent;
+ 	font->ascent = ascent;
+ 	font->descent = descent;
++	if(font->xft) {
++		font->ascent = font->xft->ascent;
++		font->descent = font->xft->descent;
++		font->height = font->xft->ascent + font->xft->descent;
++		font->y = font->xft->ascent;
++		xft_register(font);
++	}
+ 	font->avg_height = 0;
+ 	font->avg_fheight = 0.0;
+ 	font->avg_count = 0;
+ }
+ 
+ 
++/*
++ * Which fontsets stand for an Xft font.  A handful at most -- one per font
++ * keyword -- so a linear table is all it needs.  Keyed on the MyFont, whose
++ * font_set changes when the font is reloaded.
++ */
++#define XFT_FONTS_MAX 16
++static MyFont *xft_fonts[XFT_FONTS_MAX];
++
++static void
++xft_register(MyFont *font)
++{
++	int free_slot = -1;
++
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
++		if(xft_fonts[i] == font) {
++			return;
++		}
++		if(xft_fonts[i] == NULL && free_slot < 0) {
++			free_slot = i;
++		}
++	}
++	if(free_slot >= 0) {
++		xft_fonts[free_slot] = font;
++	}
++}
++
++static XftFont *
++xft_for(XFontSet fs)
++{
++	if(fs == NULL) {
++		return NULL;
++	}
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
++		if(xft_fonts[i] && xft_fonts[i]->font_set == fs) {
++			return xft_fonts[i]->xft;
++		}
++	}
++	return NULL;
++}
++
++int
++ctwm_XmbTextExtents(XFontSet fs, const char *text, int len,
++                    XRectangle *ink, XRectangle *logical)
++{
++	XftFont *xf = xft_for(fs);
++	XGlyphInfo gi;
++
++	if(xf == NULL) {
++		return XmbTextExtents(fs, text, len, ink, logical);
++	}
++	XftTextExtentsUtf8(dpy, xf, (const FcChar8 *)text, len, &gi);
++	if(ink) {
++		ink->x = -gi.x;
++		ink->y = -gi.y;
++		ink->width = gi.width;
++		ink->height = gi.height;
++	}
++	if(logical) {
++		logical->x = 0;
++		logical->y = -xf->ascent;
++		logical->width = gi.xOff;
++		logical->height = xf->ascent + xf->descent;
++	}
++	return gi.xOff;
++}
++
++/*
++ * The colour comes from the GC's foreground, which is how every caller sets
++ * it; the last pixel is cached, since a run of draws usually shares one.
++ */
++void
++ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
++                   int x, int y, const char *text, int len)
++{
++	static Pixel last_pixel;
++	static XftColor last_color;
++	static bool have_color = false;
++	XftFont *xf = xft_for(fs);
++	XGCValues gv;
++	XftDraw *draw;
++
++	if(xf == NULL) {
++		XmbDrawString(d, w, fs, gc, x, y, text, len);
++		return;
++	}
++
++	XGetGCValues(d, gc, GCForeground, &gv);
++	if(!have_color || gv.foreground != last_pixel) {
++		XColor xc;
++		XRenderColor rc;
++
++		xc.pixel = gv.foreground;
++		XQueryColor(d, DefaultColormap(d, Scr->screen), &xc);
++		rc.red = xc.red;
++		rc.green = xc.green;
++		rc.blue = xc.blue;
++		rc.alpha = 0xffff;
++		if(have_color) {
++			XftColorFree(d, Scr->d_visual, DefaultColormap(d, Scr->screen),
++			             &last_color);
++		}
++		have_color = XftColorAllocValue(d, Scr->d_visual,
++		                                DefaultColormap(d, Scr->screen),
++		                                &rc, &last_color);
++		last_pixel = gv.foreground;
++		if(!have_color) {
++			return;
++		}
++	}
++
++	draw = XftDrawCreate(d, w, Scr->d_visual, DefaultColormap(d, Scr->screen));
++	if(draw) {
++		XftDrawStringUtf8(draw, &last_color, xf, x, y, (const FcChar8 *)text,
++		                  len);
++		XftDrawDestroy(draw);
++	}
++}
++
++
+ /**
+  * Load up our various defined fonts
+  */
+diff -Nur a/win_decorations.c b/win_decorations.c
+--- a/win_decorations.c
++++ b/win_decorations.c
+@@ -23,6 +23,7 @@
+ #include "workspace_manager.h"
+ 
+ #include "win_decorations.h"
++#include "win_modern.h"
+ 
+ 
+ /* Internal bits */
+@@ -449,6 +450,16 @@ SetupFrame(TwmWindow *tmp_win, int x, int y, int w, int h, int bw,
+ 	/* Possible change how it looks in the WorkspaceManager */
+ 	WMapSetupWindow(tmp_win, x, y, w, h);
+ 
++	/*
++	 * ModernTitles: the maximise button shows the restore glyph while the
++	 * window is zoomed, and zooming always comes through here.  The buttons
++	 * keep their contents when the frame resizes (they move by gravity), so
++	 * no Expose would redraw them.
++	 */
++	if(Scr->ModernTitles && tmp_win->title_w && tmp_win->titlebuttons) {
++		PaintTitleButtons(tmp_win);
++	}
++
+ 	/*
+ 	 * And send Configure notification to the (real) window if we decided
+ 	 * we have to, telling it about what all has happened.
+@@ -694,6 +705,10 @@ CreateWindowTitlebarButtons(TwmWindow *tmp_win)
+ 	attributes.border_pixel = tmp_win->title.fore;
+ 	attributes.event_mask = (ButtonPressMask | ButtonReleaseMask |
+ 	                         ExposureMask);
++	/* ModernTitles highlights a caption button under the pointer. */
++	if(Scr->ModernTitles) {
++		attributes.event_mask |= (EnterWindowMask | LeaveWindowMask);
++	}
+ 	attributes.cursor = Scr->ButtonCursor;
+ 	valuemask = (CWWinGravity | CWBackPixel | CWBorderPixel | CWEventMask |
+ 	             CWCursor);
+@@ -719,6 +734,15 @@ CreateWindowTitlebarButtons(TwmWindow *tmp_win)
+ 			TBWindow *tbw;
+ 			int boxwidth = (Scr->TBInfo.width + Scr->TBInfo.pad);
+ 			unsigned int h = (Scr->TBInfo.width - Scr->TBInfo.border * 2);
++			unsigned int bw = h;
++
++			/* ModernTitles: a rectangle the full height of the title,
++			 * from the top edge. */
++			if(Scr->ModernTitles) {
++				bw = Scr->TBInfo.width;
++				h = Scr->TitleHeight;
++				y = 0;
++			}
+ 
+ 			for(tb = Scr->TBInfo.head, tbw = tmp_win->titlebuttons; tb;
+ 			                tb = tb->next, tbw++) {
+@@ -733,7 +757,7 @@ CreateWindowTitlebarButtons(TwmWindow *tmp_win)
+ 					leftx += boxwidth;
+ 					attributes.win_gravity = NorthWestGravity;
+ 				}
+-				tbw->window = XCreateWindow(dpy, tmp_win->title_w, x, y, h, h,
++				tbw->window = XCreateWindow(dpy, tmp_win->title_w, x, y, bw, h,
+ 				                            Scr->TBInfo.border,
+ 				                            0, CopyFromParent,
+ 				                            CopyFromParent,
+@@ -1188,6 +1212,11 @@ CreateLowlightWindows(TwmWindow *tmp_win)
+ void
+ PaintTitle(TwmWindow *tmp_win)
+ {
++	if(Scr->ModernTitles && Scr->d_visual->class == TrueColor) {
++		ModernPaintTitle(tmp_win);
++		return;
++	}
++
+ 	/* Draw 3d border around title bits */
+ 	if(Scr->use3Dtitles) {
+ 		/*
+@@ -1298,6 +1327,9 @@ PaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
+ {
+ 	TitleButton *tb = tbw->info;
+ 
++	if(ModernPaintTitleButton(tmp_win, tbw)) {
++		return;
++	}
+ 	XCopyArea(dpy, tbw->image->pixmap, tbw->window, Scr->NormalGC,
+ 	          tb->srcx, tb->srcy, tb->width, tb->height,
+ 	          tb->dstx, tb->dsty);
+diff -Nur a/win_decorations_init.c b/win_decorations_init.c
+--- a/win_decorations_init.c
++++ b/win_decorations_init.c
+@@ -54,6 +54,18 @@ InitTitlebarButtons(void)
+ 	else
+ 		Scr->TBInfo.pad = ((Scr->TitlePadding > 1)
+ 		                   ? ((Scr->TitlePadding + 1) / 2) : 1);
++	/*
++	 * ModernTitles: caption buttons are TitleButtonWidth wide and the full
++	 * title height tall (each draws its rounded rectangle inset in that),
++	 * TitlePadding apart, with FramePadding between the outermost one and
++	 * the edge of the title bar.
++	 */
++	if(Scr->ModernTitles) {
++		Scr->TBInfo.width = (Scr->TitleButtonWidth > 0)
++		                    ? Scr->TitleButtonWidth : Scr->TitleHeight;
++		Scr->TBInfo.pad = Scr->TitlePadding;
++		Scr->TBInfo.border = 0;
++	}
+ 	h = Scr->TBInfo.width - 2 * Scr->TBInfo.border;
+ 
+ 	/*
+diff -Nur a/win_modern.c b/win_modern.c
+--- a/win_modern.c
++++ b/win_modern.c
+@@ -0,0 +1,1277 @@
++/*
++ * LikeOS -- the LikeOS window frame for ctwm ("ModernTitles").
++ *
++ * See win_modern.h for what this draws.  Everything is drawn client-side into
++ * small XImages and blitted, rather than with core X lines: the caption
++ * glyphs are thin strokes with anti-aliased curves and diagonals, the caption
++ * buttons rounded rectangles with smooth corners, and the application icon is
++ * blended onto the title colour, none of which the core protocol can draw.
++ * Blending against a known, opaque background is all that is needed -- the
++ * title bar is a solid colour -- so no compositing or Render extension is
++ * involved.
++ *
++ * The colours are the LikeOS light palette: a focused title is #eef2f9 with
++ * near-black text, an unfocused one #f5f7fb with slate text and glyphs.  A
++ * caption button under the pointer gets a faint blue-grey wash, the close
++ * button a coral red (#e0443e) with a white glyph.
++ *
++ * The resize border at the end of this file is the other half of the frame:
++ * the band outside the visible edge that resizes the window.
++ *
++ * Copyright (C) 2026 The LikeOS Project
++ */
++
++/* This file implements the frame-call wrappers ctwm.h routes everything
++ * else through, so it has to see the real Xlib calls. */
++#define CTWM_NO_FRAME_REDIRECT
++#include "ctwm.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#include <X11/Xatom.h>
++#include <X11/Xutil.h>
++#include <X11/Xft/Xft.h>
++
++#include "functions_defs.h"
++#include "screen.h"
++#include "win_decorations.h"
++#include "win_modern.h"
++
++#define MD_ACTIVE_BG     0xeef2f9
++#define MD_INACTIVE_BG   0xf5f7fb
++#define MD_ACTIVE_FG     0x141a24
++#define MD_INACTIVE_FG   0x586174
++#define MD_HOVER_TINT    0x1c3a78  /* the wash under the pointer ... */
++#define MD_HOVER_ALPHA   0.06      /* ... and how much of it */
++#define MD_CLOSE_BG      0xe0443e
++#define MD_CLOSE_FG      0xffffff
++
++#define MD_GLYPH         10   /* caption glyph box, pixels */
++#define MD_STROKE        1.25 /* caption glyph line width, pixels */
++#define MD_BUTTON_H      26   /* caption button height (its width is the
++                               * TitleButtonWidth), vertically centred */
++#define MD_BUTTON_RADIUS 6    /* its corners */
++#define MD_ICON          16   /* title icon, pixels */
++#define MD_LEFT_PAD      12   /* title bar edge to the icon or the text */
++#define MD_ICON_ADVANCE  24   /* icon's left edge to the text */
++#define MD_RIGHT_PAD     8    /* text to the first caption button */
++
++typedef enum { MD_NONE, MD_MINIMIZE, MD_MAXIMIZE, MD_CLOSE } ModernKind;
++
++/* The application icon at title size, kept per window: 16x16 ARGB. */
++struct modern_icon {
++	unsigned int px[MD_ICON * MD_ICON];
++};
++
++/* ------------------------------------------------------------------------ */
++/* Colour helpers                                                           */
++/* ------------------------------------------------------------------------ */
++
++static unsigned long
++chan(unsigned int c8, unsigned long mask)
++{
++	int shift = 0, bits = 0;
++	unsigned long v;
++
++	if(mask == 0) {
++		return 0;
++	}
++	while(!(mask & 1)) {
++		mask >>= 1;
++		shift++;
++	}
++	while(mask & 1) {
++		mask >>= 1;
++		bits++;
++	}
++	v = (bits >= 8) ? ((unsigned long)c8 << (bits - 8)) : (c8 >> (8 - bits));
++	return v << shift;
++}
++
++static unsigned long
++md_pixel(unsigned int rgb)
++{
++	Visual *v = Scr->d_visual;
++
++	return chan((rgb >> 16) & 0xff, v->red_mask) |
++	       chan((rgb >> 8) & 0xff, v->green_mask) |
++	       chan(rgb & 0xff, v->blue_mask);
++}
++
++/* The 0xRRGGBB a TrueColor pixel value stands for: the inverse of
++ * md_pixel(), for colours ctwm allocated from the configuration. */
++static unsigned int
++md_rgb(unsigned long pixel)
++{
++	Visual *v = Scr->d_visual;
++	unsigned long masks[3] = { v->red_mask, v->green_mask, v->blue_mask };
++	unsigned int out = 0;
++
++	for(int c = 0; c < 3; c++) {
++		unsigned long mask = masks[c], val;
++		int shift = 0, bits = 0;
++
++		if(mask == 0) {
++			continue;
++		}
++		while(!(mask & 1)) {
++			mask >>= 1;
++			shift++;
++		}
++		while(mask & 1) {
++			mask >>= 1;
++			bits++;
++		}
++		val = (pixel >> shift) & ((1UL << bits) - 1);
++		val = bits >= 8 ? val >> (bits - 8) : (val * 255) / ((1UL << bits) - 1);
++		out |= (unsigned int)(val & 0xff) << (16 - 8 * c);
++	}
++	return out;
++}
++
++/* `a' of `fg' over `bg', both 0xRRGGBB. */
++static unsigned int
++md_blend(unsigned int bg, unsigned int fg, double a)
++{
++	unsigned int out = 0;
++
++	if(a <= 0) {
++		return bg;
++	}
++	if(a >= 1) {
++		return fg;
++	}
++	for(int s = 0; s <= 16; s += 8) {
++		double b = (bg >> s) & 0xff, f = (fg >> s) & 0xff;
++		unsigned int c = (unsigned int)(b + (f - b) * a + 0.5);
++
++		out |= (c > 255 ? 255 : c) << s;
++	}
++	return out;
++}
++
++/* Everything here assumes a TrueColor screen, which is what every modern
++ * server offers; on anything else the classic decorations are used. */
++static bool
++md_usable(void)
++{
++	return Scr->ModernTitles && Scr->d_visual &&
++	       Scr->d_visual->class == TrueColor;
++}
++
++static XImage *
++md_image(int w, int h)
++{
++	char *data = malloc((size_t)w * h * 4);
++	XImage *img;
++
++	if(!data) {
++		return NULL;
++	}
++	img = XCreateImage(dpy, Scr->d_visual, Scr->d_depth, ZPixmap, 0, data,
++	                   w, h, 32, 0);
++	if(!img) {
++		free(data);
++	}
++	return img;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Caption glyphs                                                           */
++/* ------------------------------------------------------------------------ */
++
++/* Distance from (px, py) to the segment (ax, ay)-(bx, by). */
++static double
++seg_dist(double px, double py, double ax, double ay, double bx, double by)
++{
++	double dx = bx - ax, dy = by - ay;
++	double t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
++
++	if(t < 0) {
++		t = 0;
++	}
++	if(t > 1) {
++		t = 1;
++	}
++	dx = px - (ax + t * dx);
++	dy = py - (ay + t * dy);
++	return sqrt(dx * dx + dy * dy);
++}
++
++/* Signed distance from (px, py) to the edge of the rectangle centred on
++ * (cx, cy) with half-sizes `hx' and `hy' and corner radius `r': negative
++ * inside, positive outside. */
++static double
++rrect_dist(double px, double py, double cx, double cy, double hx, double hy,
++           double r)
++{
++	double qx = fabs(px - cx) - (hx - r), qy = fabs(py - cy) - (hy - r);
++	double ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
++	double in = (qx > qy ? qx : qy);
++
++	return sqrt(ox * ox + oy * oy) + (in < 0 ? in : 0) - r;
++}
++
++/*
++ * Is glyph-space point (x, y) on the stroke of the glyph?
++ *
++ * The glyph box is MD_GLYPH square, pixel (i, j) covering [i, i+1) x
++ * [j, j+1).  Every stroke is MD_STROKE wide with round ends: the points
++ * within half of that of a centre line.  Horizontal and vertical centre lines
++ * run along pixel centres, so that each covers one pixel row or column fully
++ * and only a faint fringe either side.
++ *
++ *   minimise  one line across the middle;
++ *   maximise  a square outline with well-rounded corners, filling the box;
++ *   restore   two smaller rounded squares, the back one two pixels up and
++ *             to the right, cut away for a pixel's gap around the front one,
++ *             so that only its top and right sides show;
++ *   close     the two diagonals.
++ */
++static bool
++glyph_hit(ModernKind kind, bool restore, double x, double y)
++{
++	const double sw = MD_STROKE / 2;
++
++	switch(kind) {
++		case MD_MINIMIZE:
++			return seg_dist(x, y, 1.0, 5.5, 9.0, 5.5) <= sw;
++
++		case MD_CLOSE:
++			return seg_dist(x, y, 1.0, 1.0, 9.0, 9.0) <= sw ||
++			       seg_dist(x, y, 1.0, 9.0, 9.0, 1.0) <= sw;
++
++		case MD_MAXIMIZE:
++			if(!restore) {
++				return fabs(rrect_dist(x, y, 5.0, 5.0, 4.5, 4.5, 2.5)) <= sw;
++			}
++			/* Front square: 0.5..7.5 across, 2.5..9.5 down. */
++			if(fabs(rrect_dist(x, y, 4.0, 6.0, 3.5, 3.5, 2.0)) <= sw) {
++				return true;
++			}
++			/* Back square: 2.5..9.5 across, 0.5..7.5 down, where it
++			 * keeps clear of the front one. */
++			return fabs(rrect_dist(x, y, 6.0, 4.0, 3.5, 3.5, 2.0)) <= sw &&
++			       rrect_dist(x, y, 4.0, 6.0, 3.5, 3.5, 2.0) > sw + 1.0;
++
++		default:
++			return false;
++	}
++}
++
++/* Coverage of pixel (i, j) of the glyph box, 0..1, by 8x8 supersampling.
++ * (i, j) may lie a pixel outside the box, for the fringe of a stroke laid
++ * along its edge. */
++static double
++glyph_cover(ModernKind kind, bool restore, int i, int j)
++{
++	int n = 0;
++
++	for(int sy = 0; sy < 8; sy++) {
++		for(int sx = 0; sx < 8; sx++) {
++			if(glyph_hit(kind, restore, i + (sx + 0.5) / 8.0,
++			                j + (sy + 0.5) / 8.0)) {
++				n++;
++			}
++		}
++	}
++	return n / 64.0;
++}
++
++/* Coverage of pixel (x, y) by the w x h rounded rectangle at the origin
++ * with corner radius `r', by 4x4 supersampling. */
++static double
++rrect_cover(int x, int y, int w, int h, double r)
++{
++	int n = 0;
++
++	for(int sy = 0; sy < 4; sy++) {
++		for(int sx = 0; sx < 4; sx++) {
++			if(rrect_dist(x + (sx + 0.5) / 4.0, y + (sy + 0.5) / 4.0,
++			              w / 2.0, h / 2.0, w / 2.0, h / 2.0, r) <= 0) {
++				n++;
++			}
++		}
++	}
++	return n / 16.0;
++}
++
++static ModernKind
++md_kind(TitleButton *tb)
++{
++	TitleButtonFunc *tbf;
++
++	if(!tb) {
++		return MD_NONE;
++	}
++	for(tbf = tb->funs; tbf; tbf = tbf->next) {
++		switch(tbf->func) {
++			case F_ICONIFY:
++				return MD_MINIMIZE;
++			case F_ZOOM: case F_HORIZOOM: case F_FULLZOOM:
++			case F_FULLSCREENZOOM: case F_LEFTZOOM: case F_RIGHTZOOM:
++			case F_TOPZOOM: case F_BOTTOMZOOM: case F_XZOOM:
++			case F_XHORIZOOM: case F_XFULLZOOM: case F_XFULLSCREENZOOM:
++			case F_XLEFTZOOM: case F_XRIGHTZOOM: case F_XTOPZOOM:
++			case F_XBOTTOMZOOM:
++				return MD_MAXIMIZE;
++			case F_DELETE: case F_DESTROY: case F_DELETEORDESTROY:
++				return MD_CLOSE;
++			default:
++				break;
++		}
++	}
++	return MD_NONE;
++}
++
++bool
++ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
++{
++	ModernKind kind;
++	bool focus, restore, lit;
++	unsigned int bg, fill, fg;
++	int w, h, bh, by, gx, gy;
++	XImage *img;
++
++	if(!md_usable() || !tbw || !tbw->window) {
++		return false;
++	}
++	kind = md_kind(tbw->info);
++	if(kind == MD_NONE) {
++		return false;
++	}
++
++	focus = tmp_win->hasfocusvisible;
++	restore = (tmp_win->zoomed != ZOOM_NONE);
++	bg = focus ? MD_ACTIVE_BG : MD_INACTIVE_BG;
++	fg = focus ? MD_ACTIVE_FG : MD_INACTIVE_FG;
++	/* At rest the button is the title bar's own colour; under the pointer
++	 * its rounded rectangle is filled. */
++	lit = tbw->hover;
++	fill = bg;
++	if(lit) {
++		if(kind == MD_CLOSE) {
++			fill = MD_CLOSE_BG;
++			fg = MD_CLOSE_FG;
++		}
++		else {
++			fill = md_blend(bg, MD_HOVER_TINT, MD_HOVER_ALPHA);
++			fg = MD_ACTIVE_FG;
++		}
++	}
++
++	/* The button window is the full height of the title bar, so that the
++	 * whole of it takes the click; the rectangle is drawn inset in it. */
++	w = Scr->TBInfo.width;
++	h = Scr->TitleHeight;
++	bh = (h - 4 < MD_BUTTON_H) ? h - 4 : MD_BUTTON_H;
++	by = (h - bh) / 2;
++	img = md_image(w, h);
++	if(!img) {
++		return false;
++	}
++
++	gx = (w - MD_GLYPH) / 2;
++	gy = (h - MD_GLYPH) / 2;
++	for(int y = 0; y < h; y++) {
++		for(int x = 0; x < w; x++) {
++			unsigned int c = bg;
++			double a;
++
++			if(lit && y >= by && y < by + bh) {
++				c = md_blend(bg, fill, rrect_cover(x, y - by, w, bh,
++				                                   MD_BUTTON_RADIUS));
++			}
++			if(x >= gx - 1 && x <= gx + MD_GLYPH &&
++			                y >= gy - 1 && y <= gy + MD_GLYPH) {
++				a = glyph_cover(kind, restore, x - gx, y - gy);
++				c = md_blend(c, fg, a);
++			}
++			XPutPixel(img, x, y, md_pixel(c));
++		}
++	}
++
++	XPutImage(dpy, tbw->window, Scr->NormalGC, img, 0, 0, 0, 0, w, h);
++	XDestroyImage(img);
++	return true;
++}
++
++bool
++ModernButtonCrossing(TwmWindow *tmp_win, Window w, bool entered)
++{
++	TBWindow *tbw;
++	int nb;
++
++	if(!md_usable() || !tmp_win || !tmp_win->titlebuttons) {
++		return false;
++	}
++	nb = Scr->TBInfo.nleft + Scr->TBInfo.nright;
++	tbw = tmp_win->titlebuttons;
++	for(int i = 0; i < nb; i++, tbw++) {
++		if(tbw->window == w) {
++			tbw->hover = entered;
++			if(!ModernPaintTitleButton(tmp_win, tbw)) {
++				PaintTitleButton(tmp_win, tbw);
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Menus                                                                    */
++/* ------------------------------------------------------------------------ */
++
++#define MD_MENU_HL_INSET  4   /* highlight, in from the menu's sides */
++#define MD_MENU_HL_RADIUS 6
++
++bool
++ModernMenuHighlight(Window w, int x, int y, int width, int height, Pixel bg,
++                    Pixel fill)
++{
++	unsigned int bg_rgb, fill_rgb;
++	int hw = width - 2 * MD_MENU_HL_INSET, hh = height - 2;
++	XImage *img;
++
++	if(!md_usable() || hw <= 2 * MD_MENU_HL_RADIUS ||
++	                hh <= 2 * MD_MENU_HL_RADIUS) {
++		return false;
++	}
++	img = md_image(width, height);
++	if(!img) {
++		return false;
++	}
++	bg_rgb = md_rgb(bg);
++	fill_rgb = md_rgb(fill);
++	/* One pixel clear above and below, so that neighbouring rows never
++	 * run together. */
++	for(int j = 0; j < height; j++) {
++		for(int i = 0; i < width; i++) {
++			double a = 0;
++
++			if(j >= 1 && j < height - 1 && i >= MD_MENU_HL_INSET &&
++			                i < width - MD_MENU_HL_INSET) {
++				a = rrect_cover(i - MD_MENU_HL_INSET, j - 1, hw, hh,
++				                MD_MENU_HL_RADIUS);
++			}
++			XPutPixel(img, i, j, md_pixel(md_blend(bg_rgb, fill_rgb, a)));
++		}
++	}
++	XPutImage(dpy, w, Scr->NormalGC, img, 0, 0, x, y, (unsigned int)width,
++	          (unsigned int)height);
++	XDestroyImage(img);
++	return true;
++}
++
++Pixel
++ModernMenuSeparator(void)
++{
++	if(!md_usable()) {
++		return Scr->MenuShadowColor;
++	}
++	return md_pixel(md_blend(md_rgb(Scr->MenuC.back),
++	                         md_rgb(Scr->MenuShadowColor), 0.55));
++}
++
++/* ------------------------------------------------------------------------ */
++/* Title icon                                                               */
++/* ------------------------------------------------------------------------ */
++
++/* The application's icon at 16x16, from _NET_WM_ICON.
++ *
++ * The property holds a list of (width, height, ARGB pixels...) images.  The
++ * smallest that is at least 16 pixels is taken -- downsampling a 256-pixel
++ * icon to 16 turns detail into mud -- and box-filtered down to size, in
++ * premultiplied alpha so that transparent pixels do not darken the edges. */
++static struct modern_icon *
++md_load_icon(TwmWindow *tmp_win)
++{
++	static Atom net_wm_icon = None;
++	Atom type;
++	int fmt;
++	unsigned long n, after;
++	unsigned char *data = NULL;
++	struct modern_icon *ic = NULL;
++
++	if(net_wm_icon == None) {
++		net_wm_icon = XInternAtom(dpy, "_NET_WM_ICON", False);
++	}
++	if(XGetWindowProperty(dpy, tmp_win->w, net_wm_icon, 0, 1 << 20, False,
++	                      XA_CARDINAL, &type, &fmt, &n, &after,
++	                      &data) != Success || !data) {
++		return NULL;
++	}
++	if(type != XA_CARDINAL || fmt != 32) {
++		XFree(data);
++		return NULL;
++	}
++
++	/* Format-32 properties come back as an array of longs. */
++	unsigned long *p = (unsigned long *)data;
++	unsigned long i = 0, best = 0, bw = 0, bh = 0;
++
++	while(i + 2 <= n) {
++		unsigned long iw = p[i], ih = p[i + 1];
++
++		if(iw == 0 || ih == 0 || iw > 4096 || ih > 4096 ||
++		                i + 2 + iw * ih > n) {
++			break;
++		}
++		if((iw >= MD_ICON && (bw < MD_ICON || iw < bw)) ||
++		                (bw < MD_ICON && iw > bw)) {
++			best = i + 2;
++			bw = iw;
++			bh = ih;
++		}
++		i += 2 + iw * ih;
++	}
++
++	if(bw > 0 && (ic = calloc(1, sizeof(*ic)))) {
++		for(int y = 0; y < MD_ICON; y++) {
++			for(int x = 0; x < MD_ICON; x++) {
++				unsigned long x0 = x * bw / MD_ICON, x1 = (x + 1) * bw / MD_ICON;
++				unsigned long y0 = y * bh / MD_ICON, y1 = (y + 1) * bh / MD_ICON;
++				double a = 0, r = 0, g = 0, b = 0;
++				unsigned long cnt = 0;
++
++				if(x1 <= x0) {
++					x1 = x0 + 1;
++				}
++				if(y1 <= y0) {
++					y1 = y0 + 1;
++				}
++				for(unsigned long yy = y0; yy < y1 && yy < bh; yy++) {
++					for(unsigned long xx = x0; xx < x1 && xx < bw; xx++) {
++						unsigned long v = p[best + yy * bw + xx];
++						double al = ((v >> 24) & 0xff) / 255.0;
++
++						a += al;
++						r += ((v >> 16) & 0xff) * al;
++						g += ((v >> 8) & 0xff) * al;
++						b += (v & 0xff) * al;
++						cnt++;
++					}
++				}
++				if(cnt == 0 || a <= 0) {
++					continue;
++				}
++				r /= a;
++				g /= a;
++				b /= a;
++				a /= cnt;
++				ic->px[y * MD_ICON + x] =
++				        ((unsigned int)(a * 255 + 0.5) << 24) |
++				        ((unsigned int)(r + 0.5) << 16) |
++				        ((unsigned int)(g + 0.5) << 8) |
++				        (unsigned int)(b + 0.5);
++			}
++		}
++	}
++	XFree(data);
++	return ic;
++}
++
++void
++ModernIconChanged(TwmWindow *tmp_win)
++{
++	if(!tmp_win) {
++		return;
++	}
++	free(tmp_win->modern_icon);
++	tmp_win->modern_icon = NULL;
++	tmp_win->modern_icon_tried = false;
++	if(md_usable() && tmp_win->title_w) {
++		ModernPaintTitle(tmp_win);
++	}
++}
++
++static void md_grip_destroy(TwmWindow *tmp_win);
++
++void
++ModernForgetWindow(TwmWindow *tmp_win)
++{
++	if(!tmp_win) {
++		return;
++	}
++	free(tmp_win->modern_icon);
++	tmp_win->modern_icon = NULL;
++	tmp_win->modern_icon_tried = false;
++	md_grip_destroy(tmp_win);
++}
++
++/* ------------------------------------------------------------------------ */
++/* Title bar                                                                */
++/* ------------------------------------------------------------------------ */
++
++/* Shorten `s' (UTF-8) so that it and an ellipsis fit in `avail' pixels. */
++static char *
++md_fit(XftFont *font, const char *s, int avail)
++{
++	XGlyphInfo gi;
++	size_t len = strlen(s);
++	char *out;
++
++	XftTextExtentsUtf8(dpy, font, (const FcChar8 *)s, (int)len, &gi);
++	if(gi.xOff <= avail) {
++		return strdup(s);
++	}
++	out = malloc(len + 4);
++	if(!out) {
++		return NULL;
++	}
++	while(len > 0) {
++		/* step back one whole UTF-8 character */
++		do {
++			len--;
++		}
++		while(len > 0 && ((unsigned char)s[len] & 0xc0) == 0x80);
++		memcpy(out, s, len);
++		memcpy(out + len, "\xe2\x80\xa6", 4);
++		XftTextExtentsUtf8(dpy, font, (const FcChar8 *)out, (int)len + 3, &gi);
++		if(gi.xOff <= avail) {
++			return out;
++		}
++	}
++	free(out);
++	return NULL;
++}
++
++void
++ModernPaintTitle(TwmWindow *tmp_win)
++{
++	bool focus;
++	unsigned int bg, fg;
++	int x, h, avail;
++	MyFont *font = &Scr->TitleBarFont;
++
++	if(!tmp_win->title_w) {
++		return;
++	}
++	focus = tmp_win->hasfocusvisible;
++	bg = focus ? MD_ACTIVE_BG : MD_INACTIVE_BG;
++	fg = focus ? MD_ACTIVE_FG : MD_INACTIVE_FG;
++	h = Scr->TitleHeight;
++
++	XSetForeground(dpy, Scr->NormalGC, md_pixel(bg));
++	XFillRectangle(dpy, tmp_win->title_w, Scr->NormalGC, 0, 0,
++	               tmp_win->title_width, h);
++
++	/*
++	 * The title window has a border as wide as the frame's, and the frame
++	 * clips all of it except the bottom edge -- which would draw a line in
++	 * the border colour between the title and the window contents.  The
++	 * caption runs straight into the contents instead, so that edge takes
++	 * the title's own colour.  (The
++	 * focus code sets the border colour on every change; this runs after
++	 * it.)
++	 */
++	if(tmp_win->frame_bw > 0) {
++		XSetWindowBorder(dpy, tmp_win->title_w, md_pixel(bg));
++	}
++
++	/* MD_LEFT_PAD from the left edge, or from the last left-side button:
++	 * titlex is FramePadding further in than where those end. */
++	x = MD_LEFT_PAD + Scr->TBInfo.titlex - Scr->FramePadding;
++
++	if(!tmp_win->modern_icon_tried) {
++		tmp_win->modern_icon = md_load_icon(tmp_win);
++		tmp_win->modern_icon_tried = true;
++	}
++	if(tmp_win->modern_icon && h >= MD_ICON) {
++		XImage *img = md_image(MD_ICON, MD_ICON);
++
++		if(img) {
++			for(int y = 0; y < MD_ICON; y++) {
++				for(int xx = 0; xx < MD_ICON; xx++) {
++					unsigned int v = tmp_win->modern_icon->px[y * MD_ICON + xx];
++					double a = ((v >> 24) & 0xff) / 255.0;
++
++					XPutPixel(img, xx, y,
++					          md_pixel(md_blend(bg, v & 0xffffff, a)));
++				}
++			}
++			XPutImage(dpy, tmp_win->title_w, Scr->NormalGC, img, 0, 0,
++			          x, (h - MD_ICON) / 2, MD_ICON, MD_ICON);
++			XDestroyImage(img);
++		}
++		x += MD_ICON_ADVANCE;
++	}
++
++	if(!tmp_win->name || !*tmp_win->name) {
++		return;
++	}
++	avail = (int)tmp_win->title_width - Scr->TBInfo.rightoff - MD_RIGHT_PAD - x;
++	if(avail <= 0) {
++		return;
++	}
++
++	if(font->xft) {
++		XftDraw *d = XftDrawCreate(dpy, tmp_win->title_w, Scr->d_visual,
++		                           DefaultColormap(dpy, Scr->screen));
++		XRenderColor rc = {
++			.red = ((fg >> 16) & 0xff) * 257,
++			.green = ((fg >> 8) & 0xff) * 257,
++			.blue = (fg & 0xff) * 257,
++			.alpha = 0xffff,
++		};
++		XftColor col;
++		char *text = md_fit(font->xft, tmp_win->name, avail);
++
++		if(d && text && XftColorAllocValue(dpy, Scr->d_visual,
++		                                   DefaultColormap(dpy, Scr->screen),
++		                                   &rc, &col)) {
++			int base = (h - (font->xft->ascent + font->xft->descent)) / 2 +
++			           font->xft->ascent;
++
++			XftDrawStringUtf8(d, &col, font->xft, x, base,
++			                  (const FcChar8 *)text, (int)strlen(text));
++			XftColorFree(dpy, Scr->d_visual,
++			             DefaultColormap(dpy, Scr->screen), &col);
++		}
++		free(text);
++		if(d) {
++			XftDrawDestroy(d);
++		}
++	}
++	else {
++		XRectangle ink, logical;
++		int len = (int)strlen(tmp_win->name);
++
++		XSetForeground(dpy, Scr->NormalGC, md_pixel(fg));
++		XmbTextExtents(font->font_set, tmp_win->name, len, &ink, &logical);
++		while(len > 0 && logical.width > avail) {
++			len--;
++			XmbTextExtents(font->font_set, tmp_win->name, len, &ink, &logical);
++		}
++		XmbDrawString(dpy, tmp_win->title_w, font->font_set, Scr->NormalGC, x,
++		              (h - logical.height) / 2 - logical.y, tmp_win->name, len);
++	}
++}
++
++void
++ModernFocusChanged(TwmWindow *tmp_win, bool focus)
++{
++	(void)focus;
++	if(!md_usable() || !tmp_win || !tmp_win->title_w) {
++		return;
++	}
++	ModernPaintTitle(tmp_win);
++	/* AddWindow sets the focus look before the buttons exist. */
++	if(tmp_win->titlebuttons) {
++		PaintTitleButtons(tmp_win);
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* The resize border                                                        */
++/* ------------------------------------------------------------------------ */
++
++#define MD_GRIP          6    /* the band outside the frame, pixels */
++#define MD_GRIP_CORNER   16   /* along an edge from a corner: the corner */
++
++/* Borders in existence; the frame-call wrappers do nothing extra while it
++ * is 0, which it is whenever ModernTitles is off. */
++static int md_grips;
++
++/* Does the window get a border at all?  Not without a frame edge (docks,
++ * the desktop, NoBorder windows), and not for a window whose size is fixed
++ * -- there is nothing to resize. */
++static bool
++md_resizable(TwmWindow *t)
++{
++	const XSizeHints *h = &t->hints;
++
++	if((h->flags & PMinSize) && (h->flags & PMaxSize) &&
++	                h->min_width == h->max_width &&
++	                h->min_height == h->max_height) {
++		return false;
++	}
++	return true;
++}
++
++/* Show the border while the frame is shown, the window is not maximised
++ * (a maximised window fills the screen, it has no edges to drag) and its
++ * size is not fixed; bring it to the frame's geometry and, when the frame was
++ * restacked, put it back directly beneath the frame. */
++static void
++md_grip_sync(TwmWindow *t, bool restack)
++{
++	bool want;
++
++	int gx, gy;
++	unsigned int gw, gh;
++
++	if(t->modern_grip == None) {
++		return;
++	}
++	/* Only when it changed: this runs for every move step and every
++	 * restack, and a configure request is never free. */
++	gx = t->modern_fx - MD_GRIP;
++	gy = t->modern_fy - MD_GRIP;
++	gw = t->modern_fw + 2 * t->modern_fbw + 2 * MD_GRIP;
++	gh = t->modern_fh + 2 * t->modern_fbw + 2 * MD_GRIP;
++	if(gx != t->modern_gx || gy != t->modern_gy || gw != t->modern_gw ||
++	                gh != t->modern_gh) {
++		XMoveResizeWindow(dpy, t->modern_grip, gx, gy, gw, gh);
++		t->modern_gx = gx;
++		t->modern_gy = gy;
++		t->modern_gw = gw;
++		t->modern_gh = gh;
++	}
++	if(restack) {
++		XWindowChanges xwc;
++
++		xwc.sibling = t->frame;
++		xwc.stack_mode = Below;
++		XConfigureWindow(dpy, t->modern_grip, CWSibling | CWStackMode, &xwc);
++	}
++	want = t->modern_frame_mapped && t->zoomed == ZOOM_NONE &&
++	       md_resizable(t);
++	if(want && !t->modern_grip_mapped) {
++		if(!restack) {
++			XWindowChanges xwc;
++
++			xwc.sibling = t->frame;
++			xwc.stack_mode = Below;
++			XConfigureWindow(dpy, t->modern_grip, CWSibling | CWStackMode,
++			                 &xwc);
++		}
++		XMapWindow(dpy, t->modern_grip);
++		t->modern_grip_mapped = true;
++	}
++	else if(!want && t->modern_grip_mapped) {
++		XUnmapWindow(dpy, t->modern_grip);
++		t->modern_grip_mapped = false;
++	}
++}
++
++void
++ModernGripCreate(TwmWindow *tmp_win)
++{
++	XSetWindowAttributes attr;
++	XWindowAttributes wa;
++	Window root, parent, *kids = NULL;
++	unsigned int nkids;
++
++	if(!md_usable() || !tmp_win || tmp_win->frame == None ||
++	                tmp_win->frame_bw <= 0 || tmp_win->modern_grip != None) {
++		return;
++	}
++	/* ctwm's own windows (icon and workspace managers, the occupy
++	 * dialog) are not resized by hand. */
++	if(tmp_win->isiconmgr || tmp_win->iswspmgr || tmp_win->isoccupy) {
++		return;
++	}
++	/* Where the frame really is: the placement code may have moved it
++	 * since it was created. */
++	if(!XGetWindowAttributes(dpy, tmp_win->frame, &wa) ||
++	                !XQueryTree(dpy, tmp_win->frame, &root, &parent, &kids,
++	                            &nkids)) {
++		return;
++	}
++	if(kids) {
++		XFree(kids);
++	}
++	tmp_win->modern_grip_parent = parent;
++	tmp_win->modern_gx = wa.x - MD_GRIP;
++	tmp_win->modern_gy = wa.y - MD_GRIP;
++	tmp_win->modern_gw = (unsigned int)wa.width + 2 * (unsigned int)wa.border_width + 2 * MD_GRIP;
++	tmp_win->modern_gh = (unsigned int)wa.height + 2 * (unsigned int)wa.border_width + 2 * MD_GRIP;
++	tmp_win->modern_fx = wa.x;
++	tmp_win->modern_fy = wa.y;
++	tmp_win->modern_fw = (unsigned int)wa.width;
++	tmp_win->modern_fh = (unsigned int)wa.height;
++	tmp_win->modern_fbw = (unsigned int)wa.border_width;
++	tmp_win->modern_frame_mapped = (wa.map_state != IsUnmapped);
++	tmp_win->modern_grip_edges = -1;
++
++	/* Override-redirect: it is ctwm's own furniture, not a window for
++	 * anyone to manage or list. */
++	attr.override_redirect = True;
++	attr.event_mask = ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
++	attr.cursor = Scr->FrameCursor;
++	tmp_win->modern_grip = XCreateWindow(dpy, parent,
++	                                     wa.x - MD_GRIP, wa.y - MD_GRIP,
++	                                     (unsigned int)wa.width + 2 * (unsigned int)wa.border_width + 2 * MD_GRIP,
++	                                     (unsigned int)wa.height + 2 * (unsigned int)wa.border_width + 2 * MD_GRIP,
++	                                     0, 0, InputOnly, CopyFromParent,
++	                                     CWOverrideRedirect | CWEventMask | CWCursor,
++	                                     &attr);
++	if(tmp_win->modern_grip == None) {
++		return;
++	}
++	if(Scr->NameDecorations) {
++		XStoreName(dpy, tmp_win->modern_grip, "CTWM resize border");
++	}
++	XSaveContext(dpy, tmp_win->modern_grip, TwmContext, (XPointer) tmp_win);
++	XSaveContext(dpy, tmp_win->modern_grip, ScreenContext, (XPointer) Scr);
++	md_grips++;
++	md_grip_sync(tmp_win, true);
++}
++
++static void
++md_grip_destroy(TwmWindow *tmp_win)
++{
++	if(tmp_win->modern_grip == None) {
++		return;
++	}
++	XDeleteContext(dpy, tmp_win->modern_grip, TwmContext);
++	XDeleteContext(dpy, tmp_win->modern_grip, ScreenContext);
++	XDestroyWindow(dpy, tmp_win->modern_grip);
++	tmp_win->modern_grip = None;
++	tmp_win->modern_grip_mapped = false;
++	md_grips--;
++}
++
++/* The edges at (x, y), frame coordinates (the frame's outer top-left corner
++ * is 0,0, so the band around it is negative or beyond its size): the frame's
++ * own one-pixel edge counts, the band outside it, and near a corner the
++ * corner -- MD_GRIP_CORNER pixels along either edge, a target easier to hit
++ * than the corner pixel itself. */
++static int
++md_edges_at(TwmWindow *t, int x, int y)
++{
++	int w = (int)(t->modern_fw + 2 * t->modern_fbw);
++	int h = (int)(t->modern_fh + 2 * t->modern_fbw);
++	int bw = (int)t->modern_fbw;
++	int e = 0;
++
++	if(x < bw) {
++		e |= MODERN_EDGE_LEFT;
++	}
++	else if(x >= w - bw) {
++		e |= MODERN_EDGE_RIGHT;
++	}
++	if(y < bw) {
++		e |= MODERN_EDGE_TOP;
++	}
++	else if(y >= h - bw) {
++		e |= MODERN_EDGE_BOTTOM;
++	}
++	if(e & (MODERN_EDGE_TOP | MODERN_EDGE_BOTTOM)) {
++		if(x < MD_GRIP_CORNER) {
++			e |= MODERN_EDGE_LEFT;
++		}
++		else if(x >= w - MD_GRIP_CORNER) {
++			e |= MODERN_EDGE_RIGHT;
++		}
++	}
++	if(e & (MODERN_EDGE_LEFT | MODERN_EDGE_RIGHT)) {
++		if(y < MD_GRIP_CORNER) {
++			e |= MODERN_EDGE_TOP;
++		}
++		else if(y >= h - MD_GRIP_CORNER) {
++			e |= MODERN_EDGE_BOTTOM;
++		}
++	}
++	return e;
++}
++
++Cursor
++ModernEdgeCursor(int edges)
++{
++	switch(edges) {
++		case MODERN_EDGE_TOP | MODERN_EDGE_LEFT:
++			return TopLeftCursor;
++		case MODERN_EDGE_TOP | MODERN_EDGE_RIGHT:
++			return TopRightCursor;
++		case MODERN_EDGE_BOTTOM | MODERN_EDGE_LEFT:
++			return BottomLeftCursor;
++		case MODERN_EDGE_BOTTOM | MODERN_EDGE_RIGHT:
++			return BottomRightCursor;
++		case MODERN_EDGE_TOP:
++			return TopCursor;
++		case MODERN_EDGE_BOTTOM:
++			return BottomCursor;
++		case MODERN_EDGE_LEFT:
++			return LeftCursor;
++		case MODERN_EDGE_RIGHT:
++			return RightCursor;
++		default:
++			return Scr->FrameCursor;
++	}
++}
++
++void
++ModernGripMotion(TwmWindow *tmp_win, int x, int y)
++{
++	int e;
++
++	if(!tmp_win || tmp_win->modern_grip == None) {
++		return;
++	}
++	e = md_edges_at(tmp_win, x - MD_GRIP, y - MD_GRIP);
++	if(e != tmp_win->modern_grip_edges) {
++		XDefineCursor(dpy, tmp_win->modern_grip, ModernEdgeCursor(e));
++		tmp_win->modern_grip_edges = e;
++	}
++}
++
++int
++ModernResizeEdges(TwmWindow *tmp_win, XEvent *evp, int fx, int fy, int fw,
++                  int fh)
++{
++	int bw;
++
++	if(!md_usable() || !tmp_win || evp->type != ButtonPress) {
++		return 0;
++	}
++	if(evp->xbutton.window != tmp_win->frame &&
++	                (tmp_win->modern_grip == None ||
++	                 evp->xbutton.window != tmp_win->modern_grip)) {
++		return 0;
++	}
++	/* fx..fh are the inner geometry; the edges are measured from the
++	 * outer corner, where the frame's border begins. */
++	bw = tmp_win->frame_bw;
++	(void)fw;
++	(void)fh;
++	return md_edges_at(tmp_win, evp->xbutton.x_root - (fx - bw),
++	                   evp->xbutton.y_root - (fy - bw));
++}
++
++/* ---- The frame-call wrappers (see ctwm.h) -------------------------------- */
++
++/*
++ * Before the frame itself is restacked, its border goes to the bottom of the
++ * stack, out of everything's way; md_grip_sync() puts it back under the frame
++ * afterwards.
++ *
++ * Without this the restack passes through a state where the border is ABOVE
++ * its own frame: ctwm raises a window by placing it directly above the next
++ * frame down ("Above sibling"), which lands it underneath its border still
++ * sitting there.  For the moment between that request and the border's own
++ * restack the pointer is over the border, not the application -- and the
++ * application is told it left its window and came back.  ctwm raises on every
++ * click, the wheel included, and GDK takes each such re-entry as a new
++ * scrolling gesture and drops the scroll position it measures smooth scrolling
++ * from: the wheel did nothing in most GTK programs.
++ */
++static void
++md_grip_out_of_the_way(Display *d, TwmWindow *t)
++{
++	if(t->modern_grip_mapped) {
++		XLowerWindow(d, t->modern_grip);
++	}
++}
++
++/* The window `w' is a frame that has a border: its TwmWindow, else NULL. */
++static TwmWindow *
++md_frame_owner(Display *d, Window w)
++{
++	TwmWindow *t;
++
++	if(md_grips == 0 ||
++	                XFindContext(d, w, TwmContext, (XPointer *)&t) != XCSUCCESS) {
++		return NULL;
++	}
++	return (t && t->frame == w && t->modern_grip != None) ? t : NULL;
++}
++
++int
++ctwm_XMapWindow(Display *d, Window w)
++{
++	int r = XMapWindow(d, w);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_frame_mapped = true;
++		md_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XMapRaised(Display *d, Window w)
++{
++	int r = XMapRaised(d, w);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_frame_mapped = true;
++		md_grip_sync(t, true);
++	}
++	return r;
++}
++
++int
++ctwm_XUnmapWindow(Display *d, Window w)
++{
++	int r = XUnmapWindow(d, w);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_frame_mapped = false;
++		md_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XMoveWindow(Display *d, Window w, int x, int y)
++{
++	int r = XMoveWindow(d, w, x, y);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_fx = x;
++		t->modern_fy = y;
++		md_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XResizeWindow(Display *d, Window w, unsigned int width,
++                   unsigned int height)
++{
++	int r = XResizeWindow(d, w, width, height);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_fw = width;
++		t->modern_fh = height;
++		md_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XMoveResizeWindow(Display *d, Window w, int x, int y,
++                       unsigned int width, unsigned int height)
++{
++	int r = XMoveResizeWindow(d, w, x, y, width, height);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_fx = x;
++		t->modern_fy = y;
++		t->modern_fw = width;
++		t->modern_fh = height;
++		md_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XConfigureWindow(Display *d, Window w, unsigned int mask,
++                      XWindowChanges *xwc)
++{
++	TwmWindow *t = md_frame_owner(d, w);
++	int r;
++
++	if(t && (mask & CWStackMode)) {
++		md_grip_out_of_the_way(d, t);
++	}
++	r = XConfigureWindow(d, w, mask, xwc);
++
++	if(t) {
++		if(mask & CWX) {
++			t->modern_fx = xwc->x;
++		}
++		if(mask & CWY) {
++			t->modern_fy = xwc->y;
++		}
++		if(mask & CWWidth) {
++			t->modern_fw = (unsigned int)xwc->width;
++		}
++		if(mask & CWHeight) {
++			t->modern_fh = (unsigned int)xwc->height;
++		}
++		if(mask & CWBorderWidth) {
++			t->modern_fbw = (unsigned int)xwc->border_width;
++		}
++		md_grip_sync(t, (mask & CWStackMode) != 0);
++	}
++	return r;
++}
++
++int
++ctwm_XSetWindowBorderWidth(Display *d, Window w, unsigned int width)
++{
++	int r = XSetWindowBorderWidth(d, w, width);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		t->modern_fbw = width;
++		md_grip_sync(t, false);
++	}
++	return r;
++}
++
++int
++ctwm_XRaiseWindow(Display *d, Window w)
++{
++	int r = XRaiseWindow(d, w);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		md_grip_sync(t, true);
++	}
++	return r;
++}
++
++int
++ctwm_XLowerWindow(Display *d, Window w)
++{
++	TwmWindow *t = md_frame_owner(d, w);
++	int r;
++
++	if(t) {
++		md_grip_out_of_the_way(d, t);
++	}
++	r = XLowerWindow(d, w);
++
++	if(t) {
++		md_grip_sync(t, true);
++	}
++	return r;
++}
++
++int
++ctwm_XRestackWindows(Display *d, Window *ws, int n)
++{
++	int r;
++
++	for(int i = 0; i < n; i++) {
++		TwmWindow *t = md_frame_owner(d, ws[i]);
++
++		if(t) {
++			md_grip_out_of_the_way(d, t);
++		}
++	}
++	r = XRestackWindows(d, ws, n);
++
++	for(int i = 0; i < n; i++) {
++		TwmWindow *t = md_frame_owner(d, ws[i]);
++
++		if(t) {
++			md_grip_sync(t, true);
++		}
++	}
++	return r;
++}
++
++int
++ctwm_XReparentWindow(Display *d, Window w, Window parent, int x, int y)
++{
++	int r = XReparentWindow(d, w, parent, x, y);
++	TwmWindow *t = md_frame_owner(d, w);
++
++	if(t) {
++		/* Reparenting unmaps and remaps a mapped window; the border
++		 * goes along the same way, into the same parent. */
++		XReparentWindow(d, t->modern_grip, parent, x - MD_GRIP, y - MD_GRIP);
++		t->modern_grip_parent = parent;
++		t->modern_fx = x;
++		t->modern_fy = y;
++		t->modern_gx = x - MD_GRIP;
++		t->modern_gy = y - MD_GRIP;
++		md_grip_sync(t, true);
++	}
++	return r;
++}
+diff -Nur a/win_modern.h b/win_modern.h
+--- a/win_modern.h
++++ b/win_modern.h
+@@ -0,0 +1,102 @@
++/*
++ * LikeOS -- the LikeOS window frame for ctwm ("ModernTitles").
++ *
++ * With the ModernTitles keyword set, ctwm draws its title bars as one flat
++ * band whose colour says whether the window has the focus: the application's
++ * icon and its title on the left in an anti-aliased font, and on the right
++ * the caption buttons -- rounded rectangles inset in the band, each with a
++ * small anti-aliased line glyph, that light up under the pointer, the close
++ * button in red.
++ *
++ * The glyph a button gets follows from the function bound to it: f.iconify
++ * draws the minimise line, the zoom functions the maximise square (or the
++ * restore glyph while the window is zoomed), f.delete and f.destroy the cross.
++ * A button bound to anything else keeps its configured image.
++ *
++ * Copyright (C) 2026 The LikeOS Project
++ */
++
++#ifndef _CTWM_WIN_MODERN_H
++#define _CTWM_WIN_MODERN_H
++
++/* Draw the whole title bar band: background, icon and name. */
++void ModernPaintTitle(TwmWindow *tmp_win);
++
++/* Draw one caption button in its current state.  Returns false for a button
++ * whose function has no glyph of its own, which the caller then draws the
++ * classic way. */
++bool ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw);
++
++/* The window gained or lost the focus: redraw the title and its buttons in
++ * the colours for the new state. */
++void ModernFocusChanged(TwmWindow *tmp_win, bool focus);
++
++/* An EnterNotify or LeaveNotify on window `w'.  Returns true when `w' is one
++ * of tmp_win's caption buttons, which have then been redrawn hovered or not;
++ * false means the event is for somebody else. */
++bool ModernButtonCrossing(TwmWindow *tmp_win, Window w, bool entered);
++
++/*
++ * Menus (menus.c).  Rows are MODERN_MENU_ROW pixels tall; the entry under the
++ * pointer is a rounded rectangle in its highlight colour, inset in the row --
++ * ModernMenuHighlight() draws it over the row's background `bg' and returns
++ * true, or returns false when the mode is off and the caller fills the row
++ * the classic way.  Separators are MODERN_MENU_SEPARATOR_INSET pixels short
++ * of either edge, in ModernMenuSeparator(): MenuShadowColor, the menu's
++ * border, lightened towards the menu background.
++ */
++#define MODERN_MENU_ROW              30
++#define MODERN_MENU_SEPARATOR_INSET  10
++bool ModernMenuHighlight(Window w, int x, int y, int width, int height,
++                         Pixel bg, Pixel fill);
++Pixel ModernMenuSeparator(void);
++
++/* The window's _NET_WM_ICON changed: forget the cached title icon. */
++void ModernIconChanged(TwmWindow *tmp_win);
++
++/* The window is going away: free what ModernPaintTitle cached for it, and
++ * its resize border. */
++void ModernForgetWindow(TwmWindow *tmp_win);
++
++/*
++ * The resize border.
++ *
++ * A window shows a one-pixel edge, and the band that resizes it lies OUTSIDE
++ * that edge, where nothing is drawn: the pointer turns into a double arrow a
++ * few pixels short of the window, and a drag there resizes it.
++ * Without a compositor nothing can be drawn transparently, so the band is an
++ * InputOnly window -- invisible by definition -- a few pixels larger than the
++ * frame on every side and stacked directly beneath it.  The frame covers its
++ * middle; the ring around the frame is the band.  Being directly beneath its
++ * own frame, it is covered by every window above that frame, exactly as the
++ * window itself is.
++ *
++ * It has to follow the frame through every move, resize, restack, map, unmap
++ * and reparent.  ctwm does those in some thirty places, so rather than hook
++ * each one, ctwm.h routes the Xlib calls that do them through the wrappers
++ * below, which make the call and then bring the border along when the window
++ * is a frame that has one.
++ */
++
++/* Create the border for a newly managed window (frame already created). */
++void ModernGripCreate(TwmWindow *tmp_win);
++
++/* Pointer motion over the border, in its coordinates: set the cursor for the
++ * edge or corner the pointer is on. */
++void ModernGripMotion(TwmWindow *tmp_win, int x, int y);
++
++/* Edges a resize started by `evp' moves, as MODERN_EDGE_* bits: the edges
++ * nearest the pointer when the press was on the border (or on the frame's
++ * own one-pixel edge), 0 otherwise.  fx..fh are the frame's inner geometry,
++ * as StartResize() has it. */
++#define MODERN_EDGE_TOP    1
++#define MODERN_EDGE_BOTTOM 2
++#define MODERN_EDGE_LEFT   4
++#define MODERN_EDGE_RIGHT  8
++int ModernResizeEdges(TwmWindow *tmp_win, XEvent *evp, int fx, int fy,
++                      int fw, int fh);
++
++/* The cursor for a set of MODERN_EDGE_* bits. */
++Cursor ModernEdgeCursor(int edges);
++
++#endif /* _CTWM_WIN_MODERN_H */
+diff -Nur a/win_ops.c b/win_ops.c
+--- a/win_ops.c
++++ b/win_ops.c
+@@ -15,6 +15,7 @@
+ #include "otp.h"
+ #include "screen.h"
+ #include "win_decorations.h"
++#include "win_modern.h"
+ #include "win_iconify.h"
+ #include "win_ops.h"
+ #include "win_utils.h"
+@@ -115,6 +116,11 @@ SetFocusVisualAttributes(TwmWindow *tmp_win, bool focus)
+ 		             tmp_win->title, bs, false, false);
+ 	}
+ 	tmp_win->hasfocusvisible = focus;
++
++	/* ModernTitles: the title bar's colours follow the focus. */
++	if(Scr->ModernTitles && tmp_win->title_height) {
++		ModernFocusChanged(tmp_win, focus);
++	}
+ }
+ 
+ 
+diff -Nur a/win_resize.c b/win_resize.c
+--- a/win_resize.c
++++ b/win_resize.c
+@@ -40,6 +40,7 @@
+ #include "r_area_list.h"
+ #include "r_layout.h"
+ #include "win_decorations.h"
++#include "win_modern.h"
+ #include "win_ops.h"
+ #include "win_resize.h"
+ #include "win_utils.h"
+@@ -216,7 +217,35 @@ void StartResize(XEvent *evp, TwmWindow *tmp_win,
+ 	origHeight = dragHeight;
+ 	clampTop = clampBottom = clampLeft = clampRight = clampDX = clampDY = 0;
+ 
+-	if(Scr->AutoRelativeResize && (from3dborder || !fromtitlebar)) {
++	/* Started on the window's edge (ModernTitles' resize border): the edges
++	 * under the pointer move, and only those, keeping their distance from
++	 * the pointer -- so the window does not jump to it -- and the pointer
++	 * keeps the edge's double arrow for the whole drag. */
++	int edges = ModernResizeEdges(tmp_win, evp, dragx, dragy, (int)dragWidth,
++	                              (int)dragHeight);
++	if(edges) {
++		int x = evp->xbutton.x_root, y = evp->xbutton.y_root;
++
++		if(edges & MODERN_EDGE_LEFT) {
++			clampLeft = 1;
++			clampDX = x - dragx;
++		}
++		else if(edges & MODERN_EDGE_RIGHT) {
++			clampRight = 1;
++			clampDX = x - dragx - (int)dragWidth;
++		}
++		if(edges & MODERN_EDGE_TOP) {
++			clampTop = 1;
++			clampDY = y - dragy;
++		}
++		else if(edges & MODERN_EDGE_BOTTOM) {
++			clampBottom = 1;
++			clampDY = y - dragy - (int)dragHeight;
++		}
++		XChangeActivePointerGrab(dpy, resizeGrabMask, ModernEdgeCursor(edges),
++		                         CurrentTime);
++	}
++	else if(Scr->AutoRelativeResize && (from3dborder || !fromtitlebar)) {
+ 		do_auto_clamp(tmp_win, evp);
+ 	}
+ 
+@@ -1108,15 +1137,22 @@ void fullzoom(TwmWindow *tmp_win, int func)
+ 	*/
+ 	XUngrabServer(dpy);
+ 
+-	XQueryPointer(dpy,
+-	              tmp_win->w,
+-	              &junkRoot, &junkRoot,
+-	              &tmpX, &tmpY, &tmpW, &tmpH, &junkDepth);
+-	if(tmp_win->frame_x > tmpX ||
+-	                tmp_win->frame_x + tmp_win->frame_width < tmpX ||
+-	                tmp_win->frame_y > tmpY ||
+-	                tmp_win->frame_y + tmp_win->frame_height < tmpY) {
+-		XWarpPointer(dpy, Scr->Root, tmp_win->w, 0, 0, 0, 0, 0, 0);
++	/* Classic ctwm moves the pointer into the window when the window no
++	 * longer contains it -- to its top-left corner.  With ModernTitles the
++	 * pointer stays where the user put it: restoring a maximised
++	 * window from its caption button shrinks the window away from the
++	 * button, and the pointer jumped to the window's left edge. */
++	if(!Scr->ModernTitles) {
++		XQueryPointer(dpy,
++		              tmp_win->w,
++		              &junkRoot, &junkRoot,
++		              &tmpX, &tmpY, &tmpW, &tmpH, &junkDepth);
++		if(tmp_win->frame_x > tmpX ||
++		                tmp_win->frame_x + tmp_win->frame_width < tmpX ||
++		                tmp_win->frame_y > tmpY ||
++		                tmp_win->frame_y + tmp_win->frame_height < tmpY) {
++			XWarpPointer(dpy, Scr->Root, tmp_win->w, 0, 0, 0, 0, 0, 0);
++		}
+ 	}
+ 
+ #ifdef EWMH

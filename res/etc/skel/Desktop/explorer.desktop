@@ -11,8 +11,10 @@
 # URL is a plain absolute path rather than a file:// URI on purpose: libfm
 # resolves it with g_file_new_for_path(), which would take a URI as a relative
 # filename and never match the /usr/share/ prefix.
+#
+# Copyright (C) 2026 The LikeOS Project
 [Desktop Entry]
 Type=Link
-Name=File Explorer
+Name=LikeOS Explorer
 Icon=system-file-manager
 URL=/usr/share/applications/likeos-explorer.desktop

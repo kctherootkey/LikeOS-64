@@ -71,23 +71,46 @@ static void toggled(GtkToggleButton *t, LxSegmented *s)
 	g_signal_emit(s, sigs[SIG_CHANGED], 0, idx);
 }
 
-int lx_segmented_append(LxSegmented *s, const char *icon_name,
-			const char *tooltip)
+static int append(LxSegmented *s, GtkWidget *image, const char *tooltip)
 {
 	GtkWidget *b = gtk_toggle_button_new();
 	int idx = (int)s->buttons->len;
 
-	gtk_button_set_image(GTK_BUTTON(b), gtk_image_new_from_icon_name(
-						    icon_name, GTK_ICON_SIZE_MENU));
-	gtk_widget_set_tooltip_text(b, tooltip);
+	if (image)
+		gtk_button_set_image(GTK_BUTTON(b), image);
+	else
+		gtk_button_set_label(GTK_BUTTON(b), tooltip);
+	gtk_widget_set_tooltip_text(b, image ? tooltip : NULL);
 	atk_object_set_name(gtk_widget_get_accessible(b), tooltip);
 	gtk_button_set_relief(GTK_BUTTON(b), GTK_RELIEF_NONE);
+	gtk_widget_set_focus_on_click(b, FALSE);
 	g_object_set_data(G_OBJECT(b), "lx-index", GINT_TO_POINTER(idx));
 	g_signal_connect(b, "toggled", G_CALLBACK(toggled), s);
 	g_ptr_array_add(s->buttons, b);
 	gtk_box_pack_start(GTK_BOX(s), b, FALSE, FALSE, 0);
 	gtk_widget_show(b);
 	return idx;
+}
+
+int lx_segmented_append(LxSegmented *s, const char *icon_name,
+			const char *tooltip)
+{
+	return append(s, gtk_image_new_from_icon_name(icon_name,
+						      GTK_ICON_SIZE_MENU),
+		      tooltip);
+}
+
+int lx_segmented_append_gicon(LxSegmented *s, GIcon *icon, const char *tooltip)
+{
+	GtkWidget *img = gtk_image_new_from_gicon(icon, GTK_ICON_SIZE_MENU);
+
+	gtk_image_set_pixel_size(GTK_IMAGE(img), 16);
+	return append(s, img, tooltip);
+}
+
+int lx_segmented_append_label(LxSegmented *s, const char *label)
+{
+	return append(s, NULL, label);
 }
 
 void lx_segmented_set_active(LxSegmented *s, int index)

@@ -1,4 +1,8 @@
-// LikeOS GTK 3 theme: Windows 11, built on Adwaita's widget structure.
+// The LikeOS GTK 3 theme: a light, cool-toned look for programs -- white
+// content on a soft blue-grey window colour, the LikeOS blue as the accent,
+// 6-pixel rounded controls and flat hairline drawing -- with the dark shell
+// palette alongside for the panel's GTK surfaces.  Built on Adwaita's widget
+// structure.
 //
 // Compiled to ../gtk-3.0/gtk.css by build.py (any Sass compiler will do:
 // `sassc -t expanded gtk-contained.scss ../gtk-3.0/gtk.css').  Only the light
@@ -16,4 +20,8 @@ $variant: 'light';
 @import 'likeos';
 @import 'likeos-widgets';
 @import 'explorer';
+@import 'explorer-views';
+@import 'explorer-ops';
+@import 'mediaplayer';
+@import 'shell';
 @import 'colors-public';

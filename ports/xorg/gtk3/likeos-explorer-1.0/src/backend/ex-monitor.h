@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: watching a folder for changes made elsewhere.
+// LikeOS Explorer: watching a folder for changes made elsewhere.
 //
 // GFileMonitor where the location supports one -- on LikeOS's own disks the
 // kernel's inotify -- and, where it does not, a slow poll of the folder's

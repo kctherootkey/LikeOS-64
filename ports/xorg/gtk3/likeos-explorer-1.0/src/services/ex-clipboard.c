@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: cut, copy and paste of files.
+// LikeOS Explorer: cut, copy and paste of files.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -182,7 +182,7 @@ void ex_clipboard_copy_paths(ExClipboard *c, GPtrArray *files)
 			continue;
 		if (s->len)
 			g_string_append_c(s, '\n');
-		/* Quoted when it has a space, as Windows' "Copy as path". */
+		/* Quoted when it has a space, so it pastes as one word. */
 		if (strchr(p, ' '))
 			g_string_append_printf(s, "\"%s\"", p);
 		else

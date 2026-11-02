@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: drive-optical, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="28"><stop offset="0" stop-color="#f3f5f9"/><stop offset="1" stop-color="#c9d0dc"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="28" x2="0" y2="48"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M8 16H56A4 4 0 0 1 60 20V44A4 4 0 0 1 56 48H8A4 4 0 0 1 4 44V20A4 4 0 0 1 8 16Z" fill="url(#g1)"/>
+<path d="M4 28H60V44A4 4 0 0 1 56 48H8A4 4 0 0 1 4 44Z" fill="url(#g2)"/>
+<path d="M4 29H60" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="butt" stroke-linejoin="round" opacity="0.2"/>
+<path d="M8 35H56" fill="none" stroke="#11151e" stroke-width="2" stroke-linecap="butt" stroke-linejoin="round"/>
+<path d="M45.04 41.8L57.04 41.8L51.04 35.2Z" fill="#c9d0dc"/>
+<path d="M45.04 43.9H57.04V46.3H45.04Z" fill="#c9d0dc"/>
+<path d="M8.6 41.2A6.6 6.6 0 1 0 21.8 41.2A6.6 6.6 0 1 0 8.6 41.2Z" fill="none" stroke="#8d97a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M13.4 41.2A1.8 1.8 0 1 0 17 41.2A1.8 1.8 0 1 0 13.4 41.2Z" fill="#8d97a8"/>
+</g>
+</svg>

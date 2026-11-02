@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: media-optical, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="60" y2="60"><stop offset="0" stop-color="#e9eef6"/><stop offset="0.3" stop-color="#dbe6fb"/><stop offset="0.45" stop-color="#f6ecf7"/><stop offset="0.6" stop-color="#e2f5ee"/><stop offset="0.78" stop-color="#eef1f6"/><stop offset="1" stop-color="#c7cfdc"/></linearGradient></defs>
+<g transform="scale(0.25)">
+<path d="M4 32A28 28 0 1 0 60 32A28 28 0 1 0 4 32ZM27.52 32A4.48 4.48 0 1 0 36.48 32A4.48 4.48 0 1 0 27.52 32Z" fill="url(#g1)" fill-rule="evenodd"/>
+<path d="M6 32A26 26 0 1 0 58 32A26 26 0 1 0 6 32Z" fill="none" stroke="#9aa4b5" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M21.36 32A10.64 10.64 0 1 0 42.64 32A10.64 10.64 0 1 0 21.36 32ZM27.52 32A4.48 4.48 0 1 0 36.48 32A4.48 4.48 0 1 0 27.52 32Z" fill="#ffffff" opacity="0.7" fill-rule="evenodd"/>
+<path d="M21.36 32A10.64 10.64 0 1 0 42.64 32A10.64 10.64 0 1 0 21.36 32Z" fill="none" stroke="#aab3c2" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M25.52 32A6.48 6.48 0 1 0 38.48 32A6.48 6.48 0 1 0 25.52 32Z" fill="none" stroke="#8d97a8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

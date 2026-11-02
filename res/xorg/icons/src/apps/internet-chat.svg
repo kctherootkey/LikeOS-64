@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: internet-chat, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.3"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#f06aa8"/><stop offset="1" stop-color="#b0306e"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff" stop-opacity="0.45"/><stop offset="0.5" stop-color="#ffffff" stop-opacity="0.08"/><stop offset="1" stop-color="#000000" stop-opacity="0.12"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M17 4H47A13 13 0 0 1 60 17V47A13 13 0 0 1 47 60H17A13 13 0 0 1 4 47V17A13 13 0 0 1 17 4Z" fill="#0b1730" opacity="0.28" transform="translate(0 1.4)" filter="url(#f1)"/>
+<path d="M17 4H47A13 13 0 0 1 60 17V47A13 13 0 0 1 47 60H17A13 13 0 0 1 4 47V17A13 13 0 0 1 17 4Z" fill="url(#g2)"/>
+<path d="M17 4.5H47A12.5 12.5 0 0 1 59.5 17V47A12.5 12.5 0 0 1 47 59.5H17A12.5 12.5 0 0 1 4.5 47V17A12.5 12.5 0 0 1 17 4.5Z" fill="none" stroke="url(#g3)" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M17 4H47A13 13 0 0 1 60 17V26C44 22 20 32 4 30V17A13 13 0 0 1 17 4Z" fill="#ffffff" opacity="0.08"/>
+<path d="M33 26H45A7 7 0 0 1 52 33V39A7 7 0 0 1 45 46H33A7 7 0 0 1 26 39V33A7 7 0 0 1 33 26ZM44 44L48 52L36 45Z" fill="#ffffff" opacity="0.6"/>
+<path d="M19 14H35A7 7 0 0 1 42 21V29A7 7 0 0 1 35 36H19A7 7 0 0 1 12 29V21A7 7 0 0 1 19 14ZM18 34L16 44L26 35Z" fill="#ffffff"/>
+<path d="M18 25A2 2 0 1 0 22 25A2 2 0 1 0 18 25Z" fill="#b0306e"/>
+<path d="M25 25A2 2 0 1 0 29 25A2 2 0 1 0 25 25Z" fill="#b0306e"/>
+<path d="M32 25A2 2 0 1 0 36 25A2 2 0 1 0 32 25Z" fill="#b0306e"/>
+</g>
+</svg>

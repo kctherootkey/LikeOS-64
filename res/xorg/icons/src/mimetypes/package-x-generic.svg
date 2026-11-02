@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: package-x-generic, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><filter id="f3" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="0.8"/></filter><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="38" y1="18" x2="46.4" y2="9.6"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="40" x2="0" y2="53"><stop offset="0" stop-color="#de981f"/><stop offset="1" stop-color="#c87f00"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M15 4H38L52 18V57A3 3 0 0 1 49 60H15A3 3 0 0 1 12 57V7A3 3 0 0 1 15 4Z" fill="#0b1730" opacity="0.18" transform="translate(0 1)" filter="url(#f1)"/>
+<path d="M15 4H38L52 18V57A3 3 0 0 1 49 60H15A3 3 0 0 1 12 57V7A3 3 0 0 1 15 4Z" fill="#b9c1ce"/>
+<path d="M15 5H37.6L51 18.4V57A2 2 0 0 1 49 59H15A2 2 0 0 1 13 57V7A2 2 0 0 1 15 5Z" fill="url(#g2)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#0b1730" opacity="0.12" transform="translate(-0.6 0.9)" filter="url(#f3)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#b9c1ce"/>
+<path d="M39 6.4V15Q39 17 41 17H49.6Z" fill="url(#g4)"/>
+<path d="M17.5 40H46.5A2.5 2.5 0 0 1 49 42.5V50.5A2.5 2.5 0 0 1 46.5 53H17.5A2.5 2.5 0 0 1 15 50.5V42.5A2.5 2.5 0 0 1 17.5 40Z" fill="url(#g5)"/>
+<path d="M17.5 40.5H46.5" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.3"/>
+<path d="M0 0h3.8L0 6h3.8" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" transform="translate(25.5 43.5) scale(1)"/>
+<path d="M1.2 0v6M0 0h2.4M0 6h2.4" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" transform="translate(30.8 43.5) scale(1)"/>
+<path d="M0 6V0h2.2a1.6 1.6 0 0 1 0 3.2H0" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" transform="translate(34.7 43.5) scale(1)"/>
+<path d="M28 15H32V17.01H28Z" fill="#d98a00"/>
+<path d="M32 17H36V19.01H32Z" fill="#d98a00"/>
+<path d="M28 19H32V21.01H28Z" fill="#d98a00"/>
+<path d="M32 21H36V23.01H32Z" fill="#d98a00"/>
+<path d="M28 23H32V25.01H28Z" fill="#d98a00"/>
+<path d="M32 25H36V27.01H32Z" fill="#d98a00"/>
+<path d="M30.1 27H33.9A1.6 1.6 0 0 1 35.5 28.6V33.8A1.6 1.6 0 0 1 33.9 35.4H30.1A1.6 1.6 0 0 1 28.5 33.8V28.6A1.6 1.6 0 0 1 30.1 27Z" fill="#b87500"/>
+</g>
+</svg>

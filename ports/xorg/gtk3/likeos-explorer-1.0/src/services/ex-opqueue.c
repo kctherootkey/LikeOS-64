@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the operation queue.
+// LikeOS Explorer: the operation queue.
 //
 // Copyright (C) 2026 The LikeOS Project
 

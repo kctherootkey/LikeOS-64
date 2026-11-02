@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: camera-photo, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="54"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="22.32" x2="0" y2="49.68"><stop offset="0" stop-color="#e3e8ef"/><stop offset="1" stop-color="#8d97a8"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="18.32" y1="49.68" x2="45.68" y2="22.32"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M17 9H27A3 3 0 0 1 30 12V15A3 3 0 0 1 27 18H17A3 3 0 0 1 14 15V12A3 3 0 0 1 17 9Z" fill="#3a4357"/>
+<path d="M11 16H53A7 7 0 0 1 60 23V47A7 7 0 0 1 53 54H11A7 7 0 0 1 4 47V23A7 7 0 0 1 11 16Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M11 16H53A7 7 0 0 1 60 23V47A7 7 0 0 1 53 54H11A7 7 0 0 1 4 47V23A7 7 0 0 1 11 16Z" fill="url(#g2)"/>
+<path d="M11 16H53A7 7 0 0 1 60 23V47A7 7 0 0 1 53 54H11A7 7 0 0 1 4 47V23A7 7 0 0 1 11 16Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M18.32 36A13.68 13.68 0 1 0 45.68 36A13.68 13.68 0 1 0 18.32 36Z" fill="url(#g3)"/>
+<path d="M21.33 36A10.67 10.67 0 1 0 42.67 36A10.67 10.67 0 1 0 21.33 36Z" fill="#161c2a"/>
+<path d="M24.066 36A7.934 7.934 0 1 0 39.934 36A7.934 7.934 0 1 0 24.066 36Z" fill="url(#g4)"/>
+<path d="M26.802 32.99A2.189 2.189 0 1 0 31.179 32.99A2.189 2.189 0 1 0 26.802 32.99Z" fill="#ffffff" opacity="0.85"/>
+<path d="M49.16 22.84H51.16A1 1 0 0 1 52.16 23.84V24.84A1 1 0 0 1 51.16 25.84H49.16A1 1 0 0 1 48.16 24.84V23.84A1 1 0 0 1 49.16 22.84Z" fill="#ffd166"/>
+</g>
+</svg>

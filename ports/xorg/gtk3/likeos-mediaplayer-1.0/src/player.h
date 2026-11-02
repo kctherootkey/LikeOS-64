@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: the GStreamer engine.
+// LikeOS -- LikeOS Media Player: the GStreamer engine.
 //
 // One playbin for the life of the program, reused for every entry.  The
 // interface below hides GStreamer's asynchronous state machine behind a

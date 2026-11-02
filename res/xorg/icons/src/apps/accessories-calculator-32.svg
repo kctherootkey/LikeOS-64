@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: accessories-calculator, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#ff9a57"/><stop offset="1" stop-color="#d9532a"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H48A12 12 0 0 1 60 16V48A12 12 0 0 1 48 60H16A12 12 0 0 1 4 48V16A12 12 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M18 14H46A2 2 0 0 1 48 16V22A2 2 0 0 1 46 24H18A2 2 0 0 1 16 22V16A2 2 0 0 1 18 14Z" fill="#ffffff" opacity="0.95"/>
+<path d="M18 30H22A2 2 0 0 1 24 32V36A2 2 0 0 1 22 38H18A2 2 0 0 1 16 36V32A2 2 0 0 1 18 30Z" fill="#ffffff" opacity="0.75"/>
+<path d="M30 30H34A2 2 0 0 1 36 32V36A2 2 0 0 1 34 38H30A2 2 0 0 1 28 36V32A2 2 0 0 1 30 30Z" fill="#ffffff" opacity="0.75"/>
+<path d="M42 30H46A2 2 0 0 1 48 32V48A2 2 0 0 1 46 50H42A2 2 0 0 1 40 48V32A2 2 0 0 1 42 30Z" fill="#ffffff"/>
+<path d="M18 42H22A2 2 0 0 1 24 44V48A2 2 0 0 1 22 50H18A2 2 0 0 1 16 48V44A2 2 0 0 1 18 42Z" fill="#ffffff" opacity="0.75"/>
+<path d="M30 42H34A2 2 0 0 1 36 44V48A2 2 0 0 1 34 50H30A2 2 0 0 1 28 48V44A2 2 0 0 1 30 42Z" fill="#ffffff" opacity="0.75"/>
+</g>
+</svg>

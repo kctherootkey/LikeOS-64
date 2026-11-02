@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: one tab.
+// LikeOS Explorer: one tab.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -7,7 +7,9 @@
 #include "ui/ex-context-menu.h"
 #include "ui/ex-file-view.h"
 #include "ui/ex-folder-model.h"
+#include "ui/ex-gallery-page.h"
 #include "ui/ex-home-page.h"
+#include "ui/ex-computer-page.h"
 #include "ui/ex-preview-pane.h"
 #include "ui/ex-sidebar.h"
 #include "ui/ex-style.h"
@@ -15,7 +17,6 @@
 #include "ui/widgets/lx-segmented.h"
 #include "backend/ex-dir-loader.h"
 #include "backend/ex-monitor.h"
-#include "backend/ex-recent.h"
 #include "backend/ex-search.h"
 #include "backend/ex-thumbs.h"
 #include "backend/ex-trash.h"
@@ -43,11 +44,11 @@ struct _ExTab {
 	ExLocation *shown; /* the place last loaded */
 
 	GtkWidget *back, *fwd, *up, *crumb, *search_entry;
-	GtkWidget *cmdbar, *outer, *sidebar, *inner, *stack;
-	GtkWidget *home, *thispc, *view, *view_overlay, *empty_label;
+	GtkWidget *cmdbar, *outer, *sidebar, *column, *inner, *stack;
+	GtkWidget *home, *computer, *gallery, *view, *view_overlay, *empty_label;
 	GtkWidget *msg_box, *msg_label;
 	GtkWidget *right;
-	GtkWidget *st_count, *st_sel, *spinner, *seg;
+	GtkWidget *st_count, *st_sep1, *st_sel, *st_sep2, *spinner, *seg;
 
 	char *mode;
 	gboolean searching_replaces; /* the search entry edits the search */
@@ -121,11 +122,16 @@ static void actions_changed(ExTab *t)
 static void update_status(ExTab *t)
 {
 	ExLocationKind k = ex_location_kind(ex_tab_location(t));
-	guint n = t->model ? ex_folder_model_count(t->model) : 0;
+	guint n = k == EX_LOC_GALLERY ?
+			  ex_gallery_page_count(EX_GALLERY_PAGE(t->gallery)) :
+		  t->model ? ex_folder_model_count(t->model) :
+			     0;
 	guint s = ex_selection_count(t->sel);
 	char *a, *b = NULL;
 
-	if (k == EX_LOC_HOME || k == EX_LOC_THISPC)
+	if (k == EX_LOC_HOME || k == EX_LOC_COMPUTER ||
+	    (k == EX_LOC_GALLERY &&
+	     ex_gallery_page_loading(EX_GALLERY_PAGE(t->gallery))))
 		a = g_strdup("");
 	else
 		a = g_strdup_printf(n == 1 ? "%u item" : "%u items", n);
@@ -134,11 +140,14 @@ static void update_status(ExTab *t)
 		char *size = sz ? ex_format_size(sz) : NULL;
 
 		b = g_strdup_printf("%u item%s selected%s%s", s, s == 1 ? "" : "s",
-				    size ? "   " : "", size ? size : "");
+				    size ? "  " : "", size ? size : "");
 		g_free(size);
 	}
 	gtk_label_set_text(GTK_LABEL(t->st_count), a);
 	gtk_label_set_text(GTK_LABEL(t->st_sel), b ? b : "");
+	gtk_widget_set_visible(t->st_sep1, *a && b);
+	/* The second dot only between the selection and the spinner. */
+	gtk_widget_set_visible(t->st_sep2, b != NULL && t->loading);
 	g_free(a);
 	g_free(b);
 
@@ -170,14 +179,17 @@ static void model_count(ExFolderModel *m, ExTab *t)
 static void sel_changed(ExSelection *s, ExTab *t)
 {
 	update_status(t);
+	ex_commandbar_set_images(t->cmdbar, ex_tab_selection_is_images(t));
 	actions_changed(t);
 }
 
 /* ---- view mode, sort, panes ---------------------------------------------------- */
 
+/* The status bar's second switch stands for every layout of pictures. */
 static gboolean is_icon_mode(const char *m)
 {
 	return !strcmp(m, "icons") || !strcmp(m, "large-icons") ||
+	       !strcmp(m, "extra-large-icons") || !strcmp(m, "small-icons") ||
 	       !strcmp(m, "tiles");
 }
 
@@ -284,19 +296,55 @@ void ex_tab_apply_settings(ExTab *t)
 
 /* ---- selection commands --------------------------------------------------------- */
 
+static gboolean showing_gallery(ExTab *t)
+{
+	return gtk_stack_get_visible_child(GTK_STACK(t->stack)) == t->gallery;
+}
+
 void ex_tab_select_all(ExTab *t)
 {
-	ex_file_view_select_all(EX_FILE_VIEW(t->view));
+	if (showing_gallery(t))
+		ex_gallery_page_select_all(EX_GALLERY_PAGE(t->gallery));
+	else
+		ex_file_view_select_all(EX_FILE_VIEW(t->view));
 }
 
 void ex_tab_select_none(ExTab *t)
 {
-	ex_file_view_select_none(EX_FILE_VIEW(t->view));
+	if (showing_gallery(t))
+		ex_gallery_page_select_none(EX_GALLERY_PAGE(t->gallery));
+	else
+		ex_file_view_select_none(EX_FILE_VIEW(t->view));
 }
 
 void ex_tab_invert_selection(ExTab *t)
 {
-	ex_file_view_invert_selection(EX_FILE_VIEW(t->view));
+	if (showing_gallery(t))
+		ex_gallery_page_invert_selection(EX_GALLERY_PAGE(t->gallery));
+	else
+		ex_file_view_invert_selection(EX_FILE_VIEW(t->view));
+}
+
+gboolean ex_tab_selection_is_images(ExTab *t)
+{
+	GPtrArray *items = ex_selection_get(t->sel);
+
+	if (!items || !items->len)
+		return FALSE;
+	for (guint i = 0; i < items->len; i++)
+		if (strcmp(ex_file_get_kind(g_ptr_array_index(items, i)), "image"))
+			return FALSE;
+	return TRUE;
+}
+
+void ex_tab_set_home_filter(ExTab *t, const char *kind)
+{
+	ex_home_page_set_filter(EX_HOME_PAGE(t->home), kind);
+}
+
+const char *ex_tab_home_filter(ExTab *t)
+{
+	return ex_home_page_get_filter(EX_HOME_PAGE(t->home));
 }
 
 void ex_tab_select_files(ExTab *t, GPtrArray *files)
@@ -330,6 +378,8 @@ void ex_tab_rename_when_shown(ExTab *t, GFile *f)
 
 GPtrArray *ex_tab_listed(ExTab *t)
 {
+	if (ex_location_kind(ex_tab_location(t)) == EX_LOC_GALLERY)
+		return ex_gallery_page_list(EX_GALLERY_PAGE(t->gallery));
 	if (!t->model)
 		return g_ptr_array_new_with_free_func(g_object_unref);
 	return ex_folder_model_list(t->model);
@@ -347,7 +397,26 @@ void ex_tab_focus_search(ExTab *t)
 
 void ex_tab_focus_view(ExTab *t)
 {
-	ex_file_view_focus(EX_FILE_VIEW(t->view));
+	GtkWidget *shown = gtk_stack_get_visible_child(GTK_STACK(t->stack));
+	GtkWidget *top = gtk_widget_get_toplevel(t->root);
+
+	if (shown == t->view_overlay) {
+		ex_file_view_focus(EX_FILE_VIEW(t->view));
+		return;
+	}
+	/* Home, Computer or a message: the keyboard goes to the first thing
+	 * there that takes it, or to the window itself -- never to the item
+	 * view hidden behind them, which would get keys while it is not on
+	 * the screen. */
+	if (gtk_widget_get_mapped(shown) &&
+	    gtk_widget_child_focus(shown, GTK_DIR_TAB_FORWARD))
+		return;
+	if (GTK_IS_WINDOW(top)) {
+		GtkWidget *f = gtk_window_get_focus(GTK_WINDOW(top));
+
+		if (f && gtk_widget_is_ancestor(f, t->root))
+			gtk_window_set_focus(GTK_WINDOW(top), NULL);
+	}
 }
 
 /* ---- loading a place ---------------------------------------------------------------- */
@@ -715,6 +784,13 @@ static void set_crumbs(ExTab *t, ExLocation *loc)
 				   ex_location_display_name(l);
 		labels[i] = names[i];
 		icons[i] = ex_location_icon_name(l);
+		/* The address bar leads with where the path starts: the
+		 * house for Home, the computer for a folder on a drive. */
+		if (i == 0 && ex_location_kind(l) == EX_LOC_HOME)
+			icons[i] = "likeos-home-color";
+		else if (i == 0 && (ex_location_kind(l) == EX_LOC_FOLDER ||
+				    ex_location_kind(l) == EX_LOC_COMPUTER))
+			icons[i] = "likeos-computer-color";
 		/* Only a folder has folders inside to list. */
 		expand[i] = ex_location_kind(l) == EX_LOC_FOLDER;
 	}
@@ -740,7 +816,7 @@ static void update_title(ExTab *t)
 				     ex_location_icon_name(ex_tab_location(t)),
 				     GTK_ICON_SIZE_MENU);
 	if (is_current(t)) {
-		char *wt = g_strdup_printf("%s - File Explorer", title);
+		char *wt = g_strdup_printf(EX_WINDOW_TITLE_FMT, title);
 
 		gtk_window_set_title(GTK_WINDOW(t->win), wt);
 		g_free(wt);
@@ -816,12 +892,19 @@ static void load_location(ExTab *t)
 		gtk_stack_set_visible_child(GTK_STACK(t->stack), t->home);
 		set_loading(t, FALSE);
 		break;
-	case EX_LOC_THISPC:
+	case EX_LOC_COMPUTER:
 		g_clear_object(&t->model);
 		ex_file_view_set_model(EX_FILE_VIEW(t->view), NULL);
-		ex_home_page_reload(EX_HOME_PAGE(t->thispc));
-		gtk_stack_set_visible_child(GTK_STACK(t->stack), t->thispc);
+		ex_computer_page_reload(EX_COMPUTER_PAGE(t->computer));
+		gtk_stack_set_visible_child(GTK_STACK(t->stack), t->computer);
 		set_loading(t, FALSE);
+		break;
+	case EX_LOC_GALLERY:
+		g_clear_object(&t->model);
+		ex_file_view_set_model(EX_FILE_VIEW(t->view), NULL);
+		ex_gallery_page_reload(EX_GALLERY_PAGE(t->gallery));
+		gtk_stack_set_visible_child(GTK_STACK(t->stack), t->gallery);
+		set_loading(t, TRUE);
 		break;
 	case EX_LOC_TRASH:
 		load_trash(t);
@@ -837,15 +920,18 @@ static void load_location(ExTab *t)
 	gtk_widget_set_sensitive(t->back, ex_navigator_can_back(t->nav));
 	gtk_widget_set_sensitive(t->fwd, ex_navigator_can_forward(t->nav));
 	gtk_widget_set_sensitive(t->up, ex_navigator_can_up(t->nav));
+	/* Gallery's pictures are dropped as soon as it is left. */
+	if (k != EX_LOC_GALLERY)
+		ex_gallery_page_clear(EX_GALLERY_PAGE(t->gallery));
 	actions_changed(t);
-	if (k != EX_LOC_HOME && k != EX_LOC_THISPC && is_current(t) &&
+	if (k != EX_LOC_HOME && k != EX_LOC_COMPUTER && is_current(t) &&
 	    !lx_breadcrumb_is_editing(LX_BREADCRUMB(t->crumb)) &&
 	    !gtk_widget_has_focus(t->search_entry))
-		ex_file_view_focus(EX_FILE_VIEW(t->view));
+		ex_tab_focus_view(t);
 }
 
 /* Up, or Back to a folder that holds the one left: the folder come from
- * is selected, as in Windows. */
+ * is selected, so the eye finds where it was. */
 static GFile *came_from(ExLocation *from, ExLocation *to)
 {
 	GFile *f = from ? ex_location_file(from) : NULL;
@@ -925,7 +1011,7 @@ static void typed_info(GObject *src, GAsyncResult *res, gpointer data)
 			ex_tab_go(ty->t, l);
 			ex_location_unref(l);
 		} else {
-			/* A file's path opens the file, as in Windows. */
+			/* A file's path opens the file. */
 			ExFile *f = ex_file_new(G_FILE(src), info);
 			GPtrArray *one = g_ptr_array_new_with_free_func(g_object_unref);
 
@@ -1186,8 +1272,12 @@ static void view_sort(ExFileView *v, int col, gboolean asc, ExTab *t)
 
 static void view_zoom(ExFileView *v, int dir, ExTab *t)
 {
-	static const char *const order[] = { "details", "list", "tiles", "icons",
-					     "large-icons" };
+	/* Ctrl and the wheel step through the views: Details, List, then
+	 * the icons from small to extra large (Tiles and Compact sit outside the
+	 * order; zooming from them starts at Details). */
+	static const char *const order[] = { "details",	    "list",
+					     "small-icons", "icons",
+					     "large-icons", "extra-large-icons" };
 	int cur = 0;
 
 	for (gsize i = 0; i < G_N_ELEMENTS(order); i++)
@@ -1245,7 +1335,7 @@ static void sidebar_popup(ExSidebar *s, ExLocation *l, GdkEventButton *ev,
 	g_object_unref(m);
 }
 
-/* A tile of Home or This PC: the same menu as the place's row in the
+/* A tile of Home or Computer: the same menu as the place's row in the
  * navigation pane. */
 static void home_popup_location(GtkWidget *home, ExLocation *l,
 				GdkEventButton *ev, ExTab *t)
@@ -1271,78 +1361,48 @@ static void home_open_file(GtkWidget *h, ExFile *f, ExTab *t)
 	g_ptr_array_unref(one);
 }
 
-/* Home's own little menu: these items are not a selection of the tab. */
-typedef struct {
-	ExTab *t;
-	ExFile *f;
-} HomeItem;
-
-static void home_item_free(gpointer data, GClosure *c)
+/* A file of Home's lists: its own short menu.  These files are not a
+ * selection of the tab, so each command carries the file's URI. */
+static void home_item(GMenu *m, const char *label, const char *action,
+		      const char *uri, const char *icon)
 {
-	HomeItem *h = data;
+	GMenuItem *it = g_menu_item_new(label, NULL);
 
-	g_object_unref(h->f);
-	g_free(h);
-}
+	g_menu_item_set_action_and_target(it, action, "s", uri);
+	if (icon) {
+		GIcon *gi = g_themed_icon_new(icon);
 
-static void hi_open(GtkMenuItem *mi, HomeItem *h)
-{
-	home_open_file(NULL, h->f, h->t);
-}
-
-static void hi_location(GtkMenuItem *mi, HomeItem *h)
-{
-	GFile *p = g_file_get_parent(ex_file_get_file(h->f));
-
-	if (p) {
-		ExLocation *l = ex_location_new_folder(p);
-		GPtrArray *sel = g_ptr_array_new_with_free_func(g_object_unref);
-
-		ex_tab_go(h->t, l);
-		g_ptr_array_add(sel, g_object_ref(ex_file_get_file(h->f)));
-		ex_tab_select_files(h->t, sel);
-		g_ptr_array_unref(sel);
-		ex_location_unref(l);
-		g_object_unref(p);
+		g_menu_item_set_icon(it, gi);
+		g_object_unref(gi);
 	}
-}
-
-static void hi_unfavorite(GtkMenuItem *mi, HomeItem *h)
-{
-	ex_settings_set_favorite(ex_settings_get(), ex_file_get_file(h->f), FALSE);
-}
-
-static void hi_forget(GtkMenuItem *mi, HomeItem *h)
-{
-	(void)ex_recent_forget(ex_file_get_file(h->f), NULL);
-}
-
-static void menu_item(GtkWidget *menu, const char *label, GCallback cb,
-		      ExTab *t, ExFile *f)
-{
-	GtkWidget *mi = gtk_menu_item_new_with_mnemonic(label);
-	HomeItem *h = g_new0(HomeItem, 1);
-
-	h->t = t;
-	h->f = g_object_ref(f);
-	g_signal_connect_data(mi, "activate", cb, h, home_item_free, 0);
-	gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+	g_menu_append_item(m, it);
+	g_object_unref(it);
 }
 
 static void home_popup(GtkWidget *home, ExFile *f, GdkEventButton *ev, ExTab *t)
 {
-	GtkWidget *menu = gtk_menu_new();
+	GMenu *m = g_menu_new();
+	GMenu *s = g_menu_new();
+	char *uri = g_file_get_uri(ex_file_get_file(f));
+	gboolean fav = ex_settings_is_favorite(ex_settings_get(),
+					       ex_file_get_file(f));
 
-	menu_item(menu, "_Open", G_CALLBACK(hi_open), t, f);
-	menu_item(menu, "Open file _location", G_CALLBACK(hi_location), t, f);
-	gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-	if (ex_settings_is_favorite(ex_settings_get(), ex_file_get_file(f)))
-		menu_item(menu, "Remove from _Favorites", G_CALLBACK(hi_unfavorite),
-			  t, f);
-	menu_item(menu, "Remove from _Recent", G_CALLBACK(hi_forget), t, f);
-	gtk_widget_show_all(menu);
-	gtk_menu_attach_to_widget(GTK_MENU(menu), home, NULL);
-	gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+	home_item(s, "_Open", "win.open-uri", uri, "likeos-open");
+	home_item(s, "Show in _folder", "win.open-file-location", uri,
+		  "likeos-open-folder");
+	g_menu_append_section(m, NULL, G_MENU_MODEL(s));
+	g_object_unref(s);
+	s = g_menu_new();
+	home_item(s, fav ? "Remove from _Favorites" : "Add to _Favorites",
+		  "win.favorite-uri", uri, "likeos-favorite");
+	home_item(s, "Remove from _Recent", "win.forget-recent", uri,
+		  "likeos-close");
+	g_menu_append_section(m, NULL, G_MENU_MODEL(s));
+	g_object_unref(s);
+	ex_window_update_actions(t->win);
+	ex_context_menu_popup(home, G_MENU_MODEL(m), ev);
+	g_object_unref(m);
+	g_free(uri);
 }
 
 void ex_tab_popup(ExTab *t, GdkEventButton *ev, gboolean on_item)
@@ -1351,21 +1411,38 @@ void ex_tab_popup(ExTab *t, GdkEventButton *ev, gboolean on_item)
 				  ex_context_menu_background(t);
 
 	ex_window_update_actions(t->win);
-	ex_context_menu_popup(t->view, m, ev);
+	/* Over what is shown: the item view, or Gallery. */
+	ex_context_menu_popup(showing_gallery(t) ? t->gallery : t->view, m, ev);
 	g_object_unref(m);
+}
+
+static void gallery_activate(GtkWidget *g, GPtrArray *files, ExTab *t)
+{
+	ex_window_open(t->win, files, FALSE);
+}
+
+static void gallery_popup(GtkWidget *g, GdkEventButton *ev, gboolean on_item,
+			  ExTab *t)
+{
+	ex_tab_popup(t, ev, on_item);
+}
+
+static void gallery_loaded(GtkWidget *g, ExTab *t)
+{
+	set_loading(t, FALSE);
+	actions_changed(t);
 }
 
 /* ---- construction ------------------------------------------------------------------------ */
 
-static GtkWidget *nav_button(const char *icon, const char *tip,
-			     const char *action)
+static GtkWidget *nav_button(const char *icon, const char *fallback,
+			     const char *tip, const char *action)
 {
-	GtkWidget *b = gtk_button_new_from_icon_name(icon, GTK_ICON_SIZE_BUTTON);
+	GtkWidget *b = ex_style_icon_button(ex_style_icon(icon, fallback, 16), tip,
+					    action);
 
-	gtk_button_set_relief(GTK_BUTTON(b), GTK_RELIEF_NONE);
-	gtk_widget_set_tooltip_text(b, tip);
-	atk_object_set_name(gtk_widget_get_accessible(b), tip);
-	gtk_actionable_set_action_name(GTK_ACTIONABLE(b), action);
+	ex_style_add(b, "ex-nav-button");
+	gtk_widget_set_valign(b, GTK_ALIGN_CENTER);
 	return b;
 }
 
@@ -1419,83 +1496,243 @@ static gboolean label_button(GtkWidget *w, GdkEventButton *ev, ExTab *t)
 	return FALSE;
 }
 
+/* A tab in the window's title row: a rounded chip that asks for the same
+ * width whatever its name, all of them narrowing alike only when the row
+ * runs out of room.  The current tab is a raised card with a hairline
+ * edge, standing in the title row like the other tabs rather than joined to
+ * the bars below; the others are bare, with a soft wash under the pointer.
+ * The colours come from the theme's rules for "tab": background-color and
+ * border-top-color in each state. */
+#define TAB_WIDTH 208
+#define TAB_INSET_X 2
+#define TAB_INSET_Y 4
+#define TAB_RADIUS 8
+
+typedef struct {
+	GtkEventBox parent;
+} ExTabChip;
+typedef GtkEventBoxClass ExTabChipClass;
+
+static GType ex_tab_chip_get_type(void);
+G_DEFINE_TYPE(ExTabChip, ex_tab_chip, GTK_TYPE_EVENT_BOX)
+
+static void chip_width(GtkWidget *w, int *min, int *nat)
+{
+	GTK_WIDGET_CLASS(ex_tab_chip_parent_class)->get_preferred_width(w, min,
+									 nat);
+	*nat = MAX(*min, TAB_WIDTH);
+}
+
+static void rounded(cairo_t *cr, double x, double y, double w, double h,
+		    double r)
+{
+	cairo_new_sub_path(cr);
+	cairo_arc(cr, x + r, y + r, r, G_PI, 1.5 * G_PI);
+	cairo_arc(cr, x + w - r, y + r, r, 1.5 * G_PI, 2 * G_PI);
+	cairo_arc(cr, x + w - r, y + h - r, r, 0, 0.5 * G_PI);
+	cairo_arc(cr, x + r, y + h - r, r, 0.5 * G_PI, G_PI);
+	cairo_close_path(cr);
+}
+
+static gboolean chip_draw(GtkWidget *w, cairo_t *cr)
+{
+	GtkStyleContext *sc = gtk_widget_get_style_context(w);
+	GtkStateFlags st = gtk_widget_get_state_flags(w);
+	double width = gtk_widget_get_allocated_width(w);
+	double height = gtk_widget_get_allocated_height(w);
+	double x = TAB_INSET_X, y = TAB_INSET_Y;
+	double cw = width - 2 * TAB_INSET_X, ch = height - 2 * TAB_INSET_Y;
+	GdkRGBA *bg = NULL, *edge = NULL;
+
+	gtk_style_context_get(sc, st, "background-color", &bg,
+			      "border-top-color", &edge, NULL);
+	if (bg->alpha > 0) {
+		rounded(cr, x, y, cw, ch, TAB_RADIUS);
+		gdk_cairo_set_source_rgba(cr, bg);
+		cairo_fill(cr);
+	}
+	if (edge->alpha > 0) {
+		rounded(cr, x + 0.5, y + 0.5, cw - 1, ch - 1, TAB_RADIUS - 0.5);
+		gdk_cairo_set_source_rgba(cr, edge);
+		cairo_set_line_width(cr, 1);
+		cairo_stroke(cr);
+	}
+	gdk_rgba_free(bg);
+	gdk_rgba_free(edge);
+	return GTK_WIDGET_CLASS(ex_tab_chip_parent_class)->draw(w, cr);
+}
+
+/* The wash under the pointer: an event box is not marked hovered on its
+ * own.  Moving onto the close button inside is still over the tab. */
+static gboolean chip_crossing(GtkWidget *w, GdkEventCrossing *ev)
+{
+	if (ev->detail == GDK_NOTIFY_INFERIOR)
+		return FALSE;
+	if (ev->type == GDK_ENTER_NOTIFY)
+		gtk_widget_set_state_flags(w, GTK_STATE_FLAG_PRELIGHT, FALSE);
+	else
+		gtk_widget_unset_state_flags(w, GTK_STATE_FLAG_PRELIGHT);
+	return FALSE;
+}
+
+static void ex_tab_chip_class_init(ExTabChipClass *k)
+{
+	GTK_WIDGET_CLASS(k)->get_preferred_width = chip_width;
+	GTK_WIDGET_CLASS(k)->draw = chip_draw;
+	GTK_WIDGET_CLASS(k)->enter_notify_event = chip_crossing;
+	GTK_WIDGET_CLASS(k)->leave_notify_event = chip_crossing;
+	gtk_widget_class_set_css_name(GTK_WIDGET_CLASS(k), "tab");
+}
+
+static void ex_tab_chip_init(ExTabChip *c)
+{
+	gtk_event_box_set_visible_window(GTK_EVENT_BOX(c), FALSE);
+	gtk_widget_set_app_paintable(GTK_WIDGET(c), TRUE);
+	gtk_widget_add_events(GTK_WIDGET(c), GDK_ENTER_NOTIFY_MASK |
+						     GDK_LEAVE_NOTIFY_MASK);
+}
+
 static GtkWidget *make_label(ExTab *t)
 {
-	GtkWidget *eb = gtk_event_box_new();
-	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-	GtkWidget *close = gtk_button_new_from_icon_name("window-close-symbolic",
-							 GTK_ICON_SIZE_MENU);
+	GtkWidget *eb = g_object_new(ex_tab_chip_get_type(), NULL);
+	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	GtkWidget *close = ex_style_icon_button(ex_style_glyph(EX_GLYPH_CLOSE, 8),
+						"Close tab (Ctrl+W)", NULL);
 
 	t->label_icon = gtk_image_new();
 	t->label_text = gtk_label_new("");
 	gtk_label_set_ellipsize(GTK_LABEL(t->label_text), PANGO_ELLIPSIZE_END);
-	gtk_label_set_width_chars(GTK_LABEL(t->label_text), 12);
-	gtk_label_set_max_width_chars(GTK_LABEL(t->label_text), 24);
 	gtk_label_set_xalign(GTK_LABEL(t->label_text), 0);
-	gtk_button_set_relief(GTK_BUTTON(close), GTK_RELIEF_NONE);
-	gtk_widget_set_tooltip_text(close, "Close tab (Ctrl+W)");
-	atk_object_set_name(gtk_widget_get_accessible(close), "Close tab");
+	ex_style_add(close, "ex-tab-close");
+	gtk_widget_set_valign(close, GTK_ALIGN_CENTER);
+	gtk_widget_set_can_focus(close, FALSE);
 	g_signal_connect(close, "clicked", G_CALLBACK(close_clicked), t);
 	gtk_box_pack_start(GTK_BOX(box), t->label_icon, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(box), t->label_text, TRUE, TRUE, 0);
 	gtk_box_pack_end(GTK_BOX(box), close, FALSE, FALSE, 0);
 	gtk_container_add(GTK_CONTAINER(eb), box);
-	gtk_event_box_set_visible_window(GTK_EVENT_BOX(eb), FALSE);
+	atk_object_set_role(gtk_widget_get_accessible(eb), ATK_ROLE_PAGE_TAB);
 	g_signal_connect(eb, "button-press-event", G_CALLBACK(label_button), t);
 	gtk_widget_show_all(eb);
 	return eb;
 }
 
+/* The magnifier sits at the right end of the search box, where
+ * GtkSearchEntry puts its clear button once something is typed: the
+ * magnifier comes back whenever the box is empty, and the clear button is
+ * the thin cross.  This runs after GtkSearchEntry's own handler, so it has
+ * the last word on the icon. */
+static void search_icon(GtkEntry *e, gpointer data)
+{
+	if (!*gtk_entry_get_text(e)) {
+		static const char *names[] = { "likeos-search-symbolic",
+					       "edit-find-symbolic", NULL };
+		GIcon *icon = g_themed_icon_new_from_names((char **)names, 2);
+
+		gtk_entry_set_icon_from_gicon(e, GTK_ENTRY_ICON_SECONDARY, icon);
+		g_object_unref(icon);
+		gtk_entry_set_icon_tooltip_text(e, GTK_ENTRY_ICON_SECONDARY, NULL);
+	} else {
+		static const char *names[] = { "likeos-close-symbolic",
+					       "edit-clear-symbolic", NULL };
+		GIcon *icon = g_themed_icon_new_from_names((char **)names, 2);
+
+		/* GtkSearchEntry's own clear button, in the line style. */
+		gtk_entry_set_icon_from_gicon(e, GTK_ENTRY_ICON_SECONDARY, icon);
+		g_object_unref(icon);
+		gtk_entry_set_icon_tooltip_text(e, GTK_ENTRY_ICON_SECONDARY,
+						"Clear");
+	}
+}
+
 static GtkWidget *build_navbar(ExTab *t)
 {
-	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
 	ex_style_add(bar, EX_CLASS_NAVBAR);
-	t->back = nav_button("go-previous", "Back (Alt+Left)", "win.back");
-	t->fwd = nav_button("go-next", "Forward (Alt+Right)", "win.forward");
-	t->up = nav_button("go-up", "Up (Alt+Up)", "win.up");
+	t->back = nav_button("likeos-back-symbolic", "go-previous-symbolic",
+			     "Back (Alt+Left)", "win.back");
+	t->fwd = nav_button("likeos-forward-symbolic", "go-next-symbolic",
+			    "Forward (Alt+Right)", "win.forward");
+	t->up = nav_button("likeos-up-symbolic", "go-up-symbolic", "Up (Alt+Up)", "win.up");
 	g_signal_connect(t->back, "button-press-event", G_CALLBACK(history_menu), t);
 	g_signal_connect(t->fwd, "button-press-event", G_CALLBACK(history_menu), t);
 	gtk_box_pack_start(GTK_BOX(bar), t->back, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(bar), t->fwd, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(bar), t->up, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(bar),
-			   nav_button("view-refresh", "Refresh (F5)", "win.refresh"),
+			   nav_button("likeos-refresh-symbolic", "view-refresh-symbolic",
+				      "Refresh (F5)", "win.refresh"),
 			   FALSE, FALSE, 0);
 
 	t->crumb = lx_breadcrumb_new();
 	gtk_widget_set_hexpand(t->crumb, TRUE);
+	gtk_widget_set_valign(t->crumb, GTK_ALIGN_CENTER);
 	g_signal_connect(t->crumb, "crumb-activated", G_CALLBACK(crumb_activated), t);
 	g_signal_connect(t->crumb, "text-activated", G_CALLBACK(text_activated), t);
 	g_signal_connect(t->crumb, "children-wanted", G_CALLBACK(children_wanted), t);
-	gtk_box_pack_start(GTK_BOX(bar), t->crumb, TRUE, TRUE, 4);
+	gtk_box_pack_start(GTK_BOX(bar), t->crumb, TRUE, TRUE, 0);
 
 	t->search_entry = gtk_search_entry_new();
-	gtk_entry_set_width_chars(GTK_ENTRY(t->search_entry), 26);
+	gtk_entry_set_icon_from_gicon(GTK_ENTRY(t->search_entry),
+				      GTK_ENTRY_ICON_PRIMARY, NULL);
+	gtk_entry_set_width_chars(GTK_ENTRY(t->search_entry), 30);
+	gtk_widget_set_valign(t->search_entry, GTK_ALIGN_CENTER);
 	atk_object_set_name(gtk_widget_get_accessible(t->search_entry), "Search");
 	g_signal_connect(t->search_entry, "search-changed", G_CALLBACK(search_changed),
 			 t);
 	g_signal_connect(t->search_entry, "stop-search", G_CALLBACK(search_stop), t);
 	g_signal_connect(t->search_entry, "activate", G_CALLBACK(search_activate), t);
+	g_signal_connect(t->search_entry, "changed", G_CALLBACK(search_icon), NULL);
+	search_icon(GTK_ENTRY(t->search_entry), NULL);
 	gtk_box_pack_end(GTK_BOX(bar), t->search_entry, FALSE, FALSE, 0);
 	return bar;
 }
 
+static void seg_icon(LxSegmented *seg, const char *name, const char *fallback,
+		     const char *tip)
+{
+	GIcon *icon = ex_style_gicon(name, fallback);
+
+	lx_segmented_append_gicon(seg, icon, tip);
+	g_object_unref(icon);
+}
+
+static GtkWidget *status_separator(void)
+{
+	GtkWidget *l = gtk_label_new("·");
+
+	ex_style_add(l, "ex-status-separator");
+	gtk_widget_set_no_show_all(l, TRUE);
+	return l;
+}
+
+/* "6 items · 1 item selected  2.05 KB" at the left, and the switch
+ * between the Details and the Large icons view at the right. */
 static GtkWidget *build_statusbar(ExTab *t)
 {
-	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
 	ex_style_add(bar, EX_CLASS_STATUSBAR);
 	t->st_count = gtk_label_new("");
+	t->st_sep1 = status_separator();
 	t->st_sel = gtk_label_new("");
+	t->st_sep2 = status_separator();
 	t->spinner = gtk_spinner_new();
 	gtk_widget_set_tooltip_text(t->spinner, "Working…");
+	gtk_widget_set_margin_start(t->spinner, 8);
 	t->seg = lx_segmented_new();
-	lx_segmented_append(LX_SEGMENTED(t->seg), "view-list", "Details");
-	lx_segmented_append(LX_SEGMENTED(t->seg), "view-grid", "Large icons");
+	seg_icon(LX_SEGMENTED(t->seg), "likeos-details-view-symbolic", "view-list-symbolic",
+		 "Display information about each item in the window (Details)");
+	seg_icon(LX_SEGMENTED(t->seg), "likeos-large-icons-view-symbolic",
+		 "view-grid-symbolic",
+		 "Display items by using large thumbnails (Large icons)");
 	g_signal_connect(t->seg, "changed", G_CALLBACK(seg_changed), t);
+	gtk_widget_set_valign(t->seg, GTK_ALIGN_CENTER);
 	gtk_box_pack_start(GTK_BOX(bar), t->st_count, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(bar), t->st_sep1, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(bar), t->st_sel, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(bar), t->st_sep2, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(bar), t->spinner, FALSE, FALSE, 0);
 	gtk_box_pack_end(GTK_BOX(bar), t->seg, FALSE, FALSE, 0);
 	return bar;
@@ -1533,17 +1770,20 @@ ExTab *ex_tab_new(ExWindow *win, ExLocation *loc)
 	g_object_set_data(G_OBJECT(t->root), "ex-tab", t);
 	t->label = make_label(t);
 
-	gtk_box_pack_start(GTK_BOX(t->root), build_navbar(t), FALSE, FALSE, 0);
-	t->cmdbar = ex_commandbar_new();
-	gtk_box_pack_start(GTK_BOX(t->root), t->cmdbar, FALSE, FALSE, 0);
-
-	/* Navigation pane | content | right pane. */
+	/* The navigation pane runs the whole height under the title row, a
+	 * column of its own; beside it the address row, the command bar, the
+	 * content with the right pane, and the status bar. */
 	t->outer = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
 	t->sidebar = ex_sidebar_new();
 	gtk_widget_set_size_request(t->sidebar, 160, -1);
 	gtk_paned_pack1(GTK_PANED(t->outer), t->sidebar, FALSE, FALSE);
 	gtk_paned_set_position(GTK_PANED(t->outer),
 			       ex_settings_get_int(s, "sidebar-width"));
+	t->column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	ex_style_add(t->column, "ex-main");
+	gtk_box_pack_start(GTK_BOX(t->column), build_navbar(t), FALSE, FALSE, 0);
+	t->cmdbar = ex_commandbar_new();
+	gtk_box_pack_start(GTK_BOX(t->column), t->cmdbar, FALSE, FALSE, 0);
 	t->inner = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 	t->stack = gtk_stack_new();
 	gtk_stack_set_transition_type(GTK_STACK(t->stack),
@@ -1569,15 +1809,15 @@ ExTab *ex_tab_new(ExWindow *win, ExLocation *loc)
 	g_signal_connect(t->view, "sort", G_CALLBACK(view_sort), t);
 	g_signal_connect(t->view, "zoom", G_CALLBACK(view_zoom), t);
 
-	t->home = ex_home_page_new(FALSE);
-	t->thispc = ex_home_page_new(TRUE);
+	t->home = ex_home_page_new();
+	t->computer = ex_computer_page_new();
 	g_signal_connect(t->home, "open", G_CALLBACK(home_open), t);
-	g_signal_connect(t->thispc, "open", G_CALLBACK(home_open), t);
+	g_signal_connect(t->computer, "open", G_CALLBACK(home_open), t);
 	g_signal_connect(t->home, "open-file", G_CALLBACK(home_open_file), t);
 	g_signal_connect(t->home, "popup", G_CALLBACK(home_popup), t);
 	g_signal_connect(t->home, "popup-location",
 			 G_CALLBACK(home_popup_location), t);
-	g_signal_connect(t->thispc, "popup-location",
+	g_signal_connect(t->computer, "popup-location",
 			 G_CALLBACK(home_popup_location), t);
 
 	t->msg_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
@@ -1593,20 +1833,26 @@ ExTab *ex_tab_new(ExWindow *win, ExLocation *loc)
 
 	gtk_stack_add_named(GTK_STACK(t->stack), t->view_overlay, "files");
 	gtk_stack_add_named(GTK_STACK(t->stack), t->home, "home");
-	gtk_stack_add_named(GTK_STACK(t->stack), t->thispc, "thispc");
+	t->gallery = ex_gallery_page_new(t->sel);
+	g_signal_connect(t->gallery, "activate", G_CALLBACK(gallery_activate), t);
+	g_signal_connect(t->gallery, "popup", G_CALLBACK(gallery_popup), t);
+	g_signal_connect(t->gallery, "loaded", G_CALLBACK(gallery_loaded), t);
+	gtk_stack_add_named(GTK_STACK(t->stack), t->gallery, "gallery");
+	gtk_stack_add_named(GTK_STACK(t->stack), t->computer, "computer");
 	gtk_stack_add_named(GTK_STACK(t->stack), t->msg_box, "message");
 	gtk_box_pack_start(GTK_BOX(t->inner), t->stack, TRUE, TRUE, 0);
 	t->right = ex_preview_pane_new(t->sel);
 	gtk_widget_set_no_show_all(t->right, TRUE);
 	gtk_box_pack_end(GTK_BOX(t->inner), t->right, FALSE, FALSE, 0);
-	gtk_paned_pack2(GTK_PANED(t->outer), t->inner, TRUE, FALSE);
+	gtk_box_pack_start(GTK_BOX(t->column), t->inner, TRUE, TRUE, 0);
+	gtk_box_pack_end(GTK_BOX(t->column), build_statusbar(t), FALSE, FALSE, 0);
+	gtk_paned_pack2(GTK_PANED(t->outer), t->column, TRUE, FALSE);
 	gtk_box_pack_start(GTK_BOX(t->root), t->outer, TRUE, TRUE, 0);
 
 	g_signal_connect(t->sidebar, "open", G_CALLBACK(sidebar_open), t);
 	g_signal_connect(t->sidebar, "drop", G_CALLBACK(sidebar_drop), t);
 	g_signal_connect(t->sidebar, "popup", G_CALLBACK(sidebar_popup), t);
 
-	gtk_box_pack_end(GTK_BOX(t->root), build_statusbar(t), FALSE, FALSE, 0);
 	g_signal_connect(t->nav, "changed", G_CALLBACK(nav_changed), t);
 	g_signal_connect(t->sel, "changed", G_CALLBACK(sel_changed), t);
 	g_signal_connect(t->root, "destroy", G_CALLBACK(root_destroyed), t);

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: recently used files.
+// LikeOS Explorer: recently used files.
 //
 // Copyright (C) 2026 The LikeOS Project
 

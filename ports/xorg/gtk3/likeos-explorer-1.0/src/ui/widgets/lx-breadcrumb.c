@@ -9,6 +9,28 @@ static void destroy_child(GtkWidget *w, gpointer data)
 	gtk_widget_destroy(w);
 }
 
+/* The LikeOS line icons where the theme has them, GTK's own otherwise. */
+static void set_chevron(GtkImage *img, gboolean open)
+{
+	const char *names[] = { open ? "likeos-chevron-down-symbolic" :
+				       "likeos-chevron-right-symbolic",
+				open ? "go-down-symbolic" : "go-next-symbolic",
+				NULL };
+	GIcon *icon = g_themed_icon_new_from_names((char **)names, 2);
+
+	gtk_image_set_from_gicon(img, icon, GTK_ICON_SIZE_MENU);
+	gtk_image_set_pixel_size(img, 12);
+	g_object_unref(icon);
+}
+
+static GtkWidget *chevron_image(void)
+{
+	GtkWidget *img = gtk_image_new();
+
+	set_chevron(GTK_IMAGE(img), FALSE);
+	return img;
+}
+
 struct _LxBreadcrumb {
 	GtkBin parent;
 	GtkWidget *stack;
@@ -182,6 +204,9 @@ static void chevron_toggled(GtkToggleButton *t, LxBreadcrumb *b)
 	GtkWidget *pop = g_object_get_data(G_OBJECT(t), "lx-popover");
 	GtkWidget *box;
 
+	/* Open, the chevron points down at the list. */
+	set_chevron(GTK_IMAGE(gtk_button_get_image(GTK_BUTTON(t))),
+		    gtk_toggle_button_get_active(t));
 	if (!gtk_toggle_button_get_active(t))
 		return;
 	box = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(pop))));
@@ -201,15 +226,26 @@ void lx_breadcrumb_set_crumbs(LxBreadcrumb *b, const char *const *labels,
 	gtk_container_foreach(GTK_CONTAINER(b->crumbs),
 			      destroy_child, NULL);
 	b->n = n;
+	/* The place's picture leads the row, then a chevron before the first
+	 * name: "[icon] > Computer > System disk >". */
+	if (n && icons && icons[0]) {
+		GtkWidget *img = gtk_image_new_from_icon_name(icons[0],
+							      GTK_ICON_SIZE_MENU);
+		GtkWidget *sep = chevron_image();
+
+		gtk_image_set_pixel_size(GTK_IMAGE(img), 16);
+		gtk_style_context_add_class(gtk_widget_get_style_context(img),
+					    "lx-crumb-icon");
+		gtk_style_context_add_class(gtk_widget_get_style_context(sep),
+					    "lx-crumb-separator");
+		gtk_box_pack_start(GTK_BOX(b->crumbs), img, FALSE, FALSE, 0);
+		gtk_box_pack_start(GTK_BOX(b->crumbs), sep, FALSE, FALSE, 0);
+	}
 	for (guint i = 0; i < n; i++) {
 		GtkWidget *btn = gtk_button_new();
 		GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
-		if (i == 0 && icons && icons[i])
-			gtk_box_pack_start(GTK_BOX(row),
-					   gtk_image_new_from_icon_name(
-						   icons[i], GTK_ICON_SIZE_MENU),
-					   FALSE, FALSE, 0);
+		gtk_widget_set_focus_on_click(btn, FALSE);
 		gtk_box_pack_start(GTK_BOX(row), gtk_label_new(labels[i]), FALSE,
 				   FALSE, 0);
 		gtk_container_add(GTK_CONTAINER(btn), row);
@@ -226,14 +262,13 @@ void lx_breadcrumb_set_crumbs(LxBreadcrumb *b, const char *const *labels,
 			/* Nothing to list: a plain separator keeps the row
 			 * reading as a path. */
 			if (i + 1 < n) {
-				GtkWidget *sep = gtk_image_new_from_icon_name(
-					"pan-end-symbolic", GTK_ICON_SIZE_MENU);
+				GtkWidget *sep = chevron_image();
 
 				gtk_style_context_add_class(
 					gtk_widget_get_style_context(sep),
 					"lx-crumb-separator");
 				gtk_box_pack_start(GTK_BOX(b->crumbs), sep, FALSE,
-						   FALSE, 4);
+						   FALSE, 0);
 			}
 			continue;
 		}
@@ -242,11 +277,9 @@ void lx_breadcrumb_set_crumbs(LxBreadcrumb *b, const char *const *labels,
 		GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
 		GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-		gtk_button_set_image(GTK_BUTTON(chev),
-				     gtk_image_new_from_icon_name(
-					     "pan-end-symbolic",
-					     GTK_ICON_SIZE_MENU));
+		gtk_button_set_image(GTK_BUTTON(chev), chevron_image());
 		gtk_button_set_relief(GTK_BUTTON(chev), GTK_RELIEF_NONE);
+		gtk_widget_set_focus_on_click(chev, FALSE);
 		gtk_style_context_add_class(gtk_widget_get_style_context(chev),
 					    "lx-chevron");
 		gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),

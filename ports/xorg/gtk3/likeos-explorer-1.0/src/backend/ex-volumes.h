@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: drives and other places that hold files.
+// LikeOS Explorer: drives and other places that hold files.
 //
 // Two sources, merged: GIO's volume monitor (mounts it knows -- removable
 // media and network shares, where a backend provides them) and the system's
@@ -15,8 +15,11 @@
 
 G_BEGIN_DECLS
 
+/* The name of the disk the system runs from (the root folder's). */
+#define EX_SYSTEM_DISK_NAME "System disk"
+
 typedef struct {
-	char *name; /* "Local Disk", "RAM Disk", "USB stick" */
+	char *name; /* "System disk", "RAM Disk", "USB stick" */
 	char *icon_name;
 	GFile *root;
 	char *fs_type; /* "ext4", "tmpfs", "" */
@@ -41,6 +44,9 @@ gboolean ex_volumes_have_network(ExVolumes *v);
 const ExVolume *ex_volumes_find(ExVolumes *v, GFile *file);
 /* Ask for the space figures again. */
 void ex_volumes_refresh(ExVolumes *v);
+/* A field of the mount table as it was written: the table escapes a space,
+ * a tab, a newline and a backslash as three octal digits ("\040"). */
+char *ex_volumes_unescape(const char *field);
 
 /* Unmount / eject a GIO volume. */
 void ex_volume_eject_async(const ExVolume *vol, GMountOperation *mop,

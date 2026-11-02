@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: search.
+// LikeOS Explorer: search.
 //
 // Copyright (C) 2026 The LikeOS Project
 

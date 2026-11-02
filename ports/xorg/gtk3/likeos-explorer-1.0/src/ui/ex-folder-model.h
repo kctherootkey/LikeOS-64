@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the items of one folder, as GTK sees them.
+// LikeOS Explorer: the items of one folder, as GTK sees them.
 //
 // One list model behind every view of a tab -- the Details, List and
 // Compact tree views and the Icons, Large icons and Tiles icon views -- so a

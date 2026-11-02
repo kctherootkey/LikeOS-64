@@ -736,7 +736,8 @@ ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat tests
 # config that never reached the running system, which looks identical to the
 # edit not working.
 RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
-	res/LikeOS.png \
+	res/LikeOS.png res/LikeOS-polar.png res/LikeOS-horizon.png \
+	res/LikeOS-drift.png \
 	res/etc/skel/.profile res/etc/skel/.bashrc \
 	$(wildcard res/etc/skel/Desktop/*.desktop) res/videos \
 	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
@@ -745,6 +746,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/gtk3/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
+	$(shell find res/xorg/icons -type f -o -type l 2>/dev/null) \
 	res/firmware/i915.list res/firmware/sof.list \
 	$(wildcard res/firmware/i915/*.bin res/firmware/xe/*.bin) \
 	$(shell find res/firmware/intel -type f 2>/dev/null) \
@@ -782,7 +784,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 #
 # The file it names is the LAST program the manifest builds, which is what
 # makes its presence mean "the whole stack".  That was Claws Mail, then
-# PCManFM, and is now File Explorer (likeos-explorer), the last in-tree
+# PCManFM, and is now LikeOS Explorer (likeos-explorer), the last in-tree
 # package of gtk3/packages.list after the media player -- a sentinel left at
 # an earlier package would go on being satisfied by a port that stopped
 # before the packages added after it.
@@ -2295,8 +2297,8 @@ ports-gtk3: ports-xorg $(BUILD_DIR)/libaudio.so | $(BUILD_DIR)
 # the sysroot the GTK3 port installs into, and it does not exist until that
 # port has built.
 #
-# taskbar is the desktop bar: a Windows 2000-style panel that replaced ctwm's
-# icon manager and workspace manager, and that draws the clock and the load
+# taskbar is the desktop bar: the LikeOS panel that replaced ctwm's icon
+# manager and workspace manager, and that draws the clock and the load
 # monitor in its own tray rather than leaving them as separate windows.
 # datetime and load remain as standalone programs -- they share panel.c with
 # the panel, so the same code draws them either way -- but xinitrc no longer
@@ -2705,7 +2707,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	#
 	# Without a theme installed libXcursor falls back to the X core cursor
 	# font, whose "watch" is a 1-bit wristwatch; this replaces the busy
-	# cursors with an animated hourglass, adds the resize and link pointers
+	# cursors with an animated busy ring, adds the resize and link pointers
 	# GTK asks for by names the core font does not have, and leaves every
 	# other cursor to the fallback, which is why the theme is under a
 	# megabyte.
@@ -2725,8 +2727,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
 	# The time zone, as an Olson name.  /etc/profile exports it as $$TZ,
 	# which is the only way ICU (and so the browser's Date and Intl) can
-	# learn the zone on this system -- there is no zoneinfo tree here and
-	# libc's localtime() is UTC.  See the comment in res/etc/profile.
+	# learn the zone on this system; libc and GLib (through the zoneinfo
+	# files of the tzdata package) also read this file directly when TZ is
+	# unset.  See the comment in res/etc/profile.
 	cp res/etc/timezone      $(EXT4_STAGING)/etc/timezone
 	# Media types.  Claws Mail reads this to set an attachment's
 	# Content-Type; without it every attachment is sent as
@@ -2790,6 +2793,13 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 		mkdir -p "$$d/Videos"; \
 		cp res/videos/* "$$d/Videos/"; \
 		chmod 0644 "$$d"/Videos/*; \
+	done
+	# ~/Pictures/Wallpapers, with the wallpapers a user can pick by hand.
+	for d in $(EXT4_STAGING)/etc/skel $(EXT4_STAGING)/root; do \
+		mkdir -p "$$d/Pictures/Wallpapers"; \
+		cp res/LikeOS.png res/LikeOS-polar.png res/LikeOS-horizon.png \
+			res/LikeOS-drift.png "$$d/Pictures/Wallpapers/"; \
+		chmod 0644 "$$d"/Pictures/Wallpapers/*; \
 	done
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/etc/skel/Desktop/
 	cp res/etc/skel/Desktop/*.desktop $(EXT4_STAGING)/root/Desktop/

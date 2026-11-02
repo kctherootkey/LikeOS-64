@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the search index of the home folder.
+// LikeOS Explorer: the search index of the home folder.
 //
 // Every name below the home folder -- hidden folders and caches excepted --
 // with its kind, size and modification time, in one file

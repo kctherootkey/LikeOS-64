@@ -1,0 +1,340 @@
+// LikeOS Explorer: the file operation (copy/move/delete progress) window.
+//
+// The window colour behind white cards, one per operation: a badge for the
+// kind of operation, a line saying what goes where (the folder names as
+// links) with the status under it, Pause and Cancel as round icon buttons,
+// a slim progress bar in the accent, and with more details the speed
+// sparkline and three small facts.  A hairline above the footer's "Fewer
+// details" / "More details".  The question dialogs (replace or skip, folder
+// merge, the error dialogs) are message boxes on white with an icon badge.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+// This window's colours, from the design tokens.
+$ops-link: $color-link;
+$ops-instruction: $color-text;  // the main question of a dialog
+$ops-hairline: $color-stroke;
+$ops-hover: $color-hover;
+$ops-pressed: $color-pressed;
+$ops-bar: $color-accent;
+$ops-bar-paused: $color-caution;
+$ops-bar-trough: $color-stroke;
+$ops-choice-hover: $color-item-hover;
+$ops-choice-hover-border: $color-selection;
+$ops-choice-pressed: $color-selection;
+$ops-choice-pressed-border: $color-selection-hover;
+$ops-badge: $color-selection;
+
+// The speed sparkline's colours (read by the program by name): the white
+// card with its hairline, the accent line and the accent its wash fades
+// from, faint rules.
+@define-color lx_graph_bg #{$color-card};
+@define-color lx_graph_line #{$color-accent};
+@define-color lx_graph_fill #{$color-accent};
+@define-color lx_graph_grid #{$color-separator};
+@define-color lx_graph_border #{$color-stroke};
+
+// A flat round-cornered button that tints under the pointer.
+@mixin ops-flat-button {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  border-radius: $radius-control;
+  background: none;
+  box-shadow: none;
+  -gtk-outline-radius: $radius-control;
+  &:hover { background-color: $ops-hover; }
+  &:active { background-color: $ops-pressed; }
+}
+
+window.ex-ops-window {
+  &, &:backdrop { background-color: $color-window; color: $color-text; }
+
+  // ---- the operations -------------------------------------------------------
+
+  list.ex-op-list {
+    padding: $space-m $space-m $space-xs $space-m;
+    background-color: $color-window;
+
+    > row {
+      padding: 0;
+      margin-bottom: $space-s;
+      background: none;
+      border: none;
+      box-shadow: none;
+      &:hover, &:focus, &:selected { background: none; box-shadow: none; }
+    }
+  }
+
+  .ex-op-item {
+    padding: $space-m $space-m $space-m $space-m;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-card;
+    background-color: $color-card;
+    font-size: $type-body;
+
+    label { color: $color-text; }
+    label.ex-op-header { font-weight: $weight-strong; }
+    label.ex-op-header link { color: $ops-link; }
+    label.ex-op-status { color: $color-text-secondary; }
+
+    // The kind of operation: its glyph in the accent on a pale tile.
+    .ex-op-badge {
+      margin-right: $space-m;
+      border-radius: $radius-tile;
+      background-color: $ops-badge;
+      image { color: $color-accent-fill; -gtk-icon-style: symbolic; }
+    }
+
+    .ex-op-top { margin-bottom: $space-s + 2px; }
+
+    button.ex-op-action {
+      @include ops-flat-button;
+      min-width: 28px;
+      min-height: 28px;
+      margin-left: $space-xs;
+      border-radius: 9999px;
+      color: $color-text-secondary;
+      image { -gtk-icon-style: symbolic; }
+      &:hover { color: $color-text; }
+    }
+    button.ex-op-action.ex-op-cancel:hover { background-color: transparentize($color-critical, 0.88); color: $color-critical; }
+
+    // (Its margins are set by the program: a drawing area has no CSS box.)
+    speedgraph.ex-op-graph { color: $color-text-secondary; font-size: $type-caption + 0.5pt; }
+
+    .ex-op-details {
+      margin-top: $space-s + 2px;
+      label { min-height: 14px; }
+      label.ex-op-caption {
+        color: $color-text-secondary;
+        font-size: $type-caption;
+        font-weight: $weight-strong;
+      }
+      label.ex-op-value { font-size: $type-body; }
+    }
+
+    progressbar.ex-op-bar {
+      // A slim accent bar on a pale track, radius 3.
+      &.horizontal trough, trough {
+        min-height: 6px;
+        border: none;
+        border-radius: 3px;
+        background-color: $ops-bar-trough;
+        background-image: none;
+      }
+      progress {
+        min-height: 6px;
+        border: none;
+        border-radius: 3px;
+        background-color: $ops-bar;
+        background-image: none;
+      }
+      &.paused progress { background-color: $ops-bar-paused; }
+    }
+
+    // A finished operation: its line and how it ended.
+    &.finished {
+      label.ex-op-status { color: $color-text-secondary; }
+      .ex-op-top { margin-bottom: 0; }
+      .ex-op-badge { background-color: $color-control-pressed; image { color: $color-text-secondary; } }
+    }
+    expander.ex-op-errors {
+      margin-top: $space-s;
+      title { color: $ops-link; }
+      label { color: $color-critical; }
+    }
+  }
+
+  label.ex-op-empty {
+    padding: 32px 24px;
+    color: $color-text-secondary;
+  }
+
+  // ---- the footer -------------------------------------------------------------
+
+  .ex-op-footer {
+    min-height: 42px;
+    padding: 0 $space-m 0 $space-m;
+    border-top: 1px solid $ops-hairline;
+    background-color: $color-window;
+
+    button {
+      @include ops-flat-button;
+      min-height: 30px;
+      margin: 6px 0 6px 0;
+      padding: 0 $space-s;
+      color: $color-text;
+      font-size: $type-body;
+    }
+    button.ex-op-more label { margin-left: 6px; }
+    button.ex-op-clear { color: $ops-link; }
+    image.ex-op-chevron { -gtk-icon-style: symbolic; color: $color-text-secondary; }
+  }
+}
+
+// ---- the questions: a name taken, folder merge, failures ----------------------
+
+// A LikeOS message box: the badge and the question on white, the answers in
+// a footer band on the window colour behind a hairline.
+dialog.ex-ask {
+  &, &.background, &:backdrop { background-color: $color-card; color: $color-text; }
+  .dialog-action-box { margin: 0; padding: 0; border: none; background: none; }
+  .dialog-vbox { padding: 0; }
+
+  .ex-ask-body {
+    padding: $space-xl $space-xl $space-l $space-l + 4px;
+    background-color: $color-card;
+    font-size: $type-body;
+  }
+
+  // The badge: the glyph in the accent on a pale rounded tile, amber
+  // for a failure.
+  .ex-ask-badge {
+    margin-right: $space-l;
+    border-radius: $radius-card + 2px;
+    background-color: $ops-badge;
+    image { color: $color-accent-fill; -gtk-icon-style: symbolic; }
+    &.warning {
+      background-color: transparentize($color-caution, 0.86);
+      image { color: darken($color-caution, 6%); }
+    }
+  }
+
+  label.ex-ask-instruction {
+    margin: 2px 0 2px 0;
+    font-size: $type-subtitle;
+    font-weight: $weight-strong;
+    color: $ops-instruction;
+  }
+  label.ex-op-header.ex-ask-context { color: $color-text-secondary; margin-bottom: $space-m; }
+  label.ex-op-header link { color: $ops-link; }
+  label.ex-ask-text { margin-bottom: $space-m; color: $color-text; }
+
+  // The two sides of a conflict: cards on a hairline, a small caps-like
+  // heading over each.
+  .ex-ask-sides { margin-bottom: $space-xs; }
+  .ex-ask-side {
+    padding: $space-s + 2px $space-m;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-card;
+    background-color: $color-window;
+    label.ex-ask-side-title {
+      color: $color-text-secondary;
+      font-size: $type-caption;
+      font-weight: $weight-strong;
+    }
+  }
+
+  // The item a message is about: its icon, name and what went wrong.
+  .ex-ask-item {
+    margin: $space-xs 0 $space-xs 0;
+    label.ex-ask-item-name { font-weight: $weight-strong; }
+    label.ex-ask-item-detail { color: $color-text-secondary; }
+  }
+  .ex-ask-side .ex-ask-item { margin: 0; }
+
+  // The footer band: apply-to-all at the left, the answers at the right.
+  .ex-ask-footer {
+    padding: $space-m $space-xl $space-m $space-l + 4px;
+    border-top: 1px solid $ops-hairline;
+    background-color: $color-window;
+
+    button { min-width: 84px; }
+    button.ex-ask-more {
+      @include ops-flat-button;
+      min-width: 0;
+      min-height: 28px;
+      padding: 0 $space-s;
+      color: $ops-link;
+      image { -gtk-icon-style: symbolic; color: $ops-link; }
+    }
+    checkbutton.ex-ask-all { color: $color-text; }
+  }
+  label.ex-ask-more-text {
+    padding: 0 $space-xl $space-m 76px;
+    background-color: $color-card;
+    color: $color-text-secondary;
+  }
+}
+
+// ---- Properties and Explorer settings -------------------------------------------
+
+// The header on white -- the picture large, the name in a field, the type
+// under it -- then on the window colour a General / Access switch and the
+// facts in labelled rows on white cards, the buttons in a footer band.
+dialog.ex-properties {
+  &, &.background, &:backdrop { background-color: $color-window; color: $color-text; }
+  .dialog-vbox { padding: 0; }
+
+  .ex-props-header {
+    padding: $space-l + 4px $space-xl $space-l $space-xl;
+    border-bottom: 1px solid $color-stroke;
+    background-color: $color-card;
+  }
+  entry.ex-props-name {
+    min-height: 32px;
+    font-size: $type-subtitle;
+    font-weight: $weight-strong;
+  }
+  label.ex-props-title { font-size: $type-subtitle; font-weight: $weight-strong; }
+  .ex-dim { color: $color-text-secondary; }
+
+  lx-segmented.ex-props-switch {
+    margin: $space-m + 2px $space-xl 0 $space-xl;
+    padding: 2px;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-control + 2px;
+    background-color: $color-control-pressed;
+
+    button {
+      min-height: 24px;
+      padding: 0 $space-l;
+      margin: 0;
+      border: 1px solid transparent;
+      border-radius: $radius-control;
+      background-image: none;
+      background-color: transparent;
+      box-shadow: none;
+      color: $color-text-secondary;
+
+      &:hover { color: $color-text; }
+      &:checked { border-color: $color-stroke; background-color: $color-card; color: $color-text; }
+    }
+  }
+
+  .ex-props-page { padding: $space-m + 2px $space-xl $space-l $space-xl; }
+
+  .ex-props-card {
+    padding: $space-m + 2px $space-l;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-card;
+    background-color: $color-card;
+  }
+  label.ex-props-key { min-width: 92px; }
+  button.ex-props-choose { min-height: 26px; padding: 0 $space-m; }
+
+  // Explorer settings: groups of switch rows, each group a card under a
+  // small heading.
+  label.ex-settings-heading {
+    margin: $space-l 2px $space-s 2px;
+    color: $color-text-secondary;
+    font-size: $type-caption + 0.5pt;
+    font-weight: $weight-strong;
+  }
+  .ex-props-page > label.ex-settings-heading:first-child { margin-top: 0; }
+  .ex-settings-card { padding: 0 $space-l; }
+  .ex-settings-row { padding: $space-s + 2px 0; }
+  label.ex-settings-detail { font-size: $type-caption + 0.5pt; }
+  separator.ex-settings-separator { min-height: 1px; background-color: $color-separator; }
+
+  .dialog-action-box {
+    margin: 0;
+    padding: $space-m $space-xl;
+    border-top: 1px solid $color-stroke;
+    background-color: $color-window;
+  }
+  .dialog-action-area { margin: 0; }
+  .dialog-action-area button { min-width: 84px; }
+}

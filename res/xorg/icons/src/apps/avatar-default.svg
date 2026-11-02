@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: avatar-default, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="3" x2="0" y2="61"><stop offset="0" stop-color="#a9bde6"/><stop offset="1" stop-color="#6380c0"/></linearGradient><clipPath id="c3"><path d="M3 32A29 29 0 1 0 61 32A29 29 0 1 0 3 32Z"/></clipPath></defs>
+<g transform="scale(1)">
+<path d="M3 32A29 29 0 1 0 61 32A29 29 0 1 0 3 32Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M3 32A29 29 0 1 0 61 32A29 29 0 1 0 3 32Z" fill="url(#g2)"/>
+<g clip-path="url(#c3)">
+<path d="M22 25A10 10 0 1 0 42 25A10 10 0 1 0 22 25Z" fill="#ffffff"/>
+<path d="M12 59A20 15 0 1 0 52 59A20 15 0 1 0 12 59Z" fill="#ffffff"/>
+</g>
+</g>
+</svg>

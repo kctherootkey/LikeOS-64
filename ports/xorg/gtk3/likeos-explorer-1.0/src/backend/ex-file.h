@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: one item in a listing.
+// LikeOS Explorer: one item in a listing.
 //
 // An ExFile is a GFile together with what was last learned about it (a
 // GFileInfo), and what the item allows -- its capabilities -- worked out from

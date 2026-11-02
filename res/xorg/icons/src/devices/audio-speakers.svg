@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: audio-speakers, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r3" gradientUnits="userSpaceOnUse" cx="32" cy="15.4" r="6.8"><stop offset="0" stop-color="#c9d0dc"/><stop offset="1" stop-color="#6b7486"/></radialGradient><radialGradient id="r4" gradientUnits="userSpaceOnUse" cx="32" cy="16.76" r="3.06"><stop offset="0" stop-color="#3a4357"/><stop offset="1" stop-color="#1b2130"/></radialGradient><radialGradient id="r5" gradientUnits="userSpaceOnUse" cx="32" cy="37" r="13.2"><stop offset="0" stop-color="#c9d0dc"/><stop offset="1" stop-color="#6b7486"/></radialGradient><radialGradient id="r6" gradientUnits="userSpaceOnUse" cx="32" cy="39.64" r="5.94"><stop offset="0" stop-color="#3a4357"/><stop offset="1" stop-color="#1b2130"/></radialGradient></defs>
+<g transform="scale(1)">
+<path d="M18 4H46A6 6 0 0 1 52 10V54A6 6 0 0 1 46 60H18A6 6 0 0 1 12 54V10A6 6 0 0 1 18 4Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M18 4H46A6 6 0 0 1 52 10V54A6 6 0 0 1 46 60H18A6 6 0 0 1 12 54V10A6 6 0 0 1 18 4Z" fill="url(#g2)"/>
+<path d="M18 4H46A6 6 0 0 1 52 10V54A6 6 0 0 1 46 60H18A6 6 0 0 1 12 54V10A6 6 0 0 1 18 4Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M25.2 17.44A6.8 6.8 0 1 0 38.8 17.44A6.8 6.8 0 1 0 25.2 17.44Z" fill="url(#r3)"/>
+<path d="M28.94 17.44A3.06 3.06 0 1 0 35.06 17.44A3.06 3.06 0 1 0 28.94 17.44Z" fill="url(#r4)"/>
+<path d="M30.98 17.44A1.02 1.02 0 1 0 33.02 17.44A1.02 1.02 0 1 0 30.98 17.44Z" fill="#8d97a8"/>
+<path d="M18.8 40.96A13.2 13.2 0 1 0 45.2 40.96A13.2 13.2 0 1 0 18.8 40.96Z" fill="url(#r5)"/>
+<path d="M26.06 40.96A5.94 5.94 0 1 0 37.94 40.96A5.94 5.94 0 1 0 26.06 40.96Z" fill="url(#r6)"/>
+<path d="M30.02 40.96A1.98 1.98 0 1 0 33.98 40.96A1.98 1.98 0 1 0 30.02 40.96Z" fill="#8d97a8"/>
+</g>
+</svg>

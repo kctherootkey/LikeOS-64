@@ -1,130 +1,153 @@
-// LikeOS -- Media Player: the look.
+// LikeOS -- LikeOS Media Player: the look.
 //
-// The desktop theme (LikeOS, Windows 11's light palette on Adwaita's widget
-// structure) supplies everything general.  This sheet only adds what a
-// player has and a dialog does not: round transport buttons with the big
-// accent-filled play button in the middle, a thin seek bar, the black video
-// stage, the cover-art page and a dark control bar in fullscreen.  Every
-// rule is scoped to a class of ours, so nothing leaks into the file chooser
-// or the dialogs.
+// The look lives in the LikeOS desktop theme (res/xorg/gtk3/theme, partial
+// _mediaplayer.scss): the light sidebar with its group headers, the pages
+// with their tile cards and plain lists, and the dark rounded transport
+// strip.  Under any other theme this sheet stands in for it: the same
+// structure -- spacing, sizes, the round play button, the dark strips -- in
+// that theme's own colours, so the program stays usable and recognisable.
+// Every rule is scoped to a class of ours.
 //
 // Copyright (C) 2026 The LikeOS Project
 
+#include <string.h>
+
 #include "mediaplayer.h"
 
-static const char css[] =
-	/* The stage: black under video, the window's Mica grey under art. */
-	".mp-stage { background-color: #000000; }\n"
-	".mp-art { background-color: #f3f3f3; }\n"
-	".mp-art-title { font-size: 18pt; font-weight: 600; color: #1b1b1b; }\n"
-	".mp-art-sub { font-size: 11pt; color: #616161; }\n"
-	".mp-art-status { font-size: 9pt; color: #616161; }\n"
+static const char fallback_css[] =
+	".mp-content { border-left: 1px solid @borders; }\n"
+	".mp-nav { padding: 8px; }\n"
+	"list.mp-nav-list { background: transparent; }\n"
+	"list.mp-nav-list row.mp-nav-item { min-height: 32px;"
+	"  padding: 0 8px 0 12px; border-radius: 6px; }\n"
+	"list.mp-nav-list row.mp-nav-header { min-height: 28px;"
+	"  margin-top: 12px; padding: 0 2px 0 12px; }\n"
+	".mp-nav-header-label { font-size: 7.5pt; font-weight: bold;"
+	"  opacity: 0.7; }\n"
+	".mp-nav-count { font-size: 7.5pt; opacity: 0.7; }\n"
+	".mp-page { padding: 24px 0 0 32px; }\n"
+	".mp-page-body { padding: 0 32px 24px 0; }\n"
+	".mp-page-header { margin: 0 32px 16px 0; }\n"
+	".mp-view-bar { margin: 0 32px 12px 0; }\n"
+	".mp-list-scroller { margin: 0 24px 12px 0; }\n"
+	".mp-grid-scroller flowbox.mp-grid { margin: 0 24px 24px -4px; }\n"
+	".mp-page-title { font-size: 17pt; font-weight: bold; }\n"
+	".mp-section-title { font-size: 12pt; font-weight: bold;"
+	"  margin: 24px 0 8px 0; }\n"
+	".mp-hint, .mp-page-subtitle, .mp-tile-sub, .mp-coll-sub,"
+	" .mp-coll-kind, .mp-time, .mp-now-artist, .mp-art-sub,"
+	" .mp-art-status, .mp-setting-desc, .mp-empty-text { opacity: 0.7; }\n"
+	"button.mp-segment:checked { font-weight: bold; }\n"
+	"treeview.mp-list, treeview.mp-list:selected { background: transparent;"
+	"  color: @theme_text_color; }\n"
+	"treeview.mp-list.mp-row-hover { background-color:"
+	"  alpha(@theme_fg_color, 0.07); border-radius: 6px; }\n"
+	"treeview.mp-list.mp-row-selected { background-color:"
+	"  alpha(@theme_selected_bg_color, 0.25); border-radius: 6px; }\n"
+	"treeview.mp-list.mp-cell-secondary { color:"
+	"  alpha(@theme_text_color, 0.7); }\n"
+	"treeview.mp-list.mp-cell-current { color: @theme_selected_bg_color; }\n"
+	"treeview.mp-list.mp-cell-failed { color: @insensitive_fg_color; }\n"
+	"flowboxchild.mp-tile { padding: 6px 6px 10px 6px; margin: 2px;"
+	"  border-radius: 8px; border: 1px solid @borders; }\n"
+	"flowboxchild.mp-tile.mp-tile-round { border-color: transparent; }\n"
+	".mp-tile-title { margin-top: 8px; font-weight: bold; }\n"
+	".mp-tile-art { background-image: linear-gradient(160deg,"
+	"  shade(@theme_selected_bg_color, 1.3), @theme_selected_bg_color);"
+	"  border-radius: 6px; color: white; }\n"
+	".mp-tile-art.mp-tile-art-wide { background-image: none;"
+	"  background-color: #1f2636; }\n"
+	".mp-tile-art.mp-tile-art-round { border-radius: 9999px; }\n"
+	".mp-tile-art.mp-tile-play { background-image: none;"
+	"  background-color: @theme_selected_bg_color; border-radius: 9999px;"
+	"  border: 2px solid white; color: @theme_selected_fg_color; }\n"
+	".mp-empty-title, .mp-coll-title, .mp-art-title { font-size: 18pt;"
+	"  font-weight: bold; }\n"
+	".mp-setting-card { border: 1px solid @borders; border-radius: 8px; }\n"
+	".mp-setting-card > .mp-setting-row + .mp-setting-row,"
+	" .mp-setting-card > .mp-setting-group + .mp-setting-row,"
+	" .mp-setting-card > .mp-setting-group + .mp-setting-group,"
+	" .mp-setting-card > .mp-setting-row + .mp-setting-group"
+	" { border-top: 1px solid @borders; }\n"
+	".mp-setting-row { padding: 0 16px; min-height: 56px; }\n"
+	".mp-setting-list > .mp-setting-subrow { padding: 0 16px 0 52px;"
+	"  min-height: 40px; border-top: 1px solid @borders; }\n"
+	".mp-now-wash { background-color: @theme_base_color; }\n"
+	".mp-now-wash.mp-wash-over-cover { background-color:"
+	"  alpha(@theme_base_color, 0.7); }\n"
+	".mp-art { padding: 16px 24px 24px 24px; }\n"
+	".mp-video { background-color: black; }\n"
+	".mp-bar, .mp-top-bar { margin: 8px; border-radius: 14px;"
+	"  background-color: #161c2a; color: #eef2fa; }\n"
+	".mp-bar { padding: 8px 14px 8px 8px; }\n"
+	".mp-top-bar { margin-bottom: 0; padding: 4px 12px 4px 4px; }\n"
+	".mp-now-title, .mp-top-title { font-weight: bold; color: #eef2fa; }\n"
+	".mp-time, .mp-now-artist { color: #a4adbf; }\n"
+	"button.mp-bar-button, button.mp-now-button { min-width: 34px;"
+	"  min-height: 34px; padding: 0; color: #eef2fa; background: none;"
+	"  border-color: transparent; box-shadow: none; }\n"
+	"button.mp-bar-button { border-radius: 9999px; }\n"
+	"button.mp-bar-button:hover, button.mp-now-button:hover {"
+	"  background-color: rgba(255,255,255,0.07); }\n"
+	"button.mp-bar-button:checked { color: #5b8ff9; }\n"
+	"button.mp-play { min-width: 40px; min-height: 40px; padding: 0;"
+	"  margin: 0 8px; border-radius: 9999px; background-image: none;"
+	"  border: none; background-color: #3f74f2; color: white; }\n"
+	"scale.mp-seek highlight, scale.mp-volume highlight {"
+	"  background-color: #5b8ff9; }\n"
+	".mp-immersive, .mp-fullscreen { background-color: black; }\n"
+	".mp-immersive .mp-content { background-color: black; border: none; }\n"
+	".mp-immersive .mp-now-wash { background-color: #101010; }\n"
+	".mp-immersive .mp-art-title { color: white; }\n"
+	".mp-info-key { opacity: 0.7; }\n"
+	".mp-shortcut-key { font-family: monospace; font-weight: bold;"
+	"  padding: 1px 6px; border: 1px solid @borders; border-radius: 6px; }\n";
 
-	/* The control bar: a raised layer above the stage. */
-	".mp-controls {\n"
-	"  background-color: #fbfbfb;\n"
-	"  border-top: 1px solid #e5e5e5;\n"
-	"  padding: 6px 14px 10px 14px;\n"
-	"}\n"
-	".mp-time { color: #616161;\n"
-	"  font-size: 8pt; min-width: 48px; }\n"
-	".mp-now-title { font-weight: 600; }\n"
-	".mp-now-artist { color: #616161; font-size: 8pt; }\n"
+static GtkCssProvider *fallback;
 
-	/* Round, flat transport buttons that only show a fill when pointed
-	 * at -- Windows 11's "subtle" button. */
-	"button.mp-round {\n"
-	"  border-radius: 9999px;\n"
-	"  min-width: 32px; min-height: 32px;\n"
-	"  padding: 0;\n"
-	"  border: none;\n"
-	"  background-image: none;\n"
-	"  background-color: transparent;\n"
-	"  box-shadow: none;\n"
-	"  color: #1b1b1b;\n"
-	"}\n"
-	"button.mp-round:hover { background-color: rgba(0,0,0,0.0373); }\n"
-	"button.mp-round:active { background-color: rgba(0,0,0,0.0241);\n"
-	"  color: #5d5d5d; }\n"
-	"button.mp-round:checked { background-color: rgba(0,95,184,0.10);\n"
-	"  color: #005fb8; }\n"
-	"button.mp-round:checked:hover {\n"
-	"  background-color: rgba(0,95,184,0.16); }\n"
-	"button.mp-round:disabled { color: #a0a0a0; }\n"
+/* The fallback is wanted exactly while the theme is not LikeOS; the theme
+ * can change while the program runs. */
+static void theme_changed(GtkSettings *s, GParamSpec *ps, gpointer data)
+{
+	(void)ps;
+	(void)data;
+	gchar *name = NULL;
+	g_object_get(s, "gtk-theme-name", &name, NULL);
+	const char *env = g_getenv("GTK_THEME");
+	gboolean ours = (env != NULL && *env)
+				? g_str_has_prefix(env, "LikeOS")
+				: name != NULL && strcmp(name, "LikeOS") == 0;
+	GdkScreen *scr = gdk_screen_get_default();
 
-	/* The play button: the accent circle. */
-	"button.mp-play {\n"
-	"  border-radius: 9999px;\n"
-	"  min-width: 44px; min-height: 44px;\n"
-	"  padding: 0;\n"
-	"  border: none;\n"
-	"  background-image: none;\n"
-	"  background-color: #005fb8;\n"
-	"  color: #ffffff;\n"
-	"  box-shadow: 0 1px 2px rgba(0,0,0,0.18);\n"
-	"}\n"
-	"button.mp-play:hover { background-color: #1a6ebd; }\n"
-	"button.mp-play:active { background-color: #337fc6; }\n"
-	"button.mp-play:disabled { background-color: #c5c5c5; }\n"
-
-	/* A thin seek bar whose knob only matters when grabbed. */
-	"scale.mp-seek trough { min-height: 4px; border-radius: 2px; }\n"
-	"scale.mp-seek highlight { border-radius: 2px;\n"
-	"  background-color: #005fb8; }\n"
-	"scale.mp-seek slider { min-width: 14px; min-height: 14px; }\n"
-	"scale.mp-volume { min-width: 96px; }\n"
-	"scale.mp-volume highlight { background-color: #005fb8; }\n"
-
-	/* The play queue panel. */
-	".mp-queue { background-color: #ffffff;\n"
-	"  border-left: 1px solid #e5e5e5; }\n"
-	".mp-queue-header { padding: 8px 10px 6px 12px; }\n"
-	".mp-queue-title { font-size: 11pt; font-weight: 600; }\n"
-	".mp-queue-count { color: #616161; font-size: 8pt; }\n"
-	".mp-queue-tools { padding: 4px 8px; border-top: 1px solid #e5e5e5; }\n"
-	".mp-queue treeview.view { padding: 3px 4px; }\n"
-	".mp-queue-hint { color: #616161; }\n"
-
-	/* Fullscreen: the control bar turns dark so it does not glare over
-	 * a film. */
-	".mp-fullscreen .mp-controls {\n"
-	"  background-color: #202020;\n"
-	"  border-top-color: #2b2b2b;\n"
-	"  color: #ffffff;\n"
-	"}\n"
-	".mp-fullscreen .mp-time, .mp-fullscreen .mp-now-artist {\n"
-	"  color: #c5c5c5; }\n"
-	".mp-fullscreen button.mp-round { color: #ffffff; }\n"
-	".mp-fullscreen button.mp-round:hover {\n"
-	"  background-color: rgba(255,255,255,0.08); }\n"
-	".mp-fullscreen button.mp-round:checked { color: #60cdff;\n"
-	"  background-color: rgba(96,205,255,0.12); }\n"
-	".mp-fullscreen button.mp-play { background-color: #60cdff;\n"
-	"  color: #000000; }\n"
-	".mp-fullscreen .mp-art { background-color: #000000; }\n"
-	".mp-fullscreen .mp-art-title { color: #ffffff; }\n"
-	".mp-fullscreen .mp-art-sub, .mp-fullscreen .mp-art-status {\n"
-	"  color: #c5c5c5; }\n"
-
-	/* Information dialog: the keys quieter than the values. */
-	".mp-info-key { color: #616161; }\n"
-	".mp-shortcut-key { font-family: monospace; font-weight: 600;\n"
-	"  padding: 1px 6px; border: 1px solid #d0d0d0; border-radius: 4px;\n"
-	"  background-color: #fbfbfb; }\n";
+	if (!ours && fallback == NULL) {
+		fallback = gtk_css_provider_new();
+		GError *err = NULL;
+		if (!gtk_css_provider_load_from_data(fallback, fallback_css, -1,
+						     &err)) {
+			/* The program works without it; it just looks
+			 * plainer. */
+			g_warning("style sheet: %s", err->message);
+			g_clear_error(&err);
+		}
+		gtk_style_context_add_provider_for_screen(
+			scr, GTK_STYLE_PROVIDER(fallback),
+			GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+	} else if (ours && fallback != NULL) {
+		gtk_style_context_remove_provider_for_screen(
+			scr, GTK_STYLE_PROVIDER(fallback));
+		g_clear_object(&fallback);
+	}
+	g_free(name);
+}
 
 void mp_style_install(void)
 {
-	GtkCssProvider *p = gtk_css_provider_new();
-	GError *err = NULL;
-	if (!gtk_css_provider_load_from_data(p, css, -1, &err)) {
-		/* The program works without it; it just looks plainer. */
-		g_warning("style sheet: %s", err->message);
-		g_clear_error(&err);
-	}
-	gtk_style_context_add_provider_for_screen(
-		gdk_screen_get_default(), GTK_STYLE_PROVIDER(p),
-		GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-	g_object_unref(p);
+	GtkSettings *s = gtk_settings_get_default();
+	if (s == NULL)
+		return;
+	g_signal_connect(s, "notify::gtk-theme-name", G_CALLBACK(theme_changed),
+			 NULL);
+	theme_changed(s, NULL, NULL);
 }
 
 void mp_style_set_fullscreen(MpApp *app, gboolean on)

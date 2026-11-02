@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: input-keyboard, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="18.667" x2="0" y2="48"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M8 18.667H56A5.333 5.333 0 0 1 61.333 24V42.667A5.333 5.333 0 0 1 56 48H8A5.333 5.333 0 0 1 2.667 42.667V24A5.333 5.333 0 0 1 8 18.667Z" fill="url(#g1)"/>
+<path d="M8 24H10.667V26.667H8Z" fill="#c9d0dc"/>
+<path d="M13.333 24H16V26.667H13.333Z" fill="#c9d0dc"/>
+<path d="M18.667 24H18.667V26.667H18.667Z" fill="#c9d0dc"/>
+<path d="M21.333 24H24V26.667H21.333Z" fill="#c9d0dc"/>
+<path d="M26.667 24H29.333V26.667H26.667Z" fill="#c9d0dc"/>
+<path d="M32 24H34.667V26.667H32Z" fill="#c9d0dc"/>
+<path d="M37.333 24H40V26.667H37.333Z" fill="#c9d0dc"/>
+<path d="M42.667 24H42.667V26.667H42.667Z" fill="#c9d0dc"/>
+<path d="M45.333 24H48V26.667H45.333Z" fill="#c9d0dc"/>
+<path d="M50.667 24H53.333V26.667H50.667Z" fill="#c9d0dc"/>
+<path d="M10.667 29.333H13.333V29.333H10.667Z" fill="#c9d0dc"/>
+<path d="M16 29.333H16V29.333H16Z" fill="#c9d0dc"/>
+<path d="M21.333 29.333H21.333V29.333H21.333Z" fill="#c9d0dc"/>
+<path d="M24 29.333H26.667V29.333H24Z" fill="#c9d0dc"/>
+<path d="M29.333 29.333H32V29.333H29.333Z" fill="#c9d0dc"/>
+<path d="M34.667 29.333H37.333V29.333H34.667Z" fill="#c9d0dc"/>
+<path d="M40 29.333H40V29.333H40Z" fill="#c9d0dc"/>
+<path d="M42.667 29.333H45.333V29.333H42.667Z" fill="#c9d0dc"/>
+<path d="M48 29.333H50.667V29.333H48Z" fill="#c9d0dc"/>
+<path d="M8 32H10.667V34.667H8Z" fill="#c9d0dc"/>
+<path d="M13.333 32H16V34.667H13.333Z" fill="#c9d0dc"/>
+<path d="M18.667 32H18.667V34.667H18.667Z" fill="#c9d0dc"/>
+<path d="M21.333 32H24V34.667H21.333Z" fill="#c9d0dc"/>
+<path d="M26.667 32H29.333V34.667H26.667Z" fill="#c9d0dc"/>
+<path d="M32 32H34.667V34.667H32Z" fill="#c9d0dc"/>
+<path d="M37.333 32H40V34.667H37.333Z" fill="#c9d0dc"/>
+<path d="M42.667 32H42.667V34.667H42.667Z" fill="#c9d0dc"/>
+<path d="M45.333 32H48V34.667H45.333Z" fill="#c9d0dc"/>
+<path d="M50.667 32H53.333V34.667H50.667Z" fill="#c9d0dc"/>
+<path d="M21.333 37.333H42.667V40H21.333Z" fill="#c9d0dc"/>
+</g>
+</svg>

@@ -1,9 +1,14 @@
-// LikeOS -- File Explorer: a window.
+// LikeOS Explorer: a window.
 //
 // A window is a row of tabs, each an ExTab, and the actions every part of
-// it uses: the command bar's buttons, the context menus and the keyboard
-// shortcuts all trigger the same "win.*" actions, whose enabled state the
-// window keeps in step with the current tab's location and selection.
+// it uses.  The tabs sit in the window's own title row, next to New tab
+// and the minimise, maximise and close buttons: the window
+// asks the window manager for a border only, and its empty title row moves
+// the window, maximises it on a double click and offers the window menu on
+// a right click.  The command bar's buttons, the context menus and the
+// keyboard shortcuts all trigger the same "win.*" actions, whose enabled
+// state the window keeps in step with the current tab's location and
+// selection.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -15,6 +20,11 @@
 #include "backend/ex-fileops.h"
 
 G_BEGIN_DECLS
+
+/* The program's name, in window titles, dialogs and the about text, and a
+ * window's title: "Documents – LikeOS Explorer". */
+#define EX_APP_NAME "LikeOS Explorer"
+#define EX_WINDOW_TITLE_FMT "%s – " EX_APP_NAME
 
 typedef struct _ExTab ExTab;
 

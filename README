@@ -81,9 +81,9 @@ At a glance
   Sound             own drivers for Intel HD Audio (with HDMI and DisplayPort
                     audio), the Intel audio DSP with SoundWire, AC'97 and the
                     Ensoniq AudioPCI; the audiod service mixes every program
-  Desktop           X.Org server 21.1 (modesetting + glamor), ctwm with a
-                    Windows 11-style look, the LikeOS taskbar with a volume
-                    control, PCManFM desktop, GTK 3.24, a media player
+  Desktop           X.Org server 21.1 (modesetting + glamor), ctwm with the
+                    LikeOS desktop look, the LikeOS panel and launcher,
+                    LikeOS Explorer, PCManFM desktop, GTK 3.24, a media player
   Web browser       luakit 2.4.0 on WebKitGTK 2.52.6
   Shell             bash 5.2 as /bin/sh
 
@@ -423,18 +423,20 @@ Session:
 - A D-Bus session bus is started with the session.
 - A start-up sound when the desktop comes up, and a sound when you leave it.
 
-Windows 11-style look:
+The LikeOS desktop look:
 
-- ctwm window manager with LikeOS additions: flat, 30-pixel "Fluent" title
-  bars with the application icon, wide minimise/maximise/close buttons (close
-  in red), anti-aliased Xft title fonts, click-to-focus and raise-on-click.
-- taskbar, a LikeOS GTK panel along the bottom: start button with a menu built
-  from the installed .desktop files, a button per window with focus highlight
-  and running indicators, a four-workspace switcher, a load and memory
-  monitor, a volume control and a clock -- driven purely through the EWMH and
-  ICCCM standards.
-- A LikeOS GTK 3 theme compiled from SCSS, Windows-style message dialogs, and
-  the LikeOS cursor theme generated at build time.
+- ctwm window manager with LikeOS additions: flat title bars with the
+  application icon, rounded window corners, inset minimise/maximise/close
+  buttons, anti-aliased Xft title fonts, edge snapping, click-to-focus and
+  raise-on-click.
+- The LikeOS panel along the bottom: the start orb and its launcher with
+  favourites, all applications, recent files and search, a button per
+  application with running indicators, workspaces, a control center with
+  volume and network, a load and memory monitor and a clock -- driven purely
+  through the EWMH and ICCCM standards.
+- A LikeOS GTK 3 theme compiled from SCSS, the LikeOS icon theme (original
+  artwork), compact message dialogs, and the LikeOS cursor theme generated at
+  build time.
 - Fonts: Selawik as the interface font, plus Noto Sans, DejaVu, Liberation and
   the X core fonts.
 - PCManFM draws the wallpaper and desktop icons; new accounts receive

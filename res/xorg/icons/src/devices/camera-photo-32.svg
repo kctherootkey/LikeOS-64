@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: camera-photo, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="54"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="21.32" x2="0" y2="48.68"><stop offset="0" stop-color="#e3e8ef"/><stop offset="1" stop-color="#8d97a8"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="18.32" y1="48.68" x2="45.68" y2="21.32"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 8H28A2 2 0 0 1 30 10V16A2 2 0 0 1 28 18H16A2 2 0 0 1 14 16V10A2 2 0 0 1 16 8Z" fill="#3a4357"/>
+<path d="M10 16H54A6 6 0 0 1 60 22V48A6 6 0 0 1 54 54H10A6 6 0 0 1 4 48V22A6 6 0 0 1 10 16Z" fill="url(#g1)"/>
+<path d="M18.32 35A13.68 13.68 0 1 0 45.68 35A13.68 13.68 0 1 0 18.32 35Z" fill="url(#g2)"/>
+<path d="M21.33 35A10.67 10.67 0 1 0 42.67 35A10.67 10.67 0 1 0 21.33 35Z" fill="#161c2a"/>
+<path d="M24.066 35A7.934 7.934 0 1 0 39.934 35A7.934 7.934 0 1 0 24.066 35Z" fill="url(#g3)"/>
+<path d="M26.802 31.99A2.189 2.189 0 1 0 31.179 31.99A2.189 2.189 0 1 0 26.802 31.99Z" fill="#ffffff" opacity="0.85"/>
+<path d="M48 22H52V25H48Z" fill="#ffd166"/>
+</g>
+</svg>

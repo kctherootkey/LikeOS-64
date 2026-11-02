@@ -2,9 +2,9 @@ Show the root of the local file system as the computer in the path bar.
 
 The first segment of a file dialog's location is the file system root, and
 GTK gives it the icon of the volume it is on -- drive-harddisk-symbolic, a
-square with a hole in it that reads as nothing in particular.  Windows
-begins every address with "This PC" and its monitor icon; the local root is
-shown that way here (computer-symbolic).  Other roots -- a mounted volume, a
+square with a hole in it that reads as nothing in particular.  The local
+root is the whole computer to the user, so it is shown with the computer
+icon (computer-symbolic).  Other roots -- a mounted volume, a
 network share -- keep their volume's icon.
 
 Copyright (C) 2026 The LikeOS Project
@@ -16,7 +16,7 @@ Copyright (C) 2026 The LikeOS Project
  	}
  
 +      /* The root of the local file system is shown as the computer, the
-+       * way Windows begins every address with "This PC", rather than as
++       * whole computer the user sees at the start of a path, rather than as
 +       * the icon of the disk it happens to live on.  Other roots (a
 +       * mounted volume, a network share) keep their volume's icon. */
 +      if (g_file_has_uri_scheme (path_bar->priv->root_file, "file"))

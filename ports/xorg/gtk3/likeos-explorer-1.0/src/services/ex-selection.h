@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: what is selected.
+// LikeOS Explorer: what is selected.
 //
 // Every view of a tab reports into one selection, so the command bar, the
 // context menu, the status bar and the panes all describe the same items,

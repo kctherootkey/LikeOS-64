@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: application-x-cd-image, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="38" y1="18" x2="46.4" y2="9.6"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="36" x2="0" y2="54"><stop offset="0" stop-color="#626e81"/><stop offset="1" stop-color="#475367"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="23" y1="14" x2="41" y2="32"><stop offset="0" stop-color="#e9eef6"/><stop offset="0.3" stop-color="#dbe6fb"/><stop offset="0.45" stop-color="#f6ecf7"/><stop offset="0.6" stop-color="#e2f5ee"/><stop offset="0.78" stop-color="#eef1f6"/><stop offset="1" stop-color="#c7cfdc"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H38L52 18V56A4 4 0 0 1 48 60H16A4 4 0 0 1 12 56V8A4 4 0 0 1 16 4Z" fill="#b9c1ce"/>
+<path d="M16 6H37.2L50 18.8V56A2 2 0 0 1 48 58H16A2 2 0 0 1 14 56V8A2 2 0 0 1 16 6Z" fill="url(#g1)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#b9c1ce"/>
+<path d="M40 8.8V14Q40 16 42 16H47.2Z" fill="url(#g2)"/>
+<path d="M17 36H47A3 3 0 0 1 50 39V51A3 3 0 0 1 47 54H17A3 3 0 0 1 14 51V39A3 3 0 0 1 17 36Z" fill="url(#g3)"/>
+<path d="M20 40h2v2h-2ZM22 40h2v2h-2ZM24 40h2v2h-2ZM22 42h2v2h-2ZM22 44h2v2h-2ZM22 46h2v2h-2ZM20 48h2v2h-2ZM22 48h2v2h-2ZM24 48h2v2h-2Z" fill="#ffffff" opacity="1"/>
+<path d="M30 40h2v2h-2ZM32 40h2v2h-2ZM28 42h2v2h-2ZM30 44h2v2h-2ZM32 46h2v2h-2ZM28 48h2v2h-2ZM30 48h2v2h-2Z" fill="#ffffff" opacity="1"/>
+<path d="M38 40h2v2h-2ZM36 42h2v2h-2ZM40 42h2v2h-2ZM36 44h2v2h-2ZM40 44h2v2h-2ZM36 46h2v2h-2ZM40 46h2v2h-2ZM38 48h2v2h-2Z" fill="#ffffff" opacity="1"/>
+<path d="M23 23A9 9 0 1 0 41 23A9 9 0 1 0 23 23ZM30.56 23A1.44 1.44 0 1 0 33.44 23A1.44 1.44 0 1 0 30.56 23Z" fill="url(#g4)" fill-rule="evenodd"/>
+<path d="M24 23A8 8 0 1 0 40 23A8 8 0 1 0 24 23Z" fill="none" stroke="#9aa4b5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M28.58 23A3.42 3.42 0 1 0 35.42 23A3.42 3.42 0 1 0 28.58 23ZM30.56 23A1.44 1.44 0 1 0 33.44 23A1.44 1.44 0 1 0 30.56 23Z" fill="#ffffff" opacity="0.7" fill-rule="evenodd"/>
+<path d="M28.58 23A3.42 3.42 0 1 0 35.42 23A3.42 3.42 0 1 0 28.58 23Z" fill="none" stroke="#aab3c2" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M29.56 23A2.44 2.44 0 1 0 34.44 23A2.44 2.44 0 1 0 29.56 23Z" fill="none" stroke="#8d97a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M27.127 16.306A8.28 8.28 0 0 1 30.933 14.789L31.478 18.984A4.05 4.05 0 0 0 29.617 19.726Z" fill="#ffffff" opacity="0.55"/>
+<path d="M36.883 29.687A8.28 8.28 0 0 1 33.08 31.209L32.528 27.015A4.05 4.05 0 0 0 34.389 26.271Z" fill="#ffffff" opacity="0.55"/>
+</g>
+</svg>

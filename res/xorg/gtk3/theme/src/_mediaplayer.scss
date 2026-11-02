@@ -1,0 +1,583 @@
+// LikeOS Media Player (mediaplayer).
+//
+// The arrangement: a light sidebar on the window colour at the left (the
+// search box and the places under small group headers), the pages on the
+// content colour beside it, and the transport as a dark strip of the shell
+// palette, rounded and inset from the window's edges, along the bottom.
+// Pages are a title row (title and status at the left, commands at the
+// right), a segmented switch where a page has several views, tile cards
+// with cover art and plain lists with rounded selected rows.  On the "now
+// playing" stage -- a video, full screen, the mini player -- the window
+// turns black and the strips above and below the picture are dark too.
+//
+// The program draws some things itself and takes their colours from here
+// through style classes: the list rows (treeview.mp-list with .mp-row-*),
+// the text colour of list cells (.mp-cell-*), the placeholder of a tile
+// without a picture (.mp-tile-art), the round play button on a hovered tile
+// (.mp-tile-play) and the wash over the blurred cover (.mp-now-wash).  Its
+// line glyphs (.mp-glyph) are drawn in the CSS colour of where they sit.
+//
+// Everything is scoped to the window's .mp-window class.  When another theme
+// is in use, the program loads a small style sheet of its own instead.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+// The dark strips, in the shell palette.  Opaque: over a video they border
+// a window of its own, and without a compositor nothing shows through.
+$mp-strip: $shell-bg;
+$mp-strip-text: $shell-text;
+$mp-strip-secondary: $shell-text-secondary;
+$mp-strip-hover: $shell-hover;
+$mp-strip-pressed: $shell-active;
+$mp-strip-accent: $shell-accent;
+$mp-strip-radius: $radius-flyout;
+$mp-strip-inset: $space-s;
+
+// A subtle button: nothing at rest, a fill under the pointer.
+@mixin mp-subtle($hover: $color-hover, $pressed: $color-pressed) {
+  background-color: transparent;
+  background-image: none;
+  border-color: transparent;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  &:hover { background-color: $hover; background-image: none; border-color: transparent; box-shadow: none; }
+  &:active, &:checked:active { background-color: $pressed; background-image: none; border-color: transparent; box-shadow: none; }
+  &:disabled { background-color: transparent; background-image: none; border-color: transparent; box-shadow: none; }
+}
+
+// The buttons of a dark strip.
+@mixin mp-strip-button {
+  @include mp-subtle($mp-strip-hover, $mp-strip-pressed);
+  color: $mp-strip-text;
+  &:disabled { color: $shell-text-disabled; }
+  &:checked, &:checked:hover {
+    color: $mp-strip-accent;
+    background-color: transparent;
+    background-image: none;
+    border-color: transparent;
+    box-shadow: none;
+  }
+  &:checked:hover { background-color: $mp-strip-hover; }
+  // A menu button is "checked" while its menu is open: no accent then.
+  &.popup:checked, &.toggle.popup:checked, &.popup:checked:hover { color: $mp-strip-text; background-color: $mp-strip-pressed; background-image: none; }
+}
+
+// The slider of the strip: a light hairline track, the played part in the
+// accent, a small light knob that grows under the pointer.
+@mixin mp-strip-scale {
+  padding: 6px 0;
+  trough {
+    min-height: 4px;
+    border-radius: 2px;
+    background-color: transparentize($shell-text, 0.8);
+  }
+  highlight {
+    border-radius: 2px;
+    background-image: image($mp-strip-accent);
+    background-color: $mp-strip-accent;
+  }
+  slider {
+    min-width: 12px;
+    min-height: 12px;
+    margin: -5px;
+    border: none;
+    background-color: $shell-text;
+    box-shadow: none;
+  }
+  &:hover slider, slider:hover, slider:active { min-width: 14px; min-height: 14px; margin: -6px; background-color: white; border: none; box-shadow: none; }
+  &:disabled trough { background-color: transparentize($shell-text, 0.88); }
+  &:disabled highlight { background-image: none; background-color: transparent; }
+  &:disabled slider { background-color: transparent; }
+}
+
+window.mp-window {
+  background-color: $color-window;
+
+  // ---- the sidebar ---------------------------------------------------------
+
+  .mp-nav {
+    background-color: $color-window;
+    padding: $space-s $space-s $space-s $space-s;
+  }
+
+  .mp-nav-top { margin-bottom: $space-xs; }
+
+  entry.mp-nav-search { min-height: $height-control; }
+
+  button.mp-nav-button {
+    @include mp-subtle;
+    min-width: $height-control;
+    min-height: $height-control;
+    padding: 0;
+    border-radius: $radius-control;
+    color: $color-text-secondary;
+    &:hover { color: $color-text; }
+  }
+
+  scrolledwindow, viewport { background-color: transparent; }
+
+  list.mp-nav-list {
+    background-color: transparent;
+    padding: 0;
+
+    row {
+      background-color: transparent;
+      background-image: none;
+      border-radius: $radius-row;
+      margin: 1px 0;
+      padding: 0;
+      outline-offset: -2px;
+      -gtk-outline-radius: $radius-row;
+      color: $color-text;
+    }
+
+    row.mp-nav-item {
+      min-height: $height-row;
+      padding: 0 $space-s 0 $space-m;
+      .mp-nav-glyph { color: $color-text-secondary; }
+
+      &:hover { background-color: $color-item-hover; }
+      &:active { background-color: $color-pressed; }
+      &:selected, &:selected:focus, &:selected:backdrop {
+        background-color: $color-selection;
+        color: $color-text;
+        .mp-nav-glyph { color: $color-accent-fill; }
+        .mp-nav-label { font-weight: $weight-strong; }
+      }
+      &:selected:hover { background-color: $color-selection-hover; }
+    }
+
+    // A group's header: small capitals in the secondary text colour.
+    row.mp-nav-header, row.mp-nav-header:hover {
+      min-height: 28px;
+      margin-top: $space-m;
+      padding: 0 $space-xxs 0 $space-m;
+      background-color: transparent;
+    }
+    row.mp-nav-header:first-child { margin-top: $space-xs; }
+    .mp-nav-header-label {
+      font-size: $type-caption;
+      font-weight: $weight-strong;
+      letter-spacing: 1px;
+      color: $color-text-secondary;
+    }
+    row.mp-nav-header separator { background-color: $color-stroke; min-height: 1px; margin: 0 $space-xs; }
+
+    .mp-nav-label { font-size: $type-body; }
+    .mp-nav-count {
+      font-size: $type-caption;
+      color: $color-text-secondary;
+      padding: 1px 7px;
+      border-radius: 9999px;
+      background-color: $color-control-pressed;
+    }
+    row.mp-nav-item:selected .mp-nav-count { background-color: $color-card; color: $color-accent-fill; }
+  }
+
+  button.mp-nav-header-button {
+    @include mp-subtle;
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0;
+    border-radius: $radius-control;
+    color: $color-text-secondary;
+    &:hover { color: $color-accent-fill; }
+  }
+
+  list.mp-nav-list.mp-nav-foot {
+    border-top: 1px solid $color-stroke;
+    padding-top: $space-xs;
+  }
+
+  .mp-nav.mp-nav-compact {
+    padding: $space-s $space-xs;
+    list.mp-nav-list row.mp-nav-item { padding: 0 0 0 $space-m; }
+    list.mp-nav-list row.mp-nav-header, list.mp-nav-list row.mp-nav-header:first-child { min-height: 9px; margin-top: $space-xs; padding: 0; }
+    .mp-nav-top { margin-bottom: 0; }
+  }
+
+  // ---- the content -------------------------------------------------------
+
+  .mp-content {
+    background-color: $color-card;
+    border-left: 1px solid $color-stroke;
+    border-bottom: 1px solid $color-stroke;
+    border-bottom-left-radius: 0;
+  }
+
+  .mp-page { padding: $space-xl 0 0 $space-xxl; }
+
+  // The page's own scrolling parts reach the window's edge, so the scroll
+  // bars sit there; their content keeps the page's margin on the right.
+  .mp-page-body { padding: 0 $space-xxl $space-xl 0; }
+  .mp-list-scroller { margin: 0 $space-xl $space-m 0; }
+  .mp-grid-scroller flowbox.mp-grid { margin: 0 $space-xl $space-xl -4px; }
+
+  .mp-page-header { margin: 0 $space-xxl $space-l 0; min-height: 44px; }
+  .mp-page-title {
+    font-size: 17pt;
+    font-weight: $weight-strong;
+    color: $color-text;
+  }
+  .mp-page-subtitle { font-size: $type-body; color: $color-text-secondary; }
+
+  .mp-section-title {
+    font-size: $type-subtitle;
+    font-weight: $weight-strong;
+    margin: $space-xl 0 $space-s 0;
+    color: $color-text;
+  }
+  .mp-page-body > .mp-section-title:first-child,
+  .mp-page-body > box:first-child .mp-section-title { margin-top: $space-xs; }
+
+  .mp-hint { color: $color-text-secondary; }
+
+  button.mp-link-button {
+    @include mp-subtle;
+    color: $color-link;
+    padding: 2px 8px;
+    min-height: 0;
+    margin-bottom: 6px;
+    &:hover { color: $color-accent-hover; }
+  }
+
+  button.mp-subtle-button {
+    @include mp-subtle;
+    min-height: $height-control;
+    padding: 0 10px;
+    border-radius: $radius-control;
+    color: $color-text;
+  }
+
+  button.mp-text-button { min-height: $height-control; padding: 0 14px; }
+  button.mp-text-button .mp-glyph { color: inherit; }
+
+  // The view bar under the title: the segmented switch and the sort order.
+  .mp-view-bar { margin: 0 $space-xxl $space-m 0; }
+
+  // The segmented switch: a recessed track, the chosen segment a raised
+  // white key in it.
+  .mp-segmented {
+    padding: 3px;
+    border-radius: $radius-control + 2px;
+    background-color: $color-control-pressed;
+    border: 1px solid $color-stroke;
+  }
+  button.mp-segment {
+    @include mp-subtle(transparentize($color-card, 0.4), transparentize($color-card, 0.2));
+    min-height: 26px;
+    min-width: 72px;
+    padding: 0 $space-m;
+    border-radius: $radius-control;
+    color: $color-text-secondary;
+    font-weight: normal;
+
+    &:hover { color: $color-text; }
+    &:checked, &:checked:hover {
+      color: $color-text;
+      font-weight: $weight-strong;
+      background-color: $color-card;
+      background-image: none;
+      border: 1px solid $color-stroke;
+      border-bottom-color: $color-stroke-edge;
+      box-shadow: none;
+    }
+  }
+
+  // ---- lists ---------------------------------------------------------------
+
+  treeview.mp-list {
+    background-color: transparent;
+    color: $color-text;
+    border: none;
+    outline-color: transparent;
+    -GtkTreeView-horizontal-separator: 0;
+    -GtkTreeView-vertical-separator: 2;
+
+    &:selected, &:selected:focus, &:hover, &:selected:hover {
+      background-color: transparent;
+      color: $color-text;
+    }
+
+    // The column titles: small capitals over a hairline.
+    header button, header button:hover, header button:active {
+      min-height: 0;
+      padding: 2px 12px 6px 12px;
+      background-color: transparent;
+      background-image: none;
+      border: none;
+      border-bottom: 1px solid $color-stroke;
+      border-radius: 0;
+      box-shadow: none;
+      font-size: $type-caption;
+      font-weight: $weight-strong;
+      letter-spacing: 1px;
+      color: $color-text-secondary;
+    }
+    header button label { font-weight: $weight-strong; }
+
+    // Row fills, painted by the program under the text.
+    &.mp-row-hover {
+      background-color: $color-item-hover;
+      border-radius: $radius-row;
+    }
+    &.mp-row-selected {
+      background-color: $color-selection;
+      border-radius: $radius-row;
+    }
+    &.mp-row-current { border-radius: $radius-row; }
+    &.mp-row-current:not(.mp-row-selected):not(.mp-row-hover) {
+      background-color: transparentize($color-selection, 0.5);
+    }
+
+    // Text colours of the cells.
+    &.mp-cell { color: $color-text; }
+    &.mp-cell-secondary { color: $color-text-secondary; }
+    &.mp-cell-current { color: $color-accent-fill; }
+    &.mp-cell-failed { color: $color-text-disabled; }
+  }
+
+  // ---- tile cards ------------------------------------------------------------
+
+  flowbox.mp-grid { padding: 0; }
+
+  flowboxchild.mp-tile {
+    padding: 6px 6px 10px 6px;
+    margin: 2px;
+    border-radius: $radius-tile;
+    background-color: $color-card;
+    border: 1px solid $color-stroke;
+    outline-offset: -2px;
+    -gtk-outline-radius: $radius-tile;
+
+    // Under the pointer the card lifts: a deeper rim, darker below.
+    &:hover {
+      border-color: $color-stroke-edge;
+      border-bottom-color: $color-stroke-strong;
+      background-color: $color-card;
+    }
+    &:active { background-color: $color-control-pressed; }
+    &:selected, &:selected:focus {
+      background-color: $color-selection;
+      border-color: transparentize($color-accent, 0.5);
+    }
+  }
+  // An artist is a round portrait on no card.
+  flowboxchild.mp-tile.mp-tile-round {
+    border-color: transparent;
+    background-color: transparent;
+    &:hover { background-color: $color-item-hover; border-color: transparent; }
+  }
+
+  .mp-tile-title {
+    margin: 8px 2px 0 2px;
+    font-weight: $weight-strong;
+    color: $color-text;
+  }
+  .mp-tile-sub { color: $color-text-secondary; font-size: $type-body; margin: 1px 2px 0 2px; }
+
+  // The picture of a tile that has none: a pale blue with the glyph in the
+  // accent; a video without a still is a dark frame; an artist without a
+  // picture a pale disc with the initial.
+  .mp-tile-art {
+    background-image: linear-gradient(160deg, mix(white, $color-selection, 30%), $color-selection-hover);
+    border-radius: $radius-control;
+    color: $color-accent-fill;
+  }
+  .mp-tile-art.mp-tile-art-wide {
+    background-image: linear-gradient(160deg, $shell-raised, $shell-bg);
+    color: $shell-text-secondary;
+  }
+  .mp-tile-art.mp-tile-art-round {
+    background-image: linear-gradient(160deg, $color-selection, $color-selection-hover);
+    border-radius: 9999px;
+    color: $color-accent-fill;
+  }
+  // The round play button in the middle of a hovered tile.
+  .mp-tile-art.mp-tile-play {
+    background-image: none;
+    background-color: $shell-accent-fill;
+    border-radius: 9999px;
+    border: 2px solid white;
+    color: white;
+  }
+
+  // ---- empty pages -----------------------------------------------------------
+
+  .mp-empty { margin-bottom: 64px; }
+  .mp-empty-glyph { color: $color-accent-fill; margin-bottom: 4px; }
+  .mp-empty-title { font-size: $type-title; font-weight: $weight-strong; }
+  .mp-empty-text { color: $color-text-secondary; }
+
+  // ---- an album or an artist -----------------------------------------------
+
+  .mp-coll-header { margin: 0 $space-xxl $space-xl -8px; }
+  button.mp-back-button {
+    @include mp-subtle;
+    min-width: 36px;
+    min-height: $height-control;
+    padding: 0;
+    border-radius: $radius-control;
+    color: $color-text;
+  }
+  .mp-coll-kind {
+    color: $color-text-secondary;
+    font-size: $type-caption;
+    font-weight: $weight-strong;
+    letter-spacing: 1px;
+  }
+  .mp-coll-title { font-size: 20pt; font-weight: $weight-strong; }
+  .mp-coll-sub { color: $color-text-secondary; font-size: $type-body; }
+  .mp-coll-header .mp-page-actions { margin: $space-m 0 0 0; }
+
+  // ---- settings ------------------------------------------------------------
+
+  .mp-settings .mp-section-title {
+    font-size: $type-caption;
+    letter-spacing: 1px;
+    color: $color-text-secondary;
+    margin: $space-l 0 $space-s $space-xs;
+  }
+  .mp-settings > .mp-section-title:first-child { margin-top: $space-xs; }
+  // One card per section; its rows divided by hairlines.
+  .mp-setting-card {
+    background-color: $color-card;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-card;
+  }
+  .mp-setting-card > .mp-setting-row + .mp-setting-row,
+  .mp-setting-card > .mp-setting-group + .mp-setting-row,
+  .mp-setting-card > .mp-setting-group + .mp-setting-group,
+  .mp-setting-card > .mp-setting-row + .mp-setting-group {
+    border-top: 1px solid $color-stroke;
+  }
+  .mp-setting-row { padding: 0 $space-l; min-height: 56px; }
+  .mp-setting-row .mp-glyph { color: $color-text-secondary; }
+  .mp-setting-title { font-size: $type-body; color: $color-text; }
+  .mp-setting-desc { font-size: $type-body * 0.95; color: $color-text-secondary; }
+  .mp-setting-list > .mp-setting-subrow {
+    padding: 0 $space-l 0 52px;
+    min-height: 40px;
+    background-color: mix($color-window, $color-card, 50%);
+    border-top: 1px solid mix($color-stroke, $color-card, 50%);
+  }
+  .mp-setting-list > label.mp-setting-subrow { padding-top: 12px; padding-bottom: 12px; }
+  .mp-setting-subrow .mp-setting-title { font-size: $type-body; }
+
+  // ---- the stage -------------------------------------------------------------
+
+  .mp-stage { background-color: $color-card; }
+  .mp-video { background-color: black; }
+  .mp-now-wash { background-color: $color-card; }
+  .mp-now-wash.mp-wash-over-cover { background-color: transparentize($color-card, 0.3); }
+  .mp-art { padding: $space-l $space-xl $space-xl $space-xl; }
+  .mp-art button.mp-back-button { margin: 0 0 0 -8px; }
+  .mp-art-title { font-size: 19pt; font-weight: $weight-strong; color: $color-text; }
+  .mp-art-sub { font-size: $type-body-large; color: $color-text-secondary; }
+  .mp-art-status { font-size: $type-body; color: $color-text-secondary; }
+
+  // ---- the transport strip -----------------------------------------------------
+
+  .mp-bar {
+    margin: $mp-strip-inset;
+    padding: 8px 14px 8px 8px;
+    border-radius: $mp-strip-radius;
+    background-color: $mp-strip;
+    color: $mp-strip-text;
+  }
+  .mp-transport { margin-bottom: 0; }
+  .mp-seek-row { margin: 0 0 -2px 0; }
+  .mp-time { font-size: $type-caption; color: $mp-strip-secondary; }
+
+  button.mp-now-button {
+    @include mp-strip-button;
+    padding: 4px 10px 4px 4px;
+    border-radius: $radius-tile + 2px;
+  }
+  .mp-now-title { font-size: $type-body; font-weight: $weight-strong; color: $mp-strip-text; }
+  .mp-now-artist { font-size: $type-body * 0.95; color: $mp-strip-secondary; }
+
+  button.mp-bar-button {
+    @include mp-strip-button;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
+    border-radius: 9999px;
+  }
+
+  // The play button: an accent disc in the middle of the strip.
+  button.mp-play {
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    margin: 0 8px;
+    border-radius: 9999px;
+    border: none;
+    background-image: none;
+    background-color: $shell-accent-fill;
+    box-shadow: none;
+    color: white;
+
+    &:hover { background-color: mix(white, $shell-accent-fill, 12%); background-image: none; }
+    &:active { background-color: mix(black, $shell-accent-fill, 12%); background-image: none; color: transparentize(white, 0.2); }
+    &:disabled { background-color: $shell-raised; background-image: none; color: $shell-text-disabled; }
+  }
+
+  scale.mp-seek { @include mp-strip-scale; }
+  scale.mp-volume { @include mp-strip-scale; margin: 0 6px 0 0; }
+
+  separator.mp-bar-separator {
+    min-width: 1px;
+    margin: 10px 8px;
+    background-color: $shell-border;
+  }
+
+  // The title strip above a video: the same dark rounded strip.
+  .mp-top-bar {
+    margin: $mp-strip-inset $mp-strip-inset 0 $mp-strip-inset;
+    padding: 4px 12px 4px 4px;
+    border-radius: $mp-strip-radius;
+    background-color: $mp-strip;
+    color: $mp-strip-text;
+    button.mp-bar-button { @include mp-strip-button; }
+  }
+  .mp-top-title { color: $mp-strip-text; font-size: $type-body-large; font-weight: $weight-strong; }
+
+  // ---- immersive: video, full screen, mini player ------------------------------
+
+  &.mp-immersive, &.mp-fullscreen {
+    background-color: black;
+
+    .mp-content { border: none; background-color: black; }
+    .mp-stage { background-color: black; }
+    .mp-now-wash { background-color: mix(black, $shell-bg, 40%); }
+    .mp-now-wash.mp-wash-over-cover { background-color: rgba(0, 0, 0, 0.55); }
+    .mp-art-title { color: $mp-strip-text; }
+    .mp-art-sub, .mp-art-status { color: $mp-strip-secondary; }
+    .mp-bar { border: 1px solid $shell-border; }
+    .mp-top-bar { border: 1px solid $shell-border; }
+  }
+
+  // The mini player: the strip lies on the blurred cover.
+  &.mp-bar-floating {
+    .mp-content { border: none; }
+    .mp-art { padding-bottom: 96px; }
+  }
+
+  &.mp-mini {
+    .mp-bar { padding: 6px 8px; margin: 6px; }
+    .mp-art { padding: 10px; }
+  }
+}
+
+// The media information and shortcut dialogs.
+.mp-info-key { color: $color-text-secondary; }
+.mp-shortcut-key {
+  font-family: monospace;
+  font-weight: $weight-strong;
+  padding: 1px 6px;
+  border: 1px solid $color-stroke-edge;
+  border-radius: $radius-control;
+  background-color: $color-control;
+}

@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: turning files, folders and playlists into
+// LikeOS -- LikeOS Media Player: turning files, folders and playlists into
 // queue entries, off the GTK thread.
 //
 // Copyright (C) 2026 The LikeOS Project

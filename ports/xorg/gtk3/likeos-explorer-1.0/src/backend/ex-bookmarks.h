@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: bookmarks.
+// LikeOS Explorer: bookmarks.
 //
 // The GTK bookmarks file (~/.config/gtk-3.0/bookmarks): one "URI [label]"
 // per line, the list the GTK file chooser and the PCManFM desktop show as

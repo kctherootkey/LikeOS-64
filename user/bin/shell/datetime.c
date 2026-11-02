@@ -1,13 +1,13 @@
 // LikeOS -- datetime, the standalone clock.
 //
-// Two lines, right-aligned, in the arrangement the Windows 11 taskbar uses:
+// Two lines, centred: the time over the date, in the shell's colours.
 //
-//         13:37
-//    19.08.2026
+//      13:37
+//    Wed 19 Aug
 //
 // The drawing is in panel.c, shared with the taskbar's tray clock -- which
-// draws the one-line form of the same thing, because that is what fits beside
-// the workspace buttons.
+// draws the one-line form of the same thing, "Wed 19 Aug  13:37", because
+// that is what fits in the panel's tray.
 //
 // Since taskbar(1) took over the desktop bar this is no longer started by
 // xinitrc.  It is kept because the stacked form is the nicer one when it has a
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
 
 	g_timeout_add_seconds(1, on_tick, area);
 
-	gtk_widget_set_size_request(area, 88, PANEL_HEIGHT);
+	gtk_widget_set_size_request(area, 96, PANEL_HEIGHT);
 	/* Shown before the geometry is parsed: GTK sizes it from the window's
 	 * visible children and warns when there are none. */
 	gtk_widget_show(area);

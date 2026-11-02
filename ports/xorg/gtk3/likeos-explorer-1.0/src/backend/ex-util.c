@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: small helpers the whole backend shares.
+// LikeOS Explorer: small helpers the whole backend shares.
 //
 // Copyright (C) 2026 The LikeOS Project
 

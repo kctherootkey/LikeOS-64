@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: utilities-terminal, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="5.333" y1="5.333" x2="35.2" y2="58.667"><stop offset="0" stop-color="#3a4459"/><stop offset="1" stop-color="#141a26"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M17.333 5.333H46.667A12 12 0 0 1 58.667 17.333V46.667A12 12 0 0 1 46.667 58.667H17.333A12 12 0 0 1 5.333 46.667V17.333A12 12 0 0 1 17.333 5.333Z" fill="url(#g1)"/>
+<path d="M16 21.333L26.667 32L16 42.667" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 42.667H48" fill="none" stroke="#5b8ff9" stroke-width="4" stroke-linecap="butt" stroke-linejoin="round"/>
+</g>
+</svg>

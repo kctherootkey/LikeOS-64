@@ -711,7 +711,7 @@ fi
 #
 # What stays is every PNG size, 8 through 512.  8 to 48 are the sizes
 # GtkIconSize maps to (MENU and BUTTON 16, LARGE_TOOLBAR 24, DND 32, DIALOG
-# 48); the larger ones are what File Explorer's Large icons and Tiles, its
+# 48); the larger ones are what the file manager's large icons and tiles, its
 # panes and Home, and the media player's cover placeholder draw at.  Without
 # them GTK answered a 128-pixel request by scaling a 48-pixel image up, and
 # every large icon was blurred and blocky.  64 and 96 carry the symbolic
@@ -736,6 +736,25 @@ if [ -d "$SYSROOT/usr/share/icons/Adwaita" ]; then
 	done
 	staged=$((staged + 1))
 fi
+# The LikeOS icon theme settings.ini names: the LikeOS folders, drives, file
+# types, application icons and command glyphs, rasterized to PNG on the build
+# host by res/xorg/icons/gen-icons.py and committed (there is no SVG loader
+# here to draw them at run time).  Anything it does not define falls through
+# to Adwaita and then hicolor, which its index.theme inherits.  The licence
+# of the line icons (LICENSE.fluentui-system-icons) is in the directory and
+# is copied with it.
+#
+# The directory is shared with the LikeOS X cursor theme the top-level
+# Makefile generates into icons/LikeOS/cursors before this script runs.
+# Copying the contents rather than replacing the directory keeps those
+# cursors; this index.theme overwrites the cursor generator's, and serves
+# both, since libXcursor reads only its Inherits line.  The aliases are
+# relative symbolic links within each size directory, which cp -a keeps.
+if [ -f "$root/res/xorg/icons/LikeOS/index.theme" ]; then
+	mkdir -p "$DEST/usr/share/icons/LikeOS"
+	cp -a "$root"/res/xorg/icons/LikeOS/. "$DEST/usr/share/icons/LikeOS/"
+	staged=$((staged + 1))
+fi
 
 # ---------------------------------------------------------------------------
 # Themes and other shared data a GTK program looks for by absolute path.
@@ -758,6 +777,22 @@ fi
 if [ -d "$SYSROOT/usr/share/mime" ]; then
 	mkdir -p "$DEST/usr/share"
 	cp -a "$SYSROOT/usr/share/mime" "$DEST/usr/share/"
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# The time zone database (the tzdata package).
+#
+# GLib's local time comes from these files alone: it looks up the zone that $TZ
+# or /etc/timezone names in /usr/share/zoneinfo, and without the file every
+# clock and date drawn through GLib -- the panel clock, the file manager's
+# dates, GTK's file chooser -- is UTC.  libc and ICU carry their own rules and
+# do not need it.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/share/zoneinfo" ]; then
+	mkdir -p "$DEST/usr/share"
+	rm -rf "$DEST/usr/share/zoneinfo"
+	cp -a "$SYSROOT/usr/share/zoneinfo" "$DEST/usr/share/"
 	staged=$((staged + 1))
 fi
 
@@ -849,7 +884,7 @@ if [ -f "$renames" ] && [ -d "$DEST/usr/share/applications" ]; then
 	staged=$((staged + 1))
 fi
 
-# How the mail program takes attachments, for File Explorer's Share (the
+# How the mail program takes attachments, for LikeOS Explorer's Share (the
 # X-LikeOS-Attach key; %F stands for the files).  Added to the package's own
 # entry, in its [Desktop Entry] group, rather than replacing the entry --
 # for the reason renames gives.  Explorer reads the key from whichever

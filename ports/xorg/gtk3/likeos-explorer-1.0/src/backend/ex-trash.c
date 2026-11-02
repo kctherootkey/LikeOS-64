@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the Trash.
+// LikeOS Explorer: the Trash.
 //
 // Copyright (C) 2026 The LikeOS Project
 

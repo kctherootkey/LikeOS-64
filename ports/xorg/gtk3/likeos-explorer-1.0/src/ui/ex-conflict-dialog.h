@@ -1,12 +1,16 @@
-// LikeOS -- File Explorer: questions an operation asks.
+// LikeOS Explorer: questions an operation asks.
 //
-// "Replace or skip files": the destination already has an item of that
-// name -- replace it, skip this one, keep both, or for two folders merge
-// them, with the two items' sizes and dates side by side and "do this for
-// every conflict".  And the failure dialog: what went wrong, with Retry,
-// Skip, Cancel and, when trashing is not possible in that place, Delete
-// permanently.  Both answer the operation through ex_conflict_resolve() /
-// ex_issue_resolve() and do not block the window.
+// LikeOS message boxes: an icon badge beside the question in a larger
+// type, what the operation is doing under it, the details, and a footer
+// band holding "apply to all" at the left and the answers at the right,
+// the default one in the accent.
+//
+// A name taken at the destination: the item coming in and the one already
+// there side by side, each with its size and date, and Replace, Skip or
+// Keep both -- for two folders Merge or Skip.  A failure: what went wrong,
+// with Try again, Skip, Cancel and, when the Trash cannot take an item
+// there, Delete permanently.  Both answer the operation through
+// ex_conflict_resolve() / ex_issue_resolve() and do not block the window.
 //
 // Copyright (C) 2026 The LikeOS Project
 

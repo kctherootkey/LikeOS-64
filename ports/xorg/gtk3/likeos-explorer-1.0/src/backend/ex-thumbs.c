@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: thumbnails.
+// LikeOS Explorer: thumbnails.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -163,7 +163,7 @@ static void store(GdkPixbuf *pb, const char *path, const char *uri,
 	g_mkdir_with_parents(dir, 0700);
 	if (gdk_pixbuf_save(pb, tmp, "png", NULL, "tEXt::Thumb::URI", uri,
 			    "tEXt::Thumb::MTime", mt, "tEXt::Thumb::Size", sz,
-			    "tEXt::Software", "LikeOS File Explorer", NULL)) {
+			    "tEXt::Software", "LikeOS Explorer", NULL)) {
 		g_chmod(tmp, 0600);
 		if (g_rename(tmp, path) != 0)
 			g_unlink(tmp);

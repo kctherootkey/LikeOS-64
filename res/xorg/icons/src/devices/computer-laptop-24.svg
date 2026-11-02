@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: computer-laptop, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="10.667" x2="0" y2="42.667"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="13.333" y1="40" x2="50.667" y2="13.333"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="42.667" x2="0" y2="48"><stop offset="0" stop-color="#e9edf3"/><stop offset="1" stop-color="#aab3c2"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M14.667 10.667H49.333A4 4 0 0 1 53.333 14.667V38.667A4 4 0 0 1 49.333 42.667H14.667A4 4 0 0 1 10.667 38.667V14.667A4 4 0 0 1 14.667 10.667Z" fill="url(#g1)"/>
+<path d="M14.667 13.333H49.333A1.333 1.333 0 0 1 50.667 14.667V38.667A1.333 1.333 0 0 1 49.333 40H14.667A1.333 1.333 0 0 1 13.333 38.667V14.667A1.333 1.333 0 0 1 14.667 13.333Z" fill="url(#g2)"/>
+<path d="M10.667 42.667H53.333L61.333 45.333Q61.333 48 58.667 48H5.333Q2.667 48 2.667 45.333Z" fill="url(#g3)"/>
+</g>
+</svg>

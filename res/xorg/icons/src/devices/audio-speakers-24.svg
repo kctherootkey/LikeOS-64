@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: audio-speakers, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="5.333" x2="0" y2="58.667"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r2" gradientUnits="userSpaceOnUse" cx="32" cy="15.957" r="7.253"><stop offset="0" stop-color="#c9d0dc"/><stop offset="1" stop-color="#6b7486"/></radialGradient><radialGradient id="r3" gradientUnits="userSpaceOnUse" cx="32" cy="17.408" r="3.264"><stop offset="0" stop-color="#3a4357"/><stop offset="1" stop-color="#1b2130"/></radialGradient><radialGradient id="r4" gradientUnits="userSpaceOnUse" cx="32" cy="36.309" r="14.08"><stop offset="0" stop-color="#c9d0dc"/><stop offset="1" stop-color="#6b7486"/></radialGradient><radialGradient id="r5" gradientUnits="userSpaceOnUse" cx="32" cy="39.125" r="6.336"><stop offset="0" stop-color="#3a4357"/><stop offset="1" stop-color="#1b2130"/></radialGradient></defs>
+<g transform="scale(0.375)">
+<path d="M16 5.333H48A5.333 5.333 0 0 1 53.333 10.667V53.333A5.333 5.333 0 0 1 48 58.667H16A5.333 5.333 0 0 1 10.667 53.333V10.667A5.333 5.333 0 0 1 16 5.333Z" fill="url(#g1)"/>
+<path d="M24.747 18.133A7.253 7.253 0 1 0 39.253 18.133A7.253 7.253 0 1 0 24.747 18.133Z" fill="url(#r2)"/>
+<path d="M28.736 18.133A3.264 3.264 0 1 0 35.264 18.133A3.264 3.264 0 1 0 28.736 18.133Z" fill="url(#r3)"/>
+<path d="M30.912 18.133A1.088 1.088 0 1 0 33.088 18.133A1.088 1.088 0 1 0 30.912 18.133Z" fill="#8d97a8"/>
+<path d="M17.92 40.533A14.08 14.08 0 1 0 46.08 40.533A14.08 14.08 0 1 0 17.92 40.533Z" fill="url(#r4)"/>
+<path d="M25.664 40.533A6.336 6.336 0 1 0 38.336 40.533A6.336 6.336 0 1 0 25.664 40.533Z" fill="url(#r5)"/>
+<path d="M29.888 40.533A2.112 2.112 0 1 0 34.112 40.533A2.112 2.112 0 1 0 29.888 40.533Z" fill="#8d97a8"/>
+</g>
+</svg>

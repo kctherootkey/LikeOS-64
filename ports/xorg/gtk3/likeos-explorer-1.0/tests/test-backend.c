@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: backend test program.
+// LikeOS Explorer: backend test program.
 //
 // Exercises the file-management backend without a display: locations,
 // folder reading, monitoring, every kind of operation with its conflicts and
@@ -16,6 +16,8 @@
 #include "backend/ex-dir-loader.h"
 #include "backend/ex-file.h"
 #include "backend/ex-fileops.h"
+#include "backend/ex-gallery.h"
+#include "backend/ex-image.h"
 #include "backend/ex-index.h"
 #include "backend/ex-location.h"
 #include "backend/ex-monitor.h"
@@ -25,6 +27,7 @@
 #include "backend/ex-util.h"
 #include "backend/ex-volumes.h"
 
+#include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib/gstdio.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -183,7 +186,25 @@ static void test_locations(void)
 
 	CHECK("likeos:home is Home", h && ex_location_kind(h) == EX_LOC_HOME);
 	CHECK("trash:/// is the Trash", t && ex_location_kind(t) == EX_LOC_TRASH);
-	CHECK("computer:/// is This PC", pc && ex_location_kind(pc) == EX_LOC_THISPC);
+	CHECK("computer:/// is Computer", pc && ex_location_kind(pc) == EX_LOC_COMPUTER);
+	{
+		ExLocation *c = ex_location_parse("likeos:computer");
+		ExLocation *old = ex_location_parse("likeos:thispc");
+		char *name = pc ? ex_location_display_name(pc) : NULL;
+
+		CHECK("likeos:computer is Computer, and its own id",
+		      c && ex_location_kind(c) == EX_LOC_COMPUTER &&
+			      strcmp(ex_location_id(c), "likeos:computer") == 0);
+		CHECK("the id saved before still names Computer",
+		      old && ex_location_equal(old, c));
+		CHECK("Computer is called Computer",
+		      name && strcmp(name, "Computer") == 0);
+		g_free(name);
+		if (c)
+			ex_location_unref(c);
+		if (old)
+			ex_location_unref(old);
+	}
 	CHECK("a path is a folder", f && ex_location_kind(f) == EX_LOC_FOLDER);
 	char *tp = tilde ? g_file_get_path(ex_location_file(tilde)) : NULL;
 	char *want = P("Documents");
@@ -219,10 +240,11 @@ static void test_locations(void)
 	GFile *root = g_file_new_for_path("/");
 	ExLocation *rl = ex_location_new_folder(root);
 	ExLocation *rup = ex_location_parent(rl);
-	CHECK("Up from the root is This PC",
-	      rup && ex_location_kind(rup) == EX_LOC_THISPC);
+	CHECK("Up from the root is Computer",
+	      rup && ex_location_kind(rup) == EX_LOC_COMPUTER);
 	char *rn = ex_location_display_name(rl);
-	CHECK("the root is called Local Disk", strcmp(rn, "Local Disk") == 0);
+	CHECK("the root is called System disk",
+	      strcmp(rn, EX_SYSTEM_DISK_NAME) == 0);
 	g_free(rn);
 	g_ptr_array_unref(cr);
 	ex_location_unref(rup);
@@ -591,6 +613,120 @@ static void test_copy_move(void)
 	g_ptr_array_unref(s);
 }
 
+static void count_progress(ExOperation *op, gpointer data)
+{
+	(*(int *)data)++;
+}
+
+static void test_pause(void)
+{
+	printf("\n[pause, resume, where from]\n");
+	/* A file big enough to take more than one block. */
+	gsize big = 24 * 1024 * 1024;
+	char *buf = g_malloc(big);
+	char *p = P("pz/src/big.bin");
+	char *dir = g_path_get_dirname(p);
+
+	for (gsize i = 0; i < big; i++)
+		buf[i] = (char)(i * 7 + (i >> 12));
+	g_mkdir_with_parents(dir, 0755);
+	g_file_set_contents(p, buf, (gssize)big, NULL);
+	write_file("pz/src/small.txt", "small");
+	write_file("pz/dst/.keep", "");
+	write_file("pz/other/c.txt", "c");
+	GPtrArray *s = files("pz/src/big.bin", "pz/src/small.txt", NULL);
+	GFile *dst = F("pz/dst");
+	GFile *srcdir = F("pz/src");
+
+	/* Where the items come from. */
+	ExOperation *op = ex_operation_new_copy(s, dst);
+	CHECK("the sources' one folder is known",
+	      ex_operation_get_source_dir(op) &&
+		      g_file_equal(ex_operation_get_source_dir(op), srcdir));
+	GPtrArray *mixed = files("pz/src/small.txt", "pz/other/c.txt", NULL);
+	ExOperation *op2 = ex_operation_new_copy(mixed, dst);
+	CHECK("sources from two folders have no one folder",
+	      ex_operation_get_source_dir(op2) == NULL);
+	g_object_unref(op2);
+	g_ptr_array_unref(mixed);
+
+	/* Paused before it starts: it starts, and stops at once. */
+	gboolean done = FALSE;
+	int progress = 0;
+	g_signal_connect(op, "finished", G_CALLBACK(op_finished), &done);
+	g_signal_connect(op, "progress", G_CALLBACK(count_progress), &progress);
+	ex_operation_set_paused(op, TRUE);
+	CHECK("pausing says so with a progress signal", progress == 1);
+	CHECK("an operation reports that it is paused",
+	      ex_operation_is_paused(op));
+	ex_operation_start(op);
+	spin_for(400);
+	guint64 bd = 1, bt = 0;
+	ex_operation_get_counts(op, &bd, &bt, NULL, NULL);
+	CHECK("a paused operation keeps running but copies nothing",
+	      !done && ex_operation_get_state(op) == EX_OP_RUNNING && bd == 0 &&
+		      !exists("pz/dst/big.bin"));
+	ex_operation_set_paused(op, FALSE);
+	CHECK("resumed, it is no longer paused", !ex_operation_is_paused(op));
+	spin_until(&done, 60);
+	char *got = NULL;
+	gsize got_len = 0;
+	char *dp = P("pz/dst/big.bin");
+	g_file_get_contents(dp, &got, &got_len, NULL);
+	CHECK("resumed, it finishes",
+	      done && ex_operation_get_state(op) == EX_OP_DONE);
+	CHECK("and the copy is whole",
+	      got && got_len == big && memcmp(got, buf, big) == 0);
+	g_free(got);
+	g_free(dp);
+	g_object_unref(op);
+
+	/* Cancelled while paused: the wait ends and nothing is left. */
+	GPtrArray *one = files("pz/src/big.bin", NULL);
+	GFile *dst2 = F("pz/dst2");
+	char *d2 = P("pz/dst2");
+	g_mkdir_with_parents(d2, 0755);
+	op = ex_operation_new_copy(one, dst2);
+	done = FALSE;
+	g_signal_connect(op, "finished", G_CALLBACK(op_finished), &done);
+	ex_operation_set_paused(op, TRUE);
+	ex_operation_start(op);
+	spin_for(200);
+	gint64 t0 = g_get_monotonic_time();
+	ex_operation_cancel(op);
+	spin_until(&done, 10);
+	CHECK("cancel ends a pause promptly",
+	      done && g_get_monotonic_time() - t0 < 2 * G_USEC_PER_SEC);
+	CHECK("cancelled while paused",
+	      ex_operation_get_state(op) == EX_OP_CANCELLED);
+	GDir *dd = g_dir_open(d2, 0, NULL);
+	CHECK("a cancelled paused copy leaves nothing behind",
+	      dd && g_dir_read_name(dd) == NULL);
+	if (dd)
+		g_dir_close(dd);
+	g_object_unref(op);
+
+	/* Paused while queued, cancelled before it ever ran. */
+	op = ex_operation_new_copy(one, dst2);
+	done = FALSE;
+	g_signal_connect(op, "finished", G_CALLBACK(op_finished), &done);
+	ex_operation_set_paused(op, TRUE);
+	ex_operation_cancel(op);
+	CHECK("a queued paused operation cancels at once",
+	      done && ex_operation_get_state(op) == EX_OP_CANCELLED);
+	g_object_unref(op);
+
+	g_free(d2);
+	g_object_unref(dst2);
+	g_ptr_array_unref(one);
+	g_object_unref(srcdir);
+	g_object_unref(dst);
+	g_ptr_array_unref(s);
+	g_free(dir);
+	g_free(p);
+	g_free(buf);
+}
+
 static void test_create_rename_delete(void)
 {
 	printf("\n[create, rename, delete]\n");
@@ -854,16 +990,431 @@ static void test_thumbs_and_volumes(void)
 	g_free(idir);
 	g_free(ip);
 
+	char *un = ex_volumes_unescape("/media/Ubuntu\\04024.04.3\\040LTS\\134x");
+	CHECK("a mount name's octal escapes are undone",
+	      strcmp(un, "/media/Ubuntu 24.04.3 LTS\\x") == 0);
+	g_free(un);
 	ExVolumes *v = ex_volumes_get_default();
 	GPtrArray *l = ex_volumes_list(v);
 	gboolean has_root = FALSE;
 	for (guint i = 0; i < l->len; i++)
-		if (strcmp(((ExVolume *)g_ptr_array_index(l, i))->name, "Local Disk") == 0)
+		if (strcmp(((ExVolume *)g_ptr_array_index(l, i))->name,
+			   EX_SYSTEM_DISK_NAME) == 0)
 			has_root = TRUE;
 	CHECK("the root disk is a volume", has_root);
 	GFile *here = F(".");
 	CHECK("a file's volume is found", ex_volumes_find(v, here) != NULL);
 	g_object_unref(here);
+}
+
+static void collected(GObject *src, GAsyncResult *res, gpointer data)
+{
+	gpointer *out = data;
+
+	out[0] = ex_gallery_collect_finish(res, NULL);
+	out[1] = GINT_TO_POINTER(1);
+}
+
+static gboolean save_picture(const char *rel, int w, int h, const char *type)
+{
+	GdkPixbuf *pb = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, w, h);
+	char *p = P(rel);
+	char *dir = g_path_get_dirname(p);
+	gboolean ok;
+
+	g_mkdir_with_parents(dir, 0755);
+	gdk_pixbuf_fill(pb, 0x3366ccff);
+	ok = gdk_pixbuf_save(pb, p, type, NULL, NULL);
+	g_object_unref(pb);
+	g_free(dir);
+	g_free(p);
+	return ok;
+}
+
+/* ---- Exif data made by hand ------------------------------------------------- */
+
+static void put16(guchar *p, guint v, gboolean be)
+{
+	p[be ? 0 : 1] = (guchar)(v >> 8);
+	p[be ? 1 : 0] = (guchar)v;
+}
+
+static void put32(guchar *p, guint32 v, gboolean be)
+{
+	for (int i = 0; i < 4; i++)
+		p[be ? i : 3 - i] = (guchar)(v >> (24 - 8 * i));
+}
+
+static guint get16(const guchar *p, gboolean be)
+{
+	return be ? (guint)(p[0] << 8 | p[1]) : (guint)(p[1] << 8 | p[0]);
+}
+
+static guint32 get32(const guchar *p, gboolean be)
+{
+	guint32 v = 0;
+
+	for (int i = 0; i < 4; i++)
+		v |= (guint32)p[be ? i : 3 - i] << (24 - 8 * i);
+	return v;
+}
+
+static void put_entry(guchar *e, guint tag, guint type, guint32 count,
+		      guint32 value, gboolean be)
+{
+	put16(e, tag, be);
+	put16(e + 2, type, be);
+	put32(e + 4, count, be);
+	put32(e + 8, value, be);
+}
+
+#define EXIF_DESC "LikeOS test picture"	 /* 20 bytes with its end */
+#define EXIF_DATE "2026:11:02 12:00:00"	 /* 20 bytes */
+#define EXIF_THUMB "THUMBNAIL-BYTES!" /* 16 bytes */
+
+/* A camera's Exif data in the given byte order, without an Orientation:
+ * IFD0 (a description and a resolution stored elsewhere, a short software
+ * name in place, the Exif directory), the Exif directory (the date, the
+ * Interoperability directory), and IFD1 with a JPEG thumbnail. */
+static GByteArray *camera_exif(gboolean be)
+{
+	guchar t[204];
+	GByteArray *seg = g_byte_array_new();
+	guchar head[10] = { 0xff, 0xe1, 0, 0, 'E', 'x', 'i', 'f', 0, 0 };
+
+	memset(t, 0, sizeof(t));
+	t[0] = t[1] = be ? 'M' : 'I';
+	put16(t + 2, 42, be);
+	put32(t + 4, 8, be);
+	put16(t + 8, 4, be); /* IFD0 at 8, 4 entries, ends at 62 */
+	put_entry(t + 10, 0x010e, 2, 20, 62, be);
+	put_entry(t + 22, 0x011a, 5, 1, 82, be);
+	put_entry(t + 34, 0x0131, 2, 4, 0, be);
+	memcpy(t + 42, "Gim", 4); /* in place */
+	put_entry(t + 46, 0x8769, 4, 1, 90, be);
+	put32(t + 58, 158, be); /* next: IFD1 */
+	memcpy(t + 62, EXIF_DESC, 20);
+	put32(t + 82, 72, be);
+	put32(t + 86, 1, be);
+	put16(t + 90, 2, be); /* Exif IFD at 90 */
+	put_entry(t + 92, 0x9003, 2, 20, 120, be);
+	put_entry(t + 104, 0xa005, 4, 1, 140, be);
+	put32(t + 116, 0, be);
+	memcpy(t + 120, EXIF_DATE, 20);
+	put16(t + 140, 1, be); /* Interoperability IFD at 140 */
+	put_entry(t + 142, 0x0001, 2, 4, 0, be);
+	memcpy(t + 150, "R98", 4);
+	put32(t + 154, 0, be);
+	put16(t + 158, 2, be); /* IFD1 at 158 */
+	put_entry(t + 160, 0x0201, 4, 1, 188, be);
+	put_entry(t + 172, 0x0202, 4, 1, 16, be);
+	put32(t + 184, 0, be);
+	memcpy(t + 188, EXIF_THUMB, 16);
+	head[2] = (guchar)((sizeof(t) + 8) >> 8);
+	head[3] = (guchar)(sizeof(t) + 8);
+	g_byte_array_append(seg, head, sizeof(head));
+	g_byte_array_append(seg, t, sizeof(t));
+	return seg;
+}
+
+/* The Exif segment of a JPEG in memory: where it starts, and the TIFF data
+ * in it. */
+static const guchar *find_exif(const guchar *d, gsize len, gsize *seg_end)
+{
+	gsize pos = 2;
+
+	while (pos + 4 <= len && d[pos] == 0xff) {
+		gsize seg = (gsize)(d[pos + 2] << 8 | d[pos + 3]);
+
+		if (d[pos + 1] == 0xe1 && memcmp(d + pos + 4, "Exif\0\0", 6) == 0) {
+			*seg_end = pos + 2 + seg;
+			return d + pos + 10;
+		}
+		if (d[pos + 1] == 0xda)
+			break;
+		pos += 2 + seg;
+	}
+	return NULL;
+}
+
+static const guchar *ifd_entry(const guchar *t, guint32 ifd, guint tag,
+			       gboolean be)
+{
+	guint n = get16(t + ifd, be);
+
+	for (guint i = 0; i < n; i++)
+		if (get16(t + ifd + 2 + 12 * i, be) == tag)
+			return t + ifd + 2 + 12 * i;
+	return NULL;
+}
+
+/* Everything of camera_exif() still where its offsets say, the tags of
+ * IFD0 in order, and the new Orientation. */
+static gboolean exif_intact(const guchar *t, gboolean be, guint orientation)
+{
+	guint32 ifd0 = get32(t + 4, be), exif, interop, ifd1;
+	guint n = get16(t + ifd0, be), last = 0;
+	const guchar *e;
+
+	if (n != 5)
+		return FALSE;
+	for (guint i = 0; i < n; i++) {
+		guint tag = get16(t + ifd0 + 2 + 12 * i, be);
+
+		if (tag <= last)
+			return FALSE;
+		last = tag;
+	}
+	e = ifd_entry(t, ifd0, 0x0112, be);
+	if (!e || get16(e + 2, be) != 3 || get16(e + 8, be) != orientation)
+		return FALSE;
+	e = ifd_entry(t, ifd0, 0x010e, be);
+	if (!e || memcmp(t + get32(e + 8, be), EXIF_DESC, 20))
+		return FALSE;
+	e = ifd_entry(t, ifd0, 0x011a, be);
+	if (!e || get32(t + get32(e + 8, be), be) != 72 ||
+	    get32(t + get32(e + 8, be) + 4, be) != 1)
+		return FALSE;
+	e = ifd_entry(t, ifd0, 0x0131, be);
+	if (!e || memcmp(e + 8, "Gim", 4))
+		return FALSE;
+	e = ifd_entry(t, ifd0, 0x8769, be);
+	if (!e)
+		return FALSE;
+	exif = get32(e + 8, be);
+	e = ifd_entry(t, exif, 0x9003, be);
+	if (!e || memcmp(t + get32(e + 8, be), EXIF_DATE, 20))
+		return FALSE;
+	e = ifd_entry(t, exif, 0xa005, be);
+	if (!e)
+		return FALSE;
+	interop = get32(e + 8, be);
+	e = ifd_entry(t, interop, 0x0001, be);
+	if (!e || memcmp(e + 8, "R98", 4))
+		return FALSE;
+	ifd1 = get32(t + ifd0 + 2 + 12 * n, be);
+	e = ifd_entry(t, ifd1, 0x0201, be);
+	return e && !memcmp(t + get32(e + 8, be), EXIF_THUMB, 16);
+}
+
+static void test_exif_insert(gboolean be)
+{
+	const char *rel = be ? "pics/camera-mm.jpg" : "pics/camera-ii.jpg";
+	const char *order = be ? "big-endian" : "little-endian";
+	char *path, *plain = NULL, *after = NULL, *name;
+	gsize pl = 0, al = 0, end = 0, old_end;
+	GByteArray *seg, *file;
+	GFile *f;
+
+	if (!save_picture(rel, 40, 20, "jpeg"))
+		return;
+	path = P(rel);
+	g_file_get_contents(path, &plain, &pl, NULL);
+	/* The camera's Exif segment right after the start of the file. */
+	seg = camera_exif(be);
+	file = g_byte_array_new();
+	g_byte_array_append(file, (guchar *)plain, 2);
+	g_byte_array_append(file, seg->data, seg->len);
+	g_byte_array_append(file, (guchar *)plain + 2, (guint)(pl - 2));
+	g_file_set_contents(path, (char *)file->data, file->len, NULL);
+	old_end = 2 + seg->len;
+
+	f = g_file_new_for_path(path);
+	name = g_strdup_printf("Exif data without an Orientation (%s) is turned "
+			       "right",
+			       order);
+	CHECK(name, ex_image_rotate(f, TRUE, NULL, NULL));
+	g_free(name);
+	g_file_get_contents(path, &after, &al, NULL);
+	const guchar *t = find_exif((guchar *)after, al, &end);
+	name = g_strdup_printf("the tag is added in order and every offset "
+			       "still points at its data (%s)",
+			       order);
+	CHECK(name, t && exif_intact(t, be, 6));
+	g_free(name);
+	CHECK("the segment grew by one entry and the picture data is the same",
+	      al == file->len + 12 && end == old_end + 12 &&
+		      memcmp(after + end, file->data + old_end,
+			     file->len - old_end) == 0);
+	CHECK("its orientation reads as a quarter turn right",
+	      ex_image_jpeg_orientation(path) == 6);
+	GdkPixbuf *pb = gdk_pixbuf_new_from_file(path, NULL);
+	GdkPixbuf *shown = pb ? gdk_pixbuf_apply_embedded_orientation(pb) : NULL;
+	CHECK("GdkPixbuf shows it turned",
+	      shown && gdk_pixbuf_get_width(shown) == 20 &&
+		      gdk_pixbuf_get_height(shown) == 40);
+	g_clear_object(&shown);
+	g_clear_object(&pb);
+	g_free(after);
+	CHECK("turned right again, the tag changes in place",
+	      ex_image_rotate(f, TRUE, NULL, NULL) &&
+		      ex_image_jpeg_orientation(path) == 3);
+	g_file_get_contents(path, &after, &al, NULL);
+	t = find_exif((guchar *)after, al, &end);
+	CHECK("and everything else is still in place",
+	      t && exif_intact(t, be, 3) && al == file->len + 12);
+	g_free(after);
+	g_object_unref(f);
+	g_byte_array_unref(file);
+	g_byte_array_unref(seg);
+	g_free(plain);
+	g_free(path);
+}
+
+static void test_pictures(void)
+{
+	printf("\n[pictures, gallery, crumbs]\n");
+
+	/* The orientations a quarter turn makes. */
+	CHECK("a quarter turn right of upright is orientation 6",
+	      ex_image_orientation_turn(1, TRUE) == 6);
+	CHECK("two quarter turns right are upside down",
+	      ex_image_orientation_turn(6, TRUE) == 3);
+	CHECK("a quarter turn left of upright is orientation 8",
+	      ex_image_orientation_turn(1, FALSE) == 8);
+	gboolean round = TRUE;
+	for (int o = 1; o <= 8; o++) {
+		int r = o;
+
+		for (int i = 0; i < 4; i++)
+			r = ex_image_orientation_turn(r, i & 1);
+		if (r != o)
+			round = FALSE;
+		r = o;
+		for (int i = 0; i < 4; i++)
+			r = ex_image_orientation_turn(r, TRUE);
+		if (r != o)
+			round = FALSE;
+	}
+	CHECK("four quarter turns, or right and left, change nothing", round);
+
+	/* A JPEG: only its Exif Orientation changes. */
+	if (save_picture("pics/photo.jpg", 40, 20, "jpeg")) {
+		char *path = P("pics/photo.jpg");
+		GFile *f = F("pics/photo.jpg");
+		char *before = NULL, *after = NULL;
+		gsize bl = 0, al = 0;
+
+		g_file_get_contents(path, &before, &bl, NULL);
+		CHECK("a fresh JPEG is upright", ex_image_jpeg_orientation(path) == 1);
+		CHECK("a JPEG is turned right",
+		      ex_image_rotate(f, TRUE, NULL, NULL));
+		CHECK("its Exif data now says a quarter turn right",
+		      ex_image_jpeg_orientation(path) == 6);
+		g_file_get_contents(path, &after, &al, NULL);
+		/* One segment of 36 bytes went in; everything else is the
+		 * same bytes. */
+		gsize k = 0;
+		while (k < bl && k < al && after[k] == before[k])
+			k++;
+		CHECK("the compressed picture is untouched",
+		      al == bl + 36 &&
+			      memcmp(after + k + 36, before + k, bl - k) == 0);
+		g_free(after);
+		CHECK("it is turned right again",
+		      ex_image_rotate(f, TRUE, NULL, NULL));
+		g_file_get_contents(path, &after, &al, NULL);
+		CHECK("now upside down, the tag changed in place",
+		      ex_image_jpeg_orientation(path) == 3 && al == bl + 36);
+		GdkPixbuf *pb = gdk_pixbuf_new_from_file(path, NULL);
+		GdkPixbuf *shown = pb ? gdk_pixbuf_apply_embedded_orientation(pb) :
+					NULL;
+		CHECK("the picture still reads",
+		      shown && gdk_pixbuf_get_width(shown) == 40);
+		g_clear_object(&shown);
+		g_clear_object(&pb);
+		CHECK("and turns left back",
+		      ex_image_rotate(f, FALSE, NULL, NULL) &&
+			      ex_image_jpeg_orientation(path) == 6);
+		g_free(after);
+		g_free(before);
+		g_object_unref(f);
+		g_free(path);
+	} else {
+		printf("  (no JPEG saver: the JPEG checks are skipped)\n");
+	}
+
+	/* Exif data of a camera, which has no Orientation: the tag goes in. */
+	test_exif_insert(FALSE);
+	test_exif_insert(TRUE);
+
+	/* A PNG is turned for real. */
+	CHECK("a PNG is written", save_picture("pics/wide.png", 40, 20, "png"));
+	GFile *pf = F("pics/wide.png");
+	CHECK("a PNG is turned left", ex_image_rotate(pf, FALSE, NULL, NULL));
+	char *pp = P("pics/wide.png");
+	int w = 0, h = 0;
+	gdk_pixbuf_get_file_info(pp, &w, &h);
+	CHECK("the PNG is now tall", w == 20 && h == 40);
+	g_free(pp);
+	g_object_unref(pf);
+	write_file("pics/notes.txt", "x");
+	GFile *tf = F("pics/notes.txt");
+	CHECK("a text file is not turned", !ex_image_rotate(tf, TRUE, NULL, NULL));
+	g_object_unref(tf);
+
+	/* Gallery: the pictures of a folder tree, hidden ones left out. */
+	save_picture("gal/wide.png", 20, 10, "png");
+	save_picture("gal/deeper/sub/tall.png", 10, 30, "png");
+	save_picture("gal/.hidden/no.png", 10, 10, "png");
+	write_file("gal/notes.txt", "x");
+	GPtrArray *roots = files("gal", NULL);
+	gpointer out[2] = { NULL, NULL };
+	ex_gallery_collect_async(roots, NULL, collected, out);
+	gboolean got = FALSE;
+	gint64 end = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
+	while (!out[1] && g_get_monotonic_time() < end)
+		g_main_context_iteration(NULL, TRUE);
+	got = out[1] != NULL;
+	GPtrArray *items = out[0];
+	guint n = items ? items->len : 0;
+	CHECK("Gallery finds the pictures below the folder, not the hidden",
+	      got && n == 2);
+	gboolean tall = FALSE;
+	for (guint i = 0; i < n; i++) {
+		ExFile *f = g_ptr_array_index(items, i);
+
+		if (!strcmp(ex_file_get_name(f), "tall.png"))
+			tall = ex_gallery_aspect(f) > 0.32 && ex_gallery_aspect(f) < 0.34;
+	}
+	CHECK("a picture's proportions are read from its header", tall);
+	if (items)
+		g_ptr_array_unref(items);
+	g_ptr_array_unref(roots);
+
+	/* The address bar inside a personal folder starts at that folder. */
+	const char *desk = ex_user_dir(G_USER_DIRECTORY_DESKTOP);
+	if (desk && strcmp(desk, g_get_home_dir()) != 0) {
+		char *sub = g_build_filename(desk, "sub", NULL);
+		GFile *sf = g_file_new_for_path(sub);
+		ExLocation *sl = ex_location_new_folder(sf);
+		GPtrArray *cr = ex_location_crumbs(sl);
+		char *first = cr->len ? ex_location_display_name(
+						 g_ptr_array_index(cr, 0)) :
+					NULL;
+
+		CHECK("crumbs inside Desktop start at Desktop",
+		      cr->len == 2 && first && !strcmp(first, "Desktop"));
+		g_free(first);
+		g_ptr_array_unref(cr);
+		ex_location_unref(sl);
+		g_object_unref(sf);
+		g_free(sub);
+	}
+	GFile *etc = g_file_new_for_path("/etc");
+	ExLocation *el = ex_location_new_folder(etc);
+	GPtrArray *ec = ex_location_crumbs(el);
+	CHECK("crumbs outside the home folder start at Computer",
+	      ec->len == 3 &&
+		      ex_location_kind(g_ptr_array_index(ec, 0)) == EX_LOC_COMPUTER);
+	g_ptr_array_unref(ec);
+	ex_location_unref(el);
+	g_object_unref(etc);
+	ExLocation *gl = ex_location_parse("likeos:gallery");
+	CHECK("likeos:gallery is the Gallery",
+	      gl && ex_location_kind(gl) == EX_LOC_GALLERY);
+	if (gl)
+		ex_location_unref(gl);
 }
 
 int main(int argc, char **argv)
@@ -901,10 +1452,12 @@ int main(int argc, char **argv)
 	test_loader(big);
 	test_monitor();
 	test_copy_move();
+	test_pause();
 	test_create_rename_delete();
 	test_trash();
 	test_search();
 	test_thumbs_and_volumes();
+	test_pictures();
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	if (g_fail == 0) {

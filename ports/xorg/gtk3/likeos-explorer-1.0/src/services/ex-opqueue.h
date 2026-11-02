@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the operation queue.
+// LikeOS Explorer: the operation queue.
 //
 // Every operation of every window goes through here.  At most two run at a
 // time, and two that write into the same folder never run at once -- a copy

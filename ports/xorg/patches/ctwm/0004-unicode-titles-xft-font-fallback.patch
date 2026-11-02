@@ -24,7 +24,7 @@ fontconfig's list that has it.
    The MyFont's metrics stay those of the configured font.  A byte that does
    not start a valid UTF-8 sequence is skipped instead of ending the string
    (Xft stops there), so a name cut inside a character loses one character.
-   win_fluent.c measures and draws its title through the same layout.
+   win_modern.c measures and draws its title through the same layout.
 
 2. The fontset redirections are object-like macros, and XmbDrawImageString is
    redirected too (ctwm.h).  ctwm names XmbDrawString without calling it, in
@@ -50,7 +50,7 @@ Copyright (C) 2026 The LikeOS Project
 diff -Nur a/CMakeLists.txt b/CMakeLists.txt
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -90,6 +90,14 @@
+@@ -90,6 +90,14 @@ endif()
  include_directories(${X11_Xft_INCLUDE_PATH} ${FREETYPE2_INCLUDE_DIR})
  list(APPEND CTWMLIBS ${X11_Xft_LIB} m)
  
@@ -68,7 +68,7 @@ diff -Nur a/CMakeLists.txt b/CMakeLists.txt
 diff -Nur a/ctwm.h b/ctwm.h
 --- a/ctwm.h
 +++ b/ctwm.h
-@@ -434,13 +434,34 @@
+@@ -434,12 +434,33 @@ int ctwm_XmbTextExtents(XFontSet fs, const char *text, int len,
                          XRectangle *ink, XRectangle *logical);
  void ctwm_XmbDrawString(Display *d, Drawable w, XFontSet fs, GC gc,
                          int x, int y, const char *text, int len);
@@ -90,8 +90,8 @@ diff -Nur a/ctwm.h b/ctwm.h
 +#define XmbDrawImageString ctwm_XmbDrawImageString
  #endif
  
- /*
-+ * For code that draws with an Xft font directly (win_fluent.c): width and
++/*
++ * For code that draws with an Xft font directly (win_modern.c): width and
 + * drawing of UTF-8 text with the font's fallbacks for the characters it has
 + * no glyph for, exactly as the calls above lay it out.
 + */
@@ -102,10 +102,9 @@ diff -Nur a/ctwm.h b/ctwm.h
 +                      const MyFont *font, int x, int y, const char *text,
 +                      int len);
 +
-+/*
-  * Window operations, routed through win_fluent.c so that a frame's resize
-  * border (FluentTitles; see win_fluent.h) follows the frame wherever ctwm
-  * moves, sizes, stacks, shows, hides or reparents it.  For every window that
+ /*
+  * Window operations, routed through win_modern.c so that a frame's resize
+  * border (ModernTitles; see win_modern.h) follows the frame wherever ctwm
 diff -Nur a/ctwm_main.c b/ctwm_main.c
 --- a/ctwm_main.c
 +++ b/ctwm_main.c
@@ -117,7 +116,7 @@ diff -Nur a/ctwm_main.c b/ctwm_main.c
  
  #include <fcntl.h>
  #include <X11/Xatom.h>
-@@ -175,6 +176,32 @@
+@@ -175,6 +176,32 @@ ctwm_main(int argc, char *argv[])
  	bool nodpyok = false;
  
  	setlocale(LC_ALL, "");
@@ -161,7 +160,7 @@ diff -Nur a/util.c b/util.c
  
  
  /* Handle for debug tracing */
-@@ -315,6 +316,7 @@
+@@ -315,6 +316,7 @@ UpdateFont(MyFont *font, int height)
  
  
  static void xft_register(MyFont *font);
@@ -169,7 +168,7 @@ diff -Nur a/util.c b/util.c
  
  /**
   * Load up fontsets from the X server.  Only used by CreateFonts() below.
-@@ -347,6 +349,7 @@
+@@ -347,6 +349,7 @@ GetFont(MyFont *font)
  		XFreeFontSet(dpy, font->font_set);
  	}
  	if(font->xft != NULL) {
@@ -177,7 +176,7 @@ diff -Nur a/util.c b/util.c
  		XftFontClose(dpy, font->xft);
  		font->xft = NULL;
  	}
-@@ -420,6 +423,35 @@
+@@ -420,6 +423,35 @@ GetFont(MyFont *font)
  #define XFT_FONTS_MAX 16
  static MyFont *xft_fonts[XFT_FONTS_MAX];
  
@@ -213,7 +212,7 @@ diff -Nur a/util.c b/util.c
  static void
  xft_register(MyFont *font)
  {
-@@ -438,98 +470,396 @@
+@@ -438,98 +470,396 @@ xft_register(MyFont *font)
  	}
  }
  
@@ -232,7 +231,7 @@ diff -Nur a/util.c b/util.c
 +		                && xft_fonts[i]->xft != NULL) {
 +			return i;
 +		}
- 	}
++	}
 +	return -1;
 +}
 +
@@ -240,9 +239,7 @@ diff -Nur a/util.c b/util.c
 +static int
 +xft_slot_font(const MyFont *font)
 +{
- 	for(int i = 0; i < XFT_FONTS_MAX; i++) {
--		if(xft_fonts[i] && xft_fonts[i]->font_set == fs) {
--			return xft_fonts[i]->xft;
++	for(int i = 0; i < XFT_FONTS_MAX; i++) {
 +		if(xft_fonts[i] == font && font->xft != NULL) {
 +			return i;
 +		}
@@ -260,7 +257,7 @@ diff -Nur a/util.c b/util.c
 +			}
 +		}
 +		FcFontSetDestroy(fb->set);
-+	}
+ 	}
 +	if(fb->pattern) {
 +		FcPatternDestroy(fb->pattern);
 +	}
@@ -273,7 +270,9 @@ diff -Nur a/util.c b/util.c
 +static void
 +xft_fallback_forget(MyFont *font)
 +{
-+	for(int i = 0; i < XFT_FONTS_MAX; i++) {
+ 	for(int i = 0; i < XFT_FONTS_MAX; i++) {
+-		if(xft_fonts[i] && xft_fonts[i]->font_set == fs) {
+-			return xft_fonts[i]->xft;
 +		if(xft_fonts[i] == font) {
 +			xft_fallback_drop(&xft_fallbacks[i]);
 +		}
@@ -360,9 +359,8 @@ diff -Nur a/util.c b/util.c
 +		}
 +		if(fb->open[i] != NULL) {
 +			return fb->open[i];
- 		}
- 	}
--	return NULL;
++		}
++	}
 +	return xf;
 +}
 +
@@ -424,7 +422,7 @@ diff -Nur a/util.c b/util.c
 +				ix1 = MaxSize(ix1, gx1);
 +				iy1 = MaxSize(iy1, gy1);
 +			}
-+		}
+ 		}
 +		pen += gi.xOff;
 +	}
 +	if(nspecs) {
@@ -463,7 +461,8 @@ diff -Nur a/util.c b/util.c
 +	}
 +	if(specs != local) {
 +		free(specs);
-+	}
+ 	}
+-	return NULL;
  }
  
  int
@@ -619,7 +618,7 @@ diff -Nur a/util.c b/util.c
 +}
 +
 +/*
-+ * For code that draws with a MyFont's Xft font itself (win_fluent.c): the
++ * For code that draws with a MyFont's Xft font itself (win_modern.c): the
 + * same layout, fallback fonts included, as the fontset calls above.
 + */
 +int
@@ -658,10 +657,10 @@ diff -Nur a/util.c b/util.c
  
  /**
   * Load up our various defined fonts
-diff -Nur a/win_fluent.c b/win_fluent.c
---- a/win_fluent.c
-+++ b/win_fluent.c
-@@ -478,16 +478,18 @@
+diff -Nur a/win_modern.c b/win_modern.c
+--- a/win_modern.c
++++ b/win_modern.c
+@@ -607,16 +607,18 @@ ModernForgetWindow(TwmWindow *tmp_win)
  /* Title bar                                                                */
  /* ------------------------------------------------------------------------ */
  
@@ -672,8 +671,8 @@ diff -Nur a/win_fluent.c b/win_fluent.c
 + * no glyph for (ctwm_XftTextWidth, util.c).
 + */
  static char *
--fl_fit(XftFont *font, const char *s, int avail)
-+fl_fit(const MyFont *font, const char *s, int avail)
+-md_fit(XftFont *font, const char *s, int avail)
++md_fit(const MyFont *font, const char *s, int avail)
  {
 -	XGlyphInfo gi;
  	size_t len = strlen(s);
@@ -685,7 +684,7 @@ diff -Nur a/win_fluent.c b/win_fluent.c
  		return strdup(s);
  	}
  	out = malloc(len + 4);
-@@ -502,8 +504,7 @@
+@@ -631,8 +633,7 @@ md_fit(XftFont *font, const char *s, int avail)
  		while(len > 0 && ((unsigned char)s[len] & 0xc0) == 0x80);
  		memcpy(out, s, len);
  		memcpy(out + len, "\xe2\x80\xa6", 4);
@@ -695,16 +694,16 @@ diff -Nur a/win_fluent.c b/win_fluent.c
  			return out;
  		}
  	}
-@@ -587,7 +588,7 @@
+@@ -719,7 +720,7 @@ ModernPaintTitle(TwmWindow *tmp_win)
  			.alpha = 0xffff,
  		};
  		XftColor col;
--		char *text = fl_fit(font->xft, tmp_win->name, avail);
-+		char *text = fl_fit(font, tmp_win->name, avail);
+-		char *text = md_fit(font->xft, tmp_win->name, avail);
++		char *text = md_fit(font, tmp_win->name, avail);
  
  		if(d && text && XftColorAllocValue(dpy, Scr->d_visual,
  		                                   DefaultColormap(dpy, Scr->screen),
-@@ -595,8 +596,7 @@
+@@ -727,8 +728,7 @@ ModernPaintTitle(TwmWindow *tmp_win)
  			int base = (h - (font->xft->ascent + font->xft->descent)) / 2 +
  			           font->xft->ascent;
  

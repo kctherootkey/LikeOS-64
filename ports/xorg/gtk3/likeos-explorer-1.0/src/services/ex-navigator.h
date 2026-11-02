@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: where a tab is and where it has been.
+// LikeOS Explorer: where a tab is and where it has been.
 //
 // Back, Forward and Up over location ids: the same folder renamed in another
 // window is still found, and a search or the Trash is a place in the history

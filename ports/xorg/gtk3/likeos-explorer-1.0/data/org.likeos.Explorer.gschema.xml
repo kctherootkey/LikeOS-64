@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  LikeOS File Explorer settings.  The defaults are repeated in
+  LikeOS Explorer settings.  The defaults are repeated in
   src/services/ex-settings.c for a run without the installed schema; keep
   the two the same.
 
@@ -89,6 +89,12 @@
     <key name="start-location" type="s">
       <default>'likeos:home'</default>
       <summary>What a new window shows (a location id)</summary>
+    </key>
+    <key name="gallery-folders" type="as">
+      <default>['pictures', 'videos']</default>
+      <summary>The folders Gallery shows the pictures and videos of</summary>
+      <description>Personal folders by name: desktop, documents, download,
+      music, pictures, videos.</description>
     </key>
   </schema>
 </schemalist>

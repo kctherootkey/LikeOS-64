@@ -1,9 +1,10 @@
-// LikeOS -- File Explorer: the navigation pane.
+// LikeOS Explorer: the navigation pane.
 //
-// Grouped as Windows 11 groups it: Home; the personal folders; Pinned (the
-// shared GTK bookmarks); This PC with its drives; Network, only when some
-// backend provides network places; the Trash, full or empty.  Each row is a
-// location id, not a path, so a row follows its place.
+// Three groups under small headings: Favorites -- Home, Gallery, the
+// personal folders and the folders pinned (the shared GTK bookmarks), each
+// with its pin, and the Trash, full or empty; Devices -- Computer and its
+// drives; Network, only when some backend provides network places.  Each
+// row is a location id, not a path, so a row follows its place.
 //
 // Signals:
 //   "open"   (ExLocation *loc, gboolean new_tab)

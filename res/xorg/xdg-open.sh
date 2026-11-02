@@ -5,7 +5,7 @@
 #
 # The association is the desktop's own (mimeapps.list and the installed
 # .desktop files) as GIO reads it, so this is "gio open" under the name
-# programs call: luakit's "show download" opens the folder in File Explorer,
+# programs call: luakit's "show download" opens the folder in LikeOS Explorer,
 # a PDF link opens in the PDF viewer, a mailto: link in the mail program.
 #
 # Copyright (C) 2026 The LikeOS Project

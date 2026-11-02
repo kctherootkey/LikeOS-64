@@ -21,6 +21,10 @@ GtkWidget *lx_segmented_new(void);
  * name).  Returns its index. */
 int lx_segmented_append(LxSegmented *s, const char *icon_name,
 			const char *tooltip);
+/* The same with any GIcon (a themed icon with fallbacks, say). */
+int lx_segmented_append_gicon(LxSegmented *s, GIcon *icon, const char *tooltip);
+/* A segment named by its text. */
+int lx_segmented_append_label(LxSegmented *s, const char *label);
 void lx_segmented_set_active(LxSegmented *s, int index);
 int lx_segmented_get_active(LxSegmented *s);
 

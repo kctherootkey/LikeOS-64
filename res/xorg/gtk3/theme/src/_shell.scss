@@ -1,0 +1,312 @@
+// The LikeOS shell: the launcher, the cards it opens, the confirmation before
+// leaving the session, and the panel's menus.
+//
+// The panel, its flyouts and the launcher's background are drawn by
+// taskbar(1) itself (user/bin/shell/taskbar.c) in the dark shell palette.
+// What sits on the launcher is GTK widgets, and these rules give them the
+// shell's look: the user header with its round icon buttons, the search
+// field, the segmented switch between Favorites, All apps and Recent files,
+// flat tiles and rows that light up under the pointer, the search results
+// with their detail card, the chips for the places along the foot, and the
+// cards its menus open as.  Every rule is scoped to the launcher's window
+// class or to the panel menus' class, so nothing here reaches another
+// program.
+//
+// taskbar(1) carries a reduced copy of these rules for use under other
+// themes; keep the two in step when changing the layout here.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+// The shell palette (_tokens.scss), by what each colour does here.
+$sm-text: $shell-text;
+$sm-text-secondary: $shell-text-secondary;
+$sm-hover: $shell-hover;
+$sm-pressed: $shell-active;
+$sm-stroke: $shell-border;
+$sm-card: $shell-raised;
+$sm-focus: $shell-accent;
+
+// Shared by every clickable thing in the launcher: transparent at rest.
+@mixin sm-flat {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: $radius-control;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  outline-color: $sm-focus;
+  outline-width: 2px;
+  outline-offset: -2px;
+  outline-style: solid;
+  -gtk-outline-radius: $radius-control;
+  color: $sm-text;
+  transition: none;
+
+  &:hover { background: $sm-hover; border-color: transparent; }
+  &:active, &:checked {
+    background: $sm-pressed;
+    border-color: transparent;
+  }
+  // The focus ring only for the keyboard.
+  &:not(:focus) { outline-color: transparent; }
+}
+
+window.likeos-launcher {
+  background: none;
+  color: $sm-text;
+
+  // The header: the user, and the session's buttons at the right.
+  .launcher-header { padding: 0 12px 0 10px; }
+  button.launcher-user {
+    @include sm-flat;
+    border-radius: $radius-overlay;
+    -gtk-outline-radius: $radius-overlay;
+    padding: 4px 14px 4px 4px;
+    min-height: 0;
+  }
+  .launcher-user-name { font-weight: $weight-strong; font-size: $type-body-large; }
+  button.launcher-icon-button {
+    @include sm-flat;
+    border-radius: $radius-tile;
+    -gtk-outline-radius: $radius-tile;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+  }
+
+  .launcher-main { padding: 2px 20px 0 20px; }
+
+  // The search field: a raised dark field with the magnifier at its left;
+  // the keyboard in it turns its frame the shell accent.
+  entry.launcher-search {
+    min-height: 36px;
+    margin-bottom: 12px;
+    padding: 0 12px;
+    border-radius: $radius-tile;
+    border: 1px solid $sm-stroke;
+    background: $shell-raised;
+    box-shadow: none;
+    color: $sm-text;
+    caret-color: $sm-text;
+
+    &:focus { border-color: $shell-accent; box-shadow: inset 0 0 0 1px $shell-accent; }
+    image.left { margin-right: 10px; color: $sm-text-secondary; }
+    selection { background-color: $shell-accent-fill; color: white; }
+  }
+
+  // The prompt over the empty search field: where the entry's text starts.
+  .launcher-search-hint {
+    color: $sm-text-secondary;
+    margin: 10px 0 0 39px;
+  }
+
+  // The switch: three segments in a raised track, the chosen one lit.
+  .launcher-switch {
+    background: $shell-raised;
+    border-radius: $radius-tile;
+    padding: 3px;
+    margin-bottom: 12px;
+  }
+  button.launcher-segment {
+    @include sm-flat;
+    min-height: 26px;
+    padding: 0 16px;
+    color: $sm-text-secondary;
+
+    &:hover { color: $sm-text; }
+    &:checked, &:checked:hover, &:checked:backdrop {
+      background: $sm-pressed;
+      border-color: transparent;
+      color: $sm-text;
+      font-weight: $weight-strong;
+    }
+  }
+
+  scrolledwindow, viewport { background: none; border: none; box-shadow: none; }
+
+  // Favorites: tiles of 112 x 84, the icon over a one-line name.
+  .launcher-grid { margin: 0; }
+  button.launcher-tile {
+    @include sm-flat;
+    border-radius: $radius-tile;
+    -gtk-outline-radius: $radius-tile;
+    min-width: 0;
+    min-height: 0;
+    padding: 6px 4px;
+    margin: 0;
+  }
+  .launcher-tile-label { font-size: $type-body; }
+
+  // All apps and Recent files: rows of 36 under accent initials.
+  .launcher-list { margin: 0 0 10px 0; }
+  .launcher-letter {
+    font-weight: $weight-strong;
+    color: $shell-accent;
+    margin: 10px 10px 2px 10px;
+  }
+  button.launcher-row {
+    @include sm-flat;
+    min-height: 32px;
+    padding: 2px 10px;
+    margin: 1px 0;
+  }
+  .launcher-item-name { font-size: $type-body; }
+  .launcher-item-sub { font-size: $type-body; color: $sm-text-secondary; }
+  .launcher-empty { color: $sm-text-secondary; margin: 16px 10px; }
+  button.launcher-link {
+    @include sm-flat;
+    color: $shell-accent;
+    padding: 6px 10px;
+    margin-top: 6px;
+    &:hover { color: $sm-text; }
+  }
+
+  // Search: the results down the page, and under them a strip with the
+  // selected one and its actions.
+  list.launcher-results { background: none; margin: 0 0 4px 0; }
+  list.launcher-results row {
+    background: none;
+    border-radius: $radius-row;
+    padding: 6px 10px;
+    margin: 1px 0;
+    color: $sm-text;
+    outline-color: transparent;
+
+    &:hover { background: $sm-hover; }
+    &:selected {
+      background: $sm-pressed;
+      box-shadow: none;
+      color: $sm-text;
+      label { color: $sm-text; }
+      .launcher-item-sub { color: $sm-text-secondary; }
+    }
+  }
+  list.launcher-results row.launcher-best { padding: 10px; }
+  .launcher-results-heading {
+    font-weight: $weight-strong;
+    font-size: $type-caption;
+    color: $sm-text-secondary;
+    margin: 10px 0 4px 0;
+  }
+  .launcher-detail {
+    margin: 6px 0 12px 0;
+    padding: 8px 8px 8px 12px;
+    border-radius: $radius-overlay;
+    background: $shell-raised;
+    border: 1px solid $sm-stroke;
+  }
+  .launcher-detail-name { font-weight: $weight-strong; }
+  button.launcher-action {
+    @include sm-flat;
+    min-height: 30px;
+    padding: 0 10px 0 8px;
+  }
+
+  // The foot: chips for the places at the left, Settings at the right.
+  .launcher-footer {
+    background-color: rgba(255, 255, 255, 0.03);
+    border-top: 1px solid $sm-stroke;
+    border-radius: 0 0 $radius-flyout $radius-flyout;
+    padding: 0 12px;
+  }
+  button.launcher-chip {
+    @include sm-flat;
+    min-height: 30px;
+    padding: 0 12px 0 10px;
+    border-radius: 15px;
+    -gtk-outline-radius: 15px;
+    background: $shell-raised;
+    border-color: $sm-stroke;
+
+    &:hover { background: mix($shell-text, $shell-raised, 8%); border-color: $sm-stroke; }
+    &:active { background: mix($shell-text, $shell-raised, 13%); border-color: $sm-stroke; }
+  }
+
+  // The menus a right-click and the user open: a card over the content.
+  .launcher-card {
+    background-color: $sm-card;
+    border: 1px solid $sm-stroke;
+    border-radius: $radius-overlay;
+    padding: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.32);
+  }
+  .launcher-detail-actions button.launcher-card-item,
+  .launcher-card button.launcher-card-item {
+    @include sm-flat;
+    min-height: 0;
+    min-width: 168px;
+    padding: 7px 12px 7px 10px;
+    margin: 0;
+  }
+
+  scrollbar {
+    background: none;
+    border: none;
+    slider { background-color: rgba(255, 255, 255, 0.22); border: none; }
+    slider:hover { background-color: rgba(255, 255, 255, 0.34); }
+  }
+}
+
+// The question before signing out, restarting or shutting down: a card in
+// the middle of the screen with the question, a line under it, and Cancel
+// beside the action, which is filled in the accent and has the focus.
+window.likeos-confirm {
+  background: none;
+  color: $sm-text;
+
+  .confirm-body { padding: 24px 24px 20px 24px; }
+  .confirm-title { font-weight: $weight-strong; font-size: $type-body-large; }
+  .confirm-text { color: $sm-text-secondary; }
+  .confirm-buttons { margin-top: 24px; }
+
+  button.confirm-cancel, button.confirm-primary {
+    @include sm-flat;
+    min-height: 30px;
+    min-width: 96px;
+    padding: 0 16px;
+    outline-offset: 1px;
+    -gtk-outline-radius: $radius-control + 2px;
+  }
+  button.confirm-cancel {
+    background: $shell-raised;
+    border-color: $sm-stroke;
+
+    &:hover { background: mix($shell-text, $shell-raised, 8%); border-color: $sm-stroke; }
+    &:active { background: mix($shell-text, $shell-raised, 13%); border-color: $sm-stroke; }
+  }
+  button.confirm-primary {
+    background: $shell-accent-fill;
+    border-color: $shell-accent-fill;
+    color: white;
+    font-weight: $weight-strong;
+
+    label { color: white; }
+    &:hover { background: mix(white, $shell-accent-fill, 10%); border-color: mix(white, $shell-accent-fill, 10%); }
+    &:active { background: mix(white, $shell-accent-fill, 18%); border-color: mix(white, $shell-accent-fill, 18%); }
+  }
+}
+
+// The window a panel menu is popped up in: the shell colour from the moment
+// it is mapped, not the light window colour of the apps.
+window.likeos-shell-menu { background-color: $shell-bg; }
+
+// The panel's own menus (a button's right-click, the panel's right-click,
+// a button's list of windows): the menu's shape in the shell's colours.
+menu.likeos-shell-menu {
+  background-color: $shell-bg;
+  border-color: $sm-stroke;
+
+  &:backdrop { background-color: $shell-bg; }
+
+  menuitem {
+    color: $sm-text;
+
+    &:hover, &:backdrop:hover { background-color: $sm-hover; color: $sm-text; }
+    &:active { background-color: $sm-pressed; }
+    &:backdrop { color: $sm-text; }
+    &:disabled, &:disabled:backdrop { color: $shell-text-disabled; }
+    label { color: inherit; }
+  }
+  separator { background-color: $sm-stroke; }
+  .likeos-menu-key { color: $sm-text-secondary; margin-left: 32px; }
+}

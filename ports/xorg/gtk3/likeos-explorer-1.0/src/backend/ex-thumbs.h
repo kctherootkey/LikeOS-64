@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: thumbnails.
+// LikeOS Explorer: thumbnails.
 //
 // The freedesktop.org thumbnail cache (~/.cache/thumbnails/{normal,large,
 // x-large}/<md5 of the URI>.png, stamped with the source's URI and

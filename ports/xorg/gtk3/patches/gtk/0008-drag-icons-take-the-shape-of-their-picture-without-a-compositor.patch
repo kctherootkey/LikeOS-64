@@ -1,0 +1,226 @@
+Drag icons take the shape of their picture on a screen without compositing.
+
+A drag's icon is a window that follows the pointer.  Where a compositing
+manager blends windows, the icon window has an alpha visual and the
+transparent parts of the picture show what is under it.  Without one the
+window is opaque, and every transparent pixel of the picture showed the
+window's background instead: a dragged file icon moved inside a white
+rectangle.
+
+Without blending the icon window now takes the shape of its picture.  The
+picture is made solid first -- every pixel at least half opaque at full
+opacity in its own colour, every other pixel cut away -- and the window's
+bounding shape is set from it, so only the picture moves with the pointer
+and what is under it shows around it.  This applies to every way a program
+sets a drag icon from an image: a cairo surface (which tree views, icon
+views and text widgets use as well), a pixbuf, an icon name, a GIcon or a
+stock id; those that went through an image widget are drawn into a surface
+first.  A drag icon given as a widget is unchanged, and so is everything
+on a composited screen.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/gtk/gtkdnd.c
++++ b/gtk/gtkdnd.c
+@@ -55,6 +55,7 @@
+ #include "gtkgesturedrag.h"
+ #include "gtkgesturesingle.h"
+ #include "gtkicontheme.h"
++#include "gtkiconhelperprivate.h"
+ #include "gtkimageprivate.h"
+ #include "gtkintl.h"
+ #include "gtkmain.h"
+@@ -2070,6 +2071,11 @@
+ 
+   gtk_drag_remove_icon (info);
+ 
++  /* The shape belonged to the previous picture; a picture that needs one
++   * sets its own once it is in place (gtk_drag_set_icon_surface()). */
++  if (info->icon_window)
++    gtk_widget_shape_combine_region (info->icon_window, NULL);
++
+   if (widget)
+     g_object_ref (widget);
+ 
+@@ -2181,6 +2187,47 @@
+   cairo_paint (cr);
+ }
+ 
++/* Whether a window on the drag's screen can be partly transparent: it
++ * needs a visual with alpha and a compositing manager that blends it. */
++static gboolean
++gtk_drag_can_blend (GdkDragContext *context)
++{
++  GdkScreen *screen = gdk_window_get_screen (gdk_drag_context_get_source_window (context));
++
++  return gdk_screen_get_rgba_visual (screen) != NULL &&
++         gdk_screen_is_composited (screen);
++}
++
++/* The icon a definition names, as a picture at the drag icon size, with
++ * the hot spot at its (0, 0); NULL if there is none. */
++static cairo_surface_t *
++gtk_drag_icon_picture (GdkDragContext     *context,
++                       GtkImageDefinition *def,
++                       gint                hot_x,
++                       gint                hot_y)
++{
++  GdkWindow *source = gdk_drag_context_get_source_window (context);
++  int scale = source ? gdk_window_get_scale_factor (source) : 1;
++  GtkWidget *owner = g_object_ref_sink (gtk_image_new ());
++  GtkIconHelper *helper;
++  cairo_surface_t *surface;
++  double sx, sy;
++
++  helper = gtk_icon_helper_new (gtk_widget_get_css_node (owner), owner);
++  _gtk_icon_helper_set_definition (helper, def);
++  _gtk_icon_helper_set_icon_size (helper, GTK_ICON_SIZE_DND);
++  surface = gtk_icon_helper_load_surface (helper, scale);
++  g_object_unref (helper);
++  gtk_widget_destroy (owner);
++  g_object_unref (owner);
++  if (surface)
++    {
++      cairo_surface_get_device_scale (surface, &sx, &sy);
++      cairo_surface_set_device_offset (surface, -hot_x * sx, -hot_y * sy);
++    }
++  return surface;
++}
++
+ static void
+ set_icon_helper (GdkDragContext     *context,
+                  GtkImageDefinition *def,
+@@ -2189,6 +2236,22 @@
+ {
+   GtkWidget *widget;
+ 
++  /* An image in the icon window shows the window's background around the
++   * icon wherever the icon is transparent.  Unless that window can be
++   * blended, the icon is drawn into a picture instead, which the window
++   * then takes the shape of. */
++  if (!gtk_drag_can_blend (context))
++    {
++      cairo_surface_t *surface = gtk_drag_icon_picture (context, def, hot_x, hot_y);
++
++      if (surface)
++        {
++          gtk_drag_set_icon_surface (context, surface);
++          cairo_surface_destroy (surface);
++          return;
++        }
++    }
++
+   widget = gtk_image_new ();
+   gtk_widget_show (widget);
+ 
+@@ -2303,6 +2366,59 @@
+   return TRUE;
+ }
+ 
++/* A picture for a window that cannot be blended: every pixel at least
++ * half opaque becomes its own colour at full opacity, every other pixel
++ * fully transparent, so the window can take the picture's shape
++ * (`*shape', in the window's coordinates) and show nothing of its
++ * background.  The result starts at the corner of `extents', which is
++ * the window's (0, 0). */
++static cairo_surface_t *
++gtk_drag_icon_solid (cairo_surface_t *surface,
++                     GdkRectangle    *extents,
++                     cairo_region_t **shape)
++{
++  cairo_surface_t *solid;
++  cairo_t *cr;
++  double sx, sy;
++  int width, height, stride;
++  guchar *data;
++
++  cairo_surface_get_device_scale (surface, &sx, &sy);
++  width = MAX (1, (int) ceil (extents->width * sx));
++  height = MAX (1, (int) ceil (extents->height * sy));
++  solid = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, width, height);
++  cairo_surface_set_device_scale (solid, sx, sy);
++  cr = cairo_create (solid);
++  cairo_set_source_surface (cr, surface, -extents->x, -extents->y);
++  cairo_paint (cr);
++  cairo_destroy (cr);
++
++  cairo_surface_flush (solid);
++  data = cairo_image_surface_get_data (solid);
++  stride = cairo_image_surface_get_stride (solid);
++  for (int y = 0; y < height; y++)
++    {
++      guint32 *row = (guint32 *) (data + y * stride);
++
++      for (int x = 0; x < width; x++)
++        {
++          guint32 p = row[x], a = p >> 24;
++
++          if (a < 128)
++            row[x] = 0;
++          else if (a < 255)
++            row[x] = 0xff000000 |
++                     MIN (255, (((p >> 16) & 0xff) * 255 + a / 2) / a) << 16 |
++                     MIN (255, (((p >> 8) & 0xff) * 255 + a / 2) / a) << 8 |
++                     MIN (255, ((p & 0xff) * 255 + a / 2) / a);
++        }
++    }
++  cairo_surface_mark_dirty (solid);
++
++  *shape = gdk_cairo_region_create_from_surface (solid);
++  return solid;
++}
++
+ /**
+  * gtk_drag_set_icon_surface:
+  * @context: the context for a drag (This must be called
+@@ -2329,6 +2445,9 @@
+   GdkVisual *rgba_visual;
+   gboolean has_rgba;
+   cairo_matrix_t matrix;
++  cairo_surface_t *solid = NULL;
++  cairo_region_t *shape = NULL;
++  GtkDragSourceInfo *info;
+ 
+   g_return_if_fail (GDK_IS_DRAG_CONTEXT (context));
+   g_return_if_fail (surface != NULL);
+@@ -2354,9 +2473,22 @@
+   gtk_widget_set_size_request (window, extents.width, extents.height);
+   gtk_widget_realize (window);
+ 
+-  pattern = cairo_pattern_create_for_surface (surface);
+-  cairo_matrix_init_translate (&matrix, extents.x, extents.y);
+-  cairo_pattern_set_matrix (pattern, &matrix);
++  /* Without blending, the window would show its background wherever the
++   * picture is transparent: it takes the picture's shape instead. */
++  if (!has_rgba && cairo_surface_get_content (surface) != CAIRO_CONTENT_COLOR)
++    solid = gtk_drag_icon_solid (surface, &extents, &shape);
++
++  if (solid)
++    {
++      pattern = cairo_pattern_create_for_surface (solid);
++      cairo_surface_destroy (solid);
++    }
++  else
++    {
++      pattern = cairo_pattern_create_for_surface (surface);
++      cairo_matrix_init_translate (&matrix, extents.x, extents.y);
++      cairo_pattern_set_matrix (pattern, &matrix);
++    }
+ 
+   g_signal_connect_data (window,
+                          "draw",
+@@ -2367,6 +2499,14 @@
+                          G_CONNECT_AFTER);
+ 
+   gtk_drag_set_icon_widget_internal (context, window, extents.x, extents.y, TRUE);
++
++  if (shape)
++    {
++      info = gtk_drag_get_source_info (context, FALSE);
++      if (info && info->icon_window)
++        gtk_widget_shape_combine_region (info->icon_window, shape);
++      cairo_region_destroy (shape);
++    }
+ }
+ 
+ /**

@@ -1,0 +1,102 @@
+Desktop drags show only the selected items' icons.
+
+The drag picture was each item as the desktop draws it selected: the
+translucent box, the icon and the label over its soft shadow.  On a screen
+without a compositing manager a drag's window cannot be partly
+transparent; it takes the shape of the opaque part of its picture
+instead.  What moved with the pointer was then the box's solid edge and a
+ragged label around the icon, where the desktop should show through.
+
+The picture is now the icons alone, where the desktop shows them and as
+they look when not selected (a shortcut's mark included), so only the
+icons move with the pointer.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -4750,46 +4750,70 @@
+     if (!gtk_tree_model_get_iter_first(model, &it))
+         return NULL;
+ 
+-    /* determine the size of complete pixbuf: every selected item, icon
+-     * and label, as the desktop shows it */
++    /* determine the size of complete pixbuf: the selected items' icons */
+     area.width = 0; /* mark it */
+     do
+     {
+-        GdkRectangle whole;
+-
+         item = fm_folder_model_get_item_userdata(desktop->model, &it);
+         if (!item->is_selected)
+             continue;
+-        gdk_rectangle_union(&item->icon_rect, &item->text_rect, &whole);
+         if (area.width == 0)
+-            area = whole;
++            area = item->icon_rect;
+         else
+-            gdk_rectangle_union(&area, &whole, &area);
++            gdk_rectangle_union(&area, &item->icon_rect, &area);
+     }
+     while(gtk_tree_model_iter_next(model, &it));
+ 
+     /* now create the pixbuf */
+     if (area.width == 0) /* no selection??? */
+         return NULL;
+-    /* a pixel around, and two more right and below for the label's shadow */
+-    area.width += 4;
+-    area.height += 4;
++    area.width += 2;
++    area.height += 2;
+     s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, area.width, area.height);
+     cr = cairo_create(s);
+ 
+-    /* each item drawn exactly as it looks on the desktop, selected: its
+-     * box, icon and name (paint_item() still draws selected items here,
+-     * the drag has not started yet) */
++    /* Each item's icon where the desktop shows it, as it looks when not
++     * selected, and nothing else: no box and no label.  On a screen
++     * without a compositing manager the drag's window takes the shape of
++     * this picture, so only the icons move with the pointer, with the
++     * desktop showing around them. */
+     cairo_translate(cr, 1 - area.x, 1 - area.y);
+     gtk_tree_model_get_iter_first(model, &it);
+     do
+     {
++        gboolean link;
++
+         item = fm_folder_model_get_item_userdata(desktop->model, &it);
+         if (!item->is_selected)
+             continue;
+         icon = NULL;
+         gtk_tree_model_get(model, &it, FM_FOLDER_MODEL_COL_ICON, &icon, -1);
+-        paint_item(desktop, item, cr, &area, icon);
++        /* the icon as paint_item() draws it, with a shortcut's mark */
++        link = fm_file_info_is_symlink(item->fi) || fm_file_info_is_shortcut(item->fi);
++#if GTK_CHECK_VERSION(3, 0, 0)
++        g_object_set(desktop->icon_render, "pixbuf", icon, "info", link ? NULL : item->fi, NULL);
++        gtk_cell_renderer_render(GTK_CELL_RENDERER(desktop->icon_render), cr,
++                                 GTK_WIDGET(desktop), &item->icon_rect,
++                                 &item->icon_rect, 0);
++#else
++        if (icon)
++        {
++            gdk_cairo_set_source_pixbuf(cr, icon,
++                    item->icon_rect.x + (item->icon_rect.width - gdk_pixbuf_get_width(icon)) / 2,
++                    item->icon_rect.y + (item->icon_rect.height - gdk_pixbuf_get_height(icon)) / 2);
++            gdk_cairo_rectangle(cr, &item->icon_rect);
++            cairo_fill(cr);
++        }
++#endif
++        if (link)
++        {
++            int size = icon ? gdk_pixbuf_get_width(icon) : fm_config->big_icon_size;
++            int ih = icon ? gdk_pixbuf_get_height(icon) : fm_config->big_icon_size;
++            double ix = item->icon_rect.x + (item->icon_rect.width - size) / 2;
++            double iy = item->icon_rect.y + (item->icon_rect.height - ih) / 2;
++
++            paint_link_mark(cr, ix + size - 14, iy + ih - 14);
++        }
+         if (icon)
+             g_object_unref(icon);
+     }

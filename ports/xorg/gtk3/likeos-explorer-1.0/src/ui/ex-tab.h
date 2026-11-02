@@ -1,8 +1,8 @@
-// LikeOS -- File Explorer: one tab.
+// LikeOS Explorer: one tab.
 //
 // What a tab shows and how: its navigation bar (Back, Forward, Up, the
 // address bar, search), the command bar, the navigation pane, the content
-// -- Home, This PC, or the items of a folder, the Trash or a search -- the
+// -- Home, Computer, or the items of a folder, the Trash or a search -- the
 // optional details or preview pane, and the status bar.  The tab owns the
 // navigator (where it is and has been), the selection, the folder model and
 // the monitor that keeps the model current.
@@ -30,7 +30,7 @@ ExLocation *ex_tab_location(ExTab *t);
 ExNavigator *ex_tab_navigator(ExTab *t);
 ExSelection *ex_tab_selection(ExTab *t);
 /* The folder new items and pastes go into: the folder shown, or NULL
- * (Home, This PC, the Trash, a search). */
+ * (Home, Computer, the Trash, a search). */
 GFile *ex_tab_folder(ExTab *t);
 /* Whether the folder shown accepts new items. */
 gboolean ex_tab_folder_writable(ExTab *t);
@@ -57,6 +57,12 @@ void ex_tab_select_all(ExTab *t);
 void ex_tab_select_none(ExTab *t);
 void ex_tab_invert_selection(ExTab *t);
 void ex_tab_select_files(ExTab *t, GPtrArray *files);
+/* Whether everything selected is a picture (the picture commands). */
+gboolean ex_tab_selection_is_images(ExTab *t);
+/* Home's Filter: the kind of file Recent and Favorites show ("all", or a
+ * kind of ex_file_get_kind()). */
+void ex_tab_set_home_filter(ExTab *t, const char *kind);
+const char *ex_tab_home_filter(ExTab *t);
 void ex_tab_start_rename(ExTab *t);
 void ex_tab_rename_when_shown(ExTab *t, GFile *f);
 /* The selection is about to be deleted (see ex_file_view_note_removal()). */

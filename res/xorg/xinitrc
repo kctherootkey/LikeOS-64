@@ -151,11 +151,12 @@ fi
 
 # The desktop bar.
 #
-# taskbar(1) is this system's own program (user/bin/shell/taskbar.c): a
-# Windows 2000-style panel across the bottom of the screen holding the LikeOS
-# button, the load and memory tray, the task buttons, the four workspace
-# buttons and the clock.  It replaced three things that used to be started or
-# drawn separately -- xclock, xload, and ctwm's own icon manager and workspace
+# taskbar(1) is this system's own program (user/bin/shell/taskbar.c): the
+# dark LikeOS panel across the bottom of the screen holding the launcher
+# (the start orb), the Workspaces button, the application buttons, the load and
+# memory monitor, the network and volume icons that open the Control Center,
+# and the clock.  It replaced three things that used to be started or drawn
+# separately -- xclock, xload, and ctwm's own icon manager and workspace
 # manager, both of which are switched off in system.ctwmrc.
 #
 # Backgrounded: only the LAST command in this script may run in the foreground,

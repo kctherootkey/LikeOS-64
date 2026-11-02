@@ -200,6 +200,13 @@
 # application for anything.  A git export, because the project publishes no
 # release tarballs; nothing in it is compiled here (see install_data).
 -         shared-mime-info   2.5.1    https://gitlab.freedesktop.org/xdg/shared-mime-info/-/archive/%VERSION%/shared-mime-info-%VERSION%.tar.gz
+# The time zone database, compiled into /usr/share/zoneinfo.  GLib knows local
+# time only from these files: g_date_time_new_now_local() and every program
+# built on it (the panel clock, the file manager's dates, GTK's file chooser)
+# looks up the zone named by $TZ or /etc/timezone here and falls back to UTC
+# when the file is missing.  Data only; zic on the build host compiles the
+# source (see install_data).  The archive has no top-level directory.
+-         tzdata             2026f    https://data.iana.org/time-zones/releases/tzdata%VERSION%.tar.gz
 # The application menu itself: the .menu file that says which categories exist
 # and in what order, and the directory entries that name them.  menu-cache
 # reads it; without one, the "Open With" dialog's application list is empty

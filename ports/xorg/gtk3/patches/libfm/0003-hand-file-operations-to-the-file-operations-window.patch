@@ -1,0 +1,136 @@
+Hand file operations to the system's file operations window.
+
+Copies, moves, links, moves to the Trash and deletions started from the
+desktop ran with libfm's own progress dialog: a bar and a line of text,
+unlike the operations window every other file operation on the system
+shows (with its speed graph, pause, and the same questions for names that
+are taken), and outside that window's queue.
+
+fm_file_ops_job_run_with_progress() now hands such a job over to LikeOS
+Explorer's operations window when every file is on a local disk:
+likeos-explorer --copy-to=FOLDER, --move-to=FOLDER, --link-to=FOLDER,
+--trash or --delete with the files, and --empty-trash for the Trash
+itself.  The command passes them to the running Explorer over the session
+bus (or runs them itself, opening no window but the operations window, and
+ends when they are done).  The confirmations libfm asks before moving to
+the Trash, deleting and emptying the Trash are asked as before; Explorer
+asks nothing more.
+
+Everything else -- attribute changes, restoring from the Trash, files not
+on a local disk -- runs in libfm with its dialog as before, and so does
+every job when likeos-explorer is not installed or cannot be started.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/gtk/fm-progress-dlg.c
++++ b/src/gtk/fm-progress-dlg.c
+@@ -40,6 +40,7 @@
+ #include "fm-gtk-utils.h"
+ #include "fm-utils.h"
+ #include <glib/gi18n-lib.h>
++#include <string.h>
+ 
+ #define SHOW_DLG_DELAY  1000
+ 
+@@ -719,6 +720,88 @@
+     data->timer = g_timer_new();
+ }
+ 
++/* Copies, moves, links, moves to the Trash and deletions of local files,
++ * and emptying the Trash, are handed to the system's file operations
++ * window: LikeOS Explorer's (likeos-explorer --copy-to=FOLDER FILE... and
++ * the like), where they queue with every other file operation and show
++ * their progress and speed the same way wherever they were started.  The
++ * job itself then does not run.  Anything else -- attribute changes,
++ * restoring from the Trash, files not on a local disk -- and every job
++ * when that program is not installed or cannot be started, runs here with
++ * the dialog below as before. */
++static gboolean hand_over(FmFileOpsJob* job)
++{
++    const char* opt;
++    gboolean to_dir = TRUE, ok;
++    GPtrArray* argv;
++    GError* err = NULL;
++    char* exe;
++    GList* l;
++
++    switch(job->type) /* FIXME: direct access to job struct! */
++    {
++    case FM_FILE_OP_COPY:
++        opt = "--copy-to=";
++        break;
++    case FM_FILE_OP_MOVE:
++        opt = "--move-to=";
++        break;
++    case FM_FILE_OP_LINK:
++        opt = "--link-to=";
++        break;
++    case FM_FILE_OP_TRASH:
++        opt = "--trash";
++        to_dir = FALSE;
++        break;
++    case FM_FILE_OP_DELETE:
++        opt = "--delete";
++        to_dir = FALSE;
++        /* the Trash itself: emptying it */
++        if(fm_path_list_get_length(job->srcs) == 1 &&
++           fm_path_is_trash_root(fm_path_list_peek_head(job->srcs)))
++            opt = "--empty-trash";
++        break;
++    default:
++        return FALSE;
++    }
++    if(to_dir && (!job->dest || !fm_path_is_native(job->dest)))
++        return FALSE;
++    if(strcmp(opt, "--empty-trash") != 0)
++        for(l = fm_path_list_peek_head_link(job->srcs); l; l = l->next)
++            if(!fm_path_is_native(FM_PATH(l->data)))
++                return FALSE;
++    exe = g_find_program_in_path("likeos-explorer");
++    if(!exe)
++        return FALSE;
++
++    argv = g_ptr_array_new_with_free_func(g_free);
++    g_ptr_array_add(argv, exe);
++    if(to_dir)
++    {
++        char* dir = fm_path_to_str(job->dest);
++        g_ptr_array_add(argv, g_strconcat(opt, dir, NULL));
++        g_free(dir);
++    }
++    else
++        g_ptr_array_add(argv, g_strdup(opt));
++    if(strcmp(opt, "--empty-trash") != 0)
++    {
++        g_ptr_array_add(argv, g_strdup("--"));
++        for(l = fm_path_list_peek_head_link(job->srcs); l; l = l->next)
++            g_ptr_array_add(argv, fm_path_to_str(FM_PATH(l->data)));
++    }
++    g_ptr_array_add(argv, NULL);
++    ok = g_spawn_async(NULL, (char**)argv->pdata, NULL, G_SPAWN_DEFAULT,
++                       NULL, NULL, NULL, &err);
++    if(!ok)
++    {
++        g_warning("cannot start likeos-explorer: %s", err->message);
++        g_error_free(err);
++    }
++    g_ptr_array_unref(argv);
++    return ok;
++}
++
+ /**
+  * fm_file_ops_job_run_with_progress
+  * @parent: parent window to show dialog over it
+@@ -742,6 +825,12 @@
+ 
+     g_return_val_if_fail(job != NULL, NULL);
+ 
++    if(hand_over(job))
++    {
++        g_object_unref(job);
++        return NULL;
++    }
++
+     data = g_slice_new0(FmProgressDisplay);
+     data->job = job;
+     if(parent)

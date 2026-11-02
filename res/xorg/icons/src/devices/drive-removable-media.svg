@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: drive-removable-media, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="23" y1="0" x2="41" y2="0"><stop offset="0" stop-color="#c9d0dc"/><stop offset="0.5" stop-color="#f3f5f9"/><stop offset="1" stop-color="#aab3c2"/></linearGradient><filter id="f2" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="16" y1="18" x2="48" y2="60"><stop offset="0" stop-color="#5b8ff9"/><stop offset="1" stop-color="#2049b8"/></linearGradient><radialGradient id="r4" gradientUnits="userSpaceOnUse" cx="32" cy="54.54" r="4.5"><stop offset="0" stop-color="#9fe6b8" stop-opacity="0.55"/><stop offset="1" stop-color="#9fe6b8" stop-opacity="0"/></radialGradient></defs>
+<g transform="scale(1)">
+<path d="M24.5 4H39.5A1.5 1.5 0 0 1 41 5.5V18.5A1.5 1.5 0 0 1 39.5 20H24.5A1.5 1.5 0 0 1 23 18.5V5.5A1.5 1.5 0 0 1 24.5 4Z" fill="url(#g1)"/>
+<path d="M26.4 8.8H30.4V12.8H26.4Z" fill="#6b7486"/>
+<path d="M33.6 8.8H37.6V12.8H33.6Z" fill="#6b7486"/>
+<path d="M23 18H41A7 7 0 0 1 48 25V53A7 7 0 0 1 41 60H23A7 7 0 0 1 16 53V25A7 7 0 0 1 23 18Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f2)"/>
+<path d="M23 18H41A7 7 0 0 1 48 25V53A7 7 0 0 1 41 60H23A7 7 0 0 1 16 53V25A7 7 0 0 1 23 18Z" fill="url(#g3)"/>
+<path d="M23 18.5H41A6.5 6.5 0 0 1 47.5 25V53A6.5 6.5 0 0 1 41 59.5H23A6.5 6.5 0 0 1 16.5 53V25A6.5 6.5 0 0 1 23 18.5Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.25"/>
+<path d="M26.04 30.6H37.96A3 3 0 0 1 40.96 33.6V45.24A3 3 0 0 1 37.96 48.24H26.04A3 3 0 0 1 23.04 45.24V33.6A3 3 0 0 1 26.04 30.6Z" fill="#ffffff" opacity="0.22"/>
+<path d="M26.5 34.951A1.031 1.031 0 0 1 28.562 34.951V42.342A0.516 0.516 0 0 0 29.078 42.858H36.469A1.031 1.031 0 0 1 36.469 44.92H28.356A1.856 1.856 0 0 1 26.5 43.064Z" fill="#ffffff" opacity="0.72"/>
+<path d="M29.938 37.701A3.781 3.781 0 1 0 37.5 37.701A3.781 3.781 0 1 0 29.938 37.701ZM31.771 37.701A1.948 1.948 0 1 1 35.667 37.701A1.948 1.948 0 1 1 31.771 37.701Z" fill="#ffffff" opacity="0.9"/>
+<path d="M27.5 54.54A4.5 4.5 0 1 0 36.5 54.54A4.5 4.5 0 1 0 27.5 54.54Z" fill="url(#r4)"/>
+<path d="M30 54.54A2 2 0 1 0 34 54.54A2 2 0 1 0 30 54.54Z" fill="#9fe6b8"/>
+<path d="M30.8 54.04A0.7 0.7 0 1 0 32.2 54.04A0.7 0.7 0 1 0 30.8 54.04Z" fill="#ffffff" opacity="0.8"/>
+</g>
+</svg>

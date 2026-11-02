@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: system-file-manager, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dfe6f1"/></linearGradient></defs>
+<g transform="scale(0.25)">
+<path d="M16 4H48A12 12 0 0 1 60 16V48A12 12 0 0 1 48 60H16A12 12 0 0 1 4 48V16A12 12 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M16 6H48A10 10 0 0 1 58 16V48A10 10 0 0 1 48 58H16A10 10 0 0 1 6 48V16A10 10 0 0 1 16 6Z" fill="none" stroke="#b9c1ce" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12 20h4v4h-4ZM16 20h4v4h-4ZM20 20h4v4h-4ZM12 24h4v4h-4ZM16 24h4v4h-4ZM20 24h4v4h-4ZM24 24h4v4h-4ZM28 24h4v4h-4ZM32 24h4v4h-4ZM36 24h4v4h-4ZM40 24h4v4h-4ZM44 24h4v4h-4ZM48 24h4v4h-4ZM12 32h4v4h-4ZM16 32h4v4h-4ZM20 32h4v4h-4ZM24 32h4v4h-4ZM28 32h4v4h-4ZM32 32h4v4h-4ZM36 32h4v4h-4ZM40 32h4v4h-4ZM44 32h4v4h-4ZM48 32h4v4h-4ZM12 36h4v4h-4ZM16 36h4v4h-4ZM20 36h4v4h-4ZM24 36h4v4h-4ZM28 36h4v4h-4ZM32 36h4v4h-4ZM36 36h4v4h-4ZM40 36h4v4h-4ZM44 36h4v4h-4ZM48 36h4v4h-4ZM12 40h4v4h-4ZM16 40h4v4h-4ZM20 40h4v4h-4ZM24 40h4v4h-4ZM28 40h4v4h-4ZM32 40h4v4h-4ZM36 40h4v4h-4ZM40 40h4v4h-4ZM44 40h4v4h-4ZM48 40h4v4h-4Z" fill="#2a5bd7" opacity="1"/>
+<path d="M12 28h4v4h-4ZM16 28h4v4h-4ZM20 28h4v4h-4ZM24 28h4v4h-4ZM28 28h4v4h-4ZM32 28h4v4h-4ZM36 28h4v4h-4ZM40 28h4v4h-4ZM44 28h4v4h-4ZM48 28h4v4h-4Z" fill="#2a5bd7" opacity="0.5"/>
+</g>
+</svg>

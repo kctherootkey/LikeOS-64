@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: x-office-spreadsheet, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="2.667" x2="0" y2="61.333"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="37.333" y1="18.667" x2="46.933" y2="9.067"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="37.333" x2="0" y2="56"><stop offset="0" stop-color="#3aa969"/><stop offset="1" stop-color="#1d904e"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M14.667 2.667H37.333L53.333 18.667V57.333A4 4 0 0 1 49.333 61.333H14.667A4 4 0 0 1 10.667 57.333V6.667A4 4 0 0 1 14.667 2.667Z" fill="#b9c1ce"/>
+<path d="M14.667 5.333H36.267L50.667 19.733V57.333A1.333 1.333 0 0 1 49.333 58.667H14.667A1.333 1.333 0 0 1 13.333 57.333V6.667A1.333 1.333 0 0 1 14.667 5.333Z" fill="url(#g1)"/>
+<path d="M37.333 2.667V16Q37.333 18.667 40 18.667H53.333Z" fill="#b9c1ce"/>
+<path d="M40 9.067V13.333Q40 16 42.667 16H46.933Z" fill="url(#g2)"/>
+<path d="M16 37.333H48A2.667 2.667 0 0 1 50.667 40V53.333A2.667 2.667 0 0 1 48 56H16A2.667 2.667 0 0 1 13.333 53.333V40A2.667 2.667 0 0 1 16 37.333Z" fill="url(#g3)"/>
+<path d="M16 40h2.667v2.667h-2.667ZM21.333 40h2.667v2.667h-2.667ZM16 42.667h2.667v2.667h-2.667ZM21.333 42.667h2.667v2.667h-2.667ZM18.667 45.333h2.667v2.667h-2.667ZM16 48h2.667v2.667h-2.667ZM21.333 48h2.667v2.667h-2.667ZM16 50.667h2.667v2.667h-2.667ZM21.333 50.667h2.667v2.667h-2.667Z" fill="#ffffff" opacity="1"/>
+<path d="M26.667 40h2.667v2.667h-2.667ZM26.667 42.667h2.667v2.667h-2.667ZM26.667 45.333h2.667v2.667h-2.667ZM26.667 48h2.667v2.667h-2.667ZM26.667 50.667h2.667v2.667h-2.667ZM29.333 50.667h2.667v2.667h-2.667ZM32 50.667h2.667v2.667h-2.667Z" fill="#ffffff" opacity="1"/>
+<path d="M40 40h2.667v2.667h-2.667ZM42.667 40h2.667v2.667h-2.667ZM37.333 42.667h2.667v2.667h-2.667ZM40 45.333h2.667v2.667h-2.667ZM42.667 48h2.667v2.667h-2.667ZM37.333 50.667h2.667v2.667h-2.667ZM40 50.667h2.667v2.667h-2.667Z" fill="#ffffff" opacity="1"/>
+<path d="M18.667 13.333H45.333V20H18.667Z" fill="#1f9d55" opacity="0.9"/>
+<path d="M18.667 20H45.333M18.667 28H45.333M18.667 33.333H45.333M28 13.333V33.333M36 13.333V33.333" fill="none" stroke="#6dbf90" stroke-width="2.667" stroke-linecap="butt" stroke-linejoin="round"/>
+</g>
+</svg>

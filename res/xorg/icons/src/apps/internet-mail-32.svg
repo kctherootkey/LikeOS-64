@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: internet-mail, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#5cb0ff"/><stop offset="1" stop-color="#2265d8"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H48A12 12 0 0 1 60 16V48A12 12 0 0 1 48 60H16A12 12 0 0 1 4 48V16A12 12 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M15 20H49A3 3 0 0 1 52 23V41A3 3 0 0 1 49 44H15A3 3 0 0 1 12 41V23A3 3 0 0 1 15 20Z" fill="#ffffff"/>
+<path d="M15 23.6L32 33.92L49 23.6" fill="none" stroke="#2265d8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

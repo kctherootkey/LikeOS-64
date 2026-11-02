@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: recently used files.
+// LikeOS Explorer: recently used files.
 //
 // The desktop's shared list, ~/.local/share/recently-used.xbel, which GTK
 // programs add to when they open or save a file.  What is handed out has

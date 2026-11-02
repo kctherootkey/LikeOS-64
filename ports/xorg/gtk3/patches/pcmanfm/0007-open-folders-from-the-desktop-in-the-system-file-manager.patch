@@ -4,7 +4,7 @@ The desktop stays PCManFM's, but a folder opened on it -- a double click, a
 single click when that is set, the item menu's Open, Open in New Tab and
 Open in New Window, the Trash and Documents icons -- now goes to the
 application the system has set as the default for inode/directory, as every
-other program's "open folder" does.  On LikeOS that is File Explorer
+other program's "open folder" does.  On LikeOS that is LikeOS Explorer
 (likeos-explorer), so a folder window looks and behaves the same wherever it
 was opened from.
 

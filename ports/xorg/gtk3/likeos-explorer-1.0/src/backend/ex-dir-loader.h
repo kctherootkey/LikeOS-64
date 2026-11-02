@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: reading a folder.
+// LikeOS Explorer: reading a folder.
 //
 // Asynchronous and in batches: the first names of a large folder are on
 // screen while the rest is still being read, and the main loop never waits

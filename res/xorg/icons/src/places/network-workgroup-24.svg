@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: network-workgroup, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><radialGradient id="r1" gradientUnits="userSpaceOnUse" cx="21.733" cy="18.8" r="44"><stop offset="0" stop-color="#9cc8ff"/><stop offset="0.5" stop-color="#3b74f0"/><stop offset="1" stop-color="#1a3fa8"/></radialGradient><clipPath id="c2"><path d="M2.667 32A29.333 29.333 0 1 0 61.333 32A29.333 29.333 0 1 0 2.667 32Z"/></clipPath></defs>
+<g transform="scale(0.375)">
+<path d="M2.667 32A29.333 29.333 0 1 0 61.333 32A29.333 29.333 0 1 0 2.667 32Z" fill="url(#r1)"/>
+<g clip-path="url(#c2)" opacity="0.9">
+<path d="M2.667 32H61.333V34.667H2.667ZM32 2.667H34.667V61.333H32Z" fill="#ffffff"/>
+<path d="M17.333 32A16 28 0 1 0 49.333 32A16 28 0 1 0 17.333 32Z" fill="none" stroke="#ffffff" stroke-width="2.667" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</g>
+</svg>

@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: small helpers shared by every module.
+// LikeOS -- LikeOS Media Player: small helpers shared by every module.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -34,6 +34,10 @@ gboolean mp_is_media_name(const char *name);
 /* The extensions mp_is_media_name() knows, lower case, NULL-terminated --
  * for building file chooser filters. */
 const char *const *mp_media_extensions(void);
+
+/* Whether a file name has the extension of a video container -- a first
+ * guess at the kind of a file, before its streams have been read. */
+gboolean mp_is_video_name(const char *name);
 
 /* Whether a file name is a playlist this program reads (M3U, M3U8, PLS). */
 gboolean mp_is_playlist_name(const char *name);

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: internet-chat, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#f06aa8"/><stop offset="1" stop-color="#b0306e"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H48A12 12 0 0 1 60 16V48A12 12 0 0 1 48 60H16A12 12 0 0 1 4 48V16A12 12 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M32 26H46A6 6 0 0 1 52 32V40A6 6 0 0 1 46 46H32A6 6 0 0 1 26 40V32A6 6 0 0 1 32 26ZM44 44L48 52L36 45Z" fill="#ffffff" opacity="0.6"/>
+<path d="M18 14H36A6 6 0 0 1 42 20V30A6 6 0 0 1 36 36H18A6 6 0 0 1 12 30V20A6 6 0 0 1 18 14ZM18 34L16 44L26 35Z" fill="#ffffff"/>
+<path d="M18 25A2 2 0 1 0 22 25A2 2 0 1 0 18 25Z" fill="#b0306e"/>
+<path d="M25 25A2 2 0 1 0 29 25A2 2 0 1 0 25 25Z" fill="#b0306e"/>
+<path d="M32 25A2 2 0 1 0 36 25A2 2 0 1 0 32 25Z" fill="#b0306e"/>
+</g>
+</svg>

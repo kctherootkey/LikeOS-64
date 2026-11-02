@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: undo and redo.
+// LikeOS Explorer: undo and redo.
 //
 // Each finished operation queued as undoable leaves a record of what it did
 // (its results).  Undo runs the inverse as an ordinary operation:

@@ -1,4 +1,5 @@
-// LikeOS -- Media Player: loading and saving ~/.config/mediaplayer/settings.
+// LikeOS -- LikeOS Media Player: loading and saving
+// ~/.config/mediaplayer/settings.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -12,6 +13,52 @@
 
 #define GROUP "Player"
 
+/* The library starts out with the user's own Music or Videos folder: the
+ * one the user-dirs file names, else the customary one in the home folder.
+ * A folder that does not exist is kept all the same -- it is simply empty
+ * until something is put there. */
+static gchar **default_dirs(GUserDirectory which, const char *name)
+{
+	const char *dir = g_get_user_special_dir(which);
+	gchar **v = g_new0(gchar *, 2);
+	if (dir != NULL && strcmp(dir, g_get_home_dir()) != 0)
+		v[0] = g_strdup(dir);
+	else
+		v[0] = g_build_filename(g_get_home_dir(), name, NULL);
+	return v;
+}
+
+/* A folder list from the file: absolute paths only, without duplicates,
+ * and no more than a sensible number of them.  An empty list is a choice
+ * (the user removed every folder) and is kept. */
+static void get_dirs(GKeyFile *kf, const char *key, gchar ***out)
+{
+	gsize n = 0;
+	gchar **v = g_key_file_get_string_list(kf, GROUP, key, &n, NULL);
+	if (v == NULL) {
+		if (g_key_file_has_key(kf, GROUP, key, NULL)) {
+			g_strfreev(*out);
+			*out = g_new0(gchar *, 1);
+		}
+		return;
+	}
+	GPtrArray *a = g_ptr_array_new();
+	for (gsize i = 0; i < n && a->len < 64; i++) {
+		if (!g_path_is_absolute(v[i]))
+			continue;
+		gboolean dup = FALSE;
+		for (guint j = 0; j < a->len; j++)
+			if (strcmp(g_ptr_array_index(a, j), v[i]) == 0)
+				dup = TRUE;
+		if (!dup)
+			g_ptr_array_add(a, g_strdup(v[i]));
+	}
+	g_ptr_array_add(a, NULL);
+	g_strfreev(v);
+	g_strfreev(*out);
+	*out = (gchar **)g_ptr_array_free(a, FALSE);
+}
+
 static void set_defaults(MpSettings *s)
 {
 	s->volume = 0.8;
@@ -19,10 +66,11 @@ static void set_defaults(MpSettings *s)
 	s->last_dir = NULL;
 	s->shuffle = FALSE;
 	s->repeat = MP_REPEAT_NONE;
-	s->show_playlist = TRUE;
-	s->width = 960;
-	s->height = 600;
-	s->queue_width = 300;
+	s->nav_compact = FALSE;
+	s->width = 1100;
+	s->height = 700;
+	s->music_dirs = default_dirs(G_USER_DIRECTORY_MUSIC, "Music");
+	s->video_dirs = default_dirs(G_USER_DIRECTORY_VIDEOS, "Videos");
 	s->video_sink = g_strdup("auto");
 	s->gapless = TRUE;
 	s->discover = TRUE;
@@ -99,10 +147,11 @@ void mp_settings_load(MpSettings *s)
 	get_bool(kf, "muted", &s->muted);
 	get_bool(kf, "shuffle", &s->shuffle);
 	get_int(kf, "repeat", MP_REPEAT_NONE, MP_REPEAT_ONE, &s->repeat);
-	get_bool(kf, "show-playlist", &s->show_playlist);
+	get_bool(kf, "navigation-compact", &s->nav_compact);
 	get_int(kf, "width", 320, 16384, &s->width);
 	get_int(kf, "height", 240, 16384, &s->height);
-	get_int(kf, "queue-width", 160, 4096, &s->queue_width);
+	get_dirs(kf, "music-folders", &s->music_dirs);
+	get_dirs(kf, "video-folders", &s->video_dirs);
 	get_bool(kf, "gapless", &s->gapless);
 	get_bool(kf, "discover-metadata", &s->discover);
 	get_bool(kf, "show-remaining", &s->show_remaining);
@@ -150,10 +199,19 @@ gboolean mp_settings_save(const MpSettings *s)
 	g_key_file_set_boolean(kf, GROUP, "muted", s->muted);
 	g_key_file_set_boolean(kf, GROUP, "shuffle", s->shuffle);
 	g_key_file_set_integer(kf, GROUP, "repeat", s->repeat);
-	g_key_file_set_boolean(kf, GROUP, "show-playlist", s->show_playlist);
+	g_key_file_set_boolean(kf, GROUP, "navigation-compact",
+			       s->nav_compact);
 	g_key_file_set_integer(kf, GROUP, "width", s->width);
 	g_key_file_set_integer(kf, GROUP, "height", s->height);
-	g_key_file_set_integer(kf, GROUP, "queue-width", s->queue_width);
+	g_key_file_set_string_list(
+		kf, GROUP, "music-folders", (const gchar *const *)s->music_dirs,
+		s->music_dirs ? g_strv_length(s->music_dirs) : 0);
+	g_key_file_set_string_list(
+		kf, GROUP, "video-folders", (const gchar *const *)s->video_dirs,
+		s->video_dirs ? g_strv_length(s->video_dirs) : 0);
+	/* Keys of the old side-panel layout, which nothing reads any more. */
+	g_key_file_remove_key(kf, GROUP, "show-playlist", NULL);
+	g_key_file_remove_key(kf, GROUP, "queue-width", NULL);
 	g_key_file_set_string(kf, GROUP, "video-sink",
 			      s->video_sink ? s->video_sink : "auto");
 	g_key_file_set_boolean(kf, GROUP, "gapless", s->gapless);
@@ -186,4 +244,6 @@ void mp_settings_clear(MpSettings *s)
 {
 	g_clear_pointer(&s->last_dir, g_free);
 	g_clear_pointer(&s->video_sink, g_free);
+	g_clear_pointer(&s->music_dirs, g_strfreev);
+	g_clear_pointer(&s->video_dirs, g_strfreev);
 }

@@ -14,7 +14,7 @@
 # is only worth naming here if its .desktop file is installed.
 
 [Default Applications]
-# Folders open in File Explorer (likeos-explorer).  The PCManFM desktop asks
+# Folders open in LikeOS Explorer (likeos-explorer).  The PCManFM desktop asks
 # this same question when a folder on it is opened (gtk3 patch pcmanfm/0007),
 # so a folder window is always Explorer's while the desktop stays PCManFM's.
 # trash: is how other programs ask for the Trash.

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: drive-removable-media, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="24" y1="0" x2="40" y2="0"><stop offset="0" stop-color="#c9d0dc"/><stop offset="0.5" stop-color="#f3f5f9"/><stop offset="1" stop-color="#aab3c2"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="16" y1="18.667" x2="48" y2="58.667"><stop offset="0" stop-color="#5b8ff9"/><stop offset="1" stop-color="#2049b8"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M26.667 5.333H37.333A2.667 2.667 0 0 1 40 8V18.667A2.667 2.667 0 0 1 37.333 21.333H26.667A2.667 2.667 0 0 1 24 18.667V8A2.667 2.667 0 0 1 26.667 5.333Z" fill="url(#g1)"/>
+<path d="M26.667 10.667H32V16H26.667Z" fill="#6b7486"/>
+<path d="M32 10.667H37.333V16H32Z" fill="#6b7486"/>
+<path d="M21.333 18.667H42.667A5.333 5.333 0 0 1 48 24V53.333A5.333 5.333 0 0 1 42.667 58.667H21.333A5.333 5.333 0 0 1 16 53.333V24A5.333 5.333 0 0 1 21.333 18.667Z" fill="url(#g2)"/>
+<path d="M26.667 32H37.333A2.667 2.667 0 0 1 40 34.667V45.333A2.667 2.667 0 0 1 37.333 48H26.667A2.667 2.667 0 0 1 24 45.333V34.667A2.667 2.667 0 0 1 26.667 32Z" fill="#ffffff" opacity="0.22"/>
+<path d="M32 53.333H34.667V56H32Z" fill="#9fe6b8"/>
+</g>
+</svg>

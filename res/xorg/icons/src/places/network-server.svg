@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: network-server, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="0.8"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="20"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r3" gradientUnits="userSpaceOnUse" cx="48" cy="12" r="4.5"><stop offset="0" stop-color="#46d17f" stop-opacity="0.55"/><stop offset="1" stop-color="#46d17f" stop-opacity="0"/></radialGradient><filter id="f4" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="0.8"/></filter><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="40"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r6" gradientUnits="userSpaceOnUse" cx="48" cy="32" r="4.5"><stop offset="0" stop-color="#4f8cff" stop-opacity="0.55"/><stop offset="1" stop-color="#4f8cff" stop-opacity="0"/></radialGradient><filter id="f7" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="0.8"/></filter><linearGradient id="g8" gradientUnits="userSpaceOnUse" x1="0" y1="44" x2="0" y2="60"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r9" gradientUnits="userSpaceOnUse" cx="48" cy="52" r="4.5"><stop offset="0" stop-color="#46d17f" stop-opacity="0.55"/><stop offset="1" stop-color="#46d17f" stop-opacity="0"/></radialGradient></defs>
+<g transform="scale(1)">
+<path d="M12 4H52A4 4 0 0 1 56 8V16A4 4 0 0 1 52 20H12A4 4 0 0 1 8 16V8A4 4 0 0 1 12 4Z" fill="#0b1730" opacity="0.22" transform="translate(0 0.8)" filter="url(#f1)"/>
+<path d="M12 4H52A4 4 0 0 1 56 8V16A4 4 0 0 1 52 20H12A4 4 0 0 1 8 16V8A4 4 0 0 1 12 4Z" fill="url(#g2)"/>
+<path d="M12 4H52A4 4 0 0 1 56 8V16A4 4 0 0 1 52 20H12A4 4 0 0 1 8 16V8A4 4 0 0 1 12 4Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M12 4.5H52" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.2"/>
+<path d="M43.5 12A4.5 4.5 0 1 0 52.5 12A4.5 4.5 0 1 0 43.5 12Z" fill="url(#r3)"/>
+<path d="M46 12A2 2 0 1 0 50 12A2 2 0 1 0 46 12Z" fill="#46d17f"/>
+<path d="M46.8 11.5A0.7 0.7 0 1 0 48.2 11.5A0.7 0.7 0 1 0 46.8 11.5Z" fill="#ffffff" opacity="0.8"/>
+<path d="M13.76 8.8V15.2M17.12 8.8V15.2M20.48 8.8V15.2M23.84 8.8V15.2" fill="none" stroke="#8d97a8" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12 24H52A4 4 0 0 1 56 28V36A4 4 0 0 1 52 40H12A4 4 0 0 1 8 36V28A4 4 0 0 1 12 24Z" fill="#0b1730" opacity="0.22" transform="translate(0 0.8)" filter="url(#f4)"/>
+<path d="M12 24H52A4 4 0 0 1 56 28V36A4 4 0 0 1 52 40H12A4 4 0 0 1 8 36V28A4 4 0 0 1 12 24Z" fill="url(#g5)"/>
+<path d="M12 24H52A4 4 0 0 1 56 28V36A4 4 0 0 1 52 40H12A4 4 0 0 1 8 36V28A4 4 0 0 1 12 24Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M12 24.5H52" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.2"/>
+<path d="M43.5 32A4.5 4.5 0 1 0 52.5 32A4.5 4.5 0 1 0 43.5 32Z" fill="url(#r6)"/>
+<path d="M46 32A2 2 0 1 0 50 32A2 2 0 1 0 46 32Z" fill="#4f8cff"/>
+<path d="M46.8 31.5A0.7 0.7 0 1 0 48.2 31.5A0.7 0.7 0 1 0 46.8 31.5Z" fill="#ffffff" opacity="0.8"/>
+<path d="M13.76 28.8V35.2M17.12 28.8V35.2M20.48 28.8V35.2M23.84 28.8V35.2" fill="none" stroke="#8d97a8" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12 44H52A4 4 0 0 1 56 48V56A4 4 0 0 1 52 60H12A4 4 0 0 1 8 56V48A4 4 0 0 1 12 44Z" fill="#0b1730" opacity="0.22" transform="translate(0 0.8)" filter="url(#f7)"/>
+<path d="M12 44H52A4 4 0 0 1 56 48V56A4 4 0 0 1 52 60H12A4 4 0 0 1 8 56V48A4 4 0 0 1 12 44Z" fill="url(#g8)"/>
+<path d="M12 44H52A4 4 0 0 1 56 48V56A4 4 0 0 1 52 60H12A4 4 0 0 1 8 56V48A4 4 0 0 1 12 44Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M12 44.5H52" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.2"/>
+<path d="M43.5 52A4.5 4.5 0 1 0 52.5 52A4.5 4.5 0 1 0 43.5 52Z" fill="url(#r9)"/>
+<path d="M46 52A2 2 0 1 0 50 52A2 2 0 1 0 46 52Z" fill="#46d17f"/>
+<path d="M46.8 51.5A0.7 0.7 0 1 0 48.2 51.5A0.7 0.7 0 1 0 46.8 51.5Z" fill="#ffffff" opacity="0.8"/>
+<path d="M13.76 48.8V55.2M17.12 48.8V55.2M20.48 48.8V55.2M23.84 48.8V55.2" fill="none" stroke="#8d97a8" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

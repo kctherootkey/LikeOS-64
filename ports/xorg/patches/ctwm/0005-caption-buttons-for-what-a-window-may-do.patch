@@ -1,11 +1,11 @@
-Caption buttons for what a window may do, as Windows 11 draws them.
+Caption buttons only for what a window may do.
 
 Every window got Minimize, Maximize and Close, and all three worked: a
 Properties box or a message box could be maximised, its few controls
 stretched across the screen.  ctwm reads the Motif hints only for the
 decorations, and fullzoom() zoomed any window.
 
-What a window may do is now worked out the way Windows decides it:
+What a window may do is now worked out from its hints:
 
   maximise -- not when its size is fixed (the same minimum and maximum size
               in WM_NORMAL_HINTS, which is how GTK marks a dialog that is
@@ -14,7 +14,7 @@ What a window may do is now worked out the way Windows decides it:
   minimise -- not when it is a dialog (transient for another window) or its
               Motif hints leave the minimise function out.
 
-With FluentTitles, a caption button for something the window may not do is
+With ModernTitles, a caption button for something the window may not do is
 drawn greyed, gets no highlight under the pointer and does nothing when
 pressed; when the window may do neither, Minimize and Maximize are not drawn
 at all and only Close remains.  fullzoom() refuses such a window too, so a
@@ -25,65 +25,69 @@ _MOTIF_WM_HINTS change.
 
 Copyright (C) 2026 The LikeOS Project
 
+diff -Nur a/add_window.c b/add_window.c
 --- a/add_window.c
 +++ b/add_window.c
-@@ -1812,6 +1812,8 @@
+@@ -1812,6 +1812,8 @@ AddWindow(Window w, AWType wtype, IconMgr *iconp, VirtualScreen *vs)
  
- 	/* The invisible resize border around the frame (FluentTitles). */
- 	FluentGripCreate(tmp_win);
+ 	/* The invisible resize border around the frame (ModernTitles). */
+ 	ModernGripCreate(tmp_win);
 +	/* Which caption buttons work, from the hints just read. */
-+	FluentCapsChanged(tmp_win);
++	ModernCapsChanged(tmp_win);
  
  	/*
  	 * OK, that's all we need to do while the server's grabbed.  After
+diff -Nur a/event_handlers.c b/event_handlers.c
 --- a/event_handlers.c
 +++ b/event_handlers.c
-@@ -1444,9 +1444,15 @@
+@@ -1444,9 +1444,15 @@ void HandlePropertyNotify(void)
  
  		case XA_WM_NORMAL_HINTS: {
  			GetWindowSizeHints(Tmp_win);
 +			/* Resizable or not decides whether it may be maximised. */
-+			FluentCapsChanged(Tmp_win);
++			ModernCapsChanged(Tmp_win);
  			break;
  		}
  		default: {
 +			if(Event.xproperty.atom == XA__MOTIF_WM_HINTS) {
-+				FluentCapsChanged(Tmp_win);
++				ModernCapsChanged(Tmp_win);
 +				break;
 +			}
  			if(Event.xproperty.atom == XA_WM_COLORMAP_WINDOWS) {
  				FetchWmColormapWindows(Tmp_win);    /* frees old data */
  				break;
-@@ -2709,6 +2715,11 @@
+@@ -2709,6 +2715,11 @@ void HandleButtonPress(void)
  
  		for(i = 0, tbw = Tmp_win->titlebuttons; i < nb; i++, tbw++) {
  			if(Event.xany.window == tbw->window) {
 +				/* A greyed or hidden caption button does nothing
-+				 * (FluentTitles; win_fluent.h). */
-+				if(FluentButtonInert(Tmp_win, tbw)) {
++				 * (ModernTitles; win_modern.h). */
++				if(ModernButtonInert(Tmp_win, tbw)) {
 +					return;
 +				}
  				for(tbf = tbw->info->funs; tbf; tbf = tbf->next) {
  					if(tbf->num == ButtonPressed
  					                && tbf->mods == modifier) {
+diff -Nur a/twm_window_struct.h b/twm_window_struct.h
 --- a/twm_window_struct.h
 +++ b/twm_window_struct.h
-@@ -214,6 +214,13 @@
- 	/// has been looked for yet.  See win_fluent.c.
- 	struct fluent_icon *fluent_icon;
- 	bool fluent_icon_tried;
+@@ -214,6 +214,13 @@ struct TwmWindow {
+ 	/// has been looked for yet.  See win_modern.c.
+ 	struct modern_icon *modern_icon;
+ 	bool modern_icon_tried;
 +	/* What the window may do, for its caption buttons and for zooming
-+	 * (FluentTitles; see FluentCapsChanged()): be maximised, be
++	 * (ModernTitles; see ModernCapsChanged()): be maximised, be
 +	 * minimised.  Worked out from its size and Motif hints and whether it
 +	 * is a dialog, when it is managed and whenever those hints change. */
-+	bool fluent_caps_known;
-+	bool fluent_can_maximize;
-+	bool fluent_can_minimize;
- 	/// The invisible resize border around the frame (FluentTitles): an
++	bool modern_caps_known;
++	bool modern_can_maximize;
++	bool modern_can_minimize;
+ 	/// The invisible resize border around the frame (ModernTitles): an
  	/// InputOnly sibling of the frame, stacked right under it, and the
  	/// frame geometry it follows.  None when the window has no border.
---- a/win_fluent.c
-+++ b/win_fluent.c
+diff -Nur a/win_modern.c b/win_modern.c
+--- a/win_modern.c
++++ b/win_modern.c
 @@ -35,7 +35,9 @@
  #include <X11/Xutil.h>
  #include <X11/Xft/Xft.h>
@@ -93,17 +97,17 @@ Copyright (C) 2026 The LikeOS Project
 +#include "mwmhints.h"
  #include "screen.h"
  #include "win_decorations.h"
- #include "win_fluent.h"
+ #include "win_modern.h"
 @@ -44,6 +46,7 @@
- #define FL_INACTIVE_BG   0xf3f3f3
- #define FL_ACTIVE_FG     0x000000
- #define FL_INACTIVE_FG   0x8f8f8f
-+#define FL_DISABLED_FG   0xc5c5c5  /* a caption button that does nothing */
- #define FL_HOVER_ALPHA   0.06
- #define FL_CLOSE_BG      0xc42b1c
- #define FL_CLOSE_FG      0xffffff
-@@ -261,6 +264,102 @@
- 	return FL_NONE;
+ #define MD_INACTIVE_BG   0xf5f7fb
+ #define MD_ACTIVE_FG     0x141a24
+ #define MD_INACTIVE_FG   0x586174
++#define MD_DISABLED_FG   0xa3abb9  /* a caption button that does nothing */
+ #define MD_HOVER_TINT    0x1c3a78  /* the wash under the pointer ... */
+ #define MD_HOVER_ALPHA   0.06      /* ... and how much of it */
+ #define MD_CLOSE_BG      0xe0443e
+@@ -327,6 +330,102 @@ md_kind(TitleButton *tb)
+ 	return MD_NONE;
  }
  
 +/* ------------------------------------------------------------------------ */
@@ -111,7 +115,7 @@ Copyright (C) 2026 The LikeOS Project
 +/* ------------------------------------------------------------------------ */
 +
 +static void
-+fl_caps(TwmWindow *t)
++md_caps(TwmWindow *t)
 +{
 +	MotifWmHints mwm;
 +	XSizeHints *h = &t->hints;
@@ -121,67 +125,67 @@ Copyright (C) 2026 The LikeOS Project
 +	             h->min_width == h->max_width &&
 +	             h->min_height == h->max_height;
 +
-+	t->fluent_can_maximize = !fixed &&
++	t->modern_can_maximize = !fixed &&
 +	                         !(have_funcs && !(mwm.functions & MWM_FUNC_MAXIMIZE));
-+	t->fluent_can_minimize = !t->istransient &&
++	t->modern_can_minimize = !t->istransient &&
 +	                         !(have_funcs && !(mwm.functions & MWM_FUNC_MINIMIZE));
-+	t->fluent_caps_known = true;
++	t->modern_caps_known = true;
 +}
 +
 +bool
-+FluentCanMaximize(TwmWindow *tmp_win)
++ModernCanMaximize(TwmWindow *tmp_win)
 +{
-+	if(!tmp_win->fluent_caps_known) {
-+		fl_caps(tmp_win);
++	if(!tmp_win->modern_caps_known) {
++		md_caps(tmp_win);
 +	}
-+	return tmp_win->fluent_can_maximize;
++	return tmp_win->modern_can_maximize;
 +}
 +
 +bool
-+FluentCanMinimize(TwmWindow *tmp_win)
++ModernCanMinimize(TwmWindow *tmp_win)
 +{
-+	if(!tmp_win->fluent_caps_known) {
-+		fl_caps(tmp_win);
++	if(!tmp_win->modern_caps_known) {
++		md_caps(tmp_win);
 +	}
-+	return tmp_win->fluent_can_minimize;
++	return tmp_win->modern_can_minimize;
 +}
 +
-+typedef enum { FL_BTN_ENABLED, FL_BTN_DISABLED, FL_BTN_HIDDEN } FluentButtonState;
++typedef enum { MD_BTN_ENABLED, MD_BTN_DISABLED, MD_BTN_HIDDEN } ModernButtonState;
 +
-+static FluentButtonState
-+fl_button_state(TwmWindow *t, FluentKind kind)
++static ModernButtonState
++md_button_state(TwmWindow *t, ModernKind kind)
 +{
 +	bool max, min;
 +
-+	if(kind != FL_MINIMIZE && kind != FL_MAXIMIZE) {
-+		return FL_BTN_ENABLED;
++	if(kind != MD_MINIMIZE && kind != MD_MAXIMIZE) {
++		return MD_BTN_ENABLED;
 +	}
-+	max = FluentCanMaximize(t);
-+	min = FluentCanMinimize(t);
++	max = ModernCanMaximize(t);
++	min = ModernCanMinimize(t);
 +	/* A window that is zoomed can always be restored. */
 +	if(t->zoomed != ZOOM_NONE) {
 +		max = true;
 +	}
 +	if(!max && !min) {
-+		return FL_BTN_HIDDEN;
++		return MD_BTN_HIDDEN;
 +	}
-+	if((kind == FL_MAXIMIZE && !max) || (kind == FL_MINIMIZE && !min)) {
-+		return FL_BTN_DISABLED;
++	if((kind == MD_MAXIMIZE && !max) || (kind == MD_MINIMIZE && !min)) {
++		return MD_BTN_DISABLED;
 +	}
-+	return FL_BTN_ENABLED;
++	return MD_BTN_ENABLED;
 +}
 +
 +bool
-+FluentButtonInert(TwmWindow *tmp_win, TBWindow *tbw)
++ModernButtonInert(TwmWindow *tmp_win, TBWindow *tbw)
 +{
-+	if(!fl_usable() || !tmp_win || !tbw) {
++	if(!md_usable() || !tmp_win || !tbw) {
 +		return false;
 +	}
-+	return fl_button_state(tmp_win, fl_kind(tbw->info)) != FL_BTN_ENABLED;
++	return md_button_state(tmp_win, md_kind(tbw->info)) != MD_BTN_ENABLED;
 +}
 +
 +void
-+FluentCapsChanged(TwmWindow *tmp_win)
++ModernCapsChanged(TwmWindow *tmp_win)
 +{
 +	TBWindow *tbw;
 +	int nb;
@@ -189,59 +193,62 @@ Copyright (C) 2026 The LikeOS Project
 +	if(!tmp_win) {
 +		return;
 +	}
-+	fl_caps(tmp_win);
-+	if(!fl_usable() || !tmp_win->titlebuttons) {
++	md_caps(tmp_win);
++	if(!md_usable() || !tmp_win->titlebuttons) {
 +		return;
 +	}
 +	nb = Scr->TBInfo.nleft + Scr->TBInfo.nright;
 +	tbw = tmp_win->titlebuttons;
 +	for(int i = 0; i < nb; i++, tbw++) {
-+		if(!FluentPaintTitleButton(tmp_win, tbw)) {
++		if(!ModernPaintTitleButton(tmp_win, tbw)) {
 +			PaintTitleButton(tmp_win, tbw);
 +		}
 +	}
 +}
 +
  bool
- FluentPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
+ ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
  {
-@@ -278,11 +377,17 @@
+@@ -344,13 +443,19 @@ ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
  		return false;
  	}
  
-+	FluentButtonState state = fl_button_state(tmp_win, kind);
++	ModernButtonState state = md_button_state(tmp_win, kind);
 +
  	focus = tmp_win->hasfocusvisible;
  	restore = (tmp_win->zoomed != ZOOM_NONE);
- 	bg = focus ? FL_ACTIVE_BG : FL_INACTIVE_BG;
- 	fg = focus ? FL_ACTIVE_FG : FL_INACTIVE_FG;
--	if(tbw->hover) {
+ 	bg = focus ? MD_ACTIVE_BG : MD_INACTIVE_BG;
+ 	fg = focus ? MD_ACTIVE_FG : MD_INACTIVE_FG;
 +	/* Greyed, and no highlight under the pointer: it does nothing. */
-+	if(state == FL_BTN_DISABLED) {
-+		fg = FL_DISABLED_FG;
++	if(state == MD_BTN_DISABLED) {
++		fg = MD_DISABLED_FG;
 +	}
-+	if(tbw->hover && state == FL_BTN_ENABLED) {
- 		if(kind == FL_CLOSE) {
- 			bg = FL_CLOSE_BG;
- 			fg = FL_CLOSE_FG;
-@@ -310,7 +415,8 @@
- 
- 	gx = (w - FL_GLYPH) / 2;
- 	gy = (h - FL_GLYPH) / 2;
--	for(int j = 0; j < FL_GLYPH; j++) {
-+	/* Not shown: the title bar's own colour, nothing on it. */
-+	for(int j = 0; state != FL_BTN_HIDDEN && j < FL_GLYPH; j++) {
- 		for(int i = 0; i < FL_GLYPH; i++) {
- 			double c = glyph_cover(kind, restore, i, j);
- 
---- a/win_fluent.h
-+++ b/win_fluent.h
-@@ -63,6 +63,30 @@
+ 	/* At rest the button is the title bar's own colour; under the pointer
+ 	 * its rounded rectangle is filled. */
+-	lit = tbw->hover;
++	lit = tbw->hover && state == MD_BTN_ENABLED;
+ 	fill = bg;
+ 	if(lit) {
+ 		if(kind == MD_CLOSE) {
+@@ -385,7 +490,8 @@ ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
+ 				c = md_blend(bg, fill, rrect_cover(x, y - by, w, bh,
+ 				                                   MD_BUTTON_RADIUS));
+ 			}
+-			if(x >= gx - 1 && x <= gx + MD_GLYPH &&
++			/* Not shown: the title bar's own colour, nothing on it. */
++			if(state != MD_BTN_HIDDEN && x >= gx - 1 && x <= gx + MD_GLYPH &&
+ 			                y >= gy - 1 && y <= gy + MD_GLYPH) {
+ 				a = glyph_cover(kind, restore, x - gx, y - gy);
+ 				c = md_blend(c, fg, a);
+diff -Nur a/win_modern.h b/win_modern.h
+--- a/win_modern.h
++++ b/win_modern.h
+@@ -78,6 +78,30 @@ void ModernForgetWindow(TwmWindow *tmp_win);
   * is a frame that has one.
   */
  
 +/*
-+ * What a window may do, as Windows decides it for its caption buttons:
++ * What a window may do, which decides its caption buttons:
 + *
 + *   maximise -- not when its size is fixed (the same minimum and maximum
 + *               size, which is how GTK marks a dialog that is not resizable)
@@ -255,31 +262,32 @@ Copyright (C) 2026 The LikeOS Project
 + * Zooming by any other way (a double click on the title, a key, an EWMH
 + * request) is refused the same way.
 + */
-+bool FluentCanMaximize(TwmWindow *tmp_win);
-+bool FluentCanMinimize(TwmWindow *tmp_win);
++bool ModernCanMaximize(TwmWindow *tmp_win);
++bool ModernCanMinimize(TwmWindow *tmp_win);
 +/* The hints changed (or the window is new): work it out again and repaint
 + * the caption buttons. */
-+void FluentCapsChanged(TwmWindow *tmp_win);
++void ModernCapsChanged(TwmWindow *tmp_win);
 +/* Whether a press on this caption button is to be ignored (greyed or not
 + * shown). */
-+bool FluentButtonInert(TwmWindow *tmp_win, TBWindow *tbw);
++bool ModernButtonInert(TwmWindow *tmp_win, TBWindow *tbw);
 +
  /* Create the border for a newly managed window (frame already created). */
- void FluentGripCreate(TwmWindow *tmp_win);
+ void ModernGripCreate(TwmWindow *tmp_win);
  
+diff -Nur a/win_resize.c b/win_resize.c
 --- a/win_resize.c
 +++ b/win_resize.c
-@@ -938,6 +938,16 @@
+@@ -938,6 +938,16 @@ void fullzoom(TwmWindow *tmp_win, int func)
  		return;
  	}
  
 +	/* A window that may not be maximised is not zoomed any way -- the
-+	 * caption button is greyed or not shown (win_fluent.h), and a double
++	 * caption button is greyed or not shown (win_modern.h), and a double
 +	 * click on its title, a key or an EWMH request does nothing either.
 +	 * Restoring one that is zoomed stays possible: its hints may have
 +	 * changed since. */
 +	if(tmp_win->zoomed == ZOOM_NONE && func != ZOOM_NONE &&
-+	                !FluentCanMaximize(tmp_win)) {
++	                !ModernCanMaximize(tmp_win)) {
 +		return;
 +	}
 +

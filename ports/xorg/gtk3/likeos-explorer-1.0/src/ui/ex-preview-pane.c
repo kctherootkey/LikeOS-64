@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the details and preview panes.
+// LikeOS Explorer: the details and preview panes.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -22,7 +22,7 @@ static void destroy_child(GtkWidget *w, gpointer data)
 
 typedef struct {
 	GtkWidget *root; /* scrolled window */
-	GtkWidget *picture, *name, *kind, *grid, *text_sw, *text;
+	GtkWidget *picture, *name, *kind, *heading, *grid, *text_sw, *text;
 	ExSelection *sel;
 	ExLocation *loc;
 	char *mode;
@@ -208,8 +208,12 @@ static void show_file(Pane *p, ExFile *f, gboolean preview)
 	int scale = gtk_widget_get_scale_factor(p->root);
 	GdkPixbuf *icon = ex_icons_for_file(f, 96, scale, FALSE, FALSE);
 	const char *ct = ex_file_get_content_type(f);
-	char *kind = ex_file_get_type_description(f);
+	char *kind = ex_icons_kind_label(f);
 	GFile *gf = ex_file_get_file(f);
+	gboolean is_text = !ex_file_is_dir(f) &&
+			   (g_content_type_is_a(ct, "text/plain") ||
+			    g_str_has_prefix(ct, "text/")) &&
+			   (ex_file_get_caps(f) & EX_CAP_READ);
 
 	set_picture(p, icon);
 	g_clear_object(&icon);
@@ -261,11 +265,25 @@ static void show_file(Pane *p, ExFile *f, gboolean preview)
 	}
 	if (g_str_has_prefix(ct, "audio/") || g_str_has_prefix(ct, "video/"))
 		ex_media_describe_async(gf, p->cancel, got_media, p);
-	if (preview && !ex_file_is_dir(f) &&
-	    (g_content_type_is_a(ct, "text/plain") ||
-	     g_str_has_prefix(ct, "text/")) &&
-	    (ex_file_get_caps(f) & EX_CAP_READ))
+	if (preview && is_text)
 		g_file_read_async(gf, G_PRIORITY_DEFAULT, p->cancel, text_opened, p);
+	/* The preview pane is the item's contents alone:
+	 * the picture or the text, and where there is neither, a word saying
+	 * so -- the facts are the details pane's. */
+	if (preview) {
+		gtk_widget_hide(p->name);
+		gtk_widget_hide(p->heading);
+		gtk_widget_hide(p->grid);
+		if (is_text || ex_thumbs_supported(f)) {
+			gtk_widget_hide(p->kind);
+			if (is_text)
+				gtk_widget_hide(p->picture);
+		} else {
+			gtk_widget_hide(p->picture);
+			gtk_label_set_text(GTK_LABEL(p->kind),
+					   "No preview available.");
+		}
+	}
 }
 
 static void update(Pane *p)
@@ -280,11 +298,17 @@ static void update(Pane *p)
 	p->cancel = g_cancellable_new();
 	forget_shown(p);
 	clear_grid(p);
+	gtk_widget_show(p->picture);
+	gtk_widget_show(p->name);
+	gtk_widget_show(p->kind);
+	gtk_widget_show(p->grid);
+	gtk_widget_hide(p->heading);
 	gtk_widget_hide(p->text_sw);
 	gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->text)),
 				 "", 0);
 
 	if (items->len == 1) {
+		gtk_widget_show(p->heading);
 		show_file(p, g_ptr_array_index(items, 0), preview);
 	} else if (items->len > 1) {
 		char *n = g_strdup_printf("%u items selected", items->len);
@@ -377,11 +401,15 @@ GtkWidget *ex_preview_pane_new(ExSelection *sel)
 	gtk_label_set_line_wrap_mode(GTK_LABEL(p->name), PANGO_WRAP_WORD_CHAR);
 	gtk_label_set_selectable(GTK_LABEL(p->name), TRUE);
 	gtk_label_set_xalign(GTK_LABEL(p->name), 0);
-	ex_style_add(p->name, EX_CLASS_SECTION_TITLE);
+	ex_style_add(p->name, "ex-pane-title");
 	p->kind = gtk_label_new("");
 	gtk_label_set_xalign(GTK_LABEL(p->kind), 0);
 	gtk_label_set_line_wrap(GTK_LABEL(p->kind), TRUE);
 	ex_style_add(p->kind, EX_CLASS_DIM);
+	/* The heading over an item's facts. */
+	p->heading = gtk_label_new("Details");
+	gtk_label_set_xalign(GTK_LABEL(p->heading), 0);
+	ex_style_add(p->heading, "ex-pane-heading");
 	p->grid = gtk_grid_new();
 	gtk_grid_set_column_spacing(GTK_GRID(p->grid), 12);
 	gtk_grid_set_row_spacing(GTK_GRID(p->grid), 6);
@@ -396,11 +424,13 @@ GtkWidget *ex_preview_pane_new(ExSelection *sel)
 	gtk_box_pack_start(GTK_BOX(box), p->picture, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(box), p->name, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(box), p->kind, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(box), p->grid, FALSE, FALSE, 6);
+	gtk_box_pack_start(GTK_BOX(box), p->heading, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(box), p->grid, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(box), p->text_sw, TRUE, TRUE, 0);
 	gtk_container_add(GTK_CONTAINER(p->root), box);
 	gtk_widget_show_all(box);
 	gtk_widget_hide(p->text_sw);
+	gtk_widget_hide(p->heading);
 
 	g_object_set_data_full(G_OBJECT(p->root), "ex-pane", p,
 			       (GDestroyNotify)pane_free);

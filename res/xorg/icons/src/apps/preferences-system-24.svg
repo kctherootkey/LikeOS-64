@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: preferences-system, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="5.333" y1="5.333" x2="35.2" y2="58.667"><stop offset="0" stop-color="#7a879e"/><stop offset="1" stop-color="#3b465c"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M17.333 5.333H46.667A12 12 0 0 1 58.667 17.333V46.667A12 12 0 0 1 46.667 58.667H17.333A12 12 0 0 1 5.333 46.667V17.333A12 12 0 0 1 17.333 5.333Z" fill="url(#g1)"/>
+<path d="M45.747 33.354L49.863 37.419L48.463 40.799L42.678 40.763L40.763 42.678L40.799 48.463L37.419 49.863L33.354 45.747L30.646 45.747L26.581 49.863L23.201 48.463L23.237 42.678L21.322 40.763L15.537 40.799L14.137 37.419L18.253 33.354L18.253 30.646L14.137 26.581L15.537 23.201L21.322 23.237L23.237 21.322L23.201 15.537L26.581 14.137L30.646 18.253L33.354 18.253L37.419 14.137L40.799 15.537L40.763 21.322L42.678 23.237L48.463 23.201L49.863 26.581L45.747 30.646ZM25.653 32A6.347 6.347 0 1 0 38.347 32A6.347 6.347 0 1 0 25.653 32Z" fill="#ffffff" stroke="#ffffff" stroke-width="1.493" stroke-linecap="round" stroke-linejoin="round" fill-rule="evenodd"/>
+</g>
+</svg>

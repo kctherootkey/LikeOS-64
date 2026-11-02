@@ -1,4 +1,5 @@
-// LikeOS -- Media Player: the application state every module shares.
+// LikeOS -- LikeOS Media Player: the application state every module
+// shares.
 //
 // The program is split by concern -- player.c drives GStreamer, playlist.c
 // owns the play queue, window.c builds and runs the interface, dialogs.c holds
@@ -14,11 +15,12 @@
 #include <gst/gst.h>
 
 #include "discover.h"
+#include "library.h"
 #include "player.h"
 #include "playlist.h"
 #include "settings.h"
 
-#define MP_APP_NAME "Media Player"
+#define MP_APP_NAME "LikeOS Media Player"
 #define MP_APP_ID "mediaplayer"
 #define MP_ICON_NAME "multimedia-player"
 
@@ -51,11 +53,18 @@ typedef struct {
 typedef struct {
 	/* ---- top level ---- */
 	GtkWidget *window;
-	GtkWidget *paned;	/* media area | play queue */
 	GtkWidget *infobar;
 	GtkWidget *infobar_label;
+	GtkWidget *nav_pane;	/* the sidebar at the left */
+	GtkWidget *nav_queue_count; /* the number beside "Queue" in it */
+	GtkWidget *pages;	/* GtkStack: one child per page */
+	GtkWidget *content;	/* the card the pages sit on */
+	GtkWidget *stage_overlay; /* the body, with the bar on the stage */
+	GtkWidget *bar_slot;	/* where the transport bar sits normally */
+	GtkWidget *top_revealer; /* back button and title above the stage */
+	GtkWidget *top_title;
 
-	/* ---- media area ---- */
+	/* ---- media area (the "now" page) ---- */
 	GtkWidget *media_events; /* event box around the stack */
 	GtkWidget *media_stack;	 /* "video" or "art" */
 	GtkWidget *video_widget; /* whatever the player renders into */
@@ -65,7 +74,7 @@ typedef struct {
 	GtkWidget *art_album;
 	GtkWidget *art_status;	 /* "Buffering 40 %", "Stopped" */
 
-	/* ---- control bar ---- */
+	/* ---- the transport strip ---- */
 	GtkWidget *controls_revealer;
 	GtkWidget *controls;
 	GtkWidget *seek_scale;
@@ -73,31 +82,33 @@ typedef struct {
 	GtkWidget *time_label;
 	GtkWidget *duration_label;
 	GtkWidget *thumb_area;	/* small cover beside the title */
+	GtkWidget *now_box;	/* thumb and the two lines beside it */
 	GtkWidget *now_title;
 	GtkWidget *now_artist;
 	GtkWidget *btn_shuffle;
 	GtkWidget *btn_prev;
 	GtkWidget *btn_play;
-	GtkWidget *btn_stop;
 	GtkWidget *btn_next;
 	GtkWidget *btn_repeat;
-	GtkWidget *btn_mute;
+	GtkWidget *bar_right;	/* volume, queue and the view buttons */
+	GtkWidget *btn_queue;
+	GtkWidget *btn_volume;
+	GtkWidget *btn_mute;	/* the speaker beside the volume slider */
 	GtkWidget *volume_scale;
+	GtkWidget *volume_value; /* the volume in per cent, NULL if not shown */
 	GtkAdjustment *volume_adj;
-	GtkWidget *btn_playlist;
+	GtkWidget *btn_mini;
 	GtkWidget *btn_fullscreen;
 	GtkWidget *btn_menu;
 	GtkWidget *menu;
-	GtkWidget *menu_show_playlist;
-	GtkWidget *menu_subtitles;
+	GtkWidget *menu_stop;
 	GtkWidget *menu_audio_tracks;	 /* submenu item */
 	GtkWidget *menu_subtitle_tracks; /* submenu item */
 	GtkWidget *menu_speed;		 /* submenu item */
 
-	/* ---- play queue ---- */
-	GtkWidget *queue_panel;
+	/* ---- play queue page ---- */
 	GtkWidget *queue_view;
-	GtkWidget *queue_count;
+	GtkWidget *queue_header; /* its status line counts the entries */
 	GtkWidget *queue_empty;	/* "Drop files here" hint */
 	GtkWidget *queue_stack;
 
@@ -107,6 +118,7 @@ typedef struct {
 	MpSettings settings;
 	MpOptions *options;
 	MpDiscover *discover;
+	MpLibrary *library;
 	GCancellable *cancel;	/* cancelled when the window goes */
 	guint scans_running;
 
@@ -114,6 +126,8 @@ typedef struct {
 	guint current_id;	/* playlist entry that is loaded, 0 = none */
 	gint64 duration;	/* of the loaded entry, -1 when unknown */
 	gboolean fullscreen;
+	gboolean immersive;	/* stage alone, dark bars that hide */
+	gboolean mini;		/* the mini player */
 	gboolean user_seeking;	/* the seek bar is being dragged */
 	gboolean updating_seek;	/* we are moving the seek bar ourselves */
 	gboolean updating_volume;
@@ -154,6 +168,20 @@ void mp_app_schedule_save(MpApp *app);
 void mp_app_set_speed(MpApp *app, double rate);
 void mp_app_update_queue_count(MpApp *app);
 void mp_app_clear_queue(MpApp *app);
+/* Replace the queue with `uris' (in order) and play entry `start';
+ * `shuffle' turns shuffle on first and starts at a random entry. */
+void mp_app_play_uris(MpApp *app, GPtrArray *uris, guint start,
+		      gboolean shuffle);
+/* Add `uris' to the queue: right after what is playing when `next',
+ * at the end otherwise. */
+void mp_app_queue_uris(MpApp *app, GPtrArray *uris, gboolean next);
+/* Open or replace the queue with a playlist file and play it. */
+void mp_app_play_playlist_file(MpApp *app, const char *path, gboolean add);
+void mp_app_set_mini(MpApp *app, gboolean mini);
+/* The page shown changed: the bars follow (floating over a video). */
+void mp_app_page_changed(MpApp *app);
+void mp_app_set_discover(MpApp *app, gboolean on);
+const char *mp_app_current_uri(MpApp *app);
 
 /* dialogs.c */
 /* "Open" plays what was chosen at once; "Add" only queues it (and plays it
@@ -173,6 +201,23 @@ void mp_dialog_error(MpApp *app, const char *primary, const char *secondary,
 		     const char *details, gboolean offer_next);
 void mp_dialog_message(GtkWindow *parent, GtkMessageType type,
 		       const char *primary, const char *secondary);
+
+/* pages.c: the sidebar and every page but "queue" and "now". */
+void mp_pages_build(MpApp *app, GtkWidget *queue_page, GtkWidget *now_page);
+/* Once the window is shown: Home comes up and the folders are read. */
+void mp_pages_start(MpApp *app);
+void mp_pages_show(MpApp *app, const char *name);
+/* Back from "now" (or an album) to the page that was shown before. */
+void mp_pages_back(MpApp *app);
+const char *mp_pages_current(MpApp *app);
+/* What plays changed: the lists recolour their playing row and Home's
+ * recent tiles are brought up to date. */
+void mp_pages_now_playing_changed(MpApp *app);
+void mp_pages_rescan(MpApp *app, gboolean retag);
+void mp_pages_free(MpApp *app);
+/* Focus is in something that takes typing (the search box). */
+gboolean mp_pages_typing(MpApp *app);
+void mp_pages_focus_search(MpApp *app);
 
 /* style.c */
 void mp_style_install(void);

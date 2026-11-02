@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: undo and redo.
+// LikeOS Explorer: undo and redo.
 //
 // Copyright (C) 2026 The LikeOS Project
 

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: Share.
+// LikeOS Explorer: Share.
 //
 // Where items can go from here, as a short list of targets: an e-mail
 // attachment through the mail program the system uses for mailto: links

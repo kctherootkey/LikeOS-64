@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: what a song or a video is.
+// LikeOS Explorer: what a song or a video is.
 //
 // Length, picture size and the title, artist and album tags, read with
 // GStreamer's discoverer in a worker thread -- for the preview and details

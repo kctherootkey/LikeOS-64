@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: user-bookmarks, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="2.833" x2="0" y2="64.167"><stop offset="0" stop-color="#ffd86b"/><stop offset="1" stop-color="#f2a516"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="2.833" x2="0" y2="64.167"><stop offset="0" stop-color="#f7c040"/><stop offset="1" stop-color="#e08d00"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M32 2.833L40.472 21.839L61.166 24.023L45.708 37.954L50.025 58.31L32 47.913L13.975 58.31L18.292 37.954L2.834 24.023L23.528 21.839Z" fill="url(#g1)" stroke="url(#g2)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

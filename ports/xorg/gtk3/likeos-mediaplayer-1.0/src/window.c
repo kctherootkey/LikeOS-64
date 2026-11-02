@@ -1,21 +1,28 @@
-// LikeOS -- Media Player: the main window.
+// LikeOS -- LikeOS Media Player: the main window.
 //
-// Layout, in the manner of Windows 11's own Media Player:
+//   +----------------+---------------------------------------------------+
+//   | [Search    ] [|]|  Music                    [Add folder] [Shuffle] |
+//   |                |  23 songs · 6 albums · 5 artists                  |
+//   | LIBRARY        |  ( Songs | Albums | Artists )           Sort: A-Z |
+//   |   Recent       |  +-------+ +-------+ +-------+                    |
+//   |   Music        |  |  art  | |  art  | |  art  |   (pages.c)        |
+//   |   Videos       |  | Title | | Title | | Title |                    |
+//   | PLAYBACK       |  +-------+ +-------+ +-------+                    |
+//   |   Now playing  |                                                   |
+//   |   Queue     12 |                                                   |
+//   | PLAYLISTS    + |                                                   |
+//   |   All playlists|                                                   |
+//   |   Settings     |                                                   |
+//   +----------------+---------------------------------------------------+
+//   |  ( [art] Title   shuffle prev (PLAY) next repeat   vol --o-- ... ) |
+//   |  (       Artist  0:42 ============o-------- 3:51   queue mini  ) |
+//   +--------------------------------------------------------------------+
 //
-//   +--------------------------------------------+-----------------+
-//   |                                            | Play queue   12 |
-//   |        video, or the cover art page        |  > Track one    |
-//   |                                            |    Track two    |
-//   |                                            |    ...          |
-//   +--------------------------------------------+                 |
-//   | 0:42 ============o------------------- 3:51 |                 |
-//   | [art] Title   (shuf) (<<) (>) (>>) (rep)   | [+][dir][-] ... |
-//   |       Artist        (mute)--o (queue)(fs)(=)                 |
-//   +--------------------------------------------+-----------------+
-//
-// The queue sits in a GtkPaned so its width is the user's; fullscreen hides
-// it and turns the control bar into a dark strip that slides away while the
-// pointer rests.
+// The light sidebar and pages above a dark rounded transport strip.  The
+// "now playing" page is the stage: the cover on a blurred wash of its
+// colours, or the video.  A video, full screen and the mini player make the
+// window immersive: the sidebar goes, the window turns black and the dark
+// strips above and below the picture slide away while the pointer rests.
 //
 // Keyboard handling is done once, at the window, before GTK hands the key
 // to the focused widget -- so Space always means play/pause, not "press the
@@ -32,6 +39,7 @@
 
 #include "mediaplayer.h"
 #include "scan.h"
+#include "ui.h"
 #include "util.h"
 
 enum {
@@ -54,8 +62,14 @@ typedef struct {
 	guint count_timer;
 	double scroll_accum;
 	GdkCursor *blank_cursor;
-	gboolean queue_was_visible;
 	GtkWidget *queue_menu;
+	GtkWidget *bar;		/* the transport strip, wherever it sits */
+	GtkWidget *bar_separator; /* between the volume and the views */
+	gboolean auto_now;	/* "now" was opened for a video by itself */
+	guint auto_now_id;	/* ... for this entry */
+	int mini_w, mini_h;	/* window size before the mini player */
+	gchar *recent_uri;	/* last entry put on the recent list */
+	gboolean recent_artist;	/* ... with its artist */
 	GtkWidget *speed_items[N_SPEEDS];
 	gboolean building_menu;
 	double drag_value;	/* seconds: where the dragged bar is */
@@ -76,35 +90,9 @@ static void update_gapless_next(MpApp *app);
 static void show_controls(MpApp *app);
 static void infobar_show(MpApp *app, GtkMessageType type, const char *text);
 static void on_fullscreen_clicked(GtkButton *b, gpointer data);
+static void update_immersive(MpApp *app);
 
 /* ---- small widget helpers --------------------------------------------- */
-
-static GtkWidget *icon_button(const char *icon, const char *tooltip,
-			      const char *css_class, GtkIconSize size,
-			      gboolean toggle)
-{
-	GtkWidget *b = toggle ? gtk_toggle_button_new() : gtk_button_new();
-	GtkWidget *img = gtk_image_new_from_icon_name(icon, size);
-	gtk_container_add(GTK_CONTAINER(b), img);
-	gtk_widget_set_tooltip_text(b, tooltip);
-	gtk_widget_set_can_focus(b, FALSE);
-	gtk_widget_set_focus_on_click(b, FALSE);
-	gtk_widget_set_valign(b, GTK_ALIGN_CENTER);
-	if (css_class != NULL)
-		gtk_style_context_add_class(gtk_widget_get_style_context(b),
-					    css_class);
-	return b;
-}
-
-static void set_button_icon(GtkWidget *b, const char *icon)
-{
-	GtkWidget *img = gtk_bin_get_child(GTK_BIN(b));
-	GtkIconSize size = GTK_ICON_SIZE_BUTTON;
-	if (GTK_IS_IMAGE(img)) {
-		gtk_image_get_icon_name(GTK_IMAGE(img), NULL, &size);
-		gtk_image_set_from_icon_name(GTK_IMAGE(img), icon, size);
-	}
-}
 
 static void add_class(GtkWidget *w, const char *cls)
 {
@@ -156,18 +144,14 @@ static void capture_geometry(MpApp *app)
 	if (w == NULL)
 		return;
 	GdkWindowState st = gdk_window_get_state(w);
-	if (!(st & (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED))) {
+	if (!(st & (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED)) &&
+	    !app->mini) {
 		int ww = 0, wh = 0;
 		gtk_window_get_size(GTK_WINDOW(app->window), &ww, &wh);
 		if (ww >= 320 && wh >= 240) {
 			app->settings.width = ww;
 			app->settings.height = wh;
 		}
-	}
-	if (gtk_widget_get_visible(app->queue_panel) && !app->fullscreen) {
-		int qw = gtk_widget_get_allocated_width(app->queue_panel);
-		if (qw >= 160)
-			app->settings.queue_width = qw;
 	}
 }
 
@@ -207,8 +191,14 @@ static gboolean count_timeout(gpointer data)
 				       total > 0 ? t : "--:--");
 		g_free(t);
 	}
-	gtk_label_set_text(GTK_LABEL(app->queue_count), text);
+	mp_page_set_subtitle(app->queue_header, n > 0 ? text : NULL);
 	g_free(text);
+	if (app->nav_queue_count != NULL) {
+		gchar *c = g_strdup_printf("%u", n);
+		gtk_label_set_text(GTK_LABEL(app->nav_queue_count), c);
+		gtk_widget_set_visible(app->nav_queue_count, n > 0);
+		g_free(c);
+	}
 	gtk_stack_set_visible_child_name(GTK_STACK(app->queue_stack),
 					 n > 0 ? "list" : "empty");
 
@@ -233,37 +223,105 @@ static void on_playlist_changed(MpPlaylist *pl, gpointer data)
 	update_gapless_next(app);
 }
 
-static void title_cell_data(GtkTreeViewColumn *col, GtkCellRenderer *cell,
+/* The queue's text cells: the playing entry in the accent colour and
+ * semibold, entries that failed greyed out -- colours from the style sheet
+ * through the classes below, so a dark or a foreign theme gets its own. */
+typedef struct {
+	MpApp *app;
+	int col;
+	gboolean secondary;
+} QueueCell;
+
+/* The mark before an entry: the level bars while it plays, the pause
+ * bars while it is paused (both drawn by glyphs.c in the accent colour),
+ * the theme's warning sign when it failed. */
+static void queue_mark_cell(GtkTreeViewColumn *col, GtkCellRenderer *cell,
 			    GtkTreeModel *m, GtkTreeIter *it, gpointer data)
 {
-	(void)col;
 	(void)data;
-	gchar *title = NULL, *artist = NULL;
-	gint weight = PANGO_WEIGHT_NORMAL;
-	gboolean failed = FALSE;
-	gtk_tree_model_get(m, it, MP_COL_TITLE, &title, MP_COL_ARTIST,
-			   &artist, MP_COL_WEIGHT, &weight, MP_COL_FAILED,
-			   &failed, -1);
-	gchar *et = g_markup_escape_text(title ? title : "", -1);
-	gchar *markup;
-	const char *open = failed ? "<span foreground=\"#a0a0a0\">" : "";
-	const char *close = failed ? "</span>" : "";
-	if (artist != NULL && *artist) {
-		gchar *ea = g_markup_escape_text(artist, -1);
-		markup = g_strdup_printf(
-			"%s<span weight=\"%d\">%s</span>\n"
-			"<span size=\"small\" foreground=\"#616161\">%s</span>%s",
-			open, weight, et, ea, close);
-		g_free(ea);
-	} else {
-		markup = g_strdup_printf("%s<span weight=\"%d\">%s</span>%s",
-					 open, weight, et, close);
+	gchar *icon = NULL;
+	gtk_tree_model_get(m, it, MP_COL_ICON, &icon, -1);
+	const char *glyph = NULL;
+	if (g_strcmp0(icon, "media-playback-start-symbolic") == 0)
+		glyph = "likeos-now-playing";
+	else if (g_strcmp0(icon, "media-playback-pause-symbolic") == 0)
+		glyph = "likeos-pause";
+	if (glyph == NULL) {
+		g_object_set(cell, "surface", NULL, "icon-name", icon, NULL);
+		g_free(icon);
+		return;
 	}
-	g_object_set(cell, "markup", markup, NULL);
-	g_free(markup);
-	g_free(et);
-	g_free(title);
-	g_free(artist);
+	g_free(icon);
+	GtkWidget *tv = gtk_tree_view_column_get_tree_view(col);
+	GtkStyleContext *ctx = gtk_widget_get_style_context(tv);
+	GdkRGBA c;
+	gtk_style_context_save(ctx);
+	gtk_style_context_set_state(ctx, GTK_STATE_FLAG_NORMAL);
+	gtk_style_context_add_class(ctx, "mp-cell-current");
+	gtk_style_context_get_color(ctx, gtk_style_context_get_state(ctx), &c);
+	gtk_style_context_restore(ctx);
+	cairo_surface_t *s = mp_glyph_surface(tv, glyph, 16, &c);
+	g_object_set(cell, "icon-name", NULL, "surface", s, NULL);
+	cairo_surface_destroy(s);
+}
+
+static void queue_cell(GtkTreeViewColumn *col, GtkCellRenderer *cell,
+		       GtkTreeModel *m, GtkTreeIter *it, gpointer data)
+{
+	QueueCell *qc = data;
+	gchar *text = NULL;
+	guint id = 0;
+	gboolean failed = FALSE;
+	gtk_tree_model_get(m, it, qc->col, &text, MP_COL_ID, &id,
+			   MP_COL_FAILED, &failed, -1);
+	gboolean cur = id != 0 && id == qc->app->current_id;
+	const char *cls = failed ? "mp-cell-failed"
+			  : cur	 ? "mp-cell-current"
+			  : qc->secondary ? "mp-cell-secondary"
+					  : "mp-cell";
+	GtkStyleContext *ctx = gtk_widget_get_style_context(
+		gtk_tree_view_column_get_tree_view(col));
+	GdkRGBA c;
+	gtk_style_context_save(ctx);
+	/* The row card shows whether the row is selected or under the
+	 * pointer; the text keeps its own colour in every state. */
+	gtk_style_context_set_state(ctx, GTK_STATE_FLAG_NORMAL);
+	gtk_style_context_add_class(ctx, cls);
+	gtk_style_context_get_color(ctx, gtk_style_context_get_state(ctx), &c);
+	gtk_style_context_restore(ctx);
+	mp_cell_set_text(cell, text, &c, cur);
+	g_free(text);
+}
+
+static gboolean queue_row_current(GtkTreeModel *m, GtkTreeIter *it,
+				  gpointer data)
+{
+	MpApp *app = data;
+	guint id = 0;
+	gtk_tree_model_get(m, it, MP_COL_ID, &id, -1);
+	return id != 0 && id == app->current_id;
+}
+
+static void queue_text_column(MpApp *app, GtkTreeView *tv, int col,
+			      gboolean secondary, gboolean expand, int width,
+			      float xalign)
+{
+	QueueCell *qc = g_new0(QueueCell, 1);
+	qc->app = app;
+	qc->col = col;
+	qc->secondary = secondary;
+	GtkCellRenderer *r = gtk_cell_renderer_text_new();
+	g_object_set(r, "ellipsize", PANGO_ELLIPSIZE_END, "ypad", 11, "xpad",
+		     12, "xalign", xalign, NULL);
+	GtkTreeViewColumn *c = gtk_tree_view_column_new();
+	gtk_tree_view_column_pack_start(c, r, TRUE);
+	gtk_tree_view_column_set_cell_data_func(c, r, queue_cell, qc, g_free);
+	gtk_tree_view_column_set_expand(c, expand);
+	if (width > 0) {
+		gtk_tree_view_column_set_sizing(c, GTK_TREE_VIEW_COLUMN_FIXED);
+		gtk_tree_view_column_set_fixed_width(c, width);
+	}
+	gtk_tree_view_append_column(tv, c);
 }
 
 static GList *selected_ids(MpApp *app)
@@ -466,7 +524,7 @@ static void scan_done(MpScanResult *r, gpointer data)
 		GString *s = g_string_new(NULL);
 		if (r->truncated)
 			g_string_append_printf(
-				s, "The play queue holds at most %d entries; "
+				s, "The queue holds at most %d entries; "
 				   "the rest were not added.",
 				MP_PLAYLIST_MAX);
 		for (guint i = 0; i < r->problems->len && i < 3; i++) {
@@ -708,14 +766,49 @@ static gboolean on_art_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 	MpApp *app = data;
 	int aw = gtk_widget_get_allocated_width(w);
 	int ah = gtk_widget_get_allocated_height(w);
-	double side = MIN(MIN(aw, ah), 420);
+	double side = MIN(MIN(aw, ah), app->mini ? 1000 : 360);
 	gboolean video = app->current_id != 0 &&
 			 mp_player_has_video(app->player);
 	mp_cover_draw(cr, app->cover, (aw - side) / 2, (ah - side) / 2, side,
-		      side, 10,
-		      video ? "video-x-generic-symbolic"
-			    : "audio-x-generic-symbolic",
+		      side, 8,
+		      video ? "likeos-videos"
+			    : "likeos-music",
 		      w);
+	return FALSE;
+}
+
+/* The now-playing page's background: the cover shrunk to a few pixels and
+ * stretched back over the whole page -- a soft blur of its colours -- under
+ * the style sheet's wash, which keeps the text readable.  Without a cover,
+ * just the style sheet's background. */
+static gboolean on_wash_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+	MpApp *app = data;
+	int aw = gtk_widget_get_allocated_width(w);
+	int ah = gtk_widget_get_allocated_height(w);
+	GtkStyleContext *ctx = gtk_widget_get_style_context(w);
+	if (app->cover != NULL && aw > 0 && ah > 0) {
+		GdkPixbuf *tiny = gdk_pixbuf_scale_simple(app->cover, 6, 6,
+							  GDK_INTERP_BILINEAR);
+		if (tiny != NULL) {
+			cairo_save(cr);
+			cairo_scale(cr, aw / 5.0, ah / 5.0);
+			gdk_cairo_set_source_pixbuf(cr, tiny, -0.5, -0.5);
+			cairo_pattern_set_filter(cairo_get_source(cr),
+						 CAIRO_FILTER_BILINEAR);
+			cairo_pattern_set_extend(cairo_get_source(cr),
+						 CAIRO_EXTEND_PAD);
+			cairo_paint(cr);
+			cairo_restore(cr);
+			g_object_unref(tiny);
+		}
+		gtk_style_context_save(ctx);
+		gtk_style_context_add_class(ctx, "mp-wash-over-cover");
+		gtk_render_background(ctx, cr, 0, 0, aw, ah);
+		gtk_style_context_restore(ctx);
+	} else {
+		gtk_render_background(ctx, cr, 0, 0, aw, ah);
+	}
 	return FALSE;
 }
 
@@ -725,12 +818,34 @@ static gboolean on_thumb_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 	int aw = gtk_widget_get_allocated_width(w);
 	int ah = gtk_widget_get_allocated_height(w);
 	if (app->current_id == 0 && app->cover == NULL &&
-	    mp_player_get_state(app->player) == MP_PLAYER_STOPPED)
+	    mp_player_get_state(app->player) == MP_PLAYER_STOPPED) {
+		/* Nothing loaded: an empty slot in the text colour of the
+		 * strip, faint, with a note in it. */
+		GtkStyleContext *ctx = gtk_widget_get_style_context(w);
+		GdkRGBA c;
+		gtk_style_context_get_color(ctx, gtk_style_context_get_state(ctx),
+					    &c);
+		c.alpha *= 0.08;
+		mp_rounded_rect(cr, 0, 0, aw, ah, 8);
+		gdk_cairo_set_source_rgba(cr, &c);
+		cairo_fill(cr);
+		c.alpha = 0.35;
+		gdk_cairo_set_source_rgba(cr, &c);
+		mp_glyph_paint(cr, "likeos-music", aw / 2.0, ah / 2.0, 20);
 		return FALSE;
+	}
 	gboolean video = mp_player_has_video(app->player);
-	mp_cover_draw(cr, app->cover, 0, 0, aw, ah, 4,
-		      video ? "video-x-generic-symbolic"
-			    : "audio-x-generic-symbolic",
+	GdkPixbuf *pic = app->cover;
+	if (pic == NULL && video)
+		pic = mp_library_picture_for(app->library,
+					     mp_player_get_uri(app->player));
+	if (pic != NULL) {
+		mp_draw_picture(cr, pic, 0, 0, aw, ah, 8);
+		return FALSE;
+	}
+	mp_cover_draw(cr, NULL, 0, 0, aw, ah, 8,
+		      video ? "likeos-videos"
+			    : "likeos-music",
 		      w);
 	return FALSE;
 }
@@ -749,10 +864,10 @@ static void set_cursor_visible(MpApp *app, gboolean visible)
 	}
 }
 
-static gboolean pointer_over_controls(MpApp *app)
+static gboolean pointer_over_widget(MpApp *app, GtkWidget *w)
 {
-	GdkWindow *win = gtk_widget_get_window(app->controls);
-	if (win == NULL || !gtk_widget_get_mapped(app->controls))
+	GdkWindow *win = gtk_widget_get_window(w);
+	if (win == NULL || !gtk_widget_get_mapped(w))
 		return FALSE;
 	GdkSeat *seat = gdk_display_get_default_seat(
 		gtk_widget_get_display(app->window));
@@ -761,18 +876,26 @@ static gboolean pointer_over_controls(MpApp *app)
 	gdk_window_get_device_position(gtk_widget_get_window(app->window), ptr,
 				       &x, &y, NULL);
 	GtkAllocation a;
-	gtk_widget_get_allocation(app->controls, &a);
+	gtk_widget_get_allocation(w, &a);
 	int cx = 0, cy = 0;
-	gtk_widget_translate_coordinates(app->controls, app->window, 0, 0,
-					 &cx, &cy);
+	gtk_widget_translate_coordinates(w, app->window, 0, 0, &cx, &cy);
 	return x >= cx && x < cx + a.width && y >= cy && y < cy + a.height;
+}
+
+static gboolean pointer_over_controls(MpApp *app)
+{
+	MpPriv *pv = priv_of(app);
+	(void)pv;
+	return pointer_over_widget(app, app->controls) ||
+	       pointer_over_widget(app, app->top_revealer) ||
+	       gtk_widget_get_visible(app->menu);
 }
 
 static gboolean hide_timeout(gpointer data)
 {
 	MpApp *app = data;
 	app->hide_timer = 0;
-	if (!app->fullscreen)
+	if (!app->immersive)
 		return G_SOURCE_REMOVE;
 	/* Keep them while the pointer is on them, and while nothing plays
 	 * (a paused film with no controls looks like a hung program). */
@@ -784,8 +907,12 @@ static gboolean hide_timeout(gpointer data)
 	}
 	gtk_revealer_set_reveal_child(GTK_REVEALER(app->controls_revealer),
 				      FALSE);
+	gtk_revealer_set_reveal_child(GTK_REVEALER(app->top_revealer), FALSE);
 	app->controls_hidden = TRUE;
-	set_cursor_visible(app, FALSE);
+	/* The mini player keeps the pointer: it is a small window among
+	 * others, not a film to watch. */
+	if (!app->mini)
+		set_cursor_visible(app, FALSE);
 	return G_SOURCE_REMOVE;
 }
 
@@ -794,6 +921,8 @@ static void show_controls(MpApp *app)
 	if (app->controls_hidden) {
 		gtk_revealer_set_reveal_child(
 			GTK_REVEALER(app->controls_revealer), TRUE);
+		gtk_revealer_set_reveal_child(
+			GTK_REVEALER(app->top_revealer), app->immersive);
 		app->controls_hidden = FALSE;
 		set_cursor_visible(app, TRUE);
 	}
@@ -801,7 +930,7 @@ static void show_controls(MpApp *app)
 		g_source_remove(app->hide_timer);
 		app->hide_timer = 0;
 	}
-	if (app->fullscreen)
+	if (app->immersive)
 		app->hide_timer = g_timeout_add(MP_FULLSCREEN_HIDE_MS,
 						hide_timeout, app);
 }
@@ -812,7 +941,7 @@ static gboolean on_media_motion(GtkWidget *w, GdkEventMotion *ev,
 	(void)w;
 	(void)ev;
 	MpApp *app = data;
-	if (app->fullscreen)
+	if (app->immersive)
 		show_controls(app);
 	return FALSE;
 }
@@ -840,7 +969,7 @@ static gboolean on_media_button(GtkWidget *w, GdkEventButton *ev,
 		gtk_menu_popup_at_pointer(GTK_MENU(app->menu), (GdkEvent *)ev);
 		return TRUE;
 	}
-	if (app->fullscreen)
+	if (app->immersive)
 		show_controls(app);
 	return FALSE;
 }
@@ -901,6 +1030,25 @@ static void show_media_page(MpApp *app)
 					 video ? "video" : "art");
 	gtk_widget_queue_draw(app->art_area);
 	gtk_widget_queue_draw(app->thumb_area);
+
+	/* A video brings its stage up by itself, once per entry -- the user
+	 * may go back to the library and keep it playing there.  When the
+	 * video ends, the page it replaced comes back. */
+	MpPriv *pv = priv_of(app);
+	gboolean on_now = strcmp(mp_pages_current(app), "now") == 0;
+	if (video && pv->auto_now_id != app->current_id) {
+		pv->auto_now_id = app->current_id;
+		if (!on_now) {
+			pv->auto_now = TRUE;
+			mp_pages_show(app, "now");
+		}
+	} else if (!video && pv->auto_now && on_now && !app->mini &&
+		   !app->fullscreen &&
+		   mp_player_get_state(app->player) == MP_PLAYER_STOPPED) {
+		pv->auto_now = FALSE;
+		mp_pages_back(app);
+	}
+	update_immersive(app);
 }
 
 /* ---- now playing ------------------------------------------------------ */
@@ -919,7 +1067,11 @@ static gchar *current_tag(MpApp *app, const char *tag)
 
 static gchar *current_display_title(MpApp *app)
 {
-	gchar *t = current_tag(app, GST_TAG_TITLE);
+	/* A video's title tag is often a stream's ("Audio"); its entry's
+	 * title -- the library's, or the file name -- says more. */
+	gchar *t = mp_player_has_video(app->player)
+			   ? NULL
+			   : current_tag(app, GST_TAG_TITLE);
 	if (t != NULL && *t)
 		return t;
 	g_free(t);
@@ -959,7 +1111,8 @@ static void update_now_playing(MpApp *app)
 		artist = current_tag(app, GST_TAG_ALBUM_ARTIST);
 
 	gtk_label_set_text(GTK_LABEL(app->now_title), title ? title : "");
-	gtk_label_set_text(GTK_LABEL(app->now_artist), artist ? artist : "");
+	gtk_label_set_text(GTK_LABEL(app->now_artist),
+			   artist ? artist : loaded ? "" : "Nothing playing");
 	gtk_label_set_text(GTK_LABEL(app->art_title),
 			   title ? title : "Nothing playing");
 
@@ -973,7 +1126,27 @@ static void update_now_playing(MpApp *app)
 
 	if (title != NULL && *title)
 		gtk_widget_set_tooltip_text(app->now_title, title);
+	gtk_label_set_text(GTK_LABEL(app->top_title), title ? title : "");
 	update_title(app);
+
+	/* The Recent page's "played lately": each entry once, when it
+	 * starts, with the best title known by then. */
+	MpPriv *pv = priv_of(app);
+	const char *uri = mp_player_get_uri(app->player);
+	gboolean newer = g_strcmp0(uri, pv->recent_uri) != 0 ||
+			 (artist != NULL && !pv->recent_artist);
+	if (uri != NULL && title != NULL && newer) {
+		/* Again when the artist comes in later than the title. */
+		g_free(pv->recent_uri);
+		pv->recent_uri = g_strdup(uri);
+		pv->recent_artist = artist != NULL;
+		gchar *path = mp_uri_to_path(uri);
+		gboolean video = mp_player_has_video(app->player) ||
+				 (path != NULL && mp_is_video_name(path));
+		mp_library_add_recent(app->library, uri, title, artist, video);
+		g_free(path);
+	}
+	mp_pages_now_playing_changed(app);
 	g_free(title);
 	g_free(artist);
 	g_free(album);
@@ -1021,11 +1194,12 @@ static void update_play_button(MpApp *app)
 {
 	gboolean playing = mp_player_wants_playing(app->player) &&
 			   mp_player_get_state(app->player) != MP_PLAYER_STOPPED;
-	set_button_icon(app->btn_play, playing ? "media-playback-pause-symbolic"
-					       : "media-playback-start-symbolic");
+	mp_glyph_button_set(app->btn_play, playing ? "likeos-pause" : "likeos-play",
+			    playing ? "media-playback-pause-symbolic"
+				    : "media-playback-start-symbolic");
 	gtk_widget_set_tooltip_text(app->btn_play,
 				    playing ? "Pause (Space)" : "Play (Space)");
-	gtk_widget_set_sensitive(app->btn_stop,
+	gtk_widget_set_sensitive(app->menu_stop,
 				 mp_player_get_state(app->player) !=
 					 MP_PLAYER_STOPPED);
 }
@@ -1361,7 +1535,7 @@ void mp_app_seek_relative(MpApp *app, gint64 delta)
 	 * Repeated steps add up, from the target of the one before. */
 	mp_player_seek(app->player, target, TRUE);
 	show_position(app, target);
-	if (app->fullscreen)
+	if (app->immersive)
 		show_controls(app);
 }
 
@@ -1412,22 +1586,37 @@ static void speed_step(MpApp *app, int dir)
 static void update_volume_ui(MpApp *app)
 {
 	double v = app->settings.volume;
-	const char *icon;
-	if (app->settings.muted || v <= 0.0)
-		icon = "audio-volume-muted-symbolic";
-	else if (v < 0.34)
-		icon = "audio-volume-low-symbolic";
-	else if (v < 0.67)
-		icon = "audio-volume-medium-symbolic";
-	else
-		icon = "audio-volume-high-symbolic";
-	set_button_icon(app->btn_mute, icon);
+	const char *icon, *fb;
+	if (app->settings.muted || v <= 0.0) {
+		icon = "likeos-volume-mute";
+		fb = "audio-volume-muted-symbolic";
+	} else if (v < 0.34) {
+		icon = "likeos-volume-low";
+		fb = "audio-volume-low-symbolic";
+	} else if (v < 0.67) {
+		icon = "likeos-volume-medium";
+		fb = "audio-volume-medium-symbolic";
+	} else {
+		icon = "likeos-volume";
+		fb = "audio-volume-high-symbolic";
+	}
+	mp_glyph_button_set(app->btn_volume, icon, fb);
+	if (app->btn_mute != app->btn_volume)
+		mp_glyph_button_set(app->btn_mute, icon, fb);
 
-	gchar *tip = g_strdup_printf("%s (M) — volume %d %%",
-				     app->settings.muted ? "Unmute" : "Mute",
+	/* The speaker is the mute button; its tooltip says the volume too. */
+	gchar *tip = g_strdup_printf("%s · volume %d %%",
+				     app->settings.muted ? "Unmute (M)"
+							 : "Mute (M)",
 				     (int)lround(v * 100));
-	gtk_widget_set_tooltip_text(app->btn_mute, tip);
+	gtk_widget_set_tooltip_text(app->btn_volume, tip);
+	gtk_widget_set_tooltip_text(app->volume_scale, tip);
 	g_free(tip);
+	if (app->volume_value != NULL) {
+		gchar *val = g_strdup_printf("%d", (int)lround(v * 100));
+		gtk_label_set_text(GTK_LABEL(app->volume_value), val);
+		g_free(val);
+	}
 
 	app->updating_volume = TRUE;
 	gtk_adjustment_set_value(app->volume_adj, v * 100.0);
@@ -1478,9 +1667,12 @@ static void update_mode_buttons(MpApp *app)
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->btn_repeat),
 				     r != MP_REPEAT_NONE);
 	app->updating_toggles = FALSE;
-	set_button_icon(app->btn_repeat,
-			r == MP_REPEAT_ONE ? "media-playlist-repeat-song-symbolic"
-					   : "media-playlist-repeat-symbolic");
+	mp_glyph_button_set(app->btn_repeat,
+			    r == MP_REPEAT_ONE ? "likeos-repeat-one"
+					       : "likeos-repeat",
+			    r == MP_REPEAT_ONE
+				    ? "media-playlist-repeat-song-symbolic"
+				    : "media-playlist-repeat-symbolic");
 	gtk_widget_set_tooltip_text(
 		app->btn_repeat,
 		r == MP_REPEAT_NONE  ? "Repeat: off (R)"
@@ -1531,49 +1723,17 @@ static void on_repeat_toggled(GtkToggleButton *b, gpointer data)
 
 /* ---- queue visibility and fullscreen ---------------------------------- */
 
-static void set_queue_visible(MpApp *app, gboolean visible)
-{
-	if (gtk_widget_get_visible(app->queue_panel) && !visible)
-		capture_geometry(app);
-	gtk_widget_set_visible(app->queue_panel, visible);
-	if (visible) {
-		int ww = gtk_widget_get_allocated_width(app->paned);
-		if (ww > app->settings.queue_width + 200)
-			gtk_paned_set_position(GTK_PANED(app->paned),
-					       ww - app->settings.queue_width);
-	}
-	app->updating_toggles = TRUE;
-	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app->btn_playlist),
-				     visible);
-	gtk_check_menu_item_set_active(
-		GTK_CHECK_MENU_ITEM(app->menu_show_playlist), visible);
-	app->updating_toggles = FALSE;
-}
-
+/* F9 and the menu: to the play queue, and back to where one was. */
 void mp_app_toggle_playlist(MpApp *app)
 {
+	if (app->mini)
+		mp_app_set_mini(app, FALSE);
 	if (app->fullscreen)
 		mp_app_set_fullscreen(app, FALSE);
-	gboolean v = !gtk_widget_get_visible(app->queue_panel);
-	set_queue_visible(app, v);
-	app->settings.show_playlist = v;
-	mp_app_schedule_save(app);
-}
-
-static void on_playlist_button(GtkToggleButton *b, gpointer data)
-{
-	MpApp *app = data;
-	(void)b;
-	if (!app->updating_toggles)
-		mp_app_toggle_playlist(app);
-}
-
-static void on_playlist_menu(GtkCheckMenuItem *i, gpointer data)
-{
-	MpApp *app = data;
-	(void)i;
-	if (!app->updating_toggles)
-		mp_app_toggle_playlist(app);
+	if (strcmp(mp_pages_current(app), "queue") == 0)
+		mp_pages_back(app);
+	else
+		mp_pages_show(app, "queue");
 }
 
 void mp_app_set_fullscreen(MpApp *app, gboolean on)
@@ -1601,14 +1761,20 @@ static gboolean on_window_state(GtkWidget *w, GdkEventWindowState *ev,
 
 	if (on) {
 		capture_geometry(app);
-		pv->queue_was_visible = gtk_widget_get_visible(app->queue_panel);
 		app->fullscreen = TRUE;
-		gtk_widget_hide(app->queue_panel);
 		gtk_widget_hide(app->infobar);
-		set_button_icon(app->btn_fullscreen, "view-restore-symbolic");
+		mp_glyph_button_set(app->btn_fullscreen, "likeos-leave-fullscreen",
+				    "view-restore-symbolic");
 		gtk_widget_set_tooltip_text(app->btn_fullscreen,
 					    "Leave full screen (Esc)");
 		mp_style_set_fullscreen(app, TRUE);
+		/* Full screen is for the picture: the stage, whatever was
+		 * shown before. */
+		if (strcmp(mp_pages_current(app), "now") != 0) {
+			pv->auto_now = TRUE;
+			mp_pages_show(app, "now");
+		}
+		update_immersive(app);
 		show_controls(app);
 	} else {
 		app->fullscreen = FALSE;
@@ -1621,11 +1787,19 @@ static gboolean on_window_state(GtkWidget *w, GdkEventWindowState *ev,
 		app->controls_hidden = FALSE;
 		set_cursor_visible(app, TRUE);
 		mp_style_set_fullscreen(app, FALSE);
-		set_button_icon(app->btn_fullscreen, "view-fullscreen-symbolic");
+		mp_glyph_button_set(app->btn_fullscreen, "likeos-fullscreen",
+				    "view-fullscreen-symbolic");
 		gtk_widget_set_tooltip_text(app->btn_fullscreen,
 					    "Full screen (F)");
-		if (pv->queue_was_visible)
-			set_queue_visible(app, TRUE);
+		/* Back to the library, unless a video is still on. */
+		if (pv->auto_now && strcmp(mp_pages_current(app), "now") == 0 &&
+		    !(app->video_widget != NULL &&
+		      mp_player_has_video(app->player) &&
+		      mp_player_get_state(app->player) != MP_PLAYER_STOPPED)) {
+			pv->auto_now = FALSE;
+			mp_pages_back(app);
+		}
+		update_immersive(app);
 	}
 	mp_player_expose(app->player);
 	return FALSE;
@@ -1637,7 +1811,7 @@ static void infobar_show(MpApp *app, GtkMessageType type, const char *text)
 {
 	gtk_info_bar_set_message_type(GTK_INFO_BAR(app->infobar), type);
 	gtk_label_set_text(GTK_LABEL(app->infobar_label), text);
-	if (!app->fullscreen)
+	if (!app->fullscreen && !app->mini)
 		gtk_widget_show(app->infobar);
 }
 
@@ -1673,7 +1847,7 @@ static void cb_state(MpPlayer *p, MpPlayerState st, gpointer data)
 		pv->consecutive_errors = 0;
 		gtk_widget_queue_draw(app->thumb_area);
 	}
-	if (app->fullscreen && st != MP_PLAYER_PLAYING)
+	if (app->immersive && st != MP_PLAYER_PLAYING)
 		show_controls(app);
 	show_media_page(app);
 	update_gapless_next(app);
@@ -1829,7 +2003,9 @@ static void cb_tags(MpPlayer *p, gpointer data)
 	const GstTagList *tl = mp_player_get_tags(p);
 
 	if (app->current_id != 0 && tl != NULL) {
-		gchar *title = current_tag(app, GST_TAG_TITLE);
+		gchar *title = mp_player_has_video(p)
+				       ? NULL
+				       : current_tag(app, GST_TAG_TITLE);
 		gchar *artist = current_tag(app, GST_TAG_ARTIST);
 		gchar *album = current_tag(app, GST_TAG_ALBUM);
 		/* A radio stream's "title" tag is the song on air; the entry
@@ -1924,6 +2100,16 @@ static gboolean queue_has_focus(MpApp *app)
 	return gtk_widget_has_focus(app->queue_view);
 }
 
+/* The focus is in a list or a grid, which moves its own cursor with the
+ * arrow keys. */
+static gboolean list_has_focus(MpApp *app)
+{
+	GtkWidget *f = gtk_window_get_focus(GTK_WINDOW(app->window));
+	return f != NULL &&
+	       (GTK_IS_TREE_VIEW(f) || GTK_IS_FLOW_BOX_CHILD(f) ||
+		GTK_IS_LIST_BOX_ROW(f) || GTK_IS_FLOW_BOX(f));
+}
+
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 {
 	MpApp *app = data;
@@ -1937,7 +2123,15 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 	if (alt)
 		return FALSE;
 
-	if (ctrl) {
+	/* Typing in the search box: the keys are text, not commands. */
+	if (mp_pages_typing(app) && !ctrl) {
+		if (ev->keyval == GDK_KEY_Escape) {
+			gtk_window_set_focus(GTK_WINDOW(app->window), NULL);
+			return TRUE;
+		}
+		return FALSE;
+	}
+if (ctrl) {
 		switch (key) {
 		case GDK_KEY_o:
 			if (shift)
@@ -1953,6 +2147,12 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 			return TRUE;
 		case GDK_KEY_i:
 			mp_dialog_media_info(app);
+			return TRUE;
+		case GDK_KEY_f:
+			mp_pages_focus_search(app);
+			return TRUE;
+		case GDK_KEY_m:
+			mp_app_set_mini(app, !app->mini);
 			return TRUE;
 		case GDK_KEY_q:
 		case GDK_KEY_w:
@@ -1974,9 +2174,15 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 		return FALSE;
 	}
 
-	/* Keys the queue needs for itself while it has the focus. */
-	if (queue_has_focus(app)) {
+	/* Keys a list or grid needs for itself while it has the focus. */
+	if (list_has_focus(app)) {
 		switch (ev->keyval) {
+		case GDK_KEY_Left:
+		case GDK_KEY_Right:
+			if (GTK_IS_TREE_VIEW(gtk_window_get_focus(
+				    GTK_WINDOW(app->window))))
+				break;
+			return FALSE;
 		case GDK_KEY_Up:
 		case GDK_KEY_Down:
 		case GDK_KEY_Page_Up:
@@ -1988,6 +2194,8 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 			return FALSE;
 		case GDK_KEY_Delete:
 		case GDK_KEY_KP_Delete:
+			if (!queue_has_focus(app))
+				break;
 			queue_remove_selected(app);
 			return TRUE;
 		default:
@@ -2037,7 +2245,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 	case GDK_KEY_equal:
 	case GDK_KEY_KP_Add:
 		mp_app_set_volume(app, app->settings.volume + MP_VOLUME_STEP);
-		if (app->fullscreen)
+		if (app->immersive)
 			show_controls(app);
 		return TRUE;
 	case GDK_KEY_Down:
@@ -2045,7 +2253,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 	case GDK_KEY_minus:
 	case GDK_KEY_KP_Subtract:
 		mp_app_set_volume(app, app->settings.volume - MP_VOLUME_STEP);
-		if (app->fullscreen)
+		if (app->immersive)
 			show_controls(app);
 		return TRUE;
 	case GDK_KEY_Home:
@@ -2054,6 +2262,15 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 	case GDK_KEY_Escape:
 		if (app->fullscreen) {
 			mp_app_set_fullscreen(app, FALSE);
+			return TRUE;
+		}
+		if (app->mini) {
+			mp_app_set_mini(app, FALSE);
+			return TRUE;
+		}
+		if (strcmp(mp_pages_current(app), "now") == 0 ||
+		    strcmp(mp_pages_current(app), "collection") == 0) {
+			mp_pages_back(app);
 			return TRUE;
 		}
 		return FALSE;
@@ -2103,6 +2320,9 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data)
 		return TRUE;
 	case GDK_KEY_i:
 		mp_dialog_media_info(app);
+		return TRUE;
+	case GDK_KEY_q:
+		mp_app_toggle_playlist(app);
 		return TRUE;
 	case GDK_KEY_t:
 		app->show_remaining = !app->show_remaining;
@@ -2243,11 +2463,6 @@ static void on_menu_show(GtkWidget *menu, gpointer data)
 				 loaded && !app->options->no_video);
 	gtk_widget_set_sensitive(app->menu_speed,
 				 loaded && mp_player_is_seekable(app->player));
-	app->updating_toggles = TRUE;
-	gtk_check_menu_item_set_active(
-		GTK_CHECK_MENU_ITEM(app->menu_show_playlist),
-		gtk_widget_get_visible(app->queue_panel));
-	app->updating_toggles = FALSE;
 	pv->building_menu = FALSE;
 }
 
@@ -2266,6 +2481,20 @@ static void on_speed_item(GtkCheckMenuItem *item, gpointer data)
 static void menu_quit(MpApp *app)
 {
 	gtk_window_close(GTK_WINDOW(app->window));
+}
+
+static void menu_mini(MpApp *app)
+{
+	mp_app_set_mini(app, !app->mini);
+}
+
+static void menu_settings(MpApp *app)
+{
+	if (app->mini)
+		mp_app_set_mini(app, FALSE);
+	if (app->fullscreen)
+		mp_app_set_fullscreen(app, FALSE);
+	mp_pages_show(app, "settings");
 }
 
 static GtkWidget *build_main_menu(MpApp *app)
@@ -2313,21 +2542,19 @@ static GtkWidget *build_main_menu(MpApp *app)
 	gtk_menu_item_set_submenu(GTK_MENU_ITEM(app->menu_speed), speed);
 	menu_separator(m);
 
-	app->menu_show_playlist =
-		gtk_check_menu_item_new_with_mnemonic("Show Play _Queue");
-	GtkWidget *child = gtk_bin_get_child(GTK_BIN(app->menu_show_playlist));
-	if (GTK_IS_ACCEL_LABEL(child))
-		gtk_accel_label_set_accel(GTK_ACCEL_LABEL(child), GDK_KEY_F9,
-					  0);
-	g_signal_connect(app->menu_show_playlist, "toggled",
-			 G_CALLBACK(on_playlist_menu), app);
-	gtk_menu_shell_append(GTK_MENU_SHELL(m), app->menu_show_playlist);
+	app->menu_stop = menu_item(m, "S_top", 0, 0, G_CALLBACK(mp_app_stop),
+				   app);
+	menu_item(m, "_Queue", GDK_KEY_F9, 0,
+		  G_CALLBACK(mp_app_toggle_playlist), app);
+	menu_item(m, "_Mini Player", GDK_KEY_m, GDK_CONTROL_MASK,
+		  G_CALLBACK(menu_mini), app);
 	menu_item(m, "Media _Information", GDK_KEY_i, GDK_CONTROL_MASK,
 		  G_CALLBACK(mp_dialog_media_info), app);
 	menu_separator(m);
+	menu_item(m, "Se_ttings", 0, 0, G_CALLBACK(menu_settings), app);
 	menu_item(m, "_Keyboard Shortcuts", GDK_KEY_F1, 0,
 		  G_CALLBACK(mp_dialog_shortcuts), app);
-	menu_item(m, "A_bout Media Player", 0, 0,
+	menu_item(m, "A_bout " MP_APP_NAME, 0, 0,
 		  G_CALLBACK(mp_dialog_about), app);
 	menu_separator(m);
 	menu_item(m, "_Quit", GDK_KEY_q, GDK_CONTROL_MASK,
@@ -2354,419 +2581,6 @@ static GtkWidget *build_queue_menu(MpApp *app)
 	return m;
 }
 
-/* ---- building the window ---------------------------------------------- */
-
-static GtkWidget *build_media_area(MpApp *app)
-{
-	app->media_events = gtk_event_box_new();
-	gtk_widget_set_hexpand(app->media_events, TRUE);
-	gtk_widget_set_vexpand(app->media_events, TRUE);
-	gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->media_events),
-					 TRUE);
-	connect_media_events(app, app->media_events);
-	setup_drop_target(app->media_events, app, FALSE);
-
-	app->media_stack = gtk_stack_new();
-	gtk_stack_set_transition_type(GTK_STACK(app->media_stack),
-				      GTK_STACK_TRANSITION_TYPE_NONE);
-	gtk_container_add(GTK_CONTAINER(app->media_events), app->media_stack);
-
-	/* The art page. */
-	GtkWidget *art = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-	add_class(art, "mp-art");
-	gtk_widget_set_margin_top(art, 24);
-	gtk_widget_set_margin_bottom(art, 16);
-	app->art_area = gtk_drawing_area_new();
-	gtk_widget_set_size_request(app->art_area, 160, 160);
-	gtk_widget_set_vexpand(app->art_area, TRUE);
-	g_signal_connect(app->art_area, "draw", G_CALLBACK(on_art_draw), app);
-	gtk_box_pack_start(GTK_BOX(art), app->art_area, TRUE, TRUE, 0);
-
-	app->art_title = gtk_label_new("Nothing playing");
-	add_class(app->art_title, "mp-art-title");
-	gtk_label_set_ellipsize(GTK_LABEL(app->art_title), PANGO_ELLIPSIZE_END);
-	gtk_label_set_max_width_chars(GTK_LABEL(app->art_title), 60);
-	gtk_widget_set_margin_top(app->art_title, 12);
-	gtk_box_pack_start(GTK_BOX(art), app->art_title, FALSE, FALSE, 0);
-
-	app->art_artist = gtk_label_new("");
-	add_class(app->art_artist, "mp-art-sub");
-	gtk_label_set_ellipsize(GTK_LABEL(app->art_artist), PANGO_ELLIPSIZE_END);
-	gtk_label_set_max_width_chars(GTK_LABEL(app->art_artist), 80);
-	gtk_box_pack_start(GTK_BOX(art), app->art_artist, FALSE, FALSE, 0);
-
-	app->art_status = gtk_label_new("");
-	add_class(app->art_status, "mp-art-status");
-	gtk_widget_set_margin_top(app->art_status, 6);
-	gtk_box_pack_start(GTK_BOX(art), app->art_status, FALSE, FALSE, 0);
-	app->art_album = NULL;
-
-	/* The art page needs its own background: the event box's window is
-	 * painted by the theme, and the stack draws nothing. */
-	GtkWidget *art_bg = gtk_event_box_new();
-	add_class(art_bg, "mp-art");
-	gtk_container_add(GTK_CONTAINER(art_bg), art);
-	gtk_stack_add_named(GTK_STACK(app->media_stack), art_bg, "art");
-
-	app->video_widget = mp_player_get_video_widget(app->player);
-	if (app->video_widget != NULL) {
-		add_class(app->video_widget, "mp-stage");
-		connect_media_events(app, app->video_widget);
-		gtk_stack_add_named(GTK_STACK(app->media_stack),
-				    app->video_widget, "video");
-	}
-	return app->media_events;
-}
-
-static GtkWidget *build_controls(MpApp *app)
-{
-	app->controls = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-	add_class(app->controls, "mp-controls");
-
-	/* Row one: the seek bar between the two times. */
-	GtkWidget *row1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-	app->time_label = gtk_label_new("0:00");
-	add_class(app->time_label, "mp-time");
-	gtk_label_set_xalign(GTK_LABEL(app->time_label), 1.0);
-	gtk_label_set_width_chars(GTK_LABEL(app->time_label), 7);
-
-	app->seek_adj = gtk_adjustment_new(0, 0, 1, 1, 10, 0);
-	app->seek_scale = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL,
-					app->seek_adj);
-	gtk_scale_set_draw_value(GTK_SCALE(app->seek_scale), FALSE);
-	gtk_widget_set_hexpand(app->seek_scale, TRUE);
-	gtk_widget_set_can_focus(app->seek_scale, FALSE);
-	gtk_widget_set_sensitive(app->seek_scale, FALSE);
-	add_class(app->seek_scale, "mp-seek");
-	g_signal_connect(app->seek_scale, "change-value",
-			 G_CALLBACK(on_seek_change_value), app);
-	g_signal_connect(app->seek_scale, "button-press-event",
-			 G_CALLBACK(on_seek_press), app);
-	g_signal_connect(app->seek_scale, "button-release-event",
-			 G_CALLBACK(on_seek_release), app);
-	g_signal_connect(app->seek_scale, "grab-broken-event",
-			 G_CALLBACK(on_seek_grab_broken), app);
-
-	GtkWidget *dur_box = gtk_event_box_new();
-	app->duration_label = gtk_label_new("--:--");
-	add_class(app->duration_label, "mp-time");
-	gtk_label_set_xalign(GTK_LABEL(app->duration_label), 0.0);
-	gtk_label_set_width_chars(GTK_LABEL(app->duration_label), 8);
-	gtk_container_add(GTK_CONTAINER(dur_box), app->duration_label);
-	gtk_widget_set_tooltip_text(dur_box,
-				    "Click to show the time remaining (T)");
-	g_signal_connect(dur_box, "button-press-event",
-			 G_CALLBACK(on_duration_click), app);
-
-	gtk_box_pack_start(GTK_BOX(row1), app->time_label, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(row1), app->seek_scale, TRUE, TRUE, 0);
-	gtk_box_pack_start(GTK_BOX(row1), dur_box, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(app->controls), row1, FALSE, FALSE, 0);
-
-	/* Row two: what is playing | transport | volume and view. */
-	GtkWidget *row2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-
-	GtkWidget *now = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-	app->thumb_area = gtk_drawing_area_new();
-	gtk_widget_set_size_request(app->thumb_area, 44, 44);
-	gtk_widget_set_valign(app->thumb_area, GTK_ALIGN_CENTER);
-	g_signal_connect(app->thumb_area, "draw", G_CALLBACK(on_thumb_draw),
-			 app);
-	GtkWidget *now_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-	gtk_widget_set_valign(now_text, GTK_ALIGN_CENTER);
-	app->now_title = gtk_label_new("");
-	add_class(app->now_title, "mp-now-title");
-	app->now_artist = gtk_label_new("");
-	add_class(app->now_artist, "mp-now-artist");
-	GtkWidget *labels[] = { app->now_title, app->now_artist };
-	for (int i = 0; i < 2; i++) {
-		gtk_label_set_xalign(GTK_LABEL(labels[i]), 0.0);
-		gtk_label_set_ellipsize(GTK_LABEL(labels[i]),
-					PANGO_ELLIPSIZE_END);
-		gtk_label_set_max_width_chars(GTK_LABEL(labels[i]), 28);
-		gtk_label_set_width_chars(GTK_LABEL(labels[i]), 12);
-		gtk_box_pack_start(GTK_BOX(now_text), labels[i], FALSE, FALSE,
-				   0);
-	}
-	gtk_box_pack_start(GTK_BOX(now), app->thumb_area, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(now), now_text, TRUE, TRUE, 0);
-	gtk_box_pack_start(GTK_BOX(row2), now, TRUE, TRUE, 0);
-
-	GtkWidget *transport = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-	gtk_widget_set_margin_start(transport, 12);
-	gtk_widget_set_margin_end(transport, 12);
-	app->btn_shuffle = icon_button("media-playlist-shuffle-symbolic",
-				       "Shuffle (S)", "mp-round",
-				       GTK_ICON_SIZE_BUTTON, TRUE);
-	app->btn_prev = icon_button("media-skip-backward-symbolic",
-				    "Previous (P)", "mp-round",
-				    GTK_ICON_SIZE_BUTTON, FALSE);
-	app->btn_play = icon_button("media-playback-start-symbolic",
-				    "Play (Space)", "mp-play",
-				    GTK_ICON_SIZE_LARGE_TOOLBAR, FALSE);
-	app->btn_next = icon_button("media-skip-forward-symbolic", "Next (N)",
-				    "mp-round", GTK_ICON_SIZE_BUTTON, FALSE);
-	app->btn_repeat = icon_button("media-playlist-repeat-symbolic",
-				      "Repeat (R)", "mp-round",
-				      GTK_ICON_SIZE_BUTTON, TRUE);
-	app->btn_stop = icon_button("media-playback-stop-symbolic", "Stop",
-				    "mp-round", GTK_ICON_SIZE_BUTTON, FALSE);
-	g_signal_connect(app->btn_shuffle, "toggled",
-			 G_CALLBACK(on_shuffle_toggled), app);
-	g_signal_connect_swapped(app->btn_prev, "clicked",
-				 G_CALLBACK(mp_app_prev), app);
-	g_signal_connect_swapped(app->btn_play, "clicked",
-				 G_CALLBACK(mp_app_toggle_play), app);
-	g_signal_connect_swapped(app->btn_stop, "clicked",
-				 G_CALLBACK(mp_app_stop), app);
-	g_signal_connect(app->btn_repeat, "toggled",
-			 G_CALLBACK(on_repeat_toggled), app);
-	gtk_box_pack_start(GTK_BOX(transport), app->btn_shuffle, FALSE, FALSE,
-			   0);
-	gtk_box_pack_start(GTK_BOX(transport), app->btn_prev, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(transport), app->btn_play, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(transport), app->btn_next, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(transport), app->btn_repeat, FALSE, FALSE,
-			   0);
-	gtk_box_pack_start(GTK_BOX(transport), app->btn_stop, FALSE, FALSE, 0);
-	gtk_box_set_center_widget(GTK_BOX(row2), transport);
-
-	GtkWidget *right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
-	gtk_widget_set_halign(right, GTK_ALIGN_END);
-	app->btn_mute = icon_button("audio-volume-high-symbolic", "Mute (M)",
-				    "mp-round", GTK_ICON_SIZE_BUTTON, FALSE);
-	g_signal_connect_swapped(app->btn_mute, "clicked",
-				 G_CALLBACK(mp_app_toggle_mute), app);
-	app->volume_adj = gtk_adjustment_new(80, 0, 100, 5, 10, 0);
-	app->volume_scale = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL,
-					  app->volume_adj);
-	gtk_scale_set_draw_value(GTK_SCALE(app->volume_scale), FALSE);
-	gtk_widget_set_can_focus(app->volume_scale, FALSE);
-	gtk_widget_set_size_request(app->volume_scale, 100, -1);
-	gtk_widget_set_valign(app->volume_scale, GTK_ALIGN_CENTER);
-	add_class(app->volume_scale, "mp-volume");
-	g_signal_connect(app->volume_adj, "value-changed",
-			 G_CALLBACK(on_volume_changed), app);
-
-	app->btn_playlist = icon_button("view-list-symbolic",
-					"Play queue (F9)", "mp-round",
-					GTK_ICON_SIZE_BUTTON, TRUE);
-	g_signal_connect(app->btn_playlist, "toggled",
-			 G_CALLBACK(on_playlist_button), app);
-	app->btn_fullscreen = icon_button("view-fullscreen-symbolic",
-					  "Full screen (F)", "mp-round",
-					  GTK_ICON_SIZE_BUTTON, FALSE);
-	g_signal_connect(app->btn_fullscreen, "clicked",
-			 G_CALLBACK(on_fullscreen_clicked), app);
-
-	app->btn_menu = gtk_menu_button_new();
-	gtk_container_add(GTK_CONTAINER(app->btn_menu),
-			  gtk_image_new_from_icon_name("open-menu-symbolic",
-						       GTK_ICON_SIZE_BUTTON));
-	gtk_widget_set_tooltip_text(app->btn_menu, "Menu");
-	gtk_widget_set_can_focus(app->btn_menu, FALSE);
-	gtk_widget_set_focus_on_click(app->btn_menu, FALSE);
-	gtk_widget_set_valign(app->btn_menu, GTK_ALIGN_CENTER);
-	add_class(app->btn_menu, "mp-round");
-	app->menu = build_main_menu(app);
-	gtk_menu_button_set_popup(GTK_MENU_BUTTON(app->btn_menu), app->menu);
-	gtk_menu_button_set_direction(GTK_MENU_BUTTON(app->btn_menu),
-				      GTK_ARROW_UP);
-
-	gtk_box_pack_start(GTK_BOX(right), app->btn_mute, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(right), app->volume_scale, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(right), app->btn_playlist, FALSE, FALSE,
-			   0);
-	gtk_box_pack_start(GTK_BOX(right), app->btn_fullscreen, FALSE, FALSE,
-			   0);
-	gtk_box_pack_start(GTK_BOX(right), app->btn_menu, FALSE, FALSE, 0);
-	gtk_box_pack_end(GTK_BOX(row2), right, TRUE, TRUE, 0);
-
-	gtk_box_pack_start(GTK_BOX(app->controls), row2, FALSE, FALSE, 0);
-
-	app->controls_revealer = gtk_revealer_new();
-	gtk_revealer_set_transition_type(
-		GTK_REVEALER(app->controls_revealer),
-		GTK_REVEALER_TRANSITION_TYPE_SLIDE_UP);
-	gtk_revealer_set_transition_duration(
-		GTK_REVEALER(app->controls_revealer), 180);
-	gtk_container_add(GTK_CONTAINER(app->controls_revealer),
-			  app->controls);
-	gtk_revealer_set_reveal_child(GTK_REVEALER(app->controls_revealer),
-				      TRUE);
-	/* Motion over the bar counts as activity in fullscreen too. */
-	GtkWidget *ev = gtk_event_box_new();
-	gtk_widget_add_events(ev, GDK_POINTER_MOTION_MASK);
-	g_signal_connect(ev, "motion-notify-event",
-			 G_CALLBACK(on_media_motion), app);
-	gtk_container_add(GTK_CONTAINER(ev), app->controls_revealer);
-	return ev;
-}
-
-static GtkWidget *queue_tool(const char *icon, const char *tip,
-			     GCallback cb, MpApp *app)
-{
-	GtkWidget *b = icon_button(icon, tip, "mp-round", GTK_ICON_SIZE_BUTTON,
-				   FALSE);
-	g_signal_connect_swapped(b, "clicked", cb, app);
-	return b;
-}
-
-static GtkWidget *build_queue(MpApp *app)
-{
-	MpPriv *pv = priv_of(app);
-	app->queue_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-	add_class(app->queue_panel, "mp-queue");
-	gtk_widget_set_size_request(app->queue_panel, 200, -1);
-
-	GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-	add_class(hdr, "mp-queue-header");
-	GtkWidget *title = gtk_label_new("Play queue");
-	add_class(title, "mp-queue-title");
-	gtk_label_set_xalign(GTK_LABEL(title), 0.0);
-	app->queue_count = gtk_label_new("Empty");
-	add_class(app->queue_count, "mp-queue-count");
-	gtk_label_set_xalign(GTK_LABEL(app->queue_count), 0.0);
-	gtk_box_pack_start(GTK_BOX(hdr), title, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(hdr), app->queue_count, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(app->queue_panel), hdr, FALSE, FALSE, 0);
-
-	/* The list. */
-	app->queue_view = gtk_tree_view_new_with_model(
-		mp_playlist_model(app->playlist));
-	GtkTreeView *tv = GTK_TREE_VIEW(app->queue_view);
-	gtk_tree_view_set_headers_visible(tv, FALSE);
-	/* Letters are player commands (N, P, M, ...) everywhere in the
-	 * window, so typing in the list must not start a search. */
-	gtk_tree_view_set_enable_search(tv, FALSE);
-	gtk_tree_view_set_tooltip_column(tv, MP_COL_TOOLTIP);
-	gtk_tree_selection_set_mode(gtk_tree_view_get_selection(tv),
-				    GTK_SELECTION_MULTIPLE);
-
-	GtkCellRenderer *r_icon = gtk_cell_renderer_pixbuf_new();
-	g_object_set(r_icon, "xpad", 4, NULL);
-	gtk_cell_renderer_set_fixed_size(r_icon, 22, -1);
-	GtkTreeViewColumn *c_icon = gtk_tree_view_column_new_with_attributes(
-		"", r_icon, "icon-name", MP_COL_ICON, NULL);
-	gtk_tree_view_append_column(tv, c_icon);
-
-	GtkCellRenderer *r_title = gtk_cell_renderer_text_new();
-	g_object_set(r_title, "ellipsize", PANGO_ELLIPSIZE_END, "ypad", 3,
-		     NULL);
-	GtkTreeViewColumn *c_title = gtk_tree_view_column_new();
-	gtk_tree_view_column_pack_start(c_title, r_title, TRUE);
-	gtk_tree_view_column_set_cell_data_func(c_title, r_title,
-						title_cell_data, NULL, NULL);
-	gtk_tree_view_column_set_expand(c_title, TRUE);
-	gtk_tree_view_append_column(tv, c_title);
-
-	GtkCellRenderer *r_dur = gtk_cell_renderer_text_new();
-	g_object_set(r_dur, "xalign", 1.0, "foreground", "#616161",
-		     "xpad", 6, NULL);
-	GtkTreeViewColumn *c_dur = gtk_tree_view_column_new_with_attributes(
-		"", r_dur, "text", MP_COL_DURATION_TEXT, NULL);
-	gtk_tree_view_append_column(tv, c_dur);
-
-	g_signal_connect(app->queue_view, "row-activated",
-			 G_CALLBACK(on_row_activated), app);
-	g_signal_connect(app->queue_view, "button-press-event",
-			 G_CALLBACK(on_queue_button), app);
-
-	/* Rows can be dragged within the queue, and files dropped on it. */
-	static const GtkTargetEntry row_target[] = {
-		{ (gchar *)QUEUE_ROWS_TARGET, GTK_TARGET_SAME_WIDGET,
-		  TARGET_QUEUE_ROWS },
-	};
-	gtk_tree_view_enable_model_drag_source(tv, GDK_BUTTON1_MASK,
-					       row_target, 1, GDK_ACTION_COPY);
-	setup_drop_target(app->queue_view, app, TRUE);
-	g_signal_connect(app->queue_view, "drag-data-get",
-			 G_CALLBACK(on_queue_drag_get), app);
-	g_signal_connect(app->queue_view, "drag-data-delete",
-			 G_CALLBACK(on_queue_drag_delete), app);
-	g_signal_connect_after(app->queue_view, "drag-motion",
-			       G_CALLBACK(on_queue_drag_motion), app);
-	g_signal_connect(app->queue_view, "drag-leave",
-			 G_CALLBACK(on_queue_drag_leave), app);
-
-	GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
-	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
-				       GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-	gtk_container_add(GTK_CONTAINER(sw), app->queue_view);
-
-	/* What an empty queue shows instead. */
-	GtkWidget *empty = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-	gtk_widget_set_valign(empty, GTK_ALIGN_CENTER);
-	GtkWidget *icon = gtk_image_new_from_icon_name("folder-music-symbolic",
-						       GTK_ICON_SIZE_DIALOG);
-	gtk_widget_set_opacity(icon, 0.5);
-	GtkWidget *hint = gtk_label_new(
-		"Drop music and videos here,\nor use the buttons below.");
-	gtk_label_set_justify(GTK_LABEL(hint), GTK_JUSTIFY_CENTER);
-	add_class(hint, "mp-queue-hint");
-	gtk_box_pack_start(GTK_BOX(empty), icon, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(empty), hint, FALSE, FALSE, 0);
-	GtkWidget *empty_ev = gtk_event_box_new();
-	gtk_container_add(GTK_CONTAINER(empty_ev), empty);
-	setup_drop_target(empty_ev, app, FALSE);
-	app->queue_empty = empty_ev;
-
-	app->queue_stack = gtk_stack_new();
-	gtk_stack_add_named(GTK_STACK(app->queue_stack), empty_ev, "empty");
-	gtk_stack_add_named(GTK_STACK(app->queue_stack), sw, "list");
-	gtk_box_pack_start(GTK_BOX(app->queue_panel), app->queue_stack, TRUE,
-			   TRUE, 0);
-
-	GtkWidget *tools = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
-	add_class(tools, "mp-queue-tools");
-	gtk_box_pack_start(GTK_BOX(tools),
-			   queue_tool("list-add-symbolic", "Add files",
-				      G_CALLBACK(mp_dialog_add_files), app),
-			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(tools),
-			   queue_tool("folder-open-symbolic", "Add a folder",
-				      G_CALLBACK(mp_dialog_add_folder), app),
-			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(tools),
-			   queue_tool("insert-link-symbolic",
-				      "Add a location (Ctrl+L)",
-				      G_CALLBACK(mp_dialog_open_url), app),
-			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(tools),
-			   queue_tool("list-remove-symbolic",
-				      "Remove the selected entries (Delete)",
-				      G_CALLBACK(queue_remove_selected), app),
-			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(tools),
-			   queue_tool("go-up-symbolic", "Move up",
-				      G_CALLBACK(queue_move_up), app),
-			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(tools),
-			   queue_tool("go-down-symbolic", "Move down",
-				      G_CALLBACK(queue_move_down), app),
-			   FALSE, FALSE, 0);
-	gtk_box_pack_end(GTK_BOX(tools),
-			 queue_tool("edit-clear-all-symbolic", "Clear the queue",
-				    G_CALLBACK(queue_clear), app),
-			 FALSE, FALSE, 0);
-	gtk_box_pack_end(GTK_BOX(tools),
-			 queue_tool("document-save-symbolic",
-				    "Save as a playlist (Ctrl+S)",
-				    G_CALLBACK(mp_dialog_save_playlist), app),
-			 FALSE, FALSE, 0);
-	gtk_box_pack_end(GTK_BOX(tools),
-			 queue_tool("view-sort-ascending-symbolic",
-				    "Sort by title", G_CALLBACK(queue_sort),
-				    app),
-			 FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(app->queue_panel), tools, FALSE, FALSE, 0);
-
-	pv->queue_menu = build_queue_menu(app);
-	gtk_menu_attach_to_widget(GTK_MENU(pv->queue_menu), app->queue_view,
-				  NULL);
-	return app->queue_panel;
-}
-
 static gboolean on_delete(GtkWidget *w, GdkEvent *ev, gpointer data)
 {
 	MpApp *app = data;
@@ -2786,8 +2600,12 @@ static gboolean on_delete(GtkWidget *w, GdkEvent *ev, gpointer data)
 }
 
 static void discover_done(guint id, const char *title, const char *artist,
-			  const char *album, gint64 duration, gpointer data)
+			  const char *album, gint64 duration,
+			  gboolean has_video, const GstTagList *tags,
+			  gpointer data)
 {
+	(void)has_video;
+	(void)tags;
 	MpApp *app = data;
 	if (id == 0 || !mp_playlist_get_iter(app->playlist, id, NULL))
 		return;
@@ -2816,7 +2634,782 @@ static void priv_free(gpointer p)
 	if (pv->drag_seek_timer != 0)
 		g_source_remove(pv->drag_seek_timer);
 	g_clear_object(&pv->blank_cursor);
+	g_free(pv->recent_uri);
 	g_free(pv);
+}
+
+/* ---- building the window ---------------------------------------------- */
+
+static void on_now_back(GtkButton *b, gpointer data)
+{
+	MpApp *app = data;
+	(void)b;
+	if (app->fullscreen)
+		mp_app_set_fullscreen(app, FALSE);
+	if (app->mini) {
+		mp_app_set_mini(app, FALSE);
+		return;
+	}
+	priv_of(app)->auto_now = FALSE;
+	mp_pages_back(app);
+}
+
+/* The "now" page: the cover on its blurred wash, or the video. */
+static GtkWidget *build_media_area(MpApp *app)
+{
+	app->media_events = gtk_event_box_new();
+	gtk_widget_set_hexpand(app->media_events, TRUE);
+	gtk_widget_set_vexpand(app->media_events, TRUE);
+	gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->media_events),
+					 TRUE);
+	add_class(app->media_events, "mp-stage");
+	connect_media_events(app, app->media_events);
+	setup_drop_target(app->media_events, app, FALSE);
+
+	app->media_stack = gtk_stack_new();
+	gtk_stack_set_transition_type(GTK_STACK(app->media_stack),
+				      GTK_STACK_TRANSITION_TYPE_NONE);
+	gtk_container_add(GTK_CONTAINER(app->media_events), app->media_stack);
+
+	GtkWidget *art_overlay = gtk_overlay_new();
+	GtkWidget *wash = gtk_drawing_area_new();
+	add_class(wash, "mp-now-wash");
+	g_signal_connect(wash, "draw", G_CALLBACK(on_wash_draw), app);
+	gtk_container_add(GTK_CONTAINER(art_overlay), wash);
+
+	GtkWidget *art = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+	add_class(art, "mp-art");
+	GtkWidget *back = mp_glyph_button("likeos-back", "go-previous-symbolic",
+					  16, "Back (Esc)", "mp-back-button",
+					  FALSE);
+	gtk_widget_set_halign(back, GTK_ALIGN_START);
+	g_signal_connect(back, "clicked", G_CALLBACK(on_now_back), app);
+	g_object_set_data(G_OBJECT(app->window), "mp-now-back", back);
+	gtk_box_pack_start(GTK_BOX(art), back, FALSE, FALSE, 0);
+
+	app->art_area = gtk_drawing_area_new();
+	gtk_widget_set_size_request(app->art_area, 120, 120);
+	gtk_widget_set_vexpand(app->art_area, TRUE);
+	g_signal_connect(app->art_area, "draw", G_CALLBACK(on_art_draw), app);
+	gtk_box_pack_start(GTK_BOX(art), app->art_area, TRUE, TRUE, 0);
+
+	app->art_title = gtk_label_new("Nothing playing");
+	add_class(app->art_title, "mp-art-title");
+	gtk_label_set_ellipsize(GTK_LABEL(app->art_title), PANGO_ELLIPSIZE_END);
+	gtk_label_set_max_width_chars(GTK_LABEL(app->art_title), 60);
+	gtk_widget_set_margin_top(app->art_title, 16);
+	gtk_box_pack_start(GTK_BOX(art), app->art_title, FALSE, FALSE, 0);
+
+	app->art_artist = gtk_label_new("");
+	add_class(app->art_artist, "mp-art-sub");
+	gtk_label_set_ellipsize(GTK_LABEL(app->art_artist), PANGO_ELLIPSIZE_END);
+	gtk_label_set_max_width_chars(GTK_LABEL(app->art_artist), 80);
+	gtk_box_pack_start(GTK_BOX(art), app->art_artist, FALSE, FALSE, 0);
+
+	app->art_status = gtk_label_new("");
+	add_class(app->art_status, "mp-art-status");
+	gtk_widget_set_margin_top(app->art_status, 4);
+	gtk_box_pack_start(GTK_BOX(art), app->art_status, FALSE, FALSE, 0);
+	app->art_album = NULL;
+	gtk_overlay_add_overlay(GTK_OVERLAY(art_overlay), art);
+	gtk_stack_add_named(GTK_STACK(app->media_stack), art_overlay, "art");
+
+	app->video_widget = mp_player_get_video_widget(app->player);
+	if (app->video_widget != NULL) {
+		add_class(app->video_widget, "mp-video");
+		connect_media_events(app, app->video_widget);
+		gtk_stack_add_named(GTK_STACK(app->media_stack),
+				    app->video_widget, "video");
+	}
+	return app->media_events;
+}
+
+static void on_now_clicked(GtkButton *b, gpointer data)
+{
+	MpApp *app = data;
+	(void)b;
+	if (app->mini)
+		return;
+	if (strcmp(mp_pages_current(app), "now") == 0) {
+		priv_of(app)->auto_now = FALSE;
+		mp_pages_back(app);
+	} else if (mp_player_get_uri(app->player) != NULL) {
+		mp_pages_show(app, "now");
+	}
+}
+
+static void on_volume_clicked(GtkButton *b, gpointer data)
+{
+	(void)b;
+	mp_app_toggle_mute(data);
+}
+
+static gboolean on_volume_scroll(GtkWidget *w, GdkEventScroll *ev,
+				 gpointer data)
+{
+	return on_media_scroll(w, ev, data);
+}
+
+static void on_mini_clicked(GtkButton *b, gpointer data)
+{
+	MpApp *app = data;
+	(void)b;
+	mp_app_set_mini(app, !app->mini);
+}
+
+static void on_next_clicked(GtkButton *b, gpointer data)
+{
+	(void)b;
+	mp_app_next(data, TRUE);
+}
+
+static void on_queue_clicked(GtkButton *b, gpointer data)
+{
+	(void)b;
+	mp_app_toggle_playlist(data);
+}
+
+/* The width of the seek bar in the middle of the strip; the mini player's
+ * is short. */
+#define SEEK_WIDTH 380
+#define SEEK_WIDTH_MINI 150
+
+/* The transport strip: a dark rounded strip along the bottom of the
+ * window, inset from its edges.
+ *
+ *   ( [art] Title    |  shuffle  prev  (PLAY)  next  repeat  |  vol --o-- )
+ *   (       Artist   |  0:42 ==========o--------------- 3:51 |  queue ... )
+ *
+ * What plays at the left (a button that opens "now playing"), the
+ * transport and the seek bar in the middle, the volume and the view
+ * buttons at the right. */
+static GtkWidget *build_controls(MpApp *app)
+{
+	MpPriv *pv = priv_of(app);
+	app->controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+	add_class(app->controls, "mp-bar");
+
+	/* Left: what is playing. */
+	app->now_box = gtk_button_new();
+	gtk_button_set_relief(GTK_BUTTON(app->now_box), GTK_RELIEF_NONE);
+	gtk_widget_set_focus_on_click(app->now_box, FALSE);
+	gtk_widget_set_can_focus(app->now_box, FALSE);
+	gtk_widget_set_halign(app->now_box, GTK_ALIGN_START);
+	gtk_widget_set_valign(app->now_box, GTK_ALIGN_CENTER);
+	add_class(app->now_box, "mp-now-button");
+	gtk_widget_set_tooltip_text(app->now_box, "Now playing");
+	g_signal_connect(app->now_box, "clicked", G_CALLBACK(on_now_clicked),
+			 app);
+	GtkWidget *now = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	app->thumb_area = gtk_drawing_area_new();
+	gtk_widget_set_size_request(app->thumb_area, 48, 48);
+	gtk_widget_set_valign(app->thumb_area, GTK_ALIGN_CENTER);
+	add_class(app->thumb_area, "mp-thumb");
+	g_signal_connect(app->thumb_area, "draw", G_CALLBACK(on_thumb_draw),
+			 app);
+	GtkWidget *now_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+	gtk_widget_set_valign(now_text, GTK_ALIGN_CENTER);
+	app->now_title = gtk_label_new("");
+	add_class(app->now_title, "mp-now-title");
+	app->now_artist = gtk_label_new("");
+	add_class(app->now_artist, "mp-now-artist");
+	GtkWidget *labels[] = { app->now_title, app->now_artist };
+	for (int i = 0; i < 2; i++) {
+		gtk_label_set_xalign(GTK_LABEL(labels[i]), 0.0);
+		gtk_label_set_ellipsize(GTK_LABEL(labels[i]),
+					PANGO_ELLIPSIZE_END);
+		gtk_label_set_max_width_chars(GTK_LABEL(labels[i]), 24);
+		gtk_label_set_width_chars(GTK_LABEL(labels[i]), 8);
+		gtk_box_pack_start(GTK_BOX(now_text), labels[i], FALSE, FALSE,
+				   0);
+	}
+	gtk_box_pack_start(GTK_BOX(now), app->thumb_area, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(now), now_text, TRUE, TRUE, 0);
+	gtk_container_add(GTK_CONTAINER(app->now_box), now);
+	gtk_box_pack_start(GTK_BOX(app->controls), app->now_box, TRUE, TRUE, 0);
+
+	/* Middle: the transport above the seek bar. */
+	GtkWidget *centre = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	add_class(centre, "mp-bar-centre");
+	gtk_widget_set_valign(centre, GTK_ALIGN_CENTER);
+	GtkWidget *transport = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	add_class(transport, "mp-transport");
+	gtk_widget_set_halign(transport, GTK_ALIGN_CENTER);
+	app->btn_shuffle = mp_glyph_button("likeos-shuffle",
+					   "media-playlist-shuffle-symbolic",
+					   16, "Shuffle (S)", "mp-bar-button",
+					   TRUE);
+	app->btn_prev = mp_glyph_button("likeos-previous",
+					"media-skip-backward-symbolic", 16,
+					"Previous (P)", "mp-bar-button", FALSE);
+	app->btn_play = mp_glyph_button("likeos-play",
+					"media-playback-start-symbolic", 18,
+					"Play (Space)", "mp-play", FALSE);
+	app->btn_next = mp_glyph_button("likeos-next",
+					"media-skip-forward-symbolic", 16,
+					"Next (N)", "mp-bar-button", FALSE);
+	app->btn_repeat = mp_glyph_button("likeos-repeat",
+					  "media-playlist-repeat-symbolic", 16,
+					  "Repeat (R)", "mp-bar-button", TRUE);
+	g_signal_connect(app->btn_shuffle, "toggled",
+			 G_CALLBACK(on_shuffle_toggled), app);
+	g_signal_connect_swapped(app->btn_prev, "clicked",
+				 G_CALLBACK(mp_app_prev), app);
+	g_signal_connect_swapped(app->btn_play, "clicked",
+				 G_CALLBACK(mp_app_toggle_play), app);
+	g_signal_connect(app->btn_next, "clicked", G_CALLBACK(on_next_clicked),
+			 app);
+	g_signal_connect(app->btn_repeat, "toggled",
+			 G_CALLBACK(on_repeat_toggled), app);
+	GtkWidget *tb[] = { app->btn_shuffle, app->btn_prev, app->btn_play,
+			    app->btn_next, app->btn_repeat };
+	for (gsize i = 0; i < G_N_ELEMENTS(tb); i++)
+		gtk_box_pack_start(GTK_BOX(transport), tb[i], FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(centre), transport, FALSE, FALSE, 0);
+
+	GtkWidget *seek = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+	add_class(seek, "mp-seek-row");
+	app->time_label = gtk_label_new("0:00");
+	add_class(app->time_label, "mp-time");
+	gtk_label_set_xalign(GTK_LABEL(app->time_label), 1.0);
+	gtk_label_set_width_chars(GTK_LABEL(app->time_label), 6);
+
+	app->seek_adj = gtk_adjustment_new(0, 0, 1, 1, 10, 0);
+	app->seek_scale = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL,
+					app->seek_adj);
+	gtk_scale_set_draw_value(GTK_SCALE(app->seek_scale), FALSE);
+	gtk_widget_set_hexpand(app->seek_scale, TRUE);
+	gtk_widget_set_size_request(app->seek_scale, SEEK_WIDTH, -1);
+	gtk_widget_set_can_focus(app->seek_scale, FALSE);
+	gtk_widget_set_sensitive(app->seek_scale, FALSE);
+	add_class(app->seek_scale, "mp-seek");
+	g_signal_connect(app->seek_scale, "change-value",
+			 G_CALLBACK(on_seek_change_value), app);
+	g_signal_connect(app->seek_scale, "button-press-event",
+			 G_CALLBACK(on_seek_press), app);
+	g_signal_connect(app->seek_scale, "button-release-event",
+			 G_CALLBACK(on_seek_release), app);
+	g_signal_connect(app->seek_scale, "grab-broken-event",
+			 G_CALLBACK(on_seek_grab_broken), app);
+
+	GtkWidget *dur_box = gtk_event_box_new();
+	gtk_event_box_set_visible_window(GTK_EVENT_BOX(dur_box), FALSE);
+	app->duration_label = gtk_label_new("--:--");
+	add_class(app->duration_label, "mp-time");
+	gtk_label_set_xalign(GTK_LABEL(app->duration_label), 0.0);
+	gtk_label_set_width_chars(GTK_LABEL(app->duration_label), 6);
+	gtk_container_add(GTK_CONTAINER(dur_box), app->duration_label);
+	gtk_widget_set_tooltip_text(dur_box,
+				    "Click to show the time remaining (T)");
+	g_signal_connect(dur_box, "button-press-event",
+			 G_CALLBACK(on_duration_click), app);
+
+	gtk_box_pack_start(GTK_BOX(seek), app->time_label, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(seek), app->seek_scale, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(seek), dur_box, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(centre), seek, FALSE, FALSE, 0);
+	gtk_box_set_center_widget(GTK_BOX(app->controls), centre);
+
+	/* Right: the volume (the speaker mutes), then the queue and the
+	 * views. */
+	app->bar_right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+	gtk_widget_set_halign(app->bar_right, GTK_ALIGN_END);
+	gtk_widget_set_valign(app->bar_right, GTK_ALIGN_CENTER);
+	app->btn_volume = mp_glyph_button("likeos-volume",
+					  "audio-volume-high-symbolic", 16,
+					  "Mute (M)", "mp-bar-button", FALSE);
+	gtk_widget_add_events(app->btn_volume,
+			      GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+	g_signal_connect(app->btn_volume, "clicked",
+			 G_CALLBACK(on_volume_clicked), app);
+	g_signal_connect(app->btn_volume, "scroll-event",
+			 G_CALLBACK(on_volume_scroll), app);
+	app->btn_mute = app->btn_volume;
+	app->volume_value = NULL;
+	app->volume_adj = gtk_adjustment_new(80, 0, 100, 5, 10, 0);
+	app->volume_scale = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL,
+					  app->volume_adj);
+	gtk_scale_set_draw_value(GTK_SCALE(app->volume_scale), FALSE);
+	gtk_widget_set_can_focus(app->volume_scale, FALSE);
+	gtk_widget_set_size_request(app->volume_scale, 96, -1);
+	gtk_widget_set_valign(app->volume_scale, GTK_ALIGN_CENTER);
+	add_class(app->volume_scale, "mp-volume");
+	g_signal_connect(app->volume_adj, "value-changed",
+			 G_CALLBACK(on_volume_changed), app);
+
+	GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+	add_class(sep, "mp-bar-separator");
+	pv->bar_separator = sep;
+
+	app->btn_queue = mp_glyph_button("likeos-play-queue",
+					 "view-list-symbolic", 16,
+					 "Queue (F9)", "mp-bar-button", FALSE);
+	g_signal_connect(app->btn_queue, "clicked",
+			 G_CALLBACK(on_queue_clicked), app);
+	app->btn_mini = mp_glyph_button("likeos-mini-player",
+					"view-restore-symbolic", 16,
+					"Mini player (Ctrl+M)", "mp-bar-button",
+					FALSE);
+	g_signal_connect(app->btn_mini, "clicked", G_CALLBACK(on_mini_clicked),
+			 app);
+	app->btn_fullscreen = mp_glyph_button("likeos-fullscreen",
+					      "view-fullscreen-symbolic", 16,
+					      "Full screen (F)",
+					      "mp-bar-button", FALSE);
+	g_signal_connect(app->btn_fullscreen, "clicked",
+			 G_CALLBACK(on_fullscreen_clicked), app);
+
+	app->btn_menu = gtk_menu_button_new();
+	gtk_container_add(GTK_CONTAINER(app->btn_menu),
+			  mp_glyph_new("likeos-more", "view-more-symbolic", 16));
+	gtk_widget_set_tooltip_text(app->btn_menu, "More");
+	gtk_widget_set_can_focus(app->btn_menu, FALSE);
+	gtk_widget_set_focus_on_click(app->btn_menu, FALSE);
+	gtk_widget_set_valign(app->btn_menu, GTK_ALIGN_CENTER);
+	add_class(app->btn_menu, "mp-glyph-button");
+	add_class(app->btn_menu, "mp-bar-button");
+	app->menu = build_main_menu(app);
+	gtk_menu_button_set_popup(GTK_MENU_BUTTON(app->btn_menu), app->menu);
+	gtk_menu_button_set_direction(GTK_MENU_BUTTON(app->btn_menu),
+				      GTK_ARROW_UP);
+
+	GtkWidget *rb[] = { app->btn_volume, app->volume_scale, sep,
+			    app->btn_queue, app->btn_mini,
+			    app->btn_fullscreen, app->btn_menu };
+	for (gsize i = 0; i < G_N_ELEMENTS(rb); i++)
+		gtk_box_pack_start(GTK_BOX(app->bar_right), rb[i], FALSE, FALSE,
+				   0);
+	gtk_box_pack_end(GTK_BOX(app->controls), app->bar_right, TRUE, TRUE, 0);
+
+	app->controls_revealer = gtk_revealer_new();
+	gtk_revealer_set_transition_type(
+		GTK_REVEALER(app->controls_revealer),
+		GTK_REVEALER_TRANSITION_TYPE_SLIDE_UP);
+	gtk_revealer_set_transition_duration(
+		GTK_REVEALER(app->controls_revealer), 160);
+	gtk_container_add(GTK_CONTAINER(app->controls_revealer),
+			  app->controls);
+	gtk_revealer_set_reveal_child(GTK_REVEALER(app->controls_revealer),
+				      TRUE);
+	/* Motion over the strip counts as activity when it hides by itself
+	 * too. */
+	GtkWidget *ev = gtk_event_box_new();
+	gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev), FALSE);
+	gtk_widget_add_events(ev, GDK_POINTER_MOTION_MASK);
+	g_signal_connect(ev, "motion-notify-event",
+			 G_CALLBACK(on_media_motion), app);
+	gtk_container_add(GTK_CONTAINER(ev), app->controls_revealer);
+	add_class(ev, "mp-bar-slot");
+	pv->bar = ev;
+	return ev;
+}
+
+static GtkWidget *build_top_bar(MpApp *app)
+{
+	app->top_revealer = gtk_revealer_new();
+	gtk_revealer_set_transition_type(GTK_REVEALER(app->top_revealer),
+					 GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+	gtk_revealer_set_transition_duration(GTK_REVEALER(app->top_revealer),
+					     160);
+	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	add_class(bar, "mp-top-bar");
+	add_class(app->top_revealer, "mp-top-slot");
+	GtkWidget *back = mp_glyph_button("likeos-back", "go-previous-symbolic",
+					  16, "Back (Esc)", "mp-bar-button",
+					  FALSE);
+	g_signal_connect(back, "clicked", G_CALLBACK(on_now_back), app);
+	gtk_box_pack_start(GTK_BOX(bar), back, FALSE, FALSE, 0);
+	app->top_title = gtk_label_new("");
+	add_class(app->top_title, "mp-top-title");
+	gtk_label_set_ellipsize(GTK_LABEL(app->top_title), PANGO_ELLIPSIZE_END);
+	gtk_label_set_xalign(GTK_LABEL(app->top_title), 0.0);
+	gtk_box_pack_start(GTK_BOX(bar), app->top_title, TRUE, TRUE, 0);
+	gtk_container_add(GTK_CONTAINER(app->top_revealer), bar);
+	gtk_widget_add_events(app->top_revealer, GDK_POINTER_MOTION_MASK);
+	g_signal_connect(app->top_revealer, "motion-notify-event",
+			 G_CALLBACK(on_media_motion), app);
+	return app->top_revealer;
+}
+
+static GtkWidget *empty_hint(const char *title, const char *text)
+{
+	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+	add_class(box, "mp-empty");
+	gtk_widget_set_valign(box, GTK_ALIGN_CENTER);
+	gtk_widget_set_halign(box, GTK_ALIGN_CENTER);
+	GtkWidget *g = mp_glyph_new("likeos-play-queue", "view-list-symbolic",
+				    48);
+	add_class(g, "mp-empty-glyph");
+	gtk_box_pack_start(GTK_BOX(box), g, FALSE, FALSE, 0);
+	GtkWidget *t = gtk_label_new(title);
+	add_class(t, "mp-empty-title");
+	gtk_box_pack_start(GTK_BOX(box), t, FALSE, FALSE, 0);
+	GtkWidget *l = gtk_label_new(text);
+	gtk_label_set_justify(GTK_LABEL(l), GTK_JUSTIFY_CENTER);
+	add_class(l, "mp-empty-text");
+	gtk_box_pack_start(GTK_BOX(box), l, FALSE, FALSE, 0);
+	return box;
+}
+
+static void queue_action(GtkWidget *actions, const char *likeos,
+			 const char *fallback, const char *label,
+			 GCallback cb, MpApp *app)
+{
+	GtkWidget *b = mp_text_button(likeos, fallback, label, FALSE);
+	g_signal_connect_swapped(b, "clicked", cb, app);
+	gtk_box_pack_start(GTK_BOX(actions), b, FALSE, FALSE, 0);
+}
+
+/* The "queue" page. */
+static GtkWidget *build_queue(MpApp *app)
+{
+	MpPriv *pv = priv_of(app);
+	GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	add_class(page, "mp-page");
+	GtkWidget *actions = NULL;
+	app->queue_header = mp_page_header("Queue", &actions);
+	gtk_box_pack_start(GTK_BOX(page), app->queue_header, FALSE, FALSE, 0);
+	queue_action(actions, "likeos-add", "list-add-symbolic", "Add files",
+		     G_CALLBACK(mp_dialog_add_files), app);
+	queue_action(actions, "likeos-folder-add", "folder-new-symbolic",
+		     "Add folder", G_CALLBACK(mp_dialog_add_folder), app);
+	queue_action(actions, "likeos-save-as", "document-save-symbolic",
+		     "Save as playlist", G_CALLBACK(mp_dialog_save_playlist),
+		     app);
+	queue_action(actions, "likeos-delete", "edit-clear-all-symbolic",
+		     "Clear", G_CALLBACK(queue_clear), app);
+
+	app->queue_view = gtk_tree_view_new_with_model(
+		mp_playlist_model(app->playlist));
+	GtkTreeView *tv = GTK_TREE_VIEW(app->queue_view);
+	gtk_tree_view_set_headers_visible(tv, FALSE);
+	/* Letters are player commands (N, P, M, ...) everywhere in the
+	 * window, so typing in the list must not start a search. */
+	gtk_tree_view_set_enable_search(tv, FALSE);
+	gtk_tree_view_set_tooltip_column(tv, MP_COL_TOOLTIP);
+	gtk_tree_selection_set_mode(gtk_tree_view_get_selection(tv),
+				    GTK_SELECTION_MULTIPLE);
+
+	GtkCellRenderer *r_icon = gtk_cell_renderer_pixbuf_new();
+	g_object_set(r_icon, "xpad", 8, NULL);
+	gtk_cell_renderer_set_fixed_size(r_icon, 36, -1);
+	GtkTreeViewColumn *c_icon = gtk_tree_view_column_new();
+	gtk_tree_view_column_pack_start(c_icon, r_icon, TRUE);
+	gtk_tree_view_column_set_cell_data_func(c_icon, r_icon, queue_mark_cell,
+						app, NULL);
+	gtk_tree_view_append_column(tv, c_icon);
+	queue_text_column(app, tv, MP_COL_TITLE, FALSE, TRUE, 0, 0.0f);
+	queue_text_column(app, tv, MP_COL_ARTIST, TRUE, FALSE, 200, 0.0f);
+	queue_text_column(app, tv, MP_COL_ALBUM, TRUE, FALSE, 200, 0.0f);
+	queue_text_column(app, tv, MP_COL_DURATION_TEXT, TRUE, FALSE, 80, 1.0f);
+	mp_list_style(tv, queue_row_current, app);
+
+	g_signal_connect(app->queue_view, "row-activated",
+			 G_CALLBACK(on_row_activated), app);
+	g_signal_connect(app->queue_view, "button-press-event",
+			 G_CALLBACK(on_queue_button), app);
+
+	/* Rows can be dragged within the queue, and files dropped on it. */
+	static const GtkTargetEntry row_target[] = {
+		{ (gchar *)QUEUE_ROWS_TARGET, GTK_TARGET_SAME_WIDGET,
+		  TARGET_QUEUE_ROWS },
+	};
+	gtk_tree_view_enable_model_drag_source(tv, GDK_BUTTON1_MASK,
+					       row_target, 1, GDK_ACTION_COPY);
+	setup_drop_target(app->queue_view, app, TRUE);
+	g_signal_connect(app->queue_view, "drag-data-get",
+			 G_CALLBACK(on_queue_drag_get), app);
+	g_signal_connect(app->queue_view, "drag-data-delete",
+			 G_CALLBACK(on_queue_drag_delete), app);
+	g_signal_connect_after(app->queue_view, "drag-motion",
+			       G_CALLBACK(on_queue_drag_motion), app);
+	g_signal_connect(app->queue_view, "drag-leave",
+			 G_CALLBACK(on_queue_drag_leave), app);
+
+	GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+				       GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	add_class(sw, "mp-list-scroller");
+	gtk_container_add(GTK_CONTAINER(sw), app->queue_view);
+
+	GtkWidget *empty_ev = gtk_event_box_new();
+	gtk_event_box_set_visible_window(GTK_EVENT_BOX(empty_ev), FALSE);
+	gtk_container_add(GTK_CONTAINER(empty_ev),
+			  empty_hint("The queue is empty",
+				     "Drop music and videos here, or add them "
+				     "from the library."));
+	setup_drop_target(empty_ev, app, FALSE);
+	app->queue_empty = empty_ev;
+
+	app->queue_stack = gtk_stack_new();
+	gtk_stack_add_named(GTK_STACK(app->queue_stack), empty_ev, "empty");
+	gtk_stack_add_named(GTK_STACK(app->queue_stack), sw, "list");
+	gtk_box_pack_start(GTK_BOX(page), app->queue_stack, TRUE, TRUE, 0);
+
+	pv->queue_menu = build_queue_menu(app);
+	gtk_menu_attach_to_widget(GTK_MENU(pv->queue_menu), app->queue_view,
+				  NULL);
+	return page;
+}
+
+/* ---- floating bars ---------------------------------------------------- */
+
+static gboolean stage_shows_video(MpApp *app)
+{
+	return app->video_widget != NULL &&
+	       g_strcmp0(gtk_stack_get_visible_child_name(
+				 GTK_STACK(app->media_stack)),
+			 "video") == 0;
+}
+
+/* Immersive: the stage alone fills the window between the dark title
+ * strip above it and the dark transport strip below, and both slide away
+ * while the pointer rests, giving the picture the whole window.  That is
+ * the case for a video on the "now" page, in full screen, and in the mini
+ * player.
+ *
+ * The strips border the picture rather than lie on it: a video is drawn by
+ * the X server into a window of its own, and without a compositor nothing
+ * drawn by GTK over that window would show.
+ *
+ * The mini player showing a cover is the one place the strip lies on the
+ * page itself, over the blurred cover; everywhere else it has its own slot
+ * along the bottom of the window. */
+static void place_bar(MpApp *app, gboolean floating)
+{
+	MpPriv *pv = priv_of(app);
+	GtkWidget *bar = pv->bar;
+	GtkWidget *want = floating ? app->stage_overlay : app->bar_slot;
+	GtkWidget *parent = gtk_widget_get_parent(bar);
+	GtkStyleContext *sc = gtk_widget_get_style_context(app->window);
+	if (floating)
+		gtk_style_context_add_class(sc, "mp-bar-floating");
+	else
+		gtk_style_context_remove_class(sc, "mp-bar-floating");
+	if (parent == want)
+		return;
+	g_object_ref(bar);
+	if (parent != NULL)
+		gtk_container_remove(GTK_CONTAINER(parent), bar);
+	if (floating) {
+		gtk_widget_set_valign(bar, GTK_ALIGN_END);
+		gtk_overlay_add_overlay(GTK_OVERLAY(app->stage_overlay), bar);
+	} else {
+		gtk_widget_set_valign(bar, GTK_ALIGN_FILL);
+		gtk_box_pack_start(GTK_BOX(app->bar_slot), bar, TRUE, TRUE, 0);
+	}
+	g_object_unref(bar);
+}
+
+static void update_immersive(MpApp *app)
+{
+	MpPriv *pv = priv_of(app);
+	if (pv == NULL || pv->bar == NULL || app->pages == NULL)
+		return;
+	gboolean on_now = strcmp(mp_pages_current(app), "now") == 0;
+	gboolean video = stage_shows_video(app);
+	gboolean on = app->mini || (on_now && (app->fullscreen || video));
+
+	/* A film or the full screen takes the whole window: no sidebar
+	 * beside it.  Music on the "now" page keeps it. */
+	gtk_widget_set_visible(app->nav_pane, !on && !app->mini);
+	place_bar(app, app->mini && !video);
+	if (on == app->immersive)
+		return;
+	app->immersive = on;
+
+	GtkStyleContext *sc = gtk_widget_get_style_context(app->window);
+	if (on)
+		gtk_style_context_add_class(sc, "mp-immersive");
+	else
+		gtk_style_context_remove_class(sc, "mp-immersive");
+	GtkWidget *back = g_object_get_data(G_OBJECT(app->window),
+					    "mp-now-back");
+	if (back != NULL)
+		gtk_widget_set_visible(back, !on);
+
+	/* The mini player has the window's own title; the strip would only
+	 * take room from the picture. */
+	gtk_widget_set_visible(app->top_revealer, on && !app->mini);
+	if (on) {
+		app->controls_hidden = TRUE;	/* so that this shows them */
+		show_controls(app);
+	} else {
+		if (app->hide_timer != 0) {
+			g_source_remove(app->hide_timer);
+			app->hide_timer = 0;
+		}
+		gtk_revealer_set_reveal_child(
+			GTK_REVEALER(app->controls_revealer), TRUE);
+		gtk_revealer_set_reveal_child(GTK_REVEALER(app->top_revealer),
+					      FALSE);
+		app->controls_hidden = FALSE;
+		set_cursor_visible(app, TRUE);
+	}
+	mp_player_expose(app->player);
+}
+
+void mp_app_page_changed(MpApp *app)
+{
+	update_immersive(app);
+}
+
+void mp_app_set_mini(MpApp *app, gboolean mini)
+{
+	MpPriv *pv = priv_of(app);
+	if (mini == app->mini)
+		return;
+	if (mini && app->fullscreen)
+		mp_app_set_fullscreen(app, FALSE);
+	app->mini = mini;
+	GtkWindow *win = GTK_WINDOW(app->window);
+	GtkStyleContext *sc = gtk_widget_get_style_context(app->window);
+	if (mini) {
+		capture_geometry(app);
+		gtk_window_get_size(win, &pv->mini_w, &pv->mini_h);
+		gtk_style_context_add_class(sc, "mp-mini");
+		gtk_widget_hide(app->infobar);
+		if (strcmp(mp_pages_current(app), "now") != 0)
+			mp_pages_show(app, "now");
+	} else {
+		gtk_style_context_remove_class(sc, "mp-mini");
+	}
+	/* The mini player is the picture and the transport: no titles, no
+	 * volume, no menus; its own button brings the window back. */
+	GtkWidget *hide[] = { app->now_box, app->btn_volume,
+			      app->volume_scale, pv->bar_separator,
+			      app->btn_queue, app->btn_fullscreen,
+			      app->btn_menu, app->art_title, app->art_artist,
+			      app->art_status, app->btn_shuffle,
+			      app->btn_repeat };
+	for (gsize i = 0; i < G_N_ELEMENTS(hide); i++)
+		gtk_widget_set_visible(hide[i], !mini);
+	mp_glyph_button_set(app->btn_mini,
+			    mini ? "likeos-window-restore" : "likeos-mini-player",
+			    mini ? "view-fullscreen-symbolic"
+				 : "view-restore-symbolic");
+	gtk_widget_set_tooltip_text(app->btn_mini,
+				    mini ? "Leave the mini player (Esc)"
+					 : "Mini player (Ctrl+M)");
+	gtk_widget_set_size_request(app->seek_scale,
+				    mini ? SEEK_WIDTH_MINI : SEEK_WIDTH, -1);
+	gtk_window_set_keep_above(win, mini);
+	update_immersive(app);
+	if (mini) {
+		gtk_window_resize(win, 360, 360);
+	} else {
+		if (pv->mini_w > 0 && pv->mini_h > 0)
+			gtk_window_resize(win, pv->mini_w, pv->mini_h);
+		mp_pages_back(app);
+	}
+	gtk_widget_queue_draw(app->art_area);
+}
+
+/* ---- the queue, filled from elsewhere --------------------------------- */
+
+const char *mp_app_current_uri(MpApp *app)
+{
+	if (app->player == NULL ||
+	    (app->current_id == 0 &&
+	     mp_player_get_state(app->player) == MP_PLAYER_STOPPED))
+		return NULL;
+	return mp_player_get_uri(app->player);
+}
+
+/* One library entry into the queue at `pos', with what the library knows
+ * about it; anything else is looked up the usual way. */
+static guint insert_known(MpApp *app, gint pos, const char *uri)
+{
+	gchar *title = NULL, *artist = NULL, *album = NULL;
+	gint64 dur = -1;
+	gboolean known = mp_library_lookup(app->library, uri, &title, &artist,
+					   &album, &dur);
+	guint id = mp_playlist_insert(app->playlist, pos, uri,
+				      known ? title : NULL, dur);
+	if (id != 0 && known)
+		mp_playlist_set_info(app->playlist, id, title, artist, album,
+				     dur);
+	else if (id != 0 && app->settings.discover)
+		mp_discover_queue(app->discover, id, uri);
+	g_free(title);
+	g_free(artist);
+	g_free(album);
+	return id;
+}
+
+void mp_app_play_uris(MpApp *app, GPtrArray *uris, guint start,
+		      gboolean shuffle)
+{
+	if (uris == NULL || uris->len == 0)
+		return;
+	mp_app_clear_queue(app);
+	if (shuffle && !mp_playlist_get_shuffle(app->playlist))
+		toggle_shuffle(app);
+	guint start_id = 0;
+	mp_playlist_freeze_notify(app->playlist);
+	for (guint i = 0; i < uris->len; i++) {
+		guint id = insert_known(app, -1, g_ptr_array_index(uris, i));
+		if (id == 0)
+			break;
+		if (i == start)
+			start_id = id;
+	}
+	mp_playlist_thaw_notify(app->playlist);
+	if (shuffle)
+		start_id = mp_playlist_next(app->playlist, TRUE);
+	if (start_id == 0)
+		start_id = mp_playlist_first(app->playlist);
+	if (start_id != 0)
+		mp_app_play_id(app, start_id);
+}
+
+void mp_app_queue_uris(MpApp *app, GPtrArray *uris, gboolean next)
+{
+	gint pos = -1;
+	if (next && app->current_id != 0) {
+		gint cur = mp_playlist_index_of(app->playlist, app->current_id);
+		if (cur >= 0)
+			pos = cur + 1;
+	}
+	mp_playlist_freeze_notify(app->playlist);
+	for (guint i = 0; i < uris->len; i++) {
+		if (insert_known(app, pos, g_ptr_array_index(uris, i)) == 0)
+			break;
+		if (pos >= 0)
+			pos++;
+	}
+	mp_playlist_thaw_notify(app->playlist);
+	gchar *msg = g_strdup_printf("%u %s added to the queue.",
+				     uris->len,
+				     uris->len == 1 ? "item" : "items");
+	infobar_show(app, GTK_MESSAGE_INFO, msg);
+	g_free(msg);
+}
+
+void mp_app_play_playlist_file(MpApp *app, const char *path, gboolean add)
+{
+	GFile *f = g_file_new_for_path(path);
+	gchar *uri = g_file_get_uri(f);
+	g_object_unref(f);
+	if (!add) {
+		mp_app_stop(app);
+		mp_app_clear_queue(app);
+	}
+	gchar *one[] = { uri, NULL };
+	mp_app_add_uris(app, one, !add, -1);
+	g_free(uri);
+}
+
+void mp_app_set_discover(MpApp *app, gboolean on)
+{
+	app->settings.discover = on;
+	if (on && app->discover == NULL)
+		app->discover = mp_discover_new(discover_done, app);
+	else if (!on && app->discover != NULL) {
+		mp_discover_free(app->discover);
+		app->discover = NULL;
+	}
+	mp_app_schedule_save(app);
 }
 
 MpApp *mp_window_create(MpOptions *options)
@@ -2877,7 +3470,7 @@ MpApp *mp_window_create(MpOptions *options)
 				    options->no_audio, &err);
 	if (app->player == NULL) {
 		mp_dialog_message(NULL, GTK_MESSAGE_ERROR,
-				  "Media Player cannot start",
+				  MP_APP_NAME " cannot start",
 				  err ? err->message : "GStreamer failed.");
 		g_clear_error(&err);
 		gtk_widget_destroy(app->window);
@@ -2912,19 +3505,29 @@ MpApp *mp_window_create(MpOptions *options)
 			 G_CALLBACK(on_infobar_response), app);
 	gtk_box_pack_start(GTK_BOX(vbox), app->infobar, FALSE, FALSE, 0);
 
-	app->paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-	GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-	gtk_box_pack_start(GTK_BOX(left), build_media_area(app), TRUE, TRUE,
-			   0);
-	gtk_box_pack_start(GTK_BOX(left), build_controls(app), FALSE, FALSE,
-			   0);
-	gtk_paned_pack1(GTK_PANED(app->paned), left, TRUE, FALSE);
-	gtk_paned_pack2(GTK_PANED(app->paned), build_queue(app), FALSE, FALSE);
-	gtk_paned_set_position(GTK_PANED(app->paned),
-			       MAX(320, app->settings.width -
-						app->settings.queue_width));
-	gtk_box_pack_start(GTK_BOX(vbox), app->paned, TRUE, TRUE, 0);
+	/* The body: the navigation pane and the card with the pages, between
+	 * the title strip of immersive mode and the transport bar. */
+	GtkWidget *bar = build_controls(app);
+	mp_pages_build(app, build_queue(app), build_media_area(app));
+	gtk_stack_set_hhomogeneous(GTK_STACK(app->pages), FALSE);
+	gtk_stack_set_vhomogeneous(GTK_STACK(app->pages), FALSE);
+	GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	add_class(body, "mp-body");
+	gtk_box_pack_start(GTK_BOX(body), app->nav_pane, FALSE, FALSE, 0);
+	app->content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	add_class(app->content, "mp-content");
+	gtk_widget_set_hexpand(app->content, TRUE);
+	gtk_box_pack_start(GTK_BOX(app->content), app->pages, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(body), app->content, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(vbox), build_top_bar(app), FALSE, FALSE, 0);
+	app->stage_overlay = gtk_overlay_new();
+	gtk_container_add(GTK_CONTAINER(app->stage_overlay), body);
+	gtk_box_pack_start(GTK_BOX(vbox), app->stage_overlay, TRUE, TRUE, 0);
+	app->bar_slot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_box_pack_start(GTK_BOX(app->bar_slot), bar, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(vbox), app->bar_slot, FALSE, FALSE, 0);
 	gtk_container_add(GTK_CONTAINER(app->window), vbox);
+	add_class(app->window, "mp-window");
 
 	g_signal_connect(app->window, "key-press-event",
 			 G_CALLBACK(on_key_press), app);
@@ -2935,8 +3538,9 @@ MpApp *mp_window_create(MpOptions *options)
 
 	gtk_widget_show_all(app->window);
 	gtk_widget_hide(app->infobar);
-	set_queue_visible(app, app->settings.show_playlist);
+	gtk_widget_hide(app->top_revealer);
 	gtk_stack_set_visible_child_name(GTK_STACK(app->media_stack), "art");
+	mp_pages_start(app);
 	gtk_window_set_focus(GTK_WINDOW(app->window), NULL);
 
 	update_mode_buttons(app);
@@ -2971,7 +3575,9 @@ void mp_window_destroy(MpApp *app)
 		pv->queue_menu = NULL;
 	}
 	gtk_widget_destroy(app->menu);
+	mp_pages_free(app);
 	gtk_widget_destroy(app->window);
+	mp_library_free(app->library);
 	mp_player_free(app->player);
 	mp_playlist_free(app->playlist);
 	g_clear_object(&app->cover);

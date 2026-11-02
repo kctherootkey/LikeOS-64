@@ -1,9 +1,10 @@
-// LikeOS -- File Explorer: locations.
+// LikeOS Explorer: locations.
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include "backend/ex-location.h"
 #include "backend/ex-util.h"
+#include "backend/ex-volumes.h"
 
 #include <string.h>
 
@@ -59,8 +60,11 @@ ExLocation *ex_location_new_special(ExLocationKind kind)
 	case EX_LOC_HOME:
 		l->id = g_strdup("likeos:home");
 		break;
-	case EX_LOC_THISPC:
-		l->id = g_strdup("likeos:thispc");
+	case EX_LOC_COMPUTER:
+		l->id = g_strdup("likeos:computer");
+		break;
+	case EX_LOC_GALLERY:
+		l->id = g_strdup("likeos:gallery");
 		break;
 	case EX_LOC_TRASH:
 		l->id = g_strdup("likeos:trash");
@@ -129,9 +133,14 @@ ExLocation *ex_location_parse(const char *text)
 		return NULL;
 	if (strcmp(text, "likeos:home") == 0)
 		return ex_location_new_special(EX_LOC_HOME);
-	if (strcmp(text, "likeos:thispc") == 0 ||
+	if (strcmp(text, "likeos:gallery") == 0)
+		return ex_location_new_special(EX_LOC_GALLERY);
+	/* "likeos:thispc" is the id settings saved before Computer had its
+	 * name; it still names the same place. */
+	if (strcmp(text, "likeos:computer") == 0 ||
+	    strcmp(text, "likeos:thispc") == 0 ||
 	    g_str_has_prefix(text, "computer:"))
-		return ex_location_new_special(EX_LOC_THISPC);
+		return ex_location_new_special(EX_LOC_COMPUTER);
 	if (strcmp(text, "likeos:trash") == 0 ||
 	    g_str_has_prefix(text, "trash:"))
 		return ex_location_new_special(EX_LOC_TRASH);
@@ -234,7 +243,7 @@ static char *folder_name(GFile *f)
 
 	if (path && strcmp(path, "/") == 0) {
 		g_free(path);
-		return g_strdup("Local Disk");
+		return g_strdup(EX_SYSTEM_DISK_NAME);
 	}
 	if (path && strcmp(path, g_get_home_dir()) == 0) {
 		g_free(path);
@@ -259,8 +268,10 @@ char *ex_location_display_name(const ExLocation *loc)
 	switch (loc->kind) {
 	case EX_LOC_HOME:
 		return g_strdup("Home");
-	case EX_LOC_THISPC:
-		return g_strdup("This PC");
+	case EX_LOC_COMPUTER:
+		return g_strdup("Computer");
+	case EX_LOC_GALLERY:
+		return g_strdup("Gallery");
 	case EX_LOC_TRASH:
 		return g_strdup("Trash");
 	case EX_LOC_SEARCH: {
@@ -293,8 +304,10 @@ const char *ex_location_icon_name(const ExLocation *loc)
 	switch (loc->kind) {
 	case EX_LOC_HOME:
 		return "go-home";
-	case EX_LOC_THISPC:
+	case EX_LOC_COMPUTER:
 		return "computer";
+	case EX_LOC_GALLERY:
+		return "likeos-gallery-color";
 	case EX_LOC_TRASH:
 		return "user-trash";
 	case EX_LOC_SEARCH:
@@ -369,7 +382,7 @@ ExLocation *ex_location_parent(const ExLocation *loc)
 		ExLocation *l;
 
 		if (!p)
-			return ex_location_new_special(EX_LOC_THISPC);
+			return ex_location_new_special(EX_LOC_COMPUTER);
 		l = ex_location_new_folder(p);
 		g_object_unref(p);
 		return l;
@@ -377,7 +390,7 @@ ExLocation *ex_location_parent(const ExLocation *loc)
 	case EX_LOC_SEARCH:
 		return ex_location_ref(loc->scope);
 	case EX_LOC_TRASH:
-	case EX_LOC_THISPC:
+	case EX_LOC_COMPUTER:
 		return ex_location_new_special(EX_LOC_HOME);
 	default:
 		return NULL;
@@ -400,15 +413,47 @@ GPtrArray *ex_location_crumbs(const ExLocation *loc)
 		return out;
 	}
 
-	/* Below the home folder the chain starts there; elsewhere at This PC
-	 * and the disk. */
+	/* Where the chain starts: inside a personal folder (Desktop,
+	 * Documents, Downloads, Pictures, Music, Videos) at that folder;
+	 * elsewhere below the home folder at the home folder; on a mounted
+	 * drive at Computer and the drive; anywhere else at Computer and the
+	 * disk. */
+	static const GUserDirectory personal[] = {
+		G_USER_DIRECTORY_DESKTOP,   G_USER_DIRECTORY_DOCUMENTS,
+		G_USER_DIRECTORY_DOWNLOAD,  G_USER_DIRECTORY_PICTURES,
+		G_USER_DIRECTORY_MUSIC,	    G_USER_DIRECTORY_VIDEOS,
+	};
 	GFile *home = ex_home_dir();
-	GFile *stop = NULL;
+	GFile *stop = NULL, *pdir = NULL, *vroot = NULL;
 	GSList *chain = NULL;
 	GFile *cur = g_object_ref(loc->file);
+	gboolean computer = FALSE;
 
-	if (g_file_equal(cur, home) || g_file_has_prefix(cur, home))
+	for (gsize i = 0; i < G_N_ELEMENTS(personal) && !stop; i++) {
+		const char *p = ex_user_dir(personal[i]);
+
+		if (!p)
+			continue;
+		pdir = g_file_new_for_path(p);
+		/* The home folder itself is no personal folder (an unset
+		 * Desktop falls back to it). */
+		if (!g_file_equal(pdir, home) &&
+		    (g_file_equal(cur, pdir) || g_file_has_prefix(cur, pdir)))
+			stop = pdir;
+		else
+			g_clear_object(&pdir);
+	}
+	if (!stop && (g_file_equal(cur, home) || g_file_has_prefix(cur, home)))
 		stop = home;
+	if (!stop && g_file_is_native(cur)) {
+		const ExVolume *v = ex_volumes_find(ex_volumes_get_default(), cur);
+		GFile *root = g_file_new_for_path("/");
+
+		if (v && v->root && !g_file_equal(v->root, root))
+			stop = vroot = g_object_ref(v->root);
+		g_object_unref(root);
+		computer = TRUE;
+	}
 	for (;;) {
 		chain = g_slist_prepend(chain, cur);
 		if (stop && g_file_equal(cur, stop))
@@ -418,13 +463,15 @@ GPtrArray *ex_location_crumbs(const ExLocation *loc)
 			break;
 		cur = p;
 	}
-	if (!stop && g_file_is_native(loc->file))
-		g_ptr_array_add(out, ex_location_new_special(EX_LOC_THISPC));
+	if (computer)
+		g_ptr_array_add(out, ex_location_new_special(EX_LOC_COMPUTER));
 	for (GSList *s = chain; s; s = s->next) {
 		g_ptr_array_add(out, ex_location_new_folder(s->data));
 		g_object_unref(s->data);
 	}
 	g_slist_free(chain);
+	g_clear_object(&pdir);
+	g_clear_object(&vroot);
 	g_object_unref(home);
 	return out;
 }

@@ -1,114 +1,165 @@
-// LikeOS theme colours: the Windows 11 light palette.
+// LikeOS theme colours.
 //
-// The structure is Adwaita's (these are the names its widget rules use); the
-// values are Windows 11's, taken from the Fluent design tokens of the light
-// theme and checked against screenshots of the real desktop:
+// Two palettes.  Programs are light: a cool, faintly blue-grey window colour,
+// white for everything that holds content (fields, lists, menus), ink-blue
+// text and the LikeOS blue as the accent.  The shell -- panel, launcher,
+// control center, panel menus, notification bubbles -- is dark, and its
+// palette is defined here too so that every program that draws a shell
+// surface with GTK takes its colours from one place.
 //
-//   Mica window background        #f3f3f3
-//   Layer / control fill          #fbfbfb  (white at 70% over Mica)
-//   Card / text field / list      #ffffff
-//   Text primary                  #1b1b1b  (black at 89.6%)
-//   Text secondary                #616161  (black at 60.6%)
-//   Text disabled                 #a0a0a0  (black at 36.1%)
-//   Control stroke                #e5e5e5  (black at 5.8%)
-//   Control stroke, bottom edge   #cccccc  (black at 16.2%)
-//   Strong stroke                 #868686  (black at 44.6%) - text field edge,
-//                                          check box rim, slider track
-//   Accent (default blue)         #005fb8  (SystemAccentColorDark1, the fill
-//                                          of an accent button)
-//   Accent, as a highlight        #0078d4  (SystemAccentColor: text
-//                                          selection, focus indicators)
-//   Subtle fill, hover            #000000 at 3.7%
-//   Subtle fill, pressed          #000000 at 2.4%
+// The structure is Adwaita's: the names below are the ones its widget rules
+// read, so the whole of src/_common.scss follows these values.  The design
+// tokens in _tokens.scss give the same colours names by role; new rules use
+// those.
+//
+//   window background         #f5f7fb      title row (active)   #eef2f9
+//   raised control            #fbfcfe      hover / pressed      #f2f5fa / #ebeff6
+//   content (fields, lists)   #ffffff      menu frame           #d3dae6
+//   text                      #141a24      secondary / disabled #586174 / #a3abb9
+//   hairline                  #e1e6ef      control bottom edge  #cdd4e0
+//   strong edge               #8b94a5      (field edge, check box rim, slider track)
+//   accent fill               #2a5bd7      hover / pressed      #3a69df / #4b77e4
+//   accent highlight          #3b74f0      (selection, focus ring, progress, sliders)
 //
 // Copyright (C) 2026 The LikeOS Project
 // Portions from GTK's Adwaita theme, LGPL-2.1-or-later.
 
 $base_color: #ffffff;
-$text_color: #1b1b1b;
-$caret_color: #1b1b1b;
-$bg_color: #f3f3f3;
-$fg_color: #1b1b1b;
+$text_color: #141a24;
+$caret_color: #141a24;
+$bg_color: #f5f7fb;
+$fg_color: #141a24;
 
-// Accent.  $selected_bg_color is what Adwaita fills selected and "checked"
-// things with; Windows fills an accent button with the darker #005fb8 and
-// highlights selected text with #0078d4.
-$accent_color: #005fb8;
-$accent_hover_color: #1a6ebd;     // accent at 90% over white
-$accent_active_color: #337fc6;    // accent at 80% over white
-$accent_light_color: #0078d4;
+// The active title row of a window that draws its own (and the colour the
+// window manager gives an active title bar).
+$title_active_color: #eef2f9;
+
+// Accent.  The fill of accent buttons, checked boxes and switches is the
+// deep LikeOS blue; selected text, the keyboard focus ring, progress and
+// sliders use the brighter highlight.
+$accent_color: #2a5bd7;
+$accent_hover_color: #3a69df;
+$accent_active_color: #4b77e4;
+$accent_highlight_color: #3b74f0;
 
 $selected_fg_color: #ffffff;
-$selected_bg_color: $accent_light_color;
+$selected_bg_color: $accent_highlight_color;
 $selected_borders_color: $accent_color;
 
-$borders_color: #e5e5e5;
-$alt_borders_color: #cccccc;
-$strong_borders_color: #868686;
+$borders_color: #e1e6ef;
+$alt_borders_color: #cdd4e0;
+$strong_borders_color: #8b94a5;
 $borders_edge: transparent;
-$link_color: $accent_color;
-$link_visited_color: #003e92;
+$link_color: #2251c4;
+$link_visited_color: #5b3fc4;
 $top_hilight: transparent;
-$dark_fill: #ebebeb;
+$dark_fill: #ebeff6;
 $headerbar_color: $bg_color;
-$menu_color: #f9f9f9;
-$popover_bg_color: #f9f9f9;
-$popover_hover_color: #f0f0f0;
+// Menus and popovers are white in a hairline frame.  There is no compositing
+// manager to draw a shadow under them, so the frame is a shade deeper than
+// the hairlines inside a window: it alone separates a menu from what is
+// beneath it.
+$menu_color: $base_color;
+$menu_border_color: #d3dae6;
+$menu_separator_color: #e6eaf1;
+$popover_bg_color: $base_color;
+$popover_hover_color: #eef3fd;
 
-// Fills for "subtle" controls -- flat buttons, list rows, menu items -- which
-// show no fill at rest and a faint grey wash when pointed at or pressed.
-$subtle_hover_color: rgba(0, 0, 0, 0.0373);
-$subtle_active_color: rgba(0, 0, 0, 0.0241);
+// Fills for "subtle" controls -- flat buttons, list rows, menu items --
+// which show no fill at rest and a faint blue-grey wash under the pointer
+// and while pressed.
+$subtle_hover_color: rgba(28, 58, 120, 0.06);
+$subtle_active_color: rgba(28, 58, 120, 0.10);
 
-// Raised controls (buttons, combo boxes, spin buttons): white at 70% over
-// Mica at rest, a shade darker on hover, and the pressed look.
-$control_color: #fbfbfb;
-$control_hover_color: #f6f6f6;
-$control_active_color: #f5f5f5;
-$control_disabled_color: #f9f9f9;
-$secondary_text_color: #616161;
-$control_active_text_color: #5d5d5d;
+// Raised controls (buttons, combo boxes, spin buttons).
+$control_color: #fbfcfe;
+$control_hover_color: #f2f5fa;
+$control_active_color: #ebeff6;
+$control_disabled_color: #f5f7fb;
+$secondary_text_color: #586174;
+$control_active_text_color: #3a4252;
 
-// File-manager style list selection: the light blue Windows has always used
-// for selected items in a file list, with the text left dark.
-$list_hover_color: #e5f3ff;
-$list_selected_color: #cce8ff;
-$list_selected_hover_color: #c4e1fa;
+// Lists of items (files, places, rows): a pale blue under the pointer, a
+// deeper one for what is selected, the text staying dark.  In a window that
+// is not focused the selection turns a neutral grey-blue.
+$list_hover_color: #eef3fd;
+$list_selected_color: #dce7fd;
+$list_selected_hover_color: #d0defb;
+$list_inactive_selected_color: #e6eaf1;
 
-$scrollbar_bg_color: rgba(249, 249, 249, 0.96);
-$scrollbar_slider_color: #8a8a8a;
-$scrollbar_slider_hover_color: #6d6d6d;
-$scrollbar_slider_active_color: #5d5d5d;
+$scrollbar_bg_color: transparent;
+$scrollbar_slider_color: rgba(20, 26, 36, 0.32);
+$scrollbar_slider_hover_color: rgba(20, 26, 36, 0.48);
+$scrollbar_slider_active_color: rgba(20, 26, 36, 0.60);
 
-// Windows 11's status colours (InfoBar, validation).
-$warning_color: #9d5d00;
-$error_color: #c42b1c;
-$success_color: #0f7b0f;
-$destructive_color: #c42b1c;
+// Status colours (info bars, validation, level bars).
+$warning_color: #d98a00;
+$error_color: #d63a3a;
+$success_color: #1f9d55;
+$destructive_color: #d63a3a;
+// The text of a status in the status colour: a shade deeper, so that it
+// stays readable on white.
+$warning_text_color: #9a5f00;
+$error_text_color: #b8292a;
+$success_text_color: #17783f;
+// The pale fills and frames of an info bar by severity.
+$info_bg_color: mix($accent_highlight_color, white, 7%);
+$info_border_color: mix($accent_highlight_color, white, 28%);
+$success_bg_color: mix($success_color, white, 9%);
+$success_border_color: mix($success_color, white, 32%);
+$warning_bg_color: mix($warning_color, white, 10%);
+$warning_border_color: mix($warning_color, white, 34%);
+$error_bg_color: mix($error_color, white, 8%);
+$error_border_color: mix($error_color, white, 30%);
 
-$osd_fg_color: #eeeeec;
-$osd_text_color: white;
-$osd_bg_color: rgba(32, 32, 32, 0.9);
+// The caption buttons of a title row: close turns red with a white glyph.
+$close_hover_color: #e0443e;
+$close_active_color: #c7352f;
+
+// The one-pixel frame of a window.
+$window_border_color: #aebad0;
+$window_border_inactive_color: #d3d9e3;
+
+// The dark shell palette.  Opaque wherever a surface is a window of its
+// own: without a compositing manager nothing shows through a window.
+$shell_bg_color: #161c2a;
+$shell_raised_color: #1f2636;
+$shell_hover_color: rgba(255, 255, 255, 0.07);
+$shell_active_color: rgba(255, 255, 255, 0.12);
+$shell_border_color: #2c3446;
+$shell_text_color: #eef2fa;
+$shell_text_secondary_color: #a4adbf;
+$shell_text_disabled_color: #6b7486;
+$shell_accent_color: #5b8ff9;
+$shell_accent_fill_color: #3f74f2;
+
+// On-screen displays (video controls and the like) use the shell palette.
+$osd_fg_color: $shell_text_color;
+$osd_text_color: $shell_text_color;
+$osd_bg_color: transparentize($shell_bg_color, 0.06);
 $osd_insensitive_bg_color: transparentize(mix($osd_fg_color, opacify($osd_bg_color, 1), 10%), 0.5);
 $osd_insensitive_fg_color: mix($osd_fg_color, opacify($osd_bg_color, 1), 50%);
-$osd_borders_color: transparentize(black, 0.3);
+$osd_borders_color: $shell_border_color;
 
 $sidebar_bg_color: $bg_color;
 $base_hover_color: $subtle_hover_color;
 
-$tooltip_borders_color: #d3d3d3;
-$shadow_color: rgba(0, 0, 0, 0.14);
+// Tool tips are small dark labels in the shell palette.
+$tooltip_bg_color: $shell_raised_color;
+$tooltip_fg_color: $shell_text_color;
+$tooltip_borders_color: $shell_border_color;
+$shadow_color: rgba(20, 26, 36, 0.16);
 
-$drop_target_color: $accent_light_color;
+$drop_target_color: $accent_highlight_color;
 
 //insensitive state derived colors
-$insensitive_fg_color: #a0a0a0;
+$insensitive_fg_color: #a3abb9;
 $insensitive_bg_color: $control_disabled_color;
 $insensitive_borders_color: $borders_color;
 
-// Windows does not dim an unfocused window's content: a window behind
-// another looks exactly like the one in front, apart from its title bar.
-// So the "backdrop" colours are the normal ones.
+// The content of a window that is not focused keeps its colours; only its
+// title row and a list's selection change.  So the "backdrop" colours are
+// the normal ones.
 $backdrop_base_color: $base_color;
 $backdrop_text_color: $text_color;
 $backdrop_bg_color: $bg_color;
@@ -127,8 +178,8 @@ $backdrop_menu_color: $menu_color;
 //special cased widget colors
 $suggested_bg_color: $accent_color;
 $suggested_border_color: $accent_color;
-$progress_bg_color: $accent_color;
-$progress_border_color: $accent_color;
+$progress_bg_color: $accent_highlight_color;
+$progress_border_color: $accent_highlight_color;
 $checkradio_bg_color: $accent_color;
 $checkradio_fg_color: $selected_fg_color;
 $checkradio_borders_color: $accent_color;

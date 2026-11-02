@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: phone, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="19" y1="54" x2="45" y2="10"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M23 4H41A7 7 0 0 1 48 11V53A7 7 0 0 1 41 60H23A7 7 0 0 1 16 53V11A7 7 0 0 1 23 4Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M23 4H41A7 7 0 0 1 48 11V53A7 7 0 0 1 41 60H23A7 7 0 0 1 16 53V11A7 7 0 0 1 23 4Z" fill="url(#g2)"/>
+<path d="M23 4H41A7 7 0 0 1 48 11V53A7 7 0 0 1 41 60H23A7 7 0 0 1 16 53V11A7 7 0 0 1 23 4Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M23 10H41A4 4 0 0 1 45 14V50A4 4 0 0 1 41 54H23A4 4 0 0 1 19 50V14A4 4 0 0 1 23 10Z" fill="url(#g3)"/>
+<path d="M26 27.125A1.125 1.125 0 0 1 28.25 27.125V35.188A0.562 0.562 0 0 0 28.812 35.75H36.875A1.125 1.125 0 0 1 36.875 38H28.025A2.025 2.025 0 0 1 26 35.975Z" fill="#ffffff" opacity="0.64"/>
+<path d="M29.75 30.125A4.125 4.125 0 1 0 38 30.125A4.125 4.125 0 1 0 29.75 30.125ZM31.75 30.125A2.125 2.125 0 1 1 36 30.125A2.125 2.125 0 1 1 31.75 30.125Z" fill="#ffffff" opacity="0.8"/>
+<path d="M28 6.8H36" fill="none" stroke="#8d97a8" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

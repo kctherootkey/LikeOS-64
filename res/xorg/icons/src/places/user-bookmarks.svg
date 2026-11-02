@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: user-bookmarks, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="5.5" x2="0" y2="61.5"><stop offset="0" stop-color="#ffd86b"/><stop offset="1" stop-color="#f2a516"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="5.5" x2="0" y2="61.5"><stop offset="0" stop-color="#f7c040"/><stop offset="1" stop-color="#e08d00"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M32 5.5L39.735 22.853L58.63 24.848L44.516 37.567L48.458 56.152L32 46.66L15.542 56.152L19.484 37.567L5.37 24.848L24.265 22.853Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M32 5.5L39.735 22.853L58.63 24.848L44.516 37.567L48.458 56.152L32 46.66L15.542 56.152L19.484 37.567L5.37 24.848L24.265 22.853Z" fill="url(#g2)" stroke="url(#g3)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 5.5L39.735 22.853L58.63 24.848L32 33.5Z" fill="#ffffff" opacity="0.18"/>
+</g>
+</svg>

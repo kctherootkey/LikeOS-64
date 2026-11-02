@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: reading and writing playlist files.
+// LikeOS -- LikeOS Media Player: reading and writing playlist files.
 //
 // M3U (plain and extended, in UTF-8 or Latin-1), M3U8 (always UTF-8) and
 // PLS.  These are the formats other players save and web radio stations
@@ -83,8 +83,9 @@ static gchar *read_text(const char *path, GError **error)
 	return text;
 }
 
-/* Turn one entry line into a URI.  Windows-written playlists use
- * backslashes, and a relative "Music\track.mp3" is meant as a path. */
+/* Turn one entry line into a URI.  Playlists written with backslashes
+ * between folders are common, and a relative "Music\track.mp3" is meant as
+ * a path. */
 static gchar *entry_to_uri(const char *line, const char *base_dir)
 {
 	gchar *s = g_strdup(line);

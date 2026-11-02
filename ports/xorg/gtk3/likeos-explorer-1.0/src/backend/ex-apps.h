@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: which application opens what.
+// LikeOS Explorer: which application opens what.
 //
 // The system's association database -- the .desktop files and
 // mimeapps.list, through GAppInfo -- and nothing of Explorer's own: no
@@ -38,7 +38,7 @@ gboolean ex_apps_launch(GAppInfo *app, GPtrArray *files,
  * the kind (a document, opened with its app); a program that makes its own
  * windows, started as it is; or a console program -- one linked against no
  * windowing library, or a script (#!) -- which runs in a terminal window,
- * as Windows runs its console programs. */
+ * so that what it prints can be read. */
 typedef enum {
 	EX_PROGRAM_NONE,
 	EX_PROGRAM_WINDOWED,

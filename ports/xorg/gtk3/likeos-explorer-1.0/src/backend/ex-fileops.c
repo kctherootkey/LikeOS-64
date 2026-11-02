@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: file operations.
+// LikeOS Explorer: file operations.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -15,6 +15,13 @@
 #define EX_ASK_POLL_US (200 * 1000)
 /* Least time between two "progress" signals. */
 #define EX_PROGRESS_US (100 * 1000)
+/* The speed is measured over windows of at least this long and smoothed
+ * from one window to the next, so a single slow or fast moment does not
+ * make the estimate jump. */
+#define EX_RATE_US (500 * 1000)
+#define EX_RATE_KEEP 0.6
+/* The first measurement comes sooner, so a speed is shown early on. */
+#define EX_RATE_FIRST_US (150 * 1000)
 
 typedef struct {
 	GFile *src;
@@ -27,6 +34,7 @@ struct _ExOperation {
 	ExOpState state;
 	char *title;
 	GPtrArray *sources; /* GFile */
+	GFile *source_dir; /* the one folder all sources are in, or NULL */
 	GFile *dest_dir;
 	GPtrArray *items; /* Item */
 	char *name; /* rename, mkdir, newfile */
@@ -47,6 +55,9 @@ struct _ExOperation {
 	gint64 rate_t0;
 	guint64 rate_b0;
 	double rate;
+	/* Paused: the worker stops at its next progress point until resumed
+	 * or cancelled (under lock). */
+	gboolean paused;
 	/* The open question (under lock). */
 	gboolean waiting;
 	gboolean answered;
@@ -103,6 +114,7 @@ static void ex_operation_finalize(GObject *o)
 
 	g_free(op->title);
 	g_ptr_array_unref(op->sources);
+	g_clear_object(&op->source_dir);
 	g_clear_object(&op->dest_dir);
 	g_ptr_array_unref(op->items);
 	g_free(op->name);
@@ -189,6 +201,23 @@ static ExOperation *op_new(ExOpKind kind, GPtrArray *sources)
 			it->src = g_object_ref(f);
 			g_ptr_array_add(op->items, it);
 		}
+	/* Where the items come from, when that is one folder: "Copying 3
+	 * items from Downloads to Desktop". */
+	for (guint i = 0; i < op->sources->len; i++) {
+		GFile *parent = g_file_get_parent(g_ptr_array_index(op->sources,
+								    i));
+
+		if (!parent || (i > 0 && (!op->source_dir ||
+					  !g_file_equal(parent, op->source_dir)))) {
+			g_clear_object(&parent);
+			g_clear_object(&op->source_dir);
+			break;
+		}
+		if (i == 0)
+			op->source_dir = parent;
+		else
+			g_object_unref(parent);
+	}
 	return op;
 }
 
@@ -375,15 +404,42 @@ static void emit_on_main(ExOperation *op, guint sig, gpointer arg)
 	ex_run_on(op->ctx, do_emit, e, emit_free);
 }
 
+/* From the worker, with op->lock held: while the operation is paused, wait
+ * here.  Every progress point is one, so a paused copy stops within its
+ * current block.  ex_operation_cancel() wakes the wait; the timeout only
+ * guards against a cancel that did not. */
+static void pause_point_locked(ExOperation *op)
+{
+	if (!op->paused)
+		return;
+	while (op->paused && !g_cancellable_is_cancelled(op->cancel)) {
+		gint64 until = g_get_monotonic_time() + EX_ASK_POLL_US;
+
+		g_cond_wait_until(&op->cond, &op->lock, until);
+	}
+	/* The speed is measured afresh from here: the pause was not slow
+	 * copying. */
+	op->rate_t0 = 0;
+}
+
 /* From the worker, with op->lock held. */
 static void progress_locked(ExOperation *op)
 {
-	gint64 now = g_get_monotonic_time();
+	gint64 now;
 
-	if (now - op->rate_t0 >= G_USEC_PER_SEC) {
-		if (op->rate_t0)
-			op->rate = (double)(op->bytes_done - op->rate_b0) *
-				   G_USEC_PER_SEC / (double)(now - op->rate_t0);
+	pause_point_locked(op);
+	now = g_get_monotonic_time();
+	if (!op->rate_t0) {
+		op->rate_t0 = now;
+		op->rate_b0 = op->bytes_done;
+	} else if (now - op->rate_t0 >= (op->rate > 0 ? EX_RATE_US :
+							EX_RATE_FIRST_US)) {
+		double r = (double)(op->bytes_done - op->rate_b0) *
+			   G_USEC_PER_SEC / (double)(now - op->rate_t0);
+
+		op->rate = op->rate > 0 ? EX_RATE_KEEP * op->rate +
+						  (1.0 - EX_RATE_KEEP) * r :
+					  r;
 		op->rate_t0 = now;
 		op->rate_b0 = op->bytes_done;
 	}
@@ -1544,6 +1600,30 @@ void ex_operation_start(ExOperation *op)
 	g_object_unref(task);
 }
 
+void ex_operation_set_paused(ExOperation *op, gboolean paused)
+{
+	gboolean changed;
+
+	g_mutex_lock(&op->lock);
+	changed = op->paused != !!paused;
+	op->paused = !!paused;
+	g_cond_broadcast(&op->cond);
+	g_mutex_unlock(&op->lock);
+	/* The worker sends nothing while it waits: say so from here. */
+	if (changed)
+		g_signal_emit(op, sigs[SIG_PROGRESS], 0);
+}
+
+gboolean ex_operation_is_paused(ExOperation *op)
+{
+	gboolean p;
+
+	g_mutex_lock(&op->lock);
+	p = op->paused;
+	g_mutex_unlock(&op->lock);
+	return p;
+}
+
 void ex_operation_cancel(ExOperation *op)
 {
 	g_cancellable_cancel(op->cancel);
@@ -1591,6 +1671,11 @@ const char *ex_operation_get_title(ExOperation *op)
 GFile *ex_operation_get_dest_dir(ExOperation *op)
 {
 	return op->dest_dir;
+}
+
+GFile *ex_operation_get_source_dir(ExOperation *op)
+{
+	return op->source_dir;
 }
 
 GPtrArray *ex_operation_get_sources(ExOperation *op)

@@ -1,11 +1,12 @@
-// LikeOS -- File Explorer: locations.
+// LikeOS Explorer: locations.
 //
-// A location is what a tab shows.  Most are folders, but Home, This PC, the
-// Trash and search results are places too, and none of them is a path.  So
-// a location has a kind and, for the kinds that have one, a GFile; its
-// identity is a stable string id ("likeos:home", "likeos:trash",
-// "likeos:search?scope=<uri>&q=<query>", or a folder's URI) that history,
-// pins and settings keep, rather than the text shown in the address bar.
+// A location is what a tab shows.  Most are folders, but Home, Gallery,
+// Computer, the Trash and search results are places too, and none of them
+// is a path.  So a location has a kind and, for the kinds that have one, a
+// GFile; its identity is a stable string id ("likeos:home", "likeos:gallery",
+// "likeos:computer", "likeos:trash", "likeos:search?scope=<uri>&q=<query>",
+// or a folder's URI) that history, pins and settings keep, rather than the
+// text shown in the address bar.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -19,9 +20,10 @@ G_BEGIN_DECLS
 typedef enum {
 	EX_LOC_FOLDER,
 	EX_LOC_HOME, /* the landing page: pins, favorites, recent files */
-	EX_LOC_THISPC, /* drives and the personal folders */
+	EX_LOC_COMPUTER, /* drives and the personal folders */
 	EX_LOC_TRASH,
 	EX_LOC_SEARCH, /* results of a query below a scope location */
+	EX_LOC_GALLERY, /* the pictures and videos of the collection */
 } ExLocationKind;
 
 typedef struct _ExLocation ExLocation;
@@ -35,7 +37,7 @@ ExLocation *ex_location_new_search(ExLocation *scope, const char *query);
 
 /* An id, URI, absolute path or "~/..." -- whatever a command line, a saved
  * setting or the address bar hands over.  trash:/// and computer:/// map to
- * the Trash and This PC.  NULL for something that names no location. */
+ * the Trash and Computer.  NULL for something that names no location. */
 ExLocation *ex_location_parse(const char *text);
 
 ExLocation *ex_location_ref(ExLocation *loc);
@@ -60,11 +62,13 @@ const char *ex_location_icon_name(const ExLocation *loc);
 /* What the address bar puts in its text field when edited. */
 char *ex_location_edit_text(const ExLocation *loc);
 
-/* Up: the containing folder, or This PC above the root, or NULL. */
+/* Up: the containing folder, or Computer above the root, or NULL. */
 ExLocation *ex_location_parent(const ExLocation *loc);
 
 /* The breadcrumb chain from the outermost place down to `loc', each a new
- * reference: Home > Documents > Letters, or This PC > Local Disk > usr. */
+ * reference: Documents > Letters inside a personal folder, niko > src
+ * elsewhere below the home folder, Computer > System disk > usr outside
+ * it. */
 GPtrArray *ex_location_crumbs(const ExLocation *loc);
 
 /* The trash folder of the home directory (…/Trash/files). */

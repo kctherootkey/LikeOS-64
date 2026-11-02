@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: walking folders for media files.
+// LikeOS -- LikeOS Media Player: walking folders for media files.
 //
 // Runs in a GTask worker thread, because a folder of music on a slow disk
 // takes seconds to list and the window must keep painting meanwhile.  Only

@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: the GStreamer engine.
+// LikeOS -- LikeOS Media Player: the GStreamer engine.
 //
 // playbin does the real work: it finds a source for the URI, a demuxer for
 // the container, decoders for the streams and sinks for the output.  This
@@ -268,6 +268,13 @@ static void on_overlay_realize(GtkWidget *w, gpointer data)
 #ifdef GDK_WINDOWING_X11
 	if (GDK_IS_X11_WINDOW(win)) {
 		guintptr xid = (guintptr)GDK_WINDOW_XID(win);
+		/* The sink talks to the X server over a connection of its
+		 * own, so the window must exist on the server before it is
+		 * named there: until GDK's request to create it has been
+		 * processed, every request the sink makes on it -- the
+		 * graphics context its frames are drawn with first of all --
+		 * fails, and no frame ever shows. */
+		gdk_display_sync(gtk_widget_get_display(w));
 		g_atomic_pointer_set(&p->window_handle, (gpointer)xid);
 		if (p->overlay_sink != NULL)
 			gst_video_overlay_set_window_handle(

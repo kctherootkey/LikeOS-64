@@ -1,5 +1,5 @@
 [Desktop Entry]
-# Media Player, the system's own GTK3 player (ports/xorg/gtk3/
+# LikeOS Media Player, the system's own GTK3 player (ports/xorg/gtk3/
 # likeos-mediaplayer-1.0).  The MIME types are the audio and video formats
 # GStreamer's installed plug-ins handle, plus the playlist formats the
 # program reads itself; %U hands over several files or URLs at once.
@@ -7,7 +7,7 @@
 # Copyright (C) 2026 The LikeOS Project
 Type=Application
 Version=1.0
-Name=Media Player
+Name=LikeOS Media Player
 GenericName=Music and Video Player
 Comment=Play music, videos and internet streams
 Exec=mediaplayer %U

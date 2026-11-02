@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: printer, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="20" x2="0" y2="48"><stop offset="0" stop-color="#f3f5f9"/><stop offset="1" stop-color="#c9d0dc"/></linearGradient></defs>
+<g transform="scale(0.25)">
+<path d="M16 4H48V24H16Z" fill="#b9c1ce"/>
+<path d="M20 8H44V20H20Z" fill="#ffffff"/>
+<path d="M8 20H56A4 4 0 0 1 60 24V44A4 4 0 0 1 56 48H8A4 4 0 0 1 4 44V24A4 4 0 0 1 8 20Z" fill="url(#g1)"/>
+<path d="M10 22H54A4 4 0 0 1 58 26V42A4 4 0 0 1 54 46H10A4 4 0 0 1 6 42V26A4 4 0 0 1 10 22Z" fill="none" stroke="#8d97a8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12 36H52V40H12Z" fill="#3a4357"/>
+<path d="M16 40H48V60H16Z" fill="#b9c1ce"/>
+<path d="M20 44H44V56H20Z" fill="#ffffff"/>
+</g>
+</svg>

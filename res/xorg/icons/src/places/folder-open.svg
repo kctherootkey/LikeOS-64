@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: folder-open, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="8" x2="0" y2="54"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#2f66e3"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="12" x2="0" y2="30"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dfe6f2"/></linearGradient><filter id="f4" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1"/></filter><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="54"><stop offset="0" stop-color="#6a9cf7"/><stop offset="1" stop-color="#4a82f0"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M4 11.5A3.5 3.5 0 0 1 7.5 8H24C26.5 8 26.5 13 29 13H56.5A3.5 3.5 0 0 1 60 16.5V50.5A3.5 3.5 0 0 1 56.5 54H7.5A3.5 3.5 0 0 1 4 50.5Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M4 11.5A3.5 3.5 0 0 1 7.5 8H24C26.5 8 26.5 13 29 13H56.5A3.5 3.5 0 0 1 60 16.5V50.5A3.5 3.5 0 0 1 56.5 54H7.5A3.5 3.5 0 0 1 4 50.5Z" fill="url(#g2)"/>
+<path d="M9.5 12H54.5A1.5 1.5 0 0 1 56 13.5V42.5A1.5 1.5 0 0 1 54.5 44H9.5A1.5 1.5 0 0 1 8 42.5V13.5A1.5 1.5 0 0 1 9.5 12Z" fill="url(#g3)"/>
+<path d="M15.1 17.1H42.9" fill="none" stroke="#c4cbd7" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M15.1 22.3H37.5" fill="none" stroke="#c4cbd7" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M8.425 27.452Q9 24 12.5 24L59.5 24Q63 24 62.652 27.483L60.348 50.517Q60 54 56.5 54L7.5 54Q4 54 4.575 50.548Z" fill="#0d2a78" opacity="0.3" transform="translate(0 -1.6)" filter="url(#f4)"/>
+<path d="M8.425 27.452Q9 24 12.5 24L59.5 24Q63 24 62.652 27.483L60.348 50.517Q60 54 56.5 54L7.5 54Q4 54 4.575 50.548Z" fill="url(#g5)"/>
+<path d="M12.5 24.5H59.5" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.6"/>
+<path d="M7.5 53.5H56.5" fill="none" stroke="#1d47b0" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.35"/>
+</g>
+</svg>

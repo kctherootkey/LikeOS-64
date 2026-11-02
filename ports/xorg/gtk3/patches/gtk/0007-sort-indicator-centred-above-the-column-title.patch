@@ -1,0 +1,104 @@
+The sort indicator of a list column is a small chevron centred above the title.
+
+GTK packed the sort arrow beside the column title, at its right (or left for
+right-aligned titles), where it took width from the title and moved it off
+the line of the unsorted columns' titles.  LikeOS lists draw a small
+chevron centred at the top edge of the sorted column's header, above the
+title.  The arrow is now an overlay over the title's row: centred, aligned to
+the top of the header's content, 12 pixels, with the style class
+"sort-indicator" so the theme can place and colour it, and passing clicks
+through to the header button.  The title keeps its own alignment and no
+longer moves when a column becomes sorted.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/gtk/gtktreeviewcolumn.c
++++ b/gtk/gtktreeviewcolumn.c
+@@ -815,6 +815,7 @@
+   GtkTreeViewColumnPrivate *priv = tree_column->priv;
+   GtkWidget *child;
+   GtkWidget *hbox;
++  GtkWidget *overlay;
+ 
+   g_return_if_fail (priv->button == NULL);
+ 
+@@ -837,7 +838,19 @@
+ G_GNUC_END_IGNORE_DEPRECATIONS
+ 
+   hbox = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
++  /* The sort indicator is a small chevron centred at the top edge of the
++   * header, above the title, where the theme expects it: an overlay over
++   * the title's row, so it takes no width from the title and the titles of
++   * sorted and unsorted columns line up.  It carries the style class
++   * "sort-indicator" for the theme to place it, and lets clicks through to
++   * the button. */
++  overlay = gtk_overlay_new ();
+   priv->arrow = gtk_image_new_from_icon_name ("pan-down-symbolic", GTK_ICON_SIZE_BUTTON);
++  gtk_image_set_pixel_size (GTK_IMAGE (priv->arrow), 12);
++  gtk_widget_set_halign (priv->arrow, GTK_ALIGN_CENTER);
++  gtk_widget_set_valign (priv->arrow, GTK_ALIGN_START);
++  gtk_style_context_add_class (gtk_widget_get_style_context (priv->arrow),
++                               "sort-indicator");
+ 
+   if (priv->child)
+     child = priv->child;
+@@ -851,21 +864,16 @@
+ 		    G_CALLBACK (gtk_tree_view_column_mnemonic_activate),
+ 		    tree_column);
+ 
+-  if (priv->xalign <= 0.5)
+-    {
+-      gtk_box_pack_start (GTK_BOX (hbox), priv->alignment, TRUE, TRUE, 0);
+-      gtk_box_pack_start (GTK_BOX (hbox), priv->arrow, FALSE, FALSE, 0);
+-    }
+-  else
+-    {
+-      gtk_box_pack_start (GTK_BOX (hbox), priv->arrow, FALSE, FALSE, 0);
+-      gtk_box_pack_start (GTK_BOX (hbox), priv->alignment, TRUE, TRUE, 0);
+-    }
++  gtk_box_pack_start (GTK_BOX (hbox), priv->alignment, TRUE, TRUE, 0);
+ 
+   gtk_container_add (GTK_CONTAINER (priv->alignment), child);
+-  gtk_container_add (GTK_CONTAINER (priv->button), hbox);
++  gtk_container_add (GTK_CONTAINER (overlay), hbox);
++  gtk_overlay_add_overlay (GTK_OVERLAY (overlay), priv->arrow);
++  gtk_overlay_set_overlay_pass_through (GTK_OVERLAY (overlay), priv->arrow, TRUE);
++  gtk_container_add (GTK_CONTAINER (priv->button), overlay);
+ 
+   gtk_widget_show (hbox);
++  gtk_widget_show (overlay);
+   gtk_widget_show (priv->alignment);
+ }
+ 
+@@ -874,7 +882,6 @@
+ {
+   GtkTreeViewColumnPrivate *priv = tree_column->priv;
+   gint sort_column_id = -1;
+-  GtkWidget *hbox;
+   GtkWidget *alignment;
+   GtkWidget *arrow;
+   GtkWidget *current_child;
+@@ -886,7 +893,6 @@
+   else
+     model = NULL;
+ 
+-  hbox = gtk_bin_get_child (GTK_BIN (priv->button));
+   alignment = priv->alignment;
+   arrow = priv->arrow;
+   current_child = gtk_bin_get_child (GTK_BIN (alignment));
+@@ -960,15 +966,6 @@
+ 
+   gtk_image_set_from_icon_name (GTK_IMAGE (arrow), icon_name, GTK_ICON_SIZE_BUTTON);
+ 
+-  /* Put arrow on the right if the text is left-or-center justified, and on the
+-   * left otherwise; do this by packing boxes, so flipping text direction will
+-   * reverse things
+-   */
+-  if (priv->xalign <= 0.5)
+-    gtk_box_reorder_child (GTK_BOX (hbox), arrow, 1);
+-  else
+-    gtk_box_reorder_child (GTK_BOX (hbox), arrow, 0);
+-
+   if (priv->show_sort_indicator
+       || (GTK_IS_TREE_SORTABLE (model) && priv->sort_column_id >= 0))
+     gtk_widget_show (arrow);

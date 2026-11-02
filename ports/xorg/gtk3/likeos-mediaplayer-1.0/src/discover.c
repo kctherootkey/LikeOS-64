@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: background metadata for the play queue.
+// LikeOS -- LikeOS Media Player: background metadata for the play queue.
 //
 // GstDiscoverer opens a file far enough to know its streams, length and
 // tags, without playing it.  Files are probed one at a time with a short
@@ -92,15 +92,38 @@ static void on_discovered(GstDiscoverer *disc, GstDiscovererInfo *info,
 	GstDiscovererResult res = gst_discoverer_info_get_result(info);
 	if (it->id != 0 && (res == GST_DISCOVERER_OK ||
 			    res == GST_DISCOVERER_MISSING_PLUGINS)) {
+		gboolean video = FALSE;
+		GList *vs = gst_discoverer_info_get_video_streams(info);
+		for (GList *l = vs; l != NULL; l = l->next) {
+			if (!gst_discoverer_video_info_is_image(l->data))
+				video = TRUE;
+		}
+		gst_discoverer_stream_info_list_free(vs);
 		const GstTagList *tl = gst_discoverer_info_get_tags(info);
-		gchar *title = tag_str(tl, GST_TAG_TITLE);
+		/* A film's title is the container's: the tags of the whole
+		 * file merge those of its streams, and a stream's title is
+		 * a track name ("Audio", "English"), not the film's. */
+		gchar *title = NULL;
+		if (video) {
+			GstDiscovererStreamInfo *top =
+				gst_discoverer_info_get_stream_info(info);
+			if (top != NULL) {
+				title = tag_str(
+					gst_discoverer_stream_info_get_tags(top),
+					GST_TAG_TITLE);
+				gst_discoverer_stream_info_unref(top);
+			}
+		} else {
+			title = tag_str(tl, GST_TAG_TITLE);
+		}
 		gchar *artist = tag_str(tl, GST_TAG_ARTIST);
 		gchar *album = tag_str(tl, GST_TAG_ALBUM);
 		GstClockTime dur = gst_discoverer_info_get_duration(info);
 		gint64 ns = GST_CLOCK_TIME_IS_VALID(dur) && dur > 0
 				    ? (gint64)dur
 				    : -1;
-		d->func(it->id, title, artist, album, ns, d->user_data);
+		d->func(it->id, title, artist, album, ns, video, tl,
+			d->user_data);
 		g_free(title);
 		g_free(artist);
 		g_free(album);

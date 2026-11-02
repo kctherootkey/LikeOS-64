@@ -1,10 +1,12 @@
-// LikeOS -- File Explorer: the Properties window.
+// LikeOS Explorer: the Properties window.
 //
-// General (name, type, what opens it, where it is, size -- counted in the
-// background for folders -- and its dates), Permissions (owner, group and
-// the read/write/execute bits, editable by the owner) and, for a file, the
-// application it opens with, which can be changed for its whole type.
-// Several items get a summary instead.
+// A header with the item's picture large and its name in a field to edit,
+// the type under it; a two-way switch between General and Access; and the
+// page under it, its facts in labelled rows on white cards.  General: type,
+// the app it opens with (chosen for the whole type with "Choose…"), where
+// it is, its size -- counted in the background for folders -- and its
+// dates.  Access: owner, group and who may read, change and run it,
+// editable by the owner.  Several items get a summary instead.
 //
 // Copyright (C) 2026 The LikeOS Project
 

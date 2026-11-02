@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the item views.
+// LikeOS Explorer: the item views.
 //
 // Six layouts over one ExFolderModel: Details (columns with headers), List
 // and Compact (rows), Icons, Large icons (thumbnails) and Tiles.  The first
@@ -72,7 +72,7 @@ GdkDragAction ex_file_view_drag_hint(GdkDragContext *ctx, GFile *dest,
 /* Whether `ctx' is a drag from one of the views. */
 gboolean ex_file_view_dragging(GdkDragContext *ctx);
 /* The selected items are about to be deleted from here: when they have
- * gone, the item that took their place is selected, as in Windows. */
+ * gone, the item that took their place is selected. */
 void ex_file_view_note_removal(ExFileView *v);
 /* The next item matching `f' to appear is renamed in place (New folder). */
 void ex_file_view_rename_when_shown(ExFileView *v, GFile *f);

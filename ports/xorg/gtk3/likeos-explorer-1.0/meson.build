@@ -1,4 +1,4 @@
-# LikeOS -- File Explorer, the system's own file manager.
+# LikeOS Explorer, the system's own file manager.
 #
 # An in-tree port like the media player: the sources live here and the GTK3
 # port driver builds them with meson against the port sysroot.
@@ -74,6 +74,8 @@ backend = static_library('explorer-backend',
     'src/backend/ex-bookmarks.c',
     'src/backend/ex-dir-loader.c',
     'src/backend/ex-file.c',
+    'src/backend/ex-gallery.c',
+    'src/backend/ex-image.c',
     'src/backend/ex-fileops.c',
     'src/backend/ex-index.c',
     'src/backend/ex-location.c',
@@ -115,19 +117,23 @@ ui_sources = files(
   'src/ui/ex-context-menu.c',
   'src/ui/ex-file-view.c',
   'src/ui/ex-folder-model.c',
+  'src/ui/ex-gallery-page.c',
   'src/ui/ex-home-page.c',
   'src/ui/ex-icons.c',
   'src/ui/ex-operation-center.c',
   'src/ui/ex-preview-pane.c',
+  'src/ui/ex-progress-item.c',
   'src/ui/ex-properties.c',
   'src/ui/ex-share.c',
   'src/ui/ex-sidebar.c',
   'src/ui/ex-style.c',
   'src/ui/ex-tab.c',
+  'src/ui/ex-computer-page.c',
   'src/ui/ex-window.c',
   'src/ui/widgets/lx-breadcrumb.c',
   'src/ui/widgets/lx-flyout.c',
   'src/ui/widgets/lx-segmented.c',
+  'src/ui/widgets/lx-speed-graph.c',
   'src/ui/widgets/lx-split-button.c',
 )
 

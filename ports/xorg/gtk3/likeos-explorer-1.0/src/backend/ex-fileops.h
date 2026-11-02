@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: file operations.
+// LikeOS Explorer: file operations.
 //
 // Every change Explorer makes to files is an ExOperation: copy, move, link,
 // trash, delete, rename, new folder or file, restore from the Trash, empty
@@ -126,6 +126,13 @@ ExOperation *ex_operation_new_chmod(GFile *file, guint32 mode);
 
 void ex_operation_start(ExOperation *op);
 void ex_operation_cancel(ExOperation *op);
+/* Pause or resume.  A paused operation stops at its next progress point --
+ * within the block of data it is copying -- and waits, its files open,
+ * until resumed or cancelled; one paused while still queued stops as soon
+ * as it starts.  Emits "progress" when the state changes.  Main loop
+ * only. */
+void ex_operation_set_paused(ExOperation *op, gboolean paused);
+gboolean ex_operation_is_paused(ExOperation *op);
 
 ExOpKind ex_operation_get_kind(ExOperation *op);
 ExOpState ex_operation_get_state(ExOperation *op);
@@ -136,6 +143,10 @@ gboolean ex_operation_is_waiting(ExOperation *op);
 const char *ex_operation_get_title(ExOperation *op);
 /* The destination folder (copy, move, link, mkdir, newfile) or NULL. */
 GFile *ex_operation_get_dest_dir(ExOperation *op);
+/* The folder every source is in, or NULL when they come from different
+ * folders (or there are none) -- the "from" of "Copying 3 items from
+ * Downloads to Desktop". */
+GFile *ex_operation_get_source_dir(ExOperation *op);
 GPtrArray *ex_operation_get_sources(ExOperation *op);
 
 /* Progress: what is being worked on now (a new string), counters, and the
@@ -145,7 +156,9 @@ void ex_operation_get_counts(ExOperation *op, guint64 *bytes_done,
 			     guint64 *bytes_total, guint *items_done,
 			     guint *items_total);
 double ex_operation_get_fraction(ExOperation *op);
-/* Bytes per second over the last few seconds; 0 when not known. */
+/* Bytes per second, measured over half-second windows and smoothed; 0 until
+ * the first measurement (after a moment).  A pause does not count as
+ * slow. */
 double ex_operation_get_rate(ExOperation *op);
 
 /* After "finished". */

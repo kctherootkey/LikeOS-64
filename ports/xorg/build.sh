@@ -1503,12 +1503,14 @@ post_install() {
 # matters: every GTK program and WebKit include it, and a GLib rebuild that
 # only changes the library (a new file-monitor backend, say) would otherwise
 # stamp all its headers -- including the generated glibconfig.h, rewritten
-# with identical contents on every build -- as new.
+# with identical contents on every build -- as new.  GTK is the same one
+# level up: a patch to its widgets must not recompile WebKit.
 #
 # Paths are relative to the sysroot.  Empty for every other package.
 kept_header_dirs() {
 	case "$1" in
 	glib) echo "usr/include/glib-2.0 usr/include/gio-unix-2.0 usr/lib/glib-2.0/include" ;;
+	gtk) echo "usr/include/gtk-3.0 usr/include/gail-3.0" ;;
 	esac
 }
 
@@ -1752,6 +1754,7 @@ is_dataonly() {
 	Selawik) return 0 ;;
 	hunspell-en_US) return 0 ;;
 	shared-mime-info) return 0 ;;
+	tzdata) return 0 ;;
 	esac
 	return 1
 }
@@ -1883,6 +1886,46 @@ install_data() {
 			echo "install_data: mime.cache was not produced" >&2
 			return 1
 		}
+		;;
+	tzdata)
+		# The zone rules as compiled TZif files, one per zone name, in
+		# /usr/share/zoneinfo -- where GLib looks the zone up.  Compiled
+		# by zic on the BUILD host, for the same reason mime.cache is
+		# made there: the output is architecture-free data.
+		#
+		# "fat" files, with every transition written out instead of
+		# only the ones the rule string at the end cannot produce: a
+		# reader that ignores that string still gets the right offsets
+		# through 2037.  backward is the old names ("US/Eastern",
+		# "Europe/Kiev") as links to the current ones.
+		#
+		# zic makes those links hard links; they are copied into
+		# separate files here so that nothing between the sysroot and
+		# the image has to preserve link counts (600 small files, under
+		# a megabyte of data).
+		if ! command -v zic >/dev/null 2>&1; then
+			echo "install_data: no zic on the build host." >&2
+			echo "  It compiles the time zone source into the files" >&2
+			echo "  GLib reads.  It comes with the build host's C" >&2
+			echo "  library utilities (libc-bin on Debian and Ubuntu)." >&2
+			return 1
+		fi
+		rm -rf .zoneinfo "$SYSROOT/usr/share/zoneinfo" || return 1
+		zic -b fat -d .zoneinfo africa antarctica asia australasia \
+			europe northamerica southamerica etcetera backward ||
+			return 1
+		[ -s .zoneinfo/Europe/Berlin ] || {
+			echo "install_data: zic produced no Europe/Berlin" >&2
+			return 1
+		}
+		mkdir -p "$SYSROOT/usr/share" || return 1
+		cp -r .zoneinfo "$SYSROOT/usr/share/zoneinfo" || return 1
+		rm -rf .zoneinfo
+		# The tables that name the zones, for anything that offers a
+		# list to choose from.
+		for f in zone.tab zone1970.tab iso3166.tab; do
+			cp -f "$f" "$SYSROOT/usr/share/zoneinfo/" || return 1
+		done
 		;;
 	hunspell-en_US)
 		# /usr/share/hunspell is not a choice: Enchant's hunspell

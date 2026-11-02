@@ -1,4 +1,4 @@
-.\" mediaplayer.1 - manual page for Media Player.
+.\" mediaplayer.1 - manual page for LikeOS Media Player.
 .\"
 .\" The troff source.  man(1) on this system reads pre-formatted pages, so
 .\" the installed copy is res/man/mediaplayer.1, rendered from this file with
@@ -24,7 +24,7 @@ mediaplayer \- play music, videos and internet streams
 .SH DESCRIPTION
 .B mediaplayer
 is the desktop's music and video player, the program behind
-.B Media Player
+.B LikeOS Media Player
 in the Programs menu and the one a double-clicked song or film opens in.
 It plays whatever the installed GStreamer plug-ins can decode: WAV, AIFF and
 AU sound, AAC and M4A, MP4, Matroska and WebM video with H.264, H.265, VP8 and
@@ -35,8 +35,12 @@ enabled.  Streams play from
 and every other kind of address a GStreamer source element is installed for,
 including HLS and DASH.
 .PP
-The window shows the picture (or, for music, the album cover) with a control
-bar below it, and the play queue at the right.  Sound goes through
+The window has a sidebar at the left: a search box and the places in three
+groups \(em the library (Recent, Music, Videos), playback (Now playing,
+Queue) and the playlists \(em with Settings at its foot.  The page it
+selects is shown beside it, and the transport strip runs along the bottom:
+what is playing at the left, the transport buttons over the seek bar in the
+middle, and the volume, the queue and the view buttons at the right.  Sound goes through
 .BR autoaudiosink ,
 which picks the system's sound service, so the player mixes with everything
 else that is making a sound.
@@ -47,7 +51,7 @@ recursively for media files, which are queued in name order (\(lqTrack 2\(rq
 before \(lqTrack 10\(rq), each folder's files before its sub-folders.
 Hidden files and folders are skipped.  M3U, M3U8 and PLS playlists are read
 and their entries queued; relative entries are taken relative to the
-playlist, and Windows-style backslash paths are understood.
+playlist, and paths with backslashes between folders are understood.
 .SH OPTIONS
 .TP
 .BR \-f ", " \-\-fullscreen
@@ -114,6 +118,43 @@ and so on); see
 .BR "mediaplayer \-\-help\-all" .
 .SH THE WINDOW
 .TP
+.B Recent
+Recently played music and videos, and the albums added to the library last;
+buttons to open files, a folder or an internet address.
+.TP
+.B Music
+Every music file in the library folders (the user's Music folder unless
+others are chosen in the settings), as a list of songs or as tiles of albums
+and artists, chosen with the Songs, Albums and Artists switch.  Double-clicking a song plays the list from there; a tile opens
+the album or the artist, and its round play button plays it.
+\(lqShuffle all\(rq plays the whole library in random order.  Titles,
+artists and albums are read from the files' tags once and kept in
+.IR ~/.cache/mediaplayer/library ;
+only new and changed files are read again.
+.TP
+.B Videos
+The videos in the library folders (the Videos folder unless others are
+chosen), as tiles with a picture from each, kept in
+.IR ~/.cache/mediaplayer/thumbnails .
+.TP
+.B Search
+Typing in the search box lists the library entries whose title, artist or
+album contains the text.
+.TP
+.B Playlists
+\(lqNew playlist\(rq (or the + beside the Playlists header in the sidebar)
+saves what is in the queue under a name; a
+playlist's tile plays it, and its right-button menu adds it to the queue or
+deletes it.  They are kept in
+.IR ~/.local/share/mediaplayer/playlists .
+.TP
+.B Now playing
+Clicking the cover in the transport strip (or Now playing in the sidebar)
+shows the cover large, over a wash of its colours.  A video comes up there by
+itself.  While a video plays, in full screen and in the mini player, the
+window turns black and the dark strips above and below the picture slide
+away while the pointer rests.
+.TP
 .B Seek bar
 Drag it, click it, or scroll on it.  While it is dragged the picture follows
 in key-frame steps; the final position is reached exactly when it is let go.
@@ -121,36 +162,45 @@ Clicking the time at its right switches between the length of the entry and
 the time remaining.
 .TP
 .B Transport
-Shuffle, previous, play/pause, next, repeat and stop.  Previous restarts the
+Shuffle, previous, play/pause, next and repeat (stop is in the
+\(lqMore\(rq menu).  Previous restarts the
 current entry when more than three seconds of it have played, and goes to the
 entry before otherwise.  The repeat button cycles through off, all and
 \(lqthis one\(rq.
 .TP
 .B Volume
-The slider follows the way loudness is heard (a cubic scale), so its middle
+The slider beside the speaker sets the volume; the speaker button mutes and
+unmutes, and the scroll wheel over it changes the volume directly.  The
+slider follows the way loudness is heard (a cubic scale), so its middle
 sounds like half.  It controls this program's stream only; the system volume
 is
 .BR audioctl (1).
 Turning the volume up also unmutes.
 .TP
-.B Play queue
+.B Queue
 Double-click an entry, or select it and press Enter, to play it.  Entries are
-reordered by dragging them, or with the arrow buttons below the list; Delete
-removes the selected ones.  Files and folders dropped on the list are inserted
+reordered by dragging them, or with \(lqMove up\(rq and \(lqMove down\(rq in
+the right-button menu; Delete removes the selected ones.  Files and folders dropped on the list are inserted
 where they fall; dropped on the picture they are added and played at once.
 Titles, artists and lengths of queued local files are read in the background
 before they play.  The right mouse button opens a menu with the same actions.
 .TP
-.B Menu
-Open files, folders, locations and playlists; save the queue as a playlist;
+.B More
+The \(lq...\(rq button at the right of the transport strip: open files, folders, locations and playlists; save the queue as a playlist;
 choose the audio track and the subtitles of a film with several; set the
-playback speed (the pitch is kept); show the media information window, the
-keyboard shortcuts and the version.
+playback speed (the pitch is kept); stop; the queue, the mini player and
+the settings; the media information window, the keyboard shortcuts and the
+version.
+.TP
+.B Mini player
+A small window above the others with the cover and the transport, from its
+button in the transport strip or Ctrl+M; Esc or the same button brings the
+whole window back.
 .TP
 .B Full screen
 Double-click the picture, press
 .B F
-or F11, or use the button.  The control bar slides away while the pointer
+or F11, or use the button.  The transport strip slides away while the pointer
 rests and comes back when it moves; Esc leaves full screen.
 .PP
 The middle mouse button on the picture plays or pauses, the right one opens
@@ -191,7 +241,8 @@ Slower or faster (0.5\(mu to 2\(mu); Backspace returns to normal speed.
 Full screen on or off.
 .TP
 .B Esc
-Leave full screen.
+Leave full screen or the mini player; from the now-playing page or an album,
+go back.
 .TP
 .B T
 Show the length or the time remaining.
@@ -200,8 +251,14 @@ Show the length or the time remaining.
 Media information: tags, codecs, picture size, sample rate, and which video
 and sound outputs are in use.
 .TP
-.B F9
-Show or hide the play queue.
+.B F9\fR,\fP Q
+Show the queue, or go back from it.
+.TP
+.B Ctrl+M
+The mini player.
+.TP
+.B Ctrl+F
+Search the library.
 .TP
 .B Delete
 Remove the selected queue entries (while the queue has the keyboard).
@@ -238,7 +295,7 @@ every entry in turn has failed.
 .TP
 .I ~/.config/mediaplayer/settings
 What is remembered between runs: volume and mute, shuffle and repeat, the
-window and queue sizes, whether the queue is shown, the folder the file
+window size, whether the sidebar is folded, the folder the file
 chooser last opened, and the keys below.  A key file with one
 .B [Player]
 group, written with mode 0600.  Keys that are missing, mistyped or out of
@@ -260,7 +317,13 @@ to stop titles and lengths of queued files from being read ahead.
 .B subtitles
 .B false
 to start with subtitles hidden.
+.TP
+.B music-folders\fR,\fP video-folders
+The library folders, separated by semicolons.
 .RE
+.TP
+.I ~/.config/mediaplayer/recent
+The recently played entries the Recent page shows.
 .TP
 .I /usr/share/applications/mediaplayer.desktop
 The desktop entry: the applications menu, and the file manager's \(lqOpen

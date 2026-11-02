@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: cut, copy and paste of files.
+// LikeOS Explorer: cut, copy and paste of files.
 //
 // The X clipboard, in the formats the rest of the desktop speaks: GNOME's
 // x-special/gnome-copied-files ("copy" or "cut", then URIs) -- what the

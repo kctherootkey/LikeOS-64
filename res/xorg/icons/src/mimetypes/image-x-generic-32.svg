@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: image-x-generic, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="38" y1="18" x2="46.4" y2="9.6"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="36" x2="0" y2="54"><stop offset="0" stop-color="#35aaaa"/><stop offset="1" stop-color="#189191"/></linearGradient><clipPath id="c4"><path d="M20 14H44A2 2 0 0 1 46 16V30A2 2 0 0 1 44 32H20A2 2 0 0 1 18 30V16A2 2 0 0 1 20 14Z"/></clipPath><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="14" x2="0" y2="32"><stop offset="0" stop-color="#8fd3e6"/><stop offset="1" stop-color="#d7f1f3"/></linearGradient><linearGradient id="g6" gradientUnits="userSpaceOnUse" x1="0" y1="19.4" x2="0" y2="32"><stop offset="0" stop-color="#22b3a8"/><stop offset="1" stop-color="#1a9e9e"/></linearGradient><linearGradient id="g7" gradientUnits="userSpaceOnUse" x1="0" y1="22.64" x2="0" y2="32"><stop offset="0" stop-color="#159088"/><stop offset="1" stop-color="#0e7470"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H38L52 18V56A4 4 0 0 1 48 60H16A4 4 0 0 1 12 56V8A4 4 0 0 1 16 4Z" fill="#b9c1ce"/>
+<path d="M16 6H37.2L50 18.8V56A2 2 0 0 1 48 58H16A2 2 0 0 1 14 56V8A2 2 0 0 1 16 6Z" fill="url(#g1)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#b9c1ce"/>
+<path d="M40 8.8V14Q40 16 42 16H47.2Z" fill="url(#g2)"/>
+<path d="M17 36H47A3 3 0 0 1 50 39V51A3 3 0 0 1 47 54H17A3 3 0 0 1 14 51V39A3 3 0 0 1 17 36Z" fill="url(#g3)"/>
+<g clip-path="url(#c4)">
+<path d="M18 14H46V32H18Z" fill="url(#g5)"/>
+<path d="M18 32L18 25.16L26.96 19.4L35.36 26.96L35.36 32Z" fill="url(#g6)"/>
+<path d="M27.8 32L37.6 22.64L46 27.5L46 32Z" fill="url(#g7)"/>
+</g>
+<path d="M37.12 18.86A2.16 2.16 0 1 0 41.44 18.86A2.16 2.16 0 1 0 37.12 18.86Z" fill="#ffd166"/>
+</g>
+</svg>

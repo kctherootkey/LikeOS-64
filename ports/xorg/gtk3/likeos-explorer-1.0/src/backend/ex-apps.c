@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: which application opens what.
+// LikeOS Explorer: which application opens what.
 //
 // Copyright (C) 2026 The LikeOS Project
 

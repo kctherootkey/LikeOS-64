@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: application-x-sharedlib, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="2.667" x2="0" y2="61.333"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="37.333" y1="18.667" x2="46.933" y2="9.067"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="37.333" x2="0" y2="56"><stop offset="0" stop-color="#626e81"/><stop offset="1" stop-color="#475367"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M14.667 2.667H37.333L53.333 18.667V57.333A4 4 0 0 1 49.333 61.333H14.667A4 4 0 0 1 10.667 57.333V6.667A4 4 0 0 1 14.667 2.667Z" fill="#b9c1ce"/>
+<path d="M14.667 5.333H36.267L50.667 19.733V57.333A1.333 1.333 0 0 1 49.333 58.667H14.667A1.333 1.333 0 0 1 13.333 57.333V6.667A1.333 1.333 0 0 1 14.667 5.333Z" fill="url(#g1)"/>
+<path d="M37.333 2.667V16Q37.333 18.667 40 18.667H53.333Z" fill="#b9c1ce"/>
+<path d="M40 9.067V13.333Q40 16 42.667 16H46.933Z" fill="url(#g2)"/>
+<path d="M16 37.333H48A2.667 2.667 0 0 1 50.667 40V53.333A2.667 2.667 0 0 1 48 56H16A2.667 2.667 0 0 1 13.333 53.333V40A2.667 2.667 0 0 1 16 37.333Z" fill="url(#g3)"/>
+<path d="M16 40h2.667v2.667h-2.667ZM16 42.667h2.667v2.667h-2.667ZM16 45.333h2.667v2.667h-2.667ZM16 48h2.667v2.667h-2.667ZM16 50.667h2.667v2.667h-2.667ZM18.667 50.667h2.667v2.667h-2.667ZM21.333 50.667h2.667v2.667h-2.667Z" fill="#ffffff" opacity="1"/>
+<path d="M26.667 40h2.667v2.667h-2.667ZM29.333 40h2.667v2.667h-2.667ZM32 40h2.667v2.667h-2.667ZM29.333 42.667h2.667v2.667h-2.667ZM29.333 45.333h2.667v2.667h-2.667ZM29.333 48h2.667v2.667h-2.667ZM26.667 50.667h2.667v2.667h-2.667ZM29.333 50.667h2.667v2.667h-2.667ZM32 50.667h2.667v2.667h-2.667Z" fill="#ffffff" opacity="1"/>
+<path d="M37.333 40h2.667v2.667h-2.667ZM40 40h2.667v2.667h-2.667ZM37.333 42.667h2.667v2.667h-2.667ZM42.667 42.667h2.667v2.667h-2.667ZM37.333 45.333h2.667v2.667h-2.667ZM40 45.333h2.667v2.667h-2.667ZM37.333 48h2.667v2.667h-2.667ZM42.667 48h2.667v2.667h-2.667ZM37.333 50.667h2.667v2.667h-2.667ZM40 50.667h2.667v2.667h-2.667Z" fill="#ffffff" opacity="1"/>
+<path d="M38.996 24.022L41.091 26.091L40.378 27.812L37.434 27.793L36.46 28.768L36.478 31.712L34.758 32.424L32.689 30.329L31.311 30.329L29.242 32.424L27.522 31.712L27.54 28.768L26.566 27.793L23.622 27.812L22.909 26.091L25.004 24.022L25.004 22.644L22.909 20.576L23.622 18.855L26.566 18.874L27.54 17.899L27.522 14.955L29.242 14.242L31.311 16.337L32.689 16.337L34.758 14.242L36.478 14.955L36.46 17.899L37.434 18.874L40.378 18.855L41.091 20.576L38.996 22.644ZM28.77 23.333A3.23 3.23 0 1 0 35.23 23.333A3.23 3.23 0 1 0 28.77 23.333Z" fill="#8d97a8" stroke="#8d97a8" stroke-width="0.76" stroke-linecap="round" stroke-linejoin="round" fill-rule="evenodd"/>
+</g>
+</svg>

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the Trash.
+// LikeOS Explorer: the Trash.
 //
 // The freedesktop.org trash layout in the home folder: files/ holds the
 // trashed items, info/<name>.trashinfo records for each where it came from

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: one item in a listing.
+// LikeOS Explorer: one item in a listing.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -259,7 +259,7 @@ ExFileCaps ex_file_get_caps(ExFile *f)
 char *ex_file_get_kind_label(ExFile *f)
 {
 	if (ex_file_is_dir(f))
-		return g_strdup("File folder");
+		return g_strdup("Folder");
 	const char *ext = ex_name_extension(ex_file_get_name(f));
 	if (*ext) {
 		char *up = g_utf8_strup(ext + 1, -1);

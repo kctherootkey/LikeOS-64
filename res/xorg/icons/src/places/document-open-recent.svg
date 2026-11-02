@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: document-open-recent, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="32" y1="4" x2="32" y2="60"><stop offset="0" stop-color="#5b8ff9"/><stop offset="1" stop-color="#2a5bd7"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#e8edf5"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M4 32A28 28 0 1 0 60 32A28 28 0 1 0 4 32Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M4 32A28 28 0 1 0 60 32A28 28 0 1 0 4 32Z" fill="url(#g2)"/>
+<path d="M9 32A23 23 0 1 0 55 32A23 23 0 1 0 9 32Z" fill="url(#g3)"/>
+<path d="M50 32L53 32" fill="none" stroke="#9aa4b5" stroke-width="2.38" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M47.588 41L50.187 42.5" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M41 47.588L42.5 50.187" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 50L32 53" fill="none" stroke="#9aa4b5" stroke-width="2.38" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M23 47.588L21.5 50.187" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M16.412 41L13.813 42.5" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M14 32L11 32" fill="none" stroke="#9aa4b5" stroke-width="2.38" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M16.412 23L13.813 21.5" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M23 16.412L21.5 13.813" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 14L32 11" fill="none" stroke="#9aa4b5" stroke-width="2.38" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M41 16.412L42.5 13.813" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M47.588 23L50.187 21.5" fill="none" stroke="#9aa4b5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 17.74V32L41.66 38.9" fill="none" stroke="#141a24" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M29.62 32A2.38 2.38 0 1 0 34.38 32A2.38 2.38 0 1 0 29.62 32Z" fill="#3b74f0"/>
+</g>
+</svg>

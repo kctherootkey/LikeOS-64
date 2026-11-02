@@ -1,8 +1,8 @@
-// LikeOS -- Media Player: the secondary windows.
+// LikeOS -- LikeOS Media Player: the secondary windows.
 //
 // File choosers for media, folders and playlists, the location dialog, the
-// media information window, the keyboard reference, the about box and the
-// error dialog.
+// media information window, the list of keyboard shortcuts, the about box
+// and the error dialog.
 //
 // Errors arrive from the GStreamer bus, i.e. from inside a main-loop
 // callback, so the error dialog is never run with gtk_dialog_run(): a
@@ -302,7 +302,7 @@ void mp_dialog_save_playlist(MpApp *app)
 {
 	if (mp_playlist_count(app->playlist) == 0) {
 		mp_dialog_message(GTK_WINDOW(app->window), GTK_MESSAGE_INFO,
-				  "The play queue is empty",
+				  "The queue is empty",
 				  "Add something to it first.");
 		return;
 	}
@@ -505,8 +505,8 @@ static gboolean on_info_cover_draw(GtkWidget *w, cairo_t *cr, gpointer d)
 	int ah = gtk_widget_get_allocated_height(w);
 	mp_cover_draw(cr, app->cover, 0, 0, aw, ah, 8,
 		      mp_player_has_video(app->player)
-			      ? "video-x-generic-symbolic"
-			      : "audio-x-generic-symbolic",
+			      ? "likeos-videos"
+			      : "likeos-music",
 		      w);
 	return FALSE;
 }
@@ -739,10 +739,13 @@ void mp_dialog_shortcuts(MpApp *app)
 		{ "S", "Shuffle on or off" },
 		{ "R", "Repeat: off, all, this one" },
 		{ "Delete", "Remove the selected entries" },
-		{ "F9", "Show or hide the play queue" },
+		{ "F9  /  Q", "Show or hide the queue" },
 		{ NULL, "View and files" },
 		{ "F  /  F11", "Full screen" },
-		{ "Esc", "Leave full screen" },
+		{ "Esc", "Leave full screen, the mini player or the "
+			 "now-playing page" },
+		{ "Ctrl+M", "Mini player" },
+		{ "Ctrl+F", "Search the library" },
 		{ "Double-click", "Full screen on or off" },
 		{ "T", "Total or remaining time" },
 		{ "I  /  Ctrl+I", "Media information" },

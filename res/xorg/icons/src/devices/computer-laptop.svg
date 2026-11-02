@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: computer-laptop, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="10" x2="0" y2="44"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="13" y1="41" x2="51" y2="13"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient><filter id="f4" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="44" x2="0" y2="50"><stop offset="0" stop-color="#e9edf3"/><stop offset="1" stop-color="#aab3c2"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M14 10H50A4 4 0 0 1 54 14V40A4 4 0 0 1 50 44H14A4 4 0 0 1 10 40V14A4 4 0 0 1 14 10Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M14 10H50A4 4 0 0 1 54 14V40A4 4 0 0 1 50 44H14A4 4 0 0 1 10 40V14A4 4 0 0 1 14 10Z" fill="url(#g2)"/>
+<path d="M14 10H50A4 4 0 0 1 54 14V40A4 4 0 0 1 50 44H14A4 4 0 0 1 10 40V14A4 4 0 0 1 14 10Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.16"/>
+<path d="M14 13H50A1 1 0 0 1 51 14V40A1 1 0 0 1 50 41H14A1 1 0 0 1 13 40V14A1 1 0 0 1 14 13Z" fill="url(#g3)"/>
+<path d="M13 32.6C26.3 25.6 39.6 34 51 27V41H13Z" fill="#ffffff" opacity="0.14"/>
+<path d="M26.12 22.223A1.103 1.103 0 0 1 28.325 22.223V30.124A0.551 0.551 0 0 0 28.876 30.675H36.778A1.103 1.103 0 0 1 36.778 32.88H28.105A1.985 1.985 0 0 1 26.12 30.896Z" fill="#ffffff" opacity="0.64"/>
+<path d="M29.795 25.163A4.042 4.042 0 1 0 37.88 25.163A4.042 4.042 0 1 0 29.795 25.163ZM31.755 25.163A2.082 2.082 0 1 1 35.92 25.163A2.082 2.082 0 1 1 31.755 25.163Z" fill="#ffffff" opacity="0.8"/>
+<path d="M14 10.5H50A3.5 3.5 0 0 1 53.5 14V40A3.5 3.5 0 0 1 50 43.5H14A3.5 3.5 0 0 1 10.5 40V14A3.5 3.5 0 0 1 14 10.5Z" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.12"/>
+<path d="M10 44H54L60 48Q60 50 58 50H6Q4 50 4 48Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f4)"/>
+<path d="M10 44H54L60 48Q60 50 58 50H6Q4 50 4 48Z" fill="url(#g5)"/>
+<path d="M29 44H35A1 1 0 0 1 36 45V45A1 1 0 0 1 35 46H29A1 1 0 0 1 28 45V45A1 1 0 0 1 29 44Z" fill="#8d97a8"/>
+</g>
+</svg>

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the window's commands.
+// LikeOS Explorer: the window's commands.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -12,6 +12,7 @@
 #include "ui/ex-operation-center.h"
 #include "backend/ex-apps.h"
 #include "backend/ex-bookmarks.h"
+#include "backend/ex-image.h"
 #include "backend/ex-recent.h"
 #include "backend/ex-trash.h"
 #include "backend/ex-volumes.h"
@@ -43,8 +44,8 @@ static gboolean confirm(ExWindow *w, const char *primary, const char *secondary,
 	char *title = g_strdup(yes), *o = title;
 	int r;
 
-	/* Named after what it asks to do ("Empty Trash"), as in Windows:
-	 * the button's label without its mnemonic mark. */
+	/* Named after what it asks to do ("Empty Trash"): the button's
+	 * label without its mnemonic mark. */
 	for (const char *i = yes; *i; i++)
 		if (*i != '_')
 			*o++ = *i;
@@ -319,8 +320,8 @@ static void a_paste(GSimpleAction *a, GVariant *p, gpointer w)
 	ExFile *one = ex_selection_single(ex_tab_selection(t));
 	PasteReq *r;
 
-	/* A single selected folder is where a paste goes (as Windows'
-	 * context menu "Paste" on a folder). */
+	/* A single selected folder is where a paste goes (the item menu's
+	 * "Paste into folder"). */
 	if (p && g_variant_get_boolean(p) && one && ex_file_is_dir(one))
 		dest = ex_file_get_file(one);
 	if (!dest)
@@ -729,7 +730,7 @@ static void a_right_pane(GSimpleAction *a, GVariant *p, gpointer w)
 {
 	const char *want = g_variant_get_string(p, NULL);
 	char *cur = ex_settings_get_string(ex_settings_get(), "right-pane");
-	/* Choosing the pane already shown closes it, as in Windows. */
+	/* Choosing the pane already shown closes it. */
 	const char *now = !strcmp(cur, want) ? "none" : want;
 
 	ex_settings_set_string(ex_settings_get(), "right-pane", now);
@@ -742,15 +743,211 @@ static void a_operations(GSimpleAction *a, GVariant *p, gpointer w)
 	ex_operation_center_present(GTK_WINDOW(w));
 }
 
-/* ---- options -------------------------------------------------------------------------- */
+/* ---- pictures ------------------------------------------------------------------------- */
 
-static void opt_toggled(GtkToggleButton *b, gpointer data)
+/* The desktop is PCManFM's: it is asked to show the picture, filling the
+ * screen and cut to fit (its "crop" mode). */
+static void a_set_wallpaper(GSimpleAction *a, GVariant *p, gpointer w)
 {
-	ex_settings_set_bool(ex_settings_get(), data,
-			     gtk_toggle_button_get_active(b));
+	ExFile *f = ex_selection_single(ex_tab_selection(tab(w)));
+	char *path = f ? g_file_get_path(ex_file_get_file(f)) : NULL;
+	GError *e = NULL;
+
+	if (!path)
+		return;
+	char *arg = g_strdup_printf("--set-wallpaper=%s", path);
+	char *argv[] = { (char *)"pcmanfm", arg, (char *)"--wallpaper-mode=crop",
+			 NULL };
+
+	if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL,
+			   &e)) {
+		ex_window_show_error(EX_WINDOW(w),
+				     "The desktop background could not be set",
+				     e->message);
+		g_error_free(e);
+	}
+	g_free(arg);
+	g_free(path);
+}
+
+typedef struct {
+	ExWindow *w;
+	guint left;
+	GString *failed;
+} Turn;
+
+static void turned(GObject *src, GAsyncResult *res, gpointer data)
+{
+	Turn *tn = data;
+	GError *e = NULL;
+
+	if (!ex_image_rotate_finish(res, &e)) {
+		char *name = g_file_get_basename(G_FILE(src));
+
+		g_string_append_printf(tn->failed, "%s%s: %s",
+				       tn->failed->len ? "\n" : "", name,
+				       e->message);
+		g_free(name);
+		g_error_free(e);
+	}
+	if (--tn->left)
+		return;
+	if (tn->failed->len)
+		ex_window_show_error(tn->w, "The picture could not be rotated",
+				     tn->failed->str);
+	/* A folder's monitor shows the change; Gallery is read again. */
+	if (ex_location_kind(ex_tab_location(ex_window_current_tab(tn->w))) ==
+	    EX_LOC_GALLERY)
+		ex_tab_refresh(ex_window_current_tab(tn->w));
+	g_string_free(tn->failed, TRUE);
+	g_object_unref(tn->w);
+	g_free(tn);
+}
+
+static void rotate(gpointer w, gboolean clockwise)
+{
+	GPtrArray *items = ex_selection_get(ex_tab_selection(tab(w)));
+	Turn *tn = g_new0(Turn, 1);
+
+	tn->w = g_object_ref(w);
+	tn->failed = g_string_new(NULL);
+	tn->left = 1; /* held until every request is out */
+	for (guint i = 0; i < items->len; i++) {
+		tn->left++;
+		ex_image_rotate_async(ex_file_get_file(g_ptr_array_index(items, i)),
+				      clockwise, NULL, turned, tn);
+	}
+	if (--tn->left == 0) {
+		g_string_free(tn->failed, TRUE);
+		g_object_unref(tn->w);
+		g_free(tn);
+	}
+}
+
+static void a_rotate_right(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	rotate(w, TRUE);
+}
+
+static void a_rotate_left(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	rotate(w, FALSE);
+}
+
+/* ---- Home and Gallery ---------------------------------------------------------------- */
+
+static void a_home_filter(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	ex_tab_set_home_filter(tab(w), g_variant_get_string(p, NULL));
+	g_simple_action_set_state(a, p);
+}
+
+/* A file of Home's lists, named by its URI: these are not a selection of
+ * the tab, so their menu's commands carry the file along. */
+static void a_open_uri(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	GFile *f = g_file_new_for_uri(g_variant_get_string(p, NULL));
+	ExFile *ef = ex_file_new_query(f, NULL, NULL);
+
+	if (ef) {
+		GPtrArray *one = g_ptr_array_new_with_free_func(g_object_unref);
+
+		g_ptr_array_add(one, ef);
+		ex_window_open(EX_WINDOW(w), one, FALSE);
+		g_ptr_array_unref(one);
+	}
+	g_object_unref(f);
+}
+
+static void a_open_file_location(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	GFile *f = g_file_new_for_uri(g_variant_get_string(p, NULL));
+	GFile *dir = g_file_get_parent(f);
+
+	if (dir) {
+		ExLocation *l = ex_location_new_folder(dir);
+		GPtrArray *sel = g_ptr_array_new_with_free_func(g_object_unref);
+
+		ex_tab_go(tab(w), l);
+		g_ptr_array_add(sel, g_object_ref(f));
+		ex_tab_select_files(tab(w), sel);
+		g_ptr_array_unref(sel);
+		ex_location_unref(l);
+		g_object_unref(dir);
+	}
+	g_object_unref(f);
+}
+
+static void a_favorite_uri(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	GFile *f = g_file_new_for_uri(g_variant_get_string(p, NULL));
+	ExSettings *s = ex_settings_get();
+
+	ex_settings_set_favorite(s, f, !ex_settings_is_favorite(s, f));
+	g_object_unref(f);
+}
+
+static void a_forget_recent(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	GFile *f = g_file_new_for_uri(g_variant_get_string(p, NULL));
+
+	(void)ex_recent_forget(f, NULL);
+	g_object_unref(f);
+}
+
+/* Gallery's collection: which personal folders it shows, each a switch. */
+static const struct {
+	const char *action, *name;
+	GUserDirectory dir;
+} collection[] = {
+	{ "gallery-pictures", "pictures", G_USER_DIRECTORY_PICTURES },
+	{ "gallery-videos", "videos", G_USER_DIRECTORY_VIDEOS },
+	{ "gallery-desktop", "desktop", G_USER_DIRECTORY_DESKTOP },
+	{ "gallery-downloads", "download", G_USER_DIRECTORY_DOWNLOAD },
+	{ "gallery-documents", "documents", G_USER_DIRECTORY_DOCUMENTS },
+};
+
+static gboolean in_collection(const char *name)
+{
+	char **v = ex_settings_get_strv(ex_settings_get(), "gallery-folders");
+	gboolean in = v && g_strv_contains((const char *const *)v, name);
+
+	g_strfreev(v);
+	return in;
+}
+
+static void a_collection(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	const char *name = g_object_get_data(G_OBJECT(a), "ex-name");
+	char **v = ex_settings_get_strv(ex_settings_get(), "gallery-folders");
+	GPtrArray *out = g_ptr_array_new();
+	gboolean was = FALSE;
+
+	for (int i = 0; v && v[i]; i++) {
+		if (!strcmp(v[i], name))
+			was = TRUE;
+		else
+			g_ptr_array_add(out, v[i]);
+	}
+	if (!was)
+		g_ptr_array_add(out, (gpointer)name);
+	g_ptr_array_add(out, NULL);
+	ex_settings_set_strv(ex_settings_get(), "gallery-folders",
+			     (const char *const *)out->pdata);
+	g_simple_action_set_state(a, g_variant_new_boolean(!was));
+	g_ptr_array_unref(out);
+	g_strfreev(v);
+}
+
+/* ---- Explorer settings --------------------------------------------------------------- */
+
+static void opt_toggled(GtkSwitch *sw, GParamSpec *ps, gpointer data)
+{
+	gboolean on = gtk_switch_get_active(sw);
+
+	ex_settings_set_bool(ex_settings_get(), data, on);
 	if (!strcmp(data, "index-home"))
-		ex_index_set_enabled(ex_index_get_default(),
-				     gtk_toggle_button_get_active(b));
+		ex_index_set_enabled(ex_index_get_default(), on);
 }
 
 static void clear_history(GtkButton *b, gpointer w)
@@ -762,46 +959,121 @@ static void clear_history(GtkButton *b, gpointer w)
 				     e->message);
 		g_error_free(e);
 	} else {
-		gtk_button_set_label(b, "History cleared");
+		gtk_button_set_label(b, "Cleared");
 		gtk_widget_set_sensitive(GTK_WIDGET(b), FALSE);
 	}
 }
 
+/* One setting: its name and a line saying what it does at the left, a
+ * switch at the right; the whole row a line of its card. */
+static GtkWidget *setting_row(const char *key, const char *label,
+			      const char *detail)
+{
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+	GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+	GtkWidget *l = gtk_label_new_with_mnemonic(label);
+	GtkWidget *d = gtk_label_new(detail);
+	GtkWidget *sw = gtk_switch_new();
+
+	gtk_label_set_xalign(GTK_LABEL(l), 0);
+	gtk_label_set_xalign(GTK_LABEL(d), 0);
+	gtk_label_set_line_wrap(GTK_LABEL(d), TRUE);
+	gtk_label_set_max_width_chars(GTK_LABEL(d), 46);
+	ex_style_add(d, EX_CLASS_DIM);
+	ex_style_add(d, "ex-settings-detail");
+	gtk_label_set_mnemonic_widget(GTK_LABEL(l), sw);
+	gtk_box_pack_start(GTK_BOX(col), l, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(col), d, FALSE, FALSE, 0);
+	gtk_switch_set_active(GTK_SWITCH(sw),
+			      ex_settings_get_bool(ex_settings_get(), key));
+	gtk_widget_set_valign(sw, GTK_ALIGN_CENTER);
+	atk_object_set_name(gtk_widget_get_accessible(sw),
+			    gtk_label_get_text(GTK_LABEL(l)));
+	g_signal_connect(sw, "notify::active", G_CALLBACK(opt_toggled),
+			 (gpointer)key);
+	gtk_box_pack_start(GTK_BOX(row), col, TRUE, TRUE, 0);
+	gtk_box_pack_end(GTK_BOX(row), sw, FALSE, FALSE, 0);
+	ex_style_add(row, "ex-settings-row");
+	return row;
+}
+
+/* A titled card of settings rows. */
+static GtkWidget *settings_group(GtkWidget *box, const char *title)
+{
+	GtkWidget *h = gtk_label_new(title);
+	GtkWidget *c = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+	gtk_label_set_xalign(GTK_LABEL(h), 0);
+	ex_style_add(h, "ex-settings-heading");
+	ex_style_add(c, "ex-props-card");
+	ex_style_add(c, "ex-settings-card");
+	gtk_box_pack_start(GTK_BOX(box), h, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(box), c, FALSE, FALSE, 0);
+	return c;
+}
+
+static void group_add(GtkWidget *group, GtkWidget *w)
+{
+	/* A hairline between two rows. */
+	if (g_object_get_data(G_OBJECT(group), "ex-rows")) {
+		GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+
+		ex_style_add(sep, "ex-settings-separator");
+		gtk_box_pack_start(GTK_BOX(group), sep, FALSE, FALSE, 0);
+	}
+	g_object_set_data(G_OBJECT(group), "ex-rows", GINT_TO_POINTER(1));
+	gtk_box_pack_start(GTK_BOX(group), w, FALSE, FALSE, 0);
+}
+
 static void a_options(GSimpleAction *a, GVariant *p, gpointer w)
 {
-	static const struct {
-		const char *key, *label;
-	} opts[] = {
-		{ "single-click", "Open items with a _single click" },
-		{ "show-hidden", "Show _hidden items" },
-		{ "show-extensions", "Show file name _extensions" },
-		{ "confirm-trash", "Ask before moving items to the _Trash" },
-		{ "show-recent", "Show _recently used files on Home" },
-		{ "show-frequent", "Show _frequently used folders on Home" },
-		{ "index-home", "Keep a search _index of the home folder" },
-	};
 	GtkWidget *d = gtk_dialog_new_with_buttons(
-		"Folder options", GTK_WINDOW(w),
+		"Explorer Settings", GTK_WINDOW(w),
 		GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, "_Close",
 		GTK_RESPONSE_CLOSE, NULL);
-	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-	ExSettings *s = ex_settings_get();
+	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	GtkWidget *g, *clr, *row, *col, *l, *dl;
 
-	gtk_container_set_border_width(GTK_CONTAINER(box), 16);
-	for (gsize i = 0; i < G_N_ELEMENTS(opts); i++) {
-		GtkWidget *c = gtk_check_button_new_with_mnemonic(opts[i].label);
+	ex_style_add(d, "ex-properties");
+	ex_style_add(box, "ex-props-page");
+	g = settings_group(box, "Browsing");
+	group_add(g, setting_row("single-click", "Open items with a _single click",
+				 "Point to select, click once to open"));
+	group_add(g, setting_row("show-hidden", "Show _hidden items",
+				 "Names starting with a dot are listed too"));
+	group_add(g, setting_row("show-extensions", "Show file name _extensions",
+				 "\"report.pdf\" rather than \"report\""));
+	group_add(g, setting_row("confirm-trash", "Ask before moving to the _Trash",
+				 "A question before Delete takes effect"));
 
-		gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(c),
-					     ex_settings_get_bool(s, opts[i].key));
-		g_signal_connect(c, "toggled", G_CALLBACK(opt_toggled),
-				 (gpointer)opts[i].key);
-		gtk_box_pack_start(GTK_BOX(box), c, FALSE, FALSE, 0);
-	}
-	GtkWidget *clr = gtk_button_new_with_mnemonic("_Clear recent files history");
-	gtk_widget_set_halign(clr, GTK_ALIGN_START);
+	g = settings_group(box, "Home");
+	group_add(g, setting_row("show-recent", "Show _recent files",
+				 "The files opened last, in any program"));
+	group_add(g, setting_row("show-frequent", "Show _frequent folders",
+				 "Folders used often join the pinned ones"));
+	row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+	col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+	l = gtk_label_new("Recent files history");
+	dl = gtk_label_new("Empties the list every program shares");
+	gtk_label_set_xalign(GTK_LABEL(l), 0);
+	gtk_label_set_xalign(GTK_LABEL(dl), 0);
+	ex_style_add(dl, EX_CLASS_DIM);
+	ex_style_add(dl, "ex-settings-detail");
+	gtk_box_pack_start(GTK_BOX(col), l, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(col), dl, FALSE, FALSE, 0);
+	clr = gtk_button_new_with_mnemonic("_Clear");
+	gtk_widget_set_valign(clr, GTK_ALIGN_CENTER);
 	gtk_widget_set_tooltip_text(clr, "Empties the list every program shares");
 	g_signal_connect(clr, "clicked", G_CALLBACK(clear_history), w);
-	gtk_box_pack_start(GTK_BOX(box), clr, FALSE, FALSE, 8);
+	gtk_box_pack_start(GTK_BOX(row), col, TRUE, TRUE, 0);
+	gtk_box_pack_end(GTK_BOX(row), clr, FALSE, FALSE, 0);
+	ex_style_add(row, "ex-settings-row");
+	group_add(g, row);
+
+	g = settings_group(box, "Search");
+	group_add(g, setting_row("index-home", "Keep a search _index of the home folder",
+				 "Searches below the home folder answer at once"));
+
 	gtk_container_add(GTK_CONTAINER(gtk_dialog_get_content_area(GTK_DIALOG(d))),
 			  box);
 	ex_style_fixed_dialog(d);
@@ -863,6 +1135,14 @@ static const GActionEntry entries[] = {
 	{ "sort-by", a_sort_by, "s", "'name'" },
 	{ "sort-order", a_sort_order, "s", "'ascending'" },
 	{ "right-pane", a_right_pane, "s", "'none'" },
+	{ "set-wallpaper", a_set_wallpaper },
+	{ "rotate-right", a_rotate_right },
+	{ "rotate-left", a_rotate_left },
+	{ "home-filter", a_home_filter, "s", "'all'" },
+	{ "open-uri", a_open_uri, "s" },
+	{ "open-file-location", a_open_file_location, "s" },
+	{ "favorite-uri", a_favorite_uri, "s" },
+	{ "forget-recent", a_forget_recent, "s" },
 };
 
 static const struct {
@@ -887,6 +1167,17 @@ void ex_actions_install(ExWindow *w)
 
 		g_object_set_data(G_OBJECT(a), "ex-key", (gpointer)toggles[i].key);
 		g_signal_connect(a, "activate", G_CALLBACK(a_setting_toggle), w);
+		g_action_map_add_action(G_ACTION_MAP(w), G_ACTION(a));
+		g_object_unref(a);
+	}
+	for (gsize i = 0; i < G_N_ELEMENTS(collection); i++) {
+		GSimpleAction *a = g_simple_action_new_stateful(
+			collection[i].action, NULL,
+			g_variant_new_boolean(in_collection(collection[i].name)));
+
+		g_object_set_data(G_OBJECT(a), "ex-name",
+				  (gpointer)collection[i].name);
+		g_signal_connect(a, "activate", G_CALLBACK(a_collection), w);
 		g_action_map_add_action(G_ACTION_MAP(w), G_ACTION(a));
 		g_object_unref(a);
 	}
@@ -957,7 +1248,8 @@ void ex_actions_update(ExWindow *w)
 					((count == 1 && dirs &&
 					  (caps & EX_CAP_WRITE)) ||
 					 writable));
-	enable(w, "rename", count == 1 && (caps & EX_CAP_RENAME) && !trash);
+	enable(w, "rename", count == 1 && (caps & EX_CAP_RENAME) && !trash &&
+				    kind != EX_LOC_GALLERY);
 	enable(w, "trash", has && (caps & EX_CAP_DELETE));
 	enable(w, "delete", has && (caps & EX_CAP_DELETE));
 	enable(w, "new-folder", writable);
@@ -967,17 +1259,42 @@ void ex_actions_update(ExWindow *w)
 	enable(w, "pin", (has && dirs) || (!has && kind == EX_LOC_FOLDER));
 	enable(w, "favorite", has && !trash);
 	enable(w, "share", has && !trash);
-	enable(w, "select-all", kind != EX_LOC_HOME && kind != EX_LOC_THISPC);
+	enable(w, "select-all", kind != EX_LOC_HOME && kind != EX_LOC_COMPUTER);
 	enable(w, "select-none", has);
-	enable(w, "invert-selection", kind != EX_LOC_HOME && kind != EX_LOC_THISPC);
+	enable(w, "invert-selection", kind != EX_LOC_HOME && kind != EX_LOC_COMPUTER);
 	enable(w, "undo", ex_undo_can_undo(u));
 	enable(w, "redo", ex_undo_can_redo(u));
 	enable(w, "empty-trash", trash && !ex_trash_is_empty());
 	enable(w, "restore", trash && has);
 	enable(w, "restore-all", trash && !ex_trash_is_empty());
-	enable(w, "view-mode", kind != EX_LOC_HOME && kind != EX_LOC_THISPC);
-	enable(w, "sort-by", kind != EX_LOC_HOME && kind != EX_LOC_THISPC);
-	enable(w, "sort-order", kind != EX_LOC_HOME && kind != EX_LOC_THISPC);
+	enable(w, "view-mode", kind != EX_LOC_HOME && kind != EX_LOC_COMPUTER &&
+				       kind != EX_LOC_GALLERY);
+	enable(w, "sort-by", kind != EX_LOC_HOME && kind != EX_LOC_COMPUTER &&
+				     kind != EX_LOC_GALLERY);
+	enable(w, "sort-order", kind != EX_LOC_HOME && kind != EX_LOC_COMPUTER &&
+					kind != EX_LOC_GALLERY);
+	/* Pictures: one for the desktop background, any number turned. */
+	{
+		gboolean images = has && !trash && ex_tab_selection_is_images(t);
+		gboolean turnable = images && (caps & EX_CAP_WRITE);
+		GPtrArray *items = ex_selection_get(s);
+
+		for (guint i = 0; turnable && i < items->len; i++)
+			turnable = ex_image_can_rotate(ex_file_get_content_type(
+				g_ptr_array_index(items, i)));
+		enable(w, "set-wallpaper",
+		       images && count == 1 &&
+			       g_file_is_native(ex_file_get_file(
+				       ex_selection_single(s))));
+		enable(w, "rotate-right", turnable);
+		enable(w, "rotate-left", turnable);
+	}
+	enable(w, "home-filter", kind == EX_LOC_HOME);
+	set_state(w, "home-filter",
+		  g_variant_new_string(ex_tab_home_filter(t)));
+	for (gsize i = 0; i < G_N_ELEMENTS(collection); i++)
+		set_state(w, collection[i].action,
+			  g_variant_new_boolean(in_collection(collection[i].name)));
 
 	const char *col;
 	gboolean asc;
@@ -1022,8 +1339,13 @@ void ex_actions_set_accels(GtkApplication *app)
 		{ "win.show-hidden", { "<Control>h", NULL } },
 		{ "win.right-pane::preview", { "<Alt>p", NULL } },
 		{ "win.right-pane::details", { "<Alt><Shift>p", NULL } },
+		/* In the View menu's order: 1 extra large, 2 large, 3 medium,
+		 * 4 small icons, 5 list, 6 details, 7 tiles, 8 the compact
+		 * list. */
+		{ "win.view-mode::extra-large-icons", { "<Control><Shift>1", NULL } },
 		{ "win.view-mode::large-icons", { "<Control><Shift>2", NULL } },
 		{ "win.view-mode::icons", { "<Control><Shift>3", NULL } },
+		{ "win.view-mode::small-icons", { "<Control><Shift>4", NULL } },
 		{ "win.view-mode::list", { "<Control><Shift>5", NULL } },
 		{ "win.view-mode::details", { "<Control><Shift>6", NULL } },
 		{ "win.view-mode::tiles", { "<Control><Shift>7", NULL } },

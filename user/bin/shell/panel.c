@@ -19,6 +19,13 @@ void panel_color(cairo_t *cr, unsigned int rgb)
 			     ((rgb >> 8) & 0xff) / 255.0, (rgb & 0xff) / 255.0);
 }
 
+void panel_color_a(cairo_t *cr, unsigned int rgb, double a)
+{
+	cairo_set_source_rgba(cr, ((rgb >> 16) & 0xff) / 255.0,
+			      ((rgb >> 8) & 0xff) / 255.0, (rgb & 0xff) / 255.0,
+			      a);
+}
+
 void panel_fill_face(cairo_t *cr, double x, double y, double w, double h)
 {
 	panel_color(cr, PANEL_BG);
@@ -29,6 +36,10 @@ void panel_fill_face(cairo_t *cr, double x, double y, double w, double h)
 void panel_round_rect(cairo_t *cr, double x, double y, double w, double h,
 		      double r)
 {
+	if (r > w / 2)
+		r = w / 2;
+	if (r > h / 2)
+		r = h / 2;
 	cairo_new_sub_path(cr);
 	cairo_arc(cr, x + w - r, y + r, r, -M_PI / 2, 0);
 	cairo_arc(cr, x + w - r, y + h - r, r, 0, M_PI / 2);
@@ -37,68 +48,147 @@ void panel_round_rect(cairo_t *cr, double x, double y, double w, double h,
 	cairo_close_path(cr);
 }
 
-/* A lit tile is the lighter fill with a slightly darker lower edge, which is
- * all the depth Windows 11 gives a taskbar button.  The edge is a second,
- * one-pixel-lower copy of the shape drawn first, so only its bottom shows. */
+/* The shell's hover and pressed fills: white at 7% under the pointer, 12%
+ * for a lit control, and in between while held -- flat, no outline, so a
+ * control is a shape of light on the panel and nothing more. */
 void panel_tile(cairo_t *cr, double x, double y, double w, double h,
 		enum panel_tile state)
 {
-	if (state == PANEL_TILE_NONE)
+	double a;
+
+	switch (state) {
+	case PANEL_TILE_HOVER:
+		a = 0.07;
+		break;
+	case PANEL_TILE_LIT:
+		a = 0.12;
+		break;
+	case PANEL_TILE_DOWN:
+		a = 0.10;
+		break;
+	default:
 		return;
-	if (state == PANEL_TILE_LIT) {
-		panel_color(cr, PANEL_TILE_EDGE);
-		panel_round_rect(cr, x, y + 1, w, h, 4);
-		cairo_fill(cr);
 	}
-	panel_color(cr, state == PANEL_TILE_DOWN ? PANEL_TILE_PRESSED :
-						   PANEL_TILE_HOVER);
-	panel_round_rect(cr, x, y, w, h, 4);
+	cairo_save(cr);
+	panel_round_rect(cr, x, y, w, h, PANEL_TILE_RADIUS);
+	cairo_set_source_rgba(cr, 1, 1, 1, a);
 	cairo_fill(cr);
+	cairo_restore(cr);
 }
 
-void panel_indicator(cairo_t *cr, double cx, double y, gboolean active)
+void panel_dots(cairo_t *cr, double cx, double cy, int count,
+		gboolean active)
 {
-	double w = active ? 16 : 6;
+	const double d = 4, gap = 3;
 
-	panel_color(cr, active ? PANEL_ACCENT : PANEL_INDICATOR);
-	panel_round_rect(cr, floor(cx - w / 2), y - 3, w, 3, 1.5);
+	if (count <= 0)
+		return;
+	if (count > 3)
+		count = 3;
+
+	double x0 = cx - (count * d + (count - 1) * gap) / 2 + d / 2;
+
+	cairo_save(cr);
+	panel_color(cr, active ? PANEL_ACCENT : PANEL_TEXT_DIM);
+	for (int i = 0; i < count; i++) {
+		cairo_new_sub_path(cr);
+		cairo_arc(cr, x0 + i * (d + gap), cy, d / 2, 0, 2 * M_PI);
+	}
 	cairo_fill(cr);
+	cairo_restore(cr);
 }
 
-/* The LikeOS emblem: a 22-pixel rounded square in a blue gradient carrying a
- * white "L" -- the place and the size of the Windows logo on its start
- * button, but this system's own mark. */
-void panel_start_button(cairo_t *cr, double x, double y, double w, double h,
-			enum panel_tile state)
+void panel_orb(cairo_t *cr, double cx, double cy, double r, double glow,
+	       gboolean pressed)
 {
-	panel_tile(cr, x, y, w, h, state);
+	cairo_pattern_t *p;
+	double k = pressed ? 0.7 : 1.0 + 0.18 * glow;
 
-	double s = 22;
-	double ex = floor(x + (w - s) / 2);
-	double ey = floor(y + (h - s) / 2) + (state == PANEL_TILE_DOWN ? 1 : 0);
-	cairo_pattern_t *g = cairo_pattern_create_linear(ex, ey, ex + s, ey + s);
+	cairo_save(cr);
 
-	cairo_pattern_add_color_stop_rgb(g, 0, 0x29 / 255.0, 0xa8 / 255.0,
-					 0xff / 255.0);
-	cairo_pattern_add_color_stop_rgb(g, 1, 0x00 / 255.0, 0x5f / 255.0,
-					 0xb8 / 255.0);
-	cairo_set_source(cr, g);
-	panel_round_rect(cr, ex, ey, s, s, 5);
-	cairo_fill(cr);
-	cairo_pattern_destroy(g);
+	/* The halo, just outside the rim. */
+	if (glow > 0) {
+		p = cairo_pattern_create_radial(cx, cy, r * 0.9, cx, cy, r + 3);
+		cairo_pattern_add_color_stop_rgba(p, 0, 0.49, 0.77, 1, 0.6 * glow);
+		cairo_pattern_add_color_stop_rgba(p, 1, 0.37, 0.66, 1, 0);
+		cairo_new_sub_path(cr);
+		cairo_arc(cr, cx, cy, r + 3, 0, 2 * M_PI);
+		cairo_set_source(cr, p);
+		cairo_fill(cr);
+		cairo_pattern_destroy(p);
+	}
 
-	/* The L, built from two rounded bars rather than set in type: a glyph
-	 * would follow whatever the font does at this size. */
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	panel_round_rect(cr, ex + 7, ey + 5, 3.5, 12, 1.2);
+	/* The rim, and the glass inside it: light pooled at the bottom,
+	 * deep blue at the edge. */
+	cairo_new_sub_path(cr);
+	cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+	cairo_set_source_rgb(cr, 0.03, 0.09, 0.22);
 	cairo_fill(cr);
-	panel_round_rect(cr, ex + 7, ey + 13.5, 9, 3.5, 1.2);
+	p = cairo_pattern_create_radial(cx, cy + r * 0.9, 0, cx, cy + r * 0.6,
+					r * 1.3);
+	cairo_pattern_add_color_stop_rgb(p, 0, MIN(1, 0.5 * k), MIN(1, 0.88 * k),
+					 1);
+	cairo_pattern_add_color_stop_rgb(p, 0.32, 0.23 * k, 0.53 * k,
+					 MIN(1, 0.94 * k));
+	cairo_pattern_add_color_stop_rgb(p, 0.66, 0.14 * k, 0.31 * k, 0.78 * k);
+	cairo_pattern_add_color_stop_rgb(p, 1, 0.05 * k, 0.13 * k, 0.42 * k);
+	cairo_new_sub_path(cr);
+	cairo_arc(cr, cx, cy, r - 1, 0, 2 * M_PI);
+	cairo_set_source(cr, p);
+	cairo_fill_preserve(cr);
+	cairo_pattern_destroy(p);
+	cairo_clip(cr);
+
+	/* Pressed in: a shadow along the top inside the rim. */
+	if (pressed) {
+		p = cairo_pattern_create_linear(0, cy - r, 0, cy);
+		cairo_pattern_add_color_stop_rgba(p, 0, 0.01, 0.03, 0.14, 0.55);
+		cairo_pattern_add_color_stop_rgba(p, 1, 0.01, 0.03, 0.14, 0);
+		cairo_set_source(cr, p);
+		cairo_paint(cr);
+		cairo_pattern_destroy(p);
+	}
+
+	/* The gloss: a band of light over the top half, fading down. */
+	double g = pressed ? 0.35 : 0.7 + 0.08 * glow;
+
+	p = cairo_pattern_create_linear(0, cy - r, 0, cy);
+	cairo_pattern_add_color_stop_rgba(p, 0, 1, 1, 1, g);
+	cairo_pattern_add_color_stop_rgba(p, 0.6, 1, 1, 1, g * 0.35);
+	cairo_pattern_add_color_stop_rgba(p, 1, 1, 1, 1, 0.05);
+	cairo_save(cr);
+	cairo_translate(cr, cx, cy - r * 0.42);
+	cairo_scale(cr, r * 0.86, r * 0.56);
+	cairo_arc(cr, 0, 0, 1, 0, 2 * M_PI);
+	cairo_restore(cr);
+	cairo_set_source(cr, p);
 	cairo_fill(cr);
+	cairo_pattern_destroy(p);
+	cairo_restore(cr);
 }
 
-static int draw_text(cairo_t *cr, double x, double cy, double w,
-		     const char *text, const char *font, int align,
-		     unsigned int color)
+/* A ring and a short handle at forty-five degrees, on the 16-unit grid with
+ * the shell's 1.5-unit stroke. */
+void panel_glyph_search(cairo_t *cr, double x, double y, double s)
+{
+	double k = s / 16.0;
+
+	cairo_save(cr);
+	cairo_translate(cr, x, y);
+	cairo_scale(cr, k, k);
+	cairo_set_line_width(cr, 1.5);
+	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+	cairo_new_sub_path(cr);
+	cairo_arc(cr, 7, 7, 4.75, 0, 2 * M_PI);
+	cairo_move_to(cr, 10.6, 10.6);
+	cairo_line_to(cr, 14, 14);
+	cairo_stroke(cr);
+	cairo_restore(cr);
+}
+
+int panel_text_full(cairo_t *cr, double x, double cy, double w,
+		    const char *text, const char *font, const double rgba[4],
+		    int align)
 {
 	PangoLayout *l = pango_cairo_create_layout(cr);
 	PangoFontDescription *d = pango_font_description_from_string(font);
@@ -108,7 +198,7 @@ static int draw_text(cairo_t *cr, double x, double cy, double w,
 	pango_font_description_free(d);
 	pango_layout_set_text(l, text, -1);
 
-	/* Ellipsise rather than clip: a button narrowed by many open windows
+	/* Ellipsise rather than clip: a label squeezed by its neighbours
 	 * shows "Mozilla Fire..." instead of a title cut mid-glyph. */
 	if (w > 0) {
 		pango_layout_set_width(l, (int)w * PANGO_SCALE);
@@ -125,11 +215,36 @@ static int draw_text(cairo_t *cr, double x, double cy, double w,
 	if (tx < x)
 		tx = x;
 
-	panel_color(cr, color);
+	cairo_set_source_rgba(cr, rgba[0], rgba[1], rgba[2], rgba[3]);
 	cairo_move_to(cr, floor(tx), floor(cy - th / 2.0));
 	pango_cairo_show_layout(cr, l);
 	g_object_unref(l);
 	return tw;
+}
+
+int panel_text_width(cairo_t *cr, const char *text, const char *font)
+{
+	PangoLayout *l = pango_cairo_create_layout(cr);
+	PangoFontDescription *d = pango_font_description_from_string(font);
+	int w, h;
+
+	pango_layout_set_font_description(l, d);
+	pango_font_description_free(d);
+	pango_layout_set_text(l, text, -1);
+	pango_layout_get_pixel_size(l, &w, &h);
+	g_object_unref(l);
+	return w;
+}
+
+static int draw_text(cairo_t *cr, double x, double cy, double w,
+		     const char *text, const char *font, int align,
+		     unsigned int color)
+{
+	double c[4] = { ((color >> 16) & 0xff) / 255.0,
+			((color >> 8) & 0xff) / 255.0, (color & 0xff) / 255.0,
+			1 };
+
+	return panel_text_full(cr, x, cy, w, text, font, c, align);
 }
 
 int panel_text(cairo_t *cr, double x, double cy, double w, const char *text,
@@ -199,45 +314,71 @@ void panel_load_sample(struct panel_load *m)
 void panel_load_draw(cairo_t *cr, struct panel_load *m, double x, double y,
 		     double w, double h)
 {
-	/* The picture: the load history as accent-coloured bars on a pale
-	 * card, 26 pixels square, where Windows shows the weather icon. */
-	double gs = 26;
-	double gx = x + 8, gy = floor(y + (h - gs) / 2);
+	/* The picture: a raised card 32 x 24 with the load history as a
+	 * curve, the newest sample at the right edge, over a fill that fades
+	 * from the accent to nothing. */
+	const double gw = 32, gh = 24;
+	double gx = x + 8, gy = floor(y + (h - gh) / 2);
+	double base = gy + gh - 4, top = gy + 4;
 
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
-	panel_round_rect(cr, gx, gy, gs, gs, 4);
-	cairo_fill(cr);
+	cairo_save(cr);
+	panel_round_rect(cr, gx, gy, gw, gh, 6);
+	panel_color(cr, PANEL_RAISED);
+	cairo_fill_preserve(cr);
+	cairo_clip(cr);
 
 	if (m->nload > 0) {
-		double bw = (gs - 6) / (double)PANEL_LOAD_HISTORY;
-		double bh_max = gs - 8;
+		double step = (gw - 6) / (double)(PANEL_LOAD_HISTORY - 1);
+		double x0 = gx + 3 + (PANEL_LOAD_HISTORY - m->nload) * step;
 
-		panel_color(cr, PANEL_ACCENT);
+		/* Anything non-zero gets a pixel of height: a load of 0.01 is
+		 * not nothing, and a flat line looks like a broken graph. */
 		for (int i = 0; i < m->nload; i++) {
-			int slot = PANEL_LOAD_HISTORY - m->nload + i;
-			double bh = m->load[i] * bh_max;
+			double v = m->load[i];
+			double py = base - v * (base - top);
 
-			/* Anything non-zero gets a pixel: a load of 0.01 is
-			 * not nothing, and a blank graph looks broken. */
-			if (bh < 1.0 && m->load[i] > 0.0)
-				bh = 1.0;
-			if (bh <= 0.0)
-				continue;
-			cairo_rectangle(cr, gx + 3 + slot * bw,
-					gy + gs - 4 - bh, bw - 0.4, bh);
+			if (v > 0 && base - py < 1)
+				py = base - 1;
+			if (i == 0)
+				cairo_move_to(cr, x0, py);
+			else
+				cairo_line_to(cr, x0 + i * step, py);
 		}
-		cairo_fill(cr);
-	}
 
-	/* The two lines: processor load over memory in use, as the weather
-	 * widget sets its temperature over its forecast. */
+		cairo_path_t *line = cairo_copy_path(cr);
+		cairo_pattern_t *g = cairo_pattern_create_linear(0, top, 0, base);
+
+		cairo_line_to(cr, x0 + (m->nload - 1) * step, gy + gh);
+		cairo_line_to(cr, x0, gy + gh);
+		cairo_close_path(cr);
+		cairo_pattern_add_color_stop_rgba(g, 0, 0x5b / 255.0,
+						  0x8f / 255.0, 0xf9 / 255.0,
+						  0.45);
+		cairo_pattern_add_color_stop_rgba(g, 1, 0x5b / 255.0,
+						  0x8f / 255.0, 0xf9 / 255.0,
+						  0.05);
+		cairo_set_source(cr, g);
+		cairo_fill(cr);
+		cairo_pattern_destroy(g);
+
+		cairo_append_path(cr, line);
+		cairo_path_destroy(line);
+		panel_color(cr, PANEL_ACCENT);
+		cairo_set_line_width(cr, 1.5);
+		cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+		cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+		cairo_stroke(cr);
+	}
+	cairo_restore(cr);
+
+	/* The two lines beside it: processor load over memory in use. */
 	char l1[32], l2[32];
 	int cpu = m->nload ? (int)(m->load[m->nload - 1] * 100.0 + 0.5) : 0;
 
-	snprintf(l1, sizeof(l1), "CPU %d %%", cpu);
-	snprintf(l2, sizeof(l2), "RAM %d %%", (int)(m->mem * 100.0 + 0.5));
+	snprintf(l1, sizeof(l1), "CPU %d%%", cpu);
+	snprintf(l2, sizeof(l2), "RAM %d%%", (int)(m->mem * 100.0 + 0.5));
 
-	double tx = gx + gs + 8;
+	double tx = gx + gw + 9;
 	double tw = x + w - tx;
 
 	draw_text(cr, tx, y + h / 2 - 8, tw, l1, PANEL_FONT, 0, PANEL_TEXT);
@@ -249,55 +390,67 @@ void panel_load_draw(cairo_t *cr, struct panel_load *m, double x, double y,
 /* Clock                                                                     */
 /* ------------------------------------------------------------------------ */
 
-/* Both strings, formatted.  %H:%M and dd.mm.yyyy are written out rather than
- * taken from the locale: this is a fixed-width slot in a panel and a locale
- * that chose a longer form would simply be clipped. */
+/* The date as the panel shows it, "Mon 2 Nov", and the time, "14:32".  The
+ * time is written out as %H:%M rather than taken from the locale: it sits in
+ * a slot sized for five characters. */
 static void clock_strings(char *timebuf, size_t tsz, char *datebuf, size_t dsz)
 {
-	time_t now = time(NULL);
-	struct tm tmv;
+	GDateTime *now = g_date_time_new_now_local();
+	char *date;
 
 	timebuf[0] = datebuf[0] = '\0';
-	if (!localtime_r(&now, &tmv))
+	if (!now)
 		return;
-
-	snprintf(timebuf, tsz, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
-	snprintf(datebuf, dsz, "%02d.%02d.%04d", tmv.tm_mday, tmv.tm_mon + 1,
-		 tmv.tm_year + 1900);
+	snprintf(timebuf, tsz, "%02d:%02d", g_date_time_get_hour(now),
+		 g_date_time_get_minute(now));
+	date = g_date_time_format(now, "%a %-d %b");
+	if (date)
+		g_strlcpy(datebuf, date, dsz);
+	g_free(date);
+	g_date_time_unref(now);
 }
+
+/* The gap between the date and the time on the one-line clock. */
+#define CLOCK_GAP 10
 
 void panel_clock_draw(cairo_t *cr, double x, double y, double w, double h,
 		      gboolean stacked)
 {
-	char timebuf[16], datebuf[16], both[40];
+	static const double dim[4] = { 0xa4 / 255.0, 0xad / 255.0,
+				       0xbf / 255.0, 1 };
+	static const double text[4] = { 0xee / 255.0, 0xf2 / 255.0,
+					 0xfa / 255.0, 1 };
+	char timebuf[32], datebuf[64];
 
 	clock_strings(timebuf, sizeof(timebuf), datebuf, sizeof(datebuf));
 
-	if (!stacked) {
-		snprintf(both, sizeof(both), "%s  %s", timebuf, datebuf);
-		panel_text(cr, x, y + h / 2, w, both, FALSE, 1);
+	if (stacked) {
+		panel_text_full(cr, x, y + h / 2 - 9, w, timebuf,
+				"Selawik Semibold 11", text, 1);
+		panel_text_full(cr, x, y + h / 2 + 10, w, datebuf, PANEL_FONT,
+				dim, 1);
 		return;
 	}
 
-	/* Time over date, both right-aligned and the same size and weight, as
-	 * the Windows 11 tray sets them. */
-	panel_text(cr, x + 8, y + h / 2 - 8, w - 16, timebuf, FALSE, 2);
-	panel_text(cr, x + 8, y + h / 2 + 8, w - 16, datebuf, FALSE, 2);
+	/* One line, right-aligned in the rectangle: the time keeps its place
+	 * at the right end, and the date stands to the left of it. */
+	int tw = panel_text_width(cr, "88:88", PANEL_FONT_BOLD);
+	double tx = x + w - tw;
+
+	panel_text_full(cr, tx, y + h / 2, tw, timebuf, PANEL_FONT_BOLD, text,
+			2);
+	panel_text_full(cr, x, y + h / 2, tx - CLOCK_GAP - x, datebuf,
+			PANEL_FONT, dim, 2);
 }
 
 int panel_clock_width(cairo_t *cr)
 {
-	/* Measured against the widest digits rather than the current time: the
-	 * digits are not all the same width in a proportional face. */
-	PangoLayout *l = pango_cairo_create_layout(cr);
-	PangoFontDescription *d =
-		pango_font_description_from_string(PANEL_FONT);
-	int w, h;
+	char timebuf[32], datebuf[64];
 
-	pango_layout_set_font_description(l, d);
-	pango_font_description_free(d);
-	pango_layout_set_text(l, "88.88.8888", -1);
-	pango_layout_get_pixel_size(l, &w, &h);
-	g_object_unref(l);
-	return w + 16;
+	clock_strings(timebuf, sizeof(timebuf), datebuf, sizeof(datebuf));
+	/* The date as it is today, the time at its widest digits: the digits
+	 * are not all the same width in a proportional face, and a clock that
+	 * changed width every minute would nudge the tray about. */
+	return panel_text_width(cr, datebuf, PANEL_FONT) + CLOCK_GAP +
+	       panel_text_width(cr, "88:88", PANEL_FONT_BOLD);
 }

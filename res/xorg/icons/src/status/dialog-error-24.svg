@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: dialog-error, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="1.333" x2="0" y2="62.667"><stop offset="0" stop-color="#ea5a5a"/><stop offset="1" stop-color="#c42e2e"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="1.333" x2="0" y2="62.667"><stop offset="0" stop-color="#ea5a5a"/><stop offset="1" stop-color="#c42e2e"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M60.332 43.736L43.736 60.332L20.264 60.332L3.668 43.736L3.668 20.264L20.264 3.668L43.736 3.668L60.332 20.264Z" fill="url(#g1)" stroke="url(#g2)" stroke-width="2.667" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M21.88 21.88L42.12 42.12M42.12 21.88L21.88 42.12" fill="none" stroke="#ffffff" stroke-width="5.333" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

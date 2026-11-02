@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: settings.
+// LikeOS Explorer: settings.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -43,6 +43,7 @@ static const struct {
 	{ "window-maximized", "false" },
 	{ "sidebar-width", "220" },
 	{ "start-location", "'likeos:home'" },
+	{ "gallery-folders", "['pictures', 'videos']" },
 };
 
 static void ex_settings_class_init(ExSettingsClass *k)

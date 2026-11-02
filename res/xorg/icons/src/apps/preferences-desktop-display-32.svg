@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: preferences-desktop-display, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#4f8cff"/><stop offset="1" stop-color="#2346c0"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H48A12 12 0 0 1 60 16V48A12 12 0 0 1 48 60H16A12 12 0 0 1 4 48V16A12 12 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M17 16H47A3 3 0 0 1 50 19V37A3 3 0 0 1 47 40H17A3 3 0 0 1 14 37V19A3 3 0 0 1 17 16Z" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 42V48M22 50H42" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M27 28A5 5 0 1 0 37 28A5 5 0 1 0 27 28Z" fill="#ffffff"/>
+<path d="M40 28L43 28M37.657 33.657L39.778 35.778M32 36L32 39M26.343 33.657L24.222 35.778M24 28L21 28M26.343 22.343L24.222 20.222M32 20L32 17M37.657 22.343L39.778 20.222" fill="none" stroke="#ffffff" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

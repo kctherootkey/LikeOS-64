@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: drives and other places that hold files.
+// LikeOS Explorer: drives and other places that hold files.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -118,6 +118,24 @@ static gboolean have_root(GPtrArray *list, GFile *root)
 	return FALSE;
 }
 
+char *ex_volumes_unescape(const char *field)
+{
+	GString *out = g_string_sized_new(strlen(field));
+
+	for (const char *c = field; *c; c++) {
+		if (c[0] == '\\' && c[1] >= '0' && c[1] <= '3' && c[2] >= '0' &&
+		    c[2] <= '7' && c[3] >= '0' && c[3] <= '7') {
+			g_string_append_c(out, (char)(((c[1] - '0') << 6) |
+						      ((c[2] - '0') << 3) |
+						      (c[3] - '0')));
+			c += 3;
+		} else {
+			g_string_append_c(out, *c);
+		}
+	}
+	return g_string_free(out, FALSE);
+}
+
 /* The filesystems a person keeps files on, from the mount table.  The
  * kernel's own (proc, sysfs, devfs) are skipped. */
 static void add_system_mounts(GPtrArray *list)
@@ -132,7 +150,8 @@ static void add_system_mounts(GPtrArray *list)
 			char **f = g_strsplit_set(lines[i], " \t", -1);
 
 			if (g_strv_length(f) >= 3) {
-				const char *dir = f[1], *type = f[2];
+				char *dir = ex_volumes_unescape(f[1]);
+				const char *type = f[2];
 
 				if (strcmp(type, "proc") && strcmp(type, "sysfs") &&
 				    strcmp(type, "devfs") && strcmp(type, "devtmpfs") &&
@@ -150,7 +169,7 @@ static void add_system_mounts(GPtrArray *list)
 						v->root = root;
 						v->fs_type = g_strdup(type);
 						if (strcmp(dir, "/") == 0) {
-							v->name = g_strdup("Local Disk");
+							v->name = g_strdup(EX_SYSTEM_DISK_NAME);
 							v->icon_name = g_strdup("drive-harddisk");
 							root_seen = TRUE;
 						} else if (strcmp(type, "tmpfs") == 0) {
@@ -166,6 +185,7 @@ static void add_system_mounts(GPtrArray *list)
 						g_object_unref(root);
 					}
 				}
+				g_free(dir);
 			}
 			g_strfreev(f);
 		}
@@ -179,7 +199,7 @@ static void add_system_mounts(GPtrArray *list)
 			ExVolume *v = g_new0(ExVolume, 1);
 
 			v->root = root;
-			v->name = g_strdup("Local Disk");
+			v->name = g_strdup(EX_SYSTEM_DISK_NAME);
 			v->icon_name = g_strdup("drive-harddisk");
 			v->fs_type = g_strdup("");
 			g_ptr_array_insert(list, 0, v);

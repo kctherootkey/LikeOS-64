@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: what a song or a video is.
+// LikeOS Explorer: what a song or a video is.
 //
 // Copyright (C) 2026 The LikeOS Project
 

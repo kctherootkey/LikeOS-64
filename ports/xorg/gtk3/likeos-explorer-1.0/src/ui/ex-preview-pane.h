@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the details and preview panes.
+// LikeOS Explorer: the details and preview panes.
 //
 // The pane at the right of a tab.  Details: the selected item's picture,
 // name, type, size, dates and place -- or for several, how many and their

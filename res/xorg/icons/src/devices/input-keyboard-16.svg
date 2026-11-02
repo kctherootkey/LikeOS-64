@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: input-keyboard, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="48"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient></defs>
+<g transform="scale(0.25)">
+<path d="M8 16H56A4 4 0 0 1 60 20V44A4 4 0 0 1 56 48H8A4 4 0 0 1 4 44V20A4 4 0 0 1 8 16Z" fill="url(#g1)"/>
+<path d="M12 24h4v4h-4ZM20 24h4v4h-4ZM28 24h4v4h-4ZM36 24h4v4h-4ZM44 24h4v4h-4ZM52 24h4v4h-4ZM16 28h4v4h-4ZM24 28h4v4h-4ZM32 28h4v4h-4ZM40 28h4v4h-4ZM48 28h4v4h-4ZM20 32h4v4h-4ZM24 32h4v4h-4ZM28 32h4v4h-4ZM32 32h4v4h-4ZM36 32h4v4h-4ZM40 32h4v4h-4ZM44 32h4v4h-4Z" fill="#c9d0dc" opacity="1"/>
+</g>
+</svg>

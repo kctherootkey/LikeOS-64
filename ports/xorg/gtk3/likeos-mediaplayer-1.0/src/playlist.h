@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: the play queue.
+// LikeOS -- LikeOS Media Player: the play queue.
 //
 // A GtkListStore the queue view shows directly, plus the play order.  Every
 // entry carries a unique id that never changes and is never reused, so the

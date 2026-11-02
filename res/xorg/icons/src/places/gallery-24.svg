@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: gallery, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="5.333" x2="0" y2="40"><stop offset="0" stop-color="#c9dcff"/><stop offset="1" stop-color="#7fa6f0"/></linearGradient><clipPath id="c2"><path d="M13.333 26.667H40A2.667 2.667 0 0 1 42.667 29.333V50.667A2.667 2.667 0 0 1 40 53.333H13.333A2.667 2.667 0 0 1 10.667 50.667V29.333A2.667 2.667 0 0 1 13.333 26.667Z"/></clipPath><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="26.667" x2="0" y2="53.333"><stop offset="0" stop-color="#8fd3e6"/><stop offset="1" stop-color="#d7f1f3"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="0" y1="34.667" x2="0" y2="53.333"><stop offset="0" stop-color="#22b3a8"/><stop offset="1" stop-color="#1a9e9e"/></linearGradient><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="39.467" x2="0" y2="53.333"><stop offset="0" stop-color="#159088"/><stop offset="1" stop-color="#0e7470"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<g>
+<path d="M18.667 5.333H56A2.667 2.667 0 0 1 58.667 8V37.333A2.667 2.667 0 0 1 56 40H18.667A2.667 2.667 0 0 1 16 37.333V8A2.667 2.667 0 0 1 18.667 5.333Z" fill="#ffffff" stroke="#b9c1ce" stroke-width="2.667" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M21.333 10.667H53.333V34.667H21.333Z" fill="url(#g1)"/>
+</g>
+<g>
+<path d="M8 21.333H45.333A2.667 2.667 0 0 1 48 24V56A2.667 2.667 0 0 1 45.333 58.667H8A2.667 2.667 0 0 1 5.333 56V24A2.667 2.667 0 0 1 8 21.333Z" fill="#ffffff" stroke="#b9c1ce" stroke-width="2.667" stroke-linecap="round" stroke-linejoin="round"/>
+<g clip-path="url(#c2)">
+<path d="M10.667 26.667H42.667V53.333H10.667Z" fill="url(#g3)"/>
+<path d="M10.667 53.333L10.667 43.2L20.907 34.667L30.507 45.867L30.507 53.333Z" fill="url(#g4)"/>
+<path d="M21.867 53.333L33.067 39.467L42.667 46.667L42.667 53.333Z" fill="url(#g5)"/>
+</g>
+<path d="M31.787 33.867A3.2 3.2 0 1 0 38.187 33.867A3.2 3.2 0 1 0 31.787 33.867Z" fill="#ffd166"/>
+</g>
+</g>
+</svg>

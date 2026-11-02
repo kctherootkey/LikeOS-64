@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: what is remembered between runs.
+// LikeOS -- LikeOS Media Player: what is remembered between runs.
 //
 // Kept in ~/.config/mediaplayer/settings, a GKeyFile with one [Player]
 // group.  Every value is range-checked on load, so a hand-edited or damaged
@@ -17,9 +17,10 @@ typedef struct {
 	gchar *last_dir;	/* folder the file chooser opens in */
 	gboolean shuffle;
 	int repeat;		/* MpRepeat */
-	gboolean show_playlist;
+	gboolean nav_compact;	/* navigation pane folded to its icons */
 	int width, height;	/* window size */
-	int queue_width;	/* width of the play queue panel */
+	gchar **music_dirs;	/* folders the music library is read from */
+	gchar **video_dirs;	/* folders the video library is read from */
 	gchar *video_sink;	/* "auto", "xv", "gtk", "x11", "gl" */
 	gboolean gapless;
 	gboolean discover;	/* read tags of queued local files ahead */

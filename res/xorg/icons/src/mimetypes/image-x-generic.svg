@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: image-x-generic, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><filter id="f3" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="0.8"/></filter><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="38" y1="18" x2="46.4" y2="9.6"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g5" gradientUnits="userSpaceOnUse" x1="0" y1="40" x2="0" y2="53"><stop offset="0" stop-color="#35aaaa"/><stop offset="1" stop-color="#189191"/></linearGradient><clipPath id="c6"><path d="M20 15H44A2 2 0 0 1 46 17V34A2 2 0 0 1 44 36H20A2 2 0 0 1 18 34V17A2 2 0 0 1 20 15Z"/></clipPath><linearGradient id="g7" gradientUnits="userSpaceOnUse" x1="0" y1="15" x2="0" y2="36"><stop offset="0" stop-color="#8fd3e6"/><stop offset="1" stop-color="#d7f1f3"/></linearGradient><linearGradient id="g8" gradientUnits="userSpaceOnUse" x1="0" y1="21.3" x2="0" y2="36"><stop offset="0" stop-color="#22b3a8"/><stop offset="1" stop-color="#1a9e9e"/></linearGradient><linearGradient id="g9" gradientUnits="userSpaceOnUse" x1="0" y1="25.08" x2="0" y2="36"><stop offset="0" stop-color="#159088"/><stop offset="1" stop-color="#0e7470"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M15 4H38L52 18V57A3 3 0 0 1 49 60H15A3 3 0 0 1 12 57V7A3 3 0 0 1 15 4Z" fill="#0b1730" opacity="0.18" transform="translate(0 1)" filter="url(#f1)"/>
+<path d="M15 4H38L52 18V57A3 3 0 0 1 49 60H15A3 3 0 0 1 12 57V7A3 3 0 0 1 15 4Z" fill="#b9c1ce"/>
+<path d="M15 5H37.6L51 18.4V57A2 2 0 0 1 49 59H15A2 2 0 0 1 13 57V7A2 2 0 0 1 15 5Z" fill="url(#g2)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#0b1730" opacity="0.12" transform="translate(-0.6 0.9)" filter="url(#f3)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#b9c1ce"/>
+<path d="M39 6.4V15Q39 17 41 17H49.6Z" fill="url(#g4)"/>
+<path d="M17.5 40H46.5A2.5 2.5 0 0 1 49 42.5V50.5A2.5 2.5 0 0 1 46.5 53H17.5A2.5 2.5 0 0 1 15 50.5V42.5A2.5 2.5 0 0 1 17.5 40Z" fill="url(#g5)"/>
+<path d="M17.5 40.5H46.5" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="butt" stroke-linejoin="round" opacity="0.3"/>
+<path d="M26.54 49.815L30.44 44.55L32.78 47.67L34.34 46.11L37.46 49.815Z" fill="#ffffff"/>
+<path d="M34.262 44.355A1.248 1.248 0 1 0 36.758 44.355A1.248 1.248 0 1 0 34.262 44.355Z" fill="#ffffff"/>
+<g clip-path="url(#c6)">
+<path d="M18 15H46V36H18Z" fill="url(#g7)"/>
+<path d="M18 36L18 28.02L26.96 21.3L35.36 30.12L35.36 36Z" fill="url(#g8)"/>
+<path d="M27.8 36L37.6 25.08L46 30.75L46 36Z" fill="url(#g9)"/>
+</g>
+<path d="M36.76 20.67A2.52 2.52 0 1 0 41.8 20.67A2.52 2.52 0 1 0 36.76 20.67Z" fill="#ffd166"/>
+</g>
+</svg>

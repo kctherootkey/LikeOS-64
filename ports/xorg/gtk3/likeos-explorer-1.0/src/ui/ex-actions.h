@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the window's commands.
+// LikeOS Explorer: the window's commands.
 //
 // One GAction per command ("win.copy", "win.view-mode", ...), installed on
 // each window.  The command bar's buttons, the context menus and the

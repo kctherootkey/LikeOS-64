@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: settings.
+// LikeOS Explorer: settings.
 //
 // GSettings (schema org.likeos.Explorer) when the schema is installed -- on
 // LikeOS through the keyfile backend, ~/.config/glib-2.0/settings/keyfile.

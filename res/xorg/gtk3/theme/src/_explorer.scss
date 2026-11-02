@@ -1,144 +1,359 @@
-// LikeOS File Explorer (likeos-explorer).
+// LikeOS Explorer (likeos-explorer): the window's chrome.
 //
-// Windows 11 Explorer's arrangement: the tab row on the Mica of the window,
-// the navigation bar and the command bar on a raised layer, the content on a
-// card-white surface with the navigation pane beside it, the details or
-// preview pane at the right, the status bar at the bottom.  Everything is
-// scoped to the window's .likeos-explorer class and built from the tokens.
+// The title row runs the full width: the tabs as rounded chips, the current
+// one a raised white card, New tab, and the window's own caption buttons
+// (Explorer asks the window manager for a border only, and draws the same
+// inset rounded buttons ctwm puts on every other title bar).  Under it the
+// navigation pane is a column of its own on the window colour, the whole
+// height of the window; beside it, on white, the address row (Back,
+// Forward, Up, Refresh, the address bar, the search field), the toolbar
+// with its grouped commands, a hairline, the content and the status bar.
+// Everything is scoped to the window's .likeos-explorer class.  The content
+// views have their own partial (_explorer-views.scss), imported after this
+// one.
 //
 // Copyright (C) 2026 The LikeOS Project
 
-window.likeos-explorer {
-  background-color: $color-window;
+// The title row (with the window active, and without) and the hairlines
+// that close the bars off -- all from the design tokens.
+$ex-title: $color-title;
+$ex-title-backdrop: $color-window;
+$ex-hairline: $color-stroke;
+$ex-pane-bg: $color-window;        // the navigation pane's column
+$ex-field: $color-window;          // the address bar and search at rest
+$ex-tab-current: $color-card;
+$ex-tab-edge: $color-stroke;
+$ex-tab-hover: $color-hover;
+$ex-caption-hover: $color-hover;
+$ex-caption-pressed: $color-pressed;
+$ex-close-hover: $color-close;
+$ex-close-pressed: $color-close-pressed;
+$ex-nav-selected: $color-selection;
+$ex-nav-selected-hover: $color-selection-hover;
+$ex-nav-hover: $color-item-hover;
+$ex-toggle-checked: $color-selection;
 
-  // Tabs: the row at the top, the current tab joined to the bar below.
-  > notebook > header.top {
-    background-color: $color-window;
-    border: none;
-    padding: $space-xxs $space-s 0 $space-s;
+window.likeos-explorer {
+  background-color: $color-card;
+
+  // ---- the title row ------------------------------------------------------
+
+  .ex-titlebar {
+    background-color: $ex-title;
+    min-height: $height-title;
+    padding: 0;
+    border-bottom: 1px solid $ex-hairline;
+  }
+  &:backdrop .ex-titlebar { background-color: $ex-title-backdrop; }
+
+  // The tabs, drawn by the program as rounded chips in these colours:
+  // "background-color" is the chip's fill in each state, "border-top-color"
+  // its hairline edge.
+  .ex-tabs {
+    margin: 0 0 0 $space-xs;
 
     tab {
-      min-height: $height-tab - 8px;
-      padding: 0 $space-s;
-      margin: 0 1px;
-      border: none;
-      border-radius: $radius-overlay $radius-overlay 0 0;
+      min-height: $height-title;
+      background-color: transparent;
+      border-top-color: transparent;
       color: $color-text-secondary;
 
-      &:hover { background-color: $color-hover; color: $color-text; }
-      &:checked { background-color: $color-layer; color: $color-text; box-shadow: none; }
+      &:hover { background-color: $ex-tab-hover; color: $color-text; }
+      &:checked {
+        background-color: $ex-tab-current;
+        border-top-color: $ex-tab-edge;
+        color: $color-text;
+      }
 
-      button { min-width: 16px; min-height: 16px; padding: 2px; border-radius: $radius-control; }
+      > box { margin: 0 $space-s 0 $space-m; }
+      image { margin-right: $space-s; }
+      label { font-size: $type-body; }
     }
   }
+  &:backdrop .ex-tabs tab {
+    &:checked { background-color: $color-layer; color: $color-text-secondary; }
+  }
 
-  > notebook > stack { background-color: $color-layer; }
+  button.ex-tab-close {
+    min-width: 20px;
+    min-height: 20px;
+    padding: 0;
+    margin-left: $space-xs;
+    border: none;
+    border-radius: $radius-control;
+    background-image: none;
+    box-shadow: none;
+    color: $color-text-secondary;
 
+    &:hover { background-image: image($color-hover); color: $color-text; }
+    &:active { background-image: image($color-pressed); }
+  }
+
+  button.ex-new-tab {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    margin: 0 0 0 $space-xxs;
+    border: none;
+    border-radius: $radius-control;
+    background-image: none;
+    box-shadow: none;
+    color: $color-text-secondary;
+
+    &:hover { background-image: image($ex-caption-hover); color: $color-text; }
+    &:active { background-image: image($ex-caption-pressed); }
+  }
+
+  // Minimise, maximise (restore), close: inset rounded buttons 36 by 26
+  // pixels, 4 apart and 6 from the edge; close turns red under the
+  // pointer with a white glyph.
+  button.ex-caption {
+    min-width: 36px;
+    min-height: 26px;
+    padding: 0;
+    margin: 0 0 0 $space-xs;
+    border: none;
+    border-radius: $radius-control;
+    background-image: none;
+    box-shadow: none;
+    color: $color-text;
+
+    &:hover { background-image: image($ex-caption-hover); }
+    &:active { background-image: image($ex-caption-pressed); }
+    &:disabled { color: $color-text-disabled; }
+
+    &.close { margin-right: 6px; }
+    &.close:hover { background-image: image($ex-close-hover); color: white; }
+    &.close:active { background-image: image($ex-close-pressed); color: white; }
+  }
+  &:backdrop button.ex-caption { color: $color-text-secondary; }
+  &:backdrop button.ex-caption:hover { color: $color-text; }
+  &:backdrop button.ex-caption.close:hover,
+  &:backdrop button.ex-caption.close:active { color: white; }
+  &:backdrop button.ex-caption:disabled { color: $color-text-disabled; }
+
+  // ---- the page below a tab -----------------------------------------------
+
+  > box > notebook,
+  > box > notebook > stack { background-color: $color-card; border: none; }
+
+  .ex-main { background-color: $color-card; }
+
+  // The address row: on white, 44 pixels tall.
   .ex-navbar {
-    margin: $space-xs $space-s;
+    background-color: $color-card;
+    min-height: 44px;
+    padding: $space-xxs $space-m 0 $space-s;
+  }
 
-    > button { min-width: $height-control; min-height: $height-control; border-radius: $radius-control; }
+  button.ex-nav-button {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    margin-right: $space-xxs;
+    border: none;
+    border-radius: $radius-control;
+    background-image: none;
+    box-shadow: none;
+    color: $color-text;
 
-    entry.search {
-      min-height: $height-control;
+    &:hover { background-image: image($color-hover); }
+    &:active { background-image: image($color-pressed); }
+    &:disabled { color: $color-text-disabled; }
+    &:disabled image { -gtk-icon-effect: dim; }
+  }
+
+  // The address bar and the search field: soft filled fields at rest,
+  // white with the accent edge while they have the keyboard.
+  lx-breadcrumb, entry.search {
+    min-height: 30px;
+    background-color: $ex-field;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-control;
+    box-shadow: none;
+  }
+  lx-breadcrumb {
+    margin-left: $space-s;
+    padding: 0;
+
+    entry {
+      min-height: 30px;
+      margin: -1px;
       border-radius: $radius-control;
+      background-color: $color-card;
+      box-shadow: inset 0 0 0 1px $color-accent;
+    }
+
+    .lx-crumbs {
+      padding: 0 $space-xs 0 $space-s;
+    }
+    image.lx-crumb-icon { margin-right: $space-xs; }
+    image.lx-crumb-separator { margin: 0 $space-xxs; color: $color-text-secondary; min-width: 12px; }
+
+    button.lx-crumb {
+      min-height: 24px;
+      padding: 0 6px;
+      border-radius: $radius-control;
+      color: $color-text;
+      font-size: $type-body;
+
+      &:hover { background-image: image($color-hover); }
+      &:active { background-image: image($color-pressed); }
+    }
+    button.lx-chevron {
+      min-height: 24px;
+      min-width: 16px;
+      padding: 0 2px;
+      border-radius: $radius-control;
+      color: $color-text-secondary;
+
+      &:hover, &:checked { background-image: image($color-hover); color: $color-text; }
+    }
+  }
+  entry.search {
+    margin-left: $space-s;
+    padding: 0 $space-s 0 $space-m;
+    font-size: $type-body;
+
+    &:focus { background-color: $color-card; box-shadow: inset 0 0 0 1px $color-accent; border-color: $color-accent; }
+    image.right { margin-left: 6px; color: $color-text-secondary; }
+  }
+  lx-breadcrumb:hover, entry.search:hover:not(:focus) { border-color: $color-stroke-edge; }
+
+  // The toolbar: white, 44 pixels tall, its groups apart by hairlines,
+  // closed off below by one.
+  .ex-commandbar {
+    background-color: $color-card;
+    min-height: 44px;
+    padding: 0 $space-m 0 $space-s;
+    border-bottom: 1px solid $ex-hairline;
+
+    separator {
+      background-color: $color-stroke;
+      min-width: 1px;
+      margin: 12px $space-s;
     }
   }
 
-  .ex-commandbar {
-    margin: 0 $space-s $space-xs $space-s;
-    min-height: $height-command;
+  button.ex-command {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    margin: 0 $space-xxs 0 0;
+    border: none;
+    border-radius: $radius-control;
+    background-image: none;
+    box-shadow: none;
+    color: $color-text;
 
-    button { min-height: $height-control; border-radius: $radius-control; padding: 0 $space-s; }
-    separator { background-color: $color-stroke; min-width: 1px; margin: $space-xs 0; }
+    &.text { padding: 0 $space-s; }
+    &:hover { background-image: image($color-hover); }
+    &:active { background-image: image($color-pressed); }
+    &:checked { background-image: image($color-selection); color: $color-accent-fill; }
+    &:disabled { color: $color-text-disabled; }
+    &:disabled image { -gtk-icon-effect: dim; }
+    label { font-size: $type-body; }
+    image.ex-dropdown-arrow { color: $color-text-secondary; }
+
+    // New: the one labelled primary command, outlined in the accent.
+    &.ex-new {
+      min-height: 30px;
+      padding: 0 $space-s 0 $space-s;
+      margin-right: $space-xs;
+      border: 1px solid $color-accent-fill;
+      color: $color-accent-fill;
+      font-weight: $weight-strong;
+
+      image.ex-dropdown-arrow { color: $color-accent-fill; }
+      &:hover { background-image: image(transparentize($color-accent-fill, 0.92)); }
+      &:active, &:checked { background-image: image(transparentize($color-accent-fill, 0.84)); }
+      &:disabled { border-color: $color-stroke-edge; color: $color-text-disabled; }
+      &:disabled image.ex-dropdown-arrow { color: $color-text-disabled; }
+    }
   }
 
-  // The content area: card white, with a hairline to the bars above.
-  paned { border-top: 1px solid $color-stroke; }
-  paned > separator { background-color: $color-stroke; min-width: 1px; }
+  // The details and preview pane switches: two icon toggles in one
+  // hairline frame, the pane shown in the selection colour.
+  .ex-pane-switch {
+    padding: 1px;
+    border: 1px solid $color-stroke;
+    border-radius: $radius-control + 2px;
+
+    button.ex-command.ex-pane-toggle {
+      min-width: 30px;
+      min-height: 26px;
+      margin: 0;
+    }
+  }
+
+  // ---- the navigation pane ------------------------------------------------
+
+  paned > separator { background-color: $color-stroke; min-width: 1px; background-image: none; }
 
   .ex-sidebar {
-    background-color: $color-layer;
+    background-color: $ex-pane-bg;
 
     treeview.view {
-      background-color: $color-layer;
-      -GtkTreeView-vertical-separator: 4;
-      padding: $space-xxs $space-xs;
+      background-color: $ex-pane-bg;
+      color: $color-text;
+      font-size: $type-body;
+      -GtkTreeView-vertical-separator: 0;
+      -GtkTreeView-horizontal-separator: 0;
+      -GtkTreeView-expander-size: 16;
 
-      &:hover { background-color: $color-hover; }
-      &:selected { background-color: $color-selection; color: $color-text; }
+      &:hover { background-color: $ex-nav-hover; border-radius: $radius-row; }
+      &:selected, &:selected:focus, &:backdrop:selected {
+        background-color: $ex-nav-selected;
+        color: $color-text;
+        border-radius: $radius-row;
+      }
+      &:selected:hover { background-color: $ex-nav-selected-hover; }
     }
   }
 
-  treeview.view {
-    &:hover { background-color: $color-item-hover; }
-    &:selected { background-color: $color-selection; color: $color-text; }
-    &:selected:hover { background-color: $color-selection-hover; }
-
-    header button {
-      padding: $space-xs $space-s;
-      border: none;
-      border-right: 1px solid $color-stroke;
-      color: $color-text-secondary;
-      background-color: $color-card;
-    }
-
-    &.ex-compact { -GtkTreeView-vertical-separator: 0; }
-
-    // An empty or still-loading folder: no keyboard ring around the whole
-    // view, as Windows draws none there.
-    &.ex-empty { outline-color: transparent; }
-  }
-
-  iconview {
-    background-color: $color-card;
-
-    &:hover { background-color: $color-item-hover; }
-    &:selected { background-color: $color-selection; color: $color-text; border-radius: $radius-control; }
-  }
+  // ---- the status bar -------------------------------------------------------
 
   .ex-statusbar {
-    margin: $space-xxs $space-m;
+    min-height: 28px;
+    padding: 0 $space-s 0 $space-m;
+    background-color: $color-card;
     font-size: $type-caption + 0.5pt;
     color: $color-text-secondary;
+
+    label.ex-status-separator { margin: 0 $space-s; color: $color-text-disabled; }
+
+    // The Details / Large icons switch: a LikeOS segmented control -- a
+    // soft trough with the chosen view a raised white chip.
+    lx-segmented {
+      padding: 1px;
+      border: 1px solid $color-stroke;
+      border-radius: $radius-control + 2px;
+      background-color: $color-window;
+
+      button {
+        min-width: 26px;
+        min-height: 18px;
+        padding: 0;
+        margin: 0;
+        border: 1px solid transparent;
+        border-radius: $radius-control;
+        background-image: none;
+        background-color: transparent;
+        box-shadow: none;
+        color: $color-text-secondary;
+
+        &:hover { color: $color-text; }
+        &:checked {
+          border-color: $color-stroke;
+          background-color: $color-card;
+          color: $color-accent-fill;
+        }
+      }
+    }
   }
 
   .ex-pane {
-    background-color: $color-layer;
+    background-color: $color-card;
     border-left: 1px solid $color-stroke;
   }
-
-  // Home and This PC.
-  .ex-home {
-    background-color: $color-card;
-
-    flowbox flowboxchild { padding: 0; }
-    list { background-color: transparent; }
-    list row { border-radius: $radius-control; }
-    list row:hover { background-color: $color-hover; }
-    list row:selected { background-color: $color-selection; color: $color-text; }
-  }
-
-  .ex-section-title {
-    font-size: $type-body-large;
-    font-weight: $weight-strong;
-    margin: $space-m 0 $space-xs 0;
-  }
-
-  button.ex-tile {
-    min-width: 200px;
-    padding: $space-s $space-m;
-    border-radius: $radius-card;
-    background-color: $color-layer;
-    border: 1px solid $color-stroke;
-
-    &:hover { background-color: $control_hover_color; }
-    levelbar trough { min-height: 6px; }
-  }
-
-  .ex-dim { color: $color-text-secondary; }
-  .ex-placeholder { color: $color-text-secondary; font-size: $type-body-large; }
 }
-
-// The operation center window carries the class too.
-window.likeos-explorer list row progressbar trough { min-height: 4px; }

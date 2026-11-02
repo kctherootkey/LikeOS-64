@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: printer, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="22" x2="0" y2="48"><stop offset="0" stop-color="#f3f5f9"/><stop offset="1" stop-color="#c9d0dc"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H48V26H16Z" fill="#b9c1ce"/>
+<path d="M18 6H46V24H18Z" fill="#ffffff"/>
+<path d="M8 22H56A4 4 0 0 1 60 26V44A4 4 0 0 1 56 48H8A4 4 0 0 1 4 44V26A4 4 0 0 1 8 22Z" fill="url(#g1)"/>
+<path d="M9 23H55A4 4 0 0 1 59 27V43A4 4 0 0 1 55 47H9A4 4 0 0 1 5 43V27A4 4 0 0 1 9 23Z" fill="none" stroke="#8d97a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M10 38H54V42H10Z" fill="#3a4357"/>
+<path d="M16 40H48V60H16Z" fill="#b9c1ce"/>
+<path d="M18 42H46V58H18Z" fill="#ffffff"/>
+<path d="M22 49H42" fill="none" stroke="#c4cbd7" stroke-width="2" stroke-linecap="butt" stroke-linejoin="round"/>
+<path d="M22 55H38" fill="none" stroke="#c4cbd7" stroke-width="2" stroke-linecap="butt" stroke-linejoin="round"/>
+<path d="M50 30H54V34H50Z" fill="#4f8cff"/>
+</g>
+</svg>

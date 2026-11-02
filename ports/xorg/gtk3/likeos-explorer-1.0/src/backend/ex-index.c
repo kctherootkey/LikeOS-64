@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the search index of the home folder.
+// LikeOS Explorer: the search index of the home folder.
 //
 // The stored form is text, one entry per line after a header:
 //

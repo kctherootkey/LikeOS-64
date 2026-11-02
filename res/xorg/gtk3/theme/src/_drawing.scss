@@ -1,4 +1,10 @@
 // Drawing mixins
+//
+// Adwaita's drawing helpers, redrawn for the LikeOS look: flat fills, no
+// gradients, no embossed text, hairline frames.
+//
+// Copyright (C) 2026 The LikeOS Project
+// Portions from GTK's Adwaita theme, LGPL-2.1-or-later.
 
 // generic drawing of more complex things
 
@@ -23,30 +29,28 @@
 
 // entries
 //
-// A Windows 11 text field: a near-white fill, a hairline grey frame, and a
-// darker line along the bottom edge only.  Focus turns that bottom line into a
-// two-pixel accent bar (the second pixel is the inset shadow) and the fill to
-// pure white -- the frame itself never changes colour.
+// A LikeOS text field: white, framed all round in one even line.  Under the
+// pointer the frame deepens; with the keyboard in it the frame turns the
+// accent highlight and doubles to two pixels (the second is an inset
+// shadow), the same weight on every side.
 
-@function entry_focus_border($fc:$accent_color) { @return $fc; }
+@function entry_focus_border($fc:$accent_highlight_color) { @return $fc; }
 
-@function entry_focus_shadow($fc:$accent_color) { @return inset 0 -1px $fc; }
+@function entry_focus_shadow($fc:$accent_highlight_color) { @return inset 0 0 0 1px $fc; }
 
-@mixin entry($t, $fc:$accent_color, $edge: none) {
+@mixin entry($t, $fc:$accent_highlight_color, $edge: none) {
 //
 // $t: normal, focus, insensitive, backdrop, backdrop-insensitive,
 //     osd, osd-focus, osd-insensitive, osd-backdrop
 //
   @if $t==normal {
     color: $text_color;
-    border-color: $borders_color;
-    border-bottom-color: $strong_borders_color;
-    background-color: $control_color;
+    border-color: $alt_borders_color;
+    background-color: $base_color;
     box-shadow: entry_focus_shadow(transparentize($fc, 1));
   }
   @if $t==focus {
-    border-color: $borders_color;
-    border-bottom-color: entry_focus_border($fc);
+    border-color: entry_focus_border($fc);
     background-color: $base_color;
     box-shadow: entry_focus_shadow($fc);
   }
@@ -58,9 +62,8 @@
   }
   @if $t==backdrop {
     color: $text_color;
-    border-color: $borders_color;
-    border-bottom-color: $strong_borders_color;
-    background-color: $control_color;
+    border-color: $alt_borders_color;
+    background-color: $base_color;
     box-shadow: entry_focus_shadow(transparentize($fc, 1));
   }
   @if $t==backdrop-insensitive {
@@ -72,7 +75,7 @@
   @if $t==osd {
     color: $osd_text_color;
     border-color: $osd_borders_color;
-    background-color: transparentize(opacify($osd_borders_color, 1), 0.5);
+    background-color: $shell_raised_color;
     background-clip: padding-box;
     box-shadow: none;
     text-shadow: none;
@@ -80,10 +83,10 @@
   }
   @if $t==osd-focus {
     color: $osd_text_color;
-    border-color: $accent_light_color;
-    background-color: transparentize(opacify($osd_borders_color, 1), 0.5);
+    border-color: $shell_accent_color;
+    background-color: $shell_raised_color;
     background-clip: padding-box;
-    box-shadow: entry_focus_shadow($accent_light_color);
+    box-shadow: inset 0 0 0 1px $shell_accent_color;
     text-shadow: none;
     -gtk-icon-shadow: none;
   }
@@ -99,7 +102,7 @@
   @if $t==osd-backdrop {
     color: $osd_text_color;
     border-color: $osd_borders_color;
-    background-color: transparentize(opacify($osd_borders_color, 1), 0.5);
+    background-color: $shell_raised_color;
     background-clip: padding-box;
     box-shadow: none;
     text-shadow: none;
@@ -109,15 +112,15 @@
 
 // buttons
 //
-// Windows 11 buttons are flat: no gradient, no inner highlight, no text
-// emboss.  A standard button is a near-white face in a hairline frame whose
-// bottom edge is a shade darker, which is all the "elevation" there is.  It
-// greys slightly under the pointer, and pressing it drops the darker bottom
-// edge and dims the label.  A coloured button (the accent "suggested" one, or
-// destructive) is filled with its colour and lightens on hover and press.
+// LikeOS buttons are flat: no gradient, no inner highlight, no text emboss.
+// A standard button is a near-white face in a hairline frame whose bottom
+// edge is a shade deeper -- all the "elevation" there is.  It cools under
+// the pointer and darkens a little more while pressed.  A coloured button
+// (the accent "suggested" one, or destructive) is filled with its colour,
+// lightens under the pointer and lightens again while pressed.
 
 @function _border_color($c, $darker: false) {
-  @if $darker == true { @return darken($c, 12%); }
+  @if $darker == true { @return darken($c, 8%); }
   @else { @return $c; }
 }
 
@@ -132,6 +135,17 @@
 @mixin _button_text_shadow ($tc:$fg_color, $bg:$bg_color) {
   text-shadow: none;
   -gtk-icon-shadow: none;
+}
+
+// The hover and pressed fills of a coloured button: the accent has its own;
+// any other colour is lightened by the same amounts.
+@function _colored_hover($c) {
+  @if $c == $accent_color { @return $accent_hover_color; }
+  @return mix($c, white, 90%);
+}
+@function _colored_active($c) {
+  @if $c == $accent_color { @return $accent_active_color; }
+  @return mix($c, white, 82%);
 }
 
 @mixin button($t, $c:$bg_color, $tc:$fg_color, $edge: none, $backimage: null) {
@@ -149,14 +163,14 @@
   @if $t==normal or $t==backdrop or $t==normal-alt {
     @if $_colored {
       color: $tc;
-      outline-color: transparentize($tc, 0.3);
+      outline-color: $accent_highlight_color;
       border-color: $c;
       border-bottom-color: _border_color($c, true);
       background-image: image($c), $backimage;
     }
     @else {
       color: $fg_color;
-      outline-color: transparentize($fg_color, 0.1);
+      outline-color: $accent_highlight_color;
       border-color: $borders_color;
       border-bottom-color: $alt_borders_color;
       background-image: image($control_color), $backimage;
@@ -169,9 +183,9 @@
   @else if $t==hover or $t==hover-alt {
     @if $_colored {
       color: $tc;
-      border-color: mix($c, white, 90%);
+      border-color: _colored_hover($c);
       border-bottom-color: _border_color($c, true);
-      background-image: image(mix($c, white, 90%)), $backimage;
+      background-image: image(_colored_hover($c)), $backimage;
     }
     @else {
       color: $fg_color;
@@ -186,13 +200,13 @@
 
   @else if $t==active or $t==backdrop-active {
     @if $_colored {
-      color: transparentize($tc, 0.2);
-      border-color: mix($c, white, 80%);
-      background-image: image(mix($c, white, 80%));
+      color: $tc;
+      border-color: _colored_active($c);
+      background-image: image(_colored_active($c));
     }
     @else {
       color: $control_active_text_color;
-      border-color: $borders_color;
+      border-color: $alt_borders_color;
       background-image: image($control_active_color);
     }
     box-shadow: none;
@@ -203,9 +217,13 @@
   @else if $t==insensitive or $t==backdrop-insensitive or
            $t==insensitive-active or $t==backdrop-insensitive-active {
     @if $_colored {
+      // A disabled coloured button keeps its shape in a pale wash of its
+      // colour, the frame the same colour: with a transparent frame GTK
+      // fills the square corners behind the rounded border with the
+      // background image.
       color: white;
-      border-color: transparent;
-      background-image: image(#c8c8c8);
+      border-color: mix($c, $bg_color, 35%);
+      background-image: image(mix($c, $bg_color, 35%));
     }
     @else {
       color: $insensitive_fg_color;
@@ -228,13 +246,13 @@
     box-shadow: none;
     text-shadow: none;
     -gtk-icon-shadow: none;
-    outline-color: transparentize($osd_fg_color, 0.7);
+    outline-color: $shell_accent_color;
   }
 
   @else if $t==osd-hover {
-    $_bg: if($c != $bg_color, transparentize($c, 0.3), lighten($osd_bg_color, 12%));
+    $_bg: if($c != $bg_color, transparentize($c, 0.3), $shell_raised_color);
 
-    color: white;
+    color: $osd_fg_color;
     border-color: $osd_borders_color;
     background-color: transparent;
     background-image: image($_bg);
@@ -242,13 +260,13 @@
     box-shadow: none;
     text-shadow: none;
     -gtk-icon-shadow: none;
-    outline-color: transparentize($osd_fg_color, 0.7);
+    outline-color: $shell_accent_color;
   }
 
   @else if $t==osd-active {
-    $_bg: if($c != $bg_color, $c, $osd_borders_color);
+    $_bg: if($c != $bg_color, $c, $shell_border_color);
 
-    color: white;
+    color: $osd_fg_color;
     border-color: $osd_borders_color;
     background-color: transparent;
     background-image: image($_bg);
@@ -256,7 +274,7 @@
     box-shadow: none;
     text-shadow: none;
     -gtk-icon-shadow: none;
-    outline-color: transparentize($osd_fg_color, 0.7);
+    outline-color: $shell_accent_color;
   }
 
   @else if $t==osd-insensitive {
@@ -295,8 +313,8 @@
 
 @mixin headerbar_fill($c:$headerbar_color, $hc:$top_hilight, $ov: none) {
 //
-// header bars are a flat band of the window colour, as a Windows 11 title
-// area is.
+// header bars are a flat band of the window colour: no gradient, no
+// highlight line.
 //
   @if $ov != none { background: $c $ov; }
   @else { background: $c; }
@@ -388,38 +406,62 @@
  ***************************/
 
  @mixin check($t, $c:$bg_color, $tc:$fg_color, $checked: false) {
-  // Windows 11 check boxes and radio buttons.
+  // LikeOS check boxes and radio buttons.
   //
-  // Unchecked: a faint grey wash inside a strong grey rim, deepening on
-  // hover and press.  Checked: filled with the accent colour (rim and all),
-  // the glyph white, lightening on hover and press.  Disabled: the rim and
-  // the fill go to a pale grey.
+  // Unchecked: white inside the strong grey rim; the rim turns the accent
+  // under the pointer and the inside takes a faint wash while pressed.
+  // Checked: filled with the accent colour, rim and all, the mark white;
+  // a lighter accent under the pointer and while pressed.  Disabled: pale.
   //
   // $t: normal, hover, active, insensitive, backdrop, backdrop-insensitive
 
   @if $t==normal or $t==backdrop {
     background-clip: border-box;
-    background-image: if($checked, image($accent_color), image(rgba(0, 0, 0, 0.0241)));
+    background-image: if($checked, image($accent_color), image($base_color));
     border-color: if($checked, $accent_color, $strong_borders_color);
     box-shadow: none;
     color: if($checked, $tc, $fg_color);
   }
 
   @if $t==hover {
-    background-image: if($checked, image($accent_hover_color), image(rgba(0, 0, 0, 0.0578)));
-    border-color: if($checked, $accent_hover_color, $strong_borders_color);
+    background-image: if($checked, image($accent_hover_color), image($base_color));
+    border-color: if($checked, $accent_hover_color, $accent_color);
   }
 
   @if $t==active {
-    background-image: if($checked, image($accent_active_color), image(rgba(0, 0, 0, 0.0924)));
-    border-color: if($checked, $accent_active_color, rgba(0, 0, 0, 0.2169));
+    background-image: if($checked, image($accent_active_color), image($control_active_color));
+    border-color: if($checked, $accent_active_color, $accent_color);
     box-shadow: none;
   }
 
   @if $t==insensitive or $t==backdrop-insensitive {
     box-shadow: none;
-    background-image: if($checked, image(rgba(0, 0, 0, 0.2169)), none);
-    border-color: if($checked, transparent, rgba(0, 0, 0, 0.2169));
+    background-image: if($checked, image($alt_borders_color), image($control_disabled_color));
+    border-color: if($checked, $alt_borders_color, $alt_borders_color);
     color: if($checked, white, $insensitive_fg_color);
   }
+}
+
+// The theme's own glyphs (build.py draws them into ../gtk-3.0/assets):
+// chevrons, the menu check, dash and bullet.  They are symbolic images,
+// recoloured to the text colour wherever they are shown.
+//
+// Not wrapped in -gtk-scaled(): GTK 3 hands the doubled image out of a
+// -gtk-scaled() list without computing it, and an uncomputed -gtk-recolor()
+// draws its image as it is, black.  On a doubled screen the 16-pixel glyph
+// is drawn at twice its size instead.
+@function glyph($name) {
+  @return unquote('-gtk-recolor(url("assets/#{$name}.symbolic.png"))');
+}
+
+// A glyph drawn at its own size in the middle of a node, as a background
+// image.  As an icon (-gtk-icon-source) an image is stretched to the node's
+// box, and the arrow of a combo box or an expander is as tall as the text
+// beside it, not sixteen pixels -- a stretched chevron turns soft and tall.
+@mixin glyph-centered($name, $size: 16px) {
+  -gtk-icon-source: none;
+  background-image: glyph($name);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: $size $size;
 }

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: camera-photo, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="16" x2="0" y2="53.333"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="22.56" x2="0" y2="49.44"><stop offset="0" stop-color="#e3e8ef"/><stop offset="1" stop-color="#8d97a8"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="18.56" y1="49.44" x2="45.44" y2="22.56"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M16 8H26.667A2.667 2.667 0 0 1 29.333 10.667V16A2.667 2.667 0 0 1 26.667 18.667H16A2.667 2.667 0 0 1 13.333 16V10.667A2.667 2.667 0 0 1 16 8Z" fill="#3a4357"/>
+<path d="M10.667 16H53.333A5.333 5.333 0 0 1 58.667 21.333V48A5.333 5.333 0 0 1 53.333 53.333H10.667A5.333 5.333 0 0 1 5.333 48V21.333A5.333 5.333 0 0 1 10.667 16Z" fill="url(#g1)"/>
+<path d="M18.56 36A13.44 13.44 0 1 0 45.44 36A13.44 13.44 0 1 0 18.56 36Z" fill="url(#g2)"/>
+<path d="M21.517 36A10.483 10.483 0 1 0 42.483 36A10.483 10.483 0 1 0 21.517 36Z" fill="#161c2a"/>
+<path d="M24.205 36A7.795 7.795 0 1 0 39.795 36A7.795 7.795 0 1 0 24.205 36Z" fill="url(#g3)"/>
+<path d="M26.893 33.043A2.15 2.15 0 1 0 31.194 33.043A2.15 2.15 0 1 0 26.893 33.043Z" fill="#ffffff" opacity="0.85"/>
+<path d="M45.333 24H50.667V28H45.333Z" fill="#ffd166"/>
+</g>
+</svg>

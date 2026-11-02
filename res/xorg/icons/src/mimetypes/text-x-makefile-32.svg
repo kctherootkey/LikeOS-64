@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: text-x-makefile, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f2f5fa"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="38" y1="18" x2="46.4" y2="9.6"><stop offset="0" stop-color="#f4f6fa"/><stop offset="1" stop-color="#d9dfe9"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="36" x2="0" y2="54"><stop offset="0" stop-color="#8a64db"/><stop offset="1" stop-color="#7049c5"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H38L52 18V56A4 4 0 0 1 48 60H16A4 4 0 0 1 12 56V8A4 4 0 0 1 16 4Z" fill="#b9c1ce"/>
+<path d="M16 6H37.2L50 18.8V56A2 2 0 0 1 48 58H16A2 2 0 0 1 14 56V8A2 2 0 0 1 16 6Z" fill="url(#g1)"/>
+<path d="M38 4V16Q38 18 40 18H52Z" fill="#b9c1ce"/>
+<path d="M40 8.8V14Q40 16 42 16H47.2Z" fill="url(#g2)"/>
+<path d="M17 36H47A3 3 0 0 1 50 39V51A3 3 0 0 1 47 54H17A3 3 0 0 1 14 51V39A3 3 0 0 1 17 36Z" fill="url(#g3)"/>
+<path d="M38.297 23.62L40.182 25.482L39.54 27.03L36.891 27.014L36.014 27.891L36.03 30.54L34.482 31.182L32.62 29.297L31.38 29.297L29.518 31.182L27.97 30.54L27.986 27.891L27.109 27.014L24.46 27.03L23.818 25.482L25.703 23.62L25.703 22.38L23.818 20.518L24.46 18.97L27.109 18.986L27.986 18.109L27.97 15.46L29.518 14.818L31.38 16.703L32.62 16.703L34.482 14.818L36.03 15.46L36.014 18.109L36.891 18.986L39.54 18.97L40.182 20.518L38.297 22.38ZM29.093 23A2.907 2.907 0 1 0 34.907 23A2.907 2.907 0 1 0 29.093 23Z" fill="#7a4fd6" stroke="#7a4fd6" stroke-width="0.684" stroke-linecap="round" stroke-linejoin="round" fill-rule="evenodd"/>
+</g>
+</svg>

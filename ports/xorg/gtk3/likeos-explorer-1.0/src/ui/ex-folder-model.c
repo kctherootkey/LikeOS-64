@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the items of one folder, as GTK sees them.
+// LikeOS Explorer: the items of one folder, as GTK sees them.
 //
 // The shown rows are a GSequence kept in sort order; a GtkTreeIter carries
 // the GSequenceIter, which stays valid as rows come and go around it, so the
@@ -7,6 +7,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include "ui/ex-folder-model.h"
+#include "ui/ex-icons.h"
 
 #include <string.h>
 
@@ -110,8 +111,8 @@ static int compare(gconstpointer pa, gconstpointer pb, gpointer data)
 			    (gint64)ex_file_get_size(b));
 		break;
 	case EX_SORT_TYPE: {
-		char *ka = ex_file_get_kind_label(a);
-		char *kb = ex_file_get_kind_label(b);
+		char *ka = ex_icons_kind_label(a);
+		char *kb = ex_icons_kind_label(b);
 
 		r = g_utf8_collate(ka, kb);
 		g_free(ka);

@@ -1,0 +1,1550 @@
+Rounded corners, snapping and windows that draw their own title bar.
+
+The rest of the LikeOS window frame for ModernTitles (0003), and what an
+application needs to draw its own title row (LikeOS Explorer puts its tabs
+there).
+
+1. Rounded corners.  A window's frame is shaped (X Shape extension) to a
+   rectangle with 10-pixel corners while it is not maximised, snapped or
+   fullscreen.  The one-pixel border is the frame's X border on the straight
+   edges; along the curves it is drawn by four small child windows of the
+   frame, stacked over the title bar and the application, shaped to exactly
+   the pixels of the curve and with an empty input shape, so clicks go
+   through them.  Against the title bar the curve is anti-aliased (the
+   caption buttons are inset, so the curve always meets the title bar's own
+   colour); against the application's own pixels it is a crisp line.
+   It takes the border colour of the focus state, like the straight edges.
+   The cut-off corner pixels show the invisible resize border beneath the
+   frame, and a press there resizes from that corner.
+
+2. Maximised windows show no edge.  fullzoom() places a maximised frame with
+   its border just outside the work area and the shape takes the border
+   away, so the caption and the contents reach the screen's edges.
+
+3. Caption buttons act on release.  Minimise, maximise and close show a
+   pressed state (a deeper wash, close a darker red) while held and act when
+   the button is let go over them; moving off first cancels, and so does
+   pressing a second mouse button.  The function then runs as from a menu
+   entry, with no button held any more -- f.delete and f.destroy otherwise
+   wait for the release of the button they think is still down.
+
+4. Snapping.  A window dragged by its caption (or by _NET_WM_MOVERESIZE, or
+   with Alt) to the top edge of a monitor is maximised when it is put down;
+   to the left or right edge it fills that half of the monitor's work area,
+   and counts as zoomed (F_LEFTZOOM / F_RIGHTZOOM, _NET_WM_STATE_MAXIMIZED_VERT)
+   with square corners and the maximise glyph.  While the pointer is at such
+   an edge a thin rounded outline in the highlight blue (2 pixels, radius
+   12, 8 pixels inside the area) shows where the window will go.
+   Dragging a maximised or snapped window restores it to its normal size
+   under the pointer, which keeps its place along the caption in proportion,
+   and the drag goes on; restoring later puts it back where it was before it
+   was snapped.  A window that may not be maximised, a dock, the desktop and
+   ctwm's own windows do not snap.  The size and position box is not shown
+   during moves and resizes with ModernTitles: the window itself shows both.
+
+5. Applications that draw their own title row.  One that asks for a
+   border only through _MOTIF_WM_HINTS gets the border, the rounded corners
+   and the resize band, and drives the rest itself:
+   - _NET_WM_MOVERESIZE with a SIZE_* direction now resizes that edge or
+     corner right away, as a drag on the window's edge does (ctwm waited for
+     the pointer to cross a border first);
+   - a move or resize starts from the press position in the message rather
+     than where the pointer is when it arrives, so a move started after the
+     drag threshold does not leave the window trailing the pointer;
+   - _NET_WM_STATE_FOCUSED is set on the window that has the focus and
+     advertised in _NET_SUPPORTED.  Without it GDK takes every window to be
+     focused, so GTK never drew a window in its backdrop state and a
+     client-drawn title bar could not show itself inactive.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -Nur a/ctwm.h b/ctwm.h
+--- a/ctwm.h
++++ b/ctwm.h
+@@ -171,6 +171,7 @@ struct TBWindow {
+ 	Image *image;                       /* image to display in button */
+ 	TitleButton *info;                  /* description of this window */
+ 	bool hover;                         /* pointer is over it (ModernTitles) */
++	bool pressed;                       /* held down, not yet let go (ditto) */
+ };
+ 
+ 
+diff -Nur a/event_handlers.c b/event_handlers.c
+--- a/event_handlers.c
++++ b/event_handlers.c
+@@ -2277,6 +2277,11 @@ void HandleButtonRelease(void)
+ 		}
+ 	}
+ 
++	/* ModernTitles: a caption button held down is let go -- and acts, when
++	 * the pointer is still over it.  The rest of the release (letting go
++	 * of the pointer) is the same as for any other click. */
++	ModernCaptionRelease(&Event);
++
+ 	if(DragWindow != None) {
+ 		MoveOutline(Scr->XineramaRoot, 0, 0, 0, 0, 0, 0);
+ 
+@@ -2723,6 +2728,12 @@ void HandleButtonPress(void)
+ 				for(tbf = tbw->info->funs; tbf; tbf = tbf->next) {
+ 					if(tbf->num == ButtonPressed
+ 					                && tbf->mods == modifier) {
++						/* ModernTitles: minimise, maximise and close act
++						 * on release, over the button (win_modern.h). */
++						if(ModernCaptionPress(Tmp_win, tbw, tbf->func,
++						                      tbf->action)) {
++							return;
++						}
+ 						switch(tbf->func) {
+ 							/*
+ 							 * Opening up a menu doesn't use the f.menu
+diff -Nur a/ewmh.c b/ewmh.c
+--- a/ewmh.c
++++ b/ewmh.c
+@@ -84,6 +84,9 @@ static void EwmhClientMessage_NET_WM_DESKTOP(XClientMessageEvent *msg);
+ static void EwmhClientMessage_NET_WM_STATE(XClientMessageEvent *msg);
+ static void EwmhClientMessage_NET_ACTIVE_WINDOW(XClientMessageEvent *msg);
+ static void EwmhClientMessage_NET_WM_MOVERESIZE(XClientMessageEvent *msg);
++static Atom net_wm_state_focused(void);
++static void moveresize_from_press(XEvent *xevent, TwmWindow *twm_win,
++                                  XClientMessageEvent *msg);
+ static void EwmhClientMessage_NET_CLOSE_WINDOW(XClientMessageEvent *msg);
+ static XEvent synth_btnevent_for_moveresize(TwmWindow *twm_win);
+ static unsigned long EwmhGetWindowProperty(Window w, Atom name, Atom type);
+@@ -449,6 +452,10 @@ void EwmhInitScreenLate(ScreenInfo *scr)
+ 	supported[i++] = XA__NET_WM_STATE_ABOVE;
+ 	supported[i++] = XA__NET_WM_STATE_BELOW;
+ 	supported[i++] = XA__NET_CLOSE_WINDOW;
++	/* ModernTitles: the window with the focus says so (EwmhSetFocused()). */
++	if(scr->ModernTitles) {
++		supported[i++] = net_wm_state_focused();
++	}
+ 
+ 	XChangeProperty(dpy, scr->XineramaRoot,
+ 	                XA__NET_SUPPORTED, XA_ATOM,
+@@ -1299,6 +1306,10 @@ static void EwmhClientMessage_NET_WM_MOVERESIZE(XClientMessageEvent *msg)
+ 			/* Fake up as if we triggered f.resize on it */
+ 			XEvent xevent = synth_btnevent_for_moveresize(twm_win);
+ 
++			if(msg->data.l[2] != _NET_WM_MOVERESIZE_SIZE_KEYBOARD) {
++				moveresize_from_press(&xevent, twm_win, msg);
++			}
++
+ 			/*
+ 			 * The resize won't actually start until we cross the cursor
+ 			 * over a border.  Perhaps we should find the nearest corner,
+@@ -1306,9 +1317,34 @@ static void EwmhClientMessage_NET_WM_MOVERESIZE(XClientMessageEvent *msg)
+ 			 * for the user, since it might not be as predictable, and
+ 			 * having the cursor zoom off without warning is probably a
+ 			 * little surprising...
++			 *
++			 * With ModernTitles the resize moves the edge or corner the
++			 * application named, right away, as a drag on the window's
++			 * own edge does: an application that draws its own title bar
++			 * (or a resize grip) starts its resizes this way.
+ 			 */
++			if(Scr->ModernTitles) {
++				static const int edges[] = {
++					[_NET_WM_MOVERESIZE_SIZE_TOPLEFT] =
++					MODERN_EDGE_TOP | MODERN_EDGE_LEFT,
++					[_NET_WM_MOVERESIZE_SIZE_TOP] = MODERN_EDGE_TOP,
++					[_NET_WM_MOVERESIZE_SIZE_TOPRIGHT] =
++					MODERN_EDGE_TOP | MODERN_EDGE_RIGHT,
++					[_NET_WM_MOVERESIZE_SIZE_RIGHT] = MODERN_EDGE_RIGHT,
++					[_NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT] =
++					MODERN_EDGE_BOTTOM | MODERN_EDGE_RIGHT,
++					[_NET_WM_MOVERESIZE_SIZE_BOTTOM] = MODERN_EDGE_BOTTOM,
++					[_NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT] =
++					MODERN_EDGE_BOTTOM | MODERN_EDGE_LEFT,
++					[_NET_WM_MOVERESIZE_SIZE_LEFT] = MODERN_EDGE_LEFT,
++					[_NET_WM_MOVERESIZE_SIZE_KEYBOARD] = 0,
++				};
++
++				ModernForcedEdges = edges[msg->data.l[2]];
++			}
+ 			ExecuteFunction(F_RESIZE, "", twm_win->frame, twm_win,
+ 			                &xevent, C_WINDOW, false);
++			ModernForcedEdges = 0;
+ 
+ 			/*
+ 			 * It's not guaranteed that this actually began as a button
+@@ -1326,6 +1362,10 @@ static void EwmhClientMessage_NET_WM_MOVERESIZE(XClientMessageEvent *msg)
+ 		case _NET_WM_MOVERESIZE_MOVE_KEYBOARD: {
+ 			/* Fake up as if we triggered f.move on it */
+ 			XEvent xevent = synth_btnevent_for_moveresize(twm_win);
++
++			if(msg->data.l[2] == _NET_WM_MOVERESIZE_MOVE) {
++				moveresize_from_press(&xevent, twm_win, msg);
++			}
+ 			ExecuteFunction(F_MOVE, "", twm_win->frame, twm_win,
+ 			                &xevent, C_WINDOW, false);
+ 
+@@ -1345,6 +1385,52 @@ static void EwmhClientMessage_NET_WM_MOVERESIZE(XClientMessageEvent *msg)
+ 	}
+ }
+ 
++/* The _NET_WM_STATE_FOCUSED atom, interned the first time it is needed:
++ * ctwm's own list of atoms is generated at build time, and this one is only
++ * used with ModernTitles. */
++static Atom
++net_wm_state_focused(void)
++{
++	static Atom atom = None;
++
++	if(atom == None) {
++		atom = XInternAtom(dpy, "_NET_WM_STATE_FOCUSED", False);
++	}
++	return atom;
++}
++
++/*
++ * ModernTitles: a move or resize an application asks for starts from where
++ * the button was pressed -- the message's x_root and y_root -- not from where
++ * the pointer is when the message arrives.  An application that draws its own
++ * title bar starts the move only once the pointer has gone past the drag
++ * threshold, as it must for a double click on that title bar to reach it; by
++ * then the pointer is a few pixels on, and the window would trail it by that
++ * much for the whole drag.  A position far from the pointer is stale and
++ * left alone.
++ */
++static void
++moveresize_from_press(XEvent *xevent, TwmWindow *twm_win,
++                      XClientMessageEvent *msg)
++{
++	int px = (int)msg->data.l[0], py = (int)msg->data.l[1];
++	int x, y;
++	Window junk;
++
++	if(!Scr->ModernTitles ||
++	                abs(px - xevent->xbutton.x_root) > 64 ||
++	                abs(py - xevent->xbutton.y_root) > 64) {
++		return;
++	}
++	if(XTranslateCoordinates(dpy, Scr->Root, twm_win->frame, px, py, &x, &y,
++	                         &junk)) {
++		xevent->xbutton.x_root = px;
++		xevent->xbutton.y_root = py;
++		xevent->xbutton.x = x;
++		xevent->xbutton.y = y;
++	}
++}
++
+ static XEvent
+ synth_btnevent_for_moveresize(TwmWindow *twm_win)
+ {
+@@ -2278,11 +2364,39 @@ void EwmhSet_NET_WM_STATE(TwmWindow *twm_win, int changes)
+ 	if(flags & EWMH_STATE_BELOW) {
+ 		prop[i++] = XA__NET_WM_STATE_BELOW;
+ 	}
++	if(flags & EWMH_STATE_FOCUSED) {
++		prop[i++] = net_wm_state_focused();
++	}
+ 
+ 	XChangeProperty(dpy, twm_win->w, XA__NET_WM_STATE, XA_ATOM, 32,
+ 	                PropModeReplace, (unsigned char *)prop, i);
+ }
+ 
++/*
++ * _NET_WM_STATE_FOCUSED (ModernTitles): the window that has the focus has it
++ * in its _NET_WM_STATE, and no other window does.
++ *
++ * Without it a GTK application never learns that one of its windows lost the
++ * focus -- GDK then takes every window to be the focused one -- so none is
++ * ever drawn in the theme's "backdrop" state, and an application that draws
++ * its own title bar cannot show it inactive the way ctwm shows its own.
++ */
++void
++EwmhSetFocused(TwmWindow *twm_win, bool focus)
++{
++	if(!twm_win || !Scr->ModernTitles ||
++	                !!(twm_win->ewmhFlags & EWMH_STATE_FOCUSED) == focus) {
++		return;
++	}
++	if(focus) {
++		twm_win->ewmhFlags |= EWMH_STATE_FOCUSED;
++	}
++	else {
++		twm_win->ewmhFlags &= ~EWMH_STATE_FOCUSED;
++	}
++	EwmhSet_NET_WM_STATE(twm_win, EWMH_STATE_FOCUSED);
++}
++
+ /*
+  * Get the initial state of _NET_WM_STATE.
+  *
+diff -Nur a/ewmh.h b/ewmh.h
+--- a/ewmh.h
++++ b/ewmh.h
+@@ -40,6 +40,7 @@ typedef struct EwmhStrut {
+ #define EWMH_STATE_SHADED               0x0080  /* for _NET_WM_STATE */
+ #define EWMH_STATE_ABOVE                0x0100  /* for _NET_WM_STATE */
+ #define EWMH_STATE_BELOW                0x0200  /* for _NET_WM_STATE */
++#define EWMH_STATE_FOCUSED              0x0400  /* for _NET_WM_STATE */
+ #define EWMH_STATE_ALL                  0xFFF0
+ 
+ /*
+@@ -82,5 +83,6 @@ bool EwmhOnWindowRing(TwmWindow *twm_win);
+ void EwmhSet_NET_FRAME_EXTENTS(TwmWindow *twm_win);
+ void EwmhSet_NET_SHOWING_DESKTOP(int state);
+ void EwmhSet_NET_WM_STATE(TwmWindow *twm_win, int changes);
++void EwmhSetFocused(TwmWindow *twm_win, bool focus);
+ 
+ #endif /* _CTWM_EWMH_H */
+diff -Nur a/functions_win_moveresize.c b/functions_win_moveresize.c
+--- a/functions_win_moveresize.c
++++ b/functions_win_moveresize.c
+@@ -22,6 +22,7 @@
+ #include "util.h"
+ #include "vscreen.h"
+ #include "win_decorations.h"
++#include "win_modern.h"
+ #include "win_ops.h"
+ #include "win_resize.h"
+ #include "win_utils.h"
+@@ -118,6 +119,7 @@ movewindow(EF_FULLPROTO)
+ 	int origX, origY;
+ 	bool moving_icon;
+ 	bool fromtitlebar;
++	bool unzoom_checked = false;
+ 	const Window dragroot = Scr->XineramaRoot;
+ 	const Window rootw = eventp->xbutton.root;
+ 
+@@ -219,7 +221,11 @@ movewindow(EF_FULLPROTO)
+ 	MoveResizeSizeWindow(eventp->xbutton.x_root, eventp->xbutton.y_root,
+ 	                     Scr->SizeStringWidth + SIZE_HINDENT * 2,
+ 	                     Scr->SizeFont.height + SIZE_VINDENT * 2);
+-	XMapRaised(dpy, Scr->SizeWindow);
++	/* (Not with ModernTitles: the window itself shows where it is while
++	 * it is dragged.) */
++	if(!Scr->ModernTitles) {
++		XMapRaised(dpy, Scr->SizeWindow);
++	}
+ 
+ 	/*
+ 	 * Use XGrabPointer() to configure how we get events locations
+@@ -266,6 +272,12 @@ movewindow(EF_FULLPROTO)
+ 
+ 	DragWindow = None;
+ 
++	/* ModernTitles: snapping to the screen's edges, and a maximised window
++	 * restored by dragging it (win_modern.h). */
++	if(Scr->ModernTitles && !moving_icon && w == tmp_win->frame) {
++		ModernMoveBegin(tmp_win);
++	}
++
+ 	/* Get x/y relative to parent window, i.e. the virtual screen, Root.
+ 	 * XMoveWindow() moves are relative to this.
+ 	 * MoveOutline()s however are drawn from the XineramaRoot since they
+@@ -419,6 +431,7 @@ movewindow(EF_FULLPROTO)
+ 				             GrabModeAsync, GrabModeAsync,
+ 				             Scr->Root, cur, CurrentTime);
+ 				func_reset_cursor = false;  // Leave cursor alone
++				ModernMoveEnd(tmp_win, true);
+ 				return;
+ 			}
+ 		}
+@@ -443,6 +456,7 @@ movewindow(EF_FULLPROTO)
+ 				UninstallRootColormap();
+ 			}
+ 			func_reset_cursor = false;  // Leave cursor alone
++			ModernMoveEnd(tmp_win, true);
+ 			return;
+ 		}
+ 		if(Event.type == releaseEvent) {
+@@ -508,6 +522,22 @@ movewindow(EF_FULLPROTO)
+ 		 */
+ 		DragWindow = w;
+ 
++		/*
++		 * ModernTitles: a maximised or snapped window comes back to its
++		 * normal size under the pointer when it is dragged, and the drag
++		 * goes on with that.
++		 */
++		if(!unzoom_checked) {
++			unzoom_checked = true;
++			if(Scr->ModernTitles && !moving_icon && w == tmp_win->frame &&
++			                ModernMoveUnzoom(tmp_win, eventp->xmotion.x_root,
++			                                 eventp->xmotion.y_root, &DragX,
++			                                 &DragY)) {
++				XGetGeometry(dpy, w, &JunkRoot, &origDragX, &origDragY,
++				             &DragWidth, &DragHeight, &DragBW, &JunkDepth);
++			}
++		}
++
+ 		/* Raise when the move starts if we should */
+ 		if(!Scr->NoRaiseMove && Scr->OpaqueMove && !WindowMoved) {
+ 			TwmWindow *t;
+@@ -705,11 +735,21 @@ movewindow(EF_FULLPROTO)
+ 
+ 		/* We've moved a step, so update the displayed position */
+ 		DisplayPosition(tmp_win, CurrentDragX, CurrentDragY);
++
++		/* ModernTitles: the pointer at a screen edge shows where the
++		 * window would snap to. */
++		if(!moving_icon) {
++			ModernMoveMotion(tmp_win, eventp->xmotion.x_root,
++			                 eventp->xmotion.y_root);
++		}
+ 	}
+ 
+ 	/* Done, so hide away the position display window */
+ 	XUnmapWindow(dpy, Scr->SizeWindow);
+ 
++	/* ModernTitles: put down at a screen edge, the window snaps there. */
++	ModernMoveEnd(tmp_win, false);
++
+ 	/* Restore colormap if we replaced it */
+ 	if(!Scr->OpaqueMove && DragWindow == None) {
+ 		UninstallRootColormap();
+diff -Nur a/twm_window_struct.h b/twm_window_struct.h
+--- a/twm_window_struct.h
++++ b/twm_window_struct.h
+@@ -242,6 +242,16 @@ struct TwmWindow {
+ 	int modern_grip_edges;      ///< edges under the pointer, for its cursor
+ 	bool modern_frame_mapped;
+ 	bool modern_grip_mapped;
++	/// Rounded corners (ModernTitles): whether the frame is shaped to
++	/// them, the frame size and border width the shape was made for, the
++	/// four small windows that draw the border along the curves, and the
++	/// colours they were last painted in.  See win_modern.c.
++	bool modern_rounded;
++	bool modern_clipped;        ///< maximised: the border shaped away
++	unsigned int modern_shape_w, modern_shape_h, modern_shape_bw;
++	Window modern_corner[4];
++	unsigned long modern_corner_line;
++	unsigned int modern_corner_fill;    ///< inside the top corners, RGB
+ 	SqueezeInfo *squeeze_info;  ///< Control info for title squeezing
+ 	bool squeeze_info_copied;   ///< Should ->squeeze_info be free()'d?
+ 
+diff -Nur a/win_decorations.c b/win_decorations.c
+--- a/win_decorations.c
++++ b/win_decorations.c
+@@ -447,6 +447,11 @@ SetupFrame(TwmWindow *tmp_win, int x, int y, int w, int h, int bw,
+ 		SetFrameShape(tmp_win);
+ 	}
+ 
++	/* ModernTitles: rounded corners, square while zoomed. */
++	if(Scr->ModernTitles) {
++		ModernFrameShape(tmp_win);
++	}
++
+ 	/* Possible change how it looks in the WorkspaceManager */
+ 	WMapSetupWindow(tmp_win, x, y, w, h);
+ 
+diff -Nur a/win_modern.c b/win_modern.c
+--- a/win_modern.c
++++ b/win_modern.c
+@@ -15,8 +15,10 @@
+  * caption button under the pointer gets a faint blue-grey wash, the close
+  * button a coral red (#e0443e) with a white glyph.
+  *
+- * The resize border at the end of this file is the other half of the frame:
+- * the band outside the visible edge that resizes the window.
++ * The rounded corners and the resize border further down are the rest of
++ * the frame: the 10-pixel curves, and the band outside the visible edge that
++ * resizes the window.  Snapping, at the end, places a window dragged against
++ * an edge of the screen.
+  *
+  * Copyright (C) 2026 The LikeOS Project
+  */
+@@ -34,13 +36,20 @@
+ #include <X11/Xatom.h>
+ #include <X11/Xutil.h>
+ #include <X11/Xft/Xft.h>
++#include <X11/extensions/shape.h>
+ 
+ #include "ctwm_atoms.h"
++#include "events.h"
++#include "functions.h"
+ #include "functions_defs.h"
+ #include "mwmhints.h"
++#include "otp.h"
++#include "r_area.h"
++#include "r_layout.h"
+ #include "screen.h"
+ #include "win_decorations.h"
+ #include "win_modern.h"
++#include "win_resize.h"
+ 
+ #define MD_ACTIVE_BG     0xeef2f9
+ #define MD_INACTIVE_BG   0xf5f7fb
+@@ -49,7 +58,9 @@
+ #define MD_DISABLED_FG   0xa3abb9  /* a caption button that does nothing */
+ #define MD_HOVER_TINT    0x1c3a78  /* the wash under the pointer ... */
+ #define MD_HOVER_ALPHA   0.06      /* ... and how much of it */
++#define MD_PRESS_ALPHA   0.10      /* ... and while held down */
+ #define MD_CLOSE_BG      0xe0443e
++#define MD_CLOSE_PRESS   0xc7352f
+ #define MD_CLOSE_FG      0xffffff
+ 
+ #define MD_GLYPH         10   /* caption glyph box, pixels */
+@@ -69,6 +80,8 @@ struct modern_icon {
+ 	unsigned int px[MD_ICON * MD_ICON];
+ };
+ 
++static void md_corners_paint(TwmWindow *t);
++
+ /* ------------------------------------------------------------------------ */
+ /* Colour helpers                                                           */
+ /* ------------------------------------------------------------------------ */
+@@ -446,7 +459,10 @@ ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
+ 	ModernButtonState state = md_button_state(tmp_win, kind);
+ 
+ 	focus = tmp_win->hasfocusvisible;
+-	restore = (tmp_win->zoomed != ZOOM_NONE);
++	bool pressed = tbw->pressed && tbw->hover;
++	/* A window snapped to half the screen is not maximised: it shows the
++	 * maximise glyph, and the button maximises it. */
++	restore = (tmp_win->zoomed != ZOOM_NONE && !ModernIsSnapped(tmp_win));
+ 	bg = focus ? MD_ACTIVE_BG : MD_INACTIVE_BG;
+ 	fg = focus ? MD_ACTIVE_FG : MD_INACTIVE_FG;
+ 	/* Greyed, and no highlight under the pointer: it does nothing. */
+@@ -454,16 +470,17 @@ ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
+ 		fg = MD_DISABLED_FG;
+ 	}
+ 	/* At rest the button is the title bar's own colour; under the pointer
+-	 * its rounded rectangle is filled. */
++	 * its rounded rectangle is filled, a shade deeper while it is held. */
+ 	lit = tbw->hover && state == MD_BTN_ENABLED;
+ 	fill = bg;
+ 	if(lit) {
+ 		if(kind == MD_CLOSE) {
+-			fill = MD_CLOSE_BG;
++			fill = pressed ? MD_CLOSE_PRESS : MD_CLOSE_BG;
+ 			fg = MD_CLOSE_FG;
+ 		}
+ 		else {
+-			fill = md_blend(bg, MD_HOVER_TINT, MD_HOVER_ALPHA);
++			fill = md_blend(bg, MD_HOVER_TINT, pressed ? MD_PRESS_ALPHA :
++			                MD_HOVER_ALPHA);
+ 			fg = MD_ACTIVE_FG;
+ 		}
+ 	}
+@@ -505,6 +522,70 @@ ModernPaintTitleButton(TwmWindow *tmp_win, TBWindow *tbw)
+ 	return true;
+ }
+ 
++/* The caption button held down, the window it is on, what it runs and the
++ * mouse button holding it. */
++static struct {
++	TwmWindow *win;
++	TBWindow *tbw;
++	int func;
++	char *action;
++	unsigned int button;
++} md_press;
++
++bool
++ModernCaptionPress(TwmWindow *tmp_win, TBWindow *tbw, int func, char *action)
++{
++	if(!md_usable() || !tmp_win || !tbw || func == F_MENU ||
++	                md_kind(tbw->info) == MD_NONE) {
++		return false;
++	}
++	md_press.win = tmp_win;
++	md_press.tbw = tbw;
++	md_press.func = func;
++	md_press.action = action;
++	md_press.button = Event.xbutton.button;
++	tbw->pressed = true;
++	tbw->hover = true;
++	ModernPaintTitleButton(tmp_win, tbw);
++	return true;
++}
++
++bool
++ModernCaptionRelease(XEvent *ev)
++{
++	TwmWindow *t = md_press.win;
++	TBWindow *tbw = md_press.tbw;
++	bool over;
++
++	/* Only letting go of the mouse button that pressed it releases it;
++	 * pressing a second one in between cancels, as for any other click. */
++	if(!t || ev->type != ButtonRelease ||
++	                ev->xbutton.button != md_press.button) {
++		return false;
++	}
++	md_press.win = NULL;
++	/* The press grabbed the pointer for the button, so the release is
++	 * reported to it, in its coordinates, wherever the pointer is. */
++	over = ev->xbutton.window == tbw->window &&
++	       ev->xbutton.x >= 0 && ev->xbutton.x < Scr->TBInfo.width &&
++	       ev->xbutton.y >= 0 && ev->xbutton.y < Scr->TitleHeight;
++	tbw->pressed = false;
++	tbw->hover = over;
++	ModernPaintTitleButton(t, tbw);
++	if(over && !ModernButtonInert(t, tbw)) {
++		/* The function runs with the button already up, as from a menu
++		 * entry.  Left set, f.delete, f.destroy and f.deleteordestroy
++		 * would wait for the release of a button still held -- that is
++		 * this one, already taken, so ctwm would sit there, the busy
++		 * pointer up and the closed window's frame on screen, until the
++		 * next click anywhere. */
++		ButtonPressed = -1;
++		ExecuteFunction(md_press.func, md_press.action, tbw->window, t, ev,
++		                C_TITLE, false);
++	}
++	return true;
++}
++
+ bool
+ ModernButtonCrossing(TwmWindow *tmp_win, Window w, bool entered)
+ {
+@@ -707,6 +788,14 @@ ModernForgetWindow(TwmWindow *tmp_win)
+ 	tmp_win->modern_icon = NULL;
+ 	tmp_win->modern_icon_tried = false;
+ 	md_grip_destroy(tmp_win);
++	if(md_press.win == tmp_win) {
++		md_press.win = NULL;
++	}
++	/* The corner windows are the frame's children and go with it. */
++	for(int c = 0; c < 4; c++) {
++		tmp_win->modern_corner[c] = None;
++	}
++	tmp_win->modern_rounded = false;
+ }
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -862,7 +951,13 @@ void
+ ModernFocusChanged(TwmWindow *tmp_win, bool focus)
+ {
+ 	(void)focus;
+-	if(!md_usable() || !tmp_win || !tmp_win->title_w) {
++	if(!md_usable() || !tmp_win) {
++		return;
++	}
++	/* The border along the rounded corners takes the border's colour for
++	 * the new state -- a window without a title bar has them too. */
++	md_corners_paint(tmp_win);
++	if(!tmp_win->title_w) {
+ 		return;
+ 	}
+ 	ModernPaintTitle(tmp_win);
+@@ -872,6 +967,355 @@ ModernFocusChanged(TwmWindow *tmp_win, bool focus)
+ 	}
+ }
+ 
++/* ------------------------------------------------------------------------ */
++/* Rounded corners                                                          */
++/* ------------------------------------------------------------------------ */
++
++/*
++ * A window has corners rounded to a 10-pixel radius, except while it is
++ * maximised, snapped to half the screen or fullscreen, where it meets the
++ * screen's edges square.
++ *
++ * Without a compositor the outside of the curve can only be cut away: the
++ * frame's bounding shape (X Shape extension) is the rounded rectangle, and
++ * what is behind the window shows through the cut-off pixels -- among them
++ * the invisible resize border, which lies right under the frame, so the
++ * corner resizes as before.  The frame's shape clips everything in it, the
++ * title bar and the application's own window alike.
++ *
++ * The one-pixel border is the frame's X border, which the server draws on
++ * the straight edges.  Along the curves it has to be drawn: the pixels there
++ * lie inside the frame, under the title bar or the application.  Each corner
++ * gets a small child window of the frame, stacked above both, whose shape is
++ * exactly the pixels of the curve and whose background is a pixmap of them
++ * in the border colour, so that the server paints them by itself.  Its input
++ * shape is empty, so the pointer goes through it to whatever lies
++ * underneath.  Where the colour inside the curve is known -- the title bar's,
++ * for the top corners of a window that has one -- the curve is anti-aliased
++ * against it; elsewhere (the application's corners) it is a crisp one-pixel
++ * line.
++ */
++#define MD_RADIUS        10
++
++/* Pixels cut off at the start of row `j' of a corner of radius `r' (row 0
++ * is the outermost row): those whose centres lie outside the circle of
++ * radius `r' around the corner's centre. */
++static int
++md_inset(int r, int j)
++{
++	double dy, dx;
++	int i;
++
++	if(j < 0) {
++		return r;
++	}
++	if(j >= r) {
++		return 0;
++	}
++	dy = r - (j + 0.5);
++	dx = sqrt((double)r * r - dy * dy);
++	i = (int)ceil(r - dx - 0.5);
++	return i < 0 ? 0 : i;
++}
++
++static int
++md_corner_inset(int j)
++{
++	return md_inset(MD_RADIUS, j);
++}
++
++/* How much of pixel (i, j) of the top-left corner (outer frame coordinates)
++ * the curved border covers, 0..1: a one-pixel stroke whose outside follows
++ * the cut, so every pixel between the stroke and the cut is fully covered. */
++static double
++md_corner_alpha(int i, int j)
++{
++	double dx = MD_RADIUS - (i + 0.5), dy = MD_RADIUS - (j + 0.5);
++	double d, a;
++
++	if(dx <= 0 || dy <= 0 || i < md_corner_inset(j)) {
++		return 0;
++	}
++	d = sqrt(dx * dx + dy * dy);
++	if(d >= MD_RADIUS - 0.5) {
++		return 1;
++	}
++	a = 1 - ((MD_RADIUS - 0.5) - d);
++	return a > 0 ? a : 0;
++}
++
++/* Is pixel (i, j) of the top-left corner on the crisp curve: inside the
++ * shape, with the pixel to its left or the one above it cut off? */
++static bool
++md_corner_edge(int i, int j)
++{
++	int in = md_corner_inset(j);
++
++	return i >= in && i < MD_RADIUS && (i == in || i < md_corner_inset(j - 1));
++}
++
++/* Should the frame be rounded?  Not when it has no border to draw the curve
++ * with (docks, the desktop, NoBorder windows), not while the window is
++ * zoomed in any way, not for shaped or squeezed windows, whose frame shape
++ * ctwm makes itself, and not for ctwm's own windows. */
++static bool
++md_want_round(TwmWindow *t)
++{
++	if(!md_usable() || !HasShape || t->frame == None || t->frame_bw <= 0 ||
++	                t->frame_bw >= MD_RADIUS) {
++		return false;
++	}
++	if(t->wShaped || t->squeeze_info || t->squeezed) {
++		return false;
++	}
++	if(t->isiconmgr || t->iswspmgr || t->isoccupy) {
++		return false;
++	}
++	if(t->zoomed != ZOOM_NONE) {
++		return false;
++	}
++	return t->frame_width >= 2 * MD_RADIUS && t->frame_height >= 2 * MD_RADIUS;
++}
++
++/* Should the frame lose its border?  While the window is maximised: a
++ * maximised window shows no edge, its caption and contents fill the work
++ * area to the screen's edges.
++ * fullzoom() places such a frame with its border just outside the work area,
++ * and the shape takes the border away so that it does not show on a
++ * neighbouring monitor (or over a panel) either. */
++static bool
++md_want_clip(TwmWindow *t)
++{
++	return md_usable() && HasShape && t->frame != None && t->frame_bw > 0 &&
++	       !t->wShaped && !t->squeeze_info && !t->squeezed &&
++	       (t->zoomed == F_FULLZOOM || t->zoomed == F_XFULLZOOM);
++}
++
++/* Where corner `c' (0 top left, 1 top right, 2 bottom left, 3 bottom right)
++ * lies in the frame, and which pixel of the top-left corner its pixel (u, v)
++ * mirrors. */
++static void
++md_corner_place(TwmWindow *t, int c, int *x, int *y)
++{
++	int bw = t->frame_bw;
++
++	*x = (c & 1) ? (int)t->frame_width + bw - MD_RADIUS : 0;
++	*y = (c & 2) ? (int)t->frame_height + bw - MD_RADIUS : 0;
++}
++
++static void
++md_corner_mirror(TwmWindow *t, int c, int u, int v, int *i, int *j)
++{
++	int bw = t->frame_bw;
++
++	*i = (c & 1) ? MD_RADIUS - 1 - u : u + bw;
++	*j = (c & 2) ? MD_RADIUS - 1 - v : v + bw;
++}
++
++/* Paint the curves in the border colour for the window's focus state, and
++ * shape them; anti-aliased against the title bar for the top corners when
++ * there is one.  (The caption buttons are inset from the corner, so the
++ * curve always meets the title bar's own colour.)  Only when a colour
++ * changed, since the focus changes often and the pixels never move within
++ * their windows. */
++static void
++md_corners_paint(TwmWindow *t)
++{
++	bool focus;
++	unsigned long line;
++	unsigned int line_rgb, fill_rgb;
++	int s;
++
++	if(!t->modern_rounded || t->modern_corner[0] == None) {
++		return;
++	}
++	focus = t->hasfocusvisible || !t->highlight;
++	line = focus ? t->borderC.back : t->border_tile.back;
++	/* Inside the top corners: the title bar. */
++	fill_rgb = t->title_w ? (focus ? MD_ACTIVE_BG : MD_INACTIVE_BG) : 0;
++	if(line == t->modern_corner_line && fill_rgb == t->modern_corner_fill) {
++		return;
++	}
++	t->modern_corner_line = line;
++	t->modern_corner_fill = fill_rgb;
++	line_rgb = md_rgb(line);
++
++	s = MD_RADIUS - t->frame_bw;
++	for(int c = 0; c < 4; c++) {
++		bool smooth = t->title_w && !(c & 2);
++		XRectangle rects[MD_RADIUS * MD_RADIUS];
++		int n = 0;
++		XImage *img = md_image(s, s);
++		Pixmap pm;
++
++		if(!img) {
++			continue;
++		}
++		for(int v = 0; v < s; v++) {
++			for(int u = 0; u < s; u++) {
++				int i, j;
++				double a;
++
++				md_corner_mirror(t, c, u, v, &i, &j);
++				if(smooth) {
++					a = md_corner_alpha(i, j);
++				}
++				else {
++					a = md_corner_edge(i, j) ? 1 : 0;
++				}
++				XPutPixel(img, u, v,
++				          md_pixel(md_blend(fill_rgb, line_rgb, a)));
++				if(a > 0.02) {
++					rects[n].x = (short)u;
++					rects[n].y = (short)v;
++					rects[n].width = rects[n].height = 1;
++					n++;
++				}
++			}
++		}
++		pm = XCreatePixmap(dpy, t->modern_corner[c], (unsigned int)s,
++		                   (unsigned int)s, (unsigned int)Scr->d_depth);
++		XPutImage(dpy, pm, Scr->NormalGC, img, 0, 0, 0, 0, (unsigned int)s,
++		          (unsigned int)s);
++		XDestroyImage(img);
++		XSetWindowBackgroundPixmap(dpy, t->modern_corner[c], pm);
++		XFreePixmap(dpy, pm);
++		XShapeCombineRectangles(dpy, t->modern_corner[c], ShapeBounding, 0, 0,
++		                        rects, n, ShapeSet, Unsorted);
++		XClearWindow(dpy, t->modern_corner[c]);
++	}
++}
++
++void
++ModernFrameShape(TwmWindow *tmp_win)
++{
++	TwmWindow *t = tmp_win;
++	XRectangle rects[2 * MD_RADIUS + 1];
++	int n = 0, bw, W, H, s;
++
++	if(!t || t->frame == None) {
++		return;
++	}
++	if(!md_want_round(t)) {
++		bool clip = md_want_clip(t);
++
++		if(t->modern_rounded) {
++			for(int c = 0; c < 4; c++) {
++				if(t->modern_corner[c] != None) {
++					XUnmapWindow(dpy, t->modern_corner[c]);
++				}
++			}
++			t->modern_rounded = false;
++		}
++		if(clip) {
++			/* Maximised: the border is shaped away. */
++			XRectangle r = { 0, 0, (unsigned short)t->frame_width,
++			                 (unsigned short)t->frame_height
++			               };
++
++			XShapeCombineRectangles(dpy, t->frame, ShapeBounding, 0, 0, &r, 1,
++			                        ShapeSet, YXBanded);
++			t->modern_clipped = true;
++		}
++		else if(t->modern_clipped || t->modern_shape_w) {
++			/* Square again: give the frame back its plain shape, unless
++			 * ctwm shapes it itself. */
++			if(!t->wShaped && !t->squeeze_info) {
++				XShapeCombineMask(dpy, t->frame, ShapeBounding, 0, 0, None,
++				                  ShapeSet);
++			}
++			t->modern_clipped = false;
++			t->modern_shape_w = 0;
++		}
++		return;
++	}
++	t->modern_clipped = false;
++	if(t->modern_rounded && t->modern_shape_w == t->frame_width &&
++	                t->modern_shape_h == t->frame_height &&
++	                t->modern_shape_bw == (unsigned int)t->frame_bw) {
++		return;
++	}
++
++	bw = t->frame_bw;
++	W = (int)t->frame_width + 2 * bw;
++	H = (int)t->frame_height + 2 * bw;
++	/* One band per row through the curves, one for the straight middle;
++	 * in outer coordinates, offset by the border when applied. */
++	for(int j = 0; j < MD_RADIUS; j++) {
++		int in = md_corner_inset(j);
++
++		rects[n].x = (short)in;
++		rects[n].y = (short)j;
++		rects[n].width = (unsigned short)(W - 2 * in);
++		rects[n].height = 1;
++		n++;
++	}
++	rects[n].x = 0;
++	rects[n].y = MD_RADIUS;
++	rects[n].width = (unsigned short)W;
++	rects[n].height = (unsigned short)(H - 2 * MD_RADIUS);
++	n++;
++	for(int j = MD_RADIUS - 1; j >= 0; j--) {
++		int in = md_corner_inset(j);
++
++		rects[n].x = (short)in;
++		rects[n].y = (short)(H - 1 - j);
++		rects[n].width = (unsigned short)(W - 2 * in);
++		rects[n].height = 1;
++		n++;
++	}
++	XShapeCombineRectangles(dpy, t->frame, ShapeBounding, -bw, -bw, rects, n,
++	                        ShapeSet, YXBanded);
++
++	/* The curves: created the first time, moved to the new corners, and
++	 * raised over the title bar and the application, which ctwm may have
++	 * restacked or reparented since. */
++	s = MD_RADIUS - bw;
++	if(t->modern_shape_bw != (unsigned int)bw) {
++		for(int c = 0; c < 4; c++) {
++			if(t->modern_corner[c] != None) {
++				XDestroyWindow(dpy, t->modern_corner[c]);
++				t->modern_corner[c] = None;
++			}
++		}
++	}
++	for(int c = 0; c < 4; c++) {
++		int x, y;
++
++		md_corner_place(t, c, &x, &y);
++		if(t->modern_corner[c] == None) {
++			XSetWindowAttributes attr;
++
++			attr.background_pixel = t->borderC.back;
++			t->modern_corner[c] = XCreateWindow(dpy, t->frame, x, y,
++			                                    (unsigned int)s, (unsigned int)s,
++			                                    0, CopyFromParent, InputOutput,
++			                                    CopyFromParent, CWBackPixel,
++			                                    &attr);
++			if(t->modern_corner[c] == None) {
++				continue;
++			}
++			if(Scr->NameDecorations) {
++				XStoreName(dpy, t->modern_corner[c], "CTWM rounded corner");
++			}
++			/* Clicks go through to the window underneath. */
++			XShapeCombineRectangles(dpy, t->modern_corner[c], ShapeInput, 0, 0,
++			                        NULL, 0, ShapeSet, Unsorted);
++			/* Nothing painted yet: the next paint must not be skipped. */
++			t->modern_corner_line = ~0UL;
++		}
++		else {
++			XMoveWindow(dpy, t->modern_corner[c], x, y);
++		}
++		XMapRaised(dpy, t->modern_corner[c]);
++	}
++	t->modern_rounded = true;
++	t->modern_shape_w = t->frame_width;
++	t->modern_shape_h = t->frame_height;
++	t->modern_shape_bw = (unsigned int)bw;
++	md_corners_paint(t);
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* The resize border                                                        */
+ /* ------------------------------------------------------------------------ */
+@@ -879,6 +1323,8 @@ ModernFocusChanged(TwmWindow *tmp_win, bool focus)
+ #define MD_GRIP          6    /* the band outside the frame, pixels */
+ #define MD_GRIP_CORNER   16   /* along an edge from a corner: the corner */
+ 
++int ModernForcedEdges;
++
+ /* Borders in existence; the frame-call wrappers do nothing extra while it
+  * is 0, which it is whenever ModernTitles is off. */
+ static int md_grips;
+@@ -1058,6 +1504,13 @@ md_edges_at(TwmWindow *t, int x, int y)
+ 	else if(y >= h - bw) {
+ 		e |= MODERN_EDGE_BOTTOM;
+ 	}
++	/* Inside the frame's rectangle, yet on the border: one of the pixels
++	 * a rounded corner cuts off, where the border shows through.  That is
++	 * the corner nearest to it. */
++	if(e == 0 && x >= 0 && y >= 0 && x < w && y < h) {
++		e = (x < w / 2 ? MODERN_EDGE_LEFT : MODERN_EDGE_RIGHT) |
++		    (y < h / 2 ? MODERN_EDGE_TOP : MODERN_EDGE_BOTTOM);
++	}
+ 	if(e & (MODERN_EDGE_TOP | MODERN_EDGE_BOTTOM)) {
+ 		if(x < MD_GRIP_CORNER) {
+ 			e |= MODERN_EDGE_LEFT;
+@@ -1126,6 +1579,10 @@ ModernResizeEdges(TwmWindow *tmp_win, XEvent *evp, int fx, int fy, int fw,
+ 	if(!md_usable() || !tmp_win || evp->type != ButtonPress) {
+ 		return 0;
+ 	}
++	/* The application said which edge (_NET_WM_MOVERESIZE). */
++	if(ModernForcedEdges) {
++		return ModernForcedEdges;
++	}
+ 	if(evp->xbutton.window != tmp_win->frame &&
+ 	                (tmp_win->modern_grip == None ||
+ 	                 evp->xbutton.window != tmp_win->modern_grip)) {
+@@ -1381,3 +1838,396 @@ ctwm_XReparentWindow(Display *d, Window w, Window parent, int x, int y)
+ 	}
+ 	return r;
+ }
++
++/* ------------------------------------------------------------------------ */
++/* Snapping                                                                 */
++/* ------------------------------------------------------------------------ */
++
++typedef enum { MD_SNAP_NONE, MD_SNAP_MAX, MD_SNAP_LEFT, MD_SNAP_RIGHT } ModernSnap;
++
++#define MD_SNAP_EDGE     1    /* pointer this close to a screen edge snaps */
++#define MD_PREVIEW_INSET 8    /* the outline, inside the area it shows */
++#define MD_PREVIEW_RING  2    /* its width */
++#define MD_PREVIEW_RADIUS 12  /* its corners */
++#define MD_PREVIEW_LINE  0x3b74f0  /* the LikeOS highlight blue */
++
++/* The move in progress: its window, that window's geometry before the move
++ * (where a later restore puts it back), the zone the pointer is in and the
++ * area the window would take there, and the outline -- a thin rounded ring in
++ * the highlight colour, a shaped window with a plain background -- with the
++ * area it was last fitted to. */
++static struct {
++	TwmWindow *win;
++	int x, y;
++	unsigned int w, h;
++	ModernSnap zone;
++	RArea area;
++	Window outline, parent;
++	RArea shown;
++} md_move;
++
++bool
++ModernIsSnapped(TwmWindow *tmp_win)
++{
++	return tmp_win && (tmp_win->zoomed == F_LEFTZOOM ||
++	                   tmp_win->zoomed == F_RIGHTZOOM);
++}
++
++/* Is (x, y) on one of the monitors? */
++static bool
++md_on_screen(int x, int y)
++{
++	for(int i = 0; ; i++) {
++		RArea a = RLayoutGetAreaIndex(Scr->Layout, i);
++
++		if(!RAreaIsValid(&a)) {
++			return false;
++		}
++		if(RAreaContainsXY(&a, x, y)) {
++			return true;
++		}
++	}
++}
++
++/* The zone the pointer at (x, y) is in, and the outer frame geometry the
++ * window would take there: the edges are the monitor's own, where no other
++ * monitor continues the screen; the area is that monitor's work area, the
++ * strip the taskbar keeps for itself left out. */
++static ModernSnap
++md_snap_zone(int x, int y, RArea *out)
++{
++	RArea mon, work;
++	ModernSnap zone = MD_SNAP_NONE;
++
++	if(!md_on_screen(x, y)) {
++		return MD_SNAP_NONE;
++	}
++	mon = RLayoutGetAreaAtXY(Scr->Layout, x, y);
++	if(y < mon.y + MD_SNAP_EDGE && !md_on_screen(x, mon.y - 1)) {
++		zone = MD_SNAP_MAX;
++	}
++	else if(x < mon.x + MD_SNAP_EDGE && !md_on_screen(mon.x - 1, y)) {
++		zone = MD_SNAP_LEFT;
++	}
++	else if(x >= mon.x + mon.width - MD_SNAP_EDGE &&
++	                !md_on_screen(mon.x + mon.width, y)) {
++		zone = MD_SNAP_RIGHT;
++	}
++	if(zone == MD_SNAP_NONE) {
++		return zone;
++	}
++	work = RLayoutFull1(Scr->BorderedLayout, &mon);
++	if(!RAreaIsValid(&work)) {
++		work = mon;
++	}
++	switch(zone) {
++		case MD_SNAP_LEFT:
++			work.width = work.width / 2;
++			break;
++		case MD_SNAP_RIGHT:
++			work.x += work.width / 2;
++			work.width -= work.width / 2;
++			break;
++		default:
++			break;
++	}
++	*out = work;
++	return zone;
++}
++
++/* The shape of a rounded ring `ring' pixels wide just inside a w x h box
++ * with corner radius `r', starting `off' pixels in. */
++static void
++md_ring_shape(Window win, int w, int h, int off, int ring, int r)
++{
++	int ow = w - 2 * off, oh = h - 2 * off, ir = r - ring;
++	XRectangle *rects;
++	int n = 0;
++
++	if(ow <= 2 * r || oh <= 2 * r) {
++		return;
++	}
++	rects = calloc((size_t)(2 * oh + 2), sizeof(*rects));
++	if(!rects) {
++		return;
++	}
++	for(int y = 0; y < oh; y++) {
++		int j = y < oh / 2 ? y : oh - 1 - y;
++		int in = md_inset(r, j);
++		int left = off + in, right = off + ow - in;
++
++		/* Rows through the middle are all the same: one band for them. */
++		if(y >= r && y < oh - r) {
++			int x0 = off + ring, x1 = off + ow - ring;
++
++			rects[n++] = (XRectangle) {
++				(short)left, (short)(off + y), (unsigned short)(x0 - left),
++				(unsigned short)(oh - 2 * r)
++			};
++			rects[n++] = (XRectangle) {
++				(short)x1, (short)(off + y), (unsigned short)(right - x1),
++				(unsigned short)(oh - 2 * r)
++			};
++			y = oh - r - 1;
++			continue;
++		}
++		if(j < ring || ir <= 0) {
++			rects[n++] = (XRectangle) {
++				(short)left, (short)(off + y), (unsigned short)(right - left), 1
++			};
++		}
++		else {
++			int iin = md_inset(ir, j - ring);
++			int x0 = off + ring + iin, x1 = off + ow - ring - iin;
++
++			rects[n++] = (XRectangle) {
++				(short)left, (short)(off + y), (unsigned short)(x0 - left), 1
++			};
++			rects[n++] = (XRectangle) {
++				(short)x1, (short)(off + y), (unsigned short)(right - x1), 1
++			};
++		}
++	}
++	XShapeCombineRectangles(dpy, win, ShapeBounding, 0, 0, rects, n, ShapeSet,
++	                        YXBanded);
++	free(rects);
++}
++
++/* Show the outline over `area' (root coordinates), directly beneath the
++ * window being moved; or hide it when the zone is none. */
++static void
++md_preview(TwmWindow *t, ModernSnap zone, const RArea *area)
++{
++	XWindowChanges xwc;
++	int x, y, w, h;
++	Window cr;
++
++	if(zone == MD_SNAP_NONE) {
++		if(md_move.outline != None) {
++			XUnmapWindow(dpy, md_move.outline);
++		}
++		return;
++	}
++	/* The outline lives with the frames, in their parent, so that it can
++	 * be stacked right under the one being moved. */
++	Window parent = t->modern_grip_parent;
++
++	if(parent == None) {
++		Window root, *kids = NULL;
++		unsigned int nkids;
++
++		if(!XQueryTree(dpy, t->frame, &root, &parent, &kids, &nkids)) {
++			return;
++		}
++		if(kids) {
++			XFree(kids);
++		}
++	}
++	if(md_move.outline == None || md_move.parent != parent) {
++		XSetWindowAttributes attr;
++
++		if(md_move.outline != None) {
++			XDestroyWindow(dpy, md_move.outline);
++		}
++		attr.override_redirect = True;
++		attr.background_pixel = md_pixel(MD_PREVIEW_LINE);
++		md_move.outline = XCreateWindow(dpy, parent, 0, 0, 1, 1, 0,
++		                                CopyFromParent, InputOutput,
++		                                CopyFromParent,
++		                                CWOverrideRedirect | CWBackPixel, &attr);
++		/* It never takes the pointer: the drag goes on over it. */
++		XShapeCombineRectangles(dpy, md_move.outline, ShapeInput, 0, 0, NULL, 0,
++		                        ShapeSet, Unsorted);
++		md_move.parent = parent;
++		md_move.shown = RAreaInvalid();
++	}
++	if(md_move.shown.x != area->x || md_move.shown.y != area->y ||
++	                md_move.shown.width != area->width ||
++	                md_move.shown.height != area->height) {
++		/* The area is in root coordinates, the outline in its parent's. */
++		XTranslateCoordinates(dpy, Scr->Root, parent, area->x, area->y, &x, &y,
++		                      &cr);
++		w = area->width;
++		h = area->height;
++		XMoveResizeWindow(dpy, md_move.outline, x, y, (unsigned int)w,
++		                  (unsigned int)h);
++		md_ring_shape(md_move.outline, w, h, MD_PREVIEW_INSET, MD_PREVIEW_RING,
++		              MD_PREVIEW_RADIUS);
++		md_move.shown = *area;
++	}
++	xwc.sibling = t->frame;
++	xwc.stack_mode = Below;
++	XConfigureWindow(dpy, md_move.outline, CWSibling | CWStackMode, &xwc);
++	XMapWindow(dpy, md_move.outline);
++}
++
++void
++ModernMoveBegin(TwmWindow *tmp_win)
++{
++	md_move.win = NULL;
++	md_move.zone = MD_SNAP_NONE;
++	if(!md_usable() || !tmp_win || tmp_win->frame == None) {
++		return;
++	}
++	/* ctwm's own windows, a panel and the desktop are not snapped. */
++	if(tmp_win->isiconmgr || tmp_win->iswspmgr || tmp_win->isoccupy) {
++		return;
++	}
++#ifdef EWMH
++	if(tmp_win->ewmhWindowType == wt_Dock ||
++	                tmp_win->ewmhWindowType == wt_Desktop) {
++		return;
++	}
++#endif
++	md_move.win = tmp_win;
++	md_move.x = tmp_win->frame_x;
++	md_move.y = tmp_win->frame_y;
++	md_move.w = tmp_win->frame_width;
++	md_move.h = tmp_win->frame_height;
++	/* A zoomed window comes back to the geometry saved when it was
++	 * zoomed, so that is the one to keep if it is snapped again. */
++	if(tmp_win->zoomed != ZOOM_NONE && tmp_win->save_frame_width > 0) {
++		md_move.x = tmp_win->save_frame_x;
++		md_move.y = tmp_win->save_frame_y;
++		md_move.w = tmp_win->save_frame_width;
++		md_move.h = tmp_win->save_frame_height;
++	}
++}
++
++bool
++ModernMoveUnzoom(TwmWindow *tmp_win, int x_root, int y_root, int *dx, int *dy)
++{
++	TwmWindow *t = tmp_win;
++	int bw, ow, nx, ny, off, lo, hi;
++
++	if(!md_usable() || !t || t != md_move.win || t->zoomed == ZOOM_NONE ||
++	                t->zoomed == F_FULLSCREENZOOM || t->zoomed == F_XFULLSCREENZOOM ||
++	                t->save_frame_width == 0 || t->save_frame_height == 0) {
++		return false;
++	}
++	bw = t->frame_bw;
++	ow = (int)t->save_frame_width + 2 * bw;
++
++	/* The pointer keeps its place along the caption in proportion, but
++	 * stays on the caption itself: off the window's edge and
++	 * off its caption buttons.  Its height in the caption is kept as it
++	 * was when the button went down; the window follows it from there. */
++	off = (int)((double)(*dx + bw) * ow / (double)(t->frame_width + 2 * bw));
++	lo = bw + MD_LEFT_PAD;
++	hi = ow - bw - MD_RIGHT_PAD - (t->title_w ? Scr->TBInfo.rightoff : 0);
++	if(hi < lo) {
++		off = ow / 2;
++	}
++	else if(off < lo) {
++		off = lo;
++	}
++	else if(off > hi) {
++		off = hi;
++	}
++	nx = x_root - off;
++	ny = y_root - *dy - bw;
++
++	/* Restore to exactly there: fullzoom() puts a window that is zoomed
++	 * the way it is asked to zoom back at its saved geometry. */
++	t->save_frame_x = nx;
++	t->save_frame_y = ny;
++	fullzoom(t, t->zoomed);
++	/* fullzoom() lets go of the server, which the move had grabbed. */
++	if(!Scr->NoGrabServer || !Scr->OpaqueMove) {
++		XGrabServer(dpy);
++	}
++	if(t->zoomed != ZOOM_NONE) {
++		return false;
++	}
++	*dx = off - bw;
++	return true;
++}
++
++void
++ModernMoveMotion(TwmWindow *tmp_win, int x_root, int y_root)
++{
++	RArea area;
++	ModernSnap zone;
++
++	if(!md_move.win || tmp_win != md_move.win) {
++		return;
++	}
++	/* Only what may be maximised snaps; a fixed-size dialog does not. */
++	zone = ModernCanMaximize(tmp_win) ? md_snap_zone(x_root, y_root, &area)
++	       : MD_SNAP_NONE;
++	if(zone != md_move.zone ||
++	                (zone != MD_SNAP_NONE && (area.x != md_move.area.x ||
++	                                          area.y != md_move.area.y ||
++	                                          area.width != md_move.area.width ||
++	                                          area.height != md_move.area.height))) {
++		md_preview(tmp_win, zone, &area);
++		md_move.zone = zone;
++		if(zone != MD_SNAP_NONE) {
++			md_move.area = area;
++		}
++	}
++	else if(zone != MD_SNAP_NONE) {
++		/* The window moved over the outline: keep it beneath. */
++		XWindowChanges xwc;
++
++		xwc.sibling = tmp_win->frame;
++		xwc.stack_mode = Below;
++		if(md_move.outline != None) {
++			XConfigureWindow(dpy, md_move.outline, CWSibling | CWStackMode,
++			                 &xwc);
++		}
++	}
++}
++
++void
++ModernMoveEnd(TwmWindow *tmp_win, bool cancelled)
++{
++	TwmWindow *t = md_move.win;
++	ModernSnap zone = md_move.zone;
++	RArea area = md_move.area;
++	unsigned int w, h;
++	int bw, x, y;
++
++	md_move.win = NULL;
++	md_move.zone = MD_SNAP_NONE;
++	if(md_move.outline != None) {
++		XUnmapWindow(dpy, md_move.outline);
++	}
++	if(!t || t != tmp_win || cancelled || zone == MD_SNAP_NONE ||
++	                t->zoomed != ZOOM_NONE) {
++		return;
++	}
++
++	if(zone == MD_SNAP_MAX) {
++		fullzoom(t, F_FULLZOOM);
++	}
++	else {
++		/* Half the work area, as ctwm's own left and right zooms would
++		 * not do it (they only stretch the window to that edge). */
++		t->zoomed = (zone == MD_SNAP_LEFT) ? F_LEFTZOOM : F_RIGHTZOOM;
++		bw = t->frame_bw;
++		w = (unsigned int)(area.width - 2 * bw);
++		h = (unsigned int)(area.height - 2 * bw);
++		ConstrainSize(t, &w, &h);
++		x = area.x;
++		y = area.y;
++		/* A window that sizes in steps (a terminal) keeps to the screen's
++		 * edge on the right. */
++		if(zone == MD_SNAP_RIGHT) {
++			x = area.x + area.width - (int)w - 2 * bw;
++		}
++		OtpRaise(t, WinWin);
++		SetupWindow(t, x, y, (int)w, (int)h, -1);
++#ifdef EWMH
++		EwmhSet_NET_WM_STATE(t, EWMH_STATE_MAXIMIZED_VERT);
++#endif
++	}
++	if(t->zoomed == ZOOM_NONE) {
++		return;
++	}
++	/* Restoring puts it back where it was before it was dragged here. */
++	t->save_frame_x = md_move.x;
++	t->save_frame_y = md_move.y;
++	t->save_frame_width = md_move.w;
++	t->save_frame_height = md_move.h;
++}
+diff -Nur a/win_modern.h b/win_modern.h
+--- a/win_modern.h
++++ b/win_modern.h
+@@ -13,6 +13,10 @@
+  * restore glyph while the window is zoomed), f.delete and f.destroy the cross.
+  * A button bound to anything else keeps its configured image.
+  *
++ * Also part of the mode: rounded window corners, the invisible resize border
++ * outside the window's edge, snapping a window to the screen's edges, and
++ * caption buttons that act when they are let go -- see below.
++ *
+  * Copyright (C) 2026 The LikeOS Project
+  */
+ 
+@@ -51,6 +55,22 @@ bool ModernMenuHighlight(Window w, int x, int y, int width, int height,
+                          Pixel bg, Pixel fill);
+ Pixel ModernMenuSeparator(void);
+ 
++/*
++ * A caption button acts when the mouse button is let go over it, not when it
++ * is pressed: pressing shows it pressed, and moving off before letting go
++ * does nothing -- a press that turns out to be a mistake can still be
++ * taken back.  ModernCaptionPress() is given a press on
++ * caption button `tbw' that would run `func'; true means it is now held
++ * (minimise, maximise and close are), false that the caller is to run the
++ * function right away as before.  ModernCaptionRelease() is given every
++ * button release; true when it lets go of the mouse button holding one --
++ * whose function then runs, when that was over it, with ButtonPressed reset,
++ * since no button is held any more.
++ */
++bool ModernCaptionPress(TwmWindow *tmp_win, TBWindow *tbw, int func,
++                        char *action);
++bool ModernCaptionRelease(XEvent *ev);
++
+ /* The window's _NET_WM_ICON changed: forget the cached title icon. */
+ void ModernIconChanged(TwmWindow *tmp_win);
+ 
+@@ -123,4 +143,40 @@ int ModernResizeEdges(TwmWindow *tmp_win, XEvent *evp, int fx, int fy,
+ /* The cursor for a set of MODERN_EDGE_* bits. */
+ Cursor ModernEdgeCursor(int edges);
+ 
++/* Edges the next resize is to move whatever the event says, as
++ * MODERN_EDGE_* bits: set around a resize a client asked for with
++ * _NET_WM_MOVERESIZE (the edge or corner it names), 0 otherwise. */
++extern int ModernForcedEdges;
++
++/*
++ * Rounded corners: the frame shaped to a 10-pixel radius, the border drawn
++ * along the curves; square while the window is zoomed (maximised, snapped,
++ * fullscreen).  Called whenever SetupFrame() has given the frame its
++ * geometry; it does nothing when neither the size nor the zoom changed.
++ */
++void ModernFrameShape(TwmWindow *tmp_win);
++
++/*
++ * Snapping, for a window dragged by its caption: the pointer at the top
++ * edge of the screen maximises the window, at the left
++ * or right edge it fills that half of the work area.  While the pointer is
++ * there an outline shows where the window will go.  A maximised or snapped
++ * window dragged by its caption comes back to its normal size under the
++ * pointer and moves on from there.
++ *
++ * movewindow() calls ModernMoveBegin() when a move starts, ModernMoveUnzoom()
++ * on its first step with the pointer's offset into the frame when the button
++ * went down in *dx, *dy (true when the window was restored; they are then its
++ * offset into the restored frame), ModernMoveMotion() on every step and
++ * ModernMoveEnd() when it is over, after the window has been put down.
++ */
++void ModernMoveBegin(TwmWindow *tmp_win);
++bool ModernMoveUnzoom(TwmWindow *tmp_win, int x_root, int y_root, int *dx,
++                      int *dy);
++void ModernMoveMotion(TwmWindow *tmp_win, int x_root, int y_root);
++void ModernMoveEnd(TwmWindow *tmp_win, bool cancelled);
++
++/* Is the window snapped to the left or right half of the screen? */
++bool ModernIsSnapped(TwmWindow *tmp_win);
++
+ #endif /* _CTWM_WIN_MODERN_H */
+diff -Nur a/win_ops.c b/win_ops.c
+--- a/win_ops.c
++++ b/win_ops.c
+@@ -117,9 +117,13 @@ SetFocusVisualAttributes(TwmWindow *tmp_win, bool focus)
+ 	}
+ 	tmp_win->hasfocusvisible = focus;
+ 
+-	/* ModernTitles: the title bar's colours follow the focus. */
+-	if(Scr->ModernTitles && tmp_win->title_height) {
++	/* ModernTitles: the title bar's colours follow the focus, and so does
++	 * the border along the rounded corners, title bar or not. */
++	if(Scr->ModernTitles) {
+ 		ModernFocusChanged(tmp_win, focus);
++#ifdef EWMH
++		EwmhSetFocused(tmp_win, focus);
++#endif
+ 	}
+ }
+ 
+diff -Nur a/win_resize.c b/win_resize.c
+--- a/win_resize.c
++++ b/win_resize.c
+@@ -253,7 +253,11 @@ void StartResize(XEvent *evp, TwmWindow *tmp_win,
+ 	MoveResizeSizeWindow(evp->xbutton.x_root, evp->xbutton.y_root,
+ 	                     Scr->SizeStringWidth + SIZE_HINDENT * 2,
+ 	                     Scr->SizeFont.height + SIZE_VINDENT * 2);
+-	XMapRaised(dpy, Scr->SizeWindow);
++	/* (Not with ModernTitles: the window itself shows its size while it
++	 * is resized.) */
++	if(!Scr->ModernTitles) {
++		XMapRaised(dpy, Scr->SizeWindow);
++	}
+ 	InstallRootColormap();
+ 	last_width = 0;
+ 	last_height = 0;
+@@ -289,7 +293,9 @@ void MenuStartResize(TwmWindow *tmp_win, int x, int y, int w, int h)
+ 	MoveResizeSizeWindow(dragx, dragy,
+ 	                     Scr->SizeStringWidth + SIZE_HINDENT * 2,
+ 	                     Scr->SizeFont.height + SIZE_VINDENT * 2);
+-	XMapRaised(dpy, Scr->SizeWindow);
++	if(!Scr->ModernTitles) {
++		XMapRaised(dpy, Scr->SizeWindow);
++	}
+ 	DisplaySize(tmp_win, origWidth, origHeight);
+ 	if(! Scr->OpaqueResize)
+ 		MoveOutline(Scr->Root, dragx - tmp_win->frame_bw,
+@@ -1084,6 +1090,16 @@ void fullzoom(TwmWindow *tmp_win, int func)
+ 				dragy = finalArea.y;
+ 				dragWidth = finalArea.width - frame_bw_times_2;
+ 				dragHeight = finalArea.height - frame_bw_times_2;
++				/* ModernTitles: a maximised window shows no edge -- the
++				 * border lies just outside the work area, and
++				 * ModernFrameShape() shapes it away -- so the title bar
++				 * and the contents reach the screen's edges. */
++				if(Scr->ModernTitles && HasShape) {
++					dragx -= tmp_win->frame_bw;
++					dragy -= tmp_win->frame_bw;
++					dragWidth += frame_bw_times_2;
++					dragHeight += frame_bw_times_2;
++				}
+ 				break;
+ 			case F_XLEFTZOOM:
+ 				dragx = RLayoutFindLeftEdge(borderedLayout, &area);

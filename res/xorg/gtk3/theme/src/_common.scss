@@ -1,3 +1,8 @@
+// Widget rules: GTK's Adwaita theme, adapted to the LikeOS palette and
+// glyphs.  Adwaita is LGPL-2.1-or-later.
+//
+// Copyright (C) 2026 The LikeOS Project
+
 @function gtkalpha($c,$a) {
   @return unquote("alpha(#{$c},#{$a})");
 }
@@ -6,10 +11,16 @@ $ease-out-quad: cubic-bezier(0.25, 0.46, 0.45, 0.94);
 $asset_suffix: if($variant=='dark', '-dark', '');
 $backdrop_transition: 200ms ease-out;
 $button_transition: all 200ms $ease-out-quad;
-$button_radius: 4px;
+$button_radius: 6px;
 $menu_radius: 0;
-$window_radius: $button_radius + 3;
-$popover_radius: $button_radius + 4;
+$window_radius: 10px;
+$popover_radius: 10px;
+
+// Everything from here to the matching mark at the end of this file is
+// Adwaita's widget structure; build.py drops this part's :backdrop rules
+// (see backdrop() there), so a window that is not focused keeps the look it
+// has when it is.
+/* LIKEOS-ADWAITA-BEGIN */
 
 // Optional compact sizes for buttons, headerbar and headerbar widgets
 $_sizevariant: 'default'; //compact otherwise
@@ -1133,9 +1144,9 @@ modelbutton.flat arrow {
 
   &:hover { background: none; }
 
-  &.left { -gtk-icon-source: -gtk-icontheme("pan-start-symbolic"); }
+  &.left { -gtk-icon-source: glyph('chevron-left'); }
 
-  &.right { -gtk-icon-source: -gtk-icontheme("pan-end-symbolic"); }
+  &.right { -gtk-icon-source: glyph('chevron-right'); }
 }
 
 button.color {
@@ -1442,7 +1453,7 @@ spinbutton {
  **************/
 combobox {
   arrow {
-    -gtk-icon-source: -gtk-icontheme('pan-down-symbolic');
+    -gtk-icon-source: glyph('chevron-down');
     min-height: 16px;
     min-width: 16px;
   }
@@ -1735,7 +1746,7 @@ headerbar {
         arrow { -GtkArrow-arrow-scaling: 1; }
 
         .arrow {
-          -gtk-icon-source: -gtk-icontheme('pan-down-symbolic');
+          -gtk-icon-source: glyph('chevron-down');
           color: transparentize($selected_fg_color,0.5);
           -gtk-icon-shadow: none;
         }
@@ -2010,9 +2021,9 @@ treeview.view {
   }
 
   &.expander {
-    -gtk-icon-source: -gtk-icontheme('pan-end-symbolic');
+    -gtk-icon-source: glyph('chevron-right');
 
-    &:dir(rtl) { -gtk-icon-source: -gtk-icontheme('pan-end-symbolic-rtl'); }
+    &:dir(rtl) { -gtk-icon-source: glyph('chevron-left'); }
 
     color: mix($text_color, $base_color, 70%);
 
@@ -2026,7 +2037,7 @@ treeview.view {
       &:backdrop { color: mix($backdrop_selected_fg_color, $selected_bg_color, 70%); }
     }
 
-    &:checked { -gtk-icon-source: -gtk-icontheme('pan-down-symbolic'); }
+    &:checked { -gtk-icon-source: glyph('chevron-down'); }
 
     &:backdrop { color: mix($backdrop_fg_color, $backdrop_base_color, 70%); }
   }
@@ -2244,12 +2255,12 @@ menu,
       min-width: 16px;
 
       &:dir(ltr) {
-        -gtk-icon-source: -gtk-icontheme('pan-end-symbolic');
+        -gtk-icon-source: glyph('chevron-right');
         margin-left: 10px;
       }
 
       &:dir(rtl) {
-        -gtk-icon-source:-gtk-icontheme('pan-end-symbolic-rtl');
+        -gtk-icon-source:glyph('chevron-left');
         margin-right: 10px;
       }
     }
@@ -2274,7 +2285,7 @@ menu,
       border-bottom: 1px solid mix($fg_color, $base_color, 10%);
       border-top-right-radius: $menu_radius;
       border-top-left-radius: $menu_radius;
-      -gtk-icon-source: -gtk-icontheme('pan-up-symbolic');
+      -gtk-icon-source: glyph('chevron-up');
     }
 
     &.bottom {
@@ -2283,7 +2294,7 @@ menu,
       border-top: 1px solid mix($fg_color, $base_color, 10%);
       border-bottom-right-radius: $menu_radius;
       border-bottom-left-radius: $menu_radius;
-      -gtk-icon-source: -gtk-icontheme('pan-down-symbolic');
+      -gtk-icon-source: glyph('chevron-down');
     }
 
     &:hover { background-color: mix($fg_color, $base_color, 10%); }
@@ -2454,9 +2465,9 @@ notebook {
       padding-left: 4px;
       padding-right: 4px;
 
-      &.down { -gtk-icon-source: -gtk-icontheme('pan-start-symbolic'); }
+      &.down { -gtk-icon-source: glyph('chevron-left'); }
 
-      &.up { -gtk-icon-source: -gtk-icontheme('pan-end-symbolic'); }
+      &.up { -gtk-icon-source: glyph('chevron-right'); }
     }
 
     &.left > tabs > arrow {
@@ -2477,9 +2488,9 @@ notebook {
       padding-top: 4px;
       padding-bottom: 4px;
 
-      &.down { -gtk-icon-source: -gtk-icontheme('pan-up-symbolic'); }
+      &.down { -gtk-icon-source: glyph('chevron-up'); }
 
-      &.up { -gtk-icon-source: -gtk-icontheme('pan-down-symbolic'); }
+      &.up { -gtk-icon-source: glyph('chevron-down'); }
     }
 
     > tabs > arrow {
@@ -2798,17 +2809,17 @@ scrollbar {
   // button icons
   &.vertical {
     button {
-      &.down { -gtk-icon-source: -gtk-icontheme('pan-down-symbolic'); }
+      &.down { -gtk-icon-source: glyph('chevron-down'); }
 
-      &.up { -gtk-icon-source: -gtk-icontheme('pan-up-symbolic'); }
+      &.up { -gtk-icon-source: glyph('chevron-up'); }
     }
   }
 
   &.horizontal {
     button {
-      &.down { -gtk-icon-source: -gtk-icontheme('pan-end-symbolic'); }
+      &.down { -gtk-icon-source: glyph('chevron-right'); }
 
-      &.up { -gtk-icon-source: -gtk-icontheme('pan-start-symbolic'); }
+      &.up { -gtk-icon-source: glyph('chevron-left'); }
     }
   }
 }
@@ -3908,14 +3919,14 @@ expander {
   title > arrow {
     min-width: 16px;
     min-height: 16px;
-    -gtk-icon-source: -gtk-icontheme('pan-end-symbolic');
-    &:dir(rtl) { -gtk-icon-source: -gtk-icontheme('pan-end-symbolic-rtl'); }
+    -gtk-icon-source: glyph('chevron-right');
+    &:dir(rtl) { -gtk-icon-source: glyph('chevron-left'); }
 
     &:hover { color: lighten($fg_color,30%); } //only lightens the arrow
     &:disabled { color: $insensitive_fg_color; }
     &:disabled:backdrop { color: $backdrop_insensitive_color; }
 
-    &:checked { -gtk-icon-source: -gtk-icontheme('pan-down-symbolic'); }
+    &:checked { -gtk-icon-source: glyph('chevron-down'); }
   }
 }
 
@@ -4856,3 +4867,5 @@ popover.emoji-completion contents row box {
 popover.emoji-completion .emoji:hover {
   background: $popover_hover_color;
 }
+
+/* LIKEOS-ADWAITA-END */

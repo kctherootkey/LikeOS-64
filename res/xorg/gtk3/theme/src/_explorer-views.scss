@@ -1,0 +1,331 @@
+// LikeOS Explorer: the content views -- details, icons, Home, Gallery,
+// Computer, context menu.
+//
+// What Explorer shows inside its card: the Details list with its thin
+// column separators and the sort chevron at a title's right end, rows in
+// the list selection blue with the names in the text colour and the other
+// columns in the secondary one; the icon views with rounded hover and
+// selection fills; Home's pinned-folder cards and its Recent files /
+// Favorites lists; Computer's drive cards with their usage bars; and the
+// context menu.  Scoped to the window's .likeos-explorer class (and the
+// menu's own window class) and built from the tokens.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+// Colours of the item views.
+$ex-row-hover: $color-item-hover;
+$ex-row-selected: $color-selection;
+$ex-row-selected-hover: $color-selection-hover;
+$ex-header-hover: $color-item-hover;
+$ex-header-pressed: $color-selection;
+$ex-focus-ring: $color-accent;
+// Computer's drive bars.
+$ex-usage-trough: $color-stroke;
+$ex-usage-full: $color-critical;
+// The context menu's panel.
+$ex-menu-bg: $color-flyout;
+$ex-menu-border: $color-flyout-stroke;
+$ex-menu-disabled: $color-text-disabled;
+
+window.likeos-explorer {
+  // ---- Details, List and Compact ------------------------------------------
+  treeview.view.ex-items {
+    -GtkTreeView-vertical-separator: 0;
+    -GtkTreeView-horizontal-separator: 0;
+    background-color: $color-card;
+    color: $color-text;
+    // The keyboard ring round the row with the cursor: a thin accent
+    // rectangle, shown only for keyboard focus.
+    outline-color: $ex-focus-ring;
+    outline-style: solid;
+    outline-width: 1px;
+    outline-offset: -1px;
+
+    &:hover { background-color: $ex-row-hover; }
+    &:selected, &:selected:focus, &:backdrop:selected {
+      background-color: $ex-row-selected;
+      color: $color-text;
+    }
+    &:selected:hover { background-color: $ex-row-selected-hover; }
+
+    // An empty or still-loading folder: no ring round the whole view.
+    &.ex-empty { outline-color: transparent; }
+
+    // Column headers: no fill, a hairline between columns, the title in
+    // the secondary colour; the sort chevron is drawn at the right end by
+    // the view itself.
+    header button {
+      min-height: 0;
+      padding: 6px $space-s 6px $space-s;
+      border: none;
+      border-right: 1px solid $color-stroke;
+      border-radius: 0;
+      background-image: none;
+      background-color: $color-card;
+      box-shadow: none;
+      color: $color-text-secondary;
+      font-weight: normal;
+
+      &:hover { background-color: $ex-header-hover; color: $color-text; }
+      &:active { background-color: $ex-header-pressed; color: $color-text; }
+      &:last-child { border-right: 1px solid $color-stroke; }
+
+      // GTK's own top band for its sort chevron (_likeos.scss) is not
+      // wanted here: GTK's chevron is off and the view draws its own.
+      > overlay > box { margin-top: 0; }
+    }
+
+    &.rubberband, rubberband {
+      border: 1px solid $color-accent;
+      background-color: transparentize($color-accent, 0.85);
+    }
+  }
+
+  // ---- the icon views --------------------------------------------------------
+  iconview.ex-items {
+    background-color: $color-card;
+    color: $color-text;
+    outline-color: $ex-focus-ring;
+    outline-style: solid;
+    outline-width: 1px;
+    outline-offset: -1px;
+
+    &:hover { background-color: $ex-row-hover; border-radius: $radius-control; }
+    &:selected, &:selected:focus, &:backdrop:selected {
+      background-color: $ex-row-selected;
+      color: $color-text;
+      border-radius: $radius-control;
+    }
+    &:selected:hover { background-color: $ex-row-selected-hover; }
+
+    &.rubberband, rubberband {
+      border: 1px solid $color-accent;
+      background-color: transparentize($color-accent, 0.85);
+    }
+  }
+
+  // ---- the details and preview panes ---------------------------------------
+  // The item's name large under its picture, then "Properties" over the
+  // facts.
+  .ex-pane {
+    .ex-pane-title {
+      font-size: $type-subtitle + 1.5pt;
+      font-weight: $weight-strong;
+      margin-top: $space-s;
+    }
+    .ex-pane-heading {
+      font-weight: $weight-strong;
+      margin-top: $space-l;
+    }
+    .ex-dim { color: $color-text-secondary; }
+  }
+
+  // ---- Home and Computer ----------------------------------------------------
+  .ex-home {
+    background-color: $color-card;
+
+    .ex-page-body { padding: $space-l $space-xl $space-xl $space-xl; }
+
+    // A group's heading: its title, and after it the chevron that folds
+    // the group.
+    button.ex-fold, button.ex-group-header {
+      min-height: 28px;
+      padding: $space-xxs $space-s;
+      margin-left: -$space-s;
+      border: none;
+      border-radius: $radius-control;
+      background: none;
+      box-shadow: none;
+      color: $color-text;
+      font-size: $type-body-large;
+      font-weight: $weight-strong;
+
+      &:hover { background-color: $color-hover; }
+      &:active { background-color: $color-pressed; }
+      image.ex-fold-chevron { color: $color-text-secondary; }
+    }
+
+    // Pinned folders: cards on a hairline, the picture over the name.
+    flowbox flowboxchild { padding: 0; }
+    .ex-pinned-grid { margin: $space-s 0 $space-xl 0; }
+
+    button.ex-folder-card, button.ex-drive-tile {
+      padding: $space-m $space-s $space-s $space-s;
+      border: 1px solid $color-stroke;
+      border-radius: $radius-tile;
+      background-image: none;
+      background-color: $color-card;
+      box-shadow: none;
+      color: $color-text;
+      font-weight: normal;
+
+      &:hover { background-color: $color-item-hover; border-color: $color-selection-hover; }
+      &:active { background-color: $color-selection; border-color: $color-selection-hover; }
+    }
+    button.ex-drive-tile { min-width: 272px; padding: $space-m $space-l; }
+
+    .ex-pin { color: $color-accent-fill; margin: -$space-xs -$space-xxs 0 0; }
+    .ex-dim { color: $color-text-secondary; }
+    .ex-caption { font-size: $type-caption + 0.5pt; }
+
+    // Recent files | Favorites: a two-way switch in a soft trough, the
+    // chosen side a raised white chip.
+    .ex-files-head { margin-top: $space-xs; }
+
+    .ex-switch {
+      padding: 2px;
+      border: 1px solid $color-stroke;
+      border-radius: $radius-control + 2px;
+      background-color: $color-window;
+    }
+
+    button.ex-switch-button {
+      min-height: 0;
+      padding: 4px $space-m;
+      border: 1px solid transparent;
+      border-radius: $radius-control;
+      background-image: none;
+      background-color: transparent;
+      box-shadow: none;
+      color: $color-text-secondary;
+      font-size: $type-body;
+
+      &:hover { color: $color-text; background-color: $color-hover; }
+      &:checked {
+        border-color: $color-stroke;
+        background-color: $color-card;
+        color: $color-text;
+      }
+      &:checked image { color: $color-accent-fill; }
+    }
+
+    // The file lists under it, each in a card: titles over the columns,
+    // then rows of a picture, the name with its folder under it, and when
+    // it was last opened.
+    .ex-list-header {
+      margin: $space-m 0 $space-xs 0;
+      padding: 0 $space-m + 5px;
+      color: $color-text-secondary;
+      font-size: $type-caption + 0.5pt;
+    }
+
+    list.ex-file-list {
+      padding: $space-xs;
+      border: 1px solid $color-stroke;
+      border-radius: $radius-card;
+      background-color: $color-card;
+
+      row {
+        padding: 5px $space-s;
+        border-radius: $radius-row;
+        outline-offset: -1px;
+        box-shadow: none;
+
+        &:hover { background-color: $ex-row-hover; }
+        &:selected, &:selected:focus {
+          background-color: $ex-row-selected;
+          color: $color-text;
+          box-shadow: none;
+        }
+        &:selected:hover { background-color: $ex-row-selected-hover; }
+      }
+    }
+
+    .ex-placeholder {
+      margin: $space-m 0 0 0;
+      padding: $space-l;
+      border: 1px dashed $color-stroke-edge;
+      border-radius: $radius-card;
+      color: $color-text-secondary;
+      font-size: $type-body;
+    }
+  }
+
+  // Computer: the drives' usage bars -- a slim accent bar in a light
+  // trough, red when the drive is nearly full.
+  .ex-computer {
+    flowbox { margin: $space-s 0 $space-xl 0; }
+
+    levelbar.ex-usage {
+      trough {
+        min-height: 6px;
+        padding: 0;
+        border: none;
+        border-radius: 3px;
+        background-color: $ex-usage-trough;
+      }
+      block {
+        min-height: 6px;
+        border: none;
+        border-radius: 3px;
+      }
+      block.filled { background-color: $color-accent; }
+      block.empty { background-color: transparent; }
+    }
+    levelbar.ex-usage.ex-nearly-full block.filled { background-color: $ex-usage-full; }
+  }
+}
+
+// ---- the context menu ----------------------------------------------------
+// The LikeOS menu: a white panel with a hairline edge, rounded like every
+// menu and popover (the window is cut to the same rounded shape, there
+// being no compositor for a shadow), 30-pixel rows inset by 4 pixels with
+// the picture at the left and the key in the secondary colour at the
+// right, hairlines between the groups.
+window.ex-menu {
+  background-color: $ex-menu-bg;
+  border: 1px solid $ex-menu-border;
+  border-radius: $radius-overlay;
+  padding: $space-xs 0;
+  color: $color-text;
+
+  .ex-menu-item {
+    min-height: $height-menu-item;
+    margin: 0 $space-xs;
+    padding: 0 $space-s;
+    border-radius: $radius-row;
+
+    &:hover { background-color: $color-item-hover; }
+    &:disabled { color: $ex-menu-disabled; }
+    &:disabled image { opacity: 0.4; }
+  }
+
+  .ex-menu-label { margin-left: 10px; margin-right: $space-xl; }
+  .ex-menu-default { font-weight: $weight-strong; }
+  .ex-menu-hint { color: $color-text-secondary; font-size: $type-caption + 0.5pt; }
+  .ex-menu-item:disabled .ex-menu-hint { color: $ex-menu-disabled; }
+  .ex-menu-chevron { color: $color-text-secondary; margin-left: $space-s; }
+  .ex-menu-dot { font-size: 6pt; color: $color-accent-fill; }
+
+  .ex-menu-separator {
+    min-height: 1px;
+    margin: $space-xs 10px;
+    background-color: $color-separator;
+  }
+}
+
+// Gallery: the pictures on the card white, the month headings drawn by the
+// program in the text colour, the years down the right side as quiet
+// links, the one pointed at in the accent colour.
+window.likeos-explorer {
+  .ex-gallery-canvas { background-color: $color-card; color: $color-text; }
+
+  .ex-gallery-years {
+    background-color: $color-card;
+    padding: $space-s $space-s 0 0;
+    min-width: 56px;
+
+    button.ex-gallery-year {
+      min-height: 24px;
+      padding: 0 $space-s;
+      border: none;
+      border-radius: $radius-control;
+      background-image: none;
+      box-shadow: none;
+      color: $color-text-secondary;
+      font-size: $type-body;
+
+      &:hover { color: $color-accent; background-image: image($color-hover); }
+    }
+  }
+}

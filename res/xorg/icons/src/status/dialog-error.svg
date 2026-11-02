@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: dialog-error, master drawing.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.1"/></filter><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="3" x2="0" y2="61"><stop offset="0" stop-color="#ea5a5a"/><stop offset="1" stop-color="#c42e2e"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="3" x2="0" y2="61"><stop offset="0" stop-color="#ea5a5a"/><stop offset="1" stop-color="#c42e2e"/></linearGradient></defs>
+<g transform="scale(1)">
+<path d="M58.793 43.098L43.098 58.793L20.902 58.793L5.207 43.098L5.207 20.902L20.902 5.207L43.098 5.207L58.793 20.902Z" fill="#0b1730" opacity="0.22" transform="translate(0 1.2)" filter="url(#f1)"/>
+<path d="M58.793 43.098L43.098 58.793L20.902 58.793L5.207 43.098L5.207 20.902L20.902 5.207L43.098 5.207L58.793 20.902Z" fill="url(#g2)" stroke="url(#g3)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M22.43 22.43L41.57 41.57M41.57 22.43L22.43 41.57" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>

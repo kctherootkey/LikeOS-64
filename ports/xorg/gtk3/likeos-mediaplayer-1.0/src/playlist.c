@@ -1,4 +1,4 @@
-// LikeOS -- Media Player: the play queue and its play order.
+// LikeOS -- LikeOS Media Player: the play queue and its play order.
 //
 // Rows live in a GtkListStore; a hash table maps each entry's id to its
 // iterator.  That is safe because a GtkListStore's iterators stay valid for

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: Share.
+// LikeOS Explorer: Share.
 //
 // Copyright (C) 2026 The LikeOS Project
 

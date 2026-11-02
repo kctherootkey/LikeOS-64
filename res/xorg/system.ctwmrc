@@ -12,60 +12,89 @@
 #
 
 #
-# Fonts: Selawik, the desktop's interface font (the open substitute for
-# Segoe UI), at Windows 11's 9 points.  The "xft:" prefix makes ctwm draw it
-# anti-aliased through Xft -- a LikeOS addition (ports/xorg/patches/ctwm,
-# 0003); the part after it is a fontconfig pattern.
+# Fonts: Selawik, the desktop's interface font, at 9 points; window titles in
+# its semibold weight.  The "xft:" prefix makes ctwm draw it anti-aliased
+# through Xft -- a LikeOS addition (ports/xorg/patches/ctwm, 0003); the part
+# after it is a fontconfig pattern.
 #
 # Selawik covers Latin only.  A character it has no glyph for -- a Greek or
 # Cyrillic window title, say -- is drawn from the next font in fontconfig's
 # order for the pattern that has one (patch 0004).  Noto Sans is named second
-# so that this is a humanist sans like Segoe UI's own Greek and Cyrillic,
-# rather than whatever the generic sans-serif happens to be; scripts Noto
-# Sans lacks fall through to the fonts after it (DejaVu Sans and the rest).
+# so that this is a humanist sans that sits well beside Selawik, rather than
+# whatever the generic sans-serif happens to be; scripts Noto Sans lacks fall
+# through to the fonts after it (DejaVu Sans and the rest).
 #
-TitleFont	"xft:Selawik,Noto Sans:size=9"
+TitleFont	"xft:Selawik,Noto Sans:size=9:weight=semibold"
 ResizeFont	"xft:Selawik,Noto Sans:size=9"
 MenuFont	"xft:Selawik,Noto Sans:size=9"
 IconFont	"xft:Selawik,Noto Sans:size=9"
 IconManagerFont	"xft:Selawik,Noto Sans:size=9"
-# ShowWorkSpaceManager is deliberately absent.  The workspace switcher is the
-# four numbered buttons in taskbar(1), which drives ctwm through
-# _NET_CURRENT_DESKTOP; ctwm still owns the workspaces themselves (see the
-# WorkSpaces block below, which is what makes there be four of them and what
-# ctwm advertises as _NET_NUMBER_OF_DESKTOPS).  Without this keyword the
+# ShowWorkSpaceManager is deliberately absent.  Workspaces are switched from
+# the Workspaces button in taskbar(1) (or Super+Tab), which drives ctwm
+# through _NET_CURRENT_DESKTOP; ctwm still owns the workspaces themselves (see
+# the WorkSpaces block below, which is what makes there be four of them and
+# what ctwm advertises as _NET_NUMBER_OF_DESKTOPS).  Without this keyword the
 # manager window is created but never mapped.
 #
-# Windows 11 title bars (FluentTitles, a LikeOS addition -- see
-# ports/xorg/patches/ctwm/0003).  A flat caption 30 pixels tall: the
-# application's icon and its title on the left, minimise, maximise and close
-# on the right as 46-pixel-wide buttons with thin glyphs that highlight under
-# the pointer, close in red.  The caption is #f0f3f9 with black text when the
-# window has the focus and #f3f3f3 with grey text when it does not -- Windows
-# 11's own colours; they are built into the mode, so TitleBackground and
-# TitleForeground below do not change them.
+# The LikeOS window frame (ModernTitles, a LikeOS addition -- see
+# ports/xorg/patches/ctwm/0003 and 0007).  A flat title bar 36 pixels tall:
+# the application's icon 12 pixels in and its title after it; on the right
+# minimise, maximise and close as rounded rectangles 36 x 26 pixels inset in
+# the bar, TitlePadding (4) apart and FramePadding (6) from the right edge,
+# each with a thin line glyph.  At rest a button is only its glyph; under the
+# pointer it fills with a faint blue-grey wash, close with coral red and a
+# white glyph.  The bar is #eef2f9 with near-black text when the window has
+# the focus and #f5f7fb with slate text when it does not; those colours are
+# built into the mode, so TitleBackground and TitleForeground below do not
+# change them.
 #
-# Everything three-dimensional is off: Windows 11 draws no bevels anywhere.
+# Everything three-dimensional is off: the frame draws no bevels anywhere.
 # The window border is one flat pixel (BorderWidth, colours in the Color
-# block), and the padding and indents that space out classic title buttons are
-# zero, since the caption buttons sit flush against each other and the corner.
-# NoTitleHighlight drops the striped "this window has the focus" band classic
-# ctwm draws in the title; the colour change says it instead.
+# block).  NoTitleHighlight drops the striped "this window has the focus"
+# band classic ctwm draws in the title; the colour change says it instead.
 #
-FluentTitles
-TitleBarHeight		30
-TitleButtonWidth	46
+# The rest of the frame comes with the same keyword:
+#   - corners rounded to 10 pixels, the border following the curve; square
+#     while a window is maximised, snapped or fullscreen.  A maximised window
+#     shows no border at all: its title bar reaches the top of the screen.
+#   - an invisible band a few pixels outside every resizable window that
+#     resizes it, the cut-off corners included.
+#   - caption buttons that act when the mouse button is let go over them, and
+#     show it pressed until then, so a press can still be taken back.
+#   - snapping: a window dragged by its title to the top edge of the screen
+#     is maximised, to the left or right edge it fills that half of the work
+#     area; a thin rounded blue outline shows where it will go while the
+#     pointer is there.  Dragging a maximised or snapped window restores it
+#     under the pointer.  Double-clicking a title maximises or restores.
+#   - _NET_WM_STATE_FOCUSED, so GTK programs know which window has the focus
+#     and draw the others in the theme's backdrop state.
+#   - ctwm's own menus (Alt+F1, Alt+F2) get 30-pixel rows, a rounded
+#     highlight under the pointer and hairline separators.
+#
+# A program may draw its own title row (LikeOS Explorer puts its tabs there):
+# it asks for a border only through _MOTIF_WM_HINTS (GDK's
+# gdk_window_set_decorations (GDK_DECOR_BORDER)), and ctwm then gives it the
+# border, the rounded corners and the resize band but no title bar.  It moves
+# and resizes itself with _NET_WM_MOVERESIZE (gtk_window_begin_move_drag and
+# begin_resize_drag; the move snaps like a title drag does) and maximises
+# and minimises through _NET_WM_STATE and WM_CHANGE_STATE as usual.  Such a
+# row should match the numbers here: 36 pixels tall, buttons 36 x 26 with
+# 6-pixel corners, 4 apart, 6 from the right edge, vertically centred.
+#
+ModernTitles
+TitleBarHeight		36
+TitleButtonWidth	36
 TitleButtonBorderWidth	0
-FramePadding		0
-TitlePadding		0
+FramePadding		6
+TitlePadding		4
 ButtonIndent		0
 BorderWidth		1
 NoTitleHighlight
 TitleJustification	"left"
 #
 #
-# Focus and stacking, the way a Windows user expects: pressing a mouse button
-# ANYWHERE in a window focuses it (so its title bar highlights) and raises it.
+# Focus and stacking: pressing a mouse button ANYWHERE in a window focuses it
+# (so its title bar highlights) and raises it.
 #
 # Without ClickToFocus, ctwm follows the pointer, so moving onto a second xterm
 # focused it silently and pressing a button changed nothing visible.
@@ -113,12 +142,11 @@ RightTitleButton ":xpm:zoom"    = f.fullzoom
 RightTitleButton ":xpm:cross"   = f.delete
 
 #
-# Four workspaces.  taskbar(1) draws one numbered button per workspace in a
-# single row, so the count is what fits the bar rather than what fits a grid:
-# four 22-pixel buttons is a compact tray, and the panel would simply grow that
-# group if there were more.  ctwm still owns the workspaces themselves and
-# publishes the count as _NET_NUMBER_OF_DESKTOPS, which is where the panel
-# reads it -- change the number here and the panel follows.
+# Four workspaces, switched from the Workspaces flyout in taskbar(1)
+# (Super+Tab), which shows one card per workspace.  ctwm still owns the
+# workspaces themselves and publishes the count as _NET_NUMBER_OF_DESKTOPS,
+# which is where the panel reads it -- change the number here and the flyout
+# follows.
 #
 # Fields per workspace, as ctwm's workspace_config.c documents them:
 #     "name" { button-bg  button-fg  map-bg  map-fg  [root-image] }
@@ -152,8 +180,7 @@ WorkSpaces {
 # "sb_left_arrow" over menus.  "left_ptr" is the plain arrow every current
 # desktop uses, and it is what these should all be.
 #
-# Kept as they are, because they say something a plain arrow could not, and
-# because Windows shows its own equivalents in the same situations:
+# Kept as they are, because they say something a plain arrow could not:
 #   Move/Resize  fleur  - a drag is in progress
 #   Wait         watch  - busy
 #   Destroy      pirate - the next click KILLS the window it lands on; that is
@@ -187,9 +214,9 @@ Cursors
 #
 # ctwm's workspace manager is never mapped (ShowWorkSpaceManager is absent at
 # the top of this file), so a geometry for it would describe a window nobody
-# sees.  The switcher is the four numbered buttons at the right of taskbar(1),
-# which sends _NET_CURRENT_DESKTOP; the WorkSpaces block above still defines
-# the workspaces themselves and is what ctwm reports as
+# sees.  Workspaces are switched from the Workspaces flyout in taskbar(1)
+# (Super+Tab), which sends _NET_CURRENT_DESKTOP; the WorkSpaces block above
+# still defines the workspaces themselves and is what ctwm reports as
 # _NET_NUMBER_OF_DESKTOPS, which is where the taskbar learns there are four.
 
 # Leave the root window alone.  Without this ctwm repaints the desktop from the
@@ -212,7 +239,7 @@ DontPaintRootWindow
 NoIconManagers
 
 #
-# Windows that are the panel rather than applications: undecorated, on every
+# Clients that are the panel rather than applications: undecorated, on every
 # workspace, and never given a task button.
 #
 # taskbar(1) sets _NET_WM_WINDOW_TYPE_DOCK, which ctwm understands and stacks
@@ -247,48 +274,49 @@ OccupyAll
 }
 
 #
-# Windows 11 light colours.
+# The LikeOS light palette.
 #
-# The window border is one pixel of grey, a shade darker on the window that
-# has the focus: ctwm paints the FOCUSED window's border in BorderColor and
-# every other one from the BorderTile pair (the same colour twice, so the
-# tile is solid).  #afafaf and #c8c8c8 are what Windows 11 draws, measured
-# over a white background.
+# The window border is one pixel of cool grey-blue, a shade darker on the
+# window that has the focus: ctwm paints the FOCUSED window's border in
+# BorderColor and every other one from the BorderTile pair (the same colour
+# twice, so the tile is solid).  There is no compositor here to draw shadows,
+# so the darker edge is what tells the focused window from the ones behind
+# it.  The rounded corners draw their curves in the same two colours.
 #
-# Menus are Windows 11's light context menus: near-white, dark text, and a
-# grey wash under the pointer (the "fore":"back" pair after each menu name
-# below sets that).  Menu titles are quiet grey text rather than a coloured
-# band; Windows menus have no titles at all.  With FluentTitles the menu's
-# border and its separator lines are drawn in MenuShadowColor, a light grey
-# (the drop shadow it is otherwise for is switched off, see NoMenuShadows).
+# Menus are white with dark text and a pale blue rounded highlight under the
+# pointer (the "fore":"back" pair after each menu name below sets that).
+# Menu titles are quiet slate text rather than a coloured band.  With
+# ModernTitles the menu's border is drawn in MenuShadowColor, a light
+# blue-grey hairline, and the separators in a lighter shade of it (the drop
+# shadow MenuShadowColor is otherwise for is switched off, see NoMenuShadows).
 #
 # FrameBackground is what a window shows where its application has not drawn
 # yet -- the strip a resize uncovers while the program is busy, or a window
 # just taken over when the window manager restarts after a resolution change.
-# White, as Windows 11 shows it, rather than the grey of the border tile.
+# White, like the application's own background, rather than the border tile.
 #
 Color
 {
-    BorderColor           "#afafaf"
-    DefaultBackground     "#f9f9f9"
-    DefaultForeground     "#1b1b1b"
-    BorderTileBackground  "#c8c8c8"
-    BorderTileForeground  "#c8c8c8"
+    BorderColor           "#aebad0"
+    DefaultBackground     "#f5f7fb"
+    DefaultForeground     "#141a24"
+    BorderTileBackground  "#d3d9e3"
+    BorderTileForeground  "#d3d9e3"
     FrameBackground       "#ffffff"
-    TitleBackground       "#f3f3f3"
-    TitleForeground       "black"
-    MenuBackground        "#f9f9f9"
-    MenuForeground        "#1b1b1b"
-    MenuTitleBackground   "#f9f9f9"
-    MenuTitleForeground   "#616161"
-    MenuShadowColor       "#d0d0d0"
-    IconBackground        "#f3f3f3"
-    IconForeground        "#1b1b1b"
-    IconBorderColor       "#c8c8c8"
-    IconManagerBackground "#f3f3f3"
-    IconManagerForeground "#1b1b1b"
-    IconManagerHighlight  "#cce8ff"
-    MapWindowBackground   "#0078d4"
+    TitleBackground       "#f5f7fb"
+    TitleForeground       "#141a24"
+    MenuBackground        "#ffffff"
+    MenuForeground        "#141a24"
+    MenuTitleBackground   "#ffffff"
+    MenuTitleForeground   "#586174"
+    MenuShadowColor       "#d3dae6"
+    IconBackground        "#f5f7fb"
+    IconForeground        "#141a24"
+    IconBorderColor       "#d3d9e3"
+    IconManagerBackground "#f5f7fb"
+    IconManagerForeground "#141a24"
+    IconManagerHighlight  "#dce7fd"
+    MapWindowBackground   "#2a5bd7"
     MapWindowForeground   "white"
 }
 
@@ -347,8 +375,8 @@ StayUpMenus
 
 #
 # No drop shadow under menus.  ctwm's is a solid black copy of the menu
-# offset by a few pixels, which reads as a hard dark slab beside a Windows 11
-# menu; Windows' own shadow is a soft blur that needs a compositor.
+# offset by a few pixels, which reads as a hard dark slab beside a light menu;
+# a soft shadow would need a compositor.  The hairline border stands in.
 NoMenuShadows
 
 #
@@ -433,16 +461,16 @@ Button2 =	: frame		: f.raiselower
 # The browser is named the way res/xorg/applications/renames names it:
 # program and role together, so the entry says what it opens.
 #
-menu "defops" ("#1b1b1b":"#e9e9e9")
+menu "defops" ("#141a24":"#eef3fd")
 {
     "LikeOS"		f.title
     "Xterm"		!"xterm&"
-    "Explorer"		!"likeos-explorer &"
+    "LikeOS Explorer"	!"likeos-explorer &"
     "Editor"		!"mousepad &"
     "Xnedit"	!"xnedit &"
     "Mail"		!"claws-mail &"
     "Luakit Web Browser"	!"luakit &"
-    "Media Player"	!"mediaplayer &"
+    "LikeOS Media Player"	!"mediaplayer &"
     "Calculator"	!"xcalc &"
     ""			f.separator
     "Restart session"	f.restart
@@ -468,8 +496,8 @@ Function "exit-session"
 # on from a menu after the fact.
 #
 
-menu "windowops" ("#1b1b1b":"#e9e9e9") {
-    "Windows"		f.title
+menu "windowops" ("#141a24":"#eef3fd") {
+    "Window"		f.title
     "Occupy"		f.occupy
     "Occupy All"	f.occupyall
     "Iconify"		f.iconify

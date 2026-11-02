@@ -2,9 +2,10 @@
 //
 // The values every LikeOS surface is built from, named by what they are for
 // rather than what they look like: spacing on a 4-pixel grid, corner radii,
-// the type ramp, icon and control sizes, and the semantic colours, each an
-// alias of the palette in _colors.scss.  The widget rules below this file
-// (_likeos.scss, _likeos-widgets.scss, _explorer.scss) use these names, so a
+// the type ramp, icon and control sizes, and the semantic colours of the
+// light (program) palette and the dark (shell) palette, each an alias of
+// _colors.scss.  The widget rules below this file (_likeos.scss,
+// _likeos-widgets.scss and the program partials) use these names, so a
 // change here changes every place that means the same thing -- and a value
 // that appears nowhere in this file is a value no rule should be using.
 //
@@ -19,12 +20,18 @@ $space-l: 16px;
 $space-xl: 24px;
 $space-xxl: 32px;
 
-// Corner radii: controls, and the things that float above them.
-$radius-control: 4px;
-$radius-overlay: 8px;
+// Corner radii.  Controls and the rows of lists and menus are 6; tiles and
+// cards 8; windows, menus and popovers 10; the shell's flyouts and the
+// launcher 14.
+$radius-control: 6px;
+$radius-row: 6px;
+$radius-tile: 8px;
 $radius-card: 8px;
+$radius-overlay: 10px;
+$radius-window: 10px;
+$radius-flyout: 14px;
 
-// Type ramp (Selawik, at Windows 11's sizes for 96 dpi).
+// Type ramp (Selawik, at 96 dpi).
 $type-caption: 7.5pt;
 $type-body: 9pt;
 $type-body-large: 10.5pt;
@@ -41,27 +48,71 @@ $height-row: 32px;
 $height-row-compact: 24px;
 $height-tab: 34px;
 $height-command: 36px;
+$height-title: 36px;               // a window's title row
+$height-menu-item: 30px;           // a menu, combo box list or popover row
 $width-pane: 300px;
+$width-dialog-button: 96px;        // the narrowest button in a dialog's strip
 
-// Colours by role.
-$color-window: $bg_color;          // Mica: the window behind everything
+// Keyboard focus: a ring in the accent highlight, two pixels wide, one
+// pixel outside the control, its corners two pixels rounder than the
+// control's.  Shown only after keyboard navigation.
+$focus-ring-width: 2px;
+$focus-ring-offset: 1px;
+$focus-ring-color: $accent_highlight_color;
+
+// Colours by role: programs (light).
+$color-window: $bg_color;          // the window behind everything
+$color-title: $title_active_color; // an active title row
 $color-layer: $control_color;      // a raised layer: panes, command bar
 $color-card: $base_color;          // content: lists, fields, cards
 $color-text: $fg_color;
 $color-text-secondary: $secondary_text_color;
-$color-stroke: $borders_color;
-$color-stroke-strong: $strong_borders_color;
-$color-accent: $accent_light_color;
-$color-accent-fill: $accent_color;
-$color-hover: $subtle_hover_color;
+$color-text-disabled: $insensitive_fg_color;
+$color-stroke: $borders_color;     // control and card hairlines
+$color-stroke-edge: $alt_borders_color; // a control's deeper bottom edge
+$color-stroke-strong: $strong_borders_color; // field edge, check box rim
+$color-separator: $menu_separator_color;
+$color-accent: $accent_highlight_color;  // selection, focus, progress
+$color-accent-fill: $accent_color;       // accent buttons, checked toggles
+$color-accent-hover: $accent_hover_color;
+$color-accent-pressed: $accent_active_color;
+$color-link: $link_color;
+$color-link-visited: $link_visited_color;
+$color-hover: $subtle_hover_color;       // flat buttons, rows
 $color-pressed: $subtle_active_color;
+$color-item-hover: $list_hover_color;    // file lists, sidebars
 $color-selection: $list_selected_color;
 $color-selection-hover: $list_selected_hover_color;
-$color-item-hover: $list_hover_color;
+$color-selection-inactive: $list_inactive_selected_color;
+$color-flyout: $menu_color;        // menus, popovers
+$color-flyout-stroke: $menu_border_color;
+$color-control: $control_color;    // the face of a button, combo, field
+$color-control-hover: $control_hover_color;
+$color-control-pressed: $control_active_color;
+$color-critical: $error_color;
+$color-caution: $warning_color;
+$color-success: $success_color;
+$color-close: $close_hover_color;  // a caption close button under the pointer
+$color-close-pressed: $close_active_color;
+$color-frame: $window_border_color;
+$color-frame-inactive: $window_border_inactive_color;
+
+// Colours by role: the shell (dark).
+$shell-bg: $shell_bg_color;        // panel, launcher, flyouts
+$shell-raised: $shell_raised_color;  // cards, entries, tiles in a flyout
+$shell-hover: $shell_hover_color;
+$shell-active: $shell_active_color;
+$shell-border: $shell_border_color;  // the frame of a flyout
+$shell-text: $shell_text_color;
+$shell-text-secondary: $shell_text_secondary_color;
+$shell-text-disabled: $shell_text_disabled_color;
+$shell-accent: $shell_accent_color;  // indicators, focus, links on dark
+$shell-accent-fill: $shell_accent_fill_color; // switches on, slider fill
 
 // The same colours for programs that style themselves at run time and read
 // a theme's named colours (GtkStyleContext lookup, CSS @name).
 @define-color likeos_window #{$color-window};
+@define-color likeos_title #{$color-title};
 @define-color likeos_layer #{$color-layer};
 @define-color likeos_card #{$color-card};
 @define-color likeos_text #{$color-text};
@@ -69,3 +120,14 @@ $color-item-hover: $list_hover_color;
 @define-color likeos_stroke #{$color-stroke};
 @define-color likeos_accent #{$color-accent};
 @define-color likeos_selection #{$color-selection};
+@define-color likeos_flyout #{$color-flyout};
+@define-color likeos_flyout_stroke #{$color-flyout-stroke};
+@define-color likeos_accent_fill #{$color-accent-fill};
+@define-color likeos_control #{$color-control};
+@define-color likeos_shell_bg #{$shell-bg};
+@define-color likeos_shell_raised #{$shell-raised};
+@define-color likeos_shell_border #{$shell-border};
+@define-color likeos_shell_text #{$shell-text};
+@define-color likeos_shell_text_secondary #{$shell-text-secondary};
+@define-color likeos_shell_accent #{$shell-accent};
+@define-color likeos_shell_accent_fill #{$shell-accent-fill};

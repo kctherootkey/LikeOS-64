@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: network-server, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="5.333" x2="0" y2="21.333"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="40"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="42.667" x2="0" y2="58.667"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M10.667 5.333H53.333A2.667 2.667 0 0 1 56 8V18.667A2.667 2.667 0 0 1 53.333 21.333H10.667A2.667 2.667 0 0 1 8 18.667V8A2.667 2.667 0 0 1 10.667 5.333Z" fill="url(#g1)"/>
+<path d="M48 10.667H50.667V13.333H48Z" fill="#46d17f"/>
+<path d="M14.667 10.667V16M17.333 10.667V16" fill="none" stroke="#8d97a8" stroke-width="2.667" stroke-linecap="butt" stroke-linejoin="round"/>
+<path d="M10.667 24H53.333A2.667 2.667 0 0 1 56 26.667V37.333A2.667 2.667 0 0 1 53.333 40H10.667A2.667 2.667 0 0 1 8 37.333V26.667A2.667 2.667 0 0 1 10.667 24Z" fill="url(#g2)"/>
+<path d="M48 29.333H50.667V32H48Z" fill="#4f8cff"/>
+<path d="M14.667 29.333V34.667M17.333 29.333V34.667" fill="none" stroke="#8d97a8" stroke-width="2.667" stroke-linecap="butt" stroke-linejoin="round"/>
+<path d="M10.667 42.667H53.333A2.667 2.667 0 0 1 56 45.333V56A2.667 2.667 0 0 1 53.333 58.667H10.667A2.667 2.667 0 0 1 8 56V45.333A2.667 2.667 0 0 1 10.667 42.667Z" fill="url(#g3)"/>
+<path d="M48 48H50.667V50.667H48Z" fill="#46d17f"/>
+<path d="M14.667 48V53.333M17.333 48V53.333" fill="none" stroke="#8d97a8" stroke-width="2.667" stroke-linecap="butt" stroke-linejoin="round"/>
+</g>
+</svg>

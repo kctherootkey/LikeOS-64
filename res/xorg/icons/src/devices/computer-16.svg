@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: computer, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="44" x2="0" y2="48"><stop offset="0" stop-color="#9ea8b8"/><stop offset="1" stop-color="#c3cad6"/></linearGradient><linearGradient id="g2" gradientUnits="userSpaceOnUse" x1="0" y1="48" x2="0" y2="52"><stop offset="0" stop-color="#e3e8ef"/><stop offset="1" stop-color="#aab3c2"/></linearGradient><linearGradient id="g3" gradientUnits="userSpaceOnUse" x1="0" y1="8" x2="0" y2="44"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><linearGradient id="g4" gradientUnits="userSpaceOnUse" x1="8" y1="40" x2="56" y2="12"><stop offset="0" stop-color="#2a5bd7"/><stop offset="1" stop-color="#7fb2ff"/></linearGradient></defs>
+<g transform="scale(0.25)">
+<path d="M28 43H36V48.01H28Z" fill="url(#g1)"/>
+<path d="M20 48H44V52H20Z" fill="url(#g2)"/>
+<path d="M8 8H56A4 4 0 0 1 60 12V40A4 4 0 0 1 56 44H8A4 4 0 0 1 4 40V12A4 4 0 0 1 8 8Z" fill="url(#g3)"/>
+<path d="M8 12H56V40H8Z" fill="url(#g4)"/>
+</g>
+</svg>

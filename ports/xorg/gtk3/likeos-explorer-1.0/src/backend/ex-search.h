@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: search.
+// LikeOS Explorer: search.
 //
 // A query is words that must all appear in a name (case does not matter),
 // or a pattern with * and ?, plus filters:

@@ -1,4 +1,4 @@
-// LikeOS -- File Explorer: the item views.
+// LikeOS Explorer: the item views.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -8,6 +8,7 @@
 #include "services/ex-clipboard.h"
 #include "backend/ex-util.h"
 
+#include <math.h>
 #include <string.h>
 
 /* How long a request to select or rename something not shown yet waits for
@@ -18,6 +19,13 @@
 /* How long the item after deleted ones waits to be selected (the deletion
  * runs in the background, and a big folder takes a while). */
 #define EX_ANCHOR_US (60 * G_USEC_PER_SEC)
+/* Row heights of the Details and List views, and of Compact view, in
+ * pixels. */
+#define EX_ROW_HEIGHT 28
+#define EX_ROW_HEIGHT_COMPACT 22
+/* The style class of the item views (the theme's look for them, apart
+ * from the navigation pane's tree). */
+#define EX_CLASS_ITEMS "ex-items"
 
 static const GtkTargetEntry drag_targets[] = {
 	{ (char *)"text/uri-list", 0, 0 },
@@ -35,7 +43,7 @@ struct _ExFileView {
 
 	GtkWidget *tree_sw, *tree;
 	GtkTreeViewColumn *c_name, *c_2, *c_3, *c_size;
-	GtkCellRenderer *r_name;
+	GtkCellRenderer *r_icon, *r_name;
 	GtkWidget *icon_sw, *icons;
 	GtkCellRenderer *ri_pix, *ri_text;
 	int icon_size;
@@ -48,8 +56,8 @@ struct _ExFileView {
 	GFile *pending_rename;
 	gint64 rename_until;
 
-	/* Selected after the selected items are deleted, as in Windows: the
-	 * item that takes their place. */
+	/* Selected after the selected items are deleted: the item that takes
+	 * their place. */
 	GFile *anchor;
 	gint64 anchor_until;
 
@@ -71,7 +79,6 @@ struct _ExFileView {
 	GdkDragContext *drag;
 	GPtrArray *drag_files; /* GFile */
 	GdkPixbuf *drag_icon;
-	char *drag_label;
 	char *drag_hint;
 	GFile *hint_dest; /* the answer below is for this destination */
 	GdkDragAction hint_action;
@@ -364,11 +371,18 @@ static ExFile *file_at(GtkTreeModel *tm, GtkTreeIter *it)
 	return ex_folder_model_get_file(EX_FOLDER_MODEL(tm), it);
 }
 
+/* Whether the name is shown without its extension: when extensions are
+ * hidden, and for a shortcut always (its name is what it starts). */
+static gboolean ext_hidden(ExFileView *v, ExFile *f)
+{
+	return !ex_file_is_dir(f) && (!v->show_ext || ex_icons_is_shortcut(f));
+}
+
 static char *shown_name(ExFileView *v, ExFile *f)
 {
 	const char *n = ex_file_get_name(f);
 
-	if (v->show_ext || ex_file_is_dir(f))
+	if (!ext_hidden(v, f))
 		return g_strdup(n);
 	const char *ext = ex_name_extension(n);
 	return g_strndup(n, (gsize)(ext - n));
@@ -414,7 +428,7 @@ static void cell_name(GtkCellLayout *l, GtkCellRenderer *r, GtkTreeModel *tm,
 
 	/* Three lines only in the Tiles icon view itself (see cell_icon()). */
 	if (!GTK_IS_TREE_VIEW_COLUMN(l) && !strcmp(v->mode, "tiles")) {
-		char *kind = ex_file_get_kind_label(f);
+		char *kind = ex_icons_kind_label(f);
 		char *size = ex_file_is_dir(f) ? g_strdup("") :
 						 ex_format_size(ex_file_get_size(f));
 		char *m = g_markup_printf_escaped(
@@ -443,7 +457,7 @@ static void cell_mtime(GtkTreeViewColumn *c, GtkCellRenderer *r,
 static void cell_type(GtkTreeViewColumn *c, GtkCellRenderer *r,
 		      GtkTreeModel *tm, GtkTreeIter *it, gpointer data)
 {
-	char *t = ex_file_get_kind_label(file_at(tm, it));
+	char *t = ex_icons_kind_label(file_at(tm, it));
 
 	g_object_set(r, "text", t, NULL);
 	g_free(t);
@@ -453,6 +467,8 @@ static void cell_size(GtkTreeViewColumn *c, GtkCellRenderer *r,
 		      GtkTreeModel *tm, GtkTreeIter *it, gpointer data)
 {
 	ExFile *f = file_at(tm, it);
+	/* The size in the unit that suits it ("4.2 MB"), as every other
+	 * place in the system writes sizes. */
 	char *t = ex_file_is_dir(f) ? g_strdup("") :
 				      ex_format_size(ex_file_get_size(f));
 
@@ -503,6 +519,51 @@ static void header_clicked(GtkTreeViewColumn *c, ExFileView *v)
 	g_signal_emit(v, sigs[SIG_SORT], 0, col, asc);
 }
 
+/* A column's header: the title at the left, and for the column the items
+ * are sorted by a small chevron at the right end, centred on the title's
+ * line -- pointing up for ascending -- instead of GTK's arrow.  Drawn over
+ * the header button, in the accent colour. */
+static gboolean header_draw(GtkWidget *b, cairo_t *cr, GtkTreeViewColumn *c)
+{
+	GtkStyleContext *sc = gtk_widget_get_style_context(b);
+	gboolean up = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(c), "ex-up"));
+	double cx = gtk_widget_get_allocated_width(b) - 14.5;
+	double mid = gtk_widget_get_allocated_height(b) / 2.0;
+	double top = floor(mid) - 1.5, bottom = floor(mid) + 2.5;
+	GdkRGBA col;
+
+	if (!g_object_get_data(G_OBJECT(c), "ex-sorted"))
+		return FALSE;
+	if (!gtk_style_context_lookup_color(sc, "likeos_accent_fill", &col))
+		gtk_style_context_get_color(sc, gtk_style_context_get_state(sc),
+					    &col);
+	cairo_save(cr);
+	cairo_set_line_width(cr, 1.25);
+	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+	cairo_move_to(cr, cx - 4, up ? bottom : top);
+	cairo_line_to(cr, cx, up ? top : bottom);
+	cairo_line_to(cr, cx + 4, up ? bottom : top);
+	gdk_cairo_set_source_rgba(cr, &col);
+	cairo_stroke(cr);
+	cairo_restore(cr);
+	return FALSE;
+}
+
+/* After the column joined the tree: its header button exists then. */
+static void column_header(GtkTreeViewColumn *c)
+{
+	GtkWidget *b = gtk_tree_view_column_get_button(c);
+
+	if (b)
+		g_signal_connect_after(b, "draw", G_CALLBACK(header_draw), c);
+}
+
+static void column_title(GtkTreeViewColumn *c, const char *title)
+{
+	gtk_tree_view_column_set_title(c, title);
+}
+
 static GtkTreeViewColumn *text_column(ExFileView *v, const char *title,
 				      int width)
 {
@@ -534,22 +595,22 @@ static void apply_columns(ExFileView *v)
 {
 	switch (v->cols) {
 	case EX_COLUMNS_TRASH:
-		gtk_tree_view_column_set_title(v->c_2, "Original location");
+		column_title(v->c_2, "Original location");
 		set_col_func(v->c_2, cell_origin, EX_SORT_ORIGIN, v);
-		gtk_tree_view_column_set_title(v->c_3, "Date deleted");
+		column_title(v->c_3, "Date deleted");
 		set_col_func(v->c_3, cell_deleted, EX_SORT_DELETED, v);
 		break;
 	case EX_COLUMNS_SEARCH:
-		gtk_tree_view_column_set_title(v->c_2, "Folder");
+		column_title(v->c_2, "Folder");
 		set_col_func(v->c_2, cell_folder, EX_SORT_NAME, v);
-		gtk_tree_view_column_set_title(v->c_3, "Date modified");
+		column_title(v->c_3, "Date modified");
 		set_col_func(v->c_3, cell_mtime, EX_SORT_MODIFIED, v);
 		break;
 	case EX_COLUMNS_FOLDER:
 	default:
-		gtk_tree_view_column_set_title(v->c_2, "Date modified");
+		column_title(v->c_2, "Date modified");
 		set_col_func(v->c_2, cell_mtime, EX_SORT_MODIFIED, v);
-		gtk_tree_view_column_set_title(v->c_3, "Type");
+		column_title(v->c_3, "Type");
 		set_col_func(v->c_3, cell_type, EX_SORT_TYPE, v);
 		break;
 	}
@@ -560,7 +621,7 @@ static void apply_columns(ExFileView *v)
 static void show_sort_indicator(ExFileView *v)
 {
 	ExSortColumn col;
-	gboolean asc;
+	gboolean asc, shown = FALSE;
 	GtkTreeViewColumn *all[] = { v->c_name, v->c_2, v->c_3, v->c_size };
 
 	if (!v->model)
@@ -569,10 +630,39 @@ static void show_sort_indicator(ExFileView *v)
 	for (gsize i = 0; i < G_N_ELEMENTS(all); i++) {
 		int c = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(all[i]),
 							  "ex-sort"));
-		gtk_tree_view_column_set_sort_indicator(all[i], c == (int)col);
+		GtkWidget *b = gtk_tree_view_column_get_button(all[i]);
+		/* One chevron: a search's Folder column sorts by name too. */
+		gboolean on = c == (int)col && !shown;
+
+		shown |= on;
+		/* GTK's own indicator stays off (header_draw() draws the
+		 * chevron); the order is still told to the column. */
+		gtk_tree_view_column_set_sort_indicator(all[i], FALSE);
 		gtk_tree_view_column_set_sort_order(
 			all[i], asc ? GTK_SORT_ASCENDING : GTK_SORT_DESCENDING);
+		g_object_set_data(G_OBJECT(all[i]), "ex-sorted",
+				  GINT_TO_POINTER(on));
+		g_object_set_data(G_OBJECT(all[i]), "ex-up", GINT_TO_POINTER(asc));
+		if (b)
+			gtk_widget_queue_draw(b);
 	}
+}
+
+/* The columns after the name in the secondary text colour: the name reads
+ * first.  Looked up again when the theme changes. */
+static void tree_style_updated(GtkWidget *w, ExFileView *v)
+{
+	GtkStyleContext *sc = gtk_widget_get_style_context(w);
+	GtkTreeViewColumn *cols[] = { v->c_2, v->c_3, v->c_size };
+	GdkRGBA c;
+
+	if (!gtk_style_context_lookup_color(sc, "likeos_text_secondary", &c)) {
+		gtk_style_context_get_color(sc, GTK_STATE_FLAG_NORMAL, &c);
+		c.alpha *= 0.7;
+	}
+	for (gsize i = 0; i < G_N_ELEMENTS(cols); i++)
+		g_object_set(g_object_get_data(G_OBJECT(cols[i]), "ex-renderer"),
+			     "foreground-rgba", &c, NULL);
 }
 
 /* ---- events -------------------------------------------------------------------- */
@@ -695,9 +785,9 @@ static gboolean button_press(GtkWidget *w, GdkEventButton *ev, ExFileView *v)
 	if (ev->type != GDK_BUTTON_PRESS)
 		return FALSE;
 	p = path_at(v, ev->x, ev->y);
-	/* A press on an item, as in Windows: it is selected at once (Ctrl:
-	 * added), and moving on drags the selection -- GTK's tree would start
-	 * a selection rectangle from an unselected row instead.  Releasing
+	/* A press on an item: it is selected at once (Ctrl: added), and
+	 * moving on drags the selection -- GTK's tree would start a
+	 * selection rectangle from an unselected row instead.  Releasing
 	 * without moving settles the click.  Shift keeps GTK's range
 	 * selection; a press on no item, the rectangle. */
 	if (ev->button == 1 && p && !(ev->state & GDK_SHIFT_MASK)) {
@@ -907,7 +997,7 @@ static void name_edited(GtkCellRendererText *r, const char *path,
 
 		if (strcmp(text, shown) != 0) {
 			/* With extensions hidden, the edit is of the stem. */
-			char *name = (!v->show_ext && !ex_file_is_dir(f)) ?
+			char *name = ext_hidden(v, f) ?
 					     g_strconcat(text,
 							 ex_name_extension(
 								 ex_file_get_name(f)),
@@ -952,7 +1042,7 @@ static void editing_started(GtkCellRenderer *r, GtkCellEditable *ed,
 		gtk_entry_set_text(GTK_ENTRY(ed), n);
 		/* The name without its extension is selected, so typing
 		 * replaces the name and keeps the type. */
-		if (!ex_file_is_dir(f) && v->show_ext) {
+		if (!ex_file_is_dir(f) && !ext_hidden(v, f)) {
 			const char *ext = ex_name_extension(n);
 
 			end = (int)g_utf8_strlen(n, (gssize)(ext - n));
@@ -1014,8 +1104,10 @@ static void drag_data_get(GtkWidget *w, GdkDragContext *ctx,
 
 /* Picture sizes, in pixels. */
 #define EX_DRAG_ICON 48
-#define EX_DRAG_TEXT_W 200
 #define EX_DRAG_PAD 6
+/* Each picture stacked behind the first, when several items go, sits this
+ * much further right and up. */
+#define EX_DRAG_STACK 3
 
 static void theme_color(GtkWidget *w, const char *name, const char *fallback,
 			GdkRGBA *c)
@@ -1038,128 +1130,122 @@ static void rounded(cairo_t *cr, double x, double y, double w, double h,
 	cairo_close_path(cr);
 }
 
-/* What Windows shows under the pointer: the item as it looks selected --
- * icon and name in the selection's colour -- with the number of items on
- * a badge when there are several, and, over a place that takes them, what
- * dropping does there ("Move to Documents"). */
+/* What a drag shows under the pointer: the item's icon alone -- with two
+ * more pictures stacked behind it and the number of items on a badge when
+ * there are several -- and, over a place that takes them, what dropping
+ * does there ("Move to Documents") on a card below it.  Nothing is drawn
+ * around them and every part is opaque: on a screen without a compositing
+ * manager the drag's window takes the shape of the picture, so what is
+ * under the pointer shows around the icon. */
 static void drag_paint(ExFileView *v)
 {
 	GtkWidget *w = GTK_WIDGET(v);
 	int scale = gtk_widget_get_scale_factor(w);
-	PangoLayout *name = gtk_widget_create_pango_layout(w, v->drag_label);
 	PangoLayout *hint = v->drag_hint ?
 				    gtk_widget_create_pango_layout(w, v->drag_hint) :
 				    NULL;
+	PangoLayout *count = NULL;
 	guint n = v->drag_files ? v->drag_files->len : 0;
-	GdkRGBA sel, accent, card, text, stroke;
-	int nw, nh, hw = 0, hh = 0, bw, bh, width, height;
+	int stack = n > 2 ? 2 : n > 1 ? 1 : 0;
+	GdkRGBA accent, card, text, stroke;
+	int hw = 0, hh = 0, cw = 0, ch = 0, width, height;
+	double half, r = 0, ix, iy, cx = 0, cy = 0;
 	cairo_surface_t *s;
 	cairo_t *cr;
 
-	theme_color(w, "likeos_selection", "theme_selected_bg_color", &sel);
 	theme_color(w, "likeos_accent", "theme_selected_bg_color", &accent);
 	theme_color(w, "likeos_card", "theme_base_color", &card);
 	theme_color(w, "likeos_text", "theme_fg_color", &text);
 	theme_color(w, "likeos_stroke", "borders", &stroke);
-	pango_layout_set_width(name, EX_DRAG_TEXT_W * PANGO_SCALE);
-	pango_layout_set_ellipsize(name, PANGO_ELLIPSIZE_MIDDLE);
-	pango_layout_set_alignment(name, PANGO_ALIGN_CENTER);
-	pango_layout_get_pixel_size(name, &nw, &nh);
-	nw = MIN(nw, EX_DRAG_TEXT_W);
 	if (hint)
 		pango_layout_get_pixel_size(hint, &hw, &hh);
+	if (n > 1) {
+		char *num = g_strdup_printf("%u", n);
+		PangoAttrList *at = pango_attr_list_new();
 
-	/* The item box, then the hint below it. */
-	bw = MAX(EX_DRAG_ICON, nw) + 2 * EX_DRAG_PAD;
-	bh = EX_DRAG_PAD + EX_DRAG_ICON + 4 + nh + EX_DRAG_PAD;
-	width = MAX(bw, hint ? hw + 4 * EX_DRAG_PAD : 0) + 2;
-	height = bh + (hint ? 4 + hh + 2 * EX_DRAG_PAD : 0) + 2;
+		count = gtk_widget_create_pango_layout(w, num);
+		pango_attr_list_insert(at, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+		pango_layout_set_attributes(count, at);
+		pango_layout_get_pixel_size(count, &cw, &ch);
+		r = MAX(cw, ch) / 2.0 + 3;
+		pango_attr_list_unref(at);
+		g_free(num);
+	}
+
+	/* The icons centred, the badge on the front one's top right corner,
+	 * the hint card under them. */
+	half = EX_DRAG_ICON / 2.0 + EX_DRAG_STACK * stack + 1;
+	if (count)
+		half = MAX(half, EX_DRAG_ICON / 2.0 + r + 2);
+	if (hint)
+		half = MAX(half, (hw + 4 * EX_DRAG_PAD) / 2.0 + 1);
+	width = (int)ceil(2 * half);
+	iy = MAX(EX_DRAG_STACK * stack, count ? r - 2 : 0);
+	height = (int)ceil(iy) + EX_DRAG_ICON + 1 +
+		 (hint ? 4 + hh + 2 * EX_DRAG_PAD + 1 : 0);
+	ix = (width - EX_DRAG_ICON) / 2.0;
 	s = gdk_window_create_similar_image_surface(
 		gtk_widget_get_window(w), CAIRO_FORMAT_ARGB32, width * scale,
 		height * scale, scale);
 	if (!s) {
-		g_object_unref(name);
 		g_clear_object(&hint);
+		g_clear_object(&count);
 		return;
 	}
 	cr = cairo_create(s);
 
-	double bx = (width - bw) / 2.0;
-
-	/* The items see-through, so the place under them stays visible; the
-	 * hint solid. */
-	cairo_push_group(cr);
-	rounded(cr, bx + 0.5, 0.5, bw, bh, 4);
-	cairo_set_source_rgba(cr, sel.red, sel.green, sel.blue, 0.85);
-	cairo_fill_preserve(cr);
-	cairo_set_source_rgba(cr, accent.red, accent.green, accent.blue, 0.45);
-	cairo_set_line_width(cr, 1);
-	cairo_stroke(cr);
 	if (v->drag_icon) {
-		double ix = (width - EX_DRAG_ICON) / 2.0;
-
-		/* Several items: two more pictures stacked behind the first. */
-		for (int k = (n > 2 ? 2 : n > 1 ? 1 : 0); k >= 0; k--) {
+		/* The pictures behind first, the front one over them. */
+		for (int k = stack; k >= 0; k--) {
 			cairo_save(cr);
-			cairo_translate(cr, ix + 3 * k, EX_DRAG_PAD - 3 * k);
+			cairo_translate(cr, ix + EX_DRAG_STACK * k,
+					iy - EX_DRAG_STACK * k);
 			cairo_scale(cr, (double)EX_DRAG_ICON /
 						gdk_pixbuf_get_width(v->drag_icon),
 				    (double)EX_DRAG_ICON /
 					    gdk_pixbuf_get_height(v->drag_icon));
 			gdk_cairo_set_source_pixbuf(cr, v->drag_icon, 0, 0);
-			cairo_paint_with_alpha(cr, k ? 0.5 : 1.0);
+			cairo_paint(cr);
 			cairo_restore(cr);
 		}
 	}
-	gdk_cairo_set_source_rgba(cr, &text);
-	cairo_move_to(cr, (width - EX_DRAG_TEXT_W) / 2.0,
-		      EX_DRAG_PAD + EX_DRAG_ICON + 4);
-	pango_cairo_show_layout(cr, name);
-	if (n > 1) {
-		char *count = g_strdup_printf("%u", n);
-		PangoLayout *c = gtk_widget_create_pango_layout(w, count);
-		PangoAttrList *at = pango_attr_list_new();
-		int cw, ch;
-		double r, cx = (width + EX_DRAG_ICON) / 2.0, cy = EX_DRAG_PAD + 4;
-
-		pango_attr_list_insert(at, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-		pango_layout_set_attributes(c, at);
-		pango_layout_get_pixel_size(c, &cw, &ch);
-		r = MAX(cw, ch) / 2.0 + 3;
+	if (count) {
+		/* An accent disc on a white ring, so it stands off the icon. */
+		cx = ix + EX_DRAG_ICON - 4;
+		cy = iy + 4;
+		cairo_arc(cr, cx, cy, r + 1.5, 0, 2 * G_PI);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		cairo_fill(cr);
 		cairo_arc(cr, cx, cy, r, 0, 2 * G_PI);
 		gdk_cairo_set_source_rgba(cr, &accent);
 		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		cairo_move_to(cr, cx - cw / 2.0, cy - ch / 2.0);
-		pango_cairo_show_layout(cr, c);
-		pango_attr_list_unref(at);
-		g_object_unref(c);
-		g_free(count);
+		pango_cairo_show_layout(cr, count);
 	}
-	cairo_pop_group_to_source(cr);
-	cairo_paint_with_alpha(cr, 0.75);
 	if (hint) {
 		double hx = (width - hw) / 2.0 - 2 * EX_DRAG_PAD;
-		double hy = bh + 4;
+		double hy = iy + EX_DRAG_ICON + 4;
 
 		rounded(cr, hx + 0.5, hy + 0.5, hw + 4 * EX_DRAG_PAD,
 			hh + 2 * EX_DRAG_PAD, 4);
 		gdk_cairo_set_source_rgba(cr, &card);
 		cairo_fill_preserve(cr);
 		gdk_cairo_set_source_rgba(cr, &stroke);
+		cairo_set_line_width(cr, 1);
 		cairo_stroke(cr);
 		gdk_cairo_set_source_rgba(cr, &text);
 		cairo_move_to(cr, hx + 2 * EX_DRAG_PAD, hy + EX_DRAG_PAD);
 		pango_cairo_show_layout(cr, hint);
 	}
 	cairo_destroy(cr);
-	/* The pointer at the top middle of the picture, as in Windows. */
+	/* The pointer on the middle of the front icon. */
 	cairo_surface_set_device_offset(s, -(width / 2.0) * scale,
-					-(EX_DRAG_PAD + EX_DRAG_ICON / 2.0) * scale);
+					-(iy + EX_DRAG_ICON / 2.0) * scale);
 	gtk_drag_set_icon_surface(v->drag, s);
 	cairo_surface_destroy(s);
-	g_object_unref(name);
 	g_clear_object(&hint);
+	g_clear_object(&count);
 }
 
 static void drag_clear(ExFileView *v)
@@ -1167,7 +1253,6 @@ static void drag_clear(ExFileView *v)
 	v->drag = NULL;
 	g_clear_pointer(&v->drag_files, g_ptr_array_unref);
 	g_clear_object(&v->drag_icon);
-	g_clear_pointer(&v->drag_label, g_free);
 	g_clear_pointer(&v->drag_hint, g_free);
 	g_clear_object(&v->hint_dest);
 }
@@ -1192,8 +1277,6 @@ static void drag_begin(GtkWidget *w, GdkDragContext *ctx, ExFileView *v)
 		v->drag_icon = ex_icons_for_file(first, EX_DRAG_ICON,
 						 gtk_widget_get_scale_factor(w),
 						 FALSE, TRUE);
-		v->drag_label = a->len == 1 ? g_strdup(ex_file_get_name(first)) :
-					      g_strdup_printf("%u items", a->len);
 		drag_paint(v);
 	}
 	g_ptr_array_unref(a);
@@ -1572,11 +1655,11 @@ static void build_tree(ExFileView *v)
 
 	v->c_name = gtk_tree_view_column_new();
 	gtk_tree_view_column_set_title(v->c_name, "Name");
-	ri = gtk_cell_renderer_pixbuf_new();
+	ri = v->r_icon = gtk_cell_renderer_pixbuf_new();
 	/* A fixed 16-pixel icon cell: its width never depends on what was
-	 * measured before. */
+	 * measured before.  Its height is the row's (set_row_height()). */
 	g_object_set(ri, "xpad", 4, "xalign", 0.0, NULL);
-	gtk_cell_renderer_set_fixed_size(ri, 16 + 2 * 4, -1);
+	gtk_cell_renderer_set_fixed_size(ri, 16 + 2 * 4, EX_ROW_HEIGHT);
 	gtk_tree_view_column_pack_start(v->c_name, ri, FALSE);
 	gtk_cell_layout_set_cell_data_func(GTK_CELL_LAYOUT(v->c_name), ri,
 					   cell_icon, v, NULL);
@@ -1609,7 +1692,14 @@ static void build_tree(ExFileView *v)
 	gtk_tree_view_append_column(GTK_TREE_VIEW(v->tree), v->c_2);
 	gtk_tree_view_append_column(GTK_TREE_VIEW(v->tree), v->c_3);
 	gtk_tree_view_append_column(GTK_TREE_VIEW(v->tree), v->c_size);
+	column_header(v->c_name);
+	column_header(v->c_2);
+	column_header(v->c_3);
+	column_header(v->c_size);
 	apply_columns(v);
+	ex_style_add(v->tree, EX_CLASS_ITEMS);
+	g_signal_connect(v->tree, "style-updated", G_CALLBACK(tree_style_updated),
+			 v);
 
 	g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(v->tree)),
 			 "changed", G_CALLBACK(tree_sel_changed), v);
@@ -1634,10 +1724,12 @@ static void build_icons(ExFileView *v)
 	v->icons = gtk_icon_view_new();
 	gtk_icon_view_set_selection_mode(GTK_ICON_VIEW(v->icons),
 					 GTK_SELECTION_MULTIPLE);
-	gtk_icon_view_set_item_padding(GTK_ICON_VIEW(v->icons), 6);
-	gtk_icon_view_set_column_spacing(GTK_ICON_VIEW(v->icons), 4);
-	gtk_icon_view_set_row_spacing(GTK_ICON_VIEW(v->icons), 4);
+	gtk_icon_view_set_item_padding(GTK_ICON_VIEW(v->icons), 4);
+	gtk_icon_view_set_column_spacing(GTK_ICON_VIEW(v->icons), 2);
+	gtk_icon_view_set_row_spacing(GTK_ICON_VIEW(v->icons), 2);
+	gtk_icon_view_set_margin(GTK_ICON_VIEW(v->icons), 8);
 	atk_object_set_name(gtk_widget_get_accessible(v->icons), "Items");
+	ex_style_add(v->icons, EX_CLASS_ITEMS);
 
 	v->ri_pix = gtk_cell_renderer_pixbuf_new();
 	gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(v->icons), v->ri_pix, FALSE);
@@ -1754,6 +1846,38 @@ void ex_file_view_set_model(ExFileView *v, ExFolderModel *m)
 	show_sort_indicator(v);
 }
 
+/* The icon views' layouts: the picture's size, the
+ * width of an item, whether the name is beside the picture or under it,
+ * and how wide the name may be. */
+static const struct {
+	const char *mode;
+	int icon, width, wrap;
+	gboolean beside;
+} icon_modes[] = {
+	{ "extra-large-icons", 256, 264, 256, FALSE },
+	{ "large-icons", 96, 104, 100, FALSE },
+	{ "icons", 48, 76, 72, FALSE },
+	{ "small-icons", 16, 200, 170, TRUE },
+	{ "tiles", 48, 250, 186, TRUE },
+};
+
+/* The tree's rows: their height lives in the icon cell, and the tree
+ * measures it once (fixed-height mode) -- switched off and on, with the
+ * rows marked dirty, the tree measures again. */
+static void set_row_height(ExFileView *v, int height)
+{
+	int h;
+
+	gtk_cell_renderer_get_fixed_size(v->r_icon, NULL, &h);
+	if (h == height)
+		return;
+	gtk_cell_renderer_set_fixed_size(v->r_icon, 16 + 2 * 4, height);
+	gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(v->tree), FALSE);
+	gtk_tree_view_set_fixed_height_mode(GTK_TREE_VIEW(v->tree), TRUE);
+	/* The rows measured before keep their heights until marked dirty. */
+	gtk_tree_view_columns_autosize(GTK_TREE_VIEW(v->tree));
+}
+
 void ex_file_view_set_mode(ExFileView *v, const char *mode)
 {
 	GtkStyleContext *sc = gtk_widget_get_style_context(v->tree);
@@ -1762,41 +1886,44 @@ void ex_file_view_set_mode(ExFileView *v, const char *mode)
 	v->mode = g_strdup(mode);
 	if (is_tree_mode(mode)) {
 		gboolean details = !strcmp(mode, "details");
+		gboolean compact = !strcmp(mode, "compact");
 
 		gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(v->tree), details);
 		gtk_tree_view_column_set_visible(v->c_2, details);
 		gtk_tree_view_column_set_visible(v->c_3, details);
 		gtk_tree_view_column_set_visible(v->c_size, details);
-		if (!strcmp(mode, "compact"))
+		if (compact)
 			gtk_style_context_add_class(sc, EX_CLASS_COMPACT);
 		else
 			gtk_style_context_remove_class(sc, EX_CLASS_COMPACT);
+		set_row_height(v, compact ? EX_ROW_HEIGHT_COMPACT : EX_ROW_HEIGHT);
 		gtk_stack_set_visible_child_name(GTK_STACK(v), "tree");
 	} else {
 		GtkIconView *iv = GTK_ICON_VIEW(v->icons);
+		gsize k = 2; /* Medium icons for a mode not known here */
 
-		if (!strcmp(mode, "large-icons")) {
-			v->icon_size = 128;
-			gtk_icon_view_set_item_orientation(iv,
-							   GTK_ORIENTATION_VERTICAL);
-			gtk_icon_view_set_item_width(iv, 148);
-			g_object_set(v->ri_text, "xalign", 0.5, "alignment",
-				     PANGO_ALIGN_CENTER, "wrap-width", 140, NULL);
-		} else if (!strcmp(mode, "tiles")) {
-			v->icon_size = 48;
-			gtk_icon_view_set_item_orientation(
-				iv, GTK_ORIENTATION_HORIZONTAL);
-			gtk_icon_view_set_item_width(iv, 260);
-			g_object_set(v->ri_text, "xalign", 0.0, "alignment",
-				     PANGO_ALIGN_LEFT, "wrap-width", 190, NULL);
-		} else {
-			v->icon_size = 48;
-			gtk_icon_view_set_item_orientation(iv,
-							   GTK_ORIENTATION_VERTICAL);
-			gtk_icon_view_set_item_width(iv, 96);
-			g_object_set(v->ri_text, "xalign", 0.5, "alignment",
-				     PANGO_ALIGN_CENTER, "wrap-width", 90, NULL);
-		}
+		for (gsize i = 0; i < G_N_ELEMENTS(icon_modes); i++)
+			if (!strcmp(mode, icon_modes[i].mode))
+				k = i;
+		v->icon_size = icon_modes[k].icon;
+		gtk_icon_view_set_item_orientation(
+			iv, icon_modes[k].beside ? GTK_ORIENTATION_HORIZONTAL :
+						   GTK_ORIENTATION_VERTICAL);
+		gtk_icon_view_set_item_width(iv, icon_modes[k].width);
+		/* Pictures of one size in a cell of that size: a thumbnail
+		 * wider than tall sits on the cell's bottom edge, so the names
+		 * under a row of them line up. */
+		gtk_cell_renderer_set_fixed_size(v->ri_pix, v->icon_size,
+						 v->icon_size);
+		g_object_set(v->ri_pix, "xalign", 0.5, "yalign",
+			     icon_modes[k].beside ? 0.5 : 1.0, NULL);
+		g_object_set(v->ri_text, "xalign", icon_modes[k].beside ? 0.0 : 0.5,
+			     "yalign", icon_modes[k].beside ? 0.5 : 0.0,
+			     "alignment",
+			     icon_modes[k].beside ? PANGO_ALIGN_LEFT :
+						    PANGO_ALIGN_CENTER,
+			     "wrap-width", icon_modes[k].wrap, NULL);
+		gtk_icon_view_set_spacing(iv, icon_modes[k].beside ? 8 : 2);
 		gtk_stack_set_visible_child_name(GTK_STACK(v), "icons");
 		/* The layout depends on the item sizes just changed. */
 		gtk_icon_view_set_model(iv, NULL);

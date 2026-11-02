@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: audio-speakers, 16 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#535e75"/><stop offset="1" stop-color="#2c3344"/></linearGradient><radialGradient id="r2" gradientUnits="userSpaceOnUse" cx="32" cy="15.4" r="6.8"><stop offset="0" stop-color="#c9d0dc"/><stop offset="1" stop-color="#6b7486"/></radialGradient><radialGradient id="r3" gradientUnits="userSpaceOnUse" cx="32" cy="37" r="13.2"><stop offset="0" stop-color="#c9d0dc"/><stop offset="1" stop-color="#6b7486"/></radialGradient></defs>
+<g transform="scale(0.25)">
+<path d="M16 4H48A4 4 0 0 1 52 8V56A4 4 0 0 1 48 60H16A4 4 0 0 1 12 56V8A4 4 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M25.2 17.44A6.8 6.8 0 1 0 38.8 17.44A6.8 6.8 0 1 0 25.2 17.44Z" fill="url(#r2)"/>
+<path d="M18.8 40.96A13.2 13.2 0 1 0 45.2 40.96A13.2 13.2 0 1 0 18.8 40.96Z" fill="url(#r3)"/>
+</g>
+</svg>

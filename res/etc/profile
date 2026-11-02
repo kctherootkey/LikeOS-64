@@ -24,20 +24,20 @@ export EDITOR=nano
 
 # The time zone, as an Olson name ("Europe/Berlin", "America/New_York").
 #
-# It has to be said here because nothing else on this system knows it.  This
-# libc has no time zone database: its localtime() is gmtime(), tzname is fixed
-# at "UTC", and there is no /etc/localtime or /usr/share/zoneinfo on the image
-# to read -- so a C program's idea of local time is UTC and stays UTC.
+# Three readers take the zone from here, each with rules of its own: libc
+# (a built-in table of zones, falling back to /etc/timezone when TZ is unset),
+# GLib (the compiled files in /usr/share/zoneinfo, the tzdata package; it reads
+# /etc/timezone itself when TZ is unset) and ICU.
 #
-# The browser is the part that suffers.  ICU carries a complete zone database
-# of its own inside /lib/libicudata.so (the rules through 2026a), and that is
-# what JavaScript's Date and Intl actually ask; but ICU was compiled for this
-# system without the code that reads /etc/localtime, so the ONLY way it learns
-# the zone is this variable.  Unset, every page sees a browser running at
-# UTC+0 with no daylight saving: Date.getTimezoneOffset() returns 0 and
-# Intl.DateTimeFormat().resolvedOptions().timeZone says "UTC".  Booking sites,
-# calendars and anything that compares a date against "today" then work off a
-# clock one or two hours from the one on the wall.
+# The browser is the one that needs the variable.  ICU carries a complete zone
+# database of its own inside /lib/libicudata.so (the rules through 2026a), and
+# that is what JavaScript's Date and Intl actually ask; but ICU was compiled
+# for this system without the code that reads /etc/localtime, so the ONLY way
+# it learns the zone is this variable.  Unset, every page sees a browser
+# running at UTC+0 with no daylight saving: Date.getTimezoneOffset() returns 0
+# and Intl.DateTimeFormat().resolvedOptions().timeZone says "UTC".  Booking
+# sites, calendars and anything that compares a date against "today" then work
+# off a clock one or two hours from the one on the wall.
 #
 # /etc/timezone holds the name so it can be changed in one place.
 if [ -z "$TZ" ]; then
