@@ -1,0 +1,76 @@
+// LikeOS reusable widgets (the lx-* widgets of LikeOS programs).
+//
+// Breadcrumb address bar, segmented control, split button, flyout: shapes
+// Windows 11 has that GTK does not, written once as widgets and styled once
+// here, from the tokens, so every program that uses one looks the same.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+// The address bar: a text field's frame around a row of crumbs.
+lx-breadcrumb {
+  min-height: $height-control;
+  border: 1px solid $color-stroke;
+  border-bottom-color: $alt_borders_color;
+  border-radius: $radius-control;
+  background-color: $color-layer;
+
+  .lx-crumbs { margin: 0 $space-xs; }
+
+  button.lx-crumb {
+    min-height: $height-control - 8px;
+    padding: 0 $space-s;
+    border-radius: $radius-control;
+    color: $color-text;
+  }
+
+  button.lx-chevron {
+    min-height: $height-control - 8px;
+    min-width: 16px;
+    padding: 0 $space-xxs;
+    border-radius: $radius-control;
+    -gtk-icon-transform: scale(0.75);
+  }
+
+  button.lx-crumb:hover, button.lx-chevron:hover {
+    background-color: $color-hover;
+  }
+
+  // Editing: the frame belongs to the entry now.
+  entry {
+    min-height: $height-control - 2px;
+    border: none;
+    border-radius: $radius-control;
+  }
+}
+
+// A row of linked toggles of which one is on.
+lx-segmented {
+  button {
+    min-height: $height-control - 8px;
+    min-width: $height-control - 4px;
+    padding: 0 $space-xs;
+    border-radius: $radius-control;
+  }
+
+  button:checked {
+    background-color: $color-hover;
+    box-shadow: inset 0 -2px $color-accent;
+  }
+}
+
+// Command with its other choices behind an arrow.
+.lx-split-button {
+  > button:first-child { padding-right: $space-xs; }
+  > button:last-child { padding: 0 $space-xs; min-width: 16px; }
+}
+
+// Transient panel above the content.
+popover.lx-flyout {
+  border-radius: $radius-overlay;
+  padding: $space-xs;
+
+  .lx-flyout-title {
+    font-weight: $weight-strong;
+    font-size: $type-body-large;
+  }
+}

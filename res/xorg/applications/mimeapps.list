@@ -14,9 +14,12 @@
 # is only worth naming here if its .desktop file is installed.
 
 [Default Applications]
-# Folders open in the file manager, including the one PCManFM opens for its
-# own "Open in New Window".
-inode/directory=pcmanfm.desktop
+# Folders open in File Explorer (likeos-explorer).  The PCManFM desktop asks
+# this same question when a folder on it is opened (gtk3 patch pcmanfm/0007),
+# so a folder window is always Explorer's while the desktop stays PCManFM's.
+# trash: is how other programs ask for the Trash.
+inode/directory=likeos-explorer.desktop
+x-scheme-handler/trash=likeos-explorer.desktop
 
 # Text of every kind goes to Mousepad -- it is the graphical editor on this
 # image, and text/plain is the type most files that are not something else

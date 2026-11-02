@@ -296,6 +296,16 @@ for b in galculator xfce4-terminal hexchat xfconf-query mediaplayer; do
 	staged=$((staged + 1))
 done
 
+# The file manager (gtk3/likeos-explorer-1.0), and the test program for its
+# file-management backend -- run on the system itself it checks the real
+# filesystems, inotify and the Trash, not the build host's.  Its schema and
+# desktop entry arrive with everyone else's below.
+for b in likeos-explorer explorer-backend-test; do
+	[ -f "$SYSROOT/usr/bin/$b" ] || continue
+	cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
+	staged=$((staged + 1))
+done
+
 # The web browser, the language it embeds (interpreter and compiler both --
 # luakit's configuration IS Lua, so the tools belong beside it), and the
 # database shell for the storage everything above keeps in SQLite.
@@ -698,12 +708,16 @@ fi
 #   scalable/         SVG, which needs librsvg to render.  That is not ported
 #                     (it would bring a Rust toolchain with it), so gdk-pixbuf
 #                     cannot load a single one of these files.
-#   256x256, 512x512  Only ever used by something explicitly asking for an icon
-#   96x96, 64x64      that large.  Nothing here does.
 #
-# What stays is 8 through 48, which is every size GtkIconSize maps to: MENU and
-# BUTTON at 16, LARGE_TOOLBAR at 24, DND at 32, DIALOG at 48.  GTK scales from
-# the nearest available size, so a request outside the set is still answered.
+# What stays is every PNG size, 8 through 512.  8 to 48 are the sizes
+# GtkIconSize maps to (MENU and BUTTON 16, LARGE_TOOLBAR 24, DND 32, DIALOG
+# 48); the larger ones are what File Explorer's Large icons and Tiles, its
+# panes and Home, and the media player's cover placeholder draw at.  Without
+# them GTK answered a 128-pixel request by scaling a 48-pixel image up, and
+# every large icon was blurred and blocky.  64 and 96 carry the symbolic
+# icons as well; 256 and 512 are declared scalable from 56 pixels, so an
+# icon between 56 and 512 is drawn from the large artwork, scaled down.
+# (About 11.6 MB.)
 # ---------------------------------------------------------------------------
 if [ -d "$SYSROOT/usr/share/icons/hicolor" ]; then
 	mkdir -p "$DEST/usr/share/icons"
@@ -714,7 +728,8 @@ if [ -d "$SYSROOT/usr/share/icons/Adwaita" ]; then
 	mkdir -p "$DEST/usr/share/icons/Adwaita"
 	cp "$SYSROOT/usr/share/icons/Adwaita/index.theme" \
 		"$DEST/usr/share/icons/Adwaita/" 2>/dev/null || true
-	for sz in 8x8 16x16 22x22 24x24 32x32 48x48; do
+	for sz in 8x8 16x16 22x22 24x24 32x32 48x48 64x64 96x96 256x256 \
+		512x512; do
 		[ -d "$SYSROOT/usr/share/icons/Adwaita/$sz" ] || continue
 		cp -a "$SYSROOT/usr/share/icons/Adwaita/$sz" \
 			"$DEST/usr/share/icons/Adwaita/"
@@ -832,6 +847,19 @@ if [ -f "$renames" ] && [ -d "$DEST/usr/share/applications" ]; then
 		' "$target" >"$target.new" && mv "$target.new" "$target"
 	done <"$renames"
 	staged=$((staged + 1))
+fi
+
+# How the mail program takes attachments, for File Explorer's Share (the
+# X-LikeOS-Attach key; %F stands for the files).  Added to the package's own
+# entry, in its [Desktop Entry] group, rather than replacing the entry --
+# for the reason renames gives.  Explorer reads the key from whichever
+# program is the default for mailto:, so it names no mail program itself.
+mailer="$DEST/usr/share/applications/claws-mail.desktop"
+if [ -f "$mailer" ] && ! grep -q '^X-LikeOS-Attach=' "$mailer"; then
+	awk '
+		{ print }
+		/^\[Desktop Entry\]/ && !done { print "X-LikeOS-Attach=claws-mail --attach %F"; done = 1 }
+	' "$mailer" >"$mailer.new" && mv "$mailer.new" "$mailer"
 fi
 
 # The index of that directory, WITHOUT which none of it has any effect.
@@ -997,6 +1025,11 @@ if [ -f "$root/res/xorg/gtk3/theme/gtk-3.0/gtk.css" ]; then
 	mkdir -p "$DEST/usr/share/themes/LikeOS/gtk-3.0"
 	cp "$root/res/xorg/gtk3/theme/gtk-3.0/gtk.css" \
 		"$DEST/usr/share/themes/LikeOS/gtk-3.0/gtk.css"
+	# The glyph images gtk.css names by relative URL (check marks; drawn
+	# by build.py).
+	mkdir -p "$DEST/usr/share/themes/LikeOS/gtk-3.0/assets"
+	cp "$root"/res/xorg/gtk3/theme/gtk-3.0/assets/*.png \
+		"$DEST/usr/share/themes/LikeOS/gtk-3.0/assets/"
 fi
 if [ -f "$root/res/xorg/gtk3/local.conf" ]; then
 	mkdir -p "$DEST/etc/fonts"

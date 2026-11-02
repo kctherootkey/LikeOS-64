@@ -16,8 +16,9 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
-$control_radius: 4px;
-$overlay_radius: 8px;
+// From the design tokens (_tokens.scss).
+$control_radius: $radius-control;
+$overlay_radius: $radius-overlay;
 $focus_ring: rgba(0, 0, 0, 0.894);
 
 /*********************
@@ -297,11 +298,28 @@ menu menuitem {
       &, &:hover, &:disabled {
         min-height: 16px;
         min-width: 16px;
+        padding: 0;
         border: none;
         box-shadow: none;
         background-image: none;
         color: inherit;
       }
+    }
+  }
+
+  // A checked item's mark: the theme's check, in the text colour.
+  check:checked {
+    &, &:hover {
+      -gtk-icon-source: -gtk-scaled(url("assets/check-menu.png"), url("assets/check-menu@2.png"));
+    }
+  }
+
+  // The chosen one of a set of options (View > Details, Sort > Name) shows
+  // a dot.  The radio buttons below draw their dot with shadows and no
+  // icon, and a menu item has neither, so it needs the glyph back.
+  radio:checked {
+    &, &:hover, &:disabled {
+      -gtk-icon-source: -gtk-recolor(url("resource:///org/gtk/libgtk/theme/Adwaita/assets/bullet-symbolic.symbolic.png"));
     }
   }
 }
@@ -556,7 +574,27 @@ check, radio {
   &:only-child { margin: 0; }
 }
 
-check { border-radius: $control_radius; }
+// The mark is a 16-pixel image (GTK's own check-symbolic PNG), drawn to the
+// size of the content box: a 16-pixel content box inside one pixel of
+// padding keeps the box Windows' 20 pixels (with its border) and draws the
+// mark at its own size.  An 18-pixel content box stretched it, blurred.
+check {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 1px;
+  border-radius: $control_radius;
+
+  // The theme's own marks (build.py draws them for this 16-pixel box, and
+  // at 32 for a doubled screen), shown at their own size in every state --
+  // checked, pressed, disabled.  GTK's check-symbolic picture is a thick
+  // blurred stroke.
+  &:checked { -gtk-icon-source: -gtk-scaled(url("assets/check.png"), url("assets/check@2.png")); }
+  &:indeterminate { -gtk-icon-source: -gtk-scaled(url("assets/dash.png"), url("assets/dash@2.png")); }
+
+  // Pressed, the mark stays as it is: Adwaita squeezes it flat and lets it
+  // spring back, which Windows does not do.
+  &:active { -gtk-icon-transform: none; }
+}
 
 // A selected radio button is an accent ring around a white dot: the ring is
 // the inset shadow, so the dot grows on hover and shrinks while pressed, as
@@ -590,9 +628,19 @@ radio {
 
 checkbutton, radiobutton {
   &.text-button { padding: 4px 0; }
+
+  // A box with no label (a column of permission boxes): the keyboard ring
+  // goes round the box itself, one pixel outside it, as Windows draws it --
+  // not round whatever cell the box was put in.
+  &:not(.text-button) {
+    outline-offset: 1px;
+    -gtk-outline-radius: $control_radius + 3px;
+  }
+
   label { color: $fg_color; }
   &:disabled label { color: $insensitive_fg_color; }
 }
+radiobutton:not(.text-button) { -gtk-outline-radius: 50%; }
 
 /************
  * GtkScale *

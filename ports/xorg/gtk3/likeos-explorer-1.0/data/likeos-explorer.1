@@ -1,0 +1,150 @@
+.\" likeos-explorer.1 - manual page for File Explorer.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages, so
+.\" the installed copy is res/man/likeos-explorer.1, rendered from this file
+.\" with
+.\"   GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+.\"     data/likeos-explorer.1 | col -bx > res/man/likeos-explorer.1
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH LIKEOS-EXPLORER 1 "October 2026" "LikeOS" "User Commands"
+.SH NAME
+likeos-explorer \- browse and manage files and folders
+.SH SYNOPSIS
+.B likeos-explorer
+.RI [ location ...]
+.br
+.B likeos-explorer \-\-version
+.SH DESCRIPTION
+.B likeos-explorer
+is File Explorer, the desktop's file manager: the window a folder opens in
+from the desktop, the Programs menu, the window manager's menu and any
+program that opens a folder (\fBxdg-open\fR).  The desktop itself stays
+PCManFM's.
+.PP
+Each invocation opens a window, with a tab for every
+.I location
+given, or Home when none is.  A location is a folder (a path, a URI or
+.BR ~/ ...),
+a file (its folder opens with the file selected),
+.B trash:///
+for the Trash,
+.B computer:///
+for This PC, or
+.B likeos:home
+for Home.  A second invocation hands its locations to the running program
+over the session bus, so all windows share one list of file operations,
+one undo history and one clipboard.
+.SH THE WINDOW
+.TP
+.B Tabs
+Each tab is a place of its own with its own history.
+.TP
+.B Navigation bar
+Back, Forward (right-click for the history), Up and Refresh; the address
+bar, whose crumbs open their folder and whose arrows list the folders
+inside, and which turns into a text field on a click beside the crumbs;
+and the search box, which searches the folder shown and everything below
+it.
+.TP
+.B Command bar
+New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, and more behind
+the three dots.  What the selection does not allow is greyed out.  In the
+Trash it offers Empty Trash, Restore and Restore all.
+.TP
+.B Navigation pane
+Home, the personal folders, Pinned (the GTK bookmarks, shared with every
+file dialog), This PC with its drives, Network when a backend provides
+it, and the Trash.  Files dropped on a row are copied or moved there.
+.TP
+.B Content
+Home shows the pinned folders, the frequently used folders, Favorites,
+the recently used files and the other places.  This PC shows the drives
+with their free space.  A folder is shown as Details, List, Compact, Icons,
+Large icons (with thumbnails) or Tiles; the choice is remembered per
+folder.
+.TP
+.B Details and preview panes
+The selected item's picture, type, size, dates and place, or its contents:
+an image, the beginning of a text, a video's frame and length.
+.SS Searching
+Words in the search box must all appear in a name; case does not matter.
+.B *
+and
+.B ?
+match any characters.
+.B kind:image
+(or video, audio, document, folder, archive, program) and
+.B ext:png
+filter by kind and extension.  Below the home folder an index answers at
+once; elsewhere the folders are searched as the results come in.
+.SH KEYS
+.TS
+l l.
+Ctrl+T, Ctrl+W, Ctrl+N	new tab, close tab, new window
+Alt+Left, Alt+Right, Alt+Up	back, forward, up
+Ctrl+L, Alt+D, F4	edit the address
+Ctrl+F, Ctrl+E, F3	search
+F5	refresh
+Ctrl+X, Ctrl+C, Ctrl+V	cut, copy, paste
+Ctrl+Shift+C	copy the path
+F2	rename
+Delete	move to the Trash
+Shift+Delete	delete permanently
+Ctrl+Shift+N	new folder
+Ctrl+Z, Ctrl+Y	undo, redo
+Ctrl+A	select all
+Alt+Enter	properties
+Alt+P, Alt+Shift+P	preview pane, details pane
+Ctrl+H	show hidden items
+Ctrl+Shift+2...8	the views of the View menu
+Ctrl+wheel	smaller or larger view
+.TE
+.PP
+Typing a name in a folder selects the first item that starts with it.
+.SH FILE OPERATIONS
+Copies, moves, deletions and the rest run in the background, at most two
+at a time and never two into the same folder at once.  An operation that
+takes more than a moment opens the
+.B File operations
+window, which shows each one's progress, speed and time left and can
+cancel it.
+.PP
+When a name is taken at the destination, Explorer asks whether to replace
+the existing item, skip, keep both (the new item gets a number), or for two
+folders merge them, with a choice to answer the same way for the rest.  A
+failure can be retried, skipped or the whole operation cancelled.
+.PP
+A file is copied under a hidden temporary name and renamed into place when
+complete, so an interrupted or cancelled copy leaves no half-written file.
+A move between drives removes the original only when all of it arrived.
+.PP
+Undo reverses the last copy, move, rename, new item, move to the Trash or
+restore: copies and new items go to the Trash, moved and renamed items go
+back, trashed items are restored.  Deleting permanently and emptying the
+Trash cannot be undone.
+.SH FILES
+.TP
+.I ~/.local/share/Trash
+The Trash (freedesktop.org layout).
+.TP
+.I ~/.config/gtk-3.0/bookmarks
+Pinned folders.
+.TP
+.I ~/.local/share/recently-used.xbel
+Recently used files, shared by every program.  Folder options can turn
+their display off or clear the list.
+.TP
+.I ~/.cache/thumbnails
+Thumbnails, shared with the desktop.
+.TP
+.I ~/.cache/likeos-explorer/index-v1
+The search index of the home folder.  Turned off in Folder options, it is
+deleted.
+.TP
+.I ~/.config/glib-2.0/settings/keyfile
+Settings (schema
+.BR org.likeos.Explorer ).
+.SH SEE ALSO
+.BR pcmanfm (1),
+.BR gio (1)

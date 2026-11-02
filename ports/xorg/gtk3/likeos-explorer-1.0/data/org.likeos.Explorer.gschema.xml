@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LikeOS File Explorer settings.  The defaults are repeated in
+  src/services/ex-settings.c for a run without the installed schema; keep
+  the two the same.
+
+  Copyright (C) 2026 The LikeOS Project
+-->
+<schemalist>
+  <schema id="org.likeos.Explorer" path="/org/likeos/explorer/">
+    <key name="view-mode" type="s">
+      <choices>
+        <choice value="details"/><choice value="list"/><choice value="compact"/>
+        <choice value="icons"/><choice value="large-icons"/><choice value="tiles"/>
+      </choices>
+      <default>'details'</default>
+      <summary>How folders are shown unless a folder has its own choice</summary>
+    </key>
+    <key name="folder-view-modes" type="a{ss}">
+      <default>{}</default>
+      <summary>View chosen for individual locations (by location id)</summary>
+    </key>
+    <key name="sort-column" type="s">
+      <choices>
+        <choice value="name"/><choice value="modified"/><choice value="type"/><choice value="size"/>
+      </choices>
+      <default>'name'</default>
+      <summary>Column folders are sorted by</summary>
+    </key>
+    <key name="sort-ascending" type="b">
+      <default>true</default>
+      <summary>Ascending sort order</summary>
+    </key>
+    <key name="show-hidden" type="b">
+      <default>false</default>
+      <summary>Show hidden items</summary>
+    </key>
+    <key name="show-extensions" type="b">
+      <default>true</default>
+      <summary>Show file name extensions</summary>
+    </key>
+    <key name="show-navigation-pane" type="b">
+      <default>true</default>
+      <summary>Show the navigation pane</summary>
+    </key>
+    <key name="right-pane" type="s">
+      <choices>
+        <choice value="none"/><choice value="details"/><choice value="preview"/>
+      </choices>
+      <default>'none'</default>
+      <summary>Pane on the right: nothing, details or preview</summary>
+    </key>
+    <key name="favorites" type="as">
+      <default>[]</default>
+      <summary>Files marked as favorites (URIs)</summary>
+    </key>
+    <key name="show-recent" type="b">
+      <default>true</default>
+      <summary>Show recently used files on Home</summary>
+    </key>
+    <key name="show-frequent" type="b">
+      <default>true</default>
+      <summary>Show frequently used folders on Home</summary>
+    </key>
+    <key name="index-home" type="b">
+      <default>true</default>
+      <summary>Keep a search index of the home folder</summary>
+    </key>
+    <key name="single-click" type="b">
+      <default>false</default>
+      <summary>Open items with a single click</summary>
+    </key>
+    <key name="confirm-trash" type="b">
+      <default>false</default>
+      <summary>Ask before moving items to the Trash</summary>
+    </key>
+    <key name="window-size" type="(ii)">
+      <default>(1100, 680)</default>
+      <summary>Size of a new window</summary>
+    </key>
+    <key name="window-maximized" type="b">
+      <default>false</default>
+      <summary>Whether new windows open maximized</summary>
+    </key>
+    <key name="sidebar-width" type="i">
+      <default>220</default>
+      <summary>Width of the navigation pane</summary>
+    </key>
+    <key name="start-location" type="s">
+      <default>'likeos:home'</default>
+      <summary>What a new window shows (a location id)</summary>
+    </key>
+  </schema>
+</schemalist>

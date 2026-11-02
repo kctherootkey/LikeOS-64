@@ -85,6 +85,10 @@ int vfs_status_to_errno(int st)
 		return -EXDEV;
 	case ST_NO_DEVICE:
 		return -ENODEV;
+	case ST_ISDIR:
+		return -EISDIR;
+	case ST_NOTDIR:
+		return -ENOTDIR;
 	default:
 		return -EACCES;
 	}
@@ -244,6 +248,18 @@ unsigned int creat_mode(task_t *cur, uint64_t mode)
 	return (unsigned int)mode & 0777 & ~task_umask(cur) & 0777;
 }
 
+/* The errno for a failed unlink, rmdir or rename.  Callers act on it --
+ * remove() falls back to rmdir() on EISDIR, a file manager copies and
+ * deletes on EXDEV -- so every status the filesystems report keeps its
+ * meaning; only a status with no errno of its own is EINVAL. */
+static int64_t name_op_errno(int st)
+{
+	if (st == ST_ERR || st == ST_TIMEOUT || st == ST_EOF ||
+	    st < ST_NOTDIR || st > ST_OK)
+		return -EINVAL;
+	return vfs_status_to_errno(st);
+}
+
 int64_t sys_unlink(uint64_t pathname)
 {
 	if (!validate_user_ptr(pathname, 1))
@@ -265,9 +281,7 @@ int64_t sys_unlink(uint64_t pathname)
 	int st = vfs_unlink(kpath);
 	if (st == ST_OK)
 		return 0;
-	if (st == ST_NOT_FOUND)
-		return -ENOENT;
-	return -EINVAL;
+	return name_op_errno(st);
 }
 
 int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
@@ -304,9 +318,7 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 	int st = vfs_rename(koldpath, knewpath);
 	if (st == ST_OK)
 		return 0;
-	if (st == ST_NOT_FOUND)
-		return -ENOENT;
-	return -EINVAL;
+	return name_op_errno(st);
 }
 
 int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
@@ -365,15 +377,7 @@ int64_t sys_rmdir(uint64_t pathname)
 	int st = vfs_rmdir(kpath);
 	if (st == ST_OK)
 		return 0;
-	if (st == ST_NOT_FOUND)
-		return -ENOENT;
-	if (st == ST_NOTEMPTY)
-		return -ENOTEMPTY;
-	if (st == ST_NOMEM)
-		return -ENOMEM;
-	if (st == ST_IO)
-		return -EIO;
-	return -EINVAL;
+	return name_op_errno(st);
 }
 
 /* unlinkat(dirfd, path, flags) -- remove a name relative to a directory fd.
@@ -412,15 +416,7 @@ int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags)
 	int st = (flags & AT_REMOVEDIR) ? vfs_rmdir(full) : vfs_unlink(full);
 	if (st == ST_OK)
 		return 0;
-	if (st == ST_NOT_FOUND)
-		return -ENOENT;
-	if (st == ST_NOTEMPTY)
-		return -ENOTEMPTY;
-	if (st == ST_NOMEM)
-		return -ENOMEM;
-	if (st == ST_IO)
-		return -EIO;
-	return -EINVAL;
+	return name_op_errno(st);
 }
 
 int64_t sys_link(uint64_t oldpath, uint64_t newpath)

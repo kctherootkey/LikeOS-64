@@ -195,6 +195,9 @@
 #define SYS_SEMGET      421
 #define SYS_SEMOP       422
 #define SYS_SEMCTL      423
+#define SYS_INOTIFY_INIT1     424
+#define SYS_INOTIFY_ADD_WATCH 425
+#define SYS_INOTIFY_RM_WATCH  426
 #define SYS_GETPROCMAPS 407   /* (pid, procmapinfo*, procmap*, max) */
 #define SYS_MINCORE     409   /* (addr, length, vec) page residency, one byte per page */
 #define SYS_CLOCK_NANOSLEEP 410 /* (clockid, flags, req, rem) */

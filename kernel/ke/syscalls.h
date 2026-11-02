@@ -128,6 +128,9 @@ int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_ptr,
 			    uint64_t old_ptr);
 int64_t sys_timerfd_gettime(uint64_t fd, uint64_t cur_ptr);
 int64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags);
+int64_t sys_inotify_init1(uint64_t flags);
+int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_ptr, uint64_t mask);
+int64_t sys_inotify_rm_watch(uint64_t fd, uint64_t wd);
 int64_t sys_signalfd4(uint64_t fd, uint64_t mask_ptr, uint64_t sizemask,
 		      uint64_t flags);
 int64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags, uint64_t req_ptr,

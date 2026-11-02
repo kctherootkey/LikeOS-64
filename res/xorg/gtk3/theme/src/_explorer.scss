@@ -1,0 +1,144 @@
+// LikeOS File Explorer (likeos-explorer).
+//
+// Windows 11 Explorer's arrangement: the tab row on the Mica of the window,
+// the navigation bar and the command bar on a raised layer, the content on a
+// card-white surface with the navigation pane beside it, the details or
+// preview pane at the right, the status bar at the bottom.  Everything is
+// scoped to the window's .likeos-explorer class and built from the tokens.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+window.likeos-explorer {
+  background-color: $color-window;
+
+  // Tabs: the row at the top, the current tab joined to the bar below.
+  > notebook > header.top {
+    background-color: $color-window;
+    border: none;
+    padding: $space-xxs $space-s 0 $space-s;
+
+    tab {
+      min-height: $height-tab - 8px;
+      padding: 0 $space-s;
+      margin: 0 1px;
+      border: none;
+      border-radius: $radius-overlay $radius-overlay 0 0;
+      color: $color-text-secondary;
+
+      &:hover { background-color: $color-hover; color: $color-text; }
+      &:checked { background-color: $color-layer; color: $color-text; box-shadow: none; }
+
+      button { min-width: 16px; min-height: 16px; padding: 2px; border-radius: $radius-control; }
+    }
+  }
+
+  > notebook > stack { background-color: $color-layer; }
+
+  .ex-navbar {
+    margin: $space-xs $space-s;
+
+    > button { min-width: $height-control; min-height: $height-control; border-radius: $radius-control; }
+
+    entry.search {
+      min-height: $height-control;
+      border-radius: $radius-control;
+    }
+  }
+
+  .ex-commandbar {
+    margin: 0 $space-s $space-xs $space-s;
+    min-height: $height-command;
+
+    button { min-height: $height-control; border-radius: $radius-control; padding: 0 $space-s; }
+    separator { background-color: $color-stroke; min-width: 1px; margin: $space-xs 0; }
+  }
+
+  // The content area: card white, with a hairline to the bars above.
+  paned { border-top: 1px solid $color-stroke; }
+  paned > separator { background-color: $color-stroke; min-width: 1px; }
+
+  .ex-sidebar {
+    background-color: $color-layer;
+
+    treeview.view {
+      background-color: $color-layer;
+      -GtkTreeView-vertical-separator: 4;
+      padding: $space-xxs $space-xs;
+
+      &:hover { background-color: $color-hover; }
+      &:selected { background-color: $color-selection; color: $color-text; }
+    }
+  }
+
+  treeview.view {
+    &:hover { background-color: $color-item-hover; }
+    &:selected { background-color: $color-selection; color: $color-text; }
+    &:selected:hover { background-color: $color-selection-hover; }
+
+    header button {
+      padding: $space-xs $space-s;
+      border: none;
+      border-right: 1px solid $color-stroke;
+      color: $color-text-secondary;
+      background-color: $color-card;
+    }
+
+    &.ex-compact { -GtkTreeView-vertical-separator: 0; }
+
+    // An empty or still-loading folder: no keyboard ring around the whole
+    // view, as Windows draws none there.
+    &.ex-empty { outline-color: transparent; }
+  }
+
+  iconview {
+    background-color: $color-card;
+
+    &:hover { background-color: $color-item-hover; }
+    &:selected { background-color: $color-selection; color: $color-text; border-radius: $radius-control; }
+  }
+
+  .ex-statusbar {
+    margin: $space-xxs $space-m;
+    font-size: $type-caption + 0.5pt;
+    color: $color-text-secondary;
+  }
+
+  .ex-pane {
+    background-color: $color-layer;
+    border-left: 1px solid $color-stroke;
+  }
+
+  // Home and This PC.
+  .ex-home {
+    background-color: $color-card;
+
+    flowbox flowboxchild { padding: 0; }
+    list { background-color: transparent; }
+    list row { border-radius: $radius-control; }
+    list row:hover { background-color: $color-hover; }
+    list row:selected { background-color: $color-selection; color: $color-text; }
+  }
+
+  .ex-section-title {
+    font-size: $type-body-large;
+    font-weight: $weight-strong;
+    margin: $space-m 0 $space-xs 0;
+  }
+
+  button.ex-tile {
+    min-width: 200px;
+    padding: $space-s $space-m;
+    border-radius: $radius-card;
+    background-color: $color-layer;
+    border: 1px solid $color-stroke;
+
+    &:hover { background-color: $control_hover_color; }
+    levelbar trough { min-height: 6px; }
+  }
+
+  .ex-dim { color: $color-text-secondary; }
+  .ex-placeholder { color: $color-text-secondary; font-size: $type-body-large; }
+}
+
+// The operation center window carries the class too.
+window.likeos-explorer list row progressbar trough { min-height: 4px; }

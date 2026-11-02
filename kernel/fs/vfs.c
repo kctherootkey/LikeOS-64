@@ -9,6 +9,7 @@
 #include <kernel/uapi/stat.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
+#include <kernel/fs/fsnotify.h>
 
 /* Is this a pointer the kernel could plausibly have stored?
  *
@@ -60,6 +61,9 @@ static const vfs_ops_t *vfs_ops_for_path(const char *path);
  * itself (the public vfs_stat below adds prefix-traversal enforcement, so the
  * permission helpers must use this raw form to avoid unbounded recursion). */
 static int vfs_raw_stat(const char *path, struct kstat *st);
+static int vfs_is_dev_path(const char *path);
+static void vfs_notify_open(const char *path, int flags, int existed,
+			    vfs_file_t *f);
 
 /* ============================ Permission layer ============================
  * The VFS is the canonical place for Unix discretionary access control: this
@@ -590,6 +594,9 @@ static void vfs_set_at_path(vfs_file_t *f, const char *path)
 	if (!f)
 		return;
 	f->at_path = NULL;
+	f->fsn_ino = 0;
+	f->fsn_state = 0;
+	f->fsn_isdir = 0;
 	if (!path)
 		return;
 	while (path[n])
@@ -609,7 +616,7 @@ static void vfs_set_at_path(vfs_file_t *f, const char *path)
  * caller).  It is only consulted when the filesystem provides ->open_mode and
  * the open actually creates something. */
 static int vfs_open_common(const char *path, int flags, unsigned int cmode,
-			   vfs_file_t **out)
+			   vfs_file_t **out, int *existed)
 {
 	BUG_ON(path == NULL);
 	BUG_ON(out == NULL);
@@ -636,6 +643,7 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 			want |= MAY_WRITE;
 		struct kstat est;
 		int exists = (vfs_raw_stat(path, &est) == ST_OK);
+		*existed = exists;
 		if (exists) {
 			/*
 			 * O_CREAT|O_EXCL means "create this, and fail if it is
@@ -751,13 +759,23 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
  * and is only reached if such a caller ever does pass O_CREAT. */
 int vfs_open(const char *path, int flags, vfs_file_t **out)
 {
-	return vfs_open_common(path, flags, 0666, out);
+	int existed = 1;
+	int r = vfs_open_common(path, flags, 0666, out, &existed);
+
+	if (r == ST_OK && *out)
+		vfs_notify_open(path, flags, existed, *out);
+	return r;
 }
 
 int vfs_open_mode(const char *path, int flags, unsigned int mode,
 		  vfs_file_t **out)
 {
-	return vfs_open_common(path, flags, mode, out);
+	int existed = 1;
+	int r = vfs_open_common(path, flags, mode, out, &existed);
+
+	if (r == ST_OK && *out)
+		vfs_notify_open(path, flags, existed, *out);
+	return r;
 }
 
 /* Raw stat: dispatch to the owning filesystem with no permission check.  Used
@@ -824,6 +842,146 @@ static const vfs_ops_t *vfs_ops_for_path(const char *path)
 	return mo ? mo : g_root_ops;
 }
 
+/* ---- change notification ----------------------------------------------------
+ * What happened is reported after it succeeded (kernel/fs/fsnotify.h).  An
+ * identity is only looked up while something is watched; with no watch
+ * anywhere every hook below costs one load. */
+
+int vfs_notify_ident(const char *path, int follow, struct fsnotify_ident *id)
+{
+	const vfs_ops_t *o = vfs_ops_for_path(path);
+	struct kstat st;
+	int r;
+
+	id->valid = 0;
+	id->isdir = 0;
+	if (!o)
+		return ST_UNSUPPORTED;
+	if (!follow && o->lstat)
+		r = o->lstat(path, &st);
+	else
+		r = o->stat ? o->stat(path, &st) : ST_UNSUPPORTED;
+	if (r != ST_OK)
+		return r;
+	id->fs = o;
+	id->ino = st.st_ino;
+	id->nlink = (uint32_t)st.st_nlink;
+	id->isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+	id->valid = 1;
+	return ST_OK;
+}
+
+/* The identity of what `path' names, when anything is watched at all. */
+static void vfs_notify_path_ident(const char *path, int follow,
+				  struct fsnotify_ident *id)
+{
+	id->valid = 0;
+	id->isdir = 0;
+	if (fsnotify_wants(~0u))
+		(void)vfs_notify_ident(path, follow, id);
+}
+
+/* The identity of the object an open handle is on.  The inode number is
+ * asked for once and kept in the handle.  Devices report nothing: a terminal
+ * written a line at a time would otherwise pay for a lookup per write. */
+static int vfs_notify_file_ident(vfs_file_t *f, struct fsnotify_ident *id)
+{
+	id->valid = 0;
+	id->isdir = 0;
+	if (!f->at_path || f->fsn_state < 0)
+		return 0;
+	if (f->fsn_state == 0) {
+		struct kstat st;
+
+		if (vfs_is_dev_path(f->at_path) ||
+		    !f->ops->fstat || f->ops->fstat(f, &st) != ST_OK) {
+			f->fsn_state = -1;
+			return 0;
+		}
+		f->fsn_ino = st.st_ino;
+		f->fsn_isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+		__atomic_store_n(&f->fsn_state, 1, __ATOMIC_RELEASE);
+	}
+	id->fs = vfs_ops_for_path(f->at_path);
+	id->ino = f->fsn_ino;
+	id->nlink = 0;
+	id->isdir = f->fsn_isdir;
+	id->valid = 1;
+	return 1;
+}
+
+/* `mask' about the object behind an open handle. */
+static void vfs_notify_file(vfs_file_t *f, uint32_t mask)
+{
+	struct fsnotify_ident id;
+
+	if (!fsnotify_wants(mask) || !f->at_path)
+		return;
+	if (vfs_notify_file_ident(f, &id))
+		fsnotify_event(f->at_path, &id, mask, 0, 1);
+}
+
+/* A successful open: IN_CREATE when it made the file, IN_MODIFY when O_TRUNC
+ * emptied an existing one, and IN_OPEN. */
+static void vfs_notify_open(const char *path, int flags, int existed,
+			    vfs_file_t *f)
+{
+	struct fsnotify_ident id;
+
+	if (!fsnotify_wants(IN_CREATE | IN_MODIFY | IN_OPEN))
+		return;
+	vfs_notify_file_ident(f, &id);
+	if (!existed && (flags & O_CREAT))
+		fsnotify_event(path, &id, IN_CREATE, 0, 0);
+	else if ((flags & O_TRUNC) && file_may_write(f))
+		fsnotify_event(path, &id, IN_MODIFY, 0, 0);
+	fsnotify_event(path, &id, IN_OPEN, 0, 0);
+}
+
+/* A name was made: IN_CREATE to its directory. */
+static void vfs_notify_created(const char *path, int isdir)
+{
+	struct fsnotify_ident id;
+
+	if (!fsnotify_wants(IN_CREATE))
+		return;
+	id.valid = 0;
+	id.isdir = isdir ? 1 : 0;
+	fsnotify_event(path, &id, IN_CREATE, 0, 0);
+}
+
+/* A name was removed.  `id' was taken before the removal.  The directory
+ * hears IN_DELETE; the object loses its watches if that was its last name,
+ * and otherwise learns that its link count changed. */
+static void vfs_notify_removed(const char *path, const struct fsnotify_ident *id,
+			       int isdir)
+{
+	if (!fsnotify_wants(~0u))
+		return;
+	struct fsnotify_ident d = *id;
+
+	if (isdir)
+		d.isdir = 1;
+	fsnotify_event(path, &d, IN_DELETE, 0, 0);
+	if (!d.valid)
+		return;
+	if (d.isdir || d.nlink <= 1)
+		fsnotify_gone(&d);
+	else
+		fsnotify_event(NULL, &d, IN_ATTRIB, 0, 0);
+}
+
+/* IN_ATTRIB about what `path' names. */
+static void vfs_notify_attrib(const char *path, int follow)
+{
+	struct fsnotify_ident id;
+
+	if (!fsnotify_wants(IN_ATTRIB))
+		return;
+	vfs_notify_path_ident(path, follow, &id);
+	fsnotify_event(path, &id, IN_ATTRIB, 0, 0);
+}
+
 /* Flush the root filesystem's pending metadata + journal (sync(2)).  No-op when
  * the root fs has no sync op (e.g. FAT32, which has no journal to clean). */
 int vfs_sync(void)
@@ -861,7 +1019,10 @@ int vfs_symlink(const char *target, const char *linkpath)
 	if (pr != ST_OK)
 		return pr;
 	vfs_meta_bump();
-	return o->symlink(target, linkpath);
+	int r = o->symlink(target, linkpath);
+	if (r == ST_OK)
+		vfs_notify_created(linkpath, 0);
+	return r;
 }
 
 int vfs_readlink(const char *path, char *buf, unsigned long bufsz)
@@ -887,7 +1048,12 @@ int vfs_link(const char *oldpath, const char *newpath)
 	if (pr != ST_OK)
 		return pr;
 	vfs_meta_bump();
-	return o->link(oldpath, newpath);
+	int r = o->link(oldpath, newpath);
+	if (r == ST_OK) {
+		vfs_notify_created(newpath, 0);
+		vfs_notify_attrib(newpath, 0); /* the link count went up */
+	}
+	return r;
 }
 
 int vfs_chmod(const char *path, unsigned int mode)
@@ -917,7 +1083,10 @@ int vfs_chmod(const char *path, unsigned int mode)
 	if (!o->chmod)
 		return ST_OK; /* fs has no permission bits */
 	vfs_meta_bump();
-	return o->chmod(path, mode);
+	int r = o->chmod(path, mode);
+	if (r == ST_OK)
+		vfs_notify_attrib(path, 1);
+	return r;
 }
 
 int vfs_chown(const char *path, int uid, int gid)
@@ -950,7 +1119,10 @@ int vfs_chown(const char *path, int uid, int gid)
 	if (!o->chown)
 		return ST_OK; /* fs has no ownership */
 	vfs_meta_bump();
-	return o->chown(path, uid, gid);
+	int r = o->chown(path, uid, gid);
+	if (r == ST_OK)
+		vfs_notify_attrib(path, 1);
+	return r;
 }
 
 int vfs_fchmod(vfs_file_t *f, unsigned int mode)
@@ -960,7 +1132,10 @@ int vfs_fchmod(vfs_file_t *f, unsigned int mode)
 	if (!f->ops->fchmod)
 		return ST_OK;
 	vfs_meta_bump();
-	return f->ops->fchmod(f, mode);
+	int r = f->ops->fchmod(f, mode);
+	if (r == ST_OK)
+		vfs_notify_file(f, IN_ATTRIB);
+	return r;
 }
 
 int vfs_fchown(vfs_file_t *f, int uid, int gid)
@@ -970,7 +1145,10 @@ int vfs_fchown(vfs_file_t *f, int uid, int gid)
 	if (!f->ops->fchown)
 		return ST_OK;
 	vfs_meta_bump();
-	return f->ops->fchown(f, uid, gid);
+	int r = f->ops->fchown(f, uid, gid);
+	if (r == ST_OK)
+		vfs_notify_file(f, IN_ATTRIB);
+	return r;
 }
 
 int vfs_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
@@ -997,7 +1175,10 @@ int vfs_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
 		return im;
 	if (!o->utimensat)
 		return ST_OK; /* fs manages times itself */
-	return o->utimensat(path, mtime_sec, mtime_nsec);
+	int r = o->utimensat(path, mtime_sec, mtime_nsec);
+	if (r == ST_OK)
+		vfs_notify_attrib(path, 1);
+	return r;
 }
 
 int vfs_statfs(const char *path, struct vfs_statfs *out)
@@ -1069,7 +1250,10 @@ int vfs_setxattr(const char *path, int nofollow, const char *name,
 	if (im != ST_OK)
 		return im;
 	vfs_acl_cache_flush(); /* an ACL may have been added/changed */
-	return o->setxattr(path, nofollow, name, val, size, flags);
+	int r = o->setxattr(path, nofollow, name, val, size, flags);
+	if (r == ST_OK)
+		vfs_notify_attrib(path, !nofollow);
+	return r;
 }
 int vfs_listxattr(const char *path, int nofollow, char *list,
 		  unsigned long size)
@@ -1097,7 +1281,10 @@ int vfs_removexattr(const char *path, int nofollow, const char *name)
 	if (im != ST_OK)
 		return im;
 	vfs_acl_cache_flush(); /* an ACL may have been removed */
-	return o->removexattr(path, nofollow, name);
+	int r = o->removexattr(path, nofollow, name);
+	if (r == ST_OK)
+		vfs_notify_attrib(path, !nofollow);
+	return r;
 }
 int vfs_fgetxattr(vfs_file_t *f, const char *name, void *val,
 		  unsigned long size)
@@ -1112,7 +1299,10 @@ int vfs_fsetxattr(vfs_file_t *f, const char *name, const void *val,
 	if (!f || !f->ops || !f->ops->fsetxattr)
 		return ST_UNSUPPORTED;
 	vfs_acl_cache_flush(); /* an ACL may have been added/changed */
-	return f->ops->fsetxattr(f, name, val, size, flags);
+	int r = f->ops->fsetxattr(f, name, val, size, flags);
+	if (r == ST_OK)
+		vfs_notify_file(f, IN_ATTRIB);
+	return r;
 }
 int vfs_flistxattr(vfs_file_t *f, char *list, unsigned long size)
 {
@@ -1125,7 +1315,10 @@ int vfs_fremovexattr(vfs_file_t *f, const char *name)
 	if (!f || !f->ops || !f->ops->fremovexattr)
 		return ST_UNSUPPORTED;
 	vfs_acl_cache_flush(); /* an ACL may have been removed */
-	return f->ops->fremovexattr(f, name);
+	int r = f->ops->fremovexattr(f, name);
+	if (r == ST_OK)
+		vfs_notify_file(f, IN_ATTRIB);
+	return r;
 }
 int vfs_getxattr_ino(const char *path, unsigned long ino, const char *name,
 		     void *val, unsigned long size)
@@ -1142,7 +1335,10 @@ long vfs_read(vfs_file_t *f, void *buf, long bytes)
 		return ST_INVALID;
 	if (!f->ops->read)
 		return ST_INVALID;
-	return f->ops->read(f, buf, bytes);
+	long r = f->ops->read(f, buf, bytes);
+	if (r > 0)
+		vfs_notify_file(f, IN_ACCESS);
+	return r;
 }
 /* Read at an offset the caller names.
  *
@@ -1191,7 +1387,10 @@ long vfs_write(vfs_file_t *f, const void *buf, long bytes)
 		return ST_INVALID;
 	if (!f->ops->write)
 		return ST_INVALID;
-	return f->ops->write(f, buf, bytes);
+	long r = f->ops->write(f, buf, bytes);
+	if (r > 0)
+		vfs_notify_file(f, IN_MODIFY);
+	return r;
 }
 long vfs_seek(vfs_file_t *f, long offset, int whence)
 {
@@ -1276,7 +1475,10 @@ int vfs_truncate(vfs_file_t *f, unsigned long size)
 	/* Write access (and the immutable/append-only veto) were enforced when
 	 * the handle was opened for writing, so no path-based recheck is needed
 	 * here — an fd opened read-only cannot reach a writable fs truncate op. */
-	return f->ops->truncate(f, size);
+	int r = f->ops->truncate(f, size);
+	if (r == ST_OK)
+		vfs_notify_file(f, IN_MODIFY);
+	return r;
 }
 int vfs_unlink(const char *path)
 {
@@ -1292,8 +1494,13 @@ int vfs_unlink(const char *path)
 	int im = vfs_attr_allow_modify(path, 0); /* immutable/append: no unlink */
 	if (im != ST_OK)
 		return im;
+	struct fsnotify_ident id;
+	vfs_notify_path_ident(path, 0, &id);
 	vfs_meta_bump();
-	return ops->unlink(path);
+	int r = ops->unlink(path);
+	if (r == ST_OK)
+		vfs_notify_removed(path, &id, 0);
+	return r;
 }
 int vfs_rename(const char *oldpath, const char *newpath)
 {
@@ -1317,8 +1524,29 @@ int vfs_rename(const char *oldpath, const char *newpath)
 	int im = vfs_attr_allow_modify(oldpath, 0);
 	if (im != ST_OK)
 		return im;
+	struct fsnotify_ident src, dst;
+	vfs_notify_path_ident(oldpath, 0, &src);
+	vfs_notify_path_ident(newpath, 0, &dst);
 	vfs_meta_bump();
-	return ops->rename(oldpath, newpath);
+	int r = ops->rename(oldpath, newpath);
+	if (r == ST_OK && fsnotify_wants(~0u)) {
+		uint32_t cookie = fsnotify_cookie();
+
+		fsnotify_event(oldpath, &src, IN_MOVED_FROM, cookie, 0);
+		fsnotify_event(newpath, &src, IN_MOVED_TO | IN_MOVE_SELF,
+			       cookie, 0);
+		/* A name that was there before was replaced. */
+		if (dst.valid && src.valid &&
+		    (dst.fs != src.fs || dst.ino != src.ino)) {
+			if (dst.isdir || dst.nlink <= 1)
+				fsnotify_gone(&dst);
+			else
+				fsnotify_event(NULL, &dst, IN_ATTRIB, 0, 0);
+		}
+		if (src.valid && src.isdir)
+			fsnotify_renamed(oldpath, newpath);
+	}
+	return r;
 }
 /* Create a socket or FIFO node.  Same permission rule as creating any other
  * name: write+search on the containing directory.  The caller is expected to
@@ -1332,7 +1560,10 @@ int vfs_mknod(const char *path, unsigned int mode)
 	if (pr != ST_OK)
 		return pr;
 	vfs_meta_bump();
-	return ops->mknod(path, mode);
+	int r = ops->mknod(path, mode);
+	if (r == ST_OK)
+		vfs_notify_created(path, 0);
+	return r;
 }
 
 int vfs_mkdir(const char *path, unsigned int mode)
@@ -1344,7 +1575,10 @@ int vfs_mkdir(const char *path, unsigned int mode)
 	if (pr != ST_OK)
 		return pr;
 	vfs_meta_bump();
-	return ops->mkdir(path, mode);
+	int r = ops->mkdir(path, mode);
+	if (r == ST_OK)
+		vfs_notify_created(path, 1);
+	return r;
 }
 int vfs_rmdir(const char *path)
 {
@@ -1357,8 +1591,13 @@ int vfs_rmdir(const char *path)
 	int im = vfs_attr_allow_modify(path, 0);
 	if (im != ST_OK)
 		return im;
+	struct fsnotify_ident id;
+	vfs_notify_path_ident(path, 0, &id);
 	vfs_meta_bump();
-	return ops->rmdir(path);
+	int r = ops->rmdir(path);
+	if (r == ST_OK)
+		vfs_notify_removed(path, &id, 1);
+	return r;
 }
 
 void vfs_release_locks_for_task(uint64_t task_id)
@@ -1429,7 +1668,11 @@ int vfs_close(vfs_file_t *f)
 	/* Actually close when refcount reaches 0 (old was 1, now 0).
 	 *
 	 * at_path is released FIRST: ->close frees the vfs_file itself, so
-	 * reading the pointer afterwards would be a use-after-free. */
+	 * reading the pointer afterwards would be a use-after-free.  The close
+	 * is reported before that, while the path is still there. */
+	if (f->at_path)
+		vfs_notify_file(f, file_may_write(f) ? IN_CLOSE_WRITE :
+						       IN_CLOSE_NOWRITE);
 	if (f->at_path) {
 		kfree(f->at_path);
 		f->at_path = NULL;

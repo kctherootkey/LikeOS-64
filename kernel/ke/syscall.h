@@ -364,6 +364,9 @@ struct k_shmid_ds {
 #define SYS_SEMGET 421
 #define SYS_SEMOP 422
 #define SYS_SEMCTL 423
+#define SYS_INOTIFY_INIT1 424 /* (flags) */
+#define SYS_INOTIFY_ADD_WATCH 425 /* (fd, path, mask) */
+#define SYS_INOTIFY_RM_WATCH 426 /* (fd, wd) */
 
 // rusage who values
 #define RUSAGE_SELF 0

@@ -1,0 +1,6 @@
+# Copyright (C) 2026 The LikeOS Project
+
+option('gstreamer', type : 'feature', value : 'auto',
+  description : 'Video thumbnails and media details through GStreamer')
+option('tests', type : 'boolean', value : false,
+  description : 'Build the backend test program (explorer-backend-test)')

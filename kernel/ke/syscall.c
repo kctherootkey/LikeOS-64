@@ -383,6 +383,12 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_memfd_create(a1, a2);
 	case SYS_SIGNALFD4:
 		return sys_signalfd4(a1, a2, a3, a4);
+	case SYS_INOTIFY_INIT1:
+		return sys_inotify_init1(a1);
+	case SYS_INOTIFY_ADD_WATCH:
+		return sys_inotify_add_watch(a1, a2, a3);
+	case SYS_INOTIFY_RM_WATCH:
+		return sys_inotify_rm_watch(a1, a2);
 	case SYS_PREAD64:
 		return sys_pread64(a1, a2, a3, a4);
 	case SYS_PWRITE64:

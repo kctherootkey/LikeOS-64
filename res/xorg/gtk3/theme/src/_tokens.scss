@@ -1,0 +1,71 @@
+// LikeOS design tokens.
+//
+// The values every LikeOS surface is built from, named by what they are for
+// rather than what they look like: spacing on a 4-pixel grid, corner radii,
+// the type ramp, icon and control sizes, and the semantic colours, each an
+// alias of the palette in _colors.scss.  The widget rules below this file
+// (_likeos.scss, _likeos-widgets.scss, _explorer.scss) use these names, so a
+// change here changes every place that means the same thing -- and a value
+// that appears nowhere in this file is a value no rule should be using.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+// Spacing.
+$space-xxs: 2px;
+$space-xs: 4px;
+$space-s: 8px;
+$space-m: 12px;
+$space-l: 16px;
+$space-xl: 24px;
+$space-xxl: 32px;
+
+// Corner radii: controls, and the things that float above them.
+$radius-control: 4px;
+$radius-overlay: 8px;
+$radius-card: 8px;
+
+// Type ramp (Selawik, at Windows 11's sizes for 96 dpi).
+$type-caption: 7.5pt;
+$type-body: 9pt;
+$type-body-large: 10.5pt;
+$type-subtitle: 12pt;
+$type-title: 15pt;
+$weight-strong: 600;
+
+// Sizes.
+$icon-small: 16px;
+$icon-medium: 24px;
+$icon-tile: 48px;
+$height-control: 32px;
+$height-row: 32px;
+$height-row-compact: 24px;
+$height-tab: 34px;
+$height-command: 36px;
+$width-pane: 300px;
+
+// Colours by role.
+$color-window: $bg_color;          // Mica: the window behind everything
+$color-layer: $control_color;      // a raised layer: panes, command bar
+$color-card: $base_color;          // content: lists, fields, cards
+$color-text: $fg_color;
+$color-text-secondary: $secondary_text_color;
+$color-stroke: $borders_color;
+$color-stroke-strong: $strong_borders_color;
+$color-accent: $accent_light_color;
+$color-accent-fill: $accent_color;
+$color-hover: $subtle_hover_color;
+$color-pressed: $subtle_active_color;
+$color-selection: $list_selected_color;
+$color-selection-hover: $list_selected_hover_color;
+$color-item-hover: $list_hover_color;
+
+// The same colours for programs that style themselves at run time and read
+// a theme's named colours (GtkStyleContext lookup, CSS @name).
+@define-color likeos_window #{$color-window};
+@define-color likeos_layer #{$color-layer};
+@define-color likeos_card #{$color-card};
+@define-color likeos_text #{$color-text};
+@define-color likeos_text_secondary #{$color-text-secondary};
+@define-color likeos_stroke #{$color-stroke};
+@define-color likeos_accent #{$color-accent};
+@define-color likeos_selection #{$color-selection};

@@ -1245,7 +1245,7 @@ static int tfs_rmdir(const char *path)
 	}
 	if (d->inode->type != TFS_DIR) {
 		tfs_unlock();
-		return ST_INVALID; /* ENOTDIR has no ST_ code */
+		return ST_NOTDIR;
 	}
 	if (d->inode->nchildren) {
 		tfs_unlock();

@@ -1,0 +1,25 @@
+[Desktop Entry]
+# File Explorer, the system's own file manager (ports/xorg/gtk3/
+# likeos-explorer-1.0).  The default for folders (mimeapps.list), so the
+# PCManFM desktop, xdg-open and every "open folder" land here.
+#
+# Copyright (C) 2026 The LikeOS Project
+Type=Application
+Version=1.0
+Name=File Explorer
+GenericName=File Manager
+Comment=Browse and manage your files and folders
+Exec=likeos-explorer %U
+TryExec=likeos-explorer
+Icon=system-file-manager
+Terminal=false
+StartupNotify=true
+StartupWMClass=likeos-explorer
+Categories=System;Utility;Core;FileManager;GTK;
+Keywords=files;folders;explorer;browse;manager;
+MimeType=inode/directory;x-scheme-handler/trash;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=likeos-explorer --new-window

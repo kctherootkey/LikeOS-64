@@ -7088,7 +7088,7 @@ static int ext4_unlink_impl(const char *path)
 	if (ext4_read_inode_loc(fs, child, &cin, 0, 0) != ST_OK)
 		return ST_IO;
 	if ((cin.i_mode & S_IFMT) == S_IFDIR)
-		return -EISDIR;
+		return ST_ISDIR;
 
 	if (ext4_dir_del(fs, parent, name, nl, 0, 0) != ST_OK)
 		return ST_NOT_FOUND;
@@ -7440,7 +7440,7 @@ static int ext4_rmdir_impl(const char *path)
 	if (ext4_read_inode_loc(fs, child, &cin, 0, 0) != ST_OK)
 		return ST_IO;
 	if ((cin.i_mode & S_IFMT) != S_IFDIR)
-		return -ENOTDIR;
+		return ST_NOTDIR;
 	if (!ext4_dir_is_empty(fs, child))
 		return ST_NOTEMPTY;
 

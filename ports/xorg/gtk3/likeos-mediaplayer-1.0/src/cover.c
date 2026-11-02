@@ -264,8 +264,21 @@ void mp_cover_draw(cairo_t *cr, GdkPixbuf *cover, double x, double y,
 	cairo_pattern_destroy(g);
 
 	if (fallback_icon != NULL && widget != NULL) {
-		int isz = (int)(side * 0.45);
-		if (isz >= 8) {
+		/* The symbolic icons exist as pictures of a few fixed sizes
+		 * (there is no SVG loader to draw them at any size), so the
+		 * glyph takes the largest of those that fits -- drawn at its
+		 * own size, sharp, rather than stretched to 45% of the tile
+		 * and blurred.  On a large tile it is a little smaller than
+		 * that, which reads better than a blocky one. */
+		static const int sizes[] = { 96, 64, 48, 32, 24, 16 };
+		int want = (int)(side * 0.45), isz = 0;
+
+		for (gsize i = 0; i < G_N_ELEMENTS(sizes); i++)
+			if (sizes[i] <= want) {
+				isz = sizes[i];
+				break;
+			}
+		if (isz >= 16) {
 			GtkIconTheme *th = gtk_icon_theme_get_default();
 			GtkIconInfo *ii = gtk_icon_theme_lookup_icon(
 				th, fallback_icon, isz,

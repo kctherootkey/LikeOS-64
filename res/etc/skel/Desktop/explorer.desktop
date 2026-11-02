@@ -13,6 +13,6 @@
 # filename and never match the /usr/share/ prefix.
 [Desktop Entry]
 Type=Link
-Name=Files
+Name=File Explorer
 Icon=system-file-manager
-URL=/usr/share/applications/pcmanfm.desktop
+URL=/usr/share/applications/likeos-explorer.desktop

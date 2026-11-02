@@ -1182,6 +1182,15 @@ meson_opts() {
 	gst-libav)
 		echo "-Ddoc=disabled -Dtests=disabled"
 		;;
+	likeos-explorer)
+		# Our own file manager (in-tree, gtk3/likeos-explorer-1.0).  The
+		# backend test program is built and shipped as well
+		# (explorer-backend-test), so the backend can be checked on the
+		# system itself; GStreamer gives video thumbnails and media
+		# details, required here so a missing plugin base is a build
+		# failure rather than a quieter program.
+		echo "-Dtests=true -Dgstreamer=enabled"
+		;;
 	gst-likeos-audio)
 		# Our own plugin (in-tree, gtk3/gst-likeos-audio-1.0): the
 		# likeosaudiosink element over libaudio.  It has no options of
@@ -1488,6 +1497,46 @@ post_install() {
 # packages from autotools to meson between releases, so a hand-kept list goes
 # stale silently — and the failure it produces ("./configure: not found") does
 # not obviously say why.
+# Header directories whose unchanged files keep their old modification time
+# across a reinstall of the package, so a rebuild of a library low in the
+# stack does not make everything above it recompile.  GLib is the case that
+# matters: every GTK program and WebKit include it, and a GLib rebuild that
+# only changes the library (a new file-monitor backend, say) would otherwise
+# stamp all its headers -- including the generated glibconfig.h, rewritten
+# with identical contents on every build -- as new.
+#
+# Paths are relative to the sysroot.  Empty for every other package.
+kept_header_dirs() {
+	case "$1" in
+	glib) echo "usr/include/glib-2.0 usr/include/gio-unix-2.0 usr/lib/glib-2.0/include" ;;
+	esac
+}
+
+# Before the install: note size, checksum and modification time of every
+# file under the package's kept header directories.
+snapshot_header_mtimes() {
+	local name="$1" snap="$2" d
+	: >"$snap"
+	for d in $(kept_header_dirs "$name"); do
+		[ -d "$SYSROOT/$d" ] || continue
+		find "$SYSROOT/$d" -type f -exec sh -c \
+			'for f; do printf "%s %s %s\n" "$(stat -c %.9Y "$f")" "$(sha256sum <"$f" | cut -d" " -f1)" "$f"; done' \
+			sh {} + >>"$snap"
+	done
+}
+
+# After the install: a file whose contents are what they were gets its old
+# modification time back.  Changed and new files keep the install's.
+restore_header_mtimes() {
+	local snap="$1" mtime sum f
+	[ -s "$snap" ] || return 0
+	while read -r mtime sum f; do
+		[ -f "$f" ] || continue
+		[ "$(sha256sum <"$f" | cut -d" " -f1)" = "$sum" ] || continue
+		touch -m -d "@$mtime" "$f"
+	done <"$snap"
+}
+
 is_meson() {
 	[ -f "$2/meson.build" ] && [ ! -f "$2/configure" ] && [ ! -f "$2/autogen.sh" ]
 }
@@ -2908,8 +2957,10 @@ LUAPC
 				--prefix=/usr --libdir=/usr/lib \
 				-Ddefault_library=shared \
 				$(meson_opts "$name") &&
+				snapshot_header_mtimes "$name" .likeos-hdr-snap &&
 				DESTDIR="$SYSROOT" PATH="$here/toolchain:$HOSTTOOLS/bin:$PATH" \
 					meson install -C .likeos-build &&
+					restore_header_mtimes .likeos-hdr-snap &&
 					post_install "$name"
 		) >"$log" 2>&1
 	elif is_noarch "$name"; then

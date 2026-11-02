@@ -1,0 +1,137 @@
+Desktop drags: the items reappear at the drop, and the drag shows them whole.
+
+Desktop items being dragged are not drawn in their place (the drag image
+stands for them), until the dragging state ends -- which only a button
+release on the desktop did.  The drag holds the pointer, so that release
+never reaches the desktop: items moved on the desktop stayed invisible
+after the drop until the next click.  The state now ends when the drag
+does.
+
+The drag image was the selected items' icons alone.  It is now each item
+as the desktop shows it selected -- the box, the icon and the name -- as
+Windows drags desktop items.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -4656,7 +4656,7 @@
+     cairo_t *cr;
+     GdkPixbuf *icon;
+     GtkTreeIter it;
+-    GdkRectangle area, icon_rect;
++    GdkRectangle area;
+ #if !GTK_CHECK_VERSION(3, 0, 0)
+     guchar *dest_data, *src_data;
+     int dest_stride, src_stride, _x, _y;
+@@ -4668,65 +4668,48 @@
+     if (!gtk_tree_model_get_iter_first(model, &it))
+         return NULL;
+ 
+-    /* determine the size of complete pixbuf */
++    /* determine the size of complete pixbuf: every selected item, icon
++     * and label, as Windows drags them */
+     area.width = 0; /* mark it */
+     do
+     {
++        GdkRectangle whole;
++
+         item = fm_folder_model_get_item_userdata(desktop->model, &it);
+         if (!item->is_selected)
+             continue;
++        gdk_rectangle_union(&item->icon_rect, &item->text_rect, &whole);
+         if (area.width == 0)
+-            area = item->icon_rect;
++            area = whole;
+         else
+-        {
+-            if (item->icon_rect.x < area.x)
+-            {
+-                area.width += (area.x - item->icon_rect.x);
+-                area.x = item->icon_rect.x;
+-            }
+-            if (item->icon_rect.x + item->icon_rect.width > area.x + area.width)
+-                area.width = item->icon_rect.x + item->icon_rect.width - area.x;
+-            if (item->icon_rect.y < area.y)
+-            {
+-                area.height += (area.y - item->icon_rect.y);
+-                area.y = item->icon_rect.y;
+-            }
+-            if (item->icon_rect.y + item->icon_rect.height > area.y + area.height)
+-                area.height = item->icon_rect.y + item->icon_rect.height - area.y;
+-        }
++            gdk_rectangle_union(&area, &whole, &area);
+     }
+     while(gtk_tree_model_iter_next(model, &it));
+ 
+     /* now create the pixbuf */
+     if (area.width == 0) /* no selection??? */
+         return NULL;
+-    area.width += 2;
+-    area.height += 2;
++    /* a pixel around, and two more right and below for the label's shadow */
++    area.width += 4;
++    area.height += 4;
+     s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, area.width, area.height);
+     cr = cairo_create(s);
+ 
++    /* each item drawn exactly as it looks on the desktop, selected: its
++     * box, icon and name (paint_item() still draws selected items here,
++     * the drag has not started yet) */
++    cairo_translate(cr, 1 - area.x, 1 - area.y);
+     gtk_tree_model_get_iter_first(model, &it);
+     do
+     {
+         item = fm_folder_model_get_item_userdata(desktop->model, &it);
+         if (!item->is_selected)
+             continue;
+-        /* FIXME: should we render name too, or is it too heavy? */
+         icon = NULL;
+         gtk_tree_model_get(model, &it, FM_FOLDER_MODEL_COL_ICON, &icon, -1);
+-        /* draw the icon */
++        paint_item(desktop, item, cr, &area, icon);
+         if (icon)
+-        {
+-            icon_rect.x = item->icon_rect.x - area.x + 1;
+-            icon_rect.width = item->icon_rect.width;
+-            icon_rect.y = item->icon_rect.y - area.y + 1;
+-            icon_rect.height = item->icon_rect.height;
+-//g_debug("icon at %d %d %d %d",icon_rect.x,icon_rect.y,icon_rect.width,icon_rect.height);
+-            gdk_cairo_set_source_pixbuf(cr, icon, icon_rect.x, icon_rect.y);
+-            gdk_cairo_rectangle(cr, &icon_rect);
+-            cairo_fill(cr);
+             g_object_unref(icon);
+-        }
+     }
+     while(gtk_tree_model_iter_next(model, &it));
+ 
+@@ -4777,6 +4760,21 @@
+     return pixbuf;
+ }
+ 
++/* The drag holds the pointer until it ends, so the button release that
++ * on_button_release() waits for to end the dragging state never reaches
++ * the desktop: the dragged items -- not drawn while they are dragged --
++ * stayed invisible after the drop until the next click. */
++static void on_drag_end (GtkWidget *widget, GdkDragContext *drag_context)
++{
++    FmDesktop *desktop = FM_DESKTOP(widget);
++
++    if (desktop->dragging)
++    {
++        desktop->dragging = FALSE;
++        queue_layout_items(desktop);
++    }
++}
++
+ static void on_drag_begin (GtkWidget *widget, GdkDragContext *drag_context)
+ {
+     /* GTK auto-dragging started a drag, update state */
+@@ -5253,6 +5251,7 @@
+ #if FM_CHECK_VERSION(1, 2, 1)
+     widget_class->drag_begin = on_drag_begin;
+ #endif
++    widget_class->drag_end = on_drag_end;
+     /* widget_class->drag_data_get = on_drag_data_get; */
+ 
+     if(XInternAtoms(gdk_x11_get_default_xdisplay(), atom_names,

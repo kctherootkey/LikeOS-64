@@ -216,6 +216,15 @@ struct vfs_file {
 	 * vfs_close(), because the filesystem's ->close frees the structure
 	 * itself and would take this with it. */
 	char *at_path;
+	/* Change notification (kernel/fs/fsnotify.h): the inode number of the
+	 * object this handle is open on, looked up at the first event that
+	 * needs it and kept, since it cannot change while the handle is open.
+	 * fsn_state: 0 not looked up yet, 1 fsn_ino/fsn_isdir valid, -1 this
+	 * handle reports nothing (a device, or the lookup failed).  Meaningful
+	 * only while at_path is set, and initialised with it. */
+	uint64_t fsn_ino;
+	int8_t fsn_state;
+	uint8_t fsn_isdir;
 };
 
 /* What a descriptor was opened for, from its access mode alone: read with

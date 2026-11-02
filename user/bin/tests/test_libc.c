@@ -14035,6 +14035,453 @@ static void test_anonfd(void)
 }
 
 /* ======================================================================
+ * inotify: filesystem change events.
+ * ====================================================================== */
+#include <sys/inotify.h>
+
+#define IN_BUFSZ 65536
+
+/* Drain everything queued on a non-blocking instance into `buf'.  Events
+ * are queued before the system call that caused them returns, so no wait is
+ * needed. */
+static int in_drain(int fd, char *buf, int cap)
+{
+	int tot = 0;
+
+	while (cap - tot >= (int)sizeof(struct inotify_event) + 256) {
+		ssize_t n = read(fd, buf + tot, (size_t)(cap - tot));
+		if (n <= 0)
+			break;
+		tot += (int)n;
+	}
+	return tot;
+}
+
+/* The first event on `wd' carrying every bit of `mask' (and named `name'
+ * when given), or NULL. */
+static const struct inotify_event *in_find(const char *buf, int n, int wd,
+					   uint32_t mask, const char *name)
+{
+	for (int off = 0; off + (int)sizeof(struct inotify_event) <= n;) {
+		const struct inotify_event *e =
+			(const struct inotify_event *)(buf + off);
+		if (e->wd == wd && (e->mask & mask) == mask &&
+		    (!name || (e->len && strcmp(e->name, name) == 0)))
+			return e;
+		off += (int)sizeof(struct inotify_event) + (int)e->len;
+	}
+	return NULL;
+}
+
+static int in_count(const char *buf, int n, int wd, uint32_t mask)
+{
+	int c = 0;
+
+	for (int off = 0; off + (int)sizeof(struct inotify_event) <= n;) {
+		const struct inotify_event *e =
+			(const struct inotify_event *)(buf + off);
+		if (e->wd == wd && (e->mask & mask) == mask)
+			c++;
+		off += (int)sizeof(struct inotify_event) + (int)e->len;
+	}
+	return c;
+}
+
+static void in_touch(const char *path)
+{
+	int fd = open(path, O_CREAT | O_WRONLY, 0644);
+	if (fd >= 0)
+		close(fd);
+}
+
+struct in_waiter {
+	char path[128];
+};
+
+static void *in_late_creator(void *arg)
+{
+	struct in_waiter *w = arg;
+	usleep(30000);
+	in_touch(w->path);
+	return NULL;
+}
+
+/* The checks that need a directory, run once on the disk filesystem and once
+ * on tmpfs. */
+static void test_inotify_dir(const char *base, const char *what)
+{
+	char d[128], p[160], p2[160], sub[160];
+	char *buf = malloc(IN_BUFSZ);
+	int n;
+
+	if (!buf)
+		return;
+	snprintf(d, sizeof(d), "%s/in%d", base, (int)getpid());
+	rmtree(d);
+	if (mkdir(d, 0755) < 0) {
+		printf("      (%s: cannot create %s, skipped)\n", what, d);
+		free(buf);
+		return;
+	}
+	printf("      [%s]\n", what);
+
+	int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	int wd = inotify_add_watch(fd, d, IN_ALL_EVENTS);
+	test_result("add_watch on a directory", fd >= 0 && wd >= 1);
+	if (fd < 0 || wd < 1)
+		goto out;
+	test_result("watching it again returns the same descriptor",
+		    inotify_add_watch(fd, d, IN_ALL_EVENTS) == wd);
+
+	/* create / write / close */
+	snprintf(p, sizeof(p), "%s/a", d);
+	int f = open(p, O_CREAT | O_WRONLY, 0644);
+	write(f, "x", 1);
+	write(f, "y", 1);
+	write(f, "z", 1);
+	close(f);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("IN_CREATE names the new file", in_find(buf, n, wd, IN_CREATE, "a") != NULL);
+	test_result("IN_OPEN reported", in_find(buf, n, wd, IN_OPEN, "a") != NULL);
+	test_result("IN_MODIFY reported", in_find(buf, n, wd, IN_MODIFY, "a") != NULL);
+	test_result("consecutive identical IN_MODIFY coalesce",
+		    in_count(buf, n, wd, IN_MODIFY) == 1);
+	test_result("IN_CLOSE_WRITE after writing", in_find(buf, n, wd, IN_CLOSE_WRITE, "a") != NULL);
+
+	/* read-only open/close */
+	f = open(p, O_RDONLY);
+	char c;
+	read(f, &c, 1);
+	close(f);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("IN_ACCESS on read", in_find(buf, n, wd, IN_ACCESS, "a") != NULL);
+	test_result("IN_CLOSE_NOWRITE after a read-only open",
+		    in_find(buf, n, wd, IN_CLOSE_NOWRITE, "a") != NULL);
+
+	/* O_TRUNC */
+	f = open(p, O_WRONLY | O_TRUNC);
+	close(f);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("O_TRUNC is IN_MODIFY", in_find(buf, n, wd, IN_MODIFY, "a") != NULL);
+
+	/* attributes */
+	chmod(p, 0600);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("chmod is IN_ATTRIB", in_find(buf, n, wd, IN_ATTRIB, "a") != NULL);
+
+	/* subdirectory */
+	snprintf(sub, sizeof(sub), "%s/sub", d);
+	mkdir(sub, 0755);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("mkdir is IN_CREATE|IN_ISDIR",
+		    in_find(buf, n, wd, IN_CREATE | IN_ISDIR, "sub") != NULL);
+
+	/* rename within the directory */
+	snprintf(p2, sizeof(p2), "%s/b", d);
+	rename(p, p2);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	const struct inotify_event *mf = in_find(buf, n, wd, IN_MOVED_FROM, "a");
+	const struct inotify_event *mt = in_find(buf, n, wd, IN_MOVED_TO, "b");
+	test_result("rename: IN_MOVED_FROM and IN_MOVED_TO", mf && mt);
+	test_result("rename: the two share a non-zero cookie",
+		    mf && mt && mf->cookie != 0 && mf->cookie == mt->cookie);
+
+	/* rename into another watched directory; a watch on the file itself */
+	int wsub = inotify_add_watch(fd, sub, IN_ALL_EVENTS);
+	int wfile = inotify_add_watch(fd, p2, IN_ALL_EVENTS);
+	test_result("watches on the subdirectory and the file",
+		    wsub > 0 && wfile > 0 && wsub != wd && wfile != wsub);
+	snprintf(p, sizeof(p), "%s/c", sub);
+	rename(p2, p);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	mf = in_find(buf, n, wd, IN_MOVED_FROM, "b");
+	mt = in_find(buf, n, wsub, IN_MOVED_TO, "c");
+	test_result("move between directories pairs FROM and TO",
+		    mf && mt && mf->cookie == mt->cookie);
+	test_result("the moved file's own watch sees IN_MOVE_SELF",
+		    in_find(buf, n, wfile, IN_MOVE_SELF, NULL) != NULL);
+
+	/* the file's watch follows it to its new name */
+	f = open(p, O_WRONLY);
+	write(f, "q", 1);
+	close(f);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("watch on a file follows it after rename",
+		    in_find(buf, n, wfile, IN_MODIFY, NULL) != NULL);
+
+	/* hard link: the same object under two names */
+	snprintf(p2, sizeof(p2), "%s/hl", d);
+	if (link(p, p2) == 0) {
+		in_drain(fd, buf, IN_BUFSZ);
+		f = open(p2, O_WRONLY);
+		write(f, "h", 1);
+		close(f);
+		n = in_drain(fd, buf, IN_BUFSZ);
+		test_result("write through a hard link reaches the file's watch",
+			    in_find(buf, n, wfile, IN_MODIFY, NULL) != NULL);
+		unlink(p2);
+		n = in_drain(fd, buf, IN_BUFSZ);
+		test_result("removing one of two names: IN_ATTRIB, watch kept",
+			    in_find(buf, n, wfile, IN_ATTRIB, NULL) != NULL &&
+				    !in_find(buf, n, wfile, IN_IGNORED, NULL));
+	}
+
+	/* last name removed */
+	unlink(p);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("unlink: IN_DELETE in the directory",
+		    in_find(buf, n, wsub, IN_DELETE, "c") != NULL);
+	test_result("unlink: IN_DELETE_SELF then IN_IGNORED on the file",
+		    in_find(buf, n, wfile, IN_DELETE_SELF, NULL) &&
+			    in_find(buf, n, wfile, IN_IGNORED, NULL));
+	errno = 0;
+	test_result("rm_watch on a removed watch is EINVAL",
+		    inotify_rm_watch(fd, wfile) < 0 && errno == EINVAL);
+
+	/* rmdir */
+	rmdir(sub);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("rmdir: IN_DELETE|IN_ISDIR in the parent",
+		    in_find(buf, n, wd, IN_DELETE | IN_ISDIR, "sub") != NULL);
+	test_result("rmdir: IN_DELETE_SELF + IN_IGNORED on its own watch",
+		    in_find(buf, n, wsub, IN_DELETE_SELF, NULL) &&
+			    in_find(buf, n, wsub, IN_IGNORED, NULL));
+
+	/* a watched directory that is renamed keeps reporting names */
+	snprintf(sub, sizeof(sub), "%s/r1", d);
+	snprintf(p2, sizeof(p2), "%s/r2", d);
+	mkdir(sub, 0755);
+	int wr = inotify_add_watch(fd, sub, IN_CREATE);
+	rename(sub, p2);
+	snprintf(p, sizeof(p), "%s/inside", p2);
+	in_drain(fd, buf, IN_BUFSZ);
+	in_touch(p);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("renamed watched directory still reports its names",
+		    wr > 0 && in_find(buf, n, wr, IN_CREATE, "inside") != NULL);
+	unlink(p);
+	rmdir(p2);
+	in_drain(fd, buf, IN_BUFSZ);
+
+	/* symlinks */
+	snprintf(p, sizeof(p), "%s/target", d);
+	snprintf(p2, sizeof(p2), "%s/lnk", d);
+	in_touch(p);
+	if (symlink("target", p2) == 0) {
+		int wt = inotify_add_watch(fd, p2, IN_ATTRIB | IN_DELETE_SELF);
+		int wl = inotify_add_watch(fd, p2, IN_ATTRIB | IN_DELETE_SELF |
+							   IN_DONT_FOLLOW);
+		test_result("IN_DONT_FOLLOW watches the link, not its target",
+			    wt > 0 && wl > 0 && wt != wl);
+		in_drain(fd, buf, IN_BUFSZ);
+		unlink(p2);
+		n = in_drain(fd, buf, IN_BUFSZ);
+		test_result("removing the link ends the link's watch only",
+			    in_find(buf, n, wl, IN_DELETE_SELF, NULL) &&
+				    !in_find(buf, n, wt, IN_DELETE_SELF, NULL));
+		inotify_rm_watch(fd, wt);
+	}
+	errno = 0;
+	test_result("IN_ONLYDIR on a file is ENOTDIR",
+		    inotify_add_watch(fd, p, IN_ATTRIB | IN_ONLYDIR) < 0 &&
+			    errno == ENOTDIR);
+
+	/* IN_ONESHOT */
+	int wo = inotify_add_watch(fd, p, IN_MODIFY | IN_ONESHOT);
+	in_drain(fd, buf, IN_BUFSZ);
+	f = open(p, O_WRONLY);
+	write(f, "1", 1);
+	write(f, "2", 1);
+	close(f);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("IN_ONESHOT: one event, then IN_IGNORED",
+		    wo > 0 && in_count(buf, n, wo, IN_MODIFY) == 1 &&
+			    in_find(buf, n, wo, IN_IGNORED, NULL) != NULL);
+
+	/* mask rules */
+	int wm = inotify_add_watch(fd, p, IN_MODIFY);
+	errno = 0;
+	test_result("IN_MASK_CREATE on a watched object is EEXIST",
+		    inotify_add_watch(fd, p, IN_ATTRIB | IN_MASK_CREATE) < 0 &&
+			    errno == EEXIST);
+	test_result("IN_MASK_ADD extends the mask",
+		    inotify_add_watch(fd, p, IN_ATTRIB | IN_MASK_ADD) == wm);
+	in_drain(fd, buf, IN_BUFSZ);
+	chmod(p, 0644);
+	f = open(p, O_WRONLY);
+	write(f, "m", 1);
+	close(f);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("both the old and the added events arrive",
+		    in_find(buf, n, wm, IN_ATTRIB, NULL) &&
+			    in_find(buf, n, wm, IN_MODIFY, NULL));
+	test_result("rm_watch queues IN_IGNORED",
+		    inotify_rm_watch(fd, wm) == 0 &&
+			    (n = in_drain(fd, buf, IN_BUFSZ)) > 0 &&
+			    in_find(buf, n, wm, IN_IGNORED, NULL) != NULL);
+
+	/* readiness, FIONREAD, short buffers */
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	test_result("poll: not readable when empty", poll(&pfd, 1, 0) == 0);
+	snprintf(p2, sizeof(p2), "%s/a_rather_long_name_for_the_buffer_test", d);
+	in_touch(p2);
+	test_result("poll: readable with events queued",
+		    poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN));
+	int ep = epoll_create1(0);
+	struct epoll_event ee = { .events = EPOLLIN }, eo;
+	ee.data.fd = fd;
+	test_result("epoll: readable with events queued",
+		    ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ee) == 0 &&
+			    epoll_wait(ep, &eo, 1, 0) == 1);
+	if (ep >= 0)
+		close(ep);
+	int avail = -1;
+	char small[sizeof(struct inotify_event)];
+	errno = 0;
+	test_result("read into a buffer too small for one event is EINVAL",
+		    read(fd, small, sizeof(small)) < 0 && errno == EINVAL);
+	test_result("FIONREAD reports the queued bytes",
+		    ioctl(fd, FIONREAD, &avail) == 0 && avail > 0 &&
+			    in_drain(fd, buf, IN_BUFSZ) == avail);
+	errno = 0;
+	test_result("empty queue is EAGAIN with IN_NONBLOCK",
+		    read(fd, buf, IN_BUFSZ) < 0 && errno == EAGAIN);
+	unlink(p2);
+	in_drain(fd, buf, IN_BUFSZ);
+
+	/* another process's change */
+	snprintf(p2, sizeof(p2), "%s/from_child", d);
+	pid_t pid = fork();
+	if (pid == 0) {
+		in_touch(p2);
+		_exit(0);
+	}
+	waitpid(pid, NULL, 0);
+	n = in_drain(fd, buf, IN_BUFSZ);
+	test_result("a change made by another process is reported",
+		    in_find(buf, n, wd, IN_CREATE, "from_child") != NULL);
+	unlink(p2);
+	in_drain(fd, buf, IN_BUFSZ);
+
+	/* blocking read woken by a change from another thread */
+	int bfd = inotify_init1(0);
+	struct in_waiter w;
+	snprintf(w.path, sizeof(w.path), "%s/late", d);
+	int bw = inotify_add_watch(bfd, d, IN_CREATE);
+	pthread_t th;
+	pthread_create(&th, NULL, in_late_creator, &w);
+	n = (int)read(bfd, buf, IN_BUFSZ);
+	test_result("blocking read wakes on a change from another thread",
+		    n > 0 && in_find(buf, n, bw, IN_CREATE, "late") != NULL);
+	pthread_join(th, NULL);
+	close(bfd);
+	unlink(w.path);
+	in_drain(fd, buf, IN_BUFSZ);
+
+	/* queue overflow: alternate two files so no event coalesces */
+	char pa[160], pb[160];
+	snprintf(pa, sizeof(pa), "%s/ova", d);
+	snprintf(pb, sizeof(pb), "%s/ovb", d);
+	int ofd = inotify_init1(IN_NONBLOCK);
+	int fa = open(pa, O_CREAT | O_WRONLY, 0644);
+	int fb = open(pb, O_CREAT | O_WRONLY, 0644);
+	int ow = inotify_add_watch(ofd, d, IN_MODIFY);
+	for (int i = 0; i < 9000; i++) {
+		write(fa, "a", 1);
+		write(fb, "b", 1);
+	}
+	close(fa);
+	close(fb);
+	int overflow = 0, total = 0;
+	for (;;) {
+		ssize_t r = read(ofd, buf, IN_BUFSZ);
+		if (r <= 0)
+			break;
+		for (int off = 0; off < r;) {
+			const struct inotify_event *e =
+				(const struct inotify_event *)(buf + off);
+			total++;
+			if (e->mask & IN_Q_OVERFLOW)
+				overflow = (e->wd == -1);
+			off += (int)sizeof(*e) + (int)e->len;
+		}
+	}
+	test_result("a full queue ends in one IN_Q_OVERFLOW (wd -1)",
+		    ow > 0 && overflow && total == 16384 + 1);
+	close(ofd);
+	unlink(pa);
+	unlink(pb);
+
+	close(fd);
+out:
+	rmtree(d);
+	free(buf);
+}
+
+static void test_inotify(void)
+{
+	printf("\n[TEST] inotify\n");
+
+	int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	test_result("inotify_init1() creates a descriptor", fd >= 0);
+	if (fd < 0)
+		return;
+	test_result("IN_CLOEXEC honoured", fcntl(fd, F_GETFD) & FD_CLOEXEC);
+	errno = 0;
+	test_result("unknown init flags are EINVAL",
+		    inotify_init1(0x1) < 0 && errno == EINVAL);
+	errno = 0;
+	test_result("an empty event mask is EINVAL",
+		    inotify_add_watch(fd, "/tmp", 0) < 0 && errno == EINVAL);
+	errno = 0;
+	test_result("IN_MASK_ADD with IN_MASK_CREATE is EINVAL",
+		    inotify_add_watch(fd, "/tmp", IN_CREATE | IN_MASK_ADD |
+						  IN_MASK_CREATE) < 0 &&
+			    errno == EINVAL);
+	errno = 0;
+	test_result("a missing path is ENOENT",
+		    inotify_add_watch(fd, "/tmp/no/such/path", IN_CREATE) < 0 &&
+			    errno == ENOENT);
+	errno = 0;
+	int efd = eventfd(0, 0);
+	test_result("a descriptor that is not an instance is EINVAL",
+		    inotify_add_watch(efd, "/tmp", IN_CREATE) < 0 &&
+			    errno == EINVAL);
+	close(efd);
+	errno = 0;
+	test_result("a closed descriptor is EBADF",
+		    inotify_add_watch(-1, "/tmp", IN_CREATE) < 0 &&
+			    errno == EBADF);
+	close(fd);
+
+	test_inotify_dir("/tmp", "disk filesystem");
+	struct stat rst;
+	if (stat("/ram", &rst) == 0 && S_ISDIR(rst.st_mode))
+		test_inotify_dir("/ram", "tmpfs /ram");
+
+	/* Read permission is needed to watch something. */
+	if (geteuid() == 0) {
+		char d[64];
+		snprintf(d, sizeof(d), "/tmp/inp%d", (int)getpid());
+		rmtree(d);
+		mkdir(d, 0700);
+		pid_t pid = fork();
+		if (pid == 0) {
+			if (setgid(65534) < 0 || setuid(65534) < 0)
+				_exit(2);
+			int f = inotify_init1(0);
+			int w = inotify_add_watch(f, d, IN_CREATE);
+			_exit(w < 0 && errno == EACCES ? 0 : 1);
+		}
+		int status = -1;
+		waitpid(pid, &status, 0);
+		test_result("no read permission: EACCES",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		rmtree(d);
+	}
+}
+
+/* ======================================================================
  * /sys and /proc
  * ====================================================================== */
 static void test_sysfs_procfs(void)
@@ -16302,6 +16749,50 @@ static void *spawn_from_thread(void *arg)
 				      av, environ);
 	__atomic_store_n(&spawn_thread_done, 1, __ATOMIC_RELEASE);
 	return NULL;
+}
+
+/* The wrong kind of object for unlink() and rmdir(): the errno tells the
+ * caller what to do instead (remove() and file managers fall back to rmdir()
+ * on EISDIR), so it must name the problem, not be a generic EINVAL.  unlink()
+ * of a directory may be EISDIR or EPERM; both are POSIX. */
+static void test_remove_kinds(const char *base, const char *label)
+{
+	char d[128], f[128], name[160];
+	struct stat st;
+
+	snprintf(d, sizeof(d), "%s/rk_dir%d", base, (int)getpid());
+	snprintf(f, sizeof(f), "%s/rk_file%d", base, (int)getpid());
+	rmtree(d);
+	unlink(f);
+	if (mkdir(d, 0755) < 0) {
+		snprintf(name, sizeof(name), "%s: scratch directory", label);
+		test_result(name, 0);
+		return;
+	}
+	int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0)
+		close(fd);
+
+	errno = 0;
+	int r = unlink(d);
+	snprintf(name, sizeof(name), "%s: unlink(directory) is EISDIR or EPERM",
+		 label);
+	test_result(name, r == -1 && (errno == EISDIR || errno == EPERM));
+	snprintf(name, sizeof(name), "%s: the directory is still there", label);
+	test_result(name, stat(d, &st) == 0 && S_ISDIR(st.st_mode));
+
+	errno = 0;
+	r = rmdir(f);
+	snprintf(name, sizeof(name), "%s: rmdir(file) is ENOTDIR", label);
+	test_result(name, r == -1 && errno == ENOTDIR);
+
+	snprintf(name, sizeof(name), "%s: remove(empty directory) succeeds",
+		 label);
+	test_result(name, remove(d) == 0 && stat(d, &st) == -1 &&
+				  errno == ENOENT);
+	snprintf(name, sizeof(name), "%s: remove(file) succeeds", label);
+	test_result(name, remove(f) == 0 && stat(f, &st) == -1 &&
+				  errno == ENOENT);
 }
 
 int main(int argc, char **argv)
@@ -23488,6 +23979,31 @@ int main(int argc, char **argv)
 		int ret = unlink(_p_no_such);
 		test_result("unlink nonexistent file fails", ret == -1);
 		test_result("unlink nonexistent sets ENOENT", errno == ENOENT);
+	}
+
+	printf("\n[TEST] unlink()/rmdir()/remove() on the wrong kind\n");
+	{
+		struct stat rst;
+
+		test_remove_kinds(_td, "disk filesystem");
+		if (stat("/ram", &rst) == 0 && S_ISDIR(rst.st_mode)) {
+			char rf[64], tf[128];
+
+			test_remove_kinds("/ram", "tmpfs /ram");
+			/* Across filesystems a rename is EXDEV, which is what
+			 * tells mv and file managers to copy and delete. */
+			snprintf(rf, sizeof(rf), "/ram/rk_x%d", (int)getpid());
+			snprintf(tf, sizeof(tf), "%s/rk_x", _td);
+			int fd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd >= 0)
+				close(fd);
+			errno = 0;
+			int r = rename(tf, rf);
+			test_result("rename across filesystems is EXDEV",
+				    r == -1 && errno == EXDEV);
+			unlink(tf);
+			unlink(rf);
+		}
 	}
 
 	printf("\n[TEST] rename()\n");
@@ -33325,6 +33841,7 @@ network_skip:;
 	test_sigsuspend_delivery();
 	test_cred_threads();
 	test_anonfd();
+	test_inotify();
 	test_sysfs_procfs();
 	test_posix_additions();
 gpu_section:

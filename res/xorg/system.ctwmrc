@@ -262,6 +262,11 @@ OccupyAll
 # border and its separator lines are drawn in MenuShadowColor, a light grey
 # (the drop shadow it is otherwise for is switched off, see NoMenuShadows).
 #
+# FrameBackground is what a window shows where its application has not drawn
+# yet -- the strip a resize uncovers while the program is busy, or a window
+# just taken over when the window manager restarts after a resolution change.
+# White, as Windows 11 shows it, rather than the grey of the border tile.
+#
 Color
 {
     BorderColor           "#afafaf"
@@ -269,6 +274,7 @@ Color
     DefaultForeground     "#1b1b1b"
     BorderTileBackground  "#c8c8c8"
     BorderTileForeground  "#c8c8c8"
+    FrameBackground       "#ffffff"
     TitleBackground       "#f3f3f3"
     TitleForeground       "black"
     MenuBackground        "#f9f9f9"
@@ -431,7 +437,7 @@ menu "defops" ("#1b1b1b":"#e9e9e9")
 {
     "LikeOS"		f.title
     "Xterm"		!"xterm&"
-    "Explorer"		!"pcmanfm &"
+    "Explorer"		!"likeos-explorer &"
     "Editor"		!"mousepad &"
     "Xnedit"	!"xnedit &"
     "Mail"		!"claws-mail &"

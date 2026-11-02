@@ -1,0 +1,206 @@
+Real fullscreen, back to the state before it, and a white frame background.
+
+Fullscreen covered the work area only: fullzoom() measured it against
+BorderedLayout, the screen less the strips panels reserve with
+_NET_WM_STRUT, so the taskbar stayed visible under a fullscreen video.  It
+is measured against the whole monitor now, and the focused fullscreen
+window already stacks above docks, so it covers everything, as on Windows.
+
+Leaving fullscreen went back to the geometry saved before any zoom: a
+maximised window put into fullscreen came back at the smaller size it had
+before it was maximised, and no longer maximised.  The zoom the window had
+when it went fullscreen and that zoom's geometry are now kept, and leaving
+fullscreen restores both; the geometry saved before the first zoom stays the
+one a later restore goes back to.  Going from fullscreen straight into
+another zoom also drops the fullscreen stacking now (unzoom() missed the
+F_XFULLSCREENZOOM case).
+
+New Color keyword FrameBackground: the colour a frame shows where the
+application has not drawn yet -- the strip a resize uncovers while the
+program is busy, or a window just taken over when ctwm restarts.  GTK
+windows have no X background of their own, so that was the border tile
+grey.  Unset, the border tile colour is used as before.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/win_resize.c
++++ b/win_resize.c
+@@ -972,7 +972,24 @@
+ 		return;
+ 	}
+ 
+-	if(tmp_win->zoomed == func) {
++	if(tmp_win->zoomed == func &&
++	                (func == F_FULLSCREENZOOM || func == F_XFULLSCREENZOOM) &&
++	                tmp_win->fullscreen_from != ZOOM_NONE) {
++		int back = tmp_win->fullscreen_from;
++
++		/* Leaving fullscreen, back to the zoom the window had before:
++		 * maximised comes back maximised, not at the size the window had
++		 * before it was maximised.  The geometry saved then stays the
++		 * one a later restore goes back to. */
++		dragHeight = tmp_win->fullscreen_from_height;
++		dragWidth = tmp_win->fullscreen_from_width;
++		dragx = tmp_win->fullscreen_from_x;
++		dragy = tmp_win->fullscreen_from_y;
++
++		unzoom(tmp_win);
++		tmp_win->zoomed = back;
++	}
++	else if(tmp_win->zoomed == func) {
+ 		/* It was already zoomed this way, unzoom it */
+ 		dragHeight = tmp_win->save_frame_height;
+ 		dragWidth = tmp_win->save_frame_width;
+@@ -1006,12 +1023,27 @@
+ 			borderedLayout = Scr->BorderedLayout;
+ 		}
+ 
+-		if(tmp_win->zoomed == ZOOM_NONE) {
++		int was = tmp_win->zoomed;
++
++		if(was == F_FULLSCREENZOOM || was == F_XFULLSCREENZOOM) {
++			/* Out of fullscreen into another zoom: the geometry saved
++			 * before any zoom is still the one to restore. */
++			unzoom(tmp_win);
++			was = ZOOM_NONE;
++		}
++		else if(was == ZOOM_NONE) {
+ 			tmp_win->save_frame_x = dragx;
+ 			tmp_win->save_frame_y = dragy;
+ 			tmp_win->save_frame_width = dragWidth;
+ 			tmp_win->save_frame_height = dragHeight;
+ 		}
++		if(func == F_FULLSCREENZOOM || func == F_XFULLSCREENZOOM) {
++			tmp_win->fullscreen_from = was;
++			tmp_win->fullscreen_from_x = dragx;
++			tmp_win->fullscreen_from_y = dragy;
++			tmp_win->fullscreen_from_width = dragWidth;
++			tmp_win->fullscreen_from_height = dragHeight;
++		}
+ 		tmp_win->zoomed = func;
+ 
+ 		frame_bw_times_2 = 2 * tmp_win->frame_bw;
+@@ -1103,9 +1135,12 @@
+ 				int bw3D_times_2 = 2 * bw3D;
+ 				int bw = tmp_win->frame_bw + bw3D;
+ 
++				/* The whole monitor, the strip a panel keeps for
++				 * itself (_NET_WM_STRUT) included: a fullscreen
++				 * window covers the taskbar too, as on Windows. */
+ 				finalArea = func == F_XFULLSCREENZOOM
+-				            ? RLayoutFull(borderedLayout, &area)
+-				            : RLayoutFull1(borderedLayout, &area);
++				            ? RLayoutFull(Scr->Layout, &area)
++				            : RLayoutFull1(Scr->Layout, &area);
+ 				dragx = finalArea.x - bw;
+ 				dragy = finalArea.y - tmp_win->title_height - bw;
+ 				dragWidth = finalArea.width + bw3D_times_2;
+@@ -1182,7 +1217,8 @@
+ {
+ 	if(tmp_win->zoomed != ZOOM_NONE) {
+ #ifdef EWMH
+-		if(tmp_win->zoomed == F_FULLSCREENZOOM) {
++		if(tmp_win->zoomed == F_FULLSCREENZOOM ||
++		                tmp_win->zoomed == F_XFULLSCREENZOOM) {
+ 			OtpClearAflag(tmp_win, OTP_AFLAG_FULLSCREEN);
+ 			OtpRestackWindow(tmp_win);
+ 		}
+@@ -1190,6 +1226,7 @@
+ 
+ 		tmp_win->zoomed = ZOOM_NONE;
+ 	}
++	tmp_win->fullscreen_from = ZOOM_NONE;
+ }
+ 
+ void savegeometry(TwmWindow *tmp_win)
+--- a/twm_window_struct.h
++++ b/twm_window_struct.h
+@@ -203,6 +203,14 @@
+ 	unsigned int save_frame_width;  ///< width of frame   (saved from zoom)
+ 	unsigned int save_frame_height; ///< height of frame  (saved from zoom)
+ 	int zoomed;                ///< ZOOM_NONE || function causing zoom
++	/// While fullscreen: the zoom the window had before (ZOOM_NONE if it
++	/// had none) and that zoom's frame geometry, which leaving fullscreen
++	/// goes back to -- a maximised window comes back maximised.
++	int fullscreen_from;
++	int fullscreen_from_x;
++	int fullscreen_from_y;
++	unsigned int fullscreen_from_width;
++	unsigned int fullscreen_from_height;
+ 	bool wShaped;              ///< This window is Shape'd
+ 	/// Which protocols this window handles.  From WM_PROTOCOLS property
+ 	/// via XGetWMProtocols()
+--- a/parse_be.c
++++ b/parse_be.c
+@@ -218,6 +218,7 @@
+ #define kwc_MenuTitleForeground         5
+ #define kwc_MenuTitleBackground         6
+ #define kwc_MenuShadowColor             7
++#define kwc_FrameBackground             8
+ 
+ 
+ /*
+@@ -291,6 +292,7 @@
+ 	{ "forcefocus",             FORCE_FOCUS, 0 },
+ 	{ "forceicons",             KEYWORD, kw0_ForceIcons },
+ 	{ "frame",                  FRAME, 0 },
++	{ "framebackground",        CKEYWORD, kwc_FrameBackground },
+ 	{ "framepadding",           NKEYWORD, kwn_FramePadding },
+ 	{ "function",               FUNCTION, 0 },
+ 	{ "grabserver",             KEYWORD, kw0_GrabServer },
+@@ -1567,6 +1569,11 @@
+ 			GetColor(colormode, &Scr->MenuShadowColor, s);
+ 			return true;
+ 
++		case kwc_FrameBackground:
++			GetColor(colormode, &Scr->FrameBackground, s);
++			Scr->FrameBackgroundSet = true;
++			return true;
++
+ 	}
+ 
+ 	return false;
+--- a/screen.h
++++ b/screen.h
+@@ -438,6 +438,12 @@
+ 	/// Menu shadow color
+ 	Pixel MenuShadowColor;
+ 
++	/// What a window's frame shows where the application has not drawn
++	/// yet -- an area a resize uncovers, a window just reparented -- when
++	/// FrameBackgroundSet; otherwise the border tile colour, as before.
++	Pixel FrameBackground;
++	bool FrameBackgroundSet;
++
+ 	/// %Icon border color.  \sa ScreenInfo.IconBorderColorL
+ 	Pixel IconBorderColor;
+ 
+--- a/add_window.c
++++ b/add_window.c
+@@ -1525,7 +1525,9 @@
+ 		            | CWCursor | CWEventMask;
+ 		attributes.background_pixmap = None;
+ 		attributes.border_pixel = tmp_win->border_tile.back;
+-		attributes.background_pixel = tmp_win->border_tile.back;
++		attributes.background_pixel = Scr->FrameBackgroundSet
++		                              ? Scr->FrameBackground
++		                              : tmp_win->border_tile.back;
+ 		attributes.cursor = Scr->FrameCursor;
+ 		attributes.event_mask = (SubstructureRedirectMask
+ 		                         | ButtonPressMask | ButtonReleaseMask
+--- a/doc/manual/ctwm.1.adoc
++++ b/doc/manual/ctwm.1.adoc
+@@ -840,6 +840,13 @@
+   This variable indicates that icon pixmaps specified in the `Icons`
+   variable should override any client-supplied pixmaps.
+ 
++FrameBackground `string`::
++  This variable specifies the color a window's frame shows where the
++  application has not drawn yet: the area a resize uncovers before the
++  application repaints it, or a window just taken over.  It can only be
++  specified inside of a `Color` or `Monochrome` list.  The default is the
++  window's `BorderTileBackground`.
++
+ FramePadding `pixels`::
+   This variable specifies the distance between the titlebar decorations (the
+   button and text) and the window frame.  The default is 2 pixels if `UseThreeDTitles` is

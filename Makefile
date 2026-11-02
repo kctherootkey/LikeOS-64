@@ -560,6 +560,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/fs_eventfd.o \
 			  $(BUILD_DIR)/fs_timerfd.o \
 			  $(BUILD_DIR)/fs_signalfd.o \
+			  $(BUILD_DIR)/fs_inotify.o \
 			  $(BUILD_DIR)/fs_sync.o \
 			  $(BUILD_DIR)/mm_mmap.o \
 			  $(BUILD_DIR)/mm_mprotect.o \
@@ -780,12 +781,12 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 # leaves the parse-time test looking at the PREVIOUS build's output.
 #
 # The file it names is the LAST program the manifest builds, which is what
-# makes its presence mean "the whole stack".  That used to be Claws Mail and is
-# now PCManFM: everything Claws needs is built before it, and PCManFM adds
-# GtkSourceView, libxml2, Mousepad, the MIME database and libfm on top -- so a
-# sentinel left at claws-mail would have gone on being satisfied by a port that
-# stopped halfway through the new packages.
-GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/pcmanfm
+# makes its presence mean "the whole stack".  That was Claws Mail, then
+# PCManFM, and is now File Explorer (likeos-explorer), the last in-tree
+# package of gtk3/packages.list after the media player -- a sentinel left at
+# an earlier package would go on being satisfied by a port that stopped
+# before the packages added after it.
+GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/likeos-explorer
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
@@ -1267,6 +1268,9 @@ $(BUILD_DIR)/fs_timerfd.o: $(KERNEL_DIR)/fs/timerfd.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fs_signalfd.o: $(KERNEL_DIR)/fs/signalfd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_inotify.o: $(KERNEL_DIR)/fs/inotify.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fs_sync.o: $(KERNEL_DIR)/fs/sync.c | $(BUILD_DIR)
@@ -2583,6 +2587,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# Ends the desktop session with the log-out sound (menus and taskbar).
 	cp res/xorg/likeos-logout.sh $(EXT4_STAGING)/usr/bin/likeos-logout
 	chmod 0755 $(EXT4_STAGING)/usr/bin/likeos-logout
+	cp res/xorg/xdg-open.sh $(EXT4_STAGING)/usr/bin/xdg-open
+	chmod 0755 $(EXT4_STAGING)/usr/bin/xdg-open
 	mkdir -p $(EXT4_STAGING)/usr/share/sounds/likeos
 	cp res/sounds/likeos/*.wav $(EXT4_STAGING)/usr/share/sounds/likeos/
 	chmod 0755 $(EXT4_STAGING)/usr/share/sounds $(EXT4_STAGING)/usr/share/sounds/likeos
@@ -2796,7 +2802,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# rather than left to fall out of the filenames.  The two pairs that
 	# do the same job are kept together and the newer one first: Terminal
 	# before Xterm, Calculator before X Calculator.
-	i=0; for f in pcmanfm xfce4-terminal xterm mousepad xnedit luakit \
+	i=0; for f in explorer xfce4-terminal xterm mousepad xnedit luakit \
 	              hexchat claws-mail mediaplayer galculator xcalc; do \
 		for d in $(EXT4_STAGING)/etc/skel/Desktop \
 		         $(EXT4_STAGING)/root/Desktop; do \

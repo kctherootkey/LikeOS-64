@@ -1,4 +1,12 @@
 /* LikeOS GTK 3 theme (Windows 11 look).  GENERATED from src/ by build.py -- edit the .scss sources, not this file. */
+@define-color likeos_window #f3f3f3;
+@define-color likeos_layer #fbfbfb;
+@define-color likeos_card #ffffff;
+@define-color likeos_text #1b1b1b;
+@define-color likeos_text_secondary #616161;
+@define-color likeos_stroke #e5e5e5;
+@define-color likeos_accent #0078d4;
+@define-color likeos_selection #cce8ff;
 /***************************
  * Check and Radio buttons *
  ***************************/
@@ -7055,10 +7063,19 @@ menu separator, .menu separator, .context-menu separator {
 menu menuitem check, menu menuitem check:hover, menu menuitem check:disabled, menu menuitem check:checked, menu menuitem check:checked:hover, menu menuitem check:checked:disabled, menu menuitem check:indeterminate, menu menuitem check:indeterminate:hover, menu menuitem check:indeterminate:disabled, menu menuitem radio, menu menuitem radio:hover, menu menuitem radio:disabled, menu menuitem radio:checked, menu menuitem radio:checked:hover, menu menuitem radio:checked:disabled, menu menuitem radio:indeterminate, menu menuitem radio:indeterminate:hover, menu menuitem radio:indeterminate:disabled {
   min-height: 16px;
   min-width: 16px;
+  padding: 0;
   border: none;
   box-shadow: none;
   background-image: none;
   color: inherit;
+}
+
+menu menuitem check:checked, menu menuitem check:checked:hover {
+  -gtk-icon-source: -gtk-scaled(url("assets/check-menu.png"), url("assets/check-menu@2.png"));
+}
+
+menu menuitem radio:checked, menu menuitem radio:checked:hover, menu menuitem radio:checked:disabled {
+  -gtk-icon-source: -gtk-recolor(url("resource:///org/gtk/libgtk/theme/Adwaita/assets/bullet-symbolic.symbolic.png"));
 }
 
 /************
@@ -7437,7 +7454,22 @@ check:only-child, radio:only-child {
 }
 
 check {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 1px;
   border-radius: 4px;
+}
+
+check:checked {
+  -gtk-icon-source: -gtk-scaled(url("assets/check.png"), url("assets/check@2.png"));
+}
+
+check:indeterminate {
+  -gtk-icon-source: -gtk-scaled(url("assets/dash.png"), url("assets/dash@2.png"));
+}
+
+check:active {
+  -gtk-icon-transform: none;
 }
 
 radio {
@@ -7473,12 +7505,21 @@ checkbutton.text-button, radiobutton.text-button {
   padding: 4px 0;
 }
 
+checkbutton:not(.text-button), radiobutton:not(.text-button) {
+  outline-offset: 1px;
+  -gtk-outline-radius: 7px;
+}
+
 checkbutton label, radiobutton label {
   color: #1b1b1b;
 }
 
 checkbutton:disabled label, radiobutton:disabled label {
   color: #a0a0a0;
+}
+
+radiobutton:not(.text-button) {
+  -gtk-outline-radius: 50%;
 }
 
 /************
@@ -8098,6 +8139,289 @@ window.background, .background {
 window.background:backdrop, .background:backdrop {
   background-color: #f3f3f3;
   color: #1b1b1b;
+}
+
+lx-breadcrumb {
+  min-height: 32px;
+  border: 1px solid #e5e5e5;
+  border-bottom-color: #cccccc;
+  border-radius: 4px;
+  background-color: #fbfbfb;
+}
+
+lx-breadcrumb .lx-crumbs {
+  margin: 0 4px;
+}
+
+lx-breadcrumb button.lx-crumb {
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 4px;
+  color: #1b1b1b;
+}
+
+lx-breadcrumb button.lx-chevron {
+  min-height: 24px;
+  min-width: 16px;
+  padding: 0 2px;
+  border-radius: 4px;
+  -gtk-icon-transform: scale(0.75);
+}
+
+lx-breadcrumb button.lx-crumb:hover, lx-breadcrumb button.lx-chevron:hover {
+  background-color: rgba(0, 0, 0, 0.0373);
+}
+
+lx-breadcrumb entry {
+  min-height: 30px;
+  border: none;
+  border-radius: 4px;
+}
+
+lx-segmented button {
+  min-height: 24px;
+  min-width: 28px;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+lx-segmented button:checked {
+  background-color: rgba(0, 0, 0, 0.0373);
+  box-shadow: inset 0 -2px #0078d4;
+}
+
+.lx-split-button > button:first-child {
+  padding-right: 4px;
+}
+
+.lx-split-button > button:last-child {
+  padding: 0 4px;
+  min-width: 16px;
+}
+
+popover.lx-flyout {
+  border-radius: 8px;
+  padding: 4px;
+}
+
+popover.lx-flyout .lx-flyout-title {
+  font-weight: 600;
+  font-size: 10.5pt;
+}
+
+window.likeos-explorer {
+  background-color: #f3f3f3;
+}
+
+window.likeos-explorer > notebook > header.top {
+  background-color: #f3f3f3;
+  border: none;
+  padding: 2px 8px 0 8px;
+}
+
+window.likeos-explorer > notebook > header.top tab {
+  min-height: 26px;
+  padding: 0 8px;
+  margin: 0 1px;
+  border: none;
+  border-radius: 8px 8px 0 0;
+  color: #616161;
+}
+
+window.likeos-explorer > notebook > header.top tab:hover {
+  background-color: rgba(0, 0, 0, 0.0373);
+  color: #1b1b1b;
+}
+
+window.likeos-explorer > notebook > header.top tab:checked {
+  background-color: #fbfbfb;
+  color: #1b1b1b;
+  box-shadow: none;
+}
+
+window.likeos-explorer > notebook > header.top tab button {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+window.likeos-explorer > notebook > stack {
+  background-color: #fbfbfb;
+}
+
+window.likeos-explorer .ex-navbar {
+  margin: 4px 8px;
+}
+
+window.likeos-explorer .ex-navbar > button {
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 4px;
+}
+
+window.likeos-explorer .ex-navbar entry.search {
+  min-height: 32px;
+  border-radius: 4px;
+}
+
+window.likeos-explorer .ex-commandbar {
+  margin: 0 8px 4px 8px;
+  min-height: 36px;
+}
+
+window.likeos-explorer .ex-commandbar button {
+  min-height: 32px;
+  border-radius: 4px;
+  padding: 0 8px;
+}
+
+window.likeos-explorer .ex-commandbar separator {
+  background-color: #e5e5e5;
+  min-width: 1px;
+  margin: 4px 0;
+}
+
+window.likeos-explorer paned {
+  border-top: 1px solid #e5e5e5;
+}
+
+window.likeos-explorer paned > separator {
+  background-color: #e5e5e5;
+  min-width: 1px;
+}
+
+window.likeos-explorer .ex-sidebar {
+  background-color: #fbfbfb;
+}
+
+window.likeos-explorer .ex-sidebar treeview.view {
+  background-color: #fbfbfb;
+  -GtkTreeView-vertical-separator: 4;
+  padding: 2px 4px;
+}
+
+window.likeos-explorer .ex-sidebar treeview.view:hover {
+  background-color: rgba(0, 0, 0, 0.0373);
+}
+
+window.likeos-explorer .ex-sidebar treeview.view:selected {
+  background-color: #cce8ff;
+  color: #1b1b1b;
+}
+
+window.likeos-explorer treeview.view:hover {
+  background-color: #e5f3ff;
+}
+
+window.likeos-explorer treeview.view:selected {
+  background-color: #cce8ff;
+  color: #1b1b1b;
+}
+
+window.likeos-explorer treeview.view:selected:hover {
+  background-color: #c4e1fa;
+}
+
+window.likeos-explorer treeview.view header button {
+  padding: 4px 8px;
+  border: none;
+  border-right: 1px solid #e5e5e5;
+  color: #616161;
+  background-color: #ffffff;
+}
+
+window.likeos-explorer treeview.view.ex-compact {
+  -GtkTreeView-vertical-separator: 0;
+}
+
+window.likeos-explorer treeview.view.ex-empty {
+  outline-color: transparent;
+}
+
+window.likeos-explorer iconview {
+  background-color: #ffffff;
+}
+
+window.likeos-explorer iconview:hover {
+  background-color: #e5f3ff;
+}
+
+window.likeos-explorer iconview:selected {
+  background-color: #cce8ff;
+  color: #1b1b1b;
+  border-radius: 4px;
+}
+
+window.likeos-explorer .ex-statusbar {
+  margin: 2px 12px;
+  font-size: 8pt;
+  color: #616161;
+}
+
+window.likeos-explorer .ex-pane {
+  background-color: #fbfbfb;
+  border-left: 1px solid #e5e5e5;
+}
+
+window.likeos-explorer .ex-home {
+  background-color: #ffffff;
+}
+
+window.likeos-explorer .ex-home flowbox flowboxchild {
+  padding: 0;
+}
+
+window.likeos-explorer .ex-home list {
+  background-color: transparent;
+}
+
+window.likeos-explorer .ex-home list row {
+  border-radius: 4px;
+}
+
+window.likeos-explorer .ex-home list row:hover {
+  background-color: rgba(0, 0, 0, 0.0373);
+}
+
+window.likeos-explorer .ex-home list row:selected {
+  background-color: #cce8ff;
+  color: #1b1b1b;
+}
+
+window.likeos-explorer .ex-section-title {
+  font-size: 10.5pt;
+  font-weight: 600;
+  margin: 12px 0 4px 0;
+}
+
+window.likeos-explorer button.ex-tile {
+  min-width: 200px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background-color: #fbfbfb;
+  border: 1px solid #e5e5e5;
+}
+
+window.likeos-explorer button.ex-tile:hover {
+  background-color: #f6f6f6;
+}
+
+window.likeos-explorer button.ex-tile levelbar trough {
+  min-height: 6px;
+}
+
+window.likeos-explorer .ex-dim {
+  color: #616161;
+}
+
+window.likeos-explorer .ex-placeholder {
+  color: #616161;
+  font-size: 10.5pt;
+}
+
+window.likeos-explorer list row progressbar trough {
+  min-height: 4px;
 }
 
 /* GTK NAMED COLORS
