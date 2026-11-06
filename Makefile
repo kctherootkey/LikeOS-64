@@ -2567,8 +2567,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# /usr/bin/env so "#!/usr/bin/env <interp>" shebangs resolve (real copy;
 	# the exec path does not depend on symlink support)
 	cp $(BUILD_DIR)/env $(EXT4_STAGING)/usr/bin/env
-	# Desktop bar widgets -> /usr/bin, beside the X clients they replace
-	# (xclock and xload), which is also where xinitrc looks for them.
+	# Desktop bar widgets -> /usr/bin, beside xclock, the X client the
+	# clock replaces, which is also where xinitrc looks for them.
 	cp $(BUILD_DIR)/datetime $(EXT4_STAGING)/usr/bin/datetime
 	cp $(BUILD_DIR)/load     $(EXT4_STAGING)/usr/bin/load
 	cp $(BUILD_DIR)/taskbar  $(EXT4_STAGING)/usr/bin/taskbar
@@ -2809,11 +2809,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# on name and the order was alphabetical -- which put a newly added
 	# Calculator at the very top.  Stamping them one second apart in the
 	# order below is what actually decides the layout, so it is written here
-	# rather than left to fall out of the filenames.  The two pairs that
-	# do the same job are kept together and the newer one first: Terminal
-	# before Xterm, Calculator before X Calculator.
-	i=0; for f in explorer xfce4-terminal xterm mousepad xnedit luakit \
-	              hexchat claws-mail mediaplayer galculator xcalc; do \
+	# rather than left to fall out of the filenames.  The two that do the
+	# same job are kept together and the newer one first: Terminal before
+	# Xterm.
+	i=0; for f in explorer xfce4-terminal xterm mousepad luakit \
+	              hexchat claws-mail mediaplayer imageviewer galculator; do \
 		for d in $(EXT4_STAGING)/etc/skel/Desktop \
 		         $(EXT4_STAGING)/root/Desktop; do \
 			[ -f "$$d/$$f.desktop" ] && \

@@ -1,7 +1,7 @@
 # Names to show for desktop entries that come from a port's own tarball.
 #
-# Most entries in /usr/share/applications are written here (xterm.desktop,
-# xcalc.desktop) and say whatever this file says.  The rest
+# Most entries in /usr/share/applications are written here (xterm.desktop)
+# and say whatever this file says.  The rest
 # come from the packages themselves, installed into the sysroot by their own
 # `make install', and this is where those are given the names this desktop
 # uses.
@@ -12,11 +12,12 @@
 # forget on the next version bump.  Only the Name is ours; everything else
 # stays exactly as the package installed it.
 #
-# The names matter because two pairs of programs would otherwise collide in
-# the menu.  Galculator and xcalc are both "Calculator"; xfce4-terminal and
-# xterm are both "Terminal".  In each pair the newer program takes the plain
-# name and the X.Org one is qualified, which is the way round a user expects:
-# "Terminal" is the one to open, "Xterm" is the one you ask for by name.
+# The names matter because two programs would otherwise collide in the menu:
+# xfce4-terminal and xterm are both "Terminal".  The newer program takes the
+# plain name and the X.Org one is qualified, which is the way round a user
+# expects: "Terminal" is the one to open, "Xterm" is the one you ask for by
+# name.  Galculator, the only calculator on the image, is shown by its role,
+# "Calculator".
 #
 # Luakit is renamed for a different reason: it is not competing with anything,
 # it is the image's web browser, and a menu that offers "Luakit" alone tells a

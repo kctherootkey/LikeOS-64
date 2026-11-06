@@ -1,0 +1,721 @@
+// LikeOS Image Viewer (imageviewer).
+//
+// Pictures read best on dark, so the whole window is drawn in the shell
+// palette: the client-drawn title row (the picture's name and its
+// commands, the caption buttons inset at the right), the canvas, and the
+// floating chrome over it -- the bottom strip and the filmstrip as raised
+// dark cards inset from the window's edges, the info panel as a card at
+// the right.  The editor keeps the same surfaces: a top bar card, the tool
+// rail at the left, the options panel card at the right.  Toasts and
+// confirm cards float inside the window in the same palette; real dialogs
+// (Save as, Resize, Settings) are ordinary light LikeOS windows.
+//
+// The program draws its canvas, glyphs, filmstrip cells and swatches
+// itself and takes their colours from here through style classes (the
+// .iv-canvas-* and .iv-film-* colours below).  Everything is scoped to the
+// window's .iv-window class, and the dark menus to menu.iv-menu.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+$iv-bg: $shell-bg;
+$iv-raised: $shell-raised;
+$iv-border: $shell-border;
+$iv-text: $shell-text;
+$iv-secondary: $shell-text-secondary;
+$iv-disabled: $shell-text-disabled;
+$iv-hover: $shell-hover;
+$iv-active: $shell-active;
+$iv-accent: $shell-accent;
+$iv-accent-fill: $shell-accent-fill;
+$iv-darker: #0b0f18;
+$iv-edit-canvas: #10141f;
+$iv-card-radius: $radius-flyout;   // cards and panels
+$iv-button-radius: 8px;            // buttons and chips
+$iv-inset: $space-s;
+$iv-close: #e0443e;
+$iv-close-pressed: #c7352f;
+
+// A flat button of the dark surfaces: nothing at rest, a light veil under
+// the pointer, a stronger one pressed.
+@mixin iv-subtle {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: $iv-button-radius;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: $iv-text;
+  outline-color: transparentize($iv-accent, 0.2);
+  &:hover { background-color: $iv-hover; background-image: none; box-shadow: none; }
+  &:active, &.iv-menu-open, &.iv-pressed { background-color: $iv-active; background-image: none; box-shadow: none; }
+  &:disabled { color: $iv-disabled; background-color: transparent; }
+  &:backdrop { color: $iv-text; }
+  &:backdrop:disabled { color: $iv-disabled; }
+  label { color: inherit; }
+}
+
+// The slider of the dark surfaces: a hairline track, the accent part, a
+// light knob that grows under the pointer.
+@mixin iv-scale {
+  padding: 6px 0;
+  trough {
+    min-height: 4px;
+    border: none;
+    border-radius: 2px;
+    background-color: transparentize($iv-text, 0.82);
+    box-shadow: none;
+  }
+  highlight {
+    border: none;
+    border-radius: 2px;
+    background-image: image($iv-accent);
+    background-color: $iv-accent;
+  }
+  slider {
+    min-width: 14px;
+    min-height: 14px;
+    margin: -6px;
+    border: none;
+    border-radius: 50%;
+    background-color: $iv-text;
+    background-image: none;
+    box-shadow: 0 0 0 3px transparentize($iv-raised, 0.3);
+  }
+  &:hover slider, slider:hover, slider:active { background-color: white; }
+  marks, mark { color: $iv-secondary; }
+  mark indicator { min-height: 4px; min-width: 1px; color: $iv-secondary; }
+  &:disabled trough { background-color: transparentize($iv-text, 0.9); }
+  &:disabled highlight { background-image: none; background-color: transparent; }
+  &:disabled slider { background-color: $iv-disabled; }
+}
+
+// A raised dark card.
+@mixin iv-card {
+  background-color: $iv-raised;
+  border: 1px solid $iv-border;
+  border-radius: $iv-card-radius;
+  color: $iv-text;
+}
+
+window.iv-window {
+  background-color: $iv-bg;
+  color: $iv-text;
+  // The shared window.background:backdrop rule is the more specific one and
+  // would paint the window light whenever another window has the focus --
+  // showing round the info card and the editor's panels.
+  &:backdrop { background-color: $iv-bg; color: $iv-text; }
+
+  label { color: inherit; }
+  .iv-glyph { color: inherit; }
+  stack, scrolledwindow, viewport, overlay { background-color: transparent; }
+
+  scrollbar {
+    background-color: transparent;
+    border: none;
+    slider { background-color: transparentize($iv-text, 0.72); border: none; }
+    slider:hover { background-color: transparentize($iv-text, 0.55); }
+    trough { background-color: transparent; }
+  }
+
+  // ---- the title row --------------------------------------------------------
+
+  .iv-titlebar {
+    min-height: 40px;
+    padding: 0 0 0 $space-m;
+    background-color: $iv-bg;
+  }
+
+  .iv-title-icon { margin-right: $space-xs; }
+  .iv-title-name { font-size: $type-body; font-weight: $weight-strong; color: $iv-text; }
+  .iv-title-count { font-size: $type-body; color: $iv-secondary; }
+  &:backdrop .iv-title-name { color: $iv-secondary; }
+
+  .iv-title-commands { margin-right: $space-m; }
+
+  button.iv-title-button {
+    @include iv-subtle;
+    &.iv-text-button { padding: 0 $space-s 0 $space-m; }
+    .iv-chevron { color: $iv-secondary; }
+  }
+
+  // Edit: the one outlined in the accent.
+  button.iv-edit-button {
+    @include iv-subtle;
+    min-height: 30px;
+    padding: 0 $space-m 0 $space-s;
+    margin-right: $space-s;
+    border: 1px solid transparentize($iv-accent, 0.25);
+    .iv-glyph { color: $iv-accent; }
+    &:hover { background-color: transparentize($iv-accent, 0.86); border-color: $iv-accent; }
+    &:active { background-color: transparentize($iv-accent, 0.78); }
+    &:disabled { border-color: $iv-border; .iv-glyph { color: $iv-disabled; } }
+  }
+
+  button.iv-back { margin-right: $space-xs; }
+
+  // Minimise, maximise (restore), close: inset rounded buttons 36 by 26
+  // pixels, 4 apart and 6 from the edge.
+  button.iv-caption {
+    @include iv-subtle;
+    min-width: 36px;
+    min-height: 26px;
+    margin: 0 0 0 $space-xs;
+    border-radius: $radius-control;
+    &:hover { background-color: rgba(255, 255, 255, 0.08); }
+    &:active { background-color: rgba(255, 255, 255, 0.14); }
+    &.close { margin-right: 6px; }
+    &.close:hover { background-color: $iv-close; color: white; }
+    &.close:active { background-color: $iv-close-pressed; color: white; }
+  }
+  &:backdrop button.iv-caption { color: $iv-secondary; }
+  &:backdrop button.iv-caption.close:hover { color: white; }
+
+  // ---- the canvas -----------------------------------------------------------
+
+  .iv-canvas {
+    background-color: $iv-bg;
+    color: $iv-text;
+    &.darker { background-color: $iv-darker; }
+    &.checker { background-color: $iv-bg; }
+    &.iv-canvas-secondary { color: $iv-secondary; }
+    &.iv-canvas-accent { color: $iv-accent; }
+  }
+  .iv-canvas.iv-edit-canvas { background-color: $iv-edit-canvas; }
+  .iv-canvas.iv-edit-canvas.darker { background-color: $iv-darker; }
+
+  // ---- the bottom strip and the filmstrip ------------------------------------
+
+  .iv-strip {
+    @include iv-card;
+    margin: $iv-inset;
+    padding: 6px $space-s;
+  }
+
+  button.iv-strip-button {
+    @include iv-subtle;
+    &:checked, &:checked:hover { color: $iv-accent; background-color: $iv-active; }
+    &.iv-text-button { padding: 0 $space-s; }
+    .iv-chevron { color: $iv-secondary; }
+  }
+  button.iv-zoom-button { min-width: 76px; }
+  button.iv-nav-button { min-width: 40px; }
+
+  .iv-chip-label {
+    padding: 2px $space-s;
+    border-radius: $iv-button-radius;
+    background-color: rgba(255, 255, 255, 0.08);
+    font-size: $type-caption;
+    font-weight: $weight-strong;
+    letter-spacing: 0.5px;
+    color: $iv-text;
+  }
+  .iv-strip-fact { font-size: $type-body; color: $iv-secondary; }
+
+  scale.iv-zoom-scale { @include iv-scale; }
+
+  .iv-filmstrip {
+    @include iv-card;
+    margin: $iv-inset $iv-inset 0 $iv-inset;
+  }
+  .iv-film-area {
+    &.iv-film-accent { color: $iv-accent; }
+    &.iv-film-placeholder { color: rgba(255, 255, 255, 0.06); }
+    &.iv-film-glyph { color: $iv-disabled; }
+    &.iv-film-hover { color: rgba(255, 255, 255, 0.12); }
+  }
+
+  // ---- the info panel ---------------------------------------------------------
+
+  .iv-info {
+    @include iv-card;
+    margin: $iv-inset $iv-inset $iv-inset 0;
+  }
+  .iv-info-head { padding: $space-m $space-s $space-xs $space-l; }
+  .iv-info-title { font-size: $type-subtitle; font-weight: $weight-strong; }
+  button.iv-info-close, button.iv-info-edit { @include iv-subtle; min-width: 28px; min-height: 28px; }
+  .iv-info-content { padding: $space-xs $space-l $space-l $space-l; }
+
+  .iv-quicks { margin-bottom: $space-xs; }
+  button.iv-quick {
+    @include iv-subtle;
+    padding: $space-s $space-xxs;
+    background-color: rgba(255, 255, 255, 0.04);
+    .iv-glyph { color: $iv-accent; }
+    .iv-quick-label { font-size: $type-caption; color: $iv-secondary; }
+    &:hover .iv-quick-label { color: $iv-text; }
+  }
+
+  .iv-info-section {
+    margin-top: $space-m;
+    padding-top: $space-s;
+    border-top: 1px solid $iv-border;
+    .iv-glyph { color: $iv-secondary; }
+  }
+  .iv-info-section-title { font-weight: $weight-strong; font-size: $type-body; }
+  .iv-info-key { color: $iv-secondary; font-size: $type-body; }
+  .iv-info-value { color: $iv-text; font-size: $type-body; }
+
+  entry.iv-info-name {
+    min-height: $height-control;
+    padding: 0 $space-s;
+    border: 1px solid $iv-border;
+    border-radius: $iv-button-radius;
+    background-color: $iv-bg;
+    background-image: none;
+    color: $iv-text;
+    caret-color: $iv-accent;
+    box-shadow: none;
+    &:focus { border-color: $iv-accent; box-shadow: inset 0 -1px $iv-accent; }
+    &:disabled { color: $iv-disabled; }
+    selection { background-color: transparentize($iv-accent, 0.55); color: white; }
+  }
+
+  button.iv-link {
+    @include iv-subtle;
+    min-height: 24px;
+    min-width: 0;
+    padding: 0 $space-xxs;
+    color: $iv-accent;
+    &:hover { background-color: transparent; label { text-decoration-line: underline; } }
+    label { color: $iv-accent; }
+  }
+
+  expander.iv-info-expander, .iv-info-expander {
+    title { color: $iv-text; }
+    arrow { color: $iv-secondary; }
+  }
+
+  // ---- toasts and confirm cards -----------------------------------------------
+
+  .iv-toast {
+    @include iv-card;
+    min-width: 280px;
+    padding: $space-s $space-s $space-s $space-l;
+  }
+  button.iv-toast-action {
+    @include iv-subtle;
+    padding: 0 $space-m;
+    color: $iv-accent;
+    font-weight: $weight-strong;
+    label { color: $iv-accent; }
+  }
+  button.iv-toast-close { @include iv-subtle; min-width: 28px; min-height: 28px; }
+  progressbar.iv-toast-bar {
+    trough { min-height: 4px; border: none; border-radius: 2px; background-color: transparentize($iv-text, 0.85); }
+    progress { min-height: 4px; border: none; border-radius: 2px; background-color: $iv-accent; background-image: none; }
+  }
+
+  .iv-shade { background-color: rgba(6, 9, 15, 0.58); }
+  .iv-confirm {
+    @include iv-card;
+    padding: $space-l + 4px $space-xl;
+  }
+  .iv-confirm-title { font-size: $type-subtitle; font-weight: $weight-strong; }
+  .iv-confirm-text { color: $iv-secondary; }
+  button.iv-card-button {
+    min-height: $height-control;
+    padding: 0 $space-l;
+    border: none;
+    border-radius: $iv-button-radius;
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    outline-color: white;
+    &.iv-plain { background-color: rgba(255, 255, 255, 0.08); color: $iv-text; }
+    &.iv-plain:hover { background-color: rgba(255, 255, 255, 0.13); }
+    &.iv-accent { background-color: $iv-accent-fill; color: white; }
+    &.iv-accent:hover { background-color: lighten($iv-accent-fill, 5%); }
+    &.iv-destructive { background-color: $iv-close; color: white; }
+    &.iv-destructive:hover { background-color: lighten($iv-close, 5%); }
+    &:active { background-image: image(rgba(0, 0, 0, 0.12)); }
+    label { color: inherit; }
+  }
+
+  // ---- the editor ---------------------------------------------------------------
+
+  .iv-editor { background-color: $iv-bg; }
+
+  .iv-topbar {
+    @include iv-card;
+    margin: 0 $iv-inset 0 $iv-inset;
+    padding: $space-xs 6px;
+  }
+  button.iv-bar-button {
+    @include iv-subtle;
+    &.iv-text-button { padding: 0 $space-m 0 $space-s; }
+    .iv-chevron { color: $iv-secondary; }
+  }
+  separator.iv-bar-separator {
+    min-width: 1px;
+    margin: 6px 0;
+    background-color: $iv-border;
+  }
+
+  // Done: the accent-filled split button; Discard: an outline.
+  .iv-split button {
+    min-height: $height-control;
+    border: none;
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    background-color: $iv-accent-fill;
+    color: white;
+    &:hover { background-color: lighten($iv-accent-fill, 5%); }
+    &:active { background-color: darken($iv-accent-fill, 5%); }
+    &:disabled { background-color: transparentize($iv-accent-fill, 0.6); color: transparentize(white, 0.4); }
+    label { color: inherit; }
+  }
+  .iv-split button.iv-done {
+    padding: 0 $space-m 0 $space-m;
+    border-radius: $iv-button-radius 0 0 $iv-button-radius;
+    font-weight: $weight-strong;
+  }
+  .iv-split button.iv-done-menu {
+    min-width: 30px;
+    padding: 0;
+    border-radius: 0 $iv-button-radius $iv-button-radius 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.28);
+  }
+  button.iv-outline-button {
+    @include iv-subtle;
+    padding: 0 $space-l;
+    border: 1px solid $iv-border;
+    &:hover { border-color: transparentize($iv-text, 0.7); }
+  }
+
+  .iv-rail {
+    padding: $space-s 6px;
+    background-color: $iv-bg;
+  }
+  button.iv-rail-button {
+    @include iv-subtle;
+    min-width: 64px;
+    min-height: 58px;
+    border-radius: 10px;
+    color: $iv-secondary;
+    .iv-rail-label { font-size: $type-caption; }
+    &:hover { color: $iv-text; }
+    &.active { background-color: $iv-active; color: $iv-text; }
+    &.active .iv-glyph { color: $iv-accent; }
+  }
+
+  .iv-options {
+    @include iv-card;
+    margin: $iv-inset $iv-inset $iv-inset 0;
+  }
+
+  .iv-panel { padding: $space-l; }
+  .iv-panel-title { font-size: $type-subtitle; font-weight: $weight-strong; }
+  .iv-panel-subtitle, .iv-panel-note { color: $iv-secondary; font-size: $type-body; }
+  .iv-panel-section {
+    margin-top: $space-m;
+    padding-top: $space-s;
+    border-top: 1px solid $iv-border;
+  }
+  .iv-panel-section-title {
+    font-size: $type-caption;
+    font-weight: $weight-strong;
+    letter-spacing: 1px;
+    color: $iv-secondary;
+  }
+  button.iv-panel-reset { @include iv-subtle; min-width: 26px; min-height: 26px; color: $iv-secondary; }
+
+  .iv-slider-row { margin-top: $space-xs; }
+  .iv-slider-label { color: $iv-text; }
+  .iv-slider-value { color: $iv-secondary; font-feature-settings: "tnum"; }
+  scale.iv-slider { @include iv-scale; }
+  scale.iv-slider.iv-symmetric highlight { background-image: none; background-color: transparent; }
+
+  button.iv-chip {
+    min-height: 28px;
+    padding: 0 $space-m;
+    border: 1px solid transparent;
+    border-radius: $iv-button-radius;
+    background-color: rgba(255, 255, 255, 0.06);
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    color: $iv-text;
+    &:hover { background-color: rgba(255, 255, 255, 0.1); }
+    &:checked { background-color: transparentize($iv-accent, 0.8); border-color: $iv-accent; color: $iv-accent; }
+    label { color: inherit; }
+  }
+  flowbox.iv-chips flowboxchild, flowbox.iv-swatches flowboxchild { padding: 0; background-color: transparent; }
+
+  button.iv-panel-button {
+    @include iv-subtle;
+    min-height: 36px;
+    padding: 0 $space-m;
+    background-color: rgba(255, 255, 255, 0.06);
+    &:hover { background-color: rgba(255, 255, 255, 0.11); }
+    .iv-glyph { color: $iv-accent; }
+  }
+
+  .iv-switch-row { min-height: 36px; }
+  switch {
+    border: none;
+    background-color: transparentize($iv-text, 0.78);
+    background-image: none;
+    box-shadow: none;
+    slider { background-color: $iv-text; border: none; box-shadow: none; }
+    &:checked { background-color: $iv-accent-fill; }
+    &:checked slider { background-color: white; }
+  }
+
+  button.iv-swatch {
+    @include iv-subtle;
+    min-width: 30px;
+    min-height: 30px;
+    padding: 1px;
+    border-radius: 50%;
+    color: $iv-text;
+  }
+}
+
+// The dark menus of the viewer (a menu is a window of its own, so it is
+// matched by its own class rather than by the viewer window's).
+menu.iv-menu, .iv-menu {
+  background-color: $iv-raised;
+  border: 1px solid $iv-border;
+  color: $iv-text;
+  &:backdrop { background-color: $iv-raised; }
+
+  menuitem {
+    color: $iv-text;
+    min-width: 200px;
+    &:hover, &:backdrop:hover { background-color: $iv-hover; color: $iv-text; }
+    &:active { background-color: $iv-active; }
+    &:disabled, &:disabled:backdrop { color: $iv-disabled; }
+    &:backdrop { color: $iv-text; }
+    label { color: inherit; }
+    .iv-glyph { color: inherit; }
+    .iv-accel { color: $iv-secondary; }
+    &:disabled .iv-accel { color: $iv-disabled; }
+  }
+  separator { background-color: $iv-border; }
+}
+
+// ==== Editor tools: Crop, Adjust, Styles ======================================
+// (tool-crop.c, tool-crop-dial.c, tool-adjust.c, tool-styles.c; the other
+// editor tools keep their rules in a section of their own)
+
+window.iv-window {
+  // A small glyph in front of a panel section's title.
+  .iv-panel-section .iv-section-glyph { color: $iv-secondary; margin-right: 2px; }
+
+  // A filled accent command (Apply) and the focus ring of the panel
+  // controls that take the keyboard.
+  button.iv-accent-button {
+    @include iv-subtle;
+    min-height: $height-control;
+    padding: 0 $space-m;
+    background-color: $iv-accent-fill;
+    color: white;
+    font-weight: $weight-strong;
+    &:hover { background-color: lighten($iv-accent-fill, 5%); }
+    &:active { background-color: darken($iv-accent-fill, 5%); }
+    &:disabled { background-color: transparentize($iv-accent-fill, 0.65); color: transparentize(white, 0.45); }
+    .iv-glyph { color: inherit; }
+  }
+  .iv-crop-actions { margin-top: $space-m; }
+  .iv-crop-actions button.iv-outline-button { min-height: $height-control; }
+
+  // ---- Crop --------------------------------------------------------------------
+  flowbox.iv-aspect-chips button.iv-chip {
+    min-width: 42px;
+    padding: 0 $space-s;
+    &:checked, &:checked:hover {
+      background-image: none;
+      background-color: transparentize($iv-accent, 0.78);
+      border-color: $iv-accent;
+      color: white;
+      font-weight: $weight-strong;
+    }
+  }
+  .iv-dial-card {
+    padding: 4px 2px 2px 2px;
+    border-radius: 10px;
+    background-color: transparentize($iv-darker, 0.45);
+    border: 1px solid transparentize($iv-border, 0.3);
+  }
+  .iv-dial { color: $iv-text; }
+  button.iv-crop-tile {
+    @include iv-subtle;
+    min-height: 58px;
+    padding: 6px 0 4px 0;
+    background-color: rgba(255, 255, 255, 0.06);
+    &:hover { background-color: rgba(255, 255, 255, 0.11); }
+    &:active { background-color: rgba(255, 255, 255, 0.15); }
+    .iv-glyph { color: $iv-accent; }
+    .iv-crop-tile-label { font-size: $type-caption; color: $iv-secondary; }
+    &:hover .iv-crop-tile-label { color: $iv-text; }
+  }
+  .iv-crop-size {
+    font-size: $type-body-large;
+    font-weight: $weight-strong;
+    font-feature-settings: "tnum";
+    margin-top: $space-xxs;
+  }
+
+  // ---- Adjust ------------------------------------------------------------------
+  .iv-hist-head { margin-top: $space-s; }
+  .iv-hist-title { font-size: $type-caption; font-weight: $weight-strong; letter-spacing: 1px; color: $iv-secondary; }
+  .iv-histogram { margin-bottom: $space-xxs; }
+
+  // Sliders whose track shows where they go: the trough is the gradient,
+  // the neutral mark sits in its middle, no accent fill.
+  scale.iv-slider.iv-tracked {
+    trough { min-height: 6px; border-radius: 3px; }
+    highlight { background-image: none; background-color: transparent; }
+  }
+  scale.iv-slider.iv-track-tone trough {
+    background-image: linear-gradient(to right, #0e121b, #5d6475 50%, #f4f6fa);
+  }
+  scale.iv-slider.iv-track-saturation trough {
+    background-image: linear-gradient(to right, #6f7480, #9b8f8a 40%, #e8604f 70%, #f0a12a 85%, #f5d02f);
+  }
+  scale.iv-slider.iv-track-warmth trough {
+    background-image: linear-gradient(to right, #3f7ef2, #9fb3d6 45%, #d9cbb0 55%, #f2a53a);
+  }
+  scale.iv-slider.iv-track-tint trough {
+    background-image: linear-gradient(to right, #34b562, #9cc2a8 45%, #c9a8c6 55%, #d64fc8);
+  }
+  scale.iv-slider.iv-tracked:disabled trough { background-image: none; }
+  scale.iv-slider:focus {
+    outline-color: transparentize($iv-accent, 0.15);
+    outline-width: 2px;
+    outline-style: solid;
+    outline-offset: 1px;
+    border-radius: 6px;
+  }
+  .iv-adjust-switch { margin-top: $space-xxs; }
+  button.iv-adjust-reset-all { margin-top: $space-l; }
+
+  // ---- Styles ------------------------------------------------------------------
+  button.iv-auto-enhance {
+    min-height: 40px;
+    border: 1px solid transparentize($iv-accent, 0.4);
+    background-color: transparentize($iv-accent, 0.88);
+    font-weight: $weight-strong;
+    &:hover { background-color: transparentize($iv-accent, 0.8); border-color: $iv-accent; }
+    &.iv-on { background-color: transparentize($iv-accent, 0.72); border-color: $iv-accent; color: white; }
+    .iv-glyph { color: $iv-accent; }
+    &.iv-on .iv-glyph { color: white; }
+  }
+  flowbox.iv-style-grid {
+    margin-top: $space-xs;
+    flowboxchild {
+      padding: 3px 2px 5px 2px;
+      border-radius: 10px;
+      background-color: transparent;
+      outline-color: transparentize($iv-accent, 0.15);
+      outline-style: solid;
+      outline-width: 2px;
+      outline-offset: -2px;
+      &:hover { background-color: rgba(255, 255, 255, 0.05); }
+      &:selected { background-color: transparent; color: $iv-text; }
+      &:selected:hover { background-color: rgba(255, 255, 255, 0.05); }
+      &:selected .iv-style-name { color: $iv-accent; font-weight: $weight-strong; }
+    }
+  }
+  .iv-style-name { font-size: $type-caption; color: $iv-secondary; }
+  .iv-slider-row.iv-style-intensity {
+    margin-top: $space-m;
+    padding-top: $space-m;
+    border-top: 1px solid $iv-border;
+  }
+}
+
+// ==== Editor tools: Draw, Retouch, Background ===============================
+// (tool-draw.c, tool-retouch.c, tool-background.c, tool-brush.c)
+//
+// The Draw tool's four tool tiles, its sample-stroke box, the captions and
+// tips the brush tools share, the accent command buttons (Apply, Detect
+// background) and the Background tool's large action cards with their
+// thumbnails.  All on the dark options panel.
+window.iv-window {
+  .iv-draw-tiles { margin: $space-xs 0 $space-s 0; }
+  button.iv-draw-tile {
+    @include iv-subtle;
+    min-height: 62px;
+    padding: 6px 2px 4px 2px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.04);
+    color: $iv-secondary;
+    .iv-draw-tile-label { font-size: $type-caption; }
+    &:hover { background-color: rgba(255, 255, 255, 0.08); color: $iv-text; }
+    // The theme's light checked look is replaced in every state.
+    &:checked, &:checked:hover, &:checked:active, &:checked:backdrop {
+      background-color: transparentize($iv-accent, 0.85);
+      background-image: none;
+      border-color: transparentize($iv-accent, 0.35);
+      box-shadow: none;
+      color: $iv-text;
+    }
+    &:checked:hover { background-color: transparentize($iv-accent, 0.8); }
+    &:checked .iv-glyph { color: $iv-accent; }
+  }
+  .iv-draw-preview { margin-top: $space-xs; }
+
+  // Eight colours and the chooser in one row of the panel.
+  flowbox.iv-brush-swatches button.iv-swatch {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    margin: 0;
+  }
+
+  .iv-brush-caption { font-size: $type-caption; color: $iv-secondary; }
+  .iv-brush-tips { margin-top: $space-xs; }
+  .iv-brush-tip { color: $iv-secondary; font-size: $type-body; }
+
+  button.iv-panel-button.iv-accent-button {
+    background-color: $iv-accent-fill;
+    color: white;
+    font-weight: $weight-strong;
+    .iv-glyph { color: white; }
+    &:hover { background-color: lighten($iv-accent-fill, 5%); }
+    &:active { background-color: darken($iv-accent-fill, 5%); }
+    &:disabled {
+      background-color: rgba(255, 255, 255, 0.04);
+      color: $iv-disabled;
+      .iv-glyph { color: $iv-disabled; }
+    }
+  }
+
+  // The brush tools' mode chips (Add / Erase): the dark checked look in
+  // every state, over the theme's light one.
+  flowbox.iv-brush-chips button.iv-chip {
+    &:checked, &:checked:hover, &:checked:active, &:checked:backdrop {
+      background-color: transparentize($iv-accent, 0.8);
+      background-image: none;
+      border-color: $iv-accent;
+      box-shadow: none;
+      color: $iv-accent;
+    }
+  }
+
+  button.iv-bg-card {
+    @include iv-subtle;
+    margin-top: $space-xs;
+    padding: 8px 10px 8px 8px;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background-color: rgba(255, 255, 255, 0.04);
+    &:hover { background-color: rgba(255, 255, 255, 0.08); }
+    &.iv-selected {
+      border-color: $iv-accent;
+      background-color: transparentize($iv-accent, 0.86);
+      .iv-glyph { color: $iv-accent; }
+    }
+    &.iv-unavailable .iv-bg-card-title,
+    &.iv-unavailable .iv-bg-card-text { color: $iv-disabled; }
+  }
+  .iv-bg-card-title { font-weight: $weight-strong; font-size: $type-body; }
+  .iv-bg-card-text { color: $iv-secondary; font-size: $type-caption; }
+}

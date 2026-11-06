@@ -108,8 +108,9 @@ font      font-misc-misc     1.1.3    -  xorg/font/misc-misc
 font      font-cursor-misc   1.0.4    -  xorg/font/cursor-misc
 # The Korean (KSC 5601) and Chinese (GB 2312) bitmap fonts.  The UTF-8
 # locale's fontset names these charsets among the rest, and Xt programs --
-# xcalc -- warned "Missing charsets in String to FontSet conversion" while
-# they were absent; misc-misc covers every other one it asks for.
+# xclock, xterm's Athena menus -- warn "Missing charsets in String to FontSet
+# conversion" while they are absent; misc-misc covers every other one it asks
+# for.
 font      font-daewoo-misc   1.0.4    -  xorg/font/daewoo-misc
 font      font-isas-misc     1.0.4    -  xorg/font/isas-misc
 
@@ -122,32 +123,22 @@ font      font-isas-misc     1.0.4    -  xorg/font/isas-misc
 lib       libevdev           1.13.6   libevdev
 lib       mtdev              1.1.7    mtdev
 
-# ---- Motif stack, for xnedit ----
-# xnedit is a Motif program, and Motif is not in the base X.Org set.  The chain
-# is expat -> fontconfig -> libXft -> motif: fontconfig parses its XML config
-# with expat, libXft is the client-side font layer over freetype+fontconfig, and
-# Motif draws its text through libXft.  All four are plain C.
+# ---- client-side fonts, and the X bitmaps ----
+# The chain is expat -> fontconfig -> libXft: fontconfig parses its XML config
+# with expat, and libXft is the client-side font layer over
+# freetype+fontconfig that ctwm and xterm draw their text through (the GTK
+# stack takes fontconfig from here too).  All three are plain C.
 #
 # Section "-" means the package is not an X.Org one, so the Debian pool is the
 # only source; fetch.sh falls back to the newest version Debian carries when the
 # version named here is not in the pool.
 # xbitmaps installs the classic X bitmap files (the root weave, the icons the
 # toolkit draws) plus their pkg-config description.  xsetroot's configure
-# requires it by name -- and Motif #includes <X11/bitmaps/gray> directly, which
-# is why it has to come BEFORE the Motif stack rather than down with the
-# session programs.  It was listed after motif, and that only ever worked
-# because an earlier build had already left the headers in the sysroot; a
-# from-scratch `make distclean && make` failed on it.
+# requires it by name.
 data      xbitmaps           1.1.1    xbitmaps
 -         expat              2.7.3    https://github.com/libexpat/libexpat/releases/download/R_2_7_3/expat-%VERSION%.tar.xz
 -         fontconfig         2.15.0   fontconfig
 lib       libXft             2.3.9    libxft
--         motif              2.3.8    motif
-# xnedit is a Motif text editor (an NEdit fork with Unicode support).  Published
-# only on GitHub -- neither the x.org archive nor Debian carries it -- so it uses
-# the explicit-URL source.  It has no configure: the build selects one of
-# makefiles/Makefile.<platform>, so the port adds an arm for this system.
--         xnedit             1.6.3    https://github.com/unixwork/xnedit/archive/refs/tags/v%VERSION%.tar.gz
 
 # ---- the server and its two drivers ----
 xserver   xorg-server        21.1.23  xorg-server
@@ -167,13 +158,6 @@ app       xset               1.2.5    -  xorg/app/xset
 app       xrandr             1.5.3    -  xorg/app/xrandr
 app       xvinfo             1.1.5    -  xorg/app/xvinfo
 app       xclock             1.1.1    -  xorg/app/xclock
-# xload draws a load-average graph.  It reads the figures through getloadavg(),
-# which this system's libc now provides on top of sysinfo(2) -- its other
-# backends poke /dev/kmem or /proc/loadavg, neither of which exists here.
-app       xload              1.1.4    -  xorg/app/xload
-# xcalc is a scientific calculator on the Athena widget set -- the same libXaw
-# and libXt everything else here already uses, so it needs nothing new.
-app       xcalc              1.1.2    -  xorg/app/xcalc
 app       twm                1.0.13   twm
 # libdrm: the userspace side of the kernel's display-manager interface
 # (/dev/dri/card0, /dev/dri/renderD128 -- kernel/dev/video/gpu).  Mesa's device

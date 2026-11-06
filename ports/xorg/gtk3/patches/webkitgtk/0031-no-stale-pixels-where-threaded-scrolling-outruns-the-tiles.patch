@@ -1,0 +1,125 @@
+Areas the tiles do not cover yet show the background, not stale or undefined
+pixels, and the tiles ahead of a scroll come sooner.
+
+Tiles are created and recorded by the main thread; the scrolling thread can
+only show those that exist.  When it scrolls past them -- the main thread
+busy for longer than it takes to scroll through the cover area, half a
+viewport ahead -- the uncovered part of the view has to be filled with
+something, and three things decide what and for how long:
+
+  - What.  AcceleratedSurface cleared the viewport with an opaque background
+    colour only for frames the scrolling thread asked for, on the grounds
+    that a rendering update covers the viewport with tiles.  With threaded
+    scrolling it need not: the frame of a rendering update is composited with
+    the scrolling tree's layer positions, which may have moved past what that
+    update created tiles for.  Those pixels kept whatever the buffer held --
+    an older frame at another offset, or memory nothing wrote, which is grey
+    on VMware (its undefined surface contents are 0xcc) -- until the tiles
+    arrived, seconds later on a slow main thread.  Every frame is now
+    cleared; one clear is a small part of compositing a frame.
+
+  - Which tiles first.  createOrDestroyTiles() collects the missing tiles
+    closest to the viewport, but on finding a closer one it cleared the
+    wrong vector (the output, which is empty there, instead of the positions
+    collected so far), so tiles above the viewport, visited first, were
+    created and painted along with the visible ones, ahead of them.  Same
+    change as WebKit 322955@main (bug 326498).
+
+  - How far ahead.  The cover rect reaches half a viewport beyond the
+    visible rect on every side.  It now reaches as far again in the
+    direction the visible rect last moved, so that the main thread, each
+    time it gets to run, prepares a full viewport of the page ahead of the
+    scroll.  Those tiles are the farthest from the viewport and are created
+    last; under memory pressure, where the cover area shrinks to the
+    viewport, nothing changes.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -1046,18 +1046,29 @@ void AcceleratedSurface::willRenderFrame
+         glViewport(0, 0, size.width(), size.height());
+ }
+ 
+-void AcceleratedSurface::clear(const OptionSet<WebCore::CompositionReason>& reasons)
++// Every frame starts from the background, opaque or not.  Skipping the clear
++// for an opaque background on all but scrolling-thread frames assumed that the
++// tiles cover the viewport in every other frame, and with threaded scrolling
++// they need not: a rendering update composites with the scrolling tree's
++// positions, which may have moved past what the update covered with tiles
++// while the main thread was busy.  Uncovered pixels then showed whatever the
++// buffer held before -- an older frame at another offset, or memory nothing
++// ever wrote (grey on VMware, whose undefined surface contents are 0xcc) --
++// until the tiles arrived.  One clear per frame is a fraction of the cost of
++// compositing it.
++void AcceleratedSurface::clear(const OptionSet<WebCore::CompositionReason>&)
+ {
+     ASSERT(!RunLoop::isMain());
+     auto backgroundColor = m_backgroundColor.load();
+     if (!isColorOpaque(backgroundColor)) {
+         glClearColor(0, 0, 0, 0);
+         glClear(GL_COLOR_BUFFER_BIT);
+-    } else if (reasons.contains(CompositionReason::AsyncScrolling)) {
+-        auto [r, g, b, a] = backgroundColor;
+-        glClearColor(r, g, b, a);
+-        glClear(GL_COLOR_BUFFER_BIT);
++        return;
+     }
++
++    auto [r, g, b, a] = backgroundColor;
++    glClearColor(r, g, b, a);
++    glClear(GL_COLOR_BUFFER_BIT);
+ }
+ 
+ void AcceleratedSurface::didRenderFrame()
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.h
+@@ -148,6 +148,9 @@ private:
+     bool m_pendingTileCreation { false };
+     IntRect m_contentsRect;
+     IntRect m_visibleRect;
++    // The way the visible rect last moved vertically: 1 down, -1 up, 0 not
++    // yet.  The cover rect reaches further that way (computeCoverAndKeepRect()).
++    int m_lastVerticalScrollDirection { 0 };
+     IntRect m_coverRect;
+     IntRect m_keepRect;
+     HashMap<IntPoint, Tile> m_tiles;
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.cpp
+@@ -215,6 +215,8 @@ void CoordinatedBackingStoreProxy::creat
+         return;
+ 
+     if (geometryChanged) {
++        if (!contentsScaleChanged && !m_visibleRect.isEmpty() && visibleRect.size() == m_visibleRect.size() && visibleRect.y() != m_visibleRect.y())
++            m_lastVerticalScrollDirection = visibleRect.y() > m_visibleRect.y() ? 1 : -1;
+         m_contentsRect = contentsRect;
+         m_visibleRect = visibleRect;
+         m_coverAreaMultiplier = coverAreaMultiplier;
+@@ -321,7 +323,7 @@ void CoordinatedBackingStoreProxy::creat
+             return;
+ 
+         if (distance < shortestDistance) {
+-            tilesToCreate.clear();
++            tilePositionsToCreate.clear();
+             shortestDistance = distance;
+         }
+         tilePositionsToCreate.append(position);
+@@ -471,6 +473,19 @@ std::pair<IntRect, IntRect> CoordinatedB
+         // The initial cover area covers equally in each direction, according to the coverAreaMultiplier.
+         coverRect.inflateX(m_visibleRect.width() * (m_coverAreaMultiplier - 1) / 2);
+         coverRect.inflateY(m_visibleRect.height() * (m_coverAreaMultiplier - 1) / 2);
++
++        // And as far again in the direction the content last scrolled.  With
++        // threaded scrolling the page moves on while the main thread, the only
++        // one that can create tiles, is busy; what it covered ahead of the
++        // viewport is what can be shown meanwhile.  The tiles there are the
++        // farthest from the visible rect, so they are created last.
++        if (m_lastVerticalScrollDirection) {
++            int ahead = m_visibleRect.height() * (m_coverAreaMultiplier - 1) / 2;
++            if (m_lastVerticalScrollDirection < 0)
++                coverRect.shiftYEdgeTo(coverRect.y() - ahead);
++            else
++                coverRect.shiftMaxYEdgeTo(coverRect.maxY() + ahead);
++        }
+         keepRect = coverRect;
+         ASSERT(keepRect.contains(coverRect));
+     }

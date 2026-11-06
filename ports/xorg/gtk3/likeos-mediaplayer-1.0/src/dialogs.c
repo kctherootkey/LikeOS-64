@@ -742,9 +742,7 @@ void mp_dialog_shortcuts(MpApp *app)
 		{ "F9  /  Q", "Show or hide the queue" },
 		{ NULL, "View and files" },
 		{ "F  /  F11", "Full screen" },
-		{ "Esc", "Leave full screen, the mini player or the "
-			 "now-playing page" },
-		{ "Ctrl+M", "Mini player" },
+		{ "Esc", "Leave full screen or the now-playing page" },
 		{ "Ctrl+F", "Search the library" },
 		{ "Double-click", "Full screen on or off" },
 		{ "T", "Total or remaining time" },

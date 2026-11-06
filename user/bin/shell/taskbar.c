@@ -640,7 +640,7 @@ static char *clean_exec(const char *exec)
 }
 
 /* The file name of the program an Exec line runs, lower-cased: "env A=b
- * /usr/bin/xnc -tabbed" is "xnc".  A window whose WM_CLASS says the same
+ * /usr/bin/xterm -ls" is "xterm".  A window whose WM_CLASS says the same
  * belongs to this entry. */
 static char *exec_bin(const char *exec)
 {
@@ -943,8 +943,8 @@ static const char *const g_default_bar_pins[] = {
 static const char *const g_default_favorites[] = {
 	"likeos-explorer.desktop", "luakit.desktop", "xfce4-terminal.desktop",
 	"org.xfce.mousepad.desktop", "mediaplayer.desktop",
-	"claws-mail.desktop", "io.github.Hexchat.desktop", "xnedit.desktop",
-	"galculator.desktop", "xcalc.desktop", "xterm.desktop",
+	"claws-mail.desktop", "io.github.Hexchat.desktop",
+	"galculator.desktop", "xterm.desktop",
 	"likeos-display-settings.desktop", NULL
 };
 
@@ -2694,8 +2694,8 @@ static void power_run(const struct power_req *req)
 
 /* The icon for a menu entry, from the icon theme, at 16 pixels.
  *
- * Falls back to the generic executable icon: xnedit, for one, names an icon
- * the theme on this image does not carry, and a menu with one blank row looks
+ * Falls back to the generic executable icon: an entry may name an icon the
+ * theme on this image does not carry, and a menu with one blank row looks
  * like a bug rather than a missing artwork file. */
 static GtkWidget *menu_icon(const char *name)
 {

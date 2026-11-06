@@ -1,0 +1,91 @@
+Record tiles with a bounding box hierarchy when they are replayed more than once.
+
+WebKit 316802@main (bug 318942), adapted to 2.52.6: the recording of the
+dirty tiles of a layer is replayed once per tile, and without an R-tree
+every replay walks every operation of the recording, clipped away or not.
+With one, each replay uses only the operations that intersect its tile.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+@@ -39,6 +39,7 @@
+ #include "SkiaRecordingResult.h"
+ #include "SkiaReplayCanvas.h"
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkBBHFactory.h>
+ #include <skia/core/SkPictureRecorder.h>
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkImageGanesh.h>
+@@ -147,7 +148,7 @@
+     return buffer;
+ }
+ 
+-Ref<SkiaRecordingResult> SkiaPaintingEngine::record(const GraphicsLayerCoordinated& layer, const IntRect& recordRect, bool contentsOpaque, float contentsScale)
++Ref<SkiaRecordingResult> SkiaPaintingEngine::record(const GraphicsLayerCoordinated& layer, const IntRect& recordRect, bool contentsOpaque, float contentsScale, unsigned dirtyTilesCount)
+ {
+     // ### Asynchronous rendering on worker threads ###
+     ASSERT(useThreadedRendering());
+@@ -157,7 +158,10 @@
+ 
+     WTFBeginSignpost(this, RecordTile);
+     SkPictureRecorder pictureRecorder;
+-    auto* recordingCanvas = pictureRecorder.beginRecording(recordRect.width(), recordRect.height());
++    // Use a bounding box hierarchy factory when the picture is going be replayed more than once,
++    // so that every playback uses only the operations intersecting the dirty rect.
++    SkRTreeFactory rtreeFactory;
++    auto* recordingCanvas = pictureRecorder.beginRecording(recordRect.width(), recordRect.height(), dirtyTilesCount > 1 ? &rtreeFactory : nullptr);
+     GraphicsContextSkia recordingContext(*recordingCanvas, renderingMode, RenderingPurpose::LayerBacking);
+     recordingContext.beginRecording();
+     paintIntoGraphicsContext(layer, recordingContext, recordRect, contentsOpaque, contentsScale);
+--- a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.h
++++ b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.h
+@@ -58,7 +58,7 @@
+     bool useThreadedRendering() const { return m_workerPool; }
+ 
+     Ref<CoordinatedTileBuffer> paint(const GraphicsLayerCoordinated&, const IntRect& dirtyRect, bool contentsOpaque, float contentsScale);
+-    Ref<SkiaRecordingResult> record(const GraphicsLayerCoordinated&, const IntRect& recordRect, bool contentsOpaque, float contentsScale);
++    Ref<SkiaRecordingResult> record(const GraphicsLayerCoordinated&, const IntRect& recordRect, bool contentsOpaque, float contentsScale, unsigned dirtyTilesCount);
+     Ref<CoordinatedTileBuffer> replay(const GraphicsLayerCoordinated&, const RefPtr<SkiaRecordingResult>&, const IntRect& dirtyRect);
+ 
+ private:
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.h
+@@ -190,7 +190,7 @@
+ 
+     Ref<CoordinatedTileBuffer> paint(const IntRect&);
+ #if USE(SKIA)
+-    Ref<SkiaRecordingResult> record(const IntRect&);
++    Ref<SkiaRecordingResult> record(const IntRect&, unsigned dirtyTilesCount);
+     Ref<CoordinatedTileBuffer> replay(const RefPtr<SkiaRecordingResult>&, const IntRect&);
+ #endif
+     void willPaintTile();
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.cpp
+@@ -844,14 +844,14 @@
+ }
+ 
+ #if USE(SKIA)
+-Ref<SkiaRecordingResult> CoordinatedPlatformLayer::record(const IntRect& recordRect)
++Ref<SkiaRecordingResult> CoordinatedPlatformLayer::record(const IntRect& recordRect, unsigned dirtyTilesCount)
+ {
+     ASSERT(m_lock.isHeld());
+     ASSERT(m_client);
+     ASSERT(m_owner);
+     auto& paintingEngine = m_client->paintingEngine();
+     ASSERT(paintingEngine.useThreadedRendering());
+-    return paintingEngine.record(*m_owner, recordRect, m_contentsOpaque, m_contentsScale);
++    return paintingEngine.record(*m_owner, recordRect, m_contentsOpaque, m_contentsScale, dirtyTilesCount);
+ }
+ 
+ Ref<CoordinatedTileBuffer> CoordinatedPlatformLayer::replay(const RefPtr<SkiaRecordingResult>& recording, const IntRect& dirtyRect)
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.cpp
+@@ -130,7 +130,7 @@
+         // Record only once the whole layer.
+         RefPtr<SkiaRecordingResult> recording;
+         if (layer.client().paintingEngine().useThreadedRendering()) [[likely]]
+-            recording = layer.record(tileDirtyRectUnion);
++            recording = layer.record(tileDirtyRectUnion, dirtyTilesCount);
+ #endif
+ 
+         unsigned dirtyTileIndex = 0;

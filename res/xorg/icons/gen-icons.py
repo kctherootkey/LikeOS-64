@@ -304,8 +304,6 @@ APPS = {
 	'accessories-text-editor': (A('apps/accessories-text-editor'),
 				    ['org.xfce.mousepad', 'mousepad',
 				     'text-editor']),
-	# XNEdit, the programmer's editor: the same family, another tile.
-	'likeos-code-editor': (A('apps/code-editor'), ['xnedit']),
 	'internet-mail': (A('apps/internet-mail'),
 			  ['claws-mail', 'mail-client', 'email']),
 	'web-browser': (A('apps/web-browser'),
@@ -497,9 +495,8 @@ ACTIONS = [
 	('cloud', 'cloud', None, []),
 	('image-edit', 'image_edit', None, []),
 	('slideshow', 'slide_play', None, []),
-	# The media player's queue, mini-player and add-a-folder buttons.
+	# The media player's queue and add-a-folder buttons.
 	('play-queue', 'navigation_play', None, []),
-	('mini-player', 'picture_in_picture', None, []),
 	('folder-add', 'folder_add', None, []),
 ]
 

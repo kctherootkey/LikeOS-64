@@ -59,8 +59,6 @@ typedef struct {
 	GtkWidget *nav_queue_count; /* the number beside "Queue" in it */
 	GtkWidget *pages;	/* GtkStack: one child per page */
 	GtkWidget *content;	/* the card the pages sit on */
-	GtkWidget *stage_overlay; /* the body, with the bar on the stage */
-	GtkWidget *bar_slot;	/* where the transport bar sits normally */
 	GtkWidget *top_revealer; /* back button and title above the stage */
 	GtkWidget *top_title;
 
@@ -97,7 +95,6 @@ typedef struct {
 	GtkWidget *volume_scale;
 	GtkWidget *volume_value; /* the volume in per cent, NULL if not shown */
 	GtkAdjustment *volume_adj;
-	GtkWidget *btn_mini;
 	GtkWidget *btn_fullscreen;
 	GtkWidget *btn_menu;
 	GtkWidget *menu;
@@ -127,7 +124,6 @@ typedef struct {
 	gint64 duration;	/* of the loaded entry, -1 when unknown */
 	gboolean fullscreen;
 	gboolean immersive;	/* stage alone, dark bars that hide */
-	gboolean mini;		/* the mini player */
 	gboolean user_seeking;	/* the seek bar is being dragged */
 	gboolean updating_seek;	/* we are moving the seek bar ourselves */
 	gboolean updating_volume;
@@ -177,8 +173,7 @@ void mp_app_play_uris(MpApp *app, GPtrArray *uris, guint start,
 void mp_app_queue_uris(MpApp *app, GPtrArray *uris, gboolean next);
 /* Open or replace the queue with a playlist file and play it. */
 void mp_app_play_playlist_file(MpApp *app, const char *path, gboolean add);
-void mp_app_set_mini(MpApp *app, gboolean mini);
-/* The page shown changed: the bars follow (floating over a video). */
+/* The page shown changed: the window follows (immersive over a video). */
 void mp_app_page_changed(MpApp *app);
 void mp_app_set_discover(MpApp *app, gboolean on);
 const char *mp_app_current_uri(MpApp *app);

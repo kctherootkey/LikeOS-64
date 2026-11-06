@@ -460,6 +460,11 @@
 # likeos-mediaplayer-1.0/ is checked in, like gst-likeos-audio above.
 -         likeos-mediaplayer 1.0      in-tree
 
+# ---- the image viewer -----------------------------------------------------
+# LikeOS's own picture viewer and editor (GTK3 window, its own processing
+# library on libwebp, above).  likeos-imageviewer-1.0/ is checked in.
+-         likeos-imageviewer 1.0      in-tree
+
 # ---- the file manager -------------------------------------------------------
 # LikeOS's own file manager (GTK3 window, GIO backend); the PCManFM desktop
 # hands folders to it.  likeos-explorer-1.0/ is checked in.

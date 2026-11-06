@@ -1,0 +1,9 @@
+# A Type=Link shortcut to the image viewer (pictures), which also puts it in
+# the taskbar's Programs menu.
+#
+# Copyright (C) 2026 The LikeOS Project
+[Desktop Entry]
+Type=Link
+Name=LikeOS Image Viewer
+Icon=image-viewer
+URL=/usr/share/applications/likeos-imageviewer.desktop

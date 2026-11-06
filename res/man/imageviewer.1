@@ -1,0 +1,172 @@
+IMAGEVIEWER(1)                   User Commands                  IMAGEVIEWER(1)
+
+NAME
+       imageviewer - view, browse and edit pictures
+
+SYNOPSIS
+       imageviewer   [--fullscreen]   [--slideshow]   [--edit]  [--sort=order]
+       [file|folder...]
+       imageviewer --version
+
+DESCRIPTION
+       imageviewer is the desktop's picture viewer and editor, the program be-
+       hind LikeOS Image Viewer in the Programs menu and  the  one  a  double-
+       clicked  picture  in LikeOS Explorer opens in.  It shows PNG, JPEG, GIF
+       (animated ones play), WebP, BMP, ICO, TIFF, the PNM family,  TGA,  XPM,
+       XBM  and  ICNS  pictures,  turned the way the camera's EXIF orientation
+       says, over a dark  backdrop  with  a  checkerboard  behind  transparent
+       parts.
+
+       One  file  opens  with  the  rest of its folder to browse, in the order
+       LikeOS Explorer lists it: by name, numbers by their value ("IMG 2"  be-
+       fore  "IMG 10").  Several files make a list of just those, in the order
+       they were given.  A folder opens its  first  picture.   The  folder  is
+       watched,  so  pictures  another program adds, changes or removes appear
+       and disappear by themselves.
+
+   The window
+       The title row shows the picture's name and its place in the folder  ("3
+       of  27")  and the commands: Edit, Rotate (to the right; with Shift held
+       to the left), Delete (to the Trash), Open with (the other programs that
+       take the picture's type, "Choose another app..." and  "Show  in  LikeOS
+       Explorer"),  and the "more" menu: Save as, Copy, Copy path, Resize pic-
+       ture, Set as desktop wallpaper, Send by mail,  Rename,  Settings,  Key-
+       board shortcuts and About.
+
+       A  dark  strip floats over the bottom of the picture: the filmstrip and
+       slideshow switches, the picture's format, size and  file  size  at  the
+       left, the previous and next picture in the middle, and at the right the
+       info  panel,  fit or actual size, the zoom (as a menu of steps and as a
+       slider) and full screen.  The filmstrip is a row of thumbnails  of  the
+       folder above the strip; a click on one shows it.  Thumbnails are shared
+       with  the other programs through the thumbnail cache in ~/.cache/thumb-
+       nails.
+
+       The info panel shows the file's name (type a new one and press Enter to
+       rename the file), when the picture was taken and when the file was last
+       changed (the pencil sets the file's date from a calendar; "Use as  file
+       date" copies the time the camera recorded), the picture's size, resolu-
+       tion,  depth,  colours  and  format, its folder (a click opens it), and
+       what the camera recorded: camera and lens, exposure,  aperture,  sensi-
+       tivity,  focal  length,  flash, orientation, software, position (in de-
+       grees and in degrees, minutes and seconds) and colour space.
+
+   Viewing
+       The picture fits the window to begin with.  The mouse wheel zooms about
+       the pointer (or, with the setting changed,  goes  through  the  folder;
+       Ctrl  and  the wheel always zoom), dragging moves a picture larger than
+       the window, a double click switches between fit and  actual  size.   In
+       full  screen  the title row goes and the strips hide themselves after a
+       moment without movement.  The slideshow goes through the folder in full
+       screen, fading from one picture into the next.
+
+       Rotating a JPEG file changes only its  orientation  tag,  so  it  loses
+       nothing,  however  often  it  is  turned;  other  files are saved again
+       turned.  A picture moved to the Trash can be brought back with the Undo
+       of the message that says so.
+
+   Editing
+       Edit opens the editor in the same window: the tools in a  rail  at  the
+       left  (Crop, Adjust, Styles, Draw, Retouch and Background), the picture
+       in the middle, the tool's options at the right, and a  bar  above  with
+       the  zoom, Undo, Redo, Revert (back to the unedited picture, after ask-
+       ing), Compare (held down, it shows the  original),  Done  and  Discard.
+       Every  change  is  a step that can be undone.  Done saves over the file
+       (where the format can be written); its menu also saves a copy or copies
+       the result to the clipboard.  Leaving with edits  that  are  not  saved
+       asks whether to save them.  The original is never touched before one of
+       these.
+
+       Draw  marks  the picture up with a pen, a marker, a calligraphy pen and
+       filled rectangles, and has an eraser that takes away whole strokes.   A
+       rectangle  is  dragged  out  from corner to corner (a square with Shift
+       held), for instance to cover a name or a  number  that  should  not  be
+       seen;  a click chooses one, dragging moves it, its eight handles resize
+       it, a colour recolours it and Delete removes it.  Saved  as  JPEG  with
+       the camera data kept, the copy carries no thumbnail of the old pixels.
+
+       Edits  are  worked  out on a smaller copy of the picture while they are
+       made, and applied to the full picture when it is saved.  A picture with
+       transparent parts saved as JPEG asks first whether to save a  PNG  copy
+       instead or to fill them with white.
+
+   Saving
+       Save as writes a copy as PNG, JPEG (with its quality), WebP (lossy with
+       its  quality,  or  lossless), TIFF or BMP.  JPEG copies keep the origi-
+       nal's camera data unless that is switched off.  Resize picture saves  a
+       smaller  copy,  "name  (resized)",  by the long side (640, 1280 or 1920
+       pixels), to a size of one's own or by a percentage, with an estimate of
+       the file's size, or replaces the original after asking.  Every file  is
+       written  to  a temporary file first and then put in place, so a failure
+       never leaves half a picture.
+
+OPTIONS
+       -f, --fullscreen
+              Start in full screen.
+
+       -s, --slideshow
+              Start a slideshow of the folder.
+
+       -e, --edit
+              Open the picture in the editor.
+
+       --sort=order
+              The order of the folder: name (the  default),  name-desc,  date,
+              date-desc, size, size-desc or type.
+
+       --version
+              Print the version and exit.
+
+KEYS
+       Left, Right, Page Up, Page Down
+              The previous and the next picture.
+
+       Home, End
+              The first and the last picture.
+
+       +, -, 0, 1
+              Zoom in, zoom out, fit to the window, actual size.
+
+       F11, F Full screen.
+
+       F5, S  Slideshow;  Space  pauses  it  (outside a slideshow it shows the
+              next picture), Esc ends it.
+
+       T, I   The filmstrip, the info panel.
+
+       E, R, Shift+R
+              Edit, rotate right, rotate left.
+
+       Delete, F2
+              Move to the Trash, rename.
+
+       Ctrl+S, Ctrl+C, Ctrl+Shift+C, Ctrl+O
+              Save as, copy the picture, copy its path, open another picture.
+
+       Ctrl+Z, Ctrl+Y, \
+              In the editor: undo, redo, and (held) compare with the original.
+              C, A, S, D, R and B choose the tools.
+
+       F1     The list of keys.
+
+FILES
+       ~/.config/likeos/imageviewer.ini
+              The settings: the backdrop, what the wheel does, the slideshow's
+              pace, whether moving to the Trash asks first, the JPEG  quality,
+              whether  camera data is kept, whether the filmstrip and the info
+              panel show at start, whether going past the last  picture  comes
+              back  to the first, and the window's size; and what the editor's
+              tools keep from one run to the next: the  colour  and  width  of
+              each  of  the  Draw tool's pens, the rectangles' colour, and the
+              sizes of the Retouch and Background brushes.
+
+       ~/.cache/thumbnails/normal
+              The shared thumbnail cache the filmstrip reads and fills.
+
+       /usr/share/applications/likeos-imageviewer.desktop
+              The desktop entry, with the picture types the viewer opens.
+
+SEE ALSO
+       likeos-explorer(1), mediaplayer(1)
+
+LikeOS                           November 2026                  IMAGEVIEWER(1)

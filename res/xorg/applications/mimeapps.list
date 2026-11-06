@@ -12,6 +12,8 @@
 #
 # The names are desktop-entry file names in this same directory, so a program
 # is only worth naming here if its .desktop file is installed.
+#
+# Copyright (C) 2026 The LikeOS Project
 
 [Default Applications]
 # Folders open in LikeOS Explorer (likeos-explorer).  The PCManFM desktop asks
@@ -55,20 +57,42 @@ application/xhtml+xml=luakit.desktop
 x-scheme-handler/http=luakit.desktop
 x-scheme-handler/https=luakit.desktop
 
-# The image formats go to the browser too: nothing on the image is an image
-# viewer, and luakit displays a picture given its path.  luakit's own desktop
-# entry does not claim these types, so they are assigned here.
-image/png=luakit.desktop
-image/jpeg=luakit.desktop
-image/gif=luakit.desktop
-image/bmp=luakit.desktop
+# Pictures open in LikeOS Image Viewer (imageviewer, gtk3/likeos-imageviewer-
+# 1.0): every format its desktop entry claims -- what the image library's
+# built-in loaders read, and WebP, which it decodes itself.  Double-clicking a
+# picture in LikeOS Explorer asks this file, so this is what makes a picture
+# open in the viewer, with the rest of its folder to browse.
+image/png=likeos-imageviewer.desktop
+image/jpeg=likeos-imageviewer.desktop
+image/pjpeg=likeos-imageviewer.desktop
+image/jpg=likeos-imageviewer.desktop
+image/gif=likeos-imageviewer.desktop
+image/webp=likeos-imageviewer.desktop
+image/bmp=likeos-imageviewer.desktop
+image/x-bmp=likeos-imageviewer.desktop
+image/x-ms-bmp=likeos-imageviewer.desktop
+image/tiff=likeos-imageviewer.desktop
+image/vnd.microsoft.icon=likeos-imageviewer.desktop
+image/x-icon=likeos-imageviewer.desktop
+image/x-ico=likeos-imageviewer.desktop
+image/x-win-bitmap=likeos-imageviewer.desktop
+image/x-portable-anymap=likeos-imageviewer.desktop
+image/x-portable-bitmap=likeos-imageviewer.desktop
+image/x-portable-graymap=likeos-imageviewer.desktop
+image/x-portable-pixmap=likeos-imageviewer.desktop
+image/x-tga=likeos-imageviewer.desktop
+image/x-targa=likeos-imageviewer.desktop
+image/x-xpixmap=likeos-imageviewer.desktop
+image/x-xbitmap=likeos-imageviewer.desktop
+image/x-icns=likeos-imageviewer.desktop
+image/x-quicktime=likeos-imageviewer.desktop
+image/qtif=likeos-imageviewer.desktop
 
-# PDF goes to the browser as well: WebKit is built with its PDF.js viewer
+# PDF goes to the browser: WebKit is built with its PDF.js viewer
 # (ENABLE_PDFJS, on by default for the GTK port, and the viewer bundle is
 # compiled into libwebkit2gtk), so luakit renders a PDF handed to it as a path
-# or file:// URI, and nothing else on the image reads one.  Assigned here for
-# the same reason as the images: luakit's desktop entry does not claim the
-# type.  Claws Mail does not consult this file for attachments; /etc/mailcap
+# or file:// URI, and nothing else on the image reads one.  Assigned here
+# because luakit's desktop entry does not claim the type.  Claws Mail does not consult this file for attachments; /etc/mailcap
 # carries the matching rule for it.
 application/pdf=luakit.desktop
 

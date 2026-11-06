@@ -1,0 +1,120 @@
+A passive wheel listener no longer makes the page wait for the main thread to
+scroll.
+
+Without event regions (that is, everywhere but Apple's platforms) the
+scrolling tree learns where wheel listeners are from
+ScrollingCoordinator::absoluteEventTrackingRegionsForFrame(), and that put
+the box of every node with a wheel or mousewheel listener into the
+synchronous region, passive or not.  A wheel event there is not scrolled by
+the scrolling thread: it is sent to the main thread, scrolled there after
+dispatch, and the next one waits for the reply.  A listener on the window or
+the document covers the whole page.  microsoft.com has three, all passive --
+one on the window from its analytics plugin, one on the document from the
+Clarity session recorder, one on the site header -- so every wheel step of
+that page waited for whatever the main thread was doing.  Measured with this
+engine's upstream build on a desktop host (threaded scrolling on): all wheel
+events of the page went through WebPage::wheelEvent on the main thread, none
+through the scrolling tree, and a 1.5 s script on the main thread stopped
+the page for 1.5 s; with the passive listeners not registered, the events
+went to the scrolling thread and the page kept scrolling through the same
+script.  On a slower machine the page's own scroll and timer work is that
+script.
+
+A passive listener cannot cancel the scroll, so only nodes with a listener
+that can stay in the synchronous region; the document's bounds go into the
+asynchronous region when it has wheel listeners at all.  An event there is
+scrolled by the scrolling thread and dispatched on the main thread without
+being waited for (WheelEventProcessingSteps::NonBlockingDOMEventDispatch,
+the path event regions already take for passive listeners), so passive
+listeners still get every event, as non-cancelable events, as the
+specification has it.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebCore/dom/Document.cpp
++++ b/Source/WebCore/dom/Document.cpp
+@@ -9652,6 +9652,38 @@ Document::RegionFixedPair Document::abso
+     return RegionFixedPair(region, insideFixedPosition);
+ }
+ 
++#if !ENABLE(WHEEL_EVENT_REGIONS)
++static bool hasNonPassiveWheelEventListener(EventTarget& target)
++{
++    auto& names = eventNames();
++    for (auto* eventType : { &names.wheelEvent, &names.mousewheelEvent }) {
++        for (auto& listener : target.eventListeners(*eventType)) {
++            if (!listener->isPassive())
++                return true;
++        }
++    }
++    return false;
++}
++
++// Whether the wheel listeners counted for this node may cancel the scroll.
++// The document stands for the window's listeners too (LocalDOMWindow counts
++// them against it).
++static bool wheelEventTargetCanPreventScrolling(Node& node)
++{
++    if (hasNonPassiveWheelEventListener(node))
++        return true;
++    if (RefPtr document = dynamicDowncast<Document>(node)) {
++        if (RefPtr window = document->window())
++            return hasNonPassiveWheelEventListener(*window);
++    }
++    return false;
++}
++#endif
++
++// The region the scrolling thread must not scroll before the main thread has
++// dispatched the wheel event.  Without event regions only listeners that may
++// cancel the scroll put a target here: a passive listener cannot, and
++// ScrollingCoordinator sends the event to it without blocking the scroll.
+ auto Document::absoluteRegionForWheelEventTargets() -> RegionFixedPair
+ {
+     LayoutDisallowedScope layoutDisallowedScope(LayoutDisallowedScope::Reason::ReentrancyAvoidance);
+@@ -9661,6 +9693,10 @@ auto Document::absoluteRegionForWheelEve
+ 
+     for (auto keyValuePair : m_wheelEventTargets) {
+         Ref node = keyValuePair.key;
++#if !ENABLE(WHEEL_EVENT_REGIONS)
++        if (!wheelEventTargetCanPreventScrolling(node))
++            continue;
++#endif
+         auto targetRegionFixedPair = absoluteEventRegionForNode(node);
+         targetRegion.unite(targetRegionFixedPair.first);
+         insideFixedPosition |= targetRegionFixedPair.second;
+--- a/Source/WebCore/page/scrolling/ScrollingCoordinator.cpp
++++ b/Source/WebCore/page/scrolling/ScrollingCoordinator.cpp
+@@ -188,6 +188,17 @@ EventTrackingRegions ScrollingCoordinato
+         wheelHandlerRegion.first.unite(enclosingIntRect(inflatedWheelHandlerBounds));
+     }
+     nonFastScrollableRegion.unite(wheelHandlerRegion.first);
++
++    // Passive listeners -- the only kind absoluteRegionForWheelEventTargets()
++    // leaves out -- still get every wheel event, just without holding up the
++    // scroll: the scrolling thread scrolls and the main thread dispatches the
++    // event when it gets to it.  Their region is taken as the whole document,
++    // which costs at most a non-blocking dispatch that finds no listener.
++    if (frame.document()->hasWheelEventHandlers()) {
++        bool documentIsInsideFixed = false;
++        auto documentBounds = enclosingIntRect(frame.document()->absoluteEventHandlerBounds(documentIsInsideFixed));
++        eventTrackingRegions.asynchronousDispatchRegion.unite(Region(documentBounds));
++    }
+ #endif
+ 
+     // FIXME: If this is not the main frame, we could clip the region to the frame's bounds.
+--- a/Source/WebCore/page/scrolling/ScrollingTree.cpp
++++ b/Source/WebCore/page/scrolling/ScrollingTree.cpp
+@@ -116,6 +116,13 @@ OptionSet<WheelEventProcessingSteps> Scr
+ 
+         if (isSynchronousDispatchRegion)
+             return { WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch };
++
++#if !ENABLE(WHEEL_EVENT_REGIONS)
++        // Passive wheel listeners (see ScrollingCoordinator::absoluteEventTrackingRegionsForFrame()):
++        // scroll here, and let the main thread dispatch the event without waiting for it.
++        if (m_treeState.eventTrackingRegions.trackingTypeForPoint(EventTrackingRegions::EventType::Wheel, roundedPosition) == TrackingType::Asynchronous)
++            return { WheelEventProcessingSteps::AsyncScrolling, WheelEventProcessingSteps::NonBlockingDOMEventDispatch };
++#endif
+     }
+ 
+ #if ENABLE(WHEEL_EVENT_REGIONS)

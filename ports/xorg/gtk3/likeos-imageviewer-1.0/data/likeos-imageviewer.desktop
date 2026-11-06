@@ -1,0 +1,22 @@
+[Desktop Entry]
+# LikeOS Image Viewer, the system's own GTK3 picture viewer and editor
+# (ports/xorg/gtk3/likeos-imageviewer-1.0).  The MIME types are every format
+# the image library's built-in loaders read (PNG, JPEG, GIF, BMP, ICO and
+# CUR, TIFF, the PNM family, TGA, XPM, XBM, ICNS, QuickTime images), plus
+# WebP, which the program decodes itself.  %F hands over several files at
+# once; the first one is shown and the rest of its folder can be browsed.
+#
+# Copyright (C) 2026 The LikeOS Project
+Type=Application
+Version=1.0
+Name=LikeOS Image Viewer
+GenericName=Image Viewer
+Comment=View, browse and edit pictures
+Exec=imageviewer %F
+TryExec=imageviewer
+Icon=image-viewer
+Terminal=false
+StartupNotify=false
+Categories=Graphics;Viewer;Photography;GTK;
+Keywords=picture;photo;image;viewer;editor;slideshow;crop;rotate;jpeg;png;gif;webp;
+MimeType=image/png;image/jpeg;image/pjpeg;image/jpg;image/gif;image/bmp;image/x-bmp;image/x-MS-bmp;image/x-ms-bmp;image/vnd.microsoft.icon;image/x-icon;image/x-ico;image/x-win-bitmap;image/tiff;image/x-portable-anymap;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/x-tga;image/x-targa;image/x-xpixmap;image/x-xbitmap;image/x-icns;image/x-quicktime;image/qtif;image/webp;

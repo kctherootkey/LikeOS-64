@@ -336,21 +336,6 @@ static void gl_leave_fullscreen(cairo_t *cr)
 	poly(cr, d, 3);
 }
 
-static void gl_mini_player(cairo_t *cr)
-{
-	rrect(cr, 1.75, 3, 14.25, 13, 2);
-	rrect_fill(cr, 8, 8.25, 12.25, 11, 0.9);
-}
-
-static void gl_window_restore(cairo_t *cr)
-{
-	rrect(cr, 1.75, 3, 14.25, 13, 2);
-	/* An arrow out of the corner: back to the full window. */
-	line(cr, 6, 10, 10.5, 5.5);
-	static const double p[] = { 7.25, 5.5, 10.5, 5.5, 10.5, 8.75 };
-	poly(cr, p, 3);
-}
-
 static void gl_more(cairo_t *cr)
 {
 	dot(cr, 3.5, 8, 1.3);
@@ -543,8 +528,6 @@ static const struct {
 	{ "likeos-search", gl_search },
 	{ "likeos-fullscreen", gl_fullscreen },
 	{ "likeos-leave-fullscreen", gl_leave_fullscreen },
-	{ "likeos-mini-player", gl_mini_player },
-	{ "likeos-window-restore", gl_window_restore },
 	{ "likeos-more", gl_more },
 	{ "likeos-menu", gl_menu },
 	{ "likeos-sidebar", gl_sidebar },

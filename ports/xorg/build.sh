@@ -125,14 +125,7 @@ want=$*
 # not relink them with the cross compiler.
 host_tools() {
 	case "$1" in
-	motif)
-		# config/util/makestrs turns xmstring.list into XmStrDefs.[ch],
-		# and every widget in libXm includes those.  It only needs
-		# X11/Xos.h, which the build host has.
-		cc -O2 -I. -Iconfig/util -c -o config/util/makestrs.o \
-			config/util/makestrs.c || return 1
-		cc -O2 -o config/util/makestrs config/util/makestrs.o || return 1
-		;;
+	# No package in the manifests needs one at present.
 	esac
 	return 0
 }
@@ -276,16 +269,20 @@ pkg_opts() {
 		# The analogue clock face is unaffected; only the digital mode's
 		# antialiased text falls back to a core bitmap font.
 		#
-		# (fontconfig and expat ARE built now, for Motif; this could be
+		# (fontconfig and expat ARE built now, for libXft; this could be
 		# revisited, but it changes how the clock renders and the current
 		# rendering is what is wanted.)
 		#
-		# --with-appdefaultdir for the same reason as xload and xcalc
-		# below -- and it has to be HERE rather than in that case arm,
-		# because a shell `case` takes the FIRST match and this arm would
-		# otherwise shadow it.  That is exactly what happened: xclock was
-		# the one app whose app-defaults still went to the doubled path
-		# after the other two were fixed.
+		# --with-appdefaultdir because xclock otherwise asks pkg-config
+		# for libXt's appdefaultdir and installs to
+		# $(DESTDIR)$(appdefaultdir).  pkg-config prefixes
+		# PKG_CONFIG_SYSROOT_DIR when reporting a .pc VARIABLE, so the
+		# answer already contains the sysroot and DESTDIR then doubles
+		# it: the file landed in <sysroot>/<sysroot>/usr/share/X11/
+		# app-defaults and never reached the image.  Nothing complained,
+		# because an app-defaults file that is not there is not an error
+		# -- the program starts with its built-in defaults.  Stating the
+		# path removes the guess; xterm below does the same thing.
 		echo "--without-xft \
 		      --with-appdefaultdir=/usr/share/X11/app-defaults"
 		;;
@@ -545,34 +542,6 @@ pkg_opts() {
 		echo "--disable-java --disable-csharp --disable-d \
 		      --disable-modula2 --disable-openmp --disable-curses \
 		      --disable-rpath --without-emacs --disable-acl"
-		;;
-	motif)
-		# --disable-printing avoids libXp, the old X print extension:
-		# Motif only needs it for print-to-Xp, and porting a dead
-		# extension for that is not worth it.
-		#
-		# Xft the other way round: Motif defaults it OFF, and with
-		# libXft built there is no reason for its widgets to draw with
-		# core bitmap fonts.
-		echo "--disable-printing --enable-xft"
-		;;
-	xload | xcalc)
-		# These ask pkg-config for libXt's appdefaultdir and install to
-		# $(DESTDIR)$(appdefaultdir).  pkg-config prefixes
-		# PKG_CONFIG_SYSROOT_DIR when reporting a .pc VARIABLE, so the
-		# answer already contains the sysroot and DESTDIR then doubles
-		# it: the files landed in <sysroot>/<sysroot>/usr/share/X11/
-		# app-defaults and never reached the image.
-		#
-		# Nothing complained, because an app-defaults file that is not
-		# there is not an error -- the program starts with its built-in
-		# defaults.  For xcalc that means no buttons at all, since its
-		# entire keypad is defined in resources.
-		#
-		# Stating the path removes the guess.  xterm above does the same
-		# thing, which is why xterm's were the only ones installed
-		# correctly.
-		echo "--with-appdefaultdir=/usr/share/X11/app-defaults"
 		;;
 	*) echo "" ;;
 	esac
@@ -1344,23 +1313,6 @@ make_dirs() {
 	# compiled for the target could not be run by the thing that needs it.
 	# libtextstyle exists only to make those tools' output colourful.
 	gettext) echo "-C gettext-runtime" ;;
-	# Motif: the library and its headers, not the development toolchain.
-	#
-	# lib/ is libXm and libMrm, include/ the public headers -- that is
-	# everything a Motif PROGRAM links against, and all xnedit asks for
-	# (-lXm).  Skipped:
-	#   tools/    the UIL compiler and its table generators.  These are HOST
-	#             programs the build runs to generate source, and unlike
-	#             makestrs they link against fontconfig/freetype/Xft, so
-	#             building them for the host would mean host copies of the
-	#             whole font stack.  UIL compiles .uil interface
-	#             descriptions at DEVELOPMENT time; nothing on this system
-	#             does that.
-	#   clients/  mwm and friends -- there is already a window manager.
-	#   doc/      manual sources, and man1 pages come from the sysroot.
-	#   bindings/localized/  virtual-key and message-catalogue data for
-	#             hardware and locales this system does not have.
-	motif) echo "-C lib -C include" ;;
 	*) echo "" ;;
 	esac
 }
@@ -1458,35 +1410,11 @@ post_install() {
 		# written from the program's own option table.  Installed into
 		# the sysroot's man1 here so that the repository's gtk3-manpages
 		# target renders it exactly like the pages that did come from a
-		# source tree, rather than needing a case of its own.  This is
-		# what the xnedit arm below does with pod2man, one step shorter.
+		# source tree, rather than needing a case of its own.
 		if [ -f "$here/gtk3/man/mousepad.1" ]; then
 			mkdir -p "$SYSROOT/usr/share/man/man1" || return 1
 			cp -f "$here/gtk3/man/mousepad.1" \
 				"$SYSROOT/usr/share/man/man1/mousepad.1" || return 1
-		fi
-		;;
-	xnedit)
-		# Its own install target ships only the binaries, an icon and a
-		# .desktop file -- no manual page, because the page is generated
-		# from POD by a target upstream keeps out of the default build
-		# ("users may not have Perl installed").
-		#
-		# Generated here, into the sysroot's man1, so the repository's
-		# xorg-manpages target renders it alongside every other page
-		# instead of this one being a special case.  pod2man runs on the
-		# BUILD host, which is where it belongs -- it is documentation,
-		# not code.
-		if command -v pod2man >/dev/null 2>&1; then
-			mkdir -p "$SYSROOT/usr/share/man/man1"
-			for pg in xnedit xnc; do
-				[ -f "doc/$pg.pod" ] || continue
-				pod2man --section=1 --center="User Commands" \
-					--name="$(echo "$pg" | tr a-z A-Z)" \
-					"doc/$pg.pod" \
-					>"$SYSROOT/usr/share/man/man1/$pg.1" ||
-					return 1
-			done
 		fi
 		;;
 	esac
@@ -1994,7 +1922,7 @@ keeps_generated_sources() {
 # (a Makefile is present in almost every package), so this is by name.
 is_plainmake() {
 	case "$1" in
-	xnedit | lz4) return 0 ;;
+	lz4) return 0 ;;
 	esac
 	return 1
 }
@@ -2008,12 +1936,6 @@ is_plainmake() {
 # and the whole tree is built for the build host.
 plainmake_args() {
 	case "$1" in
-	xnedit)
-		# The platform target creates the Makefile.<platform> symlinks
-		# and then builds util/, Xlt/, Microline/ and source/ in order.
-		echo "likeos CC=$here/toolchain/likeos-cc \
-		      PKG_CONFIG=$here/toolchain/likeos-pkg-config"
-		;;
 	lz4)
 		# Only the library: the default target also builds the lz4,
 		# lz4c and unlz4 programs, and nothing here is a compression

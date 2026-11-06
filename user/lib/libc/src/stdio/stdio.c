@@ -1488,8 +1488,7 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 		 * Stored, not printed: the number the call would have
 		 * written up to this point, truncated characters included.
 		 * Programs build a buffer with it and continue writing where
-		 * the formatted part ended (xnc assembles its request to the
-		 * XNEdit server that way); printed as a letter, the count was
+		 * the formatted part ended; printed as a letter, the count was
 		 * never stored and the caller went on from garbage. */
 		case 'n':
 			if (lng == 2)

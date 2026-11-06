@@ -467,11 +467,10 @@ menu "defops" ("#141a24":"#eef3fd")
     "Xterm"		!"xterm&"
     "LikeOS Explorer"	!"likeos-explorer &"
     "Editor"		!"mousepad &"
-    "Xnedit"	!"xnedit &"
     "Mail"		!"claws-mail &"
     "Luakit Web Browser"	!"luakit &"
     "LikeOS Media Player"	!"mediaplayer &"
-    "Calculator"	!"xcalc &"
+    "Calculator"	!"galculator &"
     ""			f.separator
     "Restart session"	f.restart
     "Exit session"	f.function "exit-session"

@@ -60,10 +60,11 @@ settings.webview.enable_webgl = true
 -- WebKitGTK has two real rendering modes for this toolkit: "always" runs every
 -- page through the accelerated compositor, "never" paints with cairo.
 -- ("on-demand" composites only the pages that need it and paints the rest
--- without the compositor, the paths "never" uses.)  Wheel scrolling runs on
--- the main thread either way in this image's WebKit (webkitgtk patch 0025):
--- threaded scrolling, which "always" switches on upstream, shook sticky
--- headers by the scroll distance on every wheel step.  The compositor is what
+-- without the compositor, the paths "never" uses.)  "always" also scrolls
+-- with the wheel on the engine's scrolling thread, so a page keeps scrolling
+-- while its scripts hold the main thread (webkitgtk patches 0025, 0028 and
+-- 0029; WEBKIT_DISABLE_THREADED_SCROLLING=1 in the environment puts the wheel
+-- back on the main thread, for comparison).  The compositor is what
 -- WebGL, the accelerated 2D canvas and CSS 3D transforms need, and it is also
 -- what the rest of the engine assumes: with it off, WebKit's non-composited
 -- paths -- which upstream barely exercises -- crashed the web process on a
@@ -134,8 +135,16 @@ settings.webview.enable_webaudio = true
 -- why).  This setting is the other lever, the one that copies what closing
 -- the tab did by hand.  It went in switched off, to be tried on the same
 -- image if the first did not hold up; tried on the ThinkPad, it was the
--- better browser -- scrolling stayed smooth and memory stayed down -- so
--- it is on.
+-- better browser -- scrolling stayed smooth and memory stayed down.  It is
+-- nevertheless OFF by default now: replacing the tab costs the page's history
+-- and changes what a click does, which is a choice for the user to make, not
+-- the browser's default.
+--
+-- Off, none of it runs: the handlers below are connected to a view only while
+-- the setting is on.  At start-up, and whenever the setting changes, they are
+-- connected to every open view and to each new one (webview "init"), or taken
+-- off all of them again -- so a browser that never turns it on never enters
+-- this code on any load.
 --
 -- With it on, a load whose site differs from the one this tab first showed
 -- -- typed with `o', clicked, or started by a script; not a form
@@ -150,21 +159,22 @@ settings.webview.enable_webaudio = true
 -- as co.uk makes distinct sites under it look like one, which only keeps a
 -- load in its process, never moves one that should stay.
 --
--- Switch it off from the luakit://settings/ page (it is remembered); it is
--- read at each load, so there is nothing to restart.  WebKit's own process
--- swapping (WebKitWebContext:process-swap-on-cross-site-navigation-enabled)
--- was tried first and made scrolling worse even on a fresh redhat.com; it
--- keeps a spare process warm and parks used ones for five minutes, and this
--- does neither -- the old process is gone when the tab is.
+-- Switch it on from the luakit://settings/ page (it is remembered); it takes
+-- effect at once, in every open tab, so there is nothing to restart.  WebKit's
+-- own process swapping (WebKitWebContext:process-swap-on-cross-site-navigation-
+-- enabled) was tried first and made scrolling worse even on a fresh
+-- redhat.com; it keeps a spare process warm and parks used ones for five
+-- minutes, and this does neither -- the old process is gone when the tab is.
 settings.register_settings({
     ["webview.fresh_process_per_site"] = {
         type = "boolean",
-        default = true,
+        default = false,
         desc = "Load a page from another site in a new tab that replaces this one, so that it starts in a web process of its own -- what closing the tab and opening the page again does by hand. Reloads and back/forward stay where they are; the old page leaves history, and `u' brings the tab back.",
     },
 })
 do
     local webview = require "webview"
+    local window = require "window"
     local lousy = require "lousy"
 
     -- The part of a host that names its site: the last two labels.
@@ -179,42 +189,92 @@ do
 
     -- Per view: the site it first showed, and the request luakit was last
     -- asked to decide on, with its reason, to match the load that follows.
+    -- `attached' holds the views the handlers are connected to.
     local first_site = setmetatable({}, { __mode = "k" })
     local requested = setmetatable({}, { __mode = "k" })
+    local attached = setmetatable({}, { __mode = "k" })
 
-    webview.add_signal("init", function (view)
-        view:add_signal("navigation-request", function (v, uri, reason)
-            requested[v] = { uri = uri, reason = reason }
+    local function on_navigation_request(v, uri, reason)
+        requested[v] = { uri = uri, reason = reason }
+    end
+
+    local function on_load_status(v, status)
+        if status == "committed" then
+            if not first_site[v] then first_site[v] = site_of(v.uri) end
+            return
+        end
+        if status ~= "provisional" then return end
+        local req = requested[v]
+        requested[v] = nil
+        if not req or req.uri ~= v.uri then return end      -- a frame's, or none
+        -- Typed, scripted or clicked only.  A form submission is a
+        -- POST, and the tab that replaces this one would GET the
+        -- address instead; back/forward and reloads stay put.
+        if req.reason ~= "other" and req.reason ~= "link-clicked" then return end
+        local from, to = first_site[v], site_of(v.uri)
+        if not from or not to or from == to then return end
+        local w = webview.window(v)
+        if not w then return end
+        local uri = v.uri
+        -- Not from inside the view's own signal: the tab goes away in
+        -- the next main-loop turn, and the load with it.
+        luakit.idle_add(function ()
+            local idx = w.tabs:indexof(v)
+            if not idx then return false end
+            w:new_tab(uri, { switch = (w.view == v), order = function () return idx + 1 end })
+            w:close_tab(v)
+            return false
         end)
-        view:add_signal("load-status", function (v, status)
-            if status == "committed" then
-                if not first_site[v] then first_site[v] = site_of(v.uri) end
-                return
-            end
-            if status ~= "provisional" then return end
-            local req = requested[v]
-            requested[v] = nil
-            if not settings.get_setting("webview.fresh_process_per_site") then return end
-            if not req or req.uri ~= v.uri then return end      -- a frame's, or none
-            -- Typed, scripted or clicked only.  A form submission is a
-            -- POST, and the tab that replaces this one would GET the
-            -- address instead; back/forward and reloads stay put.
-            if req.reason ~= "other" and req.reason ~= "link-clicked" then return end
-            local from, to = first_site[v], site_of(v.uri)
-            if not from or not to or from == to then return end
-            local w = webview.window(v)
-            if not w then return end
-            local uri = v.uri
-            -- Not from inside the view's own signal: the tab goes away in
-            -- the next main-loop turn, and the load with it.
-            luakit.idle_add(function ()
-                local idx = w.tabs:indexof(v)
-                if not idx then return false end
-                w:new_tab(uri, { switch = (w.view == v), order = function () return idx + 1 end })
-                w:close_tab(v)
-                return false
-            end)
-        end)
+    end
+
+    local function attach(view)
+        if attached[view] then return end
+        attached[view] = true
+        -- A view that is already showing a page has its first site now.
+        if not first_site[view] then first_site[view] = site_of(view.uri) end
+        view:add_signal("navigation-request", on_navigation_request)
+        view:add_signal("load-status", on_load_status)
+    end
+
+    local function detach(view)
+        if not attached[view] then return end
+        attached[view] = nil
+        view:remove_signal("navigation-request", on_navigation_request)
+        view:remove_signal("load-status", on_load_status)
+        first_site[view] = nil
+        requested[view] = nil
+    end
+
+    local function each_view(fn)
+        for _, w in pairs(window.bywidget) do
+            for _, v in ipairs(w.tabs.children) do fn(v) end
+        end
+    end
+
+    local enabled = false
+    local function apply(on)
+        on = on and true or false
+        if on == enabled then return end
+        enabled = on
+        if on then
+            webview.add_signal("init", attach)
+            each_view(attach)
+        else
+            webview.remove_signal("init", attach)
+            -- Every view it was connected to, open in a window or not.
+            local views = {}
+            for view in pairs(attached) do views[#views + 1] = view end
+            for _, view in ipairs(views) do detach(view) end
+        end
+    end
+
+    apply(settings.get_setting("webview.fresh_process_per_site"))
+    -- Only the global value switches it; a per-site value has no meaning
+    -- for a rule that is about leaving the site.
+    settings.add_signal("setting-changed", function (e)
+        if e.key == "webview.fresh_process_per_site" and (e.domain or "") == "" then
+            apply(e.value)
+        end
     end)
 end
 

@@ -1,0 +1,125 @@
+Wheel scrolling runs on the scrolling thread, as upstream has it with forced
+compositing, unless WEBKIT_DISABLE_THREADED_SCROLLING=1 asks for the main
+thread.
+
+This patch used to turn threaded scrolling off for good.  With it on, sticky
+and fixed headers jumped by the scroll distance and back on every wheel step
+(github.com, chatgpt.com, redhat.com) whenever the main thread did not finish
+its rendering update within half a frame: the compositor took layer positions
+half from the main thread's layer flush and half from the scrolling tree.
+Patch 0028 commits those positions as one set, which is what removes the
+shaking, so the scrolling thread is back -- and with it scrolling that does
+not wait for the main thread: a page whose scripts keep the main thread busy
+for a second no longer stops scrolling for that second.  Patch 0029 extends
+that to pages with passive wheel listeners (microsoft.com among them), 0030
+to pages that were idle when the wheel started, and 0031 keeps the areas the
+scroll reaches before the main thread has painted them from showing stale or
+undefined pixels.
+
+The variable stays as the way to compare the two on one machine.  Without a
+scrolling thread there is no scrolling coordinator either, so a composited
+frame must not get the coordinated scrollbars controller, which leaves
+drawing the scrollbars to the scrolling tree: the scrollbar would still be
+draggable but never drawn.  Such a frame keeps the generic controller, and
+the Adwaita theme paints its scrollbars into their layers instead of leaving
+them to the (absent) scrolling thread.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebKit/UIProcess/API/glib/WebKitSettings.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitSettings.cpp
+@@ -3944,6 +3944,19 @@ WebKitHardwareAccelerationPolicy webkit_
+  *
+  * Since: 2.16
+  */
++// Wheel scrolling on the scrolling thread, as upstream has it with forced
++// compositing, unless WEBKIT_DISABLE_THREADED_SCROLLING=1 asks for the main
++// thread -- the way to compare the two on one machine.  A scrolling thread
++// that runs ahead of the main thread used to shake sticky and fixed headers,
++// because the compositor could take a set of layer positions half from the
++// main thread's flush and half from the scrolling tree; the positions are
++// now committed as one set (patch 0028).
++static bool settingsThreadedScrollingWanted()
++{
++    const char* value = getenv("WEBKIT_DISABLE_THREADED_SCROLLING");
++    return !value || !*value || !strcmp(value, "0");
++}
++
+ void webkit_settings_set_hardware_acceleration_policy(WebKitSettings* settings, WebKitHardwareAccelerationPolicy policy)
+ {
+     g_return_if_fail(WEBKIT_IS_SETTINGS(settings));
+@@ -3960,7 +3973,7 @@ void webkit_settings_set_hardware_accele
+         }
+         if (!priv->preferences->forceCompositingMode()) {
+             priv->preferences->setForceCompositingMode(true);
+-            priv->preferences->setThreadedScrollingEnabled(true);
++            priv->preferences->setThreadedScrollingEnabled(settingsThreadedScrollingWanted());
+             changed = true;
+         }
+         break;
+--- a/Source/WebKit/UIProcess/gtk/WebPreferencesGtk.cpp
++++ b/Source/WebKit/UIProcess/gtk/WebPreferencesGtk.cpp
+@@ -28,9 +28,20 @@
+ #include "WebPreferences.h"
+ 
+ #include "HardwareAccelerationManager.h"
++#include <stdlib.h>
++#include <string.h>
+ 
+ namespace WebKit {
+ 
++// Wheel scrolling on the scrolling thread, as upstream has it with forced
++// compositing, unless WEBKIT_DISABLE_THREADED_SCROLLING=1 asks for the main
++// thread (see WebKitSettings.cpp).
++static bool threadedScrollingWanted()
++{
++    const char* value = getenv("WEBKIT_DISABLE_THREADED_SCROLLING");
++    return !value || !*value || !strcmp(value, "0");
++}
++
+ void WebPreferences::platformInitializeStore()
+ {
+     struct {
+@@ -45,7 +56,7 @@ void WebPreferences::platformInitializeS
+ 
+     setAcceleratedCompositingEnabled(compositingState.acceleratedCompositingEnabled);
+     setForceCompositingMode(compositingState.forceCompositingMode);
+-    setThreadedScrollingEnabled(compositingState.forceCompositingMode);
++    setThreadedScrollingEnabled(compositingState.forceCompositingMode && threadedScrollingWanted());
+ }
+ 
+ } // namespace WebKit
+--- a/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
++++ b/Source/WebKit/WebProcess/WebCoreSupport/WebChromeClient.cpp
+@@ -1416,7 +1416,12 @@ void WebChromeClient::ensureScrollbarsCo
+         area.setScrollbarsController(makeUnique<RemoteScrollbarsController>(area, corePage.scrollingCoordinator()));
+ #endif
+ #elif USE(COORDINATED_GRAPHICS_ASYNC_SCROLLBAR)
+-    if (area.usesCompositedScrolling()) {
++    // The coordinated controller leaves the drawing of the scrollbars to the
++    // scrolling tree.  Without a scrolling coordinator (threaded scrolling
++    // off) there is no scrolling tree, and a composited frame would end up
++    // with scrollbars nobody draws: they still answer the mouse, but stay
++    // invisible.  Such a frame paints its scrollbars itself.
++    if (area.usesCompositedScrolling() && corePage.scrollingCoordinator()) {
+         if (!currentScrollbarsController || !is<ScrollbarsControllerCoordinated>(currentScrollbarsController))
+             area.setScrollbarsController(makeUnique<ScrollbarsControllerCoordinated>(area, corePage.scrollingCoordinator()));
+     } else {
+--- a/Source/WebCore/platform/adwaita/ScrollbarThemeAdwaita.cpp
++++ b/Source/WebCore/platform/adwaita/ScrollbarThemeAdwaita.cpp
+@@ -109,10 +109,13 @@ IntRect ScrollbarThemeAdwaita::trackRect
+ bool ScrollbarThemeAdwaita::paint(Scrollbar& scrollbar, GraphicsContext& graphicsContext, const IntRect& damageRect)
+ {
+ #if USE(COORDINATED_GRAPHICS_ASYNC_SCROLLBAR)
+-    if (scrollbar.checkedScrollableArea()->usesCompositedScrolling()) {
+-        // Painting is done by ScrollerCoordinated in the scrolling thread.
++    // Painting is done by ScrollerCoordinated in the scrolling thread -- but
++    // only where there is one: a composited area without a scrolling
++    // coordinator (threaded scrolling off) has its scrollbars drawn into
++    // their layers here, as its controller says.
++    if (scrollbar.checkedScrollableArea()->usesCompositedScrolling()
++        && !scrollbar.checkedScrollableArea()->scrollbarsController().shouldDrawIntoScrollbarLayer(scrollbar))
+         return true;
+-    }
+ #endif
+ 
+     std::optional<ScrollbarColor> scrollbarColor;

@@ -15,14 +15,14 @@
 //   |   Settings     |                                                   |
 //   +----------------+---------------------------------------------------+
 //   |  ( [art] Title   shuffle prev (PLAY) next repeat   vol --o-- ... ) |
-//   |  (       Artist  0:42 ============o-------- 3:51   queue mini  ) |
+//   |  (       Artist  0:42 ============o-------- 3:51   queue  ...  ) |
 //   +--------------------------------------------------------------------+
 //
 // The light sidebar and pages above a dark rounded transport strip.  The
 // "now playing" page is the stage: the cover on a blurred wash of its
-// colours, or the video.  A video, full screen and the mini player make the
-// window immersive: the sidebar goes, the window turns black and the dark
-// strips above and below the picture slide away while the pointer rests.
+// colours, or the video.  A video and full screen make the window
+// immersive: the sidebar goes, the window turns black and the dark strips
+// above and below the picture slide away while the pointer rests.
 //
 // Keyboard handling is done once, at the window, before GTK hands the key
 // to the focused widget -- so Space always means play/pause, not "press the
@@ -63,11 +63,8 @@ typedef struct {
 	double scroll_accum;
 	GdkCursor *blank_cursor;
 	GtkWidget *queue_menu;
-	GtkWidget *bar;		/* the transport strip, wherever it sits */
-	GtkWidget *bar_separator; /* between the volume and the views */
 	gboolean auto_now;	/* "now" was opened for a video by itself */
 	guint auto_now_id;	/* ... for this entry */
-	int mini_w, mini_h;	/* window size before the mini player */
 	gchar *recent_uri;	/* last entry put on the recent list */
 	gboolean recent_artist;	/* ... with its artist */
 	GtkWidget *speed_items[N_SPEEDS];
@@ -144,8 +141,7 @@ static void capture_geometry(MpApp *app)
 	if (w == NULL)
 		return;
 	GdkWindowState st = gdk_window_get_state(w);
-	if (!(st & (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED)) &&
-	    !app->mini) {
+	if (!(st & (GDK_WINDOW_STATE_FULLSCREEN | GDK_WINDOW_STATE_MAXIMIZED))) {
 		int ww = 0, wh = 0;
 		gtk_window_get_size(GTK_WINDOW(app->window), &ww, &wh);
 		if (ww >= 320 && wh >= 240) {
@@ -766,7 +762,7 @@ static gboolean on_art_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 	MpApp *app = data;
 	int aw = gtk_widget_get_allocated_width(w);
 	int ah = gtk_widget_get_allocated_height(w);
-	double side = MIN(MIN(aw, ah), app->mini ? 1000 : 360);
+	double side = MIN(MIN(aw, ah), 360);
 	gboolean video = app->current_id != 0 &&
 			 mp_player_has_video(app->player);
 	mp_cover_draw(cr, app->cover, (aw - side) / 2, (ah - side) / 2, side,
@@ -909,10 +905,7 @@ static gboolean hide_timeout(gpointer data)
 				      FALSE);
 	gtk_revealer_set_reveal_child(GTK_REVEALER(app->top_revealer), FALSE);
 	app->controls_hidden = TRUE;
-	/* The mini player keeps the pointer: it is a small window among
-	 * others, not a film to watch. */
-	if (!app->mini)
-		set_cursor_visible(app, FALSE);
+	set_cursor_visible(app, FALSE);
 	return G_SOURCE_REMOVE;
 }
 
@@ -1042,8 +1035,7 @@ static void show_media_page(MpApp *app)
 			pv->auto_now = TRUE;
 			mp_pages_show(app, "now");
 		}
-	} else if (!video && pv->auto_now && on_now && !app->mini &&
-		   !app->fullscreen &&
+	} else if (!video && pv->auto_now && on_now && !app->fullscreen &&
 		   mp_player_get_state(app->player) == MP_PLAYER_STOPPED) {
 		pv->auto_now = FALSE;
 		mp_pages_back(app);
@@ -1726,8 +1718,6 @@ static void on_repeat_toggled(GtkToggleButton *b, gpointer data)
 /* F9 and the menu: to the play queue, and back to where one was. */
 void mp_app_toggle_playlist(MpApp *app)
 {
-	if (app->mini)
-		mp_app_set_mini(app, FALSE);
 	if (app->fullscreen)
 		mp_app_set_fullscreen(app, FALSE);
 	if (strcmp(mp_pages_current(app), "queue") == 0)
@@ -1811,7 +1801,7 @@ static void infobar_show(MpApp *app, GtkMessageType type, const char *text)
 {
 	gtk_info_bar_set_message_type(GTK_INFO_BAR(app->infobar), type);
 	gtk_label_set_text(GTK_LABEL(app->infobar_label), text);
-	if (!app->fullscreen && !app->mini)
+	if (!app->fullscreen)
 		gtk_widget_show(app->infobar);
 }
 
@@ -2151,9 +2141,6 @@ if (ctrl) {
 		case GDK_KEY_f:
 			mp_pages_focus_search(app);
 			return TRUE;
-		case GDK_KEY_m:
-			mp_app_set_mini(app, !app->mini);
-			return TRUE;
 		case GDK_KEY_q:
 		case GDK_KEY_w:
 			gtk_window_close(GTK_WINDOW(app->window));
@@ -2262,10 +2249,6 @@ if (ctrl) {
 	case GDK_KEY_Escape:
 		if (app->fullscreen) {
 			mp_app_set_fullscreen(app, FALSE);
-			return TRUE;
-		}
-		if (app->mini) {
-			mp_app_set_mini(app, FALSE);
 			return TRUE;
 		}
 		if (strcmp(mp_pages_current(app), "now") == 0 ||
@@ -2483,15 +2466,8 @@ static void menu_quit(MpApp *app)
 	gtk_window_close(GTK_WINDOW(app->window));
 }
 
-static void menu_mini(MpApp *app)
-{
-	mp_app_set_mini(app, !app->mini);
-}
-
 static void menu_settings(MpApp *app)
 {
-	if (app->mini)
-		mp_app_set_mini(app, FALSE);
 	if (app->fullscreen)
 		mp_app_set_fullscreen(app, FALSE);
 	mp_pages_show(app, "settings");
@@ -2546,8 +2522,6 @@ static GtkWidget *build_main_menu(MpApp *app)
 				   app);
 	menu_item(m, "_Queue", GDK_KEY_F9, 0,
 		  G_CALLBACK(mp_app_toggle_playlist), app);
-	menu_item(m, "_Mini Player", GDK_KEY_m, GDK_CONTROL_MASK,
-		  G_CALLBACK(menu_mini), app);
 	menu_item(m, "Media _Information", GDK_KEY_i, GDK_CONTROL_MASK,
 		  G_CALLBACK(mp_dialog_media_info), app);
 	menu_separator(m);
@@ -2646,10 +2620,6 @@ static void on_now_back(GtkButton *b, gpointer data)
 	(void)b;
 	if (app->fullscreen)
 		mp_app_set_fullscreen(app, FALSE);
-	if (app->mini) {
-		mp_app_set_mini(app, FALSE);
-		return;
-	}
 	priv_of(app)->auto_now = FALSE;
 	mp_pages_back(app);
 }
@@ -2728,8 +2698,6 @@ static void on_now_clicked(GtkButton *b, gpointer data)
 {
 	MpApp *app = data;
 	(void)b;
-	if (app->mini)
-		return;
 	if (strcmp(mp_pages_current(app), "now") == 0) {
 		priv_of(app)->auto_now = FALSE;
 		mp_pages_back(app);
@@ -2750,13 +2718,6 @@ static gboolean on_volume_scroll(GtkWidget *w, GdkEventScroll *ev,
 	return on_media_scroll(w, ev, data);
 }
 
-static void on_mini_clicked(GtkButton *b, gpointer data)
-{
-	MpApp *app = data;
-	(void)b;
-	mp_app_set_mini(app, !app->mini);
-}
-
 static void on_next_clicked(GtkButton *b, gpointer data)
 {
 	(void)b;
@@ -2769,10 +2730,8 @@ static void on_queue_clicked(GtkButton *b, gpointer data)
 	mp_app_toggle_playlist(data);
 }
 
-/* The width of the seek bar in the middle of the strip; the mini player's
- * is short. */
+/* The width of the seek bar in the middle of the strip. */
 #define SEEK_WIDTH 380
-#define SEEK_WIDTH_MINI 150
 
 /* The transport strip: a dark rounded strip along the bottom of the
  * window, inset from its edges.
@@ -2785,7 +2744,6 @@ static void on_queue_clicked(GtkButton *b, gpointer data)
  * buttons at the right. */
 static GtkWidget *build_controls(MpApp *app)
 {
-	MpPriv *pv = priv_of(app);
 	app->controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
 	add_class(app->controls, "mp-bar");
 
@@ -2939,19 +2897,12 @@ static GtkWidget *build_controls(MpApp *app)
 
 	GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
 	add_class(sep, "mp-bar-separator");
-	pv->bar_separator = sep;
 
 	app->btn_queue = mp_glyph_button("likeos-play-queue",
 					 "view-list-symbolic", 16,
 					 "Queue (F9)", "mp-bar-button", FALSE);
 	g_signal_connect(app->btn_queue, "clicked",
 			 G_CALLBACK(on_queue_clicked), app);
-	app->btn_mini = mp_glyph_button("likeos-mini-player",
-					"view-restore-symbolic", 16,
-					"Mini player (Ctrl+M)", "mp-bar-button",
-					FALSE);
-	g_signal_connect(app->btn_mini, "clicked", G_CALLBACK(on_mini_clicked),
-			 app);
 	app->btn_fullscreen = mp_glyph_button("likeos-fullscreen",
 					      "view-fullscreen-symbolic", 16,
 					      "Full screen (F)",
@@ -2974,8 +2925,8 @@ static GtkWidget *build_controls(MpApp *app)
 				      GTK_ARROW_UP);
 
 	GtkWidget *rb[] = { app->btn_volume, app->volume_scale, sep,
-			    app->btn_queue, app->btn_mini,
-			    app->btn_fullscreen, app->btn_menu };
+			    app->btn_queue, app->btn_fullscreen,
+			    app->btn_menu };
 	for (gsize i = 0; i < G_N_ELEMENTS(rb); i++)
 		gtk_box_pack_start(GTK_BOX(app->bar_right), rb[i], FALSE, FALSE,
 				   0);
@@ -3000,7 +2951,6 @@ static GtkWidget *build_controls(MpApp *app)
 			 G_CALLBACK(on_media_motion), app);
 	gtk_container_add(GTK_CONTAINER(ev), app->controls_revealer);
 	add_class(ev, "mp-bar-slot");
-	pv->bar = ev;
 	return ev;
 }
 
@@ -3152,7 +3102,7 @@ static GtkWidget *build_queue(MpApp *app)
 	return page;
 }
 
-/* ---- floating bars ---------------------------------------------------- */
+/* ---- immersive mode --------------------------------------------------- */
 
 static gboolean stage_shows_video(MpApp *app)
 {
@@ -3165,55 +3115,22 @@ static gboolean stage_shows_video(MpApp *app)
 /* Immersive: the stage alone fills the window between the dark title
  * strip above it and the dark transport strip below, and both slide away
  * while the pointer rests, giving the picture the whole window.  That is
- * the case for a video on the "now" page, in full screen, and in the mini
- * player.
+ * the case for a video on the "now" page, and in full screen.
  *
  * The strips border the picture rather than lie on it: a video is drawn by
  * the X server into a window of its own, and without a compositor nothing
- * drawn by GTK over that window would show.
- *
- * The mini player showing a cover is the one place the strip lies on the
- * page itself, over the blurred cover; everywhere else it has its own slot
- * along the bottom of the window. */
-static void place_bar(MpApp *app, gboolean floating)
-{
-	MpPriv *pv = priv_of(app);
-	GtkWidget *bar = pv->bar;
-	GtkWidget *want = floating ? app->stage_overlay : app->bar_slot;
-	GtkWidget *parent = gtk_widget_get_parent(bar);
-	GtkStyleContext *sc = gtk_widget_get_style_context(app->window);
-	if (floating)
-		gtk_style_context_add_class(sc, "mp-bar-floating");
-	else
-		gtk_style_context_remove_class(sc, "mp-bar-floating");
-	if (parent == want)
-		return;
-	g_object_ref(bar);
-	if (parent != NULL)
-		gtk_container_remove(GTK_CONTAINER(parent), bar);
-	if (floating) {
-		gtk_widget_set_valign(bar, GTK_ALIGN_END);
-		gtk_overlay_add_overlay(GTK_OVERLAY(app->stage_overlay), bar);
-	} else {
-		gtk_widget_set_valign(bar, GTK_ALIGN_FILL);
-		gtk_box_pack_start(GTK_BOX(app->bar_slot), bar, TRUE, TRUE, 0);
-	}
-	g_object_unref(bar);
-}
-
+ * drawn by GTK over that window would show. */
 static void update_immersive(MpApp *app)
 {
-	MpPriv *pv = priv_of(app);
-	if (pv == NULL || pv->bar == NULL || app->pages == NULL)
+	if (app->pages == NULL)
 		return;
 	gboolean on_now = strcmp(mp_pages_current(app), "now") == 0;
 	gboolean video = stage_shows_video(app);
-	gboolean on = app->mini || (on_now && (app->fullscreen || video));
+	gboolean on = on_now && (app->fullscreen || video);
 
 	/* A film or the full screen takes the whole window: no sidebar
 	 * beside it.  Music on the "now" page keeps it. */
-	gtk_widget_set_visible(app->nav_pane, !on && !app->mini);
-	place_bar(app, app->mini && !video);
+	gtk_widget_set_visible(app->nav_pane, !on);
 	if (on == app->immersive)
 		return;
 	app->immersive = on;
@@ -3228,9 +3145,7 @@ static void update_immersive(MpApp *app)
 	if (back != NULL)
 		gtk_widget_set_visible(back, !on);
 
-	/* The mini player has the window's own title; the strip would only
-	 * take room from the picture. */
-	gtk_widget_set_visible(app->top_revealer, on && !app->mini);
+	gtk_widget_set_visible(app->top_revealer, on);
 	if (on) {
 		app->controls_hidden = TRUE;	/* so that this shows them */
 		show_controls(app);
@@ -3252,57 +3167,6 @@ static void update_immersive(MpApp *app)
 void mp_app_page_changed(MpApp *app)
 {
 	update_immersive(app);
-}
-
-void mp_app_set_mini(MpApp *app, gboolean mini)
-{
-	MpPriv *pv = priv_of(app);
-	if (mini == app->mini)
-		return;
-	if (mini && app->fullscreen)
-		mp_app_set_fullscreen(app, FALSE);
-	app->mini = mini;
-	GtkWindow *win = GTK_WINDOW(app->window);
-	GtkStyleContext *sc = gtk_widget_get_style_context(app->window);
-	if (mini) {
-		capture_geometry(app);
-		gtk_window_get_size(win, &pv->mini_w, &pv->mini_h);
-		gtk_style_context_add_class(sc, "mp-mini");
-		gtk_widget_hide(app->infobar);
-		if (strcmp(mp_pages_current(app), "now") != 0)
-			mp_pages_show(app, "now");
-	} else {
-		gtk_style_context_remove_class(sc, "mp-mini");
-	}
-	/* The mini player is the picture and the transport: no titles, no
-	 * volume, no menus; its own button brings the window back. */
-	GtkWidget *hide[] = { app->now_box, app->btn_volume,
-			      app->volume_scale, pv->bar_separator,
-			      app->btn_queue, app->btn_fullscreen,
-			      app->btn_menu, app->art_title, app->art_artist,
-			      app->art_status, app->btn_shuffle,
-			      app->btn_repeat };
-	for (gsize i = 0; i < G_N_ELEMENTS(hide); i++)
-		gtk_widget_set_visible(hide[i], !mini);
-	mp_glyph_button_set(app->btn_mini,
-			    mini ? "likeos-window-restore" : "likeos-mini-player",
-			    mini ? "view-fullscreen-symbolic"
-				 : "view-restore-symbolic");
-	gtk_widget_set_tooltip_text(app->btn_mini,
-				    mini ? "Leave the mini player (Esc)"
-					 : "Mini player (Ctrl+M)");
-	gtk_widget_set_size_request(app->seek_scale,
-				    mini ? SEEK_WIDTH_MINI : SEEK_WIDTH, -1);
-	gtk_window_set_keep_above(win, mini);
-	update_immersive(app);
-	if (mini) {
-		gtk_window_resize(win, 360, 360);
-	} else {
-		if (pv->mini_w > 0 && pv->mini_h > 0)
-			gtk_window_resize(win, pv->mini_w, pv->mini_h);
-		mp_pages_back(app);
-	}
-	gtk_widget_queue_draw(app->art_area);
 }
 
 /* ---- the queue, filled from elsewhere --------------------------------- */
@@ -3520,12 +3384,8 @@ MpApp *mp_window_create(MpOptions *options)
 	gtk_box_pack_start(GTK_BOX(app->content), app->pages, TRUE, TRUE, 0);
 	gtk_box_pack_start(GTK_BOX(body), app->content, TRUE, TRUE, 0);
 	gtk_box_pack_start(GTK_BOX(vbox), build_top_bar(app), FALSE, FALSE, 0);
-	app->stage_overlay = gtk_overlay_new();
-	gtk_container_add(GTK_CONTAINER(app->stage_overlay), body);
-	gtk_box_pack_start(GTK_BOX(vbox), app->stage_overlay, TRUE, TRUE, 0);
-	app->bar_slot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-	gtk_box_pack_start(GTK_BOX(app->bar_slot), bar, TRUE, TRUE, 0);
-	gtk_box_pack_start(GTK_BOX(vbox), app->bar_slot, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(vbox), body, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(vbox), bar, FALSE, FALSE, 0);
 	gtk_container_add(GTK_CONTAINER(app->window), vbox);
 	add_class(app->window, "mp-window");
 

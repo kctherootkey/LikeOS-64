@@ -10779,23 +10779,6 @@ window.mp-window.mp-immersive .mp-top-bar, window.mp-window.mp-fullscreen .mp-to
   border: 1px solid #2c3446;
 }
 
-window.mp-window.mp-bar-floating .mp-content {
-  border: none;
-}
-
-window.mp-window.mp-bar-floating .mp-art {
-  padding-bottom: 96px;
-}
-
-window.mp-window.mp-mini .mp-bar {
-  padding: 6px 8px;
-  margin: 6px;
-}
-
-window.mp-window.mp-mini .mp-art {
-  padding: 10px;
-}
-
 .mp-info-key {
   color: #586174;
 }
@@ -10807,6 +10790,2037 @@ window.mp-window.mp-mini .mp-art {
   border: 1px solid #cdd4e0;
   border-radius: 6px;
   background-color: #fbfcfe;
+}
+
+window.iv-window {
+  background-color: #161c2a;
+  color: #eef2fa;
+}
+
+window.iv-window:backdrop {
+  background-color: #161c2a;
+  color: #eef2fa;
+}
+
+window.iv-window label {
+  color: inherit;
+}
+
+window.iv-window .iv-glyph {
+  color: inherit;
+}
+
+window.iv-window stack, window.iv-window scrolledwindow, window.iv-window viewport, window.iv-window overlay {
+  background-color: transparent;
+}
+
+window.iv-window scrollbar {
+  background-color: transparent;
+  border: none;
+}
+
+window.iv-window scrollbar slider {
+  background-color: rgba(238, 242, 250, 0.28);
+  border: none;
+}
+
+window.iv-window scrollbar slider:hover {
+  background-color: rgba(238, 242, 250, 0.45);
+}
+
+window.iv-window scrollbar trough {
+  background-color: transparent;
+}
+
+window.iv-window .iv-titlebar {
+  min-height: 40px;
+  padding: 0 0 0 12px;
+  background-color: #161c2a;
+}
+
+window.iv-window .iv-title-icon {
+  margin-right: 4px;
+}
+
+window.iv-window .iv-title-name {
+  font-size: 9pt;
+  font-weight: 600;
+  color: #eef2fa;
+}
+
+window.iv-window .iv-title-count {
+  font-size: 9pt;
+  color: #a4adbf;
+}
+
+window.iv-window:backdrop .iv-title-name {
+  color: #a4adbf;
+}
+
+window.iv-window .iv-title-commands {
+  margin-right: 12px;
+}
+
+window.iv-window button.iv-title-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+}
+
+window.iv-window button.iv-title-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-title-button:active, window.iv-window button.iv-title-button.iv-menu-open, window.iv-window button.iv-title-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-title-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-title-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-title-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-title-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-title-button.iv-text-button {
+  padding: 0 8px 0 12px;
+}
+
+window.iv-window button.iv-title-button .iv-chevron {
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-edit-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-height: 30px;
+  padding: 0 12px 0 8px;
+  margin-right: 8px;
+  border: 1px solid rgba(91, 143, 249, 0.75);
+}
+
+window.iv-window button.iv-edit-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-edit-button:active, window.iv-window button.iv-edit-button.iv-menu-open, window.iv-window button.iv-edit-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-edit-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-edit-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-edit-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-edit-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-edit-button .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-edit-button:hover {
+  background-color: rgba(91, 143, 249, 0.14);
+  border-color: #5b8ff9;
+}
+
+window.iv-window button.iv-edit-button:active {
+  background-color: rgba(91, 143, 249, 0.22);
+}
+
+window.iv-window button.iv-edit-button:disabled {
+  border-color: #2c3446;
+}
+
+window.iv-window button.iv-edit-button:disabled .iv-glyph {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-back {
+  margin-right: 4px;
+}
+
+window.iv-window button.iv-caption {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-width: 36px;
+  min-height: 26px;
+  margin: 0 0 0 4px;
+  border-radius: 6px;
+}
+
+window.iv-window button.iv-caption:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-caption:active, window.iv-window button.iv-caption.iv-menu-open, window.iv-window button.iv-caption.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-caption:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-caption:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-caption:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-caption label {
+  color: inherit;
+}
+
+window.iv-window button.iv-caption:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+window.iv-window button.iv-caption:active {
+  background-color: rgba(255, 255, 255, 0.14);
+}
+
+window.iv-window button.iv-caption.close {
+  margin-right: 6px;
+}
+
+window.iv-window button.iv-caption.close:hover {
+  background-color: #e0443e;
+  color: white;
+}
+
+window.iv-window button.iv-caption.close:active {
+  background-color: #c7352f;
+  color: white;
+}
+
+window.iv-window:backdrop button.iv-caption {
+  color: #a4adbf;
+}
+
+window.iv-window:backdrop button.iv-caption.close:hover {
+  color: white;
+}
+
+window.iv-window .iv-canvas {
+  background-color: #161c2a;
+  color: #eef2fa;
+}
+
+window.iv-window .iv-canvas.darker {
+  background-color: #0b0f18;
+}
+
+window.iv-window .iv-canvas.checker {
+  background-color: #161c2a;
+}
+
+window.iv-window .iv-canvas.iv-canvas-secondary {
+  color: #a4adbf;
+}
+
+window.iv-window .iv-canvas.iv-canvas-accent {
+  color: #5b8ff9;
+}
+
+window.iv-window .iv-canvas.iv-edit-canvas {
+  background-color: #10141f;
+}
+
+window.iv-window .iv-canvas.iv-edit-canvas.darker {
+  background-color: #0b0f18;
+}
+
+window.iv-window .iv-strip {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  margin: 8px;
+  padding: 6px 8px;
+}
+
+window.iv-window button.iv-strip-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+}
+
+window.iv-window button.iv-strip-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-strip-button:active, window.iv-window button.iv-strip-button.iv-menu-open, window.iv-window button.iv-strip-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-strip-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-strip-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-strip-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-strip-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-strip-button:checked, window.iv-window button.iv-strip-button:checked:hover {
+  color: #5b8ff9;
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+window.iv-window button.iv-strip-button.iv-text-button {
+  padding: 0 8px;
+}
+
+window.iv-window button.iv-strip-button .iv-chevron {
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-zoom-button {
+  min-width: 76px;
+}
+
+window.iv-window button.iv-nav-button {
+  min-width: 40px;
+}
+
+window.iv-window .iv-chip-label {
+  padding: 2px 8px;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.08);
+  font-size: 7.5pt;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: #eef2fa;
+}
+
+window.iv-window .iv-strip-fact {
+  font-size: 9pt;
+  color: #a4adbf;
+}
+
+window.iv-window scale.iv-zoom-scale {
+  padding: 6px 0;
+}
+
+window.iv-window scale.iv-zoom-scale trough {
+  min-height: 4px;
+  border: none;
+  border-radius: 2px;
+  background-color: rgba(238, 242, 250, 0.18);
+  box-shadow: none;
+}
+
+window.iv-window scale.iv-zoom-scale highlight {
+  border: none;
+  border-radius: 2px;
+  background-image: image(#5b8ff9);
+  background-color: #5b8ff9;
+}
+
+window.iv-window scale.iv-zoom-scale slider {
+  min-width: 14px;
+  min-height: 14px;
+  margin: -6px;
+  border: none;
+  border-radius: 50%;
+  background-color: #eef2fa;
+  background-image: none;
+  box-shadow: 0 0 0 3px rgba(31, 38, 54, 0.7);
+}
+
+window.iv-window scale.iv-zoom-scale:hover slider, window.iv-window scale.iv-zoom-scale slider:hover, window.iv-window scale.iv-zoom-scale slider:active {
+  background-color: white;
+}
+
+window.iv-window scale.iv-zoom-scale marks, window.iv-window scale.iv-zoom-scale mark {
+  color: #a4adbf;
+}
+
+window.iv-window scale.iv-zoom-scale mark indicator {
+  min-height: 4px;
+  min-width: 1px;
+  color: #a4adbf;
+}
+
+window.iv-window scale.iv-zoom-scale:disabled trough {
+  background-color: rgba(238, 242, 250, 0.1);
+}
+
+window.iv-window scale.iv-zoom-scale:disabled highlight {
+  background-image: none;
+  background-color: transparent;
+}
+
+window.iv-window scale.iv-zoom-scale:disabled slider {
+  background-color: #6b7486;
+}
+
+window.iv-window .iv-filmstrip {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  margin: 8px 8px 0 8px;
+}
+
+window.iv-window .iv-film-area.iv-film-accent {
+  color: #5b8ff9;
+}
+
+window.iv-window .iv-film-area.iv-film-placeholder {
+  color: rgba(255, 255, 255, 0.06);
+}
+
+window.iv-window .iv-film-area.iv-film-glyph {
+  color: #6b7486;
+}
+
+window.iv-window .iv-film-area.iv-film-hover {
+  color: rgba(255, 255, 255, 0.12);
+}
+
+window.iv-window .iv-info {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  margin: 8px 8px 8px 0;
+}
+
+window.iv-window .iv-info-head {
+  padding: 12px 8px 4px 16px;
+}
+
+window.iv-window .iv-info-title {
+  font-size: 12pt;
+  font-weight: 600;
+}
+
+window.iv-window button.iv-info-close, window.iv-window button.iv-info-edit {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-width: 28px;
+  min-height: 28px;
+}
+
+window.iv-window button.iv-info-close:hover, window.iv-window button.iv-info-edit:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-info-close:active, window.iv-window button.iv-info-close.iv-menu-open, window.iv-window button.iv-info-close.iv-pressed, window.iv-window button.iv-info-edit:active, window.iv-window button.iv-info-edit.iv-menu-open, window.iv-window button.iv-info-edit.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-info-close:disabled, window.iv-window button.iv-info-edit:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-info-close:backdrop, window.iv-window button.iv-info-edit:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-info-close:backdrop:disabled, window.iv-window button.iv-info-edit:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-info-close label, window.iv-window button.iv-info-edit label {
+  color: inherit;
+}
+
+window.iv-window .iv-info-content {
+  padding: 4px 16px 16px 16px;
+}
+
+window.iv-window .iv-quicks {
+  margin-bottom: 4px;
+}
+
+window.iv-window button.iv-quick {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  padding: 8px 2px;
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+window.iv-window button.iv-quick:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-quick:active, window.iv-window button.iv-quick.iv-menu-open, window.iv-window button.iv-quick.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-quick:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-quick:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-quick:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-quick label {
+  color: inherit;
+}
+
+window.iv-window button.iv-quick .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-quick .iv-quick-label {
+  font-size: 7.5pt;
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-quick:hover .iv-quick-label {
+  color: #eef2fa;
+}
+
+window.iv-window .iv-info-section {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #2c3446;
+}
+
+window.iv-window .iv-info-section .iv-glyph {
+  color: #a4adbf;
+}
+
+window.iv-window .iv-info-section-title {
+  font-weight: 600;
+  font-size: 9pt;
+}
+
+window.iv-window .iv-info-key {
+  color: #a4adbf;
+  font-size: 9pt;
+}
+
+window.iv-window .iv-info-value {
+  color: #eef2fa;
+  font-size: 9pt;
+}
+
+window.iv-window entry.iv-info-name {
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid #2c3446;
+  border-radius: 8px;
+  background-color: #161c2a;
+  background-image: none;
+  color: #eef2fa;
+  caret-color: #5b8ff9;
+  box-shadow: none;
+}
+
+window.iv-window entry.iv-info-name:focus {
+  border-color: #5b8ff9;
+  box-shadow: inset 0 -1px #5b8ff9;
+}
+
+window.iv-window entry.iv-info-name:disabled {
+  color: #6b7486;
+}
+
+window.iv-window entry.iv-info-name selection {
+  background-color: rgba(91, 143, 249, 0.45);
+  color: white;
+}
+
+window.iv-window button.iv-link {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-height: 24px;
+  min-width: 0;
+  padding: 0 2px;
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-link:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-link:active, window.iv-window button.iv-link.iv-menu-open, window.iv-window button.iv-link.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-link:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-link:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-link:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-link label {
+  color: inherit;
+}
+
+window.iv-window button.iv-link:hover {
+  background-color: transparent;
+}
+
+window.iv-window button.iv-link:hover label {
+  text-decoration-line: underline;
+}
+
+window.iv-window button.iv-link label {
+  color: #5b8ff9;
+}
+
+window.iv-window expander.iv-info-expander title, window.iv-window .iv-info-expander title {
+  color: #eef2fa;
+}
+
+window.iv-window expander.iv-info-expander arrow, window.iv-window .iv-info-expander arrow {
+  color: #a4adbf;
+}
+
+window.iv-window .iv-toast {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  min-width: 280px;
+  padding: 8px 8px 8px 16px;
+}
+
+window.iv-window button.iv-toast-action {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  padding: 0 12px;
+  color: #5b8ff9;
+  font-weight: 600;
+}
+
+window.iv-window button.iv-toast-action:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-toast-action:active, window.iv-window button.iv-toast-action.iv-menu-open, window.iv-window button.iv-toast-action.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-toast-action:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-toast-action:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-toast-action:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-toast-action label {
+  color: inherit;
+}
+
+window.iv-window button.iv-toast-action label {
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-toast-close {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-width: 28px;
+  min-height: 28px;
+}
+
+window.iv-window button.iv-toast-close:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-toast-close:active, window.iv-window button.iv-toast-close.iv-menu-open, window.iv-window button.iv-toast-close.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-toast-close:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-toast-close:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-toast-close:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-toast-close label {
+  color: inherit;
+}
+
+window.iv-window progressbar.iv-toast-bar trough {
+  min-height: 4px;
+  border: none;
+  border-radius: 2px;
+  background-color: rgba(238, 242, 250, 0.15);
+}
+
+window.iv-window progressbar.iv-toast-bar progress {
+  min-height: 4px;
+  border: none;
+  border-radius: 2px;
+  background-color: #5b8ff9;
+  background-image: none;
+}
+
+window.iv-window .iv-shade {
+  background-color: rgba(6, 9, 15, 0.58);
+}
+
+window.iv-window .iv-confirm {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  padding: 20px 24px;
+}
+
+window.iv-window .iv-confirm-title {
+  font-size: 12pt;
+  font-weight: 600;
+}
+
+window.iv-window .iv-confirm-text {
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-card-button {
+  min-height: 32px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 8px;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  outline-color: white;
+}
+
+window.iv-window button.iv-card-button.iv-plain {
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-card-button.iv-plain:hover {
+  background-color: rgba(255, 255, 255, 0.13);
+}
+
+window.iv-window button.iv-card-button.iv-accent {
+  background-color: #3f74f2;
+  color: white;
+}
+
+window.iv-window button.iv-card-button.iv-accent:hover {
+  background-color: #5785f4;
+}
+
+window.iv-window button.iv-card-button.iv-destructive {
+  background-color: #e0443e;
+  color: white;
+}
+
+window.iv-window button.iv-card-button.iv-destructive:hover {
+  background-color: #e45954;
+}
+
+window.iv-window button.iv-card-button:active {
+  background-image: image(rgba(0, 0, 0, 0.12));
+}
+
+window.iv-window button.iv-card-button label {
+  color: inherit;
+}
+
+window.iv-window .iv-editor {
+  background-color: #161c2a;
+}
+
+window.iv-window .iv-topbar {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  margin: 0 8px 0 8px;
+  padding: 4px 6px;
+}
+
+window.iv-window button.iv-bar-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+}
+
+window.iv-window button.iv-bar-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-bar-button:active, window.iv-window button.iv-bar-button.iv-menu-open, window.iv-window button.iv-bar-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-bar-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-bar-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-bar-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-bar-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-bar-button.iv-text-button {
+  padding: 0 12px 0 8px;
+}
+
+window.iv-window button.iv-bar-button .iv-chevron {
+  color: #a4adbf;
+}
+
+window.iv-window separator.iv-bar-separator {
+  min-width: 1px;
+  margin: 6px 0;
+  background-color: #2c3446;
+}
+
+window.iv-window .iv-split button {
+  min-height: 32px;
+  border: none;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  background-color: #3f74f2;
+  color: white;
+}
+
+window.iv-window .iv-split button:hover {
+  background-color: #5785f4;
+}
+
+window.iv-window .iv-split button:active {
+  background-color: #2763f0;
+}
+
+window.iv-window .iv-split button:disabled {
+  background-color: rgba(63, 116, 242, 0.4);
+  color: rgba(255, 255, 255, 0.6);
+}
+
+window.iv-window .iv-split button label {
+  color: inherit;
+}
+
+window.iv-window .iv-split button.iv-done {
+  padding: 0 12px 0 12px;
+  border-radius: 8px 0 0 8px;
+  font-weight: 600;
+}
+
+window.iv-window .iv-split button.iv-done-menu {
+  min-width: 30px;
+  padding: 0;
+  border-radius: 0 8px 8px 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.28);
+}
+
+window.iv-window button.iv-outline-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  padding: 0 16px;
+  border: 1px solid #2c3446;
+}
+
+window.iv-window button.iv-outline-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-outline-button:active, window.iv-window button.iv-outline-button.iv-menu-open, window.iv-window button.iv-outline-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-outline-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-outline-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-outline-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-outline-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-outline-button:hover {
+  border-color: rgba(238, 242, 250, 0.3);
+}
+
+window.iv-window .iv-rail {
+  padding: 8px 6px;
+  background-color: #161c2a;
+}
+
+window.iv-window button.iv-rail-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-width: 64px;
+  min-height: 58px;
+  border-radius: 10px;
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-rail-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-rail-button:active, window.iv-window button.iv-rail-button.iv-menu-open, window.iv-window button.iv-rail-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-rail-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-rail-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-rail-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-rail-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-rail-button .iv-rail-label {
+  font-size: 7.5pt;
+}
+
+window.iv-window button.iv-rail-button:hover {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-rail-button.active {
+  background-color: rgba(255, 255, 255, 0.12);
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-rail-button.active .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window .iv-options {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  border-radius: 14px;
+  color: #eef2fa;
+  margin: 8px 8px 8px 0;
+}
+
+window.iv-window .iv-panel {
+  padding: 16px;
+}
+
+window.iv-window .iv-panel-title {
+  font-size: 12pt;
+  font-weight: 600;
+}
+
+window.iv-window .iv-panel-subtitle, window.iv-window .iv-panel-note {
+  color: #a4adbf;
+  font-size: 9pt;
+}
+
+window.iv-window .iv-panel-section {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #2c3446;
+}
+
+window.iv-window .iv-panel-section-title {
+  font-size: 7.5pt;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-panel-reset {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-width: 26px;
+  min-height: 26px;
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-panel-reset:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-panel-reset:active, window.iv-window button.iv-panel-reset.iv-menu-open, window.iv-window button.iv-panel-reset.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-panel-reset:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-panel-reset:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-panel-reset:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-panel-reset label {
+  color: inherit;
+}
+
+window.iv-window .iv-slider-row {
+  margin-top: 4px;
+}
+
+window.iv-window .iv-slider-label {
+  color: #eef2fa;
+}
+
+window.iv-window .iv-slider-value {
+  color: #a4adbf;
+  font-feature-settings: "tnum";
+}
+
+window.iv-window scale.iv-slider {
+  padding: 6px 0;
+}
+
+window.iv-window scale.iv-slider trough {
+  min-height: 4px;
+  border: none;
+  border-radius: 2px;
+  background-color: rgba(238, 242, 250, 0.18);
+  box-shadow: none;
+}
+
+window.iv-window scale.iv-slider highlight {
+  border: none;
+  border-radius: 2px;
+  background-image: image(#5b8ff9);
+  background-color: #5b8ff9;
+}
+
+window.iv-window scale.iv-slider slider {
+  min-width: 14px;
+  min-height: 14px;
+  margin: -6px;
+  border: none;
+  border-radius: 50%;
+  background-color: #eef2fa;
+  background-image: none;
+  box-shadow: 0 0 0 3px rgba(31, 38, 54, 0.7);
+}
+
+window.iv-window scale.iv-slider:hover slider, window.iv-window scale.iv-slider slider:hover, window.iv-window scale.iv-slider slider:active {
+  background-color: white;
+}
+
+window.iv-window scale.iv-slider marks, window.iv-window scale.iv-slider mark {
+  color: #a4adbf;
+}
+
+window.iv-window scale.iv-slider mark indicator {
+  min-height: 4px;
+  min-width: 1px;
+  color: #a4adbf;
+}
+
+window.iv-window scale.iv-slider:disabled trough {
+  background-color: rgba(238, 242, 250, 0.1);
+}
+
+window.iv-window scale.iv-slider:disabled highlight {
+  background-image: none;
+  background-color: transparent;
+}
+
+window.iv-window scale.iv-slider:disabled slider {
+  background-color: #6b7486;
+}
+
+window.iv-window scale.iv-slider.iv-symmetric highlight {
+  background-image: none;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-chip {
+  min-height: 28px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.06);
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-chip:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+window.iv-window button.iv-chip:checked {
+  background-color: rgba(91, 143, 249, 0.2);
+  border-color: #5b8ff9;
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-chip label {
+  color: inherit;
+}
+
+window.iv-window flowbox.iv-chips flowboxchild, window.iv-window flowbox.iv-swatches flowboxchild {
+  padding: 0;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-panel-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-height: 36px;
+  padding: 0 12px;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+window.iv-window button.iv-panel-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-panel-button:active, window.iv-window button.iv-panel-button.iv-menu-open, window.iv-window button.iv-panel-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-panel-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-panel-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-panel-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-panel-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-panel-button:hover {
+  background-color: rgba(255, 255, 255, 0.11);
+}
+
+window.iv-window button.iv-panel-button .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window .iv-switch-row {
+  min-height: 36px;
+}
+
+window.iv-window switch {
+  border: none;
+  background-color: rgba(238, 242, 250, 0.22);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window switch slider {
+  background-color: #eef2fa;
+  border: none;
+  box-shadow: none;
+}
+
+window.iv-window switch:checked {
+  background-color: #3f74f2;
+}
+
+window.iv-window switch:checked slider {
+  background-color: white;
+}
+
+window.iv-window button.iv-swatch {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-width: 30px;
+  min-height: 30px;
+  padding: 1px;
+  border-radius: 50%;
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-swatch:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-swatch:active, window.iv-window button.iv-swatch.iv-menu-open, window.iv-window button.iv-swatch.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-swatch:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-swatch:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-swatch:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-swatch label {
+  color: inherit;
+}
+
+menu.iv-menu, .iv-menu {
+  background-color: #1f2636;
+  border: 1px solid #2c3446;
+  color: #eef2fa;
+}
+
+menu.iv-menu:backdrop, .iv-menu:backdrop {
+  background-color: #1f2636;
+}
+
+menu.iv-menu menuitem, .iv-menu menuitem {
+  color: #eef2fa;
+  min-width: 200px;
+}
+
+menu.iv-menu menuitem:hover, menu.iv-menu menuitem:backdrop:hover, .iv-menu menuitem:hover, .iv-menu menuitem:backdrop:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  color: #eef2fa;
+}
+
+menu.iv-menu menuitem:active, .iv-menu menuitem:active {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+menu.iv-menu menuitem:disabled, menu.iv-menu menuitem:disabled:backdrop, .iv-menu menuitem:disabled, .iv-menu menuitem:disabled:backdrop {
+  color: #6b7486;
+}
+
+menu.iv-menu menuitem:backdrop, .iv-menu menuitem:backdrop {
+  color: #eef2fa;
+}
+
+menu.iv-menu menuitem label, .iv-menu menuitem label {
+  color: inherit;
+}
+
+menu.iv-menu menuitem .iv-glyph, .iv-menu menuitem .iv-glyph {
+  color: inherit;
+}
+
+menu.iv-menu menuitem .iv-accel, .iv-menu menuitem .iv-accel {
+  color: #a4adbf;
+}
+
+menu.iv-menu menuitem:disabled .iv-accel, .iv-menu menuitem:disabled .iv-accel {
+  color: #6b7486;
+}
+
+menu.iv-menu separator, .iv-menu separator {
+  background-color: #2c3446;
+}
+
+window.iv-window .iv-panel-section .iv-section-glyph {
+  color: #a4adbf;
+  margin-right: 2px;
+}
+
+window.iv-window button.iv-accent-button {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-height: 32px;
+  padding: 0 12px;
+  background-color: #3f74f2;
+  color: white;
+  font-weight: 600;
+}
+
+window.iv-window button.iv-accent-button:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-accent-button:active, window.iv-window button.iv-accent-button.iv-menu-open, window.iv-window button.iv-accent-button.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-accent-button:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-accent-button:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-accent-button:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-accent-button label {
+  color: inherit;
+}
+
+window.iv-window button.iv-accent-button:hover {
+  background-color: #5785f4;
+}
+
+window.iv-window button.iv-accent-button:active {
+  background-color: #2763f0;
+}
+
+window.iv-window button.iv-accent-button:disabled {
+  background-color: rgba(63, 116, 242, 0.35);
+  color: rgba(255, 255, 255, 0.55);
+}
+
+window.iv-window button.iv-accent-button .iv-glyph {
+  color: inherit;
+}
+
+window.iv-window .iv-crop-actions {
+  margin-top: 12px;
+}
+
+window.iv-window .iv-crop-actions button.iv-outline-button {
+  min-height: 32px;
+}
+
+window.iv-window flowbox.iv-aspect-chips button.iv-chip {
+  min-width: 42px;
+  padding: 0 8px;
+}
+
+window.iv-window flowbox.iv-aspect-chips button.iv-chip:checked, window.iv-window flowbox.iv-aspect-chips button.iv-chip:checked:hover {
+  background-image: none;
+  background-color: rgba(91, 143, 249, 0.22);
+  border-color: #5b8ff9;
+  color: white;
+  font-weight: 600;
+}
+
+window.iv-window .iv-dial-card {
+  padding: 4px 2px 2px 2px;
+  border-radius: 10px;
+  background-color: rgba(11, 15, 24, 0.55);
+  border: 1px solid rgba(44, 52, 70, 0.7);
+}
+
+window.iv-window .iv-dial {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-crop-tile {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-height: 58px;
+  padding: 6px 0 4px 0;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+window.iv-window button.iv-crop-tile:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-crop-tile:active, window.iv-window button.iv-crop-tile.iv-menu-open, window.iv-window button.iv-crop-tile.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-crop-tile:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-crop-tile:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-crop-tile:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-crop-tile label {
+  color: inherit;
+}
+
+window.iv-window button.iv-crop-tile:hover {
+  background-color: rgba(255, 255, 255, 0.11);
+}
+
+window.iv-window button.iv-crop-tile:active {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+
+window.iv-window button.iv-crop-tile .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-crop-tile .iv-crop-tile-label {
+  font-size: 7.5pt;
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-crop-tile:hover .iv-crop-tile-label {
+  color: #eef2fa;
+}
+
+window.iv-window .iv-crop-size {
+  font-size: 10.5pt;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+  margin-top: 2px;
+}
+
+window.iv-window .iv-hist-head {
+  margin-top: 8px;
+}
+
+window.iv-window .iv-hist-title {
+  font-size: 7.5pt;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: #a4adbf;
+}
+
+window.iv-window .iv-histogram {
+  margin-bottom: 2px;
+}
+
+window.iv-window scale.iv-slider.iv-tracked trough {
+  min-height: 6px;
+  border-radius: 3px;
+}
+
+window.iv-window scale.iv-slider.iv-tracked highlight {
+  background-image: none;
+  background-color: transparent;
+}
+
+window.iv-window scale.iv-slider.iv-track-tone trough {
+  background-image: linear-gradient(to right, #0e121b, #5d6475 50%, #f4f6fa);
+}
+
+window.iv-window scale.iv-slider.iv-track-saturation trough {
+  background-image: linear-gradient(to right, #6f7480, #9b8f8a 40%, #e8604f 70%, #f0a12a 85%, #f5d02f);
+}
+
+window.iv-window scale.iv-slider.iv-track-warmth trough {
+  background-image: linear-gradient(to right, #3f7ef2, #9fb3d6 45%, #d9cbb0 55%, #f2a53a);
+}
+
+window.iv-window scale.iv-slider.iv-track-tint trough {
+  background-image: linear-gradient(to right, #34b562, #9cc2a8 45%, #c9a8c6 55%, #d64fc8);
+}
+
+window.iv-window scale.iv-slider.iv-tracked:disabled trough {
+  background-image: none;
+}
+
+window.iv-window scale.iv-slider:focus {
+  outline-color: rgba(91, 143, 249, 0.85);
+  outline-width: 2px;
+  outline-style: solid;
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+
+window.iv-window .iv-adjust-switch {
+  margin-top: 2px;
+}
+
+window.iv-window button.iv-adjust-reset-all {
+  margin-top: 16px;
+}
+
+window.iv-window button.iv-auto-enhance {
+  min-height: 40px;
+  border: 1px solid rgba(91, 143, 249, 0.6);
+  background-color: rgba(91, 143, 249, 0.12);
+  font-weight: 600;
+}
+
+window.iv-window button.iv-auto-enhance:hover {
+  background-color: rgba(91, 143, 249, 0.2);
+  border-color: #5b8ff9;
+}
+
+window.iv-window button.iv-auto-enhance.iv-on {
+  background-color: rgba(91, 143, 249, 0.28);
+  border-color: #5b8ff9;
+  color: white;
+}
+
+window.iv-window button.iv-auto-enhance .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-auto-enhance.iv-on .iv-glyph {
+  color: white;
+}
+
+window.iv-window flowbox.iv-style-grid {
+  margin-top: 4px;
+}
+
+window.iv-window flowbox.iv-style-grid flowboxchild {
+  padding: 3px 2px 5px 2px;
+  border-radius: 10px;
+  background-color: transparent;
+  outline-color: rgba(91, 143, 249, 0.85);
+  outline-style: solid;
+  outline-width: 2px;
+  outline-offset: -2px;
+}
+
+window.iv-window flowbox.iv-style-grid flowboxchild:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+window.iv-window flowbox.iv-style-grid flowboxchild:selected {
+  background-color: transparent;
+  color: #eef2fa;
+}
+
+window.iv-window flowbox.iv-style-grid flowboxchild:selected:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+window.iv-window flowbox.iv-style-grid flowboxchild:selected .iv-style-name {
+  color: #5b8ff9;
+  font-weight: 600;
+}
+
+window.iv-window .iv-style-name {
+  font-size: 7.5pt;
+  color: #a4adbf;
+}
+
+window.iv-window .iv-slider-row.iv-style-intensity {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #2c3446;
+}
+
+window.iv-window .iv-draw-tiles {
+  margin: 4px 0 8px 0;
+}
+
+window.iv-window button.iv-draw-tile {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  min-height: 62px;
+  padding: 6px 2px 4px 2px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background-color: rgba(255, 255, 255, 0.04);
+  color: #a4adbf;
+}
+
+window.iv-window button.iv-draw-tile:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-draw-tile:active, window.iv-window button.iv-draw-tile.iv-menu-open, window.iv-window button.iv-draw-tile.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-draw-tile:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-draw-tile:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-draw-tile:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-draw-tile label {
+  color: inherit;
+}
+
+window.iv-window button.iv-draw-tile .iv-draw-tile-label {
+  font-size: 7.5pt;
+}
+
+window.iv-window button.iv-draw-tile:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-draw-tile:checked, window.iv-window button.iv-draw-tile:checked:hover, window.iv-window button.iv-draw-tile:checked:active, window.iv-window button.iv-draw-tile:checked:backdrop {
+  background-color: rgba(91, 143, 249, 0.15);
+  background-image: none;
+  border-color: rgba(91, 143, 249, 0.65);
+  box-shadow: none;
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-draw-tile:checked:hover {
+  background-color: rgba(91, 143, 249, 0.2);
+}
+
+window.iv-window button.iv-draw-tile:checked .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window .iv-draw-preview {
+  margin-top: 4px;
+}
+
+window.iv-window flowbox.iv-brush-swatches button.iv-swatch {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  margin: 0;
+}
+
+window.iv-window .iv-brush-caption {
+  font-size: 7.5pt;
+  color: #a4adbf;
+}
+
+window.iv-window .iv-brush-tips {
+  margin-top: 4px;
+}
+
+window.iv-window .iv-brush-tip {
+  color: #a4adbf;
+  font-size: 9pt;
+}
+
+window.iv-window button.iv-panel-button.iv-accent-button {
+  background-color: #3f74f2;
+  color: white;
+  font-weight: 600;
+}
+
+window.iv-window button.iv-panel-button.iv-accent-button .iv-glyph {
+  color: white;
+}
+
+window.iv-window button.iv-panel-button.iv-accent-button:hover {
+  background-color: #5785f4;
+}
+
+window.iv-window button.iv-panel-button.iv-accent-button:active {
+  background-color: #2763f0;
+}
+
+window.iv-window button.iv-panel-button.iv-accent-button:disabled {
+  background-color: rgba(255, 255, 255, 0.04);
+  color: #6b7486;
+}
+
+window.iv-window button.iv-panel-button.iv-accent-button:disabled .iv-glyph {
+  color: #6b7486;
+}
+
+window.iv-window flowbox.iv-brush-chips button.iv-chip:checked, window.iv-window flowbox.iv-brush-chips button.iv-chip:checked:hover, window.iv-window flowbox.iv-brush-chips button.iv-chip:checked:active, window.iv-window flowbox.iv-brush-chips button.iv-chip:checked:backdrop {
+  background-color: rgba(91, 143, 249, 0.2);
+  background-image: none;
+  border-color: #5b8ff9;
+  box-shadow: none;
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-bg-card {
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  color: #eef2fa;
+  outline-color: rgba(91, 143, 249, 0.8);
+  margin-top: 4px;
+  padding: 8px 10px 8px 8px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+window.iv-window button.iv-bg-card:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-bg-card:active, window.iv-window button.iv-bg-card.iv-menu-open, window.iv-window button.iv-bg-card.iv-pressed {
+  background-color: rgba(255, 255, 255, 0.12);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.iv-window button.iv-bg-card:disabled {
+  color: #6b7486;
+  background-color: transparent;
+}
+
+window.iv-window button.iv-bg-card:backdrop {
+  color: #eef2fa;
+}
+
+window.iv-window button.iv-bg-card:backdrop:disabled {
+  color: #6b7486;
+}
+
+window.iv-window button.iv-bg-card label {
+  color: inherit;
+}
+
+window.iv-window button.iv-bg-card:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+window.iv-window button.iv-bg-card.iv-selected {
+  border-color: #5b8ff9;
+  background-color: rgba(91, 143, 249, 0.14);
+}
+
+window.iv-window button.iv-bg-card.iv-selected .iv-glyph {
+  color: #5b8ff9;
+}
+
+window.iv-window button.iv-bg-card.iv-unavailable .iv-bg-card-title, window.iv-window button.iv-bg-card.iv-unavailable .iv-bg-card-text {
+  color: #6b7486;
+}
+
+window.iv-window .iv-bg-card-title {
+  font-weight: 600;
+  font-size: 9pt;
+}
+
+window.iv-window .iv-bg-card-text {
+  color: #a4adbf;
+  font-size: 7.5pt;
 }
 
 window.likeos-launcher {

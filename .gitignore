@@ -154,6 +154,12 @@
 !/ports/xorg/gtk3/likeos-explorer-1.0/
 /ports/xorg/gtk3/likeos-explorer-1.0/.likeos-build/
 /ports/xorg/gtk3/likeos-explorer-1.0/.likeos-host/
+!/ports/xorg/gtk3/likeos-imageviewer-1.0/
+/ports/xorg/gtk3/likeos-imageviewer-1.0/.likeos-build/
+/ports/xorg/gtk3/likeos-imageviewer-1.0/.likeos-host/
+# The build driver's header-mtime snapshot (ports/xorg/build.sh), in every
+# in-tree package.
+/ports/xorg/gtk3/likeos-*/.likeos-hdr-snap
 #     The one tarball that is NOT tracked: LLVM (~171 MB), which is over
 #     GitHub's 100 MB hard limit for a single file -- the push is refused, not
 #     warned about.  Its sha256 is in checksums.sha256 like every other one, so

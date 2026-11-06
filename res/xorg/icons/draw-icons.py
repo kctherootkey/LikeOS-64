@@ -2265,19 +2265,6 @@ def a_text_editor(cv):
 	cv.add('</g>')
 
 
-def a_code_editor(cv):
-	tile(cv, '#9a74f0', '#5a37bf')
-	if cv.px == 16:
-		tile_pixels(cv, ['...#..#...', '..#....#..', '.#......#.',
-				 '#........#', '.#......#.', '..#....#..',
-				 '...#..#...'])
-		return
-	sw = cv.pick(None, cv.u(1.5), cv.u(2), 4.4)
-	cv.path('M24 20L13 32L24 44M40 20L51 32L40 44', stroke='#ffffff',
-		sw=sw)
-	cv.path('M35 17L29 47', stroke='#ffffff', sw=sw, op=0.75)
-
-
 def a_mail(cv):
 	tile(cv, '#5cb0ff', '#2265d8')
 	if cv.px == 16:
@@ -2616,7 +2603,6 @@ ICONS = {
 		'utilities-terminal': a_terminal,
 		'accessories-calculator': a_calculator,
 		'accessories-text-editor': a_text_editor,
-		'code-editor': a_code_editor,
 		'internet-mail': a_mail,
 		'multimedia-player': a_media_player,
 		'image-viewer': a_image_viewer,

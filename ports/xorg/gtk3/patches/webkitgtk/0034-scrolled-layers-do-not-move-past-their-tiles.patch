@@ -1,0 +1,561 @@
+Scrolled layers do not move past their tiles.
+
+The grey or white areas over part of the view while a heavy page is
+scrolled (microsoft.com/de-de/windows: under the translucent sticky footer;
+amazon.de product pages: up to the whole view) are the view background,
+shown where the scrolling thread has moved the layers past the tiles the
+main thread has made.  The scrolling tree positions layers on its own;
+tiles are created and recorded only in a rendering update on the main
+thread, so a main thread that is busy for longer than it takes to scroll
+through the cover area leaves part of the view without tiles.
+
+At every frame of a rendering update or of the scrolling thread the
+compositor now checks, before it paints, whether every tiled layer has
+painted tiles under each pixel it draws at the scrolling tree's positions.
+If one has not, all layers are placed part of the way from the positions
+the main thread last made tiles for towards the scrolling tree's ones:
+the largest step, in whole device pixels, at which every layer is covered
+(found by bisection).  Layers that are not covered even at the main
+thread's positions (still loading, memory pressure) do not hold anything
+back.  The scroll position itself is untouched; the layers catch up as
+soon as the tiles arrive.
+
+This trades the untiled area for the page standing still until the tiles
+are there.  It is a stopgap: the cause is a main thread too slow for the
+scroll, see tmp/PLAN.md.
+
+Copyright (C) 2026 The LikeOS Project
+---
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStore.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStore.cpp
+@@ -98,6 +98,40 @@
+     }
+ }
+ 
++// The tiles of a backing store do not overlap, so they cover the part of the
++// rect the layer reaches when the parts of it they cover add up to all of it.
++// Counted in the scaled pixels the tiles were created in, where neighbouring
++// tiles share their edges exactly -- unscaled, at a fractional scale, their
++// float rects leave hairline gaps between them.
++bool CoordinatedBackingStore::coversRect(const FloatRect& rect) const
++{
++    // The tiles reach as far as the layer's whole pixels do
++    // (CoordinatedPlatformLayer::updateBackingStore()), not into a fraction
++    // of a pixel at its edge.
++    FloatRect layerPart = intersection(rect, FloatRect({ }, FloatSize(IntSize(m_size))));
++    if (layerPart.isEmpty())
++        return true;
++
++    // Every pixel whose center lies in the rect is drawn, so each of them
++    // has to be on a tile; rounding the edges to the nearest pixel boundary
++    // picks exactly those.
++    layerPart.scale(m_scale);
++    IntPoint minCorner(std::round(layerPart.x()), std::round(layerPart.y()));
++    IntPoint maxCorner(std::round(layerPart.maxX()), std::round(layerPart.maxY()));
++    IntRect needed(minCorner, maxCorner - minCorner);
++    if (needed.isEmpty())
++        return true;
++
++    uint64_t covered = 0;
++    for (const auto& tile : m_tiles.values()) {
++        if (!tile.canBePainted())
++            continue;
++        auto tilePart = intersection(tile.scaledRect(), needed);
++        covered += static_cast<uint64_t>(tilePart.width()) * tilePart.height();
++    }
++    return covered >= static_cast<uint64_t>(needed.width()) * needed.height();
++}
++
+ void CoordinatedBackingStore::drawBorder(TextureMapper& textureMapper, const Color& borderColor, float borderWidth, const FloatRect& targetRect, const TransformationMatrix& transform)
+ {
+     ASSERT(!m_size.isZero());
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStore.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStore.h
+@@ -48,6 +48,7 @@
+     void paintToTextureMapper(TextureMapper&, const FloatRect&, const TransformationMatrix&, float) override;
+     void drawBorder(TextureMapper&, const Color&, float borderWidth, const FloatRect&, const TransformationMatrix&) override;
+     void drawRepaintCounter(TextureMapper&, int repaintCount, const Color&, const FloatRect&, const TransformationMatrix&) override;
++    bool coversRect(const FloatRect&) const override;
+ 
+ private:
+     CoordinatedBackingStore() = default;
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.cpp
+@@ -78,6 +78,7 @@
+         WTFBeginSignpost(this, AcquireTexture);
+         if (!m_texture || unscaledTileRect != m_rect) {
+             m_rect = unscaledTileRect;
++            m_scaledRect = update.tileRect;
+             m_texture = BitmapTexturePool::singleton().acquireTexture(update.tileRect.size(), flags);
+         } else if (update.buffer->supportsAlpha() == m_texture->isOpaque())
+             m_texture->reset(update.tileRect.size(), flags);
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreTile.h
+@@ -37,6 +37,9 @@
+     BitmapTexture& texture() const { ASSERT(canBePainted()); return *m_texture; }
+     float scale() const { return m_scale; }
+     const FloatRect& rect() const { return m_rect; }
++    // The tile rect in the backing store's scaled pixels, as the tile was
++    // created for it: the tiles of a backing store share these edges exactly.
++    const IntRect& scaledRect() const { return m_scaledRect; }
+ 
+     struct Update {
+         Ref<CoordinatedTileBuffer> buffer;
+@@ -55,6 +58,7 @@
+     Vector<Update> m_updates;
+     float m_scale { 1. };
+     FloatRect m_rect;
++    IntRect m_scaledRect;
+ };
+ 
+ } // namespace WebCore
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.cpp
+@@ -160,6 +160,7 @@
+ void CoordinatedPlatformLayer::setPosition(FloatPoint&& position)
+ {
+     ASSERT(m_lock.isHeld());
++    m_mainThreadPositions.position = position;
+     m_pendingState.position = WTF::move(position);
+ }
+ 
+@@ -194,6 +195,7 @@
+ void CoordinatedPlatformLayer::setBoundsOrigin(const FloatPoint& origin)
+ {
+     ASSERT(m_lock.isHeld());
++    m_mainThreadPositions.boundsOrigin = origin;
+     m_pendingState.boundsOrigin = origin;
+ }
+ 
+@@ -203,6 +205,12 @@
+     m_pendingState.boundsOriginForScrolling = origin;
+ }
+ 
++void CoordinatedPlatformLayer::setMainThreadPositions(const FloatPoint& position, const FloatPoint& boundsOrigin)
++{
++    ASSERT(m_lock.isHeld());
++    m_mainThreadPositions = { position, boundsOrigin };
++}
++
+ const FloatPoint& CoordinatedPlatformLayer::boundsOrigin() const
+ {
+     ASSERT(m_lock.isHeld());
+@@ -910,6 +918,10 @@
+         notifyCompositionRequired();
+ }
+ 
++// Takes the current position and bounds origin, and with a rendering update
++// the ones the main thread set in it, into the compositor's copies; which of
++// them the frame is composited with is decided once the whole scene has been
++// flushed (CoordinatedSceneState::applyCoveredLayerPositions()).
+ void CoordinatedPlatformLayer::flushPositionChanges(const OptionSet<CompositionReason>& reasons)
+ {
+     ASSERT(!isMainThread());
+@@ -917,19 +929,52 @@
+         return;
+ 
+     Locker locker { m_lock };
+-    if (!m_pendingChanges.containsAny({ Change::Position, Change::BoundsOrigin }))
+-        return;
+-
+-    auto& layer = ensureTarget();
+     if (m_pendingChanges.contains(Change::Position)) {
+-        layer.setPosition(m_position);
++        m_compositorPositions.current.position = m_position;
+         m_pendingChanges.remove(Change::Position);
+     }
+ 
+     if (m_pendingChanges.contains(Change::BoundsOrigin)) {
+-        layer.setBoundsOrigin(m_boundsOrigin);
++        m_compositorPositions.current.boundsOrigin = m_boundsOrigin;
+         m_pendingChanges.remove(Change::BoundsOrigin);
+     }
++
++    // The tiles the compositor has are those of the last rendering update it
++    // composited, created for the positions the main thread set in it.
++    if (reasons.contains(CompositionReason::RenderingUpdate) || !m_compositorPositions.mainThread)
++        m_compositorPositions.mainThread = m_mainThreadPositions;
++}
++
++void CoordinatedPlatformLayer::applyPositions(float fractionOfScrollingTreeLead)
++{
++    ASSERT(!isMainThread());
++    const auto& current = m_compositorPositions.current;
++    auto& layer = ensureTarget();
++    if (fractionOfScrollingTreeLead >= 1 || !m_compositorPositions.mainThread) {
++        layer.setPosition(current.position);
++        layer.setBoundsOrigin(current.boundsOrigin);
++        return;
++    }
++
++    const auto& mainThread = *m_compositorPositions.mainThread;
++    float behind = 1 - std::max(fractionOfScrollingTreeLead, 0.f);
++    auto back = [&](const FloatPoint& from, const FloatPoint& to) {
++        return FloatPoint(from.x() - behind * (from.x() - to.x()), from.y() - behind * (from.y() - to.y()));
++    };
++    layer.setPosition(back(current.position, mainThread.position));
++    layer.setBoundsOrigin(back(current.boundsOrigin, mainThread.boundsOrigin));
++}
++
++float CoordinatedPlatformLayer::scrollingTreeLead() const
++{
++    ASSERT(!isMainThread());
++    if (!m_compositorPositions.mainThread)
++        return 0;
++
++    const auto& current = m_compositorPositions.current;
++    const auto& mainThread = *m_compositorPositions.mainThread;
++    return std::max({ std::abs(current.position.x() - mainThread.position.x()), std::abs(current.position.y() - mainThread.position.y()),
++        std::abs(current.boundsOrigin.x() - mainThread.boundsOrigin.x()), std::abs(current.boundsOrigin.y() - mainThread.boundsOrigin.y()) });
+ }
+ 
+ void CoordinatedPlatformLayer::flushCompositingState(const OptionSet<CompositionReason>& reasons)
+@@ -998,9 +1043,9 @@
+                 if (!m_backingStore)
+                     m_backingStore = CoordinatedBackingStore::create();
+                 layer.setBackingStore(m_backingStore.get());
+-
+-                if (m_animatedBackingStoreClient)
+-                    layer.setAnimatedBackingStoreClient(m_animatedBackingStoreClient.get());
++                // Also when there is none any more: the target must not keep the
++                // client of a transform animation that has ended.
++                layer.setAnimatedBackingStoreClient(m_animatedBackingStoreClient.get());
+             } else {
+                 layer.setBackingStore(nullptr);
+                 layer.setAnimatedBackingStoreClient(nullptr);
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedPlatformLayer.h
+@@ -111,6 +111,7 @@
+     FloatPoint topLeftPositionForScrolling();
+     void setBoundsOrigin(const FloatPoint&);
+     void setBoundsOriginForScrolling(const FloatPoint&);
++    void setMainThreadPositions(const FloatPoint&, const FloatPoint&);
+     const FloatPoint& boundsOrigin() const;
+     void setAnchorPoint(FloatPoint3D&&);
+     const FloatPoint3D& anchorPoint() const;
+@@ -182,6 +183,16 @@
+     void flushPositionChanges(const OptionSet<CompositionReason>&);
+     void flushCompositingState(const OptionSet<CompositionReason>&);
+ 
++    // Gives the target the position and bounds origin a frame is composited
++    // with: at 1 the current ones (the scrolling tree's, where it has set
++    // them), at 0 those the main thread gave the layer in the rendering update
++    // whose tiles the compositor has, and in between as far on from those as
++    // the fraction says.  See CoordinatedSceneState::applyCoveredLayerPositions().
++    void applyPositions(float fractionOfScrollingTreeLead);
++    // How far the current position and bounds origin are from the main
++    // thread's, along the axis they are furthest.
++    float scrollingTreeLead() const;
++
+     bool hasPendingTilesCreation() const { return m_pendingTilesCreation; }
+     bool isCompositionRequiredOrOngoing() const;
+     void requestComposition(CompositionReason);
+@@ -327,6 +338,24 @@
+         std::optional<FloatPoint> boundsOrigin;
+         std::optional<FloatPoint> boundsOriginForScrolling;
+     } m_pendingState WTF_GUARDED_BY_LOCK(m_lock);
++
++    struct Positions {
++        FloatPoint position;
++        FloatPoint boundsOrigin;
++    };
++
++    // Position and bounds origin the main thread's layer flush last computed
++    // the visible rect, that its tiles are created for, with -- whatever the
++    // scrolling tree has set since (setMainThreadPositions()).
++    Positions m_mainThreadPositions WTF_GUARDED_BY_LOCK(m_lock);
++
++    // The compositor's copies of the current positions and of the main
++    // thread's of the rendering update it composited last.  Only used by the
++    // compositor thread.
++    struct {
++        Positions current;
++        std::optional<Positions> mainThread;
++    } m_compositorPositions;
+ };
+ 
+ } // namespace WebCore
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/GraphicsLayerCoordinated.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/GraphicsLayerCoordinated.cpp
+@@ -834,6 +834,7 @@
+     FloatPoint3D adjustedAnchorPoint;
+     FloatSize adjustedSize;
+     computePixelAlignmentIfNeeded(pageScaleFactor, positionRelativeToBase, adjustedPosition, adjustedBoundsOrigin, adjustedAnchorPoint, adjustedSize);
++    m_appliedPixelAlignmentOffset = m_position - adjustedPosition;
+ 
+     m_platformLayer->setPosition(WTF::move(adjustedPosition));
+     m_platformLayer->setBoundsOrigin(WTF::move(adjustedBoundsOrigin));
+@@ -1033,6 +1034,13 @@
+     computeLayerTransformIfNeeded(affectedByTransformAnimation);
+     updateVisibleRect(commitState.visibleRect);
+ 
++    // The position and bounds origin the visible rect, and so the tiles, are
++    // for, aligned as updateGeometry() aligns them.  Not always those given to
++    // the platform layer above: a position the scrolling tree synced here
++    // (syncPosition(), syncBoundsOrigin()) is set there by the scrolling tree,
++    // not by this flush.
++    m_platformLayer->setMainThreadPositions(m_position - m_appliedPixelAlignmentOffset, m_boundsOrigin - m_appliedPixelAlignmentOffset);
++
+ #if ENABLE(SCROLLING_THREAD)
+     if (m_pendingChanges.contains(Change::ScrollingNode))
+         m_platformLayer->setScrollingNodeID(m_scrollingNodeID);
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/GraphicsLayerCoordinated.h
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/GraphicsLayerCoordinated.h
+@@ -200,6 +200,9 @@
+     bool m_hasDescendantsWithPendingTilesCreation { false };
+     bool m_hasDescendantsWithRunningTransformAnimations { false };
+     FloatSize m_pixelAlignmentOffset;
++    // What updateGeometry() last moved the platform layer's position and
++    // bounds origin by to align it, if anything.
++    FloatSize m_appliedPixelAlignmentOffset;
+     std::optional<Damage> m_dirtyRegion;
+     std::optional<Damage> m_contentsDirtyRegion;
+     FloatRect m_visibleRect;
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperBackingStore.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperBackingStore.h
+@@ -34,6 +34,10 @@
+     void paintToTextureMapper(TextureMapper&, const FloatRect&, const TransformationMatrix&, float) override = 0;
+     virtual void drawRepaintCounter(TextureMapper&, int, const Color&, const FloatRect&, const TransformationMatrix&) { }
+ 
++    // Whether what is painted covers the given rect (layer coordinates) of
++    // the layer, as far as the layer reaches.
++    virtual bool coversRect(const FloatRect&) const { return true; }
++
+ protected:
+     WEBCORE_EXPORT static bool allTileEdgesExposed(const FloatRect& totalRect, const FloatRect& tileRect);
+ };
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.cpp
+@@ -24,6 +24,7 @@
+ #include "BitmapTexturePool.h"
+ #include "ClipPath.h"
+ #include "FloatQuad.h"
++#include "LayoutUnit.h"
+ #include "Region.h"
+ #include "TextureMapper.h"
+ #include "TextureMapperLayer3DRenderingContext.h"
+@@ -361,6 +362,68 @@
+     textureMapper.setDepthRange(data.zNear, data.zFar);
+ }
+ 
++// Collects the layers that draw from a backing store whose tiles do not cover
++// all of what the surface rect shows of them, with the layer state as it is
++// now.  What a layer shows is found the way the layer flush finds the rect its
++// tiles are created for: the surface rect projected onto the layer's plane, its
++// ancestors' clips not taken into account.  So with the positions the tiles
++// were created for a layer is covered, and with positions that take it past
++// them -- the scrolling tree's, further on than the main thread has got -- not.
++void TextureMapperLayer::collectLayersWithUncoveredBackingStore(const FloatRect& surfaceRect, Vector<const TextureMapperLayer*>& layers) const
++{
++    collectLayersWithUncoveredBackingStoreRecursive(surfaceRect, { }, layers);
++}
++
++void TextureMapperLayer::collectLayersWithUncoveredBackingStoreRecursive(const FloatRect& surfaceRect, const TransformationMatrix& parentTransform, Vector<const TextureMapperLayer*>& layers) const
++{
++    // Neither the layer nor its descendants are painted then (paintRecursive()).
++    if (!isVisible())
++        return;
++
++    // As computeTransformsRecursive() computes combined and combinedForChildren.
++    const float originX = m_state.anchorPoint.x() * m_state.size.width();
++    const float originY = m_state.anchorPoint.y() * m_state.size.height();
++    TransformationMatrix combined = parentTransform;
++    combined
++        .translate3d(originX + (m_state.pos.x() - m_state.boundsOrigin.x()), originY + (m_state.pos.y() - m_state.boundsOrigin.y()), m_state.anchorPoint.z())
++        .multiply(m_layerTransforms.localTransform);
++    TransformationMatrix combinedForChildren = combined;
++    combined.translate3d(-originX, -originY, -m_state.anchorPoint.z());
++    if (!m_state.preserves3D)
++        combinedForChildren.flatten();
++    combinedForChildren.multiply(m_state.childrenTransform);
++    combinedForChildren.translate3d(-originX, -originY, -m_state.anchorPoint.z());
++
++    // A layer is given a backing store only while it draws content, which the
++    // coordinated layers do not pass on as drawsContent.
++    // As paintSelf() draws it: not with its back face turned and hidden.
++    bool showsBackingStore = m_backingStore && m_state.contentsVisible && m_state.visible;
++#if USE(COORDINATED_GRAPHICS)
++    // Tiles of a layer under a transform animation are created for where the
++    // animation takes it, not for where it is.
++    if (m_animatedBackingStoreClient)
++        showsBackingStore = false;
++#endif
++    if (showsBackingStore) {
++        if (auto inverse = combined.inverse()) {
++            FloatRect visibleRect = inverse->clampedBoundsOfProjectedQuad(FloatQuad(surfaceRect));
++            if (visibleRect.width() >= LayoutUnit::nearlyMax() || visibleRect.width() <= LayoutUnit::nearlyMin()) {
++                visibleRect.setX(0);
++                visibleRect.setWidth(m_state.size.width());
++            }
++            if (visibleRect.height() >= LayoutUnit::nearlyMax() || visibleRect.height() <= LayoutUnit::nearlyMin()) {
++                visibleRect.setY(0);
++                visibleRect.setHeight(m_state.size.height());
++            }
++            if (!m_backingStore->coversRect(visibleRect))
++                layers.append(this);
++        }
++    }
++
++    for (auto* child : m_children)
++        child->collectLayersWithUncoveredBackingStoreRecursive(surfaceRect, combinedForChildren, layers);
++}
++
+ void TextureMapperLayer::paint(TextureMapper& textureMapper)
+ {
+ #if !ENABLE(DAMAGE_TRACKING)
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperLayer.h
+@@ -114,6 +114,7 @@
+     WEBCORE_EXPORT bool descendantsOrSelfHaveRunningAnimations() const;
+ 
+     WEBCORE_EXPORT void prepareForPainting(TextureMapper&);
++    WEBCORE_EXPORT void collectLayersWithUncoveredBackingStore(const FloatRect&, Vector<const TextureMapperLayer*>&) const;
+     WEBCORE_EXPORT void paint(TextureMapper&);
+ 
+     void addChild(TextureMapperLayer*);
+@@ -152,6 +153,7 @@
+ 
+     struct ComputeTransformData;
+     void computeTransformsRecursive(ComputeTransformData&);
++    void collectLayersWithUncoveredBackingStoreRecursive(const FloatRect&, const TransformationMatrix&, Vector<const TextureMapperLayer*>&) const;
+ 
+     TransformationMatrix replicaTransform();
+     void removeFromParent();
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/CoordinatedSceneState.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/CoordinatedSceneState.cpp
+@@ -28,6 +28,8 @@
+ 
+ #if USE(COORDINATED_GRAPHICS)
+ #include <WebCore/CoordinatedPlatformLayer.h>
++#include <WebCore/FloatRect.h>
++#include <WebCore/TextureMapperLayer.h>
+ #include <wtf/MainThread.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+@@ -128,6 +130,88 @@
+         layer->flushCompositingState(reasons);
+ }
+ 
++// Chooses the layer positions the frame is composited with, so that it never
++// shows a part of a layer its tiles do not cover.  The scrolling tree moves the
++// layers on its own, the main thread creates the tiles; when the scrolling tree
++// gets further than the tiles reach -- the main thread busy, the scroll fast --
++// the current positions would show the background in place of the page until a
++// rendering update brought the tiles.  The frame is then composited as far on
++// from the positions the main thread created the tiles for, towards the current
++// ones, as the tiles reach: the page stops where its tiles end, as it would if
++// the main thread scrolled it, and moves on as soon as tiles get there.  All
++// layers are moved by the same fraction of the scrolling tree's lead, so fixed
++// and sticky layers stay in place with the content.  A layer whose tiles do not
++// cover it at the main thread's positions either -- tiles still to be created,
++// a viewport being resized -- is left out of the comparison: holding the page
++// back cannot help it.
++void CoordinatedSceneState::applyCoveredLayerPositions(const FloatRect& surfaceRect, float deviceScaleFactor)
++{
++    ASSERT(!isMainRunLoop());
++    // The layers flushCompositingState() took, not a set committed since.
++    auto& layers = m_committedLayers;
++    auto& rootTarget = m_rootLayer->ensureTarget();
++    auto apply = [&](float fraction) {
++        m_rootLayer->applyPositions(fraction);
++        for (auto& layer : layers)
++            layer->applyPositions(fraction);
++    };
++
++    apply(1);
++    float lead = m_rootLayer->scrollingTreeLead();
++    for (auto& layer : layers)
++        lead = std::max(lead, layer->scrollingTreeLead());
++    if (!lead)
++        return;
++
++    Vector<const TextureMapperLayer*> uncoveredAtCurrentPositions;
++    rootTarget.collectLayersWithUncoveredBackingStore(surfaceRect, uncoveredAtCurrentPositions);
++    if (uncoveredAtCurrentPositions.isEmpty())
++        return;
++
++    apply(0);
++    Vector<const TextureMapperLayer*> uncoveredAtMainThreadPositions;
++    rootTarget.collectLayersWithUncoveredBackingStore(surfaceRect, uncoveredAtMainThreadPositions);
++    auto noneUncoveredButThoseAtMainThreadPositions = [&](const Vector<const TextureMapperLayer*>& uncovered) {
++        return std::ranges::all_of(uncovered, [&](auto* layer) {
++            return uncoveredAtMainThreadPositions.contains(layer);
++        });
++    };
++    if (noneUncoveredButThoseAtMainThreadPositions(uncoveredAtCurrentPositions)) {
++        apply(1);
++        return;
++    }
++
++    // On from the main thread's positions by the most whole device pixels of
++    // the largest lead that the tiles cover.  The largest lead is that of the
++    // content of the node being scrolled, so that content is held where its
++    // tiles end, the same from frame to frame as long as the tiles are, however
++    // far the scrolling tree gets meanwhile; fixed and sticky layers, moved on
++    // by the same fraction of their own lead, stay where they are relative to
++    // it.  (Whole pixels at a page scale of 1: the lead is in the layers' units.)
++    float leadInDevicePixels = lead * deviceScaleFactor;
++    auto fractionForPixelsOn = [&](unsigned pixels) {
++        return std::min(1.f, pixels / leadInDevicePixels);
++    };
++    auto covered = [&](unsigned pixels) {
++        apply(fractionForPixelsOn(pixels));
++        Vector<const TextureMapperLayer*> uncovered;
++        rootTarget.collectLayersWithUncoveredBackingStore(surfaceRect, uncovered);
++        return noneUncoveredButThoseAtMainThreadPositions(uncovered);
++    };
++    // Covered at 0 pixels on (the main thread's positions), not at the whole
++    // lead (the current ones, tested above).
++    unsigned coveredPixels = 0;
++    unsigned notCoveredPixels = std::ceil(leadInDevicePixels);
++    while (notCoveredPixels - coveredPixels > 1) {
++        unsigned pixels = coveredPixels + (notCoveredPixels - coveredPixels) / 2;
++        if (covered(pixels))
++            coveredPixels = pixels;
++        else
++            notCoveredPixels = pixels;
++    }
++    apply(fractionForPixelsOn(coveredPixels));
++}
++
+ const HashSet<Ref<CoordinatedPlatformLayer>>& CoordinatedSceneState::committedLayers()
+ {
+     ASSERT(!isMainRunLoop());
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/CoordinatedSceneState.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/CoordinatedSceneState.h
+@@ -34,6 +34,7 @@
+ 
+ namespace WebCore {
+ class CoordinatedPlatformLayer;
++class FloatRect;
+ }
+ 
+ namespace WebKit {
+@@ -56,6 +57,7 @@
+     bool flush();
+     void flushPendingState();
+     void flushCompositingState(const OptionSet<WebCore::CompositionReason>&);
++    void applyCoveredLayerPositions(const WebCore::FloatRect&, float deviceScaleFactor);
+     void invalidate();
+ 
+     const HashSet<Ref<WebCore::CoordinatedPlatformLayer>>& committedLayers();
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -270,6 +270,17 @@
+ 
+     bool sceneHasRunningAnimations = currentRootLayer.applyAnimationsRecursively(MonotonicTime::now());
+ 
++    // The positions the scrolling tree and the main thread have set are known
++    // to the scene now, the layer transforms of this frame too.
++    if (reasons.containsAny({ CompositionReason::RenderingUpdate, CompositionReason::AsyncScrolling })) {
++        float deviceScaleFactor;
++        {
++            Locker locker { m_attributes.lock };
++            deviceScaleFactor = m_attributes.deviceScaleFactor;
++        }
++        m_sceneState->applyCoveredLayerPositions(clipRect, deviceScaleFactor);
++    }
++
+     m_textureMapper->beginPainting(m_flipY ? TextureMapper::FlipY::Yes : TextureMapper::FlipY::No);
+     m_textureMapper->beginClip(TransformationMatrix(), FloatRoundedRect(clipRect));
+ 

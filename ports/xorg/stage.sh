@@ -109,7 +109,7 @@ chmod 4755 "$DEST/usr/bin/Xorg"
 # Listed by name rather than copied wholesale, because the sysroot's bin/ also
 # holds build tooling (ucs2any, bdftruncate) and host-side diagnostics.
 for b in startx xinit xauth xsetroot xterm uxterm resize ctwm \
-	 xset xrandr xvinfo xclock xload xcalc xnedit xnc twm \
+	 xset xrandr xvinfo xclock twm \
 	 modetest vbltest proptest; do
 	[ -f "$SYSROOT/usr/bin/$b" ] && cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 done
@@ -209,9 +209,9 @@ done
 	cp -a "$SYSROOT/usr/share/X11/locale" "$DEST/usr/share/X11/locale"
 
 # The classic X bitmaps.  Xmu's String-to-Bitmap converter resolves a bare
-# name -- xcalc's icon "calculator", window-manager icons -- in
+# name -- an application's icon, window-manager icons -- in
 # /usr/include/X11/bitmaps when no bitmapFilePath is set; xbitmaps installs
-# them there.  Without them xcalc warned it could not convert "calculator".
+# them there.
 if [ -d "$SYSROOT/usr/include/X11/bitmaps" ]; then
 	mkdir -p "$DEST/usr/include/X11"
 	cp -a "$SYSROOT/usr/include/X11/bitmaps" "$DEST/usr/include/X11/"
@@ -222,7 +222,7 @@ fi
 #
 # Its configuration is NOT optional.  Without /etc/fonts/fonts.conf, fontconfig
 # has no font directories to search and every client that renders text through
-# Xft -- Motif widgets, xnedit -- comes up with no usable font.  Nothing reports
+# Xft -- ctwm, xterm -- comes up with no usable font.  Nothing reports
 # an error: fontconfig simply matches nothing.
 #
 # conf.d holds the ordering and substitution rules (which family stands in for

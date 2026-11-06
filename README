@@ -453,7 +453,6 @@ X Window System and toolkits:
       xkeyboard-config 2.47
     FreeType 2.13.3, fontconfig   font rendering and pixel compositing
       2.15.0, pixman 0.46.4
-    Motif 2.3.8                   toolkit for XNEdit
     GTK 3.24.52                   main toolkit; GTK 2.24.33 is also built for
                                   HexChat
     GLib 2.88.3                   GObject, GIO; glib-networking 2.80.1
@@ -483,9 +482,8 @@ Applications:
     Media Player 1.0        LikeOS music and video player on GStreamer
     luakit 2.4.0            web browser
     xterm 410               UTF-8, 256 colours
-    XNEdit 1.6.3            Motif text editor
-    X clients               xcalc, xclock, xload, xsetroot, xrandr, xset,
-                            xauth, xvinfo, twm
+    X clients               xclock, xsetroot, xrandr, xset, xauth, xvinfo,
+                            twm
 
 Web browser and multimedia
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -910,8 +908,8 @@ The desktop: X starts with the ctwm window manager, the PCManFM desktop
 (wallpaper and icons) and the LikeOS taskbar.
 
 - Desktop icons: Files (PCManFM), Terminal (xfce4-terminal), Xterm, Luakit Web
-  Browser, Mail (Claws Mail), Text Editor (Mousepad), XNEdit, Calculator
-  (galculator), X Calculator, Hexchat IRC Client and Media Player.
+  Browser, Mail (Claws Mail), Text Editor (Mousepad), Calculator (galculator),
+  Hexchat IRC Client and Media Player.
 - Taskbar: the load and memory monitor on the left; the start button and one
   button per open window in the middle; the four workspace buttons, the volume
   control and the clock with the date on the right.

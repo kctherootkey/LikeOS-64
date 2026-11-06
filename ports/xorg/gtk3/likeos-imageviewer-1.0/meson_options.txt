@@ -1,0 +1,4 @@
+# Copyright (C) 2026 The LikeOS Project
+
+option('tests', type : 'boolean', value : false,
+  description : 'Build the processing library tests (meson test)')

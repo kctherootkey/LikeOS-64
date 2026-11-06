@@ -7,8 +7,8 @@
 // Pages are a title row (title and status at the left, commands at the
 // right), a segmented switch where a page has several views, tile cards
 // with cover art and plain lists with rounded selected rows.  On the "now
-// playing" stage -- a video, full screen, the mini player -- the window
-// turns black and the strips above and below the picture are dark too.
+// playing" stage -- a video, full screen -- the window turns black and the
+// strips above and below the picture are dark too.
 //
 // The program draws some things itself and takes their colours from here
 // through style classes: the list rows (treeview.mp-list with .mp-row-*),
@@ -544,7 +544,7 @@ window.mp-window {
   }
   .mp-top-title { color: $mp-strip-text; font-size: $type-body-large; font-weight: $weight-strong; }
 
-  // ---- immersive: video, full screen, mini player ------------------------------
+  // ---- immersive: video, full screen ------------------------------------------
 
   &.mp-immersive, &.mp-fullscreen {
     background-color: black;
@@ -557,17 +557,6 @@ window.mp-window {
     .mp-art-sub, .mp-art-status { color: $mp-strip-secondary; }
     .mp-bar { border: 1px solid $shell-border; }
     .mp-top-bar { border: 1px solid $shell-border; }
-  }
-
-  // The mini player: the strip lies on the blurred cover.
-  &.mp-bar-floating {
-    .mp-content { border: none; }
-    .mp-art { padding-bottom: 96px; }
-  }
-
-  &.mp-mini {
-    .mp-bar { padding: 6px 8px; margin: 6px; }
-    .mp-art { padding: 10px; }
   }
 }
 

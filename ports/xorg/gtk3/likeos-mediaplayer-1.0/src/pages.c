@@ -2292,8 +2292,6 @@ const char *mp_pages_current(MpApp *app)
 void mp_pages_focus_search(MpApp *app)
 {
 	Pages *pg = pages_of(app);
-	if (app->mini)
-		mp_app_set_mini(app, FALSE);
 	if (app->fullscreen)
 		mp_app_set_fullscreen(app, FALSE);
 	set_compact(pg, FALSE);

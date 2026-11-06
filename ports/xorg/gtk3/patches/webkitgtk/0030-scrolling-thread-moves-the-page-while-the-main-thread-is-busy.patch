@@ -1,0 +1,105 @@
+The scrolling thread moves the page while the main thread is busy.
+
+With a wheel event handled on the scrolling thread (patch 0029 makes that
+the case for pages whose wheel listeners are passive), the scroll position
+changes there, but the layers move only when one of two things happens: the
+main thread runs a rendering update, or the scrolling thread decides that
+the main thread is too slow and moves them itself
+(ThreadedScrollingTree::displayDidRefreshOnScrollingThread()).  The second
+needs two things the main thread provides, and a busy main thread provides
+neither:
+
+  - It starts only once a rendering update has been asked for
+    (m_renderingUpdateWasScheduled).  After a scroll the main thread asks
+    when it gets to the task the scrolling thread posts for it; a script
+    that holds it for a second holds that request for a second.  Animated
+    scrolls set the flag from the scrolling thread already
+    (ScrollingTreeCoordinated::hasNodeWithAnimatedScrollChanged); plain
+    ones -- luakit turns smooth scrolling off by default -- did not.  The
+    scrolling thread now sets it when it scrolls.
+
+  - It runs on display refreshes.  The UI process sends those to the web
+    process's event dispatcher (off its main thread) while the user scrolls
+    with the wheel, but only to a process that also has a display refresh
+    observer registered, which the main thread registers -- for its own
+    rendering updates, or when an animated scroll starts.  A page that was
+    idle when the wheel started had none, and the display link may not even
+    have been running.  A process that asks for full-speed updates now gets
+    them with no observer, and the request starts the display link.
+
+Measured with this engine's upstream build on a desktop host, threaded
+scrolling on, wheel events handled on the scrolling thread, microsoft.com,
+a 1.5 s script on the main thread: with a requestAnimationFrame loop running
+on the page the view kept scrolling through the script; without one it
+stopped for 1.48 s (smooth scrolling off) and 1.49 s (on).
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebCore/page/scrolling/ThreadedScrollingTree.cpp
++++ b/Source/WebCore/page/scrolling/ThreadedScrollingTree.cpp
+@@ -266,6 +266,14 @@ void ThreadedScrollingTree::scrollingTre
+ 
+     addPendingScrollUpdate(WTF::move(scrollUpdate));
+ 
++    // The scroll needs a rendering update, and the main thread asks for one
++    // only once it gets to the dispatch below -- not while it is busy.  Count
++    // it as asked for now, so that the next display refresh starts the short
++    // wait after which this thread commits the layer positions itself
++    // (displayDidRefreshOnScrollingThread()), and the page moves whatever the
++    // main thread is doing.
++    m_renderingUpdateWasScheduled = true;
++
+     auto deferrer = ScrollingTreeWheelEventTestMonitorCompletionDeferrer { *this, node.scrollingNodeID(), WheelEventTestMonitor::DeferReason::ScrollingThreadSyncNeeded };
+     RunLoop::mainSingleton().dispatch([protectedThis = Ref { *this }, deferrer = WTF::move(deferrer)] {
+         if (RefPtr scrollingCoordinator = protectedThis->m_scrollingCoordinator)
+--- a/Source/WebKit/UIProcess/DisplayLink.cpp
++++ b/Source/WebKit/UIProcess/DisplayLink.cpp
+@@ -135,13 +135,26 @@ bool DisplayLink::removeInfoForClientIfU
+ 
+ void DisplayLink::incrementFullSpeedRequestClientCount(Client& client)
+ {
+-    Locker locker { m_clientsLock };
++    ASSERT(RunLoop::isMain());
+ 
+-    auto& clientInfo = m_clients.ensure(client, [] {
+-        return ClientInfo { };
+-    }).iterator->value;
++    {
++        Locker locker { m_clientsLock };
+ 
+-    ++clientInfo.fullSpeedUpdatesClientCount;
++        auto& clientInfo = m_clients.ensure(client, [] {
++            return ClientInfo { };
++        }).iterator->value;
++
++        ++clientInfo.fullSpeedUpdatesClientCount;
++    }
++
++    // A client asks for full-speed updates while the user scrolls with the
++    // wheel: they drive its scrolling thread, which must not depend on the
++    // web process's main thread having an observer registered -- that main
++    // thread may be the one that is busy.
++    if (!platformIsRunning()) {
++        m_currentUpdate = { 0, m_displayNominalFramesPerSecond };
++        platformStart();
++    }
+ }
+ 
+ void DisplayLink::decrementFullSpeedRequestClientCount(Client& client)
+@@ -199,13 +212,15 @@ void DisplayLink::notifyObserversDisplay
+ 
+     bool anyConnectionHadObservers = false;
+     for (auto& [client, clientInfo] : m_clients) {
+-        if (clientInfo.observers.isEmpty())
++        // A client that wants full-speed updates gets them without observers
++        // too: they go to its event dispatcher, off its main thread.
++        if (clientInfo.observers.isEmpty() && !clientInfo.fullSpeedUpdatesClientCount)
+             continue;
+ 
+         anyConnectionHadObservers = true;
+ 
+         auto observersMaxFramesPerSecond = maxFramesPerSecond(clientInfo.observers);
+-        bool anyObserverWantsCallback = m_currentUpdate.relevantForUpdateFrequency(observersMaxFramesPerSecond.value_or(FullSpeedFramesPerSecond));
++        bool anyObserverWantsCallback = !clientInfo.observers.isEmpty() && m_currentUpdate.relevantForUpdateFrequency(observersMaxFramesPerSecond.value_or(FullSpeedFramesPerSecond));
+ 
+         LOG_WITH_STREAM(DisplayLink, stream << "[UI ] DisplayLink " << this << " for display " << m_displayID << " (display fps " << m_displayNominalFramesPerSecond << ") update " << m_currentUpdate << " " << clientInfo.observers.size()
+             << " observers, maxFramesPerSecond " << observersMaxFramesPerSecond << " full speed client count " << clientInfo.fullSpeedUpdatesClientCount << " relevant " << anyObserverWantsCallback);

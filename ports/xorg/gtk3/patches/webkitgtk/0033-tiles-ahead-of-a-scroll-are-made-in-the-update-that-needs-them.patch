@@ -1,0 +1,184 @@
+Tiles ahead of a scroll are made in the update that needs them.
+
+The grey or white areas that cover part of the view while a heavy page is
+scrolled (amazon.de: the lower half of the view, for a moment, after every
+few wheel steps) are what threaded scrolling shows where there are no tiles.
+The scrolling thread moves the layers on its own; tiles are created and
+recorded only by the main thread, in a rendering update.  So what the page
+can be scrolled through without waiting is what the last update covered
+ahead of the viewport -- and createOrDestroyTiles() created only the missing
+tiles at the shortest distance from the viewport's centre in each update:
+the visible ones in one go, then one ring of tile rows per further update,
+each one a complete rendering update that waits for the raster of the one
+before (TilesPending -> notifySubsequentFlushRequired -> a new update).  With
+256-pixel tile rows the cover area ahead grew by 256 pixels per update; any
+scroll faster than that drained it, and the view showed the background
+until enough updates had run.  Wheel scrolling on the main thread never
+showed it because there the layer moves in the same update that creates the
+tiles for its new position.
+
+Upstream made the same diagnosis (306119@main: "It scrolls a page even while
+the main thread is blocked.  If it scrolled to the outside of coverage area
+meanwhile, there were no tiles to paint.") and, for the new Skia compositor
+only, creates every tile of the cover area in the layer flush of the visible
+ones (325723@main, bug 329076).  2.52.6 has the TextureMapper compositor, in
+which a rendering update's frame waits for every tile it carries, so here the
+part of the cover area that matters -- the area ahead of the viewport in the
+direction the content last scrolled -- counts as visible: it is created,
+recorded and painted with the visible tiles, in the same update, and the
+other sides are still filled ring by ring.  The cover area reaches a full
+viewport further that way (one and a half viewports ahead in all), so that
+one update of the main thread covers what the scrolling thread can move
+through before the next one.
+
+The dirty tiles of a layer were also recorded as one picture of the bounding
+box of all of them.  With rows being created a viewport and a half ahead,
+and any animation at the top of the page dirtying a tile there, that box is
+most of the cover area, painted on the main thread at every update for
+tiles that are clean.  They are now recorded in bands, one per run of
+consecutive tile rows with dirty tiles.
+
+Under memory pressure the cover area is the visible rect, as before.
+
+Copyright (C) 2026 The LikeOS Project
+--- a/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.cpp
++++ b/Source/WebCore/platform/graphics/texmap/coordinated/CoordinatedBackingStoreProxy.cpp
+@@ -112,13 +112,23 @@
+         result.add(UpdateResult::TilesPending);
+ 
+     // Update the dirty tiles.
+-    IntRect tileDirtyRectUnion;
+     unsigned dirtyTilesCount = 0;
++#if USE(SKIA)
++    // The dirty tiles are recorded in bands: one recording for each run of
++    // consecutive tile rows that have dirty tiles.  A single recording of the
++    // bounding box of all of them would also paint everything between two
++    // dirty areas far apart -- a banner animating at the top of the visible
++    // rect and the rows being created ahead of a scroll, a viewport below --
++    // on the main thread, at every update, for tiles that are clean.
++    Vector<int> dirtyRows;
++#endif
+     for (const auto& tile : m_tiles.values()) {
+         if (!tile.isDirty())
+             continue;
+ 
+-        tileDirtyRectUnion.unite(tile.dirtyRect);
++#if USE(SKIA)
++        dirtyRows.append(tile.position.y());
++#endif
+         ++dirtyTilesCount;
+     }
+ 
+@@ -127,10 +137,39 @@
+         WTFBeginSignpost(this, UpdateTiles, "dirty tiles: %u", dirtyTilesCount);
+ 
+ #if USE(SKIA)
+-        // Record only once the whole layer.
+-        RefPtr<SkiaRecordingResult> recording;
+-        if (layer.client().paintingEngine().useThreadedRendering()) [[likely]]
+-            recording = layer.record(tileDirtyRectUnion, dirtyTilesCount);
++        struct Band {
++            IntRect recordRect;
++            unsigned tileCount { 0 };
++            RefPtr<SkiaRecordingResult> recording;
++        };
++        Vector<Band> bands;
++        Vector<unsigned> bandOfRow;
++        bool threadedRendering = layer.client().paintingEngine().useThreadedRendering();
++        if (threadedRendering) [[likely]] {
++            std::ranges::sort(dirtyRows);
++            dirtyRows.shrink(std::unique(dirtyRows.begin(), dirtyRows.end()) - dirtyRows.begin());
++            for (size_t i = 0; i < dirtyRows.size(); ++i) {
++                if (!i || dirtyRows[i] != dirtyRows[i - 1] + 1)
++                    bands.append({ });
++                bandOfRow.append(bands.size() - 1);
++            }
++        }
++        auto bandForRow = [&](int row) -> Band& {
++            auto it = std::lower_bound(dirtyRows.begin(), dirtyRows.end(), row);
++            ASSERT(it != dirtyRows.end() && *it == row);
++            return bands[bandOfRow[it - dirtyRows.begin()]];
++        };
++        if (threadedRendering) [[likely]] {
++            for (const auto& tile : m_tiles.values()) {
++                if (!tile.isDirty())
++                    continue;
++                auto& band = bandForRow(tile.position.y());
++                band.recordRect.unite(tile.dirtyRect);
++                ++band.tileCount;
++            }
++            for (auto& band : bands)
++                band.recording = layer.record(band.recordRect, band.tileCount);
++        }
+ #endif
+ 
+         unsigned dirtyTileIndex = 0;
+@@ -142,7 +181,7 @@
+                 tile.rect.x(), tile.rect.y(), tile.rect.width(), tile.rect.height(), tile.dirtyRect.x(), tile.dirtyRect.y(), tile.dirtyRect.width(), tile.dirtyRect.height());
+ 
+ #if USE(SKIA)
+-            auto buffer = recording ? layer.replay(recording, tile.dirtyRect) : layer.paint(tile.dirtyRect);
++            auto buffer = threadedRendering ? layer.replay(bandForRow(tile.position.y()).recording, tile.dirtyRect) : layer.paint(tile.dirtyRect);
+ #else
+             auto buffer = layer.paint(tile.dirtyRect);
+ #endif
+@@ -299,18 +338,34 @@
+ 
+     // Search for the tile position closest to the viewport center that does not yet contain a tile.
+     // Which position is considered the closest depends on the tileDistance function.
++    //
++    // The cover rect beyond the visible rect in the direction the content last
++    // scrolled counts as visible: its tiles are created, recorded and painted in
++    // this update, with the visible ones.  With threaded scrolling the page moves
++    // on without the main thread, and the frame that shows this update's tiles
++    // is composited at the scrolling tree's position by then, further along that
++    // way.  Created one ring per update instead -- one tile row further for each
++    // whole rendering update, each waiting for the raster of the one before --
++    // the tiles ahead fall behind any scroll faster than a tile row per update,
++    // and the scrolling thread shows the background where the page should be.
++    // The other directions are still filled ring by ring in later updates.
++    IntRect immediateRect = m_visibleRect;
++    if (m_lastVerticalScrollDirection > 0)
++        immediateRect.shiftMaxYEdgeTo(std::max(immediateRect.maxY(), m_coverRect.maxY()));
++    else if (m_lastVerticalScrollDirection < 0)
++        immediateRect.shiftYEdgeTo(std::min(immediateRect.y(), m_coverRect.y()));
+     double shortestDistance = std::numeric_limits<double>::infinity();
+     IntPoint visibleCenterPosition = tilePositionForPoint(m_visibleRect.center());
+     auto tileDistance = [&] (const IntPoint& tilePosition) -> double {
+-        if (m_visibleRect.intersects(tileRectForPosition(tilePosition)))
++        if (immediateRect.intersects(tileRectForPosition(tilePosition)))
+             return 0;
+ 
+         return std::max(std::abs(visibleCenterPosition.y() - tilePosition.y()), std::abs(visibleCenterPosition.x() - tilePosition.x()));
+     };
+ 
+-    // Cover areas (in tiles) with minimum distance from the visible rect. If the visible rect is
+-    // not covered already it will be covered first in one go, due to the distance being 0 for tiles
+-    // inside the visible rect.
++    // Cover areas (in tiles) with minimum distance from the visible rect. If the visible rect (and
++    // the area ahead of a scroll) is not covered already it will be covered first in one go, due to
++    // the distance being 0 for tiles inside it.
+     Vector<IntPoint> tilePositionsToCreate;
+     unsigned requiredTileCount = 0;
+     forEachTilePositionInRect(m_coverRect, [&](IntPoint&& position) {
+@@ -474,13 +529,14 @@
+         coverRect.inflateX(m_visibleRect.width() * (m_coverAreaMultiplier - 1) / 2);
+         coverRect.inflateY(m_visibleRect.height() * (m_coverAreaMultiplier - 1) / 2);
+ 
+-        // And as far again in the direction the content last scrolled.  With
+-        // threaded scrolling the page moves on while the main thread, the only
+-        // one that can create tiles, is busy; what it covered ahead of the
+-        // viewport is what can be shown meanwhile.  The tiles there are the
+-        // farthest from the visible rect, so they are created last.
++        // And a viewport more in the direction the content last scrolled: one
++        // and a half viewports ahead in all.  With threaded scrolling the page
++        // moves on while the main thread, the only one that can create tiles,
++        // is busy; what it covered ahead of the viewport is what can be shown
++        // meanwhile, and createOrDestroyTiles() makes all of it in the same
++        // update as the visible tiles.
+         if (m_lastVerticalScrollDirection) {
+-            int ahead = m_visibleRect.height() * (m_coverAreaMultiplier - 1) / 2;
++            int ahead = m_visibleRect.height() * (m_coverAreaMultiplier - 1);
+             if (m_lastVerticalScrollDirection < 0)
+                 coverRect.shiftYEdgeTo(coverRect.y() - ahead);
+             else

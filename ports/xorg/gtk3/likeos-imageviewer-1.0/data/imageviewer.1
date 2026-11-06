@@ -1,0 +1,184 @@
+.\" imageviewer.1 - manual page for LikeOS Image Viewer.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages, so
+.\" the installed copy is res/man/imageviewer.1, rendered from this file with
+.\"   GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+.\"     data/imageviewer.1 | col -bx > res/man/imageviewer.1
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH IMAGEVIEWER 1 "November 2026" "LikeOS" "User Commands"
+.SH NAME
+imageviewer \- view, browse and edit pictures
+.SH SYNOPSIS
+.B imageviewer
+.RB [ \-\-fullscreen ]
+.RB [ \-\-slideshow ]
+.RB [ \-\-edit ]
+.RB [ \-\-sort =\c
+.IR order ]
+.RI [ file | folder ...]
+.br
+.B imageviewer \-\-version
+.SH DESCRIPTION
+.B imageviewer
+is the desktop's picture viewer and editor, the program behind
+.B LikeOS Image Viewer
+in the Programs menu and the one a double-clicked picture in LikeOS Explorer
+opens in.  It shows PNG, JPEG, GIF (animated ones play), WebP, BMP, ICO,
+TIFF, the PNM family, TGA, XPM, XBM and ICNS pictures, turned the way the
+camera's EXIF orientation says, over a dark backdrop with a checkerboard
+behind transparent parts.
+.PP
+One file opens with the rest of its folder to browse, in the order LikeOS
+Explorer lists it: by name, numbers by their value (\(lqIMG 2\(rq before
+\(lqIMG 10\(rq).  Several files make a list of just those, in the order they
+were given.  A folder opens its first picture.  The folder is watched, so
+pictures another program adds, changes or removes appear and disappear by
+themselves.
+.SS The window
+The title row shows the picture's name and its place in the folder
+(\(lq3 of 27\(rq) and the commands: \fBEdit\fR, \fBRotate\fR (to the right;
+with Shift held to the left), \fBDelete\fR (to the Trash), \fBOpen with\fR
+(the other programs that take the picture's type, \(lqChoose another
+app\&...\(rq and \(lqShow in LikeOS Explorer\(rq), and the \(lqmore\(rq menu:
+Save as, Copy, Copy path, Resize picture, Set as desktop wallpaper, Send by
+mail, Rename, Settings, Keyboard shortcuts and About.
+.PP
+A dark strip floats over the bottom of the picture: the filmstrip and
+slideshow switches, the picture's format, size and file size at the left,
+the previous and next picture in the middle, and at the right the info
+panel, fit or actual size, the zoom (as a menu of steps and as a slider)
+and full screen.  The filmstrip is a row of thumbnails of the folder above
+the strip; a click on one shows it.  Thumbnails are shared with the other
+programs through the thumbnail cache in
+.IR ~/.cache/thumbnails .
+.PP
+The info panel shows the file's name (type a new one and press Enter to
+rename the file), when the picture was taken and when the file was last
+changed (the pencil sets the file's date from a calendar; \(lqUse as file
+date\(rq copies the time the camera recorded), the picture's size,
+resolution, depth, colours and format, its folder (a click opens it), and
+what the camera recorded: camera and lens, exposure, aperture,
+sensitivity, focal length, flash, orientation, software, position (in
+degrees and in degrees, minutes and seconds) and colour space.
+.SS Viewing
+The picture fits the window to begin with.  The mouse wheel zooms about the
+pointer (or, with the setting changed, goes through the folder; Ctrl and
+the wheel always zoom), dragging moves a picture larger than the window, a
+double click switches between fit and actual size.  In full screen the
+title row goes and the strips hide themselves after a moment without
+movement.  The slideshow goes through the folder in full screen, fading
+from one picture into the next.
+.PP
+Rotating a JPEG file changes only its orientation tag, so it loses
+nothing, however often it is turned; other files are saved again turned.
+A picture moved to the Trash can be brought back with the \fBUndo\fR of the
+message that says so.
+.SS Editing
+\fBEdit\fR opens the editor in the same window: the tools in a rail at the
+left (\fBCrop\fR, \fBAdjust\fR, \fBStyles\fR, \fBDraw\fR, \fBRetouch\fR and
+\fBBackground\fR), the picture in the middle, the tool's options at the
+right, and a bar above with the zoom, \fBUndo\fR, \fBRedo\fR, \fBRevert\fR
+(back to the unedited picture, after asking), \fBCompare\fR (held down, it
+shows the original), \fBDone\fR and \fBDiscard\fR.  Every change is a step
+that can be undone.  \fBDone\fR saves over the file (where the format can be
+written); its menu also saves a copy or copies the result to the
+clipboard.  Leaving with edits that are not saved asks whether to save
+them.  The original is never touched before one of these.
+.PP
+\fBDraw\fR marks the picture up with a pen, a marker, a calligraphy pen and
+filled rectangles, and has an eraser that takes away whole strokes.  A
+rectangle is dragged out from corner to corner (a square with Shift held),
+for instance to cover a name or a number that should not be seen; a click
+chooses one, dragging moves it, its eight handles resize it, a colour
+recolours it and \fBDelete\fR removes it.  Saved as JPEG with the camera
+data kept, the copy carries no thumbnail of the old pixels.
+.PP
+Edits are worked out on a smaller copy of the picture while they are made,
+and applied to the full picture when it is saved.  A picture with
+transparent parts saved as JPEG asks first whether to save a PNG copy
+instead or to fill them with white.
+.SS Saving
+\fBSave as\fR writes a copy as PNG, JPEG (with its quality), WebP (lossy
+with its quality, or lossless), TIFF or BMP.  JPEG copies keep the
+original's camera data unless that is switched off.  \fBResize picture\fR
+saves a smaller copy, \(lqname (resized)\(rq, by the long side (640, 1280
+or 1920 pixels), to a size of one's own or by a percentage, with an
+estimate of the file's size, or replaces the original after asking.
+Every file is written to a temporary file first and then put in place, so
+a failure never leaves half a picture.
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-fullscreen
+Start in full screen.
+.TP
+.BR \-s ", " \-\-slideshow
+Start a slideshow of the folder.
+.TP
+.BR \-e ", " \-\-edit
+Open the picture in the editor.
+.TP
+.BI \-\-sort= order
+The order of the folder:
+.BR name " (the default), " name\-desc ", " date ", " date\-desc ,
+.BR size ", " size\-desc " or " type .
+.TP
+.B \-\-version
+Print the version and exit.
+.SH KEYS
+.TP
+.BR "Left" ", " "Right" ", " "Page Up" ", " "Page Down"
+The previous and the next picture.
+.TP
+.BR Home ", " End
+The first and the last picture.
+.TP
+.BR + ", " \- ", " 0 ", " 1
+Zoom in, zoom out, fit to the window, actual size.
+.TP
+.BR F11 ", " F
+Full screen.
+.TP
+.BR F5 ", " S
+Slideshow; \fBSpace\fR pauses it (outside a slideshow it shows the next
+picture), \fBEsc\fR ends it.
+.TP
+.BR T ", " I
+The filmstrip, the info panel.
+.TP
+.BR E ", " R ", " Shift+R
+Edit, rotate right, rotate left.
+.TP
+.BR Delete ", " F2
+Move to the Trash, rename.
+.TP
+.BR Ctrl+S ", " Ctrl+C ", " Ctrl+Shift+C ", " Ctrl+O
+Save as, copy the picture, copy its path, open another picture.
+.TP
+.BR Ctrl+Z ", " Ctrl+Y ", " "\e"
+In the editor: undo, redo, and (held) compare with the original.
+.BR C ", " A ", " S ", " D ", " R " and " B
+choose the tools.
+.TP
+.B F1
+The list of keys.
+.SH FILES
+.TP
+.I ~/.config/likeos/imageviewer.ini
+The settings: the backdrop, what the wheel does, the slideshow's pace,
+whether moving to the Trash asks first, the JPEG quality, whether camera
+data is kept, whether the filmstrip and the info panel show at start,
+whether going past the last picture comes back to the first, and the
+window's size; and what the editor's tools keep from one run to the next:
+the colour and width of each of the Draw tool's pens, the rectangles'
+colour, and the sizes of the
+Retouch and Background brushes.
+.TP
+.I ~/.cache/thumbnails/normal
+The shared thumbnail cache the filmstrip reads and fills.
+.TP
+.I /usr/share/applications/likeos-imageviewer.desktop
+The desktop entry, with the picture types the viewer opens.
+.SH SEE ALSO
+.BR likeos-explorer (1),
+.BR mediaplayer (1)
