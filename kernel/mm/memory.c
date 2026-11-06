@@ -6722,11 +6722,14 @@ extern void syscall_entry(void);
 // Global flag indicating SMAP is active (used by copy_from_user/copy_to_user)
 bool g_smap_enabled = false;
 
-// SMAP control: temporarily allow supervisor access to user pages
+// SMAP control: temporarily allow supervisor access to user pages.
+// The "memory" clobbers keep the user accesses between the two: they are
+// ordinary loads and stores, and without them only the call being out of
+// line stops the compiler moving one outside the window (a fault on SMAP).
 void smap_disable(void)
 {
 	if (g_smap_enabled) {
-		__asm__ volatile("stac" ::: "cc");
+		__asm__ volatile("stac" ::: "cc", "memory");
 	}
 }
 
@@ -6734,7 +6737,7 @@ void smap_disable(void)
 void smap_enable(void)
 {
 	if (g_smap_enabled) {
-		__asm__ volatile("clac" ::: "cc");
+		__asm__ volatile("clac" ::: "cc", "memory");
 	}
 }
 

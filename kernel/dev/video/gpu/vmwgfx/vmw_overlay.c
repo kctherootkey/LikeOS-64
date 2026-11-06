@@ -24,16 +24,23 @@
 // it, and the client does not have to notice the mode set to get its video
 // back.
 //
-// Only a display unit that scans out of guest memory (screen objects or
-// screen targets) can name a GMR in the stream registers; the legacy
-// unit would need the frame in the framebuffer BAR, which this driver's
-// buffers never are, so on such a host no stream is offered.
+// Streams are offered on screen targets only.  The legacy unit would need
+// the frame in the framebuffer BAR, which this driver's buffers never are.
+// Screen objects take the same register set, and some hosts show the
+// stream there -- but VMware on a host without 3D for the guest (version 26
+// on a desktop host) accepts every command and never draws it: the window
+// stays black with the sound playing.  Nothing the guest can read tells
+// such a host from one that draws, so on screen objects no stream is
+// offered at all, the X server registers no overlay adaptor and video
+// programs take a path every host shows.  Screen targets (3D on) have shown
+// the stream on every host tried.
 //
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from VMware's code: GPL-2.0 OR MIT
 // Portions Copyright 2009-2023 VMware, Inc., Palo Alto, CA., USA
 
 #include <kernel/dev/video/gpu/vmwgfx/vmw_gb.h>
+#include <kernel/dev/video/gpu/vmwgfx/vmw_kms.h>
 #include <kernel/dev/video/gpu/vmwgfx/svga/svga_escape.h>
 #include <kernel/dev/video/gpu/vmwgfx/svga/svga_overlay.h>
 #include <kernel/io/console.h>
@@ -86,15 +93,16 @@ static inline void fill_flush(struct vmw_escape_video_flush *cmd,
 static int vmw_overlay_available(struct vmw_device *v)
 {
 	return v->overlay_priv && v->has_gmr && v->scanout_in_guest_memory &&
+	       vmw_active_display_unit(v) == vmw_du_screen_target &&
 	       vmsvga2_hw_has_fifo_cap(SVGA_FIFO_CAP_VIDEO) &&
 	       vmsvga2_hw_has_fifo_cap(SVGA_FIFO_CAP_ESCAPE);
 }
 
 /* The whole register set of a stream, then a flush.
  *
- * Screen objects and screen targets take the GMR id and screen id registers
- * as well (the legacy unit, which stops at PITCH_3, never gets here -- see
- * the top of the file); the register ids are consecutive from 0. */
+ * Screen targets take the GMR id and screen id registers as well (the
+ * legacy unit, which stops at PITCH_3, never gets here -- see the top of
+ * the file); the register ids are consecutive from 0. */
 static int vmw_overlay_send_put(struct vmw_device *v, struct drm_gem_object *o,
 				const struct drm_vmw_control_stream_arg *arg)
 {

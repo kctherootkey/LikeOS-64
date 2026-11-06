@@ -277,6 +277,10 @@ int xhci_ring_enqueue(xhci_ring_t *ring, uint64_t param, uint32_t status,
 			1); /* enqueue at or past link TRB slot - ring wraparound code missed the link TRB */
 	ring->trbs[idx].param = param;
 	ring->trbs[idx].status = status;
+	/* The cycle bit in the control word hands the TRB to the controller,
+	 * which may fetch it as soon as that store lands: the compiler must
+	 * not move the parameter and status stores after it. */
+	__asm__ volatile("" ::: "memory");
 	ring->trbs[idx].control = (control & ~TRB_FLAG_CYCLE) |
 				  (ring->cycle ? TRB_FLAG_CYCLE : 0);
 
@@ -548,6 +552,8 @@ int xhci_ring_ex_enqueue(xhci_ring_ex_t *ring, uint64_t param, uint32_t status,
 	// Write the TRB
 	ring->enqueue->param = param;
 	ring->enqueue->status = status;
+	/* Control (with the cycle bit) last: see xhci_ring_enqueue. */
+	__asm__ volatile("" ::: "memory");
 	ring->enqueue->control = (control & ~TRB_FLAG_CYCLE) |
 				 (ring->cycle_state ? TRB_FLAG_CYCLE : 0);
 	xhci_mb();
@@ -1626,9 +1632,18 @@ void xhci_process_events(xhci_controller_t *ctrl)
 
 	while (processed < XHCI_RING_SIZE) {
 		xhci_trb_t *trb = &ring->trbs[ring->dequeue];
+		/* The controller writes event TRBs behind the compiler's back,
+		 * so the cycle bit is read from memory every time it is looked
+		 * at.  Through the plain pointer an optimising compiler reused
+		 * the first load for the second look below (the volatile
+		 * register read between them orders nothing else): the resync
+		 * then "matched" an event left from the previous lap and
+		 * handled it again -- an old bulk-in completion finishing a
+		 * mass-storage status read before the device had sent it. */
+		volatile xhci_trb_t *vtrb = trb;
 
 		// Check cycle bit matches expected
-		uint8_t trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
+		uint8_t trb_cycle = (vtrb->control & TRB_FLAG_CYCLE) ? 1 : 0;
 		if (trb_cycle != ring->cycle) {
 			// Check if EINT is set but we have cycle mismatch - might need resync
 			// Only QEMU needs resync - other controllers set EINT spuriously
@@ -1642,7 +1657,7 @@ void xhci_process_events(xhci_controller_t *ctrl)
 				// EINT set but no events - try toggling cycle bit
 				ring->cycle ^= 1;
 				trb_cycle =
-					(trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
+					(vtrb->control & TRB_FLAG_CYCLE) ? 1 : 0;
 				if (trb_cycle == ring->cycle) {
 					// Fixed! Continue processing
 					//kprintf("[XHCI] Event ring cycle resync at deq=%d\n", ring->dequeue);
@@ -1655,6 +1670,10 @@ void xhci_process_events(xhci_controller_t *ctrl)
 				break; // No more events
 			}
 		}
+
+		/* The cycle bit says the TRB is the controller's new one; the
+		 * rest of it is read only after that, never from before. */
+		__asm__ volatile("" ::: "memory");
 
 		uint8_t trb_type = (trb->control >> 10) & 0x3F;
 

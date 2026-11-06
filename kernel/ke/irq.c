@@ -74,6 +74,10 @@ int irq_request_vector(int vector, irq_handler_t fn, void *arg,
 	d->act[d->nact].fn = fn;
 	d->act[d->nact].arg = arg;
 	d->act[d->nact].name = name;
+	/* irq_dispatch reads the actions without the lock, on any CPU: the
+	 * entry is complete before the count that makes it reachable (an
+	 * optimising compiler stored the count first). */
+	__asm__ volatile("" ::: "memory");
 	d->nact++;
 	spin_unlock_irqrestore(&g_irq_lock, fl);
 	return 0;
@@ -179,12 +183,14 @@ int irq_dispatch(uint64_t vector)
 		return 0;
 	struct irq_desc *d = &g_irq[vector];
 
-	if (d->nact == 0)
-		return 0;
 	/* No lock on the fast path: actions are appended, never moved while
 	 * live, and removal is rare and racing it costs at most one stale
-	 * call into a handler that answers "not mine". */
-	int n = d->nact;
+	 * call into a handler that answers "not mine".  The count is read
+	 * once, with acquire, so the entries are read after it. */
+	int n = __atomic_load_n(&d->nact, __ATOMIC_ACQUIRE);
+
+	if (n == 0)
+		return 0;
 	int handled = 0;
 	for (int i = 0; i < n; i++) {
 		struct irq_action *a = &d->act[i];

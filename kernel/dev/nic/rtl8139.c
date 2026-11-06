@@ -320,6 +320,10 @@ static void rtl_drain_rx(rtl8139_dev_t *dev)
 {
 	int processed_any = 0;
 	while (!(rtl_read8(dev, RTL_CR) & RTL_CR_BUFE)) {
+		// The chip DMAs the header and frame into rx_buf behind the
+		// compiler's back, and inb carries no memory clobber: keep the
+		// reads below after the BUFE check that says they are there.
+		__asm__ volatile("" ::: "memory");
 		// Each packet in the ring is laid out as:
 		//   [0..1]  status (16-bit, little-endian)
 		//   [2..3]  length INCLUDING 4-byte CRC (16-bit)

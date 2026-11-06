@@ -888,9 +888,14 @@ static int vfs_notify_file_ident(vfs_file_t *f, struct fsnotify_ident *id)
 {
 	id->valid = 0;
 	id->isdir = 0;
-	if (!f->at_path || f->fsn_state < 0)
+	/* Read once, with acquire: the release store below publishes fsn_ino
+	 * and fsn_isdir, and through a plain load an optimising compiler may
+	 * read those before the state that says they are there. */
+	int fsn_state = __atomic_load_n(&f->fsn_state, __ATOMIC_ACQUIRE);
+
+	if (!f->at_path || fsn_state < 0)
 		return 0;
-	if (f->fsn_state == 0) {
+	if (fsn_state == 0) {
 		struct kstat st;
 
 		if (vfs_is_dev_path(f->at_path) ||

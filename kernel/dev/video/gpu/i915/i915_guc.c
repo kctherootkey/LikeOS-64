@@ -2289,6 +2289,10 @@ static int ct_send_wait(struct i915_device *i915, struct i915_guc *g, const uint
 			return -EPROTO;
 		if (out) {
 			uint32_t n = nout < 4 ? nout : 4;
+			/* the data was written (by whichever processor read
+			 * the answer) before wait_done: read after it, not
+			 * ahead of the volatile reads above */
+			__asm__ volatile("" ::: "memory");
 			for (uint32_t i = 0; i < n; i++)
 				out[i] = g->wait_data[i];
 			return (int)n;

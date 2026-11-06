@@ -251,6 +251,9 @@ static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
 				return NULL;
 			n->transient = 0;
 			n->sibling = dir->children;
+			/* lookups walk the list without a lock: the node is
+			 * complete before the store that makes it reachable */
+			__asm__ volatile("" ::: "memory");
 			dir->children = n;
 			return n;
 		}
@@ -267,6 +270,7 @@ static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
 				return NULL;
 			c->transient = 0;
 			c->sibling = dir->children;
+			__asm__ volatile("" ::: "memory"); /* as above */
 			dir->children = c;
 		}
 		dir = c;

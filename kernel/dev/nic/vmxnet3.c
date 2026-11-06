@@ -480,11 +480,14 @@ static void vm_drain_rx(vmxnet3_dev_t *dev)
 		vmxnet3_rx_comp_desc_t *cd =
 			&dev->rx_comp_ring[dev->rx_comp_next];
 
-		// Generation bit is bit 31 of word 3
-		uint32_t w3 = cd->word3;
+		// Generation bit is bit 31 of word 3.  The device writes the
+		// completion behind the compiler's back: read the gen word
+		// through volatile, and the other words only after it.
+		uint32_t w3 = *(volatile uint32_t *)&cd->word3;
 		uint8_t gen = (w3 >> 31) & 1;
 		if (gen != dev->rx_comp_gen)
 			break; // not ours yet
+		__asm__ volatile("" ::: "memory");
 
 		uint32_t w0 = cd->word0;
 		uint32_t w2 = cd->word2;
@@ -534,6 +537,9 @@ static void vm_drain_rx(vmxnet3_dev_t *dev)
 	// just refilled.  Replacing the per-packet RXPROD write with a single
 	// MMIO at the end of the loop removes one PCIe round-trip per packet.
 	if (processed_any) {
+		// The re-armed descriptors above are plain stores; keep them
+		// ahead of the volatile doorbell that hands them to the device.
+		__asm__ volatile("" ::: "memory");
 		vm_w32(dev->bar0, VMXNET3_REG_RXPROD, last_rxd_idx);
 	}
 }
@@ -547,7 +553,8 @@ static void vm_drain_tx(vmxnet3_dev_t *dev)
 	while (1) {
 		vmxnet3_tx_comp_desc_t *cd =
 			&dev->tx_comp_ring[dev->tx_comp_next];
-		uint8_t gen = (cd->word3 >> 31) & 1;
+		// Device-written: volatile, as in vm_drain_rx.
+		uint8_t gen = (*(volatile uint32_t *)&cd->word3 >> 31) & 1;
 		if (gen != dev->tx_comp_gen)
 			break;
 

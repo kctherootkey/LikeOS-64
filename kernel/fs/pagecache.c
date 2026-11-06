@@ -247,7 +247,10 @@ static void pc_page_unlock(pc_page_t *p)
 	if (!p)
 		return;
 	p->flags &= ~PC_PAGE_LOCKED;
-	if (p->flags & PC_PAGE_DEAD)
+	/* DEAD is set by an invalidation on another CPU, so it is read from
+	 * memory again after the store: through the plain pointer an
+	 * optimising compiler tested the value loaded before it. */
+	if (((volatile pc_page_t *)p)->flags & PC_PAGE_DEAD)
 		pc_page_free(p);
 }
 

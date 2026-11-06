@@ -117,8 +117,10 @@ __no_stack_protector void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id)
 	percpu->interrupts = 0;
 	percpu->timer_ticks = 0;
 
-	// Store in global array
-	g_percpu_ptrs[cpu_id] = percpu;
+	// Store in global array.  Other CPUs read the fields above through
+	// this pointer: release, so an optimising compiler cannot publish the
+	// pointer before them (it did).
+	__atomic_store_n(&g_percpu_ptrs[cpu_id], percpu, __ATOMIC_RELEASE);
 
 	// Increment online CPU count atomically
 	__atomic_fetch_add(&g_cpus_online, 1, __ATOMIC_SEQ_CST);

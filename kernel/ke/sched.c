@@ -2674,7 +2674,9 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	}
 
 	// Always clear the guard — the task we just resumed could have been
-	// suspended from any scheduling path.
+	// suspended from any scheduling path.  The barrier keeps the plain
+	// store above ahead of the (volatile) clear, as the order requires.
+	__asm__ volatile("" ::: "memory");
 	this_cpu()->in_context_switch = 0;
 	__asm__ volatile("sti");
 
@@ -2886,7 +2888,8 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 		this_cpu()->deferred_zombie = NULL;
 	}
 
-	// Always clear the guard.
+	// Always clear the guard -- after the zombie slot (see above).
+	__asm__ volatile("" ::: "memory");
 	this_cpu()->in_context_switch = 0;
 	__asm__ volatile("sti");
 	dead_thread_reap();

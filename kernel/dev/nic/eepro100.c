@@ -529,8 +529,12 @@ static void e100_drain_rx(eepro100_dev_t *d)
 		WARN_ON(d->rx_cur >=
 			EEPRO100_NUM_RX_DESC); /* rx_cur out of RX RFD ring bounds - ring wrap logic corrupted */
 		eepro100_rfd_t *rfd = e100_rx_rfd(d, d->rx_cur);
-		if (!(rfd->status & EEPRO100_STATUS_C))
+		// The chip writes the RFD behind the compiler's back: read
+		// status.C through volatile, and read count only after it.
+		if (!(((volatile eepro100_rfd_t *)rfd)->status &
+		      EEPRO100_STATUS_C))
 			break;
+		__asm__ volatile("" ::: "memory");
 
 		uint16_t len = rfd->count & 0x3FFF;
 		if (len > 0 && len <= EEPRO100_RX_BUF_SIZE) {

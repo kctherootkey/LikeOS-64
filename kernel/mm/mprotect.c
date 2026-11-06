@@ -211,7 +211,9 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 
 	// Flush TLB for modified pages on local CPU
 	// Use virt_to_phys() for the PML4 pointer itself (not mm_get_physical_address)
-	__asm__ volatile("mov %0, %%cr3" : : "r"(virt_to_phys(pml4)));
+	// "memory": the entry updates above must be in the tables before the
+	// reload, not merely before it in the source.
+	__asm__ volatile("mov %0, %%cr3" : : "r"(virt_to_phys(pml4)) : "memory");
 
 	// TLB shootdown: threads sharing this address space (CLONE_VM) may be running
 	// on other CPUs with stale TLB entries.  Only those CPUs can be: wait

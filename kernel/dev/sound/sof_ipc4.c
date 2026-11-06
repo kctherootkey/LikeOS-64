@@ -442,6 +442,10 @@ int sof_ipc4_service(struct sof_host *h)
 					h->rx_len = n;
 				}
 				h->tx_waiting_reply = 0;
+				/* the waiter may be polling on another CPU
+				 * without the lock: the reply words and the
+				 * payload copy are stored before the flag */
+				__asm__ volatile("" ::: "memory");
 				h->s.ipc_reply_ready = 1;
 			}
 			/* else: a reply nobody waits for (timed out) */
@@ -483,6 +487,17 @@ void sof_ipc4_dump_regs(struct sof_host *h)
 /* transactions                                                           */
 /* ===================================================================== */
 
+/* The flag is set by whoever serviced the doorbell, possibly on another
+ * CPU and outside our lock: once it reads set, the reply words and the
+ * payload it publishes are read only after this point. */
+static inline int sof_flag_seen(volatile int *flag)
+{
+	if (!*flag)
+		return 0;
+	__asm__ volatile("" ::: "memory");
+	return 1;
+}
+
 /* Wait for the condition `*flag' to become non-zero; services the doorbell
  * between checks.  Returns 0 or -ETIMEDOUT. */
 static int sof_ipc_wait_flag(struct sof_host *h, volatile int *flag,
@@ -497,7 +512,7 @@ static int sof_ipc_wait_flag(struct sof_host *h, volatile int *flag,
 		uint64_t now;
 
 		sof_ipc4_service(h);
-		if (*flag)
+		if (sof_flag_seen(flag))
 			return 0;
 		if (h->crashed)
 			return -EIO;
@@ -508,7 +523,7 @@ static int sof_ipc_wait_flag(struct sof_host *h, volatile int *flag,
 
 			wq_entry_init(&we, cur);
 			wq_add(&h->ipc_wq, &we);
-			if (*flag) {
+			if (sof_flag_seen(flag)) {
 				local_irq_restore(fl);
 				wq_remove(&h->ipc_wq, &we);
 				return 0;
@@ -531,7 +546,7 @@ static int sof_ipc_wait_flag(struct sof_host *h, volatile int *flag,
 			spent = now;
 		if (spent >= timeout_us) {
 			sof_ipc4_service(h);
-			return *flag ? 0 : -ETIMEDOUT;
+			return sof_flag_seen(flag) ? 0 : -ETIMEDOUT;
 		}
 	}
 }
