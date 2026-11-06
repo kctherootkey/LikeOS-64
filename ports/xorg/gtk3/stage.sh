@@ -694,6 +694,16 @@ if [ -d "$DEST/usr/share/fonts/truetype/selawik" ] &&
 	cp "$root/res/xorg/gtk3/fonts/Selawik-LICENSE.txt" \
 		"$DEST/usr/share/fonts/truetype/selawik/LICENSE.txt"
 fi
+# The system's own fontconfig rules for the Noto script faces: which face
+# answers for which language, and the CJK family names pages ask for (each
+# file explains itself).  Real files in conf.d, like the upstream rules
+# ../stage.sh puts there, since a link into conf.avail is only as good as the
+# copy it points at.
+for c in "$root"/res/xorg/gtk3/fonts/*.conf; do
+	[ -f "$c" ] || continue
+	mkdir -p "$DEST/etc/fonts/conf.d"
+	cp "$c" "$DEST/etc/fonts/conf.d/"
+done
 
 # ---------------------------------------------------------------------------
 # Icon themes.

@@ -510,6 +510,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/gdt.o \
               $(BUILD_DIR)/gdt_c.o \
               $(BUILD_DIR)/keyboard.o \
+              $(BUILD_DIR)/keymap.o \
 			  $(BUILD_DIR)/serial.o \
               $(BUILD_DIR)/mouse.o \
               $(BUILD_DIR)/vmmouse.o \
@@ -713,7 +714,7 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup kdump drminfo \
-	backlight gdb gdbserver
+	backlight gdb gdbserver loadkeys dumpkeys kbd_mode setleds setmetamode showkey
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
@@ -723,7 +724,7 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
 USR_SBIN_PROGS = audiod
 # Helpers -> /usr/libexec/<name>
-USR_LIBEXEC_PROGS = likeos-display-save
+USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
@@ -744,6 +745,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/etc/ssl/certs/*) $(wildcard res/xorg/*) \
 	$(wildcard res/xorg/applications/*) \
 	$(wildcard res/xorg/gtk3/*) \
+	$(wildcard res/xorg/gtk3/fonts/*) \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
 	$(shell find res/xorg/icons -type f -o -type l 2>/dev/null) \
@@ -754,6 +756,9 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/sounds/likeos/*.wav) \
 	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh \
 	host/gen-cursors.c \
+	res/keyboard/layouts.tsv res/etc/likeos/keyboard.conf \
+	host/gen-keymaps.pl host/ckbcomp/ckbcomp \
+	ports/kbd-2.10.0/defkeymap.map \
 	user/bin/tests/apnews-urls.txt
 
 # Full prerequisite set for the ext4 image (every staged build artifact).
@@ -792,7 +797,8 @@ GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/likeos-explorer
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
-	$(BUILD_DIR)/likeos-display-settings
+	$(BUILD_DIR)/likeos-display-settings $(BUILD_DIR)/likeos-settings \
+	$(BUILD_DIR)/likeos-keyboard-settings
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
 	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_SBIN_PROGS) $(USR_LIBEXEC_PROGS)) \
@@ -801,6 +807,7 @@ GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(R
 	$(GTK3_SENTINEL) \
 	$(GTK3_TESTCXX) \
 	$(GTK3_BAR_PROGS) \
+	$(KEYMAPS_STAMP) \
 	$(RES_PREREQS)
 
 # Default target: build the single ext4 GPT USB disk.
@@ -1026,6 +1033,9 @@ $(BUILD_DIR)/gdt_c.o: $(KERNEL_DIR)/ke/gdt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/keyboard.o: $(KERNEL_DIR)/dev/input/keyboard.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/keymap.o: $(KERNEL_DIR)/dev/input/keymap.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/serial.o: $(KERNEL_DIR)/hal/serial.c | $(BUILD_DIR)
@@ -1599,6 +1609,13 @@ $(BUILD_DIR)/likeos-display-save: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/likeos-display-save $@
 	$(USER_STRIP) --strip-unneeded $@
 
+# likeos-keyboard-save: writes the keyboard layout Settings and loadkeys save
+# (/etc/likeos/keyboard.conf); setuid root in /usr/libexec.
+$(BUILD_DIR)/likeos-keyboard-save: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) likeos-keyboard-save
+	cp $(USER_DIR)/likeos-keyboard-save $@
+	$(USER_STRIP) --strip-unneeded $@
+
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) memstat
 	cp $(USER_DIR)/memstat $@
@@ -2036,6 +2053,18 @@ $(BUILD_DIR)/tmux: ports-tmux | $(BUILD_DIR)
 	cp ports/tmux-3.6a/tmux $@
 	$(USER_STRIP) --strip-unneeded $@
 
+# kbd: the console keyboard tools.  loadkeys/dumpkeys load and print the
+# console keymap (/usr/share/keymaps), kbd_mode, setleds, setmetamode and
+# showkey the keyboard mode, LEDs, Meta handling and key codes.
+.PHONY: ports-kbd
+ports-kbd: userland-libc userland-rtld
+	$(MAKE) -C ports/kbd-2.10.0 -f Makefile.likeos
+
+KBD_PROGS = loadkeys dumpkeys kbd_mode setleds setmetamode showkey
+$(addprefix $(BUILD_DIR)/,$(KBD_PROGS)): ports-kbd | $(BUILD_DIR)
+	cp ports/kbd-2.10.0/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
 # gdb.
 #
 # Depends on the GTK3 package set, which is what populates build/xorg-sysroot --
@@ -2319,6 +2348,9 @@ GTK3_BAR_LIBS = $(shell LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 # there are three programs and no library, which for 380 lines is the simpler
 # arrangement.
 PANEL_SRC = user/bin/shell/panel.c user/bin/shell/panel.h
+# The keyboard setting and the layout catalogue, read by the taskbar, the
+# Settings window and the Keyboard settings window.
+KBDCONF_SRC = user/bin/shell/keyboard-conf.c user/bin/shell/keyboard-conf.h
 
 $(BUILD_DIR)/datetime: user/bin/shell/datetime.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
 	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
@@ -2332,12 +2364,13 @@ $(BUILD_DIR)/load: user/bin/shell/load.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD
 
 # taskbar also links libaudio, for its volume control and the start-up sound;
 # the GTK3 port imports it into the sysroot, so the sentinel covers it too.
-$(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
+$(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(KBDCONF_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
 	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
 		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 		   ports/xorg/toolchain/likeos-pkg-config --cflags libaudio) \
-		-o $@ $< user/bin/shell/panel.c $(GTK3_BAR_LIBS) \
+		-o $@ $< user/bin/shell/panel.c user/bin/shell/keyboard-conf.c \
+		$(GTK3_BAR_LIBS) \
 		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 		   ports/xorg/toolchain/likeos-pkg-config --libs libaudio)
 
@@ -2350,6 +2383,20 @@ $(BUILD_DIR)/likeos-display-settings: user/bin/shell/display-settings.c $(GTK3_S
 		-o $@ $< $(GTK3_BAR_LIBS) \
 		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 		   ports/xorg/toolchain/likeos-pkg-config --libs xrandr)
+
+# The Settings window: the cards that open each area's settings.
+$(BUILD_DIR)/likeos-settings: user/bin/shell/settings.c $(KBDCONF_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		-o $@ $< user/bin/shell/keyboard-conf.c $(GTK3_BAR_LIBS)
+
+# The Keyboard settings window: GTK3 for the window, XKB (libX11) for the
+# layout the test field types in; the setting is saved by
+# likeos-keyboard-save and set in the session by likeos-xkb-apply.
+$(BUILD_DIR)/likeos-keyboard-settings: user/bin/shell/keyboard-settings.c $(KBDCONF_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		-o $@ $< user/bin/shell/keyboard-conf.c $(GTK3_BAR_LIBS)
 
 # The C++ runtime's own test program.
 #
@@ -2467,6 +2514,43 @@ $(XORG_SYSROOT)/usr/bin/Xorg: ports-xorg | $(BUILD_DIR)
 		exit 1; \
 	}
 
+# The console keymaps: /usr/share/keymaps/<id>.map for every layout of the
+# catalogue (res/keyboard/layouts.tsv), plus the classic alias names as links.
+#
+# Generated on the build host, not committed: each map is translated from the
+# XKB layout the X server loads for the same catalogue line, with its dead keys
+# composing what the X compose table composes, so the console and the session
+# type the same characters and a layout added to the catalogue gets its keymap.
+# host/gen-keymaps.pl explains the translation; the translator is
+# console-setup's ckbcomp (host/ckbcomp, unmodified, GPL-2).  All three inputs
+# come out of the X.Org port's checksummed tarballs: the XKB layouts
+# (xkeyboard-config), the compose table (libX11) and the keysym names
+# (xorgproto).  Takes about twenty seconds, so it is a target of its own that
+# reruns only when one of them changes.
+KEYMAPS_DIR = $(BUILD_DIR)/keymaps
+KEYMAPS_STAMP = $(KEYMAPS_DIR)/.generated
+KEYMAPS_XKB = $(XORG_SYSROOT)/usr/share/X11/xkb
+KEYMAPS_COMPOSE = $(XORG_SYSROOT)/usr/share/X11/locale/en_US.UTF-8/Compose
+KEYMAPS_KEYSYMS = $(XORG_SYSROOT)/usr/include/X11/keysymdef.h
+KEYMAPS_INPUTS = $(KEYMAPS_XKB)/rules/evdev.lst $(KEYMAPS_COMPOSE) $(KEYMAPS_KEYSYMS)
+
+# Made by the X.Org port; checked here for the same reason as Xorg above.
+$(KEYMAPS_INPUTS): $(XORG_SYSROOT)/usr/bin/Xorg
+	@test -f $@ || { \
+		echo "ERROR: $@ is missing after building the X.Org port."; \
+		exit 1; \
+	}
+
+$(KEYMAPS_STAMP): host/gen-keymaps.pl host/ckbcomp/ckbcomp res/keyboard/layouts.tsv \
+		$(KEYMAPS_INPUTS) | $(BUILD_DIR)
+	rm -rf $(KEYMAPS_DIR)
+	perl host/gen-keymaps.pl res/keyboard/layouts.tsv $(KEYMAPS_XKB) \
+		$(KEYMAPS_COMPOSE) $(KEYMAPS_KEYSYMS) $(KEYMAPS_DIR)
+	touch $@
+
+.PHONY: keymaps
+keymaps: $(KEYMAPS_STAMP)
+
 # The same sentinel for the GTK3 stack.  PCManFM is the last package its
 # manifest builds and sits on top of nearly everything below it, so its presence
 # means the whole stack -- GLib, GTK, Cairo, Pango, the C++ runtime, libetpan,
@@ -2576,9 +2660,34 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# xinitrc runs it with --restore), its setuid-root helper ->
 	# /usr/libexec, and /etc/likeos, where the helper saves the setting.
 	cp $(BUILD_DIR)/likeos-display-settings $(EXT4_STAGING)/usr/bin/likeos-display-settings
+	# Settings (the launcher's and the Control Center's), and Keyboard
+	# settings, which it opens; their desktop entries come with
+	# res/xorg/applications, their icons with the LikeOS icon theme.
+	cp $(BUILD_DIR)/likeos-settings $(EXT4_STAGING)/usr/bin/likeos-settings
+	cp $(BUILD_DIR)/likeos-keyboard-settings $(EXT4_STAGING)/usr/bin/likeos-keyboard-settings
 	for b in $(USR_LIBEXEC_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/libexec/$$b; done
 	chmod 4755 $(EXT4_STAGING)/usr/libexec/likeos-display-save
 	mkdir -p $(EXT4_STAGING)/etc/likeos
+	# Keyboard: the setting (/etc/likeos/keyboard.conf, US until Settings
+	# or loadkeys changes it), its setuid-root helper, the layout
+	# catalogue Settings lists, the console keymaps made from it (see
+	# KEYMAPS_STAMP; the aliases are links), and likeos-xkb-apply, which
+	# gives the X session the saved layout.
+	chmod 4755 $(EXT4_STAGING)/usr/libexec/likeos-keyboard-save
+	cp res/etc/likeos/keyboard.conf $(EXT4_STAGING)/etc/likeos/keyboard.conf
+	chmod 0644 $(EXT4_STAGING)/etc/likeos/keyboard.conf
+	mkdir -p $(EXT4_STAGING)/usr/share/likeos/keyboard $(EXT4_STAGING)/usr/share/keymaps
+	cp res/keyboard/layouts.tsv $(EXT4_STAGING)/usr/share/likeos/keyboard/layouts.tsv
+	cp $(KEYMAPS_DIR)/nonlatin.list $(EXT4_STAGING)/usr/share/likeos/keyboard/nonlatin.list
+	cp -P $(KEYMAPS_DIR)/*.map $(EXT4_STAGING)/usr/share/keymaps/
+	cp ports/kbd-2.10.0/defkeymap.map $(EXT4_STAGING)/usr/share/keymaps/defkeymap.map
+	chmod 0755 $(EXT4_STAGING)/usr/share/likeos $(EXT4_STAGING)/usr/share/likeos/keyboard \
+		$(EXT4_STAGING)/usr/share/keymaps
+	chmod 0644 $(EXT4_STAGING)/usr/share/likeos/keyboard/layouts.tsv \
+		$(EXT4_STAGING)/usr/share/likeos/keyboard/nonlatin.list
+	find $(EXT4_STAGING)/usr/share/keymaps -type f -exec chmod 0644 {} +
+	cp res/xorg/likeos-xkb-apply.sh $(EXT4_STAGING)/usr/bin/likeos-xkb-apply
+	chmod 0755 $(EXT4_STAGING)/usr/bin/likeos-xkb-apply
 	# Sound: the tools -> /usr/bin, audiod -> /usr/sbin (started by init
 	# from inittab; it creates /var/run/audiod and /var/lib/audiod with
 	# their owners itself), the system sounds -> /usr/share/sounds/likeos.
@@ -3181,6 +3290,7 @@ distclean: clean
 	$(MAKE) -C ports/nano-8.3 -f Makefile.likeos clean
 	$(MAKE) -C ports/bash-5.2.37 -f Makefile.likeos distclean
 	$(MAKE) -C ports/tmux-3.6a -f Makefile.likeos clean
+	$(MAKE) -C ports/kbd-2.10.0 -f Makefile.likeos clean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean

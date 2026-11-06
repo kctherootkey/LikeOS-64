@@ -82,10 +82,13 @@ if [ "$LIKEOS_GPU_3D" != "1" ]; then
 	export WEBKIT_DMABUF_RENDERER_FORCE_SHM
 fi
 
-# Keyboard map.  The server already reads this from xorg.conf; setting it again
-# here is where to change it for a session without editing the configuration.
-if [ -x /usr/bin/setxkbmap ]; then
-	setxkbmap us
+# Keyboard layout: the one chosen in Settings > Keyboard (or with loadkeys on
+# the console), from /etc/likeos/keyboard.conf.  The server starts with the
+# layout in xorg.conf; likeos-xkb-apply switches it to the saved one before
+# any client starts.  The taskbar runs it again whenever the setting changes,
+# which is how a layout loaded on the console reaches a running session.
+if [ -x /usr/bin/likeos-xkb-apply ]; then
+	likeos-xkb-apply
 fi
 
 # The session bus.

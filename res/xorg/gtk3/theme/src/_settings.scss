@@ -1,0 +1,246 @@
+// The Settings window (likeos-settings) and the windows it opens that are
+// built the same way (likeos-keyboard-settings and its Add a keyboard
+// layout dialog).
+//
+// A white header with the area's picture, its title and a line on what it
+// is for; under it, on the window colour, the page: small headings over
+// white cards of rows, divided by hairlines, with notes in secondary text
+// under them; at the bottom a footer band with what Apply did and the
+// buttons.  The Settings window itself has no footer: its page is a grid
+// of large cards, one per area, each opening that area's window.
+//
+// Everything is scoped to the windows' .st-window class.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+$st-card-radius: $radius-card + 2px;   // the hub's area cards
+$st-badge-bg: $color-control-pressed;
+
+.st-window {
+  &, &.background, &:backdrop { background-color: $color-window; color: $color-text; }
+
+  // ---- header ----------------------------------------------------------------
+
+  .st-header {
+    padding: $space-l + 4px $space-xl $space-l $space-xl;
+    border-bottom: 1px solid $color-stroke;
+    background-color: $color-card;
+  }
+  label.st-title { font-size: $type-title; font-weight: $weight-strong; }
+  label.st-subtitle { color: $color-text-secondary; font-size: $type-body; }
+
+  // ---- page, headings, cards, rows --------------------------------------------
+
+  .st-page { padding: $space-xs $space-xl $space-l $space-xl; }
+
+  label.st-heading {
+    margin: $space-l + 2px 2px $space-s 2px;
+    color: $color-text-secondary;
+    font-size: $type-caption + 0.5pt;
+    font-weight: $weight-strong;
+  }
+
+  .st-card {
+    border: 1px solid $color-stroke;
+    border-radius: $radius-card;
+    background-color: $color-card;
+  }
+
+  list.st-list {
+    border-radius: $radius-card $radius-card 0 0;
+    background-color: transparent;
+
+    row {
+      padding: 0;
+      background-color: transparent;
+      box-shadow: none;
+      &:hover { background-color: transparent; }
+    }
+    row + row { border-top: 1px solid $color-separator; }
+  }
+
+  .st-row { min-height: 40px; padding: $space-s + 2px $space-l; }
+  .st-card > .st-row + .st-row { border-top: 1px solid $color-separator; }
+
+  label.st-row-title { font-size: $type-body; }
+  label.st-row-detail { color: $color-text-secondary; font-size: $type-caption + 0.5pt; }
+  label.st-note {
+    margin: $space-s 2px 0 2px;
+    color: $color-text-secondary;
+    font-size: $type-caption + 0.5pt;
+  }
+
+  // A layout's short code: a small soft chip, the primary one's in the
+  // accent.
+  label.st-badge {
+    min-width: 30px;
+    min-height: 24px;
+    padding: 0 $space-xs;
+    border-radius: $radius-control;
+    background-color: $st-badge-bg;
+    color: $color-text-secondary;
+    font-size: $type-caption + 0.5pt;
+    font-weight: $weight-strong;
+  }
+  label.st-badge.st-badge-primary {
+    background-color: $color-accent-fill;
+    color: #ffffff;
+  }
+  label.st-pill {
+    padding: 0 $space-s - 1px;
+    min-height: 18px;
+    border-radius: 9px;
+    background-color: $color-selection;
+    color: $color-accent-fill;
+    font-size: $type-caption;
+    font-weight: $weight-strong;
+  }
+
+  button.st-icon-button {
+    min-width: 30px;
+    min-height: 30px;
+    padding: 0;
+    border-radius: $radius-control;
+    color: $color-text;
+    &:hover { background-color: $color-hover; }
+    &:active { background-color: $color-pressed; }
+    &:disabled { color: $color-text-disabled; background-color: transparent; }
+  }
+
+  // "Add a keyboard layout": the card's last line, a flat full-width
+  // button in the accent.
+  button.st-add-row {
+    min-height: 44px;
+    padding: 0 $space-l;
+    border: none;
+    border-top: 1px solid $color-separator;
+    border-radius: 0 0 $radius-card $radius-card;
+    background-image: none;
+    background-color: transparent;
+    box-shadow: none;
+    color: $color-accent-fill;
+
+    label.st-add-label { font-weight: $weight-strong; }
+    image.st-add-icon { margin-left: 7px; margin-right: 7px; }
+    &:hover { background-color: $color-item-hover; }
+    &:active { background-color: $color-selection; }
+    &:disabled { color: $color-text-disabled; }
+  }
+
+  // The test field: a full-width entry a little larger than a form's.
+  .st-test-row { padding-top: $space-m; padding-bottom: $space-m; }
+  entry.st-test {
+    min-height: 40px;
+    font-size: $type-body-large;
+  }
+
+  // A row's choice: a combo box of the controls' height.
+  combobox button.combo {
+    min-height: $height-control - 2px;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  // ---- footer --------------------------------------------------------------------
+
+  .st-footer {
+    padding: $space-m $space-xl;
+    border-top: 1px solid $color-stroke;
+    background-color: $color-window;
+  }
+  button.st-footer-button { min-width: $width-dialog-button; }
+  label.st-status { color: $color-text-secondary; font-size: $type-body; }
+  label.st-status.st-status-ok { color: $color-success; }
+  label.st-status.st-status-error { color: $color-critical; }
+
+  label.st-empty {
+    padding: $space-xxl $space-l;
+    color: $color-text-secondary;
+    font-size: $type-body;
+  }
+
+  entry.st-search { min-height: $height-control; }
+
+  // ---- Add a keyboard layout ------------------------------------------------------
+
+  &.st-add-dialog {
+    .dialog-vbox { padding: 0; }
+    .st-add-head {
+      padding: $space-l $space-l + 4px $space-xs $space-l + 4px;
+      background-color: $color-card;
+    }
+    label.st-add-title { font-size: $type-subtitle; font-weight: $weight-strong; }
+    scrolledwindow.st-pick-scroll {
+      border-top: 1px solid $color-stroke;
+      background-color: $color-card;
+    }
+    list.st-pick-list {
+      padding: $space-xs $space-s;
+      background-color: $color-card;
+
+      row {
+        margin: 1px 0;
+        padding: $space-xs + 2px $space-m;
+        border-radius: $radius-row;
+        box-shadow: none;
+        color: $color-text;
+
+        &:hover { background-color: $color-item-hover; }
+        &:selected, &:selected:focus {
+          background-color: $color-selection;
+          color: $color-text;
+          box-shadow: none;
+          label { color: $color-text; }
+          label.st-row-detail { color: $color-text-secondary; }
+          label.st-badge { background-color: $color-card; color: $color-accent-fill; }
+        }
+        &:selected:hover { background-color: $color-selection-hover; }
+      }
+    }
+    .dialog-action-box {
+      margin: 0;
+      padding: $space-m $space-l + 4px;
+      border-top: 1px solid $color-stroke;
+      background-color: $color-window;
+    }
+    .dialog-action-area { margin: 0; }
+    .dialog-action-area button { min-width: $width-dialog-button; }
+  }
+
+  // ---- the Settings window ------------------------------------------------------------
+
+  .st-hub-header {
+    padding: $space-xl $space-xxl $space-l + 4px $space-xxl;
+    border-bottom: 1px solid $color-stroke;
+    background-color: $color-card;
+  }
+  label.st-hub-title { font-size: 19pt; font-weight: $weight-strong; }
+
+  .st-hub-page { padding: $space-xs $space-xxl $space-xxl $space-xxl; }
+  flowbox.st-hub-grid flowboxchild { padding: 0; }
+
+  button.st-hub-card {
+    min-height: 0;
+    padding: $space-l + 2px $space-l + 2px;
+    border: 1px solid $color-stroke;
+    border-bottom-color: $color-stroke-edge;
+    border-radius: $st-card-radius;
+    background-image: none;
+    background-color: $color-card;
+    box-shadow: none;
+    color: $color-text;
+    font-weight: normal;
+
+    label.st-card-title { font-size: $type-subtitle; font-weight: $weight-strong; }
+    label.st-card-desc { color: $color-text-secondary; font-size: $type-body; }
+    label.st-card-state { margin-top: 2px; color: $color-accent-fill; font-size: $type-body; }
+    image.st-card-chevron { color: $color-text-secondary; }
+
+    &:hover {
+      background-color: $color-item-hover;
+      border-color: $color-selection-hover;
+      image.st-card-chevron { color: $color-accent-fill; }
+    }
+    &:active { background-color: $color-selection; border-color: $color-selection-hover; }
+  }
+}

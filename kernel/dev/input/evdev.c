@@ -188,6 +188,14 @@ static void evdev_init_devices(void)
 		bit_set(kbd->keybits, i);
 	bit_set(kbd->keybits, KEY_KPEQUAL);
 	bit_set(kbd->keybits, KEY_PAUSE);
+	bit_set(kbd->keybits, KEY_RO);
+	bit_set(kbd->keybits, KEY_HENKAN);
+	bit_set(kbd->keybits, KEY_KATAKANAHIRAGANA);
+	bit_set(kbd->keybits, KEY_MUHENKAN);
+	bit_set(kbd->keybits, KEY_KPCOMMA);
+	bit_set(kbd->keybits, KEY_HANGEUL);
+	bit_set(kbd->keybits, KEY_HANJA);
+	bit_set(kbd->keybits, KEY_YEN);
 	bit_set(kbd->keybits, KEY_LEFTMETA);
 	bit_set(kbd->keybits, KEY_RIGHTMETA);
 	bit_set(kbd->keybits, KEY_COMPOSE);
@@ -306,9 +314,39 @@ static void evdev_report_key(evdev_dev_t *dev, uint16_t code, int pressed)
 // Producer entry points (called from the keyboard/mouse interrupt paths)
 // ---------------------------------------------------------------------------
 
+// Set-1 make codes above 0x58 (no prefix) -> key codes: the keys of
+// Japanese, Korean and Brazilian keyboards.
+static uint16_t evdev_high_keycode(uint8_t code)
+{
+	switch (code) {
+	case 0x59:
+		return KEY_KPEQUAL;
+	case 0x70:
+		return KEY_KATAKANAHIRAGANA;
+	case 0x71:
+		return KEY_HANJA;
+	case 0x72:
+		return KEY_HANGEUL;
+	case 0x73:
+		return KEY_RO;
+	case 0x79:
+		return KEY_HENKAN;
+	case 0x7B:
+		return KEY_MUHENKAN;
+	case 0x7D:
+		return KEY_YEN;
+	case 0x7E:
+		return KEY_KPCOMMA;
+	default:
+		return KEY_RESERVED;
+	}
+}
+
 int evdev_feed_keyboard(uint8_t scan_code)
 {
 	static int e0_prefix; // producer-side prefix state (IRQ serialised)
+	static int e1_left; // bytes still to come of an 0xE1 sequence
+	static uint8_t e1_first;
 	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_KEYBOARD];
 	uint16_t code;
 	int pressed;
@@ -320,14 +358,34 @@ int evdev_feed_keyboard(uint8_t scan_code)
 		e0_prefix = 1;
 		return evdev_kbd_grabbed();
 	}
+	// Pause is 0xE1 1D 45 (press) and 0xE1 9D C5 (release): one key, not
+	// a Ctrl and a Num Lock.
+	if (scan_code == 0xE1) {
+		e1_left = 2;
+		return evdev_kbd_grabbed();
+	}
+	if (e1_left) {
+		if (--e1_left) {
+			e1_first = scan_code;
+			return evdev_kbd_grabbed();
+		}
+		if ((e1_first & 0x7F) == 0x1D && (scan_code & 0x7F) == 0x45)
+			evdev_report_key(dev, KEY_PAUSE, !(scan_code & 0x80));
+		return evdev_kbd_grabbed();
+	}
 	pressed = !(scan_code & 0x80);
 	if (e0_prefix) {
 		e0_prefix = 0;
 		code = evdev_e0_keycode(scan_code & 0x7F);
+	} else if (scan_code == 0xF1 || scan_code == 0xF2) {
+		// Hanja / Hangul: a press with no release code.
+		code = evdev_high_keycode(scan_code & 0x7F);
+		evdev_report_key(dev, code, 1);
+		pressed = 0;
 	} else {
 		code = scan_code & 0x7F; // set-1 make codes == key codes
 		if (code > 0x58)
-			code = KEY_RESERVED;
+			code = evdev_high_keycode((uint8_t)code);
 	}
 	evdev_report_key(dev, code, pressed);
 	return evdev_kbd_grabbed();

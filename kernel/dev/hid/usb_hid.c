@@ -102,7 +102,7 @@ static inline void hid_mb(void)
 // (USB HID Usage Tables 1.12, Section 10 - Keyboard/Keypad Page 0x07)
 // ============================================================================
 
-// Maps HID keyboard usage codes (0x00-0x67) to PS/2 Set 1 make scan codes.
+// Maps HID keyboard usage codes to PS/2 Set 1 make scan codes.
 // Index = HID usage code, value = PS/2 scan code (0 = no mapping).
 // This table converts USB HID key codes to the same scan codes that the
 // existing PS/2 keyboard driver uses, allowing seamless integration.
@@ -184,9 +184,9 @@ static const uint8_t hid_to_scancode[256] = {
 	[0x44] = 0x57, // F11
 	[0x45] = 0x58, // F12
 	// 0x46-0x48: PrintScreen, ScrollLock, Pause
-	[0x46] = 0x00, // PrintScreen (complex E0 sequence, handled specially)
+	[0x46] = 0x37, // PrintScreen (E0 37)
 	[0x47] = 0x46, // ScrollLock
-	[0x48] = 0x00, // Pause (complex sequence, handled specially)
+	[0x48] = 0x00, // Pause (E1 sequence, sent by hid_kbd_key())
 	// 0x49-0x52: Navigation keys (these generate E0-prefixed scan codes)
 	[0x49] = 0x52, // Insert (E0 52)
 	[0x4A] = 0x47, // Home (E0 47)
@@ -217,6 +217,26 @@ static const uint8_t hid_to_scancode[256] = {
 	[0x61] = 0x49, // KP 9
 	[0x62] = 0x52, // KP 0
 	[0x63] = 0x53, // KP .
+	// 0x64-0x67: the 102nd key (<> on European keyboards), Application
+	// (Menu), Power, KP =
+	[0x64] = 0x56, // Non-US \ and |
+	[0x65] = 0x5D, // Application (E0 5D)
+	[0x66] = 0x5E, // Power (E0 5E)
+	[0x67] = 0x59, // KP =
+	// 0x7F-0x81: Mute, Volume Up, Volume Down
+	[0x7F] = 0x20, // Mute (E0 20)
+	[0x80] = 0x30, // Volume Up (E0 30)
+	[0x81] = 0x2E, // Volume Down (E0 2E)
+	// 0x85: KP comma (Brazilian keyboards)
+	[0x85] = 0x7E,
+	// 0x87-0x8B: International1-5 (Japanese keyboards)
+	[0x87] = 0x73, // Ro
+	[0x88] = 0x70, // Katakana/Hiragana
+	[0x89] = 0x7D, // Yen
+	[0x8A] = 0x79, // Henkan
+	[0x8B] = 0x7B, // Muhenkan
+	// 0x90-0x91 (LANG1 Hangul, LANG2 Hanja) have no release code in
+	// set 1; hid_kbd_key() sends them.
 };
 
 // HID usage codes that map to extended (E0-prefixed) PS/2 scan codes
@@ -236,6 +256,12 @@ static int hid_is_extended_key(uint8_t usage)
 	case HID_KEY_UP:
 	case HID_KEY_KP_SLASH:
 	case HID_KEY_KP_ENTER:
+	case HID_KEY_PRINTSCREEN:
+	case 0x65: // Application
+	case 0x66: // Power
+	case 0x7F: // Mute
+	case 0x80: // Volume Up
+	case 0x81: // Volume Down
 		return 1;
 	default:
 		return 0;
@@ -247,14 +273,84 @@ static int hid_is_extended_key(uint8_t usage)
 // (USB HID 1.11, Appendix B.1 - Boot Keyboard Input Report)
 // ============================================================================
 
+// One key of the boot keyboard as set-1 scancodes, into the keyboard
+// subsystem's stream (keyboard_buffer_add): the console's keymap and evdev
+// both take it from there, exactly as they take the PS/2 keyboard's.
+static void hid_kbd_key(uint8_t usage, int down)
+{
+	uint8_t sc;
+
+	if (usage == HID_KEY_PAUSE) {
+		// Pause has no release; its one sequence is make and break.
+		if (down) {
+			keyboard_buffer_add(0xE1);
+			keyboard_buffer_add(0x1D);
+			keyboard_buffer_add(0x45);
+			keyboard_buffer_add(0xE1);
+			keyboard_buffer_add(0x9D);
+			keyboard_buffer_add(0xC5);
+		}
+		return;
+	}
+	if (usage == 0x90 || usage == 0x91) {
+		// LANG1 (Hangul) / LANG2 (Hanja): one byte, on the press.
+		if (down)
+			keyboard_buffer_add(usage == 0x90 ? 0xF2 : 0xF1);
+		return;
+	}
+	sc = hid_to_scancode[usage]; // 256 entries: every usage has one
+	if (sc == 0)
+		return;
+	if (hid_is_extended_key(usage))
+		keyboard_buffer_add(0xE0);
+	keyboard_buffer_add(down ? sc : (uint8_t)(sc | 0x80));
+}
+
+// The modifier byte of the boot report, bit by bit: left and right are
+// different keys (right Alt is AltGr, the third level of most layouts).
+static const struct {
+	uint8_t bit;
+	uint8_t e0;
+	uint8_t sc;
+} hid_kbd_mods[8] = {
+	{ HID_KBD_MOD_LCTRL, 0, 0x1D },	 { HID_KBD_MOD_LSHIFT, 0, 0x2A },
+	{ HID_KBD_MOD_LALT, 0, 0x38 },	 { HID_KBD_MOD_LGUI, 1, 0x5B },
+	{ HID_KBD_MOD_RCTRL, 1, 0x1D },	 { HID_KBD_MOD_RSHIFT, 0, 0x36 },
+	{ HID_KBD_MOD_RALT, 1, 0x38 },	 { HID_KBD_MOD_RGUI, 1, 0x5C },
+};
+
+static void hid_kbd_mods_changed(uint8_t prev, uint8_t now, int down)
+{
+	for (int i = 0; i < 8; i++) {
+		uint8_t b = hid_kbd_mods[i].bit;
+
+		if (!((prev ^ now) & b) || !!(now & b) != down)
+			continue;
+		if (hid_kbd_mods[i].e0)
+			keyboard_buffer_add(0xE0);
+		keyboard_buffer_add(down ? hid_kbd_mods[i].sc :
+					   (uint8_t)(hid_kbd_mods[i].sc | 0x80));
+	}
+}
+
+static int hid_kbd_has_key(const uint8_t *keys, uint8_t key)
+{
+	for (int j = 0; j < HID_BOOT_KBD_MAX_KEYS; j++)
+		if (keys[j] == key)
+			return 1;
+	return 0;
+}
+
 // Process a Boot Protocol keyboard input report.
 // Report format (8 bytes):
 //   Byte 0: Modifier keys (bitmap of Ctrl/Shift/Alt/GUI)
 //   Byte 1: Reserved (OEM use)
 //   Byte 2-7: Key codes (up to 6 simultaneous keys)
 //
-// We translate HID usage codes to PS/2 scan codes and inject them into
-// the existing keyboard subsystem via keyboard_irq_handler() path.
+// The report is a snapshot of the keys held; the difference to the previous
+// one is the key events.  Releases go first, modifiers before keys, so that
+// releasing Shift and pressing the next key in one report types that key
+// unshifted, and pressing Shift with a key types it shifted.
 static void hid_process_keyboard_report(usbhid_device_t *hdev,
 					const uint8_t *report, uint8_t len)
 {
@@ -266,224 +362,27 @@ static void hid_process_keyboard_report(usbhid_device_t *hdev,
 	const uint8_t *keys = &report[2];
 	const uint8_t *prev_keys = &hdev->prev_report[2];
 
-	tty_t *tty = tty_get_console();
-	if (!tty)
+	// ErrorRollOver: more keys are down than the report can name, so it
+	// says nothing about which.  Keep the previous state.
+	if (hid_kbd_has_key(keys, HID_KEY_ERR_ROLLOVER))
 		return;
 
-	// --- Process modifier key changes ---
-	// Each modifier bit maps to a virtual key press/release.
-	// We translate them to the appropriate keyboard_buffer_add() calls.
+	hid_kbd_mods_changed(prev_modifiers, modifiers, 0);
+	for (int i = 0; i < HID_BOOT_KBD_MAX_KEYS; i++) {
+		uint8_t k = prev_keys[i];
 
-	// Check for Shift changes
-	uint8_t shift_pressed =
-		(modifiers & (HID_KBD_MOD_LSHIFT | HID_KBD_MOD_RSHIFT)) ? 1 : 0;
-	uint8_t prev_shift =
-		(prev_modifiers & (HID_KBD_MOD_LSHIFT | HID_KBD_MOD_RSHIFT)) ?
-			1 :
-			0;
-
-	if (shift_pressed && !prev_shift) {
-		// Shift pressed - inject Left Shift make code
-		keyboard_buffer_add(0x2A); // KEY_LSHIFT make
-	} else if (!shift_pressed && prev_shift) {
-		// Shift released - inject Left Shift break code
-		keyboard_buffer_add(0x2A | 0x80); // KEY_LSHIFT break
+		if (k > HID_KEY_ERR_UNDEFINED && !hid_kbd_has_key(keys, k))
+			hid_kbd_key(k, 0);
 	}
+	hid_kbd_mods_changed(prev_modifiers, modifiers, 1);
+	for (int i = 0; i < HID_BOOT_KBD_MAX_KEYS; i++) {
+		uint8_t k = keys[i];
 
-	// Check for Ctrl changes
-	uint8_t ctrl_pressed =
-		(modifiers & (HID_KBD_MOD_LCTRL | HID_KBD_MOD_RCTRL)) ? 1 : 0;
-	uint8_t prev_ctrl =
-		(prev_modifiers & (HID_KBD_MOD_LCTRL | HID_KBD_MOD_RCTRL)) ? 1 :
-									     0;
-
-	if (ctrl_pressed && !prev_ctrl) {
-		keyboard_buffer_add(0x1D); // KEY_CTRL make
-	} else if (!ctrl_pressed && prev_ctrl) {
-		keyboard_buffer_add(0x1D | 0x80); // KEY_CTRL break
-	}
-
-	// Check for Alt changes
-	uint8_t alt_pressed =
-		(modifiers & (HID_KBD_MOD_LALT | HID_KBD_MOD_RALT)) ? 1 : 0;
-	uint8_t prev_alt =
-		(prev_modifiers & (HID_KBD_MOD_LALT | HID_KBD_MOD_RALT)) ? 1 :
-									   0;
-
-	if (alt_pressed && !prev_alt) {
-		keyboard_buffer_add(0x38); // KEY_ALT make
-	} else if (!alt_pressed && prev_alt) {
-		keyboard_buffer_add(0x38 | 0x80); // KEY_ALT break
+		if (k > HID_KEY_ERR_UNDEFINED && !hid_kbd_has_key(prev_keys, k))
+			hid_kbd_key(k, 1);
 	}
 
 	hdev->kbd_modifiers = modifiers;
-
-	// --- Process key releases ---
-	// Find keys in previous report that are NOT in current report → released
-	for (int i = 0; i < HID_BOOT_KBD_MAX_KEYS; i++) {
-		uint8_t prev_key = prev_keys[i];
-		if (prev_key == 0 || prev_key >= 0x04) {
-			if (prev_key == 0)
-				continue;
-
-			// Check if this key is still in the current report
-			int still_pressed = 0;
-			for (int j = 0; j < HID_BOOT_KBD_MAX_KEYS; j++) {
-				if (keys[j] == prev_key) {
-					still_pressed = 1;
-					break;
-				}
-			}
-
-			if (!still_pressed &&
-			    prev_key < sizeof(hid_to_scancode)) {
-				uint8_t sc = hid_to_scancode[prev_key];
-				if (sc != 0) {
-					if (hid_is_extended_key(prev_key)) {
-						// Inject E0 prefix then break code
-						keyboard_buffer_add(0xE0);
-					}
-					keyboard_buffer_add(sc |
-							    0x80); // Break code
-					// Also feed the release through the keyboard IRQ handler path
-					// for proper modifier tracking
-				}
-			}
-		}
-	}
-
-	// --- Process key presses ---
-	// Find keys in current report that are NOT in previous report → newly pressed
-	for (int i = 0; i < HID_BOOT_KBD_MAX_KEYS; i++) {
-		uint8_t key = keys[i];
-		if (key == 0 || key <= HID_KEY_ERR_UNDEFINED)
-			continue;
-
-		// Check if this key was already in the previous report
-		int was_pressed = 0;
-		for (int j = 0; j < HID_BOOT_KBD_MAX_KEYS; j++) {
-			if (prev_keys[j] == key) {
-				was_pressed = 1;
-				break;
-			}
-		}
-
-		if (!was_pressed) {
-			// Newly pressed key - translate and inject
-
-			// Handle navigation and special keys that generate escape sequences
-			// directly through the TTY, similar to what keyboard_irq_handler does
-			// for E0-prefixed keys.
-			if (hid_is_extended_key(key)) {
-				// Generate the ANSI escape sequence directly
-				switch (key) {
-				case HID_KEY_UP:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, 'A', 0);
-					continue;
-				case HID_KEY_DOWN:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, 'B', 0);
-					continue;
-				case HID_KEY_RIGHT:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, 'C', 0);
-					continue;
-				case HID_KEY_LEFT:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, 'D', 0);
-					continue;
-				case HID_KEY_HOME:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, 'H', 0);
-					continue;
-				case HID_KEY_END:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, 'F', 0);
-					continue;
-				case HID_KEY_PAGEUP:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, '5', 0);
-					tty_input_char(tty, '~', 0);
-					continue;
-				case HID_KEY_PAGEDOWN:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, '6', 0);
-					tty_input_char(tty, '~', 0);
-					continue;
-				case HID_KEY_INSERT:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, '2', 0);
-					tty_input_char(tty, '~', 0);
-					continue;
-				case HID_KEY_DELETE:
-					tty_input_char(tty, 27, 0);
-					tty_input_char(tty, '[', 0);
-					tty_input_char(tty, '3', 0);
-					tty_input_char(tty, '~', 0);
-					continue;
-				}
-			}
-
-			// For regular keys, translate HID usage to PS/2 scan code
-			// and inject into the keyboard subsystem
-			if (key < sizeof(hid_to_scancode)) {
-				uint8_t sc = hid_to_scancode[key];
-				if (sc != 0) {
-					// Feed the scan code to the keyboard handler
-					// This will handle conversion to ASCII and TTY input
-					keyboard_buffer_add(sc);
-
-					// Also directly convert to ASCII and feed TTY
-					// (keyboard_irq_handler processes the buffer, but we
-					//  feed TTY directly for immediate response)
-					char ch = scan_code_to_ascii(
-						sc, shift_pressed);
-					if (ch) {
-						if (alt_pressed) {
-							tty_input_char(
-								tty, 27,
-								0); // ESC prefix for Alt
-						}
-						tty_input_char(tty, ch,
-							       ctrl_pressed);
-					}
-				}
-			}
-
-			// Handle F1-F12 keys (generate xterm escape sequences)
-			if (key >= HID_KEY_F1 && key <= HID_KEY_F12) {
-				int fnum = key - HID_KEY_F1 + 1;
-				tty_input_char(tty, 27, 0); // ESC
-				if (fnum <= 4) {
-					// F1-F4: \033OP .. \033OS
-					tty_input_char(tty, 'O', 0);
-					tty_input_char(
-						tty, (char)('P' + fnum - 1), 0);
-				} else {
-					// F5-F12: \033[N~ where N varies
-					static const char *fseq[] = {
-						"15", "17", "18", "19",
-						"20", "21", "23", "24"
-					};
-					const char *s = fseq[fnum - 5];
-					tty_input_char(tty, '[', 0);
-					while (*s)
-						tty_input_char(tty, *s++, 0);
-					tty_input_char(tty, '~', 0);
-				}
-			}
-		}
-	}
 
 	// Save report for next comparison
 	hid_memcpy(hdev->prev_report, report, HID_BOOT_KBD_REPORT_SIZE);
@@ -1092,8 +991,8 @@ int usbhid_irq_completion(xhci_controller_t *ctrl, uint8_t slot, uint8_t ep_id,
 			received, cc);
 
 		// Process the report immediately in IRQ context.
-		// keyboard_buffer_add() and tty_input_char() are safe to call here –
-		// they use their own irqsave spinlocks internally.
+		// keyboard_buffer_add() is safe to call here -- the keyboard
+		// subsystem and the terminal use their own irqsave spinlocks.
 		if (hdev->type == USBHID_TYPE_KEYBOARD &&
 		    received >= HID_BOOT_KBD_REPORT_SIZE) {
 			hid_process_keyboard_report(hdev, hdev->report_buf,
@@ -1813,6 +1712,33 @@ void usbhid_poll(void)
 			hdev->needs_resubmit = 0;
 			hid_submit_interrupt_in(hdev);
 			continue;
+		}
+
+		// --- Lock LEDs: a boot keyboard shows what its output report
+		//     says (bit 0 Num, 1 Caps, 2 Scroll), set with SET_REPORT.
+		//     A control transfer cannot be made from the completion
+		//     interrupt, so the console's LED state is picked up here. ---
+		if (hdev->type == USBHID_TYPE_KEYBOARD) {
+			uint8_t want = keyboard_led_state();
+			uint8_t bits = (uint8_t)(((want & 0x02) ? 0x01 : 0) |
+						 ((want & 0x04) ? 0x02 : 0) |
+						 ((want & 0x01) ? 0x04 : 0));
+
+			if (bits != hdev->kbd_leds) {
+				// Past the input report in the same DMA page
+				// (see hid_alloc_report_buffer), so the pending
+				// interrupt transfer is not disturbed.
+				uint8_t *out = hdev->report_buf + 2048;
+
+				hdev->kbd_leds = bits;
+				out[0] = bits;
+				xhci_control_transfer(
+					hdev->ctrl, hdev->usb_dev,
+					USB_RT_H2D | USB_RT_CLASS | USB_RT_IFACE,
+					HID_REQ_SET_REPORT,
+					(uint16_t)(HID_REPORT_TYPE_OUTPUT << 8),
+					hdev->interface_num, 1, out);
+			}
 		}
 
 		// --- (b)/(c) Catch any completed-but-unprocessed transfers or

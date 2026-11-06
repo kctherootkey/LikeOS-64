@@ -168,10 +168,17 @@
 /ports/xorg/gtk3/llvm-*.tar.xz
 #     And the one archive that is not a tarball but hits the same wall: the
 #     Noto Sans release zip (~117 MB), also over the 100 MB limit.  Every
-#     other archive here is tracked, including the other zip
-#     (hunspell-en_US, 194 KB) -- this one is excluded for its size alone,
+#     other archive here is tracked except the Noto ones below, including the
+#     other zip (hunspell-en_US, 194 KB) -- this one is excluded for its size alone,
 #     and fetch.sh pulls it on a fresh clone exactly as it does LLVM.
 /ports/xorg/gtk3/NotoSans-*.zip
+#     The per-script Noto releases and the Noto Sans CJK collections go the
+#     same way.  The CJK archive alone (~105 MB) is over the limit, and the
+#     thirty-three script archives add another ~300 MB of weights, widths and
+#     variable masters of which only the Regular and Bold faces are used; a
+#     repository should not carry that forever.  Their checksums are recorded
+#     like every other archive's, and fetch.sh pulls them on a fresh clone.
+/ports/xorg/gtk3/Noto*-*.zip
 #     Not listed, therefore tracked, and all required to build from a clone:
 #     packages.list (the manifest), fetch/unpack/build/stage/clean.sh, and
 #     checksums.sha256 (records which upstream bytes a build used).

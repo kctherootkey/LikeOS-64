@@ -552,6 +552,149 @@ static void setup_machine_id(void)
 			strerror(errno));
 }
 
+/* The console keymap of the machine's keyboard setting, loaded before the
+ * first getty so that the login prompt already types what the keyboard says.
+ *
+ * /etc/likeos/keyboard.conf names XKB layouts (LAYOUT=de,us, VARIANT=...);
+ * the console uses the first one, and the layout catalogue says which
+ * console keymap that is.  Nothing is loaded when the file is missing or
+ * names the US layout: the kernel's built-in keymap is the US one.  The
+ * keymap loader is given a few seconds and then abandoned -- a keyboard
+ * setting must never be what keeps the machine from reaching a login
+ * prompt, and the built-in keymap still types. */
+#define KEYBOARD_CONF      "/etc/likeos/keyboard.conf"
+#define KEYBOARD_CATALOGUE "/usr/share/likeos/keyboard/layouts.tsv"
+#define LOADKEYS_PATH      "/bin/loadkeys"
+#define LOADKEYS_TIMEOUT_MS 10000
+
+/* The first item of a "KEY=a,b,c" value, without quotes or blanks. */
+static void first_item(const char *value, char *out, size_t cap)
+{
+	size_t n = 0;
+
+	while (*value == ' ' || *value == '\t' || *value == '"' ||
+	       *value == '\'')
+		value++;
+	while (value[n] && strchr(",\"' \t\r\n#", value[n]) == NULL)
+		n++;
+	if (n >= cap)
+		n = 0;
+	memcpy(out, value, n);
+	out[n] = '\0';
+}
+
+/* Field `idx' of a TAB-separated catalogue line. */
+static int catalogue_field(const char *line, int idx, char *out, size_t cap)
+{
+	const char *p = line;
+	size_t n;
+
+	for (int i = 0; i < idx; i++) {
+		p = strchr(p, '\t');
+		if (!p)
+			return 0;
+		p++;
+	}
+	n = strcspn(p, "\t\r\n");
+	if (n >= cap)
+		return 0;
+	memcpy(out, p, n);
+	out[n] = '\0';
+	return 1;
+}
+
+static void load_console_keymap(void)
+{
+	char line[512], layout[64] = "", variant[64] = "", id[64] = "";
+	char argv_id[64];
+	char *argv[5];
+	FILE *f;
+	pid_t pid;
+	int waited = 0;
+
+	f = fopen(KEYBOARD_CONF, "r");
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "LAYOUT=", 7) == 0)
+			first_item(line + 7, layout, sizeof(layout));
+		else if (strncmp(line, "VARIANT=", 8) == 0)
+			first_item(line + 8, variant, sizeof(variant));
+	}
+	fclose(f);
+	if (!layout[0] || (strcmp(layout, "us") == 0 && !variant[0]))
+		return;
+
+	f = fopen(KEYBOARD_CATALOGUE, "r");
+	if (!f) {
+		fprintf(stderr, "init: %s: %s\n", KEYBOARD_CATALOGUE,
+			strerror(errno));
+		return;
+	}
+	while (!id[0] && fgets(line, sizeof(line), f)) {
+		char lid[64], llay[64], lvar[64];
+
+		if (line[0] == '#' || line[0] == '\n')
+			continue;
+		if (catalogue_field(line, 0, lid, sizeof(lid)) &&
+		    catalogue_field(line, 3, llay, sizeof(llay)) &&
+		    catalogue_field(line, 4, lvar, sizeof(lvar)) &&
+		    strcmp(llay, layout) == 0 && strcmp(lvar, variant) == 0)
+			memcpy(id, lid, sizeof(id));
+	}
+	fclose(f);
+	if (!id[0]) {
+		fprintf(stderr, "init: %s: layout %s%s%s%s is not in %s\n",
+			KEYBOARD_CONF, layout, variant[0] ? "(" : "", variant,
+			variant[0] ? ")" : "", KEYBOARD_CATALOGUE);
+		return;
+	}
+	if (strcmp(id, "us") == 0)
+		return;
+
+	memcpy(argv_id, id, sizeof(argv_id));
+	argv[0] = "loadkeys";
+	argv[1] = "-q";
+	argv[2] = "--no-save";
+	argv[3] = argv_id;
+	argv[4] = NULL;
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "init: fork for %s: %s\n", LOADKEYS_PATH,
+			strerror(errno));
+		return;
+	}
+	if (pid == 0) {
+		execv(LOADKEYS_PATH, argv);
+		fprintf(stderr, "init: %s: %s\n", LOADKEYS_PATH,
+			strerror(errno));
+		_exit(127);
+	}
+	for (;;) {
+		int status;
+		pid_t w = waitpid(pid, &status, WNOHANG);
+
+		if (w == pid) {
+			if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+				fprintf(stderr, "init: loading the console "
+					"keymap %s failed\n", id);
+			return;
+		}
+		if (w < 0 && errno != EINTR)
+			return;
+		if (waited >= LOADKEYS_TIMEOUT_MS) {
+			fprintf(stderr, "init: %s %s did not finish; "
+				"keeping the built-in keymap\n",
+				LOADKEYS_PATH, id);
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			return;
+		}
+		usleep(50 * 1000);
+		waited += 50;
+	}
+}
+
 int main(void)
 {
 	int i;
@@ -565,6 +708,7 @@ int main(void)
 	setenv("LANG", LANG_DEFAULT, 1);
 	export_timezone();
 	setup_machine_id();
+	load_console_keymap();
 
 	load_inittab();
 

@@ -1,0 +1,191 @@
+Include this platform's console keyboard headers.
+
+The KD* requests, their structures and the key symbol definitions are the
+established console keyboard interface, unchanged; on this platform they are
+reached as <sys/kd.h> and <sys/keyboard.h>.  One #ifdef per include site and
+nothing else changes.  kbd_mode also asks a kernel version header whether
+K_OFF exists; here it always has.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/dumpkeys.c
++++ b/src/dumpkeys.c
+@@ -11,8 +11,15 @@
+ #include <fcntl.h>
+ #include <getopt.h>
+ #include <unistd.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#include <sys/keyboard.h>
++#else
+ #include <linux/kd.h>
+ #include <linux/keyboard.h>
++#endif
+ #include <sys/ioctl.h>
+ #include <string.h>
+ #include <errno.h>
+--- a/src/include/kbd/keymap/context.h
++++ b/src/include/kbd/keymap/context.h
+@@ -6,8 +6,15 @@
+ #ifndef _KBD_LIBKEYMAP_CONTEXT_H_
+ #define _KBD_LIBKEYMAP_CONTEXT_H_
+ 
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#include <sys/keyboard.h>
++#else
+ #include <linux/kd.h>
+ #include <linux/keyboard.h>
++#endif
+ 
+ #include <kbd/compiler_attributes.h>
+ 
+--- a/src/kbd_mode.c
++++ b/src/kbd_mode.c
+@@ -15,14 +15,27 @@
+ #include <unistd.h>
+ #include <sysexits.h>
+ #include <sys/ioctl.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#else
+ #include <linux/kd.h>
++#endif
++#ifndef __LIKEOS__
+ #include <linux/version.h>
++#endif
+ 
+ #include "libcommon.h"
+ 
++/* K_OFF is part of this platform's keyboard interface from the start. */
++#ifdef __LIKEOS__
++#define HAS_K_OFF
++#else
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+ #define HAS_K_OFF
+ #endif
++#endif
+ 
+ static void KBD_ATTR_NORETURN
+ usage(int rc, const struct kbd_help *options)
+--- a/src/libcommon/getfd.c
++++ b/src/libcommon/getfd.c
+@@ -6,7 +6,13 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <sys/ioctl.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#else
+ #include <linux/kd.h>
++#endif
+ 
+ #include "libcommon.h"
+ 
+--- a/src/libkeymap/ksyms.c
++++ b/src/libkeymap/ksyms.c
+@@ -1,6 +1,12 @@
+ #include "config.h"
+ 
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/keyboard.h>
++#else
+ #include <linux/keyboard.h>
++#endif
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
+--- a/src/libkeymap/loadkeys.c
++++ b/src/libkeymap/loadkeys.c
+@@ -4,8 +4,15 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#include <sys/keyboard.h>
++#else
+ #include <linux/kd.h>
+ #include <linux/keyboard.h>
++#endif
+ #include <unistd.h>
+ 
+ #include "keymap.h"
+--- a/src/libkeymap/modifiers.h
++++ b/src/libkeymap/modifiers.h
+@@ -1,7 +1,13 @@
+ #ifndef _MODIFIERS_H
+ #define _MODIFIERS_H
+ 
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/keyboard.h>
++#else
+ #include <linux/keyboard.h>
++#endif
+ 
+ #define M_PLAIN 0
+ #define M_SHIFT (1 << KG_SHIFT)
+--- a/src/setleds.c
++++ b/src/setleds.c
+@@ -9,7 +9,13 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <sysexits.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#else
+ #include <linux/kd.h>
++#endif
+ #include <sys/ioctl.h>
+ 
+ #include "array_size.h"
+--- a/src/setmetamode.c
++++ b/src/setmetamode.c
+@@ -14,7 +14,13 @@
+ #include <fcntl.h>
+ #include <getopt.h>
+ #include <sysexits.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#else
+ #include <linux/kd.h>
++#endif
+ #include <sys/ioctl.h>
+ 
+ #include "array_size.h"
+--- a/src/showkey.c
++++ b/src/showkey.c
+@@ -11,8 +11,15 @@
+ #include <termios.h>
+ #include <sysexits.h>
+ #include <sys/ioctl.h>
++/* The console keyboard interface is reached through this platform's
++ * own headers; requests, structures and symbols are the same. */
++#ifdef __LIKEOS__
++#include <sys/kd.h>
++#include <sys/keyboard.h>
++#else
+ #include <linux/kd.h>
+ #include <linux/keyboard.h>
++#endif
+ 
+ #include "libcommon.h"
+ 

@@ -1,0 +1,18 @@
+[Desktop Entry]
+# Desktop entry for the Display settings window (likeos-display-settings,
+# user/bin/shell/display-settings.c).  Opened from the Settings window and
+# the Control Center's Display row, so it is kept out of the menus, where
+# Settings stands for it; the taskbar uses it to give the window its icon.
+#
+# Copyright (C) 2026 The LikeOS Project
+Type=Application
+Version=1.0
+Name=Display settings
+Comment=Resolution and layout of the screen
+Exec=likeos-display-settings
+Icon=preferences-desktop-display
+Terminal=false
+StartupNotify=false
+NoDisplay=true
+Categories=Settings;HardwareSettings;
+Keywords=display;screen;resolution;monitor;

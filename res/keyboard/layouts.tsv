@@ -1,0 +1,137 @@
+# /usr/share/likeos/keyboard/layouts.tsv - the keyboard layouts of LikeOS
+#
+# One layout per line, five fields separated by a TAB:
+#
+#   id  name  language  xkb_layout  xkb_variant
+#
+#   id           the console keymap's name (/usr/share/keymaps/<id>.map, what
+#                loadkeys takes): xkb_layout, or xkb_layout-xkb_variant, in
+#                lower case
+#   name         what Settings shows for the layout
+#   language     the language(s) it is for, Settings' second line
+#   xkb_layout   the XKB layout and variant of xkeyboard-config that the X
+#   xkb_variant  session loads (setxkbmap) and the console keymap is made
+#                from; the variant is empty for a layout's default
+#
+# Ordered by name.  The console keymaps are generated from this file at image
+# build time (host/gen-keymaps.pl), so a line added here gets its keymap.
+#
+# Copyright (C) 2026 The LikeOS Project
+al	Albanian	Albanian	al	
+et	Amharic	Amharic	et	
+ara	Arabic	Arabic	ara	
+eg	Arabic (Egypt)	Arabic	eg	
+iq	Arabic (Iraq)	Arabic	iq	
+ma	Arabic (Morocco)	Arabic	ma	
+sy	Arabic (Syria)	Arabic	sy	
+am	Armenian	Armenian	am	
+az	Azerbaijani	Azerbaijani	az	
+ml	Bambara	Bambara	ml	
+bd	Bangla	Bengali (Bangla)	bd	
+by	Belarusian	Belarusian	by	
+be	Belgian	French / Dutch / German	be	
+dz	Berber (Algeria)	Berber	dz	
+ba	Bosnian	Bosnian	ba	
+brai	Braille	Braille	brai	
+bg	Bulgarian	Bulgarian	bg	
+bg-phonetic	Bulgarian (phonetic)	Bulgarian	bg	phonetic
+mm	Burmese	Burmese	mm	
+cn	Chinese	Chinese	cn	
+hr	Croatian	Croatian	hr	
+cz	Czech	Czech	cz	
+dk	Danish	Danish	dk	
+af	Dari	Dari (Persian)	af	
+mv	Dhivehi	Dhivehi	mv	
+nl	Dutch	Dutch	nl	
+bt	Dzongkha	Dzongkha	bt	
+au	English (Australia)	English	au	
+cm	English (Cameroon)	English	cm	
+gh	English (Ghana)	English	gh	
+nz	English (New Zealand)	English	nz	
+ng	English (Nigeria)	English	ng	
+za	English (South Africa)	English	za	
+gb	English (UK)	English	gb	
+us	English (US)	English	us	
+epo	Esperanto	Esperanto	epo	
+ee	Estonian	Estonian	ee	
+fo	Faroese	Faroese	fo	
+ph	Filipino	Filipino	ph	
+fi	Finnish	Finnish	fi	
+fr	French	French	fr	
+fr-azerty	French (AZERTY)	French	fr	azerty
+fr-bepo	French (BEPO)	French	fr	bepo
+ca	French (Canada)	French	ca	
+cd	French (Democratic Republic of the Congo)	French	cd	
+fr-ergol	French (Ergo-L)	French	fr	ergol
+tg	French (Togo)	French	tg	
+ge	Georgian	Georgian	ge	
+de	German	German	de	
+at	German (Austria)	German	at	
+de-neo	German (Neo 2)	German	de	neo
+de-nodeadkeys	German (no dead keys)	German	de	nodeadkeys
+de-qwerty	German (QWERTY)	German	de	qwerty
+ch	German (Switzerland)	German	ch	
+gr	Greek	Greek	gr	
+il	Hebrew	Hebrew	il	
+hu	Hungarian	Hungarian	hu	
+is	Icelandic	Icelandic	is	
+in	Indian	Multiple Indian languages	in	
+id	Indonesian	Indonesian	id	
+ie	Irish	Irish	ie	
+it	Italian	Italian	it	
+jp	Japanese	Japanese	jp	
+jp-kana	Japanese (Kana)	Japanese	jp	kana
+jp-oadg109a	Japanese (OADG 109A)	Japanese	jp	OADG109A
+kz	Kazakh	Kazakh	kz	
+kh	Khmer (Cambodia)	Khmer	kh	
+kr	Korean	Korean	kr	
+kg	Kyrgyz	Kyrgyz	kg	
+la	Lao	Lao	la	
+lv	Latvian	Latvian	lv	
+lt	Lithuanian	Lithuanian	lt	
+mk	Macedonian	Macedonian	mk	
+my	Malay	Malay	my	
+mt	Maltese	Maltese	mt	
+md	Moldavian	Romanian	md	
+mn	Mongolian	Mongolian	mn	
+me	Montenegrin	Montenegrin	me	
+np	Nepali	Nepali	np	
+gn	N'Ko	N'Ko	gn	
+no	Norwegian	Norwegian	no	
+no-colemak	Norwegian (Colemak)	Norwegian	no	colemak
+ir	Persian	Persian (Farsi)	ir	
+pl	Polish	Polish	pl	
+pl-dvorak	Polish (Dvorak)	Polish	pl	dvorak
+pt	Portuguese	Portuguese	pt	
+br	Portuguese (Brazil)	Portuguese	br	
+ro	Romanian	Romanian	ro	
+ru	Russian	Russian	ru	
+ru-phonetic	Russian (phonetic)	Russian	ru	phonetic
+rs	Serbian	Serbian	rs	
+lk	Sinhala	Sinhala	lk	
+sk	Slovak	Slovak	sk	
+si	Slovenian	Slovenian	si	
+es	Spanish	Spanish	es	
+latam	Spanish (Latin American)	Spanish	latam	
+ke	Swahili (Kenya)	Swahili	ke	
+tz	Swahili (Tanzania)	Swahili	tz	
+se	Swedish	Swedish	se	
+se-dvorak	Swedish (Dvorak)	Swedish	se	dvorak
+tw	Taiwanese	Taiwanese	tw	
+tj	Tajik	Tajik	tj	
+th	Thai	Thai	th	
+bw	Tswana	Tswana	bw	
+tr	Turkish	Turkish	tr	
+tr-f	Turkish (F)	Turkish	tr	f
+tm	Turkmen	Turkmen	tm	
+gb-dvorak	UK (Dvorak)	English	gb	dvorak
+ua	Ukrainian	Ukrainian	ua	
+ua-phonetic	Ukrainian (phonetic)	Ukrainian	ua	phonetic
+pk	Urdu (Pakistan)	Urdu	pk	
+us-colemak	US (Colemak)	English	us	colemak
+us-colemak_dh	US (Colemak-DH)	English	us	colemak_dh
+us-dvorak	US (Dvorak)	English	us	dvorak
+us-intl	US (International)	English	us	intl
+uz	Uzbek	Uzbek	uz	
+vn	Vietnamese	Vietnamese	vn	
+sn	Wolof	Wolof	sn	

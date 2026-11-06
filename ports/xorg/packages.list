@@ -91,6 +91,12 @@ lib       libpciaccess       0.18.1   libpciaccess
 # ---- keyboard data and compiler ----
 data      xkeyboard-config   2.44     xkeyboard-config
 app       xkbcomp            1.4.7    -  xorg/app/xkbcomp
+# setxkbmap: switches the running server's keyboard layout -- it resolves a
+# layout/variant/option choice through the XKB rules into keymap components
+# and has the server load them.  likeos-xkb-apply runs it at session start and
+# whenever /etc/likeos/keyboard.conf changes.  Canonical-only, like xkbcomp:
+# Debian bundles it into x11-xkb-utils.
+app       setxkbmap          1.3.5    -  xorg/app/setxkbmap
 
 # AFTER xkeyboard-config, not with the other libraries: its meson.build asks
 # pkg-config for xkeyboard-config's xkb_root and bakes the answer into its own

@@ -182,6 +182,11 @@ pkg_opts() {
 	libxcvt) echo "" ;;
 	xkeyboard-config) echo "--disable-runtime-deps --with-xkb-rules-symlink=xorg" ;;
 	xkbcomp) echo "--disable-docs" ;;
+	# The rules directory is stated rather than left to the default:
+	# setxkbmap looks its rules (evdev) up there, and it has to be the
+	# directory the server compiles its keymaps from, which is where
+	# xkeyboard-config installs on the image.
+	setxkbmap) echo "--with-xkb-config-root=/usr/share/X11/xkb" ;;
 	font-util) echo "--with-fontrootdir=/usr/share/fonts/X11" ;;
 	font-misc-misc | font-cursor-misc | font-daewoo-misc | font-isas-misc)
 		# Uncompressed .pcf, because libXfont2 here is built without zlib
@@ -1679,6 +1684,9 @@ is_dataonly() {
 	dejavu-fonts-ttf) return 0 ;;
 	liberation-fonts-ttf) return 0 ;;
 	NotoSans) return 0 ;;
+	# The per-script Noto families and the CJK collections (see
+	# gtk3/packages.list): font files only, like Noto Sans.
+	Noto*) return 0 ;;
 	Selawik) return 0 ;;
 	hunspell-en_US) return 0 ;;
 	shared-mime-info) return 0 ;;
@@ -1760,6 +1768,70 @@ install_data() {
 				"$SYSROOT/usr/share/fonts/truetype/noto/" ||
 				return 1
 		done
+		# The licence travels with the faces, as the OFL asks.  Named
+		# after the family because every Noto family in this directory
+		# brings its own copy, each with its own copyright line.
+		if [ -f OFL.txt ]; then
+			cp -f OFL.txt \
+				"$SYSROOT/usr/share/fonts/truetype/noto/NotoSans-OFL.txt" ||
+				return 1
+		fi
+		;;
+	NotoSansCJK)
+		# Two of the seven weights: Regular and Bold.  Each file is an
+		# OpenType collection holding every regional form of the design
+		# (SC, TC, HK, JP, KR and the monospaced cuts), which fontconfig
+		# lists as separate families -- one file, ten faces.  The other
+		# weights are 18 MB apiece and nothing here selects them; a bold
+		# request finds the Bold, anything lighter or heavier lands on
+		# the nearer of the two.
+		#
+		# Their own directory, apart from noto/: they are four fifths
+		# of the bytes of all the Noto faces together, and keeping them
+		# separate makes that obvious to anyone wondering where the
+		# image's size went.
+		mkdir -p "$SYSROOT/usr/share/fonts/truetype/noto-cjk" || return 1
+		for face in Regular Bold; do
+			f="NotoSansCJK-$face.ttc"
+			[ -f "$f" ] || {
+				echo "install_data: $f missing" >&2
+				return 1
+			}
+			cp -f "$f" \
+				"$SYSROOT/usr/share/fonts/truetype/noto-cjk/" ||
+				return 1
+		done
+		cp -f LICENSE \
+			"$SYSROOT/usr/share/fonts/truetype/noto-cjk/LICENSE.txt" ||
+			return 1
+		;;
+	Noto*)
+		# One script's Noto family: the hinted Regular and Bold
+		# TrueType faces, for the reason given for Noto Sans above, and
+		# none of the other weights, widths, variable masters or OTF
+		# copies the archive carries.  Every one of these archives has
+		# the same layout -- <family>/hinted/ttf/<family>-<style>.ttf
+		# with the licence at the top -- so one rule serves them all.
+		#
+		# Bold is taken when there is one.  Some families are published
+		# in a single weight (Mongolian, N'Ko, Tifinagh and others);
+		# a bold request for those is emboldened from the Regular.  A
+		# family with no Regular at all is a broken archive, not a
+		# design decision, and fails the install.
+		mkdir -p "$SYSROOT/usr/share/fonts/truetype/noto" || return 1
+		f="$1/hinted/ttf/$1-Regular.ttf"
+		[ -f "$f" ] || {
+			echo "install_data: $f missing" >&2
+			return 1
+		}
+		cp -f "$f" "$SYSROOT/usr/share/fonts/truetype/noto/" || return 1
+		f="$1/hinted/ttf/$1-Bold.ttf"
+		if [ -f "$f" ]; then
+			cp -f "$f" "$SYSROOT/usr/share/fonts/truetype/noto/" ||
+				return 1
+		fi
+		cp -f OFL.txt "$SYSROOT/usr/share/fonts/truetype/noto/$1-OFL.txt" ||
+			return 1
 		;;
 	Selawik)
 		# The five weights as TrueType: regular, bold, light, semibold

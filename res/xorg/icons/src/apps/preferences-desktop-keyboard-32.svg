@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: preferences-desktop-keyboard, 32 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#2fb5a3"/><stop offset="1" stop-color="#147a86"/></linearGradient></defs>
+<g transform="scale(0.5)">
+<path d="M16 4H48A12 12 0 0 1 60 16V48A12 12 0 0 1 48 60H16A12 12 0 0 1 4 48V16A12 12 0 0 1 16 4Z" fill="url(#g1)"/>
+<path d="M16 18H48A2 2 0 0 1 50 20V40A2 2 0 0 1 48 42H16A2 2 0 0 1 14 40V20A2 2 0 0 1 16 18Z" fill="#ffffff"/>
+<path d="M18 22H22V26H18ZM24 22H28V26H24ZM30 22H34V26H30ZM36 22H40V26H36ZM42 22H46V26H42ZM18 28H22V32H18ZM24 28H28V32H24ZM30 28H34V32H30ZM36 28H40V32H36ZM42 28H46V32H42ZM24 34H40V38H24Z" fill="#167f8a"/>
+</g>
+</svg>

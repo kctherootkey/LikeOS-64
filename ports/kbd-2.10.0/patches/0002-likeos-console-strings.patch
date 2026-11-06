@@ -1,0 +1,84 @@
+"strings as usual" means this platform's function key strings.
+
+Keymaps made by console-setup's ckbcomp end with "strings as usual", which
+makes loadkeys load a fixed set of function key strings (F1 = ESC [ [ A,
+Home = ESC [ 1 ~ ...).  The LikeOS console sends xterm's strings instead --
+F1 = ESC O P, Home = ESC [ H -- and its terminal description and its
+programs (the ncurses of the system, nano, tmux, readline) are built around
+them, so loading any generated keymap would have silently broken F1-F5,
+Home and End everywhere.  Under __LIKEOS__ the "usual" strings are the
+console's own: F1-F12 and the cursor block as the console sends them,
+F13-F20 as F1-F8 with Shift in xterm's encoding (which is where generated
+keymaps put Shift+F1..F8).  The parser source and the generated parser
+change together.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/libkeymap/parser.c
++++ b/src/libkeymap/parser.c
+@@ -319,6 +319,23 @@
+ 	 * 26 strings, mostly inspired by the VT100 family
+ 	 */
+ 	const char *stringvalues[] = {
++#ifdef __LIKEOS__
++		/*
++		 * The strings this platform's console sends: F1-F12 and the
++		 * cursor block as xterm does (what its terminal description
++		 * and its programs expect), F13-F20 as F1-F8 with Shift.
++		 */
++		/* F1 .. F20 */
++		"\033OP",    "\033OQ",    "\033OR",    "\033OS",    "\033[15~",
++		"\033[17~",  "\033[18~",  "\033[19~",  "\033[20~",  "\033[21~",
++		"\033[23~",  "\033[24~",  "\033[1;2P", "\033[1;2Q",
++		"\033[1;2R", "\033[1;2S",
++		"\033[15;2~", "\033[17;2~", "\033[18;2~", "\033[19;2~",
++		/* Find,    Insert,     Remove,     Select,     Prior */
++		"\033[H",   "\033[2~",  "\033[3~",  "\033[F",   "\033[5~",
++		/* Next,    Macro,      Help,       Do,         Pause */
++		"\033[6~",  NULL,       NULL,       NULL,       NULL
++#else
+ 		/* F1 .. F20 */
+ 		"\033[[A",  "\033[[B",  "\033[[C",  "\033[[D",  "\033[[E",
+ 		"\033[17~", "\033[18~", "\033[19~", "\033[20~", "\033[21~",
+@@ -329,6 +346,7 @@
+ 		"\033[1~",  "\033[2~",  "\033[3~",  "\033[4~",  "\033[5~",
+ 		/* Next,    Macro,      Help,       Do,         Pause */
+ 		"\033[6~",  NULL,       NULL,       NULL,       NULL
++#endif
+ 	};
+ 	unsigned char i;
+ 
+--- a/src/libkeymap/parser.y
++++ b/src/libkeymap/parser.y
+@@ -82,6 +82,23 @@
+ 	 * 26 strings, mostly inspired by the VT100 family
+ 	 */
+ 	const char *stringvalues[] = {
++#ifdef __LIKEOS__
++		/*
++		 * The strings this platform's console sends: F1-F12 and the
++		 * cursor block as xterm does (what its terminal description
++		 * and its programs expect), F13-F20 as F1-F8 with Shift.
++		 */
++		/* F1 .. F20 */
++		"\033OP",    "\033OQ",    "\033OR",    "\033OS",    "\033[15~",
++		"\033[17~",  "\033[18~",  "\033[19~",  "\033[20~",  "\033[21~",
++		"\033[23~",  "\033[24~",  "\033[1;2P", "\033[1;2Q",
++		"\033[1;2R", "\033[1;2S",
++		"\033[15;2~", "\033[17;2~", "\033[18;2~", "\033[19;2~",
++		/* Find,    Insert,     Remove,     Select,     Prior */
++		"\033[H",   "\033[2~",  "\033[3~",  "\033[F",   "\033[5~",
++		/* Next,    Macro,      Help,       Do,         Pause */
++		"\033[6~",  NULL,       NULL,       NULL,       NULL
++#else
+ 		/* F1 .. F20 */
+ 		"\033[[A",  "\033[[B",  "\033[[C",  "\033[[D",  "\033[[E",
+ 		"\033[17~", "\033[18~", "\033[19~", "\033[20~", "\033[21~",
+@@ -92,6 +109,7 @@
+ 		"\033[1~",  "\033[2~",  "\033[3~",  "\033[4~",  "\033[5~",
+ 		/* Next,    Macro,      Help,       Do,         Pause */
+ 		"\033[6~",  NULL,       NULL,       NULL,       NULL
++#endif
+ 	};
+ 	unsigned char i;
+ 

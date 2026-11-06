@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS icon: preferences-desktop-keyboard, 24 pixels.
+     Drawn by res/xorg/icons/draw-icons.py: edit that, not this file.
+     Copyright (C) 2026 The LikeOS Project -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<defs><linearGradient id="g1" gradientUnits="userSpaceOnUse" x1="5.333" y1="5.333" x2="35.2" y2="58.667"><stop offset="0" stop-color="#2fb5a3"/><stop offset="1" stop-color="#147a86"/></linearGradient></defs>
+<g transform="scale(0.375)">
+<path d="M17.333 5.333H46.667A12 12 0 0 1 58.667 17.333V46.667A12 12 0 0 1 46.667 58.667H17.333A12 12 0 0 1 5.333 46.667V17.333A12 12 0 0 1 17.333 5.333Z" fill="url(#g1)"/>
+<path d="M13.333 18.667H50.667A2.667 2.667 0 0 1 53.333 21.333V42.667A2.667 2.667 0 0 1 50.667 45.333H13.333A2.667 2.667 0 0 1 10.667 42.667V21.333A2.667 2.667 0 0 1 13.333 18.667Z" fill="#ffffff"/>
+<path d="M13.333 21.333H18.667V26.667H13.333ZM21.333 21.333H26.667V26.667H21.333ZM29.333 21.333H34.667V26.667H29.333ZM37.333 21.333H42.667V26.667H37.333ZM45.333 21.333H50.667V26.667H45.333ZM13.333 29.333H18.667V34.667H13.333ZM21.333 29.333H26.667V34.667H21.333ZM29.333 29.333H34.667V34.667H29.333ZM37.333 29.333H42.667V34.667H37.333ZM45.333 29.333H50.667V34.667H45.333ZM21.333 37.333H42.667V42.667H21.333Z" fill="#167f8a"/>
+</g>
+</svg>

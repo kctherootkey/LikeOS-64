@@ -1,0 +1,18 @@
+[Desktop Entry]
+# Desktop entry for the Keyboard settings window (likeos-keyboard-settings,
+# user/bin/shell/keyboard-settings.c).  Opened from the Settings window and
+# the Control Center's Keyboard row, so it is kept out of the menus, where
+# Settings stands for it; the taskbar uses it to give the window its icon.
+#
+# Copyright (C) 2026 The LikeOS Project
+Type=Application
+Version=1.0
+Name=Keyboard settings
+Comment=Keyboard layouts and the shortcut that switches between them
+Exec=likeos-keyboard-settings
+Icon=preferences-desktop-keyboard
+Terminal=false
+StartupNotify=false
+NoDisplay=true
+Categories=Settings;HardwareSettings;
+Keywords=keyboard;layout;language;input;keymap;

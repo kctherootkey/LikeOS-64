@@ -2351,6 +2351,46 @@ def a_display(cv):
 		cv.path(''.join(d), stroke='#ffffff', sw=sw * 0.7)
 
 
+def a_keyboard(cv):
+	"""Keyboard settings: a white keyboard on a teal tile, its keys cut
+	out of it in the tile's own colour."""
+	tile(cv, '#2fb5a3', '#147a86')
+	if cv.px == 16:
+		tile_pixels(cv, ['############', '#.#.#.#.#.##', '############',
+				 '##.#.#.#.#.#', '############', '###......###',
+				 '############'])
+		return
+	hole = '#167f8a'
+	if cv.master:
+		body = (12, 19, 52, 45)
+		r, key, pitch = 4, 4.4, 7
+		cols = [16 + i * pitch for i in range(5)]
+		rows = [23.5, 30.5]
+		space = (23, 37.5, 41.4, 41.9)
+	else:
+		# In pixels of the size drawn: 2-pixel keys a pixel apart.
+		body, cols, rows, space = cv.pick(
+			None,
+			((4, 7, 20, 17), [5, 8, 11, 14, 17], [8, 11],
+			 (8, 14, 16, 16)),
+			((7, 9, 25, 21), [9, 12, 15, 18, 21], [11, 14],
+			 (12, 17, 20, 19)), None)
+		body = tuple(cv.u(v) for v in body)
+		cols = [cv.u(v) for v in cols]
+		rows = [cv.u(v) for v in rows]
+		space = tuple(cv.u(v) for v in space)
+		r, key = cv.u(1), cv.u(2)
+	cv.path(rr(*body, r), fill='#ffffff')
+	keys = []
+	for y in rows:
+		for x in cols:
+			keys.append(rr(x, y, x + key, y + key,
+				       1 if cv.master else 0))
+	keys.append(rr(space[0], space[1], space[2], space[3],
+		       1 if cv.master else 0))
+	cv.path(''.join(keys), fill=hole)
+
+
 def a_wallpaper(cv):
 	x0, y0, x1, y1 = tile(cv, '#7fb8ff', '#3b74f0')
 	r = cv.pick(cv.u(3), cv.u(4.5), cv.u(6), 13)
@@ -2608,6 +2648,7 @@ ICONS = {
 		'image-viewer': a_image_viewer,
 		'preferences-system': a_settings,
 		'preferences-desktop-display': a_display,
+		'preferences-desktop-keyboard': a_keyboard,
 		'preferences-desktop-wallpaper': a_wallpaper,
 		'avatar-default': a_avatar,
 		'web-browser': a_browser,

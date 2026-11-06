@@ -75,6 +75,10 @@ done
 # ---------------------------------------------------------------------------
 cp "$SYSROOT/usr/bin/Xorg" "$DEST/usr/bin/Xorg"
 cp "$SYSROOT/usr/bin/xkbcomp" "$DEST/usr/bin/xkbcomp"
+# setxkbmap switches the running server to the layout in
+# /etc/likeos/keyboard.conf (likeos-xkb-apply): the session's keyboard is
+# chosen at runtime, so it is as much a part of the keyboard as xkbcomp.
+cp "$SYSROOT/usr/bin/setxkbmap" "$DEST/usr/bin/setxkbmap"
 ln -sfn Xorg "$DEST/usr/bin/X"
 
 # Xorg is setuid root.

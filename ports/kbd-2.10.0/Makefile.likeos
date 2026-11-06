@@ -1,0 +1,86 @@
+# Makefile.likeos - build the console keyboard tools of kbd 2.10.0 for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; the programs are
+# compiled here directly (kbd's own build is autotools, which a hand build of
+# these few files does not need).  config.h in this directory stands in for
+# what configure would write.
+#
+# Output (build/): loadkeys, dumpkeys -- the keymap of the console --, and
+# kbd_mode, setleds, setmetamode, showkey for its keyboard mode, LEDs, Meta
+# handling and raw key codes.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src/src
+B := build
+
+CFLAGS = -Wall -O2 -nostdlib -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE -D_GNU_SOURCE -D__LIKEOS__ \
+         -I. -I$(S)/include -I$(S)/libcommon -I$(S)/libkeymap \
+         -I$(LIBC_DIR)/include
+# Upstream code, upstream warnings: they are not this port's to fix.
+CFLAGS += -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBS = -lc -l:ld-likeos.so
+
+LIB_SRC = libkeymap/analyze.c libkeymap/array.c libkeymap/common.c \
+          libkeymap/diacr.c libkeymap/dump.c libkeymap/func.c \
+          libkeymap/kernel.c libkeymap/kmap.c libkeymap/ksyms.c \
+          libkeymap/loadkeys.c libkeymap/modifiers.c libkeymap/parser.c \
+          libkeymap/summary.c \
+          libkbdfile/init.c libkbdfile/kbdfile.c \
+          libcommon/error.c libcommon/getfd.c libcommon/version.c
+LIB_OBJ = $(addprefix $(B)/,$(LIB_SRC:.c=.o))
+
+PROGS = loadkeys dumpkeys kbd_mode setleds setmetamode showkey
+TARGETS = $(addprefix $(B)/,$(PROGS))
+
+# The tree first: the pattern rules below can only match files that exist.
+# No implicit rules: the tarball ships its generated parser and lexer, and
+# they must not be regenerated with whatever yacc or lex the build host has.
+.SUFFIXES:
+%.c: %.y
+%.c: %.l
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): kbd-2.10.0.tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(B)/%.o: $(S)/%.c $(SRC_STAMP) config.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/loadkeys: $(B)/loadkeys.o $(B)/likeos-keyboard.o $(LIB_OBJ) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(B)/loadkeys.o $(B)/likeos-keyboard.o $(LIB_OBJ) $(LIBS) -o $@
+
+$(B)/%: $(B)/%.o $(LIB_OBJ) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $< $(LIB_OBJ) $(LIBS) -o $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

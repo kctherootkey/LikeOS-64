@@ -1,5 +1,5 @@
 // LikeOS I/O Subsystem - Keyboard Driver Interface
-// PS/2 keyboard device management and input processing
+// PS/2 keyboard device management and the console keyboard
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -14,74 +14,28 @@
 #define KEYBOARD_STATUS_OUTPUT_FULL 0x01
 #define KEYBOARD_STATUS_AUXDATA 0x20
 
-// Keyboard scan codes (US QWERTY layout)
-#define KEY_ESC 0x01
-#define KEY_BACKSPACE 0x0E
-#define KEY_TAB 0x0F
-#define KEY_ENTER 0x1C
-#define KEY_CTRL 0x1D
-#define KEY_LSHIFT 0x2A
-#define KEY_RSHIFT 0x36
-#define KEY_ALT 0x38
-#define KEY_CAPS 0x3A
-#define KEY_F1 0x3B
-#define KEY_F2 0x3C
-#define KEY_F3 0x3D
-#define KEY_F4 0x3E
-#define KEY_F5 0x3F
-#define KEY_F6 0x40
-#define KEY_F7 0x41
-#define KEY_F8 0x42
-#define KEY_F9 0x43
-#define KEY_F10 0x44
-#define KEY_F11 0x57
-#define KEY_F12 0x58
+// Input buffer full: the controller has not taken the last byte yet.
+#define KEYBOARD_STATUS_INPUT_FULL 0x02
 
-// Key release flag
-#define KEY_RELEASE 0x80
-
-// Extended key prefix
-#define KEY_EXTENDED_PREFIX 0xE0
-
-// Extended key scan codes (after 0xE0 prefix)
-#define KEY_EXT_UP 0x48
-#define KEY_EXT_DOWN 0x50
-#define KEY_EXT_LEFT 0x4B
-#define KEY_EXT_RIGHT 0x4D
-#define KEY_EXT_HOME 0x47
-#define KEY_EXT_END 0x4F
-#define KEY_EXT_PGUP 0x49
-#define KEY_EXT_PGDN 0x51
-#define KEY_EXT_INSERT 0x52
-#define KEY_EXT_DELETE 0x53
-
-// Input buffer size
-#define KEYBOARD_BUFFER_SIZE 256
-
-// Keyboard state
-typedef struct {
-	uint8_t shift_pressed;
-	uint8_t ctrl_pressed;
-	uint8_t alt_pressed;
-	uint8_t caps_lock;
-	uint8_t e0_prefix; // 1 when last scan code was 0xE0
-	uint8_t buffer[KEYBOARD_BUFFER_SIZE];
-	uint8_t buffer_start;
-	uint8_t buffer_end;
-	uint8_t buffer_count;
-} keyboard_state_t;
+struct task;
 
 // Function prototypes
 void keyboard_init(void);
 void keyboard_activate(void);
 void keyboard_reset_state(void);
-void keyboard_handler(void);
 uint8_t keyboard_read_scan_code(void);
-char scan_code_to_ascii(uint8_t scan_code, uint8_t shift);
+
+// One byte of the set-1 scancode stream from a keyboard other than the PS/2
+// one (USB HID translates its reports into the stream).  The name is
+// historical: the byte is processed at once -- evdev, then the console.
 void keyboard_buffer_add(uint8_t scan_code);
-uint8_t keyboard_buffer_get(void);
-uint8_t keyboard_buffer_has_data(void);
-char keyboard_get_char(void);
-void keyboard_wait_for_key(void);
+
+// The lock LEDs the console wants lit (LED_SCR | LED_NUM | LED_CAP), for
+// keyboards whose LEDs are set from elsewhere (USB HID).
+uint8_t keyboard_led_state(void);
+
+// The KD* ioctls (<kernel/uapi/kd.h>) of the console terminal.  -ENOTTY for
+// a request that is not one of them.
+int keyboard_kd_ioctl(unsigned long req, void *argp, struct task *cur);
 
 #endif // _KERNEL_KEYBOARD_H_

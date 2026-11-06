@@ -57,6 +57,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include "panel.h"
+#include "keyboard-conf.h"
 
 #include <audio/audio.h>
 #include <cairo-xlib.h>
@@ -72,6 +73,7 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <sys/inotify.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -777,25 +779,52 @@ static gint app_cmp(gconstpointer pa, gconstpointer pb)
 	return r;
 }
 
-/* The Display settings dialog has no desktop entry of its own -- it is part of
- * this shell -- but it belongs in the launcher like any other program. */
+/* The settings windows are part of this shell and come with desktop entries
+ * of their own (res/xorg/applications): Settings, listed in the launcher, and
+ * the Display and Keyboard windows it opens, which are not listed -- Settings
+ * stands for them -- but give their windows an icon on the panel.  Should an
+ * entry be missing, it is made up here, so the launcher's Settings and the
+ * Control Center's rows always have something to start. */
 static void apps_add_builtin(void)
 {
-	if (g_hash_table_contains(g_app_by_id, "likeos-display-settings.desktop"))
-		return;
+	static const struct {
+		const char *id, *name, *comment, *icon, *bin, *keywords;
+		gboolean hidden;
+	} builtin[] = {
+		{ "likeos-settings.desktop", "Settings",
+		  "Display, keyboard and the other settings of the system",
+		  "preferences-system", "likeos-settings",
+		  "settings preferences control panel display screen "
+		  "resolution keyboard layout language input",
+		  FALSE },
+		{ "likeos-display-settings.desktop", "Display settings",
+		  "Resolution and layout of the screen",
+		  "preferences-desktop-display", "likeos-display-settings",
+		  "display screen resolution monitor", TRUE },
+		{ "likeos-keyboard-settings.desktop", "Keyboard settings",
+		  "Keyboard layouts and the shortcut that switches between "
+		  "them",
+		  "preferences-desktop-keyboard", "likeos-keyboard-settings",
+		  "keyboard layout language input keymap", TRUE },
+	};
 
-	struct app *a = g_new0(struct app, 1);
+	for (guint i = 0; i < G_N_ELEMENTS(builtin); i++) {
+		if (g_hash_table_contains(g_app_by_id, builtin[i].id))
+			continue;
 
-	a->id = g_strdup("likeos-display-settings.desktop");
-	a->name = g_strdup("Settings");
-	a->comment = g_strdup("Display resolution and layout");
-	a->icon = g_strdup("preferences-desktop-display");
-	a->exec = g_strdup("/usr/bin/likeos-display-settings");
-	a->bin = g_strdup("likeos-display-settings");
-	a->keywords = g_strdup("display screen resolution monitor settings "
-			       "control panel");
-	g_ptr_array_add(g_apps, a);
-	g_hash_table_insert(g_app_by_id, g_strdup(a->id), a);
+		struct app *a = g_new0(struct app, 1);
+
+		a->id = g_strdup(builtin[i].id);
+		a->name = g_strdup(builtin[i].name);
+		a->comment = g_strdup(builtin[i].comment);
+		a->icon = g_strdup(builtin[i].icon);
+		a->exec = g_strdup_printf("/usr/bin/%s", builtin[i].bin);
+		a->bin = g_strdup(builtin[i].bin);
+		a->keywords = g_strdup(builtin[i].keywords);
+		a->hidden = builtin[i].hidden;
+		g_ptr_array_add(g_apps, a);
+		g_hash_table_insert(g_app_by_id, g_strdup(a->id), a);
+	}
 }
 
 static void apps_load(void)
@@ -956,7 +985,7 @@ static const char *const g_default_favorites[] = {
 	"org.xfce.mousepad.desktop", "mediaplayer.desktop",
 	"claws-mail.desktop", "io.github.Hexchat.desktop",
 	"galculator.desktop", "xterm.desktop",
-	"likeos-display-settings.desktop", NULL
+	"likeos-settings.desktop", NULL
 };
 
 static GPtrArray *g_pin_bar, *g_favorites; /* char * */
@@ -1165,7 +1194,8 @@ static const char *button_title(const struct button *b)
  *
  * It is a vertical list: the volume row at the top, then one row per thing
  * this system can set from here (the network's details, the display, the
- * workspaces), and a footer with Settings and the system monitor.  The
+ * keyboard layout, the workspaces), and a footer with Settings and the
+ * system monitor.  The
  * session's own buttons are the launcher's, not this.  The sizes are the shell's: 380 pixels wide, rows of 56, corners of 14. */
 #define FLY_W 380	  /* the panel, its 1-pixel border included */
 #define FLY_PAD 8	  /* rows' inset from the border */
@@ -1175,7 +1205,7 @@ static const char *button_title(const struct button *b)
 #define FLY_FOOT_H 56	  /* the footer strip */
 #define FLY_LIST_HEAD 52  /* the outputs page's heading */
 #define FLY_LIST_ROW 44	  /* one output */
-#define FLY_NROWS 3	  /* network, display, workspaces */
+#define FLY_NROWS 4	  /* network, display, keyboard, workspaces */
 #define FLY_BTN 36	  /* a round-cornered icon button */
 #define FLY_FOOT_SETTINGS_W 104 /* the footer's two buttons */
 #define FLY_FOOT_MONITOR_W 144
@@ -1200,7 +1230,7 @@ static const char *button_title(const struct button *b)
 #define FH_MUTE 1
 #define FH_SLIDER 2
 #define FH_SETTINGS 3	  /* the footer's Settings button */
-#define FH_ROW 4	  /* 4..6: network, display, workspaces */
+#define FH_ROW 4	  /* 4..7: network, display, keyboard, workspaces */
 #define FH_OUTPUTS 8	  /* the chevron that lists the outputs */
 #define FH_BACK 9	  /* back from that list */
 #define FH_MONITOR 10	  /* the footer's System monitor button */
@@ -1711,6 +1741,7 @@ enum glyph {
 	GL_DOWNLOAD,
 	GL_PICTURE,
 	GL_DISPLAY,
+	GL_KEYBOARD,	/* a keyboard: a row of keys and the space bar */
 	GL_CLOSE,
 	GL_CHECK,
 	GL_PIN,		/* a map pin: the panel's pinned buttons */
@@ -1912,6 +1943,18 @@ static void glyph_draw(cairo_t *cr, enum glyph g, double x, double y,
 		cairo_line_to(cr, 11, 13.5);
 		cairo_stroke(cr);
 		break;
+	case GL_KEYBOARD:
+		panel_round_rect(cr, 1.75, 3.75, 12.5, 8.5, 1.5);
+		cairo_stroke(cr);
+		/* A row of keys, on whole pixels so they stay apart at 16
+		 * pixels, and the space bar under them. */
+		for (int k = 0; k < 3; k++)
+			cairo_rectangle(cr, 4 + 3 * k, 5.75, 2, 1.25);
+		cairo_fill(cr);
+		cairo_move_to(cr, 5.25, 9.25);
+		cairo_line_to(cr, 10.75, 9.25);
+		cairo_stroke(cr);
+		break;
 	case GL_CLOSE:
 		cairo_move_to(cr, 4, 4);
 		cairo_line_to(cr, 12, 12);
@@ -1977,6 +2020,131 @@ static GtkWidget *glyph_image(enum glyph g, int size, unsigned int rgb)
 
 	cairo_surface_destroy(s);
 	return img;
+}
+
+/* --- the keyboard setting -------------------------------------------------------- */
+
+/* The keyboard layouts are a system setting, /etc/likeos/keyboard.conf (see
+ * keyboard-conf.h), and two things change it: Keyboard settings, through its
+ * setuid helper, and loadkeys at the text console, which saves the layout it
+ * loaded so that the desktop follows.  Either way the file is replaced by a
+ * rename, and this is what notices: the taskbar watches the directory and,
+ * once the file has changed, runs likeos-xkb-apply, which sets the layouts in
+ * this X session -- that is how a layout chosen at the console reaches the
+ * running desktop -- and shows the primary layout in the Control Center's
+ * Keyboard row.
+ *
+ * Only a change is applied.  The session started with the file as it is
+ * (xinitrc runs likeos-xkb-apply), and a replacement that leaves the text as
+ * it was -- the same setting saved again -- does nothing.  The events of one
+ * replacement (the new file written, then renamed into place) are taken
+ * together: the file is read once they have stopped for KBD_SETTLE_MS. */
+
+#ifndef KBD_XKB_APPLY
+#define KBD_XKB_APPLY "/usr/bin/likeos-xkb-apply"
+#endif
+#define KBD_SETTLE_MS 150
+
+static struct {
+	char *summary;	/* the Keyboard row's state: "German, +1 more" */
+	char *text;	/* the file as last read; NULL when there is none */
+	int fd;		/* the inotify instance, or -1 */
+	guint settle;
+} g_kbd = { .fd = -1 };
+
+static char *kbd_file_text(void)
+{
+	char *path = g_build_filename(KBD_CONF_DIR, KBD_CONF_NAME, NULL);
+	char *text = NULL;
+
+	if (!g_file_get_contents(path, &text, NULL, NULL))
+		text = NULL;
+	g_free(path);
+	return text;
+}
+
+/* The Keyboard row's state, from the setting and the catalogue. */
+static void kbd_read(void)
+{
+	GPtrArray *cat = kbd_catalogue_load();
+	struct kbd_conf c;
+
+	kbd_conf_read(&c);
+	g_free(g_kbd.summary);
+	g_kbd.summary = kbd_conf_summary(cat, &c);
+	kbd_conf_clear(&c);
+	g_ptr_array_unref(cat);
+}
+
+static gboolean kbd_settled(gpointer data)
+{
+	char *text = kbd_file_text();
+
+	(void)data;
+	g_kbd.settle = 0;
+	if (g_strcmp0(text, g_kbd.text) == 0) {
+		g_free(text);
+		return G_SOURCE_REMOVE;
+	}
+	g_free(g_kbd.text);
+	g_kbd.text = text;
+	kbd_read();
+	spawn_command(KBD_XKB_APPLY);
+	if (F.up)
+		gtk_widget_queue_draw(F.win);
+	return G_SOURCE_REMOVE;
+}
+
+static gboolean kbd_on_event(gint fd, GIOCondition cond, gpointer data)
+{
+	union {
+		struct inotify_event ev;
+		char buf[4096];
+	} u;
+	gboolean ours = FALSE;
+	ssize_t n;
+
+	(void)cond;
+	(void)data;
+	while ((n = read(fd, u.buf, sizeof(u.buf))) > 0) {
+		ssize_t off = 0;
+
+		while (off + (ssize_t)sizeof(struct inotify_event) <= n) {
+			struct inotify_event *ev =
+				(struct inotify_event *)(u.buf + off);
+
+			/* Events lost to an overflow may have been ours. */
+			if ((ev->mask & IN_Q_OVERFLOW) ||
+			    (ev->len && strcmp(ev->name, KBD_CONF_NAME) == 0))
+				ours = TRUE;
+			off += sizeof(struct inotify_event) + ev->len;
+		}
+	}
+	if (ours) {
+		if (g_kbd.settle)
+			g_source_remove(g_kbd.settle);
+		g_kbd.settle = g_timeout_add(KBD_SETTLE_MS, kbd_settled, NULL);
+	}
+	return G_SOURCE_CONTINUE;
+}
+
+static void kbd_watch(void)
+{
+	g_kbd.text = kbd_file_text();
+	kbd_read();
+	g_kbd.fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (g_kbd.fd < 0)
+		return;
+	if (inotify_add_watch(g_kbd.fd, KBD_CONF_DIR,
+			      IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE |
+				      IN_DELETE | IN_MOVED_FROM) < 0) {
+		g_warning("cannot watch %s: %s", KBD_CONF_DIR,
+			  g_strerror(errno));
+		close(g_kbd.fd);
+		g_kbd.fd = -1;
+		return;
+	}
+	g_unix_fd_add(g_kbd.fd, G_IO_IN, kbd_on_event, NULL);
 }
 
 /* --- the network icon --------------------------------------------------------- */
@@ -2982,8 +3150,8 @@ static void show_panel_menu(double x)
  * shell surface.  The volume row comes first -- the speaker (mute), the
  * slider, the level, and a chevron to the list of outputs when there is a
  * choice -- then the network (its state, and its details when the row is
- * opened), the display and the workspaces, and a footer with Settings and
- * the system monitor.
+ * opened), the display, the keyboard layout and the workspaces, and a
+ * footer with Settings and the system monitor.
  *
  * Drawn by hand like the panel, and for the same reason: the slider wanted is
  * a specific one -- a six-pixel track, a light thumb that gathers a soft
@@ -3370,9 +3538,12 @@ static void fly_draw_rows(cairo_t *cr, const struct fly_layout *L)
 
 	fly_draw_row(cr, L, 1, GL_DISPLAY, FALSE, "Display",
 		     "Resolution and layout", GL_CHEVRON_RIGHT);
+	fly_draw_row(cr, L, 2, GL_KEYBOARD, FALSE, "Keyboard",
+		     g_kbd.summary ? g_kbd.summary : "English (US)",
+		     GL_CHEVRON_RIGHT);
 	g_snprintf(ws, sizeof(ws), "Workspace %ld of %ld", g_desktop + 1,
 		   g_ndesktops < 1 ? 1 : g_ndesktops);
-	fly_draw_row(cr, L, 2, GL_WORKSPACES, FALSE, "Workspaces", ws,
+	fly_draw_row(cr, L, 3, GL_WORKSPACES, FALSE, "Workspaces", ws,
 		     GL_CHEVRON_RIGHT);
 }
 
@@ -4023,14 +4194,22 @@ static gboolean on_fly_button_release(GtkWidget *w, GdkEventButton *ev,
 		fly_end_drag();
 	else if (hit == was && hit == FH_MUTE)
 		vol_toggle_mute();
-	else if (hit == was && (hit == FH_SETTINGS || hit == FH_ROW + 1)) {
+	else if (hit == was && hit == FH_SETTINGS) {
+		fly_close();
+		app_launch(app_by_id("likeos-settings.desktop"));
+		return TRUE;
+	} else if (hit == was && hit == FH_ROW + 1) {
 		fly_close();
 		app_launch(app_by_id("likeos-display-settings.desktop"));
+		return TRUE;
+	} else if (hit == was && hit == FH_ROW + 2) {
+		fly_close();
+		app_launch(app_by_id("likeos-keyboard-settings.desktop"));
 		return TRUE;
 	} else if (hit == was && hit == FH_ROW) {
 		F.net_info = !F.net_info;
 		fly_place();
-	} else if (hit == was && hit == FH_ROW + 2) {
+	} else if (hit == was && hit == FH_ROW + 3) {
 		fly_close();
 		tv_open();
 		return TRUE;
@@ -7509,10 +7688,10 @@ static GtkWidget *footer(void)
 					   FALSE, FALSE, 0);
 		g_free(path);
 	}
-	if (app_by_id("likeos-display-settings.desktop"))
+	if (app_by_id("likeos-settings.desktop"))
 		gtk_box_pack_end(GTK_BOX(bar),
 				 chip(GL_SETTINGS, "Settings", act_launch,
-				      "likeos-display-settings.desktop", NULL),
+				      "likeos-settings.desktop", NULL),
 				 FALSE, FALSE, 0);
 	return bar;
 }
@@ -9426,6 +9605,7 @@ int main(int argc, char **argv)
 	sw_grab();
 	net_poll(NULL);
 	g_timeout_add_seconds(NET_POLL_SECS, net_poll, NULL);
+	kbd_watch();
 
 	/* A new icon theme: the cached icons are the old theme's. */
 	g_signal_connect(gtk_icon_theme_get_default(), "changed",

@@ -6,6 +6,7 @@
 #include <kernel/io/tty.h>
 #include <kernel/io/vt.h>
 #include <kernel/io/console.h>
+#include <kernel/io/unicode.h> /* unicode_width(), for erasing a character */
 #include <kernel/mm/memory.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/dev/usb/usb_serial.h>
@@ -17,6 +18,7 @@
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/vfs.h> /* vfs_file refcount in the pty diagnostic dump */
 #include <kernel/fs/sysfs.h>
+#include <kernel/dev/input/keyboard.h> /* the console's KD* ioctls */
 
 #define TTY_MAX_PTYS 16
 
@@ -738,6 +740,45 @@ void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta)
 	tty_wake_readers(&tty->read_waiters, &tty->poll_wq);
 }
 
+/* Erase the last CHARACTER of the line being edited -- not the last byte.
+ * The console keyboard types UTF-8, so one key (ü, €, a CJK character) can
+ * be two to four bytes, and erasing one of them left the rest of the
+ * sequence in the line: the program then read a broken character, and the
+ * echo lost track of the cursor.  The whole sequence goes, and the echo
+ * steps back over as many cells as the character took (none for a
+ * combining mark, two for a wide one). */
+static void tty_canon_erase_char(tty_t *tty)
+{
+	uint32_t cp = 0;
+	unsigned shift = 0;
+	uint8_t b;
+	uint32_t cells;
+
+	do {
+		b = (uint8_t)tty->canon_buf[--tty->canon_len];
+		if ((b & 0xC0) == 0x80) {
+			cp |= (uint32_t)(b & 0x3F) << shift;
+			shift += 6;
+		}
+	} while ((b & 0xC0) == 0x80 && tty->canon_len > 0);
+	if (b >= 0xF0)
+		cp |= (uint32_t)(b & 0x07) << shift;
+	else if (b >= 0xE0)
+		cp |= (uint32_t)(b & 0x0F) << shift;
+	else if (b >= 0xC0)
+		cp |= (uint32_t)(b & 0x1F) << shift;
+	else
+		cp = b;
+	if (!(tty->term.c_lflag & ECHO))
+		return;
+	cells = cp < 0x80 ? 1 : unicode_width(cp);
+	for (uint32_t i = 0; i < cells; i++) {
+		tty->output(tty, '\b');
+		tty->output(tty, ' ');
+		tty->output(tty, '\b');
+	}
+}
+
 /* Feed one character through the line discipline.  Returns non-zero when the
  * character made input available to a reader -- i.e. when a wake is owed.
  *
@@ -825,25 +866,13 @@ static int tty_input_char_core(tty_t *tty, char c, int ctrl)
 	if (tty->term.c_lflag & ICANON) {
 		// Handle backspace: check VERASE (typically 8) or DEL (127)
 		if (c == tty->term.c_cc[VERASE] || c == 127) {
-			if (tty->canon_len > 0) {
-				tty->canon_len--;
-				if (tty->term.c_lflag & ECHO) {
-					tty->output(tty, '\b');
-					tty->output(tty, ' ');
-					tty->output(tty, '\b');
-				}
-			}
+			if (tty->canon_len > 0)
+				tty_canon_erase_char(tty);
 			return 0;
 		}
 		if (c == tty->term.c_cc[VKILL]) {
-			while (tty->canon_len > 0) {
-				tty->canon_len--;
-				if (tty->term.c_lflag & ECHO) {
-					tty->output(tty, '\b');
-					tty->output(tty, ' ');
-					tty->output(tty, '\b');
-				}
-			}
+			while (tty->canon_len > 0)
+				tty_canon_erase_char(tty);
 			return 0;
 		}
 		if (c == tty->term.c_cc[VEOF]) {
@@ -1279,6 +1308,14 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 {
 	if (!tty) {
 		return -ENOTTY;
+	}
+	/* The console keyboard's KD* requests (the 'K' group, 0x4B00-0x4BFF):
+	 * keymap, keyboard mode, LEDs.  Only the console has a keyboard; a pty
+	 * answers ENOTTY, which is how a program tells the two apart. */
+	if ((req & ~0xFFUL) == 0x4B00UL) {
+		if (tty != &g_console_tty)
+			return -ENOTTY;
+		return keyboard_kd_ioctl(req, argp, cur);
 	}
 	switch (req) {
 	case TCGETS:

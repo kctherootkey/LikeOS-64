@@ -110,9 +110,82 @@
 -         liberation-fonts-ttf 2.00.1 https://releases.pagure.org/liberation-fonts/liberation-fonts-ttf-%VERSION%.tar.gz
 
 # Noto Sans covers what DejaVu and Liberation do not, and is asked for by name
-# by a growing number of sites.  This is the Latin/Greek/Cyrillic release only
-# -- the full Noto set is hundreds of megabytes of scripts nothing here renders.
+# by a growing number of sites.  This is the Latin/Greek/Cyrillic release; the
+# other scripts come from the per-script Noto releases below.
 -         NotoSans           v2.015   https://github.com/notofonts/latin-greek-cyrillic/releases/download/NotoSans-%VERSION%/NotoSans-%VERSION%.zip
+
+# The writing systems of every keyboard layout the Settings window offers.
+# DejaVu, Liberation and Noto Sans between them draw Latin (Vietnamese's
+# stacked diacritics included), Greek and Cyrillic; everything else -- Thai,
+# Arabic, the Indic scripts, Chinese, Japanese, Korean -- had no font at all,
+# so a Thai web page came up as empty boxes and a Thai keyboard typed them.
+#
+# One Noto family per script, each from that script's own release on the
+# notofonts project (SIL OFL 1.1, the licence travels beside the faces).  Only
+# the hinted Regular and Bold TrueType faces are installed (see install_data
+# in ../build.sh): the archives also carry seven more weights, three widths,
+# variable-font masters and OTF duplicates, which no CSS or theme here asks
+# for.  Where upstream publishes no Bold (Mongolian, N'Ko, Tifinagh, Tagalog,
+# Syriac, Symbols 2) the renderer emboldens the Regular, as fontconfig's
+# 90-synthetic.conf arranges.
+#
+# Sans where one exists.  Tibetan (Dzongkha) is published as a serif only.
+# Arabic gets three faces, because the languages that write it disagree about
+# the hand: Noto Sans Arabic for interface text, Noto Naskh Arabic for running
+# text in a serif context, and Noto Nastaliq Urdu, the calligraphic style Urdu
+# readers expect.  Which one a page or a program gets is decided by
+# res/xorg/gtk3/fonts/66-likeos-noto.conf.
+#
+# A few scripts are here for layout variants rather than for the layout
+# names themselves: Ol Chiki and Meetei Mayek (Santali and Manipuri, two of
+# the "Indian" variants), Syriac (Arabic (Syria)), Tagalog (Baybayin, a
+# Filipino variant), Javanese (an Indonesian variant) and the Canadian
+# Aboriginal syllabics (Inuktitut, a Canadian variant).  Symbols 2 carries the
+# Braille patterns for the Braille layout, and the arrows, shapes and game
+# pieces web pages use as icons.
+-         NotoSansArabic     v2.013   https://github.com/notofonts/arabic/releases/download/NotoSansArabic-%VERSION%/NotoSansArabic-%VERSION%.zip
+-         NotoNaskhArabic    v2.021   https://github.com/notofonts/arabic/releases/download/NotoNaskhArabic-%VERSION%/NotoNaskhArabic-%VERSION%.zip
+-         NotoNastaliqUrdu   v4.000   https://github.com/notofonts/nastaliq/releases/download/NotoNastaliqUrdu-%VERSION%/NotoNastaliqUrdu-%VERSION%.zip
+-         NotoSansHebrew     v3.001   https://github.com/notofonts/hebrew/releases/download/NotoSansHebrew-%VERSION%/NotoSansHebrew-%VERSION%.zip
+-         NotoSansSyriac     v3.000   https://github.com/notofonts/syriac/releases/download/NotoSansSyriac-%VERSION%/NotoSansSyriac-%VERSION%.zip
+-         NotoSansThaana     v3.001   https://github.com/notofonts/thaana/releases/download/NotoSansThaana-%VERSION%/NotoSansThaana-%VERSION%.zip
+-         NotoSansNKo        v2.004   https://github.com/notofonts/nko/releases/download/NotoSansNKo-%VERSION%/NotoSansNKo-%VERSION%.zip
+-         NotoSansTifinagh   v2.006   https://github.com/notofonts/tifinagh/releases/download/NotoSansTifinagh-%VERSION%/NotoSansTifinagh-%VERSION%.zip
+-         NotoSansEthiopic   v2.102   https://github.com/notofonts/ethiopic/releases/download/NotoSansEthiopic-%VERSION%/NotoSansEthiopic-%VERSION%.zip
+-         NotoSansArmenian   v2.008   https://github.com/notofonts/armenian/releases/download/NotoSansArmenian-%VERSION%/NotoSansArmenian-%VERSION%.zip
+-         NotoSansGeorgian   v2.005   https://github.com/notofonts/georgian/releases/download/NotoSansGeorgian-%VERSION%/NotoSansGeorgian-%VERSION%.zip
+-         NotoSansDevanagari v2.007   https://github.com/notofonts/devanagari/releases/download/NotoSansDevanagari-%VERSION%/NotoSansDevanagari-%VERSION%.zip
+-         NotoSansBengali    v3.011   https://github.com/notofonts/bengali/releases/download/NotoSansBengali-%VERSION%/NotoSansBengali-%VERSION%.zip
+-         NotoSansGurmukhi   v2.004   https://github.com/notofonts/gurmukhi/releases/download/NotoSansGurmukhi-%VERSION%/NotoSansGurmukhi-%VERSION%.zip
+-         NotoSansGujarati   v2.106   https://github.com/notofonts/gujarati/releases/download/NotoSansGujarati-%VERSION%/NotoSansGujarati-%VERSION%.zip
+-         NotoSansOriya      v2.007   https://github.com/notofonts/oriya/releases/download/NotoSansOriya-%VERSION%/NotoSansOriya-%VERSION%.zip
+-         NotoSansTamil      v2.004   https://github.com/notofonts/tamil/releases/download/NotoSansTamil-%VERSION%/NotoSansTamil-%VERSION%.zip
+-         NotoSansTelugu     v2.005   https://github.com/notofonts/telugu/releases/download/NotoSansTelugu-%VERSION%/NotoSansTelugu-%VERSION%.zip
+-         NotoSansKannada    v2.006   https://github.com/notofonts/kannada/releases/download/NotoSansKannada-%VERSION%/NotoSansKannada-%VERSION%.zip
+-         NotoSansMalayalam  v2.104   https://github.com/notofonts/malayalam/releases/download/NotoSansMalayalam-%VERSION%/NotoSansMalayalam-%VERSION%.zip
+-         NotoSansSinhala    v3.000   https://github.com/notofonts/sinhala/releases/download/NotoSansSinhala-%VERSION%/NotoSansSinhala-%VERSION%.zip
+-         NotoSansOlChiki    v2.003   https://github.com/notofonts/ol-chiki/releases/download/NotoSansOlChiki-%VERSION%/NotoSansOlChiki-%VERSION%.zip
+-         NotoSansMeeteiMayek v2.002  https://github.com/notofonts/meetei-mayek/releases/download/NotoSansMeeteiMayek-%VERSION%/NotoSansMeeteiMayek-%VERSION%.zip
+-         NotoSerifTibetan   v2.103   https://github.com/notofonts/tibetan/releases/download/NotoSerifTibetan-%VERSION%/NotoSerifTibetan-%VERSION%.zip
+-         NotoSansThai       v2.002   https://github.com/notofonts/thai/releases/download/NotoSansThai-%VERSION%/NotoSansThai-%VERSION%.zip
+-         NotoSansLao        v2.003   https://github.com/notofonts/lao/releases/download/NotoSansLao-%VERSION%/NotoSansLao-%VERSION%.zip
+-         NotoSansKhmer      v2.004   https://github.com/notofonts/khmer/releases/download/NotoSansKhmer-%VERSION%/NotoSansKhmer-%VERSION%.zip
+-         NotoSansMyanmar    v2.107   https://github.com/notofonts/myanmar/releases/download/NotoSansMyanmar-%VERSION%/NotoSansMyanmar-%VERSION%.zip
+-         NotoSansTagalog    v2.002   https://github.com/notofonts/tagalog/releases/download/NotoSansTagalog-%VERSION%/NotoSansTagalog-%VERSION%.zip
+-         NotoSansJavanese   v2.005   https://github.com/notofonts/javanese/releases/download/NotoSansJavanese-%VERSION%/NotoSansJavanese-%VERSION%.zip
+-         NotoSansMongolian  v3.103   https://github.com/notofonts/mongolian/releases/download/NotoSansMongolian-%VERSION%/NotoSansMongolian-%VERSION%.zip
+-         NotoSansCanadianAboriginal v2.004 https://github.com/notofonts/canadian-aboriginal/releases/download/NotoSansCanadianAboriginal-%VERSION%/NotoSansCanadianAboriginal-%VERSION%.zip
+-         NotoSansSymbols2   v2.008   https://github.com/notofonts/symbols/releases/download/NotoSansSymbols2-%VERSION%/NotoSansSymbols2-%VERSION%.zip
+
+# Chinese (simplified and traditional), Japanese and Korean: one design in
+# five regional forms, because the same Unicode ideograph is drawn differently
+# in each region and a reader notices.  The OpenType collections carry all
+# five (Noto Sans CJK SC, TC, HK, JP and KR, plus their monospaced cuts) in one
+# file per weight, sharing the outlines the regions agree on -- 19 MB for the
+# Regular and 20 MB for the Bold, against roughly 16 MB per region per weight
+# for the separate fonts.  Kana and Hangul are in every one of them.  Only
+# Regular and Bold are installed of the seven weights the archive holds.
+-         NotoSansCJK        2.004    https://github.com/notofonts/noto-cjk/releases/download/Sans%VERSION%/03_NotoSansCJK-OTC.zip
 
 # Selawik is the desktop's interface font: Microsoft's open-source (SIL OFL 1.1)
 # stand-in for Segoe UI, drawn to Segoe UI's metrics so text set for that face

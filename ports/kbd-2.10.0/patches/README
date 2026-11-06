@@ -1,0 +1,19 @@
+Patches applied to the pristine kbd-2.10.0 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-platform-console-headers.patch
+        The console keyboard interface (KD* requests, key symbols) is reached
+        through <sys/kd.h> and <sys/keyboard.h> here.
+
+  0002-likeos-console-strings.patch
+        "strings as usual" in a keymap means the function key strings the
+        LikeOS console sends (xterm's), not the fixed set kbd carries.
+
+  0003-loadkeys-likeos-keyboard-setting.patch
+        Loading a keymap of the layout catalogue makes it the system's
+        keyboard setting (likeos-keyboard-save); --no-save; a user who may
+        not load a keymap hands the layout to the setting helper.
+
+Copyright (C) 2026 The LikeOS Project

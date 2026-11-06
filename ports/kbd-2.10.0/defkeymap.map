@@ -1,0 +1,657 @@
+# defkeymap.map - the console's compiled-in keymap (US)
+#
+# What dumpkeys prints for the keymap the kernel starts with;
+# 'loadkeys -d' loads it.  Written by host/test-keymap.sh
+# (KBDTEST_UPDATE=1), which also checks it is current.
+#
+# Copyright (C) 2026 The LikeOS Project
+keymaps 0-1,4-5,8-9,12-13
+keycode   1 = Escape           Escape          
+	control	keycode   1 = Escape          
+	shift	control	keycode   1 = Escape          
+	alt	keycode   1 = Meta_Escape     
+	shift	alt	keycode   1 = Meta_Escape     
+	control	alt	keycode   1 = Meta_Escape     
+	shift	control	alt	keycode   1 = Meta_Escape     
+keycode   2 = one              exclam          
+	control	keycode   2 = one             
+	shift	control	keycode   2 = exclam          
+	alt	keycode   2 = Meta_one        
+	shift	alt	keycode   2 = Meta_exclam     
+	control	alt	keycode   2 = Meta_one        
+	shift	control	alt	keycode   2 = Meta_exclam     
+keycode   3 = two              at              
+	control	keycode   3 = two             
+	shift	control	keycode   3 = at              
+	alt	keycode   3 = Meta_two        
+	shift	alt	keycode   3 = Meta_at         
+	control	alt	keycode   3 = Meta_two        
+	shift	control	alt	keycode   3 = Meta_at         
+keycode   4 = three            numbersign      
+	control	keycode   4 = three           
+	shift	control	keycode   4 = numbersign      
+	alt	keycode   4 = Meta_three      
+	shift	alt	keycode   4 = Meta_numbersign 
+	control	alt	keycode   4 = Meta_three      
+	shift	control	alt	keycode   4 = Meta_numbersign 
+keycode   5 = four             dollar          
+	control	keycode   5 = four            
+	shift	control	keycode   5 = dollar          
+	alt	keycode   5 = Meta_four       
+	shift	alt	keycode   5 = Meta_dollar     
+	control	alt	keycode   5 = Meta_four       
+	shift	control	alt	keycode   5 = Meta_dollar     
+keycode   6 = five             percent         
+	control	keycode   6 = five            
+	shift	control	keycode   6 = percent         
+	alt	keycode   6 = Meta_five       
+	shift	alt	keycode   6 = Meta_percent    
+	control	alt	keycode   6 = Meta_five       
+	shift	control	alt	keycode   6 = Meta_percent    
+keycode   7 = six              asciicircum     
+	control	keycode   7 = six             
+	shift	control	keycode   7 = asciicircum     
+	alt	keycode   7 = Meta_six        
+	shift	alt	keycode   7 = Meta_asciicircum
+	control	alt	keycode   7 = Meta_six        
+	shift	control	alt	keycode   7 = Meta_asciicircum
+keycode   8 = seven            ampersand       
+	control	keycode   8 = seven           
+	shift	control	keycode   8 = ampersand       
+	alt	keycode   8 = Meta_seven      
+	shift	alt	keycode   8 = Meta_ampersand  
+	control	alt	keycode   8 = Meta_seven      
+	shift	control	alt	keycode   8 = Meta_ampersand  
+keycode   9 = eight            asterisk        
+	control	keycode   9 = eight           
+	shift	control	keycode   9 = asterisk        
+	alt	keycode   9 = Meta_eight      
+	shift	alt	keycode   9 = Meta_asterisk   
+	control	alt	keycode   9 = Meta_eight      
+	shift	control	alt	keycode   9 = Meta_asterisk   
+keycode  10 = nine             parenleft       
+	control	keycode  10 = nine            
+	shift	control	keycode  10 = parenleft       
+	alt	keycode  10 = Meta_nine       
+	shift	alt	keycode  10 = Meta_parenleft  
+	control	alt	keycode  10 = Meta_nine       
+	shift	control	alt	keycode  10 = Meta_parenleft  
+keycode  11 = zero             parenright      
+	control	keycode  11 = zero            
+	shift	control	keycode  11 = parenright      
+	alt	keycode  11 = Meta_zero       
+	shift	alt	keycode  11 = Meta_parenright 
+	control	alt	keycode  11 = Meta_zero       
+	shift	control	alt	keycode  11 = Meta_parenright 
+keycode  12 = minus            underscore      
+	control	keycode  12 = minus           
+	shift	control	keycode  12 = underscore      
+	alt	keycode  12 = Meta_minus      
+	shift	alt	keycode  12 = Meta_underscore 
+	control	alt	keycode  12 = Meta_minus      
+	shift	control	alt	keycode  12 = Meta_underscore 
+keycode  13 = equal            plus            
+	control	keycode  13 = equal           
+	shift	control	keycode  13 = plus            
+	alt	keycode  13 = Meta_equal      
+	shift	alt	keycode  13 = Meta_plus       
+	control	alt	keycode  13 = Meta_equal      
+	shift	control	alt	keycode  13 = Meta_plus       
+keycode  14 = BackSpace        BackSpace       
+	control	keycode  14 = BackSpace       
+	shift	control	keycode  14 = BackSpace       
+	alt	keycode  14 = Meta_BackSpace  
+	shift	alt	keycode  14 = Meta_BackSpace  
+	control	alt	keycode  14 = Meta_BackSpace  
+	shift	control	alt	keycode  14 = Meta_BackSpace  
+keycode  15 = Tab              Tab             
+	control	keycode  15 = Tab             
+	shift	control	keycode  15 = Tab             
+	alt	keycode  15 = Meta_Tab        
+	shift	alt	keycode  15 = Meta_Tab        
+	control	alt	keycode  15 = Meta_Tab        
+	shift	control	alt	keycode  15 = Meta_Tab        
+keycode  16 = q                Q               
+	control	keycode  16 = Control_q       
+	shift	control	keycode  16 = Control_q       
+	alt	keycode  16 = Meta_q          
+	shift	alt	keycode  16 = Meta_Q          
+	control	alt	keycode  16 = Meta_Control_q  
+	shift	control	alt	keycode  16 = Meta_Control_q  
+keycode  17 = w                W               
+	control	keycode  17 = Control_w       
+	shift	control	keycode  17 = Control_w       
+	alt	keycode  17 = Meta_w          
+	shift	alt	keycode  17 = Meta_W          
+	control	alt	keycode  17 = Meta_Control_w  
+	shift	control	alt	keycode  17 = Meta_Control_w  
+keycode  18 = e                E               
+	control	keycode  18 = Control_e       
+	shift	control	keycode  18 = Control_e       
+	alt	keycode  18 = Meta_e          
+	shift	alt	keycode  18 = Meta_E          
+	control	alt	keycode  18 = Meta_Control_e  
+	shift	control	alt	keycode  18 = Meta_Control_e  
+keycode  19 = r                R               
+	control	keycode  19 = Control_r       
+	shift	control	keycode  19 = Control_r       
+	alt	keycode  19 = Meta_r          
+	shift	alt	keycode  19 = Meta_R          
+	control	alt	keycode  19 = Meta_Control_r  
+	shift	control	alt	keycode  19 = Meta_Control_r  
+keycode  20 = t                T               
+	control	keycode  20 = Control_t       
+	shift	control	keycode  20 = Control_t       
+	alt	keycode  20 = Meta_t          
+	shift	alt	keycode  20 = Meta_T          
+	control	alt	keycode  20 = Meta_Control_t  
+	shift	control	alt	keycode  20 = Meta_Control_t  
+keycode  21 = y                Y               
+	control	keycode  21 = Control_y       
+	shift	control	keycode  21 = Control_y       
+	alt	keycode  21 = Meta_y          
+	shift	alt	keycode  21 = Meta_Y          
+	control	alt	keycode  21 = Meta_Control_y  
+	shift	control	alt	keycode  21 = Meta_Control_y  
+keycode  22 = u                U               
+	control	keycode  22 = Control_u       
+	shift	control	keycode  22 = Control_u       
+	alt	keycode  22 = Meta_u          
+	shift	alt	keycode  22 = Meta_U          
+	control	alt	keycode  22 = Meta_Control_u  
+	shift	control	alt	keycode  22 = Meta_Control_u  
+keycode  23 = i                I               
+	control	keycode  23 = Tab             
+	shift	control	keycode  23 = Tab             
+	alt	keycode  23 = Meta_i          
+	shift	alt	keycode  23 = Meta_I          
+	control	alt	keycode  23 = Meta_Tab        
+	shift	control	alt	keycode  23 = Meta_Tab        
+keycode  24 = o                O               
+	control	keycode  24 = Control_o       
+	shift	control	keycode  24 = Control_o       
+	alt	keycode  24 = Meta_o          
+	shift	alt	keycode  24 = Meta_O          
+	control	alt	keycode  24 = Meta_Control_o  
+	shift	control	alt	keycode  24 = Meta_Control_o  
+keycode  25 = p                P               
+	control	keycode  25 = Control_p       
+	shift	control	keycode  25 = Control_p       
+	alt	keycode  25 = Meta_p          
+	shift	alt	keycode  25 = Meta_P          
+	control	alt	keycode  25 = Meta_Control_p  
+	shift	control	alt	keycode  25 = Meta_Control_p  
+keycode  26 = bracketleft      braceleft       
+	control	keycode  26 = bracketleft     
+	shift	control	keycode  26 = braceleft       
+	alt	keycode  26 = Meta_bracketleft
+	shift	alt	keycode  26 = Meta_braceleft  
+	control	alt	keycode  26 = Meta_bracketleft
+	shift	control	alt	keycode  26 = Meta_braceleft  
+keycode  27 = bracketright     braceright      
+	control	keycode  27 = bracketright    
+	shift	control	keycode  27 = braceright      
+	alt	keycode  27 = Meta_bracketright
+	shift	alt	keycode  27 = Meta_braceright 
+	control	alt	keycode  27 = Meta_bracketright
+	shift	control	alt	keycode  27 = Meta_braceright 
+keycode  28 = Control_m        Control_m       
+	control	keycode  28 = Control_m       
+	shift	control	keycode  28 = Control_m       
+	alt	keycode  28 = Meta_Control_m  
+	shift	alt	keycode  28 = Meta_Control_m  
+	control	alt	keycode  28 = Meta_Control_m  
+	shift	control	alt	keycode  28 = Meta_Control_m  
+keycode  29 = Control         
+keycode  30 = a                A               
+	control	keycode  30 = Control_a       
+	shift	control	keycode  30 = Control_a       
+	alt	keycode  30 = Meta_a          
+	shift	alt	keycode  30 = Meta_A          
+	control	alt	keycode  30 = Meta_Control_a  
+	shift	control	alt	keycode  30 = Meta_Control_a  
+keycode  31 = s                S               
+	control	keycode  31 = Control_s       
+	shift	control	keycode  31 = Control_s       
+	alt	keycode  31 = Meta_s          
+	shift	alt	keycode  31 = Meta_S          
+	control	alt	keycode  31 = Meta_Control_s  
+	shift	control	alt	keycode  31 = Meta_Control_s  
+keycode  32 = d                D               
+	control	keycode  32 = Control_d       
+	shift	control	keycode  32 = Control_d       
+	alt	keycode  32 = Meta_d          
+	shift	alt	keycode  32 = Meta_D          
+	control	alt	keycode  32 = Meta_Control_d  
+	shift	control	alt	keycode  32 = Meta_Control_d  
+keycode  33 = f                F               
+	control	keycode  33 = Control_f       
+	shift	control	keycode  33 = Control_f       
+	alt	keycode  33 = Meta_f          
+	shift	alt	keycode  33 = Meta_F          
+	control	alt	keycode  33 = Meta_Control_f  
+	shift	control	alt	keycode  33 = Meta_Control_f  
+keycode  34 = g                G               
+	control	keycode  34 = Control_g       
+	shift	control	keycode  34 = Control_g       
+	alt	keycode  34 = Meta_g          
+	shift	alt	keycode  34 = Meta_G          
+	control	alt	keycode  34 = Meta_Control_g  
+	shift	control	alt	keycode  34 = Meta_Control_g  
+keycode  35 = h                H               
+	control	keycode  35 = BackSpace       
+	shift	control	keycode  35 = BackSpace       
+	alt	keycode  35 = Meta_h          
+	shift	alt	keycode  35 = Meta_H          
+	control	alt	keycode  35 = Meta_BackSpace  
+	shift	control	alt	keycode  35 = Meta_BackSpace  
+keycode  36 = j                J               
+	control	keycode  36 = Linefeed        
+	shift	control	keycode  36 = Linefeed        
+	alt	keycode  36 = Meta_j          
+	shift	alt	keycode  36 = Meta_J          
+	control	alt	keycode  36 = Meta_Linefeed   
+	shift	control	alt	keycode  36 = Meta_Linefeed   
+keycode  37 = k                K               
+	control	keycode  37 = Control_k       
+	shift	control	keycode  37 = Control_k       
+	alt	keycode  37 = Meta_k          
+	shift	alt	keycode  37 = Meta_K          
+	control	alt	keycode  37 = Meta_Control_k  
+	shift	control	alt	keycode  37 = Meta_Control_k  
+keycode  38 = l                L               
+	control	keycode  38 = Control_l       
+	shift	control	keycode  38 = Control_l       
+	alt	keycode  38 = Meta_l          
+	shift	alt	keycode  38 = Meta_L          
+	control	alt	keycode  38 = Meta_Control_l  
+	shift	control	alt	keycode  38 = Meta_Control_l  
+keycode  39 = semicolon        colon           
+	control	keycode  39 = semicolon       
+	shift	control	keycode  39 = colon           
+	alt	keycode  39 = Meta_semicolon  
+	shift	alt	keycode  39 = Meta_colon      
+	control	alt	keycode  39 = Meta_semicolon  
+	shift	control	alt	keycode  39 = Meta_colon      
+keycode  40 = apostrophe       quotedbl        
+	control	keycode  40 = apostrophe      
+	shift	control	keycode  40 = quotedbl        
+	alt	keycode  40 = Meta_apostrophe 
+	shift	alt	keycode  40 = Meta_quotedbl   
+	control	alt	keycode  40 = Meta_apostrophe 
+	shift	control	alt	keycode  40 = Meta_quotedbl   
+keycode  41 = grave            asciitilde      
+	control	keycode  41 = grave           
+	shift	control	keycode  41 = asciitilde      
+	alt	keycode  41 = Meta_grave      
+	shift	alt	keycode  41 = Meta_asciitilde 
+	control	alt	keycode  41 = Meta_grave      
+	shift	control	alt	keycode  41 = Meta_asciitilde 
+keycode  42 = Shift           
+keycode  43 = backslash        bar             
+	control	keycode  43 = backslash       
+	shift	control	keycode  43 = bar             
+	alt	keycode  43 = Meta_backslash  
+	shift	alt	keycode  43 = Meta_bar        
+	control	alt	keycode  43 = Meta_backslash  
+	shift	control	alt	keycode  43 = Meta_bar        
+keycode  44 = z                Z               
+	control	keycode  44 = Control_z       
+	shift	control	keycode  44 = Control_z       
+	alt	keycode  44 = Meta_z          
+	shift	alt	keycode  44 = Meta_Z          
+	control	alt	keycode  44 = Meta_Control_z  
+	shift	control	alt	keycode  44 = Meta_Control_z  
+keycode  45 = x                X               
+	control	keycode  45 = Control_x       
+	shift	control	keycode  45 = Control_x       
+	alt	keycode  45 = Meta_x          
+	shift	alt	keycode  45 = Meta_X          
+	control	alt	keycode  45 = Meta_Control_x  
+	shift	control	alt	keycode  45 = Meta_Control_x  
+keycode  46 = c                C               
+	control	keycode  46 = Control_c       
+	shift	control	keycode  46 = Control_c       
+	alt	keycode  46 = Meta_c          
+	shift	alt	keycode  46 = Meta_C          
+	control	alt	keycode  46 = Meta_Control_c  
+	shift	control	alt	keycode  46 = Meta_Control_c  
+keycode  47 = v                V               
+	control	keycode  47 = Control_v       
+	shift	control	keycode  47 = Control_v       
+	alt	keycode  47 = Meta_v          
+	shift	alt	keycode  47 = Meta_V          
+	control	alt	keycode  47 = Meta_Control_v  
+	shift	control	alt	keycode  47 = Meta_Control_v  
+keycode  48 = b                B               
+	control	keycode  48 = Control_b       
+	shift	control	keycode  48 = Control_b       
+	alt	keycode  48 = Meta_b          
+	shift	alt	keycode  48 = Meta_B          
+	control	alt	keycode  48 = Meta_Control_b  
+	shift	control	alt	keycode  48 = Meta_Control_b  
+keycode  49 = n                N               
+	control	keycode  49 = Control_n       
+	shift	control	keycode  49 = Control_n       
+	alt	keycode  49 = Meta_n          
+	shift	alt	keycode  49 = Meta_N          
+	control	alt	keycode  49 = Meta_Control_n  
+	shift	control	alt	keycode  49 = Meta_Control_n  
+keycode  50 = m                M               
+	control	keycode  50 = Control_m       
+	shift	control	keycode  50 = Control_m       
+	alt	keycode  50 = Meta_m          
+	shift	alt	keycode  50 = Meta_M          
+	control	alt	keycode  50 = Meta_Control_m  
+	shift	control	alt	keycode  50 = Meta_Control_m  
+keycode  51 = comma            less            
+	control	keycode  51 = comma           
+	shift	control	keycode  51 = less            
+	alt	keycode  51 = Meta_comma      
+	shift	alt	keycode  51 = Meta_less       
+	control	alt	keycode  51 = Meta_comma      
+	shift	control	alt	keycode  51 = Meta_less       
+keycode  52 = period           greater         
+	control	keycode  52 = period          
+	shift	control	keycode  52 = greater         
+	alt	keycode  52 = Meta_period     
+	shift	alt	keycode  52 = Meta_greater    
+	control	alt	keycode  52 = Meta_period     
+	shift	control	alt	keycode  52 = Meta_greater    
+keycode  53 = slash            question        
+	control	keycode  53 = slash           
+	shift	control	keycode  53 = question        
+	alt	keycode  53 = Meta_slash      
+	shift	alt	keycode  53 = Meta_question   
+	control	alt	keycode  53 = Meta_slash      
+	shift	control	alt	keycode  53 = Meta_question   
+keycode  54 = Shift           
+keycode  55 = asterisk         asterisk        
+	control	keycode  55 = asterisk        
+	shift	control	keycode  55 = asterisk        
+	alt	keycode  55 = Meta_asterisk   
+	shift	alt	keycode  55 = Meta_asterisk   
+	control	alt	keycode  55 = Meta_asterisk   
+	shift	control	alt	keycode  55 = Meta_asterisk   
+keycode  56 = Alt             
+keycode  57 = space            space           
+	control	keycode  57 = nul             
+	shift	control	keycode  57 = nul             
+	alt	keycode  57 = Meta_space      
+	shift	alt	keycode  57 = Meta_space      
+	control	alt	keycode  57 = nul             
+	shift	control	alt	keycode  57 = nul             
+keycode  58 = Shift_Lock      
+keycode  59 = F1              
+keycode  60 = F2              
+keycode  61 = F3              
+keycode  62 = F4              
+keycode  63 = F5              
+keycode  64 = F6              
+keycode  65 = F7              
+keycode  66 = F8              
+keycode  67 = F9              
+keycode  68 = F10             
+keycode  69 = Num_Lock        
+keycode  70 = Scroll_Lock     
+keycode  71 = KP_7            
+keycode  72 = KP_8            
+keycode  73 = KP_9            
+keycode  74 = minus            minus           
+	control	keycode  74 = minus           
+	shift	control	keycode  74 = minus           
+	alt	keycode  74 = Meta_minus      
+	shift	alt	keycode  74 = Meta_minus      
+	control	alt	keycode  74 = Meta_minus      
+	shift	control	alt	keycode  74 = Meta_minus      
+keycode  75 = KP_4            
+keycode  76 = KP_5            
+keycode  77 = KP_6            
+keycode  78 = plus             plus            
+	control	keycode  78 = plus            
+	shift	control	keycode  78 = plus            
+	alt	keycode  78 = Meta_plus       
+	shift	alt	keycode  78 = Meta_plus       
+	control	alt	keycode  78 = Meta_plus       
+	shift	control	alt	keycode  78 = Meta_plus       
+keycode  79 = KP_1            
+keycode  80 = KP_2            
+keycode  81 = KP_3            
+keycode  82 = KP_0            
+keycode  83 = KP_Period       
+keycode  87 = F11             
+keycode  88 = F12             
+keycode  96 = KP_Enter        
+keycode  97 = Control         
+keycode  98 = KP_Divide       
+keycode 100 = Alt             
+keycode 102 = Find            
+keycode 103 = Up              
+keycode 104 = Prior           
+keycode 105 = Left            
+keycode 106 = Right           
+keycode 107 = Select          
+keycode 108 = Down            
+keycode 109 = Next            
+keycode 110 = Insert          
+keycode 111 = Remove          
+string F1 = "\033OP"
+string F2 = "\033OQ"
+string F3 = "\033OR"
+string F4 = "\033OS"
+string F5 = "\033[15~"
+string F6 = "\033[17~"
+string F7 = "\033[18~"
+string F8 = "\033[19~"
+string F9 = "\033[20~"
+string F10 = "\033[21~"
+string F11 = "\033[23~"
+string F12 = "\033[24~"
+string F13 = "\033[1;2P"
+string F14 = "\033[1;2Q"
+string F15 = "\033[1;2R"
+string F16 = "\033[1;2S"
+string F17 = "\033[15;2~"
+string F18 = "\033[17;2~"
+string F19 = "\033[18;2~"
+string F20 = "\033[19;2~"
+string Find = "\033[H"
+string Insert = "\033[2~"
+string Remove = "\033[3~"
+string Select = "\033[F"
+string Prior = "\033[5~"
+string Next = "\033[6~"
+string F21 = "\033[20;2~"
+string F22 = "\033[21;2~"
+string F23 = "\033[23;2~"
+string F24 = "\033[24;2~"
+string F25 = "\033[1;5P"
+string F26 = "\033[1;5Q"
+string F27 = "\033[1;5R"
+string F28 = "\033[1;5S"
+string F29 = "\033[15;5~"
+string F30 = "\033[17;5~"
+string F31 = "\033[18;5~"
+string F32 = "\033[19;5~"
+string F33 = "\033[20;5~"
+string F34 = "\033[21;5~"
+string F35 = "\033[23;5~"
+string F36 = "\033[24;5~"
+string F37 = "\033[1;6P"
+string F38 = "\033[1;6Q"
+string F39 = "\033[1;6R"
+string F40 = "\033[1;6S"
+string F41 = "\033[15;6~"
+string F42 = "\033[17;6~"
+string F43 = "\033[18;6~"
+string F44 = "\033[19;6~"
+string F45 = "\033[20;6~"
+string F46 = "\033[21;6~"
+string F47 = "\033[23;6~"
+string F48 = "\033[24;6~"
+string Backtab = "\033[Z"
+compose '`' ' ' to grave
+compose '`' 'A' to Agrave
+compose '`' 'E' to Egrave
+compose '`' 'I' to Igrave
+compose '`' 'O' to Ograve
+compose '`' 'U' to Ugrave
+compose '`' 'a' to agrave
+compose '`' 'e' to egrave
+compose '`' 'i' to igrave
+compose '`' 'o' to ograve
+compose '`' 'u' to ugrave
+compose '\'' ' ' to apostrophe
+compose '\'' 'A' to Aacute
+compose '\'' 'E' to Eacute
+compose '\'' 'I' to Iacute
+compose '\'' 'O' to Oacute
+compose '\'' 'U' to Uacute
+compose '\'' 'Y' to Yacute
+compose '\'' 'a' to aacute
+compose '\'' 'e' to eacute
+compose '\'' 'i' to iacute
+compose '\'' 'o' to oacute
+compose '\'' 'u' to uacute
+compose '\'' 'y' to yacute
+compose '^' ' ' to asciicircum
+compose '^' '.' to periodcentered
+compose '^' '1' to onesuperior
+compose '^' '2' to twosuperior
+compose '^' '3' to threesuperior
+compose '^' 'A' to Acircumflex
+compose '^' 'E' to Ecircumflex
+compose '^' 'I' to Icircumflex
+compose '^' 'O' to Ocircumflex
+compose '^' 'U' to Ucircumflex
+compose '^' 'a' to acircumflex
+compose '^' 'e' to ecircumflex
+compose '^' 'i' to icircumflex
+compose '^' 'o' to ocircumflex
+compose '^' 'u' to ucircumflex
+compose '~' ' ' to asciitilde
+compose '~' 'A' to Atilde
+compose '~' 'N' to Ntilde
+compose '~' 'O' to Otilde
+compose '~' 'a' to atilde
+compose '~' 'n' to ntilde
+compose '~' 'o' to otilde
+compose '"' ' ' to quotedbl
+compose '"' 'A' to Adiaeresis
+compose '"' 'E' to Ediaeresis
+compose '"' 'I' to Idiaeresis
+compose '"' 'O' to Odiaeresis
+compose '"' 'U' to Udiaeresis
+compose '"' 'a' to adiaeresis
+compose '"' 'e' to ediaeresis
+compose '"' 'i' to idiaeresis
+compose '"' 'o' to odiaeresis
+compose '"' 'u' to udiaeresis
+compose '"' 'y' to ydiaeresis
+compose ',' ' ' to cedilla
+compose ',' 'C' to Ccedilla
+compose ',' 'c' to ccedilla
+compose ' ' ' ' to nobreakspace
+compose ' ' ',' to cedilla
+compose ' ' '_' to macron
+compose '/' 'O' to Ooblique
+compose '/' 'c' to cent
+compose '/' 'o' to oslash
+compose '/' 'u' to mu
+compose '0' '*' to degree
+compose '1' '2' to onehalf
+compose '1' '4' to onequarter
+compose '1' '^' to onesuperior
+compose '2' '^' to twosuperior
+compose '3' '4' to threequarters
+compose '3' '^' to threesuperior
+compose '<' '<' to guillemotleft
+compose '>' '>' to guillemotright
+compose '>' 'A' to Acircumflex
+compose '>' 'E' to Ecircumflex
+compose '>' 'I' to Icircumflex
+compose '>' 'O' to Ocircumflex
+compose '>' 'U' to Ucircumflex
+compose '>' 'a' to acircumflex
+compose '>' 'e' to ecircumflex
+compose '>' 'i' to icircumflex
+compose '>' 'o' to ocircumflex
+compose '>' 'u' to ucircumflex
+compose 'A' '"' to Adiaeresis
+compose 'A' '\'' to Aacute
+compose 'A' '*' to Aring
+compose 'A' '>' to Acircumflex
+compose 'A' 'A' to Aring
+compose 'A' 'E' to AE
+compose 'A' '^' to Acircumflex
+compose 'A' '`' to Agrave
+compose 'A' '~' to Atilde
+compose 'C' ',' to Ccedilla
+compose 'C' 'O' to copyright
+compose 'D' 'H' to ETH
+compose 'E' '"' to Ediaeresis
+compose 'E' '\'' to Eacute
+compose 'E' '>' to Ecircumflex
+compose 'E' '^' to Ecircumflex
+compose 'E' '`' to Egrave
+compose 'I' '"' to Idiaeresis
+compose 'I' '\'' to Iacute
+compose 'I' '>' to Icircumflex
+compose 'I' '^' to Icircumflex
+compose 'I' '`' to Igrave
+compose 'L' '-' to sterling
+compose 'N' '~' to Ntilde
+compose 'O' '"' to Odiaeresis
+compose 'O' '\'' to Oacute
+compose 'O' '/' to Ooblique
+compose 'O' '>' to Ocircumflex
+compose 'O' 'C' to copyright
+compose 'O' 'R' to registered
+compose 'O' 'S' to section
+compose 'O' 'X' to currency
+compose 'O' '^' to Ocircumflex
+compose 'O' '`' to Ograve
+compose 'O' '~' to Otilde
+compose 'P' '!' to paragraph
+compose 'P' 'P' to paragraph
+compose 'R' 'O' to registered
+compose 'S' '!' to section
+compose 'S' 'O' to section
+compose 'T' 'H' to THORN
+compose 'X' 'O' to currency
+compose 'Y' '\'' to Yacute
+compose 'Y' '=' to yen
+compose 'a' '"' to adiaeresis
+compose 'a' '\'' to aacute
+compose 'a' '*' to aring
+compose 'a' '>' to acircumflex
+compose 'a' '^' to acircumflex
+compose 'a' '`' to agrave
+compose 'a' 'a' to aring
+compose 'a' 'e' to ae
+compose 'a' '~' to atilde
+compose 'd' 'h' to eth
+compose 'e' '"' to ediaeresis
+compose 'e' '\'' to eacute
+compose 'e' '>' to ecircumflex
+compose 'e' '^' to ecircumflex
+compose 'e' '`' to egrave
+compose 'l' '-' to sterling
+compose 'm' 'u' to mu
+compose 'p' '!' to paragraph
+compose 's' '!' to section
+compose 's' 'o' to section
+compose 's' 's' to ssharp
+compose 't' 'h' to thorn
+compose 'u' '"' to udiaeresis
+compose 'u' '\'' to uacute
+compose 'u' '/' to mu
+compose 'u' '>' to ucircumflex
+compose 'u' '^' to ucircumflex
+compose 'u' '`' to ugrave
+compose 'x' 'o' to currency
+compose 'x' 'x' to multiply
+compose 'y' '"' to ydiaeresis
+compose 'y' '\'' to yacute
+compose 'y' '=' to yen
+compose '|' 'c' to cent

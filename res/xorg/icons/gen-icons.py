@@ -321,6 +321,10 @@ APPS = {
 	'preferences-desktop-display': (A('apps/preferences-desktop-display'),
 					['video-display-settings',
 					 'likeos-display-settings']),
+	'preferences-desktop-keyboard': (A('apps/preferences-desktop-keyboard'),
+					 ['input-keyboard-settings',
+					  'likeos-keyboard-settings',
+					  'preferences-desktop-keyboard-layout']),
 	'preferences-desktop-wallpaper': (A('apps/'
 					    'preferences-desktop-wallpaper'),
 					  ['background']),

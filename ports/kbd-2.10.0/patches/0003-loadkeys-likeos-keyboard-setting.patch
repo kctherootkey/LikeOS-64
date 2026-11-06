@@ -1,0 +1,474 @@
+loadkeys: a catalogue keymap becomes the system's keyboard setting.
+
+The keyboard layout of the system is /etc/likeos/keyboard.conf, shared by
+the console and the X session; the layouts are the lines of
+/usr/share/likeos/keyboard/layouts.tsv, and /usr/share/keymaps/<id>.map is
+the console keymap of catalogue entry <id>.  So that "loadkeys de" changes
+the layout of the whole system rather than of the console alone:
+
+ * After loading one keymap of /usr/share/keymaps whose name (through an
+   alias link, e.g. de-latin1.map -> de.map) is a catalogue id, loadkeys
+   runs "likeos-keyboard-save --console <id>"; the setuid helper records
+   the layout and the X session follows.  A missing or failing helper is a
+   warning, the keymap stays loaded.
+
+ * A process that may not load a keymap (an ordinary user in a terminal
+   window: the console is not its terminal) hands a catalogue layout to
+   the helper's other form, "likeos-keyboard-save LAYOUT VARIANT OPTIONS",
+   which records it and loads the keymap as root.  The current OPTIONS are
+   kept.
+
+ * --no-save turns both off; the helper and the boot use it.
+
+src/likeos-keyboard.c holds the LikeOS part; loadkeys.c only calls it, and
+the keymap search path is now set before the console is opened so that the
+keymap can be identified first.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/likeos-keyboard.c
++++ b/src/likeos-keyboard.c
+@@ -0,0 +1,276 @@
++/* likeos-keyboard.c - loadkeys and the system keyboard setting
++ *
++ * The keyboard layout of the system is one setting, /etc/likeos/keyboard.conf,
++ * shared by the console and the X session; its layouts are the lines of the
++ * catalogue /usr/share/likeos/keyboard/layouts.tsv, whose first field (the
++ * id) is also the name of the console keymap /usr/share/keymaps/<id>.map.
++ * Loading one of those keymaps with loadkeys therefore changes the setting:
++ *
++ *  - when the keymap was loaded, loadkeys runs
++ *        likeos-keyboard-save --console <id>
++ *    which records the layout (the X session follows the file);
++ *
++ *  - when this process may not load a keymap at all (an ordinary user in a
++ *    terminal window, where the console is not this process's terminal),
++ *    loadkeys hands the request to the helper's other form,
++ *        likeos-keyboard-save LAYOUT VARIANT OPTIONS
++ *    which records the layout and loads the console keymap itself.
++ *
++ * The helper is setuid root and checks everything it is given; this file
++ * only works out which catalogue entry a keymap file is.  --no-save turns
++ * all of it off (the helper itself and the boot use it).
++ *
++ * Copyright (C) 2026 The LikeOS Project
++ */
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <sys/kd.h>
++#include <sys/keyboard.h>
++
++#include "likeos-keyboard.h"
++
++#ifndef LIKEOS_KEYBOARD_CATALOGUE
++#define LIKEOS_KEYBOARD_CATALOGUE "/usr/share/likeos/keyboard/layouts.tsv"
++#endif
++#ifndef LIKEOS_KEYBOARD_CONF
++#define LIKEOS_KEYBOARD_CONF "/etc/likeos/keyboard.conf"
++#endif
++#ifndef LIKEOS_KEYBOARD_SAVE
++#define LIKEOS_KEYBOARD_SAVE "/usr/libexec/likeos-keyboard-save"
++#endif
++#ifndef LIKEOS_KEYMAP_DIR
++#define LIKEOS_KEYMAP_DIR "/usr/share/keymaps"
++#endif
++
++/* The catalogue line of `id': its XKB layout and variant (each at most
++ * cap - 1 bytes).  Returns 1 when `id' is in the catalogue. */
++static int catalogue_lookup(const char *id, char *layout, char *variant,
++			    size_t cap)
++{
++	FILE *f = fopen(LIKEOS_KEYBOARD_CATALOGUE, "r");
++	char line[512];
++	int found = 0;
++
++	if (!f)
++		return 0;
++	while (!found && fgets(line, sizeof(line), f)) {
++		char *field[5] = { 0 };
++		char *p = line;
++		int n = 0;
++
++		if (line[0] == '#' || line[0] == '\n')
++			continue;
++		line[strcspn(line, "\r\n")] = 0;
++		while (n < 5) {
++			field[n++] = p;
++			p = strchr(p, '\t');
++			if (!p)
++				break;
++			*p++ = 0;
++		}
++		if (n < 4 || strcmp(field[0], id) != 0)
++			continue;
++		snprintf(layout, cap, "%s", field[3]);
++		snprintf(variant, cap, "%s", n >= 5 ? field[4] : "");
++		found = 1;
++	}
++	fclose(f);
++	return found;
++}
++
++/* The console, as getfd() finds it, but without giving up the process when
++ * there is none: -1 then. */
++static int is_a_console(int fd)
++{
++	char arg = 0;
++
++	return isatty(fd) && ioctl(fd, KDGKBTYPE, &arg) == 0 &&
++	       (arg == KB_101 || arg == KB_84);
++}
++
++static int open_a_console(const char *name)
++{
++	/* O_NOCTTY: looking at the console must not make it the controlling
++	 * terminal of a session leader that has none (the boot's loadkeys). */
++	int fd = open(name, O_RDWR | O_NOCTTY);
++
++	if (fd < 0)
++		fd = open(name, O_WRONLY | O_NOCTTY);
++	if (fd < 0)
++		fd = open(name, O_RDONLY | O_NOCTTY);
++	if (fd >= 0 && !is_a_console(fd)) {
++		close(fd);
++		fd = -1;
++	}
++	return fd;
++}
++
++int likeos_console_fd(const char *name)
++{
++	static const char *const paths[] = { "/proc/self/fd/0", "/dev/tty",
++					     "/dev/tty0", "/dev/console", NULL };
++	int fd;
++
++	if (name)
++		return open_a_console(name);
++	for (int i = 0; paths[i]; i++)
++		if ((fd = open_a_console(paths[i])) >= 0)
++			return fd;
++	for (fd = 0; fd < 3; fd++)
++		if (is_a_console(fd))
++			return dup(fd);
++	return -1;
++}
++
++int likeos_may_load_keymap(int fd)
++{
++	/* Entry 0 of a keymap only checks the request; what it answers is
++	 * whether this process may change the keymap at all. */
++	struct kbentry ke = { 0, 0, K_HOLE };
++
++	return ioctl(fd, KDSKBENT, &ke) == 0 || errno != EPERM;
++}
++
++char *likeos_keymap_catalogue_id(const char *arg, const char *pathname)
++{
++	char real[PATH_MAX];
++	char layout[128], variant[128];
++	const char *base;
++	size_t dirlen = strlen(LIKEOS_KEYMAP_DIR);
++	size_t len;
++	char *id;
++
++	if (!arg || !pathname || !strcmp(arg, "-"))
++		return NULL;
++	/* The file that was found, through any alias link (de-latin1.map ->
++	 * de.map).  Only the system's own keymaps stand for a layout: a file
++	 * elsewhere that happens to be called de.map is not the German
++	 * layout. */
++	if (!realpath(pathname, real))
++		return NULL;
++	if (strncmp(real, LIKEOS_KEYMAP_DIR, dirlen) != 0 || real[dirlen] != '/')
++		return NULL;
++	base = real + dirlen + 1;
++	if (strchr(base, '/'))
++		return NULL;
++	len = strlen(base);
++	if (len > 4 && !strcmp(base + len - 4, ".map"))
++		len -= 4;
++	else if (len > 5 && !strcmp(base + len - 5, ".kmap"))
++		len -= 5;
++	id = strndup(base, len);
++	if (!id)
++		return NULL;
++	if (!catalogue_lookup(id, layout, variant, sizeof(layout))) {
++		free(id);
++		return NULL;
++	}
++	return id;
++}
++
++/* Run the helper with `argv'; its exit status, or -1 when it could not be
++ * run (errno says why). */
++static int run_helper(char *const argv[])
++{
++	pid_t pid;
++	int status;
++
++	pid = fork();
++	if (pid < 0)
++		return -1;
++	if (pid == 0) {
++		execv(LIKEOS_KEYBOARD_SAVE, argv);
++		_exit(errno == ENOENT ? 127 : 126);
++	}
++	while (waitpid(pid, &status, 0) < 0) {
++		if (errno != EINTR)
++			return -1;
++	}
++	if (!WIFEXITED(status))
++		return -1;
++	if (WEXITSTATUS(status) == 127) {
++		errno = ENOENT;
++		return -1;
++	}
++	return WEXITSTATUS(status);
++}
++
++static void warn_helper(int rc, const char *id, int quiet)
++{
++	if (rc == 0 || quiet)
++		return;
++	if (rc < 0)
++		fprintf(stderr,
++			"loadkeys: warning: the keyboard setting was not saved: "
++			"%s: %s\n",
++			LIKEOS_KEYBOARD_SAVE, strerror(errno));
++	else
++		fprintf(stderr,
++			"loadkeys: warning: the keyboard setting was not saved "
++			"(%s --console %s failed)\n",
++			LIKEOS_KEYBOARD_SAVE, id);
++}
++
++void likeos_keyboard_save_console(const char *id, int quiet)
++{
++	char *argv[] = { (char *)"likeos-keyboard-save", (char *)"--console",
++			 (char *)id, NULL };
++
++	warn_helper(run_helper(argv), id, quiet);
++}
++
++/* OPTIONS of the current setting (empty when there is none). */
++static void current_options(char *out, size_t cap)
++{
++	FILE *f = fopen(LIKEOS_KEYBOARD_CONF, "r");
++	char line[512];
++
++	out[0] = 0;
++	if (!f)
++		return;
++	while (fgets(line, sizeof(line), f)) {
++		char *v;
++		size_t n;
++
++		if (strncmp(line, "OPTIONS=", 8) != 0)
++			continue;
++		v = line + 8;
++		v[strcspn(v, "\r\n#")] = 0;
++		n = strlen(v);
++		while (n && (v[n - 1] == ' ' || v[n - 1] == '\t'))
++			v[--n] = 0;
++		if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) {
++			v[n - 1] = 0;
++			v++;
++		}
++		snprintf(out, cap, "%s", v);
++	}
++	fclose(f);
++}
++
++int likeos_keyboard_delegate(const char *id)
++{
++	char layout[128], variant[128], options[512];
++	char *argv[] = { (char *)"likeos-keyboard-save", layout, variant,
++			 options, NULL };
++	int rc;
++
++	if (!catalogue_lookup(id, layout, variant, sizeof(layout)))
++		return -1;
++	current_options(options, sizeof(options));
++	rc = run_helper(argv);
++	if (rc < 0)
++		fprintf(stderr, "loadkeys: %s: %s\n", LIKEOS_KEYBOARD_SAVE,
++			strerror(errno));
++	return rc;
++}
+--- a/src/likeos-keyboard.h
++++ b/src/likeos-keyboard.h
+@@ -0,0 +1,33 @@
++/* likeos-keyboard.h - loadkeys and the system keyboard setting
++ *
++ * See likeos-keyboard.c.
++ *
++ * Copyright (C) 2026 The LikeOS Project
++ */
++#ifndef LIKEOS_KEYBOARD_H
++#define LIKEOS_KEYBOARD_H
++
++/* A descriptor of the console (`name', or the usual places when NULL), or
++ * -1 when this process can reach none. */
++int likeos_console_fd(const char *name);
++
++/* Whether the process may load a keymap through `fd'. */
++int likeos_may_load_keymap(int fd);
++
++/* The catalogue id the keymap file `pathname' (found for the argument
++ * `arg') stands for: a keymap of the system's keymap directory, directly or
++ * through an alias link, whose name is a catalogue entry.  Malloc'd, or
++ * NULL when it is none. */
++char *likeos_keymap_catalogue_id(const char *arg, const char *pathname);
++
++/* After loading the keymap of catalogue entry `id': record it as the
++ * system's layout (likeos-keyboard-save --console).  A failure is a warning,
++ * printed unless `quiet'. */
++void likeos_keyboard_save_console(const char *id, int quiet);
++
++/* This process may not load a keymap: have the helper record the layout of
++ * catalogue entry `id' and load its keymap.  Returns the helper's exit
++ * status, or -1 when it could not be run. */
++int likeos_keyboard_delegate(const char *id);
++
++#endif
+--- a/src/loadkeys.c
++++ b/src/loadkeys.c
+@@ -28,6 +28,11 @@
+ #include "xkbsupport.h"
+ #endif
+ 
++#ifdef __LIKEOS__
++/* The system keyboard setting: see likeos-keyboard.c. */
++#include "likeos-keyboard.h"
++#endif
++
+ static const char *const dirpath1[] = {
+ 	DATADIR "/" KEYMAPDIR "/**",
+ 	KERNDIR "/",
+@@ -82,6 +87,11 @@
+ 	char *ev;
+ 	struct kbdfile_ctx *fctx;
+ 	struct kbdfile *fp = NULL;
++#ifdef __LIKEOS__
++	int no_save = 0;
++	int quiet = 0;
++	char *likeos_id = NULL;
++#endif
+ 
+ #ifdef USE_XKB
+ 	struct xkeymap_params xkeymap_params = {
+@@ -112,6 +122,9 @@
+ 		{ "quiet", no_argument, NULL, 'q' },
+ 		{ "verbose", no_argument, NULL, 'v' },
+ 		{ "version", no_argument, NULL, 'V' },
++#ifdef __LIKEOS__
++		{ "no-save", no_argument, NULL, 7 },
++#endif
+ #ifdef USE_XKB
+ 		//{ "xkb-rules", required_argument, NULL, 1 },
+ 		{ "xkb-model", required_argument, NULL, 2 },
+@@ -142,6 +155,9 @@
+ 		{ "-q, --quiet",           _("suppress all normal output.") },
+ 		{ "-t, --tkeymap[=SHAPE]", _("output a text keymap to stdout.") },
+ 		{ "-v, --verbose",         _("be more verbose.") },
++#ifdef __LIKEOS__
++		{ "    --no-save",         _("do not make the keymap the system's keyboard setting.") },
++#endif
+ 		{ "-V, --version",         _("print version number.")     },
+ 		{ "-h, --help",            _("print this usage message.") },
+ 		{ NULL, NULL }
+@@ -220,7 +236,15 @@
+ 				break;
+ 			case 'q':
+ 				lk_set_log_priority(ctx, LOG_ERR);
++#ifdef __LIKEOS__
++				quiet = 1;
++#endif
++				break;
++#ifdef __LIKEOS__
++			case 7:
++				no_save = 1;
+ 				break;
++#endif
+ 			case 't':
+ 				options |= OPT_T;
+ 				if (optarg) {
+@@ -246,8 +270,44 @@
+ 		kbd_error(EXIT_FAILURE, 0, _("Options %s and %s are mutually exclusive."),
+ 				"--unicode", "--ascii");
+ 
++	dirpath = dirpath1;
++	if ((ev = getenv("LOADKEYS_KEYMAP_PATH")) != NULL) {
++		dirpath2[0] = ev;
++		dirpath     = dirpath2;
++	}
++
++#ifdef __LIKEOS__
++	/* One keymap of the system's keymap directory, to be loaded: which
++	 * layout of the catalogue is it? */
++	if (!no_save && !(options & (OPT_M | OPT_B | OPT_T | OPT_P | OPT_D)) &&
++	    optind == argc - 1) {
++		struct kbdfile *probe = kbdfile_new(fctx);
++
++		if (probe && !kbdfile_find(argv[optind], dirpath, suffixes, probe))
++			likeos_id = likeos_keymap_catalogue_id(argv[optind],
++			                                       kbdfile_get_pathname(probe));
++		if (probe)
++			kbdfile_free(probe);
++	}
++#endif
++
+ 	if (!(options & OPT_M) && !(options & OPT_B) && !(options & OPT_T)) {
+ 		/* get console */
++#ifdef __LIKEOS__
++		/* Not allowed to load a keymap here (no access to the console,
++		 * or the console is not this process's terminal): a layout of
++		 * the catalogue is still the user's to choose, through the
++		 * keyboard setting helper, which loads it. */
++		fd = likeos_console_fd(console);
++		if (likeos_id && (fd < 0 || !likeos_may_load_keymap(fd))) {
++			if (fd >= 0)
++				close(fd);
++			rc = likeos_keyboard_delegate(likeos_id);
++			free(likeos_id);
++			exit(rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
++		}
++		if (fd < 0)
++#endif
+ 		if ((fd = getfd(console)) < 0)
+ 			kbd_error(EXIT_FAILURE, 0, _("Couldn't get a file descriptor referring to the console."));
+ 
+@@ -278,12 +338,6 @@
+ 
+ 	lk_set_parser_flags(ctx, flags);
+ 
+-	dirpath = dirpath1;
+-	if ((ev = getenv("LOADKEYS_KEYMAP_PATH")) != NULL) {
+-		dirpath2[0] = ev;
+-		dirpath     = dirpath2;
+-	}
+-
+ 	if (options & OPT_D) {
+ 		if (!(fp = kbdfile_new(fctx)))
+ 			kbd_error(EXIT_FAILURE, 0, _("Unable to create kbdfile instance: %m"));
+@@ -364,6 +418,10 @@
+ 			rc = 0;
+ 		} else {
+ 			rc = lk_load_keymap(ctx, fd, kbd_mode);
++#ifdef __LIKEOS__
++			if (rc == 0 && likeos_id)
++				likeos_keyboard_save_console(likeos_id, quiet);
++#endif
+ 		}
+ 	}
+ 	else if (getenv("LK_DUMPKEYS")) {
