@@ -19,6 +19,11 @@
 // top, the search field, a switch between Favorites, All apps and Recent
 // files, and the places along its foot.  The Super key opens it too.
 //
+// Alt+Tab brings up the window switcher: a panel in the middle of the screen
+// with this workspace's windows as large icons, their titles under them, in
+// the order they last had the focus; letting go of Alt switches to the one
+// selected.
+//
 // It replaces ctwm's icon manager (which was the task list) and ctwm's
 // workspace manager (which was the workspace switcher -- now the Workspaces
 // flyout).  Both are switched off in system.ctwmrc -- ctwm still manages
@@ -102,7 +107,8 @@
  * the expensive part of talking to the server and these are used on every
  * window on every update. */
 static struct {
-	Atom client_list, active_window, current_desktop, number_of_desktops;
+	Atom client_list, client_list_stacking, active_window, current_desktop;
+	Atom number_of_desktops;
 	Atom wm_desktop, wm_name, wm_visible_name, wm_state, wm_change_state;
 	Atom net_wm_state, skip_taskbar, close_window;
 	Atom window_type, type_dock, type_desktop, type_toolbar, type_splash;
@@ -307,13 +313,13 @@ static gboolean win_iconic(Window w)
 	return ic;
 }
 
-/* The smallest _NET_WM_ICON that is still at least ICON_SIZE square, scaled
- * to ICON_SIZE.
+/* The smallest _NET_WM_ICON that is still at least `size' square, scaled
+ * to `size'.
  *
  * The property is a list of (width, height, ARGB pixels...) runs.  Picking the
  * smallest adequate one rather than the first keeps a 256x256 icon from being
  * downsampled to 24 pixels, which turns detailed artwork into mud. */
-static GdkPixbuf *win_icon(Window w)
+static GdkPixbuf *win_icon_at(Window w, int size)
 {
 	unsigned long n = 0;
 	unsigned char *d = prop_get(w, A.wm_icon, XA_CARDINAL, NULL, &n);
@@ -330,7 +336,7 @@ static GdkPixbuf *win_icon(Window w)
 
 		if (iw == 0 || ih == 0 || i + 2 + iw * ih > n)
 			break;
-		if (iw >= ICON_SIZE && (best_w == 0 || iw < best_w)) {
+		if (iw >= (unsigned long)size && (best_w == 0 || iw < best_w)) {
 			best_w = iw;
 			best_h = ih;
 			best_off = i + 2;
@@ -386,11 +392,16 @@ static GdkPixbuf *win_icon(Window w)
 	}
 	XFree(d);
 
-	GdkPixbuf *small = gdk_pixbuf_scale_simple(pb, ICON_SIZE, ICON_SIZE,
+	GdkPixbuf *small = gdk_pixbuf_scale_simple(pb, size, size,
 						   GDK_INTERP_BILINEAR);
 
 	g_object_unref(pb);
 	return small;
+}
+
+static GdkPixbuf *win_icon(Window w)
+{
+	return win_icon_at(w, ICON_SIZE);
 }
 
 /* WM_CLASS, both halves lower-cased: what a window is matched to its
@@ -4422,6 +4433,7 @@ static gboolean on_pop_scroll(GtkWidget *w, GdkEventScroll *ev, gpointer d)
 }
 
 static void launcher_toggle(gboolean search);
+static void sw_begin(gboolean back, Time t); /* the window switcher, below */
 
 static gboolean on_pop_key(GtkWidget *w, GdkEventKey *ev, gpointer d)
 {
@@ -4434,6 +4446,14 @@ static gboolean on_pop_key(GtkWidget *w, GdkEventKey *ev, gpointer d)
 	if (ev->keyval == GDK_KEY_Super_L || ev->keyval == GDK_KEY_Super_R) {
 		pop_close();
 		launcher_toggle(FALSE);
+		return TRUE;
+	}
+	/* The flyout's grab has the keyboard, so the root's Alt+Tab never
+	 * fires while it is open: started from here instead. */
+	if ((ev->keyval == GDK_KEY_Tab || ev->keyval == GDK_KEY_ISO_Left_Tab) &&
+	    (ev->state & GDK_MOD1_MASK)) {
+		pop_close();
+		sw_begin((ev->state & GDK_SHIFT_MASK) != 0, ev->time);
 		return TRUE;
 	}
 	if (P.ops->key && P.ops->key(ev->keyval))
@@ -5158,6 +5178,806 @@ static void tv_open(void)
 {
 	tv_scan();
 	pop_open(&g_tv_ops, HIT_WORKSPACES, POP_OVER_OWNER);
+}
+
+/* --- the window switcher ------------------------------------------------------------ */
+
+/* Alt+Tab.  Holding Alt and pressing Tab brings up a panel in the middle of
+ * the screen, over everything else, with one tile per window on this
+ * workspace -- its application's icon, large, and its title under it -- in
+ * the order the windows last had the focus, the focused one first.  The tile
+ * after it is selected; every further Tab moves the selection on (Shift+Tab
+ * back, the arrow keys any way), and letting go of Alt brings the selected
+ * window to the front and takes the panel away.  Escape takes it away without
+ * switching, Delete closes the selected window.  A quick Alt+Tab, Alt let go
+ * before the panel has had time to appear, switches straight back to the
+ * window used before, without the panel showing at all.
+ *
+ * The pointer works on it as well: the tile under it lights up, a click on
+ * one switches to that window, and the close button that appears in the
+ * tile's corner closes it.
+ *
+ * Alt+Tab is grabbed on the root window, as the Super key is.  While the
+ * panel is up the whole keyboard is grabbed: the passive grab on Tab ends
+ * when Tab is let go, and the release of Alt that comes after it has to reach
+ * this program all the same. */
+#define SW_TILE_W 176
+#define SW_TILE_H 152
+#define SW_ICON 64
+#define SW_ICON_Y 30	/* from the tile's top */
+#define SW_TITLE_Y 120	/* the title's centre line, from the tile's top */
+#define SW_GAP 8
+#define SW_PAD 16
+#define SW_MARGIN 48	/* the closest the screen's sides may come */
+#define SW_MARGIN_V (PANEL_HEIGHT + 16) /* top and bottom: clear of the bar */
+#define SW_RADIUS 8
+#define SW_TILE_RADIUS 6
+#define SW_CLOSE 24	/* the close button, square */
+#define SW_CLOSE_INSET 6
+#define SW_CLOSE_BG 0xe0443e /* the window frame's close colour */
+#define SW_SHOW_MS 100	/* how long Alt+Tab has to be held for the panel */
+
+static gboolean monitor_geometry(GdkRectangle *geo); /* with the layout */
+
+struct sw_item {
+	Window win;
+	char *title;
+	GdkPixbuf *icon; /* SW_ICON square, a reference */
+	int rank;	 /* the sort key: focus history, then stacking */
+};
+
+static struct {
+	GArray *items;	 /* struct sw_item */
+	gboolean active; /* Alt+Tab is held down: the keyboard is ours */
+	gboolean shown;	 /* and the panel is on the screen */
+	int sel;
+	int hover;	 /* the tile under the pointer, or -1 */
+	gboolean hover_close; /* on that tile's close button */
+	int pressed;	 /* the tile button 1 went down on, or -1 */
+	gboolean pressed_close;
+	int cols, rows, top; /* the grid, and its first row in view */
+	int w, h;
+	guint show_timer;
+	gboolean holding; /* switched, the keyboard kept until no key is down */
+	guint hold_timer;
+	GtkWidget *win;
+} SW = { .hover = -1, .pressed = -1 };
+
+/* The windows in the order they last had the focus, the most recent first.
+ * Fed from _NET_ACTIVE_WINDOW; the window switcher is what reads it. */
+static GArray *g_mru; /* Window */
+
+static KeyCode g_tab;
+static KeyCode g_alt[8]; /* the keys bound to Mod1 */
+static int g_nalt;
+
+static void mru_touch(Window w)
+{
+	if (w == None || !g_mru)
+		return;
+	for (guint i = 0; i < g_mru->len; i++) {
+		if (g_array_index(g_mru, Window, i) == w) {
+			g_array_remove_index(g_mru, i);
+			break;
+		}
+	}
+	g_array_prepend_val(g_mru, w);
+}
+
+/* Minimised: to the back of the history, behind every window that is not,
+ * so that Alt+Tab goes to the window under it rather than straight back. */
+static void mru_demote(Window w)
+{
+	if (!g_mru)
+		return;
+	for (guint i = 0; i < g_mru->len; i++) {
+		if (g_array_index(g_mru, Window, i) == w) {
+			g_array_remove_index(g_mru, i);
+			g_array_append_val(g_mru, w);
+			return;
+		}
+	}
+}
+
+static void sw_free(void)
+{
+	if (!SW.items)
+		return;
+	for (guint i = 0; i < SW.items->len; i++) {
+		struct sw_item *it = &g_array_index(SW.items, struct sw_item, i);
+
+		g_free(it->title);
+		if (it->icon)
+			g_object_unref(it->icon);
+	}
+	g_array_set_size(SW.items, 0);
+}
+
+static int sw_count(void)
+{
+	return SW.items ? (int)SW.items->len : 0;
+}
+
+static struct sw_item *sw_item(int i)
+{
+	return &g_array_index(SW.items, struct sw_item, i);
+}
+
+static gint sw_cmp(gconstpointer a, gconstpointer b)
+{
+	const struct sw_item *x = a, *y = b;
+
+	return (x->rank > y->rank) - (x->rank < y->rank);
+}
+
+/* The icon a tile shows: the application's from the icon theme when the
+ * window is one of a known application, else the window's own, else the
+ * generic program icon. */
+static GdkPixbuf *sw_icon(const struct task *t)
+{
+	struct app *a = app_for_task(t);
+	GdkPixbuf *pb = a ? icon_load(a->icon, SW_ICON) : NULL;
+
+	if (pb)
+		return g_object_ref(pb);
+	pb = win_icon_at(t->win, SW_ICON);
+	if (pb)
+		return pb;
+	pb = app_icon(NULL, SW_ICON);
+	return pb ? g_object_ref(pb) : NULL;
+}
+
+/* The windows of the task list -- this workspace's, minimised ones included
+ * -- most recently focused first.  Those that have never had the focus since
+ * this program started come after the rest, the topmost first, and minimised
+ * windows come last of all, the one minimised most recently at the very end:
+ * minimising a window puts it behind the others. */
+#define SW_BAND (1 << 24)
+
+static void sw_scan(void)
+{
+	unsigned long n = 0;
+	unsigned char *d = prop_get(g_root, A.client_list_stacking, XA_WINDOW,
+				    NULL, &n);
+	Window *stack = (Window *)d;
+
+	sw_free();
+	if (!SW.items)
+		SW.items = g_array_new(FALSE, TRUE, sizeof(struct sw_item));
+
+	/* The history forgets windows that are gone. */
+	if (d) {
+		for (guint i = g_mru->len; i-- > 0;) {
+			Window w = g_array_index(g_mru, Window, i);
+			gboolean found = FALSE;
+
+			for (unsigned long k = 0; k < n && !found; k++)
+				found = stack[k] == w;
+			if (!found)
+				g_array_remove_index(g_mru, i);
+		}
+	}
+
+	for (guint i = 0; i < g_tasks->len; i++) {
+		struct task *t = &g_array_index(g_tasks, struct task, i);
+		struct sw_item it = { 0 };
+
+		it.win = t->win;
+		it.title = g_strdup(t->title);
+		it.icon = sw_icon(t);
+		it.rank = -1;
+		for (guint k = 0; k < g_mru->len; k++) {
+			if (g_array_index(g_mru, Window, k) == t->win) {
+				it.rank = (int)k;
+				break;
+			}
+		}
+		/* The stacking list runs from the bottom up. */
+		for (unsigned long k = 0; it.rank < 0 && k < n; k++)
+			if (stack[k] == t->win)
+				it.rank = SW_BAND / 2 + (int)(n - 1 - k);
+		if (it.rank < 0)
+			it.rank = SW_BAND - 1;
+		if (t->iconic)
+			it.rank += SW_BAND;
+		g_array_append_val(SW.items, it);
+	}
+	if (d)
+		XFree(d);
+	g_array_sort(SW.items, sw_cmp);
+}
+
+/* Keep the selected tile's row in view, when there are more rows than fit. */
+static void sw_keep_in_view(void)
+{
+	int n = sw_count();
+	int total = SW.cols ? (n + SW.cols - 1) / SW.cols : 0;
+	int row = SW.cols ? SW.sel / SW.cols : 0;
+
+	if (row < SW.top)
+		SW.top = row;
+	if (row >= SW.top + SW.rows)
+		SW.top = row - SW.rows + 1;
+	SW.top = CLAMP(SW.top, 0, MAX(0, total - SW.rows));
+}
+
+/* As many tiles a row as the screen has room for, as many rows as it takes
+ * (or as fit; the rest scroll into view with the selection). */
+static void sw_size(void)
+{
+	GdkRectangle geo = { 0, 0, 1024, 768 };
+	int n = sw_count();
+
+	monitor_geometry(&geo);
+
+	int maxc = (geo.width - 2 * SW_MARGIN - 2 * SW_PAD + SW_GAP) /
+		   (SW_TILE_W + SW_GAP);
+	int maxr = (geo.height - 2 * SW_MARGIN_V - 2 * SW_PAD + SW_GAP) /
+		   (SW_TILE_H + SW_GAP);
+
+	SW.cols = CLAMP(n, 1, MAX(1, maxc));
+	SW.rows = CLAMP((n + SW.cols - 1) / SW.cols, 1, MAX(1, maxr));
+	SW.w = 2 * SW_PAD + SW.cols * SW_TILE_W + (SW.cols - 1) * SW_GAP;
+	SW.h = 2 * SW_PAD + SW.rows * SW_TILE_H + (SW.rows - 1) * SW_GAP;
+	sw_keep_in_view();
+}
+
+/* Where tile `i' is in the panel, or FALSE when its row is scrolled out of
+ * view.  A last row that is not full is centred under the others. */
+static gboolean sw_tile_rect(int i, double *x, double *y)
+{
+	int n = sw_count();
+	int row = i / SW.cols, col = i % SW.cols;
+
+	if (row < SW.top || row >= SW.top + SW.rows)
+		return FALSE;
+
+	int in_row = MIN(SW.cols, n - row * SW.cols);
+
+	*x = SW_PAD + floor((SW.cols - in_row) * (SW_TILE_W + SW_GAP) / 2.0) +
+	     col * (SW_TILE_W + SW_GAP);
+	*y = SW_PAD + (row - SW.top) * (SW_TILE_H + SW_GAP);
+	return TRUE;
+}
+
+static void sw_close_rect(double tx, double ty, double *x, double *y)
+{
+	*x = tx + SW_TILE_W - SW_CLOSE_INSET - SW_CLOSE;
+	*y = ty + SW_CLOSE_INSET;
+}
+
+static void sw_paint_tile(cairo_t *cr, int i, double x, double y)
+{
+	static const double text[4] = { 0xee / 255.0, 0xf2 / 255.0,
+					0xfa / 255.0, 1 };
+	struct sw_item *it = sw_item(i);
+	gboolean sel = i == SW.sel, hov = i == SW.hover;
+
+	/* The selected tile is filled and ringed in white; the one under the
+	 * pointer only filled. */
+	if (sel || hov) {
+		panel_round_rect(cr, x, y, SW_TILE_W, SW_TILE_H, SW_TILE_RADIUS);
+		cairo_set_source_rgba(cr, 1, 1, 1, sel ? 0.10 : 0.06);
+		cairo_fill(cr);
+	}
+	if (sel) {
+		panel_round_rect(cr, x + 1.5, y + 1.5, SW_TILE_W - 3,
+				 SW_TILE_H - 3, SW_TILE_RADIUS - 1.5);
+		panel_color(cr, PANEL_TEXT);
+		cairo_set_line_width(cr, 3);
+		cairo_stroke(cr);
+	}
+
+	if (it->icon)
+		draw_pixbuf(cr, it->icon, x + (SW_TILE_W - SW_ICON) / 2,
+			    y + SW_ICON_Y, SW_ICON);
+	panel_text_full(cr, x + 12, y + SW_TITLE_Y, SW_TILE_W - 24, it->title,
+			PANEL_FONT, text, 1);
+
+	/* The close button, on the tile under the pointer. */
+	if (hov) {
+		double cx, cy;
+
+		sw_close_rect(x, y, &cx, &cy);
+		panel_round_rect(cr, cx, cy, SW_CLOSE, SW_CLOSE, 4);
+		if (SW.hover_close)
+			panel_color(cr, SW_CLOSE_BG);
+		else
+			panel_color(cr, PANEL_RAISED);
+		cairo_fill(cr);
+
+		double c = SW.hover_close ? 1.0 : 0xee / 255.0;
+		double mx = cx + SW_CLOSE / 2.0, my = cy + SW_CLOSE / 2.0;
+
+		cairo_set_source_rgb(cr, c, c, c);
+		cairo_set_line_width(cr, 1.2);
+		cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+		cairo_move_to(cr, mx - 4.5, my - 4.5);
+		cairo_line_to(cr, mx + 4.5, my + 4.5);
+		cairo_move_to(cr, mx + 4.5, my - 4.5);
+		cairo_line_to(cr, mx - 4.5, my + 4.5);
+		cairo_stroke(cr);
+	}
+}
+
+static gboolean on_sw_draw(GtkWidget *w, cairo_t *cr, gpointer d)
+{
+	(void)w;
+	(void)d;
+	cairo_save(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	cairo_set_source_rgba(cr, 0, 0, 0, 0);
+	cairo_paint(cr);
+	cairo_restore(cr);
+	shell_surface(cr, 0, 0, SW.w, SW.h, SW_RADIUS);
+	for (int i = 0; i < sw_count(); i++) {
+		double x, y;
+
+		if (sw_tile_rect(i, &x, &y))
+			sw_paint_tile(cr, i, x, y);
+	}
+	return TRUE;
+}
+
+static void sw_redraw(void)
+{
+	if (SW.shown)
+		gtk_widget_queue_draw(SW.win);
+}
+
+/* In the middle of the screen the panel is on, over everything: an
+ * override-redirect window mapped after the others, and raised once more
+ * for good measure. */
+static void sw_place(void)
+{
+	GdkRectangle geo = { 0, 0, 1024, 768 };
+
+	monitor_geometry(&geo);
+
+	int x = geo.x + (geo.width - SW.w) / 2;
+	int y = geo.y + (geo.height - SW.h) / 2;
+	GdkWindow *gw = gtk_widget_get_window(SW.win);
+
+	gtk_widget_set_size_request(SW.win, SW.w, SW.h);
+	gtk_window_resize(GTK_WINDOW(SW.win), SW.w, SW.h);
+	gtk_window_move(GTK_WINDOW(SW.win), x, y);
+	if (gw) {
+		gdk_window_move_resize(gw, x, y, SW.w, SW.h);
+		gdk_window_raise(gw);
+	}
+	popup_shape(SW.win, SW.w, SW.h, SW_RADIUS);
+	gtk_widget_queue_draw(SW.win);
+}
+
+static int sw_hit(double x, double y, gboolean *on_close)
+{
+	*on_close = FALSE;
+	for (int i = 0; i < sw_count(); i++) {
+		double tx, ty, cx, cy;
+
+		if (!sw_tile_rect(i, &tx, &ty) || x < tx || y < ty ||
+		    x >= tx + SW_TILE_W || y >= ty + SW_TILE_H)
+			continue;
+		sw_close_rect(tx, ty, &cx, &cy);
+		*on_close = x >= cx && x < cx + SW_CLOSE && y >= cy &&
+			    y < cy + SW_CLOSE;
+		return i;
+	}
+	return -1;
+}
+
+/* The keyboard is let go only once no key is down any more.  Whatever is
+ * still held when the switch happens -- Tab, when Alt went up first; Alt,
+ * after a click on a tile -- would otherwise send its release to the window
+ * just brought to the front, and a GTK window that receives a key event
+ * shows its focus ring, as if it were being worked from the keyboard: a
+ * frame round whichever button has the focus.  A second at the most, in case
+ * a key is reported down that never comes up. */
+#define SW_HOLD_MS 1000
+
+static gboolean sw_keys_down(void)
+{
+	char keys[32];
+
+	XQueryKeymap(g_dpy, keys);
+	for (guint i = 0; i < sizeof(keys); i++)
+		if (keys[i])
+			return TRUE;
+	return FALSE;
+}
+
+static void sw_ungrab(void)
+{
+	SW.holding = FALSE;
+	if (SW.hold_timer) {
+		g_source_remove(SW.hold_timer);
+		SW.hold_timer = 0;
+	}
+	gdk_x11_display_error_trap_push(gdk_display_get_default());
+	XUngrabKeyboard(g_dpy, CurrentTime);
+	gdk_x11_display_error_trap_pop_ignored(gdk_display_get_default());
+}
+
+static gboolean sw_hold_over(gpointer data)
+{
+	(void)data;
+	SW.hold_timer = 0;
+	sw_ungrab();
+	return G_SOURCE_REMOVE;
+}
+
+static void sw_release_keyboard(void)
+{
+	if (!sw_keys_down()) {
+		sw_ungrab();
+		return;
+	}
+	SW.holding = TRUE;
+	if (!SW.hold_timer)
+		SW.hold_timer = g_timeout_add(SW_HOLD_MS, sw_hold_over, NULL);
+}
+
+static void sw_end(void)
+{
+	if (!SW.active)
+		return;
+	SW.active = FALSE;
+	if (SW.show_timer) {
+		g_source_remove(SW.show_timer);
+		SW.show_timer = 0;
+	}
+	sw_release_keyboard();
+	if (SW.shown) {
+		gtk_widget_hide(SW.win);
+		SW.shown = FALSE;
+	}
+	SW.hover = SW.pressed = -1;
+	SW.hover_close = SW.pressed_close = FALSE;
+	sw_free();
+}
+
+/* Switch to tile `i' and take the panel away. */
+static void sw_commit(int i)
+{
+	Window w = i >= 0 && i < sw_count() ? sw_item(i)->win : None;
+
+	sw_end();
+	if (w != None)
+		task_activate(w);
+}
+
+/* A tile's window has gone, or is being closed: its tile goes too. */
+static void sw_drop(int i)
+{
+	struct sw_item *it = sw_item(i);
+
+	g_free(it->title);
+	if (it->icon)
+		g_object_unref(it->icon);
+	g_array_remove_index(SW.items, i);
+	if (sw_count() == 0) {
+		sw_end();
+		return;
+	}
+	if (SW.sel > i || SW.sel >= sw_count())
+		SW.sel = MAX(0, SW.sel - 1);
+	SW.hover = SW.pressed = -1;
+	SW.hover_close = SW.pressed_close = FALSE;
+	sw_size();
+	if (SW.shown)
+		sw_place();
+}
+
+static void sw_close(int i)
+{
+	if (i < 0 || i >= sw_count())
+		return;
+	task_close(sw_item(i)->win);
+	sw_drop(i);
+}
+
+/* The task list changed while the panel is up: tiles of windows that have
+ * gone are taken off.  New windows wait for the next Alt+Tab. */
+static void sw_prune(void)
+{
+	for (int i = sw_count() - 1; SW.active && i >= 0; i--) {
+		gboolean found = FALSE;
+
+		for (guint k = 0; k < g_tasks->len && !found; k++)
+			found = g_array_index(g_tasks, struct task, k).win ==
+				sw_item(i)->win;
+		if (!found)
+			sw_drop(i);
+	}
+}
+
+static gboolean on_sw_motion(GtkWidget *w, GdkEventMotion *ev, gpointer d)
+{
+	gboolean on_close;
+	int hit = sw_hit(ev->x, ev->y, &on_close);
+
+	(void)w;
+	(void)d;
+	if (hit != SW.hover || on_close != SW.hover_close) {
+		SW.hover = hit;
+		SW.hover_close = on_close;
+		sw_redraw();
+	}
+	return TRUE;
+}
+
+static gboolean on_sw_leave(GtkWidget *w, GdkEventCrossing *ev, gpointer d)
+{
+	(void)w;
+	(void)ev;
+	(void)d;
+	if (SW.hover >= 0) {
+		SW.hover = -1;
+		SW.hover_close = FALSE;
+		sw_redraw();
+	}
+	return TRUE;
+}
+
+static gboolean on_sw_press(GtkWidget *w, GdkEventButton *ev, gpointer d)
+{
+	(void)w;
+	(void)d;
+	if (ev->type == GDK_BUTTON_PRESS && ev->button == 1)
+		SW.pressed = sw_hit(ev->x, ev->y, &SW.pressed_close);
+	return TRUE;
+}
+
+static gboolean on_sw_release(GtkWidget *w, GdkEventButton *ev, gpointer d)
+{
+	gboolean on_close;
+	int hit;
+
+	(void)w;
+	(void)d;
+	if (ev->button != 1 || !SW.active)
+		return TRUE;
+	hit = sw_hit(ev->x, ev->y, &on_close);
+	if (hit >= 0 && hit == SW.pressed && on_close == SW.pressed_close) {
+		if (on_close)
+			sw_close(hit);
+		else
+			sw_commit(hit);
+	}
+	SW.pressed = -1;
+	return TRUE;
+}
+
+static gboolean on_sw_scroll(GtkWidget *w, GdkEventScroll *ev, gpointer d)
+{
+	int n = sw_count();
+	int total = SW.cols ? (n + SW.cols - 1) / SW.cols : 0;
+
+	(void)w;
+	(void)d;
+	if (ev->direction == GDK_SCROLL_UP && SW.top > 0)
+		SW.top--;
+	else if (ev->direction == GDK_SCROLL_DOWN && SW.top + SW.rows < total)
+		SW.top++;
+	else
+		return TRUE;
+	SW.hover = -1;
+	sw_redraw();
+	return TRUE;
+}
+
+static gboolean sw_show(gpointer data)
+{
+	(void)data;
+	SW.show_timer = 0;
+	if (!SW.active || SW.shown)
+		return G_SOURCE_REMOVE;
+	if (!SW.win) {
+		SW.win = popup_new(G_CALLBACK(on_sw_draw), PANEL_BG);
+		gtk_widget_add_events(SW.win, GDK_BUTTON_PRESS_MASK |
+						      GDK_BUTTON_RELEASE_MASK |
+						      GDK_POINTER_MOTION_MASK |
+						      GDK_LEAVE_NOTIFY_MASK |
+						      GDK_SCROLL_MASK);
+		g_signal_connect(SW.win, "motion-notify-event",
+				 G_CALLBACK(on_sw_motion), NULL);
+		g_signal_connect(SW.win, "leave-notify-event",
+				 G_CALLBACK(on_sw_leave), NULL);
+		g_signal_connect(SW.win, "button-press-event",
+				 G_CALLBACK(on_sw_press), NULL);
+		g_signal_connect(SW.win, "button-release-event",
+				 G_CALLBACK(on_sw_release), NULL);
+		g_signal_connect(SW.win, "scroll-event", G_CALLBACK(on_sw_scroll),
+				 NULL);
+	}
+	sw_size();
+	SW.shown = TRUE;
+	sw_place();
+	gtk_widget_show(SW.win);
+	sw_place(); /* again now that it is mapped; see fly_place() */
+	return G_SOURCE_REMOVE;
+}
+
+static void sw_step(int d)
+{
+	int n = sw_count();
+
+	SW.sel = ((SW.sel + d) % n + n) % n;
+	sw_keep_in_view();
+	sw_redraw();
+}
+
+static void sw_step_row(int d)
+{
+	int s = SW.sel + d * SW.cols;
+
+	if (s < 0 || s >= sw_count())
+		return;
+	SW.sel = s;
+	sw_keep_in_view();
+	sw_redraw();
+}
+
+static gboolean sw_is_alt(KeyCode c)
+{
+	for (int i = 0; i < g_nalt; i++)
+		if (g_alt[i] == c)
+			return TRUE;
+	return FALSE;
+}
+
+/* Is any key bound to Mod1 held down right now? */
+static gboolean sw_alt_down(void)
+{
+	char keys[32];
+
+	XQueryKeymap(g_dpy, keys);
+	for (int i = 0; i < g_nalt; i++)
+		if (keys[g_alt[i] / 8] & (1 << (g_alt[i] % 8)))
+			return TRUE;
+	return FALSE;
+}
+
+static void sw_begin(gboolean back, Time t)
+{
+	GdkDisplay *disp = gdk_display_get_default();
+	int n, g;
+
+	popups_close();
+	sw_scan();
+	n = sw_count();
+	if (n == 0)
+		return;
+
+	gdk_x11_display_error_trap_push(disp);
+	g = XGrabKeyboard(g_dpy, g_root, False, GrabModeAsync, GrabModeAsync, t);
+	gdk_x11_display_error_trap_pop_ignored(disp);
+
+	SW.active = TRUE;
+	SW.top = 0;
+	SW.hover = SW.pressed = -1;
+	SW.hover_close = SW.pressed_close = FALSE;
+	if (back)
+		SW.sel = n - 1;
+	else
+		SW.sel = n > 1 && sw_item(0)->win == g_active ? 1 : 0;
+	sw_size();
+
+	/* Alt already let go -- between the Tab and the grab, a quick tap --
+	 * or the keyboard not to be had: switch at once. */
+	if (g != GrabSuccess || !sw_alt_down()) {
+		sw_commit(SW.sel);
+		return;
+	}
+	SW.show_timer = g_timeout_add(SW_SHOW_MS, sw_show, NULL);
+}
+
+/* A key on the root window: Alt+Tab itself, or, while the switcher holds the
+ * keyboard, any key at all.  TRUE when it was the switcher's. */
+static gboolean sw_key(XKeyEvent *k, gboolean press)
+{
+	/* Switched, and waiting for the last key to come up (see
+	 * sw_release_keyboard()).  Its release is swallowed; Alt+Tab again
+	 * starts a new switch, and any other key means typing has begun, so
+	 * the keyboard goes back -- that one key is lost. */
+	if (SW.holding) {
+		if (!press) {
+			if (!sw_keys_down())
+				sw_ungrab();
+			return TRUE;
+		}
+		sw_ungrab();
+		if (g_tab && k->keycode == g_tab && (k->state & Mod1Mask))
+			sw_begin((k->state & ShiftMask) != 0, k->time);
+		return TRUE;
+	}
+	if (!SW.active) {
+		if (!press || !g_tab || k->keycode != g_tab ||
+		    !(k->state & Mod1Mask))
+			return FALSE;
+		sw_begin((k->state & ShiftMask) != 0, k->time);
+		return TRUE;
+	}
+	if (!press) {
+		if (sw_is_alt(k->keycode))
+			sw_commit(SW.sel);
+		return TRUE;
+	}
+
+	switch (XLookupKeysym(k, 0)) {
+	case XK_Tab:
+		sw_step(k->state & ShiftMask ? -1 : 1);
+		/* A second Tab: the panel is wanted, no need to wait. */
+		if (!SW.shown) {
+			if (SW.show_timer) {
+				g_source_remove(SW.show_timer);
+				SW.show_timer = 0;
+			}
+			sw_show(NULL);
+		}
+		break;
+	case XK_Right:
+		sw_step(1);
+		break;
+	case XK_Left:
+		sw_step(-1);
+		break;
+	case XK_Down:
+		sw_step_row(1);
+		break;
+	case XK_Up:
+		sw_step_row(-1);
+		break;
+	case XK_Return:
+	case XK_KP_Enter:
+	case XK_space:
+		sw_commit(SW.sel);
+		break;
+	case XK_Delete:
+		sw_close(SW.sel);
+		break;
+	case XK_Escape:
+		sw_end();
+		break;
+	default:
+		break;
+	}
+	return TRUE;
+}
+
+/* Tab with Alt, and with Alt and Shift, whatever the lock keys; and which keys
+ * are Alt, for its release. */
+static void sw_grab(void)
+{
+	GdkDisplay *disp = gdk_display_get_default();
+	unsigned int locks[] = { 0, LockMask, Mod2Mask, LockMask | Mod2Mask };
+	XModifierKeymap *mm = XGetModifierMapping(g_dpy);
+
+	g_nalt = 0;
+	if (mm) {
+		for (int k = 0; k < mm->max_keypermod &&
+				g_nalt < (int)G_N_ELEMENTS(g_alt); k++) {
+			KeyCode c = mm->modifiermap[Mod1MapIndex *
+							    mm->max_keypermod +
+						    k];
+
+			if (c)
+				g_alt[g_nalt++] = c;
+		}
+		XFreeModifiermap(mm);
+	}
+
+	g_tab = XKeysymToKeycode(g_dpy, XK_Tab);
+	if (!g_tab)
+		return;
+	gdk_x11_display_error_trap_push(disp);
+	for (guint i = 0; i < G_N_ELEMENTS(locks); i++) {
+		XGrabKey(g_dpy, g_tab, Mod1Mask | locks[i], g_root, False,
+			 GrabModeAsync, GrabModeAsync);
+		XGrabKey(g_dpy, g_tab, Mod1Mask | ShiftMask | locks[i], g_root,
+			 False, GrabModeAsync, GrabModeAsync);
+	}
+	gdk_x11_display_error_trap_pop_ignored(disp);
 }
 
 /* --- the overflow button ---------------------------------------------------------- */
@@ -7945,10 +8765,14 @@ static GdkFilterReturn event_filter(GdkXEvent *xev, GdkEvent *ev, gpointer data)
 	(void)data;
 
 	if ((e->type == KeyPress || e->type == KeyRelease) &&
-	    e->xkey.window == g_root)
-		return super_key(&e->xkey, e->type == KeyPress) ?
-			       GDK_FILTER_REMOVE :
-			       GDK_FILTER_CONTINUE;
+	    e->xkey.window == g_root) {
+		gboolean press = e->type == KeyPress;
+
+		if (sw_key(&e->xkey, press))
+			return GDK_FILTER_REMOVE;
+		return super_key(&e->xkey, press) ? GDK_FILTER_REMOVE :
+						    GDK_FILTER_CONTINUE;
+	}
 
 	if (e->type != PropertyNotify)
 		return GDK_FILTER_CONTINUE;
@@ -7959,14 +8783,17 @@ static GdkFilterReturn event_filter(GdkXEvent *xev, GdkEvent *ev, gpointer data)
 		if (a == A.client_list) {
 			tasks_refresh();
 			snaps_prune();
+			sw_prune();
 		} else if (a == A.active_window) {
 			g_active = prop_window(g_root, A.active_window);
+			mru_touch(g_active);
 			gtk_widget_queue_draw(g_area);
 		} else if (a == A.current_desktop) {
 			g_desktop = prop_card(g_root, A.current_desktop, 0);
 			/* The task list is per-desktop, so a workspace switch
 			 * changes it as surely as opening a window does. */
 			tasks_refresh();
+			sw_prune();
 		} else if (a == A.number_of_desktops) {
 			g_ndesktops = prop_card(g_root,
 						A.number_of_desktops, 4);
@@ -7993,6 +8820,8 @@ static GdkFilterReturn event_filter(GdkXEvent *xev, GdkEvent *ev, gpointer data)
 	/* A client window: a title change, or a minimise/restore. */
 	if (a == A.wm_name || a == XA_WM_NAME || a == A.wm_state ||
 	    a == A.wm_desktop || a == A.net_wm_state) {
+		if (a == A.wm_state && win_iconic(e->xproperty.window))
+			mru_demote(e->xproperty.window);
 		tasks_refresh();
 	}
 	return GDK_FILTER_CONTINUE;
@@ -8210,6 +9039,7 @@ static void intern_atoms(void)
 {
 #define IA(f, n) A.f = XInternAtom(g_dpy, n, False)
 	IA(client_list, "_NET_CLIENT_LIST");
+	IA(client_list_stacking, "_NET_CLIENT_LIST_STACKING");
 	IA(active_window, "_NET_ACTIVE_WINDOW");
 	IA(current_desktop, "_NET_CURRENT_DESKTOP");
 	IA(number_of_desktops, "_NET_NUMBER_OF_DESKTOPS");
@@ -8590,7 +9420,10 @@ int main(int argc, char **argv)
 	g_desktop = prop_card(g_root, A.current_desktop, 0);
 	g_showing_desktop = prop_card(g_root, A.showing_desktop, 0) != 0;
 	tasks_refresh();
+	g_mru = g_array_new(FALSE, FALSE, sizeof(Window));
+	mru_touch(g_active);
 	super_grab();
+	sw_grab();
 	net_poll(NULL);
 	g_timeout_add_seconds(NET_POLL_SECS, net_poll, NULL);
 

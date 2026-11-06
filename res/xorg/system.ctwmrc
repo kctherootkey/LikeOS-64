@@ -427,6 +427,9 @@ Button2 =	: root		: f.menu "windowops"
 "F1" = m	: all		: f.menu "defops"
 "F2" = m	: all		: f.menu "windowops"
 
+# Alt+Tab is not bound here: taskbar(1) grabs it for its window switcher,
+# and a binding of ctwm's own would take the key away from it.
+
 Button1 = m	: window|icon	: f.function "move-or-lower"
 Button2 = m	: window|icon	: f.iconify
 Button3 = m	: window|icon	: f.function "move-or-raise"

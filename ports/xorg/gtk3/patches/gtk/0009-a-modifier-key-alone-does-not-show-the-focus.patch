@@ -1,0 +1,38 @@
+A modifier key on its own does not show the focus.
+
+Every key event a window receives switches on its focus-visible state,
+which is how GTK tells keyboard use from pointer use: from then on the
+widget with the focus is drawn with its focus ring.  That included a
+modifier pressed and let go on its own, which moves nothing -- above all
+the Alt that starts Alt+Tab.  The switcher only learns that it is wanted
+when Tab comes, so the press of Alt has already gone to the focused window,
+and every window Alt+Tab left showed a ring round its focused button (in
+LikeOS Explorer the new-tab button in the title row) when it was switched
+back to.  Alt, Shift, Control and Super alone now leave the state as it
+is; any other key switches it on as before, and Alt still shows the
+mnemonics.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/gtk/gtkmain.c
++++ b/gtk/gtkmain.c
+@@ -1869,12 +1869,17 @@
+       if (gtk_invoke_key_snoopers (grab_widget, event))
+         break;
+ 
+-      /* make focus visible in a window that receives a key event */
++      /* make focus visible in a window that receives a key event --
++       * other than a modifier on its own: Alt, Shift, Control or Super
++       * pressed and let go moves nothing, and the press of Alt that
++       * starts Alt+Tab reaches the focused window before the switcher
++       * sees the Tab
++       */
+       {
+         GtkWidget *window;
+ 
+         window = gtk_widget_get_toplevel (grab_widget);
+-        if (GTK_IS_WINDOW (window))
++        if (GTK_IS_WINDOW (window) && !event->key.is_modifier)
+           gtk_window_set_focus_visible (GTK_WINDOW (window), TRUE);
+       }
+ 
