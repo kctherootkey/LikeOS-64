@@ -1,0 +1,291 @@
+// LikeOS - block layer internals shared by its own source files
+//
+// <kernel/dev/block/blkdev.h> is the contract every driver and filesystem
+// codes against.  This header is NOT part of it: it is what the seven files
+// of the block layer itself (block.c, blk_queue.c, blk_work.c, genhd.c,
+// partition.c, blkdev_node.c, blk_sysfs.c) need from each other -- internal flag bits of
+// struct blk_request, the queue's accounting entry points, the registry
+// walks of genhd.c, the release paths of partitions and disks, and the node
+// and sysfs bookkeeping.  Nothing outside kernel/dev/block includes it.
+//
+// Lock order reminder (blkdev.h has the full story):
+//   g_disk_registry_mutex -> driver locks -> blk_queue.lock / g_block_lock
+// Every *_locked function below expects the registry mutex held; the
+// queue-internal ones say so explicitly when they need the queue lock.
+//
+// Copyright (C) 2026 The LikeOS Project
+
+#ifndef LIKEOS_BLK_INTERNAL_H
+#define LIKEOS_BLK_INTERNAL_H
+
+#include <kernel/dev/block/blkdev.h>
+
+/* ==========================================================================
+ * Prefix of every message the block layer prints
+ * ========================================================================== */
+#define BLK_LOG_PREFIX "[blk] "
+
+/* A sleeping path that also runs before the scheduler (it polls then):
+ * assert "may sleep" only when sleeping is actually what would happen. */
+#define blk_might_sleep()                       \
+	do {                                    \
+		if (blk_can_sleep())            \
+			might_sleep();          \
+	} while (0)
+
+/* ==========================================================================
+ * struct blk_request.bl.seq -- flush sequencing steps still to run
+ * ========================================================================== */
+#define BLK_SEQ_PREFLUSH (1u << 0) /* flush the cache before the data */
+#define BLK_SEQ_DATA (1u << 1) /* the data transfer itself */
+#define BLK_SEQ_POSTFLUSH (1u << 2) /* flush after it (FUA emulation) */
+#define BLK_SEQ_DONE (1u << 3) /* the sequence is over */
+#define BLK_SEQ_ACTIONS (BLK_SEQ_PREFLUSH | BLK_SEQ_DATA | BLK_SEQ_POSTFLUSH)
+/* With data steps in flight a pending flush waits this long for their
+ * post-flushes to join it. */
+#define BLK_FLUSH_PENDING_TIMEOUT_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
+
+/* ==========================================================================
+ * struct blk_request.bl.internal -- block layer bookkeeping bits
+ * ========================================================================== */
+#define BLK_RQI_HEAP (1u << 0) /* made by blk_request_alloc() */
+#define BLK_RQI_ACCT (1u << 1) /* statistics accounting started */
+#define BLK_RQI_CARRIER (1u << 2) /* bl.own_* hold its pre-merge state */
+#define BLK_RQI_MERGED (1u << 3) /* absorbed into another request */
+#define BLK_RQI_BYPASS (1u << 4) /* sits on the bypass list */
+#define BLK_RQI_SORTED (1u << 5) /* sits on the elevator lists */
+#define BLK_RQI_INFLIGHT_REF (1u << 6) /* blk_submit took the bdev ref */
+#define BLK_RQI_LEGACY (1u << 7) /* executed by the legacy callbacks */
+#define BLK_RQI_SCHED_TAG (1u << 8) /* holds one of the queue's slots */
+#define BLK_RQI_FLUSH_SEQ (1u << 9) /* runs through the flush machinery */
+#define BLK_RQI_FLUSH_RQ (1u << 10) /* the queue's own flush request */
+#define BLK_RQI_FLUSH_END (1u << 11) /* its sequence is over: end it */
+#define BLK_RQI_SPLIT (1u << 12) /* a piece of a request split at submit */
+#define BLK_RQI_ELV (1u << 13) /* went through the elevator's lists */
+
+/* ==========================================================================
+ * block.c
+ * ========================================================================== */
+
+/* Run the end of a request's life that is the same for every request:
+ * state COMPLETE, end_io, the waiter's wake-up, the in-flight reference.
+ * The caller has set status/resid.  After this returns the request may no
+ * longer exist.  Any context. */
+void blk_rq_finish(struct blk_request *req);
+/* The same without the last step: the device reference the request held
+ * while in flight is returned instead of dropped (NULL: none), so the
+ * caller can finish the queue's side of the completion first -- the
+ * reference keeps the disk, and with it the queue, alive until then. */
+block_device_t *blk_rq_finish_keep_bdev(struct blk_request *req);
+/* End a request that never reached the driver (its queue is dying) from
+ * the block softirq instead of the caller's context: the caller is the
+ * scheduler's plug hook, where an end_io must not run.  Any context. */
+void blk_request_end_deferred(struct blk_request *req, int status,
+			      uint32_t resid_bytes);
+/* blk_bdev_put() that is safe in any context: a last reference dropped
+ * where sleeping is impossible is handed to the deferred-release list. */
+void blk_bdev_put_any(block_device_t *bdev);
+/* Free heap requests whose last reference went in interrupt context. */
+void blk_reap_deferred_requests(void);
+/* Destroy a list of heap requests linked through disp_next (a completion
+ * section's end), or put one on the deferred list. */
+void blk_request_destroy_list(struct blk_request *list);
+void blk_request_defer_destroy(struct blk_request *req);
+/* errno <- ST_* (legacy callbacks). */
+int blk_status_to_errno(int st);
+/* Synchronous read of a device with the given request flags (QUIET for
+ * probes).  Same contract as blk_read_sync(). */
+int blk_read_sync_flags(block_device_t *bdev, uint64_t lba, uint32_t count,
+			void *buf, uint32_t flags);
+/* The disk a block device belongs to (NULL for a legacy device). */
+static inline struct gendisk *blk_bdev_gendisk(const block_device_t *bdev)
+{
+	return blk_bdev_is_extended(bdev) ? bdev->disk : NULL;
+}
+/* Effective write protection: the device's own flag, its disk's, or the
+ * disk's write-protected media. */
+int blk_bdev_read_only(const block_device_t *bdev);
+/* Names for log lines. */
+const char *blk_op_name(enum blk_op op);
+/* Per-disk power management used by blk_suspend_all/resume_all and the
+ * sysfs power/state attribute.  Called with g_blk_pm_mutex held and the
+ * registry mutex NOT held: the driver's suspend takes its own error
+ * handling mutex, which nests inside the registry mutex, and its error
+ * handler may need the registry (hot removal) while we wait for it. */
+extern struct blk_mutex g_blk_pm_mutex;
+int blk_disk_suspend(struct gendisk *disk);
+int blk_disk_resume(struct gendisk *disk);
+
+/* ==========================================================================
+ * blk_queue.c
+ * ========================================================================== */
+
+/* Take one of the queue's request slots for `req' (nr_requests; for
+ * anything but a read at most async_depth of them), waiting for one when
+ * the caller may sleep; a caller that cannot sleep takes one beyond the
+ * limit.  0, or -ENODEV when the queue is dying (no slot taken). */
+int blk_queue_get_sched_tag(struct blk_queue *q, struct blk_request *req);
+/* Wait until there is room under nr_requests (may sleep).  0, or -ENODEV
+ * when the queue is dying. */
+int blk_queue_wait_room(struct blk_queue *q);
+/* Hold the queue for blk_submit(): -ENODEV when it is dying, else 0 and
+ * q->active counts the caller until blk_queue_leave(). */
+int blk_queue_enter(struct blk_queue *q);
+void blk_queue_leave(struct blk_queue *q);
+/* Wait until nothing is dispatched (in-flight 0, no dispatcher active);
+ * queued requests may remain.  For suspend.  0 or -ETIMEDOUT. */
+int blk_queue_quiesce(struct blk_queue *q, uint32_t timeout_ms);
+/* The flush machinery's completion of a request in a flush sequence (a
+ * data step) or of the queue's flush request: the sequence moves on, a
+ * finished request is ended.  Any context.  blk_queue.c. */
+void blk_flush_complete(struct blk_queue *q, struct blk_request *rq,
+			int status, uint32_t resid);
+/* Take `rq' onto the submitting task's plug: 1 taken (it keeps the queue
+ * entered until the plug is flushed), 0 it goes to its queue now. */
+int blk_add_rq_to_plug(struct blk_request *rq);
+/* Final free of a queue's memory (the disk's last reference). */
+void blk_queue_free(struct blk_queue *q);
+/* The statistics groups of an op (BLK_STAT_*), -1 for unaccounted. */
+int blk_stat_group(enum blk_op op);
+/* Snapshot of the in-flight counts of one device for /sys .../inflight
+ * (the sum of its per-CPU counts, never negative). */
+void blk_queue_inflight(struct blk_queue *q, const struct blk_part_stats *s,
+			uint64_t out[2]);
+/* Sum one device's per-CPU statistics into the printable form (the busy
+ * time brought up to now first when something is in flight). */
+void blk_queue_stats_snapshot(struct blk_queue *q,
+			      const struct blk_part_stats *s,
+			      struct blk_disk_stats *out);
+/* What the queue's side of a completion needs from a request, taken
+ * before the request's end_io and waiter run -- the waiter may free the
+ * request (it often lives on the waiter's stack) as soon as it is woken.
+ * blk_queue_done_snap() then works from this alone. */
+struct blk_done_snap {
+	struct blk_part_stats *disk_stats; /* NULL: not accounted */
+	struct blk_part_stats *part_stats; /* the partition's, or NULL */
+	uint64_t start_ns, now_ns;
+	uint64_t sect512;
+	int tag; /* -1: held none */
+	int merge_slot; /* -1: none */
+	int status;
+	int acct; /* accounting was started */
+	int group; /* BLK_STAT_*, -1: not counted */
+	int dir;
+	int elv; /* went through the elevator */
+	int sched_tag; /* held one of the queue's request slots */
+	uint32_t completed; /* the request and the ones merged into it */
+};
+void blk_queue_done_prepare(struct blk_queue *q, struct blk_request *req,
+			    struct blk_done_snap *snap);
+void blk_queue_done_snap(struct blk_queue *q, const struct blk_done_snap *snap);
+/* Undo the pre-merge redirection of a carrier (its own sg list and
+ * range come back).  Called on completion with the request no longer on
+ * any queue list. */
+void blk_rq_restore_carrier(struct blk_request *req);
+/* Name of the active scheduler, and the sysfs text listing both. */
+const char *blk_queue_sched_name(const struct blk_queue *q);
+long blk_queue_sched_show(const struct blk_queue *q, char *buf, long cap);
+
+/* ==========================================================================
+ * genhd.c
+ * ========================================================================== */
+
+/* The next disk sequence number (global, starts at 1, never reused). */
+uint64_t genhd_next_diskseq(void);
+/* Walk helpers, registry mutex held: the first/next disk in index order
+ * (sd disks, then sr drives). */
+struct gendisk *genhd_first_locked(void);
+struct gendisk *genhd_next_locked(struct gendisk *disk);
+/* Is `disk' a live, added disk?  (Validates a pointer remembered by a
+ * sysfs node.)  Registry mutex held. */
+int genhd_disk_alive_locked(const struct gendisk *disk);
+/* The registered block device with that name or device number, without
+ * taking a reference.  Registry mutex held. */
+block_device_t *genhd_find_name_locked(const char *name);
+block_device_t *genhd_find_devt_locked(uint32_t major, uint32_t minor);
+/* Extended partition minors (BLK_EXT_MAJOR). */
+int genhd_ext_minor_alloc_locked(uint32_t *minor);
+void genhd_ext_minor_free_locked(uint32_t minor);
+/* Capacity change with the registry mutex held. */
+int disk_set_capacity_locked(struct gendisk *disk, uint64_t sectors);
+/* Release paths: drop a reference from any context (deferred when the
+ * last one goes where sleeping is impossible). */
+void disk_put_any(struct gendisk *disk);
+/* A partition's last reference went where sleeping is impossible: its
+ * release runs later, from genhd_reap_deferred(). */
+void genhd_defer_partition_release(struct blk_partition *p);
+/* Run the deferred releases (disks, partitions, requests).  Process
+ * context. */
+void genhd_reap_deferred(void);
+/* Default max_segments when a driver gives none. */
+#define BLK_DEFAULT_MAX_SEGMENTS 128
+/* Segments the controller sees for `len' bytes of an sg element from
+ * `off': one per max_segment_size of a physically contiguous range, one
+ * per page touched of memory known only by its virtual address -- and the
+ * sum over a request's list.  Pure (blk_queue.c). */
+uint32_t blk_sg_segments(const struct blk_sg_entry *e, uint32_t off,
+			 uint32_t len, const struct blk_limits *lim);
+uint32_t blk_rq_nr_segments(const struct blk_request *rq,
+			    const struct blk_limits *lim);
+/* A task that waits for block-layer progress while it keeps an error
+ * handler's done queue (blk_cpl_collect_done) finishes what it collected
+ * first: the progress may be one of those completions.  block.c. */
+void blk_flush_own_done(void);
+/* The timeout scan for a waiter that polls with interrupts off (boot, a
+ * polled driver): the queue's timer cannot fire then.  Handles what is
+ * due right away (the driver's ->timeout, in the caller).  blk_queue.c. */
+void blk_queue_poll_timeouts(struct blk_queue *q);
+/* Have kblockd reap the deferred lists (requests, partitions, disks,
+ * driver items).  Any context. */
+void genhd_kick_reap(void);
+/* Probe the filesystem identity of a device (I/O, registry mutex NOT
+ * held), then record it and refresh the device's /dev/disk links under
+ * the registry mutex.  May sleep. */
+void genhd_refresh_identity(block_device_t *bdev);
+/* Count of whole disks currently added (sd + sr). */
+int genhd_disk_count(void);
+
+/* ==========================================================================
+ * partition.c
+ * ========================================================================== */
+
+/* Create and register one partition (scan, BLKPG).  Registry mutex
+ * held.  Returns the partition or NULL (logged). */
+struct blk_partition *blk_partition_create_locked(struct gendisk *disk,
+						  const struct blk_pt_entry *e);
+/* Unregister one partition and drop the registry's reference. */
+void blk_partition_remove_locked(struct blk_partition *p);
+/* The last reference to a partition is gone: free it, release its disk
+ * reference.  Process context. */
+void blk_partition_release(struct blk_partition *p);
+/* Is the partition (or, for p == NULL, any partition of `disk') open or
+ * claimed? */
+int blk_partition_busy_locked(struct gendisk *disk, struct blk_partition *p);
+/* The table-type name for logs ("gpt", "dos", "none"). */
+const char *blk_pt_type_name(enum blk_pt_type t);
+
+/* ==========================================================================
+ * blkdev_node.c
+ * ========================================================================== */
+
+/* devfs directories /dev/disk/by-*: created on first use. */
+void blkdev_nodes_init(void);
+/* Remove every /dev/disk link of a device (before re-creating them). */
+void blkdev_links_remove_locked(block_device_t *bdev);
+/* udev-style escaping of a name for a /dev/disk link component. */
+int blkdev_link_escape(const char *in, char *out, size_t cap);
+/* Is a holder an exclusive open of a block node (O_EXCL), as opposed to
+ * a mount?  Registry mutex held. */
+int blkdev_holder_is_node_locked(const void *holder);
+/* Free node records whose grace period ended (process context). */
+void blkdev_nodes_reap(void);
+
+/* ==========================================================================
+ * blk_sysfs.c
+ * ========================================================================== */
+
+/* uevent text of a device ("MAJOR=8\nMINOR=0\nDEVNAME=sda\n...").  The
+ * registry mutex is held. */
+long blk_sysfs_uevent_locked(block_device_t *bdev, char *buf, long cap);
+
+#endif // LIKEOS_BLK_INTERNAL_H

@@ -24,6 +24,9 @@ extern "C" {
 #define _PATH_VARRUN    "/var/run/"
 #define _PATH_VI        "/usr/bin/vi"
 #define _PATH_MAILDIR   "/var/mail"
+/* The mount tables <mntent.h> names MNTTAB and MOUNTED. */
+#define _PATH_MNTTAB    "/etc/fstab"
+#define _PATH_MOUNTED   "/etc/mtab"
 /* Where rwhod deposits one whod.<host> file per host it has heard from.  4.4BSD
  * kept this in <protocols/rwhod.h>; it belongs here, and that header includes
  * this one so code written against either spelling compiles. */

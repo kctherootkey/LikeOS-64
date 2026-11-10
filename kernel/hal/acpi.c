@@ -2263,9 +2263,19 @@ __attribute__((weak)) void net_quiesce_for_poweroff(void)
 {
 }
 
+/* kernel/ke/system.c: flush and park the disks, stop the storage
+ * controllers; once per boot (a no-op when sys_reboot() did it already).
+ * The argument is an enum blk_shutdown_mode (1 = power-off). */
+void system_storage_shutdown(int mode);
+
 void acpi_poweroff(void)
 {
 	acpi_dbg("ACPI: powering off...\n");
+
+	/* The disks first: data in their write caches would be lost with the
+	 * power.  Normally sys_reboot() has done this already, with
+	 * interrupts on; this covers any other way into the power-off. */
+	system_storage_shutdown(1 /* BLK_SHUTDOWN_POWEROFF */);
 
 	// Quiesce all NICs first: stop bus-master DMA, mask interrupts, clear
 	// any wake-on-LAN enables.  Without this the platform's S5 path can

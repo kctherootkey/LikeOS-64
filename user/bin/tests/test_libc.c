@@ -65,6 +65,13 @@
 #include <sys/audio.h>
 #include <sys/soundcard.h>
 #include <sys/input.h>
+/* Block devices: the BLK* requests (<sys/mount.h>), the ATA disk requests,
+ * the SCSI pass-through and the SCSI command set -- the storage section. */
+#include <sys/mount.h>
+#include <sys/hdreg.h>
+#include <scsi/sg.h>
+#include <scsi/scsi.h>
+#include <mntent.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
 #include <net/if.h>
@@ -16795,6 +16802,1987 @@ static void test_remove_kinds(const char *base, const char *label)
 				  errno == ENOENT);
 }
 
+/* ---- libc additions for the disk tools ------------------------------------
+ *
+ * What the hdparm, smartmontools and disk-utility ports needed from the C
+ * library: the mount-table reader <mntent.h>, memory and cookie streams
+ * (fmemopen, fopencookie), readlinkat, getpass, the interval-timer and
+ * timeval/timespec declarations of <sys/time.h>, and a few errno values.
+ * ------------------------------------------------------------------------- */
+
+struct dlt_cookie {
+	char data[64];
+	size_t len, pos;
+	int closes;
+};
+
+static ssize_t dlt_ck_read(void *c, char *buf, size_t n)
+{
+	struct dlt_cookie *k = c;
+	size_t left = k->len - k->pos;
+
+	if (n > left)
+		n = left;
+	memcpy(buf, k->data + k->pos, n);
+	k->pos += n;
+	return (ssize_t)n;
+}
+
+static ssize_t dlt_ck_write(void *c, const char *buf, size_t n)
+{
+	struct dlt_cookie *k = c;
+
+	if (n > sizeof(k->data) - k->len)
+		n = sizeof(k->data) - k->len;
+	memcpy(k->data + k->len, buf, n);
+	k->len += n;
+	return (ssize_t)n;
+}
+
+static int dlt_ck_close(void *c)
+{
+	((struct dlt_cookie *)c)->closes++;
+	return 0;
+}
+
+static void test_disktool_libc_additions(void)
+{
+	char tmpl[64];
+	char buf[256];
+
+	printf("\n[TEST] libc additions for the disk tools (mntent, fmemopen, fopencookie, readlinkat, getpass)\n");
+
+	/* <mntent.h> */
+	snprintf(tmpl, sizeof(tmpl), "/tmp/mntent%d", (int)getpid());
+	{
+		FILE *f = fopen(tmpl, "w");
+
+		if (f) {
+			fputs("# comment line\n\n", f);
+			fputs("/dev/sda2 / ext4 rw,relatime 0 1\n", f);
+			fputs("/dev/sdb1 /mnt/with\\040space vfat uid=1000,ro\n", f);
+			fclose(f);
+		}
+	}
+	{
+		FILE *m = setmntent(tmpl, "r");
+		struct mntent *e;
+		int ok1 = 0, ok2 = 0;
+
+		test_result("setmntent opens a table", m != NULL);
+		if (m) {
+			e = getmntent(m);
+			ok1 = e && strcmp(e->mnt_fsname, "/dev/sda2") == 0 &&
+			      strcmp(e->mnt_dir, "/") == 0 &&
+			      strcmp(e->mnt_type, "ext4") == 0 &&
+			      e->mnt_freq == 0 && e->mnt_passno == 1;
+			test_result("getmntent skips comments/blank lines, parses fields", ok1);
+			test_result("hasmntopt matches whole options only",
+				    e && hasmntopt(e, "rw") != NULL &&
+					    hasmntopt(e, "rel") == NULL &&
+					    hasmntopt(e, "relatime") != NULL);
+			e = getmntent(m);
+			ok2 = e && strcmp(e->mnt_dir, "/mnt/with space") == 0 &&
+			      e->mnt_freq == 0 && e->mnt_passno == 0;
+			test_result("getmntent: \\040 is a space, missing freq/passno are 0", ok2);
+			test_result("hasmntopt finds uid=1000",
+				    e && hasmntopt(e, "uid") != NULL &&
+					    strncmp(hasmntopt(e, "uid"), "uid=1000", 8) == 0);
+			test_result("getmntent returns NULL at the end", getmntent(m) == NULL);
+			test_result("endmntent returns 1", endmntent(m) == 1);
+		}
+		/* addmntent round trip, with an escaped blank */
+		m = setmntent(tmpl, "w");
+		if (m) {
+			struct mntent w = { "/dev/sdc1", "/a b", "ext4", "rw", 1, 2 };
+			struct mntent r, *rp;
+			char sbuf[256];
+
+			test_result("addmntent writes an entry", addmntent(m, &w) == 0);
+			endmntent(m);
+			m = setmntent(tmpl, "r");
+			rp = m ? getmntent_r(m, &r, sbuf, sizeof(sbuf)) : NULL;
+			test_result("addmntent/getmntent_r round trip keeps the escaped blank",
+				    rp == &r && strcmp(r.mnt_dir, "/a b") == 0 &&
+					    r.mnt_freq == 1 && r.mnt_passno == 2);
+			if (m)
+				endmntent(m);
+		}
+		unlink(tmpl);
+	}
+
+	/* fmemopen */
+	{
+		char mb[16] = "hello world";
+		FILE *f = fmemopen(mb, 11, "r");
+		size_t n;
+
+		test_result("fmemopen(\"r\") opens", f != NULL);
+		if (f) {
+			n = fread(buf, 1, sizeof(buf), f);
+			test_result("fmemopen read returns exactly size bytes, then EOF",
+				    n == 11 && memcmp(buf, "hello world", 11) == 0 &&
+					    feof(f));
+			test_result("fmemopen: fseek inside, ftell",
+				    fseek(f, 6, SEEK_SET) == 0 && ftell(f) == 6 &&
+					    fgetc(f) == 'w');
+			errno = 0;
+			test_result("fmemopen: fseek past size -> EINVAL",
+				    fseek(f, 12, SEEK_SET) == -1 && errno == EINVAL);
+			test_result("fmemopen: fileno is -1", fileno(f) == -1);
+			fclose(f);
+		}
+		memset(mb, 'x', sizeof(mb));
+		f = fmemopen(mb, 8, "w");
+		if (f) {
+			fputs("abc", f);
+			fflush(f);
+			test_result("fmemopen(\"w\") keeps the content NUL-terminated",
+				    strcmp(mb, "abc") == 0);
+			fputs("defghijk", f);
+			fflush(f);
+			test_result("fmemopen(\"w\") stops at the buffer's end",
+				    memcmp(mb, "abcdefg", 7) == 0);
+			fclose(f);
+		}
+		f = fmemopen(NULL, 32, "w+");
+		test_result("fmemopen(NULL, 32, \"w+\") allocates a buffer", f != NULL);
+		if (f) {
+			fputs("round trip", f);
+			rewind(f);
+			test_result("fmemopen(NULL) reads back what was written",
+				    fgets(buf, sizeof(buf), f) &&
+					    strcmp(buf, "round trip") == 0);
+			fclose(f);
+		}
+		errno = 0;
+		test_result("fmemopen size 0 -> EINVAL",
+			    fmemopen(mb, 0, "r") == NULL && errno == EINVAL);
+	}
+
+	/* fopencookie */
+	{
+		struct dlt_cookie k;
+		cookie_io_functions_t io = { dlt_ck_read, dlt_ck_write, NULL,
+					     dlt_ck_close };
+		FILE *f;
+
+		memset(&k, 0, sizeof(k));
+		f = fopencookie(&k, "w+", io);
+		test_result("fopencookie opens", f != NULL);
+		if (f) {
+			fprintf(f, "n=%d", 42);
+			fflush(f);
+			test_result("fopencookie: writes reach the write function",
+				    k.len == 4 && memcmp(k.data, "n=42", 4) == 0);
+			errno = 0;
+			test_result("fopencookie without seek: fseek -> ESPIPE",
+				    fseek(f, 0, SEEK_SET) == -1 && errno == ESPIPE);
+			fclose(f);
+			test_result("fopencookie: close function called once", k.closes == 1);
+		}
+		memset(&k, 0, sizeof(k));
+		memcpy(k.data, "line1\nline2\n", 12);
+		k.len = 12;
+		f = fopencookie(&k, "r", io);
+		if (f) {
+			test_result("fopencookie: reads come from the read function",
+				    fgets(buf, sizeof(buf), f) &&
+					    strcmp(buf, "line1\n") == 0);
+			fclose(f);
+		}
+		{
+			cookie_io_functions_t none = { NULL, NULL, NULL, NULL };
+
+			f = fopencookie(&k, "r", none);
+			test_result("fopencookie with no read function is at EOF",
+				    f && fgetc(f) == EOF);
+			if (f)
+				fclose(f);
+		}
+	}
+
+	/* readlinkat */
+	{
+		char dir[64], link[96];
+		int dfd;
+		ssize_t n;
+
+		snprintf(dir, sizeof(dir), "/tmp/rla%d", (int)getpid());
+		mkdir(dir, 0755);
+		snprintf(link, sizeof(link), "%s/lnk", dir);
+		symlink("target-of-link", link);
+		dfd = open(dir, O_RDONLY | O_DIRECTORY);
+		memset(buf, 0, sizeof(buf));
+		n = readlinkat(dfd, "lnk", buf, sizeof(buf));
+		test_result("readlinkat(dirfd, relative)",
+			    n == 14 && memcmp(buf, "target-of-link", 14) == 0);
+		n = readlinkat(AT_FDCWD, link, buf, sizeof(buf));
+		test_result("readlinkat(AT_FDCWD, absolute)", n == 14);
+		n = readlinkat(12345, link, buf, sizeof(buf));
+		test_result("readlinkat: an absolute path ignores dirfd", n == 14);
+		errno = 0;
+		n = readlinkat(98765, "lnk", buf, sizeof(buf));
+		test_result("readlinkat: bad dirfd -> EBADF", n == -1 && errno == EBADF);
+		errno = 0;
+		n = readlinkat(dfd, "", buf, sizeof(buf));
+		test_result("readlinkat: empty path -> ENOENT", n == -1 && errno == ENOENT);
+		{
+			int ffd = open(link, O_RDONLY | O_NOFOLLOW);
+			int rfd = open("/etc/passwd", O_RDONLY);
+
+			errno = 0;
+			n = readlinkat(rfd, "lnk", buf, sizeof(buf));
+			test_result("readlinkat: non-directory dirfd -> ENOTDIR",
+				    n == -1 && errno == ENOTDIR);
+			if (ffd >= 0)
+				close(ffd);
+			if (rfd >= 0)
+				close(rfd);
+		}
+		if (dfd >= 0)
+			close(dfd);
+		unlink(link);
+		rmdir(dir);
+	}
+
+	/* getpass without a terminal: reads the line from stdin. */
+	{
+		int pfd[2];
+		pid_t pid;
+
+		if (pipe(pfd) == 0) {
+			pid = fork();
+			if (pid == 0) {
+				char *pw;
+				int fd = open("/dev/null", O_WRONLY);
+
+				close(pfd[1]);
+				dup2(pfd[0], 0);
+				if (fd >= 0)
+					dup2(fd, 2);
+				/* No controlling terminal for the child; the
+				 * alarm turns a hang into a failure. */
+				setsid();
+				alarm(5);
+				pw = getpass("pw: ");
+				_exit(pw && strcmp(pw, "s3cret") == 0 ? 0 : 1);
+			}
+			close(pfd[0]);
+			write(pfd[1], "s3cret\nmore\n", 12);
+			close(pfd[1]);
+			if (pid > 0) {
+				int st = 0;
+
+				waitpid(pid, &st, 0);
+				test_result("getpass without a tty reads a line from stdin",
+					    WIFEXITED(st) && WEXITSTATUS(st) == 0);
+			}
+		}
+	}
+
+	/* <sys/time.h>: interval timers and the conversion macros */
+	{
+		struct itimerval it, old, cur;
+		struct timeval tv = { 3, 250000 };
+		struct timespec ts;
+
+		memset(&it, 0, sizeof(it));
+		it.it_value.tv_sec = 100;
+		test_result("setitimer(ITIMER_REAL) via <sys/time.h>",
+			    setitimer(ITIMER_REAL, &it, &old) == 0);
+		test_result("getitimer: remaining <= what was set",
+			    getitimer(ITIMER_REAL, &cur) == 0 &&
+				    cur.it_value.tv_sec <= 100 &&
+				    (cur.it_value.tv_sec > 0 || cur.it_value.tv_usec > 0));
+		memset(&it, 0, sizeof(it));
+		setitimer(ITIMER_REAL, &it, NULL);
+		TIMEVAL_TO_TIMESPEC(&tv, &ts);
+		test_result("TIMEVAL_TO_TIMESPEC",
+			    ts.tv_sec == 3 && ts.tv_nsec == 250000000);
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+		TIMESPEC_TO_TIMEVAL(&tv, &ts);
+		test_result("TIMESPEC_TO_TIMEVAL", tv.tv_sec == 3 && tv.tv_usec == 250000);
+	}
+
+	/* errno values and constants */
+	test_result("strerror(EBADE) is \"Invalid exchange\"",
+		    strcmp(strerror(EBADE), "Invalid exchange") == 0);
+	test_result("UTIME_NOW/UTIME_OMIT from <sys/stat.h>",
+		    UTIME_NOW == 1073741823L && UTIME_OMIT == 1073741822L);
+}
+
+/* ==========================================================================
+ * Storage: block device nodes, the block/HDIO/SG ioctls, sysfs and procfs
+ *
+ * What a disk utility sees of a disk: the S_IFBLK node and its device
+ * number, the BLK* ioctls (size, sector sizes, I/O hints, read-only state,
+ * geometry, disk sequence), the ATA identity (HDIO_GET_IDENTITY) and the
+ * SCSI pass-through (SG_IO) with its SCSI/ATA translation -- INQUIRY and
+ * its vital product data pages, READ CAPACITY, and ATA PASS-THROUGH
+ * carrying IDENTIFY DEVICE, CHECK POWER MODE and SMART RETURN STATUS --,
+ * /sys/block, /proc/partitions, /proc/diskstats and the /dev/disk/by-*
+ * links.  All of these describe the same disk, so most checks here are
+ * that the different views agree with each other.
+ *
+ * Read-only by default: these tests run in every full run and touch no
+ * data.  The destructive part (test_storage_write) runs only under
+ * `testlibc storage', and only on a target explicitly set aside for it: a
+ * GPT partition named "likeos-test" (/dev/disk/by-partlabel/likeos-test)
+ * or the node named by TESTLIBC_DISK=/dev/sdXN -- never anything else, and
+ * never while it is mounted.
+ * ========================================================================== */
+
+/* Read a sysfs/procfs attribute into buf, trailing whitespace removed. */
+static int stg_read_attr(const char *path, char *buf, size_t cap)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (cap == 0)
+		return -1;
+	buf[0] = 0;
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, cap - 1);
+	close(fd);
+	if (n < 0)
+		return -1;
+	buf[n] = 0;
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+		buf[--n] = 0;
+	return 0;
+}
+
+/* An unsigned number from a sysfs attribute; -1 when absent. */
+static long long stg_attr_ull(const char *fmt, const char *a, const char *b)
+{
+	char path[256], val[64];
+	char *end;
+	unsigned long long v;
+
+	snprintf(path, sizeof(path), fmt, a, b);
+	if (stg_read_attr(path, val, sizeof(val)) != 0 || !val[0])
+		return -1;
+	errno = 0;
+	v = strtoull(val, &end, 10);
+	if (errno || end == val)
+		return -1;
+	return (long long)v;
+}
+
+/* Copy a fixed-width text field, trimming trailing (and leading) blanks. */
+static void stg_trim(char *dst, size_t cap, const char *src, size_t len)
+{
+	size_t s = 0, e = len;
+
+	while (s < len && (src[s] == ' ' || src[s] == 0))
+		s++;
+	while (e > s && (src[e - 1] == ' ' || src[e - 1] == 0))
+		e--;
+	if (e - s >= cap)
+		e = s + cap - 1;
+	memcpy(dst, src + s, e - s);
+	dst[e - s] = 0;
+}
+
+/* An ATA string from IDENTIFY data: byte pairs swapped, then trimmed. */
+static void stg_ata_string(char *dst, size_t cap, const uint8_t *id,
+			   int word, int nwords)
+{
+	char raw[96];
+	int n = nwords * 2;
+
+	if (n > (int)sizeof(raw))
+		n = (int)sizeof(raw);
+	for (int i = 0; i < n; i += 2) {
+		raw[i] = (char)id[word * 2 + i + 1];
+		raw[i + 1] = (char)id[word * 2 + i];
+	}
+	stg_trim(dst, cap, raw, (size_t)n);
+}
+
+static uint16_t stg_id_word(const uint8_t *id, int w)
+{
+	return (uint16_t)(id[w * 2] | (id[w * 2 + 1] << 8));
+}
+
+/* One synchronous SG_IO.  Returns the ioctl result; *hdr holds the status,
+ * the sense length and the residual. */
+static int stg_sgio(int fd, const uint8_t *cdb, int cdb_len, int dir,
+		    void *buf, unsigned len, uint8_t *sense, unsigned sense_len,
+		    struct sg_io_hdr *hdr)
+{
+	memset(hdr, 0, sizeof(*hdr));
+	if (sense)
+		memset(sense, 0, sense_len);
+	hdr->interface_id = 'S';
+	hdr->dxfer_direction = dir;
+	hdr->cmd_len = (unsigned char)cdb_len;
+	hdr->mx_sb_len = (unsigned char)sense_len;
+	hdr->dxfer_len = len;
+	hdr->dxferp = buf;
+	hdr->cmdp = (unsigned char *)cdb;
+	hdr->sbp = sense;
+	hdr->timeout = 20000;
+	return ioctl(fd, SG_IO, hdr);
+}
+
+/* The ATA registers an ATA PASS-THROUGH with CK_COND=1 returned, from the
+ * sense data: descriptor format (72h, ATA Status Return descriptor 09h) or
+ * fixed format (70h).  0 when found. */
+struct stg_ata_regs {
+	uint8_t error, status, device;
+	uint16_t count;
+	uint32_t lba;
+};
+
+static int stg_ata_regs_from_sense(const uint8_t *s, unsigned sb_len,
+				   struct stg_ata_regs *r)
+{
+	memset(r, 0, sizeof(*r));
+	if (sb_len >= 8 && (s[0] & 0x7f) == 0x72) {
+		unsigned add = s[7], off = 8;
+
+		while (off + 2 <= 8 + add && off + 2 <= sb_len) {
+			const uint8_t *d = s + off;
+
+			if (d[0] == 0x09 && d[1] >= 0x0c && off + 14 <= sb_len) {
+				r->error = d[3];
+				r->count = (uint16_t)((d[4] << 8) | d[5]);
+				r->lba = (uint32_t)d[7] | ((uint32_t)d[9] << 8) |
+					 ((uint32_t)d[11] << 16);
+				r->device = d[12];
+				r->status = d[13];
+				return 0;
+			}
+			off += 2u + d[1];
+		}
+		return -1;
+	}
+	if (sb_len >= 12 && (s[0] & 0x7f) == 0x70) {
+		r->error = s[3];
+		r->status = s[4];
+		r->device = s[5];
+		r->count = s[6];
+		r->lba = (uint32_t)s[9] | ((uint32_t)s[10] << 8) |
+			 ((uint32_t)s[11] << 16);
+		return 0;
+	}
+	return -1;
+}
+
+/* Is the device with this device number, or (whole disk) any of its
+ * partitions, mounted?  /proc/mounts names the mounted nodes. */
+static int stg_mounted(dev_t dev, int whole_disk)
+{
+	FILE *f = fopen("/proc/mounts", "r");
+	char line[512];
+	int hit = 0;
+
+	if (!f)
+		return 0;
+	while (!hit && fgets(line, sizeof(line), f)) {
+		char node[256];
+		struct stat st;
+
+		if (sscanf(line, "%255s", node) != 1 || node[0] != '/')
+			continue;
+		if (stat(node, &st) != 0 || !S_ISBLK(st.st_mode))
+			continue;
+		if (st.st_rdev == dev)
+			hit = 1;
+		else if (whole_disk && major(st.st_rdev) == major(dev) &&
+			 minor(st.st_rdev) / 16 == minor(dev) / 16)
+			hit = 1;
+	}
+	fclose(f);
+	return hit;
+}
+
+/* The root filesystem's device lives on this disk?  The root may be named
+ * /dev/root in the mount table, so also compare st_dev of "/". */
+static int stg_disk_holds_root(dev_t disk_dev)
+{
+	struct stat st;
+
+	if (stat("/", &st) != 0)
+		return 0;
+	if (major(st.st_dev) == major(disk_dev) &&
+	    minor(st.st_dev) / 16 == minor(disk_dev) / 16)
+		return 1;
+	return 0;
+}
+
+static int stg_is_sd_major(unsigned maj)
+{
+	return maj == SCSI_DISK0_MAJOR ||
+	       (maj >= SCSI_DISK1_MAJOR && maj <= SCSI_DISK7_MAJOR);
+}
+
+/* /proc/diskstats fields of one device: reads completed, sectors read,
+ * writes completed, sectors written.  0 when found. */
+static int stg_diskstats(const char *name, unsigned long long *rd_ios,
+			 unsigned long long *rd_sec, unsigned long long *wr_ios,
+			 unsigned long long *wr_sec)
+{
+	FILE *f = fopen("/proc/diskstats", "r");
+	char line[512];
+	int found = -1;
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned maj, min;
+		char dev[64];
+		unsigned long long v[11];
+		int n = sscanf(line,
+			       " %u %u %63s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+			       &maj, &min, dev, &v[0], &v[1], &v[2], &v[3],
+			       &v[4], &v[5], &v[6], &v[7], &v[8], &v[9],
+			       &v[10]);
+
+		if (n < 14 || strcmp(dev, name) != 0)
+			continue;
+		*rd_ios = v[0];
+		*rd_sec = v[2];
+		*wr_ios = v[4];
+		*wr_sec = v[6];
+		found = 0;
+		break;
+	}
+	fclose(f);
+	return found;
+}
+
+/* /proc/partitions: the size in 1 KiB blocks of one device; -1 absent.
+ * Also checks the whole file parses (header + rows of 4 fields). */
+static long long stg_proc_partitions(const char *name, int *parse_ok,
+				     unsigned *maj_out, unsigned *min_out)
+{
+	FILE *f = fopen("/proc/partitions", "r");
+	char line[256];
+	long long blocks = -1;
+	int lineno = 0;
+
+	*parse_ok = (f != NULL);
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned maj, min;
+		unsigned long long b;
+		char dev[64];
+
+		lineno++;
+		if (lineno == 1) {
+			if (strncmp(line, "major", 5) != 0)
+				*parse_ok = 0;
+			continue;
+		}
+		if (line[0] == '\n')
+			continue;
+		if (sscanf(line, " %u %u %llu %63s", &maj, &min, &b, dev) != 4) {
+			*parse_ok = 0;
+			continue;
+		}
+		if (strcmp(dev, name) == 0) {
+			blocks = (long long)b;
+			*maj_out = maj;
+			*min_out = min;
+		}
+	}
+	fclose(f);
+	return blocks;
+}
+
+/* The SCSI/ATA view of one SATA disk: INQUIRY + VPD, READ CAPACITY, ATA
+ * PASS-THROUGH, and their agreement with HDIO_GET_IDENTITY and sysfs. */
+static void test_storage_sat(int fd, const char *d, uint64_t bytes,
+			     unsigned lsz)
+{
+	uint8_t cdb[16], inq[96], vpd[256], cap16[32], cap10[8];
+	uint8_t id_pt[512], id_hd[512], sense[64];
+	struct sg_io_hdr h;
+	char name[160], vendor[16], product[24], id_model[48], id_serial[24];
+	char sysval[128], path[128];
+	int r, have_hd = 0, have_pt = 0;
+
+	/* INQUIRY, standard data */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = INQUIRY;
+	cdb[4] = sizeof(inq);
+	r = stg_sgio(fd, cdb, 6, SG_DXFER_FROM_DEV, inq, sizeof(inq), sense,
+		     sizeof(sense), &h);
+	snprintf(name, sizeof(name), "%s: SG_IO INQUIRY succeeds (GOOD)", d);
+	test_result(name, r == 0 && h.status == SAM_STAT_GOOD &&
+				  h.host_status == 0 && h.driver_status == 0);
+	if (r != 0 || h.status != SAM_STAT_GOOD)
+		return;
+	snprintf(name, sizeof(name), "%s: INQUIRY: direct-access device, SPC version, residual sane",
+		 d);
+	test_result(name, (inq[0] & 0x1f) == TYPE_DISK && inq[2] >= 5 &&
+				  h.resid >= 0 && h.resid < (int)sizeof(inq) &&
+				  inq[4] + 5 >= 36);
+	stg_trim(vendor, sizeof(vendor), (const char *)inq + 8, 8);
+	stg_trim(product, sizeof(product), (const char *)inq + 16, 16);
+	snprintf(name, sizeof(name), "%s: INQUIRY vendor is \"ATA\" (SCSI/ATA translation)", d);
+	test_result(name, strcmp(vendor, "ATA") == 0);
+
+	/* VPD 00h: the supported pages; 80h and 83h must be among them. */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = INQUIRY;
+	cdb[1] = 1;
+	cdb[2] = 0x00;
+	cdb[4] = 255;
+	memset(vpd, 0, sizeof(vpd));
+	r = stg_sgio(fd, cdb, 6, SG_DXFER_FROM_DEV, vpd, 255, sense,
+		     sizeof(sense), &h);
+	{
+		int has80 = 0, has83 = 0;
+
+		for (int i = 0; r == 0 && i < vpd[3] && 4 + i < 255; i++) {
+			has80 |= vpd[4 + i] == 0x80;
+			has83 |= vpd[4 + i] == 0x83;
+		}
+		snprintf(name, sizeof(name), "%s: VPD 00h lists pages 80h and 83h", d);
+		test_result(name, r == 0 && h.status == 0 && vpd[1] == 0x00 &&
+					  has80 && has83);
+	}
+
+	/* IDENTIFY DEVICE through ATA PASS-THROUGH (16): PIO data-in,
+	 * transfer length in the count field, in blocks, from the device. */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = ATA_16;
+	cdb[1] = 4 << 1; /* protocol 4: PIO data-in */
+	cdb[2] = 0x08 | 0x04 | 0x02; /* T_DIR in, BYT_BLOK, T_LENGTH=count */
+	cdb[6] = 1;
+	cdb[14] = 0xEC;
+	memset(id_pt, 0, sizeof(id_pt));
+	r = stg_sgio(fd, cdb, 16, SG_DXFER_FROM_DEV, id_pt, 512, sense,
+		     sizeof(sense), &h);
+	snprintf(name, sizeof(name), "%s: ATA PASS-THROUGH(16) IDENTIFY DEVICE returns 512 bytes", d);
+	have_pt = (r == 0 && h.status == SAM_STAT_GOOD && h.resid == 0);
+	test_result(name, have_pt);
+
+	/* HDIO_GET_IDENTITY: the identify block the driver keeps. */
+	memset(id_hd, 0, sizeof(id_hd));
+	r = ioctl(fd, HDIO_GET_IDENTITY, id_hd);
+	have_hd = (r == 0);
+	snprintf(name, sizeof(name), "%s: HDIO_GET_IDENTITY succeeds", d);
+	test_result(name, have_hd);
+	if (have_hd && (id_hd[510] == 0xA5)) {
+		uint8_t sum = 0;
+
+		for (int i = 0; i < 512; i++)
+			sum = (uint8_t)(sum + id_hd[i]);
+		snprintf(name, sizeof(name), "%s: identify integrity word checksums to 0", d);
+		test_result(name, sum == 0);
+	}
+
+	if (have_pt && have_hd) {
+		/* Identity, capacity and geometry words do not change at run
+		 * time (feature-enable words may: hdparm -W toggles them). */
+		static const int words[] = { 10, 11, 12, 13, 14, 15, 16, 17,
+					     18, 19, 23, 24, 25, 26, 27, 46,
+					     60, 61, 100, 101, 102, 103, 106,
+					     117, 118, 209 };
+		int same = 1;
+
+		for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+			if (stg_id_word(id_pt, words[i]) !=
+			    stg_id_word(id_hd, words[i]))
+				same = 0;
+		snprintf(name, sizeof(name), "%s: SG_IO IDENTIFY == HDIO_GET_IDENTITY (identity/capacity words)", d);
+		test_result(name, same);
+	}
+
+	if (have_pt) {
+		uint64_t lba48 = (uint64_t)stg_id_word(id_pt, 100) |
+				 ((uint64_t)stg_id_word(id_pt, 101) << 16) |
+				 ((uint64_t)stg_id_word(id_pt, 102) << 32) |
+				 ((uint64_t)stg_id_word(id_pt, 103) << 48);
+		uint64_t lba28 = (uint64_t)stg_id_word(id_pt, 60) |
+				 ((uint64_t)stg_id_word(id_pt, 61) << 16);
+		uint16_t w106 = stg_id_word(id_pt, 106);
+		uint64_t sectors = (stg_id_word(id_pt, 83) & (1u << 10)) &&
+						   lba48 ?
+					   lba48 :
+					   lba28;
+		unsigned id_lsz = 512;
+
+		if ((w106 & 0xC000) == 0x4000 && (w106 & (1u << 12)))
+			id_lsz = 2u * ((uint32_t)stg_id_word(id_pt, 117) |
+				       ((uint32_t)stg_id_word(id_pt, 118) << 16));
+		snprintf(name, sizeof(name), "%s: IDENTIFY capacity x sector size == BLKGETSIZE64", d);
+		test_result(name, sectors * id_lsz == bytes && id_lsz == lsz);
+
+		stg_ata_string(id_model, sizeof(id_model), id_pt, 27, 20);
+		stg_ata_string(id_serial, sizeof(id_serial), id_pt, 10, 10);
+		snprintf(name, sizeof(name), "%s: INQUIRY product is the start of the IDENTIFY model", d);
+		test_result(name, product[0] &&
+					  strncmp(id_model, product,
+						  strlen(product)) == 0);
+		snprintf(path, sizeof(path), "/sys/block/%s/device/model", d);
+		if (stg_read_attr(path, sysval, sizeof(sysval)) == 0) {
+			snprintf(name, sizeof(name), "%s: sysfs device/model matches the drive", d);
+			test_result(name, strcmp(sysval, id_model) == 0 ||
+						  strcmp(sysval, product) == 0);
+		}
+		snprintf(path, sizeof(path), "/sys/block/%s/device/serial", d);
+		if (stg_read_attr(path, sysval, sizeof(sysval)) == 0) {
+			char t[64];
+
+			stg_trim(t, sizeof(t), sysval, strlen(sysval));
+			snprintf(name, sizeof(name), "%s: sysfs device/serial == IDENTIFY serial", d);
+			test_result(name, strcmp(t, id_serial) == 0);
+		}
+
+		/* VPD 80h: the unit serial number is the ATA serial. */
+		memset(cdb, 0, sizeof(cdb));
+		cdb[0] = INQUIRY;
+		cdb[1] = 1;
+		cdb[2] = 0x80;
+		cdb[4] = 255;
+		memset(vpd, 0, sizeof(vpd));
+		r = stg_sgio(fd, cdb, 6, SG_DXFER_FROM_DEV, vpd, 255, sense,
+			     sizeof(sense), &h);
+		{
+			char vs[64];
+			unsigned n = vpd[3] < 60 ? vpd[3] : 60;
+
+			stg_trim(vs, sizeof(vs), (const char *)vpd + 4, n);
+			snprintf(name, sizeof(name), "%s: VPD 80h serial == IDENTIFY serial", d);
+			test_result(name, r == 0 && h.status == 0 &&
+						  vpd[1] == 0x80 &&
+						  strcmp(vs, id_serial) == 0);
+		}
+
+		/* VPD 83h: at least one designator, well formed; the SAT
+		 * one carries the ATA model and serial. */
+		memset(cdb, 0, sizeof(cdb));
+		cdb[0] = INQUIRY;
+		cdb[1] = 1;
+		cdb[2] = 0x83;
+		cdb[4] = 255;
+		memset(vpd, 0, sizeof(vpd));
+		r = stg_sgio(fd, cdb, 6, SG_DXFER_FROM_DEV, vpd, 255, sense,
+			     sizeof(sense), &h);
+		{
+			unsigned len = ((unsigned)vpd[2] << 8) | vpd[3];
+			unsigned off = 4, ndesc = 0;
+			int well_formed = (r == 0 && h.status == 0 &&
+					   vpd[1] == 0x83 && len >= 4);
+			int has_serial = 0;
+
+			while (well_formed && off + 4 <= 4 + len && off + 4 <= 255) {
+				unsigned dl = vpd[off + 3];
+
+				if (off + 4 + dl > 4 + len) {
+					well_formed = 0;
+					break;
+				}
+				if (memmem(vpd + off + 4, dl, id_serial,
+					   strlen(id_serial)) &&
+				    id_serial[0])
+					has_serial = 1;
+				ndesc++;
+				off += 4 + dl;
+			}
+			snprintf(name, sizeof(name), "%s: VPD 83h has well-formed designators", d);
+			test_result(name, well_formed && ndesc >= 1);
+			snprintf(name, sizeof(name), "%s: VPD 83h names the drive (serial in a designator)", d);
+			test_result(name, has_serial);
+		}
+	}
+
+	/* READ CAPACITY (16) and (10) against BLKGETSIZE64/BLKSSZGET. */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = SERVICE_ACTION_IN_16;
+	cdb[1] = SAI_READ_CAPACITY_16;
+	cdb[13] = sizeof(cap16);
+	memset(cap16, 0, sizeof(cap16));
+	r = stg_sgio(fd, cdb, 16, SG_DXFER_FROM_DEV, cap16, sizeof(cap16),
+		     sense, sizeof(sense), &h);
+	{
+		uint64_t last = 0;
+		uint32_t bl = 0;
+
+		for (int i = 0; i < 8; i++)
+			last = (last << 8) | cap16[i];
+		for (int i = 8; i < 12; i++)
+			bl = (bl << 8) | cap16[i];
+		snprintf(name, sizeof(name), "%s: READ CAPACITY(16): last LBA + 1 and block length match", d);
+		test_result(name, r == 0 && h.status == 0 && bl == lsz &&
+					  (last + 1) * bl == bytes);
+		if (r == 0 && h.status == 0) {
+			unsigned exp = cap16[13] & 0x0f;
+			unsigned pbsz = 0;
+
+			if (ioctl(fd, BLKPBSZGET, &pbsz) == 0) {
+				snprintf(name, sizeof(name), "%s: READ CAPACITY(16) physical exponent == BLKPBSZGET", d);
+				test_result(name, (lsz << exp) == pbsz);
+			}
+		}
+	}
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = READ_CAPACITY;
+	memset(cap10, 0, sizeof(cap10));
+	r = stg_sgio(fd, cdb, 10, SG_DXFER_FROM_DEV, cap10, sizeof(cap10),
+		     sense, sizeof(sense), &h);
+	{
+		uint32_t last = ((uint32_t)cap10[0] << 24) | (cap10[1] << 16) |
+				(cap10[2] << 8) | cap10[3];
+		uint32_t bl = ((uint32_t)cap10[4] << 24) | (cap10[5] << 16) |
+			      (cap10[6] << 8) | cap10[7];
+		uint64_t blocks = bytes / lsz;
+
+		snprintf(name, sizeof(name), "%s: READ CAPACITY(10) consistent (or FFFFFFFFh when too large)", d);
+		test_result(name, r == 0 && h.status == 0 && bl == lsz &&
+					  (blocks - 1 > 0xFFFFFFFEull ?
+						   last == 0xFFFFFFFFu :
+						   (uint64_t)last + 1 == blocks));
+	}
+
+	/* TEST UNIT READY */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = TEST_UNIT_READY;
+	r = stg_sgio(fd, cdb, 6, SG_DXFER_NONE, NULL, 0, sense, sizeof(sense),
+		     &h);
+	snprintf(name, sizeof(name), "%s: TEST UNIT READY -> GOOD", d);
+	test_result(name, r == 0 && h.status == SAM_STAT_GOOD);
+
+	/* CHECK POWER MODE: non-data, CK_COND=1 returns the registers. */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = ATA_16;
+	cdb[1] = 3 << 1; /* protocol 3: non-data */
+	cdb[2] = 0x20; /* CK_COND */
+	cdb[14] = 0xE5;
+	r = stg_sgio(fd, cdb, 16, SG_DXFER_NONE, NULL, 0, sense, sizeof(sense),
+		     &h);
+	{
+		struct stg_ata_regs regs;
+		int got = (r == 0 && h.sb_len_wr > 0 &&
+			   stg_ata_regs_from_sense(sense, h.sb_len_wr, &regs) == 0);
+		uint8_t c = (uint8_t)regs.count;
+
+		snprintf(name, sizeof(name), "%s: ATA PASS-THROUGH CHECK POWER MODE returns registers", d);
+		test_result(name, got && !(regs.status & 0x01));
+		snprintf(name, sizeof(name), "%s: CHECK POWER MODE count is a defined power state", d);
+		test_result(name, got && (c == 0x00 || c == 0x01 || c == 0x40 ||
+					  c == 0x41 || c == 0x80 || c == 0x81 ||
+					  c == 0x82 || c == 0x83 || c == 0xFF));
+	}
+
+	/* SMART RETURN STATUS, when the drive supports SMART (word 82 bit 0)
+	 * and has it enabled (word 85 bit 0). */
+	if (have_pt && (stg_id_word(id_pt, 82) & 1) &&
+	    (stg_id_word(id_pt, 85) & 1)) {
+		memset(cdb, 0, sizeof(cdb));
+		cdb[0] = ATA_16;
+		cdb[1] = 3 << 1;
+		cdb[2] = 0x20;
+		cdb[4] = 0xDA; /* feature: RETURN STATUS */
+		cdb[10] = 0x4F; /* LBA mid */
+		cdb[12] = 0xC2; /* LBA high */
+		cdb[14] = 0xB0;
+		r = stg_sgio(fd, cdb, 16, SG_DXFER_NONE, NULL, 0, sense,
+			     sizeof(sense), &h);
+		{
+			struct stg_ata_regs regs;
+			int got = (r == 0 && h.sb_len_wr > 0 &&
+				   stg_ata_regs_from_sense(sense, h.sb_len_wr,
+							   &regs) == 0);
+			uint16_t midhi = (uint16_t)((regs.lba >> 8) & 0xFFFF);
+
+			snprintf(name, sizeof(name), "%s: SMART RETURN STATUS answers 4Fh/C2h (ok) or F4h/2Ch (failing)", d);
+			test_result(name, got && (midhi == 0xC24F ||
+						  midhi == 0x2CF4));
+			if (got && midhi == 0x2CF4)
+				printf("  [NOTE] %s: SMART says the drive is FAILING (threshold exceeded)\n",
+				       d);
+		}
+	} else {
+		printf("  (%s: SMART not supported or disabled -- RETURN STATUS not checked)\n",
+		       d);
+	}
+
+	/* A malformed request is refused, not passed on. */
+	memset(cdb, 0, sizeof(cdb));
+	cdb[0] = INQUIRY;
+	cdb[4] = 36;
+	{
+		struct sg_io_hdr bad;
+
+		memset(&bad, 0, sizeof(bad));
+		bad.interface_id = 'Q'; /* not the v3 header */
+		bad.cmd_len = 6;
+		bad.cmdp = cdb;
+		bad.dxfer_direction = SG_DXFER_NONE;
+		errno = 0;
+		r = ioctl(fd, SG_IO, &bad);
+		snprintf(name, sizeof(name), "%s: SG_IO with a foreign interface_id -> EINVAL/ENOSYS", d);
+		test_result(name, r == -1 && (errno == EINVAL || errno == ENOSYS));
+		memset(&bad, 0, sizeof(bad));
+		bad.interface_id = 'S';
+		bad.cmd_len = 40; /* longer than any CDB */
+		bad.cmdp = cdb;
+		bad.dxfer_direction = SG_DXFER_NONE;
+		errno = 0;
+		r = ioctl(fd, SG_IO, &bad);
+		snprintf(name, sizeof(name), "%s: SG_IO with a 40-byte CDB -> EINVAL", d);
+		test_result(name, r == -1 && errno == EINVAL);
+	}
+}
+
+/* Read-only checks of one partition of disk d. */
+static void test_storage_partition(int dfd, const char *d, const char *p,
+				   unsigned lsz)
+{
+	char path[160], name[200], val[64];
+	struct stat st, dst;
+	long long start, size, partno;
+	int fd;
+
+	start = stg_attr_ull("/sys/block/%s/%s/start", d, p);
+	size = stg_attr_ull("/sys/block/%s/%s/size", d, p);
+	partno = stg_attr_ull("/sys/block/%s/%s/partition", d, p);
+	snprintf(name, sizeof(name), "%s: sysfs start/size/partition readable", p);
+	test_result(name, start >= 0 && size >= 0 && partno >= 1);
+	if (start < 0 || size < 0 || partno < 1)
+		return;
+
+	snprintf(path, sizeof(path), "/dev/%s", p);
+	snprintf(name, sizeof(name), "%s: node is S_IFBLK", path);
+	test_result(name, stat(path, &st) == 0 && S_ISBLK(st.st_mode));
+	if (fstat(dfd, &dst) == 0 && S_ISBLK(st.st_mode)) {
+		if (partno < 16) {
+			snprintf(name, sizeof(name), "%s: device number = disk + partition number", path);
+			test_result(name, major(st.st_rdev) == major(dst.st_rdev) &&
+						  minor(st.st_rdev) ==
+							  minor(dst.st_rdev) +
+								  (unsigned)partno);
+		} else {
+			snprintf(name, sizeof(name), "%s: partition >= 16 on the extended major", path);
+			test_result(name, major(st.st_rdev) == 254);
+		}
+	}
+	{
+		char devattr[160];
+		unsigned ma = 0, mi = 0;
+
+		snprintf(devattr, sizeof(devattr), "/sys/block/%s/%s/dev", d, p);
+		if (stg_read_attr(devattr, val, sizeof(val)) == 0 &&
+		    sscanf(val, "%u:%u", &ma, &mi) == 2) {
+			snprintf(name, sizeof(name), "%s: sysfs dev == st_rdev", path);
+			test_result(name, ma == major(st.st_rdev) &&
+						  mi == minor(st.st_rdev));
+		}
+	}
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDONLY)", path);
+	test_result(name, fd >= 0);
+	if (fd < 0)
+		return;
+	{
+		unsigned long long b64 = 0;
+		struct hd_geometry geo;
+		int pssz = 0;
+
+		snprintf(name, sizeof(name), "%s: BLKGETSIZE64 == sysfs size x 512", path);
+		test_result(name, ioctl(fd, BLKGETSIZE64, &b64) == 0 &&
+					  b64 == (unsigned long long)size * 512);
+		snprintf(name, sizeof(name), "%s: BLKSSZGET == the disk's", path);
+		test_result(name, ioctl(fd, BLKSSZGET, &pssz) == 0 &&
+					  (unsigned)pssz == lsz);
+		memset(&geo, 0, sizeof(geo));
+		snprintf(name, sizeof(name), "%s: HDIO_GETGEO start == sysfs start", path);
+		test_result(name, ioctl(fd, HDIO_GETGEO, &geo) == 0 &&
+					  geo.start == (unsigned long)start);
+		snprintf(name, sizeof(name), "%s: BLKRRPART on a partition -> EINVAL", path);
+		errno = 0;
+		test_result(name, ioctl(fd, BLKRRPART, 0) == -1 &&
+					  (errno == EINVAL || errno == ENOTTY));
+	}
+	/* The partition's first sector is the disk's sector `start'. */
+	if (size > 0) {
+		uint8_t a[4096], b[4096];
+		unsigned n = lsz <= sizeof(a) ? lsz : sizeof(a);
+		ssize_t ra = pread(fd, a, n, 0);
+		ssize_t rb = pread(dfd, b, n, (off_t)start * 512);
+
+		snprintf(name, sizeof(name), "%s: sector 0 == disk byte start x 512", path);
+		test_result(name, ra == (ssize_t)n && rb == (ssize_t)n &&
+					  memcmp(a, b, n) == 0);
+	}
+	close(fd);
+}
+
+/* Unprivileged access: a process that is neither root nor in the disk
+ * group cannot open the node, and cannot run raw commands through a
+ * descriptor it was handed. */
+static void test_storage_perms(const char *node, int root_fd)
+{
+	int pfd[2];
+	pid_t pid;
+	int res[4] = { -1, -1, -1, -1 };
+	char name[200];
+	struct stat st;
+
+	if (geteuid() != 0) {
+		printf("  (not root: unprivileged storage checks need a uid switch, skipped)\n");
+		return;
+	}
+	if (stat(node, &st) == 0) {
+		snprintf(name, sizeof(name), "%s: mode 0660, group disk (6)", node);
+		test_result(name, (st.st_mode & 07777) == 0660 && st.st_gid == 6 &&
+					  st.st_uid == 0);
+	}
+	if (pipe(pfd) != 0)
+		return;
+	pid = fork();
+	if (pid == 0) {
+		uint8_t cdb[16], buf[512], sense[32];
+		struct sg_io_hdr h;
+		int fd, r;
+
+		close(pfd[0]);
+		if (setgroups(0, NULL) != 0 || setgid(65534) != 0 ||
+		    setuid(65534) != 0)
+			_exit(2);
+		errno = 0;
+		fd = open(node, O_RDONLY);
+		res[0] = (fd == -1 && errno == EACCES);
+		if (fd >= 0)
+			close(fd);
+
+		/* Raw ATA through an inherited read descriptor: refused. */
+		memset(cdb, 0, sizeof(cdb));
+		cdb[0] = ATA_16;
+		cdb[1] = 4 << 1;
+		cdb[2] = 0x0E;
+		cdb[6] = 1;
+		cdb[14] = 0xEC;
+		errno = 0;
+		r = stg_sgio(root_fd, cdb, 16, SG_DXFER_FROM_DEV, buf, 512,
+			     sense, sizeof(sense), &h);
+		res[1] = (r == -1 && (errno == EACCES || errno == EPERM));
+
+		/* Re-reading the partition table and flushing are root's. */
+		errno = 0;
+		r = ioctl(root_fd, BLKRRPART, 0);
+		res[2] = (r == -1 && (errno == EACCES || errno == EPERM));
+		errno = 0;
+		r = ioctl(root_fd, BLKFLSBUF, 0);
+		res[3] = (r == -1 && (errno == EACCES || errno == EPERM));
+		write(pfd[1], res, sizeof(res));
+		_exit(0);
+	}
+	close(pfd[1]);
+	if (pid > 0) {
+		int status = 0;
+		ssize_t n = read(pfd[0], res, sizeof(res));
+
+		waitpid(pid, &status, 0);
+		if (n != (ssize_t)sizeof(res)) {
+			test_fail("unprivileged storage child reported");
+		} else {
+			snprintf(name, sizeof(name), "nobody: open(%s) -> EACCES", node);
+			test_result(name, res[0] == 1);
+			snprintf(name, sizeof(name), "nobody: SG_IO ATA PASS-THROUGH on an inherited fd -> EACCES/EPERM");
+			test_result(name, res[1] == 1);
+			test_result("nobody: BLKRRPART -> EACCES/EPERM", res[2] == 1);
+			test_result("nobody: BLKFLSBUF -> EACCES/EPERM", res[3] == 1);
+		}
+	}
+	close(pfd[0]);
+}
+
+/* The /dev/disk/by-* links all resolve to block device nodes. */
+static void test_storage_links(void)
+{
+	static const char *dirs[] = { "by-id", "by-partuuid", "by-path",
+				      "by-partlabel", "by-uuid", "by-label" };
+	char name[200];
+
+	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		char dpath[64];
+		DIR *dir;
+		struct dirent *de;
+		int n = 0, good = 0;
+
+		snprintf(dpath, sizeof(dpath), "/dev/disk/%s", dirs[i]);
+		dir = opendir(dpath);
+		if (!dir) {
+			/* by-id and by-path exist whenever a disk does;
+			 * the rest only when something carries such a name. */
+			if (i == 0 || i == 2) {
+				snprintf(name, sizeof(name), "%s exists", dpath);
+				test_result(name, 0);
+			}
+			continue;
+		}
+		while ((de = readdir(dir)) != NULL) {
+			char lp[320], rp[PATH_MAX];
+			struct stat st;
+
+			if (de->d_name[0] == '.')
+				continue;
+			n++;
+			snprintf(lp, sizeof(lp), "%s/%s", dpath, de->d_name);
+			if (realpath(lp, rp) && stat(rp, &st) == 0 &&
+			    S_ISBLK(st.st_mode) && strncmp(rp, "/dev/", 5) == 0)
+				good++;
+			else
+				printf("  [INFO] %s does not resolve to a block node\n",
+				       lp);
+		}
+		closedir(dir);
+		snprintf(name, sizeof(name), "%s: all %d links resolve to /dev block nodes", dpath, n);
+		test_result(name, good == n && (n > 0 || (i != 0 && i != 2)));
+	}
+
+	/* Each GPT partition with a PARTUUID in sysfs (uevent PARTUUID=) has
+	 * its link -- checked through the partitions blkid would see. */
+	{
+		DIR *dir = opendir("/dev/disk/by-partuuid");
+		struct dirent *de;
+		int lower_ok = 1, n = 0;
+
+		if (dir) {
+			while ((de = readdir(dir)) != NULL) {
+				if (de->d_name[0] == '.')
+					continue;
+				n++;
+				for (const char *c = de->d_name; *c; c++)
+					if (*c >= 'A' && *c <= 'F')
+						lower_ok = 0;
+			}
+			closedir(dir);
+			if (n)
+				test_result("by-partuuid names are lowercase GUIDs/MBR ids",
+					    lower_ok);
+		}
+	}
+}
+
+/* ---- destructive tests on the designated test target ------------------ */
+
+struct stg_wthread {
+	int fd;
+	uint64_t off;
+	size_t len;
+	uint32_t seed;
+	int ok;
+};
+
+static void stg_pattern(uint8_t *buf, size_t len, uint64_t off,
+			uint32_t seed)
+{
+	/* Each 8-byte word carries its own absolute offset and the seed, so
+	 * a block landing at the wrong place is never "right by accident". */
+	for (size_t i = 0; i + 8 <= len; i += 8) {
+		uint64_t v = ((off + i) * 0x9E3779B97F4A7C15ull) ^
+			     ((uint64_t)seed << 32 | seed);
+
+		memcpy(buf + i, &v, 8);
+	}
+}
+
+static void *stg_writer(void *arg)
+{
+	struct stg_wthread *w = arg;
+	uint8_t *buf = malloc(w->len), *chk = malloc(w->len);
+
+	w->ok = 0;
+	if (!buf || !chk)
+		goto out;
+	/* Several passes over the region in 64 KiB pieces, then one check. */
+	for (int pass = 0; pass < 3; pass++) {
+		stg_pattern(buf, w->len, w->off, w->seed + (uint32_t)pass);
+		for (size_t o = 0; o < w->len; o += 65536)
+			if (pwrite(w->fd, buf + o, 65536, (off_t)(w->off + o)) !=
+			    65536)
+				goto out;
+	}
+	if (pread(w->fd, chk, w->len, (off_t)w->off) != (ssize_t)w->len)
+		goto out;
+	w->ok = memcmp(buf, chk, w->len) == 0;
+out:
+	free(buf);
+	free(chk);
+	return NULL;
+}
+
+static void test_storage_write(const char *target)
+{
+	char name[200], real[PATH_MAX], what[96];
+	struct stat st;
+	unsigned long long bytes = 0;
+	int lsz = 0, fd, r;
+	uint8_t *a, *b;
+	const size_t big = 8u << 20;
+
+	printf("\n--- Storage write tests on %s (designated test target) ---\n",
+	       target);
+	if (!realpath(target, real) || stat(real, &st) != 0 ||
+	    !S_ISBLK(st.st_mode)) {
+		test_fail("storage write target is a block device");
+		return;
+	}
+	snprintf(what, sizeof(what), "%s", real);
+	if (stg_mounted(st.st_rdev, minor(st.st_rdev) % 16 == 0) ||
+	    (minor(st.st_rdev) % 16 == 0 && stg_disk_holds_root(st.st_rdev))) {
+		printf("  [SKIP] %s (or a partition of it) is mounted: no write tests\n",
+		       what);
+		return;
+	}
+	fd = open(real, O_RDWR | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDWR)", what);
+	test_result(name, fd >= 0);
+	if (fd < 0)
+		return;
+	if (ioctl(fd, BLKGETSIZE64, &bytes) != 0 ||
+	    ioctl(fd, BLKSSZGET, &lsz) != 0 || bytes < 32ull << 20) {
+		printf("  [SKIP] %s: size unknown or smaller than 32 MiB\n", what);
+		close(fd);
+		return;
+	}
+	a = malloc(big);
+	b = malloc(big);
+	if (!a || !b) {
+		test_fail("storage write buffers");
+		free(a);
+		free(b);
+		close(fd);
+		return;
+	}
+
+	/* Read-only flag first: with BLKROSET=1 writes fail, then back. */
+	{
+		int ro = 1, cur = -1;
+
+		r = ioctl(fd, BLKROSET, &ro);
+		test_result("BLKROSET 1 on the test target", r == 0);
+		test_result("BLKROGET reports 1",
+			    ioctl(fd, BLKROGET, &cur) == 0 && cur == 1);
+		memset(a, 0x5A, (size_t)lsz);
+		errno = 0;
+		r = (int)pwrite(fd, a, (size_t)lsz, 0);
+		test_result("write while read-only -> EPERM/EROFS/EACCES",
+			    r == -1 && (errno == EPERM || errno == EROFS ||
+					errno == EACCES));
+		ro = 0;
+		test_result("BLKROSET 0 restores read-write",
+			    ioctl(fd, BLKROSET, &ro) == 0 &&
+				    ioctl(fd, BLKROGET, &cur) == 0 && cur == 0);
+	}
+
+	/* Patterns + read-back, at the start, the middle and the end. */
+	{
+		uint64_t offs[3] = { 0, (bytes / 2) & ~(uint64_t)0xFFFFF,
+				     bytes - (1u << 20) };
+		int ok = 1;
+
+		for (int i = 0; i < 3; i++) {
+			stg_pattern(a, 1u << 20, offs[i], 0x1111u * (unsigned)(i + 1));
+			if (pwrite(fd, a, 1u << 20, (off_t)offs[i]) != 1 << 20)
+				ok = 0;
+		}
+		test_result("1 MiB pattern writes at start/middle/end", ok);
+		test_result("fsync on the block device", fsync(fd) == 0);
+		test_result("BLKFLSBUF", ioctl(fd, BLKFLSBUF, 0) == 0);
+		ok = 1;
+		for (int i = 0; i < 3; i++) {
+			stg_pattern(a, 1u << 20, offs[i], 0x1111u * (unsigned)(i + 1));
+			if (pread(fd, b, 1u << 20, (off_t)offs[i]) != 1 << 20 ||
+			    memcmp(a, b, 1u << 20) != 0)
+				ok = 0;
+		}
+		test_result("patterns read back after flush", ok);
+	}
+
+	/* Unaligned writes through the node: read-modify-write keeps the
+	 * bytes around them. */
+	{
+		uint8_t rec[300];
+		int ok;
+
+		stg_pattern(a, 8192, 0, 0x2222);
+		pwrite(fd, a, 8192, 0);
+		memset(rec, 0xC3, sizeof(rec));
+		r = (int)pwrite(fd, rec, sizeof(rec), 4000);
+		test_result("unaligned 300-byte write at 4000 (crosses a sector and page)",
+			    r == (int)sizeof(rec));
+		memcpy(a + 4000, rec, sizeof(rec));
+		fsync(fd);
+		ioctl(fd, BLKFLSBUF, 0);
+		ok = pread(fd, b, 8192, 0) == 8192 && memcmp(a, b, 8192) == 0;
+		test_result("unaligned write: neighbours preserved", ok);
+	}
+
+	/* Ordering: the last of several writes to one place wins, before and
+	 * after a flush. */
+	{
+		int ok = 1;
+
+		for (uint32_t i = 0; i < 16; i++) {
+			stg_pattern(a, 65536, 2u << 20, 0x3300u + i);
+			if (pwrite(fd, a, 65536, 2 << 20) != 65536)
+				ok = 0;
+		}
+		ok = ok && pread(fd, b, 65536, 2 << 20) == 65536 &&
+		     memcmp(a, b, 65536) == 0;
+		test_result("write ordering: the last of 16 overwrites is read (cached)", ok);
+		fsync(fd);
+		ioctl(fd, BLKFLSBUF, 0);
+		ok = pread(fd, b, 65536, 2 << 20) == 65536 &&
+		     memcmp(a, b, 65536) == 0;
+		test_result("write ordering: the last overwrite is on the media", ok);
+	}
+
+	/* Large I/O: one 8 MiB write and read. */
+	{
+		stg_pattern(a, big, 4u << 20, 0x4444);
+		r = (int)pwrite(fd, a, big, 4 << 20);
+		test_result("8 MiB single write", r == (int)big);
+		fsync(fd);
+		ioctl(fd, BLKFLSBUF, 0);
+		r = (int)pread(fd, b, big, 4 << 20);
+		test_result("8 MiB single read returns the data",
+			    r == (int)big && memcmp(a, b, big) == 0);
+	}
+
+	/* Concurrent writers on disjoint regions. */
+	{
+		struct stg_wthread w[8];
+		pthread_t th[8];
+		int ok = 1;
+
+		for (int i = 0; i < 8; i++) {
+			w[i].fd = fd;
+			w[i].off = (16ull << 20) + (uint64_t)i * (1u << 20);
+			w[i].len = 1u << 20;
+			w[i].seed = 0x5500u + (uint32_t)i;
+			if (pthread_create(&th[i], NULL, stg_writer, &w[i]) != 0)
+				w[i].ok = -1;
+		}
+		for (int i = 0; i < 8; i++) {
+			if (w[i].ok != -1)
+				pthread_join(th[i], NULL);
+			if (w[i].ok != 1)
+				ok = 0;
+		}
+		test_result("8 concurrent writers on disjoint regions verify", ok);
+		fsync(fd);
+		ioctl(fd, BLKFLSBUF, 0);
+		ok = 1;
+		for (int i = 0; i < 8; i++) {
+			stg_pattern(a, 1u << 20, w[i].off, w[i].seed + 2);
+			if (pread(fd, b, 1u << 20, (off_t)w[i].off) != 1 << 20 ||
+			    memcmp(a, b, 1u << 20) != 0)
+				ok = 0;
+		}
+		test_result("concurrent writers: data on the media after flush", ok);
+	}
+
+	/* BLKZEROOUT: zeroes, range checks. */
+	{
+		uint64_t range[2] = { 1u << 20, 1u << 20 };
+		int zero = 1;
+
+		stg_pattern(a, 1u << 20, 1u << 20, 0x6666);
+		pwrite(fd, a, 1u << 20, 1 << 20);
+		r = ioctl(fd, BLKZEROOUT, range);
+		test_result("BLKZEROOUT 1 MiB", r == 0);
+		ioctl(fd, BLKFLSBUF, 0);
+		if (pread(fd, b, 1u << 20, 1 << 20) != 1 << 20)
+			zero = 0;
+		for (size_t i = 0; zero && i < (1u << 20); i++)
+			if (b[i])
+				zero = 0;
+		test_result("BLKZEROOUT: the range reads back as zeroes", zero);
+		range[0] = 1;
+		range[1] = 4096;
+		errno = 0;
+		test_result("BLKZEROOUT unaligned -> EINVAL",
+			    ioctl(fd, BLKZEROOUT, range) == -1 && errno == EINVAL);
+		range[0] = bytes;
+		range[1] = 4096;
+		errno = 0;
+		test_result("BLKZEROOUT past the end -> EINVAL",
+			    ioctl(fd, BLKZEROOUT, range) == -1 && errno == EINVAL);
+	}
+
+	/* BLKDISCARD: when the device discards; zeroes when it says so. */
+	{
+		char disk[32], path[128];
+		long long dmax = -1;
+		unsigned int dz = 0;
+		uint64_t range[2] = { 1u << 20, 1u << 20 };
+
+		/* The disk of the target: /sys/class/block/<name>/.. */
+		snprintf(disk, sizeof(disk), "%s", strrchr(real, '/') + 1);
+		snprintf(path, sizeof(path), "/sys/class/block/%s/partition", disk);
+		if (access(path, F_OK) == 0) {
+			size_t n = strlen(disk);
+
+			while (n > 0 && disk[n - 1] >= '0' && disk[n - 1] <= '9')
+				disk[--n] = 0;
+			if (n > 1 && disk[n - 1] == 'p' && disk[n - 2] >= '0' &&
+			    disk[n - 2] <= '9')
+				disk[n - 1] = 0;
+		}
+		dmax = stg_attr_ull("/sys/block/%s/queue/discard_max_bytes%s",
+				    disk, "");
+		stg_pattern(a, 1u << 20, 1u << 20, 0x7777);
+		pwrite(fd, a, 1u << 20, 1 << 20);
+		fsync(fd);
+		errno = 0;
+		r = ioctl(fd, BLKDISCARD, range);
+		if (dmax == 0) {
+			test_result("BLKDISCARD on a device without discard -> EOPNOTSUPP",
+				    r == -1 && (errno == EOPNOTSUPP || errno == ENOTSUP));
+		} else {
+			test_result("BLKDISCARD 1 MiB", r == 0);
+			if (r == 0 && ioctl(fd, BLKDISCARDZEROES, &dz) == 0 && dz) {
+				int zero = 1;
+
+				ioctl(fd, BLKFLSBUF, 0);
+				if (pread(fd, b, 1u << 20, 1 << 20) != 1 << 20)
+					zero = 0;
+				for (size_t i = 0; zero && i < (1u << 20); i++)
+					if (b[i])
+						zero = 0;
+				test_result("BLKDISCARD with deterministic zeroes reads zeroes", zero);
+			} else if (r == 0) {
+				test_result("BLKDISCARD range still readable",
+					    pread(fd, b, 1u << 20, 1 << 20) == 1 << 20);
+			}
+		}
+		range[0] = 512 + (uint64_t)lsz / 2;
+		errno = 0;
+		test_result("BLKDISCARD unaligned -> EINVAL",
+			    ioctl(fd, BLKDISCARD, range) == -1 && errno == EINVAL);
+	}
+
+	/* Writing at or past the end. */
+	{
+		memset(a, 0x77, 4096);
+		errno = 0;
+		r = (int)pwrite(fd, a, (size_t)lsz, (off_t)bytes);
+		test_result("write at the end -> ENOSPC (or 0)",
+			    (r == -1 && (errno == ENOSPC || errno == EINVAL)) ||
+				    r == 0);
+		r = (int)pwrite(fd, a, 2u * (unsigned)lsz, (off_t)(bytes - (unsigned)lsz));
+		test_result("write straddling the end is cut to the last sector",
+			    r == lsz);
+	}
+
+	free(a);
+	free(b);
+	close(fd);
+}
+
+/* Find the designated write target: TESTLIBC_DISK, else the partition
+ * named likeos-test.  NULL when there is none. */
+static const char *stg_write_target(char *buf, size_t cap)
+{
+	const char *e = getenv("TESTLIBC_DISK");
+	struct stat st;
+
+	if (e && *e) {
+		snprintf(buf, cap, "%s", e);
+		return buf;
+	}
+	if (stat("/dev/disk/by-partlabel/likeos-test", &st) == 0 &&
+	    S_ISBLK(st.st_mode)) {
+		snprintf(buf, cap, "/dev/disk/by-partlabel/likeos-test");
+		return buf;
+	}
+	return NULL;
+}
+
+/* One whole disk: node, ioctls vs sysfs, procfs, reads, partitions. */
+static void test_storage_disk(const char *d, int storage_only)
+{
+	char path[128], name[200], val[128];
+	struct stat st;
+	unsigned sys_maj = 0, sys_min = 0;
+	long long size, lbs, pbs, iomin, ioopt, alignoff, ro, seq, rot, dzd;
+	int fd, is_sata = 0;
+	unsigned long long b64 = 0;
+	unsigned long sz = 0;
+	int ssz = 0, roget = -1;
+	unsigned int pbsz = 0, imin = 0, iopt = 0;
+	int aoff = -1;
+	uint64_t dseq = 0;
+
+	printf("\n  -- /dev/%s --\n", d);
+	snprintf(path, sizeof(path), "/dev/%s", d);
+	snprintf(name, sizeof(name), "%s exists and is S_IFBLK", path);
+	test_result(name, stat(path, &st) == 0 && S_ISBLK(st.st_mode));
+	if (!S_ISBLK(st.st_mode))
+		return;
+	snprintf(name, sizeof(name), "%s: sd major (8 or 65-71), minor a multiple of 16", path);
+	test_result(name, stg_is_sd_major(major(st.st_rdev)) &&
+				  minor(st.st_rdev) % 16 == 0);
+	{
+		char a[96];
+
+		snprintf(a, sizeof(a), "/sys/block/%s/dev", d);
+		snprintf(name, sizeof(name), "/sys/block/%s/dev == st_rdev", d);
+		test_result(name, stg_read_attr(a, val, sizeof(val)) == 0 &&
+					  sscanf(val, "%u:%u", &sys_maj, &sys_min) == 2 &&
+					  sys_maj == major(st.st_rdev) &&
+					  sys_min == minor(st.st_rdev));
+		snprintf(a, sizeof(a), "/sys/dev/block/%u:%u",
+			 major(st.st_rdev), minor(st.st_rdev));
+		snprintf(name, sizeof(name), "/sys/dev/block/%u:%u exists",
+			 major(st.st_rdev), minor(st.st_rdev));
+		test_result(name, access(a, F_OK) == 0);
+		snprintf(a, sizeof(a), "/sys/class/block/%s", d);
+		snprintf(name, sizeof(name), "/sys/class/block/%s exists", d);
+		test_result(name, access(a, F_OK) == 0);
+	}
+
+	size = stg_attr_ull("/sys/block/%s/size%s", d, "");
+	lbs = stg_attr_ull("/sys/block/%s/queue/logical_block_size%s", d, "");
+	pbs = stg_attr_ull("/sys/block/%s/queue/physical_block_size%s", d, "");
+	iomin = stg_attr_ull("/sys/block/%s/queue/minimum_io_size%s", d, "");
+	ioopt = stg_attr_ull("/sys/block/%s/queue/optimal_io_size%s", d, "");
+	alignoff = stg_attr_ull("/sys/block/%s/alignment_offset%s", d, "");
+	ro = stg_attr_ull("/sys/block/%s/ro%s", d, "");
+	seq = stg_attr_ull("/sys/block/%s/diskseq%s", d, "");
+	rot = stg_attr_ull("/sys/block/%s/queue/rotational%s", d, "");
+	dzd = stg_attr_ull("/sys/block/%s/queue/discard_zeroes_data%s", d, "");
+	snprintf(name, sizeof(name), "/sys/block/%s: size, queue/*_block_size, ro readable", d);
+	test_result(name, size > 0 && lbs >= 512 && pbs >= lbs && ro >= 0);
+	{
+		char vend[32];
+		char a[96];
+
+		snprintf(a, sizeof(a), "/sys/block/%s/device/vendor", d);
+		if (stg_read_attr(a, vend, sizeof(vend)) == 0) {
+			char t[32];
+
+			stg_trim(t, sizeof(t), vend, strlen(vend));
+			is_sata = strcmp(t, "ATA") == 0;
+		}
+	}
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDONLY)", path);
+	test_result(name, fd >= 0);
+	if (fd < 0)
+		return;
+
+	snprintf(name, sizeof(name), "%s: BLKGETSIZE64 == sysfs size x 512", d);
+	test_result(name, ioctl(fd, BLKGETSIZE64, &b64) == 0 && size > 0 &&
+				  b64 == (unsigned long long)size * 512);
+	snprintf(name, sizeof(name), "%s: BLKGETSIZE == sysfs size", d);
+	test_result(name, ioctl(fd, BLKGETSIZE, &sz) == 0 &&
+				  (long long)sz == size);
+	snprintf(name, sizeof(name), "%s: BLKSSZGET == queue/logical_block_size", d);
+	test_result(name, ioctl(fd, BLKSSZGET, &ssz) == 0 && ssz == lbs);
+	snprintf(name, sizeof(name), "%s: BLKPBSZGET == queue/physical_block_size", d);
+	test_result(name, ioctl(fd, BLKPBSZGET, &pbsz) == 0 &&
+				  (long long)pbsz == pbs);
+	snprintf(name, sizeof(name), "%s: BLKIOMIN == queue/minimum_io_size", d);
+	test_result(name, ioctl(fd, BLKIOMIN, &imin) == 0 &&
+				  (long long)imin == iomin && imin >= (unsigned)ssz);
+	snprintf(name, sizeof(name), "%s: BLKIOOPT == queue/optimal_io_size", d);
+	test_result(name, ioctl(fd, BLKIOOPT, &iopt) == 0 &&
+				  (long long)iopt == ioopt);
+	snprintf(name, sizeof(name), "%s: BLKALIGNOFF == alignment_offset", d);
+	test_result(name, ioctl(fd, BLKALIGNOFF, &aoff) == 0 &&
+				  (long long)aoff == alignoff);
+	snprintf(name, sizeof(name), "%s: BLKROGET == ro", d);
+	test_result(name, ioctl(fd, BLKROGET, &roget) == 0 &&
+				  (long long)roget == ro);
+	snprintf(name, sizeof(name), "%s: BLKGETDISKSEQ == diskseq, non-zero", d);
+	test_result(name, ioctl(fd, BLKGETDISKSEQ, &dseq) == 0 && dseq != 0 &&
+				  (seq < 0 || (long long)dseq == seq));
+	if (rot >= 0) {
+		unsigned short rs = 9;
+
+		snprintf(name, sizeof(name), "%s: BLKROTATIONAL == queue/rotational", d);
+		test_result(name, ioctl(fd, BLKROTATIONAL, &rs) == 0 &&
+					  (long long)rs == rot);
+	}
+	if (dzd >= 0) {
+		unsigned int z = 9;
+
+		snprintf(name, sizeof(name), "%s: BLKDISCARDZEROES == queue/discard_zeroes_data", d);
+		test_result(name, ioctl(fd, BLKDISCARDZEROES, &z) == 0 &&
+					  (long long)z == dzd);
+	}
+	{
+		unsigned short ms = 0;
+		long long mskb = stg_attr_ull("/sys/block/%s/queue/max_sectors_kb%s",
+					     d, "");
+
+		snprintf(name, sizeof(name), "%s: BLKSECTGET agrees with queue/max_sectors_kb", d);
+		test_result(name, ioctl(fd, BLKSECTGET, &ms) == 0 && ms > 0 &&
+					  (mskb < 0 || ms == 65535 ||
+					   (long long)ms == mskb * 2));
+	}
+	{
+		size_t bsz = 0;
+
+		snprintf(name, sizeof(name), "%s: BLKBSZGET is a power of two >= the sector size", d);
+		test_result(name, ioctl(fd, BLKBSZGET, &bsz) == 0 &&
+					  bsz >= (size_t)ssz && (bsz & (bsz - 1)) == 0);
+	}
+	{
+		struct hd_geometry geo;
+
+		memset(&geo, 0xff, sizeof(geo));
+		snprintf(name, sizeof(name), "%s: HDIO_GETGEO: heads/sectors set, start 0", d);
+		test_result(name, ioctl(fd, HDIO_GETGEO, &geo) == 0 &&
+					  geo.heads > 0 && geo.sectors > 0 &&
+					  geo.start == 0);
+	}
+	{
+		int v = 0;
+		struct scsi_idlun idl;
+
+		snprintf(name, sizeof(name), "%s: SG_GET_VERSION_NUM >= 3.0", d);
+		test_result(name, ioctl(fd, SG_GET_VERSION_NUM, &v) == 0 &&
+					  v >= 30000);
+		memset(&idl, 0xff, sizeof(idl));
+		snprintf(name, sizeof(name), "%s: SCSI_IOCTL_GET_IDLUN: lun 0, channel 0", d);
+		test_result(name, ioctl(fd, SCSI_IOCTL_GET_IDLUN, &idl) == 0 &&
+					  ((idl.dev_id >> 8) & 0xff) == 0 &&
+					  ((idl.dev_id >> 16) & 0xff) == 0);
+		if (is_sata) {
+			snprintf(name, sizeof(name), "%s: SG_EMULATED_HOST is 1 (SCSI/ATA translation)", d);
+			v = 0;
+			test_result(name, ioctl(fd, SG_EMULATED_HOST, &v) == 0 &&
+						  v == 1);
+		}
+	}
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: unknown ioctl -> ENOTTY", d);
+	test_result(name, ioctl(fd, _IO(0x12, 250), 0) == -1 && errno == ENOTTY);
+
+	/* procfs */
+	{
+		int parse_ok = 0;
+		unsigned pm = 0, pn = 0;
+		long long kb = stg_proc_partitions(d, &parse_ok, &pm, &pn);
+
+		test_result("/proc/partitions parses", parse_ok);
+		snprintf(name, sizeof(name), "/proc/partitions: %s with size/2 blocks and its dev", d);
+		test_result(name, kb >= 0 && kb == size / 2 &&
+					  pm == major(st.st_rdev) &&
+					  pn == minor(st.st_rdev));
+	}
+
+	/* Reads: LBA 0, the last LBA, past the end, unaligned. */
+	if (ssz >= 512 && b64 >= (unsigned long long)ssz * 4) {
+		uint8_t *s0 = malloc(8192), *s1 = malloc(8192);
+		unsigned long long rd0 = 0, rs0 = 0, wr0 = 0, ws0 = 0;
+		unsigned long long rd1 = 0, rs1 = 0, wr1 = 0, ws1 = 0;
+		ssize_t n;
+
+		if (!s0 || !s1) {
+			free(s0);
+			free(s1);
+			close(fd);
+			return;
+		}
+		/* Drop what the kernel caches for the device so the reads
+		 * below reach the disk and show up in diskstats. */
+		ioctl(fd, BLKFLSBUF, 0);
+		stg_diskstats(d, &rd0, &rs0, &wr0, &ws0);
+		n = pread(fd, s0, (size_t)ssz, 0);
+		snprintf(name, sizeof(name), "%s: read LBA 0", d);
+		test_result(name, n == ssz);
+		n = pread(fd, s1, (size_t)ssz, (off_t)(b64 - (unsigned)ssz));
+		snprintf(name, sizeof(name), "%s: read the last LBA", d);
+		test_result(name, n == ssz);
+		errno = 0;
+		n = pread(fd, s1, (size_t)ssz, (off_t)b64);
+		snprintf(name, sizeof(name), "%s: read at the end -> 0 bytes", d);
+		test_result(name, n == 0);
+		errno = 0;
+		n = pread(fd, s1, (size_t)ssz, (off_t)(b64 + 1024 * 1024));
+		snprintf(name, sizeof(name), "%s: read past the end -> 0 bytes or EINVAL", d);
+		test_result(name, n == 0 || (n == -1 && errno == EINVAL));
+		n = pread(fd, s1, 2u * (unsigned)ssz, (off_t)(b64 - (unsigned)ssz));
+		snprintf(name, sizeof(name), "%s: read straddling the end is cut short", d);
+		test_result(name, n == ssz);
+		errno = 0;
+		n = pread(fd, s1, 16, -512);
+		snprintf(name, sizeof(name), "%s: read at a negative offset -> EINVAL", d);
+		test_result(name, n == -1 && errno == EINVAL);
+
+		/* Unaligned reads agree with the aligned one. */
+		n = pread(fd, s0, 4096 > (unsigned)ssz ? 4096 : (size_t)ssz, 0);
+		{
+			ssize_t m = pread(fd, s1, 100, 7);
+
+			snprintf(name, sizeof(name), "%s: unaligned read (100 bytes at 7) == aligned data", d);
+			test_result(name, n > 107 && m == 100 &&
+						  memcmp(s1, s0 + 7, 100) == 0);
+			m = pread(fd, s1, 1000, 300);
+			snprintf(name, sizeof(name), "%s: unaligned read across sectors (1000 at 300)", d);
+			test_result(name, n >= 1300 && m == 1000 &&
+						  memcmp(s1, s0 + 300, 1000) == 0);
+		}
+		/* read() advances the offset; lseek(SEEK_END) is the size. */
+		{
+			off_t end = lseek(fd, 0, SEEK_END);
+			off_t pos;
+
+			snprintf(name, sizeof(name), "%s: lseek(SEEK_END) == BLKGETSIZE64", d);
+			test_result(name, end == (off_t)b64);
+			lseek(fd, 0, SEEK_SET);
+			n = read(fd, s1, 1000);
+			pos = lseek(fd, 0, SEEK_CUR);
+			snprintf(name, sizeof(name), "%s: read() of 1000 bytes advances the offset by 1000", d);
+			test_result(name, n == 1000 && pos == 1000 &&
+						  memcmp(s1, s0, 1000) == 0);
+		}
+		/* A read on a read-only descriptor's partner: writing to an
+		 * O_RDONLY descriptor is EBADF. */
+		errno = 0;
+		n = pwrite(fd, s0, (size_t)ssz, 0);
+		snprintf(name, sizeof(name), "%s: write on an O_RDONLY descriptor -> EBADF", d);
+		test_result(name, n == -1 && errno == EBADF);
+
+		/* A fresh range far from the start: uncached, so it is a
+		 * real read the statistics must count. */
+		{
+			off_t mid = (off_t)((b64 / 2) & ~(unsigned long long)65535);
+
+			n = pread(fd, s1, 8192, mid);
+		}
+		if (stg_diskstats(d, &rd1, &rs1, &wr1, &ws1) == 0) {
+			snprintf(name, sizeof(name), "/proc/diskstats: %s reads and sectors advance after reading", d);
+			test_result(name, rd1 > rd0 && rs1 >= rs0 + 16);
+		} else {
+			snprintf(name, sizeof(name), "/proc/diskstats has a line for %s", d);
+			test_result(name, 0);
+		}
+		{
+			char a[96], line[256];
+			unsigned long long f[4] = { 0, 0, 0, 0 };
+
+			snprintf(a, sizeof(a), "/sys/block/%s/stat", d);
+			snprintf(name, sizeof(name), "/sys/block/%s/stat parses and counts reads", d);
+			test_result(name, stg_read_attr(a, line, sizeof(line)) == 0 &&
+						  sscanf(line, "%llu %llu %llu %llu", &f[0],
+							 &f[1], &f[2], &f[3]) == 4 &&
+						  f[0] >= rd1 && f[2] >= rs1);
+		}
+		free(s0);
+		free(s1);
+	}
+
+	if (is_sata && b64)
+		test_storage_sat(fd, d, b64, (unsigned)ssz);
+	else
+		printf("  (%s is not an ATA disk: ATA identity and pass-through checks skipped)\n",
+		       d);
+
+	/* Partitions: the /sys/block/<d>/<d>N directories. */
+	{
+		DIR *dir;
+		struct dirent *de;
+		char sp[96];
+		int nparts = 0;
+
+		snprintf(sp, sizeof(sp), "/sys/block/%s", d);
+		dir = opendir(sp);
+		while (dir && (de = readdir(dir)) != NULL) {
+			if (strncmp(de->d_name, d, strlen(d)) != 0 ||
+			    strlen(de->d_name) == strlen(d))
+				continue;
+			nparts++;
+			test_storage_partition(fd, d, de->d_name, (unsigned)ssz);
+		}
+		if (dir)
+			closedir(dir);
+		printf("  (%s: %d partition(s))\n", d, nparts);
+	}
+
+	/* BLKRRPART: allowed on a disk nothing uses; EBUSY otherwise. */
+	{
+		int busy = stg_mounted(st.st_rdev, 1) ||
+			   stg_disk_holds_root(st.st_rdev);
+		uint64_t seq_before = 0, seq_after = 0;
+		long long parts_before = 0, parts_after = 0;
+		DIR *dir;
+		struct dirent *de;
+		char sp[96];
+
+		ioctl(fd, BLKGETDISKSEQ, &seq_before);
+		snprintf(sp, sizeof(sp), "/sys/block/%s", d);
+		if ((dir = opendir(sp)) != NULL) {
+			while ((de = readdir(dir)) != NULL)
+				if (strncmp(de->d_name, d, strlen(d)) == 0 &&
+				    strlen(de->d_name) > strlen(d))
+					parts_before++;
+			closedir(dir);
+		}
+		errno = 0;
+		if (busy || storage_only) {
+			int r = ioctl(fd, BLKRRPART, 0);
+
+			if (busy) {
+				snprintf(name, sizeof(name), "%s: BLKRRPART while a partition is mounted -> EBUSY", d);
+				test_result(name, r == -1 && errno == EBUSY);
+			} else if (storage_only) {
+				/* Only under `testlibc storage': in a full
+				 * run a concurrent testlibc (teststress) may
+				 * hold a partition open, and the re-scan would
+				 * rightly answer EBUSY. */
+				snprintf(name, sizeof(name), "%s: BLKRRPART on an unused disk", d);
+				test_result(name, r == 0);
+				if ((dir = opendir(sp)) != NULL) {
+					while ((de = readdir(dir)) != NULL)
+						if (strncmp(de->d_name, d, strlen(d)) == 0 &&
+						    strlen(de->d_name) > strlen(d))
+							parts_after++;
+					closedir(dir);
+				}
+				snprintf(name, sizeof(name), "%s: same partitions after BLKRRPART", d);
+				test_result(name, parts_after == parts_before);
+				ioctl(fd, BLKGETDISKSEQ, &seq_after);
+				snprintf(name, sizeof(name), "%s: diskseq does not go backwards", d);
+				test_result(name, seq_after >= seq_before);
+			}
+		}
+	}
+
+	close(fd);
+}
+
+/* Optical drives (srN): node, major 11, INQUIRY type ROM. */
+static void test_storage_sr(const char *d)
+{
+	char path[64], name[160];
+	struct stat st;
+	int fd;
+
+	snprintf(path, sizeof(path), "/dev/%s", d);
+	snprintf(name, sizeof(name), "%s is S_IFBLK, major 11", path);
+	test_result(name, stat(path, &st) == 0 && S_ISBLK(st.st_mode) &&
+				  major(st.st_rdev) == SCSI_CDROM_MAJOR);
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDONLY|O_NONBLOCK) without media", path);
+	test_result(name, fd >= 0);
+	if (fd < 0)
+		return;
+	{
+		uint8_t cdb[16], inq[36], sense[32];
+		struct sg_io_hdr h;
+		int r;
+
+		memset(cdb, 0, sizeof(cdb));
+		cdb[0] = INQUIRY;
+		cdb[4] = sizeof(inq);
+		r = stg_sgio(fd, cdb, 6, SG_DXFER_FROM_DEV, inq, sizeof(inq),
+			     sense, sizeof(sense), &h);
+		snprintf(name, sizeof(name), "%s: SG_IO INQUIRY: CD/DVD device (type 5)", d);
+		test_result(name, r == 0 && h.status == 0 &&
+					  (inq[0] & 0x1f) == TYPE_ROM);
+		memset(cdb, 0, sizeof(cdb));
+		cdb[0] = TEST_UNIT_READY;
+		r = stg_sgio(fd, cdb, 6, SG_DXFER_NONE, NULL, 0, sense,
+			     sizeof(sense), &h);
+		snprintf(name, sizeof(name), "%s: TEST UNIT READY: GOOD, or NOT READY with sense", d);
+		test_result(name, r == 0 && (h.status == SAM_STAT_GOOD ||
+					     (h.status == SAM_STAT_CHECK_CONDITION &&
+					      h.sb_len_wr > 0)));
+		if (r == 0 && h.status == SAM_STAT_GOOD) {
+			int ssz = 0;
+
+			snprintf(name, sizeof(name), "%s: media present: 2048-byte sectors", d);
+			test_result(name, ioctl(fd, BLKSSZGET, &ssz) == 0 &&
+						  ssz == 2048);
+		}
+	}
+	{
+		int ro = 0;
+
+		snprintf(name, sizeof(name), "%s: BLKROGET is 1 (read-only)", d);
+		test_result(name, ioctl(fd, BLKROGET, &ro) == 0 && ro == 1);
+	}
+	close(fd);
+}
+
+static void test_storage(int storage_only)
+{
+	DIR *dir;
+	struct dirent *de;
+	char disks[32][32], srs[8][32];
+	int nd = 0, nsr = 0;
+	char tbuf[PATH_MAX];
+	const char *target;
+
+	printf("\n--- Storage Tests (block devices, BLK*/HDIO/SG_IO, /sys/block, /proc) ---\n");
+	dir = opendir("/sys/block");
+	while (dir && (de = readdir(dir)) != NULL) {
+		if (strncmp(de->d_name, "sd", 2) == 0 && nd < 32)
+			snprintf(disks[nd++], sizeof(disks[0]), "%s", de->d_name);
+		else if (strncmp(de->d_name, "sr", 2) == 0 && nsr < 8)
+			snprintf(srs[nsr++], sizeof(srs[0]), "%s", de->d_name);
+	}
+	if (dir)
+		closedir(dir);
+	if (nd == 0 && nsr == 0) {
+		struct stat st;
+
+		if (stat("/dev/sda", &st) == 0)
+			test_fail("/dev/sda exists but /sys/block lists no sd disk");
+		else
+			printf("  [SKIP] skipped: no disk (/sys/block has no sdX or srN)\n");
+		return;
+	}
+	if (geteuid() != 0) {
+		printf("  [SKIP] not root: the disk nodes are root:disk 0660\n");
+		return;
+	}
+
+	for (int i = 0; i < nd; i++)
+		test_storage_disk(disks[i], storage_only);
+	for (int i = 0; i < nsr; i++)
+		test_storage_sr(srs[i]);
+	test_storage_links();
+	{
+		test_result("/proc/diskstats is readable",
+			    access("/proc/diskstats", R_OK) == 0);
+	}
+	if (nd > 0) {
+		char node[64];
+		int fd;
+
+		snprintf(node, sizeof(node), "/dev/%s", disks[0]);
+		fd = open(node, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			test_storage_perms(node, fd);
+			close(fd);
+		}
+	}
+
+	target = stg_write_target(tbuf, sizeof(tbuf));
+	if (!storage_only) {
+		if (target)
+			printf("  (write tests on %s run under `testlibc storage')\n",
+			       target);
+		return;
+	}
+	if (!target) {
+		printf("  [SKIP] no designated write target (GPT partition \"likeos-test\" or TESTLIBC_DISK=/dev/sdXN)\n");
+		return;
+	}
+	test_storage_write(target);
+}
+
 int main(int argc, char **argv)
 {
 	g_ctor_saw_main_before = g_ctor_ran; /* constructors must precede main */
@@ -16846,6 +18834,10 @@ int main(int argc, char **argv)
 	int gpu_only = (argc > 1 && strcmp(argv[1], "gpu") == 0);
 	/*   testlibc audio    -- run only the sound device section */
 	int audio_only = (argc > 1 && strcmp(argv[1], "audio") == 0);
+	/*   testlibc storage  -- run only the block device section, including
+	 *                        the write tests on the designated test target
+	 *                        (partition "likeos-test" or TESTLIBC_DISK) */
+	int storage_only = (argc > 1 && strcmp(argv[1], "storage") == 0);
 	int skip_network =
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
@@ -16853,6 +18845,7 @@ int main(int argc, char **argv)
 	printf("  LikeOS Libc Tests%s%s\n", net_only     ? " (network only)" :
 					       gpu_only     ? " (graphics only)" :
 					       audio_only   ? " (audio only)" :
+					       storage_only ? " (storage only)" :
 					       skip_network ? " (no network)" :
 							      " (all)",
 	       g_stress ? " [--stress: no screen drawing or mode changes]" : "");
@@ -16914,6 +18907,8 @@ int main(int argc, char **argv)
 		goto gpu_section;
 	if (audio_only)
 		goto audio_section;
+	if (storage_only)
+		goto storage_section;
 
 	// ========================================
 	// Test: malloc/free
@@ -24492,6 +26487,7 @@ int main(int argc, char **argv)
 	test_drm_i915();
 	test_fbdev();
 	test_audio();
+	test_storage(0);
 	test_evdev();
 	test_shebang();
 	test_devfd();
@@ -24529,6 +26525,7 @@ int main(int argc, char **argv)
 	test_gtk3_libc_additions();
 	test_dprintf();
 	test_bash_libc_additions();
+	test_disktool_libc_additions();
 	test_unicode();
 	test_syscall_arg_hygiene();
 	test_dup_redirected_stdio();
@@ -33857,6 +35854,12 @@ gpu_section:
 audio_section:
 	if (audio_only)
 		test_audio();
+
+	/* Reached only by `testlibc storage'; a full run covers the read-only
+	 * part in the device-node section above. */
+storage_section:
+	if (storage_only)
+		test_storage(1);
 
 	// ========================================
 	// Summary

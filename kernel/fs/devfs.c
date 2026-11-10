@@ -125,6 +125,11 @@ int devfs_fd_alias_target(const char *path)
 }
 
 static int devfs_permission(const char *path, unsigned long ino, int want);
+static int devfs_resolve_link(const char *path, char *out, size_t cap);
+static int devfs_link_target(const char *path, char *out, size_t cap);
+static int devfs_lstat(const char *path, struct kstat *st);
+static int devfs_readlink(const char *path, char *buf, unsigned long bufsz);
+static int devfs_fsync(vfs_file_t *f);
 
 int devfs_init(void)
 {
@@ -142,6 +147,10 @@ int devfs_init(void)
 	g_devfs_ops.chdir = devfs_chdir;
 	g_devfs_ops.close = devfs_close;
 	g_devfs_ops.permission = devfs_permission;
+	/* Registered symbolic links (/dev/disk/by-*) and block devices. */
+	g_devfs_ops.lstat = devfs_lstat;
+	g_devfs_ops.readlink = devfs_readlink;
+	g_devfs_ops.fsync = devfs_fsync;
 	return 0;
 }
 
@@ -174,7 +183,10 @@ static devfs_file_t *devfs_file_of(vfs_file_t *f)
  * Drivers add nodes here at init; the path switches below consult this
  * table when none of the built-in names matched.  The table is small and
  * scanned linearly: a system has dozens of device nodes, not thousands. */
-#define DEVFS_MAX_NODES 64
+/* 512: a system with a few disks needs a node per disk and partition and
+ * half a dozen /dev/disk links for each of them on top of the GPU, sound
+ * and input nodes. */
+#define DEVFS_MAX_NODES 512
 static struct devfs_node *g_nodes[DEVFS_MAX_NODES];
 static spinlock_t g_nodes_lock = SPINLOCK_INIT("devfs_nodes");
 
@@ -207,10 +219,13 @@ static int devfs_permission(const char *path, unsigned long ino, int want)
 	uint32_t owner;
 	uint64_t fl;
 	int uaccess = 0;
+	char resolved[DEVFS_NODE_PATH_MAX];
 
 	(void)ino;
 	if (!c || !want || (want & ~(MAY_READ | MAY_WRITE)))
 		return ST_UNSUPPORTED;
+	if (devfs_resolve_link(path, resolved, sizeof(resolved)) == 1)
+		path = resolved;
 	spin_lock_irqsave(&g_nodes_lock, &fl);
 	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
 		struct devfs_node *n = g_nodes[i];
@@ -232,7 +247,7 @@ static int devfs_permission(const char *path, unsigned long ino, int want)
  * slash? */
 static struct devfs_node *devfs_dir_lookup(const char *path)
 {
-	char tmp[48];
+	char tmp[DEVFS_NODE_PATH_MAX];
 	size_t n = 0;
 
 	while (path[n] && n < sizeof(tmp) - 1) {
@@ -252,7 +267,9 @@ static int devfs_register_common(struct devfs_node *node, int is_dir)
 
 	if (!node || node->path[0] != '/' || !is_prefix(node->path, "/dev/"))
 		return -EINVAL;
-	if (!is_dir && !node->ops)
+	if (!is_dir && !node->is_link && !node->ops)
+		return -EINVAL;
+	if (node->is_link && !node->link[0])
 		return -EINVAL;
 	node->is_dir = is_dir;
 	node->ctime = timer_get_epoch();
@@ -285,6 +302,153 @@ int device_register_dir(struct devfs_node *node)
 	return devfs_register_common(node, 1);
 }
 
+int device_register_link(struct devfs_node *node)
+{
+	if (!node)
+		return -EINVAL;
+	node->is_link = 1;
+	node->is_blk = 0;
+	return devfs_register_common(node, 0);
+}
+
+/* ---- Symbolic links among the registered nodes ---------------------------
+ *
+ * Resolve `path' when it names a registered link, following up to eight
+ * links: a relative target is taken relative to the link's directory and
+ * `.'/`..' are folded textually; the result must stay under /dev.  Writes
+ * the final path to `out'.  Returns 1 when a link was followed, 0 when
+ * `path' is not a link (out untouched), -1 for a loop or a target leaving
+ * /dev or too long. */
+#define DEVFS_LINK_HOPS 8
+
+static void devfs_normalize(char *path)
+{
+	char *out = path;
+	const char *p = path;
+
+	/* absolute paths only: keep the leading slash */
+	while (*p == '/')
+		p++;
+	*out++ = '/';
+	while (*p) {
+		const char *e = p;
+		size_t len;
+
+		while (*e && *e != '/')
+			e++;
+		len = (size_t)(e - p);
+		if (len == 1 && p[0] == '.') {
+			/* nothing */
+		} else if (len == 2 && p[0] == '.' && p[1] == '.') {
+			if (out > path + 1) {
+				out--; /* the separator before the last part */
+				while (out > path + 1 && out[-1] != '/')
+					out--;
+			}
+		} else if (len) {
+			for (size_t k = 0; k < len; k++)
+				*out++ = p[k];
+			*out++ = '/';
+		}
+		p = e;
+		while (*p == '/')
+			p++;
+	}
+	if (out > path + 1 && out[-1] == '/')
+		out--;
+	*out = 0;
+}
+
+static int devfs_resolve_link(const char *path, char *out, size_t cap)
+{
+	char cur[DEVFS_NODE_PATH_MAX + DEVFS_LINK_MAX + 2];
+	int followed = 0;
+
+	if (kstrlen(path) >= sizeof(cur))
+		return 0;
+	kstrncpy(cur, path, sizeof(cur));
+	cur[sizeof(cur) - 1] = 0;
+	for (int hop = 0; hop <= DEVFS_LINK_HOPS; hop++) {
+		char target[DEVFS_LINK_MAX];
+		char next[sizeof(cur)];
+		struct devfs_node *n;
+		uint64_t fl;
+		size_t dl, tl;
+
+		n = NULL;
+		spin_lock_irqsave(&g_nodes_lock, &fl);
+		for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+			struct devfs_node *c = g_nodes[i];
+			if (c && c->is_link && kstrcmp(c->path, cur) == 0) {
+				n = c;
+				kstrncpy(target, c->link, sizeof(target));
+				target[sizeof(target) - 1] = 0;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&g_nodes_lock, fl);
+		if (!n) {
+			if (!followed)
+				return 0;
+			if (kstrlen(cur) >= cap)
+				return -1;
+			kstrncpy(out, cur, cap);
+			out[cap - 1] = 0;
+			return 1;
+		}
+		if (hop == DEVFS_LINK_HOPS)
+			return -1;
+		tl = kstrlen(target);
+		if (target[0] == '/') {
+			if (tl >= sizeof(next))
+				return -1;
+			kstrncpy(next, target, sizeof(next));
+		} else {
+			/* relative to the directory that holds the link */
+			dl = kstrlen(cur);
+			while (dl > 0 && cur[dl - 1] != '/')
+				dl--;
+			if (dl + tl + 1 >= sizeof(next))
+				return -1;
+			for (size_t k = 0; k < dl; k++)
+				next[k] = cur[k];
+			for (size_t k = 0; k <= tl; k++)
+				next[dl + k] = target[k];
+		}
+		next[sizeof(next) - 1] = 0;
+		devfs_normalize(next);
+		if (!is_prefix(next, "/dev/"))
+			return -1;
+		kstrncpy(cur, next, sizeof(cur));
+		cur[sizeof(cur) - 1] = 0;
+		followed = 1;
+	}
+	return -1;
+}
+
+/* The registered link node at exactly `path', or NULL. */
+static int devfs_link_target(const char *path, char *out, size_t cap)
+{
+	uint64_t fl;
+	int len = -1;
+
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		struct devfs_node *c = g_nodes[i];
+		if (c && c->is_link && kstrcmp(c->path, path) == 0) {
+			size_t k = 0;
+			while (c->link[k] && k < cap) {
+				out[k] = c->link[k];
+				k++;
+			}
+			len = (int)k;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return len;
+}
+
 int device_unregister(struct devfs_node *node)
 {
 	uint64_t fl;
@@ -303,9 +467,9 @@ int device_unregister(struct devfs_node *node)
 }
 
 /* Directory listing of a registered directory: every registered node
- * whose path is `dir'/<one component>. */
+ * whose path is `dir'/<one component>.  *dtype receives its DT_* type. */
 static int devfs_node_child(const char *dir, unsigned index, char *name,
-			    size_t cap, int *is_dir)
+			    size_t cap, int *dtype)
 {
 	size_t dl = 0;
 	unsigned seen = 0;
@@ -335,7 +499,10 @@ static int devfs_node_child(const char *dir, unsigned index, char *name,
 				k++;
 			}
 			name[k] = 0;
-			*is_dir = n->is_dir;
+			*dtype = n->is_dir ? 4 /* DT_DIR */ :
+				 n->is_link ? 10 /* DT_LNK */ :
+				 n->is_blk ? 6 /* DT_BLK */ :
+					     2 /* DT_CHR */;
 			rc = 1;
 			break;
 		}
@@ -456,7 +623,10 @@ static int devfs_open_device(struct devfs_node *node, int flags,
 				return ST_INVALID;
 			case -ENODEV:
 			case -ENXIO:
+			case -ENOMEDIUM:
 				return ST_NO_DEVICE;
+			case -EROFS:
+				return ST_ROFS;
 			default:
 				return ST_IO;
 			}
@@ -759,7 +929,8 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 			return ST_OK;
 		}
 		struct devfs_node *n = devfs_node_lookup(path);
-		if (n && !n->is_dir)
+		/* (a link was resolved by devfs_open_for_task already) */
+		if (n && !n->is_dir && !n->is_link)
 			return devfs_open_device(n, flags, out, cur);
 	}
 	return ST_NOT_FOUND;
@@ -768,6 +939,14 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 int devfs_open_for_task(const char *path, int flags, unsigned int cmode,
 			vfs_file_t **out, task_t *cur)
 {
+	char resolved[DEVFS_NODE_PATH_MAX];
+	int lr = path ? devfs_resolve_link(path, resolved, sizeof(resolved)) : 0;
+
+	/* A registered symbolic link opens what it points to. */
+	if (lr < 0)
+		return ST_NOT_FOUND;
+	if (lr == 1)
+		path = resolved;
 	int r = devfs_open_impl(path, flags, cmode, out, cur);
 	/* Remember the name so a /dev/fd/N symlink can report which node the
 	 * descriptor refers to.  Trailing-slash forms ("/dev/pts/") normalise
@@ -853,8 +1032,18 @@ static uint64_t devfs_node_time(const struct devfs_node *n)
 
 int devfs_stat(const char *path, struct kstat *st)
 {
+	char resolved[DEVFS_NODE_PATH_MAX];
+
 	if (!path || !st)
 		return ST_INVALID;
+	/* stat() follows a registered link; lstat() does not. */
+	{
+		int lr = devfs_resolve_link(path, resolved, sizeof(resolved));
+		if (lr < 0)
+			return ST_NOT_FOUND;
+		if (lr == 1)
+			path = resolved;
+	}
 	mm_memset(st, 0, sizeof(*st));
 	/* Built-in nodes and directories: there since boot.  Registered
 	 * nodes overwrite this with their own time below. */
@@ -957,7 +1146,8 @@ int devfs_stat(const char *path, struct kstat *st)
 		struct devfs_node *n = devfs_node_lookup(path);
 		if (!n)
 			return ST_NOT_FOUND;
-		st->st_mode = S_IFCHR | (n->mode & 07777);
+		st->st_mode = (n->is_blk ? S_IFBLK : S_IFCHR) | (n->mode & 07777);
+		st->st_blksize = 4096;
 		st->st_uid = n->uid;
 		st->st_gid = n->gid;
 		st->st_rdev = ((uint64_t)n->major << 8) | n->minor;
@@ -1178,6 +1368,10 @@ static unsigned devfs_write_dirent64(char *out, unsigned out_size,
 	return 1;
 }
 
+/* devfs_file_t.dir_pos: 0 not started, 1 finished, DEVFS_DIRPOS_REG + i
+ * resume a listing of registered nodes at child i. */
+#define DEVFS_DIRPOS_REG 0x1000u
+
 long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 {
 	if (!f || !buf || bytes <= 0)
@@ -1198,11 +1392,30 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	    df->type != DEVFS_TYPE_DEVICE_DIR) {
 		return -ENOTDIR;
 	}
-	if (df->dir_pos) {
+	if (df->dir_pos == 1) {
 		return 0;
 	}
 
 	unsigned out_off = 0;
+	/* A /dev listing resumed in the registered nodes. */
+	if (df->type == DEVFS_TYPE_DIR && df->dir_pos >= DEVFS_DIRPOS_REG) {
+		char nm[DEVFS_NODE_PATH_MAX];
+		int dt;
+		unsigned i = df->dir_pos - DEVFS_DIRPOS_REG;
+
+		for (; devfs_node_child("/dev", i, nm, sizeof(nm), &dt); i++) {
+			if (!devfs_write_dirent64((char *)buf, (unsigned)bytes,
+						  &out_off, nm, 100 + i,
+						  (uint8_t)dt)) {
+				if (out_off == 0)
+					return -EINVAL;
+				df->dir_pos = DEVFS_DIRPOS_REG + i;
+				return (long)out_off;
+			}
+		}
+		df->dir_pos = 1;
+		return (long)out_off;
+	}
 	if (df->type == DEVFS_TYPE_INPUT_DIR) {
 		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
 				     "event0", 200, 2);
@@ -1247,29 +1460,48 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 				     "stderr", 15, 10);
 		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
 				     "shm", 16, 4);
-		/* Registered nodes directly under /dev. */
+		/* Registered nodes directly under /dev, resumable: dir_pos
+		 * holds DEVFS_DIRPOS_REG + the index of the next one. */
 		{
-			char nm[48];
-			int isd;
-			for (unsigned i = 0;
-			     devfs_node_child("/dev", i, nm, sizeof(nm), &isd);
-			     i++)
-				devfs_write_dirent64((char *)buf,
-						     (unsigned)bytes, &out_off,
-						     nm, 100 + i, isd ? 4 : 2);
+			char nm[DEVFS_NODE_PATH_MAX];
+			int dt;
+			unsigned i = 0;
+
+			for (i = 0;
+			     devfs_node_child("/dev", i, nm, sizeof(nm), &dt);
+			     i++) {
+				if (!devfs_write_dirent64((char *)buf,
+							  (unsigned)bytes,
+							  &out_off, nm, 100 + i,
+							  (uint8_t)dt)) {
+					/* the rest in the next call */
+					df->dir_pos = DEVFS_DIRPOS_REG + i;
+					return (long)out_off;
+				}
+			}
 		}
 		df->dir_pos = 1;
 		return (long)out_off;
 	}
 	if (df->type == DEVFS_TYPE_DEVICE_DIR) {
-		char nm[48];
-		int isd;
-		for (unsigned i = 0; df->node && devfs_node_child(df->node->path, i,
-							     nm, sizeof(nm),
-							     &isd);
-		     i++)
-			devfs_write_dirent64((char *)buf, (unsigned)bytes,
-					     &out_off, nm, 100 + i, isd ? 4 : 2);
+		char nm[DEVFS_NODE_PATH_MAX];
+		int dt;
+		unsigned i = df->dir_pos >= DEVFS_DIRPOS_REG ?
+				     df->dir_pos - DEVFS_DIRPOS_REG :
+				     0;
+
+		for (; df->node && devfs_node_child(df->node->path, i, nm,
+						    sizeof(nm), &dt);
+		     i++) {
+			if (!devfs_write_dirent64((char *)buf, (unsigned)bytes,
+						  &out_off, nm, 100 + i,
+						  (uint8_t)dt)) {
+				if (out_off == 0)
+					return -EINVAL;
+				df->dir_pos = DEVFS_DIRPOS_REG + i;
+				return (long)out_off;
+			}
+		}
 		df->dir_pos = 1;
 		return (long)out_off;
 	}
@@ -1641,7 +1873,8 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	if (df->type == DEVFS_TYPE_DEVICE && df->node) {
 		const struct device_ops *ops = df->node->ops;
 		mm_memset(st, 0, sizeof(*st));
-		st->st_mode = S_IFCHR | (df->node->mode & 07777);
+		st->st_mode = (df->node->is_blk ? S_IFBLK : S_IFCHR) |
+			      (df->node->mode & 07777);
 		st->st_uid = df->node->uid;
 		st->st_gid = df->node->gid;
 		st->st_rdev = ((uint64_t)df->node->major << 8) |
@@ -1815,4 +2048,70 @@ int devfs_get_pty_master_id(vfs_file_t *f)
 int devfs_is_devfile(vfs_file_t *f)
 {
 	return (f && f->ops == &g_devfs_ops);
+}
+
+/* ---- Registered links and block devices: the VFS operations ------------- */
+
+/* lstat(): a registered link is reported as itself. */
+static int devfs_lstat(const char *path, struct kstat *st)
+{
+	char target[DEVFS_LINK_MAX];
+	int len;
+
+	if (!path || !st)
+		return ST_INVALID;
+	len = devfs_link_target(path, target, sizeof(target));
+	if (len < 0)
+		return devfs_stat(path, st);
+	mm_memset(st, 0, sizeof(*st));
+	st->st_mode = S_IFLNK | 0777;
+	st->st_nlink = 1;
+	st->st_size = (uint64_t)len;
+	st->st_blksize = 4096;
+	{
+		struct devfs_node *n = devfs_node_lookup(path);
+		uint64_t t = devfs_node_time(n);
+		st->st_atime = t;
+		st->st_mtime = t;
+		st->st_ctime = t;
+	}
+	return ST_OK;
+}
+
+static int devfs_readlink(const char *path, char *buf, unsigned long bufsz)
+{
+	char target[DEVFS_LINK_MAX];
+	int len;
+
+	if (!path || !buf)
+		return ST_INVALID;
+	len = devfs_link_target(path, target, sizeof(target));
+	if (len < 0)
+		return ST_INVALID; /* not a symlink */
+	if ((unsigned long)len > bufsz)
+		len = (int)bufsz;
+	for (int i = 0; i < len; i++)
+		buf[i] = target[i];
+	return len;
+}
+
+static int devfs_fsync(vfs_file_t *f)
+{
+	devfs_file_t *df = devfs_file_of(f);
+	const struct device_ops *ops;
+
+	if (!df)
+		return -EINVAL;
+	ops = device_file_ops(f);
+	if (ops && ops->fsync)
+		return ops->fsync(f);
+	return 0;
+}
+
+int devfs_file_is_blk(vfs_file_t *f)
+{
+	devfs_file_t *df = devfs_file_of(f);
+
+	return df && df->type == DEVFS_TYPE_DEVICE && df->node &&
+	       df->node->is_blk;
 }

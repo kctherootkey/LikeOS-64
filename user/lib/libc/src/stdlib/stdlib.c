@@ -10,6 +10,8 @@
 #include <errno.h>
 #include <stdio.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 // Simple environment variable storage
 
@@ -656,104 +658,140 @@ void __libc_init_environ(char **envp)
 }
 
 
-static int normalize_path(const char *in, char *out, size_t out_size)
-{
-	if (!in || !out || out_size < 2) {
-		return -1;
-	}
-	size_t out_len = 0;
-	out[out_len++] = '/';
-
-	size_t i = 0;
-	while (in[i]) {
-		while (in[i] == '/')
-			i++;
-		if (!in[i])
-			break;
-		char segment[64];
-		size_t seg_len = 0;
-		while (in[i] && in[i] != '/' && seg_len < sizeof(segment) - 1) {
-			segment[seg_len++] = in[i++];
-		}
-		segment[seg_len] = '\0';
-		if (seg_len == 0 || (seg_len == 1 && segment[0] == '.')) {
-			continue;
-		}
-		if (seg_len == 2 && segment[0] == '.' && segment[1] == '.') {
-			if (out_len > 1) {
-				out_len--;
-				while (out_len > 1 && out[out_len - 1] != '/') {
-					out_len--;
-				}
-			}
-			out[out_len] = '\0';
-			continue;
-		}
-		if (out_len > 1 && out[out_len - 1] != '/') {
-			if (out_len + 1 >= out_size)
-				return -1;
-			out[out_len++] = '/';
-		}
-		if (out_len + seg_len + 1 >= out_size)
-			return -1;
-		for (size_t s = 0; s < seg_len; ++s) {
-			out[out_len++] = segment[s];
-		}
-		out[out_len] = '\0';
-	}
-	if (out_len > 1 && out[out_len - 1] == '/') {
-		out[out_len - 1] = '\0';
-	}
-	return 0;
-}
+/* realpath(3): the canonical absolute name of an existing file -- every
+ * ".", ".." and symbolic link resolved, component by component, the way
+ * POSIX specifies it.  A component that does not exist fails the call with
+ * ENOENT, a non-directory in the middle with ENOTDIR, more than
+ * RP_MAX_LINKS links with ELOOP.  (It used to be textual normalisation
+ * only: /dev/disk/by-partlabel/x came back as itself instead of the
+ * /dev/sdXN it points at, and tools that find a disk's sysfs entry by name
+ * looked for a disk called "x".) */
+#define RP_MAX_LINKS 40
 
 char *realpath(const char *path, char *resolved_path)
 {
+	char out[PATH_MAX]; /* resolved so far, "" = the root */
+	char rest[PATH_MAX]; /* still to resolve */
+	char link[PATH_MAX];
+	size_t olen = 0, rlen;
+	unsigned links = 0;
+	const char *p;
+
 	if (!path) {
 		errno = EINVAL;
 		return NULL;
 	}
-	char tmp[512];
-	if (path[0] == '/') {
-		strncpy(tmp, path, sizeof(tmp) - 1);
-		tmp[sizeof(tmp) - 1] = '\0';
-	} else {
-		char cwd[256];
-		if (!getcwd(cwd, sizeof(cwd))) {
-			errno = EINVAL;
-			return NULL;
-		}
-		size_t len = strlen(cwd);
-		if (len + 1 >= sizeof(tmp)) {
-			errno = ENOMEM;
-			return NULL;
-		}
-		strcpy(tmp, cwd);
-		if (len == 0 || tmp[len - 1] != '/') {
-			tmp[len++] = '/';
-			tmp[len] = '\0';
-		}
-		if (len + strlen(path) + 1 >= sizeof(tmp)) {
-			errno = ENOMEM;
-			return NULL;
-		}
-		strcpy(tmp + len, path);
-	}
-
-	char norm[512];
-	if (normalize_path(tmp, norm, sizeof(norm)) != 0) {
-		errno = ENOMEM;
+	if (!*path) {
+		errno = ENOENT;
 		return NULL;
 	}
+	rlen = strlen(path);
+	if (rlen >= sizeof(rest)) {
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	memcpy(rest, path, rlen + 1);
+	out[0] = '\0';
+	if (rest[0] != '/') {
+		if (!getcwd(out, sizeof(out)))
+			return NULL;
+		olen = strlen(out);
+		if (olen == 1 && out[0] == '/')
+			olen = 0; /* the root is "" here */
+		out[olen] = '\0';
+	}
 
+	p = rest;
+	for (;;) {
+		const char *c, *e;
+		size_t clen;
+		struct stat st;
+		int more;
+
+		while (*p == '/')
+			p++;
+		if (!*p)
+			break;
+		c = p;
+		e = c;
+		while (*e && *e != '/')
+			e++;
+		clen = (size_t)(e - c);
+		p = e;
+		/* is another component (or a trailing slash) after this? */
+		more = *p == '/';
+
+		if (clen == 1 && c[0] == '.')
+			continue;
+		if (clen == 2 && c[0] == '.' && c[1] == '.') {
+			while (olen > 0 && out[olen - 1] != '/')
+				olen--;
+			if (olen > 0)
+				olen--; /* the separator */
+			out[olen] = '\0';
+			continue;
+		}
+		if (olen + 1 + clen >= sizeof(out)) {
+			errno = ENAMETOOLONG;
+			return NULL;
+		}
+		out[olen] = '/';
+		memcpy(out + olen + 1, c, clen);
+		out[olen + 1 + clen] = '\0';
+
+		if (lstat(out, &st) != 0)
+			return NULL; /* errno from lstat: ENOENT, EACCES ... */
+		if (S_ISLNK(st.st_mode)) {
+			ssize_t n;
+			size_t tail = strlen(p);
+
+			if (++links > RP_MAX_LINKS) {
+				errno = ELOOP;
+				return NULL;
+			}
+			n = readlink(out, link, sizeof(link) - 1);
+			if (n < 0)
+				return NULL;
+			if (n == 0) {
+				errno = ENOENT;
+				return NULL;
+			}
+			link[n] = '\0';
+			/* the rest becomes: target + what was left (which
+			 * starts with its own separator, if anything) */
+			if ((size_t)n + tail + 1 >= sizeof(rest)) {
+				errno = ENAMETOOLONG;
+				return NULL;
+			}
+			memmove(rest + n, p, tail + 1);
+			memcpy(rest, link, (size_t)n);
+			p = rest;
+			/* an absolute target restarts at the root, a relative
+			 * one from the directory holding the link */
+			if (link[0] == '/')
+				olen = 0;
+			out[olen] = '\0';
+			continue;
+		}
+		olen += 1 + clen;
+		if (more && !S_ISDIR(st.st_mode)) {
+			errno = ENOTDIR;
+			return NULL;
+		}
+	}
+	if (olen == 0) {
+		out[0] = '/';
+		out[1] = '\0';
+		olen = 1;
+	}
 	if (!resolved_path) {
-		resolved_path = (char *)malloc(strlen(norm) + 1);
+		resolved_path = (char *)malloc(olen + 1);
 		if (!resolved_path) {
 			errno = ENOMEM;
 			return NULL;
 		}
 	}
-	strcpy(resolved_path, norm);
+	memcpy(resolved_path, out, olen + 1);
 	return resolved_path;
 }
 

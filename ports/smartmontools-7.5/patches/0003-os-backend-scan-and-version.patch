@@ -1,0 +1,45 @@
+OS backend: report the system by name; scan only what LikeOS has.
+
+smartctl -i and smartctl -V print the OS string of the backend, which
+has the name of the system it was written for fixed into it.  On LikeOS
+the name comes from uname(): machine-sysname-release.
+
+smartctl --scan and smartd's DEVICESCAN look for /dev/hd[a-t], /dev/sd*
+(and /dev/disk/by-id with -d by-id) and NVMe nodes, which is the LikeOS
+naming as well, and then probe for MegaRAID and 3SNIC RAID controllers
+through /proc/devices, /sys/class/scsi_host and /dev/bsg nodes.  LikeOS has
+none of those, and the 3SNIC probe falls back to trying /dev/bsg/sssraid0
+.. 16 and printing an "open ... error" line for each; so the two RAID
+probes are left out of the scan.  Opening such a device by name with
+-d megaraid,N or -d sssraid,N is unchanged and fails cleanly.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -ruN a/os_linux.cpp b/os_linux.cpp
+--- a/os_linux.cpp	2026-11-09 13:03:29.006823527 +0100
++++ b/os_linux.cpp	2026-11-09 13:03:29.054377368 +0100
+@@ -2865,7 +2865,11 @@
+ {
+   struct utsname u;
+   if (!uname(&u))
++#ifdef __LIKEOS__
++    return strprintf("%s-%s-%s", u.machine, u.sysname, u.release);
++#else
+     return strprintf("%s-linux-%s", u.machine, u.release);
++#endif
+   else
+     return SMARTMONTOOLS_BUILD_HOST;
+ }
+@@ -3129,10 +3133,12 @@
+     get_dev_list(devlist, "/dev/sd[a-z]", true, p_dev_sdxy_seen, false, type_scsi_sat, autodetect);
+     get_dev_list(devlist, "/dev/sd[a-z][a-z]", true, p_dev_sdxy_seen, false, type_scsi_sat, autodetect);
+ 
++#ifndef __LIKEOS__
+     // get device list from the megaraid device
+     get_dev_megasas(devlist);
+     // get device list from the sssraid device
+     get_dev_sssraid(devlist);
++#endif
+   }
+ 
+   if (type_nvme) {

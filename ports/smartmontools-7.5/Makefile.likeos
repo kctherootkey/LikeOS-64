@@ -1,0 +1,99 @@
+# Makefile.likeos - build smartctl and smartd of smartmontools 7.5 for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/, and the two
+# programs are compiled here directly from the source lists of upstream's
+# Makefile.am, with the SG_IO OS backend and its helpers (configure's
+# os_deps for systems with that backend).  configure is not run: its answers
+# for LikeOS are fixed and written down in config.h in this directory, which
+# is shorter to read than a cross configure run is to set up, and the build
+# itself has no other generated input than svnversion.h (below).  drivedb.h
+# is compiled in, as upstream does.
+#
+# C++, so the compiler is the cross driver of the X.Org toolchain, likeos-c++:
+# it supplies the LikeOS libc, libstdc++ from build/xorg-sysroot (which must
+# have been built, see the top-level ports-gtk3), the start files and the link
+# arrangement of a LikeOS executable.
+#
+# Output: build/smartctl, build/smartd
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CXX = ../xorg/toolchain/likeos-c++
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+
+# Upstream's AM_CPPFLAGS with the paths of the LikeOS file system layout:
+# /etc/smartd.conf, /etc/smartd_warning.sh, and an optional newer drive
+# database in /usr/share/smartmontools/drivedb.h (the built-in one is used
+# when there is none).
+CPPFLAGS = -I. -I$(B) \
+           -DBUILD_INFO='"(LikeOS)"' \
+           -DSMARTMONTOOLS_SYSCONFDIR='"/etc"' \
+           -DSMARTMONTOOLS_SMARTDSCRIPTDIR='"/etc"' \
+           -DSMARTMONTOOLS_DRIVEDBDIR='"/usr/share/smartmontools"'
+# The flags configure adds for g++ (-Wall -W); C++17, the compiler default.
+CXXFLAGS = -std=gnu++17 -Wall -W
+# The executable link script discards every .note section, so the build ID
+# the host compiler asks for by default would only draw a linker warning.
+LDFLAGS = -Wl,--build-id=none
+
+COMMON = atacmdnames atacmds dev_ata_cmd_set dev_intelliprop dev_interface \
+         dev_jmb39x_raid knowndrives nvmecmds scsicmds scsiata scsinvme \
+         utility
+# configure's os_deps for the SG_IO backend; cciss.cpp compiles to nothing
+# here (it needs the cciss ioctl header), as it does wherever that is absent.
+OS_DEPS = os_linux cciss dev_areca
+
+SMARTCTL_SRC = smartctl ataidentify ataprint farmcmds farmprint json \
+               nvmeprint scsiprint $(COMMON) $(OS_DEPS)
+SMARTD_SRC = smartd popen_as_ugid $(COMMON) $(OS_DEPS)
+
+SMARTCTL_OBJ = $(addprefix $(B)/,$(addsuffix .o,$(SMARTCTL_SRC)))
+SMARTD_OBJ = $(addprefix $(B)/,$(addsuffix .o,$(SMARTD_SRC)))
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(B)/smartctl $(B)/smartd
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): smartmontools-7.5.tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+# The revision stamp smartctl -V prints, made the way upstream's Makefile
+# makes it.  "ids" takes it from the $Id: strings of the release's own files;
+# the script's default would first ask svn and git, and git would answer
+# with the revision of whatever checkout this port sits in.
+$(B)/svnversion.h: $(SRC_STAMP)
+	@mkdir -p $(B)
+	$(SHELL) $(S)/getversion.sh -i ids > $@.tmp
+	mv $@.tmp $@
+
+# Every object depends on every header: the tree is small and its headers
+# are shared throughout, so a finer list would only be wrong sooner.
+HDRS = config.h likeos-smartmontools.h $(B)/svnversion.h $(wildcard $(S)/*.h)
+
+$(B)/%.o: $(S)/%.cpp $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(B)/smartctl: $(SMARTCTL_OBJ)
+	$(CXX) $(LDFLAGS) -o $@ $(SMARTCTL_OBJ)
+
+$(B)/smartd: $(SMARTD_OBJ)
+	$(CXX) $(LDFLAGS) -o $@ $(SMARTD_OBJ)
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

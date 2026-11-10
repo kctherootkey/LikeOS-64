@@ -57,6 +57,36 @@ int utimes(const char *path, const struct timeval tv[2]);
         }                                                         \
     } while (0)
 
+/* Converting between struct timeval and struct timespec (BSD macros). */
+#define TIMEVAL_TO_TIMESPEC(tv, ts)                               \
+    do {                                                          \
+        (ts)->tv_sec  = (tv)->tv_sec;                             \
+        (ts)->tv_nsec = (tv)->tv_usec * 1000;                     \
+    } while (0)
+#define TIMESPEC_TO_TIMEVAL(tv, ts)                               \
+    do {                                                          \
+        (tv)->tv_sec  = (ts)->tv_sec;                             \
+        (tv)->tv_usec = (ts)->tv_nsec / 1000;                     \
+    } while (0)
+
+/* Interval timers.  POSIX declares them in this header; <signal.h> carries
+ * the same definitions (same guard, same values), so a program may include
+ * either or both. */
+#ifndef _STRUCT_ITIMERVAL
+#define _STRUCT_ITIMERVAL
+struct itimerval {
+    struct timeval it_interval;
+    struct timeval it_value;
+};
+#endif
+
+#define ITIMER_REAL    0
+#define ITIMER_VIRTUAL 1
+#define ITIMER_PROF    2
+
+int setitimer(int which, const struct itimerval* new_value, struct itimerval* old_value);
+int getitimer(int which, struct itimerval* curr_value);
+
 #ifdef __cplusplus
 }
 #endif

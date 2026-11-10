@@ -1,0 +1,202 @@
+Build against the LikeOS C library headers.
+
+hdparm takes its kernel interface from a handful of system headers (the
+__u8 .. __u64 types, the BLK* and HDIO_* requests, byte order helpers,
+the optical drive packet interface).  On LikeOS these are in the C library:
+<sys/mount.h> (BLK*), <sys/hdreg.h> (HDIO_*), <scsi/sg.h> (SG_IO), and the
+rest is gathered in the port's likeos-hdparm.h.  Each include is switched
+under __LIKEOS__, the upstream line stays as it is in the other branch.
+
+MAP_LOCKED for the firmware image of --fwdownload is 0 on LikeOS, the way
+hdparm already handles a system without MAP_POPULATE: memory is never paged
+out there, so the populated mapping stays resident anyway.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -ruN a/apt.c b/apt.c
+--- a/apt.c	2020-11-21 16:06:45.000000000 +0100
++++ b/apt.c	2026-11-09 12:53:42.154182655 +0100
+@@ -4,7 +4,11 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/cdrom.h>
++#endif
+ #include <scsi/scsi.h>
+ #include <scsi/sg.h>
+ #include <sys/types.h>
+diff -ruN a/fallocate.c b/fallocate.c
+--- a/fallocate.c	2016-10-13 01:50:52.000000000 +0200
++++ b/fallocate.c	2026-11-09 12:53:42.152924118 +0100
+@@ -12,8 +12,12 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <sys/syscall.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
+ #include <linux/fs.h>
++#endif
+ 
+ #include "hdparm.h"
+ 
+diff -ruN a/fibmap.c b/fibmap.c
+--- a/fibmap.c	2018-10-16 19:22:02.000000000 +0200
++++ b/fibmap.c	2026-11-09 12:53:42.152998420 +0100
+@@ -17,8 +17,12 @@
+ #include <errno.h>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
+ #include <linux/fs.h>
++#endif
+ 
+ #include "hdparm.h"
+ 
+diff -ruN a/fwdownload.c b/fwdownload.c
+--- a/fwdownload.c	2017-12-06 13:41:40.000000000 +0100
++++ b/fwdownload.c	2026-11-09 12:53:42.154261254 +0100
+@@ -14,8 +14,12 @@
+ #include <errno.h>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
+ #include <linux/fs.h>
++#endif
+ #include <sys/mman.h>
+ 
+ #include "hdparm.h"
+@@ -26,6 +30,11 @@
+ #define MAP_POPULATE	0
+ #endif
+ 
++#if defined(__LIKEOS__) && !defined(MAP_LOCKED)
++/* LikeOS never pages memory out: what MAP_POPULATE brings in stays resident. */
++#define MAP_LOCKED	0
++#endif
++
+ extern int verbose;
+ 
+ /* Download a firmware segment to the drive */
+diff -ruN a/geom.c b/geom.c
+--- a/geom.c	2018-12-28 17:36:54.000000000 +0100
++++ b/geom.c	2026-11-09 12:53:42.152776037 +0100
+@@ -17,8 +17,12 @@
+ #include <sys/stat.h>
+ #include <sys/sysmacros.h>
+ #include <sys/ioctl.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
+ #include <linux/fs.h>
++#endif
+ 
+ #include "hdparm.h"
+ 
+diff -ruN a/hdparm.c b/hdparm.c
+--- a/hdparm.c	2022-09-06 19:02:56.000000000 +0200
++++ b/hdparm.c	2026-11-09 12:53:42.153798733 +0100
+@@ -23,6 +23,9 @@
+ #include <sys/types.h>
+ #include <sys/mount.h>
+ #include <sys/mman.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <sys/user.h>
+ #include <linux/types.h>
+ #ifndef FSCONFIG_SET_FLAG
+@@ -31,6 +34,7 @@
+ #include <linux/major.h>
+ #include <endian.h>
+ #include <asm/byteorder.h>
++#endif
+ 
+ #include "hdparm.h"
+ #include "sgio.h"
+diff -ruN a/identify.c b/identify.c
+--- a/identify.c	2022-09-06 18:58:09.000000000 +0200
++++ b/identify.c	2026-11-09 12:53:42.153445107 +0100
+@@ -4,7 +4,11 @@
+ #include <stdlib.h>
+ #include <errno.h>
+ #include <string.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
++#endif
+ #include <endian.h>
+ 
+ #if __BYTE_ORDER == __BIG_ENDIAN
+diff -ruN a/sgio.c b/sgio.c
+--- a/sgio.c	2019-01-03 23:37:54.000000000 +0100
++++ b/sgio.c	2026-11-09 12:53:42.154087898 +0100
+@@ -15,7 +15,11 @@
+ #include "sgio.h"
+ #include "hdparm.h"
+ 
++#ifdef __LIKEOS__
++#include <sys/hdreg.h>
++#else
+ #include <linux/hdreg.h>
++#endif
+ 
+ extern int verbose;
+ extern int prefer_ata12;
+diff -ruN a/sgio.h b/sgio.h
+--- a/sgio.h	2018-10-12 19:22:49.000000000 +0200
++++ b/sgio.h	2026-11-09 12:53:42.153593221 +0100
+@@ -1,6 +1,10 @@
+ /* prototypes and stuff for ATA command ioctls */
+ 
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
++#endif
+ 
+ enum {
+ 	ATA_OP_DSM			= 0x06, // Data Set Management (TRIM)
+diff -ruN a/sysfs.c b/sysfs.c
+--- a/sysfs.c	2018-09-03 20:20:25.000000000 +0200
++++ b/sysfs.c	2026-11-09 12:53:42.153219404 +0100
+@@ -16,7 +16,11 @@
+ #include <limits.h>
+ #include <sys/stat.h>
+ #include <sys/sysmacros.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
++#endif
+ 
+ #include "hdparm.h"
+ 
+diff -ruN a/wdidle3.c b/wdidle3.c
+--- a/wdidle3.c	2018-10-16 18:55:35.000000000 +0200
++++ b/wdidle3.c	2026-11-09 12:53:42.153147572 +0100
+@@ -5,8 +5,12 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <sys/syscall.h>
++#ifdef __LIKEOS__
++#include "likeos-hdparm.h"
++#else
+ #include <linux/types.h>
+ #include <linux/fs.h>
++#endif
+ 
+ #include "sgio.h"
+ #include "hdparm.h"

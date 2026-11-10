@@ -409,6 +409,8 @@ char *strerror(int errnum)
 		return "No message of desired type";
 	case 43:
 		return "Identifier removed";
+	case 52:
+		return "Invalid exchange";
 	case 60:
 		return "Device not a stream";
 	case 61:
@@ -475,6 +477,14 @@ char *strerror(int errnum)
 		return "Operation now in progress";
 	case 116:
 		return "Stale file handle";
+	case 121:
+		return "Remote I/O error";
+	case 123:
+		return "No medium found";
+	case 124:
+		return "Wrong medium type";
+	case 125:
+		return "Operation canceled";
 	case 130:
 		return "Owner died";
 	case 131:

@@ -1,0 +1,93 @@
+-E (optical drive speed): send SET STREAMING through SG_IO.
+
+set_dvdspeed() hands the SET STREAMING packet to the drive with the
+CDROM_SEND_PACKET request.  On LikeOS an optical drive (/dev/sr0) takes any
+packet command through SG_IO instead, so the LikeOS branch sends the same
+command and parameter list that way; the function body is unchanged.  If it
+fails, hdparm falls back to CDROM_SELECT_SPEED as before (which the LikeOS
+kernel does not answer, so the result is the usual "both failed" message).
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -ruN a/dvdspeed.c b/dvdspeed.c
+--- a/dvdspeed.c	2016-10-13 01:50:52.000000000 +0200
++++ b/dvdspeed.c	2026-11-09 12:53:42.164258490 +0100
+@@ -4,7 +4,13 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
++#ifdef __LIKEOS__
++#include <errno.h>
++#include <scsi/sg.h>
++#include "likeos-hdparm.h"
++#else
+ #include <linux/cdrom.h>
++#endif
+ #include "hdparm.h"
+ /*
+  * dvdspeed - use SET STREAMING command to set the speed of DVD-drives
+@@ -14,6 +20,53 @@
+  *
+  */
+ 
++#ifdef __LIKEOS__
++/*
++ * LikeOS: an optical drive takes packet commands through SG_IO, the request
++ * that passes any SCSI command to /dev/sr0 (there is no CDROM_SEND_PACKET).
++ * The fields below are the ones set_dvdspeed() fills in; send_packet()
++ * hands them to SG_IO and, like CDROM_SEND_PACKET, fails with EIO when the
++ * drive answers with anything but GOOD status.
++ */
++#define CGC_DATA_WRITE	SG_DXFER_TO_DEV
++
++struct request_sense {
++	unsigned char	data[18];
++};
++
++struct cdrom_generic_command {
++	unsigned char		cmd[12];
++	unsigned char		*buffer;
++	unsigned int		buflen;
++	struct request_sense	*sense;
++	int			data_direction;
++};
++
++static int send_packet(int fd, struct cdrom_generic_command *cgc)
++{
++	struct sg_io_hdr io;
++
++	memset(&io, 0, sizeof(io));
++	io.interface_id    = 'S';
++	io.cmd_len         = sizeof(cgc->cmd);
++	io.cmdp            = cgc->cmd;
++	io.dxfer_direction = cgc->data_direction;
++	io.dxferp          = cgc->buffer;
++	io.dxfer_len       = cgc->buflen;
++	io.sbp             = cgc->sense;
++	io.mx_sb_len       = sizeof(*cgc->sense);
++	io.timeout         = 7000;	/* ms */
++
++	if (ioctl(fd, SG_IO, &io) == -1)
++		return -1;
++	if (io.status || io.host_status || io.driver_status) {
++		errno = EIO;
++		return -1;
++	}
++	return 0;
++}
++#endif
++
+ int set_dvdspeed(int fd, int speed)
+ {
+ 	struct cdrom_generic_command cgc;
+@@ -61,6 +114,10 @@
+ 	buffer[26] = 0x03;
+ 	buffer[27] = 0xE8;
+ 
++#ifdef __LIKEOS__
++	return send_packet(fd, &cgc);
++#else
+ 	return ioctl(fd, CDROM_SEND_PACKET, &cgc);
++#endif
+ }
+ 

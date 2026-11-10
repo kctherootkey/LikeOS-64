@@ -505,6 +505,20 @@ void smp_send_reschedule(uint32_t cpu_id)
 	}
 }
 
+/* The block softirq's IPI: like the reschedule IPI, one fixed interrupt
+ * to the named CPU, sent by the block layer when it puts completions on a
+ * done list that was empty (so a burst costs one). */
+void smp_send_block_softirq(uint32_t cpu_id)
+{
+	percpu_t *target;
+
+	if (WARN_ON_ONCE(cpu_id >= g_cpu_count))
+		return;
+	target = percpu_get(cpu_id);
+	if (target)
+		lapic_send_ipi(target->apic_id, IPI_BLOCK_SOFTIRQ_VECTOR);
+}
+
 void smp_send_reschedule_all(void)
 {
 	lapic_send_ipi_all_excl_self(IPI_RESCHEDULE_VECTOR);

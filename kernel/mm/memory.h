@@ -349,10 +349,58 @@ typedef struct {
 		uint32_t width;
 		uint32_t height;
 	} gop_modes[BOOT_GOP_MODES_MAX]; // the firmware's 32 bpp sizes
+
+	/* ---- Root identity (valid when rootid_magic == BOOT_ROOTID_MAGIC) ----
+	 * Which partition the firmware started the bootloader from, and the
+	 * boot command line.  The kernel finds its root filesystem by these
+	 * (kernel/ke/storage.c): an explicit root= from the command line
+	 * first, otherwise the partition of the standard x86-64 root type on
+	 * the disk that holds the loader partition.  An older bootloader does
+	 * not write these fields (the magic is then whatever followed its
+	 * smaller structure, never this value) and the kernel falls back to
+	 * its legacy root search.  The bootloader carries an identical copy
+	 * of this structure (boot/bootloader.c); keep both the same. */
+	uint64_t rootid_magic; // BOOT_ROOTID_MAGIC when the fields below are valid
+	uint32_t loader_part_sig_type; // BOOT_PART_SIG_*: how the loader partition is identified
+	uint32_t loader_part_number; // its number in the partition table (1-based), 0 unknown
+	uint64_t loader_part_start; // its first LBA (the firmware's block size)
+	uint64_t loader_part_size; // its length in blocks
+	uint8_t loader_part_sig[16]; // GPT: unique partition GUID in on-disk byte order;
+		// MBR: bytes 0-3 the disk signature (little-endian), rest 0
+	char loader_partuuid[40]; // the same as text: GPT "xxxxxxxx-xxxx-...", MBR "xxxxxxxx-nn"
+	uint32_t loader_disk_bus; // BOOT_DISK_BUS_*: the bus the firmware reached the disk by
+	uint32_t loader_disk_port; // SATA HBA port, USB parent port, NVMe namespace; ~0u unknown
+	char loader_device_path[256]; // the loader partition's device path as text (diagnostics)
+	char kernel_partuuid[40]; // PARTUUID of the partition kernel.elf was read from, "" unknown
+	char root_spec[128]; // root= value of the command line, "" none
+	char cmdline[512]; // the whole boot command line (ASCII, one line), "" none
+	uint32_t cmdline_source; // BOOT_CMDLINE_*: where the command line came from
+	uint32_t rootid_reserved;
 } boot_info_t;
 
 #define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
 #define BOOT_DISPLAY_MAGIC 0x5953494459414c50ULL
+#define BOOT_ROOTID_MAGIC 0x44494f544f4f524cULL /* "LROOTOID" */
+
+// boot_info_t.loader_part_sig_type (the UEFI HD() device path SignatureType)
+#define BOOT_PART_SIG_NONE 0 // no partition identity (loader not on a partition)
+#define BOOT_PART_SIG_MBR 1 // MBR disk signature + partition number
+#define BOOT_PART_SIG_GPT 2 // GPT unique partition GUID
+
+// boot_info_t.loader_disk_bus
+#define BOOT_DISK_BUS_UNKNOWN 0
+#define BOOT_DISK_BUS_USB 1
+#define BOOT_DISK_BUS_SATA 2
+#define BOOT_DISK_BUS_NVME 3
+#define BOOT_DISK_BUS_SCSI 4
+#define BOOT_DISK_BUS_ATAPI 5 // parallel ATA / ATAPI device path node
+#define BOOT_DISK_BUS_SD 6 // SD / eMMC
+#define BOOT_DISK_BUS_VIRTUAL 7 // RAM disk, vendor-defined or other virtual media
+
+// boot_info_t.cmdline_source
+#define BOOT_CMDLINE_NONE 0 // no command line
+#define BOOT_CMDLINE_LOAD_OPTIONS 1 // the boot entry's load options
+#define BOOT_CMDLINE_ESP_FILE 2 // \EFI\LIKEOS\cmdline.txt on the ESP
 
 // The SMBIOS entry points the bootloader found (0 = none or an older
 // bootloader); saved by kernel_main before the identity map goes away.

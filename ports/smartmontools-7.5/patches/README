@@ -1,0 +1,19 @@
+Patches applied to the pristine smartmontools-7.5 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-likeos-platform-headers.patch
+        The SG_IO backend takes its kernel types (__u8 .., struct sg_io_v4)
+        from the port's likeos-smartmontools.h; dev_areca.h defines the
+        Areca request codes for it.
+
+  0002-popen-as-ugid-setgroups.patch
+        smartd's popen_as_ugid() calls setgroups() through a gid_t overload
+        of the C library's int-list declaration.
+
+  0003-os-backend-scan-and-version.patch
+        The OS string comes from uname(); the device scan leaves out the
+        MegaRAID and 3SNIC RAID probes (no such controllers or nodes).
+
+Copyright (C) 2026 The LikeOS Project

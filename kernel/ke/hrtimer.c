@@ -134,22 +134,45 @@ static void hw_program(void)
 	}
 }
 
-/* After queue `q''s head changed: point the device serving it at the new
- * head.  Caller holds g_lock with interrupts off.  A local timer can only
- * be programmed from its own CPU; a remote queue whose head became LATER
- * (a cancel) is left alone -- its timer fires early into nothing and is
- * re-armed then -- and timers are only ever added to the arming CPU's own
- * queue, so a head that became EARLIER is always local. */
-static void queue_head_changed(int q)
+/* The earliest expiry queued on `q' (0: none).  Caller holds g_lock. */
+static inline uint64_t queue_head_ns(int q)
 {
-	if (!g_lapic_ce) {
-		hw_program();
-		return;
-	}
-	if ((uint32_t)q == this_cpu_id())
-		lapic_clockevent_program(g_cpu_head[q] ?
-						 g_cpu_head[q]->expires_ns :
-						 0);
+	return g_cpu_head[q] ? g_cpu_head[q]->expires_ns : 0;
+}
+
+/* `q' if it is the calling CPU's own queue, served by this CPU's running
+ * local timer -- the only device this CPU may program for a queue; -1
+ * otherwise: a remote queue (its own timer re-arms it when it fires), or
+ * HPET mode (the comparator is programmed under g_lock, see hw_program).
+ * Interrupts off. */
+static inline int local_ce_queue(int q)
+{
+	uint32_t c;
+
+	if (!g_lapic_ce || q < 0)
+		return -1;
+	c = this_cpu_id();
+	if ((uint32_t)q != c || !lapic_clockevent_ready(c))
+		return -1;
+	return q;
+}
+
+/* After a start or a cancel changed the earliest expiry of this CPU's own
+ * queue from `before' to `after': point this CPU's local timer at it.
+ * Called with g_lock RELEASED and interrupts still off.  Nothing can make
+ * that queue's head earlier meanwhile -- timers are only ever added to the
+ * arming CPU's own queue, and this CPU is not taking interrupts -- so the
+ * value read under the lock is still the one to aim for; another CPU can
+ * only remove from it, which leaves the timer firing early into nothing.
+ * The device is touched only when the earliest expiry actually changed,
+ * and lapic_clockevent_program() itself skips a write that would program
+ * the value the timer already holds (the tick may come first anyway).  A
+ * remote queue whose head became later is left alone: its own timer fires
+ * early and is re-armed there. */
+static inline void local_head_changed(int q, uint64_t before, uint64_t after)
+{
+	if (q >= 0 && before != after)
+		lapic_clockevent_program(after);
 }
 
 void hrtimer_init(hrtimer_t *t, hrtimer_fn_t fn, void *arg)
@@ -189,13 +212,17 @@ static int queue_remove_locked(hrtimer_t *t)
 
 void hrtimer_start(hrtimer_t *t, uint64_t abs_ns)
 {
-	uint64_t flags;
-	int q;
+	uint64_t flags, before = 0, after = 0;
+	int q, local;
 
 	spin_lock_irqsave(&g_lock, &flags);
+	/* The queue the timer goes on decides which device follows it. */
+	q = queue_for_new_timer();
+	local = local_ce_queue(q);
+	if (local >= 0)
+		before = queue_head_ns(local);
 	if (t->armed)
 		(void)queue_remove_locked(t);
-	q = queue_for_new_timer();
 	t->expires_ns = abs_ns;
 	t->armed = 1;
 	t->cpu = q;
@@ -206,21 +233,38 @@ void hrtimer_start(hrtimer_t *t, uint64_t abs_ns)
 	t->next = *pp;
 	*pp = t;
 
-	if (g_cpu_head[q] == t)
-		queue_head_changed(q);
-	spin_unlock_irqrestore(&g_lock, flags);
+	if (local >= 0)
+		after = queue_head_ns(local);
+	else if (!g_lapic_ce && g_cpu_head[q] == t)
+		hw_program(); /* HPET mode: the shared comparator */
+	spin_unlock(&g_lock);
+	local_head_changed(local, before, after);
+	local_irq_restore(flags);
 }
 
 int hrtimer_cancel(hrtimer_t *t)
 {
-	uint64_t flags;
-	int was_armed;
+	uint64_t flags, before = 0, after = 0;
+	int was_armed, local;
 
+	/* Not queued: nothing to take, and no lock to take for it.  The lock
+	 * does not order a cancel against a start racing it on another CPU
+	 * anyway; the callers exclude that by their own state. */
+	if (!__atomic_load_n(&t->armed, __ATOMIC_ACQUIRE))
+		return 0;
 	spin_lock_irqsave(&g_lock, &flags);
+	/* Only the queue the timer is on can change. */
+	local = local_ce_queue(t->armed ? t->cpu : -1);
+	if (local >= 0)
+		before = queue_head_ns(local);
 	was_armed = t->armed;
 	if (was_armed)
 		(void)queue_remove_locked(t);
-	spin_unlock_irqrestore(&g_lock, flags);
+	if (local >= 0)
+		after = queue_head_ns(local);
+	spin_unlock(&g_lock);
+	local_head_changed(local, before, after);
+	local_irq_restore(flags);
 	return was_armed;
 }
 
@@ -285,10 +329,15 @@ void hrtimer_clockevent_started(void)
 		g_highres = 1;
 		kprintf("hrtimer: on the CPUs' local timers (HPET comparator retired)\n");
 	}
-	if (g_lapic_ce && c < MAX_CPUS)
-		lapic_clockevent_program(g_cpu_head[c] ?
-						 g_cpu_head[c]->expires_ns : 0);
-	spin_unlock_irqrestore(&g_lock, flags);
+	{
+		uint64_t head = g_lapic_ce && c < MAX_CPUS ? queue_head_ns((int)c) : 0;
+		int arm = g_lapic_ce && c < MAX_CPUS;
+
+		spin_unlock(&g_lock);
+		if (arm)
+			lapic_clockevent_program(head);
+		local_irq_restore(flags);
+	}
 }
 
 void hrtimer_irq(void)

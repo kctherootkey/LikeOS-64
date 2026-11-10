@@ -66,6 +66,11 @@ static struct pfs_node *pfs_child(struct pfs_node *dir, const char *name,
 }
 
 #define PFS_WALK_MAX 512
+/* The open flag of the established ABI (libc fcntl.h): do not follow a
+ * final link. */
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0x20000
+#endif
 #define PFS_LINK_HOPS 8
 
 /* Defined below; the walk needs it to turn an absolute link target back
@@ -226,6 +231,69 @@ restart: {
 	}
 	return cur;
 	}
+}
+
+/* pfs_lookup, and when the node found is itself a link, the node the link
+ * leads to: what open() and stat() of a path must see.  A program that opens
+ * /sys/dev/block/8:0 or /sys/class/block/sda wants the device's directory,
+ * not the link -- it goes on to read "size" relative to that descriptor, and
+ * a descriptor on the link itself is no directory to read anything in.
+ * lstat(), readlink() and O_NOFOLLOW keep pfs_lookup.  A link that cannot be
+ * resolved inside this file system (an absolute target elsewhere, such as
+ * /proc/self/exe, or a dangling one) is returned as the link itself, which is
+ * how every such path behaved before. */
+static struct pfs_node *pfs_lookup_follow(struct pfs *fs, const char *relpath)
+{
+	char path[PFS_WALK_MAX];
+	struct pfs_node *n;
+
+	if (pfs_strlcpy(path, relpath, sizeof(path)) >= sizeof(path))
+		return NULL;
+	pfs_normalize(path);
+	n = pfs_lookup(fs, path);
+	for (unsigned hops = 0; n && n->type == PFS_LINK; hops++) {
+		char next[PFS_WALK_MAX];
+		struct pfs_node *m;
+		const char *target = n->link;
+		size_t k = 0;
+
+		if (hops >= PFS_LINK_HOPS)
+			return n; /* a loop, or too deep: leave it a link */
+		if (target[0] == '/') {
+			const char *rel = pfs_rel(fs, target);
+
+			if (!rel)
+				return n; /* outside this file system */
+			while (*rel == '/')
+				rel++;
+			if (pfs_strlcpy(next, rel, sizeof(next)) >=
+			    sizeof(next))
+				return n;
+		} else {
+			/* Relative to the directory holding the link. */
+			size_t dir = 0;
+
+			for (size_t i = 0; path[i]; i++)
+				if (path[i] == '/')
+					dir = i;
+			for (k = 0; k < dir; k++)
+				next[k] = path[k];
+			if (dir)
+				next[k++] = '/';
+			next[k] = 0;
+			if (k + pfs_strlcpy(next + k, target,
+					    sizeof(next) - k) >= sizeof(next))
+				return n;
+		}
+		pfs_normalize(next);
+		m = pfs_lookup(fs, next);
+		if (!m)
+			return n; /* dangling: report the link */
+		pfs_node_put(n);
+		n = m;
+		pfs_strlcpy(path, next, sizeof(path));
+	}
+	return n;
 }
 
 static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
@@ -454,7 +522,8 @@ static int pfs_open_common(struct pfs *fs, const char *path, int flags,
 		return ST_NOT_FOUND;
 	if ((flags & (O_CREAT | O_TRUNC)) && !(flags & (O_WRONLY | O_RDWR)))
 		return ST_PERM;
-	struct pfs_node *n = pfs_lookup(fs, rel);
+	struct pfs_node *n = (flags & O_NOFOLLOW) ? pfs_lookup(fs, rel) :
+						    pfs_lookup_follow(fs, rel);
 	if (!n)
 		return ST_NOT_FOUND;
 	/* Only a file with a store callback opens for writing (O_TRUNC on
@@ -493,10 +562,12 @@ static int pfs_stat_common(struct pfs *fs, const char *path, struct kstat *st,
 
 	if (!rel)
 		return ST_NOT_FOUND;
-	struct pfs_node *n = pfs_lookup(fs, rel);
+	/* stat() follows a final link, lstat() does not (pfs_lookup_follow
+	 * keeps links it cannot resolve here as links). */
+	struct pfs_node *n = follow ? pfs_lookup_follow(fs, rel) :
+				      pfs_lookup(fs, rel);
 	if (!n)
 		return ST_NOT_FOUND;
-	(void)follow; /* links are reported as links; the VFS resolves */
 	int r = pfs_fill_stat(n, st);
 	pfs_node_put(n);
 	return r;

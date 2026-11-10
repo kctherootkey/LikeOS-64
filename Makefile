@@ -50,7 +50,7 @@ KERNEL_DEBUG_CFLAGS += -DI915_DEBUG=$(I915_DEBUG)
 CODENAME = blessed kitty
 
 # Version string: override on command line with LIKEOS_VERSION=x.y.z
-LIKEOS_VERSION ?= 0.2.7-HEAD
+LIKEOS_VERSION ?= 0.2.9-HEAD
 
 # Tools
 GCC = gcc
@@ -661,6 +661,38 @@ SOUND_OBJS = $(BUILD_DIR)/snd_core.o \
 	     $(BUILD_DIR)/es1371.o \
 	     $(SOF_OBJS)
 KERNEL_OBJS += $(SOUND_OBJS)
+
+# Storage (kernel/dev/ata, kernel/dev/block): the AHCI host controller
+# driver, the ATA/ATAPI command layer with its SCSI translation, and the
+# extended block layer (request queues, disks, partitions, device nodes,
+# sysfs/procfs).  Contracts: kernel/dev/ata/ahci.h, kernel/dev/ata/ata.h,
+# kernel/dev/block/blkdev.h.
+STORAGE_OBJS = $(BUILD_DIR)/ahci_pci.o \
+	       $(BUILD_DIR)/ahci_hba.o \
+	       $(BUILD_DIR)/ahci_irq.o \
+	       $(BUILD_DIR)/ahci_dma.o \
+	       $(BUILD_DIR)/ahci_port.o \
+	       $(BUILD_DIR)/ahci_pmp.o \
+	       $(BUILD_DIR)/ahci_cmd.o \
+	       $(BUILD_DIR)/ahci_eh.o \
+	       $(BUILD_DIR)/ahci_debug.o \
+	       $(BUILD_DIR)/ata_core.o \
+	       $(BUILD_DIR)/ata_rw.o \
+	       $(BUILD_DIR)/ata_features.o \
+	       $(BUILD_DIR)/ata_pm.o \
+	       $(BUILD_DIR)/ata_smart.o \
+	       $(BUILD_DIR)/ata_trim.o \
+	       $(BUILD_DIR)/ata_security.o \
+	       $(BUILD_DIR)/atapi.o \
+	       $(BUILD_DIR)/ata_sat.o \
+	       $(BUILD_DIR)/blk_queue.o \
+	       $(BUILD_DIR)/blk_work.o \
+	       $(BUILD_DIR)/blk_softirq.o \
+	       $(BUILD_DIR)/genhd.o \
+	       $(BUILD_DIR)/partition.o \
+	       $(BUILD_DIR)/blkdev_node.o \
+	       $(BUILD_DIR)/blk_sysfs.o
+KERNEL_OBJS += $(STORAGE_OBJS)
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -714,21 +746,23 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup kdump drminfo \
-	backlight gdb gdbserver loadkeys dumpkeys kbd_mode setleds setmetamode showkey
-# System binaries -> /sbin/<name>
-ROOT_SBIN_PROGS = init getty
+	backlight gdb gdbserver loadkeys dumpkeys kbd_mode setleds setmetamode showkey \
+	lsblk
+# System binaries -> /sbin/<name>, the disk administration tools (hdparm,
+# blkid, fdisk, sfdisk, wipefs, blockdev, blkdiscard, findfs) among them.
+ROOT_SBIN_PROGS = init getty hdparm blkid fdisk sfdisk wipefs blockdev blkdiscard findfs
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
 	libdlbase.so libdlchain.so libaudio.so
 # Audio tools -> /usr/bin, the audio service -> /usr/sbin
 USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
-USR_SBIN_PROGS = audiod
+USR_SBIN_PROGS = audiod smartctl smartd partx addpart delpart resizepart
 # Helpers -> /usr/libexec/<name>
 USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
-	webstress wkstress codecheck apload
+	webstress wkstress codecheck apload disktest
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -988,6 +1022,29 @@ $(BUILD_DIR)/es1371.o: $(KERNEL_DIR)/dev/sound/es1371.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/sdca.o: $(KERNEL_DIR)/dev/sound/sdca.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# Storage (kernel/dev/ata, kernel/dev/block): one rule per file-name
+# prefix, explicit rules for the rest.
+$(BUILD_DIR)/ahci_%.o: $(KERNEL_DIR)/dev/ata/ahci_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ata_%.o: $(KERNEL_DIR)/dev/ata/ata_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/atapi.o: $(KERNEL_DIR)/dev/ata/atapi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/blk_%.o: $(KERNEL_DIR)/dev/block/blk_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/genhd.o: $(KERNEL_DIR)/dev/block/genhd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/partition.o: $(KERNEL_DIR)/dev/block/partition.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/blkdev_node.o: $(KERNEL_DIR)/dev/block/blkdev_node.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/firmware.o: $(KERNEL_DIR)/ke/firmware.c | $(BUILD_DIR)
@@ -1666,6 +1723,13 @@ $(BUILD_DIR)/openssltest: userland-libc userland-rtld | $(BUILD_DIR)
 
 # openssltest is staged into the ext4 image via GPT_PREREQS (ROOT_USRLOCAL_BINS).
 
+# disktest: block device stress and data-integrity tester (writes only to a
+# partition named likeos-test* or one named in DISKTEST_DISK/TESTLIBC_DISK).
+$(BUILD_DIR)/disktest: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/disktest
+	cp $(USER_DIR)/tests/disktest $@
+	$(USER_STRIP) --strip-unneeded $@
+
 $(BUILD_DIR)/usbtest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/usbtest
 	cp $(USER_DIR)/tests/usbtest $@
@@ -2063,6 +2127,52 @@ ports-kbd: userland-libc userland-rtld
 KBD_PROGS = loadkeys dumpkeys kbd_mode setleds setmetamode showkey
 $(addprefix $(BUILD_DIR)/,$(KBD_PROGS)): ports-kbd | $(BUILD_DIR)
 	cp ports/kbd-2.10.0/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# hdparm: ATA drive parameters, identify data, timing (-t/-T), power modes
+# (-C/-y/-Y), write cache, APM, AAM, security, sanitize -- through SG_IO
+# (ATA PASS-THROUGH) on /dev/sdX and the HDIO_* requests.
+.PHONY: ports-hdparm
+ports-hdparm: userland-libc userland-rtld
+	$(MAKE) -C ports/hdparm-9.65 -f Makefile.likeos
+
+$(BUILD_DIR)/hdparm: ports-hdparm | $(BUILD_DIR)
+	cp ports/hdparm-9.65/build/hdparm $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# smartmontools: smartctl (SMART status, attributes, logs and self-tests of
+# SATA disks through the SCSI/ATA translation on /dev/sdX, SCSI and ATAPI
+# devices) and the smartd monitor.  C++: built with likeos-c++ against the
+# libstdc++ the GTK3 port installs into the sysroot -- the prerequisite gdb
+# has too, checked the way testcxx checks it.
+.PHONY: ports-smartmontools
+ports-smartmontools: userland-libc userland-rtld $(GTK3_SENTINEL)
+	@test -f $(XORG_SYSROOT)/usr/lib/libstdc++.so || { \
+		echo "ERROR: no libstdc++ in $(XORG_SYSROOT)."; \
+		echo "  The C++ runtime is built by the GTK3 port:"; \
+		echo "      make ports-gtk3"; \
+		exit 1; \
+	}
+	$(MAKE) -C ports/smartmontools-7.5 -f Makefile.likeos
+
+SMARTMONTOOLS_PROGS = smartctl smartd
+$(addprefix $(BUILD_DIR)/,$(SMARTMONTOOLS_PROGS)): ports-smartmontools | $(BUILD_DIR)
+	cp ports/smartmontools-7.5/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# The disk and partition tools -- lsblk, blkid, fdisk, sfdisk, wipefs, partx
+# (+ addpart/delpart/resizepart), blockdev, blkdiscard, findfs -- from the
+# port in ports/util-linux-2.42.4.  libblkid, libfdisk, libsmartcols, libuuid
+# and the table-parsing part of libmount are static archives linked into the
+# programs.
+.PHONY: ports-disktools
+ports-disktools: userland-libc userland-rtld
+	$(MAKE) -C ports/util-linux-2.42.4 -f Makefile.likeos
+
+DISKTOOLS_PROGS = lsblk blkid fdisk sfdisk wipefs blockdev blkdiscard findfs \
+	partx addpart delpart resizepart
+$(addprefix $(BUILD_DIR)/,$(DISKTOOLS_PROGS)): ports-disktools | $(BUILD_DIR)
+	cp ports/util-linux-2.42.4/build/$(notdir $@) $@
 	$(USER_STRIP) --strip-unneeded $@
 
 # gdb.
@@ -2695,6 +2805,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 		chmod 0755 $(EXT4_STAGING)/usr/bin/$$b; done
 	for b in $(USR_SBIN_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/sbin/$$b; \
 		chmod 0755 $(EXT4_STAGING)/usr/sbin/$$b; done
+	# smartd's configuration: the upstream sample, whose one active line
+	# monitors every device it finds (DEVICESCAN).
+	install -m 0644 ports/smartmontools-7.5/src/smartd.conf $(EXT4_STAGING)/etc/smartd.conf
 	# Ends the desktop session with the log-out sound (menus and taskbar).
 	cp res/xorg/likeos-logout.sh $(EXT4_STAGING)/usr/bin/likeos-logout
 	chmod 0755 $(EXT4_STAGING)/usr/bin/likeos-logout
@@ -2734,6 +2847,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	cp $(BUILD_DIR)/snifftest     $(EXT4_STAGING)/usr/local/bin/snifftest
 	cp $(BUILD_DIR)/webstress     $(EXT4_STAGING)/usr/local/bin/webstress
 	cp $(BUILD_DIR)/apload        $(EXT4_STAGING)/usr/local/bin/apload
+	cp $(BUILD_DIR)/disktest      $(EXT4_STAGING)/usr/local/bin/disktest
 	cp user/bin/tests/apnews-urls.txt $(EXT4_STAGING)/usr/local/bin/apnews-urls.txt
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
@@ -3074,7 +3188,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	truncate -s $$(( $(ESP_MB) + ext4_mb + 2 ))M $(GPT_DISK); \
 	sgdisk -Z $(GPT_DISK) >/dev/null 2>&1; \
 	sgdisk -a 2048 -n 1:2048:+$(ESP_MB)M -t 1:EF00 -c 1:"ESP"         $(GPT_DISK) >/dev/null; \
-	sgdisk         -n 2:0:+$${ext4_mb}M  -t 2:8300 -c 2:"likeos-root" $(GPT_DISK) >/dev/null; \
+	sgdisk         -n 2:0:+$${ext4_mb}M  -t 2:4f68bce3-e8cd-4db1-96e7-fbcaf984b709 -c 2:"likeos-root" $(GPT_DISK) >/dev/null; \
 	$(DD) if=$(EXT4_ESP_IMG)  of=$(GPT_DISK) bs=512 seek=2048 conv=sparse,notrunc status=none; \
 	$(DD) if=$(EXT4_ROOT_IMG) of=$(GPT_DISK) bs=512 seek=$$(( 2048 + $(ESP_MB) * 2048 )) conv=sparse,notrunc status=none; \
 	echo "ext4 GPT disk created: $(GPT_DISK)  (ESP=$(ESP_MB)M ext4=$${ext4_mb}M)"
@@ -3105,6 +3219,70 @@ qemu-usb: $(GPT_DISK)
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
+
+# ---------------------------------------------------------------------------
+# SATA/AHCI targets.
+#
+# The second disk is a scratch disk for the storage tests: AHCI_DATA_DISK, a
+# sparse raw file of AHCI_DATA_MB megabytes, created blank on first use and
+# kept afterwards (delete it to start over).  With AHCI_TEST_PART=1 it is
+# created with a GPT holding one partition named "likeos-test" over the
+# whole disk -- the designated target `testlibc storage' and `disktest auto'
+# write to.  A blank disk can get that partition from inside LikeOS too:
+#   echo 'label: gpt
+#   name=likeos-test' | sfdisk /dev/sdb
+# ---------------------------------------------------------------------------
+AHCI_DATA_DISK ?= $(BUILD_DIR)/ahci-data.img
+AHCI_DATA_MB ?= 1024
+AHCI_TEST_PART ?=
+# The ISO in the ATAPI drive: the first build/*.iso, else an empty drive
+# (no medium -- the optical drive itself is what the driver has to find).
+AHCI_ISO ?= $(firstword $(wildcard $(BUILD_DIR)/*.iso))
+ifneq ($(strip $(AHCI_ISO)),)
+  QEMU_AHCI_CD = -drive if=none,id=cd0,media=cdrom,readonly=on,file=$(AHCI_ISO)
+else
+  QEMU_AHCI_CD = -drive if=none,id=cd0,media=cdrom
+endif
+
+$(AHCI_DATA_DISK): | $(BUILD_DIR)
+	truncate -s $(AHCI_DATA_MB)M $@
+	@if [ -n "$(AHCI_TEST_PART)" ]; then \
+		sgdisk -Z $@ >/dev/null 2>&1; \
+		sgdisk -n 1:2048:0 -t 1:8300 -c 1:"likeos-test" $@ >/dev/null && \
+		echo "$@: GPT with partition 1 \"likeos-test\" (scratch for the storage tests)"; \
+	else \
+		echo "$@: blank $(AHCI_DATA_MB) MB scratch disk"; \
+	fi
+
+# Boot LikeOS from a SATA disk: q35, whose ICH9 AHCI controller (00:1f.2) gets
+# the image as SATA port 0 (boot disk), the scratch disk on port 1 and an
+# ATAPI CD/DVD drive on port 2.  Root is found by partition identity on the
+# disk the bootloader came from, so the same image boots here as from USB.
+# The USB controller stays for the optional USB keyboard/mouse (USB_HID=1).
+qemu-ahci: $(GPT_DISK) $(AHCI_DATA_DISK)
+	@echo "Running LikeOS from a SATA disk (q35 ICH9 AHCI: image, scratch disk, ATAPI $(if $(strip $(AHCI_ISO)),$(AHCI_ISO),empty))..."
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
+		-drive if=none,id=sata0,file=$(GPT_DISK),format=raw,readonly=off \
+		-device ide-hd,drive=sata0,bus=ide.0,bootindex=0 \
+		-drive if=none,id=sata1,file=$(AHCI_DATA_DISK),format=raw,readonly=off \
+		-device ide-hd,drive=sata1,bus=ide.1 \
+		$(QEMU_AHCI_CD) -device ide-cd,drive=cd0,bus=ide.2 \
+		$(QEMU_USB_HID) \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
+
+# The usual USB boot (as `qemu') plus a separate ICH9 AHCI controller on the
+# PCI bus with the scratch disk: SATA as a data disk next to a USB root.
+qemu-ahci-usb: $(GPT_DISK) $(AHCI_DATA_DISK)
+	@echo "Running LikeOS from the ext4 GPT USB disk + an AHCI controller with a SATA scratch disk..."
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
+		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
+		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
+		-device ich9-ahci,id=ahci \
+		-drive if=none,id=sata0,file=$(AHCI_DATA_DISK),format=raw,readonly=off \
+		-device ide-hd,drive=sata0,bus=ahci.0 \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
 
 # Boot the ext4 GPT USB disk with GDB support and debug symbols.
@@ -3204,7 +3382,7 @@ usb-write: $(GPT_DISK)
 	 if [ -z "$$START" ]; then echo "ERROR: could not read partition 2 start; skipping grow"; else \
 	   sudo sgdisk -e $(USB_DEVICE) >/dev/null; \
 	   sudo sgdisk -d 2 $(USB_DEVICE) >/dev/null; \
-	   sudo sgdisk -a 1 -n 2:$$START:0 -t 2:8300 -c 2:"likeos-root" $(USB_DEVICE) >/dev/null; \
+	   sudo sgdisk -a 1 -n 2:$$START:0 -t 2:4f68bce3-e8cd-4db1-96e7-fbcaf984b709 -c 2:"likeos-root" $(USB_DEVICE) >/dev/null; \
 	   DISKSZ=$$(sudo blockdev --getsize64 $(USB_DEVICE)); ok=0; PSZ=0; \
 	   for n in 1 2 3 4 5 6; do \
 	     sudo partprobe $(USB_DEVICE) 2>/dev/null || true; \
@@ -3291,6 +3469,9 @@ distclean: clean
 	$(MAKE) -C ports/bash-5.2.37 -f Makefile.likeos distclean
 	$(MAKE) -C ports/tmux-3.6a -f Makefile.likeos clean
 	$(MAKE) -C ports/kbd-2.10.0 -f Makefile.likeos clean
+	$(MAKE) -C ports/hdparm-9.65 -f Makefile.likeos distclean
+	$(MAKE) -C ports/smartmontools-7.5 -f Makefile.likeos distclean
+	$(MAKE) -C ports/util-linux-2.42.4 -f Makefile.likeos distclean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
@@ -3747,6 +3928,8 @@ help:
 	@echo "  qemu-realusb - Run QEMU with real USB device as xHCI storage (requires USB_DEVICE=/dev/sdX)"
 	@echo "  qemu-realusb-gdb - Same as qemu-realusb but with GDB server on :1234 (requires USB_DEVICE=/dev/sdX)"
 	@echo "  qemu-usb-passthrough - Run QEMU with host USB device passthrough (experimental)"
+	@echo "  qemu-ahci  - Boot from a SATA disk: q35 ICH9 AHCI with the image, a scratch disk and an ATAPI drive"
+	@echo "  qemu-ahci-usb - Same as qemu plus an AHCI controller with a SATA scratch disk"
 	@echo "  usb-write  - dd the ext4 GPT USB disk to a real device (requires USB_DEVICE=/dev/sdX)"
 	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"
 	@echo "  linux-usb-write - Write the host Linux image to USB (requires USB_DEVICE=/dev/sdX)"
@@ -3759,6 +3942,9 @@ help:
 	@echo "  NUM_CPUS=N        - Set number of QEMU CPUs (default: 4)"
 	@echo "  NO_SMP=1          - Disable SMP (omit -smp argument entirely)"
 	@echo "  USB_HID=1         - Add USB keyboard and mouse to QEMU xHCI controller"
+	@echo "  AHCI_DATA_MB=N    - Size of the SATA scratch disk (build/ahci-data.img) of the qemu-ahci targets (default: 1024)"
+	@echo "  AHCI_TEST_PART=1  - Create the scratch disk with a GPT partition named likeos-test (storage write tests)"
+	@echo "  AHCI_ISO=file.iso - Medium for the ATAPI drive of qemu-ahci (default: first build/*.iso, else empty)"
 	@echo "  EXT4_MB=N         - Force the ext4 root partition size in MB (default: auto-size to content)"
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
 	@echo "  SCREEN_SIZE=large or unset - Real-hardware start resolution when none is saved in Display settings: sizes above 1920x1200, then 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768); VMs start at 1280x800"
@@ -3782,7 +3968,7 @@ kernel: $(KERNEL_ELF)
 bootloader: $(BOOTLOADER_EFI)
 usb: $(GPT_DISK)
 
-.PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
+.PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-ahci qemu-ahci-usb qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
 
 # Feed back the header dependencies recorded by -MMD (see DEPFLAGS above).
 #

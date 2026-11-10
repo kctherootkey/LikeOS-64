@@ -23,11 +23,29 @@
 #include <kernel/uapi/bug.h>
 
 // Read sectors from block device (chunked).
+//
+// `lba' and `count' are in the DEVICE's logical sectors -- the unit the
+// filesystems' block_to_lba() returns (ext4: part_lba_offset + block *
+// sectors_per_block with sectors_per_block = block_size / bdev->sector_size;
+// FAT32: BPB sectors, which the FAT32 mount requires to equal the device's
+// sector size).  So the byte stride through `buf' is count * sector_size of
+// the device: 512 on the usual disk, 4096 on a 4Kn disk.  A device that does
+// not report a sector size is taken as 512-byte, the unit every caller used
+// before devices with other sizes existed.
 #define PC_MAX_SECTORS_PER_READ 128
+
+static unsigned long pc_sector_bytes(const block_device_t *bdev)
+{
+	unsigned long ss = bdev->sector_size;
+	return ss ? ss : 512;
+}
 
 static int pc_read_sectors(const block_device_t *bdev, unsigned long lba,
 			   unsigned long count, void *buf)
 {
+	if (!bdev || !bdev->read)
+		return ST_IO; /* -5, the value this always returned */
+	const unsigned long ss = pc_sector_bytes(bdev);
 	unsigned long offset = 0;
 	while (count > 0) {
 		unsigned long chunk = (count > PC_MAX_SECTORS_PER_READ) ?
@@ -38,7 +56,7 @@ static int pc_read_sectors(const block_device_t *bdev, unsigned long lba,
 		if (st != 0)
 			return st;
 		lba += chunk;
-		offset += chunk * 512;
+		offset += chunk * ss;
 		count -= chunk;
 	}
 	return 0; // ST_OK
@@ -48,7 +66,8 @@ static int pc_write_sectors(const block_device_t *bdev, unsigned long lba,
 			    unsigned long count, const void *buf)
 {
 	if (!bdev || !bdev->write)
-		return -5; // ST_UNSUPPORTED
+		return ST_IO; /* -5, the value this always returned */
+	const unsigned long ss = pc_sector_bytes(bdev);
 	unsigned long offset = 0;
 	while (count > 0) {
 		unsigned long chunk = (count > PC_MAX_SECTORS_PER_READ) ?
@@ -59,7 +78,7 @@ static int pc_write_sectors(const block_device_t *bdev, unsigned long lba,
 		if (st != 0)
 			return st;
 		lba += chunk;
-		offset += chunk * 512;
+		offset += chunk * ss;
 		count -= chunk;
 	}
 	return 0;

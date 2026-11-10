@@ -106,6 +106,11 @@
 #define IPI_TLB_SHOOTDOWN 0xFE // IPI: TLB shootdown
 #define IPI_HALT_VECTOR 0xFD // IPI: Halt CPU
 #define IPI_RESCHEDULE_VECTOR 0xFC // IPI: Reschedule
+/* Completions of storage requests finished on another CPU's behalf: the
+ * receiver runs its block softirq (kernel/dev/block/blk_softirq.c).  Below
+ * the reschedule vector -- it asks for deferred work, nothing waits on
+ * its acknowledgement -- and above every device vector. */
+#define IPI_BLOCK_SOFTIRQ_VECTOR 0xFB // IPI: block softirq
 
 // ============================================================================
 // LAPIC Functions

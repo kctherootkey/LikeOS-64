@@ -9,6 +9,7 @@
 #include <kernel/ke/timer.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
+#include <kernel/hal/serial.h>
 #include <kernel/ke/signal.h>
 #include <kernel/io/tty.h>
 #include <kernel/hal/lapic.h>
@@ -18,6 +19,7 @@
 #include <kernel/net/net.h>
 #include <kernel/dev/nic/e1000.h>
 #include <kernel/net/softirq.h>
+#include <kernel/dev/block/blk_softirq.h>
 #include <kernel/uapi/bug.h>
 
 // Write a formatted message to a task's controlling TTY.
@@ -375,7 +377,7 @@ static void imcr_route_to_pic(void)
 
 void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags)
 {
-	BUG_ON(num >= IDT_ENTRIES);
+	BUILD_BUG_ON(IDT_ENTRIES != 256); /* a uint8_t `num' covers it */
 	idt[num].offset_low = base & 0xFFFF;
 	idt[num].offset_mid = (base >> 16) & 0xFFFF;
 	idt[num].offset_high = (base >> 32) & 0xFFFFFFFF;
@@ -390,7 +392,7 @@ void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags)
 void idt_set_entry_ist(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags,
 		       uint8_t ist_index)
 {
-	BUG_ON(num >= IDT_ENTRIES);
+	BUILD_BUG_ON(IDT_ENTRIES != 256); /* a uint8_t `num' covers it */
 	WARN_ON(ist_index == 0 ||
 		ist_index > 7); /* IST index must be 1-7 for IST entries */
 	idt[num].offset_low = base & 0xFFFF;
@@ -512,6 +514,13 @@ void idt_init()
 	}
 
 	// IPI vectors for SMP
+	{
+		/* Completions another CPU finished on this one's behalf
+		 * (blk_softirq.c, IPI_BLOCK_SOFTIRQ_VECTOR). */
+		extern void ipi_vector_0xFB(void);
+
+		idt_set_entry(0xFB, (uint64_t)ipi_vector_0xFB, 0x08, 0x8E);
+	}
 	idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08,
 		      0x8E); // Reschedule (IPI_RESCHEDULE_VECTOR)
 	idt_set_entry(0xFD, (uint64_t)ipi_vector_0xFD, 0x08, 0x8E); // Halt CPU
@@ -800,6 +809,7 @@ static volatile uint32_t g_oops_writer =
 void kernel_oops(const char *reason, uint64_t *regs)
 {
 	__asm__ volatile("cli" ::: "memory");
+	serial_set_sync(); /* the report must reach the serial log */
 
 	/* Determine our CPU id, but don't fault doing it: percpu/GS may not be
      * set up (early boot) or may itself be the thing that broke. */
@@ -977,6 +987,7 @@ void kernel_oops(const char *reason, uint64_t *regs)
 void panic(const char *fmt, ...)
 {
 	__asm__ volatile("cli" ::: "memory");
+	serial_set_sync();
 	char msg[256];
 	va_list ap;
 	__builtin_va_start(ap, fmt);
@@ -1321,14 +1332,14 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 		uint64_t pml4e = cur->pml4[pml4i];
 		task_tty_printf(cur, "\nPage table walk for VA %016llx:\n",
 				cr2);
-		task_tty_printf(cur, "  PML4[%lu] = %016llx %s\n", pml4i, pml4e,
+		task_tty_printf(cur, "  PML4[%llu] = %016llx %s\n", pml4i, pml4e,
 				(pml4e & 1) ? "present" : "NOT PRESENT");
 		if (pml4e & 1) {
 			uint64_t pdpt_phys = pml4e & 0x000FFFFFFFFFF000ULL;
 			uint64_t *pdpt = (uint64_t *)phys_to_virt(pdpt_phys);
 			uint64_t pdpte = pdpt[pdpti];
 			int pdpt_huge = (pdpte & 0x80) != 0;
-			task_tty_printf(cur, "  PDPT[%lu] = %016llx %s%s\n",
+			task_tty_printf(cur, "  PDPT[%llu] = %016llx %s%s\n",
 					pdpti, pdpte,
 					(pdpte & 1) ? "present" : "NOT PRESENT",
 					pdpt_huge ? " 1G-huge" : "");
@@ -1340,7 +1351,7 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 				uint64_t pde = pd[pdi];
 				int pd_huge = (pde & 0x80) != 0;
 				task_tty_printf(
-					cur, "  PD[%lu]   = %016llx %s%s\n",
+					cur, "  PD[%llu]   = %016llx %s%s\n",
 					pdi, pde,
 					(pde & 1) ? "present" : "NOT PRESENT",
 					pd_huge ? " 2M-huge" : "");
@@ -1352,7 +1363,7 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 					uint64_t pte = pt[pti];
 					task_tty_printf(
 						cur,
-						"  PT[%lu]   = %016llx %s%s%s%s%s\n",
+						"  PT[%llu]   = %016llx %s%s%s%s%s\n",
 						pti, pte,
 						(pte & 1) ? " present" :
 							    " NOT-PRESENT",
@@ -1613,7 +1624,18 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 	// interrupted kernel code had IRQs enabled (i.e. not inside an IRQ-off
 	// critical section such as a held spinlock).  sched_preempt() applies
 	// its own in_context_switch / bootstrap / try-lock guards on top.
-	if (allow_preempt && sched_need_resched() &&
+	//
+	// Nor while this CPU runs the block softirq.  A run started at an
+	// interrupt tail executes on the interrupted task's stack with
+	// interrupts enabled, and its state (the CPU's done list, the
+	// "running" mark) belongs to this processor: an interrupt taken in
+	// the middle of it must return into it.  Switching away would leave
+	// the run half done on a task that may resume on another CPU, and
+	// this CPU marked as running it for as long -- no softirq here in the
+	// meantime.  The reschedule is not lost: need_resched stays set, the
+	// run notices it and hands the rest to kblksoftirqd, and the outer
+	// interrupt's own exit, after the run, switches.
+	if (allow_preempt && sched_need_resched() && !blk_in_softirq() &&
 	    (from_user || (regs[REGS_RFLAGS] & 0x200))) {
 		sched_preempt((interrupt_frame_t *)regs);
 
@@ -2079,7 +2101,10 @@ static inline uint8_t pic2_read_isr(void)
 	return inb(PIC2_CMD);
 }
 
-void irq_handler(uint64_t *regs)
+/* The device and timer dispatch.  Returns 1 when the common return work
+ * (irqentry_exit) is to follow, 0 for a spurious interrupt, which goes
+ * back to the interrupted code as it was. */
+static int irq_handler_body(uint64_t *regs)
 {
 	BUG_ON(regs == NULL);
 	uint64_t int_no = regs[REGS_INTNO];
@@ -2292,7 +2317,7 @@ void irq_handler(uint64_t *regs)
 			g_spurious_irq_count++;
 			if (g_lapic_active || lapic_is_available())
 				lapic_eoi();
-			return;
+			return 0;
 		}
 	}
 
@@ -2307,7 +2332,7 @@ void irq_handler(uint64_t *regs)
 			     0x20); // EOI to master only (no slave — spurious)
 			if (g_lapic_active || lapic_is_available())
 				lapic_eoi();
-			return;
+			return 0;
 		}
 	}
 
@@ -2340,9 +2365,9 @@ void irq_handler(uint64_t *regs)
 		/* Common return-to-user work: deliver a pending signal (on the
 		 * IRETQ frame, not the SYSRET state — timer returns via iretq)
 		 * and honour a pending reschedule.  Same code path as every
-		 * other interrupt return; see irqentry_exit(). */
-		irqentry_exit(regs, 1);
-		return; // EOI already sent
+		 * other interrupt return; see irq_handler() and
+		 * irqentry_exit(). */
+		return 1; // EOI already sent
 	}
 	case 33:
 		g_irq1_count++;
@@ -2381,18 +2406,43 @@ void irq_handler(uint64_t *regs)
 	 * NIC rx that made a polled task runnable) is seen by the preempt
 	 * check. */
 exit:
-	irqentry_exit(regs, 1);
+	return 1;
+}
+
+/* Every device and timer interrupt, entered from the stub.  In order: the
+ * handler (acknowledged inside), the end of hard interrupt context, the
+ * block softirq when this was the outermost interrupt and no run of it
+ * was interrupted, and only then the return work -- signal delivery and
+ * preemption -- so a task the softirq woke is seen by that preemption
+ * check. */
+void irq_handler(uint64_t *regs)
+{
+	int ret;
+
+	blk_hardirq_enter();
+	ret = irq_handler_body(regs);
+	blk_hardirq_exit();
+	blk_softirq_irq_tail();
+	if (ret)
+		irqentry_exit(regs, 1);
 }
 
 // ============================================================================
 // IPI Handler (called from ipi_common_stub in assembly)
 // ============================================================================
 
-void ipi_handler(uint64_t *regs)
+/* The IPI vectors.  The block softirq IPI only raises the softirq here;
+ * it runs at the tail, in ipi_handler(). */
+static void ipi_handler_body(uint64_t *regs)
 {
 	uint64_t vector = regs[15]; // Vector number pushed by IPI stub
 
 	switch (vector) {
+	case IPI_BLOCK_SOFTIRQ_VECTOR:
+		blk_softirq_ipi();
+		lapic_eoi();
+		break;
+
 	case IPI_RESCHEDULE_VECTOR:
 		// Mark current task as needing reschedule; the actual signal
 		// delivery + preemption happen in the shared irqentry_exit()
@@ -2437,6 +2487,16 @@ void ipi_handler(uint64_t *regs)
 		break;
 	}
 
+}
+
+void ipi_handler(uint64_t *regs)
+{
+	blk_hardirq_enter();
+	ipi_handler_body(regs);
+	blk_hardirq_exit();
+	/* The block softirq, before the return work below so a task it woke
+	 * is seen by the preemption check (see irq_handler()). */
+	blk_softirq_irq_tail();
 	/* Common return-to-user work — one shared path for every IPI vector
 	 * that returns (the halt vector loops forever and never reaches here).
 	 * Delivers a pending signal on return to user and performs the pending

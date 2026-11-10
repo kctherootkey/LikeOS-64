@@ -1,0 +1,56 @@
+LikeOS has neither O_PATH descriptors nor direct (cache-bypassing) I/O.
+The symlink-free open helper reports its O_PATH based verification as
+unavailable (ENOSYS), as it does on every other system without O_PATH, and
+the loop device code opens a backing file for ordinary I/O when direct I/O
+is asked for (there are no loop devices on LikeOS, so that path is not
+reached by the disk tools).
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/lib/fileutils.c
++++ b/lib/fileutils.c
+@@ -487,6 +487,21 @@
+ }
+ #endif
+ 
++#if defined(__LIKEOS__) && !defined(O_PATH)
++/*
++ * LikeOS has no O_PATH descriptors, so the opened name cannot be verified
++ * without opening the file for real (devices, FIFOs).  Report the check as
++ * impossible, as the generic fallback does.
++ */
++static int open_no_symlinks_fallback(
++			const char *path __attribute__((__unused__)),
++			int flags __attribute__((__unused__)),
++			mode_t mode __attribute__((__unused__)))
++{
++	errno = ENOSYS;
++	return -1;
++}
++#else
+ #ifdef __linux__
+ /*
+  * Fallback for kernels without openat2() (Linux < 5.6).
+@@ -593,6 +608,7 @@
+ 	return -1;
+ }
+ #endif /* __linux__ */
++#endif /* __LIKEOS__ && !O_PATH */
+ 
+ /* Opens @path with the guarantee that no component of the path is a symbolic
+  * link, otherwise it fails with ELOOP.
+--- a/lib/loopdev.c
++++ b/lib/loopdev.c
+@@ -43,6 +43,12 @@
+ #include "debug.h"
+ #include "fileutils.h"
+ 
++#if defined(__LIKEOS__) && !defined(O_DIRECT)
++/* LikeOS has no direct (cache-bypassing) I/O: a backing file asked for with
++ * LO_FLAGS_DIRECT_IO is opened for ordinary I/O. */
++# define O_DIRECT 0
++#endif
++
+ #define LOOPDEV_MAX_TRIES	10
+ 
+ /*

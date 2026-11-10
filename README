@@ -46,8 +46,9 @@ Current state
   framebuffer (there is no VMware SVGA support under QEMU), Intel HD Audio
   sound; KVM recommended for the desktop.
 - UEFI boot is required; there is no legacy BIOS boot path.
-- LikeOS runs from a USB drive.  AHCI/SATA and NVMe are not supported yet, so
-  the machine's internal disks are left untouched.
+- LikeOS runs from a USB drive or from a SATA disk (AHCI).  Internal disks
+  appear as /dev/sda, /dev/sdb ... but are never mounted automatically: only
+  the root partition the system booted from is.  NVMe is not supported yet.
 
 The i915 driver's device table reaches far beyond the machines it has been
 verified on; real-hardware testing so far has been on the two notebooks above.
@@ -73,8 +74,12 @@ At a glance
                     kernel straight from the ext4 root filesystem
   Kernel            monolithic, preemptive, SMP; 199 system calls with a
                     POSIX-style interface; ACPI through ACPICA 20251212
-  Root filesystem   ext4 (read/write, journalled), on a single GPT USB disk
-                    image: FAT32 EFI System Partition + ext4 root
+  Root filesystem   ext4 (read/write, journalled), on a single GPT disk
+                    image -- FAT32 EFI System Partition + ext4 root -- written
+                    to a USB stick or a SATA disk
+  Storage           own AHCI/SATA driver (NCQ, TRIM, SMART, ATAPI), USB mass
+                    storage; block layer with sdX naming, partitions and the
+                    standard disk tools (lsblk, fdisk, hdparm, smartctl)
   Graphics          own DRM/KMS core with GEM, sync objects and DMA-BUF;
                     native Intel i915 and VMware SVGA (vmwgfx) drivers; UEFI
                     framebuffer fallback
@@ -207,10 +212,25 @@ Filesystems and storage
   (F_GETLK/F_SETLK/F_SETLKW).
 - Dentry cache (positive and negative entries), inode cache, and the unified
   page cache with dirty writeback.
-- Block device layer over USB mass storage (Bulk-Only Transport) on xHCI, with
-  1 MiB write coalescing for USB throughput.
-- AHCI/SATA and NVMe controllers are not yet supported, and mounting removable
-  media is still pending.
+- Block layer: request queues with merging and a deadline scheduler, many
+  requests in flight per disk, per-disk statistics, GPT (both headers, CRC
+  checked) and MBR (with extended partitions).  Disks are /dev/sda, /dev/sdb
+  ... with partitions /dev/sda1 ...; optical drives are /dev/sr0.  The nodes
+  are block devices in the disk group (cdrom for optical drives) and answer
+  the established block, ATA (HDIO_*) and SCSI pass-through (SG_IO) ioctls.
+- Stable names in /dev/disk/by-id, by-path, by-partuuid, by-partlabel,
+  by-uuid and by-label; /sys/block, /proc/partitions and /proc/diskstats.
+- Root by partition identity: the bootloader passes the GPT identity of the
+  partition it was loaded from, and the kernel mounts the partition of type
+  "x86-64 root" (4f68bce3-e8cd-4db1-96e7-fbcaf984b709) on that same disk.
+  root=PARTUUID=..., UUID=..., LABEL=... or /dev/sdXN overrides the choice.
+  Other disks and partitions stay unmounted.
+- AHCI/SATA: see Devices and buses.  USB mass storage (Bulk-Only Transport)
+  disks are sdX disks of the same block layer.
+- Disk tools: lsblk, blkid, fdisk, sfdisk, wipefs, partx, blockdev,
+  blkdiscard and findfs, hdparm 9.65, and smartctl/smartd (smartmontools
+  7.5).
+- NVMe is not supported yet, and mounting removable media is still pending.
 
 Devices and buses
 ~~~~~~~~~~~~~~~~~
@@ -219,6 +239,13 @@ Devices and buses
 - ACPI: ACPICA 20251212 -- tables (RSDP/XSDT/MADT/FADT), AML, device
   enumeration, S5 poweroff, reset.
 - Interrupt controllers: Local APIC (xAPIC and x2APIC), IOAPIC; HPET.
+- AHCI/SATA: host controllers by PCI class (Intel, AMD, ASMedia, Marvell,
+  the VMware and VirtualBox controllers) with MSI-X, MSI or legacy
+  interrupts; native command queuing, 512-byte and 4K-sector drives, LBA48,
+  FUA and cache flush, TRIM, SMART, security state, power management (link
+  and device), port multipliers with FIS-based switching, hot-plug, ATAPI
+  CD/DVD drives, and error recovery from a single command up to a controller
+  reset.  Diagnostics under /sys/class/ata_port, ata_link and ata_device.
 - USB: xHCI (USB 3.x) host controller driver, interrupt-driven; mass storage
   (Bulk-Only Transport); HID boot keyboards and mice, report-protocol mice with
   scroll wheel; USB-serial logging.
@@ -734,6 +761,10 @@ Make targets (make help prints the complete list):
                             build the image if it is not current, write it to
                             a USB stick and grow the root filesystem to fill it
   make qemu, make qemu-usb  legacy: boot the image file in QEMU
+  make qemu-ahci            boot the image file as a SATA disk in QEMU (q35)
+                            with a second SATA scratch disk and an ATAPI drive
+  make qemu-ahci-usb        boot as make qemu, with an AHCI controller and a
+                            SATA scratch disk added
   make qemu-realusb USB_DEVICE=/dev/sdX
                             boot a stick written by usb-write in QEMU (console
                             only)
@@ -844,6 +875,8 @@ QEMU (legacy targets):
 
   make qemu
   make qemu-usb
+  make qemu-ahci
+  make qemu-ahci-usb
   make qemu-realusb USB_DEVICE=/dev/sdX
 
 These use OVMF, an xHCI controller, an e1000 card with user-mode networking
@@ -853,6 +886,23 @@ stick; make qemu-usb does the same through sudo, so that ping to outside hosts
 works; make qemu-realusb boots a stick written by usb-write and is console
 only -- do not run startx under it.  The guest gets 1024 MB by default; raise
 it with QEMU_MEM=2G.
+
+make qemu-ahci boots the same image from a SATA disk on the q35 machine's AHCI
+controller, with a scratch disk (build/ahci-data.img, AHCI_DATA_MB=1024) and
+an ATAPI drive holding AHCI_ISO (empty without one); make qemu-ahci-usb boots
+from USB and adds an AHCI controller with the scratch disk.  AHCI_TEST_PART=1
+creates the scratch disk with a GPT partition named likeos-test.
+
+Disks: a partition named likeos-test (or the node in TESTLIBC_DISK) is the one
+place the storage tests may write -- testlibc storage runs the block device
+tests including writes there, and disktest auto stresses it with concurrent
+checksummed I/O.  Read-only checks of every disk:
+
+  lsblk
+  blkid
+  fdisk -l
+  hdparm -I /dev/sda
+  smartctl -a /dev/sda
 
 To run X from a real stick under QEMU, drive it through virt-manager with KVM.
 This configuration is known to work:
@@ -1021,7 +1071,8 @@ Project structure
 Planned work
 ------------
 
-- Storage drivers: AHCI/SATA and NVMe.
+- Storage drivers: NVMe.
+- An installer that puts LikeOS on an internal disk.
 - Mounting removable media.
 - Expanded POSIX coverage.
 - Package management.

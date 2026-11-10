@@ -1,0 +1,35 @@
+The BLKPG partition interface (struct blkpg_ioctl_arg, struct
+blkpg_partition) and the discard/zero-out requests are declared in
+<sys/mount.h> here, together with the other BLK* block device requests;
+partx/addpart/delpart/resizepart and blkdiscard include it on LikeOS.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/include/partx.h
++++ b/include/partx.h
+@@ -6,7 +6,11 @@
+ #define UTIL_LINUX_PARTX_H
+ 
+ #include <sys/ioctl.h>
++#ifdef __LIKEOS__
++# include <sys/mount.h>	/* BLKPG and struct blkpg_partition */
++#else
+ #include <linux/blkpg.h>
++#endif
+ #include <stdint.h>
+ 
+ #ifndef BLKPG_ADD_PARTITION
+--- a/sys-utils/blkdiscard.c
++++ b/sys-utils/blkdiscard.c
+@@ -36,7 +36,11 @@
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <sys/time.h>
++#ifdef __LIKEOS__
++# include <sys/mount.h>	/* BLKDISCARD, BLKSECDISCARD, BLKZEROOUT */
++#else
+ #include <linux/fs.h>
++#endif
+ 
+ #ifdef HAVE_LIBBLKID
+ # include <blkid.h>

@@ -59,7 +59,7 @@ PROGRAMS = hello ls cat cmp pwd stat progerr memstat uname nproc shutdown powero
 # Test programs (sources live in user/bin/tests/, built as tests/<name>)
 # test_libc has a custom rule (needs libpam+libcrypt for the auth tests).
 TESTS = test_syscalls testmem teststress netstress openssltest usbtest ext4test fbtest pmap ttydump \
-	forkstress wkstress codecheck
+	forkstress wkstress codecheck disktest
 TEST_BINS = $(addprefix tests/,$(TESTS))
 
 # The audio tools talk to audiod through libaudio (custom rule below).

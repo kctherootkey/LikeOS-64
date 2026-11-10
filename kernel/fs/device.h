@@ -15,6 +15,9 @@
 // close() refcounting, fstat(), poll() and descriptor passing over AF_UNIX
 // all work on it with no special cases.
 //
+// Block device nodes (S_IFBLK) and symbolic links (the /dev/disk/by-*
+// names) are registered nodes as well; see is_blk and is_link below.
+//
 // Copyright (C) 2026 The LikeOS Project
 
 #ifndef KERNEL_DEV_DEVICE_H
@@ -107,12 +110,31 @@ struct device_ops {
 	/* Optional: refine the fstat answer (size, times) after the node's
 	 * identity has been filled in. */
 	int (*fstat)(vfs_file_t *file, struct kstat *st);
+	/* fsync(2) on the handle: a block device node flushes the drive's
+	 * write cache.  NULL: fsync succeeds without doing anything.
+	 * Returns 0 or a negative errno. */
+	int (*fsync)(vfs_file_t *file);
+	/* Optional: read/write at an explicit byte offset without touching
+	 * the handle's position (pread/pwrite on a block device node).  Many
+	 * threads may call them on one handle at once; they must not
+	 * serialise on it.  Return bytes moved or a negative errno. */
+	long (*pread)(vfs_file_t *file, void *buf, long bytes, long off);
+	long (*pwrite)(vfs_file_t *file, const void *buf, long bytes,
+		       long off);
 };
+
+/* Longest path of a registered node: room for the /dev/disk/by-id names
+ * of a disk ("/dev/disk/by-id/ata-<40-char model>_<20-char serial>-part15")
+ * and the escaped filesystem labels of /dev/disk/by-label. */
+#define DEVFS_NODE_PATH_MAX 128
+/* Longest target of a registered symbolic link. */
+#define DEVFS_LINK_MAX 128
 
 /* A registered node under /dev. */
 struct devfs_node {
-	char path[48]; /* full path, "/dev/dri/card0" */
-	uint32_t mode; /* permission bits; S_IFCHR is implied */
+	char path[DEVFS_NODE_PATH_MAX]; /* full path, "/dev/dri/card0" */
+	uint32_t mode; /* permission bits; the type is S_IFCHR unless is_blk
+			* or is_link says otherwise */
 	uint32_t uid, gid;
 	uint32_t major, minor; /* st_rdev */
 	const struct device_ops *ops;
@@ -128,6 +150,16 @@ struct devfs_node {
 	/* When the node appeared, in epoch seconds: what stat() reports as
 	 * its access, modification and change times.  Set at registration. */
 	uint64_t ctime;
+	/* A block device node: stat() reports S_IFBLK (with major:minor in
+	 * st_rdev) instead of S_IFCHR.  Its operations are those of any
+	 * registered node. */
+	int is_blk;
+	/* A symbolic link (registered with device_register_link()): `link'
+	 * is its target, absolute or relative to the link's directory, and
+	 * must stay inside /dev.  open() and stat() follow it, lstat() and
+	 * readlink() report it, a listing shows it as DT_LNK.  ops unused. */
+	int is_link;
+	char link[DEVFS_LINK_MAX];
 };
 
 /* Register / unregister.  A path whose parent directory is not one of the
@@ -135,6 +167,11 @@ struct devfs_node {
 int device_register(struct devfs_node *node);
 int device_unregister(struct devfs_node *node);
 int device_register_dir(struct devfs_node *node);
+/* Register a symbolic link node (path and link filled in). */
+int device_register_link(struct devfs_node *node);
+/* Is this handle open on a block device node?  (For the read/write path:
+ * a block device has a position, so pread/pwrite apply to it.) */
+int devfs_file_is_blk(vfs_file_t *f);
 
 /* Per-open private state. */
 void *device_file_priv(vfs_file_t *file);

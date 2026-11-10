@@ -109,6 +109,10 @@ void smp_send_reschedule(uint32_t cpu_id);
 // Send reschedule IPI to all other CPUs
 void smp_send_reschedule_all(void);
 
+// Send the block-softirq IPI to one CPU (blk_softirq.c: completions were
+// put on that CPU's done list)
+void smp_send_block_softirq(uint32_t cpu_id);
+
 // Send TLB shootdown IPI to all other CPUs (asynchronous)
 void smp_tlb_shootdown(void);
 

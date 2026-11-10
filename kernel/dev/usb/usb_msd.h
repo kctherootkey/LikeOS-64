@@ -1,5 +1,16 @@
 // LikeOS - USB Mass Storage (Bulk-Only Transport) Driver
 //
+// A USB stick (or USB disk, card reader, USB optical drive) is a SCSI device
+// reached through the Bulk-Only Transport: every command is a Command Block
+// Wrapper on the bulk OUT endpoint, an optional data stage, and a Command
+// Status Wrapper on the bulk IN endpoint.  The driver presents the device to
+// the disk layer (kernel/dev/block/blkdev.h) as a disk like any other --
+// sdX with partitions sdXN (or srN for an optical drive), removable -- and
+// executes the requests of its queue on a kernel thread of its own
+// ("kusbmsd<N>"), because a BOT transfer sleeps and the disk layer's submit
+// path must not.  SG_IO pass-through of SCSI CDBs goes through the same
+// thread, in order with ordinary I/O.
+//
 // Copyright (C) 2026 The LikeOS Project
 
 #ifndef LIKEOS_USB_MSD_H
@@ -10,6 +21,16 @@
 #include <kernel/dev/usb/xhci.h>
 #include <kernel/dev/block/block.h>
 #include <kernel/ke/sched.h>
+
+struct gendisk;
+struct blk_request;
+
+// Requests the driver accepts at once (the disk queue's dispatch depth)
+#define USB_MSD_QUEUE_DEPTH 8
+// SCSI host numbers of USB disks start here, after the ATA ports
+#define USB_MSD_SCSI_HOST_BASE 32
+// Largest SG_IO data transfer accepted (bytes)
+#define USB_MSD_SGIO_MAX_BYTES (1024u * 1024u)
 
 // USB Mass Storage class codes
 #define USB_CLASS_MASS_STORAGE 0x08
@@ -129,9 +150,50 @@ typedef struct usb_msd_device {
 	uint32_t data_buf_size; // usable size of bounce buffer in bytes
 	uint32_t data_buf_pages; // page count backing the bounce buffer
 
-	// Block device
+	// SCSI identity beyond vendor/product (INQUIRY)
+	char revision[5];
+	uint8_t device_type; // peripheral device type (0 disk, 5 optical)
+
+	// The disk-layer disk (sdX / srN); NULL until registered, or when the
+	// disk layer refused it and the legacy registration below is used.
+	struct gendisk *disk;
+	int index; // slot in g_msd_devices[], -1 none
+	char name[16]; // legacy fallback name ("usbmsd<N>")
+	uint8_t legacy_registered; // `blk' was registered the old way
+	// The device refuses SYNCHRONIZE CACHE as an invalid command (many USB
+	// sticks do, while reporting a write cache): flushes complete without
+	// sending it from then on, as for a device without a cache.
+	uint8_t no_sync_cache;
+	uint8_t sync_fail_reported; // the first other refusal was logged
+
+	// Request execution: requests the disk layer handed to submit wait in
+	// this ring until the worker thread runs them (BOT is one command at a
+	// time; the ring lets the next request be queued while one runs).
+	spinlock_t rq_lock; // protects rq_ring/rq_head/rq_count; leaf, irqsave
+	struct blk_request *rq_ring[USB_MSD_QUEUE_DEPTH];
+	uint32_t rq_head; // index of the oldest queued request
+	uint32_t rq_count; // queued, not yet taken by the worker
+	volatile int rq_wait; // wait channel of the idle worker
+	task_t *worker; // the "kusbmsd<N>" thread, NULL if it could not start
+	volatile int worker_running;
+	uint8_t inline_running; // a caller runs the ring itself (no worker)
+	struct blk_request *rq_active; // the request the worker executes
+
+	// Staging buffer for scatter/gather elements that split a sector
+	// (USB_MSD_BLOCK_CHUNK sectors); NULL until first needed
+	uint8_t *stage_buf;
+	uint32_t stage_size;
+
+	// Counters (diagnostics)
+	uint64_t nr_requests; // requests completed
+	uint64_t nr_errors; // requests completed with an error
+	uint64_t nr_passthrough; // SG_IO commands executed
+
+	// Block device of the legacy fallback registration (and of the old
+	// read/write/sync callbacks, which still work on it)
 	block_device_t blk;
 } usb_msd_device_t;
+
 
 // MSD state for boot integration
 typedef struct {

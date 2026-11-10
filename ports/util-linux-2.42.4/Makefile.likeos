@@ -1,0 +1,247 @@
+# Makefile.likeos - build the disk tools of util-linux 2.42.4 for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; the libraries and
+# programs are compiled here directly, the way the kbd port does it.  config.h
+# in this directory stands in for what configure would write.
+#
+# Why not util-linux's own configure: its feature and program switches are
+# keyed to the host triple, and for a system it does not know by name it turns
+# off exactly the tools wanted here (lsblk, partx, blockdev, blkdiscard), drops
+# the block-device topology code of libblkid and requires kernel headers this
+# system does not install.  A hand build of the needed sources with a config.h
+# checked against the LikeOS libc is smaller than the patches that would bend
+# configure into shape, and it compiles nothing else.
+#
+# The compiler's built-in platform macros are left as gcc sets them, as in the
+# kbd port: util-linux guards its block-device ioctl, sysfs and partition
+# re-read code with them, and those are the interfaces the LikeOS kernel
+# implements (the BLK* requests of <sys/mount.h>, /sys/block, /sys/dev/block).
+#
+# Libraries (static archives in build/, linked into the programs):
+#   libcommon  util-linux's internal helpers (lib/), incl. terminal colours
+#   libuuid    UUIDs (libfdisk needs them for GPT)
+#   libblkid   filesystem/partition-table probing and block-device topology
+#   libmount   mount table parsing only (lsblk's MOUNTPOINTS); the parts that
+#              mount and unmount are not built
+#   libsmartcols  table/tree output
+#   libfdisk   partition table editing (DOS/MBR, GPT, BSD, SGI, Sun)
+#
+# Programs (build/):
+#   /bin       lsblk
+#   /sbin      blkid fdisk sfdisk wipefs blockdev blkdiscard findfs
+#   /usr/sbin  partx addpart delpart resizepart
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+AR = ar
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+G := $(B)/gen
+
+VERSION := 2.42.4
+VERSION_MAJOR := 2
+VERSION_MINOR := 42
+VERSION_PATCH := 4
+# The date util-linux's configure.ac records for this libblkid release.
+LIBBLKID_DATE := 21-Sep-2026
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.
+CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE -fsigned-char -fno-common \
+         -D_GNU_SOURCE -D__LIKEOS__ \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -I. -include config.h -I$(S)/include -I$(G)
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Wall -Werror=implicit-function-declaration -Werror=implicit-int
+# Upstream code, upstream warnings: they are not this port's to fix.
+CFLAGS += -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
+          -Wno-unused-variable -Wno-unused-but-set-variable -Wno-pointer-sign
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+# ---- libraries ---------------------------------------------------------------
+
+COMMON_SRC = lib/blkdev.c lib/buffer.c lib/canonicalize.c lib/color-names.c \
+	lib/colors.c lib/crc32.c lib/crc32c.c lib/crc64.c lib/c_strtod.c \
+	lib/debug.c lib/default_shell.c lib/encode.c lib/env.c lib/fileutils.c \
+	lib/idcache.c lib/ismounted.c lib/jsonwrt.c lib/linux_version.c \
+	lib/loopdev.c lib/mangle.c \
+	lib/match.c lib/mbsalign.c lib/mbsedit.c lib/md5.c lib/monotonic.c \
+	lib/pager.c \
+	lib/path.c lib/pidutils.c lib/procfs.c lib/pwdutils.c lib/randutils.c \
+	lib/sha1.c lib/sha256.c lib/signames.c lib/strutils.c lib/strv.c \
+	lib/sysfs.c lib/timeutils.c lib/ttyutils.c lib/xxhash.c lib/configs.c
+
+UUID_SRC = $(addprefix libuuid/src/,clear.c compare.c copy.c gen_uuid.c \
+	isnull.c pack.c parse.c unpack.c unparse.c uuid_time.c predefined.c)
+
+BLKID_SRC = $(addprefix libblkid/src/,init.c cache.c config.c dev.c \
+	devname.c devno.c encode.c evaluate.c getsize.c probe.c read.c \
+	resolve.c save.c tag.c verify.c version.c) \
+	$(sort $(patsubst $(S)/%,%,$(wildcard $(S)/libblkid/src/partitions/*.c))) \
+	$(sort $(patsubst $(S)/%,%,$(wildcard $(S)/libblkid/src/superblocks/*.c))) \
+	$(sort $(patsubst $(S)/%,%,$(wildcard $(S)/libblkid/src/topology/*.c)))
+
+MOUNT_SRC = $(addprefix libmount/src/,cache.c fs.c fs_statmount.c init.c \
+	iter.c lock.c optmap.c optlist.c optstr.c tab.c tab_diff.c \
+	tab_listmount.c tab_parse.c tab_update.c test.c utils.c version.c)
+
+SMARTCOLS_SRC = $(addprefix libsmartcols/src/,iter.c symbols.c cell.c \
+	column.c line.c table.c print.c print-api.c version.c calculate.c \
+	grouping.c walk.c init.c filter-parser.c filter-scanner.c filter.c \
+	filter-param.c filter-expr.c)
+
+FDISK_SRC = $(addprefix libfdisk/src/,init.c field.c item.c test.c ask.c \
+	alignment.c label.c utils.c context.c parttype.c partition.c table.c \
+	iter.c script.c version.c wipe.c sun.c sgi.c dos.c bsd.c gpt.c)
+
+obj = $(addprefix $(B)/,$(1:.c=.o))
+
+LIBCOMMON    = $(B)/libcommon.a
+LIBUUID      = $(B)/libuuid.a
+LIBBLKID     = $(B)/libblkid.a
+LIBMOUNT     = $(B)/libmount.a
+LIBSMARTCOLS = $(B)/libsmartcols.a
+LIBFDISK     = $(B)/libfdisk.a
+
+# Headers configure would generate from their .in templates (the library
+# versions are all that is substituted).
+GEN_HDRS = $(G)/blkid.h $(G)/libmount.h $(G)/libsmartcols.h $(G)/libfdisk.h
+
+# Per-library include directories, as upstream sets them.
+$(B)/libuuid/%.o:      XFLAGS = -I$(S)/libuuid/src
+$(B)/libblkid/%.o:     XFLAGS = -I$(S)/libblkid/src
+$(B)/libmount/%.o:     XFLAGS = -I$(S)/libblkid/src -I$(S)/libmount/src
+$(B)/libsmartcols/%.o: XFLAGS = -I$(S)/libsmartcols/src
+$(B)/libfdisk/%.o:     XFLAGS = -I$(S)/libuuid/src -I$(S)/libfdisk/src \
+                                -I$(S)/libblkid/src
+$(B)/misc-utils/%.o \
+$(B)/disk-utils/%.o \
+$(B)/sys-utils/%.o:    XFLAGS = -I$(S)/libuuid/src -I$(S)/libblkid/src \
+                                -I$(S)/libmount/src -I$(S)/libsmartcols/src \
+                                -I$(S)/libfdisk/src
+
+# ---- programs ----------------------------------------------------------------
+
+PROGS = lsblk blkid fdisk sfdisk wipefs partx addpart delpart resizepart \
+        blockdev blkdiscard findfs
+TARGETS = $(addprefix $(B)/,$(PROGS))
+
+LSBLK_OBJ  = $(call obj,misc-utils/lsblk.c misc-utils/lsblk-mnt.c \
+	misc-utils/lsblk-properties.c misc-utils/lsblk-devtree.c)
+FDISK_OBJ  = $(call obj,disk-utils/fdisk.c disk-utils/fdisk-menu.c \
+	disk-utils/fdisk-list.c)
+SFDISK_OBJ = $(call obj,disk-utils/sfdisk.c disk-utils/fdisk-list.c)
+
+# The tree first: the pattern rules below can only match files that exist.
+# No implicit rules: the tarball ships its generated parser and scanner
+# (libsmartcols' filter), and they must not be regenerated with whatever yacc
+# or lex the build host has.
+.SUFFIXES:
+%.c: %.y
+%.c: %.l
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): util-linux-$(VERSION).tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(G)/blkid.h: $(S)/libblkid/src/blkid.h.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/@LIBBLKID_VERSION@/$(VERSION)/' \
+	    -e 's/@LIBBLKID_MAJOR_VERSION@/$(VERSION_MAJOR)/' \
+	    -e 's/@LIBBLKID_MINOR_VERSION@/$(VERSION_MINOR)/' \
+	    -e 's/@LIBBLKID_PATCH_VERSION@/$(VERSION_PATCH)/' \
+	    -e 's/@LIBBLKID_DATE@/$(LIBBLKID_DATE)/' $< >$@
+
+$(G)/libmount.h: $(S)/libmount/src/libmount.h.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/@LIBMOUNT_VERSION@/$(VERSION)/' \
+	    -e 's/@LIBMOUNT_MAJOR_VERSION@/$(VERSION_MAJOR)/' \
+	    -e 's/@LIBMOUNT_MINOR_VERSION@/$(VERSION_MINOR)/' \
+	    -e 's/@LIBMOUNT_PATCH_VERSION@/$(VERSION_PATCH)/' $< >$@
+
+$(G)/libsmartcols.h: $(S)/libsmartcols/src/libsmartcols.h.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/@LIBSMARTCOLS_VERSION@/$(VERSION)/' $< >$@
+
+$(G)/libfdisk.h: $(S)/libfdisk/src/libfdisk.h.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/@LIBFDISK_VERSION@/$(VERSION)/' \
+	    -e 's/@LIBFDISK_MAJOR_VERSION@/$(VERSION_MAJOR)/' \
+	    -e 's/@LIBFDISK_MINOR_VERSION@/$(VERSION_MINOR)/' \
+	    -e 's/@LIBFDISK_PATCH_VERSION@/$(VERSION_PATCH)/' $< >$@
+
+$(B)/%.o: $(S)/%.c $(SRC_STAMP) config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+
+$(LIBCOMMON): $(call obj,$(COMMON_SRC))
+$(LIBUUID): $(call obj,$(UUID_SRC))
+$(LIBBLKID): $(call obj,$(BLKID_SRC))
+$(LIBMOUNT): $(call obj,$(MOUNT_SRC))
+$(LIBSMARTCOLS): $(call obj,$(SMARTCOLS_SRC))
+$(LIBFDISK): $(call obj,$(FDISK_SRC))
+
+$(B)/lib%.a:
+	@rm -f $@
+	$(AR) rcs $@ $^
+
+# Each program: its objects, then the archives it uses, most dependent first,
+# libcommon last (every library uses it).
+
+$(B)/lsblk: $(LSBLK_OBJ) $(LIBMOUNT) $(LIBBLKID) $(LIBSMARTCOLS) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/blkid $(B)/findfs: $(B)/%: $(B)/misc-utils/%.o $(LIBBLKID) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/wipefs: $(B)/misc-utils/wipefs.o $(LIBBLKID) $(LIBSMARTCOLS) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/fdisk: $(FDISK_OBJ) $(LIBFDISK) $(LIBBLKID) $(LIBUUID) $(LIBSMARTCOLS) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/sfdisk: $(SFDISK_OBJ) $(LIBFDISK) $(LIBBLKID) $(LIBUUID) $(LIBSMARTCOLS) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/partx: $(B)/disk-utils/partx.o $(LIBBLKID) $(LIBSMARTCOLS) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/addpart $(B)/delpart $(B)/resizepart $(B)/blockdev: $(B)/%: $(B)/disk-utils/%.o $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/blkdiscard: $(B)/sys-utils/blkdiscard.o $(LIBBLKID) $(LIBCOMMON) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean

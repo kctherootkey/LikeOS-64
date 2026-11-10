@@ -1,0 +1,68 @@
+# Makefile.likeos - build hdparm 9.65 for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; hdparm's own
+# Makefile is one link line over eleven files, so they are compiled here
+# directly with the LikeOS flags instead.  likeos-hdparm.h in this directory
+# supplies what the kernel headers supply elsewhere (patch 0001).
+#
+# Output: build/hdparm
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+
+# hdparm's own warning set, minus the ones that only object to its style.
+CFLAGS = -W -Wall -O2 -nostdlib -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE -D_GNU_SOURCE -D__LIKEOS__ \
+         -I. -I$(LIBC_DIR)/include
+# Upstream code, upstream warnings: they are not this port's to fix.
+CFLAGS += -Wno-sign-compare -Wno-unused-parameter
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBS = -lc -l:ld-likeos.so
+
+# The object list of hdparm's Makefile (OBJS).
+SRCS = hdparm.c identify.c sgio.c sysfs.c geom.c fallocate.c fibmap.c \
+       fwdownload.c dvdspeed.c wdidle3.c apt.c
+OBJS = $(addprefix $(B)/,$(SRCS:.c=.o))
+HDRS = likeos-hdparm.h $(S)/hdparm.h $(S)/sgio.h
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(B)/hdparm
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): hdparm-9.65.tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(B)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/hdparm: $(OBJS) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(OBJS) $(LIBS) -o $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

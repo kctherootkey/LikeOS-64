@@ -44,6 +44,10 @@ void sysfs_pci_path(const pci_device_t *dev, char *out, size_t cap);
  * sysfs_add_attr(). */
 int sysfs_add_class_device(const char *class, const char *name,
 			   const pci_device_t *pci, char *base, size_t cap);
+/* A directory under /sys (created with its parents, or the existing
+ * one), for a subsystem that makes it dynamic (pfs_set_dynamic) and lists
+ * its own entries -- the block layer's /sys/block. */
+struct pfs_node *sysfs_mkdir(const char *path);
 /* An attribute file in such a directory; `store' NULL makes it read-only. */
 struct pfs_node *sysfs_add_attr(const char *base, const char *name,
 				pfs_show_t show, pfs_store_t store, void *arg,

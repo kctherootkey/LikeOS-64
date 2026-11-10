@@ -1,0 +1,20 @@
+The LikeOS terminal has no hardcopy-erase (ECHOPRT) local mode, so
+<termios.h> does not define the flag; the terminal reset helper clears
+nothing for it, the same fallback the header already uses for the delay
+masks a terminal may lack.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/include/ttyutils.h
++++ b/include/ttyutils.h
+@@ -159,6 +159,10 @@
+ #ifndef TABDLY
+ # define TABDLY 0
+ #endif
++#if defined(__LIKEOS__) && !defined(ECHOPRT)
++/* The LikeOS terminal has no hardcopy-erase (ECHOPRT) mode to clear. */
++# define ECHOPRT 0
++#endif
+ 
+ 	tp->c_iflag |=  (BRKINT | ICRNL | IMAXBEL);
+ 	tp->c_iflag &= ~(IGNBRK | INLCR | IGNCR | IXOFF | IUCLC | IXANY | ISTRIP);

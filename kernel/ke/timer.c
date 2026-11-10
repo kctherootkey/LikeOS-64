@@ -9,6 +9,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/signal.h>
 #include <kernel/ke/percpu.h>
+#include <kernel/hal/serial.h>
 #include <kernel/fs/pagecache.h>
 #include <kernel/hal/acpi.h>
 #include <kernel/mm/memory.h>
@@ -1520,6 +1521,13 @@ void timer_irq_handler(int from_user)
 	 * before the boot CPU's seqlock write window below opens -- the
 	 * PM-timer arm of this reads that seqlock. */
 	uint64_t now_us = timer_get_precise_us();
+
+#ifdef SERIAL_ENABLED
+	/* The serial console's queued output leaves as the UART takes it
+	 * (the console itself never waits for the port). */
+	if (is_bsp)
+		serial_poll();
+#endif
 
 	if (is_bsp) {
 		/* What the tick counter SHOULD read, from the free-running

@@ -47,9 +47,13 @@ static inline void hrtimer_start_rel(hrtimer_t *t, uint64_t rel_ns)
 {
 	hrtimer_start(t, hrtimer_now_ns() + rel_ns);
 }
-/* Disarm.  Returns 1 if the timer was armed (and so has not fired), 0 if
- * it had already fired or was never started.  Safe against a concurrent
- * expiry: on return the callback is not running and will not run. */
+/* Disarm.  Returns 1 if the timer was armed (and so its callback will not
+ * run for that arming), 0 if it had already fired or was never started.
+ * It does NOT wait for a callback that is already running, or about to
+ * run, on another processor: the expiry path unlinks the timer before it
+ * calls the callback without any lock held.  A caller that frees the
+ * memory the callback uses must wait for it by its own means (a count or
+ * flag the callback drops as its last access). */
 int hrtimer_cancel(hrtimer_t *t);
 static inline int hrtimer_is_armed(const hrtimer_t *t)
 {

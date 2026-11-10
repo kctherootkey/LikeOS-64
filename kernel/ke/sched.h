@@ -16,6 +16,7 @@
 struct vfs_file;
 struct tty;
 struct task;
+struct blk_plug;
 
 /* Maximum file descriptors per task.
  *
@@ -240,11 +241,14 @@ static inline int spin_trylock(spinlock_t *lock)
 // was needlessly serialising the pipeline on every unlock kernel-wide.
 static inline void spin_unlock(spinlock_t *lock)
 {
+	// The release store must be the lock's LAST access: once `locked'
+	// reads 0 another CPU may take the lock and free the object that
+	// embeds it, so nothing may be written to the lock after it.
+	lock->owner_cpu = 0xFFFFFFFF;
 	__asm__ volatile(
 		"" ::
 			: "memory"); // compiler barrier (release semantics on x86)
 	lock->locked = 0;
-	lock->owner_cpu = 0xFFFFFFFF;
 }
 
 // Check if spinlock is held
@@ -1231,19 +1235,43 @@ typedef struct task {
 	 * life of the borrowing child, so it never has two at once. */
 	volatile int vfork_done;
 
-	/* Fair scheduling (the reference's CFS core): the processor time this
+	/* Fair scheduling (vruntime ordered): the processor time this
 	 * task has consumed, in TSC ticks, and when it was last put on a
 	 * processor.  The run queue is ordered by vruntime; a task that slept
 	 * is placed just ahead of the runnable ones when it wakes, a task that
 	 * ran goes behind them. */
 	uint64_t vruntime;
 	uint64_t exec_start;
+	/* The task's load weight and nice level (sched_set_user_nice).  Its
+	 * processor time is charged to vruntime scaled by NICE_0_LOAD /
+	 * weight: a heavier task's vruntime advances more slowly, so it gets
+	 * proportionally more of a contended processor.  0 = nice 0, the
+	 * weight of every task unless set; a forked child inherits its
+	 * parent's. */
+	uint32_t sched_weight;
+	int32_t sched_nice;
+	/* A worker thread of a worker pool (kblockd, blk_work.c): the
+	 * scheduler tells the pool when the thread blocks and when it runs
+	 * again (kblockd_worker_sleeping / kblockd_worker_running).  NULL for
+	 * every other task. */
+	void *wq_worker;
 
 	/* The deadline of the timed wait this task is parked in (a futex or a
 	 * poll timeout): hrtimer_wait_arm() / hrtimer_wait_disarm().  One per
 	 * task, because a task waits for one thing at a time, and part of the
 	 * task so that it outlives any callback still running for it. */
 	hrtimer_t wait_timer;
+
+	/* The storage stack's completion this task is inside (struct
+	 * blk_cpl_ctx on its stack, innermost first; NULL outside one).  The
+	 * last references a completion drops are released by the task itself
+	 * when the completion has returned, never by another task while it
+	 * still runs -- see blk_cpl_begin() in kernel/dev/block/genhd.c. */
+	void *blk_cpl_ctx;
+	/* The storage requests this task holds back while it submits a batch
+	 * (struct blk_plug on its stack; NULL outside one): flushed when it
+	 * finishes the batch or is about to sleep (kernel/dev/block). */
+	struct blk_plug *plug;
 } task_t;
 
 /* THE descriptor table of `t`.  A thread created with CLONE_FILES shares one
@@ -1451,6 +1479,21 @@ void sched_preempt(
 		*frame); // Called from timer IRQ, performs context switch
 int sched_need_resched(void); // Check if reschedule is needed
 void sched_set_need_resched(task_t *t); // Mark task as needing reschedule
+/* Nice levels of the fair scheduler: -20 (heaviest) .. 19, 0 the default.
+ * Sets the load weight `t' is charged with from now on. */
+#define SCHED_MIN_NICE (-20)
+#define SCHED_MAX_NICE 19
+#define SCHED_NICE_0_LOAD 1024u
+void sched_set_user_nice(task_t *t, int nice);
+/* Worker-pool hooks, called by sched_schedule() for a task with wq_worker
+ * set: before it blocks (state TASK_BLOCKED), and when it runs again. */
+void kblockd_worker_sleeping(task_t *t);
+void kblockd_worker_running(task_t *t);
+/* The block layer's plug of a task about to sleep goes to its queues
+ * (kernel/dev/block/blk_queue.c; declared in blkdev.h as well). */
+void blk_flush_plug(struct blk_plug *plug, int from_schedule);
+/* From the timer tick, for such a task while it runs (interrupts off). */
+void kblockd_worker_tick(task_t *t);
 /* From the timer tick: charge the running task for the time since it was
  * last charged, so wake-up placement compares against its true run time. */
 void sched_tick_account(task_t *t);

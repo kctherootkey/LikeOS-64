@@ -87,6 +87,18 @@ int mkfifoat(int dirfd, const char* path, mode_t mode);
  * function where the standard says it lives. */
 int mkdir(const char* path, mode_t mode);
 
+/* POSIX also puts utimensat/futimens and their two special tv_nsec values
+ * here.  <utime.h> and <unistd.h> carry the same definitions for the code
+ * written against them; the values are the kernel's (see utime.h). */
+#ifndef UTIME_NOW
+#define UTIME_NOW  ((long)1073741823)   /* (1<<30) - 1: set to the current time */
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((long)1073741822)   /* (1<<30) - 2: leave unchanged */
+#endif
+int utimensat(int dirfd, const char* pathname, const struct timespec times[2], int flags);
+int futimens(int fd, const struct timespec times[2]);
+
 #ifdef __cplusplus
 }
 #endif

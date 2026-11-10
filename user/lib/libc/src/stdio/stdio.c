@@ -127,6 +127,66 @@ static void stream_unregister(FILE *fp)
 	streams_lock_release();
 }
 
+/* ------------------------------------------------------------------ */
+/* The stream's backing I/O: its descriptor, or fopencookie()'s four   */
+/* functions.  Every read, write, seek and close of a stream goes      */
+/* through these.                                                      */
+/* ------------------------------------------------------------------ */
+static ssize_t __io_read(FILE *stream, void *buf, size_t n)
+{
+	if (stream->ck) {
+		if (!stream->ck_io.read)
+			return 0; /* no reader: always at end of file */
+		return stream->ck_io.read(stream->ck_cookie, buf, n);
+	}
+	return read(stream->fd, buf, n);
+}
+
+static ssize_t __io_write(FILE *stream, const void *buf, size_t n)
+{
+	if (stream->ck) {
+		ssize_t r;
+
+		if (!stream->ck_io.write)
+			return (ssize_t)n; /* no writer: output is discarded */
+		r = stream->ck_io.write(stream->ck_cookie, buf, n);
+		/* A cookie writer reports failure as 0; the callers here
+		 * expect -1, and would otherwise retry forever. */
+		if (r == 0 && n > 0) {
+			if (errno == 0)
+				errno = EIO;
+			return -1;
+		}
+		return r;
+	}
+	return write(stream->fd, buf, n);
+}
+
+static off_t __io_seek(FILE *stream, off_t offset, int whence)
+{
+	if (stream->ck) {
+		off64_t pos = offset;
+
+		if (!stream->ck_io.seek) {
+			errno = ESPIPE;
+			return -1;
+		}
+		if (stream->ck_io.seek(stream->ck_cookie, &pos, whence) < 0)
+			return -1;
+		return (off_t)pos;
+	}
+	return lseek(stream->fd, offset, whence);
+}
+
+static int __io_close(FILE *stream)
+{
+	if (stream->ck)
+		return stream->ck_io.close ?
+			       stream->ck_io.close(stream->ck_cookie) :
+			       0;
+	return close(stream->fd);
+}
+
 FILE *fopen(const char *pathname, const char *mode)
 {
 	if (!pathname || !mode) {
@@ -201,6 +261,10 @@ FILE *fopen(const char *pathname, const char *mode)
 	fp->ms = 0;
 	fp->ms_bufp = NULL;
 	fp->ms_sizep = NULL;
+	/* Not a cookie stream either, for the same reason. */
+	fp->ck = 0;
+	fp->ck_cookie = NULL;
+	memset(&fp->ck_io, 0, sizeof(fp->ck_io));
 
 	stream_register(fp);
 	return fp;
@@ -222,7 +286,7 @@ int fclose(FILE *stream)
 		free(stream);
 		return 0;
 	}
-	int result = close(stream->fd);
+	int result = __io_close(stream);
 	if (stream != stdin && stream != stdout && stream != stderr) {
 		free(stream->buffer);
 		free(stream->wbuf);
@@ -290,7 +354,7 @@ static int __flush_wbuf(FILE *stream)
 	size_t remaining = stream->wbuf_pos;
 	const unsigned char *p = stream->wbuf;
 	while (remaining > 0) {
-		ssize_t n = write(stream->fd, p, remaining);
+		ssize_t n = __io_write(stream, p, remaining);
 		if (n < 0) {
 			stream->error = 1;
 			return EOF;
@@ -312,7 +376,7 @@ static int __fill_rbuf(FILE *stream)
 
 	stream->buf_pos = 0;
 	stream->buf_end = 0;
-	ssize_t n = read(stream->fd, stream->buffer, stream->buf_size);
+	ssize_t n = __io_read(stream, stream->buffer, stream->buf_size);
 	if (n < 0) {
 		stream->error = 1;
 		return -1;
@@ -354,7 +418,7 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
 	/* If we still need data: for large reads, bypass buffer */
 	if (got < total &&
 	    (total - got) >= (stream->buf_size > 0 ? stream->buf_size : 1)) {
-		ssize_t n = read(stream->fd, dst, total - got);
+		ssize_t n = __io_read(stream, dst, total - got);
 		if (n < 0) {
 			stream->error = 1;
 		} else if (n == 0) {
@@ -369,7 +433,7 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
 	while (got < total) {
 		if (!stream->buffer || stream->buf_size == 0) {
 			/* No read buffer — direct read */
-			ssize_t n = read(stream->fd, dst, total - got);
+			ssize_t n = __io_read(stream, dst, total - got);
 			if (n < 0) {
 				stream->error = 1;
 				break;
@@ -405,7 +469,7 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 	/* Unbuffered: write directly */
 	if (stream->buf_mode == _IONBF || !stream->wbuf ||
 	    stream->wbuf_size == 0) {
-		ssize_t n = write(stream->fd, src, total);
+		ssize_t n = __io_write(stream, src, total);
 		if (n < 0) {
 			stream->error = 1;
 			return 0;
@@ -501,7 +565,7 @@ int fgetc(FILE *stream)
 
 	/* No read buffer — direct 1-byte read */
 	unsigned char c;
-	ssize_t n = read(stream->fd, &c, 1);
+	ssize_t n = __io_read(stream, &c, 1);
 	if (n <= 0) {
 		if (n == 0)
 			stream->eof = 1;
@@ -617,6 +681,10 @@ FILE *fdopen(int fd, const char *mode)
 	fp->ms = 0;
 	fp->ms_bufp = NULL;
 	fp->ms_sizep = NULL;
+	/* Not a cookie stream either, for the same reason. */
+	fp->ck = 0;
+	fp->ck_cookie = NULL;
+	memset(&fp->ck_io, 0, sizeof(fp->ck_io));
 
 	stream_register(fp);
 	return fp;
@@ -629,8 +697,11 @@ FILE *freopen(const char *pathname, const char *mode, FILE *stream)
 
 	/* Flush and close the underlying fd, but keep the FILE* alive */
 	fflush(stream);
-	close(stream->fd);
+	__io_close(stream);
 	stream->fd = -1;
+	/* Whatever the stream was before, it is a descriptor stream now. */
+	stream->ck = 0;
+	stream->ck_cookie = NULL;
 
 	int flags = 0;
 	switch (mode[0]) {
@@ -714,6 +785,52 @@ int fflush(FILE *stream)
 	return __flush_wbuf(stream);
 }
 
+/* fopencookie(): a buffered stream whose I/O is done by the caller's four
+ * functions (see <stdio.h> for their contract).  The mode string decides
+ * only what the stream may do -- "r" read, "w"/"a" write, '+' both; what
+ * reading, writing and positioning mean is entirely the functions' business,
+ * appending included. */
+FILE *fopencookie(void *cookie, const char *mode, cookie_io_functions_t io_funcs)
+{
+	int flags;
+
+	if (!mode) {
+		errno = EINVAL;
+		return NULL;
+	}
+	switch (mode[0]) {
+	case 'r':
+		flags = strchr(mode, '+') ? O_RDWR : O_RDONLY;
+		break;
+	case 'w':
+		flags = strchr(mode, '+') ? O_RDWR : O_WRONLY;
+		break;
+	case 'a':
+		flags = O_APPEND | (strchr(mode, '+') ? O_RDWR : O_WRONLY);
+		break;
+	default:
+		errno = EINVAL;
+		return NULL;
+	}
+
+	FILE *fp = calloc(1, sizeof(FILE));
+	if (!fp)
+		return NULL;
+	fp->fd = -1; /* no descriptor behind it */
+	fp->buffer = malloc(BUFSIZ);
+	fp->buf_size = fp->buffer ? BUFSIZ : 0;
+	fp->wbuf = malloc(BUFSIZ);
+	fp->wbuf_size = fp->wbuf ? BUFSIZ : 0;
+	fp->buf_mode = _IOFBF;
+	fp->flags = flags;
+	fp->ungetc_buf = -1;
+	fp->ck = 1;
+	fp->ck_cookie = cookie;
+	fp->ck_io = io_funcs;
+	stream_register(fp);
+	return fp;
+}
+
 FILE *open_memstream(char **bufp, size_t *sizep)
 {
 	if (!bufp || !sizep) {
@@ -788,7 +905,7 @@ int fseek(FILE *stream, long offset, int whence)
 	/* Clear EOF flag on seek */
 	stream->eof = 0;
 
-	off_t result = lseek(stream->fd, offset, whence);
+	off_t result = __io_seek(stream, offset, whence);
 	if (result < 0) {
 		stream->error = 1;
 		return -1;
@@ -807,7 +924,7 @@ long ftell(FILE *stream)
 	/* Flush any pending writes so the fd position is up to date */
 	__flush_wbuf(stream);
 
-	long pos = (long)lseek(stream->fd, 0, SEEK_CUR);
+	long pos = (long)__io_seek(stream, 0, SEEK_CUR);
 	if (pos < 0)
 		return -1;
 

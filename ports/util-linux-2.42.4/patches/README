@@ -1,0 +1,19 @@
+Patches applied to the pristine util-linux-2.42.4 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-platform-block-headers.patch
+        The BLKPG partition interface and the discard/zero-out requests are
+        declared in <sys/mount.h> here, with the other BLK* requests.
+
+  0002-no-o-path-o-direct.patch
+        No O_PATH descriptors and no direct I/O: the symlink-free open
+        helper reports its verification as unavailable, the loop device
+        code opens backing files for ordinary I/O.
+
+  0003-terminal-no-echoprt.patch
+        The terminal has no ECHOPRT mode; the terminal reset helper clears
+        nothing for it.
+
+Copyright (C) 2026 The LikeOS Project

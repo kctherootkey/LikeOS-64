@@ -63,6 +63,27 @@ extern "C" {
 typedef struct _IO_FILE FILE;
 #endif
 
+/* fopencookie(): a stream whose reads, writes, seeks and close go to four
+ * caller functions instead of a descriptor.
+ *   read   returns the bytes read, 0 at end of file, -1 on error;
+ *          NULL: the stream is always at end of file.
+ *   write  returns the bytes written, 0 on error; NULL: output is discarded.
+ *   seek   moves to *offset from whence, stores the new position in *offset,
+ *          returns 0 or -1; NULL: the stream cannot seek (ESPIPE).
+ *   close  returns 0 or -1; NULL: nothing to release. */
+typedef ssize_t cookie_read_function_t(void *cookie, char *buf, size_t size);
+typedef ssize_t cookie_write_function_t(void *cookie, const char *buf,
+					size_t size);
+typedef int cookie_seek_function_t(void *cookie, off64_t *offset, int whence);
+typedef int cookie_close_function_t(void *cookie);
+
+typedef struct {
+    cookie_read_function_t *read;
+    cookie_write_function_t *write;
+    cookie_seek_function_t *seek;
+    cookie_close_function_t *close;
+} cookie_io_functions_t;
+
 struct _IO_FILE {
     int fd;
     /* Read buffer */
@@ -98,9 +119,18 @@ struct _IO_FILE {
     int ms;             /* 1 = memstream */
     char **ms_bufp;     /* caller's buffer pointer, kept current */
     size_t *ms_sizep;   /* caller's size, kept current */
+    /* fopencookie(): when ck is set, the stream's I/O goes to ck_io with
+     * ck_cookie instead of to fd (which is -1).  Appended for the same
+     * reason as the memstream fields. */
+    int ck;
+    void *ck_cookie;
+    cookie_io_functions_t ck_io;
 };
 
 FILE *open_memstream(char **bufp, size_t *sizep);
+FILE *fopencookie(void *cookie, const char *mode, cookie_io_functions_t io_funcs);
+/* A stream over the caller's `size'-byte buffer (POSIX). */
+FILE *fmemopen(void *buf, size_t size, const char *mode);
 
 extern FILE* stdin;
 extern FILE* stdout;

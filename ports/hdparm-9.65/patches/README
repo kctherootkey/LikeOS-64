@@ -1,0 +1,17 @@
+Patches applied to the pristine hdparm-9.65 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-likeos-platform-headers.patch
+        The kernel interface (types, BLK*, HDIO_*, SG_IO) comes from the
+        LikeOS C library headers and the port's likeos-hdparm.h; MAP_LOCKED
+        is 0 (memory is never paged out).
+
+  0002-fallocate-through-libc.patch
+        --fallocate calls the C library's fallocate().
+
+  0003-dvdspeed-set-streaming-via-sg-io.patch
+        -E sends the SET STREAMING packet to an optical drive through SG_IO.
+
+Copyright (C) 2026 The LikeOS Project

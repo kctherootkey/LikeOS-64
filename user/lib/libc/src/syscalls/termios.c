@@ -93,3 +93,68 @@ int cfsetospeed(struct termios *t, speed_t s)
 	(void)s;
 	return 0;
 }
+
+/* getpass() - read a password from the terminal without echoing it.
+ *
+ * The terminal is /dev/tty when the process has one, else stdin for reading
+ * and stderr for the prompt.  Echo and signal characters are off while the
+ * line is read and the previous settings are restored afterwards (a newline
+ * is then written, since the user's Enter was not echoed).  Bytes beyond 128
+ * are read and dropped so the rest of the line does not leak into the next
+ * read.  End of input before a newline returns what was read, possibly "".
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+
+#define GETPASS_MAX 128
+
+char *getpass(const char *prompt)
+{
+	static char buf[GETPASS_MAX + 1];
+	struct termios saved, quiet;
+	int in, out, opened, restore = 0;
+	size_t n = 0;
+	ssize_t r;
+	char c;
+
+	in = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+	opened = in >= 0;
+	if (opened) {
+		out = in;
+	} else {
+		in = STDIN_FILENO;
+		out = STDERR_FILENO;
+	}
+
+	if (tcgetattr(in, &saved) == 0) {
+		quiet = saved;
+		quiet.c_lflag &= ~(ECHO | ISIG);
+		if (tcsetattr(in, TCSAFLUSH, &quiet) == 0)
+			restore = 1;
+	}
+
+	if (prompt && *prompt)
+		(void)write(out, prompt, strlen(prompt));
+
+	for (;;) {
+		r = read(in, &c, 1);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0 || c == '\n')
+			break;
+		if (n < GETPASS_MAX)
+			buf[n++] = c;
+	}
+	buf[n] = '\0';
+
+	if (restore) {
+		(void)tcsetattr(in, TCSAFLUSH, &saved);
+		(void)write(out, "\n", 1);
+	}
+	if (opened)
+		close(in);
+	return buf;
+}

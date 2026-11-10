@@ -593,6 +593,17 @@ typedef struct k_flock {
 #define ELOOP 40 // Too many symbolic links
 #define ENFILE 23 // File table overflow
 #define EMSGSIZE 90 // Message too long
+/* The storage stack's error vocabulary (block layer, ATA/AHCI, SCSI
+ * translation); the numbers are the conventional ones the libc's
+ * <errno.h> uses. */
+#define ENOLINK 67 // Link has been severed
+#define EBADMSG 74 // Not a data message (corrupt structure)
+#define EOVERFLOW 75 // Value too large for defined data type
+#define EILSEQ 84 // Illegal byte sequence
+#define EREMOTEIO 121 // Remote I/O error (device-reported failure)
+#define ENOMEDIUM 123 // No medium found
+#define EMEDIUMTYPE 124 // Wrong medium type
+#define ECANCELED 125 // Operation canceled
 
 // Syscall handler prototype
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,

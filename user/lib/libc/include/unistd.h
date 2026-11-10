@@ -172,6 +172,7 @@ int rmdir(const char* path);
 int link(const char* oldpath, const char* newpath);
 int symlink(const char* target, const char* linkpath);
 int readlink(const char* path, char* buf, size_t bufsiz);
+ssize_t readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz);
 int chown(const char* path, int owner, int group);
 int fchown(int fd, int owner, int group);
 
@@ -304,6 +305,11 @@ unsigned long getauxval(unsigned long type);
 
 // Generic syscall entry point
 long syscall(long number, ...);
+
+/* Prompt on the controlling terminal and read a line with echo off; the
+ * result (no newline, at most 128 bytes) is in a static buffer.  Obsolete in
+ * POSIX, still how command-line tools ask for a password. */
+char *getpass(const char *prompt);
 
 #ifdef __cplusplus
 }

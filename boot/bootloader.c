@@ -120,10 +120,53 @@ typedef struct {
     uint32_t hypervisor;          // 1 when CPUID reports a hypervisor
     uint32_t gop_mode_count;      // entries used in gop_modes[]
     struct { uint32_t width; uint32_t height; } gop_modes[BOOT_GOP_MODES_MAX];
+
+    // ---- Root identity (valid when rootid_magic == BOOT_ROOTID_MAGIC) ----
+    // The kernel's copy is kernel/mm/memory.h; keep both identical.  See
+    // "Boot identity" below for how each field is obtained.
+    uint64_t rootid_magic;          // BOOT_ROOTID_MAGIC when the fields below are valid
+    uint32_t loader_part_sig_type;  // BOOT_PART_SIG_*: how the loader partition is identified
+    uint32_t loader_part_number;    // its number in the partition table (1-based), 0 unknown
+    uint64_t loader_part_start;     // its first LBA (the firmware's block size)
+    uint64_t loader_part_size;      // its length in blocks
+    uint8_t  loader_part_sig[16];   // GPT: unique partition GUID, on-disk byte order;
+                                    // MBR: bytes 0-3 the disk signature (LE), rest 0
+    char     loader_partuuid[40];   // the same as text: GPT canonical, MBR "xxxxxxxx-nn"
+    uint32_t loader_disk_bus;       // BOOT_DISK_BUS_*: the bus the firmware reached the disk by
+    uint32_t loader_disk_port;      // SATA HBA port, USB parent port, NVMe namespace; ~0u unknown
+    char     loader_device_path[256]; // the loader partition's device path as text
+    char     kernel_partuuid[40];   // PARTUUID of the partition kernel.elf was read from
+    char     root_spec[128];        // root= value of the command line, "" none
+    char     cmdline[512];          // the whole boot command line (ASCII, one line)
+    uint32_t cmdline_source;        // BOOT_CMDLINE_*: where the command line came from
+    uint32_t rootid_reserved;
 } boot_info_t;
 
 #define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
 #define BOOT_DISPLAY_MAGIC 0x5953494459414c50ULL
+#define BOOT_ROOTID_MAGIC 0x44494f544f4f524cULL /* "LROOTOID" */
+
+#define BOOT_PART_SIG_NONE 0
+#define BOOT_PART_SIG_MBR  1
+#define BOOT_PART_SIG_GPT  2
+
+#define BOOT_DISK_BUS_UNKNOWN 0
+#define BOOT_DISK_BUS_USB     1
+#define BOOT_DISK_BUS_SATA    2
+#define BOOT_DISK_BUS_NVME    3
+#define BOOT_DISK_BUS_SCSI    4
+#define BOOT_DISK_BUS_ATAPI   5
+#define BOOT_DISK_BUS_SD      6
+#define BOOT_DISK_BUS_VIRTUAL 7
+
+#define BOOT_CMDLINE_NONE         0
+#define BOOT_CMDLINE_LOAD_OPTIONS 1
+#define BOOT_CMDLINE_ESP_FILE     2
+
+// The optional boot command line on the EFI System Partition: one or more
+// lines of "key=value" words (root=PARTUUID=..., root=UUID=..., root=LABEL=...,
+// root=/dev/sda2, rootfstype=ext4); '#' starts a comment line.
+#define BOOT_CMDLINE_PATH L"\\EFI\\LIKEOS\\cmdline.txt"
 
 // Global boot info to pass to kernel
 static boot_info_t g_boot_info;
@@ -1113,11 +1156,1017 @@ static UINT32 e4_resolve(e4_ctx *c, const char *path, UINT8 *inode_out) {
     return ino;
 }
 
-/* Identify an ext4 partition among all EFI_BLOCK_IO handles and load the
- * file at `path' (at most `max_size' bytes) into a freshly allocated pool
- * buffer: /boot/kernel.elf, and the saved display setting before it. */
+/* Open an ext4 filesystem on `blk' (a partition, or a whole disk holding a
+ * filesystem without a partition table): read and check the superblock,
+ * build the reader context and allocate its two block-sized buffers.  When
+ * `sb_out' is non-NULL the first 1024 bytes of the superblock are copied
+ * there as well (the root selection reads the UUID and label from it).
+ * EFI_NOT_FOUND when there is no ext4 superblock; e4_ctx_close() releases
+ * what a successful open allocated. */
+static EFI_STATUS e4_ctx_open(EFI_BLOCK_IO_PROTOCOL *blk, e4_ctx *c, UINT8 *sb_out) {
+    if (!blk || !blk->Media || !blk->Media->MediaPresent) return EFI_NO_MEDIA;
+    UINT32 dev_bs = blk->Media->BlockSize;
+    if (dev_bs == 0 || dev_bs > 4096 || (dev_bs & (dev_bs - 1))) return EFI_UNSUPPORTED;
+
+    /* Read enough to cover the superblock at byte offset 1024. */
+    UINT32 probe_bytes = dev_bs > 2048 ? dev_bs : 2048;
+    UINT8 *probe = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                    probe_bytes, (VOID **)&probe)) || !probe)
+        return EFI_OUT_OF_RESOURCES;
+    if (EFI_ERROR(uefi_call_wrapper(blk->ReadBlocks, 5, blk,
+                                    blk->Media->MediaId, (EFI_LBA)0,
+                                    (UINTN)probe_bytes, probe))) {
+        uefi_call_wrapper(BS->FreePool, 1, probe);
+        return EFI_DEVICE_ERROR;
+    }
+    const UINT8 *sb = probe + 1024;
+    if (e4_rd16(sb + 56) != E4_SUPER_MAGIC) {
+        uefi_call_wrapper(BS->FreePool, 1, probe);
+        return EFI_NOT_FOUND;
+    }
+    if (sb_out) {
+        for (UINT32 i = 0; i < 1024; i++) sb_out[i] = sb[i];
+    }
+
+    /* Build the context from the superblock. */
+    c->blk = blk;
+    c->media_id = blk->Media->MediaId;
+    c->dev_bs = dev_bs;
+    UINT32 log_bs = e4_rd32(sb + 24);                       /* s_log_block_size */
+    c->block_size = log_bs <= 6 ? (1024u << log_bs) : 0;    /* 1 KiB .. 64 KiB */
+    c->inodes_per_group = e4_rd32(sb + 40);
+    c->inode_size = e4_rd16(sb + 88);
+    if (c->inode_size < 128) c->inode_size = 128;
+    UINT32 incompat = e4_rd32(sb + 96);
+    c->desc_size = 32;
+    if (incompat & E4_INCOMPAT_64BIT) {
+        UINT16 ds = e4_rd16(sb + 254);
+        c->desc_size = ds >= 32 ? ds : 32;
+    }
+    UINT32 first_data = e4_rd32(sb + 20);                   /* s_first_data_block */
+    uefi_call_wrapper(BS->FreePool, 1, probe);
+    if (c->block_size == 0 || c->inodes_per_group == 0 ||
+        c->block_size < c->dev_bs || (c->block_size % c->dev_bs) != 0)
+        return EFI_UNSUPPORTED;
+    c->spb = c->block_size / c->dev_bs;
+    c->gdt_block = (UINT64)first_data + 1;
+
+    /* Allocate the two reusable ext4-block scratch buffers. */
+    c->scratch = NULL; c->node = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                    c->block_size, (VOID **)&c->scratch)) ||
+        EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                    c->block_size, (VOID **)&c->node))) {
+        if (c->scratch) uefi_call_wrapper(BS->FreePool, 1, c->scratch);
+        if (c->node)    uefi_call_wrapper(BS->FreePool, 1, c->node);
+        c->scratch = NULL; c->node = NULL;
+        return EFI_OUT_OF_RESOURCES;
+    }
+    return EFI_SUCCESS;
+}
+
+static void e4_ctx_close(e4_ctx *c) {
+    if (c->scratch) uefi_call_wrapper(BS->FreePool, 1, c->scratch);
+    if (c->node)    uefi_call_wrapper(BS->FreePool, 1, c->node);
+    c->scratch = NULL;
+    c->node = NULL;
+}
+
+/* Load the file at `path' (at most `max_size' bytes) from an opened ext4
+ * context into a freshly allocated pool buffer. */
+static EFI_STATUS e4_load_file(e4_ctx *c, const char *path, UINT64 max_size,
+                               VOID **out_buf, UINTN *out_size) {
+    UINT8 inode[256];
+    UINT32 ino = e4_resolve(c, path, inode);
+    if (!ino) return EFI_NOT_FOUND;
+    UINT64 size = e4_isize(inode);
+    if (size == 0 || size > max_size) return EFI_BAD_BUFFER_SIZE;
+
+    /* A file small enough to live in the inode itself (inline
+     * data): its bytes are where the block map would be. */
+    if ((e4_rd32(inode + 32) & E4_INLINE_DATA_FL) && size <= 60) {
+        VOID *ibuf = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                        (UINTN)size, &ibuf)) || !ibuf)
+            return EFI_OUT_OF_RESOURCES;
+        for (UINT64 z = 0; z < size; z++)
+            ((UINT8 *)ibuf)[z] = inode[40 + z];
+        *out_buf = ibuf;
+        *out_size = (UINTN)size;
+        return EFI_SUCCESS;
+    }
+
+    /* Allocate rounded up to whole blocks so bulk reads of full blocks
+     * never overflow (the ELF loader only consumes `size` bytes). */
+    UINT64 nblk = (size + c->block_size - 1) / c->block_size;
+    UINTN  alloc = (UINTN)(nblk * c->block_size);
+    VOID *kbuf = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                    alloc, &kbuf)) || !kbuf)
+        return EFI_OUT_OF_RESOURCES;
+    /* Read contiguous physical block runs in a single ReadBlocks call
+     * instead of one transfer per 4 KB block — turns a ~1.3 MB kernel
+     * load from ~300 USB transactions into a handful. */
+    UINT64 b = 0;
+    while (b < nblk) {
+        UINT8 *dst = (UINT8 *)kbuf + b * c->block_size;
+        UINT64 pbn = e4_bmap(c, inode, b);
+        if (!pbn) {                                  /* sparse hole */
+            for (UINT64 z = 0; z < c->block_size; z++) dst[z] = 0;
+            b++;
+            continue;
+        }
+        UINT64 run = 1;
+        while (b + run < nblk && run < 1024) {        /* cap run at 4 MB */
+            if (e4_bmap(c, inode, b + run) != pbn + run) break;
+            run++;
+        }
+        if (EFI_ERROR(e4_read_dev(c, pbn * c->spb, (UINT32)(run * c->spb), dst))) {
+            uefi_call_wrapper(BS->FreePool, 1, kbuf);
+            return EFI_DEVICE_ERROR;
+        }
+        b += run;
+    }
+    *out_buf = kbuf;
+    *out_size = (UINTN)size;
+    return EFI_SUCCESS;
+}
+
+/* ===========================================================================
+ *  Boot identity: the partition this loader was started from
+ * ---------------------------------------------------------------------------
+ *  The kernel must mount the root filesystem of THIS installation -- the one
+ *  on the disk the firmware booted -- and never another disk that merely
+ *  happens to carry an ext4 filesystem (an internal SATA disk next to the
+ *  USB stick, a second installation, a data disk).  The established way to
+ *  learn which disk that is:
+ *
+ *    1. EFI_LOADED_IMAGE_PROTOCOL on our own ImageHandle gives DeviceHandle,
+ *       the handle of the partition the firmware read this program from (the
+ *       EFI System Partition).
+ *    2. EFI_DEVICE_PATH_PROTOCOL on that handle is the path from the root
+ *       bridge to the partition, e.g.
+ *         PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)/HD(1,GPT,<guid>,...)
+ *    3. The Hard Drive media node -- type 4 (MEDIA_DEVICE_PATH), subtype 1
+ *       (MEDIA_HARDDRIVE_DP) -- names the partition: its number, start and
+ *       size, and its signature.  SignatureType 2 means the signature is the
+ *       GPT unique partition GUID (what a running system calls the
+ *       PARTUUID); SignatureType 1 means an MBR disk, the signature then being
+ *       the 32-bit disk signature, and the PARTUUID is written
+ *       "<signature>-<partition number>".
+ *
+ *  Everything in front of the HD() node names the DISK.  Two device paths
+ *  that share that prefix are partitions of the same disk, which is how the
+ *  root partition is found below: on the loader's disk, the partition whose
+ *  GPT type is the x86-64 root type (4f68bce3-e8cd-4db1-96e7-fbcaf984b709).
+ *  The kernel repeats that decision with its own drivers (kernel/ke/storage.c)
+ *  from the loader PARTUUID passed in boot_info; the PARTUUID of the
+ *  partition kernel.elf was actually read from is passed too, so both sides
+ *  can confirm they agree.
+ *
+ *  An explicit root= on the boot command line overrides the search; the
+ *  command line comes from the boot entry's load options (a UEFI shell, an
+ *  efibootmgr entry) or, when those are empty, from \EFI\LIKEOS\cmdline.txt
+ *  on the ESP.
+ * =========================================================================== */
+
+/* Device path node types and subtypes used here (UEFI specification,
+ * "Device Path Protocol").  Spelled out under our own names: the GNU-EFI
+ * headers define only some of them, under names that vary by version. */
+#define BL_DP_HARDWARE        0x01
+#define BL_DP_MESSAGING       0x03
+#define BL_DP_MEDIA           0x04
+#define BL_DP_END             0x7f
+#define BL_DP_END_ENTIRE      0xff
+#define BL_HW_VENDOR          0x04
+#define BL_MSG_ATAPI          0x01
+#define BL_MSG_SCSI           0x02
+#define BL_MSG_USB            0x05
+#define BL_MSG_VENDOR         0x0a
+#define BL_MSG_USB_CLASS      0x0f
+#define BL_MSG_USB_WWID       0x10
+#define BL_MSG_SATA           0x12
+#define BL_MSG_NVME           0x17
+#define BL_MSG_UFS            0x19
+#define BL_MSG_SD             0x1a
+#define BL_MSG_EMMC           0x1d
+#define BL_MEDIA_HARDDRIVE    0x01
+#define BL_MEDIA_CDROM        0x02
+#define BL_MEDIA_RAMDISK      0x09
+#define BL_HD_SIG_MBR         0x01
+#define BL_HD_SIG_GUID        0x02
+/* Sanity bounds for walking a firmware device path */
+#define BL_DP_MAX_NODES       64
+#define BL_DP_MAX_BYTES       4096
+
+/* The Hard Drive media node exactly as the specification lays it out: 42
+ * bytes, no padding.  Device path nodes are byte-packed and may sit at any
+ * address, so a node is always copied into one of these before its
+ * multi-byte fields are read. */
+typedef struct __attribute__((packed)) {
+    UINT8  Type;
+    UINT8  SubType;
+    UINT8  Length[2];
+    UINT32 PartitionNumber;
+    UINT64 PartitionStart;
+    UINT64 PartitionSize;
+    UINT8  Signature[16];
+    UINT8  MBRType;
+    UINT8  SignatureType;
+} bl_hd_node_t;
+
+/* GPT type GUID of the x86-64 root partition, 4f68bce3-e8cd-4db1-96e7-
+ * fbcaf984b709, in the on-disk (EFI_GUID) byte order. */
+static const UINT8 g_gpt_type_root_x86_64[16] = {
+    0xe3, 0xbc, 0x68, 0x4f, 0xcd, 0xe8, 0xb1, 0x4d,
+    0x96, 0xe7, 0xfb, 0xca, 0xf9, 0x84, 0xb7, 0x09
+};
+
+/* What the boot identity code learned about the loader partition. */
+typedef struct {
+    BOOLEAN          have_hd;      /* an HD() node was found */
+    EFI_HANDLE       device;       /* LoadedImage->DeviceHandle */
+    EFI_DEVICE_PATH *dp;           /* its device path (firmware memory) */
+    UINTN            prefix_len;   /* bytes of dp in front of the HD() node */
+    bl_hd_node_t     hd;           /* copy of the HD() node */
+} bl_loader_t;
+
+static bl_loader_t g_loader;
+
+/* The GPT of the loader's disk, as far as root selection needs it. */
+#define BL_GPT_MAX_ENTRIES 128
+typedef struct {
+    BOOLEAN valid;
+    UINT32  nr;                                  /* entries read */
+    UINT8   type[BL_GPT_MAX_ENTRIES][16];        /* type GUIDs (on-disk order) */
+    UINT8   uuid[BL_GPT_MAX_ENTRIES][16];        /* unique GUIDs */
+    char    name[BL_GPT_MAX_ENTRIES][37];        /* names, ASCII-folded */
+} bl_gpt_t;
+
+static bl_gpt_t g_loader_gpt;
+
+/* The root partition the bootloader chose (kernel.elf and display.conf are
+ * read from it alone); NULL when the choice could not be made, in which case
+ * the old any-ext4-partition search is used. */
+static EFI_BLOCK_IO_PROTOCOL *g_root_blk = NULL;
+
+static BOOLEAN bl_mem_eq(const void *a, const void *b, UINTN n) {
+    const UINT8 *x = (const UINT8 *)a, *y = (const UINT8 *)b;
+    for (UINTN i = 0; i < n; i++)
+        if (x[i] != y[i]) return FALSE;
+    return TRUE;
+}
+
+static void bl_mem_copy(void *dst, const void *src, UINTN n) {
+    UINT8 *d = (UINT8 *)dst;
+    const UINT8 *s = (const UINT8 *)src;
+    for (UINTN i = 0; i < n; i++) d[i] = s[i];
+}
+
+static char bl_lower(char ch) {
+    return (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+}
+
+/* Case-insensitive ASCII string equality. */
+static BOOLEAN bl_str_eq_nocase(const char *a, const char *b) {
+    while (*a && *b) {
+        if (bl_lower(*a) != bl_lower(*b)) return FALSE;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static BOOLEAN bl_str_eq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+static BOOLEAN bl_str_prefix(const char *s, const char *prefix) {
+    while (*prefix) {
+        if (*s != *prefix) return FALSE;
+        s++; prefix++;
+    }
+    return TRUE;
+}
+
+/* Bounded copy that always terminates (cap >= 1). */
+static void bl_str_copy(char *dst, UINTN cap, const char *src) {
+    UINTN i = 0;
+    if (cap == 0) return;
+    for (; src[i] && i + 1 < cap; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+
+static void bl_hex_bytes(char **p, const UINT8 *b, UINTN n, BOOLEAN reverse) {
+    static const char hx[] = "0123456789abcdef";
+    for (UINTN i = 0; i < n; i++) {
+        UINT8 v = b[reverse ? n - 1 - i : i];
+        *(*p)++ = hx[v >> 4];
+        *(*p)++ = hx[v & 15];
+    }
+}
+
+/* GUID in on-disk (mixed-endian EFI_GUID) byte order -> canonical lowercase
+ * text "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" (37 bytes with the NUL). */
+static void bl_guid_to_str(const UINT8 *g, char *out) {
+    char *p = out;
+    bl_hex_bytes(&p, g + 0, 4, TRUE);  *p++ = '-';
+    bl_hex_bytes(&p, g + 4, 2, TRUE);  *p++ = '-';
+    bl_hex_bytes(&p, g + 6, 2, TRUE);  *p++ = '-';
+    bl_hex_bytes(&p, g + 8, 2, FALSE); *p++ = '-';
+    bl_hex_bytes(&p, g + 10, 6, FALSE);
+    *p = 0;
+}
+
+/* ext4 UUID (16 raw bytes, printed in storage order) -> text. */
+static void bl_uuid_to_str(const UINT8 *u, char *out) {
+    char *p = out;
+    bl_hex_bytes(&p, u + 0, 4, FALSE);  *p++ = '-';
+    bl_hex_bytes(&p, u + 4, 2, FALSE);  *p++ = '-';
+    bl_hex_bytes(&p, u + 6, 2, FALSE);  *p++ = '-';
+    bl_hex_bytes(&p, u + 8, 2, FALSE);  *p++ = '-';
+    bl_hex_bytes(&p, u + 10, 6, FALSE);
+    *p = 0;
+}
+
+/* The PARTUUID text of a partition from its HD() node: the GPT GUID, or for
+ * an MBR disk "<disk signature as 8 hex digits>-<partition number as 2>". */
+static BOOLEAN bl_hd_partuuid(const bl_hd_node_t *hd, char *out) {
+    if (hd->SignatureType == BL_HD_SIG_GUID) {
+        bl_guid_to_str(hd->Signature, out);
+        return TRUE;
+    }
+    if (hd->SignatureType == BL_HD_SIG_MBR) {
+        char *p = out;
+        UINT8 num = (UINT8)hd->PartitionNumber;
+        bl_hex_bytes(&p, hd->Signature, 4, TRUE);
+        *p++ = '-';
+        bl_hex_bytes(&p, &num, 1, FALSE);
+        *p = 0;
+        return TRUE;
+    }
+    out[0] = 0;
+    return FALSE;
+}
+
+/* Length of one node, 0 when it is malformed (shorter than its header, or
+ * running past what is left of the walk budget). */
+static UINTN bl_dp_node_len(const EFI_DEVICE_PATH *n, UINTN budget) {
+    UINTN len = (UINTN)n->Length[0] | ((UINTN)n->Length[1] << 8);
+    if (len < 4 || len > budget) return 0;
+    return len;
+}
+
+static BOOLEAN bl_dp_is_end(const EFI_DEVICE_PATH *n) {
+    return (n->Type & 0x7f) == BL_DP_END && n->SubType == BL_DP_END_ENTIRE;
+}
+
+/* Find the first Hard Drive media node of `dp'.  Returns TRUE and copies it
+ * to *hd, with *prefix_len = the bytes in front of it (the disk's path). */
+static BOOLEAN bl_dp_find_hd(const EFI_DEVICE_PATH *dp, UINTN *prefix_len,
+                             bl_hd_node_t *hd) {
+    const UINT8 *p = (const UINT8 *)dp;
+    UINTN off = 0;
+    if (!dp) return FALSE;
+    for (UINTN i = 0; i < BL_DP_MAX_NODES; i++) {
+        const EFI_DEVICE_PATH *n = (const EFI_DEVICE_PATH *)(p + off);
+        UINTN len = bl_dp_node_len(n, BL_DP_MAX_BYTES - off);
+        if (!len || bl_dp_is_end(n)) return FALSE;
+        if ((n->Type & 0x7f) == BL_DP_MEDIA && n->SubType == BL_MEDIA_HARDDRIVE &&
+            len >= sizeof(bl_hd_node_t)) {
+            bl_mem_copy(hd, n, sizeof(*hd));
+            *prefix_len = off;
+            return TRUE;
+        }
+        off += len;
+        if (off >= BL_DP_MAX_BYTES) return FALSE;
+    }
+    return FALSE;
+}
+
+/* Does `dp' start with the loader disk's path, followed directly by `next'
+ * (an HD() node when `want_hd', the end node otherwise)?  That is: is it a
+ * partition of, or the whole of, the loader's disk? */
+static BOOLEAN bl_dp_on_loader_disk(const EFI_DEVICE_PATH *dp, BOOLEAN want_hd) {
+    if (!dp || !g_loader.have_hd || g_loader.prefix_len == 0 ||
+        g_loader.prefix_len >= BL_DP_MAX_BYTES)
+        return FALSE;
+    /* Walk dp node by node up to prefix_len so a short or malformed path
+     * is never read past its end. */
+    const UINT8 *p = (const UINT8 *)dp;
+    UINTN off = 0;
+    for (UINTN i = 0; i < BL_DP_MAX_NODES && off < g_loader.prefix_len; i++) {
+        const EFI_DEVICE_PATH *n = (const EFI_DEVICE_PATH *)(p + off);
+        UINTN len = bl_dp_node_len(n, BL_DP_MAX_BYTES - off);
+        if (!len || bl_dp_is_end(n)) return FALSE;
+        off += len;
+    }
+    if (off != g_loader.prefix_len) return FALSE;
+    if (!bl_mem_eq(dp, g_loader.dp, g_loader.prefix_len)) return FALSE;
+    const EFI_DEVICE_PATH *next = (const EFI_DEVICE_PATH *)(p + off);
+    if (!bl_dp_node_len(next, BL_DP_MAX_BYTES - off)) return FALSE;
+    if (want_hd)
+        return (next->Type & 0x7f) == BL_DP_MEDIA && next->SubType == BL_MEDIA_HARDDRIVE;
+    return bl_dp_is_end(next);
+}
+
+/* The bus the firmware reached the loader's disk through: the LAST
+ * messaging node in front of the HD() node decides (a USB stick behind a
+ * hub has several USB nodes; a SATA disk behind a RAID-mode controller
+ * shows Sata()), with its port number where the node has one. */
+static void bl_dp_classify_bus(const EFI_DEVICE_PATH *dp, UINTN prefix_len,
+                               UINT32 *bus, UINT32 *port) {
+    const UINT8 *p = (const UINT8 *)dp;
+    UINTN off = 0;
+    *bus = BOOT_DISK_BUS_UNKNOWN;
+    *port = ~0u;
+    for (UINTN i = 0; i < BL_DP_MAX_NODES && off < prefix_len; i++) {
+        const EFI_DEVICE_PATH *n = (const EFI_DEVICE_PATH *)(p + off);
+        UINTN len = bl_dp_node_len(n, BL_DP_MAX_BYTES - off);
+        if (!len || bl_dp_is_end(n)) break;
+        const UINT8 *b = (const UINT8 *)n;
+        UINT8 type = n->Type & 0x7f;
+        if (type == BL_DP_MESSAGING) {
+            switch (n->SubType) {
+            case BL_MSG_USB:
+                *bus = BOOT_DISK_BUS_USB;
+                *port = len >= 5 ? b[4] : ~0u;          /* ParentPortNumber */
+                break;
+            case BL_MSG_USB_CLASS:
+            case BL_MSG_USB_WWID:
+                *bus = BOOT_DISK_BUS_USB;
+                break;
+            case BL_MSG_SATA:
+                *bus = BOOT_DISK_BUS_SATA;              /* HBAPortNumber */
+                *port = len >= 6 ? (UINT32)(b[4] | (b[5] << 8)) : ~0u;
+                break;
+            case BL_MSG_NVME:                           /* NamespaceId */
+                *bus = BOOT_DISK_BUS_NVME;
+                *port = len >= 8 ? (UINT32)b[4] | ((UINT32)b[5] << 8) |
+                                   ((UINT32)b[6] << 16) | ((UINT32)b[7] << 24) : ~0u;
+                break;
+            case BL_MSG_SCSI:                           /* Pun (target) */
+            case BL_MSG_UFS:
+                *bus = BOOT_DISK_BUS_SCSI;
+                *port = len >= 6 ? (UINT32)(b[4] | (b[5] << 8)) : ~0u;
+                break;
+            case BL_MSG_ATAPI:                          /* primary/secondary */
+                *bus = BOOT_DISK_BUS_ATAPI;
+                *port = len >= 6 ? (UINT32)(b[4] * 2 + b[5]) : ~0u;
+                break;
+            case BL_MSG_SD:
+            case BL_MSG_EMMC:
+                *bus = BOOT_DISK_BUS_SD;
+                break;
+            default:
+                break;
+            }
+        } else if ((type == BL_DP_MEDIA && n->SubType == BL_MEDIA_RAMDISK) ||
+                   (type == BL_DP_HARDWARE && n->SubType == BL_HW_VENDOR &&
+                    *bus == BOOT_DISK_BUS_UNKNOWN)) {
+            *bus = BOOT_DISK_BUS_VIRTUAL;
+        }
+        off += len;
+    }
+}
+
+static const char *bl_bus_name(UINT32 bus) {
+    switch (bus) {
+    case BOOT_DISK_BUS_USB:     return "usb";
+    case BOOT_DISK_BUS_SATA:    return "sata";
+    case BOOT_DISK_BUS_NVME:    return "nvme";
+    case BOOT_DISK_BUS_SCSI:    return "scsi";
+    case BOOT_DISK_BUS_ATAPI:   return "ata";
+    case BOOT_DISK_BUS_SD:      return "sd/mmc";
+    case BOOT_DISK_BUS_VIRTUAL: return "virtual";
+    default:                    return "unknown";
+    }
+}
+
+/* Find the loader partition and record its identity in boot_info. */
+static void boot_identity_init(EFI_HANDLE image) {
+    EFI_LOADED_IMAGE *li = NULL;
+    EFI_DEVICE_PATH *dp = NULL;
+
+    g_loader.have_hd = FALSE;
+    g_boot_info.rootid_magic = BOOT_ROOTID_MAGIC;
+    g_boot_info.loader_part_sig_type = BOOT_PART_SIG_NONE;
+    g_boot_info.loader_disk_bus = BOOT_DISK_BUS_UNKNOWN;
+    g_boot_info.loader_disk_port = ~0u;
+
+    if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, image,
+                                    &LoadedImageProtocol, (VOID **)&li)) || !li) {
+        serial_puts("boot-id: no LoadedImage protocol on our image handle\n");
+        return;
+    }
+    g_loader.device = li->DeviceHandle;
+    if (!li->DeviceHandle ||
+        EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, li->DeviceHandle,
+                                    &DevicePathProtocol, (VOID **)&dp)) || !dp) {
+        serial_puts("boot-id: the loader's device has no device path\n");
+        return;
+    }
+    g_loader.dp = dp;
+
+    /* The device path as text, for the logs on both sides. */
+    {
+        CHAR16 *s = DevicePathToStr(dp);
+        if (s) {
+            UINTN i = 0;
+            for (; s[i] && i + 1 < sizeof(g_boot_info.loader_device_path); i++)
+                g_boot_info.loader_device_path[i] =
+                    (s[i] >= 0x20 && s[i] < 0x7f) ? (char)s[i] : '?';
+            g_boot_info.loader_device_path[i] = 0;
+            uefi_call_wrapper(BS->FreePool, 1, s);
+        }
+        serial_puts("boot-id: loader device path ");
+        serial_puts(g_boot_info.loader_device_path[0] ?
+                    g_boot_info.loader_device_path : "(no text form)");
+        serial_putc('\n');
+    }
+
+    if (!bl_dp_find_hd(dp, &g_loader.prefix_len, &g_loader.hd)) {
+        /* A loader started from a whole-disk filesystem, a CD image or a
+         * network: there is no partition to identify the disk by. */
+        serial_puts("boot-id: no HD() node -- loader not on a disk partition\n");
+        return;
+    }
+    g_loader.have_hd = TRUE;
+    g_boot_info.loader_part_number = g_loader.hd.PartitionNumber;
+    g_boot_info.loader_part_start = g_loader.hd.PartitionStart;
+    g_boot_info.loader_part_size = g_loader.hd.PartitionSize;
+    bl_mem_copy(g_boot_info.loader_part_sig, g_loader.hd.Signature, 16);
+    if (g_loader.hd.SignatureType == BL_HD_SIG_GUID)
+        g_boot_info.loader_part_sig_type = BOOT_PART_SIG_GPT;
+    else if (g_loader.hd.SignatureType == BL_HD_SIG_MBR)
+        g_boot_info.loader_part_sig_type = BOOT_PART_SIG_MBR;
+    if (g_boot_info.loader_part_sig_type == BOOT_PART_SIG_MBR) {
+        /* only the 32-bit disk signature is meaningful */
+        for (int i = 4; i < 16; i++) g_boot_info.loader_part_sig[i] = 0;
+    }
+    bl_hd_partuuid(&g_loader.hd, g_boot_info.loader_partuuid);
+    bl_dp_classify_bus(dp, g_loader.prefix_len, &g_boot_info.loader_disk_bus,
+                       &g_boot_info.loader_disk_port);
+
+    serial_puts("boot-id: loader partition ");
+    serial_putdec(g_loader.hd.PartitionNumber);
+    serial_puts(g_boot_info.loader_part_sig_type == BOOT_PART_SIG_GPT ? " GPT" :
+                g_boot_info.loader_part_sig_type == BOOT_PART_SIG_MBR ? " MBR" :
+                " (no signature)");
+    serial_puts(" PARTUUID=");
+    serial_puts(g_boot_info.loader_partuuid[0] ? g_boot_info.loader_partuuid : "-");
+    serial_puts(" start=");
+    serial_putdec(g_loader.hd.PartitionStart);
+    serial_puts(" size=");
+    serial_putdec(g_loader.hd.PartitionSize);
+    serial_puts(" bus=");
+    serial_puts(bl_bus_name(g_boot_info.loader_disk_bus));
+    serial_putc('\n');
+    Print(L"Loader partition: %d, PARTUUID=%a (%a)\r\n",
+          (int)g_loader.hd.PartitionNumber,
+          g_boot_info.loader_partuuid[0] ? g_boot_info.loader_partuuid : "-",
+          bl_bus_name(g_boot_info.loader_disk_bus));
+}
+
+/* ---- Boot command line -------------------------------------------------- */
+
+/* Normalise raw command-line text into boot_info.cmdline: lines starting
+ * with '#' are comments, every run of blanks, tabs and line ends becomes one
+ * space, anything outside printable ASCII is dropped, and the result is
+ * trimmed.  `skip_first' drops the first word (the program's own name, which
+ * a UEFI shell puts in front of the options). */
+static void bl_cmdline_set(const char *raw, UINTN len, BOOLEAN skip_first) {
+    char *out = g_boot_info.cmdline;
+    UINTN cap = sizeof(g_boot_info.cmdline), o = 0;
+    BOOLEAN line_start = TRUE, in_comment = FALSE, pending_space = FALSE;
+    BOOLEAN skipping = skip_first;
+
+    for (UINTN i = 0; i < len; i++) {
+        char ch = raw[i];
+        if (ch == 0) break;
+        if (ch == '\r' || ch == '\n') {
+            line_start = TRUE;
+            in_comment = FALSE;
+            pending_space = o > 0;
+            skipping = FALSE;
+            continue;
+        }
+        if (in_comment) continue;
+        if (line_start && ch == '#') { in_comment = TRUE; continue; }
+        if (ch == ' ' || ch == '\t') {
+            if (!line_start) pending_space = o > 0;
+            if (skipping && !line_start) skipping = FALSE;
+            continue;
+        }
+        line_start = FALSE;
+        if (ch < 0x20 || ch > 0x7e) continue;
+        if (skipping) continue;
+        if (pending_space) {
+            if (o + 1 >= cap) break;
+            out[o++] = ' ';
+            pending_space = FALSE;
+        }
+        if (o + 1 >= cap) break;
+        out[o++] = ch;
+    }
+    out[o] = 0;
+}
+
+/* The value of the word `key=' of boot_info.cmdline (the last one wins, as
+ * with repeated kernel options); FALSE when absent. */
+static BOOLEAN bl_cmdline_get(const char *key, char *val, UINTN cap) {
+    const char *s = g_boot_info.cmdline;
+    BOOLEAN found = FALSE;
+    UINTN klen = 0;
+    while (key[klen]) klen++;
+    while (*s) {
+        while (*s == ' ') s++;
+        const char *w = s;
+        while (*s && *s != ' ') s++;
+        if ((UINTN)(s - w) > klen && bl_str_prefix(w, key) && w[klen] == '=') {
+            UINTN n = 0;
+            const char *v = w + klen + 1;
+            while (v < s && n + 1 < cap) val[n++] = *v++;
+            val[n] = 0;
+            found = TRUE;
+        }
+    }
+    return found;
+}
+
+/* The boot entry's load options as a command line: UCS-2 text, accepted
+ * only when it really is printable text (firmware passes binary data there
+ * for its own boot entries).  A UEFI shell includes the program name as the
+ * first word; it is dropped when it names an .efi file. */
+static BOOLEAN bl_cmdline_from_load_options(EFI_HANDLE image) {
+    EFI_LOADED_IMAGE *li = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, image,
+                                    &LoadedImageProtocol, (VOID **)&li)) || !li)
+        return FALSE;
+    if (!li->LoadOptions || li->LoadOptionsSize < 2 || (li->LoadOptionsSize & 1))
+        return FALSE;
+    const CHAR16 *w = (const CHAR16 *)li->LoadOptions;
+    UINTN n = li->LoadOptionsSize / 2;
+    char tmp[512];
+    UINTN o = 0;
+    for (UINTN i = 0; i < n && w[i]; i++) {
+        CHAR16 ch = w[i];
+        if (ch != '\t' && ch != '\r' && ch != '\n' && (ch < 0x20 || ch > 0x7e))
+            return FALSE;                     /* not text: firmware data */
+        if (o + 1 < sizeof(tmp)) tmp[o++] = (char)ch;
+    }
+    tmp[o] = 0;
+    if (o == 0) return FALSE;
+    /* Is the first word a program name? */
+    BOOLEAN skip = FALSE;
+    {
+        UINTN i = 0, end;
+        while (i < o && tmp[i] == ' ') i++;
+        end = i;
+        while (end < o && tmp[end] != ' ') end++;
+        if (end - i >= 4 && tmp[end - 4] == '.' && bl_lower(tmp[end - 3]) == 'e' &&
+            bl_lower(tmp[end - 2]) == 'f' && bl_lower(tmp[end - 1]) == 'i')
+            skip = TRUE;
+    }
+    bl_cmdline_set(tmp, o, skip);
+    if (!g_boot_info.cmdline[0]) return FALSE;
+    g_boot_info.cmdline_source = BOOT_CMDLINE_LOAD_OPTIONS;
+    return TRUE;
+}
+
+/* \EFI\LIKEOS\cmdline.txt on the partition the loader came from. */
+static BOOLEAN bl_cmdline_from_esp(void) {
+    EFI_FILE_IO_INTERFACE *fs = NULL;
+    EFI_FILE_HANDLE root = NULL, file = NULL;
+    char buf[1024];
+    UINTN size = sizeof(buf) - 1;
+    BOOLEAN ok = FALSE;
+
+    if (!g_loader.device ||
+        EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, g_loader.device,
+                                    &FileSystemProtocol, (VOID **)&fs)) || !fs)
+        return FALSE;
+    if (EFI_ERROR(uefi_call_wrapper(fs->OpenVolume, 2, fs, &root)) || !root)
+        return FALSE;
+    if (!EFI_ERROR(uefi_call_wrapper(root->Open, 5, root, &file,
+                                     BOOT_CMDLINE_PATH, EFI_FILE_MODE_READ, 0ULL)) &&
+        file) {
+        if (!EFI_ERROR(uefi_call_wrapper(file->Read, 3, file, &size, buf)) && size > 0) {
+            if (size >= sizeof(buf)) size = sizeof(buf) - 1;
+            buf[size] = 0;
+            bl_cmdline_set(buf, size, FALSE);
+            if (g_boot_info.cmdline[0]) {
+                g_boot_info.cmdline_source = BOOT_CMDLINE_ESP_FILE;
+                ok = TRUE;
+            }
+        }
+        uefi_call_wrapper(file->Close, 1, file);
+    }
+    uefi_call_wrapper(root->Close, 1, root);
+    return ok;
+}
+
+/* The command line (load options first, then the ESP file) and its root=. */
+static void boot_cmdline_init(EFI_HANDLE image) {
+    g_boot_info.cmdline[0] = 0;
+    g_boot_info.root_spec[0] = 0;
+    g_boot_info.cmdline_source = BOOT_CMDLINE_NONE;
+    if (!bl_cmdline_from_load_options(image))
+        bl_cmdline_from_esp();
+    if (g_boot_info.cmdline[0]) {
+        serial_puts("boot-id: command line (");
+        serial_puts(g_boot_info.cmdline_source == BOOT_CMDLINE_LOAD_OPTIONS ?
+                    "load options" : "ESP cmdline.txt");
+        serial_puts("): ");
+        serial_puts(g_boot_info.cmdline);
+        serial_putc('\n');
+        Print(L"Boot command line: %a\r\n", g_boot_info.cmdline);
+    }
+    if (bl_cmdline_get("root", g_boot_info.root_spec, sizeof(g_boot_info.root_spec))) {
+        serial_puts("boot-id: root=");
+        serial_puts(g_boot_info.root_spec);
+        serial_putc('\n');
+    }
+}
+
+/* ---- The loader disk's partition table ----------------------------------- */
+
+/* Read the GPT of the loader's disk through the whole-disk BLOCK_IO handle
+ * (the one whose device path is exactly the disk prefix).  Only the entries'
+ * type and unique GUIDs and their names are kept.  The header CRC is not
+ * re-checked: the firmware already accepted this table to produce the HD()
+ * nodes; the entry array bounds are checked. */
+static void bl_read_loader_gpt(void) {
+    EFI_GUID blk_guid = BLOCK_IO_PROTOCOL;
+    EFI_HANDLE *handles = NULL;
+    UINTN nhandles = 0;
+
+    g_loader_gpt.valid = FALSE;
+    g_loader_gpt.nr = 0;
+    if (!g_loader.have_hd || g_loader.hd.SignatureType != BL_HD_SIG_GUID) return;
+    if (EFI_ERROR(uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol,
+                                    &blk_guid, NULL, &nhandles, &handles)) || !handles)
+        return;
+    for (UINTN h = 0; h < nhandles && !g_loader_gpt.valid; h++) {
+        EFI_BLOCK_IO_PROTOCOL *blk = NULL;
+        EFI_DEVICE_PATH *dp = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
+                                        &blk_guid, (VOID **)&blk)) || !blk)
+            continue;
+        if (!blk->Media || !blk->Media->MediaPresent || blk->Media->LogicalPartition)
+            continue;
+        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
+                                        &DevicePathProtocol, (VOID **)&dp)) || !dp)
+            continue;
+        if (!bl_dp_on_loader_disk(dp, FALSE))
+            continue;
+        UINT32 bs = blk->Media->BlockSize;
+        if (bs < 512 || bs > 4096 || (bs & (bs - 1))) continue;
+
+        UINT8 *hdr = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, bs,
+                                        (VOID **)&hdr)) || !hdr)
+            break;
+        if (EFI_ERROR(uefi_call_wrapper(blk->ReadBlocks, 5, blk, blk->Media->MediaId,
+                                        (EFI_LBA)1, (UINTN)bs, hdr)) ||
+            !bl_mem_eq(hdr, "EFI PART", 8)) {
+            uefi_call_wrapper(BS->FreePool, 1, hdr);
+            serial_puts("boot-id: loader disk has no readable GPT header\n");
+            break;
+        }
+        UINT64 ent_lba = 0;
+        UINT32 num = 0, esz = 0;
+        bl_mem_copy(&ent_lba, hdr + 72, 8);
+        bl_mem_copy(&num, hdr + 80, 4);
+        bl_mem_copy(&esz, hdr + 84, 4);
+        uefi_call_wrapper(BS->FreePool, 1, hdr);
+        if (esz < 128 || esz > 1024 || (esz & 7) || num == 0 || ent_lba < 2 ||
+            ent_lba > blk->Media->LastBlock) {
+            serial_puts("boot-id: loader disk GPT header out of range\n");
+            break;
+        }
+        if (num > BL_GPT_MAX_ENTRIES) num = BL_GPT_MAX_ENTRIES;
+        UINTN bytes = (UINTN)num * esz;
+        UINTN blocks = (bytes + bs - 1) / bs;
+        UINT8 *arr = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                        blocks * bs, (VOID **)&arr)) || !arr)
+            break;
+        if (!EFI_ERROR(uefi_call_wrapper(blk->ReadBlocks, 5, blk, blk->Media->MediaId,
+                                         (EFI_LBA)ent_lba, blocks * bs, arr))) {
+            for (UINT32 i = 0; i < num; i++) {
+                const UINT8 *e = arr + (UINTN)i * esz;
+                bl_mem_copy(g_loader_gpt.type[i], e + 0, 16);
+                bl_mem_copy(g_loader_gpt.uuid[i], e + 16, 16);
+                /* name: 36 UTF-16LE units at offset 56, folded to ASCII */
+                UINTN k = 0;
+                for (; k < 36; k++) {
+                    UINT16 u = (UINT16)(e[56 + 2 * k] | (e[57 + 2 * k] << 8));
+                    if (!u) break;
+                    g_loader_gpt.name[i][k] = (u >= 0x20 && u < 0x7f) ? (char)u : '?';
+                }
+                g_loader_gpt.name[i][k] = 0;
+            }
+            g_loader_gpt.nr = num;
+            g_loader_gpt.valid = TRUE;
+        }
+        uefi_call_wrapper(BS->FreePool, 1, arr);
+    }
+    uefi_call_wrapper(BS->FreePool, 1, handles);
+    serial_puts(g_loader_gpt.valid ? "boot-id: loader disk GPT read, entries="
+                                   : "boot-id: loader disk GPT not available\n");
+    if (g_loader_gpt.valid) {
+        serial_putdec(g_loader_gpt.nr);
+        serial_putc('\n');
+    }
+}
+
+/* ---- Root partition selection --------------------------------------------- */
+
+/* Candidate ranks, best first.  What the kernel does with its own drivers
+ * is the same ladder (kernel/ke/storage.c). */
+#define BL_RANK_ROOT_SPEC   0   /* named by root= */
+#define BL_RANK_ROOT_TYPE   1   /* loader disk, GPT type x86-64 root */
+#define BL_RANK_LOADER_DISK 2   /* loader disk, any other ext4 partition */
+#define BL_RANK_ANY         3   /* any other ext4 (the old search) */
+#define BL_RANK_NONE        4
+
+#define BL_MAX_CANDIDATES 64
+
+typedef struct {
+    EFI_BLOCK_IO_PROTOCOL *blk;
+    UINT32  rank;
+    UINT32  partno;              /* 0 = whole device */
+    char    partuuid[40];
+    char    fs_uuid[40];
+    char    label[17];
+} bl_cand_t;
+
+/* Does candidate `c' match the root= specification? */
+static BOOLEAN bl_root_spec_matches(const bl_cand_t *c, const char *gpt_name) {
+    const char *spec = g_boot_info.root_spec;
+    if (!spec[0]) return FALSE;
+    if (bl_str_prefix(spec, "PARTUUID="))
+        return c->partuuid[0] && bl_str_eq_nocase(spec + 9, c->partuuid);
+    if (bl_str_prefix(spec, "UUID="))
+        return c->fs_uuid[0] && bl_str_eq_nocase(spec + 5, c->fs_uuid);
+    if (bl_str_prefix(spec, "LABEL="))          /* labels compare exactly */
+        return c->label[0] && bl_str_eq(spec + 6, c->label);
+    if (bl_str_prefix(spec, "PARTLABEL="))
+        return gpt_name && gpt_name[0] && bl_str_eq_nocase(spec + 10, gpt_name);
+    /* /dev/sdXN and other kernel device names mean nothing to the firmware;
+     * the kernel resolves them itself. */
+    return FALSE;
+}
+
+/* Choose the ext4 partition to read kernel.elf (and the display setting)
+ * from, by the ranks above, and only among partitions that actually hold
+ * /boot/kernel.elf.  Sets g_root_blk and boot_info.kernel_partuuid. */
+static void boot_select_root(void) {
+    EFI_GUID blk_guid = BLOCK_IO_PROTOCOL;
+    EFI_HANDLE *handles = NULL;
+    UINTN nhandles = 0;
+    bl_cand_t *cands = NULL;
+    UINT32 ncand = 0;
+    UINT8 *sb = NULL;
+
+    g_root_blk = NULL;
+    g_boot_info.kernel_partuuid[0] = 0;
+    if (EFI_ERROR(uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol,
+                                    &blk_guid, NULL, &nhandles, &handles)) || !handles)
+        return;
+    if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                    sizeof(bl_cand_t) * BL_MAX_CANDIDATES,
+                                    (VOID **)&cands)) || !cands ||
+        EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, 1024,
+                                    (VOID **)&sb)) || !sb) {
+        if (cands) uefi_call_wrapper(BS->FreePool, 1, cands);
+        uefi_call_wrapper(BS->FreePool, 1, handles);
+        return;
+    }
+
+    for (UINTN h = 0; h < nhandles && ncand < BL_MAX_CANDIDATES; h++) {
+        EFI_BLOCK_IO_PROTOCOL *blk = NULL;
+        EFI_DEVICE_PATH *dp = NULL;
+        bl_hd_node_t hd;
+        UINTN prefix = 0;
+        e4_ctx c;
+
+        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
+                                        &blk_guid, (VOID **)&blk)) || !blk)
+            continue;
+        if (EFI_ERROR(e4_ctx_open(blk, &c, sb)))
+            continue;                               /* not ext4 */
+        e4_ctx_close(&c);
+
+        bl_cand_t *cd = &cands[ncand];
+        cd->blk = blk;
+        cd->rank = BL_RANK_ANY;
+        cd->partno = 0;
+        cd->partuuid[0] = 0;
+        bl_uuid_to_str(sb + 104, cd->fs_uuid);       /* s_uuid */
+        bl_mem_copy(cd->label, sb + 120, 16);        /* s_volume_name */
+        cd->label[16] = 0;
+
+        const char *gpt_name = NULL;
+        BOOLEAN is_root_type = FALSE, same_disk = FALSE;
+        if (!EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
+                                         &DevicePathProtocol, (VOID **)&dp)) && dp &&
+            bl_dp_find_hd(dp, &prefix, &hd)) {
+            cd->partno = hd.PartitionNumber;
+            bl_hd_partuuid(&hd, cd->partuuid);
+            same_disk = bl_dp_on_loader_disk(dp, TRUE);
+            if (same_disk && g_loader_gpt.valid && hd.SignatureType == BL_HD_SIG_GUID) {
+                for (UINT32 i = 0; i < g_loader_gpt.nr; i++) {
+                    if (!bl_mem_eq(g_loader_gpt.uuid[i], hd.Signature, 16)) continue;
+                    is_root_type = bl_mem_eq(g_loader_gpt.type[i],
+                                             g_gpt_type_root_x86_64, 16);
+                    gpt_name = g_loader_gpt.name[i];
+                    break;
+                }
+            }
+        }
+        if (bl_root_spec_matches(cd, gpt_name))
+            cd->rank = BL_RANK_ROOT_SPEC;
+        else if (is_root_type)
+            cd->rank = BL_RANK_ROOT_TYPE;
+        else if (same_disk)
+            cd->rank = BL_RANK_LOADER_DISK;
+
+        serial_puts("boot-root: ext4 candidate part=");
+        serial_putdec(cd->partno);
+        serial_puts(" PARTUUID=");
+        serial_puts(cd->partuuid[0] ? cd->partuuid : "-");
+        serial_puts(" UUID=");
+        serial_puts(cd->fs_uuid);
+        serial_puts(" rank=");
+        serial_putdec(cd->rank);
+        serial_puts(is_root_type ? " (x86-64 root type)" : "");
+        serial_puts(same_disk ? " (loader disk)\n" : "\n");
+        ncand++;
+    }
+
+    /* Best rank first, firmware order within a rank; the first candidate
+     * that holds /boot/kernel.elf is the root. */
+    for (UINT32 rank = BL_RANK_ROOT_SPEC; rank < BL_RANK_NONE && !g_root_blk; rank++) {
+        for (UINT32 i = 0; i < ncand && !g_root_blk; i++) {
+            if (cands[i].rank != rank) continue;
+            e4_ctx c;
+            UINT8 inode[256];
+            if (EFI_ERROR(e4_ctx_open(cands[i].blk, &c, NULL))) continue;
+            UINT32 ino = e4_resolve(&c, "/boot/kernel.elf", inode);
+            e4_ctx_close(&c);
+            if (!ino) continue;
+            g_root_blk = cands[i].blk;
+            bl_str_copy(g_boot_info.kernel_partuuid, sizeof(g_boot_info.kernel_partuuid),
+                        cands[i].partuuid);
+            serial_puts("boot-root: selected part=");
+            serial_putdec(cands[i].partno);
+            serial_puts(" PARTUUID=");
+            serial_puts(cands[i].partuuid[0] ? cands[i].partuuid : "-");
+            serial_puts(rank == BL_RANK_ROOT_SPEC ? " (root= on the command line)\n" :
+                        rank == BL_RANK_ROOT_TYPE ? " (x86-64 root type on the loader disk)\n" :
+                        rank == BL_RANK_LOADER_DISK ? " (ext4 on the loader disk; partition type is not the x86-64 root type)\n" :
+                        " (first ext4 partition found: no loader identity match)\n");
+            Print(L"Root partition: %d, PARTUUID=%a\r\n", (int)cands[i].partno,
+                  cands[i].partuuid[0] ? cands[i].partuuid : "-");
+        }
+    }
+    if (!g_root_blk)
+        serial_puts("boot-root: no ext4 partition with /boot/kernel.elf found\n");
+    if (g_boot_info.root_spec[0] && ncand) {
+        BOOLEAN matched = FALSE;
+        for (UINT32 i = 0; i < ncand; i++)
+            if (cands[i].rank == BL_RANK_ROOT_SPEC) matched = TRUE;
+        if (!matched)
+            serial_puts("boot-root: root= names no ext4 partition the firmware can see "
+                        "(the kernel resolves it again with its own drivers)\n");
+    }
+
+    uefi_call_wrapper(BS->FreePool, 1, sb);
+    uefi_call_wrapper(BS->FreePool, 1, cands);
+    uefi_call_wrapper(BS->FreePool, 1, handles);
+}
+
+/* Load the file at `path' (at most `max_size' bytes) from the ext4 root into
+ * a freshly allocated pool buffer: /boot/kernel.elf, and the saved display
+ * setting before it.  Once boot_select_root() has chosen the root partition
+ * only that partition is read -- a display setting or a kernel from another
+ * disk's installation must never be mixed into this boot.  Without a choice
+ * (no partition held /boot/kernel.elf when it looked) every ext4 partition
+ * is tried in firmware order, as this loader always did. */
 static EFI_STATUS try_load_file_ext4(const char *path, UINT64 max_size,
                                      VOID **out_buf, UINTN *out_size) {
+    if (g_root_blk) {
+        e4_ctx c;
+        EFI_STATUS st = e4_ctx_open(g_root_blk, &c, NULL);
+        if (EFI_ERROR(st)) return st;
+        st = e4_load_file(&c, path, max_size, out_buf, out_size);
+        e4_ctx_close(&c);
+        return st;
+    }
+
     EFI_GUID blk_guid = BLOCK_IO_PROTOCOL;
     EFI_HANDLE *handles = NULL;
     UINTN nhandles = 0;
@@ -1128,130 +2177,14 @@ static EFI_STATUS try_load_file_ext4(const char *path, UINT64 max_size,
     EFI_STATUS result = EFI_NOT_FOUND;
     for (UINTN h = 0; h < nhandles && EFI_ERROR(result); h++) {
         EFI_BLOCK_IO_PROTOCOL *blk = NULL;
-        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
-                                        &blk_guid, (VOID **)&blk)))
-            continue;
-        if (!blk || !blk->Media || !blk->Media->MediaPresent) continue;
-        UINT32 dev_bs = blk->Media->BlockSize;
-        if (dev_bs == 0 || dev_bs > 4096) continue;
-
-        /* Read enough to cover the superblock at byte offset 1024. */
-        UINT32 probe_bytes = dev_bs > 2048 ? dev_bs : 2048;
-        UINT8 *probe = NULL;
-        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
-                                        probe_bytes, (VOID **)&probe)))
-            continue;
-        UINT32 probe_sectors = probe_bytes / dev_bs;
-        if (EFI_ERROR(uefi_call_wrapper(blk->ReadBlocks, 5, blk,
-                                        blk->Media->MediaId, (EFI_LBA)0,
-                                        (UINTN)probe_bytes, probe))) {
-            uefi_call_wrapper(BS->FreePool, 1, probe);
-            continue;
-        }
-        (void)probe_sectors;
-        const UINT8 *sb = probe + 1024;
-        if (e4_rd16(sb + 56) != E4_SUPER_MAGIC) {
-            uefi_call_wrapper(BS->FreePool, 1, probe);
-            continue;
-        }
-
-        /* Build the context from the superblock. */
         e4_ctx c;
-        c.blk = blk;
-        c.media_id = blk->Media->MediaId;
-        c.dev_bs = dev_bs;
-        c.block_size = 1024u << e4_rd32(sb + 24);          /* s_log_block_size */
-        c.inodes_per_group = e4_rd32(sb + 40);
-        c.inode_size = e4_rd16(sb + 88);
-        if (c.inode_size < 128) c.inode_size = 128;
-        UINT32 incompat = e4_rd32(sb + 96);
-        c.desc_size = 32;
-        if (incompat & E4_INCOMPAT_64BIT) {
-            UINT16 ds = e4_rd16(sb + 254);
-            c.desc_size = ds >= 32 ? ds : 32;
-        }
-        UINT32 first_data = e4_rd32(sb + 20);              /* s_first_data_block */
-        if (c.block_size == 0 || c.dev_bs == 0 ||
-            c.block_size < c.dev_bs || (c.block_size % c.dev_bs) != 0) {
-            uefi_call_wrapper(BS->FreePool, 1, probe);
+        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
+                                        &blk_guid, (VOID **)&blk)) || !blk)
             continue;
-        }
-        c.spb = c.block_size / c.dev_bs;
-        c.gdt_block = (UINT64)first_data + 1;
-        uefi_call_wrapper(BS->FreePool, 1, probe);
-
-        /* Allocate the two reusable ext4-block scratch buffers. */
-        c.scratch = NULL; c.node = NULL;
-        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
-                                        c.block_size, (VOID **)&c.scratch)) ||
-            EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
-                                        c.block_size, (VOID **)&c.node))) {
-            if (c.scratch) uefi_call_wrapper(BS->FreePool, 1, c.scratch);
-            if (c.node)    uefi_call_wrapper(BS->FreePool, 1, c.node);
+        if (EFI_ERROR(e4_ctx_open(blk, &c, NULL)))
             continue;
-        }
-
-        UINT8 inode[256];
-        do {
-            UINT32 ino = e4_resolve(&c, path, inode);
-            if (!ino) continue;
-            UINT64 size = e4_isize(inode);
-            if (size == 0 || size > max_size) continue;
-
-            /* A file small enough to live in the inode itself (inline
-             * data): its bytes are where the block map would be. */
-            if ((e4_rd32(inode + 32) & E4_INLINE_DATA_FL) && size <= 60) {
-                VOID *ibuf = NULL;
-                if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
-                                                (UINTN)size, &ibuf)) || !ibuf)
-                    continue;
-                for (UINT64 z = 0; z < size; z++)
-                    ((UINT8 *)ibuf)[z] = inode[40 + z];
-                *out_buf = ibuf;
-                *out_size = (UINTN)size;
-                result = EFI_SUCCESS;
-                continue;
-            }
-
-            /* Allocate rounded up to whole blocks so bulk reads of full blocks
-             * never overflow (the ELF loader only consumes `size` bytes). */
-            UINT64 nblk = (size + c.block_size - 1) / c.block_size;
-            UINTN  alloc = (UINTN)(nblk * c.block_size);
-            VOID *kbuf = NULL;
-            if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
-                                            alloc, &kbuf)) || !kbuf)
-                continue;
-            /* Read contiguous physical block runs in a single ReadBlocks call
-             * instead of one transfer per 4 KB block — turns a ~1.3 MB kernel
-             * load from ~300 USB transactions into a handful. */
-            int ok = 1;
-            UINT64 b = 0;
-            while (b < nblk) {
-                UINT8 *dst = (UINT8 *)kbuf + b * c.block_size;
-                UINT64 pbn = e4_bmap(&c, inode, b);
-                if (!pbn) {                                  /* sparse hole */
-                    for (UINT64 z = 0; z < c.block_size; z++) dst[z] = 0;
-                    b++;
-                    continue;
-                }
-                UINT64 run = 1;
-                while (b + run < nblk && run < 1024) {        /* cap run at 4 MB */
-                    if (e4_bmap(&c, inode, b + run) != pbn + run) break;
-                    run++;
-                }
-                if (EFI_ERROR(e4_read_dev(&c, pbn * c.spb,
-                                          (UINT32)(run * c.spb), dst))) { ok = 0; break; }
-                b += run;
-            }
-            if (!ok) { uefi_call_wrapper(BS->FreePool, 1, kbuf); continue; }
-
-            *out_buf = kbuf;
-            *out_size = (UINTN)size;
-            result = EFI_SUCCESS;
-        } while (0);
-
-        uefi_call_wrapper(BS->FreePool, 1, c.scratch);
-        uefi_call_wrapper(BS->FreePool, 1, c.node);
+        result = e4_load_file(&c, path, max_size, out_buf, out_size);
+        e4_ctx_close(&c);
     }
 
     uefi_call_wrapper(BS->FreePool, 1, handles);
@@ -1383,6 +2316,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     //for (;;) {}
     
     Print(L"Loading /boot/kernel.elf from ext4 root...\r\n");
+
+    // Which partition we were started from, the boot command line, and from
+    // those the ext4 root partition: everything read from ext4 below (the
+    // saved display setting, the kernel) comes from that partition alone,
+    // and the kernel receives the same identity to find its root by.
+    boot_identity_init(ImageHandle);
+    boot_cmdline_init(ImageHandle);
+    bl_read_loader_gpt();
+    boot_select_root();
 
     // Get Graphics Output Protocol for framebuffer info
     status = uefi_call_wrapper(BS->LocateProtocol, 3, &GraphicsOutputProtocol, NULL, (VOID**)&gop);

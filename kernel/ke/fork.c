@@ -378,6 +378,8 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * execution context, not to the address space it shares. */
 	child->in_exit_teardown = false;
 	child->in_exit_path = false;
+	child->blk_cpl_ctx = NULL; /* the creator's stack, not ours */
+	child->plug = NULL; /* likewise */
 	task_fpu_fork(child, cur);
 
 	/* A new occupant of a pid, and not traced by whoever traces the parent.

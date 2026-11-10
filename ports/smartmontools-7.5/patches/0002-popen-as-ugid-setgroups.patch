@@ -1,0 +1,28 @@
+smartd: setgroups() with the LikeOS C library declaration.
+
+popen_as_ugid() (smartd's -u option for warning scripts) calls
+setgroups(1, &gid).  The LikeOS C library declares the list as int rather
+than gid_t; both are 32 bits.  A C++ overload taking gid_t forwards to it,
+so the upstream call stays as it is.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -ruN a/popen_as_ugid.cpp b/popen_as_ugid.cpp
+--- a/popen_as_ugid.cpp	2025-04-29 11:36:54.000000000 +0200
++++ b/popen_as_ugid.cpp	2026-11-09 13:03:29.031528745 +0100
+@@ -24,6 +24,15 @@
+ 
+ #include "config.h"
+ 
++#ifdef __LIKEOS__
++// The LikeOS C library declares setgroups() with an int list; gid_t is the
++// same 32 bits, so the call below is forwarded unchanged.
++static inline int setgroups(size_t size, const gid_t * list)
++{
++  return ::setgroups((int)size, reinterpret_cast<const int *>(list));
++}
++#endif
++
+ static FILE * s_popen_file /* = 0 */;
+ static pid_t s_popen_pid /* = 0 */;
+ 

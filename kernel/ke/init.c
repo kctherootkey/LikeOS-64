@@ -27,6 +27,9 @@ void procfs_init(void);
 #include <kernel/hal/ioapic.h>
 #include <kernel/ke/xhci_boot.h>
 #include <kernel/ke/storage.h>
+#include <kernel/hal/serial.h>
+#include <kernel/dev/ata/ahci.h>
+#include <kernel/dev/block/blkdev.h>
 #include <kernel/ke/userinit.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/sched.h>
@@ -214,6 +217,10 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 	// The saved display setting and the firmware's display modes.
 	fbdev_boot_display_init(boot_info);
 
+	// The boot partition's identity and the boot command line, by which
+	// the storage bootstrap finds the root filesystem (BOOT_ROOTID_MAGIC).
+	storage_boot_info_save(boot_info);
+
 	// Save SMP trampoline address from bootloader
 	g_smp_trampoline_address = boot_info->smp_trampoline_addr;
 
@@ -307,6 +314,15 @@ __no_stack_protector void continue_system_startup(void)
 	 * snd_late_init() once the root filesystem is mounted. */
 	snd_init();
 
+	/* The storage stack's completion framework -- the block softirq's
+	 * per-CPU done lists, its IPI and the cache topology that routes
+	 * completions, and kblockd's per-CPU lists -- before the first
+	 * storage driver (USB mass storage below, AHCI after it) can
+	 * register a disk or complete a request.  There are no threads
+	 * yet: until blk_softirq_start() completions requested from process
+	 * context run in the caller. */
+	blk_softirq_init();
+
 	xhci_boot_init(&g_xhci_boot);
 	usbhid_init();
 	usbserial_init();
@@ -314,6 +330,15 @@ __no_stack_protector void continue_system_startup(void)
 	ps2_init();
 	keyboard_init();
 	mouse_init();
+
+	/* SATA disks behind AHCI controllers.  Here, with interrupts still
+	 * off and no scheduler, the driver works entirely by polling: it
+	 * resets each controller, brings the links up, identifies the drives
+	 * and registers their disks and partitions, so that every disk is a
+	 * registered block device before the storage bootstrap below starts
+	 * looking for the root filesystem.  Interrupts and the per-controller
+	 * worker thread come later, with ahci_late_init(). */
+	ahci_init();
 
 	storage_fs_init(&g_storage_state);
 	/* A display driver's late bring-up -- firmware from the root
@@ -413,6 +438,32 @@ __no_stack_protector void continue_system_startup(void)
 	// machines, leading to g_frequency diverging from the real tick rate.
 	// This takes ~2 seconds but keeps wall-clock time accurate.
 	timer_calibrate_frequency();
+
+	/* The storage stack's threads -- kblksoftirqd/N, which takes over
+	 * the block softirq of CPU N when a run at an interrupt tail exceeds
+	 * its bounds or work is raised outside an interrupt, and kblockd/N,
+	 * the per-CPU workers for queue runs, timeouts and requeues.  Started
+	 * before the disk controllers leave polled mode, so the first
+	 * completion an AHCI interrupt hands on finds them running. */
+	blk_softirq_start();
+	/* AHCI controllers leave polled mode here.  This is the first point
+	 * where everything the switch needs exists: interrupts are on (an
+	 * MSI or INTx handler can actually be called), the scheduler runs
+	 * (the per-controller "kahci" error-handling thread can be created
+	 * with sched_add_task), the local timer ticks at its calibrated rate
+	 * (command timeouts on hrtimers and tick deadlines measure real
+	 * time).  And it is still before storage_fs_set_ready() below, so the
+	 * root filesystem is mounted -- and every later disk access made --
+	 * with interrupt-driven I/O and error handling in place, not by the
+	 * boot-time polling path.  Runs on the boot thread and does not
+	 * sleep; anything long is handed to the kahci threads. */
+	ahci_late_init();
+#ifdef SERIAL_ENABLED
+	/* The serial log leaves through its own thread from now on: the
+	 * console never waits for the UART (a hypervisor's virtual port can
+	 * be slow for seconds while the host is busy). */
+	serial_start_thread();
+#endif
 
 	// Wait for DHCP to complete before starting the shell so that DNS
 	// and routing are ready for the very first user command.

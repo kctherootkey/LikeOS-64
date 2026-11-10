@@ -609,9 +609,22 @@ static void fat32_extract_lfn(const fat32_lfn_t *entries, int count, char *out,
 	out[pos] = '\0';
 }
 
-// Maximum sectors per single USB read (1 sector = 512 bytes)
-// 128 sectors = 64KB — optimal for USB mass storage sequential I/O.
+// Maximum sectors per single device read: 128 sectors = 64 KB on a
+// 512-byte device -- optimal for USB mass storage sequential I/O.
+//
+// Units: `lba' and `count' below are DEVICE logical sectors, and the byte
+// stride through the buffer is the device's sector size (fat_sector_bytes):
+// FAT32 addresses in BPB sectors, and fat32_mount_at_lba() accepts a volume
+// only when its BPB sector size equals the device's, so the two units are the
+// same.  A device that reports no sector size is taken as 512-byte, the unit
+// every caller used before 4 KiB-sector devices existed.
 #define MAX_SECTORS_PER_READ 128
+
+static unsigned long fat_sector_bytes(const block_device_t *bdev)
+{
+	unsigned long ss = bdev->sector_size;
+	return ss ? ss : 512;
+}
 
 static int read_sectors(const block_device_t *bdev, unsigned long lba,
 			unsigned long count, void *buf)
@@ -619,6 +632,7 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba,
 	BUG_ON(bdev == NULL);
 	BUG_ON(buf == NULL);
 	might_sleep();
+	const unsigned long ss = fat_sector_bytes(bdev);
 	// Chunk large reads to work around QEMU xHCI DMA limitations
 	unsigned long offset = 0;
 	while (count > 0) {
@@ -638,7 +652,7 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba,
 			return st;
 		}
 		lba += chunk;
-		offset += chunk * 512;
+		offset += chunk * ss;
 		count -= chunk;
 	}
 	return ST_OK;
@@ -650,6 +664,7 @@ static int write_sectors(const block_device_t *bdev, unsigned long lba,
 	if (!bdev || !bdev->write) {
 		return ST_UNSUPPORTED;
 	}
+	const unsigned long ss = fat_sector_bytes(bdev);
 	unsigned long offset = 0;
 	while (count > 0) {
 		unsigned long chunk = (count > MAX_SECTORS_PER_READ) ?
@@ -668,7 +683,7 @@ static int write_sectors(const block_device_t *bdev, unsigned long lba,
 			return st;
 		}
 		lba += chunk;
-		offset += chunk * 512;
+		offset += chunk * ss;
 		count -= chunk;
 	}
 	return ST_OK;
@@ -1816,7 +1831,10 @@ static int fat32_mount_at_lba(const block_device_t *bdev,
 		g_fat_cache_entries = 0;
 	}
 
-	void *sector = kalloc(512);
+	/* One device sector (512 or 4096 bytes): read_sectors() fills whole
+	 * device sectors, so a 512-byte buffer would overflow on a 4Kn disk. */
+	const unsigned long dev_ss = fat_sector_bytes(bdev);
+	void *sector = kalloc(dev_ss);
 	if (!sector)
 		return ST_NOMEM;
 	if (read_sectors(bdev, base_lba, 1, sector) != ST_OK) {
@@ -1837,6 +1855,16 @@ static int fat32_mount_at_lba(const block_device_t *bdev,
 			kfree(sector);
 			return ST_ERR;
 		}
+	}
+	/* Every LBA this driver computes is in BPB sectors and is handed to
+	 * the device as device sectors: the two sizes must agree. */
+	if (bpb->bytes_per_sector != dev_ss) {
+		kprintf("FAT32: BPB sector size %u differs from the device's %lu "
+			"(%s); not mounted\n",
+			(unsigned)bpb->bytes_per_sector, dev_ss,
+			bdev->name ? bdev->name : "?");
+		kfree(sector);
+		return ST_ERR;
 	}
 	unsigned long fat_sz =
 		bpb->fat_size32 ? bpb->fat_size32 : bpb->fat_size16;
@@ -1874,7 +1902,7 @@ static int fat32_mount_at_lba(const block_device_t *bdev,
 		uint16_t fsinfo_sec = bpb->fs_info;
 		if (fsinfo_sec >= 1 &&
 		    fsinfo_sec < bpb->reserved_sector_count) {
-			void *fi_buf = kalloc(512);
+			void *fi_buf = kalloc(dev_ss);
 			if (fi_buf) {
 				unsigned long fi_lba = base_lba + fsinfo_sec;
 				if (read_sectors(bdev, fi_lba, 1, fi_buf) ==
@@ -1926,7 +1954,8 @@ int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 	int cand_count = 0;
 	int protective_gpt = 0;
 
-	void *mbr = kalloc(512);
+	const unsigned long dev_ss = fat_sector_bytes(bdev);
+	void *mbr = kalloc(dev_ss);
 	if (!mbr)
 		return ST_NOMEM;
 	if (read_sectors(bdev, 0, 1, mbr) != ST_OK) {
@@ -1934,6 +1963,23 @@ int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 		return ST_IO;
 	}
 	uint8_t *m = (uint8_t *)mbr;
+
+	/* A partition device (sda1, the root search hands the chosen partition
+	 * over at offset 0) and a disk formatted without a partition table
+	 * both start with the FAT32 boot sector itself.  Its bytes 446..509 are
+	 * boot code, which the MBR interpretation below would misread as
+	 * partition entries, so a valid FAT32 boot sector at sector 0 is
+	 * mounted first and directly. */
+	if (fat32_validate_bpb((const fat32_bpb_t *)m)) {
+		fat32_fs_t tmp;
+		if (fat32_mount_at_lba(bdev, 0, &tmp) == ST_OK) {
+			kfree(mbr);
+			*out = tmp;
+			return ST_OK;
+		}
+		/* not mountable after all: try the partition table below */
+	}
+
 	int has_sig = (m[510] == 0x55 && m[511] == 0xAA);
 	mbr_part_t *p = (mbr_part_t *)(m + 446);
 
@@ -1964,7 +2010,7 @@ int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 
 	// If GPT, parse GPT header to discover ESP (or any) partitions
 	if (protective_gpt) {
-		void *hdr = kalloc(512);
+		void *hdr = kalloc(dev_ss);
 		if (hdr && read_sectors(bdev, 1, 1, hdr) == ST_OK) {
 			uint8_t *h = (uint8_t *)hdr;
 			if (h[0] == 'E' && h[1] == 'F' && h[2] == 'I' &&
@@ -1984,8 +2030,9 @@ int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 					uint64_t bytes =
 						(uint64_t)to_read * entry_size;
 					uint32_t sectors =
-						(uint32_t)((bytes + 511) / 512);
-					void *pe = kalloc(sectors * 512);
+						(uint32_t)((bytes + dev_ss - 1) /
+							   dev_ss);
+					void *pe = kalloc(sectors * dev_ss);
 					if (pe &&
 					    read_sectors(
 						    bdev,

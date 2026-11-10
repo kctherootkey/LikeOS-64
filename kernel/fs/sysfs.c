@@ -10,6 +10,8 @@
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 
+void blk_sysfs_init(void); /* kernel/dev/block/blk_sysfs.c */
+
 static struct pfs g_sysfs;
 
 void sysfs_pci_path(const pci_device_t *dev, char *out, size_t cap)
@@ -285,6 +287,11 @@ struct pfs_node *sysfs_add_attr(const char *base, const char *name,
 	return pfs_add_file(&g_sysfs, path, show, arg, arg2);
 }
 
+struct pfs_node *sysfs_mkdir(const char *path)
+{
+	return pfs_mkdir(&g_sysfs, path);
+}
+
 void sysfs_init(void)
 {
 	int count = 0;
@@ -297,5 +304,8 @@ void sysfs_init(void)
 	pfs_mkdir(&g_sysfs, "devices/virtual");
 	for (int i = 0; i < count; i++)
 		sysfs_add_pci(&devs[i]);
+	/* /sys/block, /sys/class/block, /sys/dev/block and the disk power
+	 * trigger: directories the block layer fills from its registry. */
+	blk_sysfs_init();
 	vfs_register_mount("/sys", pfs_ops(&g_sysfs));
 }

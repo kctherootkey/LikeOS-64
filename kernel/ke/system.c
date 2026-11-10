@@ -2,7 +2,12 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
+/* The storage contract headers first: they must come before any direct
+ * include of <kernel/ke/syscall.h>. */
+#include <kernel/dev/ata/ahci.h>
+#include <kernel/dev/block/blkdev.h>
 #include <kernel/ke/sched.h>
+#include <kernel/hal/serial.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
 #include <kernel/mm/rwsem.h>
@@ -93,6 +98,34 @@ int64_t sys_uname(uint64_t buf)
 
 static int g_cad_enabled = 0; // Ctrl-Alt-Del behaviour
 
+/* Bring the disks down before the machine goes: drain every disk's queue,
+ * flush its write cache and -- for power-off and halt -- park it with
+ * STANDBY IMMEDIATE (blk_shutdown_all), then stop the AHCI controllers
+ * (ahci_shutdown_all).  Exactly once per boot: sys_reboot() does it while
+ * interrupts and the scheduler still work; the ACPI power-off path calls
+ * it as well for any other way of getting there, and then finds it done.
+ * `mode' is an enum blk_shutdown_mode. */
+/* The disk shutdown mode of a reboot() command: power-off (0x4321FEDC)
+ * and halt (0xCDEF0123) park the drives, a restart leaves them spinning. */
+static int reboot_storage_mode(uint32_t cmd)
+{
+	if (cmd == 0x4321FEDCu)
+		return BLK_SHUTDOWN_POWEROFF;
+	if (cmd == 0xCDEF0123u)
+		return BLK_SHUTDOWN_HALT;
+	return BLK_SHUTDOWN_REBOOT;
+}
+
+void system_storage_shutdown(int mode)
+{
+	static volatile int done;
+
+	if (__atomic_exchange_n(&done, 1, __ATOMIC_SEQ_CST))
+		return;
+	blk_shutdown_all((enum blk_shutdown_mode)mode);
+	ahci_shutdown_all();
+}
+
 int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 		   uint64_t arg)
 {
@@ -118,6 +151,9 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 	case LINUX_REBOOT_CMD_POWER_OFF:
 	case LINUX_REBOOT_CMD_RESTART2:
 		sys_sync();
+		/* Then the disks themselves: their write caches flushed (and
+		 * parked for power-off/halt) while interrupts still work. */
+		system_storage_shutdown(reboot_storage_mode((uint32_t)cmd));
 		break;
 	default:
 		break;
@@ -125,6 +161,7 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
 	switch ((uint32_t)cmd) {
 	case LINUX_REBOOT_CMD_RESTART:
+		serial_set_sync();
 		kprintf("[REBOOT] System is going down for reboot NOW!\n");
 		__asm__ volatile("cli");
 		smp_halt_others();
@@ -133,6 +170,7 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 			__asm__ volatile("hlt");
 
 	case LINUX_REBOOT_CMD_HALT:
+		serial_set_sync();
 		kprintf("[HALT] System halted.\n");
 		__asm__ volatile("cli");
 		smp_halt_others();
@@ -140,6 +178,7 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 			__asm__ volatile("hlt");
 
 	case LINUX_REBOOT_CMD_POWER_OFF:
+		serial_set_sync();
 		kprintf("[POWEROFF] Power down.\n");
 		__asm__ volatile("cli");
 		smp_halt_others();
@@ -157,6 +196,7 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
 	case LINUX_REBOOT_CMD_RESTART2: {
 		// arg is a pointer to a command string (ignored in our impl)
+		serial_set_sync();
 		kprintf("[REBOOT] System is going down for reboot NOW!\n");
 		__asm__ volatile("cli");
 		smp_halt_others();

@@ -1,0 +1,33 @@
+--fallocate through the C library's fallocate().
+
+fallocate.c reaches the system call through syscall(SYS_fallocate, ...) and
+reports "built without support" when that name is missing.  The LikeOS C
+library has fallocate() itself (the system call has its own number there),
+so the LikeOS branch calls it directly with the same arguments.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -ruN a/fallocate.c b/fallocate.c
+--- a/fallocate.c	2026-11-09 12:53:42.152924118 +0100
++++ b/fallocate.c	2026-11-09 12:53:42.160168221 +0100
+@@ -25,7 +25,7 @@
+ {
+ 	int err;
+ 
+-#ifndef SYS_fallocate
++#if !defined(SYS_fallocate) && !defined(__LIKEOS__)
+ 	bytecount = 0;
+ 	fprintf(stderr, "Error: this copy of hdparm was built without %s support\n", path);
+ 	err = EINVAL;
+@@ -40,7 +40,11 @@
+ 		err = errno;
+ 	} else {
+ 		len = bytecount;
++#ifdef __LIKEOS__
++		err = fallocate(fd, mode, offset, len);
++#else
+ 		err = syscall(SYS_fallocate, fd, mode, offset, len);
++#endif
+ 		if (err >= 0) {
+ 			fsync(fd);
+ 			exit(0);

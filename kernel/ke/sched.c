@@ -380,7 +380,6 @@ static uint64_t g_preempt_count_total = 0;
 
 static unsigned long g_loadavg[3] = { 0, 0, 0 };
 static spinlock_t g_loadavg_lock = SPINLOCK_INIT("loadavg");
-static uint64_t g_loadavg_last_tick = 0;
 
 // ============================================================================
 // DEAD THREAD REAPING
@@ -1115,6 +1114,51 @@ static void sched_update_min_vruntime_locked(percpu_t *cpu, task_t *cur)
 		__atomic_store_n(&cpu->min_vruntime, v, __ATOMIC_RELAXED);
 }
 
+/* Load weights of the nice levels -20..19.  Each level is about 10 % of
+ * processor time apart from the next (a factor of 1.25 between the
+ * weights); nice 0 weighs SCHED_NICE_0_LOAD. */
+static const uint32_t sched_prio_to_weight[40] = {
+	/* -20 */ 88761, 71755, 56483, 46273, 36291,
+	/* -15 */ 29154, 23254, 18705, 14949, 11916,
+	/* -10 */ 9548,	 7620,	6100,  4904,  3906,
+	/*  -5 */ 3121,	 2501,	1991,  1586,  1277,
+	/*   0 */ 1024,	 820,	655,   526,   423,
+	/*   5 */ 335,	 272,	215,   172,   137,
+	/*  10 */ 110,	 87,	70,    56,    45,
+	/*  15 */ 36,	 29,	23,    18,    15,
+};
+
+/* The vruntime a run of `delta' costs `t': delta * NICE_0_LOAD / weight.
+ * Nice 0 (and an unset weight) costs exactly delta. */
+static inline uint64_t sched_calc_delta_fair(uint64_t delta, const task_t *t)
+{
+	uint32_t w = t->sched_weight;
+
+	if (w == 0 || w == SCHED_NICE_0_LOAD)
+		return delta;
+	/* 2^53 TSC ticks is weeks; the product cannot overflow below it. */
+	if (delta < (1ULL << 53))
+		return delta * SCHED_NICE_0_LOAD / w;
+	return delta / w * SCHED_NICE_0_LOAD;
+}
+
+void sched_set_user_nice(task_t *t, int nice)
+{
+	if (!t)
+		return;
+	if (nice < SCHED_MIN_NICE)
+		nice = SCHED_MIN_NICE;
+	if (nice > SCHED_MAX_NICE)
+		nice = SCHED_MAX_NICE;
+	/* Charged at the old weight up to here, at the new one from the
+	 * next charge on (the running task is charged by the processor it
+	 * runs on; a single store each). */
+	__atomic_store_n(&t->sched_nice, nice, __ATOMIC_RELAXED);
+	__atomic_store_n(&t->sched_weight,
+			 sched_prio_to_weight[nice - SCHED_MIN_NICE],
+			 __ATOMIC_RELAXED);
+}
+
 /* Charge `cur' for the time since it was last charged.  Only the processor
  * running a task touches its vruntime while it runs, so no lock is needed
  * for that; the floor follows under the run queue lock, which the caller
@@ -1124,7 +1168,8 @@ static void sched_update_curr(percpu_t *cpu, task_t *cur, uint64_t now)
 	if (!cur || is_idle_task(cur))
 		return;
 	if (cur->exec_start && (int64_t)(now - cur->exec_start) > 0)
-		cur->vruntime += now - cur->exec_start;
+		cur->vruntime +=
+			sched_calc_delta_fair(now - cur->exec_start, cur);
 	cur->exec_start = now;
 	sched_update_min_vruntime_locked(cpu, cur);
 }
@@ -1147,9 +1192,14 @@ void sched_tick_account(task_t *t)
 		uint64_t now = sched_clock();
 
 		if (t->exec_start && (int64_t)(now - t->exec_start) > 0)
-			t->vruntime += now - t->exec_start;
+			t->vruntime +=
+				sched_calc_delta_fair(now - t->exec_start, t);
 		t->exec_start = now;
 	}
+	/* A worker of a worker pool running one item for long without
+	 * blocking stops counting as running (blk_work.c). */
+	if (t->wq_worker)
+		kblockd_worker_tick(t);
 	local_irq_restore(flags);
 }
 
@@ -1176,9 +1226,14 @@ static int sched_wakeup_preempts(percpu_t *cpu, task_t *task)
 	now = sched_clock();
 	cur_v = cur->vruntime;
 	if (cur->exec_start && (int64_t)(now - cur->exec_start) > 0)
-		cur_v += now - cur->exec_start;
+		cur_v += sched_calc_delta_fair(now - cur->exec_start, cur);
+	/* The granularity is processor time; on the newcomer's virtual
+	 * clock it is that time scaled by the newcomer's weight (a heavier
+	 * task's vruntime moves more slowly, so the same time is less of
+	 * it).  Nice 0: unchanged. */
 	return (int64_t)(cur_v - task->vruntime) >
-	       (int64_t)sched_us_to_ticks(SCHED_WAKEUP_GRAN_US);
+	       (int64_t)sched_calc_delta_fair(
+		       sched_us_to_ticks(SCHED_WAKEUP_GRAN_US), task);
 }
 
 /* The run queue is ordered by vruntime (see above). */
@@ -2399,7 +2454,32 @@ void sched_yield_in_kernel(void)
 // it against a different value and calls __stack_chk_fail on a frame that was
 // never actually smashed — halting the box on a self-diagnosed false positive.
 // The function has no local buffers to protect, so excluding it loses nothing.
+static __attribute__((no_stack_protector)) void __sched_schedule(void);
+
+/* The scheduling call every voluntary switch goes through.  A worker of a
+ * worker pool (kblockd) that blocks tells its pool first -- the pool then
+ * hands its pending items to another worker instead of waiting for this
+ * one -- and tells it again once it runs.  A yield or a preemption does
+ * not: the worker stays runnable and keeps counting as running. */
 __attribute__((no_stack_protector)) void sched_schedule(void)
+{
+	task_t *me = sched_current();
+	void *worker = me ? me->wq_worker : NULL;
+
+	if (worker && me->state != TASK_RUNNING && me->state != TASK_READY)
+		kblockd_worker_sleeping(me);
+	/* About to sleep with storage requests held on a plug: they go to
+	 * their queues first (run by kblockd), or the sleep may wait for
+	 * them. */
+	if (me && me->plug && me->state != TASK_RUNNING &&
+	    me->state != TASK_READY)
+		blk_flush_plug(me->plug, 1);
+	__sched_schedule();
+	if (worker)
+		kblockd_worker_running(me);
+}
+
+static __attribute__((no_stack_protector)) void __sched_schedule(void)
 {
 	if (!g_smp_initialized) {
 		// Pre-SMP: nothing to schedule yet (timer hasn't started)
@@ -2463,7 +2543,6 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 
 	// Dequeue next ready task from local queue FIRST
 	task_t *next = rq_dequeue_locked(cpu);
-	int my_cpu = this_cpu_id();
 
 	// If we dequeued ourselves, it means we were blocked but got woken
 	// before we reached sched_schedule().  This is a normal race between
@@ -2949,6 +3028,14 @@ static void task_trampoline(void)
 	}
 	cur = sched_current();
 	if (cur) {
+		/* A kernel thread that returns from its function is released
+		 * as it exits: nobody waits for a kernel thread, so it must not
+		 * stay behind as a zombie (in the task list, in /proc, its
+		 * creator's stack never free).  No exit signal makes the switch
+		 * away from it below hand it to the reaper, as for any thread
+		 * nobody waits for (see the deferred_zombie hand-off in
+		 * __sched_schedule). */
+		cur->exit_signal = 0;
 		cur->state = TASK_ZOMBIE;
 		cur->has_exited = true;
 		cur->in_exit_path = true;
@@ -3942,6 +4029,9 @@ task_t *sched_fork_current(void)
 
 	// Copy parent
 	mm_memcpy(child, cur, sizeof(task_t));
+	child->blk_cpl_ctx = NULL; /* the creator's stack, not ours */
+	child->plug = NULL; /* likewise */
+	child->wq_worker = NULL; /* a pool's worker, the child is not */
 
 	/* The copy above duplicated the POINTER to the parent's region table,
 	 * not the table.  Give the child its own with the parent's contents --
@@ -5479,7 +5569,7 @@ static int task_tracee_matches(task_t *tracer, task_t *t, int64_t pid_sel)
 	/* Same pid selector waitpid() applies to children:
 	 *   > 0   that one    == 0  the caller's process group
 	 *   == -1 any         < -1  process group -pid            */
-	if (pid_sel > 0 && t->id != (uint32_t)pid_sel)
+	if (pid_sel > 0 && (uint32_t)t->id != (uint32_t)pid_sel)
 		return 0;
 	if (pid_sel == 0 && t->pgid != tracer->pgid)
 		return 0;
@@ -6823,7 +6913,7 @@ void sched_dump_tasks(struct tty *tty)
 					 "???";
 		tty_printf(
 			tty,
-			"%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx  %016lx  %016lx\n",
+			"%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016llx  %016llx  %016llx  %016llx\n",
 			snaps[i].marker, snaps[i].id, snaps[i].tgid,
 			snaps[i].ppid, snaps[i].on_cpu, sn, snaps[i].on_rq,
 			snaps[i].nr_threads, snaps[i].is_leader,
@@ -6962,7 +7052,6 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 		return;
 	}
 
-	int my_cpu = this_cpu_id();
 	cur->need_resched = 0;
 	cur->preempt_frame = frame;
 

@@ -5,6 +5,7 @@
 #include <kernel/uapi/status.h>
 #include <kernel/uapi/stat.h>
 #include <kernel/fs/devfs.h>
+#include <kernel/fs/device.h>
 #include <kernel/ke/waitq.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
@@ -560,7 +561,11 @@ static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
 	file = fdget(cur, (int)fd);
 	if (!file)
 		return -EBADF;
-	if (fd_is_special(file) || devfs_is_devfile(file)) {
+	/* Devices have no position to read at -- except block devices, which
+	 * are addressed by byte offset like a file (vfs_pread's seek-and-read
+	 * path serves them). */
+	if (fd_is_special(file) ||
+	    (devfs_is_devfile(file) && !devfs_file_is_blk(file))) {
 		fdput(file);
 		return -ESPIPE;
 	}
@@ -572,6 +577,22 @@ static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
 	 * present (and, for a read, writable) before the filesystem takes any
 	 * lock -- see mm_prefault_user_range. */
 	mm_prefault_user_range(buf, count, !write);
+
+	/* A block device node reads and writes at the offset directly, many
+	 * threads at once on one descriptor (the seek-and-transfer sequence
+	 * below would serialise them on the handle). */
+	if (devfs_file_is_blk(file)) {
+		const struct device_ops *ops = device_file_ops(file);
+
+		if (ops && (write ? ops->pwrite != NULL : ops->pread != NULL)) {
+			ret = write ? ops->pwrite(file, (const void *)buf,
+						  (long)count, (long)offset) :
+				      ops->pread(file, (void *)buf, (long)count,
+						 (long)offset);
+			fdput(file);
+			return ret;
+		}
+	}
 
 	if (!write) {
 		/* A positional read is exactly what vfs_pread() is: it uses

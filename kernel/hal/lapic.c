@@ -916,6 +916,27 @@ static uint64_t g_hrt_target[MAX_CPUS];
 static uint32_t g_hrt_early[MAX_CPUS];
 static uint64_t g_hrt_gaveup[MAX_CPUS];
 
+/* What the local timer is armed for right now (both modes): the tick
+ * boundary and the high-resolution deadline that came first (0: the
+ * tick).  A request for the same event leaves the device alone -- on a
+ * hypervisor every MSR or timer-register write is an exit.  Cleared when
+ * the timer fires (it is disarmed then) and whenever it is set up anew. */
+static uint64_t g_ce_armed_tick[MAX_CPUS];
+static uint64_t g_ce_armed_hrt[MAX_CPUS];
+static int g_ce_armed[MAX_CPUS];
+
+/* 1 when the timer is already armed for (tick, hrt); else records it. */
+static int ce_already_armed(uint32_t c, uint64_t tick, uint64_t hrt)
+{
+	if (g_ce_armed[c] && g_ce_armed_tick[c] == tick &&
+	    g_ce_armed_hrt[c] == hrt)
+		return 1;
+	g_ce_armed_tick[c] = tick;
+	g_ce_armed_hrt[c] = hrt;
+	g_ce_armed[c] = 1;
+	return 0;
+}
+
 /* Processors whose TSC-deadline timer misbehaves below a microcode
  * revision: family 6 model, stepping range, first good revision (0: every
  * revision of those steppings is bad). */
@@ -1054,14 +1075,18 @@ static uint64_t lapic_ns_to_tsc_deadline(uint64_t ns, uint64_t now_tsc)
 
 static void tscdl_program(uint32_t c, uint64_t hrt_ns)
 {
-	uint64_t now = rdtsc(), next = g_tick_next_tsc[c];
+	uint64_t now = rdtsc(), next = g_tick_next_tsc[c], first = 0;
 
 	if (hrt_ns) {
 		uint64_t h = lapic_ns_to_tsc_deadline(hrt_ns, now);
 
-		if (h && (int64_t)(h - next) < 0)
+		if (h && (int64_t)(h - next) < 0) {
 			next = h;
+			first = hrt_ns;
+		}
 	}
+	if (ce_already_armed(c, g_tick_next_tsc[c], first))
+		return;
 	wrmsr(MSR_IA32_TSC_DEADLINE, next);
 }
 
@@ -1069,6 +1094,8 @@ static int tscdl_interrupt(uint32_t c, uint64_t hnext)
 {
 	uint64_t now = rdtsc(), next = g_tick_next_tsc[c];
 	uint64_t p = g_tick_period_tsc;
+
+	g_ce_armed[c] = 0; /* it fired: disarmed */
 
 	if ((int64_t)(now - next) < 0) {
 		tscdl_program(c, hnext);
@@ -1099,6 +1126,8 @@ static void lc_program(uint32_t c, uint64_t hrt_ns)
 			g_hrt_target[c] = hrt_ns;
 		}
 	}
+	if (ce_already_armed(c, g_tick_next_tsc[c], g_hrt_target[c]))
+		return;
 	d = (int64_t)(next - now) > 0 ? next - now : 0;
 	if (d > tsc_freq_hz)
 		d = tsc_freq_hz;
@@ -1115,6 +1144,8 @@ static int lc_interrupt(uint32_t c, uint64_t hnext)
 	uint64_t now = rdtsc(), next = g_tick_next_tsc[c];
 	uint64_t p = g_tick_period_tsc;
 	int tick = 0;
+
+	g_ce_armed[c] = 0; /* it fired: disarmed */
 
 	if ((int64_t)(now - next) >= 0) {
 		/* The first boundary after now: whatever lies between was
@@ -1209,6 +1240,7 @@ void lapic_timer_start(uint32_t frequency)
 			__asm__ volatile("mfence" ::: "memory");
 			g_tick_next_tsc[c] = rdtsc() + g_tick_period_tsc;
 			g_tick_mode = TICK_TSC_DEADLINE;
+			g_ce_armed[c] = 0;
 			g_ce_running[c] = 1;
 			wrmsr(MSR_IA32_TSC_DEADLINE, g_tick_next_tsc[c]);
 			hrtimer_clockevent_started();
@@ -1225,6 +1257,7 @@ void lapic_timer_start(uint32_t frequency)
 		g_hrt_early[c] = 0;
 		g_hrt_gaveup[c] = 0;
 		g_tick_mode = TICK_ONESHOT;
+		g_ce_armed[c] = 0;
 		g_ce_running[c] = 1;
 		lc_program(c, 0);
 		hrtimer_clockevent_started();
@@ -1251,6 +1284,7 @@ void lapic_timer_stop(void)
 	uint32_t c = lapic_tick_slot();
 
 	g_ce_running[c] = 0;
+	g_ce_armed[c] = 0;
 	lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
 	lapic_write(LAPIC_TIMER_ICR, 0);
 	if (g_tick_mode == TICK_TSC_DEADLINE)

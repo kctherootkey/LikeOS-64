@@ -1,0 +1,68 @@
+Build the SG_IO backend against the LikeOS headers.
+
+LikeOS disks are driven the way smartmontools' SG_IO backend expects:
+/dev/sdX and /dev/srX answer SG_IO (ATA PASS-THROUGH for the ATA disks
+behind them), with the usual device naming, so that backend -- the os_*.cpp
+configure selects for such systems -- is the OS backend here as well.  It
+takes the __u8 .. __u64 types and the version 4 SCSI generic header from
+kernel headers; on LikeOS they come from the port's likeos-smartmontools.h
+(the version 3 header and the requests are in the C library's <scsi/sg.h>).
+
+dev_areca.h defines the Areca request codes per system; LikeOS gets the
+codes of the SG_IO backend, a copy of that branch.
+
+Copyright (C) 2026 The LikeOS Project
+
+diff -ruN a/dev_areca.h b/dev_areca.h
+--- a/dev_areca.h	2021-02-01 21:36:02.000000000 +0100
++++ b/dev_areca.h	2026-11-09 13:03:29.007072165 +0100
+@@ -35,6 +35,19 @@
+ #define ARCMSR_IOCTL_CLEAR_RQBUFFER          0x9000200C
+ #define ARCMSR_IOCTL_CLEAR_WQBUFFER          0x90002010
+ #define ARCMSR_IOCTL_RETURN_CODE_3F          0x90002018
++#elif defined(__LIKEOS__)
++/* LikeOS uses the SG_IO backend: the same codes as the branch below. */
++#define ARECA_SATA_RAID                      0x90000000
++#define FUNCTION_READ_RQBUFFER               0x0801
++#define FUNCTION_WRITE_WQBUFFER              0x0802
++#define FUNCTION_CLEAR_RQBUFFER              0x0803
++#define FUNCTION_CLEAR_WQBUFFER              0x0804
++#define FUNCTION_RETURN_CODE_3F              0x0806
++#define ARCMSR_IOCTL_READ_RQBUFFER           (ARECA_SATA_RAID | FUNCTION_READ_RQBUFFER)
++#define ARCMSR_IOCTL_WRITE_WQBUFFER          (ARECA_SATA_RAID | FUNCTION_WRITE_WQBUFFER)
++#define ARCMSR_IOCTL_CLEAR_RQBUFFER          (ARECA_SATA_RAID | FUNCTION_CLEAR_RQBUFFER)
++#define ARCMSR_IOCTL_CLEAR_WQBUFFER          (ARECA_SATA_RAID | FUNCTION_CLEAR_WQBUFFER)
++#define ARCMSR_IOCTL_RETURN_CODE_3F          (ARECA_SATA_RAID | FUNCTION_RETURN_CODE_3F)
+ #elif defined(__linux__)
+ /*DeviceType*/
+ #define ARECA_SATA_RAID                      0x90000000
+diff -ruN a/linux_nvme_ioctl.h b/linux_nvme_ioctl.h
+--- a/linux_nvme_ioctl.h	2019-08-04 16:39:24.000000000 +0200
++++ b/linux_nvme_ioctl.h	2026-11-09 13:03:29.007007214 +0100
+@@ -7,7 +7,11 @@
+ #ifndef _UAPI_LINUX_NVME_IOCTL_H
+ #define _UAPI_LINUX_NVME_IOCTL_H
+ 
++#ifdef __LIKEOS__
++#include "likeos-smartmontools.h"
++#else
+ #include <linux/types.h>
++#endif
+ 
+ struct nvme_user_io {
+ 	__u8	opcode;
+diff -ruN a/os_linux.cpp b/os_linux.cpp
+--- a/os_linux.cpp	2025-03-14 16:29:53.000000000 +0100
++++ b/os_linux.cpp	2026-11-09 13:03:29.006823527 +0100
+@@ -46,7 +46,11 @@
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_ioctl.h>
+ #include <scsi/sg.h>
++#ifdef __LIKEOS__
++#include "likeos-smartmontools.h"
++#else
+ #include <linux/bsg.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>

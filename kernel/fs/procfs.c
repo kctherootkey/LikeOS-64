@@ -24,6 +24,11 @@
 #include <kernel/io/console.h>
 #include <kernel/ke/userinit.h>
 #include <kernel/uapi/dirent.h>
+#include <kernel/ke/storage.h> /* the root device for /proc/mounts */
+
+/* /proc/partitions and /proc/diskstats (kernel/dev/block/blk_sysfs.c) */
+long blk_proc_partitions_show(struct pfs_node *n, char *buf, long cap);
+long blk_proc_diskstats_show(struct pfs_node *n, char *buf, long cap);
 
 static struct pfs g_procfs;
 
@@ -517,6 +522,9 @@ static struct pfs_node *fd_lookup(struct pfs_node *dir, const char *name)
 	return n;
 }
 
+static long show_mounts(struct pfs_node *n, char *buf, long cap);
+static long show_mountinfo(struct pfs_node *n, char *buf, long cap);
+
 /* /proc/<pid>: a transient directory with static-looking children made
  * on lookup. */
 static int pid_list(struct pfs_node *dir, unsigned *cursor, char *name,
@@ -526,11 +534,11 @@ static int pid_list(struct pfs_node *dir, unsigned *cursor, char *name,
 					     "status",	  "maps",  "mem",
 					     "auxv",	  "exe",   "cwd",
 					     "fd",	  "statm", "loginuid",
-					     "sessionid" };
+					     "sessionid", "mounts", "mountinfo" };
 	unsigned index = *cursor; /* a fixed set: its place is its key */
 
 	(void)dir;
-	if (index >= 13)
+	if (index >= sizeof(names) / sizeof(names[0]))
 		return 0;
 	ksnprintf(name, (size_t)cap, "%s", names[index]);
 	*type = index == 9 ? DT_DIR :
@@ -547,6 +555,13 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 	if (!t)
 		return NULL;
 	struct pfs_node *n;
+	if (kstrcmp(name, "mounts") == 0 || kstrcmp(name, "mountinfo") == 0) {
+		/* one mount namespace: every process sees the same table */
+		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
+		if (n)
+			n->show = name[5] ? show_mountinfo : show_mounts;
+		return n;
+	}
 	if (kstrcmp(name, "fd") == 0) {
 		n = pfs_node_new(dir->fs, dir, name, PFS_DIR);
 		if (n)
@@ -776,9 +791,66 @@ static long show_boot_settled(struct pfs_node *n, char *buf, long cap)
 
 static long show_mounts(struct pfs_node *n, char *buf, long cap)
 {
+	/* The root as the storage bootstrap mounted it ("/dev/sda2 / ext4"),
+	 * so tools that map a mount to its block device (lsblk, findmnt, df)
+	 * find the real node.  Before the root is mounted -- or for a root
+	 * that is not on a named block device -- the conventional
+	 * placeholder. */
+	const char *dev = storage_root_device_name();
+	const char *type = storage_root_fs_type();
+	long p;
+
+	(void)n;
+	if (dev && dev[0])
+		p = pfs_printf(buf, cap, 0, "/dev/%s / %s rw 0 0\n", dev,
+			       type ? type : "ext4");
+	else
+		p = pfs_printf(buf, cap, 0, "/dev/root / %s rw 0 0\n",
+			       type ? type : "ext4");
+	return pfs_printf(buf, cap, p,
+			  "devfs /dev devfs rw 0 0\nsysfs /sys sysfs ro 0 0\nproc /proc proc ro 0 0\n");
+}
+
+/* /proc/<pid>/mountinfo: the same mounts with their ids, device numbers
+ * and options, in the form tools that map a mount to its block device
+ * (findmnt, lsblk) parse. */
+static long show_mountinfo(struct pfs_node *n, char *buf, long cap)
+{
+	const char *dev = storage_root_device_name();
+	const char *type = storage_root_fs_type();
+	const block_device_t *b = storage_root_bdev();
+	uint32_t ma = 0, mi = 0;
+	long p;
+
+	(void)n;
+	if (b && b->magic == BLOCK_DEVICE_MAGIC) {
+		ma = b->major;
+		mi = b->minor;
+	}
+	if (dev && dev[0])
+		p = pfs_printf(buf, cap, 0, "1 0 %u:%u / / rw,relatime shared:1 - %s /dev/%s rw\n",
+			       ma, mi, type ? type : "ext4", dev);
+	else
+		p = pfs_printf(buf, cap, 0, "1 0 0:1 / / rw,relatime shared:1 - %s /dev/root rw\n",
+			       type ? type : "ext4");
+	p = pfs_printf(buf, cap, p, "2 1 0:5 / /dev rw,nosuid shared:2 - devfs devfs rw\n");
+	p = pfs_printf(buf, cap, p, "3 1 0:20 / /sys ro,nosuid,nodev,noexec shared:3 - sysfs sysfs ro\n");
+	return pfs_printf(buf, cap, p, "4 1 0:21 / /proc ro,nosuid,nodev,noexec shared:4 - proc proc ro\n");
+}
+
+/* /proc/devices: the majors in use, character then block, the table the
+ * disk tools (hdparm) read to tell disks from other devices. */
+static long show_devices(struct pfs_node *n, char *buf, long cap)
+{
 	(void)n;
 	return pfs_printf(buf, cap, 0,
-			  "/dev/root / ext4 rw 0 0\ndevfs /dev devfs rw 0 0\nsysfs /sys sysfs ro 0 0\nproc /proc proc ro 0 0\n");
+			  "Character devices:\n"
+			  "  1 mem\n  4 /dev/vc/0\n  4 tty\n  5 /dev/tty\n"
+			  "  5 /dev/console\n  5 /dev/ptmx\n 13 input\n 14 sound\n"
+			  " 29 fb\n136 pts\n226 drm\n"
+			  "\nBlock devices:\n"
+			  "  8 sd\n 11 sr\n 65 sd\n 66 sd\n 67 sd\n 68 sd\n"
+			  " 69 sd\n 70 sd\n 71 sd\n254 blkext\n");
 }
 
 void procfs_init(void)
@@ -791,5 +863,9 @@ void procfs_init(void)
 	pfs_add_file(&g_procfs, "cpuinfo", show_cpuinfo, NULL, 0);
 	pfs_add_file(&g_procfs, "mounts", show_mounts, NULL, 0);
 	pfs_add_file(&g_procfs, "boot_settled", show_boot_settled, NULL, 0);
+	/* The block layer's tables (kernel/dev/block/blk_sysfs.c). */
+	pfs_add_file(&g_procfs, "partitions", blk_proc_partitions_show, NULL, 0);
+	pfs_add_file(&g_procfs, "diskstats", blk_proc_diskstats_show, NULL, 0);
+	pfs_add_file(&g_procfs, "devices", show_devices, NULL, 0);
 	vfs_register_mount("/proc", pfs_ops(&g_procfs));
 }
