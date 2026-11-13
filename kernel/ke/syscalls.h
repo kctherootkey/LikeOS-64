@@ -108,6 +108,7 @@ int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence);
 int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf);
 int64_t sys_madvise(uint64_t addr, uint64_t length, uint64_t advice);
 int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vec);
+int64_t sys_msync(uint64_t addr, uint64_t length, uint64_t flags);
 int64_t sys_memstats(uint64_t a1, uint64_t a2);
 int64_t sys_mkdir(uint64_t pathname, uint64_t mode);
 int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
@@ -155,6 +156,10 @@ int64_t sys_raw_send(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_
 int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz);
 int64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t iovcnt);
+int64_t sys_preadv2(uint64_t fd, uint64_t iovp, uint64_t iovcnt,
+		    uint64_t offset, uint64_t flags);
+int64_t sys_pwritev2(uint64_t fd, uint64_t iovp, uint64_t iovcnt,
+		     uint64_t offset, uint64_t flags);
 int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 		   uint64_t arg);
 int64_t sys_recv(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);

@@ -1,0 +1,14 @@
+Patches applied to the pristine nvme-cli-2.16 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-alloc-huge-without-hugetlb.patch
+        Large buffers skip the MAP_HUGETLB attempt (no HugeTLB pool) and
+        come from the posix_memalign() fallback.
+
+  0002-rpmb-digests-in-process.patch
+        The RPMB HMAC-SHA256 and MD5 digests are computed by
+        ../likeos-hash.c instead of the kernel crypto socket (AF_ALG).
+
+Copyright (C) 2026 The LikeOS Project

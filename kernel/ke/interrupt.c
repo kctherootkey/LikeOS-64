@@ -3,6 +3,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/ke/irq.h>
+#include <kernel/ke/irq_internal.h>
 #include <kernel/ke/hrtimer.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/dev/usb/xhci.h>
@@ -506,11 +507,18 @@ void idt_init()
 		      0x8E); // MSI: vmxnet3 paravirt NIC
 	idt_set_entry(62, (uint64_t)irq30, 0x08,
 		      0x8E); // HPET comparator: high-resolution timers
-	/* 63..127: run-time allocated (irq_alloc_vector). */
+	/* 63..127: run-time allocated (irq_alloc_vector); 128..239: the
+	 * per-CPU vector matrix of request_irq() (kernel/ke/irq.c). */
 	{
 		extern uint64_t irq_dyn_stub_table[];
-		for (int v = 63; v <= 127; v++)
-			idt_set_entry(v, irq_dyn_stub_table[v - 63], 0x08, 0x8E);
+		BUILD_BUG_ON(IRQ_DYN_VECTOR_FIRST != 63 ||
+			     IRQ_MATRIX_FIRST != IRQ_DYN_VECTOR_LAST + 1 ||
+			     IRQ_MATRIX_END != 240);
+		for (int v = IRQ_DYN_VECTOR_FIRST; v < IRQ_MATRIX_END; v++)
+			idt_set_entry((uint8_t)v,
+				      irq_dyn_stub_table[v - IRQ_DYN_VECTOR_FIRST],
+				      0x08, 0x8E);
+		irq_core_init();
 	}
 
 	// IPI vectors for SMP

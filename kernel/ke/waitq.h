@@ -45,11 +45,16 @@ struct wait_queue_entry {
 	struct wait_queue_entry *next;
 	struct wait_queue_entry **pprev; /* NULL when not queued */
 	task_t *task;
+	uint64_t seq; /* the head's wake_seq when it was queued */
 };
 
 struct wait_queue_head {
 	struct wait_queue_entry *first;
 	spinlock_t lock;
+	/* Counts the wake-all walks started on this head (wq_wake_all): an
+	 * entry queued after a walk began carries its number and is left to
+	 * the next walk. */
+	uint64_t wake_seq;
 };
 
 /* A head must be initialised before use.  Objects that are zeroed on
@@ -59,6 +64,7 @@ struct wait_queue_head {
 static inline void wq_head_init(struct wait_queue_head *h, const char *name)
 {
 	h->first = NULL;
+	h->wake_seq = 0;
 	spinlock_init(&h->lock, name);
 }
 
@@ -119,12 +125,47 @@ static inline void wq_entry_init(struct wait_queue_entry *e, task_t *t)
 	e->next = NULL;
 	e->pprev = NULL;
 	e->task = t;
+	e->seq = 0;
 }
 
 /* True when the entry is currently on some queue. */
 static inline int wq_entry_queued(const struct wait_queue_entry *e)
 {
 	return e->pprev != NULL;
+}
+
+/* The list operations with h->lock already held by the caller. */
+/* Appended at the tail: waiters are woken in the order they came (a
+ * wake-one -- complete(), a mutex unlock -- takes the longest waiter,
+ * never the newest).  Finding the tail walks the list; the lists are
+ * short (the waiters of one object), and the walk keeps the entries at
+ * two pointers with an O(1) unlink. */
+static inline void wq_add_locked(struct wait_queue_head *h,
+				 struct wait_queue_entry *e)
+{
+	struct wait_queue_entry **link = &h->first;
+
+	if (wq_entry_queued(e))
+		return;
+	while (*link)
+		link = &(*link)->next;
+	e->next = NULL;
+	e->seq = h->wake_seq;
+	*link = e;
+	e->pprev = link;
+}
+
+static inline void wq_remove_locked(struct wait_queue_head *h,
+				    struct wait_queue_entry *e)
+{
+	(void)h; /* the entry knows where it is linked */
+	if (e->pprev) {
+		*e->pprev = e->next;
+		if (e->next)
+			e->next->pprev = e->pprev;
+		e->next = NULL;
+		e->pprev = NULL;
+	}
 }
 
 /* Put `e' on `h'.  Adding an entry that is already queued is a caller error;
@@ -138,6 +179,7 @@ static inline void wq_add(struct wait_queue_head *h,
 	if (wq_entry_queued(e))
 		return;
 	spin_lock_irqsave(&h->lock, &flags);
+	e->seq = h->wake_seq;
 	e->next = h->first;
 	if (e->next)
 		e->next->pprev = &e->next;
@@ -172,11 +214,20 @@ static inline void wq_remove(struct wait_queue_head *h,
  * whose task is claimed is unlinked in the SAME pass, so a waiter can never be
  * left claimed but not enqueued.
  *
+ * Only the entries that were queued when the call began are woken.  A task
+ * woken by an earlier batch can run on another CPU, find its condition still
+ * false and queue itself again (at the head) before the next batch is
+ * collected; walking those again would never end while waiters keep doing
+ * that, and the caller may have interrupts off for all of it.  A waiter that
+ * queues itself after the call began looks at its condition after queueing,
+ * so it sees whatever the waker changed before calling this.
+ *
  * A waiter that loses the claim (it timed out, or another waker got there
  * first) is skipped and left on the queue for its owner to remove.
  */
 static inline int wq_wake_all(struct wait_queue_head *h)
 {
+	uint64_t start = 0;
 	int total = 0;
 
 	for (;;) {
@@ -186,9 +237,11 @@ static inline int wq_wake_all(struct wait_queue_head *h)
 		struct wait_queue_entry *e, *next;
 
 		spin_lock_irqsave(&h->lock, &flags);
+		if (!start)
+			start = ++h->wake_seq;
 		for (e = h->first; e && n < 16; e = next) {
 			next = e->next;
-			if (!e->task)
+			if (!e->task || e->seq >= start)
 				continue;
 			if (!sched_claim_wake(e->task, TASK_BLOCKED))
 				continue;
@@ -215,5 +268,185 @@ static inline int wq_wake_all(struct wait_queue_head *h)
 	}
 	return total;
 }
+
+/* ==========================================================================
+ * Waiting for a condition: the wait_event family (kernel/ke/waitq.c)
+ * ==========================================================================
+ *
+ * wait_event*(wq, condition, ...) puts the calling task to sleep on `wq'
+ * until `condition' (any C expression, evaluated again after every wake-up,
+ * so it must have no side effects beyond what repeating it allows) is true.
+ * Whoever makes the condition true calls wake_up(&wq) AFTER changing it.
+ *
+ * The protocol that makes this race-free is the scheduler's: the waiter
+ * queues itself on `wq' and publishes TASK_BLOCKED (a full barrier) and only
+ * THEN evaluates the condition; a waker changes the condition and only then
+ * walks the queue.  Either the waiter sees the new condition, or the waker
+ * sees a blocked task to wake.  When the condition turns out true after the
+ * task published TASK_BLOCKED, the waiter takes its own sleep back
+ * (BLOCKED -> RUNNING by compare-and-exchange); if a waker claimed it in
+ * that window it passes through sched_schedule() once, which returns at
+ * once because the task is already queued to run.
+ *
+ * Timeouts are milliseconds.  The deadline is exact: an hrtimer wakes the
+ * task at the deadline (hrtimer_wait_arm) and the scheduler tick backs it
+ * up.  Return values (as the conventional interface defines them):
+ *   wait_event(wq, c)                             void
+ *   wait_event_timeout(wq, c, ms)                 0: timed out with c still
+ *                                                 false; else the remaining
+ *                                                 milliseconds, at least 1
+ *   wait_event_interruptible_timeout(wq, c, ms)   >0 remaining ms, 0 timed
+ *                                                 out, -ERESTARTSYS
+ *   wait_event_killable(wq, c)                    0, or -ERESTARTSYS on a
+ *                                                 fatal signal (SIGKILL)
+ *
+ * Context: process context.  might_sleep() is asserted.  Where the caller
+ * cannot sleep -- no scheduler task yet (boot), or interrupts disabled --
+ * the same macros poll the condition with `pause' instead (the event must
+ * then come from another CPU or a device the caller polls inside the
+ * condition); signals are not looked at while polling.
+ *
+ * NEVER call these with a spinlock held, from a hard interrupt handler, an
+ * hrtimer callback or the block softirq.
+ *
+ * ERESTARTSYS is turned into EINTR or a restart by the system call exit
+ * path; a driver passes it up unchanged.
+ */
+
+#define WQ_WAIT_UNINTERRUPTIBLE 0
+#define WQ_WAIT_INTERRUPTIBLE 1 /* any unblocked signal ends the wait */
+#define WQ_WAIT_KILLABLE 2 /* only SIGKILL ends the wait */
+
+/* One waiter's bookkeeping, on its stack for the length of the wait.  The
+ * fields belong to waitq.c. */
+struct wq_waiter {
+	struct wait_queue_entry entry;
+	struct wait_queue_head *head;
+	task_t *task; /* NULL: polling (cannot sleep) */
+	uint64_t deadline_ns; /* absolute monotonic, 0 = none */
+	int mode; /* WQ_WAIT_* */
+	int blocked; /* TASK_BLOCKED published, not yet slept/undone */
+};
+
+/* Set up `w' for a wait on `h' with an absolute deadline (0 none).  Decides
+ * once whether this wait sleeps or polls. */
+void wq_waiter_init(struct wq_waiter *w, struct wait_queue_head *h,
+		    uint64_t deadline_ns, int mode);
+/* Queue the waiter (if not queued yet) and publish TASK_BLOCKED.  Called
+ * before every evaluation of the condition.  Nothing to do when polling. */
+void wq_waiter_prepare(struct wq_waiter *w);
+/* The same with the head's own lock held by the caller. */
+void wq_waiter_prepare_locked(struct wq_waiter *w);
+/* The condition is true: take the sleep back, leave the queue. */
+void wq_waiter_finish(struct wq_waiter *w);
+/* The condition is false: sleep (or pause once when polling) until woken
+ * or the deadline.  Returns 0 to evaluate the condition again, 1 when the
+ * deadline has passed, -ERESTARTSYS when the mode's signals are pending.
+ * On a non-zero return the waiter has left the queue already. */
+int wq_waiter_sleep(struct wq_waiter *w);
+/* Absolute deadline `ms' milliseconds from now (monotonic ns); ms < 0 is
+ * treated as 0 (already expired), so callers may pass a signed count. */
+uint64_t wq_deadline_after_ms(long ms);
+/* Has `t' got SIGKILL pending?  (The killable waits.) */
+int task_fatal_signal_pending(task_t *t);
+
+/* Wake every waiter of `h' (wake_up and wake_up_all are the same here:
+ * there are no exclusive waiters on a wait_event queue). */
+#define wake_up(h) ((void)wq_wake_all(h))
+#define wake_up_all(h) ((void)wq_wake_all(h))
+
+/* Static initialiser of a head: struct wait_queue_head h =
+ * WAIT_QUEUE_HEAD_INIT("name"); */
+#define WAIT_QUEUE_HEAD_INIT(n)                              \
+	{                                                    \
+		.first = NULL, .lock = SPINLOCK_INIT(n)      \
+	}
+#define DECLARE_WAIT_QUEUE_HEAD(name) \
+	struct wait_queue_head name = WAIT_QUEUE_HEAD_INIT(#name)
+
+/* The core: returns 1 when the condition became true, 0 when the deadline
+ * passed with it false (evaluated once more at the deadline), or
+ * -ERESTARTSYS. */
+#define __wait_event_core(wq_head, condition, deadline_ns, mode)            \
+	({                                                                  \
+		struct wq_waiter __wqw;                                     \
+		long __wqret;                                               \
+		wq_waiter_init(&__wqw, &(wq_head), (deadline_ns), (mode));  \
+		for (;;) {                                                  \
+			wq_waiter_prepare(&__wqw);                          \
+			if (condition) {                                    \
+				wq_waiter_finish(&__wqw);                   \
+				__wqret = 1;                                \
+				break;                                      \
+			}                                                   \
+			__wqret = wq_waiter_sleep(&__wqw);                  \
+			if (__wqret == 1) {                                 \
+				__wqret = (condition) ? 1 : 0;              \
+				break;                                      \
+			}                                                   \
+			if (__wqret < 0) {                                  \
+				/* A waiter woken for its condition must  \
+				 * not fail for a signal that came along: \
+				 * it consumes what it was woken for. */   \
+				if (condition)                              \
+					__wqret = 1;                        \
+				break;                                      \
+			}                                                   \
+		}                                                           \
+		__wqret;                                                    \
+	})
+
+/* The timed forms report the remaining milliseconds (at least 1) when the
+ * condition became true; the deadline is fixed once, before the loop. */
+#define __wait_event_timed(wq_head, condition, ms, mode)                     \
+	({                                                                   \
+		uint64_t __wqdl = wq_deadline_after_ms((long)(ms));          \
+		long __wqr = __wait_event_core(wq_head, condition, __wqdl,   \
+					       mode);                        \
+		if (__wqr == 1) {                                            \
+			uint64_t __wqnow = hrtimer_now_ns();                 \
+			__wqr = __wqnow >= __wqdl ?                          \
+					1 :                                  \
+					(long)((__wqdl - __wqnow + 999999ULL) / \
+					       1000000ULL);                  \
+		}                                                            \
+		__wqr;                                                       \
+	})
+
+#define wait_event(wq_head, condition)                                   \
+	do {                                                             \
+		if (!(condition))                                        \
+			(void)__wait_event_core(wq_head, condition, 0,   \
+						WQ_WAIT_UNINTERRUPTIBLE);\
+	} while (0)
+
+#define wait_event_timeout(wq_head, condition, timeout_ms)                 \
+	({                                                                 \
+		long __wet = (condition) ? 1 : 0;                          \
+		if (!__wet)                                                \
+			__wet = __wait_event_timed(wq_head, condition,     \
+						   timeout_ms,             \
+						   WQ_WAIT_UNINTERRUPTIBLE); \
+		__wet;                                                     \
+	})
+
+#define wait_event_interruptible_timeout(wq_head, condition, timeout_ms)   \
+	({                                                                 \
+		long __weit = (condition) ? 1 : 0;                         \
+		if (!__weit)                                               \
+			__weit = __wait_event_timed(wq_head, condition,    \
+						    timeout_ms,            \
+						    WQ_WAIT_INTERRUPTIBLE); \
+		__weit;                                                    \
+	})
+
+#define wait_event_killable(wq_head, condition)                            \
+	({                                                                 \
+		long __wek = 0;                                            \
+		if (!(condition))                                          \
+			__wek = __wait_event_core(wq_head, condition, 0,   \
+						  WQ_WAIT_KILLABLE);       \
+		__wek < 0 ? __wek : 0;                                     \
+	})
 
 #endif /* _KERNEL_WAITQ_H_ */

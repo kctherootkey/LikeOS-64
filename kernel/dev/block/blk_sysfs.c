@@ -57,6 +57,9 @@ enum {
 	DK_POWER,
 	DK_PART,
 	DK_EMPTY,
+	DK_MQ, /* /sys/block/<disk>/mq: one directory per hardware queue */
+	DK_MQ_HCTX, /* mq/<n> */
+	DK_INTEGRITY, /* /sys/block/<disk>/integrity */
 };
 
 /* Attribute ids (file node arg2 bits 0..15) */
@@ -123,6 +126,44 @@ enum {
 	D_IODONE,
 	D_IOERR,
 	P_STATE,
+	/* multi-queue, zoned, atomic writes, integrity (P2) */
+	A_WWID,
+	Q_IO_POLL_DELAY,
+	Q_NR_ZONES,
+	Q_MAX_OPEN_ZONES,
+	Q_MAX_ACTIVE_ZONES,
+	Q_ZONE_APPEND_MAX,
+	Q_ZONE_WRITE_GRAN,
+	Q_ATOMIC_MAX,
+	Q_ATOMIC_BOUNDARY,
+	Q_ATOMIC_UNIT_MIN,
+	Q_ATOMIC_UNIT_MAX,
+	Q_MAX_WRITE_STREAMS,
+	Q_WRITE_STREAM_GRAN,
+	Q_VIRT_BOUNDARY,
+	Q_MAX_DISCARD_SEGS,
+	Q_MAX_INTEGRITY_SEGS,
+	Q_STABLE_WRITES,
+	Q_WRITE_SAME_MAX,
+	Q_TIMEOUT,
+	M_CPU_LIST,
+	M_NR_TAGS,
+	M_NR_RESERVED,
+	M_DISPATCHED,
+	M_RUN,
+	M_BUSY,
+	M_TAGS_IN_USE,
+	M_DISPATCH_BUSY,
+	M_TYPE,
+	M_POLL_STATS,
+	M_TIMEOUTS,
+	M_REQUEUED,
+	I_FORMAT,
+	I_TAG_SIZE,
+	I_INTERVAL,
+	I_READ_VERIFY,
+	I_WRITE_GENERATE,
+	I_CAPABLE,
 };
 
 enum { T_FILE = 1, T_DIR, T_LINK };
@@ -153,7 +194,10 @@ static const struct blk_attr g_disk_attrs[] = {
 	{ "events", A_EVENTS, T_FILE, 0, NULL },
 	{ "events_async", A_EVENTS_ASYNC, T_FILE, 0, NULL },
 	{ "events_poll_msecs", A_EVENTS_POLL, T_FILE, 0, NULL },
+	{ "wwid", A_WWID, T_FILE, 0, NULL },
 	{ "queue", DK_QUEUE, T_DIR, 0, NULL },
+	{ "mq", DK_MQ, T_DIR, 0, NULL },
+	{ "integrity", DK_INTEGRITY, T_DIR, 0, NULL },
 	{ "device", DK_DEVICE, T_DIR, 0, NULL },
 	{ "power", DK_POWER, T_DIR, 0, NULL },
 	{ "holders", DK_EMPTY, T_DIR, 0, NULL },
@@ -191,6 +235,48 @@ static const struct blk_attr g_queue_attrs[] = {
 	{ "io_poll", Q_IO_POLL, T_FILE, 0, NULL },
 	{ "chunk_sectors", Q_CHUNK, T_FILE, 0, NULL },
 	{ "dma_alignment", Q_DMA_ALIGN, T_FILE, 0, NULL },
+	{ "io_poll_delay", Q_IO_POLL_DELAY, T_FILE, 1, NULL },
+	{ "nr_zones", Q_NR_ZONES, T_FILE, 0, NULL },
+	{ "max_open_zones", Q_MAX_OPEN_ZONES, T_FILE, 0, NULL },
+	{ "max_active_zones", Q_MAX_ACTIVE_ZONES, T_FILE, 0, NULL },
+	{ "zone_append_max_bytes", Q_ZONE_APPEND_MAX, T_FILE, 0, NULL },
+	{ "zone_write_granularity", Q_ZONE_WRITE_GRAN, T_FILE, 0, NULL },
+	{ "atomic_write_max_bytes", Q_ATOMIC_MAX, T_FILE, 0, NULL },
+	{ "atomic_write_boundary_bytes", Q_ATOMIC_BOUNDARY, T_FILE, 0, NULL },
+	{ "atomic_write_unit_min_bytes", Q_ATOMIC_UNIT_MIN, T_FILE, 0, NULL },
+	{ "atomic_write_unit_max_bytes", Q_ATOMIC_UNIT_MAX, T_FILE, 0, NULL },
+	{ "max_write_streams", Q_MAX_WRITE_STREAMS, T_FILE, 0, NULL },
+	{ "write_stream_granularity", Q_WRITE_STREAM_GRAN, T_FILE, 0, NULL },
+	{ "virt_boundary_mask", Q_VIRT_BOUNDARY, T_FILE, 0, NULL },
+	{ "max_discard_segments", Q_MAX_DISCARD_SEGS, T_FILE, 0, NULL },
+	{ "max_integrity_segments", Q_MAX_INTEGRITY_SEGS, T_FILE, 0, NULL },
+	{ "stable_writes", Q_STABLE_WRITES, T_FILE, 0, NULL },
+	{ "write_same_max_bytes", Q_WRITE_SAME_MAX, T_FILE, 0, NULL },
+	{ "io_timeout", Q_TIMEOUT, T_FILE, 0, NULL },
+};
+
+static const struct blk_attr g_mq_hctx_attrs[] = {
+	{ "cpu_list", M_CPU_LIST, T_FILE, 0, NULL },
+	{ "nr_tags", M_NR_TAGS, T_FILE, 0, NULL },
+	{ "nr_reserved_tags", M_NR_RESERVED, T_FILE, 0, NULL },
+	{ "dispatched", M_DISPATCHED, T_FILE, 0, NULL },
+	{ "run", M_RUN, T_FILE, 0, NULL },
+	{ "busy", M_BUSY, T_FILE, 0, NULL },
+	{ "tags_in_use", M_TAGS_IN_USE, T_FILE, 0, NULL },
+	{ "dispatch_busy", M_DISPATCH_BUSY, T_FILE, 0, NULL },
+	{ "type", M_TYPE, T_FILE, 0, NULL },
+	{ "poll_stats", M_POLL_STATS, T_FILE, 0, NULL },
+	{ "timeouts", M_TIMEOUTS, T_FILE, 0, NULL },
+	{ "requeued", M_REQUEUED, T_FILE, 0, NULL },
+};
+
+static const struct blk_attr g_integrity_attrs[] = {
+	{ "format", I_FORMAT, T_FILE, 0, NULL },
+	{ "tag_size", I_TAG_SIZE, T_FILE, 0, NULL },
+	{ "protection_interval_bytes", I_INTERVAL, T_FILE, 0, NULL },
+	{ "read_verify", I_READ_VERIFY, T_FILE, 1, NULL },
+	{ "write_generate", I_WRITE_GENERATE, T_FILE, 1, NULL },
+	{ "device_is_integrity_capable", I_CAPABLE, T_FILE, 0, NULL },
 };
 
 static const struct blk_attr g_device_attrs[] = {
@@ -248,6 +334,12 @@ static const struct blk_attr *blk_table(int kind, int *n)
 	case DK_PART:
 		*n = NELEM(g_part_attrs);
 		return g_part_attrs;
+	case DK_MQ_HCTX:
+		*n = NELEM(g_mq_hctx_attrs);
+		return g_mq_hctx_attrs;
+	case DK_INTEGRITY:
+		*n = NELEM(g_integrity_attrs);
+		return g_integrity_attrs;
 	default:
 		*n = 0;
 		return NULL;
@@ -267,6 +359,43 @@ static inline int blk_node_partno(const struct pfs_node *n)
 static inline int blk_node_attr(const struct pfs_node *n)
 {
 	return (int)(n->arg2 & 0xFFFF);
+}
+
+/* mq/<n> nodes carry the hardware queue index in bits 32..47. */
+static inline unsigned int blk_node_hctx(const struct pfs_node *n)
+{
+	return (unsigned int)((n->arg2 >> 32) & 0xFFFF);
+}
+
+/* Is a table entry present for this disk (mq/ only on a multi-queue
+ * disk; device/ a link when the driver names its device)? */
+static int blk_attr_present(const struct gendisk *d, const struct blk_attr *a)
+{
+	if (a->type == T_DIR && a->id == DK_MQ)
+		return d && blk_queue_is_mq(d->queue);
+	return 1;
+}
+
+/* The integrity format name the established attribute prints. */
+static const char *blk_integrity_format(const struct blk_integrity *bi)
+{
+	uint32_t md = bi->metadata_size ? bi->metadata_size : bi->tuple_size;
+
+	if (!md)
+		return "none";
+	switch (bi->csum_type) {
+	case BLK_INTEGRITY_CSUM_CRC:
+		return (bi->flags & BLK_INTEGRITY_REF_TAG) ? "T10-DIF-TYPE1-CRC" :
+							     "T10-DIF-TYPE3-CRC";
+	case BLK_INTEGRITY_CSUM_IP:
+		return (bi->flags & BLK_INTEGRITY_REF_TAG) ? "T10-DIF-TYPE1-IP" :
+							     "T10-DIF-TYPE3-IP";
+	case BLK_INTEGRITY_CSUM_CRC64:
+		return (bi->flags & BLK_INTEGRITY_REF_TAG) ? "EXT-DIF-TYPE1-CRC64" :
+							     "EXT-DIF-TYPE3-CRC64";
+	default:
+		return "nop";
+	}
 }
 
 /* The device a node describes, if its disk is still live.  Registry
@@ -526,13 +655,161 @@ static long blk_attr_show(struct pfs_node *n, char *buf, long cap)
 		r = pfs_printf(buf, cap, 0, "%u\n", q->read_ahead_kb);
 		break;
 	case Q_ZONED:
-		r = pfs_printf(buf, cap, 0, "none\n");
+		r = pfs_printf(buf, cap, 0, "%s\n",
+			       blk_queue_is_zoned(q) ? "host-managed" : "none");
+		break;
+	case Q_IO_POLL:
+		r = pfs_printf(buf, cap, 0, "%d\n",
+			       (l->features & BLK_FEAT_POLL) ? 1 : 0);
+		break;
+	case Q_CHUNK:
+		r = pfs_printf(buf, cap, 0, "%u\n",
+			       l->chunk_sectors * (l->logical_block_size / 512));
 		break;
 	case Q_DAX:
 	case Q_ADD_RANDOM:
-	case Q_IO_POLL:
-	case Q_CHUNK:
+	case Q_WRITE_SAME_MAX:
 		r = pfs_printf(buf, cap, 0, "0\n");
+		break;
+	case Q_IO_POLL_DELAY:
+		r = pfs_printf(buf, cap, 0, "%d\n",
+			       blk_queue_is_mq(q) ? (int)l->io_poll_delay : -1);
+		break;
+	case Q_NR_ZONES:
+		r = pfs_printf(buf, cap, 0, "%u\n",
+			       blk_queue_is_zoned(q) ? d->nr_zones : 0);
+		break;
+	case Q_MAX_OPEN_ZONES:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->max_open_zones);
+		break;
+	case Q_MAX_ACTIVE_ZONES:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->max_active_zones);
+		break;
+	case Q_ZONE_APPEND_MAX:
+		r = pfs_printf(buf, cap, 0, "%llu\n",
+			       (unsigned long long)l->max_zone_append_sectors *
+				       l->logical_block_size);
+		break;
+	case Q_ZONE_WRITE_GRAN:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->zone_write_granularity);
+		break;
+	case Q_ATOMIC_MAX:
+		r = pfs_printf(buf, cap, 0, "%llu\n",
+			       (unsigned long long)l->atomic_write_max_sectors *
+				       512);
+		break;
+	case Q_ATOMIC_BOUNDARY:
+		r = pfs_printf(buf, cap, 0, "%llu\n",
+			       (unsigned long long)l->atomic_write_boundary_sectors *
+				       512);
+		break;
+	case Q_ATOMIC_UNIT_MIN:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->atomic_write_unit_min);
+		break;
+	case Q_ATOMIC_UNIT_MAX:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->atomic_write_unit_max);
+		break;
+	case Q_MAX_WRITE_STREAMS:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->max_write_streams);
+		break;
+	case Q_WRITE_STREAM_GRAN:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->write_stream_granularity);
+		break;
+	case Q_VIRT_BOUNDARY:
+		r = pfs_printf(buf, cap, 0, "%llu\n",
+			       (unsigned long long)l->virt_boundary_mask);
+		break;
+	case Q_MAX_DISCARD_SEGS:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->max_discard_segments);
+		break;
+	case Q_MAX_INTEGRITY_SEGS:
+		r = pfs_printf(buf, cap, 0, "%u\n",
+			       (l->integrity.metadata_size ||
+				l->integrity.tuple_size) ?
+				       1u :
+				       0u);
+		break;
+	case Q_STABLE_WRITES:
+		r = pfs_printf(buf, cap, 0, "%d\n",
+			       (l->features & BLK_FEAT_STABLE_WRITES) ? 1 : 0);
+		break;
+	case Q_TIMEOUT:
+		r = pfs_printf(buf, cap, 0, "%u\n",
+			       q->tag_set ? q->tag_set->timeout_ms :
+					    BLK_DEFAULT_TIMEOUT_MS);
+		break;
+	case A_WWID:
+		if (d->wwid[0]) {
+			r = pfs_printf(buf, cap, 0, "%s\n", d->wwid);
+		} else if (d->ops && d->ops->get_unique_id) {
+			uint8_t id[16];
+			int nb = d->ops->get_unique_id(d, id, 3);
+
+			if (nb <= 0)
+				nb = d->ops->get_unique_id(d, id, 1);
+			r = 0;
+			if (nb > 0 && nb <= 16) {
+				r = pfs_printf(buf, cap, 0, "%s.",
+					       nb == 8 ? "eui" : "uuid");
+				for (int i = 0; i < nb; i++)
+					r = pfs_printf(buf, cap, r, "%02x", id[i]);
+				r = pfs_printf(buf, cap, r, "\n");
+			} else {
+				r = pfs_printf(buf, cap, 0, "\n");
+			}
+		} else {
+			r = pfs_printf(buf, cap, 0, "\n");
+		}
+		break;
+	case M_CPU_LIST:
+	case M_NR_TAGS:
+	case M_NR_RESERVED:
+	case M_DISPATCHED:
+	case M_RUN:
+	case M_BUSY:
+	case M_TAGS_IN_USE:
+	case M_DISPATCH_BUSY:
+	case M_TYPE:
+	case M_POLL_STATS:
+	case M_TIMEOUTS:
+	case M_REQUEUED:
+		r = blk_mq_hctx_show(q, blk_node_hctx(n),
+				     blk_node_attr(n) - M_CPU_LIST, buf, cap);
+		break;
+	case I_FORMAT:
+		r = pfs_printf(buf, cap, 0, "%s\n",
+			       blk_integrity_format(&l->integrity));
+		break;
+	case I_TAG_SIZE:
+		r = pfs_printf(buf, cap, 0, "%u\n", l->integrity.tag_size);
+		break;
+	case I_INTERVAL:
+		r = pfs_printf(buf, cap, 0, "%u\n",
+			       (l->integrity.metadata_size ||
+				l->integrity.tuple_size) ?
+				       (1u << (l->integrity.interval_exp ?
+						       l->integrity.interval_exp :
+						       9)) :
+				       0u);
+		break;
+	case I_READ_VERIFY:
+		r = pfs_printf(buf, cap, 0, "%d\n",
+			       (l->integrity.flags & BLK_INTEGRITY_NOVERIFY) ?
+				       0 :
+				       1);
+		break;
+	case I_WRITE_GENERATE:
+		r = pfs_printf(buf, cap, 0, "%d\n",
+			       (l->integrity.flags & BLK_INTEGRITY_NOGENERATE) ?
+				       0 :
+				       1);
+		break;
+	case I_CAPABLE:
+		r = pfs_printf(buf, cap, 0, "%d\n",
+			       (l->integrity.flags &
+				BLK_INTEGRITY_DEVICE_CAPABLE) ?
+				       1 :
+				       0);
 		break;
 	case Q_IOSTATS:
 		r = pfs_printf(buf, cap, 0, "1\n");
@@ -572,7 +849,8 @@ static long blk_attr_show(struct pfs_node *n, char *buf, long cap)
 								  "running");
 		break;
 	case D_QUEUE_DEPTH:
-		r = pfs_printf(buf, cap, 0, "%u\n", q->depth);
+		r = pfs_printf(buf, cap, 0, "%u\n",
+			       q->tag_set ? q->tag_set->queue_depth : q->depth);
 		break;
 	case D_TIMEOUT:
 		r = pfs_printf(buf, cap, 0, "%u\n", BLK_DEFAULT_TIMEOUT_MS / 1000);
@@ -721,12 +999,33 @@ static long blk_attr_store(struct pfs_node *n, const char *buf, long len)
 		break;
 	case Q_SCHEDULER: {
 		long k = len < (long)sizeof(word) - 1 ? len : (long)sizeof(word) - 1;
+		int rc;
+
 		for (long i = 0; i < k; i++)
 			word[i] = buf[i];
 		word[k] = 0;
-		if (blk_queue_set_scheduler(q, word))
-			r = -EINVAL;
-		break;
+		if (!blk_queue_is_mq(q)) {
+			if (blk_queue_set_scheduler(q, word))
+				r = -EINVAL;
+			break;
+		}
+		/* A multi-queue switch freezes and quiesces the queue, i.e.
+		 * waits for its I/O: never under the registry mutex.  The
+		 * queue is held by a reference and entered (its teardown
+		 * waits for us before its contexts and tag set go). */
+		blk_get_queue(q);
+		if (blk_queue_enter(q)) {
+			blk_mutex_unlock(&g_disk_registry_mutex);
+			blk_put_queue(q);
+			return -ENODEV;
+		}
+		blk_mutex_unlock(&g_disk_registry_mutex);
+		rc = blk_queue_set_scheduler(q, word);
+		blk_queue_leave(q);
+		blk_put_queue(q);
+		if (rc == -ENODEV || rc == -EAGAIN)
+			return rc;
+		return rc ? -EINVAL : r;
 	}
 	case Q_NR_REQUESTS:
 		if (blk_parse_u64(buf, len, &v) || v < 4 || v > 4096) {
@@ -750,6 +1049,31 @@ static long blk_attr_store(struct pfs_node *n, const char *buf, long len)
 		else {
 			r = -EINVAL;
 			break;
+		}
+		if (blk_queue_is_mq(q)) {
+			/* "write through" on a cache the device has only
+			 * switches the kernel's flushes off
+			 * (BLK_FLAG_WRITE_CACHE_DISABLED); "write back" brings
+			 * them back, never beyond what the device has. */
+			if (on && !(q->limits.features & BLK_FEAT_WRITE_CACHE)) {
+				r = -EINVAL;
+				break;
+			}
+			if (on)
+				q->limits.lim_flags &=
+					~BLK_FLAG_WRITE_CACHE_DISABLED;
+			else
+				q->limits.lim_flags |=
+					BLK_FLAG_WRITE_CACHE_DISABLED;
+			q->limits.fua = on && (q->limits.features & BLK_FEAT_FUA);
+			d->limits.lim_flags = q->limits.lim_flags;
+			d->limits.write_cache = (uint8_t)on;
+			d->limits.fua = q->limits.fua;
+			d->bdev.fua_supported = q->limits.fua;
+			for (int i = 1; i <= DISK_MAX_PARTS; i++)
+				if (d->part[i])
+					d->part[i]->bdev.fua_supported =
+						q->limits.fua;
 		}
 		q->limits.write_cache = (uint8_t)on;
 		d->bdev.flush_supported = (uint8_t)on;
@@ -785,6 +1109,56 @@ static long blk_attr_store(struct pfs_node *n, const char *buf, long len)
 		}
 		q->read_ahead_kb = (uint32_t)v;
 		break;
+	case Q_IO_POLL_DELAY: {
+		/* -1 classic polling, 0 adaptive (half the mean completion
+		 * time), > 0 a fixed sleep in microseconds (hybrid). */
+		long sv = 0;
+		long i = 0;
+		int neg = 0;
+
+		if (!blk_queue_is_mq(q)) {
+			r = -EINVAL;
+			break;
+		}
+		while (i < len && buf[i] == ' ')
+			i++;
+		if (i < len && buf[i] == '-') {
+			neg = 1;
+			i++;
+		}
+		if (i >= len || buf[i] < '0' || buf[i] > '9') {
+			r = -EINVAL;
+			break;
+		}
+		for (; i < len && buf[i] >= '0' && buf[i] <= '9'; i++)
+			sv = sv * 10 + (buf[i] - '0');
+		if (neg)
+			sv = -sv;
+		if (sv < -1 || sv > 10000000) {
+			r = -EINVAL;
+			break;
+		}
+		q->limits.io_poll_delay = (int32_t)sv;
+		d->limits.io_poll_delay = (int32_t)sv;
+		break;
+	}
+	case I_READ_VERIFY:
+	case I_WRITE_GENERATE: {
+		uint8_t bit = blk_node_attr(n) == I_READ_VERIFY ?
+				      BLK_INTEGRITY_NOVERIFY :
+				      BLK_INTEGRITY_NOGENERATE;
+
+		if (blk_parse_u64(buf, len, &v) || v > 1) {
+			r = -EINVAL;
+			break;
+		}
+		if (v)
+			q->limits.integrity.flags &= (uint8_t)~bit;
+		else
+			q->limits.integrity.flags |= bit;
+		d->limits.integrity.flags = q->limits.integrity.flags;
+		break;
+	}
 	case P_STATE:
 		/* The driver's suspend must not run under the registry
 		 * mutex: hold the disk by a reference instead. */
@@ -819,7 +1193,8 @@ static struct pfs_node *blk_make_node(struct pfs_node *dir, const char *name,
 		 * into it for "..". */
 		n->parent = NULL;
 		n->arg = d;
-		n->arg2 = ((uint64_t)a->id << 24) | ((uint64_t)partno << 16);
+		n->arg2 = ((uint64_t)a->id << 24) | ((uint64_t)partno << 16) |
+			  (dir->arg2 & (0xFFFFULL << 32));
 		pfs_set_dynamic(n, NULL, NULL);
 		return n;
 	}
@@ -833,7 +1208,8 @@ static struct pfs_node *blk_make_node(struct pfs_node *dir, const char *name,
 	if (!n)
 		return NULL;
 	n->arg = d;
-	n->arg2 = ((uint64_t)partno << 16) | a->id;
+	n->arg2 = ((uint64_t)partno << 16) | a->id |
+		  (dir->arg2 & (0xFFFFULL << 32));
 	n->show = blk_attr_show;
 	if (a->writable) {
 		n->store = blk_attr_store;
@@ -853,6 +1229,67 @@ static int blk_attr_dtype(const struct blk_attr *a)
 
 #define BLK_LIST_PART_KEY 1000u
 
+/* A name the disk directory has of its own (table entry)? */
+static int blk_disk_name_builtin(const char *name)
+{
+	for (int i = 0; i < NELEM(g_disk_attrs); i++)
+		if (kstrcmp(g_disk_attrs[i].name, name) == 0)
+			return 1;
+	return 0;
+}
+
+/* The disk's driver attribute directory, copied while the disk is known
+ * live; "" when it has none.  The copy is used without the mutex. */
+static void blk_disk_attr_dir(struct gendisk *d, char *out, size_t cap)
+{
+	out[0] = 0;
+	blk_mutex_lock(&g_disk_registry_mutex);
+	if (d && genhd_disk_alive_locked(d) && d->attr_dir[0])
+		ksnprintf(out, cap, "%s", d->attr_dir);
+	blk_mutex_unlock(&g_disk_registry_mutex);
+}
+
+/* Entries of the driver directory, after the table (cursor n .. below
+ * BLK_LIST_PART_KEY: the driver directory's own cursor plus n).  1 with
+ * an entry, 0 when it has no more. */
+static int blk_disk_attr_list(struct pfs_node *dir, unsigned n,
+			      unsigned *cursor, char *name, long cap,
+			      int *type)
+{
+	char adir[sizeof(((struct gendisk *)0)->attr_dir)];
+	struct pfs_node *ad;
+	unsigned fc;
+	int found = 0;
+
+	if (*cursor < n || *cursor >= BLK_LIST_PART_KEY)
+		return 0;
+	blk_disk_attr_dir((struct gendisk *)dir->arg, adir, sizeof(adir));
+	if (!adir[0])
+		return 0;
+	ad = pfs_lookup(dir->fs, adir);
+	if (!ad)
+		return 0;
+	fc = *cursor - n;
+	while (ad->type == PFS_DIR && ad->list) {
+		unsigned prev = fc;
+		int t = DT_REG;
+
+		if (!ad->list(ad, &fc, name, cap, &t))
+			break;
+		/* Keys past the window (or not moving) end the walk. */
+		if (fc <= prev || n + fc >= BLK_LIST_PART_KEY)
+			break;
+		if (blk_disk_name_builtin(name))
+			continue;
+		*type = t;
+		*cursor = n + fc;
+		found = 1;
+		break;
+	}
+	pfs_node_put(ad);
+	return found;
+}
+
 static int blk_dir_list(struct pfs_node *dir, unsigned *cursor, char *name,
 			long cap, int *type)
 {
@@ -861,14 +1298,56 @@ static int blk_dir_list(struct pfs_node *dir, unsigned *cursor, char *name,
 	const struct blk_attr *t = blk_table(kind, &n);
 	unsigned c = *cursor;
 
-	if (c < (unsigned)n) {
-		ksnprintf(name, (size_t)cap, "%s", t[c].name);
-		*type = blk_attr_dtype(&t[c]);
-		*cursor = c + 1;
-		return 1;
+	if (kind == DK_MQ) {
+		/* one directory per hardware queue: 0, 1, ... */
+		struct gendisk *d = (struct gendisk *)dir->arg;
+		int found = 0;
+
+		blk_mutex_lock(&g_disk_registry_mutex);
+		if (d && genhd_disk_alive_locked(d) && d->queue &&
+		    blk_queue_is_mq(d->queue) && c < d->queue->nr_hw_queues) {
+			ksnprintf(name, (size_t)cap, "%u", c);
+			*type = DT_DIR;
+			*cursor = c + 1;
+			found = 1;
+		}
+		blk_mutex_unlock(&g_disk_registry_mutex);
+		return found;
+	}
+	while (c < (unsigned)n) {
+		struct gendisk *d = (struct gendisk *)dir->arg;
+		int present = 1, link = 0;
+
+		/* mq/ (multi-queue disks only) and device/ (a link when the
+		 * driver names its device) depend on the disk: looked at
+		 * under the registry mutex. */
+		if (kind == DK_DISK && t[c].type == T_DIR &&
+		    (t[c].id == DK_MQ || t[c].id == DK_DEVICE)) {
+			blk_mutex_lock(&g_disk_registry_mutex);
+			present = d && genhd_disk_alive_locked(d) &&
+				  blk_attr_present(d, &t[c]);
+			link = present && t[c].id == DK_DEVICE &&
+			       d->device_link[0];
+			blk_mutex_unlock(&g_disk_registry_mutex);
+		}
+		if (present) {
+			ksnprintf(name, (size_t)cap, "%s", t[c].name);
+			*type = link ? DT_LNK : blk_attr_dtype(&t[c]);
+			*cursor = c + 1;
+			return 1;
+		}
+		c++;
 	}
 	if (kind != DK_DISK)
 		return 0;
+	/* the driver's attributes */
+	if (c < BLK_LIST_PART_KEY) {
+		if (blk_disk_attr_list(dir, (unsigned)n, &c, name, cap, type)) {
+			*cursor = c;
+			return 1;
+		}
+		c = BLK_LIST_PART_KEY;
+	}
 	/* the disk's partitions, keyed by number */
 	{
 		struct gendisk *d = (struct gendisk *)dir->arg;
@@ -903,9 +1382,58 @@ static struct pfs_node *blk_dir_lookup(struct pfs_node *dir, const char *name)
 	const struct blk_attr *t = blk_table(kind, &n);
 	struct pfs_node *r = NULL;
 
+	if (kind == DK_MQ) {
+		/* mq/<n> */
+		unsigned int idx = 0;
+		const char *p = name;
+		int ok = *p >= '0' && *p <= '9';
+
+		while (*p >= '0' && *p <= '9')
+			idx = idx * 10 + (unsigned int)(*p++ - '0');
+		if (!ok || *p)
+			return NULL;
+		blk_mutex_lock(&g_disk_registry_mutex);
+		if (d && genhd_disk_alive_locked(d) && d->queue &&
+		    blk_queue_is_mq(d->queue) && idx < d->queue->nr_hw_queues) {
+			static const struct blk_attr ha = { "", DK_MQ_HCTX,
+							    T_DIR, 0, NULL };
+
+			r = blk_make_node(dir, name, &ha, d, 0);
+			if (r) {
+				r->arg2 |= (uint64_t)idx << 32;
+				pfs_set_dynamic(r, blk_dir_list, blk_dir_lookup);
+			}
+		}
+		blk_mutex_unlock(&g_disk_registry_mutex);
+		return r;
+	}
 	for (int i = 0; i < n; i++)
 		if (kstrcmp(t[i].name, name) == 0) {
-			r = blk_make_node(dir, name, &t[i], d, partno);
+			int present = 1;
+
+			if (kind == DK_DISK && t[i].type == T_DIR &&
+			    (t[i].id == DK_MQ || t[i].id == DK_DEVICE)) {
+				blk_mutex_lock(&g_disk_registry_mutex);
+				present = d && genhd_disk_alive_locked(d) &&
+					  blk_attr_present(d, &t[i]);
+				if (present && t[i].type == T_DIR &&
+				    t[i].id == DK_DEVICE && d->device_link[0]) {
+					/* device -> the driver's device dir */
+					r = pfs_node_new(dir->fs, dir, name,
+							 PFS_LINK);
+					if (r)
+						ksnprintf(r->link,
+							  sizeof(r->link),
+							  "../../%s",
+							  d->device_link);
+					present = 0;
+				}
+				blk_mutex_unlock(&g_disk_registry_mutex);
+				if (r)
+					return r;
+			}
+			if (present)
+				r = blk_make_node(dir, name, &t[i], d, partno);
 			break;
 		}
 	if (r && r->type == PFS_DIR)
@@ -930,6 +1458,18 @@ static struct pfs_node *blk_dir_lookup(struct pfs_node *dir, const char *name)
 		}
 	}
 	blk_mutex_unlock(&g_disk_registry_mutex);
+	if (r)
+		return r;
+	/* one of the driver's attributes: its own node */
+	if (!blk_disk_name_builtin(name)) {
+		char adir[sizeof(d->attr_dir)], path[192];
+
+		blk_disk_attr_dir(d, adir, sizeof(adir));
+		if (adir[0]) {
+			ksnprintf(path, sizeof(path), "%s/%s", adir, name);
+			r = pfs_lookup(dir->fs, path);
+		}
+	}
 	return r;
 }
 
@@ -937,9 +1477,15 @@ static struct pfs_node *blk_dir_lookup(struct pfs_node *dir, const char *name)
  * plus the partition number. */
 static unsigned blk_disk_key(const struct gendisk *d)
 {
-	return (unsigned)((d->kind == BLK_DISK_SD ? d->index :
-						    DISK_MAX_DISKS + d->index) *
-			  256);
+	unsigned base;
+
+	if (d->kind == BLK_DISK_SD)
+		base = (unsigned)d->index;
+	else if (d->kind == BLK_DISK_SR)
+		base = DISK_MAX_DISKS + (unsigned)d->index;
+	else /* named disks after them, in index order */
+		base = DISK_MAX_DISKS + DISK_MAX_SR + (unsigned)d->index;
+	return base * 256;
 }
 
 /* The device with the smallest key >= `from' (whole disks only when

@@ -19,11 +19,13 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/fs/sysfs.h>
+#include <kernel/ke/uaccess_range.h>
 
-// SMAP-aware user copies (argp/user_buf are raw user pointers)
+// SMAP-aware user copies (argp/user_buf are raw user pointers); the whole
+// range must be user memory.
 static int fbdev_copy_to_user(void *user_dst, const void *src, size_t len)
 {
-	if (!user_dst)
+	if (!user_dst || !user_range_ok((uint64_t)user_dst, len))
 		return -EFAULT;
 	smap_disable();
 	kmemcpy(user_dst, src, len);
@@ -33,7 +35,7 @@ static int fbdev_copy_to_user(void *user_dst, const void *src, size_t len)
 
 static int fbdev_copy_from_user(void *dst, const void *user_src, size_t len)
 {
-	if (!user_src)
+	if (!user_src || !user_range_ok((uint64_t)user_src, len))
 		return -EFAULT;
 	smap_disable();
 	kmemcpy(dst, user_src, len);

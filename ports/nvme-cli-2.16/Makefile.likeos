@@ -1,0 +1,119 @@
+# Makefile.likeos - build nvme-cli 2.16 (the `nvme' program) for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; meson is not
+# run.  The source list is upstream's meson.build, plugins/meson.build,
+# plugins/{feat,lm,ocp}/meson.build, util/meson.build and ccan/meson.build
+# under the answers in config.h (no json-c: no JSON printers and no
+# solidigm plugin; no sed-opal: no sed plugin).  likeos-hash.c in this
+# directory computes the RPMB digests (patch 0002).
+#
+# libnvme comes from ../libnvme-1.16.2 (static archives and headers); the
+# top-level ports-nvmecli target builds it first.
+#
+# Output: build/nvme
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+LIBNVME_DIR = ../libnvme-1.16.2
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+
+# Upstream: c_std=gnu99, warning_level=1, -fomit-frame-pointer -D_GNU_SOURCE,
+# -include config.h, include path ccan/.
+CFLAGS = -std=gnu99 -Wall -O2 -fomit-frame-pointer -nostdlib -fno-builtin \
+         -fstack-protector-strong -mno-red-zone -ffreestanding -fPIE \
+         -D_GNU_SOURCE -D__LIKEOS__ \
+         -I. -I$(LIBC_DIR)/include -I$(S) -I$(S)/ccan -I$(LIBNVME_DIR)/src/src \
+         -include config.h
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBNVME = $(LIBNVME_DIR)/build/libnvme-mi.a $(LIBNVME_DIR)/build/libnvme.a
+LIBS = -lc -l:ld-likeos.so
+
+CORE = nbft.c fabrics.c nvme.c nvme-models.c nvme-print.c \
+       nvme-print-stdout.c nvme-print-binary.c nvme-rpmb.c nvme-wrap.c \
+       plugin.c libnvme-wrap.c logging.c
+PLUGINS = plugins/amzn/amzn-nvme.c plugins/dapustor/dapustor-nvme.c \
+          plugins/dell/dell-nvme.c plugins/dera/dera-nvme.c \
+          plugins/fdp/fdp.c plugins/huawei/huawei-nvme.c \
+          plugins/ibm/ibm-nvme.c plugins/innogrit/innogrit-nvme.c \
+          plugins/inspur/inspur-nvme.c plugins/intel/intel-nvme.c \
+          plugins/mangoboost/mangoboost-nvme.c \
+          plugins/memblaze/memblaze-nvme.c plugins/micron/micron-nvme.c \
+          plugins/nbft/nbft-plugin.c plugins/netapp/netapp-nvme.c \
+          plugins/nvidia/nvidia-nvme.c plugins/sandisk/sandisk-nvme.c \
+          plugins/sandisk/sandisk-utils.c plugins/scaleflux/sfx-nvme.c \
+          plugins/seagate/seagate-nvme.c plugins/shannon/shannon-nvme.c \
+          plugins/ssstc/ssstc-nvme.c plugins/toshiba/toshiba-nvme.c \
+          plugins/transcend/transcend-nvme.c plugins/virtium/virtium-nvme.c \
+          plugins/wdc/wdc-nvme.c plugins/wdc/wdc-utils.c \
+          plugins/ymtc/ymtc-nvme.c plugins/zns/zns.c \
+          plugins/feat/feat-nvme.c \
+          plugins/lm/lm-nvme.c plugins/lm/lm-print.c \
+          plugins/lm/lm-print-stdout.c plugins/lm/lm-print-binary.c \
+          plugins/ocp/ocp-utils.c plugins/ocp/ocp-nvme.c \
+          plugins/ocp/ocp-clear-features.c \
+          plugins/ocp/ocp-smart-extended-log.c \
+          plugins/ocp/ocp-fw-activation-history.c \
+          plugins/ocp/ocp-telemetry-decode.c \
+          plugins/ocp/ocp-hardware-component-log.c \
+          plugins/ocp/ocp-print.c plugins/ocp/ocp-print-stdout.c \
+          plugins/ocp/ocp-print-binary.c
+UTIL = util/argconfig.c util/base64.c util/crc32.c util/mem.c \
+       util/sighdl.c util/suffix.c util/types.c util/utils.c util/table.c
+CCAN = ccan/ccan/hash/hash.c ccan/ccan/htable/htable.c \
+       ccan/ccan/ilog/ilog.c ccan/ccan/likely/likely.c \
+       ccan/ccan/list/list.c ccan/ccan/str/debug.c ccan/ccan/str/str.c \
+       ccan/ccan/strset/strset.c
+
+SRCS = $(CORE) $(PLUGINS) $(UTIL) $(CCAN)
+OBJS = $(addprefix $(B)/,$(SRCS:.c=.o)) $(B)/likeos-hash.o
+
+# Every object depends on every header: the plugin headers are generated
+# through cmd.h/define_cmd.h macros and shared throughout.
+HDRS = config.h likeos-hash.h \
+       $(wildcard $(S)/*.h $(S)/util/*.h $(S)/plugins/*/*.h $(S)/ccan/ccan/*/*.h) \
+       $(wildcard $(LIBNVME_DIR)/src/src/*.h $(LIBNVME_DIR)/src/src/nvme/*.h)
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(B)/nvme
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): nvme-cli-2.16.tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(B)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/likeos-hash.o: likeos-hash.c likeos-hash.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Wextra -c $< -o $@
+
+$(B)/nvme: $(OBJS) $(LIBNVME) $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(OBJS) $(LIBNVME) $(LIBS) -o $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

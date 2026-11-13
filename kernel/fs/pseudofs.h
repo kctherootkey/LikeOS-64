@@ -91,6 +91,13 @@ struct pfs_node *pfs_add_link(struct pfs *fs, const char *path,
 struct pfs_node *pfs_add_file_rw(struct pfs *fs, const char *path,
 				 pfs_show_t show, pfs_store_t store, void *arg,
 				 uint64_t arg2);
+/* Add a node of `type' whose fields (mode, uid/gid, show/store/read_at,
+ * arg/arg2, link, list/lookup) are taken from `tmpl' before the node
+ * becomes reachable -- what a caller that would otherwise set them on the
+ * returned node afterwards, while lookups can already see it, should use.
+ * Adding is serialised; nodes are never removed. */
+struct pfs_node *pfs_add_node(struct pfs *fs, const char *path,
+			      enum pfs_type type, const struct pfs_node *tmpl);
 /* Make a directory dynamic. */
 void pfs_set_dynamic(struct pfs_node *dir, pfs_list_t list,
 		     pfs_lookup_t lookup);

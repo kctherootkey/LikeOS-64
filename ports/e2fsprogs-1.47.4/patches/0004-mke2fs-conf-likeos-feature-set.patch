@@ -1,0 +1,34 @@
+mke2fs's defaults for ext4 are the configuration the LikeOS root image is
+built with (top-level Makefile: EXT4_MKFS_FEATURES and the mkfs.ext4 call)
+and the LikeOS ext4 driver is verified against: has_journal, extent,
+huge_file, flex_bg, metadata_csum, dir_nlink, extra_isize on top of the base
+features, 4 KiB blocks for every size class.  Dropped from the upstream
+default: 64bit (32-byte group descriptors, as in the image),
+metadata_csum_seed and orphan_file (not in the image), and the 1 KiB block
+size of the "small" and "floppy" classes (the image is always 4 KiB).
+auto_64-bit_support turns 64bit back on only for a device whose block count
+does not fit in 32 bits (16 TiB at 4 KiB blocks), where mke2fs would
+otherwise refuse; the driver implements 64bit.  The same text is mke2fs's
+built-in profile and the installed /etc/mke2fs.conf.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/misc/mke2fs.conf.in	2026-03-06 18:17:36.000000000 +0100
++++ b/misc/mke2fs.conf.in	2026-11-11 15:40:00.000000000 +0100
+@@ -11,14 +11,13 @@
+ 		features = has_journal
+ 	}
+ 	ext4 = {
+-		features = has_journal,extent,huge_file,flex_bg,metadata_csum,metadata_csum_seed,64bit,dir_nlink,extra_isize,orphan_file
++		features = has_journal,extent,huge_file,flex_bg,metadata_csum,dir_nlink,extra_isize
++		auto_64-bit_support = 1
+ 	}
+ 	small = {
+-		blocksize = 1024
+ 		inode_ratio = 4096
+ 	}
+ 	floppy = {
+-		blocksize = 1024
+ 		inode_ratio = 8192
+ 	}
+ 	big = {

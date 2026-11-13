@@ -284,6 +284,16 @@ typedef struct procmapinfo {
 #define SYS_PWRITE64 418 /* (fd, buf, count, offset) */
 #define SYS_FDATASYNC 419 /* (fd) */
 #define SYS_FALLOCATE 420 /* (fd, mode, offset, len) */
+/* Vectored positional I/O with per-call flags (RWF_*): offset -1 uses and
+ * advances the file position.  (fd, iov, iovcnt, offset, flags) */
+#define SYS_PREADV2 427
+#define SYS_PWRITEV2 428
+/* msync(2): write what was stored into a shared file mapping to the file.
+ * (addr, length, flags) */
+#define SYS_MSYNC 429
+#define MS_ASYNC 1
+#define MS_INVALIDATE 2
+#define MS_SYNC 4
 
 /* Trace options (PTRACE_SETOPTIONS): which extra events stop the tracee.
  * Mirrored in user/lib/libc/include/sys/ptrace.h. */

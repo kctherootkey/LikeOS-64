@@ -28,6 +28,13 @@ void sysfs_init(void);
 int sysfs_add_char_device(const char *name, uint32_t major, uint32_t minor,
 			  const char *class, const pci_device_t *pci);
 
+/* A PCI function's directory /sys/bus/pci/devices/SSSS:BB:DD.F with its
+ * attribute files: every function present at boot gets one from
+ * sysfs_init; the PCI core calls this for functions found later (hot-plug,
+ * VMD domains).  A function found again at the same address reuses its
+ * directory.  No-op before sysfs_init. */
+void sysfs_add_pci(const pci_device_t *d);
+
 /* Record which driver bound a PCI function: the uevent's DRIVER= line,
  * a `driver' link in the device's directory and the device's entry under
  * /sys/bus/pci/drivers/<name>/.  `name' must outlive the call (a driver's
@@ -44,6 +51,13 @@ void sysfs_pci_path(const pci_device_t *dev, char *out, size_t cap);
  * sysfs_add_attr(). */
 int sysfs_add_class_device(const char *class, const char *name,
 			   const pci_device_t *pci, char *base, size_t cap);
+/* /sys/class/hwmon/hwmon<N>: register a hardware monitor whose directory
+ * is <parent>/hwmon<N> (`parent' an absolute /sys path; the caller serves
+ * that directory under the name it is given).  Returns N (lowest free)
+ * or a negative errno; unregister with N when the monitor goes.  Any
+ * context. */
+int sysfs_hwmon_register(const char *parent);
+void sysfs_hwmon_unregister(int id);
 /* A directory under /sys (created with its parents, or the existing
  * one), for a subsystem that makes it dynamic (pfs_set_dynamic) and lists
  * its own entries -- the block layer's /sys/block. */

@@ -411,6 +411,8 @@ char *strerror(int errnum)
 		return "Identifier removed";
 	case 52:
 		return "Invalid exchange";
+	case 57:
+		return "Invalid slot";
 	case 60:
 		return "Device not a stream";
 	case 61:
@@ -485,6 +487,8 @@ char *strerror(int errnum)
 		return "Wrong medium type";
 	case 125:
 		return "Operation canceled";
+	case 126:
+		return "Required key not available";
 	case 130:
 		return "Owner died";
 	case 131:

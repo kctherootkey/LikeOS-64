@@ -36,6 +36,7 @@
 
 #include <kernel/dev/block/blkdev.h> /* first: it includes ke/syscall.h */
 #include <kernel/ke/storage.h>
+#include <kernel/fs/kdev_t.h>
 #include <kernel/io/console.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/userinit.h>
@@ -348,7 +349,7 @@ static void sto_parse_root_spec(void)
 			sto_copy(maj, sizeof(maj), s, (size_t)(colon - s));
 			if (sto_parse_uint(maj, &g_spec.major) &&
 			    sto_parse_uint(colon + 1, &g_spec.minor) &&
-			    g_spec.major < 256 && g_spec.minor < 256) {
+			    kdev_valid(g_spec.major, g_spec.minor)) {
 				g_spec.kind = SPEC_DEVT;
 				sto_copy(g_spec.value, sizeof(g_spec.value), s,
 					 sizeof(g_spec.value));

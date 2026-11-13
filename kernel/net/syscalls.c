@@ -9,6 +9,7 @@
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
+#include <kernel/ke/uaccess_range.h>
 #include <kernel/fs/file.h>
 
 /* A descriptor passed over a socket that could not be handed to the
@@ -297,12 +298,18 @@ __attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 		 * flattening here is what preserves the message boundary the
 		 * caller is relying on.  The descriptors above were queued
 		 * before any byte, so they carry this record's start offset. */
+		/* Summed without wrapping: a record past the limit -- or
+		 * lengths whose sum only looks small after wrapping -- is
+		 * refused before anything is copied. */
 		size_t rtotal = 0;
-		for (int i = 0; i < kiovcnt; i++)
-			rtotal += iov[i].iov_len;
-		if (rtotal > 65536 - 8)
-			return -EMSGSIZE;
 		int r;
+		for (int i = 0; i < kiovcnt; i++) {
+			if (iov[i].iov_len > 65536 - 8 - rtotal) {
+				r = -EMSGSIZE;
+				goto seq_done;
+			}
+			rtotal += iov[i].iov_len;
+		}
 		if (kiovcnt == 1 || rtotal == 0) {
 			void *base = kiovcnt ? iov[0].iov_base : NULL;
 			if (rtotal &&
@@ -1443,12 +1450,60 @@ int64_t sys_accept4(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	}
 }
 
+/* The most iovecs one sendmsg/recvmsg may carry (UIO_MAXIOV). */
+#define MSG_MAXIOV 1024
+
+/* For the inet socket paths, which walk a msghdr's memory directly: check
+ * every user range it points to -- the address, the control buffer, each
+ * iovec's buffer -- and replace the iovec array by a kernel copy, so the
+ * entries cannot change after the check.  *kiov_out (kfree) is that copy,
+ * NULL when there is none. */
+static int msghdr_prepare(struct msghdr *kmsg, struct iovec **kiov_out)
+{
+	struct iovec *kiov;
+	size_t bytes;
+
+	*kiov_out = NULL;
+	if (kmsg->msg_iovlen < 0 || kmsg->msg_iovlen > MSG_MAXIOV)
+		return -EMSGSIZE;
+	if (kmsg->msg_name && kmsg->msg_namelen &&
+	    !validate_user_ptr((uint64_t)kmsg->msg_name, kmsg->msg_namelen))
+		return -EFAULT;
+	if (kmsg->msg_control && kmsg->msg_controllen &&
+	    !validate_user_ptr((uint64_t)kmsg->msg_control,
+			       kmsg->msg_controllen))
+		return -EFAULT;
+	if (kmsg->msg_iovlen == 0) {
+		kmsg->msg_iov = NULL;
+		return 0;
+	}
+	bytes = (size_t)kmsg->msg_iovlen * sizeof(struct iovec);
+	kiov = (struct iovec *)kalloc(bytes);
+	if (!kiov)
+		return -ENOMEM;
+	if (copy_from_user(kiov, kmsg->msg_iov, bytes)) {
+		kfree(kiov);
+		return -EFAULT;
+	}
+	for (int i = 0; i < kmsg->msg_iovlen; i++)
+		if (kiov[i].iov_len &&
+		    !validate_user_ptr((uint64_t)kiov[i].iov_base,
+				       kiov[i].iov_len)) {
+			kfree(kiov);
+			return -EFAULT;
+		}
+	kmsg->msg_iov = kiov;
+	*kiov_out = kiov;
+	return 0;
+}
+
 int64_t sys_sendmsg(uint64_t a1, uint64_t a2, uint64_t a3)
 {
 	if (!validate_user_ptr(a2, sizeof(struct msghdr)))
 		return -EFAULT;
 	struct msghdr kmsg;
-	copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr));
+	if (copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr)))
+		return -EFAULT;
 
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd)
@@ -1457,7 +1512,14 @@ int64_t sys_sendmsg(uint64_t a1, uint64_t a2, uint64_t a3)
 	int idx = sock_idx_from_fd(a1);
 	if (idx < 0)
 		return idx;
-	return sock_sendmsg(idx, &kmsg, (int)a3);
+	struct iovec *kiov;
+	int r = msghdr_prepare(&kmsg, &kiov);
+	if (r < 0)
+		return r;
+	r = sock_sendmsg(idx, &kmsg, (int)a3);
+	if (kiov)
+		kfree(kiov);
+	return r;
 }
 
 int64_t sys_recvmsg(uint64_t a1, uint64_t a2, uint64_t a3)
@@ -1465,7 +1527,8 @@ int64_t sys_recvmsg(uint64_t a1, uint64_t a2, uint64_t a3)
 	if (!validate_user_ptr(a2, sizeof(struct msghdr)))
 		return -EFAULT;
 	struct msghdr kmsg;
-	copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr));
+	if (copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr)))
+		return -EFAULT;
 
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
@@ -1479,7 +1542,17 @@ int64_t sys_recvmsg(uint64_t a1, uint64_t a2, uint64_t a3)
 	int idx = sock_idx_from_fd(a1);
 	if (idx < 0)
 		return idx;
-	int ret = sock_recvmsg(idx, &kmsg, (int)a3);
+	struct iovec *uiov = kmsg.msg_iov;
+	struct iovec *kiov;
+	int ret = msghdr_prepare(&kmsg, &kiov);
+	if (ret < 0)
+		return ret;
+	ret = sock_recvmsg(idx, &kmsg, (int)a3);
+	if (kiov)
+		kfree(kiov);
+	/* The caller's header gets its own iovec pointer back, not the
+	 * kernel copy's. */
+	kmsg.msg_iov = uiov;
 	if (ret >= 0)
 		copy_to_user((void *)a2, &kmsg, sizeof(struct msghdr));
 	return ret;
@@ -1512,9 +1585,13 @@ int64_t sys_dns_resolve(uint64_t a1, uint64_t a2)
 	// Copy page-by-page to avoid faulting across page boundaries.
 	char khost[256];
 	size_t off = 0;
+	/* Never past the end of user space, wherever the string starts. */
+	size_t lim = 255;
+	if (user_range_room(a1) < lim)
+		lim = (size_t)user_range_room(a1);
 	khost[0] = '\0';
 	smap_disable();
-	while (off < 255) {
+	while (off < lim) {
 		uintptr_t addr = a1 + off;
 		// Check that the page containing this byte is mapped
 		if (!mm_is_page_mapped(addr))
@@ -1522,8 +1599,8 @@ int64_t sys_dns_resolve(uint64_t a1, uint64_t a2)
 		// Copy up to end of this page (or remaining buffer)
 		size_t page_end = (addr | 0xFFF) + 1;
 		size_t chunk = page_end - addr;
-		if (off + chunk > 255)
-			chunk = 255 - off;
+		if (off + chunk > lim)
+			chunk = lim - off;
 		for (size_t j = 0; j < chunk; j++) {
 			khost[off] = ((const char *)a1)[off];
 			if (khost[off] == '\0')

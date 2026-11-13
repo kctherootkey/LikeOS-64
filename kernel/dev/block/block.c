@@ -211,7 +211,7 @@ int block_sync(block_device_t *dev)
  * Small helpers
  * ========================================================================== */
 
-int blk_status_to_errno(int st)
+int blk_st_to_errno(int st)
 {
 	switch (st) {
 	case ST_OK:
@@ -267,7 +267,8 @@ const char *blk_op_name(enum blk_op op)
 	case BLK_OP_DRV_OUT:
 		return "DRV_OUT";
 	default:
-		return "?";
+		/* The multi-queue / zoned ops (blk_mq.c has every name). */
+		return blk_op_str((int)op);
 	}
 }
 
@@ -480,6 +481,10 @@ void blk_request_init(struct blk_request *req, block_device_t *bdev,
 	req->bl.merge_slot = -1;
 	req->bl.tag = -1;
 	req->submit_cpu = -1;
+	/* Multi-queue: no driver tag, not at a driver, no hctx yet. */
+	req->tag = -1;
+	req->mq_state = MQ_RQ_IDLE;
+	refcount_set(&req->mq_ref, 0);
 }
 
 /* Make room for one more element.  0 or -ENOMEM. */
@@ -625,6 +630,18 @@ static void blk_request_destroy_any(struct blk_request *req)
 	 * split piece does when its last reference is dropped. */
 	if (blk_can_release_now() || sched_current() == NULL ||
 	    (blk_in_softirq() && !blk_in_hardirq())) {
+		blk_request_destroy(req);
+		return;
+	}
+	/* A request not made by blk_request_alloc() lives in its owner's
+	 * storage -- on the stack for the synchronous helpers -- and a task
+	 * drops its last reference only when it is done with it.  Parked on
+	 * a section's list -- or on the deferred list, where a task that
+	 * releases it with interrupts off would put it -- it would leave a
+	 * pointer into storage that is gone by the time the list is walked:
+	 * a kblockd item that reads synchronously returns before its section
+	 * ends. */
+	if (!(req->bl.internal & BLK_RQI_HEAP)) {
 		blk_request_destroy(req);
 		return;
 	}
@@ -795,7 +812,7 @@ static int blk_submit_legacy(struct blk_request *req)
 				st = dev->write(dev, (unsigned long)lba, n,
 						req->sg[i].virt);
 			if (st != ST_OK) {
-				err = blk_status_to_errno(st);
+				err = blk_st_to_errno(st);
 				break;
 			}
 			lba += n;
@@ -810,7 +827,7 @@ static int blk_submit_legacy(struct blk_request *req)
 		if (dev->sync) {
 			int st = dev->sync(dev);
 			if (st != ST_OK)
-				err = blk_status_to_errno(st);
+				err = blk_st_to_errno(st);
 		}
 		break;
 	default:
@@ -878,7 +895,12 @@ static int blk_validate_extended(struct blk_request *req)
 		return -ENODEV;
 	if ((bdev->parent && (bdev->parent->flags & BDEV_F_DEAD)))
 		return -ENODEV;
-	if (!disk->ops || !disk->ops->submit)
+	/* A disk whose device is gone (blk_mark_disk_dead): I/O fails with
+	 * -EIO; a pass-through command is refused as at its allocation. */
+	if (disk_flags(disk) & GENHD_FL_GONE)
+		return blk_rq_is_passthrough(req) ? -ENODEV : -EIO;
+	/* Single queue: the driver's ->submit; multi-queue: its tag set. */
+	if (!disk->ops || (!disk->ops->submit && !blk_queue_is_mq(q)))
 		return -ENODEV;
 
 	switch (req->op) {
@@ -906,13 +928,51 @@ static int blk_validate_extended(struct blk_request *req)
 	case BLK_OP_DRV_IN:
 	case BLK_OP_DRV_OUT:
 		/* Pass-through: the command object carries everything; it
-		 * may address a drive with no medium (TEST UNIT READY). */
-		if (!req->drv_cmd)
+		 * may address a drive with no medium (TEST UNIT READY).  A
+		 * multi-queue driver keeps its command in the per-tag data
+		 * instead. */
+		if (!req->drv_cmd && !blk_queue_is_mq(q))
+			return -EINVAL;
+		break;
+	case BLK_OP_ZONE_APPEND:
+		/* A write at the zone's write pointer: lba is the zone's
+		 * start, the data must stay inside the zone. */
+		if (!blk_queue_is_zoned(q))
+			return -EOPNOTSUPP;
+		if (!bdev->ready)
+			return -ENODEV;
+		if (req->count == 0)
+			return -EINVAL;
+		end = req->lba + req->count;
+		if (end < req->lba || end > bdev->total_sectors)
+			return -EINVAL;
+		break;
+	case BLK_OP_ZONE_OPEN:
+	case BLK_OP_ZONE_CLOSE:
+	case BLK_OP_ZONE_FINISH:
+	case BLK_OP_ZONE_RESET:
+	case BLK_OP_ZONE_RESET_ALL:
+		/* No data; lba is the zone's start (0 for RESET_ALL). */
+		if (!blk_queue_is_zoned(q))
+			return -EOPNOTSUPP;
+		if (req->count != 0 || req->nsg)
+			return -EINVAL;
+		if (req->op != BLK_OP_ZONE_RESET_ALL &&
+		    req->lba >= bdev->total_sectors)
 			return -EINVAL;
 		break;
 	default:
 		return -EINVAL;
 	}
+
+	/* Multi-queue features: a write stream the device has, an atomic
+	 * write only as a plain write. */
+	if (req->write_stream &&
+	    (!blk_op_is_write(req->op) ||
+	     req->write_stream > q->limits.max_write_streams))
+		return -EINVAL;
+	if ((req->flags & BLK_REQ_ATOMIC) && req->op != BLK_OP_WRITE)
+		return -EINVAL;
 
 	if (blk_op_is_write(req->op) && req->op != BLK_OP_DRV_OUT &&
 	    blk_bdev_read_only(bdev))
@@ -922,6 +982,18 @@ static int blk_validate_extended(struct blk_request *req)
 	case BLK_OP_READ:
 	case BLK_OP_WRITE:
 		return blk_validate_sg(req, q);
+	case BLK_OP_ZONE_APPEND: {
+		int rc = blk_validate_sg(req, q);
+		uint64_t total = 0;
+
+		if (rc)
+			return rc;
+		for (uint32_t i = 0; i < req->nsg; i++)
+			total += req->sg[i].len;
+		return total == (uint64_t)req->count * bdev->sector_size ?
+			       0 :
+			       -EINVAL;
+	}
 	case BLK_OP_DRV_IN:
 	case BLK_OP_DRV_OUT:
 		return req->nsg ? blk_validate_sg(req, q) : 0;
@@ -1018,6 +1090,11 @@ static uint64_t blk_rq_max_sectors(const struct blk_queue *q, enum blk_op op)
 		return l->max_discard_sectors;
 	case BLK_OP_WRITE_ZEROES:
 		return l->max_write_zeroes_sectors;
+	case BLK_OP_ZONE_APPEND:
+		/* An emulated zone append is a write: the write limit. */
+		if (!l->max_zone_append_sectors)
+			return l->max_sectors ? l->max_sectors : l->max_hw_sectors;
+		return l->max_zone_append_sectors;
 	default:
 		return 0;
 	}
@@ -1279,6 +1356,12 @@ static int blk_submit_split(struct blk_queue *q, struct blk_request *req)
 	return 0;
 }
 
+static int blk_submit_reject(struct blk_queue *q, struct blk_request *req,
+			     int rc);
+static int blk_submit_tail(struct blk_queue *q, struct blk_request *req,
+			   int resumed);
+static int blk_submit_mq(struct blk_queue *q, struct blk_request *req);
+
 int blk_submit(struct blk_request *req)
 {
 	block_device_t *bdev;
@@ -1350,6 +1433,25 @@ int blk_submit(struct blk_request *req)
 		return 0;
 	}
 
+	/* An atomic write goes to the device as one command or not at all:
+	 * within the disk's atomic write limits and never split.  A zone
+	 * append is never split either (its position is the device's). */
+	if (req->flags & BLK_REQ_ATOMIC) {
+		rc = blk_validate_atomic_write(bdev->disk, blk_rq_pos(req),
+					       req->count * bdev->sector_size);
+		if (!rc && blk_rq_needs_split(q, req))
+			rc = -EINVAL;
+		if (rc)
+			return blk_submit_reject(q, req, rc);
+		req->flags |= BLK_REQ_NOMERGE;
+	}
+	if (req->op == BLK_OP_ZONE_APPEND && blk_rq_needs_split(q, req))
+		return blk_submit_reject(q, req, -EINVAL);
+
+	/* Multi-queue and zoned queues continue on their own path. */
+	if (blk_queue_is_mq(q) || blk_queue_is_zoned(q))
+		return blk_submit_mq(q, req);
+
 	/* Larger than one command of the disk: split into pieces, each a
 	 * request of its own. */
 	if (blk_rq_needs_split(q, req))
@@ -1379,6 +1481,132 @@ int blk_submit(struct blk_request *req)
 	blk_queue_insert(q, req);
 	blk_queue_leave(q);
 	return 0;
+}
+
+/* blk_submit() for a multi-queue or zoned queue: the split, zone write
+ * plugging, then blk_submit_tail(). */
+static int blk_submit_mq(struct blk_queue *q, struct blk_request *req)
+{
+	int rc;
+
+	/* Larger than one command of the disk: split into pieces, each a
+	 * request of its own. */
+	if (blk_rq_needs_split(q, req))
+		return blk_submit_split(q, req);
+
+	/* Zoned disks: writes to a sequential zone are serialised per zone
+	 * (zone write plugging); a held write is submitted when the one
+	 * before it completed.  The usage count is taken first, as the
+	 * established order has it: a write is only ever prepared against
+	 * the zone table of a queue it entered, so a freeze (zone
+	 * revalidation) waits for every prepared and every held write, and
+	 * none is submitted against a table that was swapped meanwhile.  A
+	 * held write keeps its count (released when it ends). */
+	if (blk_queue_is_zoned(q)) {
+		if (blk_queue_is_mq(q)) {
+			rc = blk_mq_rq_enter(q, req);
+			if (rc)
+				return blk_submit_reject(q, req, rc);
+		}
+		rc = blk_zone_plug_request(q, req);
+		if (rc < 0)
+			return blk_submit_reject(q, req, rc);
+		if (rc > 0) {
+			/* Held by its zone: it leaves the submission (not the
+			 * usage count) until then. */
+			blk_queue_leave(q);
+			return 0;
+		}
+	}
+	return blk_submit_tail(q, req, 0);
+}
+
+/* Undo blk_submit's acceptance steps and reject `req' with `rc' (the
+ * request is untouched as far as its submitter can tell). */
+static int blk_submit_reject(struct blk_queue *q, struct blk_request *req,
+			     int rc)
+{
+	block_device_t *bdev = req->bdev;
+
+	req->bl.internal &= ~(BLK_RQI_INFLIGHT_REF | BLK_RQI_FLUSH_SEQ);
+	req->bl.seq = 0;
+	if (req->bl.internal & BLK_RQI_Q_USAGE)
+		blk_mq_rq_exit(q, req);
+	blk_integrity_free(req);
+	(void)refcount_dec_and_test(&req->ref);
+	req->state = BLK_RQ_IDLE;
+	blk_queue_leave(q);
+	blk_bdev_put_any(bdev);
+	return rc;
+}
+
+/* The rest of a submission: the usage count of a multi-queue queue, the
+ * protection information, the flush sequence, a request slot, the plug
+ * or the queue.  `resumed': the request was accepted earlier (a zone
+ * write plug held it) -- a failure ends it instead of rejecting it. */
+static int blk_submit_tail(struct blk_queue *q, struct blk_request *req,
+			   int resumed)
+{
+	int rc;
+
+	if (blk_queue_is_mq(q)) {
+		/* The usage count (frozen: wait, or -EAGAIN for NOWAIT). */
+		rc = blk_mq_rq_enter(q, req);
+		if (!rc)
+			rc = blk_integrity_prep(req);
+		if (rc)
+			goto fail;
+	}
+
+	blk_setup_flush_sequence(req);
+
+	/* One of the queue's request slots (nr_requests), held until the
+	 * request has completed: a submitter that may sleep waits for one;
+	 * one that cannot, and a HEAD/PM request, takes one regardless -- it
+	 * has no other way to make progress. */
+	rc = blk_queue_get_sched_tag(q, req);
+	if (rc)
+		goto fail; /* dying (perhaps while we waited) */
+
+	/* On the submitting task's plug, or into the queue now. */
+	req->state = BLK_RQ_QUEUED;
+	if (blk_add_rq_to_plug(req))
+		return 0;
+	blk_queue_insert(q, req);
+	blk_queue_leave(q);
+	return 0;
+
+fail:
+	/* A write that took its zone's write plug was accepted: it ends with
+	 * the error, and the end gives the plug back (the zone's pointer is
+	 * read back from the device, the next held write may go) -- a
+	 * rejection would leave the zone plugged for good. */
+	if (!resumed && !(req->bl.internal & BLK_RQI_ZONE_WPLUG))
+		return blk_submit_reject(q, req, rc);
+	/* Accepted: it ends with the error. */
+	req->bl.internal &= ~BLK_RQI_FLUSH_SEQ;
+	req->bl.seq = 0;
+	req->state = BLK_RQ_QUEUED;
+	blk_queue_leave(q);
+	blk_request_complete(req, rc, (uint32_t)blk_rq_data_bytes(req));
+	return 0;
+}
+
+int blk_submit_resume(struct blk_request *req)
+{
+	struct blk_queue *q;
+	int rc;
+
+	BUG_ON(req == NULL);
+	VM_BUG_ON(req->magic != BLK_REQUEST_MAGIC);
+	q = req->queue;
+	rc = blk_queue_enter(q);
+	if (rc) {
+		req->state = BLK_RQ_QUEUED;
+		blk_request_complete(req, rc, (uint32_t)blk_rq_data_bytes(req));
+		return rc;
+	}
+	return blk_submit_tail(q, req, 1);
 }
 
 /* ==========================================================================
@@ -1429,6 +1657,9 @@ int blk_wait(struct blk_request *req)
 				break;
 			if (disk && disk->ops && disk->ops->poll)
 				disk->ops->poll(disk);
+			/* A request on a multi-queue poll queue: reap it. */
+			if (req->queue && blk_queue_is_mq(req->queue))
+				blk_mq_wait_poll(req);
 			/* Completions waiting for this CPU's block softirq
 			 * (a polled driver completing from a task) run in
 			 * the poller. */
@@ -1558,6 +1789,12 @@ void blk_request_complete(struct blk_request *req, int status,
 	}
 	q = req->queue;
 
+	/* Multi-queue: a request that still holds a driver tag ends when the
+	 * last reference on that tag goes (a timeout scan or an iterator may
+	 * hold one): blk_mq_end_hook() takes it and calls us again then. */
+	if (q && blk_queue_is_mq(q) && blk_mq_end_hook(req, status, resid_bytes))
+		return;
+
 	/* The flush machinery: the queue's own flush request, or the data
 	 * step of a request in a flush sequence, moves its sequence on; the
 	 * request ends here once its sequence is over (FLUSH_END). */
@@ -1568,6 +1805,13 @@ void blk_request_complete(struct blk_request *req, int status,
 	}
 	req->bl.internal &= ~(BLK_RQI_FLUSH_SEQ | BLK_RQI_FLUSH_END);
 	req->bl.seq = 0;
+
+	/* A write that held its zone's write plug: the write pointer moves
+	 * (or is fixed after an error) and the next held write may go. */
+	if (req->bl.internal & BLK_RQI_ZONE_WPLUG)
+		blk_zone_write_plug_complete(req, status);
+	/* Protection information the block layer allocated goes now. */
+	blk_integrity_free(req);
 
 	{
 		uint64_t total = blk_rq_data_bytes(req);
@@ -1666,6 +1910,16 @@ void blk_request_complete(struct blk_request *req, int status,
 		blk_rq_restore_carrier(req);
 	req->status = own_status;
 	req->resid_bytes = own_resid;
+
+	/* A request from blk_mq_alloc_request: its end_io may free it
+	 * (blk_mq_free_request), which lets go of the queue's usage count --
+	 * the last thing that keeps a queue without a disk alive.  The
+	 * queue's side of its completion is therefore done before, and
+	 * nothing below touches the queue or the request after end_io. */
+	if (q && (req->flags & BLK_REQ_MQ_ALLOC)) {
+		blk_queue_done_snap(q, &snap);
+		q = NULL;
+	}
 
 	/* The submitters learn their results first: the carried requests
 	 * (each is an independent object, on the same device as the carrier,
@@ -1989,7 +2243,7 @@ int blk_flush_sync(block_device_t *bdev)
 	blk_might_sleep();
 	if (!blk_bdev_is_extended(bdev)) {
 		if (bdev->sync)
-			return blk_status_to_errno(bdev->sync(bdev));
+			return blk_st_to_errno(bdev->sync(bdev));
 		return 0;
 	}
 	if (!bdev->flush_supported)

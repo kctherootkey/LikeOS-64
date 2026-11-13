@@ -245,32 +245,78 @@ static void pc_page_free(pc_page_t *pg)
 	kfree(pg);
 }
 
-/* Release a page that was held for I/O, freeing it if it died meanwhile.
+/* ---- Page flags and references -------------------------------------------
  *
- * A page can be detached from the cache while somebody holds it -- its file was
- * truncated or unlinked -- and the invalidation cannot free the frame out from
- * under the holder.  So it takes the page off the hash, the LRU and the dirty
- * list, marks it PC_PAGE_DEAD, and leaves the frame to whoever lets go.  That
- * makes EVERY unlock site responsible for it.
+ * The flags word is changed from several processors at once (a lookup marks
+ * a page referenced while writeback clears its dirty bit), so every change is
+ * one atomic operation: a plain read-modify-write would lose the other's bit.
  *
- * pagecache_write_done() and pc_wb_retire() honoured that; the writeback batch
- * paths and their error exits did not -- they cleared the bit and walked away.
- * The page was then on no list, owned by nobody and pointed to by nothing: it
- * could never be found, reused or freed.  Under a load that creates and
- * deletes files continuously (a test suite in a loop, say) that is a permanent
- * drain of physical memory which no amount of idling gives back, and it does
- * not show up as cache because the page has already been discounted.
- */
-static void pc_page_unlock(pc_page_t *p)
+ * The frame lives as long as anybody refers to it.  The cache holds one
+ * reference while the page can be found (hash and LRU); whoever uses the page
+ * outside the cache's locks -- a reader or writer copying, writeback storing
+ * it -- holds one more, taken while it still finds the page under the lock of
+ * the hash bucket, the LRU or the dirty list.  Holds nest: each holder drops
+ * only its own.  Detaching the page from the cache (invalidation, reclaim)
+ * drops the cache's reference, and the last reference frees the frame -- so
+ * a page detached while a copy is in flight on another processor is freed
+ * when that copy is done, never under it.
+ *
+ * Reclaim takes only a page whose one reference is the cache's, and freezes
+ * the count at zero under the bucket lock before unhashing it: a lookup
+ * needs that lock to take a reference, so none can appear meanwhile. */
+static inline uint32_t pc_flags(const pc_page_t *p)
+{
+	return __atomic_load_n(&p->flags, __ATOMIC_ACQUIRE);
+}
+
+static inline void pc_set_flags(pc_page_t *p, uint32_t f)
+{
+	__atomic_fetch_or(&p->flags, f, __ATOMIC_ACQ_REL);
+}
+
+static inline void pc_clear_flags(pc_page_t *p, uint32_t f)
+{
+	__atomic_fetch_and(&p->flags, ~f, __ATOMIC_ACQ_REL);
+}
+
+/* Set `f'; nonzero when it was set already. */
+static inline int pc_test_and_set_flags(pc_page_t *p, uint32_t f)
+{
+	return (__atomic_fetch_or(&p->flags, f, __ATOMIC_ACQ_REL) & f) != 0;
+}
+
+/* A reference to a page the caller found under the lock of a list it is on
+ * (hash bucket, LRU, dirty list): on any of them it still has the cache's
+ * reference, so the count is not zero. */
+static inline void pc_page_get(pc_page_t *p)
+{
+	refcount_inc(&p->refs);
+}
+
+void pagecache_put(pc_page_t *p)
 {
 	if (!p)
 		return;
-	p->flags &= ~PC_PAGE_LOCKED;
-	/* DEAD is set by an invalidation on another CPU, so it is read from
-	 * memory again after the store: through the plain pointer an
-	 * optimising compiler tested the value loaded before it. */
-	if (((volatile pc_page_t *)p)->flags & PC_PAGE_DEAD)
+	if (refcount_dec_and_test(&p->refs)) {
+		/* Everything the other holders did to the page happens
+		 * before the free: their releases end in the count, which
+		 * this reads back with acquire. */
+		(void)__atomic_load_n(&p->refs.counter, __ATOMIC_ACQUIRE);
+		/* The last reference goes only after the page left the cache. */
+		WARN_ON_ONCE(p->lru_next || p->lru_prev || p->dirty_next ||
+			     p->dirty_prev);
 		pc_page_free(p);
+	}
+}
+
+/* Writeback lets go of a page it took (PC_PAGE_LOCKED and a reference):
+ * freed here when it was detached from the cache meanwhile. */
+static void pc_wb_release(pc_page_t *p)
+{
+	if (!p)
+		return;
+	pc_clear_flags(p, PC_PAGE_LOCKED);
+	pagecache_put(p);
 }
 
 // ============================================================================
@@ -292,7 +338,17 @@ static unsigned long pc_walk_chain(vfs_superblock_t *sb,
 				   unsigned long start_block,
 				   unsigned long block_index)
 {
-	unsigned long result = icache_chain_get(start_block, block_index, sb);
+	unsigned long result;
+
+	/* Positional ids need no walk (and no per-inode chain cache, whose
+	 * size limit would make blocks past it unreachable). */
+	if (sb->ops->block_at) {
+		result = vfs_sb_block_at(sb, start_block, block_index);
+		return (result != 0 && result < vfs_sb_end_of_chain(sb)) ?
+			       result :
+			       0;
+	}
+	result = icache_chain_get(start_block, block_index, sb);
 	if (result != 0 && result < vfs_sb_end_of_chain(sb))
 		return result;
 	return 0;
@@ -340,7 +396,10 @@ void pagecache_init(void)
 // Lookup (cache-only, no disk I/O)
 // ============================================================================
 
-pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index)
+/* The cached page, marked referenced; with `hold', a reference is taken for
+ * the caller under the bucket lock -- the lock reclaim needs to take it. */
+static pc_page_t *pc_lookup(unsigned long cluster_id, unsigned long page_index,
+			    int hold)
 {
 	if (!pc_initialized)
 		return 0;
@@ -353,7 +412,9 @@ pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index)
 	while (pg) {
 		if (pg->cluster_id == cluster_id &&
 		    pg->page_index == page_index) {
-			pg->flags |= PC_PAGE_REFERENCED;
+			pc_set_flags(pg, PC_PAGE_REFERENCED);
+			if (hold)
+				pc_page_get(pg);
 			spin_unlock_irqrestore(&pc_hash[bucket].lock, flags);
 			return pg;
 		}
@@ -364,11 +425,22 @@ pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index)
 	return 0;
 }
 
+pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index)
+{
+	return pc_lookup(cluster_id, page_index, 0);
+}
+
 // ============================================================================
 // Insert a page into the hash table + LRU
 // ============================================================================
 
-pc_page_t *pagecache_insert(pc_page_t *page)
+/* Insert `page' (fresh, never published) into the hash and the LRU in one
+ * step -- the LRU lock taken first, then the bucket lock, the order reclaim
+ * nests them in -- so a page that can be found is always on the LRU, and an
+ * invalidation never meets one half inserted.  With `hold', the page returned
+ * carries a reference for the caller.  When the key is cached already the
+ * cached page is returned and `page' is the caller's to free. */
+static pc_page_t *pc_insert(pc_page_t *page, int hold)
 {
 	BUG_ON(!page);
 	WARN_ON(page->data ==
@@ -379,7 +451,8 @@ pc_page_t *pagecache_insert(pc_page_t *page)
 		return 0;
 
 	unsigned long bucket = pc_hash_key(page->cluster_id, page->page_index);
-	uint64_t flags;
+	uint64_t lru_flags, flags;
+	spin_lock_irqsave(&pc_lru_lock, &lru_flags);
 	spin_lock_irqsave(&pc_hash[bucket].lock, &flags);
 
 	// Check for duplicate
@@ -388,43 +461,53 @@ pc_page_t *pagecache_insert(pc_page_t *page)
 		if (existing->cluster_id == page->cluster_id &&
 		    existing->page_index == page->page_index) {
 			// Already cached — return existing, caller should free `page`
-			existing->flags |= PC_PAGE_REFERENCED;
+			pc_set_flags(existing, PC_PAGE_REFERENCED);
+			if (hold)
+				pc_page_get(existing);
 			spin_unlock_irqrestore(&pc_hash[bucket].lock, flags);
+			spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
 			return existing;
 		}
 		existing = existing->hash_next;
 	}
 
+	/* The cache's reference, and the caller's. */
+	refcount_set(&page->refs, hold ? 2 : 1);
 	// Insert at head of hash chain
 	page->hash_next = pc_hash[bucket].head;
 	pc_hash[bucket].head = page;
-	spin_unlock_irqrestore(&pc_hash[bucket].lock, flags);
-
-	// Add to LRU
-	uint64_t lru_flags;
-	spin_lock_irqsave(&pc_lru_lock, &lru_flags);
 	lru_insert_head(page);
+	spin_unlock_irqrestore(&pc_hash[bucket].lock, flags);
 	spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
 
 	__sync_fetch_and_add(&pc_stat_total_pages, 1);
 	return page;
 }
 
+pc_page_t *pagecache_insert(pc_page_t *page)
+{
+	return pc_insert(page, 0);
+}
+
 // ============================================================================
 // Remove a page from hash table (caller must hold bucket lock)
 // ============================================================================
 
-static void hash_remove_locked(pc_page_t *page, unsigned long bucket)
+/* 1 when the page was in the bucket (and is not any more), 0 when it was not
+ * there -- an invalidation took it out first. */
+static int hash_remove_locked(pc_page_t *page, unsigned long bucket)
 {
+	lockdep_assert_held(&pc_hash[bucket].lock);
 	pc_page_t **pp = &pc_hash[bucket].head;
 	while (*pp) {
 		if (*pp == page) {
 			*pp = page->hash_next;
 			page->hash_next = 0;
-			return;
+			return 1;
 		}
 		pp = &(*pp)->hash_next;
 	}
+	return 0;
 }
 
 // ============================================================================
@@ -471,25 +554,31 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 		pc_page_t *pg = pc_clock_hand;
 		pc_clock_hand = pg->lru_next;
 		scanned++;
+		uint32_t fl = pc_flags(pg);
 
-		// Skip locked pages
-		if (pg->flags & PC_PAGE_LOCKED)
+		/* Skip pages somebody holds besides the cache: a copy into or
+		 * out of it is in flight, or writeback has it. */
+		if ((fl & PC_PAGE_LOCKED) || refcount_read(&pg->refs) != 1)
 			continue;
 
 		// CLOCK: if referenced, clear and give second chance
-		if (pg->flags & PC_PAGE_REFERENCED) {
-			pg->flags &= ~PC_PAGE_REFERENCED;
+		if (fl & PC_PAGE_REFERENCED) {
+			pc_clear_flags(pg, PC_PAGE_REFERENCED);
 			continue;
 		}
 
 		// Skip dirty pages unless we're allowed to flush them
-		if (pg->flags & PC_PAGE_DIRTY) {
+		if (fl & PC_PAGE_DIRTY) {
 			if (!flush_dirty)
 				continue;
-			// Write dirty page back to disk before evicting.
-			// We need to drop the LRU lock to do I/O.
-			// Mark locked to prevent concurrent eviction.
-			pg->flags |= PC_PAGE_LOCKED;
+			/* Write it back before it can be evicted.  The I/O
+			 * needs the LRU lock dropped, so the page is taken for
+			 * writeback first -- unless a flush has it already --
+			 * and held (it is on the LRU, so it has the cache's
+			 * reference and can take one more). */
+			if (pc_test_and_set_flags(pg, PC_PAGE_LOCKED))
+				continue;
+			pc_page_get(pg);
 			spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
 
 			// Flush this single dirty page inline through the generic sb
@@ -582,14 +671,14 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 				vfs_sb_unlock_io(sb);
 			}
 			if (flush_ok) {
-				pg->flags &= ~PC_PAGE_DIRTY;
+				pc_clear_flags(pg, PC_PAGE_DIRTY);
 				uint64_t df;
 				spin_lock_irqsave(&pc_dirty_lock, &df);
 				dirty_list_remove(pg);
 				spin_unlock_irqrestore(&pc_dirty_lock, df);
 				__sync_fetch_and_add(&pc_stat_writebacks, 1);
 			}
-			pc_page_unlock(pg);
+			pc_wb_release(pg);
 
 			spin_lock_irqsave(&pc_lru_lock, &lru_flags);
 			// If flush succeeded, the page is now clean and can be
@@ -597,19 +686,35 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 			continue;
 		}
 
-		// Evict this page: remove from LRU
-		lru_remove(pg);
-
-		// Remove from hash table
+		/* Evict it.  Under its bucket lock (nested inside the LRU
+		 * lock, as in pc_insert) the count is frozen from the cache's
+		 * one reference to none: no lookup can take a reference while
+		 * the lock is held, and once the page is out of the hash none
+		 * can find it.  A page no longer in the hash is being
+		 * invalidated, which drops the cache's reference itself. */
 		unsigned long bucket =
 			pc_hash_key(pg->cluster_id, pg->page_index);
-		// Drop LRU lock, take bucket lock
-		spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
-
 		uint64_t bucket_flags;
+		int one = 1;
+
 		spin_lock_irqsave(&pc_hash[bucket].lock, &bucket_flags);
-		hash_remove_locked(pg, bucket);
+		if (!__atomic_compare_exchange_n(&pg->refs.counter, &one, 0, 0,
+						 __ATOMIC_ACQ_REL,
+						 __ATOMIC_ACQUIRE)) {
+			spin_unlock_irqrestore(&pc_hash[bucket].lock,
+					       bucket_flags);
+			continue;
+		}
+		if ((pc_flags(pg) & (PC_PAGE_DIRTY | PC_PAGE_LOCKED)) ||
+		    !hash_remove_locked(pg, bucket)) {
+			refcount_set(&pg->refs, 1);
+			spin_unlock_irqrestore(&pc_hash[bucket].lock,
+					       bucket_flags);
+			continue;
+		}
 		spin_unlock_irqrestore(&pc_hash[bucket].lock, bucket_flags);
+		lru_remove(pg);
+		spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
 
 		// Remove from dirty list if present
 		uint64_t dirty_flags;
@@ -617,7 +722,7 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 		dirty_list_remove(pg);
 		spin_unlock_irqrestore(&pc_dirty_lock, dirty_flags);
 
-		// Free the page
+		// Free the page: unreachable, and nobody refers to it
 		pc_page_free(pg);
 		__sync_fetch_and_sub(&pc_stat_total_pages, 1);
 		__sync_fetch_and_add(&pc_stat_evictions, 1);
@@ -689,11 +794,12 @@ void pagecache_reclaim_if_needed(void)
 // on disk.  Must be called under sb->ops->lock_io().
 // Returns the requested page on success, NULL if the first page's blocks
 // are not contiguous (caller should fall back to per-block reads).
+// With `hold', the requested page is returned held (a reference).
 static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 				    unsigned long cluster_id,
 				    unsigned long start_cluster,
 				    unsigned long page_index,
-				    unsigned long file_size)
+				    unsigned long file_size, int hold)
 {
 	might_sleep();
 	VM_BUG_ON(sb == NULL);
@@ -782,7 +888,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			zpg->page_index = page_index;
 			mm_memset(zpg->data, 0, PAGE_SIZE);
 			zpg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
-			pc_page_t *zr = pagecache_insert(zpg);
+			pc_page_t *zr = pc_insert(zpg, hold);
 			if (zr != zpg)
 				pc_page_free(zpg);
 			return zr;
@@ -838,7 +944,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			mm_memset(pg->data + v, 0, PAGE_SIZE - v);
 		}
 		pg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
-		pc_page_t *r = pagecache_insert(pg);
+		pc_page_t *r = pc_insert(pg, hold);
 		if (r != pg)
 			pc_page_free(pg);
 		return r;
@@ -867,7 +973,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			mm_memset(pg->data + v, 0, PAGE_SIZE - v);
 		}
 		pg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
-		pc_page_t *r = pagecache_insert(pg);
+		pc_page_t *r = pc_insert(pg, hold);
 		if (r != pg)
 			pc_page_free(pg);
 		return r;
@@ -901,7 +1007,8 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 		if (i > 0)
 			pg->flags |= PC_PAGE_READAHEAD;
 
-		pc_page_t *ins = pagecache_insert(pg);
+		/* the requested page is the caller's: held when asked */
+		pc_page_t *ins = pc_insert(pg, hold && i == 0);
 		if (ins != pg)
 			pc_page_free(pg);
 
@@ -920,9 +1027,10 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 // pagecache_get() — the primary read path
 // ============================================================================
 
-pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
+/* With `hold', the page is returned held for the caller (pagecache_put). */
+static pc_page_t *pc_get(unsigned long cluster_id, unsigned long page_index,
 			 unsigned long file_size, struct vfs_superblock *sb,
-			 unsigned long start_cluster)
+			 unsigned long start_cluster, int hold)
 {
 	VM_BUG_ON(sb == NULL);
 	VM_BUG_ON(start_cluster < 2);
@@ -942,11 +1050,11 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 	 * commit thread picks it up (see the ordered-data flush in the journal
 	 * commit), which is a context that owns its locks from the outside. */
 
-	// 1. Try cache lookup (no I/O lock needed)
-	pc_page_t *pg = pagecache_lookup(cluster_id, page_index);
+	// 1. Try cache lookup (no I/O lock needed); held when asked
+	pc_page_t *pg = pc_lookup(cluster_id, page_index, hold);
 	if (pg) {
 		WARN_ON_ONCE(!(
-			pg->flags &
+			pc_flags(pg) &
 			PC_PAGE_VALID)); /* lookup returned a page without PC_PAGE_VALID: stale insertion */
 		__sync_fetch_and_add(&pc_stat_hits, 1);
 		return pg;
@@ -965,7 +1073,7 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 	//    (Handles its own locking: mapping under the driver's shared map
 	//    lock when provided, transfer unlocked; else lock_io across both.)
 	pc_page_t *result = pc_coalesced_read(sb, cluster_id, start_cluster,
-					      page_index, file_size);
+					      page_index, file_size, hold);
 	if (result)
 		return result;
 
@@ -1052,11 +1160,27 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 		}
 
 		new_pg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
-		result = pagecache_insert(new_pg);
+		result = pc_insert(new_pg, hold);
 		if (result != new_pg)
 			pc_page_free(new_pg);
 		return result;
 	}
+}
+
+pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
+			 unsigned long file_size, struct vfs_superblock *sb,
+			 unsigned long start_cluster)
+{
+	return pc_get(cluster_id, page_index, file_size, sb, start_cluster, 0);
+}
+
+pc_page_t *pagecache_get_held(unsigned long cluster_id,
+			      unsigned long page_index,
+			      unsigned long file_size,
+			      struct vfs_superblock *sb,
+			      unsigned long start_cluster)
+{
+	return pc_get(cluster_id, page_index, file_size, sb, start_cluster, 1);
 }
 
 // ============================================================================
@@ -1067,14 +1191,18 @@ void pagecache_mark_dirty(pc_page_t *page)
 {
 	if (!page)
 		return;
-	if (page->flags & PC_PAGE_DIRTY)
+	if (pc_flags(page) & PC_PAGE_DIRTY)
 		return; // already dirty
 
-	page->flags |= PC_PAGE_DIRTY;
-
+	/* Not a page detached from the cache meanwhile: the invalidation sets
+	 * DEAD and takes it off the dirty list under this lock, so a page
+	 * added after that would stay on the list once it is freed. */
 	uint64_t flags;
 	spin_lock_irqsave(&pc_dirty_lock, &flags);
-	dirty_list_add(page);
+	if (!(pc_flags(page) & PC_PAGE_DEAD)) {
+		pc_set_flags(page, PC_PAGE_DIRTY);
+		dirty_list_add(page);
+	}
 	spin_unlock_irqrestore(&pc_dirty_lock, flags);
 }
 
@@ -1108,19 +1236,18 @@ static void pc_wb_bounce_init(void)
 	pc_wb_bounce_pages = pc_wb_bounce ? PC_WB_RUN_MAX : 0;
 }
 
-/* Retire one written-back page: no longer dirty, no longer held for I/O. */
+/* Retire one written-back page: no longer dirty, no longer held for I/O.
+ * Freed here when it was detached while being written back. */
 static void pc_wb_retire(pc_page_t *p)
 {
 	uint64_t flags;
 
-	p->flags &= ~(PC_PAGE_DIRTY | PC_PAGE_LOCKED);
+	pc_clear_flags(p, PC_PAGE_DIRTY);
 	__sync_fetch_and_add(&pc_stat_writebacks, 1);
 	spin_lock_irqsave(&pc_dirty_lock, &flags);
 	dirty_list_remove(p);
 	spin_unlock_irqrestore(&pc_dirty_lock, flags);
-	/* Detached while it was being written back: we are the last reference. */
-	if (p->flags & PC_PAGE_DEAD)
-		pc_page_free(p);
+	pc_wb_release(p);
 }
 
 /*
@@ -1198,10 +1325,10 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 		 * as intended.  The dirty flag is not a claim on the data once
 		 * the file has disowned it.
 		 *
-		 * Unlocking is what frees it (pc_page_unlock), which is the
+		 * Releasing it is what frees it (pc_wb_release), which is the
 		 * whole point of the deferral. */
-		if (p && (p->flags & PC_PAGE_DEAD)) {
-			pc_page_unlock(p);
+		if (p && (pc_flags(p) & PC_PAGE_DEAD)) {
+			pc_wb_release(p);
 			p = 0;
 		}
 
@@ -1258,14 +1385,14 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 					p->cluster_id, p->cluster_id,
 					p->page_index, blk,
 					(unsigned)p->flags);
-				pc_page_unlock(p);
+				pc_wb_release(p);
 				p = 0;
 			} else {
 				lba = vfs_sb_block_to_lba(sb, blk);
 				/* LBA 0 is the boot block, used as the sentinel
 				 * for a hole -- never file data. */
 				if (lba == 0) {
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					p = 0;
 				}
 			}
@@ -1303,7 +1430,7 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 				} else {
 					/* Still dirty: it did not reach the
 					 * device, and forgetting that loses it. */
-					pc_page_unlock(run[k]);
+					pc_wb_release(run[k]);
 				}
 			}
 			nrun = 0;
@@ -1353,10 +1480,12 @@ pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
 	if (!pc_initialized || !sb || start_cluster < 2)
 		return 0;
 
-	pg = pagecache_lookup(cluster_id, page_index);
+	/* Held under the bucket lock -- the lock reclaim needs to take the
+	 * page -- whoever else holds it: writeback that took it keeps its own
+	 * hold (and its PC_PAGE_LOCKED) through this write. */
+	pg = pc_lookup(cluster_id, page_index, 1);
 	if (pg) {
 		__sync_fetch_and_add(&pc_stat_hits, 1);
-		pg->flags |= PC_PAGE_LOCKED;
 		return pg;
 	}
 
@@ -1379,21 +1508,15 @@ pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
 		 * never as whatever the previous owner of the frame left. */
 		mm_memset(np->data, 0, PAGE_SIZE);
 		np->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
-		pg = pagecache_insert(np);
+		pg = pc_insert(np, 1);
 		if (pg != np)
 			pc_page_free(np);
-		if (pg)
-			pg->flags |= PC_PAGE_LOCKED;
 		return pg;
 	}
 
 	/* Partial write inside the file: the existing contents are part of the
-	 * result, so read them the ordinary way. */
-	pg = pagecache_get(cluster_id, page_index, file_size, sb,
-			   start_cluster);
-	if (pg)
-		pg->flags |= PC_PAGE_LOCKED;
-	return pg;
+	 * result, so read them the ordinary way (held as well). */
+	return pc_get(cluster_id, page_index, file_size, sb, start_cluster, 1);
 }
 
 /*
@@ -1414,15 +1537,12 @@ void pagecache_write_end(pc_page_t *page)
 {
 	if (!page)
 		return;
-	/* Detached while we held it -- the file it belonged to was truncated or
-	 * removed, so there is nothing to publish and nobody to publish it to.
-	 * We are the last reference; the frame goes back here. */
-	if (page->flags & PC_PAGE_DEAD) {
-		pc_page_unlock(page); /* frees it */
-		return;
-	}
+	/* A page detached while we held it -- its file was truncated or
+	 * removed -- is not published (mark_dirty refuses it): there is nobody
+	 * to publish it to.  Releasing our reference frees it when it was the
+	 * last. */
 	pagecache_mark_dirty(page);
-	pc_page_unlock(page);
+	pagecache_put(page);
 }
 
 /* Release a page taken for writing WITHOUT publishing it: the write failed and
@@ -1431,7 +1551,28 @@ void pagecache_write_abort(pc_page_t *page)
 {
 	if (!page)
 		return;
-	pc_page_unlock(page);
+	pagecache_put(page);
+}
+
+/*
+ * Flush passes.  A flush takes each dirty page at most once: it stamps every
+ * page it collects with its pass number (kept in pc_page_t._pad) and passes
+ * over pages already carrying it.  A page that cannot be stored stays dirty
+ * and unlocked where it is; without the stamp the collection loops below,
+ * which go on while a batch comes back full, would take the same 32 or more
+ * such pages again and again and never return.  Pages dirtied again after
+ * this pass stored them are left to the next flush.
+ */
+static uint32_t pc_wb_pass_gen;
+
+static uint32_t pc_wb_pass_begin(void)
+{
+	uint32_t pass = __atomic_add_fetch(&pc_wb_pass_gen, 1, __ATOMIC_RELAXED);
+
+	/* 0 is what a page never taken carries */
+	if (pass == 0)
+		pass = __atomic_add_fetch(&pc_wb_pass_gen, 1, __ATOMIC_RELAXED);
+	return pass;
 }
 
 /*
@@ -1456,6 +1597,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 #define FLUSH_SET_BATCH 32
 	pc_page_t *batch[FLUSH_SET_BATCH];
 	int batch_count;
+	uint32_t pass = pc_wb_pass_begin();
 
 	do {
 		batch_count = 0;
@@ -1463,14 +1605,24 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 		pc_page_t *pg = pc_dirty_sentinel.dirty_next;
 		while (pg != &pc_dirty_sentinel &&
 		       batch_count < FLUSH_SET_BATCH) {
-			if ((pg->flags & PC_PAGE_DIRTY) &&
-			    !(pg->flags & PC_PAGE_LOCKED)) {
+			uint32_t fl = pc_flags(pg);
+
+			if ((fl & PC_PAGE_DIRTY) && !(fl & PC_PAGE_LOCKED) &&
+			    pg->_pad != pass) {
 				for (unsigned i = 0; i < nids; i++) {
-					if (pg->cluster_id == ids[i]) {
-						pg->flags |= PC_PAGE_LOCKED;
+					if (pg->cluster_id != ids[i])
+						continue;
+					/* Taken for writeback -- unless
+					 * reclaim took it meanwhile -- and
+					 * held: on the dirty list it has the
+					 * cache's reference. */
+					if (!pc_test_and_set_flags(
+						    pg, PC_PAGE_LOCKED)) {
+						pc_page_get(pg);
+						pg->_pad = pass;
 						batch[batch_count++] = pg;
-						break;
 					}
+					break;
 				}
 			}
 			pg = pg->dirty_next;
@@ -1483,7 +1635,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 		vfs_superblock_t *sb = g_root_sb;
 		if (!sb) {
 			for (int i = 0; i < batch_count; i++)
-				pc_page_unlock(batch[i]);
+				pc_wb_release(batch[i]);
 			break;
 		}
 		vfs_sb_lock_io(sb);
@@ -1493,7 +1645,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 			/* Block sizes that do not match a page keep the
 			 * per-file path; this set walk is for the common one. */
 			for (int i = 0; i < batch_count; i++)
-				pc_page_unlock(batch[i]);
+				pc_wb_release(batch[i]);
 			vfs_sb_unlock_io(sb);
 			for (unsigned i = 0; i < nids; i++)
 				wrote += pagecache_flush_file(ids[i]);
@@ -1525,16 +1677,23 @@ int pagecache_flush_file(unsigned long cluster_id)
 #define FLUSH_BATCH 32
 	pc_page_t *batch[FLUSH_BATCH];
 	int batch_count;
+	uint32_t pass = pc_wb_pass_begin();
 
 	do {
 		batch_count = 0;
 		spin_lock_irqsave(&pc_dirty_lock, &flags);
 		pc_page_t *pg = pc_dirty_sentinel.dirty_next;
 		while (pg != &pc_dirty_sentinel && batch_count < FLUSH_BATCH) {
+			uint32_t fl = pc_flags(pg);
+
+			/* Taken for writeback (unless reclaim took it
+			 * meanwhile) and held, as in pagecache_flush_fileset. */
 			if (pg->cluster_id == cluster_id &&
-			    (pg->flags & PC_PAGE_DIRTY) &&
-			    !(pg->flags & PC_PAGE_LOCKED)) {
-				pg->flags |= PC_PAGE_LOCKED;
+			    (fl & PC_PAGE_DIRTY) && !(fl & PC_PAGE_LOCKED) &&
+			    pg->_pad != pass &&
+			    !pc_test_and_set_flags(pg, PC_PAGE_LOCKED)) {
+				pc_page_get(pg);
+				pg->_pad = pass;
 				batch[batch_count++] = pg;
 			}
 			pg = pg->dirty_next;
@@ -1548,7 +1707,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 		vfs_superblock_t *sb = g_root_sb;
 		if (!sb) {
 			for (int i = 0; i < batch_count; i++)
-				pc_page_unlock(batch[i]);
+				pc_wb_release(batch[i]);
 			break;
 		}
 		const block_device_t *bdev = vfs_sb_bdev(sb);
@@ -1584,7 +1743,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 				unsigned long disk_block = pc_walk_chain(
 					sb, p->cluster_id, block_index);
 				if (disk_block == 0 || disk_block >= eoc) {
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					continue;
 				}
 				/* Guard against the FS-reserved metadata block (FAT32 root
@@ -1596,7 +1755,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 						"inode_id=%lu page_idx=%lu bi=%lu\n",
 						p->cluster_id, p->page_index,
 						block_index);
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					continue;
 				}
 
@@ -1607,7 +1766,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 				 * page there (it is the superblock, and a hole
 				 * needs allocation we do not do); leave dirty. */
 				if (lba == 0) {
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					continue;
 				}
 				if (bs == PAGE_SIZE) {
@@ -1657,17 +1816,10 @@ int pagecache_flush_file(unsigned long cluster_id)
 				}
 			}
 
-			p->flags &= ~(PC_PAGE_DIRTY | PC_PAGE_LOCKED);
+			/* Clean, off the dirty list, and released: freed
+			 * here when it was detached while we wrote it. */
+			pc_wb_retire(p);
 			wrote++;
-			__sync_fetch_and_add(&pc_stat_writebacks, 1);
-
-			spin_lock_irqsave(&pc_dirty_lock, &flags);
-			dirty_list_remove(p);
-			spin_unlock_irqrestore(&pc_dirty_lock, flags);
-			/* Detached while we were writing it back: off every
-			 * list now, so this is the last reference. */
-			if (p->flags & PC_PAGE_DEAD)
-				pc_page_free(p);
 		}
 		vfs_sb_unlock_io(sb);
 
@@ -1681,7 +1833,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 // Flush all dirty pages
 // ============================================================================
 
-static int pagecache_flush_all_batch(void);
+static int pagecache_flush_all_batch(uint32_t pass);
 
 /*
  * Store up to `max_pages` dirty pages and stop, whether or not any remain.
@@ -1704,8 +1856,10 @@ int pagecache_flush_bounded(unsigned long max_pages)
 	if (!pc_initialized || max_pages == 0)
 		return 0;
 
+	uint32_t pass = pc_wb_pass_begin();
+
 	while (done < max_pages) {
-		int n = pagecache_flush_all_batch();
+		int n = pagecache_flush_all_batch(pass);
 
 		if (n <= 0)
 			break;
@@ -1719,9 +1873,10 @@ int pagecache_flush_bounded(unsigned long max_pages)
  *
  * Split out so that callers can choose how much work to take on: the periodic
  * writeback wants everything, a writer being throttled wants a bounded amount.
+ * Pages pass `pass` has taken already are left alone (pc_wb_pass_begin).
  * Returns 0 when there is nothing left to store.
  */
-static int pagecache_flush_all_batch(void)
+static int pagecache_flush_all_batch(uint32_t pass)
 {
 	might_sleep();
 	if (!pc_initialized)
@@ -1742,9 +1897,15 @@ static int pagecache_flush_all_batch(void)
 		pc_page_t *pg = pc_dirty_sentinel.dirty_next;
 		while (pg != &pc_dirty_sentinel &&
 		       batch_count < FLUSH_ALL_BATCH) {
-			if ((pg->flags & PC_PAGE_DIRTY) &&
-			    !(pg->flags & PC_PAGE_LOCKED)) {
-				pg->flags |= PC_PAGE_LOCKED;
+			uint32_t fl = pc_flags(pg);
+
+			/* Taken for writeback (unless reclaim took it
+			 * meanwhile) and held, as in pagecache_flush_fileset. */
+			if ((fl & PC_PAGE_DIRTY) && !(fl & PC_PAGE_LOCKED) &&
+			    pg->_pad != pass &&
+			    !pc_test_and_set_flags(pg, PC_PAGE_LOCKED)) {
+				pc_page_get(pg);
+				pg->_pad = pass;
 				batch[batch_count++] = pg;
 			}
 			pg = pg->dirty_next;
@@ -1757,7 +1918,7 @@ static int pagecache_flush_all_batch(void)
 		vfs_superblock_t *sb = g_root_sb;
 		if (!sb) {
 			for (int i = 0; i < batch_count; i++)
-				pc_page_unlock(batch[i]);
+				pc_wb_release(batch[i]);
 			break;
 		}
 		const block_device_t *bdev = vfs_sb_bdev(sb);
@@ -1793,7 +1954,7 @@ static int pagecache_flush_all_batch(void)
 				unsigned long disk_block = pc_walk_chain(
 					sb, p->cluster_id, block_index);
 				if (disk_block == 0 || disk_block >= eoc) {
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					continue;
 				}
 				if (reserved_meta &&
@@ -1802,7 +1963,7 @@ static int pagecache_flush_all_batch(void)
 						"inode_id=%lu page_idx=%lu bi=%lu\n",
 						p->cluster_id, p->page_index,
 						block_index);
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					continue;
 				}
 
@@ -1811,7 +1972,7 @@ static int pagecache_flush_all_batch(void)
 				/* lba 0 marks a hole: never persist a dirty page
 				 * there (superblock; needs allocation). */
 				if (lba == 0) {
-					pc_page_unlock(p);
+					pc_wb_release(p);
 					continue;
 				}
 				if (bs == PAGE_SIZE) {
@@ -1861,18 +2022,10 @@ static int pagecache_flush_all_batch(void)
 				}
 			}
 
-			p->flags &= ~(PC_PAGE_DIRTY | PC_PAGE_LOCKED);
+			/* Clean, off the dirty list, and released: freed
+			 * here when it was detached while we wrote it. */
+			pc_wb_retire(p);
 			wrote++;
-			__sync_fetch_and_add(&pc_stat_writebacks, 1);
-
-			uint64_t df;
-			spin_lock_irqsave(&pc_dirty_lock, &df);
-			dirty_list_remove(p);
-			spin_unlock_irqrestore(&pc_dirty_lock, df);
-			/* Detached while we were writing it back: off every
-			 * list now, so this is the last reference. */
-			if (p->flags & PC_PAGE_DEAD)
-				pc_page_free(p);
 		}
 		vfs_sb_unlock_io(sb);
 	} while (0);
@@ -1884,10 +2037,11 @@ static int pagecache_flush_all_batch(void)
 int pagecache_flush_all(void)
 {
 	int wrote = 0;
+	uint32_t pass = pc_wb_pass_begin();
 
 	might_sleep();
 	for (;;) {
-		int n = pagecache_flush_all_batch();
+		int n = pagecache_flush_all_batch(pass);
 
 		if (n <= 0)
 			break;
@@ -1924,6 +2078,33 @@ int pagecache_sync(void)
 // Invalidation
 // ============================================================================
 
+/* The rest of taking a page out of the cache, once it is out of the hash:
+ * off the LRU and the dirty list, marked DEAD -- under the dirty-list lock,
+ * so a writer's pagecache_mark_dirty either comes before and is undone here
+ * or comes after and sees DEAD -- and the cache's reference dropped.  Freed
+ * now when nobody else holds it; a reader, writer or writeback holding it
+ * frees it when it lets go, so a copy in flight never lands in a frame
+ * somebody else owns by then. */
+static void pc_detach(pc_page_t *pg)
+{
+	uint64_t lru_flags, df;
+
+	spin_lock_irqsave(&pc_lru_lock, &lru_flags);
+	// Fix clock hand if it points to this page
+	if (pc_clock_hand == pg)
+		pc_clock_hand = pg->lru_next;
+	lru_remove(pg);
+	spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
+
+	spin_lock_irqsave(&pc_dirty_lock, &df);
+	pc_set_flags(pg, PC_PAGE_DEAD);
+	dirty_list_remove(pg);
+	spin_unlock_irqrestore(&pc_dirty_lock, df);
+
+	__sync_fetch_and_sub(&pc_stat_total_pages, 1);
+	pagecache_put(pg);
+}
+
 void pagecache_invalidate_file(unsigned long cluster_id)
 {
 	VM_BUG_ON(cluster_id < 2);
@@ -1944,34 +2125,7 @@ void pagecache_invalidate_file(unsigned long cluster_id)
 				*pp = pg->hash_next;
 				pg->hash_next = 0;
 				spin_unlock_irqrestore(&pc_hash[b].lock, flags);
-
-				// Remove from LRU
-				uint64_t lru_flags;
-				spin_lock_irqsave(&pc_lru_lock, &lru_flags);
-				// Fix clock hand if it points to this page
-				if (pc_clock_hand == pg)
-					pc_clock_hand = pg->lru_next;
-				lru_remove(pg);
-				spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
-
-				// Remove from dirty list
-				uint64_t df;
-				spin_lock_irqsave(&pc_dirty_lock, &df);
-				dirty_list_remove(pg);
-				spin_unlock_irqrestore(&pc_dirty_lock, df);
-
-				/* Free it only if nobody is using it.  A held
-				 * page is being copied into or out of right
-				 * now; releasing the frame here would hand it
-				 * to a new owner with that copy still in
-				 * flight.  It is already off every list, so
-				 * nothing can find it again -- the holder
-				 * frees it when it lets go. */
-				if (pg->flags & PC_PAGE_LOCKED)
-					pg->flags |= PC_PAGE_DEAD;
-				else
-					pc_page_free(pg);
-				__sync_fetch_and_sub(&pc_stat_total_pages, 1);
+				pc_detach(pg);
 
 				// Re-acquire bucket lock and restart scan (chain modified)
 				spin_lock_irqsave(&pc_hash[b].lock, &flags);
@@ -2005,31 +2159,7 @@ void pagecache_invalidate_range(unsigned long cluster_id,
 				*pp = pg->hash_next;
 				pg->hash_next = 0;
 				spin_unlock_irqrestore(&pc_hash[b].lock, flags);
-
-				uint64_t lru_flags;
-				spin_lock_irqsave(&pc_lru_lock, &lru_flags);
-				if (pc_clock_hand == pg)
-					pc_clock_hand = pg->lru_next;
-				lru_remove(pg);
-				spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
-
-				uint64_t df;
-				spin_lock_irqsave(&pc_dirty_lock, &df);
-				dirty_list_remove(pg);
-				spin_unlock_irqrestore(&pc_dirty_lock, df);
-
-				/* Free it only if nobody is using it.  A held
-				 * page is being copied into or out of right
-				 * now; releasing the frame here would hand it
-				 * to a new owner with that copy still in
-				 * flight.  It is already off every list, so
-				 * nothing can find it again -- the holder
-				 * frees it when it lets go. */
-				if (pg->flags & PC_PAGE_LOCKED)
-					pg->flags |= PC_PAGE_DEAD;
-				else
-					pc_page_free(pg);
-				__sync_fetch_and_sub(&pc_stat_total_pages, 1);
+				pc_detach(pg);
 
 				spin_lock_irqsave(&pc_hash[b].lock, &flags);
 				pp = &pc_hash[b].head;
@@ -2057,25 +2187,10 @@ void pagecache_invalidate_all(void)
 		while (pg) {
 			pc_page_t *next = pg->hash_next;
 
-			uint64_t lru_flags;
-			spin_lock_irqsave(&pc_lru_lock, &lru_flags);
-			if (pc_clock_hand == pg)
-				pc_clock_hand = pg->lru_next;
-			lru_remove(pg);
-			spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
-
-			uint64_t df;
-			spin_lock_irqsave(&pc_dirty_lock, &df);
-			dirty_list_remove(pg);
-			spin_unlock_irqrestore(&pc_dirty_lock, df);
-
 			/* Same rule as the other invalidations: a held page is
 			 * detached now and freed by whoever releases it. */
-			if (pg->flags & PC_PAGE_LOCKED)
-				pg->flags |= PC_PAGE_DEAD;
-			else
-				pc_page_free(pg);
-			__sync_fetch_and_sub(&pc_stat_total_pages, 1);
+			pg->hash_next = 0;
+			pc_detach(pg);
 
 			pg = next;
 		}
@@ -2127,11 +2242,12 @@ void pagecache_readahead(pc_readahead_t *ra, unsigned long cluster_id,
 			continue;
 
 		// Fetch the page (will do disk I/O on miss)
-		pc_page_t *pg = pagecache_get(cluster_id, ahead_page, file_size,
-					      sb, start_cluster);
+		pc_page_t *pg = pc_get(cluster_id, ahead_page, file_size, sb,
+				       start_cluster, 1);
 		if (pg) {
-			pg->flags |= PC_PAGE_READAHEAD;
+			pc_set_flags(pg, PC_PAGE_READAHEAD);
 			__sync_fetch_and_add(&pc_stat_readahead, 1);
+			pagecache_put(pg);
 		}
 	}
 }

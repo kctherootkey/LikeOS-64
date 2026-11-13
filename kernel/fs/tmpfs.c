@@ -697,9 +697,17 @@ static int tfs_open_mode(const char *path, int flags, unsigned int mode,
 	struct tfs_dentry *d = tfs_lookup(path, 1);
 	struct tfs_inode *n;
 
+	/* O_CREAT|O_EXCL fails on a name that exists.  Decided here, under
+	 * the lock the create below holds too, so two such opens of one name
+	 * cannot both succeed. */
+	int excl = (flags & O_CREAT) && (flags & O_EXCL);
+
+	if (d && excl) {
+		tfs_unlock();
+		return ST_EXISTS;
+	}
 	if (!d) {
-		/* O_EXCL on an existing name was already refused by the
-		 * VFS; here a missing name is created when asked. */
+		/* A missing name is created when asked. */
 		if (!(flags & O_CREAT)) {
 			tfs_unlock();
 			return ST_NOT_FOUND;
@@ -713,10 +721,11 @@ static int tfs_open_mode(const char *path, int flags, unsigned int mode,
 			return rc;
 		}
 		/* The lookup followed symlinks; a name that exists but leads
-		 * nowhere (a dangling link) is not one to create under. */
+		 * nowhere (a dangling link) is not one to create under -- and
+		 * for O_EXCL it is a name that exists. */
 		if (tfs_find_child(dir, name, kstrlen(name))) {
 			tfs_unlock();
-			return ST_NOT_FOUND;
+			return excl ? ST_EXISTS : ST_NOT_FOUND;
 		}
 		n = tfs_inode_new(TFS_REG, mode);
 		if (!n) {

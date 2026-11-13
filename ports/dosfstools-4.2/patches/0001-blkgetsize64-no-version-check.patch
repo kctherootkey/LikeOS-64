@@ -1,0 +1,19 @@
+blkdev_get_size() asks BLKGETSIZE64 only when the release uname() reports
+is not one of the kernel versions whose BLKGETSIZE64 was broken (2.4.15 to
+2.4.17), reading anything below 2.6 as suspect.  On LikeOS that release is
+the LikeOS version ("0.2.9"), which would turn the request off for no
+reason; the version test is skipped and BLKGETSIZE64 is always asked.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/blkdev/blkdev.c	2021-01-31 13:49:12.000000000 +0100
++++ b/src/blkdev/blkdev.c	2026-11-11 15:02:49.391796713 +0100
+@@ -95,7 +95,7 @@
+ 
+ #ifdef BLKGETSIZE64
+ 	{
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__LIKEOS__)
+ 		int ver = get_linux_version();
+ 
+ 		/* kernels 2.4.15-2.4.17, had a broken BLKGETSIZE64 */

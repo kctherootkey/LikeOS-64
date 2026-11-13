@@ -858,6 +858,10 @@ static int blk_merge_absorb_locked(struct blk_queue *q, struct blk_request *a,
 	/* It is no longer a request of the queue's own: its slot goes back
 	 * (the caller wakes the waiters after dropping the lock). */
 	blk_sched_tag_put(q, b);
+	/* A multi-queue request holds the usage count on its own until it
+	 * becomes part of another one. */
+	if (b->bl.internal & BLK_RQI_Q_USAGE)
+		blk_mq_rq_exit(q, b);
 	blk_account_merge(q, b);
 	if (front)
 		q->merges_front++;
@@ -1164,13 +1168,27 @@ static void blk_sched_tag_put(struct blk_queue *q, struct blk_request *rq)
 
 static int blk_cond_drained(struct blk_queue *q)
 {
+	/* A multi-queue request holds the usage count from its submission
+	 * to its end, wherever it waits (software queue, dispatch list,
+	 * elevator, requeue list, the driver). */
+	if (blk_queue_is_mq(q))
+		return blk_mq_usage_sum(q) == 0 && blk_ld32(&q->active) == 0 &&
+		       blk_ld32(&q->nr_requeue) == 0;
 	return blk_queue_nr_queued(q) == 0 && blk_ld32(&q->nr_requeue) == 0 &&
 	       blk_queue_nr_in_flight(q) == 0 && blk_ld32(&q->active) == 0;
 }
 
 static int blk_cond_quiet(struct blk_queue *q)
 {
+	if (blk_queue_is_mq(q))
+		return blk_mq_nr_at_driver(q) == 0 && blk_ld32(&q->active) == 0;
 	return blk_queue_nr_in_flight(q) == 0 && blk_ld32(&q->active) == 0;
+}
+
+/* Teardown of a multi-queue queue: every request gone and nobody inside. */
+static int blk_cond_mq_gone(struct blk_queue *q)
+{
+	return blk_mq_usage_sum(q) == 0 && blk_ld32(&q->active) == 0;
 }
 
 /* After any change that may satisfy a waiter.  Any context, no queue
@@ -1523,7 +1541,7 @@ static void blk_timer_fire_put(struct blk_queue *q)
 static void blk_queue_mod_timeout_timer_locked(struct blk_queue *q, uint64_t at)
 {
 	lockdep_assert_held(&q->timer_lock);
-	if (blk_qflags(q) & BLK_QUEUE_FL_DYING)
+	if (blk_qflags(q) & BLK_QUEUE_FL_NOTIMER)
 		return;
 	if (!hrtimer_cancel(&q->timeout_timer))
 		(void)__atomic_add_fetch(&q->timer_fires, 1, __ATOMIC_SEQ_CST);
@@ -1592,7 +1610,7 @@ static void blk_queue_timeout_timer_fn(hrtimer_t *t)
 {
 	struct blk_queue *q = (struct blk_queue *)t->arg;
 
-	if (!(blk_qflags(q) & BLK_QUEUE_FL_DYING)) {
+	if (!(blk_qflags(q) & BLK_QUEUE_FL_NOTIMER)) {
 		if (blk_kblockd_running())
 			(void)kblockd_schedule_work(&q->timeout_work);
 		else
@@ -1763,6 +1781,10 @@ void blk_queue_run_async(struct blk_queue *q)
 {
 	if (!q)
 		return;
+	if (blk_queue_is_mq(q)) {
+		blk_mq_run_queue(q, 1);
+		return;
+	}
 	if (!blk_queue_need_run(q)) {
 		/* Looked at without a lock: look once more behind a full
 		 * barrier, which orders the look after whatever change the
@@ -2117,6 +2139,10 @@ void blk_queue_run(struct blk_queue *q)
 {
 	if (!q)
 		return;
+	if (blk_queue_is_mq(q)) {
+		blk_mq_run_queue(q, 0);
+		return;
+	}
 	if (!blk_queue_need_run(q)) {
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
 		if (!blk_queue_need_run(q))
@@ -2157,20 +2183,31 @@ static void blk_insert_flush(struct blk_queue *q, struct blk_request *rq);
  * driver first.  `from_schedule': the caller is the scheduler's plug hook,
  * where an end_io must not run -- the end goes through the block softirq.
  * No lock held. */
+/* A multi-queue request the driver prepared (BLK_REQ_DONTPREP) ends in
+ * the block layer: the driver's ->cleanup_rq releases what it set up. */
+static void blk_mq_cleanup_prepared(struct blk_queue *q, struct blk_request *rq)
+{
+	if (blk_queue_is_mq(q) && (rq->flags & BLK_REQ_DONTPREP) &&
+	    q->tag_set->ops->cleanup_rq)
+		q->tag_set->ops->cleanup_rq(rq);
+}
+
 static void blk_queue_fail_insert(struct blk_queue *q, struct blk_request *req,
 				  int from_schedule)
 {
 	struct gendisk *disk = q->disk;
+	/* A disk whose device is gone (blk_mark_disk_dead): an I/O error. */
+	int err = disk && (disk_flags(disk) & GENHD_FL_GONE) ? -EIO : -ENODEV;
 
+	blk_mq_cleanup_prepared(q, req);
 	if (req->driver_data && disk && disk->ops && disk->ops->cleanup_rq)
 		disk->ops->cleanup_rq(req);
 	req->driver_data = NULL;
 	req->bl.internal |= BLK_RQI_FLUSH_END;
 	if (from_schedule)
-		blk_request_end_deferred(req, -ENODEV,
-					 blk_rq_bytes_for_resid(req));
+		blk_request_end_deferred(req, err, blk_rq_bytes_for_resid(req));
 	else
-		blk_request_complete(req, -ENODEV, blk_rq_bytes_for_resid(req));
+		blk_request_complete(req, err, blk_rq_bytes_for_resid(req));
 }
 
 /* Requests that never go through the elevator: their order is their
@@ -2293,6 +2330,12 @@ static void blk_queue_try_issue_directly(struct blk_queue *q,
 void blk_queue_insert(struct blk_queue *q, struct blk_request *req)
 {
 	BUG_ON(q == NULL || req == NULL);
+	/* A multi-queue queue: per-CPU software queues and hardware
+	 * contexts (blk_mq.c). */
+	if (blk_queue_is_mq(q)) {
+		blk_mq_queue_insert(q, req, 0);
+		return;
+	}
 	/* Without a scheduler an ordinary request is tried at the driver
 	 * directly. */
 	if (q->sched == BLK_SCHED_NONE && !blk_rq_is_bypass(req) &&
@@ -2346,6 +2389,13 @@ void blk_queue_done_prepare(struct blk_queue *q, struct blk_request *req,
 	req->bl.internal &= ~BLK_RQI_SCHED_TAG;
 	snap->acct = (req->bl.internal & BLK_RQI_ACCT) != 0;
 	req->bl.internal &= ~BLK_RQI_ACCT;
+	/* The usage count goes last (blk_queue_done_snap); a request from
+	 * blk_mq_alloc_request keeps it until it is freed. */
+	snap->q_usage = (req->bl.internal & BLK_RQI_Q_USAGE) &&
+			!(req->flags & BLK_REQ_MQ_ALLOC);
+	snap->q_usage_slot = req->bl.usage_slot;
+	if (snap->q_usage)
+		req->bl.internal &= ~BLK_RQI_Q_USAGE;
 	snap->group = blk_stat_group(op);
 	snap->dir = blk_op_is_write(op) ? 1 : 0;
 	snap->start_ns = req->submit_ns;
@@ -2388,7 +2438,12 @@ void blk_queue_done_snap(struct blk_queue *q, const struct blk_done_snap *snap)
 		blk_atomic_dec_nonzero(&q->nr_sched);
 	/* The tag is free: a dispatch that stopped for want of one goes on,
 	 * through kblockd. */
-	blk_queue_sched_restart(q);
+	if (!blk_queue_is_mq(q))
+		blk_queue_sched_restart(q);
+	/* A multi-queue request leaves the queue: a freeze or a teardown
+	 * may be waiting for exactly this. */
+	if (snap->q_usage)
+		blk_mq_usage_put(q, snap->q_usage_slot);
 	blk_queue_wake(q);
 }
 
@@ -2419,6 +2474,7 @@ static void blk_queue_fail_queued(struct blk_queue *q, struct blk_request *rq)
 {
 	struct gendisk *disk = q->disk;
 
+	blk_mq_cleanup_prepared(q, rq);
 	if (rq->driver_data && disk && disk->ops && disk->ops->cleanup_rq)
 		disk->ops->cleanup_rq(rq);
 	rq->driver_data = NULL;
@@ -2466,6 +2522,8 @@ static int blk_queue_add_requeue(struct blk_queue *q, struct blk_request *rq,
 	else
 		blk_requeue_list_add_locked(&q->requeue_head,
 					    &q->requeue_tail, rq);
+	if (blk_queue_is_mq(q))
+		rq->bl.internal |= BLK_RQI_MQ_REQUEUE;
 	(void)__atomic_add_fetch(&q->nr_requeue, 1, __ATOMIC_SEQ_CST);
 	spin_unlock_irqrestore(&q->requeue_lock, fl);
 	return 0;
@@ -2501,6 +2559,18 @@ static void blk_queue_requeue_work_fn(void *arg)
 			flist = rq->disp_next;
 		}
 		rq->disp_next = NULL;
+		if (blk_queue_is_mq(q)) {
+			/* Multi-queue: back to its hardware context's dispatch
+			 * list (blk_mq_requeue_insert decides head or tail). */
+			if (unlikely(blk_qflags(q) & BLK_QUEUE_FL_DYING)) {
+				rq->bl.internal &= ~BLK_RQI_MQ_REQUEUE;
+				blk_queue_fail_queued(q, rq);
+			} else {
+				blk_mq_requeue_insert(q, rq);
+			}
+			blk_atomic_dec_nonzero(&q->nr_requeue);
+			continue;
+		}
 		spin_lock_irqsave(&q->lock, &fl);
 		if (unlikely(blk_qflags(q) & BLK_QUEUE_FL_DYING)) {
 			spin_unlock_irqrestore(&q->lock, fl);
@@ -2622,6 +2692,9 @@ static int blk_kick_flush_locked(struct blk_queue *q, uint64_t now)
 	f->submit_ns = now;
 	f->bl.internal |= BLK_RQI_FLUSH_RQ;
 	f->bl.tag = -1;
+	/* Multi-queue: the flush goes to the hardware context of the first
+	 * request it serves, with a driver tag of its own. */
+	f->mq_hctx = first->mq_hctx;
 	f->state = BLK_RQ_QUEUED;
 	if (blk_queue_add_requeue(q, f, 1)) {
 		/* Dying: teardown fails what waits on the flush lists. */
@@ -2771,8 +2844,10 @@ void blk_flush_complete(struct blk_queue *q, struct blk_request *rq,
 	spin_unlock_irqrestore(&q->flush_lock, fl);
 	if (tag >= 0)
 		blk_tag_put(q, tag);
-	/* The tag the step held is free: a dispatch waiting for one goes on. */
-	blk_queue_sched_restart(q);
+	/* The tag the step held is free: a dispatch waiting for one goes on.
+	 * (A multi-queue step gave its driver tag back before it got here.) */
+	if (!blk_queue_is_mq(q))
+		blk_queue_sched_restart(q);
 	blk_queue_wake(q);
 	if (kick)
 		blk_queue_kick_requeue(q);
@@ -2785,6 +2860,10 @@ void blk_queue_stop(struct blk_queue *q)
 
 	if (!q)
 		return;
+	if (blk_queue_is_mq(q)) {
+		blk_mq_stop_hw_queues(q);
+		return;
+	}
 	spin_lock_irqsave(&q->lock, &fl);
 	blk_qflags_set(q, BLK_QUEUE_FL_STOPPED);
 	spin_unlock_irqrestore(&q->lock, fl);
@@ -2796,6 +2875,10 @@ void blk_queue_start(struct blk_queue *q)
 
 	if (!q)
 		return;
+	if (blk_queue_is_mq(q)) {
+		blk_mq_start_stopped_hw_queues(q, 0);
+		return;
+	}
 	spin_lock_irqsave(&q->lock, &fl);
 	blk_qflags_clear(q, BLK_QUEUE_FL_STOPPED);
 	spin_unlock_irqrestore(&q->lock, fl);
@@ -2812,6 +2895,11 @@ void blk_queue_start_async(struct blk_queue *q)
 
 	if (!q)
 		return;
+	if (blk_queue_is_mq(q)) {
+		blk_mq_start_stopped_hw_queues(q, 1);
+		blk_queue_kick_requeue(q);
+		return;
+	}
 	spin_lock_irqsave(&q->lock, &fl);
 	blk_qflags_clear(q, BLK_QUEUE_FL_STOPPED);
 	spin_unlock_irqrestore(&q->lock, fl);
@@ -2957,14 +3045,24 @@ static void blk_queue_timeout_scan(struct blk_queue *q, int rearm)
 
 static void blk_queue_timeout_work_fn(void *arg)
 {
-	blk_queue_timeout_scan((struct blk_queue *)arg, 1);
+	struct blk_queue *q = (struct blk_queue *)arg;
+
+	/* Multi-queue: the deadlines live in the requests (blk-mq timeout
+	 * semantics, blk_mq.c). */
+	if (blk_queue_is_mq(q)) {
+		blk_mq_timeout_work(q);
+		return;
+	}
+	blk_queue_timeout_scan(q, 1);
 }
 
 void blk_queue_poll_timeouts(struct blk_queue *q)
 {
 	uint64_t now_ms, busy;
 
-	if (!q)
+	/* A multi-queue driver's ->timeout may sleep: never from a poller
+	 * with interrupts off. */
+	if (!q || blk_queue_is_mq(q))
 		return;
 	/* Only what is due: a polled waiter calls this every few
 	 * microseconds. */
@@ -3025,6 +3123,39 @@ static void blk_flush_plug_list(struct blk_plug *plug, int from_schedule)
 	plug->head = plug->tail = NULL;
 	plug->rq_count = 0;
 	plug->multiple_queues = 0;
+	/* Multi-queue queues take their requests as a batch each (merging,
+	 * ops->queue_rqs): split them off, in order, per queue. */
+	{
+		struct blk_request *keep = NULL, **kt = &keep;
+
+		while (list) {
+			struct blk_queue *mq = NULL;
+			struct blk_request *mine = NULL, **mt = &mine;
+			struct blk_request *rest = NULL, **rt = &rest;
+
+			while (list) {
+				struct blk_request *rq = list;
+
+				list = rq->disp_next;
+				rq->disp_next = NULL;
+				if (!blk_queue_is_mq(rq->queue)) {
+					*kt = rq;
+					kt = &rq->disp_next;
+				} else if (!mq || rq->queue == mq) {
+					mq = rq->queue;
+					*mt = rq;
+					mt = &rq->disp_next;
+				} else {
+					*rt = rq;
+					rt = &rq->disp_next;
+				}
+			}
+			if (mine)
+				blk_mq_flush_plug_list(mq, mine, from_schedule);
+			list = rest;
+		}
+		list = keep;
+	}
 	while (list) {
 		struct blk_request *rq = list;
 		struct blk_queue *q = rq->queue;
@@ -3167,6 +3298,36 @@ int blk_queue_set_scheduler(struct blk_queue *q, const char *name)
 		s = BLK_SCHED_NONE;
 	else
 		return -EINVAL;
+	if (blk_queue_is_mq(q)) {
+		/* Requests sit in different places for the two policies of a
+		 * multi-queue queue (software queues / the elevator): switch
+		 * frozen and quiesced, as an elevator switch is made. */
+		if (!blk_can_sleep())
+			return -EAGAIN;
+		blk_mq_freeze_queue(q);
+		blk_mq_quiesce_queue(q);
+		/* Its disk went meanwhile: nothing to switch (the caller
+		 * keeps the queue entered, so its contexts and tag set are
+		 * still there for the unquiesce). */
+		if (blk_qflags(q) & BLK_QUEUE_FL_DYING) {
+			blk_mq_unquiesce_queue(q);
+			blk_mq_unfreeze_queue(q);
+			return -ENODEV;
+		}
+		spin_lock_irqsave(&q->lock, &fl);
+		q->sched = s;
+		q->batching = q->fifo_batch;
+		spin_unlock_irqrestore(&q->lock, fl);
+		q->nr_requests = blk_mq_default_nr_requests(q);
+		__atomic_store_n(&q->async_depth, q->nr_requests,
+				 __ATOMIC_RELEASE);
+		blk_mq_unquiesce_queue(q);
+		blk_mq_unfreeze_queue(q);
+		if (q->disk)
+			kprintf(BLK_LOG_PREFIX "%s: I/O scheduler %s\n",
+				q->disk->disk_name, blk_queue_sched_name(q));
+		return 0;
+	}
 	spin_lock_irqsave(&q->lock, &fl);
 	/* The lists are the same for both policies; only the choice of the
 	 * next request differs, so a switch needs no migration. */
@@ -3339,6 +3500,7 @@ struct blk_queue *blk_queue_create(struct gendisk *disk,
 	spinlock_init(&q->requeue_lock, "blk_requeue");
 	spinlock_init(&q->timer_lock, "blk_queue_timer");
 	spinlock_init(&q->flush_lock, "blk_flush");
+	spinlock_init(&q->zone_wplugs_lock, "blk_zone_wplugs");
 	if (lim)
 		q->limits = *lim;
 	blk_limits_normalize(&q->limits, name);
@@ -3357,6 +3519,7 @@ struct blk_queue *blk_queue_create(struct gendisk *disk,
 	q->async_depth = q->nr_requests;
 	q->rq_affinity = 1;
 	q->read_ahead_kb = 128;
+	refcount_set(&q->q_refs, 1); /* the disk's (or the creator's) */
 	hrtimer_init(&q->timeout_timer, blk_queue_timeout_timer_fn, q);
 	blk_work_init(&q->run_work, blk_queue_run_work_fn, q);
 	blk_work_init(&q->timeout_work, blk_queue_timeout_work_fn, q);
@@ -3405,6 +3568,186 @@ static struct blk_request **blk_collect_list(struct blk_request *list,
 	return tailp;
 }
 
+/* Everything of a dying queue that has not reached the driver fails with
+ * -ENODEV: the bypass list and the elevator (collected by the caller under
+ * q->lock onto the list at *failp -- through disp_next -- whose last link
+ * is *tailp; the collection below goes on at that link), a multi-queue
+ * queue's software queues and dispatch lists (and the zone write plugs),
+ * the requeue lists, and requests waiting for a flush step that was not
+ * issued yet.  Collected under the locks; `before_fail' runs once all is
+ * collected, then everything is completed.  Called when the teardown
+ * starts and again for whatever a submitter, a requeue or a dispatcher put
+ * back after that. */
+static void blk_queue_fail_collected(struct blk_queue *q,
+				     struct blk_request **failp,
+				     struct blk_request **tailp,
+				     void (*before_fail)(struct blk_queue *q))
+{
+	uint64_t fl;
+	struct blk_request *fail, *flush_fail = NULL;
+
+	/* Multi-queue: and what waits on the software queues and the
+	 * hardware contexts' dispatch lists. */
+	if (blk_queue_is_mq(q))
+		tailp = blk_mq_collect_queued(q, tailp);
+
+	/* What waits on the requeue lists (DYING is set: nothing is added
+	 * there any more). */
+	spin_lock_irqsave(&q->requeue_lock, &fl);
+	{
+		uint32_t n = 0;
+
+		tailp = blk_collect_list(q->rq_flush_head, tailp, &n);
+		tailp = blk_collect_list(q->requeue_head, tailp, &n);
+		q->requeue_head = q->requeue_tail = NULL;
+		q->rq_flush_head = q->rq_flush_tail = NULL;
+		/* A requeue work under way counts down what it took itself. */
+		(void)__atomic_sub_fetch(&q->nr_requeue, n, __ATOMIC_SEQ_CST);
+	}
+	spin_unlock_irqrestore(&q->requeue_lock, fl);
+
+	/* Requests waiting for a flush step that was not issued yet. */
+	spin_lock_irqsave(&q->flush_lock, &fl);
+	{
+		int pidx = q->flush_pending_idx;
+
+		if (pidx != q->flush_running_idx || q->flush_list[pidx]) {
+			struct blk_request *w = q->flush_list[pidx];
+
+			q->flush_list[pidx] = q->flush_tail[pidx] = NULL;
+			while (w) {
+				struct blk_request *n = w->bl.flush_next;
+
+				w->status = -ENODEV;
+				w->bl.flush_next = flush_fail;
+				flush_fail = w;
+				w = n;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&q->flush_lock, fl);
+
+	if (before_fail)
+		before_fail(q);
+
+	/* Read only now: the collections above may have started the list. */
+	fail = *failp;
+	*failp = NULL;
+	while (fail) {
+		struct blk_request *rq = fail;
+
+		fail = rq->disp_next;
+		rq->disp_next = NULL;
+		blk_queue_fail_queued(q, rq);
+	}
+	blk_flush_end_list(flush_fail);
+}
+
+/* The bypass list and the elevator onto *tailp.  q->lock held. */
+static struct blk_request **blk_queue_collect_elv_locked(struct blk_queue *q,
+							 struct blk_request **tailp)
+{
+	lockdep_assert_held(&q->lock);
+	while (q->disp_head) {
+		struct blk_request *rq = q->disp_head;
+
+		blk_bypass_unlink_locked(q, NULL, rq);
+		*tailp = rq;
+		tailp = &rq->disp_next;
+	}
+	for (int dir = 0; dir < 2; dir++) {
+		while (q->fifo_head[dir]) {
+			struct blk_request *rq = q->fifo_head[dir];
+
+			blk_elv_remove_locked(q, rq);
+			rq->disp_next = NULL;
+			*tailp = rq;
+			tailp = &rq->disp_next;
+		}
+	}
+	*tailp = NULL;
+	return tailp;
+}
+
+/* A multi-queue teardown looks for requests queued after its first
+ * collection this often while it waits for the drain. */
+#define BLK_DESTROY_RELOOK_MS 100
+
+/* A later look of the teardown (multi-queue): what was queued since.
+ * Not while the queue is quiesced: whoever quiesced it (a driver in the
+ * middle of a reset) owns the dispatch order, and what waits on the
+ * software queues is dispatched -- and so completed or failed by the
+ * driver -- once it unquiesces, as a freeze waits for it.  A quiesced
+ * queue's requests are failed here only after the unquiesce, at the
+ * point where a dying queue's dispatch would hand them on anyway. */
+static void blk_queue_fail_all_queued(struct blk_queue *q)
+{
+	struct blk_request *fail = NULL, **tailp = &fail;
+	uint64_t fl;
+
+	if (blk_queue_quiesced(q))
+		return;
+	spin_lock_irqsave(&q->lock, &fl);
+	tailp = blk_queue_collect_elv_locked(q, tailp);
+	spin_unlock_irqrestore(&q->lock, fl);
+	blk_queue_fail_collected(q, &fail, tailp, NULL);
+}
+
+/* blk_queue_destroy() of a multi-queue queue. */
+static void blk_queue_destroy_mq(struct blk_queue *q)
+{
+	struct blk_request *fail = NULL, **tailp = &fail;
+	uint64_t fl;
+	int rc;
+	uint64_t next_note;
+
+	spin_lock_irqsave(&q->lock, &fl);
+	blk_qflags_set(q, BLK_QUEUE_FL_DYING);
+	blk_qflags_clear(q, BLK_QUEUE_FL_SUSPENDED);
+	/* The timer stays until the drain below is over: a request stuck at
+	 * a hung device is only ever given back by the driver's timeout
+	 * handling.  Collected under the same lock hold that sets DYING. */
+	tailp = blk_queue_collect_elv_locked(q, tailp);
+	spin_unlock_irqrestore(&q->lock, fl);
+	/* Submitters waiting for room see DYING. */
+	blk_queue_fail_collected(q, &fail, tailp, blk_queue_wake);
+
+	next_note = hrtimer_now_ns() + 10000000000ULL;
+	/* Every request of a multi-queue queue holds its usage count
+	 * until it ended; nobody may be inside a submission or a run
+	 * when the hardware contexts go.  What the driver holds comes
+	 * back from it (completed, failed, or cancelled by its timeout
+	 * handling -- the timer stays armed).  What a racing submitter,
+	 * requeue or dispatcher put on a list after the look above (a
+	 * dying queue still dispatches, but not while quiesced) is
+	 * failed by the next look, every BLK_DESTROY_RELOOK_MS, once
+	 * the queue is not quiesced (blk_queue_fail_all_queued). */
+	if (q->mq_usage)
+		wake_up(&q->mq_freeze_wq);
+	for (;;) {
+		rc = blk_queue_wait_cond(q, &q->wait_drain,
+					 blk_cond_mq_gone,
+					 BLK_DESTROY_RELOOK_MS);
+		if (!rc)
+			break;
+		blk_queue_fail_all_queued(q);
+		if (hrtimer_now_ns() >= next_note) {
+			next_note = hrtimer_now_ns() + 10000000000ULL;
+			kprintf(BLK_LOG_PREFIX "%s: still waiting for %lld request%s before removal\n",
+				q->disk ? q->disk->disk_name : "queue",
+				(long long)blk_mq_usage_sum(q),
+				blk_mq_usage_sum(q) == 1 ? "" : "s");
+		}
+	}
+	/* Drained: the timer goes for good, and a timeout work still
+	 * queued or running is waited for before the contexts go. */
+	spin_lock_irqsave(&q->lock, &fl);
+	blk_qflags_set(q, BLK_QUEUE_FL_NOTIMER);
+	spin_unlock_irqrestore(&q->lock, fl);
+	blk_sync_queue(q);
+	blk_mq_exit_queue(q);
+}
+
 void blk_queue_destroy(struct blk_queue *q)
 {
 	uint64_t fl;
@@ -3415,8 +3758,12 @@ void blk_queue_destroy(struct blk_queue *q)
 	if (!q)
 		return;
 	blk_might_sleep();
+	if (blk_queue_is_mq(q)) {
+		blk_queue_destroy_mq(q);
+		return;
+	}
 	spin_lock_irqsave(&q->lock, &fl);
-	blk_qflags_set(q, BLK_QUEUE_FL_DYING);
+	blk_qflags_set(q, BLK_QUEUE_FL_DYING | BLK_QUEUE_FL_NOTIMER);
 	blk_qflags_clear(q, BLK_QUEUE_FL_SUSPENDED);
 	/* Everything that has not reached the driver fails with -ENODEV.
 	 * Collected under the lock, completed after it. */
@@ -3525,7 +3872,7 @@ void blk_queue_free(struct blk_queue *q)
 	 * firings is 0.  Bounded: a callback that never finishes leaks the
 	 * queue rather than freeing memory that is still in use. */
 	spin_lock_irqsave(&q->lock, &fl);
-	blk_qflags_set(q, BLK_QUEUE_FL_DYING);
+	blk_qflags_set(q, BLK_QUEUE_FL_DYING | BLK_QUEUE_FL_NOTIMER);
 	spin_unlock_irqrestore(&q->lock, fl);
 	for (uint32_t spin = 0; spin < 100000; spin++) {
 		spin_lock_irqsave(&q->timer_lock, &fl);
@@ -3551,6 +3898,10 @@ void blk_queue_free(struct blk_queue *q)
 		     q->disk ? q->disk->disk_name : "?");
 		return;
 	}
+	/* The multi-queue part: hardware contexts (if teardown did not take
+	 * them already), software queues, usage counters, zone plugs. */
+	if (q->tag_set || q->queue_ctx_raw || q->mq_usage_raw)
+		blk_mq_release_queue(q);
 	WARN_ON(blk_queue_nr_in_flight(q) != 0);
 	WARN_ON(q->disp_head != NULL || q->fifo_head[0] || q->fifo_head[1]);
 	WARN_ON(q->requeue_head != NULL || q->rq_flush_head != NULL);
@@ -3560,4 +3911,205 @@ void blk_queue_free(struct blk_queue *q)
 		kfree(q->merge_pool);
 	q->merge_pool = NULL;
 	kfree(q);
+}
+
+/* ==========================================================================
+ * Helpers for the multi-queue layer (blk_mq.c, blk_zoned.c)
+ *
+ * The multi-queue code shares the elevator, merging, the flush machinery,
+ * the statistics and the requeue lists of this file; these are the
+ * entry points it uses, each taking the lock its part needs.
+ * ========================================================================== */
+
+uint32_t blk_queue_flags(const struct blk_queue *q)
+{
+	return blk_qflags(q);
+}
+
+void blk_queue_account_start_rq(struct blk_queue *q, struct blk_request *rq)
+{
+	blk_account_start(q, rq, hrtimer_now_ns());
+}
+
+void blk_queue_insert_flush(struct blk_queue *q, struct blk_request *rq)
+{
+	blk_insert_flush(q, rq);
+}
+
+void blk_queue_fail_rq(struct blk_queue *q, struct blk_request *rq,
+		       int from_schedule)
+{
+	blk_queue_fail_insert(q, rq, from_schedule);
+}
+
+int blk_queue_rq_is_bypass(const struct blk_request *rq)
+{
+	return blk_rq_is_bypass(rq);
+}
+
+int blk_queue_elv_insert(struct blk_queue *q, struct blk_request *rq)
+{
+	uint64_t fl;
+
+	spin_lock_irqsave(&q->lock, &fl);
+	if (blk_try_merge_locked(q, rq)) {
+		spin_unlock_irqrestore(&q->lock, fl);
+		blk_queue_wake(q);
+		return 0;
+	}
+	blk_elv_add_locked(q, rq, hrtimer_now_ns());
+	spin_unlock_irqrestore(&q->lock, fl);
+	return 1;
+}
+
+struct blk_request *blk_queue_elv_take(struct blk_queue *q)
+{
+	struct blk_request *rq;
+	uint64_t fl;
+
+	if (!blk_elv_has_work(q))
+		return NULL;
+	spin_lock_irqsave(&q->lock, &fl);
+	rq = blk_elv_dispatch_locked(q, hrtimer_now_ns());
+	spin_unlock_irqrestore(&q->lock, fl);
+	if (rq)
+		blk_queue_wake(q); /* its slot no longer counts as queued */
+	return rq;
+}
+
+int blk_queue_elv_pending(const struct blk_queue *q)
+{
+	return blk_elv_has_work(q);
+}
+
+int blk_queue_merge_pair(struct blk_queue *q, struct blk_request *a,
+			 struct blk_request *b)
+{
+	uint64_t fl;
+	int merged = 0;
+
+	if (blk_qflags(q) & BLK_QUEUE_FL_NOMERGES)
+		return 0;
+	/* The predicate first, without the lock: both requests are the
+	 * caller's (on its plug), nobody else looks at them. */
+	if (!blk_rq_can_back_merge(a, b, &q->limits))
+		return 0;
+	spin_lock_irqsave(&q->lock, &fl);
+	if (blk_merge_feasible_locked(q, a, b))
+		merged = blk_merge_absorb_locked(q, a, b, 0);
+	spin_unlock_irqrestore(&q->lock, fl);
+	if (merged)
+		blk_queue_wake(q);
+	return merged;
+}
+
+int blk_queue_elv_cancel(struct blk_queue *q, struct blk_request *rq)
+{
+	uint64_t fl;
+	int found = 0;
+
+	spin_lock_irqsave(&q->lock, &fl);
+	if (rq->bl.internal & BLK_RQI_SORTED) {
+		blk_elv_remove_locked(q, rq);
+		found = 1;
+	}
+	spin_unlock_irqrestore(&q->lock, fl);
+	return found;
+}
+
+int blk_queue_requeue_cancel(struct blk_queue *q, struct blk_request *rq)
+{
+	uint64_t fl;
+	int found = 0;
+
+	spin_lock_irqsave(&q->requeue_lock, &fl);
+	{
+		struct blk_request *prev = NULL;
+
+		for (struct blk_request *r = q->requeue_head; r;
+		     prev = r, r = r->disp_next) {
+			if (r != rq)
+				continue;
+			if (prev)
+				prev->disp_next = r->disp_next;
+			else
+				q->requeue_head = r->disp_next;
+			if (q->requeue_tail == r)
+				q->requeue_tail = prev;
+			r->disp_next = NULL;
+			r->bl.internal &= ~BLK_RQI_MQ_REQUEUE;
+			found = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&q->requeue_lock, fl);
+	if (found)
+		blk_atomic_dec_nonzero(&q->nr_requeue);
+	return found;
+}
+
+void blk_queue_add_timer_ns(struct blk_queue *q, uint64_t deadline_ns,
+			    uint64_t now_ns)
+{
+	blk_add_timer(q, deadline_ns, now_ns);
+}
+
+void blk_queue_mod_timer_ns(struct blk_queue *q, uint64_t at_ns)
+{
+	uint64_t now = hrtimer_now_ns();
+
+	/* The same rounding as an arming: one firing for neighbouring
+	 * deadlines, never further ahead than BLK_MAX_TIMER_NS. */
+	if (at_ns < now)
+		at_ns = now;
+	blk_add_timer(q, at_ns, now);
+}
+
+void blk_queue_wake_waiters(struct blk_queue *q)
+{
+	blk_queue_wake(q);
+}
+
+void blk_queue_kick_requeue_ns(struct blk_queue *q, uint64_t delay_ns)
+{
+	(void)kblockd_mod_delayed_work_on(blk_queue_run_cpu(), &q->requeue_work,
+					  delay_ns);
+}
+
+int blk_queue_requeue_add(struct blk_queue *q, struct blk_request *rq)
+{
+	return blk_queue_add_requeue(q, rq, 0);
+}
+
+void blk_queue_free_now(struct blk_queue *q)
+{
+	blk_queue_free(q);
+}
+
+void blk_sync_queue(struct blk_queue *q)
+{
+	uint64_t fl;
+
+	if (!q)
+		return;
+	blk_might_sleep();
+	/* The timer: disarmed, a firing under way waited for. */
+	spin_lock_irqsave(&q->timer_lock, &fl);
+	blk_queue_disarm_timer_locked(q);
+	spin_unlock_irqrestore(&q->timer_lock, fl);
+	for (uint32_t spin = 0;
+	     __atomic_load_n(&q->timer_fires, __ATOMIC_ACQUIRE) && spin < 100000;
+	     spin++)
+		lapic_delay_us(10);
+	/* The timeout work: taken off its list and waited for without
+	 * bound (a handler may be in the middle of a controller recovery);
+	 * a run that re-queues itself is taken off again.  The requeue and
+	 * run work stay as they are: dropping them could strand requests. */
+	for (;;) {
+		int rc = blk_work_cancel_sync(&q->timeout_work, 0);
+
+		if (rc != -ETIMEDOUT)
+			break;
+		blk_mq_msleep(1);
+	}
 }

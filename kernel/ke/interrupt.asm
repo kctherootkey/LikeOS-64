@@ -344,9 +344,11 @@ IRQ 29, 61              ; MSI: vmxnet3 NIC
 IRQ 30, 62              ; hrtimer (HPET one-shot comparator)
 
 ; ----------------------------------------------------------------------------
-; Vectors 63..127: handed out at run time by irq_alloc_vector() (MSI/MSI-X
-; lines for drivers that register through kernel/ke/irq.c).  One stub each,
-; and a table of their addresses so the IDT can be filled in a loop.
+; Vectors 63..239: handed out at run time.  63..127 by irq_alloc_vector()
+; (MSI/MSI-X lines for drivers that register through kernel/ke/irq.c),
+; 128..239 from the per-CPU vector matrix (kernel/ke/irq_matrix.c) for
+; request_irq().  One stub each, and a table of their addresses so the IDT
+; can be filled in a loop.
 ; ----------------------------------------------------------------------------
 %macro IRQ_VEC 1
 global irq_vec%1
@@ -358,7 +360,7 @@ irq_vec%1:
 %endmacro
 
 %assign vec 63
-%rep 65
+%rep 177
 IRQ_VEC vec
 %assign vec vec+1
 %endrep
@@ -367,7 +369,7 @@ section .data
 global irq_dyn_stub_table
 irq_dyn_stub_table:
 %assign vec 63
-%rep 65
+%rep 177
     dq irq_vec%+vec
 %assign vec vec+1
 %endrep

@@ -71,6 +71,8 @@ SYSCALLS_ASM = src/syscalls/vfork.S
 SETJMP_ASM  = src/setjmp.S
 UCONTEXT_ASM = src/misc/ucontext.S
 MISC_SRC = src/misc/makecontext.c src/misc/threads.c
+# POSIX asynchronous I/O (<aio.h>): a worker-thread pool over pread/pwrite/fsync.
+AIO_SRC = src/aio/aio.c
 CRT0_SRC = src/crt0.S
 CRT1_SRC = src/crt1.S
 CRTI_SRC = src/crti.S
@@ -95,6 +97,7 @@ NET_OBJ = $(NET_SRC:.c=.o)
 PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 SETJMP_OBJ  = $(SETJMP_ASM:.S=.o)
 UCONTEXT_OBJ = $(UCONTEXT_ASM:.S=.o) $(MISC_SRC:.c=.o)
+AIO_OBJ = $(AIO_SRC:.c=.o)
 STACK_CHK_OBJ = $(STACK_CHK_SRC:.c=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 CRT1_OBJ = $(CRT1_SRC:.S=.o)
@@ -104,7 +107,8 @@ CRTN_OBJ = $(CRTN_SRC:.S=.o)
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
            $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(ICONV_OBJ) $(LOCALE_OBJ) $(SYSCALLS_OBJ) \
-           $(NET_OBJ) $(SETJMP_OBJ) $(UCONTEXT_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ)
+           $(NET_OBJ) $(SETJMP_OBJ) $(UCONTEXT_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ) \
+           $(AIO_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 

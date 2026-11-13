@@ -1372,7 +1372,7 @@ int blk_partition_scan(struct gendisk *disk)
 	if (!disk)
 		return -EINVAL;
 	blk_might_sleep();
-	if ((disk->flags & GENHD_FL_NO_PART_SCAN) || disk->kind == BLK_DISK_SR)
+	if ((disk->flags & GENHD_FL_NO_PARTS) || disk->kind == BLK_DISK_SR)
 		return 0;
 	if (!disk->capacity || !disk->bdev.ready)
 		return 0;
@@ -1471,7 +1471,7 @@ int blk_partition_rescan(struct gendisk *disk)
 		blk_mutex_unlock(&g_disk_registry_mutex);
 		return -ENODEV;
 	}
-	if ((disk->flags & GENHD_FL_NO_PART_SCAN) ||
+	if ((disk->flags & GENHD_FL_NO_PARTS) ||
 	    disk->kind == BLK_DISK_SR) {
 		blk_mutex_unlock(&g_disk_registry_mutex);
 		return -EINVAL;
@@ -1538,7 +1538,7 @@ int blk_partition_add(struct gendisk *disk, int partno, uint64_t start_lba,
 		rc = -ENODEV;
 		goto out;
 	}
-	if ((disk->flags & GENHD_FL_NO_PART_SCAN) || disk->kind == BLK_DISK_SR) {
+	if ((disk->flags & GENHD_FL_NO_PARTS) || disk->kind == BLK_DISK_SR) {
 		rc = -EINVAL;
 		goto out;
 	}

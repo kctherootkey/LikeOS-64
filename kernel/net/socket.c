@@ -2081,8 +2081,10 @@ int sock_sendmsg(int sockfd, const struct msghdr *msg, int flags)
 	for (int i = 0; i < msg->msg_iovlen; i++)
 		total += msg->msg_iov[i].iov_len;
 
-	if (total == 0)
+	if (total == 0) {
+		smap_enable(); /* not left open on the way out */
 		return 0;
+	}
 
 	// Copy scatter buffers into a single contiguous buffer
 	uint8_t buf[2048];

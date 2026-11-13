@@ -59,13 +59,25 @@ static int64_t ioctl_held(task_t *cur, vfs_file_t *file, uint64_t fd,
 		case SIOCGIFHWADDR:
 		case SIOCGIFINDEX:
 		case SIOCGIFNAME:
+		case SIOCGIFMETRIC:
 			arg_len = sizeof(struct ifreq);
 			break;
 		case 0x5421: /* FIONBIO */
 		case 0x541B: /* FIONREAD */
+		case SIOCGIFCOUNT:
 			arg_len = sizeof(int);
 			break;
+		case SIOCGARP:
+		case SIOCSARP:
+		case SIOCDARP:
+			arg_len = sizeof(struct arpreq);
+			break;
+		case SIOCADDRT:
+		case SIOCDELRT:
+			arg_len = sizeof(struct rtentry);
+			break;
 		default:
+			/* The handler touches no argument for the rest. */
 			arg_len = 0;
 			break;
 		}
@@ -74,6 +86,30 @@ static int64_t ioctl_held(task_t *cur, vfs_file_t *file, uint64_t fd,
 				return -EFAULT;
 			if (!validate_user_ptr(argp, arg_len))
 				return -EFAULT;
+		}
+		/* SIOCGIFCONF writes through the buffer pointer INSIDE the
+		 * argument: the handler gets a kernel copy of the header whose
+		 * buffer was checked for the length it claims, so the program
+		 * cannot point it elsewhere after the check; the resulting
+		 * length is copied back. */
+		if (req == SIOCGIFCONF) {
+			struct ifconf kifc;
+
+			if (copy_from_user(&kifc, (void *)argp, sizeof(kifc)))
+				return -EFAULT;
+			if (kifc.ifc_buf && kifc.ifc_len > 0 &&
+			    !validate_user_ptr((uint64_t)kifc.ifc_buf,
+					       (size_t)kifc.ifc_len))
+				return -EFAULT;
+			smap_disable();
+			int64_t r = sock_ioctl_net(idx, (unsigned long)req,
+						   &kifc);
+			smap_enable();
+			if (r == 0 &&
+			    copy_to_user((void *)argp, &kifc.ifc_len,
+					 sizeof(kifc.ifc_len)))
+				return -EFAULT;
+			return r;
 		}
 		/* Mutating interface configuration (address, netmask, flags, MTU)
 		 * is a privileged, system-wide change; the query ioctls are not. */

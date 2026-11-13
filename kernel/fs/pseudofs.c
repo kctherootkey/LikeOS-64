@@ -33,7 +33,9 @@ struct pfs_node *pfs_node_new(struct pfs *fs, struct pfs_node *parent,
 	n->mode = type == PFS_DIR ? 0555 : (type == PFS_LINK ? 0777 : 0444);
 	n->parent = parent;
 	n->fs = fs;
-	n->ino = ++fs->next_ino;
+	/* Nodes are made concurrently (lookups of dynamic directories,
+	 * drivers adding files): one number each. */
+	n->ino = __atomic_add_fetch(&fs->next_ino, 1, __ATOMIC_RELAXED);
 	n->transient = 1;
 	return n;
 }
@@ -47,7 +49,10 @@ void pfs_node_put(struct pfs_node *n)
 static struct pfs_node *pfs_child(struct pfs_node *dir, const char *name,
 				  size_t len)
 {
-	for (struct pfs_node *c = dir->children; c; c = c->sibling) {
+	/* Pairs with the release store that publishes a new node. */
+	for (struct pfs_node *c = __atomic_load_n(&dir->children,
+						  __ATOMIC_ACQUIRE);
+	     c; c = c->sibling) {
 		size_t k = 0;
 		while (k < len && c->name[k] == name[k])
 			k++;
@@ -296,11 +301,64 @@ static struct pfs_node *pfs_lookup_follow(struct pfs *fs, const char *relpath)
 	return n;
 }
 
-static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
-				enum pfs_type type)
+/* Adding to the tree is serialised -- drivers register files from several
+ * threads (hotplug, probe work, init) -- while lookups walk the lists
+ * without a lock: a node is complete, template applied, before the store
+ * that makes it reachable, and nodes are never removed.  One lock for all
+ * instances: adding is rare. */
+static spinlock_t g_pfs_add_lock = SPINLOCK_INIT("pfs_add");
+
+/* A static child of `dir' named name[0..len) (no dynamic lookup: the tree
+ * being built is the static one).  g_pfs_add_lock. */
+static struct pfs_node *pfs_static_child(struct pfs_node *dir,
+					 const char *name, size_t len)
 {
-	/* Split off the last component; parents are created as directories
-	 * on demand. */
+	for (struct pfs_node *c = dir->children; c; c = c->sibling) {
+		size_t k = 0;
+		while (k < len && c->name[k] == name[k])
+			k++;
+		if (k == len && c->name[k] == 0)
+			return c;
+	}
+	return NULL;
+}
+
+/* The settable fields of `tmpl' onto `n'.  The data fields go first and
+ * the callbacks that use them last, with release stores: a node that is
+ * already reachable (an existing one a caller adds to again) never shows
+ * a callback without the arguments it reads. */
+static void pfs_apply(struct pfs_node *n, const struct pfs_node *t)
+{
+	if (t->mode)
+		n->mode = t->mode;
+	if (t->uid)
+		n->uid = t->uid;
+	if (t->gid)
+		n->gid = t->gid;
+	if (t->show || t->store || t->read_at || t->list || t->lookup ||
+	    t->arg || t->arg2) {
+		n->arg = t->arg;
+		n->arg2 = t->arg2;
+	}
+	if (t->link[0])
+		mm_memcpy(n->link, t->link, sizeof(n->link));
+	if (t->show)
+		__atomic_store_n(&n->show, t->show, __ATOMIC_RELEASE);
+	if (t->store)
+		__atomic_store_n(&n->store, t->store, __ATOMIC_RELEASE);
+	if (t->read_at)
+		__atomic_store_n(&n->read_at, t->read_at, __ATOMIC_RELEASE);
+	if (t->list || t->lookup)
+		pfs_set_dynamic(n, t->list, t->lookup);
+}
+
+/* Find or create `path' (parents are created as directories on demand);
+ * a node created for the last component is of `type' and carries the
+ * fields of `tmpl' (may be NULL) from the moment it is reachable.  An
+ * existing node is returned as it is, `tmpl' applied to it. */
+static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
+				enum pfs_type type, const struct pfs_node *tmpl)
+{
 	const char *p = path;
 	struct pfs_node *dir = &fs->root;
 
@@ -310,37 +368,47 @@ static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
 		const char *e = p;
 		while (*e && *e != '/')
 			e++;
-		if (!*e) {
-			struct pfs_node *n = pfs_child(dir, p, (size_t)(e - p));
-			if (n)
-				return n; /* already there */
-			n = pfs_node_new(fs, dir, p, type);
-			if (!n)
+		size_t l = (size_t)(e - p);
+		int last = !*e;
+		struct pfs_node *fresh = NULL, *c;
+		char tmp[64];
+
+		if (!last && l >= sizeof(tmp))
+			return NULL;
+		if (l >= sizeof(tmp))
+			l = sizeof(tmp) - 1; /* the name a node can hold */
+		mm_memcpy(tmp, p, l);
+		tmp[l] = 0;
+		for (;;) {
+			uint64_t fl;
+
+			spin_lock_irqsave(&g_pfs_add_lock, &fl);
+			c = pfs_static_child(dir, tmp, l);
+			if (c && last && tmpl)
+				pfs_apply(c, tmpl);
+			if (!c && fresh) {
+				fresh->sibling = dir->children;
+				/* complete before it is reachable */
+				__atomic_store_n(&dir->children, fresh,
+						 __ATOMIC_RELEASE);
+				c = fresh;
+				fresh = NULL;
+			}
+			spin_unlock_irqrestore(&g_pfs_add_lock, fl);
+			if (c)
+				break;
+			fresh = pfs_node_new(fs, dir, tmp,
+					     last ? type : PFS_DIR);
+			if (!fresh)
 				return NULL;
-			n->transient = 0;
-			n->sibling = dir->children;
-			/* lookups walk the list without a lock: the node is
-			 * complete before the store that makes it reachable */
-			__asm__ volatile("" ::: "memory");
-			dir->children = n;
-			return n;
+			fresh->transient = 0;
+			if (last && tmpl)
+				pfs_apply(fresh, tmpl);
 		}
-		struct pfs_node *c = pfs_child(dir, p, (size_t)(e - p));
-		if (!c) {
-			char tmp[64];
-			size_t l = (size_t)(e - p);
-			if (l >= sizeof(tmp))
-				return NULL;
-			mm_memcpy(tmp, p, l);
-			tmp[l] = 0;
-			c = pfs_node_new(fs, dir, tmp, PFS_DIR);
-			if (!c)
-				return NULL;
-			c->transient = 0;
-			c->sibling = dir->children;
-			__asm__ volatile("" ::: "memory"); /* as above */
-			dir->children = c;
-		}
+		if (fresh)
+			kfree(fresh); /* another thread added it first */
+		if (last)
+			return c;
 		dir = c;
 		p = e;
 		while (*p == '/')
@@ -350,54 +418,63 @@ static struct pfs_node *pfs_add(struct pfs *fs, const char *path,
 
 struct pfs_node *pfs_mkdir(struct pfs *fs, const char *path)
 {
-	return pfs_add(fs, path, PFS_DIR);
+	return pfs_add(fs, path, PFS_DIR, NULL);
 }
 
 struct pfs_node *pfs_add_file(struct pfs *fs, const char *path,
 			      pfs_show_t show, void *arg, uint64_t arg2)
 {
-	struct pfs_node *n = pfs_add(fs, path, PFS_FILE);
+	struct pfs_node t;
 
-	if (n) {
-		n->show = show;
-		n->arg = arg;
-		n->arg2 = arg2;
-	}
-	return n;
+	mm_memset(&t, 0, sizeof(t));
+	t.show = show;
+	t.arg = arg;
+	t.arg2 = arg2;
+	return pfs_add(fs, path, PFS_FILE, &t);
 }
 
 struct pfs_node *pfs_add_file_rw(struct pfs *fs, const char *path,
 				 pfs_show_t show, pfs_store_t store, void *arg,
 				 uint64_t arg2)
 {
-	struct pfs_node *n = pfs_add_file(fs, path, show, arg, arg2);
-	if (n) {
-		n->store = store;
-		n->mode = 0644;
-	}
-	return n;
+	struct pfs_node t;
+
+	mm_memset(&t, 0, sizeof(t));
+	t.show = show;
+	t.store = store;
+	t.arg = arg;
+	t.arg2 = arg2;
+	t.mode = 0644;
+	return pfs_add(fs, path, PFS_FILE, &t);
 }
 
 struct pfs_node *pfs_add_link(struct pfs *fs, const char *path,
 			      const char *target)
 {
-	struct pfs_node *n = pfs_add(fs, path, PFS_LINK);
+	struct pfs_node t;
+	size_t k = 0;
 
-	if (n) {
-		size_t k = 0;
-		while (target[k] && k < sizeof(n->link) - 1) {
-			n->link[k] = target[k];
-			k++;
-		}
-		n->link[k] = 0;
+	mm_memset(&t, 0, sizeof(t));
+	while (target[k] && k < sizeof(t.link) - 1) {
+		t.link[k] = target[k];
+		k++;
 	}
-	return n;
+	t.link[k] = 0;
+	return pfs_add(fs, path, PFS_LINK, &t);
+}
+
+struct pfs_node *pfs_add_node(struct pfs *fs, const char *path,
+			      enum pfs_type type, const struct pfs_node *tmpl)
+{
+	return pfs_add(fs, path, type, tmpl);
 }
 
 void pfs_set_dynamic(struct pfs_node *dir, pfs_list_t list, pfs_lookup_t lookup)
 {
-	dir->list = list;
-	dir->lookup = lookup;
+	/* Release stores: whatever the caller set up for the callbacks (the
+	 * node's arg/arg2) is visible before they are. */
+	__atomic_store_n(&dir->lookup, lookup, __ATOMIC_RELEASE);
+	__atomic_store_n(&dir->list, list, __ATOMIC_RELEASE);
 }
 
 long pfs_printf(char *buf, long cap, long pos, const char *fmt, ...)
@@ -609,7 +686,7 @@ static long pfs_read(vfs_file_t *f, void *buf, long bytes)
 			pf->pos += n;
 		return n;
 	}
-	/* A read from the start renders the file again, as the reference
+	/* A read from the start renders the file again, as the established
 	 * procfs does (seq_file), and readers rely on that: a monitor that
 	 * keeps /proc/meminfo open and rewinds it every few seconds -- WebKit's
 	 * memory pressure monitor is one -- otherwise reads the numbers from
@@ -770,7 +847,9 @@ static long pfs_readdir(vfs_file_t *f, void *buf, long bytes)
 								 pos - 3;
 			struct pfs_node *pick = NULL;
 
-			for (struct pfs_node *c = dir->children; c; c = c->sibling)
+			for (struct pfs_node *c = __atomic_load_n(
+				     &dir->children, __ATOMIC_ACQUIRE);
+			     c; c = c->sibling)
 				if (c->ino < bound && (!pick || c->ino > pick->ino))
 					pick = c;
 			if (!pick) {

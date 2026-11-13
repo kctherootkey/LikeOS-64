@@ -1,0 +1,87 @@
+# Makefile.likeos - build libnvme 1.16.2 for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; meson is not
+# run.  The library's source lists come from upstream's src/meson.build and
+# ccan/meson.build, and config.h in this directory holds the answers its
+# configure step would have found (see there for the optional
+# dependencies, all of which are off).
+#
+# Output, both static archives linked into the programs that use them (the
+# libraries of the disk tools port are handled the same way):
+#   build/libnvme.a      the NVMe library: ioctl wrappers, sysfs topology
+#                        (subsystems, controllers, namespaces, paths),
+#                        identify/log/feature helpers, NBFT, fabrics
+#   build/libnvme-mi.a   the Management Interface library; its log.c and the
+#                        ccan helpers come from libnvme.a (link it after
+#                        libnvme-mi.a), as both shared libraries upstream
+#                        compile the same file
+# Headers for users: src/src (libnvme.h, libnvme-mi.h, nvme/*.h).
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+AR = ar
+
+LIBC_DIR = ../../user/lib/libc
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+
+# Upstream: c_std=gnu99, warning_level=1, -fomit-frame-pointer -D_GNU_SOURCE,
+# every file with -include config.h.
+CFLAGS = -std=gnu99 -Wall -O2 -fomit-frame-pointer -nostdlib -fno-builtin \
+         -fstack-protector-strong -mno-red-zone -ffreestanding -fPIE \
+         -D_GNU_SOURCE -D__LIKEOS__ \
+         -I. -I$(LIBC_DIR)/include -I$(S) -I$(S)/ccan -I$(S)/src \
+         -include config.h
+
+# upstream's src/meson.build list: every library source except the
+# Management Interface ones (their own archive) and json.c (no json-c: its
+# replacement no-json.c is built); the unpacked tree is fixed by the tarball.
+# Evaluated in the inner make (`libs'), after unpack.sh ran.
+NVME_SRCS = $(filter-out src/nvme/json.c src/nvme/mi.c src/nvme/mi-mctp.c, \
+              $(patsubst $(S)/%,%,$(wildcard $(S)/src/nvme/*.c))) \
+            ccan/ccan/list/list.c ccan/ccan/str/debug.c ccan/ccan/str/str.c
+MI_SRCS = src/nvme/mi.c src/nvme/mi-mctp.c
+
+NVME_OBJS = $(addprefix $(B)/,$(NVME_SRCS:.c=.o))
+MI_OBJS = $(addprefix $(B)/,$(MI_SRCS:.c=.o))
+
+# Every object depends on every header: the library's headers are shared
+# throughout.
+HDRS = config.h $(wildcard $(S)/src/*.h $(S)/src/nvme/*.h $(S)/ccan/ccan/*/*.h)
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos libs
+
+libs: $(B)/libnvme.a $(B)/libnvme-mi.a
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): libnvme-1.16.2.tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(B)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/libnvme.a: $(NVME_OBJS)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+$(B)/libnvme-mi.a: $(MI_OBJS)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all libs unpack clean distclean
+.SECONDARY:

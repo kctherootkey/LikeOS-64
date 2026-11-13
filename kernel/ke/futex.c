@@ -25,6 +25,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/ke/uaccess_range.h>
 
 // ============================================================================
 // FUTEX TRACE RING BUFFER (diagnostic)
@@ -189,13 +190,8 @@ static bool futex_initialized = false;
 // Validate user pointer is in user space
 static inline bool validate_user_ptr(uint64_t ptr, size_t len)
 {
-	if (ptr < 0x10000)
-		return false; // Reject low addresses (NULL deref protection)
-	if (ptr >= 0x7FFFFFFFFFFF)
-		return false; // Beyond user space
-	if (ptr + len < ptr)
-		return false; // Overflow check
-	return true;
+	/* The whole range, overflow-safe (uaccess_range.h). */
+	return user_range_ok(ptr, (uint64_t)len);
 }
 
 // Hash function for futex addresses (MurmurHash3 finalizer)

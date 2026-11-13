@@ -727,6 +727,40 @@ int blk_work_cancel_sync(struct blk_work *w, uint32_t timeout_ms)
 	}
 }
 
+int blk_work_flush(struct blk_work *w)
+{
+	int waited = 0;
+
+	if (!w)
+		return 0;
+	for (;;) {
+		uint32_t pend = __atomic_load_n(&w->flags, __ATOMIC_ACQUIRE) &
+				BLK_WORK_PENDING;
+		int running = __atomic_load_n(&w->running, __ATOMIC_ACQUIRE);
+
+		if (!pend && !running)
+			return waited;
+		/* Waiting for itself would never end. */
+		if (WARN(kblockd_runs_own(w),
+			 BLK_LOG_PREFIX "work item flushed from its own run"))
+			return -EBUSY;
+		/* Pending on its delay timer: run it now, as a flush of a
+		 * delayed item does. */
+		if (pend && !__atomic_load_n(&w->queued, __ATOMIC_ACQUIRE) &&
+		    !running && blk_kblockd_running())
+			(void)kblockd_mod_delayed_work_on(
+				__atomic_load_n(&w->delay_cpu, __ATOMIC_RELAXED),
+				w, 0);
+		waited = 1;
+		if (!blk_kblockd_running() || !blk_can_sleep()) {
+			blk_work_run_pending();
+			lapic_delay_us(10);
+		} else {
+			blk_mq_msleep(1);
+		}
+	}
+}
+
 /* Pollers run items off a pool's worklist that nobody runs. */
 static struct blk_work *kblockd_poll_take_locked(struct kblockd_pool *p)
 {

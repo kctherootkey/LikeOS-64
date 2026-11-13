@@ -454,6 +454,12 @@ typedef struct mmap_region {
 	 * be mapped writable in the first place (mmap refuses).  Carried by
 	 * splits, forks and mremap with the rest of the record. */
 	bool no_write;
+	/* A shared mapping of a regular file on a disk filesystem (ext4,
+	 * FAT32): its pages are this address space's own copies, so what the
+	 * processor writes into them (the dirty bit of each entry) is written
+	 * to `file' by msync, munmap, exec and exit -- see
+	 * mm_region_writes_back().  Carried with the rest of the record. */
+	bool wb_file;
 } mmap_region_t;
 
 /* The user's registers as syscall_entry leaves them on the kernel stack.

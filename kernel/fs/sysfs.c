@@ -7,23 +7,30 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/hal/pci.h>
 #include <kernel/ke/syscall.h>
+#include <kernel/ke/sched.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
+#include <kernel/uapi/dirent.h>
+#include <kernel/uapi/bug.h>
 
 void blk_sysfs_init(void); /* kernel/dev/block/blk_sysfs.c */
 
 static struct pfs g_sysfs;
 
+static struct pfs_node *g_sysfs_pci_dir; /* bus/pci/devices, once set up */
+
+/* "SSSS:BB:DD.F": the segment (domain) is part of the name -- a VMD
+ * domain's functions repeat the bus numbers of segment 0. */
 void sysfs_pci_path(const pci_device_t *dev, char *out, size_t cap)
 {
-	ksnprintf(out, cap, "/sys/bus/pci/devices/0000:%02x:%02x.%x", dev->bus,
-		  dev->device, dev->function);
+	ksnprintf(out, cap, "/sys/bus/pci/devices/%04x:%02x:%02x.%x",
+		  dev->segment, dev->bus, dev->device, dev->function);
 }
 
 static void pci_relpath(const pci_device_t *dev, char *out, size_t cap)
 {
-	ksnprintf(out, cap, "bus/pci/devices/0000:%02x:%02x.%x", dev->bus,
-		  dev->device, dev->function);
+	ksnprintf(out, cap, "bus/pci/devices/%04x:%02x:%02x.%x", dev->segment,
+		  dev->bus, dev->device, dev->function);
 }
 
 /* ---- PCI attribute files ---- */
@@ -41,15 +48,14 @@ static long pci_show_hex16(struct pfs_node *n, char *buf, long cap)
 		v = d->device_id;
 		break;
 	case 2: /* subsystem vendor */
-		v = pci_cfg_read32(d->bus, d->device, d->function, 0x2C) & 0xFFFF;
+		v = pci_cfg_read32_dev(d, 0x2C) & 0xFFFF;
 		break;
 	case 3: /* subsystem device */
-		v = pci_cfg_read32(d->bus, d->device, d->function, 0x2C) >> 16;
+		v = pci_cfg_read32_dev(d, 0x2C) >> 16;
 		break;
 	case 4: /* revision */
 		return pfs_printf(buf, cap, 0, "0x%02x\n",
-				  pci_cfg_read32(d->bus, d->device, d->function,
-						 0x08) & 0xFF);
+				  pci_cfg_read32_dev(d, 0x08) & 0xFF);
 	case 5: /* class: base<<16 | sub<<8 | prog_if */
 		return pfs_printf(buf, cap, 0, "0x%06x\n",
 				  ((uint32_t)d->class_code << 16) |
@@ -67,8 +73,7 @@ static long pci_show_config(struct pfs_node *n, char *buf, long cap)
 
 	/* The 256-byte header space, raw. */
 	for (int off = 0; off < 256; off += 4) {
-		uint32_t v = pci_cfg_read32(d->bus, d->device, d->function,
-					    (unsigned char)off);
+		uint32_t v = pci_cfg_read32_dev(d, (unsigned char)off);
 		for (int b = 0; b < 4; b++)
 			if (off + b < cap)
 				buf[off + b] = (char)((v >> (8 * b)) & 0xFF);
@@ -87,11 +92,11 @@ static long pci_show_uevent(struct pfs_node *n, char *buf, long cap)
 			       ((uint32_t)d->subclass << 8) | d->prog_if);
 	p = pfs_printf(buf, cap, p, "PCI_ID=%04X:%04X\n", d->vendor_id,
 		       d->device_id);
-	uint32_t sub = pci_cfg_read32(d->bus, d->device, d->function, 0x2C);
+	uint32_t sub = pci_cfg_read32_dev(d, 0x2C);
 	p = pfs_printf(buf, cap, p, "PCI_SUBSYS_ID=%04X:%04X\n", sub & 0xFFFF,
 		       sub >> 16);
-	p = pfs_printf(buf, cap, p, "PCI_SLOT_NAME=0000:%02x:%02x.%x\n", d->bus,
-		       d->device, d->function);
+	p = pfs_printf(buf, cap, p, "PCI_SLOT_NAME=%04x:%02x:%02x.%x\n",
+		       d->segment, d->bus, d->device, d->function);
 	p = pfs_printf(buf, cap, p, "MODALIAS=pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
 		       d->vendor_id, d->device_id, sub & 0xFFFF, sub >> 16,
 		       d->class_code, d->subclass, d->prog_if);
@@ -128,12 +133,22 @@ static long pci_show_resource(struct pfs_node *n, char *buf, long cap)
 	return p;
 }
 
-static void sysfs_add_pci(const pci_device_t *d)
+void sysfs_add_pci(const pci_device_t *d)
 {
 	char base[64], path[96];
 
+	/* Before sysfs_init the boot-time walk below adds it. */
+	if (!d || !__atomic_load_n(&g_sysfs_pci_dir, __ATOMIC_ACQUIRE))
+		return;
+
 	pci_relpath(d, base, sizeof(base));
-	struct pfs_node *dir = pfs_mkdir(&g_sysfs, base);
+	/* The directory carries its function from the moment it is visible
+	 * (published complete, see pfs_add_node). */
+	struct pfs_node dtmpl;
+
+	mm_memset(&dtmpl, 0, sizeof(dtmpl));
+	dtmpl.arg = (void *)d;
+	struct pfs_node *dir = pfs_add_node(&g_sysfs, base, PFS_DIR, &dtmpl);
 	if (!dir)
 		return;
 	static const char *names[] = { "vendor", "device", "subsystem_vendor",
@@ -150,7 +165,6 @@ static void sysfs_add_pci(const pci_device_t *d)
 	pfs_add_file(&g_sysfs, path, pci_show_resource, (void *)d, 0);
 	ksnprintf(path, sizeof(path), "%s/subsystem", base);
 	pfs_add_link(&g_sysfs, path, "../../../bus/pci");
-	dir->arg = (void *)d;
 }
 
 int sysfs_pci_set_driver(const pci_device_t *dev, const char *name)
@@ -167,8 +181,8 @@ int sysfs_pci_set_driver(const pci_device_t *dev, const char *name)
 	ksnprintf(path, sizeof(path), "bus/pci/drivers/%s", name);
 	if (!pfs_mkdir(&g_sysfs, path))
 		return -ENOMEM;
-	ksnprintf(path, sizeof(path), "bus/pci/drivers/%s/0000:%02x:%02x.%x",
-		  name, dev->bus, dev->device, dev->function);
+	ksnprintf(path, sizeof(path), "bus/pci/drivers/%s/%04x:%02x:%02x.%x",
+		  name, dev->segment, dev->bus, dev->device, dev->function);
 	ksnprintf(target, sizeof(target), "/sys/%s", base);
 	pfs_add_link(&g_sysfs, path, target);
 	ksnprintf(path, sizeof(path), "%s/driver", base);
@@ -219,13 +233,25 @@ int sysfs_add_char_device(const char *name, uint32_t major, uint32_t minor,
 	if (!pfs_mkdir(&g_sysfs, base))
 		return -ENOMEM;
 
-	char *devname = kalloc(64);
-	if (!devname)
-		return -ENOMEM;
+	/* Static nodes are never removed: a device registered again under
+	 * the same name (a hot re-plug) gets the same nodes back, refreshed,
+	 * and keeps its name buffer. */
+	char *devname = NULL;
+	ksnprintf(path, sizeof(path), "%s/uevent", base);
+	struct pfs_node *old = pfs_lookup(&g_sysfs, path);
+	if (old) {
+		if (!old->transient && old->show == chr_show_uevent)
+			devname = (char *)old->arg;
+		pfs_node_put(old);
+	}
+	if (!devname) {
+		devname = kalloc(64);
+		if (!devname)
+			return -ENOMEM;
+	}
 	ksnprintf(devname, 64, "%s", name);
 	uint64_t devnum = ((uint64_t)major << 20) | minor;
 
-	ksnprintf(path, sizeof(path), "%s/uevent", base);
 	pfs_add_file(&g_sysfs, path, chr_show_uevent, devname, devnum);
 	ksnprintf(path, sizeof(path), "%s/dev", base);
 	pfs_add_file(&g_sysfs, path, chr_show_dev, devname, devnum);
@@ -276,6 +302,112 @@ int sysfs_add_class_device(const char *class, const char *name,
 	return 0;
 }
 
+/* ---- /sys/class/hwmon ---- */
+
+/*
+ * The class directory of hardware monitors: hwmon<N> for every monitor a
+ * driver registered, each a link to the monitor's own directory (which
+ * the driver serves, e.g. under its device).  N comes from one number
+ * space for all drivers, lowest free first, as tools expect.  Dynamic:
+ * a monitor that goes away disappears from the listing at once.
+ */
+#define SYSFS_HWMON_MAX 128
+#define SYSFS_HWMON_TARGET 112
+static char g_hwmon_target[SYSFS_HWMON_MAX][SYSFS_HWMON_TARGET];
+static uint8_t g_hwmon_used[SYSFS_HWMON_MAX];
+static spinlock_t g_hwmon_lock = SPINLOCK_INIT("sysfs_hwmon");
+
+int sysfs_hwmon_register(const char *parent)
+{
+	uint64_t fl;
+	int id = -ENOSPC;
+
+	/* Room for "/hwmon<NNN>" after the parent. */
+	if (!parent || parent[0] != '/' ||
+	    kstrlen(parent) + 10 >= SYSFS_HWMON_TARGET)
+		return -EINVAL;
+	spin_lock_irqsave(&g_hwmon_lock, &fl);
+	for (int i = 0; i < SYSFS_HWMON_MAX; i++) {
+		if (g_hwmon_used[i])
+			continue;
+		ksnprintf(g_hwmon_target[i], SYSFS_HWMON_TARGET, "%s/hwmon%d",
+			  parent, i);
+		g_hwmon_used[i] = 1;
+		id = i;
+		break;
+	}
+	spin_unlock_irqrestore(&g_hwmon_lock, fl);
+	return id;
+}
+
+void sysfs_hwmon_unregister(int id)
+{
+	uint64_t fl;
+
+	if (id < 0 || id >= SYSFS_HWMON_MAX)
+		return;
+	spin_lock_irqsave(&g_hwmon_lock, &fl);
+	WARN_ON(!g_hwmon_used[id]);
+	g_hwmon_used[id] = 0;
+	g_hwmon_target[id][0] = 0;
+	spin_unlock_irqrestore(&g_hwmon_lock, fl);
+}
+
+static int sysfs_hwmon_list(struct pfs_node *dir, unsigned *cursor,
+			    char *name, long cap, int *type)
+{
+	uint64_t fl;
+	int found = 0;
+
+	(void)dir;
+	spin_lock_irqsave(&g_hwmon_lock, &fl);
+	for (unsigned i = *cursor; i < SYSFS_HWMON_MAX; i++) {
+		if (!g_hwmon_used[i])
+			continue;
+		ksnprintf(name, (size_t)cap, "hwmon%u", i);
+		*type = DT_LNK;
+		*cursor = i + 1;
+		found = 1;
+		break;
+	}
+	spin_unlock_irqrestore(&g_hwmon_lock, fl);
+	return found;
+}
+
+static struct pfs_node *sysfs_hwmon_lookup(struct pfs_node *dir,
+					   const char *name)
+{
+	char target[SYSFS_HWMON_TARGET];
+	struct pfs_node *n;
+	unsigned id = 0;
+	const char *p;
+	uint64_t fl;
+
+	if (kstrncmp(name, "hwmon", 5) != 0)
+		return NULL;
+	p = name + 5;
+	if (*p < '0' || *p > '9' || (*p == '0' && p[1]))
+		return NULL;
+	while (*p >= '0' && *p <= '9') {
+		id = id * 10 + (unsigned)(*p++ - '0');
+		if (id >= SYSFS_HWMON_MAX)
+			return NULL;
+	}
+	if (*p)
+		return NULL;
+	target[0] = 0;
+	spin_lock_irqsave(&g_hwmon_lock, &fl);
+	if (g_hwmon_used[id])
+		ksnprintf(target, sizeof(target), "%s", g_hwmon_target[id]);
+	spin_unlock_irqrestore(&g_hwmon_lock, fl);
+	if (!target[0])
+		return NULL;
+	n = pfs_node_new(dir->fs, dir, name, PFS_LINK);
+	if (n)
+		ksnprintf(n->link, sizeof(n->link), "%s", target);
+	return n;
+}
+
 struct pfs_node *sysfs_add_attr(const char *base, const char *name,
 				pfs_show_t show, pfs_store_t store, void *arg,
 				uint64_t arg2)
@@ -298,9 +430,23 @@ void sysfs_init(void)
 	const pci_device_t *devs = pci_get_devices(&count);
 
 	pfs_init(&g_sysfs, "/sys");
-	pfs_mkdir(&g_sysfs, "bus/pci/devices");
+	__atomic_store_n(&g_sysfs_pci_dir, pfs_mkdir(&g_sysfs, "bus/pci/devices"),
+			 __ATOMIC_RELEASE);
+	/* Physical slots: none are registered (there is no hot-plug slot
+	 * driver), but the directory is part of the PCI bus layout and
+	 * tools list it to name a device's slot. */
+	pfs_mkdir(&g_sysfs, "bus/pci/slots");
 	pfs_mkdir(&g_sysfs, "dev/char");
 	pfs_mkdir(&g_sysfs, "class");
+	{
+		/* dynamic from the moment it exists */
+		struct pfs_node hw;
+
+		mm_memset(&hw, 0, sizeof(hw));
+		hw.list = sysfs_hwmon_list;
+		hw.lookup = sysfs_hwmon_lookup;
+		pfs_add_node(&g_sysfs, "class/hwmon", PFS_DIR, &hw);
+	}
 	pfs_mkdir(&g_sysfs, "devices/virtual");
 	for (int i = 0; i < count; i++)
 		sysfs_add_pci(&devs[i]);

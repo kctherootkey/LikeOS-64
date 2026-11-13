@@ -1,0 +1,20 @@
+getsectsize.c defines BLKSSZGET and BLKPBSZGET itself, but only when _IO is
+already defined, and it gets <sys/ioctl.h> (and with it _IO) only together
+with <linux/fd.h>.  The libc has no floppy header, so without this the
+logical and physical sector size queries compiled to "unknown" and mke2fs
+took every device for a 512-byte one -- wrong on 4096-byte NVMe namespaces.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/lib/ext2fs/getsectsize.c	2026-03-06 18:17:36.000000000 +0100
++++ b/lib/ext2fs/getsectsize.c	2026-11-11 15:04:00.156924428 +0100
+@@ -33,6 +33,9 @@
+ #include <sys/ioctl.h>
+ #include <linux/fd.h>
+ #endif
++#if defined(__LIKEOS__) && defined(HAVE_SYS_IOCTL_H)
++#include <sys/ioctl.h>	/* _IO, for BLKSSZGET and BLKPBSZGET below */
++#endif
+ 
+ #if defined(__linux__) && defined(_IO)
+ #if !defined(BLKSSZGET)

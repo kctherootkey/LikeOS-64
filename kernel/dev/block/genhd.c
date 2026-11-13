@@ -43,6 +43,7 @@
 #include <kernel/ke/timer.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
+#include <kernel/ke/ida.h>
 #include <kernel/uapi/bug.h>
 
 struct blk_mutex g_disk_registry_mutex = BLK_MUTEX_INIT("disk_registry");
@@ -51,8 +52,14 @@ struct blk_mutex g_disk_registry_mutex = BLK_MUTEX_INIT("disk_registry");
  * that is allocated but not yet added.  Registry mutex. */
 static struct gendisk *g_sd_disks[DISK_MAX_DISKS];
 static struct gendisk *g_sr_disks[DISK_MAX_SR];
-/* Extended partition minors in use (BLK_EXT_MAJOR).  Registry mutex. */
-static uint64_t g_ext_minors[BLK_EXT_MINORS / 64];
+/* Minors of the extended major (BLK_EXT_MAJOR): every disk of a named
+ * kind and its partitions, and sd partitions numbered 16 and above, take
+ * the lowest free one.  Its own lock (any context that may allocate). */
+static DEFINE_IDA(g_blk_ext_ida);
+/* Disks of named kinds (BLK_DISK_NVME), in index order, and their
+ * indexes (the sysfs walk keys).  Registry mutex. */
+static struct gendisk *g_named_disks;
+static DEFINE_IDA(g_named_index_ida);
 /* The disk sequence counter. */
 static uint64_t g_diskseq;
 /* Disks currently added (sd + sr). */
@@ -151,6 +158,15 @@ static int genhd_disk_listed(const struct gendisk *d)
 	return d && (d->flags & GENHD_FL_UP) && !(d->flags & GENHD_FL_DEAD);
 }
 
+/* The first listed named disk at or after `d' in the named list. */
+static struct gendisk *genhd_named_from(struct gendisk *d)
+{
+	for (; d; d = d->named_next)
+		if (genhd_disk_listed(d))
+			return d;
+	return NULL;
+}
+
 struct gendisk *genhd_first_locked(void)
 {
 	for (int i = 0; i < DISK_MAX_DISKS; i++)
@@ -159,7 +175,7 @@ struct gendisk *genhd_first_locked(void)
 	for (int i = 0; i < DISK_MAX_SR; i++)
 		if (genhd_disk_listed(g_sr_disks[i]))
 			return g_sr_disks[i];
-	return NULL;
+	return genhd_named_from(g_named_disks);
 }
 
 struct gendisk *genhd_next_locked(struct gendisk *disk)
@@ -168,6 +184,8 @@ struct gendisk *genhd_next_locked(struct gendisk *disk)
 
 	if (!disk)
 		return NULL;
+	if (disk->kind == BLK_DISK_NVME)
+		return genhd_named_from(disk->named_next);
 	if (disk->kind == BLK_DISK_SD) {
 		for (i = disk->index + 1; i < DISK_MAX_DISKS; i++)
 			if (genhd_disk_listed(g_sd_disks[i]))
@@ -179,7 +197,7 @@ struct gendisk *genhd_next_locked(struct gendisk *disk)
 	for (; i < DISK_MAX_SR; i++)
 		if (genhd_disk_listed(g_sr_disks[i]))
 			return g_sr_disks[i];
-	return NULL;
+	return genhd_named_from(g_named_disks);
 }
 
 int genhd_disk_alive_locked(const struct gendisk *disk)
@@ -250,24 +268,37 @@ block_device_t *genhd_find_devt_locked(uint32_t major, uint32_t minor)
  * Extended minors and the sequence counter
  * ========================================================================== */
 
+int blk_ext_devt_alloc(uint32_t *minor)
+{
+	int m;
+
+	if (!minor)
+		return -EINVAL;
+	m = ida_alloc_range(&g_blk_ext_ida, 0, KDEV_MINOR_MAX);
+	if (m < 0)
+		return m == -ENOMEM ? -ENOMEM : -ENOSPC;
+	*minor = (uint32_t)m;
+	return 0;
+}
+
+void blk_ext_devt_free(uint32_t minor)
+{
+	if (WARN_ON(minor > KDEV_MINOR_MAX))
+		return;
+	WARN_ON(!ida_is_allocated(&g_blk_ext_ida, minor));
+	ida_free(&g_blk_ext_ida, minor);
+}
+
+/* The partition code's names for the same allocator (sd partitions >= 16
+ * and every partition of a named disk). */
 int genhd_ext_minor_alloc_locked(uint32_t *minor)
 {
-	for (uint32_t i = 0; i < BLK_EXT_MINORS; i++) {
-		if (!(g_ext_minors[i / 64] & (1ULL << (i % 64)))) {
-			g_ext_minors[i / 64] |= 1ULL << (i % 64);
-			*minor = i;
-			return 0;
-		}
-	}
-	return -ENOSPC;
+	return blk_ext_devt_alloc(minor);
 }
 
 void genhd_ext_minor_free_locked(uint32_t minor)
 {
-	if (minor >= BLK_EXT_MINORS)
-		return;
-	WARN_ON(!(g_ext_minors[minor / 64] & (1ULL << (minor % 64))));
-	g_ext_minors[minor / 64] &= ~(1ULL << (minor % 64));
+	blk_ext_devt_free(minor);
 }
 
 uint64_t genhd_next_diskseq(void)
@@ -554,6 +585,23 @@ void disk_get(struct gendisk *disk)
 	refcount_inc(&disk->refcount);
 }
 
+/* Take a named disk off the named list and give its index back.
+ * Registry mutex held. */
+static void genhd_named_unlink_locked(struct gendisk *disk)
+{
+	struct gendisk **pp;
+
+	for (pp = &g_named_disks; *pp && *pp != disk; pp = &(*pp)->named_next)
+		;
+	if (*pp) {
+		*pp = disk->named_next;
+		disk->named_next = NULL;
+		if (disk->index >= 0)
+			ida_free(&g_named_index_ida, (unsigned int)disk->index);
+		disk->index = -1;
+	}
+}
+
 static void disk_release(struct gendisk *disk)
 {
 	int held;
@@ -573,18 +621,28 @@ static void disk_release(struct gendisk *disk)
 		if (disk->index >= 0 && disk->index < DISK_MAX_DISKS &&
 		    g_sd_disks[disk->index] == disk)
 			g_sd_disks[disk->index] = NULL;
-	} else {
+	} else if (disk->kind == BLK_DISK_SR) {
 		if (disk->index >= 0 && disk->index < DISK_MAX_SR &&
 		    g_sr_disks[disk->index] == disk)
 			g_sr_disks[disk->index] = NULL;
+	} else {
+		genhd_named_unlink_locked(disk);
 	}
 	if (!held)
 		blk_mutex_unlock(&g_disk_registry_mutex);
+	if (disk->ops && disk->ops->disk_release)
+		disk->ops->disk_release(disk);
 	if (disk->ops && disk->ops->free_disk)
 		disk->ops->free_disk(disk);
 	if (disk->queue) {
-		blk_queue_free(disk->queue);
+		/* The disk's reference; a blk_get_queue() holder keeps the
+		 * memory a little longer. */
+		blk_put_queue(disk->queue);
 		disk->queue = NULL;
+	}
+	if (disk->ext_minor_dyn) {
+		blk_ext_devt_free(disk->first_minor);
+		disk->ext_minor_dyn = 0;
 	}
 	disk->magic = 0;
 	kfree(disk);
@@ -963,6 +1021,147 @@ struct gendisk *disk_alloc(enum blk_disk_kind kind, const struct blk_ops *ops,
 	return disk;
 }
 
+/* Is `name' taken by any disk (allocated or added) or partition?
+ * Registry mutex held. */
+static int genhd_name_taken_locked(const char *name)
+{
+	for (int i = 0; i < DISK_MAX_DISKS; i++)
+		if (g_sd_disks[i] && kstrcmp(g_sd_disks[i]->disk_name, name) == 0)
+			return 1;
+	for (int i = 0; i < DISK_MAX_SR; i++)
+		if (g_sr_disks[i] && kstrcmp(g_sr_disks[i]->disk_name, name) == 0)
+			return 1;
+	for (struct gendisk *d = g_named_disks; d; d = d->named_next)
+		if (kstrcmp(d->disk_name, name) == 0)
+			return 1;
+	return genhd_find_name_locked(name) != NULL;
+}
+
+struct gendisk *disk_alloc_named(enum blk_disk_kind kind,
+				 const struct blk_ops *ops, void *private_data,
+				 const char *name)
+{
+	struct gendisk *disk, **pp;
+	uint32_t minor;
+	size_t len;
+	int idx;
+
+	if (kind != BLK_DISK_NVME || !ops || !name)
+		return NULL;
+	len = kstrlen(name);
+	if (!len || len >= DISK_NAME_LEN) {
+		kprintf(BLK_LOG_PREFIX "disk_alloc_named: bad name \"%s\"\n", name);
+		return NULL;
+	}
+	blk_might_sleep();
+	genhd_reap_deferred();
+	disk = (struct gendisk *)kcalloc(1, sizeof(*disk));
+	if (!disk)
+		return NULL;
+	if (blk_ext_devt_alloc(&minor)) {
+		kprintf(BLK_LOG_PREFIX "%s: no device number left\n", name);
+		kfree(disk);
+		return NULL;
+	}
+	disk->magic = GENDISK_MAGIC;
+	disk->kind = kind;
+	disk->ops = ops;
+	disk->private_data = private_data;
+	refcount_set(&disk->refcount, 1); /* the registry's */
+	genhd_default_limits(&disk->limits);
+	/* A named disk is solid state until its driver says otherwise. */
+	disk->limits.rotational = 0;
+	disk->host_no = -1;
+	disk->scsi_type = TYPE_DISK;
+	ksnprintf(disk->vendor, sizeof(disk->vendor), "NVMe    ");
+	ksnprintf(disk->bus, sizeof(disk->bus), "nvme");
+	disk->bdev.registry_index = -1;
+	kstrncpy(disk->disk_name, name, sizeof(disk->disk_name) - 1);
+	disk->disk_name[sizeof(disk->disk_name) - 1] = 0;
+	disk->major = BLK_EXT_MAJOR;
+	disk->first_minor = minor;
+	disk->minors = 1;
+	disk->ext_minor_dyn = 1;
+
+	blk_mutex_lock(&g_disk_registry_mutex);
+	if (genhd_name_taken_locked(disk->disk_name)) {
+		blk_mutex_unlock(&g_disk_registry_mutex);
+		kprintf(BLK_LOG_PREFIX "%s: name in use\n", disk->disk_name);
+		blk_ext_devt_free(minor);
+		kfree(disk);
+		return NULL;
+	}
+	idx = ida_alloc(&g_named_index_ida);
+	if (idx < 0) {
+		blk_mutex_unlock(&g_disk_registry_mutex);
+		blk_ext_devt_free(minor);
+		kfree(disk);
+		return NULL;
+	}
+	disk->index = idx;
+	/* In index order: the sysfs walks key on it. */
+	for (pp = &g_named_disks; *pp && (*pp)->index < idx;
+	     pp = &(*pp)->named_next)
+		;
+	disk->named_next = *pp;
+	*pp = disk;
+	blk_mutex_unlock(&g_disk_registry_mutex);
+	return disk;
+}
+
+int disk_set_name(struct gendisk *disk, const char *name)
+{
+	size_t len;
+	int rc = 0;
+
+	if (!disk || disk->magic != GENDISK_MAGIC || !name ||
+	    disk->kind != BLK_DISK_NVME)
+		return -EINVAL;
+	len = kstrlen(name);
+	if (!len || len >= DISK_NAME_LEN)
+		return -EINVAL;
+	blk_might_sleep();
+	blk_mutex_lock(&g_disk_registry_mutex);
+	if (disk->flags & GENHD_FL_UP) {
+		rc = -EBUSY;
+	} else if (kstrcmp(disk->disk_name, name) != 0) {
+		/* The disk's own (old) name is on the list too: it cannot
+		 * collide with the new one, which differs from it. */
+		if (genhd_name_taken_locked(name)) {
+			rc = -EEXIST;
+		} else {
+			kstrncpy(disk->disk_name, name,
+				 sizeof(disk->disk_name) - 1);
+			disk->disk_name[sizeof(disk->disk_name) - 1] = 0;
+		}
+	}
+	blk_mutex_unlock(&g_disk_registry_mutex);
+	return rc;
+}
+
+int set_capacity_and_notify(struct gendisk *disk, uint64_t sectors)
+{
+	uint64_t old;
+	int rc;
+
+	if (!disk || disk->magic != GENDISK_MAGIC)
+		return -EINVAL;
+	blk_might_sleep();
+	blk_mutex_lock(&g_disk_registry_mutex);
+	old = disk->capacity;
+	rc = disk_set_capacity_locked(disk, sectors);
+	blk_mutex_unlock(&g_disk_registry_mutex);
+	/* The change event of the established interface (RESIZE=1): the new
+	 * diskseq tells userland, and the log says it -- only for a live disk
+	 * whose size really changed, never for the first size. */
+	if (!rc && old != sectors && (disk->flags & GENHD_FL_UP) && old &&
+	    sectors)
+		kprintf(BLK_LOG_PREFIX "%s: detected capacity change from %llu to %llu\n",
+			disk->disk_name, (unsigned long long)old,
+			(unsigned long long)sectors);
+	return rc;
+}
+
 /* Fill the whole-disk block device from the disk and its queue. */
 static void genhd_setup_bdev(struct gendisk *disk)
 {
@@ -1105,7 +1304,12 @@ int disk_add(struct gendisk *disk)
 	blk_might_sleep();
 	if (disk->flags & (GENHD_FL_UP | GENHD_FL_DEAD))
 		return -EBUSY;
-	if (!disk->capacity && !(disk->flags & GENHD_FL_REMOVABLE)) {
+	/* An NVMe disk may be empty: a namespace in a format the host
+	 * cannot do block I/O on stays registered with capacity 0 (its
+	 * pass-through node still works) and grows on a revalidation.  The
+	 * partition and identity probes below skip an empty disk. */
+	if (!disk->capacity && !(disk->flags & GENHD_FL_REMOVABLE) &&
+	    disk->kind != BLK_DISK_NVME) {
 		kprintf(BLK_LOG_PREFIX "%s: refusing a disk of capacity 0\n",
 			disk->disk_name);
 		return -EINVAL;
@@ -1113,9 +1317,17 @@ int disk_add(struct gendisk *disk)
 	if (disk->kind == BLK_DISK_SR)
 		disk->flags |= GENHD_FL_NO_PART_SCAN;
 
-	disk->queue = blk_queue_create(disk, &disk->limits);
-	if (!disk->queue)
-		return -ENOMEM;
+	if (disk->tag_set) {
+		/* A multi-queue disk: its queue exists since
+		 * blk_mq_alloc_disk(), with the limits the driver gave there
+		 * or committed since (queue_limits_commit_update). */
+		if (!disk->queue)
+			return -EINVAL;
+	} else {
+		disk->queue = blk_queue_create(disk, &disk->limits);
+		if (!disk->queue)
+			return -ENOMEM;
+	}
 	/* The driver's limits after normalisation are what everybody sees. */
 	disk->limits = disk->queue->limits;
 	disk->diskseq = genhd_next_diskseq();
@@ -1127,7 +1339,8 @@ int disk_add(struct gendisk *disk)
 		blk_mutex_unlock(&g_disk_registry_mutex);
 		kprintf(BLK_LOG_PREFIX "%s: could not be registered\n",
 			disk->disk_name);
-		blk_queue_destroy(disk->queue);
+		if (!disk->tag_set)
+			blk_queue_destroy(disk->queue);
 		return -ENOSPC;
 	}
 	disk->flags |= GENHD_FL_UP;
@@ -1212,9 +1425,11 @@ void disk_del(struct gendisk *disk)
 	if (disk->kind == BLK_DISK_SD) {
 		if (g_sd_disks[disk->index] == disk)
 			g_sd_disks[disk->index] = NULL;
-	} else {
+	} else if (disk->kind == BLK_DISK_SR) {
 		if (g_sr_disks[disk->index] == disk)
 			g_sr_disks[disk->index] = NULL;
+	} else {
+		genhd_named_unlink_locked(disk);
 	}
 	disk->flags &= ~GENHD_FL_UP;
 	__atomic_sub_fetch(&g_disks_up, 1, __ATOMIC_RELAXED);

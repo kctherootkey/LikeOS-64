@@ -189,6 +189,14 @@ typedef struct {
 	 * shares its handle with the caller's open descriptor -- see
 	 * vfs_pread(). */
 	long (*read_at)(vfs_file_t *f, void *buf, long bytes, long off);
+	/* Write at an explicit offset without touching the handle's position
+	 * (pwrite).  The position is the call's own: a concurrent read(),
+	 * write() or lseek() on the same description neither moves it nor is
+	 * moved by it.  Bytes written or a negative status.
+	 *
+	 * Optional: vfs_pwrite() falls back to seek/write/seek-back under the
+	 * handle's page-in flag for a filesystem without it. */
+	long (*write_at)(vfs_file_t *f, const void *buf, long bytes, long off);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -271,6 +279,10 @@ long vfs_read(vfs_file_t *f, void *buf, long bytes);
  * under the handle's page-in flag when it cannot. */
 long vfs_pread(vfs_file_t *f, void *buf, long bytes, long off);
 long vfs_write(vfs_file_t *f, const void *buf, long bytes);
+/* Write `bytes' at `off' without moving the handle's position (pwrite):
+ * the filesystem's ->write_at, else seek/write/seek-back under the handle's
+ * page-in flag.  Bytes written or a negative status. */
+long vfs_pwrite(vfs_file_t *f, const void *buf, long bytes, long off);
 long vfs_seek(vfs_file_t *f, long offset, int whence);
 long vfs_readdir(vfs_file_t *f, void *buf, long bytes);
 int vfs_truncate(vfs_file_t *f, unsigned long size);

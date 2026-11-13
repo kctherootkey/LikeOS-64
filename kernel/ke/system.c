@@ -5,6 +5,7 @@
 /* The storage contract headers first: they must come before any direct
  * include of <kernel/ke/syscall.h>. */
 #include <kernel/dev/ata/ahci.h>
+#include <kernel/dev/nvme/nvme.h>
 #include <kernel/dev/block/blkdev.h>
 #include <kernel/ke/sched.h>
 #include <kernel/hal/serial.h>
@@ -101,7 +102,8 @@ static int g_cad_enabled = 0; // Ctrl-Alt-Del behaviour
 /* Bring the disks down before the machine goes: drain every disk's queue,
  * flush its write cache and -- for power-off and halt -- park it with
  * STANDBY IMMEDIATE (blk_shutdown_all), then stop the AHCI controllers
- * (ahci_shutdown_all).  Exactly once per boot: sys_reboot() does it while
+ * (ahci_shutdown_all) and shut the NVMe controllers down with CC.SHN
+ * (nvme_shutdown_all).  Exactly once per boot: sys_reboot() does it while
  * interrupts and the scheduler still work; the ACPI power-off path calls
  * it as well for any other way of getting there, and then finds it done.
  * `mode' is an enum blk_shutdown_mode. */
@@ -124,6 +126,7 @@ void system_storage_shutdown(int mode)
 		return;
 	blk_shutdown_all((enum blk_shutdown_mode)mode);
 	ahci_shutdown_all();
+	nvme_shutdown_all();
 }
 
 int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
@@ -331,7 +334,9 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 {
 	if (max_count == 0)
 		return 0;
-	if (!validate_user_ptr(buf_ptr, max_count * sizeof(procinfo_t)))
+	/* The byte count must not wrap before it is checked. */
+	if (max_count > (uint64_t)-1 / sizeof(procinfo_t) ||
+	    !validate_user_ptr(buf_ptr, max_count * sizeof(procinfo_t)))
 		return -EFAULT;
 
 	// Allocate a kernel-side buffer (limit to prevent DoS)

@@ -8,6 +8,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/pseudofs.h>
+#include <kernel/fs/chrdev.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/file.h>
@@ -838,21 +839,6 @@ static long show_mountinfo(struct pfs_node *n, char *buf, long cap)
 	return pfs_printf(buf, cap, p, "4 1 0:21 / /proc ro,nosuid,nodev,noexec shared:4 - proc proc ro\n");
 }
 
-/* /proc/devices: the majors in use, character then block, the table the
- * disk tools (hdparm) read to tell disks from other devices. */
-static long show_devices(struct pfs_node *n, char *buf, long cap)
-{
-	(void)n;
-	return pfs_printf(buf, cap, 0,
-			  "Character devices:\n"
-			  "  1 mem\n  4 /dev/vc/0\n  4 tty\n  5 /dev/tty\n"
-			  "  5 /dev/console\n  5 /dev/ptmx\n 13 input\n 14 sound\n"
-			  " 29 fb\n136 pts\n226 drm\n"
-			  "\nBlock devices:\n"
-			  "  8 sd\n 11 sr\n 65 sd\n 66 sd\n 67 sd\n 68 sd\n"
-			  " 69 sd\n 70 sd\n 71 sd\n254 blkext\n");
-}
-
 void procfs_init(void)
 {
 	pfs_init(&g_procfs, "/proc");
@@ -866,6 +852,7 @@ void procfs_init(void)
 	/* The block layer's tables (kernel/dev/block/blk_sysfs.c). */
 	pfs_add_file(&g_procfs, "partitions", blk_proc_partitions_show, NULL, 0);
 	pfs_add_file(&g_procfs, "diskstats", blk_proc_diskstats_show, NULL, 0);
-	pfs_add_file(&g_procfs, "devices", show_devices, NULL, 0);
+	/* The major registry (kernel/fs/chrdev.c): built-in and dynamic. */
+	pfs_add_file(&g_procfs, "devices", chrdev_proc_devices_show, NULL, 0);
 	vfs_register_mount("/proc", pfs_ops(&g_procfs));
 }

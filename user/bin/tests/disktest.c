@@ -1,8 +1,9 @@
 /*
  * disktest -- block device stress and data-integrity tester
  *
- * Drives one or more block devices (SATA disks behind the AHCI driver, USB
- * disks, their partitions) with sustained sequential and random reads and
+ * Drives one or more block devices (SATA disks behind the AHCI driver, NVMe
+ * namespaces, USB disks, their partitions) with sustained sequential and
+ * random reads and
  * writes from many threads at once, and proves afterwards that every block
  * holds exactly what was last written to it.
  *
@@ -21,7 +22,11 @@
  * HOW IT LOADS THE DEVICE.  N threads per target (--threads) issue
  * synchronous pread/pwrite calls, so the device sees up to N outstanding
  * requests: with N >= the NCQ depth (/sys/block/<disk>/device/queue_depth,
- * 31 or 32 on SATA) the drive's command queue is saturated.  Several targets
+ * 31 or 32 on SATA) the drive's command queue is saturated.  A multi-queue
+ * device (an NVMe namespace: one hardware queue per CPU or group of CPUs,
+ * /sys/block/<disk>/mq/<n>) gets 32 threads per hardware queue by default
+ * (at most 128), spread round-robin over the CPUs (--affinity), so every
+ * submission queue of the controller carries load at once.  Several targets
  * run concurrently, each with its own threads, which loads several ports of
  * one controller (or several controllers) at the same time.  The sequential
  * phases share one block cursor per target, so the device sees an ascending
@@ -54,6 +59,14 @@
  *            the run fails on any data error or any other I/O error.  A
  *            "timeout" round lasts at least one command timeout (30 s).
  *
+ * NVMe TARGETS.  For /dev/nvmeXnY (and its partitions) the controller is
+ * found through sysfs (the namespace's device link, the subsystem's
+ * controller list for a multipath head, the controller directories, the
+ * name), and its model, PCI address, queue count and size are shown with
+ * the block layer's hardware queue count and depth.  The read-only mode
+ * runs on any namespace; the writing modes on a likeos-test* partition of
+ * one, as for SATA.
+ *
  * FAULT INJECTION (--fault SPEC).  For SATA targets the AHCI driver has a
  * per-port fault injection knob, /sys/class/ata_port/ataN/fault_inject:
  *     off | <timeout|dev_error|host_error|link_down> [count] [every=N]
@@ -67,6 +80,21 @@
  * is.  So a fault run passes when the driver recovered (I/O works again after
  * the faults stop) and no data was damaged.
  *
+ * For NVMe namespaces the NVMe driver's fault object of the namespace is
+ * used: /sys/kernel/debug/<ns>/fault_inject/<attr> (or the same under
+ * /sys/kernel/debug/nvme/, or the one-file /sys/block/<ns>/fault_inject),
+ * for a multipath head the object of one of its paths.  SPEC is then a
+ * list of key=value words for it:
+ *     kind=<status|timeout|abort|reset> status=0xSSS dont_retry=<Y|N>
+ *     interval=N times=N space=N probability=PCT     (or "off")
+ * e.g. "kind=status status=0x281 interval=40 times=-1 probability=100".
+ * The fault mode's NVMe rounds: a retried media error, the same with Do
+ * Not Retry, a retried internal error, a controller reset during I/O, a
+ * lost completion that ends in an Abort, and one that runs the whole
+ * timeout ladder (CQ poll, Abort, controller reset).  Before and after
+ * each round the controller state, the object's counters and the
+ * controller's debug summary are printed.
+ *
  * SAFETY.  Every mode except `read' destroys the target's contents.  A
  * target is accepted for writing only when
  *   - it is a partition whose GPT name starts with "likeos-test" (that is,
@@ -78,10 +106,12 @@
  * likeos-test* partition there is.
  *
  * REPORTING.  Every --report seconds one line per target: read and write
- * throughput and IOPS of the interval, average and maximum latency, the
- * highest number of requests seen in flight (/sys/block/<disk>/inflight),
- * errors so far.  At the end a summary per target and overall, with the
- * latency distribution.
+ * throughput and IOPS of the interval, average, 99th percentile and
+ * maximum latency, the requests in flight now and the most seen
+ * (/sys/block/<disk>/inflight, sampled ten times a second), errors so far.
+ * Each phase ends with its overall IOPS, throughput and latency
+ * percentiles; the run ends with a summary per target, with the latency
+ * distribution.
  *
  * EXIT STATUS: 0 everything verified; 1 data integrity failure (the one that
  * matters); 2 unexpected I/O errors but no bad data; 3 usage or setup error.
@@ -102,6 +132,7 @@
 #include <signal.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <sched.h>
 #include <dirent.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -163,6 +194,27 @@ static const char *const g_fault_rounds[] = {
 	"timeout 1",
 };
 
+/* The same for NVMe namespaces, in the grammar of the NVMe fault object
+ * (kind, status in the driver's form SCT << 8 | SC, dont_retry, interval,
+ * times, probability -- probability last, so the object goes live with
+ * the rest in place):
+ *   - a media error (Unrecovered Read Error) on every 40th command that
+ *     the driver retries: no error should reach disktest;
+ *   - the same with Do Not Retry: the errors reach disktest (expected);
+ *   - an Internal Error, retried;
+ *   - a controller reset while I/O is in flight;
+ *   - a lost completion on an I/O queue: timeout, then Abort;
+ *   - a lost completion: the full timeout ladder (CQ poll, Abort, reset).
+ */
+static const char *const g_fault_rounds_nvme[] = {
+	"kind=status status=0x281 dont_retry=N interval=40 times=-1 probability=100",
+	"kind=status status=0x281 dont_retry=Y interval=40 times=-1 probability=100",
+	"kind=status status=0x006 dont_retry=N interval=40 times=-1 probability=100",
+	"kind=reset times=1 probability=100",
+	"kind=abort times=1 probability=100",
+	"kind=timeout times=1 probability=100",
+};
+
 /* The kind of a phase a worker runs. */
 enum dt_phase {
 	PH_SEQ_WRITE,
@@ -211,6 +263,8 @@ static struct {
 	unsigned fault_every_s; /* re-arm interval */
 	int quiet;
 	int stop_on_error;
+	int threads_set; /* -j given */
+	int affinity; /* spread the threads over the CPUs (multi-queue) */
 } opt = {
 	.mode = MODE_FULL,
 	.threads = DT_DEF_THREADS,
@@ -219,6 +273,7 @@ static struct {
 	.report_s = DT_DEF_REPORT,
 	.rwmix = DT_DEF_RWMIX,
 	.loops = 1,
+	.affinity = 1,
 };
 
 /* Set by SIGINT/SIGTERM: finish the current phase early, still verify. */
@@ -619,6 +674,18 @@ static uint64_t lat_percentile_us(const struct dt_stats *s, double pct)
 	return 1ull << DT_LAT_BUCKETS;
 }
 
+/* The same for the operations between two snapshots (`prev' taken first). */
+static uint64_t lat_percentile_delta_us(const struct dt_stats *now,
+					const struct dt_stats *prev, double pct)
+{
+	struct dt_stats d;
+
+	memset(&d, 0, sizeof(d));
+	for (int i = 0; i < DT_LAT_BUCKETS; i++)
+		d.lat_hist[i] = now->lat_hist[i] - prev->lat_hist[i];
+	return lat_percentile_us(&d, pct);
+}
+
 /* ======================================================================
  * Targets
  * ====================================================================== */
@@ -636,6 +703,7 @@ struct dt_worker {
 	 * through __atomic loads, the final summary after join. */
 	struct dt_stats st;
 	int failed; /* stop_on_error tripped */
+	int cpu; /* pinned to this CPU, -1 = anywhere */
 };
 
 struct dt_target {
@@ -645,6 +713,18 @@ struct dt_target {
 	char disk[32]; /* "sdb" */
 	char ata_port[16]; /* "ata3" or "" */
 	int fd;
+	/* NVMe namespaces (is_nvme): the controller serving the namespace,
+	 * found through sysfs, and the namespace's fault injection object. */
+	int is_nvme;
+	char nvme_ctrl[32]; /* "nvme0" */
+	char nvme_model[64];
+	char nvme_addr[32]; /* PCI address of the controller */
+	unsigned nvme_queue_count; /* I/O queues + admin (controller attr) */
+	unsigned nvme_sqsize; /* 0-based queue size (controller attr) */
+	unsigned nr_hw_queues; /* /sys/block/<disk>/mq/<n> directories */
+	unsigned nr_requests; /* /sys/block/<disk>/queue/nr_requests */
+	char fi_path[PATH_MAX]; /* fault_inject directory or file, "" none */
+	int fi_onefile; /* fi_path is the one-file form */
 	int is_partition;
 	uint32_t lsz; /* logical sector size */
 	uint32_t psz; /* physical sector size */
@@ -677,6 +757,9 @@ struct dt_target {
 	unsigned bad_reported;
 	pthread_mutex_t report_lock;
 	struct dt_stats total; /* summed over all phases */
+	unsigned inflight_now; /* last sample */
+	struct dt_stats phase_base; /* at the start of the phase */
+	const char *fault; /* fault spec of the current random phase, or NULL */
 };
 
 static struct dt_target g_t[DT_MAX_TARGETS];
@@ -722,6 +805,32 @@ static void derive_disk_name(struct dt_target *t)
 		t->disk[n - 1] = 0;
 }
 
+/* The name of the whole disk a block device number belongs to, from
+ * sysfs: /sys/dev/block/MAJ:MIN links to ../../block/<disk> or
+ * ../../block/<disk>/<part>.  Works for every disk kind (sd disks with 16
+ * minors each, NVMe namespaces with dynamic minors on the extended
+ * major).  0 when found. */
+static int disk_name_of_devt(dev_t dev, char *out, size_t cap)
+{
+	char p[64], link[PATH_MAX], *b, *slash;
+	ssize_t n;
+
+	snprintf(p, sizeof(p), "/sys/dev/block/%u:%u", major(dev), minor(dev));
+	n = readlink(p, link, sizeof(link) - 1);
+	if (n <= 0)
+		return -1;
+	link[n] = 0;
+	b = strstr(link, "block/");
+	if (!b)
+		return -1;
+	b += 6;
+	slash = strchr(b, '/');
+	if (slash)
+		*slash = 0;
+	snprintf(out, cap, "%s", b);
+	return 0;
+}
+
 /* Is the device (or, for a whole disk, any of its partitions) mounted?  The
  * mount table names devices by their node path; compare by device number so
  * /dev/root-style aliases count too. */
@@ -747,10 +856,12 @@ static int target_mounted(const struct dt_target *t, char *what, size_t cap)
 		if (st.st_rdev == tst.st_rdev) {
 			hit = 1;
 		} else if (!t->is_partition) {
-			/* A partition of this disk?  Same major, minor in
-			 * the disk's range of 16. */
-			if (major(st.st_rdev) == major(tst.st_rdev) &&
-			    minor(st.st_rdev) / 16 == minor(tst.st_rdev) / 16)
+			/* A partition of this disk?  Its sysfs entry lives in
+			 * the disk's directory. */
+			char dn[64];
+
+			if (disk_name_of_devt(st.st_rdev, dn, sizeof(dn)) == 0 &&
+			    strcmp(dn, t->disk) == 0)
 				hit = 1;
 		}
 		if (hit)
@@ -825,6 +936,299 @@ static int add_auto_targets(char paths[][PATH_MAX], int max)
 	}
 	closedir(d);
 	return n;
+}
+
+/* ======================================================================
+ * NVMe namespaces
+ * ====================================================================== */
+
+/* "nvme<digits>" and nothing else: a controller's name. */
+static int is_ctrl_name(const char *s)
+{
+	if (strncmp(s, "nvme", 4) != 0 || !s[4])
+		return 0;
+	for (s += 4; *s; s++)
+		if (*s < '0' || *s > '9')
+			return 0;
+	return 1;
+}
+
+static int ctrl_is_live(const char *ctrl)
+{
+	char p[PATH_MAX], v[32];
+
+	snprintf(p, sizeof(p), "/sys/class/nvme/%s/state", ctrl);
+	return read_text(p, v, sizeof(v)) == 0 && strncmp(v, "live", 4) == 0;
+}
+
+/* The controller that serves namespace disk `disk', from sysfs.  The
+ * namespace's device link names the controller -- or, for a multipath
+ * head, the subsystem, whose directory lists its controllers (the first
+ * live one is taken).  Failing that, the controller whose directory holds
+ * the namespace, and last the naming rule nvme<ctrl>n<ns>.  0 when found. */
+static int nvme_find_ctrl(const char *disk, char *out, size_t cap)
+{
+	char p[PATH_MAX], link[PATH_MAX], first[32] = "";
+	struct dirent *de;
+	unsigned a, b;
+	ssize_t n;
+	DIR *d;
+
+	snprintf(p, sizeof(p), "/sys/block/%s/device", disk);
+	n = readlink(p, link, sizeof(link) - 1);
+	if (n > 0) {
+		const char *base;
+
+		link[n] = 0;
+		base = strrchr(link, '/') ? strrchr(link, '/') + 1 : link;
+		if (is_ctrl_name(base)) {
+			snprintf(out, cap, "%s", base);
+			return 0;
+		}
+		if (strncmp(base, "nvme-subsys", 11) == 0) {
+			snprintf(p, sizeof(p), "/sys/class/nvme-subsystem/%s", base);
+			d = opendir(p);
+			if (d) {
+				while ((de = readdir(d)) != NULL) {
+					if (!is_ctrl_name(de->d_name))
+						continue;
+					if (!first[0])
+						snprintf(first, sizeof(first), "%s",
+							 de->d_name);
+					if (ctrl_is_live(de->d_name)) {
+						snprintf(first, sizeof(first), "%s",
+							 de->d_name);
+						break;
+					}
+				}
+				closedir(d);
+				if (first[0]) {
+					snprintf(out, cap, "%s", first);
+					return 0;
+				}
+			}
+		}
+	}
+	d = opendir("/sys/class/nvme");
+	if (d) {
+		while ((de = readdir(d)) != NULL) {
+			struct stat st;
+
+			if (!is_ctrl_name(de->d_name))
+				continue;
+			snprintf(p, sizeof(p), "/sys/class/nvme/%s/%s", de->d_name,
+				 disk);
+			if (stat(p, &st) == 0) {
+				snprintf(out, cap, "%s", de->d_name);
+				closedir(d);
+				return 0;
+			}
+		}
+		closedir(d);
+	}
+	if (sscanf(disk, "nvme%un%u", &a, &b) == 2) {
+		snprintf(p, sizeof(p), "/sys/class/nvme/nvme%u", a);
+		if (access(p, F_OK) == 0) {
+			snprintf(out, cap, "nvme%u", a);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* The fault injection object of the namespace: the per-attribute directory
+ * (/sys/kernel/debug/<name>/fault_inject/, or under debug/nvme/), else a
+ * one-file attribute (/sys/block/<name>/fault_inject).  <name> is the
+ * namespace disk, or for a multipath head one of its paths (listed in
+ * /sys/block/<head>/multipath/) -- a fault on one path is what makes the
+ * head fail over.  0 when found. */
+static int nvme_find_fault(struct dt_target *t)
+{
+	char names[9][64], p[PATH_MAX];
+	int nn = 0;
+	DIR *d;
+
+	snprintf(names[nn++], sizeof(names[0]), "%s", t->disk);
+	snprintf(p, sizeof(p), "/sys/block/%s/multipath", t->disk);
+	d = opendir(p);
+	if (d) {
+		struct dirent *de;
+
+		while (nn < 9 && (de = readdir(d)) != NULL)
+			if (strncmp(de->d_name, "nvme", 4) == 0)
+				snprintf(names[nn++], sizeof(names[0]), "%s",
+					 de->d_name);
+		closedir(d);
+	}
+	for (int i = 0; i < nn; i++) {
+		static const char *const dirs[] = {
+			"/sys/kernel/debug/%s/fault_inject",
+			"/sys/kernel/debug/nvme/%s/fault_inject",
+		};
+
+		for (unsigned k = 0; k < sizeof(dirs) / sizeof(dirs[0]); k++) {
+			char q[PATH_MAX];
+
+			snprintf(p, sizeof(p), dirs[k], names[i]);
+			snprintf(q, sizeof(q), "%s/probability", p);
+			if (access(q, F_OK) == 0) {
+				snprintf(t->fi_path, sizeof(t->fi_path), "%s", p);
+				t->fi_onefile = 0;
+				return 0;
+			}
+		}
+		snprintf(p, sizeof(p), "/sys/block/%s/fault_inject", names[i]);
+		if (access(p, F_OK) == 0) {
+			snprintf(t->fi_path, sizeof(t->fi_path), "%s", p);
+			t->fi_onefile = 1;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* Is the target on an NVMe namespace?  Then fill in its controller, the
+ * controller's and the queue's properties and the fault object. */
+static void nvme_target_init(struct dt_target *t)
+{
+	char p[PATH_MAX], v[128];
+	DIR *d;
+
+	if (strncmp(t->disk, "nvme", 4) != 0)
+		return;
+	if (nvme_find_ctrl(t->disk, t->nvme_ctrl, sizeof(t->nvme_ctrl)) != 0)
+		return;
+	t->is_nvme = 1;
+
+	snprintf(p, sizeof(p), "/sys/class/nvme/%s/model", t->nvme_ctrl);
+	if (read_text(p, v, sizeof(v)) == 0)
+		snprintf(t->nvme_model, sizeof(t->nvme_model), "%s", v);
+	snprintf(p, sizeof(p), "/sys/class/nvme/%s/address", t->nvme_ctrl);
+	if (read_text(p, v, sizeof(v)) == 0)
+		snprintf(t->nvme_addr, sizeof(t->nvme_addr), "%s", v);
+	snprintf(p, sizeof(p), "/sys/class/nvme/%s/queue_count", t->nvme_ctrl);
+	if (read_text(p, v, sizeof(v)) == 0)
+		t->nvme_queue_count = (unsigned)strtoul(v, NULL, 10);
+	snprintf(p, sizeof(p), "/sys/class/nvme/%s/sqsize", t->nvme_ctrl);
+	if (read_text(p, v, sizeof(v)) == 0)
+		t->nvme_sqsize = (unsigned)strtoul(v, NULL, 10);
+
+	/* The block layer's view: one mq/<n> directory per hardware queue. */
+	snprintf(p, sizeof(p), "/sys/block/%s/mq", t->disk);
+	d = opendir(p);
+	if (d) {
+		struct dirent *de;
+
+		while ((de = readdir(d)) != NULL)
+			if (de->d_name[0] >= '0' && de->d_name[0] <= '9')
+				t->nr_hw_queues++;
+		closedir(d);
+	}
+	nvme_find_fault(t);
+}
+
+/* Write one attribute of a per-attribute fault directory. */
+static int nvme_fi_write_attr(const struct dt_target *t, const char *key,
+			      const char *val)
+{
+	char p[PATH_MAX];
+
+	snprintf(p, sizeof(p), "%s/%s", t->fi_path, key);
+	return write_text(p, val);
+}
+
+/*
+ * Apply an NVMe fault spec: "off" (probability 0), "clear" (the defaults
+ * back) or whitespace/comma separated key=value words with the keys of the
+ * fault object -- kind (status|timeout|abort|reset), probability, interval,
+ * times, space, status, dont_retry, verbose.  The one-file attribute takes
+ * the spec as it is; the per-attribute directory gets each word written to
+ * its file, in the order given (so a spec names probability last: the
+ * object goes live with every other value already in place).
+ */
+static int nvme_fi_apply(const struct dt_target *t, const char *spec)
+{
+	char buf[512], *tok, *save = NULL;
+
+	if (t->fi_onefile)
+		return write_text(t->fi_path, spec);
+	snprintf(buf, sizeof(buf), "%s", spec);
+	for (tok = strtok_r(buf, " \t,", &save); tok;
+	     tok = strtok_r(NULL, " \t,", &save)) {
+		char *eq = strchr(tok, '=');
+
+		if (!strcmp(tok, "off")) {
+			if (nvme_fi_write_attr(t, "probability", "0"))
+				return -1;
+			continue;
+		}
+		if (!strcmp(tok, "clear")) {
+			/* probability first: quiet before anything else moves */
+			static const char *const def[][2] = {
+				{ "probability", "0" }, { "interval", "1" },
+				{ "times", "1" },       { "space", "0" },
+				{ "kind", "status" },   { "dont_retry", "Y" },
+			};
+
+			for (unsigned i = 0; i < sizeof(def) / sizeof(def[0]); i++)
+				if (nvme_fi_write_attr(t, def[i][0], def[i][1]))
+					return -1;
+			continue;
+		}
+		if (!eq || eq == tok) {
+			errno = EINVAL;
+			return -1;
+		}
+		*eq = 0;
+		if (nvme_fi_write_attr(t, tok, eq + 1))
+			return -1;
+	}
+	return 0;
+}
+
+/* The controller state and the fault object's settings and counters. */
+static void print_nvme_fault_state(const struct dt_target *t, const char *label)
+{
+	char p[PATH_MAX], v[2048];
+
+	snprintf(p, sizeof(p), "/sys/class/nvme/%s/state", t->nvme_ctrl);
+	if (read_text(p, v, sizeof(v)) == 0)
+		msg("  %s %s state %s: %s\n", t->name, t->nvme_ctrl, label, v);
+	if (!t->fi_path[0])
+		return;
+	if (t->fi_onefile) {
+		if (read_text(t->fi_path, v, sizeof(v)) == 0)
+			msg("  %s %s %s: %s\n", t->name, t->fi_path, label, v);
+	} else {
+		static const char *const keys[] = {
+			"kind", "probability", "interval", "times", "status",
+			"dont_retry", "count", "injected",
+		};
+		char line[512];
+		size_t used = 0;
+
+		line[0] = 0;
+		for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+			char a[64];
+
+			snprintf(p, sizeof(p), "%s/%s", t->fi_path, keys[i]);
+			if (read_text(p, a, sizeof(a)) != 0)
+				continue;
+			used += (size_t)snprintf(line + used, sizeof(line) - used,
+						 "%s%s=%s", used ? " " : "", keys[i], a);
+			if (used >= sizeof(line))
+				break;
+		}
+		msg("  %s %s %s: %s\n", t->name, t->fi_path, label, line);
+	}
+	/* The controller's debug summary (error and reset counters), when the
+	 * debug tree is there. */
+	snprintf(p, sizeof(p), "/sys/kernel/debug/nvme/%s/info", t->nvme_ctrl);
+	if (read_text(p, v, sizeof(v)) == 0) {
+		msg("  %s %s %s:\n", t->name, p, label);
+		for (char *ln = strtok(v, "\n"); ln; ln = strtok(NULL, "\n"))
+			msg("      %s\n", ln);
+	}
 }
 
 static int target_open(struct dt_target *t, const char *path, int writable)
@@ -914,21 +1318,50 @@ static int target_open(struct dt_target *t, const char *path, int writable)
 			avail = opt.size;
 		t->nblocks = avail / opt.bs;
 	}
-	if (t->nblocks < (uint64_t)opt.threads) {
+
+	snprintf(p, sizeof(p), "/sys/block/%s/device/queue_depth", t->disk);
+	if (read_text(p, val, sizeof(val)) == 0)
+		t->queue_depth = (unsigned)strtoul(val, NULL, 10);
+	snprintf(p, sizeof(p), "/sys/block/%s/queue/nr_requests", t->disk);
+	if (read_text(p, val, sizeof(val)) == 0)
+		t->nr_requests = (unsigned)strtoul(val, NULL, 10);
+
+	/* NVMe: the controller behind the namespace, its queues and the
+	 * fault object.  The command queue depth is the block layer's
+	 * per-hardware-queue request count. */
+	nvme_target_init(t);
+	if (t->is_nvme && !t->queue_depth)
+		t->queue_depth = t->nr_requests ? t->nr_requests :
+				 t->nvme_sqsize ? t->nvme_sqsize + 1 : 0;
+
+	/* Threads: as given, else enough to keep every hardware queue of a
+	 * multi-queue device busy -- 32 per queue (one more than a SATA NCQ
+	 * depth), within 32..DT_MAX_THREADS. */
+	t->nworkers = opt.threads;
+	if (!opt.threads_set && t->nr_hw_queues > 1) {
+		unsigned n = 32u * t->nr_hw_queues;
+
+		t->nworkers = n > DT_MAX_THREADS ? DT_MAX_THREADS : (int)n;
+		/* A small region: no more threads than blocks. */
+		if ((uint64_t)t->nworkers > t->nblocks && t->nblocks >= (uint64_t)opt.threads)
+			t->nworkers = (int)t->nblocks;
+	}
+	if (t->nblocks < (uint64_t)t->nworkers) {
 		fprintf(stderr,
 			"disktest: %s: only %llu blocks of %u bytes -- fewer than threads\n",
 			t->real, (unsigned long long)t->nblocks, opt.bs);
 		return -1;
 	}
 
-	snprintf(p, sizeof(p), "/sys/block/%s/device/queue_depth", t->disk);
-	if (read_text(p, val, sizeof(val)) == 0)
-		t->queue_depth = (unsigned)strtoul(val, NULL, 10);
-
 	/* The ATA port, for fault injection: SCSI_IOCTL_GET_IDLUN reports
-	 * host_no = port number - 1 on a SATA disk. */
+	 * host_no = port number - 1 on a SATA disk.  An NVMe namespace has
+	 * no ATA port: the ioctl answers with the controller instance as
+	 * host (nvme0 -> host 0), which would name ata1, a SATA port that
+	 * is not this disk's.  Its fault injection is the namespace's own
+	 * fault_inject object. */
 	memset(&idlun, 0, sizeof(idlun));
-	if (ioctl(t->fd, SCSI_IOCTL_GET_IDLUN, &idlun) == 0) {
+	if (strncmp(t->disk, "nvme", 4) != 0 &&
+	    ioctl(t->fd, SCSI_IOCTL_GET_IDLUN, &idlun) == 0) {
 		int host = (int)((idlun.dev_id >> 24) & 0xFF);
 
 		snprintf(t->ata_port, sizeof(t->ata_port), "ata%d", host + 1);
@@ -951,9 +1384,22 @@ static void target_describe(const struct dt_target *t)
 	    fmt_bytes(t->nblocks * opt.bs, a, sizeof(a)),
 	    fmt_bytes(t->dev_bytes, b, sizeof(b)), t->disk,
 	    t->ata_port[0] ? ", port " : "", t->ata_port);
-	msg("             logical %u, physical %u, %llu blocks of %u, NCQ depth %u, %d threads\n",
+	if (t->is_nvme) {
+		msg("             NVMe controller %s%s%s%s%s%s, %u I/O queue(s) (sqsize %u), %u hardware queue(s) of depth %u\n",
+		    t->nvme_ctrl, t->nvme_model[0] ? " \"" : "", t->nvme_model,
+		    t->nvme_model[0] ? "\"" : "",
+		    t->nvme_addr[0] ? " at " : "", t->nvme_addr,
+		    t->nvme_queue_count ? t->nvme_queue_count - 1 : 0,
+		    t->nvme_sqsize, t->nr_hw_queues, t->nr_requests);
+		if (t->fi_path[0])
+			msg("             fault injection: %s%s\n", t->fi_path,
+			    t->fi_onefile ? " (one-file)" : "");
+	}
+	msg("             logical %u, physical %u, %llu blocks of %u, queue depth %u, %d threads%s\n",
 	    t->lsz, t->psz, (unsigned long long)t->nblocks, opt.bs,
-	    t->queue_depth, opt.threads);
+	    t->queue_depth, t->nworkers,
+	    t->nworkers > 1 && opt.affinity && t->nr_hw_queues > 1 ?
+		    " spread over the CPUs" : "");
 }
 
 /* ======================================================================
@@ -1154,6 +1600,17 @@ static void *worker_main(void *arg)
 	struct dt_target *t = w->t;
 	uint64_t ops = 0, writes = 0;
 
+	/* Multi-queue devices map each CPU to a hardware queue: threads
+	 * spread over the CPUs put load on every queue, not just on the ones
+	 * of the CPUs the scheduler happens to pick. */
+	if (w->cpu >= 0) {
+		cpu_set_t set;
+
+		CPU_ZERO(&set);
+		CPU_SET(w->cpu, &set);
+		pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	}
+
 	switch (t->phase) {
 	case PH_SEQ_WRITE:
 		for (;;) {
@@ -1299,6 +1756,9 @@ static void target_snapshot(const struct dt_target *t, struct dt_stats *out)
 			__atomic_load_n(&s->fault_errors, __ATOMIC_RELAXED);
 		c.bad_blocks =
 			__atomic_load_n(&s->bad_blocks, __ATOMIC_RELAXED);
+		for (int b = 0; b < DT_LAT_BUCKETS; b++)
+			c.lat_hist[b] = __atomic_load_n(&s->lat_hist[b],
+							__ATOMIC_RELAXED);
 		stats_add(out, &c);
 	}
 }
@@ -1332,11 +1792,12 @@ static void report_line(struct dt_target *t, uint64_t now)
 	dwo = s.wr_ops - t->last.wr_ops;
 	dln = s.lat_n - t->last.lat_n;
 	dls = s.lat_sum_ns - t->last.lat_sum_ns;
-	msg("  [%-8s] %-17s rd %7.1f MB/s %6.0f IOPS | wr %7.1f MB/s %6.0f IOPS | lat avg %6.2f ms max %7.2f ms | inflight max %u | err %llu/%llu bad %llu\n",
+	msg("  [%-8s] %-17s rd %7.1f MB/s %6.0f IOPS | wr %7.1f MB/s %6.0f IOPS | lat avg %6.2f ms p99 %6.2f ms max %7.2f ms | inflight %u max %u | err %llu/%llu bad %llu\n",
 	    t->name, phase_name(t->phase), (double)drb / secs / 1e6,
 	    (double)dro / secs, (double)dwb / secs / 1e6, (double)dwo / secs,
 	    dln ? (double)dls / (double)dln / 1e6 : 0.0,
-	    (double)s.lat_max_ns / 1e6, t->inflight_max,
+	    (double)lat_percentile_delta_us(&s, &t->last, 99.0) / 1e3,
+	    (double)s.lat_max_ns / 1e6, t->inflight_now, t->inflight_max,
 	    (unsigned long long)s.io_errors,
 	    (unsigned long long)s.fault_errors,
 	    (unsigned long long)s.bad_blocks);
@@ -1362,20 +1823,45 @@ static void print_port_file(const struct dt_target *t, const char *file,
 		msg("      %s\n", line);
 }
 
+/* on: 1 arm at the start of the phase, 2 re-arm (the same spec again,
+ * which renews its count), 0 disarm. */
 static int fault_arm(struct dt_target *t, int on)
 {
 	char p[PATH_MAX];
 
+	if (on && !t->fault)
+		return 0;
+	if (t->is_nvme) {
+		int r;
+
+		if (!t->fi_path[0])
+			return -1;
+		/* The first arm starts from the defaults, so nothing of an
+		 * earlier round's spec lingers; a re-arm keeps the counters. */
+		if (on == 1)
+			r = nvme_fi_apply(t, "clear") || nvme_fi_apply(t, t->fault);
+		else if (on)
+			r = nvme_fi_apply(t, t->fault);
+		else
+			r = nvme_fi_apply(t, "off");
+		if (r) {
+			msg("  %s: applying \"%s\" to %s failed: %s\n", t->name,
+			    on ? t->fault : "off", t->fi_path, strerror(errno));
+			return -1;
+		}
+		t->faults_armed = on != 0;
+		return 0;
+	}
 	if (!t->ata_port[0])
 		return -1;
 	snprintf(p, sizeof(p), "/sys/class/ata_port/%s/fault_inject",
 		 t->ata_port);
-	if (write_text(p, on ? opt.fault : "off") != 0) {
+	if (write_text(p, on ? t->fault : "off") != 0) {
 		msg("  %s: writing \"%s\" to %s failed: %s\n", t->name,
-		    on ? opt.fault : "off", p, strerror(errno));
+		    on ? t->fault : "off", p, strerror(errno));
 		return -1;
 	}
-	t->faults_armed = on;
+	t->faults_armed = on != 0;
 	return 0;
 }
 
@@ -1387,7 +1873,12 @@ static void run_phase(enum dt_phase ph, uint64_t duration_ns,
 		      uint64_t ops_per_target)
 {
 	uint64_t start = now_ns(), next_report, next_fault = 0;
-	int fault_phase = (ph == PH_RANDOM && opt.fault);
+	int fault_phase = 0;
+
+	if (ph == PH_RANDOM)
+		for (int i = 0; i < g_nt; i++)
+			if (g_t[i].fault)
+				fault_phase = 1;
 
 	msg("\n== %s ==\n", phase_name(ph));
 	for (int i = 0; i < g_nt; i++) {
@@ -1402,11 +1893,17 @@ static void run_phase(enum dt_phase ph, uint64_t duration_ns,
 					(uint64_t)t->nworkers :
 				0;
 		t->inflight_max = 0;
+		t->inflight_now = 0;
 		target_snapshot(t, &t->last);
+		t->phase_base = t->last;
 		t->last_ns = start;
-		if (fault_phase) {
-			print_port_file(t, "stats", "before");
-			print_port_file(t, "eh", "before");
+		if (fault_phase && t->fault) {
+			if (t->is_nvme) {
+				print_nvme_fault_state(t, "before");
+			} else {
+				print_port_file(t, "stats", "before");
+				print_port_file(t, "eh", "before");
+			}
 			fault_arm(t, 1);
 		}
 	}
@@ -1437,6 +1934,7 @@ static void run_phase(enum dt_phase ph, uint64_t duration_ns,
 			struct dt_target *t = &g_t[i];
 			unsigned inf = sample_inflight(t);
 
+			t->inflight_now = inf;
 			if (inf > t->inflight_max)
 				t->inflight_max = inf;
 			if (t->phase == PH_SEQ_WRITE ||
@@ -1460,7 +1958,7 @@ static void run_phase(enum dt_phase ph, uint64_t duration_ns,
 		}
 		if (next_fault && now >= next_fault) {
 			for (int i = 0; i < g_nt; i++)
-				fault_arm(&g_t[i], 1);
+				fault_arm(&g_t[i], 2);
 			next_fault = now + (uint64_t)opt.fault_every_s *
 						   1000000000ull;
 		}
@@ -1483,19 +1981,43 @@ static void run_phase(enum dt_phase ph, uint64_t duration_ns,
 			struct dt_target *t = &g_t[i];
 			double secs = (double)(now - start) / 1e9;
 
-			if (fault_phase) {
+			if (fault_phase && t->fault) {
 				fault_arm(t, 0);
-				print_port_file(t, "fault_inject", "after");
-				print_port_file(t, "stats", "after");
-				print_port_file(t, "eh", "after");
+				if (t->is_nvme) {
+					print_nvme_fault_state(t, "after");
+				} else {
+					print_port_file(t, "fault_inject", "after");
+					print_port_file(t, "stats", "after");
+					print_port_file(t, "eh", "after");
+				}
 			}
 			/* The rate of the stretch since the last report
 			 * line (unless that line was just printed), then
-			 * the phase's duration. */
+			 * the phase's duration and its overall rate. */
 			if (now - t->last_ns > 200000000ull)
 				report_line(t, now);
-			msg("  [%-8s] %s done in %.1f s\n", t->name,
-			    phase_name(ph), secs);
+			{
+				struct dt_stats e;
+				uint64_t ops, bytes, ln, ls;
+
+				target_snapshot(t, &e);
+				ops = (e.rd_ops + e.wr_ops) -
+				      (t->phase_base.rd_ops + t->phase_base.wr_ops);
+				bytes = (e.rd_bytes + e.wr_bytes) -
+					(t->phase_base.rd_bytes +
+					 t->phase_base.wr_bytes);
+				ln = e.lat_n - t->phase_base.lat_n;
+				ls = e.lat_sum_ns - t->phase_base.lat_sum_ns;
+				msg("  [%-8s] %s done in %.1f s: %.0f IOPS, %.1f MB/s, lat avg %.2f ms p50 %.2f p99 %.2f p99.9 %.2f ms, inflight max %u\n",
+				    t->name, phase_name(ph), secs,
+				    secs > 0 ? (double)ops / secs : 0.0,
+				    secs > 0 ? (double)bytes / secs / 1e6 : 0.0,
+				    ln ? (double)ls / (double)ln / 1e6 : 0.0,
+				    (double)lat_percentile_delta_us(&e, &t->phase_base, 50.0) / 1e3,
+				    (double)lat_percentile_delta_us(&e, &t->phase_base, 99.0) / 1e3,
+				    (double)lat_percentile_delta_us(&e, &t->phase_base, 99.9) / 1e3,
+				    t->inflight_max);
+			}
 		}
 	}
 	/* Make sure the next phase reads the media, not a cache: write back
@@ -1525,7 +2047,7 @@ static void on_signal(int sig)
 
 static void usage(void)
 {
-	printf("usage: disktest [options] TARGET...   (TARGET: /dev/sdXN, or `auto')\n"
+	printf("usage: disktest [options] TARGET...   (TARGET: /dev/sdXN, /dev/nvmeXnYpZ, or `auto')\n"
 	       "\n"
 	       "Stress a block device with concurrent sequential and random I/O and\n"
 	       "verify every block afterwards.  Writing modes DESTROY the target: it must be\n"
@@ -1533,7 +2055,8 @@ static void usage(void)
 	       "\n"
 	       "  -m, --mode MODE        full (default), write, verify, random, read,\n"
 	       "                         quick (1 GiB, ~1 min), fault (error-recovery rounds)\n"
-	       "  -j, --threads N        threads per target (default %d; >= NCQ depth saturates)\n"
+	       "  -j, --threads N        threads per target (default %d, multi-queue: 32 per\n"
+	       "                         hardware queue up to 128; >= queue depth saturates)\n"
 	       "  -b, --bs SIZE          block size (default 64k, up to 16m, multiple of the sector)\n"
 	       "  -o, --offset SIZE      start this far into each target (multiple of --bs)\n"
 	       "  -s, --size SIZE        use only this much of each target\n"
@@ -1545,10 +2068,15 @@ static void usage(void)
 	       "  -F, --flush-every N    fdatasync after every N writes per thread\n"
 	       "  -V, --verify-after-write  read back every random write at once\n"
 	       "  -f, --fault SPEC       arm /sys/class/ata_port/ataN/fault_inject during the\n"
-	       "                         random phase, e.g. \"timeout 3\", \"dev_error every=50 ncq\"\n"
+	       "                         random phase, e.g. \"timeout 3\", \"dev_error every=50 ncq\";\n"
+	       "                         NVMe: the namespace's fault object, e.g.\n"
+	       "                         \"kind=status status=0x281 interval=40 times=-1 probability=100\"\n"
+	       "                         or \"kind=reset times=1 probability=100\"\n"
 	       "  -e, --fault-every SEC  re-arm the fault every SEC seconds\n"
 	       "  -r, --report SEC       report interval (default %d; 0 = only at phase ends)\n"
 	       "  -x, --stop-on-error    stop a target at its first error\n"
+	       "  -A, --affinity on|off  spread the threads of a multi-queue target over the\n"
+	       "                         CPUs (default on)\n"
 	       "  -q, --quiet            do not list expected fault-injection errors\n"
 	       "  -h, --help\n"
 	       "\n"
@@ -1575,6 +2103,7 @@ int main(int argc, char **argv)
 		{ "fault-every", required_argument, NULL, 'e' },
 		{ "report", required_argument, NULL, 'r' },
 		{ "stop-on-error", no_argument, NULL, 'x' },
+		{ "affinity", required_argument, NULL, 'A' },
 		{ "quiet", no_argument, NULL, 'q' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -1587,8 +2116,12 @@ int main(int argc, char **argv)
 	uint64_t t_start;
 	unsigned loop;
 	int rc;
+	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 
-	while ((c = getopt_long(argc, argv, "m:j:b:o:s:t:n:l:w:S:F:Vf:e:r:xqh",
+	if (ncpu > 64)
+		ncpu = 64; /* the width of cpu_set_t here */
+
+	while ((c = getopt_long(argc, argv, "m:j:b:o:s:t:n:l:w:S:F:Vf:e:r:xA:qh",
 				lo, NULL)) != -1) {
 		switch (c) {
 		case 'm':
@@ -1613,6 +2146,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'j':
+			opt.threads_set = 1;
 			opt.threads = atoi(optarg);
 			if (opt.threads < 1 || opt.threads > DT_MAX_THREADS) {
 				fprintf(stderr,
@@ -1676,6 +2210,14 @@ int main(int argc, char **argv)
 			break;
 		case 'x':
 			opt.stop_on_error = 1;
+			break;
+		case 'A':
+			if (!strcmp(optarg, "on"))
+				opt.affinity = 1;
+			else if (!strcmp(optarg, "off"))
+				opt.affinity = 0;
+			else
+				goto bad_arg;
 			break;
 		case 'q':
 			opt.quiet = 1;
@@ -1760,13 +2302,16 @@ int main(int argc, char **argv)
 			free(t->alt);
 			continue;
 		}
-		if (opt.fault && !t->ata_port[0]) {
+		if ((opt.fault || opt.mode == MODE_FAULT) && !t->ata_port[0] &&
+		    !(t->is_nvme && t->fi_path[0])) {
 			fprintf(stderr,
-				"disktest: %s has no AHCI port with a fault_inject knob\n",
+				t->is_nvme ?
+					"disktest: %s: no fault_inject object for the namespace (/sys/kernel/debug/<ns>/fault_inject)\n" :
+					"disktest: %s has no AHCI port with a fault_inject knob\n",
 				t->real);
 			return DT_EXIT_SETUP;
 		}
-		t->nworkers = opt.threads;
+		t->fault = opt.fault;
 		t->w = xcalloc((size_t)t->nworkers, sizeof(struct dt_worker));
 		for (int k = 0; k < t->nworkers; k++) {
 			uint64_t st = ((uint64_t)opt.seed << 20) ^
@@ -1774,6 +2319,9 @@ int main(int argc, char **argv)
 
 			t->w[k].t = t;
 			t->w[k].tid = k;
+			t->w[k].cpu = -1;
+			if (opt.affinity && t->nr_hw_queues > 1 && ncpu > 1)
+				t->w[k].cpu = k % ncpu;
 			t->w[k].buf = xmalloc_aligned(4096, opt.bs);
 			t->w[k].buf2 = xmalloc_aligned(4096, opt.bs);
 			t->w[k].rnd = splitmix64(&st) | 1;
@@ -1800,8 +2348,10 @@ int main(int argc, char **argv)
 			msg("  fault round: \"%s\", %u s of load, re-armed every %u s\n",
 			    opt.fault, opt.time_s, opt.fault_every_s);
 		else
-			msg("  %zu fault rounds of %u s each (re-armed every %u s), a verify after each\n",
+			msg("  %zu fault rounds (SATA) / %zu (NVMe) of %u s each (re-armed every %u s), a verify after each\n",
 			    sizeof(g_fault_rounds) / sizeof(g_fault_rounds[0]),
+			    sizeof(g_fault_rounds_nvme) /
+				    sizeof(g_fault_rounds_nvme[0]),
 			    opt.time_s, opt.fault_every_s);
 	} else if (opt.fault) {
 		msg("  fault injection during the random phase: \"%s\"%s\n",
@@ -1830,14 +2380,25 @@ int main(int argc, char **argv)
 		/* One round per fault kind: random load with the fault
 		 * armed, then a verify of the whole region -- also after
 		 * Ctrl-C, the data has to be checked whatever stopped it. */
-		const char *const *rounds = g_fault_rounds;
-		size_t nrounds = sizeof(g_fault_rounds) /
-				 sizeof(g_fault_rounds[0]);
+		/* The rounds are per target kind: SATA targets go through
+		 * the AHCI knob's list, NVMe namespaces through theirs; a
+		 * target whose list is shorter idles (no fault) in the extra
+		 * rounds.  --fault SPEC is one round for every target. */
+		const size_t n_ahci = sizeof(g_fault_rounds) /
+				      sizeof(g_fault_rounds[0]);
+		const size_t n_nvme = sizeof(g_fault_rounds_nvme) /
+				      sizeof(g_fault_rounds_nvme[0]);
 		const char *given = opt.fault;
+		size_t nrounds = 1;
 
-		if (given) {
-			rounds = &given;
-			nrounds = 1;
+		if (!given) {
+			nrounds = 0;
+			for (int i = 0; i < g_nt; i++) {
+				size_t n = g_t[i].is_nvme ? n_nvme : n_ahci;
+
+				if (n > nrounds)
+					nrounds = n;
+			}
 		}
 		run_phase(PH_SEQ_WRITE, 0, 0);
 		if (!g_interrupted)
@@ -1845,9 +2406,24 @@ int main(int argc, char **argv)
 		for (size_t r = 0; r < nrounds && !g_interrupted; r++) {
 			volatile sig_atomic_t was;
 
-			opt.fault = rounds[r];
-			msg("\n-- fault round %zu of %zu: \"%s\" --\n", r + 1,
-			    nrounds, opt.fault);
+			msg("\n-- fault round %zu of %zu --\n", r + 1, nrounds);
+			for (int i = 0; i < g_nt; i++) {
+				struct dt_target *t = &g_t[i];
+
+				if (given)
+					t->fault = given;
+				else if (t->is_nvme)
+					t->fault = r < n_nvme ?
+							   g_fault_rounds_nvme[r] :
+							   NULL;
+				else
+					t->fault = r < n_ahci ? g_fault_rounds[r] :
+								NULL;
+				msg("  %s: %s%s%s\n", t->name,
+				    t->fault ? "\"" : "",
+				    t->fault ? t->fault : "no fault this round",
+				    t->fault ? "\"" : "");
+			}
 			run_phase(PH_RANDOM,
 				  (uint64_t)opt.time_s * 1000000000ull, 0);
 			was = g_interrupted;
@@ -1855,7 +2431,8 @@ int main(int argc, char **argv)
 			run_phase(PH_SEQ_VERIFY, 0, 0);
 			g_interrupted = was;
 		}
-		opt.fault = given;
+		for (int i = 0; i < g_nt; i++)
+			g_t[i].fault = given;
 		break;
 	}
 	case MODE_FULL:
@@ -1910,11 +2487,15 @@ int main(int argc, char **argv)
 		    (unsigned long long)lat_percentile_us(&s, 99.0),
 		    (unsigned long long)lat_percentile_us(&s, 99.9),
 		    (double)s.lat_max_ns / 1e6);
-		msg("             I/O errors %llu, during fault injection %llu, short transfers %llu, highest inflight %u (queue depth %u)\n",
+		msg("             I/O errors %llu, during fault injection %llu, short transfers %llu, queue depth %u%s\n",
 		    (unsigned long long)s.io_errors,
 		    (unsigned long long)s.fault_errors,
-		    (unsigned long long)s.short_io, t->inflight_max,
-		    t->queue_depth);
+		    (unsigned long long)s.short_io, t->queue_depth,
+		    t->nr_hw_queues > 1 ? " per hardware queue" : "");
+		if (t->is_nvme)
+			msg("             NVMe %s: %u hardware queue(s), %d threads%s\n",
+			    t->nvme_ctrl, t->nr_hw_queues, t->nworkers,
+			    t->w[0].cpu >= 0 ? " spread over the CPUs" : "");
 		if (s.bad_blocks) {
 			msg("             DATA ERRORS: %llu blocks\n",
 			    (unsigned long long)s.bad_blocks);

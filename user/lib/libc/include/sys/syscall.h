@@ -211,6 +211,11 @@
 #define SYS_PWRITE64    418
 #define SYS_FDATASYNC   419
 #define SYS_FALLOCATE   420
+/* Vectored positional I/O with per-call flags (RWF_* in <sys/uio.h>):
+ * (fd, iov, iovcnt, offset, flags); offset -1 = the file position. */
+#define SYS_PREADV2     427
+#define SYS_PWRITEV2    428
+#define SYS_MSYNC       429   /* (addr, length, flags) */
 #define SYS_TKILL       258   /* (tid, sig) signal ONE thread */
 #define SYS_TGKILL      259   /* (tgid, tid, sig) same, group-checked */
 #define SYS_PTRACE      408   /* (request, pid, addr, data) — see sys/ptrace.h */

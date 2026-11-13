@@ -93,6 +93,13 @@ struct winsize {
 #define SIOCDELRT       0x890C
 #define SIOCRTMSG       0x890D
 
+/* The request ranges reserved for socket families and for devices.  Their
+ * meaning belongs to the protocol or driver; programs derive their own
+ * request numbers from these bases (the MCTP tag requests are
+ * SIOCPROTOPRIVATE + 0 and + 1). */
+#define SIOCPROTOPRIVATE 0x89E0
+#define SIOCDEVPRIVATE   0x89F0
+
 /* Variadic, as POSIX specifies and as every other C library declares it.
  *
  * The third argument is whatever the particular request wants -- a pointer to

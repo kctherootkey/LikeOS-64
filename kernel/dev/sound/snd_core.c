@@ -789,9 +789,55 @@ static void snd_pcm_free_one(struct snd_pcm *pcm)
 	kfree(pp);
 }
 
+static void snd_card_destroy(struct snd_card_priv *cp);
+
+/* Opens in flight on the card's /dev nodes: devfs found one of them and
+ * its ->open (snd_node_open) has not returned.  Such an open reads the
+ * node and the card it is embedded in before it can take a reference. */
+static bool snd_card_nodes_busy(struct snd_card *card)
+{
+	return devfs_node_in_use(&card->node_mixer) ||
+	       devfs_node_in_use(&card->node_dsp) ||
+	       devfs_node_in_use(&card->node_audio);
+}
+
+static void snd_card_destroy_work(void *arg)
+{
+	snd_card_destroy(arg);
+}
+
+/* A reference for an open, unless the card is already on its way out
+ * (count at zero): an open in flight never brings a dying card back. */
+static bool snd_card_tryget(struct snd_card_priv *cp)
+{
+	int v = __atomic_load_n(&cp->refs, __ATOMIC_ACQUIRE);
+
+	while (v > 0) {
+		if (__atomic_compare_exchange_n(&cp->refs, &v, v + 1, false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_ACQUIRE))
+			return true;
+	}
+	return false;
+}
+
 static void snd_card_destroy(struct snd_card_priv *cp)
 {
 	struct snd_card *card = &cp->card;
+
+	might_sleep();
+	/* The last reference is gone and no new one can be taken
+	 * (snd_card_tryget), but an open that found a node before it was
+	 * unregistered may still be reading the card: the memory goes only
+	 * once none is left.  Normally ksnd looks again shortly; without it
+	 * (early boot, queue full) this caller waits, which is short -- such
+	 * an open fails at its first check. */
+	while (snd_card_nodes_busy(card)) {
+		if (g_ksnd &&
+		    snd_schedule_work(snd_card_destroy_work, cp, 10) == 0)
+			return;
+		sched_yield_in_kernel();
+	}
 
 	for (int i = 0; i < card->npcm && i < SND_MAX_PCMS; i++) {
 		if (card->pcm[i]) {
@@ -1080,12 +1126,22 @@ static int snd_node_open(struct devfs_node *node, vfs_file_t *file, int flags,
 	if (!card)
 		return -ENODEV;
 	cp = snd_card_priv(card);
-	if (cp->magic != SND_CARD_MAGIC || card->disconnected || !card->registered)
+	/* The handle's card reference, taken first: devfs keeps the node (and
+	 * so the card it is part of) from being freed until this returns, and
+	 * a card whose count already reached zero is not revived. */
+	if (!snd_card_tryget(cp))
 		return -ENODEV;
+	if (cp->magic != SND_CARD_MAGIC || card->disconnected ||
+	    !card->registered) {
+		snd_card_unref(card);
+		return -ENODEV;
+	}
 
 	f = kalloc(sizeof(*f));
-	if (!f)
+	if (!f) {
+		snd_card_unref(card);
 		return -ENOMEM;
+	}
 	mm_memset(f, 0, sizeof(*f));
 	f->magic = SND_FILE_MAGIC;
 	f->card = card;
@@ -1127,6 +1183,7 @@ static int snd_node_open(struct devfs_node *node, vfs_file_t *file, int flags,
 		}
 		if (!pcm) {
 			kfree(f);
+			snd_card_unref(card);
 			return -ENODEV;
 		}
 		f->pcm = pcm;
@@ -1140,6 +1197,7 @@ static int snd_node_open(struct devfs_node *node, vfs_file_t *file, int flags,
 						snd_pcm_release_ss(f, &pcm->sub[e]);
 				f->magic = 0;
 				kfree(f);
+				snd_card_unref(card);
 				return rc;
 			}
 			f->dirs |= 1u << d;
@@ -1150,7 +1208,7 @@ static int snd_node_open(struct devfs_node *node, vfs_file_t *file, int flags,
 		snd_oss_file_init(f);
 	}
 
-	snd_card_ref(card);
+	/* the card reference taken at the top is the handle's */
 	__atomic_fetch_add(&cp->open_files, 1, __ATOMIC_ACQ_REL);
 	device_file_set_priv(file, f);
 	return 0;

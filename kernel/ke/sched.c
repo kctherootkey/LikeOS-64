@@ -41,6 +41,7 @@
 #include <kernel/dev/rand/random.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/dev/usb/usb_msd.h>
+#include <kernel/ke/uaccess_range.h>
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t **old_sp, uint64_t *new_sp);
@@ -437,13 +438,8 @@ static void idle_entry(void *arg);
 // Validate user pointer is in user space
 static inline bool validate_user_ptr(uint64_t ptr, size_t len)
 {
-	if (ptr < 0x10000)
-		return false; // Reject low addresses (NULL deref protection)
-	if (ptr >= 0x7FFFFFFFFFFF)
-		return false; // Beyond user space
-	if (ptr + len < ptr)
-		return false; // Overflow check
-	return true;
+	/* The whole range, overflow-safe (uaccess_range.h). */
+	return user_range_ok(ptr, (uint64_t)len);
 }
 
 static inline int is_idle_task(const task_t *t)
@@ -601,6 +597,8 @@ static void task_close_open_files(task_t *task)
 		for (uint32_t i = 0; i < owner->mmap_capacity; i++) {
 			mmap_region_t *r = &owner->mmap_regions[i];
 			vfs_file_t *f = NULL;
+			/* asked while the record still names its file */
+			bool wb = r->in_use && mm_region_writes_back(r);
 
 			/* Take the reference OUT of the slot, atomically, and
 			 * close only what this thread actually took.
@@ -639,6 +637,12 @@ static void task_close_open_files(task_t *task)
 					__atomic_clear(&f->pagein_busy,
 						       __ATOMIC_RELEASE);
 				}
+				/* A shared file mapping: what the process
+				 * stored into it goes to the file now, while
+				 * its pages are still mapped -- by the one
+				 * thread that took the file. */
+				if (wb)
+					mm_region_writeback_exit(pml4, r, f);
 				vfs_close(f);
 			}
 			/* The file is not all a record holds.  A device

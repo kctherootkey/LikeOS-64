@@ -120,12 +120,14 @@ int *__errno_location(void);
 #define EDQUOT         122 /* Disk quota exceeded */
 #define EREMOTE        66  /* Object is remote */
 #define EBADE          52  /* Invalid exchange */
+#define EBADSLT        57  /* Invalid slot */
 #define EREMOTEIO      121 /* Remote I/O error */
 #define ENOMEDIUM      123 /* No medium found */
 #define EMEDIUMTYPE    124 /* Wrong medium type */
 #define ECANCELED      125 /* Operation canceled */
 #define EOWNERDEAD     130 /* Owner died */
 #define ENOTRECOVERABLE 131 /* State not recoverable */
+#define ENOKEY         126 /* Required key not available */
 
 #ifdef __cplusplus
 }

@@ -15,9 +15,15 @@
 //     taken from the device's command queue depth (NCQ), plugging, and the
 //     per-disk statistics /proc/diskstats reports;
 //   * DISKS (struct gendisk, genhd.c): a registry with the conventional
-//     names (sda, sdb ... sdz, sdaa ...; sr0 for optical drives), device
-//     numbers (major 8 / 65-71 for disks, 16 minors each; major 11 for
-//     optical drives), identity strings for /dev/disk/by-id;
+//     names (sda, sdb ... sdz, sdaa ...; sr0 for optical drives; names the
+//     driver chooses for other kinds, nvme0n1), device numbers (major 8 /
+//     65-71 for disks, 16 minors each; major 11 for optical drives; the
+//     extended major 259 with dynamically allocated minors for NVMe
+//     namespaces and partitions beyond the 15th), identity strings for
+//     /dev/disk/by-id;
+//   * MULTI-QUEUE disks (blk_mq.h): a disk with a tag set dispatches
+//     through per-CPU hardware queues (NVMe); a disk without one keeps the
+//     single queue described here;
 //   * PARTITIONS (struct blk_partition, partition.c): GPT (both headers,
 //     CRC32 checked, backup used when the primary is damaged) and MBR
 //     (including the extended/logical chain), each partition a block
@@ -99,6 +105,10 @@
 //   partition.c, blkdev_node.c, blk_sysfs.c; plus the S_IFBLK support in
 //   kernel/fs/device.h + devfs.c, the /proc registrations in procfs.c and
 //   the blk_shutdown_all() calls in ke/system.c and the ACPI power-off path.
+//   NVMe project (11-11): the multi-queue contract (blk_mq.h and the
+//   sections marked "multi-queue" here) is implemented by agent P2 in
+//   blk_mq*.c and the files above; AHCI and usb_msd stay on the single
+//   queue unchanged.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -107,6 +117,8 @@
 
 #include <kernel/dev/block/block.h>
 #include <kernel/dev/block/blk_softirq.h>
+#include <kernel/dev/block/blk_mq.h>
+#include <kernel/fs/kdev_t.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/waitq.h>
@@ -129,18 +141,22 @@ struct devfs_node;
  * Constants
  * ========================================================================== */
 
-/* Device numbers.  The dev_t encoding of this system is major << 8 | minor
- * with 8 bits each (kernel/fs/devfs.c, libc <sys/sysmacros.h>), so every
- * number below fits in 8 bits. */
+/* Device numbers.  userland sees them packed by kdev_encode()
+ * (kernel/fs/kdev_t.h, libc <sys/sysmacros.h>): 12-bit majors, 20-bit
+ * minors, the old 8:8 value for every major < 4096 / minor < 256. */
 #define BLK_SD_MAJOR SCSI_DISK0_MAJOR /* 8: sda..sdp */
 #define BLK_SD_MAJOR_EXT_FIRST SCSI_DISK1_MAJOR /* 65: sdq.. */
 #define BLK_SD_MAJOR_EXT_LAST SCSI_DISK7_MAJOR /* 71 */
 #define BLK_SR_MAJOR SCSI_CDROM_MAJOR /* 11: sr0, sr1 ... */
-/* Partitions numbered 16 and above have no minor in their disk's range of
- * 16; they get a minor from this extended major, allocated in order of
- * appearance (256 of them system-wide).  The conventional extended block
- * major (259) does not fit in the 8-bit major field, so LikeOS uses 254. */
-#define BLK_EXT_MAJOR 254
+/* The extended block major ("blkext"): partitions numbered 16 and above
+ * of an sd disk (which have no minor in their disk's range of 16), and
+ * EVERY device of a disk kind with driver-chosen names (NVMe namespaces
+ * and their partitions), get a minor of this major, allocated
+ * dynamically -- the lowest free one -- in order of appearance.
+ * BLK_EXT_MINORS is the size of the pool the single-queue code uses
+ * today (genhd.c, partition.c); the multi-queue allocator
+ * (blk_ext_devt_alloc below, P2) serves up to KDEV_MINOR_MAX + 1. */
+#define BLK_EXT_MAJOR 259
 #define BLK_EXT_MINORS 256
 
 #define DISK_MINORS 16 /* per sd disk: the disk + partitions 1..15 */
@@ -168,11 +184,8 @@ struct devfs_node;
  * flight (no completion will come to restart it) is asked again after
  * this long, by kblockd. */
 #define BLK_RESOURCE_DELAY_NS (3ULL * 1000ULL * 1000ULL)
-/* What a driver's ->timeout wants done with a request that timed out. */
-enum blk_eh_timer_return {
-	BLK_EH_DONE = 0, /* the driver's error handling completes it */
-	BLK_EH_RESET_TIMER = 1, /* not yet: another timeout period */
-};
+/* What a driver's ->timeout wants done with a request that timed out:
+ * enum blk_eh_timer_return, BLK_EH_DONE / BLK_EH_RESET_TIMER (blk_mq.h). */
 /* Default queue sizes.  nr_requests bounds the requests a queue holds,
  * from their insertion to their completion (dispatched ones included):
  * twice the dispatch depth, the depth counted up to
@@ -389,6 +402,11 @@ int blk_work_queue(struct blk_work *w);
  * -EBUSY when called by kblockd from inside the item's own run -- the
  * owner must then leak rather than free.  Any context. */
 int blk_work_cancel_sync(struct blk_work *w, uint32_t timeout_ms);
+/* Wait until `w' is neither pending nor running (a pending delayed item
+ * is run at once), without cancelling it: 1 when it had to wait, 0 when
+ * it was idle, -EBUSY from inside its own run.  May sleep (polls before
+ * kblockd and with interrupts off). */
+int blk_work_flush(struct blk_work *w);
 /* Run whatever waits on kblockd's lists in the calling context, this
  * CPU's first.  For pollers that wait with interrupts off once the
  * scheduler runs (kblockd may then never get the processor).  Items
@@ -493,21 +511,37 @@ enum blk_op {
 	BLK_OP_WRITE_ZEROES = 5, /* make `count' sectors read back zero */
 	BLK_OP_DRV_IN = 6, /* driver pass-through, data from device */
 	BLK_OP_DRV_OUT = 7, /* driver pass-through, data to device / none */
+	/* --- multi-queue / zoned devices (P2) --------------------------- */
+	BLK_OP_ZONE_APPEND = 8, /* write at the zone's write pointer; the
+				 * driver reports where (rq->append_sector) */
+	BLK_OP_ZONE_OPEN = 9, /* explicitly open the zone at `lba' */
+	BLK_OP_ZONE_CLOSE = 10,
+	BLK_OP_ZONE_FINISH = 11, /* move the write pointer to the end */
+	BLK_OP_ZONE_RESET = 12, /* reset the zone's write pointer */
+	BLK_OP_ZONE_RESET_ALL = 13, /* reset every sequential zone */
 	BLK_OP_NR
 };
+
+/* Zone management ops (no data). */
+static inline int blk_op_is_zone_mgmt(enum blk_op op)
+{
+	return op >= BLK_OP_ZONE_OPEN && op <= BLK_OP_ZONE_RESET_ALL;
+}
 
 static inline int blk_op_is_write(enum blk_op op)
 {
 	return op == BLK_OP_WRITE || op == BLK_OP_DISCARD ||
 	       op == BLK_OP_SECURE_ERASE || op == BLK_OP_WRITE_ZEROES ||
-	       op == BLK_OP_DRV_OUT;
+	       op == BLK_OP_DRV_OUT || op == BLK_OP_ZONE_APPEND ||
+	       blk_op_is_zone_mgmt(op);
 }
 
 /* Does the op move data through the sg list? */
 static inline int blk_op_has_data(enum blk_op op)
 {
 	return op == BLK_OP_READ || op == BLK_OP_WRITE ||
-	       op == BLK_OP_DRV_IN || op == BLK_OP_DRV_OUT;
+	       op == BLK_OP_DRV_IN || op == BLK_OP_DRV_OUT ||
+	       op == BLK_OP_ZONE_APPEND;
 }
 
 /* struct blk_request.flags -- set by the submitter */
@@ -525,6 +559,22 @@ static inline int blk_op_has_data(enum blk_op op)
 #define BLK_REQ_PM (1u << 11) /* power management: allowed while the
 				* queue is suspended */
 #define BLK_REQ_NO_ACCOUNT (1u << 12) /* not counted in diskstats */
+/* --- multi-queue (P2) ------------------------------------------------- */
+#define BLK_REQ_ATOMIC (1u << 13) /* RWF_ATOMIC: all or nothing */
+#define BLK_REQ_NOWAIT (1u << 14) /* fail with -EAGAIN instead of waiting */
+#define BLK_REQ_FAILFAST_DEV (1u << 15) /* no retry on device errors */
+#define BLK_REQ_FAILFAST_TRANSPORT (1u << 16) /* no retry on path errors */
+#define BLK_REQ_FAILFAST_DRIVER (1u << 17) /* no driver-level retry */
+#define BLK_REQ_MPATH (1u << 18) /* issued by a multipath head (NVMe
+					* REQ_NVME_MPATH: fail over on a
+					* path error instead of retrying) */
+#define BLK_REQ_INTEGRITY (1u << 19) /* carries rq->integrity */
+#define BLK_REQ_RESERVED (1u << 20) /* holds a reserved tag */
+#define BLK_REQ_DONTPREP (1u << 21) /* driver prepared it already */
+#define BLK_REQ_MQ_ALLOC (1u << 22) /* from blk_mq_alloc_request */
+#define BLK_REQ_FAILFAST_MASK                                     \
+	(BLK_REQ_FAILFAST | BLK_REQ_FAILFAST_DEV |               \
+	 BLK_REQ_FAILFAST_TRANSPORT | BLK_REQ_FAILFAST_DRIVER)
 
 /* struct blk_request.state -- owned by the block layer */
 enum blk_req_state {
@@ -634,6 +684,26 @@ struct blk_request {
 	 * by blk_request_release() */
 	struct blk_sg_entry *sg_alloc;
 
+	/* --- multi-queue (blk_mq.h, P2) ------------------------------------
+	 * Set by the block layer when the request goes to a multi-queue
+	 * queue (or by blk_mq_alloc_request); drivers read them. */
+	struct blk_mq_hw_ctx *mq_hctx; /* the hardware queue it runs on */
+	int tag; /* its tag on mq_hctx->tags, -1 none */
+	volatile int mq_state; /* enum mq_rq_state */
+	struct blk_request *rq_next; /* rq_list / io_comp_batch link */
+	uint64_t deadline_ns; /* timeout deadline once started */
+	uint64_t append_sector; /* ZONE_APPEND: where it was written
+				 * (logical block of the disk, as sector) */
+	uint16_t write_hint; /* write lifetime hint (RWH_*) */
+	uint16_t write_stream; /* write stream / FDP placement handle, 0 */
+	uint32_t mq_flags; /* BLK_MQ_REQ_* it was allocated with */
+	uint32_t nr_integrity_segs;
+	struct blk_integrity_payload *integrity; /* BLK_REQ_INTEGRITY */
+	struct blk_integrity_payload integrity_inline;
+	refcount_t mq_ref; /* timeout handler / iterators hold it */
+	void *end_io_data; /* blk_mq_alloc_request users' context */
+	uint32_t poll_cookie; /* hctx queue_num for blk_mq_poll */
+
 	/* --- block layer private (block.c, blk_queue.c); drivers and
 	 * submitters never read or write any of this ------------------------ */
 	struct {
@@ -660,6 +730,10 @@ struct blk_request {
 		/* The queue's tag while the request is at the driver (its
 		 * slot in struct blk_queue.tags), -1 while it holds none. */
 		int tag;
+		/* Multi-queue: the per-CPU slot of the usage count it holds
+		 * (BLK_RQI_Q_USAGE) -- given back to the same slot, so no
+		 * slot ever goes negative and a sum of 0 is exact. */
+		int usage_slot;
 	} bl;
 };
 
@@ -714,7 +788,87 @@ struct blk_limits {
 	uint8_t discard_zeroes_data;
 	uint8_t secure_erase; /* BLK_OP_SECURE_ERASE supported */
 	uint8_t pad[3];
+
+	/* --- multi-queue, zoned, atomic, integrity (P2).  Zero is the
+	 * single-queue default ("not supported" / "no limit beyond the
+	 * above"), so drivers that do not know these fields are
+	 * unaffected. ------------------------------------------------------ */
+	uint32_t features; /* BLK_FEAT_* */
+	uint32_t lim_flags; /* BLK_FLAG_* */
+	uint64_t virt_boundary_mask; /* no gap inside a request crosses
+				      * this (NVMe PRP: page - 1) */
+	uint32_t max_dev_sectors; /* the device's own ceiling */
+	uint32_t max_secure_erase_sectors;
+	uint64_t max_hw_discard_sectors;
+	/* Zoned devices (BLK_FEAT_ZONED). */
+	uint32_t chunk_sectors; /* zone size (logical blocks), power of 2 */
+	uint32_t max_hw_zone_append_sectors;
+	uint32_t max_zone_append_sectors;
+	uint32_t zone_write_granularity; /* bytes */
+	uint32_t max_open_zones; /* 0: no limit */
+	uint32_t max_active_zones; /* 0: no limit */
+	/* Atomic writes (BLK_FEAT_ATOMIC_WRITES): hardware values set by
+	 * the driver, the usable ones derived by the block layer. */
+	uint32_t atomic_write_hw_max; /* bytes */
+	uint32_t atomic_write_hw_unit_min; /* bytes */
+	uint32_t atomic_write_hw_unit_max; /* bytes */
+	uint32_t atomic_write_hw_boundary; /* bytes, 0: none */
+	uint32_t atomic_write_max_sectors;
+	uint32_t atomic_write_boundary_sectors;
+	uint32_t atomic_write_unit_min; /* bytes */
+	uint32_t atomic_write_unit_max; /* bytes */
+	/* Write streams / data placement. */
+	uint16_t max_write_streams;
+	uint16_t pad2;
+	uint32_t write_stream_granularity; /* bytes */
+	/* Protection information / metadata. */
+	struct blk_integrity integrity;
+	/* Hybrid polling: delay before the first poll (us), -1 classic
+	 * polling, 0 adaptive (half the mean). */
+	int32_t io_poll_delay;
+	uint32_t dma_pad_mask;
 };
+
+/* struct blk_limits.features */
+#define BLK_FEAT_WRITE_CACHE (1u << 0) /* volatile write cache */
+#define BLK_FEAT_FUA (1u << 1) /* FUA writes */
+#define BLK_FEAT_ROTATIONAL (1u << 2)
+#define BLK_FEAT_ADD_RANDOM (1u << 3)
+#define BLK_FEAT_IO_STAT (1u << 4)
+#define BLK_FEAT_STABLE_WRITES (1u << 5) /* data must not change in flight
+					   * (PI generated on the data) */
+#define BLK_FEAT_SYNCHRONOUS (1u << 6)
+#define BLK_FEAT_NOWAIT (1u << 7)
+#define BLK_FEAT_DAX (1u << 8)
+#define BLK_FEAT_POLL (1u << 9) /* has poll queues */
+#define BLK_FEAT_ZONED (1u << 10)
+#define BLK_FEAT_PCI_P2PDMA (1u << 12)
+#define BLK_FEAT_SKIP_TAGSET_QUIESCE (1u << 13) /* not quiesced with the
+						  * tag set (multipath) */
+#define BLK_FEAT_BOUNCE_HIGH (1u << 14)
+#define BLK_FEAT_ATOMIC_WRITES (1u << 15)
+#define BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE (1u << 16)
+
+/* struct blk_limits.lim_flags */
+#define BLK_FLAG_WRITE_CACHE_DISABLED (1u << 0) /* by sysfs */
+#define BLK_FLAG_MISALIGNED (1u << 1)
+
+/* Validate and apply new limits to a live queue (freezing it): the
+ * driver copies the current limits (queue_limits_start_update), changes
+ * them, and commits.  0 / -EINVAL.  May sleep.  P2. */
+void queue_limits_start_update(struct blk_queue *q, struct blk_limits *lim);
+int queue_limits_commit_update(struct blk_queue *q,
+			       const struct blk_limits *lim);
+/* Check and fill derived values (max_sectors from max_hw_sectors, atomic
+ * write units, integrity interval ...).  0 / -EINVAL.  Pure. */
+int blk_validate_limits(struct blk_limits *lim);
+/* Is `bsize' a valid logical block size (512 .. 64 KiB, power of 2)? */
+static inline int blk_validate_block_size(uint64_t bsize)
+{
+	if (bsize < 512 || bsize > 65536 || (bsize & (bsize - 1)))
+		return -EINVAL;
+	return 0;
+}
 
 /* Indices of the four /proc/diskstats groups */
 enum blk_stat_group {
@@ -777,6 +931,11 @@ enum blk_sched {
 #define BLK_QUEUE_FL_SUSPENDED (1u << 2) /* only BLK_REQ_PM requests run */
 #define BLK_QUEUE_FL_NOMERGES (1u << 3) /* sysfs queue/nomerges */
 #define BLK_QUEUE_FL_POLLED (1u << 5) /* driver has no interrupts yet */
+/* The timeout timer is off for good (teardown).  A single-queue queue
+ * sets it together with DYING; a multi-queue queue only once its
+ * requests drained, so that a request stuck at a hung device still
+ * times out while its disk is being removed. */
+#define BLK_QUEUE_FL_NOTIMER (1u << 6)
 
 /* struct blk_queue.state -- bits changed without the queue lock */
 /* Dispatch stopped with requests left for want of a tag (or the driver
@@ -952,7 +1111,86 @@ struct blk_queue {
 	uint64_t flush_pending_since; /* the first one began waiting */
 	uint32_t flush_data_in_flight; /* data steps of flush sequences */
 	struct blk_request flush_rq; /* the queue's own FLUSH */
+
+	/* --- multi-queue (blk_mq.h; P2).  tag_set NULL: the single-queue
+	 * queue above.  Fields after `queuedata' are blk_mq*.c private. ---- */
+	struct blk_mq_tag_set *tag_set;
+	void *queuedata; /* the driver's (NVMe: struct nvme_ns) */
+	struct blk_mq_hw_ctx **queue_hw_ctx; /* [nr_hw_queues] */
+	unsigned int nr_hw_queues;
+	struct blk_queue *set_next; /* tag_set->tag_list */
+	refcount_t q_refs; /* blk_get_queue/blk_put_queue */
+	/* Freeze: q_usage counts submitters inside the queue; a freeze
+	 * stops new entries and waits for 0. */
+	volatile int64_t q_usage;
+	volatile int mq_freeze_depth;
+	struct mutex mq_freeze_lock;
+	struct wait_queue_head mq_freeze_wq;
+	volatile int quiesce_depth;
+	spinlock_t mq_requeue_lock;
+	struct blk_request *mq_requeue_head, *mq_requeue_tail;
+	struct blk_work *mq_requeue_work;
+	struct blk_work *mq_timeout_work;
+	/* Zoned devices: per-zone write plugs and the conventional bitmap. */
+	unsigned int nr_zones;
+	uint64_t *conv_zones_bitmap;
+	void *zone_wplugs; /* blk_zoned.c */
+	uint64_t mq_flags; /* BLK_QUEUE_MQ_* */
+
+	/* --- blk_mq*.c private (multi-queue queues only) ---------------- */
+	struct blk_mq_ctx *queue_ctx; /* one per CPU (MAX_CPUS) */
+	void *queue_ctx_raw;
+	/* The usage count (q_usage_counter): one counter per CPU, entered
+	 * on the submitting CPU, left wherever the request ends; only the
+	 * sum means something.  A freeze sets mq_frozen first and then
+	 * waits for the sum to reach 0. */
+	struct blk_mq_usage_cpu *mq_usage;
+	void *mq_usage_raw;
+	struct blk_mq_hw_ctx *mq_dead_hctx; /* unused after a resize */
+	/* Room in queue_hw_ctx (it only grows: a shrink keeps the array). */
+	unsigned int mq_hctx_cap;
+	/* Paths that walk queue_hw_ctx[0..nr_hw_queues) without holding the
+	 * usage count (timeout work, runs of all hctxs, sysfs, mark dead,
+	 * quiesce waits) count themselves in mq_hctx_readers and back off
+	 * while mq_hctx_updating is set; blk_mq_update_nr_hw_queues sets
+	 * it on the frozen queue and waits for the readers to leave before
+	 * the contexts, the array and the surplus tags change (the role the
+	 * usage-count tryget plays for those paths in the established
+	 * design).  Waiters sleep on mq_freeze_wq. */
+	volatile int mq_hctx_readers;
+	volatile int mq_hctx_updating;
+	spinlock_t mq_freeze_spin; /* mq_freeze_depth <-> mq_frozen */
+	volatile int mq_frozen;
+	spinlock_t mq_quiesce_lock; /* quiesce_depth */
+	struct wait_queue_head mq_quiesce_wq; /* dispatch left a quiesced q */
+	/* Requests per hctx a submitter may hold (sched slots): see
+	 * blk_mq_init_queue_nr_requests. */
+	uint32_t mq_nr_requests_hw;
+	uint32_t mq_pad;
+	/* Zoned: zone size shift and per-zone write plugs (blk_zoned.c). */
+	uint32_t zone_sectors_shift;
+	uint32_t zone_wplugs_nr;
+	spinlock_t zone_wplugs_lock;
+	struct blk_work *zone_wplugs_work;
+	uint64_t zone_capacity_sectors; /* reported zone capacity, 0 = len */
 };
+
+/* One CPU's share of a multi-queue queue's usage count. */
+struct blk_mq_usage_cpu {
+	volatile int64_t count;
+	uint64_t pad[7];
+};
+
+/* struct blk_queue.mq_flags */
+#define BLK_QUEUE_MQ_DYING (1u << 0)
+#define BLK_QUEUE_MQ_QUIESCED (1u << 1)
+#define BLK_QUEUE_MQ_NOWAIT (1u << 2)
+#define BLK_QUEUE_MQ_REGISTERED (1u << 3)
+
+static inline int blk_queue_is_mq(const struct blk_queue *q)
+{
+	return q && q->tag_set != NULL;
+}
 
 /* Set bits of a word (the kernel links no compiler support library, so
  * no __builtin_popcount). */
@@ -1196,6 +1434,26 @@ struct blk_ops {
 	 * dispatched again (the disk is going away): release what
 	 * driver_data holds.  Any context, no lock held.  Optional. */
 	void (*cleanup_rq)(struct blk_request *req);
+
+	/* --- multi-queue disks (P2 calls them; drivers such as NVMe fill
+	 * them).  A multi-queue disk does not use ->submit/->poll/->timeout/
+	 * ->complete above: its I/O goes through disk->tag_set->ops
+	 * (struct blk_mq_ops). ---------------------------------------------- */
+	/* Report zones (BLKREPORTZONE, blk_revalidate_disk_zones): call cb
+	 * for up to nr_zones zones from `sector'.  Returns the number
+	 * reported or -errno.  May sleep.  Zoned disks only. */
+	int (*report_zones)(struct gendisk *disk, uint64_t sector,
+			    unsigned int nr_zones, report_zones_cb cb,
+			    void *data);
+	/* Persistent reservations (IOC_PR_*).  NULL: -EOPNOTSUPP. */
+	const struct pr_ops *pr_ops;
+	/* A unique identifier of the device (NVMe: NGUID/EUI64/UUID) for
+	 * /sys/block/X/wwid-style users: bytes written, 0 none, -errno.
+	 * `type' 1 = EUI-64 (8 bytes), 2 = NAA, 3 = UUID/NGUID (16). */
+	int (*get_unique_id)(struct gendisk *disk, uint8_t id[16], int type);
+	/* The disk is about to be freed / its last opener went: the
+	 * multipath head drops a path reference.  Optional. */
+	void (*disk_release)(struct gendisk *disk);
 };
 
 /* ==========================================================================
@@ -1205,6 +1463,13 @@ struct blk_ops {
 enum blk_disk_kind {
 	BLK_DISK_SD = 0, /* a disk: sdX, partitionable */
 	BLK_DISK_SR = 1, /* an optical drive: srN, not partitioned */
+	/* An NVMe namespace (P2/P4): the name is the driver's
+	 * ("nvme0n1"; "nvme0c1n1" for a hidden multipath path), the device
+	 * numbers are BLK_EXT_MAJOR with a dynamic minor for the disk and
+	 * each partition, partitions are named with the 'p' separator
+	 * ("nvme0n1p1").  Kept in the registry list only (no sd/sr index
+	 * table).  disk->bus is "nvme". */
+	BLK_DISK_NVME = 2,
 };
 
 /* struct gendisk.flags */
@@ -1217,6 +1482,20 @@ enum blk_disk_kind {
 #define GENHD_FL_RO (1u << 6) /* write protected */
 #define GENHD_FL_HIDDEN (1u << 7) /* no /dev node (internal) */
 #define GENHD_FL_HOTPLUGGED (1u << 8) /* appeared after boot */
+/* Multi-queue / NVMe disks only, changed after allocation with
+ * disk_set_flags() / disk_clear_flags() (atomic): */
+/* blk_mark_disk_dead(): the device is gone (surprise removal); new
+ * I/O fails with -EIO until disk_del() takes the disk down. */
+#define GENHD_FL_GONE (1u << 9)
+/* No partition scan for now: a multipath head's scan is deferred to its
+ * own work, which clears the bit. */
+#define GENHD_FL_SUPPRESS_PART_SCAN (1u << 10)
+/* A zoned disk is not partitioned: set by the zone revalidation. */
+#define GENHD_FL_ZONED_NO_PART (1u << 11)
+/* Any of these: no partitions (the partition code tests this mask). */
+#define GENHD_FL_NO_PARTS                                         \
+	(GENHD_FL_NO_PART_SCAN | GENHD_FL_SUPPRESS_PART_SCAN |    \
+	 GENHD_FL_ZONED_NO_PART)
 
 /* Filesystem identity found on a device -- what /dev/disk/by-uuid and
  * by-label and the root=UUID=/LABEL= boot option are made of.  Probed by
@@ -1293,6 +1572,35 @@ struct gendisk {
 	/* sysfs: "block/sda" relative to /sys, set by blk_sysfs_add_disk */
 	char sysfs_base[96];
 	struct devfs_node *node; /* the /dev node (blkdev_node.c) */
+
+	/* --- multi-queue disks (P2; NULL / 0 for single-queue disks) ------ */
+	struct blk_mq_tag_set *tag_set; /* set before disk_add */
+	void *queuedata; /* blk_queue.queuedata */
+	/* World-wide identifier as /sys/block/X/wwid prints it
+	 * ("eui.0025388b71b0cb45", "nvme.8086-...") and the by-id link
+	 * suffix; "" none.  Room for the longest NVMe fallback
+	 * ("nvme.VVVV-" + 40 hex serial + "-" + 80 hex model + "-NNNNNNNN",
+	 * 140 characters): a cut one would lose the namespace ID. */
+	char wwid[160];
+	/* /dev/disk/by-path name of the whole disk without "pci-<addr>-"
+	 * ("nvme-1" for namespace 1); "" derive from host/target/lun. */
+	char by_path[32];
+	/* A sysfs link target for /sys/block/X/device (the controller's
+	 * class directory, "class/nvme/nvme0"); "" the PCI device. */
+	char device_link[64];
+	/* A driver directory (relative to /sys, "" none) whose entries
+	 * /sys/block/X/ shows as well -- a driver's attribute group on the
+	 * disk (NVMe: nsid, eui, nguid, uuid, ...).  The block layer's own
+	 * names win on a clash. */
+	char attr_dir[96];
+	uint32_t nr_zones; /* zoned: zones, 0 otherwise */
+	/* Hidden disks of a multipath head ("nvme0c0n1") point at it. */
+	struct gendisk *mpath_head;
+	uint32_t ext_minor_dyn; /* minor came from blk_ext_devt_alloc */
+	uint32_t pad_mq;
+	/* genhd.c private: the list of named disks (registry mutex), in
+	 * index order. */
+	struct gendisk *named_next;
 };
 
 #define GENDISK_MAGIC 0x4B534944u /* "DISK" */
@@ -1304,6 +1612,41 @@ struct gendisk {
  * exhausted. */
 struct gendisk *disk_alloc(enum blk_disk_kind kind, const struct blk_ops *ops,
 			   void *private_data);
+/* The same for a kind whose names the driver chooses (BLK_DISK_NVME):
+ * `name' (< DISK_NAME_LEN, unique -- NULL when taken) and a dynamic
+ * BLK_EXT_MAJOR minor.  May sleep.  P2. */
+struct gendisk *disk_alloc_named(enum blk_disk_kind kind,
+				 const struct blk_ops *ops, void *private_data,
+				 const char *name);
+/* Give a named disk that is not added yet its final name (a driver that
+ * learns the name only after allocating the disk).  0, -EINVAL, -EBUSY
+ * (already added), -EEXIST (taken).  May sleep. */
+int disk_set_name(struct gendisk *disk, const char *name);
+/* The extended-major minor allocator (lowest free minor, 0 ..
+ * KDEV_MINOR_MAX): disks of named kinds and their partitions, sd
+ * partitions >= 16.  0 with *minor set, -ENOSPC.  Any context that may
+ * allocate; its own lock (no registry mutex needed).  P2. */
+int blk_ext_devt_alloc(uint32_t *minor);
+void blk_ext_devt_free(uint32_t minor);
+/* The capacity changed (namespace resize, AEN): set it and tell
+ * userland (diskseq, uevent-style change).  May sleep.  P2. */
+int set_capacity_and_notify(struct gendisk *disk, uint64_t sectors);
+/* Add or remove flags on a disk that other contexts may already see
+ * (the multi-queue / NVMe paths after allocation): one atomic OR / AND,
+ * so no concurrent writer of those bits loses one.  disk_clear_flags()
+ * returns the flags as they were. */
+static inline void disk_set_flags(struct gendisk *disk, uint32_t mask)
+{
+	(void)__atomic_fetch_or(&disk->flags, mask, __ATOMIC_SEQ_CST);
+}
+static inline uint32_t disk_clear_flags(struct gendisk *disk, uint32_t mask)
+{
+	return __atomic_fetch_and(&disk->flags, ~mask, __ATOMIC_SEQ_CST);
+}
+static inline uint32_t disk_flags(const struct gendisk *disk)
+{
+	return __atomic_load_n(&disk->flags, __ATOMIC_ACQUIRE);
+}
 /* Make the disk live: create its queue from disk->limits, fill the
  * whole-disk block_device_t (extended fields + legacy read/write/sync
  * wrappers), register it, create /dev and /sys entries and the by-id
@@ -1706,6 +2049,30 @@ int blkdev_links_update_locked(block_device_t *bdev);
 long blkdev_ioctl(block_device_t *bdev, unsigned long cmd, void *argp,
 		  struct task *cur, int open_flags);
 
+/* preadv2()/pwritev2() on a block device node (kernel/fs/read_write.c):
+ * `iov' is the caller's vector copied into the kernel (user buffer
+ * pointers), `off' -1 for the handle's position (advanced), `rwf' the
+ * RWF_* flags (BLK_RWF_* below, the established values): HIPRI polls on
+ * a poll queue, NOWAIT never waits for the queue, DSYNC/SYNC write with
+ * FUA, ATOMIC writes everything as one atomic request, APPEND writes at
+ * the end.  Bytes moved, or -errno.  May sleep. */
+struct vfs_file;
+struct blk_uvec {
+	void *base; /* user address */
+	uint64_t len;
+};
+#define BLK_RWF_HIPRI 0x01u
+#define BLK_RWF_DSYNC 0x02u
+#define BLK_RWF_SYNC 0x04u
+#define BLK_RWF_NOWAIT 0x08u
+#define BLK_RWF_APPEND 0x10u
+#define BLK_RWF_NOAPPEND 0x20u
+#define BLK_RWF_ATOMIC 0x40u
+#define BLK_RWF_DONTCACHE 0x80u
+#define BLK_RWF_SUPPORTED 0xFFu
+long blkdev_file_rwv(struct vfs_file *file, const struct blk_uvec *iov,
+		     int cnt, int64_t off, int write, uint32_t rwf);
+
 /* The devfs groups of disk and optical drive nodes.  The numbers must
  * match res/etc/group ("disk:x:6:", "cdrom:x:24:"). */
 #define DEVFS_GID_DISK 6
@@ -1736,6 +2103,70 @@ long blk_proc_diskstats_show(struct pfs_node *n, char *buf, long cap);
 /* /sys/power/disk_state-style trigger: "suspend" / "resume" written to
  * /sys/block/power_state calls blk_suspend_all/blk_resume_all. */
 void blk_sysfs_init(void);
+
+
+/* ==========================================================================
+ * Request accessors (the established names, for drivers mirroring them)
+ * ========================================================================== */
+
+/* Start sector on the whole disk, in 512-byte units. */
+static inline uint64_t blk_rq_pos(const struct blk_request *rq)
+{
+	uint32_t lbs = rq->disk ? rq->disk->limits.logical_block_size : 512;
+
+	return rq->sector * (lbs ? lbs / 512 : 1);
+}
+/* Bytes the request covers (data ops: count * logical block size;
+ * pass-through: the sg list). */
+static inline uint64_t blk_rq_bytes(const struct blk_request *rq)
+{
+	uint64_t n = 0;
+
+	if (rq->op == BLK_OP_DRV_IN || rq->op == BLK_OP_DRV_OUT ||
+	    !rq->disk) {
+		for (uint32_t i = 0; i < rq->nsg; i++)
+			n += rq->sg[i].len;
+		return n;
+	}
+	return (uint64_t)rq->count * rq->disk->limits.logical_block_size;
+}
+static inline uint64_t blk_rq_sectors(const struct blk_request *rq)
+{
+	return blk_rq_bytes(rq) >> 9;
+}
+/* Bytes moved through the sg list (0 for discard / write zeroes). */
+static inline uint64_t blk_rq_payload_bytes(const struct blk_request *rq)
+{
+	return blk_op_has_data(rq->op) ? blk_rq_bytes(rq) : 0;
+}
+static inline enum blk_op req_op(const struct blk_request *rq)
+{
+	return rq->op;
+}
+/* 1 for a request moving data to the device. */
+static inline int rq_data_dir(const struct blk_request *rq)
+{
+	return blk_op_is_write(rq->op);
+}
+static inline int blk_rq_is_passthrough(const struct blk_request *rq)
+{
+	return rq->op == BLK_OP_DRV_IN || rq->op == BLK_OP_DRV_OUT;
+}
+/* No retries wanted (fail fast of any kind). */
+static inline int blk_noretry_request(const struct blk_request *rq)
+{
+	return (rq->flags & BLK_REQ_FAILFAST_MASK) != 0;
+}
+static inline uint32_t blk_rq_nr_phys_segments(const struct blk_request *rq)
+{
+	return rq->nsg;
+}
+/* Discard ranges of a (merged) discard request: the request itself plus
+ * what was merged into it. */
+static inline uint32_t blk_rq_nr_discard_segments(const struct blk_request *rq)
+{
+	return 1 + rq->nr_merged;
+}
 
 /* ==========================================================================
  * Compile-time layout checks of the UAPI structures
@@ -1777,6 +2208,13 @@ static inline void blkdev_uapi_layout_checks(void)
 	BUILD_BUG_ON(sizeof(struct blk_guid) != 16);
 	BUILD_BUG_ON(DISK_MAX_DISKS > 16 * (1 + BLK_SD_MAJOR_EXT_LAST -
 					    BLK_SD_MAJOR_EXT_FIRST + 1));
+	BUILD_BUG_ON(sizeof(struct blk_zone) != 64);
+	BUILD_BUG_ON(sizeof(struct blk_zone_report) != 16);
+	BUILD_BUG_ON(sizeof(struct blk_zone_range) != 16);
+	BUILD_BUG_ON(BLKREPORTZONE != 0xc0101282UL);
+	BUILD_BUG_ON(BLKGETZONESZ != 0x80041284UL);
+	BUILD_BUG_ON(BLK_OP_NR > 16);
+	BUILD_BUG_ON(BLK_EXT_MAJOR > KDEV_MAJOR_MAX);
 }
 
 #endif // LIKEOS_BLKDEV_H

@@ -344,7 +344,56 @@ int64_t sys_brk(uint64_t new_brk)
 struct mmap_prefill {
 	uint64_t *pages;
 	uint64_t n;
+	/* The file a shared mapping of this call writes back to (held), or
+	 * NULL; see mmap_writeback_file(). */
+	vfs_file_t *wb;
 };
+
+/* Filesystems whose shared file mappings write back (statfs f_type). */
+#define MMAP_WB_EXT4_MAGIC 0xEF53UL
+#define MMAP_WB_FAT_MAGIC 0x4d44UL
+
+/* Will a MAP_SHARED mapping of `fd' write what is stored into it back to the
+ * file?  Only a regular file on a disk filesystem (ext4, FAT32), through a
+ * descriptor open for writing -- a read-only one can never be written
+ * through, nor an O_APPEND one, whose writes all go to the end of the file.
+ * Everything else keeps its own semantics: anonymous memory,
+ * /dev/shm and memfd objects and device mappings map their real pages, and a
+ * file on tmpfs or a pseudo filesystem stays the copy it always was.
+ *
+ * Asked before the address-space lock is taken, because the filesystem
+ * answers under its own locks.  Returns the file with a reference held (the
+ * mapping is only made writing-back if the descriptor still names this very
+ * file under the lock), or NULL. */
+static vfs_file_t *mmap_writeback_file(uint64_t flags, uint64_t fd)
+{
+	task_t *cur = sched_current();
+	struct vfs_statfs sfs;
+	struct kstat st;
+	vfs_file_t *file;
+
+	if (!cur || !(flags & MAP_SHARED) || (flags & MAP_ANONYMOUS) ||
+	    (int64_t)fd < 0)
+		return NULL;
+	file = fdget(cur, (int)fd);
+	if (!file)
+		return NULL;
+	if (fd_is_special(file) || devfs_shm_object(file) ||
+	    devfs_is_fb0(file) || device_file_ops(file) ||
+	    !file_may_write(file) || (file->flags & O_APPEND))
+		goto no;
+	mm_memset(&st, 0, sizeof(st));
+	if (vfs_fstat(file, &st) != ST_OK || !S_ISREG(st.st_mode))
+		goto no;
+	mm_memset(&sfs, 0, sizeof(sfs));
+	if (vfs_fstatfs(file, &sfs) != ST_OK ||
+	    (sfs.f_type != MMAP_WB_EXT4_MAGIC && sfs.f_type != MMAP_WB_FAT_MAGIC))
+		goto no;
+	return file; /* fdget's reference, released by mmap_prefill_release */
+no:
+	fdput(file);
+	return NULL;
+}
 
 static void mmap_prefill(struct mmap_prefill *pre, uint64_t fd, uint64_t length,
 			 uint64_t offset)
@@ -390,6 +439,10 @@ static void mmap_prefill(struct mmap_prefill *pre, uint64_t fd, uint64_t length,
 
 static void mmap_prefill_release(struct mmap_prefill *pre)
 {
+	if (pre->wb) {
+		fdput(pre->wb);
+		pre->wb = NULL;
+	}
 	if (!pre->pages)
 		return;
 	for (uint64_t i = 0; i < pre->n; i++)
@@ -894,6 +947,10 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->lazy = true;
 		region->file = backing;
 		region->no_write = shared_ro;
+		/* a shared PROT_NONE mapping made accessible later writes
+		 * back like the eager one below */
+		region->wb_file = (flags & MAP_SHARED) && pre && pre->wb &&
+				  pre->wb == backing;
 		region->in_use = true;
 		mm_merge_region_neighbours(cur, region);
 		ret = (int64_t)vaddr;
@@ -968,6 +1025,17 @@ static int64_t mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	region->offset = offset;
 	region->lazy = false;
 	region->file = NULL;
+	/* A shared mapping of a file on a disk filesystem: the pages above
+	 * are this address space's copies of the file's, and what is written
+	 * into them goes back to the file (msync, munmap, exec, exit -- see
+	 * mm_region_writes_back()).  The record pins the file for that, as
+	 * every file-backed record does.  Any other file keeps the plain
+	 * copy it always had. */
+	if (backing && pre && pre->wb == backing) {
+		vfs_incref(backing);
+		region->file = backing;
+		region->wb_file = true;
+	}
 	region->in_use = true;
 	mm_merge_region_neighbours(cur, region);
 
@@ -984,12 +1052,13 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		 uint64_t flags, uint64_t fd, uint64_t offset)
 {
 	int64_t ret;
-	struct mmap_prefill pre = { NULL, 0 };
+	struct mmap_prefill pre = { NULL, 0, NULL };
 
 	if ((flags & MAP_SHARED) && !(flags & MAP_ANONYMOUS) &&
 	    (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) && length &&
 	    length <= (1ULL << 30))
 		mmap_prefill(&pre, fd, PAGE_ALIGN(length), offset);
+	pre.wb = mmap_writeback_file(flags, fd);
 	RUN_WRITE_LOCKED_RET(
 		ret, mmap_locked(addr, length, prot, flags, fd, offset, NULL, &pre));
 	mmap_prefill_release(&pre);
@@ -1045,4 +1114,33 @@ static int64_t sys_munmap_locked(uint64_t addr, uint64_t length)
 int64_t sys_munmap(uint64_t addr, uint64_t length)
 {
 	RUN_WRITE_LOCKED(sys_munmap_locked(addr, length));
+}
+
+/* msync(2).  A shared mapping of a file on a disk filesystem has what was
+ * stored into it written to the file (MS_ASYNC as well: written here, before
+ * the call returns, so read() sees it at once); MS_SYNC also flushes the file
+ * to the medium; MS_INVALIDATE then shows the file's current contents in the
+ * mapping.  Every other kind of mapping has nothing to write and succeeds.
+ *
+ * EINVAL: an unaligned address, an unknown flag, or MS_ASYNC with MS_SYNC.
+ * ENOMEM: part of the range is not mapped (the mapped rest is still done). */
+int64_t sys_msync(uint64_t addr, uint64_t length, uint64_t flags)
+{
+	uint64_t end;
+
+	if (flags & ~(uint64_t)(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
+		return -EINVAL;
+	if (addr & (PAGE_SIZE - 1))
+		return -EINVAL;
+	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
+		return -EINVAL;
+	if (length > ~0ULL - (PAGE_SIZE - 1))
+		return -ENOMEM;
+	length = PAGE_ALIGN(length);
+	end = addr + length;
+	if (end < addr)
+		return -ENOMEM;
+	if (end == addr)
+		return 0;
+	return mm_msync(addr, end, (int)flags);
 }

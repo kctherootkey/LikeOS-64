@@ -3,6 +3,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/devfs.h>
+#include <kernel/fs/kdev_t.h>
 #include <kernel/mm/shm.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -58,6 +59,15 @@ typedef struct {
 	struct devfs_node *node;
 	const struct device_ops *aops;
 	void *dev_priv;
+	/* What devfs itself needs of a registered node, copied while the
+	 * registry lock was held at open: the node's memory belongs to its
+	 * driver and may be gone by the time this handle is used, so devfs
+	 * never reads it again -- only the driver gets `node' back. */
+	const struct device_ops *dops;
+	uint32_t n_mode, n_uid, n_gid, n_major, n_minor;
+	int n_is_blk;
+	uint64_t n_ctime;
+	char npath[DEVFS_NODE_PATH_MAX]; /* a registered directory's path */
 	/* The name this handle was opened under.  Several device paths share
 	 * one type (/dev/tty, /dev/console and /dev/tty0 are all DEVFS_TYPE_TTY),
 	 * so the type alone cannot say which node a descriptor refers to — and
@@ -190,21 +200,117 @@ static devfs_file_t *devfs_file_of(vfs_file_t *f)
 static struct devfs_node *g_nodes[DEVFS_MAX_NODES];
 static spinlock_t g_nodes_lock = SPINLOCK_INIT("devfs_nodes");
 
-static struct devfs_node *devfs_node_lookup(const char *path)
+/* A registered node as devfs saw it under the registry lock.  Nothing in
+ * devfs dereferences a node after that lock is dropped: its memory is the
+ * driver's, and an unregistering driver may free it at any time once no
+ * open is IN FLIGHT on it (see devfs_node_in_use()). */
+struct devfs_node_snap {
+	struct devfs_node *node;
+	const struct device_ops *ops;
+	uint32_t mode, uid, gid, major, minor;
+	int is_dir, is_link, is_blk;
+	uint64_t ctime;
+	char path[DEVFS_NODE_PATH_MAX];
+};
+
+/* Opens in flight -- between finding a node and its driver's ->open
+ * having returned -- per node, keyed by the node's address and kept here
+ * rather than in the node, so the count stays valid whatever the driver
+ * does with the node's memory.  g_nodes_lock. */
+static struct {
+	struct devfs_node *node;
+	unsigned count;
+} g_busy[DEVFS_MAX_NODES];
+
+static void devfs_snap_fill(struct devfs_node_snap *s, struct devfs_node *n)
+{
+	s->node = n;
+	s->ops = n->ops;
+	s->mode = n->mode;
+	s->uid = n->uid;
+	s->gid = n->gid;
+	s->major = n->major;
+	s->minor = n->minor;
+	s->is_dir = n->is_dir;
+	s->is_link = n->is_link;
+	s->is_blk = n->is_blk;
+	s->ctime = n->ctime;
+	kstrncpy(s->path, n->path, sizeof(s->path));
+	s->path[sizeof(s->path) - 1] = 0;
+}
+
+/* Copy the registered node at `path' into `s'.  With `hold', an open is
+ * in flight on it until devfs_node_release(): the driver must not free the
+ * node meanwhile.  1 when found, 0 when not (or no room to track it). */
+static int devfs_node_get(const char *path, struct devfs_node_snap *s,
+			  int hold)
 {
 	uint64_t fl;
-	struct devfs_node *found = NULL;
+	int found = 0;
 
 	spin_lock_irqsave(&g_nodes_lock, &fl);
 	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
 		struct devfs_node *n = g_nodes[i];
 		if (n && kstrcmp(n->path, path) == 0) {
-			found = n;
+			devfs_snap_fill(s, n);
+			found = 1;
 			break;
+		}
+	}
+	if (found && hold) {
+		int slot = -1;
+
+		for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+			if (g_busy[i].count && g_busy[i].node == s->node) {
+				slot = i;
+				break;
+			}
+			if (!g_busy[i].count && slot < 0)
+				slot = i;
+		}
+		if (slot < 0) {
+			WARN_RATELIMIT(1, "devfs: no room to track an open of %s",
+				       path);
+			found = 0;
+		} else {
+			g_busy[slot].node = s->node;
+			g_busy[slot].count++;
 		}
 	}
 	spin_unlock_irqrestore(&g_nodes_lock, fl);
 	return found;
+}
+
+/* The open that devfs_node_get(.., 1) started is over. */
+static void devfs_node_release(struct devfs_node *node)
+{
+	uint64_t fl;
+	int done = 0;
+
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++)
+		if (g_busy[i].count && g_busy[i].node == node) {
+			g_busy[i].count--;
+			done = 1;
+			break;
+		}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	BUG_ON(!done); /* releasing an open that was never started */
+}
+
+unsigned devfs_node_in_use(const struct devfs_node *node)
+{
+	uint64_t fl;
+	unsigned c = 0;
+
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++)
+		if (g_busy[i].count && g_busy[i].node == node) {
+			c = g_busy[i].count;
+			break;
+		}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return c;
 }
 
 /* The VFS asks this before the mode bits (vfs_permission_st()).  It only
@@ -244,8 +350,8 @@ static int devfs_permission(const char *path, unsigned long ino, int want)
 }
 
 /* Does `path' name a registered directory, with or without a trailing
- * slash? */
-static struct devfs_node *devfs_dir_lookup(const char *path)
+ * slash?  Its snapshot goes to `s'. */
+static int devfs_dir_lookup(const char *path, struct devfs_node_snap *s)
 {
 	char tmp[DEVFS_NODE_PATH_MAX];
 	size_t n = 0;
@@ -257,8 +363,7 @@ static struct devfs_node *devfs_dir_lookup(const char *path)
 	tmp[n] = 0;
 	if (n > 1 && tmp[n - 1] == '/')
 		tmp[n - 1] = 0;
-	struct devfs_node *d = devfs_node_lookup(tmp);
-	return (d && d->is_dir) ? d : NULL;
+	return devfs_node_get(tmp, s, 0) && s->is_dir;
 }
 
 static int devfs_register_common(struct devfs_node *node, int is_dir)
@@ -449,6 +554,11 @@ static int devfs_link_target(const char *path, char *out, size_t cap)
 	return len;
 }
 
+/* Takes the node out of /dev: no new lookup finds it.  It does not wait
+ * for opens already in flight -- the driver's ->open may be waiting for a
+ * lock the caller holds -- so the driver keeps the node's memory until
+ * devfs_node_in_use() says none is left (and, for its open handles, until
+ * their ->release, as always). */
 int device_unregister(struct devfs_node *node)
 {
 	uint64_t fl;
@@ -538,7 +648,7 @@ const struct device_ops *device_file_ops(vfs_file_t *file)
 	if (!df)
 		return NULL;
 	if (df->type == DEVFS_TYPE_DEVICE)
-		return df->node ? df->node->ops : NULL;
+		return df->dops;
 	if (df->type == DEVFS_TYPE_ANON)
 		return df->aops;
 	return NULL;
@@ -591,18 +701,32 @@ int devfs_device_poll(vfs_file_t *f, short events, struct poll_table *pt,
 	return 0;
 }
 
-static int devfs_open_device(struct devfs_node *node, int flags,
+/* Open a registered node found as `sn' (an open in flight on it, which
+ * this ends).  The driver's ->open gets the node and decides whether it is
+ * still there to be opened. */
+static int devfs_open_device(const struct devfs_node_snap *sn, int flags,
 			     vfs_file_t **out, task_t *cur)
 {
 	devfs_file_t *df = devfs_alloc_file();
 
-	if (!df)
+	if (!df) {
+		devfs_node_release(sn->node);
 		return ST_NOMEM;
+	}
 	df->type = DEVFS_TYPE_DEVICE;
-	df->node = node;
+	df->node = sn->node;
+	df->dops = sn->ops;
+	df->n_mode = sn->mode;
+	df->n_uid = sn->uid;
+	df->n_gid = sn->gid;
+	df->n_major = sn->major;
+	df->n_minor = sn->minor;
+	df->n_is_blk = sn->is_blk;
+	df->n_ctime = sn->ctime;
 	df->vfs.flags = flags;
-	if (node->ops->open) {
-		int rc = node->ops->open(node, &df->vfs, flags, cur);
+	if (sn->ops->open) {
+		int rc = sn->ops->open(sn->node, &df->vfs, flags, cur);
+		devfs_node_release(sn->node);
 		if (rc < 0) {
 			kfree(df);
 			/* A driver's refusal keeps its meaning: "in use" and "no
@@ -631,6 +755,8 @@ static int devfs_open_device(struct devfs_node *node, int flags,
 				return ST_IO;
 			}
 		}
+	} else {
+		devfs_node_release(sn->node);
 	}
 	*out = &df->vfs;
 	return ST_OK;
@@ -918,22 +1044,33 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 
 	/* Registered nodes: a directory, or a device with its own ops. */
 	{
-		struct devfs_node *d = devfs_dir_lookup(path);
-		if (d) {
+		struct devfs_node_snap *sn =
+			(struct devfs_node_snap *)kalloc(sizeof(*sn));
+		int r = ST_NOT_FOUND;
+
+		if (!sn)
+			return ST_NOMEM;
+		if (devfs_dir_lookup(path, sn)) {
 			devfs_file_t *df = devfs_alloc_file();
-			if (!df)
-				return ST_NOMEM;
-			df->type = DEVFS_TYPE_DEVICE_DIR;
-			df->node = d;
-			*out = &df->vfs;
-			return ST_OK;
+			if (df) {
+				df->type = DEVFS_TYPE_DEVICE_DIR;
+				kstrncpy(df->npath, sn->path,
+					 sizeof(df->npath));
+				*out = &df->vfs;
+				r = ST_OK;
+			} else {
+				r = ST_NOMEM;
+			}
+		} else if (devfs_node_get(path, sn, 1)) {
+			/* (a link was resolved by devfs_open_for_task) */
+			if (!sn->is_dir && !sn->is_link && sn->ops)
+				r = devfs_open_device(sn, flags, out, cur);
+			else
+				devfs_node_release(sn->node);
 		}
-		struct devfs_node *n = devfs_node_lookup(path);
-		/* (a link was resolved by devfs_open_for_task already) */
-		if (n && !n->is_dir && !n->is_link)
-			return devfs_open_device(n, flags, out, cur);
+		kfree(sn);
+		return r;
 	}
-	return ST_NOT_FOUND;
 }
 
 int devfs_open_for_task(const char *path, int flags, unsigned int cmode,
@@ -1023,10 +1160,10 @@ static int devfs_parse_unit(const char *p)
  * framework's plugin registry checks /dev/dri this way -- concluded on
  * every start that it was not, and rebuilt it.  A node registered before
  * the clock was known carries 0 and is dated to the boot as well. */
-static uint64_t devfs_node_time(const struct devfs_node *n)
+static uint64_t devfs_node_time(uint64_t ctime)
 {
-	if (n && n->ctime)
-		return n->ctime;
+	if (ctime)
+		return ctime;
 	return timer_get_boot_epoch();
 }
 
@@ -1047,7 +1184,7 @@ int devfs_stat(const char *path, struct kstat *st)
 	mm_memset(st, 0, sizeof(*st));
 	/* Built-in nodes and directories: there since boot.  Registered
 	 * nodes overwrite this with their own time below. */
-	uint64_t t = devfs_node_time(NULL);
+	uint64_t t = devfs_node_time(0);
 	uint64_t now = timer_get_epoch(); /* /dev/shm objects: no times of their own */
 	/* The shared memory namespace: world-writable and sticky like /tmp, so
 	 * any user can create an object but only its owner can remove it. */
@@ -1132,35 +1269,43 @@ int devfs_stat(const char *path, struct kstat *st)
 		rmaj = 136;
 		rmin = (uint32_t)id;
 	} else {
-		struct devfs_node *d = devfs_dir_lookup(path);
-		if (d) {
-			st->st_mode = S_IFDIR | (d->mode ? d->mode : 0755);
-			st->st_uid = d->uid;
-			st->st_gid = d->gid;
+		struct devfs_node_snap *sn =
+			(struct devfs_node_snap *)kalloc(sizeof(*sn));
+
+		if (!sn)
+			return ST_NOMEM;
+		if (devfs_dir_lookup(path, sn)) {
+			st->st_mode = S_IFDIR | (sn->mode ? sn->mode : 0755);
+			st->st_uid = sn->uid;
+			st->st_gid = sn->gid;
 			st->st_nlink = 1;
-			st->st_atime = devfs_node_time(d);
-			st->st_mtime = devfs_node_time(d);
-			st->st_ctime = devfs_node_time(d);
+			st->st_atime = devfs_node_time(sn->ctime);
+			st->st_mtime = st->st_atime;
+			st->st_ctime = st->st_atime;
+			kfree(sn);
 			return ST_OK;
 		}
-		struct devfs_node *n = devfs_node_lookup(path);
-		if (!n)
+		if (!devfs_node_get(path, sn, 0)) {
+			kfree(sn);
 			return ST_NOT_FOUND;
-		st->st_mode = (n->is_blk ? S_IFBLK : S_IFCHR) | (n->mode & 07777);
+		}
+		st->st_mode = (sn->is_blk ? S_IFBLK : S_IFCHR) |
+			      (sn->mode & 07777);
 		st->st_blksize = 4096;
-		st->st_uid = n->uid;
-		st->st_gid = n->gid;
-		st->st_rdev = ((uint64_t)n->major << 8) | n->minor;
+		st->st_uid = sn->uid;
+		st->st_gid = sn->gid;
+		st->st_rdev = kdev_encode(sn->major, sn->minor);
 		st->st_nlink = 1;
-		st->st_atime = devfs_node_time(n);
-		st->st_mtime = devfs_node_time(n);
-		st->st_ctime = devfs_node_time(n);
+		st->st_atime = devfs_node_time(sn->ctime);
+		st->st_mtime = st->st_atime;
+		st->st_ctime = st->st_atime;
+		kfree(sn);
 		return ST_OK;
 	}
 	st->st_mode = S_IFCHR | perm;
 	st->st_uid = uid;
 	st->st_gid = gid;
-	st->st_rdev = ((uint64_t)rmaj << 8) | rmin;
+	st->st_rdev = kdev_encode(rmaj, rmin);
 	st->st_nlink = 1;
 	st->st_atime = t;
 	st->st_mtime = t;
@@ -1179,8 +1324,18 @@ int devfs_chdir(const char *path)
 	    is_path(path, "/dev/shm") || is_path(path, "/dev/shm/")) {
 		return ST_OK;
 	}
-	if (devfs_dir_lookup(path))
-		return ST_OK;
+	{
+		struct devfs_node_snap *sn =
+			(struct devfs_node_snap *)kalloc(sizeof(*sn));
+		int isdir;
+
+		if (!sn)
+			return ST_NOMEM;
+		isdir = devfs_dir_lookup(path, sn);
+		kfree(sn);
+		if (isdir)
+			return ST_OK;
+	}
 	return ST_NOT_FOUND;
 }
 
@@ -1490,8 +1645,8 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 				     df->dir_pos - DEVFS_DIRPOS_REG :
 				     0;
 
-		for (; df->node && devfs_node_child(df->node->path, i, nm,
-						    sizeof(nm), &dt);
+		for (; df->npath[0] && devfs_node_child(df->npath, i, nm,
+							 sizeof(nm), &dt);
 		     i++) {
 			if (!devfs_write_dirent64((char *)buf, (unsigned)bytes,
 						  &out_off, nm, 100 + i,
@@ -1783,11 +1938,8 @@ int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 	if (req == DEVFS_FIONBIO) {
 		int on;
 
-		if (!argp)
+		if (!argp || copy_from_user(&on, argp, sizeof(on)))
 			return -EFAULT;
-		smap_disable();
-		on = *(const int *)argp;
-		smap_enable();
 		if (on)
 			f->flags |= O_NONBLOCK;
 		else
@@ -1871,17 +2023,16 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	}
 
 	if (df->type == DEVFS_TYPE_DEVICE && df->node) {
-		const struct device_ops *ops = df->node->ops;
+		const struct device_ops *ops = df->dops;
 		mm_memset(st, 0, sizeof(*st));
-		st->st_mode = (df->node->is_blk ? S_IFBLK : S_IFCHR) |
-			      (df->node->mode & 07777);
-		st->st_uid = df->node->uid;
-		st->st_gid = df->node->gid;
-		st->st_rdev = ((uint64_t)df->node->major << 8) |
-			      df->node->minor;
+		st->st_mode = (df->n_is_blk ? S_IFBLK : S_IFCHR) |
+			      (df->n_mode & 07777);
+		st->st_uid = df->n_uid;
+		st->st_gid = df->n_gid;
+		st->st_rdev = kdev_encode(df->n_major, df->n_minor);
 		st->st_nlink = 1;
 		st->st_blksize = 4096;
-		st->st_atime = devfs_node_time(df->node);
+		st->st_atime = devfs_node_time(df->n_ctime);
 		st->st_mtime = st->st_atime;
 		st->st_ctime = st->st_atime;
 		if (ops && ops->fstat)
@@ -1990,7 +2141,7 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	st->st_mode = S_IFCHR | perm;
 	st->st_uid = uid;
 	st->st_gid = gid;
-	st->st_rdev = ((uint64_t)rmaj << 8) | rmin;
+	st->st_rdev = kdev_encode(rmaj, rmin);
 	st->st_nlink = 1;
 	st->st_size = 0;
 	return 0;
@@ -2069,8 +2220,12 @@ static int devfs_lstat(const char *path, struct kstat *st)
 	st->st_size = (uint64_t)len;
 	st->st_blksize = 4096;
 	{
-		struct devfs_node *n = devfs_node_lookup(path);
-		uint64_t t = devfs_node_time(n);
+		struct devfs_node_snap *sn =
+			(struct devfs_node_snap *)kalloc(sizeof(*sn));
+		uint64_t t = devfs_node_time(
+			(sn && devfs_node_get(path, sn, 0)) ? sn->ctime : 0);
+		if (sn)
+			kfree(sn);
 		st->st_atime = t;
 		st->st_mtime = t;
 		st->st_ctime = t;
@@ -2113,5 +2268,5 @@ int devfs_file_is_blk(vfs_file_t *f)
 	devfs_file_t *df = devfs_file_of(f);
 
 	return df && df->type == DEVFS_TYPE_DEVICE && df->node &&
-	       df->node->is_blk;
+	       df->n_is_blk;
 }

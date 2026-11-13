@@ -15,6 +15,7 @@
 #define _KERNEL_PAGECACHE_H_
 
 #include <kernel/uapi/types.h>
+#include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
 
 struct vfs_superblock; /* forward — see vfs_sb.h                    */
@@ -58,7 +59,10 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 #define PC_PAGE_VALID 0x01 // Page contains valid data
 #define PC_PAGE_DIRTY 0x02 // Page modified, needs writeback
 #define PC_PAGE_REFERENCED 0x04 // Accessed since last CLOCK sweep
-#define PC_PAGE_LOCKED 0x08 // Page locked for I/O (do not evict)
+/* Taken for writeback (a flush pass or reclaim storing it): one taker at a
+ * time, set and cleared only by writeback.  Keeping the frame alive is the
+ * reference count's job (pc_page_t.refs), not this bit's. */
+#define PC_PAGE_LOCKED 0x08
 #define PC_PAGE_READAHEAD 0x10 // Page was fetched by read-ahead
 /* Detached from the cache while somebody still held it.
  *
@@ -91,8 +95,13 @@ typedef struct pc_page {
 	uint8_t *data; // Virtual pointer (phys_to_virt of phys_addr)
 
 	// State
-	uint32_t flags; // PC_PAGE_* flags
+	uint32_t flags; // PC_PAGE_* flags, changed atomically
 	uint32_t _pad;
+	/* References.  The cache holds one while the page can be found;
+	 * everybody using the page outside the cache's locks (a copy into or
+	 * out of it, writeback) holds one more.  The last one frees the
+	 * frame. */
+	refcount_t refs;
 
 	// Hash chain (per-bucket singly-linked list)
 	struct pc_page *hash_next;
@@ -123,7 +132,8 @@ void pagecache_init(void);
 // --- Core lookup / insert ---
 
 // Look up a cached page.  Returns NULL if not cached.
-// Sets PC_PAGE_REFERENCED on hit.
+// Sets PC_PAGE_REFERENCED on hit.  The page is NOT held: reclaim or an
+// invalidation may free it once the lookup has returned.
 pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index);
 
 // Fetch a page: lookup + read-from-disk on miss.
@@ -132,13 +142,29 @@ pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index);
 // `file_size` is the file size in bytes (to avoid reading past EOF).
 // Returns page with data, or NULL on error.
 // This is the primary entry point for cached reads.
+// The page is NOT held (as pagecache_lookup()); to copy out of it with
+// reclaim unable to free it meanwhile, take it with pagecache_get_held().
 pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 			 unsigned long file_size, struct vfs_superblock *sb,
 			 unsigned long start_cluster);
 
+// pagecache_get(), but the page returned is HELD (a reference): reclaim
+// cannot free it while the caller copies out of it, and an invalidation
+// leaves the frame to the last holder.  Release it with pagecache_put().
+pc_page_t *pagecache_get_held(unsigned long cluster_id,
+			      unsigned long page_index,
+			      unsigned long file_size,
+			      struct vfs_superblock *sb,
+			      unsigned long start_cluster);
+
+// Release a page taken with pagecache_get_held() (or a writer's hold, through
+// pagecache_write_end/abort).  Frees it when it was the last reference.
+void pagecache_put(pc_page_t *page);
+
 // Insert a page into the cache (used internally and by write path).
 // The caller provides a page with data already filled in.
 // If a page with the same key exists, returns the existing one.
+// The returned page is not held.
 pc_page_t *pagecache_insert(pc_page_t *page);
 
 // --- Write-back ---
@@ -157,11 +183,13 @@ void pagecache_mark_dirty(pc_page_t *page);
  *
  * The caller copies its data in and then calls pagecache_mark_dirty(): the page
  * must not be advertised for writeback before it holds what is to be written. */
-/* The returned page is HELD: it cannot be reclaimed or written back until the
- * caller releases it.  Without that, reclaim on another processor is free to
- * take the frame -- the page is clean until the copy finishes -- and the copy
- * lands in memory belonging to somebody else.  Release with exactly one of
- * pagecache_write_end() (published) or pagecache_write_abort() (discarded). */
+/* The returned page is HELD (a reference): it cannot be reclaimed or freed
+ * until the caller releases it.  Without that, reclaim on another processor
+ * is free to take the frame -- the page is clean until the copy finishes --
+ * and the copy lands in memory belonging to somebody else.  Holds nest: a
+ * page writeback has taken keeps writeback's hold through the write.
+ * Release with exactly one of pagecache_write_end() (published) or
+ * pagecache_write_abort() (discarded). */
 pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
 				   unsigned long page_index,
 				   unsigned long file_size,

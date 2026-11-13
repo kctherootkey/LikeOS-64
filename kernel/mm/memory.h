@@ -686,6 +686,27 @@ void mm_region_retire(struct mmap_region *r, uint64_t *pml4);
 /* Close the files mm_region_retire() set aside for `t' while it held its
  * mmap_lock for writing.  Called by mm_write_unlock() once it is released. */
 void mm_close_deferred(struct task *t);
+/* Shared mappings of files on a disk filesystem (mmap_region.wb_file): what
+ * is stored into their pages is written to the file by msync, munmap, exec
+ * and exit.  mm_region_writes_back() says whether a record is one;
+ * mm_region_writeback_queue() queues the written pages of [from, to), read
+ * from `pml4', to be written once the caller's address-space write lock is
+ * released; mm_writeback_page() writes one page at its file offset (never
+ * past the end of the file), 0 or a negative errno. */
+struct vfs_file;
+bool mm_region_writes_back(const struct mmap_region *r);
+void mm_region_writeback_queue(uint64_t *pml4, const struct mmap_region *r,
+			       uint64_t from, uint64_t to);
+int mm_writeback_page(struct vfs_file *f, uint64_t phys, uint64_t off);
+/* The exit walk's form: the written pages of the whole record, read from
+ * `pml4', written now through `f' -- the file the walk took out of the
+ * record, with its hold.  Nothing may hold the address-space lock. */
+void mm_region_writeback_exit(uint64_t *pml4, const struct mmap_region *r,
+			      struct vfs_file *f);
+/* msync(2) over [start, end), both page aligned, start < end, `flags'
+ * already checked (MS_ASYNC / MS_SYNC / MS_INVALIDATE).  0 or a negative
+ * errno; -ENOMEM when part of the range is not mapped. */
+int64_t mm_msync(uint64_t start, uint64_t end, int flags);
 /* Pages this address space actually has resident -- the real resident set,
  * as opposed to how much address space has been reserved. */
 uint64_t mm_count_resident_pages(uint64_t *pml4);

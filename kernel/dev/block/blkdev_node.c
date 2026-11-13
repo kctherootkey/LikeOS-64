@@ -263,7 +263,13 @@ void blkdev_nodes_reap(void)
 	while (n) {
 		struct blk_node *next = n->next;
 
+		/* No handle (ref) and no open in flight: devfs hands the node
+		 * to blkdev_open() after its own lookup, and that open reads
+		 * the node before it takes a reference.  The grace period
+		 * stays as a second margin.  devfs_node_in_use() only takes
+		 * devfs' registry spinlock (a leaf), so it nests here. */
 		if (refcount_read(&n->ref) == 0 &&
+		    devfs_node_in_use(&n->dn) == 0 &&
 		    now - n->dead_ns >= BLKNODE_GRACE_NS) {
 			n->next = dead;
 			dead = n;
@@ -415,6 +421,16 @@ int blkdev_links_update_locked(block_device_t *bdev)
 	/* by-id */
 	if (blk_bdev_disk_id(bdev, name, sizeof(name)) == 0)
 		blkdev_link_add_locked(bdev, BLD_ID, name);
+	/* A named disk's world-wide identifier ("nvme-eui.0025...") */
+	if (d->wwid[0] && d->bus[0]) {
+		/* Only a whole name: a cut one could be the same for two
+		 * namespaces (the NVMe fallback identifier ends with the
+		 * namespace ID), so a name that does not fit is no link. */
+		if (ksnprintf(name, sizeof(name), "%s-%s%s", d->bus, d->wwid,
+			      suffix) < (int)sizeof(name) &&
+		    blkdev_link_escape(name, esc, sizeof(esc)) == 0)
+			blkdev_link_add_locked(bdev, BLD_ID, esc);
+	}
 	if (d->wwn[0]) {
 		const char *w = d->wwn;
 		int has0x = w[0] == '0' && (w[1] == 'x' || w[1] == 'X');
@@ -424,8 +440,16 @@ int blkdev_links_update_locked(block_device_t *bdev)
 		if (blkdev_link_escape(name, esc, sizeof(esc)) == 0)
 			blkdev_link_add_locked(bdev, BLD_ID, esc);
 	}
-	/* by-path */
-	if (d->pci && d->host_no >= 0) {
+	/* by-path: a driver-named disk gives its own suffix
+	 * ("pci-0000:01:00.0-nvme-1") */
+	if (d->pci && d->by_path[0]) {
+		const pci_device_t *pd = d->pci;
+
+		ksnprintf(name, sizeof(name), "pci-%04x:%02x:%02x.%x-%s%s",
+			  pd->segment, pd->bus, pd->device, pd->function,
+			  d->by_path, suffix);
+		blkdev_link_add_locked(bdev, BLD_PATH, name);
+	} else if (d->pci && d->host_no >= 0) {
 		const pci_device_t *pd = d->pci;
 
 		if (kstrcmp(d->bus, "usb") == 0)
@@ -654,8 +678,20 @@ static uint64_t blkdev_size(const block_device_t *bdev)
  * 32 workers, a database's I/O threads -- runs its own requests, so the
  * device sees them side by side (that is what fills an NCQ queue).  Returns
  * the bytes moved, or a negative errno when nothing was. */
+static long blkdev_xfer_flags(struct blk_file *bf, void *ubuf, long bytes,
+			      uint64_t pos, int write, uint32_t rflags);
+
 static long blkdev_xfer(struct blk_file *bf, void *ubuf, long bytes,
 			uint64_t pos, int write)
+{
+	return blkdev_xfer_flags(bf, ubuf, bytes, pos, write, 0);
+}
+
+/* The same with request flags (preadv2/pwritev2: BLK_REQ_POLLED for
+ * RWF_HIPRI, BLK_REQ_NOWAIT, BLK_REQ_FUA for RWF_DSYNC/RWF_SYNC); 0 is
+ * exactly the plain read()/write() path. */
+static long blkdev_xfer_flags(struct blk_file *bf, void *ubuf, long bytes,
+			      uint64_t pos, int write, uint32_t rflags)
 {
 	block_device_t *bdev = bf->bdev;
 	uint32_t ss = bdev->sector_size ? bdev->sector_size : 512;
@@ -718,7 +754,9 @@ static long blkdev_xfer(struct blk_file *bf, void *ubuf, long bytes,
 			span = bcap - off;
 		nsect = (uint32_t)((off + span + ss - 1) / ss);
 		if (!write) {
-			r = blk_read_sync(bdev, lba, nsect, bounce);
+			r = rflags ? blk_read_sync_flags(bdev, lba, nsect,
+							 bounce, rflags) :
+				     blk_read_sync(bdev, lba, nsect, bounce);
 			if (r) {
 				rc = r;
 				break;
@@ -753,7 +791,7 @@ static long blkdev_xfer(struct blk_file *bf, void *ubuf, long bytes,
 				rc = -EFAULT;
 				break;
 			}
-			r = blk_write_sync(bdev, lba, nsect, bounce, 0);
+			r = blk_write_sync(bdev, lba, nsect, bounce, rflags);
 			if (r) {
 				rc = r;
 				break;
@@ -791,6 +829,124 @@ static long blkdev_rw(struct blk_file *bf, void *ubuf, long bytes, int write)
 		blk_mutex_unlock(&bf->io);
 	}
 	return r;
+}
+
+/* An atomic write (RWF_ATOMIC): the iovecs gathered into one buffer and
+ * written as ONE request with BLK_REQ_ATOMIC -- whole logical blocks,
+ * at most one request of the device; the block layer checks the
+ * device's atomic write limits (blk_validate_atomic_write).  All or
+ * nothing: the bytes written, or a negative errno. */
+static long blkdev_atomic_write(struct blk_file *bf,
+				const struct blk_uvec *iov, int cnt,
+				uint64_t pos, uint32_t rflags)
+{
+	block_device_t *bdev = bf->bdev;
+	uint32_t ss = bdev->sector_size ? bdev->sector_size : 512;
+	uint64_t total = 0, bphys, size;
+	uint32_t pages, maxs;
+	uint8_t *buf;
+	long rc;
+
+	if (!blk_open_writable(bf->flags))
+		return -EBADF;
+	if (blk_bdev_read_only(bdev))
+		return -EPERM;
+	if (!bdev->disk || !bdev->disk->queue ||
+	    !(bdev->disk->queue->limits.features & BLK_FEAT_ATOMIC_WRITES))
+		return -EOPNOTSUPP;
+	for (int i = 0; i < cnt; i++)
+		total += iov[i].len;
+	size = blkdev_size(bdev);
+	maxs = bdev->disk->queue->limits.max_sectors;
+	if (!total || (pos % ss) || (total % ss) || pos + total > size ||
+	    total > BLKDEV_BOUNCE_BYTES || total / ss > maxs)
+		return -EINVAL;
+	pages = (uint32_t)((total + PAGE_SIZE - 1) / PAGE_SIZE);
+	bphys = mm_allocate_contiguous_pages(pages);
+	if (!bphys)
+		return -ENOMEM;
+	buf = (uint8_t *)phys_to_virt(bphys);
+	{
+		uint64_t at = 0;
+
+		for (int i = 0; i < cnt; i++) {
+			if (iov[i].len &&
+			    copy_from_user(buf + at, iov[i].base,
+					   (size_t)iov[i].len)) {
+				mm_free_contiguous_pages(bphys, pages);
+				return -EFAULT;
+			}
+			at += iov[i].len;
+		}
+	}
+	rc = blk_write_sync(bdev, pos / ss, (uint32_t)(total / ss), buf,
+			    rflags | BLK_REQ_ATOMIC);
+	mm_free_contiguous_pages(bphys, pages);
+	return rc ? rc : (long)total;
+}
+
+long blkdev_file_rwv(struct vfs_file *file, const struct blk_uvec *iov,
+		     int cnt, int64_t off, int write, uint32_t rwf)
+{
+	struct blk_file *bf = blk_file_of(file);
+	uint32_t rflags = 0;
+	uint64_t pos;
+	long total = 0;
+
+	if (!bf)
+		return -EBADF;
+	if (cnt < 0 || (cnt && !iov))
+		return -EINVAL;
+	if (rwf & BLK_RWF_HIPRI)
+		rflags |= BLK_REQ_POLLED;
+	if (rwf & BLK_RWF_NOWAIT)
+		rflags |= BLK_REQ_NOWAIT;
+	if (write && (rwf & (BLK_RWF_DSYNC | BLK_RWF_SYNC)))
+		rflags |= BLK_REQ_FUA;
+	if (off == -1) {
+		blk_mutex_lock(&bf->io);
+		pos = bf->pos;
+		blk_mutex_unlock(&bf->io);
+	} else if (off < 0) {
+		return -EINVAL;
+	} else {
+		pos = (uint64_t)off;
+	}
+	/* RWF_APPEND: a write at the end of the device (which has no room
+	 * past it). */
+	if (write && (rwf & BLK_RWF_APPEND) && !(rwf & BLK_RWF_NOAPPEND))
+		pos = blkdev_size(bf->bdev);
+	if (write && (rwf & BLK_RWF_ATOMIC)) {
+		total = blkdev_atomic_write(bf, iov, cnt, pos, rflags);
+	} else {
+		for (int i = 0; i < cnt; i++) {
+			long r;
+
+			if (!iov[i].len)
+				continue;
+			if (iov[i].len > (uint64_t)0x7FFFFFFFFFFFFFFFULL)
+				return total ? total : -EINVAL;
+			r = blkdev_xfer_flags(bf, iov[i].base, (long)iov[i].len,
+					      pos, write, rflags);
+			if (r < 0) {
+				if (!total)
+					total = r;
+				break;
+			}
+			total += r;
+			pos += (uint64_t)r;
+			if ((uint64_t)r < iov[i].len)
+				break; /* short: end of the device */
+		}
+	}
+	if (off == -1 && total > 0) {
+		blk_mutex_lock(&bf->io);
+		bf->pos = pos + ((write && (rwf & BLK_RWF_ATOMIC)) ?
+					 (uint64_t)total :
+					 0);
+		blk_mutex_unlock(&bf->io);
+	}
+	return total;
 }
 
 static long blkdev_pread(vfs_file_t *file, void *buf, long bytes, long off)
@@ -1093,6 +1249,21 @@ long blkdev_ioctl(block_device_t *bdev, unsigned long cmd, void *argp,
 				 disk->ops->ioctl_mode(bdev, cmd, argp, cur,
 						       open_flags) :
 				 disk->ops->ioctl(bdev, cmd, argp, cur);
+		if (r != -ENOTTY)
+			return r;
+	}
+	/* Zoned devices (BLK*ZONE*) and persistent reservations (IOC_PR_*):
+	 * the multi-queue block layer's generic handling, for the disks
+	 * that have them. */
+	if (q && blk_queue_is_zoned(q)) {
+		long r = blkdev_zone_ioctl(disk, cmd, argp, open_flags);
+
+		if (r != -ENOTTY)
+			return r;
+	}
+	if (disk->ops && disk->ops->pr_ops) {
+		long r = blkdev_pr_ioctl(disk, cmd, argp, open_flags);
+
 		if (r != -ENOTTY)
 			return r;
 	}

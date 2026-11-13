@@ -125,10 +125,12 @@ struct device_ops {
 
 /* Longest path of a registered node: room for the /dev/disk/by-id names
  * of a disk ("/dev/disk/by-id/ata-<40-char model>_<20-char serial>-part15")
- * and the escaped filesystem labels of /dev/disk/by-label. */
-#define DEVFS_NODE_PATH_MAX 128
+ * the escaped filesystem labels of /dev/disk/by-label, and the NVMe
+ * fallback identity ("/dev/disk/by-id/nvme-nvme.<vid>-<serial hex>-<model
+ * hex>-<nsid>-part15", up to about 170 characters). */
+#define DEVFS_NODE_PATH_MAX 256
 /* Longest target of a registered symbolic link. */
-#define DEVFS_LINK_MAX 128
+#define DEVFS_LINK_MAX 256
 
 /* A registered node under /dev. */
 struct devfs_node {
@@ -163,9 +165,22 @@ struct devfs_node {
 };
 
 /* Register / unregister.  A path whose parent directory is not one of the
- * built-in ones must have been registered as a directory first. */
+ * built-in ones must have been registered as a directory first.
+ *
+ * Lifetime: the node's memory is the driver's.  devfs copies what it needs
+ * of a node while its registry lock is held and never reads the node again;
+ * the only use after that is the node pointer handed to the driver's
+ * ->open (and device_file_node()).  Between finding a node and its ->open
+ * returning, an open is IN FLIGHT on it.  device_unregister() takes the
+ * node out of /dev and returns without waiting for those (the ->open may
+ * need a lock the caller holds); the driver frees the node's memory only
+ * when devfs_node_in_use() is 0 -- and, for handles it opened, not before
+ * their ->release, as always. */
 int device_register(struct devfs_node *node);
 int device_unregister(struct devfs_node *node);
+/* Opens in flight on `node' (found, ->open not yet returned).  Any context
+ * that may take a spinlock. */
+unsigned devfs_node_in_use(const struct devfs_node *node);
 int device_register_dir(struct devfs_node *node);
 /* Register a symbolic link node (path and link filled in). */
 int device_register_link(struct devfs_node *node);

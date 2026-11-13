@@ -19,6 +19,7 @@
 #include <kernel/fs/vfs.h> /* vfs_file refcount in the pty diagnostic dump */
 #include <kernel/fs/sysfs.h>
 #include <kernel/dev/input/keyboard.h> /* the console's KD* ioctls */
+#include <kernel/ke/uaccess_range.h>
 
 #define TTY_MAX_PTYS 16
 
@@ -28,13 +29,8 @@ static spinlock_t tty_lock = SPINLOCK_INIT("tty");
 // Security: Validate user pointer is in user space
 static bool tty_validate_user_ptr(uint64_t ptr, size_t len)
 {
-	if (ptr < 0x10000)
-		return false; // Reject low addresses (NULL deref protection)
-	if (ptr >= 0x7FFFFFFFFFFF)
-		return false; // Beyond user space
-	if (ptr + len < ptr)
-		return false; // Overflow check
-	return true;
+	/* The whole range, overflow-safe (uaccess_range.h). */
+	return user_range_ok(ptr, (uint64_t)len);
 }
 
 // Security: SMAP-aware copy from kernel to user

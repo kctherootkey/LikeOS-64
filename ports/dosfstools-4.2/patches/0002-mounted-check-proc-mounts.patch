@@ -1,0 +1,21 @@
+is_device_mounted() reads /etc/mtab and calls a device unmounted when that
+file cannot be opened.  LikeOS has no /etc/mtab; the table of mounted file
+systems is /proc/mounts, which is read when /etc/mtab is missing.  (The
+O_EXCL open of the target stays the second line of defence: the kernel
+refuses it with EBUSY while the device is mounted.)
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/device_info.c	2021-01-31 13:49:12.000000000 +0100
++++ b/src/device_info.c	2026-11-11 15:02:49.391994758 +0100
+@@ -325,6 +325,10 @@
+     struct mntent *mnt;
+ 
+     if ((f = setmntent(_PATH_MOUNTED, "r")) == NULL)
++#ifdef __LIKEOS__
++	/* No /etc/mtab: the kernel's table of mounted file systems. */
++	if ((f = setmntent("/proc/mounts", "r")) == NULL)
++#endif
+ 	return 0;
+     while ((mnt = getmntent(f)) != NULL)
+ 	if (strcmp(path, mnt->mnt_fsname) == 0)

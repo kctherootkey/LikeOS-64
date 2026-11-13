@@ -370,14 +370,14 @@ static int ext4_dir_csum_ok(const ext4_fs_t *fs, unsigned long dir_ino,
 	       want;
 }
 
-/* Verify a block/inode bitmap buffer against the csum kept in its group
- * descriptor.  Returns 1 if OK (no metadata_csum, or an uninitialized group). */
-static int ext4_block_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g,
-				     const uint8_t *bm)
+/* Compare a block/inode bitmap buffer with the csum kept in its group
+ * descriptor, whatever the group's UNINIT flags say.  Returns 1 if they match
+ * (or there is no metadata_csum).  The repair of stale UNINIT flags uses this
+ * directly: there the flag is the thing in doubt. */
+static int ext4_block_bitmap_csum_match(const ext4_fs_t *fs, unsigned g,
+					const uint8_t *bm)
 {
 	if (!fs->has_metadata_csum)
-		return 1;
-	if (fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT)
 		return 1;
 	uint32_t csum =
 		ext4_crc32c(fs->csum_seed, bm, fs->blocks_per_group / 8);
@@ -388,12 +388,10 @@ static int ext4_block_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g,
 		csum &= 0xFFFFu;
 	return csum == want;
 }
-static int ext4_inode_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g,
-				     const uint8_t *bm)
+static int ext4_inode_bitmap_csum_match(const ext4_fs_t *fs, unsigned g,
+					const uint8_t *bm)
 {
 	if (!fs->has_metadata_csum)
-		return 1;
-	if (fs->gdt[g].bg_flags & EXT4_BG_INODE_UNINIT)
 		return 1;
 	uint32_t csum =
 		ext4_crc32c(fs->csum_seed, bm, (fs->inodes_per_group + 7) / 8);
@@ -403,6 +401,24 @@ static int ext4_inode_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g,
 	else
 		csum &= 0xFFFFu;
 	return csum == want;
+}
+
+/* Verify a bitmap read for use.  Returns 1 if OK: it matches, there is no
+ * metadata_csum, or the group is flagged uninitialized (its bitmap is not
+ * laid out on disk yet). */
+static int ext4_block_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g,
+				     const uint8_t *bm)
+{
+	if (fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT)
+		return 1;
+	return ext4_block_bitmap_csum_match(fs, g, bm);
+}
+static int ext4_inode_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g,
+				     const uint8_t *bm)
+{
+	if (fs->gdt[g].bg_flags & EXT4_BG_INODE_UNINIT)
+		return 1;
+	return ext4_inode_bitmap_csum_match(fs, g, bm);
 }
 
 /* Verify an EXTERNAL extent-tree block (depth>0 index/leaf node) against its
@@ -1461,6 +1477,96 @@ static void ext4_bput(void *p)
  * Group descriptor + inode reads
  * =================================================================== */
 
+/* ---- Block group geometry ------------------------------------------------
+ *
+ * Where the superblock copies and the group descriptor table live.  The
+ * allocators need this to build the block bitmap of a group whose bitmap was
+ * never written (BLOCK_UNINIT): its used blocks are exactly the metadata at
+ * the start of the group plus whichever of its own bitmaps / inode table
+ * blocks fall inside it.
+ *
+ * Only the classic layout is described: the descriptor table right behind
+ * the superblock (no meta_bg), superblock copies in the groups sparse_super
+ * names or in every group (no sparse_super2).  The UNINIT flags are honoured
+ * on metadata_csum file systems with that layout (ext4_uninit_honoured); on
+ * any other the bitmaps on disk are used as they are. */
+
+#define EXT4_FEATURE_COMPAT_SPARSE_SUPER2 0x0200
+
+static int ext4_uninit_honoured(const ext4_fs_t *fs)
+{
+	return fs->has_metadata_csum &&
+	       !(fs->feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG) &&
+	       !(fs->feature_compat & EXT4_FEATURE_COMPAT_SPARSE_SUPER2);
+}
+
+static unsigned long ext4_group_first_block(const ext4_fs_t *fs, unsigned g)
+{
+	return fs->first_data_block + (unsigned long)g * fs->blocks_per_group;
+}
+
+/* Blocks group `g` covers: blocks_per_group, less for a short last group. */
+static unsigned ext4_blocks_in_group(const ext4_fs_t *fs, unsigned g)
+{
+	if (g == fs->groups_count - 1)
+		return (unsigned)(fs->blocks_count -
+				  ext4_group_first_block(fs, g));
+	return fs->blocks_per_group;
+}
+
+/* Blocks of the group descriptor table. */
+static unsigned ext4_gdt_blocks(const ext4_fs_t *fs)
+{
+	unsigned per_block = fs->block_size / fs->desc_size;
+	return (fs->groups_count + per_block - 1) / per_block;
+}
+
+/* Blocks of one group's inode table. */
+static unsigned ext4_itable_blocks(const ext4_fs_t *fs)
+{
+	return (unsigned)(((unsigned long)fs->inodes_per_group *
+				   fs->inode_size +
+			   fs->block_size - 1) /
+			  fs->block_size);
+}
+
+/* 1 if `a` is a power of `b` (b^1, b^2, ...). */
+static int ext4_is_power_of(unsigned a, unsigned b)
+{
+	for (;;) {
+		if (a < b)
+			return 0;
+		if (a == b)
+			return 1;
+		if (a % b)
+			return 0;
+		a /= b;
+	}
+}
+
+/* Does group `g` carry a superblock (the primary or a backup)?  sparse_super:
+ * groups 0, 1 and the powers of 3, 5 and 7; without it: every group. */
+static int ext4_bg_has_super(const ext4_fs_t *fs, unsigned g)
+{
+	if (g <= 1 ||
+	    !(fs->feature_ro_compat & EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER))
+		return 1;
+	if (!(g & 1))
+		return 0;
+	return ext4_is_power_of(g, 3) || ext4_is_power_of(g, 5) ||
+	       ext4_is_power_of(g, 7);
+}
+
+/* Blocks at the very start of group `g` taken by its superblock copy, its GDT
+ * copy and the reserved GDT blocks (online-resize headroom, which follows
+ * every GDT copy). */
+static unsigned ext4_num_base_meta_blocks(const ext4_fs_t *fs, unsigned g)
+{
+	if (!ext4_bg_has_super(fs, g))
+		return 0;
+	return 1 + ext4_gdt_blocks(fs) + fs->sb_copy.s_reserved_gdt_blocks;
+}
+
 /* Load the entire group descriptor table into fs->gdt at mount time.  The
  * GDT is read on every inode access, so caching it in memory eliminates a
  * block read per inode lookup. */
@@ -2083,6 +2189,29 @@ static unsigned long ext4_sb_next_block(vfs_superblock_t *sb, unsigned long bid)
 	return EXT4_BID_ENC(ino, lidx + 1);
 }
 
+/* Block N of a chain, without walking (vfs_sb_ops_t.block_at): the same
+ * answer as N calls of ext4_sb_next_block -- the positional id while N lies
+ * inside the recorded size, holes included, 0 past it. */
+static unsigned long ext4_sb_block_at(vfs_superblock_t *sb,
+				      unsigned long chain_id,
+				      unsigned long block_index)
+{
+	ext4_fs_t *fs = (ext4_fs_t *)sb->fs_private;
+	ext4_inode in;
+
+	if (!fs || !EXT4_BID_IS(chain_id) || block_index > 0xFFFFFFFFUL)
+		return 0;
+	unsigned long ino = EXT4_BID_INO(chain_id);
+	if (ino == 0 || ino > fs->inodes_count ||
+	    !ext4_get_inode_cached(fs, ino, &in))
+		return 0;
+	unsigned long bs = fs->block_size ? fs->block_size : 4096;
+	unsigned long total = (ext4_inode_size(&in) + bs - 1) / bs;
+	if (block_index >= total)
+		return 0;
+	return EXT4_BID_ENC(ino, block_index);
+}
+
 /* Map block N of a file directly.  ext4 block ids are positional -- block N of
  * inode I is EXT4_BID_ENC(I, N) -- so there is nothing to walk; the only
  * question is whether the block exists, and the extent tree answers it.
@@ -2255,6 +2384,7 @@ static const vfs_sb_ops_t ext4_sb_ops = {
 	.end_of_chain_marker = ext4_sb_end_of_chain,
 	.next_block = ext4_sb_next_block,
 	.map_block = ext4_sb_map_block,
+	.block_at = ext4_sb_block_at,
 	.write_inode = ext4_sb_write_inode,
 	.lock_io = ext4_sb_lock_io,
 	.unlock_io = ext4_sb_unlock_io,
@@ -2694,6 +2824,8 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 static int ext4_create_inode(ext4_fs_t *fs, unsigned long ino, unsigned mode,
 			     unsigned uid, unsigned gid);
 static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir);
+static void ext4_abandon_new_inode(ext4_fs_t *fs, unsigned long ino,
+				   int is_dir);
 static void ext4_init_owner(unsigned puid, unsigned pgid, unsigned pmode,
 			    int is_dir, unsigned *uid, unsigned *gid,
 			    unsigned *mode);
@@ -2713,6 +2845,19 @@ static int ext4_open_impl(const char *path, int flags, unsigned cmode,
 
 	unsigned long ino = 0;
 	int rr = ext4_resolve(fs, path, &ino);
+	/* O_CREAT|O_EXCL fails on a name that exists -- a final symlink
+	 * counts as one, wherever it leads.  Decided here, under the I/O lock
+	 * that the create below holds too (ext4_open_locked), so two such
+	 * opens of one name cannot both succeed. */
+	if ((flags & O_CREAT) && (flags & O_EXCL)) {
+		unsigned long lino = 0;
+
+		if (rr == ST_OK ||
+		    (rr == ST_NOT_FOUND &&
+		     ext4_resolve_ex(fs, g_ext4_cwd_ino, path, 0, &lino, 0) ==
+			     ST_OK))
+			return ST_EXISTS;
+	}
 	if (rr != ST_OK) {
 		/* A genuine I/O / corruption error (e.g. a bad inode metadata_csum)
          * must surface as -EIO, not be masked as "not found" — and must not
@@ -2752,12 +2897,12 @@ static int ext4_open_impl(const char *path, int flags, unsigned cmode,
 		if (newino == 0)
 			return ST_NOMEM;
 		if (ext4_create_inode(fs, newino, nmode, nuid, ngid) != ST_OK) {
-			ext4_free_inode(fs, newino, 0);
+			ext4_abandon_new_inode(fs, newino, 0);
 			return ST_IO;
 		}
 		if (ext4_dir_add(fs, parent, nm, nl, newino,
 				 EXT4_FT_REG_FILE) != ST_OK) {
-			ext4_free_inode(fs, newino, 0);
+			ext4_abandon_new_inode(fs, newino, 0);
 			return ST_IO;
 		}
 		ext4_inode_cache_flush();
@@ -2904,13 +3049,16 @@ static long ext4_read_at_impl(vfs_file_t *f, void *buf, long bytes,
 		unsigned chunk =
 			(remaining < avail) ? (unsigned)remaining : avail;
 
-		pc_page_t *pg = pagecache_get(chain_id, page_idx, ef->size,
-					      &ef->fs->sb, chain_id);
+		/* Held across the copy: reclaim cannot free it meanwhile. */
+		pc_page_t *pg = pagecache_get_held(chain_id, page_idx, ef->size,
+						   &ef->fs->sb, chain_id);
 		if (!pg || !pg->data) {
+			pagecache_put(pg);
 			smap_enable();
 			return copied ? (long)copied : ST_IO;
 		}
 		mm_memcpy((uint8_t *)buf + copied, pg->data + page_off, chunk);
+		pagecache_put(pg);
 
 		pagecache_readahead(ra, chain_id, page_idx, ef->size,
 				    &ef->fs->sb, chain_id);
@@ -3296,32 +3444,40 @@ static void ext4_probe_dev_sync(ext4_fs_t *fs)
 	}
 }
 
-/* Central metadata-corruption handler — the ext4_error() analog.  Records the
- * error in the superblock (clears the "clean" bit, sets the error bit, bumps the
- * count) and persists it, then applies the errors= policy: remount read-only
- * (latch fs->read_only so all further writes are refused), panic, or continue.
- * The specific failed op still returns -EIO to its caller; this governs the
- * filesystem-wide reaction.  Idempotent: re-entry after the fs is already
- * errored re-records but does not re-apply the (one-shot) policy.  ext4_write_super
- * is intentionally NOT gated by the read-only latch so this can persist the mark. */
-static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino)
+/* Record a file system error in the superblock: clear the "clean" bit, set
+ * the error bit (so the next e2fsck runs a full check), bump the count, and
+ * persist it.  ext4_write_super is intentionally NOT gated by the read-only
+ * latch so this can persist the mark. */
+static void ext4_record_error(ext4_fs_t *fs)
 {
-	if (!fs)
-		return;
-	int first = !(fs->sb_copy.s_state & EXT4_ERROR_FS);
-	if (ino)
-		kprintf("ext4: ERROR: %s (inode %lu)\n", what, ino);
-	else
-		kprintf("ext4: ERROR: %s\n", what);
-
 	fs->sb_copy.s_state &= ~(uint16_t)EXT4_VALID_FS;
 	fs->sb_copy.s_state |= (uint16_t)EXT4_ERROR_FS;
 	fs->sb_copy.s_error_count++;
 	ext4_write_super(fs); /* best-effort; ungated by latch */
 	ext4_dev_sync(fs, "error-mark");
+}
 
-	if (!first)
-		return; /* policy already applied once   */
+/* Central metadata-corruption handler — the ext4_error() analog.  Records the
+ * error in the superblock (clears the "clean" bit, sets the error bit, bumps the
+ * count) and persists it, then applies the errors= policy: remount read-only
+ * (latch fs->read_only so all further writes are refused), panic, or continue.
+ * The specific failed op still returns -EIO to its caller; this governs the
+ * filesystem-wide reaction.  The policy applies on EVERY error, also on a disk
+ * that was already marked errored when it was mounted (the mark says an
+ * earlier mount saw an error, not that this one has reacted); only the
+ * "read-only" message is once per mount.  ext4_write_super is intentionally
+ * NOT gated by the read-only latch so this can persist the mark. */
+static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino)
+{
+	if (!fs)
+		return;
+	if (ino)
+		kprintf("ext4: ERROR: %s (inode %lu)\n", what, ino);
+	else
+		kprintf("ext4: ERROR: %s\n", what);
+
+	ext4_record_error(fs);
+
 	switch (fs->errors_behavior) {
 	case EXT4_ERRORS_PANIC:
 		kprintf("ext4: errors=panic -> halting\n");
@@ -3332,6 +3488,8 @@ static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino)
 		break;
 	case EXT4_ERRORS_RO:
 	default:
+		if (fs->read_only)
+			break; /* already refusing writes */
 		fs->read_only = 1; /* latch: refuse further writes  */
 		kprintf("ext4: remounting filesystem read-only\n");
 		break;
@@ -3535,6 +3693,197 @@ static unsigned long ext4_gd_inode_bitmap(ext4_fs_t *fs, unsigned g)
 	return lo | (hi << 32);
 }
 
+/* ---- Bitmaps of groups that were never initialized -----------------------
+ *
+ * With group descriptor checksums, mke2fs (and resize2fs) leave most groups
+ * flagged BLOCK_UNINIT and/or INODE_UNINIT and never write their bitmap
+ * blocks: whatever those blocks hold -- zeroes on a fresh image, a previous
+ * file system's data on a reused disk -- is NOT the bitmap.  The bitmap is
+ * defined by the geometry instead:
+ *   INODE_UNINIT  every inode free;
+ *   BLOCK_UNINIT  used = the group's superblock / GDT / reserved-GDT copy
+ *                 plus those of its own block bitmap, inode bitmap and
+ *                 inode table blocks that lie inside the group (with flex_bg
+ *                 they usually live in another group);
+ * and in both, the bits past the end of the group are set (padding).
+ *
+ * Loading such a bitmap computes it; the first change made to it clears the
+ * flag, fixes the free count to the computed value and writes the bitmap
+ * with its checksum, all in the same transaction as the change itself, so
+ * the descriptor and the bitmap on disk always describe the same state.
+ * Only where ext4_uninit_honoured() says so; elsewhere the loaders read the
+ * bitmap block as it is. */
+
+/* Set the bitmap bits [start, end): the padding past a group's last block or
+ * inode up to the end of the bitmap block. */
+static void ext4_mark_bitmap_end(unsigned start, unsigned end, uint8_t *bm)
+{
+	unsigned i;
+	if (start >= end)
+		return;
+	for (i = start; i < ((start + 7) & ~7u) && i < end; i++)
+		ext4_bm_set(bm, i);
+	if (i < end)
+		mm_memset(bm + (i >> 3), 0xFF, (end - i) >> 3);
+}
+
+/* Is physical block `b` inside group `g`? */
+static int ext4_block_in_group(const ext4_fs_t *fs, unsigned long b, unsigned g)
+{
+	if (b < fs->first_data_block)
+		return 0;
+	return (b - fs->first_data_block) / fs->blocks_per_group == g;
+}
+
+/* Status returned by the bitmap loaders when the group's metadata is
+ * corrupt (the error has already been recorded through ext4_fs_error); the
+ * allocators stop instead of trying the next group. */
+#define EXT4_BM_CORRUPT ST_INVALID
+
+/* Compute the block bitmap of BLOCK_UNINIT group `g` into `bm`. */
+static int ext4_init_block_bitmap(ext4_fs_t *fs, unsigned g, uint8_t *bm)
+{
+	mm_memset(bm, 0, fs->block_size);
+	unsigned base = ext4_num_base_meta_blocks(fs, g);
+	if ((base >> 3) >= fs->block_size) {
+		ext4_fs_error(fs, "group metadata larger than its bitmap", 0);
+		return EXT4_BM_CORRUPT;
+	}
+	for (unsigned b = 0; b < base; b++)
+		ext4_bm_set(bm, b);
+	unsigned long start = ext4_group_first_block(fs, g);
+	unsigned long t = ext4_gd_block_bitmap(fs, g);
+	if (ext4_block_in_group(fs, t, g))
+		ext4_bm_set(bm, t - start);
+	t = ext4_gd_inode_bitmap(fs, g);
+	if (ext4_block_in_group(fs, t, g))
+		ext4_bm_set(bm, t - start);
+	unsigned long itbl = ext4_inode_table_block(fs, &fs->gdt[g]);
+	unsigned long itb = ext4_itable_blocks(fs);
+	for (t = itbl; t < itbl + itb; t++)
+		if (ext4_block_in_group(fs, t, g))
+			ext4_bm_set(bm, t - start);
+	ext4_mark_bitmap_end(ext4_blocks_in_group(fs, g), fs->block_size * 8,
+			     bm);
+	return ST_OK;
+}
+
+/* Free blocks a bitmap shows within the group's real extent. */
+static unsigned long ext4_bitmap_free_blocks(const ext4_fs_t *fs, unsigned g,
+					     const uint8_t *bm)
+{
+	unsigned n = ext4_blocks_in_group(fs, g);
+	unsigned long free_cnt = 0;
+	for (unsigned b = 0; b < n; b++)
+		if (!ext4_bm_test(bm, b))
+			free_cnt++;
+	return free_cnt;
+}
+
+/* Load group `g`'s block bitmap into `bm`: computed for a BLOCK_UNINIT group
+ * (*uninit = 1), else read and checksum-verified.  ST_OK, an I/O status, or
+ * EXT4_BM_CORRUPT.  Caller holds the group lock. */
+static int ext4_load_block_bitmap(ext4_fs_t *fs, unsigned g, uint8_t *bm,
+				  int *uninit)
+{
+	*uninit = 0;
+	if (ext4_uninit_honoured(fs) &&
+	    (fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT)) {
+		if (g == 0) {
+			ext4_fs_error(fs,
+				      "block bitmap of group 0 marked uninitialized",
+				      0);
+			return EXT4_BM_CORRUPT;
+		}
+		int st = ext4_init_block_bitmap(fs, g, bm);
+		if (st == ST_OK)
+			*uninit = 1;
+		return st;
+	}
+	int st = ext4_read_block(fs, ext4_gd_block_bitmap(fs, g), bm);
+	if (st != ST_OK)
+		return st == EXT4_BM_CORRUPT ? ST_IO : st;
+	if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
+		ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+		return EXT4_BM_CORRUPT;
+	}
+	return ST_OK;
+}
+
+/* Load group `g`'s inode bitmap into `bm`: all-free (plus padding) for an
+ * INODE_UNINIT group (*uninit = 1), else read and checksum-verified. */
+static int ext4_load_inode_bitmap(ext4_fs_t *fs, unsigned g, uint8_t *bm,
+				  int *uninit)
+{
+	*uninit = 0;
+	if (ext4_uninit_honoured(fs) &&
+	    (fs->gdt[g].bg_flags & EXT4_BG_INODE_UNINIT)) {
+		if (g == 0) {
+			ext4_fs_error(fs,
+				      "inode bitmap of group 0 marked uninitialized",
+				      0);
+			return EXT4_BM_CORRUPT;
+		}
+		mm_memset(bm, 0, fs->block_size);
+		ext4_mark_bitmap_end(fs->inodes_per_group, fs->block_size * 8,
+				     bm);
+		*uninit = 1;
+		return ST_OK;
+	}
+	int st = ext4_read_block(fs, ext4_gd_inode_bitmap(fs, g), bm);
+	if (st != ST_OK)
+		return st == EXT4_BM_CORRUPT ? ST_IO : st;
+	if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
+		ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
+		return EXT4_BM_CORRUPT;
+	}
+	return ST_OK;
+}
+
+/* The block bitmap of BLOCK_UNINIT group `g` is about to change: drop the
+ * flag and set the descriptor's free count to what the computed bitmap shows
+ * (`init_free`), before the caller applies its own delta.  The superblock
+ * total moves by the same correction so it keeps equalling the sum of the
+ * descriptors.  Caller holds the group lock and writes the bitmap. */
+static void ext4_bg_block_uninit_clear(ext4_fs_t *fs, unsigned g,
+				       unsigned long init_free)
+{
+	unsigned long cur = fs->gdt[g].bg_free_blocks_count_lo;
+	/* mkfs/resize2fs store exactly this count; a difference means the
+	 * descriptor was wrong (fixed here) or the geometry computed above is. */
+	WARN_RATELIMIT(cur != init_free,
+		       "ext4: group %u BLOCK_UNINIT free count %lu, computed %lu",
+		       g, cur, init_free);
+	fs->gdt[g].bg_flags &= (uint16_t)~EXT4_BG_BLOCK_UNINIT;
+	fs->gdt[g].bg_free_blocks_count_lo = (uint16_t)init_free;
+	fs->sb_copy.s_free_blocks_count_lo += (uint32_t)(init_free - cur);
+	ext4_gd_dirty(fs, g);
+}
+
+/* Write out the computed block bitmap of BLOCK_UNINIT group `g` and clear the
+ * flag, with no blocks changing hands: a group that gets an inode in use gets
+ * a real block bitmap too.  Caller holds the group lock. */
+static int ext4_bg_block_bitmap_materialize(ext4_fs_t *fs, unsigned g)
+{
+	if (!ext4_uninit_honoured(fs) ||
+	    !(fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT))
+		return ST_OK;
+	uint8_t *bbm = (uint8_t *)ext4_bget(fs);
+	if (!bbm)
+		return ST_NOMEM;
+	int uninit = 0;
+	int st = ext4_load_block_bitmap(fs, g, bbm, &uninit);
+	if (st == ST_OK && uninit) {
+		unsigned long init_free = ext4_bitmap_free_blocks(fs, g, bbm);
+		ext4_block_bitmap_csum_set(fs, g, bbm);
+		st = ext4_write_block(fs, ext4_gd_block_bitmap(fs, g), bbm);
+		if (st == ST_OK)
+			ext4_bg_block_uninit_clear(fs, g, init_free);
+	}
+	ext4_bput(bbm);
+	return st;
+}
+
 /* Self-heal: recompute every touched group's free-block count + block-bitmap
  * checksum directly from its (authoritative) bitmap, so the on-disk descriptors
  * can never drift from the bitmaps at a sync point — the same principle the mount
@@ -3550,6 +3899,11 @@ static void ext4_resync_gd_from_bitmaps(ext4_fs_t *fs)
 	int is64 = (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
 	for (unsigned g = s_gd_seen_lo;
 	     g <= s_gd_seen_hi && g < fs->groups_count; g++) {
+		/* A BLOCK_UNINIT group has no bitmap on disk to resync from:
+		 * its count and its computed bitmap agree by definition. */
+		if (ext4_uninit_honoured(fs) &&
+		    (fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT))
+			continue;
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
 		if (ext4_read_block(fs, bblk, bm) != ST_OK)
 			continue;
@@ -3746,15 +4100,16 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 		/* Group lock: this group's inode-bitmap read-modify-write. */
 		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) != ST_OK) {
-			ext4_bg_unlock(g);
-			continue;
-		}
-		if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
-			ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
+		int uninit = 0;
+		int lst = ext4_load_inode_bitmap(fs, g, bm, &uninit);
+		if (lst == EXT4_BM_CORRUPT) {
 			ext4_bg_unlock(g);
 			kfree(bm);
 			return 0;
+		}
+		if (lst != ST_OK) {
+			ext4_bg_unlock(g);
+			continue;
 		}
 		for (unsigned i = 0; i < fs->inodes_per_group; i++) {
 			if (ext4_bm_test(bm, i))
@@ -3763,6 +4118,13 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 				(unsigned long)g * fs->inodes_per_group + i + 1;
 			if (ino < fs->first_ino && ino != EXT4_ROOT_INO)
 				continue;
+			/* A group that gets an inode in use gets a real
+			 * block bitmap as well. */
+			if (ext4_bg_block_bitmap_materialize(fs, g) != ST_OK) {
+				ext4_bg_unlock(g);
+				kfree(bm);
+				return 0;
+			}
 			ext4_bm_set(bm, i);
 			ext4_inode_bitmap_csum_set(fs, g, bm);
 			/* shrink bg_itable_unused if we used an inode past the tracked front
@@ -3773,6 +4135,10 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 					1; /* 1-based offset within the group */
 				unsigned used_front = fs->inodes_per_group -
 						      ext4_itable_unused(fs, g);
+				/* none at all in an INODE_UNINIT group, which
+				 * is initialized by this allocation */
+				if (uninit)
+					used_front = 0;
 				if (off1 > used_front)
 					ext4_itable_unused_set(
 						fs, g,
@@ -3783,6 +4149,9 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 				kfree(bm);
 				return 0;
 			}
+			if (uninit)
+				fs->gdt[g].bg_flags &=
+					(uint16_t)~EXT4_BG_INODE_UNINIT;
 			fs->gdt[g].bg_free_inodes_count_lo--;
 			if (is_dir)
 				fs->gdt[g].bg_used_dirs_count_lo++;
@@ -3852,13 +4221,9 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
 	/* Group lock: serialises this group's bitmap read-modify-write. */
 	ext4_bg_lock(g);
 	unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
-	if (ext4_read_block(fs, bblk, bm) == ST_OK) {
-		if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
-			ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
-			ext4_bg_unlock(g);
-			kfree(bm);
-			return;
-		}
+	int uninit = 0;
+	/* An INODE_UNINIT group loads as all-free: nothing in it to release. */
+	if (ext4_load_inode_bitmap(fs, g, bm, &uninit) == ST_OK && !uninit) {
 		if (ext4_bm_test(bm, i)) {
 			ext4_bm_clear(bm, i);
 			ext4_inode_bitmap_csum_set(fs, g, bm);
@@ -3921,15 +4286,16 @@ static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start,
 		/* Group lock: this group's block-bitmap read-modify-write. */
 		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) == ST_OK) {
-			if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
-				ext4_fs_error(fs,
-					      "block bitmap checksum mismatch",
-					      0);
-				ext4_bg_unlock(g);
-				kfree(bm);
-				return;
-			}
+		int uninit = 0;
+		int lst = ext4_load_block_bitmap(fs, g, bm, &uninit);
+		if (lst == EXT4_BM_CORRUPT) {
+			ext4_bg_unlock(g);
+			kfree(bm);
+			return;
+		}
+		if (lst == ST_OK) {
+			unsigned long init_free =
+				uninit ? ext4_bitmap_free_blocks(fs, g, bm) : 0;
 			unsigned long cleared = 0;
 			for (unsigned long k = 0; k < n; k++)
 				if (ext4_bm_test(bm, i + k)) {
@@ -3937,6 +4303,9 @@ static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start,
 					cleared++;
 				}
 			if (cleared) {
+				if (uninit)
+					ext4_bg_block_uninit_clear(fs, g,
+								   init_free);
 				ext4_block_bitmap_csum_set(fs, g, bm);
 				ext4_write_block(fs, bblk, bm);
 				fs->gdt[g].bg_free_blocks_count_lo =
@@ -3965,10 +4334,12 @@ static void ext4_free_block(ext4_fs_t *fs, unsigned long pbn)
 }
 
 /* ===================================================================
- * Extent-tree WRITE support — append-only growth to arbitrary depth.
+ * Extent-tree WRITE support — growth at the end, to arbitrary depth.
  *
- * The driver only ever appends blocks at increasing logical indices (files/dirs
- * grow at the end), so we only ever insert at the RIGHTMOST path of the tree.
+ * Blocks added past the last extent (a file or directory growing at its
+ * end, the common case) go in at the RIGHTMOST path of the tree; anything
+ * else -- a hole being filled -- is handed to the general sorted insertion
+ * further down (ext4_ext_insert_run).
  * That makes growth a clean "add to the rightmost leaf; on full, build a new
  * rightmost branch under the lowest ancestor with room; if none, grow a new
  * level on top".  External index/leaf blocks carry the et_checksum tail
@@ -4172,6 +4543,11 @@ io_fail:
 	return ST_IO;
 }
 
+static unsigned ext4_ext_insert_run(ext4_fs_t *fs, unsigned long ino,
+				    ext4_inode *in, unsigned long lblk,
+				    unsigned long pblk,
+				    unsigned len); /* defined below */
+
 /* Append `addlen` contiguous blocks (lidx,pbn..) to the inode's extent tree,
  * coalescing with the rightmost extent and growing the tree as needed.  Returns
  * the number of blocks actually mapped (== addlen on success, fewer if the tree
@@ -4237,6 +4613,23 @@ static unsigned ext4_ext_add(ext4_fs_t *fs, unsigned long ino, ext4_inode *in,
 		unsigned chunk = addlen > 32768 ? 32768 : addlen;
 		int handled = 0;
 
+		if (leh->eh_entries > 0) {
+			ext4_extent *last = &ex[leh->eh_entries - 1];
+			unsigned llen = last->ee_len;
+			if (llen > 32768)
+				llen -= 32768;
+			/* Not past the last extent: a hole inside the file
+			 * is being filled, and the extent has to go where it
+			 * belongs in the order, not at the end. */
+			if (lidx < (unsigned long)last->ee_block + llen) {
+				for (unsigned d = 1; d <= depth; d++)
+					if (pbuf[d])
+						kfree(pbuf[d]);
+				return done + ext4_ext_insert_run(fs, ino, in,
+								  lidx, pbn,
+								  addlen);
+			}
+		}
 		if (leh->eh_entries > 0) { /* coalesce with the last extent? */
 			ext4_extent *last = &ex[leh->eh_entries - 1];
 			unsigned llen = last->ee_len;
@@ -4327,15 +4720,18 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
 		/* Group lock: this group's block-bitmap read-modify-write. */
 		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) != ST_OK) {
-			ext4_bg_unlock(g);
-			continue;
-		}
-		if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
-			ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+		int uninit = 0;
+		int lst = ext4_load_block_bitmap(fs, g, bm, &uninit);
+		if (lst == EXT4_BM_CORRUPT) {
 			ext4_bg_unlock(g);
 			break;
 		}
+		if (lst != ST_OK) {
+			ext4_bg_unlock(g);
+			continue;
+		}
+		unsigned long init_free =
+			uninit ? ext4_bitmap_free_blocks(fs, g, bm) : 0;
 		unsigned long base = fs->first_data_block +
 				     (unsigned long)g * fs->blocks_per_group;
 		unsigned group_alloc = 0, i = 0;
@@ -4360,6 +4756,8 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
 			nruns++;
 		}
 		if (group_alloc) {
+			if (uninit)
+				ext4_bg_block_uninit_clear(fs, g, init_free);
 			ext4_block_bitmap_csum_set(fs, g, bm);
 			ext4_write_block(fs, bblk, bm);
 			fs->gdt[g].bg_free_blocks_count_lo -= group_alloc;
@@ -4499,6 +4897,440 @@ static void ext4_free_blocks_from(ext4_fs_t *fs, unsigned long ino,
 	unsigned long fsub = freed * (fs->block_size / 512);
 	in->i_blocks_lo =
 		(in->i_blocks_lo >= fsub) ? (in->i_blocks_lo - fsub) : 0;
+}
+
+/* ===================================================================
+ * Extent tree: sorted insertion with node splits.
+ *
+ * The append path above (ext4_ext_add) covers a file growing at its end.  A
+ * write filling a hole inside the file needs its extent placed where it
+ * belongs in the tree, and that is what this section does, the way the
+ * on-disk format requires it:
+ *   - the entries of every node stay sorted by logical block;
+ *   - an index entry's key is the first logical block of its child, at
+ *     every level (fsck checks the equality, not just the order), so a
+ *     change to a node's first entry is carried up as far as it is the
+ *     first entry (ext4_ext_correct_index);
+ *   - a full node is split in two under a parent with room; a full path
+ *     grows the tree by one level at the root (ext4_ext_grow_depth).
+ * The new extent is merged into a neighbour it continues on disk and in the
+ * file, when both are initialized and the sum still fits one extent.
+ *
+ * A path holds one buffer per level; level 0 is the inode's inline root
+ * (never written here -- the caller stores the inode), levels 1..depth are
+ * external blocks, written back through the journal with their checksum
+ * tail.  Callers hold the metadata lock exclusively.
+ * =================================================================== */
+
+#define EXT4_EXT_DEPTH_MAX 5 /* levels below the root */
+
+struct ext4_ext_path {
+	unsigned depth;
+	uint8_t *node[EXT4_EXT_DEPTH_MAX + 1];
+	unsigned long blk[EXT4_EXT_DEPTH_MAX + 1];
+	/* Entry chosen at each level: the last one starting at or before the
+	 * block looked up (index levels: the first one when none does);
+	 * -1 in a leaf where no extent starts at or before it. */
+	int pos[EXT4_EXT_DEPTH_MAX + 1];
+};
+
+static inline ext4_extent_header *ext4_ext_hdr(const struct ext4_ext_path *p,
+					       unsigned lvl)
+{
+	return (ext4_extent_header *)p->node[lvl];
+}
+
+static inline ext4_extent *ext4_ext_first(const struct ext4_ext_path *p,
+					  unsigned lvl)
+{
+	return (ext4_extent *)(ext4_ext_hdr(p, lvl) + 1);
+}
+
+static inline ext4_extent_idx *ext4_ext_first_idx(const struct ext4_ext_path *p,
+						  unsigned lvl)
+{
+	return (ext4_extent_idx *)(ext4_ext_hdr(p, lvl) + 1);
+}
+
+/* Blocks an extent maps (an uninitialized one stores its length + 32768). */
+static inline unsigned ext4_ext_len(const ext4_extent *e)
+{
+	return e->ee_len > 32768 ? e->ee_len - 32768u : e->ee_len;
+}
+
+static inline unsigned long ext4_ext_pblk(const ext4_extent *e)
+{
+	return (unsigned long)e->ee_start_lo |
+	       ((unsigned long)e->ee_start_hi << 32);
+}
+
+static inline unsigned long ext4_idx_pblk(const ext4_extent_idx *ix)
+{
+	return (unsigned long)ix->ei_leaf_lo |
+	       ((unsigned long)ix->ei_leaf_hi << 32);
+}
+
+/* Store an initialized extent. */
+static void ext4_ext_store(ext4_extent *e, unsigned long lblk,
+			   unsigned long pblk, unsigned len)
+{
+	BUG_ON(len == 0 || len > 32768);
+	e->ee_block = (uint32_t)lblk;
+	e->ee_len = (uint16_t)len;
+	e->ee_start_hi = (uint16_t)(pblk >> 32);
+	e->ee_start_lo = (uint32_t)pblk;
+}
+
+/* Can `b' be folded into `a' (a immediately before b, in the file and on
+ * the device, both initialized, and the sum still fits one extent)? */
+static int ext4_ext_mergeable(const ext4_extent *a, const ext4_extent *b)
+{
+	unsigned la = ext4_ext_len(a), lb = ext4_ext_len(b);
+
+	if (a->ee_len > 32768 || b->ee_len > 32768)
+		return 0;
+	if ((unsigned long)a->ee_block + la != b->ee_block)
+		return 0;
+	if (ext4_ext_pblk(a) + la != ext4_ext_pblk(b))
+		return 0;
+	return la + lb <= 32768;
+}
+
+static void ext4_ext_path_free(struct ext4_ext_path *p)
+{
+	for (unsigned l = 1; l <= p->depth && l <= EXT4_EXT_DEPTH_MAX; l++)
+		if (p->node[l]) {
+			kfree(p->node[l]);
+			p->node[l] = 0;
+		}
+}
+
+/* Is a node header sane for its place in the tree? */
+static int ext4_ext_hdr_ok(const ext4_fs_t *fs, const ext4_extent_header *h,
+			   unsigned want_depth, int is_root)
+{
+	unsigned max = is_root ? 4 : ext4_ext_extern_max(fs);
+
+	/* An index node (depth > 0) with no entries points nowhere. */
+	return h->eh_magic == EXT4_EXT_MAGIC && h->eh_depth == want_depth &&
+	       h->eh_max != 0 && h->eh_max <= max &&
+	       h->eh_entries <= h->eh_max &&
+	       !(h->eh_entries == 0 && want_depth > 0);
+}
+
+/* Look `lblk' up: fill `p' with the path from the root to the leaf that
+ * would hold it.  ST_OK, or ST_IO for a damaged tree (reported). */
+static int ext4_ext_find(ext4_fs_t *fs, unsigned long ino, ext4_inode *in,
+			 unsigned long lblk, struct ext4_ext_path *p)
+{
+	ext4_extent_header *root = (ext4_extent_header *)in->i_block;
+
+	mm_memset(p, 0, sizeof(*p));
+	p->node[0] = in->i_block;
+	if (root->eh_magic != EXT4_EXT_MAGIC ||
+	    root->eh_depth > EXT4_EXT_DEPTH_MAX ||
+	    !ext4_ext_hdr_ok(fs, root, root->eh_depth, 1)) {
+		ext4_fs_error(fs, "bad extent tree root", ino);
+		return ST_IO;
+	}
+	p->depth = root->eh_depth;
+	for (unsigned lvl = 0;; lvl++) {
+		ext4_extent_header *h = ext4_ext_hdr(p, lvl);
+		unsigned n = h->eh_entries;
+		int pos = -1;
+
+		if (lvl == p->depth) {
+			ext4_extent *ex = (ext4_extent *)(h + 1);
+
+			for (unsigned i = 0; i < n && ex[i].ee_block <= lblk;
+			     i++)
+				pos = (int)i;
+			p->pos[lvl] = pos;
+			return ST_OK;
+		}
+		ext4_extent_idx *ix = (ext4_extent_idx *)(h + 1);
+
+		if (n == 0) {
+			ext4_fs_error(fs, "empty extent index node", ino);
+			ext4_ext_path_free(p);
+			return ST_IO;
+		}
+		pos = 0;
+		for (unsigned i = 1; i < n && ix[i].ei_block <= lblk; i++)
+			pos = (int)i;
+		p->pos[lvl] = pos;
+
+		unsigned long child = ext4_idx_pblk(&ix[pos]);
+		uint8_t *buf = (uint8_t *)kalloc(fs->block_size);
+
+		if (!buf) {
+			ext4_ext_path_free(p);
+			return ST_NOMEM;
+		}
+		p->node[lvl + 1] = buf;
+		p->blk[lvl + 1] = child;
+		if (ext4_read_block(fs, child, buf) != ST_OK) {
+			ext4_ext_path_free(p);
+			return ST_IO;
+		}
+		if (!ext4_mbc_verified(child)) {
+			if (!ext4_extent_block_csum_ok(fs, ino, in->i_generation,
+						       buf)) {
+				ext4_fs_error(fs,
+					      "extent block checksum mismatch",
+					      ino);
+				ext4_ext_path_free(p);
+				return ST_IO;
+			}
+			ext4_mbc_mark_verified(child);
+		}
+		if (!ext4_ext_hdr_ok(fs, (ext4_extent_header *)buf,
+				     p->depth - lvl - 1, 0)) {
+			ext4_fs_error(fs, "bad extent tree node", ino);
+			ext4_ext_path_free(p);
+			return ST_IO;
+		}
+	}
+}
+
+/* Store the node at `lvl' (the inline root is stored with the inode). */
+static int ext4_ext_dirty(ext4_fs_t *fs, unsigned long ino,
+			  const ext4_inode *in, struct ext4_ext_path *p,
+			  unsigned lvl)
+{
+	if (lvl == 0)
+		return ST_OK;
+	ext4_ext_block_csum_set(fs, ino, in->i_generation, p->node[lvl]);
+	return ext4_write_block(fs, p->blk[lvl], p->node[lvl]);
+}
+
+static uint32_t ext4_ext_node_key(const struct ext4_ext_path *p, unsigned lvl)
+{
+	if (lvl == p->depth)
+		return ext4_ext_first(p, lvl)[0].ee_block;
+	return ext4_ext_first_idx(p, lvl)[0].ei_block;
+}
+
+/* The first entry of the node at `lvl' changed: give its index entry the
+ * new key, and the same one level up for as long as the entry changed is
+ * the first of its node. */
+static void ext4_ext_correct_index(ext4_fs_t *fs, unsigned long ino,
+				   const ext4_inode *in,
+				   struct ext4_ext_path *p, unsigned lvl)
+{
+	if (ext4_ext_hdr(p, lvl)->eh_entries == 0)
+		return;
+	uint32_t key = ext4_ext_node_key(p, lvl);
+
+	for (unsigned l = lvl; l > 0; l--) {
+		ext4_extent_idx *ix = &ext4_ext_first_idx(p, l - 1)[p->pos[l - 1]];
+
+		if (ix->ei_block == key)
+			break;
+		ix->ei_block = key;
+		ext4_ext_dirty(fs, ino, in, p, l - 1);
+		if (p->pos[l - 1] != 0)
+			break;
+	}
+}
+
+/* Make room in the leaf of `p' for one more entry, without inserting it:
+ * split the deepest full node whose parent has room (moving its upper half
+ * to a new block), or, when every node on the path is full, add a level at
+ * the root.  One step per call; the caller looks the block up again and
+ * repeats until the leaf has room.  Frees the path. */
+static int ext4_ext_make_room(ext4_fs_t *fs, unsigned long ino, ext4_inode *in,
+			      struct ext4_ext_path *p)
+{
+	int parent = -1;
+
+	for (int l = (int)p->depth - 1; l >= 0; l--)
+		if (ext4_ext_hdr(p, (unsigned)l)->eh_entries <
+		    ext4_ext_hdr(p, (unsigned)l)->eh_max) {
+			parent = l;
+			break;
+		}
+	if (parent < 0) {
+		ext4_ext_path_free(p);
+		if (((ext4_extent_header *)in->i_block)->eh_depth >=
+		    EXT4_EXT_DEPTH_MAX)
+			return ST_NOSPC;
+		return ext4_ext_grow_depth(fs, ino, in);
+	}
+
+	unsigned lvl = (unsigned)parent + 1;
+	ext4_extent_header *h = ext4_ext_hdr(p, lvl);
+	unsigned n = h->eh_entries, half = n / 2;
+	unsigned long nb;
+
+	/* A full node of fewer than two entries cannot be split at its middle.
+	 * The driver never writes one (an external node gets the block's whole
+	 * capacity), but a node read from the disk may carry any eh_max from 1
+	 * up (ext4_ext_hdr_ok accepts what the format allows): damaged or
+	 * foreign metadata is an error to report, not a kernel bug. */
+	if (n < 2) {
+		ext4_ext_path_free(p);
+		ext4_fs_error(fs, "extent node too small to split", ino);
+		return ST_IO;
+	}
+	nb = ext4_alloc_one_block(fs);
+	if (!nb) {
+		ext4_ext_path_free(p);
+		return ST_NOSPC;
+	}
+	uint8_t *buf = (uint8_t *)kalloc(fs->block_size);
+
+	if (!buf) {
+		ext4_free_block(fs, nb);
+		ext4_ext_path_free(p);
+		return ST_NOMEM;
+	}
+	mm_memset(buf, 0, fs->block_size);
+	ext4_extent_header *nh = (ext4_extent_header *)buf;
+
+	nh->eh_magic = EXT4_EXT_MAGIC;
+	nh->eh_depth = h->eh_depth;
+	nh->eh_max = (uint16_t)ext4_ext_extern_max(fs);
+	nh->eh_entries = (uint16_t)(n - half);
+	/* Index entries and extents are both 12 bytes. */
+	mm_memcpy(nh + 1, (uint8_t *)(h + 1) + (unsigned long)half * 12,
+		  (unsigned long)(n - half) * 12);
+	uint32_t key = ((ext4_extent_idx *)(nh + 1))->ei_block;
+
+	ext4_ext_block_csum_set(fs, ino, in->i_generation, buf);
+	int rc = ext4_write_block(fs, nb, buf);
+
+	kfree(buf);
+	if (rc != ST_OK) {
+		ext4_free_block(fs, nb);
+		ext4_ext_path_free(p);
+		return rc;
+	}
+	h->eh_entries = (uint16_t)half;
+	mm_memset((uint8_t *)(h + 1) + (unsigned long)half * 12, 0,
+		  (unsigned long)(n - half) * 12);
+	ext4_ext_dirty(fs, ino, in, p, lvl);
+
+	/* The new node's entry goes right after the split node's. */
+	ext4_extent_header *ph = ext4_ext_hdr(p, (unsigned)parent);
+	ext4_extent_idx *pix = ext4_ext_first_idx(p, (unsigned)parent);
+	unsigned at = (unsigned)p->pos[parent] + 1;
+
+	BUG_ON(ph->eh_entries >= ph->eh_max || at > ph->eh_entries);
+	for (unsigned i = ph->eh_entries; i > at; i--)
+		pix[i] = pix[i - 1];
+	pix[at].ei_block = key;
+	pix[at].ei_leaf_lo = (uint32_t)nb;
+	pix[at].ei_leaf_hi = (uint16_t)(nb >> 32);
+	pix[at].ei_unused = 0;
+	ph->eh_entries++;
+	ext4_ext_dirty(fs, ino, in, p, (unsigned)parent);
+	in->i_blocks_lo += fs->block_size / 512; /* nb is a metadata block */
+	ext4_ext_path_free(p);
+	return ST_OK;
+}
+
+/* Insert the initialized extent [lblk, lblk+len) -> pblk (one extent's
+ * worth at most, not overlapping anything mapped), folded into a neighbour
+ * it continues where it can.  ST_OK / ST_NOSPC / ST_NOMEM / ST_IO; on
+ * failure nothing was inserted. */
+static int ext4_ext_insert(ext4_fs_t *fs, unsigned long ino, ext4_inode *in,
+			   unsigned long lblk, unsigned long pblk, unsigned len)
+{
+	struct ext4_ext_path p;
+	ext4_extent ne;
+
+	ext4_ext_store(&ne, lblk, pblk, len);
+	for (unsigned tries = 0; tries < 4 * (EXT4_EXT_DEPTH_MAX + 2);
+	     tries++) {
+		int rc = ext4_ext_find(fs, ino, in, lblk, &p);
+
+		if (rc != ST_OK)
+			return rc;
+		unsigned d = p.depth;
+		ext4_extent_header *h = ext4_ext_hdr(&p, d);
+		ext4_extent *ex = ext4_ext_first(&p, d);
+		int at = p.pos[d];
+		unsigned n = h->eh_entries;
+
+		if ((at >= 0 && (unsigned long)ex[at].ee_block +
+						ext4_ext_len(&ex[at]) >
+					lblk) ||
+		    (at + 1 < (int)n &&
+		     ex[at + 1].ee_block < lblk + (unsigned long)len)) {
+			WARN(1, "ext4: inode %lu: extent %lu+%u overlaps the tree",
+			     ino, lblk, len);
+			ext4_ext_path_free(&p);
+			return ST_IO;
+		}
+		if (at >= 0 && ext4_ext_mergeable(&ex[at], &ne)) {
+			unsigned nl = ext4_ext_len(&ex[at]) + len;
+
+			ext4_ext_store(&ex[at], ex[at].ee_block,
+				       ext4_ext_pblk(&ex[at]), nl);
+			if (at + 1 < (int)n &&
+			    ext4_ext_mergeable(&ex[at], &ex[at + 1])) {
+				nl += ext4_ext_len(&ex[at + 1]);
+				ext4_ext_store(&ex[at], ex[at].ee_block,
+					       ext4_ext_pblk(&ex[at]), nl);
+				for (unsigned i = (unsigned)at + 1; i + 1 < n;
+				     i++)
+					ex[i] = ex[i + 1];
+				h->eh_entries--;
+				mm_memset(&ex[h->eh_entries], 0, sizeof(*ex));
+			}
+			rc = ext4_ext_dirty(fs, ino, in, &p, d);
+			ext4_ext_path_free(&p);
+			return rc;
+		}
+		if (at + 1 < (int)n && ext4_ext_mergeable(&ne, &ex[at + 1])) {
+			ext4_ext_store(&ex[at + 1], lblk, pblk,
+				       len + ext4_ext_len(&ex[at + 1]));
+			rc = ext4_ext_dirty(fs, ino, in, &p, d);
+			if (at + 1 == 0)
+				ext4_ext_correct_index(fs, ino, in, &p, d);
+			ext4_ext_path_free(&p);
+			return rc;
+		}
+		if (n < h->eh_max) {
+			unsigned i0 = (unsigned)(at + 1);
+
+			for (unsigned i = n; i > i0; i--)
+				ex[i] = ex[i - 1];
+			ex[i0] = ne;
+			h->eh_entries++;
+			rc = ext4_ext_dirty(fs, ino, in, &p, d);
+			if (i0 == 0)
+				ext4_ext_correct_index(fs, ino, in, &p, d);
+			ext4_ext_path_free(&p);
+			return rc;
+		}
+		rc = ext4_ext_make_room(fs, ino, in, &p);
+		if (rc != ST_OK)
+			return rc;
+	}
+	WARN(1, "ext4: inode %lu: no room for an extent after splitting",
+	     ino);
+	return ST_IO;
+}
+
+/* Map the blocks [lblk, lblk+len) -> pblk.. as initialized extents,
+ * extent-sized piece by piece.  Returns the blocks mapped. */
+static unsigned ext4_ext_insert_run(ext4_fs_t *fs, unsigned long ino,
+				    ext4_inode *in, unsigned long lblk,
+				    unsigned long pblk, unsigned len)
+{
+	unsigned done = 0;
+
+	while (done < len) {
+		unsigned c = len - done > 32768 ? 32768 : len - done;
+
+		if (ext4_ext_insert(fs, ino, in, lblk + done, pblk + done, c) !=
+		    ST_OK)
+			break;
+		done += c;
+	}
+	return done;
 }
 
 /* ===================================================================
@@ -4745,20 +5577,24 @@ static unsigned long ext4_alloc_one_block(ext4_fs_t *fs)
 		/* Group lock: this group's block-bitmap read-modify-write. */
 		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) != ST_OK) {
-			ext4_bg_unlock(g);
-			continue;
-		}
-		if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
-			ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+		int uninit = 0;
+		int lst = ext4_load_block_bitmap(fs, g, bm, &uninit);
+		if (lst == EXT4_BM_CORRUPT) {
 			ext4_bg_unlock(g);
 			break;
+		}
+		if (lst != ST_OK) {
+			ext4_bg_unlock(g);
+			continue;
 		}
 		unsigned long base = fs->first_data_block +
 				     (unsigned long)g * fs->blocks_per_group;
 		for (unsigned i = 0; i < fs->blocks_per_group; i++) {
 			if (ext4_bm_test(bm, i))
 				continue;
+			if (uninit)
+				ext4_bg_block_uninit_clear(
+					fs, g, ext4_bitmap_free_blocks(fs, g, bm));
 			ext4_bm_set(bm, i);
 			ext4_block_bitmap_csum_set(fs, g, bm);
 			ext4_write_block(fs, bblk, bm);
@@ -5869,7 +6705,12 @@ static int ext4_htree_split_leaf(ext4_fs_t *fs, unsigned long dir_ino,
 		bs - (fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0);
 	/* Two fresh output buffers: the refs point INTO leafbuf, so neither output may
      * be leafbuf (ext4_dx_build_leaf memsets its destination first). */
-	ext4_dx_ref *refs = (ext4_dx_ref *)kalloc(bs); /* up to ~512 refs */
+	/* One ref per live entry plus the new one.  A dirent takes at least 8
+	 * header bytes, so bs/8 + 1 always suffices -- a ref is 16 bytes, so
+	 * sizing this as one block held only 256, and a leaf of short names
+	 * (up to 340 in a 4 KiB block) could never be split. */
+	unsigned cap = bs / 8 + 1;
+	ext4_dx_ref *refs = (ext4_dx_ref *)kalloc(cap * sizeof(ext4_dx_ref));
 	uint8_t *lowleaf = (uint8_t *)kalloc(bs);
 	uint8_t *newleaf = (uint8_t *)kalloc(bs);
 	if (!refs || !lowleaf || !newleaf) {
@@ -5882,7 +6723,6 @@ static int ext4_htree_split_leaf(ext4_fs_t *fs, unsigned long dir_ino,
 		return ST_NOMEM;
 	}
 	int n = 0;
-	unsigned cap = bs / sizeof(ext4_dx_ref);
 
 	unsigned off = 0;
 	while (off + 8 <= scan_limit) {
@@ -6482,6 +7322,24 @@ static int ext4_write_inode_new(ext4_fs_t *fs, unsigned long ino,
 	return st;
 }
 
+/* Undo an inode allocation whose creation failed part-way.  The slot may
+ * never have been written (a never-zeroed inode table leaves stale bytes in
+ * it, a zeroed one a slot whose checksum is wrong), so it is first stored as
+ * a deleted inode -- zeroed, dtime set, checksummed -- and only then released
+ * the normal way, which reads it back.  Blocks the caller already attached
+ * must have been freed before. */
+static void ext4_abandon_new_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
+{
+	ext4_inode dead;
+	mm_memset(&dead, 0, sizeof(dead));
+	dead.i_dtime = (uint32_t)timer_get_epoch();
+	if (fs->inode_size > 128)
+		dead.i_extra_isize = 32;
+	ext4_write_inode_new(fs, ino, &dead);
+	ext4_inode_cache_drop(ino);
+	ext4_free_inode(fs, ino, is_dir);
+}
+
 static int ext4_create_inode(ext4_fs_t *fs, unsigned long ino, unsigned mode,
 			     unsigned uid, unsigned gid)
 {
@@ -6589,7 +7447,11 @@ static int ext4_zero_range(ext4_fs_t *fs, unsigned long chain_id,
 	return 0;
 }
 
-static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
+/* The write itself, at *posp -- the description's position for write(), a
+ * position of the call's own for pwrite() -- which it moves past what it
+ * wrote.  Called with the inode lock exclusive and the I/O lock. */
+static long ext4_write_impl_at(vfs_file_t *f, const void *buf, long bytes,
+			       unsigned long *posp)
 {
 	if (!f || !buf)
 		return ST_INVALID;
@@ -6606,7 +7468,8 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	if (fs->read_only)
 		return ST_ROFS; /* error latch / read-only mount */
 
-	unsigned long end = ef->pos + (unsigned long)bytes;
+	unsigned long wpos = *posp;
+	unsigned long end = wpos + (unsigned long)bytes;
 	ext4_inode in;
 	if (ext4_read_inode_loc(fs, ef->ino, &in, 0, 0) != ST_OK)
 		return ST_IO;
@@ -6647,9 +7510,9 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	 */
 	{
 		unsigned long bs = fs->block_size;
-		unsigned long first_lb = ef->pos / bs;
+		unsigned long first_lb = wpos / bs;
 		unsigned long last_lb =
-			(end > ef->pos) ? (end - 1) / bs : first_lb;
+			(end > wpos) ? (end - 1) / bs : first_lb;
 		unsigned long lb = first_lb;
 
 		/* ext4_block_map reads the inode through the parsed cache, so
@@ -6692,12 +7555,12 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 				 * can only reach as far as what was created. */
 				unsigned long max_end = (run_start + got) * bs;
 
-				if (max_end <= ef->pos) {
+				if (max_end <= wpos) {
 					ext4_flush_meta(fs);
 					return -ENOSPC;
 				}
 				end = max_end;
-				bytes = (long)(end - ef->pos);
+				bytes = (long)(end - wpos);
 				break;
 			}
 		}
@@ -6777,8 +7640,8 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
      * these blocks.  Partial edge blocks are read-modify-written directly (after
      * flushing pending data so the on-disk block is current).  With NO journal,
      * data is written directly as before — no deferral. */
-	unsigned long write_start = ef->pos;
-	unsigned long pos = ef->pos, remaining = (unsigned long)bytes,
+	unsigned long write_start = wpos;
+	unsigned long pos = wpos, remaining = (unsigned long)bytes,
 		      written = 0;
 	unsigned long chain_id = EXT4_BID_ENC(ef->ino, 0);
 	const uint8_t *src = (const uint8_t *)buf;
@@ -6941,9 +7804,10 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	if (written == 0 && io_err)
 		return ST_IO;
 
-	ef->pos += written;
-	if (ef->pos > ef->size)
-		ef->size = ef->pos;
+	wpos += written;
+	*posp = wpos;
+	if (wpos > ef->size)
+		ef->size = wpos;
 	if (ef->inode)
 		icache_update_size((ic_inode_t *)ef->inode, ef->size);
 	/* The cached pages are NOT dropped here.
@@ -6996,6 +7860,15 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 	if (size < cur) {
 		unsigned long from =
 			(size + fs->block_size - 1) / fs->block_size;
+
+		/* The part of the new last block past the new end must read
+		 * as zeros when the file grows again (by a write past it, a
+		 * truncate or an allocation), so it is cleared now, while the
+		 * block is still the file's. */
+		if (size % fs->block_size &&
+		    ext4_zero_range(fs, EXT4_BID_ENC(ef->ino, 0), cur, size,
+				    (unsigned long)from * fs->block_size))
+			return ST_IO;
 
 		/* Drop the cached pages BEFORE the blocks under them go away.
 		 *
@@ -7304,7 +8177,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 		in.i_extra_isize = 32;
 
 	if (ext4_alloc_blocks_for_file(fs, nino, &in, 0, 1) != 1) {
-		ext4_free_inode(fs, nino, 1);
+		ext4_abandon_new_inode(fs, nino, 1);
 		ext4_flush_meta(fs);
 		return ST_NOMEM;
 	}
@@ -7315,7 +8188,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 	uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
 	if (!blk) {
 		ext4_free_blocks_from(fs, nino, &in, 0);
-		ext4_free_inode(fs, nino, 1);
+		ext4_abandon_new_inode(fs, nino, 1);
 		ext4_flush_meta(fs);
 		return ST_NOMEM;
 	}
@@ -7328,7 +8201,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 
 	if (ext4_dir_add(fs, parent, name, nl, nino, EXT4_FT_DIR) != ST_OK) {
 		ext4_free_blocks_from(fs, nino, &in, 0);
-		ext4_free_inode(fs, nino, 1);
+		ext4_abandon_new_inode(fs, nino, 1);
 		ext4_flush_meta(fs);
 		return ST_IO;
 	}
@@ -7406,7 +8279,7 @@ static int ext4_mknod_impl(const char *path, unsigned mode)
 		ft = EXT4_FT_FIFO;
 
 	if (ext4_dir_add(fs, parent, name, nl, nino, ft) != ST_OK) {
-		ext4_free_inode(fs, nino, 0);
+		ext4_abandon_new_inode(fs, nino, 0);
 		ext4_flush_meta(fs);
 		return ST_IO;
 	}
@@ -7491,9 +8364,29 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 		return ST_IO;
 	int src_is_dir = ((sin.i_mode & S_IFMT) == S_IFDIR);
 
+	/* A directory cannot move below itself: walking up from the new
+	 * parent must not meet it, or the subtree would hang off nothing. */
+	if (src_is_dir && op != np) {
+		unsigned long cur = np;
+
+		for (unsigned depth = 0; cur != EXT4_ROOT_INO; depth++) {
+			unsigned long up = 0;
+
+			if (cur == src)
+				return ST_INVALID;
+			if (depth > 4096 ||
+			    ext4_dir_lookup(fs, cur, "..", 2, &up, 0) !=
+				    ST_OK ||
+			    up == cur)
+				break;
+			cur = up;
+		}
+	}
+
 	/* If the destination exists, remove it (only an existing *file* — leave
      * directory replacement to a later increment to keep link accounting
-     * simple and correct). */
+     * simple and correct).  A file never replaces a directory, nor a
+     * directory a file. */
 	unsigned long dst = 0;
 	unsigned dft = 0;
 	if (ext4_dir_lookup(fs, np, nname, nnl, &dst, &dft) == ST_OK) {
@@ -7502,7 +8395,15 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 		ext4_inode din;
 		if (ext4_read_inode_loc(fs, dst, &din, 0, 0) != ST_OK)
 			return ST_IO;
-		if ((din.i_mode & S_IFMT) == S_IFDIR)
+		int dst_is_dir = (din.i_mode & S_IFMT) == S_IFDIR;
+
+		if (dst_is_dir && !src_is_dir)
+			return ST_ISDIR;
+		if (!dst_is_dir && src_is_dir)
+			return ST_NOTDIR;
+		if (dst_is_dir && !ext4_dir_is_empty(fs, dst))
+			return ST_NOTEMPTY;
+		if (dst_is_dir)
 			return ST_EXISTS;
 		ext4_dir_del(fs, np, nname, nnl, 0, 0);
 		if (din.i_links_count > 0)
@@ -7690,7 +8591,7 @@ int ext4_symlink(const char *target, const char *linkpath)
 		eh->eh_magic = EXT4_EXT_MAGIC;
 		eh->eh_max = 4;
 		if (ext4_alloc_blocks_for_file(fs, nino, &in, 0, 1) != 1) {
-			ext4_free_inode(fs, nino, 0);
+			ext4_abandon_new_inode(fs, nino, 0);
 			ext4_flush_meta(fs);
 			ext4_io_unlock();
 			return ST_NOMEM;
@@ -7701,7 +8602,7 @@ int ext4_symlink(const char *target, const char *linkpath)
 		uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
 		if (!blk) {
 			ext4_free_blocks_from(fs, nino, &in, 0);
-			ext4_free_inode(fs, nino, 0);
+			ext4_abandon_new_inode(fs, nino, 0);
 			ext4_flush_meta(fs);
 			ext4_io_unlock();
 			return ST_NOMEM;
@@ -7720,7 +8621,7 @@ int ext4_symlink(const char *target, const char *linkpath)
 	}
 	if (ext4_dir_add(fs, parent, name, nl, nino, EXT4_FT_SYMLINK) !=
 	    ST_OK) {
-		ext4_free_inode(fs, nino, 0);
+		ext4_abandon_new_inode(fs, nino, 0);
 		ext4_flush_meta(fs);
 		ext4_io_unlock();
 		return ST_IO;
@@ -8156,7 +9057,25 @@ static long ext4_write(vfs_file_t *f, const void *buf, long bytes)
 		return ST_INVALID;
 	ext4_ilock_excl(ef->ino);
 	ext4_io_lock();
-	long r = ext4_write_impl(f, buf, bytes);
+	long r = ext4_write_impl_at(f, buf, bytes, &ef->pos);
+	ext4_io_unlock();
+	ext4_iunlock_excl(ef->ino);
+	return r;
+}
+/* pwrite: the same at a position of the call's own; the description's is
+ * neither read nor moved (ext4_seek touches it without any lock, so it may
+ * not even be borrowed). */
+static long ext4_write_at(vfs_file_t *f, const void *buf, long bytes, long off)
+{
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	unsigned long pos;
+
+	if (!ef || off < 0)
+		return ST_INVALID;
+	pos = (unsigned long)off;
+	ext4_ilock_excl(ef->ino);
+	ext4_io_lock();
+	long r = ext4_write_impl_at(f, buf, bytes, &pos);
 	ext4_io_unlock();
 	ext4_iunlock_excl(ef->ino);
 	return r;
@@ -8536,6 +9455,7 @@ static const vfs_ops_t ext4_vfs_ops = {
 	.stat = ext4_stat_vfs,
 	.read = ext4_read,
 	.read_at = ext4_read_at,
+	.write_at = ext4_write_at,
 	.write = ext4_write,
 	.seek = ext4_seek,
 	.readdir = ext4_readdir,
@@ -10156,6 +11076,332 @@ static void ext4_flush_thread(void *arg)
 	}
 }
 
+/* ---- Groups left flagged UNINIT with allocations in them ---------------
+ *
+ * Earlier LikeOS drivers allocated blocks and inodes inside BLOCK_UNINIT /
+ * INODE_UNINIT groups -- writing real bitmaps (with their checksums) and
+ * lowering the descriptor counts -- but never cleared the flags.  A driver
+ * that believes the flags computes "all free" for such a group and hands out
+ * blocks and inodes that live files own.
+ *
+ * So a flag is believed only while the descriptor still shows the state the
+ * flag describes: INODE_UNINIT with every inode free and no directory,
+ * BLOCK_UNINIT with exactly the free count of the computed bitmap (what mkfs
+ * and resize2fs store).  Any other group is made initialized from the bitmap
+ * on disk: flag cleared, bitmap written back with its checksum, free count
+ * from the bitmap, and bg_itable_unused moved below the highest inode in use
+ * (e2fsck's rule).  Run once per rw mount, before the first allocation, in
+ * journal transactions of a bounded number of groups.
+ *
+ * Those drivers started from the block on disk of a flagged group -- never
+ * written by mkfs, so zeros or old contents -- which knows nothing of the
+ * group's own metadata (superblock and descriptor backups, reserved
+ * descriptor blocks, bitmaps and inode table when they live in the group).
+ * Allocating first fit, they handed those blocks to files.  The repair keeps
+ * every such block marked in use and leaves file data alone; the groups are
+ * named on the console and the file system is marked as having errors, so
+ * the next e2fsck runs a full check (which sorts out the shared blocks). */
+
+/* Groups found with their metadata blocks handed out (named once). */
+#define EXT4_LEGACY_NAMED 48
+struct ext4_legacy_damage {
+	unsigned n; /* groups found */
+	unsigned g[EXT4_LEGACY_NAMED]; /* the first of them */
+	unsigned long meta_used; /* metadata blocks in use by files */
+	/* Of those, blocks this driver itself writes: the group's own
+	 * bitmaps and inode table, a primary descriptor block.  A file
+	 * sharing one corrupts it, or is corrupted by it, on the next
+	 * write -- unlike backups, which nothing here writes. */
+	unsigned long live;
+};
+
+/* 1 when the flagged bitmap of group `g' was found in use and rewritten,
+ * 0 when the flag is believable, < 0 on an I/O error or a corrupt bitmap
+ * (recorded through ext4_fs_error). */
+static int ext4_fix_inode_uninit(ext4_fs_t *fs, unsigned g, uint8_t *bm)
+{
+	unsigned long ipg = fs->inodes_per_group;
+	unsigned long dfree = fs->gdt[g].bg_free_inodes_count_lo;
+
+	if (!(fs->gdt[g].bg_flags & EXT4_BG_INODE_UNINIT))
+		return 0;
+	if (dfree == ipg && fs->gdt[g].bg_used_dirs_count_lo == 0)
+		return 0;
+	int st = ext4_read_block(fs, ext4_gd_inode_bitmap(fs, g), bm);
+	if (st != ST_OK)
+		return st == EXT4_BM_CORRUPT ? ST_IO : st;
+	/* The flag is what is in doubt: compare the checksum itself (the
+	 * _ok form takes any flagged bitmap as good). */
+	if (!ext4_inode_bitmap_csum_match(fs, g, bm)) {
+		/* Inodes are in use and there is no bitmap to say which:
+		 * handing any out could reuse a live one. */
+		ext4_fs_error(fs,
+			      "inode bitmap of an INODE_UNINIT group in use fails its checksum",
+			      0);
+		return EXT4_BM_CORRUPT;
+	}
+	ext4_mark_bitmap_end((unsigned)ipg, fs->block_size * 8, bm);
+	unsigned long nfree = 0, hi = 0;
+	for (unsigned long i = 0; i < ipg; i++) {
+		if (ext4_bm_test(bm, (unsigned)i))
+			hi = i + 1;
+		else
+			nfree++;
+	}
+	kprintf("ext4: group %u: INODE_UNINIT set with %lu inode(s) in use; taking the bitmap on disk\n",
+		g, ipg - nfree);
+	ext4_inode_bitmap_csum_set(fs, g, bm);
+	st = ext4_write_block(fs, ext4_gd_inode_bitmap(fs, g), bm);
+	if (st != ST_OK)
+		return st;
+	fs->gdt[g].bg_flags &= (uint16_t)~EXT4_BG_INODE_UNINIT;
+	if (nfree != dfree) {
+		fs->gdt[g].bg_free_inodes_count_lo = (uint16_t)nfree;
+		fs->sb_copy.s_free_inodes_count =
+			(uint32_t)((long)fs->sb_copy.s_free_inodes_count +
+				   (long)nfree - (long)dfree);
+	}
+	if (ext4_itable_unused(fs, g) > ipg - hi)
+		ext4_itable_unused_set(fs, g, (unsigned)(ipg - hi));
+	ext4_gd_dirty(fs, g);
+	return 1;
+}
+
+/* The bitmap on disk of flagged group `g' is being taken: count the group's
+ * own metadata blocks (the computed bitmap `calc' without its padding) that
+ * it shows in use.  An old driver's bitmap started without them, so one shown
+ * in use was given to a file: file data and metadata share that block.  Ones
+ * shown free were never handed out (or only to a file deleted since; e2fsck
+ * finds nothing there) and are merely counted. */
+static int ext4_legacy_bit_in_use(ext4_fs_t *fs, unsigned g,
+				  const uint8_t *bm, unsigned long b)
+{
+	return ext4_block_in_group(fs, b, g) &&
+	       ext4_bm_test(bm, b - ext4_group_first_block(fs, g));
+}
+
+static void ext4_legacy_meta_check(ext4_fs_t *fs, unsigned g,
+				   const uint8_t *bm, const uint8_t *calc,
+				   struct ext4_legacy_damage *dmg)
+{
+	unsigned n = ext4_blocks_in_group(fs, g);
+	unsigned long used = 0, live = 0;
+
+	for (unsigned b = 0; b < n; b++) {
+		if (!ext4_bm_test(calc, b))
+			continue;
+		if (ext4_bm_test(bm, b))
+			used++;
+	}
+	if (!used)
+		return; /* no metadata block given to a file */
+
+	/* Of those, the blocks this driver itself writes. */
+	if (ext4_legacy_bit_in_use(fs, g, bm, ext4_gd_block_bitmap(fs, g)))
+		live++;
+	if (ext4_legacy_bit_in_use(fs, g, bm, ext4_gd_inode_bitmap(fs, g)))
+		live++;
+	unsigned long itbl = ext4_inode_table_block(fs, &fs->gdt[g]);
+	unsigned long itb = ext4_itable_blocks(fs);
+	for (unsigned long t = itbl; t < itbl + itb; t++)
+		if (ext4_legacy_bit_in_use(fs, g, bm, t))
+			live++;
+	/* The primary descriptor table, right behind the superblock. */
+	unsigned ndesc = ext4_gdt_blocks(fs);
+	for (unsigned nr = 0; nr < ndesc; nr++)
+		if (ext4_legacy_bit_in_use(fs, g, bm,
+					   fs->first_data_block + 1ul + nr))
+			live++;
+
+	if (dmg->n < EXT4_LEGACY_NAMED)
+		dmg->g[dmg->n] = g;
+	dmg->n++;
+	dmg->meta_used += used;
+	dmg->live += live;
+}
+
+static int ext4_fix_block_uninit(ext4_fs_t *fs, unsigned g, uint8_t *bm,
+				 uint8_t *calc, struct ext4_legacy_damage *dmg)
+{
+	if (!(fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT))
+		return 0;
+	int st = ext4_init_block_bitmap(fs, g, calc);
+	if (st != ST_OK)
+		return st;
+	unsigned long dfree = fs->gdt[g].bg_free_blocks_count_lo;
+	unsigned long cfree = ext4_bitmap_free_blocks(fs, g, calc);
+	if (dfree == cfree)
+		return 0;
+	st = ext4_read_block(fs, ext4_gd_block_bitmap(fs, g), bm);
+	if (st != ST_OK)
+		return st == EXT4_BM_CORRUPT ? ST_IO : st;
+	/* The flag is what is in doubt: compare the checksum itself (the
+	 * _ok form takes any flagged bitmap as good). */
+	if (!ext4_block_bitmap_csum_match(fs, g, bm)) {
+		/* Not a bitmap any driver wrote: every writer stamps the
+		 * checksum.  So nothing was allocated here through it, and
+		 * the count disagrees with the computation only. */
+		if (dfree < cfree) {
+			/* The descriptor counts blocks in use that the
+			 * computed bitmap would hand out, and nothing on
+			 * disk says which: the safe answer is none. */
+			kprintf("ext4: group %u: BLOCK_UNINIT free count %lu below the computed %lu, bitmap on disk fails its checksum\n",
+				g, dfree, cfree);
+			ext4_fs_error(fs,
+				      "block bitmap of a BLOCK_UNINIT group in use fails its checksum",
+				      0);
+			return EXT4_BM_CORRUPT;
+		}
+		/* More free than computed: the computed bitmap marks every
+		 * block the descriptor counts in use and more; taking it
+		 * frees nothing. */
+		kprintf("ext4: group %u: BLOCK_UNINIT free count %lu, computed %lu, no valid bitmap on disk; using the computed one\n",
+			g, dfree, cfree);
+		mm_memcpy(bm, calc, fs->block_size);
+	} else {
+		ext4_legacy_meta_check(fs, g, bm, calc, dmg);
+		/* The group's own metadata and the padding stay in use
+		 * whatever the bitmap on disk says. */
+		for (unsigned long i = 0; i < fs->block_size; i++)
+			bm[i] |= calc[i];
+		kprintf("ext4: group %u: BLOCK_UNINIT set with blocks in use (free %lu, computed %lu); taking the bitmap on disk\n",
+			g, dfree, cfree);
+	}
+	unsigned long nfree = ext4_bitmap_free_blocks(fs, g, bm);
+	ext4_block_bitmap_csum_set(fs, g, bm);
+	st = ext4_write_block(fs, ext4_gd_block_bitmap(fs, g), bm);
+	if (st != ST_OK)
+		return st;
+	fs->gdt[g].bg_flags &= (uint16_t)~EXT4_BG_BLOCK_UNINIT;
+	fs->gdt[g].bg_free_blocks_count_lo = (uint16_t)nfree;
+	fs->sb_copy.s_free_blocks_count_lo += (uint32_t)(nfree - dfree);
+	ext4_gd_dirty(fs, g);
+	return 1;
+}
+
+/* Name the groups whose metadata an old driver gave out, once, loudly, and
+ * mark the file system as having errors so e2fsck checks it in full.  File
+ * data is not touched: which file owns a shared block, and which copy is
+ * right, is e2fsck's business (it clones multiply-claimed blocks). */
+static void ext4_legacy_damage_report(ext4_fs_t *fs,
+				      const struct ext4_legacy_damage *dmg)
+{
+	char line[160];
+	unsigned k = 0, i;
+
+	if (!dmg->n)
+		return;
+	kprintf("ext4: ****************************************************************\n");
+	kprintf("ext4: WARNING: an earlier LikeOS ext4 driver allocated blocks reserved\n");
+	kprintf("ext4: for file system metadata (superblock / group descriptor backups,\n");
+	kprintf("ext4: reserved descriptor blocks, bitmaps, inode tables) to files in\n");
+	kprintf("ext4: %u group(s):\n", dmg->n);
+	for (i = 0; i < dmg->n && i < EXT4_LEGACY_NAMED; i++) {
+		int w = ksnprintf(line + k, sizeof(line) - k, "%s%u",
+				  k ? " " : "", dmg->g[i]);
+		if (w < 0 || (unsigned)w >= sizeof(line) - k)
+			break;
+		k += (unsigned)w;
+		if (k > 64) {
+			kprintf("ext4:   %s\n", line);
+			k = 0;
+		}
+	}
+	if (k)
+		kprintf("ext4:   %s\n", line);
+	if (dmg->n > EXT4_LEGACY_NAMED)
+		kprintf("ext4:   ... and %u more\n", dmg->n - EXT4_LEGACY_NAMED);
+	kprintf("ext4: %lu metadata blocks are shared with file data (%lu of them\n",
+		dmg->meta_used, dmg->live);
+	kprintf("ext4: bitmaps, inode tables or descriptors).  They all stay\n");
+	kprintf("ext4: marked in use; no file data was changed.  Run \"e2fsck -f\"\n");
+	kprintf("ext4: on this file system (unmounted) before any tune2fs or resize2fs.\n");
+	kprintf("ext4: ****************************************************************\n");
+	if (dmg->live) {
+		/* Blocks this driver writes (bitmaps, inode tables, primary
+		 * descriptors) may be shared with file data: every further
+		 * write could corrupt one or the other.  A file system error,
+		 * with the errors= reaction (read-only). */
+		ext4_fs_error(fs,
+			      "file data may share blocks with bitmaps, inode tables or group descriptors",
+			      0);
+		return;
+	}
+	/* Only backups and reserved descriptor blocks, which nothing here
+	 * writes: recorded without the errors= reaction -- the blocks are
+	 * protected now and the system stays usable until e2fsck has run. */
+	ext4_record_error(fs);
+}
+
+static void ext4_fix_legacy_uninit(ext4_fs_t *fs)
+{
+	if (fs->read_only || !ext4_uninit_honoured(fs) || fs->groups_count < 2)
+		return;
+	uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
+	uint8_t *calc = (uint8_t *)kalloc(fs->block_size);
+	struct ext4_legacy_damage *dmg =
+		(struct ext4_legacy_damage *)kalloc(sizeof(*dmg));
+	unsigned fixed = 0, in_txn = 0;
+
+	if (!bm || !calc || !dmg) {
+		if (bm)
+			kfree(bm);
+		if (calc)
+			kfree(calc);
+		if (dmg)
+			kfree(dmg);
+		/* Cannot check: refuse to allocate on a guess.  Out of memory
+		 * says nothing about the disk -- nothing is recorded there;
+		 * the latch is set directly, whatever errors= says. */
+		kprintf("ext4: ERROR: no memory to check the UNINIT groups; mounting read-only\n");
+		fs->read_only = 1;
+		return;
+	}
+	mm_memset(dmg, 0, sizeof(*dmg));
+	ext4_io_lock();
+	for (unsigned g = 1; g < fs->groups_count && !fs->read_only; g++) {
+		int a = ext4_fix_inode_uninit(fs, g, bm);
+		int b = a < 0 ? a : ext4_fix_block_uninit(fs, g, bm, calc, dmg);
+
+		if (a < 0 || b < 0) {
+			/* A group that could not be checked (I/O) or is
+			 * corrupt: allocating anywhere could hit its blocks.
+			 * Recorded, and read-only whatever errors= says --
+			 * the latch is set here, not left to the policy. */
+			if (a != EXT4_BM_CORRUPT && b != EXT4_BM_CORRUPT)
+				ext4_fs_error(fs, "cannot check an UNINIT group",
+					      0);
+			fs->read_only = 1;
+			break;
+		}
+		if (a > 0 || b > 0) {
+			fixed++;
+			/* Bounded transactions: each commit is consistent on
+			 * its own (bitmap, flag and counts of a group go
+			 * together). */
+			if (++in_txn >= 16) {
+				ext4_flush_meta(fs);
+				if (s_txn.active && s_meta.wdepth == 1) {
+					ext4_txn_flush(fs);
+					ext4_txn_begin();
+				}
+				in_txn = 0;
+			}
+		}
+	}
+	if (fixed) {
+		fs->meta_dirty = 1;
+		ext4_flush_meta(fs);
+		kprintf("ext4: %u group(s) with stale UNINIT flags made initialized\n",
+			fixed);
+	}
+	ext4_legacy_damage_report(fs, dmg);
+	ext4_io_unlock();
+	kfree(bm);
+	kfree(calc);
+	kfree(dmg);
+}
+
 int ext4_vfs_register_root(ext4_fs_t *fs)
 {
 	if (!fs)
@@ -10189,6 +11435,9 @@ int ext4_vfs_register_root(ext4_fs_t *fs)
 	if (!s_gd_buf) {
 		s_gd_buf = (uint8_t *)kalloc(fs->block_size);
 	}
+	/* Before anything can allocate: groups an earlier driver used while
+	 * leaving them flagged uninitialized. */
+	ext4_fix_legacy_uninit(fs);
 	/* Start the periodic commit task once the journalled root is live.  It is a
      * TASK_KERNEL thread, so sched_add_task makes it unkillable by design (sys_kill
      * and sched_signal_pgrp both reject TASK_KERNEL with -EPERM).  Name it for ps,

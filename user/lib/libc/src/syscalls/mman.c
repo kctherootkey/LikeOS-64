@@ -5,7 +5,6 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <errno.h>
-#include <unistd.h> /* getpagesize() for the msync alignment check */
 #include "syscall.h"
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset)
@@ -100,31 +99,19 @@ int mincore(void *addr, size_t length, unsigned char *vec)
 	return 0;
 }
 
-/* msync: flush a mapping back to its backing store.
- *
- * Nothing in this system needs to copy anything back.  A /dev/fb0 mapping
- * writes straight into video memory, so the pixels are already where they
- * belong; anonymous and shared-memory mappings have no backing store; and
- * file-backed MAP_SHARED is materialised as a private copy that the kernel
- * deliberately does not write back.  So the flush itself is a no-op — but the
- * argument checking is real, because callers use EINVAL to detect a bad
- * address or a nonsensical flag combination. */
+/* msync(2): what was stored into a shared mapping of a file is written to
+ * the file -- MS_SYNC also has it on the medium before the call returns,
+ * MS_INVALIDATE has the mapping show what the file holds now.  The kernel
+ * checks the arguments (EINVAL: unaligned address, unknown flag, MS_ASYNC
+ * with MS_SYNC; ENOMEM: part of the range not mapped). */
 int msync(void *addr, size_t length, int flags)
 {
-	if (((unsigned long)addr & (unsigned long)(getpagesize() - 1)) != 0) {
-		errno = EINVAL;
+	long ret = syscall3(SYS_MSYNC, (long)addr, (long)length, (long)flags);
+
+	if (ret < 0) {
+		errno = (int)-ret;
 		return -1;
 	}
-	if (flags & ~(MS_ASYNC | MS_SYNC | MS_INVALIDATE)) {
-		errno = EINVAL;
-		return -1;
-	}
-	/* MS_ASYNC and MS_SYNC are mutually exclusive. */
-	if ((flags & MS_ASYNC) && (flags & MS_SYNC)) {
-		errno = EINVAL;
-		return -1;
-	}
-	(void)length;
 	return 0;
 }
 

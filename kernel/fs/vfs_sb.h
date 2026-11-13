@@ -90,6 +90,15 @@ typedef struct vfs_sb_ops {
 	unsigned long (*map_block)(vfs_superblock_t *sb, unsigned long chain_id,
 				   unsigned long block_index);
 
+	/* The id of block N of a chain, straight from N.  OPTIONAL: for a
+	 * filesystem whose ids are positional (ext4: block N of inode I is
+	 * EXT4_BID_ENC(I, N)), where walking -- and caching the walk per
+	 * inode, which caps how far it can reach -- is pointless.  Same answer
+	 * as N steps of next_block(): the id, or 0 past the end of the chain
+	 * (the recorded length).  Called with lock_map() or lock_io() held. */
+	unsigned long (*block_at)(vfs_superblock_t *sb, unsigned long chain_id,
+				  unsigned long block_index);
+
 	/* Persist a dirty inode's metadata to disk.  The driver translates the
      * generic ic_inode_t fields (size, etc.) plus its own fs_private data
      * back into the on-disk inode/dirent layout.  Takes lock_io() as needed
@@ -171,6 +180,13 @@ static inline unsigned long vfs_sb_map_block(vfs_superblock_t *sb,
 	if (!sb || !sb->ops || !sb->ops->map_block)
 		return 0;
 	return sb->ops->map_block(sb, chain_id, block_index);
+}
+
+static inline unsigned long vfs_sb_block_at(vfs_superblock_t *sb,
+					    unsigned long chain_id,
+					    unsigned long block_index)
+{
+	return sb->ops->block_at(sb, chain_id, block_index);
 }
 
 static inline int vfs_sb_write_inode(vfs_superblock_t *sb, struct ic_inode *ino)

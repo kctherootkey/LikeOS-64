@@ -1,0 +1,19 @@
+The large-file seek needs no system call numbers here: off_t is 64 bits
+wide, so ext2fs_llseek() is plain lseek() (the SIZEOF_OFF_T >= 8 branch),
+and the libc has no <linux/unistd.h> to declare the numbers it would not
+use.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/lib/ext2fs/llseek.c	2026-03-06 18:17:36.000000000 +0100
++++ b/lib/ext2fs/llseek.c	2026-11-11 15:00:22.785626007 +0100
+@@ -35,7 +35,9 @@
+ 
+ #ifdef __linux__
+ 
++#ifndef __LIKEOS__	/* off_t is 64 bits: lseek() is the large-file call */
+ #include <linux/unistd.h>
++#endif
+ 
+ static ext2_loff_t my_llseek (int fd, ext2_loff_t offset, int origin)
+ {

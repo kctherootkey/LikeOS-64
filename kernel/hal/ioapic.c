@@ -8,6 +8,7 @@
 #include <kernel/hal/lapic.h> // for lapic_get_id_cpuid
 #include <kernel/mm/memory.h> // for phys_to_virt
 #include <kernel/ke/sched.h> // for sched_is_smp()
+#include <kernel/ke/irq.h> // irq_reserve_legacy_vector()
 #include <kernel/uapi/bug.h>
 
 // Default IOAPIC MMIO base (commonly 0xFEC00000). No ACPI parsing yet.
@@ -96,6 +97,10 @@ int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity,
 			max_redir);
 		return -2;
 	}
+	/* Lowest-priority delivery may pick any CPU: the vector must be
+	 * this line's on every one of them, never a per-CPU allocation. */
+	if (irq_reserve_legacy_vector(vector) != 0)
+		return -3;
 
 	// Build redirection entry low dword
 	uint32_t low = 0;

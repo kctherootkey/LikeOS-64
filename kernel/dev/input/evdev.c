@@ -22,6 +22,7 @@
 #include <kernel/ke/timer.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
+#include <kernel/ke/uaccess_range.h>
 
 // Wake pollers sleeping in poll()/select() (kernel/net/poll.c)
 extern void poll_notify_io_ready(void);
@@ -688,9 +689,10 @@ void evdev_release_grab_for(int unit, int64_t task_id)
 // ioctl interface
 // ---------------------------------------------------------------------------
 
+/* SMAP-aware copies of whole, user-range-checked spans. */
 static int evdev_copy_out(void *user_dst, const void *src, size_t len)
 {
-	if (!user_dst)
+	if (!user_dst || !user_range_ok((uint64_t)user_dst, len))
 		return -EFAULT;
 	smap_disable();
 	kmemcpy(user_dst, src, len);
@@ -700,7 +702,7 @@ static int evdev_copy_out(void *user_dst, const void *src, size_t len)
 
 static int evdev_copy_in(void *dst, const void *user_src, size_t len)
 {
-	if (!user_src)
+	if (!user_src || !user_range_ok((uint64_t)user_src, len))
 		return -EFAULT;
 	smap_disable();
 	kmemcpy(dst, user_src, len);
@@ -718,6 +720,9 @@ static int evdev_copy_bits(void *argp, const uint8_t *bits, size_t bits_len,
 
 	if (n == 0)
 		return 0;
+	/* The zero fill below writes the caller's whole length. */
+	if (!argp || !user_range_ok((uint64_t)argp, user_len))
+		return -EFAULT;
 	rc = evdev_copy_out(argp, bits, n);
 	if (rc != 0)
 		return rc;

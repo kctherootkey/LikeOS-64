@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -271,10 +272,10 @@ static void process_format_char(char spec, const char *filename,
 		printf("%lu", (unsigned long)st->st_size);
 		break;
 	case 't':
-		printf("%lx", (unsigned long)(st->st_rdev >> 8));
+		printf("%x", major(st->st_rdev));
 		break;
 	case 'T':
-		printf("%lx", (unsigned long)(st->st_rdev & 0xff));
+		printf("%x", minor(st->st_rdev));
 		break;
 	case 'u':
 		printf("%u", st->st_uid);

@@ -1,0 +1,27 @@
+Patches applied to the pristine e2fsprogs-1.47.4 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-llseek-no-syscall-numbers.patch
+        ext2fs_llseek() is plain lseek() (off_t is 64 bits); the system
+        call number header it does not use is not included.
+
+  0002-mke2fs-no-kernel-version-checks.patch
+        mke2fs does not read the uname() release as a kernel version with
+        historic ext2/ext4 limits (it would have made revision 0 file
+        systems on LikeOS).
+
+  0003-getsectsize-ioctl-header.patch
+        The logical/physical sector size queries (BLKSSZGET, BLKPBSZGET)
+        are compiled in: <sys/ioctl.h> is included without the floppy
+        header it otherwise comes with.
+
+  0004-mke2fs-conf-likeos-feature-set.patch
+        The default ext4 feature set (mke2fs's built-in profile and the
+        installed /etc/mke2fs.conf) is the one the LikeOS root image is
+        built with: no 64bit, metadata_csum_seed or orphan_file, 4 KiB
+        blocks also for small file systems; 64bit only where the device is
+        too big for 32-bit block numbers.
+
+Copyright (C) 2026 The LikeOS Project

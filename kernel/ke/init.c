@@ -29,6 +29,7 @@ void procfs_init(void);
 #include <kernel/ke/storage.h>
 #include <kernel/hal/serial.h>
 #include <kernel/dev/ata/ahci.h>
+#include <kernel/dev/nvme/nvme.h>
 #include <kernel/dev/block/blkdev.h>
 #include <kernel/ke/userinit.h>
 #include <kernel/ke/timer.h>
@@ -286,6 +287,10 @@ __no_stack_protector void continue_system_startup(void)
 		0); /* RSDP not provided by bootloader: ACPI, xHCI, HPET, and timers will all fail */
 	acpi_init(g_rsdp_address);
 	acpi_pm_init();
+	/* Extended configuration space (MCFG, every segment): the devices'
+	 * capabilities above 0x100 (AER, DSN, L1 substates ...) become
+	 * visible, and segments other than 0 are scanned. */
+	pci_ecam_init();
 	timer_init_hpet(); // Prefer HPET for precise wall-clock timing if available
 	timer_init_pmtimer(); // Probe ACPI PM Timer for sub-tick interpolation
 	hrtimer_init_hw(); // One HPET comparator for nanosecond deadlines
@@ -338,7 +343,16 @@ __no_stack_protector void continue_system_startup(void)
 	 * registered block device before the storage bootstrap below starts
 	 * looking for the root filesystem.  Interrupts and the per-controller
 	 * worker thread come later, with ahci_late_init(). */
+	/* Intel VMD domains: the NVMe drives (and root ports) the firmware
+	 * hid behind a VMD are enumerated before the storage drivers look
+	 * for their devices. */
+	pci_vmd_init();
 	ahci_init();
+	/* NVMe controllers: the PCI driver registers and probe() sets each
+	 * controller up (BAR, quirks, the core's objects) WITHOUT enabling
+	 * it -- there are no interrupts and no scheduler yet.  The
+	 * controllers come up asynchronously from nvme_late_init(). */
+	nvme_init();
 
 	storage_fs_init(&g_storage_state);
 	/* A display driver's late bring-up -- firmware from the root
@@ -394,6 +408,12 @@ __no_stack_protector void continue_system_startup(void)
 	WARN_ON_ONCE(smp_get_cpu_count() <
 		     1); /* at least BSP must be online before STI */
 	__asm__ volatile("sti");
+	{
+		/* From here on a might_sleep() with interrupts off is a bug
+		 * (ke/stack_guard.c). */
+		extern volatile int g_might_sleep_armed;
+		__atomic_store_n(&g_might_sleep_armed, 1, __ATOMIC_RELAXED);
+	}
 
 	// Send DHCP DISCOVER now that interrupts are enabled and the E1000
 	// can actually receive the OFFER response.
@@ -458,6 +478,12 @@ __no_stack_protector void continue_system_startup(void)
 	 * boot-time polling path.  Runs on the boot thread and does not
 	 * sleep; anything long is handed to the kahci threads. */
 	ahci_late_init();
+	/* NVMe controllers come up here, each in its own reset work on
+	 * kblockd (enable, I/O queues on per-CPU interrupt vectors, namespace
+	 * scan); their disks register as they appear, and the storage
+	 * bootstrap accepts a root disk that registers late.  Does not
+	 * wait. */
+	nvme_late_init();
 #ifdef SERIAL_ENABLED
 	/* The serial log leaves through its own thread from now on: the
 	 * console never waits for the UART (a hypervisor's virtual port can

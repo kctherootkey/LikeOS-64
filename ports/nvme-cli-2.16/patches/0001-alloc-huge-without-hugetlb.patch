@@ -1,0 +1,26 @@
+Large buffers without the HugeTLB pool.
+
+nvme_alloc_huge() first asks mmap() for MAP_HUGETLB pages and falls back to
+posix_memalign() when the pool is empty.  LikeOS has no HugeTLB pool (and
+no MAP_HUGETLB), so the attempt is compiled only where the flag exists and
+large buffers come from the fallback directly.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/util/mem.c	2025-11-04 10:36:51.000000000 +0100
++++ b/util/mem.c	2026-11-11 11:55:49.043778405 +0100
+@@ -64,12 +64,14 @@
+ 	 *
+ 	 * https://www.kernel.org/doc/Documentation/vm/hugetlbpage.txt
+ 	 */
++#ifdef MAP_HUGETLB
+ 	mh->p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+ 		     MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
+ 	if (mh->p != MAP_FAILED) {
+ 		mh->len = len;
+ 		return mh->p;
+ 	}
++#endif
+ 
+ 	/*
+ 	 * And if mmap fails because the pool is empty, try to use

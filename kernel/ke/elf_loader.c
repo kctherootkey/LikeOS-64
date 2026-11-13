@@ -1095,6 +1095,13 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
 			mmap_region_t *r = &cur->mmap_regions[i];
 
+			/* What the old image stored into a shared file
+			 * mapping goes to the file (written once the lock
+			 * below is released), read from the old tables while
+			 * they still exist. */
+			if (r->in_use && old)
+				mm_region_writeback_queue(old, r, r->start,
+							  r->start + r->length);
 			if (r->in_use)
 				mm_region_ref_drop(r);
 			r->file = NULL;

@@ -522,9 +522,15 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/vfs.o \
 			  $(BUILD_DIR)/frlock.o \
 			  $(BUILD_DIR)/devfs.o \
+			  $(BUILD_DIR)/chrdev.o \
 			  $(BUILD_DIR)/tty.o \
 			  $(BUILD_DIR)/vt.o \
 			  $(BUILD_DIR)/pci.o \
+			  $(BUILD_DIR)/pci_ecam.o \
+			  $(BUILD_DIR)/pci_msi.o \
+			  $(BUILD_DIR)/pci_pm.o \
+			  $(BUILD_DIR)/pci_vmd.o \
+			  $(BUILD_DIR)/pci_driver.o \
 			  $(BUILD_DIR)/block.o \
 			  $(BUILD_DIR)/xhci.o \
 			  $(BUILD_DIR)/fat32.o \
@@ -543,6 +549,13 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/fpu.o \
 			  $(BUILD_DIR)/hrtimer.o \
 			  $(BUILD_DIR)/irq.o \
+			  $(BUILD_DIR)/irq_matrix.o \
+			  $(BUILD_DIR)/irq_affinity.o \
+			  $(BUILD_DIR)/completion.o \
+			  $(BUILD_DIR)/mutex.o \
+			  $(BUILD_DIR)/waitq.o \
+			  $(BUILD_DIR)/cpumask.o \
+			  $(BUILD_DIR)/ida.o \
 			  $(BUILD_DIR)/syscall.o \
 			  $(BUILD_DIR)/syscall_c.o \
 			  $(BUILD_DIR)/uaccess.o \
@@ -691,8 +704,45 @@ STORAGE_OBJS = $(BUILD_DIR)/ahci_pci.o \
 	       $(BUILD_DIR)/genhd.o \
 	       $(BUILD_DIR)/partition.o \
 	       $(BUILD_DIR)/blkdev_node.o \
-	       $(BUILD_DIR)/blk_sysfs.o
+	       $(BUILD_DIR)/blk_sysfs.o \
+	       $(BUILD_DIR)/blk_mq.o \
+	       $(BUILD_DIR)/blk_mq_tag.o \
+	       $(BUILD_DIR)/blk_mq_cpumap.o \
+	       $(BUILD_DIR)/blk_integrity.o \
+	       $(BUILD_DIR)/blk_zoned.o \
+	       $(BUILD_DIR)/blk_pr.o \
+	       $(BUILD_DIR)/blk_settings.o
 KERNEL_OBJS += $(STORAGE_OBJS)
+
+# NVMe host driver (kernel/dev/nvme): the transport-independent core
+# (controller, admin commands, namespaces, I/O, multipath, zoned
+# namespaces, reservations, ioctls, character devices, debug) and the
+# PCI Express transport.  Contracts: kernel/dev/nvme/nvme_spec.h (on-wire
+# definitions), nvme.h (core), nvme_pci.h (transport),
+# kernel/dev/block/blk_mq.h (multi-queue block layer).
+NVME_OBJS = $(BUILD_DIR)/nvme_core.o \
+	    $(BUILD_DIR)/nvme_admin.o \
+	    $(BUILD_DIR)/nvme_constants.o \
+	    $(BUILD_DIR)/nvme_hwmon.o \
+	    $(BUILD_DIR)/nvme_sysfs.o \
+	    $(BUILD_DIR)/nvme_ns.o \
+	    $(BUILD_DIR)/nvme_io.o \
+	    $(BUILD_DIR)/nvme_mpath.o \
+	    $(BUILD_DIR)/nvme_zns.o \
+	    $(BUILD_DIR)/nvme_pr.o \
+	    $(BUILD_DIR)/nvme_feat_ns.o \
+	    $(BUILD_DIR)/nvme_ioctl.o \
+	    $(BUILD_DIR)/nvme_chrdev.o \
+	    $(BUILD_DIR)/nvme_admin_ops.o \
+	    $(BUILD_DIR)/nvme_debug.o \
+	    $(BUILD_DIR)/nvme_fault_inject.o \
+	    $(BUILD_DIR)/nvme_pci.o \
+	    $(BUILD_DIR)/nvme_pci_queue.o \
+	    $(BUILD_DIR)/nvme_pci_dma.o \
+	    $(BUILD_DIR)/nvme_pci_irq.o \
+	    $(BUILD_DIR)/nvme_pci_pm.o \
+	    $(BUILD_DIR)/nvme_pci_quirks.o
+KERNEL_OBJS += $(NVME_OBJS)
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -726,6 +776,7 @@ EXT4_MB      ?=
 # mkfs.ext4 feature flags.  metadata_csum is ON by default: the driver maintains
 # every metadata checksum on WRITE (P6 Step 2 — verified e2fsck-clean 2026-06-17).
 # 64bit stays off (32-byte group descriptors), the verified configuration.
+# The installed /etc/mke2fs.conf carries the same set (e2fsprogs patch 0004).
 # Overrides:
 #   make EXT4_MKFS_FEATURES=                       (also enable 64bit / 64-byte descs)
 #   make EXT4_MKFS_FEATURES=^metadata_csum,^64bit  (legacy no-csum image)
@@ -749,14 +800,26 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	backlight gdb gdbserver loadkeys dumpkeys kbd_mode setleds setmetamode showkey \
 	lsblk
 # System binaries -> /sbin/<name>, the disk administration tools (hdparm,
-# blkid, fdisk, sfdisk, wipefs, blockdev, blkdiscard, findfs) among them.
-ROOT_SBIN_PROGS = init getty hdparm blkid fdisk sfdisk wipefs blockdev blkdiscard findfs
+# blkid, fdisk, sfdisk, wipefs, blockdev, blkdiscard, findfs) and the file
+# system tools (e2fsprogs: mke2fs, e2fsck, tune2fs, dumpe2fs, resize2fs,
+# debugfs, badblocks; dosfstools: mkfs.fat, fsck.fat, fatlabel) among them.
+ROOT_SBIN_PROGS = init getty hdparm blkid fdisk sfdisk wipefs blockdev blkdiscard findfs \
+	mke2fs e2fsck tune2fs dumpe2fs resize2fs debugfs badblocks \
+	mkfs.fat fsck.fat fatlabel
+# The other names of those tools, as symbolic links in /sbin (<link>:<target>):
+# the programs act on the name they are started under (mkfs.ext4 makes ext4,
+# e2label is tune2fs -L ...).
+ROOT_SBIN_LINKS = mkfs.ext2:mke2fs mkfs.ext3:mke2fs mkfs.ext4:mke2fs \
+	fsck.ext2:e2fsck fsck.ext3:e2fsck fsck.ext4:e2fsck e2label:tune2fs \
+	mkfs.vfat:mkfs.fat mkfs.msdos:mkfs.fat mkdosfs:mkfs.fat \
+	fsck.vfat:fsck.fat fsck.msdos:fsck.fat dosfsck:fsck.fat \
+	dosfslabel:fatlabel
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
 	libdlbase.so libdlchain.so libaudio.so
 # Audio tools -> /usr/bin, the audio service -> /usr/sbin
 USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
-USR_SBIN_PROGS = audiod smartctl smartd partx addpart delpart resizepart
+USR_SBIN_PROGS = audiod smartctl smartd partx addpart delpart resizepart nvme
 # Helpers -> /usr/libexec/<name>
 USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
@@ -1036,6 +1099,36 @@ $(BUILD_DIR)/atapi.o: $(KERNEL_DIR)/dev/ata/atapi.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/blk_%.o: $(KERNEL_DIR)/dev/block/blk_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# NVMe (kernel/dev/nvme): one rule for every nvme_*.c.
+$(BUILD_DIR)/nvme_%.o: $(KERNEL_DIR)/dev/nvme/nvme_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# PCI core (kernel/hal/pci_*.c) and the interrupt core (kernel/ke/irq_*.c).
+$(BUILD_DIR)/pci_%.o: $(KERNEL_DIR)/hal/pci_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/irq_%.o: $(KERNEL_DIR)/ke/irq_%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# Kernel synchronisation primitives and registries.
+$(BUILD_DIR)/completion.o: $(KERNEL_DIR)/ke/completion.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mutex.o: $(KERNEL_DIR)/ke/mutex.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/waitq.o: $(KERNEL_DIR)/ke/waitq.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpumask.o: $(KERNEL_DIR)/ke/cpumask.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ida.o: $(KERNEL_DIR)/ke/ida.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/chrdev.o: $(KERNEL_DIR)/fs/chrdev.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/genhd.o: $(KERNEL_DIR)/dev/block/genhd.c | $(BUILD_DIR)
@@ -2175,6 +2268,52 @@ $(addprefix $(BUILD_DIR)/,$(DISKTOOLS_PROGS)): ports-disktools | $(BUILD_DIR)
 	cp ports/util-linux-2.42.4/build/$(notdir $@) $@
 	$(USER_STRIP) --strip-unneeded $@
 
+# e2fsprogs: creating, checking, tuning, resizing and inspecting ext2/ext3/
+# ext4 file systems -- mke2fs (mkfs.ext2/3/4, defaults in /etc/mke2fs.conf),
+# e2fsck (fsck.ext2/3/4), tune2fs (e2label), dumpe2fs, resize2fs (off-line
+# only), debugfs and badblocks.  libuuid and libblkid are util-linux's
+# (ports-disktools builds them first); libext2fs, libe2p, libcom_err, libss
+# and e2fsprogs' support library are static archives linked into each tool.
+.PHONY: ports-e2fsprogs
+ports-e2fsprogs: userland-libc userland-rtld ports-disktools
+	$(MAKE) -C ports/e2fsprogs-1.47.4 -f Makefile.likeos
+
+E2FSPROGS_PROGS = mke2fs e2fsck tune2fs dumpe2fs resize2fs debugfs badblocks
+$(addprefix $(BUILD_DIR)/,$(E2FSPROGS_PROGS)): ports-e2fsprogs | $(BUILD_DIR)
+	cp ports/e2fsprogs-1.47.4/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# dosfstools: FAT12/16/32 file systems (the EFI System Partition) --
+# mkfs.fat (mkfs.vfat, mkfs.msdos, mkdosfs), fsck.fat (fsck.vfat,
+# fsck.msdos, dosfsck) and fatlabel (dosfslabel).
+.PHONY: ports-dosfstools
+ports-dosfstools: userland-libc userland-rtld
+	$(MAKE) -C ports/dosfstools-4.2 -f Makefile.likeos
+
+DOSFSTOOLS_PROGS = mkfs.fat fsck.fat fatlabel
+$(addprefix $(BUILD_DIR)/,$(DOSFSTOOLS_PROGS)): ports-dosfstools | $(BUILD_DIR)
+	cp ports/dosfstools-4.2/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# nvme-cli: the `nvme' program -- list, id-ctrl/id-ns, smart-log, error-log,
+# fw-log/fw-download/fw-commit, get/set-feature, format, sanitize, self-test,
+# ns management, zns, reservations, telemetry and the vendor plugins -- on
+# /dev/nvmeX, /dev/nvmeXnY and /dev/ngXnY through the NVME_IOCTL_* requests
+# and the /sys/class/nvme* topology.  libnvme (ports/libnvme-1.16.2) is a
+# static archive linked into it.  Without json-c, openssl, keyutils, dbus,
+# liburing: no -o json, no fabrics TLS/authentication (NVMe over Fabrics is
+# not supported anyway).
+.PHONY: ports-libnvme ports-nvmecli
+ports-libnvme: userland-libc
+	$(MAKE) -C ports/libnvme-1.16.2 -f Makefile.likeos
+
+ports-nvmecli: userland-libc userland-rtld ports-libnvme
+	$(MAKE) -C ports/nvme-cli-2.16 -f Makefile.likeos
+
+$(BUILD_DIR)/nvme: ports-nvmecli | $(BUILD_DIR)
+	cp ports/nvme-cli-2.16/build/nvme $@
+	$(USER_STRIP) --strip-unneeded $@
+
 # gdb.
 #
 # Depends on the GTK3 package set, which is what populates build/xorg-sysroot --
@@ -2747,6 +2886,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	ln -sfn bash $(EXT4_STAGING)/bin/sh
 	# System programs (init, getty) -> /sbin
 	for p in $(ROOT_SBIN_PROGS); do cp $(BUILD_DIR)/$$p $(EXT4_STAGING)/sbin/$$p; done
+	# Their other names (mkfs.ext4 -> mke2fs, fsck.vfat -> fsck.fat ...)
+	for l in $(ROOT_SBIN_LINKS); do ln -sfn $${l#*:} $(EXT4_STAGING)/sbin/$${l%%:*}; done
 	# setuid-root helpers: passwd (write /etc/shadow) and su (switch user).
 	# Owner is root (root_owner=0:0 below), so mode 4755 = -rwsr-xr-x root.
 	# Each drops or confines privilege internally and decides on getuid().
@@ -2948,6 +3089,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# /bin/sh when the file is missing, whatever the password database says.
 	cp res/etc/shells        $(EXT4_STAGING)/etc/shells
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
+	# mke2fs's defaults per file system type and usage (from e2fsprogs;
+	# built with $(BUILD_DIR)/mke2fs, which is in ROOT_SBIN_PROGS)
+	cp ports/e2fsprogs-1.47.4/build/mke2fs.conf $(EXT4_STAGING)/etc/mke2fs.conf
 	# The time zone, as an Olson name.  /etc/profile exports it as $$TZ,
 	# which is the only way ICU (and so the browser's Date and Intl) can
 	# learn the zone on this system; libc and GLib (through the zoneinfo
@@ -3285,6 +3429,159 @@ qemu-ahci-usb: $(GPT_DISK) $(AHCI_DATA_DISK)
 		-device ide-hd,drive=sata0,bus=ahci.0 \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
 
+# ---------------------------------------------------------------------------
+# NVMe targets.
+#
+# Like the AHCI ones: the scratch disks are sparse raw files created on first
+# use and kept afterwards (delete them to start over).  With NVME_TEST_PART=1
+# a fresh data disk gets a GPT with one partition named "likeos-test" over
+# the whole disk -- the target `testlibc nvme', `testlibc storage' and
+# `disktest auto' write to.  q35 throughout: the controllers sit on PCI
+# Express (extended configuration space through MCFG, MSI-X), each behind a
+# root port of its own.
+#
+#   qemu-nvme       USB boot (as `qemu') plus one NVMe controller with a
+#                   data namespace (NVME_DATA_DISK, NVME_DATA_MB megabytes)
+#   qemu-nvme-boot  the image itself on an NVMe namespace, booted by the
+#                   firmware from it (bootindex 0), plus the data namespace on
+#                   a second controller
+#   qemu-nvme-full  USB boot plus every NVMe feature QEMU emulates:
+#                   - nvme-subsys "likeos-subsys0" with two controllers
+#                     (multipath; flexible data placement: an endurance group
+#                     with 2 reclaim groups and 8 reclaim unit handles), and
+#                     shared namespaces on it: 1 data (512 B LBA, likeos-test
+#                     with NVME_TEST_PART=1), 2 4 KiB LBA, 3 8-byte metadata
+#                     with protection information type 1 (separate buffer),
+#                     4 scratch (TESTLIBC_NVME_SCRATCH for the installer check);
+#                     controller 0 with a 64 MiB controller memory buffer,
+#                     controller 1 with a 16 MiB persistent memory region;
+#                     NVME_MSIX vectors and NVME_IOQ I/O queue pairs each
+#                   - a third controller (outside the FDP subsystem, which
+#                     QEMU does not combine with zones) with a zoned namespace:
+#                     64 MiB zones of 60 MiB capacity, 4 KiB LBA, at most 14
+#                     open / 16 active zones (TESTLIBC_ZNS for the zone writes)
+# ---------------------------------------------------------------------------
+NVME_DATA_DISK ?= $(BUILD_DIR)/nvme-data.img
+NVME_DATA_MB ?= 1024
+NVME_TEST_PART ?=
+NVME_FULL_DIR ?= $(BUILD_DIR)/nvme-full
+NVME_MSIX ?= 17
+NVME_IOQ ?= 16
+
+# One scratch image: $(call nvme_scratch,FILE,MB,PART) -- PART non-empty puts
+# the likeos-test GPT partition on it (when NVME_TEST_PART=1).  A failed
+# partitioning removes the file again, so the next run does not take a blank
+# image for a prepared one.
+define nvme_scratch
+	rm -f $(1)
+	truncate -s $(2)M $(1)
+	@if [ -n "$(3)" ] && [ -n "$(NVME_TEST_PART)" ]; then \
+		sgdisk -Z $(1) >/dev/null 2>&1; \
+		if sgdisk -n 1:2048:0 -t 1:8300 -c 1:"likeos-test" $(1) >/dev/null; then \
+			echo "$(1): GPT with partition 1 \"likeos-test\" (scratch for the storage tests)"; \
+		else \
+			rm -f $(1); \
+			echo "$(1): partitioning failed (sgdisk), image removed" >&2; \
+			exit 1; \
+		fi; \
+	else \
+		echo "$(1): blank $(2) MB scratch disk"; \
+	fi
+endef
+
+# NVME_TEST_PART=1 on an image made without it (or whose partition is gone):
+# the images that carry the partition are made again.  Checked when the
+# variable is set only, so a plain run never touches an existing image.
+ifneq ($(NVME_TEST_PART),)
+NVME_PART_STALE := $(shell for f in $(NVME_DATA_DISK) $(NVME_FULL_DIR)/ns1-data.img; do \
+	if [ -f "$$f" ] && command -v sgdisk >/dev/null 2>&1 && \
+	   ! sgdisk -p "$$f" 2>/dev/null | grep -q likeos-test; then echo "$$f"; fi; done)
+ifneq ($(strip $(NVME_PART_STALE)),)
+$(NVME_PART_STALE): nvme-part-force
+endif
+endif
+.PHONY: nvme-part-force
+nvme-part-force:
+	@echo "NVME_TEST_PART=1: re-creating $(NVME_PART_STALE) with the likeos-test partition"
+
+$(NVME_DATA_DISK): | $(BUILD_DIR)
+	$(call nvme_scratch,$@,$(NVME_DATA_MB),part)
+
+$(NVME_FULL_DIR):
+	mkdir -p $@
+$(NVME_FULL_DIR)/ns1-data.img: | $(NVME_FULL_DIR)
+	$(call nvme_scratch,$@,1024,part)
+$(NVME_FULL_DIR)/ns2-4k.img: | $(NVME_FULL_DIR)
+	$(call nvme_scratch,$@,512,)
+$(NVME_FULL_DIR)/ns3-pi.img: | $(NVME_FULL_DIR)
+	$(call nvme_scratch,$@,256,)
+$(NVME_FULL_DIR)/ns4-scratch.img: | $(NVME_FULL_DIR)
+	$(call nvme_scratch,$@,512,)
+$(NVME_FULL_DIR)/zns.img: | $(NVME_FULL_DIR)
+	$(call nvme_scratch,$@,1024,)
+# The persistent memory region's backing file: a power of two in size.
+$(NVME_FULL_DIR)/pmr.img: | $(NVME_FULL_DIR)
+	truncate -s 16M $@
+
+NVME_FULL_DISKS = $(addprefix $(NVME_FULL_DIR)/,ns1-data.img ns2-4k.img ns3-pi.img \
+	ns4-scratch.img zns.img pmr.img)
+
+QEMU_NVME_DATA = \
+	-device pcie-root-port,id=nvmerp9,bus=pcie.0,chassis=9,slot=9 \
+	-drive if=none,id=nvmdata,file=$(NVME_DATA_DISK),format=raw,readonly=off \
+	-device nvme,id=nvme-data,bus=nvmerp9,serial=likeos-nvme-data,drive=nvmdata,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX)
+
+# USB boot plus an NVMe controller with the data namespace.
+qemu-nvme: $(GPT_DISK) $(NVME_DATA_DISK)
+	@echo "Running LikeOS from the ext4 GPT USB disk + an NVMe controller with a data namespace..."
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
+		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
+		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
+		$(QEMU_NVME_DATA) \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
+
+# Boot from NVMe: the image is namespace 1 of the first controller and the
+# firmware's boot device; root is found by partition identity on the disk
+# the bootloader came from, so the same image boots here as from USB.
+qemu-nvme-boot: $(GPT_DISK) $(NVME_DATA_DISK)
+	@echo "Running LikeOS from an NVMe namespace (q35, image on nvme0n1, data namespace on a second controller)..."
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
+		-drive if=none,id=nvmboot,file=$(GPT_DISK),format=raw,readonly=off \
+		-device pcie-root-port,id=nvmerp8,bus=pcie.0,chassis=8,slot=8 \
+		-device nvme,id=nvme-boot,bus=nvmerp8,serial=likeos-nvme-boot,drive=nvmboot,bootindex=0 \
+		$(QEMU_NVME_DATA) \
+		$(QEMU_USB_HID) \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
+
+# USB boot plus the full NVMe feature set (see above).
+qemu-nvme-full: $(GPT_DISK) $(NVME_FULL_DISKS)
+	@echo "Running LikeOS from the ext4 GPT USB disk + an NVMe subsystem (2 controllers, FDP, CMB, PMR, 4 namespaces) + a zoned namespace..."
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
+		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
+		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
+		-object memory-backend-file,id=nvmepmr,share=on,mem-path=$(NVME_FULL_DIR)/pmr.img,size=16M \
+		-device nvme-subsys,id=nvmesubsys0,nqn=likeos-subsys0,fdp=on,fdp.nruh=8,fdp.nrg=2,fdp.runs=32M \
+		-device pcie-root-port,id=nvmerp1,bus=pcie.0,chassis=1,slot=1 \
+		-device pcie-root-port,id=nvmerp2,bus=pcie.0,chassis=2,slot=2 \
+		-device pcie-root-port,id=nvmerp3,bus=pcie.0,chassis=3,slot=3 \
+		-device nvme,id=nvme0,bus=nvmerp1,serial=likeos-nvme-a,subsys=nvmesubsys0,cmb_size_mb=64,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX) \
+		-device nvme,id=nvme1,bus=nvmerp2,serial=likeos-nvme-b,subsys=nvmesubsys0,pmrdev=nvmepmr,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX) \
+		-drive if=none,id=nvmns1,file=$(NVME_FULL_DIR)/ns1-data.img,format=raw,readonly=off \
+		-device nvme-ns,drive=nvmns1,bus=nvme0,nsid=1,fdp.ruhs=0-3 \
+		-drive if=none,id=nvmns2,file=$(NVME_FULL_DIR)/ns2-4k.img,format=raw,readonly=off \
+		-device nvme-ns,drive=nvmns2,bus=nvme0,nsid=2,logical_block_size=4096,physical_block_size=4096,fdp.ruhs=4-7 \
+		-drive if=none,id=nvmns3,file=$(NVME_FULL_DIR)/ns3-pi.img,format=raw,readonly=off \
+		-device nvme-ns,drive=nvmns3,bus=nvme0,nsid=3,ms=8,mset=0,pi=1,pil=0 \
+		-drive if=none,id=nvmns4,file=$(NVME_FULL_DIR)/ns4-scratch.img,format=raw,readonly=off \
+		-device nvme-ns,drive=nvmns4,bus=nvme0,nsid=4 \
+		-device nvme,id=nvme2,bus=nvmerp3,serial=likeos-nvme-zns,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX) \
+		-drive if=none,id=nvmzns,file=$(NVME_FULL_DIR)/zns.img,format=raw,readonly=off \
+		-device nvme-ns,drive=nvmzns,bus=nvme2,nsid=1,logical_block_size=4096,physical_block_size=4096,zoned=on,zoned.zone_size=64M,zoned.zone_capacity=60M,zoned.max_open=14,zoned.max_active=16 \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
+
 # Boot the ext4 GPT USB disk with GDB support and debug symbols.
 # Connect with: gdb build/kernel.elf -ex "target remote :1234"
 qemu-usb-gdb:
@@ -3472,6 +3769,10 @@ distclean: clean
 	$(MAKE) -C ports/hdparm-9.65 -f Makefile.likeos distclean
 	$(MAKE) -C ports/smartmontools-7.5 -f Makefile.likeos distclean
 	$(MAKE) -C ports/util-linux-2.42.4 -f Makefile.likeos distclean
+	$(MAKE) -C ports/libnvme-1.16.2 -f Makefile.likeos distclean
+	$(MAKE) -C ports/nvme-cli-2.16 -f Makefile.likeos distclean
+	$(MAKE) -C ports/e2fsprogs-1.47.4 -f Makefile.likeos distclean
+	$(MAKE) -C ports/dosfstools-4.2 -f Makefile.likeos distclean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
@@ -3930,6 +4231,9 @@ help:
 	@echo "  qemu-usb-passthrough - Run QEMU with host USB device passthrough (experimental)"
 	@echo "  qemu-ahci  - Boot from a SATA disk: q35 ICH9 AHCI with the image, a scratch disk and an ATAPI drive"
 	@echo "  qemu-ahci-usb - Same as qemu plus an AHCI controller with a SATA scratch disk"
+	@echo "  qemu-nvme  - Same as qemu (q35) plus an NVMe controller with a data namespace"
+	@echo "  qemu-nvme-boot - Boot from an NVMe namespace (q35, image on nvme0n1, bootindex 0)"
+	@echo "  qemu-nvme-full - qemu plus an NVMe subsystem (2 controllers, multipath, FDP, CMB, PMR, 4K/PI namespaces) and a zoned namespace"
 	@echo "  usb-write  - dd the ext4 GPT USB disk to a real device (requires USB_DEVICE=/dev/sdX)"
 	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"
 	@echo "  linux-usb-write - Write the host Linux image to USB (requires USB_DEVICE=/dev/sdX)"
@@ -3945,6 +4249,9 @@ help:
 	@echo "  AHCI_DATA_MB=N    - Size of the SATA scratch disk (build/ahci-data.img) of the qemu-ahci targets (default: 1024)"
 	@echo "  AHCI_TEST_PART=1  - Create the scratch disk with a GPT partition named likeos-test (storage write tests)"
 	@echo "  AHCI_ISO=file.iso - Medium for the ATAPI drive of qemu-ahci (default: first build/*.iso, else empty)"
+	@echo "  NVME_DATA_MB=N    - Size of the NVMe data namespace (build/nvme-data.img) of qemu-nvme* (default: 1024)"
+	@echo "  NVME_TEST_PART=1  - Create the NVMe scratch disks with a GPT partition named likeos-test"
+	@echo "  NVME_MSIX=N NVME_IOQ=N - MSI-X vectors / I/O queue pairs per NVMe controller (default: 17 / 16)"
 	@echo "  EXT4_MB=N         - Force the ext4 root partition size in MB (default: auto-size to content)"
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
 	@echo "  SCREEN_SIZE=large or unset - Real-hardware start resolution when none is saved in Display settings: sizes above 1920x1200, then 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768); VMs start at 1280x800"
@@ -3968,7 +4275,7 @@ kernel: $(KERNEL_ELF)
 bootloader: $(BOOTLOADER_EFI)
 usb: $(GPT_DISK)
 
-.PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-ahci qemu-ahci-usb qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
+.PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-ahci qemu-ahci-usb qemu-nvme qemu-nvme-boot qemu-nvme-full qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
 
 # Feed back the header dependencies recorded by -MMD (see DEPFLAGS above).
 #

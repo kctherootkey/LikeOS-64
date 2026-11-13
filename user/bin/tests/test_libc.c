@@ -71,6 +71,12 @@
 #include <sys/hdreg.h>
 #include <scsi/sg.h>
 #include <scsi/scsi.h>
+/* NVMe pass-through, zoned block devices, persistent reservations and
+ * POSIX AIO -- the NVMe section. */
+#include <linux/nvme_ioctl.h>
+#include <linux/blkzoned.h>
+#include <linux/pr.h>
+#include <aio.h>
 #include <mntent.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
@@ -13400,6 +13406,215 @@ static void test_xsave(void)
 	}
 }
 
+/* Shared file mappings write back (msync, munmap, mprotect, exit) on a disk
+ * filesystem; private, anonymous and shared-memory mappings are as before.
+ * Copyright (C) 2026 The LikeOS Project */
+static int wb_byte_at(int fd, off_t off)
+{
+	unsigned char c;
+
+	return pread(fd, &c, 1, off) == 1 ? c : -1;
+}
+
+static void test_mmap_shared_file_writeback(void)
+{
+	const size_t pg = 4096;
+	const off_t size = (off_t)(3 * pg + 100);
+	const char *p = tmpp("msync_wb");
+	struct statfs sfs;
+	struct stat st;
+	unsigned char *m;
+	int fd, disk;
+
+	printf("  -- shared file mapping write-back --\n");
+	fd = open(p, O_CREAT | O_TRUNC | O_RDWR, 0644);
+	test_result("msync: create the test file", fd >= 0);
+	if (fd < 0)
+		return;
+	{
+		unsigned char buf[4096];
+
+		for (int i = 0; i < 4; i++) {
+			memset(buf, 'a' + i, sizeof(buf));
+			if (pwrite(fd, buf, i < 3 ? pg : 100, (off_t)(i * pg)) < 0)
+				break;
+		}
+	}
+	disk = fstatfs(fd, &sfs) == 0 &&
+	       (sfs.f_type == 0xEF53 || sfs.f_type == 0x4d44);
+	if (!disk) {
+		printf("  [SKIP] %s is not on ext4/FAT32 (f_type %lx)\n", p,
+		       (unsigned long)sfs.f_type);
+		close(fd);
+		unlink(p);
+		return;
+	}
+
+	m = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	test_result("msync: mmap(MAP_SHARED) of a regular file", m != MAP_FAILED);
+	if (m == MAP_FAILED) {
+		close(fd);
+		unlink(p);
+		return;
+	}
+	test_result("msync: the mapping shows the file",
+		    m[0] == 'a' && m[2 * pg] == 'c' && m[3 * pg + 99] == 'd');
+	m[10] = 'X';
+	m[3 * pg + 50] = 'Y'; /* inside the file's last, partial page */
+	m[3 * pg + 200] = 'Z'; /* past its end */
+	test_result("msync(MS_SYNC) of a written shared file mapping",
+		    msync(m, 4 * pg, MS_SYNC) == 0);
+	test_result("msync: read() sees the store",
+		    wb_byte_at(fd, 10) == 'X' &&
+			    wb_byte_at(fd, (off_t)(3 * pg + 50)) == 'Y');
+	test_result("msync: unwritten bytes unchanged",
+		    wb_byte_at(fd, 11) == 'a' && wb_byte_at(fd, (off_t)pg) == 'b');
+	test_result("msync: the file did not grow",
+		    fstat(fd, &st) == 0 && st.st_size == size);
+
+	m[pg + 5] = 'Q';
+	test_result("msync(MS_ASYNC) writes too",
+		    msync(m + pg, pg, MS_ASYNC) == 0 &&
+			    wb_byte_at(fd, (off_t)(pg + 5)) == 'Q');
+
+	/* written some other way: MS_INVALIDATE shows it in the mapping */
+	{
+		unsigned char c = '#';
+
+		pwrite(fd, &c, 1, (off_t)(2 * pg + 7));
+		test_result("msync(MS_INVALIDATE) succeeds",
+			    msync(m, 4 * pg, MS_INVALIDATE) == 0);
+		test_result("msync(MS_INVALIDATE): the mapping shows the file",
+			    m[2 * pg + 7] == '#' && m[10] == 'X');
+	}
+
+	/* the dirty mark survives mprotect */
+	m[2 * pg + 1] = 'P';
+	test_result("mprotect(PROT_READ) of a written shared file page",
+		    mprotect(m + 2 * pg, pg, PROT_READ) == 0);
+	test_result("msync after mprotect writes the earlier store",
+		    msync(m + 2 * pg, pg, MS_SYNC) == 0 &&
+			    wb_byte_at(fd, (off_t)(2 * pg + 1)) == 'P');
+
+	/* munmap writes back */
+	m[pg + 6] = 'U';
+	test_result("munmap of a written shared file mapping",
+		    munmap(m, 4 * pg) == 0);
+	test_result("munmap: read() sees the store",
+		    wb_byte_at(fd, (off_t)(pg + 6)) == 'U');
+	test_result("munmap: the file did not grow",
+		    fstat(fd, &st) == 0 && st.st_size == size);
+
+	/* a hole in the range: ENOMEM, the mapped rest still written */
+	m = mmap(NULL, 3 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (m != MAP_FAILED) {
+		munmap(m + pg, pg);
+		m[0] = 'H';
+		m[2 * pg] = 'J';
+		errno = 0;
+		test_result("msync over a hole -> ENOMEM",
+			    msync(m, 3 * pg, MS_SYNC) == -1 && errno == ENOMEM);
+		test_result("msync over a hole still writes the mapped parts",
+			    wb_byte_at(fd, 0) == 'H' &&
+				    wb_byte_at(fd, (off_t)(2 * pg)) == 'J');
+		errno = 0;
+		test_result("msync with an unknown flag -> EINVAL",
+			    msync(m, pg, 0x100) == -1 && errno == EINVAL);
+		munmap(m, pg);
+		munmap(m + 2 * pg, pg);
+	}
+
+	/* exit writes back: a child stores and exits with the mapping in place */
+	{
+		pid_t c = fork();
+
+		if (c == 0) {
+			unsigned char *cm = mmap(NULL, pg, PROT_READ | PROT_WRITE,
+						 MAP_SHARED, fd, 0);
+			if (cm == MAP_FAILED)
+				_exit(2);
+			cm[20] = 'E';
+			_exit(0);
+		}
+		int ws = 0;
+		test_result("exit: child stores into a shared file mapping",
+			    c > 0 && waitpid(c, &ws, 0) == c &&
+				    WIFEXITED(ws) && WEXITSTATUS(ws) == 0);
+		test_result("exit: read() sees the child's store",
+			    wb_byte_at(fd, 20) == 'E');
+	}
+
+	/* a private mapping never reaches the file */
+	m = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (m != MAP_FAILED) {
+		m[30] = '!';
+		test_result("msync of a private file mapping succeeds",
+			    msync(m, pg, MS_SYNC) == 0);
+		munmap(m, pg);
+		test_result("a private file mapping leaves the file alone",
+			    wb_byte_at(fd, 30) == 'a');
+	}
+	close(fd);
+
+	/* a read-only description: a shared read mapping msyncs fine */
+	fd = open(p, O_RDONLY);
+	if (fd >= 0) {
+		m = mmap(NULL, pg, PROT_READ, MAP_SHARED, fd, 0);
+		if (m != MAP_FAILED) {
+			test_result("msync of a read-only shared file mapping",
+				    msync(m, pg, MS_SYNC) == 0 && m[20] == 'E');
+			munmap(m, pg);
+		}
+		close(fd);
+	}
+	unlink(p);
+
+	/* anonymous shared memory: unchanged, shared with a child */
+	m = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+		 -1, 0);
+	if (m != MAP_FAILED) {
+		pid_t c = fork();
+
+		if (c == 0) {
+			m[0] = 'S';
+			_exit(0);
+		}
+		if (c > 0)
+			waitpid(c, NULL, 0);
+		test_result("anonymous MAP_SHARED: msync succeeds, child's store seen",
+			    msync(m, pg, MS_SYNC | MS_INVALIDATE) == 0 && m[0] == 'S');
+		munmap(m, pg);
+	}
+
+	/* POSIX shared memory: unchanged */
+	{
+		char name[64];
+		int sfd;
+
+		snprintf(name, sizeof(name), "/tl_msync_%d", (int)getpid());
+		sfd = shm_open(name, O_CREAT | O_RDWR, 0600);
+		if (sfd >= 0 && ftruncate(sfd, (off_t)pg) == 0) {
+			unsigned char *a = mmap(NULL, pg, PROT_READ | PROT_WRITE,
+						MAP_SHARED, sfd, 0);
+			unsigned char *b = mmap(NULL, pg, PROT_READ, MAP_SHARED,
+						sfd, 0);
+			if (a != MAP_FAILED && b != MAP_FAILED) {
+				a[3] = 'R';
+				test_result("shm_open mapping: msync succeeds, both views agree",
+					    msync(a, pg, MS_SYNC) == 0 && b[3] == 'R');
+			}
+			if (a != MAP_FAILED)
+				munmap(a, pg);
+			if (b != MAP_FAILED)
+				munmap(b, pg);
+		}
+		if (sfd >= 0) {
+			close(sfd);
+			shm_unlink(name);
+		}
+	}
+}
+
 /* ======================================================================
  * Large and special mappings: multi-GB lazy reservations carved up with
  * mprotect, MAP_FIXED_NOREPLACE, MAP_POPULATE, MADV_FREE.
@@ -13513,6 +13728,8 @@ static void test_mmap_large(void)
 		if (blocker != MAP_FAILED)
 			munmap(blocker, pg);
 	}
+
+	test_mmap_shared_file_writeback();
 }
 
 /* ======================================================================
@@ -14614,6 +14831,152 @@ static int c11_fn(void *a)
 	return *(int *)a + 1;
 }
 
+/* ======================================================================
+ * VFS (11-12): pwrite keeps its offset to itself (a filesystem with a
+ * positioned write: ext4), and O_CREAT|O_EXCL is atomic.  On the root
+ * filesystem (/tmp) and on /ram.
+ * ====================================================================== */
+struct vl_pw {
+	int fd;
+	int n;
+};
+
+static void *vl_pwrite_thread(void *a)
+{
+	struct vl_pw *p = (struct vl_pw *)a;
+
+	for (int i = 0; i < p->n; i++)
+		if (pwrite(p->fd, "p", 1, 0) != 1)
+			return (void *)1;
+	return NULL;
+}
+
+struct vl_ex {
+	const char *path;
+	int rounds;
+	int wins;
+};
+
+static void *vl_excl_thread(void *a)
+{
+	struct vl_ex *x = (struct vl_ex *)a;
+
+	for (int i = 0; i < x->rounds; i++) {
+		int fd = open(x->path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		if (fd >= 0) {
+			x->wins++;
+			close(fd);
+		}
+		usleep(50);
+	}
+	return NULL;
+}
+
+static void test_vfs_leftovers_on(const char *dir)
+{
+	char p[128], q[128], name[64];
+	struct statfs sfs;
+	int fd;
+
+	printf("  -- on %s\n", dir);
+	/* V1: pwrite on one thread, write() on another, one description:
+	 * the write position is the description's alone.  Only ext4 writes
+	 * at an offset of the call's own; elsewhere pwrite still borrows the
+	 * description's position. */
+	snprintf(p, sizeof(p), "%s/tlvl_pw%d", dir, getpid());
+	fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0 && (fstatfs(fd, &sfs) != 0 || sfs.f_type != 0xEF53)) {
+		printf("  [SKIP] %s: pwrite vs write() needs ext4\n", dir);
+		close(fd);
+		unlink(p);
+	} else if (fd >= 0) {
+		enum { N = 3000, BASE = 4096 };
+		struct vl_pw a = { fd, N };
+		pthread_t t;
+		char *b = malloc(BASE + N);
+		int ok = 1;
+
+		lseek(fd, BASE, SEEK_SET);
+		pthread_create(&t, NULL, vl_pwrite_thread, &a);
+		for (int i = 0; i < N; i++)
+			if (write(fd, "w", 1) != 1)
+				ok = 0;
+		void *tr = NULL;
+		pthread_join(t, &tr);
+		snprintf(name, sizeof(name), "%s: write() and pwrite() side by side", dir);
+		test_result(name, ok && tr == NULL);
+		snprintf(name, sizeof(name), "%s: the position is write()'s own", dir);
+		test_result(name, lseek(fd, 0, SEEK_CUR) == BASE + N);
+		if (b && pread(fd, b, BASE + N, 0) == BASE + N) {
+			int ws = 0;
+			for (int i = BASE; i < BASE + N; i++)
+				ws += b[i] == 'w';
+			snprintf(name, sizeof(name), "%s: every write() landed at its position", dir);
+			test_result(name, ws == N && b[0] == 'p');
+		} else {
+			test_fail("pread back");
+		}
+		free(b);
+		close(fd);
+		unlink(p);
+	} else {
+		test_fail("V1 test file");
+	}
+
+	/* V9: O_CREAT|O_EXCL is one step: two racing threads, one winner per
+	 * round; and a dangling symlink counts as a name that exists. */
+	{
+		struct vl_ex a, b;
+		pthread_t t1, t2;
+		int rounds = 200, ok = 1;
+
+		snprintf(p, sizeof(p), "%s/tlvl_ex%d", dir, getpid());
+		for (int r = 0; r < 20 && ok; r++) {
+			unlink(p);
+			a.path = b.path = p;
+			a.rounds = b.rounds = rounds / 20;
+			a.wins = b.wins = 0;
+			/* each thread tries the name rounds/20 times; only the
+			 * very first open may succeed */
+			pthread_create(&t1, NULL, vl_excl_thread, &a);
+			pthread_create(&t2, NULL, vl_excl_thread, &b);
+			pthread_join(t1, NULL);
+			pthread_join(t2, NULL);
+			if (a.wins + b.wins != 1)
+				ok = 0;
+		}
+		snprintf(name, sizeof(name), "%s: racing O_CREAT|O_EXCL: exactly one winner", dir);
+		test_result(name, ok);
+		unlink(p);
+		snprintf(q, sizeof(q), "%s/tlvl_nowhere%d", dir, getpid());
+		unlink(q);
+		if (symlink(q, p) == 0) {
+			errno = 0;
+			fd = open(p, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			snprintf(name, sizeof(name), "%s: O_EXCL on a dangling symlink: EEXIST", dir);
+			test_result(name, fd < 0 && errno == EEXIST && access(q, F_OK) != 0);
+			if (fd >= 0)
+				close(fd);
+			unlink(p);
+		}
+		unlink(q);
+		errno = 0;
+		fd = open(dir, O_CREAT | O_EXCL | O_RDONLY, 0600);
+		snprintf(name, sizeof(name), "%s: O_EXCL on a directory: EEXIST", dir);
+		test_result(name, fd < 0 && errno == EEXIST);
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
+static void test_vfs_leftovers(void)
+{
+	printf("\n[TEST] VFS: pwrite keeps its offset, atomic O_CREAT|O_EXCL\n");
+	test_vfs_leftovers_on("/tmp");
+	if (access("/ram", W_OK) == 0)
+		test_vfs_leftovers_on("/ram");
+}
+
 static void test_posix_additions(void)
 {
 	printf("\n[TEST] pread/pwrite, fallocate and libc additions\n");
@@ -14734,6 +15097,7 @@ static void test_posix_additions(void)
 		    mtx_init(&mx, mtx_plain) == thrd_success && mtx_lock(&mx) == thrd_success &&
 			    mtx_trylock(&mx) == thrd_busy && mtx_unlock(&mx) == thrd_success);
 	mtx_destroy(&mx);
+	test_vfs_leftovers();
 }
 
 
@@ -17273,6 +17637,49 @@ static int stg_ata_regs_from_sense(const uint8_t *s, unsigned sb_len,
 	return -1;
 }
 
+/* The whole-disk device number of `dev' (dev itself for a whole disk),
+ * from sysfs: /sys/dev/block/MAJ:MIN links to ../../block/<disk> or
+ * ../../block/<disk>/<part>, and /sys/block/<disk>/dev holds the disk's
+ * MAJ:MIN.  This works for every disk kind -- sd disks with 16 minors
+ * each and NVMe namespaces on the extended major with dynamic minors --
+ * where arithmetic on minor numbers only works for the former.  0 when
+ * found. */
+static int stg_whole_disk_of(dev_t dev, dev_t *disk)
+{
+	char path[64], link[256], attr[160], val[64];
+	char *b, *slash;
+	unsigned ma, mi;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "/sys/dev/block/%u:%u", major(dev),
+		 minor(dev));
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return -1;
+	link[n] = 0;
+	b = strstr(link, "block/");
+	if (!b)
+		return -1;
+	b += 6;
+	slash = strchr(b, '/');
+	if (slash)
+		*slash = 0;
+	snprintf(attr, sizeof(attr), "/sys/block/%s/dev", b);
+	if (stg_read_attr(attr, val, sizeof(val)) != 0 ||
+	    sscanf(val, "%u:%u", &ma, &mi) != 2)
+		return -1;
+	*disk = makedev(ma, mi);
+	return 0;
+}
+
+/* Is `dev' a whole disk (not a partition)? */
+static int stg_is_whole_disk(dev_t dev)
+{
+	dev_t d;
+
+	return stg_whole_disk_of(dev, &d) == 0 && d == dev;
+}
+
 /* Is the device with this device number, or (whole disk) any of its
  * partitions, mounted?  /proc/mounts names the mounted nodes. */
 static int stg_mounted(dev_t dev, int whole_disk)
@@ -17291,11 +17698,14 @@ static int stg_mounted(dev_t dev, int whole_disk)
 			continue;
 		if (stat(node, &st) != 0 || !S_ISBLK(st.st_mode))
 			continue;
-		if (st.st_rdev == dev)
+		if (st.st_rdev == dev) {
 			hit = 1;
-		else if (whole_disk && major(st.st_rdev) == major(dev) &&
-			 minor(st.st_rdev) / 16 == minor(dev) / 16)
-			hit = 1;
+		} else if (whole_disk) {
+			dev_t d;
+
+			if (stg_whole_disk_of(st.st_rdev, &d) == 0 && d == dev)
+				hit = 1;
+		}
 	}
 	fclose(f);
 	return hit;
@@ -17309,16 +17719,34 @@ static int stg_disk_holds_root(dev_t disk_dev)
 
 	if (stat("/", &st) != 0)
 		return 0;
-	if (major(st.st_dev) == major(disk_dev) &&
-	    minor(st.st_dev) / 16 == minor(disk_dev) / 16)
-		return 1;
+	{
+		dev_t d;
+
+		if (st.st_dev == disk_dev ||
+		    (stg_whole_disk_of(st.st_dev, &d) == 0 && d == disk_dev))
+			return 1;
+	}
 	return 0;
 }
+
+/* The extended block major: NVMe namespaces and their partitions, and sd
+ * partitions numbered 16 and above (dynamic minors). */
+#define STG_BLKEXT_MAJOR 259
 
 static int stg_is_sd_major(unsigned maj)
 {
 	return maj == SCSI_DISK0_MAJOR ||
 	       (maj >= SCSI_DISK1_MAJOR && maj <= SCSI_DISK7_MAJOR);
+}
+
+/* Is `maj' right for the whole disk `name'?  sdX: major 8 or 65-71 with
+ * the disk on a multiple of 16; every other disk kind (nvmeXnY): the
+ * extended major, any minor. */
+static int stg_disk_devnum_ok(const char *name, unsigned maj, unsigned min)
+{
+	if (strncmp(name, "sd", 2) == 0)
+		return stg_is_sd_major(maj) && min % 16 == 0;
+	return maj == STG_BLKEXT_MAJOR;
 }
 
 /* /proc/diskstats fields of one device: reads completed, sectors read,
@@ -17764,7 +18192,7 @@ static void test_storage_partition(int dfd, const char *d, const char *p,
 								  (unsigned)partno);
 		} else {
 			snprintf(name, sizeof(name), "%s: partition >= 16 on the extended major", path);
-			test_result(name, major(st.st_rdev) == 254);
+			test_result(name, major(st.st_rdev) == STG_BLKEXT_MAJOR);
 		}
 	}
 	{
@@ -18032,8 +18460,9 @@ static void test_storage_write(const char *target)
 		return;
 	}
 	snprintf(what, sizeof(what), "%s", real);
-	if (stg_mounted(st.st_rdev, minor(st.st_rdev) % 16 == 0) ||
-	    (minor(st.st_rdev) % 16 == 0 && stg_disk_holds_root(st.st_rdev))) {
+	if (stg_mounted(st.st_rdev, stg_is_whole_disk(st.st_rdev)) ||
+	    (stg_is_whole_disk(st.st_rdev) &&
+	     stg_disk_holds_root(st.st_rdev))) {
 		printf("  [SKIP] %s (or a partition of it) is mounted: no write tests\n",
 		       what);
 		return;
@@ -18325,9 +18754,9 @@ static void test_storage_disk(const char *d, int storage_only)
 	test_result(name, stat(path, &st) == 0 && S_ISBLK(st.st_mode));
 	if (!S_ISBLK(st.st_mode))
 		return;
-	snprintf(name, sizeof(name), "%s: sd major (8 or 65-71), minor a multiple of 16", path);
-	test_result(name, stg_is_sd_major(major(st.st_rdev)) &&
-				  minor(st.st_rdev) % 16 == 0);
+	snprintf(name, sizeof(name), "%s: disk major (sd: 8 or 65-71 with minor a multiple of 16; else the extended major)", path);
+	test_result(name, stg_disk_devnum_ok(d, major(st.st_rdev),
+					     minor(st.st_rdev)));
 	{
 		char a[96];
 
@@ -18444,7 +18873,9 @@ static void test_storage_disk(const char *d, int storage_only)
 					  geo.heads > 0 && geo.sectors > 0 &&
 					  geo.start == 0);
 	}
-	{
+	if (strncmp(d, "nvme", 4) == 0) {
+		printf("  (%s is an NVMe namespace: SCSI generic checks skipped, see the NVMe tests)\n", d);
+	} else {
 		int v = 0;
 		struct scsi_idlun idl;
 
@@ -18715,6 +19146,2271 @@ static void test_storage_sr(const char *d)
 	close(fd);
 }
 
+/* ==========================================================================
+ * NVMe: controller and namespace nodes, the NVMe pass-through ioctls,
+ * sysfs, the zoned and reservation ioctls, asynchronous I/O, fault
+ * injection, reset and rescan
+ *
+ * Read-only part (every full run and `testlibc storage'): the character
+ * majors in /proc/devices; per controller /dev/nvmeX and its sysfs
+ * directory, Identify Controller (also through the 64-bit command), the
+ * active namespace list, the SMART/health, error and firmware slot logs,
+ * Get Features (number of queues, arbitration, power management,
+ * temperature threshold, volatile write cache), an invalid opcode; per
+ * namespace the block node (extended major), the generic node /dev/ngXnY,
+ * NVME_IOCTL_ID everywhere, Identify Namespace against the block ioctls,
+ * the hardware queues, reads through SUBMIT_IO, IO_CMD, IO64_CMD and
+ * IO64_CMD_VEC against pread(), the zone report of a zoned namespace, and
+ * what an unprivileged process may do through an inherited descriptor.
+ *
+ * `testlibc nvme' adds the destructive part, on a designated target only:
+ * a GPT partition named likeos-test* on an NVMe namespace, or the node in
+ * TESTLIBC_NVME (whole namespace or partition) -- never anything mounted.
+ * Block writes against pass-through reads and vice versa, Flush, Compare
+ * (match and miscompare), Write Zeroes, Dataset Management, Verify,
+ * BLKZEROOUT/BLKDISCARD, POSIX AIO (lio_listio, aio_suspend, aio_cancel),
+ * preadv2(RWF_HIPRI) and pwritev2(RWF_ATOMIC), persistent reservations
+ * (when the namespace supports them), a fault injection round trip, a
+ * controller reset with reads in flight, and a rescan.  TESTLIBC_ZNS names
+ * a zoned namespace whose first zones may be reset and written.
+ * TESTLIBC_NVME_SCRATCH names a whole namespace the installer-readiness
+ * check may repartition and format: a GPT (ESP + root) through sfdisk,
+ * BLKRRPART, mkfs.ext4 on the root partition (refused while the partition
+ * is held with O_EXCL, then e2fsck -fn, the superblock read back),
+ * mkfs.vfat on the ESP (fsck.vfat -n, the boot sector read back).
+ *
+ * Skipped cleanly when there is no NVMe controller.
+ * ========================================================================== */
+
+#define NVM_ADMIN_GET_LOG 0x02
+#define NVM_ADMIN_IDENTIFY 0x06
+#define NVM_ADMIN_GET_FEATURES 0x0a
+#define NVM_CMD_FLUSH 0x00
+#define NVM_CMD_WRITE 0x01
+#define NVM_CMD_READ 0x02
+#define NVM_CMD_COMPARE 0x05
+#define NVM_CMD_WRITE_ZEROES 0x08
+#define NVM_CMD_DSM 0x09
+#define NVM_CMD_VERIFY 0x0c
+/* Status as the ioctls return it: SCT << 8 | SC, plus MORE and DNR. */
+#define NVM_STATUS(r) ((r) & 0x7ff)
+#define NVM_SC_INVALID_OPCODE 0x001
+#define NVM_SC_COMPARE_FAILED 0x285
+#define NVM_SC_READ_ERROR 0x281
+
+struct nvm_ctrl_info {
+	char name[16]; /* "nvme0" */
+	unsigned instance;
+	int fd; /* /dev/nvmeX, O_RDONLY, or -1 */
+	uint8_t id[4096]; /* Identify Controller */
+	int id_ok;
+};
+
+struct nvm_ns_info {
+	char disk[32]; /* "nvme0n1" (block disk name) */
+	char ctrl[16]; /* serving controller */
+	unsigned nsid;
+	int fd; /* /dev/<disk>, O_RDONLY */
+	uint32_t lbs; /* logical block size */
+	uint64_t bytes;
+	uint8_t idns[4096];
+	int idns_ok;
+};
+
+static int nvm_admin(int fd, uint8_t opc, uint32_t nsid, uint32_t cdw10,
+		     uint32_t cdw11, void *buf, uint32_t len, uint32_t *result)
+{
+	struct nvme_admin_cmd c;
+	int r;
+
+	memset(&c, 0, sizeof(c));
+	c.opcode = opc;
+	c.nsid = nsid;
+	c.cdw10 = cdw10;
+	c.cdw11 = cdw11;
+	c.addr = (uint64_t)(uintptr_t)buf;
+	c.data_len = len;
+	r = ioctl(fd, NVME_IOCTL_ADMIN_CMD, &c);
+	if (result)
+		*result = c.result;
+	return r;
+}
+
+static int nvm_identify(int fd, uint32_t nsid, uint8_t cns, void *buf)
+{
+	memset(buf, 0, 4096);
+	return nvm_admin(fd, NVM_ADMIN_IDENTIFY, nsid, cns, 0, buf, 4096, NULL);
+}
+
+static int nvm_get_log(int fd, uint32_t nsid, uint8_t lid, void *buf,
+		       uint32_t len)
+{
+	uint32_t numd = len / 4 - 1;
+
+	memset(buf, 0, len);
+	return nvm_admin(fd, NVM_ADMIN_GET_LOG, nsid,
+			 lid | ((numd & 0xffff) << 16), numd >> 16, buf, len,
+			 NULL);
+}
+
+/* An I/O command on a namespace: nlb blocks at slba, cdw12 extra bits
+ * (FUA, ...) or-ed in. */
+static int nvm_io(int fd, uint8_t opc, uint32_t nsid, uint64_t slba,
+		  uint32_t nlb, void *buf, uint32_t len, uint32_t cdw12_extra)
+{
+	struct nvme_passthru_cmd c;
+
+	memset(&c, 0, sizeof(c));
+	c.opcode = opc;
+	c.nsid = nsid;
+	c.cdw10 = (uint32_t)slba;
+	c.cdw11 = (uint32_t)(slba >> 32);
+	c.cdw12 = (nlb ? nlb - 1 : 0) | cdw12_extra;
+	c.addr = (uint64_t)(uintptr_t)buf;
+	c.data_len = len;
+	return ioctl(fd, NVME_IOCTL_IO_CMD, &c);
+}
+
+static uint16_t nvm_le16(const uint8_t *p)
+{
+	return (uint16_t)(p[0] | p[1] << 8);
+}
+
+static uint32_t nvm_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+	       (uint32_t)p[3] << 24;
+}
+
+static uint64_t nvm_le64(const uint8_t *p)
+{
+	return (uint64_t)nvm_le32(p) | (uint64_t)nvm_le32(p + 4) << 32;
+}
+
+/* VMware's virtual NVMe controller (PCI vendor 0x15ad) returns its
+ * SMART / health log in a layout of its own: the composite temperature
+ * at bytes 2-3, the spare at 4 and every counter 8 bytes late.  The
+ * PCI vendor from sysfs; the Identify VID (which is the PCI vendor ID)
+ * when the device link cannot be read. */
+static int nvm_ctrl_is_vmware(const struct nvm_ctrl_info *c)
+{
+	char a[96], v[32];
+
+	snprintf(a, sizeof(a), "/sys/class/nvme/%s/device/vendor", c->name);
+	if (stg_read_attr(a, v, sizeof(v)) == 0 && v[0])
+		return strtoul(v, NULL, 0) == 0x15ad;
+	return c->id_ok && nvm_le16(c->id) == 0x15ad;
+}
+
+static int all_zero_buf(const uint8_t *p, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+		if (p[i])
+			return 0;
+	return 1;
+}
+
+/* "nvme<digits>": a controller name. */
+static int nvm_is_ctrl_name(const char *s)
+{
+	if (strncmp(s, "nvme", 4) != 0 || !s[4])
+		return 0;
+	for (s += 4; *s; s++)
+		if (*s < '0' || *s > '9')
+			return 0;
+	return 1;
+}
+
+/* "nvme<digits>n<digits>": a namespace disk (not a partition, not a
+ * hidden multipath path). */
+static int nvm_is_ns_name(const char *s)
+{
+	unsigned a, b;
+	int n = 0;
+
+	return sscanf(s, "nvme%un%u%n", &a, &b, &n) == 2 && s[n] == 0;
+}
+
+/* The character major registered under `drv' in /proc/devices. */
+static int nvm_chr_major(const char *drv)
+{
+	FILE *f = fopen("/proc/devices", "r");
+	char line[128];
+	int in_chr = 0, maj = -1;
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f)) {
+		char nm[64];
+		int m;
+
+		if (strncmp(line, "Character devices:", 18) == 0) {
+			in_chr = 1;
+			continue;
+		}
+		if (strncmp(line, "Block devices:", 14) == 0) {
+			in_chr = 0;
+			continue;
+		}
+		if (in_chr && sscanf(line, "%d %63s", &m, nm) == 2 &&
+		    strcmp(nm, drv) == 0) {
+			maj = m;
+			break;
+		}
+	}
+	fclose(f);
+	return maj;
+}
+
+/* The controller serving namespace disk `disk' (as disktest finds it):
+ * the device link names the controller or, for a multipath head, the
+ * subsystem; then the controller directories; then the name. */
+static int nvm_ctrl_of_disk(const char *disk, char *out, size_t cap)
+{
+	char p[300], link[256];
+	ssize_t n;
+	DIR *d;
+	struct dirent *de;
+	unsigned a, b;
+
+	snprintf(p, sizeof(p), "/sys/block/%s/device", disk);
+	n = readlink(p, link, sizeof(link) - 1);
+	if (n > 0) {
+		const char *base;
+
+		link[n] = 0;
+		base = strrchr(link, '/') ? strrchr(link, '/') + 1 : link;
+		if (nvm_is_ctrl_name(base)) {
+			snprintf(out, cap, "%s", base);
+			return 0;
+		}
+		if (strncmp(base, "nvme-subsys", 11) == 0) {
+			snprintf(p, sizeof(p), "/sys/class/nvme-subsystem/%s", base);
+			if ((d = opendir(p)) != NULL) {
+				while ((de = readdir(d)) != NULL) {
+					if (nvm_is_ctrl_name(de->d_name)) {
+						snprintf(out, cap, "%s", de->d_name);
+						closedir(d);
+						return 0;
+					}
+				}
+				closedir(d);
+			}
+		}
+	}
+	if ((d = opendir("/sys/class/nvme")) != NULL) {
+		while ((de = readdir(d)) != NULL) {
+			struct stat st;
+
+			if (!nvm_is_ctrl_name(de->d_name))
+				continue;
+			snprintf(p, sizeof(p), "/sys/class/nvme/%s/%s", de->d_name,
+				 disk);
+			if (stat(p, &st) == 0) {
+				snprintf(out, cap, "%s", de->d_name);
+				closedir(d);
+				return 0;
+			}
+		}
+		closedir(d);
+	}
+	if (sscanf(disk, "nvme%un%u", &a, &b) == 2) {
+		snprintf(out, cap, "nvme%u", a);
+		return 0;
+	}
+	return -1;
+}
+
+/* A string field of an identify structure, trailing blanks dropped. */
+static void nvm_id_string(char *dst, size_t cap, const uint8_t *src, size_t len)
+{
+	stg_trim(dst, cap, (const char *)src, len);
+}
+
+/* The logical block size of the namespace's formatted LBA format. */
+static uint32_t nvm_ns_lbs(const uint8_t *idns)
+{
+	unsigned flbas = idns[26];
+	unsigned idx = (flbas & 0xf) | (((flbas >> 5) & 3) << 4);
+
+	if (idx > 63)
+		return 0;
+	return 1u << idns[128 + idx * 4 + 2];
+}
+
+/* Metadata bytes per block of the formatted LBA format, and whether they
+ * travel inside the data buffer (extended LBA) rather than separately. */
+static uint16_t nvm_ns_ms(const uint8_t *idns, int *extended)
+{
+	unsigned flbas = idns[26];
+	unsigned idx = (flbas & 0xf) | (((flbas >> 5) & 3) << 4);
+
+	*extended = (flbas >> 4) & 1;
+	if (idx > 63)
+		return 0;
+	return nvm_le16(idns + 128 + idx * 4);
+}
+
+/* ---- read-only: controllers ------------------------------------------- */
+
+static void test_nvme_ctrl(struct nvm_ctrl_info *c, int nvme_major)
+{
+	char path[64], a[160], v[256], name[256];
+	struct stat st;
+	uint8_t *buf;
+	uint32_t res;
+	int r;
+
+	printf("\n  -- /dev/%s --\n", c->name);
+	snprintf(path, sizeof(path), "/dev/%s", c->name);
+	snprintf(name, sizeof(name), "%s exists and is S_IFCHR", path);
+	test_result(name, stat(path, &st) == 0 && S_ISCHR(st.st_mode));
+	if (!S_ISCHR(st.st_mode))
+		return;
+	snprintf(name, sizeof(name), "%s: major is /proc/devices \"nvme\" (%d), minor the instance %u",
+		 path, nvme_major, c->instance);
+	test_result(name, (int)major(st.st_rdev) == nvme_major &&
+				  minor(st.st_rdev) == c->instance);
+	snprintf(a, sizeof(a), "/sys/class/nvme/%s/dev", c->name);
+	{
+		unsigned ma = 0, mi = 0;
+
+		snprintf(name, sizeof(name), "/sys/class/nvme/%s/dev == st_rdev", c->name);
+		test_result(name, stg_read_attr(a, v, sizeof(v)) == 0 &&
+					  sscanf(v, "%u:%u", &ma, &mi) == 2 &&
+					  ma == major(st.st_rdev) &&
+					  mi == minor(st.st_rdev));
+	}
+	snprintf(a, sizeof(a), "/sys/class/nvme/%s/state", c->name);
+	snprintf(name, sizeof(name), "/sys/class/nvme/%s/state is \"live\"", c->name);
+	test_result(name, stg_read_attr(a, v, sizeof(v)) == 0 &&
+				  strcmp(v, "live") == 0);
+	snprintf(a, sizeof(a), "/sys/class/nvme/%s/transport", c->name);
+	snprintf(name, sizeof(name), "/sys/class/nvme/%s/transport is \"pcie\"", c->name);
+	test_result(name, stg_read_attr(a, v, sizeof(v)) == 0 &&
+				  strcmp(v, "pcie") == 0);
+	snprintf(a, sizeof(a), "/sys/class/nvme/%s/address", c->name);
+	{
+		unsigned dom, bus, dev, fn;
+
+		snprintf(name, sizeof(name), "/sys/class/nvme/%s/address is a PCI address", c->name);
+		test_result(name, stg_read_attr(a, v, sizeof(v)) == 0 &&
+					  sscanf(v, "%x:%x:%x.%x", &dom, &bus, &dev,
+						 &fn) == 4);
+	}
+	{
+		long long qc = stg_attr_ull("/sys/class/nvme/%s/queue_count%s",
+					    c->name, "");
+		long long sq = stg_attr_ull("/sys/class/nvme/%s/sqsize%s",
+					    c->name, "");
+
+		snprintf(name, sizeof(name), "/sys/class/nvme/%s: queue_count >= 2 (admin + I/O), sqsize > 0", c->name);
+		test_result(name, qc >= 2 && sq > 0);
+	}
+
+	c->fd = open(path, O_RDONLY | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDONLY)", path);
+	test_result(name, c->fd >= 0);
+	if (c->fd < 0)
+		return;
+
+	errno = 0;
+	snprintf(name, sizeof(name), "%s: NVME_IOCTL_ID on a controller node -> ENOTTY", c->name);
+	test_result(name, ioctl(c->fd, NVME_IOCTL_ID) == -1 && errno == ENOTTY);
+
+	r = nvm_identify(c->fd, 0, 0x01, c->id);
+	c->id_ok = (r == 0);
+	snprintf(name, sizeof(name), "%s: Identify Controller (ADMIN_CMD)", c->name);
+	test_result(name, r == 0);
+	if (!c->id_ok)
+		return;
+	{
+		char sn[24], mn[48], fr[12], s2[256];
+
+		nvm_id_string(sn, sizeof(sn), c->id + 4, 20);
+		nvm_id_string(mn, sizeof(mn), c->id + 24, 40);
+		nvm_id_string(fr, sizeof(fr), c->id + 64, 8);
+		printf("  (%s: \"%s\" sn \"%s\" fw \"%s\", vid %04x, cntlid %u, nn %u)\n",
+		       c->name, mn, sn, fr, nvm_le16(c->id), nvm_le16(c->id + 78),
+		       nvm_le32(c->id + 516));
+		snprintf(a, sizeof(a), "/sys/class/nvme/%s/model", c->name);
+		snprintf(name, sizeof(name), "%s: sysfs model == Identify MN", c->name);
+		test_result(name, stg_read_attr(a, s2, sizeof(s2)) == 0 &&
+					  strcmp(s2, mn) == 0);
+		snprintf(a, sizeof(a), "/sys/class/nvme/%s/serial", c->name);
+		snprintf(name, sizeof(name), "%s: sysfs serial == Identify SN", c->name);
+		test_result(name, stg_read_attr(a, s2, sizeof(s2)) == 0 &&
+					  strcmp(s2, sn) == 0);
+		snprintf(a, sizeof(a), "/sys/class/nvme/%s/firmware_rev", c->name);
+		snprintf(name, sizeof(name), "%s: sysfs firmware_rev == Identify FR", c->name);
+		test_result(name, stg_read_attr(a, s2, sizeof(s2)) == 0 &&
+					  strcmp(s2, fr) == 0);
+		snprintf(name, sizeof(name), "%s: sysfs cntlid == Identify CNTLID", c->name);
+		test_result(name, stg_attr_ull("/sys/class/nvme/%s/cntlid%s",
+					       c->name, "") ==
+					  (long long)nvm_le16(c->id + 78));
+		snprintf(a, sizeof(a), "/sys/class/nvme/%s/subsysnqn", c->name);
+		nvm_id_string(s2, sizeof(s2), c->id + 768, 256);
+		snprintf(name, sizeof(name), "%s: sysfs subsysnqn == Identify SUBNQN (or the generated one)", c->name);
+		test_result(name, stg_read_attr(a, v, sizeof(v)) == 0 && v[0] &&
+					  (s2[0] == 0 || strcmp(v, s2) == 0));
+	}
+
+	buf = malloc(4096);
+	if (!buf)
+		return;
+	{
+		struct nvme_passthru_cmd64 c64;
+
+		memset(&c64, 0, sizeof(c64));
+		c64.opcode = NVM_ADMIN_IDENTIFY;
+		c64.cdw10 = 0x01;
+		c64.addr = (uint64_t)(uintptr_t)buf;
+		c64.data_len = 4096;
+		memset(buf, 0, 4096);
+		snprintf(name, sizeof(name), "%s: Identify Controller through ADMIN64_CMD == ADMIN_CMD", c->name);
+		test_result(name, ioctl(c->fd, NVME_IOCTL_ADMIN64_CMD, &c64) == 0 &&
+					  memcmp(buf, c->id, 512) == 0);
+	}
+
+	/* Logs. */
+	snprintf(name, sizeof(name), "%s: SMART / health log (LID 2)", c->name);
+	r = nvm_get_log(c->fd, 0xffffffffu, 0x02, buf, 512);
+	test_result(name, r == 0);
+	if (r == 0) {
+		uint16_t kelvin = nvm_le16(buf + 1);
+
+		printf("  (%s: critical warning 0x%02x, composite %u K, spare %u%%, used %u%%, power-on hours %llu)\n",
+		       c->name, buf[0], kelvin, buf[3], buf[5],
+		       (unsigned long long)nvm_le64(buf + 128));
+		if (nvm_ctrl_is_vmware(c)) {
+			printf("  [INFO] %s: the VMware controller reports the SMART log in a non-standard layout: composite temperature not checked\n",
+			       c->name);
+		} else {
+			snprintf(name, sizeof(name), "%s: SMART composite temperature is plausible (200..400 K)", c->name);
+			test_result(name, kelvin >= 200 && kelvin <= 400);
+		}
+	}
+	/* The controller's temperature monitor in the hwmon class, where
+	 * sensor tools look (a link to its directory under the controller). */
+	if (r == 0) {
+		DIR *d = opendir("/sys/class/hwmon");
+		struct dirent *de;
+		int found = 0;
+		long long mc = -1;
+		char p2[300], nm[64], tgt[256], want[96];
+
+		snprintf(want, sizeof(want), "/sys/class/nvme/%s/hwmon", c->name);
+		while (d && (de = readdir(d)) != NULL) {
+			ssize_t l;
+
+			if (strncmp(de->d_name, "hwmon", 5) != 0)
+				continue;
+			snprintf(p2, sizeof(p2), "/sys/class/hwmon/%s", de->d_name);
+			l = readlink(p2, tgt, sizeof(tgt) - 1);
+			if (l <= 0)
+				continue;
+			tgt[l] = 0;
+			if (strncmp(tgt, want, strlen(want)) != 0)
+				continue;
+			snprintf(p2, sizeof(p2), "/sys/class/hwmon/%s/name", de->d_name);
+			found = stg_read_attr(p2, nm, sizeof(nm)) == 0 && strcmp(nm, "nvme") == 0;
+			mc = stg_attr_ull("/sys/class/hwmon/%s/temp1_input%s", de->d_name, "");
+			break;
+		}
+		if (d)
+			closedir(d);
+		snprintf(name, sizeof(name), "%s: /sys/class/hwmon/hwmonN leads to its monitor (name \"nvme\")", c->name);
+		test_result(name, found);
+		if (found && nvm_ctrl_is_vmware(c)) {
+			printf("  [INFO] %s: the VMware controller reports the SMART log in a non-standard layout: hwmon temp1_input (%lld) not checked\n",
+			       c->name, mc);
+		} else {
+			snprintf(name, sizeof(name), "%s: hwmon temp1_input in millidegrees (%lld)", c->name, mc);
+			test_result(name, !found || (mc > 0 && mc < 150000));
+		}
+	}
+	{
+		unsigned entries = (unsigned)c->id[262] + 1;
+		uint32_t len = entries * 64 > 4096 ? 4096 : entries * 64;
+
+		snprintf(name, sizeof(name), "%s: error information log (LID 1, %u entries)", c->name, len / 64);
+		test_result(name, nvm_get_log(c->fd, 0xffffffffu, 0x01, buf, len) == 0);
+	}
+	snprintf(name, sizeof(name), "%s: firmware slot log (LID 3)", c->name);
+	r = nvm_get_log(c->fd, 0xffffffffu, 0x03, buf, 512);
+	test_result(name, r == 0);
+	if (r == 0) {
+		unsigned act = buf[0] & 7;
+
+		snprintf(name, sizeof(name), "%s: firmware slot log: active slot %u holds the running revision", c->name, act);
+		test_result(name, act >= 1 && act <= 7 &&
+					  memcmp(buf + 8 * act, c->id + 64, 8) == 0);
+	}
+
+	/* Features. */
+	snprintf(name, sizeof(name), "%s: Get Features Number of Queues covers queue_count", c->name);
+	res = 0;
+	r = nvm_admin(c->fd, NVM_ADMIN_GET_FEATURES, 0, 0x07, 0, NULL, 0, &res);
+	{
+		long long qc = stg_attr_ull("/sys/class/nvme/%s/queue_count%s",
+					    c->name, "");
+
+		test_result(name, r == 0 && qc >= 2 &&
+					  (long long)(res & 0xffff) + 1 >= qc - 1 &&
+					  (long long)(res >> 16) + 1 >= qc - 1);
+	}
+	snprintf(name, sizeof(name), "%s: Get Features Arbitration", c->name);
+	test_result(name, nvm_admin(c->fd, NVM_ADMIN_GET_FEATURES, 0, 0x01, 0,
+				    NULL, 0, &res) == 0);
+	snprintf(name, sizeof(name), "%s: Get Features Power Management: state <= NPSS", c->name);
+	r = nvm_admin(c->fd, NVM_ADMIN_GET_FEATURES, 0, 0x02, 0, NULL, 0, &res);
+	test_result(name, r == 0 && (res & 0x1f) <= c->id[263]);
+	/* FID 04h, dword 11 = 0: TMPSEL 0 (composite), THSEL 00b (over).
+	 * The over threshold of the composite temperature defaults to
+	 * WCTEMP when the controller reports one; with WCTEMP 0 the
+	 * default is implementation specific (0 included), so a value is
+	 * required only then. */
+	{
+		unsigned wctemp = nvm_le16(c->id + 266);
+
+		res = 0;
+		r = nvm_admin(c->fd, NVM_ADMIN_GET_FEATURES, 0, 0x04, 0, NULL, 0, &res);
+		snprintf(name, sizeof(name),
+			 "%s: Get Features Temperature Threshold (composite, over) = %u K (WCTEMP %u K)",
+			 c->name, (unsigned)(res & 0xffff), wctemp);
+		test_result(name, r == 0 && (!wctemp || (res & 0xffff) > 0));
+	}
+	if (c->id[524] & 1) {
+		snprintf(name, sizeof(name), "%s: Get Features Volatile Write Cache", c->name);
+		test_result(name, nvm_admin(c->fd, NVM_ADMIN_GET_FEATURES, 0, 0x06,
+					    0, NULL, 0, &res) == 0);
+	} else {
+		printf("  (%s has no volatile write cache)\n", c->name);
+	}
+	snprintf(name, sizeof(name), "%s: a reserved admin opcode -> status Invalid Opcode", c->name);
+	r = nvm_admin(c->fd, 0x03, 0, 0, 0, NULL, 0, NULL);
+	test_result(name, r > 0 && NVM_STATUS(r) == NVM_SC_INVALID_OPCODE);
+	free(buf);
+}
+
+/* ---- read-only: namespaces -------------------------------------------- */
+
+static void test_nvme_ns(struct nvm_ns_info *ns, struct nvm_ctrl_info *ctrls,
+			 int nctrl, int generic_major)
+{
+	char path[64], a[160], v[256], name[256];
+	struct stat st;
+	int r, id;
+	struct nvm_ctrl_info *c = NULL;
+	unsigned long long b64 = 0;
+	int ssz = 0;
+	uint8_t *b1 = NULL, *b2 = NULL;
+
+	printf("\n  -- /dev/%s (NVMe namespace on %s) --\n", ns->disk, ns->ctrl);
+	for (int i = 0; i < nctrl; i++)
+		if (strcmp(ctrls[i].name, ns->ctrl) == 0)
+			c = &ctrls[i];
+	snprintf(path, sizeof(path), "/dev/%s", ns->disk);
+	ns->fd = open(path, O_RDONLY | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDONLY)", path);
+	test_result(name, ns->fd >= 0);
+	if (ns->fd < 0)
+		return;
+	if (fstat(ns->fd, &st) == 0) {
+		snprintf(name, sizeof(name), "%s: block major %u (blkext)", ns->disk,
+			 STG_BLKEXT_MAJOR);
+		test_result(name, S_ISBLK(st.st_mode) &&
+					  major(st.st_rdev) == STG_BLKEXT_MAJOR);
+	}
+
+	id = ioctl(ns->fd, NVME_IOCTL_ID);
+	snprintf(name, sizeof(name), "%s: NVME_IOCTL_ID returns a namespace ID", ns->disk);
+	test_result(name, id > 0);
+	if (id <= 0)
+		return;
+	ns->nsid = (unsigned)id;
+	{
+		long long sys_nsid = stg_attr_ull("/sys/block/%s/nsid%s",
+						  ns->disk, "");
+
+		if (sys_nsid >= 0) {
+			snprintf(name, sizeof(name), "%s: /sys/block/%s/nsid == NVME_IOCTL_ID", ns->disk, ns->disk);
+			test_result(name, sys_nsid == id);
+		}
+	}
+	{
+		char wwid[160];
+
+		snprintf(a, sizeof(a), "/sys/block/%s/wwid", ns->disk);
+		snprintf(name, sizeof(name), "/sys/block/%s/wwid names the namespace (eui./nvme./uuid.)", ns->disk);
+		test_result(name, stg_read_attr(a, wwid, sizeof(wwid)) == 0 &&
+					  (strncmp(wwid, "eui.", 4) == 0 ||
+					   strncmp(wwid, "nvme.", 5) == 0 ||
+					   strncmp(wwid, "uuid.", 5) == 0));
+	}
+	{
+		char link[256], ctl[16];
+		ssize_t n;
+
+		snprintf(a, sizeof(a), "/sys/block/%s/device", ns->disk);
+		n = readlink(a, link, sizeof(link) - 1);
+		snprintf(name, sizeof(name), "/sys/block/%s/device links to the controller or subsystem", ns->disk);
+		if (n > 0)
+			link[n] = 0;
+		test_result(name, n > 0 && nvm_ctrl_of_disk(ns->disk, ctl, sizeof(ctl)) == 0 &&
+					  strcmp(ctl, ns->ctrl) == 0);
+	}
+	/* Hardware queues. */
+	{
+		DIR *d;
+		struct dirent *de;
+		int nq = 0, tags_ok = 1;
+
+		snprintf(a, sizeof(a), "/sys/block/%s/mq", ns->disk);
+		if ((d = opendir(a)) != NULL) {
+			while ((de = readdir(d)) != NULL) {
+				if (de->d_name[0] < '0' || de->d_name[0] > '9')
+					continue;
+				nq++;
+				if (stg_attr_ull("/sys/block/%s/mq/%s/nr_tags", ns->disk,
+						 de->d_name) <= 0)
+					tags_ok = 0;
+			}
+			closedir(d);
+		}
+		snprintf(name, sizeof(name), "/sys/block/%s/mq: hardware queues with nr_tags > 0", ns->disk);
+		test_result(name, nq >= 1 && tags_ok);
+		printf("  (%s: %d hardware queue(s), nr_requests %lld, io_poll %lld)\n",
+		       ns->disk, nq,
+		       stg_attr_ull("/sys/block/%s/queue/nr_requests%s", ns->disk, ""),
+		       stg_attr_ull("/sys/block/%s/queue/io_poll%s", ns->disk, ""));
+	}
+
+	/* Identify Namespace against the block layer's view. */
+	r = c && c->fd >= 0 ? nvm_identify(c->fd, ns->nsid, 0x00, ns->idns) :
+			      nvm_identify(ns->fd, ns->nsid, 0x00, ns->idns);
+	ns->idns_ok = (r == 0);
+	snprintf(name, sizeof(name), "%s: Identify Namespace %u", ns->disk, ns->nsid);
+	test_result(name, r == 0);
+	ioctl(ns->fd, BLKGETSIZE64, &b64);
+	ioctl(ns->fd, BLKSSZGET, &ssz);
+	ns->bytes = b64;
+	ns->lbs = (uint32_t)ssz;
+	if (ns->idns_ok) {
+		uint32_t lbs = nvm_ns_lbs(ns->idns);
+		uint64_t nsze = nvm_le64(ns->idns);
+
+		snprintf(name, sizeof(name), "%s: Identify LBA format size == BLKSSZGET (%d)", ns->disk, ssz);
+		test_result(name, lbs == (uint32_t)ssz);
+		snprintf(name, sizeof(name), "%s: NSZE x LBA size == BLKGETSIZE64", ns->disk);
+		test_result(name, nsze * lbs == b64);
+	}
+	if (c && c->id_ok) {
+		/* CNS 02h exists from NVMe 1.1 on; a 1.0 controller (or one
+		 * the driver quirks as identify_cns) truncates CNS and answers
+		 * something else.  VER (bytes 83:80) is reported from 1.2 on,
+		 * so 0 there means "1.0 or 1.1": only a reported version of
+		 * 1.1 or later without the quirk is held to the list. */
+		uint32_t ver = nvm_le32(c->id + 80);
+		char q[512];
+		int quirked = 0;
+
+		snprintf(a, sizeof(a), "/sys/class/nvme/%s/quirks", c->name);
+		if (stg_read_attr(a, q, sizeof(q)) == 0 && strstr(q, "identify_cns"))
+			quirked = 1;
+		if (ver < 0x00010100u || quirked) {
+			printf("  [SKIP] %s: no active namespace list (CNS 2) on VER %u.%u%s\n",
+			       c->name, ver >> 16, (ver >> 8) & 0xff,
+			       quirked ? ", identify_cns quirk" : "");
+		} else {
+			uint8_t *list = malloc(4096);
+			int found = 0;
+
+			if (list && nvm_identify(c->fd, 0, 0x02, list) == 0)
+				for (int i = 0; i < 1024; i++)
+					if (nvm_le32(list + 4 * i) == ns->nsid)
+						found = 1;
+			snprintf(name, sizeof(name), "%s: nsid %u is in the active namespace list (CNS 2)", ns->disk, ns->nsid);
+			test_result(name, found);
+			free(list);
+		}
+	}
+	/* The namespace attribute group on the disk itself (libnvme reads
+	 * /sys/block/<ns>/nsid, eui, nguid, uuid, csi, ...). */
+	snprintf(name, sizeof(name), "%s: /sys/block/%s/nsid == %u", ns->disk, ns->disk, ns->nsid);
+	test_result(name, stg_attr_ull("/sys/block/%s/nsid%s", ns->disk, "") == (long long)ns->nsid);
+	{
+		char v2[64];
+
+		snprintf(a, sizeof(a), "/sys/block/%s/csi", ns->disk);
+		snprintf(name, sizeof(name), "%s: /sys/block/%s/csi readable", ns->disk, ns->disk);
+		test_result(name, stg_read_attr(a, v2, sizeof(v2)) == 0 && v2[0]);
+	}
+
+	/* The generic character node /dev/ngXnY. */
+	{
+		unsigned ci, ni;
+		char ng[64];
+
+		if (sscanf(ns->disk, "nvme%un%u", &ci, &ni) == 2) {
+			snprintf(ng, sizeof(ng), "/dev/ng%un%u", ci, ni);
+			if (stat(ng, &st) == 0) {
+				int gfd;
+
+				snprintf(name, sizeof(name), "%s is S_IFCHR on the \"nvme-generic\" major (%d)", ng, generic_major);
+				test_result(name, S_ISCHR(st.st_mode) &&
+							  (int)major(st.st_rdev) == generic_major);
+				gfd = open(ng, O_RDONLY | O_CLOEXEC);
+				snprintf(name, sizeof(name), "%s: NVME_IOCTL_ID == %u", ng, ns->nsid);
+				test_result(name, gfd >= 0 &&
+							  ioctl(gfd, NVME_IOCTL_ID) == (int)ns->nsid);
+				if (gfd >= 0)
+					close(gfd);
+			} else {
+				snprintf(name, sizeof(name), "%s exists", ng);
+				test_result(name, 0);
+			}
+		}
+	}
+
+	/* Reads: the pass-through paths against pread().  Not on a namespace
+	 * with metadata: the command would need a metadata buffer (or, for
+	 * extended LBAs, a larger data buffer), and without one the device
+	 * would transfer the metadata to address 0. */
+	if (ns->idns_ok) {
+		int ext = 0;
+		uint16_t ms = nvm_ns_ms(ns->idns, &ext);
+
+		if (ms) {
+			printf("  (%s: %u metadata bytes per block%s: pass-through reads skipped)\n",
+			       ns->disk, ms, ext ? " (extended LBA)" : "");
+			return;
+		}
+	}
+	if (ssz < 512 || b64 < (unsigned long long)ssz * 8 ||
+	    posix_memalign((void **)&b1, 4096, 8192) != 0 ||
+	    posix_memalign((void **)&b2, 4096, 8192) != 0) {
+		free(b1);
+		return;
+	}
+	if (pread(ns->fd, b1, 8192 > (unsigned)ssz * 2 ? 8192 : (size_t)ssz * 2, 0) > 0) {
+		uint32_t nlb = 4096 / (unsigned)ssz ? 4096 / (unsigned)ssz : 1;
+		uint32_t len = nlb * (unsigned)ssz;
+		struct nvme_user_io uio;
+		struct nvme_passthru_cmd64 c64;
+		struct iovec iov[2];
+
+		memset(b2, 0xa5, 8192);
+		snprintf(name, sizeof(name), "%s: IO_CMD Read of LBA 0 == pread", ns->disk);
+		r = nvm_io(ns->fd, NVM_CMD_READ, ns->nsid, 0, nlb, b2, len, 0);
+		test_result(name, r == 0 && memcmp(b1, b2, len) == 0);
+
+		memset(b2, 0xa5, 8192);
+		memset(&uio, 0, sizeof(uio));
+		uio.opcode = NVM_CMD_READ;
+		uio.nblocks = (uint16_t)(nlb - 1);
+		uio.addr = (uint64_t)(uintptr_t)b2;
+		uio.slba = 0;
+		snprintf(name, sizeof(name), "%s: SUBMIT_IO Read of LBA 0 == pread", ns->disk);
+		r = ioctl(ns->fd, NVME_IOCTL_SUBMIT_IO, &uio);
+		test_result(name, r == 0 && memcmp(b1, b2, len) == 0);
+
+		memset(b2, 0xa5, 8192);
+		memset(&c64, 0, sizeof(c64));
+		c64.opcode = NVM_CMD_READ;
+		c64.nsid = ns->nsid;
+		c64.cdw12 = nlb - 1;
+		c64.addr = (uint64_t)(uintptr_t)b2;
+		c64.data_len = len;
+		snprintf(name, sizeof(name), "%s: IO64_CMD Read of LBA 0 == pread", ns->disk);
+		r = ioctl(ns->fd, NVME_IOCTL_IO64_CMD, &c64);
+		test_result(name, r == 0 && memcmp(b1, b2, len) == 0);
+
+		/* Vectored: the same blocks into two halves of two buffers. */
+		memset(b2, 0xa5, 8192);
+		iov[0].iov_base = b2;
+		iov[0].iov_len = len / 2;
+		iov[1].iov_base = b2 + 4096;
+		iov[1].iov_len = len - len / 2;
+		memset(&c64, 0, sizeof(c64));
+		c64.opcode = NVM_CMD_READ;
+		c64.nsid = ns->nsid;
+		c64.cdw12 = nlb - 1;
+		c64.addr = (uint64_t)(uintptr_t)iov;
+		c64.vec_cnt = 2;
+		snprintf(name, sizeof(name), "%s: IO64_CMD_VEC Read into two iovecs == pread", ns->disk);
+		r = ioctl(ns->fd, NVME_IOCTL_IO64_CMD_VEC, &c64);
+		test_result(name, r == 0 && memcmp(b1, b2, len / 2) == 0 &&
+					  memcmp(b1 + len / 2, b2 + 4096,
+						 len - len / 2) == 0);
+
+		snprintf(name, sizeof(name), "%s: a Read past the namespace end -> LBA Out of Range", ns->disk);
+		r = nvm_io(ns->fd, NVM_CMD_READ, ns->nsid,
+			   b64 / (unsigned)ssz, 1, b2, (unsigned)ssz, 0);
+		test_result(name, r > 0 && NVM_STATUS(r) == 0x080);
+	}
+	free(b1);
+	free(b2);
+
+	/* A partition of the namespace answers NVME_IOCTL_ID as well. */
+	{
+		DIR *d;
+		struct dirent *de;
+
+		snprintf(a, sizeof(a), "/sys/block/%s", ns->disk);
+		if ((d = opendir(a)) != NULL) {
+			while ((de = readdir(d)) != NULL) {
+				char pn[300];
+				int pfd;
+
+				if (strncmp(de->d_name, ns->disk, strlen(ns->disk)) != 0 ||
+				    de->d_name[strlen(ns->disk)] != 'p')
+					continue;
+				snprintf(pn, sizeof(pn), "/dev/%s", de->d_name);
+				pfd = open(pn, O_RDONLY | O_CLOEXEC);
+				snprintf(name, sizeof(name), "%s: NVME_IOCTL_ID == %u", pn, ns->nsid);
+				test_result(name, pfd >= 0 &&
+							  ioctl(pfd, NVME_IOCTL_ID) == (int)ns->nsid);
+				if (pfd >= 0)
+					close(pfd);
+				break;
+			}
+			closedir(d);
+		}
+	}
+
+	/* Zoned namespaces: the zone report. */
+	snprintf(a, sizeof(a), "/sys/block/%s/queue/zoned", ns->disk);
+	if (stg_read_attr(a, v, sizeof(v)) == 0 && strcmp(v, "host-managed") == 0) {
+		uint32_t zsz = 0, nz = 0;
+		long long chunk = stg_attr_ull("/sys/block/%s/queue/chunk_sectors%s",
+					       ns->disk, "");
+		long long nrz = stg_attr_ull("/sys/block/%s/queue/nr_zones%s",
+					     ns->disk, "");
+		struct blk_zone_report *rep;
+
+		snprintf(name, sizeof(name), "%s: BLKGETZONESZ == queue/chunk_sectors", ns->disk);
+		test_result(name, ioctl(ns->fd, BLKGETZONESZ, &zsz) == 0 && zsz > 0 &&
+					  (long long)zsz == chunk);
+		snprintf(name, sizeof(name), "%s: BLKGETNRZONES == queue/nr_zones", ns->disk);
+		test_result(name, ioctl(ns->fd, BLKGETNRZONES, &nz) == 0 && nz > 0 &&
+					  (long long)nz == nrz);
+		rep = calloc(1, sizeof(*rep) + 16 * sizeof(struct blk_zone));
+		if (rep && zsz) {
+			int ok = 1;
+
+			rep->sector = 0;
+			rep->nr_zones = 16;
+			r = ioctl(ns->fd, BLKREPORTZONE, rep);
+			snprintf(name, sizeof(name), "%s: BLKREPORTZONE from sector 0", ns->disk);
+			test_result(name, r == 0 && rep->nr_zones > 0 &&
+						  rep->nr_zones <= 16);
+			for (unsigned i = 0; r == 0 && i < rep->nr_zones; i++) {
+				const struct blk_zone *z = &rep->zones[i];
+
+				if (z->start != (uint64_t)i * zsz || z->len != zsz ||
+				    (z->type == BLK_ZONE_TYPE_SEQWRITE_REQ &&
+				     (z->wp < z->start || z->wp > z->start + z->len)) ||
+				    ((rep->flags & BLK_ZONE_REP_CAPACITY) &&
+				     z->capacity > z->len))
+					ok = 0;
+			}
+			snprintf(name, sizeof(name), "%s: zones are contiguous, write pointers inside their zones", ns->disk);
+			test_result(name, r == 0 && ok);
+		}
+		free(rep);
+	}
+}
+
+/* ---- unprivileged, through inherited descriptors ----------------------- */
+
+static void test_nvme_unpriv(struct nvm_ns_info *ns, struct nvm_ctrl_info *c)
+{
+	int pfd[2], res[5] = { -1, -1, -1, -1, -1 };
+	pid_t pid;
+
+	if (geteuid() != 0 || ns->fd < 0 || pipe(pfd) != 0)
+		return;
+	pid = fork();
+	if (pid == 0) {
+		uint8_t *buf = malloc(4096);
+		int r;
+
+		close(pfd[0]);
+		if (!buf || setgroups(0, NULL) != 0 || setgid(65534) != 0 ||
+		    setuid(65534) != 0)
+			_exit(2);
+		/* NVME_IOCTL_ID needs no privilege. */
+		res[0] = ioctl(ns->fd, NVME_IOCTL_ID) == (int)ns->nsid;
+		/* Identify Controller through a namespace node is allowed. */
+		res[1] = nvm_identify(ns->fd, 0, 0x01, buf) == 0;
+		/* Get Log Page is not. */
+		errno = 0;
+		r = nvm_get_log(ns->fd, 0xffffffffu, 0x02, buf, 512);
+		res[2] = r == -1 && (errno == EACCES || errno == EPERM);
+		/* A Write through a read-only descriptor is not. */
+		errno = 0;
+		r = nvm_io(ns->fd, NVM_CMD_WRITE, ns->nsid, 0, 1, buf,
+			   ns->lbs ? ns->lbs : 512, 0);
+		res[3] = r == -1 && (errno == EACCES || errno == EPERM);
+		/* Controller reset is root's. */
+		errno = 0;
+		r = c && c->fd >= 0 ? ioctl(c->fd, NVME_IOCTL_RESET) : -1;
+		res[4] = !(c && c->fd >= 0) ||
+			 (r == -1 && (errno == EACCES || errno == EPERM));
+		write(pfd[1], res, sizeof(res));
+		_exit(0);
+	}
+	close(pfd[1]);
+	if (pid > 0) {
+		int status = 0;
+		ssize_t n = read(pfd[0], res, sizeof(res));
+		char name[200];
+
+		waitpid(pid, &status, 0);
+		if (n != (ssize_t)sizeof(res)) {
+			test_fail("unprivileged NVMe child reported");
+		} else {
+			snprintf(name, sizeof(name), "nobody: NVME_IOCTL_ID on an inherited %s fd", ns->disk);
+			test_result(name, res[0] == 1);
+			test_result("nobody: Identify Controller through a namespace fd is allowed", res[1] == 1);
+			test_result("nobody: Get Log Page -> EACCES/EPERM", res[2] == 1);
+			test_result("nobody: Write through an O_RDONLY namespace fd -> EACCES/EPERM", res[3] == 1);
+			test_result("nobody: NVME_IOCTL_RESET -> EACCES/EPERM", res[4] == 1);
+		}
+	}
+	close(pfd[0]);
+}
+
+/* ---- destructive: the designated target ------------------------------- */
+
+struct nvm_target {
+	char node[PATH_MAX]; /* partition or namespace node */
+	char part[64]; /* the partition's name, "" for a whole namespace */
+	char disk[32]; /* namespace disk */
+	int fd; /* node, O_RDWR */
+	int nsfd; /* whole namespace, O_RDWR */
+	unsigned nsid;
+	uint32_t lbs;
+	uint64_t start_lba; /* of the node inside the namespace */
+	uint64_t bytes; /* of the node */
+};
+
+/* TESTLIBC_NVME, else the first likeos-test* partition on an NVMe
+ * namespace.  0 when found. */
+static int nvm_find_target(struct nvm_target *t)
+{
+	const char *e = getenv("TESTLIBC_NVME");
+	char real[PATH_MAX];
+	DIR *d;
+	struct dirent *de;
+
+	memset(t, 0, sizeof(*t));
+	t->fd = t->nsfd = -1;
+	if (e && *e) {
+		if (!realpath(e, real))
+			return -1;
+		snprintf(t->node, sizeof(t->node), "%s", real);
+	} else {
+		if ((d = opendir("/dev/disk/by-partlabel")) == NULL)
+			return -1;
+		while ((de = readdir(d)) != NULL) {
+			char p[PATH_MAX];
+
+			if (strncmp(de->d_name, "likeos-test", 11) != 0)
+				continue;
+			snprintf(p, sizeof(p), "/dev/disk/by-partlabel/%s", de->d_name);
+			if (realpath(p, real) && strncmp(real, "/dev/nvme", 9) == 0) {
+				snprintf(t->node, sizeof(t->node), "%s", real);
+				break;
+			}
+		}
+		closedir(d);
+		if (!t->node[0])
+			return -1;
+	}
+	{
+		const char *base = strrchr(t->node, '/') + 1;
+		struct stat st;
+		dev_t whole;
+		char a[300], v[64];
+
+		if (stat(t->node, &st) != 0 || !S_ISBLK(st.st_mode) ||
+		    stg_whole_disk_of(st.st_rdev, &whole) != 0)
+			return -1;
+		if (whole == st.st_rdev) {
+			snprintf(t->disk, sizeof(t->disk), "%s", base);
+			t->start_lba = 0;
+		} else {
+			snprintf(t->part, sizeof(t->part), "%s", base);
+			snprintf(t->disk, sizeof(t->disk), "%s", base);
+			/* nvme0n1p3 -> nvme0n1 */
+			{
+				char *p = strrchr(t->disk, 'p');
+
+				if (p)
+					*p = 0;
+			}
+			snprintf(a, sizeof(a), "/sys/class/block/%s/start", base);
+			if (stg_read_attr(a, v, sizeof(v)) != 0)
+				return -1;
+			t->start_lba = strtoull(v, NULL, 10); /* 512-byte units for now */
+		}
+		if (!nvm_is_ns_name(t->disk))
+			return -1;
+		if (stg_mounted(st.st_rdev, whole == st.st_rdev))
+			return -2;
+	}
+	return 0;
+}
+
+static void nvm_pattern(uint8_t *b, size_t len, uint32_t seed)
+{
+	uint32_t x = seed * 2654435761u + 1;
+
+	for (size_t i = 0; i < len; i++) {
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		b[i] = (uint8_t)x;
+	}
+}
+
+struct nvm_reader {
+	int fd;
+	uint64_t bytes;
+	volatile int *stop;
+	unsigned reads, errors;
+	int first_errno;
+};
+
+/* Random 4 KiB block reads over the whole node until told to stop. */
+static void *nvm_reader_main(void *arg)
+{
+	struct nvm_reader *r = arg;
+	uint8_t *b = NULL;
+	uint64_t x = (uint64_t)(uintptr_t)r * 0x9e3779b97f4a7c15ull;
+	uint64_t blocks = r->bytes / 4096;
+
+	if (posix_memalign((void **)&b, 4096, 4096) != 0 || blocks == 0)
+		return NULL;
+	while (!*r->stop) {
+		uint64_t blk;
+
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		blk = x % blocks;
+		if (pread(r->fd, b, 4096, (off_t)(blk * 4096)) != 4096) {
+			if (!r->errors++)
+				r->first_errno = errno;
+		}
+		r->reads++;
+	}
+	free(b);
+	return NULL;
+}
+
+/* Wait for /sys/class/nvme/<ctrl>/state to read `want' (ms budget). */
+static int nvm_wait_state(const char *ctrl, const char *want, int ms)
+{
+	char a[96], v[32];
+
+	snprintf(a, sizeof(a), "/sys/class/nvme/%s/state", ctrl);
+	for (int i = 0; i <= ms / 50; i++) {
+		if (stg_read_attr(a, v, sizeof(v)) == 0 && strcmp(v, want) == 0)
+			return 0;
+		usleep(50000);
+	}
+	return -1;
+}
+
+/* The namespace's fault object: per-attribute directory or one file. */
+static int nvm_fault_path(const char *nsname, char *out, size_t cap, int *onefile)
+{
+	static const char *const dirs[] = {
+		"/sys/kernel/debug/%s/fault_inject",
+		"/sys/kernel/debug/nvme/%s/fault_inject",
+	};
+	char p[PATH_MAX], q[PATH_MAX + 16];
+
+	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		snprintf(p, sizeof(p), dirs[i], nsname);
+		snprintf(q, sizeof(q), "%s/probability", p);
+		if (access(q, F_OK) == 0) {
+			snprintf(out, cap, "%s", p);
+			*onefile = 0;
+			return 0;
+		}
+	}
+	snprintf(p, sizeof(p), "/sys/block/%s/fault_inject", nsname);
+	if (access(p, F_OK) == 0) {
+		snprintf(out, cap, "%s", p);
+		*onefile = 1;
+		return 0;
+	}
+	return -1;
+}
+
+/* Set fault attributes: "key=value ..." (written one by one into the
+ * directory, or as a whole into the one-file attribute). */
+static int nvm_fault_set(const char *fpath, int onefile, const char *spec)
+{
+	char buf[256], *tok, *save = NULL;
+
+	if (onefile) {
+		int fd = open(fpath, O_WRONLY | O_CLOEXEC);
+		ssize_t n;
+
+		if (fd < 0)
+			return -1;
+		n = write(fd, spec, strlen(spec));
+		close(fd);
+		return n == (ssize_t)strlen(spec) ? 0 : -1;
+	}
+	snprintf(buf, sizeof(buf), "%s", spec);
+	for (tok = strtok_r(buf, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
+		char *eq = strchr(tok, '='), p[PATH_MAX + 32];
+		int fd;
+		ssize_t n;
+
+		if (!eq)
+			return -1;
+		*eq = 0;
+		snprintf(p, sizeof(p), "%s/%s", fpath, tok);
+		fd = open(p, O_WRONLY | O_CLOEXEC);
+		if (fd < 0)
+			return -1;
+		n = write(fd, eq + 1, strlen(eq + 1));
+		close(fd);
+		if (n != (ssize_t)strlen(eq + 1))
+			return -1;
+	}
+	return 0;
+}
+
+/* A counter of the fault object ("injected"), -1 when unreadable. */
+static long long nvm_fault_counter(const char *fpath, int onefile, const char *key)
+{
+	char v[1024];
+
+	if (!onefile) {
+		char p[PATH_MAX + 32];
+
+		snprintf(p, sizeof(p), "%s/%s", fpath, key);
+		if (stg_read_attr(p, v, sizeof(v)) != 0)
+			return -1;
+		return strtoll(v, NULL, 0);
+	}
+	if (stg_read_attr(fpath, v, sizeof(v)) == 0) {
+		char *k = strstr(v, key);
+
+		if (k && k[strlen(key)] == '=')
+			return strtoll(k + strlen(key) + 1, NULL, 0);
+	}
+	return -1;
+}
+
+static void test_nvme_write(struct nvm_ctrl_info *ctrls, int nctrl)
+{
+	struct nvm_target t;
+	struct nvm_ctrl_info *c = NULL;
+	char name[300], ctl[16], a[300], v[128];
+	uint8_t *wb = NULL, *rb = NULL;
+	const size_t region = 1u << 20; /* 1 MiB at the node's start */
+	uint64_t lba0;
+	uint32_t nlb, oncs = 0;
+	int r;
+
+	printf("\n  -- NVMe write tests --\n");
+	r = nvm_find_target(&t);
+	if (r == -2) {
+		printf("  [SKIP] %s is mounted: no NVMe write tests\n", t.node);
+		return;
+	}
+	if (r != 0) {
+		printf("  [SKIP] no designated NVMe write target (GPT partition likeos-test* on a namespace, or TESTLIBC_NVME=/dev/nvmeXnYpZ)\n");
+		return;
+	}
+	if (nvm_ctrl_of_disk(t.disk, ctl, sizeof(ctl)) == 0)
+		for (int i = 0; i < nctrl; i++)
+			if (strcmp(ctrls[i].name, ctl) == 0)
+				c = &ctrls[i];
+	printf("  (target %s on namespace %s, controller %s)\n", t.node, t.disk,
+	       c ? c->name : "?");
+	t.fd = open(t.node, O_RDWR | O_CLOEXEC);
+	snprintf(a, sizeof(a), "/dev/%s", t.disk);
+	t.nsfd = open(a, O_RDWR | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s) and its namespace %s O_RDWR", t.node, a);
+	test_result(name, t.fd >= 0 && t.nsfd >= 0);
+	if (t.fd < 0 || t.nsfd < 0)
+		goto out;
+	{
+		int id = ioctl(t.nsfd, NVME_IOCTL_ID), ssz = 0;
+		unsigned long long b = 0;
+
+		ioctl(t.nsfd, BLKSSZGET, &ssz);
+		ioctl(t.fd, BLKGETSIZE64, &b);
+		if (id <= 0 || ssz < 512 || b < 4 * region) {
+			test_fail("NVMe write target: nsid, sector size and size (>= 4 MiB)");
+			goto out;
+		}
+		t.nsid = (unsigned)id;
+		t.lbs = (uint32_t)ssz;
+		t.bytes = b;
+		t.start_lba = t.start_lba * 512 / t.lbs;
+	}
+	if (c && c->id_ok)
+		oncs = nvm_le16(c->id + 520);
+	{
+		uint8_t *idns = malloc(4096);
+		int ext = 0, bad = !idns || nvm_identify(t.nsfd, t.nsid, 0x00, idns) != 0;
+
+		if (!bad && nvm_ns_ms(idns, &ext)) {
+			printf("  [SKIP] %s formats blocks with metadata: the write tests need a namespace without\n",
+			       t.disk);
+			bad = 2;
+		}
+		free(idns);
+		if (bad == 1)
+			test_fail("NVMe write target: Identify Namespace");
+		if (bad)
+			goto out;
+	}
+	if (posix_memalign((void **)&wb, 4096, region) != 0 ||
+	    posix_memalign((void **)&rb, 4096, region) != 0)
+		goto out;
+	lba0 = t.start_lba;
+	nlb = 65536 / t.lbs;
+
+	/* 1. Block write -> pass-through read. */
+	nvm_pattern(wb, region, 1);
+	r = (int)pwrite(t.fd, wb, region, 0);
+	snprintf(name, sizeof(name), "%s: pwrite 1 MiB + fsync", t.node);
+	test_result(name, r == (int)region && fsync(t.fd) == 0);
+	memset(rb, 0, 65536);
+	r = nvm_io(t.nsfd, NVM_CMD_READ, t.nsid, lba0, nlb, rb, 65536, 0);
+	snprintf(name, sizeof(name), "%s: IO_CMD Read at the partition's LBA sees the block write", t.disk);
+	test_result(name, r == 0 && memcmp(rb, wb, 65536) == 0);
+
+	/* 2. Pass-through write -> block read. */
+	nvm_pattern(wb, 65536, 2);
+	r = nvm_io(t.nsfd, NVM_CMD_WRITE, t.nsid, lba0 + nlb, nlb, wb, 65536, 0);
+	snprintf(name, sizeof(name), "%s: IO_CMD Write of 64 KiB", t.disk);
+	test_result(name, r == 0);
+	ioctl(t.fd, BLKFLSBUF, 0);
+	memset(rb, 0, 65536);
+	snprintf(name, sizeof(name), "%s: pread after BLKFLSBUF sees the pass-through write", t.node);
+	test_result(name, pread(t.fd, rb, 65536, 65536) == 65536 &&
+				  memcmp(rb, wb, 65536) == 0);
+	{
+		struct nvme_user_io uio;
+		uint8_t *x = rb + 65536;
+
+		nvm_pattern(x, t.lbs, 3);
+		memset(&uio, 0, sizeof(uio));
+		uio.opcode = NVM_CMD_WRITE;
+		uio.addr = (uint64_t)(uintptr_t)x;
+		uio.slba = lba0 + 2 * nlb;
+		snprintf(name, sizeof(name), "%s: SUBMIT_IO Write + Read of one block", t.disk);
+		r = ioctl(t.nsfd, NVME_IOCTL_SUBMIT_IO, &uio);
+		memcpy(wb, x, t.lbs);
+		memset(x, 0, t.lbs);
+		uio.opcode = NVM_CMD_READ;
+		test_result(name, r == 0 && ioctl(t.nsfd, NVME_IOCTL_SUBMIT_IO, &uio) == 0 &&
+					  memcmp(x, wb, t.lbs) == 0);
+	}
+
+	/* 3. Flush. */
+	snprintf(name, sizeof(name), "%s: Flush", t.disk);
+	test_result(name, nvm_io(t.nsfd, NVM_CMD_FLUSH, t.nsid, 0, 0, NULL, 0, 0) == 0);
+
+	/* 4. Compare: match and miscompare. */
+	nvm_pattern(wb, 65536, 2);
+	r = nvm_io(t.nsfd, NVM_CMD_COMPARE, t.nsid, lba0 + nlb, nlb, wb, 65536, 0);
+	if (!(oncs & 1) && r > 0 && NVM_STATUS(r) == NVM_SC_INVALID_OPCODE) {
+		printf("  (%s: Compare not supported, ONCS 0x%04x)\n", t.disk, oncs);
+	} else {
+		snprintf(name, sizeof(name), "%s: Compare against the written data succeeds", t.disk);
+		test_result(name, r == 0);
+		wb[100] ^= 0xff;
+		r = nvm_io(t.nsfd, NVM_CMD_COMPARE, t.nsid, lba0 + nlb, nlb, wb,
+			   65536, 0);
+		snprintf(name, sizeof(name), "%s: Compare against different data -> Compare Failure", t.disk);
+		test_result(name, r > 0 && NVM_STATUS(r) == NVM_SC_COMPARE_FAILED);
+	}
+
+	/* 5. Write Zeroes (pass-through and BLKZEROOUT). */
+	if (oncs & (1u << 3)) {
+		r = nvm_io(t.nsfd, NVM_CMD_WRITE_ZEROES, t.nsid, lba0 + nlb, nlb,
+			   NULL, 0, 0);
+		snprintf(name, sizeof(name), "%s: Write Zeroes", t.disk);
+		test_result(name, r == 0);
+		memset(rb, 0xee, 65536);
+		r = nvm_io(t.nsfd, NVM_CMD_READ, t.nsid, lba0 + nlb, nlb, rb, 65536, 0);
+		snprintf(name, sizeof(name), "%s: Write Zeroes reads back as zeros", t.disk);
+		test_result(name, r == 0 && all_zero_buf(rb, 65536));
+	} else {
+		printf("  (%s: Write Zeroes not supported, ONCS 0x%04x)\n", t.disk, oncs);
+	}
+	{
+		uint64_t range[2] = { 131072, 65536 };
+
+		nvm_pattern(wb, 65536, 9);
+		pwrite(t.fd, wb, 65536, 131072);
+		fsync(t.fd);
+		snprintf(name, sizeof(name), "%s: BLKZEROOUT of 64 KiB", t.node);
+		test_result(name, ioctl(t.fd, BLKZEROOUT, range) == 0);
+		memset(rb, 0xee, 65536);
+		snprintf(name, sizeof(name), "%s: BLKZEROOUT range reads back as zeros", t.node);
+		test_result(name, pread(t.fd, rb, 65536, 131072) == 65536 &&
+					  all_zero_buf(rb, 65536));
+	}
+
+	/* 6. Dataset Management (deallocate) and BLKDISCARD. */
+	if (stg_attr_ull("/sys/block/%s/queue/discard_max_bytes%s", t.disk, "") > 0) {
+		uint64_t range[2] = { 196608, 65536 };
+
+		snprintf(name, sizeof(name), "%s: BLKDISCARD of 64 KiB", t.node);
+		test_result(name, ioctl(t.fd, BLKDISCARD, range) == 0);
+	}
+	if (oncs & (1u << 2)) {
+		uint8_t *rng = rb;
+
+		memset(rng, 0, 4096);
+		/* one range: context attributes 0, NLB, SLBA */
+		rng[4] = (uint8_t)nlb;
+		rng[5] = (uint8_t)(nlb >> 8);
+		rng[6] = (uint8_t)(nlb >> 16);
+		rng[7] = (uint8_t)(nlb >> 24);
+		for (int i = 0; i < 8; i++)
+			rng[8 + i] = (uint8_t)((lba0 + 3 * (uint64_t)nlb) >> (8 * i));
+		{
+			struct nvme_passthru_cmd cmd;
+
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opcode = NVM_CMD_DSM;
+			cmd.nsid = t.nsid;
+			cmd.cdw10 = 0; /* NR: one range */
+			cmd.cdw11 = 1u << 2; /* AD: deallocate */
+			cmd.addr = (uint64_t)(uintptr_t)rng;
+			cmd.data_len = 16;
+			snprintf(name, sizeof(name), "%s: Dataset Management (deallocate one range)", t.disk);
+			test_result(name, ioctl(t.nsfd, NVME_IOCTL_IO_CMD, &cmd) == 0);
+		}
+	} else {
+		printf("  (%s: Dataset Management not supported)\n", t.disk);
+	}
+
+	/* 7. Verify. */
+	if (oncs & (1u << 7)) {
+		snprintf(name, sizeof(name), "%s: Verify of 64 KiB", t.disk);
+		test_result(name, nvm_io(t.nsfd, NVM_CMD_VERIFY, t.nsid, lba0, nlb,
+					 NULL, 0, 0) == 0);
+	} else {
+		printf("  (%s: Verify not supported)\n", t.disk);
+	}
+
+	/* 8. POSIX AIO on the node. */
+	{
+		enum { N = 16 };
+		struct aiocb cb[N], *list[N];
+		static uint8_t abuf[N][4096] __attribute__((aligned(4096)));
+		int ok = 1;
+
+		memset(cb, 0, sizeof(cb));
+		for (int i = 0; i < N; i++) {
+			nvm_pattern(abuf[i], 4096, 100 + (uint32_t)i);
+			cb[i].aio_fildes = t.fd;
+			cb[i].aio_buf = abuf[i];
+			cb[i].aio_nbytes = 4096;
+			cb[i].aio_offset = 262144 + (off_t)i * 4096;
+			cb[i].aio_lio_opcode = LIO_WRITE;
+			cb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
+			list[i] = &cb[i];
+		}
+		snprintf(name, sizeof(name), "%s: lio_listio(LIO_WAIT) of %d writes", t.node, N);
+		test_result(name, lio_listio(LIO_WAIT, list, N, NULL) == 0);
+		for (int i = 0; i < N; i++)
+			if (aio_error(&cb[i]) != 0 || aio_return(&cb[i]) != 4096)
+				ok = 0;
+		test_result("lio_listio: every write returned 4096", ok);
+		fsync(t.fd);
+		ioctl(t.fd, BLKFLSBUF, 0);
+		for (int i = 0; i < N; i++) {
+			memset(abuf[i], 0, 4096);
+			cb[i].aio_lio_opcode = LIO_READ;
+			if (aio_read(&cb[i]) != 0)
+				ok = 0;
+		}
+		for (int done = 0; done < N;) {
+			const struct aiocb *const *cl = (const struct aiocb *const *)list;
+			struct timespec ts = { 10, 0 };
+
+			if (aio_suspend(cl, N, &ts) != 0 && errno != EINTR) {
+				ok = 0;
+				break;
+			}
+			done = 0;
+			for (int i = 0; i < N; i++)
+				if (aio_error(&cb[i]) != EINPROGRESS)
+					done++;
+		}
+		for (int i = 0; i < N; i++) {
+			uint8_t exp[4096];
+
+			nvm_pattern(exp, 4096, 100 + (uint32_t)i);
+			if (aio_error(&cb[i]) != 0 || aio_return(&cb[i]) != 4096 ||
+			    memcmp(abuf[i], exp, 4096) != 0)
+				ok = 0;
+		}
+		snprintf(name, sizeof(name), "%s: aio_read + aio_suspend read back every write", t.node);
+		test_result(name, ok);
+
+		/* Cancel: queue reads, cancel all; each ends as done or
+		 * ECANCELED, and the answer fits what happened. */
+		for (int i = 0; i < N; i++)
+			if (aio_read(&cb[i]) != 0)
+				ok = 0;
+		r = aio_cancel(t.fd, NULL);
+		{
+			int canceled = 0, notdone = 0, bad = 0;
+
+			for (int i = 0; i < N; i++) {
+				const struct aiocb *one[1] = { &cb[i] };
+
+				while (aio_error(&cb[i]) == EINPROGRESS) {
+					notdone = 1;
+					aio_suspend(one, 1, NULL);
+				}
+				if (aio_error(&cb[i]) == ECANCELED) {
+					canceled++;
+					if (aio_return(&cb[i]) != -1)
+						bad = 1;
+				} else if (aio_error(&cb[i]) != 0 ||
+					   aio_return(&cb[i]) != 4096) {
+					bad = 1;
+				}
+			}
+			snprintf(name, sizeof(name), "aio_cancel(fd, NULL): result %d fits %d cancelled of %d", r, canceled, N);
+			test_result(name, !bad &&
+						  ((r == AIO_CANCELED && canceled > 0) ||
+						   (r == AIO_NOTCANCELED) ||
+						   (r == AIO_ALLDONE && canceled == 0)));
+			(void)notdone;
+		}
+		errno = 0;
+		test_result("aio_cancel on a closed descriptor -> EBADF",
+			    aio_cancel(1000, NULL) == -1 && errno == EBADF);
+	}
+
+	/* 9. Polled read (RWF_HIPRI) and atomic write (RWF_ATOMIC). */
+	{
+		struct iovec iov = { rb, 4096 };
+		ssize_t n;
+
+		memset(rb, 0, 4096);
+		errno = 0;
+		n = preadv2(t.fd, &iov, 1, 262144, RWF_HIPRI);
+		if (n == -1 && errno == EOPNOTSUPP) {
+			printf("  [SKIP] preadv2(RWF_HIPRI): EOPNOTSUPP (no preadv2 in the kernel yet)\n");
+		} else {
+			uint8_t exp[4096];
+
+			nvm_pattern(exp, 4096, 100);
+			snprintf(name, sizeof(name), "%s: preadv2(RWF_HIPRI) reads the data", t.node);
+			test_result(name, n == 4096 && memcmp(rb, exp, 4096) == 0);
+		}
+		{
+			long long amax = stg_attr_ull("/sys/block/%s/queue/atomic_write_unit_max_bytes%s",
+						      t.disk, "");
+			long long amin = stg_attr_ull("/sys/block/%s/queue/atomic_write_unit_min_bytes%s",
+						      t.disk, "");
+
+			iov.iov_base = wb;
+			errno = 0;
+			if (amax > 0 && amin > 0 && amin <= 65536) {
+				iov.iov_len = (size_t)amin;
+				nvm_pattern(wb, (size_t)amin, 11);
+				n = pwritev2(t.fd, &iov, 1, 327680, RWF_ATOMIC);
+				if (n == -1 && errno == EOPNOTSUPP) {
+					printf("  [SKIP] pwritev2(RWF_ATOMIC): EOPNOTSUPP (no pwritev2 in the kernel yet)\n");
+				} else if (n == -1 && errno == EINVAL) {
+					printf("  [SKIP] pwritev2(RWF_ATOMIC): EINVAL (atomic writes need direct I/O)\n");
+				} else {
+					snprintf(name, sizeof(name), "%s: pwritev2(RWF_ATOMIC) of the minimum unit (%lld)", t.node, amin);
+					test_result(name, n == amin);
+					iov.iov_len = (size_t)amin + 1;
+					errno = 0;
+					n = pwritev2(t.fd, &iov, 1, 327680, RWF_ATOMIC);
+					snprintf(name, sizeof(name), "%s: pwritev2(RWF_ATOMIC) of a length that is no power of two -> EINVAL", t.node);
+					test_result(name, n == -1 && errno == EINVAL);
+				}
+			} else {
+				iov.iov_len = 4096;
+				n = pwritev2(t.fd, &iov, 1, 327680, RWF_ATOMIC);
+				snprintf(name, sizeof(name), "%s: pwritev2(RWF_ATOMIC) without atomic write support -> EOPNOTSUPP", t.node);
+				test_result(name, n == -1 && errno == EOPNOTSUPP);
+			}
+		}
+	}
+
+	/* 10. Persistent reservations on the whole namespace. */
+	if (c && c->id_ok && (oncs & (1u << 5))) {
+		const uint64_t key = 0x4c696b654f53ull; /* "LikeOS" */
+		struct pr_registration reg = { 0, key, 0, 0 };
+		struct pr_reservation rsv = { key, PR_WRITE_EXCLUSIVE, 0 };
+		struct pr_read_reservation rr;
+		uint64_t keys[16];
+		struct pr_read_keys rk = { 0, 16, (uint64_t)(uintptr_t)keys };
+		int has = 0;
+
+		r = ioctl(t.nsfd, IOC_PR_REGISTER, &reg);
+		snprintf(name, sizeof(name), "%s: IOC_PR_REGISTER a key", t.disk);
+		test_result(name, r == 0);
+		if (ioctl(t.nsfd, IOC_PR_READ_KEYS, &rk) == 0)
+			for (unsigned i = 0; i < rk.num_keys && i < 16; i++)
+				if (keys[i] == key)
+					has = 1;
+		snprintf(name, sizeof(name), "%s: IOC_PR_READ_KEYS lists it", t.disk);
+		test_result(name, has);
+		snprintf(name, sizeof(name), "%s: IOC_PR_RESERVE write exclusive", t.disk);
+		test_result(name, ioctl(t.nsfd, IOC_PR_RESERVE, &rsv) == 0);
+		memset(&rr, 0, sizeof(rr));
+		snprintf(name, sizeof(name), "%s: IOC_PR_READ_RESERVATION shows the holder and type", t.disk);
+		test_result(name, ioctl(t.nsfd, IOC_PR_READ_RESERVATION, &rr) == 0 &&
+					  rr.key == key && rr.type == PR_WRITE_EXCLUSIVE);
+		snprintf(name, sizeof(name), "%s: IOC_PR_RELEASE", t.disk);
+		test_result(name, ioctl(t.nsfd, IOC_PR_RELEASE, &rsv) == 0);
+		memset(&rr, 0, sizeof(rr));
+		snprintf(name, sizeof(name), "%s: no reservation after the release", t.disk);
+		test_result(name, ioctl(t.nsfd, IOC_PR_READ_RESERVATION, &rr) == 0 &&
+					  rr.type == 0);
+		reg.old_key = key;
+		reg.new_key = 0;
+		snprintf(name, sizeof(name), "%s: IOC_PR_REGISTER new key 0 unregisters", t.disk);
+		test_result(name, ioctl(t.nsfd, IOC_PR_REGISTER, &reg) == 0);
+		errno = 0;
+		if (t.part[0]) {
+			snprintf(name, sizeof(name), "%s: reservations on a partition are refused", t.node);
+			test_result(name, ioctl(t.fd, IOC_PR_READ_KEYS, &rk) == -1);
+		}
+	} else {
+		printf("  (%s: no reservation support (ONCS bit 5): reservation tests skipped)\n", t.disk);
+	}
+
+	/* 11. Fault injection round trip on the namespace. */
+	{
+		char fpath[PATH_MAX];
+		int onefile = 0;
+
+		if (nvm_fault_path(t.disk, fpath, sizeof(fpath), &onefile) != 0) {
+			printf("  [SKIP] %s has no fault_inject object (/sys/kernel/debug/%s/fault_inject)\n",
+			       t.disk, t.disk);
+		} else {
+			long long before, after;
+			int armed, hit = 0, tries = 0;
+
+			/* The injection applies to every command of the
+			 * namespace: other traffic (read-ahead, a journal, a
+			 * flush on a mounted partition) can take the single
+			 * shot before our read does.  The counter tells: when
+			 * it rose but our read succeeded, arm again. */
+			for (;;) {
+				before = nvm_fault_counter(fpath, onefile, "injected");
+				armed = nvm_fault_set(fpath, onefile,
+						      "kind=status status=0x281 dont_retry=Y interval=1 times=1 space=0 probability=100") == 0;
+				r = nvm_io(t.nsfd, NVM_CMD_READ, t.nsid, lba0, 1, rb, t.lbs, 0);
+				after = nvm_fault_counter(fpath, onefile, "injected");
+				hit = r > 0 && NVM_STATUS(r) == NVM_SC_READ_ERROR &&
+				      (r & 0x4000);
+				if (hit || !armed || before < 0 || after <= before ||
+				    ++tries >= 8)
+					break;
+				printf("  (%s: the injected error went to other I/O, arming again)\n",
+				       t.disk);
+			}
+			snprintf(name, sizeof(name), "%s: arm a one-shot media error", fpath);
+			test_result(name, armed);
+			snprintf(name, sizeof(name), "%s: the next command fails with Unrecovered Read Error + DNR", t.disk);
+			test_result(name, hit);
+			snprintf(name, sizeof(name), "%s: the injected counter went up by one", fpath);
+			test_result(name, before < 0 || after == before + 1);
+			r = nvm_io(t.nsfd, NVM_CMD_READ, t.nsid, lba0, 1, rb, t.lbs, 0);
+			snprintf(name, sizeof(name), "%s: the command after it succeeds (times exhausted)", t.disk);
+			test_result(name, r == 0);
+			/* The same through the block layer: an uncached read
+			 * reports the error. */
+			/* Every command fails while it is armed: a failed
+			 * read-ahead is followed by a synchronous read, which
+			 * has to fail as well. */
+			ioctl(t.fd, BLKFLSBUF, 0);
+			nvm_fault_set(fpath, onefile,
+				      "kind=status status=0x281 dont_retry=Y interval=1 times=-1 probability=100");
+			errno = 0;
+			{
+				ssize_t n = pread(t.fd, rb, 4096, 393216);
+				int e = errno;
+
+				nvm_fault_set(fpath, onefile, onefile ? "off" : "probability=0");
+				snprintf(name, sizeof(name), "%s: a block read under an injected media error fails (EIO/ENODATA)", t.node);
+				test_result(name, n == -1 && (e == EIO || e == ENODATA));
+			}
+			ioctl(t.fd, BLKFLSBUF, 0);
+			snprintf(name, sizeof(name), "%s: and reads fine afterwards", t.node);
+			test_result(name, pread(t.fd, rb, 4096, 393216) == 4096);
+			nvm_fault_set(fpath, onefile, onefile ? "off" : "probability=0");
+		}
+	}
+
+	/* 12. Controller reset with reads in flight, then a rescan. */
+	if (c && c->fd >= 0) {
+		enum { NR = 4 };
+		pthread_t th[NR];
+		struct nvm_reader rd[NR];
+		volatile int stop = 0;
+		unsigned reads = 0, errs = 0;
+		int ctlfd;
+		char cp[64];
+
+		snprintf(cp, sizeof(cp), "/dev/%s", c->name);
+		ctlfd = open(cp, O_RDWR | O_CLOEXEC);
+		memset(rd, 0, sizeof(rd));
+		for (int i = 0; i < NR; i++) {
+			rd[i].fd = t.fd;
+			rd[i].bytes = t.bytes;
+			rd[i].stop = &stop;
+			pthread_create(&th[i], NULL, nvm_reader_main, &rd[i]);
+		}
+		usleep(300000);
+		errno = 0;
+		r = ctlfd >= 0 ? ioctl(ctlfd, NVME_IOCTL_RESET) : -1;
+		snprintf(name, sizeof(name), "%s: NVME_IOCTL_RESET with reads in flight", c->name);
+		test_result(name, r == 0);
+		snprintf(name, sizeof(name), "%s: state is live again after the reset", c->name);
+		test_result(name, nvm_wait_state(c->name, "live", 30000) == 0);
+		usleep(300000);
+		stop = 1;
+		for (int i = 0; i < NR; i++) {
+			pthread_join(th[i], NULL);
+			reads += rd[i].reads;
+			errs += rd[i].errors;
+		}
+		snprintf(name, sizeof(name), "%s: %u reads across the reset, %u failed", t.node, reads, errs);
+		test_result(name, reads > 0 && errs == 0);
+		ioctl(t.fd, BLKFLSBUF, 0);
+		nvm_pattern(wb, 65536, 1);
+		snprintf(name, sizeof(name), "%s: data written before the reset reads back", t.node);
+		test_result(name, pread(t.fd, rb, 65536, 0) == 65536 &&
+					  memcmp(rb, wb, 65536) == 0);
+
+		r = ctlfd >= 0 ? ioctl(ctlfd, NVME_IOCTL_RESCAN) : -1;
+		snprintf(name, sizeof(name), "%s: NVME_IOCTL_RESCAN", c->name);
+		test_result(name, r == 0);
+		usleep(500000);
+		snprintf(a, sizeof(a), "/sys/block/%s", t.disk);
+		snprintf(name, sizeof(name), "%s still present after the rescan", t.disk);
+		test_result(name, access(a, F_OK) == 0);
+		snprintf(a, sizeof(a), "/sys/class/nvme/%s/rescan_controller", c->name);
+		if (access(a, W_OK) == 0) {
+			int fd = open(a, O_WRONLY | O_CLOEXEC);
+
+			snprintf(name, sizeof(name), "%s: writing rescan_controller", c->name);
+			test_result(name, fd >= 0 && write(fd, "1", 1) == 1);
+			if (fd >= 0)
+				close(fd);
+		}
+		if (ctlfd >= 0)
+			close(ctlfd);
+		(void)v;
+	}
+out:
+	free(wb);
+	free(rb);
+	if (t.fd >= 0)
+		close(t.fd);
+	if (t.nsfd >= 0)
+		close(t.nsfd);
+}
+
+/* ---- destructive: a zoned namespace named by TESTLIBC_ZNS -------------- */
+
+static int nvm_zone0(int fd, struct blk_zone *z)
+{
+	struct {
+		struct blk_zone_report r;
+		struct blk_zone z[1];
+	} rep;
+
+	memset(&rep, 0, sizeof(rep));
+	rep.r.sector = 0;
+	rep.r.nr_zones = 1;
+	if (ioctl(fd, BLKREPORTZONE, &rep) != 0 || rep.r.nr_zones != 1)
+		return -1;
+	*z = rep.r.zones[0];
+	return 0;
+}
+
+static void test_nvme_zns_write(void)
+{
+	const char *e = getenv("TESTLIBC_ZNS");
+	struct blk_zone z;
+	struct blk_zone_range rg;
+	uint32_t zsz = 0;
+	uint8_t *b = NULL;
+	char name[200];
+	int fd, ssz = 0;
+
+	if (!e || !*e) {
+		printf("  (zone write tests: set TESTLIBC_ZNS=/dev/nvmeXnY to a zoned namespace whose first zone may be reset)\n");
+		return;
+	}
+	printf("\n  -- zone tests on %s --\n", e);
+	fd = open(e, O_RDWR | O_CLOEXEC);
+	snprintf(name, sizeof(name), "open(%s, O_RDWR)", e);
+	test_result(name, fd >= 0);
+	if (fd < 0)
+		return;
+	if (ioctl(fd, BLKGETZONESZ, &zsz) != 0 || zsz == 0 ||
+	    ioctl(fd, BLKSSZGET, &ssz) != 0 ||
+	    posix_memalign((void **)&b, 4096, 4096) != 0) {
+		test_fail("TESTLIBC_ZNS names a zoned namespace");
+		close(fd);
+		return;
+	}
+	rg.sector = 0;
+	rg.nr_sectors = zsz;
+	test_result("BLKRESETZONE zone 0", ioctl(fd, BLKRESETZONE, &rg) == 0);
+	test_result("zone 0 is empty, write pointer at its start",
+		    nvm_zone0(fd, &z) == 0 && z.cond == BLK_ZONE_COND_EMPTY &&
+			    z.wp == z.start);
+	nvm_pattern(b, 4096, 7);
+	test_result("a 4 KiB write at the write pointer",
+		    pwrite(fd, b, 4096, 0) == 4096 && fsync(fd) == 0);
+	test_result("the write pointer advanced by 8 sectors, zone open",
+		    nvm_zone0(fd, &z) == 0 && z.wp == z.start + 8 &&
+			    (z.cond == BLK_ZONE_COND_IMP_OPEN ||
+			     z.cond == BLK_ZONE_COND_EXP_OPEN ||
+			     z.cond == BLK_ZONE_COND_CLOSED));
+	errno = 0;
+	test_result("a write behind the write pointer fails",
+		    pwrite(fd, b, 4096, 1024 * 1024) == -1 || fsync(fd) == -1);
+	test_result("BLKFINISHZONE: zone 0 full", ioctl(fd, BLKFINISHZONE, &rg) == 0 &&
+			    nvm_zone0(fd, &z) == 0 && z.cond == BLK_ZONE_COND_FULL);
+	test_result("BLKRESETZONE: empty again", ioctl(fd, BLKRESETZONE, &rg) == 0 &&
+			    nvm_zone0(fd, &z) == 0 && z.cond == BLK_ZONE_COND_EMPTY);
+	test_result("BLKOPENZONE: explicitly open", ioctl(fd, BLKOPENZONE, &rg) == 0 &&
+			    nvm_zone0(fd, &z) == 0 && z.cond == BLK_ZONE_COND_EXP_OPEN);
+	test_result("BLKCLOSEZONE of an open zone without data: empty",
+		    ioctl(fd, BLKCLOSEZONE, &rg) == 0 && nvm_zone0(fd, &z) == 0 &&
+			    (z.cond == BLK_ZONE_COND_EMPTY ||
+			     z.cond == BLK_ZONE_COND_CLOSED));
+	ioctl(fd, BLKRESETZONE, &rg);
+	free(b);
+	close(fd);
+}
+
+/* ---- installer readiness on TESTLIBC_NVME_SCRATCH ---------------------- */
+
+static int nvm_run(const char *cmd)
+{
+	int st = system(cmd);
+
+	return st != -1 && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* The file system tools an installer runs, by the names it runs them under
+ * (/sbin/mkfs.ext4 is a link to mke2fs, /sbin/mkfs.vfat one to mkfs.fat). */
+#define NVM_MKFS_EXT4 "/sbin/mkfs.ext4"
+#define NVM_FSCK_EXT4 "/sbin/fsck.ext4"
+#define NVM_MKFS_VFAT "/sbin/mkfs.vfat"
+#define NVM_FSCK_VFAT "/sbin/fsck.vfat"
+
+/* Read `len' bytes at `off' of the block device `path' (O_RDONLY, so the
+ * read sees what the tools wrote through their own descriptors). */
+static int nvm_pread_dev(const char *path, off_t off, void *buf, size_t len)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = pread(fd, buf, len, off);
+	close(fd);
+	return n == (ssize_t)len ? 0 : -1;
+}
+
+/* Format `part' as ext4 with mkfs.ext4, check it with e2fsck -fn and read
+ * the superblock back: the magic, the label, ext4's extents and 64-bit
+ * group descriptor features as mke2fs.conf asks for them, a block size the
+ * device's logical sector size divides. */
+static void nvm_installer_ext4(const char *part, int lbs)
+{
+	uint8_t sb[1024];
+	char name[300], cmd[512];
+	uint32_t log_bs, incompat;
+	int fd, ok;
+
+	/* A partition someone holds open exclusively is in use: mke2fs must
+	 * refuse it (its O_EXCL probe gets EBUSY) and leave it untouched. */
+	fd = open(part, O_RDONLY | O_EXCL | O_CLOEXEC);
+	snprintf(name, sizeof(name), "mkfs.ext4: %s held with O_EXCL", part);
+	test_result(name, fd >= 0);
+	if (fd >= 0) {
+		snprintf(cmd, sizeof(cmd), "%s -F -q %s </dev/null >/dev/null 2>&1",
+			 NVM_MKFS_EXT4, part);
+		snprintf(name, sizeof(name), "mkfs.ext4: refuses %s while it is held", part);
+		test_result(name, nvm_run(cmd) != 0);
+		close(fd);
+	}
+
+	snprintf(cmd, sizeof(cmd), "%s -F -q -L likeos-root %s </dev/null >/dev/null 2>&1",
+		 NVM_MKFS_EXT4, part);
+	snprintf(name, sizeof(name), "mkfs.ext4: formats %s", part);
+	ok = nvm_run(cmd) == 0;
+	test_result(name, ok);
+	if (!ok)
+		return;
+
+	snprintf(cmd, sizeof(cmd), "%s -fn %s </dev/null >/dev/null 2>&1", NVM_FSCK_EXT4, part);
+	snprintf(name, sizeof(name), "e2fsck -fn: %s is clean", part);
+	test_result(name, nvm_run(cmd) == 0);
+
+	/* The primary superblock: 1024 bytes at byte 1024. */
+	if (nvm_pread_dev(part, 1024, sb, sizeof(sb)) != 0) {
+		test_fail("pread of the ext4 superblock");
+		return;
+	}
+	test_result("superblock: s_magic is 0xEF53", nvm_le16(sb + 56) == 0xEF53);
+	test_result("superblock: s_volume_name is \"likeos-root\"",
+		    memcmp(sb + 120, "likeos-root", 12) == 0);
+	incompat = nvm_le32(sb + 96);
+	/* /etc/mke2fs.conf turns 64bit on only above 2^32 blocks, so only
+	 * extents is required here. */
+	test_result("superblock: ext4 (extents in s_feature_incompat)",
+		    (incompat & 0x40) != 0);
+	log_bs = nvm_le32(sb + 24);
+	snprintf(name, sizeof(name),
+		 "superblock: block size %u is a multiple of the %d-byte logical sector",
+		 log_bs < 6 ? 1024u << log_bs : 0, lbs);
+	test_result(name, log_bs < 6 && lbs > 0 && ((1024u << log_bs) % (unsigned)lbs) == 0);
+
+	/* e2label is tune2fs under another name. */
+	snprintf(cmd, sizeof(cmd), "/sbin/e2label %s 2>/dev/null | grep -qx likeos-root", part);
+	snprintf(name, sizeof(name), "e2label: %s reads likeos-root", part);
+	test_result(name, nvm_run(cmd) == 0);
+	snprintf(cmd, sizeof(cmd), "/sbin/dumpe2fs -h %s 2>/dev/null | grep -q '^Filesystem state: *clean'",
+		 part);
+	snprintf(name, sizeof(name), "dumpe2fs -h: %s is clean", part);
+	test_result(name, nvm_run(cmd) == 0);
+}
+
+/* Format `part' as FAT with mkfs.vfat (the type mkfs.fat picks for its
+ * size), check it with fsck.vfat -n and read the boot sector back. */
+static void nvm_installer_fat(const char *part)
+{
+	uint8_t bs[512];
+	char name[300], cmd[512];
+	int fat32, ok;
+
+	snprintf(cmd, sizeof(cmd), "%s -n LIKEOS-ESP %s </dev/null >/dev/null 2>&1",
+		 NVM_MKFS_VFAT, part);
+	snprintf(name, sizeof(name), "mkfs.vfat: formats %s", part);
+	ok = nvm_run(cmd) == 0;
+	test_result(name, ok);
+	if (!ok)
+		return;
+
+	snprintf(cmd, sizeof(cmd), "%s -n %s </dev/null >/dev/null 2>&1", NVM_FSCK_VFAT, part);
+	snprintf(name, sizeof(name), "fsck.vfat -n: %s is clean", part);
+	test_result(name, nvm_run(cmd) == 0);
+
+	if (nvm_pread_dev(part, 0, bs, sizeof(bs)) != 0) {
+		test_fail("pread of the FAT boot sector");
+		return;
+	}
+	test_result("boot sector: signature 55 AA", bs[510] == 0x55 && bs[511] == 0xAA);
+	/* BPB_FATSz16 == 0 marks FAT32; the type string and the volume label
+	 * sit at 82/71 there, at 54/43 for FAT12/16. */
+	fat32 = nvm_le16(bs + 22) == 0;
+	test_result("boot sector: \"FAT\" file system type",
+		    memcmp(bs + (fat32 ? 82 : 54), "FAT", 3) == 0);
+	test_result("boot sector: volume label LIKEOS-ESP",
+		    memcmp(bs + (fat32 ? 71 : 43), "LIKEOS-ESP ", 11) == 0);
+	test_result("boot sector: bytes per sector is a power of two >= 512",
+		    nvm_le16(bs + 11) >= 512 && (nvm_le16(bs + 11) & (nvm_le16(bs + 11) - 1)) == 0);
+}
+
+static void test_nvme_installer(void)
+{
+	static const char *const fs_tools[] = {
+		NVM_MKFS_EXT4, NVM_FSCK_EXT4, NVM_MKFS_VFAT, NVM_FSCK_VFAT,
+		"/sbin/e2label", "/sbin/dumpe2fs",
+	};
+	const char *e = getenv("TESTLIBC_NVME_SCRATCH");
+	char name[300], cmd[512], disk[64], a[160];
+	struct stat st;
+	int fd, have_fs_tools = 1, lbs = 0;
+
+	printf("\n  -- installer readiness --\n");
+	test_result("lsblk is installed", access("/bin/lsblk", X_OK) == 0);
+	test_result("sfdisk is installed", access("/sbin/sfdisk", X_OK) == 0);
+	for (unsigned i = 0; i < sizeof(fs_tools) / sizeof(fs_tools[0]); i++) {
+		int ok = access(fs_tools[i], X_OK) == 0;
+
+		snprintf(name, sizeof(name), "%s is installed", fs_tools[i]);
+		test_result(name, ok);
+		if (!ok)
+			have_fs_tools = 0;
+	}
+	if (!e || !*e) {
+		printf("  (repartitioning: set TESTLIBC_NVME_SCRATCH=/dev/nvmeXnY to a whole namespace that may be wiped)\n");
+		return;
+	}
+	if (stat(e, &st) != 0 || !S_ISBLK(st.st_mode) ||
+	    !stg_is_whole_disk(st.st_rdev)) {
+		test_fail("TESTLIBC_NVME_SCRATCH names a whole namespace");
+		return;
+	}
+	if (stg_mounted(st.st_rdev, 1) || stg_disk_holds_root(st.st_rdev)) {
+		printf("  [SKIP] %s is in use: not repartitioned\n", e);
+		return;
+	}
+	snprintf(disk, sizeof(disk), "%s", strrchr(e, '/') + 1);
+	/* Detect: /sys/block and lsblk both list it. */
+	snprintf(a, sizeof(a), "/sys/block/%s", disk);
+	snprintf(name, sizeof(name), "detect: /sys/block/%s", disk);
+	test_result(name, access(a, F_OK) == 0);
+	snprintf(cmd, sizeof(cmd), "/bin/lsblk -dn -o NAME %s 2>/dev/null | grep -qx %s", e, disk);
+	snprintf(name, sizeof(name), "detect: lsblk lists %s", disk);
+	test_result(name, nvm_run(cmd) == 0);
+	/* Partition: the layout an installer writes (ESP + root). */
+	snprintf(cmd, sizeof(cmd),
+		 "printf 'label: gpt\\nsize=64MiB, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=likeos-esp\\ntype=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=likeos-root\\n' | /sbin/sfdisk -q %s >/dev/null 2>&1",
+		 e);
+	snprintf(name, sizeof(name), "partition: sfdisk writes a GPT (ESP + root) on %s", e);
+	test_result(name, nvm_run(cmd) == 0);
+	fd = open(e, O_RDONLY | O_CLOEXEC);
+	snprintf(name, sizeof(name), "partition: BLKRRPART on %s", e);
+	test_result(name, fd >= 0 && (ioctl(fd, BLKRRPART, 0) == 0 || errno == EBUSY));
+	if (fd >= 0) {
+		if (ioctl(fd, BLKSSZGET, &lbs) != 0)
+			lbs = 0;
+		close(fd);
+	}
+	usleep(200000);
+	{
+		char p1[80], p2[80];
+		int have_parts;
+
+		snprintf(p1, sizeof(p1), "%sp1", e);
+		snprintf(p2, sizeof(p2), "%sp2", e);
+		snprintf(name, sizeof(name), "partition: %s and %s exist", p1, p2);
+		have_parts = stat(p1, &st) == 0 && S_ISBLK(st.st_mode) &&
+			     stat(p2, &st) == 0 && S_ISBLK(st.st_mode);
+		test_result(name, have_parts);
+		test_result("partition: /dev/disk/by-partlabel/likeos-root exists",
+			    access("/dev/disk/by-partlabel/likeos-root", F_OK) == 0);
+		if (!have_parts)
+			return;
+		if (!have_fs_tools) {
+			printf("  [SKIP] file system creation: the e2fsprogs/dosfstools tools are not all installed\n");
+			return;
+		}
+		/* Format: the root partition as ext4, the ESP as FAT. */
+		nvm_installer_ext4(p2, lbs);
+		nvm_installer_fat(p1);
+	}
+}
+
+/* ---- entry ------------------------------------------------------------- */
+
+static void test_nvme(int nvme_only)
+{
+	struct nvm_ctrl_info *ctrls;
+	struct nvm_ns_info *nss;
+	int nctrl = 0, nns = 0, nvme_major, generic_major;
+	DIR *d;
+	struct dirent *de;
+
+	printf("\n--- NVMe Tests (controllers, namespaces, NVME_IOCTL_*, zones, reservations%s) ---\n",
+	       nvme_only ? ", writes, AIO, faults, reset" : "");
+	if (access("/sys/class/nvme", F_OK) != 0) {
+		struct stat st;
+
+		if (stat("/dev/nvme0", &st) == 0)
+			test_fail("/dev/nvme0 exists but there is no /sys/class/nvme");
+		else
+			printf("  [SKIP] no NVMe controller (/sys/class/nvme is absent)\n");
+		if (nvme_only)
+			test_nvme_installer();
+		return;
+	}
+	if (geteuid() != 0) {
+		printf("  [SKIP] not root: the NVMe nodes are root-only\n");
+		return;
+	}
+	nvme_major = nvm_chr_major("nvme");
+	generic_major = nvm_chr_major("nvme-generic");
+	test_result("/proc/devices: character major \"nvme\"", nvme_major > 0);
+	test_result("/proc/devices: character major \"nvme-generic\"",
+		    generic_major > 0 && generic_major != nvme_major);
+
+	ctrls = calloc(16, sizeof(*ctrls));
+	nss = calloc(64, sizeof(*nss));
+	if (!ctrls || !nss) {
+		free(ctrls);
+		free(nss);
+		return;
+	}
+	if ((d = opendir("/sys/class/nvme")) != NULL) {
+		while (nctrl < 16 && (de = readdir(d)) != NULL) {
+			if (!nvm_is_ctrl_name(de->d_name))
+				continue;
+			snprintf(ctrls[nctrl].name, sizeof(ctrls[0].name), "%s",
+				 de->d_name);
+			ctrls[nctrl].instance = (unsigned)atoi(de->d_name + 4);
+			ctrls[nctrl].fd = -1;
+			nctrl++;
+		}
+		closedir(d);
+	}
+	if (nctrl == 0) {
+		printf("  [SKIP] /sys/class/nvme lists no controller\n");
+		goto out;
+	}
+	{
+		/* The subsystems: each lists its controllers. */
+		int nsub = 0;
+
+		if ((d = opendir("/sys/class/nvme-subsystem")) != NULL) {
+			while ((de = readdir(d)) != NULL)
+				if (strncmp(de->d_name, "nvme-subsys", 11) == 0)
+					nsub++;
+			closedir(d);
+		}
+		test_result("/sys/class/nvme-subsystem lists a subsystem", nsub > 0);
+	}
+	for (int i = 0; i < nctrl; i++)
+		test_nvme_ctrl(&ctrls[i], nvme_major);
+
+	if ((d = opendir("/sys/block")) != NULL) {
+		while (nns < 64 && (de = readdir(d)) != NULL) {
+			if (!nvm_is_ns_name(de->d_name))
+				continue;
+			snprintf(nss[nns].disk, sizeof(nss[0].disk), "%s", de->d_name);
+			nss[nns].fd = -1;
+			if (nvm_ctrl_of_disk(de->d_name, nss[nns].ctrl,
+					     sizeof(nss[0].ctrl)) != 0)
+				snprintf(nss[nns].ctrl, sizeof(nss[0].ctrl), "?");
+			nns++;
+		}
+		closedir(d);
+	}
+	if (nns == 0)
+		printf("  (no NVMe namespace in /sys/block)\n");
+	for (int i = 0; i < nns; i++)
+		test_nvme_ns(&nss[i], ctrls, nctrl, generic_major);
+	for (int i = 0; i < nns; i++) {
+		if (nss[i].fd < 0)
+			continue;
+		for (int k = 0; k < nctrl; k++)
+			if (strcmp(ctrls[k].name, nss[i].ctrl) == 0) {
+				test_nvme_unpriv(&nss[i], &ctrls[k]);
+				break;
+			}
+		break; /* once is enough */
+	}
+
+	if (nvme_only) {
+		test_nvme_write(ctrls, nctrl);
+		test_nvme_zns_write();
+		test_nvme_installer();
+	} else {
+		printf("  (NVMe write, AIO, fault, reset and installer tests run under `testlibc nvme')\n");
+	}
+out:
+	for (int i = 0; i < nns; i++)
+		if (nss[i].fd >= 0)
+			close(nss[i].fd);
+	for (int i = 0; i < nctrl; i++)
+		if (ctrls[i].fd >= 0)
+			close(ctrls[i].fd);
+	free(ctrls);
+	free(nss);
+}
+
+/* ---- Page cache holds: readers, a writer, fsync and truncation at once.
+ * Every page of the file is always written whole with one byte value, so a
+ * whole-page read must come back uniform (or empty past the end).  A page
+ * freed or reused under a copy that is still in flight -- reclaim or a
+ * truncation taking a page a reader or writer is copying, writeback's hold
+ * dropped by a writer -- shows up as mixed bytes. */
+#define PCH_PAGES 32
+struct pch_ctl {
+	const char *path;
+	volatile int stop;
+	volatile int bad;
+	volatile long reads;
+};
+
+static int pch_uniform(const unsigned char *b, size_t n)
+{
+	for (size_t i = 1; i < n; i++)
+		if (b[i] != b[0])
+			return 0;
+	return 1;
+}
+
+static void *pch_reader(void *arg)
+{
+	struct pch_ctl *c = (struct pch_ctl *)arg;
+	unsigned char *b = malloc(4096);
+	unsigned s = (unsigned)(uintptr_t)&b;
+	int fd = open(c->path, O_RDONLY);
+
+	if (!b || fd < 0) {
+		c->bad = 1;
+		free(b);
+		if (fd >= 0)
+			close(fd);
+		return NULL;
+	}
+	while (!c->stop) {
+		s = s * 1103515245u + 12345u;
+		off_t off = (off_t)((s >> 8) % PCH_PAGES) * 4096;
+		ssize_t r = pread(fd, b, 4096, off);
+		if (r < 0 || (r != 0 && r != 4096) ||
+		    (r == 4096 && !pch_uniform(b, 4096))) {
+			c->bad = 1;
+			fail_log("page cache holds: pread at %ld: %zd, %s",
+				   (long)off, r,
+				   r == 4096 ? "mixed bytes" : "bad length");
+			break;
+		}
+		__sync_fetch_and_add(&c->reads, 1);
+	}
+	close(fd);
+	free(b);
+	return NULL;
+}
+
+static void *pch_writer(void *arg)
+{
+	struct pch_ctl *c = (struct pch_ctl *)arg;
+	unsigned char *b = malloc(4096);
+	unsigned s = 77;
+	int fd = open(c->path, O_RDWR);
+
+	if (!b || fd < 0) {
+		c->bad = 1;
+		free(b);
+		if (fd >= 0)
+			close(fd);
+		return NULL;
+	}
+	for (long i = 0; !c->stop; i++) {
+		s = s * 1103515245u + 12345u;
+		off_t off = (off_t)((s >> 8) % PCH_PAGES) * 4096;
+		memset(b, (int)((s >> 16) | 1) & 0xff, 4096);
+		if (pwrite(fd, b, 4096, off) != 4096) {
+			c->bad = 1;
+			fail_log("page cache holds: pwrite at %ld: %s",
+				   (long)off, strerror(errno));
+			break;
+		}
+		if (i % 64 == 63 &&
+		    ftruncate(fd, (off_t)((s >> 20) % PCH_PAGES) * 4096) != 0) {
+			c->bad = 1;
+			fail_log("page cache holds: ftruncate: %s",
+				   strerror(errno));
+			break;
+		}
+	}
+	close(fd);
+	free(b);
+	return NULL;
+}
+
+static void *pch_syncer(void *arg)
+{
+	struct pch_ctl *c = (struct pch_ctl *)arg;
+	int fd = open(c->path, O_RDWR);
+
+	if (fd < 0) {
+		c->bad = 1;
+		return NULL;
+	}
+	while (!c->stop) {
+		if (fsync(fd) != 0) {
+			c->bad = 1;
+			fail_log("page cache holds: fsync: %s",
+				   strerror(errno));
+			break;
+		}
+		usleep(2000);
+	}
+	close(fd);
+	return NULL;
+}
+
+static void test_pagecache_holds(void)
+{
+	char path[64];
+	struct pch_ctl c;
+	pthread_t th[5];
+	int nt = 0, fd;
+	unsigned char *b = malloc(4096);
+
+	printf("\n--- page cache holds (readers, writer, fsync, truncate) ---\n");
+	snprintf(path, sizeof(path), "/tmp/pc_holds_%d", (int)getpid());
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	test_result("page cache holds: create", fd >= 0 && b != NULL);
+	if (fd < 0 || !b) {
+		free(b);
+		return;
+	}
+	int ok = 1;
+	for (int p = 0; p < PCH_PAGES && ok; p++) {
+		memset(b, 'a' + p % 26, 4096);
+		ok = pwrite(fd, b, 4096, (off_t)p * 4096) == 4096;
+	}
+	close(fd);
+	test_result("page cache holds: initial pages", ok);
+	memset(&c, 0, sizeof(c));
+	c.path = path;
+	for (int i = 0; i < 3; i++)
+		if (pthread_create(&th[nt], NULL, pch_reader, &c) == 0)
+			nt++;
+	if (pthread_create(&th[nt], NULL, pch_writer, &c) == 0)
+		nt++;
+	if (pthread_create(&th[nt], NULL, pch_syncer, &c) == 0)
+		nt++;
+	test_result("page cache holds: threads started", nt == 5);
+	sleep(3);
+	c.stop = 1;
+	for (int i = 0; i < nt; i++)
+		pthread_join(th[i], NULL);
+	test_result("page cache holds: every whole-page read was uniform",
+		    !c.bad && c.reads > 0);
+
+	/* and afterwards, from a fresh descriptor: whole pages, uniform */
+	fd = open(path, O_RDONLY);
+	ok = fd >= 0;
+	for (int p = 0; p < PCH_PAGES && ok; p++) {
+		ssize_t r = pread(fd, b, 4096, (off_t)p * 4096);
+		if (r == 0)
+			break;
+		ok = r == 4096 && pch_uniform(b, 4096);
+	}
+	if (fd >= 0)
+		close(fd);
+	test_result("page cache holds: file consistent afterwards", ok);
+	unlink(path);
+	free(b);
+}
+
 static void test_storage(int storage_only)
 {
 	DIR *dir;
@@ -18727,7 +21423,8 @@ static void test_storage(int storage_only)
 	printf("\n--- Storage Tests (block devices, BLK*/HDIO/SG_IO, /sys/block, /proc) ---\n");
 	dir = opendir("/sys/block");
 	while (dir && (de = readdir(dir)) != NULL) {
-		if (strncmp(de->d_name, "sd", 2) == 0 && nd < 32)
+		if ((strncmp(de->d_name, "sd", 2) == 0 ||
+		     nvm_is_ns_name(de->d_name)) && nd < 32)
 			snprintf(disks[nd++], sizeof(disks[0]), "%s", de->d_name);
 		else if (strncmp(de->d_name, "sr", 2) == 0 && nsr < 8)
 			snprintf(srs[nsr++], sizeof(srs[0]), "%s", de->d_name);
@@ -18740,7 +21437,7 @@ static void test_storage(int storage_only)
 		if (stat("/dev/sda", &st) == 0)
 			test_fail("/dev/sda exists but /sys/block lists no sd disk");
 		else
-			printf("  [SKIP] skipped: no disk (/sys/block has no sdX or srN)\n");
+			printf("  [SKIP] skipped: no disk (/sys/block has no sdX, nvmeXnY or srN)\n");
 		return;
 	}
 	if (geteuid() != 0) {
@@ -18757,6 +21454,9 @@ static void test_storage(int storage_only)
 		test_result("/proc/diskstats is readable",
 			    access("/proc/diskstats", R_OK) == 0);
 	}
+	/* The NVMe-specific read-only probes (controllers, pass-through,
+	 * zones); the rest of `testlibc nvme' writes. */
+	test_nvme(0);
 	if (nd > 0) {
 		char node[64];
 		int fd;
@@ -18838,6 +21538,11 @@ int main(int argc, char **argv)
 	 *                        the write tests on the designated test target
 	 *                        (partition "likeos-test" or TESTLIBC_DISK) */
 	int storage_only = (argc > 1 && strcmp(argv[1], "storage") == 0);
+	/*   testlibc nvme     -- run only the NVMe section, including the write,
+	 *                        AIO, fault injection and reset tests on the
+	 *                        designated target (partition likeos-test* on a
+	 *                        namespace, or TESTLIBC_NVME) */
+	int nvme_only = (argc > 1 && strcmp(argv[1], "nvme") == 0);
 	int skip_network =
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
@@ -18846,6 +21551,7 @@ int main(int argc, char **argv)
 					       gpu_only     ? " (graphics only)" :
 					       audio_only   ? " (audio only)" :
 					       storage_only ? " (storage only)" :
+					       nvme_only    ? " (NVMe only)" :
 					       skip_network ? " (no network)" :
 							      " (all)",
 	       g_stress ? " [--stress: no screen drawing or mode changes]" : "");
@@ -18909,6 +21615,8 @@ int main(int argc, char **argv)
 		goto audio_section;
 	if (storage_only)
 		goto storage_section;
+	if (nvme_only)
+		goto nvme_section;
 
 	// ========================================
 	// Test: malloc/free
@@ -25694,6 +28402,30 @@ int main(int argc, char **argv)
 		ch = getopt_long_only(2, argv9, "hv", longopts8, &longidx);
 		test_result("getopt_long_only: -nosuch returns '?'", ch == '?');
 		opterr = 1;
+
+		/* optind = 0 restarts the scan at argv[1] (nvme-cli parses a
+		 * subcommand's vector this way: argv[0] is "smart-log", the
+		 * device follows the options) */
+		struct option longopts10[] = { { "namespace-id", required_argument, NULL, 'n' },
+					       { "human-readable", no_argument, NULL, 'H' },
+					       { NULL, 0, NULL, 0 } };
+		char *argv10[] = { "smart-log", "/dev/nvme0", NULL };
+		char *argv11[] = { "smart-log", "-n", "1", "-H", "/dev/nvme0", NULL };
+		int got_n = 0, got_h = 0;
+		optind = 0;
+		while ((ch = getopt_long_only(2, argv10, "n:H", longopts10, &longidx)) != -1)
+			;
+		test_result("getopt_long_only: optind = 0, no options -> optind 1 (the operand)",
+			    optind == 1);
+		optind = 0;
+		while ((ch = getopt_long_only(5, argv11, "n:H", longopts10, &longidx)) != -1) {
+			if (ch == 'n' && optarg && strcmp(optarg, "1") == 0)
+				got_n = 1;
+			if (ch == 'H')
+				got_h = 1;
+		}
+		test_result("getopt_long_only: optind = 0 restart parses -n 1 -H, optind at the operand",
+			    got_n && got_h && optind == 4);
 		optind = 1;
 	}
 
@@ -30231,6 +32963,8 @@ network_section:
 			unlink(path);
 		}
 	}
+
+	test_pagecache_holds();
 
 	{
 		/* Volume, in small unaligned pieces.
@@ -35860,6 +38594,12 @@ audio_section:
 storage_section:
 	if (storage_only)
 		test_storage(1);
+
+	/* Reached only by `testlibc nvme'; full and storage runs cover the
+	 * read-only part through test_storage(). */
+nvme_section:
+	if (nvme_only)
+		test_nvme(1);
 
 	// ========================================
 	// Summary

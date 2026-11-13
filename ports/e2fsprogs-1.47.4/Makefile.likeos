@@ -1,0 +1,372 @@
+# Makefile.likeos - build the ext2/ext3/ext4 tools of e2fsprogs 1.47.4 for
+# LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; configure is not
+# run.  config.h in this directory stands in for lib/config.h and
+# lib/dirpaths.h; the source lists are those of upstream's Makefile.in files
+# (lib/{et,ss,e2p,support,ext2fs}, misc, e2fsck, resize, debugfs) with the
+# configure defaults (MMP, TDB, test I/O manager, bitmap statistics, e2image
+# and debugfs support in libext2fs), without libarchive, fuse2fs, uuidd and
+# e2fsprogs' private copies of libuuid and libblkid: those two come from the
+# util-linux port (ports/util-linux-2.42.4), built first by the top-level
+# ports-e2fsprogs target, exactly as distributions configure e2fsprogs.
+#
+# The files configure and the build would generate are made here with the
+# tools upstream uses for them, nothing else:
+#   lib/ext2fs/ext2_types.h   sizes substituted into ext2_types.h.in
+#   lib/ext2fs/ext2_err.[ch], lib/ss/ss_err.[ch], lib/support/prof_err.[ch]
+#                             the error tables, by lib/et/et_[ch].awk
+#   lib/ss/std_rqs.c, debugfs/{debug,extent}_cmds.c
+#                             the command tables, by lib/ss/ct_c.{sed,awk}
+#   lib/ext2fs/crc32c_table.h by gen_crc32ctable, a build-host program
+#   misc/default_profile.c    mke2fs.conf.in, by misc/profile-to-c.awk
+#
+# Libraries (static archives in build/, linked into the programs):
+#   libcom_err  error tables and messages
+#   libss       the debugfs command line
+#   libe2p      superblock/feature printing and parsing
+#   libsupport  profiles (mke2fs.conf/e2fsck.conf), quota files, helpers
+#   libext2fs   the file system library
+#
+# Programs (build/), all installed to /sbin:
+#   mke2fs     (+ mkfs.ext2, mkfs.ext3, mkfs.ext4; /etc/mke2fs.conf)
+#   e2fsck     (+ fsck.ext2, fsck.ext3, fsck.ext4)
+#   tune2fs    (+ e2label)
+#   dumpe2fs, resize2fs, debugfs, badblocks
+# blkid and findfs are util-linux's.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+AR = ar
+AWK = awk
+HOSTCC = gcc
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+UL_DIR = ../util-linux-2.42.4
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+G := $(B)/gen
+O := $(B)/obj
+
+VERSION := 1.47.4
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.  Include order as upstream's
+# "-I. -I../lib -I$(srcdir)/../lib": the generated headers first (with the
+# util-linux uuid/ and blkid/ headers among them), then the sources.
+CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE -fno-common -pthread \
+         -D_GNU_SOURCE -D__LIKEOS__ -DHAVE_CONFIG_H \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -I. -I$(G) -I$(S)/lib
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Wall -Werror=implicit-function-declaration -Werror=implicit-int
+# Upstream code, upstream warnings: they are not this port's to fix.
+CFLAGS += -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
+          -Wno-unused-variable -Wno-unused-but-set-variable -Wno-pointer-sign
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+# ---- libraries ---------------------------------------------------------------
+
+ET_SRC = $(addprefix lib/et/,error_message.c et_name.c init_et.c com_err.c \
+	com_right.c)
+
+SS_SRC = $(addprefix lib/ss/,invocation.c help.c execute_cmd.c listen.c \
+	parse.c error.c prompt.c request_tbl.c list_rqs.c pager.c requests.c \
+	data.c get_readline.c)
+SS_GEN = lib/ss/ss_err.c lib/ss/std_rqs.c
+
+E2P_SRC = $(addprefix lib/e2p/,feature.c fgetflags.c fsetflags.c \
+	fgetversion.c fsetversion.c getflags.c getversion.c hashstr.c iod.c \
+	ls.c ljs.c mntopts.c parse_num.c pe.c pf.c ps.c setflags.c \
+	setversion.c uuid.c ostype.c percent.c crypto_mode.c fgetproject.c \
+	fsetproject.c encoding.c errcode.c)
+
+SUPPORT_SRC = $(addprefix lib/support/,cstring.c mkquota.c plausible.c \
+	profile.c parse_qtype.c print_fs_flags.c profile_helpers.c quotaio.c \
+	quotaio_v2.c quotaio_tree.c dict.c devname.c)
+SUPPORT_GEN = lib/support/prof_err.c
+
+# OS_IO_FILE is unix_io; the debugfs, resize, e2image and test_io parts are
+# configured in, as upstream's defaults have them.
+EXT2FS_SRC = $(addprefix lib/ext2fs/,bb_compat.c inode_io.c write_bb_file.c \
+	dupfs.c imager.c test_io.c \
+	alloc.c alloc_sb.c alloc_stats.c alloc_tables.c atexit.c badblocks.c \
+	bb_inode.c bitmaps.c bitops.c blkmap64_ba.c blkmap64_rb.c blknum.c \
+	block.c bmap.c check_desc.c closefs.c crc16.c crc32c.c csum.c \
+	dblist.c dblist_dir.c dirblock.c dirhash.c dir_iterate.c expanddir.c \
+	ext_attr.c extent.c fallocate.c fileio.c finddev.c flushb.c freefs.c \
+	gen_bitmap.c gen_bitmap64.c get_num_dirs.c get_pathname.c getenv.c \
+	getsize.c getsectsize.c hashmap.c i_block.c icount.c ind_block.c \
+	initialize.c inline.c inline_data.c inode.c io_manager.c ismounted.c \
+	link.c llseek.c lookup.c mkdir.c mkjournal.c mmp.c namei.c native.c \
+	newdir.c nls_utf8.c openfs.c orphan.c progress.c punch.c qcow2.c \
+	read_bb.c read_bb_file.c res_gdt.c rw_bitmaps.c sha512.c swapfs.c \
+	symlink.c tdb.c undo_io.c unix_io.c sparse_io.c unlink.c valid_blk.c \
+	version.c rbtree.c)
+EXT2FS_GEN = lib/ext2fs/ext2_err.c
+
+obj = $(addprefix $(O)/,$(1:.c=.o))
+
+LIBCOM_ERR = $(B)/libcom_err.a
+LIBSS      = $(B)/libss.a
+LIBE2P     = $(B)/libe2p.a
+LIBSUPPORT = $(B)/libsupport.a
+LIBEXT2FS  = $(B)/libext2fs.a
+
+# util-linux's libblkid and libuuid, and the helpers they are built on.
+UL_LIBS = $(UL_DIR)/build/libblkid.a $(UL_DIR)/build/libuuid.a \
+          $(UL_DIR)/build/libcommon.a
+
+# Every e2fsprogs archive, in one group: libext2fs and libcom_err, libsupport
+# and libext2fs call each other.
+E2_LIBS = --start-group $(LIBSUPPORT) $(LIBEXT2FS) $(LIBE2P) $(LIBSS) \
+          $(LIBCOM_ERR) --end-group $(UL_LIBS)
+E2_DEPS = $(LIBSUPPORT) $(LIBEXT2FS) $(LIBE2P) $(LIBSS) $(LIBCOM_ERR) $(UL_LIBS)
+
+# Headers the build generates; every object waits for them.
+GEN_HDRS = $(G)/ext2fs/ext2_types.h $(G)/ext2fs/ext2_err.h \
+           $(G)/ext2fs/crc32c_table.h $(G)/ss/ss_err.h \
+           $(G)/support/prof_err.h $(G)/uuid/uuid.h $(G)/blkid/blkid.h
+
+# Per-directory include paths: upstream compiles each directory with its
+# build directory first ("-I."), which is where that directory's generated
+# headers are.
+$(O)/lib/ext2fs/%.o:  XFLAGS = -I$(G)/ext2fs
+$(O)/lib/ss/%.o:      XFLAGS = -I$(G)/ss
+$(O)/lib/support/%.o: XFLAGS = -I$(G)/support
+$(O)/e2fsck/%.o:      XFLAGS = -I$(S)/e2fsck
+$(O)/resize/%.o:      XFLAGS = -I$(S)/resize
+# misc: journal.c, recovery.c, revoke.c are built for tune2fs with
+# JOURNAL_CFLAGS (-I../e2fsck -DDEBUGFS -I.).
+$(O)/misc/%.o:        XFLAGS = -I$(S)/misc
+$(O)/misc/journal.o $(O)/misc/recovery.o $(O)/misc/revoke.o: \
+                      XFLAGS = -I$(S)/e2fsck -DDEBUGFS -I$(S)/misc
+# debugfs: LOCAL_CFLAGS = -I../e2fsck -DDEBUGFS, plus -I. for the files it
+# takes from misc and e2fsck.
+$(O)/debugfs/%.o:     XFLAGS = -I$(S)/e2fsck -DDEBUGFS -I$(S)/debugfs
+
+# ---- programs ----------------------------------------------------------------
+
+MKE2FS_OBJ = $(call obj,misc/mke2fs.c misc/util.c misc/mk_hugefiles.c \
+	misc/create_inode.c misc/create_inode_libarchive.c) \
+	$(O)/misc/default_profile.o
+TUNE2FS_OBJ = $(call obj,misc/tune2fs.c misc/util.c misc/journal.c \
+	misc/recovery.c misc/revoke.c)
+DUMPE2FS_OBJ = $(O)/misc/dumpe2fs.o
+BADBLOCKS_OBJ = $(O)/misc/badblocks.o
+E2FSCK_OBJ = $(call obj,$(addprefix e2fsck/,unix.c e2fsck.c super.c \
+	pass1.c pass1b.c pass2.c pass3.c pass4.c pass5.c journal.c \
+	badblocks.c util.c dirinfo.c dx_dirinfo.c ehandler.c problem.c \
+	message.c quota.c recovery.c region.c revoke.c ea_refcount.c \
+	rehash.c logfile.c sigcatcher.c readahead.c extents.c \
+	encrypted_files.c))
+RESIZE_OBJ = $(call obj,$(addprefix resize/,extent.c resize2fs.c main.c \
+	online.c resource_track.c sim_progress.c))
+DEBUGFS_OBJ = $(call obj,$(addprefix debugfs/,debug_cmds.c debugfs.c util.c \
+	ncheck.c icheck.c ls.c lsdel.c dump.c set_fields.c logdump.c htree.c \
+	unused.c e2freefrag.c filefrag.c extent_cmds.c extent_inode.c zap.c \
+	create_inode.c create_inode_libarchive.c quota.c xattrs.c journal.c \
+	revoke.c recovery.c do_journal.c do_orphan.c))
+
+PROGS = mke2fs e2fsck tune2fs dumpe2fs resize2fs debugfs badblocks
+TARGETS = $(addprefix $(B)/,$(PROGS)) $(B)/mke2fs.conf
+
+# The tree first: the pattern rules below can only match files that exist.
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): e2fsprogs-$(VERSION).tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+# ---- generated files ---------------------------------------------------------
+
+# What configure substitutes: the type sizes, and the two header fragments it
+# assembles (the fixed-width typedef spellings and the public config).
+$(G)/ext2fs/ext2_types.h: $(S)/lib/ext2fs/ext2_types.h.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	$(AWK) '/@ASM_TYPES_HEADER@/ { \
+		print "#define __S8_TYPEDEF __signed__ char"; \
+		print "#define __U8_TYPEDEF unsigned char"; \
+		print "#define __S16_TYPEDEF __signed__ short"; \
+		print "#define __U16_TYPEDEF unsigned short"; \
+		print "#define __S32_TYPEDEF __signed__ int"; \
+		print "#define __U32_TYPEDEF unsigned int"; \
+		print "#define __S64_TYPEDEF __signed__ long long"; \
+		print "#define __U64_TYPEDEF unsigned long long"; next } \
+	/@PUBLIC_CONFIG_HEADER@/ { \
+		print "/* These defines are needed for the public ext2fs.h header file */"; \
+		print "#define HAVE_SYS_TYPES_H 1"; \
+		print "#define SIZEOF_TIME_T 8"; \
+		print "#undef WORDS_BIGENDIAN"; next } \
+	{ gsub(/@SIZEOF_INT@/, "4"); gsub(/@SIZEOF_SHORT@/, "2"); \
+	  gsub(/@SIZEOF_LONG@/, "8"); gsub(/@SIZEOF_LONG_LONG@/, "8"); print }' \
+		$< >$@.tmp
+	mv $@.tmp $@
+
+$(G)/ext2fs/ext2_err.et: $(S)/lib/ext2fs/ext2_err.et.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/@E2FSPROGS_VERSION@/$(VERSION)/' $< >$@
+
+# compile_et: the header and the table from one .et file.
+define compile_et
+	@mkdir -p $(dir $@)
+	LC_ALL=C $(AWK) -f $(S)/lib/et/et_h.awk "outfile=$(basename $@).h" \
+		"outfn=$(notdir $(basename $@)).h" $<
+	LC_ALL=C $(AWK) -f $(S)/lib/et/et_c.awk "outfile=$(basename $@).c" \
+		"outfn=$(notdir $(basename $@)).c" $<
+endef
+
+$(G)/ext2fs/ext2_err.h $(G)/ext2fs/ext2_err.c &: $(G)/ext2fs/ext2_err.et
+	$(compile_et)
+$(G)/ss/ss_err.h $(G)/ss/ss_err.c &: $(S)/lib/ss/ss_err.et $(SRC_STAMP)
+	$(compile_et)
+$(G)/support/prof_err.h $(G)/support/prof_err.c &: $(S)/lib/support/prof_err.et $(SRC_STAMP)
+	$(compile_et)
+
+# mk_cmds: a command table from one .ct file.
+define mk_cmds
+	@mkdir -p $(dir $@)
+	LC_ALL=C sed -f $(S)/lib/ss/ct_c.sed $< | \
+		LC_ALL=C $(AWK) -f $(S)/lib/ss/ct_c.awk \
+		"rootname=$(basename $<)" "outfile=$@.tmp" -
+	@if grep -q '^#__ERROR_IN_FILE' $@.tmp; then \
+		rm -f $@.tmp; echo "mk_cmds: errors in $<" >&2; exit 1; fi
+	mv $@.tmp $@
+endef
+
+$(G)/ss/std_rqs.c: $(S)/lib/ss/std_rqs.ct $(SRC_STAMP)
+	$(mk_cmds)
+$(G)/debugfs/debug_cmds.c: $(S)/debugfs/debug_cmds.ct $(SRC_STAMP)
+	$(mk_cmds)
+$(G)/debugfs/extent_cmds.c: $(S)/debugfs/extent_cmds.ct $(SRC_STAMP)
+	$(mk_cmds)
+
+# The CRC32C slice tables, by a program run on the build host.
+$(B)/host/gen_crc32ctable: $(S)/lib/ext2fs/gen_crc32ctable.c $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -O2 -I$(S)/lib/ext2fs -o $@ $<
+
+$(G)/ext2fs/crc32c_table.h: $(B)/host/gen_crc32ctable
+	@mkdir -p $(dir $@)
+	$< >$@.tmp
+	mv $@.tmp $@
+
+# mke2fs's built-in profile, used when /etc/mke2fs.conf is missing; the
+# same text is installed as /etc/mke2fs.conf.
+$(B)/mke2fs.conf: $(S)/misc/mke2fs.conf.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(G)/misc/default_profile.c: $(B)/mke2fs.conf $(S)/misc/profile-to-c.awk
+	@mkdir -p $(dir $@)
+	$(AWK) -f $(S)/misc/profile-to-c.awk <$< >$@.tmp
+	mv $@.tmp $@
+
+# util-linux's public headers, at the include paths e2fsprogs uses for them.
+$(G)/uuid/uuid.h: $(UL_DIR)/src/libuuid/src/uuid.h
+	@mkdir -p $(dir $@)
+	cp $< $@
+$(G)/blkid/blkid.h: $(UL_DIR)/build/gen/blkid.h
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+# ---- objects -----------------------------------------------------------------
+
+$(O)/%.o: $(S)/%.c $(SRC_STAMP) config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+
+$(O)/%.o: $(G)/%.c config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+
+# The generated sources keep the directory of the library they belong to.
+$(O)/lib/ext2fs/ext2_err.o: $(G)/ext2fs/ext2_err.c config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+$(O)/lib/ss/%.o: $(G)/ss/%.c config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+$(O)/lib/support/prof_err.o: $(G)/support/prof_err.c config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+
+# Sources shared between directories, compiled once per program with that
+# program's flags (upstream's explicit rules).
+$(O)/misc/journal.o: $(S)/debugfs/journal.c $(SRC_STAMP) config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+$(O)/misc/recovery.o $(O)/misc/revoke.o: $(O)/misc/%.o: $(S)/e2fsck/%.c $(SRC_STAMP) config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+$(O)/debugfs/recovery.o $(O)/debugfs/revoke.o: $(O)/debugfs/%.o: $(S)/e2fsck/%.c $(SRC_STAMP) config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+$(O)/debugfs/create_inode.o $(O)/debugfs/create_inode_libarchive.o $(O)/debugfs/e2freefrag.o: $(O)/debugfs/%.o: $(S)/misc/%.c $(SRC_STAMP) config.h $(GEN_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+
+# ---- archives ----------------------------------------------------------------
+
+$(LIBCOM_ERR): $(call obj,$(ET_SRC))
+$(LIBSS):      $(call obj,$(SS_SRC) $(SS_GEN))
+$(LIBE2P):     $(call obj,$(E2P_SRC))
+$(LIBSUPPORT): $(call obj,$(SUPPORT_SRC) $(SUPPORT_GEN))
+$(LIBEXT2FS):  $(call obj,$(EXT2FS_SRC) $(EXT2FS_GEN))
+
+$(B)/lib%.a:
+	@rm -f $@
+	$(AR) rcs $@ $^
+
+# ---- links -------------------------------------------------------------------
+
+LINK = $(LD) $(LDFLAGS) $(CRT1) $(filter %.o,$(filter-out $(CRT1),$^)) \
+       $(E2_LIBS) $(LIBS) -o $@
+
+$(B)/mke2fs: $(MKE2FS_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+$(B)/tune2fs: $(TUNE2FS_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+$(B)/dumpe2fs: $(DUMPE2FS_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+$(B)/badblocks: $(BADBLOCKS_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+$(B)/e2fsck: $(E2FSCK_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+$(B)/resize2fs: $(RESIZE_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+$(B)/debugfs: $(DEBUGFS_OBJ) $(E2_DEPS) $(CRT1)
+	$(LINK)
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

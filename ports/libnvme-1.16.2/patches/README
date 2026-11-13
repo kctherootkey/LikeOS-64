@@ -1,0 +1,10 @@
+Patches applied to the pristine libnvme-1.16.2 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+None so far: the library builds unchanged against the LikeOS C library
+(<linux/types.h>, ENOKEY/EBADSLT, SIOCPROTOPRIVATE come from there) with
+the answers in ../config.h.
+
+Copyright (C) 2026 The LikeOS Project

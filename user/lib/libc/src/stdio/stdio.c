@@ -1067,48 +1067,392 @@ static int num_to_str(unsigned long long num, char *buf, int base,
 }
 
 /*
- * Sign of a double, including negative zero.
+ * Floating-point conversions: %f %F %e %E %g %G, double and long double.
  *
- * `val < 0.0` is FALSE for -0.0, so every float conversion here used to drop
- * its sign: printf("%f", -0.0) produced "0.000000" where C, and every other
- * implementation, produce "-0.000000".  The sign of zero is not a curiosity --
- * it is how a computation reports which side it underflowed from, and dropping
- * it silently discards that.
+ * The value is taken apart into its bits -- sign, an integer mantissa m and
+ * a binary exponent e2, value = m * 2^e2 -- and expanded into decimal with
+ * integer arithmetic only, in limbs of nine decimal digits:
+ *
+ *   integer part   I = m * 2^e2 (e2 >= 0), or m >> -e2
+ *   fraction       r / 2^k = r * 5^k / 10^k, so its k digits are those of
+ *                  D = r * 5^k, zero-filled on the left to k places
+ *
+ * Every digit printed is then the true digit of the value, whatever its
+ * magnitude and whatever the precision, and the rounding at the last printed
+ * place is exact: to nearest, a tie to the even digit.
+ *
+ * The conversions this replaces scaled the value through an unsigned long
+ * long.  Anything from 2^64 up converted out of range -- "%.0f" of 1e20
+ * printed "1" -- the digits of %e came from repeated division by ten and
+ * drifted in the last places, precisions above 19 overflowed the power of
+ * ten, and a long double was narrowed to double first, so "%.0Lf" of
+ * 2^63 - 1 printed 9223372036854775808.  Infinities and NaNs were run
+ * through the same arithmetic.
  */
-static int dbl_is_neg(double v)
+
+/* Limbs for the longest expansion: the fraction of the smallest long double
+ * (k = 16445, r < 2^64: at most 11514 digits) or the integer part of the
+ * largest (4933 digits). */
+#define FPD_BASE 1000000000u
+#define FPD_LIMBS 1284
+
+static const unsigned int fpd_p10[10] = { 1,	   10,	    100,     1000,
+					  10000,   100000,  1000000, 10000000,
+					  100000000, 1000000000 };
+
+enum { FP_ZERO, FP_FINITE, FP_INF, FP_NAN };
+
+struct fp_val {
+	int neg; /* sign bit (-0.0 and -nan included) */
+	int cls;
+	unsigned long long m;
+	int e2;
+};
+
+static void fp_decode_dbl(struct fp_val *v, double d)
 {
-	union {
-		double d;
-		unsigned long long u;
-	} b = { .d = v };
-	return (int)(b.u >> 63);
+	unsigned long long b;
+	int ex;
+
+	memcpy(&b, &d, sizeof(b));
+	v->neg = (int)(b >> 63);
+	ex = (int)((b >> 52) & 0x7ff);
+	v->m = b & ((1ULL << 52) - 1);
+	if (ex == 0x7ff) {
+		v->cls = v->m ? FP_NAN : FP_INF;
+		return;
+	}
+	if (ex == 0) {
+		v->cls = v->m ? FP_FINITE : FP_ZERO;
+		v->e2 = 1 - 1075;
+		return;
+	}
+	v->cls = FP_FINITE;
+	v->m |= 1ULL << 52;
+	v->e2 = ex - 1075;
 }
 
-/*
- * Round a scaled fraction to an integer, breaking exact ties to even.
- *
- * The obvious `(unsigned long long)(x + 0.5)` rounds halves AWAY from zero,
- * which is not what C does: the conversion follows the current rounding
- * direction, and that is round-to-nearest-even.  The difference shows on every
- * exactly-representable tie -- "%.0f" of 0.5 came out as 1 rather than 0, and
- * "%.2f" of 0.125 as 0.13 rather than 0.12 -- so any value landing exactly
- * halfway printed one ulp high, consistently and in the same direction.
- *
- * `int_part` decides the tie when there are no fractional digits to keep, e.g.
- * "%.0f", where the digit being rounded is the last integer digit: 0.5 goes to
- * 0 and 1.5 goes to 2, both to even.
- */
-static unsigned long long round_half_even(double scaled, int have_frac_digits,
-					  unsigned long long int_part)
+/* x86-64 long double: 64-bit mantissa with an explicit integer bit, then
+ * sign and a 15-bit exponent. */
+static void fp_decode_ldbl(struct fp_val *v, long double ld)
 {
-	unsigned long long iv = (unsigned long long)scaled;
-	double rem = scaled - (double)iv;
+	struct {
+		unsigned long long m;
+		unsigned short se;
+	} b;
+	int ex;
 
-	if (rem > 0.5)
-		return iv + 1;
-	if (rem < 0.5)
-		return iv;
-	return ((have_frac_digits ? iv : int_part) & 1ULL) ? iv + 1 : iv;
+	memcpy(&b, &ld, 10);
+	v->neg = b.se >> 15;
+	ex = b.se & 0x7fff;
+	v->m = b.m;
+	if (ex == 0x7fff) {
+		v->cls = (b.m << 1) ? FP_NAN : FP_INF;
+		return;
+	}
+	v->cls = b.m ? FP_FINITE : FP_ZERO;
+	v->e2 = (ex ? ex : 1) - 16383 - 63;
+}
+
+struct fpd {
+	unsigned int big[FPD_LIMBS]; /* I when e2 >= 0, else D */
+	unsigned int small[3]; /* I when e2 < 0 (below 2^64) */
+	const unsigned int *il; /* integer part, least significant first */
+	int ni;
+	const unsigned int *fl; /* D, least significant first */
+	int nf;
+	int k; /* digits of the fraction */
+	int msd; /* weight of the leading digit (0 for zero) */
+};
+
+static int fpd_set(unsigned int *l, unsigned long long v)
+{
+	int n = 0;
+
+	while (v) {
+		l[n++] = (unsigned int)(v % FPD_BASE);
+		v /= FPD_BASE;
+	}
+	return n;
+}
+
+/* l *= f, f < 2^32 */
+static int fpd_mul(unsigned int *l, int n, unsigned int f)
+{
+	unsigned long long c = 0;
+
+	for (int i = 0; i < n; i++) {
+		c += (unsigned long long)l[i] * f;
+		l[i] = (unsigned int)(c % FPD_BASE);
+		c /= FPD_BASE;
+	}
+	while (c && n < FPD_LIMBS) {
+		l[n++] = (unsigned int)(c % FPD_BASE);
+		c /= FPD_BASE;
+	}
+	return n;
+}
+
+static int fpd_ndig(const unsigned int *l, int n)
+{
+	int d = 0;
+
+	if (!n)
+		return 0;
+	while (d < 9 && l[n - 1] >= fpd_p10[d])
+		d++;
+	return 9 * (n - 1) + d;
+}
+
+static void fpd_expand(struct fpd *d, const struct fp_val *v)
+{
+	unsigned long long m = v->m, r;
+	int k;
+
+	d->il = d->fl = d->big;
+	d->ni = d->nf = d->k = 0;
+	if (v->cls != FP_FINITE) {
+		d->msd = 0;
+		return;
+	}
+	if (v->e2 >= 0) {
+		int e = v->e2;
+
+		d->ni = fpd_set(d->big, m);
+		for (; e > 0; e -= 29)
+			d->ni = fpd_mul(d->big, d->ni,
+					1u << (e > 29 ? 29 : e));
+		d->msd = fpd_ndig(d->il, d->ni) - 1;
+		return;
+	}
+	k = -v->e2;
+	if (k < 64) {
+		d->il = d->small;
+		d->ni = fpd_set(d->small, m >> k);
+		r = m & ((1ULL << k) - 1);
+	} else {
+		r = m;
+	}
+	if (r) {
+		int t = __builtin_ctzll(r);
+
+		r >>= t;
+		k -= t;
+		d->k = k;
+		d->nf = fpd_set(d->big, r);
+		for (; k > 0; k -= 13) {
+			unsigned int f = 1;
+
+			for (int i = 0; i < (k > 13 ? 13 : k); i++)
+				f *= 5;
+			d->nf = fpd_mul(d->big, d->nf, f);
+		}
+	}
+	if (d->ni)
+		d->msd = fpd_ndig(d->il, d->ni) - 1;
+	else
+		d->msd = fpd_ndig(d->fl, d->nf) - d->k - 1;
+}
+
+static int fpd_ldig(const unsigned int *l, int n, int p)
+{
+	if (p < 0 || p / 9 >= n)
+		return 0;
+	return (int)(l[p / 9] / fpd_p10[p % 9] % 10);
+}
+
+/* The digit of weight 10^w. */
+static int fpd_digit(const struct fpd *d, int w)
+{
+	return w >= 0 ? fpd_ldig(d->il, d->ni, w) :
+			fpd_ldig(d->fl, d->nf, d->k + w);
+}
+
+/* Any nonzero digit among positions [0, lim). */
+static int fpd_nz_low(const unsigned int *l, int n, int lim)
+{
+	int full;
+
+	if (lim <= 0)
+		return 0;
+	full = lim / 9;
+	for (int i = 0; i < full && i < n; i++)
+		if (l[i])
+			return 1;
+	return full < n && l[full] % fpd_p10[lim % 9] != 0;
+}
+
+/* Any nonzero digit of weight below 10^w. */
+static int fpd_nz_below(const struct fpd *d, int w)
+{
+	if (w > 0 && fpd_nz_low(d->il, d->ni, w))
+		return 1;
+	return fpd_nz_low(d->fl, d->nf, d->k + w);
+}
+
+/* Rounding at the digit of weight 10^cut: to nearest, a tie to even.  On a
+ * round up the digit of weight w0 grows by one and those below it, down to
+ * the cut, become 0. */
+struct fpr {
+	int cut;
+	int up;
+	int w0;
+};
+
+static void fpd_round(const struct fpd *d, int cut, struct fpr *r)
+{
+	int rd = fpd_digit(d, cut - 1);
+
+	r->cut = cut;
+	r->up = rd > 5 || (rd == 5 && (fpd_nz_below(d, cut - 1) ||
+				       (fpd_digit(d, cut) & 1)));
+	r->w0 = cut;
+	if (r->up)
+		while (fpd_digit(d, r->w0) == 9)
+			r->w0++;
+}
+
+static int fpd_rdigit(const struct fpd *d, const struct fpr *r, int w)
+{
+	if (w < r->cut)
+		return 0;
+	if (!r->up || w > r->w0)
+		return fpd_digit(d, w);
+	return w == r->w0 ? fpd_digit(d, w) + 1 : 0;
+}
+
+/* The leading digit's weight after rounding. */
+static int fpd_top(const struct fpd *d, const struct fpr *r)
+{
+	return r->up && r->w0 > d->msd ? r->w0 : d->msd;
+}
+
+/* Format one value; returns the new output position (every character is
+ * counted, those past `cap' are not stored -- vsnprintf_body's contract). */
+static __attribute__((noinline)) size_t fp_format(char *str, size_t cap, size_t pos,
+			const struct fp_val *v, char conv, int width, int prec,
+			int fl_minus, int fl_zero, int fl_plus, int fl_space,
+			int fl_hash)
+{
+	struct fpd d;
+	struct fpr r;
+	int upper = conv == 'F' || conv == 'E' || conv == 'G';
+	char sign = v->neg ? '-' : fl_plus ? '+' : fl_space ? ' ' : 0;
+	int hi, nint, nfrac, point, elen = 0, total, pad;
+	char ebuf[8];
+
+#define FP_PUT(c)                         \
+	do {                              \
+		char fp_c_ = (char)(c);   \
+		if (pos < cap)            \
+			str[pos] = fp_c_; \
+		pos++;                    \
+	} while (0)
+
+	if (v->cls == FP_INF || v->cls == FP_NAN) {
+		const char *t = v->cls == FP_INF ? (upper ? "INF" : "inf") :
+						   (upper ? "NAN" : "nan");
+
+		total = 3 + (sign ? 1 : 0);
+		pad = width > total ? width - total : 0;
+		if (!fl_minus)
+			for (int p = 0; p < pad; p++)
+				FP_PUT(' ');
+		if (sign)
+			FP_PUT(sign);
+		for (int i = 0; i < 3; i++)
+			FP_PUT(t[i]);
+		if (fl_minus)
+			for (int p = 0; p < pad; p++)
+				FP_PUT(' ');
+		return pos;
+	}
+
+	fpd_expand(&d, v);
+	if (prec < 0)
+		prec = 6;
+	if (conv == 'g' || conv == 'G') {
+		int x;
+
+		if (prec == 0)
+			prec = 1;
+		/* The exponent %e would print with prec - 1 digits after the
+		 * point, after its rounding. */
+		fpd_round(&d, d.msd - (prec - 1), &r);
+		x = fpd_top(&d, &r);
+		if (x < prec && x >= -4) {
+			conv = 'f';
+			prec = prec - 1 - x;
+			fpd_round(&d, -prec, &r);
+		} else {
+			conv = 'e';
+			prec = prec - 1;
+		}
+		/* Trailing zeros of the fraction go, unless '#'. */
+		if (!fl_hash) {
+			int low = conv == 'f' ? -prec : fpd_top(&d, &r) - prec;
+
+			while (prec > 0 && fpd_rdigit(&d, &r, low) == 0) {
+				prec--;
+				low++;
+			}
+		}
+	} else if (conv == 'e' || conv == 'E') {
+		conv = 'e';
+		fpd_round(&d, d.msd - prec, &r);
+	} else {
+		conv = 'f';
+		fpd_round(&d, -prec, &r);
+	}
+
+	if (conv == 'f') {
+		hi = fpd_top(&d, &r);
+		if (hi < 0)
+			hi = 0;
+		nint = hi + 1;
+	} else {
+		int x = fpd_top(&d, &r), ax = x < 0 ? -x : x, n = 0;
+		char t[8];
+
+		hi = x;
+		nint = 1;
+		ebuf[elen++] = upper ? 'E' : 'e';
+		ebuf[elen++] = x < 0 ? '-' : '+';
+		do {
+			t[n++] = (char)('0' + ax % 10);
+			ax /= 10;
+		} while (ax);
+		if (n < 2)
+			t[n++] = '0';
+		while (n)
+			ebuf[elen++] = t[--n];
+	}
+	nfrac = prec;
+	point = nfrac > 0 || fl_hash;
+
+	total = (sign ? 1 : 0) + nint + point + nfrac + elen;
+	pad = width > total ? width - total : 0;
+	if (!fl_minus && !fl_zero)
+		for (int p = 0; p < pad; p++)
+			FP_PUT(' ');
+	if (sign)
+		FP_PUT(sign);
+	if (!fl_minus && fl_zero)
+		for (int p = 0; p < pad; p++)
+			FP_PUT('0');
+	for (int i = 0; i < nint; i++)
+		FP_PUT('0' + fpd_rdigit(&d, &r, hi - i));
+	if (point)
+		FP_PUT('.');
+	for (int i = 0; i < nfrac; i++)
+		FP_PUT('0' + fpd_rdigit(&d, &r, hi - nint - i));
+	for (int i = 0; i < elen; i++)
+		FP_PUT(ebuf[i]);
+	if (fl_minus)
+		for (int p = 0; p < pad; p++)
+			FP_PUT(' ');
+#undef FP_PUT
+	return pos;
 }
 
 /* Store one character if it fits, and count it either way.
@@ -1259,8 +1603,8 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 		} else if (*format == 'L') {
 			/* long double.  It MUST be consumed as a long double
 			 * (16 bytes here, not 8) or every later argument is
-			 * read from the wrong offset; the value is then
-			 * narrowed to double for formatting. */
+			 * read from the wrong offset; it is formatted with
+			 * its full precision (fp_format). */
 			format++;
 			ldbl = 1;
 		}
@@ -1660,397 +2004,20 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 
 		/* ---- floating-point ---- */
 		case 'f':
-		case 'F': {
-			double val = ldbl ?
-					     (double)va_arg(ap, long double) :
-					     va_arg(ap, double);
-			int fprec = (prec < 0) ? 6 : prec;
-
-			/* Handle negative / sign (negative zero included) */
-			int is_neg = dbl_is_neg(val);
-			if (is_neg)
-				val = -val;
-
-			/* Separate integer and fractional parts.
-             * Multiply fractional part by 10^fprec and round. */
-			unsigned long long int_part = (unsigned long long)val;
-			double frac = val - (double)int_part;
-
-			/* Build the power-of-ten multiplier for the fractional digits */
-			unsigned long long fmul = 1;
-			for (int i = 0; i < fprec; i++)
-				fmul *= 10;
-
-			unsigned long long frac_val = round_half_even(
-				frac * (double)fmul, fprec > 0, int_part);
-			/* Handle rounding overflow (e.g. 9.9999... rounds up) */
-			if (frac_val >= fmul) {
-				frac_val = 0;
-				int_part++;
-			}
-
-			/* Convert integer part to string */
-			char ibuf[24];
-			int ilen = 0;
-			if (int_part == 0) {
-				ibuf[ilen++] = '0';
-			} else {
-				char tmp[24];
-				int ti = 0;
-				unsigned long long v = int_part;
-				while (v > 0) {
-					tmp[ti++] = '0' + (char)(v % 10);
-					v /= 10;
-				}
-				while (ti > 0)
-					ibuf[ilen++] = tmp[--ti];
-			}
-
-			/* Convert fractional part to string (zero-padded to fprec width) */
-			char fbuf[24];
-			if (fprec > 0) {
-				for (int i = fprec - 1; i >= 0; i--) {
-					fbuf[i] = '0' + (char)(frac_val % 10);
-					frac_val /= 10;
-				}
-			}
-
-			/* Total output length: sign + int + '.' + frac */
-			char sign = 0;
-			if (is_neg)
-				sign = '-';
-			else if (fl_plus)
-				sign = '+';
-			else if (fl_space)
-				sign = ' ';
-
-			int total = (sign ? 1 : 0) + ilen +
-				    (fprec > 0 ? 1 + fprec : 0);
-			int pad = (width > total) ? width - total : 0;
-
-			if (!fl_minus && !fl_zero)
-				for (int p = 0; p < pad; p++)
-					SP_PUT(' ');
-			if (sign)
-				SP_PUT(sign);
-			if (!fl_minus && fl_zero)
-				for (int p = 0; p < pad; p++)
-					SP_PUT('0');
-			for (int i = 0; i < ilen; i++)
-				SP_PUT(ibuf[i]);
-			if (fprec > 0) {
-				SP_PUT('.');
-				for (int i = 0; i < fprec;
-				     i++)
-					SP_PUT(fbuf[i]);
-			}
-			if (fl_minus)
-				for (int p = 0; p < pad; p++)
-					SP_PUT(' ');
-
-			format++;
-			continue;
-		}
-
+		case 'F':
 		case 'e':
-		case 'E': {
-			double val = ldbl ?
-					     (double)va_arg(ap, long double) :
-					     va_arg(ap, double);
-			int fprec = (prec < 0) ? 6 : prec;
-			int is_neg = dbl_is_neg(val); /* -0.0 counts */
-			if (is_neg)
-				val = -val;
-
-			/* Compute exponent: normalize val to [1.0, 10.0) */
-			int exponent = 0;
-			if (val != 0.0) {
-				while (val >= 10.0) {
-					val /= 10.0;
-					exponent++;
-				}
-				while (val < 1.0) {
-					val *= 10.0;
-					exponent--;
-				}
-			}
-
-			/* Now val is in [1.0, 10.0). Separate integer and fraction */
-			unsigned long long int_digit = (unsigned long long)val;
-			double frac = val - (double)int_digit;
-			unsigned long long fmul = 1;
-			for (int i = 0; i < fprec; i++)
-				fmul *= 10;
-			unsigned long long frac_val = round_half_even(
-				frac * (double)fmul, fprec > 0, int_digit);
-			if (frac_val >= fmul) {
-				frac_val = 0;
-				int_digit++;
-				if (int_digit >= 10) {
-					int_digit = 1;
-					exponent++;
-				}
-			}
-
-			char sign = 0;
-			if (is_neg)
-				sign = '-';
-			else if (fl_plus)
-				sign = '+';
-			else if (fl_space)
-				sign = ' ';
-
-			/* Build: [sign] digit '.' frac 'e' [+-] exp (at least 2 digits) */
-			char ebuf[8];
-			int abs_exp = exponent < 0 ? -exponent : exponent;
-			int ei = 0;
-			ebuf[ei++] = (*format == 'E') ? 'E' : 'e';
-			ebuf[ei++] = exponent < 0 ? '-' : '+';
-			if (abs_exp < 10)
-				ebuf[ei++] = '0';
-			{
-				char tmp[8];
-				int ti = 0;
-				int ae = abs_exp;
-				if (ae == 0) {
-					tmp[ti++] = '0';
-				} else {
-					while (ae > 0) {
-						tmp[ti++] =
-							'0' + (char)(ae % 10);
-						ae /= 10;
-					}
-				}
-				while (ti > 0)
-					ebuf[ei++] = tmp[--ti];
-			}
-			int elen = ei;
-
-			char fbuf[24];
-			if (fprec > 0) {
-				for (int i = fprec - 1; i >= 0; i--) {
-					fbuf[i] = '0' + (char)(frac_val % 10);
-					frac_val /= 10;
-				}
-			}
-
-			int total = (sign ? 1 : 0) + 1 +
-				    (fprec > 0 ? 1 + fprec : 0) + elen;
-			int pad = (width > total) ? width - total : 0;
-
-			if (!fl_minus && !fl_zero)
-				for (int p = 0; p < pad; p++)
-					SP_PUT(' ');
-			if (sign)
-				SP_PUT(sign);
-			if (!fl_minus && fl_zero)
-				for (int p = 0; p < pad; p++)
-					SP_PUT('0');
-			SP_PUT('0' + (char)int_digit);
-			if (fprec > 0) {
-				SP_PUT('.');
-				for (int i = 0; i < fprec;
-				     i++)
-					SP_PUT(fbuf[i]);
-			}
-			for (int i = 0; i < elen; i++)
-				SP_PUT(ebuf[i]);
-			if (fl_minus)
-				for (int p = 0; p < pad; p++)
-					SP_PUT(' ');
-
-			format++;
-			continue;
-		}
-
+		case 'E':
 		case 'g':
 		case 'G': {
-			/* %g: use %e if exponent < -4 or >= precision, else %f style */
-			double val = ldbl ?
-					     (double)va_arg(ap, long double) :
-					     va_arg(ap, double);
-			int fprec = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
-			int is_neg = dbl_is_neg(val); /* -0.0 counts */
-			if (is_neg)
-				val = -val;
+			struct fp_val fv;
 
-			int exponent = 0;
-			double nval = val;
-			if (nval != 0.0) {
-				while (nval >= 10.0) {
-					nval /= 10.0;
-					exponent++;
-				}
-				while (nval < 1.0) {
-					nval *= 10.0;
-					exponent--;
-				}
-			}
-
-			/* Rounding to fprec significant digits can carry into
-			 * the next decade -- 999.9995 at %.3g becomes 1000 --
-			 * and the style must be chosen from the exponent the
-			 * value will actually PRINT with, not the one it had
-			 * before rounding.  Deciding first yields "1000" where
-			 * the rule (%e once the exponent reaches the precision)
-			 * calls for "1e+03".
-			 *
-			 * Bounded at 17 digits because that is the most a
-			 * double distinguishes, and because 10^18 is the last
-			 * power of ten that fits the counter below. */
-			if (nval != 0.0 && fprec >= 1 && fprec <= 17) {
-				unsigned long long m = 1;
-				for (int i = 0; i < fprec - 1; i++)
-					m *= 10;
-				unsigned long long r = round_half_even(
-					nval * (double)m, fprec > 1,
-					(unsigned long long)nval);
-				if (r >= m * 10)
-					exponent++;
-			}
-
-			char tmp_buf[80];
-			int tlen;
-			if (exponent < -4 || exponent >= fprec) {
-				/* Use %e style with (fprec-1) digits after decimal */
-				int ep = fprec - 1;
-				if (ep < 0)
-					ep = 0;
-				/* Normalize to [1,10) */
-				nval = val;
-				int exp2 = 0;
-				if (nval != 0.0) {
-					while (nval >= 10.0) {
-						nval /= 10.0;
-						exp2++;
-					}
-					while (nval < 1.0) {
-						nval *= 10.0;
-						exp2--;
-					}
-				}
-				unsigned long long idig =
-					(unsigned long long)nval;
-				double fr = nval - (double)idig;
-				unsigned long long fmul = 1;
-				for (int i = 0; i < ep; i++)
-					fmul *= 10;
-				unsigned long long fv = round_half_even(
-					fr * (double)fmul, ep > 0, idig);
-				if (fv >= fmul) {
-					fv = 0;
-					idig++;
-					if (idig >= 10) {
-						idig = 1;
-						exp2++;
-					}
-				}
-				tlen = 0;
-				if (is_neg)
-					tmp_buf[tlen++] = '-';
-				tmp_buf[tlen++] = '0' + (char)idig;
-				/* Strip trailing zeros unless # flag */
-				char fbuf2[24];
-				int flen2 = ep;
-				for (int i = ep - 1; i >= 0; i--) {
-					fbuf2[i] = '0' + (char)(fv % 10);
-					fv /= 10;
-				}
-				if (!fl_hash) {
-					while (flen2 > 0 &&
-					       fbuf2[flen2 - 1] == '0')
-						flen2--;
-				}
-				if (flen2 > 0) {
-					tmp_buf[tlen++] = '.';
-					for (int i = 0; i < flen2; i++)
-						tmp_buf[tlen++] = fbuf2[i];
-				}
-				tmp_buf[tlen++] = (*format == 'G') ? 'E' : 'e';
-				tmp_buf[tlen++] = exp2 < 0 ? '-' : '+';
-				int aexp = exp2 < 0 ? -exp2 : exp2;
-				if (aexp < 10)
-					tmp_buf[tlen++] = '0';
-				{
-					char et[8];
-					int ei2 = 0;
-					int ae2 = aexp;
-					if (ae2 == 0) {
-						et[ei2++] = '0';
-					} else {
-						while (ae2 > 0) {
-							et[ei2++] = '0' +
-								    (char)(ae2 %
-									   10);
-							ae2 /= 10;
-						}
-					}
-					while (ei2 > 0)
-						tmp_buf[tlen++] = et[--ei2];
-				}
-			} else {
-				/* Use %f style with (fprec - 1 - exponent) fractional digits */
-				int fp = fprec - 1 - exponent;
-				if (fp < 0)
-					fp = 0;
-				unsigned long long ipart =
-					(unsigned long long)val;
-				double fr = val - (double)ipart;
-				unsigned long long fmul = 1;
-				for (int i = 0; i < fp; i++)
-					fmul *= 10;
-				unsigned long long fv = round_half_even(
-					fr * (double)fmul, fp > 0, ipart);
-				if (fv >= fmul) {
-					fv = 0;
-					ipart++;
-				}
-				tlen = 0;
-				if (is_neg)
-					tmp_buf[tlen++] = '-';
-				/* Integer part */
-				if (ipart == 0) {
-					tmp_buf[tlen++] = '0';
-				} else {
-					char it[24];
-					int ii = 0;
-					unsigned long long v = ipart;
-					while (v > 0) {
-						it[ii++] = '0' + (char)(v % 10);
-						v /= 10;
-					}
-					while (ii > 0)
-						tmp_buf[tlen++] = it[--ii];
-				}
-				/* Fractional part with trailing-zero stripping */
-				char fbuf2[24];
-				int flen2 = fp;
-				for (int i = fp - 1; i >= 0; i--) {
-					fbuf2[i] = '0' + (char)(fv % 10);
-					fv /= 10;
-				}
-				if (!fl_hash) {
-					while (flen2 > 0 &&
-					       fbuf2[flen2 - 1] == '0')
-						flen2--;
-				}
-				if (flen2 > 0) {
-					tmp_buf[tlen++] = '.';
-					for (int i = 0; i < flen2; i++)
-						tmp_buf[tlen++] = fbuf2[i];
-				}
-			}
-
-			int pad = (width > tlen) ? width - tlen : 0;
-			if (!fl_minus)
-				for (int p = 0; p < pad; p++)
-					SP_PUT(fl_zero ? '0' : ' ');
-			for (int i = 0; i < tlen; i++)
-				SP_PUT(tmp_buf[i]);
-			if (fl_minus)
-				for (int p = 0; p < pad; p++)
-					SP_PUT(' ');
-
+			if (ldbl)
+				fp_decode_ldbl(&fv, va_arg(ap, long double));
+			else
+				fp_decode_dbl(&fv, va_arg(ap, double));
+			pos = fp_format(str, cap, pos, &fv, *format, width, prec,
+					fl_minus, fl_zero, fl_plus, fl_space,
+					fl_hash);
 			format++;
 			continue;
 		}

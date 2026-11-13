@@ -79,9 +79,11 @@ extern "C" {
 #define F_SEAL_GROW         0x0004
 #define F_SEAL_WRITE        0x0008
 #define F_SEAL_FUTURE_WRITE 0x0010
-/* fallocate(): reserve [offset, offset+len).  Mode 0 grows the file;
- * FALLOC_FL_KEEP_SIZE is accepted as a no-op. */
-#define FALLOC_FL_KEEP_SIZE 1
+/* fallocate(): allocate [offset, offset+len) (mode 0, growing the file
+ * unless FALLOC_FL_KEEP_SIZE), punch a hole (FALLOC_FL_PUNCH_HOLE |
+ * FALLOC_FL_KEEP_SIZE) or zero a range (FALLOC_FL_ZERO_RANGE).  The mode
+ * values come from <linux/falloc.h>. */
+#include <linux/falloc.h>
 int fallocate(int fd, int mode, off_t offset, off_t len);
 int posix_fallocate(int fd, off_t offset, off_t len);
 /* POSIX advisory record locking.  Values are the conventional x86-64 ones so

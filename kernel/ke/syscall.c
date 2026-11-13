@@ -371,6 +371,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_clock_nanosleep(a1, a2, a3, a4);
 	case SYS_MREMAP:
 		return sys_mremap(a1, a2, a3, a4, a5);
+	case SYS_MSYNC:
+		return sys_msync(a1, a2, a3);
 	case SYS_EVENTFD2:
 		return sys_eventfd2(a1, a2);
 	case SYS_TIMERFD_CREATE:
@@ -397,6 +399,10 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_fsync(a1);
 	case SYS_FALLOCATE:
 		return sys_fallocate(a1, a2, a3, a4);
+	case SYS_PREADV2:
+		return sys_preadv2(a1, a2, a3, a4, a5);
+	case SYS_PWRITEV2:
+		return sys_pwritev2(a1, a2, a3, a4, a5);
 
 	case SYS_REBOOT:
 		return sys_reboot(a1, a2, a3, a4);

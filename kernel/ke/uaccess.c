@@ -7,16 +7,15 @@
 #include <kernel/mm/memory.h>
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
+#include <kernel/ke/uaccess_range.h>
 
+/* The whole range [ptr, ptr + len) must be user memory: start above the
+ * low guard, end at or below the top of the user half (overflow-safe, see
+ * uaccess_range.h).  Checking only where a range starts let a long enough
+ * length carry it into the kernel half. */
 bool validate_user_ptr(uint64_t ptr, size_t len)
 {
-	if (ptr < 0x10000)
-		return false; // Reject low addresses (NULL deref protection)
-	if (ptr >= 0x7FFFFFFFFFFF)
-		return false; // Beyond user space
-	if (ptr + len < ptr)
-		return false; // Overflow check
-	return true;
+	return user_range_ok(ptr, (uint64_t)len);
 }
 
 // SMAP-aware copy from user space to kernel space
@@ -109,14 +108,18 @@ int user_strnlen(const char *user_str, size_t max_len, size_t *out_len)
 	if (!user_str || !out_len) {
 		return -EFAULT;
 	}
-	// Validate entire potential range first
-	if (!validate_user_ptr((uint64_t)user_str, max_len)) {
+	/* `max_len' is a limit, not the string's size: the scan stops at the
+	 * NUL.  Only the part of it that is user address space is looked at;
+	 * a string still unterminated where user space ends is a bad address,
+	 * one longer than the limit is too long. */
+	uint64_t room = user_range_room((uint64_t)user_str);
+	if (room == 0)
 		return -EFAULT;
-	}
+	size_t scan = (uint64_t)max_len > room ? (size_t)room : max_len;
 	// Temporarily allow user memory access
 	smap_disable();
 	size_t i;
-	for (i = 0; i < max_len; i++) {
+	for (i = 0; i < scan; i++) {
 		if (user_str[i] == '\0') {
 			*out_len = i;
 			smap_enable();
@@ -124,7 +127,7 @@ int user_strnlen(const char *user_str, size_t max_len, size_t *out_len)
 		}
 	}
 	smap_enable();
-	return -EINVAL; // Too long
+	return scan < max_len ? -EFAULT : -EINVAL; // Too long
 }
 
 int copy_user_string(const char *user_str, size_t max_len,
@@ -214,21 +217,17 @@ int copy_user_string_array(const char *const *user_arr, size_t max_count,
 
 	size_t total = 0;
 	for (size_t i = 0; i < max_count; i++) {
-		// SMAP-aware read of user array element
+		/* Element i is read only once its own address is known to be
+		 * user memory: copy_from_user checks it (and the task) first. */
 		const char *user_str;
-		smap_disable();
-		user_str = user_arr[i];
-		smap_enable();
+		if (copy_from_user(&user_str, &user_arr[i], sizeof(user_str))) {
+			free_user_string_array(karr);
+			return -EFAULT;
+		}
 		if (!user_str) {
 			karr[i] = NULL;
 			*out_arr = karr;
 			return 0;
-		}
-		if (!validate_user_ptr((uint64_t)user_arr +
-					       (i * sizeof(uint64_t)),
-				       sizeof(uint64_t))) {
-			free_user_string_array(karr);
-			return -EFAULT;
 		}
 
 		char *kstr = NULL;

@@ -17,6 +17,8 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
+#include <kernel/dev/block/blkdev.h>
+#include <kernel/ke/syscalls.h>
 
 /* Release tasks blocked in select()/poll()/epoll_wait().  A blocking read or
  * write parks on the object itself and sched_wake_channel() releases it; a
@@ -539,10 +541,12 @@ int64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t iovcnt)
  * the descriptor's position.  Only a plain file has a position to leave
  * alone; every other kind is ESPIPE, as POSIX says.
  *
- * The filesystem interface reads at the handle's position, so this is a
- * seek-read-seek-back sequence made atomic against the other user of that
- * position on the same handle -- the demand-paging page-in -- by the
- * handle's pagein flag, which serialises exactly such sequences. */
+ * Both go to the filesystem's positioned operation (vfs_pread/vfs_pwrite),
+ * which keeps the offset local to the call: a read(), write() or lseek() on
+ * the same description at the same time neither sees nor moves it.  A
+ * filesystem without one gets a seek/transfer/seek-back sequence made atomic
+ * against the other users of that position on the same handle -- the
+ * demand-paging page-in -- by the handle's pagein flag. */
 static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
 			  int64_t offset, int write)
 {
@@ -606,25 +610,7 @@ static int64_t prw_common(uint64_t fd, uint64_t buf, uint64_t count,
 		return ret;
 	}
 
-	while (__atomic_test_and_set(&file->pagein_busy, __ATOMIC_ACQUIRE))
-		sched_yield_in_kernel();
-	file->pagein_owner = (int64_t)cur->id;
-
-	long saved = vfs_seek(file, 0, 1 /* SEEK_CUR */);
-	if (saved < 0) {
-		ret = saved;
-		goto unlock;
-	}
-	long at = vfs_seek(file, (long)offset, 0 /* SEEK_SET */);
-	if (at < 0) {
-		ret = at;
-		goto unlock;
-	}
-	ret = vfs_write(file, (const void *)buf, (long)count);
-	vfs_seek(file, saved, 0);
-unlock:
-	file->pagein_owner = -1;
-	__atomic_clear(&file->pagein_busy, __ATOMIC_RELEASE);
+	ret = vfs_pwrite(file, (const void *)buf, (long)count, (long)offset);
 	fdput(file);
 	return ret;
 }
@@ -638,6 +624,158 @@ int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
 		     uint64_t offset)
 {
 	return prw_common(fd, buf, count, (int64_t)offset, 1);
+}
+
+/* preadv2(2) / pwritev2(2): vectored I/O at an offset (-1: at and
+ * advancing the file position, as readv/writev) with per-call RWF_*
+ * flags, as the established interface defines them:
+ *   RWF_HIPRI     polled completion (block nodes on a poll queue; a hint
+ *                 elsewhere)
+ *   RWF_DSYNC/SYNC the write is durable when the call returns (FUA on a
+ *                 block node, fsync of the file otherwise)
+ *   RWF_NOWAIT    never wait for the device's queue (block nodes; other
+ *                 files cannot promise it: -EOPNOTSUPP)
+ *   RWF_APPEND    write at the end of the file; RWF_NOAPPEND overrides an
+ *                 O_APPEND descriptor for this call
+ *   RWF_ATOMIC    the write is one untorn unit (block nodes with atomic
+ *                 write support: the device's limits, -EINVAL otherwise)
+ *   RWF_DONTCACHE uncached buffered I/O (block nodes are uncached)
+ * Any other flag: -EOPNOTSUPP. */
+static int64_t prwv2_common(uint64_t fd, uint64_t iovp, uint64_t iovcnt,
+			    int64_t offset, uint32_t flags, int write)
+{
+	task_t *cur = sched_current();
+	struct blk_uvec *kiov;
+	vfs_file_t *file;
+	int64_t ret = 0;
+	int blk;
+
+	if (!cur)
+		return -EFAULT;
+	if (flags & ~BLK_RWF_SUPPORTED)
+		return -EOPNOTSUPP;
+	if (iovcnt > 1024)
+		return -EINVAL;
+	if (offset < -1)
+		return -EINVAL;
+	if ((flags & BLK_RWF_ATOMIC) && !write)
+		return -EOPNOTSUPP;
+	if (iovcnt == 0)
+		return 0;
+	if (!iovp || !validate_user_ptr(iovp, iovcnt *
+						 sizeof(struct k_iovec_compat)))
+		return -EFAULT;
+	kiov = (struct blk_uvec *)kcalloc(iovcnt, sizeof(*kiov));
+	if (!kiov)
+		return -ENOMEM;
+	for (uint64_t i = 0; i < iovcnt; i++) {
+		struct k_iovec_compat iov;
+
+		if (copy_from_user(&iov, (void *)(iovp + i * sizeof(iov)),
+				   sizeof(iov)) != 0) {
+			kfree(kiov);
+			return -EFAULT;
+		}
+		if ((int64_t)iov.iov_len < 0) {
+			kfree(kiov);
+			return -EINVAL;
+		}
+		if (iov.iov_len && !validate_user_ptr(iov.iov_base, iov.iov_len)) {
+			kfree(kiov);
+			return -EFAULT;
+		}
+		kiov[i].base = (void *)iov.iov_base;
+		kiov[i].len = iov.iov_len;
+	}
+
+	file = fdget(cur, (int)fd);
+	if (!file) {
+		kfree(kiov);
+		return -EBADF;
+	}
+	blk = !fd_is_special(file) && devfs_is_devfile(file) &&
+	      devfs_file_is_blk(file);
+	if (blk) {
+		if (write ? !file_may_write(file) : !file_may_read(file)) {
+			ret = -EBADF;
+		} else {
+			for (uint64_t i = 0; i < iovcnt; i++)
+				if (kiov[i].len)
+					mm_prefault_user_range(
+						(uint64_t)kiov[i].base,
+						kiov[i].len, !write);
+			ret = blkdev_file_rwv(file, kiov, (int)iovcnt, offset,
+					      write, flags);
+		}
+		fdput(file);
+		kfree(kiov);
+		return ret;
+	}
+	fdput(file);
+	/* Not a block node: no atomic writes, no non-blocking promise, no
+	 * uncached mode here. */
+	if (flags & (BLK_RWF_ATOMIC | BLK_RWF_NOWAIT | BLK_RWF_DONTCACHE)) {
+		kfree(kiov);
+		return -EOPNOTSUPP;
+	}
+	if (write && (flags & BLK_RWF_APPEND) && !(flags & BLK_RWF_NOAPPEND)) {
+		/* At the end, whatever the offset says (and the position
+		 * moves only for offset -1). */
+		int64_t end = sys_lseek(fd, 0, 2 /* SEEK_END */);
+
+		if (end < 0) {
+			kfree(kiov);
+			return end;
+		}
+		if (offset != -1)
+			offset = end;
+	}
+	for (uint64_t i = 0; i < iovcnt; i++) {
+		int64_t r;
+
+		if (!kiov[i].len)
+			continue;
+		if (offset == -1)
+			r = write ? sys_write(fd, (uint64_t)kiov[i].base,
+					      kiov[i].len) :
+				    sys_read(fd, (uint64_t)kiov[i].base,
+					     kiov[i].len);
+		else
+			r = prw_common(fd, (uint64_t)kiov[i].base, kiov[i].len,
+				       offset + ret, write);
+		if (r < 0) {
+			if (!ret)
+				ret = r;
+			break;
+		}
+		ret += r;
+		if (r == 0 || (uint64_t)r < kiov[i].len)
+			break;
+	}
+	kfree(kiov);
+	if (write && ret > 0 && (flags & (BLK_RWF_DSYNC | BLK_RWF_SYNC))) {
+		int64_t s = sys_fsync(fd);
+
+		if (s < 0)
+			return s;
+	}
+	return ret;
+}
+
+int64_t sys_preadv2(uint64_t fd, uint64_t iovp, uint64_t iovcnt,
+		    uint64_t offset, uint64_t flags)
+{
+	return prwv2_common(fd, iovp, iovcnt, (int64_t)offset, (uint32_t)flags,
+			    0);
+}
+
+int64_t sys_pwritev2(uint64_t fd, uint64_t iovp, uint64_t iovcnt,
+		     uint64_t offset, uint64_t flags)
+{
+	if (flags >> 32)
+		return -EOPNOTSUPP;
+	return prwv2_common(fd, iovp, iovcnt, (int64_t)offset, (uint32_t)flags,
+			    1);
 }
 
 /* fallocate(2): reserve space.  The filesystems here have no preallocation

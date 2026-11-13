@@ -1,0 +1,14 @@
+Patches applied to the pristine dosfstools-4.2 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-blkgetsize64-no-version-check.patch
+        The device size comes from BLKGETSIZE64 without a kernel version
+        test on the uname() release (which is the LikeOS version here).
+
+  0002-mounted-check-proc-mounts.patch
+        The "is it mounted" check reads /proc/mounts when there is no
+        /etc/mtab.
+
+Copyright (C) 2026 The LikeOS Project

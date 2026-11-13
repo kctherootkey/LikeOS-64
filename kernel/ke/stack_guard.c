@@ -101,10 +101,18 @@ static const char *__attribute__((no_stack_protector)) _ksc_pattern(uint64_t c)
  *   addr2line -f -e build/kernel.elf <addr> ...
  * (build with NO_STRIP=1 to keep the symbols).  Rate-limited: a path that does
  * this once normally does it on every iteration of a loop. */
+/* Set once the boot CPU enabled interrupts for the first time.  Before
+ * that the boot thread runs everything with interrupts off and nothing can
+ * sleep anyway (every wait polls): a might_sleep() there is not a bug, as
+ * during the established kernel's SYSTEM_BOOTING state. */
+volatile int g_might_sleep_armed;
+
 void __attribute__((no_stack_protector))
 bug_report_atomic_sleep(const char *file, int line, const char *func)
 {
 	static int count = 0;
+	if (!__atomic_load_n(&g_might_sleep_armed, __ATOMIC_RELAXED))
+		return;
 	if (count >= 10)
 		return;
 	count++;

@@ -15,10 +15,23 @@ int optopt = 0;
 /* Position within the current argument string (for grouped short opts) */
 static int _optpos = 0;
 
+/* optind = 0 asks for a fresh scan: start over at argv[1], with no
+ * half-read group of short options left over.  Programs that parse
+ * several argument vectors (a command's own options after the program's)
+ * reset this way; argv[0] is the command name, never an option. */
+static void getopt_restart_if_asked(void)
+{
+	if (optind == 0) {
+		optind = 1;
+		_optpos = 0;
+	}
+}
+
 int getopt(int argc, char *const argv[], const char *optstring)
 {
 	const char *p;
 
+	getopt_restart_if_asked();
 	optarg = NULL;
 
 	if (optind >= argc)
@@ -102,6 +115,7 @@ static int getopt_long_common(int argc, char *const argv[], const char *optstrin
 			      const struct option *longopts, int *longindex,
 			      int long_only)
 {
+	getopt_restart_if_asked();
 	optarg = NULL;
 
 	if (optind >= argc)

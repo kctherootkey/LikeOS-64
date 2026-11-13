@@ -1,0 +1,114 @@
+# Makefile.likeos - build dosfstools 4.2 (mkfs.fat, fsck.fat, fatlabel) for
+# LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; configure is not
+# run.  The source lists are upstream's src/Makefile.am; config.h in this
+# directory stands in for the DEFS configure would put on the command line and
+# is force-included, src/version.h is made from version.h.in the way
+# configure makes it.  Built without iconv (see config.h).
+#
+# Programs (build/), installed to /sbin:
+#   mkfs.fat  (+ mkfs.vfat, mkfs.msdos, mkdosfs)
+#   fsck.fat  (+ fsck.vfat, fsck.msdos, dosfsck)
+#   fatlabel  (+ dosfslabel)
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+O := $(B)/obj
+
+VERSION := 4.2
+# The release date configure.ac records for this version.
+RELEASE_DATE := 2021-01-31
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.
+CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE -fno-common \
+         -D_GNU_SOURCE -D__LIKEOS__ \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -include config.h -I$(O) -I$(S)/src
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int
+# Upstream's AM_CFLAGS.
+CFLAGS += -Wall -Wextra -Wno-sign-compare -Wno-missing-field-initializers \
+          -Wmissing-prototypes -Wstrict-prototypes -Wwrite-strings
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+obj = $(addprefix $(O)/,$(1:.c=.o))
+
+FSCKLABEL_COMMON = boot.c common.c fat.c io.c charconv.c
+DEVINFO_COMMON = device_info.c blkdev/blkdev.c blkdev/linux_version.c
+
+FSCK_OBJ = $(call obj,check.c file.c fsck.fat.c lfn.c $(FSCKLABEL_COMMON))
+FATLABEL_OBJ = $(call obj,fatlabel.c $(FSCKLABEL_COMMON))
+MKFS_OBJ = $(call obj,mkfs.fat.c common.c charconv.c $(DEVINFO_COMMON))
+
+PROGS = mkfs.fat fsck.fat fatlabel
+TARGETS = $(addprefix $(B)/,$(PROGS))
+
+# mkfs.fat and its device probing compile with the blkdev directory on the
+# include path (mkfs_fat_CPPFLAGS).
+$(O)/mkfs.fat.o $(O)/device_info.o $(O)/blkdev/%.o: XFLAGS = -I$(S)/src/blkdev
+
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): dosfstools-$(VERSION).tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+$(O)/version.h: $(S)/src/version.h.in $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/@PACKAGE_VERSION@/$(VERSION)/' \
+	    -e 's/@RELEASE_DATE@/$(RELEASE_DATE)/' $< >$@
+
+# Every object depends on every header: there are few of them.
+HDRS = config.h $(O)/version.h $(wildcard $(S)/src/*.h $(S)/src/blkdev/*.h)
+
+$(O)/%.o: $(S)/src/%.c $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(XFLAGS) -c $< -o $@
+
+LINK = $(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/mkfs.fat: $(MKFS_OBJ) $(CRT1)
+	$(LINK)
+$(B)/fsck.fat: $(FSCK_OBJ) $(CRT1)
+	$(LINK)
+$(B)/fatlabel: $(FATLABEL_OBJ) $(CRT1)
+	$(LINK)
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

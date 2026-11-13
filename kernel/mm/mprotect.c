@@ -69,6 +69,25 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 		return -EFAULT;
 	}
 
+	/* In a shared file mapping an entry's dirty bit is the only record
+	 * of what was stored and is still to be written to the file
+	 * (mm_region_writes_back), so the entries rebuilt below keep it. */
+	bool keep_dirty = false;
+	{
+		task_t *mm = task_mm_owner(cur);
+		uint64_t end = addr + pages * PAGE_SIZE;
+
+		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
+			mmap_region_t *r = &mm->mmap_regions[i];
+
+			if (mm_region_writes_back(r) && end > r->start &&
+			    addr < r->start + r->length) {
+				keep_dirty = true;
+				break;
+			}
+		}
+	}
+
 	/* Keep the region records describing the protection the pages actually
 	 * have -- including when the range covers only PART of a region, which
 	 * has to SPLIT it.
@@ -203,6 +222,14 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 					page_flags |= PAGE_DIRTY_TRACKED;
 				}
 			}
+		}
+
+		if (keep_dirty) {
+			uint64_t *pte =
+				mm_get_page_table_from_pml4(pml4, vaddr, false);
+
+			if (pte && !(*pte & PAGE_DEVICE) && (*pte & PAGE_DIRTY))
+				page_flags |= PAGE_DIRTY;
 		}
 
 		// Remap with new protection

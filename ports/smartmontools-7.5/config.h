@@ -57,7 +57,10 @@
 /* #undef HAVE_CLOSE_RANGE */
 
 /* NVMe devices in smartd's DEVICESCAN: upstream's default for this OS
- * backend is on; LikeOS has no NVMe driver yet, so the scan finds nothing. */
+ * backend, on.  The scan finds the controller nodes /dev/nvmeX of the LikeOS
+ * NVMe driver, and smartctl/smartd talk to them (and to the namespace nodes
+ * /dev/nvmeXnY) through NVME_IOCTL_ADMIN_CMD (SMART/health, error and
+ * self-test logs, identify, device self-test). */
 #define WITH_NVME_DEVICESCAN 1
 
 #endif /* LIKEOS_SMARTMONTOOLS_CONFIG_H */

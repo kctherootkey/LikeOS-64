@@ -2628,11 +2628,129 @@ static void region_harvest_obj(uint64_t *pml4, const mmap_region_t *r,
  * through a watched mapping, so they are read here, by the one thread that
  * took the object and therefore knows it is still alive, before the object is
  * released.  munmap harvests before it clears its entries and passes NULL. */
-/* A file set aside to be closed after the address space is released. */
+/* A file set aside to be closed after the address space is released --
+ * and, when `wb_phys' is set, a page of a shared mapping of it to be written
+ * to it first (mm_region_writeback_queue): the page's own reference and its
+ * offset in the file. */
 struct mm_close_node {
 	vfs_file_t *f;
 	struct mm_close_node *next;
+	uint64_t wb_phys;
+	uint64_t wb_off;
 };
+
+/* ---- Shared file mappings: writing back what was stored into them ----------
+ *
+ * A MAP_SHARED mapping of a file on a disk filesystem is made of this address
+ * space's own pages, filled from the file when it is mapped.  What the program
+ * stores into them reaches the file only by being written there: the processor
+ * marks every entry it writes through (the dirty bit), and msync, munmap, exec
+ * and exit write each marked page through the file's own write path -- never
+ * past the file's current end, which a mapping does not move. */
+
+bool mm_region_writes_back(const mmap_region_t *r)
+{
+	return r && r->in_use && r->wb_file && r->file && !r->device &&
+	       (r->flags & MAP_SHARED);
+}
+
+/* Write `len' bytes at `off' of the file without moving the handle's
+ * position, which is the program's.  The bytes belong exactly there, so a
+ * description that writes at the end of the file (O_APPEND, possibly set
+ * after the mapping was made) cannot carry them: refused, and msync says so. */
+static long mm_wb_pwrite(vfs_file_t *f, const void *buf, long len, long off)
+{
+	if (__atomic_load_n(&f->flags, __ATOMIC_RELAXED) & O_APPEND)
+		return -EIO;
+	return vfs_pwrite(f, buf, len, off);
+}
+
+int mm_writeback_page(vfs_file_t *f, uint64_t phys, uint64_t off)
+{
+	struct kstat st;
+	long len, got;
+
+	might_sleep();
+	if (!f || !phys)
+		return 0;
+	mm_memset(&st, 0, sizeof(st));
+	if (vfs_fstat(f, &st) != ST_OK)
+		return -EIO;
+	if (st.st_size <= 0 || off >= (uint64_t)st.st_size)
+		return 0; /* nothing of the file is there any more */
+	len = (long)((uint64_t)st.st_size - off);
+	if (len > (long)PAGE_SIZE)
+		len = (long)PAGE_SIZE;
+	got = mm_wb_pwrite(f, phys_to_virt(phys), len, (long)off);
+	if (got < 0)
+		return (int)got;
+	return got == len ? 0 : -EIO;
+}
+
+/* The written pages of [from, to) inside `r', from the entries of `pml4':
+ * queued, each with its own page and file reference, to be written once the
+ * address-space lock -- held for writing by the caller, munmap or exec -- is
+ * released (mm_close_deferred).  Not under it: the write enters the
+ * filesystem, and a thread holding one of its locks may be faulting on this
+ * very address space. */
+void mm_region_writeback_queue(uint64_t *pml4, const mmap_region_t *r,
+			       uint64_t from, uint64_t to)
+{
+	task_t *cur = sched_current();
+
+	if (!pml4 || !cur || !mm_region_writes_back(r))
+		return;
+	mm_assert_write_locked(&task_mm_owner(cur)->mmap_lock);
+	for (uint64_t va = from; va < to; va += PAGE_SIZE) {
+		uint64_t *pte = mm_get_page_table_from_pml4(pml4, va, false);
+		uint64_t e = pte ? __atomic_load_n(pte, __ATOMIC_RELAXED) : 0;
+		uint64_t phys, off;
+		struct mm_close_node *n;
+
+		if ((e & (PAGE_PRESENT | PAGE_DEVICE | PAGE_DIRTY)) !=
+		    (PAGE_PRESENT | PAGE_DIRTY))
+			continue;
+		phys = e & 0x000FFFFFFFFFF000ULL;
+		off = r->offset + (va - r->start);
+		n = kalloc(sizeof(*n));
+		if (!n) {
+			/* No note to defer it with: now, as the deferred
+			 * close does in the same case. */
+			(void)mm_writeback_page(r->file, phys, off);
+			continue;
+		}
+		mm_get_page(phys);
+		vfs_incref(r->file);
+		n->f = r->file;
+		n->wb_phys = phys;
+		n->wb_off = off;
+		n->next = cur->mm_close_later;
+		cur->mm_close_later = n;
+	}
+}
+
+/* The same at exit, where nothing holds the address-space lock and the page
+ * tables are about to go wholesale: written now, through `f', which the
+ * caller took out of the record together with its hold (so the record itself
+ * no longer names it). */
+void mm_region_writeback_exit(uint64_t *pml4, const mmap_region_t *r,
+			      vfs_file_t *f)
+{
+	might_sleep();
+	if (!pml4 || !f || r->device || !r->wb_file || !(r->flags & MAP_SHARED))
+		return;
+	for (uint64_t va = r->start; va < r->start + r->length;
+	     va += PAGE_SIZE) {
+		uint64_t *pte = mm_get_page_table_from_pml4(pml4, va, false);
+		uint64_t e = pte ? __atomic_load_n(pte, __ATOMIC_RELAXED) : 0;
+
+		if ((e & (PAGE_PRESENT | PAGE_DEVICE | PAGE_DIRTY)) !=
+		    (PAGE_PRESENT | PAGE_DIRTY))
+			continue;
+		(void)mm_writeback_page(f, e & 0x000FFFFFFFFFF000ULL,
+					r->offset + (va - r->start));
+	}
+}
 
 void mm_close_deferred(task_t *t)
 {
@@ -2645,10 +2763,185 @@ void mm_close_deferred(task_t *t)
 	while (n) {
 		struct mm_close_node *next = n->next;
 
+		if (n->wb_phys) {
+			(void)mm_writeback_page(n->f, n->wb_phys, n->wb_off);
+			mm_put_page(n->wb_phys);
+		}
 		vfs_close(n->f);
 		kfree(n);
 		n = next;
 	}
+}
+
+static mmap_region_t *mm_region_at_or_after(task_t *task, uint64_t *addr);
+
+/* msync(2).  One entry per page to write (`dirty'), to read again
+ * (MS_INVALIDATE), or -- with no page -- a file to flush (MS_SYNC); each
+ * holds a reference on its file and, when it has one, its page. */
+struct mm_msync_ent {
+	struct mm_msync_ent *next;
+	vfs_file_t *f;
+	uint64_t phys;
+	uint64_t off;
+	bool dirty;
+	bool failed;
+};
+
+static struct mm_msync_ent *mm_msync_ent_new(struct mm_msync_ent ***tail,
+					     vfs_file_t *f)
+{
+	struct mm_msync_ent *e = kalloc(sizeof(*e));
+
+	if (!e)
+		return NULL;
+	mm_memset(e, 0, sizeof(*e));
+	vfs_incref(f);
+	e->f = f;
+	**tail = e;
+	*tail = &e->next;
+	return e;
+}
+
+/* Under the address-space lock, held for writing: what has to be done for
+ * [start, end).  A written page's dirty bit is cleared here and every
+ * processor's translation of it dropped before the lock is released, so a
+ * store made after that sets the bit again and is written by the next
+ * msync or the unmap, while the page's content -- copied after the lock is
+ * released -- includes every store made before it.  *unmapped is set when
+ * part of the range is not mapped. */
+static int mm_msync_collect(task_t *mm, uint64_t start, uint64_t end,
+			    int flags, struct mm_msync_ent **head,
+			    bool *unmapped)
+{
+	struct mm_msync_ent **tail = head;
+	uint64_t va = start;
+	int cleared = 0, ret = 0;
+
+	mm_assert_write_locked(&mm->mmap_lock);
+	while (va < end) {
+		uint64_t at = va, stop;
+		mmap_region_t *r = mm_region_at_or_after(mm, &at);
+
+		if (!r || at >= end) {
+			*unmapped = true;
+			break;
+		}
+		if (at > va)
+			*unmapped = true;
+		va = at;
+		stop = r->start + r->length;
+		if (stop > end)
+			stop = end;
+		if (!mm_region_writes_back(r)) {
+			va = stop;
+			continue;
+		}
+		if ((flags & MS_SYNC) && !mm_msync_ent_new(&tail, r->file)) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		for (; va < stop; va += PAGE_SIZE) {
+			uint64_t *pte = mm_get_page_table_from_pml4(mm->pml4, va,
+								    false);
+			uint64_t e = pte ? __atomic_load_n(pte, __ATOMIC_RELAXED) :
+					   0;
+			struct mm_msync_ent *ent;
+
+			if ((e & (PAGE_PRESENT | PAGE_DEVICE)) != PAGE_PRESENT)
+				continue;
+			if (!(e & PAGE_DIRTY) && !(flags & MS_INVALIDATE))
+				continue;
+			ent = mm_msync_ent_new(&tail, r->file);
+			if (!ent) {
+				ret = -ENOMEM; /* this page is still marked */
+				goto out;
+			}
+			if (e & PAGE_DIRTY) {
+				/* Only the processor changes the entry under
+				 * this lock, and only to set A or D. */
+				while (!__atomic_compare_exchange_n(
+					pte, &e, e & ~(uint64_t)PAGE_DIRTY, false,
+					__ATOMIC_RELAXED, __ATOMIC_RELAXED))
+					;
+				mm_flush_tlb(va);
+				cleared++;
+				ent->dirty = true;
+			}
+			ent->phys = e & 0x000FFFFFFFFFF000ULL;
+			ent->off = r->offset + (va - r->start);
+			mm_get_page(ent->phys);
+		}
+	}
+out:
+	if (cleared)
+		smp_tlb_shootdown_mm_sync(virt_to_phys(mm->pml4));
+	return ret;
+}
+
+int64_t mm_msync(uint64_t start, uint64_t end, int flags)
+{
+	task_t *cur = sched_current();
+	task_t *mm = cur ? task_mm_owner(cur) : NULL;
+	struct mm_msync_ent *head = NULL, *e, *next;
+	bool unmapped = false;
+	int ret, err = 0;
+
+	might_sleep();
+	if (!mm)
+		return -EFAULT;
+	mm_write_lock(&mm->mmap_lock);
+	ret = mm_msync_collect(mm, start, end, flags, &head, &unmapped);
+	mm_write_unlock(&mm->mmap_lock);
+
+	/* The written pages, through the file's own write path. */
+	for (e = head; e; e = e->next) {
+		int rc;
+
+		if (!e->phys || !e->dirty)
+			continue;
+		rc = mm_writeback_page(e->f, e->phys, e->off);
+		if (rc < 0) {
+			e->failed = true;
+			if (!err)
+				err = rc;
+		}
+	}
+	/* MS_SYNC: on the medium before the call returns. */
+	for (e = head; e; e = e->next) {
+		int rc;
+
+		if (e->phys || !e->f->ops || !e->f->ops->fsync)
+			continue;
+		rc = e->f->ops->fsync(e->f);
+		if (rc < 0 && !err)
+			err = rc;
+	}
+	/* MS_INVALIDATE: the mapping shows what the file holds now --
+	 * including what was written to it some other way since it was
+	 * mapped.  A page whose own write failed keeps what was stored. */
+	for (e = head; e; e = e->next) {
+		long got;
+
+		if (!(flags & MS_INVALIDATE) || !e->phys || e->failed)
+			continue;
+		got = vfs_pread(e->f, phys_to_virt(e->phys), (long)PAGE_SIZE,
+				(long)e->off);
+		if (got >= 0 && got < (long)PAGE_SIZE)
+			mm_memset((uint8_t *)phys_to_virt(e->phys) + got, 0,
+				  PAGE_SIZE - (uint64_t)got);
+	}
+	for (e = head; e; e = next) {
+		next = e->next;
+		if (e->phys)
+			mm_put_page(e->phys);
+		vfs_close(e->f);
+		kfree(e);
+	}
+	if (ret < 0)
+		return ret;
+	if (err < 0)
+		return err;
+	return unmapped ? -ENOMEM : 0;
 }
 
 void mm_region_retire(mmap_region_t *r, uint64_t *pml4)
@@ -2671,6 +2964,8 @@ void mm_region_retire(mmap_region_t *r, uint64_t *pml4)
 		if (mm && mm->mmap_lock.writer && mm->mmap_lock.owner == (uint64_t)cur->id)
 			n = kalloc(sizeof(*n));
 		if (n) {
+			n->wb_phys = 0;
+			n->wb_off = 0;
 			n->f = f;
 			n->next = cur->mm_close_later;
 			cur->mm_close_later = n;
@@ -3005,6 +3300,9 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 		return false;
 	/* one that may never be made writable is not one that may */
 	if (a->no_write != b->no_write)
+		return false;
+	/* one written back to its file is not one that is not */
+	if (a->wb_file != b->wb_file)
 		return false;
 	/* a lazy device mapping's pages come from its own driver object
 	 * with its own index base; two records are two mappings */
@@ -3403,6 +3701,10 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 		 * the record goes. */
 		mm_region_harvest_dirty(task->pml4, region, cur_addr,
 					unmap_end);
+		/* A shared file mapping: what was stored into the pages about
+		 * to go is written to the file, once the lock is released. */
+		mm_region_writeback_queue(task->pml4, region, cur_addr,
+					  unmap_end);
 
 		/* Clear the entries within [cur_addr, unmap_end).  The pages
 		 * are not released yet -- the gather holds them until every

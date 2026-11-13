@@ -1397,6 +1397,51 @@ long vfs_write(vfs_file_t *f, const void *buf, long bytes)
 		vfs_notify_file(f, IN_MODIFY);
 	return r;
 }
+
+/* Write at an offset the caller names, the counterpart of vfs_pread(): the
+ * description's position is neither used nor moved.  A filesystem with
+ * ->write_at keeps the position out of it entirely; for one without, the
+ * seek/write/seek-back sequence runs under the handle's page-in flag, which
+ * serialises it against the other users of that sequence (vfs_pread's
+ * fallback, demand paging) -- not against read() or lseek() on the same
+ * description, which is why the op exists. */
+long vfs_pwrite(vfs_file_t *f, const void *buf, long bytes, long off)
+{
+	long r;
+
+	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
+		return ST_INVALID;
+	if (off < 0)
+		return ST_INVALID;
+	if (f->ops->write_at) {
+		r = f->ops->write_at(f, buf, bytes, off);
+		if (r > 0)
+			vfs_notify_file(f, IN_MODIFY);
+		return r;
+	}
+
+	while (__atomic_test_and_set(&f->pagein_busy, __ATOMIC_ACQUIRE))
+		sched_yield_in_kernel();
+	task_t *cur = sched_current();
+	f->pagein_owner = cur ? (int64_t)cur->id : -1;
+
+	long saved = vfs_seek(f, 0, 1 /* SEEK_CUR */);
+	if (saved < 0) {
+		r = saved;
+		goto unlock;
+	}
+	long at = vfs_seek(f, off, 0 /* SEEK_SET */);
+	if (at < 0) {
+		r = at;
+		goto unlock;
+	}
+	r = vfs_write(f, buf, bytes);
+	vfs_seek(f, saved, 0);
+unlock:
+	f->pagein_owner = -1;
+	__atomic_clear(&f->pagein_busy, __ATOMIC_RELEASE);
+	return r;
+}
 long vfs_seek(vfs_file_t *f, long offset, int whence)
 {
 	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))

@@ -600,7 +600,7 @@ static int64_t ptrace_set_tf(task_t *t, bool on)
  * Everything this refuses, and why:
  *
  *   - addresses outside the user range, and any length that carries the end
- *     out of it.  validate_user_ptr() bounds only the start.
+ *     out of it (validate_user_ptr() checks the whole range).
  *   - an address with no region behind it: an unmapped hole reads as zero
  *     through the page tables and would look like real memory.
  *   - a region marked `device'.  Those are MMIO -- framebuffer aperture today,
@@ -631,9 +631,8 @@ int64_t ptrace_xfer_mem(task_t *mm, uint64_t addr, void *kbuf,
 		return 0;
 	if (!validate_user_ptr(addr, len))
 		return -EFAULT;
-	/* Re-bound the END.  validate_user_ptr checks the start against the top
-	 * of the user half and checks that start+len does not wrap, but not
-	 * that the end is still below the top. */
+	/* The end, once more, as this function computes it: validate_user_ptr
+	 * already bounds the whole range below the top of the user half. */
 	if (end < addr || end > 0x7FFFFFFFFFFFULL)
 		return -EFAULT;
 	if (!mm->pml4 || mm->has_exited || mm->in_exit_teardown)
