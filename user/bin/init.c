@@ -72,8 +72,6 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
-#include <dirent.h>
-#include <pwd.h>
 
 #include "fstab-util.h"
 
@@ -1483,100 +1481,6 @@ static void mount_fstab(void)
 	fsu_table_free(&tab);
 }
 
-/* ---- X state left over from before the last start --------------------------- */
-
-/* Nothing of a display server can be running while init starts, so whatever
- * one left behind belongs to a session that ended with a reset or a power
- * loss, and keeps the next one from starting:
- *
- *  - /tmp/.X<n>-lock and the socket /tmp/.X11-unix/X<n>: the server finds the
- *    lock, reads a process id out of it that a different program may now
- *    have, and refuses display :<n> as taken.
- *  - <home>/.Xauthority-c and -l, the lock pair xauth holds while it rewrites
- *    the authority file.  xauth breaks such a lock only once it is ten
- *    minutes old; until then every xauth call startx makes times out, the
- *    new server's key never reaches the file, and no program can connect to
- *    the server -- a black screen.
- *
- * Only these exact names are removed, only regular files (and the socket),
- * never by following a symbolic link: unlink() acts on the name itself. */
-static int x_display_name(const char *name, const char *prefix,
-			  const char *suffix)
-{
-	size_t pl = strlen(prefix), sl = strlen(suffix), n = strlen(name);
-	size_t i;
-
-	if (n <= pl + sl || strncmp(name, prefix, pl) != 0 ||
-	    strcmp(name + n - sl, suffix) != 0)
-		return 0;
-	for (i = pl; i < n - sl; i++)
-		if (name[i] < '0' || name[i] > '9')
-			return 0;
-	return 1;
-}
-
-static void remove_stale(const char *path, int want_socket)
-{
-	struct stat st;
-
-	if (lstat(path, &st) != 0)
-		return;
-	if (want_socket ? !S_ISSOCK(st.st_mode) : !S_ISREG(st.st_mode))
-		return;
-	if (unlink(path) == 0)
-		fprintf(stderr, "init: removed %s, left by an X session "
-			"that did not end\n", path);
-}
-
-static void clean_x_dir(const char *dir, const char *prefix,
-			const char *suffix, int want_socket)
-{
-	DIR *d = opendir(dir);
-	struct dirent *de;
-	char path[PATH_MAX];
-
-	if (!d)
-		return;
-	while ((de = readdir(d)) != NULL) {
-		if (!x_display_name(de->d_name, prefix, suffix))
-			continue;
-		if (snprintf(path, sizeof(path), "%s/%s", dir, de->d_name) >=
-		    (int)sizeof(path))
-			continue;
-		remove_stale(path, want_socket);
-	}
-	closedir(d);
-}
-
-static void clean_stale_x_state(void)
-{
-	FILE *f;
-	struct passwd *pw;
-	char path[PATH_MAX];
-
-	clean_x_dir("/tmp", ".X", "-lock", 0);
-	clean_x_dir("/tmp/.X11-unix", "X", "", 1);
-
-	/* The authority-file locks of the accounts that sign in: root and the
-	 * people's accounts (uid 1000 and up). */
-	f = fopen("/etc/passwd", "r");
-	if (!f)
-		return;
-	while ((pw = fgetpwent(f)) != NULL) {
-		if (pw->pw_uid != 0 && pw->pw_uid < 1000)
-			continue;
-		if (!pw->pw_dir || pw->pw_dir[0] != '/')
-			continue;
-		if (snprintf(path, sizeof(path), "%s/.Xauthority-c",
-			     pw->pw_dir) < (int)sizeof(path))
-			remove_stale(path, 0);
-		if (snprintf(path, sizeof(path), "%s/.Xauthority-l",
-			     pw->pw_dir) < (int)sizeof(path))
-			remove_stale(path, 0);
-	}
-	fclose(f);
-}
-
 int main(void)
 {
 	int i;
@@ -1594,8 +1498,6 @@ int main(void)
 	setup_hostname();
 	/* The filesystems before anything that may want them. */
 	mount_fstab();
-	/* After the mounts: a home directory may live on one of them. */
-	clean_stale_x_state();
 	setup_machine_id();
 	load_console_keymap();
 
