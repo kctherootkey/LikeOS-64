@@ -89,6 +89,10 @@ typedef struct pc_page {
 	// Cache key
 	unsigned long cluster_id; // File identity (start_cluster)
 	unsigned long page_index; // Page offset within file
+	/* The filesystem the page belongs to: file ids are only unique within
+	 * one filesystem, so two mounted filesystems can have the same ones.
+	 * Also what writeback stores the page through. */
+	struct vfs_superblock *sb;
 
 	// Data
 	uint64_t phys_addr; // Physical address of the 4KB data page
@@ -134,7 +138,8 @@ void pagecache_init(void);
 // Look up a cached page.  Returns NULL if not cached.
 // Sets PC_PAGE_REFERENCED on hit.  The page is NOT held: reclaim or an
 // invalidation may free it once the lookup has returned.
-pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index);
+pc_page_t *pagecache_lookup(struct vfs_superblock *sb, unsigned long cluster_id,
+			    unsigned long page_index);
 
 // Fetch a page: lookup + read-from-disk on miss.
 // Caller provides the filesystem superblock (for block translation +
@@ -204,9 +209,13 @@ void pagecache_write_abort(pc_page_t *page);
 /* Store the dirty pages of a set of files in ONE pass over the dirty list.
  * Flushing a set one file at a time costs a full walk per file, including for
  * files with nothing dirty -- worse than flushing everything. */
-int pagecache_flush_fileset(const unsigned long *ids, unsigned nids);
+int pagecache_flush_fileset(struct vfs_superblock *sb,
+			    const unsigned long *ids, unsigned nids);
 
-int pagecache_flush_file(unsigned long cluster_id);
+int pagecache_flush_file(struct vfs_superblock *sb, unsigned long cluster_id);
+
+/* Every dirty page of one filesystem (syncfs, unmount). */
+int pagecache_flush_sb(struct vfs_superblock *sb);
 
 // Flush all dirty pages globally. Called by periodic writeback timer.
 int pagecache_flush_all(void);
@@ -229,14 +238,20 @@ void pagecache_request_writeback(void);
 // --- Invalidation ---
 
 // Invalidate all cached pages for a file. Used on unlink, truncate-to-0.
-void pagecache_invalidate_file(unsigned long cluster_id);
+void pagecache_invalidate_file(struct vfs_superblock *sb,
+			       unsigned long cluster_id);
 
 // Invalidate pages beyond `new_size` bytes for a file. Used on truncate.
-void pagecache_invalidate_range(unsigned long cluster_id,
+void pagecache_invalidate_range(struct vfs_superblock *sb,
+				unsigned long cluster_id,
 				unsigned long new_size);
 
 // Invalidate the entire cache (e.g., filesystem unmount).
 void pagecache_invalidate_all(void);
+
+/* Drop every page of one filesystem and wait out writeback running on them:
+ * the last cache step of an unmount, after pagecache_flush_sb(). */
+void pagecache_invalidate_sb(struct vfs_superblock *sb);
 
 // --- Read-ahead ---
 
@@ -278,7 +293,8 @@ int pagecache_writeback_if_due(void);
  * the caller writes it back itself.  Every dirty page is un-reclaimable until
  * stored, so without this a steady writer consumes memory the system cannot get
  * back and later allocations fail.  Call from the write path, which can block. */
-int pagecache_balance_dirty(void);
+/* `sb' is the writer's filesystem: only its pages are stored here. */
+int pagecache_balance_dirty(struct vfs_superblock *sb);
 
 /* Store at most `max_pages` dirty pages and return, whether or not more
  * remain.  For callers that must not be held up by the size of the backlog. */

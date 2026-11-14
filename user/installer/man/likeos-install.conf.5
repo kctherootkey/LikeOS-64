@@ -1,0 +1,225 @@
+.\" likeos-install.conf.5 - manual page for the installer's answer files.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man5/likeos-install.conf.5, rendered from this
+.\" file by "make installer-manpages" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH LIKEOS-INSTALL.CONF 5 "November 2026" "LikeOS" "File Formats"
+.SH NAME
+likeos-install.conf \- answers for an unattended LikeOS installation
+.SH SYNOPSIS
+.B likeos-install \-\-answers
+.I file
+.SH DESCRIPTION
+An answer file holds everything
+.BR likeos-install (1)
+would otherwise ask: the disk to install on, the language, the time zone,
+the keyboard, the computer's name, the root password and the account to
+sign in with.
+Given with
+.BR \-\-answers ,
+it makes the installation unattended.
+.PP
+The file is UTF-8 text with one setting per line,
+.IP
+.IB key = value
+.PP
+Blanks around the key and the value are ignored.
+Empty lines and lines starting with
+.B #
+are ignored.
+A value may be put in double quotes; inside them
+.B \e"
+stands for a quote,
+.B \e\e
+for a backslash and
+.B \en
+for a new line, and blanks and
+.B #
+are kept.
+After the closing quote only blanks and a comment may follow.
+An unknown key, a bad value or a line without
+.B =
+stops the installation before anything is changed, with the file name and
+line number.
+.PP
+Every key may be left out; the default is given below.
+.SH KEYS
+.SS The disk
+.TP
+.BR disk= \fIdevice\fR | auto
+The disk to install on:
+.BR /dev/sda ,
+.B sda
+or
+.BR /dev/nvme0n1 .
+.B auto
+(the default) takes the only disk LikeOS can be installed on, and is
+refused when there is more than one.
+The disk the installer was started from cannot be chosen.
+.TP
+.BR whole_disk= yes | no
+.B yes
+(the default) erases the whole disk: a new GUID partition table, an EFI
+system partition of 512 MiB (FAT32) and the LikeOS root file system (ext4)
+in the rest.
+.B no
+installs on one partition of the disk, given with
+.BR root_partition ;
+the other partitions are kept.
+.TP
+.BI root_partition= n
+With
+.BR whole_disk=no :
+the number of the partition LikeOS goes to.
+It is formatted with ext4 (everything on it is lost) and must be large
+enough for the system.
+The disk must have an EFI system partition (FAT, at least 100 MB) apart
+from it; the boot loader is put there next to what it holds already.
+.TP
+.BR reboot= yes | no
+Restart the computer into the installed system when done (default
+.BR yes ).
+.SS Language and region
+.TP
+.BI locale= locale
+The language of the installed system, as a locale name (default
+.BR en_US.UTF\-8 ).
+.TP
+.BI time_format= locale
+How dates, times and numbers are shown (default
+.BR en_US.UTF\-8 ).
+.TP
+.BI timezone= zone
+The time zone, as a name of the time zone database:
+.BR Europe/Berlin ,
+.BR America/New_York ,
+.B UTC
+(the default).
+.SS Keyboard
+.TP
+.BI keyboard= layout\fR[\fB,\fIlayout\fR...]
+The keyboard layouts, up to four, separated by commas, as XKB layout names:
+.BR us ,
+.BR de ,
+.BR fr ,
+.B gb
+\&... (default
+.BR us ).
+With more than one, Alt+Shift switches between them.
+.TP
+.BI keyboard_variant= variant\fR[\fB,\fIvariant\fR...]
+The variant of each layout, in the same order, an empty one for the
+layout's own:
+.B nodeadkeys,
+for
+.BR keyboard=de,us .
+When given, there must be as many as there are layouts.
+.TP
+.BI keyboard_options= options
+XKB options, separated by commas
+.RB ( grp:alt_shift_toggle ,
+.BR caps:escape ...).
+.SS This computer
+.TP
+.BI hostname= name
+The computer's name: letters, digits and hyphens, at most 63, with at
+least one letter, not starting or ending with a hyphen, no dots (no domain)
+and not
+.BR localhost .
+The default is
+.B likeos\-
+followed by four random hexadecimal digits.
+.TP
+.BI root_password= password
+The password of root, as plain text.
+.TP
+.BI root_password_hash= hash
+The password of root as a
+.BR crypt (3)
+hash
+.RB ( $y$ ...
+yescrypt,
+.B $6$
+\&...), used when
+.B root_password
+is not given.
+One of the two is required.
+.SS The account
+The account to sign in with.
+It is created when
+.B user_name
+(or
+.BR user_fullname )
+is given, and then needs a password too.
+.TP
+.BI user_fullname= name
+The full name of the person
+.RB ( "\(dqErika Mustermann\(dq" ).
+.TP
+.BI user_name= name
+The user name: lower-case letters, digits, hyphens and underscores,
+starting with a letter or an underscore, at most 32, and not the name of a
+system account.
+.TP
+.BI user_password= password
+The account's password, as plain text.
+.TP
+.BI user_password_hash= hash
+The account's password as a
+.BR crypt (3)
+hash, used when
+.B user_password
+is not given.
+.TP
+.BR user_extra_groups= yes | no
+Put the account in the groups
+.BR audio ,
+.B render
+and
+.B users
+(default
+.BR yes ),
+so it can play sound and use the graphics hardware.
+.SH SECURITY
+An answer file with plain-text passwords gives them to anyone who can read
+it.
+Prefer the
+.B _hash
+keys; files the installer saves itself have mode 0600 and hold hashes
+unless asked to keep the plain passwords.
+.SH EXAMPLE
+.nf
+# likeos\-install.conf \-\- answers for an unattended LikeOS installation
+# (likeos\-install \-\-answers FILE).  See likeos\-install.conf(5).
+
+disk=/dev/nvme0n1
+whole_disk=yes
+reboot=yes
+
+# Language, formats, time zone
+locale=de_DE.UTF\-8
+time_format=de_DE.UTF\-8
+timezone=Europe/Berlin
+
+# Keyboard
+keyboard=de,us
+keyboard_variant=nodeadkeys,
+keyboard_options=grp:alt_shift_toggle
+
+# This computer
+hostname=office\-pc
+root_password_hash=$y$j9T$...
+
+# Your account
+user_fullname="Erika Mustermann"
+user_name=erika
+user_password_hash=$y$j9T$...
+user_extra_groups=yes
+.fi
+.SH SEE ALSO
+.BR likeos-install (1),
+.BR likeos-installer (1),
+.BR crypt (3),
+.BR fstab (5)

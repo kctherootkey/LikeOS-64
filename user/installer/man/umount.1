@@ -1,0 +1,113 @@
+.\" umount.1 - manual page for umount.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man/umount.1, rendered from this file by
+.\" "make installer-manpages" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH UMOUNT 1 "November 2026" "LikeOS" "System Administration"
+.SH NAME
+umount \- unmount file systems
+.SH SYNOPSIS
+.B umount
+.RB [ \-flnrv ]
+.IR directory | source ...
+.br
+.B umount \-a
+.RB [ \-flnrv ]
+.RB [ \-t
+.IR types ]
+.SH DESCRIPTION
+.B umount
+detaches mounted file systems: what
+.BR mount (1)
+attached.
+Each argument is a mount point, or the source a file system is mounted
+from \(em a device
+.RB ( /dev/sdb1 )
+or a tag naming one
+.RB ( UUID= ,
+.BR LABEL= ,
+.BR PARTUUID= ,
+.BR PARTLABEL= ).
+When several file systems are mounted on top of each other at one
+directory, the topmost is unmounted.
+.PP
+Before a file system is detached, what is still buffered for it is
+written; a file system on which files are open, or which is some process's
+working directory, is busy and stays mounted (see
+.B \-l
+and
+.BR \-r ).
+.PP
+Unmounting needs root.
+.SH OPTIONS
+.TP
+.BR \-a ", " \-\-all
+Unmount every file system that can be, the most recently mounted first:
+everything but the root and the kernel's own
+.RB ( /proc ,
+.BR /sys ,
+.BR /dev ).
+.TP
+.BR \-t ", " \-\-types " \fIlist\fR"
+With
+.BR \-a :
+only the file systems of these types (separated by commas; a
+.B no
+prefix excludes a type).
+.TP
+.BR \-f ", " \-\-force
+Force the unmount.
+Accepted for compatibility: files open on the file system still keep it
+busy.
+.TP
+.BR \-l ", " \-\-lazy
+Detach the file system now, and finish unmounting it when the last file
+open on it is closed.
+.TP
+.BR \-r ", " \-\-read\-only
+When the file system is busy, mount it read-only instead.
+.TP
+.BR \-n ", " \-\-no\-mtab
+Accepted; there is no
+.B /etc/mtab
+to update.
+.TP
+.BR \-v ", " \-\-verbose
+Say what is unmounted.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the options.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Wrong usage, or no permission.
+.TP
+.B 2
+A system error.
+.TP
+.B 32
+The unmount failed.
+.TP
+.B 64
+Some of several unmounts failed.
+.SH FILES
+.TP
+.B /proc/mounts
+What is mounted now.
+.SH EXAMPLES
+.nf
+umount /mnt
+umount LABEL=STICK
+umount \-l /media/stick
+.fi
+.SH SEE ALSO
+.BR mount (1),
+.BR fstab (5)

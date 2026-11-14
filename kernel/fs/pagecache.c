@@ -398,7 +398,8 @@ void pagecache_init(void)
 
 /* The cached page, marked referenced; with `hold', a reference is taken for
  * the caller under the bucket lock -- the lock reclaim needs to take it. */
-static pc_page_t *pc_lookup(unsigned long cluster_id, unsigned long page_index,
+static pc_page_t *pc_lookup(const vfs_superblock_t *sb,
+			    unsigned long cluster_id, unsigned long page_index,
 			    int hold)
 {
 	if (!pc_initialized)
@@ -411,7 +412,7 @@ static pc_page_t *pc_lookup(unsigned long cluster_id, unsigned long page_index,
 	pc_page_t *pg = pc_hash[bucket].head;
 	while (pg) {
 		if (pg->cluster_id == cluster_id &&
-		    pg->page_index == page_index) {
+		    pg->page_index == page_index && pg->sb == sb) {
 			pc_set_flags(pg, PC_PAGE_REFERENCED);
 			if (hold)
 				pc_page_get(pg);
@@ -425,9 +426,10 @@ static pc_page_t *pc_lookup(unsigned long cluster_id, unsigned long page_index,
 	return 0;
 }
 
-pc_page_t *pagecache_lookup(unsigned long cluster_id, unsigned long page_index)
+pc_page_t *pagecache_lookup(struct vfs_superblock *sb, unsigned long cluster_id,
+			    unsigned long page_index)
 {
-	return pc_lookup(cluster_id, page_index, 0);
+	return pc_lookup(sb, cluster_id, page_index, 0);
 }
 
 // ============================================================================
@@ -459,7 +461,8 @@ static pc_page_t *pc_insert(pc_page_t *page, int hold)
 	pc_page_t *existing = pc_hash[bucket].head;
 	while (existing) {
 		if (existing->cluster_id == page->cluster_id &&
-		    existing->page_index == page->page_index) {
+		    existing->page_index == page->page_index &&
+		    existing->sb == page->sb) {
 			// Already cached — return existing, caller should free `page`
 			pc_set_flags(existing, PC_PAGE_REFERENCED);
 			if (hold)
@@ -576,17 +579,24 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 			 * writeback first -- unless a flush has it already --
 			 * and held (it is on the LRU, so it has the cache's
 			 * reference and can take one more). */
+			/* A filesystem being unmounted stores its own pages
+			 * and then takes them all out; its superblock may not
+			 * be touched once that has begun. */
+			vfs_superblock_t *sb = pg->sb;
+			if (!sb || sb->pc_dying)
+				continue;
 			if (pc_test_and_set_flags(pg, PC_PAGE_LOCKED))
 				continue;
 			pc_page_get(pg);
+			__atomic_add_fetch(&sb->pc_wb_active, 1,
+					   __ATOMIC_ACQ_REL);
 			spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
 
 			// Flush this single dirty page inline through the generic sb
 			// ops.  Everything FS-specific (cluster math, FAT chain walk)
 			// lives behind block_to_lba() / next_block().
 			int flush_ok = 0;
-			if (g_root_sb) {
-				vfs_superblock_t *sb = g_root_sb;
+			{
 				const block_device_t *bdev = vfs_sb_bdev(sb);
 				unsigned long bs = vfs_sb_block_size(sb);
 				unsigned long ss = vfs_sb_sector_size(sb);
@@ -670,6 +680,8 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 				}
 				vfs_sb_unlock_io(sb);
 			}
+			__atomic_sub_fetch(&sb->pc_wb_active, 1,
+					   __ATOMIC_ACQ_REL);
 			if (flush_ok) {
 				pc_clear_flags(pg, PC_PAGE_DIRTY);
 				uint64_t df;
@@ -825,7 +837,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 
 	for (unsigned long pi = page_index;
 	     pi < file_pages && run_count < PC_COALESCE_MAX; pi++) {
-		if (pi != page_index && pagecache_lookup(cluster_id, pi))
+		if (pi != page_index && pagecache_lookup(sb, cluster_id, pi))
 			break;
 
 		unsigned long page_lba;
@@ -885,6 +897,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			if (!zpg)
 				return 0;
 			zpg->cluster_id = cluster_id;
+			zpg->sb = sb;
 			zpg->page_index = page_index;
 			mm_memset(zpg->data, 0, PAGE_SIZE);
 			zpg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
@@ -930,6 +943,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			return 0;
 		}
 		pg->cluster_id = cluster_id;
+		pg->sb = sb;
 		pg->page_index = page_index;
 		if (pc_read_sectors(bdev, run_start_lba, run_sectors,
 				    pg->data) != 0) {
@@ -960,6 +974,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			return 0;
 		}
 		pg->cluster_id = cluster_id;
+		pg->sb = sb;
 		pg->page_index = page_index;
 		if (pc_read_sectors(bdev, run_start_lba, spp, pg->data) != 0) {
 			pc_page_free(pg);
@@ -994,6 +1009,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 		if (!pg)
 			break;
 		pg->cluster_id = cluster_id;
+		pg->sb = sb;
 		pg->page_index = pi;
 		mm_memcpy(pg->data, (uint8_t *)buf + i * PAGE_SIZE, PAGE_SIZE);
 
@@ -1051,7 +1067,7 @@ static pc_page_t *pc_get(unsigned long cluster_id, unsigned long page_index,
 	 * commit), which is a context that owns its locks from the outside. */
 
 	// 1. Try cache lookup (no I/O lock needed); held when asked
-	pc_page_t *pg = pc_lookup(cluster_id, page_index, hold);
+	pc_page_t *pg = pc_lookup(sb, cluster_id, page_index, hold);
 	if (pg) {
 		WARN_ON_ONCE(!(
 			pc_flags(pg) &
@@ -1098,6 +1114,7 @@ static pc_page_t *pc_get(unsigned long cluster_id, unsigned long page_index,
 		if (!new_pg)
 			return 0;
 		new_pg->cluster_id = cluster_id;
+		new_pg->sb = sb;
 		new_pg->page_index = page_index;
 
 		int split = (sb->ops->lock_map != 0);
@@ -1483,7 +1500,7 @@ pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
 	/* Held under the bucket lock -- the lock reclaim needs to take the
 	 * page -- whoever else holds it: writeback that took it keeps its own
 	 * hold (and its PC_PAGE_LOCKED) through this write. */
-	pg = pc_lookup(cluster_id, page_index, 1);
+	pg = pc_lookup(sb, cluster_id, page_index, 1);
 	if (pg) {
 		__sync_fetch_and_add(&pc_stat_hits, 1);
 		return pg;
@@ -1502,6 +1519,7 @@ pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
 		if (!np)
 			return 0;
 		np->cluster_id = cluster_id;
+		np->sb = sb;
 		np->page_index = page_index;
 		/* Zeroed, not merely claimed.  A partial write beyond the end
 		 * of the file must read back as zeros outside its own range,
@@ -1584,14 +1602,15 @@ static uint32_t pc_wb_pass_begin(void)
  * flush-everything it was meant to improve on.  A commit knows the whole set
  * up front, so it should pay for one walk, not one per member.
  */
-int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
+int pagecache_flush_fileset(struct vfs_superblock *sb,
+			    const unsigned long *ids, unsigned nids)
 {
 	int wrote = 0;
 	uint64_t flags;
 
 	might_sleep();
 	BUG_ON(nids > 0 && ids == NULL);
-	if (!pc_initialized || nids == 0)
+	if (!pc_initialized || nids == 0 || !sb)
 		return 0;
 
 #define FLUSH_SET_BATCH 32
@@ -1608,7 +1627,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 			uint32_t fl = pc_flags(pg);
 
 			if ((fl & PC_PAGE_DIRTY) && !(fl & PC_PAGE_LOCKED) &&
-			    pg->_pad != pass) {
+			    pg->_pad != pass && pg->sb == sb) {
 				for (unsigned i = 0; i < nids; i++) {
 					if (pg->cluster_id != ids[i])
 						continue;
@@ -1632,12 +1651,6 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 		if (batch_count == 0)
 			break;
 
-		vfs_superblock_t *sb = g_root_sb;
-		if (!sb) {
-			for (int i = 0; i < batch_count; i++)
-				pc_wb_release(batch[i]);
-			break;
-		}
 		vfs_sb_lock_io(sb);
 		if (vfs_sb_block_size(sb) == PAGE_SIZE) {
 			wrote += pc_writeback_batch(sb, batch, batch_count);
@@ -1648,7 +1661,7 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 				pc_wb_release(batch[i]);
 			vfs_sb_unlock_io(sb);
 			for (unsigned i = 0; i < nids; i++)
-				wrote += pagecache_flush_file(ids[i]);
+				wrote += pagecache_flush_file(sb, ids[i]);
 			break;
 		}
 		vfs_sb_unlock_io(sb);
@@ -1658,11 +1671,11 @@ int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
 	return wrote;
 }
 
-int pagecache_flush_file(unsigned long cluster_id)
+int pagecache_flush_file(struct vfs_superblock *sb, unsigned long cluster_id)
 {
 	might_sleep();
 	VM_BUG_ON(cluster_id < 2);
-	if (!pc_initialized || cluster_id < 2)
+	if (!pc_initialized || cluster_id < 2 || !sb)
 		return 0;
 
 	// Collect dirty pages for this cluster_id from the dirty list.
@@ -1688,7 +1701,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 
 			/* Taken for writeback (unless reclaim took it
 			 * meanwhile) and held, as in pagecache_flush_fileset. */
-			if (pg->cluster_id == cluster_id &&
+			if (pg->cluster_id == cluster_id && pg->sb == sb &&
 			    (fl & PC_PAGE_DIRTY) && !(fl & PC_PAGE_LOCKED) &&
 			    pg->_pad != pass &&
 			    !pc_test_and_set_flags(pg, PC_PAGE_LOCKED)) {
@@ -1704,12 +1717,6 @@ int pagecache_flush_file(unsigned long cluster_id)
 			break;
 
 		// Flush the batch under the FS-wide I/O lock via sb ops.
-		vfs_superblock_t *sb = g_root_sb;
-		if (!sb) {
-			for (int i = 0; i < batch_count; i++)
-				pc_wb_release(batch[i]);
-			break;
-		}
 		const block_device_t *bdev = vfs_sb_bdev(sb);
 		unsigned long bs = vfs_sb_block_size(sb);
 		unsigned long ss = vfs_sb_sector_size(sb);
@@ -1833,7 +1840,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 // Flush all dirty pages
 // ============================================================================
 
-static int pagecache_flush_all_batch(uint32_t pass);
+static int pagecache_flush_all_batch(uint32_t pass, vfs_superblock_t *only);
 
 /*
  * Store up to `max_pages` dirty pages and stop, whether or not any remain.
@@ -1848,7 +1855,9 @@ static int pagecache_flush_all_batch(uint32_t pass);
  *
  * Returns the number of pages stored.
  */
-int pagecache_flush_bounded(unsigned long max_pages)
+/* The same, for the pages of one filesystem only (`only' NULL: any). */
+static int pagecache_flush_bounded_sb(vfs_superblock_t *only,
+				      unsigned long max_pages)
 {
 	unsigned long done = 0;
 
@@ -1859,13 +1868,18 @@ int pagecache_flush_bounded(unsigned long max_pages)
 	uint32_t pass = pc_wb_pass_begin();
 
 	while (done < max_pages) {
-		int n = pagecache_flush_all_batch(pass);
+		int n = pagecache_flush_all_batch(pass, only);
 
 		if (n <= 0)
 			break;
 		done += (unsigned long)n;
 	}
 	return (int)done;
+}
+
+int pagecache_flush_bounded(unsigned long max_pages)
+{
+	return pagecache_flush_bounded_sb(NULL, max_pages);
 }
 
 /*
@@ -1876,7 +1890,7 @@ int pagecache_flush_bounded(unsigned long max_pages)
  * Pages pass `pass` has taken already are left alone (pc_wb_pass_begin).
  * Returns 0 when there is nothing left to store.
  */
-static int pagecache_flush_all_batch(uint32_t pass)
+static int pagecache_flush_all_batch(uint32_t pass, vfs_superblock_t *only)
 {
 	might_sleep();
 	if (!pc_initialized)
@@ -1893,6 +1907,12 @@ static int pagecache_flush_all_batch(uint32_t pass)
 	do {
 		batch_count = 0;
 		uint64_t flags;
+		/* One filesystem per batch: the pages are written under that
+		 * filesystem's I/O lock, through its block mapping.  The first
+		 * page the walk can take decides which; pages of any other
+		 * filesystem are left for the next batch.  An unmounting
+		 * filesystem's pages are its own business (pc_dying). */
+		vfs_superblock_t *sb = only;
 		spin_lock_irqsave(&pc_dirty_lock, &flags);
 		pc_page_t *pg = pc_dirty_sentinel.dirty_next;
 		while (pg != &pc_dirty_sentinel &&
@@ -1902,25 +1922,24 @@ static int pagecache_flush_all_batch(uint32_t pass)
 			/* Taken for writeback (unless reclaim took it
 			 * meanwhile) and held, as in pagecache_flush_fileset. */
 			if ((fl & PC_PAGE_DIRTY) && !(fl & PC_PAGE_LOCKED) &&
-			    pg->_pad != pass &&
+			    pg->_pad != pass && pg->sb && !pg->sb->pc_dying &&
+			    (!sb || pg->sb == sb) &&
 			    !pc_test_and_set_flags(pg, PC_PAGE_LOCKED)) {
 				pc_page_get(pg);
 				pg->_pad = pass;
 				batch[batch_count++] = pg;
+				sb = pg->sb;
 			}
 			pg = pg->dirty_next;
 		}
+		if (batch_count)
+			__atomic_add_fetch(&sb->pc_wb_active, 1,
+					   __ATOMIC_ACQ_REL);
 		spin_unlock_irqrestore(&pc_dirty_lock, flags);
 
 		if (batch_count == 0)
 			break;
 
-		vfs_superblock_t *sb = g_root_sb;
-		if (!sb) {
-			for (int i = 0; i < batch_count; i++)
-				pc_wb_release(batch[i]);
-			break;
-		}
 		const block_device_t *bdev = vfs_sb_bdev(sb);
 		unsigned long bs = vfs_sb_block_size(sb);
 		unsigned long ss = vfs_sb_sector_size(sb);
@@ -1937,6 +1956,8 @@ static int pagecache_flush_all_batch(uint32_t pass)
 		if (bs == PAGE_SIZE) {
 			wrote += pc_writeback_batch(sb, batch, batch_count);
 			vfs_sb_unlock_io(sb);
+			__atomic_sub_fetch(&sb->pc_wb_active, 1,
+					   __ATOMIC_ACQ_REL);
 			continue;
 		}
 
@@ -2028,6 +2049,7 @@ static int pagecache_flush_all_batch(uint32_t pass)
 			wrote++;
 		}
 		vfs_sb_unlock_io(sb);
+		__atomic_sub_fetch(&sb->pc_wb_active, 1, __ATOMIC_ACQ_REL);
 	} while (0);
 
 #undef FLUSH_ALL_BATCH
@@ -2041,7 +2063,7 @@ int pagecache_flush_all(void)
 
 	might_sleep();
 	for (;;) {
-		int n = pagecache_flush_all_batch(pass);
+		int n = pagecache_flush_all_batch(pass, NULL);
 
 		if (n <= 0)
 			break;
@@ -2105,7 +2127,8 @@ static void pc_detach(pc_page_t *pg)
 	pagecache_put(pg);
 }
 
-void pagecache_invalidate_file(unsigned long cluster_id)
+void pagecache_invalidate_file(struct vfs_superblock *sb,
+			       unsigned long cluster_id)
 {
 	VM_BUG_ON(cluster_id < 2);
 	if (!pc_initialized || cluster_id < 2)
@@ -2120,7 +2143,7 @@ void pagecache_invalidate_file(unsigned long cluster_id)
 		pc_page_t **pp = &pc_hash[b].head;
 		while (*pp) {
 			pc_page_t *pg = *pp;
-			if (pg->cluster_id == cluster_id) {
+			if (pg->cluster_id == cluster_id && pg->sb == sb) {
 				// Remove from hash chain
 				*pp = pg->hash_next;
 				pg->hash_next = 0;
@@ -2138,7 +2161,8 @@ void pagecache_invalidate_file(unsigned long cluster_id)
 	}
 }
 
-void pagecache_invalidate_range(unsigned long cluster_id,
+void pagecache_invalidate_range(struct vfs_superblock *sb,
+				unsigned long cluster_id,
 				unsigned long new_size)
 {
 	if (!pc_initialized || cluster_id < 2)
@@ -2154,7 +2178,7 @@ void pagecache_invalidate_range(unsigned long cluster_id,
 		pc_page_t **pp = &pc_hash[b].head;
 		while (*pp) {
 			pc_page_t *pg = *pp;
-			if (pg->cluster_id == cluster_id &&
+			if (pg->cluster_id == cluster_id && pg->sb == sb &&
 			    pg->page_index >= first_invalid) {
 				*pp = pg->hash_next;
 				pg->hash_next = 0;
@@ -2194,6 +2218,101 @@ void pagecache_invalidate_all(void)
 
 			pg = next;
 		}
+	}
+}
+
+/* Store every dirty page of one filesystem (syncfs, unmount).  The caller
+ * keeps the filesystem alive for the duration.  Returns the pages stored. */
+int pagecache_flush_sb(struct vfs_superblock *sb)
+{
+	int wrote = 0;
+
+	might_sleep();
+	if (!pc_initialized || !sb)
+		return 0;
+	uint32_t pass = pc_wb_pass_begin();
+	for (;;) {
+#define FLUSH_SB_BATCH 32
+		unsigned long ids[FLUSH_SB_BATCH];
+		unsigned n = 0;
+		uint64_t flags;
+		/* Every pass begun since this one, the flushes this loop
+		 * runs included, has a number in [pass, newest]. */
+		uint32_t window = __atomic_load_n(&pc_wb_pass_gen,
+						  __ATOMIC_RELAXED) - pass;
+
+		/* The files with dirty pages, a batch of distinct ids at a
+		 * time; pagecache_flush_fileset() then takes their pages in one
+		 * walk.  A page this pass met already, or one a flush begun
+		 * since has taken, is passed over: one that flush could not
+		 * store stays dirty, and taking it again would loop for as
+		 * long as the device keeps failing (and a page dirtied again
+		 * after it was stored is the next flush's, as everywhere). */
+		spin_lock_irqsave(&pc_dirty_lock, &flags);
+		for (pc_page_t *pg = pc_dirty_sentinel.dirty_next;
+		     pg != &pc_dirty_sentinel && n < FLUSH_SB_BATCH;
+		     pg = pg->dirty_next) {
+			if (pg->sb != sb ||
+			    (uint32_t)(pg->_pad - pass) <= window ||
+			    !(pc_flags(pg) & PC_PAGE_DIRTY))
+				continue;
+			pg->_pad = pass;
+			unsigned i;
+			for (i = 0; i < n; i++)
+				if (ids[i] == pg->cluster_id)
+					break;
+			if (i == n)
+				ids[n++] = pg->cluster_id;
+		}
+		spin_unlock_irqrestore(&pc_dirty_lock, flags);
+#undef FLUSH_SB_BATCH
+		if (n == 0)
+			break;
+		wrote += pagecache_flush_fileset(sb, ids, n);
+	}
+	return wrote;
+}
+
+/* Take every page of one filesystem out of the cache, for good: the last step
+ * of unmounting it, after its dirty pages were stored.  From here on no
+ * writeback starts on the filesystem's pages, and the call returns only once
+ * the writeback passes already running on them have finished -- after that
+ * nothing in the cache refers to the superblock any more. */
+void pagecache_invalidate_sb(struct vfs_superblock *sb)
+{
+	uint64_t lru_flags, dflags;
+
+	if (!pc_initialized || !sb)
+		return;
+	/* Under both locks the writeback takers decide under. */
+	spin_lock_irqsave(&pc_lru_lock, &lru_flags);
+	spin_lock_irqsave(&pc_dirty_lock, &dflags);
+	__atomic_store_n(&sb->pc_dying, 1, __ATOMIC_SEQ_CST);
+	spin_unlock_irqrestore(&pc_dirty_lock, dflags);
+	spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
+
+	while (__atomic_load_n(&sb->pc_wb_active, __ATOMIC_SEQ_CST) != 0)
+		sched_yield_in_kernel();
+
+	for (int b = 0; b < PC_HASH_BUCKETS; b++) {
+		uint64_t flags;
+		spin_lock_irqsave(&pc_hash[b].lock, &flags);
+
+		pc_page_t **pp = &pc_hash[b].head;
+		while (*pp) {
+			pc_page_t *pg = *pp;
+			if (pg->sb == sb) {
+				*pp = pg->hash_next;
+				pg->hash_next = 0;
+				spin_unlock_irqrestore(&pc_hash[b].lock, flags);
+				pc_detach(pg);
+				spin_lock_irqsave(&pc_hash[b].lock, &flags);
+				pp = &pc_hash[b].head;
+				continue;
+			}
+			pp = &(*pp)->hash_next;
+		}
+		spin_unlock_irqrestore(&pc_hash[b].lock, flags);
 	}
 }
 
@@ -2237,7 +2356,7 @@ void pagecache_readahead(pc_readahead_t *ra, unsigned long cluster_id,
 			break;
 
 		// Check if already cached
-		pc_page_t *existing = pagecache_lookup(cluster_id, ahead_page);
+		pc_page_t *existing = pagecache_lookup(sb, cluster_id, ahead_page);
 		if (existing)
 			continue;
 
@@ -2290,7 +2409,7 @@ void pagecache_get_stats(pc_stats_t *stats)
  * needs from the outside; the write path qualifies, holding the filesystem's
  * I/O lock (which is recursive) for writing.
  */
-int pagecache_balance_dirty(void)
+int pagecache_balance_dirty(vfs_superblock_t *sb)
 {
 	unsigned long dirty;
 	uint64_t flags;
@@ -2310,7 +2429,10 @@ int pagecache_balance_dirty(void)
 	 * finish; the next write() that is still over the limit takes another
 	 * turn. */
 	might_sleep();
-	return pagecache_flush_bounded(PC_DIRTY_WRITEBACK_BATCH);
+	/* Only the writer's own filesystem: the writer holds that one's I/O
+	 * lock, and taking another filesystem's from here would nest two
+	 * filesystems' locks in an order a writer on the other one reverses. */
+	return pagecache_flush_bounded_sb(sb, PC_DIRTY_WRITEBACK_BATCH);
 }
 
 /*

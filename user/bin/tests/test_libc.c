@@ -118,6 +118,17 @@ static int tests_failed = 0;
  * would fight the X server for it, so they are left out. */
 static int g_stress = 0;
 
+/* /ram is the live medium's tmpfs, mounted from /etc/fstab; an installed
+ * system has none.  The tmpfs tests run only when it is there AND is a
+ * filesystem of its own (not a plain directory on the root's disk). */
+static int ram_is_mounted(void)
+{
+	struct stat rs, ts;
+
+	return stat("/ram", &rs) == 0 && S_ISDIR(rs.st_mode) &&
+	       stat("/", &ts) == 0 && rs.st_dev != ts.st_dev;
+}
+
 /* True, after saying so, when `what' must not run under --stress. */
 static int stress_skip(const char *what)
 {
@@ -14679,8 +14690,7 @@ static void test_inotify(void)
 	close(fd);
 
 	test_inotify_dir("/tmp", "disk filesystem");
-	struct stat rst;
-	if (stat("/ram", &rst) == 0 && S_ISDIR(rst.st_mode))
+	if (ram_is_mounted())
 		test_inotify_dir("/ram", "tmpfs /ram");
 
 	/* Read permission is needed to watch something. */
@@ -14973,7 +14983,7 @@ static void test_vfs_leftovers(void)
 {
 	printf("\n[TEST] VFS: pwrite keeps its offset, atomic O_CREAT|O_EXCL\n");
 	test_vfs_leftovers_on("/tmp");
-	if (access("/ram", W_OK) == 0)
+	if (ram_is_mounted() && access("/ram", W_OK) == 0)
 		test_vfs_leftovers_on("/ram");
 }
 
@@ -28710,10 +28720,8 @@ int main(int argc, char **argv)
 
 	printf("\n[TEST] unlink()/rmdir()/remove() on the wrong kind\n");
 	{
-		struct stat rst;
-
 		test_remove_kinds(_td, "disk filesystem");
-		if (stat("/ram", &rst) == 0 && S_ISDIR(rst.st_mode)) {
+		if (ram_is_mounted()) {
 			char rf[64], tf[128];
 
 			test_remove_kinds("/ram", "tmpfs /ram");

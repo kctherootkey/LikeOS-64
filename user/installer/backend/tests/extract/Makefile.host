@@ -1,0 +1,45 @@
+# Host build of the extractor test driver (glibc + the host's libzstd).
+#
+#   make -f Makefile.host           builds extract_test and acl_test
+#   make -f Makefile.host check     runs every extractor test (boxed)
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC ?= gcc
+BACKEND = ../..
+GPT_INC = ../../../../lib/libgpt/include
+ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd)
+ZSTD_LIBS := $(shell pkg-config --libs libzstd)
+CFLAGS = -D_GNU_SOURCE -Wall -Wextra -O2 -g -I$(BACKEND)/include -I$(BACKEND) \
+	 -I$(GPT_INC) $(ZSTD_CFLAGS)
+OUT ?= .
+
+LIB_SRC = $(BACKEND)/il_extract.c $(BACKEND)/il_tar.c $(BACKEND)/il_acl.c \
+	  $(BACKEND)/il_ctx.c $(BACKEND)/il_log.c $(BACKEND)/il_util.c \
+	  $(BACKEND)/il_sha256.c
+HDRS = $(BACKEND)/il_internal.h $(BACKEND)/il_compat.h $(BACKEND)/il_tar.h \
+       $(BACKEND)/include/installer.h
+
+all: $(OUT)/extract_test $(OUT)/extract_test_nozstd $(OUT)/tar_unit_test
+
+$(OUT)/extract_test: extract_test.c $(LIB_SRC) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ extract_test.c $(LIB_SRC) $(ZSTD_LIBS)
+
+# The same driver as the LikeOS build has it before the zstd port exists.
+$(OUT)/extract_test_nozstd: extract_test.c $(LIB_SRC) $(HDRS)
+	$(CC) $(CFLAGS) -DIL_NO_ZSTD -o $@ extract_test.c $(LIB_SRC)
+
+$(OUT)/tar_unit_test: tar_unit_test.c $(BACKEND)/il_tar.c $(BACKEND)/il_acl.c \
+		$(BACKEND)/il_tar.h
+	$(CC) $(CFLAGS) -o $@ tar_unit_test.c $(BACKEND)/il_tar.c \
+		$(BACKEND)/il_acl.c
+
+# Every test runs niced, with a memory cap and a time limit.
+check: all
+	nice -n 19 timeout 300 sh -c 'ulimit -v 2500000; \
+		$(OUT)/tar_unit_test && ./run_tests.sh $(OUT)/extract_test'
+
+clean:
+	rm -f $(OUT)/extract_test $(OUT)/extract_test_nozstd $(OUT)/tar_unit_test
+
+.PHONY: all check clean

@@ -1,0 +1,187 @@
+# Makefile.likeos - build acl 2.4.0 (libacl, getfacl, setfacl, chacl) for
+# LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; configure is not
+# run.  config.h in this directory stands in for the include/config.h
+# configure would write; the source lists are upstream's Makemodule.am files
+# (libacl, libmisc, tools) with the conditionals configure would settle for
+# the LikeOS libc: libmisc/xattrat.c (no *xattrat calls in the libc), no
+# libmisc/openat2.c (no openat2).
+#
+# Like configure, the build makes include/acl and include/sys point at
+# upstream's include/ directory (build/gen/acl, build/gen/sys), so
+# "acl/libacl.h" and "sys/acl.h" resolve while compiling.  The attr port
+# (ports/attr-2.6.0, built first by the top-level ports-acl target) supplies
+# <attr/error_context.h>.
+#
+# Results, in build/:
+#   lib/libacl.a         the library (static, position independent; the GNU
+#                        tar port links it), with libmisc's objects in it as
+#                        libtool puts them into libacl.so (libacl_la_LIBADD),
+#                        exporting what libacl.so exports (see below)
+#   include/sys/acl.h, include/acl/libacl.h
+#                        the public headers, as "make install" writes them
+#                        (EXPORT -> extern)
+#   getfacl, setfacl, chacl   the programs, installed to /usr/bin
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+AR = ar
+OBJCOPY = objcopy
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+ATTR_DIR = ../attr-2.6.0
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+G := $(B)/gen
+O := $(B)/obj
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.  Include order as upstream's
+# AM_CPPFLAGS (-I$(top_builddir)/include -I$(top_srcdir)/include), this
+# directory first for config.h.
+CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIC -fno-common \
+         -D_GNU_SOURCE -D__LIKEOS__ -DHAVE_CONFIG_H -DNDEBUG \
+         -DLOCALEDIR=\"/usr/share/locale\" \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -I. -I$(G) -I$(S)/include -I$(S) -I$(ATTR_DIR)/build/include
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int
+# Upstream's AM_CFLAGS.
+CFLAGS += -Wall -Wextra -Wmissing-prototypes
+# id_t is a signed int in the LikeOS libc (unsigned elsewhere), so every
+# comparison of a uid_t/gid_t with ACL_UNDEFINED_ID, ((id_t)-1), and every
+# uid_t * passed as an id_t * draws a signedness warning.  The comparisons
+# convert -1 to the unsigned 32-bit value they always meant; the one place
+# where the widening changed the value is patches/0003.
+CFLAGS += -Wno-sign-compare -Wno-pointer-sign
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+obj = $(addprefix $(O)/,$(1:.c=.o))
+
+POSIX_CFILES = acl_add_perm.c acl_calc_mask.c acl_clear_perms.c \
+	acl_copy_entry.c acl_copy_ext.c acl_copy_int.c acl_create_entry.c \
+	acl_delete_def_file.c acl_delete_def_file_at.c acl_delete_entry.c \
+	acl_delete_perm.c acl_dup.c acl_free.c acl_from_text.c \
+	acl_get_entry.c acl_get_fd.c acl_get_file.c acl_get_file_at.c \
+	acl_get_perm.c acl_get_permset.c acl_get_qualifier.c \
+	acl_get_tag_type.c acl_init.c acl_set_fd.c acl_set_file.c \
+	acl_set_file_at.c acl_set_permset.c acl_set_qualifier.c \
+	acl_set_tag_type.c acl_size.c acl_to_text.c acl_valid.c
+LIBACL_CFILES = acl_check.c acl_cmp.c acl_entries.c acl_equiv_mode.c \
+	acl_error.c acl_extended_fd.c acl_extended_file.c \
+	acl_extended_file_at.c acl_extended_file_nofollow.c acl_from_mode.c \
+	acl_to_any_text.c
+INTERNAL_CFILES = __acl_apply_mask_to_mode.c __acl_from_xattr.c \
+	__acl_reorder_obj_p.c __acl_to_any_text.c __acl_to_xattr.c __libobj.c
+LIBACL_OBJ = $(call obj,$(addprefix libacl/,$(POSIX_CFILES) \
+	$(LIBACL_CFILES) $(INTERNAL_CFILES) perm_copy_fd.c perm_copy_file.c))
+LIBMISC_OBJ = $(call obj,$(addprefix libmisc/,fchmodat_compat.c \
+	getxattrat_compat.c high_water_alloc.c listxattrat_compat.c \
+	next_line.c proc-self-fd.c quote.c walk_tree.c \
+	removexattrat_compat.c setxattrat_compat.c uid_gid_lookup.c \
+	unquote.c xattrat.c))
+
+CHACL_OBJ = $(call obj,tools/chacl.c)
+GETFACL_OBJ = $(call obj,tools/getfacl.c tools/user_group.c)
+SETFACL_OBJ = $(call obj,tools/do_set.c tools/parse.c tools/sequence.c \
+	tools/setfacl.c)
+
+PROGS = getfacl setfacl chacl
+TARGETS = $(B)/lib/libacl.a \
+	$(B)/include/sys/acl.h $(B)/include/acl/libacl.h \
+	$(addprefix $(B)/,$(PROGS))
+
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): acl-2.4.0.tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+# configure's AC_CONFIG_COMMANDS([include/acl]) and ([include/sys]).
+$(G)/acl $(G)/sys: $(SRC_STAMP)
+	@mkdir -p $(G)
+	ln -sfn $(abspath $(S)/include) $@
+	@touch -h $@
+
+# Every object depends on every header: there are few of them.
+HDRS = config.h $(wildcard $(S)/include/*.h $(S)/libacl/*.h \
+	$(S)/libmisc/*.h $(S)/tools/*.h) \
+	$(ATTR_DIR)/build/include/attr/error_context.h
+
+$(O)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS) | $(G)/acl $(G)/sys
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# libacl.so carries libmisc (libacl_la_LIBADD) and exports only what the
+# version script (src/exports) lists.  The archive is made the same way:
+# libacl's and libmisc's objects linked into one object, every symbol not
+# in src/exports made local.  So a program linking libacl.a (GNU tar) finds
+# what libacl calls, and none of libmisc's names (walk_tree, quote,
+# listxattrat ...) can collide with its own.
+$(B)/exports.syms: $(S)/exports $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\);.*/\1/p' $< >$@
+
+$(B)/lib/libacl.a: $(LIBACL_OBJ) $(LIBMISC_OBJ) $(B)/exports.syms
+	@mkdir -p $(dir $@) $(O)
+	$(LD) -r -o $(O)/libacl-all.o $(LIBACL_OBJ) $(LIBMISC_OBJ)
+	$(OBJCOPY) --keep-global-symbols=$(B)/exports.syms $(O)/libacl-all.o
+	rm -f $@
+	$(AR) rcs $@ $(O)/libacl-all.o
+
+# The programs use libmisc's helpers as well: they link the objects.
+$(O)/libacl-tools.a: $(LIBACL_OBJ) $(LIBMISC_OBJ)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+# Makefile.am's SUBST_INSTALL_HEADER.
+$(B)/include/sys/acl.h: $(S)/include/acl.h $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/\<EXPORT\>/extern/' $< >$@
+$(B)/include/acl/libacl.h: $(S)/include/libacl.h $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/\<EXPORT\>/extern/' $< >$@
+
+LINK = $(LD) $(LDFLAGS) $(CRT1) $(filter %.o,$(filter-out $(CRT1),$^)) \
+	$(O)/libacl-tools.a $(LIBS) -o $@
+
+$(B)/chacl: $(CHACL_OBJ) $(O)/libacl-tools.a $(CRT1)
+	$(LINK)
+$(B)/getfacl: $(GETFACL_OBJ) $(O)/libacl-tools.a $(CRT1)
+	$(LINK)
+$(B)/setfacl: $(SETFACL_OBJ) $(O)/libacl-tools.a $(CRT1)
+	$(LINK)
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

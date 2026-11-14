@@ -1088,16 +1088,22 @@ int rmdir(const char *path)
 	return 0;
 }
 
-/* The kernel has no special-file inodes (FIFOs, device nodes) on disk yet,
- * so mknod/mkfifo report ENOSYS honestly rather than pretending.  Programs
- * with a fallback (e.g. process substitution via /dev/fd) take it. */
+/* Special files: FIFOs, sockets, and (for root) character and block device
+ * nodes, kept on the filesystem with their device number. */
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev)
+{
+	long ret = syscall4(SYS_MKNODAT, dirfd, (long)path, (long)mode,
+			    (long)dev);
+	if (ret < 0) {
+		errno = -ret;
+		return -1;
+	}
+	return 0;
+}
+
 int mknod(const char *path, mode_t mode, dev_t dev)
 {
-	(void)path;
-	(void)mode;
-	(void)dev;
-	errno = ENOSYS;
-	return -1;
+	return mknodat(AT_FDCWD, path, mode, dev);
 }
 
 int mkfifo(const char *path, mode_t mode)
@@ -1105,18 +1111,90 @@ int mkfifo(const char *path, mode_t mode)
 	return mknod(path, (mode & 07777) | S_IFIFO, 0);
 }
 
-/* The directory-relative forms answer exactly as the plain ones: the
- * kernel has no device or FIFO nodes to make on a filesystem, so every
- * variant reports ENOSYS. */
-int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev)
-{
-	(void)dirfd;
-	return mknod(path, mode, dev);
-}
-
 int mkfifoat(int dirfd, const char *path, mode_t mode)
 {
 	return mknodat(dirfd, path, (mode & 07777) | S_IFIFO, 0);
+}
+
+static int at_result(long ret)
+{
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	return 0;
+}
+
+int fchownat(int dirfd, const char *path, uid_t owner, gid_t group, int flags)
+{
+	return at_result(syscall5(SYS_FCHOWNAT, dirfd, (long)path,
+				  (long)(int)owner, (long)(int)group, flags));
+}
+
+int lchown(const char *path, uid_t owner, gid_t group)
+{
+	return fchownat(AT_FDCWD, path, owner, group, AT_SYMLINK_NOFOLLOW);
+}
+
+int linkat(int olddirfd, const char *oldpath, int newdirfd,
+	   const char *newpath, int flags)
+{
+	return at_result(syscall5(SYS_LINKAT, olddirfd, (long)oldpath,
+				  newdirfd, (long)newpath, flags));
+}
+
+int symlinkat(const char *target, int newdirfd, const char *linkpath)
+{
+	return at_result(syscall3(SYS_SYMLINKAT, (long)target, newdirfd,
+				  (long)linkpath));
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode)
+{
+	return at_result(syscall3(SYS_MKDIRAT, dirfd, (long)path, (long)mode));
+}
+
+int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+	      const char *newpath, unsigned int flags)
+{
+	return at_result(syscall5(SYS_RENAMEAT2, olddirfd, (long)oldpath,
+				  newdirfd, (long)newpath, (long)flags));
+}
+
+int renameat(int olddirfd, const char *oldpath, int newdirfd,
+	     const char *newpath)
+{
+	return renameat2(olddirfd, oldpath, newdirfd, newpath, 0);
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+	return at_result(syscall4(SYS_FCHMODAT, dirfd, (long)path, (long)mode,
+				  flags));
+}
+
+int syncfs(int fd)
+{
+	return at_result(syscall1(SYS_SYNCFS, fd));
+}
+
+#include <sys/mount.h>
+
+int mount(const char *source, const char *target, const char *fstype,
+	  unsigned long flags, const void *data)
+{
+	return at_result(syscall5(SYS_MOUNT, (long)source, (long)target,
+				  (long)fstype, (long)flags, (long)data));
+}
+
+int umount2(const char *target, int flags)
+{
+	return at_result(syscall2(SYS_UMOUNT2, (long)target, flags));
+}
+
+int umount(const char *target)
+{
+	return umount2(target, 0);
 }
 
 int link(const char *oldpath, const char *newpath)
@@ -1525,14 +1603,20 @@ int execlp(const char *file, const char *arg, ...)
 	return execvp(file, argv);
 }
 
+/* The times of the file a descriptor is open on: utimensat() with a NULL
+ * path, which the kernel takes as "the descriptor itself". */
 int futimens(int fd, const struct timespec times[2])
 {
-	/* Use utimensat with AT_FDCWD-like approach */
-	/* For now, stub - nano uses this for timestamp preservation */
-	(void)fd;
-	(void)times;
-	errno = ENOSYS;
-	return -1;
+	if (fd < 0) {
+		errno = EBADF;
+		return -1;
+	}
+	long ret = syscall4(SYS_UTIMENSAT, fd, 0, (long)times, 0);
+	if (ret < 0) {
+		errno = -ret;
+		return -1;
+	}
+	return 0;
 }
 
 int flock(int fd, int op)

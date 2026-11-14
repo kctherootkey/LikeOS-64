@@ -14,6 +14,7 @@
 #include <kernel/ke/signal.h>
 #include <kernel/io/tty.h>
 #include <kernel/hal/lapic.h>
+#include <kernel/hal/efi.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
 #include <kernel/dev/hid/i2c_hid.h>
@@ -1693,6 +1694,16 @@ static void exception_handler_body(uint64_t *regs)
 	 * this is the last point before kernel code could disturb them. */
 	if (user_mode)
 		task_capture_user_segments(sched_current());
+
+	/* An exception raised by UEFI firmware code during a runtime service
+	 * call (kernel/hal/efi.c): the call is ended with EFI_ABORTED and the
+	 * runtime services are switched off, instead of the kernel taking
+	 * the blame.  First, before the page-fault paths below: the
+	 * firmware runs on addresses that look like user ones. */
+	if (!user_mode &&
+	    efi_rt_fault(int_no, err_code, &regs[REGS_RIP], &regs[REGS_RFLAGS],
+			 &regs[REGS_RAX]))
+		return;
 
 	/* INT 2 (NMI): if this NMI is a diagnostic probe armed by another CPU
      * via smp_tlb_shootdown_sync's timeout path, record this CPU's state

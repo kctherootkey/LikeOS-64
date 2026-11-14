@@ -1,0 +1,25 @@
+# /etc/inittab.install - what init starts when the LikeOS medium was booted
+# with "Install LikeOS" (likeos.mode=install on the kernel command line).
+#
+# The same format as /etc/inittab (see there).  Instead of a login prompt
+# the installer session runs on the console: it starts the X server with
+# LikeOS Setup, and when the graphical installer cannot run, the text-mode
+# installer.  It is respawned when it ends without restarting the computer.
+#
+# The live medium only: the installer removes this file from the system it
+# installs.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+# A word on the console, which still shows the boot messages, before the
+# screen changes to the installer.
+wait	console	/bin/echo LikeOS Setup is starting ...
+
+# Audio service, so the installer can play its sounds (optional: setup
+# works without it).
+respawn	/usr/sbin/audiod -f
+
+# The installer session (X server + likeos-installer, or likeos-install on
+# the console).  "console": it needs the terminal for its messages and for
+# the text-mode installer.
+respawn	console	/usr/libexec/likeos-installer-session

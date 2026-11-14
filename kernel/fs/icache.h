@@ -56,6 +56,9 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 typedef struct ic_inode {
 	// Key — FS-native inode identifier (FAT32: start cluster; EXT4: inode no.).
 	unsigned long start_cluster;
+	/* ...within this filesystem: the identifiers of two mounted
+	 * filesystems overlap.  Also what the inode is written back through. */
+	struct vfs_superblock *sb;
 
 	// Generic cached metadata
 	unsigned long size; // File size in bytes
@@ -107,12 +110,13 @@ void icache_init(void);
 
 // Look up an inode by start_cluster. Returns NULL on miss.
 // Does NOT increment refcount — caller must call icache_ref() if keeping.
-ic_inode_t *icache_lookup(unsigned long start_cluster);
+ic_inode_t *icache_lookup(struct vfs_superblock *sb, unsigned long start_cluster);
 
 // Look up or create: returns an inode for start_cluster.
 // If not cached, allocates a new inode with the given metadata.
 // Increments refcount.
-ic_inode_t *icache_get(unsigned long start_cluster, unsigned long size,
+ic_inode_t *icache_get(struct vfs_superblock *sb, unsigned long start_cluster,
+		       unsigned long size,
 		       unsigned int attr, unsigned long parent_cluster,
 		       unsigned long dirent_cluster, unsigned int dirent_index,
 		       uint16_t wrt_time, uint16_t wrt_date);
@@ -127,7 +131,8 @@ void icache_unref(ic_inode_t *inode);
 // it.  Test and mark are one step under the cache's lock, so a close racing
 // with the caller either sees the flag or has already been counted out.
 // Returns 1 if marked (something holds the inode), 0 otherwise.
-int icache_flag_if_referenced(unsigned long start_cluster, uint32_t flag);
+int icache_flag_if_referenced(struct vfs_superblock *sb,
+			      unsigned long start_cluster, uint32_t flag);
 
 // icache_unref() that also answers whether this was the LAST reference to
 // an inode carrying `flag': returns 1 in that case (the flag is cleared and
@@ -147,10 +152,14 @@ int icache_flush(ic_inode_t *inode);
 int icache_flush_all(void);
 
 // Remove an inode from the cache (on unlink)
-void icache_remove(unsigned long start_cluster);
+void icache_remove(struct vfs_superblock *sb, unsigned long start_cluster);
 
 // Invalidate the entire cache
 void icache_invalidate_all(void);
+
+// One filesystem's dirty inodes stored / all its inodes forgotten (unmount)
+int icache_flush_sb(struct vfs_superblock *sb);
+void icache_invalidate_sb(struct vfs_superblock *sb);
 
 // Per-inode I/O lock (for cached-read-without-global-lock pattern)
 void icache_io_lock(ic_inode_t *inode);
@@ -167,7 +176,8 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 
 // Invalidate (discard) the chain cache for a file.
 // Call on truncate or unlink.
-void icache_chain_invalidate(unsigned long start_cluster);
+void icache_chain_invalidate(struct vfs_superblock *sb,
+			     unsigned long start_cluster);
 
 // Statistics
 typedef struct ic_stats {

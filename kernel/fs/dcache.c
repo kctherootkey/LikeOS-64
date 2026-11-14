@@ -141,10 +141,12 @@ static int dc_strcmp(const char *a, const char *b)
 
 /* The two interfaces differ only in how a name is hashed and compared, plus
  * the flag that keeps their entries from being addressed by the wrong one. */
-static inline int dc_key_matches(const dc_entry_t *e, unsigned long parent,
-				 unsigned long nh, const char *name, int cs)
+static inline int dc_key_matches(const dc_entry_t *e, const void *owner,
+				 unsigned long parent, unsigned long nh,
+				 const char *name, int cs)
 {
-	if (e->parent_cluster != parent || e->name_hash != nh)
+	if (e->parent_cluster != parent || e->name_hash != nh ||
+	    e->owner != owner)
 		return 0;
 	if (!!(e->flags & DC_CASE_SENSITIVE) != !!cs)
 		return 0;
@@ -256,7 +258,7 @@ static void dc_evict_one(void)
 // Lookup
 // ============================================================================
 
-dc_entry_t *dcache_lookup(unsigned long parent_cluster, const char *name)
+dc_entry_t *dcache_lookup(const void *owner, unsigned long parent_cluster, const char *name)
 {
 	BUG_ON(name == NULL);
 	WARN_ON_ONCE(
@@ -272,7 +274,7 @@ dc_entry_t *dcache_lookup(unsigned long parent_cluster, const char *name)
 
 	dc_entry_t *e = dc_hash[bucket].head;
 	while (e) {
-		if (dc_key_matches(e, parent_cluster, nh, name, 0)) {
+		if (dc_key_matches(e, owner, parent_cluster, nh, name, 0)) {
 			// Hit — move to LRU head
 			uint64_t lru_flags;
 			spin_lock_irqsave(&dc_lru_lock, &lru_flags);
@@ -298,7 +300,8 @@ dc_entry_t *dcache_lookup(unsigned long parent_cluster, const char *name)
 // Internal insert helper
 // ============================================================================
 
-static dc_entry_t *dc_alloc_entry(unsigned long parent_cluster,
+static dc_entry_t *dc_alloc_entry(const void *owner,
+				  unsigned long parent_cluster,
 				  const char *name, unsigned long nh)
 {
 	might_sleep();
@@ -312,6 +315,7 @@ static dc_entry_t *dc_alloc_entry(unsigned long parent_cluster,
 		return 0;
 	mm_memset(e, 0, sizeof(dc_entry_t));
 	e->parent_cluster = parent_cluster;
+	e->owner = owner;
 	e->name_hash = nh;
 	// Copy name (case-preserved)
 	int i;
@@ -357,8 +361,9 @@ static void dc_free_chain(dc_entry_t *victims)
  * It is not harmless to remove.  Stopping at the first would leave the second
  * behind, and that leftover is a name that has just been deleted still
  * answering lookups. */
-static void dc_remove_existing(unsigned long parent_cluster, const char *name,
-			       unsigned long nh, unsigned long bucket, int cs)
+static void dc_remove_existing(const void *owner, unsigned long parent_cluster,
+			       const char *name, unsigned long nh,
+			       unsigned long bucket, int cs)
 {
 	dc_entry_t *victims = 0;
 	uint64_t flags;
@@ -367,7 +372,7 @@ static void dc_remove_existing(unsigned long parent_cluster, const char *name,
 	dc_entry_t **pp = &dc_hash[bucket].head;
 	while (*pp) {
 		dc_entry_t *e = *pp;
-		if (dc_key_matches(e, parent_cluster, nh, name, cs)) {
+		if (dc_key_matches(e, owner, parent_cluster, nh, name, cs)) {
 			*pp = e->hash_next;
 
 			uint64_t lru_flags;
@@ -413,7 +418,7 @@ static void dc_publish(dc_entry_t *e, unsigned long bucket)
 // Insert positive dentry
 // ============================================================================
 
-void dcache_insert(unsigned long parent_cluster, const char *name,
+void dcache_insert(const void *owner, unsigned long parent_cluster, const char *name,
 		   unsigned long start_cluster, unsigned long size,
 		   unsigned int attr, uint16_t wrt_time, uint16_t wrt_date,
 		   unsigned long dirent_cluster, unsigned int dirent_index,
@@ -429,9 +434,9 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
 	unsigned long bucket = dc_bucket_index(parent_cluster, nh);
 
 	// Remove any existing entry with same key
-	dc_remove_existing(parent_cluster, name, nh, bucket, 0);
+	dc_remove_existing(owner, parent_cluster, name, nh, bucket, 0);
 
-	dc_entry_t *e = dc_alloc_entry(parent_cluster, name, nh);
+	dc_entry_t *e = dc_alloc_entry(owner, parent_cluster, name, nh);
 	if (!e)
 		return;
 
@@ -468,7 +473,7 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
 // Insert negative dentry
 // ============================================================================
 
-void dcache_insert_negative(unsigned long parent_cluster, const char *name)
+void dcache_insert_negative(const void *owner, unsigned long parent_cluster, const char *name)
 {
 	if (!dc_initialized || !name || !name[0])
 		return;
@@ -477,9 +482,9 @@ void dcache_insert_negative(unsigned long parent_cluster, const char *name)
 	unsigned long bucket = dc_bucket_index(parent_cluster, nh);
 
 	// Remove any existing entry with same key
-	dc_remove_existing(parent_cluster, name, nh, bucket, 0);
+	dc_remove_existing(owner, parent_cluster, name, nh, bucket, 0);
 
-	dc_entry_t *e = dc_alloc_entry(parent_cluster, name, nh);
+	dc_entry_t *e = dc_alloc_entry(owner, parent_cluster, name, nh);
 	if (!e)
 		return;
 
@@ -492,7 +497,7 @@ void dcache_insert_negative(unsigned long parent_cluster, const char *name)
 // Invalidation
 // ============================================================================
 
-void dcache_invalidate(unsigned long parent_cluster, const char *name)
+void dcache_invalidate(const void *owner, unsigned long parent_cluster, const char *name)
 {
 	if (!dc_initialized || !name)
 		return;
@@ -500,10 +505,10 @@ void dcache_invalidate(unsigned long parent_cluster, const char *name)
 	unsigned long nh = dc_name_hash(name);
 	unsigned long bucket = dc_bucket_index(parent_cluster, nh);
 
-	dc_remove_existing(parent_cluster, name, nh, bucket, 0);
+	dc_remove_existing(owner, parent_cluster, name, nh, bucket, 0);
 }
 
-void dcache_invalidate_dir(unsigned long parent_cluster)
+void dcache_invalidate_dir(const void *owner, unsigned long parent_cluster)
 {
 	if (!dc_initialized)
 		return;
@@ -518,7 +523,8 @@ void dcache_invalidate_dir(unsigned long parent_cluster)
 		dc_entry_t **pp = &dc_hash[b].head;
 		while (*pp) {
 			dc_entry_t *e = *pp;
-			if (e->parent_cluster == parent_cluster) {
+			if (e->parent_cluster == parent_cluster &&
+			    e->owner == owner) {
 				*pp = e->hash_next;
 
 				/* Off the LRU before the bucket lock is
@@ -527,6 +533,40 @@ void dcache_invalidate_dir(unsigned long parent_cluster)
 				 * concurrent eviction, which would fail to find
 				 * it in its bucket and free it -- while it is
 				 * also on this list, waiting to be freed. */
+				uint64_t lru_flags;
+				spin_lock_irqsave(&dc_lru_lock, &lru_flags);
+				dc_lru_remove(e);
+				spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
+
+				e->hash_next = victims;
+				victims = e;
+			} else {
+				pp = &(*pp)->hash_next;
+			}
+		}
+		spin_unlock_irqrestore(&dc_hash[b].lock, flags);
+
+		dc_free_chain(victims);
+	}
+}
+
+/* Every entry one filesystem made (unmount). */
+void dcache_invalidate_owner(const void *owner)
+{
+	if (!dc_initialized)
+		return;
+
+	for (int b = 0; b < DC_HASH_BUCKETS; b++) {
+		dc_entry_t *victims = 0;
+		uint64_t flags;
+
+		spin_lock_irqsave(&dc_hash[b].lock, &flags);
+		dc_entry_t **pp = &dc_hash[b].head;
+		while (*pp) {
+			dc_entry_t *e = *pp;
+			if (e->owner == owner) {
+				*pp = e->hash_next;
+
 				uint64_t lru_flags;
 				spin_lock_irqsave(&dc_lru_lock, &lru_flags);
 				dc_lru_remove(e);
@@ -594,7 +634,7 @@ void dcache_invalidate_all(void)
  * DC_CASE_SENSITIVE is part of the key match.
  */
 
-int dcache_lookup_cs(unsigned long parent, const char *name, dc_result_t *out)
+int dcache_lookup_cs(const void *owner, unsigned long parent, const char *name, dc_result_t *out)
 {
 	BUG_ON(name == NULL);
 	BUG_ON(out == NULL);
@@ -612,7 +652,7 @@ int dcache_lookup_cs(unsigned long parent, const char *name, dc_result_t *out)
 	uint64_t flags;
 	spin_lock_irqsave(&dc_hash[bucket].lock, &flags);
 	for (dc_entry_t *e = dc_hash[bucket].head; e; e = e->hash_next) {
-		if (!dc_key_matches(e, parent, nh, name, 1))
+		if (!dc_key_matches(e, owner, parent, nh, name, 1))
 			continue;
 
 		uint64_t lru_flags;
@@ -645,7 +685,7 @@ int dcache_lookup_cs(unsigned long parent, const char *name, dc_result_t *out)
 	return result;
 }
 
-void dcache_insert_cs(unsigned long parent, const char *name, unsigned long ino,
+void dcache_insert_cs(const void *owner, unsigned long parent, const char *name, unsigned long ino,
 		      unsigned long size, unsigned int attr)
 {
 	BUG_ON(name == NULL);
@@ -661,9 +701,9 @@ void dcache_insert_cs(unsigned long parent, const char *name, unsigned long ino,
 	unsigned long nh = dc_name_hash_cs(name);
 	unsigned long bucket = dc_bucket_index(parent, nh);
 
-	dc_remove_existing(parent, name, nh, bucket, 1);
+	dc_remove_existing(owner, parent, name, nh, bucket, 1);
 
-	dc_entry_t *e = dc_alloc_entry(parent, name, nh);
+	dc_entry_t *e = dc_alloc_entry(owner, parent, name, nh);
 	if (!e)
 		return;
 
@@ -678,7 +718,7 @@ void dcache_insert_cs(unsigned long parent, const char *name, unsigned long ino,
 	WARN_ON_ONCE(dc_entry_count > DC_MAX_ENTRIES + 1);
 }
 
-void dcache_insert_negative_cs(unsigned long parent, const char *name)
+void dcache_insert_negative_cs(const void *owner, unsigned long parent, const char *name)
 {
 	BUG_ON(name == NULL);
 	BUG_ON(parent == 0);
@@ -690,9 +730,9 @@ void dcache_insert_negative_cs(unsigned long parent, const char *name)
 	unsigned long nh = dc_name_hash_cs(name);
 	unsigned long bucket = dc_bucket_index(parent, nh);
 
-	dc_remove_existing(parent, name, nh, bucket, 1);
+	dc_remove_existing(owner, parent, name, nh, bucket, 1);
 
-	dc_entry_t *e = dc_alloc_entry(parent, name, nh);
+	dc_entry_t *e = dc_alloc_entry(owner, parent, name, nh);
 	if (!e)
 		return;
 
@@ -701,7 +741,7 @@ void dcache_insert_negative_cs(unsigned long parent, const char *name)
 	dc_publish(e, bucket);
 }
 
-void dcache_invalidate_cs(unsigned long parent, const char *name)
+void dcache_invalidate_cs(const void *owner, unsigned long parent, const char *name)
 {
 	BUG_ON(name == NULL);
 	if (!dc_initialized || !name || !name[0])
@@ -712,7 +752,7 @@ void dcache_invalidate_cs(unsigned long parent, const char *name)
 	unsigned long nh = dc_name_hash_cs(name);
 	unsigned long bucket = dc_bucket_index(parent, nh);
 
-	dc_remove_existing(parent, name, nh, bucket, 1);
+	dc_remove_existing(owner, parent, name, nh, bucket, 1);
 }
 
 // ============================================================================

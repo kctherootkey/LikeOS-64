@@ -1,0 +1,42 @@
+# likeos-survey.cache - answers for the configure tests of GNU tar that
+# have to run a program, read by likeos-survey.sh (configure -C).
+#
+# A cross configure cannot run its test programs, so gnulib guesses, and
+# for a system it does not know it guesses "no": the function is replaced
+# by gnulib's own.  Most of those replacements wrap the libc function and
+# are harmless, and they stay (stat/lstat/mkdir/rename/... trailing-slash
+# handling, strtol, mktime, fnmatch, regex, snprintf, wcwidth ...).  The
+# answers below are the ones where a replacement would be wrong for the
+# LikeOS libc, checked against its source (user/lib/libc):
+#
+# Copyright (C) 2026 The LikeOS Project
+
+# setenv/unsetenv: the libc keeps the environment in its own tables and
+# rebuilds environ from them; gnulib's replacements edit environ directly,
+# which getenv() would then not see.  Both validate their arguments (empty
+# name, '=' in the name: EINVAL), which is what the tests check.
+gl_cv_func_setenv_works=yes
+gl_cv_func_unsetenv_works=yes
+
+# getcwd(NULL, 0) allocates the result (src/syscalls/unistd.c); the kernel
+# answers for every path it can resolve, and no longer path exists, so
+# gnulib's directory-walking getcwd has nothing to add.
+gl_cv_func_getcwd_null=yes
+gl_cv_func_getcwd_path_max=yes
+gl_cv_func_getcwd_succeeds_beyond_4k=yes
+
+# struct dirent has d_ino (include/dirent.h).
+gl_cv_struct_dirent_d_ino=yes
+
+# getgroups(0, NULL) returns the number of supplementary groups (it is the
+# system call's own answer).  Guessed "no", gnulib would take getgroups for
+# missing altogether and build its ENOSYS stub.
+ac_cv_func_getgroups_works=yes
+
+# fflush() of an input stream does not discard the read buffer in this
+# libc.  tar never flushes an input stream; its one fseeko() (rewinding the
+# --listed-incremental snapshot file) is the libc's, which drops the read
+# buffer itself.  Answered "no", gnulib would substitute an fseeko()/fclose()
+# built on stdio internals it does not know for this libc (and fail to
+# compile).
+gl_cv_func_fflush_stdin=yes

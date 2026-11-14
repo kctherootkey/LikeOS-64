@@ -97,7 +97,8 @@ struct percpu {
 	// Idle task for this CPU
 	task_t *idle_task;
 
-	// Preemption control (replaces global g_preempt_count)
+	// Preemption gate (percpu_preempt_disable/enable, below): while it is
+	// non-zero, an interrupt's exit never switches this CPU to another task.
 	volatile int preempt_count;
 
 	// Nested interrupt count
@@ -280,6 +281,24 @@ static inline void set_current(task_t *task)
 // ============================================================================
 // Preemption Control (Per-CPU)
 // ============================================================================
+//
+// The preemption gate.  While this CPU's count is non-zero, sched_preempt() --
+// the one place a task is switched away from without asking, at the exit of an
+// interrupt or IPI -- leaves the running task where it is: need_resched stays
+// set and the switch happens at the first interrupt exit after the count is
+// back to zero.  Interrupts themselves are not held off: handlers run, they
+// just return to the code they interrupted.
+//
+// The count belongs to the CPU, not the task, so a gated section must not
+// sleep, block or yield: a task that left the CPU with the count raised would
+// leave it gating whatever runs there next, and its own enable would land on
+// whatever CPU it resumed on.  Nothing in a gated section may call the
+// scheduler.  Sections nest.
+//
+// Users: the UEFI runtime-service call (kernel/hal/efi.c), which must not be
+// switched away from while CR3 holds the firmware's page table.  (The older
+// preempt_disable() in sched.h counts in a single global that nothing raises
+// and the scheduler never consulted; it is unrelated to this gate.)
 
 // Disable preemption on this CPU
 static inline void percpu_preempt_disable(void)

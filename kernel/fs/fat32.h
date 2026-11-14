@@ -21,6 +21,15 @@ typedef struct fat32_fs {
 	unsigned int root_cluster;
 	unsigned int num_fats;
 	unsigned long fat_size_sectors;
+	/* Absolute LBA of the FSInfo sector, 0 when the boot sector names
+	 * none (or one outside the reserved area). */
+	unsigned long fsinfo_lba;
+	/* Everything that changes while the filesystem is mounted (the FAT
+	 * window, the root directory copy, the free count, the I/O mutex, the
+	 * mount options).  Allocated by fat32_mount() for the volume it
+	 * chose, freed by fat32_release(); NULL in a volume that was only
+	 * looked at.  Private to fat32.c. */
+	struct fat32_state *st;
 	/* VFS-layer superblock.  sb.fs_private points back at this fat32_fs_t,
      * and sb.ops dispatches the generic cache <-> FS calls
      * (block_to_lba / next_block / write_inode / lock_io ...).  The
@@ -62,34 +71,51 @@ typedef struct {
 #define FAT32_ATTR_DIRECTORY 0x10
 #define FAT32_ATTR_ARCHIVE 0x20
 
+/* Find the FAT32 volume on `bdev' (the device itself, or a partition its
+ * MBR/GPT names) and bring it up in `out': geometry, private state, and the
+ * page-cache superblock.  Publishes nothing; the caller makes it the root
+ * (fat32_vfs_register_root) or a mount (fat32_fstype).  ST_OK, or an ST_ code
+ * with nothing left allocated. */
 int fat32_mount(const block_device_t *bdev, fat32_fs_t *out);
+/* Free what fat32_mount() allocated for `fs' (not `fs' itself).  The caller
+ * has dropped every cache entry of the instance first. */
+void fat32_release(fat32_fs_t *fs);
+/* Make the mounted instance `fs' the root filesystem. */
 int fat32_vfs_register_root(fat32_fs_t *fs);
-void fat32_list_root(void (*cb)(const char *, unsigned attr,
-				unsigned long size));
-void fat32_debug_dump_root(void);
-int fat32_dir_list(unsigned long cluster,
-		   void (*cb)(const char *, unsigned attr, unsigned long size));
-int fat32_dir_find(unsigned long start_cluster, const char *name,
-		   unsigned *attr, unsigned long *first_cluster,
-		   unsigned long *size);
-unsigned long fat32_root_cluster(void);
-void fat32_set_cwd(unsigned long cluster);
-unsigned long fat32_get_cwd(void);
-// Extended path resolution (supports relative, '.', '..')
-int fat32_resolve_path(unsigned long start_cluster, const char *path,
-		       unsigned *attr, unsigned long *first_cluster,
-		       unsigned long *size);
-// Metadata/stat helper
-int fat32_stat(unsigned long start_cluster, const char *path, unsigned *attr,
-	       unsigned long *first_cluster, unsigned long *size);
-// Get parent cluster of directory (returns same cluster for root)
-unsigned long fat32_parent_cluster(unsigned long dir_cluster);
+/* mount(2) type "vfat" (also "fat32", "msdos", "fat"). */
+extern const vfs_fstype_t fat32_fstype;
 
-// Write helpers
-int fat32_unlink_path(const char *path);
-int fat32_rename_path(const char *oldpath, const char *newpath);
-int fat32_mkdir_path(const char *path);
-int fat32_rmdir_path(const char *path);
+/* Directory and path helpers of one instance.  Clusters are that volume's;
+ * a start cluster of 0 means its root directory. */
+void fat32_list_root(fat32_fs_t *fs,
+		     void (*cb)(const char *, unsigned attr,
+				unsigned long size));
+void fat32_debug_dump_root(fat32_fs_t *fs);
+int fat32_dir_list(fat32_fs_t *fs, unsigned long cluster,
+		   void (*cb)(const char *, unsigned attr, unsigned long size));
+int fat32_dir_find(fat32_fs_t *fs, unsigned long start_cluster,
+		   const char *name, unsigned *attr,
+		   unsigned long *first_cluster, unsigned long *size);
+unsigned long fat32_root_cluster(fat32_fs_t *fs);
+void fat32_set_cwd(fat32_fs_t *fs, unsigned long cluster);
+unsigned long fat32_get_cwd(fat32_fs_t *fs);
+// Extended path resolution (supports relative, '.', '..')
+int fat32_resolve_path(fat32_fs_t *fs, unsigned long start_cluster,
+		       const char *path, unsigned *attr,
+		       unsigned long *first_cluster, unsigned long *size);
+// Metadata/stat helper
+int fat32_stat(fat32_fs_t *fs, unsigned long start_cluster, const char *path,
+	       unsigned *attr, unsigned long *first_cluster,
+	       unsigned long *size);
+// Get parent cluster of directory (returns same cluster for root)
+unsigned long fat32_parent_cluster(fat32_fs_t *fs, unsigned long dir_cluster);
+
+// Write helpers (caller holds the instance's I/O mutex)
+int fat32_unlink_path(fat32_fs_t *fs, const char *path);
+int fat32_rename_path(fat32_fs_t *fs, const char *oldpath,
+		      const char *newpath);
+int fat32_mkdir_path(fat32_fs_t *fs, const char *path);
+int fat32_rmdir_path(fat32_fs_t *fs, const char *path);
 
 /* Filesystem statistics for statfs(2) */
 typedef struct {
@@ -107,22 +133,25 @@ typedef struct {
 } fat32_statfs_t;
 
 /* Fill fs_info with current filesystem statistics.  Returns 0 on success. */
-int fat32_get_statfs(fat32_statfs_t *info);
+int fat32_get_statfs(fat32_fs_t *fs, fat32_statfs_t *info);
 
 /* Update mtime of a file at path.  mtime_nsec == KRN_UTIME_NOW means
  * set to current time; KRN_UTIME_OMIT leaves it unchanged. */
 #define KRN_UTIME_NOW ((long)1073741823L)
 #define KRN_UTIME_OMIT ((long)1073741822L)
-int fat32_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec);
+
 
 /* Page cache support: exported FAT32 internals */
+/* The instance mounted as the root filesystem, NULL when the root is not
+ * FAT32. */
 extern fat32_fs_t *g_root_fs;
-void fat32_io_lock(void);
-void fat32_io_unlock(void);
-/* If the FAT32 I/O mutex is currently held by the given task id, force-release
- * it and wake any waiters.  Used by the task-exit path (via the VFS layer) to
- * recover from a task killed mid-write while inside the FS. */
-int fat32_io_release_if_owner(uint64_t task_id);
+/* The instance's sleeping I/O mutex (reentrant per task). */
+void fat32_io_lock(fat32_fs_t *fs);
+void fat32_io_unlock(fat32_fs_t *fs);
+/* If the instance's I/O mutex is currently held by the given task id,
+ * force-release it and wake any waiters.  Used by the task-exit path (via the
+ * VFS layer) to recover from a task killed mid-write while inside the FS. */
+int fat32_io_release_if_owner(fat32_fs_t *fs, uint64_t task_id);
 unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
 
 #endif // LIKEOS_FAT32_H

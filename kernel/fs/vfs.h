@@ -35,6 +35,23 @@ typedef unsigned long uintptr_t;
 
 typedef struct vfs_file vfs_file_t;
 
+/* A mounted filesystem instance (kernel/fs/mount.c).  Every path operation
+ * of vfs_ops_t receives the mount it runs on, which is how a driver that can
+ * be mounted more than once finds its instance (m->fs_data). */
+struct vfs_mount;
+typedef struct vfs_mount vfs_mount_t;
+struct vfs_superblock;
+struct block_device;
+
+/* Times for the utimens/futimens ops.  A nanosecond field may hold
+ * VFS_UTIME_NOW (use the current time) or VFS_UTIME_OMIT (leave as it is). */
+struct vfs_utimes {
+	int64_t atime_sec;
+	long atime_nsec;
+	int64_t mtime_sec;
+	long mtime_nsec;
+};
+
 /* Whole-filesystem statistics, filled by the statfs op.  Mirrors the fields
  * the statfs/fstatfs syscalls expose to userspace, but is filesystem-agnostic
  * so the syscall layer never references a specific driver's struct. */
@@ -53,27 +70,29 @@ struct vfs_statfs {
 	unsigned long f_fsid; /* filesystem id (not meaningful here)         */
 	unsigned long
 		f_namelen; /* maximum filename length                     */
+	unsigned long f_flags; /* mount flags (ST_RDONLY ...), set by the VFS */
 };
 
 typedef struct {
-	int (*open)(const char *path, int flags, vfs_file_t **out);
-	int (*stat)(const char *path, struct kstat *st);
+	int (*open)(vfs_mount_t *m, const char *path, int flags,
+		    vfs_file_t **out);
+	int (*stat)(vfs_mount_t *m, const char *path, struct kstat *st);
 	long (*read)(vfs_file_t *f, void *buf, long bytes);
 	long (*write)(vfs_file_t *f, const void *buf, long bytes);
 	long (*seek)(vfs_file_t *f, long offset, int whence);
 	long (*readdir)(vfs_file_t *f, void *buf, long bytes);
 	int (*truncate)(vfs_file_t *f, unsigned long size);
-	int (*unlink)(const char *path);
-	int (*rename)(const char *oldpath, const char *newpath);
-	int (*mkdir)(const char *path, unsigned int mode);
-	int (*rmdir)(const char *path);
-	int (*chdir)(const char *path);
+	int (*unlink)(vfs_mount_t *m, const char *path);
+	int (*rename)(vfs_mount_t *m, const char *oldpath, const char *newpath);
+	int (*mkdir)(vfs_mount_t *m, const char *path, unsigned int mode);
+	int (*rmdir)(vfs_mount_t *m, const char *path);
+	int (*chdir)(vfs_mount_t *m, const char *path);
 	int (*close)(vfs_file_t *f);
 	/* Force-release any per-filesystem locks owned by the given task.
      * Called from the scheduler's dead-thread reaper when a task that was
      * killed (e.g. via SIGINT) may have died inside a syscall while holding
      * filesystem-private locks.  Optional; may be NULL. */
-	int (*release_locks_for_task)(uint64_t task_id);
+	int (*release_locks_for_task)(vfs_mount_t *m, uint64_t task_id);
 	/* Flush a file's dirty data + metadata to disk (fsync).  Optional; when
      * NULL the syscall layer treats the flush as a no-op for this fs.  Lets
      * a filesystem whose cache key differs from the raw FAT32 start_cluster
@@ -87,27 +106,39 @@ typedef struct {
 
 	/* Like stat(), but does NOT follow a final symlink.  NULL => no symlinks
      * on this fs, so the wrapper falls back to stat(). */
-	int (*lstat)(const char *path, struct kstat *st);
+	int (*lstat)(vfs_mount_t *m, const char *path, struct kstat *st);
 	/* Create a symbolic link `linkpath` -> `target`.  NULL => unsupported. */
-	int (*symlink)(const char *target, const char *linkpath);
+	int (*symlink)(vfs_mount_t *m, const char *target, const char *linkpath);
 	/* Read a symlink's target into buf (no NUL).  Returns byte count (>=0) or
      * a negative ST_ code.  NULL => path is not a symlink on this fs. */
-	int (*readlink)(const char *path, char *buf, unsigned long bufsz);
-	/* Create a hard link `newpath` -> `oldpath`.  NULL => unsupported. */
-	int (*link)(const char *oldpath, const char *newpath);
+	int (*readlink)(vfs_mount_t *m, const char *path, char *buf,
+			unsigned long bufsz);
+	/* Create a hard link `newpath` -> `oldpath`.  NULL => unsupported.
+	 * `follow' says whether a symlink named by `oldpath' is followed (the
+	 * link then names its target) or linked itself, which is the default
+	 * of link()/linkat(). */
+	int (*link)(vfs_mount_t *m, const char *oldpath, const char *newpath,
+		    int follow);
 	/* Change a path's permission bits.  NULL => fs has no perms (succeed). */
-	int (*chmod)(const char *path, unsigned int mode);
+	int (*chmod)(vfs_mount_t *m, const char *path, unsigned int mode);
 	/* Change a path's owner/group (-1 leaves a field unchanged).  NULL =>
-     * fs has no ownership (succeed). */
-	int (*chown)(const char *path, int uid, int gid);
+     * fs has no ownership (succeed).  `nofollow' changes a final symlink
+     * itself (lchown) instead of what it points to. */
+	int (*chown)(vfs_mount_t *m, const char *path, int uid, int gid,
+		     int nofollow);
 	/* chmod/chown addressed by an open handle.  NULL => succeed. */
 	int (*fchmod)(vfs_file_t *f, unsigned int mode);
 	int (*fchown)(vfs_file_t *f, int uid, int gid);
-	/* Set a path's modification time (see VFS_UTIME_NOW / VFS_UTIME_OMIT).
-     * NULL => fs manages times itself (succeed). */
-	int (*utimensat)(const char *path, int64_t mtime_sec, long mtime_nsec);
+	/* Set a path's access and modification times (struct vfs_utimes;
+	 * each may be "now" or "leave alone"); the change time becomes the
+	 * current time.  `nofollow' sets a final symlink's own times.  NULL =>
+	 * fs manages times itself (succeed). */
+	int (*utimens)(vfs_mount_t *m, const char *path, int nofollow,
+		       const struct vfs_utimes *t);
+	/* The same for an open handle (futimens).  NULL => succeed. */
+	int (*futimens)(vfs_file_t *f, const struct vfs_utimes *t);
 	/* Fill whole-filesystem statistics.  NULL => unsupported. */
-	int (*statfs)(struct vfs_statfs *out);
+	int (*statfs)(vfs_mount_t *m, struct vfs_statfs *out);
 	/* Fill a kstat for an open handle (real mode/uid/gid).  NULL => the caller
      * cannot determine the owner (used by fd-based permission checks). */
 	int (*fstat)(vfs_file_t *f, struct kstat *st);
@@ -121,19 +152,21 @@ typedef struct {
      * deferred metadata, any in-flight journal transaction, and — for a
      * journalled fs — mark the journal clean so a reboot right after does not
      * replay.  Optional; NULL => the wrapper treats a whole-fs sync as a no-op. */
-	int (*sync)(void);
+	int (*sync)(vfs_mount_t *m);
 	/* Extended attributes.  Path ops take a `nofollow` flag (1 => operate on a
      * final symlink itself).  `name` is the full attribute name (e.g. "user.x").
      * get/list return the value/list size (or its size when buf is NULL/0), set
      * takes XATTR_CREATE/REPLACE flags.  Negative ST_ on error; NULL op => the
      * filesystem has no xattrs (the wrapper reports -EOPNOTSUPP). */
-	int (*getxattr)(const char *path, int nofollow, const char *name,
-			void *val, unsigned long size);
-	int (*setxattr)(const char *path, int nofollow, const char *name,
-			const void *val, unsigned long size, int flags);
-	int (*listxattr)(const char *path, int nofollow, char *list,
-			 unsigned long size);
-	int (*removexattr)(const char *path, int nofollow, const char *name);
+	int (*getxattr)(vfs_mount_t *m, const char *path, int nofollow,
+			const char *name, void *val, unsigned long size);
+	int (*setxattr)(vfs_mount_t *m, const char *path, int nofollow,
+			const char *name, const void *val, unsigned long size,
+			int flags);
+	int (*listxattr)(vfs_mount_t *m, const char *path, int nofollow,
+			 char *list, unsigned long size);
+	int (*removexattr)(vfs_mount_t *m, const char *path, int nofollow,
+			   const char *name);
 	int (*fgetxattr)(vfs_file_t *f, const char *name, void *val,
 			 unsigned long size);
 	int (*fsetxattr)(vfs_file_t *f, const char *name, const void *val,
@@ -143,26 +176,32 @@ typedef struct {
 	/* Fetch an attribute given an already-resolved inode number (no path walk).
      * Lets a caller that just stat()'d a file read e.g. its ACL without paying a
      * second path resolution.  NULL op => the wrapper reports -EOPNOTSUPP. */
-	int (*getxattr_ino)(unsigned long ino, const char *name, void *val,
-			    unsigned long size);
+	int (*getxattr_ino)(vfs_mount_t *m, unsigned long ino, const char *name,
+			    void *val, unsigned long size);
 	/* ---- Optional permission participation --------------------------------
 	 * Filesystem-specific access decision, consulted by vfs_permission()
 	 * BEFORE the generic mode/ACL check.  Returns ST_OK to allow outright,
 	 * a negative ST_ code to deny outright, or ST_UNSUPPORTED to defer to the
 	 * generic VFS check.  Used by an ownership-less fs (FAT32) to emulate
 	 * permissive access.  NULL => always defer to the generic check. */
-	int (*permission)(const char *path, unsigned long ino, int want);
+	int (*permission)(vfs_mount_t *m, const char *path, unsigned long ino,
+			  int want);
 	/* Report the VFS_ATTR_* flags for an already-resolved inode (immutable /
 	 * append-only).  Lets the VFS veto modifications independently of the mode
 	 * bits.  NULL => the filesystem has no such flags (none set). */
-	int (*inode_flags)(unsigned long ino, uint32_t *out_flags);
+	int (*inode_flags)(vfs_mount_t *m, unsigned long ino,
+			   uint32_t *out_flags);
 	/* Create a node that owns no data: a socket (S_IFSOCK) or FIFO
-	 * (S_IFIFO), with the type in the high bits of `mode`.  Needed because
-	 * a bound AF_UNIX socket must be visible in the filesystem — clients
-	 * stat() the path and require S_IFSOCK before connecting.  NULL => the
-	 * filesystem cannot represent such nodes (the wrapper reports
-	 * -EOPNOTSUPP). */
-	int (*mknod)(const char *path, unsigned int mode);
+	 * (S_IFIFO), or a character / block device node (S_IFCHR / S_IFBLK,
+	 * `dev' its device number in the userland dev_t encoding), with the
+	 * type in the high bits of `mode`.  Needed because a bound AF_UNIX
+	 * socket must be visible in the filesystem — clients stat() the path
+	 * and require S_IFSOCK before connecting.  NULL => the filesystem
+	 * cannot represent such nodes (the wrapper reports -EOPNOTSUPP); a
+	 * filesystem that keeps only some of the types answers ST_UNSUPPORTED
+	 * for the others. */
+	int (*mknod)(vfs_mount_t *m, const char *path, unsigned int mode,
+		     uint64_t dev);
 	/* Like ->open, but carries the creation mode for O_CREAT.  A filesystem
 	 * that does not list it gets NULL and the wrapper falls back to ->open,
 	 * which creates with a default mode.
@@ -179,8 +218,8 @@ typedef struct {
 	 * The tables (ext4_vfs_ops, fat32_vfs_ops) are designated initialisers
 	 * now, so a member may be added anywhere and a wrong slot is a compile
 	 * error rather than a crash.  Keep them that way. */
-	int (*open_mode)(const char *path, int flags, unsigned int mode,
-			 vfs_file_t **out);
+	int (*open_mode)(vfs_mount_t *m, const char *path, int flags,
+			 unsigned int mode, vfs_file_t **out);
 	/* Read at an explicit offset without touching the handle's position.
 	 *
 	 * Optional: vfs_pread() falls back to seek/read/seek-back for a
@@ -233,7 +272,123 @@ struct vfs_file {
 	uint64_t fsn_ino;
 	int8_t fsn_state;
 	uint8_t fsn_isdir;
+	/* The mount the handle was opened through (set by vfs_open_common();
+	 * NULL for a handle made some other way -- a device opened by the
+	 * syscall layer directly, an anonymous file).  An open handle keeps
+	 * its mount from being unmounted (vfs_mount.open_files). */
+	vfs_mount_t *mnt;
 };
+
+/* ---- Mounts ---------------------------------------------------------------
+ *
+ * Mount flags, the values of the mount(2) interface (mirrored in the
+ * userland <sys/mount.h>).  Only the ones the VFS acts on are listed with a
+ * note; the rest are accepted and shown in /proc/mounts. */
+#define VFS_MS_RDONLY 0x1UL /* every modification fails with EROFS */
+#define VFS_MS_NOSUID 0x2UL /* exec ignores set-user/-group-ID bits */
+#define VFS_MS_NODEV 0x4UL /* device nodes on it cannot be opened */
+#define VFS_MS_NOEXEC 0x8UL /* nothing on it can be executed */
+#define VFS_MS_SYNCHRONOUS 0x10UL
+#define VFS_MS_REMOUNT 0x20UL /* change the flags of an existing mount */
+#define VFS_MS_MANDLOCK 0x40UL
+#define VFS_MS_DIRSYNC 0x80UL
+#define VFS_MS_NOSYMFOLLOW 0x100UL
+#define VFS_MS_NOATIME 0x400UL
+#define VFS_MS_NODIRATIME 0x800UL
+#define VFS_MS_BIND 0x1000UL
+#define VFS_MS_MOVE 0x2000UL
+#define VFS_MS_REC 0x4000UL
+#define VFS_MS_SILENT 0x8000UL
+#define VFS_MS_RELATIME 0x200000UL
+#define VFS_MS_STRICTATIME 0x1000000UL
+#define VFS_MS_LAZYTIME 0x2000000UL
+/* The flags a mount keeps (the others are requests: REMOUNT, BIND, ...). */
+#define VFS_MS_PERMANENT                                                    \
+	(VFS_MS_RDONLY | VFS_MS_NOSUID | VFS_MS_NODEV | VFS_MS_NOEXEC |    \
+	 VFS_MS_SYNCHRONOUS | VFS_MS_MANDLOCK | VFS_MS_DIRSYNC |           \
+	 VFS_MS_NOSYMFOLLOW | VFS_MS_NOATIME | VFS_MS_NODIRATIME |         \
+	 VFS_MS_RELATIME | VFS_MS_STRICTATIME | VFS_MS_LAZYTIME)
+
+/* umount2() flags. */
+#define VFS_MNT_FORCE 0x1
+#define VFS_MNT_DETACH 0x2
+#define VFS_MNT_EXPIRE 0x4
+#define VFS_UMOUNT_NOFOLLOW 0x8
+
+#define VFS_FSTYPE_MAX 16
+#define VFS_MOUNT_OPTS_MAX 160
+
+/* A filesystem type that mount(2) can instantiate. */
+typedef struct vfs_fstype {
+	const char *name; /* what /proc/mounts shows: "ext4", "vfat"      */
+	/* Other names mount(2) accepts for it ("ext2", "fat32", ...), NULL
+	 * terminated; NULL for none.  The name used is what is shown. */
+	const char *const *aliases;
+	/* Needs a block device as its source (else the source is a label). */
+	int needs_device;
+	/* Bring up an instance: fill m->ops, m->fs_data and (for a
+	 * filesystem in the page cache) m->sb.  `bdev' is the claimed device
+	 * or NULL, `flags' the VFS_MS_* flags, `data' the option string (may
+	 * be NULL).  ST_OK or an ST_ code; on failure nothing is left behind. */
+	int (*mount)(vfs_mount_t *m, struct block_device *bdev,
+		     unsigned long flags, const char *data);
+	/* Last step of an unmount, called with nothing open on the mount and
+	 * its pages and inodes already stored: commit what is left, drop
+	 * every cache entry of the instance and free it.  ST_OK, or an error
+	 * that leaves the instance mounted and intact. */
+	int (*unmount)(vfs_mount_t *m);
+	/* Change a live instance's flags (read-only <-> read-write) and
+	 * options.  NULL: only changes the filesystem need not act on. */
+	int (*remount)(vfs_mount_t *m, unsigned long flags, const char *data);
+	/* Append the filesystem's own options ("uid=1000,umask=022") to
+	 * /proc/mounts' option column.  Returns the length written (without
+	 * a NUL), at most cap - 1.  NULL: none. */
+	long (*show_options)(vfs_mount_t *m, char *buf, long cap);
+	/* Does `bdev' hold this filesystem?  For fstype "auto".  NULL: the
+	 * type is never chosen automatically. */
+	int (*probe)(struct block_device *bdev);
+} vfs_fstype_t;
+
+struct vfs_mount {
+	/* --- lookup state (kernel/fs/mount.c) --- */
+	volatile uint32_t seq; /* odd while the slot is being rewritten   */
+	volatile int state; /* VFS_MNT_*                                */
+	volatile long active; /* path operations in flight on it          */
+	volatile long open_files; /* handles open through it              */
+	volatile long open_writers; /* of those, open for writing (counted
+				     * on every mount, the boot ones too) */
+	int pinned; /* registered at boot, never unmounted: not counted    */
+	int full_paths; /* the driver is handed absolute paths, not paths
+			 * relative to the mount point (devfs, /proc, /sys) */
+	int inject; /* listed in the root directory by the VFS             */
+	/* --- identity --- */
+	int id; /* mount id (/proc/self/mountinfo)                       */
+	int parent_id;
+	char path[VFS_MAX_PATH]; /* canonical mount point, "/" for the root */
+	unsigned path_len;
+	char source[VFS_MAX_PATH]; /* "/dev/sda2", "tmpfs", "proc"      */
+	char fstype[VFS_FSTYPE_MAX];
+	unsigned long flags; /* VFS_MS_* (VFS_MS_PERMANENT bits only)     */
+	char options[VFS_MOUNT_OPTS_MAX]; /* filesystem option string   */
+	const char *show_flags; /* fixed option text for /proc/mounts, or NULL */
+	/* Device number: shown in mountinfo, and -- with dev_override -- the
+	 * st_dev every stat on the mount reports (unique per mount, so tools
+	 * comparing st_dev see where one filesystem ends). */
+	uint64_t dev;
+	int dev_override;
+	/* --- the instance --- */
+	const vfs_ops_t *ops;
+	const vfs_fstype_t *type; /* NULL for a boot-time pseudo mount     */
+	void *fs_data; /* the driver's instance                           */
+	struct vfs_superblock *sb; /* page-cache superblock, or NULL      */
+	struct block_device *bdev; /* claimed device, or NULL             */
+};
+
+#define VFS_MNT_FREE 0
+#define VFS_MNT_LIVE 1 /* reachable by path                            */
+#define VFS_MNT_DYING 2 /* being unmounted                              */
+#define VFS_MNT_DETACHED 3 /* lazily unmounted: gone from the name space,
+			    * torn down when its last file closes        */
 
 /* What a descriptor was opened for, from its access mode alone: read with
  * O_RDONLY or O_RDWR, write with O_WRONLY or O_RDWR.  Access mode 3 is for
@@ -257,13 +412,53 @@ static inline int file_may_write(const struct vfs_file *f)
 #define FD_CLOEXEC 0x1
 
 int vfs_init(void);
-int vfs_register_root(const vfs_ops_t *ops);
+/* The root filesystem, mounted by the storage bootstrap: `fs_data' is its
+ * instance, `sb' its page-cache superblock (or NULL), `type' its fstype (for
+ * remounting; may be NULL). */
+int vfs_register_root(const vfs_ops_t *ops, void *fs_data,
+		      struct vfs_superblock *sb, const vfs_fstype_t *type,
+		      const char *fstype);
+/* Name the root's device for /proc/mounts ("/dev/sda2") once it is known;
+ * `dev' its device number. */
+void vfs_root_set_source(const char *source, uint64_t dev);
 int vfs_register_devfs(const vfs_ops_t *ops);
-/* A further filesystem at `prefix' ("/sys", "/proc"); paths under it go to
- * `ops'.  The name is listed in the root directory. */
-int vfs_register_mount(const char *prefix, const vfs_ops_t *ops);
+/* A further boot-time filesystem at `prefix' ("/sys", "/proc"); paths under
+ * it go to `ops' -- absolute when `full_paths', else relative to the mount
+ * point like any mounted filesystem's.  The name is listed in the root
+ * directory.  `fstype' is what /proc/mounts shows, `fs_data' the driver's
+ * instance (may be NULL), `show' a fixed option text for /proc/mounts
+ * (NULL: from the flags). */
+int vfs_register_mount(const char *prefix, const vfs_ops_t *ops,
+		       const char *fstype, void *fs_data, unsigned long flags,
+		       const char *show, int full_paths);
+/* A boot-time instance of the mountable filesystem `type' at `prefix'
+ * (tmpfs at /ram), made by type->mount with `flags' (VFS_MS_*) and the
+ * option string `data' (may be NULL).  Like the other boot-time mounts it is
+ * never unmounted and its name is listed in the root directory; /proc/mounts
+ * shows it like a mount(2) one.  ST_OK or an ST_* error. */
+int vfs_mount_boot(const char *prefix, const vfs_fstype_t *type,
+		   unsigned long flags, const char *data);
 int vfs_mount_name(int index, const char **name_out);
 int vfs_root_ready(void);
+
+/* Filesystem types mount(2) can create (kernel/fs/mount.c). */
+int vfs_fstype_register(const vfs_fstype_t *type);
+/* mount(2) / umount2(2) on canonical absolute paths (the target's symbolic
+ * links are resolved here).  0 or a negative errno. */
+int vfs_mount(const char *source, const char *target, const char *fstype,
+	      unsigned long flags, const char *data);
+int vfs_umount(const char *target, int flags);
+/* Flush one filesystem (syncfs(2)): its pages, inodes, metadata and the
+ * device cache. */
+int vfs_syncfs(vfs_file_t *f);
+/* The mount table as /proc/mounts (info == 0) or /proc/self/mountinfo
+ * (info == 1) shows it, appended at `pos' (pfs_printf conventions: the
+ * returned length may exceed cap, the caller then retries larger). */
+long vfs_mounts_show(char *buf, long cap, long pos, int info);
+/* The VFS_MS_* flags of the mount `path' is on (0 when none). */
+unsigned long vfs_path_mount_flags(const char *path);
+/* A path's st_dev as stat() reports it (the mount's device number). */
+int vfs_path_dev(const char *path, uint64_t *dev);
 int vfs_open(const char *path, int flags, vfs_file_t **out);
 /* open() with the creation mode for O_CREAT.  `mode` is the FINAL mode -- the
  * caller has already applied its umask, matching the convention vfs_mknod()
@@ -289,8 +484,9 @@ int vfs_truncate(vfs_file_t *f, unsigned long size);
 int vfs_unlink(const char *path);
 int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_mkdir(const char *path, unsigned int mode);
-/* Create a node with no data: S_IFSOCK or S_IFIFO in the mode's type bits. */
-int vfs_mknod(const char *path, unsigned int mode);
+/* Create a node with no data: S_IFSOCK, S_IFIFO, S_IFCHR or S_IFBLK in the
+ * mode's type bits; `dev' the device number of a device node. */
+int vfs_mknod(const char *path, unsigned int mode, uint64_t dev);
 int vfs_rmdir(const char *path);
 int vfs_close(vfs_file_t *f);
 /* UNIX-semantics wrappers — dispatch to the mounted filesystem's op (path ops
@@ -299,12 +495,13 @@ int vfs_close(vfs_file_t *f);
 int vfs_lstat(const char *path, struct kstat *st);
 int vfs_symlink(const char *target, const char *linkpath);
 int vfs_readlink(const char *path, char *buf, unsigned long bufsz);
-int vfs_link(const char *oldpath, const char *newpath);
+int vfs_link(const char *oldpath, const char *newpath, int follow);
 int vfs_chmod(const char *path, unsigned int mode);
-int vfs_chown(const char *path, int uid, int gid);
+int vfs_chown(const char *path, int uid, int gid, int nofollow);
 int vfs_fchmod(vfs_file_t *f, unsigned int mode);
 int vfs_fchown(vfs_file_t *f, int uid, int gid);
-int vfs_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec);
+int vfs_utimens(const char *path, int nofollow, const struct vfs_utimes *t);
+int vfs_futimens(vfs_file_t *f, const struct vfs_utimes *t);
 int vfs_statfs(const char *path, struct vfs_statfs *out);
 int vfs_fstatfs(vfs_file_t *f, struct vfs_statfs *out);
 int vfs_fstat(vfs_file_t *f, struct kstat *st);
@@ -378,8 +575,8 @@ int vfs_check_access(const char *path, const struct kstat *st, int want,
 /* The owning filesystem's ->permission hook alone (ST_UNSUPPORTED: none). */
 int vfs_fs_permission(const char *path, unsigned long ino, int want);
 
-/* Flush the root filesystem's pending metadata + journal to disk (sync(2)).
- * No-op when the root fs provides no sync op.  fs-independent. */
+/* Flush every mounted filesystem's pending metadata + journal to disk
+ * (sync(2)).  fs-independent. */
 int vfs_sync(void);
 size_t vfs_size(vfs_file_t *f);
 vfs_file_t *
@@ -388,7 +585,30 @@ void vfs_incref(vfs_file_t *f); // Increment refcount
 
 /* Force-release any filesystem-private locks owned by the given task id.
  * Used by the scheduler's dead-thread reaper to recover from tasks killed
- * mid-syscall while holding such locks. */
+ * mid-syscall while holding such locks.  Reaches every filesystem instance
+ * that still exists, unmounted-but-busy and being-unmounted ones included. */
 void vfs_release_locks_for_task(uint64_t task_id);
+/* Drop the mount holds (vfs_mount.active) a dead task took for a path
+ * operation it never finished (kernel/fs/mount.c).  From the task's
+ * teardown, after vfs_release_locks_for_task(). */
+void vfs_mnt_release_task(struct task *t);
+
+/* ---- Symbolic links ---------------------------------------------------------
+ *
+ * Symbolic links are followed by the VFS, so a link can lead from one
+ * mounted filesystem into another: an absolute target from the process's
+ * root (its chroot), a relative one from the link's directory, ".." across a
+ * mount's root into the directory it is mounted on.  A filesystem walking a
+ * path it was handed calls vfs_link_hop() when it meets a link it would
+ * follow -- any link before the last component, and the last one when the
+ * operation follows it -- with the path, the byte offsets of the link's
+ * component in it, and the link's target.  1: the VFS takes the walk over
+ * from there, and the filesystem returns ST_LINK at once, having changed
+ * nothing; the operation is then run again on the path the link leads to.
+ * 0: the VFS does not take it (no operation of its own is in progress, or
+ * the path is not the operation's), and the filesystem follows the link
+ * itself as it always did.  A path with no link on it costs nothing. */
+int vfs_link_hop(vfs_mount_t *m, const char *path, unsigned long comp_start,
+		 unsigned long comp_end, const char *target);
 
 #endif // LIKEOS_VFS_H

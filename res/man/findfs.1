@@ -1,0 +1,78 @@
+FINDFS(8)                    System Administration                   FINDFS(8)
+
+NAME
+       findfs - find a filesystem by label or UUID
+
+SYNOPSIS
+       findfs TAGNAME=value
+
+DESCRIPTION
+       findfs will search the block devices in the system for a filesystem or
+       partition with the specified tag. The currently supported tags are:
+
+          LABEL=label
+              Specifies a filesystem label.
+
+          UUID=uuid
+              Specifies a filesystem UUID.
+
+          PARTUUID=uuid
+              Specifies a partition UUID. Partition identifiers are
+              supported for example for GUID Partition Table (GPT)
+              partition tables.
+
+          PARTLABEL=label
+              Specifies a partition label (name). Partition labels are
+              supported for example for GPT and MAC partition tables.
+
+       If the filesystem or partition is found, the device name will be
+       printed on stdout. If the input is not in the format of TAGNAME=value,
+       then the input will be copied to the output without any modification.
+
+       You can get a complete overview about the filesystems and partitions in
+       the system with one of the following commands:
+
+          lsblk --fs
+
+          partx --show disk
+
+          blkid
+
+OPTIONS
+       -h, --help
+           Display help text and exit.
+
+       -V, --version
+           Display version and exit.
+
+EXIT STATUS
+       0
+           success
+
+       1
+           label or UUID cannot be found
+
+       2
+           usage error, wrong number of arguments or unknown option
+
+ENVIRONMENT
+       LIBBLKID_DEBUG=all
+           enables libblkid debug output.
+
+AUTHORS
+       findfs was originally written by Theodore Ts'o <tytso@mit.edu> and
+       re-written for the util-linux package by Karel Zak <kzak@redhat.com>.
+
+SEE ALSO
+       blkid(8), lsblk(8), partx(8)
+
+REPORTING BUGS
+       For bug reports, use the issue tracker
+       <https://github.com/util-linux/util-linux/issues>.
+
+AVAILABILITY
+       The findfs command is part of the util-linux package which can be
+       downloaded from Linux Kernel Archive
+       <https://www.kernel.org/pub/linux/utils/util-linux/>.
+
+util-linux 2.42.4                 2026-08-04                         FINDFS(8)

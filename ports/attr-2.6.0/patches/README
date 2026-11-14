@@ -1,0 +1,17 @@
+Patches applied to the pristine attr-2.6.0 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-xattrat-syscall-header-only-with-syscalls.patch
+        libmisc/xattrat.c includes the header defining struct xattr_args
+        only when the *xattrat system call numbers exist; without them its
+        stand-ins answer ENOSYS and never use the structure.
+
+  0002-proc-self-fd-likeos-descriptor-paths.patch
+        A name relative to a directory descriptor (getfattr -R, setfattr -R,
+        setfattr --restore) is reached through the path the descriptor was
+        opened with, read from the /proc/self/fd/N link, instead of through
+        /proc/self/fd/N/<name>, which the path walk does not cross.
+
+Copyright (C) 2026 The LikeOS Project

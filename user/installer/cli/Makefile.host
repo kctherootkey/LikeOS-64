@@ -1,0 +1,65 @@
+# likeos-install -- host build and tests (the build machine's gcc and
+# glibc, the host's libzstd and libcrypt), linked with a host build of the
+# installer backend.  The program runs here only in simulate mode
+# (--simulate IMAGE): image files stand for the disks, nothing else on the
+# host is touched.
+#
+#   make -f Makefile.host          host/likeos-install
+#   make -f Makefile.host check    an unattended installation from an
+#                                  answer file, a scripted interactive one
+#                                  and the checks of their results, boxed
+#                                  (nice, a memory limit, a time limit)
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+OUT ?= host
+BACKEND = ../backend
+LIBGPT = ../../lib/libgpt
+RES = ../../../res
+
+ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd)
+ZSTD_LIBS := $(shell pkg-config --libs libzstd)
+
+CFLAGS = -D_GNU_SOURCE -Wall -Wextra -Werror=implicit-function-declaration \
+	-O2 -g -I$(BACKEND)/include -I$(BACKEND) -I$(LIBGPT)/include \
+	$(ZSTD_CFLAGS)
+LIBS = $(ZSTD_LIBS) -lcrypt
+
+CLI_SRC = likeos-install.c cli-ui.c cli-keyboard.c
+CLI_HDRS = cli-ui.h cli-keyboard.h $(BACKEND)/include/installer.h
+
+BACKEND_SRC = il_ctx.c il_log.c il_util.c il_sha256.c il_disk.c il_source.c \
+	il_plan.c il_partition.c il_format.c il_mount.c il_extract.c il_tar.c \
+	il_acl.c il_config.c il_accounts.c il_boot.c il_install.c il_progress.c \
+	il_answers.c il_validate.c il_tz.c il_locale.c
+LIBGPT_SRC = crc32.c guid.c blkio.c mbr.c gpt.c layout.c types.c
+
+OBJ = $(addprefix $(OUT)/il/,$(BACKEND_SRC:.c=.o)) \
+	$(addprefix $(OUT)/gpt/,$(LIBGPT_SRC:.c=.o))
+HDRS = $(BACKEND)/include/installer.h $(BACKEND)/il_internal.h \
+	$(BACKEND)/il_compat.h $(BACKEND)/il_tar.h $(LIBGPT)/include/gpt.h
+
+all: $(OUT)/likeos-install
+
+$(OUT) $(OUT)/il $(OUT)/gpt:
+	mkdir -p $@
+
+$(OUT)/il/%.o: $(BACKEND)/%.c $(HDRS) | $(OUT)/il
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUT)/gpt/%.o: $(LIBGPT)/%.c $(LIBGPT)/include/gpt.h | $(OUT)/gpt
+	$(CC) -D_GNU_SOURCE -Wall -Wextra -O2 -g -I$(LIBGPT)/include \
+		-I$(LIBGPT) -c $< -o $@
+
+$(OUT)/likeos-install: $(CLI_SRC) $(CLI_HDRS) $(OBJ) | $(OUT)
+	$(CC) $(CFLAGS) $(CLI_SRC) $(OBJ) $(LIBS) -o $@
+
+check: all
+	nice -n 19 timeout 900 sh -c 'ulimit -v 2500000; \
+		sh tests/run-tests.sh $(OUT) $(RES)'
+
+clean:
+	rm -rf $(OUT)
+
+.PHONY: all check clean

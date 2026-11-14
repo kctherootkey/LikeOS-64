@@ -222,6 +222,12 @@ static struct {
 
 // UEFI memory map storage - saved from boot_info for later use
 static memory_map_info_t g_uefi_memory_map = { 0 };
+/* boot_info's EFI_MEMORY_RUNTIME regions (mm_initialize_from_boot_info). */
+static struct {
+	uint64_t phys;
+	uint64_t pages;
+} g_efi_rt_regions[BOOT_EFI_RT_MAX];
+static uint32_t g_efi_rt_count;
 
 // Utility functions (non-static, declared in memory.h)
 /* Block fill and copy.  kmemset()/kmemcpy() in console.c are these same two
@@ -580,6 +586,12 @@ static void mark_usable_uefi_regions(void)
 		if (!mm_is_usable_memory_type(entry->type)) {
 			continue;
 		}
+		/* A region the firmware still needs for its runtime services
+		 * stays out of the allocator whatever its type says: the
+		 * kernel calls those services (kernel/hal/efi.c), and they
+		 * read and write every region marked this way. */
+		if (entry->attribute & EFI_MEMORY_RUNTIME)
+			continue;
 
 		// This is a usable region - mark pages as free
 		uint64_t region_start = entry->physical_start;
@@ -691,6 +703,26 @@ static void reserve_uefi_memory_regions(void)
 
 	kprintf("  Reserved %lu pages across %lu UEFI reserved regions\n",
 		pages_reserved, reserved_regions);
+
+	/* The runtime regions the bootloader collected on their own, from the
+	 * map ExitBootServices was finally given -- which can be a later map
+	 * than the one copied into mem_info (the loader retries the exit with
+	 * a fresh map), or hold regions mem_info had no room for.  Whatever
+	 * that copy says about them, they stay out of the allocator. */
+	for (uint32_t i = 0; i < g_efi_rt_count; i++) {
+		uint64_t start = g_efi_rt_regions[i].phys;
+		uint64_t pages = g_efi_rt_regions[i].pages;
+
+		if (pages > (1ULL << 34) || start >= mm_state.memory_end)
+			continue;
+		for (uint64_t k = 0; k < pages; k++) {
+			uint64_t phys = start + k * PAGE_SIZE;
+
+			if (phys >= mm_state.memory_end)
+				break;
+			reserve_physical_page(phys);
+		}
+	}
 }
 
 // Initialize memory manager with UEFI memory map from boot_info
@@ -731,6 +763,23 @@ void mm_initialize_from_boot_info(boot_info_t *boot_info)
 
 	for (uint32_t i = 0; i < n_entries; i++) {
 		g_uefi_memory_map.entries[i] = boot_info->mem_info.entries[i];
+	}
+
+	/* The firmware's runtime regions, reserved with the rest (see
+	 * reserve_uefi_memory_regions). */
+	g_efi_rt_count = 0;
+	if (boot_info->efi_magic == BOOT_EFI_MAGIC) {
+		uint32_t n = boot_info->efi_rt_count;
+
+		if (n > BOOT_EFI_RT_MAX)
+			n = BOOT_EFI_RT_MAX;
+		for (uint32_t i = 0; i < n; i++) {
+			g_efi_rt_regions[i].phys =
+				boot_info->efi_rt_regions[i].phys & ~(PAGE_SIZE - 1);
+			g_efi_rt_regions[i].pages =
+				boot_info->efi_rt_regions[i].pages;
+		}
+		g_efi_rt_count = n;
 	}
 
 	kprintf("Stored UEFI memory map: %u entries, %lu MB total\n",
@@ -1763,6 +1812,16 @@ void mm_init_pt_pool(void)
 		pt_pool_size, (void *)pt_pool_phys_start);
 	pt_pool_initialized = 1;
 	kprintf("  Page table pool ready\n");
+}
+
+/* The physical range of the page-table pool: kernel page tables are carved
+ * from it by address, outside the allocator and its view of the firmware's
+ * memory map.  Firmware runtime regions must not lie inside it (efi.c
+ * checks); [0, 0) before mm_initialize_physical_memory. */
+void mm_pt_pool_range(uint64_t *start, uint64_t *end)
+{
+	*start = pt_pool_phys_start;
+	*end = pt_pool_phys_start + pt_pool_size * PAGE_SIZE;
 }
 
 // Get page table for virtual address

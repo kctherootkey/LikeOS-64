@@ -13,12 +13,14 @@
 #include <kernel/dev/usb/usb.h>
 #include <kernel/dev/usb/usb_serial.h>
 #include <kernel/dev/hid/usb_hid.h>
+#include <kernel/dev/usb/usb_msd.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/ke/irq.h>
 #include <kernel/hal/ioapic.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/mutex.h>
 #include <kernel/uapi/bug.h>
 
 // Debug output control
@@ -209,6 +211,7 @@ xhci_ring_t *xhci_alloc_ring(void)
 	xhci_ring_t *ring = (xhci_ring_t *)aligned_addr;
 
 	xhci_memset(ring, 0, ring_size);
+	ring->alloc_base = raw;
 	return ring;
 }
 
@@ -216,6 +219,16 @@ void xhci_free_ring(xhci_ring_t *ring)
 {
 	// Note: We can't easily free the original raw pointer, but for kernel this is OK
 	(void)ring;
+}
+
+/* Give a ring's memory back.  Only for a ring the controller can no longer
+ * reach: the transfer rings of a slot after a successful Disable Slot
+ * command.  (xhci_free_ring() above stays a no-op for its callers, which
+ * drop rings of endpoints that may still be running.) */
+static void xhci_ring_release(xhci_ring_t *ring)
+{
+	if (ring && ring->alloc_base)
+		kfree_dma(ring->alloc_base);
 }
 
 void xhci_ring_init(xhci_ring_t *ring, uint64_t phys)
@@ -1488,6 +1501,18 @@ static int xhci_wait_ready(xhci_controller_t *ctrl, uint32_t timeout_ms)
 static volatile uint8_t g_cmd_complete = 0;
 static volatile uint8_t g_cmd_cc = 0;
 static volatile uint32_t g_cmd_slot = 0;
+/* The command in flight (its TRB's bus address and controller), and the
+ * last one that timed out: a completion for that one arriving late must not
+ * be taken for the completion of the command issued after it. */
+static volatile uint64_t g_cmd_trb_phys = 0;
+static xhci_controller_t *volatile g_cmd_ctrl = NULL;
+static volatile uint64_t g_cmd_stale_phys = 0;
+static xhci_controller_t *volatile g_cmd_stale_ctrl = NULL;
+
+/* One command at a time, of every caller and controller: the completion
+ * state above is shared, and the input context a command reads is the
+ * controller's single one. */
+static DEFINE_MUTEX(xhci_cmd_mutex);
 
 int xhci_send_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
 		      uint32_t control)
@@ -1531,6 +1556,9 @@ int xhci_send_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
 		spin_unlock_irqrestore(&xhci_lock, flags);
 		return ST_ERR;
 	}
+	g_cmd_trb_phys =
+		mm_get_physical_address((uint64_t)&ctrl->cmd_ring->trbs[idx]);
+	g_cmd_ctrl = ctrl;
 
 	// Ring command doorbell (slot 0, target 0)
 	xhci_ring_doorbell(ctrl, 0, 0);
@@ -1563,7 +1591,35 @@ int xhci_wait_command(xhci_controller_t *ctrl, uint32_t timeout_ms)
 	kprintf("[XHCI] Command timeout! USBSTS=0x%x (HSE=%d HCH=%d)\n", usbsts,
 		(usbsts >> 2) & 1, usbsts & 1);
 
+	/* Its completion may still come: remember it, so it is not taken
+	 * for the next command's. */
+	{
+		uint64_t flags;
+		spin_lock_irqsave(&xhci_lock, &flags);
+		g_cmd_stale_phys = g_cmd_trb_phys;
+		g_cmd_stale_ctrl = g_cmd_ctrl;
+		spin_unlock_irqrestore(&xhci_lock, flags);
+	}
 	return ST_TIMEOUT;
+}
+
+int xhci_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
+		 uint32_t control, uint32_t timeout_ms, uint8_t *slot_out,
+		 uint8_t *cc_out)
+{
+	int st;
+
+	BUG_ON(ctrl == NULL);
+	mutex_lock(&xhci_cmd_mutex);
+	st = xhci_send_command(ctrl, param, status, control);
+	if (st == ST_OK)
+		st = xhci_wait_command(ctrl, timeout_ms);
+	if (slot_out)
+		*slot_out = (uint8_t)g_cmd_slot;
+	if (cc_out)
+		*cc_out = g_cmd_cc;
+	mutex_unlock(&xhci_cmd_mutex);
+	return st;
 }
 
 //=============================================================================
@@ -1726,7 +1782,15 @@ void xhci_process_events(xhci_controller_t *ctrl)
 
 static void xhci_handle_command_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
 {
-	(void)ctrl;
+	/* The late completion of a command that timed out: not the one
+	 * waited for now. */
+	if (g_cmd_stale_phys && ctrl == g_cmd_stale_ctrl &&
+	    (trb->param & ~0xFULL) == g_cmd_stale_phys &&
+	    g_cmd_stale_phys != g_cmd_trb_phys) {
+		g_cmd_stale_phys = 0;
+		g_cmd_stale_ctrl = NULL;
+		return;
+	}
 	g_cmd_cc = (trb->status >> 24) & 0xFF;
 	g_cmd_slot = (trb->control >> 24) & 0xFF;
 	g_cmd_complete = 1;
@@ -1775,7 +1839,29 @@ static void xhci_handle_port_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
 	// enumeration requires control transfers that can't be issued from
 	// IRQ context with xhci_lock held.
 	if ((portsc & XHCI_PORTSC_CSC) && port > 0 && port <= XHCI_MAX_PORTS) {
-		ctrl->hotplug_ports |= (1U << (port - 1));
+		/* A disconnect: whatever is configured on the port is gone
+		 * from now on.  Transfers in flight to it fail at once
+		 * (they watch dev->gone) instead of running into their
+		 * timeouts; the hot-plug poll tears the devices down.  Only a
+		 * port that had a configured device is recorded as gone: the
+		 * link of a device being enumerated may drop during its port
+		 * reset. */
+		if (!(portsc & XHCI_PORTSC_CCS)) {
+			int had = 0;
+			for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+				usb_device_t *d = &ctrl->devices[i];
+				if (d->configured && d->port == port) {
+					d->gone = 1;
+					had = 1;
+				}
+			}
+			if (had)
+				__atomic_or_fetch(&ctrl->port_gone,
+						  1U << (port - 1),
+						  __ATOMIC_SEQ_CST);
+		}
+		__atomic_or_fetch(&ctrl->hotplug_ports, 1U << (port - 1),
+				  __ATOMIC_SEQ_CST);
 	}
 
 	// NOTE: Don't clear change bits here - let xhci_port_reset / hotplug_poll
@@ -1838,15 +1924,9 @@ int xhci_poll_ports(xhci_controller_t *ctrl)
 		if (portsc & XHCI_PORTSC_CCS) {
 			connected++;
 
-			// Check if this port is already enumerated
-			int already_enumerated = 0;
-			for (int i = 0; i < ctrl->num_devices; i++) {
-				if (ctrl->devices[i].port == port &&
-				    ctrl->devices[i].configured) {
-					already_enumerated = 1;
-					break;
-				}
-			}
+			// Check if this port is already enumerated (devices
+			// are kept by slot id, which need not be dense)
+			int already_enumerated = xhci_port_has_device(ctrl, port);
 
 			// Try to enumerate if not already done for this port
 			if (!already_enumerated &&
@@ -1864,45 +1944,59 @@ int xhci_poll_ports(xhci_controller_t *ctrl)
 	return connected;
 }
 
+int xhci_port_has_device(xhci_controller_t *ctrl, uint8_t port)
+{
+	for (int i = 0; i < XHCI_MAX_SLOTS; i++)
+		if (ctrl->devices[i].configured && ctrl->devices[i].port == port)
+			return 1;
+	return 0;
+}
+
 // Disable a device slot and release its resources.
 // xHCI spec Section 4.6.4: Disable Slot Command.
 int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot)
 {
-	if (slot == 0 || slot > ctrl->max_slots)
+	if (slot == 0 || slot > ctrl->max_slots || slot > XHCI_MAX_SLOTS)
 		return ST_INVALID;
 
 	usb_device_t *dev = &ctrl->devices[slot - 1];
+	uint64_t flags;
+	int st;
+
+	/* Anybody still holding the device sees it gone from here on. */
+	dev->gone = 1;
+	__asm__ volatile("" ::: "memory");
 
 	// Send Disable Slot command (slot ID in bits 31:24 of control)
 	uint32_t control =
 		(TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot << 24);
-	if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
-		xhci_dbg("Disable slot %d: send failed\n", slot);
-		return ST_ERR;
-	}
-	xhci_wait_command(ctrl, 500);
+	st = xhci_command(ctrl, 0, 0, control, 500, NULL, NULL);
+	if (st != ST_OK)
+		xhci_dbg("Disable slot %d: command failed (%d)\n", slot, st);
 
-	// Clear DCBAA entry
+	// Clear the DCBAA entry and every pending transfer of the slot (under
+	// the lock the completion handler takes)
+	spin_lock_irqsave(&xhci_lock, &flags);
 	ctrl->dcbaa[slot] = 0;
-
-	// Free transfer rings
-	if (dev->ep0_ring) {
-		xhci_free_ring(dev->ep0_ring);
-		dev->ep0_ring = NULL;
-	}
-	if (dev->bulk_in_ring) {
-		xhci_free_ring(dev->bulk_in_ring);
-		dev->bulk_in_ring = NULL;
-	}
-	if (dev->bulk_out_ring) {
-		xhci_free_ring(dev->bulk_out_ring);
-		dev->bulk_out_ring = NULL;
-	}
-
-	// Clear all pending transfers for this slot
-	for (int ep = 0; ep < XHCI_MAX_ENDPOINTS; ep++) {
+	for (int ep = 0; ep < XHCI_MAX_ENDPOINTS; ep++)
 		ctrl->pending_xfer[slot - 1][ep] = NULL;
+	spin_unlock_irqrestore(&xhci_lock, flags);
+
+	/* The rings and the device context are the controller's until the
+	 * slot is disabled: give them back only then.  If the command
+	 * failed, the controller may still own them -- they are left. */
+	if (st == ST_OK) {
+		xhci_ring_release(dev->ep0_ring);
+		xhci_ring_release(dev->bulk_in_ring);
+		xhci_ring_release(dev->bulk_out_ring);
+		if (ctrl->dev_ctx_raw[slot - 1])
+			kfree_dma(ctrl->dev_ctx_raw[slot - 1]);
+		ctrl->dev_ctx_raw[slot - 1] = NULL;
+		ctrl->dev_ctx[slot - 1] = NULL;
 	}
+	dev->ep0_ring = NULL;
+	dev->bulk_in_ring = NULL;
+	dev->bulk_out_ring = NULL;
 
 	// Mark device as unconfigured
 	dev->configured = 0;
@@ -1910,7 +2004,76 @@ int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot)
 	dev->port = 0;
 
 	xhci_dbg("Slot %d disabled and cleaned up\n", slot);
-	return ST_OK;
+	return st == ST_OK ? ST_OK : ST_ERR;
+}
+
+/* Tear down every device on a root port: its drivers first (each stops
+ * using the device before this returns), then the slot. */
+static void xhci_port_disconnect(xhci_controller_t *ctrl, uint8_t port)
+{
+	for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+		usb_device_t *dev = &ctrl->devices[i];
+		if (dev->port != port || !dev->configured)
+			continue;
+		kprintf("[XHCI] Hot-unplug: device removed from port %d (slot %d)\n",
+			port, dev->slot_id);
+		dev->gone = 1;
+		__asm__ volatile("" ::: "memory");
+
+		// Notify the drivers first so they stop using the device: the
+		// mass-storage driver returns only once no transfer of its own
+		// is running on it (I/O to the disk fails from now on)
+		usbhid_disconnect(dev);
+		usbserial_disconnect(dev);
+		usb_msd_disconnect(ctrl, dev);
+
+		// Disable the slot and free resources
+		xhci_disable_slot(ctrl, dev->slot_id);
+		if (ctrl->num_devices > 0)
+			ctrl->num_devices--;
+	}
+}
+
+/* After a connect change on a port whose device is configured, while the
+ * port shows a connection again: is the configured device still there?
+ * One that was unplugged and plugged in again is back in its default state
+ * and no longer answers at its address (on a USB 2 port the port is not
+ * even enabled any more); a link that only bounced leaves the device as it
+ * was: it answers its device descriptor, with the same identity, and is
+ * kept.  Device-poll thread. */
+static int xhci_port_device_kept(xhci_controller_t *ctrl, uint8_t port,
+				 uint32_t portsc)
+{
+	uint8_t *raw;
+	usb_device_desc_t *desc;
+	int kept = 1;
+
+	if (!(portsc & XHCI_PORTSC_PED))
+		return 0;
+	raw = (uint8_t *)kcalloc_dma(1, 4096 + 4096);
+	if (!raw)
+		return 1; /* cannot tell: leave it */
+	desc = (usb_device_desc_t *)(((uint64_t)raw + 4095) & ~4095ULL);
+	for (int i = 0; i < XHCI_MAX_SLOTS && kept; i++) {
+		usb_device_t *dev = &ctrl->devices[i];
+		if (!dev->configured || dev->port != port)
+			continue;
+		xhci_memset(desc, 0, sizeof(*desc));
+		if (xhci_control_transfer(ctrl, dev,
+					  USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
+					  USB_REQ_GET_DESCRIPTOR,
+					  (USB_DESC_DEVICE << 8) | 0, 0,
+					  sizeof(*desc), desc) != ST_OK) {
+			kept = 0;
+			break;
+		}
+		__asm__ volatile("" ::: "memory");
+		if (desc->vendor_id != dev->vendor_id ||
+		    desc->product_id != dev->product_id)
+			kept = 0;
+	}
+	kfree_dma(raw);
+	return kept;
 }
 
 // Hot-plug poll: called from the main loop to handle runtime USB
@@ -1934,12 +2097,15 @@ void xhci_hotplug_poll(xhci_controller_t *ctrl)
 	// essentially free.
 	xhci_process_events_locked(ctrl);
 
-	// Now handle any port status changes that were flagged
-	uint32_t pending = ctrl->hotplug_ports;
+	// Now handle any port status changes that were flagged (taken
+	// atomically: the interrupt handler may flag more meanwhile)
+	uint32_t gone = __atomic_exchange_n(&ctrl->port_gone, 0,
+					    __ATOMIC_SEQ_CST);
+	uint32_t pending = __atomic_exchange_n(&ctrl->hotplug_ports, 0,
+					       __ATOMIC_SEQ_CST);
+	pending |= gone;
 	if (!pending)
 		return;
-	ctrl->hotplug_ports = 0;
-	__asm__ volatile("" ::: "memory");
 
 	for (uint8_t port = 1;
 	     port <= ctrl->max_ports && port <= XHCI_MAX_PORTS; port++) {
@@ -1949,49 +2115,64 @@ void xhci_hotplug_poll(xhci_controller_t *ctrl)
 		uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
 		uint32_t portsc = xhci_op_read32(ctrl, off);
 
-		// Clear the CSC bit (RW1C) while preserving PP.
+		// Clear the CSC bit (RW1C) while preserving PP, then look at
+		// the port again: a change after this clear raises a new
+		// event instead of being wiped by it.
 		// CRITICAL: Do NOT include PED in the write value!  PED is RW1CS,
 		// meaning writing 1 to it CLEARS it, which disables the port and
 		// kills any active transfers on that port.
-		uint32_t clear = (portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_CSC;
-		xhci_op_write32(ctrl, off, clear);
-
-		if (portsc & XHCI_PORTSC_CCS) {
-			// === Device connected ===
-			// Check if already enumerated on this port
-			int already = 0;
-			for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-				if (ctrl->devices[i].port == port &&
-				    ctrl->devices[i].configured) {
-					already = 1;
-					break;
-				}
-			}
-			if (!already && ctrl->num_devices < XHCI_MAX_SLOTS) {
-				kprintf("[XHCI] Hot-plug: device connected on port %d\n",
-					port);
-				xhci_enumerate_device(ctrl, port);
-			}
-		} else {
-			// === Device disconnected ===
-			for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-				usb_device_t *dev = &ctrl->devices[i];
-				if (dev->port == port && dev->configured) {
-					kprintf("[XHCI] Hot-unplug: device removed from port %d (slot %d)\n",
-						port, dev->slot_id);
-
-					// Notify HID driver first so it stops using the device
-					usbhid_disconnect(dev);
-					usbserial_disconnect(dev);
-
-					// Disable the slot and free resources
-					uint8_t slot = dev->slot_id;
-					xhci_disable_slot(ctrl, slot);
-					if (ctrl->num_devices > 0)
-						ctrl->num_devices--;
-				}
-			}
+		int changed = 0;
+		if (portsc & XHCI_PORTSC_CSC) {
+			uint32_t clear =
+				(portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_CSC;
+			xhci_op_write32(ctrl, off, clear);
+			portsc = xhci_op_read32(ctrl, off);
+			changed = 1;
 		}
+
+		// A connect change while the port is connected, and its device
+		// was not seen go (the unplug and the re-plug both came before
+		// the port was looked at): the configured device stays only if
+		// it still answers as itself.
+		int replaced = 0;
+		if (changed && (portsc & XHCI_PORTSC_CCS) &&
+		    !(gone & (1U << (port - 1))) &&
+		    xhci_port_has_device(ctrl, port) &&
+		    !xhci_port_device_kept(ctrl, port, portsc)) {
+			kprintf("[XHCI] Port %d: device replaced while unseen; "
+				"enumerating it again\n",
+				port);
+			replaced = 1;
+		}
+
+		// === Device disconnected (or replaced by a quick re-plug) ===
+		if (!(portsc & XHCI_PORTSC_CCS) ||
+		    (gone & (1U << (port - 1))) || replaced)
+			xhci_port_disconnect(ctrl, port);
+
+		// === Device connected ===
+		if ((portsc & XHCI_PORTSC_CCS) &&
+		    !xhci_port_has_device(ctrl, port) &&
+		    ctrl->num_devices < XHCI_MAX_SLOTS) {
+			kprintf("[XHCI] Hot-plug: device connected on port %d\n",
+				port);
+			xhci_enumerate_device(ctrl, port);
+		}
+	}
+}
+
+void xhci_hotplug_rescan(xhci_controller_t *ctrl)
+{
+	if (!ctrl || !ctrl->initialized || !ctrl->running)
+		return;
+	for (uint8_t port = 1;
+	     port <= ctrl->max_ports && port <= XHCI_MAX_PORTS; port++) {
+		uint32_t portsc = xhci_op_read32(
+			ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
+		if ((portsc & XHCI_PORTSC_CCS) &&
+		    !xhci_port_has_device(ctrl, port))
+			__atomic_or_fetch(&ctrl->hotplug_ports,
+					  1U << (port - 1), __ATOMIC_SEQ_CST);
 	}
 }
 
@@ -2114,23 +2295,47 @@ int xhci_enable_slot(xhci_controller_t *ctrl)
 {
 	// Send Enable Slot command
 	uint32_t control = (TRB_TYPE_ENABLE_SLOT << 10);
+	uint8_t slot = 0;
 
-	if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
+	if (xhci_command(ctrl, 0, 0, control, 1000, &slot, NULL) != ST_OK) {
+		return -1;
+	}
+	/* A slot id beyond what the device table holds cannot be used:
+	 * give it back. */
+	if (slot == 0 || slot > XHCI_MAX_SLOTS) {
+		if (slot)
+			xhci_command(ctrl, 0, 0,
+				     (TRB_TYPE_DISABLE_SLOT << 10) |
+					     ((uint32_t)slot << 24),
+				     500, NULL, NULL);
 		return -1;
 	}
 
-	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-		return -1;
-	}
-
-	return g_cmd_slot; // Slot ID assigned by controller
+	return slot; // Slot ID assigned by controller
 }
 
 int xhci_address_device(xhci_controller_t *ctrl, uint8_t slot, uint8_t port,
 			uint8_t speed)
 {
-	if (slot == 0 || slot > ctrl->max_slots)
+	if (slot == 0 || slot > ctrl->max_slots || slot > XHCI_MAX_SLOTS)
 		return ST_INVALID;
+
+	/* A new device in the slot: nothing of the previous one (its
+	 * endpoints, strings, interface) may carry over; the generation
+	 * tells holders of the old one apart. */
+	usb_device_t *udev = &ctrl->devices[slot - 1];
+	{
+		uint32_t gen = udev->gen + 1;
+		xhci_memset(udev, 0, sizeof(*udev));
+		udev->gen = gen ? gen : 1;
+	}
+	/* A context left by a slot whose disabling failed: the controller
+	 * gave the slot id out again, so it no longer uses it. */
+	if (ctrl->dev_ctx_raw[slot - 1]) {
+		kfree_dma(ctrl->dev_ctx_raw[slot - 1]);
+		ctrl->dev_ctx_raw[slot - 1] = NULL;
+		ctrl->dev_ctx[slot - 1] = NULL;
+	}
 
 	// Allocate device context - DMA-safe for low physical addresses
 	// Size: 32 contexts (slot + 31 endpoints) * context_size
@@ -2138,6 +2343,7 @@ int xhci_address_device(xhci_controller_t *ctrl, uint8_t slot, uint8_t port,
 	uint8_t *dev_ctx_raw = (uint8_t *)kcalloc_dma(1, dev_ctx_size + 64);
 	if (!dev_ctx_raw)
 		return ST_NOMEM;
+	ctrl->dev_ctx_raw[slot - 1] = dev_ctx_raw;
 
 	// Align to 64 bytes
 	uint64_t ctx_addr = (uint64_t)dev_ctx_raw;
@@ -2158,7 +2364,6 @@ int xhci_address_device(xhci_controller_t *ctrl, uint8_t slot, uint8_t port,
 	ctrl->dcbaa[slot] = dev_ctx_phys;
 
 	// Allocate transfer ring for EP0 (control endpoint)
-	usb_device_t *udev = &ctrl->devices[slot - 1];
 	udev->slot_id = slot;
 	udev->port = port;
 	udev->speed = speed;
@@ -2233,14 +2438,11 @@ int xhci_address_device(xhci_controller_t *ctrl, uint8_t slot, uint8_t port,
 
 	// Send Address Device command (BSR=0 to send SET_ADDRESS to device)
 	uint32_t control = (TRB_TYPE_ADDRESS_DEV << 10) | (slot << 24);
+	uint8_t cmd_cc = 0;
 
-	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) !=
-	    ST_OK) {
-		return ST_ERR;
-	}
-
-	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-		kprintf("[XHCI] Address Device failed: CC=%d\n", g_cmd_cc);
+	if (xhci_command(ctrl, ctrl->input_ctx_phys, 0, control, 1000, NULL,
+			 &cmd_cc) != ST_OK) {
+		kprintf("[XHCI] Address Device failed: CC=%d\n", cmd_cc);
 		// CC=4 = USB Transaction Error (device not responding)
 		// CC=9 = No Slots Available
 		return ST_ERR;
@@ -2290,6 +2492,19 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 		return ST_ERR;
 	}
 
+	/* The connection enumerated here is the one the port has now: its
+	 * connect change (and one a warm reset may raise) is consumed, so a
+	 * connect change seen on the port once the device is configured
+	 * always means that it was unplugged since (xhci_hotplug_poll). */
+	{
+		uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+		uint32_t portsc = xhci_op_read32(ctrl, off);
+		if (portsc & XHCI_PORTSC_CSC)
+			xhci_op_write32(ctrl, off,
+					(portsc & XHCI_PORTSC_PP) |
+						XHCI_PORTSC_CSC);
+	}
+
 	// USB spec requires at least 10ms recovery time after reset before SET_ADDRESS
 	// But we've already read the speed, so a shorter delay is OK
 	delay_ms(10);
@@ -2302,6 +2517,9 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 
 	// Address device
 	if (xhci_address_device(ctrl, slot, port, speed) != ST_OK) {
+		/* Give the slot back: left enabled it would be lost for good,
+		 * and the next attempt (a re-plug) needs one. */
+		xhci_disable_slot(ctrl, (uint8_t)slot);
 		return ST_ERR; // Address device failed (no logging to reduce noise)
 	}
 
@@ -2312,6 +2530,7 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 	uint8_t *raw_buf = (uint8_t *)kcalloc_dma(1, 4096 + 4096);
 	if (!raw_buf) {
 		kprintf("[XHCI] Failed to allocate DMA buffer\n");
+		xhci_disable_slot(ctrl, (uint8_t)slot);
 		return ST_NOMEM;
 	}
 	uint8_t *dma_buf = (uint8_t *)(((uint64_t)raw_buf + 4095) & ~4095ULL);
@@ -2354,6 +2573,9 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 		dev->subclass = desc->subclass;
 		dev->protocol = desc->protocol;
 		dev->num_configs = desc->num_configs;
+		dev->str_manufacturer = desc->manufacturer_str;
+		dev->str_product = desc->product_str;
+		dev->str_serial = desc->serial_str;
 
 		xhci_dbg("Device: VID=%04x PID=%04x Class=%02x/%02x/%02x\n",
 			 dev->vendor_id, dev->product_id, dev->class_code,
@@ -2371,32 +2593,58 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 		// Parse configuration descriptor
 		usb_config_desc_t *cfg = (usb_config_desc_t *)dma_buf;
 		uint8_t *ptr = dma_buf + cfg->length;
-		uint8_t *end = dma_buf + cfg->total_length;
+		uint16_t total = cfg->total_length;
+		if (total > 256)
+			total = 256; // what was read
+		uint8_t *end = dma_buf + total;
 
-		while (ptr < end) {
+		/* A mass-storage function is driven through the Bulk-Only
+		 * Transport with the SCSI transparent command set.  A device
+		 * that also offers UAS does so as another alternate setting of
+		 * the same interface: the BOT setting is the one chosen, and
+		 * only its bulk endpoints are taken.  For anything else the
+		 * bulk endpoints are found as they always were. */
+		int cur_msd = 0; // the interface being parsed is the chosen one
+		uint8_t m_in = 0, m_out = 0;
+		uint16_t m_in_pkt = 0, m_out_pkt = 0;
+		int uas_only = 0;
+
+		while (ptr + 2 <= end) {
 			uint8_t len = ptr[0];
 			uint8_t type = ptr[1];
 
-			if (len == 0)
+			if (len < 2 || ptr + len > end)
 				break;
 
-			if (type == USB_DESC_INTERFACE) {
+			if (type == USB_DESC_INTERFACE &&
+			    len >= sizeof(usb_interface_desc_t)) {
 				usb_interface_desc_t *iface =
 					(usb_interface_desc_t *)ptr;
 				xhci_dbg("Interface: %d/%d/%d, EPs=%d\n",
 					 iface->class_code, iface->subclass,
 					 iface->protocol, iface->num_endpoints);
 
+				cur_msd = 0;
 				// Check for Mass Storage
 				if (iface->class_code ==
 					    USB_CLASS_MASS_STORAGE &&
 				    iface->subclass == 0x06 &&
-				    iface->protocol == 0x50) {
+				    iface->protocol == 0x50 &&
+				    !dev->msd_iface_valid) {
 					dev->class_code = iface->class_code;
 					dev->subclass = iface->subclass;
 					dev->protocol = iface->protocol;
+					dev->msd_iface_valid = 1;
+					dev->msd_iface = iface->interface_num;
+					dev->msd_alt = iface->alt_setting;
+					cur_msd = 1;
+				} else if (iface->class_code ==
+						   USB_CLASS_MASS_STORAGE &&
+					   iface->protocol == 0x62) {
+					uas_only = 1;
 				}
-			} else if (type == USB_DESC_ENDPOINT) {
+			} else if (type == USB_DESC_ENDPOINT &&
+				   len >= sizeof(usb_endpoint_desc_t)) {
 				usb_endpoint_desc_t *ep =
 					(usb_endpoint_desc_t *)ptr;
 				uint8_t ep_type =
@@ -2419,10 +2667,33 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 						dev->bulk_out_max_pkt =
 							ep->max_packet;
 					}
+					if (cur_msd && ep_in && !m_in) {
+						m_in = ep_num;
+						m_in_pkt = ep->max_packet;
+					} else if (cur_msd && !ep_in && !m_out) {
+						m_out = ep_num;
+						m_out_pkt = ep->max_packet;
+					}
 				}
 			}
 
 			ptr += len;
+		}
+		if (dev->msd_iface_valid) {
+			if (m_in && m_out) {
+				dev->bulk_in_ep = m_in;
+				dev->bulk_in_max_pkt = m_in_pkt;
+				dev->bulk_out_ep = m_out;
+				dev->bulk_out_max_pkt = m_out_pkt;
+			} else {
+				/* A BOT interface without its two bulk
+				 * endpoints cannot be driven. */
+				dev->msd_iface_valid = 0;
+			}
+		} else if (uas_only) {
+			kprintf("[XHCI] Port %d: USB Attached SCSI device without a "
+				"Bulk-Only setting; not supported\n",
+				port);
 		}
 	}
 
@@ -2431,6 +2702,19 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 				  USB_RT_H2D | USB_RT_STD | USB_RT_DEV,
 				  USB_REQ_SET_CONFIG, 1, 0, 0, NULL) != ST_OK) {
 		// Continue anyway, some devices work without this
+	}
+
+	// The mass-storage interface's Bulk-Only setting, when it is not the
+	// default one (SET_INTERFACE)
+	if (dev->msd_iface_valid && dev->msd_alt != 0) {
+		if (xhci_control_transfer(ctrl, dev,
+					  USB_RT_H2D | USB_RT_STD | USB_RT_IFACE,
+					  11 /* SET_INTERFACE */, dev->msd_alt,
+					  dev->msd_iface, 0, NULL) != ST_OK) {
+			kprintf("[XHCI] Port %d: SET_INTERFACE %u/%u failed\n",
+				port, dev->msd_iface, dev->msd_alt);
+			dev->msd_iface_valid = 0;
+		}
 	}
 
 	// Probe for USB HID devices (keyboard/mouse) while the configuration
@@ -2470,12 +2754,23 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 	// Free DMA buffer (free the raw allocation, not the aligned pointer)
 	kfree_dma(raw_buf);
 
+	/* A mass-storage class without a usable Bulk-Only interface is not
+	 * offered to the storage driver. */
+	if (dev->class_code == USB_CLASS_MASS_STORAGE && !dev->msd_iface_valid)
+		dev->class_code = 0;
+
 	dev->configured = 1;
 	ctrl->num_devices++;
 
 	// Report success with device info
 	kprintf("[XHCI] Port %d: USB device (VID=%04x PID=%04x class=%d)\n",
 		dev->port, dev->vendor_id, dev->product_id, dev->class_code);
+
+	// A storage device found after the boot enumeration goes to the
+	// storage driver's attach thread (during boot, xhci_boot_poll()
+	// attaches it itself)
+	if (dev->msd_iface_valid)
+		usb_msd_probe(ctrl, dev);
 
 	return ST_OK;
 }
@@ -2514,12 +2809,8 @@ static int xhci_evaluate_context(xhci_controller_t *ctrl, uint8_t slot,
 	// Send Evaluate Context command
 	uint32_t control = (TRB_TYPE_EVAL_CTX << 10) | (slot << 24);
 
-	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) !=
-	    ST_OK) {
-		return ST_ERR;
-	}
-
-	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+	if (xhci_command(ctrl, ctrl->input_ctx_phys, 0, control, 1000, NULL,
+			 NULL) != ST_OK) {
 		kprintf("[XHCI] Evaluate Context failed for slot %d\n", slot);
 		return ST_ERR;
 	}
@@ -2604,12 +2895,8 @@ int xhci_configure_endpoint(xhci_controller_t *ctrl, uint8_t slot,
 	// Send Configure Endpoint command
 	uint32_t control = (TRB_TYPE_CONFIG_EP << 10) | (slot << 24);
 
-	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) !=
-	    ST_OK) {
-		return ST_ERR;
-	}
-
-	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+	if (xhci_command(ctrl, ctrl->input_ctx_phys, 0, control, 1000, NULL,
+			 NULL) != ST_OK) {
 		kprintf("[XHCI] Configure Endpoint failed\n");
 		return ST_ERR;
 	}
@@ -2625,7 +2912,7 @@ int xhci_configure_endpoint(xhci_controller_t *ctrl, uint8_t slot,
 
 int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
 {
-	if (slot == 0 || slot > ctrl->max_slots)
+	if (slot == 0 || slot > ctrl->max_slots || slot > XHCI_MAX_SLOTS)
 		return ST_INVALID;
 	if (dci == 0 || dci > 31)
 		return ST_INVALID;
@@ -2635,6 +2922,11 @@ int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
 	// Get the ring for this endpoint
 	usb_device_t *dev = &ctrl->devices[slot - 1];
 	xhci_ring_t *ring = NULL;
+
+	/* A disconnected device: nothing to recover, and its commands
+	 * would only run into their timeouts. */
+	if (dev->gone)
+		return ST_NO_DEVICE;
 
 	if (dci == 1) {
 		ring = dev->ep0_ring;
@@ -2648,14 +2940,16 @@ int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
 	uint32_t reset_ctrl =
 		(TRB_TYPE_RESET_EP << 10) | (slot << 24) | (dci << 16);
 
-	if (xhci_send_command(ctrl, 0, 0, reset_ctrl) != ST_OK) {
-		kprintf("[XHCI] Failed to send Reset EP command\n");
-		return ST_ERR;
-	}
-
-	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-		kprintf("[XHCI] Reset EP command timeout\n");
-		return ST_TIMEOUT;
+	{
+		int rst = xhci_command(ctrl, 0, 0, reset_ctrl, 1000, NULL,
+				       NULL);
+		if (rst != ST_OK) {
+			if (rst == ST_TIMEOUT)
+				kprintf("[XHCI] Reset EP command timeout\n");
+			else
+				kprintf("[XHCI] Reset EP command failed\n");
+			return rst == ST_TIMEOUT ? ST_TIMEOUT : ST_ERR;
+		}
 	}
 
 	// Step 2: Queue Set TR Dequeue Pointer command to reset ring position
@@ -2668,15 +2962,14 @@ int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
 		uint32_t set_deq_ctrl = (TRB_TYPE_SET_TR_DEQ << 10) |
 					(slot << 24) | (dci << 16);
 
-		if (xhci_send_command(ctrl, deq_ptr, 0, set_deq_ctrl) !=
-		    ST_OK) {
-			kprintf("[XHCI] Failed to send Set TR Dequeue command\n");
-			return ST_ERR;
-		}
-
-		if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-			kprintf("[XHCI] Set TR Dequeue command timeout\n");
-			return ST_TIMEOUT;
+		int dst = xhci_command(ctrl, deq_ptr, 0, set_deq_ctrl, 1000,
+				       NULL, NULL);
+		if (dst != ST_OK) {
+			if (dst == ST_TIMEOUT)
+				kprintf("[XHCI] Set TR Dequeue command timeout\n");
+			else
+				kprintf("[XHCI] Set TR Dequeue command failed\n");
+			return dst == ST_TIMEOUT ? ST_TIMEOUT : ST_ERR;
 		}
 	}
 
@@ -2688,16 +2981,48 @@ int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
 // Control Transfers
 //=============================================================================
 
+/* One control transfer at a time.  A device's default endpoint has one
+ * ring and one completion slot (pending_xfer[slot][1]), and since the
+ * storage driver issues control requests from its own threads (string
+ * descriptors, GET MAX LUN, CLEAR_FEATURE, the Bulk-Only reset) while the
+ * device-poll thread issues the HID and serial ones, two callers could
+ * otherwise meet on the same device.  Never taken by a holder of
+ * xhci_cmd_mutex (the command path issues no control transfers). */
+static DEFINE_MUTEX(xhci_ep0_mutex);
+
+static int xhci_control_transfer_one(xhci_controller_t *ctrl,
+				     usb_device_t *dev, uint8_t bmRequestType,
+				     uint8_t bRequest, uint16_t wValue,
+				     uint16_t wIndex, uint16_t wLength,
+				     void *data);
+
 int xhci_control_transfer(xhci_controller_t *ctrl, usb_device_t *dev,
 			  uint8_t bmRequestType, uint8_t bRequest,
 			  uint16_t wValue, uint16_t wIndex, uint16_t wLength,
 			  void *data)
+{
+	int st;
+
+	mutex_lock(&xhci_ep0_mutex);
+	st = xhci_control_transfer_one(ctrl, dev, bmRequestType, bRequest,
+				       wValue, wIndex, wLength, data);
+	mutex_unlock(&xhci_ep0_mutex);
+	return st;
+}
+
+static int xhci_control_transfer_one(xhci_controller_t *ctrl,
+				     usb_device_t *dev, uint8_t bmRequestType,
+				     uint8_t bRequest, uint16_t wValue,
+				     uint16_t wIndex, uint16_t wLength,
+				     void *data)
 {
 	if (!dev || !dev->ep0_ring) {
 		kprintf("[XHCI] Control: invalid dev=%p ring=%p\n", dev,
 			dev ? dev->ep0_ring : NULL);
 		return ST_INVALID;
 	}
+	if (dev->gone)
+		return ST_NO_DEVICE;
 
 	xhci_ring_t *ring = dev->ep0_ring;
 	uint8_t slot = dev->slot_id;
@@ -2778,7 +3103,19 @@ int xhci_control_transfer(xhci_controller_t *ctrl, usb_device_t *dev,
 				return ST_OK;
 			}
 
+			/* A request the device refuses (a class request it
+			 * does not know) halts the default endpoint on the
+			 * host side: reset it, or every later control
+			 * transfer fails as well.  (The device side clears
+			 * its protocol stall by itself at the next SETUP.) */
+			if (xfer.cc == TRB_CC_STALL)
+				xhci_reset_endpoint(ctrl, slot, 1);
+
 			return ST_IO;
+		}
+		if (dev->gone) {
+			xhci_clear_pending_xfer(ctrl, slot, 1);
+			return ST_NO_DEVICE;
 		}
 
 		delay_ms(1);
@@ -2902,6 +3239,8 @@ int xhci_bulk_transfer_in(xhci_controller_t *ctrl, usb_device_t *dev, void *buf,
 	BUG_ON(ctrl == NULL);
 	if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep)
 		return ST_INVALID;
+	if (dev->gone)
+		return ST_NO_DEVICE;
 
 	xhci_ring_t *ring = dev->bulk_in_ring;
 	uint8_t slot = dev->slot_id;
@@ -2992,6 +3331,14 @@ int xhci_bulk_transfer_in(xhci_controller_t *ctrl, usb_device_t *dev, void *buf,
 			return ST_IO;
 		}
 
+		/* Unplugged: the transfer will never complete.  The
+		 * device cannot move data any more, and the slot is
+		 * disabled before the caller's buffers can go. */
+		if (dev->gone) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+			return ST_NO_DEVICE;
+		}
+
 		delay_us(xhci_wait_backoff_us(i)); // adaptive: tight then coarse
 	}
 
@@ -3056,6 +3403,8 @@ int xhci_bulk_transfer_out(xhci_controller_t *ctrl, usb_device_t *dev,
 {
 	if (!dev || !dev->bulk_out_ring || !dev->bulk_out_ep)
 		return ST_INVALID;
+	if (dev->gone)
+		return ST_NO_DEVICE;
 
 	xhci_ring_t *ring = dev->bulk_out_ring;
 	uint8_t slot = dev->slot_id;
@@ -3129,6 +3478,14 @@ int xhci_bulk_transfer_out(xhci_controller_t *ctrl, usb_device_t *dev,
 			return ST_IO;
 		}
 
+		/* Unplugged: the transfer will never complete.  The
+		 * device cannot move data any more, and the slot is
+		 * disabled before the caller's buffers can go. */
+		if (dev->gone) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+			return ST_NO_DEVICE;
+		}
+
 		delay_us(xhci_wait_backoff_us(i)); // adaptive: tight then coarse
 	}
 
@@ -3155,6 +3512,8 @@ int xhci_bulk_transfer_in_sg(xhci_controller_t *ctrl, usb_device_t *dev,
 {
 	if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep || !sg_list)
 		return ST_INVALID;
+	if (dev->gone)
+		return ST_NO_DEVICE;
 
 	xhci_ring_t *ring = dev->bulk_in_ring;
 	uint8_t slot = dev->slot_id;
@@ -3226,6 +3585,14 @@ int xhci_bulk_transfer_in_sg(xhci_controller_t *ctrl, usb_device_t *dev,
 			return ST_IO;
 		}
 
+		/* Unplugged: the transfer will never complete.  The
+		 * device cannot move data any more, and the slot is
+		 * disabled before the caller's buffers can go. */
+		if (dev->gone) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+			return ST_NO_DEVICE;
+		}
+
 		delay_us(xhci_wait_backoff_us(i)); // adaptive: tight then coarse
 	}
 
@@ -3238,6 +3605,8 @@ int xhci_bulk_transfer_out_sg(xhci_controller_t *ctrl, usb_device_t *dev,
 {
 	if (!dev || !dev->bulk_out_ring || !dev->bulk_out_ep || !sg_list)
 		return ST_INVALID;
+	if (dev->gone)
+		return ST_NO_DEVICE;
 
 	xhci_ring_t *ring = dev->bulk_out_ring;
 	uint8_t slot = dev->slot_id;
@@ -3304,6 +3673,14 @@ int xhci_bulk_transfer_out_sg(xhci_controller_t *ctrl, usb_device_t *dev,
 			return ST_IO;
 		}
 
+		/* Unplugged: the transfer will never complete.  The
+		 * device cannot move data any more, and the slot is
+		 * disabled before the caller's buffers can go. */
+		if (dev->gone) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+			return ST_NO_DEVICE;
+		}
+
 		delay_us(xhci_wait_backoff_us(i)); // adaptive: tight then coarse
 	}
 
@@ -3326,8 +3703,10 @@ void xhci_shutdown(xhci_controller_t *ctrl)
 
 	// Free device resources
 	for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-		if (ctrl->dev_ctx[i])
-			kfree_dma(ctrl->dev_ctx[i]);
+		if (ctrl->dev_ctx_raw[i])
+			kfree_dma(ctrl->dev_ctx_raw[i]);
+		ctrl->dev_ctx_raw[i] = NULL;
+		ctrl->dev_ctx[i] = NULL;
 		if (ctrl->devices[i].ep0_ring)
 			xhci_free_ring(ctrl->devices[i].ep0_ring);
 		if (ctrl->devices[i].bulk_in_ring)

@@ -9,8 +9,14 @@
 # and bookmark files -- lives under ~/.cache and ~/.local/share, on the
 # USB stick, through ext4, with an fsync behind every SQLite commit.  To
 # see how much of luakit's slowness is that, this launcher moves both
-# directories to /ram, the kernel's RAM filesystem (kernel/fs/tmpfs.c),
-# for the life of the boot.  GLib reads the locations from XDG_DATA_HOME
+# directories to /ram, a RAM filesystem (tmpfs, kernel/fs/tmpfs.c) that
+# the live medium's /etc/fstab mounts at boot, for the life of the boot.
+#
+# ONLY WHERE /ram IS A MOUNTED tmpfs: an installed system has no /ram line
+# in its fstab and runs luakit from the disk like any other program.  So
+# does any system where /ram is missing, is an ordinary directory, or is
+# something else mounted there -- this launcher then execs /usr/bin/luakit
+# untouched, whatever else is set.  GLib reads the locations from XDG_DATA_HOME
 # and XDG_CACHE_HOME, so luakit and WebKit's helper processes (which
 # inherit the environment) need no change of their own.
 #
@@ -77,6 +83,17 @@ esac
 [ -n "$HOME" ] || exec "$real" "$@"
 [ -e "$HOME/.config/luakit/use-disk" ] && exec "$real" "$@"
 [ -d "$ram" ] || exec "$real" "$@"
+
+# /ram must be a tmpfs mounted right there (the top mount of /ram in
+# /proc/mounts, the last line naming it).  A plain directory on the disk
+# would buy nothing and only copy the files around.
+ram_type=
+if [ -r /proc/mounts ]; then
+	while read -r _src _dir _type _rest; do
+		[ "$_dir" = "$ram" ] && ram_type=$_type
+	done < /proc/mounts
+fi
+[ "$ram_type" = tmpfs ] || exec "$real" "$@"
 
 # The tree is named for the user, as asked, so /ram says at a glance whose
 # session is whose.  The name comes from the passwd entry; `id -un' prints

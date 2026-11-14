@@ -66,5 +66,11 @@ struct pfs_node *sysfs_mkdir(const char *path);
 struct pfs_node *sysfs_add_attr(const char *base, const char *name,
 				pfs_show_t show, pfs_store_t store, void *arg,
 				uint64_t arg2);
+/* A node of `type' at `path' (relative to /sys) carrying the fields of
+ * `tmpl' from the moment it is reachable (pfs_add_node): a dynamic
+ * directory with its list/lookup/create callbacks, a file with a mode of
+ * its own. */
+struct pfs_node *sysfs_add_node(const char *path, enum pfs_type type,
+				const struct pfs_node *tmpl);
 
 #endif

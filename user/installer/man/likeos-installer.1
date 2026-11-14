@@ -1,0 +1,129 @@
+.\" likeos-installer.1 - manual page for likeos-installer, LikeOS Setup.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man-live/likeos-installer.1 (the live medium
+.\" only), rendered from this file by "make installer-manpages"
+.\" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH LIKEOS-INSTALLER 1 "November 2026" "LikeOS" "System Administration"
+.SH NAME
+likeos-installer \- LikeOS Setup, the graphical installer
+.SH SYNOPSIS
+.B likeos-installer
+.RB [ \-\-mock ]
+.RB [ \-\-window ]
+.RB [ \-\-page=\fIn\fP
+.RB [ \-\-substep=\fIn\fP ]]
+.RB [ \-\-size=\fIw\fPx\fIh\fP ]
+.RB [ \-\-fast ]
+.RB [ \-\-no\-animation ]
+.br
+.B likeos-installer \-\-version
+.SH DESCRIPTION
+.B likeos-installer
+is LikeOS Setup: the program that installs LikeOS from the USB medium onto
+a disk of the computer.
+It is normally not started by hand.
+The boot menu of the installation medium has an entry
+.BR "Install LikeOS from USB" ;
+it starts the medium's system with
+.B likeos.mode=install
+on the kernel command line, and
+.BR init (8)
+then starts LikeOS Setup on the console instead of the login prompt: the
+X server with this program alone, full screen, without a window manager or
+desktop.
+.PP
+Setup asks, page by page: the language and the formats of dates and times,
+the keyboard to use during setup, where LikeOS goes (a disk to erase
+completely, or a partition, with tools to delete, create, format and extend
+partitions \(em nothing is written until the installation starts), the time
+zone, the keyboard layouts of the new system, the computer's name, the root
+password and the account to sign in with.
+A summary shows every choice before anything is changed; Install then
+partitions and formats, unpacks the system image, sets up the new system,
+installs the boot loader and registers it with the firmware, showing the
+progress, and restarts the computer into the installed system.
+.PP
+The disks of the medium Setup was started from are shown but cannot be
+chosen.
+When something goes wrong a page says what, with the installation log.
+.PP
+The work is done by the installer library that the text-mode installer,
+.BR likeos-install (1),
+uses too.
+When the graphical installer cannot run (the graphics of the computer do
+not work), the installation medium's console offers
+.B likeos-install
+instead.
+.SH OPTIONS
+These are for developing and testing Setup; the installation medium starts
+it without any.
+.TP
+.B \-\-mock
+Use the built-in stand-in for the installer library: made-up disks and a
+simulated installation that changes nothing.
+.TP
+.B \-\-window
+Run in a normal 1024\(mu768 window instead of covering the screen.
+.TP
+.BI \-\-page= n
+Start on page
+.I n
+(0 the start screen, 1 language, 2 keyboard, 3 preparing, 4 disk, 5 time
+zone, 6 keyboard layouts, 7 computer name, 8 root password, 9 account, 10
+summary, 11 installing, 12 finished, 13 error), with made-up answers for the
+pages before it \(em for screenshots.
+.TP
+.BI \-\-substep= n
+With
+.BR \-\-page :
+go
+.I n
+steps into a page that has steps.
+.TP
+.BI \-\-size= w x h
+Lay the pages out as if the screen were
+.IR w \(mu h
+pixels.
+.TP
+.B \-\-fast
+No minimum time on the start and waiting screens.
+.TP
+.B \-\-no\-animation
+Still illustrations and spinners.
+.TP
+.B \-\-version
+Show the version and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+The installation finished (Setup restarts the computer itself).
+.TP
+.B 10
+The person chose to switch the computer off.
+.TP
+.B other
+Setup could not run or broke down; the installation medium's console then
+offers the text-mode installer.
+.SH FILES
+.TP
+.B /install/likeos-rootfs.tar.zst
+The system image that is installed.
+.TP
+.B /tmp/likeos-install.log
+The log of the installation (kept on the installed system as
+.BR /var/log/likeos-install.log ).
+.TP
+.B /etc/inittab.install
+What
+.BR init (8)
+runs when the medium was started with
+.BR likeos.mode=install .
+.SH SEE ALSO
+.BR likeos-install (1),
+.BR likeos-install.conf (5),
+.BR likeos-bootmenu.conf (5),
+.BR likeos-gpt (1),
+.BR likeos-efiboot (1)

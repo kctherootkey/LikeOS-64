@@ -311,8 +311,10 @@ static inline void spin_unlock_irqrestore(spinlock_t *lock, uint64_t flags)
 // PREEMPTION CONTROL (Full Kernel Preemption)
 // ============================================================================
 
-// Global preemption counter (per-CPU for SMP, single for UP)
-// When > 0, preemption is disabled in the current context
+// Global preemption counter.  Nothing raises it and the scheduler does not
+// consult it: it is only read (always 0) by code asking whether it may sleep.
+// The gate the scheduler honours is the per-CPU one in percpu.h
+// (percpu_preempt_disable/enable), with its own rules.
 extern volatile int g_preempt_count;
 
 // Disable kernel preemption (increment counter)
@@ -391,6 +393,11 @@ struct robust_list_head;
 // ============================================================================
 
 typedef void (*task_entry_t)(void *arg);
+
+/* Mount holds a task records at once (task_t.mnt_held).  A path operation
+ * nests a few at most: the mount it runs on, a second one for a two-name
+ * operation, one taken again by a check inside it. */
+#define TASK_MNT_HOLDS 8
 
 typedef enum {
 	TASK_READY = 0,
@@ -1278,6 +1285,17 @@ typedef struct task {
 	 * (struct blk_plug on its stack; NULL outside one): flushed when it
 	 * finishes the batch or is about to sleep (kernel/dev/block). */
 	struct blk_plug *plug;
+	/* The path operation this task is inside (struct vfs_walk on its
+	 * stack, kernel/fs/vfs.c; NULL outside one): where a filesystem that
+	 * meets a symbolic link on the way hands the rest of the walk back,
+	 * so the link is followed across mounts.  Never inherited. */
+	void *vfs_walk;
+	/* The mounts this task holds for a path operation in flight
+	 * (vfs_mnt_get() .. vfs_mnt_put(), kernel/fs/mount.c).  A task that
+	 * dies inside the operation never puts them; its teardown does
+	 * (vfs_mnt_release_task), so an unmount does not wait for them in
+	 * vain.  Never inherited. */
+	struct vfs_mount *mnt_held[TASK_MNT_HOLDS];
 } task_t;
 
 /* THE descriptor table of `t`.  A thread created with CLONE_FILES shares one

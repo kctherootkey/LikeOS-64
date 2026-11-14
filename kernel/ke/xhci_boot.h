@@ -15,6 +15,17 @@ typedef struct {
 	xhci_controller_t *ctrl_hid; // Secondary controller (HID), may be NULL
 	int enum_complete;
 	int msd_ready;
+	/* The boot enumeration phase is over (a mass-storage device is
+	 * ready, or the root was mounted from another disk); from then on
+	 * xhci_boot_poll() leaves the controllers to the hot-plug path. */
+	int boot_done;
+	/* First poll seen, and timer_ticks() at that poll */
+	int started;
+	uint64_t start_tick;
+	/* The USB HID status last reported (reported once per change) */
+	int hid_count;
+	int hid_kbd;
+	int hid_mouse;
 } xhci_boot_state_t;
 
 // Boot-time initialization

@@ -1,0 +1,337 @@
+.\" mount.1 - manual page for mount.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man/mount.1, rendered from this file by
+.\" "make installer-manpages" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH MOUNT 1 "November 2026" "LikeOS" "System Administration"
+.SH NAME
+mount \- mount file systems, or list the mounted ones
+.SH SYNOPSIS
+.B mount
+.RB [ \-l ]
+.RB [ \-t
+.IR types ]
+.br
+.B mount \-a
+.RB [ \-fnv ]
+.RB [ \-t
+.IR types ]
+.RB [ \-O
+.IR options ]
+.br
+.B mount
+.RB [ \-fnrvw ]
+.RB [ \-t
+.IR type ]
+.RB [ \-o
+.IR options ]
+.I source directory
+.br
+.B mount
+.RB [ \-fnrvw ]
+.RB [ \-o
+.IR options ]
+.IR source | directory
+.br
+.B mount \-o remount\fR[\fB,\fIoptions\fR]
+.I directory
+.SH DESCRIPTION
+.B mount
+attaches the file system on a device (or one that needs no device, such as
+.BR tmpfs )
+to a directory, the mount point, so that its files appear there.
+.BR umount (1)
+detaches it again.
+.PP
+Without arguments
+.B mount
+lists the mounted file systems, one line each,
+.IP
+.I source
+.B on
+.I directory
+.B type
+.I type
+.BI ( options )
+.PP
+from
+.BR /proc/mounts ;
+.B \-t
+limits the list to some types.
+.PP
+With one argument, a mount point or a source, the line of
+.B /etc/fstab
+for it is mounted, with that line's type and options (options given with
+.B \-o
+are added to them).
+.B mount \-a
+mounts every line of
+.B /etc/fstab
+that is not marked
+.BR noauto ,
+is not swap and is not mounted already, in the order of the file \(em what
+.BR init (8)
+does at start-up.
+.PP
+Mounting needs root; listing does not.
+.SS Sources
+.TP
+.BI /dev/ device
+A block device:
+.BR /dev/sda1 ,
+.BR /dev/nvme0n1p2 ,
+.BR /dev/mmcblk0p1 .
+.TP
+.BI UUID= uuid
+The device whose file system has this UUID
+.RB ( blkid (8)
+shows it).
+.TP
+.BI LABEL= label
+The device whose file system has this label.
+.TP
+.BI PARTUUID= uuid
+The partition with this unique partition GUID (GPT) or MBR identifier.
+.TP
+.BI PARTLABEL= name
+The partition with this name (GPT).
+.TP
+.I word
+A file system without a device:
+.BR tmpfs .
+.PP
+The tags are looked up in
+.BR /dev/disk/by\-uuid ,
+.BR by\-label ,
+.B by\-partuuid
+and
+.BR by\-partlabel .
+Bind mounts and loop devices (a directory or a file as the source) are not
+offered.
+.SS File system types
+.TP
+.B ext4
+The LikeOS root file system and data disks (also ext2 and ext3 file
+systems, read and written as ext4).
+.TP
+.B vfat
+FAT12, FAT16 and FAT32: the EFI system partition, USB sticks and memory
+cards
+.RB ( fat ,
+.B fat32
+and
+.B msdos
+are taken for the same).
+.TP
+.B tmpfs
+A file system in memory, empty when mounted, gone when unmounted.
+.PP
+Without
+.B \-t
+the type is the one
+.B /etc/fstab
+gives, or else the kernel recognises the file system on the device.
+.SH OPTIONS
+.TP
+.BR \-a ", " \-\-all
+Mount every file system of
+.B /etc/fstab
+that is not
+.BR noauto .
+.TP
+.BR \-t ", " \-\-types " \fIlist\fR"
+The file system type.
+With
+.B \-a
+or a listing: the types to include, separated by commas; a
+.B no
+prefix excludes a type
+.RB ( notmpfs ),
+and a list starting with
+.B no
+excludes all of its types.
+.TP
+.BR \-O ", " \-\-test\-opts " \fIlist\fR"
+With
+.BR \-a :
+only the lines that have these options
+.RB ( no
+.I option
+selects the lines without it).
+.TP
+.BR \-o ", " \-\-options " \fIlist\fR"
+Mount options, separated by commas (below).
+.TP
+.BR \-r ", " \-R ", " \-\-read\-only
+Mount read-only, the same as
+.BR "\-o ro" .
+.TP
+.BR \-w ", " \-\-rw ", " \-\-read\-write
+Mount read-write, the same as
+.BR "\-o rw" .
+A device that is write-protected is mounted read-only when neither
+.B rw
+nor
+.B \-w
+was asked for.
+.TP
+.BR \-f ", " \-\-fake
+Do everything but the mount itself (with
+.BR \-v :
+show what would be mounted).
+.TP
+.BR \-n ", " \-\-no\-mtab
+Accepted; there is no
+.B /etc/mtab
+to update.
+.TP
+.BR \-v ", " \-\-verbose
+Say what is mounted, with which options.
+.TP
+.BR \-l ", " \-\-show\-labels
+Accepted with a listing.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the options.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH MOUNT OPTIONS
+The options every file system takes:
+.TP
+.BR ro ", " rw
+Read-only, or read-write (the default).
+.TP
+.B defaults
+.BR rw ,
+.BR suid ,
+.BR dev ,
+.BR exec ,
+.BR auto ,
+.BR async .
+.TP
+.BR nosuid ", " suid
+Ignore (or honour) the set-user-ID and set-group-ID bits of programs.
+.TP
+.BR nodev ", " dev
+Do not (or do) give access to device files on the file system.
+.TP
+.BR noexec ", " exec
+Do not (or do) allow programs on the file system to be run.
+.TP
+.BR noatime ", " atime ", " relatime ", " strictatime ", " nodiratime ", " diratime
+When the access times of files (and directories) are updated.
+.TP
+.BR sync ", " async ", " dirsync
+Write data (or directory changes) at once, or when convenient.
+.TP
+.B lazytime
+Keep time stamp updates in memory longer.
+.TP
+.B nosymfollow
+Do not follow symbolic links on the file system.
+.TP
+.B remount
+Change the options of a file system that is mounted already: its flags
+.RB ( ro
+and
+.B rw
+among them) are those it has, changed by the options given.
+.TP
+.BR noauto ", " auto
+In
+.BR /etc/fstab :
+not mounted (or mounted) by
+.B mount \-a
+and at start-up.
+.TP
+.B nofail
+In
+.BR /etc/fstab :
+a device that is not there is no error.
+.TP
+.BR X\-mount.mkdir [ =\fImode\fR ]
+Make the mount point when it does not exist (with
+.IR mode ,
+octal; default 0755).
+.PP
+Anything else is the file system's own option and passed on to it.
+.B ext4
+has none.
+.B vfat
+takes
+.BI uid= n
+and
+.BI gid= n
+(the owner every file shows; FAT stores none),
+.BI umask= octal\fR,
+.BI fmask= octal
+and
+.BI dmask= octal
+(the permission bits taken away from every file, from files, from
+directories; the defaults give files 0644 and directories 0755), and
+.BR shortname= lower | win95 | winnt | mixed
+(how names that fit 8.3 are shown and created).
+.B tmpfs
+takes
+.BI size= n
+(bytes, with a
+.BR k ,
+.B m
+or
+.B g
+suffix, or a percentage of the memory with
+.BR % ;
+default: a quarter of the memory),
+.BI nr_inodes= n
+(the most files),
+.BI mode= octal
+(of the root directory; default 1777),
+.BI uid= n
+and
+.BI gid= n
+(the owner of the root directory).
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Wrong usage, or no permission.
+.TP
+.B 2
+A system error.
+.TP
+.B 32
+The mount failed.
+.TP
+.B 64
+Some of several mounts failed
+.RB ( \-a ).
+.SH FILES
+.TP
+.B /etc/fstab
+The file systems to mount, see
+.BR fstab (5).
+.TP
+.B /proc/mounts
+What is mounted now.
+.TP
+.B /dev/disk/by\-uuid\fR, \fBby\-label\fR, \fBby\-partuuid\fR, \fBby\-partlabel
+Where the tags are looked up.
+.SH EXAMPLES
+.nf
+mount /dev/sdb1 /mnt
+mount \-t vfat \-o uid=1000,gid=1000 LABEL=STICK /media/stick
+mount \-t tmpfs \-o size=512m,mode=1777 tmpfs /scratch
+mount \-o remount,ro /
+mount \-a \-t notmpfs
+.fi
+.SH SEE ALSO
+.BR umount (1),
+.BR fstab (5),
+.BR blkid (8),
+.BR lsblk (8),
+.BR findfs (8)

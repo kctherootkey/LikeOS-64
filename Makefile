@@ -576,6 +576,9 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/fs_signalfd.o \
 			  $(BUILD_DIR)/fs_inotify.o \
 			  $(BUILD_DIR)/fs_sync.o \
+			  $(BUILD_DIR)/fs_mount.o \
+			  $(BUILD_DIR)/fs_kmsg.o \
+			  $(BUILD_DIR)/fs_efivars.o \
 			  $(BUILD_DIR)/mm_mmap.o \
 			  $(BUILD_DIR)/mm_mprotect.o \
 			  $(BUILD_DIR)/mm_madvise.o \
@@ -598,6 +601,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/lapic.o \
 			  $(BUILD_DIR)/cpu_pstate.o \
 			  $(BUILD_DIR)/acpi.o \
+			  $(BUILD_DIR)/hal_efi.o \
+			  $(BUILD_DIR)/efi_loadopt.o \
 			  $(ACPICA_OBJS) \
 			  $(BUILD_DIR)/percpu.o \
 			  $(BUILD_DIR)/smp.o \
@@ -747,13 +752,28 @@ KERNEL_OBJS += $(NVME_OBJS)
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
 
-# Single GPT USB disk = the one and only bootable image.  Layout:
-#   P1: small FAT EFI System Partition carrying ONLY the bootloader
-#       (/EFI/BOOT/BOOTX64.EFI) — FAT is mandated by UEFI for the ESP.
-#   P2: ext4 root holding /boot/kernel.elf and the whole userland.
+# Single GPT USB disk = the live USB medium.  Layout:
+#   P1: small FAT EFI System Partition carrying the bootloader
+#       (/EFI/BOOT/BOOTX64.EFI) and the boot menu (/EFI/LIKEOS/bootmenu.conf)
+#       — FAT is mandated by UEFI for the ESP.
+#   P2: ext4 root holding /boot/kernel.elf and the whole userland, the
+#       installer and the installed system's image (/install/likeos-rootfs.tar.zst).
 # The bootloader reads /boot/kernel.elf straight from the ext4 partition, so
 # the complete OS lives on one stick with no FAT data filesystem anywhere.
+# EXT4_STAGING_STAMP: the staging of everything the live medium and the
+# installed system share is done (mk/installer.mk, release section).
 EXT4_STAGING  = $(BUILD_DIR)/ext4_staging
+# Normalises the staged modes: no file or directory of the image is
+# group-writable unless it is also world-writable on purpose (the 1777
+# directories /tmp, /var/tmp, /tmp/.X11-unix and /ram).  The staging copies
+# keep whatever the build user's umask gave them -- 0775/0664 under the usual
+# per-user-group umask 002 -- which would leave /etc and its files writable
+# by group root on the installed system and make the tarball depend on who
+# built it.  Everything staged is owned by root:root, so this only takes away
+# the group's write bit.  $(1) is the tree.
+STAGING_MODE_FIX = find $(1) \( -type f -o -type d \) -perm -g+w ! -perm -o+w \
+	-exec chmod g-w {} +
+EXT4_STAGING_STAMP = $(BUILD_DIR)/.ext4-staging
 # The Intel graphics firmware ships in res/firmware (i915/ and xe/, with
 # LICENSE.i915 and LICENSE.xe) and all of it is staged.  FIRMWARE_SRC, the
 # vendor package as the build host has it (plain or zstd-compressed), only
@@ -798,7 +818,7 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup kdump drminfo \
 	backlight gdb gdbserver loadkeys dumpkeys kbd_mode setleds setmetamode showkey \
-	lsblk
+	lsblk mount umount
 # System binaries -> /sbin/<name>, the disk administration tools (hdparm,
 # blkid, fdisk, sfdisk, wipefs, blockdev, blkdiscard, findfs) and the file
 # system tools (e2fsprogs: mke2fs, e2fsck, tune2fs, dumpe2fs, resize2fs,
@@ -825,7 +845,7 @@ USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
-	webstress wkstress codecheck apload disktest
+	webstress wkstress codecheck apload disktest mounttest usbhotplug
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -1438,6 +1458,15 @@ $(BUILD_DIR)/fs_inotify.o: $(KERNEL_DIR)/fs/inotify.c | $(BUILD_DIR)
 $(BUILD_DIR)/fs_sync.o: $(KERNEL_DIR)/fs/sync.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/fs_mount.o: $(KERNEL_DIR)/fs/mount.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_kmsg.o: $(KERNEL_DIR)/fs/kmsg.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs_efivars.o: $(KERNEL_DIR)/fs/efivars.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/mm_mmap.o: $(KERNEL_DIR)/mm/mmap.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -1502,6 +1531,14 @@ $(BUILD_DIR)/cpu_pstate.o: $(KERNEL_DIR)/hal/cpu_pstate.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/acpi.o: $(KERNEL_DIR)/hal/acpi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# UEFI runtime services (kernel/hal/efi.c) and the device path / load
+# option code the kernel shares with the bootloader and likeos-efiboot.
+$(BUILD_DIR)/hal_efi.o: $(KERNEL_DIR)/hal/efi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/efi_loadopt.o: $(BOOT_DIR)/efi_loadopt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Pattern rule for all ACPICA source files
@@ -1640,6 +1677,17 @@ $(BUILD_DIR)/getty: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/init: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) init
 	cp $(USER_DIR)/init $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# mount/umount: /etc/fstab and /proc/mounts aware, sharing that code with
+# init (user/bin/fstab-util.c).  Ordered one after the other: separate
+# sub-makes running in parallel would each compile fstab-util.o, into the
+# same file at the same time.
+$(BUILD_DIR)/mount: | $(BUILD_DIR)/init
+$(BUILD_DIR)/umount: | $(BUILD_DIR)/mount
+$(BUILD_DIR)/mount $(BUILD_DIR)/umount: $(BUILD_DIR)/%: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) $*
+	cp $(USER_DIR)/$* $@
 	$(USER_STRIP) --strip-unneeded $@
 
 # Account/identity utilities.  id/whoami/groups/adduser/addgroup use libc only;
@@ -1821,6 +1869,21 @@ $(BUILD_DIR)/openssltest: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/disktest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/disktest
 	cp $(USER_DIR)/tests/disktest $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# mounttest: mount table and *at() syscall tests (formats the scratch
+# partition named on its command line; see the source).
+$(BUILD_DIR)/mounttest: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/mounttest
+	cp $(USER_DIR)/tests/mounttest $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# usbhotplug: watches /sys/block for USB storage coming and going; --io
+# reads each new disk and checks that I/O to a removed one fails with EIO
+# without hanging (never writes).
+$(BUILD_DIR)/usbhotplug: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/usbhotplug
+	cp $(USER_DIR)/tests/usbhotplug $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/usbtest: userland-libc userland-rtld | $(BUILD_DIR)
@@ -2828,7 +2891,22 @@ endif
 	@echo "LikeOS ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
-$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S $(KERNEL_DIR)/dev/video/screen_modes.h $(SCREEN_STAMP) | $(BUILD_DIR)
+# The boot menu (menu.c, drawn by gfx.c from the generated font and logo
+# headers -- host/gen-bootfont.py, host/gen-bootlogo.py), the firmware boot
+# entry registration (fallback.c) and the device path / load option code it
+# shares with the kernel and likeos-efiboot (efi_loadopt.c).  The newer
+# files are held to -Wall -Wextra and built with -O2 (the renderer works
+# per pixel over the whole screen).
+BOOTLOADER_SRCS = $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c \
+	$(BOOT_DIR)/trampoline.S $(BOOT_DIR)/menu.c $(BOOT_DIR)/gfx.c \
+	$(BOOT_DIR)/fallback.c $(BOOT_DIR)/efi_loadopt.c
+BOOTLOADER_HDRS = $(BOOT_DIR)/bootcommon.h $(BOOT_DIR)/gfx.h \
+	$(BOOT_DIR)/bootfont.h $(BOOT_DIR)/bootlogo.h $(BOOT_DIR)/efi_loadopt.h
+# -ffreestanding -fno-tree-loop-distribute-patterns: no C library behind the
+# loader, so the optimiser must not turn a loop into a call to strlen/memset.
+BOOTLOADER_WFLAGS = -O2 -ffreestanding -fno-tree-loop-distribute-patterns \
+	-Wall -Wextra
+$(BOOTLOADER_EFI): $(BOOTLOADER_SRCS) $(BOOTLOADER_HDRS) $(KERNEL_DIR)/dev/video/screen_modes.h $(SCREEN_STAMP) | $(BUILD_DIR)
 	@echo "Building UEFI bootloader..."
 	# Compile bootloader C code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/bootloader.c -o $(BUILD_DIR)/bootloader.o
@@ -2839,10 +2917,24 @@ $(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_
 	# Assemble trampoline code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/trampoline.S -o $(BUILD_DIR)/trampoline.o
 	
+	# Boot menu, its renderer, boot entry registration, load options
+	$(GCC) $(UEFI_CFLAGS) $(BOOTLOADER_WFLAGS) -c $(BOOT_DIR)/menu.c -o $(BUILD_DIR)/boot_menu.o
+	$(GCC) $(UEFI_CFLAGS) $(BOOTLOADER_WFLAGS) -c $(BOOT_DIR)/gfx.c -o $(BUILD_DIR)/boot_gfx.o
+	$(GCC) $(UEFI_CFLAGS) $(BOOTLOADER_WFLAGS) -c $(BOOT_DIR)/fallback.c -o $(BUILD_DIR)/boot_fallback.o
+	$(GCC) $(UEFI_CFLAGS) $(BOOTLOADER_WFLAGS) -c $(BOOT_DIR)/efi_loadopt.c -o $(BUILD_DIR)/boot_efi_loadopt.o
+	
 	# Link as shared object
 	$(LD) $(UEFI_LDFLAGS) $(EFI_LIBS) $(BUILD_DIR)/bootloader.o $(BUILD_DIR)/boot_stack_chk.o $(BUILD_DIR)/trampoline.o \
+		$(BUILD_DIR)/boot_menu.o $(BUILD_DIR)/boot_gfx.o $(BUILD_DIR)/boot_fallback.o $(BUILD_DIR)/boot_efi_loadopt.o \
 		-o $(BUILD_DIR)/bootloader.so \
 		/usr/lib/libgnuefi.a /usr/lib/libefi.a
+	# A shared object links with symbols left undefined, and the firmware
+	# would jump to address 0 for them: stop before making the .efi.
+	@undef=$$(nm $(BUILD_DIR)/bootloader.so | awk '$$1 == "U" { print $$2 }'); \
+	if [ -n "$$undef" ]; then \
+		echo "ERROR: undefined symbols in the bootloader: $$undef"; \
+		exit 1; \
+	fi
 	
 	# Convert to EFI executable
 	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic \
@@ -2851,15 +2943,22 @@ $(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_
 	@echo "UEFI bootloader built: $(BOOTLOADER_EFI)"
 
 # ---------------------------------------------------------------------------
-# Single ext4 GPT USB disk: FAT ESP (bootloader only) + ext4 root (everything).
-# The ext4 root staging tree is assembled directly from the build artifacts
-# (no intermediate FAT image), then populated with `mkfs.ext4 -d` under
-# fakeroot (root-owned).  The ext4 partition is auto-sized to the staged
-# content so the image stays small and builds fast; override with EXT4_MB=.
+# Single ext4 GPT USB disk: FAT ESP (bootloader + boot menu) + ext4 root
+# (everything).  The ext4 root staging tree is assembled directly from the
+# build artifacts (no intermediate FAT image), then populated with
+# `mkfs.ext4 -d` under fakeroot (root-owned).  The ext4 partition is
+# auto-sized to the staged content so the image stays small and builds fast;
+# override with EXT4_MB=.
+#
+# Two rules (see the release section of mk/installer.mk): this one stages
+# what the live medium and the installed system share and copies the
+# installed system's tree off it; $(GPT_DISK) below adds what only the live
+# medium has and makes the image.
 # ---------------------------------------------------------------------------
-$(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
-	$(if $(strip $(ADD_USER)),$(HOST_CRYPT)) | $(BUILD_DIR)
+$(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
+	| $(BUILD_DIR)
 	@echo "Assembling ext4 root staging tree from build artifacts..."
+	rm -f $@
 	rm -rf $(EXT4_STAGING)
 	mkdir -p $(EXT4_STAGING)/boot $(EXT4_STAGING)/bin $(EXT4_STAGING)/sbin \
 		$(EXT4_STAGING)/lib $(EXT4_STAGING)/usr/bin $(EXT4_STAGING)/usr/sbin \
@@ -2989,6 +3088,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	cp $(BUILD_DIR)/webstress     $(EXT4_STAGING)/usr/local/bin/webstress
 	cp $(BUILD_DIR)/apload        $(EXT4_STAGING)/usr/local/bin/apload
 	cp $(BUILD_DIR)/disktest      $(EXT4_STAGING)/usr/local/bin/disktest
+	cp $(BUILD_DIR)/mounttest     $(EXT4_STAGING)/usr/local/bin/mounttest
+	cp $(BUILD_DIR)/usbhotplug    $(EXT4_STAGING)/usr/local/bin/usbhotplug
 	cp user/bin/tests/apnews-urls.txt $(EXT4_STAGING)/usr/local/bin/apnews-urls.txt
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
@@ -2997,14 +3098,20 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	cp user/bin/tests/testbash.sh $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	# luakit runs through a launcher that keeps its cache and data on the
-	# RAM filesystem (/ram) instead of the disk; it sits ahead of
-	# /usr/bin/luakit on the PATH.  /ram is world-writable and sticky, so
-	# the launcher gives each user a private /ram/<name>, created 0700 in
-	# one step and never adopted from another owner.  LUAKIT_RAM=0 or
+	# RAM filesystem (/ram, the tmpfs the kernel mounts at boot) instead of
+	# the disk -- on the live medium and on an installed system alike; it
+	# sits ahead of /usr/bin/luakit on the PATH.  /ram is world-writable and
+	# sticky, so the launcher gives each user a private /ram/<name>, created
+	# 0700 in one step and never adopted from another owner.  LUAKIT_RAM=0 or
 	# ~/.config/luakit/use-disk bypasses it -- see the script for the
 	# switch and what it copies back.
 	cp res/xorg/luakit-ram.sh $(EXT4_STAGING)/usr/local/bin/luakit
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/luakit
+	# The mount point of the kernel's /ram tmpfs.
+	mkdir -p $(EXT4_STAGING)/ram
+	chmod 1777 $(EXT4_STAGING)/ram
+	# (luakit's RAM launcher, /usr/local/bin/luakit, belongs to the live
+	# medium alone: INSTALLER_STAGE_LIVE, mk/installer.mk.)
 	# Resources, manpages, config
 	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
@@ -3089,6 +3196,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# /bin/sh when the file is missing, whatever the password database says.
 	cp res/etc/shells        $(EXT4_STAGING)/etc/shells
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
+	# (/etc/fstab: the live medium's and the installed system's are staged
+	# by mk/installer.mk -- INSTALLER_STAGE_LIVE and host/stage-rootfs.sh.)
 	# mke2fs's defaults per file system type and usage (from e2fsprogs;
 	# built with $(BUILD_DIR)/mke2fs, which is in ROOT_SBIN_PROGS)
 	cp ports/e2fsprogs-1.47.4/build/mke2fs.conf $(EXT4_STAGING)/etc/mke2fs.conf
@@ -3271,12 +3380,32 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	# Signature file selects this device as the OS root; sample text file
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(EXT4_STAGING)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(EXT4_STAGING)/HELLO.TXT
+	# The installer's tools, which both systems have (mk/installer.mk).
+	$(INSTALLER_STAGE_COMMON)
+	# No umask leftovers (0775/0664) in either system: see STAGING_MODE_FIX.
+	$(call STAGING_MODE_FIX,$(EXT4_STAGING))
+	# The installed system's tree ($(ROOTFS_STAGING), packed into
+	# likeos-rootfs.tar.zst), copied off this one before anything of the
+	# live medium alone goes into it.
+	$(INSTALLER_STAGE_SPLIT)
+	touch $@
+
+# The live medium.  Adds to $(EXT4_STAGING) in place what only the live
+# medium has, and runs again without a new staging when only one of those
+# files changed: every step gives the same result when repeated.
+$(GPT_DISK): $(EXT4_STAGING_STAMP) $(ADD_USER_STAMP) \
+	$(if $(strip $(ADD_USER)),$(HOST_CRYPT)) | $(BUILD_DIR)
+	# The live medium's fstab, the installer, its session,
+	# /install/likeos-rootfs.tar.zst (mk/installer.mk).
+	$(INSTALLER_STAGE_LIVE)
 	# make ADD_USER=<name>: the account adduser would make (see ADD_USER
 	# above), after everything else has gone into /etc/skel.  Its files
 	# are given to the account inside the fakeroot that builds the file
-	# system, below.
+	# system, below.  The live medium's alone: an installed system gets
+	# the accounts the installer makes.  Made once per staging.
 	@set -e; \
-	if [ -n "$(strip $(ADD_USER))" ]; then \
+	if [ -n "$(strip $(ADD_USER))" ] && \
+	   ! cut -d: -f1 $(EXT4_STAGING)/etc/passwd | grep -qx '$(strip $(ADD_USER))'; then \
 	  st=$(EXT4_STAGING); user="$(strip $(ADD_USER))"; \
 	  uid=1000; \
 	  while cut -d: -f3 $$st/etc/passwd | grep -qx $$uid; do uid=$$((uid + 1)); done; \
@@ -3297,6 +3426,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	  done; \
 	  echo "ADD_USER: account $$user (uid $$uid, gid $$gid), password '$(ADD_USER_PASSWORD)'"; \
 	fi
+	# The live-only files and the ADD_USER home were copied under the build
+	# user's umask as well.
+	$(call STAGING_MODE_FIX,$(EXT4_STAGING))
 	@set -e; \
 	if [ -n "$(EXT4_MB)" ]; then ext4_mb=$(EXT4_MB); \
 	else \
@@ -3328,6 +3460,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER_STAMP) \
 	$(MKFS_FAT) -F32 -n LIKEOSESP $(EXT4_ESP_IMG) >/dev/null; \
 	MTOOLS_SKIP_CHECK=1 mmd -i $(EXT4_ESP_IMG) ::/EFI ::/EFI/BOOT; \
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(EXT4_ESP_IMG) $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI; \
+	$(INSTALLER_ESP_EXTRA) \
 	rm -f $(GPT_DISK); \
 	truncate -s $$(( $(ESP_MB) + ext4_mb + 2 ))M $(GPT_DISK); \
 	sgdisk -Z $(GPT_DISK) >/dev/null 2>&1; \
@@ -4219,10 +4352,11 @@ deps:
 help:
 	@echo "LikeOS UEFI Build System"
 	@echo "Available targets:"
-	@echo "  all        - Build the single ext4 GPT USB disk (build/likeos-ext4.img)"
+	@echo "  all        - Build the live USB medium (build/likeos-ext4.img): the live system, the installer, the boot menu and /install/likeos-rootfs.tar.zst"
+	@echo "  rootfs-tarball - Build only the installed system's image, build/likeos-rootfs.tar.zst (+ .sha256, .info), without the USB medium"
 	@echo "  kernel     - Build kernel ELF only"
 	@echo "  bootloader - Build UEFI bootloader only"
-	@echo "  usb        - Build the ext4 GPT USB disk (alias for the default image)"
+	@echo "  usb        - Build the live USB medium (alias for the default image)"
 	@echo "  qemu       - Run the ext4 GPT USB disk in QEMU (UEFI, boots from ext4 root)"
 	@echo "  qemu-usb   - Same as qemu plus SLIRP networking (sudo, for raw ICMP ping)"
 	@echo "  qemu-usb-gdb - Same as qemu-usb but with GDB server on :1234 (rebuilds with -g)"
@@ -4257,7 +4391,10 @@ help:
 	@echo "  SCREEN_SIZE=large or unset - Real-hardware start resolution when none is saved in Display settings: sizes above 1920x1200, then 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768); VMs start at 1280x800"
 	@echo "  SCREEN_SIZE=medium - Real-hardware start resolution 1280x800 (fallback: 1280x768, 1024x768)"
 	@echo "  MAX_SCREEN_SIZE=WxH - Ceiling on the size the machine starts in on its own, e.g. MAX_SCREEN_SIZE=1920x1080 picks 1920x1080 instead of 1920x1200; a saved Display setting is not held to it (default: no ceiling)"
-	@echo "  ADD_USER=<name>     - Image ships an ordinary account <name> (password likeos), made as adduser makes one"
+	@echo "  ADD_USER=<name>     - The live medium ships an ordinary account <name> (password likeos), made as adduser makes one; not in likeos-rootfs.tar.zst (the installer makes the accounts)"
+	@echo "  ROOTFS_ZSTD_LEVEL=N - zstd level of likeos-rootfs.tar.zst (default: 19; lower packs faster, e.g. 3 for a quick test build)"
+	@echo "  ROOTFS_ZSTD_THREADS=N - zstd threads for likeos-rootfs.tar.zst (default: 0 = one per CPU; the archive is the same for any count)"
+	@echo "  SOURCE_DATE_EPOCH=N - Latest time stamp in likeos-rootfs.tar.zst and its build date (default: the time of the last commit)"
 	@echo "  LIKEOS_VERSION=x.y.z - Override the version in the boot banner and uname (default: $(LIKEOS_VERSION))"
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
 	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."
@@ -4276,6 +4413,9 @@ bootloader: $(BOOTLOADER_EFI)
 usb: $(GPT_DISK)
 
 .PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-ahci qemu-ahci-usb qemu-nvme qemu-nvme-boot qemu-nvme-full qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
+
+# Installer: libgpt, backend, GTK3 frontend, CLI, release image (mk/installer.mk).
+include mk/installer.mk
 
 # Feed back the header dependencies recorded by -MMD (see DEPFLAGS above).
 #

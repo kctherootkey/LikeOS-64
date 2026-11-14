@@ -1,0 +1,84 @@
+proc-self-fd.c: on LikeOS, name a file relative to a directory descriptor
+by the path the descriptor was opened with.
+
+Without getxattrat() and its siblings, attr's tools reach a name relative
+to a directory descriptor (getfattr -R, setfattr -R, --restore below the
+top level) through /proc/self/fd/N/<name>.  On LikeOS /proc/self/fd/N is
+a link holding the absolute path the descriptor was opened with, and the
+path walk does not cross from /proc into another file system through it.
+The link is read instead and the path it holds used (with /<name>
+appended).  When it holds no absolute path, the /proc/self/fd path is used
+as before.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/libmisc/proc-self-fd.c	2026-11-13 15:12:16.864731448 +0100
++++ b/libmisc/proc-self-fd.c	2026-11-13 15:12:16.872495322 +0100
+@@ -25,6 +25,52 @@
+ #include <errno.h>
+ #include "libmisc/proc-self-fd.h"
+ 
++#ifdef __LIKEOS__
++#include <string.h>
++
++/*
++ * /proc/self/fd/N is a link holding the absolute path the descriptor was
++ * opened with, and the path walk does not follow it into another file
++ * system: /proc/self/fd/N/name names nothing, and /proc/self/fd/N itself is
++ * the link.  The path the link holds is used instead (a malloc()ed copy,
++ * with "/name" appended when there is a name).  NULL when the link does not
++ * hold an absolute path (a pipe, a socket): the caller then goes on with
++ * the /proc/self/fd path.
++ */
++static char *
++fd_target_path(int fd, const char *path)
++{
++	char link[sizeof("/proc/self/fd/") + 1 + DECIMAL_DIGITS(int)];
++	char *target, *newpath;
++	size_t size = 256;
++	ssize_t len;
++
++	snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
++	for (;;) {
++		target = malloc(size);
++		if (!target)
++			return NULL;
++		len = readlink(link, target, size);
++		if (len < 0 || target[0] != '/') {
++			free(target);
++			return NULL;
++		}
++		if ((size_t)len < size)
++			break;
++		free(target);
++		size *= 2;
++	}
++	target[len] = '\0';
++	if (!*path)
++		return target;
++	if (asprintf(&newpath, "%s%s%s", target,
++		     target[len - 1] == '/' ? "" : "/", path) == -1)
++		newpath = NULL;
++	free(target);
++	return newpath;
++}
++#endif
++
+ char *
+ proc_self_fd_path(int fd, struct proc_self_fd_buffer *buffer)
+ {
+@@ -46,6 +92,14 @@
+ 	char *newpath;
+ 	int ret;
+ 
++#ifdef __LIKEOS__
++	newpath = fd_target_path(dirfd, path);
++	if (newpath) {
++		if (!*path)
++			*at_flags &= ~AT_SYMLINK_NOFOLLOW;
++		return newpath;
++	}
++#endif
+ 	if (!*path) {
+ 		*at_flags &= ~AT_SYMLINK_NOFOLLOW;
+ 		return proc_self_fd_path(dirfd, buffer);

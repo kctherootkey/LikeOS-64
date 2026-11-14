@@ -291,6 +291,18 @@ typedef struct procmapinfo {
 /* msync(2): write what was stored into a shared file mapping to the file.
  * (addr, length, flags) */
 #define SYS_MSYNC 429
+/* Mounting and the remaining directory-relative name calls. */
+#define SYS_MOUNT 430 /* (source, target, fstype, flags, data) */
+#define SYS_UMOUNT2 431 /* (target, flags) */
+#define SYS_MKNODAT 432 /* (dirfd, path, mode, dev) */
+#define SYS_FCHOWNAT 433 /* (dirfd, path, owner, group, flags) */
+#define SYS_LINKAT 434 /* (olddirfd, oldpath, newdirfd, newpath, flags) */
+#define SYS_SYMLINKAT 435 /* (target, newdirfd, linkpath) */
+#define SYS_MKDIRAT 436 /* (dirfd, path, mode) */
+#define SYS_RENAMEAT2 437 /* (olddirfd, oldpath, newdirfd, newpath, flags) */
+#define SYS_FCHMODAT 438 /* (dirfd, path, mode, flags) */
+#define SYS_SYNCFS 439 /* (fd) */
+#define SYS_READLINKAT 440 /* (dirfd, path, buf, bufsiz) */
 #define MS_ASYNC 1
 #define MS_INVALIDATE 2
 #define MS_SYNC 4
@@ -434,6 +446,15 @@ typedef struct k_sysinfo {
 // unlinkat: remove a DIRECTORY rather than a file (same value as AT_EACCESS,
 // as in the reference: the two are used by different syscalls and never meet).
 #define AT_REMOVEDIR 0x200
+// fchownat/fstatat/utimensat/fchmodat: act on a final symlink itself
+#define AT_SYMLINK_NOFOLLOW 0x100
+// linkat: follow a final symlink of the existing name
+#define AT_SYMLINK_FOLLOW 0x400
+// an empty path names the file the dirfd refers to
+#define AT_EMPTY_PATH 0x1000
+// renameat2: fail if the new name exists / swap the two names
+#define RENAME_NOREPLACE 0x1
+#define RENAME_EXCHANGE 0x2
 
 // File descriptor limits
 #define MAX_FDS 1024
@@ -560,6 +581,7 @@ typedef struct k_flock {
 #define EMFILE 24 // Too many open files
 #define ESPIPE 29 // Illegal seek
 #define EPIPE 32 // Broken pipe
+#define ENOTBLK 15 // Block device required
 #define EBUSY 16 // Device or resource busy
 #define EEXIST 17 // File exists
 #define EXDEV 18 // Cross-device link

@@ -251,6 +251,24 @@ int64_t sys_umask(uint64_t mask);
 int64_t sys_uname(uint64_t buf);
 int64_t sys_unlink(uint64_t pathname);
 int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags);
+int64_t sys_mount(uint64_t u_source, uint64_t u_target, uint64_t u_fstype,
+		  uint64_t flags, uint64_t u_data);
+int64_t sys_umount2(uint64_t u_target, uint64_t flags);
+int64_t sys_syncfs(uint64_t fd);
+int64_t sys_mknodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
+		    uint64_t dev);
+int64_t sys_fchownat(uint64_t dirfd, uint64_t pathname, uint64_t owner,
+		     uint64_t group, uint64_t flags);
+int64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
+		   uint64_t newpath, uint64_t flags);
+int64_t sys_symlinkat(uint64_t target, uint64_t newdirfd, uint64_t linkpath);
+int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode);
+int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
+		      uint64_t newpath, uint64_t flags);
+int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
+		     uint64_t flags);
+int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname, uint64_t buf,
+		       uint64_t bufsiz);
 int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 		      uint64_t flags);
 int64_t sys_vfork(void);

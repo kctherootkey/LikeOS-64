@@ -1,0 +1,307 @@
+.\" likeos-gpt.1 - manual page for likeos-gpt.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man/likeos-gpt.1, rendered from this file by
+.\" "make installer-manpages" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH LIKEOS-GPT 1 "November 2026" "LikeOS" "System Administration"
+.SH NAME
+likeos-gpt \- show, check and edit GUID partition tables
+.SH SYNOPSIS
+.B likeos-gpt
+.RI [ options ]
+.B print
+.I device
+.br
+.B likeos-gpt
+.RI [ options ]
+.B verify
+.I device
+.br
+.B likeos-gpt
+.RI [ options ]
+.B info
+.I device n
+.br
+.B likeos-gpt
+.RI [ options ]
+.B new-table
+.I device
+.br
+.B likeos-gpt
+.RI [ options ]
+.B add
+.I device
+.RB [ \-n
+.IR n ]
+.RB [ \-\-start
+.IR pos ]
+.RB [ \-\-size
+.IR size ]
+.RB [ \-\-type
+.IR type ]
+.RB [ \-\-name
+.IR name ]
+.RB [ \-\-uuid
+.IR guid ]
+.RB [ \-\-attrs
+.IR hex ]
+.br
+.B likeos-gpt
+.RI [ options ]
+.B delete
+.I device n
+.br
+.B likeos-gpt
+.RI [ options ]
+.B resize
+.I device n
+.IR size | max
+.br
+.B likeos-gpt
+.RI [ options ]
+.BR name | type | attrs
+.I device n value
+.br
+.B likeos-gpt
+.RI [ options ]
+.BR repair | wipe
+.I device
+.br
+.B likeos-gpt
+.RI [ options ]
+.B types
+.SH DESCRIPTION
+.B likeos-gpt
+reads and writes the GUID partition table (GPT) of a disk: the protective
+MBR in the first sector, the primary table (header and partition entries)
+after it, and the backup copy at the end of the disk.
+It is the tool of the LikeOS installer's partitioning library (libgpt) for
+the command line: everything the installer does to a partition table can be
+looked at and done by hand with it.
+.PP
+.I device
+is a block device
+.RB ( /dev/sda ,
+.BR /dev/nvme0n1 )
+or a disk image file.
+Only the editing commands write, and only to the device named.
+After writing to a block device
+.B likeos-gpt
+asks the kernel to read the new table again, so the partition devices
+.RB ( /dev/sda1 ,
+.BR /dev/nvme0n1p1 ...)
+follow at once; a disk with a mounted partition may refuse that, and the
+change is then seen after the next start.
+.SH COMMANDS
+.TP
+.BI print " device"
+Show the table: the disk's size, sector size and GUID, the usable sectors,
+and one line per partition with its number, first and last sector, size,
+type and name.
+.TP
+.BI verify " device"
+Check both copies of the table: the header and entry checksums, the
+positions the headers give, overlapping or out-of-range partitions, and
+whether the two copies agree.
+Problems found give exit status 1.
+.TP
+.BI info " device n"
+Show partition
+.I n
+in detail: its type (name, code and GUID), its unique partition GUID, the
+first and last sector, the size, the name and the attribute bits.
+.TP
+.BI new-table " device"
+Write a new, empty GPT with a protective MBR.
+A device that already has partitions is refused unless
+.B \-\-yes
+is given.
+.TP
+.BI add " device"
+Create a partition, by default in the first free region, starting at the
+first 1 MiB boundary in it and filling the rest of it.
+The add options below choose otherwise.
+.TP
+.BI delete " device n"
+Delete partition
+.IR n .
+The data on the disk is not touched.
+.TP
+.BI resize " device n size" \fR|\fPmax
+Move the end of partition
+.IR n :
+.I size
+is its new size,
+.B max
+makes it reach the next partition or the end of the usable sectors.
+The start stays where it is, and the file system in the partition is not
+changed: grow the file system after growing the partition (for ext4
+.BR resize2fs (8)),
+shrink it before shrinking the partition.
+.TP
+.BI name " device n name"
+Set the name of partition
+.I n
+(UTF-8, at most 36 UTF-16 code units).
+.TP
+.BI type " device n type"
+Set the type of partition
+.IR n .
+.TP
+.BI attrs " device n hex"
+Set the 64 attribute bits of partition
+.IR n ,
+as a hexadecimal number (bit 0: required by the platform, bit 1: ignored by
+the firmware, bit 2: legacy BIOS bootable, bits 48\(en63: defined by the
+partition type).
+.TP
+.BI repair " device"
+Rebuild a damaged copy of the table from the intact one, move a backup copy
+that is not at the end of the disk (a disk image that was made larger, a
+disk copied to a bigger one) to the end, and rewrite a missing or wrong
+protective MBR.
+When both copies are intact but differ, the primary one is kept.
+.TP
+.BI wipe " device"
+Erase the partition table: both GPT copies and the MBR.
+Needs
+.BR \-\-yes .
+.TP
+.B types
+List the partition types
+.B likeos-gpt
+knows by name: alias, four-digit code, GUID and description.
+.SH ADD OPTIONS
+.TP
+.BR \-n ", " \-\-number " \fIn\fR"
+The partition number (default: the first unused one).
+.TP
+.BR \-s ", " \-\-start " \fIpos\fR"
+The first sector (default: the start of the first free region, aligned to
+1 MiB).
+.TP
+.BR \-S ", " \-\-size " \fIsize\fR"
+The size (default: the rest of the free region it starts in).
+.TP
+.BR \-t ", " \-\-type " \fItype\fR"
+The partition type (default:
+.BR data ).
+.TP
+.BR \-c ", " \-\-name " \fIname\fR"
+The partition name.
+.TP
+.BR \-u ", " \-\-uuid " \fIguid\fR"
+The unique partition GUID (default: a random one).
+.TP
+.BR \-A ", " \-\-attrs " \fIhex\fR"
+The attribute bits.
+.SH OPTIONS
+.TP
+.B \-\-json
+Machine-readable output (JSON) of
+.BR print ,
+.BR verify ,
+.B info
+and
+.BR types ,
+and of the partition
+.B add
+created.
+.TP
+.BR \-\-sector\-size " 512|4096"
+The logical sector size of a disk image file (block devices report their
+own).
+.TP
+.BR \-y ", " \-\-yes
+Confirm a command that destroys a partition table:
+.B new-table
+over an existing table, and
+.BR wipe .
+.TP
+.B \-\-no\-reread
+Do not ask the kernel to read the table again after writing it.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the commands and options.
+.TP
+.B \-\-version
+Show the version.
+.SH SIZES, POSITIONS AND TYPES
+A position or size that is a plain number counts sectors.
+With a suffix it counts bytes:
+.BR K ,
+.BR M ,
+.BR G ,
+.B T
+(or
+.BR KiB ,
+.BR MiB ,
+.BR GiB ,
+.BR TiB )
+are powers of 1024, so
+.B 512M
+is 512 MiB.
+.PP
+A
+.I type
+is an alias, a four-digit code or a GUID.
+The common ones:
+.PP
+.RS
+.nf
+esp           ef00  EFI system partition
+likeos\-root   8304  LikeOS root file system
+data          8300  generic data
+swap          8200  swap
+bios\-boot     ef02  BIOS boot
+home          8302  home directories
+basic         0700  basic data (NTFS, exFAT, FAT)
+msr           0c01  reserved (MSR)
+recovery      2700  recovery environment
+lvm, raid     8e00, fd00
+.fi
+.RE
+.PP
+.B likeos-gpt types
+lists them all.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The command failed, or
+.B verify
+found problems.
+.TP
+.B 2
+Wrong usage.
+.SH EXAMPLES
+Partition a disk the way the installer does for a whole-disk installation:
+.PP
+.RS
+.nf
+likeos\-gpt \-\-yes new\-table /dev/sdb
+likeos\-gpt add /dev/sdb \-\-size 512M \-\-type esp \e
+        \-\-name "EFI system partition"
+likeos\-gpt add /dev/sdb \-\-type likeos\-root \-\-name likeos\-root
+.fi
+.RE
+.PP
+Check a disk image and repair it after it was made larger:
+.PP
+.RS
+.nf
+likeos\-gpt verify disk.img
+likeos\-gpt repair disk.img
+.fi
+.RE
+.SH SEE ALSO
+.BR likeos-install (1),
+.BR fdisk (8),
+.BR sfdisk (8),
+.BR partx (8),
+.BR blkid (8),
+.BR lsblk (8)

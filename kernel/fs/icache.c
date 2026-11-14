@@ -173,7 +173,7 @@ static void ic_evict_one(void)
 // Lookup
 // ============================================================================
 
-ic_inode_t *icache_lookup(unsigned long start_cluster)
+ic_inode_t *icache_lookup(struct vfs_superblock *sb, unsigned long start_cluster)
 {
 	if (!ic_initialized || start_cluster < 2)
 		return 0;
@@ -184,7 +184,7 @@ ic_inode_t *icache_lookup(unsigned long start_cluster)
 
 	ic_inode_t *n = ic_hash[bucket].head;
 	while (n) {
-		if (n->start_cluster == start_cluster) {
+		if (n->start_cluster == start_cluster && n->sb == sb) {
 			spin_unlock_irqrestore(&ic_hash[bucket].lock, flags);
 			__sync_fetch_and_add(&ic_stat_hits, 1);
 			return n;
@@ -200,7 +200,8 @@ ic_inode_t *icache_lookup(unsigned long start_cluster)
 // Get or create
 // ============================================================================
 
-ic_inode_t *icache_get(unsigned long start_cluster, unsigned long size,
+ic_inode_t *icache_get(struct vfs_superblock *sb, unsigned long start_cluster,
+		       unsigned long size,
 		       unsigned int attr, unsigned long parent_cluster,
 		       unsigned long dirent_cluster, unsigned int dirent_index,
 		       uint16_t wrt_time, uint16_t wrt_date)
@@ -219,7 +220,7 @@ ic_inode_t *icache_get(unsigned long start_cluster, unsigned long size,
 
 	ic_inode_t *n = ic_hash[bucket].head;
 	while (n) {
-		if (n->start_cluster == start_cluster) {
+		if (n->start_cluster == start_cluster && n->sb == sb) {
 			// Found — update metadata and bump refcount
 			n->size = size;
 			n->attr = attr;
@@ -257,6 +258,7 @@ ic_inode_t *icache_get(unsigned long start_cluster, unsigned long size,
 		return 0;
 	mm_memset(inode, 0, sizeof(ic_inode_t));
 	inode->start_cluster = start_cluster;
+	inode->sb = sb;
 	WARN_ON(start_cluster < 2); /* inode start_cluster must be >= 2 */
 	inode->size = size;
 	inode->attr = attr;
@@ -305,9 +307,10 @@ void icache_ref(ic_inode_t *inode)
 	}
 }
 
-int icache_flag_if_referenced(unsigned long start_cluster, uint32_t flag)
+int icache_flag_if_referenced(struct vfs_superblock *sb,
+			      unsigned long start_cluster, uint32_t flag)
 {
-	ic_inode_t *n = icache_lookup(start_cluster);
+	ic_inode_t *n = icache_lookup(sb, start_cluster);
 	uint64_t flags;
 	int held = 0;
 
@@ -414,12 +417,12 @@ int icache_flush(ic_inode_t *inode)
 {
 	if (!inode || !(inode->flags & IC_DIRTY))
 		return 0;
-	if (!g_root_sb)
+	if (!inode->sb)
 		return -1;
 
 	/* Dispatch through the generic superblock op; the FS driver knows how
      * its inode metadata is laid out on disk.  Returns 0 on success. */
-	int rc = vfs_sb_write_inode(g_root_sb, inode);
+	int rc = vfs_sb_write_inode(inode->sb, inode);
 	if (rc != 0)
 		return rc;
 
@@ -428,7 +431,7 @@ int icache_flush(ic_inode_t *inode)
      * After mutating that dirent the dcache must be invalidated or
      * subsequent stat() lookups will return the stale pre-flush size. */
 	if (inode->parent_cluster)
-		dcache_invalidate_dir(inode->parent_cluster);
+		dcache_invalidate_dir(inode->sb, inode->parent_cluster);
 	return 0;
 }
 
@@ -444,8 +447,18 @@ int icache_flush_all(void)
 		ic_inode_t *n = ic_hash[b].head;
 		while (n) {
 			if (n->flags & IC_DIRTY) {
+				/* Its filesystem stays while the flush runs:
+				 * an unmount waits for this count to drain
+				 * before it frees anything, and one that has
+				 * begun stores its own inodes. */
+				struct vfs_superblock *sb = n->sb;
+				if (!sb || !vfs_sb_teardown_enter(sb)) {
+					n = n->hash_next;
+					continue;
+				}
 				spin_unlock_irqrestore(&ic_hash[b].lock, flags);
 				icache_flush(n);
+				vfs_sb_teardown_exit(sb);
 				flushed++;
 				spin_lock_irqsave(&ic_hash[b].lock, &flags);
 				// Restart from head since list may have changed
@@ -463,7 +476,7 @@ int icache_flush_all(void)
 // Removal (on unlink)
 // ============================================================================
 
-void icache_remove(unsigned long start_cluster)
+void icache_remove(struct vfs_superblock *sb, unsigned long start_cluster)
 {
 	if (!ic_initialized || start_cluster < 2)
 		return;
@@ -475,7 +488,7 @@ void icache_remove(unsigned long start_cluster)
 	ic_inode_t **pp = &ic_hash[bucket].head;
 	while (*pp) {
 		ic_inode_t *n = *pp;
-		if (n->start_cluster == start_cluster) {
+		if (n->start_cluster == start_cluster && n->sb == sb) {
 			/* Detach from the hash so no new lookup/ref can find it (the key
              * may be reused for a freshly allocated inode). */
 			*pp = n->hash_next;
@@ -502,6 +515,81 @@ void icache_remove(unsigned long start_cluster)
 		pp = &(*pp)->hash_next;
 	}
 	spin_unlock_irqrestore(&ic_hash[bucket].lock, flags);
+}
+
+/* Store the dirty inodes of one filesystem (syncfs, unmount).  The caller
+ * keeps the filesystem alive.  Returns how many were written. */
+int icache_flush_sb(struct vfs_superblock *sb)
+{
+	int flushed = 0;
+
+	if (!ic_initialized || !sb)
+		return 0;
+	for (int b = 0; b < IC_HASH_BUCKETS; b++) {
+		uint64_t flags;
+		/* An inode whose store fails stays dirty; the walk resumes
+		 * past it instead of meeting it again for ever. */
+		unsigned skip = 0;
+	again:
+		spin_lock_irqsave(&ic_hash[b].lock, &flags);
+		ic_inode_t *n = ic_hash[b].head;
+		unsigned pos = 0;
+		while (n) {
+			if (pos >= skip && n->sb == sb && (n->flags & IC_DIRTY)) {
+				spin_unlock_irqrestore(&ic_hash[b].lock, flags);
+				if (icache_flush(n) != 0)
+					skip = pos + 1;
+				else
+					flushed++;
+				goto again;
+			}
+			n = n->hash_next;
+			pos++;
+		}
+		spin_unlock_irqrestore(&ic_hash[b].lock, flags);
+	}
+	return flushed;
+}
+
+/* Forget every cached inode of one filesystem: unmount, after its inodes
+ * were stored.  An entry still in use (there should be none
+ * once nothing is open) is detached and left to its last icache_unref(). */
+void icache_invalidate_sb(struct vfs_superblock *sb)
+{
+	if (!ic_initialized || !sb)
+		return;
+	for (int b = 0; b < IC_HASH_BUCKETS; b++) {
+		uint64_t flags;
+		spin_lock_irqsave(&ic_hash[b].lock, &flags);
+		ic_inode_t **pp = &ic_hash[b].head;
+		while (*pp) {
+			ic_inode_t *n = *pp;
+			if (n->sb != sb) {
+				pp = &n->hash_next;
+				continue;
+			}
+			*pp = n->hash_next;
+			spin_unlock_irqrestore(&ic_hash[b].lock, flags);
+			__sync_fetch_and_sub(&ic_entry_count, 1);
+
+			uint64_t lru_flags;
+			spin_lock_irqsave(&ic_lru_lock, &lru_flags);
+			ic_lru_remove(n);
+			n->flags |= IC_DEAD;
+			int rc = n->refcount;
+			spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
+			WARN_ON(rc > 0); /* an inode in use on an unmounted fs */
+			if (rc <= 0) {
+				ic_chain_account_free(n);
+				if (n->chain)
+					kfree(n->chain);
+				kfree(n);
+			}
+			spin_lock_irqsave(&ic_hash[b].lock, &flags);
+			pp = &ic_hash[b].head;
+		}
+		spin_unlock_irqrestore(&ic_hash[b].lock, flags);
+	}
 }
 
 void icache_invalidate_all(void)
@@ -609,7 +697,7 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 	unsigned long eoc = vfs_sb_end_of_chain(sb);
 
 	// Look up the inode
-	ic_inode_t *inode = icache_lookup(start_cluster);
+	ic_inode_t *inode = icache_lookup(sb, start_cluster);
 	if (!inode) {
 		// No cached inode — fall back to linear walk via sb ops.
 		unsigned long cur = start_cluster;
@@ -649,12 +737,13 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 	return result;
 }
 
-void icache_chain_invalidate(unsigned long start_cluster)
+void icache_chain_invalidate(struct vfs_superblock *sb,
+			     unsigned long start_cluster)
 {
 	if (!ic_initialized || start_cluster < 2)
 		return;
 
-	ic_inode_t *inode = icache_lookup(start_cluster);
+	ic_inode_t *inode = icache_lookup(sb, start_cluster);
 	if (!inode)
 		return;
 

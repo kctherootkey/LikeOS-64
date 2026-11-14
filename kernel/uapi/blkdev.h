@@ -47,6 +47,7 @@
 //
 // Mirrored into the userspace libc include tree as <sys/mount.h>, where the
 // established interface puts these definitions; keep both copies identical.
+// The mount(2) flags and the mount/umount prototypes follow at the end.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -139,6 +140,55 @@ struct blkpg_partition {
 #define SCSI_DISK1_MAJOR 65
 #define SCSI_DISK7_MAJOR 71
 #define SCSI_CDROM_MAJOR 11
+
+// ---- Mounting -----------------------------------------------------------------
+//
+// mount(2) flags (the `mountflags' argument).  The kernel keeps the
+// RDONLY .. LAZYTIME group with the mount and acts on RDONLY (every change
+// fails with EROFS), NOSUID (exec ignores set-user/-group-ID bits), NODEV
+// (device nodes cannot be opened) and NOEXEC (nothing runs from it); the
+// others are shown in /proc/mounts.  REMOUNT changes the flags of an
+// existing mount (read-only <-> read-write included).  BIND and MOVE are
+// not offered (EINVAL).
+#define MS_RDONLY 0x1
+#define MS_NOSUID 0x2
+#define MS_NODEV 0x4
+#define MS_NOEXEC 0x8
+#define MS_SYNCHRONOUS 0x10
+#define MS_REMOUNT 0x20
+#define MS_MANDLOCK 0x40
+#define MS_DIRSYNC 0x80
+#define MS_NOSYMFOLLOW 0x100
+#define MS_NOATIME 0x400
+#define MS_NODIRATIME 0x800
+#define MS_BIND 0x1000
+#define MS_MOVE 0x2000
+#define MS_REC 0x4000
+#define MS_SILENT 0x8000
+#define MS_RELATIME 0x200000
+#define MS_STRICTATIME 0x1000000
+#define MS_LAZYTIME 0x2000000
+#define MS_MGC_VAL 0xC0ED0000 // old magic in the high half; ignored
+#define MS_MGC_MSK 0xffff0000
+
+// umount2(2) flags.  FORCE is accepted and changes nothing (open files keep
+// a filesystem); DETACH takes a busy filesystem out of the name space at
+// once and finishes the unmount when the last file open on it is closed.
+#define MNT_FORCE 0x1
+#define MNT_DETACH 0x2
+#define MNT_EXPIRE 0x4
+#define UMOUNT_NOFOLLOW 0x8
+
+#ifndef __LIKEOS_KERNEL__
+// source: a block device ("/dev/sda2", "/dev/disk/by-uuid/..."), or a label
+// for a filesystem without one ("tmpfs").  fstype: "ext4" ("ext3", "ext2"),
+// "vfat" ("fat32", "msdos"), "tmpfs", or "auto".  data: the filesystem's
+// option string ("uid=1000,umask=022", "size=64m,mode=1777"), or NULL.
+int mount(const char *source, const char *target, const char *fstype,
+	  unsigned long flags, const void *data);
+int umount(const char *target);
+int umount2(const char *target, int flags);
+#endif
 
 #ifdef __cplusplus
 }

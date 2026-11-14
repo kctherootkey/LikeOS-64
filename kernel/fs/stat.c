@@ -103,7 +103,8 @@ static int64_t sys_stat_common(const char *path, uint64_t stat_buf,
 			return -ENOENT;
 		if (ret == ST_IO)
 			return -EIO; /* corrupt metadata, not absent */
-		if (ret == ST_ACCESS || ret == ST_PERM)
+		if (ret == ST_ACCESS || ret == ST_PERM || ret == ST_LOOP ||
+		    ret == ST_NAMETOOLONG)
 			return vfs_status_to_errno(ret);
 		return -EINVAL;
 	}
@@ -138,6 +139,8 @@ int64_t sys_stat(uint64_t pathname, uint64_t stat_buf)
 	return sys_stat_common(full, stat_buf, 0);
 }
 
+static int64_t lstat_kpath(task_t *cur, const char *p, uint64_t stat_buf);
+
 int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 {
 	task_t *cur = sched_current();
@@ -161,6 +164,12 @@ int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 			return ret;
 		p = full;
 	}
+	return lstat_kpath(cur, p, stat_buf);
+}
+
+/* lstat() of a resolved path. */
+static int64_t lstat_kpath(task_t *cur, const char *p, uint64_t stat_buf)
+{
 	/* lstat must NOT follow a final symlink.  vfs_lstat dispatches to the
      * filesystem's no-follow stat; on a filesystem without symlinks it
      * transparently falls back to plain stat.  vfs_lstat runs the ancestor
@@ -194,7 +203,8 @@ int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 	mm_memset(&st, 0, sizeof(st));
 	int r = vfs_lstat(p, &st);
 	if (r != ST_OK) {
-		if (r == ST_ACCESS || r == ST_PERM)
+		if (r == ST_ACCESS || r == ST_PERM || r == ST_LOOP ||
+		    r == ST_NAMETOOLONG)
 			return vfs_status_to_errno(r);
 		return (r == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
 	}
@@ -332,10 +342,11 @@ out:
 int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
 		    uint64_t flags)
 {
-	(void)flags;
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
+	/* Flags other than these two have nothing to act on here and are
+	 * accepted, as they always were. */
 	if (!validate_user_ptr(pathname, 1) ||
 	    !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
 		return -EFAULT;
@@ -346,6 +357,15 @@ int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
 	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
 	if (cret != 0)
 		return cret;
+	if (kpath[0] == '\0') {
+		/* The file the descriptor itself is open on. */
+		if (!(flags & AT_EMPTY_PATH))
+			return -ENOENT;
+		if ((int)dirfd != AT_FDCWD)
+			return sys_fstat(dirfd, stat_buf);
+		kpath[0] = '.';
+		kpath[1] = '\0';
+	}
 
 	char full[VFS_MAX_PATH];
 	if (kpath[0] == '/') {
@@ -368,8 +388,13 @@ int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
 		if (ret != 0)
 			return ret;
 	}
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		return lstat_kpath(cur, full, stat_buf);
 	return sys_stat_common(full, stat_buf, 0);
 }
+
+static int64_t readlink_kpath(const char *kpath, uint64_t buf,
+			      uint64_t bufsiz);
 
 int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 {
@@ -380,6 +405,35 @@ int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 	c = canon_task_path(kpath, sizeof(kpath));
 	if (c)
 		return c;
+	return readlink_kpath(kpath, buf, bufsiz);
+}
+
+/* readlinkat(dirfd, path, buf, bufsiz): readlink() of a name relative to a
+ * directory descriptor.  An empty path would name the link the descriptor
+ * is open on, which needs descriptors that can be open on a link: ENOENT,
+ * as for any empty path. */
+int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname, uint64_t buf,
+		       uint64_t bufsiz)
+{
+	task_t *cur = sched_current();
+	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+
+	if (!cur)
+		return -EFAULT;
+	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	if (kpath[0] == '\0')
+		return -ENOENT;
+	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (c)
+		return c;
+	return readlink_kpath(full, buf, bufsiz);
+}
+
+static int64_t readlink_kpath(const char *kpath, uint64_t buf,
+			      uint64_t bufsiz)
+{
 	int tr = perm_traverse(kpath); /* search on every ancestor dir */
 	if (tr < 0)
 		return tr;
@@ -418,89 +472,90 @@ int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 	return r; /* byte count (no NUL)           */
 }
 
-// utimensat: set a path's modification time via the owning filesystem.
+/* utimensat(dirfd, path, times, flags): set a file's access and
+ * modification times (times[0], times[1]; NULL means both "now"), each to a
+ * time with nanoseconds, to "now" (UTIME_NOW) or left as it is (UTIME_OMIT);
+ * its change time becomes the current time.  AT_SYMLINK_NOFOLLOW sets a
+ * final symlink's own times.  A NULL path -- or an empty one with
+ * AT_EMPTY_PATH -- means the file `dirfd' is open on (futimens). */
 int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 		      uint64_t flags)
 {
-	(void)flags;
-
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
-
-	/* Reject AT_EMPTY_PATH (0x1000) - not supported */
-	if (flags & 0x1000)
+	if (flags & ~((uint64_t)AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
 		return -EINVAL;
 
-	/* If pathname is NULL/empty, we'd need dirfd to be a real fd — not supported */
-	if (!pathname)
-		return -EFAULT;
-
-	char kpath[VFS_MAX_PATH];
-	size_t plen;
-	int err = user_strnlen((const char *)pathname, VFS_MAX_PATH, &plen);
-	if (err)
-		return err;
-	err = copy_from_user(kpath, (const void *)pathname, plen + 1);
-	if (err)
-		return err;
-
-	/* Canonicalise against the task cwd / dirfd so the VFS gets an absolute
-	 * path: a relative path skips the ancestor search-permission traversal
-	 * (and trips a warning) for a non-root caller. */
-	char full[VFS_MAX_PATH];
-	if (kpath[0] == '/') {
-		size_t i = 0;
-		for (; kpath[i] && i < sizeof(full) - 1; ++i)
-			full[i] = kpath[i];
-		full[i] = '\0';
-		/* A jailed task's absolute paths must be canonicalised and
-		 * prefixed with the jail root; build_at_path does both.  No-op
-		 * (verbatim copy stands) when the task is not chrooted. */
-		if (cur->root[0]) {
-			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
-						sizeof(full));
-			if (_cr != 0)
-				return _cr;
-		}
-	} else {
-		int bret = build_at_path(cur, (int)dirfd, kpath, full,
-					 sizeof(full));
-		if (bret != 0)
-			return bret;
-	}
-
-	int64_t mtime_sec = 0;
-	/* The UTIME_NOW / UTIME_OMIT sentinels (1073741823 / 1073741822) match the
-     * VFS_UTIME_* protocol values, so the userspace nsec passes straight
-     * through; default (no times given) means "set to now". */
-	long mtime_nsec = VFS_UTIME_NOW;
-
+	struct vfs_utimes t;
+	t.atime_sec = t.mtime_sec = 0;
+	t.atime_nsec = t.mtime_nsec = VFS_UTIME_NOW;
 	if (times) {
 		/* times points to struct timespec[2]: [0]=atime, [1]=mtime */
 		struct k_timespec ts[2];
 		if (!validate_user_ptr(times, sizeof(ts)))
 			return -EFAULT;
-		err = copy_from_user(ts, (const void *)times, sizeof(ts));
-		if (err)
-			return err;
-
-		mtime_sec = ts[1].tv_sec;
-		mtime_nsec = (long)ts[1].tv_nsec;
+		if (copy_from_user(ts, (const void *)times, sizeof(ts)))
+			return -EFAULT;
+		for (int i = 0; i < 2; i++) {
+			long ns = (long)ts[i].tv_nsec;
+			if (ns != VFS_UTIME_NOW && ns != VFS_UTIME_OMIT &&
+			    (ns < 0 || ns > 999999999L))
+				return -EINVAL;
+		}
+		t.atime_sec = ts[0].tv_sec;
+		t.atime_nsec = (long)ts[0].tv_nsec;
+		t.mtime_sec = ts[1].tv_sec;
+		t.mtime_nsec = (long)ts[1].tv_nsec;
 	}
 
-	/* vfs_utimensat routes to the owning filesystem (devfs has no timestamps,
-     * so it succeeds silently). */
-	int r = vfs_utimensat(full, mtime_sec, mtime_nsec);
-	if (r == ST_NOT_FOUND || r == ST_INVALID)
+	char kpath[VFS_MAX_PATH];
+	kpath[0] = '\0';
+	if (pathname) {
+		int err = copy_user_path((const char *)pathname, kpath,
+					 sizeof(kpath));
+		if (err)
+			return err;
+		if (kpath[0] == '\0' && !(flags & AT_EMPTY_PATH))
+			return -ENOENT;
+	}
+	int r;
+	if (kpath[0] == '\0') {
+		/* The descriptor's own file. */
+		if ((int)dirfd == AT_FDCWD) {
+			char full[VFS_MAX_PATH];
+			int bret = build_at_path(cur, AT_FDCWD, ".", full,
+						 sizeof(full));
+			if (bret != 0)
+				return bret;
+			r = vfs_utimens(full, 0, &t);
+		} else {
+			vfs_file_t *file = fdget(cur, (int)dirfd);
+			if (!file)
+				return -EBADF;
+			if (fd_is_special(file) || devfs_is_devfile(file))
+				r = ST_OK; /* nothing with times to set */
+			else
+				r = vfs_futimens(file, &t);
+			fdput(file);
+		}
+	} else {
+		/* Canonicalise against the task cwd / dirfd (and the jail) so
+		 * the VFS gets an absolute path. */
+		char full[VFS_MAX_PATH];
+		int bret = build_at_path(cur, (int)dirfd, kpath, full,
+					 sizeof(full));
+		if (bret != 0)
+			return bret;
+		/* vfs_utimens routes to the owning filesystem (devfs has no
+		 * timestamps, so it succeeds silently). */
+		r = vfs_utimens(full, (flags & AT_SYMLINK_NOFOLLOW) ? 1 : 0, &t);
+	}
+	if (r == ST_OK)
+		return 0;
+	if (r == ST_INVALID)
 		return -ENOENT;
-	if (r == ST_NOMEM)
-		return -ENOMEM;
-	if (r == ST_IO)
-		return -EIO;
-	if (r != ST_OK)
-		return -EIO;
-	return 0;
+	return vfs_status_to_errno(r);
 }
 
 // Userspace struct statfs layout (must match user/lib/libc/include/sys/vfs.h)
@@ -559,7 +614,7 @@ int64_t sys_statfs(uint64_t u_path, uint64_t u_buf)
 	uinfo.f_fsid = vsf.f_fsid;
 	uinfo.f_namelen = vsf.f_namelen;
 	uinfo.f_frsize = vsf.f_frsize;
-	uinfo.f_flags = 0;
+	uinfo.f_flags = vsf.f_flags;
 
 	return copy_to_user((void *)u_buf, &uinfo, sizeof(uinfo));
 }
@@ -608,7 +663,7 @@ int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
 	uinfo.f_fsid = vsf.f_fsid;
 	uinfo.f_namelen = vsf.f_namelen;
 	uinfo.f_frsize = vsf.f_frsize;
-	uinfo.f_flags = 0;
+	uinfo.f_flags = vsf.f_flags;
 
 	return copy_to_user((void *)u_buf, &uinfo, sizeof(uinfo));
 }

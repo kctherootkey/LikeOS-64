@@ -1,0 +1,43 @@
+# LikeOS installer -- the text of the Help dialog (Pango markup).
+# Lines starting with # are left out.
+# Copyright (C) 2026 The LikeOS Project
+LikeOS Setup installs LikeOS from this installation medium onto a disk of your computer. It asks a few questions first and changes nothing on any disk until you choose <b>Install</b> on the "Ready to install" page. The installation then runs in one pass: your computer restarts only once, at the very end.
+
+<b>Moving around</b>
+<b>Next</b> or <b>Alt+N</b> goes to the next page; <b>Back</b>, <b>Alt+B</b> or <b>Esc</b> to the page before. <b>Enter</b> presses the highlighted button, <b>Tab</b> and <b>Shift+Tab</b> move between the controls, and <b>Esc</b> closes a dialog like this one.
+
+<b>Language and formats</b>
+The language of the new system, and how it writes dates, times and numbers.
+
+<b>Keyboard layout</b>
+The layout printed on your keyboard. It is switched on right away, so you can try it. Later you can add up to three more layouts; <b>Alt+Shift</b> switches between them.
+
+<b>Install location</b>
+The disk or partition LikeOS goes on. You can delete, format, create and extend partitions, use a whole disk, or convert a disk with an older MBR partition table to GPT, and <b>Undo</b> takes back one change after the other. All of these are only planned on that page and made when the installation starts. The medium setup was started from is shown, but cannot be chosen. LikeOS creates a 512 MiB EFI system partition when the disk has none, and uses an existing one otherwise.
+
+<b>Time zone</b>
+The zone the clock of the new system shows. It is kept in <tt>/etc/timezone</tt>.
+
+<b>Computer name</b>
+The host name: lower-case letters, digits and hyphens, 1 to 63 characters, not only digits.
+
+<b>Administrator password</b>
+The password of root, the account that may change everything on the system.
+
+<b>Your account</b>
+Your own account for every day, with its password.
+
+<b>Ready to install</b>
+A summary of your choices, the list of changes to the disk, and a warning when something is erased. From there you can also check the installation medium and save your choices to a file for the text-mode installer.
+
+<b>What LikeOS needs</b>
+A computer that starts with UEFI firmware, a disk with a GPT partition table (setup creates one when you use a whole disk or convert a disk), and room for the system: the install location page tells you how much.
+
+<b>If something goes wrong</b>
+The page that reports a problem names the step that failed and shows the last lines of the installation log. The whole log is kept in <tt>/tmp/likeos-install.log</tt> while setup runs; after a successful installation a copy is stored in <tt>/var/log/likeos-install.log</tt> on the new system.
+
+<b>Leaving setup</b>
+The close button of this window, or the power button below the cards, asks what to do: restart or shut down the computer, or <b>Exit setup</b>, which ends LikeOS Setup and shows a menu on the screen with the text-mode installer, a console login, restarting and switching off. Before you choose Install, nothing on your disks has been changed.
+
+<b>After the installation</b>
+Remove the USB stick and restart. At the login prompt, sign in with your user name and password; <tt>startx</tt> starts the desktop.

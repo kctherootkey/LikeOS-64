@@ -22,6 +22,9 @@ static int execve_check_exec(const char *kpath, struct kstat *xst,
 			     int *have_xst)
 {
 	*have_xst = (vfs_stat(kpath, xst) == ST_OK);
+	/* Nothing on a filesystem mounted noexec runs, whoever asks. */
+	if (*have_xst && (vfs_path_mount_flags(kpath) & VFS_MS_NOEXEC))
+		return -EACCES;
 	task_t *cur = sched_current();
 	if (cur && cur->cred.euid != 0) {
 		int pr = perm_traverse(kpath); /* search on ancestor dirs */
@@ -120,6 +123,10 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			 * take the file's.  xst describes the FINAL binary, so
 			 * set-id bits on a #! script are ignored while the
 			 * interpreter's own still apply. */
+			/* A filesystem mounted nosuid lends no identity. */
+			if (have_xst &&
+			    (vfs_path_mount_flags(kpath) & VFS_MS_NOSUID))
+				have_xst = 0;
 			if (have_xst) {
 				if (xst.st_mode & 04000) { /* S_ISUID */
 					newcred.euid = newcred.suid =

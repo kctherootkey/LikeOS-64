@@ -1,0 +1,13 @@
+Patches applied to the pristine tar-1.35 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-xattrs-acl-at-wrappers-renamed.patch
+        src/xattrs.c's static acl_get_file_at/acl_set_file_at/
+        acl_delete_def_file_at wrappers are renamed xattrs_acl_*_at: acl
+        2.4.0 declares functions of those names (with an at_flags
+        argument) in <sys/acl.h>, and tar 1.35 no longer compiled against
+        it.
+
+Copyright (C) 2026 The LikeOS Project

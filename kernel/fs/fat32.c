@@ -14,80 +14,167 @@
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/dcache.h>
 #include <kernel/fs/icache.h>
+#include <kernel/fs/mount.h>
 #include <kernel/uapi/bug.h>
 
-// Spinlock for FAT32 filesystem access
-static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
+/* Everything of one mounted FAT32 volume that changes while it is mounted.
+ * fat32_fs_t holds the geometry read from the boot sector and points here;
+ * fat32_mount() allocates it for the volume it settles on, fat32_release()
+ * frees it with what hangs off it. */
+struct fat32_state {
+	/* Sleeping I/O mutex (SMP safety).  The FAT cache window below is
+	 * one window per volume.  Concurrent fat32_read/fat32_write from
+	 * different CPUs race on it: one CPU can move the window while
+	 * another is mid-traversal, reading garbage cluster numbers, which
+	 * means infinite loops or hung USB transfers.  A spinlock is
+	 * unsuitable because USB I/O takes milliseconds; this mutex blocks
+	 * the calling task via the scheduler with IRQs enabled.  It is
+	 * REENTRANT: the same task can lock it several times (e.g. fat32_read
+	 * holds the outer lock while pagecache_get takes it again through
+	 * the superblock's lock_io).  The waiters sleep on &io_locked. */
+	spinlock_t io_wait_lock;
+	volatile int io_locked;
+	volatile int io_depth; /* recursion depth */
+	volatile uint64_t io_owner; /* owning task id (-1 = none) */
+	/* This instance is the root filesystem: the lock state is mirrored
+	 * into the global debug variables below. */
+	int is_root;
 
-// Sleeping mutex for FAT32 file I/O operations (SMP safety).
-// The FAT cache (g_fat_cache, g_fat_cache_start, g_fat_cache_entries) is a
-// single global window.  Concurrent fat32_read/fat32_write from different CPUs
-// race on the cache: one CPU can evict the window while another is mid-traversal,
-// reading garbage cluster numbers.  This causes infinite loops or XHCI hangs.
-// A spinlock is unsuitable because USB I/O takes milliseconds; this sleeping
-// mutex blocks the calling task via the scheduler with IRQs enabled.
-// The mutex is REENTRANT: the same task can lock it multiple times (e.g.
-// fat32_read holds the outer lock while pagecache_get takes it again internally).
-/* Non-static so the debug dump (kernel/ke/sched.c) can print lock state. */
+	/* First cluster of the root directory, and a copy of it read at
+	 * mount time (diagnostics only). */
+	unsigned long root_dir_cluster;
+	void *root_dir_cache;
+
+	/* FAT cache window: fat_cache_entries entries starting at entry
+	 * fat_cache_start.  fat_total_entries (entries in one FAT) and
+	 * fat_first_sectors (sectors of one FAT) are worked out at the first
+	 * FAT access. */
+	void *fat_cache;
+	unsigned long fat_cache_entries;
+	unsigned long fat_cache_start;
+	unsigned long fat_total_entries;
+	unsigned long fat_first_sectors;
+
+	/* Deferred FAT-sector write: the one FAT sector (relative to the
+	 * first FAT) changed in the window but not yet written, or -1.  See
+	 * fat32_fat_set(). */
+	unsigned long fat_dirty_sector;
+
+	/* Free cluster count, so statfs does not scan the whole FAT on every
+	 * call.  Initialised from the FSInfo sector at mount time; kept in
+	 * sync by alloc/free.  (unsigned long)-1 means "not yet known, do a
+	 * full scan once".  fsinfo_lba is the FSInfo sector that carries it
+	 * on disk (0: none valid), fsinfo_dirty says the count changed since
+	 * it was last written there. */
+	unsigned long free_cluster_count;
+	unsigned long fsinfo_lba;
+	int fsinfo_dirty;
+
+	/* Mounted read-only: the VFS refuses every modification, and the
+	 * driver's own write-backs (FAT sector, FSInfo) are skipped. */
+	int read_only;
+
+	/* Working directory of fat32_chdir (0 means the root). */
+	unsigned long cwd_cluster;
+
+	/* Mount options (fat32_fstype).  Ownership and permission bits are
+	 * not stored on FAT, so every file reports uid/gid and the mode
+	 * 0777 & ~fmask, every directory 0777 & ~dmask.  perm_opts says that
+	 * any of uid=, gid=, umask=, fmask=, dmask= was given: access is then
+	 * decided by those bits instead of being granted to everyone. */
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t fmask;
+	uint32_t dmask;
+	int perm_opts;
+	int shortname; /* FAT32_SHORTNAME_* */
+};
+
+#define FAT32_SHORTNAME_LOWER 0
+#define FAT32_SHORTNAME_WIN95 1
+#define FAT32_SHORTNAME_WINNT 2
+#define FAT32_SHORTNAME_MIXED 3
+
+/* The defaults reproduce what the driver has always reported: files 0644,
+ * directories 0755, owned by root. */
+#define FAT32_DEFAULT_FMASK 0133u
+#define FAT32_DEFAULT_DMASK 0022u
+
+/* Debug mirrors of the ROOT instance's I/O mutex, for the scheduler's
+ * debug dump.  Written only while the root instance's wait lock is held. */
 volatile int fat32_io_locked = 0;
 volatile int fat32_io_depth = 0; // recursion depth
 volatile uint64_t fat32_io_owner = (uint64_t)-1; // owning task id (-1 = none)
-static spinlock_t fat32_io_wait_lock = SPINLOCK_INIT("fat32_io_wait");
 
-void fat32_io_lock(void)
+static void fat32_io_mirror(struct fat32_state *st)
+{
+	if (!st->is_root)
+		return;
+	fat32_io_locked = st->io_locked;
+	fat32_io_depth = st->io_depth;
+	fat32_io_owner = st->io_owner;
+}
+
+void fat32_io_lock(fat32_fs_t *fs)
 {
 	might_sleep();
+	struct fat32_state *st = fs->st;
 	task_t *cur = sched_current();
 	uint64_t my_id = cur ? cur->id : 0;
 
 	while (1) {
 		uint64_t flags;
-		spin_lock_irqsave(&fat32_io_wait_lock, &flags);
-		if (!fat32_io_locked) {
-			fat32_io_locked = 1;
-			fat32_io_owner = my_id;
-			fat32_io_depth = 1;
+		spin_lock_irqsave(&st->io_wait_lock, &flags);
+		if (!st->io_locked) {
+			st->io_locked = 1;
+			st->io_owner = my_id;
+			st->io_depth = 1;
+			fat32_io_mirror(st);
 			task_sleep_lock_taken();
-			spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+			spin_unlock_irqrestore(&st->io_wait_lock, flags);
 			return;
 		}
 		// Reentrant: same task already holds it
-		if (fat32_io_owner == my_id) {
-			fat32_io_depth++;
-			spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+		if (st->io_owner == my_id) {
+			st->io_depth++;
+			fat32_io_mirror(st);
+			spin_unlock_irqrestore(&st->io_wait_lock, flags);
 			return;
 		}
 		if (cur) {
-			cur->wait_channel = (void *)&fat32_io_locked;
+			cur->wait_channel = (void *)&st->io_locked;
 			task_set_blocked(cur);
 		}
-		spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+		spin_unlock_irqrestore(&st->io_wait_lock, flags);
 		sched_schedule();
 	}
 }
 
-void fat32_io_unlock(void)
+void fat32_io_unlock(fat32_fs_t *fs)
 {
+	struct fat32_state *st = fs->st;
 	uint64_t flags;
-	spin_lock_irqsave(&fat32_io_wait_lock, &flags);
-	WARN_ON(!fat32_io_locked); /* unlock without prior lock */
-	WARN_ON(fat32_io_depth <=
+	spin_lock_irqsave(&st->io_wait_lock, &flags);
+	WARN_ON(!st->io_locked); /* unlock without prior lock */
+	WARN_ON(st->io_depth <=
 		0); /* depth underflow: double-unlock or mismatched lock/unlock */
-	if (fat32_io_depth > 1) {
-		fat32_io_depth--;
-		spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+	if (st->io_depth > 1) {
+		st->io_depth--;
+		fat32_io_mirror(st);
+		spin_unlock_irqrestore(&st->io_wait_lock, flags);
 		return;
 	}
-	fat32_io_locked = 0;
-	fat32_io_owner = (uint64_t)-1;
-	fat32_io_depth = 0;
+	st->io_locked = 0;
+	st->io_owner = (uint64_t)-1;
+	st->io_depth = 0;
+	fat32_io_mirror(st);
 	task_sleep_lock_dropped();
-	spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
-	sched_wake_channel((void *)&fat32_io_locked);
+	spin_unlock_irqrestore(&st->io_wait_lock, flags);
+	sched_wake_channel((void *)&st->io_locked);
 }
 
-/* Force-release the FAT32 I/O mutex if it is currently owned by the given
- * task id.  Used by the task-exit path (vfs_release_locks_for_task →
+/* Force-release the instance's I/O mutex if it is currently owned by the
+ * given task id.  Used by the task-exit path (vfs_release_locks_for_task →
  * dead_thread_reap) to recover from a task that was killed mid-FS-write
  * (e.g. Ctrl+C on curl while inside fat32_write_impl).  Without this
  * recovery the lock would stay held forever: the dying task can never
@@ -95,20 +182,24 @@ void fat32_io_unlock(void)
  * execve reading /bin/<cmd>) would block on it.  Confirmed via the
  * scheduler debug dump: `FAT32 io_lock: held=1 depth=1 owner=<dead-tid>`.
  * Returns 1 if the lock was released by this call, 0 otherwise. */
-int fat32_io_release_if_owner(uint64_t task_id)
+int fat32_io_release_if_owner(fat32_fs_t *fs, uint64_t task_id)
 {
+	if (!fs || !fs->st)
+		return 0;
+	struct fat32_state *st = fs->st;
 	uint64_t flags;
 	int released = 0;
-	spin_lock_irqsave(&fat32_io_wait_lock, &flags);
-	if (fat32_io_locked && fat32_io_owner == task_id) {
-		fat32_io_locked = 0;
-		fat32_io_owner = (uint64_t)-1;
-		fat32_io_depth = 0;
+	spin_lock_irqsave(&st->io_wait_lock, &flags);
+	if (st->io_locked && st->io_owner == task_id) {
+		st->io_locked = 0;
+		st->io_owner = (uint64_t)-1;
+		st->io_depth = 0;
+		fat32_io_mirror(st);
 		released = 1;
 	}
-	spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+	spin_unlock_irqrestore(&st->io_wait_lock, flags);
 	if (released)
-		sched_wake_channel((void *)&fat32_io_locked);
+		sched_wake_channel((void *)&st->io_locked);
 	return released;
 }
 
@@ -165,13 +256,11 @@ static unsigned long fat32_sb_next_block(vfs_superblock_t *sb,
 }
 static void fat32_sb_lock_io(vfs_superblock_t *sb)
 {
-	(void)sb;
-	fat32_io_lock();
+	fat32_io_lock((fat32_fs_t *)sb->fs_private);
 }
 static void fat32_sb_unlock_io(vfs_superblock_t *sb)
 {
-	(void)sb;
-	fat32_io_unlock();
+	fat32_io_unlock((fat32_fs_t *)sb->fs_private);
 }
 
 static unsigned long fat32_sb_reserved_meta_block(vfs_superblock_t *sb)
@@ -193,13 +282,13 @@ static const vfs_sb_ops_t fat32_sb_ops = {
 	.reserved_meta_block = fat32_sb_reserved_meta_block,
 };
 
-/* Wire up sb on a freshly-mounted fat32_fs_t and register it as the
- * filesystem-independent root.  Caches see only g_root_sb from here on. */
+/* Wire up sb on a freshly-mounted fat32_fs_t: the caches reach the
+ * instance through it.  (Making it the root superblock is
+ * fat32_vfs_register_root's business.) */
 static void fat32_sb_attach(fat32_fs_t *fs)
 {
 	fs->sb.ops = &fat32_sb_ops;
 	fs->sb.fs_private = fs;
-	g_root_sb = &fs->sb;
 }
 
 /* fat32_sb_write_inode: persist ic_inode_t's size + mtime into the on-disk
@@ -218,14 +307,14 @@ static int fat32_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 	if (!buf)
 		return -1;
 
-	fat32_io_lock();
+	fat32_io_lock(fs);
 
 	unsigned long lba =
 		fs->part_lba_offset + fs->data_start_lba +
 		(inode->dirent_cluster - 2) * fs->sectors_per_cluster;
 	if (fs->bdev->read((block_device_t *)fs->bdev, lba,
 			   fs->sectors_per_cluster, buf) != 0) {
-		fat32_io_unlock();
+		fat32_io_unlock(fs);
 		kfree(buf);
 		return -1;
 	}
@@ -259,7 +348,7 @@ static int fat32_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 		}
 	}
 
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	kfree(buf);
 	return 0;
 }
@@ -699,35 +788,21 @@ static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
 
 // Forward declaration (defined later)
 unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
-static unsigned long fat32_get_task_cwd_cluster(void);
+static unsigned long fat32_get_task_cwd_cluster(fat32_fs_t *fs);
 static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry);
 
-// Simple root directory cache (single cluster only for now)
-static void *g_root_dir_cache = 0; // first cluster of root directory cached
-static unsigned long g_root_dir_cluster = 0;
-static void *g_fat_cache = 0; // cached FAT window
-static unsigned long g_fat_cache_entries =
-	0; // number of entries in cache window
-static unsigned long g_fat_cache_start =
-	0; // first cluster entry in cache window
-static unsigned long g_fat_total_entries = 0; // total FAT entries on disk
-static unsigned long g_fat_first_sectors = 0; // first FAT size in sectors
 #define FAT_CACHE_MAX_BYTES (1024 * 1024) // 1MB max FAT cache
 #define FAT_CACHE_MAX_ENTRIES (FAT_CACHE_MAX_BYTES / 4) // 262144 entries
+/* The instance that is the root filesystem (fat32_vfs_register_root), NULL
+ * when the root is not FAT32.  Nothing in this file works through it: every
+ * operation reaches its instance through the mount or the open file. */
 fat32_fs_t *g_root_fs = 0;
-/* Filesystem-independent root superblock pointer.  Set by fat32_mount() once
- * the FAT32 sb-ops table is wired up; consumed by the dcache / icache /
- * pagecache for all back-into-FS dispatch.  Lives in this TU so the FAT32
- * driver owns its publication; ext4_mount() will overwrite it the same way. */
+/* Filesystem-independent root superblock pointer.  Set by
+ * fat32_vfs_register_root(); consumed by the dcache / icache / pagecache for
+ * all back-into-FS dispatch that has no superblock of its own.  Lives in this
+ * TU so the FAT32 driver owns its publication; ext4 sets it the same way. */
 vfs_superblock_t *g_root_sb = 0;
 static fat32_fs_t g_static_fs; // internal singleton instance
-static unsigned long g_cwd_cluster = 0; // 0 means root
-
-/* Cached free cluster count — avoids scanning the entire FAT every statfs call.
- * Initialised from the FSInfo sector at mount time; kept in sync by alloc/free.
- * A value of (unsigned long)-1 means "not yet known, do a full scan once". */
-static unsigned long g_free_cluster_count = (unsigned long)-1;
-static unsigned long g_fsinfo_sector = 0; // absolute LBA of FSInfo sector
 
 /* Deferred FAT-sector writes: each fat32_fat_set used to write the
  * single FAT sector containing the updated entry SYNCHRONOUSLY for every
@@ -735,13 +810,12 @@ static unsigned long g_fsinfo_sector = 0; // absolute LBA of FSInfo sector
  * one-sector writes (×2 with FAT mirrors), dominating the USB pipe and
  * capping write throughput at ~1 MB/s.  Consecutive cluster allocations
  * touch the SAME 512-byte FAT sector (128 entries per sector), so just
- * remember the last dirty sector and flush it only when we move to a
- * different one (or at file close / sync). */
-static unsigned long g_fat_dirty_sector = (unsigned long)-1;
-static fat32_fs_t *g_fat_dirty_fs = NULL;
-static int fat32_fat_flush_pending(void);
+ * remember the last dirty sector (per volume, fat32_state.fat_dirty_sector)
+ * and flush it only when we move to a different one (or at file close /
+ * sync). */
+static int fat32_fat_flush_pending(fat32_fs_t *fs);
 
-static const char *fat32_normalize_start(const char *path,
+static const char *fat32_normalize_start(fat32_fs_t *fs, const char *path,
 					 unsigned long *start_cluster)
 {
 	if (!path || !start_cluster)
@@ -749,7 +823,7 @@ static const char *fat32_normalize_start(const char *path,
 
 	// Handle absolute paths starting with /
 	if (path[0] == '/') {
-		*start_cluster = g_root_dir_cluster;
+		*start_cluster = fs->st->root_dir_cluster;
 		while (*path == '/')
 			path++;
 		return path;
@@ -768,7 +842,7 @@ static const char *fat32_normalize_start(const char *path,
 	if (path[0] == '.' && path[1] == '.' && path[2] == '/') {
 		// Move to parent directory
 		unsigned long cur = *start_cluster;
-		*start_cluster = fat32_parent_cluster(cur);
+		*start_cluster = fat32_parent_cluster(fs, cur);
 		path += 3;
 		while (*path == '/')
 			path++;
@@ -782,11 +856,11 @@ static int fat32_ensure_fat_loaded(fat32_fs_t *fs)
 {
 	if (!fs)
 		return ST_INVALID;
-	if (g_fat_cache)
+	if (fs->st->fat_cache)
 		return ST_OK;
 	// trigger FAT cache load
 	(void)fat32_next_cluster_cached(fs, 2);
-	return g_fat_cache ? ST_OK : ST_IO;
+	return fs->st->fat_cache ? ST_OK : ST_IO;
 }
 
 static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
@@ -797,12 +871,12 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
 		cluster); /* FAT self-loop: FAT[cluster] = cluster creates an infinite chain */
 	WARN_ON((value & 0x0FFFFFFF) ==
 		1); /* FAT entry value 1 is reserved and invalid - FAT is corrupted */
-	if (!fs || cluster >= g_fat_total_entries)
+	if (!fs || cluster >= fs->st->fat_total_entries)
 		return ST_INVALID;
 
 	/* Ensure cluster is in cache window */
-	if (!g_fat_cache || cluster < g_fat_cache_start ||
-	    cluster >= g_fat_cache_start + g_fat_cache_entries) {
+	if (!fs->st->fat_cache || cluster < fs->st->fat_cache_start ||
+	    cluster >= fs->st->fat_cache_start + fs->st->fat_cache_entries) {
 		/* Load window containing this cluster */
 		unsigned long window_start = 0;
 		if (cluster >= FAT_CACHE_MAX_ENTRIES / 2)
@@ -815,9 +889,9 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
 	}
 
 	/* Update in cache. */
-	unsigned long cache_index = cluster - g_fat_cache_start;
-	WARN_ON(cache_index >= g_fat_cache_entries);
-	uint32_t *fat = (uint32_t *)g_fat_cache;
+	unsigned long cache_index = cluster - fs->st->fat_cache_start;
+	WARN_ON(cache_index >= fs->st->fat_cache_entries);
+	uint32_t *fat = (uint32_t *)fs->st->fat_cache;
 	fat[cache_index] = value & 0x0FFFFFFF;
 
 	/* Determine which FAT sector this entry lives in.  Defer the disk
@@ -828,58 +902,54 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
 	unsigned long fat_byte = cluster * 4;
 	unsigned long sector = fat_byte / fs->bytes_per_sector;
 
-	if (g_fat_dirty_sector != (unsigned long)-1 &&
-	    (g_fat_dirty_sector != sector || g_fat_dirty_fs != fs)) {
+	if (fs->st->fat_dirty_sector != (unsigned long)-1 &&
+	    fs->st->fat_dirty_sector != sector) {
 		/* We're about to dirty a different sector — flush the previous
          * one so we don't lose its updates. */
-		int rc = fat32_fat_flush_pending();
+		int rc = fat32_fat_flush_pending(fs);
 		if (rc != ST_OK)
 			return rc;
 	}
-	g_fat_dirty_sector = sector;
-	g_fat_dirty_fs = fs;
+	fs->st->fat_dirty_sector = sector;
 	return ST_OK;
 }
 
 /* Flush the single pending dirty FAT sector to disk (and mirror FATs).
  * Called whenever a different FAT sector gets dirtied, at file close,
- * or at filesystem sync points.  Caller MUST hold fat32_io_lock. */
-static int fat32_fat_flush_pending(void)
+ * or at filesystem sync points.  Caller MUST hold the instance's
+ * fat32_io_lock. */
+static int fat32_fat_flush_pending(fat32_fs_t *fs)
 {
-	if (g_fat_dirty_sector == (unsigned long)-1 || !g_fat_dirty_fs ||
-	    !g_fat_cache)
+	if (fs->st->fat_dirty_sector == (unsigned long)-1 ||
+	    !fs->st->fat_cache)
 		return ST_OK;
 
-	fat32_fs_t *fs = g_fat_dirty_fs;
-	unsigned long sector = g_fat_dirty_sector;
+	unsigned long sector = fs->st->fat_dirty_sector;
 
-	/* Compute the byte offset in g_fat_cache for this sector.  The cache
-     * window starts at g_fat_cache_start (in FAT entries) — convert to
+	/* Compute the byte offset in fs->st->fat_cache for this sector.  The cache
+     * window starts at fs->st->fat_cache_start (in FAT entries) — convert to
      * the equivalent sector and subtract. */
 	unsigned long entries_per_sector = fs->bytes_per_sector / 4;
 	unsigned long window_first_sector =
-		(fs->fat_start_lba + g_fat_cache_start / entries_per_sector) -
+		(fs->fat_start_lba + fs->st->fat_cache_start / entries_per_sector) -
 		fs->fat_start_lba;
 	if (sector < window_first_sector) {
 		/* Sector not in the loaded window — stale dirty marker (window
          * was changed without us being asked to flush).  Clear and bail. */
-		g_fat_dirty_sector = (unsigned long)-1;
-		g_fat_dirty_fs = NULL;
+		fs->st->fat_dirty_sector = (unsigned long)-1;
 		return ST_OK;
 	}
 	unsigned long cache_sector_off = sector - window_first_sector;
-	if (cache_sector_off * entries_per_sector >= g_fat_cache_entries) {
-		g_fat_dirty_sector = (unsigned long)-1;
-		g_fat_dirty_fs = NULL;
+	if (cache_sector_off * entries_per_sector >= fs->st->fat_cache_entries) {
+		fs->st->fat_dirty_sector = (unsigned long)-1;
 		return ST_OK;
 	}
-	uint8_t *sector_data = ((uint8_t *)g_fat_cache) +
+	uint8_t *sector_data = ((uint8_t *)fs->st->fat_cache) +
 			       cache_sector_off * fs->bytes_per_sector;
 
 	unsigned long lba = fs->part_lba_offset + fs->fat_start_lba + sector;
 	if (write_sectors(fs->bdev, lba, 1, sector_data) != ST_OK) {
-		g_fat_dirty_sector = (unsigned long)-1;
-		g_fat_dirty_fs = NULL;
+		fs->st->fat_dirty_sector = (unsigned long)-1;
 		return ST_IO;
 	}
 	for (unsigned int f = 1; f < fs->num_fats; ++f) {
@@ -890,8 +960,7 @@ static int fat32_fat_flush_pending(void)
 			break;
 		}
 	}
-	g_fat_dirty_sector = (unsigned long)-1;
-	g_fat_dirty_fs = NULL;
+	fs->st->fat_dirty_sector = (unsigned long)-1;
 	return ST_OK;
 }
 
@@ -904,8 +973,8 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
 		return ST_IO;
 
 	/* Search all FAT entries for a free cluster */
-	for (unsigned long c = 2; c < g_fat_total_entries; ++c) {
-		if (c == g_root_dir_cluster) {
+	for (unsigned long c = 2; c < fs->st->fat_total_entries; ++c) {
+		if (c == fs->st->root_dir_cluster) {
 			/* Defensive guard: never allocate the root directory cluster.
              * If it appears free (FAT[c]==0) something has already gone wrong. */
 			unsigned long root_val =
@@ -942,9 +1011,11 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
              *     write_sectors call below. */
 			*out_cluster = c;
 			WARN_ON(*out_cluster < 2);
-			if (g_free_cluster_count != (unsigned long)-1 &&
-			    g_free_cluster_count > 0)
-				g_free_cluster_count--;
+			if (fs->st->free_cluster_count != (unsigned long)-1 &&
+			    fs->st->free_cluster_count > 0) {
+				fs->st->free_cluster_count--;
+				fs->st->fsinfo_dirty = 1;
+			}
 			return ST_OK;
 		}
 	}
@@ -958,7 +1029,7 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
 	if (!fs || start_cluster < 2)
 		return ST_OK;
 	/* Defensive guard: never free the root directory cluster. */
-	if (start_cluster == g_root_dir_cluster) {
+	if (start_cluster == fs->st->root_dir_cluster) {
 		kprintf("FAT32: BUG: fat32_free_chain called with root cluster %lu!\n",
 			start_cluster);
 		return ST_INVALID;
@@ -970,9 +1041,9 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
 	while (c >= 2 && c < 0x0FFFFFF8) {
 		WARN_ON_ONCE(
 			++loop_count >
-			g_fat_total_entries); /* FAT chain longer than total clusters: circular chain or FAT corruption */
+			fs->st->fat_total_entries); /* FAT chain longer than total clusters: circular chain or FAT corruption */
 		/* Defensive guard: abort if the chain somehow reaches the root cluster. */
-		if (c == g_root_dir_cluster) {
+		if (c == fs->st->root_dir_cluster) {
 			kprintf("FAT32: BUG: free_chain reached root cluster %lu (chain from %lu)!\n",
 				c, start_cluster);
 			break;
@@ -981,8 +1052,10 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
 		WARN_ON(next == c); /* self-loop: corrupted FAT chain */
 		if (fat32_fat_set(fs, c, 0) != ST_OK)
 			return ST_IO;
-		if (g_free_cluster_count != (unsigned long)-1)
-			g_free_cluster_count++;
+		if (fs->st->free_cluster_count != (unsigned long)-1) {
+			fs->st->free_cluster_count++;
+			fs->st->fsinfo_dirty = 1;
+		}
 		if (next >= 0x0FFFFFF8 || next == 0)
 			break;
 		c = next;
@@ -1112,14 +1185,14 @@ static int fat32_prepare_name(const char *name, fat32_name_t *out)
 // Find entry by name (supports both LFN and 8.3, case-insensitive)
 // Also returns the index of the first LFN entry if present
 static int fat32_dir_find_entry_lfn(
-	unsigned long start_cluster, const char *name, unsigned *attr,
+	fat32_fs_t *fs, unsigned long start_cluster, const char *name, unsigned *attr,
 	unsigned long *first_cluster, unsigned long *size,
 	unsigned long *out_cluster, unsigned int *out_index,
 	unsigned long *lfn_start_cluster, unsigned int *lfn_start_index)
 {
 	BUG_ON(name == NULL);
 	might_sleep();
-	if (!g_root_fs || !name)
+	if (!fs || !name)
 		return ST_INVALID;
 
 	// Prepare the name we're looking for
@@ -1128,7 +1201,7 @@ static int fat32_dir_find_entry_lfn(
 		return ST_INVALID;
 
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	unsigned long cluster = start_cluster;
 
 	// LFN accumulation state
@@ -1146,8 +1219,8 @@ static int fat32_dir_find_entry_lfn(
 		if (!buf)
 			return ST_NOMEM;
 		if (read_sectors(
-			    g_root_fs->bdev, cluster_to_lba(g_root_fs, cluster),
-			    g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+			    fs->bdev, cluster_to_lba(fs, cluster),
+			    fs->sectors_per_cluster, buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
 		}
@@ -1317,7 +1390,7 @@ static int fat32_dir_find_entry_lfn(
 		}
 		kfree(buf);
 		unsigned long next =
-			fat32_next_cluster_cached(g_root_fs, cluster);
+			fat32_next_cluster_cached(fs, cluster);
 		if (next >= 0x0FFFFFF8 || next == 0)
 			break;
 		cluster = next;
@@ -1326,7 +1399,8 @@ static int fat32_dir_find_entry_lfn(
 }
 
 // Legacy wrapper for 8.3 name search (still used internally)
-static int fat32_dir_find_entry(unsigned long start_cluster, const char *name83,
+static int fat32_dir_find_entry(fat32_fs_t *fs, unsigned long start_cluster,
+				const char *name83,
 				unsigned *attr, unsigned long *first_cluster,
 				unsigned long *size, unsigned long *out_cluster,
 				unsigned int *out_index)
@@ -1349,21 +1423,22 @@ static int fat32_dir_find_entry(unsigned long start_cluster, const char *name83,
 	}
 	filename[p] = '\0';
 
-	return fat32_dir_find_entry_lfn(start_cluster, filename, attr,
+	return fat32_dir_find_entry_lfn(fs, start_cluster, filename, attr,
 					first_cluster, size, out_cluster,
 					out_index, 0, 0);
 }
 
 // Find contiguous free entries for LFN (need lfn_entries + 1 entries)
-static int fat32_dir_find_free_entries(unsigned long start_cluster, int count,
+static int fat32_dir_find_free_entries(fat32_fs_t *fs,
+				       unsigned long start_cluster, int count,
 				       unsigned long *out_cluster,
 				       unsigned int *out_index)
 {
-	if (!g_root_fs || !out_cluster || !out_index || count <= 0)
+	if (!fs || !out_cluster || !out_index || count <= 0)
 		return ST_INVALID;
 
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	unsigned entries_per_cluster = cluster_size / sizeof(fat32_dirent_t);
 	unsigned long cluster = start_cluster;
 	unsigned long last_cluster = start_cluster;
@@ -1378,8 +1453,8 @@ static int fat32_dir_find_free_entries(unsigned long start_cluster, int count,
 		if (!buf)
 			return ST_NOMEM;
 		if (read_sectors(
-			    g_root_fs->bdev, cluster_to_lba(g_root_fs, cluster),
-			    g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+			    fs->bdev, cluster_to_lba(fs, cluster),
+			    fs->sectors_per_cluster, buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
 		}
@@ -1422,7 +1497,7 @@ static int fat32_dir_find_free_entries(unsigned long start_cluster, int count,
 		kfree(buf);
 		last_cluster = cluster;
 		unsigned long next =
-			fat32_next_cluster_cached(g_root_fs, cluster);
+			fat32_next_cluster_cached(fs, cluster);
 		if (next >= 0x0FFFFFF8 || next == 0)
 			break;
 		cluster = next;
@@ -1430,7 +1505,7 @@ static int fat32_dir_find_free_entries(unsigned long start_cluster, int count,
 
 	// Need to allocate new cluster
 	unsigned long newc = 0;
-	if (fat32_append_cluster(g_root_fs, last_cluster, &newc) != ST_OK)
+	if (fat32_append_cluster(fs, last_cluster, &newc) != ST_OK)
 		return ST_IO;
 
 	// If we had some contiguous entries at the end, they might span into new cluster
@@ -1445,34 +1520,36 @@ static int fat32_dir_find_free_entries(unsigned long start_cluster, int count,
 }
 
 // Legacy single entry find
-static int fat32_dir_find_free_entry(unsigned long start_cluster,
+static int fat32_dir_find_free_entry(fat32_fs_t *fs,
+				     unsigned long start_cluster,
 				     unsigned long *out_cluster,
 				     unsigned int *out_index)
 {
-	return fat32_dir_find_free_entries(start_cluster, 1, out_cluster,
+	return fat32_dir_find_free_entries(fs, start_cluster, 1, out_cluster,
 					   out_index);
 }
 
-static int fat32_write_dirent(unsigned long dir_cluster, unsigned int index,
+static int fat32_write_dirent(fat32_fs_t *fs, unsigned long dir_cluster,
+			      unsigned int index,
 			      const fat32_dirent_t *ent)
 {
-	if (!g_root_fs || !ent)
+	if (!fs || !ent)
 		return ST_INVALID;
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	void *buf = kalloc(cluster_size);
 	if (!buf)
 		return ST_NOMEM;
-	unsigned long lba = cluster_to_lba(g_root_fs, dir_cluster);
-	if (read_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster,
+	unsigned long lba = cluster_to_lba(fs, dir_cluster);
+	if (read_sectors(fs->bdev, lba, fs->sectors_per_cluster,
 			 buf) != ST_OK) {
 		kfree(buf);
 		return ST_IO;
 	}
 	fat32_dirent_t *ents = (fat32_dirent_t *)buf;
 	ents[index] = *ent;
-	int st = write_sectors(g_root_fs->bdev, lba,
-			       g_root_fs->sectors_per_cluster, buf);
+	int st = write_sectors(fs->bdev, lba,
+			       fs->sectors_per_cluster, buf);
 	kfree(buf);
 	return st;
 }
@@ -1481,16 +1558,17 @@ static int fat32_write_dirent(unsigned long dir_cluster, unsigned int index,
 // start_cluster/start_index: first entry position (for first LFN entry)
 // fat32_name: prepared name structure
 // short_ent: the short directory entry to write
-static int fat32_write_lfn_entries(unsigned long start_cluster,
+static int fat32_write_lfn_entries(fat32_fs_t *fs,
+				   unsigned long start_cluster,
 				   unsigned int start_index,
 				   const fat32_name_t *nm,
 				   const fat32_dirent_t *short_ent)
 {
-	if (!g_root_fs || !nm || !short_ent)
+	if (!fs || !nm || !short_ent)
 		return ST_INVALID;
 
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	unsigned entries_per_cluster = cluster_size / sizeof(fat32_dirent_t);
 	(void)entries_per_cluster; // Used later in cluster navigation
 
@@ -1502,9 +1580,9 @@ static int fat32_write_lfn_entries(unsigned long start_cluster,
 	unsigned long current_cluster = start_cluster;
 	unsigned int current_index = start_index;
 
-	if (read_sectors(g_root_fs->bdev,
-			 cluster_to_lba(g_root_fs, current_cluster),
-			 g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+	if (read_sectors(fs->bdev,
+			 cluster_to_lba(fs, current_cluster),
+			 fs->sectors_per_cluster, buf) != ST_OK) {
 		kfree(buf);
 		return ST_IO;
 	}
@@ -1518,15 +1596,15 @@ static int fat32_write_lfn_entries(unsigned long start_cluster,
 		if (current_index >= entries_per_cluster) {
 			// Write current cluster and move to next
 			if (write_sectors(
-				    g_root_fs->bdev,
-				    cluster_to_lba(g_root_fs, current_cluster),
-				    g_root_fs->sectors_per_cluster,
+				    fs->bdev,
+				    cluster_to_lba(fs, current_cluster),
+				    fs->sectors_per_cluster,
 				    buf) != ST_OK) {
 				kfree(buf);
 				return ST_IO;
 			}
 			unsigned long next = fat32_next_cluster_cached(
-				g_root_fs, current_cluster);
+				fs, current_cluster);
 			if (next >= 0x0FFFFFF8 || next == 0) {
 				kfree(buf);
 				return ST_IO;
@@ -1534,9 +1612,9 @@ static int fat32_write_lfn_entries(unsigned long start_cluster,
 			current_cluster = next;
 			current_index = 0;
 			if (read_sectors(
-				    g_root_fs->bdev,
-				    cluster_to_lba(g_root_fs, current_cluster),
-				    g_root_fs->sectors_per_cluster,
+				    fs->bdev,
+				    cluster_to_lba(fs, current_cluster),
+				    fs->sectors_per_cluster,
 				    buf) != ST_OK) {
 				kfree(buf);
 				return ST_IO;
@@ -1553,24 +1631,24 @@ static int fat32_write_lfn_entries(unsigned long start_cluster,
 
 	// Write short name entry
 	if (current_index >= entries_per_cluster) {
-		if (write_sectors(g_root_fs->bdev,
-				  cluster_to_lba(g_root_fs, current_cluster),
-				  g_root_fs->sectors_per_cluster,
+		if (write_sectors(fs->bdev,
+				  cluster_to_lba(fs, current_cluster),
+				  fs->sectors_per_cluster,
 				  buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
 		}
 		unsigned long next =
-			fat32_next_cluster_cached(g_root_fs, current_cluster);
+			fat32_next_cluster_cached(fs, current_cluster);
 		if (next >= 0x0FFFFFF8 || next == 0) {
 			kfree(buf);
 			return ST_IO;
 		}
 		current_cluster = next;
 		current_index = 0;
-		if (read_sectors(g_root_fs->bdev,
-				 cluster_to_lba(g_root_fs, current_cluster),
-				 g_root_fs->sectors_per_cluster,
+		if (read_sectors(fs->bdev,
+				 cluster_to_lba(fs, current_cluster),
+				 fs->sectors_per_cluster,
 				 buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
@@ -1581,24 +1659,24 @@ static int fat32_write_lfn_entries(unsigned long start_cluster,
 	ents[current_index] = *short_ent;
 
 	// Write final cluster
-	int st = write_sectors(g_root_fs->bdev,
-			       cluster_to_lba(g_root_fs, current_cluster),
-			       g_root_fs->sectors_per_cluster, buf);
+	int st = write_sectors(fs->bdev,
+			       cluster_to_lba(fs, current_cluster),
+			       fs->sectors_per_cluster, buf);
 	kfree(buf);
 	return st;
 }
 
 // Delete directory entries from lfn_start to short_entry
-static int fat32_delete_entries(unsigned long start_cluster,
+static int fat32_delete_entries(fat32_fs_t *fs, unsigned long start_cluster,
 				unsigned int start_index,
 				unsigned long end_cluster,
 				unsigned int end_index)
 {
-	if (!g_root_fs)
+	if (!fs)
 		return ST_INVALID;
 
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	unsigned entries_per_cluster = cluster_size / sizeof(fat32_dirent_t);
 
 	unsigned long current_cluster = start_cluster;
@@ -1609,9 +1687,9 @@ static int fat32_delete_entries(unsigned long start_cluster,
 		if (!buf)
 			return ST_NOMEM;
 
-		if (read_sectors(g_root_fs->bdev,
-				 cluster_to_lba(g_root_fs, current_cluster),
-				 g_root_fs->sectors_per_cluster,
+		if (read_sectors(fs->bdev,
+				 cluster_to_lba(fs, current_cluster),
+				 fs->sectors_per_cluster,
 				 buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
@@ -1628,10 +1706,10 @@ static int fat32_delete_entries(unsigned long start_cluster,
 				// Done
 				if (modified) {
 					write_sectors(
-						g_root_fs->bdev,
-						cluster_to_lba(g_root_fs,
+						fs->bdev,
+						cluster_to_lba(fs,
 							       current_cluster),
-						g_root_fs->sectors_per_cluster,
+						fs->sectors_per_cluster,
 						buf);
 				}
 				kfree(buf);
@@ -1642,15 +1720,15 @@ static int fat32_delete_entries(unsigned long start_cluster,
 
 		if (modified) {
 			write_sectors(
-				g_root_fs->bdev,
-				cluster_to_lba(g_root_fs, current_cluster),
-				g_root_fs->sectors_per_cluster, buf);
+				fs->bdev,
+				cluster_to_lba(fs, current_cluster),
+				fs->sectors_per_cluster, buf);
 		}
 		kfree(buf);
 
 		// Move to next cluster
 		unsigned long next =
-			fat32_next_cluster_cached(g_root_fs, current_cluster);
+			fat32_next_cluster_cached(fs, current_cluster);
 		if (next >= 0x0FFFFFF8 || next == 0)
 			return ST_IO;
 		current_cluster = next;
@@ -1672,6 +1750,43 @@ static void fat32_init_dirent(fat32_dirent_t *ent, const char name83[11],
 	ent->fileSize = (uint32_t)size;
 }
 
+/* Set creation, modification and access time of a new entry. */
+static void fat32_stamp_dirent(fat32_dirent_t *ent, uint16_t date,
+			       uint16_t time_val)
+{
+	ent->crtTimeTenth = 0;
+	ent->crtTime = time_val;
+	ent->crtDate = date;
+	ent->lstAccDate = date;
+	ent->wrtTime = time_val;
+	ent->wrtDate = date;
+}
+
+/* True for the '..' entry of a directory (name ".." padded with blanks). */
+static int fat32_dirent_is_dotdot(const fat32_dirent_t *ent)
+{
+	if (ent->name[0] != '.' || ent->name[1] != '.')
+		return 0;
+	for (int i = 2; i < 11; ++i)
+		if (ent->name[i] != ' ')
+			return 0;
+	return 1;
+}
+
+/* The directory a '..' entry names.  On disk, the '..' entry of a directory
+ * that sits in the root directory holds start cluster 0, whatever the root
+ * directory's real cluster is; for lookups that 0 stands for this volume's
+ * root directory. */
+static unsigned long fat32_dotdot_target(fat32_fs_t *fs,
+					 const fat32_dirent_t *ent,
+					 unsigned long cluster)
+{
+	if (cluster == 0 && (ent->attr & FAT32_ATTR_DIRECTORY) &&
+	    fat32_dirent_is_dotdot(ent))
+		return fs->st->root_dir_cluster;
+	return cluster;
+}
+
 static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 {
 	might_sleep();
@@ -1679,14 +1794,14 @@ static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 	/* If we have a pending dirty FAT sector in the current window, flush
      * it BEFORE we overwrite the cache window with a different range —
      * otherwise the update is silently lost. */
-	if (g_fat_dirty_sector != (unsigned long)-1)
-		fat32_fat_flush_pending();
+	if (fs->st->fat_dirty_sector != (unsigned long)-1)
+		fat32_fat_flush_pending(fs);
 	/* Calculate how many sectors we need and can cache */
 	unsigned long entries_per_sector = fs->bytes_per_sector / 4;
 	unsigned long start_sector = start_entry / entries_per_sector;
 
 	/* Limit cache to FAT_CACHE_MAX_ENTRIES or remaining FAT entries */
-	unsigned long entries_to_load = g_fat_total_entries - start_entry;
+	unsigned long entries_to_load = fs->st->fat_total_entries - start_entry;
 	if (entries_to_load > FAT_CACHE_MAX_ENTRIES)
 		entries_to_load = FAT_CACHE_MAX_ENTRIES;
 
@@ -1696,9 +1811,9 @@ static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 	unsigned long bytes_to_load = sectors_to_load * fs->bytes_per_sector;
 
 	/* Allocate cache if not already done */
-	if (!g_fat_cache) {
-		g_fat_cache = kalloc(bytes_to_load);
-		if (!g_fat_cache) {
+	if (!fs->st->fat_cache) {
+		fs->st->fat_cache = kalloc(bytes_to_load);
+		if (!fs->st->fat_cache) {
 			return -1;
 		}
 	}
@@ -1706,7 +1821,7 @@ static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 	/* Read FAT window */
 	unsigned long lba =
 		fs->part_lba_offset + fs->fat_start_lba + start_sector;
-	uint8_t *dest = (uint8_t *)g_fat_cache;
+	uint8_t *dest = (uint8_t *)fs->st->fat_cache;
 	unsigned long remaining = sectors_to_load;
 
 	while (remaining > 0) {
@@ -1723,8 +1838,8 @@ static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 		remaining -= chunk;
 	}
 
-	g_fat_cache_start = start_sector * entries_per_sector;
-	g_fat_cache_entries = sectors_to_load * entries_per_sector;
+	fs->st->fat_cache_start = start_sector * entries_per_sector;
+	fs->st->fat_cache_entries = sectors_to_load * entries_per_sector;
 
 	return 0;
 }
@@ -1734,24 +1849,24 @@ unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
 	WARN_ON(cluster <
 		2); /* cluster 0 and 1 are reserved in FAT32 and never valid data clusters */
 	/* First time: calculate total FAT entries */
-	if (g_fat_total_entries == 0) {
+	if (fs->st->fat_total_entries == 0) {
 		unsigned long fat_total =
 			fs->data_start_lba - fs->fat_start_lba;
 		if (fat_total == 0)
 			return 0x0FFFFFFF;
-		g_fat_first_sectors = fat_total / fs->num_fats;
-		if (g_fat_first_sectors == 0)
-			g_fat_first_sectors = fat_total;
-		g_fat_total_entries =
-			(g_fat_first_sectors * fs->bytes_per_sector) / 4;
+		fs->st->fat_first_sectors = fat_total / fs->num_fats;
+		if (fs->st->fat_first_sectors == 0)
+			fs->st->fat_first_sectors = fat_total;
+		fs->st->fat_total_entries =
+			(fs->st->fat_first_sectors * fs->bytes_per_sector) / 4;
 	}
 
-	if (cluster >= g_fat_total_entries)
+	if (cluster >= fs->st->fat_total_entries)
 		return 0x0FFFFFFF;
 
 	/* Check if cluster is in current cache window */
-	if (!g_fat_cache || cluster < g_fat_cache_start ||
-	    cluster >= g_fat_cache_start + g_fat_cache_entries) {
+	if (!fs->st->fat_cache || cluster < fs->st->fat_cache_start ||
+	    cluster >= fs->st->fat_cache_start + fs->st->fat_cache_entries) {
 		/* Need to load a new window centered around cluster */
 		unsigned long window_start = 0;
 		if (cluster >= FAT_CACHE_MAX_ENTRIES / 2)
@@ -1765,9 +1880,9 @@ unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
 			return 0x0FFFFFFF;
 	}
 
-	unsigned long cache_index = cluster - g_fat_cache_start;
-	WARN_ON(cache_index >= g_fat_cache_entries);
-	return ((uint32_t *)g_fat_cache)[cache_index] & 0x0FFFFFFF;
+	unsigned long cache_index = cluster - fs->st->fat_cache_start;
+	WARN_ON(cache_index >= fs->st->fat_cache_entries);
+	return ((uint32_t *)fs->st->fat_cache)[cache_index] & 0x0FFFFFFF;
 }
 
 // (globals moved above)
@@ -1824,12 +1939,10 @@ static int fat32_mount_at_lba(const block_device_t *bdev,
 {
 	BUG_ON(bdev == NULL);
 	BUG_ON(out == NULL);
-	// Invalidate old FAT cache (important for re-mounts or device changes)
-	if (g_fat_cache) {
-		kfree(g_fat_cache);
-		g_fat_cache = 0;
-		g_fat_cache_entries = 0;
-	}
+	/* Only the geometry is filled in here: several candidates may be
+	 * looked at, and the private state is set up by fat32_mount() for the
+	 * one it keeps (fat32_instance_init). */
+	mm_memset(out, 0, sizeof(*out));
 
 	/* One device sector (512 or 4096 bytes): read_sectors() fills whole
 	 * device sectors, so a 512-byte buffer would overflow on a 4Kn disk. */
@@ -1880,55 +1993,13 @@ static int fat32_mount_at_lba(const block_device_t *bdev,
 	out->num_fats = bpb->num_fats;
 	out->fat_size_sectors = fat_sz;
 	out->part_lba_offset = base_lba;
-	g_root_dir_cluster = out->root_cluster;
-	g_root_fs = out;
-	fat32_sb_attach(out); /* publish vfs_superblock_t for the caches */
-	if (!g_root_dir_cache)
-		g_root_dir_cache = kalloc(out->sectors_per_cluster *
-					  out->bytes_per_sector);
-	if (g_root_dir_cache) {
-		unsigned long root_lba = cluster_to_lba(out, out->root_cluster);
-		unsigned long read_count =
-			out->sectors_per_cluster ? out->sectors_per_cluster : 1;
-		read_sectors(bdev, root_lba, read_count, g_root_dir_cache);
-	}
 	unsigned long abs_data = out->part_lba_offset + out->data_start_lba;
 	unsigned long abs_fat = out->part_lba_offset + out->fat_start_lba;
 
-	/* ---- Read FSInfo sector to get cached free cluster count ---- */
-	g_free_cluster_count = (unsigned long)-1; /* assume unknown */
-	g_fsinfo_sector = 0;
-	{
-		uint16_t fsinfo_sec = bpb->fs_info;
-		if (fsinfo_sec >= 1 &&
-		    fsinfo_sec < bpb->reserved_sector_count) {
-			void *fi_buf = kalloc(dev_ss);
-			if (fi_buf) {
-				unsigned long fi_lba = base_lba + fsinfo_sec;
-				if (read_sectors(bdev, fi_lba, 1, fi_buf) ==
-				    ST_OK) {
-					uint8_t *fb = (uint8_t *)fi_buf;
-					/* Validate FSInfo signatures: 0x41615252 at 0, 0x61417272 at 484 */
-					uint32_t sig1 = *(uint32_t *)(fb + 0);
-					uint32_t sig2 = *(uint32_t *)(fb + 484);
-					if (sig1 == 0x41615252 &&
-					    sig2 == 0x61417272) {
-						uint32_t free_cnt =
-							*(uint32_t *)(fb + 488);
-						if (free_cnt != 0xFFFFFFFF) {
-							g_free_cluster_count =
-								free_cnt;
-							g_fsinfo_sector =
-								fi_lba;
-							kprintf("FAT32: FSInfo free clusters = %lu\n",
-								g_free_cluster_count);
-						}
-					}
-				}
-				kfree(fi_buf);
-			}
-		}
-	}
+	/* Where the FSInfo sector is (read by fat32_instance_init). */
+	out->fsinfo_lba = 0;
+	if (bpb->fs_info >= 1 && bpb->fs_info < bpb->reserved_sector_count)
+		out->fsinfo_lba = base_lba + bpb->fs_info;
 
 	kprintf("FAT32: mounted %s base=%lu root=%lu\n", bdev->name, base_lba,
 		out->root_cluster);
@@ -1945,6 +2016,89 @@ typedef struct __attribute__((packed)) {
 	uint32_t lba_first;
 	uint32_t sectors;
 } mbr_part_t;
+
+/* Set up the private state of the volume fat32_mount() settled on: the
+ * I/O mutex, the root directory copy, the free count from FSInfo, the
+ * default options, and the page-cache superblock.  ST_OK or ST_NOMEM with
+ * nothing allocated. */
+static int fat32_instance_init(fat32_fs_t *fs)
+{
+	struct fat32_state *st =
+		(struct fat32_state *)kcalloc(1, sizeof(struct fat32_state));
+	if (!st)
+		return ST_NOMEM;
+	spinlock_init(&st->io_wait_lock, "fat32_io_wait");
+	st->io_locked = 0;
+	st->io_depth = 0;
+	st->io_owner = (uint64_t)-1;
+	st->root_dir_cluster = fs->root_cluster;
+	st->fat_dirty_sector = (unsigned long)-1;
+	st->free_cluster_count = (unsigned long)-1; /* assume unknown */
+	st->fsinfo_lba = 0;
+	st->uid = 0;
+	st->gid = 0;
+	st->fmask = FAT32_DEFAULT_FMASK;
+	st->dmask = FAT32_DEFAULT_DMASK;
+	st->shortname = FAT32_SHORTNAME_LOWER;
+	fs->st = st;
+
+	st->root_dir_cache = kalloc(fs->sectors_per_cluster *
+				    fs->bytes_per_sector);
+	if (st->root_dir_cache) {
+		unsigned long root_lba = cluster_to_lba(fs, fs->root_cluster);
+		unsigned long read_count =
+			fs->sectors_per_cluster ? fs->sectors_per_cluster : 1;
+		read_sectors(fs->bdev, root_lba, read_count,
+			     st->root_dir_cache);
+	}
+
+	/* ---- Read FSInfo sector to get cached free cluster count ---- */
+	if (fs->fsinfo_lba) {
+		void *fi_buf = kalloc(fat_sector_bytes(fs->bdev));
+		if (fi_buf) {
+			if (read_sectors(fs->bdev, fs->fsinfo_lba, 1, fi_buf) ==
+			    ST_OK) {
+				uint8_t *fb = (uint8_t *)fi_buf;
+				/* Validate FSInfo signatures: 0x41615252 at 0,
+				 * 0x61417272 at 484 */
+				uint32_t sig1 = *(uint32_t *)(fb + 0);
+				uint32_t sig2 = *(uint32_t *)(fb + 484);
+				if (sig1 == 0x41615252 && sig2 == 0x61417272) {
+					/* A valid FSInfo sector: the free
+					 * count goes back there. */
+					st->fsinfo_lba = fs->fsinfo_lba;
+					uint32_t free_cnt =
+						*(uint32_t *)(fb + 488);
+					if (free_cnt != 0xFFFFFFFF) {
+						st->free_cluster_count =
+							free_cnt;
+						kprintf("FAT32: FSInfo free clusters = %lu\n",
+							st->free_cluster_count);
+					}
+				}
+			}
+			kfree(fi_buf);
+		}
+	}
+
+	fat32_sb_attach(fs);
+	return ST_OK;
+}
+
+void fat32_release(fat32_fs_t *fs)
+{
+	if (!fs || !fs->st)
+		return;
+	struct fat32_state *st = fs->st;
+	WARN_ON(st->io_locked); /* released while an operation runs */
+	if (st->fat_cache)
+		kfree(st->fat_cache);
+	if (st->root_dir_cache)
+		kfree(st->root_dir_cache);
+	fs->st = NULL;
+	fs->sb.fs_private = NULL;
+	kfree(st);
+}
 
 int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 {
@@ -1975,7 +2129,7 @@ int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 		if (fat32_mount_at_lba(bdev, 0, &tmp) == ST_OK) {
 			kfree(mbr);
 			*out = tmp;
-			return ST_OK;
+			return fat32_instance_init(out);
 		}
 		/* not mountable after all: try the partition table below */
 	}
@@ -2229,14 +2383,15 @@ int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
 	if (best_set) {
 		*out = best;
 		/* selection silent (summary printed by mount_at_lba) */
-		return ST_OK;
+		return fat32_instance_init(out);
 	}
 	kprintf("FAT32: no valid FAT32 volume found on %s\n", bdev->name);
 	return ST_ERR;
 }
 
 // VFS bridge
-static int fat32_match_name(const uint8_t *raw, const char *name)
+static int fat32_match_name(fat32_fs_t *fs, const uint8_t *raw,
+			    const char *name)
 {
 	char temp[13];
 	int p = 0;
@@ -2273,26 +2428,27 @@ static int fat32_match_name(const uint8_t *raw, const char *name)
 		cmp = canon + 1;
 	else if (canon[0] == '/' && !canon[1])
 		return ST_INVALID;
-	if (!g_root_dir_cache)
+	if (!fs->st->root_dir_cache)
 		return ST_NOT_FOUND;
 	if (str_eq(cmp, temp))
 		return 1;
 	return str_eq(cmp, temp);
 }
 
-static int fat32_dir_list_internal(unsigned long start_cluster,
+static int fat32_dir_list_internal(fat32_fs_t *fs,
+				   unsigned long start_cluster,
 				   void (*cb)(const char *, unsigned,
 					      unsigned long),
 				   unsigned *out_count)
 {
-	if (!g_root_fs || !cb)
+	if (!fs || !cb)
 		return ST_INVALID;
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	FAT32_LOG(
 		"list start cluster=%lu cluster_size=%u bytes_per_sector=%u spc=%u\n",
-		start_cluster, cluster_size, g_root_fs->bytes_per_sector,
-		g_root_fs->sectors_per_cluster);
+		start_cluster, cluster_size, fs->bytes_per_sector,
+		fs->sectors_per_cluster);
 	unsigned long cluster = start_cluster;
 	unsigned listed = 0;
 	unsigned clusters = 0;
@@ -2305,9 +2461,9 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
 		void *buf = kalloc(cluster_size);
 		if (!buf)
 			return ST_NOMEM;
-		unsigned long lba = cluster_to_lba(g_root_fs, cluster);
-		int st = read_sectors(g_root_fs->bdev, lba,
-				      g_root_fs->sectors_per_cluster, buf);
+		unsigned long lba = cluster_to_lba(fs, cluster);
+		int st = read_sectors(fs->bdev, lba,
+				      fs->sectors_per_cluster, buf);
 		if (st != ST_OK) {
 			FAT32_LOG("list read err cluster=%lu lba=%lu st=%d\n",
 				  cluster, lba, st);
@@ -2408,7 +2564,7 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
 		}
 		kfree(buf);
 		unsigned long next =
-			fat32_next_cluster_cached(g_root_fs, cluster);
+			fat32_next_cluster_cached(fs, cluster);
 		if (next >= 0x0FFFFFF8 || next == 0)
 			break;
 		cluster = next;
@@ -2421,10 +2577,10 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
 	return ST_OK;
 }
 
-int fat32_dir_list(unsigned long cluster,
+int fat32_dir_list(fat32_fs_t *fs, unsigned long cluster,
 		   void (*cb)(const char *, unsigned, unsigned long))
 {
-	return fat32_dir_list_internal(cluster, cb, 0);
+	return fat32_dir_list_internal(fs, cluster, cb, 0);
 }
 
 /* Convert Unix epoch seconds to FAT32 date/time fields.
@@ -2508,21 +2664,22 @@ static uint64_t fat32_datetime_to_epoch(uint16_t date, uint16_t time_val)
 	return days * 86400 + (uint64_t)hour * 3600 + (uint64_t)min * 60 + sec;
 }
 
-// Lock-free core of fat32_dir_find — caller must hold fat32_lock or ensure
-// exclusive access.  Used by internal helpers (fat32_resolve_parent, etc.)
-// that are already called under fat32_lock.
+// Lock-free core of fat32_dir_find — caller must hold the instance's
+// fat32_io_lock.  Used by internal helpers (fat32_resolve_parent, etc.)
+// that are already called under it.
 // out_wrt_time/out_wrt_date are optional — pass NULL if not needed.
-static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
+static int fat32_dir_find_nolock(fat32_fs_t *fs, unsigned long start_cluster,
+				 const char *name,
 				 unsigned *attr, unsigned long *first_cluster,
 				 unsigned long *size, uint16_t *out_wrt_time,
 				 uint16_t *out_wrt_date)
 {
 	BUG_ON(name == NULL);
-	if (!g_root_fs || !name)
+	if (!fs || !name)
 		return ST_INVALID;
 
 	// --- Dentry cache lookup ---
-	dc_entry_t *cached = dcache_lookup(start_cluster, name);
+	dc_entry_t *cached = dcache_lookup(&fs->sb, start_cluster, name);
 	if (cached) {
 		if (cached->flags & DC_NEGATIVE)
 			return ST_NOT_FOUND;
@@ -2540,7 +2697,7 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
 	}
 
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	unsigned long cluster = start_cluster;
 	char canon[FAT32_LFN_MAX];
 	int ci = 0;
@@ -2561,8 +2718,8 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
 		if (!buf)
 			return ST_NOMEM;
 		if (read_sectors(
-			    g_root_fs->bdev, cluster_to_lba(g_root_fs, cluster),
-			    g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+			    fs->bdev, cluster_to_lba(fs, cluster),
+			    fs->sectors_per_cluster, buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
 		}
@@ -2571,7 +2728,7 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
 		for (unsigned i = 0; i < entries; i++) {
 			if (ents[i].name[0] == 0x00) {
 				kfree(buf);
-				dcache_insert_negative(start_cluster, name);
+				dcache_insert_negative(&fs->sb, start_cluster, name);
 				return ST_NOT_FOUND;
 			}
 			if (ents[i].name[0] == 0xE5)
@@ -2654,16 +2811,17 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
 			lname[li] = '\0';
 			if (str_eq(lname, canon)) {
 				unsigned int found_attr = ents[i].attr;
-				unsigned long found_fc =
+				unsigned long found_fc = fat32_dotdot_target(
+					fs, &ents[i],
 					((unsigned long)ents[i].fstClusHI
 					 << 16) |
-					ents[i].fstClusLO;
+						ents[i].fstClusLO);
 				unsigned long found_sz = ents[i].fileSize;
 				uint16_t found_wt = ents[i].wrtTime;
 				uint16_t found_wd = ents[i].wrtDate;
 				kfree(buf);
 				// Insert into dentry cache
-				dcache_insert(start_cluster, name, found_fc,
+				dcache_insert(&fs->sb, start_cluster, name, found_fc,
 					      found_sz, found_attr, found_wt,
 					      found_wd, cluster, i, 0, 0);
 				if (attr)
@@ -2683,38 +2841,43 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
 		}
 		kfree(buf);
 		unsigned long next =
-			fat32_next_cluster_cached(g_root_fs, cluster);
+			fat32_next_cluster_cached(fs, cluster);
 		if (next >= 0x0FFFFFF8 || next == 0)
 			break;
 		cluster = next;
 	}
-	dcache_insert_negative(start_cluster, name);
+	dcache_insert_negative(&fs->sb, start_cluster, name);
 	return ST_NOT_FOUND;
 }
 
-// Public API: acquires fat32_lock, then delegates to nolock version.
-int fat32_dir_find(unsigned long start_cluster, const char *name,
-		   unsigned *attr, unsigned long *first_cluster,
-		   unsigned long *size)
+/* Public API: takes the instance's I/O mutex, then delegates to the nolock
+ * version.  (The lookup reads the disk and allocates, so it may sleep: the
+ * sleeping mutex is the lock that serialises it with the other operations
+ * on the volume; a spinlock with interrupts off cannot be held across it.) */
+int fat32_dir_find(fat32_fs_t *fs, unsigned long start_cluster,
+		   const char *name, unsigned *attr,
+		   unsigned long *first_cluster, unsigned long *size)
 {
-	uint64_t flags;
-	spin_lock_irqsave(&fat32_lock, &flags);
-	int ret = fat32_dir_find_nolock(start_cluster, name, attr,
+	if (!fs || !fs->st)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int ret = fat32_dir_find_nolock(fs, start_cluster, name, attr,
 					first_cluster, size, NULL, NULL);
-	spin_unlock_irqrestore(&fat32_lock, flags);
+	fat32_io_unlock(fs);
 	return ret;
 }
 
-static int fat32_path_resolve(const char *path, unsigned *attr,
+static int fat32_path_resolve(fat32_fs_t *fs, const char *path,
+			      unsigned *attr,
 			      unsigned long *first_cluster, unsigned long *size)
 {
-	if (!g_root_fs || !path)
+	if (!fs || !path)
 		return ST_INVALID;
 	if (path[0] == '/')
 		path++;
 	if (!*path)
 		return ST_INVALID;
-	unsigned long current = g_root_dir_cluster;
+	unsigned long current = fs->st->root_dir_cluster;
 	const char *seg = path;
 	char part[FAT32_LFN_MAX];
 	while (*seg) {
@@ -2728,7 +2891,7 @@ static int fat32_path_resolve(const char *path, unsigned *attr,
 		unsigned a;
 		unsigned long fc;
 		unsigned long sz;
-		if (fat32_dir_find_nolock(current, part, &a, &fc, &sz, NULL,
+		if (fat32_dir_find_nolock(fs, current, part, &a, &fc, &sz, NULL,
 					  NULL) != ST_OK)
 			return ST_NOT_FOUND;
 		if (*seg == '/') {
@@ -2760,16 +2923,16 @@ static int fat32_path_resolve(const char *path, unsigned *attr,
 }
 
 // Extended resolution supporting relative paths, '.' and '..' ( '..' limited: returns root for now )
-int fat32_resolve_path(unsigned long start_cluster, const char *path,
-		       unsigned *attr, unsigned long *first_cluster,
-		       unsigned long *size)
+int fat32_resolve_path(fat32_fs_t *fs, unsigned long start_cluster,
+		       const char *path, unsigned *attr,
+		       unsigned long *first_cluster, unsigned long *size)
 {
-	if (!g_root_fs || !path)
+	if (!fs || !path)
 		return ST_INVALID;
 	unsigned long current =
-		(start_cluster == 0) ? g_root_dir_cluster : start_cluster;
+		(start_cluster == 0) ? fs->st->root_dir_cluster : start_cluster;
 	if (path[0] == '/') {
-		current = g_root_dir_cluster;
+		current = fs->st->root_dir_cluster;
 		path++;
 	}
 	if (!*path) {
@@ -2803,12 +2966,12 @@ int fat32_resolve_path(unsigned long start_cluster, const char *path,
 			/* stay */
 		} else if (part[0] == '.' && part[1] == '.' &&
 			   part[2] == '\0') {
-			current = fat32_parent_cluster(current);
+			current = fat32_parent_cluster(fs, current);
 		} else {
 			unsigned a;
 			unsigned long fc;
 			unsigned long sz;
-			if (fat32_dir_find_nolock(current, part, &a, &fc, &sz,
+			if (fat32_dir_find_nolock(fs, current, part, &a, &fc, &sz,
 						  NULL, NULL) != ST_OK)
 				return ST_NOT_FOUND;
 			if (*seg == '/') {
@@ -2848,27 +3011,28 @@ int fat32_resolve_path(unsigned long start_cluster, const char *path,
 	return ST_OK;
 }
 
-int fat32_stat(unsigned long start_cluster, const char *path, unsigned *attr,
-	       unsigned long *first_cluster, unsigned long *size)
+int fat32_stat(fat32_fs_t *fs, unsigned long start_cluster, const char *path,
+	       unsigned *attr, unsigned long *first_cluster,
+	       unsigned long *size)
 {
-	return fat32_resolve_path(start_cluster, path, attr, first_cluster,
+	return fat32_resolve_path(fs, start_cluster, path, attr, first_cluster,
 				  size);
 }
 
-unsigned long fat32_parent_cluster(unsigned long dir_cluster)
+unsigned long fat32_parent_cluster(fat32_fs_t *fs, unsigned long dir_cluster)
 {
-	if (dir_cluster == g_root_dir_cluster || dir_cluster == 0)
-		return g_root_dir_cluster;
+	if (dir_cluster == fs->st->root_dir_cluster || dir_cluster == 0)
+		return fs->st->root_dir_cluster;
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	void *buf = kalloc(cluster_size);
 	if (!buf)
-		return g_root_dir_cluster;
-	if (read_sectors(g_root_fs->bdev,
-			 cluster_to_lba(g_root_fs, dir_cluster),
-			 g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+		return fs->st->root_dir_cluster;
+	if (read_sectors(fs->bdev,
+			 cluster_to_lba(fs, dir_cluster),
+			 fs->sectors_per_cluster, buf) != ST_OK) {
 		kfree(buf);
-		return g_root_dir_cluster;
+		return fs->st->root_dir_cluster;
 	}
 	fat32_dirent_t *ents = (fat32_dirent_t *)buf;
 	unsigned i;
@@ -2885,19 +3049,21 @@ unsigned long fat32_parent_cluster(unsigned long dir_cluster)
 					 << 16) |
 					ents[i].fstClusLO;
 				if (parent == 0)
-					parent = g_root_dir_cluster;
+					parent = fs->st->root_dir_cluster;
 				kfree(buf);
 				return parent;
 			}
 		}
 	}
 	kfree(buf);
-	return g_root_dir_cluster;
+	return fs->st->root_dir_cluster;
 }
 
 // Forward declare _impl functions (unlocked, internal)
-static int fat32_open_impl(const char *path, int flags, vfs_file_t **out);
-static int fat32_stat_vfs_impl(const char *path, struct kstat *st);
+static int fat32_open_impl(fat32_fs_t *fs, const char *path, int flags,
+			   vfs_file_t **out);
+static int fat32_stat_vfs_impl(fat32_fs_t *fs, const char *path,
+			       struct kstat *st);
 static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes);
 static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes);
 static long fat32_seek_impl(vfs_file_t *f, long offset, int whence);
@@ -2906,35 +3072,39 @@ static int fat32_truncate_impl(vfs_file_t *f, unsigned long size);
 /* close() acquires fat32_io_lock now since it does disk I/O (deferred
  * dirent update + FAT flush).  Forward decl of the locked wrapper. */
 static int fat32_close(vfs_file_t *f);
-static int fat32_unlink_impl(const char *path);
-static int fat32_rename_impl(const char *oldpath, const char *newpath);
-static int fat32_mkdir_impl(const char *path, unsigned int mode);
-static int fat32_rmdir_impl(const char *path);
-static int fat32_chdir_impl(const char *path);
-static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
+static int fat32_unlink_impl(fat32_fs_t *fs, const char *path);
+static int fat32_rename_impl(fat32_fs_t *fs, const char *oldpath,
+			     const char *newpath);
+static int fat32_mkdir_impl(fat32_fs_t *fs, const char *path,
+			    unsigned int mode);
+static int fat32_rmdir_impl(fat32_fs_t *fs, const char *path);
+static int fat32_chdir_impl(fat32_fs_t *fs, const char *path);
+static int fat32_resolve_parent(fat32_fs_t *fs, unsigned long start_cluster,
+				const char *path,
 				unsigned long *parent_cluster, char *name_out,
 				unsigned name_out_len);
 
-/* fat32_utimensat_impl - Update mtime (wrtTime/wrtDate) of a file on FAT32.
- * times[0] = atime (FAT32 has no atime field, ignored)
- * times[1] = mtime
- * If times is NULL, set mtime to current time (use timer_get_epoch()).
- * tv_nsec == KRN_UTIME_OMIT: leave that timestamp unchanged.
- * tv_nsec == KRN_UTIME_NOW: set to current time.
+/* fat32_utimensat_impl - Update the times of a file on FAT32.
+ * mtime goes to the modification time and date (wrtTime/wrtDate) and, as it
+ * always has, to the last-access date; an atime given on its own sets the
+ * last-access date (FAT keeps no access time of day).
+ * *_nsec == KRN_UTIME_OMIT: leave that timestamp unchanged.
+ * *_nsec == KRN_UTIME_NOW: set to current time.
  */
-static int fat32_utimensat_impl(const char *path, int64_t mtime_sec,
-				long mtime_nsec)
+static int fat32_utimensat_impl(fat32_fs_t *fs, const char *path,
+				int64_t atime_sec, long atime_nsec,
+				int64_t mtime_sec, long mtime_nsec)
 {
-	if (!g_root_fs || !path)
+	if (!fs || !path)
 		return ST_INVALID;
 
 	/* Resolve parent cluster + final component name */
-	unsigned long start_cluster = fat32_get_task_cwd_cluster();
-	const char *rpath = fat32_normalize_start(path, &start_cluster);
+	unsigned long start_cluster = fat32_get_task_cwd_cluster(fs);
+	const char *rpath = fat32_normalize_start(fs, path, &start_cluster);
 
 	unsigned long parent_cluster = 0;
 	char name[FAT32_LFN_MAX];
-	if (fat32_resolve_parent(start_cluster, rpath, &parent_cluster, name,
+	if (fat32_resolve_parent(fs, start_cluster, rpath, &parent_cluster, name,
 				 sizeof(name)) != ST_OK)
 		return ST_NOT_FOUND;
 
@@ -2943,67 +3113,110 @@ static int fat32_utimensat_impl(const char *path, int64_t mtime_sec,
 	unsigned long fc = 0, sz = 0;
 	unsigned long dir_cluster = 0;
 	unsigned int dir_index = 0;
-	if (fat32_dir_find_entry_lfn(parent_cluster, name, &attr, &fc, &sz,
+	if (fat32_dir_find_entry_lfn(fs, parent_cluster, name, &attr, &fc, &sz,
 				     &dir_cluster, &dir_index, NULL,
 				     NULL) != ST_OK)
 		return ST_NOT_FOUND;
 
-	/* Determine the new mtime */
-	uint16_t new_date, new_time;
-	if (mtime_nsec == KRN_UTIME_OMIT) {
-		/* Caller wants to leave mtime unchanged — nothing to do */
+	/* Determine the new mtime and access date */
+	uint16_t new_date = 0, new_time = 0, acc_date = 0, acc_time;
+	int set_m = (mtime_nsec != KRN_UTIME_OMIT);
+	int set_a = (atime_nsec != KRN_UTIME_OMIT);
+	if (!set_m && !set_a) {
+		/* Caller wants to leave both unchanged — nothing to do */
 		return ST_OK;
-	} else if (mtime_nsec == KRN_UTIME_NOW) {
-		uint64_t now = timer_get_epoch();
-		fat32_epoch_to_datetime(now, &new_date, &new_time);
-	} else {
-		fat32_epoch_to_datetime((uint64_t)mtime_sec, &new_date,
-					&new_time);
+	}
+	if (set_m) {
+		if (mtime_nsec == KRN_UTIME_NOW) {
+			uint64_t now = timer_get_epoch();
+			fat32_epoch_to_datetime(now, &new_date, &new_time);
+		} else {
+			fat32_epoch_to_datetime((uint64_t)mtime_sec, &new_date,
+						&new_time);
+		}
+		acc_date = new_date;
+	}
+	if (set_a) {
+		if (atime_nsec == KRN_UTIME_NOW)
+			fat32_epoch_to_datetime(timer_get_epoch(), &acc_date,
+						&acc_time);
+		else
+			fat32_epoch_to_datetime((uint64_t)atime_sec, &acc_date,
+						&acc_time);
 	}
 
 	/* Read the cluster containing the dirent, update timestamps, write back */
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	void *buf = kalloc(cluster_size);
 	if (!buf)
 		return ST_NOMEM;
 
-	unsigned long lba = cluster_to_lba(g_root_fs, dir_cluster);
-	if (read_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster,
+	unsigned long lba = cluster_to_lba(fs, dir_cluster);
+	if (read_sectors(fs->bdev, lba, fs->sectors_per_cluster,
 			 buf) != ST_OK) {
 		kfree(buf);
 		return ST_IO;
 	}
 
 	fat32_dirent_t *ents = (fat32_dirent_t *)buf;
-	ents[dir_index].wrtTime = new_time;
-	ents[dir_index].wrtDate = new_date;
-	ents[dir_index].lstAccDate = new_date;
+	if (set_m) {
+		ents[dir_index].wrtTime = new_time;
+		ents[dir_index].wrtDate = new_date;
+	}
+	ents[dir_index].lstAccDate = acc_date;
 
-	int st = write_sectors(g_root_fs->bdev, lba,
-			       g_root_fs->sectors_per_cluster, buf);
+	int st = write_sectors(fs->bdev, lba,
+			       fs->sectors_per_cluster, buf);
 	kfree(buf);
 
 	/* Invalidate dentry cache so next stat re-reads from disk */
-	dcache_invalidate(parent_cluster, name);
+	dcache_invalidate(&fs->sb, parent_cluster, name);
 
 	return st;
 }
 
-// Locked wrappers: serialize all FAT32 VFS operations via the sleeping mutex
-// to protect the shared FAT cache (g_fat_cache) from SMP races.
-static int fat32_open(const char *path, int flags, vfs_file_t **out)
+/* The instance a VFS path operation is for (the mount's), and the one an
+ * open file is on (recorded in the handle at open). */
+static inline fat32_fs_t *fat32_fs_of(vfs_mount_t *m)
 {
-	fat32_io_lock();
-	int r = fat32_open_impl(path, flags, out);
-	fat32_io_unlock();
+	fat32_fs_t *fs = m ? (fat32_fs_t *)m->fs_data : NULL;
+	return (fs && fs->st) ? fs : NULL;
+}
+static inline fat32_fs_t *fat32_fs_of_file(vfs_file_t *f)
+{
+	fat32_file_t *ff = f ? (fat32_file_t *)f->fs_private : NULL;
+	return (ff && ff->fs && ff->fs->st) ? ff->fs : NULL;
+}
+
+/* The permission bits stat reports for a file or a directory of `fs'. */
+static uint32_t fat32_mode_bits(const fat32_fs_t *fs, int is_dir)
+{
+	return 0777u & ~(is_dir ? fs->st->dmask : fs->st->fmask);
+}
+
+// Locked wrappers: serialize all FAT32 VFS operations on one volume via its
+// sleeping mutex to protect its FAT cache window (fs->st->fat_cache) from SMP
+// races.
+static int fat32_open(vfs_mount_t *m, const char *path, int flags,
+		      vfs_file_t **out)
+{
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_open_impl(fs, path, flags, out);
+	fat32_io_unlock(fs);
 	return r;
 }
-static int fat32_stat_vfs(const char *path, struct kstat *st)
+static int fat32_stat_vfs(vfs_mount_t *m, const char *path, struct kstat *st)
 {
-	fat32_io_lock();
-	int r = fat32_stat_vfs_impl(path, st);
-	fat32_io_unlock();
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_stat_vfs_impl(fs, path, st);
+	fat32_io_unlock(fs);
 	return r;
 }
 /* fstat on an open handle: report size + type straight from the in-memory file
@@ -3016,19 +3229,28 @@ static int fat32_fstat(vfs_file_t *f, struct kstat *st)
 		return ST_INVALID;
 	fat32_file_t *ff =
 		(fat32_file_t *)f; /* vfs_file_t is the first member */
+	fat32_fs_t *fs = (ff->fs && ff->fs->st) ? ff->fs : NULL;
 	mm_memset(st, 0, sizeof(*st));
 	st->st_nlink = 1;
-	st->st_blksize = g_root_fs ? (uint64_t)g_root_fs->sectors_per_cluster *
-					     g_root_fs->bytes_per_sector :
-				     4096;
+	st->st_blksize = fs ? (uint64_t)fs->sectors_per_cluster *
+				      fs->bytes_per_sector :
+			      4096;
 	st->st_ino = ff->start_cluster;
 	if (ff->is_dir) {
-		st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
-					 S_IXGRP | S_IROTH | S_IXOTH);
+		st->st_mode = S_IFDIR |
+			      (fs ? fat32_mode_bits(fs, 1) :
+				    (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
+				     S_IXGRP | S_IROTH | S_IXOTH));
 	} else {
-		st->st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+		st->st_mode = S_IFREG |
+			      (fs ? fat32_mode_bits(fs, 0) :
+				    (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH));
 		st->st_size = (long)ff->size;
 		st->st_blocks = (long)((ff->size + 511) / 512);
+	}
+	if (fs) {
+		st->st_uid = fs->st->uid;
+		st->st_gid = fs->st->gid;
 	}
 	uint64_t now = timer_get_epoch();
 	st->st_mtime = now;
@@ -3038,94 +3260,134 @@ static int fat32_fstat(vfs_file_t *f, struct kstat *st)
 }
 static long fat32_read(vfs_file_t *f, void *buf, long bytes)
 {
-	fat32_io_lock();
+	fat32_fs_t *fs = fat32_fs_of_file(f);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
 	long r = fat32_read_impl(f, buf, bytes);
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	return r;
 }
 static long fat32_write(vfs_file_t *f, const void *buf, long bytes)
 {
-	fat32_io_lock();
+	fat32_fs_t *fs = fat32_fs_of_file(f);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
 	long r = fat32_write_impl(f, buf, bytes);
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	return r;
 }
 static long fat32_seek(vfs_file_t *f, long offset, int whence)
 {
-	fat32_io_lock();
+	fat32_fs_t *fs = fat32_fs_of_file(f);
+	if (!fs)
+		return -1;
+	fat32_io_lock(fs);
 	long r = fat32_seek_impl(f, offset, whence);
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	return r;
 }
 static long fat32_readdir(vfs_file_t *f, void *buf, long bytes)
 {
-	fat32_io_lock();
+	fat32_fs_t *fs = fat32_fs_of_file(f);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
 	long r = fat32_readdir_impl(f, buf, bytes);
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	return r;
 }
 static int fat32_truncate(vfs_file_t *f, unsigned long size)
 {
-	fat32_io_lock();
+	fat32_fs_t *fs = fat32_fs_of_file(f);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
 	int r = fat32_truncate_impl(f, size);
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	return r;
 }
-static int fat32_unlink(const char *path)
+static int fat32_unlink(vfs_mount_t *m, const char *path)
 {
-	fat32_io_lock();
-	int r = fat32_unlink_impl(path);
-	fat32_io_unlock();
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_unlink_impl(fs, path);
+	fat32_io_unlock(fs);
 	return r;
 }
-static int fat32_rename(const char *oldpath, const char *newpath)
+static int fat32_rename(vfs_mount_t *m, const char *oldpath,
+			const char *newpath)
 {
-	fat32_io_lock();
-	int r = fat32_rename_impl(oldpath, newpath);
-	fat32_io_unlock();
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_rename_impl(fs, oldpath, newpath);
+	fat32_io_unlock(fs);
 	return r;
 }
-static int fat32_mkdir(const char *path, unsigned int mode)
+static int fat32_mkdir(vfs_mount_t *m, const char *path, unsigned int mode)
 {
-	fat32_io_lock();
-	int r = fat32_mkdir_impl(path, mode);
-	fat32_io_unlock();
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_mkdir_impl(fs, path, mode);
+	fat32_io_unlock(fs);
 	return r;
 }
-static int fat32_rmdir(const char *path)
+static int fat32_rmdir(vfs_mount_t *m, const char *path)
 {
-	fat32_io_lock();
-	int r = fat32_rmdir_impl(path);
-	fat32_io_unlock();
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_rmdir_impl(fs, path);
+	fat32_io_unlock(fs);
 	return r;
 }
-static int fat32_chdir(const char *path)
+static int fat32_chdir(vfs_mount_t *m, const char *path)
 {
-	fat32_io_lock();
-	int r = fat32_chdir_impl(path);
-	fat32_io_unlock();
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_chdir_impl(fs, path);
+	fat32_io_unlock(fs);
 	return r;
 }
-int fat32_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
+/* FAT keeps a modification time and a last-access DATE; no others. */
+static int fat32_utimens(vfs_mount_t *m, const char *path, int nofollow,
+			 const struct vfs_utimes *t)
 {
-	fat32_io_lock();
-	int r = fat32_utimensat_impl(path, mtime_sec, mtime_nsec);
-	fat32_io_unlock();
+	(void)nofollow; /* no symbolic links on FAT */
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs || !t)
+		return ST_INVALID;
+	fat32_io_lock(fs);
+	int r = fat32_utimensat_impl(fs, path, t->atime_sec, t->atime_nsec,
+				     t->mtime_sec, t->mtime_nsec);
+	fat32_io_unlock(fs);
 	return r;
 }
 
-static int fat32_release_locks_for_task(uint64_t task_id)
+static int fat32_release_locks_for_task(vfs_mount_t *m, uint64_t task_id)
 {
-	int released = fat32_io_release_if_owner(task_id);
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return 0;
+	int released = fat32_io_release_if_owner(fs, task_id);
 	/* Also release any per-device block-layer sleeping locks the dying
      * task may have been holding (nested inside fat32_io_lock — e.g.
      * usb_msd's io_locked acquired by read_sectors/write_sectors).
      * Without this, the FAT lock recovers but every subsequent USB I/O
      * still hangs on the orphaned MSD mutex. */
-	if (g_root_fs && g_root_fs->bdev &&
-	    g_root_fs->bdev->release_locks_for_task) {
-		released |= g_root_fs->bdev->release_locks_for_task(
-			(block_device_t *)g_root_fs->bdev, task_id);
+	if (fs->bdev && fs->bdev->release_locks_for_task) {
+		released |= fs->bdev->release_locks_for_task(
+			(block_device_t *)fs->bdev, task_id);
 	}
 	return released;
 }
@@ -3141,9 +3403,12 @@ static int fat32_close(vfs_file_t *f)
      * a sibling operation that then writes back its own version,
      * silently dropping our update — observed as "ls shows old size
      * after curl re-downloaded over an existing file". */
-	fat32_io_lock();
+	fat32_fs_t *fs = fat32_fs_of_file(f);
+	if (!fs)
+		return fat32_close_impl(f); /* nothing on disk to touch */
+	fat32_io_lock(fs);
 	int r = fat32_close_impl(f);
-	fat32_io_unlock();
+	fat32_io_unlock(fs);
 	return r;
 }
 
@@ -3153,22 +3418,79 @@ static int fat32_fsync(vfs_file_t *f)
 	if (!f)
 		return 0;
 	fat32_file_t *ff = (fat32_file_t *)f->fs_private;
-	if (ff && ff->start_cluster >= 2) {
-		pagecache_flush_file(ff->start_cluster);
+	if (ff && ff->fs && ff->start_cluster >= 2) {
+		pagecache_flush_file(&ff->fs->sb, ff->start_cluster);
 		if (ff->inode)
 			icache_flush((ic_inode_t *)ff->inode);
 	}
 	return 0;
 }
 
-/* Fill the generic statfs struct from the FAT32-native one. */
-static int fat32_statfs_op(struct vfs_statfs *out)
+/* Store the free cluster count in the FSInfo sector when it changed since
+ * it was last stored (the next-free hint there is left as it is: it is only
+ * a hint).  Caller holds the instance's I/O mutex. */
+static int fat32_fsinfo_write(fat32_fs_t *fs)
 {
-	if (!out)
+	struct fat32_state *st = fs->st;
+	if (!st->fsinfo_lba || !st->fsinfo_dirty ||
+	    st->free_cluster_count == (unsigned long)-1)
+		return ST_OK;
+	void *buf = kalloc(fat_sector_bytes(fs->bdev));
+	if (!buf)
+		return ST_NOMEM;
+	int r = read_sectors(fs->bdev, st->fsinfo_lba, 1, buf);
+	if (r == ST_OK) {
+		uint8_t *fb = (uint8_t *)buf;
+		/* Still the FSInfo sector it was at mount time? */
+		if (*(uint32_t *)(fb + 0) == 0x41615252 &&
+		    *(uint32_t *)(fb + 484) == 0x61417272) {
+			*(uint32_t *)(fb + 488) =
+				(uint32_t)st->free_cluster_count;
+			r = write_sectors(fs->bdev, st->fsinfo_lba, 1, buf);
+			if (r == ST_OK)
+				st->fsinfo_dirty = 0;
+		} else {
+			st->fsinfo_lba = 0; /* gone: stop maintaining it */
+		}
+	}
+	kfree(buf);
+	return r;
+}
+
+/* Write what the volume keeps back in memory: the deferred FAT sector and
+ * the FSInfo free count.  (File data and directory entries are the page
+ * cache's and the inode cache's, stored before this by the VFS; the
+ * device's own cache is flushed after it.) */
+static int fat32_sync_fs(fat32_fs_t *fs)
+{
+	fat32_io_lock(fs);
+	if (fs->st->read_only) {
+		fat32_io_unlock(fs);
+		return ST_OK;
+	}
+	int r = fat32_fat_flush_pending(fs);
+	int r2 = fat32_fsinfo_write(fs);
+	fat32_io_unlock(fs);
+	return r != ST_OK ? r : r2;
+}
+
+static int fat32_sync_op(vfs_mount_t *m)
+{
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!fs)
+		return ST_INVALID;
+	return fat32_sync_fs(fs);
+}
+
+/* Fill the generic statfs struct from the FAT32-native one. */
+static int fat32_statfs_op(vfs_mount_t *m, struct vfs_statfs *out)
+{
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (!out || !fs)
 		return ST_INVALID;
 	fat32_statfs_t k;
 	mm_memset(&k, 0, sizeof(k));
-	if (fat32_get_statfs(&k) != 0)
+	if (fat32_get_statfs(fs, &k) != 0)
 		return ST_IO;
 	out->f_type = k.f_type;
 	out->f_bsize = k.f_bsize;
@@ -3183,24 +3505,31 @@ static int fat32_statfs_op(struct vfs_statfs *out)
 	return ST_OK;
 }
 
-/* FAT32 stores no ownership or permission bits, so it emulates a fully
- * permissive policy: every user may read and traverse (and, lacking any owner,
- * write) any file or directory.  A future mount option could instead stamp the
- * files with the mounting user's uid/gid.  Returning ST_OK makes the VFS
- * permission check allow the access outright, before the generic mode-bit
- * check the emulated metadata would otherwise drive. */
-static int fat32_permission_op(const char *path, unsigned long ino, int want)
+/* FAT32 stores no ownership or permission bits.  Mounted without ownership
+ * options (the root filesystem, or a mount with none of uid=, gid=, umask=,
+ * fmask=, dmask=) it emulates a fully permissive policy: every user may read
+ * and traverse (and, lacking any owner, write) any file or directory, and
+ * ST_OK makes the VFS permission check allow the access outright, before the
+ * generic mode-bit check the emulated metadata would otherwise drive.  With
+ * any of those options the owner and mode bits stat reports are the
+ * mounter's statement of who may do what, so the decision is left to the
+ * generic check of exactly those bits (ST_UNSUPPORTED). */
+static int fat32_permission_op(vfs_mount_t *m, const char *path,
+			       unsigned long ino, int want)
 {
 	(void)path;
 	(void)ino;
 	(void)want;
+	fat32_fs_t *fs = fat32_fs_of(m);
+	if (fs && fs->st->perm_opts)
+		return ST_UNSUPPORTED; /* the reported uid/gid/mode decide */
 	return ST_OK; /* no on-disk perms: allow everyone */
 }
 
-/* FAT32 has no symlinks, hard links, permission bits or ownership, so those
- * ops stay NULL — the vfs_* wrappers then apply the legacy fallbacks (chmod/
- * chown succeed silently, symlink/link report unsupported, lstat == stat).
- * The permission op above makes access permissive for all users. */
+/* FAT32 has no symlinks, hard links, device nodes, permission bits or
+ * ownership, so those ops stay NULL — the vfs_* wrappers then apply the
+ * legacy fallbacks (chmod/chown succeed silently, symlink/link/mknod report
+ * unsupported, lstat == stat).  The permission op above decides access. */
 static const vfs_ops_t fat32_vfs_ops = {
 	.open = fat32_open,
 	.stat = fat32_stat_vfs,
@@ -3217,23 +3546,24 @@ static const vfs_ops_t fat32_vfs_ops = {
 	.close = fat32_close,
 	.release_locks_for_task = fat32_release_locks_for_task,
 	.fsync = fat32_fsync,
-	.utimensat = fat32_utimensat,
+	.utimens = fat32_utimens,
 	.statfs = fat32_statfs_op,
 	.fstat = fat32_fstat,
 	.permission = fat32_permission_op,
+	.sync = fat32_sync_op,
 };
 
-static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
-				unsigned long *parent_cluster, char *name_out,
-				unsigned name_out_len)
+static int fat32_resolve_parent(fat32_fs_t *fs, unsigned long start_cluster,
+				const char *path, unsigned long *parent_cluster,
+				char *name_out, unsigned name_out_len)
 {
-	if (!g_root_fs || !path || !parent_cluster || !name_out ||
+	if (!fs || !path || !parent_cluster || !name_out ||
 	    name_out_len < 2)
 		return ST_INVALID;
 	unsigned long current =
-		(start_cluster == 0) ? g_root_dir_cluster : start_cluster;
+		(start_cluster == 0) ? fs->st->root_dir_cluster : start_cluster;
 	if (path[0] == '/') {
-		current = g_root_dir_cluster;
+		current = fs->st->root_dir_cluster;
 		path++;
 	}
 	if (!*path)
@@ -3252,7 +3582,7 @@ static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
 			unsigned a;
 			unsigned long fc;
 			unsigned long sz;
-			if (fat32_dir_find_nolock(current, part, &a, &fc, &sz,
+			if (fat32_dir_find_nolock(fs, current, part, &a, &fc, &sz,
 						  NULL, NULL) != ST_OK)
 				return ST_NOT_FOUND;
 			if (!(a & FAT32_ATTR_DIRECTORY))
@@ -3304,7 +3634,7 @@ static int fat32_update_dirent(fat32_file_t *ff)
      * re-reads from disk; otherwise ls keeps showing the pre-truncate
      * size even though the dirent on disk is correct. */
 	if (ff->parent_cluster)
-		dcache_invalidate_dir(ff->parent_cluster);
+		dcache_invalidate_dir(&ff->fs->sb, ff->parent_cluster);
 	return st;
 }
 
@@ -3338,30 +3668,31 @@ static int fat32_set_position(fat32_file_t *ff, unsigned long target_pos)
 	return ST_OK;
 }
 
-static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
+static int fat32_open_impl(fat32_fs_t *fs, const char *path, int flags,
+			   vfs_file_t **out)
 {
 	if (!out)
 		return ST_INVALID;
 	if (!path || !path[0])
 		return ST_INVALID;
-	unsigned long start_cluster = fat32_get_task_cwd_cluster();
-	const char *rpath = fat32_normalize_start(path, &start_cluster);
+	unsigned long start_cluster = fat32_get_task_cwd_cluster(fs);
+	const char *rpath = fat32_normalize_start(fs, path, &start_cluster);
 
 	// Directory open handling
 	if (kstrcmp(path, "/") == 0 || kstrcmp(path, ".") == 0 ||
 	    kstrcmp(path, "..") == 0 || (rpath && rpath[0] == '\0')) {
-		unsigned long dir_cluster = fat32_root_cluster();
+		unsigned long dir_cluster = fat32_root_cluster(fs);
 		if (kstrcmp(path, ".") == 0) {
-			dir_cluster = fat32_get_task_cwd_cluster();
+			dir_cluster = fat32_get_task_cwd_cluster(fs);
 		} else if (kstrcmp(path, "..") == 0) {
-			unsigned long cur = fat32_get_task_cwd_cluster();
-			dir_cluster = fat32_parent_cluster(cur);
+			unsigned long cur = fat32_get_task_cwd_cluster(fs);
+			dir_cluster = fat32_parent_cluster(fs, cur);
 		}
 		fat32_file_t *ff = (fat32_file_t *)kalloc(sizeof(fat32_file_t));
 		if (!ff)
 			return ST_NOMEM;
 		mm_memset(ff, 0, sizeof(fat32_file_t));
-		ff->fs = g_root_fs;
+		ff->fs = fs;
 		ff->start_cluster = dir_cluster;
 		ff->current_cluster = dir_cluster;
 		ff->size = 0;
@@ -3378,13 +3709,13 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 	unsigned attr = 0;
 	unsigned long fc = 0;
 	unsigned long size = 0;
-	int res = fat32_resolve_path(start_cluster, rpath, &attr, &fc, &size);
+	int res = fat32_resolve_path(fs, start_cluster, rpath, &attr, &fc, &size);
 	if (res == ST_OK && (attr & FAT32_ATTR_DIRECTORY)) {
 		fat32_file_t *ff = (fat32_file_t *)kalloc(sizeof(fat32_file_t));
 		if (!ff)
 			return ST_NOMEM;
 		mm_memset(ff, 0, sizeof(fat32_file_t));
-		ff->fs = g_root_fs;
+		ff->fs = fs;
 		ff->start_cluster = fc;
 		ff->current_cluster = fc;
 		ff->size = 0;
@@ -3400,7 +3731,7 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 	unsigned long parent = 0;
 	char name[256]; // Increased for LFN support
 	name[0] = '\0';
-	if (fat32_resolve_parent(start_cluster, rpath, &parent, name,
+	if (fat32_resolve_parent(fs, start_cluster, rpath, &parent, name,
 				 sizeof(name)) != ST_OK)
 		return ST_NOT_FOUND;
 
@@ -3416,7 +3747,7 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 	unsigned int dir_index = 0;
 	unsigned long lfn_start_cluster = 0;
 	unsigned int lfn_start_index = 0;
-	int found = (fat32_dir_find_entry_lfn(parent, name, &attr, &fc, &size,
+	int found = (fat32_dir_find_entry_lfn(fs, parent, name, &attr, &fc, &size,
 					      &dir_cluster, &dir_index,
 					      &lfn_start_cluster,
 					      &lfn_start_index) == ST_OK);
@@ -3428,7 +3759,7 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 		// Create new entry with LFN if needed
 		int entries_needed =
 			fname.lfn_entries + 1; // LFN entries + short entry
-		if (fat32_dir_find_free_entries(parent, entries_needed,
+		if (fat32_dir_find_free_entries(fs, parent, entries_needed,
 						&dir_cluster,
 						&dir_index) != ST_OK)
 			return ST_IO;
@@ -3444,18 +3775,18 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 
 		if (fname.lfn_entries > 0) {
 			// Write LFN entries + short entry
-			if (fat32_write_lfn_entries(dir_cluster, dir_index,
+			if (fat32_write_lfn_entries(fs, dir_cluster, dir_index,
 						    &fname, &ent) != ST_OK)
 				return ST_IO;
 			// Update dir_index to point to the short entry
 			unsigned entries_per_cluster =
-				(g_root_fs->sectors_per_cluster *
-				 g_root_fs->bytes_per_sector) /
+				(fs->sectors_per_cluster *
+				 fs->bytes_per_sector) /
 				sizeof(fat32_dirent_t);
 			unsigned total_offset = dir_index + fname.lfn_entries;
 			while (total_offset >= entries_per_cluster) {
 				unsigned long next = fat32_next_cluster_cached(
-					g_root_fs, dir_cluster);
+					fs, dir_cluster);
 				if (next >= 0x0FFFFFF8 || next == 0)
 					break;
 				dir_cluster = next;
@@ -3463,7 +3794,7 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 			}
 			dir_index = total_offset;
 		} else {
-			if (fat32_write_dirent(dir_cluster, dir_index, &ent) !=
+			if (fat32_write_dirent(fs, dir_cluster, dir_index, &ent) !=
 			    ST_OK)
 				return ST_IO;
 		}
@@ -3472,15 +3803,15 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 		size = 0;
 		lfn_start_cluster = dir_cluster;
 		lfn_start_index = dir_index;
-		dcache_invalidate_dir(parent);
+		dcache_invalidate_dir(&fs->sb, parent);
 	} else {
 		if (attr & FAT32_ATTR_DIRECTORY)
 			return ST_UNSUPPORTED;
 		if (flags & O_TRUNC) {
 			if (fc >= 2) {
-				pagecache_invalidate_file(fc);
-				icache_chain_invalidate(fc);
-				fat32_free_chain(g_root_fs, fc);
+				pagecache_invalidate_file(&fs->sb, fc);
+				icache_chain_invalidate(&fs->sb, fc);
+				fat32_free_chain(fs, fc);
 			}
 			fc = 0;
 			size = 0;
@@ -3491,7 +3822,7 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 	if (!ff)
 		return ST_NOMEM;
 	mm_memset(ff, 0, sizeof(fat32_file_t));
-	ff->fs = g_root_fs;
+	ff->fs = fs;
 	ff->start_cluster = fc;
 	ff->current_cluster = fc;
 	ff->size = size;
@@ -3507,7 +3838,7 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 
 	// Attach inode cache entry (increments refcount)
 	if (fc >= 2 && !(attr & FAT32_ATTR_DIRECTORY))
-		ff->inode = icache_get(fc, size, attr, parent, dir_cluster,
+		ff->inode = icache_get(&fs->sb, fc, size, attr, parent, dir_cluster,
 				       dir_index, 0, 0);
 	else
 		ff->inode = NULL;
@@ -3525,12 +3856,13 @@ static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 	return ST_OK;
 }
 
-static int fat32_stat_vfs_impl(const char *path, struct kstat *st)
+static int fat32_stat_vfs_impl(fat32_fs_t *fs, const char *path,
+			       struct kstat *st)
 {
-	if (!st || !path)
+	if (!fs || !st || !path)
 		return ST_INVALID;
-	unsigned long start_cluster = fat32_get_task_cwd_cluster();
-	const char *rpath = fat32_normalize_start(path, &start_cluster);
+	unsigned long start_cluster = fat32_get_task_cwd_cluster(fs);
+	const char *rpath = fat32_normalize_start(fs, path, &start_cluster);
 
 	/* Strip trailing slashes so "/tmp/" resolves the same as "/tmp".
        We work on a small local copy to avoid modifying the caller's string. */
@@ -3552,17 +3884,17 @@ static int fat32_stat_vfs_impl(const char *path, struct kstat *st)
 	st->st_dev = 0;
 	st->st_rdev = 0;
 	st->st_nlink = 1;
-	st->st_uid = 0;
-	st->st_gid = 0;
-	st->st_blksize = g_root_fs ? (uint64_t)g_root_fs->sectors_per_cluster *
-					     g_root_fs->bytes_per_sector :
-				     4096;
+	/* No owner or permission bits on FAT: the instance's options say
+	 * them (by default root-owned, files 0644, directories 0755). */
+	st->st_uid = fs->st->uid;
+	st->st_gid = fs->st->gid;
+	st->st_blksize = (uint64_t)fs->sectors_per_cluster *
+			 fs->bytes_per_sector;
 
 	/* Root directory — special case, no parent entry */
 	if (rpath[0] == '\0') {
-		st->st_ino = g_root_fs ? g_root_fs->root_cluster : 2;
-		st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
-					 S_IXGRP | S_IROTH | S_IXOTH);
+		st->st_ino = fs->root_cluster;
+		st->st_mode = S_IFDIR | fat32_mode_bits(fs, 1);
 		st->st_size = 0;
 		st->st_blocks = 0;
 		uint64_t now = timer_get_epoch();
@@ -3601,7 +3933,7 @@ static int fat32_stat_vfs_impl(const char *path, struct kstat *st)
 		unsigned pattr;
 		unsigned long pfc;
 		unsigned long psz;
-		if (fat32_resolve_path(start_cluster, parent_path, &pattr, &pfc,
+		if (fat32_resolve_path(fs, start_cluster, parent_path, &pattr, &pfc,
 				       &psz) != ST_OK)
 			return ST_NOT_FOUND;
 		parent_cluster = pfc;
@@ -3617,7 +3949,7 @@ static int fat32_stat_vfs_impl(const char *path, struct kstat *st)
 	unsigned long fc = 0;
 	unsigned long size = 0;
 	uint16_t wrt_time = 0, wrt_date = 0;
-	if (fat32_dir_find_nolock(parent_cluster, final_name, &attr, &fc, &size,
+	if (fat32_dir_find_nolock(fs, parent_cluster, final_name, &attr, &fc, &size,
 				  &wrt_time, &wrt_date) != ST_OK)
 		return ST_NOT_FOUND;
 
@@ -3625,10 +3957,9 @@ static int fat32_stat_vfs_impl(const char *path, struct kstat *st)
 	st->st_ino = fc; /* use first cluster as inode number */
 	st->st_blocks = (size + 511) / 512;
 	if (attr & FAT32_ATTR_DIRECTORY) {
-		st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
-					 S_IXGRP | S_IROTH | S_IXOTH);
+		st->st_mode = S_IFDIR | fat32_mode_bits(fs, 1);
 	} else {
-		st->st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+		st->st_mode = S_IFREG | fat32_mode_bits(fs, 0);
 	}
 
 	uint64_t epoch = fat32_datetime_to_epoch(wrt_date, wrt_time);
@@ -3639,7 +3970,7 @@ static int fat32_stat_vfs_impl(const char *path, struct kstat *st)
 	return ST_OK;
 }
 
-int fat32_unlink_path(const char *path)
+int fat32_unlink_path(fat32_fs_t *fs, const char *path)
 {
 	/* fat32_unlink_path is always called from fat32_unlink_impl which is
      * wrapped by fat32_io_lock() (sleeping mutex).  The old fat32_lock
@@ -3655,7 +3986,7 @@ int fat32_unlink_path(const char *path)
 	unsigned long parent = 0;
 	char name[256];
 	name[0] = '\0';
-	if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent,
+	if (fat32_resolve_parent(fs, fat32_get_task_cwd_cluster(fs), path, &parent,
 				 name, sizeof(name)) != ST_OK)
 		return ST_NOT_FOUND;
 
@@ -3667,7 +3998,7 @@ int fat32_unlink_path(const char *path)
 	unsigned long lfn_start_cluster = 0;
 	unsigned int lfn_start_index = 0;
 
-	if (fat32_dir_find_entry_lfn(
+	if (fat32_dir_find_entry_lfn(fs,
 		    parent, name, &attr, &fc, &size, &dir_cluster, &dir_index,
 		    &lfn_start_cluster, &lfn_start_index) != ST_OK)
 		return ST_NOT_FOUND;
@@ -3676,39 +4007,40 @@ int fat32_unlink_path(const char *path)
 		return ST_UNSUPPORTED;
 
 	// Delete all entries from LFN start to short entry
-	int st = fat32_delete_entries(lfn_start_cluster, lfn_start_index,
+	int st = fat32_delete_entries(fs, lfn_start_cluster, lfn_start_index,
 				      dir_cluster, dir_index);
 	if (st != ST_OK)
 		return st;
 
 	if (fc >= 2) {
-		pagecache_invalidate_file(fc);
-		icache_chain_invalidate(fc);
-		icache_remove(fc);
-		fat32_free_chain(g_root_fs, fc);
+		pagecache_invalidate_file(&fs->sb, fc);
+		icache_chain_invalidate(&fs->sb, fc);
+		icache_remove(&fs->sb, fc);
+		fat32_free_chain(fs, fc);
 	}
-	dcache_invalidate_dir(parent);
+	dcache_invalidate_dir(&fs->sb, parent);
 	return ST_OK;
 }
 
-static int fat32_unlink_impl(const char *path)
+static int fat32_unlink_impl(fat32_fs_t *fs, const char *path)
 {
-	return fat32_unlink_path(path);
+	return fat32_unlink_path(fs, path);
 }
 
-int fat32_rename_path(const char *oldpath, const char *newpath)
+int fat32_rename_path(fat32_fs_t *fs, const char *oldpath,
+		      const char *newpath)
 {
 	unsigned long old_parent = 0;
 	char old_name[256];
 	old_name[0] = '\0';
-	if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), oldpath,
+	if (fat32_resolve_parent(fs, fat32_get_task_cwd_cluster(fs), oldpath,
 				 &old_parent, old_name,
 				 sizeof(old_name)) != ST_OK)
 		return ST_NOT_FOUND;
 	unsigned long new_parent = 0;
 	char new_name[256];
 	new_name[0] = '\0';
-	if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), newpath,
+	if (fat32_resolve_parent(fs, fat32_get_task_cwd_cluster(fs), newpath,
 				 &new_parent, new_name,
 				 sizeof(new_name)) != ST_OK)
 		return ST_NOT_FOUND;
@@ -3724,7 +4056,7 @@ int fat32_rename_path(const char *oldpath, const char *newpath)
 	unsigned long old_lfn_cluster = 0;
 	unsigned int old_lfn_index = 0;
 
-	if (fat32_dir_find_entry_lfn(old_parent, old_name, &attr, &fc, &size,
+	if (fat32_dir_find_entry_lfn(fs, old_parent, old_name, &attr, &fc, &size,
 				     &old_dir_cluster, &old_dir_index,
 				     &old_lfn_cluster, &old_lfn_index) != ST_OK)
 		return ST_NOT_FOUND;
@@ -3735,7 +4067,7 @@ int fat32_rename_path(const char *oldpath, const char *newpath)
 		return ST_INVALID;
 
 	// Delete old entries
-	int st = fat32_delete_entries(old_lfn_cluster, old_lfn_index,
+	int st = fat32_delete_entries(fs, old_lfn_cluster, old_lfn_index,
 				      old_dir_cluster, old_dir_index);
 	if (st != ST_OK)
 		return st;
@@ -3744,7 +4076,7 @@ int fat32_rename_path(const char *oldpath, const char *newpath)
 	unsigned long new_dir_cluster = 0;
 	unsigned int new_dir_index = 0;
 	int entries_needed = new_fname.lfn_entries + 1;
-	if (fat32_dir_find_free_entries(new_parent, entries_needed,
+	if (fat32_dir_find_free_entries(fs, new_parent, entries_needed,
 					&new_dir_cluster,
 					&new_dir_index) != ST_OK)
 		return ST_IO;
@@ -3760,31 +4092,32 @@ int fat32_rename_path(const char *oldpath, const char *newpath)
 	ent.fileSize = (uint32_t)size;
 
 	if (new_fname.lfn_entries > 0) {
-		st = fat32_write_lfn_entries(new_dir_cluster, new_dir_index,
+		st = fat32_write_lfn_entries(fs, new_dir_cluster, new_dir_index,
 					     &new_fname, &ent);
 	} else {
-		st = fat32_write_dirent(new_dir_cluster, new_dir_index, &ent);
+		st = fat32_write_dirent(fs, new_dir_cluster, new_dir_index, &ent);
 	}
 	if (st == ST_OK) {
-		dcache_invalidate_dir(old_parent);
+		dcache_invalidate_dir(&fs->sb, old_parent);
 		if (new_parent != old_parent)
-			dcache_invalidate_dir(new_parent);
+			dcache_invalidate_dir(&fs->sb, new_parent);
 	}
 
 	return st;
 }
 
-static int fat32_rename_impl(const char *oldpath, const char *newpath)
+static int fat32_rename_impl(fat32_fs_t *fs, const char *oldpath,
+			     const char *newpath)
 {
-	return fat32_rename_path(oldpath, newpath);
+	return fat32_rename_path(fs, oldpath, newpath);
 }
 
-int fat32_mkdir_path(const char *path)
+int fat32_mkdir_path(fat32_fs_t *fs, const char *path)
 {
 	unsigned long parent = 0;
 	char name[256];
 	name[0] = '\0';
-	if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent,
+	if (fat32_resolve_parent(fs, fat32_get_task_cwd_cluster(fs), path, &parent,
 				 name, sizeof(name)) != ST_OK)
 		return ST_NOT_FOUND;
 
@@ -3802,7 +4135,7 @@ int fat32_mkdir_path(const char *path)
 	unsigned long lfn_start_cluster = 0;
 	unsigned int lfn_start_index = 0;
 
-	if (fat32_dir_find_entry_lfn(
+	if (fat32_dir_find_entry_lfn(fs,
 		    parent, name, &attr, &fc, &size, &dir_cluster, &dir_index,
 		    &lfn_start_cluster, &lfn_start_index) == ST_OK) {
 		return ST_EXISTS; // Already exists
@@ -3810,31 +4143,37 @@ int fat32_mkdir_path(const char *path)
 
 	// Find space for new entries
 	int entries_needed = fname.lfn_entries + 1;
-	if (fat32_dir_find_free_entries(parent, entries_needed, &dir_cluster,
+	if (fat32_dir_find_free_entries(fs, parent, entries_needed, &dir_cluster,
 					&dir_index) != ST_OK)
 		return ST_IO;
 
 	unsigned long newc = 0;
-	if (fat32_alloc_cluster(g_root_fs, &newc) != ST_OK)
+	if (fat32_alloc_cluster(fs, &newc) != ST_OK)
 		return ST_IO;
+
+	/* The new directory, its '.' and its '..' all carry the time it was
+	 * made as creation, modification and access time. */
+	uint16_t now_date = 0, now_time = 0;
+	fat32_epoch_to_datetime(timer_get_epoch(), &now_date, &now_time);
 
 	fat32_dirent_t ent;
 	fat32_init_dirent(&ent, fname.short_name, FAT32_ATTR_DIRECTORY, newc,
 			  0);
+	fat32_stamp_dirent(&ent, now_date, now_time);
 
 	int st;
 	if (fname.lfn_entries > 0) {
-		st = fat32_write_lfn_entries(dir_cluster, dir_index, &fname,
+		st = fat32_write_lfn_entries(fs, dir_cluster, dir_index, &fname,
 					     &ent);
 	} else {
-		st = fat32_write_dirent(dir_cluster, dir_index, &ent);
+		st = fat32_write_dirent(fs, dir_cluster, dir_index, &ent);
 	}
 	if (st != ST_OK)
 		return st;
 
 	// Initialize directory cluster with . and ..
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	void *buf = kcalloc(1, cluster_size);
 	if (!buf)
 		return ST_NOMEM;
@@ -3844,30 +4183,38 @@ int fat32_mkdir_path(const char *path)
 	};
 	char dotdot[11] = { '.', '.', ' ', ' ', ' ', ' ',
 			    ' ', ' ', ' ', ' ', ' ' };
+	/* '..' of a directory made in the root directory names the root with
+	 * start cluster 0, not with the root directory's cluster number. */
+	unsigned long dotdot_cluster =
+		(parent == fs->st->root_dir_cluster) ? 0 : parent;
 	fat32_init_dirent(&ents[0], dot, FAT32_ATTR_DIRECTORY, newc, 0);
-	fat32_init_dirent(&ents[1], dotdot, FAT32_ATTR_DIRECTORY, parent, 0);
-	st = write_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, newc),
-			   g_root_fs->sectors_per_cluster, buf);
+	fat32_stamp_dirent(&ents[0], now_date, now_time);
+	fat32_init_dirent(&ents[1], dotdot, FAT32_ATTR_DIRECTORY,
+			  dotdot_cluster, 0);
+	fat32_stamp_dirent(&ents[1], now_date, now_time);
+	st = write_sectors(fs->bdev, cluster_to_lba(fs, newc),
+			   fs->sectors_per_cluster, buf);
 	kfree(buf);
 	if (st != ST_OK)
 		return st;
 
-	dcache_invalidate_dir(parent);
+	dcache_invalidate_dir(&fs->sb, parent);
 	return ST_OK;
 }
 
-static int fat32_mkdir_impl(const char *path, unsigned int mode)
+static int fat32_mkdir_impl(fat32_fs_t *fs, const char *path,
+			    unsigned int mode)
 {
 	(void)mode;
-	return fat32_mkdir_path(path);
+	return fat32_mkdir_path(fs, path);
 }
 
-int fat32_rmdir_path(const char *path)
+int fat32_rmdir_path(fat32_fs_t *fs, const char *path)
 {
 	unsigned long parent = 0;
 	char name[256];
 	name[0] = '\0';
-	if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent,
+	if (fat32_resolve_parent(fs, fat32_get_task_cwd_cluster(fs), path, &parent,
 				 name, sizeof(name)) != ST_OK)
 		return ST_NOT_FOUND;
 
@@ -3879,7 +4226,7 @@ int fat32_rmdir_path(const char *path)
 	unsigned long lfn_start_cluster = 0;
 	unsigned int lfn_start_index = 0;
 
-	if (fat32_dir_find_entry_lfn(
+	if (fat32_dir_find_entry_lfn(fs,
 		    parent, name, &attr, &fc, &size, &dir_cluster, &dir_index,
 		    &lfn_start_cluster, &lfn_start_index) != ST_OK)
 		return ST_NOT_FOUND;
@@ -3888,7 +4235,7 @@ int fat32_rmdir_path(const char *path)
 
 	// Ensure directory is empty (only . and ..) — walk the full cluster chain
 	unsigned cluster_size =
-		g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+		fs->sectors_per_cluster * fs->bytes_per_sector;
 	unsigned entries_per_cluster = cluster_size / sizeof(fat32_dirent_t);
 	void *buf = kalloc(cluster_size);
 	if (!buf)
@@ -3898,8 +4245,8 @@ int fat32_rmdir_path(const char *path)
 	unsigned long scan = fc;
 	while (!done && scan >= 2 && scan < 0x0FFFFFF8) {
 		if (read_sectors(
-			    g_root_fs->bdev, cluster_to_lba(g_root_fs, scan),
-			    g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+			    fs->bdev, cluster_to_lba(fs, scan),
+			    fs->sectors_per_cluster, buf) != ST_OK) {
 			kfree(buf);
 			return ST_IO;
 		}
@@ -3923,7 +4270,7 @@ int fat32_rmdir_path(const char *path)
 		}
 		if (!done) {
 			unsigned long next =
-				fat32_next_cluster_cached(g_root_fs, scan);
+				fat32_next_cluster_cached(fs, scan);
 			if (next >= 0x0FFFFFF8 || next == 0)
 				break;
 			scan = next;
@@ -3934,37 +4281,37 @@ int fat32_rmdir_path(const char *path)
 		return ST_NOTEMPTY;
 
 	// Delete all entries (LFN + short entry)
-	int st = fat32_delete_entries(lfn_start_cluster, lfn_start_index,
+	int st = fat32_delete_entries(fs, lfn_start_cluster, lfn_start_index,
 				      dir_cluster, dir_index);
 	if (st != ST_OK)
 		return st;
 
 	if (fc >= 2) {
-		icache_chain_invalidate(fc);
-		fat32_free_chain(g_root_fs, fc);
+		icache_chain_invalidate(&fs->sb, fc);
+		fat32_free_chain(fs, fc);
 	}
-	dcache_invalidate_dir(parent);
+	dcache_invalidate_dir(&fs->sb, parent);
 	return ST_OK;
 }
 
-static int fat32_rmdir_impl(const char *path)
+static int fat32_rmdir_impl(fat32_fs_t *fs, const char *path)
 {
-	return fat32_rmdir_path(path);
+	return fat32_rmdir_path(fs, path);
 }
 
-static int fat32_chdir_impl(const char *path)
+static int fat32_chdir_impl(fat32_fs_t *fs, const char *path)
 {
 	unsigned attr = 0;
 	unsigned long fc = 0;
 	unsigned long size = 0;
-	unsigned long start_cluster = fat32_get_task_cwd_cluster();
-	const char *rpath = fat32_normalize_start(path, &start_cluster);
-	if (fat32_resolve_path(start_cluster, rpath, &attr, &fc, &size) !=
+	unsigned long start_cluster = fat32_get_task_cwd_cluster(fs);
+	const char *rpath = fat32_normalize_start(fs, path, &start_cluster);
+	if (fat32_resolve_path(fs, start_cluster, rpath, &attr, &fc, &size) !=
 	    ST_OK)
 		return ST_NOT_FOUND;
 	if (!(attr & FAT32_ATTR_DIRECTORY))
 		return ST_INVALID;
-	fat32_set_cwd(fc);
+	fat32_set_cwd(fs, fc);
 	return ST_OK;
 }
 
@@ -3973,8 +4320,9 @@ static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
 	if (!f || !buf)
 		return ST_INVALID;
 	fat32_file_t *ff = (fat32_file_t *)f->fs_private;
-	if (!ff)
+	if (!ff || !ff->fs)
 		return ST_INVALID;
+	fat32_fs_t *fs = ff->fs;
 	if (ff->pos >= ff->size)
 		return 0;
 	if (bytes < 0)
@@ -4026,12 +4374,12 @@ static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
 				smap_enable();
 				return copied ? (long)copied : ST_NOMEM;
 			}
-			fat32_io_lock();
+			fat32_io_lock(fs);
 			int st = read_sectors(
 				ff->fs->bdev,
 				cluster_to_lba(ff->fs, ff->current_cluster),
 				ff->fs->sectors_per_cluster, tmp);
-			fat32_io_unlock();
+			fat32_io_unlock(fs);
 			if (st != ST_OK) {
 				smap_enable();
 				kfree(tmp);
@@ -4055,10 +4403,10 @@ static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
 
 		// Keep current_cluster in sync for the fallback path and seek
 		if (ff->pos % cluster_size == 0) {
-			fat32_io_lock();
+			fat32_io_lock(fs);
 			unsigned long next = fat32_next_cluster_cached(
 				ff->fs, ff->current_cluster);
-			fat32_io_unlock();
+			fat32_io_unlock(fs);
 			if (next >= 0x0FFFFFF8) {
 				break;
 			}
@@ -4082,6 +4430,7 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 	fat32_file_t *ff = (fat32_file_t *)f->fs_private;
 	if (!ff || !ff->fs)
 		return ST_INVALID;
+	fat32_fs_t *fs = ff->fs;
 	if (bytes < 0)
 		return ST_INVALID;
 
@@ -4127,10 +4476,10 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 			ff->current_cluster = cluster;
 		}
 		/* BUG GUARD: writing file data to root cluster would corrupt root dir */
-		if (ff->current_cluster == g_root_dir_cluster) {
+		if (ff->current_cluster == fs->st->root_dir_cluster) {
 			kprintf("FAT32: BUG: write_impl current_cluster==root(%lu)! "
 				"start=%lu dirent_clust=%lu dirent_idx=%u name=%s\n",
-				g_root_dir_cluster, ff->start_cluster,
+				fs->st->root_dir_cluster, ff->start_cluster,
 				ff->dirent_cluster, ff->dirent_index,
 				ff->name83);
 			return written ? (long)written : ST_IO;
@@ -4145,7 +4494,7 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 		unsigned long page_idx = ff->pos / PAGE_SIZE;
 		unsigned page_offset = ff->pos % PAGE_SIZE;
 
-		pc_page_t *pg = pagecache_lookup(ff->start_cluster, page_idx);
+		pc_page_t *pg = pagecache_lookup(&fs->sb, ff->start_cluster, page_idx);
 		if (pg) {
 			/* Cached page hit — update in place.  Stay within the page so
              * pagecache_mark_dirty's per-page semantics are preserved. */
@@ -4178,7 +4527,7 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 				(end_byte - 1) / PAGE_SIZE;
 			for (unsigned long p = page_idx + 1; p <= last_page_idx;
 			     p++) {
-				if (pagecache_lookup(ff->start_cluster, p)) {
+				if (pagecache_lookup(&fs->sb, ff->start_cluster, p)) {
 					/* Truncate at the start byte of this cached page. */
 					chunk = (unsigned)(p * PAGE_SIZE -
 							   ff->pos);
@@ -4235,7 +4584,7 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 					int cached_in_next = 0;
 					for (unsigned long p = start_p;
 					     p <= end_p; p++) {
-						if (pagecache_lookup(
+						if (pagecache_lookup(&fs->sb,
 							    ff->start_cluster,
 							    p)) {
 							cached_in_next = 1;
@@ -4633,8 +4982,10 @@ static long fat32_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 				display_name[p] = '\0';
 			}
 
-			uint64_t ino = ((uint64_t)ents[idx].fstClusHI << 16) |
-				       ents[idx].fstClusLO;
+			uint64_t ino = fat32_dotdot_target(
+				ff->fs, &ents[idx],
+				((unsigned long)ents[idx].fstClusHI << 16) |
+					ents[idx].fstClusLO);
 			uint8_t dtype =
 				(ents[idx].attr & FAT32_ATTR_DIRECTORY) ?
 					4 :
@@ -4697,6 +5048,7 @@ static int fat32_truncate_impl(vfs_file_t *f, unsigned long new_size)
 	fat32_file_t *ff = (fat32_file_t *)f->fs_private;
 	if (!ff || !ff->fs)
 		return ST_INVALID;
+	fat32_fs_t *fs = ff->fs;
 
 	unsigned cluster_size =
 		ff->fs->sectors_per_cluster * ff->fs->bytes_per_sector;
@@ -4707,8 +5059,8 @@ static int fat32_truncate_impl(vfs_file_t *f, unsigned long new_size)
 
 	if (new_size == 0) {
 		// Invalidate all cached pages and cluster chain for this file
-		pagecache_invalidate_file(ff->start_cluster);
-		icache_chain_invalidate(ff->start_cluster);
+		pagecache_invalidate_file(&fs->sb, ff->start_cluster);
+		icache_chain_invalidate(&fs->sb, ff->start_cluster);
 		if (ff->start_cluster >= 2) {
 			fat32_free_chain(ff->fs, ff->start_cluster);
 		}
@@ -4752,8 +5104,8 @@ static int fat32_truncate_impl(vfs_file_t *f, unsigned long new_size)
 	// Trim extra clusters if shrinking
 	if (new_size < ff->size) {
 		// Invalidate cached pages beyond new size and reset cluster chain cache
-		pagecache_invalidate_range(ff->start_cluster, new_size);
-		icache_chain_invalidate(ff->start_cluster);
+		pagecache_invalidate_range(&fs->sb, ff->start_cluster, new_size);
+		icache_chain_invalidate(&fs->sb, ff->start_cluster);
 		unsigned long cut_cluster = 0;
 		if (fat32_get_cluster_at(ff->fs, ff->start_cluster,
 					 needed_clusters - 1,
@@ -4826,15 +5178,22 @@ static int fat32_close_impl(vfs_file_t *f)
 	if (!f)
 		return ST_INVALID;
 	fat32_file_t *ff = (fat32_file_t *)f->fs_private;
+	if (ff && (!ff->fs || !ff->fs->st)) {
+		/* Not on a live volume (never happens for a handle made by
+		 * fat32_open): nothing on disk to bring up to date. */
+		kfree(ff);
+		return ST_OK;
+	}
 	if (ff) {
+		fat32_fs_t *fs = ff->fs;
 		// Flush any dirty cached pages for this file before closing
 		if (ff->start_cluster >= 2)
-			pagecache_flush_file(ff->start_cluster);
+			pagecache_flush_file(&fs->sb, ff->start_cluster);
 		/* Persist any FAT entries that were deferred during the writes
          * to this file.  Without this, a power loss right after close
          * would lose the chain (data clusters are on disk but the FAT
          * still says they are free). */
-		fat32_fat_flush_pending();
+		fat32_fat_flush_pending(fs);
 		// Release inode cache reference
 		if (ff->inode) {
 			ic_inode_t *ic = (ic_inode_t *)ff->inode;
@@ -4866,26 +5225,33 @@ static int fat32_close_impl(vfs_file_t *f)
 // (ops struct moved earlier)
 
 // Accessor for root cluster
-unsigned long fat32_root_cluster(void)
+unsigned long fat32_root_cluster(fat32_fs_t *fs)
 {
-	return g_root_dir_cluster;
+	return fs->st->root_dir_cluster;
 }
-void fat32_set_cwd(unsigned long cluster)
+void fat32_set_cwd(fat32_fs_t *fs, unsigned long cluster)
 {
-	g_cwd_cluster = cluster;
+	fs->st->cwd_cluster = cluster;
 }
-unsigned long fat32_get_cwd(void)
+unsigned long fat32_get_cwd(fat32_fs_t *fs)
 {
-	return g_cwd_cluster ? g_cwd_cluster : g_root_dir_cluster;
+	return fs->st->cwd_cluster ? fs->st->cwd_cluster :
+				     fs->st->root_dir_cluster;
 }
 
-// Get current task's cwd cluster (not the global one)
-static unsigned long fat32_get_task_cwd_cluster(void)
+/* The current task's working directory as a cluster of this volume, for
+ * resolving a relative path.  A task's cwd is a path of the whole name
+ * space, so it names a directory of this volume only when the volume is the
+ * root filesystem; for any other instance the VFS hands over paths relative
+ * to the mount point and they start at the volume's root directory. */
+static unsigned long fat32_get_task_cwd_cluster(fat32_fs_t *fs)
 {
+	if (!fs->st->is_root)
+		return fs->st->root_dir_cluster;
 	// Get current task's cwd path
 	task_t *cur = sched_current();
 	if (!cur || cur->cwd[0] == '\0' || kstrcmp(cur->cwd, "/") == 0) {
-		return g_root_dir_cluster;
+		return fs->st->root_dir_cluster;
 	}
 
 	// Resolve the task's cwd path to get cluster
@@ -4898,51 +5264,70 @@ static unsigned long fat32_get_task_cwd_cluster(void)
 	unsigned long size = 0;
 
 	if (path[0] == '\0') {
-		return g_root_dir_cluster; // Root directory
+		return fs->st->root_dir_cluster; // Root directory
 	}
 
-	int res =
-		fat32_resolve_path(g_root_dir_cluster, path, &attr, &fc, &size);
+	int res = fat32_resolve_path(fs, fs->st->root_dir_cluster, path, &attr,
+				     &fc, &size);
 	if (res == ST_OK && (attr & FAT32_ATTR_DIRECTORY)) {
 		return fc;
 	}
 
 	// Fallback to root if resolution fails
-	return g_root_dir_cluster;
+	return fs->st->root_dir_cluster;
 }
 
 int fat32_vfs_register_root(fat32_fs_t *fs)
 {
-	if (!fs)
+	if (!fs || !fs->st)
 		return ST_INVALID;
+	uint64_t flags;
+	spin_lock_irqsave(&fs->st->io_wait_lock, &flags);
+	fs->st->is_root = 1;
+	fat32_io_mirror(fs->st);
+	spin_unlock_irqrestore(&fs->st->io_wait_lock, flags);
+	fat32_fs_t *prev_fs = g_root_fs;
+	vfs_superblock_t *prev_sb = g_root_sb;
 	g_root_fs = fs;
-	fat32_sb_attach(fs);
-	return vfs_register_root(&fat32_vfs_ops);
+	/* The caches' superblock for whole-system flushes (pagecache_sync). */
+	g_root_sb = &fs->sb;
+	int r = vfs_register_root(&fat32_vfs_ops, fs, &fs->sb, &fat32_fstype,
+				  "vfat");
+	if (r != ST_OK) {
+		/* A root is already there: it keeps what it published. */
+		g_root_fs = prev_fs;
+		g_root_sb = prev_sb;
+		spin_lock_irqsave(&fs->st->io_wait_lock, &flags);
+		fs->st->is_root = 0;
+		spin_unlock_irqrestore(&fs->st->io_wait_lock, flags);
+	}
+	return r;
 }
 
-void fat32_list_root(void (*cb)(const char *name, unsigned attr,
+void fat32_list_root(fat32_fs_t *fs,
+		     void (*cb)(const char *name, unsigned attr,
 				unsigned long size))
 {
-	if (!g_root_fs || !cb)
+	if (!fs || !cb)
 		return;
 	unsigned listed = 0;
-	FAT32_LOG("list_root start cluster=%lu\n", g_root_dir_cluster);
+	FAT32_LOG("list_root start cluster=%lu\n", fs->st->root_dir_cluster);
 	// Reuse directory iterator over entire root cluster chain for multi-cluster roots
-	fat32_dir_list_internal(g_root_dir_cluster, cb, &listed);
+	fat32_dir_list_internal(fs, fs->st->root_dir_cluster, cb, &listed);
 	FAT32_LOG("list_root done listed=%u\n", listed);
 }
 
 // Debug helper: dump first few raw directory entries (8.3) for diagnostics
-void fat32_debug_dump_root(void)
+void fat32_debug_dump_root(fat32_fs_t *fs)
 {
-	if (!g_root_fs || !g_root_dir_cache) {
+	if (!fs || !fs->st->root_dir_cache) {
 		kprintf("FAT32 dbg: no root cache yet\n");
 		return;
 	}
 	unsigned entries =
-		(g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector) /
+		(fs->sectors_per_cluster * fs->bytes_per_sector) /
 		sizeof(fat32_dirent_t);
-	fat32_dirent_t *ents = (fat32_dirent_t *)g_root_dir_cache;
+	fat32_dirent_t *ents = (fat32_dirent_t *)fs->st->root_dir_cache;
 	kprintf("FAT32 dbg root first entries:\n");
 	for (unsigned i = 0; i < entries && i < 8; i++) {
 		if (ents[i].name[0] == 0x00) {
@@ -4983,37 +5368,40 @@ void fat32_debug_dump_root(void)
 /* ========================================================================
  * fat32_get_statfs — fill filesystem statistics
  * ======================================================================== */
-int fat32_get_statfs(fat32_statfs_t *info)
+int fat32_get_statfs(fat32_fs_t *fs, fat32_statfs_t *info)
 {
-	if (!info || !g_root_fs)
+	if (!info || !fs)
 		return -1;
 
-	unsigned long bsize = (unsigned long)g_root_fs->sectors_per_cluster *
-			      (unsigned long)g_root_fs->bytes_per_sector;
+	unsigned long bsize = (unsigned long)fs->sectors_per_cluster *
+			      (unsigned long)fs->bytes_per_sector;
 
 	/* Calculate total FAT entries if not yet known */
-	if (g_fat_total_entries == 0) {
-		if (fat32_ensure_fat_loaded(g_root_fs) != ST_OK)
+	if (fs->st->fat_total_entries == 0) {
+		if (fat32_ensure_fat_loaded(fs) != ST_OK)
 			return -1;
 	}
-	unsigned long total =
-		(g_fat_total_entries > 2) ? g_fat_total_entries - 2 : 0;
+	unsigned long total = (fs->st->fat_total_entries > 2) ?
+				      fs->st->fat_total_entries - 2 :
+				      0;
 
 	/* Use cached free cluster count (from FSInfo or previous scan).
      * Only do a full FAT scan if FSInfo was unavailable or invalid. */
-	unsigned long free_count = g_free_cluster_count;
+	unsigned long free_count = fs->st->free_cluster_count;
 	if (free_count == (unsigned long)-1) {
 		/* One-time scan — result is cached for all future calls */
-		if (fat32_ensure_fat_loaded(g_root_fs) != ST_OK)
+		if (fat32_ensure_fat_loaded(fs) != ST_OK)
 			return -1;
 		free_count = 0;
-		for (unsigned long c = 2; c < g_fat_total_entries; ++c) {
+		for (unsigned long c = 2; c < fs->st->fat_total_entries; ++c) {
 			unsigned long v =
-				fat32_next_cluster_cached(g_root_fs, c);
+				fat32_next_cluster_cached(fs, c);
 			if (v == 0)
 				free_count++;
 		}
-		g_free_cluster_count = free_count;
+		fs->st->free_cluster_count = free_count;
+		/* Worth storing in FSInfo, which did not have it. */
+		fs->st->fsinfo_dirty = 1;
 	}
 
 	info->f_bsize = bsize;
@@ -5028,3 +5416,303 @@ int fat32_get_statfs(fat32_statfs_t *info)
 	info->f_type = 0x4d44; /* MSDOS_SUPER_MAGIC */
 	return 0;
 }
+
+/* ---- mount(2) ------------------------------------------------------------ */
+
+/* The options of a vfat mount, as parsed. */
+struct fat32_opts {
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t fmask;
+	uint32_t dmask;
+	int perm_opts;
+	int shortname;
+};
+
+static const char *const fat32_shortname_names[] = {
+	[FAT32_SHORTNAME_LOWER] = "lower",
+	[FAT32_SHORTNAME_WIN95] = "win95",
+	[FAT32_SHORTNAME_WINNT] = "winnt",
+	[FAT32_SHORTNAME_MIXED] = "mixed",
+};
+
+static int fat32_opt_number(const char *v, unsigned base, uint32_t *out)
+{
+	unsigned long n = 0;
+
+	if (!v || !*v)
+		return 0;
+	for (; *v; v++) {
+		unsigned d;
+		if (*v >= '0' && *v <= '9')
+			d = (unsigned)(*v - '0');
+		else
+			return 0;
+		if (d >= base)
+			return 0;
+		n = n * base + d;
+		if (n > 0xFFFFFFFFUL)
+			return 0;
+	}
+	*out = (uint32_t)n;
+	return 1;
+}
+
+/* Parse `data' over the values already in `o'.  uid= and gid= are decimal;
+ * umask= sets both masks, fmask= and dmask= set one each (octal, whatever
+ * the order they come in); shortname= is one of lower, win95, winnt, mixed.
+ * Any other option -- the generic flags, utf8, iocharset=, codepage=,
+ * errors=, flush, quiet, ... -- is accepted and has no effect.  ST_OK, or
+ * ST_INVALID for a value that is not one, and then `o' is unchanged. */
+static int fat32_parse_options(const char *data, struct fat32_opts *o)
+{
+	struct fat32_opts n = *o;
+	const char *cur = data;
+	char tmp[VFS_MOUNT_OPTS_MAX];
+	const char *key, *val;
+	uint32_t umask = 0, v;
+	int have_umask = 0, have_fmask = 0, have_dmask = 0;
+
+	while (data && vfs_next_option(&cur, tmp, sizeof(tmp), &key, &val)) {
+		if (kstrcmp(key, "uid") == 0) {
+			if (!fat32_opt_number(val, 10, &v))
+				return ST_INVALID;
+			n.uid = v;
+			n.perm_opts = 1;
+		} else if (kstrcmp(key, "gid") == 0) {
+			if (!fat32_opt_number(val, 10, &v))
+				return ST_INVALID;
+			n.gid = v;
+			n.perm_opts = 1;
+		} else if (kstrcmp(key, "umask") == 0) {
+			if (!fat32_opt_number(val, 8, &v) || v > 0777)
+				return ST_INVALID;
+			umask = v;
+			have_umask = 1;
+			n.perm_opts = 1;
+		} else if (kstrcmp(key, "fmask") == 0) {
+			if (!fat32_opt_number(val, 8, &v) || v > 0777)
+				return ST_INVALID;
+			n.fmask = v;
+			have_fmask = 1;
+			n.perm_opts = 1;
+		} else if (kstrcmp(key, "dmask") == 0) {
+			if (!fat32_opt_number(val, 8, &v) || v > 0777)
+				return ST_INVALID;
+			n.dmask = v;
+			have_dmask = 1;
+			n.perm_opts = 1;
+		} else if (kstrcmp(key, "shortname") == 0) {
+			int found = -1;
+			for (int i = 0; val && i <= FAT32_SHORTNAME_MIXED; i++)
+				if (kstrcmp(val, fat32_shortname_names[i]) == 0)
+					found = i;
+			if (found < 0)
+				return ST_INVALID;
+			n.shortname = found;
+		}
+	}
+	if (have_umask) {
+		if (!have_fmask)
+			n.fmask = umask;
+		if (!have_dmask)
+			n.dmask = umask;
+	}
+	*o = n;
+	return ST_OK;
+}
+
+static void fat32_opts_get(const fat32_fs_t *fs, struct fat32_opts *o)
+{
+	o->uid = fs->st->uid;
+	o->gid = fs->st->gid;
+	o->fmask = fs->st->fmask;
+	o->dmask = fs->st->dmask;
+	o->perm_opts = fs->st->perm_opts;
+	o->shortname = fs->st->shortname;
+}
+
+/* Install parsed options.  Under the I/O mutex, so a stat in flight sees
+ * either the old set or the new one. */
+static void fat32_opts_set(fat32_fs_t *fs, const struct fat32_opts *o)
+{
+	fat32_io_lock(fs);
+	fs->st->uid = o->uid;
+	fs->st->gid = o->gid;
+	fs->st->fmask = o->fmask;
+	fs->st->dmask = o->dmask;
+	fs->st->perm_opts = o->perm_opts;
+	fs->st->shortname = o->shortname;
+	fat32_io_unlock(fs);
+}
+
+/* Does this device sector 0 hold a FAT32 boot sector?  The volume is
+ * mounted only from the start of the device it is given (a partition, or a
+ * disk formatted without a partition table): looking into a partition table
+ * here would let the same volume be mounted through the disk and through
+ * its partition at once. */
+static int fat32_is_fat32_boot_sector(const uint8_t *sec, unsigned long ss)
+{
+	const fat32_bpb_t *bpb = (const fat32_bpb_t *)sec;
+
+	if (sec[510] != 0x55 || sec[511] != 0xAA)
+		return 0;
+	if (!fat32_validate_bpb(bpb))
+		return 0;
+	/* FAT32 proper: the FAT size is in the 32-bit field only. */
+	if (bpb->fat_size16 != 0 || bpb->fat_size32 == 0)
+		return 0;
+	return bpb->bytes_per_sector == ss;
+}
+
+static int fat32_probe_bdev(const block_device_t *b)
+{
+	unsigned long ss = fat_sector_bytes(b);
+	uint8_t *sec = (uint8_t *)kalloc(ss);
+	int ok = 0;
+
+	if (!sec)
+		return 0;
+	if (read_sectors(b, 0, 1, sec) == ST_OK)
+		ok = fat32_is_fat32_boot_sector(sec, ss);
+	kfree(sec);
+	return ok;
+}
+
+/* Is there a FAT32 volume at the start of `bdev'?  For fstype "auto". */
+static int fat32_fst_probe(struct block_device *bdev)
+{
+	return bdev ? fat32_probe_bdev(bdev) : 0;
+}
+
+static int fat32_fst_mount(vfs_mount_t *m, struct block_device *bdev,
+			   unsigned long flags, const char *data)
+{
+	if (!m || !bdev)
+		return ST_INVALID;
+	struct fat32_opts o = {
+		.uid = 0,
+		.gid = 0,
+		.fmask = FAT32_DEFAULT_FMASK,
+		.dmask = FAT32_DEFAULT_DMASK,
+		.perm_opts = 0,
+		.shortname = FAT32_SHORTNAME_LOWER,
+	};
+	if (fat32_parse_options(data, &o) != ST_OK)
+		return ST_INVALID;
+	if (!fat32_probe_bdev(bdev))
+		return ST_NOT_FOUND; /* not a FAT32 volume */
+
+	fat32_fs_t *fs = (fat32_fs_t *)kcalloc(1, sizeof(*fs));
+	if (!fs)
+		return ST_NOMEM;
+	int r = fat32_mount_at_lba(bdev, 0, fs);
+	if (r == ST_OK)
+		r = fat32_instance_init(fs);
+	else if (r == ST_ERR)
+		r = ST_NOT_FOUND;
+	if (r != ST_OK) {
+		kfree(fs);
+		return r;
+	}
+	/* Nothing else can reach the instance yet: no lock needed.  (The
+	 * VFS enforces read-only; the flag only keeps the driver's own
+	 * write-backs off the disk.) */
+	fs->st->read_only = (flags & VFS_MS_RDONLY) != 0;
+	fs->st->uid = o.uid;
+	fs->st->gid = o.gid;
+	fs->st->fmask = o.fmask;
+	fs->st->dmask = o.dmask;
+	fs->st->perm_opts = o.perm_opts;
+	fs->st->shortname = o.shortname;
+
+	m->ops = &fat32_vfs_ops;
+	m->fs_data = fs;
+	m->sb = &fs->sb;
+	return ST_OK;
+}
+
+/* The end of an unmount: nothing is open and every page and inode was
+ * stored by the VFS.  Write the deferred FAT sector and the FSInfo free
+ * count, let go of every cached piece of the volume and free it. */
+static int fat32_fst_unmount(vfs_mount_t *m)
+{
+	fat32_fs_t *fs = fat32_fs_of(m);
+
+	if (!fs)
+		return ST_INVALID;
+	if (fs->st->is_root)
+		return ST_BUSY;
+	int r = fat32_sync_fs(fs);
+	if (r != ST_OK)
+		kprintf("FAT32: could not store the FAT/FSInfo of %s before "
+			"unmount (%d)\n",
+			m->path, r);
+	vfs_sb_release_caches(&fs->sb);
+	fat32_release(fs);
+	m->fs_data = NULL;
+	m->sb = NULL;
+	kfree(fs);
+	return ST_OK;
+}
+
+/* A remount may switch between read-only and read-write (the VFS enforces
+ * read-only; going there stores what is pending first) and change the
+ * options; the ones not given keep their values. */
+static int fat32_fst_remount(vfs_mount_t *m, unsigned long flags,
+			     const char *data)
+{
+	fat32_fs_t *fs = fat32_fs_of(m);
+
+	if (!fs)
+		return ST_INVALID;
+	struct fat32_opts o;
+	fat32_opts_get(fs, &o);
+	if (data && fat32_parse_options(data, &o) != ST_OK)
+		return ST_INVALID;
+	int want_ro = (flags & VFS_MS_RDONLY) != 0;
+	if (want_ro && !fs->st->read_only) {
+		/* A file open for writing would be left holding a promise
+		 * the filesystem can no longer keep. */
+		if (__atomic_load_n(&m->open_writers, __ATOMIC_SEQ_CST) > 0)
+			return ST_BUSY;
+		fat32_sync_fs(fs);
+	}
+	fat32_opts_set(fs, &o);
+	fat32_io_lock(fs);
+	fs->st->read_only = want_ro;
+	fat32_io_unlock(fs);
+	return ST_OK;
+}
+
+/* "uid=..,gid=..,fmask=..,dmask=..,shortname=.." for /proc/mounts. */
+static long fat32_fst_show_options(vfs_mount_t *m, char *buf, long cap)
+{
+	fat32_fs_t *fs = fat32_fs_of(m);
+
+	if (!fs || !buf || cap < 1)
+		return 0;
+	int sn = fs->st->shortname;
+	if (sn < 0 || sn > FAT32_SHORTNAME_MIXED)
+		sn = FAT32_SHORTNAME_LOWER;
+	int n = ksnprintf(buf, (size_t)cap,
+			  "uid=%u,gid=%u,fmask=%04o,dmask=%04o,shortname=%s",
+			  (unsigned)fs->st->uid, (unsigned)fs->st->gid,
+			  (unsigned)fs->st->fmask, (unsigned)fs->st->dmask,
+			  fat32_shortname_names[sn]);
+	return n < 0 ? 0 : (n >= cap ? cap - 1 : n);
+}
+
+static const char *const fat32_fst_aliases[] = { "fat32", "msdos", "fat",
+						 NULL };
+
+const vfs_fstype_t fat32_fstype = {
+	.name = "vfat",
+	.aliases = fat32_fst_aliases,
+	.needs_device = 1,
+	.mount = fat32_fst_mount,
+	.unmount = fat32_fst_unmount,
+	.remount = fat32_fst_remount,
+	.show_options = fat32_fst_show_options,
+	.probe = fat32_fst_probe,
+};

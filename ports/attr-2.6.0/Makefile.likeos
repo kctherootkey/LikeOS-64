@@ -1,0 +1,151 @@
+# Makefile.likeos - build attr 2.6.0 (libattr, getfattr, setfattr, attr) for
+# LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; configure is not
+# run.  config.h in this directory stands in for the include/config.h
+# configure would write; the source lists are upstream's Makemodule.am files
+# (libattr, libmisc, tools) with the conditionals configure would settle for
+# the LikeOS libc: libmisc/xattrat.c (no *xattrat calls in the libc), no
+# libmisc/openat2.c (no openat2), no libattr/syscalls.c (its compatibility
+# wrappers are for the shared library's old symbol versions only).
+#
+# Like configure, the build makes include/attr point at upstream's include/
+# directory (build/gen/attr), so "attr/libattr.h" resolves while compiling.
+#
+# Results, in build/:
+#   lib/libattr.a        the library (static, position independent),
+#                        exporting what libattr.so exports
+#   lib/libmisc.a        attr's private helpers (not installed)
+#   include/attr/attributes.h, error_context.h, libattr.h
+#                        the public headers, as "make install" writes them
+#                        (EXPORT -> extern)
+#   getfattr, setfattr, attr   the programs, installed to /usr/bin
+#   etc/xattr.conf       which attributes attr_copy_*() copies, installed to
+#                        /etc/xattr.conf
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+AR = ar
+OBJCOPY = objcopy
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+G := $(B)/gen
+O := $(B)/obj
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.  Include order as upstream's
+# AM_CPPFLAGS (-I$(top_builddir)/include -I$(top_srcdir)/include), this
+# directory first for config.h.
+CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIC -fno-common \
+         -D_GNU_SOURCE -D__LIKEOS__ -DHAVE_CONFIG_H -DNDEBUG \
+         -DLOCALEDIR=\"/usr/share/locale\" -DSYSCONFDIR=\"/etc\" \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -I. -I$(G) -I$(S)/include -I$(S)
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int
+# Upstream's AM_CFLAGS.
+CFLAGS += -Wall -Wextra -Wmissing-prototypes
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+obj = $(addprefix $(O)/,$(1:.c=.o))
+
+LIBATTR_OBJ = $(call obj,libattr/attr_copy_action.c libattr/attr_copy_check.c \
+	libattr/attr_copy_fd.c libattr/attr_copy_file.c libattr/libattr.c)
+LIBMISC_OBJ = $(call obj,libmisc/getxattrat_compat.c \
+	libmisc/high_water_alloc.c libmisc/listxattrat_compat.c \
+	libmisc/next_line.c libmisc/proc-self-fd.c libmisc/quote.c \
+	libmisc/removexattrat_compat.c libmisc/setxattrat_compat.c \
+	libmisc/unquote.c libmisc/walk_tree.c libmisc/xattrat.c)
+
+PROGS = getfattr setfattr attr
+PUBLIC_HEADERS = attributes.h error_context.h libattr.h
+TARGETS = $(B)/lib/libattr.a $(B)/lib/libmisc.a \
+	$(addprefix $(B)/include/attr/,$(PUBLIC_HEADERS)) \
+	$(addprefix $(B)/,$(PROGS)) $(B)/etc/xattr.conf
+
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): attr-2.6.0.tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+# configure's AC_CONFIG_COMMANDS([include/attr]): include/attr -> include.
+$(G)/attr: $(SRC_STAMP)
+	@mkdir -p $(G)
+	ln -sfn $(abspath $(S)/include) $@
+	@touch -h $@
+
+# Every object depends on every header: there are few of them.
+HDRS = config.h $(wildcard $(S)/include/*.h $(S)/libmisc/*.h)
+
+$(O)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS) | $(G)/attr
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# libattr.so exports only what its version script (src/exports) lists; the
+# archive is made the same way: its objects linked into one object, every
+# symbol not in src/exports made local, so none of its internal names can
+# collide with a program's own.
+$(B)/exports.syms: $(S)/exports $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\);.*/\1/p' $< >$@
+
+$(B)/lib/libattr.a: $(LIBATTR_OBJ) $(B)/exports.syms
+	@mkdir -p $(dir $@) $(O)
+	$(LD) -r -o $(O)/libattr-all.o $(LIBATTR_OBJ)
+	$(OBJCOPY) --keep-global-symbols=$(B)/exports.syms $(O)/libattr-all.o
+	rm -f $@
+	$(AR) rcs $@ $(O)/libattr-all.o
+
+$(B)/lib/libmisc.a: $(LIBMISC_OBJ)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+# Makefile.am's SUBST_INSTALL_HEADER.
+$(B)/include/attr/%.h: $(S)/include/%.h $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	sed -e 's/\<EXPORT\>/extern/' $< >$@
+
+$(B)/etc/xattr.conf: $(S)/xattr.conf $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(B)/%: $(O)/tools/%.o $(B)/lib/libattr.a $(B)/lib/libmisc.a $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $< $(B)/lib/libattr.a $(B)/lib/libmisc.a \
+		$(LIBS) -o $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

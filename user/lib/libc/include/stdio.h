@@ -225,6 +225,15 @@ int mkstemp(char* templ);
 int mkstemps(char* templ, int suffixlen);
 int remove(const char* pathname);
 int rename(const char* oldpath, const char* newpath);
+int renameat(int olddirfd, const char* oldpath, int newdirfd,
+	     const char* newpath);
+/* renameat2() flags: fail if the new name exists / swap the two names
+ * (the second is refused with EINVAL by this system). */
+#define RENAME_NOREPLACE (1 << 0)
+#define RENAME_EXCHANGE  (1 << 1)
+#define RENAME_WHITEOUT  (1 << 2)
+int renameat2(int olddirfd, const char* oldpath, int newdirfd,
+	      const char* newpath, unsigned int flags);
 FILE* fdopen(int fd, const char *mode);
 FILE* freopen(const char *pathname, const char *mode, FILE *stream);
 int dprintf(int fd, const char *format, ...);

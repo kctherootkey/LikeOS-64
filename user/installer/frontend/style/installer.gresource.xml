@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LikeOS installer: files built into the program.
+     Copyright (C) 2026 The LikeOS Project -->
+<gresources>
+  <gresource prefix="/org/likeos/installer">
+    <file compressed="true">installer.css</file>
+    <file compressed="true">help.txt</file>
+    <file>likeos-logo.png</file>
+    <file compressed="true">COPYING</file>
+  </gresource>
+</gresources>

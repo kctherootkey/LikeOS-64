@@ -5,6 +5,8 @@
 #include <efi.h>
 #include <efilib.h>
 
+#include "bootcommon.h"
+
 // ELF64 structures
 #define EI_NIDENT 16
 
@@ -103,6 +105,9 @@ typedef struct {
 // The firmware's display modes passed on to the kernel (32 bpp, distinct sizes)
 #define BOOT_GOP_MODES_MAX 64
 
+// The firmware's EFI_MEMORY_RUNTIME regions passed on to the kernel
+#define BOOT_EFI_RT_MAX 128
+
 // Boot information passed to kernel
 typedef struct {
     framebuffer_info_t fb_info;
@@ -140,7 +145,37 @@ typedef struct {
     char     cmdline[512];          // the whole boot command line (ASCII, one line)
     uint32_t cmdline_source;        // BOOT_CMDLINE_*: where the command line came from
     uint32_t rootid_reserved;
+
+    // ---- UEFI runtime services (valid when efi_magic == BOOT_EFI_MAGIC) ----
+    // What the kernel needs to call the firmware's runtime services after
+    // ExitBootServices (kernel/hal/efi.c).  SetVirtualAddressMap is never
+    // called: the addresses are physical and stay so.  The runtime regions
+    // are collected on their own so the cap on mem_info.entries cannot lose
+    // one.  Appended at the end; the kernel's copy is kernel/mm/memory.h.
+    uint64_t efi_magic;             // BOOT_EFI_MAGIC when the fields below are valid
+    uint64_t efi_system_table;      // physical address of EFI_SYSTEM_TABLE
+    uint64_t efi_runtime_services;  // physical address of EFI_RUNTIME_SERVICES
+    uint32_t efi_memdesc_version;   // the firmware's memory descriptor version
+    uint32_t efi_memdesc_size;      // the firmware's memory descriptor size (bytes)
+    uint32_t efi_fw_revision;       // EFI_SYSTEM_TABLE.FirmwareRevision
+    uint32_t efi_spec_revision;     // EFI_SYSTEM_TABLE.Hdr.Revision
+    char     efi_fw_vendor[64];     // EFI_SYSTEM_TABLE.FirmwareVendor, folded to ASCII
+    uint32_t efi_rt_count;          // entries used in efi_rt_regions[]
+    uint32_t efi_rt_dropped;        // runtime regions that did not fit (0 normally)
+    struct {
+        uint32_t type;              // EFI memory type
+        uint32_t pad;
+        uint64_t phys;              // first byte
+        uint64_t pages;             // length in 4 KiB pages
+        uint64_t attribute;         // EFI_MEMORY_* bits
+    } efi_rt_regions[BOOT_EFI_RT_MAX];
+    uint32_t bootmenu_entry;        // boot menu entry started (0-based), BOOT_MENU_NONE
+    uint32_t efi_reserved;
 } boot_info_t;
+
+#define BOOT_EFI_MAGIC 0x56524553544e5552ULL /* "RUNTSERV" */
+#define BOOT_MENU_NONE 0xffffffffu
+#define BL_EFI_MEMORY_RUNTIME 0x8000000000000000ULL
 
 #define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
 #define BOOT_DISPLAY_MAGIC 0x5953494459414c50ULL
@@ -265,6 +300,19 @@ static void serial_putdec(UINT64 val) {
         val /= 10;
     }
     serial_puts(&buf[i+1]);
+}
+
+/* The serial log for the loader's other parts (bootcommon.h). */
+void bl_log(const char *s) {
+    serial_puts(s);
+}
+
+void bl_log_dec(UINT64 v) {
+    serial_putdec(v);
+}
+
+void bl_log_hex(UINT64 v) {
+    serial_puthex(v);
 }
 
 /*
@@ -1890,6 +1938,182 @@ static void boot_cmdline_init(EFI_HANDLE image) {
     }
 }
 
+/* The boot menu's choice: its words go after the command line's own (so a
+ * word given twice is decided by the menu -- the last one wins), and root=
+ * is looked up again in case the entry names one.  Whole words only: one
+ * that does not fit any more is left out, never cut. */
+static void bl_cmdline_append(const char *words) {
+    char *out = g_boot_info.cmdline;
+    UINTN cap = sizeof(g_boot_info.cmdline), o = 0;
+    BOOLEAN dropped = FALSE;
+
+    while (out[o]) o++;
+    while (*words) {
+        const char *w;
+        UINTN n = 0;
+
+        while (*words == ' ') words++;
+        w = words;
+        while (*words && *words != ' ') words++;
+        n = (UINTN)(words - w);
+        if (!n) break;
+        if (o + (o ? 1 : 0) + n + 1 > cap) {
+            dropped = TRUE;
+            continue;
+        }
+        if (o) out[o++] = ' ';
+        for (UINTN i = 0; i < n; i++) out[o++] = w[i];
+        out[o] = 0;
+    }
+    if (dropped) {
+        serial_puts("boot-id: command line full, menu words left out\n");
+        Print(L"WARNING: the boot command line is full; menu options left out\r\n");
+    }
+    g_boot_info.root_spec[0] = 0;
+    if (bl_cmdline_get("root", g_boot_info.root_spec, sizeof(g_boot_info.root_spec))) {
+        serial_puts("boot-id: root=");
+        serial_puts(g_boot_info.root_spec);
+        serial_putc('\n');
+    }
+    serial_puts("boot-id: command line with the menu's words: ");
+    serial_puts(out);
+    serial_putc('\n');
+}
+
+/* The boot menu, when this partition has one (the live medium). */
+static void boot_menu(EFI_HANDLE image) {
+    char words[BOOTMENU_ARGS_MAX];
+    INT32 choice;
+
+    g_boot_info.bootmenu_entry = BOOT_MENU_NONE;
+    choice = bootmenu_run(image, words, sizeof(words));
+    if (choice < 0)
+        return;
+    g_boot_info.bootmenu_entry = (uint32_t)choice;
+    if (words[0])
+        bl_cmdline_append(words);
+    if (g_boot_info.cmdline[0])
+        Print(L"Boot command line: %a\r\n", g_boot_info.cmdline);
+}
+
+/* The memory map for the kernel (boot_info_t.mem_info) from a map read
+ * with GetMemoryMap: at most MAX_MEMORY_MAP_ENTRIES entries.  Plain memory
+ * work, no firmware call: also run once more after ExitBootServices with
+ * the final map.  dump: the whole map to the serial port as well. */
+static void bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                              UINTN desc_size, int dump) {
+    UINTN num_entries = desc_size ? map_size / desc_size : 0;
+
+    g_boot_info.mem_info.entry_count = 0;
+    g_boot_info.mem_info.descriptor_size = (uint32_t)desc_size;
+    g_boot_info.mem_info.total_memory = 0;
+
+    if (dump) {
+        // Dump full memory map to serial for VMware debugging
+        serial_puts("\n=== UEFI MEMORY MAP ===\n");
+        serial_puts("Entries: ");
+        serial_putdec(num_entries);
+        serial_puts(", Descriptor size: ");
+        serial_putdec(desc_size);
+        serial_puts("\n\n");
+    }
+
+    for (UINTN i = 0; i < num_entries && g_boot_info.mem_info.entry_count < MAX_MEMORY_MAP_ENTRIES; i++) {
+        const EFI_MEMORY_DESCRIPTOR *desc =
+            (const EFI_MEMORY_DESCRIPTOR *)((const UINT8 *)map + i * desc_size);
+
+        if (dump) {
+            serial_puts("[");
+            serial_putdec(i);
+            serial_puts("] ");
+            serial_puthex(desc->PhysicalStart);
+            serial_puts(" - ");
+            serial_puthex(desc->PhysicalStart + desc->NumberOfPages * 4096);
+            serial_puts(" (");
+            serial_putdec(desc->NumberOfPages);
+            serial_puts(" pages, ");
+            serial_putdec(desc->NumberOfPages * 4096 / 1024);
+            serial_puts(" KB) Type=");
+            serial_putdec(desc->Type);
+            serial_puts(" ");
+            serial_puts(efi_memory_type_name(desc->Type));
+            serial_puts("\n");
+        }
+
+        // Copy entry to boot_info
+        memory_map_entry_t *entry = &g_boot_info.mem_info.entries[g_boot_info.mem_info.entry_count];
+        entry->type = desc->Type;
+        entry->physical_start = desc->PhysicalStart;
+        entry->virtual_start = desc->VirtualStart;
+        entry->number_of_pages = desc->NumberOfPages;
+        entry->attribute = desc->Attribute;
+
+        // Count usable memory (EfiConventionalMemory type = 7)
+        if (desc->Type == 7) {
+            g_boot_info.mem_info.total_memory += desc->NumberOfPages * 4096;
+        }
+
+        g_boot_info.mem_info.entry_count++;
+    }
+
+    if (dump) {
+        serial_puts("\nTotal usable memory: ");
+        serial_putdec(g_boot_info.mem_info.total_memory / (1024 * 1024));
+        serial_puts(" MB\n");
+        serial_puts("=== END MEMORY MAP ===\n\n");
+    }
+}
+
+/* What the kernel needs for the runtime services: the tables, and every
+ * region of the memory map marked EFI_MEMORY_RUNTIME.  Plain memory work,
+ * no firmware call: also run once more after ExitBootServices with the
+ * final map. */
+static void bl_collect_runtime(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                               UINTN desc_size, UINT32 desc_version) {
+    UINTN n = desc_size ? map_size / desc_size : 0;
+
+    g_boot_info.efi_rt_count = 0;
+    g_boot_info.efi_rt_dropped = 0;
+    g_boot_info.efi_memdesc_size = (uint32_t)desc_size;
+    g_boot_info.efi_memdesc_version = desc_version;
+    for (UINTN i = 0; i < n; i++) {
+        const EFI_MEMORY_DESCRIPTOR *d =
+            (const EFI_MEMORY_DESCRIPTOR *)((const UINT8 *)map + i * desc_size);
+        UINT32 k;
+
+        if (!(d->Attribute & BL_EFI_MEMORY_RUNTIME) || !d->NumberOfPages)
+            continue;
+        k = g_boot_info.efi_rt_count;
+        if (k >= BOOT_EFI_RT_MAX) {
+            g_boot_info.efi_rt_dropped++;
+            continue;
+        }
+        g_boot_info.efi_rt_regions[k].type = d->Type;
+        g_boot_info.efi_rt_regions[k].pad = 0;
+        g_boot_info.efi_rt_regions[k].phys = d->PhysicalStart;
+        g_boot_info.efi_rt_regions[k].pages = d->NumberOfPages;
+        g_boot_info.efi_rt_regions[k].attribute = d->Attribute;
+        g_boot_info.efi_rt_count = k + 1;
+    }
+}
+
+static void bl_efi_tables(void) {
+    UINTN i = 0;
+
+    g_boot_info.efi_system_table = (uint64_t)(UINTN)ST;
+    g_boot_info.efi_runtime_services = (uint64_t)(UINTN)ST->RuntimeServices;
+    g_boot_info.efi_fw_revision = ST->FirmwareRevision;
+    g_boot_info.efi_spec_revision = ST->Hdr.Revision;
+    if (ST->FirmwareVendor) {
+        for (; ST->FirmwareVendor[i] && i + 1 < sizeof(g_boot_info.efi_fw_vendor); i++) {
+            CHAR16 c = ST->FirmwareVendor[i];
+            g_boot_info.efi_fw_vendor[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+        }
+    }
+    g_boot_info.efi_fw_vendor[i] = 0;
+    g_boot_info.efi_magic = BOOT_EFI_MAGIC;
+}
+
 /* ---- The loader disk's partition table ----------------------------------- */
 
 /* Read the GPT of the loader's disk through the whole-disk BLOCK_IO handle
@@ -2322,7 +2546,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // saved display setting, the kernel) comes from that partition alone,
     // and the kernel receives the same identity to find its root by.
     boot_identity_init(ImageHandle);
+    // Started from \EFI\BOOT on an installed disk whose firmware has lost
+    // (or never got) the LikeOS boot entry: put it back.
+    boot_fallback_register(ImageHandle);
     boot_cmdline_init(ImageHandle);
+    // The live medium's boot menu: its choice adds to the command line
+    // before the root partition is chosen from it.
+    boot_menu(ImageHandle);
     bl_read_loader_gpt();
     boot_select_root();
 
@@ -2611,6 +2841,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_MEMORY_DESCRIPTOR *memory_map = NULL;
     UINTN map_key, descriptor_size;
     UINT32 descriptor_version;
+    UINTN memory_map_cap;
     
     // Get memory map size
     status = uefi_call_wrapper(BS->GetMemoryMap, 5, &memory_map_size, memory_map, 
@@ -2625,7 +2856,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     
     // Allocate buffer for memory map
-    memory_map_size += 2 * descriptor_size;  // Add some extra space
+    // Extra room: the trampoline, the page tables and the SMP trampoline
+    // are allocated after the map is read, and ExitBootServices reads it
+    // once more into this same buffer.
+    memory_map_size += 16 * descriptor_size;
+    memory_map_cap = memory_map_size;
     status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, 
                                memory_map_size, (VOID**)&memory_map);
     if (EFI_ERROR(status)) {
@@ -2653,65 +2888,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // Store memory map info for kernel
     {
         UINTN num_entries = memory_map_size / descriptor_size;
-        g_boot_info.mem_info.entry_count = 0;
-        g_boot_info.mem_info.descriptor_size = (uint32_t)descriptor_size;
-        g_boot_info.mem_info.total_memory = 0;
-        
+
         Print(L"Processing %lu memory map entries...\r\n", num_entries);
-        
-        // Dump full memory map to serial for VMware debugging
-        serial_puts("\n=== UEFI MEMORY MAP ===\n");
-        serial_puts("Entries: ");
-        serial_putdec(num_entries);
-        serial_puts(", Descriptor size: ");
-        serial_putdec(descriptor_size);
-        serial_puts("\n\n");
-        
-        for (UINTN i = 0; i < num_entries && g_boot_info.mem_info.entry_count < MAX_MEMORY_MAP_ENTRIES; i++) {
-            EFI_MEMORY_DESCRIPTOR *desc = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)memory_map + i * descriptor_size);
-            
-            // Dump to serial
-            serial_puts("[");
-            serial_putdec(i);
-            serial_puts("] ");
-            serial_puthex(desc->PhysicalStart);
-            serial_puts(" - ");
-            serial_puthex(desc->PhysicalStart + desc->NumberOfPages * 4096);
-            serial_puts(" (");
-            serial_putdec(desc->NumberOfPages);
-            serial_puts(" pages, ");
-            serial_putdec(desc->NumberOfPages * 4096 / 1024);
-            serial_puts(" KB) Type=");
-            serial_putdec(desc->Type);
-            serial_puts(" ");
-            serial_puts(efi_memory_type_name(desc->Type));
-            serial_puts("\n");
-            
-            // Copy entry to boot_info
-            memory_map_entry_t *entry = &g_boot_info.mem_info.entries[g_boot_info.mem_info.entry_count];
-            entry->type = desc->Type;
-            entry->physical_start = desc->PhysicalStart;
-            entry->virtual_start = desc->VirtualStart;
-            entry->number_of_pages = desc->NumberOfPages;
-            entry->attribute = desc->Attribute;
-            
-            // Count usable memory (EfiConventionalMemory type = 7)
-            if (desc->Type == 7) {
-                g_boot_info.mem_info.total_memory += desc->NumberOfPages * 4096;
-            }
-            
-            g_boot_info.mem_info.entry_count++;
-        }
-        
-        serial_puts("\nTotal usable memory: ");
-        serial_putdec(g_boot_info.mem_info.total_memory / (1024 * 1024));
-        serial_puts(" MB\n");
-        serial_puts("=== END MEMORY MAP ===\n\n");
-        
+        bl_store_mem_info(memory_map, memory_map_size, descriptor_size, 1);
         Print(L"Stored %d memory entries, total usable: %lu MB\r\n", 
               g_boot_info.mem_info.entry_count, 
               g_boot_info.mem_info.total_memory / (1024 * 1024));
     }
+
+    // The runtime services for the kernel (boot variables, clock).
+    bl_efi_tables();
+    bl_collect_runtime(memory_map, memory_map_size, descriptor_size, descriptor_version);
+    serial_puts("EFI runtime: ");
+    serial_putdec(g_boot_info.efi_rt_count);
+    serial_puts(" runtime regions, RuntimeServices at ");
+    serial_puthex(g_boot_info.efi_runtime_services);
+    serial_puts(g_boot_info.efi_rt_dropped ? " (some regions did not fit)\n" : "\n");
     
     // Find ACPI RSDP from UEFI Configuration Tables
     g_boot_info.rsdp_address = 0;
@@ -2838,10 +3030,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // Step 3: Exit boot services
     status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
     if (EFI_ERROR(status)) {
-        // Try one more time in case the memory map changed
+        // Try one more time in case the memory map changed: the whole
+        // buffer, since the map has grown by the allocations since.
+        memory_map_size = memory_map_cap;
         uefi_call_wrapper(BS->GetMemoryMap, 5, &memory_map_size, memory_map, 
                           &map_key, &descriptor_size, &descriptor_version);
         status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
+        if (!EFI_ERROR(status)) {
+            // The map the firmware left the machine with: the kernel's
+            // memory map and the runtime regions from it (memory work
+            // only, no firmware call).
+            bl_store_mem_info(memory_map, memory_map_size, descriptor_size, 0);
+            bl_collect_runtime(memory_map, memory_map_size, descriptor_size,
+                               descriptor_version);
+            serial_puts("ExitBootServices on the re-read map: ");
+            serial_putdec(g_boot_info.mem_info.entry_count);
+            serial_puts(" memory entries, ");
+            serial_putdec(g_boot_info.mem_info.total_memory / (1024 * 1024));
+            serial_puts(" MB usable\n");
+        }
         if (EFI_ERROR(status)) {
             Print(L"ERROR: Could not exit boot services: %r\r\n", status);
             Print(L"System halted. Press any key to continue...\r\n");

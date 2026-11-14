@@ -1,0 +1,52 @@
+# libgpt -- host build and tests (glibc, the build machine's gcc).
+#
+#   make -f Makefile.host          host library + test programs
+#   make -f Makefile.host check    run the tests (boxed: nice, ulimit, timeout)
+#
+# The tests work on sparse image files in a scratch directory (TESTDIR,
+# default a fresh directory under $TMPDIR) and cross-check the results with
+# the host's sgdisk and sfdisk.  Nothing runs as root and no block device
+# is ever opened.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+AR = ar
+
+HOSTDIR = host
+CFLAGS = -D_GNU_SOURCE -Wall -Wextra -Werror=implicit-function-declaration \
+	-O2 -g -Iinclude -I.
+
+SRC = crc32.c guid.c blkio.c mbr.c gpt.c layout.c types.c
+HOST_OBJ = $(addprefix $(HOSTDIR)/,$(SRC:.c=.o))
+HOST_LIB = $(HOSTDIR)/libgpt.a
+TOOLS_DIR = ../../installer/tools
+
+TESTS = $(HOSTDIR)/test_gpt $(HOSTDIR)/likeos-gpt
+
+all: $(HOST_LIB) $(TESTS)
+
+$(HOSTDIR):
+	mkdir -p $@
+
+$(HOSTDIR)/%.o: %.c include/gpt.h gpt_internal.h | $(HOSTDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(HOST_LIB): $(HOST_OBJ)
+	rm -f $@
+	$(AR) rcs $@ $(HOST_OBJ)
+
+$(HOSTDIR)/test_gpt: tests/test_gpt.c $(HOST_LIB)
+	$(CC) $(CFLAGS) $< $(HOST_LIB) -o $@
+
+$(HOSTDIR)/likeos-gpt: $(TOOLS_DIR)/likeos-gpt.c $(HOST_LIB)
+	$(CC) $(CFLAGS) $< $(HOST_LIB) -o $@
+
+check: all
+	nice -n 19 timeout 300 sh -c 'ulimit -v 2500000; \
+		sh tests/run-tests.sh $(HOSTDIR)/test_gpt $(HOSTDIR)/likeos-gpt'
+
+clean:
+	rm -rf $(HOSTDIR)
+
+.PHONY: all check clean

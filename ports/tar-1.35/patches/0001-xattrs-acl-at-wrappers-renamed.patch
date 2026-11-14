@@ -1,0 +1,82 @@
+xattrs.c: rename the static acl_*_at() wrappers so they do not collide with
+libacl's.
+
+acl 2.4.0 added acl_get_file_at(), acl_set_file_at() and
+acl_delete_def_file_at() to <sys/acl.h>, with an at_flags argument the
+static wrappers of the same names in src/xattrs.c (built from
+gnu/at-func.c) do not have, so the file no longer compiles against it.
+The wrappers become xattrs_acl_*_at(); they and what they do are
+unchanged, and so are the messages naming the calls.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/xattrs.c	2026-11-13 15:23:13.058707374 +0100
++++ b/src/xattrs.c	2026-11-13 15:23:13.071707474 +0100
+@@ -139,13 +139,13 @@
+ #ifdef HAVE_POSIX_ACLS
+ 
+ /* acl-at wrappers, TODO: move to gnulib in future? */
+-static acl_t acl_get_file_at (int, const char *, acl_type_t);
+-static int acl_set_file_at (int, const char *, acl_type_t, acl_t);
++static acl_t xattrs_acl_get_file_at (int, const char *, acl_type_t);
++static int xattrs_acl_set_file_at (int, const char *, acl_type_t, acl_t);
+ static int file_has_acl_at (int, char const *, struct stat const *);
+-static int acl_delete_def_file_at (int, char const *);
++static int xattrs_acl_delete_def_file_at (int, char const *);
+ 
+-/* acl_get_file_at */
+-#define AT_FUNC_NAME acl_get_file_at
++/* xattrs_acl_get_file_at */
++#define AT_FUNC_NAME xattrs_acl_get_file_at
+ #define AT_FUNC_RESULT acl_t
+ #define AT_FUNC_FAIL (acl_t)NULL
+ #define AT_FUNC_F1 acl_get_file
+@@ -159,8 +159,8 @@
+ #undef AT_FUNC_POST_FILE_PARAM_DECLS
+ #undef AT_FUNC_POST_FILE_ARGS
+ 
+-/* acl_set_file_at */
+-#define AT_FUNC_NAME acl_set_file_at
++/* xattrs_acl_set_file_at */
++#define AT_FUNC_NAME xattrs_acl_set_file_at
+ #define AT_FUNC_F1 acl_set_file
+ #define AT_FUNC_POST_FILE_PARAM_DECLS   , acl_type_t type, acl_t acl
+ #define AT_FUNC_POST_FILE_ARGS          , type, acl
+@@ -170,8 +170,8 @@
+ #undef AT_FUNC_POST_FILE_PARAM_DECLS
+ #undef AT_FUNC_POST_FILE_ARGS
+ 
+-/* acl_delete_def_file_at */
+-#define AT_FUNC_NAME acl_delete_def_file_at
++/* xattrs_acl_delete_def_file_at */
++#define AT_FUNC_NAME xattrs_acl_delete_def_file_at
+ #define AT_FUNC_F1 acl_delete_def_file
+ #define AT_FUNC_POST_FILE_PARAM_DECLS
+ #define AT_FUNC_POST_FILE_ARGS
+@@ -299,7 +299,7 @@
+       /* No "default" IEEE 1003.1e ACL set for directory.  At this moment,
+          FILE_NAME may already have inherited default acls from parent
+          directory;  clean them up. */
+-      if (acl_delete_def_file_at (chdir_fd, file_name))
++      if (xattrs_acl_delete_def_file_at (chdir_fd, file_name))
+         WARNOPT (WARN_XATTR_WRITE,
+                 (0, errno,
+                  _("acl_delete_def_file_at: Cannot drop default POSIX ACLs "
+@@ -316,7 +316,7 @@
+       return;
+     }
+ 
+-  if (acl_set_file_at (chdir_fd, file_name, type, acl) == -1)
++  if (xattrs_acl_set_file_at (chdir_fd, file_name, type, acl) == -1)
+     /* warn even if filesystem does not support acls */
+     WARNOPT (WARN_XATTR_WRITE,
+ 	     (0, errno,
+@@ -357,7 +357,7 @@
+   char *val = NULL;
+   acl_t acl;
+ 
+-  if (!(acl = acl_get_file_at (parentfd, file_name, type)))
++  if (!(acl = xattrs_acl_get_file_at (parentfd, file_name, type)))
+     {
+       if (errno != ENOTSUP)
+         call_arg_warn ("acl_get_file_at", file_name);

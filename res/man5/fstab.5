@@ -1,0 +1,170 @@
+FSTAB(5)                         File Formats                         FSTAB(5)
+
+NAME
+       fstab - the file systems to mount
+
+SYNOPSIS
+       /etc/fstab
+
+DESCRIPTION
+       /etc/fstab  lists  the  file systems of the computer and where they are
+       mounted.  init(8) reads it at start-up and mounts  them;  mount(1)  and
+       umount(1)  read  it to complete a command that names only a mount point
+       or a device, and mount -a mounts what it lists.
+
+       The file is plain text, one file system  per  line.   Empty  lines  and
+       lines starting with # are ignored.  A line has six fields, separated by
+       blanks (spaces or tabs):
+
+              fs_spec fs_file fs_vfstype fs_mntops fs_freq fs_passno
+
+       A  blank inside a field is written \040 (a tab \011, a backslash \134).
+       The last two fields may be left out; they are 0 then.
+
+   fs_spec
+       What is mounted:
+
+       UUID=uuid
+              The file system with this UUID (ext4, or  the  xxxx-xxxx  volume
+              serial  of  a  FAT file system), as blkid(8) shows it.  The best
+              choice: it stays the same when disks are added, removed or found
+              in another order.
+
+       LABEL=label
+              The file system with this label (e2label(8), fatlabel(8)).
+
+       PARTUUID=uuid
+              The partition with this unique partition GUID (GPT) or MBR iden-
+              tifier (ssssssss-nn).
+
+       PARTLABEL=name
+              The partition with this name (GPT).
+
+       /dev/device
+              A device by name: /dev/sda1, /dev/nvme0n1p2.  Names  follow  the
+              order in which disks are found, and can change.
+
+       tmpfs  For a file system without a device.
+
+       The  tags are looked up in /dev/disk/by-uuid, by-label, by-partuuid and
+       by-partlabel.  At start-up a device that is not there yet is waited for
+       (up to ten seconds: USB and NVMe disks come up after init starts).
+
+   fs_file
+       The mount point: an absolute path.  At start-up init makes it  when  it
+       does not exist; mount does that only for a line with X-mount.mkdir.
+
+   fs_vfstype
+       The file system type:
+
+       ext4   The  LikeOS  root file system and data disks (ext2 and ext3 file
+              systems are mounted as ext4).
+
+       vfat   FAT12, FAT16 and FAT32: the EFI system  partition,  USB  sticks,
+              memory cards (fat, fat32 and msdos mean the same).
+
+       tmpfs  A file system in memory.
+
+       auto   Whatever the kernel recognises on the device.
+
+       swap   Not mounted; the line is passed over.
+
+   fs_mntops
+       The  mount options, separated by commas, as for mount(1); defaults when
+       there are none to give.  The generic ones:
+
+       defaults
+              rw, suid, dev, exec, auto, async.
+
+       ro, rw Read-only, read-write.
+
+       noauto Not mounted at start-up nor by mount -a; only on request  (mount
+              /media/stick).
+
+       nofail A  device  that  is  not  there  is no error: nothing is said at
+              start-up.
+
+       nosuid, nodev, noexec
+              No set-user-ID programs, no device files, no programs  run  from
+              the file system.
+
+       noatime, relatime, strictatime, nodiratime
+              When access times are updated.
+
+       sync, dirsync, lazytime, nosymfollow
+              See mount(1).
+
+       X-mount.mkdir[=mode]
+              Make the mount point, with this mode (octal, default 0755).
+
+       The file system's own options:
+
+       vfat   uid=n,   gid=n   (the  owner  every  file  shows),  umask=octal,
+              fmask=octal, dmask=octal (the permission bits  taken  away  from
+              everything, from files, from directories; without them files are
+              0644 and directories 0755 and anyone may read and write), short-
+              name=lower|win95|winnt|mixed.
+
+       tmpfs  size=n  (bytes  with  a k, m or g suffix, or a percentage of the
+              memory with %; default: a quarter of the  memory),  nr_inodes=n,
+              mode=octal (of the root directory, default 1777), uid=n, gid=n.
+
+       ext4   None.
+
+   fs_freq
+       The  dump  frequency.   Kept for compatibility; nothing on LikeOS reads
+       it.  Write 0.
+
+   fs_passno
+       Whether and in which order the file system is checked at start-up,  be-
+       fore  it  is mounted: 0 not checked, 1 first, 2 after those with 1, and
+       so on.  The root file system gets 1, the others 2 (or 0).  The  checker
+       is  fsck.ext4  -p  (that  is,  e2fsck(8))  for  ext4  and  fsck.vfat -a
+       (fsck.fat(8)) for FAT; a tmpfs is never checked.  A  file  system  with
+       errors  the checker could not repair is mounted read-only, and the con-
+       sole says so.
+
+THE ROOT FILE SYSTEM
+       The root file system is mounted by the kernel  before  init  runs;  its
+       line  (fs_file  /)  is not mounted again.  When the line asks for other
+       flags than the root has (ro, noatime...)  the root  is  remounted  with
+       them,  and a root mounted read-only is checked first when its fs_passno
+       is above 0.
+
+START-UP
+       At start-up init(8) goes through the file the way mount -a does:  lines
+       marked  noauto and swap lines, and mount points something is mounted on
+       already, are passed over; the devices are looked up (and  waited  for);
+       the  file systems with a pass number above 0 are checked, pass 1 before
+       pass 2; then the lines are mounted in the order  of  the  file.   Every
+       step  is  bounded  in  time:  a device that never appears, a check that
+       never finishes or a mount that hangs costs that one file system,  never
+       the start-up.
+
+EXAMPLES
+       The  file the LikeOS installer writes, with the root and the EFI system
+       partition named by their UUIDs:
+
+              UUID=6c1f...9d2a /         ext4 defaults                   0 1
+              UUID=3A7B-91C4   /boot/efi vfat umask=0077,shortname=mixed 0 2
+
+       A USB stick mounted on request, owned by user 1000:
+
+              LABEL=STICK /media/stick vfat noauto,nofail,uid=1000,gid=1000 0 0
+
+       A further memory file system for scratch files (the kernel  itself  mounts
+       /ram, the one luakit uses):
+
+              tmpfs  /scratch  tmpfs  size=512m,mode=1777,nosuid,nodev  0  0
+
+FILES
+       /etc/fstab
+              The file.
+
+       /proc/mounts
+              What is mounted now, in the same format.
+
+SEE ALSO
+       mount(1), umount(1), blkid(8), e2fsck(8), fsck.fat(8), init(8)
+
+LikeOS                           November 2026                        FSTAB(5)

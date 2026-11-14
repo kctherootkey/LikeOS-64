@@ -380,6 +380,8 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	child->in_exit_path = false;
 	child->blk_cpl_ctx = NULL; /* the creator's stack, not ours */
 	child->plug = NULL; /* likewise */
+	child->vfs_walk = NULL; /* likewise */
+	mm_memset(child->mnt_held, 0, sizeof(child->mnt_held)); /* the creator's */
 	task_fpu_fork(child, cur);
 
 	/* A new occupant of a pid, and not traced by whoever traces the parent.

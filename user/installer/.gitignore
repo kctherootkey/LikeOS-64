@@ -1,0 +1,9 @@
+# LikeOS installer: build output of the LikeOS and host builds
+# Copyright (C) 2026 The LikeOS Project
+/backend/.il-cflags
+/backend/tests/host/
+__pycache__/
+/cli/likeos-install
+/cli/host/
+/tools/likeos-gpt
+/tools/likeos-efiboot

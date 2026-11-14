@@ -1,0 +1,199 @@
+MOUNT(1)                     System Administration                    MOUNT(1)
+
+NAME
+       mount - mount file systems, or list the mounted ones
+
+SYNOPSIS
+       mount [-l] [-t types]
+       mount -a [-fnv] [-t types] [-O options]
+       mount [-fnrvw] [-t type] [-o options] source directory
+       mount [-fnrvw] [-o options] source|directory
+       mount -o remount[,options] directory
+
+DESCRIPTION
+       mount  attaches  the  file system on a device (or one that needs no de-
+       vice, such as tmpfs) to a directory, the mount point, so that its files
+       appear there.  umount(1) detaches it again.
+
+       Without arguments mount lists the mounted file systems, one line each,
+
+              source on directory type type (options)
+
+       from /proc/mounts; -t limits the list to some types.
+
+       With one argument, a mount point or a source, the  line  of  /etc/fstab
+       for  it  is  mounted,  with that line's type and options (options given
+       with -o are added to them).  mount -a mounts every line  of  /etc/fstab
+       that  is  not marked noauto, is not swap and is not mounted already, in
+       the order of the file -- what init(8) does at start-up.
+
+       Mounting needs root; listing does not.
+
+   Sources
+       /dev/device
+              A block device: /dev/sda1, /dev/nvme0n1p2, /dev/mmcblk0p1.
+
+       UUID=uuid
+              The device whose file system has this UUID (blkid(8) shows it).
+
+       LABEL=label
+              The device whose file system has this label.
+
+       PARTUUID=uuid
+              The partition with this unique partition GUID (GPT) or MBR iden-
+              tifier.
+
+       PARTLABEL=name
+              The partition with this name (GPT).
+
+       word   A file system without a device: tmpfs.
+
+       The tags are looked up in /dev/disk/by-uuid, by-label, by-partuuid  and
+       by-partlabel.   Bind  mounts and loop devices (a directory or a file as
+       the source) are not offered.
+
+   File system types
+       ext4   The LikeOS root file system and data disks (also ext2  and  ext3
+              file systems, read and written as ext4).
+
+       vfat   FAT12, FAT16 and FAT32: the EFI system partition, USB sticks and
+              memory cards (fat, fat32 and msdos are taken for the same).
+
+       tmpfs  A  file  system  in  memory,  empty  when mounted, gone when un-
+              mounted.
+
+       Without -t the type is the one /etc/fstab gives,  or  else  the  kernel
+       recognises the file system on the device.
+
+OPTIONS
+       -a, --all
+              Mount every file system of /etc/fstab that is not noauto.
+
+       -t, --types list
+              The  file  system  type.  With -a or a listing: the types to in-
+              clude,  separated  by  commas;  a  no  prefix  excludes  a  type
+              (notmpfs),  and  a  list  starting  with  no excludes all of its
+              types.
+
+       -O, --test-opts list
+              With -a: only the lines that have these options (no  option  se-
+              lects the lines without it).
+
+       -o, --options list
+              Mount options, separated by commas (below).
+
+       -r, -R, --read-only
+              Mount read-only, the same as -o ro.
+
+       -w, --rw, --read-write
+              Mount  read-write,  the  same as -o rw.  A device that is write-
+              protected is mounted read-only when neither rw nor -w was  asked
+              for.
+
+       -f, --fake
+              Do  everything but the mount itself (with -v: show what would be
+              mounted).
+
+       -n, --no-mtab
+              Accepted; there is no /etc/mtab to update.
+
+       -v, --verbose
+              Say what is mounted, with which options.
+
+       -l, --show-labels
+              Accepted with a listing.
+
+       -h, --help
+              Show a summary of the options.
+
+       -V, --version
+              Show the version.
+
+MOUNT OPTIONS
+       The options every file system takes:
+
+       ro, rw Read-only, or read-write (the default).
+
+       defaults
+              rw, suid, dev, exec, auto, async.
+
+       nosuid, suid
+              Ignore (or honour) the set-user-ID and set-group-ID bits of pro-
+              grams.
+
+       nodev, dev
+              Do not (or do) give access to device files on the file system.
+
+       noexec, exec
+              Do not (or do) allow programs on the file system to be run.
+
+       noatime, atime, relatime, strictatime, nodiratime, diratime
+              When the access times of files (and directories) are updated.
+
+       sync, async, dirsync
+              Write data (or directory changes) at once, or when convenient.
+
+       lazytime
+              Keep time stamp updates in memory longer.
+
+       nosymfollow
+              Do not follow symbolic links on the file system.
+
+       remount
+              Change the options of a file system that is mounted already: its
+              flags (ro and rw among them) are those it has,  changed  by  the
+              options given.
+
+       noauto, auto
+              In  /etc/fstab:  not  mounted  (or  mounted)  by mount -a and at
+              start-up.
+
+       nofail In /etc/fstab: a device that is not there is no error.
+
+       X-mount.mkdir[=mode]
+              Make the mount point when it does not exist (with  mode,  octal;
+              default 0755).
+
+       Anything  else  is  the  file  system's own option and passed on to it.
+       ext4 has none.  vfat takes uid=n and gid=n (the owner every file shows;
+       FAT stores none), umask=octal, fmask=octal and dmask=octal (the permis-
+       sion bits taken away from every file, from files, from directories; the
+       defaults  give  files  0644   and   directories   0755),   and   short-
+       name=lower|win95|winnt|mixed (how names that fit 8.3 are shown and cre-
+       ated).   tmpfs  takes size=n (bytes, with a k, m or g suffix, or a per-
+       centage of the memory with %; default: a quarter of the memory), nr_in-
+       odes=n (the most files), mode=octal (of  the  root  directory;  default
+       1777), uid=n and gid=n (the owner of the root directory).
+
+EXIT STATUS
+       0      Success.
+
+       1      Wrong usage, or no permission.
+
+       2      A system error.
+
+       32     The mount failed.
+
+       64     Some of several mounts failed (-a).
+
+FILES
+       /etc/fstab
+              The file systems to mount, see fstab(5).
+
+       /proc/mounts
+              What is mounted now.
+
+       /dev/disk/by-uuid, by-label, by-partuuid, by-partlabel
+              Where the tags are looked up.
+
+EXAMPLES
+       mount /dev/sdb1 /mnt
+       mount -t vfat -o uid=1000,gid=1000 LABEL=STICK /media/stick
+       mount -t tmpfs -o size=512m,mode=1777 tmpfs /scratch
+       mount -o remount,ro /
+       mount -a -t notmpfs
+
+SEE ALSO
+       umount(1), fstab(5), blkid(8), lsblk(8), findfs(8)
+
+LikeOS                           November 2026                        MOUNT(1)

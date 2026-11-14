@@ -216,6 +216,18 @@
 #define SYS_PREADV2     427
 #define SYS_PWRITEV2    428
 #define SYS_MSYNC       429   /* (addr, length, flags) */
+/* Mounting and the remaining directory-relative name calls. */
+#define SYS_MOUNT       430   /* (source, target, fstype, flags, data) */
+#define SYS_UMOUNT2     431   /* (target, flags) */
+#define SYS_MKNODAT     432   /* (dirfd, path, mode, dev) */
+#define SYS_FCHOWNAT    433   /* (dirfd, path, owner, group, flags) */
+#define SYS_LINKAT      434   /* (olddirfd, oldpath, newdirfd, newpath, flags) */
+#define SYS_SYMLINKAT   435   /* (target, newdirfd, linkpath) */
+#define SYS_MKDIRAT     436   /* (dirfd, path, mode) */
+#define SYS_RENAMEAT2   437   /* (olddirfd, oldpath, newdirfd, newpath, flags) */
+#define SYS_FCHMODAT    438   /* (dirfd, path, mode, flags) */
+#define SYS_SYNCFS      439   /* (fd) */
+#define SYS_READLINKAT  440   /* (dirfd, path, buf, bufsiz) */
 #define SYS_TKILL       258   /* (tid, sig) signal ONE thread */
 #define SYS_TGKILL      259   /* (tgid, tid, sig) same, group-checked */
 #define SYS_PTRACE      408   /* (request, pid, addr, data) — see sys/ptrace.h */

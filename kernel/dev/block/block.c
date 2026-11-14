@@ -891,14 +891,16 @@ static int blk_validate_extended(struct blk_request *req)
 
 	if (!disk || !q || disk->magic != GENDISK_MAGIC)
 		return -ENODEV;
+	/* A disk whose device is gone (blk_mark_disk_dead): I/O fails with
+	 * -EIO -- also once disk_del() took it down, for whoever still has
+	 * it open or mounted; a pass-through command is refused as at its
+	 * allocation. */
+	if (disk_flags(disk) & GENHD_FL_GONE)
+		return blk_rq_is_passthrough(req) ? -ENODEV : -EIO;
 	if ((bdev->flags & BDEV_F_DEAD) || (disk->flags & GENHD_FL_DEAD))
 		return -ENODEV;
 	if ((bdev->parent && (bdev->parent->flags & BDEV_F_DEAD)))
 		return -ENODEV;
-	/* A disk whose device is gone (blk_mark_disk_dead): I/O fails with
-	 * -EIO; a pass-through command is refused as at its allocation. */
-	if (disk_flags(disk) & GENHD_FL_GONE)
-		return blk_rq_is_passthrough(req) ? -ENODEV : -EIO;
 	/* Single queue: the driver's ->submit; multi-queue: its tag set. */
 	if (!disk->ops || (!disk->ops->submit && !blk_queue_is_mq(q)))
 		return -ENODEV;

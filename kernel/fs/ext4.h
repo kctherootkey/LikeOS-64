@@ -478,6 +478,14 @@ typedef struct ext4_fs {
 	int j_csum3; /* journal uses jbd2 csum v3         */
 	uint32_t j_csum_seed; /* crc32c(~0, j_uuid) for tag/desc/  */
 	/* commit csums (NOT the sb csum)    */
+	/* Everything else the mounted filesystem keeps: locks, caches, the
+	 * journal batch (struct ext4_state, private to ext4.c).  Allocated by
+	 * ext4_mount(). */
+	struct ext4_state *st;
+	/* The mount this filesystem is (NULL until registered). */
+	struct vfs_mount *mnt;
+	/* What mount(2) asked for beyond the flags (EXT4_MNT_*, ext4.c). */
+	unsigned mnt_opts;
 } ext4_fs_t;
 
 typedef struct ext4_file {
@@ -503,47 +511,17 @@ typedef struct ext4_file {
  * =================================================================== */
 
 /* Probe + mount the ext4 filesystem on `bdev` into `out`.  Returns ST_OK on
- * success (a valid ext4 superblock was found and parsed). */
-int ext4_mount(const block_device_t *bdev, ext4_fs_t *out);
+ * success (a valid ext4 superblock was found and parsed).  `read_only' makes
+ * the mount refuse every modification once it is up (a journal left behind
+ * is still replayed first, so the filesystem it shows is consistent).  On
+ * failure nothing is left allocated. */
+int ext4_mount(const block_device_t *bdev, ext4_fs_t *out, int read_only);
 
-/* Register a mounted ext4_fs_t as the VFS root (publishes g_root_sb and the
- * vfs_ops_t).  Returns ST_OK. */
+/* Register a mounted ext4_fs_t as the VFS root (the mount table's "/").
+ * Returns ST_OK. */
 int ext4_vfs_register_root(ext4_fs_t *fs);
 
-/* Reentrant sleeping I/O mutex (same discipline as fat32_io_lock). */
-void ext4_io_lock(void);
-void ext4_io_unlock(void);
-int ext4_io_release_if_owner(uint64_t task_id);
-
-/* Set the per-process current directory inode (used by chdir/relative paths). */
-unsigned long ext4_get_cwd_ino(void);
-void ext4_set_cwd_ino(unsigned long ino);
-
-/* The active ext4 root (non-NULL when ext4 is the mounted root). */
-extern ext4_fs_t *g_ext4_fs;
-
-/* Update a file's mtime (path-based).  mtime_nsec == 1073741823 means "now",
- * 1073741822 means "omit".  Returns ST_OK / ST_NOT_FOUND / ST_IO. */
-int ext4_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec);
-
-/* Fill basic filesystem statistics for statfs(2).  Returns 0 on success. */
-int ext4_get_statfs(unsigned long *f_bsize, unsigned long *f_blocks,
-		    unsigned long *f_bfree, unsigned long *f_files,
-		    unsigned long *f_ffree, unsigned long *f_namelen,
-		    unsigned long *f_type);
-
-/* Symlinks / hard links / chmod / chown / lstat.  All return ST_OK
- * or an ST_* error (readlink returns the byte count). */
-int ext4_symlink(const char *target, const char *linkpath);
-int ext4_readlink(const char *path, char *buf, unsigned long bufsiz);
-int ext4_link(const char *oldpath, const char *newpath);
-int ext4_chmod(const char *path, unsigned mode);
-int ext4_chown(const char *path, int uid, int gid);
-int ext4_lstat(const char *path, struct kstat *st);
-/* fd-based variants: ext4_file_ino() returns the inode behind an ext4 vfs_file
- * (0 if not ext4), to back fchmod/fchown. */
-unsigned long ext4_file_ino(struct vfs_file *f);
-int ext4_fchmod_ino(unsigned long ino, unsigned mode);
-int ext4_fchown_ino(unsigned long ino, int uid, int gid);
+/* The filesystem type mount(2) instantiates for "ext4", "ext3", "ext2". */
+extern const vfs_fstype_t ext4_fstype;
 
 #endif /* LIKEOS_EXT4_H */

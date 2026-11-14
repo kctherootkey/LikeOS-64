@@ -205,8 +205,8 @@ Filesystems and storage
   close.
 - The bootloader reads /boot/kernel.elf straight out of ext4.
 - FAT32 with long file names, used for the EFI System Partition.
-- tmpfs mounted at /ram, with hard links (used to run the browser's cache in
-  RAM).
+- tmpfs with hard links, mounted at /ram by the kernel at boot (used to run
+  the browser's cache in RAM, on the live medium and on an installed disk).
 - devfs: /dev/null, zero, random, urandom, tty, console, ptmx, pts/*, fb0,
   input/event*, dri/card*, dri/renderD*, shm, fd and the disk nodes.
 - procfs (/proc) and sysfs (/sys/bus/pci/devices and device classes such as
@@ -575,7 +575,8 @@ luakit 2.4.0:
 - Built-in ad blocking with option-aware filter rules and a keyword index,
   shipping EasyList, EasyPrivacy, Peter Lowe's list and more than twenty
   regional lists.
-- An optional launcher keeps the browser's profile and caches in RAM (/ram).
+- A launcher keeps the browser's profile and caches in RAM (/ram), on the
+  live medium and on a system installed on a disk alike.
 - A cheat sheet of its key bindings and of the LikeOS-specific settings is on
   the web site: https://likeos.systemtrap.com/luakit.html
 
@@ -679,14 +680,31 @@ Building LikeOS
 ---------------
 
 Everything is built from source on a build host by the top-level Makefile,
-including the third-party ports under ports/.  The result is a single file,
-build/likeos-ext4.img, a complete bootable GPT disk:
+including the third-party ports under ports/.  The build makes two
+deliverables from the same kernel, bootloader and programs:
 
-  Partition 1   a small FAT EFI System Partition (64 MB by default) that holds
-                only the UEFI bootloader, /EFI/BOOT/BOOTX64.EFI
-  Partition 2   the ext4 root filesystem with the kernel (/boot/kernel.elf)
-                and the whole userland; the bootloader reads the kernel
-                straight out of ext4
+  build/likeos-rootfs.tar.zst   the installed system: a clean, reproducible
+    (+ .sha256, .info)          root filesystem (GNU tar, POSIX format, zstd)
+                                that the installer unpacks onto a disk.  It
+                                keeps owners, modes, symbolic and hard links,
+                                extended attributes, ACLs and device nodes,
+                                and holds nothing of the live system: no
+                                installer, no SSH host keys, no
+                                temporary files or other state of a running
+                                system.  The same tree always gives the same
+                                bytes (time stamps no later than the last
+                                commit, members sorted by name).
+
+  build/likeos-ext4.img         the live USB medium, a complete bootable GPT
+                                disk:
+
+  Partition 1   a small FAT EFI System Partition (64 MB by default) with the
+                UEFI bootloader, /EFI/BOOT/BOOTX64.EFI, and the boot menu,
+                /EFI/LIKEOS/bootmenu.conf
+  Partition 2   the ext4 root filesystem with the kernel (/boot/kernel.elf),
+                the whole userland and the installer, and the installed
+                system's image in /install/likeos-rootfs.tar.zst; the
+                bootloader reads the kernel straight out of ext4
 
 The short version:
 
@@ -776,8 +794,14 @@ OpenSSH, netcat and gdb), the X.Org port (make ports-xorg) and the GTK3 port
 (make ports-gtk3: GLib, GTK, Cairo, Pango, HarfBuzz, libstdc++, LLVM and Mesa,
 GStreamer and FFmpeg, libva and the Intel media drivers, WebKitGTK, luakit,
 PCManFM, Claws Mail, Mousepad, xfce4-terminal and the rest) into the shared
-sysroot build/xorg-sysroot, and finally stages everything into
-build/likeos-ext4.img.
+sysroot build/xorg-sysroot, and finally stages everything: first what the
+live medium and an installed system share (build/ext4_staging), copied off
+as the installed system's tree (build/rootfs_staging) and packed into
+build/likeos-rootfs.tar.zst, then what only the live medium has -- the
+installer, the boot menu, ADD_USER's account
+-- and the archive into build/likeos-ext4.img.  Packing the archive with
+zstd -19 takes a few minutes; when nothing in the installed system's tree
+changed, a rebuild keeps the previous archive.
 
 Because the first build runs for hours, keep a log and run it somewhere that
 survives a closed terminal (inside tmux, for example):
@@ -789,7 +813,11 @@ If the build is interrupted, simply run make again.
 Make targets (make help prints the complete list):
 
   make all                  everything, ending in build/likeos-ext4.img
+                            (with build/likeos-rootfs.tar.zst on it)
   make usb                  alias for the image; same result as all
+  make rootfs-tarball       only the installed system's image,
+                            build/likeos-rootfs.tar.zst with its .sha256 and
+                            .info, without the USB medium
   make kernel               only build/kernel.elf
   make bootloader           only build/bootloader.efi
   make ports-xorg           fetch, unpack and build the X.Org port
@@ -836,6 +864,17 @@ Build variables, passed on the make command line (they can be combined):
                             show it on the terminal)
   USB_SERIAL=1              mirror the kernel log to a USB CDC ACM serial
                             device on real hardware
+                            (SERIAL and USB_SERIAL apply to a system installed
+                            from the medium as well: it has the same kernel;
+                            the installer then logs its steps there too)
+  ADD_USER=<name>           the live medium gets an ordinary account <name>
+                            (password likeos); an installed system has the
+                            accounts made in the installer instead
+  ROOTFS_ZSTD_LEVEL=N       zstd level of likeos-rootfs.tar.zst (default 19;
+                            3 packs much faster, for a quick test build)
+  ROOTFS_ZSTD_THREADS=N     zstd threads (default 0: one per CPU)
+  SOURCE_DATE_EPOCH=N       latest time stamp in likeos-rootfs.tar.zst and its
+                            build date (default: the time of the last commit)
   I915_DEBUG=1              detailed log from the Intel graphics driver
   EXT4_MB=..., ESP_MB=...   force the root / EFI System Partition sizes in MB
   LIKEOS_WEBKIT_JOBS=N      (environment) number of parallel WebKitGTK compile
@@ -1021,7 +1060,30 @@ display driver what it is with drminfo and pick the configuration to match.
   3D off, or another DRM driver   xorg.conf.modesetting; software (llvmpipe)
   No display driver at all        xorg.conf: fbdev on /dev/fb0; software
 
-First steps after boot
+Installing LikeOS on a disk
+---------------------------
+
+The USB medium starts with a boot menu (it has /EFI/LIKEOS/bootmenu.conf on
+its EFI System Partition, see likeos-bootmenu.conf(5)):
+
+  Run LikeOS Live from USB      the live system, as described above
+  Install LikeOS from USB       LikeOS Setup, the installer
+
+Up and Down choose an entry, Enter starts it; without a key the live system
+starts after ten seconds.  The install entry adds likeos.mode=install to the
+kernel command line, and init starts the graphical installer instead of the
+login prompt (the text-mode installer, likeos-install, when the graphical one
+cannot run).  It partitions and formats the disk you choose (an EFI System
+Partition and an ext4 root), checks and unpacks
+/install/likeos-rootfs.tar.zst, writes /etc/fstab, the computer's name, the
+accounts, keyboard layout and time zone, installs the bootloader and creates
+the firmware boot entry "LikeOS".
+
+The installed system starts straight away, without the menu, and is the
+same LikeOS as the live one with what belongs to the live medium left out
+(the installer and the boot menu).  Like the live system it runs the
+browser with its files in RAM (/ram).
+
 ----------------------
 
 Log in as root at the console:
@@ -1163,7 +1225,6 @@ Project structure
 Planned work
 ------------
 
-- An installer that puts LikeOS on an internal disk.
 - Mounting removable media.
 - Expanded POSIX coverage.
 - Package management.

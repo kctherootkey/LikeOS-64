@@ -1,0 +1,67 @@
+LIKEOS-BOOTMENU.CONF(5)          File Formats          LIKEOS-BOOTMENU.CONF(5)
+
+NAME
+       likeos-bootmenu.conf - the boot menu of the LikeOS installation medium
+
+SYNOPSIS
+       \EFI\LIKEOS\bootmenu.conf on the EFI system partition
+
+DESCRIPTION
+       The  LikeOS boot loader (BOOTX64.EFI) shows a menu before it starts the
+       kernel when the EFI system partition it was loaded from  has  the  file
+       \EFI\LIKEOS\bootmenu.conf.   The  USB  medium  LikeOS is written to has
+       one, with the entries Run LikeOS Live from USB and Install LikeOS  from
+       USB; a LikeOS installed on a disk has none, and starts straight away.
+
+       The  menu  is  drawn  on  the firmware's graphics screen (as text where
+       there is none).  Up and Down choose an entry, Home and  End  the  first
+       and  the  last,  a  digit the entry of that number (1 the first); Enter
+       starts the chosen entry.  Until a key is pressed a countdown runs,  and
+       when it ends the default entry starts.
+
+       The  file  is  UTF-8 text, one setting per line.  Lines starting with #
+       are comments; empty lines are ignored; blanks around  a  line  are  ig-
+       nored.
+
+       timeout=seconds
+              How long the menu waits before it starts the default entry.
+
+       default=index
+              The  entry  chosen  when  the  menu appears and started when the
+              countdown ends, counted from 0 in the order of the  entry  lines
+              (default 0, the first).
+
+       title=text
+              The heading of the menu.
+
+       entry=title|words
+              One  menu  entry,  in  the order of the file: the title the menu
+              shows, a vertical bar, and the words the entry adds to the  ker-
+              nel command line (they may be empty).  The kernel and the system
+              it starts see them in /proc/cmdline.
+
+KERNEL COMMAND LINE WORDS
+       likeos.mode=install
+              init(8) starts LikeOS Setup, likeos-installer(1), on the console
+              instead  of  the login prompt (it reads /etc/inittab.install in-
+              stead of /etc/inittab).
+
+       efi=noruntime
+              The kernel does not call the  firmware's  runtime  services:  no
+              UEFI  variables  in /sys/firmware/efi/efivars (for firmware that
+              misbehaves; boot entries cannot be changed then).
+
+EXAMPLE
+       The file on the USB medium:
+
+              # The boot menu of the LikeOS USB medium
+              title=LikeOS
+              timeout=10
+              default=0
+              entry=Run LikeOS Live from USB|
+              entry=Install LikeOS from USB|likeos.mode=install
+
+SEE ALSO
+       likeos-installer(1), likeos-install(1), likeos-efiboot(1)
+
+LikeOS                           November 2026         LIKEOS-BOOTMENU.CONF(5)

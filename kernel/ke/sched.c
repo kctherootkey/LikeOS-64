@@ -3794,6 +3794,10 @@ void sched_remove_task(task_t *task)
      * mid-write while sleeping on a USB MSD completion) — otherwise
      * every subsequent FS op blocks forever on the orphaned mutex. */
 	vfs_release_locks_for_task(task->id);
+	/* Then the mounts it held for an operation it never finished: after
+	 * its filesystem locks, so an unmount waiting for these finds the
+	 * instance unlocked. */
+	vfs_mnt_release_task(task);
 	if (task->fds_pending_close) {
 		task->fds_pending_close = false;
 		task_close_open_files(task);
@@ -4035,6 +4039,8 @@ task_t *sched_fork_current(void)
 	mm_memcpy(child, cur, sizeof(task_t));
 	child->blk_cpl_ctx = NULL; /* the creator's stack, not ours */
 	child->plug = NULL; /* likewise */
+	child->vfs_walk = NULL; /* likewise */
+	mm_memset(child->mnt_held, 0, sizeof(child->mnt_held)); /* the parent's */
 	child->wq_worker = NULL; /* a pool's worker, the child is not */
 
 	/* The copy above duplicated the POINTER to the parent's region table,
@@ -6947,14 +6953,12 @@ void sched_dump_tasks(struct tty *tty)
 			   ext4_io_locked, ext4_io_depth,
 			   (long long)ext4_io_owner);
 	}
-	/* Show USB MSD per-device lock states — ext4_io_lock is nested over
-     * msd->io_locked; if a task dies mid-write both can orphan. */
+	/* Show USB MSD per-host lock states — ext4_io_lock is nested over
+     * the host's io_locked; if a task dies mid-write both can orphan. */
 	{
-		extern usb_msd_device_t *g_msd_devices[8];
-		extern int g_msd_count;
-		for (int mi = 0; mi < g_msd_count && mi < 8; mi++) {
-			usb_msd_device_t *m = g_msd_devices[mi];
-			if (m) {
+		for (int mi = 0; mi < USB_MSD_MAX_HOSTS; mi++) {
+			usb_msd_host_t *m = &g_msd_hosts[mi];
+			if (m->state != USB_MSD_HOST_FREE) {
 				tty_printf(
 					tty,
 					"MSD[%d] io_lock: held=%d owner=%lld\n",
@@ -7030,6 +7034,13 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	// kernel stack.  Preempting here would save the wrong RSP into next->sp,
 	// permanently corrupting its saved stack pointer → triple fault later.
 	if (cpu->in_context_switch)
+		return;
+
+	/* The preemption gate (percpu.h): the code this interrupt came out of
+	 * must not lose the CPU now -- a firmware call running on a page
+	 * table that is not any task's.  need_resched is left set, so the
+	 * first interrupt exit after the gate opens switches. */
+	if (cpu->preempt_count)
 		return;
 
 	task_t *cur = cpu->current_task;

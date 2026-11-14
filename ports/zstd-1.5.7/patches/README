@@ -1,0 +1,9 @@
+Patches applied to the pristine zstd-1.5.7 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+There are none: zstd builds for LikeOS as released.  What its makefiles
+would decide by probing the build host is in ../config.h.
+
+Copyright (C) 2026 The LikeOS Project

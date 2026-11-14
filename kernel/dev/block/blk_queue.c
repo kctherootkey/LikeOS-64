@@ -2468,17 +2468,19 @@ void blk_queue_done(struct blk_queue *q, struct blk_request *req)
  * ========================================================================== */
 
 /* End a request that waits in the queue with -ENODEV (the queue is
- * dying): a driver context it still carries (a request waiting for its
- * next step) goes back to the driver first.  No lock held. */
+ * dying), or -EIO when the disk's device is gone (blk_mark_disk_dead): a
+ * driver context it still carries (a request waiting for its next step)
+ * goes back to the driver first.  No lock held. */
 static void blk_queue_fail_queued(struct blk_queue *q, struct blk_request *rq)
 {
 	struct gendisk *disk = q->disk;
+	int err = disk && (disk_flags(disk) & GENHD_FL_GONE) ? -EIO : -ENODEV;
 
 	blk_mq_cleanup_prepared(q, rq);
 	if (rq->driver_data && disk && disk->ops && disk->ops->cleanup_rq)
 		disk->ops->cleanup_rq(rq);
 	rq->driver_data = NULL;
-	blk_request_complete(rq, -ENODEV, blk_rq_bytes_for_resid(rq));
+	blk_request_complete(rq, err, blk_rq_bytes_for_resid(rq));
 }
 
 static void blk_requeue_list_add_locked(struct blk_request **head,

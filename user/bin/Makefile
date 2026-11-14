@@ -54,19 +54,23 @@ AUTH_LDFLAGS = -L$(LIBPAM_DIR) -L$(LIBCRYPT_DIR) \
 
 # Programs (sources live alongside this Makefile in user/bin/)
 # getty/init link only against libc; login needs libpam+libcrypt (custom rule below).
-PROGRAMS = hello ls cat cmp pwd stat progerr memstat uname nproc shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink getty init id whoami groups adduser deluser permbench kdump drminfo backlight likeos-display-save likeos-keyboard-save
+PROGRAMS = hello ls cat cmp pwd stat progerr memstat uname nproc shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink getty id whoami groups adduser deluser permbench kdump drminfo backlight likeos-display-save likeos-keyboard-save
 
 # Test programs (sources live in user/bin/tests/, built as tests/<name>)
 # test_libc has a custom rule (needs libpam+libcrypt for the auth tests).
 TESTS = test_syscalls testmem teststress netstress openssltest usbtest ext4test fbtest pmap ttydump \
-	forkstress wkstress codecheck disktest
+	forkstress wkstress codecheck disktest mounttest usbhotplug
 TEST_BINS = $(addprefix tests/,$(TESTS))
 
 # The audio tools talk to audiod through libaudio (custom rule below).
 AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
 AUDIO_LDFLAGS = -L$(LIBAUDIO_DIR) -rpath-link $(LIBC_DIR):$(LIBAUDIO_DIR):$(RTLD_DIR)
 
-all: $(PROGRAMS) $(TEST_BINS) tests/test_libc login passwd su addgroup delgroup reboot halt \
+# init, mount and umount share the mount table code of fstab-util.c
+# (/etc/fstab, /proc/mounts, mount options, UUID=/LABEL= sources).
+FSTAB_PROGS = init mount umount
+
+all: $(PROGRAMS) $(FSTAB_PROGS) $(TEST_BINS) tests/test_libc login passwd su addgroup delgroup reboot halt \
 	$(AUDIO_PROGS)
 
 # Generic link rule: crt1.o + program.o → PIE binary linked against libc.so + libpthread.so
@@ -77,6 +81,13 @@ endef
 
 $(foreach prog,$(PROGRAMS),$(eval $(call LINK_RULE,$(prog))))
 $(foreach prog,$(TEST_BINS),$(eval $(call LINK_RULE,$(prog))))
+
+define FSTAB_LINK_RULE
+$(1): $(CRT1) $(1).o fstab-util.o $(LDSCRIPT)
+	$$(LD) $$(LDFLAGS) $$(CRT1) $(1).o fstab-util.o $$(LIBS) -o $$@
+endef
+
+$(foreach prog,$(FSTAB_PROGS),$(eval $(call FSTAB_LINK_RULE,$(prog))))
 
 # login/su authenticate via libpam (which pulls in libcrypt transitively).
 login: $(CRT1) login.o $(LDSCRIPT)
@@ -121,7 +132,7 @@ halt: poweroff
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o $(PROGRAMS) login passwd su addgroup delgroup reboot halt tests/*.o $(TEST_BINS) tests/test_libc
+	rm -f *.o $(PROGRAMS) $(FSTAB_PROGS) login passwd su addgroup delgroup reboot halt tests/*.o $(TEST_BINS) tests/test_libc
 	rm -f $(AUDIO_PROGS)
 	rm -f *.d tests/*.d shell/*.d
 

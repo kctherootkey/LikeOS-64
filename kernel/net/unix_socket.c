@@ -466,7 +466,7 @@ int unix_bind(unix_socket_t *us, const struct sockaddr_un *addr,
 		 * genuinely wants to be reachable by everyone (the X server
 		 * does) chmods the node itself afterwards. */
 		unsigned int smode = 0777 & ~task_umask(sched_current());
-		int mr = vfs_mknod(pathbuf, S_IFSOCK | smode);
+		int mr = vfs_mknod(pathbuf, S_IFSOCK | smode, 0);
 		if (mr != ST_OK) {
 			/* Undo the registration so the name does not stay
 			 * claimed by a socket nobody can reach. */

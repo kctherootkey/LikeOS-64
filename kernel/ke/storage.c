@@ -1516,7 +1516,7 @@ static int sto_mount(storage_fs_state_t *state, struct sto_cand *c, int rule)
 	/* ext4 first (the default root), then FAT32 as the original bootstrap
 	 * did -- but only on this one device, at its offset 0. */
 	if (want != STO_FS_FAT32) {
-		rc_ext4 = ext4_mount(c->bdev, &s_ext4_root);
+		rc_ext4 = ext4_mount(c->bdev, &s_ext4_root, 0);
 		if (rc_ext4 == ST_OK) {
 			ext4_vfs_register_root(&s_ext4_root);
 			g_root.fs = STO_FS_EXT4;
@@ -1545,6 +1545,16 @@ static int sto_mount(storage_fs_state_t *state, struct sto_cand *c, int rule)
 	g_root.bdev = c->bdev;
 	g_root.rule = rule;
 	sto_copy(g_root.name, sizeof(g_root.name), c->name, sizeof(c->name));
+	/* The mount table shows the root by its device node. */
+	{
+		char src[8 + sizeof(c->name)];
+		uint64_t dev = 0;
+
+		ksnprintf(src, sizeof(src), "/dev/%s", c->name);
+		if (c->bdev && c->bdev->magic == BLOCK_DEVICE_MAGIC)
+			dev = kdev_encode(c->bdev->major, c->bdev->minor);
+		vfs_root_set_source(src, dev);
+	}
 	sto_copy(g_root.partuuid, sizeof(g_root.partuuid), c->partuuid,
 		 sizeof(c->partuuid));
 	/* The root keeps a reference of its own for as long as the system

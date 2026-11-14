@@ -1,0 +1,128 @@
+# Makefile.likeos - build zstd 1.5.7 (libzstd and the zstd program) for
+# LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/.  zstd has no
+# configure; its makefiles' -D options and host probing are replaced by
+# config.h in this directory, force-included into every source.  The source
+# lists are upstream's (lib/libzstd.mk, programs/Makefile): the whole library
+# (common, compress, decompress with the x86-64 assembly decoder,
+# dictBuilder, the v0.5 - v0.7 legacy decoders) and every file of programs/.
+#
+# Results, in build/:
+#   lib/libzstd.a          the library, static, position independent (it is
+#                          linked into PIE programs: the installer back end,
+#                          the zstd program)
+#   include/zstd.h, include/zstd_errors.h, include/zdict.h
+#                          its public headers
+#   zstd                   the program, installed to /usr/bin with the
+#                          links unzstd (= zstd -d) and zstdcat (= zstd -dcf)
+#
+# The library is built with the compiler's built-in memcpy/memset: zstd
+# reads and writes its bit streams through fixed-size memcpy() calls that
+# only become single loads and stores when the compiler may expand them
+# (-fno-builtin turns each into a libc call and the codec several times
+# slower).  -O3 as upstream.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+AR = ar
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+O := $(B)/obj
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.
+CFLAGS = -O3 -nostdlib -nostdinc -fstack-protector-strong \
+         -mno-red-zone -fPIC -fno-common -pthread \
+         -D_GNU_SOURCE -D__LIKEOS__ -DNDEBUG \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -include config.h -I$(S)/lib -I$(S)/lib/common
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int
+# Upstream's DEBUGFLAGS (lib/libzstd.mk, programs/Makefile).
+CFLAGS += -Wall -Wextra -Wcast-qual -Wcast-align -Wshadow \
+          -Wstrict-aliasing=1 -Wswitch-enum -Wdeclaration-after-statement \
+          -Wstrict-prototypes -Wundef -Wpointer-arith -Wvla -Wformat=2 \
+          -Winit-self -Wfloat-equal -Wwrite-strings -Wredundant-decls \
+          -Wmissing-prototypes -Wa,--noexecstack
+ASFLAGS = -nostdinc -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+          -include config.h -Wa,--noexecstack
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -z noexecstack -rpath /lib \
+          -dynamic-linker /lib/ld-likeos.so -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+# Relative to src/ (the lists are made after unpacking, see "all").
+LIB_C = $(sort $(wildcard $(S)/lib/common/*.c $(S)/lib/compress/*.c \
+	$(S)/lib/decompress/*.c $(S)/lib/dictBuilder/*.c)) \
+	$(sort $(filter $(foreach v,5 6 7,%/zstd_v0$(v).c), \
+	$(wildcard $(S)/lib/legacy/*.c)))
+LIB_S = $(S)/lib/decompress/huf_decompress_amd64.S
+PROG_C = $(sort $(wildcard $(S)/programs/*.c))
+
+LIB_OBJ = $(patsubst $(S)/%.c,$(O)/%.o,$(LIB_C)) \
+	  $(patsubst $(S)/%.S,$(O)/%.o,$(LIB_S))
+PROG_OBJ = $(patsubst $(S)/%.c,$(O)/%.o,$(PROG_C))
+
+HEADERS = zstd.h zstd_errors.h zdict.h
+TARGETS = $(B)/lib/libzstd.a $(addprefix $(B)/include/,$(HEADERS)) $(B)/zstd
+
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): zstd-1.5.7.tar.gz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+# Every object depends on every header: the library is one unit.
+HDRS = config.h $(wildcard $(S)/lib/*.h $(S)/lib/*/*.h $(S)/programs/*.h)
+
+$(O)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(O)/%.o: $(S)/%.S $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(B)/lib/libzstd.a: $(LIB_OBJ)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+$(B)/include/%.h: $(S)/lib/%.h $(SRC_STAMP)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(B)/zstd: $(PROG_OBJ) $(B)/lib/libzstd.a $(CRT1)
+	$(LD) $(LDFLAGS) $(CRT1) $(PROG_OBJ) $(B)/lib/libzstd.a $(LIBS) -o $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

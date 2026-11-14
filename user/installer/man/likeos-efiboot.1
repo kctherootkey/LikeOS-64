@@ -1,0 +1,240 @@
+.\" likeos-efiboot.1 - manual page for likeos-efiboot.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man/likeos-efiboot.1, rendered from this file by
+.\" "make installer-manpages" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH LIKEOS-EFIBOOT 1 "November 2026" "LikeOS" "System Administration"
+.SH NAME
+likeos-efiboot \- show and edit the firmware's boot entries
+.SH SYNOPSIS
+.B likeos-efiboot
+.RB [ \-\-list ]
+.RB [ \-v ]
+.br
+.B likeos-efiboot \-\-create \-\-disk
+.I dev
+.B \-\-part
+.I n
+.B \-\-loader
+.I path
+.B \-\-label
+.I text
+.RB [ \-\-first ]
+.RB [ \-\-options
+.IR text ]
+.br
+.B likeos-efiboot \-\-delete
+.I num
+.br
+.B likeos-efiboot
+.BI \-\-active " num"
+|
+.BI \-\-inactive " num"
+.br
+.B likeos-efiboot \-\-bootorder
+.IR num , num ,...
+.RB [ \-\-force ]
+.br
+.B likeos-efiboot
+.BI \-\-bootnext " num"
+|
+.B \-\-delete\-bootnext
+.br
+.B likeos-efiboot
+.BI \-\-timeout " seconds"
+|
+.B \-\-delete\-timeout
+.SH DESCRIPTION
+.B likeos-efiboot
+shows and changes the boot entries of a computer's UEFI firmware: the list
+the firmware's boot menu offers, and the order in which it tries them when
+nobody chooses.
+.PP
+The firmware keeps these settings in UEFI variables of the EFI global
+variable GUID:
+.B Boot####
+(one load option per entry: whether it is active, its label, the device
+path of the loader it starts, and optional data passed to the loader),
+.B BootOrder
+(the entries in the order they are tried),
+.B BootNext
+(one entry to try on the next start only),
+.B BootCurrent
+(the entry the running system was started from) and
+.B Timeout
+(how many seconds the firmware's own menu waits).
+The kernel shows every variable as a file in
+.BR /sys/firmware/efi/efivars ;
+on a computer started without UEFI, or with
+.B efi=noruntime
+on the kernel command line, the directory does not exist and
+.B likeos-efiboot
+says so (exit status 2).
+.PP
+Without an action, or with
+.BR \-\-list ,
+the entries are shown: BootCurrent, BootNext, the timeout and the boot
+order, then one line per entry with its number, an asterisk when it is
+active, its label and the device path of the loader it starts.
+With
+.B \-v
+each entry's attributes and optional data are shown too.
+.PP
+Several actions may be given at once; they run in the order create, delete,
+active/inactive, bootorder, bootnext, timeout.
+Changing the variables needs root.
+.SH ACTIONS
+.TP
+.B \-\-list
+Show the boot entries (the default).
+.TP
+.BR \-c ", " \-\-create
+Create a boot entry for a loader on an EFI system partition, as a freshly
+installed system needs one:
+the device path
+.BI HD( n ,GPT, guid , start , size )/File( loader )
+is taken from the partition table of the disk given with
+.BR \-\-disk ,
+and the entry gets the label given with
+.BR \-\-label .
+An entry that already starts the same loader from the same partition is
+reused rather than duplicated (and given the new label and options).
+Needs
+.BR \-\-disk ,
+.BR \-\-part ,
+.B \-\-loader
+and
+.BR \-\-label .
+.TP
+.BR \-B ", " \-\-delete " \fInum\fR"
+Delete entry
+.I num
+and take it out of the boot order.
+.TP
+.BR \-a ", " \-\-active " \fInum\fR"
+Mark entry
+.I num
+active: the firmware tries it.
+.TP
+.BR \-A ", " \-\-inactive " \fInum\fR"
+Mark entry
+.I num
+inactive: it stays in the list but the firmware passes over it.
+.TP
+.BR \-o ", " \-\-bootorder " \fInum\fR,\fInum\fR,..."
+Set the boot order.
+Numbers of entries that do not exist are refused unless
+.B \-\-force
+is given.
+.TP
+.BR \-n ", " \-\-bootnext " \fInum\fR"
+Start entry
+.I num
+on the next start only; the firmware deletes BootNext when it uses it.
+.TP
+.BR \-N ", " \-\-delete\-bootnext
+Cancel BootNext.
+.TP
+.BR \-t ", " \-\-timeout " \fIseconds\fR"
+Set how long the firmware's own boot menu waits.
+.TP
+.BR \-T ", " \-\-delete\-timeout
+Remove the timeout setting (the firmware's default applies).
+.SH CREATE OPTIONS
+.TP
+.BR \-d ", " \-\-disk " \fIdev\fR"
+The disk that holds the EFI system partition
+.RB ( /dev/sda ,
+.BR /dev/nvme0n1 ).
+.TP
+.BR \-p ", " \-\-part " \fIn\fR"
+The number of the EFI system partition on it.
+.TP
+.BR \-l ", " \-\-loader " \fIpath\fR"
+The loader's path on that partition, with backslashes:
+.BR \eEFI\eLIKEOS\eBOOTX64.EFI .
+.TP
+.BR \-L ", " \-\-label " \fItext\fR"
+The name the firmware's boot menu shows.
+.TP
+.BR \-f ", " \-\-first
+Put the entry first in the boot order (otherwise it is added at the end).
+.TP
+.BR \-u ", " \-\-options " \fItext\fR"
+Optional data passed to the loader (as UCS-2 text).
+.SH OPTIONS
+.TP
+.B \-\-force
+Accept entry numbers in
+.B \-\-bootorder
+that have no entry.
+.TP
+.BR \-q ", " \-\-quiet
+Report errors only.
+.TP
+.BR \-v ", " \-\-verbose
+Show the attributes and optional data of the entries too.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the actions and options.
+.TP
+.B \-\-version
+Show the version.
+.PP
+.I num
+is a hexadecimal entry number:
+.BR 3 ,
+.B 0003
+and
+.B Boot0003
+are the same entry.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The action failed.
+.TP
+.B 2
+Wrong usage, or the system has no UEFI variables.
+.SH ENVIRONMENT
+.TP
+.B LIKEOS_EFIVARS_DIR
+A directory used in place of
+.B /sys/firmware/efi/efivars
+(for tests).
+.SH FILES
+.TP
+.BI /sys/firmware/efi/efivars/ Name \- GUID
+One UEFI variable: four bytes of attributes (little-endian) followed by
+its value.
+Writing the file in one
+.BR write (2)
+sets the variable,
+.BR unlink (2)
+deletes it.
+.SH EXAMPLES
+The entry the installer creates for a LikeOS installation whose EFI system
+partition is the first partition of /dev/nvme0n1:
+.PP
+.RS
+.nf
+likeos\-efiboot \-\-create \-\-disk /dev/nvme0n1 \-\-part 1 \e
+        \-\-loader '\eEFI\eLIKEOS\eBOOTX64.EFI' \e
+        \-\-label LikeOS \-\-first
+.fi
+.RE
+.PP
+Start entry 0004 once, on the next start:
+.PP
+.RS
+.nf
+likeos\-efiboot \-\-bootnext 4
+.fi
+.RE
+.SH SEE ALSO
+.BR likeos-install (1),
+.BR likeos-gpt (1)

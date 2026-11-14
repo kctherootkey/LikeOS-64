@@ -289,6 +289,17 @@ typedef struct {
 #define EFI_PERSISTENT_MEMORY 14 // Persistent memory (NVDIMM)
 #define EFI_MAX_MEMORY_TYPE 15
 
+// UEFI memory attribute bits (EFI_MEMORY_DESCRIPTOR.Attribute)
+#define EFI_MEMORY_UC 0x0000000000000001ULL // uncacheable
+#define EFI_MEMORY_WC 0x0000000000000002ULL // write-combining
+#define EFI_MEMORY_WT 0x0000000000000004ULL // write-through
+#define EFI_MEMORY_WB 0x0000000000000008ULL // write-back
+#define EFI_MEMORY_WP 0x0000000000001000ULL // write-protected (cacheability)
+#define EFI_MEMORY_RP 0x0000000000002000ULL // read-protected
+#define EFI_MEMORY_XP 0x0000000000004000ULL // execute-protected
+#define EFI_MEMORY_RO 0x0000000000020000ULL // read-only
+#define EFI_MEMORY_RUNTIME 0x8000000000000000ULL // needed by runtime services
+
 // Helper to check if memory type is usable (safe to allocate from)
 static inline int mm_is_usable_memory_type(uint32_t type)
 {
@@ -325,6 +336,9 @@ typedef struct {
 
 // The firmware's display modes the bootloader passes on (distinct sizes)
 #define BOOT_GOP_MODES_MAX 64
+
+// The firmware's EFI_MEMORY_RUNTIME regions the bootloader passes on
+#define BOOT_EFI_RT_MAX 128
 
 // Boot information passed from bootloader
 typedef struct {
@@ -376,7 +390,55 @@ typedef struct {
 	char cmdline[512]; // the whole boot command line (ASCII, one line), "" none
 	uint32_t cmdline_source; // BOOT_CMDLINE_*: where the command line came from
 	uint32_t rootid_reserved;
+
+	/* ---- UEFI runtime services (valid when efi_magic == BOOT_EFI_MAGIC) ----
+	 * What the kernel needs to call the firmware's runtime services after
+	 * ExitBootServices (kernel/hal/efi.c): the system table and its
+	 * runtime services table (physical addresses; SetVirtualAddressMap is
+	 * never called, so the firmware stays in physical mode), and every
+	 * memory region the firmware marked EFI_MEMORY_RUNTIME, collected here
+	 * on their own so they survive the cap on mem_info.entries.  Appended
+	 * after the root identity; an older bootloader leaves the magic as
+	 * whatever followed its structure, never this value. */
+	uint64_t efi_magic; // BOOT_EFI_MAGIC when the fields below are valid
+	uint64_t efi_system_table; // physical address of EFI_SYSTEM_TABLE
+	uint64_t efi_runtime_services; // physical address of EFI_RUNTIME_SERVICES
+	uint32_t efi_memdesc_version; // the firmware's memory descriptor version
+	uint32_t efi_memdesc_size; // the firmware's memory descriptor size (bytes)
+	uint32_t efi_fw_revision; // EFI_SYSTEM_TABLE.FirmwareRevision
+	uint32_t efi_spec_revision; // EFI_SYSTEM_TABLE.Hdr.Revision (major << 16 | minor)
+	char efi_fw_vendor[64]; // EFI_SYSTEM_TABLE.FirmwareVendor, folded to ASCII
+	uint32_t efi_rt_count; // entries used in efi_rt_regions[]
+	uint32_t efi_rt_dropped; // runtime regions that did not fit (0 normally)
+	struct {
+		uint32_t type; // EFI memory type (EFI_RUNTIME_SERVICES_CODE, ...)
+		uint32_t pad;
+		uint64_t phys; // first byte (4 KiB aligned)
+		uint64_t pages; // length in 4 KiB pages
+		uint64_t attribute; // EFI_MEMORY_* bits, EFI_MEMORY_RUNTIME included
+	} efi_rt_regions[BOOT_EFI_RT_MAX];
+	uint32_t bootmenu_entry; // boot menu entry started (0-based), BOOT_MENU_NONE
+	uint32_t efi_reserved;
 } boot_info_t;
+
+/* The bootloader's copy of boot_info_t (boot/bootloader.c) is laid out to
+ * these offsets as well; a field added on one side only moves them. */
+_Static_assert(__builtin_offsetof(boot_info_t, cmdline) == 11400,
+	       "boot_info_t.cmdline moved");
+_Static_assert(__builtin_offsetof(boot_info_t, efi_magic) == 11920,
+	       "boot_info_t.efi_magic moved");
+_Static_assert(__builtin_offsetof(boot_info_t, efi_fw_vendor) == 11960,
+	       "boot_info_t.efi_fw_vendor moved");
+_Static_assert(__builtin_offsetof(boot_info_t, efi_rt_count) == 12024,
+	       "boot_info_t.efi_rt_count moved");
+_Static_assert(__builtin_offsetof(boot_info_t, efi_rt_regions) == 12032,
+	       "boot_info_t.efi_rt_regions moved");
+_Static_assert(__builtin_offsetof(boot_info_t, bootmenu_entry) == 16128,
+	       "boot_info_t.bootmenu_entry moved");
+_Static_assert(sizeof(boot_info_t) == 16136, "boot_info_t size changed");
+
+#define BOOT_EFI_MAGIC 0x56524553544e5552ULL /* "RUNTSERV" */
+#define BOOT_MENU_NONE 0xffffffffu // no boot menu was shown
 
 #define BOOT_SMBIOS_MAGIC 0x534d42494f53424cULL
 #define BOOT_DISPLAY_MAGIC 0x5953494459414c50ULL
@@ -732,6 +794,7 @@ uint16_t mm_get_page_refcount(uint64_t physical_addr);
 // Kernel Heap Allocator
 void mm_initialize_heap(void);
 void mm_init_pt_pool(void); // Initialize page table page pool
+void mm_pt_pool_range(uint64_t *start, uint64_t *end); // its physical extent
 void *kalloc(size_t size);
 void kfree(void *ptr);
 void *krealloc(void *ptr, size_t new_size);

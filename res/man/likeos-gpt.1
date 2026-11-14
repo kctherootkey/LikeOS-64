@@ -1,0 +1,186 @@
+LIKEOS-GPT(1)                System Administration               LIKEOS-GPT(1)
+
+NAME
+       likeos-gpt - show, check and edit GUID partition tables
+
+SYNOPSIS
+       likeos-gpt [options] print device
+       likeos-gpt [options] verify device
+       likeos-gpt [options] info device n
+       likeos-gpt [options] new-table device
+       likeos-gpt  [options]  add  device  [-n  n] [--start pos] [--size size]
+       [--type type] [--name name] [--uuid guid] [--attrs hex]
+       likeos-gpt [options] delete device n
+       likeos-gpt [options] resize device n size|max
+       likeos-gpt [options] name|type|attrs device n value
+       likeos-gpt [options] repair|wipe device
+       likeos-gpt [options] types
+
+DESCRIPTION
+       likeos-gpt reads and writes the GUID partition table (GPT) of  a  disk:
+       the  protective  MBR in the first sector, the primary table (header and
+       partition entries) after it, and the backup copy  at  the  end  of  the
+       disk.   It  is  the tool of the LikeOS installer's partitioning library
+       (libgpt) for the command line: everything the installer does to a  par-
+       tition table can be looked at and done by hand with it.
+
+       device is a block device (/dev/sda, /dev/nvme0n1) or a disk image file.
+       Only  the  editing commands write, and only to the device named.  After
+       writing to a block device likeos-gpt asks the kernel to  read  the  new
+       table  again,  so  the partition devices (/dev/sda1, /dev/nvme0n1p1...)
+       follow at once; a disk with a mounted partition may  refuse  that,  and
+       the change is then seen after the next start.
+
+COMMANDS
+       print device
+              Show  the  table: the disk's size, sector size and GUID, the us-
+              able sectors, and one line per partition with its number,  first
+              and last sector, size, type and name.
+
+       verify device
+              Check  both copies of the table: the header and entry checksums,
+              the positions the headers give, overlapping or out-of-range par-
+              titions, and whether the two copies agree.  Problems found  give
+              exit status 1.
+
+       info device n
+              Show  partition n in detail: its type (name, code and GUID), its
+              unique partition GUID, the first and last sector, the size,  the
+              name and the attribute bits.
+
+       new-table device
+              Write a new, empty GPT with a protective MBR.  A device that al-
+              ready has partitions is refused unless --yes is given.
+
+       add device
+              Create  a partition, by default in the first free region, start-
+              ing at the first 1 MiB boundary in it and filling  the  rest  of
+              it.  The add options below choose otherwise.
+
+       delete device n
+              Delete partition n.  The data on the disk is not touched.
+
+       resize device n size|max
+              Move  the end of partition n: size is its new size, max makes it
+              reach the next partition or the end of the usable sectors.   The
+              start stays where it is, and the file system in the partition is
+              not  changed:  grow  the file system after growing the partition
+              (for ext4 resize2fs(8)), shrink it before shrinking  the  parti-
+              tion.
+
+       name device n name
+              Set  the  name  of  partition  n  (UTF-8, at most 36 UTF-16 code
+              units).
+
+       type device n type
+              Set the type of partition n.
+
+       attrs device n hex
+              Set the 64 attribute bits of partition n, as a hexadecimal  num-
+              ber  (bit  0:  required  by  the platform, bit 1: ignored by the
+              firmware, bit 2: legacy BIOS bootable, bits  48-63:  defined  by
+              the partition type).
+
+       repair device
+              Rebuild  a damaged copy of the table from the intact one, move a
+              backup copy that is not at the end of the  disk  (a  disk  image
+              that was made larger, a disk copied to a bigger one) to the end,
+              and rewrite a missing or wrong protective MBR.  When both copies
+              are intact but differ, the primary one is kept.
+
+       wipe device
+              Erase  the  partition table: both GPT copies and the MBR.  Needs
+              --yes.
+
+       types  List the partition types likeos-gpt knows by name: alias,  four-
+              digit code, GUID and description.
+
+ADD OPTIONS
+       -n, --number n
+              The partition number (default: the first unused one).
+
+       -s, --start pos
+              The  first  sector (default: the start of the first free region,
+              aligned to 1 MiB).
+
+       -S, --size size
+              The size (default: the rest of the free region it starts in).
+
+       -t, --type type
+              The partition type (default: data).
+
+       -c, --name name
+              The partition name.
+
+       -u, --uuid guid
+              The unique partition GUID (default: a random one).
+
+       -A, --attrs hex
+              The attribute bits.
+
+OPTIONS
+       --json Machine-readable output (JSON) of print, verify, info and types,
+              and of the partition add created.
+
+       --sector-size 512|4096
+              The logical sector size of a disk image file (block devices  re-
+              port their own).
+
+       -y, --yes
+              Confirm  a  command  that  destroys a partition table: new-table
+              over an existing table, and wipe.
+
+       --no-reread
+              Do not ask the kernel to read the table again after writing it.
+
+       -h, --help
+              Show a summary of the commands and options.
+
+       --version
+              Show the version.
+
+SIZES, POSITIONS AND TYPES
+       A position or size that is a plain number counts sectors.  With a  suf-
+       fix  it  counts bytes: K, M, G, T (or KiB, MiB, GiB, TiB) are powers of
+       1024, so 512M is 512 MiB.
+
+       A type is an alias, a four-digit code or a GUID.  The common ones:
+
+              esp           ef00  EFI system partition
+              likeos-root   8304  LikeOS root file system
+              data          8300  generic data
+              swap          8200  swap
+              bios-boot     ef02  BIOS boot
+              home          8302  home directories
+              basic         0700  basic data (NTFS, exFAT, FAT)
+              msr           0c01  reserved (MSR)
+              recovery      2700  recovery environment
+              lvm, raid     8e00, fd00
+
+       likeos-gpt types lists them all.
+
+EXIT STATUS
+       0      Success.
+
+       1      The command failed, or verify found problems.
+
+       2      Wrong usage.
+
+EXAMPLES
+       Partition a disk the way the installer does for a whole-disk  installa-
+       tion:
+
+              likeos-gpt --yes new-table /dev/sdb
+              likeos-gpt add /dev/sdb --size 512M --type esp \
+                      --name "EFI system partition"
+              likeos-gpt add /dev/sdb --type likeos-root --name likeos-root
+
+       Check a disk image and repair it after it was made larger:
+
+              likeos-gpt verify disk.img
+              likeos-gpt repair disk.img
+
+SEE ALSO
+       likeos-install(1), fdisk(8), sfdisk(8), partx(8), blkid(8), lsblk(8)
+
+LikeOS                           November 2026                   LIKEOS-GPT(1)

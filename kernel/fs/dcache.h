@@ -50,6 +50,9 @@
 typedef struct dc_entry {
 	// Cache key
 	unsigned long parent_cluster; // Parent directory's start_cluster
+	/* The filesystem that made the entry (its superblock): directory ids
+	 * of two mounted filesystems overlap, so the id alone is not a key. */
+	const void *owner;
 	unsigned long name_hash; // Hash of the filename (case-insensitive)
 
 	// Cached result (valid only if !(flags & DC_NEGATIVE))
@@ -89,10 +92,12 @@ void dcache_init(void);
 // Look up a dentry. Returns a pointer to the cached entry, or NULL on miss.
 // If the returned entry has DC_NEGATIVE set, the name was looked up before
 // and confirmed not to exist.
-dc_entry_t *dcache_lookup(unsigned long parent_cluster, const char *name);
+dc_entry_t *dcache_lookup(const void *owner, unsigned long parent_cluster,
+			  const char *name);
 
 // Insert a positive dentry (found result) into the cache.
-void dcache_insert(unsigned long parent_cluster, const char *name,
+void dcache_insert(const void *owner, unsigned long parent_cluster,
+		   const char *name,
 		   unsigned long start_cluster, unsigned long size,
 		   unsigned int attr, uint16_t wrt_time, uint16_t wrt_date,
 		   unsigned long dirent_cluster, unsigned int dirent_index,
@@ -100,17 +105,22 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
 		   unsigned int lfn_start_index);
 
 // Insert a negative dentry (not-found result) into the cache.
-void dcache_insert_negative(unsigned long parent_cluster, const char *name);
+void dcache_insert_negative(const void *owner, unsigned long parent_cluster,
+			    const char *name);
 
 // Invalidate all dentries whose parent is `parent_cluster`.
 // Called when a directory's contents change (create/unlink/rename/mkdir/rmdir).
-void dcache_invalidate_dir(unsigned long parent_cluster);
+void dcache_invalidate_dir(const void *owner, unsigned long parent_cluster);
 
 // Invalidate a specific dentry by name.
-void dcache_invalidate(unsigned long parent_cluster, const char *name);
+void dcache_invalidate(const void *owner, unsigned long parent_cluster,
+		       const char *name);
 
 // Invalidate the entire cache (e.g., filesystem unmount).
 void dcache_invalidate_all(void);
+
+// Every entry one filesystem made (unmount).
+void dcache_invalidate_owner(const void *owner);
 
 // ============================================================================
 // Case-sensitive interface
@@ -149,17 +159,21 @@ typedef struct dc_result {
 #define DC_LOOKUP_NEGATIVE 2 // Cached, and it is known NOT to exist
 
 // Look up `name` in `parent`, comparing case-sensitively.
-int dcache_lookup_cs(unsigned long parent, const char *name, dc_result_t *out);
+int dcache_lookup_cs(const void *owner, unsigned long parent, const char *name,
+		     dc_result_t *out);
 
 // Record that `name` in `parent` exists and names `ino`.
-void dcache_insert_cs(unsigned long parent, const char *name, unsigned long ino,
+void dcache_insert_cs(const void *owner, unsigned long parent, const char *name,
+		      unsigned long ino,
 		      unsigned long size, unsigned int attr);
 
 // Record that `name` in `parent` does not exist.
-void dcache_insert_negative_cs(unsigned long parent, const char *name);
+void dcache_insert_negative_cs(const void *owner, unsigned long parent,
+			       const char *name);
 
 // Forget whatever was recorded for `name` in `parent`.
-void dcache_invalidate_cs(unsigned long parent, const char *name);
+void dcache_invalidate_cs(const void *owner, unsigned long parent,
+			  const char *name);
 
 // Statistics
 typedef struct dc_stats {

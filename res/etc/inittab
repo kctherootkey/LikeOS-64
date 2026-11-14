@@ -32,6 +32,13 @@
 # after every logout.
 respawn	/sbin/getty /dev/console
 
+# SSH host keys: makes the ones missing in /etc/ssh and does nothing when
+# they are there.  The system image an installation is made from carries
+# none, so that no two computers share keys: an installed system makes its
+# own at its first start.  "once" does not hold up the start-up (sshd, when
+# enabled below, may have to be restarted once by init on that first start).
+once	/usr/bin/ssh-keygen -A
+
 # Secure shell daemon.  -D keeps it in the foreground: without it sshd forks
 # into the background and exits, init would see that as a crash and start it
 # again and again.  Add "console" after "respawn" to see what it logs.

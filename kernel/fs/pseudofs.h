@@ -34,10 +34,35 @@ typedef long (*pfs_store_t)(struct pfs_node *n, const char *buf, long len);
  * every later one down by one, and one of them would never be listed. */
 typedef int (*pfs_list_t)(struct pfs_node *dir, unsigned *cursor, char *name,
 			  long cap, int *type);
+/* Dynamic directory listed from a snapshot that belongs to one open
+ * directory handle -- for a source that can only be enumerated as a whole
+ * ("the entry after this one") and must not shift under a reader that is
+ * part way through.  *snap is the handle's: NULL when it was opened, and
+ * again after a rewind (lseek to 0) when `refresh' is set too; the callback
+ * takes its snapshot when it finds NULL there (freeing an old one first
+ * when refreshing) and keeps it.  Otherwise as pfs_list_t, with *cursor an
+ * index into the snapshot; a negative errno when no snapshot can be had.
+ * `list_free' releases a snapshot: at close, and nowhere else. */
+typedef int (*pfs_list_snap_t)(struct pfs_node *dir, void **snap, int refresh,
+			       unsigned *cursor, char *name, long cap,
+			       int *type);
 /* Dynamic directory: resolve one child name to a node that the caller
  * owns until pfs_node_put(); NULL if there is no such child. */
 typedef struct pfs_node *(*pfs_lookup_t)(struct pfs_node *dir,
 					 const char *name);
+/* Dynamic directory that takes new files: the node for `name', which does
+ * not exist yet and is about to be created by an open() with O_CREAT -- a
+ * transient file node with a store callback, owned by the caller until
+ * pfs_node_put(); NULL refuses the name.  Nothing exists until the first
+ * write reaches `store'.  The directory must be a static node (the new
+ * node keeps a pointer to it). */
+typedef struct pfs_node *(*pfs_create_t)(struct pfs_node *dir,
+					 const char *name);
+
+/* The longest name a dynamic directory's list/lookup/create callbacks are
+ * handed or may report (including the terminating NUL).  Static nodes keep
+ * the shorter pfs_node.name. */
+#define PFS_NAME_MAX 256
 
 enum pfs_type { PFS_DIR = 1, PFS_FILE = 2, PFS_LINK = 3 };
 
@@ -64,8 +89,23 @@ struct pfs_node {
 	/* symlinks: target, absolute or relative to the link's directory */
 	char link[128];
 	/* dynamic directories */
+	pfs_list_snap_t list_snap; /* takes precedence over `list' */
+	void (*list_free)(struct pfs_node *dir, void *snap);
 	pfs_list_t list;
 	pfs_lookup_t lookup;
+	pfs_create_t create; /* open(O_CREAT) of a name that does not exist */
+	/* Files that unlink() may remove: 0 or a negative errno.  Without it
+	 * unlink() is refused with EPERM. */
+	int (*unlink)(struct pfs_node *n);
+	/* Called on a transient node just before it is freed, for a callback
+	 * that hung private data on `arg'. */
+	void (*release)(struct pfs_node *n);
+	/* The most one write() hands `store'.  0: PFS_STORE_MAX, and a longer
+	 * write is cut to it (attribute files take one short value).  Set: a
+	 * write up to this many bytes reaches `store' whole, a longer one
+	 * fails with EFBIG -- for files whose contents are one record that
+	 * must arrive in a single write. */
+	long store_max;
 	/* nodes made by a lookup callback are freed when released */
 	int transient;
 	uint64_t ino;
@@ -101,6 +141,8 @@ struct pfs_node *pfs_add_node(struct pfs *fs, const char *path,
 /* Make a directory dynamic. */
 void pfs_set_dynamic(struct pfs_node *dir, pfs_list_t list,
 		     pfs_lookup_t lookup);
+/* The most a write to a file whose node does not set store_max delivers. */
+#define PFS_STORE_MAX 256
 /* For lookup callbacks: allocate a transient node. */
 struct pfs_node *pfs_node_new(struct pfs *fs, struct pfs_node *parent,
 			      const char *name, enum pfs_type type);

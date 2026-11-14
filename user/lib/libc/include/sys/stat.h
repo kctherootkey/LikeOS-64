@@ -86,6 +86,8 @@ int mkfifoat(int dirfd, const char* path, mode_t mode);
  * includes only <sys/stat.h> (ICU's tools were the first) must find the
  * function where the standard says it lives. */
 int mkdir(const char* path, mode_t mode);
+int mkdirat(int dirfd, const char* path, mode_t mode);
+int fchmodat(int dirfd, const char* path, mode_t mode, int flags);
 
 /* POSIX also puts utimensat/futimens and their two special tv_nsec values
  * here.  <utime.h> and <unistd.h> carry the same definitions for the code

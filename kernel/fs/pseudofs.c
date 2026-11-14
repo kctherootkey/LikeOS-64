@@ -42,8 +42,11 @@ struct pfs_node *pfs_node_new(struct pfs *fs, struct pfs_node *parent,
 
 void pfs_node_put(struct pfs_node *n)
 {
-	if (n && n->transient)
+	if (n && n->transient) {
+		if (n->release)
+			n->release(n);
 		kfree(n);
+	}
 }
 
 static struct pfs_node *pfs_child(struct pfs_node *dir, const char *name,
@@ -60,7 +63,7 @@ static struct pfs_node *pfs_child(struct pfs_node *dir, const char *name,
 			return c;
 	}
 	if (dir->lookup) {
-		char tmp[64];
+		char tmp[PFS_NAME_MAX];
 		if (len >= sizeof(tmp))
 			return NULL;
 		mm_memcpy(tmp, name, len);
@@ -336,18 +339,30 @@ static void pfs_apply(struct pfs_node *n, const struct pfs_node *t)
 	if (t->gid)
 		n->gid = t->gid;
 	if (t->show || t->store || t->read_at || t->list || t->lookup ||
-	    t->arg || t->arg2) {
+	    t->list_snap || t->create || t->unlink || t->arg || t->arg2) {
 		n->arg = t->arg;
 		n->arg2 = t->arg2;
 	}
 	if (t->link[0])
 		mm_memcpy(n->link, t->link, sizeof(n->link));
+	if (t->store_max)
+		n->store_max = t->store_max;
+	if (t->release)
+		__atomic_store_n(&n->release, t->release, __ATOMIC_RELEASE);
+	if (t->unlink)
+		__atomic_store_n(&n->unlink, t->unlink, __ATOMIC_RELEASE);
+	if (t->create)
+		__atomic_store_n(&n->create, t->create, __ATOMIC_RELEASE);
 	if (t->show)
 		__atomic_store_n(&n->show, t->show, __ATOMIC_RELEASE);
 	if (t->store)
 		__atomic_store_n(&n->store, t->store, __ATOMIC_RELEASE);
 	if (t->read_at)
 		__atomic_store_n(&n->read_at, t->read_at, __ATOMIC_RELEASE);
+	if (t->list_free)
+		__atomic_store_n(&n->list_free, t->list_free, __ATOMIC_RELEASE);
+	if (t->list_snap)
+		__atomic_store_n(&n->list_snap, t->list_snap, __ATOMIC_RELEASE);
 	if (t->list || t->lookup)
 		pfs_set_dynamic(n, t->list, t->lookup);
 }
@@ -504,6 +519,10 @@ typedef struct {
 	long len;
 	long pos;
 	uint64_t dirpos; /* where the next getdents resumes: see pfs_readdir() */
+	/* A directory listed through list_snap: this handle's snapshot, and
+	 * whether a rewind asked for a fresh one. */
+	void *dirsnap;
+	int dirsnap_refresh;
 } pfs_file_t;
 
 /* Strip the mount prefix: "/sys/bus/pci" -> "bus/pci". */
@@ -586,9 +605,42 @@ static struct pfs *pfs_of_ops(const vfs_ops_t *ops)
 
 static struct pfs *g_pfs_current_open; /* set per call by the wrappers */
 
-/* Each mounted instance gets its own trampolines, so the VFS call carries
- * no fs pointer.  Two instances is what this kernel has; a third would
- * need a third set.  */
+
+/* open(O_CREAT) of a name that is not there: the directory's create
+ * callback makes the node, when the directory has one. */
+static struct pfs_node *pfs_create_child(struct pfs *fs, const char *rel)
+{
+	char dir[PFS_WALK_MAX];
+	const char *name;
+	struct pfs_node *d, *n = NULL;
+	size_t len, cut;
+
+	len = pfs_strlcpy(dir, rel, sizeof(dir));
+	if (len >= sizeof(dir))
+		return NULL;
+	while (len > 0 && dir[len - 1] == '/')
+		dir[--len] = 0;
+	cut = len;
+	while (cut > 0 && dir[cut - 1] != '/')
+		cut--;
+	name = dir + cut;
+	if (!*name || (name[0] == '.' && (!name[1] ||
+					  (name[1] == '.' && !name[2]))) ||
+	    len - cut >= PFS_NAME_MAX)
+		return NULL;
+	{
+		/* the parent's path, then the name kept apart from it */
+		char leaf[PFS_NAME_MAX];
+
+		pfs_strlcpy(leaf, name, sizeof(leaf));
+		dir[cut] = 0;
+		d = pfs_lookup_follow(fs, dir);
+		if (d && d->type == PFS_DIR && !d->transient && d->create)
+			n = d->create(d, leaf);
+	}
+	pfs_node_put(d);
+	return n;
+}
 
 static int pfs_open_common(struct pfs *fs, const char *path, int flags,
 			   vfs_file_t **out)
@@ -601,6 +653,8 @@ static int pfs_open_common(struct pfs *fs, const char *path, int flags,
 		return ST_PERM;
 	struct pfs_node *n = (flags & O_NOFOLLOW) ? pfs_lookup(fs, rel) :
 						    pfs_lookup_follow(fs, rel);
+	if (!n && (flags & O_CREAT))
+		n = pfs_create_child(fs, rel);
 	if (!n)
 		return ST_NOT_FOUND;
 	/* Only a file with a store callback opens for writing (O_TRUNC on
@@ -725,8 +779,6 @@ static long pfs_read(vfs_file_t *f, void *buf, long bytes)
 	return n;
 }
 
-#define PFS_STORE_MAX 256
-
 static long pfs_write(vfs_file_t *f, const void *buf, long bytes)
 {
 	pfs_file_t *pf = f->fs_private;
@@ -736,6 +788,23 @@ static long pfs_write(vfs_file_t *f, const void *buf, long bytes)
 		return -EACCES;
 	if (bytes <= 0)
 		return 0;
+	if (pf->node->store_max > 0) {
+		/* One record per write, delivered whole or not at all. */
+		char *big;
+		long r;
+
+		if (bytes > pf->node->store_max)
+			return -EFBIG;
+		big = kalloc((size_t)bytes);
+		if (!big)
+			return -ENOMEM;
+		smap_disable();
+		mm_memcpy(big, buf, bytes);
+		smap_enable();
+		r = pf->node->store(pf->node, big, bytes);
+		kfree(big);
+		return r;
+	}
 	if (bytes > PFS_STORE_MAX)
 		bytes = PFS_STORE_MAX;
 	smap_disable();
@@ -758,6 +827,11 @@ static long pfs_seek(vfs_file_t *f, long offset, int whence)
 			pf->dirpos = (uint64_t)offset;
 		else if (!(whence == 1 && offset == 0))
 			return -EINVAL;
+		/* rewinddir(): a snapshot listing starts over from a fresh
+		 * snapshot; any other position keeps the one it refers to. */
+		if (whence == 0 && offset == 0)
+			__atomic_store_n(&pf->dirsnap_refresh, 1,
+					 __ATOMIC_RELEASE);
 		return (long)pf->dirpos;
 	}
 	switch (whence) {
@@ -829,7 +903,7 @@ static long pfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	for (;;) {
 		uint64_t pos = pf->dirpos, next, ino;
 		const char *name;
-		char nm[64];
+		char nm[PFS_NAME_MAX];
 		int t;
 
 		if (pos == 0) {
@@ -863,9 +937,27 @@ static long pfs_readdir(vfs_file_t *f, void *buf, long bytes)
 			next = 3 + pick->ino;
 		} else {
 			unsigned cursor = (unsigned)(pos - PFS_POS_DYN);
+			pfs_list_snap_t ls =
+				__atomic_load_n(&dir->list_snap, __ATOMIC_ACQUIRE);
 
-			if (!dir->list || !dir->list(dir, &cursor, nm, sizeof(nm), &t))
+			if (ls) {
+				int refresh = __atomic_exchange_n(
+					&pf->dirsnap_refresh, 0,
+					__ATOMIC_ACQ_REL);
+				int lr = ls(dir, &pf->dirsnap, refresh, &cursor,
+					    nm, sizeof(nm), &t);
+
+				if (lr < 0) {
+					if (off == 0)
+						return lr;
+					break;
+				}
+				if (!lr)
+					break;
+			} else if (!dir->list ||
+				   !dir->list(dir, &cursor, nm, sizeof(nm), &t)) {
 				break;
+			}
 			name = nm;
 			ino = dir->ino * 1000 + cursor;
 			next = PFS_POS_DYN + cursor;
@@ -889,6 +981,9 @@ static int pfs_close(vfs_file_t *f)
 	if (pf) {
 		if (pf->data)
 			kfree(pf->data);
+		if (pf->dirsnap && pf->node->list_free)
+			pf->node->list_free(pf->node, pf->dirsnap);
+		pf->dirsnap = NULL;
 		pfs_node_put(pf->node);
 		kfree(pf);
 	}
@@ -907,38 +1002,85 @@ static int pfs_fstat(vfs_file_t *f, struct kstat *st)
 	return 0;
 }
 
-/* Per-instance trampolines. */
-#define PFS_INSTANCE(N)                                                       \
-	static struct pfs *g_pfs_##N;                                         \
-	static int pfs_##N##_open(const char *p, int fl, vfs_file_t **o)      \
-	{                                                                     \
-		return pfs_open_common(g_pfs_##N, p, fl, o);                  \
-	}                                                                     \
-	static int pfs_##N##_stat(const char *p, struct kstat *st)            \
-	{                                                                     \
-		return pfs_stat_common(g_pfs_##N, p, st, 1);                  \
-	}                                                                     \
-	static int pfs_##N##_lstat(const char *p, struct kstat *st)           \
-	{                                                                     \
-		return pfs_stat_common(g_pfs_##N, p, st, 0);                  \
-	}                                                                     \
-	static int pfs_##N##_readlink(const char *p, char *b, unsigned long s) \
-	{                                                                     \
-		return pfs_readlink_common(g_pfs_##N, p, b, s);               \
-	}                                                                     \
-	static int pfs_##N##_chdir(const char *p)                             \
-	{                                                                     \
-		struct kstat st;                                              \
-		int r = pfs_stat_common(g_pfs_##N, p, &st, 1);                \
-		if (r != ST_OK)                                               \
-			return r;                                             \
-		return S_ISDIR(st.st_mode) ? ST_OK : ST_NOT_FOUND;            \
+/* The VFS entry points.  The instance is the mount's (vfs_register_mount()
+ * is given the struct pfs as the mount's fs_data), and the path arrives
+ * absolute, as each instance's own lookups expect. */
+static int pfs_vop_open(vfs_mount_t *m, const char *p, int fl, vfs_file_t **o)
+{
+	return pfs_open_common((struct pfs *)m->fs_data, p, fl, o);
+}
+
+static int pfs_vop_stat(vfs_mount_t *m, const char *p, struct kstat *st)
+{
+	return pfs_stat_common((struct pfs *)m->fs_data, p, st, 1);
+}
+
+static int pfs_vop_lstat(vfs_mount_t *m, const char *p, struct kstat *st)
+{
+	return pfs_stat_common((struct pfs *)m->fs_data, p, st, 0);
+}
+
+static int pfs_vop_readlink(vfs_mount_t *m, const char *p, char *b,
+			    unsigned long s)
+{
+	return pfs_readlink_common((struct pfs *)m->fs_data, p, b, s);
+}
+
+/* unlink(): only a file whose node says how it is removed. */
+static int pfs_vop_unlink(vfs_mount_t *m, const char *p)
+{
+	struct pfs *fs = (struct pfs *)m->fs_data;
+	const char *rel = pfs_rel(fs, p);
+	struct pfs_node *n;
+	int r;
+
+	if (!rel)
+		return ST_NOT_FOUND;
+	n = pfs_lookup(fs, rel);
+	if (!n)
+		return ST_NOT_FOUND;
+	if (n->type == PFS_DIR) {
+		pfs_node_put(n);
+		return ST_ISDIR;
 	}
+	if (n->type != PFS_FILE || !n->unlink) {
+		pfs_node_put(n);
+		return ST_PERM;
+	}
+	r = n->unlink(n);
+	pfs_node_put(n);
+	switch (r) {
+	case 0:
+		return ST_OK;
+	case -ENOENT:
+		return ST_NOT_FOUND;
+	case -EACCES:
+		return ST_ACCESS;
+	case -EPERM:
+		return ST_PERM;
+	case -ENOMEM:
+		return ST_NOMEM;
+	case -EINVAL:
+		return ST_INVALID;
+	case -EROFS:
+		return ST_ROFS;
+	case -EBUSY:
+		return ST_BUSY;
+	default:
+		return ST_IO;
+	}
+}
 
-PFS_INSTANCE(0)
-PFS_INSTANCE(1)
+static int pfs_vop_chdir(vfs_mount_t *m, const char *p)
+{
+	struct kstat st;
+	int r = pfs_stat_common((struct pfs *)m->fs_data, p, &st, 1);
 
-static int g_pfs_count;
+	if (r != ST_OK)
+		return r;
+	return S_ISDIR(st.st_mode) ? ST_OK : ST_NOT_FOUND;
+}
+
 
 void pfs_init(struct pfs *fs, const char *mount)
 {
@@ -955,24 +1097,12 @@ void pfs_init(struct pfs *fs, const char *mount)
 	fs->ops.readdir = pfs_readdir;
 	fs->ops.close = pfs_close;
 	fs->ops.fstat = pfs_fstat;
-	if (g_pfs_count == 0) {
-		g_pfs_0 = fs;
-		fs->ops.open = pfs_0_open;
-		fs->ops.stat = pfs_0_stat;
-		fs->ops.lstat = pfs_0_lstat;
-		fs->ops.readlink = pfs_0_readlink;
-		fs->ops.chdir = pfs_0_chdir;
-	} else if (g_pfs_count == 1) {
-		g_pfs_1 = fs;
-		fs->ops.open = pfs_1_open;
-		fs->ops.stat = pfs_1_stat;
-		fs->ops.lstat = pfs_1_lstat;
-		fs->ops.readlink = pfs_1_readlink;
-		fs->ops.chdir = pfs_1_chdir;
-	} else {
-		BUG_ON(1); /* more instances than trampolines */
-	}
-	g_pfs_count++;
+	fs->ops.open = pfs_vop_open;
+	fs->ops.stat = pfs_vop_stat;
+	fs->ops.lstat = pfs_vop_lstat;
+	fs->ops.readlink = pfs_vop_readlink;
+	fs->ops.chdir = pfs_vop_chdir;
+	fs->ops.unlink = pfs_vop_unlink;
 	(void)pfs_of_ops;
 	(void)g_pfs_current_open;
 }

@@ -575,19 +575,11 @@ static int64_t ftruncate_held(task_t *cur, vfs_file_t *f, uint64_t length)
 
 /* chmod/chown persist on filesystems with UNIX perms; on one without them the
  * vfs layer succeeds silently (ST_OK) so legacy behavior is preserved. */
-int64_t sys_chmod(uint64_t pathname, uint64_t mode)
+static int64_t chmod_path(task_t *cur, const char *kpath, uint64_t mode)
 {
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (c)
-		return c;
-	c = canon_task_path(kpath, sizeof(kpath));
-	if (c)
-		return c;
 	unsigned new_mode = (unsigned)mode;
 	/* Only the file's owner (or root) may change its mode; and a non-root
      * caller not in the file's group cannot set the set-group-ID bit. */
-	task_t *cur = sched_current();
 	if (cur && cur->cred.euid != 0) {
 		int tr = perm_traverse(kpath);
 		if (tr < 0)
@@ -603,6 +595,62 @@ int64_t sys_chmod(uint64_t pathname, uint64_t mode)
 	}
 	int r = vfs_chmod(kpath, new_mode);
 	return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
+}
+
+int64_t sys_chmod(uint64_t pathname, uint64_t mode)
+{
+	char kpath[VFS_MAX_PATH];
+	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	c = canon_task_path(kpath, sizeof(kpath));
+	if (c)
+		return c;
+	return chmod_path(sched_current(), kpath, mode);
+}
+
+/* fchmodat(dirfd, path, mode, flags).  A symbolic link has no mode of its
+ * own to change: with AT_SYMLINK_NOFOLLOW on a link the answer is
+ * EOPNOTSUPP, on anything else the call is chmod().  AT_EMPTY_PATH with an
+ * empty path changes the file dirfd refers to. */
+int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
+		     uint64_t flags)
+{
+	task_t *cur = sched_current();
+	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	int c;
+
+	if (!cur)
+		return -EFAULT;
+	if (flags & ~((uint64_t)AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
+	if (!pathname)
+		return -EFAULT;
+	c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	if (kpath[0] == '\0') {
+		if (!(flags & AT_EMPTY_PATH))
+			return -ENOENT;
+		if ((int)dirfd == AT_FDCWD) {
+			c = build_at_path(cur, AT_FDCWD, ".", full,
+					  sizeof(full));
+			return c ? c : chmod_path(cur, full, mode);
+		}
+		return sys_fchmod(dirfd, mode);
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (c)
+		return c;
+	if (flags & AT_SYMLINK_NOFOLLOW) {
+		struct kstat st;
+		int r = vfs_lstat(full, &st);
+		if (r != ST_OK)
+			return vfs_status_to_errno(r);
+		if (S_ISLNK(st.st_mode))
+			return -EOPNOTSUPP;
+	}
+	return chmod_path(cur, full, mode);
 }
 
 int64_t sys_fchmod(uint64_t fd, uint64_t mode)
@@ -645,25 +693,21 @@ static int64_t fchmod_held(task_t *cur, vfs_file_t *f, uint64_t mode)
 	return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
 }
 
-int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
+/* chown on a canonical path: of a final symlink itself when `nofollow'. */
+static int64_t chown_path(task_t *cur, const char *kpath, uint64_t owner,
+			  uint64_t group, int nofollow)
 {
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (c)
-		return c;
-	c = canon_task_path(kpath, sizeof(kpath));
-	if (c)
-		return c;
 	/* Changing the owner is root-only; a non-root owner may change the
      * group of their own file to one of their groups. */
-	task_t *cur = sched_current();
 	int new_uid = (int)owner, new_gid = (int)group;
 	if (cur && cur->cred.euid != 0) {
 		int tr = perm_traverse(kpath);
 		if (tr < 0)
 			return tr;
 		struct kstat st;
-		if (vfs_stat(kpath, &st) == ST_OK) {
+		int sr = nofollow ? vfs_lstat(kpath, &st) :
+				    vfs_stat(kpath, &st);
+		if (sr == ST_OK) {
 			if (new_uid != -1 &&
 			    (uint32_t)new_uid != (uint32_t)st.st_uid)
 				return -EPERM; /* owner change: root only */
@@ -677,17 +721,76 @@ int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
 			}
 		}
 	}
-	int r = vfs_chown(kpath, new_uid, new_gid); /* -1 => leave unchanged */
+	/* -1 => leave unchanged */
+	int r = vfs_chown(kpath, new_uid, new_gid, nofollow);
 	if (r == ST_OK && cur &&
 	    cur->cred.euid != 0) { /* drop set-id on ownership change */
 		struct kstat st;
-		if (vfs_stat(kpath, &st) == ST_OK) {
+		int sr = nofollow ? vfs_lstat(kpath, &st) :
+				    vfs_stat(kpath, &st);
+		/* A symbolic link has no set-id bits to drop. */
+		if (sr == ST_OK && !S_ISLNK(st.st_mode)) {
 			unsigned clr = setid_strip_bits((uint32_t)st.st_mode);
 			if (clr)
 				vfs_chmod(kpath, (unsigned)st.st_mode & ~clr);
 		}
 	}
 	return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
+}
+
+int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
+{
+	char kpath[VFS_MAX_PATH];
+	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	c = canon_task_path(kpath, sizeof(kpath));
+	if (c)
+		return c;
+	return chown_path(sched_current(), kpath, owner, group, 0);
+}
+
+/* fchownat(dirfd, path, owner, group, flags): AT_SYMLINK_NOFOLLOW changes a
+ * final symlink itself (lchown), AT_EMPTY_PATH with an empty path the file
+ * dirfd refers to (fchown). */
+int64_t sys_fchownat(uint64_t dirfd, uint64_t pathname, uint64_t owner,
+		     uint64_t group, uint64_t flags)
+{
+	task_t *cur = sched_current();
+	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	int c;
+
+	if (!cur)
+		return -EFAULT;
+	if (flags & ~((uint64_t)AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
+	if (!pathname)
+		return -EFAULT;
+	c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	if (kpath[0] == '\0') {
+		if (!(flags & AT_EMPTY_PATH))
+			return -ENOENT;
+		if ((int)dirfd == AT_FDCWD) {
+			c = build_at_path(cur, AT_FDCWD, ".", full,
+					  sizeof(full));
+			if (c)
+				return c;
+			return chown_path(cur, full, owner, group, 0);
+		}
+		vfs_file_t *f = fdget(cur, (int)dirfd);
+		if (!f)
+			return -EBADF;
+		int64_t r = fchown_held(cur, f, owner, group);
+		fdput(f);
+		return r;
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (c)
+		return c;
+	return chown_path(cur, full, owner, group,
+			  (flags & AT_SYMLINK_NOFOLLOW) ? 1 : 0);
 }
 
 int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)

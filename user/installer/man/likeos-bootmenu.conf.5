@@ -1,0 +1,91 @@
+.\" likeos-bootmenu.conf.5 - manual page for the boot menu of the LikeOS
+.\" installation medium.
+.\"
+.\" The troff source.  man(1) on this system reads pre-formatted pages; the
+.\" installed copy is res/man5/likeos-bootmenu.conf.5, rendered from this
+.\" file by "make installer-manpages" (mk/installer.mk).
+.\"
+.\" Copyright (C) 2026 The LikeOS Project
+.TH LIKEOS-BOOTMENU.CONF 5 "November 2026" "LikeOS" "File Formats"
+.SH NAME
+likeos-bootmenu.conf \- the boot menu of the LikeOS installation medium
+.SH SYNOPSIS
+.B \eEFI\eLIKEOS\ebootmenu.conf
+on the EFI system partition
+.SH DESCRIPTION
+The LikeOS boot loader
+.RB ( BOOTX64.EFI )
+shows a menu before it starts the kernel when the EFI system partition it
+was loaded from has the file
+.BR \eEFI\eLIKEOS\ebootmenu.conf .
+The USB medium LikeOS is written to has one, with the entries
+.B Run LikeOS Live from USB
+and
+.BR "Install LikeOS from USB" ;
+a LikeOS installed on a disk has none, and starts straight away.
+.PP
+The menu is drawn on the firmware's graphics screen (as text where there is
+none).
+Up and Down choose an entry, Home and End the first and the last, a digit
+the entry of that number (1 the first); Enter starts the chosen entry.
+Until a key is pressed a countdown runs, and when it ends the default entry
+starts.
+.PP
+The file is UTF-8 text, one setting per line.
+Lines starting with
+.B #
+are comments; empty lines are ignored; blanks around a line are ignored.
+.TP
+.BI timeout= seconds
+How long the menu waits before it starts the default entry.
+.TP
+.BI default= index
+The entry chosen when the menu appears and started when the countdown
+ends, counted from 0 in the order of the
+.B entry
+lines (default 0, the first).
+.TP
+.BI title= text
+The heading of the menu.
+.TP
+.BI entry= title\fB|\fIwords
+One menu entry, in the order of the file: the
+.I title
+the menu shows, a vertical bar, and the
+.I words
+the entry adds to the kernel command line (they may be empty).
+The kernel and the system it starts see them in
+.BR /proc/cmdline .
+.SH KERNEL COMMAND LINE WORDS
+.TP
+.B likeos.mode=install
+.BR init (8)
+starts LikeOS Setup,
+.BR likeos-installer (1),
+on the console instead of the login prompt (it reads
+.B /etc/inittab.install
+instead of
+.BR /etc/inittab ).
+.TP
+.B efi=noruntime
+The kernel does not call the firmware's runtime services: no UEFI variables
+in
+.B /sys/firmware/efi/efivars
+(for firmware that misbehaves; boot entries cannot be changed then).
+.SH EXAMPLE
+The file on the USB medium:
+.PP
+.RS
+.nf
+# The boot menu of the LikeOS USB medium
+title=LikeOS
+timeout=10
+default=0
+entry=Run LikeOS Live from USB|
+entry=Install LikeOS from USB|likeos.mode=install
+.fi
+.RE
+.SH SEE ALSO
+.BR likeos-installer (1),
+.BR likeos-install (1),
+.BR likeos-efiboot (1)

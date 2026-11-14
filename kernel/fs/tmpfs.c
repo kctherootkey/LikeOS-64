@@ -32,8 +32,13 @@
  * one the rest of the system cannot reclaim, and a program filling it up
  * must get ENOSPC rather than take the machine down.
  *
+ * The kernel mounts one instance at boot, at TMPFS_MOUNT (/ram), on every
+ * system -- the live medium and an installed disk alike -- as an entry of
+ * the mount table (vfs_mount_boot); /proc/mounts lists it as tmpfs at /ram.
+ * mount -t tmpfs makes further instances anywhere else.
+ *
  * Interface: the path-based vfs_ops_t every other filesystem here speaks,
- * reached through the VFS mount table (vfs_register_mount), so the paths
+ * reached through the VFS mount table (tmpfs_fstype, mount(2)), so the paths
  * arriving are absolute and canonical -- no "." or "..", no double slashes
  * (namei's normalize_path guarantees it) -- and always start with the mount
  * prefix.  Permissions are decided by the VFS from stat(), like everywhere
@@ -50,6 +55,7 @@
  */
 #include <kernel/fs/tmpfs.h>
 #include <kernel/fs/vfs.h>
+#include <kernel/fs/mount.h>
 #include <kernel/uapi/status.h>
 #include <kernel/uapi/stat.h>
 #include <kernel/uapi/dirent.h>
@@ -65,7 +71,7 @@
 /* At most 1/N of physical memory may be held in file frames. */
 #define TFS_RAM_FRACTION 4
 /* ...but never less than this many frames, so a small machine still has a
- * usable /ram (16 MB). */
+ * usable tmpfs (16 MB). */
 #define TFS_MIN_CAP_PAGES 4096
 /* Largest single file: 1 GB.  Keeps every size computation far from
  * overflowing, and nothing that belongs in RAM is bigger. */
@@ -80,21 +86,24 @@
 #define TFS_MAGIC 0x01021994UL
 #define TFS_DEV 0x746d7066UL /* "tmpf" */
 
-#define TFS_MOUNT_LEN (sizeof(TMPFS_MOUNT) - 1)
 
 /* ---- Structures --------------------------------------------------------- */
 
-enum tfs_type { TFS_REG, TFS_DIR, TFS_LNK, TFS_SOCK, TFS_FIFO };
+enum tfs_type { TFS_REG, TFS_DIR, TFS_LNK, TFS_SOCK, TFS_FIFO, TFS_CHR, TFS_BLK };
 
 struct tfs_dentry;
+struct tfs_sb;
 
 /* The object: what stat() describes and what a handle holds. */
 struct tfs_inode {
+	struct tfs_sb *sb; /* the instance it belongs to                    */
 	enum tfs_type type;
 	uint32_t mode; /* permission bits (07777)                       */
 	uint32_t uid, gid;
 	uint64_t ino;
 	uint64_t atime, mtime, ctime; /* seconds since the epoch       */
+	uint32_t atime_ns, mtime_ns, ctime_ns; /* and their nanoseconds */
+	uint64_t rdev; /* device nodes: the device number               */
 	uint32_t nlink; /* names pointing here (a directory has one)    */
 	int refs; /* open handles                                         */
 	/* directories */
@@ -129,24 +138,33 @@ typedef struct {
 
 /* ---- State --------------------------------------------------------------- */
 
-static struct tfs_inode g_root_inode;
-static struct tfs_dentry g_root;
-static uint64_t g_next_ino = 1;
-static unsigned long g_cap_pages; /* frames /ram may hold in total     */
-static unsigned long g_used_pages; /* frames it holds now              */
-static unsigned long g_inodes; /* objects alive (for statfs)           */
+/* One mounted instance: the boot-time /ram, and one per tmpfs mount(2).
+ * Each has its own tree, its own frame budget and its own lock. */
+struct tfs_sb {
+	struct {
+		spinlock_t lock; /* protects the three fields below           */
+		volatile int held;
+		volatile uint64_t owner; /* task id of the holder               */
+		volatile int depth; /* reentrant holds by the owner              */
+	} mtx;
+	struct tfs_inode root_inode;
+	struct tfs_dentry root;
+	uint64_t next_ino;
+	unsigned long cap_pages; /* frames the instance may hold in total */
+	unsigned long used_pages; /* frames it holds now              */
+	unsigned long inodes; /* objects alive (for statfs)           */
+	unsigned long max_inodes; /* nr_inodes=, 0 for the frame cap   */
+	unsigned long fsid; /* statfs f_fsid */
+	/* Where it is mounted (an absolute symlink is resolved inside the
+	 * instance when it points below there). */
+	const vfs_mount_t *mnt;
+};
+
 static vfs_ops_t g_tfs_ops;
 
 /* ---- The lock ------------------------------------------------------------ */
 
-static struct {
-	spinlock_t lock; /* protects the three fields below           */
-	volatile int held;
-	volatile uint64_t owner; /* task id of the holder               */
-	volatile int depth; /* reentrant holds by the owner              */
-} g_mtx;
-
-static void tfs_lock(void)
+static void tfs_lock(struct tfs_sb *sb)
 {
 	task_t *cur = sched_current();
 	uint64_t me = cur ? (uint64_t)cur->id : (uint64_t)-2;
@@ -154,69 +172,70 @@ static void tfs_lock(void)
 	for (;;) {
 		uint64_t fl;
 
-		spin_lock_irqsave(&g_mtx.lock, &fl);
-		if (!g_mtx.held) {
-			g_mtx.held = 1;
-			g_mtx.owner = me;
-			g_mtx.depth = 1;
+		spin_lock_irqsave(&sb->mtx.lock, &fl);
+		if (!sb->mtx.held) {
+			sb->mtx.held = 1;
+			sb->mtx.owner = me;
+			sb->mtx.depth = 1;
 			task_sleep_lock_taken();
-			spin_unlock_irqrestore(&g_mtx.lock, fl);
+			spin_unlock_irqrestore(&sb->mtx.lock, fl);
 			return;
 		}
-		if (g_mtx.owner == me) {
-			g_mtx.depth++;
-			spin_unlock_irqrestore(&g_mtx.lock, fl);
+		if (sb->mtx.owner == me) {
+			sb->mtx.depth++;
+			spin_unlock_irqrestore(&sb->mtx.lock, fl);
 			return;
 		}
 		/* Park on the mutex as ext4's rwsem does: BLOCKED is set under
 		 * the spinlock, so a release that happens after this unlock
 		 * finds the task on the channel and wakes it. */
 		if (cur && irqs_enabled()) {
-			cur->wait_channel = (void *)&g_mtx;
+			cur->wait_channel = (void *)&sb->mtx;
 			task_set_blocked(cur);
-			spin_unlock_irqrestore(&g_mtx.lock, fl);
+			spin_unlock_irqrestore(&sb->mtx.lock, fl);
 			sched_schedule();
 		} else {
-			spin_unlock_irqrestore(&g_mtx.lock, fl);
+			spin_unlock_irqrestore(&sb->mtx.lock, fl);
 			__asm__ volatile("pause");
 		}
 	}
 }
 
-static void tfs_unlock(void)
+static void tfs_unlock(struct tfs_sb *sb)
 {
 	uint64_t fl;
 	int released = 0;
 
-	spin_lock_irqsave(&g_mtx.lock, &fl);
-	if (g_mtx.held && --g_mtx.depth == 0) {
-		g_mtx.held = 0;
-		g_mtx.owner = (uint64_t)-1;
+	spin_lock_irqsave(&sb->mtx.lock, &fl);
+	if (sb->mtx.held && --sb->mtx.depth == 0) {
+		sb->mtx.held = 0;
+		sb->mtx.owner = (uint64_t)-1;
 		released = 1;
 		task_sleep_lock_dropped();
 	}
-	spin_unlock_irqrestore(&g_mtx.lock, fl);
+	spin_unlock_irqrestore(&sb->mtx.lock, fl);
 	if (released)
-		sched_wake_channel((void *)&g_mtx);
+		sched_wake_channel((void *)&sb->mtx);
 }
 
 /* The reaper's hook: a task that died inside an operation must not keep
  * the tree locked forever. */
-static int tfs_release_locks_for_task(uint64_t task_id)
+static int tfs_release_locks_for_task(vfs_mount_t *m, uint64_t task_id)
 {
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
 	uint64_t fl;
 	int released = 0;
 
-	spin_lock_irqsave(&g_mtx.lock, &fl);
-	if (g_mtx.held && g_mtx.owner == task_id) {
-		g_mtx.held = 0;
-		g_mtx.depth = 0;
-		g_mtx.owner = (uint64_t)-1;
+	spin_lock_irqsave(&sb->mtx.lock, &fl);
+	if (sb->mtx.held && sb->mtx.owner == task_id) {
+		sb->mtx.held = 0;
+		sb->mtx.depth = 0;
+		sb->mtx.owner = (uint64_t)-1;
 		released = 1;
 	}
-	spin_unlock_irqrestore(&g_mtx.lock, fl);
+	spin_unlock_irqrestore(&sb->mtx.lock, fl);
 	if (released)
-		sched_wake_channel((void *)&g_mtx);
+		sched_wake_channel((void *)&sb->mtx);
 	return ST_OK;
 }
 
@@ -245,11 +264,13 @@ static int tfs_name_eq(const char *name, const char *s, size_t len)
 static void tfs_touch_ctime(struct tfs_inode *n)
 {
 	n->ctime = timer_get_epoch();
+	n->ctime_ns = 0;
 }
 
 static void tfs_touch_mtime(struct tfs_inode *n)
 {
 	n->mtime = n->ctime = timer_get_epoch();
+	n->mtime_ns = n->ctime_ns = 0;
 }
 
 /* ---- Frames --------------------------------------------------------------- */
@@ -259,9 +280,11 @@ static void tfs_touch_mtime(struct tfs_inode *n)
  * before a failure stay: they are zero and accounted for. */
 static int tfs_grow_pages(struct tfs_inode *n, unsigned long want)
 {
+	struct tfs_sb *sb = n->sb;
+
 	if (want <= n->npages)
 		return ST_OK;
-	if (want - n->npages > g_cap_pages - g_used_pages)
+	if (want - n->npages > sb->cap_pages - sb->used_pages)
 		return ST_NOSPC;
 	if (want > n->pcap) {
 		unsigned long ncap = n->pcap ? n->pcap : 8;
@@ -289,7 +312,7 @@ static int tfs_grow_pages(struct tfs_inode *n, unsigned long want)
 		 * as zero either way. */
 		mm_memset(phys_to_virt(p), 0, PAGE_SIZE);
 		n->pages[n->npages++] = p;
-		g_used_pages++;
+		sb->used_pages++;
 	}
 	return ST_OK;
 }
@@ -297,10 +320,12 @@ static int tfs_grow_pages(struct tfs_inode *n, unsigned long want)
 /* Drop frames beyond `keep'. */
 static void tfs_shrink_pages(struct tfs_inode *n, unsigned long keep)
 {
+	struct tfs_sb *sb = n->sb;
+
 	while (n->npages > keep) {
 		n->npages--;
 		mm_free_physical_page(n->pages[n->npages]);
-		g_used_pages--;
+		sb->used_pages--;
 	}
 	if (keep == 0 && n->pages) {
 		kfree(n->pages);
@@ -337,13 +362,17 @@ static int tfs_set_size(struct tfs_inode *n, unsigned long size)
 
 /* ---- Inodes and names ----------------------------------------------------- */
 
-static struct tfs_inode *tfs_inode_new(enum tfs_type type, uint32_t mode)
+static struct tfs_inode *tfs_inode_new(struct tfs_sb *sb, enum tfs_type type,
+				       uint32_t mode)
 {
+	if (sb->max_inodes && sb->inodes >= sb->max_inodes)
+		return NULL;
 	struct tfs_inode *n = kalloc(sizeof(*n));
 
 	if (!n)
 		return NULL;
 	mm_memset(n, 0, sizeof(*n));
+	n->sb = sb;
 	n->type = type;
 	n->mode = mode & 07777;
 	task_t *cur = sched_current();
@@ -352,25 +381,27 @@ static struct tfs_inode *tfs_inode_new(enum tfs_type type, uint32_t mode)
 		n->uid = cur->cred.fsuid;
 		n->gid = cur->cred.fsgid;
 	}
-	n->ino = ++g_next_ino;
+	n->ino = ++sb->next_ino;
 	n->atime = n->mtime = n->ctime = timer_get_epoch();
-	g_inodes++;
+	sb->inodes++;
 	return n;
 }
 
 static void tfs_inode_free(struct tfs_inode *n)
 {
+	struct tfs_sb *sb = n->sb;
+
 	tfs_shrink_pages(n, 0);
 	if (n->target)
 		kfree(n->target);
-	g_inodes--;
+	sb->inodes--;
 	kfree(n);
 }
 
 /* An object goes when it has no name left and nobody holds it open. */
 static void tfs_inode_maybe_free(struct tfs_inode *n)
 {
-	if (n->nlink == 0 && n->refs == 0 && n != &g_root_inode)
+	if (n->nlink == 0 && n->refs == 0 && n != &n->sb->root_inode)
 		tfs_inode_free(n);
 }
 
@@ -460,17 +491,34 @@ static struct tfs_dentry *tfs_find_child(struct tfs_dentry *dir, const char *s,
 
 /* ---- Path resolution ----------------------------------------------------- */
 
-/* The part of an absolute path below the mount point, without its leading
- * slash: "/ram/a/b" -> "a/b", "/ram" -> "".  NULL if not ours. */
-static const char *tfs_rel(const char *path)
+/* A path as the VFS hands it over -- relative to the mount point, with a
+ * leading slash: "/a/b" -- without that slash: "a/b", "" for the root. */
+static const char *tfs_rel(struct tfs_sb *sb, const char *path)
 {
-	size_t k = 0;
-
+	(void)sb;
 	if (!path)
 		return NULL;
-	while (k < TFS_MOUNT_LEN && path[k] == TMPFS_MOUNT[k])
+	while (*path == '/')
+		path++;
+	return path;
+}
+
+/* The part of an ABSOLUTE path (a symlink's target) below the instance's
+ * mount point, without its leading slash: "/ram/a/b" -> "a/b", "/ram" ->
+ * "".  NULL if it leads out of the instance. */
+static const char *tfs_target_rel(struct tfs_sb *sb, const char *path)
+{
+	const char *mp = sb->mnt ? sb->mnt->path : NULL;
+	size_t ml, k = 0;
+
+	if (!path || !mp)
+		return NULL;
+	ml = kstrlen(mp);
+	if (ml == 1) /* mounted on "/" */
+		ml = 0;
+	while (k < ml && path[k] == mp[k])
 		k++;
-	if (k != TFS_MOUNT_LEN)
+	if (k != ml)
 		return NULL;
 	if (path[k] == 0)
 		return path + k;
@@ -483,12 +531,21 @@ static const char *tfs_rel(const char *path)
 
 /* Resolve `p' relative to `base' to a name.  `follow' says whether a
  * symlink in the FINAL component is followed (stat/open: yes; lstat/unlink/
- * rename/link: no); one in the middle always is.  A link whose target
- * leaves /ram cannot be followed from here and reads as missing. */
-static struct tfs_dentry *tfs_resolve(struct tfs_dentry *base, const char *p,
-				      int follow, int hops)
+ * rename/link: no); one in the middle always is.
+ *
+ * `whole' is the path the VFS handed the operation, when `p' is (a prefix
+ * of) it starting at byte `woff' -- NULL otherwise.  A link met on it is
+ * offered to the VFS (vfs_link_hop), which follows it wherever in the name
+ * space it leads: then NULL comes back, and the operation fails without
+ * having changed anything, to be run again where the link leads.  Followed
+ * here instead, a link whose target leaves the instance reads as missing. */
+static struct tfs_dentry *tfs_resolve(struct tfs_sb *sb,
+				      struct tfs_dentry *base, const char *p,
+				      int follow, int hops, const char *whole,
+				      size_t woff)
 {
 	struct tfs_dentry *cur = base;
+	const char *p0 = p;
 
 	if (hops > TFS_LINK_HOPS)
 		return NULL;
@@ -523,42 +580,57 @@ static struct tfs_dentry *tfs_resolve(struct tfs_dentry *base, const char *p,
 			if (!next)
 				return NULL;
 		}
-		if (next->inode->type == TFS_LNK && (!last || follow)) {
+		/* "name/" names what is THROUGH a link: followed even by
+		 * the operations that otherwise stop at one. */
+		if (next->inode->type == TFS_LNK &&
+		    (!last || follow || *p == '/')) {
 			const char *t = next->inode->target;
 
+			if (whole && hops == 0 &&
+			    vfs_link_hop((vfs_mount_t *)sb->mnt, whole,
+					 woff + (size_t)(s - p0),
+					 woff + (size_t)(s - p0) + len, t))
+				return NULL; /* the VFS follows it */
 			if (t[0] == '/') {
-				const char *r = tfs_rel(t);
+				const char *r = tfs_target_rel(sb, t);
 
 				if (!r)
-					return NULL; /* leaves /ram */
-				next = tfs_resolve(&g_root, r, 1, hops + 1);
+					return NULL; /* leaves the instance */
+				next = tfs_resolve(sb, &sb->root, r, 1,
+						   hops + 1, NULL, 0);
 			} else {
-				next = tfs_resolve(cur, t, 1, hops + 1);
+				next = tfs_resolve(sb, cur, t, 1, hops + 1,
+						   NULL, 0);
 			}
 			if (!next)
 				return NULL;
 		}
 		cur = next;
+		/* ...and has to be a directory. */
+		if (last && *p == '/' && cur->inode->type != TFS_DIR)
+			return NULL;
 	}
 	return cur;
 }
 
-static struct tfs_dentry *tfs_lookup(const char *path, int follow)
+static struct tfs_dentry *tfs_lookup(struct tfs_sb *sb, const char *path,
+				     int follow)
 {
-	const char *rel = tfs_rel(path);
+	const char *rel = tfs_rel(sb, path);
 
 	if (!rel)
 		return NULL;
-	return tfs_resolve(&g_root, rel, follow, 0);
+	return tfs_resolve(sb, &sb->root, rel, follow, 0,
+			   path[0] == '/' ? path : NULL, (size_t)(rel - path));
 }
 
 /* Split `path' into its parent directory (resolved, symlinks followed) and
  * its final name, copied to `name' (NUL-terminated).  The name must be a
  * real one: not empty, not "." or "..", not longer than VFS_NAME_MAX. */
-static int tfs_split(const char *path, struct tfs_dentry **dir_out, char *name,
-		     size_t namecap)
+static int tfs_split(struct tfs_sb *sb, const char *path,
+		     struct tfs_dentry **dir_out, char *name, size_t namecap)
 {
-	const char *rel = tfs_rel(path);
+	const char *rel = tfs_rel(sb, path);
 
 	if (!rel || !*rel)
 		return ST_INVALID; /* the root has no parent here */
@@ -585,7 +657,7 @@ static int tfs_split(const char *path, struct tfs_dentry **dir_out, char *name,
 	struct tfs_dentry *dir;
 
 	if (start == 0) {
-		dir = &g_root;
+		dir = &sb->root;
 	} else {
 		char prefix[VFS_MAX_PATH];
 
@@ -593,7 +665,9 @@ static int tfs_split(const char *path, struct tfs_dentry **dir_out, char *name,
 			return ST_INVALID;
 		mm_memcpy(prefix, rel, start);
 		prefix[start] = 0;
-		dir = tfs_resolve(&g_root, prefix, 1, 0);
+		dir = tfs_resolve(sb, &sb->root, prefix, 1, 0,
+				  path[0] == '/' ? path : NULL,
+				  (size_t)(rel - path));
 		if (!dir || dir->inode->type != TFS_DIR)
 			return ST_NOT_FOUND;
 	}
@@ -615,6 +689,9 @@ static void tfs_fill_stat(const struct tfs_inode *n, struct kstat *st)
 	st->st_atime = n->atime;
 	st->st_mtime = n->mtime;
 	st->st_ctime = n->ctime;
+	st->st_atime_nsec = n->atime_ns;
+	st->st_mtime_nsec = n->mtime_ns;
+	st->st_ctime_nsec = n->ctime_ns;
 	switch (n->type) {
 	case TFS_DIR: {
 		/* The customary count: its own name, ".", and every
@@ -639,6 +716,14 @@ static void tfs_fill_stat(const struct tfs_inode *n, struct kstat *st)
 	case TFS_FIFO:
 		st->st_mode = S_IFIFO | n->mode;
 		break;
+	case TFS_CHR:
+		st->st_mode = S_IFCHR | n->mode;
+		st->st_rdev = n->rdev;
+		break;
+	case TFS_BLK:
+		st->st_mode = S_IFBLK | n->mode;
+		st->st_rdev = n->rdev;
+		break;
 	default:
 		st->st_mode = S_IFREG | n->mode;
 		st->st_size = n->size;
@@ -647,28 +732,29 @@ static void tfs_fill_stat(const struct tfs_inode *n, struct kstat *st)
 	}
 }
 
-static int tfs_stat_common(const char *path, struct kstat *st, int follow)
+static int tfs_stat_common(struct tfs_sb *sb, const char *path,
+			   struct kstat *st, int follow)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, follow);
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, follow);
 
 	if (!d) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	tfs_fill_stat(d->inode, st);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_stat(const char *path, struct kstat *st)
+static int tfs_stat(vfs_mount_t *m, const char *path, struct kstat *st)
 {
-	return tfs_stat_common(path, st, 1);
+	return tfs_stat_common((struct tfs_sb *)m->fs_data, path, st, 1);
 }
 
-static int tfs_lstat(const char *path, struct kstat *st)
+static int tfs_lstat(vfs_mount_t *m, const char *path, struct kstat *st)
 {
-	return tfs_stat_common(path, st, 0);
+	return tfs_stat_common((struct tfs_sb *)m->fs_data, path, st, 0);
 }
 
 static int tfs_fstat(vfs_file_t *f, struct kstat *st)
@@ -677,24 +763,26 @@ static int tfs_fstat(vfs_file_t *f, struct kstat *st)
 
 	if (!tf)
 		return ST_INVALID;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	tfs_fill_stat(tf->inode, st);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
 /* ---- open / close ---------------------------------------------------------- */
 
-static int tfs_open_mode(const char *path, int flags, unsigned int mode,
-			 vfs_file_t **out)
+static int tfs_open_mode(vfs_mount_t *m, const char *path, int flags,
+			 unsigned int mode, vfs_file_t **out)
 {
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
 	int acc = flags & 3;
 	int writing = (acc == O_WRONLY || acc == O_RDWR || (flags & O_TRUNC));
 
-	if (!tfs_rel(path))
+	if (!tfs_rel(sb, path))
 		return ST_NOT_FOUND;
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 1);
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, 1);
 	struct tfs_inode *n;
 
 	/* O_CREAT|O_EXCL fails on a name that exists.  Decided here, under
@@ -703,51 +791,51 @@ static int tfs_open_mode(const char *path, int flags, unsigned int mode,
 	int excl = (flags & O_CREAT) && (flags & O_EXCL);
 
 	if (d && excl) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_EXISTS;
 	}
 	if (!d) {
 		/* A missing name is created when asked. */
 		if (!(flags & O_CREAT)) {
-			tfs_unlock();
+			tfs_unlock(sb);
 			return ST_NOT_FOUND;
 		}
 		struct tfs_dentry *dir;
 		char name[VFS_NAME_MAX + 1];
-		int rc = tfs_split(path, &dir, name, sizeof(name));
+		int rc = tfs_split(sb, path, &dir, name, sizeof(name));
 
 		if (rc != ST_OK) {
-			tfs_unlock();
+			tfs_unlock(sb);
 			return rc;
 		}
 		/* The lookup followed symlinks; a name that exists but leads
 		 * nowhere (a dangling link) is not one to create under -- and
 		 * for O_EXCL it is a name that exists. */
 		if (tfs_find_child(dir, name, kstrlen(name))) {
-			tfs_unlock();
+			tfs_unlock(sb);
 			return excl ? ST_EXISTS : ST_NOT_FOUND;
 		}
-		n = tfs_inode_new(TFS_REG, mode);
+		n = tfs_inode_new(sb, TFS_REG, mode);
 		if (!n) {
-			tfs_unlock();
+			tfs_unlock(sb);
 			return ST_NOMEM;
 		}
 		if (!tfs_dentry_add(dir, name, n)) {
 			tfs_inode_free(n);
-			tfs_unlock();
+			tfs_unlock(sb);
 			return ST_NOMEM;
 		}
 	} else {
 		n = d->inode;
 		if (n->type == TFS_DIR) {
 			if (writing) {
-				tfs_unlock();
+				tfs_unlock(sb);
 				return ST_INVALID; /* EISDIR has no ST_ code */
 			}
 		} else if (n->type != TFS_REG) {
 			/* A socket or FIFO node is a name, not something to
 			 * read. */
-			tfs_unlock();
+			tfs_unlock(sb);
 			return ST_UNSUPPORTED;
 		}
 	}
@@ -755,7 +843,7 @@ static int tfs_open_mode(const char *path, int flags, unsigned int mode,
 	tfs_file_t *tf = kalloc(sizeof(*tf));
 
 	if (!tf) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOMEM;
 	}
 	mm_memset(tf, 0, sizeof(*tf));
@@ -770,16 +858,17 @@ static int tfs_open_mode(const char *path, int flags, unsigned int mode,
 		}
 		tf->pos = (flags & O_APPEND) ? (long)n->size : 0;
 	}
-	tfs_unlock();
+	tfs_unlock(sb);
 	*out = &tf->vfs;
 	return ST_OK;
 }
 
 /* Plain open: in-kernel openers, which never create here.  0644 is what a
  * creation through this path gets, the same default ext4 applies. */
-static int tfs_open(const char *path, int flags, vfs_file_t **out)
+static int tfs_open(vfs_mount_t *m, const char *path, int flags,
+		    vfs_file_t **out)
 {
-	return tfs_open_mode(path, flags, 0644, out);
+	return tfs_open_mode(m, path, flags, 0644, out);
 }
 
 static int tfs_close(vfs_file_t *f)
@@ -788,12 +877,13 @@ static int tfs_close(vfs_file_t *f)
 
 	if (!tf)
 		return ST_OK;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	struct tfs_inode *n = tf->inode;
 
 	n->refs--;
 	tfs_inode_maybe_free(n);
-	tfs_unlock();
+	tfs_unlock(sb);
 	kfree(tf);
 	return ST_OK;
 }
@@ -843,12 +933,13 @@ static long tfs_read(vfs_file_t *f, void *buf, long bytes)
 		return -EISDIR;
 	if (bytes == 0)
 		return 0;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	long n = tfs_copy_out(tf->inode, buf, bytes, (unsigned long)tf->pos);
 
 	if (n > 0)
 		tf->pos += n;
-	tfs_unlock();
+	tfs_unlock(sb);
 	return n;
 }
 
@@ -864,10 +955,11 @@ static long tfs_read_at(vfs_file_t *f, void *buf, long bytes, long off)
 		return -EISDIR;
 	if (bytes == 0)
 		return 0;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	long n = tfs_copy_out(tf->inode, buf, bytes, (unsigned long)off);
 
-	tfs_unlock();
+	tfs_unlock(sb);
 	return n;
 }
 
@@ -883,7 +975,8 @@ static long tfs_write(vfs_file_t *f, const void *buf, long bytes)
 		return -EISDIR;
 	if (bytes == 0)
 		return 0;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	struct tfs_inode *n = tf->inode;
 
 	if (f->flags & O_APPEND)
@@ -892,7 +985,7 @@ static long tfs_write(vfs_file_t *f, const void *buf, long bytes)
 	unsigned long end = off + (unsigned long)bytes;
 
 	if (end < off || end > TFS_MAX_FILE_SIZE) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return -ENOSPC; /* no EFBIG in this kernel */
 	}
 	/* Frames for the whole write first, so it is all or nothing: a
@@ -900,7 +993,7 @@ static long tfs_write(vfs_file_t *f, const void *buf, long bytes)
 	int rc = tfs_grow_pages(n, (end + PAGE_SIZE - 1) / PAGE_SIZE);
 
 	if (rc != ST_OK) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return rc == ST_NOSPC ? -ENOSPC : -ENOMEM;
 	}
 	unsigned long done = 0;
@@ -923,7 +1016,7 @@ static long tfs_write(vfs_file_t *f, const void *buf, long bytes)
 		n->size = end;
 	tf->pos = (long)end;
 	tfs_touch_mtime(n);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return bytes;
 }
 
@@ -933,12 +1026,13 @@ static long tfs_seek(vfs_file_t *f, long offset, int whence)
 
 	if (!tf)
 		return -EINVAL;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	if (tf->inode->type == TFS_DIR) {
 		/* rewinddir(): only a rewind means anything for a listing. */
 		if (whence == SEEK_SET && offset == 0)
 			tf->dirpos = 0;
-		tfs_unlock();
+		tfs_unlock(sb);
 		return 0;
 	}
 	long base;
@@ -954,17 +1048,17 @@ static long tfs_seek(vfs_file_t *f, long offset, int whence)
 		base = (long)tf->inode->size;
 		break;
 	default:
-		tfs_unlock();
+		tfs_unlock(sb);
 		return -EINVAL;
 	}
 	long np = base + offset;
 
 	if (np < 0) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return -EINVAL;
 	}
 	tf->pos = np;
-	tfs_unlock();
+	tfs_unlock(sb);
 	return np;
 }
 
@@ -976,12 +1070,13 @@ static int tfs_truncate(vfs_file_t *f, unsigned long size)
 		return ST_INVALID;
 	if (tf->inode->type != TFS_REG)
 		return ST_INVALID;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	int rc = tfs_set_size(tf->inode, size);
 
 	if (rc == ST_OK)
 		tfs_touch_mtime(tf->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return rc;
 }
 
@@ -1036,7 +1131,8 @@ static long tfs_readdir(vfs_file_t *f, void *buf, long bytes)
 		return -ENOTDIR;
 	if (bytes < 0)
 		return -EINVAL;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	struct tfs_inode *dir = tf->inode;
 	unsigned off = 0;
 	unsigned long idx = 0;
@@ -1046,7 +1142,7 @@ static long tfs_readdir(vfs_file_t *f, void *buf, long bytes)
 		rl = tfs_put_dirent(buf, (unsigned)bytes, off, ".", dir->ino,
 				    DT_DIR);
 		if (!rl) {
-			tfs_unlock();
+			tfs_unlock(sb);
 			return -EINVAL; /* buffer cannot hold one record */
 		}
 		off += rl;
@@ -1078,7 +1174,7 @@ static long tfs_readdir(vfs_file_t *f, void *buf, long bytes)
 		tf->dirpos = idx + 1;
 	}
 out:
-	tfs_unlock();
+	tfs_unlock(sb);
 	return (long)off;
 }
 
@@ -1086,21 +1182,22 @@ out:
 
 /* Create a fresh object of `type' under a new name.  Shared by mkdir, mknod
  * and symlink; open() creates its own because it also needs the handle. */
-static int tfs_create(const char *path, enum tfs_type type, unsigned int mode,
-		      const char *target)
+static int tfs_create(struct tfs_sb *sb, const char *path, enum tfs_type type,
+		      unsigned int mode, const char *target, uint64_t rdev)
 {
 	struct tfs_dentry *dir;
 	char name[VFS_NAME_MAX + 1];
-	int rc = tfs_split(path, &dir, name, sizeof(name));
+	int rc = tfs_split(sb, path, &dir, name, sizeof(name));
 
 	if (rc != ST_OK)
 		return rc;
 	if (tfs_find_child(dir, name, kstrlen(name)))
 		return ST_EXISTS;
-	struct tfs_inode *n = tfs_inode_new(type, mode);
+	struct tfs_inode *n = tfs_inode_new(sb, type, mode);
 
 	if (!n)
 		return ST_NOMEM;
+	n->rdev = rdev;
 	if (target) {
 		n->target = tfs_strdup(target);
 		if (!n->target) {
@@ -1115,17 +1212,20 @@ static int tfs_create(const char *path, enum tfs_type type, unsigned int mode,
 	return ST_OK;
 }
 
-static int tfs_mkdir(const char *path, unsigned int mode)
+static int tfs_mkdir(vfs_mount_t *m, const char *path, unsigned int mode)
 {
-	tfs_lock();
-	int rc = tfs_create(path, TFS_DIR, mode, NULL);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	int rc = tfs_create(sb, path, TFS_DIR, mode, NULL, 0);
 
-	tfs_unlock();
+	tfs_unlock(sb);
 	return rc;
 }
 
-static int tfs_mknod(const char *path, unsigned int mode)
+static int tfs_mknod(vfs_mount_t *m, const char *path, unsigned int mode,
+		     uint64_t dev)
 {
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
 	enum tfs_type t;
 
 	switch (mode & S_IFMT) {
@@ -1135,6 +1235,12 @@ static int tfs_mknod(const char *path, unsigned int mode)
 	case S_IFIFO:
 		t = TFS_FIFO;
 		break;
+	case S_IFCHR:
+		t = TFS_CHR;
+		break;
+	case S_IFBLK:
+		t = TFS_BLK;
+		break;
 	case S_IFREG:
 	case 0:
 		t = TFS_REG;
@@ -1142,35 +1248,40 @@ static int tfs_mknod(const char *path, unsigned int mode)
 	default:
 		return ST_UNSUPPORTED;
 	}
-	tfs_lock();
-	int rc = tfs_create(path, t, mode, NULL);
+	tfs_lock(sb);
+	int rc = tfs_create(sb, path, t, mode, NULL,
+			    (t == TFS_CHR || t == TFS_BLK) ? dev : 0);
 
-	tfs_unlock();
+	tfs_unlock(sb);
 	return rc;
 }
 
-static int tfs_symlink(const char *target, const char *linkpath)
+static int tfs_symlink(vfs_mount_t *m, const char *target,
+		       const char *linkpath)
 {
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
 	if (!target || !*target)
 		return ST_INVALID;
-	tfs_lock();
-	int rc = tfs_create(linkpath, TFS_LNK, 0777, target);
+	tfs_lock(sb);
+	int rc = tfs_create(sb, linkpath, TFS_LNK, 0777, target, 0);
 
-	tfs_unlock();
+	tfs_unlock(sb);
 	return rc;
 }
 
-static int tfs_readlink(const char *path, char *buf, unsigned long bufsz)
+static int tfs_readlink(vfs_mount_t *m, const char *path, char *buf,
+			unsigned long bufsz)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 0);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, 0);
 
 	if (!d) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	if (d->inode->type != TFS_LNK) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_INVALID;
 	}
 	unsigned long k = 0;
@@ -1179,89 +1290,91 @@ static int tfs_readlink(const char *path, char *buf, unsigned long bufsz)
 		buf[k] = d->inode->target[k];
 		k++;
 	}
-	tfs_unlock();
+	tfs_unlock(sb);
 	return (int)k;
 }
 
 /* A second name for an existing object.  Not for directories (a loop in
  * the tree is not worth the trouble, and no filesystem allows it); the
- * name itself is what is linked when `oldpath' is a symlink. */
-static int tfs_link(const char *oldpath, const char *newpath)
+ * name itself is what is linked when `oldpath' is a symlink, unless
+ * `follow' asks for what it points to.  The VFS has made sure both names
+ * are on this instance. */
+static int tfs_link(vfs_mount_t *m, const char *oldpath, const char *newpath,
+		    int follow)
 {
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
 	struct tfs_dentry *dir;
 	char name[VFS_NAME_MAX + 1];
 
-	/* The VFS routes by the new name; the old one has to be here too,
-	 * since two names of one object cannot straddle filesystems. */
-	if (!tfs_rel(oldpath))
-		return ST_XDEV;
-	tfs_lock();
-	struct tfs_dentry *src = tfs_lookup(oldpath, 0);
+	tfs_lock(sb);
+	struct tfs_dentry *src = tfs_lookup(sb, oldpath, follow ? 1 : 0);
 
 	if (!src) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	if (src->inode->type == TFS_DIR) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_PERM;
 	}
-	int rc = tfs_split(newpath, &dir, name, sizeof(name));
+	int rc = tfs_split(sb, newpath, &dir, name, sizeof(name));
 
 	if (rc != ST_OK) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return rc;
 	}
 	if (tfs_find_child(dir, name, kstrlen(name))) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_EXISTS;
 	}
 	if (!tfs_dentry_add(dir, name, src->inode)) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOMEM;
 	}
 	tfs_touch_ctime(src->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_unlink(const char *path)
+static int tfs_unlink(vfs_mount_t *m, const char *path)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 0);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, 0);
 
-	if (!d || d == &g_root) {
-		tfs_unlock();
+	if (!d || d == &sb->root) {
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	if (d->inode->type == TFS_DIR) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_PERM; /* unlink(2) on a directory: EPERM */
 	}
 	tfs_dentry_remove(d);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_rmdir(const char *path)
+static int tfs_rmdir(vfs_mount_t *m, const char *path)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 0);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, 0);
 
-	if (!d || d == &g_root) {
-		tfs_unlock();
+	if (!d || d == &sb->root) {
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	if (d->inode->type != TFS_DIR) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOTDIR;
 	}
 	if (d->inode->nchildren) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOTEMPTY;
 	}
 	tfs_dentry_remove(d);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
@@ -1275,32 +1388,33 @@ static int tfs_is_below(const struct tfs_dentry *d, const struct tfs_dentry *anc
 	return 0;
 }
 
-static int tfs_rename(const char *oldpath, const char *newpath)
+static int tfs_rename(vfs_mount_t *m, const char *oldpath, const char *newpath)
 {
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
 	struct tfs_dentry *ndir;
 	char name[VFS_NAME_MAX + 1];
 
-	tfs_lock();
-	struct tfs_dentry *src = tfs_lookup(oldpath, 0);
+	tfs_lock(sb);
+	struct tfs_dentry *src = tfs_lookup(sb, oldpath, 0);
 
-	if (!src || src == &g_root) {
-		tfs_unlock();
+	if (!src || src == &sb->root) {
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
-	int rc = tfs_split(newpath, &ndir, name, sizeof(name));
+	int rc = tfs_split(sb, newpath, &ndir, name, sizeof(name));
 
 	if (rc != ST_OK) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return rc;
 	}
 	if (src->inode->type == TFS_DIR && tfs_is_below(ndir, src)) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_INVALID;
 	}
 	struct tfs_dentry *dst = tfs_find_child(ndir, name, kstrlen(name));
 
 	if (dst == src) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_OK; /* renaming a name onto itself */
 	}
 	if (dst) {
@@ -1309,27 +1423,27 @@ static int tfs_rename(const char *oldpath, const char *newpath)
 		 * empty; a file never by a directory. */
 		if (dst->inode->type == TFS_DIR) {
 			if (src->inode->type != TFS_DIR) {
-				tfs_unlock();
+				tfs_unlock(sb);
 				return ST_INVALID;
 			}
 			if (dst->inode->nchildren) {
-				tfs_unlock();
+				tfs_unlock(sb);
 				return ST_NOTEMPTY;
 			}
 		} else if (src->inode->type == TFS_DIR) {
-			tfs_unlock();
+			tfs_unlock(sb);
 			return ST_INVALID;
 		}
 		if (dst->inode == src->inode) {
 			/* Two names for one object: POSIX says do nothing. */
-			tfs_unlock();
+			tfs_unlock(sb);
 			return ST_OK;
 		}
 	}
 	char *nn = tfs_strdup(name);
 
 	if (!nn) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOMEM;
 	}
 	if (dst)
@@ -1341,45 +1455,49 @@ static int tfs_rename(const char *oldpath, const char *newpath)
 	src->name = nn;
 	tfs_dentry_attach(ndir, src);
 	tfs_touch_ctime(src->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_chdir(const char *path)
+static int tfs_chdir(vfs_mount_t *m, const char *path)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 1);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, 1);
 	int ok = d && d->inode->type == TFS_DIR;
 
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ok ? ST_OK : ST_NOT_FOUND;
 }
 
 /* ---- attributes ---------------------------------------------------------------- */
 
-static int tfs_chmod(const char *path, unsigned int mode)
+static int tfs_chmod(vfs_mount_t *m, const char *path, unsigned int mode)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 1);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, 1);
 
 	if (!d) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	if (d->inode->type != TFS_LNK)
 		d->inode->mode = mode & 07777;
 	tfs_touch_ctime(d->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_chown(const char *path, int uid, int gid)
+static int tfs_chown(vfs_mount_t *m, const char *path, int uid, int gid,
+		     int nofollow)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 1);
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, !nofollow);
 
 	if (!d) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
 	if (uid != -1)
@@ -1387,7 +1505,7 @@ static int tfs_chown(const char *path, int uid, int gid)
 	if (gid != -1)
 		d->inode->gid = (uint32_t)gid;
 	tfs_touch_ctime(d->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
@@ -1397,10 +1515,11 @@ static int tfs_fchmod(vfs_file_t *f, unsigned int mode)
 
 	if (!tf)
 		return ST_INVALID;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	tf->inode->mode = mode & 07777;
 	tfs_touch_ctime(tf->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
@@ -1410,82 +1529,385 @@ static int tfs_fchown(vfs_file_t *f, int uid, int gid)
 
 	if (!tf)
 		return ST_INVALID;
-	tfs_lock();
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
 	if (uid != -1)
 		tf->inode->uid = (uint32_t)uid;
 	if (gid != -1)
 		tf->inode->gid = (uint32_t)gid;
 	tfs_touch_ctime(tf->inode);
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
+/* One time of an inode as struct vfs_utimes asks. */
+static void tfs_set_time(uint64_t *sec, uint32_t *ns, int64_t want_sec,
+			 long want_ns)
 {
-	tfs_lock();
-	struct tfs_dentry *d = tfs_lookup(path, 1);
+	if (want_ns == VFS_UTIME_OMIT)
+		return;
+	if (want_ns == VFS_UTIME_NOW) {
+		*sec = timer_get_epoch();
+		*ns = 0;
+		return;
+	}
+	*sec = (uint64_t)want_sec;
+	*ns = (want_ns >= 0 && want_ns <= 999999999L) ? (uint32_t)want_ns : 0;
+}
+
+static void tfs_utimes_inode(struct tfs_inode *n, const struct vfs_utimes *t)
+{
+	tfs_set_time(&n->atime, &n->atime_ns, t->atime_sec, t->atime_nsec);
+	tfs_set_time(&n->mtime, &n->mtime_ns, t->mtime_sec, t->mtime_nsec);
+	tfs_touch_ctime(n);
+}
+
+static int tfs_utimens(vfs_mount_t *m, const char *path, int nofollow,
+		       const struct vfs_utimes *t)
+{
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
+	struct tfs_dentry *d = tfs_lookup(sb, path, !nofollow);
 
 	if (!d) {
-		tfs_unlock();
+		tfs_unlock(sb);
 		return ST_NOT_FOUND;
 	}
-	if (mtime_nsec == VFS_UTIME_NOW)
-		d->inode->mtime = timer_get_epoch();
-	else if (mtime_nsec != VFS_UTIME_OMIT)
-		d->inode->mtime = (uint64_t)mtime_sec;
-	d->inode->ctime = timer_get_epoch();
-	tfs_unlock();
+	tfs_utimes_inode(d->inode, t);
+	tfs_unlock(sb);
 	return ST_OK;
 }
 
-static int tfs_statfs(struct vfs_statfs *out)
+static int tfs_futimens(vfs_file_t *f, const struct vfs_utimes *t)
 {
-	tfs_lock();
+	tfs_file_t *tf = f->fs_private;
+
+	if (!tf)
+		return ST_INVALID;
+	struct tfs_sb *sb = tf->inode->sb;
+	tfs_lock(sb);
+	tfs_utimes_inode(tf->inode, t);
+	tfs_unlock(sb);
+	return ST_OK;
+}
+
+static int tfs_statfs(vfs_mount_t *m, struct vfs_statfs *out)
+{
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	tfs_lock(sb);
 	mm_memset(out, 0, sizeof(*out));
 	out->f_type = TFS_MAGIC;
 	out->f_bsize = PAGE_SIZE;
 	out->f_frsize = PAGE_SIZE;
-	out->f_blocks = g_cap_pages;
-	out->f_bfree = g_cap_pages - g_used_pages;
+	out->f_blocks = sb->cap_pages;
+	out->f_bfree = sb->cap_pages - sb->used_pages;
 	out->f_bavail = out->f_bfree;
-	/* Objects are limited only by memory; report the frame cap as the
-	 * object cap so the numbers are at least plausible. */
-	out->f_files = g_cap_pages;
-	out->f_ffree = g_cap_pages > g_inodes ? g_cap_pages - g_inodes : 0;
-	out->f_fsid = TFS_DEV;
+	/* Objects are limited only by memory unless nr_inodes= says
+	 * otherwise; report the frame cap as the object cap so the numbers
+	 * are at least plausible. */
+	unsigned long files = sb->max_inodes ? sb->max_inodes : sb->cap_pages;
+	out->f_files = files;
+	out->f_ffree = files > sb->inodes ? files - sb->inodes : 0;
+	out->f_fsid = sb->fsid;
 	out->f_namelen = VFS_NAME_MAX;
-	tfs_unlock();
+	tfs_unlock(sb);
 	return ST_OK;
 }
+
+/* ---- instances ----------------------------------------------------------------- */
+
+/* An empty tree: the root directory alone. */
+static void tfs_sb_init(struct tfs_sb *sb, unsigned long cap_pages,
+			uint32_t root_mode, uint32_t uid, uint32_t gid)
+{
+	static unsigned long next_fsid = TFS_DEV;
+
+	mm_memset(sb, 0, sizeof(*sb));
+	spinlock_init(&sb->mtx.lock, "tmpfs");
+	sb->mtx.owner = (uint64_t)-1;
+	sb->cap_pages = cap_pages;
+	sb->next_ino = 1;
+	sb->fsid = __atomic_fetch_add(&next_fsid, 1, __ATOMIC_RELAXED);
+	sb->root_inode.sb = sb;
+	sb->root_inode.type = TFS_DIR;
+	sb->root_inode.mode = root_mode & 07777;
+	sb->root_inode.uid = uid;
+	sb->root_inode.gid = gid;
+	sb->root_inode.ino = 1;
+	sb->root_inode.nlink = 1;
+	sb->root_inode.atime = sb->root_inode.mtime = sb->root_inode.ctime =
+		timer_get_epoch();
+	sb->root_inode.self = &sb->root;
+	sb->root.name = "";
+	sb->root.inode = &sb->root_inode;
+	sb->inodes = 1;
+}
+
+/* Free a whole tree (an unmount: nothing is open on it any more). */
+static void tfs_free_tree(struct tfs_dentry *dir)
+{
+	struct tfs_dentry *c = dir->inode->children;
+
+	while (c) {
+		struct tfs_dentry *next = c->sibling;
+		struct tfs_inode *n = c->inode;
+
+		if (n->type == TFS_DIR)
+			tfs_free_tree(c);
+		/* What remains is the name; the object goes with its last. */
+		n->nlink--;
+		kfree(c->name);
+		kfree(c);
+		if (n->nlink == 0) {
+			WARN_ON(n->refs != 0);
+			tfs_inode_free(n);
+		}
+		c = next;
+	}
+	dir->inode->children = NULL;
+	dir->inode->nchildren = 0;
+}
+
+/* The default size of an instance: a share of memory, never too little. */
+static unsigned long tfs_default_cap(void)
+{
+	memory_stats_t ms;
+	unsigned long cap;
+
+	mm_get_memory_stats(&ms);
+	cap = ms.total_pages / TFS_RAM_FRACTION;
+	if (cap < TFS_MIN_CAP_PAGES)
+		cap = TFS_MIN_CAP_PAGES;
+	return cap;
+}
+
+/* A number with an optional k/m/g suffix (size=, nr_inodes=); 0 when it
+ * is not one. */
+static int tfs_parse_size(const char *v, unsigned long *out, int *percent)
+{
+	unsigned long n = 0;
+	int digits = 0;
+
+	*percent = 0;
+	while (*v >= '0' && *v <= '9') {
+		n = n * 10 + (unsigned long)(*v - '0');
+		v++;
+		digits++;
+	}
+	if (!digits)
+		return 0;
+	switch (*v) {
+	case 'k':
+	case 'K':
+		n <<= 10;
+		v++;
+		break;
+	case 'm':
+	case 'M':
+		n <<= 20;
+		v++;
+		break;
+	case 'g':
+	case 'G':
+		n <<= 30;
+		v++;
+		break;
+	case '%':
+		*percent = 1;
+		v++;
+		break;
+	}
+	if (*v)
+		return 0;
+	*out = n;
+	return 1;
+}
+
+static unsigned long tfs_parse_octal(const char *v, int *ok)
+{
+	unsigned long n = 0;
+
+	*ok = (*v != 0);
+	for (; *v; v++) {
+		if (*v < '0' || *v > '7') {
+			*ok = 0;
+			return 0;
+		}
+		n = n * 8 + (unsigned long)(*v - '0');
+	}
+	return n;
+}
+
+static unsigned long tfs_parse_dec(const char *v, int *ok)
+{
+	unsigned long n = 0;
+
+	*ok = (*v != 0);
+	for (; *v; v++) {
+		if (*v < '0' || *v > '9') {
+			*ok = 0;
+			return 0;
+		}
+		n = n * 10 + (unsigned long)(*v - '0');
+	}
+	return n;
+}
+
+/* The options of a tmpfs mount: size= (bytes, k/m/g, or a percentage of
+ * memory), nr_inodes=, mode= (octal, of the root directory), uid=, gid=.
+ * Anything else is accepted and ignored.  ST_OK or ST_INVALID for a value
+ * that is not one. */
+static int tfs_parse_options(const char *data, unsigned long *cap,
+			     unsigned long *max_inodes, uint32_t *mode,
+			     uint32_t *uid, uint32_t *gid)
+{
+	const char *cur = data;
+	char tmp[64];
+	const char *key, *val;
+
+	while (data && vfs_next_option(&cur, tmp, sizeof(tmp), &key, &val)) {
+		int ok = 1, pct = 0;
+		unsigned long n = 0;
+
+		if (!val)
+			continue;
+		if (kstrcmp(key, "size") == 0) {
+			ok = tfs_parse_size(val, &n, &pct);
+			if (ok && pct) {
+				memory_stats_t ms;
+				mm_get_memory_stats(&ms);
+				n = ms.total_pages * n / 100;
+			} else if (ok) {
+				n = (n + PAGE_SIZE - 1) / PAGE_SIZE;
+			}
+			if (ok && n == 0)
+				ok = 0;
+			if (ok)
+				*cap = n;
+		} else if (kstrcmp(key, "nr_inodes") == 0) {
+			ok = tfs_parse_size(val, &n, &pct) && !pct;
+			if (ok)
+				*max_inodes = n;
+		} else if (kstrcmp(key, "mode") == 0) {
+			n = tfs_parse_octal(val, &ok);
+			if (ok)
+				*mode = (uint32_t)n & 07777;
+		} else if (kstrcmp(key, "uid") == 0) {
+			n = tfs_parse_dec(val, &ok);
+			if (ok)
+				*uid = (uint32_t)n;
+		} else if (kstrcmp(key, "gid") == 0) {
+			n = tfs_parse_dec(val, &ok);
+			if (ok)
+				*gid = (uint32_t)n;
+		}
+		if (!ok)
+			return ST_INVALID;
+	}
+	return ST_OK;
+}
+
+static int tfs_fst_mount(vfs_mount_t *m, struct block_device *bdev,
+			 unsigned long flags, const char *data)
+{
+	unsigned long cap = tfs_default_cap(), max_inodes = 0;
+	uint32_t mode = 01777, uid = 0, gid = 0;
+
+	(void)bdev;
+	(void)flags; /* read-only is the VFS's to enforce */
+	if (tfs_parse_options(data, &cap, &max_inodes, &mode, &uid, &gid) !=
+	    ST_OK)
+		return ST_INVALID;
+	struct tfs_sb *sb = kalloc(sizeof(*sb));
+
+	if (!sb)
+		return ST_NOMEM;
+	tfs_sb_init(sb, cap, mode, uid, gid);
+	sb->max_inodes = max_inodes;
+	sb->mnt = m;
+	m->ops = &g_tfs_ops;
+	m->fs_data = sb;
+	m->sb = NULL; /* not in the page cache */
+	return ST_OK;
+}
+
+static int tfs_fst_unmount(vfs_mount_t *m)
+{
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+
+	if (!sb)
+		return ST_BUSY;
+	tfs_lock(sb);
+	tfs_free_tree(&sb->root);
+	tfs_unlock(sb);
+	WARN_ON(sb->used_pages != 0);
+	m->fs_data = NULL;
+	kfree(sb);
+	return ST_OK;
+}
+
+/* A remount may change the size and the root's mode and owner. */
+static int tfs_fst_remount(vfs_mount_t *m, unsigned long flags,
+			   const char *data)
+{
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	unsigned long cap = sb->cap_pages, max_inodes = sb->max_inodes;
+	uint32_t mode = sb->root_inode.mode, uid = sb->root_inode.uid,
+		 gid = sb->root_inode.gid;
+
+	(void)flags;
+	if (tfs_parse_options(data, &cap, &max_inodes, &mode, &uid, &gid) !=
+	    ST_OK)
+		return ST_INVALID;
+	tfs_lock(sb);
+	if (cap < sb->used_pages ||
+	    (max_inodes && max_inodes < sb->inodes)) {
+		tfs_unlock(sb);
+		return ST_BUSY; /* would not hold what is there */
+	}
+	sb->cap_pages = cap;
+	sb->max_inodes = max_inodes;
+	sb->root_inode.mode = mode;
+	sb->root_inode.uid = uid;
+	sb->root_inode.gid = gid;
+	tfs_unlock(sb);
+	return ST_OK;
+}
+
+static long tfs_fst_show_options(vfs_mount_t *m, char *buf, long cap)
+{
+	struct tfs_sb *sb = (struct tfs_sb *)m->fs_data;
+	int n;
+
+	if (!sb || cap < 1)
+		return 0;
+	n = ksnprintf(buf, (size_t)cap, "size=%luk,mode=%o",
+		      sb->cap_pages * (PAGE_SIZE / 1024),
+		      (unsigned)sb->root_inode.mode);
+	if (n > 0 && (sb->root_inode.uid || sb->root_inode.gid) && n < cap)
+		n += ksnprintf(buf + n, (size_t)(cap - n), ",uid=%u,gid=%u",
+			       sb->root_inode.uid, sb->root_inode.gid);
+	if (n > 0 && sb->max_inodes && n < cap)
+		n += ksnprintf(buf + n, (size_t)(cap - n), ",nr_inodes=%lu",
+			       sb->max_inodes);
+	return n < 0 ? 0 : (n >= cap ? cap - 1 : n);
+}
+
+const vfs_fstype_t tmpfs_fstype = {
+	.name = "tmpfs",
+	.aliases = NULL,
+	.needs_device = 0,
+	.mount = tfs_fst_mount,
+	.unmount = tfs_fst_unmount,
+	.remount = tfs_fst_remount,
+	.show_options = tfs_fst_show_options,
+	.probe = NULL,
+};
 
 /* ---- init ---------------------------------------------------------------------- */
 
 void tmpfs_init(void)
 {
-	memory_stats_t ms;
-
-	spinlock_init(&g_mtx.lock, "tmpfs");
-	g_mtx.owner = (uint64_t)-1;
-
-	mm_get_memory_stats(&ms);
-	g_cap_pages = ms.total_pages / TFS_RAM_FRACTION;
-	if (g_cap_pages < TFS_MIN_CAP_PAGES)
-		g_cap_pages = TFS_MIN_CAP_PAGES;
-
-	mm_memset(&g_root_inode, 0, sizeof(g_root_inode));
-	g_root_inode.type = TFS_DIR;
-	/* Like /tmp: anyone may create here, only the owner may remove. */
-	g_root_inode.mode = 01777;
-	g_root_inode.ino = 1;
-	g_root_inode.nlink = 1;
-	g_root_inode.atime = g_root_inode.mtime = g_root_inode.ctime =
-		timer_get_epoch();
-	g_root_inode.self = &g_root;
-	mm_memset(&g_root, 0, sizeof(g_root));
-	g_root.name = "";
-	g_root.inode = &g_root_inode;
-	g_inodes = 1;
-
 	/* Designated initialisers, as the vfs.h note asks: the slots are
 	 * named, so a member added to vfs_ops_t cannot shift these. */
 	g_tfs_ops = (vfs_ops_t){
@@ -1514,16 +1936,26 @@ void tmpfs_init(void)
 		.chown = tfs_chown,
 		.fchmod = tfs_fchmod,
 		.fchown = tfs_fchown,
-		.utimensat = tfs_utimensat,
+		.utimens = tfs_utimens,
+		.futimens = tfs_futimens,
 		.statfs = tfs_statfs,
 		.release_locks_for_task = tfs_release_locks_for_task,
 		/* No fsync/sync: there is nothing to flush to.  No xattrs. */
 	};
 
-	if (vfs_register_mount(TMPFS_MOUNT, &g_tfs_ops) != ST_OK) {
-		kprintf("tmpfs: could not register %s\n", TMPFS_MOUNT);
+	/* Without size= an instance may hold up to 1/TFS_RAM_FRACTION of
+	 * memory; without mode= its root is 1777. */
+	if (vfs_fstype_register(&tmpfs_fstype) != ST_OK)
+		kprintf("tmpfs: could not register the filesystem type\n");
+
+	/* /ram, mounted by the kernel at boot: the default size (a quarter
+	 * of memory) and the default root, 1777 like /tmp -- anyone may
+	 * create here, only the owner may remove.  Never unmounted. */
+	int r = vfs_mount_boot(TMPFS_MOUNT, &tmpfs_fstype, 0, NULL);
+	if (r != ST_OK) {
+		kprintf("tmpfs: could not mount %s (%d)\n", TMPFS_MOUNT, r);
 		return;
 	}
 	kprintf("tmpfs: %s ready, up to %lu MB\n", TMPFS_MOUNT,
-		g_cap_pages * (PAGE_SIZE / 1024) / 1024);
+		tfs_default_cap() * (PAGE_SIZE / 1024) / 1024);
 }

@@ -1,0 +1,23 @@
+uid_gid_lookup.c: reject the undefined id as a 32-bit number whatever the
+signedness of id_t.
+
+ACL_UNDEFINED_ID is ((id_t)-1).  get_id() compares it with the unsigned
+long it parsed; with an unsigned 32-bit id_t that is 4294967295, the value
+meant, but the LikeOS libc's id_t is a signed int, and -1 widened to
+unsigned long is 2^64-1, which no 32-bit id equals: "4294967295" would be
+taken as a user or group id.  Comparing with the id converted to uid_t
+first gives 4294967295 with either id_t.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/libmisc/uid_gid_lookup.c	2026-11-13 15:14:53.017595100 +0100
++++ b/libmisc/uid_gid_lookup.c	2026-11-13 15:14:53.018673946 +0100
+@@ -60,7 +60,7 @@
+ 		}
+ 		l = -l & 0xFFFF;
+ 	}
+-	if ((uid_t)(gid_t)l != l || l == ACL_UNDEFINED_ID) {
++	if ((uid_t)(gid_t)l != l || l == (uid_t)ACL_UNDEFINED_ID) {
+ 		errno = ERANGE;
+ 		return -1;
+ 	}

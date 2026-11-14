@@ -1,0 +1,1434 @@
+/* LikeOS installer -- the look of LikeOS Setup.
+ *
+ * Loaded at GTK_STYLE_PROVIDER_PRIORITY_APPLICATION, above any theme, and
+ * written to stand on its own: every colour, border and size the wizard
+ * relies on is set here, so it looks the same under the LikeOS theme, the
+ * default GTK theme or none.  Palette from the LikeOS design tokens
+ * (res/xorg/gtk3/theme/src/_tokens.scss): accent #2a5bd7, highlight
+ * #3b74f0, text #141a24, window #f5f7fb.
+ *
+ * Three tiers (classes on the window, set by layout.c): il-compact for
+ * screens under 1000 x 700, the regular sizes, and il-large from
+ * 1600 x 1000 up.  il-narrow and il-short say which side is small.
+ *
+ * Copyright (C) 2026 The LikeOS Project
+ */
+
+/* ---- base ------------------------------------------------------------ */
+
+window.il-window,
+window.il-window .il-root,
+.il-popover,
+window.il-window menu,
+.il-window tooltip {
+	font-family: "Selawik", "Noto Sans", "Cantarell", "DejaVu Sans", sans-serif;
+}
+
+window.il-window {
+	background-color: #0a132c;
+	color: #141a24;
+	font-size: 14px;
+}
+
+.il-root stack,
+.il-root overlay,
+.il-root scrolledwindow,
+.il-root viewport,
+.il-root revealer {
+	background-color: transparent;
+	background-image: none;
+}
+
+.il-root scrolledwindow undershoot.top,
+.il-root scrolledwindow undershoot.bottom,
+.il-root scrolledwindow overshoot.top,
+.il-root scrolledwindow overshoot.bottom {
+	background: none;
+	box-shadow: none;
+}
+
+.il-root label {
+	text-shadow: none;
+}
+
+.il-root *:focus {
+	outline-color: rgba(42, 91, 215, 0.75);
+	outline-width: 2px;
+	outline-offset: 1px;
+	outline-style: solid;
+	-gtk-outline-radius: 6px;
+}
+
+.il-root selection,
+.il-root entry selection {
+	background-color: #3b74f0;
+	color: #ffffff;
+}
+
+/* ---- buttons --------------------------------------------------------- */
+
+.il-root button.il-button,
+.il-sheet button.il-button {
+	min-height: 32px;
+	min-width: 96px;
+	padding: 0 18px;
+	border-radius: 6px;
+	border: 1px solid #cfd6e2;
+	border-bottom-color: #b8c1cf;
+	background-color: #fdfdfe;
+	background-image: none;
+	box-shadow: none;
+	color: #141a24;
+	font-weight: 500;
+	text-shadow: none;
+	-gtk-icon-shadow: none;
+	transition: background-color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.il-root button.il-button:hover,
+.il-sheet button.il-button:hover {
+	background-color: #f2f5fa;
+}
+
+.il-root button.il-button:active,
+.il-sheet button.il-button:active {
+	background-color: #e7ecf4;
+	border-bottom-color: #cfd6e2;
+}
+
+.il-root button.il-button:disabled,
+.il-sheet button.il-button:disabled {
+	background-color: #f5f6f9;
+	border-color: #e1e5ec;
+	color: #a2aab8;
+}
+
+.il-root button.il-button:disabled label,
+.il-sheet button.il-button:disabled label {
+	color: #a2aab8;
+}
+
+.il-root button.il-primary,
+.il-sheet button.il-primary {
+	background-color: #2a5bd7;
+	border-color: #2a5bd7;
+	border-bottom-color: #1e47b2;
+	color: #ffffff;
+}
+
+.il-root button.il-primary label,
+.il-sheet button.il-primary label {
+	color: #ffffff;
+}
+
+.il-root button.il-primary:hover,
+.il-sheet button.il-primary:hover {
+	background-color: #3a69df;
+	border-color: #3a69df;
+}
+
+.il-root button.il-primary:active,
+.il-sheet button.il-primary:active {
+	background-color: #4b77e4;
+	border-color: #4b77e4;
+}
+
+.il-root button.il-primary:disabled,
+.il-sheet button.il-primary:disabled {
+	background-color: #c5ccd8;
+	border-color: #c5ccd8;
+	color: #f4f6f9;
+}
+
+.il-root button.il-primary:disabled label,
+.il-sheet button.il-primary:disabled label {
+	color: #f4f6f9;
+}
+
+.il-sheet button.il-danger {
+	background-color: #d63a3a;
+	border-color: #d63a3a;
+	border-bottom-color: #b02a2a;
+	color: #ffffff;
+}
+
+.il-sheet button.il-danger label {
+	color: #ffffff;
+}
+
+.il-sheet button.il-danger:hover {
+	background-color: #e04b4b;
+	border-color: #e04b4b;
+}
+
+.il-sheet button.il-danger:active {
+	background-color: #c23131;
+}
+
+/* link-looking buttons */
+.il-root button.il-link,
+.il-sheet button.il-link {
+	padding: 4px 6px;
+	min-height: 0;
+	min-width: 0;
+	border: none;
+	border-radius: 4px;
+	background: none;
+	box-shadow: none;
+	color: #2251c4;
+}
+
+.il-root button.il-link label,
+.il-sheet button.il-link label {
+	color: #2251c4;
+}
+
+.il-root button.il-link:hover label,
+.il-sheet button.il-link:hover label {
+	text-decoration-line: underline;
+}
+
+.il-root button.il-link:active label {
+	color: #183f9e;
+}
+
+.il-root button.il-link .il-icon {
+	color: #2a5bd7;
+}
+
+.il-root button.il-link:disabled label,
+.il-root button.il-link:disabled .il-icon {
+	color: #a2aab8;
+}
+
+/* ---- the Setup scene ------------------------------------------------- */
+
+.il-setup-panel {
+	background-color: #ffffff;
+	border-radius: 10px;
+	box-shadow: 0 26px 70px rgba(0, 0, 0, 0.50), 0 0 0 1px rgba(255, 255, 255, 0.10);
+}
+
+.il-setup-titlebar {
+	min-height: 36px;
+	padding-left: 12px;
+	background-color: #f2f5fa;
+	border-bottom: 1px solid #e2e7ef;
+	border-radius: 10px 10px 0 0;
+}
+
+.il-setup-title {
+	font-size: 12px;
+	color: #3b4558;
+}
+
+.il-setup-titlebar button.il-caption-close {
+	min-width: 46px;
+	min-height: 35px;
+	padding: 0;
+	border: none;
+	border-radius: 0 10px 0 0;
+	background: none;
+	box-shadow: none;
+	color: #3b4558;
+}
+
+.il-setup-titlebar button.il-caption-close:hover {
+	background-color: #d63a3a;
+	color: #ffffff;
+}
+
+.il-setup-titlebar button.il-caption-close:active {
+	background-color: #b92e2e;
+	color: #ffffff;
+}
+
+.il-setup-page {
+	padding: 28px 48px 10px 48px;
+}
+
+.il-setup-page .il-heading {
+	color: #2a5bd7;
+	font-size: 30px;
+	font-weight: 300;
+	margin-bottom: 14px;
+}
+
+.il-setup-footer {
+	padding: 12px 24px 18px 48px;
+}
+
+.il-setup-footer button.il-button {
+	min-width: 104px;
+}
+
+.il-brand-box {
+	margin-right: 18px;
+}
+
+.il-brand {
+	font-weight: 600;
+	font-size: 15px;
+	color: #2b3343;
+}
+
+.il-text {
+	font-size: 14.5px;
+	color: #2b3240;
+}
+
+.il-caption {
+	font-size: 12.5px;
+	color: #687286;
+}
+
+.il-section {
+	font-size: 15px;
+	font-weight: 600;
+	color: #141a24;
+	margin-top: 8px;
+}
+
+.il-status {
+	font-size: 16px;
+	color: #141a24;
+}
+
+.il-form-label {
+	font-size: 14.5px;
+	color: #2b3240;
+}
+
+.il-form {
+	margin-top: 8px;
+	margin-bottom: 8px;
+}
+
+/* combo boxes */
+.il-root combobox.il-combo button,
+.il-root .il-combo button.combo {
+	min-height: 34px;
+	padding: 0 10px;
+	border-radius: 6px;
+	border: 1px solid #cfd6e2;
+	border-bottom-color: #b8c1cf;
+	background-color: #ffffff;
+	background-image: none;
+	box-shadow: none;
+	color: #141a24;
+}
+
+.il-root combobox.il-combo button:hover {
+	background-color: #f7f9fc;
+}
+
+.il-root combobox.il-combo arrow {
+	color: #4a5468;
+	-gtk-icon-source: -gtk-icontheme("pan-down-symbolic");
+	min-height: 16px;
+	min-width: 16px;
+}
+
+.il-window menu,
+.il-window .menu {
+	background-color: #ffffff;
+	border: 1px solid #d6dce6;
+	padding: 4px;
+	border-radius: 8px;
+}
+
+.il-window menu menuitem,
+.il-window .menu menuitem {
+	min-height: 30px;
+	padding: 2px 12px;
+	border-radius: 4px;
+	color: #141a24;
+}
+
+.il-window menu menuitem:hover,
+.il-window .menu menuitem:hover {
+	background-color: #2a5bd7;
+	color: #ffffff;
+}
+
+.il-window menu menuitem:hover label {
+	color: #ffffff;
+}
+
+/* entries */
+.il-root entry.il-entry,
+.il-root spinbutton.il-entry,
+.il-sheet entry.il-entry {
+	min-height: 36px;
+	padding-left: 12px;
+	padding-right: 10px;
+	border-radius: 6px;
+	border: 1px solid #cfd6e2;
+	border-bottom: 2px solid #8b95a7;
+	background-color: #ffffff;
+	background-image: none;
+	box-shadow: none;
+	color: #141a24;
+	caret-color: #2a5bd7;
+	font-size: 15px;
+}
+
+.il-root spinbutton.il-entry {
+	padding-left: 0;
+	padding-right: 0;
+}
+
+.il-root spinbutton.il-entry entry {
+	min-height: 32px;
+	padding-left: 10px;
+	border: none;
+	background: none;
+	box-shadow: none;
+}
+
+.il-root spinbutton.il-entry button {
+	border: none;
+	border-left: 1px solid #e1e6ee;
+	border-radius: 0;
+	background: none;
+	box-shadow: none;
+	color: #3b4558;
+	min-width: 30px;
+}
+
+.il-root entry.il-entry:focus,
+.il-root spinbutton.il-entry:focus {
+	border-bottom-color: #2a5bd7;
+	outline-style: none;
+}
+
+.il-root entry.il-entry.il-invalid {
+	border-bottom-color: #d63a3a;
+}
+
+.il-root entry.il-entry image {
+	color: #5b6475;
+	min-width: 18px;
+}
+
+.il-root entry.il-entry-large {
+	min-height: 42px;
+	font-size: 16px;
+}
+
+.il-root entry.il-search {
+	min-height: 36px;
+}
+
+.il-root entry.il-entry placeholder,
+.il-root entry.il-entry text placeholder {
+	color: #8c95a6;
+}
+
+/* check buttons */
+.il-root checkbutton.il-check {
+	color: #141a24;
+	font-size: 14px;
+}
+
+.il-root checkbutton.il-check check {
+	min-width: 18px;
+	min-height: 18px;
+	border-radius: 4px;
+	border: 1px solid #8b95a7;
+	background-color: #ffffff;
+	background-image: none;
+	margin-right: 8px;
+	-gtk-icon-source: none;
+}
+
+.il-root checkbutton.il-check check:checked {
+	background-color: #2a5bd7;
+	border-color: #2a5bd7;
+	color: #ffffff;
+	-gtk-icon-source: -gtk-icontheme("object-select-symbolic");
+}
+
+/* fields */
+.il-field-label {
+	font-size: 13.5px;
+	font-weight: 600;
+	color: #2b3240;
+}
+
+.il-field-hint label {
+	font-size: 12.5px;
+	color: #687286;
+}
+
+.il-field-error label,
+.il-field-error .il-icon {
+	font-size: 12.5px;
+	color: #c22f2f;
+}
+
+.il-field-warning label,
+.il-field-warning .il-icon {
+	font-size: 12.5px;
+	color: #9a6200;
+}
+
+.il-field-ok label,
+.il-field-ok .il-icon {
+	font-size: 12.5px;
+	color: #1a7f46;
+}
+
+.il-meter-label {
+	font-size: 12px;
+	font-weight: 600;
+	color: #687286;
+}
+
+.il-meter-label.il-strength-0 { color: #c22f2f; }
+.il-meter-label.il-strength-1 { color: #c9561f; }
+.il-meter-label.il-strength-2 { color: #a66d00; }
+.il-meter-label.il-strength-3 { color: #3f8a2c; }
+.il-meter-label.il-strength-4 { color: #1a7f46; }
+
+/* notices */
+.il-notice {
+	padding: 10px 14px;
+	border-radius: 8px;
+	border: 1px solid #c9d8fb;
+	background-color: #eef3fe;
+}
+
+.il-notice label {
+	font-size: 13.5px;
+	color: #1d3f97;
+}
+
+.il-notice .il-icon {
+	color: #2a5bd7;
+}
+
+.il-notice.il-notice-warning {
+	background-color: #fdf5e6;
+	border-color: #f0d39f;
+}
+
+.il-notice.il-notice-warning label {
+	color: #6b4400;
+}
+
+.il-notice.il-notice-warning .il-icon {
+	color: #d98a00;
+}
+
+.il-notice.il-notice-error {
+	background-color: #fdefef;
+	border-color: #f2c4c4;
+}
+
+.il-notice.il-notice-error label {
+	color: #8a1c1c;
+}
+
+.il-notice.il-notice-error .il-icon {
+	color: #d63a3a;
+}
+
+.il-notice.il-notice-success {
+	background-color: #e9f7ef;
+	border-color: #b8e2c8;
+}
+
+.il-notice.il-notice-success label {
+	color: #145c34;
+}
+
+.il-notice.il-notice-success .il-icon {
+	color: #1f9d55;
+}
+
+/* lists in a frame */
+.il-list-frame {
+	border: 1px solid #d6dce6;
+	border-radius: 8px;
+	background-color: #ffffff;
+}
+
+/* ---- the disk page --------------------------------------------------- */
+
+.il-toolbar {
+	margin-bottom: 6px;
+}
+
+.il-root button.il-action {
+	min-height: 26px;
+	padding: 2px 8px;
+	border: none;
+	border-radius: 6px;
+	background: none;
+	box-shadow: none;
+	color: #2251c4;
+}
+
+.il-root button.il-action label {
+	color: #2251c4;
+	font-size: 14px;
+}
+
+.il-root button.il-action:hover {
+	background-color: rgba(42, 91, 215, 0.07);
+}
+
+.il-root button.il-action:hover label {
+	text-decoration-line: underline;
+}
+
+.il-root button.il-action .il-icon {
+	color: #4a5468;
+}
+
+.il-root button.il-action .il-icon.il-icon-danger {
+	color: #d63a3a;
+}
+
+.il-root button.il-action .il-icon.il-icon-accent {
+	color: #2a5bd7;
+}
+
+.il-root button.il-action:disabled label {
+	color: #9aa3b2;
+}
+
+.il-root button.il-action:disabled .il-icon,
+.il-root button.il-action:disabled .il-icon.il-icon-danger,
+.il-root button.il-action:disabled .il-icon.il-icon-accent {
+	color: #bcc3ce;
+}
+
+.il-size-row {
+	padding: 8px 10px;
+	margin-bottom: 4px;
+	border-radius: 8px;
+	background-color: #f3f6fb;
+}
+
+.il-size-row label {
+	font-size: 14px;
+}
+
+.il-root treeview.il-disk-tree {
+	background-color: #ffffff;
+	color: #141a24;
+	font-size: 13.5px;
+}
+
+.il-root treeview.il-disk-tree:selected,
+.il-root treeview.il-disk-tree:selected:focus,
+.il-root treeview.il-disk-tree:selected:hover,
+.il-root treeview.il-disk-tree:selected:backdrop {
+	background-color: #2a5bd7;
+	background-image: none;
+	color: #ffffff;
+}
+
+.il-root treeview.il-disk-tree:hover:not(:selected) {
+	background-color: #f1f5fd;
+}
+
+.il-root treeview.il-disk-tree:disabled {
+	color: #a2aab8;
+}
+
+.il-root treeview.il-disk-tree header button {
+	padding: 6px 10px;
+	border: none;
+	border-bottom: 1px solid #e1e6ee;
+	border-right: 1px solid #eef1f6;
+	border-radius: 0;
+	background-color: #f6f8fb;
+	background-image: none;
+	box-shadow: none;
+	color: #3b4558;
+	font-weight: 600;
+	font-size: 12.5px;
+}
+
+.il-root treeview.il-disk-tree header button:hover {
+	background-color: #eef2f8;
+}
+
+/* ---- the card scene -------------------------------------------------- */
+
+.il-card {
+	border-radius: 14px;
+	background-color: #f8faff;
+	background-image: linear-gradient(135deg, #fcfdff 0%, #f4f7fd 55%, #edf2fb 100%);
+	border: 1px solid rgba(255, 255, 255, 0.85);
+	box-shadow: 0 22px 56px rgba(24, 44, 96, 0.20), 0 2px 8px rgba(24, 44, 96, 0.08);
+}
+
+.il-card-art {
+	padding: 48px 24px 48px 48px;
+}
+
+.il-card-page {
+	padding: 48px 48px 10px 8px;
+}
+
+.il-card-page .il-heading {
+	font-size: 26px;
+	font-weight: 600;
+	color: #141a24;
+	margin-bottom: 8px;
+}
+
+.il-subtitle {
+	font-size: 15px;
+	color: #59627a;
+	margin-bottom: 18px;
+}
+
+.il-card-page .il-page-body {
+	margin-top: 4px;
+}
+
+.il-card-buttons {
+	padding: 10px 48px 32px 24px;
+}
+
+.il-card-buttons button.il-button {
+	min-height: 40px;
+	min-width: 128px;
+	font-size: 15px;
+}
+
+.il-card-buttons button.il-link label {
+	font-size: 15px;
+}
+
+.il-card-buttons button.il-secondary-link {
+	padding: 8px 14px;
+}
+
+.il-root button.il-card-back {
+	margin: 18px;
+	min-width: 40px;
+	min-height: 40px;
+	padding: 0;
+	border: none;
+	border-radius: 8px;
+	background: none;
+	box-shadow: none;
+	color: #1f2633;
+}
+
+.il-root button.il-card-back:hover {
+	background-color: rgba(20, 26, 36, 0.06);
+}
+
+/* the big list rows */
+.il-root list.il-choice {
+	background-color: transparent;
+}
+
+.il-root list.il-choice row {
+	min-height: 52px;
+	padding: 0 18px;
+	margin: 2px 4px 2px 0;
+	border-radius: 6px;
+	background-color: transparent;
+	color: #1f2633;
+	outline-offset: -2px;
+}
+
+.il-root list.il-choice row:hover {
+	background-color: rgba(42, 91, 215, 0.07);
+}
+
+.il-root list.il-choice row:selected,
+.il-root list.il-choice row:selected:focus,
+.il-root list.il-choice row:selected:hover,
+.il-root list.il-choice row:selected:backdrop {
+	background-image: none;
+	background-color: #2a5bd7;
+	color: #ffffff;
+}
+
+.il-choice-label {
+	font-size: 16px;
+}
+
+.il-choice-sublabel {
+	font-size: 12px;
+	color: #6b7486;
+}
+
+.il-root list.il-choice row:selected label {
+	color: #ffffff;
+}
+
+.il-root list.il-choice row:selected .il-choice-sublabel {
+	color: rgba(255, 255, 255, 0.82);
+}
+
+.il-root list.il-choice.il-choice-compact row {
+	min-height: 40px;
+	padding: 0 14px;
+	margin: 1px 4px;
+}
+
+.il-root list.il-choice.il-choice-compact .il-choice-label {
+	font-size: 14px;
+}
+
+/* status tray, below the card */
+.il-tray {
+	margin: 0 20px 10px 0;
+}
+
+.il-root button.il-tray-button {
+	min-height: 32px;
+	padding: 4px 9px;
+	border: none;
+	border-radius: 6px;
+	background: none;
+	box-shadow: none;
+	color: #2b3343;
+}
+
+.il-root button.il-tray-button label {
+	font-size: 12px;
+	font-weight: 600;
+	color: #2b3343;
+}
+
+.il-root button.il-tray-button:hover {
+	background-color: rgba(20, 26, 36, 0.07);
+}
+
+.il-popover {
+	padding: 8px;
+	background-color: #ffffff;
+	border-radius: 10px;
+}
+
+.il-popover-title {
+	font-weight: 600;
+	font-size: 13px;
+	padding: 2px 8px 6px 8px;
+	color: #141a24;
+}
+
+.il-popover-hint {
+	font-size: 12px;
+	color: #687286;
+	padding: 6px 8px 2px 8px;
+}
+
+.il-popover button.il-popover-item {
+	min-height: 32px;
+	padding: 0 10px;
+	border: none;
+	background: none;
+	box-shadow: none;
+	color: #141a24;
+	border-radius: 6px;
+}
+
+.il-popover button.il-popover-item:hover {
+	background-color: #2a5bd7;
+	color: #ffffff;
+}
+
+.il-popover button.il-popover-item:hover label {
+	color: #ffffff;
+}
+
+/* the interlude and spinners */
+.il-interlude-text {
+	font-size: 18px;
+	color: #1f2633;
+}
+
+.il-accent-spinner {
+	color: #2a5bd7;
+}
+
+.il-busy-row {
+	margin: 10px 0 6px 0;
+}
+
+/* check rows (summary, tips) */
+.il-check-row .il-icon {
+	color: #2a5bd7;
+}
+
+.il-check-label {
+	font-size: 14px;
+	color: #1f2633;
+}
+
+.il-muted-row .il-icon,
+.il-muted-row label {
+	color: #687286;
+	font-size: 13px;
+}
+
+.il-recap {
+	margin: 4px 0 6px 0;
+}
+
+.il-ops {
+	padding: 10px 14px;
+	border-radius: 8px;
+	background-color: #f5f7fb;
+}
+
+.il-op-row .il-icon {
+	color: #4a5468;
+}
+
+.il-op-row label {
+	font-size: 13.5px;
+}
+
+/* the host-name page */
+.il-rules {
+	margin: 2px 0 2px 2px;
+}
+
+.il-rule {
+	font-size: 13px;
+	color: #59627a;
+}
+
+.il-terminal {
+	margin-top: 6px;
+	padding: 12px 16px;
+	border-radius: 8px;
+	background-color: #10151f;
+}
+
+.il-terminal-text {
+	font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+	font-size: 13px;
+	color: #cfe0ff;
+}
+
+/* keyboard layouts chosen */
+.il-layout-row {
+	padding: 10px 14px;
+	border-radius: 8px;
+	border: 1px solid #e1e6ee;
+	background-color: #ffffff;
+}
+
+.il-layout-badge {
+	min-width: 40px;
+	padding: 5px 0;
+	border-radius: 6px;
+	background-color: #2a5bd7;
+	color: #ffffff;
+	font-weight: 700;
+	font-size: 12px;
+}
+
+.il-layout-name {
+	font-size: 15px;
+	font-weight: 600;
+	color: #141a24;
+}
+
+.il-root button.il-icon-button {
+	min-width: 32px;
+	min-height: 32px;
+	padding: 0;
+	border: none;
+	border-radius: 6px;
+	background: none;
+	box-shadow: none;
+	color: #4a5468;
+}
+
+.il-root button.il-icon-button:hover {
+	background-color: #fdecec;
+	color: #d63a3a;
+}
+
+/* password tips */
+.il-tips {
+	margin-top: 4px;
+	padding: 12px 16px;
+	border-radius: 8px;
+	background-color: rgba(42, 91, 215, 0.05);
+}
+
+.il-tips-title {
+	font-weight: 600;
+	font-size: 13.5px;
+}
+
+.il-tips .il-check-label {
+	font-size: 13px;
+	color: #3b4558;
+}
+
+.il-tips .il-icon {
+	color: #1f9d55;
+}
+
+/* the finished and error pages */
+.il-next-steps .il-icon {
+	color: #2a5bd7;
+}
+
+.il-countdown {
+	margin-top: 12px;
+	font-size: 14px;
+	color: #3b4558;
+}
+
+progressbar.il-progress trough,
+.il-root progressbar.il-progress trough {
+	min-height: 6px;
+	border: none;
+	border-radius: 3px;
+	background-color: #dfe5ef;
+	background-image: none;
+	box-shadow: none;
+}
+
+progressbar.il-progress progress,
+.il-root progressbar.il-progress progress {
+	min-height: 6px;
+	border: none;
+	border-radius: 3px;
+	background-color: #2a5bd7;
+	background-image: none;
+	box-shadow: none;
+}
+
+.il-expander title label {
+	color: #2251c4;
+}
+
+.il-root textview.il-log,
+.il-root textview.il-log text {
+	background-color: #10151f;
+	color: #d6def0;
+	font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+	font-size: 12px;
+	padding: 8px;
+}
+
+/* ---- the step list --------------------------------------------------- */
+
+.il-steps {
+	margin: 6px 0;
+}
+
+.il-step {
+	min-height: 28px;
+}
+
+.il-step label {
+	font-size: 14px;
+}
+
+.il-steps-light .il-step label {
+	color: #2b3240;
+}
+
+.il-steps-light .il-step.il-step-pending label {
+	color: #8c95a6;
+}
+
+.il-steps-light .il-step .il-icon,
+.il-steps-light .il-step .il-spinner {
+	color: #2a5bd7;
+}
+
+.il-steps-light .il-step.il-step-pending .il-icon {
+	color: #c3cad6;
+}
+
+.il-steps-light .il-step.il-step-failed .il-icon {
+	color: #d63a3a;
+}
+
+.il-steps-dark .il-step label {
+	color: #ffffff;
+	font-size: 15px;
+}
+
+.il-steps-dark .il-step.il-step-pending label {
+	color: rgba(255, 255, 255, 0.55);
+}
+
+.il-steps-dark .il-step.il-step-running label {
+	font-weight: 600;
+}
+
+.il-steps-dark .il-step .il-icon,
+.il-steps-dark .il-step .il-spinner {
+	color: #ffffff;
+}
+
+.il-steps-dark .il-step.il-step-pending .il-icon {
+	color: rgba(255, 255, 255, 0.4);
+}
+
+.il-steps-dark .il-step.il-step-done .il-icon {
+	color: #8ff0c0;
+}
+
+.il-steps-dark .il-step.il-step-failed .il-icon {
+	color: #ffb4b4;
+}
+
+/* ---- the installing scene -------------------------------------------- */
+
+.il-installing {
+	padding: 56px 72px 40px 72px;
+}
+
+.il-install-title {
+	font-size: 52px;
+	font-weight: 300;
+	color: #ffffff;
+	margin-bottom: 14px;
+}
+
+.il-install-subtitle {
+	font-size: 16px;
+	color: rgba(255, 255, 255, 0.9);
+	margin-bottom: 26px;
+}
+
+.il-install-progress-row {
+	margin-bottom: 10px;
+}
+
+.il-install-progress-row .il-spinner {
+	color: #ffffff;
+}
+
+.il-install-percent {
+	font-size: 18px;
+	color: #ffffff;
+}
+
+.il-install-eta {
+	font-size: 13px;
+	color: rgba(255, 255, 255, 0.8);
+}
+
+.il-install-step {
+	margin-top: 18px;
+	font-size: 13px;
+	font-weight: 600;
+	color: rgba(255, 255, 255, 0.9);
+}
+
+.il-install-detail {
+	margin-top: 4px;
+	font-size: 13px;
+	color: rgba(255, 255, 255, 0.78);
+}
+
+.il-install-stats {
+	margin-top: 2px;
+	margin-bottom: 22px;
+	font-size: 12.5px;
+	color: rgba(255, 255, 255, 0.65);
+}
+
+.il-install-ring {
+	color: #ffffff;
+}
+
+.il-install-bar trough {
+	min-height: 4px;
+	border: none;
+	border-radius: 2px;
+	background-color: rgba(255, 255, 255, 0.22);
+	background-image: none;
+	box-shadow: none;
+	margin-bottom: 12px;
+}
+
+.il-install-bar progress {
+	min-height: 4px;
+	border: none;
+	border-radius: 2px;
+	background-color: #ffffff;
+	background-image: none;
+	box-shadow: none;
+}
+
+.il-root button.il-button.il-button-light {
+	min-height: 32px;
+	min-width: 104px;
+	padding: 0 18px;
+	border-radius: 6px;
+	border: 1px solid rgba(255, 255, 255, 0.85);
+	background: none;
+	box-shadow: none;
+	color: #ffffff;
+}
+
+.il-root button.il-button.il-button-light label {
+	color: #ffffff;
+}
+
+.il-root button.il-button.il-button-light:hover {
+	background-color: rgba(255, 255, 255, 0.12);
+}
+
+.il-root button.il-button.il-button-light:disabled {
+	background: none;
+	border-color: rgba(255, 255, 255, 0.4);
+}
+
+.il-root button.il-button.il-button-light:disabled label {
+	color: rgba(255, 255, 255, 0.6);
+}
+
+/* ---- the splash ------------------------------------------------------ */
+
+.il-splash-spinner {
+	color: #ffffff;
+	margin-top: 72px;
+}
+
+.il-splash-status {
+	margin-top: 26px;
+	font-size: 13px;
+	color: rgba(255, 255, 255, 0.5);
+}
+
+/* ---- sheets ---------------------------------------------------------- */
+
+.il-sheet {
+	background-color: #ffffff;
+	border-radius: 12px;
+	box-shadow: 0 26px 70px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(0, 0, 0, 0.06);
+	color: #141a24;
+	font-family: "Selawik", "Noto Sans", "Cantarell", "DejaVu Sans", sans-serif;
+}
+
+.il-sheet-head {
+	padding: 24px 28px 10px 28px;
+}
+
+.il-sheet-title {
+	font-size: 20px;
+	font-weight: 600;
+	color: #141a24;
+}
+
+.il-sheet-body {
+	padding: 6px 28px 18px 28px;
+}
+
+.il-sheet-text {
+	font-size: 14px;
+	color: #2b3240;
+}
+
+.il-sheet-mono {
+	font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+	font-size: 12px;
+	color: #2b3240;
+}
+
+.il-sheet-buttons {
+	padding: 16px 24px 18px 24px;
+	background-color: #f5f7fb;
+	border-top: 1px solid #e6eaf1;
+	border-radius: 0 0 12px 12px;
+}
+
+.il-details {
+	margin-bottom: 6px;
+}
+
+.il-detail-key {
+	font-size: 13px;
+	font-weight: 600;
+	color: #3b4558;
+}
+
+.il-detail-value {
+	font-size: 13px;
+	color: #141a24;
+}
+
+.il-detail-mono {
+	font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+	font-size: 12px;
+	color: #141a24;
+}
+
+/* ---- tiers ----------------------------------------------------------- */
+
+window.il-compact .il-setup-page {
+	padding: 18px 20px 8px 20px;
+}
+
+window.il-compact .il-setup-page .il-heading {
+	font-size: 23px;
+	margin-bottom: 10px;
+}
+
+window.il-compact .il-setup-footer {
+	padding: 8px 14px 12px 20px;
+}
+
+window.il-compact .il-setup-footer button.il-button {
+	min-width: 84px;
+}
+
+window.il-compact .il-brand-box {
+	margin-right: 6px;
+}
+
+window.il-compact .il-card-page {
+	padding: 52px 24px 6px 24px;
+}
+
+window.il-compact .il-card-page .il-heading {
+	font-size: 22px;
+}
+
+window.il-compact .il-subtitle {
+	font-size: 14px;
+	margin-bottom: 14px;
+}
+
+window.il-compact .il-card-buttons {
+	padding: 8px 24px 18px 24px;
+}
+
+window.il-compact .il-card-buttons button.il-button {
+	min-height: 36px;
+	min-width: 108px;
+}
+
+window.il-compact .il-card-art {
+	padding: 32px 12px 32px 28px;
+}
+
+window.il-compact .il-installing {
+	padding: 28px 28px 20px 28px;
+}
+
+window.il-compact .il-install-title {
+	font-size: 34px;
+}
+
+window.il-compact .il-install-subtitle {
+	margin-bottom: 16px;
+}
+
+window.il-compact list.il-choice row {
+	min-height: 44px;
+}
+
+window.il-compact .il-choice-label {
+	font-size: 15px;
+}
+
+window.il-compact .il-tray {
+	margin: 0 12px 4px 0;
+}
+
+window.il-compact .il-sheet-head {
+	padding: 18px 20px 6px 20px;
+}
+
+window.il-compact .il-sheet-body {
+	padding: 4px 20px 12px 20px;
+}
+
+window.il-tiny .il-setup-page .il-heading {
+	font-size: 20px;
+}
+
+window.il-tiny .il-card-page .il-heading {
+	font-size: 20px;
+}
+
+window.il-tiny .il-brand {
+	font-size: 13px;
+}
+
+window.il-large {
+	font-size: 15px;
+}
+
+window.il-large .il-setup-page .il-heading {
+	font-size: 34px;
+}
+
+window.il-large .il-text,
+window.il-large .il-form-label,
+window.il-large .il-check-label {
+	font-size: 15.5px;
+}
+
+window.il-large .il-root button.il-button {
+	min-height: 36px;
+}
+
+window.il-large .il-root treeview.il-disk-tree {
+	font-size: 14.5px;
+}
+
+window.il-large .il-root button.il-action label {
+	font-size: 15px;
+}
+
+window.il-large .il-install-percent {
+	font-size: 20px;
+}
+
+window.il-large .il-steps-dark .il-step label {
+	font-size: 16px;
+}
+
+window.il-large .il-card-page {
+	padding: 84px 72px 12px 16px;
+}
+
+window.il-large .il-card-page .il-heading {
+	font-size: 32px;
+}
+
+window.il-large .il-subtitle {
+	font-size: 16px;
+}
+
+window.il-large .il-choice-label {
+	font-size: 17px;
+}
+
+window.il-large list.il-choice row {
+	min-height: 56px;
+}
+
+window.il-large .il-card-buttons {
+	padding: 12px 72px 52px 24px;
+}
+
+window.il-large .il-card-art {
+	padding: 72px 40px 72px 72px;
+}
+
+window.il-large .il-installing {
+	padding: 80px 110px 56px 110px;
+}
+
+window.il-large .il-install-title {
+	font-size: 60px;
+}

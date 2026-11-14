@@ -89,6 +89,13 @@ int vfs_status_to_errno(int st)
 		return -EISDIR;
 	case ST_NOTDIR:
 		return -ENOTDIR;
+	case ST_LOOP:
+	case ST_LINK: /* never meant to get out of the VFS */
+		return -ELOOP;
+	case ST_NAMETOOLONG:
+		return -ENAMETOOLONG;
+	case ST_NXIO:
+		return -ENXIO;
 	default:
 		return -EACCES;
 	}
@@ -255,7 +262,7 @@ unsigned int creat_mode(task_t *cur, uint64_t mode)
 static int64_t name_op_errno(int st)
 {
 	if (st == ST_ERR || st == ST_TIMEOUT || st == ST_EOF ||
-	    st < ST_NOTDIR || st > ST_OK)
+	    st < ST_NXIO || st > ST_OK)
 		return -EINVAL;
 	return vfs_status_to_errno(st);
 }
@@ -284,6 +291,11 @@ int64_t sys_unlink(uint64_t pathname)
 	return name_op_errno(st);
 }
 
+static int64_t rename_paths(const char *koldpath, const char *knewpath);
+static int64_t mkdir_path(task_t *cur, const char *kpath, uint64_t mode);
+static int64_t link_paths(const char *kold, const char *knew, int follow);
+static int64_t symlink_path(const char *ktarget, const char *klink);
+
 int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 {
 	if (!validate_user_ptr(oldpath, 1) || !validate_user_ptr(newpath, 1))
@@ -306,7 +318,11 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 	cret = canon_task_path(knewpath, sizeof(knewpath));
 	if (cret != 0)
 		return cret;
+	return rename_paths(koldpath, knewpath);
+}
 
+static int64_t rename_paths(const char *koldpath, const char *knewpath)
+{
 	int pr = perm_check_remove(
 		koldpath); /* remove source (+ sticky)        */
 	if (pr < 0)
@@ -319,6 +335,49 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 	if (st == ST_OK)
 		return 0;
 	return name_op_errno(st);
+}
+
+/* renameat2(olddirfd, oldpath, newdirfd, newpath, flags): rename() with
+ * each name relative to its own directory descriptor.  RENAME_NOREPLACE
+ * refuses an existing new name with EEXIST; RENAME_EXCHANGE (swapping two
+ * names) is not something the filesystems here can do in one step, and is
+ * refused with EINVAL. */
+int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
+		      uint64_t newpath, uint64_t flags)
+{
+	task_t *cur = sched_current();
+	char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
+	char fold[VFS_MAX_PATH], fnew[VFS_MAX_PATH];
+	int c;
+
+	if (!cur)
+		return -EFAULT;
+	if (flags & ~((uint64_t)RENAME_NOREPLACE | RENAME_EXCHANGE))
+		return -EINVAL;
+	if (flags & RENAME_EXCHANGE)
+		return -EINVAL;
+	c = copy_user_path((const char *)oldpath, kold, sizeof(kold));
+	if (c)
+		return c;
+	c = copy_user_path((const char *)newpath, knew, sizeof(knew));
+	if (c)
+		return c;
+	if (!kold[0] || !knew[0])
+		return -ENOENT;
+	c = build_at_path(cur, (int)olddirfd, kold, fold, sizeof(fold));
+	if (c)
+		return c;
+	c = build_at_path(cur, (int)newdirfd, knew, fnew, sizeof(fnew));
+	if (c)
+		return c;
+	if (flags & RENAME_NOREPLACE) {
+		struct kstat st;
+		/* Checked, not held: a name that appears between the check
+		 * and the rename is replaced. */
+		if (vfs_lstat(fnew, &st) == ST_OK)
+			return -EEXIST;
+	}
+	return rename_paths(fold, fnew);
 }
 
 int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
@@ -335,7 +394,11 @@ int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 	cret = canon_task_path(kpath, sizeof(kpath));
 	if (cret != 0)
 		return cret;
+	return mkdir_path(cur, kpath, mode);
+}
 
+static int64_t mkdir_path(task_t *cur, const char *kpath, uint64_t mode)
+{
 	int pr = perm_check_create(kpath);
 	if (pr < 0)
 		return pr;
@@ -353,7 +416,75 @@ int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 		return -ENOMEM;
 	if (st == ST_IO)
 		return -EIO;
+	if (st == ST_ROFS || st == ST_NOSPC || st == ST_ACCESS ||
+	    st == ST_PERM || st == ST_NOTDIR)
+		return vfs_status_to_errno(st);
 	return -EINVAL;
+}
+
+/* mkdirat(dirfd, path, mode) */
+int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode)
+{
+	task_t *cur = sched_current();
+	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+
+	if (!cur)
+		return -EFAULT;
+	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	if (!kpath[0])
+		return -ENOENT;
+	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (c)
+		return c;
+	return mkdir_path(cur, full, mode);
+}
+
+/* mknodat(dirfd, path, mode, dev): a regular file, FIFO, socket, or -- for
+ * the privileged caller -- a character or block device node numbered
+ * `dev'.  The permission bits are reduced by the umask. */
+int64_t sys_mknodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
+		    uint64_t dev)
+{
+	task_t *cur = sched_current();
+	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	unsigned type = (unsigned)mode & S_IFMT;
+
+	if (!cur)
+		return -EFAULT;
+	if (type != 0 && type != S_IFREG && type != S_IFIFO &&
+	    type != S_IFSOCK && type != S_IFCHR && type != S_IFBLK)
+		return -EINVAL; /* directories are mkdir's; links symlink's */
+	if ((type == S_IFCHR || type == S_IFBLK) && !capable())
+		return -EPERM;
+	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	if (!kpath[0])
+		return -ENOENT;
+	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (c)
+		return c;
+	int pr = perm_check_create(full);
+	if (pr < 0)
+		return pr;
+	/* The set-id and sticky bits are kept; the umask takes the rest. */
+	unsigned perm = creat_mode(cur, mode) | ((unsigned)mode & 07000);
+	int st;
+	if (type == 0 || type == S_IFREG) {
+		vfs_file_t *f = NULL;
+		st = vfs_open_mode(full, O_WRONLY | O_CREAT | O_EXCL, perm, &f);
+		if (st == ST_OK && f)
+			vfs_close(f);
+	} else {
+		st = vfs_mknod(full, type | perm, dev);
+	}
+	if (st == ST_OK)
+		return 0;
+	if (st == ST_UNSUPPORTED)
+		return -EPERM; /* the filesystem cannot hold such a node */
+	return vfs_status_to_errno(st);
 }
 
 int64_t sys_rmdir(uint64_t pathname)
@@ -434,21 +565,82 @@ int64_t sys_link(uint64_t oldpath, uint64_t newpath)
 	c = canon_task_path(knew, sizeof(knew));
 	if (c)
 		return c;
+	/* A final symlink is linked itself, as linkat() does by default. */
+	return link_paths(kold, knew, 0);
+}
+
+static int64_t link_paths(const char *kold, const char *knew, int follow)
+{
 	/* The existing name is looked up first: a missing one is ENOENT
 	 * whatever the new name is. */
 	struct kstat ost;
-	int lr = vfs_lstat(kold, &ost);
+	int lr = follow ? vfs_stat(kold, &ost) : vfs_lstat(kold, &ost);
 	if (lr != ST_OK)
 		return vfs_status_to_errno(lr);
+	if (S_ISDIR(ost.st_mode))
+		return -EPERM; /* no hard links to directories */
 	int pr = perm_check_create(knew);
 	if (pr < 0)
 		return pr;
-	int r = vfs_link(kold, knew);
+	int r = vfs_link(kold, knew, follow);
 	if (r == ST_OK)
 		return 0;
 	if (r == ST_UNSUPPORTED)
 		return -EPERM; /* filesystem has no hard links  */
 	return vfs_status_to_errno(r);
+}
+
+/* linkat(olddirfd, oldpath, newdirfd, newpath, flags): link() with each
+ * name relative to its own directory descriptor.  A final symlink in
+ * oldpath is linked itself unless AT_SYMLINK_FOLLOW; with AT_EMPTY_PATH an
+ * empty oldpath names the file olddirfd is open on (privileged). */
+int64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
+		   uint64_t newpath, uint64_t flags)
+{
+	task_t *cur = sched_current();
+	char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
+	char fold[VFS_MAX_PATH], fnew[VFS_MAX_PATH];
+	int c;
+
+	if (!cur)
+		return -EFAULT;
+	if (flags & ~((uint64_t)AT_SYMLINK_FOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
+	c = copy_user_path((const char *)oldpath, kold, sizeof(kold));
+	if (c)
+		return c;
+	c = copy_user_path((const char *)newpath, knew, sizeof(knew));
+	if (c)
+		return c;
+	if (!knew[0])
+		return -ENOENT;
+	if (!kold[0]) {
+		if (!(flags & AT_EMPTY_PATH))
+			return -ENOENT;
+		if (!capable())
+			return -ENOENT;
+		/* The descriptor's own file, by the path it was opened as. */
+		vfs_file_t *df = fdget(cur, (int)olddirfd);
+		if (!df)
+			return -EBADF;
+		c = 0;
+		if (fd_is_special(df) || !df->at_path)
+			c = -ENOENT;
+		else
+			kstrncpy(fold, df->at_path, sizeof(fold));
+		fdput(df);
+		if (c)
+			return c;
+		fold[sizeof(fold) - 1] = '\0';
+	} else {
+		c = build_at_path(cur, (int)olddirfd, kold, fold, sizeof(fold));
+		if (c)
+			return c;
+	}
+	c = build_at_path(cur, (int)newdirfd, knew, fnew, sizeof(fnew));
+	if (c)
+		return c;
+	return link_paths(fold, fnew, (flags & AT_SYMLINK_FOLLOW) ? 1 : 0);
 }
 
 int64_t sys_symlink(uint64_t target, uint64_t linkpath)
@@ -466,6 +658,13 @@ int64_t sys_symlink(uint64_t target, uint64_t linkpath)
 	c = canon_task_path(klink, sizeof(klink));
 	if (c)
 		return c;
+	return symlink_path(ktarget, klink);
+}
+
+static int64_t symlink_path(const char *ktarget, const char *klink)
+{
+	if (!ktarget[0])
+		return -ENOENT;
 	int pr = perm_check_create(klink);
 	if (pr < 0)
 		return pr;
@@ -475,6 +674,29 @@ int64_t sys_symlink(uint64_t target, uint64_t linkpath)
 	if (r == ST_UNSUPPORTED)
 		return -EPERM; /* filesystem has no symlinks    */
 	return vfs_status_to_errno(r);
+}
+
+/* symlinkat(target, newdirfd, linkpath): the link's own name relative to
+ * the descriptor; the target is stored as written. */
+int64_t sys_symlinkat(uint64_t target, uint64_t newdirfd, uint64_t linkpath)
+{
+	task_t *cur = sched_current();
+	char ktarget[VFS_MAX_PATH], klink[VFS_MAX_PATH], full[VFS_MAX_PATH];
+
+	if (!cur)
+		return -EFAULT;
+	int c = copy_user_path((const char *)target, ktarget, sizeof(ktarget));
+	if (c)
+		return c;
+	c = copy_user_path((const char *)linkpath, klink, sizeof(klink));
+	if (c)
+		return c;
+	if (!klink[0])
+		return -ENOENT;
+	c = build_at_path(cur, (int)newdirfd, klink, full, sizeof(full));
+	if (c)
+		return c;
+	return symlink_path(ktarget, full);
 }
 
 int normalize_path(const char *base, const char *path, char *out,

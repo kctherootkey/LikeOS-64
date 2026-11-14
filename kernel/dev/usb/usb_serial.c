@@ -108,6 +108,11 @@ typedef struct {
 
 static spinlock_t g_usbserial_lock = SPINLOCK_INIT("usbserial");
 static usbserial_state_t g_usbserial;
+/* Log writes running on the device outside the lock (g_usbserial_lock).
+ * Not part of the state cleared at a disconnect: the disconnect waits for
+ * them, since the controller gives the device's rings back once its slot is
+ * disabled. */
+static volatile uint32_t g_usbserial_writers;
 
 // Forward declarations
 static int usbserial_activate_pl2303(xhci_controller_t *ctrl, usb_device_t *dev,
@@ -637,6 +642,12 @@ void usbserial_disconnect(usb_device_t *dev)
 		usbserial_clear_state();
 	}
 	spin_unlock_irqrestore(&g_usbserial_lock, flags);
+
+	/* A log write that got the device before it was cleared may still
+	 * be transferring: it ends at once (the device is marked gone
+	 * before this is called), and nothing touches the device after. */
+	while (__atomic_load_n(&g_usbserial_writers, __ATOMIC_SEQ_CST))
+		__asm__ volatile("pause" ::: "memory");
 }
 
 void usbserial_log_write(const char *data, uint32_t len)
@@ -659,11 +670,13 @@ void usbserial_log_write(const char *data, uint32_t len)
 	ctrl = g_usbserial.ctrl;
 	dev = g_usbserial.dev;
 	g_usbserial.write_busy = 1;
+	__atomic_add_fetch(&g_usbserial_writers, 1, __ATOMIC_SEQ_CST);
 	spin_unlock_irqrestore(&g_usbserial_lock, flags);
 
 	(void)usbserial_write_text(ctrl, dev, data, len);
 
 	spin_lock_irqsave(&g_usbserial_lock, &flags);
+	__atomic_sub_fetch(&g_usbserial_writers, 1, __ATOMIC_SEQ_CST);
 	if (g_usbserial.dev == dev) {
 		g_usbserial.write_busy = 0;
 	}

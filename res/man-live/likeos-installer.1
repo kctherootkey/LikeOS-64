@@ -1,0 +1,95 @@
+LIKEOS-INSTALLER(1)          System Administration         LIKEOS-INSTALLER(1)
+
+NAME
+       likeos-installer - LikeOS Setup, the graphical installer
+
+SYNOPSIS
+       likeos-installer    [--mock]    [--window]   [--page=n   [--substep=n]]
+       [--size=wxh] [--fast] [--no-animation]
+       likeos-installer --version
+
+DESCRIPTION
+       likeos-installer is LikeOS Setup: the program that installs LikeOS from
+       the USB medium onto a disk of the computer.  It is normally not started
+       by hand.  The boot menu of the installation medium has an entry Install
+       LikeOS from USB; it starts the medium's system with likeos.mode=install
+       on the kernel command line, and init(8) then starts LikeOS Setup on the
+       console instead of the login prompt: the X  server  with  this  program
+       alone, full screen, without a window manager or desktop.
+
+       Setup  asks,  page  by  page: the language and the formats of dates and
+       times, the keyboard to use during setup, where LikeOS goes (a  disk  to
+       erase  completely, or a partition, with tools to delete, create, format
+       and extend partitions -- nothing  is  written  until  the  installation
+       starts),  the  time  zone,  the keyboard layouts of the new system, the
+       computer's name, the root password and the account to sign in with.   A
+       summary  shows  every  choice  before anything is changed; Install then
+       partitions and formats, unpacks the system image, sets up the new  sys-
+       tem, installs the boot loader and registers it with the firmware, show-
+       ing the progress, and restarts the computer into the installed system.
+
+       The  disks of the medium Setup was started from are shown but cannot be
+       chosen.  When something goes wrong a page says what, with the installa-
+       tion log.
+
+       The work is done by the installer library that the text-mode installer,
+       likeos-install(1), uses too.  When the graphical installer  cannot  run
+       (the  graphics  of the computer do not work), the installation medium's
+       console offers likeos-install instead.
+
+OPTIONS
+       These are for developing and testing  Setup;  the  installation  medium
+       starts it without any.
+
+       --mock Use  the  built-in  stand-in  for the installer library: made-up
+              disks and a simulated installation that changes nothing.
+
+       --window
+              Run in a normal 1024x768 window instead of covering the screen.
+
+       --page=n
+              Start on page n (0 the start screen, 1 language, 2  keyboard,  3
+              preparing,  4  disk, 5 time zone, 6 keyboard layouts, 7 computer
+              name, 8 root password, 9 account, 10 summary, 11 installing,  12
+              finished,  13  error), with made-up answers for the pages before
+              it -- for screenshots.
+
+       --substep=n
+              With --page: go n steps into a page that has steps.
+
+       --size=wxh
+              Lay the pages out as if the screen were wxh pixels.
+
+       --fast No minimum time on the start and waiting screens.
+
+       --no-animation
+              Still illustrations and spinners.
+
+       --version
+              Show the version and exit.
+
+EXIT STATUS
+       0      The installation finished (Setup restarts the computer itself).
+
+       10     The person chose to switch the computer off.
+
+       other  Setup could not run or broke  down;  the  installation  medium's
+              console then offers the text-mode installer.
+
+FILES
+       /install/likeos-rootfs.tar.zst
+              The system image that is installed.
+
+       /tmp/likeos-install.log
+              The  log  of  the  installation (kept on the installed system as
+              /var/log/likeos-install.log).
+
+       /etc/inittab.install
+              What  init(8)  runs   when   the   medium   was   started   with
+              likeos.mode=install.
+
+SEE ALSO
+       likeos-install(1),   likeos-install.conf(5),   likeos-bootmenu.conf(5),
+       likeos-gpt(1), likeos-efiboot(1)
+
+LikeOS                           November 2026             LIKEOS-INSTALLER(1)

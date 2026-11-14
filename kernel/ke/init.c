@@ -38,6 +38,7 @@ void procfs_init(void);
 #include <kernel/fs/devfs.h>
 #include <kernel/mm/shm.h>
 #include <kernel/hal/acpi.h>
+#include <kernel/hal/efi.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
 #include <kernel/hal/lapic.h>
@@ -222,6 +223,9 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 	// the storage bootstrap finds the root filesystem (BOOT_ROOTID_MAGIC).
 	storage_boot_info_save(boot_info);
 
+	// The UEFI runtime services the bootloader passed on (efi_init below).
+	efi_boot_info_save(boot_info);
+
 	// Save SMP trampoline address from bootloader
 	g_smp_trampoline_address = boot_info->smp_trampoline_addr;
 
@@ -261,12 +265,16 @@ __no_stack_protector void continue_system_startup(void)
 	/* The sysfs-style device tree and /proc: read-only views of the
 	 * PCI table and the task list. */
 	sysfs_init();
+	/* The firmware's runtime services and, when they work, its
+	 * variables under /sys/firmware/efi. */
+	efi_init();
+	efivars_init();
 	procfs_init();
 	fbdev_boot_display_sysfs();
 	tty_sysfs_init();
 	/* /ram: a filesystem that lives in memory, for whatever should not
 	 * touch the disk (luakit's caches and databases, see
-	 * res/xorg/luakit-ram.sh). */
+	 * res/xorg/luakit-ram.sh); mount(2) makes further tmpfs instances. */
 	tmpfs_init();
 	tty_init();
 

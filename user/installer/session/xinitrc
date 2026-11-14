@@ -1,0 +1,82 @@
+#!/bin/sh
+# The X session of LikeOS Setup, installed as /usr/share/likeos/installer/
+# xinitrc on the live medium and started by likeos-installer-session through
+# startx.
+#
+# Only the installer runs in it: no window manager, no desktop, no desktop
+# bar.  likeos-installer makes its own window cover the screen.  When it
+# ends the session ends and the X server stops; its exit status is written
+# to $LIKEOS_INSTALLER_STATUS for the session script, because xinit does not
+# pass a client's status on.
+#
+# The settings below are those of the desktop session (/etc/X11/xinit/
+# xinitrc), kept in step with it: X resources, which GL the clients use,
+# the keyboard layout, the D-Bus session bus, the saved resolution and the
+# cursor theme.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+# System-wide X resources for every toolkit client (see the desktop xinitrc).
+if [ -r /etc/X11/Xresources ]; then
+	XENVIRONMENT=/etc/X11/Xresources
+	export XENVIRONMENT
+fi
+
+# Mesa: the GPU where the machine has one that renders 3D (Intel graphics,
+# VMware with 3D acceleration), llvmpipe everywhere else -- the same
+# questions xserverrc asks of the display device, so the server and the
+# clients agree.
+LIKEOS_GPU_DRIVER=$(drminfo --driver /dev/dri/card0 2>/dev/null)
+export LIKEOS_GPU_DRIVER
+LIKEOS_GPU_3D=0
+if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0 &&
+	drminfo --has-3d /dev/dri/card0 &&
+	[ -r /dev/dri/renderD128 ] && [ -w /dev/dri/renderD128 ]; then
+	LIKEOS_GPU_3D=1
+fi
+export LIKEOS_GPU_3D
+if [ "$LIKEOS_GPU_3D" != "1" ]; then
+	LIBGL_ALWAYS_SOFTWARE=1
+	export LIBGL_ALWAYS_SOFTWARE
+fi
+
+# No accessibility bus here; GTK must not wait for one.
+NO_AT_BRIDGE=1
+export NO_AT_BRIDGE
+
+# The keyboard layout of /etc/likeos/keyboard.conf.  The installer's
+# keyboard page changes it live with setxkbmap afterwards.
+if [ -x /usr/bin/likeos-xkb-apply ]; then
+	likeos-xkb-apply
+fi
+
+# The session bus, for the GTK pieces that look for one; it goes away with
+# this script.
+if [ -x /usr/bin/dbus-launch ] && [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+	eval "$(dbus-launch --sh-syntax --exit-with-session)"
+	export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+fi
+
+# Black, as the screen already is, with the plain arrow instead of the
+# server's default X pointer.
+xsetroot -solid "#000000" -cursor_name left_ptr
+
+# The resolution saved in Display settings, before the installer measures
+# the screen.
+if [ -x /usr/bin/likeos-display-settings ]; then
+	likeos-display-settings --restore
+fi
+
+# The LikeOS pointer theme (busy and resize pointers included).
+XCURSOR_THEME=LikeOS
+XCURSOR_SIZE=32
+export XCURSOR_THEME XCURSOR_SIZE
+
+# The installer, in the foreground: its lifetime is the session's.  The GTK
+# theme is the system's (/etc/gtk-3.0/settings.ini).
+/usr/bin/likeos-installer
+status=$?
+if [ -n "$LIKEOS_INSTALLER_STATUS" ]; then
+	printf '%s\n' "$status" > "$LIKEOS_INSTALLER_STATUS"
+fi
+exit "$status"

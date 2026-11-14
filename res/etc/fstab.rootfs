@@ -1,0 +1,22 @@
+# /etc/fstab -- the filesystems of a LikeOS installation
+#
+# This is the template in the system image (likeos-rootfs.tar.zst).  The
+# installer writes the real file when it installs LikeOS: a line for the
+# root and one for the EFI system partition, both by filesystem UUID,
+#
+#   UUID=<root uuid>  /          ext4  defaults                    0  1
+#   UUID=<esp uuid>   /boot/efi  vfat  umask=0077,shortname=mixed  0  2
+#
+# and below them every line of this file that is not a comment and does not
+# mount / or /boot/efi.  A line added here for all installations is kept.
+#
+# Format, one filesystem per line (see fstab(5)):
+#
+#   <file system>  <mount point>  <type>  <options>  <dump>  <pass>
+#
+# init mounts every line but the root (which the kernel mounts) at
+# start-up, checking the filesystems with a pass number above 0 first
+# (pass 1 before pass 2).  Devices are best named by UUID=, LABEL=,
+# PARTUUID= or PARTLABEL=, which stay the same when disks are added.
+#
+# Copyright (C) 2026 The LikeOS Project

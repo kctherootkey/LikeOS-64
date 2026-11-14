@@ -1,0 +1,146 @@
+LIKEOS-INSTALL(1)            System Administration           LIKEOS-INSTALL(1)
+
+NAME
+       likeos-install - install LikeOS on a disk, in a text terminal
+
+SYNOPSIS
+       likeos-install [--verbose] [--no-reboot]
+       likeos-install --answers file [--yes] [--dry-run] [--no-reboot] [--ver-
+       bose]
+       likeos-install --list-disks
+       likeos-install --reset-tty
+
+DESCRIPTION
+       likeos-install installs LikeOS from the medium it was started from onto
+       a  disk of the computer: it partitions the disk (or uses a partition of
+       it), creates the file systems, unpacks the system image,  sets  up  the
+       new  system  --  language, time zone, keyboard, computer name, the root
+       password and a user account --, installs the boot  loader  on  the  EFI
+       system partition, registers it with the firmware, and restarts the com-
+       puter into the installed system.
+
+       It  is the text-mode counterpart of the graphical installer, likeos-in-
+       staller(1), and does the same work through the same installer  library;
+       the  installation  medium offers it when the graphical installer cannot
+       run (a computer whose graphics do not work), and it runs in any  termi-
+       nal, also over a serial line or ssh(1).  It must run as root.
+
+   Interactive installation
+       Started  without  --answers,  likeos-install  asks the questions of the
+       graphical installer, one at a time: the language of the installed  sys-
+       tem  and  the  format of dates and times, the disk to install on (to be
+       erased completely, or one of its partitions), the time zone,  the  key-
+       board layouts (up to four), the computer's name, the root password, and
+       the  name,  user name and password of the account to sign in with; then
+       it shows a summary and asks for a last confirmation before anything  is
+       written  to  the disk.  Typing back (or <) at a question returns to the
+       one before; Ctrl-C or the end of the input cancels the installation  --
+       until  the  confirmation  nothing  has been changed.  On a terminal the
+       progress of the installation is a bar that  redraws  itself;  when  the
+       standard  input  or  output  is not a terminal every question reads one
+       line and the progress is printed line by line, so the  program  can  be
+       driven by another program or logged.
+
+   Unattended installation
+       With --answers file the answers are read from file instead (see likeos-
+       install.conf(5)),  and nothing is asked but the confirmation before the
+       disk is changed, which --yes gives in advance.
+
+   What is installed
+       Erasing the whole disk gives it a new GUID  partition  table  with  two
+       partitions:  an  EFI  system partition of 512 MiB (FAT32, label LIKEOS-
+       ESP) and the LikeOS root file system (ext4, label likeos-root)  in  the
+       rest  of  the disk.  Installing on one partition formats that partition
+       with ext4 and uses the EFI system partition the disk has already  (FAT,
+       at  least  100 MB; the first one when there are several).  LikeOS needs
+       at  least  the  size  the  system  image  asks  for   (/install/likeos-
+       rootfs.tar.zst.info).
+
+       The system image is /install/likeos-rootfs.tar.zst, checked against its
+       checksum (/install/likeos-rootfs.tar.zst.sha256) before it is unpacked.
+       The  installed  system  gets  an  /etc/fstab naming its file systems by
+       UUID,    the    boot    loader    in    \EFI\LIKEOS\BOOTX64.EFI    (and
+       \EFI\BOOT\BOOTX64.EFI  as  the  firmware's  fallback) on its EFI system
+       partition, and a firmware boot entry labelled LikeOS first in the  boot
+       order (see likeos-efiboot(1)).  It starts straight into LikeOS, without
+       the boot menu of the installation medium.
+
+OPTIONS
+       --answers file
+              Install unattended, with the answers in file.
+
+       --list-disks
+              List  the  disks LikeOS can be installed on, and exit.  The disk
+              the running system was started from cannot be chosen.
+
+       --dry-run
+              Do everything but change the disk: check the answers,  work  out
+              and  show  the  plan (partitions, file systems, what is erased),
+              then stop.
+
+       --yes  Do not ask for the last confirmation before the disk is changed.
+              Meant for --answers; it is the caller's  confirmation  that  the
+              disk named there may be erased.
+
+       --no-reboot
+              Do  not  restart the computer when the installation is done (the
+              reboot setting of an answer file is overridden).
+
+       --verbose
+              Show the installer's log lines (each step, each program it  runs
+              and its result) as well as the progress.
+
+       --reset-tty
+              Put  the terminal on the standard input back into line mode with
+              echo (line editing, echo, Ctrl-C and the other signal keys, car-
+              riage return read as newline, newline written as carriage return
+              and newline), and exit.  An installation  turns  echo  and  line
+              mode  off and puts them back when it ends; a likeos-install that
+              was killed cannot, and the installation medium's console session
+              runs this before each of its menus.  It fails  (exit  status  4)
+              when the standard input is not a terminal.
+
+EXIT STATUS
+       0      LikeOS  was  installed  (or, with --dry-run or --list-disks, the
+              plan or the list was shown; with --reset-tty, the  terminal  was
+              reset).
+
+       not 0  The installation failed or was cancelled, or the command line or
+              the  answer file had a mistake; the reason is shown, and the log
+              says more.
+
+FILES
+       /install/likeos-rootfs.tar.zst
+              The system image that is installed, with its checksum  (.sha256)
+              and a description (.info).
+
+       /tmp/likeos-install.log
+              The  log  of  the  installation; a copy is kept on the installed
+              system as /var/log/likeos-install.log.
+
+       /mnt/likeos
+              Where the new system's file systems are mounted during  the  in-
+              stallation.
+
+EXAMPLES
+       Install on /dev/nvme0n1 without questions, erasing it:
+
+              cat > answers.conf <<'EOF'
+              disk=/dev/nvme0n1
+              whole_disk=yes
+              locale=de_DE.UTF-8
+              timezone=Europe/Berlin
+              keyboard=de
+              hostname=office-pc
+              user_fullname="Erika Mustermann"
+              user_name=erika
+              user_password_hash=$y$j9T$...
+              EOF
+              likeos-install --answers answers.conf --dry-run
+              likeos-install --answers answers.conf --yes
+
+SEE ALSO
+       likeos-installer(1), likeos-install.conf(5), likeos-gpt(1), likeos-efi-
+       boot(1), fstab(5), mke2fs(8), mkfs.fat(8)
+
+LikeOS                           November 2026               LIKEOS-INSTALL(1)

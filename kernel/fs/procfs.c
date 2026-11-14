@@ -790,26 +790,13 @@ static long show_boot_settled(struct pfs_node *n, char *buf, long cap)
 	return pfs_printf(buf, cap, 0, "%d\n", boot_settled() ? 1 : 0);
 }
 
+/* /proc/mounts and /proc/<pid>/mounts: the mount table, root first, one
+ * "source target fstype options 0 0" line per mount (kernel/fs/mount.c).
+ * One mount name space: every process sees the same table. */
 static long show_mounts(struct pfs_node *n, char *buf, long cap)
 {
-	/* The root as the storage bootstrap mounted it ("/dev/sda2 / ext4"),
-	 * so tools that map a mount to its block device (lsblk, findmnt, df)
-	 * find the real node.  Before the root is mounted -- or for a root
-	 * that is not on a named block device -- the conventional
-	 * placeholder. */
-	const char *dev = storage_root_device_name();
-	const char *type = storage_root_fs_type();
-	long p;
-
 	(void)n;
-	if (dev && dev[0])
-		p = pfs_printf(buf, cap, 0, "/dev/%s / %s rw 0 0\n", dev,
-			       type ? type : "ext4");
-	else
-		p = pfs_printf(buf, cap, 0, "/dev/root / %s rw 0 0\n",
-			       type ? type : "ext4");
-	return pfs_printf(buf, cap, p,
-			  "devfs /dev devfs rw 0 0\nsysfs /sys sysfs ro 0 0\nproc /proc proc ro 0 0\n");
+	return vfs_mounts_show(buf, cap, 0, 0);
 }
 
 /* /proc/<pid>/mountinfo: the same mounts with their ids, device numbers
@@ -817,26 +804,24 @@ static long show_mounts(struct pfs_node *n, char *buf, long cap)
  * (findmnt, lsblk) parse. */
 static long show_mountinfo(struct pfs_node *n, char *buf, long cap)
 {
-	const char *dev = storage_root_device_name();
-	const char *type = storage_root_fs_type();
-	const block_device_t *b = storage_root_bdev();
-	uint32_t ma = 0, mi = 0;
-	long p;
+	(void)n;
+	return vfs_mounts_show(buf, cap, 0, 1);
+}
+
+/* /proc/cmdline: the command line the system was booted with, as the
+ * bootloader passed it, newline-terminated. */
+static long show_boot_cmdline(struct pfs_node *n, char *buf, long cap)
+{
+	const char *c = storage_boot_cmdline();
+	long p = 0;
 
 	(void)n;
-	if (b && b->magic == BLOCK_DEVICE_MAGIC) {
-		ma = b->major;
-		mi = b->minor;
-	}
-	if (dev && dev[0])
-		p = pfs_printf(buf, cap, 0, "1 0 %u:%u / / rw,relatime shared:1 - %s /dev/%s rw\n",
-			       ma, mi, type ? type : "ext4", dev);
-	else
-		p = pfs_printf(buf, cap, 0, "1 0 0:1 / / rw,relatime shared:1 - %s /dev/root rw\n",
-			       type ? type : "ext4");
-	p = pfs_printf(buf, cap, p, "2 1 0:5 / /dev rw,nosuid shared:2 - devfs devfs rw\n");
-	p = pfs_printf(buf, cap, p, "3 1 0:20 / /sys ro,nosuid,nodev,noexec shared:3 - sysfs sysfs ro\n");
-	return pfs_printf(buf, cap, p, "4 1 0:21 / /proc ro,nosuid,nodev,noexec shared:4 - proc proc ro\n");
+	for (; c && *c; c++, p++)
+		if (p < cap)
+			buf[p] = *c;
+	if (p < cap)
+		buf[p] = '\n';
+	return p + 1;
 }
 
 void procfs_init(void)
@@ -848,11 +833,16 @@ void procfs_init(void)
 	pfs_add_file(&g_procfs, "meminfo", show_meminfo, NULL, 0);
 	pfs_add_file(&g_procfs, "cpuinfo", show_cpuinfo, NULL, 0);
 	pfs_add_file(&g_procfs, "mounts", show_mounts, NULL, 0);
+	pfs_add_file(&g_procfs, "cmdline", show_boot_cmdline, NULL, 0);
 	pfs_add_file(&g_procfs, "boot_settled", show_boot_settled, NULL, 0);
 	/* The block layer's tables (kernel/dev/block/blk_sysfs.c). */
 	pfs_add_file(&g_procfs, "partitions", blk_proc_partitions_show, NULL, 0);
 	pfs_add_file(&g_procfs, "diskstats", blk_proc_diskstats_show, NULL, 0);
 	/* The major registry (kernel/fs/chrdev.c): built-in and dynamic. */
 	pfs_add_file(&g_procfs, "devices", chrdev_proc_devices_show, NULL, 0);
-	vfs_register_mount("/proc", pfs_ops(&g_procfs));
+	vfs_register_mount("/proc", pfs_ops(&g_procfs), "proc", &g_procfs,
+			   /* Shown as the conventional options, but not
+			    * enforced: a program re-executes itself through
+			    * /proc/self/exe, which lexically is below here. */
+			   0, "ro,nosuid,nodev,noexec", 1);
 }

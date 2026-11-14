@@ -373,6 +373,28 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_mremap(a1, a2, a3, a4, a5);
 	case SYS_MSYNC:
 		return sys_msync(a1, a2, a3);
+	case SYS_MOUNT:
+		return sys_mount(a1, a2, a3, a4, a5);
+	case SYS_UMOUNT2:
+		return sys_umount2(a1, a2);
+	case SYS_MKNODAT:
+		return sys_mknodat(a1, a2, a3, a4);
+	case SYS_FCHOWNAT:
+		return sys_fchownat(a1, a2, a3, a4, a5);
+	case SYS_LINKAT:
+		return sys_linkat(a1, a2, a3, a4, a5);
+	case SYS_SYMLINKAT:
+		return sys_symlinkat(a1, a2, a3);
+	case SYS_MKDIRAT:
+		return sys_mkdirat(a1, a2, a3);
+	case SYS_RENAMEAT2:
+		return sys_renameat2(a1, a2, a3, a4, a5);
+	case SYS_FCHMODAT:
+		return sys_fchmodat(a1, a2, a3, a4);
+	case SYS_SYNCFS:
+		return sys_syncfs(a1);
+	case SYS_READLINKAT:
+		return sys_readlinkat(a1, a2, a3, a4);
 	case SYS_EVENTFD2:
 		return sys_eventfd2(a1, a2);
 	case SYS_TIMERFD_CREATE:

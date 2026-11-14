@@ -1,0 +1,4 @@
+# LikeOS installer: host build output (Makefile.host)
+# Copyright (C) 2026 The LikeOS Project
+/build-host/
+/build-host-real/

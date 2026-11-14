@@ -240,6 +240,10 @@ typedef struct __attribute__((aligned(64))) {
 	uint32_t dequeue;
 	uint8_t cycle;
 	uint8_t pad[3];
+	/* The allocation the ring was carved from (xhci_alloc_ring); the
+	 * transfer rings of a slot are given back with it once the slot is
+	 * disabled. */
+	void *alloc_base;
 } xhci_ring_t;
 
 // Expandable transfer ring using linked segments
@@ -323,6 +327,30 @@ typedef struct usb_device {
 	uint8_t lun_count;
 	uint8_t configured;
 
+	// String descriptor indexes from the device descriptor (0 = none)
+	uint8_t str_manufacturer;
+	uint8_t str_product;
+	uint8_t str_serial;
+
+	// The mass-storage interface chosen at enumeration (msd_iface_valid):
+	// SCSI transparent command set over the Bulk-Only Transport, its
+	// interface number and alternate setting.  The bulk endpoints above are
+	// that interface's.
+	uint8_t msd_iface_valid;
+	uint8_t msd_iface;
+	uint8_t msd_alt;
+	// Attach attempts of the storage driver for this connection
+	uint8_t msd_attempts;
+
+	// Lifetime of the device in this slot.  `gen' changes every time a
+	// device is addressed in the slot, so a holder of the pointer can tell
+	// the device it bound from a later one.  `gone' is set as soon as the
+	// device is known to be disconnected (the port event, from the
+	// interrupt handler) or its slot is disabled: transfers on it fail at
+	// once with ST_NO_DEVICE instead of running into their timeouts.
+	volatile uint8_t gone;
+	uint32_t gen;
+
 	// Error tracking for retry logic
 	uint8_t err_count_in; // Error count for bulk IN endpoint
 	uint8_t err_count_out; // Error count for bulk OUT endpoint
@@ -380,8 +408,9 @@ typedef struct xhci_controller {
 	xhci_erst_entry_t *erst;
 	uint64_t erst_phys;
 
-	// Device contexts
+	// Device contexts (and the allocations they were aligned in)
 	xhci_dev_ctx_t *dev_ctx[XHCI_MAX_SLOTS];
+	void *dev_ctx_raw[XHCI_MAX_SLOTS];
 	xhci_input_ctx_t *input_ctx; // For compatibility (deprecated)
 	uint8_t *input_ctx_raw; // Raw byte access for variable context size
 	uint64_t input_ctx_phys;
@@ -416,6 +445,11 @@ typedef struct xhci_controller {
 	// Set by xhci_handle_port_event() in IRQ context, consumed by
 	// xhci_hotplug_poll() in the main loop.
 	volatile uint32_t hotplug_ports;
+	// Ports whose configured device(s) the interrupt handler saw go away
+	// (connect status 0 in a port event).  The hot-plug poll disconnects
+	// them even if the port is connected again by then: a quick re-plug
+	// is a new device.
+	volatile uint32_t port_gone;
 } xhci_controller_t;
 
 // Global controller instances
@@ -444,6 +478,12 @@ uint8_t xhci_port_speed(xhci_controller_t *ctrl, uint8_t port);
 // Called from the main loop.  Checks hotplug_ports bitmask set by IRQ,
 // enumerates newly connected devices, cleans up disconnected ones.
 void xhci_hotplug_poll(xhci_controller_t *ctrl);
+// The end of the boot enumeration: flag every port that is connected but
+// has no device, so the hot-plug poll enumerates it (a connect that was seen
+// during the boot phase may have had its change event drained).
+void xhci_hotplug_rescan(xhci_controller_t *ctrl);
+// Is a configured device on this root port?
+int xhci_port_has_device(xhci_controller_t *ctrl, uint8_t port);
 
 // Device management
 int xhci_enable_slot(xhci_controller_t *ctrl);
@@ -519,6 +559,16 @@ int xhci_ring_ex_enqueue(xhci_ring_ex_t *ring, uint64_t param, uint32_t status,
 int xhci_send_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
 		      uint32_t control);
 int xhci_wait_command(xhci_controller_t *ctrl, uint32_t timeout_ms);
+/* Issue one command and wait for its completion: ST_OK, ST_ERR (completed
+ * with an error code), ST_TIMEOUT.  Commands of all callers and controllers
+ * are serialised here (the completion state is shared), so a mass-storage
+ * worker resetting an endpoint never races an enumeration on another
+ * thread.  `slot_out'/`cc_out' (optional) receive the completion's slot id
+ * and completion code.  May sleep (process context; polls before the
+ * scheduler runs). */
+int xhci_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
+		 uint32_t control, uint32_t timeout_ms, uint8_t *slot_out,
+		 uint8_t *cc_out);
 
 // Memory helpers
 static inline uint32_t xhci_cap_read32(xhci_controller_t *ctrl, uint32_t off)

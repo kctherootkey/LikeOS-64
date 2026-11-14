@@ -141,26 +141,76 @@ static int devfs_lstat(const char *path, struct kstat *st);
 static int devfs_readlink(const char *path, char *buf, unsigned long bufsz);
 static int devfs_fsync(vfs_file_t *f);
 
+/* The VFS calls carry the mount; devfs is mounted once, at /dev, and is
+ * handed absolute paths, so it has no use for it.  These adapt its entry
+ * points, which the syscall layer also calls directly. */
+static int devfs_vop_open(vfs_mount_t *m, const char *path, int flags,
+			  vfs_file_t **out)
+{
+	(void)m;
+	return devfs_open(path, flags, out);
+}
+
+static int devfs_vop_stat(vfs_mount_t *m, const char *path, struct kstat *st)
+{
+	(void)m;
+	return devfs_stat(path, st);
+}
+
+static int devfs_vop_unlink(vfs_mount_t *m, const char *path)
+{
+	(void)m;
+	return devfs_unlink(path);
+}
+
+static int devfs_vop_chdir(vfs_mount_t *m, const char *path)
+{
+	(void)m;
+	return devfs_chdir(path);
+}
+
+static int devfs_vop_permission(vfs_mount_t *m, const char *path,
+				unsigned long ino, int want)
+{
+	(void)m;
+	return devfs_permission(path, ino, want);
+}
+
+static int devfs_vop_lstat(vfs_mount_t *m, const char *path, struct kstat *st)
+{
+	(void)m;
+	return devfs_lstat(path, st);
+}
+
+static int devfs_vop_readlink(vfs_mount_t *m, const char *path, char *buf,
+			      unsigned long bufsz)
+{
+	(void)m;
+	return devfs_readlink(path, buf, bufsz);
+}
+
 int devfs_init(void)
 {
-	g_devfs_ops.open = devfs_open;
-	g_devfs_ops.stat = devfs_stat;
+	g_devfs_ops.open = devfs_vop_open;
+	g_devfs_ops.stat = devfs_vop_stat;
 	g_devfs_ops.read = devfs_read;
 	g_devfs_ops.write = devfs_write;
 	g_devfs_ops.seek = devfs_seek;
 	g_devfs_ops.readdir = devfs_readdir;
 	g_devfs_ops.truncate = devfs_truncate;
-	g_devfs_ops.unlink = devfs_unlink;
+	g_devfs_ops.unlink = devfs_vop_unlink;
 	g_devfs_ops.rename = NULL;
 	g_devfs_ops.mkdir = NULL;
 	g_devfs_ops.rmdir = NULL;
-	g_devfs_ops.chdir = devfs_chdir;
+	g_devfs_ops.chdir = devfs_vop_chdir;
 	g_devfs_ops.close = devfs_close;
-	g_devfs_ops.permission = devfs_permission;
+	g_devfs_ops.permission = devfs_vop_permission;
 	/* Registered symbolic links (/dev/disk/by-*) and block devices. */
-	g_devfs_ops.lstat = devfs_lstat;
-	g_devfs_ops.readlink = devfs_readlink;
+	g_devfs_ops.lstat = devfs_vop_lstat;
+	g_devfs_ops.readlink = devfs_vop_readlink;
 	g_devfs_ops.fsync = devfs_fsync;
+	/* /dev/kmsg (kernel/fs/kmsg.c). */
+	kmsg_init();
 	return 0;
 }
 
@@ -1311,6 +1361,65 @@ int devfs_stat(const char *path, struct kstat *st)
 	st->st_mtime = t;
 	st->st_ctime = t;
 	return ST_OK;
+}
+
+/* The /dev name of the device numbered `rdev' (a block device when
+ * `is_blk'), for opening a device node kept on an ordinary filesystem: the
+ * node there carries only the number.  The built-in character devices are
+ * matched by the numbers devfs_stat() reports for them, everything else
+ * among the registered nodes.  ST_OK with the path in `out', or
+ * ST_NOT_FOUND. */
+int devfs_path_for_rdev(int is_blk, uint64_t rdev, char *out, size_t cap)
+{
+	uint32_t ma = kdev_major(rdev), mi = kdev_minor(rdev);
+	const char *fixed = NULL;
+	int found = 0;
+
+	if (!out || cap < 8)
+		return ST_INVALID;
+	if (!is_blk) {
+		static const struct {
+			uint32_t ma, mi;
+			const char *path;
+		} b[] = {
+			{ 5, 0, "/dev/tty" },	  { 5, 1, "/dev/console" },
+			{ 4, 0, "/dev/tty0" },	  { 5, 2, "/dev/ptmx" },
+			{ 1, 8, "/dev/random" },  { 1, 9, "/dev/urandom" },
+			{ 1, 3, "/dev/null" },	  { 1, 5, "/dev/zero" },
+			{ 29, 0, "/dev/fb0" },
+		};
+		for (unsigned i = 0; i < sizeof(b) / sizeof(b[0]); i++)
+			if (b[i].ma == ma && b[i].mi == mi)
+				fixed = b[i].path;
+		if (fixed) {
+			kstrncpy(out, fixed, cap);
+			out[cap - 1] = 0;
+			return ST_OK;
+		}
+		if (ma == 13 && mi >= 64) {
+			ksnprintf(out, cap, "/dev/input/event%u", mi - 64);
+			return ST_OK;
+		}
+		if (ma == 136) {
+			ksnprintf(out, cap, "/dev/pts/%u", mi);
+			return ST_OK;
+		}
+	}
+	uint64_t fl;
+	spin_lock_irqsave(&g_nodes_lock, &fl);
+	for (int i = 0; i < DEVFS_MAX_NODES; i++) {
+		struct devfs_node *n = g_nodes[i];
+		if (!n || n->is_dir || n->is_link)
+			continue;
+		if (!!n->is_blk != !!is_blk || n->major != ma || n->minor != mi)
+			continue;
+		kstrncpy(out, n->path, cap);
+		out[cap - 1] = 0;
+		found = 1;
+		break;
+	}
+	spin_unlock_irqrestore(&g_nodes_lock, fl);
+	return found ? ST_OK : ST_NOT_FOUND;
 }
 
 int devfs_chdir(const char *path)

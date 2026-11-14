@@ -1,0 +1,703 @@
+NVME(1)                           NVMe Manual                          NVME(1)
+
+NAME
+       nvme - the NVMe storage command line interface utility (nvme-cli)
+
+SYNOPSIS
+       built-in plugin:
+
+       nvme <command> <device> [<args>]
+
+       extension plugins:
+
+       nvme <plugin> <command> <device> [<args>]
+
+DESCRIPTION
+       NVM-Express is a fast, scalable host controller interface designed to
+       address the needs for not only PCI Express based solid state drives,
+       but also NVMe-oF(over fabrics).
+
+       This nvme program is a user space utility to provide standards
+       compliant tooling for NVM-Express drives. It was made specifically for
+       Linux as it relies on the IOCTLs defined by the mainline kernel driver.
+
+NVME COMMANDS
+       The utility has sub-commands for all admin and io commands defined in
+       the specification and for displaying controller registers. There is
+       also an option to submit completely arbitrary commands. For a list of
+       commands available, run "nvme help".
+
+NVME CLI SUB-COMMANDS
+   Main commands
+       nvme-admin-passthru(1)
+           Admin Passthrough Command
+
+       nvme-compare(1)
+           IO Compare
+
+       nvme-error-log(1)
+           Retrieve error logs
+
+       nvme-flush(1)
+           Submit flush
+
+       nvme-dsm(1)
+           Submit Data Set Management
+
+       nvme-format(1)
+           Format namespace(s)
+
+       nvme-fw-activate(1)
+           F/W Activate (in old version < 1.2)
+
+       nvme-fw-commit(1)
+           F/W Commit (in > 1.2)
+
+       nvme-fw-download(1)
+           F/W Download
+
+       nvme-fw-log(1)
+           Retrieve f/w log
+
+       nvme-get-feature(1)
+           Get Features
+
+       nvme-get-log(1)
+           Generic Get Log
+
+       nvme-telemetry-log(1)
+           Telemetry Host-Initiated Log
+
+       nvme-changed-ns-list-log(1)
+           Retrieve Changed Namespace List Log
+
+       nvme-smart-log(1)
+           Retrieve Smart Log
+
+       nvme-ana-log(1)
+           Retrieve ANA(Asymmetric Namespace Access) Log
+
+       nvme-endurance-log(1)
+           Retrieve endurance Log
+
+       nvme-effects-log(1)
+           Retrieve effects Log
+
+       nvme-self-test-log(1)
+           Retrieve Device Self-test Log
+
+       nvme-get-ns-id(1)
+           Retrieve namespace identifier
+
+       nvme-help(1)
+           NVMe CLI Help
+
+       nvme-id-ctrl(1)
+           Identify Controller
+
+       nvme-id-ns(1)
+           Identify Namespace
+
+       nvme-id-nvmset(1)
+           Identify NVM Set List
+
+       nvme-id-iocs(1)
+           Identify I/O Command Set
+
+       nvme-create-ns(1)
+           Create a new namespace
+
+       nvme-delete-ns(1)
+           Delete existing namespace
+
+       nvme-attach-ns(1)
+           Attach namespace
+
+       nvme-detach-ns(1)
+           Detach namespace
+
+       nvme-io-passthru(1)
+           IO Passthrough Command
+
+       nvme-list-ns(1)
+           List all nvme namespaces
+
+       nvme-ns-descs(1)
+           Identify Namespace Identification Descriptor
+
+       nvme-list(1)
+           List all nvme controllers
+
+       nvme-list-ctrl(1)
+           List controller in NVMe subsystem
+
+       nvme-list-subsys(1)
+           List NVMe subsystems
+
+       nvme-reset(1)
+           Reset a NVMe controller
+
+       nvme-device-self-test(1)
+           Issue Device Self-test Command
+
+       nvme-read(1)
+           Issue IO Read Command
+
+       nvme-write(1)
+           Issue IO Write Command
+
+       nvme-write-zeroes(1)
+           Issue IO Write Zeroes Command
+
+       nvme-write-uncor(1)
+           Issue IO Write Uncorrectable Command
+
+       nvme-resv-acquire(1)
+           Acquire Namespace Reservation
+
+       nvme-resv-register(1)
+           Register Namespace Reservation
+
+       nvme-resv-release(1)
+           Release Namespace Reservation
+
+       nvme-resv-report(1)
+           Report Reservation Capabilities
+
+       nvme-security-recv(1)
+           Security Receive
+
+       nvme-security-send(1)
+           Security Send
+
+       nvme-dsm(1)
+           Issue Data Set Management Command
+
+       nvme-copy(1)
+           Issue Simple Copy Command
+
+       nvme-set-feature(1)
+           Set Feature
+
+       nvme-show-regs(1)
+           Show NVMe Controller Registers
+
+       nvme-discover(1)
+           Send Get Log Page request to Discovery Controller
+
+       nvme-connect-all(1)
+           Discover and connect to all NVMe-over-Fabrics subsystems
+
+       nvme-connect(1)
+           Connect to an NVMe-over-Fabrics subsystem
+
+       nvme-dim(1)
+           Send Discovery Information Management command to a Discovery
+           Controller
+
+       nvme-disconnect(1)
+           Disconnect from an NVMe-over-Fabrics subsystem
+
+       nvme-disconnect-all(1)
+           Disconnect from all NVMe-over-Fabrics subsystems
+
+       nvme-get-property(1)
+           Reads and shows NVMe-over-Fabrics controller property
+
+       nvme-media-unit-stat-log(1)
+           Retrieve and show the configuration and wear of media units
+
+       nvme-supported-cap-config-log(1)
+           Retrieve and show the list of Supported Capacity Configuration
+           Descriptors
+
+       nvme-boot-part-log(1)
+           Retrieve Boot Partition Log
+
+       nvme-capacity-mgmt(1)
+           Capacity Management Command
+
+       nvme-check-dhchap-key(1)
+           Generate NVMeoF DH-HMAC-CHAP host key
+
+       nvme-check-tls-key(1)
+           Validate NVMeoF TLS PSK
+
+       nvme-cmdset-ind-id-ns(1)
+           I/O Command Set Independent Identify Namespace
+
+       nvme-endurance-event-agg-log(1)
+           Retrieve Endurance Group Event Aggregate Log
+
+       nvme-fid-support-effects-log(1)
+           Retrieve FID Support and Effects log
+
+       nvme-gen-dhchap-key(1)
+           Generate NVMeoF DH-HMAC-CHAP host key
+
+       nvme-gen-hostnqn(1)
+           Generate NVMeoF host NQN
+
+       nvme-gen-tls-key(1)
+           Generate NVMeoF TLS PSK
+
+       nvme-get-lba-status(1)
+           Get LBA Status command
+
+       nvme-id-domain(1)
+           NVMe Identify Domain List
+
+       nvme-id-ns-lba-format(1)
+           NVMe Identify Namespace for the specified LBA Format index
+
+       nvme-lba-status-log(1)
+           Retrieve LBA Status Information Log
+
+       nvme-list-endgrp(1)
+           NVMe Identify Endurance Group List
+
+       nvme-ns-rescan(1)
+           Rescans the NVME namespaces
+
+       nvme-nvm-id-ctrl(1)
+           NVMe Identify Controller NVM Command Set
+
+       nvme-nvm-id-ns(1)
+           NVMe Identify Namespace NVM Command Set
+
+       nvme-nvm-id-ns-lba-format(1)
+           NVMe Identify Namespace NVM Command Set for the specified LBA
+           Format index
+
+       nvme-persistent-event-log(1)
+           Retrieve Persistent Event Log
+
+       nvme-predictable-lat-log(1)
+           Retrieve Predictable Latency per Nvmset Log
+
+       nvme-pred-lat-event-agg-log(1)
+           Retrieve Predictable Latency Event Aggregate Log
+
+       nvme-primary-ctrl-caps(1)
+           NVMe Identify Primary Controller Capabilities
+
+       nvme-reset(1)
+           Resets the controller
+
+       nvme-rpmb(1)
+           Replay Protection Memory Block commands
+
+       nvme-sanitize-log(1)
+           Retrieve sanitize log
+
+       nvme-set-property(1)
+           Set a property and show the resulting value
+
+       nvme-show-hostnqn(1)
+           Show NVMeoF host NQN
+
+       nvme-subsystem-reset(1)
+           Resets the subsystem
+
+       nvme-supported-log-pages(1)
+           Retrieve the Supported Log pages details
+
+       nvme-verify(1)
+           verify command
+
+       nvme-show-topology(1)
+           Show NVMe topology
+
+   Plugins/Vendor extension commands
+       nvme-intel-id-ctrl(1)
+           Intel - NVMe Identify Controller
+
+       nvme-intel-internal-log(1)
+           Retrieve Intel device's internal log and save to file
+
+       nvme-intel-lat-stats(1)
+           Retrieve NVMe Identify Controller, return result and structure
+
+       nvme-intel-market-name(1)
+           Intel vendor specific marketing name log page
+
+       nvme-intel-smart-log-add(1)
+           NVMe Intel Additional SMART log page
+
+       nvme-intel-temp-stats(1)
+           NVMe Intel Additional SMART log page for temp stats
+
+       nvme-huawei-id-ctrl(1)
+           NVMe huawei Identify Controller
+
+       nvme-huawei-list(1)
+           List all recognized Huawei NVMe devices
+
+       nvme-dera-stat(1)
+           NVMe Dera Device status and Additional SMART log page request
+
+       nvme-micron-clear-pcie-errors(1)
+           Clears correctable PCIe correctable errors of given Micron device
+
+       nvme-micron-internal-log(1)
+           Retrieve Micron device's internal logs and save to given zip file
+
+       nvme-micron-nand-stats(1)
+           Retrieves NAND statistics of given micron device
+
+       nvme-micron-pcie-stats(1)
+           Retrieves pcie error statistics for given micron device
+
+       nvme-micron-selective-download(1)
+           Performs selective firmware download
+
+       nvme-micron-smart-add-log(1)
+           Retrieves NAND statistics
+
+       nvme-micron-temperature-stats(1)
+           Retrieves temperature information of given micron device
+
+       nvme-ocp-internal-log(1)
+           Retrieves and parses OCP Telemetry DA1 and DA2 logs.
+
+       nvme-ocp-telemetry-string-log(1)
+           Retrieves and parses OCP Telemetry String Log page.
+
+       nvme-netapp-ontapdevices(1)
+           Display information about ONTAP devices
+
+       nvme-netapp-smdevices(1)
+           Display information for each NVMe path to an E-Series volume
+
+       nvme-sndk-capabilities(1)
+           Display Sandisk plugin command capabilities
+
+       nvme-sndk-clear-assert-dump(1)
+           Clears the assert dump (if present)
+
+       nvme-sndk-clear-fw-activate-history(1)
+           Clears the firmware activate history table
+
+       nvme-sndk-clear-pcie-correctable-errors(1)
+           Clears the pcie correctable errors returned in the smart-log-add
+           command
+
+       nvme-sndk-cloud-SSD-plugin-version(1)
+           Display Sandisk plugin Cloud SSD Plugin Version
+
+       nvme-sndk-cloud-boot-SSD-version(1)
+           Display Sandisk Cloud Boot SSD Version
+
+       nvme-sndk-cu-smart-log(1)
+           Display Sandisk Customer Unique Smart log pagee
+
+       nvme-sndk-drive-resize(1)
+           Send NVMe Sandisk Resize Vendor Unique Command
+
+       nvme-sndk-get-drive-status(1)
+           Send the NVMe Sandisk get-drive-status command
+
+       nvme-sndk-get-dev-capabilities-log(1)
+           Display device capabilities og page data in human readable format
+
+       nvme-sndk-get-error-recovery-log(1)
+           Display error recovery log page data in human readable format
+
+       nvme-sndk-get-latency-monitor-log(1)
+           Display latency monitor log page data in human readable format
+
+       nvme-sndk-get-unsupported-reqs-log(1)
+           Display unsupported requirements log page data in human readable
+           format
+
+       nvme-sndk-log-page-directory(1)
+           Retrieves the list of Log IDs supported by the drive
+
+       nvme-sndk-namespace-resize(1)
+           Resizes the device's namespace
+
+       nvme-sndk-set-latency-monitor-feature(1)
+           Set Latency Monitor feature
+
+       nvme-sndk-vs-cloud-log(1)
+           Display the cloud log page
+
+       nvme-sndk-vs-device-waf(1)
+           Display calculated device Write Amplication Factor
+
+       nvme-sndk-vs-drive-info(1)
+           Send the NVMe Sandisk vs-drive-info command
+
+       nvme-sndk-vs-error-reason-identifier(1)
+           Retrieve Sandisk device's telemetry log error reason identifier
+           field
+
+       nvme-sndk-vs-fw-activate-history(1)
+           Execute NVMe Sandisk vs-fw-activate-history Vendor Unique Command
+
+       nvme-sndk-vs-hw-rev-log(1)
+           Display hardware revision log page
+
+       nvme-sndk-vs-internal-log(1)
+           Retrieve Sandisk device's internal firmware log and save to file
+
+       nvme-sndk-vs-nand-stats(1)
+           Send NVMe Sandisk vs-nand-stats Vendor Unique Command
+
+       nvme-sndk-vs-pcie-stats(1)
+           Send the NVMe Sandisk vs-pcie-stats command
+
+       nvme-sndk-vs-smart-add-log(1)
+           Send NVMe Sandisk smart add log Vendor Unique Command
+
+       nvme-sndk-vs-telemetry-controller-option(1)
+           Disable/Enable the controller initiated option of the telemetry log
+           page
+
+       nvme-sndk-vs-temperature-stats(1)
+           Display temperature-related statistics
+
+       nvme-toshiba-clear-pcie-correctable-errors(1)
+           Reset the PCIe correctable errors count to zero
+
+       nvme-toshiba-vs-internal-log(1)
+           Retrieve a Toshiba device's vendor specific internal log
+
+       nvme-toshiba-vs-smart-add-log(1)
+           Retrieve a Toshiba device's vendor specific extended SMART log page
+
+       nvme-transcend-badblock(1)
+           Retrieve Transcend NVMe device's bad blocks
+
+       nvme-transcend-healthvalue(1)
+           Use NVMe SMART table to analyze the health value of Transcend
+           device
+
+       nvme-virtium-show-identify(1)
+           Show a complete detail of identify device information in json
+           format
+
+       nvme-virtium-save-smart-to-vtview-log(1)
+           Periodically save smart attributes into a log file
+
+       nvme-wdc-cap-diag(1)
+           Retrieve WDC device's diagnostic log and save to file
+
+       nvme-wdc-capabilities(1)
+           Display WDC plugin command capabilities
+
+       nvme-wdc-clear-assert-dump(1)
+           Clears the assert dump (if present)
+
+       nvme-wdc-clear-fw-activate-history(1)
+           Clears the firmware activate history table
+
+       nvme-wdc-clear-pcie-corr(1)
+           Clears the pcie correctable errors field
+
+       nvme-wdc-clear-pcie-correctable-errors(1)
+           Clears the pcie correctable errors returned in the smart-log-add
+           command
+
+       nvme-wdc-cloud-SSD-plugin-version(1)
+           Display WDC plugin Cloud SSD Plugin Version
+
+       nvme-wdc-cu-smart-log(1)
+           Display WDC plugin Customer Unique Log Page
+
+       nvme-wdc-drive-essentials(1)
+           Retrieve WDC device's drive essentials bin files
+
+       nvme-wdc-drive-log(1)
+           Retrieve WDC device's drive log and save to file
+
+       nvme-wdc-drive-resize(1)
+           Send NVMe WDC Resize Vendor Unique Command
+
+       nvme-wdc-enc-get-log(1)
+           Send NVMe WDC enc-get-log Vendor Unique Command
+
+       nvme-wdc-get-crash-dump(1)
+           Retrieve WDC device's crash dump
+
+       nvme-wdc-get-drive-status(1)
+           Send the NVMe WDC get-drive-status command
+
+       nvme-wdc-get-latency-monitor-log(1)
+           Display latency monitor log page data in human readable format
+
+       nvme-wdc-get-pfail-dump(1)
+           Retrieve WDC device's pfail crash dump
+
+       nvme-wdc-id-ctrl(1)
+           Send NVMe Identify Controller, return result and structure
+
+       nvme-wdc-log-page-directory(1)
+           Retrieves the list of Log IDs supported by the drive
+
+       nvme-wdc-namespace-resize(1)
+           Resizes the device's namespace
+
+       nvme-wdc-purge-monitor(1)
+           Send NVMe WDC Purge-Monitor Vendor Unique Command
+
+       nvme-wdc-purge(1)
+           Send NVMe WDC Purge Vendor Unique Command
+
+       nvme-wdc-smart-add-log(1)
+           Send NVMe WDC smart add log Vendor Unique Command
+
+       nvme-wdc-vs-drive-info(1)
+           Send the NVMe WDC vs-drive-info command
+
+       nvme-wdc-vs-error-reason-identifier(1)
+           Retrieve WDC device's telemetry log error reason identifier field
+
+       nvme-wdc-vs-fw-activate-history(1)
+           Execute NVMe WDC vs-fw-activate-history Vendor Unique Command
+
+       nvme-wdc-vs-internal-log(1)
+           Retrieve WDC device's internal firmware log and save to file
+
+       nvme-wdc-vs-nand-stats(1)
+           Send NVMe WDC vs-nand-stats Vendor Unique Command
+
+       nvme-wdc-vs-telemetry-controller-option(1)
+           Disable/Enable the controller initiated option of the telemetry log
+           page
+
+       nvme-wdc-vs-temperature-stats(1)
+           Display temperature-related statistics
+
+       nvme-zns-changed-zone-list(1)
+           Retrieve Changed Zone log for the given device
+
+       nvme-zns-close-zone(1)
+           Closes one or all zones
+
+       nvme-zns-finish-zone(1)
+           Finishes one or all zones
+
+       nvme-zns-id-ctrl(1)
+           Send NVMe Zoned Command Set Identify Controller
+
+       nvme-zns-id-ns(1)
+           Send NVMe Zoned Command Set Identify Namespace
+
+       nvme-zns-offline-zone(1)
+           Offlines one or all zones
+
+       nvme-zns-open-zone(1)
+           Opens one or all zones
+
+       nvme-zns-report-zones(1)
+           Retrieve and display the Report Zones data structure
+
+       nvme-zns-reset-zone(1)
+           Resets one or all zones
+
+       nvme-zns-set-zone-desc(1)
+           Set extended descriptor data for a zone
+
+       nvme-zns-zone-append(1)
+           Send an NVMe write command, provide results
+
+       nvme-zns-zone-mgmt-recv(1)
+           Zone Management Receive command
+
+       nvme-zns-zone-mgmt-send(1)
+           Zone Management Send command
+
+       nvme-zns-zrwa-flush-zone(1)
+           Flush LBAs associated with a ZRWA to a zone
+
+       nvme-inspur-nvme-vendor-log(1)
+           NVMe Inspur Device Vendor log page request
+
+       nvme-dapustor-smart-log-add(1)
+           NVMe DapuStor Additional SMART log page
+
+       nvme-solidigm-id-ctrl(1)
+           Solidigm - NVMe Identify Controller
+
+       nvme-solidigm-smart-log-add(1)
+           Retrieve Solidigm SMART Log
+
+       nvme-solidigm-vs-internal-log(1)
+           Retrieve Debug log binaries
+
+       nvme-solidigm-garbage-collect-log(1)
+           Retrieve Garbage Collection Log
+
+       nvme-solidigm-market-log(1)
+           Retrieve Market Log
+
+       nvme-solidigm-latency-tracking-log(1)
+           Enable/Retrieve Latency tracking Log
+
+       nvme-solidigm-parse-telemetry-log(1)
+           Parse Telemetry Log binary
+
+       nvme-solidigm-log-page-directory(1)
+           Retrieve log page directory
+
+       nvme-solidigm-temp-stats(1)
+           Retrieve Temperature Statistics log
+
+       nvme-solidigm-vs-drive-info(1)
+           Retrieve drive information
+
+       nvme-solidigm-workload-tracker(1)
+           Real Time capture Workload Tracker samples
+
+       nvme-sed-discover(1)
+           Discover SED Opal Locking Features
+
+       nvme-sed-initialize(1)
+           Initialize a SED Opal Device for locking
+
+       nvme-sed-revert(1)
+           Revert a SED Opal Device from locking
+
+       nvme-sed-lock(1)
+           Lock a SED Opal Device
+
+       nvme-sed-unlock(1)
+           Unlock a SED Opal Device
+
+       nvme-sed-password(1)
+           Change the SED Opal Device password
+
+       nvme-mangoboost-id-ctrl(1)
+           MangoBoost - NVMe Identify Controller
+
+RETURNS
+       All commands will behave the same, they will return 0 on success and 1
+       on failure.
+
+FURTHER DOCUMENTATION
+       See the freely available references on the Official NVM-Express
+       Site[1].
+
+AUTHORS
+       This is written and maintained by Keith Busch[2].
+
+REPORTING BUGS
+       Patches and issues may be submitted to the official repository at
+       https://github.com/linux-nvme/nvme-cli or the Linux NVMe mailing list
+       linux-nvme[3]
+
+NVME
+       Part of the nvme suite
+
+NOTES
+        1. Official NVM-Express Site
+           http://nvmexpress.org
+
+        2. Keith Busch
+           mailto:kbusch@kernel.org
+
+        3. linux-nvme
+           mailto:linux-nvme@lists.infradead.org
+
+NVMe                              11/04/2025                           NVME(1)

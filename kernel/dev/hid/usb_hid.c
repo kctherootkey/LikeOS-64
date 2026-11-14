@@ -1273,13 +1273,8 @@ static int hid_setup_interrupt_endpoint(usbhid_device_t *hdev)
 	// Send Configure Endpoint command
 	uint32_t cmd_control = (TRB_TYPE_CONFIG_EP << 10) | (slot << 24);
 
-	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, cmd_control) !=
-	    ST_OK) {
-		kprintf("[USBHID] Failed to send Configure EP command\n");
-		return ST_ERR;
-	}
-
-	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+	if (xhci_command(ctrl, ctrl->input_ctx_phys, 0, cmd_control, 1000,
+			 NULL, NULL) != ST_OK) {
 		kprintf("[USBHID] Configure Endpoint command failed\n");
 		return ST_ERR;
 	}

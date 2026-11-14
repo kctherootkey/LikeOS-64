@@ -1,0 +1,156 @@
+LIKEOS-INSTALL.CONF(5)           File Formats           LIKEOS-INSTALL.CONF(5)
+
+NAME
+       likeos-install.conf - answers for an unattended LikeOS installation
+
+SYNOPSIS
+       likeos-install --answers file
+
+DESCRIPTION
+       An  answer file holds everything likeos-install(1) would otherwise ask:
+       the disk to install on, the language, the time zone, the keyboard,  the
+       computer's  name,  the  root  password and the account to sign in with.
+       Given with --answers, it makes the installation unattended.
+
+       The file is UTF-8 text with one setting per line,
+
+              key=value
+
+       Blanks around the key and the value are ignored.  Empty lines and lines
+       starting with # are ignored.  A value may be put in double quotes;  in-
+       side  them  \"  stands for a quote, \\ for a backslash and \n for a new
+       line, and blanks and # are kept.  After the closing quote  only  blanks
+       and  a comment may follow.  An unknown key, a bad value or a line with-
+       out = stops the installation before anything is changed, with the  file
+       name and line number.
+
+       Every key may be left out; the default is given below.
+
+KEYS
+   The disk
+       disk=device|auto
+              The  disk  to  install  on: /dev/sda, sda or /dev/nvme0n1.  auto
+              (the default) takes the only disk LikeOS can  be  installed  on,
+              and  is  refused  when there is more than one.  The disk the in-
+              staller was started from cannot be chosen.
+
+       whole_disk=yes|no
+              yes (the default) erases the whole disk: a  new  GUID  partition
+              table, an EFI system partition of 512 MiB (FAT32) and the LikeOS
+              root  file system (ext4) in the rest.  no installs on one parti-
+              tion of the disk, given with root_partition;  the  other  parti-
+              tions are kept.
+
+       root_partition=n
+              With  whole_disk=no: the number of the partition LikeOS goes to.
+              It is formatted with ext4 (everything on it is lost) and must be
+              large enough for the system.  The disk must have an  EFI  system
+              partition  (FAT, at least 100 MB) apart from it; the boot loader
+              is put there next to what it holds already.
+
+       reboot=yes|no
+              Restart the computer into the installed system  when  done  (de-
+              fault yes).
+
+   Language and region
+       locale=locale
+              The  language of the installed system, as a locale name (default
+              en_US.UTF-8).
+
+       time_format=locale
+              How dates, times and numbers are shown (default en_US.UTF-8).
+
+       timezone=zone
+              The time zone,  as  a  name  of  the  time  zone  database:  Eu-
+              rope/Berlin, America/New_York, UTC (the default).
+
+   Keyboard
+       keyboard=layout[,layout...]
+              The  keyboard  layouts,  up to four, separated by commas, as XKB
+              layout names: us, de, fr, gb ... (default us).  With  more  than
+              one, Alt+Shift switches between them.
+
+       keyboard_variant=variant[,variant...]
+              The  variant of each layout, in the same order, an empty one for
+              the layout's own: nodeadkeys, for keyboard=de,us.   When  given,
+              there must be as many as there are layouts.
+
+       keyboard_options=options
+              XKB options, separated by commas (grp:alt_shift_toggle, caps:es-
+              cape...).
+
+   This computer
+       hostname=name
+              The  computer's  name:  letters, digits and hyphens, at most 63,
+              with at least one letter, not starting or ending with a  hyphen,
+              no  dots  (no domain) and not localhost.  The default is likeos-
+              followed by four random hexadecimal digits.
+
+       root_password=password
+              The password of root, as plain text.
+
+       root_password_hash=hash
+              The password of root as a crypt(3) hash ($y$...   yescrypt,  $6$
+              ...),  used  when root_password is not given.  One of the two is
+              required.
+
+   The account
+       The account to  sign  in  with.   It  is  created  when  user_name  (or
+       user_fullname) is given, and then needs a password too.
+
+       user_fullname=name
+              The full name of the person ("Erika Mustermann").
+
+       user_name=name
+              The  user  name:  lower-case letters, digits, hyphens and under-
+              scores, starting with a letter or an underscore, at most 32, and
+              not the name of a system account.
+
+       user_password=password
+              The account's password, as plain text.
+
+       user_password_hash=hash
+              The account's password as a crypt(3) hash, used when  user_pass-
+              word is not given.
+
+       user_extra_groups=yes|no
+              Put  the  account in the groups audio, render and users (default
+              yes), so it can play sound and use the graphics hardware.
+
+SECURITY
+       An answer file with plain-text passwords gives them to anyone  who  can
+       read  it.  Prefer the _hash keys; files the installer saves itself have
+       mode 0600 and hold hashes unless asked to keep the plain passwords.
+
+EXAMPLE
+       # likeos-install.conf -- answers for an unattended LikeOS installation
+       # (likeos-install --answers FILE).  See likeos-install.conf(5).
+
+       disk=/dev/nvme0n1
+       whole_disk=yes
+       reboot=yes
+
+       # Language, formats, time zone
+       locale=de_DE.UTF-8
+       time_format=de_DE.UTF-8
+       timezone=Europe/Berlin
+
+       # Keyboard
+       keyboard=de,us
+       keyboard_variant=nodeadkeys,
+       keyboard_options=grp:alt_shift_toggle
+
+       # This computer
+       hostname=office-pc
+       root_password_hash=$y$j9T$...
+
+       # Your account
+       user_fullname="Erika Mustermann"
+       user_name=erika
+       user_password_hash=$y$j9T$...
+       user_extra_groups=yes
+
+SEE ALSO
+       likeos-install(1), likeos-installer(1), crypt(3), fstab(5)
+
+LikeOS                           November 2026          LIKEOS-INSTALL.CONF(5)

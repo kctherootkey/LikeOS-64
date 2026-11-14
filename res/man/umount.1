@@ -1,0 +1,79 @@
+UMOUNT(1)                    System Administration                   UMOUNT(1)
+
+NAME
+       umount - unmount file systems
+
+SYNOPSIS
+       umount [-flnrv] directory|source...
+       umount -a [-flnrv] [-t types]
+
+DESCRIPTION
+       umount detaches mounted file systems: what mount(1) attached.  Each ar-
+       gument is a mount point, or the source a file system is mounted from --
+       a  device  (/dev/sdb1)  or  a tag naming one (UUID=, LABEL=, PARTUUID=,
+       PARTLABEL=).  When several file systems are  mounted  on  top  of  each
+       other at one directory, the topmost is unmounted.
+
+       Before  a  file  system  is  detached, what is still buffered for it is
+       written; a file system on which  files  are  open,  or  which  is  some
+       process's working directory, is busy and stays mounted (see -l and -r).
+
+       Unmounting needs root.
+
+OPTIONS
+       -a, --all
+              Unmount every file system that can be, the most recently mounted
+              first:  everything  but  the  root  and the kernel's own (/proc,
+              /sys, /dev).
+
+       -t, --types list
+              With -a: only the file systems of these types (separated by com-
+              mas; a no prefix excludes a type).
+
+       -f, --force
+              Force the unmount.  Accepted for compatibility:  files  open  on
+              the file system still keep it busy.
+
+       -l, --lazy
+              Detach  the  file  system now, and finish unmounting it when the
+              last file open on it is closed.
+
+       -r, --read-only
+              When the file system is busy, mount it read-only instead.
+
+       -n, --no-mtab
+              Accepted; there is no /etc/mtab to update.
+
+       -v, --verbose
+              Say what is unmounted.
+
+       -h, --help
+              Show a summary of the options.
+
+       -V, --version
+              Show the version.
+
+EXIT STATUS
+       0      Success.
+
+       1      Wrong usage, or no permission.
+
+       2      A system error.
+
+       32     The unmount failed.
+
+       64     Some of several unmounts failed.
+
+FILES
+       /proc/mounts
+              What is mounted now.
+
+EXAMPLES
+       umount /mnt
+       umount LABEL=STICK
+       umount -l /media/stick
+
+SEE ALSO
+       mount(1), fstab(5)
+
+LikeOS                           November 2026                       UMOUNT(1)

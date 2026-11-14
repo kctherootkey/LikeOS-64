@@ -131,12 +131,42 @@ typedef struct vfs_sb_ops {
 struct vfs_superblock {
 	const vfs_sb_ops_t *ops;
 	void *fs_private; /* fat32_fs_t*, ext4_fs_t*, ...        */
+	/* Unmount handshake with the page cache's writeback.  pc_dying is set
+	 * (under the cache's LRU and dirty-list locks) when the filesystem is
+	 * going away: no writeback pass takes its pages after that.
+	 * pc_wb_active counts the passes that took some before, and the
+	 * unmount waits for it to reach zero before the superblock is freed.
+	 * Both start at zero with the zeroed filesystem structure. */
+	volatile int pc_dying;
+	volatile int pc_wb_active;
 };
 
 /* Globally-registered root superblock.  Installed by the FS mount path
  * (fat32_mount today, ext4_mount tomorrow).  NULL before mount.  The
  * caches use this when they need to flush back without an explicit sb. */
 extern vfs_superblock_t *g_root_sb;
+
+/* Enter / leave a stretch of cache code that calls into a filesystem it found
+ * through a cached object rather than through an operation on the filesystem
+ * itself (writeback, a whole-cache inode flush).  enter() answers 0 when the
+ * filesystem is being unmounted, and then nothing may be done with it.  The
+ * count is raised before the flag is read and the unmount sets the flag
+ * before it reads the count, both in sequential consistency, so either the
+ * caller sees the flag or the unmount sees the caller. */
+static inline int vfs_sb_teardown_enter(vfs_superblock_t *sb)
+{
+	__atomic_add_fetch(&sb->pc_wb_active, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&sb->pc_dying, __ATOMIC_SEQ_CST)) {
+		__atomic_sub_fetch(&sb->pc_wb_active, 1, __ATOMIC_SEQ_CST);
+		return 0;
+	}
+	return 1;
+}
+
+static inline void vfs_sb_teardown_exit(vfs_superblock_t *sb)
+{
+	__atomic_sub_fetch(&sb->pc_wb_active, 1, __ATOMIC_SEQ_CST);
+}
 
 /* Convenience wrappers (compile-out at -O). */
 static inline unsigned long vfs_sb_block_size(vfs_superblock_t *sb)

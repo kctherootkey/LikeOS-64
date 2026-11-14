@@ -1,0 +1,157 @@
+LIKEOS-EFIBOOT(1)            System Administration           LIKEOS-EFIBOOT(1)
+
+NAME
+       likeos-efiboot - show and edit the firmware's boot entries
+
+SYNOPSIS
+       likeos-efiboot [--list] [-v]
+       likeos-efiboot  --create --disk dev --part n --loader path --label text
+       [--first] [--options text]
+       likeos-efiboot --delete num
+       likeos-efiboot --active num | --inactive num
+       likeos-efiboot --bootorder num,num,...  [--force]
+       likeos-efiboot --bootnext num | --delete-bootnext
+       likeos-efiboot --timeout seconds | --delete-timeout
+
+DESCRIPTION
+       likeos-efiboot shows and changes the boot entries of a computer's  UEFI
+       firmware:  the  list  the firmware's boot menu offers, and the order in
+       which it tries them when nobody chooses.
+
+       The firmware keeps these settings in UEFI variables of the  EFI  global
+       variable  GUID:  Boot#### (one load option per entry: whether it is ac-
+       tive, its label, the device path of the loader it starts, and  optional
+       data  passed  to  the loader), BootOrder (the entries in the order they
+       are tried), BootNext (one  entry  to  try  on  the  next  start  only),
+       BootCurrent (the entry the running system was started from) and Timeout
+       (how  many  seconds  the  firmware's own menu waits).  The kernel shows
+       every variable as a file in /sys/firmware/efi/efivars;  on  a  computer
+       started without UEFI, or with efi=noruntime on the kernel command line,
+       the  directory  does  not exist and likeos-efiboot says so (exit status
+       2).
+
+       Without an action, or with --list, the entries are shown:  BootCurrent,
+       BootNext,  the timeout and the boot order, then one line per entry with
+       its number, an asterisk when it is active, its  label  and  the  device
+       path  of the loader it starts.  With -v each entry's attributes and op-
+       tional data are shown too.
+
+       Several actions may be given at once; they run  in  the  order  create,
+       delete,  active/inactive,  bootorder,  bootnext, timeout.  Changing the
+       variables needs root.
+
+ACTIONS
+       --list Show the boot entries (the default).
+
+       -c, --create
+              Create a boot entry for a loader on an EFI system partition,  as
+              a   freshly   installed   system  needs  one:  the  device  path
+              HD(n,GPT,guid,start,size)/File(loader) is taken from the  parti-
+              tion table of the disk given with --disk, and the entry gets the
+              label given with --label.  An entry that already starts the same
+              loader  from the same partition is reused rather than duplicated
+              (and given the new label and options).   Needs  --disk,  --part,
+              --loader and --label.
+
+       -B, --delete num
+              Delete entry num and take it out of the boot order.
+
+       -a, --active num
+              Mark entry num active: the firmware tries it.
+
+       -A, --inactive num
+              Mark  entry  num inactive: it stays in the list but the firmware
+              passes over it.
+
+       -o, --bootorder num,num,...
+              Set the boot order.  Numbers of entries that do  not  exist  are
+              refused unless --force is given.
+
+       -n, --bootnext num
+              Start  entry  num  on  the next start only; the firmware deletes
+              BootNext when it uses it.
+
+       -N, --delete-bootnext
+              Cancel BootNext.
+
+       -t, --timeout seconds
+              Set how long the firmware's own boot menu waits.
+
+       -T, --delete-timeout
+              Remove the timeout setting (the firmware's default applies).
+
+CREATE OPTIONS
+       -d, --disk dev
+              The  disk  that  holds  the  EFI  system  partition   (/dev/sda,
+              /dev/nvme0n1).
+
+       -p, --part n
+              The number of the EFI system partition on it.
+
+       -l, --loader path
+              The   loader's   path   on  that  partition,  with  backslashes:
+              \EFI\LIKEOS\BOOTX64.EFI.
+
+       -L, --label text
+              The name the firmware's boot menu shows.
+
+       -f, --first
+              Put the entry first in the boot order (otherwise it is added  at
+              the end).
+
+       -u, --options text
+              Optional data passed to the loader (as UCS-2 text).
+
+OPTIONS
+       --force
+              Accept entry numbers in --bootorder that have no entry.
+
+       -q, --quiet
+              Report errors only.
+
+       -v, --verbose
+              Show the attributes and optional data of the entries too.
+
+       -h, --help
+              Show a summary of the actions and options.
+
+       --version
+              Show the version.
+
+       num  is  a  hexadecimal entry number: 3, 0003 and Boot0003 are the same
+       entry.
+
+EXIT STATUS
+       0      Success.
+
+       1      The action failed.
+
+       2      Wrong usage, or the system has no UEFI variables.
+
+ENVIRONMENT
+       LIKEOS_EFIVARS_DIR
+              A directory used  in  place  of  /sys/firmware/efi/efivars  (for
+              tests).
+
+FILES
+       /sys/firmware/efi/efivars/Name-GUID
+              One UEFI variable: four bytes of attributes (little-endian) fol-
+              lowed  by  its value.  Writing the file in one write(2) sets the
+              variable, unlink(2) deletes it.
+
+EXAMPLES
+       The entry the installer creates for a  LikeOS  installation  whose  EFI
+       system partition is the first partition of /dev/nvme0n1:
+
+              likeos-efiboot --create --disk /dev/nvme0n1 --part 1 \
+                      --loader '\EFI\LIKEOS\BOOTX64.EFI' \
+                      --label LikeOS --first
+
+       Start entry 0004 once, on the next start:
+
+              likeos-efiboot --bootnext 4
+
+SEE ALSO
+       likeos-install(1), likeos-gpt(1)
+
+LikeOS                           November 2026               LIKEOS-EFIBOOT(1)

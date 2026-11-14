@@ -424,6 +424,12 @@ struct pfs_node *sysfs_mkdir(const char *path)
 	return pfs_mkdir(&g_sysfs, path);
 }
 
+struct pfs_node *sysfs_add_node(const char *path, enum pfs_type type,
+				const struct pfs_node *tmpl)
+{
+	return pfs_add_node(&g_sysfs, path, type, tmpl);
+}
+
 void sysfs_init(void)
 {
 	int count = 0;
@@ -453,5 +459,9 @@ void sysfs_init(void)
 	/* /sys/block, /sys/class/block, /sys/dev/block and the disk power
 	 * trigger: directories the block layer fills from its registry. */
 	blk_sysfs_init();
-	vfs_register_mount("/sys", pfs_ops(&g_sysfs));
+	vfs_register_mount("/sys", pfs_ops(&g_sysfs), "sysfs", &g_sysfs,
+			   /* Shown as the conventional options, but not
+			    * enforced: a program re-executes itself through
+			    * /proc/self/exe, which lexically is below here. */
+			   0, "ro,nosuid,nodev,noexec", 1);
 }

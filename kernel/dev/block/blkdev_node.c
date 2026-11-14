@@ -704,8 +704,12 @@ static long blkdev_xfer_flags(struct blk_file *bf, void *ubuf, long bytes,
 		return -EINVAL;
 	if (bytes == 0)
 		return 0;
+	/* The device was unplugged under the open file: an I/O error, as
+	 * for any request to it; a disk deleted otherwise is just gone. */
 	if (bdev->flags & BDEV_F_DEAD)
-		return -ENODEV;
+		return (bdev->disk && (disk_flags(bdev->disk) & GENHD_FL_GONE)) ?
+			       -EIO :
+			       -ENODEV;
 	if (write) {
 		if (!blk_open_writable(bf->flags))
 			return -EBADF;

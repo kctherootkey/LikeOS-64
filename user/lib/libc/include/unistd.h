@@ -175,6 +175,12 @@ int readlink(const char* path, char* buf, size_t bufsiz);
 ssize_t readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz);
 int chown(const char* path, int owner, int group);
 int fchown(int fd, int owner, int group);
+int lchown(const char* path, uid_t owner, gid_t group);
+int fchownat(int dirfd, const char* path, uid_t owner, gid_t group, int flags);
+int linkat(int olddirfd, const char* oldpath, int newdirfd,
+	   const char* newpath, int flags);
+int symlinkat(const char* target, int newdirfd, const char* linkpath);
+int syncfs(int fd);
 
 // Timestamp operations
 #include <time.h>

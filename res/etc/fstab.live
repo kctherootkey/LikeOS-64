@@ -1,0 +1,14 @@
+# /etc/fstab -- the filesystems of the LikeOS live medium
+#
+# Read by init at start-up, and by mount and umount.  One filesystem per
+# line, six fields separated by blanks:
+#
+#   <file system>  <mount point>  <type>  <options>  <dump>  <pass>
+#
+# The root (the live medium's ext4 partition) and /ram (the RAM filesystem
+# luakit keeps its caches and databases in) are mounted by the kernel and
+# need no line here.  Every line that is not marked noauto is mounted at
+# start-up, after the filesystems with a pass number above 0 have been
+# checked.  See fstab(5).
+#
+# Copyright (C) 2026 The LikeOS Project

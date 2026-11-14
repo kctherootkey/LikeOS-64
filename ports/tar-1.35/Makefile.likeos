@@ -1,0 +1,127 @@
+# Makefile.likeos - build GNU tar 1.35 for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/.  configure is
+# not run: what it decides for the LikeOS libc is recorded in this directory
+# (likeos-survey.sh records it, see there) as
+#   config.h       copied to build/config.h
+#   config.subst   the values config.status would substitute; config-status.sh
+#                  makes build/{gnu,lib,src}/Makefile from upstream's
+#                  Makefile.in with them, as config.status would
+# and upstream's own Makefiles then build gnulib (build/gnu/libgnu.a, with
+# the replacement headers gnulib's rules generate), tar's helper library
+# (build/lib/libtar.a) and the program (build/src/tar).  The compiler, its
+# flags and the link are this file's, passed in as the CC/CFLAGS/CPPFLAGS/
+# LDFLAGS/LIBS values; dependency tracking is off (as with configure
+# --disable-dependency-tracking): build/ is made afresh when the sources or
+# the configuration (config.h, config.subst, this file) change.
+#
+# Program (build/tar), installed to /bin/tar:
+#   GNU tar with POSIX ACLs (--acls, the acl port's libacl.a linked in),
+#   extended attributes (--xattrs), --zstd/-z/-J/... through the compressor
+#   programs, --sparse, the pax/posix, gnu, ustar, v7 and oldgnu formats.
+#   No rmt (remote archives): see config.h.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+
+ROOT := $(abspath ../..)
+LIBC_DIR = $(ROOT)/user/lib/libc
+RTLD_DIR = $(ROOT)/user/lib/rtld
+ACL_DIR = $(ROOT)/ports/acl-2.4.0/build
+ATTR_DIR = $(ROOT)/ports/attr-2.6.0/build
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := $(abspath src)
+B := $(abspath build)
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.  The host gcc's own __linux__ & co.
+# are undefined, as config.h was surveyed: gnulib and tar must not take the
+# code paths of another system.
+TAR_CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+	-mno-red-zone -ffreestanding -fPIE -fno-common \
+	-D_GNU_SOURCE -D__LIKEOS__ \
+	-U__linux__ -U__linux -Ulinux -U__gnu_linux__ \
+	-isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+	-Werror=implicit-function-declaration -Werror=implicit-int
+TAR_CPPFLAGS = -I$(ACL_DIR)/include -I$(ATTR_DIR)/include
+# The link, through the gcc driver as upstream's Makefiles do it: no start
+# files or libraries of the build host, crt1.o first, the libc last.
+TAR_LDFLAGS = -nostdlib -nostartfiles -pie \
+	-Wl,-T,$(ROOT)/user/bin/user_dyn.lds -Wl,--hash-style=gnu \
+	-Wl,-z,now -Wl,-z,relro -Wl,-rpath,/lib \
+	-Wl,-dynamic-linker,/lib/ld-likeos.so \
+	-L$(LIBC_DIR) -L$(RTLD_DIR) -L$(ACL_DIR)/lib $(LIBC_DIR)/crt1.o
+TAR_LIBS = -lacl -lc -l:ld-likeos.so $(LIBGCC)
+
+# What config.status works out per Makefile, and the build's own values.
+SUBST_COMMON = top_builddir=.. top_build_prefix=../ \
+	abs_top_srcdir=$(S) abs_top_builddir=$(B) top_srcdir=$(S) \
+	INSTALL="install -c" MKDIR_P="mkdir -p" \
+	CC="$(CC)" CPP="$(CC) -E" CFLAGS="$(TAR_CFLAGS)" \
+	CPPFLAGS="$(TAR_CPPFLAGS)" LDFLAGS="$(TAR_LDFLAGS)" LIBS="$(TAR_LIBS)" \
+	AMDEP_TRUE="\#" AMDEP_FALSE= am__fastdepCC_TRUE="\#" \
+	am__fastdepCC_FALSE= AMDEPBACKSLASH= AM_DEFAULT_VERBOSITY=1
+subst_for = srcdir=$(S)/$(1) abs_srcdir=$(S)/$(1) builddir=. \
+	abs_builddir=$(B)/$(1) configure_input="Generated from $(1)/Makefile.in by config-status.sh."
+
+SUBDIRS = gnu lib src
+
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(B)/tar
+
+# Re-unpack whenever the tarball or a patch changes; the old build goes
+# with the old sources.
+$(SRC_STAMP): tar-1.35.tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	rm -rf $(B)
+	@touch $@
+
+# config.status's outputs.  config.status itself is only a name the
+# Makefiles' header rules depend on: it is made first, so nothing it is a
+# prerequisite of looks out of date against it.  Without dependency
+# tracking nothing would recompile for a changed configuration, so the
+# build starts over.
+$(B)/config.status: $(SRC_STAMP) config.subst config.h config-status.sh \
+		Makefile.likeos
+	rm -rf $(B)
+	@mkdir -p $(B)
+	printf '#!/bin/sh\n# The configuration is config.h and config.subst of the port.\nexit 0\n' >$@
+	chmod 755 $@
+
+$(B)/config.h: config.h $(B)/config.status
+	cp config.h $@
+
+$(B)/%/Makefile: $(S)/%/Makefile.in $(B)/config.status config.subst config-status.sh
+	@mkdir -p $(dir $@)
+	$(SHELL) ./config-status.sh config.subst $< $@ \
+		$(SUBST_COMMON) $(call subst_for,$*)
+
+TAR_MAKEFILES = $(addprefix $(B)/,$(addsuffix /Makefile,$(SUBDIRS)))
+
+# Upstream's order: gnulib (with its generated headers), tar's library, tar.
+$(B)/tar: $(B)/config.h $(TAR_MAKEFILES) $(ACL_DIR)/lib/libacl.a
+	$(MAKE) -C $(B)/gnu all
+	$(MAKE) -C $(B)/lib all
+	$(MAKE) -C $(B)/src tar
+	cp $(B)/src/tar $@
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean

@@ -1,0 +1,25 @@
+xattrat.c: include the header with struct xattr_args only where the *xattrat
+system calls exist.
+
+The LikeOS libc has no getxattrat/setxattrat/listxattrat/removexattrat
+system call numbers, so the stand-ins in libmisc/xattrat.c compile to their
+ENOSYS branches, which never use struct xattr_args; the header that defines
+it is not part of the libc and is included only when one of the numbers is
+defined.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/libmisc/xattrat.c	2026-11-13 15:12:46.253208586 +0100
++++ b/libmisc/xattrat.c	2026-11-13 15:12:46.272220122 +0100
+@@ -18,8 +18,10 @@
+ */
+ 
+ #include "config.h"
+-#include <linux/xattr.h>
+ #include <sys/syscall.h>
++#if defined(__NR_getxattrat) || defined(__NR_setxattrat)
++#include <linux/xattr.h>
++#endif
+ #include <unistd.h>
+ #include <errno.h>
+ 

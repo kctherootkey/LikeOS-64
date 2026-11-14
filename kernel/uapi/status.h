@@ -31,6 +31,11 @@ typedef enum {
 	ST_XDEV = -20, // the two paths are on different filesystems — maps to EXDEV
 	ST_ISDIR = -21, // a name-only operation (unlink) met a directory — EISDIR
 	ST_NOTDIR = -22, // a directory operation (rmdir) met a non-directory — ENOTDIR
+	ST_LOOP = -23, // too many symbolic links, or one not to be followed — ELOOP
+	ST_LINK = -24, // (inside the VFS only) a filesystem met a symbolic link
+		       // whose target the VFS follows from here (vfs_link_hop)
+	ST_NAMETOOLONG = -25, // a path grew past the longest one — ENAMETOOLONG
+	ST_NXIO = -26, // no such device behind the name (/dev/tty without one) — ENXIO
 } status_t;
 
 #endif // LIKEOS_STATUS_H

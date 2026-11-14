@@ -1,0 +1,306 @@
+#!/bin/sh
+# likeos-installer-session -- the installer on the LikeOS medium's console.
+#
+# Started by init from /etc/inittab.install when the medium was booted with
+# "Install LikeOS" (likeos.mode=install), as root, on the console, and
+# respawned whenever it ends.  Installed as /usr/libexec/likeos-installer-
+# session, on the live medium only.
+#
+# It starts the X server with LikeOS Setup (likeos-installer) and nothing
+# else -- no window manager, no desktop -- through startx, which also gives
+# the display its access cookie.  The session file is
+# /usr/share/likeos/installer/xinitrc; it leaves the installer's exit status
+# in $LIKEOS_INSTALLER_STATUS, since xinit does not pass it on.  Then:
+#
+#   0    the installer finished (it restarts the computer itself; this is
+#        the fallback when that did not happen): restart
+#   10   the person chose to switch the computer off: power off
+#   else the graphical installer could not run or broke down: the console
+#        says so and offers the text-mode installer, likeos-install, which
+#        needs no X server -- so a machine whose graphics do not work can
+#        still be installed
+#
+# Once the text-mode installer has installed LikeOS (and the restart was
+# declined), the session never starts an installer by itself again: it
+# stays in a menu of restart, power off and the console login.  A mark on
+# /ram (memory only, gone at the next start) keeps it there should the
+# session be started again.
+#
+# Every menu first puts the console back into line mode
+# (likeos-install --reset-tty): a text-mode installer that was killed
+# can leave it without echo and line editing.  A console that keeps
+# reporting end of input gets the login prompt instead of a menu.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+INSTALLER_GUI=/usr/bin/likeos-installer
+INSTALLER_CLI=/usr/sbin/likeos-install
+SESSION_RC=/usr/share/likeos/installer/xinitrc
+STATUS_REBOOT=0
+STATUS_POWEROFF=10
+
+# Root's session, whatever init's environment held.
+HOME=/root
+USER=root
+LOGNAME=root
+SHELL=/bin/sh
+export HOME USER LOGNAME SHELL
+# LANG comes from init (/etc/locale.conf); UTF-8 whatever happens.
+LANG=${LANG:-en_US.UTF-8}
+export LANG
+# No accessibility bus: nothing here provides one, and GTK would wait for it.
+NO_AT_BRIDGE=1
+export NO_AT_BRIDGE
+LIKEOS_MODE=install
+export LIKEOS_MODE
+
+# The runtime directory: private to root, on /tmp, made afresh.
+XDG_RUNTIME_DIR=/tmp/runtime-root
+export XDG_RUNTIME_DIR
+if [ -L "$XDG_RUNTIME_DIR" ] || { [ -e "$XDG_RUNTIME_DIR" ] && [ ! -d "$XDG_RUNTIME_DIR" ]; }; then
+	rm -f "$XDG_RUNTIME_DIR"
+fi
+mkdir -p -m 700 "$XDG_RUNTIME_DIR" 2>/dev/null
+chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null
+
+LIKEOS_INSTALLER_STATUS=$XDG_RUNTIME_DIR/likeos-installer.status
+export LIKEOS_INSTALLER_STATUS
+
+# "LikeOS was installed by this session": on /ram, which is in memory,
+# so it does not outlive this start of the medium.  Without /ram there is
+# no mark (the session then only remembers it while it runs).
+INSTALLED_MARK=
+while read -r _dev _dir _type _rest; do
+	if [ "$_dir" = /ram ] && [ "$_type" = tmpfs ]; then
+		INSTALLED_MARK=/ram/.likeos-installer-installed
+	fi
+done 2>/dev/null < /proc/mounts
+
+cd "$HOME" 2>/dev/null || cd /
+
+say() {
+	printf '%s\n' "$*"
+}
+
+# The boot goes on after init starts (graphics firmware, sound): wait until
+# the kernel says it has settled, as the login prompt does, but never more
+# than half a minute.  An X server started in the middle of a display
+# driver's bring-up finds no screen.
+wait_settled() {
+	n=0
+	while [ $n -lt 60 ]; do
+		[ -r /proc/boot_settled ] || return 0
+		read -r s < /proc/boot_settled 2>/dev/null || return 0
+		[ "$s" = 0 ] || return 0
+		sleep 0.5
+		n=$((n + 1))
+	done
+}
+
+power() { # power reboot|poweroff
+	sync
+	case "$1" in
+	poweroff) poweroff || halt ;;
+	*) reboot ;;
+	esac
+	# Not reached when it worked.  Wait for init to act on it.
+	sleep 30
+}
+
+# The console back in line mode with echo, whatever a killed text-mode
+# installer left it in.
+reset_tty() {
+	[ -x "$INSTALLER_CLI" ] && "$INSTALLER_CLI" --reset-tty 2>/dev/null
+}
+
+# A menu answer into $choice (the menu has put the console in line mode).
+# 0: answered; 1: end of input (no answer); 2: the console kept reporting
+# end of input, so the login prompt ran instead -- show the menu again.  A
+# few ends of input in a row are given up on rather than spun on.
+eofs=0
+read_choice() {
+	choice=
+	if read -r choice; then
+		eofs=0
+		return 0
+	fi
+	say ""
+	eofs=$((eofs + 1))
+	if [ $eofs -ge 3 ]; then
+		eofs=0
+		say "  The console reports no input; starting the login prompt."
+		sleep 2
+		/sbin/getty /dev/console || sleep 5
+		return 2
+	fi
+	sleep 1
+	return 1
+}
+
+installed() {
+	[ -n "$INSTALLED_MARK" ] && [ -f "$INSTALLED_MARK" ] && [ -O "$INSTALLED_MARK" ]
+}
+
+# After the text-mode installer installed LikeOS: no installer any more,
+# only what to do with the new system.  Never returns.
+installed_menu() {
+	if [ -n "$INSTALLED_MARK" ]; then
+		rm -f "$INSTALLED_MARK"
+		: > "$INSTALLED_MARK" 2>/dev/null
+	fi
+	while :; do
+		reset_tty
+		say ""
+		say "  LikeOS is installed"
+		say ""
+		say "  Remove the installation medium before the computer starts"
+		say "  again, or choose the disk in the firmware's boot menu."
+		say ""
+		say "  1  Restart the computer"
+		say "  2  Switch the computer off"
+		say "  3  Log in on the console"
+		say ""
+		printf '  Choose 1-3 [1]: '
+		read_choice || continue
+		case "${choice:-1}" in
+		1)
+			power reboot
+			;;
+		2)
+			power poweroff
+			;;
+		3)
+			/sbin/getty /dev/console
+			;;
+		*)
+			say "  Please type a number from 1 to 3."
+			;;
+		esac
+	done
+}
+
+# The text-mode installer on this console.  Returns its exit status.
+run_cli() {
+	if [ ! -x "$INSTALLER_CLI" ]; then
+		say "The text-mode installer ($INSTALLER_CLI) is missing."
+		return 1
+	fi
+	"$INSTALLER_CLI"
+}
+
+# Asked when the graphical installer is not coming back: what now.
+console_menu() {
+	while :; do
+		reset_tty
+		say ""
+		say "  LikeOS Setup"
+		say ""
+		say "  1  Install LikeOS in text mode (no graphics needed)"
+		say "  2  Try the graphical installer again"
+		say "  3  Log in on the console"
+		say "  4  Restart the computer"
+		say "  5  Switch the computer off"
+		say ""
+		printf '  Choose 1-5 [1]: '
+		read_choice
+		case $? in
+		1)
+			# No terminal to read from: the text-mode installer is
+			# all that can still help, and it says why it cannot.
+			choice=1
+			;;
+		2)
+			continue
+			;;
+		esac
+		case "${choice:-1}" in
+		1)
+			run_cli
+			rc=$?
+			# likeos-install restarts the computer itself when it
+			# installed; 0 here means the restart was declined (or
+			# failed): the new system is there, so no installer
+			# again -- restart, power off or log in.
+			[ $rc -eq 0 ] && installed_menu
+			;;
+		2)
+			return 1
+			;;
+		3)
+			# getty claims the console, runs login, and ends with
+			# the session.
+			/sbin/getty /dev/console
+			;;
+		4)
+			power reboot
+			;;
+		5)
+			power poweroff
+			;;
+		*)
+			say "  Please type a number from 1 to 5."
+			;;
+		esac
+	done
+}
+
+wait_settled
+
+if installed; then
+	say ""
+	say "LikeOS has been installed from this medium."
+	installed_menu
+fi
+
+if [ ! -x "$INSTALLER_GUI" ] || [ ! -x /usr/bin/startx ] || [ ! -r "$SESSION_RC" ]; then
+	say ""
+	say "The graphical installer is not on this medium."
+	console_menu
+	exit 0
+fi
+
+say ""
+say "Starting LikeOS Setup ..."
+rm -f "$LIKEOS_INSTALLER_STATUS"
+# startx with a client of its own and no server arguments: the server
+# command line comes from /etc/X11/xinit/xserverrc, as for every session,
+# and startx makes the display's MIT-MAGIC-COOKIE-1 file.  What X prints
+# goes to its log (/var/log/Xorg.0.log) and to this console.
+startx "$SESSION_RC"
+xrc=$?
+
+status=
+if [ -r "$LIKEOS_INSTALLER_STATUS" ]; then
+	read -r status < "$LIKEOS_INSTALLER_STATUS"
+fi
+rm -f "$LIKEOS_INSTALLER_STATUS"
+
+case "$status" in
+"$STATUS_REBOOT")
+	say "LikeOS Setup has finished; restarting the computer."
+	power reboot
+	exit 0
+	;;
+"$STATUS_POWEROFF")
+	say "Switching the computer off."
+	power poweroff
+	exit 0
+	;;
+esac
+
+say ""
+if [ -z "$status" ]; then
+	say "The graphical installer could not be started (the X server ended with"
+	say "status $xrc).  The messages above and /var/log/Xorg.0.log say why."
+else
+	say "The graphical installer ended unexpectedly (status $status)."
+	say "Its log is /tmp/likeos-install.log."
+fi
+say "LikeOS can still be installed with the text-mode installer."
+console_menu
+# Ending here makes init start the session again: the graphical installer
+# ("try again" was chosen).
+exit 0
