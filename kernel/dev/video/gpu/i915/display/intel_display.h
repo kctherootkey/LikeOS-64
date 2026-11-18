@@ -62,6 +62,9 @@ struct intel_vbt_dsc {
 
 struct intel_vbt_port {
 	int present; /* a child device names this port */
+	/* The child's device handle (0x0008 the first panel, 0x0080 the
+	 * second), of the last child naming the port. */
+	uint16_t handle;
 	int supports_dp, supports_hdmi, supports_dvi, supports_edp;
 	int is_internal; /* the panel */
 	uint8_t aux_ch; /* AUX channel letter index (0 = A), 0xff none */
@@ -119,10 +122,24 @@ struct intel_vbt {
 	char signature[24];
 	struct intel_vbt_port port[INTEL_MAX_PORTS];
 	int nchildren;
-	/* the internal panel */
-	int panel_type; /* index into the LFP tables, -1 unknown */
-	struct drm_mode_modeinfo panel_mode; /* from the LFP data block */
+	/* The internal panel.  Its type indexes every per-panel table (the
+	 * timing, the power sequencing, the link, the backlight); -1 while
+	 * it is not known, when none of the per-panel fields below are
+	 * filled.  intel_vbt_parse_platform() decides it when the table
+	 * names it outright; a table that asks for the panel to be matched
+	 * by its EDID's PnP id leaves it to intel_vbt_init_panel(). */
+	int panel_type;
+	int panel_type_src; /* enum intel_vbt_panel_src */
+	int panel_type_vbt; /* the LFP options block's panel type, -1 none */
+	int panel_type2_vbt; /* its second panel's (BDB 212+), -1 none */
+	/* the table itself, for intel_vbt_init_panel() */
+	const uint8_t *raw;
+	unsigned raw_len;
+	/* the timing: the generic DTD block (BDB 229+), else the LFP data
+	 * block's */
+	struct drm_mode_modeinfo panel_mode;
 	int panel_mode_valid;
+	uint32_t panel_width_mm, panel_height_mm;
 	struct intel_vbt_pps pps;
 	uint8_t edp_rate; /* 0=1.62 1=2.7 2=5.4 GHz */
 	uint8_t edp_lanes; /* 1, 2, 4 */
@@ -148,6 +165,25 @@ struct intel_vbt {
  * Returns 0 or -EINVAL. */
 int intel_vbt_parse(const uint8_t *vbt, unsigned len, struct intel_vbt *out);
 
+/* Where the panel type came from. */
+enum intel_vbt_panel_src {
+	INTEL_VBT_PANEL_NONE = 0,
+	INTEL_VBT_PANEL_VBT, /* the LFP options block names it */
+	INTEL_VBT_PANEL_PNPID, /* the table defers to the EDID's PnP id */
+	INTEL_VBT_PANEL_FALLBACK, /* neither: the first entry */
+};
+
+/* The panel type once the panel's EDID (`edid', `edid_len' bytes, NULL
+ * for none) is known, and with it every per-panel table.  `lfp2': the
+ * panel is the second one (its child's handle is the second panel's).
+ * Without `use_fallback' a type that cannot be decided stays unknown.
+ * Returns 1 when the type was decided now, 0 when it was known already,
+ * -1 when it is still unknown.  Pure, like the parse. */
+int intel_vbt_init_panel(struct intel_vbt *vbt, const uint8_t *edid, unsigned edid_len,
+			 int lfp2, int use_fallback);
+/* The panel source's name, for the log. */
+const char *intel_vbt_panel_src_name(int src);
+
 /* ---- the OpRegion (intel_opregion.c) --------------------------------------- */
 
 struct intel_opregion {
@@ -159,6 +195,7 @@ struct intel_opregion {
 	void *rvda_virt; /* the extended VBT mapping, if any */
 	uint32_t rvda_pages;
 	uint8_t asle_present;
+	uint8_t asle_ext_present; /* mailbox 5: the panel's EDID */
 	/* A discrete part has no OpRegion: its VBT is copied out of the
 	 * option ROM in the card's SPI flash into this (vbt points here). */
 	uint8_t *rom_vbt;
@@ -230,6 +267,25 @@ int intel_power_init(struct i915_device *i915);
 void intel_power_fini(struct i915_device *i915);
 void intel_power_get(struct i915_device *i915, enum intel_power_domain d);
 void intel_power_put(struct i915_device *i915, enum intel_power_domain d);
+/* The same for a short hold (an AUX exchange): the get returns which of
+ * the domain's wells were up for the firmware (requested, needed by
+ * nothing of the driver's), and the put leaves those as they were while
+ * they are still requested. */
+uint32_t intel_power_get_transient(struct i915_device *i915, enum intel_power_domain d);
+void intel_power_put_transient(struct i915_device *i915, enum intel_power_domain d, uint32_t was);
+/* The same release, made 100 ms after the last such release: a run of
+ * AUX exchanges keeps the channel powered between them.  Display lock
+ * held.  Until the worker that makes the releases runs (started by
+ * intel_power_async_start(), after the boot) the holds wait. */
+void intel_power_put_async(struct i915_device *i915, enum intel_power_domain d, uint32_t was);
+/* The power domain of the channel an output's AUX is routed to
+ * (intel_dp_aux.c); an enabled output holds it. */
+enum intel_power_domain intel_dp_aux_power_domain(const struct intel_dp_aux *aux);
+/* Every waiting release made now (suspend, teardown). */
+void intel_power_flush_async(struct i915_device *i915);
+/* The worker, once threads run; without it the releases are made at
+ * once from here on. */
+int intel_power_async_start(struct i915_device *i915);
 
 /* ---- clocks (intel_cdclk.c, intel_dpll.c) ------------------------------- */
 
@@ -360,6 +416,10 @@ int mtl_phy_init(struct i915_device *i915);
 
 /* ---- outputs (intel_ddi.c, intel_dp.c, intel_hdmi.c) ---------------------- */
 
+/* The most timings of its size beside the preferred one a panel's EDID
+ * contributes. */
+#define INTEL_PANEL_MAX_ALT 7
+
 struct intel_output {
 	int present;
 	int port; /* DDI A..E */
@@ -412,11 +472,21 @@ struct intel_output {
 	uint8_t edid[512];
 	int edid_len;
 	int detected;
-	/* A panel has one timing it takes (the EDID's preferred): any
-	 * other mode a client sets is run through the pipe scaler onto
-	 * it. */
+	/* A panel has one timing it takes (the EDID's preferred, else the
+	 * VBT's), found once when the output is set up
+	 * (intel_edp_init_panel()): any other mode a client sets is run
+	 * through the pipe scaler onto it.  The EDID's other timings of the
+	 * panel's size are the panel's too (other refresh rates); a mode
+	 * within 1 Hz of one of them runs at that one.  Without a fixed
+	 * mode the panel is not driven at all. */
 	struct drm_mode_modeinfo fixed_mode;
 	int fixed_mode_valid;
+	struct drm_mode_modeinfo fixed_alt[INTEL_PANEL_MAX_ALT];
+	int nfixed_alt;
+	/* the VBT panel type the panel's tables are, -1 none */
+	int panel_type;
+	/* attempts at setting the panel up (intel_edp_init_panel()) */
+	int panel_init_tries;
 	/* Type-C ports (Ice Lake and later): which PHY the port is on and
 	 * the mode the connector was found in (intel_tc.c). */
 	int is_tc;
@@ -491,6 +561,36 @@ int intel_ddi_wait_idle_done(struct i915_device *i915, struct intel_output *o);
 /* DP */
 int intel_dp_detect(struct i915_device *i915, struct intel_output *o);
 int intel_dp_read_edid(struct i915_device *i915, struct intel_output *o);
+/* The eDP panel, set up once, when its output is and before its first
+ * probe: the DPCD and the EDID read with the panel's VDD and the AUX
+ * channel's power held (the EDID the OpRegion keeps when the panel does
+ * not answer; one that gives no mode counts as none), the VBT panel type
+ * decided with it, the fixed mode taken, and one line logged.  Once the
+ * panel has a fixed mode its EDID (or its absence) is final: the probes
+ * take the modes from it and never read the panel's again; until then
+ * each detect tries again.  0, or -ENODEV when the panel cannot be
+ * driven (yet): no link information, or no fixed mode. */
+int intel_edp_init_panel(struct i915_device *i915, struct intel_output *o);
+
+/* ---- panels (intel_connector.c), the DDI displays' and the older ones' ---- */
+
+/* The fixed modes a panel's EDID gives, into fixed[0..max_fixed): first
+ * the mode it marks preferred (else its first mode), then the other
+ * timings of that size (other refresh rates).  The count, 0 for an EDID
+ * that gives no mode; *bpc (0 unknown) and the size in mm from the EDID
+ * when those are not NULL.  `conn_type' is DRM_MODE_CONNECTOR_*. */
+int intel_panel_edid_fixed_modes(const uint8_t *edid, unsigned len, uint32_t conn_type,
+				 struct drm_mode_modeinfo *fixed, int max_fixed, int *bpc,
+				 uint32_t *width_mm, uint32_t *height_mm);
+/* The panel timing a mode set of `m' on panel output `o' runs: the fixed
+ * mode (or one of the EDID's others) whose refresh rate is nearest, when
+ * that is within 1 Hz; else the preferred fixed mode.  Any other size is
+ * scaled onto it.  The output must have a fixed mode. */
+const struct drm_mode_modeinfo *intel_panel_drive_mode(const struct intel_output *o,
+							const struct drm_mode_modeinfo *m);
+/* The panel EDID the firmware keeps in the OpRegion (mailbox 5), copied
+ * into buf: its length, 0 for none or an invalid one. */
+int intel_opregion_get_edid(struct i915_device *i915, uint8_t *buf, unsigned cap);
 int intel_dp_choose_link(struct i915_device *i915, struct intel_output *o,
 			 const struct drm_mode_modeinfo *mode);
 int intel_dp_link_train(struct i915_device *i915, struct intel_output *o);
@@ -538,6 +638,10 @@ int intel_dp_retrain_link(struct i915_device *i915, struct intel_output *o);
 
 /* eDP panel power and backlight (intel_pps.c, intel_backlight.c) */
 int intel_pps_init(struct i915_device *i915);
+/* The sequencer and its delays again, once the panel's VBT entries are
+ * known (intel_edp_init_panel()); VDD forced for `o' on a sequencer that
+ * turns out not to be the panel's is released. */
+void intel_pps_init_late(struct i915_device *i915, struct intel_output *o);
 void intel_pps_vdd_on(struct i915_device *i915, struct intel_output *o);
 void intel_pps_vdd_off(struct i915_device *i915, struct intel_output *o);
 void intel_pps_panel_on(struct i915_device *i915, struct intel_output *o);
@@ -607,6 +711,10 @@ struct intel_display {
 	uint32_t ddb_blocks; /* the data buffer this driver hands out */
 	struct intel_opregion opregion;
 	struct intel_vbt vbt;
+	/* The eDP output (its index + 1, 0 none) whose panel vbt's per-panel
+	 * fields describe: the first one set up.  A second panel's own VBT
+	 * timing comes from a separate pass (intel_edp_init_panel()). */
+	int vbt_panel_output;
 	int nout;
 	struct intel_output outputs[INTEL_MAX_OUTPUTS];
 	struct intel_pipe pipes[INTEL_MAX_PIPES];
@@ -615,6 +723,18 @@ struct intel_display {
 	uint32_t cdclk_khz;
 	uint32_t rawclk_khz;
 	int pw_count[INTEL_PW_COUNT];
+	/* Holds released through intel_power_put_async(), still in place:
+	 * per domain, the count and the wells found up for the firmware;
+	 * all of them go when pw_parked_until has passed with no new one.
+	 * pw_async_state: 0 before the worker that releases them runs (they
+	 * wait for it), 1 while it does, -1 none (released at once). */
+	int pw_parked[INTEL_PW_COUNT];
+	uint32_t pw_parked_was[INTEL_PW_COUNT];
+	uint64_t pw_parked_until;
+	volatile int pw_parked_any;
+	int pw_async_state;
+	struct wait_queue_head pw_wq;
+	task_t *pw_worker;
 	uint32_t mem_latency[8]; /* watermark latency levels, us */
 	int nlatency;
 	/* GGTT range for scanout buffers (i915_gtt.c hands them out) */

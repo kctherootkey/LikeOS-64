@@ -147,6 +147,10 @@ struct i915_device {
 	hrtimer_t fw_timer; /* releases the lingering domains */
 	int fw_timer_ready;
 	int unclaimed_warned;
+	/* set while i915_init() runs: every register access, reads and the
+	 * display's included, is checked for having been claimed, so the
+	 * report names the access itself */
+	int unclaimed_check_all;
 
 	/* topology, from the fuse registers */
 	uint32_t slice_mask;

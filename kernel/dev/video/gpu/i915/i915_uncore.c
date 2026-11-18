@@ -761,7 +761,8 @@ void i915_fw_put(struct i915_device *i915, uint32_t mask)
 
 /* An access the device did not claim -- a register that does not exist
  * on this part, or one in a unit that was asleep -- is recorded in the
- * debug register.  Checked after writes while bringing the driver up;
+ * debug register.  Checked after writes that take forcewake, and while
+ * the driver is being brought up after every access (unclaimed_check_all);
  * one line, then silence. */
 static void check_unclaimed(struct i915_device *i915, uint32_t reg)
 {
@@ -775,8 +776,8 @@ static void check_unclaimed(struct i915_device *i915, uint32_t reg)
 	if (dbg & FPGA_DBG_RM_NOCLAIM) {
 		i915_write32_fw(i915, FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
 		i915->unclaimed_warned = 1;
-		kprintf("[drm] i915: unclaimed register access (last %05x)\n",
-			reg);
+		kprintf("[drm] i915: unclaimed register access (%s %05x)\n",
+			i915->unclaimed_check_all ? "at" : "last", reg);
 	}
 }
 
@@ -790,13 +791,18 @@ uint32_t i915_read32(struct i915_device *i915, uint32_t reg)
 	if (!fw) {
 		if (legacy)
 			i915_legacy_mmio_read_prepare(i915, reg);
-		return i915_read32_fw(i915, reg);
+		v = i915_read32_fw(i915, reg);
+		if (!legacy && i915->unclaimed_check_all)
+			check_unclaimed(i915, reg);
+		return v;
 	}
 	spin_lock_irqsave(&i915->fw_lock, &fl);
 	fw_domains_get_locked(i915, fw);
 	if (legacy)
 		i915_legacy_mmio_read_prepare(i915, reg);
 	v = i915_read32_fw(i915, reg);
+	if (!legacy && i915->unclaimed_check_all)
+		check_unclaimed(i915, reg);
 	fw_domains_put_locked(i915, fw);
 	spin_unlock_irqrestore(&i915->fw_lock, fl);
 	return v;
@@ -819,6 +825,8 @@ void i915_write32(struct i915_device *i915, uint32_t reg, uint32_t val)
 		if (legacy)
 			i915_legacy_mmio_write_prepare(i915, reg);
 		i915_write32_fw(i915, reg, val);
+		if (!legacy && i915->unclaimed_check_all)
+			check_unclaimed(i915, reg);
 		return;
 	}
 	spin_lock_irqsave(&i915->fw_lock, &fl);

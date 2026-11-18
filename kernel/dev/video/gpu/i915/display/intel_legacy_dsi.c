@@ -2946,6 +2946,9 @@ void lg_dsi_init(struct lg_display *d)
 		return;
 	}
 
+	/* No EDID on a DSI panel: the VBT's panel type (else the first
+	 * entry) is all there is, and its timing the fixed mode. */
+	(void)lg_vbt_init_panel(d, NULL, 0, 0);
 	if (!d->vbt.lfp_mode_valid) {
 		kprintf("[drm] i915: DSI: no panel mode in the VBT\n");
 		return;

@@ -378,22 +378,36 @@ static void engine_hw_init(struct i915_engine *e)
 	i915_write32(i915, RING_HEAD(base), 0);
 	i915_write32(i915, RING_TAIL(base), 0);
 	i915_write32(i915, RING_START(base), 0);
-	i915_write32(i915, RING_HWS_PGA(base), e->hwsp_ggtt);
-	(void)i915_read32(i915, RING_HWS_PGA(base));
-	i915_write32(i915, RING_HWSTAM(base), 0xffffffffu);
-	i915_write32(i915, RING_IMR(base),
-		     ~(uint32_t)(GT_RENDER_USER_INTERRUPT | GT_CONTEXT_SWITCH_INTERRUPT));
-	i915_write32(i915, RING_MI_MODE(base), I915_MASKED_DISABLE(STOP_RING));
-	/* Execution lists on.  Gen11 turned the bit around: the legacy
-	 * ring buffer mode is switched off instead. */
-	if (i915->info->gen >= 11)
+	if (i915->info->gen >= 11) {
+		/* Gen11 on, in the order the part is brought up in: the
+		 * status buffer's pointers set back while the engine is
+		 * still in ring buffer mode, the status page's interrupt
+		 * writes masked, execution lists on (Gen11 turned the bit
+		 * around: the legacy ring buffer mode is switched off), the
+		 * engine let run, and only then the status page's address,
+		 * which is where the engine writes the status buffer. */
+		i915_execlists_init_engine(e);
+		i915_write32(i915, RING_HWSTAM(base), 0xffffffffu);
+		i915_write32(i915, RING_IMR(base),
+			     ~(uint32_t)(GT_RENDER_USER_INTERRUPT | GT_CONTEXT_SWITCH_INTERRUPT));
 		i915_write32(i915, RING_MODE_GEN7(base),
 			     I915_MASKED_ENABLE(GEN11_GFX_DISABLE_LEGACY_MODE));
-	else
+		i915_write32(i915, RING_MI_MODE(base), I915_MASKED_DISABLE(STOP_RING));
+		i915_write32(i915, RING_HWS_PGA(base), e->hwsp_ggtt);
+		(void)i915_read32(i915, RING_HWS_PGA(base));
+	} else {
+		i915_write32(i915, RING_HWS_PGA(base), e->hwsp_ggtt);
+		(void)i915_read32(i915, RING_HWS_PGA(base));
+		i915_write32(i915, RING_HWSTAM(base), 0xffffffffu);
+		i915_write32(i915, RING_IMR(base),
+			     ~(uint32_t)(GT_RENDER_USER_INTERRUPT | GT_CONTEXT_SWITCH_INTERRUPT));
+		i915_write32(i915, RING_MI_MODE(base), I915_MASKED_DISABLE(STOP_RING));
+		/* Execution lists on. */
 		i915_write32(i915, RING_MODE_GEN7(base),
 			     I915_MASKED_ENABLE(GFX_RUN_LIST_ENABLE) |
 				     I915_MASKED_DISABLE(GFX_REPLAY_MODE));
-	(void)i915_read32(i915, RING_MODE_GEN7(base));
+		(void)i915_read32(i915, RING_MODE_GEN7(base));
+	}
 	/* The render and compute engines share their slices; the compute
 	 * engines only get a share once the render engine's unit is told
 	 * they exist.  Written with the first of them, since all of them
@@ -405,7 +419,8 @@ static void engine_hw_init(struct i915_engine *e)
 	i915_gt_apply_workarounds(i915, e);
 	/* how each kind of surface is cached */
 	i915_mocs_init_engine(i915, e);
-	i915_execlists_init_engine(e);
+	if (i915->info->gen < 11)
+		i915_execlists_init_engine(e);
 }
 
 /* Top-level GT interrupt enables (Gen8-10): each engine's user and
@@ -852,6 +867,7 @@ void i915_engine_report_stuck(struct i915_device *i915, uint64_t context, uint64
 		i915->guc.submission ? (e->gsi_offset ? (i915->media_guc.ct_broken ? ", media GuC transport broken" : ", under the media GuC") :
 						     (i915->guc.ct_broken ? ", GuC transport broken" : ", under the GuC")) :
 				       "");
+	i915_execlists_report(e);
 }
 
 int i915_engine_idle(struct i915_engine *e, uint32_t timeout_ms)

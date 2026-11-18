@@ -70,6 +70,7 @@ static int fbdev_current_info(framebuffer_info_t *fi)
 uint64_t fbdev_get_phys(uint64_t *size_out)
 {
 	framebuffer_info_t fi;
+	uint64_t phys;
 
 	if (g_backend)
 		return g_backend->get_phys(size_out);
@@ -79,6 +80,10 @@ uint64_t fbdev_get_phys(uint64_t *size_out)
 		*size_out = fi.framebuffer_size;
 	if (is_direct_map_addr((uint64_t)fi.framebuffer_base))
 		return virt_to_phys(fi.framebuffer_base);
+	// The firmware framebuffer mapped above the direct map
+	if (console_boot_fb_virt_to_phys((uint64_t)fi.framebuffer_base,
+					 &phys) == 0)
+		return phys;
 	// Early identity-mapped address: VA == PA
 	return (uint64_t)fi.framebuffer_base;
 }

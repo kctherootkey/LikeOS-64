@@ -703,6 +703,23 @@ out:
 		s->backlight_off_ms, s->power_down_ms, s->power_cycle_ms);
 }
 
+void lg_pps_edp_init_late(struct lg_display *d, struct lg_output *o)
+{
+	struct pps_state *s = pps_st(d, o);
+
+	if (!s->is_edp || !s->delays_valid)
+		return;
+	/* on Valleyview and Cherryview only once a sequencer is the port's */
+	if (is_vlv_chv(d) && s->vlv_pps_pipe < 0)
+		return;
+	s->delays_valid = 0;
+	pps_init_delays(d, o);
+	pps_init_registers(d, o, 0);
+	kprintf("[drm] i915: %s: panel power sequencer %s with the panel's VBT entry: T1+T3 %u ms, T8 %u ms, T9 %u ms, T10 %u ms, T11+T12 %u ms\n",
+		o->name, pps_name(d, o), s->power_up_ms, s->backlight_on_ms,
+		s->backlight_off_ms, s->power_down_ms, s->power_cycle_ms);
+}
+
 /* Callers may reach the sequencer before lg_pps_edp_init ran. */
 static int pps_ready(struct lg_display *d, struct lg_output *o)
 {

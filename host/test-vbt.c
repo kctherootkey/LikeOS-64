@@ -85,21 +85,42 @@ int main(void)
 	/* lvds options: panel type 3 */
 	uint8_t lo[2] = { 3, 0 };
 	off = put_block(bdb, off, 40, lo, sizeof(lo));
-	/* LFP data pointers + data: panel 3's DVO timing at data offset 3+18*3 */
-	uint8_t ptrs[1 + 16 * 9];
+	/* LFP data pointers + data, laid out as real tables have them: per
+	 * panel 38 bytes of fp_timing (32 declared, the 0xffff terminator in
+	 * the 6 undeclared ones), the 18-byte DTD, the 10-byte PnP id; the
+	 * pointers count from the start of the BDB.  Panel 3 is 1920x1080. */
+	uint8_t ptrs[1 + 16 * 9 + 3];
 	memset(ptrs, 0, sizeof(ptrs));
-	ptrs[0] = 16;
-	uint8_t data[4 * 18];
+	ptrs[0] = 3;
+	static uint8_t data[16 * 66];
 	memset(data, 0, sizeof(data));
+	/* where the data block's body will be: after this block and the
+	 * data block's own header */
+	unsigned data_off = off + 3 + sizeof(ptrs) + 3;
 	for (int p = 0; p < 16; p++) {
-		uint16_t o = 3 + 18 * (p < 4 ? p : 0);
-		ptrs[1 + p * 9 + 3] = o & 0xff; ptrs[1 + p * 9 + 4] = o >> 8; ptrs[1 + p * 9 + 5] = 18;
+		uint16_t fp = (uint16_t)(data_off + p * 66), dvo = (uint16_t)(fp + 38), pnp = (uint16_t)(dvo + 18);
+		uint8_t *e = ptrs + 1 + p * 9;
+		e[0] = fp & 0xff; e[1] = fp >> 8; e[2] = 32;
+		e[3] = dvo & 0xff; e[4] = dvo >> 8; e[5] = 18;
+		e[6] = pnp & 0xff; e[7] = pnp >> 8; e[8] = 10;
+		data[p * 66 + 36] = 0xff;
+		data[p * 66 + 37] = 0xff;
+		/* a 1024x768 DTD in every entry but panel 3's */
+		uint8_t *x = data + p * 66 + 38;
+		x[0] = 6500 & 0xff; x[1] = 6500 >> 8;
+		x[2] = 1024 & 0xff; x[3] = 320 & 0xff; x[4] = ((1024 >> 8) << 4) | (320 >> 8);
+		x[5] = 768 & 0xff; x[6] = 38; x[7] = ((768 >> 8) << 4);
+		x[8] = 24; x[9] = 136; x[10] = (3 << 4) | 6;
+		/* PnP id: "ABC" product 0x1234 + entry, serial 0, week 0, year 30 */
+		uint8_t *id = data + p * 66 + 56;
+		id[0] = 0x04; id[1] = 0x43; id[2] = (uint8_t)(0x34 + p); id[3] = 0x12;
+		id[8] = 0; id[9] = 30;
 	}
-	uint8_t *d = data + 18 * 3;
+	uint8_t *d = data + 3 * 66 + 38;
 	d[0] = 14850 & 0xff; d[1] = 14850 >> 8;
 	d[2] = 1920 & 0xff; d[3] = 280 & 0xff; d[4] = ((1920 >> 8) << 4) | (280 >> 8);
 	d[5] = 1080 & 0xff; d[6] = 45; d[7] = ((1080 >> 8) << 4);
-	d[8] = 88; d[9] = 44; d[10] = (4 << 4) | 5; d[11] = 0; d[17] = 0x1e;
+	d[8] = 88; d[9] = 44; d[10] = (4 << 4) | 5; d[11] = 0; d[17] = 0x1e | 0x60;
 	off = put_block(bdb, off, 41, ptrs, sizeof(ptrs));
 	off = put_block(bdb, off, 42, data, sizeof(data));
 	/* eDP: power seq for panel 3: T3 2100 (210 ms), T8 500, T9 500, T10 5000, T12 5000; then color depth, fast link */
@@ -151,6 +172,9 @@ int main(void)
 	CHECK(out.panel_type == 3, "panel type %d", out.panel_type);
 	CHECK(out.panel_mode_valid && out.panel_mode.hdisplay == 1920 && out.panel_mode.vdisplay == 1080 && out.panel_mode.clock == 148500, "panel mode");
 	CHECK(out.panel_mode.htotal == 2200 && out.panel_mode.vtotal == 1125, "panel timings %u %u", out.panel_mode.htotal, out.panel_mode.vtotal);
+	CHECK(out.panel_mode.flags == (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC), "panel sync polarity %x", out.panel_mode.flags);
+	CHECK(out.panel_type_src == INTEL_VBT_PANEL_VBT, "panel type from the table");
+	CHECK(intel_vbt_init_panel(&out, NULL, 0, 0, 1) == 0, "a named type is final");
 	CHECK(out.pps.valid && out.pps.t1_t3 == 2100 && out.pps.t8 == 500 && out.pps.t10 == 5000, "pps %u %u %u", out.pps.t1_t3, out.pps.t8, out.pps.t10);
 	CHECK(out.panel_bpc == 8, "bpc %d", out.panel_bpc);
 	CHECK(out.edp_rate == 1 && out.edp_lanes == 2, "edp link %u x%u", out.edp_rate, out.edp_lanes);
@@ -175,6 +199,52 @@ int main(void)
 		CHECK(intel_vbt_parse(vbt, bdb_off + off, &out4) == 0, "parse with panel 4");
 		CHECK(out4.edp_low_vswing == 1, "panel 4 is on the low-voltage table");
 		CHECK(out4.backlight_active_low == 1, "panel 4 IS active low (got %u)", out4.backlight_active_low);
+		lo_panel_type(vbt, bdb_off, 3);
+	}
+
+	/* 0xff: by the EDID's PnP id.  Unknown until the EDID is there; an
+	 * EDID that matches entry 5 picks it, one with a date only an entry
+	 * without one; no match (or no EDID) is the first entry. */
+	{
+		uint8_t edid[128];
+		struct intel_vbt o2;
+
+		memset(edid, 0, sizeof(edid));
+		edid[8] = 0x04; edid[9] = 0x43; edid[10] = 0x34 + 5; edid[11] = 0x12;
+		edid[17] = 30;
+		lo_panel_type(vbt, bdb_off, 0xff);
+		CHECK(intel_vbt_parse(vbt, bdb_off + off, &out) == 0, "parse with 0xff");
+		CHECK(out.panel_type == -1 && !out.panel_mode_valid && !out.pps.valid, "0xff waits for the EDID (%d)", out.panel_type);
+		CHECK(intel_vbt_init_panel(&out, NULL, 0, 0, 0) == -1, "no EDID, no fallback: still unknown");
+		o2 = out;
+		CHECK(intel_vbt_init_panel(&o2, edid, sizeof(edid), 0, 1) == 1, "decided with the EDID");
+		CHECK(o2.panel_type == 5 && o2.panel_type_src == INTEL_VBT_PANEL_PNPID, "PnP match %d", o2.panel_type);
+		CHECK(o2.panel_mode_valid && o2.panel_mode.hdisplay == 1024, "panel 5's timing");
+		/* panel 3's id, a different date: no full match; 3 has a date,
+		 * so no dateless match either -> fallback */
+		edid[10] = 0x34 + 3; edid[16] = 7; edid[17] = 31;
+		o2 = out;
+		CHECK(intel_vbt_init_panel(&o2, edid, sizeof(edid), 0, 1) == 1 && o2.panel_type == 0 &&
+		      o2.panel_type_src == INTEL_VBT_PANEL_FALLBACK, "dated mismatch falls back (%d)", o2.panel_type);
+		/* ... unless the table's entry has no date */
+		{
+			uint8_t *bb = vbt + bdb_off;
+			unsigned o = 22;
+			while (o + 3 <= 8192) {
+				unsigned bl = (unsigned)bb[o + 1] | ((unsigned)bb[o + 2] << 8);
+				if (bb[o] == 42) {
+					bb[o + 3 + 3 * 66 + 56 + 9] = 0;
+					break;
+				}
+				o += 3 + bl;
+			}
+		}
+		CHECK(intel_vbt_parse(vbt, bdb_off + off, &out) == 0, "parse again");
+		o2 = out;
+		CHECK(intel_vbt_init_panel(&o2, edid, sizeof(edid), 0, 1) == 1 && o2.panel_type == 3 &&
+		      o2.panel_mode.hdisplay == 1920, "dateless match (%d)", o2.panel_type);
+		o2 = out;
+		CHECK(intel_vbt_init_panel(&o2, NULL, 0, 0, 1) == 1 && o2.panel_type == 0, "no EDID: fallback");
 		lo_panel_type(vbt, bdb_off, 3);
 	}
 

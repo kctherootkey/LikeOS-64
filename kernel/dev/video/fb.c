@@ -617,9 +617,11 @@ void fb_optimize_remap_to_direct_map(void)
 		return;
 	}
 	// The front buffer was stored as an identity-mapped physical address
-	// Convert it to use the direct map at PHYS_MAP_BASE
+	// Convert it to the console's mapping of it: the direct map, or the
+	// framebuffer's own mapping when it lies above the direct map.
 	uint64_t fb_phys = (uint64_t)g_double_buffer.front_buffer;
-	g_double_buffer.front_buffer = (uint32_t *)phys_to_virt(fb_phys);
+	g_double_buffer.front_buffer =
+		(uint32_t *)console_boot_fb_phys_to_virt(fb_phys);
 }
 
 // Merge overlapping dirty regions to optimize copy operations
@@ -1519,6 +1521,11 @@ int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size)
 	for (uint64_t addr = start_2mb; addr < end_2mb; addr += 0x200000ULL) {
 		uint32_t pdpt_idx = (addr >> 30) & 0x1FF;
 		uint32_t pd_idx = (addr >> 21) & 0x1FF;
+
+		// Beyond the direct map the index would wrap onto RAM's entries;
+		// such a framebuffer has a write-combining mapping of its own.
+		if (!is_phys_in_direct_map(addr))
+			continue;
 
 		uint64_t pdpte = pdpt[pdpt_idx];
 		if (!(pdpte & PAGE_PRESENT))

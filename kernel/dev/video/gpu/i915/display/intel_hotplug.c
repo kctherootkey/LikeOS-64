@@ -523,7 +523,6 @@ static void hpd_worker(void *arg)
 {
 	struct i915_device *i915 = arg;
 	struct intel_display *d = &i915->display;
-	task_t *cur = sched_current();
 
 	d->hpd_ready = 1;
 	for (;;) {
@@ -569,27 +568,19 @@ static void hpd_worker(void *arg)
 			intel_display_unlock(i915);
 			continue;
 		}
-		struct wait_queue_entry we;
-		uint64_t fl = local_irq_save();
-		wq_entry_init(&we, cur);
-		wq_add(&d->hpd_wq, &we);
-		if (d->hpd_pending) {
-			local_irq_restore(fl);
-			wq_remove(&d->hpd_wq, &we);
-			continue;
-		}
-		cur->wait_channel = &d->hpd_wq;
-		task_set_blocked(cur);
-		local_irq_restore(fl);
-		sched_schedule();
-		cur->wait_channel = NULL;
-		wq_remove(&d->hpd_wq, &we);
+		/* queued and blocked before the condition is looked at, so a
+		 * pulse on another processor in between still wakes it */
+		wait_event(d->hpd_wq, d->hpd_pending);
 	}
 }
 
 int intel_hpd_start(struct i915_device *i915)
 {
 	struct intel_display *d = &i915->display;
+
+	/* Threads run now: the worker that releases the AUX power holds
+	 * after their delay, whatever the hotplug setup. */
+	(void)intel_power_async_start(i915);
 
 	if (!d->ready || d->hpd_worker ||
 	    (!d->hpd_irq_mask && !d->hpd_irq_mask_de && !d->hpd_irq_mask_port))

@@ -42,10 +42,18 @@
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
+#include <kernel/ke/hrtimer.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/waitq.h>
 
 /* A well: the register its request and state bits are in, and their
  * index there; or (Meteor Lake) an AUX channel, powered through the
  * request bit of its control register. */
+/* Gemini Lake's AUX wells (A-C) and its DDI A I/O well (B's and C's are
+ * Skylake's indices) in the driver's power well control register. */
+#define GLK_PW_CTL_IDX_AUX_A 8
+#define GLK_PW_CTL_IDX_DDI_A 1
+
 enum well_kind {
 	WELL_HSW = 0, /* request bit 2*idx+1, state bit 2*idx */
 	WELL_XELPDP_AUX, /* reg = the channel's AUX_CH_CTL */
@@ -534,6 +542,18 @@ static int domain_wells(struct i915_device *i915, enum intel_power_domain d,
 		return n;
 	case INTEL_DISPLAY_BXT:
 		out[n++] = W(HSW_PWR_WELL_CTL2, SKL_PW_CTL_IDX_PW_1);
+		if (plat_is(i915, I915_PLATFORM_GEMINILAKE) && (aux >= 0 || port >= 0)) {
+			/* Gemini Lake: each of A-C has an AUX well and a DDI
+			 * I/O well of its own, B's and C's behind PW2 */
+			int x = aux >= 0 ? aux : port;
+			if (x > 2)
+				return n;
+			if (x > 0)
+				out[n++] = W(HSW_PWR_WELL_CTL2, SKL_PW_CTL_IDX_PW_2);
+			out[n++] = W(HSW_PWR_WELL_CTL2,
+				     aux >= 0 ? GLK_PW_CTL_IDX_AUX_A + x : GLK_PW_CTL_IDX_DDI_A + x);
+			return n;
+		}
 		if (d == INTEL_PW_DISPLAY_CORE || pipe == 0 || d == INTEL_PW_TRANSCODER_EDP ||
 		    aux == 0 || port == 0)
 			return n;
@@ -620,17 +640,47 @@ void intel_power_get(struct i915_device *i915, enum intel_power_domain d)
 		well_enable(i915, ws[i]);
 }
 
-void intel_power_put(struct i915_device *i915, enum intel_power_domain d)
+static int well_requested(struct i915_device *i915, struct well w)
+{
+	uint32_t v = i915_read32(i915, w.reg);
+
+	if (w.kind == WELL_XELPDP_AUX)
+		return !!(v & XELPDP_DP_AUX_CH_CTL_POWER_REQUEST);
+	if (w.kind == WELL_PICA)
+		return !!(v & XE2LPD_PICA_CTL_POWER_REQUEST);
+	return !!(v & HSW_PWR_WELL_CTL_REQ(w.idx));
+}
+
+/* A well by its register and index, for the sets of wells kept up. */
+struct well_id {
+	uint32_t reg;
+	int idx;
+};
+
+static int well_in(const struct well_id *k, int nk, struct well w)
+{
+	for (int i = 0; i < nk; i++)
+		if (k[i].reg == w.reg && k[i].idx == w.idx)
+			return 1;
+	return 0;
+}
+
+/* Every well of domain `d' nothing needs any more brought down -- but for
+ * the wells in `keep' that are still requested: those were up for the
+ * firmware when they were found, and stay as found. */
+static void domain_release_wells(struct i915_device *i915, enum intel_power_domain d,
+				 const struct well_id *keep, int nkeep)
 {
 	struct well ws[8];
 	int n = domain_wells(i915, d, ws, 8);
 
-	if (i915->display.pw_count[d] > 0)
-		i915->display.pw_count[d]--;
 	/* PW1 (and Broadwell's one well) stay up while the driver runs. */
-	for (int i = n - 1; i >= 1; i--)
+	for (int i = n - 1; i >= 1; i--) {
+		if (well_in(keep, nkeep, ws[i]) && well_requested(i915, ws[i]))
+			continue;
 		if (!well_needed(i915, ws[i]))
 			well_disable(i915, ws[i]);
+	}
 	/* A Type-C AUX domain is mapped by the port's current mode; if the
 	 * mode changed while it was held, the other well of the pair may
 	 * be the one that is up. */
@@ -648,6 +698,192 @@ void intel_power_put(struct i915_device *i915, enum intel_power_domain d)
 		if (!well_needed(i915, o))
 			well_disable(i915, o);
 	}
+}
+
+/* The wells of domain `d' a mask (a bit per well in domain_wells()
+ * order) names, appended to `keep'. */
+static int keep_add(struct i915_device *i915, enum intel_power_domain d, uint32_t mask,
+		    struct well_id *keep, int nkeep, int cap)
+{
+	struct well ws[8];
+	int n = domain_wells(i915, d, ws, 8);
+
+	for (int i = 0; i < n && nkeep < cap; i++) {
+		if (!(mask & (1u << i)) || well_in(keep, nkeep, ws[i]))
+			continue;
+		keep[nkeep].reg = ws[i].reg;
+		keep[nkeep].idx = ws[i].idx;
+		nkeep++;
+	}
+	return nkeep;
+}
+
+/* One hold on domain `d' dropped, and its wells released; `keep' names
+ * the ones found up for the firmware when the hold was taken. */
+static void domain_put(struct i915_device *i915, enum intel_power_domain d, uint32_t keep)
+{
+	struct well_id k[8] = { { 0, 0 } };
+	int nk = keep ? keep_add(i915, d, keep, k, 0, 8) : 0;
+
+	if (i915->display.pw_count[d] > 0)
+		i915->display.pw_count[d]--;
+	domain_release_wells(i915, d, k, nk);
+}
+
+void intel_power_put(struct i915_device *i915, enum intel_power_domain d)
+{
+	domain_put(i915, d, 0);
+}
+
+/* A domain held for a moment, around an AUX exchange.  A well that was
+ * requested when the hold was taken while nothing of the driver's needed
+ * it is the firmware's: the release leaves it as it was found, so long as
+ * it is still requested.  Every other well is released as by
+ * intel_power_put(). */
+uint32_t intel_power_get_transient(struct i915_device *i915, enum intel_power_domain d)
+{
+	struct well ws[8];
+	int n = domain_wells(i915, d, ws, 8);
+	uint32_t was = 0;
+
+	for (int i = 0; i < n; i++)
+		if (well_requested(i915, ws[i]) && !well_needed(i915, ws[i]))
+			was |= 1u << i;
+	intel_power_get(i915, d);
+	return was;
+}
+
+void intel_power_put_transient(struct i915_device *i915, enum intel_power_domain d, uint32_t was)
+{
+	domain_put(i915, d, was);
+}
+
+/* ---- releases after a delay ------------------------------------------------------ */
+
+/* A short hold released through intel_power_put_async() stays in
+ * place for this long after the last such release, so that a run of
+ * AUX exchanges does not power the channel up and down for each one. */
+#define POWER_ASYNC_PUT_NS (100ull * 1000 * 1000)
+
+/* Every parked hold dropped at once.  The wells found up for the firmware
+ * are one set across all of them: a well two domains share (PW2 under
+ * two AUX channels) found up by either stays as found. */
+static void release_parked_locked(struct i915_device *i915)
+{
+	struct intel_display *d = &i915->display;
+	struct well_id keep[32] = { { 0, 0 } };
+	int nkeep = 0;
+
+	d->pw_parked_any = 0;
+	for (int dom = 0; dom < INTEL_PW_COUNT; dom++)
+		if (d->pw_parked[dom] && d->pw_parked_was[dom])
+			nkeep = keep_add(i915, (enum intel_power_domain)dom, d->pw_parked_was[dom],
+					 keep, nkeep, 32);
+	for (int dom = 0; dom < INTEL_PW_COUNT; dom++) {
+		int n = d->pw_parked[dom];
+
+		if (!n)
+			continue;
+		d->pw_count[dom] = d->pw_count[dom] > n ? d->pw_count[dom] - n : 0;
+	}
+	for (int dom = 0; dom < INTEL_PW_COUNT; dom++) {
+		if (!d->pw_parked[dom])
+			continue;
+		d->pw_parked[dom] = 0;
+		d->pw_parked_was[dom] = 0;
+		domain_release_wells(i915, (enum intel_power_domain)dom, keep, nkeep);
+	}
+}
+
+void intel_power_put_async(struct i915_device *i915, enum intel_power_domain dom, uint32_t was)
+{
+	struct intel_display *d = &i915->display;
+	int first;
+
+	/* no worker to release it later: now */
+	if (d->pw_async_state < 0) {
+		domain_put(i915, dom, was);
+		return;
+	}
+	/* The hold stays, parked.  The first parked hold's view
+	 * of the firmware's wells is the one that holds: a later hold finds
+	 * them needed by the parked one. */
+	d->pw_parked_was[dom] = d->pw_parked[dom] ? (d->pw_parked_was[dom] | was) : was;
+	d->pw_parked[dom]++;
+	d->pw_parked_until = hrtimer_now_ns() + POWER_ASYNC_PUT_NS;
+	first = !d->pw_parked_any;
+	d->pw_parked_any = 1;
+	/* Before the worker runs (the boot, before there are threads) the
+	 * holds wait for it; it releases them once it is up. */
+	if (first && d->pw_async_state > 0)
+		wake_up(&d->pw_wq);
+}
+
+void intel_power_flush_async(struct i915_device *i915)
+{
+	intel_display_lock(i915);
+	release_parked_locked(i915);
+	intel_display_unlock(i915);
+}
+
+static uint8_t g_pw_stack[16384] __attribute__((aligned(16)));
+
+static void power_async_worker(void *arg)
+{
+	struct i915_device *i915 = arg;
+	struct intel_display *d = &i915->display;
+
+	for (;;) {
+		uint64_t until = 0;
+		int wait = 0;
+
+		intel_display_lock(i915);
+		if (d->pw_parked_any) {
+			if (hrtimer_now_ns() >= d->pw_parked_until)
+				release_parked_locked(i915);
+			else {
+				until = d->pw_parked_until;
+				wait = 1;
+			}
+		}
+		intel_display_unlock(i915);
+		/* A hold parked during this sleep only moves the deadline
+		 * on: the next pass looks again. */
+		if (wait) {
+			uint64_t rem;
+			hrtimer_sleep_until(until, &rem);
+			continue;
+		}
+		/* queued and blocked before the condition is looked at, so a
+		 * park on another processor in between still wakes it */
+		wait_event(d->pw_wq, d->pw_parked_any);
+	}
+}
+
+int intel_power_async_start(struct i915_device *i915)
+{
+	struct intel_display *d = &i915->display;
+
+	if (d->pw_async_state != 0)
+		return 0;
+	if (!d->ready) {
+		d->pw_async_state = -1;
+		intel_power_flush_async(i915);
+		return 0;
+	}
+	wq_head_init(&d->pw_wq, "i915_power");
+	d->pw_worker = sched_add_task(power_async_worker, i915, g_pw_stack, sizeof(g_pw_stack));
+	if (!d->pw_worker) {
+		d->pw_async_state = -1;
+		intel_power_flush_async(i915);
+		return -ENOMEM;
+	}
+	intel_display_lock(i915);
+	d->pw_async_state = 1;
+	if (d->pw_parked_any)
+		wake_up(&d->pw_wq);
+	intel_display_unlock(i915);
+	return 0;
 }
 
 /* ---- DC states ------------------------------------------------------------------ */
@@ -802,8 +1038,13 @@ int intel_power_init(struct i915_device *i915)
 	enum intel_display_model model = i915->display.model;
 	struct intel_display *d = &i915->display;
 
-	for (int dom = 0; dom < INTEL_PW_COUNT; dom++)
+	for (int dom = 0; dom < INTEL_PW_COUNT; dom++) {
 		d->pw_count[dom] = 0;
+		/* (a suspend released the parked holds first) */
+		d->pw_parked[dom] = 0;
+		d->pw_parked_was[dom] = 0;
+	}
+	d->pw_parked_any = 0;
 	if (model == INTEL_DISPLAY_BDW) {
 		/* The one well is left as the firmware had it: PW1-style
 		 * bring-up does not exist here. */

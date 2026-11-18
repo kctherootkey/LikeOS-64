@@ -4,7 +4,8 @@
 // through which firmware and driver talk about the display: the VBT is
 // inside it (or, when too large, at an address it names), and its
 // mailboxes carry the firmware's requests (backlight, display switch)
-// and the driver's declaration that it owns the display.
+// and the driver's declaration that it owns the display.  Mailbox 5 may
+// hold the internal panel's EDID, for a panel that cannot be asked.
 //
 // A discrete card (DG2, Battlemage) has no OpRegion; its VBT is in the
 // option ROM image in the card's SPI flash, which the display reads one
@@ -19,6 +20,7 @@
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
 #include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/drm/drm_edid.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -43,6 +45,12 @@
 #define ASLE_RVDS 0xC2 /* u32 */
 #define OPREGION_MBOX_ASLE (1 << 2)
 #define OPREGION_MBOX_ASLE_EXT (1 << 4) /* mailbox 5 in use: the VBT ends before it */
+
+/* mailbox 5 (ASLE extension): the panel's EDID as the firmware read it,
+ * how many of its 128-byte blocks are valid in the low two bits of PHED */
+#define ASLE_EXT_PHED 0x00
+#define ASLE_EXT_BDDC 0x04
+#define ASLE_PHED_EDID_VALID_MASK 0x3
 
 /* mailbox 1 (ACPI) */
 #define ACPI_DRDY 0x00 /* driver ready */
@@ -182,6 +190,7 @@ static int opregion_map(struct i915_device *i915)
 	uint32_t over = rd32(hdr, OPREGION_H_OVER);
 	uint32_t mboxes = rd32(hdr, OPREGION_H_MBOXES);
 	op->asle_present = !!(mboxes & OPREGION_MBOX_ASLE);
+	op->asle_ext_present = !!(mboxes & OPREGION_MBOX_ASLE_EXT);
 
 	/* The version is four bytes: reserved, revision, minor, major --
 	 * so the major number is the top one, not the top half. */
@@ -266,6 +275,38 @@ void intel_opregion_fini(struct i915_device *i915)
 		kfree(op->rom_vbt);
 		op->rom_vbt = NULL;
 	}
+}
+
+int intel_opregion_get_edid(struct i915_device *i915, uint8_t *buf, unsigned cap)
+{
+	struct intel_opregion *op = &i915->display.opregion;
+	const volatile uint8_t *ext;
+	const struct drm_edid *e;
+	unsigned len, i;
+	int nonzero = 0, ok;
+
+	if (!op->virt || !op->asle_ext_present)
+		return 0;
+	ext = (const volatile uint8_t *)op->virt + OPREGION_ASLE_EXT_OFFSET;
+	len = (rd32(op->virt, OPREGION_ASLE_EXT_OFFSET + ASLE_EXT_PHED) & ASLE_PHED_EDID_VALID_MASK) *
+	      DRM_EDID_BLOCK;
+	if (!len || len > cap)
+		return 0;
+	for (i = 0; i < len; i++) {
+		buf[i] = ext[ASLE_EXT_BDDC + i];
+		nonzero |= buf[i];
+	}
+	if (!nonzero)
+		return 0;
+	e = drm_edid_alloc(buf, len);
+	ok = e && drm_edid_valid(e);
+	if (e)
+		drm_edid_free(e);
+	if (!ok) {
+		i915_dbg("[drm] i915: invalid EDID in the OpRegion (mailbox 5)\n");
+		return 0;
+	}
+	return (int)len;
 }
 
 void intel_opregion_driver_ready(struct i915_device *i915)

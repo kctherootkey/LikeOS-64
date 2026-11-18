@@ -176,6 +176,9 @@ int kmemcmp(const void *s1, const void *s2, size_t n);
 
 // Remap framebuffer to use direct map (call before removing identity mapping)
 void console_remap_to_direct_map(void);
+// The firmware framebuffer's kernel mapping, both ways (see console.c)
+void *console_boot_fb_phys_to_virt(uint64_t phys);
+int console_boot_fb_virt_to_phys(uint64_t virt, uint64_t *phys);
 
 // VGA colors
 #define VGA_COLOR_BLACK 0

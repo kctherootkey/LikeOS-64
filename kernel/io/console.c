@@ -848,23 +848,69 @@ void console_init(framebuffer_info_t *fb)
 	sb_reset();
 }
 
+/* The firmware framebuffer as the kernel maps it for good: its physical
+ * address and the kernel virtual address console_remap_to_direct_map()
+ * gave it.  Set once at boot; 0 until then. */
+static uint64_t g_boot_fb_phys;
+static uint64_t g_boot_fb_virt;
+static uint64_t g_boot_fb_size;
+
 // Remap framebuffer to use direct map (call before removing identity mapping)
-// This converts the framebuffer_base from identity-mapped address to direct-mapped address
+// This converts the framebuffer_base from identity-mapped address to a kernel
+// virtual address: the direct map where it covers the framebuffer, otherwise
+// a mapping of its own (firmware may place it far above RAM, e.g. a 64-bit
+// BAR at 256 GB, which only the bootloader's identity map reached).
 void console_remap_to_direct_map(void)
 {
 	if (fb_info && fb_info->framebuffer_base) {
 		// The framebuffer base was passed as a physical address (identity-mapped by bootloader)
 		uint64_t fb_phys = (uint64_t)fb_info->framebuffer_base;
+		uint64_t fb_size = fb_info->framebuffer_size ?
+					   fb_info->framebuffer_size :
+					   PAGE_SIZE;
+		uint64_t first = fb_phys & ~(PAGE_SIZE - 1);
+		uint64_t npages =
+			(fb_phys + fb_size - first + PAGE_SIZE - 1) / PAGE_SIZE;
+		uint64_t va;
 
-		// Check if framebuffer is within our 4GB direct map range
-		if (fb_phys >= 0x100000000ULL) {
-			// Leave as identity-mapped - this will crash after identity map removal
-			return;
+		if (is_phys_in_direct_map(first + (npages - 1) * PAGE_SIZE)) {
+			// Convert it to use the direct map at PHYS_MAP_BASE
+			va = (uint64_t)phys_to_virt(fb_phys);
+		} else {
+			va = mm_map_mmio_flags(fb_phys, npages, MM_MMIO_WC);
+			if (!va) {
+				kprintf("console: cannot map framebuffer at 0x%lx\n",
+					fb_phys);
+				return;
+			}
 		}
-
-		// Convert it to use the direct map at PHYS_MAP_BASE
-		fb_info->framebuffer_base = phys_to_virt(fb_phys);
+		g_boot_fb_phys = fb_phys;
+		g_boot_fb_virt = va;
+		g_boot_fb_size = fb_size;
+		fb_info->framebuffer_base = (void *)va;
 	}
+}
+
+/* The kernel virtual address of a physical address inside the firmware
+ * framebuffer, once console_remap_to_direct_map() has mapped it; anything
+ * else through the direct map. */
+void *console_boot_fb_phys_to_virt(uint64_t phys)
+{
+	if (g_boot_fb_virt && phys >= g_boot_fb_phys &&
+	    phys - g_boot_fb_phys < g_boot_fb_size)
+		return (void *)(g_boot_fb_virt + (phys - g_boot_fb_phys));
+	return phys_to_virt(phys);
+}
+
+/* The physical address behind virt when it lies in the firmware
+ * framebuffer's own mapping: 0 on success, -1 when it does not. */
+int console_boot_fb_virt_to_phys(uint64_t virt, uint64_t *phys)
+{
+	if (!g_boot_fb_virt || virt < g_boot_fb_virt ||
+	    virt - g_boot_fb_virt >= g_boot_fb_size)
+		return -1;
+	*phys = g_boot_fb_phys + (virt - g_boot_fb_virt);
+	return 0;
 }
 
 // Initialize framebuffer optimization system (call after console_init)

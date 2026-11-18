@@ -467,32 +467,16 @@ static int compute_is_dual_link_lvds(struct lg_display *d, uint32_t reg,
 }
 
 /* The panel's EDID over its DDC pin: the preferred mode (else the first)
- * and the physical size.  0, or -ENODEV. */
+ * and the physical size.  An EDID that gives no mode is none.  0, or
+ * -ENODEV. */
 static int lvds_probe_edid(struct lg_display *d, struct lg_output *probe,
 			   struct drm_mode_modeinfo *mode)
 {
-	struct drm_edid_info *info;
-	int ret = -ENODEV;
-
 	if (!probe->ddc || lg_read_edid(d, probe) != 0 || probe->edid_len <= 0)
 		goto none;
-
-	info = kalloc(sizeof(*info));
-	if (!info)
-		goto none;
-	mm_memset(info, 0, sizeof(*info));
-	if (drm_edid_parse(probe->edid, (unsigned)probe->edid_len, info) == 0 &&
-	    info->nmodes > 0) {
-		int i = (info->preferred >= 0 && info->preferred < info->nmodes) ?
-				info->preferred : 0;
-
-		*mode = info->modes[i];
-		probe->mm_width = info->mm_width;
-		probe->mm_height = info->mm_height;
-		ret = 0;
-	}
-	kfree(info);
-	if (ret == 0)
+	if (intel_panel_edid_fixed_modes(probe->edid, (unsigned)probe->edid_len,
+					 DRM_MODE_CONNECTOR_LVDS, mode, 1, NULL, &probe->mm_width,
+					 &probe->mm_height) > 0)
 		return 0;
 none:
 	/* not an EDID one can use: forget it */
@@ -564,16 +548,20 @@ void lg_lvds_init(struct lg_display *d)
 	}
 
 	/* The fixed mode: the EDID on the panel's DDC, else the VBT's
-	 * panel timing, else what the firmware runs on the port's pipe. */
+	 * panel timing (of the panel type the EDID's PnP id decides where
+	 * the table defers to it), else what the firmware runs on the
+	 * port's pipe. */
 	mm_memset(&fixed, 0, sizeof(fixed));
-	if (lvds_probe_edid(d, probe, &fixed) == 0) {
+	if (lvds_probe_edid(d, probe, &fixed) == 0)
 		src = "EDID";
-	} else if (d->vbt.lfp_mode_valid) {
+	(void)lg_vbt_init_panel(d, probe->edid_len > 0 ? probe->edid : NULL,
+				(uint32_t)(probe->edid_len > 0 ? probe->edid_len : 0), 0);
+	if (!src && d->vbt.lfp_mode_valid) {
 		fixed = d->vbt.lfp_mode;
 		probe->mm_width = d->vbt.lfp_width_mm;
 		probe->mm_height = d->vbt.lfp_height_mm;
 		src = "VBT";
-	} else if (lvds_port_enabled(d, reg, &pipe) &&
+	} else if (!src && lvds_port_enabled(d, reg, &pipe) &&
 		   lg_pipe_read_mode(d, pipe, &fixed) == 0) {
 		src = "current (BIOS)";
 	}
@@ -626,11 +614,12 @@ void lg_lvds_init(struct lg_display *d)
 	p->a3_power = lvds & LVDS_A3_POWER_MASK;
 	d->lvds_dual = p->is_dual_link;
 
-	kprintf("[drm] i915: LVDS panel %ux%u@%u (%s fixed mode, %u kHz), %s-link, %d bpp, %ux%u mm, SSC %s\n",
+	kprintf("[drm] i915: LVDS panel %ux%u@%u (%s fixed mode, %u kHz), %s-link, %d bpp, %ux%u mm, SSC %s (VBT panel type %d via %s)\n",
 		fixed.hdisplay, fixed.vdisplay, mode_vrefresh(&fixed), src, fixed.clock,
 		p->is_dual_link ? "dual" : "single",
 		p->a3_power == LVDS_A3_POWER_UP ? 24 : 18, o->mm_width, o->mm_height,
-		d->lvds_use_ssc ? "on" : "off");
+		d->lvds_use_ssc ? "on" : "off", d->vbt.panel_type,
+		d->vbt.valid ? intel_vbt_panel_src_name(d->vbt.panel_type_src) : "no VBT");
 	return;
 
 fail:

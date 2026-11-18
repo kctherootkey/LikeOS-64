@@ -640,6 +640,8 @@ void intel_tc_disconnect(struct i915_device *i915, struct intel_output *o)
 {
 	if (!o->is_tc || !o->tc_owned)
 		return;
+	/* the AUX holds still waiting for their release go before the PHY */
+	intel_power_flush_async(i915);
 	phy_disconnect(i915, o);
 	o->tc_owned = 0;
 	o->tc_mode = INTEL_TC_DISCONNECTED;

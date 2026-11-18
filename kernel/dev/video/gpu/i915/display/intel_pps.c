@@ -108,30 +108,40 @@ static void pick_pps(struct i915_device *i915)
 	d->pps_base = base + (uint32_t)idx * 0x100;
 }
 
-int intel_pps_init(struct i915_device *i915)
+/* What the firmware programmed into the sequencer, as read at init: the
+ * pass made once the panel's VBT entries are known starts from it again,
+ * not from what the first pass wrote. */
+static struct pps_delays g_pps_hw[2];
+static int g_pps_hw_valid[2];
+
+static void pps_read_hw(struct i915_device *i915, struct pps_delays *hw)
 {
-	struct intel_vbt *vbt = &i915->display.vbt;
-	pick_pps(i915);
 	uint32_t on = i915_read32(i915, PPS(i915, 8));
 	uint32_t off = i915_read32(i915, PPS(i915, 0xc));
 
-	/* What the firmware programmed, the VBT, and the spec's maxima:
-	 * the longest of each wins, so a delay is never shortened. */
-	struct pps_delays hw = {
-		.t1_t3 = (on & PANEL_POWER_UP_DELAY_MASK) >> PANEL_POWER_UP_DELAY_SHIFT,
-		.t8 = on & PANEL_LIGHT_ON_DELAY_MASK,
-		.t9 = off & PANEL_LIGHT_OFF_DELAY_MASK,
-		.t10 = (off & PANEL_POWER_DOWN_DELAY_MASK) >> PANEL_POWER_DOWN_DELAY_SHIFT,
-		.t11_t12 = 0,
-	};
+	hw->t1_t3 = (on & PANEL_POWER_UP_DELAY_MASK) >> PANEL_POWER_UP_DELAY_SHIFT;
+	hw->t8 = on & PANEL_LIGHT_ON_DELAY_MASK;
+	hw->t9 = off & PANEL_LIGHT_OFF_DELAY_MASK;
+	hw->t10 = (off & PANEL_POWER_DOWN_DELAY_MASK) >> PANEL_POWER_DOWN_DELAY_SHIFT;
 	if (i915->pch >= I915_PCH_CNP || i915->display.model == INTEL_DISPLAY_BXT) {
 		uint32_t ctl = i915_read32(i915, PPS(i915, 4));
-		hw.t11_t12 = ((ctl & BXT_POWER_CYCLE_DELAY_MASK) >>
-			      BXT_POWER_CYCLE_DELAY_SHIFT) * 1000 / 100;
+		hw->t11_t12 = ((ctl & BXT_POWER_CYCLE_DELAY_MASK) >>
+			       BXT_POWER_CYCLE_DELAY_SHIFT) * 1000 / 100;
 	} else {
 		uint32_t div = i915_read32(i915, PPS(i915, 0x10));
-		hw.t11_t12 = (div & PANEL_POWER_CYCLE_DELAY_MASK) * 1000 / 100;
+		hw->t11_t12 = (div & PANEL_POWER_CYCLE_DELAY_MASK) * 1000 / 100;
 	}
+}
+
+/* The delays from what the firmware programmed (`hw'), the VBT and the
+ * spec, into the sequencer. */
+static void pps_program(struct i915_device *i915, const struct pps_delays *hwp)
+{
+	struct intel_vbt *vbt = &i915->display.vbt;
+	struct pps_delays hw = *hwp;
+	uint32_t on = i915_read32(i915, PPS(i915, 8));
+	uint32_t off = i915_read32(i915, PPS(i915, 0xc));
+
 	struct pps_delays v = { 0, 0, 0, 0, 0 };
 	if (vbt->pps.valid) {
 		v.t1_t3 = vbt->pps.t1_t3;
@@ -177,7 +187,43 @@ int intel_pps_init(struct i915_device *i915)
 		i915->display.pps_idx, g_pps.t1_t3 / 10, g_pps.t1_t3 % 10, g_pps.t8 / 10, g_pps.t8 % 10,
 		g_pps.t9 / 10, g_pps.t9 % 10, g_pps.t10 / 10, g_pps.t10 % 10,
 		g_pps.t11_t12 / 10, g_pps.t11_t12 % 10);
+}
+
+int intel_pps_init(struct i915_device *i915)
+{
+	struct pps_delays hw;
+
+	pick_pps(i915);
+	pps_read_hw(i915, &hw);
+	g_pps_hw[i915->display.pps_idx & 1] = hw;
+	g_pps_hw_valid[i915->display.pps_idx & 1] = 1;
+	pps_program(i915, &hw);
 	return 0;
+}
+
+void intel_pps_init_late(struct i915_device *i915, struct intel_output *o)
+{
+	struct intel_display *d = &i915->display;
+	uint32_t old_base = d->pps_base;
+	struct pps_delays hw;
+
+	/* the VBT may name the panel's backlight controller, and with it
+	 * its sequencer, only now */
+	pick_pps(i915);
+	if (d->pps_base != old_base && o->vdd_forced) {
+		uint32_t ctl = i915_read32(i915, old_base + 4);
+
+		ctl &= ~PANEL_UNLOCK_MASK;
+		ctl |= PANEL_UNLOCK_REGS;
+		i915_write32(i915, old_base + 4, ctl & ~EDP_FORCE_VDD);
+		(void)i915_read32(i915, old_base + 4);
+		o->vdd_forced = 0;
+	}
+	if (g_pps_hw_valid[d->pps_idx & 1])
+		hw = g_pps_hw[d->pps_idx & 1];
+	else
+		pps_read_hw(i915, &hw);
+	pps_program(i915, &hw);
 }
 
 static int pps_wait(struct i915_device *i915, uint32_t mask, uint32_t value,

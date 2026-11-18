@@ -2900,7 +2900,8 @@ static int edp_init(struct lg_dp *dp)
 {
 	struct lg_display *d = dp->d;
 	struct lg_output *o = dp->o;
-	struct drm_edid_info *info;
+	const struct lg_vbt_child *child;
+	const char *edid_src = "EDID", *edid_fail = NULL;
 
 	lg_pps_edp_init(d, o);
 
@@ -2922,34 +2923,62 @@ static int edp_init(struct lg_dp *dp)
 	dp_set_max_sink_lanes(dp);
 	dp->has_dpcd = 1;
 
-	(void)lg_read_edid(d, o);
+	/* The EDID, read once: the panel's, else the copy the firmware
+	 * keeps in the OpRegion.  One that gives no mode is none. */
+	if (lg_read_edid(d, o) != 0 || o->edid_len <= 0) {
+		int n = intel_opregion_get_edid(d->i915, o->edid, sizeof(o->edid));
+
+		edid_fail = "EDID read failed";
+		o->edid_len = n > 0 ? n : 0;
+		if (n > 0)
+			edid_src = "OpRegion EDID";
+	}
 	edp_vdd_put(dp);
 
 	o->fixed_mode_valid = 0;
-	info = kalloc(sizeof(*info));
-	if (info && o->edid_len && drm_edid_parse(o->edid, (unsigned)o->edid_len, info) == 0) {
-		dp->edid_bpc = info->bpc;
-		if (info->preferred >= 0 && info->preferred < info->nmodes) {
-			o->fixed_mode = info->modes[info->preferred];
-			o->fixed_mode_valid = 1;
-		}
-		o->mm_width = info->mm_width;
-		o->mm_height = info->mm_height;
+	dp->edid_bpc = 0;
+	if (o->edid_len > 0 &&
+	    intel_panel_edid_fixed_modes(o->edid, (unsigned)o->edid_len, DRM_MODE_CONNECTOR_eDP,
+					 &o->fixed_mode, 1, &dp->edid_bpc, &o->mm_width,
+					 &o->mm_height) > 0) {
+		o->fixed_mode_valid = 1;
+	} else if (o->edid_len > 0) {
+		o->edid_len = 0;
+		edid_fail = edid_fail ? "EDID read failed, OpRegion EDID gives no mode" :
+					"EDID gives no mode";
 	}
-	if (info)
-		kfree(info);
+
+	/* The VBT panel type, decided with the EDID where the table defers
+	 * to its PnP id; the sequencer's delays again when its entry only
+	 * now became known. */
+	child = lg_vbt_child_for_port(d, o->port);
+	if (lg_vbt_init_panel(d, o->edid_len > 0 ? o->edid : NULL,
+			      (uint32_t)(o->edid_len > 0 ? o->edid_len : 0),
+			      child && child->handle == 0x0080) == 1)
+		lg_pps_edp_init_late(d, o);
+
 	if (!o->fixed_mode_valid && d->vbt.lfp_mode_valid) {
 		o->fixed_mode = d->vbt.lfp_mode;
 		o->fixed_mode_valid = 1;
+		edid_src = "VBT";
 	}
 	if (!o->mm_width || !o->mm_height) {
 		o->mm_width = d->vbt.lfp_width_mm;
 		o->mm_height = d->vbt.lfp_height_mm;
 	}
 	if (!o->fixed_mode_valid) {
-		kprintf("[drm] i915: %s: no fixed mode for the panel, disabling eDP\n", o->name);
+		kprintf("[drm] i915: %s: no fixed mode for the panel (%s, VBT panel type %d via %s has no timing), disabling eDP\n",
+			o->name, edid_fail ? edid_fail : "no EDID", d->vbt.panel_type,
+			d->vbt.valid ? intel_vbt_panel_src_name(d->vbt.panel_type_src) : "no VBT");
 		return -ENODEV;
 	}
+	if (!o->fixed_mode.vrefresh || !o->fixed_mode.name[0])
+		drm_mode_finish(&o->fixed_mode);
+	kprintf("[drm] i915: %s: eDP panel %ux%u@%u (%u kHz) from %s%s%s (VBT panel type %d via %s)\n",
+		o->name, o->fixed_mode.hdisplay, o->fixed_mode.vdisplay, o->fixed_mode.vrefresh,
+		o->fixed_mode.clock, edid_src, edid_fail ? ", " : "", edid_fail ? edid_fail : "",
+		d->vbt.panel_type,
+		d->vbt.valid ? intel_vbt_panel_src_name(d->vbt.panel_type_src) : "no VBT");
 	o->fixed_mode.type |= DRM_MODE_TYPE_PREFERRED;
 	o->is_panel = 1;
 

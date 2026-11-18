@@ -2778,7 +2778,9 @@ int intel_legacy_display_resume(struct i915_device *i915)
 		o->active = 0;
 		o->pipe = -1;
 		o->detected = 0;
-		o->edid_len = 0;
+		/* an LVDS or eDP panel's EDID was read once and stays */
+		if (o->type != LG_OUTPUT_LVDS && o->type != LG_OUTPUT_EDP)
+			o->edid_len = 0;
 		if (o->funcs->resume)
 			o->funcs->resume(d, o);
 	}

@@ -456,9 +456,27 @@ void pci_assign_unassigned_bars(void)
 							  p->function, off);
 			/* Treat zero, 0xFFFFFFFF, or suspicious tiny (<4KB) mem BARs as unassigned */
 			int looks_mem = (val & 0x1) == 0; /* memory BAR */
-			unsigned int base_field = val & ~0xFUL;
-			if (val == 0 || val == 0xFFFFFFFF ||
-			    (looks_mem && base_field < 0x1000)) {
+			/* A 64-bit memory BAR's address is both dwords: one
+			 * the firmware placed on a 4 GB boundary (a graphics
+			 * aperture at 0x4000000000, say) has a low dword of
+			 * just its flag bits, and is assigned all the same. */
+			int cur64 = looks_mem && (val & 0x6) == 0x4 && bar < 5;
+			unsigned long base_field = val & ~0xFUL;
+			if (cur64)
+				base_field |=
+					(unsigned long)pci_cfg_read32(
+						p->bus, p->device, p->function,
+						off + 4)
+					<< 32;
+			if (!(val == 0 || val == 0xFFFFFFFF ||
+			      (looks_mem && base_field < 0x1000))) {
+				/* Assigned.  The upper dword of a 64-bit
+				 * BAR is not a BAR of its own. */
+				if (cur64)
+					bar++;
+				continue;
+			}
+			{
 				/* Probe size */
 				pci_cfg_write32(p->bus, p->device, p->function,
 						off, 0xFFFFFFFF);
@@ -540,6 +558,8 @@ void pci_assign_unassigned_bars(void)
 					p->bar[bar] = pci_cfg_read32(
 						p->bus, p->device, p->function,
 						off);
+				} else if (is64 && bar < 5) {
+					bar++; /* its upper dword is no BAR */
 				}
 			}
 		}

@@ -6,7 +6,9 @@
 // channel with a control register and five data registers; a
 // transaction is written into the data registers as a header plus
 // payload, started with the busy bit, and its reply read back the same
-// way.  Tiger Lake numbers its Type-C ports' channels after A-C (USBC1
+// way.  Every transaction runs with the channel's power domain held:
+// from Ice Lake to Alder Lake and on DG1/DG2 the channel has a power well
+// of its own, which is down whenever nothing holds it.  Tiger Lake numbers its Type-C ports' channels after A-C (USBC1
 // is the fourth); Meteor Lake moved them into PICA, 0x200 apart, and powers
 // every channel through a request bit in its control register, which a
 // transfer must therefore keep set when it writes the register.  Display
@@ -124,9 +126,44 @@ static void aux_power_up(struct intel_dp_aux *aux)
 	lapic_delay_us(600);
 }
 
+/* The power domain of the channel (Skylake's channel E is A's). */
+static enum intel_power_domain aux_power_domain(const struct intel_dp_aux *aux)
+{
+	int ch = aux->port >= 0 && aux->port <= INTEL_PW_AUX_I - INTEL_PW_AUX_A ? aux->port : 0;
+
+	if (aux->i915->display.model == INTEL_DISPLAY_SKL && ch > 3)
+		ch = 0;
+	return (enum intel_power_domain)(INTEL_PW_AUX_A + ch);
+}
+
+/* The channel's power domain, held around every transaction and by
+ * callers around a burst of them (a probe, an EDID read); an enabled
+ * output holds it for as long as it runs.  Such a hold is released 100 ms
+ * after the last one, so back-to-back transactions find the channel up,
+ * and it leaves the wells it found up for the firmware as they were.
+ * The domains' counts are the display lock's to guard: every user of a
+ * channel holds that lock already, and it nests. */
+uint32_t intel_dp_aux_power_get(struct intel_dp_aux *aux)
+{
+	intel_display_lock(aux->i915);
+	return intel_power_get_transient(aux->i915, aux_power_domain(aux));
+}
+
+void intel_dp_aux_power_put(struct intel_dp_aux *aux, uint32_t was)
+{
+	intel_power_put_async(aux->i915, aux_power_domain(aux), was);
+	intel_display_unlock(aux->i915);
+}
+
+enum intel_power_domain intel_dp_aux_power_domain(const struct intel_dp_aux *aux)
+{
+	return aux_power_domain(aux);
+}
+
 /* One transaction: `send' bytes (header + payload) out, the reply back
  * into `recv' (up to `recv_cap').  Returns the reply length (the first
- * byte is the reply header) or a negative errno. */
+ * byte is the reply header) or a negative errno.  The caller holds the
+ * channel's power domain. */
 static int aux_xfer(struct intel_dp_aux *aux, const uint8_t *send,
 		    unsigned send_bytes, uint8_t *recv, unsigned recv_cap)
 {
@@ -227,7 +264,9 @@ static int aux_request(struct intel_dp_aux *aux, uint8_t cmd, uint32_t addr,
 		}
 	}
 	for (int retry = 0; retry < AUX_RETRIES; retry++) {
+		uint32_t pw = intel_dp_aux_power_get(aux);
 		int got = aux_xfer(aux, send, n, recv, sizeof(recv));
+		intel_dp_aux_power_put(aux, pw);
 		if (got < 0)
 			return got;
 		uint8_t reply = recv[0] >> 4;
@@ -411,13 +450,16 @@ static void aux_msg_header(uint8_t txbuf[HEADER_SIZE], const struct drm_dp_aux_m
 static int aux_xfer_locked(struct intel_dp_aux *aux, const uint8_t *send,
 			   unsigned send_bytes, uint8_t *recv, unsigned recv_cap)
 {
+	uint32_t pw;
 	int ret;
 
+	pw = intel_dp_aux_power_get(aux);
 	if (aux->hw_lock)
 		mm_write_lock(aux->hw_lock);
 	ret = aux_xfer(aux, send, send_bytes, recv, recv_cap);
 	if (aux->hw_lock)
 		mm_write_unlock(aux->hw_lock);
+	intel_dp_aux_power_put(aux, pw);
 	return ret;
 }
 

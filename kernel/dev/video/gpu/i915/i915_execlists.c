@@ -13,6 +13,8 @@
 // says it means (i915_execlists_process_csb), and none is set aside.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2014-2024 Intel Corporation
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
@@ -28,18 +30,52 @@ static inline int csb_write_index(struct i915_engine *e)
 	return e->i915->info->gen >= 11 ? ICL_HWS_CSB_WRITE_INDEX : I915_HWS_CSB_WRITE_INDEX;
 }
 
+/* The status buffer's lines in the status page written back and dropped
+ * from the processor's caches. */
+static void csb_clflush(struct i915_engine *e)
+{
+	const volatile uint8_t *from = (const volatile uint8_t *)&e->hwsp[I915_HWS_CSB_BUF0_INDEX];
+	const volatile uint8_t *to = from + (unsigned)e->csb_entries * 8;
+
+	for (uintptr_t a = (uintptr_t)from & ~(uintptr_t)63; a < (uintptr_t)to; a += 64)
+		__asm__ volatile("clflush (%0)" ::"r"(a) : "memory");
+	__asm__ volatile("mfence" ::: "memory");
+}
+
 int i915_execlists_init_engine(struct i915_engine *e)
 {
 	struct i915_device *i915 = e->i915;
 	int reset = e->csb_entries - 1;
+	uint32_t ptr = (0xffffu << 16) | ((uint32_t)reset << 8) | (uint32_t)reset;
 
-	/* both pointers to the last entry, the mirror emptied */
-	i915_write32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base),
-		     (0xffffu << 16) | ((uint32_t)reset << 8) | (uint32_t)reset);
-	for (int i = 0; i < 2 * e->csb_entries; i++)
-		e->hwsp[I915_HWS_CSB_BUF0_INDEX + i] = 0xffffffffu;
-	e->hwsp[csb_write_index(e)] = (uint32_t)reset;
-	e->csb_head = reset;
+	if (i915->info->gen >= 11) {
+		/* Gen11 on: done while the engine is still in ring buffer
+		 * mode (engine_hw_init), before the execution lists are
+		 * switched on.  The pointers are set on both sides of the
+		 * emptying of the buffer: Ice Lake does not always reset
+		 * them itself.  After it the hardware writes entry 0
+		 * first, so the head and the page's copy of the write
+		 * pointer both start on the last entry. */
+		i915_write32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base), ptr);
+		(void)i915_read32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base));
+		e->csb_head = reset;
+		e->hwsp[csb_write_index(e)] = (uint32_t)reset;
+		__asm__ volatile("sfence" ::: "memory");
+		for (int i = 0; i < e->csb_entries; i++)
+			((volatile uint64_t *)&e->hwsp[I915_HWS_CSB_BUF0_INDEX])[i] = ~0ULL;
+		csb_clflush(e);
+		__asm__ volatile("clflush (%0)" ::"r"(&e->hwsp[csb_write_index(e)]) : "memory");
+		__asm__ volatile("mfence" ::: "memory");
+		i915_write32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base), ptr);
+		(void)i915_read32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base));
+	} else {
+		/* both pointers to the last entry, the mirror emptied */
+		i915_write32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base), ptr);
+		for (int i = 0; i < 2 * e->csb_entries; i++)
+			e->hwsp[I915_HWS_CSB_BUF0_INDEX + i] = 0xffffffffu;
+		e->hwsp[csb_write_index(e)] = (uint32_t)reset;
+		e->csb_head = reset;
+	}
 	e->active_ctx = NULL;
 	e->active_lrc = NULL;
 	e->active_ctx_id = 0;
@@ -68,10 +104,13 @@ static void port_write(struct i915_engine *e, uint64_t desc)
 	uint32_t base = e->mmio_base;
 
 	if (i915->info->gen >= 11) {
-		i915_write32(i915, RING_EXECLIST_SQ_CONTENTS(base) + 0, (uint32_t)desc);
-		i915_write32(i915, RING_EXECLIST_SQ_CONTENTS(base) + 4, (uint32_t)(desc >> 32));
+		/* The submit queue keeps what it was loaded with: every
+		 * slot is written each time, the last first, low dword
+		 * before high, then the queue is loaded. */
 		i915_write32(i915, RING_EXECLIST_SQ_CONTENTS(base) + 8, 0);
 		i915_write32(i915, RING_EXECLIST_SQ_CONTENTS(base) + 12, 0);
+		i915_write32(i915, RING_EXECLIST_SQ_CONTENTS(base) + 0, (uint32_t)desc);
+		i915_write32(i915, RING_EXECLIST_SQ_CONTENTS(base) + 4, (uint32_t)(desc >> 32));
 		i915_write32(i915, RING_EXECLIST_CONTROL(base), EL_CTRL_LOAD);
 		(void)i915_read32(i915, RING_EXECLIST_CONTROL(base));
 		return;
@@ -145,7 +184,12 @@ void i915_execlists_submit(struct i915_engine *e)
 		}
 	}
 	e->port_busy = 1;
-	port_write(e, i915_lrc_descriptor(i915, lrc, e));
+	uint64_t desc = i915_lrc_descriptor(i915, lrc, e);
+	/* Gen11 on: the engines that share the execution units name the
+	 * units' priority for the context, normal */
+	if (i915->info->gen >= 11 && (e->class == 0 || e->class == 4))
+		desc |= GEN12_CTX_PRIORITY_NORMAL;
+	port_write(e, desc);
 }
 
 /* One entry of the status buffer, both words in one read: the hardware
@@ -159,6 +203,40 @@ static uint64_t csb_read(struct i915_engine *e, int index)
 	if (!(e->i915->info->flags & I915_INFO_HAS_LLC))
 		__asm__ volatile("clflush (%0)" ::"r"(p) : "memory");
 	return *p;
+}
+
+/* The status buffer's own registers: entries 0-5 in the first bank,
+ * 6-11 (Gen11 on) in the second. */
+static uint64_t csb_read_mmio(struct i915_engine *e, int index)
+{
+	uint32_t reg = index < 6 ? RING_CONTEXT_STATUS_BUF_LO(e->mmio_base, index) :
+				   RING_CONTEXT_STATUS_BUF2_LO(e->mmio_base, index - 6);
+	return i915_read64(e->i915, reg);
+}
+
+/* Gen11 on: one entry, consumed.  The engine does not always make its
+ * write of an entry visible before its write of the write pointer (Ice
+ * Lake, Tiger Lake), and on Tiger Lake and DG1 the write of the entry
+ * into the status page can be lost altogether: an entry still empty is
+ * looked at for up to 10 us, then taken from the status registers.  It
+ * is never left for later -- an entry that never arrives in the page
+ * would hold the head, and the port, for ever.  Each entry is emptied
+ * once read, so that a stale one is recognised the next time round. */
+static uint64_t csb_take_gen11(struct i915_engine *e, int index)
+{
+	volatile uint64_t *p = (volatile uint64_t *)&e->hwsp[I915_HWS_CSB_BUF0_INDEX + index * 2];
+	uint64_t entry = csb_read(e, index);
+
+	if (entry == ~0ULL) {
+		for (int t = 0; t < 10 && entry == ~0ULL; t++) {
+			lapic_delay_us(1);
+			entry = csb_read(e, index);
+		}
+		if (entry == ~0ULL)
+			entry = csb_read_mmio(e, index);
+	}
+	*p = ~0ULL;
+	return entry;
 }
 
 /* Does this entry say a context is being handed the engine (as opposed to
@@ -178,6 +256,13 @@ static int csb_promotes(struct i915_device *i915, uint64_t entry)
 	uint32_t lower = (uint32_t)entry;
 	uint32_t upper = (uint32_t)(entry >> 32);
 
+	if (i915->info->gen_x10 >= 125) {
+		/* Xe_HP: the ids are wider, the new-queue bit is high */
+		int away_valid = ((upper & XEHP_CSB_SW_CTX_ID_MASK) >> XEHP_CSB_SW_CTX_ID_SHIFT) !=
+				 XEHP_IDLE_CTX_ID;
+		int new_queue = !!(upper & XEHP_CTX_STATUS_SWITCHED_TO_NEW_QUEUE);
+		return !away_valid || new_queue;
+	}
 	if (i915->info->gen >= 12) {
 		int away_valid = ((upper & GEN12_CSB_SW_CTX_ID_MASK) >> GEN12_CSB_SW_CTX_ID_SHIFT) !=
 				 GEN12_IDLE_CTX_ID;
@@ -199,6 +284,31 @@ static int csb_process(struct i915_engine *e)
 	if (write >= e->csb_entries)
 		write = e->csb_entries - 1;
 	int head = e->csb_head;
+	if (i915->info->gen >= 11) {
+		if (head != write) {
+			/* the write pointer is read before any entry */
+			__asm__ volatile("lfence" ::: "memory");
+			do {
+				head = (head + 1) % e->csb_entries;
+				uint64_t entry = csb_take_gen11(e, head);
+				/* as below: the last entry says whether the
+				 * context in the port has left */
+				if (csb_promotes(i915, entry)) {
+					left = 0;
+					/* Tiger Lake wants a moment here */
+					(void)i915_read32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base));
+				} else {
+					left = 1;
+				}
+			} while (head != write);
+			e->csb_head = head;
+			/* Gen11 does not always order an entry's write before
+			 * the write pointer's: the lines are dropped, so that
+			 * the next entries are read fresh from memory */
+			csb_clflush(e);
+		}
+		goto port;
+	}
 	while (head != write) {
 		head = (head + 1) % e->csb_entries;
 		uint64_t entry = csb_read(e, head);
@@ -223,6 +333,7 @@ static int csb_process(struct i915_engine *e)
 		i915_write32(i915, RING_CONTEXT_STATUS_PTR(e->mmio_base),
 			     (GEN8_CSB_READ_PTR_MASK << 16) | ((uint32_t)head << 8));
 	}
+port:
 	if (left) {
 		e->port_busy = 0;
 		e->active_ctx = NULL;
@@ -249,6 +360,46 @@ void i915_execlists_process_csb_irq(struct i915_engine *e)
 	if (i915_is_legacy(e->i915))
 		return;
 	(void)csb_process(e);
+}
+
+/* The state of the port and of the status buffer, for a fence that does
+ * not signal: whether the port is held, where the driver's head is,
+ * where the engine says it has written to (in the status page and in
+ * its register), the execution list status, the mode, where the status
+ * page is programmed, and the next entry to read and the last one
+ * written, as the status page and the registers have them. */
+void i915_execlists_report(struct i915_engine *e)
+{
+	struct i915_device *i915 = e->i915;
+	uint32_t base = e->mmio_base;
+	uint64_t fl;
+
+	if (i915_is_legacy(i915) || i915->guc.submission)
+		return;
+	spin_lock_irqsave(&e->lock, &fl);
+	int busy = e->port_busy;
+	int head = e->csb_head;
+	uint32_t id = e->active_ctx_id;
+	spin_unlock_irqrestore(&e->lock, fl);
+	int n = e->csb_entries;
+	uint32_t wp = i915_hwsp_read(e, csb_write_index(e));
+	int next = (head + 1) % n;
+	int last = (int)(wp & 0xff) < n ? (int)(wp & 0xff) : n - 1;
+	uint64_t next_page = csb_read(e, next), last_page = csb_read(e, last);
+	uint64_t next_reg = csb_read_mmio(e, next), last_reg = csb_read_mmio(e, last);
+
+	kprintf("[drm] i915:   %s: execution lists: port %s (context id %u), status head %d, write pointer %u in the page, pointers register %08x, execlist status %08x %08x, ring mode %08x, status page %08x (programmed %08x)\n",
+		e->name, busy ? "busy" : "free", id, head, wp,
+		i915_read32(i915, RING_CONTEXT_STATUS_PTR(base)),
+		i915_read32(i915, RING_EXECLIST_STATUS_LO(base)),
+		i915_read32(i915, RING_EXECLIST_STATUS_HI(base)),
+		i915_read32(i915, RING_MODE_GEN7(base)), e->hwsp_ggtt,
+		i915_read32(i915, RING_HWS_PGA(base)));
+	kprintf("[drm] i915:   %s: status entry %d (next) %08x %08x in the page, %08x %08x in the registers; entry %d (last written) %08x %08x in the page, %08x %08x in the registers\n",
+		e->name, next, (uint32_t)(next_page >> 32), (uint32_t)next_page,
+		(uint32_t)(next_reg >> 32), (uint32_t)next_reg, last,
+		(uint32_t)(last_page >> 32), (uint32_t)last_page, (uint32_t)(last_reg >> 32),
+		(uint32_t)last_reg);
 }
 
 /* ---- the GT worker: hang detection and a safety net for lost interrupts -- */

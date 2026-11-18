@@ -52,6 +52,7 @@
 #define VBT_BDB_LFP_DATA 42
 #define VBT_BDB_LFP_BACKLIGHT 43
 #define VBT_BDB_MIPI_SEQUENCE 53
+#define VBT_BDB_GENERIC_DTD 58 /* BDB 229+ */
 
 /* Child device types: the old exact codes and the bits of the 915+ ones */
 #define VBT_DEVICE_TYPE_TV 0x0009
@@ -667,28 +668,6 @@ static int fill_detail_timing(const uint8_t *t, struct drm_mode_modeinfo *m,
 	return 1;
 }
 
-/* Which of the 16 panel entries this machine has: the table's own
- * choice when it is a valid index, else the first entry.  (A table that
- * defers to the panel's EDID ID, 0xff, gets the first entry too: no EDID
- * has been read when the table is parsed.) */
-static int get_panel_type(struct lg_display *d)
-{
-	uint32_t len = 0;
-	const uint8_t *b = lg_vbt_block(d, VBT_BDB_LFP_OPTIONS, &len);
-	int pt;
-
-	if (!b)
-		return 0;
-	pt = rd8(b, len, 0);
-	if (pt < 16)
-		return pt;
-	if (pt == 0xff)
-		i915_dbg("[drm] i915: VBT panel type by PNP ID, using the fallback\n");
-	else
-		i915_dbg("[drm] i915: invalid VBT panel type 0x%x\n", pt);
-	return 0;
-}
-
 static void parse_panel_options(struct lg_display *d)
 {
 	uint32_t len = 0;
@@ -819,7 +798,7 @@ static int generate_lfp_data_ptrs(struct lg_display *d, uint32_t data_size,
 }
 
 static int get_lfp_data_ptrs(struct lg_display *d, const uint8_t *data, uint32_t data_size,
-			     struct lfp_ptrs *ptrs)
+			     struct lfp_ptrs *ptrs, int verbose)
 {
 	uint32_t len = 0, data_off = 0, dummy;
 	const uint8_t *b = lg_vbt_block(d, VBT_BDB_LFP_DATA_PTRS, &len);
@@ -856,8 +835,157 @@ static int get_lfp_data_ptrs(struct lg_display *d, const uint8_t *data, uint32_t
 	if (validate_lfp_data_ptrs(ptrs, data, data_size))
 		return 1;
 bad:
-	kprintf("[drm] i915: VBT has malformed LFP data table pointers\n");
+	if (verbose)
+		kprintf("[drm] i915: VBT has malformed LFP data table pointers\n");
 	return 0;
+}
+
+/* The panel type the table's PnP ids name for this EDID: the first
+ * entry equal to the EDID's ten identification bytes (manufacturer,
+ * product, serial, week and year of manufacture), else the first that
+ * equals them with no date given; -1 for none. */
+static int pnpid_get_panel_type(struct lg_display *d, const uint8_t *edid, uint32_t edid_len)
+{
+	struct lfp_ptrs ptrs;
+	uint32_t data_size = 0;
+	const uint8_t *data = lg_vbt_block(d, VBT_BDB_LFP_DATA, &data_size);
+	uint8_t id[VBT_PNP_ID_SIZE], nodate[VBT_PNP_ID_SIZE];
+	int best = -1, i, k;
+
+	if (!edid || edid_len < 128)
+		return -1;
+	for (i = 0; i < VBT_PNP_ID_SIZE; i++)
+		id[i] = nodate[i] = edid[8 + i];
+	nodate[8] = 0;
+	nodate[9] = 0;
+	i915_dbg("[drm] i915: EDID PnP id %02x%02x %02x%02x %02x%02x%02x%02x week %u year %u\n",
+		 id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7], id[8], id[9]);
+	if (!data || !get_lfp_data_ptrs(d, data, data_size, &ptrs, 0))
+		return -1;
+	for (i = 0; i < 16; i++) {
+		const uint8_t *v = data + ptrs.p[i].pnp.off;
+		int same = 1, same_nodate = 1;
+
+		for (k = 0; k < VBT_PNP_ID_SIZE; k++) {
+			if (v[k] != id[k])
+				same = 0;
+			if (v[k] != nodate[k])
+				same_nodate = 0;
+		}
+		if (same)
+			return i;
+		if (best < 0 && same_nodate)
+			best = i;
+	}
+	return best;
+}
+
+/* The LFP options block's panel type for the first or the second panel
+ * (BDB 212+; a shorter block reads zero there); -1 for none or an
+ * invalid one, 0xff ("by PnP id") passed on.  The range is checked on
+ * the first panel's value whichever is asked for. */
+static int vbt_get_panel_type(struct lg_display *d, int lfp2)
+{
+	uint32_t len = 0;
+	const uint8_t *b = lg_vbt_block(d, VBT_BDB_LFP_OPTIONS, &len);
+	int t;
+
+	if (!b)
+		return -1;
+	t = rd8(b, len, 0);
+	if (t > 0xf && t != 0xff) {
+		i915_dbg("[drm] i915: invalid VBT panel type 0x%x\n", t);
+		return -1;
+	}
+	if (lfp2)
+		t = rd8(b, len, 1);
+	if (t > 0xf && t != 0xff)
+		return -1;
+	return t;
+}
+
+/* Which of the 16 panel entries this machine has: what the table names,
+ * or with 0xff the entry whose PnP id matches the panel's EDID; neither,
+ * the first entry -- but only with `use_fallback', so that a decision
+ * that needs the EDID is left until it has been read.  (The firmware's
+ * own idea of the panel type, which the OpRegion can be asked for, is
+ * not consulted: firmware reports it unreliably.) */
+static int get_panel_type(struct lg_display *d, const uint8_t *edid, uint32_t edid_len,
+			  int lfp2, int use_fallback, int *src)
+{
+	int vbt = vbt_get_panel_type(d, lfp2);
+	int pnpid = pnpid_get_panel_type(d, edid, edid_len);
+
+	if (vbt == 0xff && pnpid >= 0) {
+		*src = INTEL_VBT_PANEL_PNPID;
+		return pnpid;
+	}
+	if (vbt != 0xff && vbt >= 0) {
+		*src = INTEL_VBT_PANEL_VBT;
+		return vbt;
+	}
+	if (use_fallback) {
+		*src = INTEL_VBT_PANEL_FALLBACK;
+		return 0;
+	}
+	*src = INTEL_VBT_PANEL_NONE;
+	return -1;
+}
+
+/* The generic DTD block (BDB 229+): a u16 entry size, then a 28-byte
+ * entry per panel type -- the pixel clock in kHz (u32), u16s of hactive,
+ * hblank, hfront porch, hsync, the same vertically, the size in mm, and
+ * a flag byte whose bit 7 is a positive horizontal sync and bit 6 a
+ * positive vertical one.  Its timing wins over the LFP data block's. */
+#define VBT_GENERIC_DTD_SIZE 28
+
+static void parse_generic_dtd(struct lg_display *d, int panel_type)
+{
+	uint32_t len = 0, esz, num, e;
+	const uint8_t *b;
+	struct drm_mode_modeinfo *m = &d->vbt.lfp_mode;
+
+	if (d->vbt.version < 229)
+		return;
+	b = lg_vbt_block(d, VBT_BDB_GENERIC_DTD, &len);
+	if (!b || len < 2)
+		return;
+	esz = rd16(b, len, 0);
+	if (esz < VBT_GENERIC_DTD_SIZE) {
+		kprintf("[drm] i915: VBT generic DTD size %u is too small\n", esz);
+		return;
+	}
+	num = (len - 2) / esz;
+	if ((uint32_t)panel_type >= num) {
+		kprintf("[drm] i915: VBT panel type %d not in the table of %u generic DTDs\n",
+			panel_type, num);
+		return;
+	}
+	e = 2 + (uint32_t)panel_type * esz;
+	mm_memset(m, 0, sizeof(*m));
+	m->clock = rd32(b, len, e + 0);
+	m->hdisplay = rd16(b, len, e + 4);
+	m->hsync_start = (uint16_t)(m->hdisplay + rd16(b, len, e + 8));
+	m->hsync_end = (uint16_t)(m->hsync_start + rd16(b, len, e + 10));
+	m->htotal = (uint16_t)(m->hdisplay + rd16(b, len, e + 6));
+	m->vdisplay = rd16(b, len, e + 12);
+	m->vsync_start = (uint16_t)(m->vdisplay + rd16(b, len, e + 16));
+	m->vsync_end = (uint16_t)(m->vsync_start + rd16(b, len, e + 18));
+	m->vtotal = (uint16_t)(m->vdisplay + rd16(b, len, e + 14));
+	m->type = DRM_MODE_TYPE_PREFERRED;
+	m->flags = (rd8(b, len, e + 24) & 0x80) ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC;
+	m->flags |= (rd8(b, len, e + 24) & 0x40) ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC;
+	if (!m->hdisplay || !m->vdisplay || !m->clock || m->htotal <= m->hdisplay ||
+	    m->vtotal <= m->vdisplay) {
+		mm_memset(m, 0, sizeof(*m));
+		return;
+	}
+	drm_mode_finish(m);
+	d->vbt.lfp_width_mm = rd16(b, len, e + 20);
+	d->vbt.lfp_height_mm = rd16(b, len, e + 22);
+	d->vbt.lfp_mode_valid = 1;
+	i915_dbg("[drm] i915: VBT generic DTD panel mode %ux%u@%u clock %u kHz\n", m->hdisplay,
+		 m->vdisplay, m->vrefresh, m->clock);
 }
 
 static void parse_lfp_data(struct lg_display *d, int panel_type)
@@ -868,10 +996,12 @@ static void parse_lfp_data(struct lg_display *d, int panel_type)
 	const uint8_t *fp;
 	uint32_t x_res, y_res, lvds_reg, lvds_val;
 
-	if (!data || !get_lfp_data_ptrs(d, data, data_size, &ptrs))
+	if (!data || !get_lfp_data_ptrs(d, data, data_size, &ptrs, 1))
 		return;
 
-	if (fill_detail_timing(data + ptrs.p[panel_type].dvo.off, &d->vbt.lfp_mode,
+	/* the generic DTD block's timing, when it had the panel's, wins */
+	if (!d->vbt.lfp_mode_valid &&
+	    fill_detail_timing(data + ptrs.p[panel_type].dvo.off, &d->vbt.lfp_mode,
 			       &d->vbt.lfp_width_mm, &d->vbt.lfp_height_mm)) {
 		d->vbt.lfp_mode_valid = 1;
 		i915_dbg("[drm] i915: VBT panel mode %ux%u@%u clock %u kHz, %ux%u mm\n",
@@ -1072,17 +1202,46 @@ static void parse_edp(struct lg_display *d, int panel_type)
 		 d->vbt.edp_t8, d->vbt.edp_t9, d->vbt.edp_t10, d->vbt.edp_t11_t12);
 }
 
-static void parse_panel(struct lg_display *d)
+/* Everything the panel type indexes, once it is known. */
+static void parse_panel_entries(struct lg_display *d, int pt)
 {
-	int pt = get_panel_type(d);
-
-	d->vbt.panel_type = pt;
-	i915_dbg("[drm] i915: VBT panel type %d\n", pt);
-	parse_panel_options(d);
+	parse_generic_dtd(d, pt);
 	parse_lfp_data(d, pt);
 	parse_lfp_backlight(d, pt);
-	parse_sdvo_lvds_data(d);
 	parse_edp(d, pt);
+}
+
+/* The panel blocks while the table is parsed: the type when the table
+ * names it, and with it the panel's entries; one to be matched by the
+ * panel's EDID waits for lg_vbt_init_panel(). */
+static void parse_panel(struct lg_display *d)
+{
+	int src, pt = get_panel_type(d, NULL, 0, 0, 0, &src);
+
+	parse_panel_options(d);
+	parse_sdvo_lvds_data(d);
+	d->vbt.panel_type = pt;
+	d->vbt.panel_type_src = src;
+	if (pt < 0) {
+		i915_dbg("[drm] i915: VBT panel type by PnP id, decided with the EDID\n");
+		return;
+	}
+	i915_dbg("[drm] i915: VBT panel type %d\n", pt);
+	parse_panel_entries(d, pt);
+}
+
+int lg_vbt_init_panel(struct lg_display *d, const uint8_t *edid, uint32_t edid_len, int lfp2)
+{
+	int src, pt;
+
+	if (d->vbt.panel_type >= 0)
+		return 0;
+	pt = get_panel_type(d, edid, edid_len, lfp2, 1, &src);
+	d->vbt.panel_type = pt;
+	d->vbt.panel_type_src = src;
+	i915_dbg("[drm] i915: VBT panel type %d (%s)\n", pt, intel_vbt_panel_src_name(src));
+	parse_panel_entries(d, pt);
+	return 1;
 }
 
 /* ---- defaults ----------------------------------------------------------------- */

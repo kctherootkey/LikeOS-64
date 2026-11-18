@@ -422,6 +422,23 @@ struct i915_lrc *i915_context_lrc(struct i915_gem_context *ctx, struct i915_engi
 	return lrc;
 }
 
+/* The engine's HARDWARE class, as the Gen11/12 descriptor carries it --
+ * render 0, video decode 1, video enhancement 2, copy 3, compute 5 --
+ * from the interface's numbering the engines are kept in (render 0,
+ * copy 1, video 2, video enhancement 3, compute 4).  Only render has the
+ * same number in both. */
+static uint32_t uapi_class_to_hw(int uapi_class)
+{
+	switch (uapi_class) {
+	case I915_ENGINE_CLASS_RENDER: return 0;
+	case I915_ENGINE_CLASS_VIDEO: return 1;
+	case I915_ENGINE_CLASS_VIDEO_ENHANCE: return 2;
+	case I915_ENGINE_CLASS_COPY: return 3;
+	case I915_ENGINE_CLASS_COMPUTE: return 5;
+	default: return 4; /* other */
+	}
+}
+
 /* The descriptor the execution list port takes: the image's address,
  * the addressing mode, and the context id the status buffer will name.
  * The privilege bit is what lets the context's batches run through its
@@ -442,7 +459,7 @@ uint64_t i915_lrc_descriptor(struct i915_device *i915, struct i915_lrc *lrc, str
 	} else if (i915->info->gen >= 11) {
 		desc |= (uint64_t)lrc->hw_id << GEN11_SW_CTX_ID_SHIFT;
 		desc |= (uint64_t)e->instance << GEN11_ENGINE_INSTANCE_SHIFT;
-		desc |= (uint64_t)e->class << GEN11_ENGINE_CLASS_SHIFT;
+		desc |= (uint64_t)uapi_class_to_hw(e->class) << GEN11_ENGINE_CLASS_SHIFT;
 	} else {
 		desc |= (uint64_t)lrc->hw_id << GEN8_CTX_ID_SHIFT;
 	}
@@ -544,6 +561,13 @@ int i915_gt_golden_init(struct i915_device *i915)
 				for (int t = 0; t < 200 && e->port_busy; t++) {
 					i915_execlists_process_csb(e);
 					lapic_delay_us(500);
+				}
+				/* the port stays held: nothing after this
+				 * batch would ever be handed to the engine */
+				if (e->port_busy) {
+					kprintf("[drm] i915: %s: the first batch completed, but its context never left the engine\n",
+						e->name);
+					i915_execlists_report(e);
 				}
 			}
 			if (saved)

@@ -18,6 +18,7 @@
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
 #include <kernel/dev/video/gpu/i915/i915_xe2_reg.h>
 #include <kernel/dev/video/gpu/i915/i915_legacy.h>
+#include <kernel/dev/video/gpu/i915/display/intel_xelpdp_regs.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/ke/irq.h>
 #include <kernel/io/console.h>
@@ -304,6 +305,37 @@ static int i915_irq_handler(void *arg)
 	return mine;
 }
 
+/* Is the power well holding the pipe's interrupt registers up?  A
+ * well that is off does not claim accesses to them (each one is recorded
+ * as unclaimed), and a well that comes up starts with them at their reset
+ * values -- everything masked and disabled -- so a pipe whose well is off
+ * needs no reset.  Read from the wells' own state, not from the display
+ * code's books: this runs before the display code has come up. */
+static int pipe_irq_regs_powered(struct i915_device *i915, int pipe)
+{
+	int ver = i915->info->display_ver;
+	int idx;
+
+	if (ver >= 13) {
+		idx = XELPD_PW_CTL_IDX_PW_A + pipe; /* PW_A .. PW_D */
+	} else if (ver >= 11) {
+		if (pipe == 0)
+			return 1; /* in power well 1, up while the driver runs */
+		/* B: PW3, C: PW4, D: PW5 (Tiger Lake on) */
+		idx = pipe == 1 ? ICL_PW_CTL_IDX_PW_3 :
+		      pipe == 2 ? ICL_PW_CTL_IDX_PW_4 : TGL_PW_CTL_IDX_PW_5;
+	} else if (ver >= 9) {
+		if (pipe == 0)
+			return 1; /* in power well 1 */
+		idx = SKL_PW_CTL_IDX_PW_2;
+	} else {
+		if (pipe == 0)
+			return 1; /* always on */
+		idx = HSW_PW_CTL_IDX_GLOBAL;
+	}
+	return !!(i915_read32_fw(i915, HSW_PWR_WELL_CTL2) & HSW_PWR_WELL_CTL_STATE(idx));
+}
+
 /* Everything masked and cleared, then only the master enabled: sources
  * are switched on by the code that consumes them. */
 static void i915_irq_reset(struct i915_device *i915)
@@ -336,6 +368,8 @@ static void i915_irq_reset(struct i915_device *i915)
 		}
 	}
 	for (int pipe = 0; pipe < i915->info->num_pipes; pipe++) {
+		if (!pipe_irq_regs_powered(i915, pipe))
+			continue;
 		i915_write32_fw(i915, GEN8_DE_PIPE_IMR(pipe), ~0u);
 		i915_write32_fw(i915, GEN8_DE_PIPE_IER(pipe), 0);
 		i915_write32_fw(i915, GEN8_DE_PIPE_IIR(pipe), ~0u);

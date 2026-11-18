@@ -6,7 +6,7 @@
 //   - Intel 82583V Gigabit Network Connection                 (PCI 0x150C)
 //   - Intel I217-LM / I217-V                                  (PCH LPT LOM)
 //   - Intel I218-LM / I218-V / I218-LM2 / I218-V2 / I218-LM3  (PCH LPT-LP/WPT LOM)
-//   - Intel I219-LM / I219-V family, generations 1..23        (PCH SPT-H through MTP/RPL/ADP)
+//   - Intel I219-LM / I219-V family, generations 1..29        (PCH SPT through MTP/LNP/ARL/PTP/NVL)
 //       Verified on Lenovo ThinkPad P50 (PCH SPT-H, dev 0x156F).
 //
 // Note: The VirtualBox NIC choices "Intel PRO/1000 MT Desktop" (82540EM)
@@ -26,7 +26,8 @@
 //
 // What works:
 //   * Probe / BAR0 MMIO mapping (uncached) for all supported parts.
-//   * Full ICH8/9/10 + PCH (LPT/SPT/CNP/ICP/CMP/TGP/ADP/MTP/RPL) bring-up:
+//   * Full ICH8/9/10 + PCH (LPT/SPT/CNP/ICP/CMP/TGP/ADP/RPL/MTP/LNP/ARL/PTP/NVL)
+//     bring-up:
 //       - PHY ULP exit (CV_SMB_CTRL / I218_ULP_CONFIG1 / FEXTNVM7 handshake)
 //       - LANPHYPC toggle and LAN_INIT_DONE wait on cold boot
 //       - PCIe master-disable drain + CTRL.RST sequenced reset
@@ -118,9 +119,10 @@ static void e1000e_dbg(const char *fmt, ...)
 // Supported PCI device IDs.  Compiled from publicly documented
 // hw.h (E1000_DEV_ID_*).  Covers the
 // entire 8257x family plus 80003ES2LAN, ICH8/9/10, and the PCH (LPT, SPT,
-// CNP, ICP, CMP, TGP, ADP, MTP, RPL) I217/I218/I219 LOM parts that ship
-// in virtually every Intel-based business laptop and desktop board from
-// 2012 onwards (including the Lenovo ThinkPad P50's I219-LM at 0x156F).
+// LBG, CNP, ICP, CMP, TGP, ADP, RPL, MTP, LNP, ARL, PTP, NVL) I217/I218/I219
+// LOM parts that ship in virtually every Intel-based business laptop and
+// desktop board from 2012 onwards (including the Lenovo ThinkPad P50's
+// I219-LM at 0x156F).  Labels follow the hw.h part name and PCH generation.
 // ============================================================================
 typedef struct {
 	uint16_t did;
@@ -134,28 +136,28 @@ static const e1000e_id_t e1000e_pci_ids[] = {
 	{ 0x1060, "82571EB SerDes (dual)" },
 	{ 0x10A4, "82571EB Quad Copper" },
 	{ 0x10A5, "82571EB Quad Fiber" },
-	{ 0x10BC, "82571EB Quad LP" },
+	{ 0x10BC, "82571EB Quad Copper LP" },
 	{ 0x10D9, "82571EB SerDes Dual" },
 	{ 0x10DA, "82571EB SerDes Quad" },
-	{ 0x10D5, "82571PT Quad LP" },
+	{ 0x10D5, "82571PT Quad Copper" },
 	// ---- 82572 family ----
 	{ 0x107D, "82572EI Copper" },
 	{ 0x107E, "82572EI Fiber" },
 	{ 0x107F, "82572EI SerDes" },
 	{ 0x10B9, "82572EI" },
 	// ---- 82573 family ----
-	{ 0x108B, "82573V" },
-	{ 0x108C, "82573E" },
+	{ 0x108B, "82573E" },
+	{ 0x108C, "82573E IAMT" },
 	{ 0x109A, "82573L" },
 	// ---- 82574 / 82583 ----
 	{ 0x10D3, "82574L" }, // QEMU -device e1000e
 	{ 0x10F6, "82574LA" },
 	{ 0x150C, "82583V" },
 	// ---- 80003ES2LAN ----
-	{ 0x1096, "80003ES2LAN Copper Dual" },
-	{ 0x1098, "80003ES2LAN SerDes Dual" },
-	{ 0x10BA, "80003ES2LAN Copper" },
-	{ 0x10BB, "80003ES2LAN SerDes" },
+	{ 0x1096, "80003ES2LAN Copper (DPT)" },
+	{ 0x1098, "80003ES2LAN SerDes (DPT)" },
+	{ 0x10BA, "80003ES2LAN Copper (SPT)" },
+	{ 0x10BB, "80003ES2LAN SerDes (SPT)" },
 	// ---- ICH8 ----
 	{ 0x1049, "ICH8 IGP M Amt" },
 	{ 0x104A, "ICH8 IGP Amt" },
@@ -164,84 +166,104 @@ static const e1000e_id_t e1000e_pci_ids[] = {
 	{ 0x104D, "ICH8 IGP M" },
 	{ 0x10C4, "ICH8 IFE GT" },
 	{ 0x10C5, "ICH8 IFE G" },
+	{ 0x1501, "ICH8 82567V-3" },
 	// ---- ICH9 ----
 	{ 0x10BD, "ICH9 IGP Amt" },
 	{ 0x10BF, "ICH9 IGP M" },
 	{ 0x10CB, "ICH9 IGP M V" },
-	{ 0x10CC, "ICH9 IGP M Amt" },
-	{ 0x10CD, "ICH9 BM LM" },
-	{ 0x10CE, "ICH9 BM LF" },
 	{ 0x10E5, "ICH9 BM" },
 	{ 0x294C, "ICH9 IGP C" },
-	{ 0x10F5, "ICH9 IGP M Amt (2)" },
-	{ 0x10BD, "ICH9 IGP Amt" },
+	{ 0x10F5, "ICH9 IGP M Amt" },
+	{ 0x10C0, "ICH9 IFE" },
+	{ 0x10C2, "ICH9 IFE G" },
+	{ 0x10C3, "ICH9 IFE GT" },
 	// ---- ICH10 ----
-	{ 0x10C0, "ICH10 D BM LM" },
-	{ 0x10C2, "ICH10 D BM LF" },
-	{ 0x10C3, "ICH10 D BM V" },
-	{ 0x10DF, "ICH10 R BM LM" },
-	{ 0x10F0, "ICH10 D BM LM (2)" },
-	// ---- PCH (Pineview) ----
+	{ 0x10CC, "ICH10 R BM LM" },
+	{ 0x10CD, "ICH10 R BM LF" },
+	{ 0x10CE, "ICH10 R BM V" },
+	{ 0x10DE, "ICH10 D BM LM" },
+	{ 0x10DF, "ICH10 D BM LF" },
+	{ 0x1525, "ICH10 D BM V" },
+	// ---- PCH (Ibex Peak) ----
 	{ 0x10EA, "PCH M HV LM" },
 	{ 0x10EB, "PCH M HV LC" },
 	{ 0x10EF, "PCH D HV DM" },
 	{ 0x10F0, "PCH D HV DC" },
-	// ---- PCH2 (CougarPoint) ----
+	// ---- PCH2 (Cougar Point) ----
 	{ 0x1502, "PCH2 LV LM" },
 	{ 0x1503, "PCH2 LV V" },
 	// ---- LPT / I217 (Lynx Point, Haswell PCH) ----
-	{ 0x153A, "I217-LM" },
-	{ 0x153B, "I217-V" },
-	// ---- LPT-LP / I218 (Lynx Point LP, Haswell-ULT PCH) ----
-	{ 0x155A, "I218-LM" },
-	{ 0x1559, "I218-V" },
-	{ 0x15A0, "I218-LM (2)" },
-	{ 0x15A1, "I218-V  (2)" },
-	{ 0x15A2, "I218-LM (3)" },
-	{ 0x15A3, "I218-V  (3)" },
-	// ---- SPT / I219 (Sunrise Point, Skylake PCH) ----  ← ThinkPad P50
+	{ 0x153A, "I217-LM (LPT)" },
+	{ 0x153B, "I217-V (LPT)" },
+	// ---- LPT-LP / WPT / I218 (Lynx Point LP, Wildcat Point) ----
+	{ 0x155A, "I218-LM (LPT-LP)" },
+	{ 0x1559, "I218-V (LPT-LP)" },
+	{ 0x15A0, "I218-LM2 (LPT)" },
+	{ 0x15A1, "I218-V2 (LPT)" },
+	{ 0x15A2, "I218-LM3 (WPT)" },
+	{ 0x15A3, "I218-V3 (WPT)" },
+	// ---- SPT / LBG / I219 (Sunrise Point, Lewisburg) ----  ← ThinkPad P50
 	{ 0x156F, "I219-LM (SPT)" },
-	{ 0x1570, "I219-V  (SPT)" },
-	{ 0x15B7, "I219-LM (SPT-H)" },
-	{ 0x15B8, "I219-V  (SPT-H)" },
-	{ 0x15B9, "I219-LM (SPT-LP)" },
-	// ---- CNP / I219 (Cannon/Coffee Lake PCH) ----
-	{ 0x15BB, "I219-LM (CNP)" },
-	{ 0x15BC, "I219-V  (CNP)" },
-	{ 0x15BD, "I219-LM (CNP-H)" },
-	{ 0x15BE, "I219-V  (CNP-H)" },
-	{ 0x15DF, "I219-LM (CNP-LP)" },
-	{ 0x15E0, "I219-V  (CNP-LP)" },
-	{ 0x15E1, "I219-LM (CNP-2)" },
-	{ 0x15E2, "I219-V  (CNP-2)" },
-	// ---- ICP / I219 (Ice Lake / Comet Lake PCH) ----
-	{ 0x15D6, "I219-V  (ICP)" },
-	{ 0x15D7, "I219-LM (ICP)" },
-	{ 0x15D8, "I219-V  (ICP-2)" },
-	{ 0x15E3, "I219-LM (ICP-2)" },
-	// ---- CMP / I219 (Comet Lake PCH) ----
-	{ 0x0D4E, "I219-LM (CMP)" },
-	{ 0x0D4F, "I219-V  (CMP)" },
-	{ 0x0D4C, "I219-LM (CMP-2)" },
-	{ 0x0D4D, "I219-V  (CMP-2)" },
-	{ 0x0D53, "I219-LM (CMP-LP)" },
-	{ 0x0D55, "I219-V  (CMP-LP)" },
-	// ---- TGP / I219 (Tiger Lake PCH) ----
-	{ 0x15F9, "I219-LM (TGP-LP)" },
-	{ 0x15FA, "I219-V  (TGP-LP)" },
-	{ 0x15FB, "I219-LM (TGP-H)" },
-	{ 0x15FC, "I219-V  (TGP-H)" },
-	// ---- ADP / RPL / MTP / LNL (Alder/Raptor/Meteor/Lunar Lake PCH) ----
-	{ 0x1A1C, "I219-LM (ADP)" },
-	{ 0x1A1D, "I219-V  (ADP)" },
-	{ 0x1A1E, "I219-LM (ADP-N)" },
-	{ 0x1A1F, "I219-V  (ADP-N)" },
-	{ 0x550A, "I219-LM (RPL)" },
-	{ 0x550B, "I219-V  (RPL)" },
-	{ 0x550C, "I219-LM (RPL-2)" },
-	{ 0x550D, "I219-V  (RPL-2)" },
-	{ 0x57A0, "I219-LM (MTP)" },
-	{ 0x57A1, "I219-V  (MTP)" },
+	{ 0x1570, "I219-V (SPT)" },
+	{ 0x15B7, "I219-LM2 (SPT-H)" },
+	{ 0x15B8, "I219-V2 (SPT-H)" },
+	{ 0x15B9, "I219-LM3 (LBG)" },
+	{ 0x15D7, "I219-LM4 (SPT)" },
+	{ 0x15D8, "I219-V4 (SPT)" },
+	{ 0x15E3, "I219-LM5 (SPT)" },
+	{ 0x15D6, "I219-V5 (SPT)" },
+	// ---- CNP / I219 (Cannon Point) ----
+	{ 0x15BD, "I219-LM6 (CNP)" },
+	{ 0x15BE, "I219-V6 (CNP)" },
+	{ 0x15BB, "I219-LM7 (CNP)" },
+	{ 0x15BC, "I219-V7 (CNP)" },
+	// ---- ICP / I219 (Ice Point) ----
+	{ 0x15DF, "I219-LM8 (ICP)" },
+	{ 0x15E0, "I219-V8 (ICP)" },
+	{ 0x15E1, "I219-LM9 (ICP)" },
+	{ 0x15E2, "I219-V9 (ICP)" },
+	// ---- CMP / I219 (Comet Point) ----
+	{ 0x0D4E, "I219-LM10 (CMP)" },
+	{ 0x0D4F, "I219-V10 (CMP)" },
+	{ 0x0D4C, "I219-LM11 (CMP)" },
+	{ 0x0D4D, "I219-V11 (CMP)" },
+	{ 0x0D53, "I219-LM12 (CMP)" },
+	{ 0x0D55, "I219-V12 (CMP)" },
+	// ---- TGP / I219 (Tiger Point) ----
+	{ 0x15FB, "I219-LM13 (TGP)" },
+	{ 0x15FC, "I219-V13 (TGP)" },
+	{ 0x15F9, "I219-LM14 (TGP)" },
+	{ 0x15FA, "I219-V14 (TGP)" },
+	{ 0x15F4, "I219-LM15 (TGP)" },
+	{ 0x15F5, "I219-V15 (TGP)" },
+	// ---- ADP / RPL / I219 (Alder Point, Raptor Point) ----
+	{ 0x1A1E, "I219-LM16 (ADP)" },
+	{ 0x1A1F, "I219-V16 (ADP)" },
+	{ 0x1A1C, "I219-LM17 (ADP)" },
+	{ 0x1A1D, "I219-V17 (ADP)" },
+	{ 0x550C, "I219-LM19 (ADP)" },
+	{ 0x550D, "I219-V19 (ADP)" },
+	{ 0x0DC7, "I219-LM22 (RPL)" },
+	{ 0x0DC8, "I219-V22 (RPL)" },
+	{ 0x0DC5, "I219-LM23 (RPL)" },
+	{ 0x0DC6, "I219-V23 (RPL)" },
+	// ---- MTP / LNP / ARL / PTP / NVL / I219 ----
+	{ 0x550A, "I219-LM18 (MTP)" },
+	{ 0x550B, "I219-V18 (MTP)" },
+	{ 0x550E, "I219-LM20 (LNP)" },
+	{ 0x550F, "I219-V20 (LNP)" },
+	{ 0x5510, "I219-LM21 (LNP)" },
+	{ 0x5511, "I219-V21 (LNP)" },
+	{ 0x57A0, "I219-LM24 (ARL)" },
+	{ 0x57A1, "I219-V24 (ARL)" },
+	{ 0x57B3, "I219-LM25 (PTP)" },
+	{ 0x57B4, "I219-V25 (PTP)" },
+	{ 0x57B5, "I219-LM26 (PTP)" },
+	{ 0x57B6, "I219-V26 (PTP)" },
+	{ 0x57B7, "I219-LM27 (PTP)" },
+	{ 0x57B8, "I219-V27 (PTP)" },
+	{ 0x57B9, "I219-LM29 (NVL)" },
+	{ 0x57BA, "I219-V29 (NVL)" },
 	{ 0, NULL },
 };
 
@@ -271,6 +293,7 @@ static int e1000e_is_pch_lan(uint16_t did)
 	case 0x104D:
 	case 0x10C4:
 	case 0x10C5:
+	case 0x1501:
 	case 0x10BD:
 	case 0x10BF:
 	case 0x10CB:
@@ -284,6 +307,8 @@ static int e1000e_is_pch_lan(uint16_t did)
 	case 0x10C2:
 	case 0x10C3:
 	case 0x10DF:
+	case 0x10DE:
+	case 0x1525:
 	case 0x10F0:
 	// PCH / PCH2
 	case 0x10EA:
@@ -291,7 +316,8 @@ static int e1000e_is_pch_lan(uint16_t did)
 	case 0x10EF:
 	case 0x1502:
 	case 0x1503:
-	// I217 / I218 / I219 (LPT, LPT-LP, SPT, CNP, ICP, CMP, TGP, ADP, RPL, MTP)
+	// I217 / I218 / I219 (LPT, LPT-LP, SPT, CNP, ICP, CMP, TGP, ADP, RPL, MTP,
+	// LNP, ARL, PTP, NVL)
 	case 0x153A:
 	case 0x153B:
 	case 0x155A:
@@ -327,6 +353,8 @@ static int e1000e_is_pch_lan(uint16_t did)
 	case 0x15FA:
 	case 0x15FB:
 	case 0x15FC:
+	case 0x15F4:
+	case 0x15F5:
 	case 0x1A1C:
 	case 0x1A1D:
 	case 0x1A1E:
@@ -335,15 +363,119 @@ static int e1000e_is_pch_lan(uint16_t did)
 	case 0x550B:
 	case 0x550C:
 	case 0x550D:
+	case 0x0DC5:
+	case 0x0DC6:
+	case 0x0DC7:
+	case 0x0DC8:
+	case 0x550E:
+	case 0x550F:
+	case 0x5510:
+	case 0x5511:
 	case 0x57A0:
 	case 0x57A1:
+	case 0x57B3:
+	case 0x57B4:
+	case 0x57B5:
+	case 0x57B6:
+	case 0x57B7:
+	case 0x57B8:
+	case 0x57B9:
+	case 0x57BA:
 		return 1;
 	default:
 		return 0;
 	}
 }
 
-static int e1000e_is_pch_spt(uint16_t did)
+// MAC generation of an I219 PCH-LAN part, ordered so that later PCH
+// generations compare greater.  Several I219 IDs are typed by their MAC
+// generation rather than by the PCH they were first paired with: the
+// 0x15D6/0x15D7/0x15D8/0x15E3 and CMP 0x0D53/0x0D55 parts are SPT MACs,
+// ICP and CMP 0x0D4C-0x0D4F are CNP MACs, RPL parts are ADP MACs, and
+// LNP/ARL/PTP/NVL parts are MTP MACs.  Everything that is not an I219
+// (8257x, 80003ES2LAN, ICH8-10, PCH, PCH2, LPT) reports E1000E_MAC_PRE_SPT.
+enum e1000e_mac_gen {
+	E1000E_MAC_PRE_SPT = 0,
+	E1000E_MAC_PCH_SPT,
+	E1000E_MAC_PCH_CNP,
+	E1000E_MAC_PCH_TGP,
+	E1000E_MAC_PCH_ADP,
+	E1000E_MAC_PCH_MTP,
+};
+
+static enum e1000e_mac_gen e1000e_mac_gen(uint16_t did)
+{
+	switch (did) {
+	case 0x156F:
+	case 0x1570:
+	case 0x15B7:
+	case 0x15B8:
+	case 0x15B9:
+	case 0x15D7:
+	case 0x15D8:
+	case 0x15E3:
+	case 0x15D6:
+	case 0x0D53:
+	case 0x0D55:
+		return E1000E_MAC_PCH_SPT;
+	case 0x15BD:
+	case 0x15BE:
+	case 0x15BB:
+	case 0x15BC:
+	case 0x15DF:
+	case 0x15E0:
+	case 0x15E1:
+	case 0x15E2:
+	case 0x0D4E:
+	case 0x0D4F:
+	case 0x0D4C:
+	case 0x0D4D:
+		return E1000E_MAC_PCH_CNP;
+	case 0x15FB:
+	case 0x15FC:
+	case 0x15F9:
+	case 0x15FA:
+	case 0x15F4:
+	case 0x15F5:
+		return E1000E_MAC_PCH_TGP;
+	case 0x0DC5:
+	case 0x0DC6:
+	case 0x1A1E:
+	case 0x1A1F:
+	case 0x1A1C:
+	case 0x1A1D:
+	case 0x0DC7:
+	case 0x0DC8:
+	case 0x550C:
+	case 0x550D:
+		return E1000E_MAC_PCH_ADP;
+	case 0x550A:
+	case 0x550B:
+	case 0x550E:
+	case 0x550F:
+	case 0x5510:
+	case 0x5511:
+	case 0x57A0:
+	case 0x57A1:
+	case 0x57B3:
+	case 0x57B4:
+	case 0x57B5:
+	case 0x57B6:
+	case 0x57B7:
+	case 0x57B8:
+	case 0x57B9:
+	case 0x57BA:
+		return E1000E_MAC_PCH_MTP;
+	default:
+		return E1000E_MAC_PRE_SPT;
+	}
+}
+
+// The parts that get the post-link 10/100 full-duplex K1 / REQ_PLL_CLK
+// sequence in e1000e_init().  This is the set it was brought up and
+// verified on (ThinkPad P50 SPT I219); it is deliberately an explicit ID
+// list and not a MAC-generation range.
+static int e1000e_has_10_100_k1_pll_quirk(uint16_t did)
 {
 	switch (did) {
 	case 0x156F:
@@ -1793,7 +1925,9 @@ static void e1000e_pch_lan_init(e1000e_dev_t *dev)
 		uint32_t fextnvm7 = fextnvm7_before;
 		fextnvm7 &= ~E1000_FEXTNVM7_DISABLE_TSYNC_CLK;
 		fextnvm7 |= E1000_FEXTNVM7_ENABLE_TSYNC_INTR;
-		if (e1000e_is_pch_spt(dev->pci_dev->device_id)) {
+		// Side-clock ungate: every SPT-or-later MAC.
+		if (e1000e_mac_gen(dev->pci_dev->device_id) >=
+		    E1000E_MAC_PCH_SPT) {
 			fextnvm7 |= E1000_FEXTNVM7_SIDE_CLK_UNGATE;
 		}
 		e1000e_write(dev, E1000_FEXTNVM7, fextnvm7);
@@ -2322,23 +2456,31 @@ static int e1000e_init_tx(e1000e_dev_t *dev)
 #endif
 	}
 
-	if (e1000e_is_pch_spt(dev->device_id)) {
+	// FEXTNVM11.DISABLE_MULR_FIX applies to every SPT-or-later MAC; the
+	// IOSFPC data-corruption and TARC0 3->2 outstanding-request Tx-hang
+	// errata apply to SPT MACs only.  Register write order is unchanged.
+	enum e1000e_mac_gen mac_gen = e1000e_mac_gen(dev->device_id);
+	if (mac_gen >= E1000E_MAC_PCH_SPT) {
 		uint32_t iosfpc = e1000e_read(dev, E1000_IOSFPC);
 		uint32_t fextnvm11 = e1000e_read(dev, E1000_FEXTNVM11);
 		uint32_t tarc0 = e1000e_read(dev, E1000_TARC0);
 
-		iosfpc |= (1u << 16);
-		e1000e_write(dev, E1000_IOSFPC, iosfpc);
+		if (mac_gen == E1000E_MAC_PCH_SPT) {
+			iosfpc |= (1u << 16);
+			e1000e_write(dev, E1000_IOSFPC, iosfpc);
+		}
 
 		fextnvm11 |= E1000_FEXTNVM11_DISABLE_MULR_FIX;
 		e1000e_write(dev, E1000_FEXTNVM11, fextnvm11);
 
-		tarc0 &= ~E1000_TARC0_CB_MULTIQ_3_REQ;
-		tarc0 |= E1000_TARC0_CB_MULTIQ_2_REQ;
-		e1000e_write(dev, E1000_TARC0, tarc0);
+		if (mac_gen == E1000E_MAC_PCH_SPT) {
+			tarc0 &= ~E1000_TARC0_CB_MULTIQ_3_REQ;
+			tarc0 |= E1000_TARC0_CB_MULTIQ_2_REQ;
+			e1000e_write(dev, E1000_TARC0, tarc0);
+		}
 
 		e1000e_dbg(
-			"E1000E: SPT tx-hang WA IOSFPC=%08x FEXTNVM11=%08x TARC0=%08x\n",
+			"E1000E: SPT+ tx-hang WA IOSFPC=%08x FEXTNVM11=%08x TARC0=%08x\n",
 			e1000e_read(dev, E1000_IOSFPC),
 			e1000e_read(dev, E1000_FEXTNVM11),
 			e1000e_read(dev, E1000_TARC0));
@@ -3152,7 +3294,7 @@ void e1000e_init(void)
 				//                          udelay(10..20)
 				//                          FEXTNVM6 |= REQ_PLL_CLK
 				//   else: don't touch
-				if (e1000e_is_pch_spt(did) &&
+				if (e1000e_has_10_100_k1_pll_quirk(did) &&
 				    (st_spd & E1000_STATUS_LU) &&
 				    (st_spd & 0x1) /* FD */) {
 					uint16_t k1cfg = 0;

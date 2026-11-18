@@ -349,6 +349,9 @@ void i915_execlists_process_csb(struct i915_engine *e);
 void i915_execlists_process_csb_irq(struct i915_engine *e);
 int i915_execlists_init_engine(struct i915_engine *e);
 void i915_execlists_reset_engine(struct i915_engine *e);
+/* The port's and the status buffer's state, said (a fence that does not
+ * signal); nothing under the GuC or on the ring path. */
+void i915_execlists_report(struct i915_engine *e);
 /* i915_workarounds.c: what this part needs set before it renders.  The
  * engine's own settings are written at engine init; the ones a context
  * carries are emitted into the batch whose saved state becomes the

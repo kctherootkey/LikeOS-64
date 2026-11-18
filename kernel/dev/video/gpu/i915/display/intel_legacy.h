@@ -339,6 +339,7 @@ struct lg_vbt {
 	} sdvo[2];
 	/* the internal panel */
 	int panel_type; /* -1 unknown */
+	int panel_type_src; /* enum intel_vbt_panel_src */
 	int lvds_dither;
 	uint32_t bios_lvds_val; /* the LVDS register as the VBIOS set it, 0 */
 	struct drm_mode_modeinfo lfp_mode;
@@ -740,6 +741,13 @@ int lg_vbt_lvds_present(struct lg_display *d, uint8_t *i2c_pin);
 int lg_vbt_tv_present(struct lg_display *d);
 /* Is there a DSI panel, and on which DSI port (0 = A, 2 = C)? */
 int lg_vbt_dsi_present(struct lg_display *d, int *port);
+/* The panel type once the panel's EDID (NULL for none) is known, for a
+ * table that defers to its PnP id, and with it the panel's entries (its
+ * timing, power sequencing, link and backlight); a type that cannot be
+ * decided is the first entry.  `lfp2': the panel is the second one.
+ * Every panel output calls this before it uses the per-panel fields.
+ * 1 when the type was decided now, 0 when it was known already. */
+int lg_vbt_init_panel(struct lg_display *d, const uint8_t *edid, uint32_t edid_len, int lfp2);
 
 /* ---- panel: power sequencer, backlight, fitters (intel_legacy_panel.c) ----------------- */
 
@@ -749,6 +757,9 @@ void lg_pps_init(struct lg_display *d);
 /* An eDP panel found on `o': its sequencer's delays from the VBT and the
  * hardware, programmed. */
 void lg_pps_edp_init(struct lg_display *d, struct lg_output *o);
+/* The delays again once the panel's VBT entries are known
+ * (lg_vbt_init_panel() decided the panel type after lg_pps_edp_init()). */
+void lg_pps_edp_init_late(struct lg_display *d, struct lg_output *o);
 /* eDP: force panel VDD for the AUX channel, and drop it again. */
 void lg_pps_vdd_on(struct lg_display *d, struct lg_output *o);
 void lg_pps_vdd_off(struct lg_display *d, struct lg_output *o);

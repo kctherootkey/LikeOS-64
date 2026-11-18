@@ -1860,7 +1860,9 @@ static struct sdvo_output *sdvo_output_prepare(struct sdvo_dev *s, uint16_t type
 		po->enc_type = DRM_MODE_ENCODER_LVDS;
 		po->conn_type = DRM_MODE_CONNECTOR_LVDS;
 		/* The VBT's mode first: some SDVO-to-LVDS chips cannot cope
-		 * with the panel's EDID mode. */
+		 * with the panel's EDID mode.  (The panel's entries of the VBT
+		 * are decided without its EDID.) */
+		(void)lg_vbt_init_panel(d, NULL, 0, 0);
 		if (d->vbt.sdvo_lvds_mode_valid) {
 			po->fixed = d->vbt.sdvo_lvds_mode;
 			po->fixed_valid = 1;

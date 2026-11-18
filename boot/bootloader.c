@@ -502,7 +502,7 @@ static void detect_physmap_size(void) {
     // Size the page-table pool to fit these PDs plus all the fixed tables.
     pt_pool_pages = 112 + g_num_physmap_pds;
 
-    Print(L"Direct map: %lu GB usable RAM detected -> %lu physmap PD(s)\r\n",
+    Print(L"Direct map: RAM ends at %lu GB -> %lu physmap PD(s)\r\n",
           (UINT64)BYTES_TO_GB_CEIL(highest_usable_end), (UINT64)g_num_physmap_pds);
 }
 
@@ -693,6 +693,61 @@ extern void trampoline_jump(UINT64 kernel_entry, void* boot_info, UINT64 pml4_ad
 // We need the end symbol to calculate the size
 extern char trampoline_jump_end[];
 
+#define BL_PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
+#define BL_IDENTITY_LOW_END 0x100000000ULL // the fixed identity map: 4 GB
+// The kernel drops PML4 entries 0-3 with the identity map, so a mapping
+// made here must stay below 4 * 512 GB.
+#define BL_IDENTITY_MAX_END (4 * 0x8000000000ULL)
+
+// Identity-map the GOP framebuffer when it lies above the fixed 4 GB identity
+// map.  Firmware is free to place it high (a 64-bit BAR at 256 GB, say); the
+// kernel's console writes to the address it is given from its first
+// instruction on, before it has any page fault handler, and maps the
+// framebuffer itself before the identity map is removed (see
+// console_remap_to_direct_map).  2 MB pages from the page-table pool.
+static void bl_identity_map_framebuffer(page_table_t *pml4) {
+    UINT64 base = (UINT64)(UINTN)g_boot_info.fb_info.framebuffer_base;
+    UINT64 size = g_boot_info.fb_info.framebuffer_size;
+    UINT64 start, end, a;
+
+    if (!base || !size)
+        return;
+    start = base & ~0x1FFFFFULL;
+    end = (base + size + 0x1FFFFFULL) & ~0x1FFFFFULL;
+    if (end <= BL_IDENTITY_LOW_END)
+        return; // already inside the fixed identity map
+    if (end > BL_IDENTITY_MAX_END) {
+        Print(L"WARNING: framebuffer at 0x%lx is beyond the identity map range\r\n",
+              base);
+        return;
+    }
+    for (a = start; a < end; a += 0x200000ULL) {
+        UINTN l4 = (a >> 39) & 0x1FF;
+        UINTN l3 = (a >> 30) & 0x1FF;
+        UINTN l2 = (a >> 21) & 0x1FF;
+        page_table_t *pdpt, *pd;
+
+        if (a < BL_IDENTITY_LOW_END)
+            continue;
+        if (!(pml4->entries[l4] & PAGE_PRESENT)) {
+            EFI_PHYSICAL_ADDRESS t = allocate_page_table();
+            if (!t)
+                return;
+            pml4->entries[l4] = t | PAGE_RWX;
+        }
+        pdpt = (page_table_t *)(UINTN)(pml4->entries[l4] & BL_PTE_ADDR_MASK);
+        if (!(pdpt->entries[l3] & PAGE_PRESENT)) {
+            EFI_PHYSICAL_ADDRESS t = allocate_page_table();
+            if (!t)
+                return;
+            pdpt->entries[l3] = t | PAGE_RWX;
+        }
+        pd = (page_table_t *)(UINTN)(pdpt->entries[l3] & BL_PTE_ADDR_MASK);
+        pd->entries[l2] = a | PAGE_RW | PAGE_SIZE; // no NX: EFER.NXE may be off
+    }
+    Print(L"  Framebuffer identity mapped: 0x%lx - 0x%lx\r\n", start, end);
+}
+
 // Set up higher half kernel paging with identity mapping for low memory
 static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size) {
     page_table_t *pml4 = (page_table_t*)g_pml4_addr;
@@ -746,6 +801,10 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
         }
     }
     
+    // The framebuffer, wherever the firmware put it: the kernel's console
+    // writes to it through this identity map until it maps it itself.
+    bl_identity_map_framebuffer(pml4);
+
     // Set up higher half mapping for kernel
     // KERNEL_OFFSET = 0xFFFFFFFF80000000
     // Virtual address: KERNEL_OFFSET + KERNEL_START = 0xFFFFFFFF80000000
@@ -1996,13 +2055,42 @@ static void boot_menu(EFI_HANDLE image) {
         Print(L"Boot command line: %a\r\n", g_boot_info.cmdline);
 }
 
+/* Memory the kernel may allocate from once boot services are gone: the
+ * kernel treats all of these types alike (mm_is_usable_memory_type). */
+static int bl_mem_type_usable(UINT32 type) {
+    return type == EfiLoaderCode || type == EfiLoaderData ||
+           type == EfiBootServicesCode || type == EfiBootServicesData ||
+           type == EfiConventionalMemory;
+}
+
+/* May desc be folded into the stored entry prev?  Only when it continues
+ * prev without a gap and with the same attributes, and either has the same
+ * type or both are allocatable RAM the firmware no longer needs: the kernel
+ * makes no distinction between those types, and a firmware's map is mostly
+ * such fragments (a 403-entry map would otherwise not fit). */
+static int bl_mem_entry_mergeable(const memory_map_entry_t *prev,
+                                  const EFI_MEMORY_DESCRIPTOR *desc) {
+    if (prev->physical_start + prev->number_of_pages * 4096 != desc->PhysicalStart)
+        return 0;
+    if (prev->attribute != desc->Attribute)
+        return 0;
+    if (prev->type == desc->Type)
+        return 1;
+    return bl_mem_type_usable(prev->type) && bl_mem_type_usable(desc->Type) &&
+           !(desc->Attribute & BL_EFI_MEMORY_RUNTIME);
+}
+
 /* The memory map for the kernel (boot_info_t.mem_info) from a map read
- * with GetMemoryMap: at most MAX_MEMORY_MAP_ENTRIES entries.  Plain memory
- * work, no firmware call: also run once more after ExitBootServices with
- * the final map.  dump: the whole map to the serial port as well. */
-static void bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
-                              UINTN desc_size, int dump) {
+ * with GetMemoryMap: adjacent entries the kernel would treat alike are
+ * folded into one (bl_mem_entry_mergeable), and at most
+ * MAX_MEMORY_MAP_ENTRIES entries are kept.  Plain memory work, no firmware
+ * call: also run once more after ExitBootServices with the final map.
+ * dump: the whole map to the serial port as well.  Returns the number of
+ * entries that did not fit. */
+static UINTN bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                               UINTN desc_size, int dump) {
     UINTN num_entries = desc_size ? map_size / desc_size : 0;
+    UINTN dropped = 0;
 
     g_boot_info.mem_info.entry_count = 0;
     g_boot_info.mem_info.descriptor_size = (uint32_t)desc_size;
@@ -2018,7 +2106,7 @@ static void bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
         serial_puts("\n\n");
     }
 
-    for (UINTN i = 0; i < num_entries && g_boot_info.mem_info.entry_count < MAX_MEMORY_MAP_ENTRIES; i++) {
+    for (UINTN i = 0; i < num_entries; i++) {
         const EFI_MEMORY_DESCRIPTOR *desc =
             (const EFI_MEMORY_DESCRIPTOR *)((const UINT8 *)map + i * desc_size);
 
@@ -2040,6 +2128,31 @@ static void bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
             serial_puts("\n");
         }
 
+        // Count usable memory (EfiConventionalMemory type = 7)
+        if (desc->Type == 7) {
+            g_boot_info.mem_info.total_memory += desc->NumberOfPages * 4096;
+        }
+
+        if (!desc->NumberOfPages)
+            continue;
+
+        // Fold into the previous entry where the kernel cannot tell them apart
+        if (g_boot_info.mem_info.entry_count) {
+            memory_map_entry_t *prev =
+                &g_boot_info.mem_info.entries[g_boot_info.mem_info.entry_count - 1];
+            if (bl_mem_entry_mergeable(prev, desc)) {
+                if (prev->type != desc->Type)
+                    prev->type = EfiConventionalMemory;
+                prev->number_of_pages += desc->NumberOfPages;
+                continue;
+            }
+        }
+
+        if (g_boot_info.mem_info.entry_count >= MAX_MEMORY_MAP_ENTRIES) {
+            dropped++;
+            continue;
+        }
+
         // Copy entry to boot_info
         memory_map_entry_t *entry = &g_boot_info.mem_info.entries[g_boot_info.mem_info.entry_count];
         entry->type = desc->Type;
@@ -2048,11 +2161,6 @@ static void bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
         entry->number_of_pages = desc->NumberOfPages;
         entry->attribute = desc->Attribute;
 
-        // Count usable memory (EfiConventionalMemory type = 7)
-        if (desc->Type == 7) {
-            g_boot_info.mem_info.total_memory += desc->NumberOfPages * 4096;
-        }
-
         g_boot_info.mem_info.entry_count++;
     }
 
@@ -2060,8 +2168,13 @@ static void bl_store_mem_info(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
         serial_puts("\nTotal usable memory: ");
         serial_putdec(g_boot_info.mem_info.total_memory / (1024 * 1024));
         serial_puts(" MB\n");
-        serial_puts("=== END MEMORY MAP ===\n\n");
+        serial_puts("Stored entries: ");
+        serial_putdec(g_boot_info.mem_info.entry_count);
+        serial_puts(", dropped: ");
+        serial_putdec(dropped);
+        serial_puts("\n=== END MEMORY MAP ===\n\n");
     }
+    return dropped;
 }
 
 /* What the kernel needs for the runtime services: the tables, and every
@@ -2888,12 +3001,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // Store memory map info for kernel
     {
         UINTN num_entries = memory_map_size / descriptor_size;
+        UINTN dropped;
 
         Print(L"Processing %lu memory map entries...\r\n", num_entries);
-        bl_store_mem_info(memory_map, memory_map_size, descriptor_size, 1);
+        dropped = bl_store_mem_info(memory_map, memory_map_size, descriptor_size, 1);
         Print(L"Stored %d memory entries, total usable: %lu MB\r\n", 
               g_boot_info.mem_info.entry_count, 
               g_boot_info.mem_info.total_memory / (1024 * 1024));
+        if (dropped)
+            Print(L"WARNING: %lu memory map entries did not fit\r\n", dropped);
     }
 
     // The runtime services for the kernel (boot variables, clock).

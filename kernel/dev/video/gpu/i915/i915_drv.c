@@ -490,7 +490,7 @@ static void i915_teardown(struct i915_device *i915)
 	}
 }
 
-int i915_init(void)
+static int i915_init_device(void)
 {
 	struct i915_device *i915 = &g_i915;
 	const pci_device_t *pci = i915_find_device();
@@ -566,6 +566,8 @@ int i915_init(void)
 			return -ENOMEM;
 		}
 	}
+	/* from here to the end of the bring-up every access is checked */
+	i915->unclaimed_check_all = 1;
 
 	const char *pch = i915_pch_detect(i915);
 	i915_dbg("[drm] i915: PCH %s (%04x)\n", pch, i915->pch_devid);
@@ -669,4 +671,14 @@ int i915_init(void)
 		}
 	}
 	return 0;
+}
+
+int i915_init(void)
+{
+	int rc = i915_init_device();
+
+	/* the bring-up is over, whichever way it ended: back to checking
+	 * only the writes that take forcewake */
+	g_i915.unclaimed_check_all = 0;
+	return rc;
 }

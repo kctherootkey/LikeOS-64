@@ -26,6 +26,16 @@
 // the LFP power block says whether the panel may run variable refresh
 // (BDB 233+).  These are parsed for the features that use them.
 //
+// The internal panel's entries -- its timing (the generic DTD block from
+// BDB 229, else the LFP data block, found through the LFP data table
+// pointers, which are checked before they are believed and made up for a
+// BDB 155+ table that lacks them), its power sequencing, link, backlight
+// and refresh range -- are all indexed by one panel type.  The LFP
+// options block names it, or says 0xff: then it is the entry whose PnP id
+// equals the panel's EDID's, which is only known once the EDID has been
+// read; intel_vbt_init_panel() makes that second pass.  A type that
+// cannot be decided even then is the first entry.
+//
 // Copyright (C) 2026 The LikeOS Project
 // SPDX-License-Identifier for the portions derived from Intel's code: MIT
 // Portions Copyright (C) 2006-2025 Intel Corporation
@@ -61,6 +71,7 @@ static uint32_t rd32(const uint8_t *p)
 #define BDB_LFP_POWER 44
 #define BDB_COMPRESSION_PARAMETERS 56 /* BDB 213+; the earlier id is not read */
 #define BDB_GENERIC_DTD 58
+#define BDB_MIPI_SEQUENCE 53
 
 /* Child device types (device_type field bits) */
 #define DEVICE_TYPE_INTERNAL_CONNECTOR (1 << 12)
@@ -72,6 +83,10 @@ static uint32_t rd32(const uint8_t *p)
 #define DEVICE_TYPE_DISPLAYPORT_OUTPUT (1 << 2)
 #define DEVICE_TYPE_DIGITAL_OUTPUT (1 << 1)
 #define DEVICE_TYPE_ANALOG_OUTPUT (1 << 0)
+
+/* Device handles of the two panels' children */
+#define DEVICE_HANDLE_LFP1 0x0008
+#define DEVICE_HANDLE_LFP2 0x0080
 
 /* DVO port codes in the child device */
 #define DVO_PORT_HDMIA 0
@@ -315,6 +330,7 @@ static void parse_child(const struct vbt_ctx *ctx, const uint8_t *c, unsigned si
 		return;
 	struct intel_vbt_port *p = &out->port[ddi];
 	p->present = 1;
+	p->handle = handle;
 	int internal = !!(device_type & DEVICE_TYPE_INTERNAL_CONNECTOR);
 	int dp = !!(device_type & DEVICE_TYPE_DISPLAYPORT_OUTPUT);
 	int tmds = !!(device_type & DEVICE_TYPE_TMDS_DVI_SIGNALING);
@@ -459,59 +475,221 @@ static void parse_edp(const uint8_t *b, unsigned len, struct intel_vbt *out)
 		out->edp_dsc_disable = (uint8_t)((rd16(b + 812) >> pt) & 1);
 }
 
+/* The LFP options block: the panel type (0..15, or 0xff for "match the
+ * panel by its EDID's PnP id"), and from BDB 212 the second panel's in
+ * the next byte -- a shorter block reads as zero there -- then the
+ * capability bits. */
 static void parse_lvds_options(const uint8_t *b, unsigned len,
 			       struct intel_vbt *out)
 {
-	if (len < 2)
-		return;
-	/* byte 0: panel_type; byte 1: bits: pfit, dither...  A type of 0xff
-	 * asks for the panel to be matched by its EDID's PnP id, which
-	 * cannot be done here: the first entry is the fallback then, as
-	 * it is for an out-of-range type. */
-	out->panel_type = b[0] <= 0x0f ? b[0] : 0;
-	out->lvds_dither = !!(b[1] & 0x01);
+	out->panel_type_vbt = len >= 1 ? b[0] : 0;
+	out->panel_type2_vbt = len >= 2 ? b[1] : 0;
+	/* byte 2: the panel fitter mode (bits 0-1) and its enhancements
+	 * (bits 2-4), the pixel dither (bit 5); zero past a short block */
+	out->lvds_dither = len >= 3 ? (b[2] >> 5) & 1 : 0;
 }
 
-/* The LFP data pointers block gives, per panel type, where the DTD of
- * that panel sits in the LFP data block. */
-static void parse_lfp_data(const uint8_t *bdb, const uint8_t *ptrs, unsigned ptrs_len,
-			   const uint8_t *data, unsigned data_len,
-			   struct intel_vbt *out)
+/* The blocks the panel's entries are in, found again for the pass made
+ * once the panel's EDID is known. */
+struct vbt_panel_blocks {
+	uint16_t version;
+	const uint8_t *opts; /* LFP options */
+	unsigned opts_len;
+	const uint8_t *ptrs; /* LFP data pointers */
+	unsigned ptrs_len;
+	const uint8_t *data; /* LFP data */
+	unsigned data_len;
+	unsigned data_off; /* the LFP data's offset from the start of the BDB */
+	const uint8_t *edp;
+	unsigned edp_len;
+	const uint8_t *bl;
+	unsigned bl_len;
+	const uint8_t *power;
+	unsigned power_len;
+	const uint8_t *gdtd; /* generic DTD */
+	unsigned gdtd_len;
+};
+
+/* ---- the LFP data table pointers ---------------------------------------------- */
+
+#define VBT_DTD_SIZE 18
+#define VBT_PNP_ID_SIZE 10
+#define VBT_PANEL_NAME_SIZE 13
+
+/* Offsets relative to the LFP data block's body. */
+struct lfp_tbl {
+	int off, size;
+};
+
+struct lfp_ptrs {
+	int num_entries;
+	struct {
+		struct lfp_tbl fp, dvo, pnp;
+	} p[16];
+	struct lfp_tbl name;
+};
+
+static uint16_t rd16_in(const uint8_t *b, unsigned len, unsigned off)
 {
-	int pt = out->panel_type;
-	const uint8_t *d = 0;
-	if (pt < 0 || pt > 15 || !data)
-		return;
-	if (ptrs) {
-		/* ptrs: byte 0 = lvds_entries; then 16 x (3 x (u16 offset,
-		 * u8 size)) for fp_timing, dvo_timing, panel_pnp_id.  The
-		 * offsets count from the start of the BIOS data block; some
-		 * tables (and this driver's tests) count them from the LFP
-		 * data block's header instead, which is tried when the first
-		 * reading falls outside the block. */
-		if (ptrs_len < 1 + 16 * 9)
-			return;
-		const uint8_t *e = ptrs + 1 + pt * 9;
-		uint32_t dvo_off = rd16(e + 3);
-		uint8_t dvo_size = e[5];
-		uint32_t data_off = (uint32_t)(data - bdb);
-		if (dvo_size < 18)
-			return;
-		if (dvo_off >= data_off && dvo_off - data_off + 18 <= data_len)
-			d = data + (dvo_off - data_off);
-		else if (dvo_off >= 3 && dvo_off - 3 + 18 <= data_len)
-			d = data + dvo_off - 3;
-		else
-			return;
-	} else {
-		/* Modern tables have no pointer block: the entries are 38
-		 * bytes of panel timing, the 18-byte DTD and the 10-byte PnP
-		 * id, sixteen of them in a row. */
-		if (out->version < 155 || 16 * (38 + 18 + 10) > data_len)
-			return;
-		d = data + (unsigned)pt * (38 + 18 + 10) + 38;
+	return off + 2 <= len ? rd16(b + off) : 0;
+}
+
+static void lfp_tbl_read(const uint8_t *b, unsigned len, unsigned off, struct lfp_tbl *t)
+{
+	t->off = rd16_in(b, len, off);
+	t->size = off + 2 < len ? b[off + 2] : 0;
+}
+
+/* Every entry the same shape -- an fp_timing table, the 18-byte DTD and
+ * the 10-byte PnP id back to back -- at a constant stride, all inside
+ * the data block, each fp_timing ending in its 0xffff terminator. */
+static int validate_lfp_data_ptrs(const struct lfp_ptrs *ptrs, const uint8_t *data,
+				  unsigned data_size)
+{
+	int fp_size, dvo_size, pnp_size, name_size, lfp_data_size, i;
+
+	if (!data || !data_size)
+		return 0;
+	/* always three tables: fp_timing, dvo_timing, panel PnP id */
+	if (ptrs->num_entries != 3)
+		return 0;
+
+	fp_size = ptrs->p[0].fp.size;
+	dvo_size = ptrs->p[0].dvo.size;
+	pnp_size = ptrs->p[0].pnp.size;
+	name_size = ptrs->name.size;
+
+	/* fp_timing has a variable size */
+	if (fp_size < 32 || dvo_size != VBT_DTD_SIZE || pnp_size != VBT_PNP_ID_SIZE)
+		return 0;
+	/* the panel names are not in old tables */
+	if (name_size != 0 && name_size != VBT_PANEL_NAME_SIZE)
+		return 0;
+
+	lfp_data_size = ptrs->p[1].fp.off - ptrs->p[0].fp.off;
+	if (lfp_data_size <= 0 || 16 * lfp_data_size > (int)data_size)
+		return 0;
+
+	for (i = 1; i < 16; i++) {
+		if (ptrs->p[i].fp.size != fp_size || ptrs->p[i].dvo.size != dvo_size ||
+		    ptrs->p[i].pnp.size != pnp_size)
+			return 0;
+		if (ptrs->p[i].fp.off - ptrs->p[i - 1].fp.off != lfp_data_size ||
+		    ptrs->p[i].dvo.off - ptrs->p[i - 1].dvo.off != lfp_data_size ||
+		    ptrs->p[i].pnp.off - ptrs->p[i - 1].pnp.off != lfp_data_size)
+			return 0;
 	}
-	/* the same 18-byte detailed timing layout as an EDID descriptor */
+
+	/* Real tables carry 6 bytes more in fp_timing than they declare
+	 * (its 0xffff terminator falls in them). */
+	if (fp_size + 6 + dvo_size + pnp_size == lfp_data_size)
+		fp_size += 6;
+	if (fp_size + dvo_size + pnp_size != lfp_data_size)
+		return 0;
+	if (ptrs->p[0].fp.off + fp_size != ptrs->p[0].dvo.off ||
+	    ptrs->p[0].dvo.off + dvo_size != ptrs->p[0].pnp.off ||
+	    ptrs->p[0].pnp.off + pnp_size != lfp_data_size)
+		return 0;
+
+	for (i = 0; i < 16; i++) {
+		if (ptrs->p[i].fp.off + fp_size > (int)data_size ||
+		    ptrs->p[i].dvo.off + dvo_size > (int)data_size ||
+		    ptrs->p[i].pnp.off + pnp_size > (int)data_size)
+			return 0;
+	}
+	if (ptrs->name.off + 16 * name_size > (int)data_size)
+		return 0;
+
+	for (i = 0; i < 16; i++) {
+		int t = ptrs->p[i].fp.off + fp_size - 2;
+
+		if (rd16_in(data, data_size, (unsigned)t) != 0xffff)
+			return 0;
+	}
+	return 1;
+}
+
+/* A table of BDB 155 or later without the pointer block: the entries
+ * laid out as every such table has them, 38 bytes of fp_timing, the DTD
+ * and the PnP id, sixteen in a row, the panel names after them. */
+static int generate_lfp_data_ptrs(const struct vbt_panel_blocks *blk, struct lfp_ptrs *ptrs)
+{
+	const int fp_size = 38;
+	const int size = fp_size + VBT_DTD_SIZE + VBT_PNP_ID_SIZE;
+	int i;
+
+	if (blk->version < 155 || !blk->data)
+		return 0;
+	if (size * 16 > (int)blk->data_len)
+		return 0;
+	for (i = 0; i < (int)sizeof(*ptrs); i++)
+		((uint8_t *)ptrs)[i] = 0;
+	ptrs->num_entries = 3;
+	for (i = 0; i < 16; i++) {
+		ptrs->p[i].fp.off = i * size;
+		ptrs->p[i].fp.size = fp_size;
+		ptrs->p[i].dvo.off = i * size + fp_size;
+		ptrs->p[i].dvo.size = VBT_DTD_SIZE;
+		ptrs->p[i].pnp.off = i * size + fp_size + VBT_DTD_SIZE;
+		ptrs->p[i].pnp.size = VBT_PNP_ID_SIZE;
+	}
+	if (16 * (size + VBT_PANEL_NAME_SIZE) <= (int)blk->data_len) {
+		ptrs->name.size = VBT_PANEL_NAME_SIZE;
+		ptrs->name.off = size * 16;
+	}
+	return 1;
+}
+
+/* The pointers to each panel's entry in the LFP data block, made
+ * relative to that block's body; 0 when the table has none that hold
+ * up (then no panel timing and no PnP id come from it). */
+static int get_lfp_data_ptrs(const struct vbt_panel_blocks *blk, struct lfp_ptrs *ptrs)
+{
+	const uint8_t *b = blk->ptrs;
+	unsigned len = blk->ptrs_len;
+	int data_off = (int)blk->data_off;
+	int i;
+
+	if (!blk->data)
+		return 0;
+	if (!b)
+		return generate_lfp_data_ptrs(blk, ptrs) &&
+		       validate_lfp_data_ptrs(ptrs, blk->data, blk->data_len);
+
+	for (i = 0; i < (int)sizeof(*ptrs); i++)
+		((uint8_t *)ptrs)[i] = 0;
+	ptrs->num_entries = len >= 1 ? b[0] : 0;
+	for (i = 0; i < 16; i++) {
+		lfp_tbl_read(b, len, 1 + (unsigned)i * 9 + 0, &ptrs->p[i].fp);
+		lfp_tbl_read(b, len, 1 + (unsigned)i * 9 + 3, &ptrs->p[i].dvo);
+		lfp_tbl_read(b, len, 1 + (unsigned)i * 9 + 6, &ptrs->p[i].pnp);
+	}
+	lfp_tbl_read(b, len, 1 + 16 * 9, &ptrs->name);
+
+	/* the table's offsets count from the start of the BDB */
+	for (i = 0; i < 16; i++) {
+		if (ptrs->p[i].fp.off < data_off || ptrs->p[i].dvo.off < data_off ||
+		    ptrs->p[i].pnp.off < data_off)
+			return 0;
+		ptrs->p[i].fp.off -= data_off;
+		ptrs->p[i].dvo.off -= data_off;
+		ptrs->p[i].pnp.off -= data_off;
+	}
+	if (ptrs->name.size) {
+		if (ptrs->name.off < data_off)
+			return 0;
+		ptrs->name.off -= data_off;
+	}
+	return validate_lfp_data_ptrs(ptrs, blk->data, blk->data_len);
+}
+
+/* An 18-byte LFP DTD into a mode.  The layout is an EDID detailed
+ * timing's but for the sync polarities: bit 6 of the last byte is the
+ * horizontal one, bit 5 the vertical.  Sync ends past the totals (some
+ * tables have them) are pulled back.  0 when it is no mode. */
+static int fill_detail_timing(const uint8_t *d, struct drm_mode_modeinfo *m,
+			      uint32_t *width_mm, uint32_t *height_mm)
+{
 	uint32_t clock = (uint32_t)rd16(d) * 10;
 	uint32_t hactive = d[2] | ((d[4] & 0xf0) << 4);
 	uint32_t hblank = d[3] | ((d[4] & 0x0f) << 8);
@@ -521,9 +699,9 @@ static void parse_lfp_data(const uint8_t *bdb, const uint8_t *ptrs, unsigned ptr
 	uint32_t hsync_w = d[9] | ((d[11] & 0x30) << 4);
 	uint32_t vsync_off = (d[10] >> 4) | ((d[11] & 0x0c) << 2);
 	uint32_t vsync_w = (d[10] & 0x0f) | ((d[11] & 0x03) << 4);
-	if (!clock || !hactive || !vactive)
-		return;
-	struct drm_mode_modeinfo *m = &out->panel_mode;
+
+	if (!clock || !hactive || !vactive || !hblank || !vblank)
+		return 0;
 	for (unsigned i = 0; i < sizeof(*m); i++)
 		((uint8_t *)m)[i] = 0;
 	m->clock = clock;
@@ -535,11 +713,172 @@ static void parse_lfp_data(const uint8_t *bdb, const uint8_t *ptrs, unsigned ptr
 	m->vsync_start = (uint16_t)(vactive + vsync_off);
 	m->vsync_end = (uint16_t)(vactive + vsync_off + vsync_w);
 	m->vtotal = (uint16_t)(vactive + vblank);
-	m->flags = (d[17] & 0x02) ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC;
-	m->flags |= (d[17] & 0x04) ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC;
+	if (m->hsync_end > m->htotal)
+		m->hsync_end = m->htotal;
+	if (m->vsync_end > m->vtotal)
+		m->vsync_end = m->vtotal;
+	m->flags = (d[17] & 0x40) ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC;
+	m->flags |= (d[17] & 0x20) ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC;
 	m->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
 	drm_mode_finish(m);
+	if (width_mm)
+		*width_mm = d[12] | ((uint32_t)(d[14] >> 4) << 8);
+	if (height_mm)
+		*height_mm = d[13] | ((uint32_t)(d[14] & 0x0f) << 8);
+	return 1;
+}
+
+/* The generic DTD block (BDB 229+): a u16 entry size, then one 28-byte
+ * entry per panel type -- the pixel clock in kHz (u32), then u16s of
+ * hactive, hblank, hfront porch, hsync, the same four vertically, the
+ * size in mm, and a flag byte whose bit 7 is a positive horizontal sync
+ * and bit 6 a positive vertical one.  When it has the panel's entry the
+ * panel's timing comes from here rather than from the LFP data block. */
+#define VBT_GENERIC_DTD_SIZE 28
+
+static void parse_generic_dtd(const struct vbt_panel_blocks *blk, struct intel_vbt *out)
+{
+	const uint8_t *b = blk->gdtd;
+	unsigned esz, num;
+	const uint8_t *e;
+	struct drm_mode_modeinfo *m = &out->panel_mode;
+	int pt = out->panel_type;
+
+	if (blk->version < 229 || !b || blk->gdtd_len < 2)
+		return;
+	esz = rd16(b);
+	/* a larger entry has fields this parser does not know: the ones it
+	 * knows are still where they were */
+	if (esz < VBT_GENERIC_DTD_SIZE)
+		return;
+	num = (blk->gdtd_len - 2) / esz;
+	if (pt < 0 || (unsigned)pt >= num)
+		return;
+	e = b + 2 + (unsigned)pt * esz;
+	uint32_t clock = rd32(e + 0);
+	uint32_t hactive = rd16(e + 4), hblank = rd16(e + 6), hfp = rd16(e + 8), hsync = rd16(e + 10);
+	uint32_t vactive = rd16(e + 12), vblank = rd16(e + 14), vfp = rd16(e + 16), vsync = rd16(e + 18);
+	if (!clock || !hactive || !vactive || !hblank || !vblank)
+		return;
+	for (unsigned i = 0; i < sizeof(*m); i++)
+		((uint8_t *)m)[i] = 0;
+	m->clock = clock;
+	m->hdisplay = (uint16_t)hactive;
+	m->hsync_start = (uint16_t)(hactive + hfp);
+	m->hsync_end = (uint16_t)(hactive + hfp + hsync);
+	m->htotal = (uint16_t)(hactive + hblank);
+	m->vdisplay = (uint16_t)vactive;
+	m->vsync_start = (uint16_t)(vactive + vfp);
+	m->vsync_end = (uint16_t)(vactive + vfp + vsync);
+	m->vtotal = (uint16_t)(vactive + vblank);
+	m->flags = (e[24] & 0x80) ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC;
+	m->flags |= (e[24] & 0x40) ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC;
+	m->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	drm_mode_finish(m);
+	out->panel_width_mm = rd16(e + 20);
+	out->panel_height_mm = rd16(e + 22);
 	out->panel_mode_valid = 1;
+}
+
+/* The LFP data block: the panel's DTD (unless the generic DTD block
+ * gave the timing already). */
+static void parse_lfp_data(const struct vbt_panel_blocks *blk, struct intel_vbt *out)
+{
+	struct lfp_ptrs ptrs;
+	int pt = out->panel_type;
+
+	if (pt < 0 || pt > 15 || out->panel_mode_valid)
+		return;
+	if (!get_lfp_data_ptrs(blk, &ptrs))
+		return;
+	if (fill_detail_timing(blk->data + ptrs.p[pt].dvo.off, &out->panel_mode,
+			       &out->panel_width_mm, &out->panel_height_mm))
+		out->panel_mode_valid = 1;
+}
+
+/* The panel type the table's PnP ids name for this EDID: the first
+ * entry equal to the EDID's ten identification bytes (manufacturer,
+ * product, serial, week and year of manufacture), else the first that
+ * equals them with no date given; -1 for none. */
+static int pnpid_get_panel_type(const struct vbt_panel_blocks *blk, const uint8_t *edid,
+				unsigned edid_len)
+{
+	struct lfp_ptrs ptrs;
+	uint8_t id[VBT_PNP_ID_SIZE], nodate[VBT_PNP_ID_SIZE];
+	int best = -1;
+
+	if (!edid || edid_len < 128)
+		return -1;
+	for (int i = 0; i < VBT_PNP_ID_SIZE; i++)
+		id[i] = nodate[i] = edid[8 + i];
+	nodate[8] = 0;
+	nodate[9] = 0;
+	if (!get_lfp_data_ptrs(blk, &ptrs))
+		return -1;
+	for (int i = 0; i < 16; i++) {
+		const uint8_t *v = blk->data + ptrs.p[i].pnp.off;
+		int same = 1, same_nodate = 1;
+
+		for (int k = 0; k < VBT_PNP_ID_SIZE; k++) {
+			if (v[k] != id[k])
+				same = 0;
+			if (v[k] != nodate[k])
+				same_nodate = 0;
+		}
+		if (same)
+			return i;
+		if (best < 0 && same_nodate)
+			best = i;
+	}
+	return best;
+}
+
+/* The LFP options block's panel type for the first or the second panel;
+ * -1 for none or an invalid one.  The range is checked on the first
+ * panel's value whichever is asked for; 0xff, "by PnP id", is passed on. */
+static int vbt_get_panel_type(const struct vbt_panel_blocks *blk, int lfp2)
+{
+	int t;
+
+	if (!blk->opts)
+		return -1;
+	t = blk->opts_len >= 1 ? blk->opts[0] : 0;
+	if (t > 0xf && t != 0xff)
+		return -1;
+	if (lfp2)
+		t = blk->opts_len >= 2 ? blk->opts[1] : 0;
+	/* an out of range second value is refused like the first */
+	if (t > 0xf && t != 0xff)
+		return -1;
+	return t;
+}
+
+/* The panel type: what the table names, or with 0xff the entry whose PnP
+ * id matches the EDID's; neither, the first entry -- but only when
+ * `use_fallback', so that a decision made before the EDID could be read
+ * is left for later.  (The firmware's own idea of the panel type, which
+ * the OpRegion can be asked for, is not consulted: firmware reports it
+ * unreliably.) */
+static int get_panel_type(const struct vbt_panel_blocks *blk, const uint8_t *edid,
+			  unsigned edid_len, int lfp2, int use_fallback, int *src)
+{
+	int vbt = vbt_get_panel_type(blk, lfp2);
+	int pnpid = pnpid_get_panel_type(blk, edid, edid_len);
+
+	if (vbt == 0xff && pnpid >= 0) {
+		*src = INTEL_VBT_PANEL_PNPID;
+		return pnpid;
+	}
+	if (vbt != 0xff && vbt >= 0) {
+		*src = INTEL_VBT_PANEL_VBT;
+		return vbt;
+	}
+	if (use_fallback) {
+		*src = INTEL_VBT_PANEL_FALLBACK;
+		return 0;
+	}
+	*src = INTEL_VBT_PANEL_NONE;
+	return -1;
 }
 
 static void parse_backlight(const uint8_t *b, unsigned len,
@@ -634,25 +973,15 @@ int intel_vbt_parse(const uint8_t *vbt, unsigned len, struct intel_vbt *out)
 	return intel_vbt_parse_platform(vbt, len, 0, 0, out);
 }
 
-int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
-			     int platform, struct intel_vbt *out)
+/* The BIOS data block: where it starts, its header's size and the bytes
+ * of it inside the image.  0, or -EINVAL for an image that is not a VBT. */
+static int vbt_bdb(const uint8_t *vbt, unsigned len, const uint8_t **bdbp, uint16_t *hsizep,
+		   uint16_t *bsizep)
 {
-	struct vbt_ctx ctx = { display_ver, platform };
-	for (unsigned i = 0; i < sizeof(*out); i++)
-		((uint8_t *)out)[i] = 0;
-	out->panel_type = -1;
-	out->lfp_vrr = 1;
-	for (int i = 0; i < INTEL_MAX_PORTS; i++) {
-		out->port[i].aux_ch = 0xff;
-		out->port[i].hdmi_level_shift = 0xff;
-	}
 	if (!vbt || len < 48)
 		return -EINVAL;
 	if (vbt[0] != '$' || vbt[1] != 'V' || vbt[2] != 'B' || vbt[3] != 'T')
 		return -EINVAL;
-	for (int i = 0; i < 20; i++)
-		out->signature[i] = (char)vbt[i];
-	out->signature[20] = 0;
 	/* header: 20 bytes of signature, u16 version, u16 header_size,
 	 * u16 vbt_size, u8 checksum, u8 reserved, then at byte 28 the u32
 	 * offset of the data blocks.  Reading it four bytes early picks up
@@ -667,77 +996,212 @@ int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
 	const uint8_t *bdb = vbt + bdb_off;
 	/* BDB header: 16 sig "BIOS_DATA_BLOCK ", u16 version, u16 header
 	 * size, u16 bdb_size */
-	out->version = rd16(bdb + 16);
 	uint16_t hsize = rd16(bdb + 18);
 	uint16_t bsize = rd16(bdb + 20);
 	if (hsize < 22 || bdb_off + bsize > len)
 		bsize = (uint16_t)(len - bdb_off);
-	const uint8_t *ptrs_blk = 0;
-	unsigned ptrs_len = 0;
-	const uint8_t *data_blk = 0;
-	unsigned data_len = 0;
-	const uint8_t *edp_blk = 0;
-	unsigned edp_len = 0;
-	const uint8_t *bl_blk = 0;
-	unsigned bl_len = 0;
-	const uint8_t *power_blk = 0;
-	unsigned power_len = 0;
-	const uint8_t *dsc_blk = 0;
-	unsigned dsc_len = 0;
-	/* first pass: everything that does not depend on the panel type */
+	*bdbp = bdb;
+	*hsizep = hsize;
+	*bsizep = bsize;
+	return 0;
+}
+
+/* One walk over the blocks: the panel's blocks noted in `blk', and with
+ * `out' the child devices parsed and the compression parameters block
+ * noted too. */
+static void walk_blocks(const struct vbt_ctx *ctx, const uint8_t *bdb, uint16_t hsize,
+			uint16_t bsize, struct vbt_panel_blocks *blk, const uint8_t **dsc_blk,
+			unsigned *dsc_len, struct intel_vbt *out)
+{
 	for (unsigned off = hsize; off + 3 <= bsize;) {
 		uint8_t id = bdb[off];
-		uint16_t blen = rd16(bdb + off + 1);
+		uint32_t blen = rd16(bdb + off + 1);
 		const uint8_t *body = bdb + off + 3;
-		if (off + 3 + blen > bsize)
+		/* the MIPI sequence block from version 3 keeps a 32-bit size
+		 * after its version byte */
+		if (id == BDB_MIPI_SEQUENCE && off + 8 <= bsize && bdb[off + 3] >= 3)
+			blen = rd32(bdb + off + 4);
+		if (blen > bsize || off + 3 + blen > bsize)
 			break;
 		switch (id) {
 		case BDB_GENERAL_DEFINITIONS:
-			parse_general_definitions(&ctx, body, blen, out->version, out);
+			if (out)
+				parse_general_definitions(ctx, body, blen, out->version, out);
 			break;
 		case BDB_LVDS_OPTIONS:
-			parse_lvds_options(body, blen, out);
+			blk->opts = body;
+			blk->opts_len = blen;
+			if (out)
+				parse_lvds_options(body, blen, out);
 			break;
 		case BDB_LVDS_LFP_DATA_PTRS:
-			ptrs_blk = body;
-			ptrs_len = blen;
+			blk->ptrs = body;
+			blk->ptrs_len = blen;
 			break;
 		case BDB_LVDS_LFP_DATA:
-			data_blk = body;
-			data_len = blen;
+			blk->data = body;
+			blk->data_len = blen;
+			blk->data_off = off + 3;
 			break;
 		case BDB_EDP:
-			edp_blk = body;
-			edp_len = blen;
+			blk->edp = body;
+			blk->edp_len = blen;
 			break;
 		case BDB_LFP_BACKLIGHT:
-			bl_blk = body;
-			bl_len = blen;
+			blk->bl = body;
+			blk->bl_len = blen;
 			break;
 		case BDB_LFP_POWER:
-			power_blk = body;
-			power_len = blen;
+			blk->power = body;
+			blk->power_len = blen;
+			break;
+		case BDB_GENERIC_DTD:
+			blk->gdtd = body;
+			blk->gdtd_len = blen;
 			break;
 		case BDB_COMPRESSION_PARAMETERS:
-			dsc_blk = body;
-			dsc_len = blen;
+			if (dsc_blk) {
+				*dsc_blk = body;
+				*dsc_len = blen;
+			}
 			break;
 		default:
 			break;
 		}
 		off += 3 + blen;
 	}
-	if (out->panel_type < 0)
-		out->panel_type = 0;
-	if (data_blk)
-		parse_lfp_data(bdb, ptrs_blk, ptrs_len, data_blk, data_len, out);
-	if (edp_blk)
-		parse_edp(edp_blk, edp_len, out);
-	if (bl_blk)
-		parse_backlight(bl_blk, bl_len, out);
-	if (power_blk)
-		parse_lfp_power(power_blk, power_len, out);
+}
+
+/* Every per-panel field as it is while the panel type is unknown. */
+static void panel_defaults(struct intel_vbt *out)
+{
+	for (unsigned i = 0; i < sizeof(out->panel_mode); i++)
+		((uint8_t *)&out->panel_mode)[i] = 0;
+	out->panel_mode_valid = 0;
+	out->panel_width_mm = 0;
+	out->panel_height_mm = 0;
+	for (unsigned i = 0; i < sizeof(out->pps); i++)
+		((uint8_t *)&out->pps)[i] = 0;
+	out->edp_rate = 0;
+	out->edp_lanes = 0;
+	out->edp_vswing_preemph = 0;
+	out->edp_low_vswing = 0;
+	out->edp_dsc_disable = 0;
+	out->backlight_valid = 0;
+	out->backlight_pwm_hz = 0;
+	out->backlight_min = 0;
+	out->backlight_active_low = 0;
+	out->backlight_controller = 0;
+	out->panel_bpc = 0;
+	out->lfp_vrr = 1;
+}
+
+/* Everything the panel type indexes. */
+static void parse_panel(const struct vbt_panel_blocks *blk, struct intel_vbt *out)
+{
+	panel_defaults(out);
+	parse_generic_dtd(blk, out);
+	parse_lfp_data(blk, out);
+	if (blk->edp)
+		parse_edp(blk->edp, blk->edp_len, out);
+	if (blk->bl)
+		parse_backlight(blk->bl, blk->bl_len, out);
+	if (blk->power)
+		parse_lfp_power(blk->power, blk->power_len, out);
+}
+
+/* Is the first eDP port's child the second panel's?  The panel data the
+ * table parse fills is that port's. */
+static int first_edp_is_lfp2(const struct intel_vbt *out)
+{
+	for (int i = 0; i < INTEL_MAX_PORTS; i++)
+		if (out->port[i].present && out->port[i].supports_edp)
+			return out->port[i].handle == DEVICE_HANDLE_LFP2;
+	return 0;
+}
+
+int intel_vbt_parse_platform(const uint8_t *vbt, unsigned len, int display_ver,
+			     int platform, struct intel_vbt *out)
+{
+	struct vbt_ctx ctx = { display_ver, platform };
+	struct vbt_panel_blocks blk;
+	const uint8_t *bdb;
+	uint16_t hsize, bsize;
+	const uint8_t *dsc_blk = 0;
+	unsigned dsc_len = 0;
+	int src, pt;
+
+	for (unsigned i = 0; i < sizeof(*out); i++)
+		((uint8_t *)out)[i] = 0;
+	for (unsigned i = 0; i < sizeof(blk); i++)
+		((uint8_t *)&blk)[i] = 0;
+	out->panel_type = -1;
+	out->panel_type_vbt = -1;
+	out->panel_type2_vbt = -1;
+	out->lfp_vrr = 1;
+	for (int i = 0; i < INTEL_MAX_PORTS; i++) {
+		out->port[i].aux_ch = 0xff;
+		out->port[i].hdmi_level_shift = 0xff;
+	}
+	if (vbt_bdb(vbt, len, &bdb, &hsize, &bsize))
+		return -EINVAL;
+	for (int i = 0; i < 20; i++)
+		out->signature[i] = (char)vbt[i];
+	out->signature[20] = 0;
+	out->version = rd16(bdb + 16);
+	blk.version = out->version;
+	/* first everything that does not depend on the panel type */
+	walk_blocks(&ctx, bdb, hsize, bsize, &blk, &dsc_blk, &dsc_len, out);
+	out->raw = vbt;
+	out->raw_len = len;
+	/* The panel type now if the table names it; one to be matched by
+	 * the panel's EDID waits for intel_vbt_init_panel(). */
+	pt = get_panel_type(&blk, 0, 0, first_edp_is_lfp2(out), 0, &src);
+	if (pt >= 0) {
+		out->panel_type = pt;
+		out->panel_type_src = src;
+		parse_panel(&blk, out);
+	}
 	parse_compression_parameters(dsc_blk, dsc_len, out);
 	out->valid = 1;
 	return 0;
+}
+
+int intel_vbt_init_panel(struct intel_vbt *vbt, const uint8_t *edid, unsigned edid_len,
+			 int lfp2, int use_fallback)
+{
+	struct vbt_panel_blocks blk;
+	const uint8_t *bdb;
+	uint16_t hsize, bsize;
+	int src, pt;
+
+	if (vbt->panel_type >= 0)
+		return 0;
+	for (unsigned i = 0; i < sizeof(blk); i++)
+		((uint8_t *)&blk)[i] = 0;
+	if (vbt->valid && vbt->raw && vbt_bdb(vbt->raw, vbt->raw_len, &bdb, &hsize, &bsize) == 0) {
+		blk.version = vbt->version;
+		walk_blocks(0, bdb, hsize, bsize, &blk, 0, 0, 0);
+	}
+	pt = get_panel_type(&blk, edid, edid_len, lfp2, use_fallback, &src);
+	if (pt < 0)
+		return -1;
+	vbt->panel_type = pt;
+	vbt->panel_type_src = src;
+	parse_panel(&blk, vbt);
+	return 1;
+}
+
+const char *intel_vbt_panel_src_name(int src)
+{
+	switch (src) {
+	case INTEL_VBT_PANEL_VBT:
+		return "VBT";
+	case INTEL_VBT_PANEL_PNPID:
+		return "PnP id";
+	case INTEL_VBT_PANEL_FALLBACK:
+		return "fallback";
+	default:
+		return "none";
+	}
 }

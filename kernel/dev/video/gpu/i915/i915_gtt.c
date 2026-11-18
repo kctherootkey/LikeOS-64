@@ -122,8 +122,15 @@ int i915_gtt_probe(struct i915_device *i915)
 	i915->gtt_size = (uint64_t)1 << (20 + ggms);
 	i915->ggtt_bytes = i915->gtt_size / 8 * 4096;
 	i915->stolen_size = chv ? chv_stolen_size(gms) : stolen_size_from_gms(info, gms);
-	i915->stolen_base = pci_cfg_read32_dev(i915->pci, I915_PCI_BSM) &
-			    0xFFF00000u;
+	/* Gen11 on: a 64-bit base of its own (the Gen6-10 register reads
+	 * zero there) */
+	if (info->gen >= 11)
+		i915->stolen_base =
+			((uint64_t)pci_cfg_read32_dev(i915->pci, I915_PCI_GEN11_BSM_DW1) << 32) |
+			(pci_cfg_read32_dev(i915->pci, I915_PCI_GEN11_BSM_DW0) & 0xFFF00000u);
+	else
+		i915->stolen_base = pci_cfg_read32_dev(i915->pci, I915_PCI_BSM) &
+				    0xFFF00000u;
 	if (info->gen <= 9)
 		i915->gsm_base = pci_cfg_read32_dev(i915->pci, I915_PCI_BGSM) &
 				 0xFFF00000u;

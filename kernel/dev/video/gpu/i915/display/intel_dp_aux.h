@@ -46,6 +46,12 @@ struct intel_dp_aux {
 
 void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
 		       int port);
+/* The channel's power domain, held across a burst of transactions (every
+ * transaction holds it for itself as well); takes the display lock.  The
+ * get's value goes to the put, which releases the hold 100 ms after the
+ * last one. */
+uint32_t intel_dp_aux_power_get(struct intel_dp_aux *aux);
+void intel_dp_aux_power_put(struct intel_dp_aux *aux, uint32_t was);
 /* Native AUX: read/write `len' bytes at DPCD `addr'.  Returns the byte
  * count or a negative errno. */
 int intel_dp_aux_native_read(struct intel_dp_aux *aux, uint32_t addr,

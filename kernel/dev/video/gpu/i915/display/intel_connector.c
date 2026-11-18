@@ -43,6 +43,114 @@
 #include <kernel/dev/video/gpu/drm/drm_modes.h>
 #include <kernel/dev/video/gpu/drm/drm_probe_helper.h>
 #include <kernel/dev/video/gpu/drm/gpu_util.h>
+#include <kernel/mm/memory.h>
+
+/* ---- panels ------------------------------------------------------------------ */
+
+/* A client mode's refresh rate, from its timings. */
+static int umode_vrefresh(const struct drm_mode_modeinfo *m)
+{
+	struct drm_display_mode dm;
+
+	if (drm_mode_from_umode(&dm, m) == 0)
+		return drm_mode_vrefresh(&dm);
+	return (int)m->vrefresh;
+}
+
+int intel_panel_edid_fixed_modes(const uint8_t *edid, unsigned len, uint32_t conn_type,
+				 struct drm_mode_modeinfo *fixed, int max_fixed, int *bpc,
+				 uint32_t *width_mm, uint32_t *height_mm)
+{
+	const uint32_t sync = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_PVSYNC |
+			      DRM_MODE_FLAG_NVSYNC;
+	struct drm_display_info *info = kalloc(sizeof(*info));
+	struct drm_display_mode *modes = kcalloc(DRM_PROBE_MAX_MODES, sizeof(*modes));
+	struct drm_edid_conn ec;
+	int count = 0, pref = -1;
+
+	if (bpc)
+		*bpc = 0;
+	if (!info || !modes || !edid || len < DRM_EDID_BLOCK || max_fixed < 1)
+		goto out;
+	mm_memset(info, 0, sizeof(*info));
+	mm_memset(&ec, 0, sizeof(ec));
+	ec.connector_type = conn_type;
+	ec.info = info;
+	ec.eld = NULL;
+	ec.modes = modes;
+	ec.max_modes = DRM_PROBE_MAX_MODES;
+	if (drm_edid_parse_full(edid, len, &ec) <= 0 || ec.nmodes <= 0)
+		goto out_info;
+	/* the mode the EDID marks preferred, else its first */
+	for (int i = 0; i < ec.nmodes; i++) {
+		if (modes[i].type & DRM_MODE_TYPE_PREFERRED) {
+			pref = i;
+			break;
+		}
+	}
+	if (pref < 0)
+		pref = 0;
+	drm_mode_convert_to_umode(&fixed[count], &modes[pref]);
+	fixed[count++].type |= DRM_MODE_TYPE_PREFERRED;
+	/* the other timings of that size */
+	for (int i = 0; i < ec.nmodes && count < max_fixed; i++) {
+		struct drm_mode_modeinfo u;
+		int dup = 0;
+
+		if (i == pref || modes[i].hdisplay != modes[pref].hdisplay ||
+		    modes[i].vdisplay != modes[pref].vdisplay ||
+		    (modes[i].flags & ~sync) != (modes[pref].flags & ~sync))
+			continue;
+		drm_mode_convert_to_umode(&u, &modes[i]);
+		for (int k = 0; k < count; k++)
+			if (drm_mode_equal(&fixed[k], &u))
+				dup = 1;
+		if (!dup) {
+			u.type &= (uint32_t)~DRM_MODE_TYPE_PREFERRED;
+			fixed[count++] = u;
+		}
+	}
+	if (bpc)
+		*bpc = (int)info->bpc;
+	if (width_mm)
+		*width_mm = info->width_mm;
+	if (height_mm)
+		*height_mm = info->height_mm;
+out_info:
+	drm_display_info_reset(info);
+out:
+	if (modes)
+		kfree(modes);
+	if (info)
+		kfree(info);
+	return count;
+}
+
+const struct drm_mode_modeinfo *intel_panel_drive_mode(const struct intel_output *o,
+							const struct drm_mode_modeinfo *m)
+{
+	const struct drm_mode_modeinfo *best = &o->fixed_mode;
+	int v = umode_vrefresh(m);
+	int bd = umode_vrefresh(best) - v;
+
+	if (bd < 0)
+		bd = -bd;
+	/* the nearest refresh rate; on a tie the one listed first */
+	for (int i = 0; i < o->nfixed_alt; i++) {
+		int d = umode_vrefresh(&o->fixed_alt[i]) - v;
+
+		if (d < 0)
+			d = -d;
+		if (d < bd) {
+			best = &o->fixed_alt[i];
+			bd = d;
+		}
+	}
+	/* no timing of the panel's near it: the panel's own, scaled */
+	if (bd > 1)
+		return &o->fixed_mode;
+	return best;
+}
 
 static int detect_locked(struct drm_device *dev, struct drm_connector *c)
 {
@@ -53,6 +161,12 @@ static int detect_locked(struct drm_device *dev, struct drm_connector *c)
 	/* a Type-C port answers only once the display holds its PHY */
 	if (o->is_tc && !o->active && intel_tc_connect(i915, o))
 		return DRM_MODE_DISCONNECTED;
+	/* a panel that could not be set up yet (it did not answer when the
+	 * display came up): another attempt, which detects it too */
+	if (o->is_edp && !o->fixed_mode_valid) {
+		(void)intel_edp_init_panel(i915, o);
+		return o->detected ? DRM_MODE_CONNECTED : DRM_MODE_DISCONNECTED;
+	}
 	if (o->type == INTEL_OUTPUT_DP || o->type == INTEL_OUTPUT_EDP)
 		return intel_dp_detect(i915, o) ? DRM_MODE_CONNECTED : DRM_MODE_DISCONNECTED;
 	if (o->type == INTEL_OUTPUT_HDMI || o->type == INTEL_OUTPUT_DVI)
@@ -101,7 +215,12 @@ static int get_modes_locked(struct drm_device *dev, struct drm_connector *c)
 		intel_vrr_connector_update(i915, o, conn);
 		return (int)c->nmodes;
 	}
-	if (o->type == INTEL_OUTPUT_DP || o->type == INTEL_OUTPUT_EDP) {
+	if (o->is_edp) {
+		/* The panel's EDID was read once, when the output was set up
+		 * (intel_edp_init_panel()), and is never read again. */
+		if (o->edid_len > 0)
+			n = drm_connector_set_edid(dev, conn, o->edid, (unsigned)o->edid_len);
+	} else if (o->type == INTEL_OUTPUT_DP) {
 		if (intel_dp_read_edid(i915, o) == 0)
 			n = drm_connector_set_edid(dev, conn, o->edid, (unsigned)o->edid_len);
 	} else if (o->edid_len > 0 || intel_hdmi_read_edid(i915, o) == 0) {
@@ -110,25 +229,22 @@ static int get_modes_locked(struct drm_device *dev, struct drm_connector *c)
 	if (n <= 0) {
 		drm_connector_set_edid(dev, conn, NULL, 0);
 		drm_connector_clear_modes(dev, conn);
-		/* the VBT's timing is marked preferred: it stays first */
-		if (o->is_edp && i915->display.vbt.panel_mode_valid) {
-			drm_connector_add_mode(dev, conn, &i915->display.vbt.panel_mode);
+		/* a panel without an EDID: its fixed mode (the VBT's timing),
+		 * marked preferred, so it stays first */
+		if (o->is_edp && o->fixed_mode_valid) {
+			drm_connector_add_mode(dev, conn, &o->fixed_mode);
 			n = 1;
 		}
 	}
 	if (o->is_edp) {
 		/* The panel's timing is the first mode; anything else on the
 		 * list is scaled onto it by the pipe, so the standard modes
-		 * up to its size are offered too. */
-		o->fixed_mode_valid = 0;
-		if (c->nmodes) {
-			o->fixed_mode = c->modes[0];
-			o->fixed_mode_valid = 1;
-			if (!helper || I915_FEAT_EDP_STD_MODES)
-				drm_connector_add_std_modes(dev, conn, o->fixed_mode.clock,
-							    o->fixed_mode.hdisplay,
-							    o->fixed_mode.vdisplay);
-		}
+		 * up to its size are offered too.  A panel without a fixed
+		 * mode offers nothing. */
+		if (o->fixed_mode_valid && c->nmodes && (!helper || I915_FEAT_EDP_STD_MODES))
+			drm_connector_add_std_modes(dev, conn, o->fixed_mode.clock,
+						    o->fixed_mode.hdisplay,
+						    o->fixed_mode.vdisplay);
 	} else if (!helper) {
 		/* an external sink: the standard modes under its limits */
 		uint32_t max_clock;
@@ -295,35 +411,27 @@ static enum drm_mode_status max_plane_size_mode_valid(struct i915_device *i915,
 	return MODE_OK;
 }
 
-/* The embedded panel: it runs its own timing (o->fixed_mode).  A mode of
- * the panel's size is driven as it is; with I915_FEAT_EDP_STD_MODES any
- * other is scaled onto the panel within the bounds the atomic check
- * accepts, else only the panel's own size at its refresh rate is
- * offered.  *hw is the timing the transcoder will run. */
+/* The embedded panel: it runs its own timing (o->fixed_mode, or the
+ * EDID's other timing of its size within 1 Hz of the mode's refresh
+ * rate: intel_panel_drive_mode()).  With I915_FEAT_EDP_STD_MODES any
+ * other mode is scaled onto the panel within the bounds the atomic check
+ * accepts, else only the panel's own size at one of its refresh rates is
+ * offered.  *hw is the timing the transcoder will run.  A panel without
+ * a fixed mode takes nothing. */
 static enum drm_mode_status panel_mode_valid(const struct intel_output *o,
-					     const struct drm_connector *c,
 					     const struct drm_display_mode *mode,
 					     struct drm_mode_modeinfo *hw)
 {
 	const struct drm_mode_modeinfo *f = &o->fixed_mode;
+	struct drm_mode_modeinfo m;
 
-	drm_mode_to_umode(hw, mode);
-	if (!o->fixed_mode_valid) {
-		/* Nothing tells the panel's timing (no EDID, no VBT mode):
-		 * the standard modes the probe would offer instead are not
-		 * the panel's, and none of them is driven onto it. */
-		if (!c->edid_blob_id)
-			return MODE_PANEL;
-		return MODE_OK;
-	}
+	if (!o->fixed_mode_valid)
+		return MODE_PANEL;
+	drm_mode_to_umode(&m, mode);
+	*hw = *intel_panel_drive_mode(o, &m);
 	if (mode->hdisplay == f->hdisplay && mode->vdisplay == f->vdisplay) {
-		if (!I915_FEAT_EDP_STD_MODES) {
-			struct drm_display_mode fm;
-
-			if (drm_mode_from_umode(&fm, f) == 0 &&
-			    drm_mode_vrefresh(mode) != drm_mode_vrefresh(&fm))
-				return MODE_PANEL;
-		}
+		if (!I915_FEAT_EDP_STD_MODES && umode_vrefresh(hw) != drm_mode_vrefresh(mode))
+			return MODE_PANEL;
 		return MODE_OK;
 	}
 	if (!I915_FEAT_EDP_STD_MODES)
@@ -332,16 +440,41 @@ static enum drm_mode_status panel_mode_valid(const struct intel_output *o,
 	if (mode->hdisplay < 8 || mode->vdisplay < 8 || mode->hdisplay > f->hdisplay * 3 ||
 	    mode->vdisplay > f->vdisplay * 3 || mode->hdisplay > 4096 || mode->vdisplay > 4096)
 		return MODE_PANEL;
-	*hw = *f;
+	return MODE_OK;
+}
+
+/* Can the link carry `hw' (uncompressed at the fastest rate and every
+ * lane the sink and the port share, else compressed where both ends
+ * can)? */
+static enum drm_mode_status dp_link_mode_valid(struct i915_device *i915, struct intel_output *o,
+					       const struct drm_mode_modeinfo *hw)
+{
+	if (o->detected && !intel_dp_link_carries(i915, o, hw)) {
+		struct intel_dsc_config dsc;
+
+		if (intel_dsc_compute_config(i915, o, hw, &dsc))
+			return MODE_CLOCK_HIGH;
+	}
+	return MODE_OK;
+}
+
+/* Can the pipe run `hw''s dot clock? */
+static enum drm_mode_status dotclock_mode_valid(struct i915_device *i915,
+						const struct drm_mode_modeinfo *hw)
+{
+	int max_dotclk = max_dotclock_khz(i915);
+
+	if (max_dotclk > 0 && (int)hw->clock > max_dotclk)
+		return MODE_CLOCK_HIGH;
 	return MODE_OK;
 }
 
 static enum drm_mode_status dp_mode_valid(struct i915_device *i915, struct intel_output *o,
-					  const struct drm_connector *c,
 					  const struct drm_display_mode *mode)
 {
-	struct drm_mode_modeinfo hw;
+	struct drm_mode_modeinfo hw, own;
 	enum drm_mode_status status;
+	int same_size;
 
 	status = cpu_transcoder_mode_valid(mode);
 	if (status != MODE_OK)
@@ -353,34 +486,36 @@ static enum drm_mode_status dp_mode_valid(struct i915_device *i915, struct intel
 	if (mode->clock < 10000)
 		return MODE_CLOCK_LOW;
 
+	drm_mode_to_umode(&own, mode);
 	if (o->is_edp) {
-		status = panel_mode_valid(o, c, mode, &hw);
+		status = panel_mode_valid(o, mode, &hw);
 		if (status != MODE_OK)
 			return status;
 	} else {
-		drm_mode_to_umode(&hw, mode);
+		hw = own;
 	}
+	/* A mode of the panel's size is offered only where its own timing
+	 * would pass as well: the list is what the panel is known to take. */
+	same_size = o->is_edp && mode->hdisplay == o->fixed_mode.hdisplay &&
+		    mode->vdisplay == o->fixed_mode.vdisplay;
 
-	/* The link: as the atomic check decides it -- uncompressed at the
-	 * fastest rate and every lane the sink and the port share, else
-	 * compressed where both ends can. */
-	if (o->detected && !intel_dp_link_carries(i915, o, &hw)) {
-		struct intel_dsc_config dsc;
-
-		if (intel_dsc_compute_config(i915, o, &hw, &dsc))
-			return MODE_CLOCK_HIGH;
-	}
+	/* The link: as the atomic check decides it. */
+	status = dp_link_mode_valid(i915, o, &hw);
+	if (status == MODE_OK && same_size)
+		status = dp_link_mode_valid(i915, o, &own);
+	if (status != MODE_OK)
+		return status;
 
 	status = max_plane_size_mode_valid(i915, mode);
 	if (status != MODE_OK)
 		return status;
 
 	/* the dot clock the pipe runs, the panel's when it scales */
-	{
-		int max_dotclk = max_dotclock_khz(i915);
-		if (max_dotclk > 0 && (int)hw.clock > max_dotclk)
-			return MODE_CLOCK_HIGH;
-	}
+	status = dotclock_mode_valid(i915, &hw);
+	if (status == MODE_OK && same_size)
+		status = dotclock_mode_valid(i915, &own);
+	if (status != MODE_OK)
+		return status;
 
 	/* A branch device in front of the sink (a DP-to-HDMI/DVI/VGA
 	 * adaptor) passes on only what its own dot and TMDS clock limits
@@ -440,7 +575,7 @@ enum drm_mode_status intel_mode_valid(struct drm_device *dev, struct drm_connect
 	if (!o)
 		status = MODE_ERROR;
 	else if (o->type == INTEL_OUTPUT_DP || o->type == INTEL_OUTPUT_EDP)
-		status = dp_mode_valid(i915, o, c, mode);
+		status = dp_mode_valid(i915, o, mode);
 	else if (o->type == INTEL_OUTPUT_HDMI || o->type == INTEL_OUTPUT_DVI)
 		status = hdmi_mode_valid(i915, o, mode);
 	else

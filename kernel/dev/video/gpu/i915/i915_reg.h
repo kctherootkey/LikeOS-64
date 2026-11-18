@@ -6,6 +6,8 @@
 // name (GEN8_, GEN9_, GEN11_, GEN12_).
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2014-2024 Intel Corporation
 
 #ifndef KERNEL_DEV_GPU_I915_REG_H
 #define KERNEL_DEV_GPU_I915_REG_H
@@ -19,6 +21,8 @@
 /* ---- PCI config registers of the graphics function ---------------------- */
 #define I915_PCI_GGC 0x50 /* graphics control: stolen + GTT sizes */
 #define I915_PCI_BSM 0x5C /* base of stolen memory (data) */
+#define I915_PCI_GEN11_BSM_DW0 0xC0 /* Gen11+: base of stolen memory, low dword */
+#define I915_PCI_GEN11_BSM_DW1 0xC4 /* Gen11+: base of stolen memory, high dword */
 #define I915_PCI_BGSM 0xB0 /* base of GTT stolen memory (Gen8-9) */
 #define I915_PCI_ASLS 0xFC /* ACPI OpRegion base */
 #define I915_PCI_MSAC 0x62 /* aperture size (Gen<8) */
@@ -1007,6 +1011,8 @@
 #define GFX_FORWARD_VBLANK_MASK (3 << 5)
 #define RING_CONTEXT_STATUS_BUF_LO(base, i) ((base) + 0x370 + (i) * 8)
 #define RING_CONTEXT_STATUS_BUF_HI(base, i) ((base) + 0x374 + (i) * 8)
+/* Gen11 on: status entries 6 to 11 in registers of their own */
+#define RING_CONTEXT_STATUS_BUF2_LO(base, i) ((base) + 0x3c0 + (i) * 8)
 #define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3a0)
 #define GEN8_CSB_ENTRIES 6
 #define GEN11_CSB_ENTRIES 12
@@ -1040,12 +1046,20 @@
 #define GEN8_CTX_STATUS_ACTIVE_IDLE (1 << 3)
 #define GEN8_CTX_STATUS_COMPLETE (1 << 4)
 #define GEN8_CTX_STATUS_LITE_RESTORE (1 << 15)
-/* Gen12 entries: the low word's switch-to-new-queue bit, the high word's
- * outgoing software context id (all ones when none was running). */
-#define GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE (1 << 1)
+/* Gen12 entries: the low word's switch-to-new-queue bit (bit 0; bit 1 is
+ * reserved), and in each word the software context id (bits 15-25) --
+ * the low word's of the context switched to, the high word's of the one
+ * switched away from, all ones when there is none. */
+#define GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE (1 << 0)
 #define GEN12_CSB_SW_CTX_ID_SHIFT 15
 #define GEN12_CSB_SW_CTX_ID_MASK (0x7ffu << GEN12_CSB_SW_CTX_ID_SHIFT)
 #define GEN12_IDLE_CTX_ID 0x7ffu
+/* Xe_HP entries: the context ids in bits 10-25, the switch-to-new-queue
+ * bit in the high word. */
+#define XEHP_CTX_STATUS_SWITCHED_TO_NEW_QUEUE (1u << 1)
+#define XEHP_CSB_SW_CTX_ID_SHIFT 10
+#define XEHP_CSB_SW_CTX_ID_MASK (0x3fffffu << XEHP_CSB_SW_CTX_ID_SHIFT)
+#define XEHP_IDLE_CTX_ID 0xffffu
 #define GEN8_CTX_STATUS_COMPLETED_MASK (GEN8_CTX_STATUS_COMPLETE | GEN8_CTX_STATUS_PREEMPTED)
 
 /* context descriptors */
@@ -1057,6 +1071,7 @@
 #define GEN8_CTX_ADDRESSING_MODE_LEGACY64 (3 << 3)
 #define GEN8_CTX_L3LLC_COHERENT (1 << 5)
 #define GEN8_CTX_PRIVILEGE (1 << 8)
+#define GEN12_CTX_PRIORITY_NORMAL (1u << 9) /* the descriptor's EU priority */
 #define GEN8_CTX_ID_SHIFT 32
 #define GEN8_CTX_ID_WIDTH 21
 #define GEN11_SW_CTX_ID_SHIFT 37

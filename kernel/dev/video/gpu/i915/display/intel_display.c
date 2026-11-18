@@ -92,13 +92,6 @@ static enum intel_power_domain port_domain(int port)
 	return (enum intel_power_domain)(INTEL_PW_DDI_A + port);
 }
 
-/* Skylake's DDI E shares AUX A; everywhere else a port has its own. */
-static enum intel_power_domain aux_domain(struct i915_device *i915, int port)
-{
-	if (i915->display.model == INTEL_DISPLAY_SKL && port > 3)
-		return INTEL_PW_AUX_A;
-	return (enum intel_power_domain)(INTEL_PW_AUX_A + port);
-}
 
 const char *intel_port_name(struct i915_device *i915, int port)
 {
@@ -667,7 +660,7 @@ static void output_disable(struct i915_device *i915, struct intel_output *o)
 	}
 	intel_ddi_post_disable(i915, o);
 	intel_power_put(i915, port_domain(o->port));
-	intel_power_put(i915, aux_domain(i915, o->port));
+	intel_power_put(i915, intel_dp_aux_power_domain(&o->aux));
 	if (p)
 		intel_power_put(i915, (enum intel_power_domain)(INTEL_PW_PIPE_A + p->pipe));
 	o->active = 0;
@@ -691,10 +684,10 @@ static int output_enable(struct i915_device *i915, struct intel_output *o,
 	if (o->is_tc && intel_tc_connect(i915, o)) {
 		kprintf("[drm] i915: port %s: nothing on the Type-C connector\n",
 			intel_port_name(i915, o->port));
-		intel_power_get(i915, aux_domain(i915, o->port));
+		intel_power_get(i915, intel_dp_aux_power_domain(&o->aux));
 		goto fail;
 	}
-	intel_power_get(i915, aux_domain(i915, o->port));
+	intel_power_get(i915, intel_dp_aux_power_domain(&o->aux));
 	if (o->type == INTEL_OUTPUT_DP || o->type == INTEL_OUTPUT_EDP) {
 		if (o->is_edp) {
 			intel_pps_vdd_on(i915, o);
@@ -796,7 +789,7 @@ fail:
 		intel_dpll_put(i915, o->pll);
 		o->pll = -1;
 	}
-	intel_power_put(i915, aux_domain(i915, o->port));
+	intel_power_put(i915, intel_dp_aux_power_domain(&o->aux));
 	intel_power_put(i915, port_domain(o->port));
 	intel_power_put(i915, (enum intel_power_domain)(INTEL_PW_PIPE_A + p->pipe));
 	mm_memset(&p->dsc, 0, sizeof(p->dsc));
@@ -1083,17 +1076,23 @@ static int atomic_check_locked(struct drm_device *dev, struct drm_atomic_state *
 		const struct drm_mode_modeinfo *m = &cs->mode;
 		cs->adjusted_mode = *m;
 		cs->use_scaler = 0;
-		if (o->is_edp && o->fixed_mode_valid &&
-		    (m->hdisplay != o->fixed_mode.hdisplay ||
-		     m->vdisplay != o->fixed_mode.vdisplay)) {
-			/* the panel runs its own timing; the pipe scales */
-			const struct drm_mode_modeinfo *f = &o->fixed_mode;
-			if (m->hdisplay < 8 || m->vdisplay < 8 ||
-			    m->hdisplay > f->hdisplay * 3 || m->vdisplay > f->vdisplay * 3 ||
-			    m->hdisplay > 4096 || m->vdisplay > 4096)
-				return intel_display_check_reject(i915, "the mode cannot be scaled onto the panel");
+		if (o->is_edp) {
+			/* A panel runs its own timing and nothing else: a mode
+			 * of its size at that timing (or at the EDID's other
+			 * timing within 1 Hz of the mode's refresh rate), any
+			 * other size scaled onto it by the pipe.  Without a
+			 * fixed mode it is not driven. */
+			if (!o->fixed_mode_valid)
+				return intel_display_check_reject(i915, "the panel has no fixed mode");
+			const struct drm_mode_modeinfo *f = intel_panel_drive_mode(o, m);
+			if (m->hdisplay != f->hdisplay || m->vdisplay != f->vdisplay) {
+				if (m->hdisplay < 8 || m->vdisplay < 8 ||
+				    m->hdisplay > f->hdisplay * 3 || m->vdisplay > f->vdisplay * 3 ||
+				    m->hdisplay > 4096 || m->vdisplay > 4096)
+					return intel_display_check_reject(i915, "the mode cannot be scaled onto the panel");
+				cs->use_scaler = 1;
+			}
 			cs->adjusted_mode = *f;
-			cs->use_scaler = 1;
 		}
 		const struct drm_mode_modeinfo *hw = &cs->adjusted_mode;
 		if (o->type == INTEL_OUTPUT_DP || o->type == INTEL_OUTPUT_EDP) {
@@ -1812,6 +1811,10 @@ int intel_display_init(struct i915_device *i915)
 		/* the connector's vrr_capable, false until a probe finds a
 		 * refresh range */
 		intel_vrr_connector_init(i915, o, conn);
+		/* A panel is set up once: its EDID, its VBT entries, its
+		 * fixed mode. */
+		if (o->is_edp)
+			(void)intel_edp_init_panel(i915, o);
 		/* Probe now: the console needs modes before anyone asks. */
 		intel_connector_probe(i915, conn);
 		kprintf("[drm] i915: connector %d: DDI %s %s, %s, %u modes%s%s\n", conn,
@@ -1846,6 +1849,8 @@ void intel_display_suspend(struct i915_device *i915)
 		d->pipes[i].output = -1;
 		d->pipes[i].surf_ggtt = 0;
 	}
+	/* the AUX holds still waiting for their release go now */
+	intel_power_flush_async(i915);
 	intel_display_unlock(i915);
 }
 
@@ -1894,6 +1899,7 @@ void intel_display_fini(struct i915_device *i915)
 	d->hpd_ready = 0;
 	for (int i = 0; i < d->nout; i++)
 		output_disable(i915, &d->outputs[i]);
+	intel_power_flush_async(i915);
 	intel_opregion_fini(i915);
 	d->ready = 0;
 }

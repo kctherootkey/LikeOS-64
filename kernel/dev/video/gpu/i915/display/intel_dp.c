@@ -6,7 +6,10 @@
 // equalisation, each a loop of "send this pattern, read what the sink
 // saw, adjust the swing" until the sink reports every lane locked.
 // eDP is the same protocol on the internal panel, with panel power
-// sequencing around it.
+// sequencing around it.  The panel is set up once (intel_edp_init_panel):
+// its EDID read with VDD and the AUX channel's power held, the VBT panel
+// type decided with it, its fixed mode taken -- and never asked for its
+// EDID again.
 //
 // With I915_FEAT_DP_HELPERS the sink is read through the DisplayPort
 // helper library: the receiver capabilities (and their extended copy),
@@ -122,7 +125,9 @@ int intel_dp_detect(struct i915_device *i915, struct intel_output *o)
 int intel_dp_read_edid(struct i915_device *i915, struct intel_output *o)
 {
 	(void)i915;
+	uint32_t pw = intel_dp_aux_power_get(&o->aux);
 	int blocks = drm_edid_read(&o->aux.i2c, o->edid, sizeof(o->edid) / DRM_EDID_BLOCK);
+	intel_dp_aux_power_put(&o->aux, pw);
 	if (blocks <= 0) {
 		o->edid_len = 0;
 		return blocks < 0 ? blocks : -ENOENT;
@@ -376,11 +381,14 @@ int intel_dp_detect(struct i915_device *i915, struct intel_output *o)
 		o->detected = 0;
 		return 0;
 	}
+	/* the channel powered across the whole exchange */
+	uint32_t pw = intel_dp_aux_power_get(&o->aux);
 	int status = dp_detect_dpcd(i915, o);
 	if (status == DRM_MODE_DISCONNECTED)
 		dp_clear_sink(o);
 	else
 		detect_dsc_caps(i915, o);
+	intel_dp_aux_power_put(&o->aux, pw);
 	dp_set_probe(i915, o);
 	/* an adaptor whose display cannot be seen counts as connected */
 	o->detected = (status != DRM_MODE_DISCONNECTED);
@@ -413,8 +421,10 @@ int intel_dp_read_edid(struct i915_device *i915, struct intel_output *o)
 	/* the counts DP compliance asks about are the EDID read's own */
 	o->aux.dp.i2c_nack_count = 0;
 	o->aux.dp.i2c_defer_count = 0;
+	uint32_t pw = intel_dp_aux_power_get(&o->aux);
 	int blocks = drm_edid_read(intel_dp_aux_ddc(&o->aux), o->edid,
 				   sizeof(o->edid) / DRM_EDID_BLOCK);
+	intel_dp_aux_power_put(&o->aux, pw);
 	if (blocks <= 0) {
 		o->edid_len = 0;
 		if (!o->is_edp)
@@ -428,6 +438,139 @@ int intel_dp_read_edid(struct i915_device *i915, struct intel_output *o)
 }
 
 #endif /* I915_FEAT_DP_HELPERS */
+
+/* ---- the panel ------------------------------------------------------------ */
+
+static uint32_t fixed_vrefresh(const struct drm_mode_modeinfo *m)
+{
+	uint64_t den = (uint64_t)m->htotal * m->vtotal;
+
+	if (!den)
+		return m->vrefresh;
+	return (uint32_t)(((uint64_t)m->clock * 1000 + den / 2) / den);
+}
+
+int intel_edp_init_panel(struct i915_device *i915, struct intel_output *o)
+{
+	struct intel_display *d = &i915->display;
+	struct drm_mode_modeinfo *fixed = NULL;
+	struct intel_vbt *pv = NULL;
+	const char *edid_src = "EDID", *edid_fail = NULL;
+	int idx = (int)(o - d->outputs);
+	/* a panel that could not be set up is tried again by the probes;
+	 * only the first attempt says why */
+	int say = o->panel_init_tries++ == 0;
+	int owner, lfp2, nfixed = 0, decided = 0, rc = 0;
+	uint32_t pw;
+
+	intel_display_lock(i915);
+	if (o->fixed_mode_valid) {
+		intel_display_unlock(i915);
+		return 0;
+	}
+	o->nfixed_alt = 0;
+	o->panel_type = -1;
+	o->edid_len = 0;
+
+	/* The panel's logic and its AUX channel powered for the DPCD and
+	 * the EDID both: the channel's well (Ice Lake to Alder Lake, DG1,
+	 * DG2) must not drop between them. */
+	pw = intel_dp_aux_power_get(&o->aux);
+	intel_pps_vdd_on(i915, o);
+	if (!intel_dp_detect(i915, o)) {
+		intel_dp_aux_power_put(&o->aux, pw);
+		if (say)
+			kprintf("[drm] i915: eDP panel on DDI %s: failed to retrieve link info, not driven\n",
+				intel_port_name(i915, o->port));
+		intel_display_unlock(i915);
+		return -ENODEV;
+	}
+	if (intel_dp_read_edid(i915, o) != 0) {
+		o->edid_len = intel_opregion_get_edid(i915, o->edid, sizeof(o->edid));
+		edid_fail = "EDID read failed";
+		if (o->edid_len > 0)
+			edid_src = "OpRegion EDID";
+	}
+	intel_dp_aux_power_put(&o->aux, pw);
+
+	/* An EDID that gives no mode is no EDID. */
+	fixed = kcalloc(1 + INTEL_PANEL_MAX_ALT, sizeof(*fixed));
+	if (o->edid_len > 0 && fixed)
+		nfixed = intel_panel_edid_fixed_modes(o->edid, (unsigned)o->edid_len,
+						      DRM_MODE_CONNECTOR_eDP, fixed,
+						      1 + INTEL_PANEL_MAX_ALT, NULL, NULL, NULL);
+	if (o->edid_len > 0 && nfixed <= 0) {
+		o->edid_len = 0;
+		edid_fail = edid_fail ? "EDID read failed, OpRegion EDID gives no mode" :
+					"EDID gives no mode";
+	}
+
+	/* The VBT panel type, decided with the EDID where the table defers
+	 * to its PnP id, on a copy: it becomes the display's only when the
+	 * panel gets a fixed mode, so that an attempt that failed decides
+	 * nothing.  The first panel's entries are the ones the display's
+	 * VBT state carries (power sequencing, link, backlight); a second
+	 * panel's timing comes from a pass of its own. */
+	lfp2 = d->vbt.valid && d->vbt.port[o->port].handle == 0x0080;
+	owner = !d->vbt_panel_output || d->vbt_panel_output == idx + 1;
+	pv = kalloc(sizeof(*pv));
+	if (pv) {
+		*pv = d->vbt;
+		if (!owner)
+			pv->panel_type = -1;
+		decided = intel_vbt_init_panel(pv, o->edid_len > 0 ? o->edid : NULL,
+					       (unsigned)(o->edid_len > 0 ? o->edid_len : 0), lfp2, 1);
+		o->panel_type = pv->panel_type;
+	}
+
+	/* The fixed mode: the EDID's, else the VBT's for this panel type. */
+	if (nfixed > 0) {
+		o->fixed_mode = fixed[0];
+		for (int i = 1; i < nfixed; i++)
+			o->fixed_alt[o->nfixed_alt++] = fixed[i];
+		o->fixed_mode_valid = 1;
+	} else if (pv && pv->panel_mode_valid) {
+		o->fixed_mode = pv->panel_mode;
+		o->fixed_mode_valid = 1;
+		edid_src = "VBT";
+	}
+	if (o->fixed_mode_valid) {
+		if (owner && pv) {
+			d->vbt_panel_output = idx + 1;
+			/* the per-panel entries arrived only now: the
+			 * sequencer and the backlight again with them */
+			if (decided == 1) {
+				d->vbt = *pv;
+				intel_pps_init_late(i915, o);
+				d->bl_ready = 0;
+				intel_backlight_init(i915);
+			}
+		}
+		o->fixed_mode.type |= DRM_MODE_TYPE_PREFERRED;
+		kprintf("[drm] i915: eDP panel on DDI %s: %ux%u@%u (%u kHz) from %s%s%s (VBT panel type %d via %s)\n",
+			intel_port_name(i915, o->port), o->fixed_mode.hdisplay,
+			o->fixed_mode.vdisplay, fixed_vrefresh(&o->fixed_mode), o->fixed_mode.clock,
+			edid_src, edid_fail ? ", " : "", edid_fail ? edid_fail : "", o->panel_type,
+			pv && pv->valid ? intel_vbt_panel_src_name(pv->panel_type_src) : "no VBT");
+	} else {
+		if (say)
+			kprintf("[drm] i915: eDP panel on DDI %s: no fixed mode (%s, VBT panel type %d via %s has no timing): not driven\n",
+				intel_port_name(i915, o->port), edid_fail ? edid_fail : "no EDID",
+				o->panel_type,
+				pv && pv->valid ? intel_vbt_panel_src_name(pv->panel_type_src) : "no VBT");
+		/* nothing of this attempt is kept: the next one reads the
+		 * panel again */
+		o->edid_len = 0;
+		o->nfixed_alt = 0;
+		rc = -ENODEV;
+	}
+	if (pv)
+		kfree(pv);
+	if (fixed)
+		kfree(fixed);
+	intel_display_unlock(i915);
+	return rc;
+}
 
 /* ---- the link ------------------------------------------------------------ */
 
