@@ -1,6 +1,6 @@
 # LikeOS installer -- the source files of likeos-installer, shared by the
-# host build (Makefile.host) and the LikeOS build (mk/installer.mk).
-# Paths are relative to user/installer/frontend; the including makefile
+# host build (Makefile.host) and the LikeOS build (user/bin/installer/installer.mk).
+# Paths are relative to user/bin/installer/frontend; the including makefile
 # sets INSTALLER_FE_DIR (this directory) and INSTALLER_FE_TOP (the tree).
 #
 # Copyright (C) 2026 The LikeOS Project
@@ -33,7 +33,7 @@ INSTALLER_FE_HDRS := $(addprefix $(INSTALLER_FE_DIR)/, \
 	backend-ops.h backend-api.h autopilot.h mock/il-mock-names.h \
 	widgets/widgets.h art/art.h art/art-private.h pages/pages.h \
 	pages/password-pair.h) \
-	$(INSTALLER_FE_TOP)/user/installer/backend/include/installer.h
+	$(INSTALLER_FE_TOP)/user/bin/installer/backend/include/installer.h
 
 # What goes into the program's resources, and where it is found.
 INSTALLER_FE_RES_DIRS := \

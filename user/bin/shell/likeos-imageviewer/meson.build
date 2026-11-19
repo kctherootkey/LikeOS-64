@@ -1,8 +1,9 @@
 # LikeOS -- LikeOS Image Viewer, the system's own GTK3 picture viewer and
 # editor.
 #
-# An in-tree port like the media player and Explorer: the sources live here
-# and the GTK3 port driver builds them with meson against the port sysroot.
+# Part of the desktop shell (user/bin/shell), like the media player and
+# Explorer: the top-level Makefile builds it with meson against the GTK3 port
+# sysroot.
 #
 # Two parts:
 #

@@ -141,25 +141,6 @@
 #     `*/` rule above would drop it -- the build would then quietly produce an
 #     image whose only missing piece is one manual page.
 !/ports/xorg/gtk3/man/
-#     And the in-tree packages, which are our own source rather than an
-#     unpacked tarball ("in-tree" in packages.list; clean.sh keeps them).
-#     build.sh configures every package inside its own tree, so their
-#     build directories are ignored again one level down.
-!/ports/xorg/gtk3/gst-likeos-audio-1.0/
-/ports/xorg/gtk3/gst-likeos-audio-1.0/.likeos-build/
-/ports/xorg/gtk3/gst-likeos-audio-1.0/.likeos-host/
-!/ports/xorg/gtk3/likeos-mediaplayer-1.0/
-/ports/xorg/gtk3/likeos-mediaplayer-1.0/.likeos-build/
-/ports/xorg/gtk3/likeos-mediaplayer-1.0/.likeos-host/
-!/ports/xorg/gtk3/likeos-explorer-1.0/
-/ports/xorg/gtk3/likeos-explorer-1.0/.likeos-build/
-/ports/xorg/gtk3/likeos-explorer-1.0/.likeos-host/
-!/ports/xorg/gtk3/likeos-imageviewer-1.0/
-/ports/xorg/gtk3/likeos-imageviewer-1.0/.likeos-build/
-/ports/xorg/gtk3/likeos-imageviewer-1.0/.likeos-host/
-# The build driver's header-mtime snapshot (ports/xorg/build.sh), in every
-# in-tree package.
-/ports/xorg/gtk3/likeos-*/.likeos-hdr-snap
 #     The one tarball that is NOT tracked: LLVM (~171 MB), which is over
 #     GitHub's 100 MB hard limit for a single file -- the push is refused, not
 #     warned about.  Its sha256 is in checksums.sha256 like every other one, so
@@ -214,4 +195,16 @@
 /user/bin/shell/*
 !/user/bin/shell/*.c
 !/user/bin/shell/*.h
+#     The shell's meson programs (file manager, image viewer, media player,
+#     GStreamer audio sink), each a source tree of its own.  The Makefile
+#     configures each inside its tree, so the build directory is ignored again
+#     one level down.
+!/user/bin/shell/gst-likeos-audio/
+!/user/bin/shell/likeos-explorer/
+!/user/bin/shell/likeos-imageviewer/
+!/user/bin/shell/likeos-mediaplayer/
+/user/bin/shell/*/.likeos-build/
+#     The installer (backend, front ends, tools, its makefile); its own
+#     .gitignore files name the build outputs inside it.
+!/user/bin/installer/
 /tmp/

@@ -4,7 +4,7 @@
  * Some calls it needs -- mount, umount2, the *at family, lchown, syncfs --
  * are being added to the LikeOS C library while this code is written.  The
  * LikeOS build passes -DIL_HAVE_<CALL>=1 for every call its <unistd.h>,
- * <fcntl.h>, <sys/stat.h> and <sys/mount.h> declare (mk/installer.mk greps
+ * <fcntl.h>, <sys/stat.h> and <sys/mount.h> declare (user/bin/installer/installer.mk greps
  * the headers), so a call that appears later is picked up by the next
  * build without a change here.  A host build against glibc has them all.
  *
@@ -68,7 +68,7 @@
 #ifndef IL_HAVE_FUTIMENS
 #define IL_HAVE_FUTIMENS 1
 #endif
-#else /* the LikeOS C library: what mk/installer.mk found */
+#else /* the LikeOS C library: what user/bin/installer/installer.mk found */
 #include <sys/mount.h>
 #ifndef IL_HAVE_MOUNT
 #define IL_HAVE_MOUNT 0

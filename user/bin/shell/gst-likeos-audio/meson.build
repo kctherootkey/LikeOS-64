@@ -1,15 +1,15 @@
 # gst-likeos-audio: the GStreamer plugin "likeosaudio" with the element
 # likeosaudiosink, audio output through the LikeOS audio service (audiod).
 #
-# An in-tree package of the GTK3 port: packages.list names it with the
-# source marker "in-tree", so fetch.sh and unpack.sh leave this directory
-# alone and build.sh builds it like any other meson package, cross-compiled
-# into the port sysroot after gst-libav.  The plugin lands in
-# /usr/lib/gstreamer-1.0, which stage.sh copies onto the image wholesale.
+# Part of the desktop shell (user/bin/shell): the top-level Makefile builds it
+# with meson, cross-compiled against the GTK3 port sysroot once that port has
+# built, and installs it into the sysroot.  The plugin lands in
+# /usr/lib/gstreamer-1.0, which ports/xorg/gtk3/stage.sh copies onto the image
+# wholesale.
 #
 # libaudio is the system's own client library (user/lib/libaudio); its
 # headers and libaudio.pc are published into the sysroot by
-# ports/xorg/import-base-libs.sh, which is why it is an ordinary dependency()
+# ports/xorg/import-libaudio.sh, which is why it is an ordinary dependency()
 # here.
 #
 # Copyright (C) 2026 The LikeOS Project

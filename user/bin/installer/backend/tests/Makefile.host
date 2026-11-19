@@ -16,8 +16,8 @@
 CC = gcc
 OUT ?= host
 BACKEND = ..
-LIBGPT = ../../../lib/libgpt
-RES_ETC = ../../../../res/etc
+LIBGPT = ../../../../lib/libgpt
+RES_ETC = ../../../../../res/etc
 
 ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd)
 ZSTD_LIBS := $(shell pkg-config --libs libzstd)
@@ -59,7 +59,7 @@ $(OUT)/test_install: test_install.c $(OBJ)
 
 # The backend and libgpt as one host library, for the host build of the
 # graphical installer that installs onto image files
-# (user/installer/frontend/Makefile.host BACKEND=real).  Programs linking it
+# (user/bin/installer/frontend/Makefile.host BACKEND=real).  Programs linking it
 # need $(ZSTD_LIBS) -lcrypt as well.
 lib: $(OUT)/libinstaller-host.a
 

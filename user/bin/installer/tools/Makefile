@@ -1,7 +1,7 @@
 # Installer tools for LikeOS: likeos-gpt (GUID partition tables) and
 # likeos-efiboot (the firmware's boot entries).
 #
-# Compiled and linked like the programs in user/bin (see ../../bin/Makefile):
+# Compiled and linked like the programs in user/bin (see ../../Makefile):
 # freestanding against the LikeOS C library headers, dynamic PIE linked
 # against libc.so through ld-likeos.so, with libgpt.a linked in statically.
 #
@@ -10,9 +10,9 @@
 CC = gcc
 LD = ld
 
-LIBC_DIR = ../../lib/libc
-RTLD_DIR = ../../lib/rtld
-LIBGPT_DIR = ../../lib/libgpt
+LIBC_DIR = ../../../lib/libc
+RTLD_DIR = ../../../lib/rtld
+LIBGPT_DIR = ../../../lib/libgpt
 
 DEPFLAGS = -MMD -MP
 
@@ -22,7 +22,7 @@ CFLAGS = $(DEPFLAGS) -Wall -Wextra -Werror=implicit-function-declaration \
 	-I$(LIBC_DIR)/include -I$(LIBGPT_DIR)/include \
 	-fno-tree-vectorize -fno-strict-aliasing
 
-LDSCRIPT = ../../bin/user_dyn.lds
+LDSCRIPT = ../../user_dyn.lds
 
 LDFLAGS = -pie -nostdlib -T $(LDSCRIPT) --hash-style=gnu \
 	-z now -z relro --eh-frame-hdr \
@@ -36,7 +36,7 @@ PROGRAMS = likeos-gpt likeos-efiboot
 
 # The device path and load option code shared with the boot loader and the
 # kernel (freestanding C, compiled here like the tool itself).
-BOOT_DIR = ../../../boot
+BOOT_DIR = ../../../../boot
 
 all: $(PROGRAMS)
 

@@ -7,8 +7,8 @@
  * locale) and installs the boot loader with its firmware boot entry.
  *
  * It has no knowledge of any toolkit.  Two front ends drive it:
- *  - likeos-installer, the GTK3 wizard (user/installer/frontend), and
- *  - likeos-install, the text-mode installer (user/installer/cli), which
+ *  - likeos-installer, the GTK3 wizard (user/bin/installer/frontend), and
+ *  - likeos-install, the text-mode installer (user/bin/installer/cli), which
  *    also runs unattended from an answer file and needs no X server.
  *
  * Threading: a context is used by one thread at a time.  il_install() runs

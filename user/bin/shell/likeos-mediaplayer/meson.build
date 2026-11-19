@@ -1,9 +1,9 @@
 # LikeOS -- LikeOS Media Player, the system's own GTK3 music and video
 # player.
 #
-# An in-tree port: the sources live here rather than in a tarball, and the
-# GTK3 port driver builds it with meson like any other package, against the
-# port sysroot (GTK 3, GStreamer 1.24 and its base libraries).
+# Part of the desktop shell (user/bin/shell): the top-level Makefile builds it
+# with meson against the GTK3 port sysroot (GTK 3, GStreamer 1.24 and its base
+# libraries).
 #
 # Copyright (C) 2026 The LikeOS Project
 

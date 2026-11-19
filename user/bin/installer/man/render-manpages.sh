@@ -2,7 +2,7 @@
 # render-manpages.sh - render the manual pages of the disk, file system and
 # installer tools into the pre-formatted pages man(1) reads.
 #
-# A maintenance tool (make installer-manpages, mk/installer.mk), not part of
+# A maintenance tool (make installer-manpages, user/bin/installer/installer.mk), not part of
 # the build: the rendered pages are checked in, and groff is not a build
 # dependency.  It writes
 #
@@ -10,7 +10,7 @@
 #                     page keeps its own section in its header)
 #   res/man5/NAME.5   the file formats
 #   res/man-live/NAME.1  the installers' pages: staged on the live medium
-#                     only (mk/installer.mk, INSTALLER_STAGE_LIVE), as the
+#                     only (user/bin/installer/installer.mk, INSTALLER_STAGE_LIVE), as the
 #                     programs are
 #
 # from the upstream troff sources in the unpacked port trees (run each
@@ -33,7 +33,7 @@ set -eu
 
 root=$(cd "$1" && pwd)
 host_os=${2:-}
-here="$root/user/installer/man"
+here="$root/user/bin/installer/man"
 ports="$root/ports"
 man1="$root/res/man"
 man5="$root/res/man5"

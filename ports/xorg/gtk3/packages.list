@@ -495,15 +495,6 @@
 -         gst-plugins-bad    1.24.13  https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-%VERSION%.tar.xz
 -         ffmpeg             7.1.1    https://ffmpeg.org/releases/ffmpeg-%VERSION%.tar.xz
 -         gst-libav          1.24.13  https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-%VERSION%.tar.xz
-# Sound: likeosaudiosink, GStreamer's output to the system audio service
-# (audiod) through libaudio, at a rank that makes autoaudiosink -- what
-# playbin and WebKit use -- pick it first.  Our own code, so there is no
-# tarball: the source marker "in-tree" tells fetch.sh and unpack.sh that
-# gst-likeos-audio-1.0/ is checked in, and clean.sh keeps it.  libaudio's
-# headers and libaudio.pc come from ../import-libaudio.sh (run by the
-# ports-gtk3 make target before this manifest is built).
--         gst-likeos-audio   1.0      in-tree
-
 # The engine itself.  2.52.6 is the newest stable release that still ships
 # the GTK3 API (webkit2gtk-4.1); the GTK4-only builds do not apply here.
 -         webkitgtk          2.52.6   https://webkitgtk.org/releases/webkitgtk-%VERSION%.tar.xz
@@ -527,18 +518,3 @@
 -         luafilesystem      1.9.0    https://github.com/lunarmodules/luafilesystem/archive/refs/tags/v1_9_0.tar.gz
 # The browser.
 -         luakit             2.4.0    https://github.com/luakit/luakit/archive/refs/tags/%VERSION%.tar.gz
-
-# ---- the media player -----------------------------------------------------
-# LikeOS's own music and video player (GStreamer playbin, GTK3 window).
-# likeos-mediaplayer-1.0/ is checked in, like gst-likeos-audio above.
--         likeos-mediaplayer 1.0      in-tree
-
-# ---- the image viewer -----------------------------------------------------
-# LikeOS's own picture viewer and editor (GTK3 window, its own processing
-# library on libwebp, above).  likeos-imageviewer-1.0/ is checked in.
--         likeos-imageviewer 1.0      in-tree
-
-# ---- the file manager -------------------------------------------------------
-# LikeOS's own file manager (GTK3 window, GIO backend); the PCManFM desktop
-# hands folders to it.  likeos-explorer-1.0/ is checked in.
--         likeos-explorer    1.0      in-tree

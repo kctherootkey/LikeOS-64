@@ -2,7 +2,8 @@
 #
 # Publish libaudio -- the LikeOS audio client library -- into the X sysroot:
 # the headers (<audio/audio.h>, <audio/protocol.h>), libaudio.so and a
-# libaudio.pc, so ports such as the GStreamer audio sink can find it with
+# libaudio.pc, so programs built against the sysroot -- the GStreamer audio
+# sink (user/bin/shell/gst-likeos-audio) and the taskbar -- can find it with
 # pkg-config and link it.
 #
 # The library is built by the top-level Makefile (user/lib/libaudio) and

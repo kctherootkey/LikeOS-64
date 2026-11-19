@@ -15,8 +15,8 @@
 CC = gcc
 OUT ?= host
 BACKEND = ../backend
-LIBGPT = ../../lib/libgpt
-RES = ../../../res
+LIBGPT = ../../../lib/libgpt
+RES = ../../../../res
 
 ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd)
 ZSTD_LIBS := $(shell pkg-config --libs libzstd)

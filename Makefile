@@ -761,7 +761,7 @@ BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
 # The bootloader reads /boot/kernel.elf straight from the ext4 partition, so
 # the complete OS lives on one stick with no FAT data filesystem anywhere.
 # EXT4_STAGING_STAMP: the staging of everything the live medium and the
-# installed system share is done (mk/installer.mk, release section).
+# installed system share is done (user/bin/installer/installer.mk, release section).
 EXT4_STAGING  = $(BUILD_DIR)/ext4_staging
 # Normalises the staged modes: no file or directory of the image is
 # group-writable unless it is also world-writable on purpose (the 1777
@@ -906,16 +906,22 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 #
 # The file it names is the LAST program the manifest builds, which is what
 # makes its presence mean "the whole stack".  That was Claws Mail, then
-# PCManFM, and is now LikeOS Explorer (likeos-explorer), the last in-tree
-# package of gtk3/packages.list after the media player -- a sentinel left at
-# an earlier package would go on being satisfied by a port that stopped
-# before the packages added after it.
-GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/likeos-explorer
+# PCManFM, then LikeOS Explorer, and is now luakit, the last package of
+# gtk3/packages.list -- a sentinel left at an earlier package would go on
+# being satisfied by a port that stopped before the packages added after it.
+# (Explorer, the media player, the image viewer and the GStreamer audio sink
+# are the shell's own programs, built after the port: SHELL_MESON_PROGS.)
+GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/luakit
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
 	$(BUILD_DIR)/likeos-display-settings $(BUILD_DIR)/likeos-settings \
 	$(BUILD_DIR)/likeos-keyboard-settings
+# The shell's meson programs (user/bin/shell/<name>/), built like the bar
+# widgets against the GTK3 sysroot and installed into it; see their rule.
+SHELL_MESON_PROGS = gst-likeos-audio likeos-mediaplayer likeos-imageviewer \
+	likeos-explorer
+SHELL_MESON_STAMPS = $(patsubst %,$(BUILD_DIR)/shell-meson/%.installed,$(SHELL_MESON_PROGS))
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
 	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_SBIN_PROGS) $(USR_LIBEXEC_PROGS)) \
@@ -924,6 +930,7 @@ GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(R
 	$(GTK3_SENTINEL) \
 	$(GTK3_TESTCXX) \
 	$(GTK3_BAR_PROGS) \
+	$(SHELL_MESON_STAMPS) \
 	$(KEYMAPS_STAMP) \
 	$(RES_PREREQS)
 
@@ -2710,6 +2717,60 @@ $(BUILD_DIR)/likeos-keyboard-settings: user/bin/shell/keyboard-settings.c $(KBDC
 	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
 		-o $@ $< user/bin/shell/keyboard-conf.c $(GTK3_BAR_LIBS)
 
+# The shell's meson programs: the file manager (likeos-explorer, with its
+# backend test program explorer-backend-test), the image viewer, the media
+# player, and the GStreamer plugin with likeosaudiosink, GStreamer's output to
+# the audio service (audiod) through libaudio, at a rank that makes
+# autoaudiosink -- what playbin and WebKit use -- pick it first.
+#
+# Each is a meson project of its own under user/bin/shell, cross-compiled with
+# the GTK3 port's toolchain (the cross file, the compiler and pkg-config
+# wrappers, the port's native GLib tools and meson on PATH) and installed into
+# the sysroot, from where ports/xorg/gtk3/stage.sh puts the programs, the
+# plugin, the desktop entries and Explorer's schema on the image.  Configured
+# from scratch on every build, inside the source tree (.likeos-build), so the
+# compiler sees the same relative source paths wherever the tree lives.
+#
+# Explorer's GStreamer support is required rather than automatic, so a missing
+# plugin base is a build failure rather than a quieter program.  libaudio's
+# headers and libaudio.pc come from ports/xorg/import-libaudio.sh, which the
+# ports-gtk3 target runs.
+SHELL_MESON_DIR = user/bin/shell
+SHELL_MESON_OPTS_likeos-explorer = -Dtests=true -Dgstreamer=enabled
+SHELL_MESON_PATH = $(CURDIR)/ports/xorg/toolchain:$(CURDIR)/ports/xorg/.hosttools/bin:$$PATH
+shell_meson_srcs = $(shell find $(SHELL_MESON_DIR)/$(1) -name .likeos-build -prune \
+	-o -type f -print 2>/dev/null)
+
+$(BUILD_DIR)/shell-meson/gst-likeos-audio.installed: \
+	$(call shell_meson_srcs,gst-likeos-audio)
+$(BUILD_DIR)/shell-meson/likeos-mediaplayer.installed: \
+	$(call shell_meson_srcs,likeos-mediaplayer)
+$(BUILD_DIR)/shell-meson/likeos-imageviewer.installed: \
+	$(call shell_meson_srcs,likeos-imageviewer)
+$(BUILD_DIR)/shell-meson/likeos-explorer.installed: \
+	$(call shell_meson_srcs,likeos-explorer)
+
+$(BUILD_DIR)/shell-meson/%.installed: $(GTK3_SENTINEL) | $(BUILD_DIR)
+	@mkdir -p $(@D)
+	@echo "  MESON   $(SHELL_MESON_DIR)/$* (log: $(@D)/$*.log)"
+	@( cd $(SHELL_MESON_DIR)/$* && rm -rf .likeos-build && \
+	   LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) && export LIKEOS_SYSROOT && \
+	   PATH="$(SHELL_MESON_PATH)" && export PATH && \
+	   meson setup .likeos-build \
+		--cross-file $(CURDIR)/ports/xorg/toolchain/likeos-cross.ini \
+		--prefix=/usr --libdir=/usr/lib -Ddefault_library=shared \
+		$(SHELL_MESON_OPTS_$*) && \
+	   DESTDIR=$(CURDIR)/$(XORG_SYSROOT) meson install -C .likeos-build \
+	) > $(@D)/$*.log 2>&1 || { \
+		tail -n 40 $(@D)/$*.log; \
+		echo "ERROR: building $(SHELL_MESON_DIR)/$* failed; see $(@D)/$*.log"; \
+		exit 1; \
+	}
+	touch $@
+
+.PHONY: shell-meson
+shell-meson: $(SHELL_MESON_STAMPS)
+
 # The C++ runtime's own test program.
 #
 # Built with the port's C++ driver rather than the userland one, because it is
@@ -2863,10 +2924,11 @@ $(KEYMAPS_STAMP): host/gen-keymaps.pl host/ckbcomp/ckbcomp res/keyboard/layouts.
 .PHONY: keymaps
 keymaps: $(KEYMAPS_STAMP)
 
-# The same sentinel for the GTK3 stack.  PCManFM is the last package its
+# The same sentinel for the GTK3 stack.  luakit is the last package its
 # manifest builds and sits on top of nearly everything below it, so its presence
 # means the whole stack -- GLib, GTK, Cairo, Pango, the C++ runtime, libetpan,
-# GtkSourceView, libfm and menu-cache -- is installed in the sysroot.
+# GtkSourceView, libfm, menu-cache, GStreamer and WebKit -- is installed in the
+# sysroot.
 #
 # Checks rather than assumes, for the reason given above: without a recipe that
 # verifies its own target, a rule reports success for a file that was never
@@ -2950,7 +3012,7 @@ $(BOOTLOADER_EFI): $(BOOTLOADER_SRCS) $(BOOTLOADER_HDRS) $(KERNEL_DIR)/dev/video
 # auto-sized to the staged content so the image stays small and builds fast;
 # override with EXT4_MB=.
 #
-# Two rules (see the release section of mk/installer.mk): this one stages
+# Two rules (see the release section of user/bin/installer/installer.mk): this one stages
 # what the live medium and the installed system share and copies the
 # installed system's tree off it; $(GPT_DISK) below adds what only the live
 # medium has and makes the image.
@@ -3111,7 +3173,7 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	mkdir -p $(EXT4_STAGING)/ram
 	chmod 1777 $(EXT4_STAGING)/ram
 	# (luakit's RAM launcher, /usr/local/bin/luakit, belongs to the live
-	# medium alone: INSTALLER_STAGE_LIVE, mk/installer.mk.)
+	# medium alone: INSTALLER_STAGE_LIVE, user/bin/installer/installer.mk.)
 	# Resources, manpages, config
 	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
@@ -3197,7 +3259,7 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	cp res/etc/shells        $(EXT4_STAGING)/etc/shells
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
 	# (/etc/fstab: the live medium's and the installed system's are staged
-	# by mk/installer.mk -- INSTALLER_STAGE_LIVE and host/stage-rootfs.sh.)
+	# by user/bin/installer/installer.mk -- INSTALLER_STAGE_LIVE and host/stage-rootfs.sh.)
 	# mke2fs's defaults per file system type and usage (from e2fsprogs;
 	# built with $(BUILD_DIR)/mke2fs, which is in ROOT_SBIN_PROGS)
 	cp ports/e2fsprogs-1.47.4/build/mke2fs.conf $(EXT4_STAGING)/etc/mke2fs.conf
@@ -3380,7 +3442,7 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	# Signature file selects this device as the OS root; sample text file
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(EXT4_STAGING)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(EXT4_STAGING)/HELLO.TXT
-	# The installer's tools, which both systems have (mk/installer.mk).
+	# The installer's tools, which both systems have (user/bin/installer/installer.mk).
 	$(INSTALLER_STAGE_COMMON)
 	# No umask leftovers (0775/0664) in either system: see STAGING_MODE_FIX.
 	$(call STAGING_MODE_FIX,$(EXT4_STAGING))
@@ -3396,7 +3458,7 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 $(GPT_DISK): $(EXT4_STAGING_STAMP) $(ADD_USER_STAMP) \
 	$(if $(strip $(ADD_USER)),$(HOST_CRYPT)) | $(BUILD_DIR)
 	# The live medium's fstab, the installer, its session,
-	# /install/likeos-rootfs.tar.zst (mk/installer.mk).
+	# /install/likeos-rootfs.tar.zst (user/bin/installer/installer.mk).
 	$(INSTALLER_STAGE_LIVE)
 	# make ADD_USER=<name>: the account adduser would make (see ADD_USER
 	# above), after everything else has gone into /etc/skel.  Its files
@@ -3887,6 +3949,8 @@ clean:
 	$(MAKE) -C user/lib/libaudio clean
 	$(MAKE) -C user/sbin/audiod clean
 	$(MAKE) -C $(USER_DIR) clean
+	@# The shell's meson build directories (SHELL_MESON_PROGS).
+	rm -rf $(addsuffix /.likeos-build,$(addprefix $(SHELL_MESON_DIR)/,$(SHELL_MESON_PROGS)))
 
 distclean: clean
 	@# The LLVM math objects, which `clean' keeps -- see user/lib/libc/Makefile.
@@ -4414,8 +4478,8 @@ usb: $(GPT_DISK)
 
 .PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-ahci qemu-ahci-usb qemu-nvme qemu-nvme-boot qemu-nvme-full qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
 
-# Installer: libgpt, backend, GTK3 frontend, CLI, release image (mk/installer.mk).
-include mk/installer.mk
+# Installer: libgpt, backend, GTK3 frontend, CLI, release image (user/bin/installer/installer.mk).
+include user/bin/installer/installer.mk
 
 # Feed back the header dependencies recorded by -MMD (see DEPFLAGS above).
 #

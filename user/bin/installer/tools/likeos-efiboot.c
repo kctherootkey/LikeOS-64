@@ -48,7 +48,7 @@
 #include <unistd.h>
 
 #include "gpt.h"
-#include "../../../boot/efi_loadopt.h"
+#include "../../../../boot/efi_loadopt.h"
 
 #define PROG "likeos-efiboot"
 #define VERSION "1.0"

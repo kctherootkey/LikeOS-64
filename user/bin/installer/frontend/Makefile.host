@@ -7,7 +7,7 @@
 #   make -f Makefile.host BACKEND=real
 #                                    build-host-real/likeos-installer:
 #                                    libinstaller (the host build of
-#                                    user/installer/backend) as well; it
+#                                    user/bin/installer/backend) as well; it
 #                                    installs onto image files:
 #       likeos-installer --window --simulate=disk.img \
 #           --source=likeos-rootfs.tar.zst --target=DIR --log=FILE
@@ -19,12 +19,12 @@
 #
 # Needs the host's GTK 3 development files (pkg-config gtk+-3.0) and
 # glib-compile-resources; BACKEND=real also libzstd and libcrypt.  The
-# LikeOS build of this program is in mk/installer.mk.
+# LikeOS build of this program is in user/bin/installer/installer.mk.
 #
 # Copyright (C) 2026 The LikeOS Project
 
 INSTALLER_FE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-INSTALLER_FE_TOP := $(abspath $(INSTALLER_FE_DIR)/../../..)
+INSTALLER_FE_TOP := $(abspath $(INSTALLER_FE_DIR)/../../../..)
 BACKEND ?= mock
 ifeq ($(BACKEND),real)
 OUT ?= $(INSTALLER_FE_DIR)/build-host-real
@@ -39,7 +39,7 @@ PKGS     := gtk+-3.0
 CFLAGS   ?= -O2 -g
 CFLAGS   += -std=gnu11 -Wall -Wextra
 CPPFLAGS += $(shell pkg-config --cflags $(PKGS)) \
-	-I$(INSTALLER_FE_DIR) -I$(INSTALLER_FE_TOP)/user/installer/backend/include \
+	-I$(INSTALLER_FE_DIR) -I$(INSTALLER_FE_TOP)/user/bin/installer/backend/include \
 	-I$(INSTALLER_FE_TOP)/user/bin/shell -I$(OUT) \
 	-DKBD_CATALOGUE='"$(INSTALLER_FE_TOP)/res/keyboard/layouts.tsv"'
 LDLIBS   += $(shell pkg-config --libs $(PKGS)) -lm
@@ -50,7 +50,7 @@ SRCS := $(INSTALLER_FE_SRCS) $(INSTALLER_FE_MOCK_SRCS)
 ifeq ($(BACKEND),real)
 # The backend's host objects as one library, built by its own host
 # makefile (the same objects its tests use).
-BACKEND_TESTS := $(INSTALLER_FE_TOP)/user/installer/backend/tests
+BACKEND_TESTS := $(INSTALLER_FE_TOP)/user/bin/installer/backend/tests
 BACKEND_LIB := $(OUT)/backend/libinstaller-host.a
 SRCS += $(INSTALLER_FE_REAL_SRCS)
 CPPFLAGS += -DINSTALLER_HAVE_REAL

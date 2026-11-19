@@ -1,12 +1,12 @@
 # libinstaller -- the LikeOS installer backend (static library for LikeOS).
 #
-# Built like the other LikeOS libraries (see ../../lib/libcrypt/Makefile and
-# ../../lib/libgpt/Makefile): the host gcc, freestanding, against the LikeOS
+# Built like the other LikeOS libraries (see ../../../lib/libcrypt/Makefile and
+# ../../../lib/libgpt/Makefile): the host gcc, freestanding, against the LikeOS
 # C library headers.  The result, libinstaller.a, is linked into the GTK
 # front end (likeos-installer) and the text-mode installer (likeos-install)
-# together with ../../lib/libgpt/libgpt.a, libcrypt and libzstd.
+# together with ../../../lib/libgpt/libgpt.a, libcrypt and libzstd.
 #
-# Variables the top-level build (mk/installer.mk) passes in:
+# Variables the top-level build (user/bin/installer/installer.mk) passes in:
 #   SERIAL_LOG_CFLAGS  -DLIKEOS_SERIAL_LOG for SERIAL=1 / USB_SERIAL=1 builds:
 #                      every log line also goes to /dev/kmsg
 #   ZSTD_CFLAGS        -I<zstd port headers>, or -DIL_NO_ZSTD while the
@@ -21,8 +21,8 @@
 CC = gcc
 AR = ar
 
-LIBC_DIR = ../../lib/libc
-LIBGPT_DIR = ../../lib/libgpt
+LIBC_DIR = ../../../lib/libc
+LIBGPT_DIR = ../../../lib/libgpt
 LIBC_INC = $(LIBC_DIR)/include
 
 SERIAL_LOG_CFLAGS ?=

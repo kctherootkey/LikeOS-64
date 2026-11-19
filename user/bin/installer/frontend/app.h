@@ -19,7 +19,7 @@ typedef struct Bridge Bridge;
 typedef struct Autopilot Autopilot;
 
 /* How the program ends: the contract with the installer session
- * (user/installer/session/likeos-installer-session), which acts on it. */
+ * (user/bin/installer/session/likeos-installer-session), which acts on it. */
 enum {
 	APP_EXIT_RESTART = 0,    /* the session restarts the computer */
 	APP_EXIT_QUIT = 2,       /* left without installing: the session's

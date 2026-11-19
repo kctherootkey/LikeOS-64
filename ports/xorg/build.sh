@@ -1156,24 +1156,6 @@ meson_opts() {
 	gst-libav)
 		echo "-Ddoc=disabled -Dtests=disabled"
 		;;
-	likeos-explorer)
-		# Our own file manager (in-tree, gtk3/likeos-explorer-1.0).  The
-		# backend test program is built and shipped as well
-		# (explorer-backend-test), so the backend can be checked on the
-		# system itself; GStreamer gives video thumbnails and media
-		# details, required here so a missing plugin base is a build
-		# failure rather than a quieter program.
-		echo "-Dtests=true -Dgstreamer=enabled"
-		;;
-	gst-likeos-audio)
-		# Our own plugin (in-tree, gtk3/gst-likeos-audio-1.0): the
-		# likeosaudiosink element over libaudio.  It has no options of
-		# its own; its project() defaults set the build type and
-		# warnings, and libaudio is found through the libaudio.pc that
-		# import-base-libs.sh published.  Named here so the package is
-		# not mistaken for one that was forgotten.
-		echo ""
-		;;
 	*) echo "" ;;
 	esac
 }

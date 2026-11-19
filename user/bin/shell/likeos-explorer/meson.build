@@ -1,7 +1,7 @@
 # LikeOS Explorer, the system's own file manager.
 #
-# An in-tree port like the media player: the sources live here and the GTK3
-# port driver builds them with meson against the port sysroot.
+# Part of the desktop shell (user/bin/shell), like the media player: the
+# top-level Makefile builds it with meson against the GTK3 port sysroot.
 #
 # Three layers, each a static library the next one links:
 #

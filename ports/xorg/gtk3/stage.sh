@@ -285,8 +285,9 @@ for b in pcmanfm mousepad libfm-pref-apps lxshortcut; do
 done
 
 # The desktop applications this port exists for beside Claws: a
-# calculator, a terminal emulator, an IRC client, the media player and the
-# image viewer.
+# calculator, a terminal emulator and an IRC client; and the shell's media
+# player and image viewer (user/bin/shell, which the top-level Makefile builds
+# and installs into this sysroot after the port).
 #
 # xfconf-query is the settings store's command-line face -- the only way to
 # read or set a preference without the dialog that owns it, and the first
@@ -298,7 +299,8 @@ for b in galculator xfce4-terminal hexchat xfconf-query mediaplayer \
 	staged=$((staged + 1))
 done
 
-# The file manager (gtk3/likeos-explorer-1.0), and the test program for its
+# The file manager (user/bin/shell/likeos-explorer, installed into the sysroot
+# like the media player above), and the test program for its
 # file-management backend -- run on the system itself it checks the real
 # filesystems, inotify and the Trash, not the build host's.  Its schema and
 # desktop entry arrive with everyone else's below.
@@ -1141,7 +1143,9 @@ fi
 # Drop debug information.
 #
 # The single largest saving here: these libraries are 172MB with it and 31MB
-# without, and it is unusable on a system with no debugger to read it.
+# without, and it is unusable on a system with no debugger to read it.  The
+# Mesa and VA-API drivers (usr/lib/dri, usr/lib/gbm) are the biggest of all --
+# the Intel media driver alone is 433MB with it and 42MB without.
 #
 # --strip-debug, not a full strip, for the reason ../stage.sh gives: it never
 # touches .dynsym, which is what the loader resolves against.  Set NO_STRIP=1
@@ -1153,7 +1157,9 @@ if [ "${NO_STRIP:-0}" != "1" ] && [ "$staged" -gt 0 ]; then
 		"$DEST/usr/lib/libfm" "$DEST/usr/libexec" \
 		"$DEST/usr/lib/webkit2gtk-4.1" "$DEST/usr/lib/gio" \
 		"$DEST/usr/lib/claws-mail" "$DEST/usr/lib/lua" \
-		"$DEST/usr/lib/luakit" "$DEST/usr/lib/gstreamer-1.0" -type f \
+		"$DEST/usr/lib/luakit" "$DEST/usr/lib/gstreamer-1.0" \
+		"$DEST/usr/lib/dri" "$DEST/usr/lib/gbm" "$DEST/usr/lib/xfce4" \
+		"$DEST/usr/lib/hexchat" -type f \
 		\( -name '*.so*' -o -perm -u+x \) \
 		-exec strip --strip-debug {} + 2>/dev/null || true
 fi

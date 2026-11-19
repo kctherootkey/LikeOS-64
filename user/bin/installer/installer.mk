@@ -9,10 +9,10 @@
 
 # Sections are filled in by the installer work packages:
 #   libgpt            user/lib/libgpt
-#   libinstaller      user/installer/backend
-#   likeos-installer  user/installer/frontend (GTK3)
-#   likeos-install    user/installer/cli
-#   tools             user/installer/tools (likeos-gpt, likeos-efiboot)
+#   libinstaller      user/bin/installer/backend
+#   likeos-installer  user/bin/installer/frontend (GTK3)
+#   likeos-install    user/bin/installer/cli
+#   tools             user/bin/installer/tools (likeos-gpt, likeos-efiboot)
 #   release           build/likeos-rootfs.tar.zst and the live USB staging
 
 INSTALLER_PREREQS =
@@ -56,9 +56,9 @@ else
   ZSTD_PORT_TARGET =
 endif
 
-INSTALLER_BACKEND_DIR = user/installer/backend
+INSTALLER_BACKEND_DIR = user/bin/installer/backend
 LIBGPT_DIR = user/lib/libgpt
-INSTALLER_TOOLS_DIR = user/installer/tools
+INSTALLER_TOOLS_DIR = user/bin/installer/tools
 
 # What a program linking the backend needs (front ends, CLI).
 INSTALLER_BACKEND_CFLAGS = -I$(INSTALLER_BACKEND_DIR)/include \
@@ -123,7 +123,7 @@ installer-backend-check:
 # --- backend end ---
 
 # --- frontend begin ---
-# likeos-installer, the graphical installer (user/installer/frontend),
+# likeos-installer, the graphical installer (user/bin/installer/frontend),
 # built like the Settings window: the port toolchain's likeos-cc against the
 # X sysroot's GTK 3, ordered after the GTK3 sentinel.  The source list is
 # shared with the host build (Makefile.host) through sources.mk.  The
@@ -136,7 +136,7 @@ installer-backend-check:
 # own, and chosen with --mock (made-up disks, nothing is written).
 # INSTALLER_FE_BACKEND=mock builds the program with the stand-in only.
 # Not part of the image yet (the release section stages it).
-INSTALLER_FE_DIR := $(CURDIR)/user/installer/frontend
+INSTALLER_FE_DIR := $(CURDIR)/user/bin/installer/frontend
 INSTALLER_FE_TOP := $(CURDIR)
 INSTALLER_FE_BACKEND ?= real
 include $(INSTALLER_FE_DIR)/sources.mk
@@ -171,14 +171,14 @@ $(BUILD_DIR)/likeos-installer: $(INSTALLER_FE_CSRCS) $(INSTALLER_FE_HDRS) \
 	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -std=gnu11 \
 		-Wall -Wextra -Wno-overlength-strings $(INSTALLER_FE_DEFS) \
-		-I$(INSTALLER_FE_DIR) -I$(INSTALLER_FE_TOP)/user/installer/backend/include \
+		-I$(INSTALLER_FE_DIR) -I$(INSTALLER_FE_TOP)/user/bin/installer/backend/include \
 		-I$(INSTALLER_FE_TOP)/user/bin/shell \
 		-o $@ $(INSTALLER_FE_CSRCS) user/bin/shell/keyboard-conf.c \
 		$(INSTALLER_FE_GEN)/resources.c $(INSTALLER_FE_LIBS) $(GTK3_BAR_LIBS)
 # --- frontend end ---
 
 # --- efiboot begin ---
-# likeos-efiboot, the firmware boot entry tool (user/installer/tools):
+# likeos-efiboot, the firmware boot entry tool (user/bin/installer/tools):
 # reads and writes the firmware's Boot####/BootOrder/BootNext/Timeout
 # variables through /sys/firmware/efi/efivars; the installer backend runs
 # it as /usr/sbin/likeos-efiboot --create.  It links libgpt (for the
@@ -200,14 +200,14 @@ installer-efiboot-check:
 # --- efiboot end ---
 
 # --- cli begin ---
-# likeos-install, the text-mode installer (user/installer/cli): compiled
+# likeos-install, the text-mode installer (user/bin/installer/cli): compiled
 # like the programs in user/bin, with libinstaller, libgpt and libzstd
 # linked in statically and libcrypt dynamically.  Staged (by the release
 # section) as /usr/sbin/likeos-install on the live medium, where the
 # installer session falls back to it when the graphical installer cannot
 # run.  installer-cli-check runs its host tests (simulated installations
 # on image files).
-INSTALLER_CLI_DIR = user/installer/cli
+INSTALLER_CLI_DIR = user/bin/installer/cli
 
 .PHONY: installer-cli installer-cli-check
 installer-cli: $(BUILD_DIR)/likeos-install
@@ -310,7 +310,7 @@ installer-manpages:
 		$(MAKE) --no-print-directory -C ports/$$p -f Makefile.likeos \
 			unpack >/dev/null || exit 1; \
 	done
-	$(SHELL) user/installer/man/render-manpages.sh . "$(MANPAGE_HOST_OS)"
+	$(SHELL) user/bin/installer/man/render-manpages.sh . "$(MANPAGE_HOST_OS)"
 # --- ports end ---
 
 # --- release begin ---
@@ -394,7 +394,7 @@ $(shell test -d $(BUILD_DIR) && \
 $(ROOTFS_FLAGS_STAMP): | $(BUILD_DIR)
 	printf '%s\n' '$(ROOTFS_FLAGS_NOW)' > $@
 
-# Step 1, the part of mk/installer.mk: the archiving and file system tools
+# Step 1, the part of user/bin/installer/installer.mk: the archiving and file system tools
 # (the ports section), the man pages of section 5, the partitioning and
 # boot entry tools, and the boot loader, which the installer copies from
 # the installed system's /usr/lib/likeos/efi to its EFI system partition.
@@ -433,8 +433,8 @@ $(ROOTFS_TARBALL): $(EXT4_STAGING_STAMP) host/mk-rootfs-tarball.sh \
 
 # Step 4.  Every command can run twice on the same tree.
 INSTALLER_LIVE_FILES = res/etc/fstab.live \
-	res/etc/inittab.install user/installer/session/likeos-installer-session \
-	user/installer/session/xinitrc res/boot/bootmenu.conf \
+	res/etc/inittab.install user/bin/installer/session/likeos-installer-session \
+	user/bin/installer/session/xinitrc res/boot/bootmenu.conf \
 	$(INSTALLER_LIVE_MAN)
 # The installers' manual pages, in /usr/share/man/man1 with the others.
 INSTALLER_LIVE_MAN = res/man-live/likeos-install.1 \
@@ -447,10 +447,10 @@ define INSTALLER_STAGE_LIVE
 @echo "Adding the live medium's own files to $(EXT4_STAGING)..."
 install -m 0644 res/etc/fstab.live $(EXT4_STAGING)/etc/fstab
 install -m 0644 res/etc/inittab.install $(EXT4_STAGING)/etc/inittab.install
-install -m 0755 user/installer/session/likeos-installer-session $(EXT4_STAGING)/usr/libexec/likeos-installer-session
+install -m 0755 user/bin/installer/session/likeos-installer-session $(EXT4_STAGING)/usr/libexec/likeos-installer-session
 mkdir -p $(EXT4_STAGING)/usr/share/likeos/installer
 chmod 0755 $(EXT4_STAGING)/usr/share/likeos/installer
-install -m 0755 user/installer/session/xinitrc $(EXT4_STAGING)/usr/share/likeos/installer/xinitrc
+install -m 0755 user/bin/installer/session/xinitrc $(EXT4_STAGING)/usr/share/likeos/installer/xinitrc
 install -m 0755 $(BUILD_DIR)/likeos-installer $(EXT4_STAGING)/usr/bin/likeos-installer
 install -m 0755 $(BUILD_DIR)/likeos-install $(EXT4_STAGING)/usr/sbin/likeos-install
 install -m 0644 $(INSTALLER_LIVE_MAN) $(EXT4_STAGING)/usr/share/man/man1/

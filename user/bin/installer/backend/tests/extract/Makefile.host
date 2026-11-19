@@ -7,7 +7,7 @@
 
 CC ?= gcc
 BACKEND = ../..
-GPT_INC = ../../../../lib/libgpt/include
+GPT_INC = ../../../../../lib/libgpt/include
 ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd)
 ZSTD_LIBS := $(shell pkg-config --libs libzstd)
 CFLAGS = -D_GNU_SOURCE -Wall -Wextra -O2 -g -I$(BACKEND)/include -I$(BACKEND) \
