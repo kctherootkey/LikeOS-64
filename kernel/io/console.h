@@ -179,6 +179,9 @@ void console_remap_to_direct_map(void);
 // The firmware framebuffer's kernel mapping, both ways (see console.c)
 void *console_boot_fb_phys_to_virt(uint64_t phys);
 int console_boot_fb_virt_to_phys(uint64_t virt, uint64_t *phys);
+/* The firmware framebuffer's physical range: 0 when it is known, -1 before
+ * console_remap_to_direct_map() has recorded it. */
+int console_boot_fb_range(uint64_t *phys, uint64_t *size);
 
 // VGA colors
 #define VGA_COLOR_BLACK 0

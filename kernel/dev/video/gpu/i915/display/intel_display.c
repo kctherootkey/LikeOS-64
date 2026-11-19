@@ -280,8 +280,14 @@ static uint32_t trans_ddi_func_value(struct i915_device *i915, struct intel_outp
 			 * under its own transcoder's control, which nothing
 			 * here enables: the embedded transcoder then reports
 			 * itself running while the pipe never scans a line
-			 * and the panel stays dark. */
-			func |= TRANS_DDI_EDP_INPUT_A_ON;
+			 * and the panel stays dark.  Haswell's panel fitter on
+			 * pipe A is the exception: it is only in the path in
+			 * the "on/off" setting (and powered from the global
+			 * well, held while it is in use). */
+			if (i915->info->platform == I915_PLATFORM_HASWELL && p->scaled)
+				func |= TRANS_DDI_EDP_INPUT_A_ONOFF;
+			else
+				func |= TRANS_DDI_EDP_INPUT_A_ON;
 			break;
 		case PIPE_B:
 			func |= TRANS_DDI_EDP_INPUT_B_ONOFF;
@@ -523,9 +529,42 @@ int intel_fb_check(struct drm_device *dev, struct drm_gem_object *o,
 /* Scaler 0 of the pipe stretches the pipe's picture (PIPESRC) onto the
  * transcoder's active area.  Programmed before the transcoder starts and
  * cleared after it stops, the way the hardware wants it. */
+/* Haswell/Broadwell have no pipe scalers: the pipe's panel fitter
+ * stretches the picture, with the fixed medium 3x3 filter (the firmware's
+ * coefficients are not to be trusted); Haswell's also names the pipe it
+ * serves.  Pipe A's fitter is powered from the global well on Haswell. */
+static void hsw_pfit_program(struct i915_device *i915, struct intel_pipe *p,
+			     uint32_t dst_w, uint32_t dst_h, int on)
+{
+	int pipe = p->pipe;
+
+	if (!on) {
+		i915_write32(i915, HSW_PF_CTL(pipe), 0);
+		i915_write32(i915, HSW_PF_WIN_POS(pipe), 0);
+		i915_write32(i915, HSW_PF_WIN_SZ(pipe), 0);
+		(void)i915_read32(i915, HSW_PF_WIN_SZ(pipe));
+		if (pipe == PIPE_A)
+			intel_power_put(i915, INTEL_PW_PFIT_A);
+		return;
+	}
+	if (pipe == PIPE_A)
+		intel_power_get(i915, INTEL_PW_PFIT_A);
+	uint32_t ctl = HSW_PF_ENABLE | HSW_PF_FILTER_MED_3x3;
+	if (i915->info->platform == I915_PLATFORM_HASWELL)
+		ctl |= HSW_PF_PIPE_SEL(pipe);
+	i915_write32(i915, HSW_PF_CTL(pipe), ctl);
+	i915_write32(i915, HSW_PF_WIN_POS(pipe), 0);
+	i915_write32(i915, HSW_PF_WIN_SZ(pipe), (dst_w << 16) | dst_h);
+	(void)i915_read32(i915, HSW_PF_WIN_SZ(pipe));
+}
+
 static void pipe_scaler_program(struct i915_device *i915, struct intel_pipe *p,
 				uint32_t dst_w, uint32_t dst_h, int on)
 {
+	if (i915->display.model == INTEL_DISPLAY_BDW) {
+		hsw_pfit_program(i915, p, dst_w, dst_h, on);
+		return;
+	}
 	if (!on) {
 		i915_write32(i915, SKL_PS_CTRL(p->pipe, 0), 0);
 		i915_write32(i915, SKL_PS_WIN_POS(p->pipe, 0), 0);

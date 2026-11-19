@@ -16,6 +16,7 @@
 #include <kernel/dev/video/gpu/i915/i915_lmem.h>
 #include <kernel/dev/video/gpu/i915/display/intel_audio.h>
 #include <kernel/dev/video/gpu/i915/i915_legacy.h>
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/uapi/drm/i915_drm.h>
 #include <kernel/uapi/ioctl.h>
 #include <kernel/io/console.h>
@@ -33,18 +34,24 @@ struct pch_id {
 	const char *name;
 };
 
+/* The ISA bridge's device id names the south bridge in its upper nine
+ * bits: every entry is matched under 0xff80, so a type whose ids share
+ * the upper byte with another's (Cannon Point LP after Sunrise Point LP,
+ * Comet Point-V after Cannon Point, Wildcat Point after Lynx Point) is
+ * told apart. */
+
 static const struct pch_id pch_ids[] = {
-	{ 0x3b00, 0xff00, I915_PCH_IBX, "Ibex Peak" },
-	{ 0x1c00, 0xff00, I915_PCH_CPT, "Cougar Point" },
-	{ 0x1e00, 0xff00, I915_PCH_PPT, "Panther Point" },
-	{ 0x8c00, 0xff00, I915_PCH_LPT, "Lynx Point" },
-	{ 0x9c00, 0xff00, I915_PCH_LPT, "Lynx Point LP" },
+	{ 0x3b00, 0xff80, I915_PCH_IBX, "Ibex Peak" },
+	{ 0x1c00, 0xff80, I915_PCH_CPT, "Cougar Point" },
+	{ 0x1e00, 0xff80, I915_PCH_PPT, "Panther Point" },
+	{ 0x8c00, 0xff80, I915_PCH_LPT, "Lynx Point" },
+	{ 0x9c00, 0xff80, I915_PCH_LPT, "Lynx Point LP" },
 	{ 0x8c80, 0xff80, I915_PCH_WPT, "Wildcat Point" },
 	{ 0x9c80, 0xff80, I915_PCH_WPT, "Wildcat Point LP" },
-	{ 0xa100, 0xff00, I915_PCH_SPT, "Sunrise Point" },
-	{ 0x9d00, 0xff00, I915_PCH_SPT, "Sunrise Point LP" },
+	{ 0xa100, 0xff80, I915_PCH_SPT, "Sunrise Point" },
+	{ 0x9d00, 0xff80, I915_PCH_SPT, "Sunrise Point LP" },
 	{ 0xa280, 0xff80, I915_PCH_KBP, "Kaby Point" },
-	{ 0xa300, 0xff00, I915_PCH_CNP, "Cannon Point" },
+	{ 0xa300, 0xff80, I915_PCH_CNP, "Cannon Point" },
 	{ 0x9d80, 0xff80, I915_PCH_CNP, "Cannon Point LP" },
 	{ 0x0280, 0xff80, I915_PCH_CMP, "Comet Point LP" },
 	{ 0x0680, 0xff80, I915_PCH_CMP, "Comet Point" },
@@ -128,6 +135,12 @@ static int i915_gem_init_obj(struct drm_gem_object *o)
 	bo->read_domains = I915_GEM_DOMAIN_CPU;
 	bo->write_domain = I915_GEM_DOMAIN_CPU;
 	o->priv = bo;
+	/* 965G/965GM: every page the GPU sees below 4 GB */
+	if (i915_is_legacy(&g_i915) && i915_legacy_obj_fix_pages(&g_i915, o) != 0) {
+		o->priv = NULL;
+		kfree(bo);
+		return -ENOMEM;
+	}
 	/* a discrete part's display reads only its local memory: a buffer
 	 * made for scanout moves there before anything maps it */
 	if (o->scanout && i915_lmem_present(&g_i915) && !o->pages_borrowed)
@@ -446,11 +459,55 @@ static const struct drm_driver *i915_driver_for(struct i915_device *i915)
 
 /* ---- probe ---------------------------------------------------------------- */
 
+/* A memory window of a bridge (base and limit registers at `off', the
+ * prefetchable one with its upper halves when it is 64-bit) forwards
+ * `addr' to the bus below.  A window whose base lies above its limit is
+ * off, and one at 0 is taken as unassigned. */
+static int bridge_window_has(const pci_device_t *br, unsigned char off, int pref, uint64_t addr)
+{
+	uint16_t b = pci_cfg_read16(br, off), l = pci_cfg_read16(br, (unsigned char)(off + 2));
+	uint64_t base = (uint64_t)(b & 0xfff0u) << 16;
+	uint64_t limit = ((uint64_t)(l & 0xfff0u) << 16) | 0xfffffu;
+
+	if (pref && (b & 0xfu) == 1) {
+		base |= (uint64_t)pci_cfg_read32_dev(br, 0x28) << 32;
+		limit |= (uint64_t)pci_cfg_read32_dev(br, 0x2c) << 32;
+	}
+	return base && base <= limit && addr >= base && addr <= limit;
+}
+
+/* Whether the firmware's framebuffer at `fb' provably lies in display
+ * device `d': inside a memory BAR the PCI core has already sized, or
+ * forwarded by the bridge right above `d' when nothing but `d''s own
+ * functions sits below that bridge.  A BAR at 0 is unassigned and
+ * proves nothing.  Nothing is sized here: the device may be scanning
+ * that framebuffer out. */
+static int fb_in_device(const pci_device_t *d, const pci_device_t *devs, int count, uint64_t fb)
+{
+	const pci_device_t *br = d->bus_self;
+
+	for (int b = 0; b < 6; b++) {
+		uint64_t start = pci_resource_start(d, b), len = pci_resource_len(d, b);
+		if (start && len && !(pci_resource_flags(d, b) & PCI_BAR_IO) && fb >= start &&
+		    fb - start < len)
+			return 1;
+	}
+	if (!br || br->hdr_type != 1)
+		return 0;
+	for (int i = 0; i < count; i++) {
+		const pci_device_t *o = &devs[i];
+		if (o->bus_self == br && (o->bus != d->bus || o->device != d->device))
+			return 0;
+	}
+	return bridge_window_has(br, 0x20, 0, fb) || bridge_window_has(br, 0x24, 1, fb);
+}
+
 static const pci_device_t *i915_find_device(void)
 {
 	int count = 0;
 	const pci_device_t *devs = pci_get_devices(&count);
 	const pci_device_t *found = NULL;
+	uint64_t fb;
 
 	for (int i = 0; i < count; i++) {
 		const pci_device_t *d = &devs[i];
@@ -460,10 +517,41 @@ static const pci_device_t *i915_find_device(void)
 		 * 0; take it over any other Intel display device (a
 		 * discrete card is not driven by this driver's display
 		 * path in a hybrid machine). */
-		if (d->bus == 0 && d->device == 2 && d->function == 0)
-			return d;
+		if (d->bus == 0 && d->device == 2 && d->function == 0) {
+			found = d;
+			break;
+		}
 		if (!found)
 			found = d;
+	}
+	if (!found)
+		return NULL;
+
+	/* The screen the firmware lit is the one the user looks at.  When
+	 * its framebuffer provably belongs to another display device, that
+	 * device carries the display: an Intel one this driver knows is
+	 * driven instead; anything else keeps the boot framebuffer, and the
+	 * Intel device is left alone.  Without such proof (the framebuffer
+	 * in the Intel device's own aperture or in its stolen memory, or no
+	 * framebuffer at all) the choice above stands. */
+	fb = fbdev_get_phys(NULL);
+	if (fb < 0x100000)
+		return found;
+	for (int i = 0; i < count; i++) {
+		const pci_device_t *d = &devs[i];
+		if (d == found || d->class_code != 0x03 || !fb_in_device(d, devs, count, fb))
+			continue;
+		if (d->vendor_id == 0x8086) {
+			const struct i915_pci_id *id = i915_pci_lookup(d->device_id);
+			if (id && !(id->info->flags & I915_INFO_NAME_ONLY)) {
+				kprintf("[drm] i915: the firmware display is on %02x:%02x.%u; driving that device\n",
+					d->bus, d->device, d->function);
+				return d;
+			}
+		}
+		kprintf("[drm] i915: the firmware display is on another GPU (%04x:%04x at %02x:%02x.%u); keeping the boot framebuffer\n",
+			d->vendor_id, d->device_id, d->bus, d->device, d->function);
+		return NULL;
 	}
 	return found;
 }

@@ -572,7 +572,7 @@ static int bind_fenced(struct i915_device *i915, struct drm_gem_object *o, uint3
 		return rc;
 	for (uint32_t i = 0; i < fs / 4096; i++)
 		leg_ggtt_write(i915, first + i,
-			       i < o->npages ? leg_pte_encode(i915, o->pages[i], LEG_CACHE_NONE, 0) :
+			       i < o->npages ? leg_pte_for_page(i915, o->pages[i], LEG_CACHE_NONE) :
 					       g_leg.scratch_pte);
 	leg_ggtt_invalidate(i915);
 	*ggtt = first * 4096;

@@ -251,6 +251,24 @@ int bxt_dpio_phy_init_port(struct i915_device *i915, int port)
 	return dpio_phy_is_enabled(i915, phy) ? 0 : -EIO;
 }
 
+/* An AUX channel's transfers go out through the DPIO PHY of its port:
+ * before one, that PHY is brought up unless it already is, and set up the
+ * way the init leaves it.  It stays up, as it does for a PLL. */
+void bxt_dpio_phy_aux_get(struct i915_device *i915, int aux_ch)
+{
+	const struct dpio_phy_info *info;
+	int phy, ch;
+
+	if (aux_ch < PORT_A || aux_ch > PORT_C)
+		return;
+	port_to_phy_ch(i915, aux_ch, &phy, &ch);
+	info = phy_info(i915, phy);
+	if (dpio_phy_is_enabled(i915, phy) &&
+	    dpio_phy_verify(i915, phy, info->rcomp_phy != -1 ? dpio_grc(i915, phy) : 0))
+		return;
+	dpio_phy_init(i915, phy);
+}
+
 int bxt_phy_init(struct i915_device *i915, int port)
 {
 	return bxt_dpio_phy_init_port(i915, port);

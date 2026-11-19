@@ -32,6 +32,8 @@
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_gt.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
+#include <kernel/dev/video/gpu/i915/i915_wa_reg.h>
+#include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -93,6 +95,8 @@ static void whitelist_build(struct i915_device *i915, struct i915_engine *e)
 		COMMON_SLICE_CHICKEN2,
 		GEN8_L3SQCREG4,
 	};
+	int platform = i915->info->platform;
+	int cfl = platform == I915_PLATFORM_COFFEELAKE || platform == I915_PLATFORM_COMETLAKE;
 	uint32_t n = 0;
 
 	if (e->class == 0) { /* render */
@@ -102,6 +106,22 @@ static void whitelist_build(struct i915_device *i915, struct i915_engine *e)
 			i915_write32(i915, RING_FORCE_TO_NONPRIV(e->mmio_base, (int)n),
 				     render_whitelist[n]);
 		}
+		/* Gemini Lake: the client sets the barrier mode itself, or
+		 * the part can hang (WA #0862) */
+		if (platform == I915_PLATFORM_GEMINILAKE && n < RING_FORCE_TO_NONPRIV_COUNT)
+			i915_write32(i915, RING_FORCE_TO_NONPRIV(e->mmio_base, (int)n++),
+				     GEN9_SLICE_COMMON_ECO_CHICKEN1);
+		/* Coffee Lake, Comet Lake: the pixel shader invocation and
+		 * depth counters, four registers in a row, readable
+		 * (WaAllowPMDepthAndInvocationCountAccessFromUMD) */
+		if (cfl && n < RING_FORCE_TO_NONPRIV_COUNT)
+			i915_write32(i915, RING_FORCE_TO_NONPRIV(e->mmio_base, (int)n++),
+				     PS_INVOCATION_COUNT | RING_FORCE_TO_NONPRIV_ACCESS_RD |
+					     RING_FORCE_TO_NONPRIV_RANGE_4);
+	} else if (platform == I915_PLATFORM_COMETLAKE) {
+		/* Comet Lake: the other engines' context timestamp, readable */
+		i915_write32(i915, RING_FORCE_TO_NONPRIV(e->mmio_base, (int)n++),
+			     RING_CTX_TIMESTAMP(e->mmio_base) | RING_FORCE_TO_NONPRIV_ACCESS_RD);
 	}
 	/* the rest of the list must not leave stale entries behind: point
 	 * them at the engine's no-op id register, which a write cannot hurt */
@@ -163,6 +183,52 @@ static void wa_list_verify(struct i915_device *i915, const struct i915_wa_list *
 	}
 }
 
+/* Gen8: the L3's share of credits for ordinary and high priority
+ * requests.  The register's clock gating is held off around the write,
+ * and for at least a hundred clocks after it. */
+static void gen8_set_l3sqc_credits(struct i915_device *i915, uint32_t general, uint32_t high)
+{
+	uint32_t misccpctl = i915_read32(i915, GEN7_MISCCPCTL);
+	uint32_t v;
+
+	i915_write32(i915, GEN7_MISCCPCTL, misccpctl & ~GEN7_DOP_CLOCK_GATE_ENABLE);
+	v = mcr_read(i915, GEN8_L3SQCREG1);
+	v &= ~L3_PRIO_CREDITS_MASK;
+	v |= L3_GENERAL_PRIO_CREDITS(general) | L3_HIGH_PRIO_CREDITS(high);
+	i915_write32(i915, GEN8_L3SQCREG1, v);
+	(void)mcr_read(i915, GEN8_L3SQCREG1);
+	lapic_delay_us(1);
+	i915_write32(i915, GEN7_MISCCPCTL, misccpctl);
+}
+
+/* Gen8 (Broadwell, Cherryview): the GT's clock gating settings. */
+static void gen8_gt_clock_gating(struct i915_device *i915)
+{
+	int bdw = i915->info->platform == I915_PLATFORM_BROADWELL;
+
+	/* WaSwitchSolVfFArbitrationPriority:bdw */
+	if (bdw)
+		wa_set(i915, GAM_ECOCHK, HSW_ECOCHK_ARB_PRIO_SOL);
+	/* WaVSRefCountFullforceMissDisable, WaDSRefCountFullforceMissDisable */
+	i915_write32(i915, GEN7_FF_THREAD_MODE,
+		     i915_read32(i915, GEN7_FF_THREAD_MODE) &
+			     ~(uint32_t)(GEN8_FF_DS_REF_CNT_FFME | GEN7_FF_VS_REF_CNT_FFME));
+	/* WaDisableSemaphoreAndSyncFlipWait */
+	i915_write32(i915, RING_PSMI_CTL(RENDER_RING_BASE),
+		     I915_MASKED_ENABLE(GEN8_RC_SEMA_IDLE_MSG_DISABLE));
+	/* WaDisableCSUnitClockGating:chv */
+	if (!bdw)
+		wa_set(i915, GEN6_UCGCTL1, GEN6_CSUNIT_CLOCK_GATE_DISABLE);
+	/* WaDisableSDEUnitClockGating */
+	wa_set(i915, GEN8_UCGCTL6, GEN8_SDEUNIT_CLOCK_GATE_DISABLE);
+	/* WaProgramL3SqcReg1Default */
+	gen8_set_l3sqc_credits(i915, bdw ? 30 : 38, 2);
+	/* WaDisableDopClockGating:bdw (the context half is in the
+	 * context list) */
+	if (bdw)
+		wa_set(i915, GEN6_UCGCTL1, GEN6_EU_TCUNIT_CLOCK_GATE_DISABLE);
+}
+
 /* The GT-wide settings: the primary GT's, and the media GT's where the
  * part has one.  Once after every GT reset. */
 void i915_gt_apply_gt_workarounds(struct i915_device *i915)
@@ -170,7 +236,11 @@ void i915_gt_apply_gt_workarounds(struct i915_device *i915)
 	struct i915_wa *storage;
 	struct i915_wa_list wal;
 
-	if (i915->info->gen_x10 < 120)
+	if (i915->info->gen == 8) {
+		gen8_gt_clock_gating(i915);
+		return;
+	}
+	if (i915->info->gen_x10 < 110)
 		return;
 	storage = kalloc(WA_LIST_CAP * sizeof(*storage));
 	if (!storage)
@@ -226,7 +296,9 @@ static void gen12_engine_workarounds(struct i915_device *i915, struct i915_engin
 /* Settings that belong to the engine, not to a context. */
 void i915_gt_apply_workarounds(struct i915_device *i915, struct i915_engine *e)
 {
-	if (i915->info->gen_x10 >= 120) {
+	int platform = i915->info->platform;
+
+	if (i915->info->gen_x10 >= 110) {
 		gen12_engine_workarounds(i915, e);
 		return;
 	}
@@ -254,8 +326,12 @@ void i915_gt_apply_workarounds(struct i915_device *i915, struct i915_engine *e)
 		     i915_read32(i915, GEN9_SCRATCH_LNCF1) &
 			     ~(uint32_t)GEN9_LNCF_NONIA_COHERENT_ATOMICS_ENABLE);
 	/* the translation cache and the data cache must not be invalidated
-	 * behind the driver's back */
-	wa_set(i915, GAM_ECOCHK, ECOCHK_DIS_TLB | BDW_DISABLE_HDC_INVALIDATION);
+	 * behind the driver's back (Coffee Lake and Comet Lake keep their
+	 * translation cache kill logic) */
+	if (platform == I915_PLATFORM_COFFEELAKE || platform == I915_PLATFORM_COMETLAKE)
+		wa_set(i915, GAM_ECOCHK, BDW_DISABLE_HDC_INVALIDATION);
+	else
+		wa_set(i915, GAM_ECOCHK, ECOCHK_DIS_TLB | BDW_DISABLE_HDC_INVALIDATION);
 	/* the hashing the sampler and the display must agree on */
 	if (i915->info->flags & I915_INFO_HAS_LLC)
 		wa_set(i915, MMCD_MISC_CTRL, MMCD_PCLA | MMCD_HOTSPOT_EN);
@@ -265,6 +341,9 @@ void i915_gt_apply_workarounds(struct i915_device *i915, struct i915_engine *e)
 	wa_set(i915, GEN9_GAMT_ECO_REG_RW_IA, GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS);
 	/* the credit the memory arbiter gives the sampler */
 	wa_set(i915, GEN8_GARBCNTL, GEN9_GAPS_TSV_CREDIT_DISABLE);
+	/* WaDisablePooledEuLoadBalancingFix:bxt */
+	if (platform == I915_PLATFORM_BROXTON)
+		wa_masked_set(i915, FF_SLICE_CS_CHICKEN2, GEN9_POOLED_EU_LOAD_BALANCING_FIX_DISABLE);
 }
 
 /* Settings the engine saves and restores with a context.  Emitted as
@@ -283,16 +362,26 @@ static unsigned gen9_ctx_workarounds(struct i915_device *i915, struct wa_ctx_ent
 {
 	int llc = !!(i915->info->flags & I915_INFO_HAS_LLC);
 	int lp = !!(i915->info->flags & I915_INFO_IS_LP);
+	int platform = i915->info->platform;
+	int bxt = platform == I915_PLATFORM_BROXTON;
+	int glk = platform == I915_PLATFORM_GEMINILAKE;
+	int kbl = platform == I915_PLATFORM_KABYLAKE;
+	int cfl = platform == I915_PLATFORM_COFFEELAKE || platform == I915_PLATFORM_COMETLAKE;
+	/* WaToEnableHwFixForPushConstHWBug: bxt, glk, cfl, and kbl from
+	 * stepping C0 (revision 2) on */
+	int push_const = bxt || glk || cfl || (kbl && i915->revid >= 2);
 	unsigned n = 0;
 
 	if (max < 12)
 		return 0;
-	if (llc) {
+	if (llc || push_const) {
 		/* compressed surfaces are hashed the way the display
 		 * engine hashes them, by the pixel back end and the
-		 * sampler both */
+		 * sampler both; and the push constants' hardware fix
+		 * enabled where the part has one */
 		wa[n].reg = COMMON_SLICE_CHICKEN2;
-		wa[n++].value = I915_MASKED_ENABLE(GEN9_PBE_COMPRESSED_HASH_SELECTION);
+		wa[n++].value = I915_MASKED_ENABLE((llc ? GEN9_PBE_COMPRESSED_HASH_SELECTION : 0) |
+						   (push_const ? GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION : 0));
 	}
 	wa[n].reg = GEN9_HALF_SLICE_CHICKEN7;
 	wa[n++].value = I915_MASKED_ENABLE((llc ? GEN9_SAMPLER_HASH_COMPRESSED_READ_ADDR : 0) |
@@ -302,7 +391,9 @@ static unsigned gen9_ctx_workarounds(struct i915_device *i915, struct wa_ctx_ent
 	 * an instruction shootdown that leaves a thread half-run is off */
 	wa[n].reg = GEN8_ROW_CHICKEN;
 	wa[n++].value = I915_MASKED_ENABLE(FLOW_CONTROL_ENABLE |
-					   PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE);
+					   PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE |
+					   /* WaDisableThreadStallDopClockGating:bxt */
+					   (bxt ? STALL_DOP_GATING_DISABLE : 0));
 	/* a resolve optimisation that corrupts the result */
 	wa[n].reg = CACHE_MODE_1;
 	wa[n++].value = I915_MASKED_ENABLE(GEN8_4x4_STC_OPTIMIZATION_DISABLE |
@@ -333,6 +424,69 @@ static unsigned gen9_ctx_workarounds(struct i915_device *i915, struct wa_ctx_ent
 	wa[n].reg = GEN8_CS_CHICKEN1(RENDER_RING_BASE);
 	wa[n++].value = I915_MASKED_DISABLE(GEN9_PREEMPT_3D_OBJECT_LEVEL) |
 			(GEN9_PREEMPT_GPGPU_LEVEL_MASK << 16) | GEN9_PREEMPT_GPGPU_COMMAND_LEVEL;
+	/* WaDisableSbeCacheDispatchPortSharing:kbl,cfl */
+	if (kbl || cfl) {
+		wa[n].reg = GEN8_HALF_SLICE_CHICKEN1;
+		wa[n++].value = I915_MASKED_ENABLE(GEN7_SBE_SS_CACHE_DISPATCH_PORT_SHARING_DISABLE);
+	}
+	/* WaClearHIZ_WM_CHICKEN3:bxt,glk */
+	if (bxt || glk) {
+		wa[n].reg = GEN9_WM_CHICKEN3;
+		wa[n++].value = I915_MASKED_ENABLE(GEN9_FACTOR_IN_CLR_VAL_HIZ);
+	}
+	return n;
+}
+
+/* The Gen8 list, Broadwell's and Cherryview's (GT3 Broadwell also keeps
+ * fences out of the shared local memory). */
+static unsigned gen8_ctx_workarounds(struct i915_device *i915, struct wa_ctx_entry *wa,
+				     unsigned max)
+{
+	int bdw = i915->info->platform == I915_PLATFORM_BROADWELL;
+	int gt = (i915->id && i915->id->gt) ? i915->id->gt : i915->info->gt;
+	unsigned n = 0;
+
+	if (max < 12)
+		return 0;
+	wa[n].reg = INSTPM;
+	wa[n++].value = I915_MASKED_ENABLE(INSTPM_FORCE_ORDERING);
+	/* WaDisableAsyncFlipPerfMode */
+	wa[n].reg = RING_MI_MODE(RENDER_RING_BASE);
+	wa[n++].value = I915_MASKED_ENABLE(ASYNC_FLIP_PERF_DISABLE);
+	/* WaDisablePartialInstShootdown; WaDisableThreadStallDopClockGating */
+	wa[n].reg = GEN8_ROW_CHICKEN;
+	wa[n++].value = I915_MASKED_ENABLE(PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE |
+					   STALL_DOP_GATING_DISABLE);
+	/* Force non-coherent whenever a 3D context runs: a translation
+	 * cache invalidation during a pixel shader dispatcher flush can
+	 * hang the part (WaForceEnableNonCoherent,
+	 * WaHdcDisableFetchWhenMasked; on Broadwell also
+	 * WaForceContextSaveRestoreNonCoherent and, GT3,
+	 * WaDisableFenceDestinationToSLM) */
+	wa[n].reg = HDC_CHICKEN0;
+	wa[n++].value = I915_MASKED_ENABLE(HDC_DONOT_FETCH_MEM_WHEN_MASKED | HDC_FORCE_NON_COHERENT |
+					   (bdw ? HDC_FORCE_CONTEXT_SAVE_RESTORE_NON_COHERENT : 0) |
+					   (bdw && gt == 3 ? HDC_FENCE_DEST_SLM_DISABLE : 0));
+	/* the hierarchical Z raw stall optimisation, off by default here */
+	wa[n].reg = CACHE_MODE_0_GEN7;
+	wa[n++].value = I915_MASKED_DISABLE(HIZ_RAW_STALL_OPT_DISABLE);
+	/* Wa4x4STCOptimizationDisable */
+	wa[n].reg = CACHE_MODE_1;
+	wa[n++].value = I915_MASKED_ENABLE(GEN8_4x4_STC_OPTIMIZATION_DISABLE);
+	/* 16x4 hashing */
+	wa[n].reg = GEN7_GT_MODE;
+	wa[n++].value = (GEN6_WIZ_HASHING_MASK << 16) | GEN6_WIZ_HASHING_16x4;
+	if (bdw) {
+		/* WaDisableDopClockGating:bdw */
+		wa[n].reg = GEN8_ROW_CHICKEN2;
+		wa[n++].value = I915_MASKED_ENABLE(DOP_CLOCK_GATING_DISABLE);
+		wa[n].reg = HALF_SLICE_CHICKEN3;
+		wa[n++].value = I915_MASKED_ENABLE(GEN8_SAMPLER_POWER_BYPASS_DIS);
+	} else {
+		/* more hierarchical Z throughput on Cherryview */
+		wa[n].reg = HIZ_CHICKEN;
+		wa[n++].value = I915_MASKED_ENABLE(CHV_HZ_8X8_MODE_IN_1X);
+	}
 	return n;
 }
 
@@ -388,9 +542,10 @@ uint32_t i915_ctx_workarounds_emit(struct i915_device *i915, int engine_class,
 	unsigned count;
 	uint32_t n = 0;
 
-	if (i915->info->gen != 9 || engine_class != 0)
+	if ((i915->info->gen != 9 && i915->info->gen != 8) || engine_class != 0)
 		return 0;
-	count = gen9_ctx_workarounds(i915, wa, 12);
+	count = i915->info->gen == 8 ? gen8_ctx_workarounds(i915, wa, 12) :
+				       gen9_ctx_workarounds(i915, wa, 12);
 	if (!count || max_dwords < 2 + count * 2)
 		return 0;
 	ring[n++] = MI_LOAD_REGISTER_IMM((uint32_t)count);
@@ -424,8 +579,12 @@ uint32_t i915_ctx_settings_emit(struct i915_device *i915, struct i915_engine *e,
 {
 	uint32_t n;
 
-	if (i915->info->gen_x10 >= 120)
+	if (i915->info->gen_x10 >= 110)
 		return gen12_ctx_workarounds_emit(i915, e, ring, max_dwords);
+	/* Gen8: the context settings alone (no cache-control table, and
+	 * nothing the power request could ask for) */
+	if (i915->info->gen == 8 && e->class == 0)
+		return i915_ctx_workarounds_emit(i915, e->class, ring, max_dwords);
 	if (i915->info->gen != 9 || e->class != 0)
 		return 0;
 	n = i915_ctx_workarounds_emit(i915, e->class, ring, max_dwords);

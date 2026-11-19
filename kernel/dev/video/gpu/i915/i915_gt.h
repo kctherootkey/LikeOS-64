@@ -418,7 +418,7 @@ void i915_wa_list_init(struct i915_wa_list *wal, const char *name,
  * first (its clear bits win over earlier set bits). */
 void i915_wa_add(struct i915_wa_list *wal, uint32_t reg, uint32_t clr, uint32_t set,
 		 uint32_t read, uint32_t flags);
-/* i915_wa_lists.c, graphics IP 12.0 and later (nothing on older parts):
+/* i915_wa_lists.c, graphics IP 11.0 and later (nothing on older parts):
  * the GT-wide list of the primary GT or (media_gt) of the standalone
  * media GT -- registers below 0x40000 relative to that GT, i915_gt_reg()
  * makes them absolute -- the list of one engine,

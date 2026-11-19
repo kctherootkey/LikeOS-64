@@ -913,6 +913,15 @@ int console_boot_fb_virt_to_phys(uint64_t virt, uint64_t *phys)
 	return 0;
 }
 
+int console_boot_fb_range(uint64_t *phys, uint64_t *size)
+{
+	if (!g_boot_fb_virt)
+		return -1;
+	*phys = g_boot_fb_phys;
+	*size = g_boot_fb_size;
+	return 0;
+}
+
 // Initialize framebuffer optimization system (call after console_init)
 void console_init_fb_optimization(void)
 {

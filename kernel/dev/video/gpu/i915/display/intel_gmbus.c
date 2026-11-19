@@ -460,6 +460,14 @@ void intel_gmbus_adapter_init(struct i915_device *i915, struct i2c_adapter *a,
 
 int intel_gmbus_init(struct i915_device *i915)
 {
+	/* Wa_15013987218 (display version 20): with the display core up,
+	 * the GMBUS unit's clock gating is switched off and on again once */
+	if (i915->info->display_ver == 20) {
+		uint32_t v = i915_read32(i915, SOUTH_DSPCLK_GATE_D);
+		i915_write32(i915, SOUTH_DSPCLK_GATE_D, v | PCH_GMBUSUNIT_CLOCK_GATE_DISABLE);
+		v = i915_read32(i915, SOUTH_DSPCLK_GATE_D);
+		i915_write32(i915, SOUTH_DSPCLK_GATE_D, v & ~PCH_GMBUSUNIT_CLOCK_GATE_DISABLE);
+	}
 	/* whatever the firmware left: no pin selected, no interrupts */
 	i915_write32(i915, GMBUS0(i915), 0);
 	i915_write32(i915, GMBUS4(i915), 0);

@@ -410,8 +410,12 @@ int i915_vm_bind_pat(struct i915_vm *vm, uint64_t addr, const uint64_t *pages,
 	if (i915_is_legacy(i915))
 		return i915_legacy_vm_bind(vm, addr, pages, npages, i915_pat_is_uncached(i915, pat));
 	if (addr & 0xfff ||
-	    addr + (uint64_t)npages * 4096 > (i915_vm_3lvl(i915) ? 1ULL << 32 : I915_VM_SIZE))
+	    addr + (uint64_t)npages * 4096 > i915_vm_hw_size(i915))
 		return -EINVAL;
+	/* Xe2 on: an engine's atomic operation on a page whose entry does
+	 * not allow atomics is a catastrophic memory error; every page a
+	 * client binds allows them (the scratch page does not). */
+	uint64_t ae = i915->gt_ip >= I915_IP(20, 0) ? XE2_PPGTT_PTE_AE : 0;
 	/* One run per page table: every page of a run shares its table, so
 	 * the three pages reserved before each run cover everything the
 	 * walk can have to create. */
@@ -433,7 +437,7 @@ int i915_vm_bind_pat(struct i915_vm *vm, uint64_t addr, const uint64_t *pages,
 		}
 		for (uint32_t i = 0; i < run; i++) {
 			uint64_t p = a + (uint64_t)i * 4096;
-			pt[(p >> 12) & 0x1ff] = pte_encode(i915, pages[done + i], pat) |
+			pt[(p >> 12) & 0x1ff] = pte_encode(i915, pages[done + i], pat) | ae |
 						i915_lmem_ppgtt_pte_bits(i915, pages, done + i,
 									 npages, p);
 		}

@@ -521,7 +521,7 @@ static inline void e1000e_write(e1000e_dev_t *dev, uint32_t reg, uint32_t val)
 #define E1000_FEXTNVM6 0x00010
 #define E1000_FEXTNVM7 0x000E4
 #define E1000_FEXTNVM8 0x05BB0
-#define E1000_FEXTNVM9 0x0005C
+#define E1000_FEXTNVM9 0x05BB4 // SPT+ Future Extended NVM 9
 #define E1000_FEXTNVM11 0x05BBC // SPT/CNP/TGP+ Future Extended NVM 11
 #define E1000_PBA 0x01000
 #define E1000_PBS 0x01008
@@ -727,8 +727,8 @@ static inline void e1000e_write(e1000e_dev_t *dev, uint32_t reg, uint32_t val)
 #define E1000_CTRL_LANPHYPC_VALUE 0x00020000u
 
 // FEXTNVM9 / FEXTNVM11 quirks (CMP / TGP)
-#define E1000_FEXTNVM9_IOSFSB_CLKGATE_DIS (1u << 12)
-#define E1000_FEXTNVM9_IOSFSB_CLKREQ_DIS (1u << 11)
+#define E1000_FEXTNVM9_IOSFSB_CLKGATE_DIS (1u << 11)
+#define E1000_FEXTNVM9_IOSFSB_CLKREQ_DIS (1u << 12)
 #define E1000_FEXTNVM11_DISABLE_MULR_FIX 0x00002000u
 #define E1000_TARC0_CB_MULTIQ_3_REQ 0x30000000u
 #define E1000_TARC0_CB_MULTIQ_2_REQ 0x20000000u
@@ -3454,6 +3454,22 @@ void e1000e_init(void)
 							0x04, cmd);
 					kprintf("E1000E: cleared PCI Command INTx Disable bit\n");
 				}
+			}
+
+			// SPT-or-later MAC on the legacy interrupt pin: the
+			// IOSF sideband's clock gating and clock requests are
+			// switched off, or the pin interrupt can be held back
+			// while the sideband sleeps.  Only on this path: with
+			// MSI the register keeps the value the firmware left.
+			if (e1000e_mac_gen(dev->pci_dev->device_id) >=
+			    E1000E_MAC_PCH_SPT) {
+				uint32_t fx9 = e1000e_read(dev, E1000_FEXTNVM9);
+				e1000e_write(dev, E1000_FEXTNVM9,
+					     fx9 |
+					     E1000_FEXTNVM9_IOSFSB_CLKGATE_DIS |
+					     E1000_FEXTNVM9_IOSFSB_CLKREQ_DIS);
+				e1000e_dbg("E1000E: legacy INTx: FEXTNVM9 %08x -> %08x\n",
+					   fx9, e1000e_read(dev, E1000_FEXTNVM9));
 			}
 
 			if (irq <= 23) {

@@ -185,6 +185,78 @@ static uint32_t leg_context_size(struct i915_device *i915, struct i915_engine *e
 
 /* ---- driver objects ----------------------------------------------------------------- */
 
+/* 965G and 965GM write the status page with 32-bit addresses whatever
+ * its real place (memory above 4 GB gets overwritten), and general state
+ * above 4 GB is undefined on them: every object the GPU sees lives
+ * below 4 GB. */
+static int leg_objs_below_4g(struct i915_device *i915)
+{
+	int p = i915->info->platform;
+	return p == I915_PLATFORM_I965G || p == I915_PLATFORM_I965GM;
+}
+
+/* Every page of a fresh object (not yet bound or mapped) moved below
+ * 4 GB.  A physically contiguous object (the console's framebuffer, a
+ * ring: addressed linearly through the direct map) moves as one run. */
+static int leg_obj_move_below_4g(struct drm_gem_object *o)
+{
+	int high = 0, run = o->npages > 1;
+
+	for (uint32_t i = 0; i < o->npages; i++) {
+		if (o->pages[i] + 4096 > (1ULL << 32))
+			high = 1;
+		if (o->pages[i] != o->pages[0] + (uint64_t)i * 4096)
+			run = 0;
+	}
+	if (!high)
+		return 0;
+	if (run) {
+		/* runs are served from below 4 GB while there is room */
+		uint64_t base = mm_allocate_contiguous_pages(o->npages);
+		if (!base)
+			return -ENOMEM;
+		if (base + (uint64_t)o->npages * 4096 > (1ULL << 32)) {
+			mm_free_contiguous_pages(base, o->npages);
+			return -ENOMEM;
+		}
+		mm_memset(phys_to_virt(base), 0, (size_t)o->npages * 4096);
+		for (uint32_t i = 0; i < o->npages; i++) {
+			mm_free_physical_page(o->pages[i]);
+			o->pages[i] = base + (uint64_t)i * 4096;
+		}
+		return 0;
+	}
+	for (uint32_t i = 0; i < o->npages; i++) {
+		uint64_t p;
+
+		if (o->pages[i] + 4096 <= (1ULL << 32))
+			continue;
+		p = mm_allocate_contiguous_pages(1);
+		if (!p)
+			return -ENOMEM;
+		if (p + 4096 > (1ULL << 32)) {
+			mm_free_physical_page(p);
+			return -ENOMEM;
+		}
+		mm_memset(phys_to_virt(p), 0, 4096);
+		mm_free_physical_page(o->pages[i]);
+		o->pages[i] = p;
+	}
+	return 0;
+}
+
+int i915_legacy_obj_fix_pages(struct i915_device *i915, struct drm_gem_object *o)
+{
+	if (!leg_objs_below_4g(i915) || !o->pages || o->pages_borrowed)
+		return 0;
+	if (leg_obj_move_below_4g(o) != 0) {
+		kprintf("[drm] i915: no memory below 4 GB for a %llu KB buffer\n",
+			(unsigned long long)(o->size / 1024));
+		return -ENOMEM;
+	}
+	return 0;
+}
+
 static struct drm_gem_object *leg_obj_alloc(struct i915_device *i915, uint64_t size, int contig)
 {
 	struct drm_gem_object *o = drm_gem_alloc(&i915->drm, DRM_GEM_BO, size);
@@ -195,6 +267,7 @@ static struct drm_gem_object *leg_obj_alloc(struct i915_device *i915, uint64_t s
 		drm_gem_put(o);
 		return NULL;
 	}
+	/* (gem_init moves the pages below 4 GB where the part needs it) */
 	if (i915->drm.drv->gem_init && i915->drm.drv->gem_init(o) != 0) {
 		drm_gem_put(o);
 		return NULL;
@@ -1128,7 +1201,8 @@ static int hwsp_alloc(struct i915_engine *e)
 	if (le->hws_physical) {
 		/* addressed physically; the register holds 32 bits (and
 		 * from gen4 four more) */
-		if (o->pages[0] + 4096 > g_leg.dma_limit) {
+		if (o->pages[0] + 4096 > g_leg.dma_limit &&
+		    (leg_obj_move_below_4g(o) != 0 || o->pages[0] + 4096 > g_leg.dma_limit)) {
 			drm_gem_put(o);
 			return -ENOMEM;
 		}

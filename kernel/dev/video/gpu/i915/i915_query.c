@@ -44,7 +44,10 @@ static long query_reply(struct drm_i915_query_item *it, const void *data, uint32
 static long query_topology_gen11(struct i915_device *i915, struct drm_i915_query_item *it,
 				 uint32_t ss_mask)
 {
-	uint16_t max_ss = i915->info->gen_x10 >= 125 ? 32 : i915->info->gen_x10 >= 120 ? 6 : 8;
+	int ehl = i915->info->platform == I915_PLATFORM_ELKHARTLAKE ||
+		  i915->info->platform == I915_PLATFORM_JASPERLAKE;
+	uint16_t max_ss = i915->info->gen_x10 >= 125 ? 32 : i915->info->gen_x10 >= 120 ? 6 :
+			  ehl ? 4 : 8;
 	uint16_t max_eus = i915->info->gen_x10 >= 120 ? 16 : 8;
 	uint16_t ss_stride = (uint16_t)((max_ss + 7) / 8), eu_stride = (uint16_t)((max_eus + 7) / 8);
 	uint8_t buf[sizeof(struct drm_i915_query_topology_info) + 1 + 4 + 32 * 2];

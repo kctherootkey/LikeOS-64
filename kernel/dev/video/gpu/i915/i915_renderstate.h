@@ -14,5 +14,8 @@ uint32_t i915_renderstate_gen9_bytes(void);
 /* Write the Gen9 batch into `page', relocated to run at `base' (page
  * aligned, in the address space it will run in).  0 on success. */
 int i915_renderstate_gen9_build(uint32_t *page, uint32_t page_bytes, uint64_t base);
+/* The same for Gen8 (Broadwell, Cherryview). */
+uint32_t i915_renderstate_gen8_bytes(void);
+int i915_renderstate_gen8_build(uint32_t *page, uint32_t page_bytes, uint64_t base);
 
 #endif

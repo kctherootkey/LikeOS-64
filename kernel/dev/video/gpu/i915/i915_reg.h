@@ -465,6 +465,21 @@
 #define DP_AUX_CH_CTL_FW_SYNC_PULSE_SKL(c) (((c) - 1) << 5)
 #define DP_AUX_CH_CTL_SYNC_PULSE_SKL(c) ((c) - 1)
 
+/* Haswell/Broadwell: the AUX control word's precharge and 2x bit clock
+ * divider fields; channels B-D are in the PCH. */
+#define DP_AUX_CH_CTL_PRECHARGE_2US(x) (((uint32_t)(x) << 16) & DP_AUX_CH_CTL_PRECHARGE_2US_MASK)
+#define DP_AUX_CH_CTL_BIT_CLOCK_2X(x) ((uint32_t)(x) & DP_AUX_CH_CTL_BIT_CLOCK_2X_MASK)
+#define PCH_DP_AUX_CH_CTL(ch) (0xE4110 + ((ch) - 1) * 0x100)
+#define PCH_DP_AUX_CH_DATA(ch, i) (0xE4114 + ((ch) - 1) * 0x100 + (i) * 4)
+
+/* Haswell/Broadwell: the pipe's panel fitter (one per pipe, 0x800 apart) */
+#define HSW_PF_CTL(pipe) (0x68080 + (pipe) * 0x800)
+#define HSW_PF_ENABLE (1u << 31)
+#define HSW_PF_PIPE_SEL(pipe) ((uint32_t)(pipe) << 29)
+#define HSW_PF_FILTER_MED_3x3 (1u << 23)
+#define HSW_PF_WIN_POS(pipe) (0x68070 + (pipe) * 0x800)
+#define HSW_PF_WIN_SZ(pipe) (0x68074 + (pipe) * 0x800)
+
 /* ---- transcoders and pipes -------------------------------------------------- */
 #define TRANS_BASE(trans) ((trans) == TRANSCODER_EDP ? 0x6F000 : 0x60000 + (trans) * 0x1000)
 #define TRANS_HTOTAL(trans) (TRANS_BASE(trans) + 0x000)

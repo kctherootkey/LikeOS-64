@@ -519,6 +519,9 @@ static int domain_wells(struct i915_device *i915, enum intel_power_domain d,
 		if (pipe == 0 || d == INTEL_PW_TRANSCODER_EDP || port == 0 || aux == 0 ||
 		    d == INTEL_PW_DISPLAY_CORE)
 			return 0;
+		/* and so is pipe A's panel fitter, but on Haswell */
+		if (d == INTEL_PW_PFIT_A && !plat_is(i915, I915_PLATFORM_HASWELL))
+			return 0;
 		out[n++] = W(HSW_PWR_WELL_CTL2, HSW_PW_CTL_IDX_GLOBAL);
 		return n;
 	case INTEL_DISPLAY_SKL:
@@ -527,8 +530,14 @@ static int domain_wells(struct i915_device *i915, enum intel_power_domain d,
 			return n;
 		}
 		out[n++] = W(HSW_PWR_WELL_CTL2, SKL_PW_CTL_IDX_PW_1);
-		if (pipe == 0 || d == INTEL_PW_TRANSCODER_EDP || aux == 0 || port == 0 ||
-		    port == 4) {
+		if (pipe == 0 || d == INTEL_PW_TRANSCODER_EDP || aux == 0 || port == 0) {
+			out[n++] = W(HSW_PWR_WELL_CTL2, SKL_PW_CTL_IDX_DDI_A_E);
+			return n;
+		}
+		/* DDI E's lanes, and the transcoder (A, B or C) it runs on,
+		 * are in PW2; its I/O shares A's well. */
+		if (port == 4) {
+			out[n++] = W(HSW_PWR_WELL_CTL2, SKL_PW_CTL_IDX_PW_2);
 			out[n++] = W(HSW_PWR_WELL_CTL2, SKL_PW_CTL_IDX_DDI_A_E);
 			return n;
 		}

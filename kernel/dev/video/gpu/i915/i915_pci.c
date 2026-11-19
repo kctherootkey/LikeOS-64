@@ -328,10 +328,13 @@ static const struct intel_device_info info_cannonlake = {
 
 /* ---- generation 11 ----------------------------------------------------- */
 
-#define GEN11_COMMON                                                       \
+/* Elkhart Lake and Jasper Lake translate 36 address bits, Ice Lake 48:
+ * the width is the descriptor's own (GEN11_COMMON_VA). */
+#define GEN11_COMMON_VA(bits_)                                             \
 	.gen = 11, .gen_x10 = 110, .display_ver = 11, .num_pipes = 3,       \
-	.ppgtt_bits = 48, .csb_entries = 12, .dpll_model = I915_DPLL_ICL,   \
+	.ppgtt_bits = (bits_), .csb_entries = 12, .dpll_model = I915_DPLL_ICL, \
 	.max_dpll = 7, .dma_mask_bits = 39
+#define GEN11_COMMON GEN11_COMMON_VA(48)
 
 static const struct intel_device_info info_icelake = {
 	.name = "Ice Lake",
@@ -349,8 +352,10 @@ static const struct intel_device_info info_icelake = {
 static const struct intel_device_info info_elkhartlake = {
 	.name = "Elkhart Lake",
 	.platform = I915_PLATFORM_ELKHARTLAKE,
-	GEN11_COMMON,
-	.flags = GEN9_LP_FLAGS | I915_INFO_HAS_COMBO_PHY | I915_INFO_HAS_PCH,
+	GEN11_COMMON_VA(36),
+	/* Ice Lake's GT (a shared last-level cache, not a low-power part)
+	 * without its Type-C PHYs */
+	.flags = GEN9_CORE_FLAGS | I915_INFO_HAS_COMBO_PHY,
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VECS0,
 	.dmc_fw = "i915/icl_dmc_ver1_09.bin",
@@ -361,8 +366,10 @@ static const struct intel_device_info info_elkhartlake = {
 static const struct intel_device_info info_jasperlake = {
 	.name = "Jasper Lake",
 	.platform = I915_PLATFORM_JASPERLAKE,
-	GEN11_COMMON,
-	.flags = GEN9_LP_FLAGS | I915_INFO_HAS_COMBO_PHY | I915_INFO_HAS_PCH,
+	GEN11_COMMON_VA(36),
+	/* Ice Lake's GT (a shared last-level cache, not a low-power part)
+	 * without its Type-C PHYs */
+	.flags = GEN9_CORE_FLAGS | I915_INFO_HAS_COMBO_PHY,
 	.engine_mask = I915_ENGINE_RCS0 | I915_ENGINE_BCS0 | I915_ENGINE_VCS0 |
 		       I915_ENGINE_VECS0,
 	.dmc_fw = "i915/icl_dmc_ver1_09.bin",
@@ -373,9 +380,10 @@ static const struct intel_device_info info_jasperlake = {
 
 /* ---- generation 12 ----------------------------------------------------- */
 
-#define GEN12_COMMON                                                       \
-	.gen = 12, .gen_x10 = 120, .ppgtt_bits = 48, .csb_entries = 12,     \
+#define GEN12_COMMON_VA(bits_)                                             \
+	.gen = 12, .gen_x10 = 120, .ppgtt_bits = (bits_), .csb_entries = 12, \
 	.dpll_model = I915_DPLL_ICL, .max_dpll = 8, .dma_mask_bits = 39
+#define GEN12_COMMON GEN12_COMMON_VA(48)
 
 #define GEN12_FLAGS                                                        \
 	(I915_INFO_HAS_DDI | I915_INFO_HAS_EXECLISTS | I915_INFO_HAS_LLC | \
@@ -413,7 +421,8 @@ static const struct intel_device_info info_rocketlake = {
 static const struct intel_device_info info_dg1 = {
 	.name = "DG1",
 	.platform = I915_PLATFORM_DG1,
-	GEN12_COMMON,
+	/* Wa_16011227922: nothing in the upper half of the address space */
+	GEN12_COMMON_VA(47),
 	.display_ver = 12,
 	.num_pipes = 4,
 	.flags = (GEN12_FLAGS & ~(I915_INFO_HAS_LLC | I915_INFO_HAS_PCH)) |

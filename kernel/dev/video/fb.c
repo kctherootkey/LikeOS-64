@@ -30,6 +30,9 @@ static spinlock_t fb_lock = SPINLOCK_INIT("framebuffer");
 // Global double buffer state
 static fb_double_buffer_t g_double_buffer = { 0 };
 static uint8_t g_initialized = 0;
+/* Set once kalloc() works (fb_optimize_heap_ready); a back buffer larger
+ * than the static one cannot be had before. */
+static uint8_t g_heap_ready = 0;
 
 // Maximum number of dirty regions to track
 #define MAX_DIRTY_REGIONS 64
@@ -474,6 +477,10 @@ int fb_optimize_init(framebuffer_info_t *fb_info)
 			(size_t)MAX_STATIC_FB_SIZE);
 #endif
 	} else {
+		// Larger framebuffers need the heap; until it exists the
+		// console draws to the front buffer directly.
+		if (!g_heap_ready)
+			return -1;
 		// Try dynamic allocation for larger framebuffers
 		g_double_buffer.back_buffer = (uint32_t *)kalloc(buffer_size);
 		if (!g_double_buffer.back_buffer) {
@@ -532,6 +539,11 @@ int fb_optimize_init(framebuffer_info_t *fb_info)
 	kprintf("Framebuffer optimization system initialized successfully\n");
 #endif
 	return 0;
+}
+
+void fb_optimize_heap_ready(void)
+{
+	g_heap_ready = 1;
 }
 
 // Shutdown the optimization system

@@ -179,6 +179,9 @@ static inline void leg_clflush_range(const void *p, uint32_t bytes)
 
 /* i915_legacy_gtt.c */
 uint32_t leg_pte_encode(struct i915_device *i915, uint64_t phys, enum leg_cache level, int readonly);
+/* leg_pte_encode for an object's page, the scratch page's entry when the
+ * page lies beyond what the part can address (g_leg.dma_limit). */
+uint32_t leg_pte_for_page(struct i915_device *i915, uint64_t phys, enum leg_cache level);
 void leg_ggtt_invalidate(struct i915_device *i915);
 void leg_ggtt_write(struct i915_device *i915, uint32_t index, uint32_t pte);
 int leg_ggtt_alloc(struct i915_device *i915, uint32_t npages, uint32_t align_pages,

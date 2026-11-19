@@ -352,5 +352,7 @@ int intel_tc_pll_clock_ok(struct i915_device *i915, uint32_t clock_khz, int is_d
 /* Broxton/Gemini Lake: bring up (if needed) the DPIO PHY that carries a
  * port -- and the PHY it copies its compensation from (intel_dpll_bxt.c). */
 int bxt_dpio_phy_init_port(struct i915_device *i915, int port);
+/* ... and the PHY an AUX channel's transfers go through, before one. */
+void bxt_dpio_phy_aux_get(struct i915_device *i915, int aux_ch);
 
 #endif

@@ -61,6 +61,8 @@
  * directory entry that maps a large page */
 #define XE2_PPGTT_PTE_PAT4 (1ULL << 61)
 #define XE2_PPGTT_PDE_PDPE_PAT2 (1ULL << 12)
+/* atomic operations allowed on the page an entry maps (bound entries only) */
+#define XE2_PPGTT_PTE_AE (1ULL << 10)
 
 /* ---- the GuC ----------------------------------------------------------------------- */
 

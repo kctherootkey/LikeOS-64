@@ -8,6 +8,8 @@
 // from, patched with its own ring and page directory.
 //
 // Copyright (C) 2026 The LikeOS Project
+// SPDX-License-Identifier for the portions derived from Intel's code: MIT
+// Portions Copyright (C) 2019-2024 Intel Corporation
 
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
@@ -254,6 +256,34 @@ uint32_t i915_rpcs_for(struct i915_device *i915)
 			n = 1;
 		return GEN8_RPCS_ENABLE | GEN8_RPCS_S_CNT_ENABLE |
 		       ((n << GEN11_RPCS_S_CNT_SHIFT) & GEN11_RPCS_S_CNT_MASK);
+	}
+	if (i915->info->gen_x10 >= 110) {
+		/* Gen11 gates slices, subslices and units.  The subslice
+		 * count field is three bits and documented up to four, so
+		 * one slice of more subslices than that (or than half of
+		 * those present) is asked for as two whole slices, without
+		 * a subslice count; the hardware turns that back into the
+		 * one slice with all of its subslices.  Each subslice asks
+		 * for its eight units. */
+		unsigned n = 0, ss = 0;
+		int ss_count = 1;
+		uint32_t rpcs;
+		for (uint32_t m = i915->slice_mask; m; m >>= 1)
+			n += m & 1;
+		for (uint32_t m = i915->subslice_mask[0] & 0xff; m; m >>= 1)
+			ss += m & 1;
+		if (n == 1 && ss > (ss / 2 < 4 ? ss / 2 : 4)) {
+			ss_count = 0;
+			n = 2;
+		}
+		rpcs = GEN8_RPCS_ENABLE | GEN8_RPCS_S_CNT_ENABLE |
+		       ((n << GEN11_RPCS_S_CNT_SHIFT) & GEN11_RPCS_S_CNT_MASK);
+		if (ss_count)
+			rpcs |= GEN8_RPCS_SS_CNT_ENABLE |
+				((ss << GEN8_RPCS_SS_CNT_SHIFT) & (0x7u << GEN8_RPCS_SS_CNT_SHIFT));
+		rpcs |= ((8u << GEN8_RPCS_EU_MIN_SHIFT) & (0xfu << GEN8_RPCS_EU_MIN_SHIFT)) |
+			((8u << GEN8_RPCS_EU_MAX_SHIFT) & (0xfu << GEN8_RPCS_EU_MAX_SHIFT));
+		return rpcs;
 	}
 
 	for (int s = 0; s < 4; s++) {
@@ -505,6 +535,9 @@ int i915_gt_golden_init(struct i915_device *i915)
 		if (e->class == 0 && i915->info->gen == 9 &&
 		    i915_renderstate_gen9_build(b, 4096, batch_addr) == 0) {
 			batch_len = i915_renderstate_gen9_bytes();
+		} else if (e->class == 0 && i915->info->gen == 8 &&
+			   i915_renderstate_gen8_build(b, 4096, batch_addr) == 0) {
+			batch_len = i915_renderstate_gen8_bytes();
 		} else {
 			b[0] = MI_BATCH_BUFFER_END;
 			b[1] = MI_NOOP;

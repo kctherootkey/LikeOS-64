@@ -379,7 +379,7 @@ static uint64_t leg_pte_decode(uint32_t pte)
 
 /* A page the device cannot address (above the part's DMA limit) is
  * mapped as the scratch page instead, and said once. */
-static uint32_t leg_pte_for_page(struct i915_device *i915, uint64_t phys, enum leg_cache level)
+uint32_t leg_pte_for_page(struct i915_device *i915, uint64_t phys, enum leg_cache level)
 {
 	if (phys + 4096 > g_leg.dma_limit) {
 		if (!g_leg.dma_warned) {

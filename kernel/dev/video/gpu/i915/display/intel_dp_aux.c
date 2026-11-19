@@ -32,6 +32,7 @@
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
 #include <kernel/dev/video/gpu/i915/display/intel_display.h>
+#include <kernel/dev/video/gpu/i915/display/intel_dpll_regs.h>
 #include <kernel/dev/video/gpu/i915/display/intel_xelpdp_regs.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
@@ -79,8 +80,53 @@ static int aux_is_xelpdp(struct intel_dp_aux *aux)
 #define AUX_SYNC_LEN (16 + 16)
 #define AUX_FW_SYNC_LEN (10 + 8)
 
-static uint32_t aux_ctl_value(struct intel_dp_aux *aux, unsigned send_bytes)
+/* Haswell/Broadwell: the channel's clock is divided down to 2 MHz by the
+ * control word -- CDCLK for channel A, the PCH's raw clock for B-D.  The
+ * index-th divider to try (0: none left): Lynx and Wildcat Point-H's
+ * channels want 63, and 72 should that fail.  From Skylake the hardware
+ * derives the clock itself and there is just the one pass. */
+static uint32_t aux_clock_divider(struct intel_dp_aux *aux, int index)
 {
+	struct i915_device *i915 = aux->i915;
+	uint32_t freq;
+
+	if (i915->display.model != INTEL_DISPLAY_BDW)
+		return index ? 0 : 1;
+	if (aux->port != PORT_A && (i915->pch_devid & 0xff00) == 0x8c00) {
+		switch (index) {
+		case 0: return 63;
+		case 1: return 72;
+		default: return 0;
+		}
+	}
+	if (index)
+		return 0;
+	freq = aux->port == PORT_A ? i915->display.cdclk_khz : i915->display.rawclk_khz;
+	return (freq + 1000) / 2000;
+}
+
+/* Haswell/Broadwell's control word: a timeout, the precharge beyond the
+ * 10 clocks the hardware always sends (of a sync of 16 precharge plus 16
+ * preamble clocks), in 2 us units, and the clock divider. */
+static uint32_t hsw_aux_ctl_value(struct intel_dp_aux *aux, unsigned send_bytes,
+				  uint32_t divider)
+{
+	uint32_t timeout = aux->i915->info->platform == I915_PLATFORM_HASWELL ?
+				   DP_AUX_CH_CTL_TIME_OUT_400us :
+				   DP_AUX_CH_CTL_TIME_OUT_600us;
+
+	return DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE | DP_AUX_CH_CTL_INTERRUPT |
+	       DP_AUX_CH_CTL_TIME_OUT_ERROR | timeout | DP_AUX_CH_CTL_RECEIVE_ERROR |
+	       (send_bytes << DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT) |
+	       DP_AUX_CH_CTL_PRECHARGE_2US((AUX_SYNC_LEN - 10 - 16) / 2) |
+	       DP_AUX_CH_CTL_BIT_CLOCK_2X(divider);
+}
+
+static uint32_t aux_ctl_value(struct intel_dp_aux *aux, unsigned send_bytes, uint32_t divider)
+{
+	if (aux->i915->display.model == INTEL_DISPLAY_BDW)
+		return hsw_aux_ctl_value(aux, send_bytes, divider);
+
 	uint32_t v = DP_AUX_CH_CTL_SEND_BUSY | DP_AUX_CH_CTL_DONE |
 		     DP_AUX_CH_CTL_INTERRUPT | DP_AUX_CH_CTL_TIME_OUT_ERROR |
 		     DP_AUX_CH_CTL_TIME_OUT_MAX | DP_AUX_CH_CTL_RECEIVE_ERROR |
@@ -145,8 +191,14 @@ static enum intel_power_domain aux_power_domain(const struct intel_dp_aux *aux)
  * channel holds that lock already, and it nests. */
 uint32_t intel_dp_aux_power_get(struct intel_dp_aux *aux)
 {
+	uint32_t was;
+
 	intel_display_lock(aux->i915);
-	return intel_power_get_transient(aux->i915, aux_power_domain(aux));
+	was = intel_power_get_transient(aux->i915, aux_power_domain(aux));
+	/* Broxton/Gemini Lake: the channel needs its port's PHY up too */
+	if (aux->i915->display.model == INTEL_DISPLAY_BXT)
+		bxt_dpio_phy_aux_get(aux->i915, aux->port);
+	return was;
 }
 
 void intel_dp_aux_power_put(struct intel_dp_aux *aux, uint32_t was)
@@ -185,50 +237,53 @@ static int aux_xfer(struct intel_dp_aux *aux, const uint8_t *send,
 		return -EBUSY;
 	}
 	int rc = -ETIMEDOUT;
-	for (int attempt = 0; attempt < 5; attempt++) {
-		for (unsigned i = 0; i < send_bytes; i += 4)
-			i915_write32(i915, aux->data_reg + i,
-				     pack_be(send + i,
-					     send_bytes - i < 4 ? send_bytes - i : 4));
-		i915_write32(i915, aux->ctl_reg, aux_ctl_value(aux, send_bytes));
-		/* Done or errored, within a few hundred microseconds. */
-		for (int t = 0; t < 2000; t++) {
-			status = i915_read32(i915, aux->ctl_reg);
-			if (!(status & DP_AUX_CH_CTL_SEND_BUSY))
-				break;
-			lapic_delay_us(5);
+	uint32_t div;
+	for (int clock = 0; (div = aux_clock_divider(aux, clock)) != 0; clock++) {
+		for (int attempt = 0; attempt < 5; attempt++) {
+			for (unsigned i = 0; i < send_bytes; i += 4)
+				i915_write32(i915, aux->data_reg + i,
+					     pack_be(send + i,
+						     send_bytes - i < 4 ? send_bytes - i : 4));
+			i915_write32(i915, aux->ctl_reg, aux_ctl_value(aux, send_bytes, div));
+			/* Done or errored, within a few hundred microseconds. */
+			for (int t = 0; t < 2000; t++) {
+				status = i915_read32(i915, aux->ctl_reg);
+				if (!(status & DP_AUX_CH_CTL_SEND_BUSY))
+					break;
+				lapic_delay_us(5);
+			}
+			/* Clear the sticky bits. */
+			i915_write32(i915, aux->ctl_reg,
+				     status | DP_AUX_CH_CTL_DONE |
+					     DP_AUX_CH_CTL_TIME_OUT_ERROR |
+					     DP_AUX_CH_CTL_RECEIVE_ERROR);
+			if (status & DP_AUX_CH_CTL_TIME_OUT_ERROR) {
+				rc = -ETIMEDOUT;
+				lapic_delay_us(500);
+				continue;
+			}
+			if (status & DP_AUX_CH_CTL_RECEIVE_ERROR) {
+				rc = -EIO;
+				lapic_delay_us(500);
+				continue;
+			}
+			if (!(status & DP_AUX_CH_CTL_DONE)) {
+				rc = -EBUSY;
+				continue;
+			}
+			unsigned got = (status & DP_AUX_CH_CTL_MESSAGE_SIZE_MASK) >>
+				       DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT;
+			if (got == 0 || got > 20) {
+				rc = -EIO;
+				continue;
+			}
+			if (got > recv_cap)
+				got = recv_cap;
+			for (unsigned i = 0; i < got; i += 4)
+				unpack_be(i915_read32(i915, aux->data_reg + i), recv + i,
+					  got - i < 4 ? got - i : 4);
+			return (int)got;
 		}
-		/* Clear the sticky bits. */
-		i915_write32(i915, aux->ctl_reg,
-			     status | DP_AUX_CH_CTL_DONE |
-				     DP_AUX_CH_CTL_TIME_OUT_ERROR |
-				     DP_AUX_CH_CTL_RECEIVE_ERROR);
-		if (status & DP_AUX_CH_CTL_TIME_OUT_ERROR) {
-			rc = -ETIMEDOUT;
-			lapic_delay_us(500);
-			continue;
-		}
-		if (status & DP_AUX_CH_CTL_RECEIVE_ERROR) {
-			rc = -EIO;
-			lapic_delay_us(500);
-			continue;
-		}
-		if (!(status & DP_AUX_CH_CTL_DONE)) {
-			rc = -EBUSY;
-			continue;
-		}
-		unsigned got = (status & DP_AUX_CH_CTL_MESSAGE_SIZE_MASK) >>
-			       DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT;
-		if (got == 0 || got > 20) {
-			rc = -EIO;
-			continue;
-		}
-		if (got > recv_cap)
-			got = recv_cap;
-		for (unsigned i = 0; i < got; i += 4)
-			unpack_be(i915_read32(i915, aux->data_reg + i), recv + i,
-				  got - i < 4 ? got - i : 4);
-		return (int)got;
 	}
 	aux->errors++;
 	return rc;
@@ -582,6 +637,11 @@ void intel_dp_aux_init(struct i915_device *i915, struct intel_dp_aux *aux,
 			ch = PORT_A;
 		aux->ctl_reg = DP_AUX_CH_CTL(ch);
 		aux->data_reg = DP_AUX_CH_DATA(ch, 0);
+		/* Haswell/Broadwell: only A is in the CPU; B-D are the PCH's */
+		if (i915->display.model == INTEL_DISPLAY_BDW && ch >= PORT_B && ch <= PORT_D) {
+			aux->ctl_reg = PCH_DP_AUX_CH_CTL(ch);
+			aux->data_reg = PCH_DP_AUX_CH_DATA(ch, 0);
+		}
 	}
 #if !I915_FEAT_DP_HELPERS
 	aux->i2c.xfer = aux_i2c_xfer;

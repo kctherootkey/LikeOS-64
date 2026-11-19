@@ -175,7 +175,7 @@ struct intel_device_info {
 	uint8_t display_ver; /* 9, 10, 11, 12, 13, 14, 20, 30, 35 */
 	uint8_t gt; /* GT level as sold, 0 when it does not apply */
 	uint8_t num_pipes; /* display pipes */
-	uint8_t ppgtt_bits; /* 32 or 48 */
+	uint8_t ppgtt_bits; /* address bits a context translates: 31, 32, 36, 47 or 48 */
 	uint8_t csb_entries; /* context status buffer depth: 6 or 12 */
 	uint8_t dpll_model; /* enum i915_dpll_model */
 	uint8_t max_dpll; /* how many shared PLLs */

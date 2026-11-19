@@ -733,6 +733,19 @@ static void reserve_uefi_memory_regions(void)
  * for a legacy bootloader that does not report the field (direct_map_bytes==0). */
 static uint64_t g_direct_map_limit = 16ULL * 1024 * 1024 * 1024;
 
+/* What is_phys_in_direct_map() and is_direct_map_addr() test against:
+ * the same extent, but never below the 16 GB every bootloader maps. */
+uint64_t g_direct_map_bytes = DIRECT_MAP_MIN_BYTES;
+
+void mm_init_direct_map_limit(const boot_info_t *boot_info)
+{
+	if (!boot_info || boot_info->direct_map_bytes == 0)
+		return;
+	g_direct_map_limit = boot_info->direct_map_bytes;
+	if (boot_info->direct_map_bytes > DIRECT_MAP_MIN_BYTES)
+		g_direct_map_bytes = boot_info->direct_map_bytes;
+}
+
 void mm_initialize_from_boot_info(boot_info_t *boot_info)
 {
 	if (!boot_info) {
@@ -740,8 +753,7 @@ void mm_initialize_from_boot_info(boot_info_t *boot_info)
 		return;
 	}
 
-	if (boot_info->direct_map_bytes != 0)
-		g_direct_map_limit = boot_info->direct_map_bytes;
+	mm_init_direct_map_limit(boot_info);
 
 	// Copy the memory map to our static storage
 	/* Clamp the COUNT to what is actually copied.  It used to record the
@@ -785,6 +797,34 @@ void mm_initialize_from_boot_info(boot_info_t *boot_info)
 	kprintf("Stored UEFI memory map: %u entries, %lu MB total\n",
 		g_uefi_memory_map.entry_count,
 		g_uefi_memory_map.total_memory / (1024 * 1024));
+}
+
+bool mm_phys_range_is_ram(uint64_t phys, uint64_t size)
+{
+	uint64_t end = phys + size;
+
+	if (size == 0 || end < phys)
+		return size != 0;
+	for (uint32_t i = 0; i < g_uefi_memory_map.entry_count; i++) {
+		const memory_map_entry_t *e = &g_uefi_memory_map.entries[i];
+		uint64_t start = e->physical_start;
+		uint64_t stop = start + e->number_of_pages * PAGE_SIZE;
+
+		switch (e->type) {
+		case EFI_RESERVED_MEMORY_TYPE:
+		case EFI_MEMORY_MAPPED_IO:
+		case EFI_MEMORY_MAPPED_IO_PORT_SPACE:
+		case EFI_PAL_CODE:
+			continue;
+		default:
+			if (e->type >= EFI_MAX_MEMORY_TYPE)
+				continue; /* vendor-defined: not known as RAM */
+			break;
+		}
+		if (phys < stop && start < end)
+			return true;
+	}
+	return false;
 }
 
 // Allocation hint - start searching from here for faster subsequent allocations
@@ -1974,10 +2014,10 @@ void mm_initialize_virtual_memory(void)
 	// Save kernel PML4 for mm_destroy_address_space to know which PML4 not to free
 	g_kernel_pml4_phys = get_cr3() & ~0xFFFULL;
 
-	uint64_t heap_start = mm_get_kernel_heap_start();
-	mm_state.next_virtual_addr =
-		heap_start + KERNEL_HEAP_SIZE + mm_state.bitmap_size;
-	mm_state.next_virtual_addr = PAGE_ALIGN(mm_state.next_virtual_addr);
+	/* Device mappings outside the direct map get a bounded window of
+	 * their own: the few MB left after the heap and the bitmap end where
+	 * the slab's range begins. */
+	mm_state.next_virtual_addr = MMIO_VIRT_BASE;
 
 	kprintf("  Page tables at: %p\n", mm_state.pml4_table);
 	kprintf("  Next virtual address: %p\n",
@@ -2128,8 +2168,30 @@ bool mm_map_page_no_shootdown(uint64_t virtual_addr, uint64_t physical_addr,
 	return true;
 }
 
+/* A fresh range of `num_pages' pages in the device-mapping window
+ * [MMIO_VIRT_BASE, MMIO_VIRT_LIMIT), or 0 when it does not fit. */
+static uint64_t mm_mmio_va_alloc(size_t num_pages)
+{
+	uint64_t lock_flags;
+	uint64_t virt_base = 0;
+
+	spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+	if (mm_state.next_virtual_addr >= MMIO_VIRT_BASE &&
+	    mm_state.next_virtual_addr <= MMIO_VIRT_LIMIT &&
+	    num_pages <= (MMIO_VIRT_LIMIT - mm_state.next_virtual_addr) /
+				 PAGE_SIZE) {
+		virt_base = mm_state.next_virtual_addr;
+		mm_state.next_virtual_addr += num_pages * PAGE_SIZE;
+	}
+	spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+	if (!virt_base)
+		kprintf("mm: device mapping window full, %lu pages refused\n",
+			(unsigned long)num_pages);
+	return virt_base;
+}
+
 // Map device MMIO region into kernel virtual address space.
-// Used for PCI BARs that point above the bootloader's 16GB direct map.
+// Used for PCI BARs that point above the bootloader's direct map.
 // Returns the virtual base address, or 0 on failure.
 uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages)
 {
@@ -2138,14 +2200,12 @@ uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages)
 
 	uint64_t phys_base = phys_addr & ~0xFFFULL;
 
-	// Allocate a contiguous kernel virtual range from next_virtual_addr
-	uint64_t lock_flags;
-	spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
-	uint64_t cursor_before = mm_state.next_virtual_addr;
-	uint64_t virt_base = mm_state.next_virtual_addr;
-	mm_state.next_virtual_addr += num_pages * PAGE_SIZE;
-	uint64_t cursor_after = mm_state.next_virtual_addr;
-	spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+	// Allocate a contiguous kernel virtual range from the MMIO window
+	uint64_t virt_base = mm_mmio_va_alloc(num_pages);
+	if (!virt_base)
+		return 0;
+	uint64_t cursor_before = virt_base;
+	uint64_t cursor_after = virt_base + num_pages * PAGE_SIZE;
 
 	// Map each page as present + writable + write-through + cache-disable (UC)
 	// MMIO regions must never be cached.
@@ -2238,11 +2298,9 @@ uint64_t mm_map_mmio_flags(uint64_t phys_addr, size_t num_pages, int attr)
 	if (in_direct) {
 		virt_base = (uint64_t)phys_to_virt(phys_base);
 	} else {
-		uint64_t lock_flags;
-		spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
-		virt_base = mm_state.next_virtual_addr;
-		mm_state.next_virtual_addr += num_pages * PAGE_SIZE;
-		spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+		virt_base = mm_mmio_va_alloc(num_pages);
+		if (!virt_base)
+			return 0;
 	}
 	for (size_t i = 0; i < num_pages; i++) {
 		uint64_t va = virt_base + i * PAGE_SIZE;

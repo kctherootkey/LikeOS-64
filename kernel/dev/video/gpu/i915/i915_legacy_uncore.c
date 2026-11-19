@@ -68,7 +68,10 @@ static void leg_platform_init(struct i915_device *i915)
 	 * and the two non-G4x gen4 parts */
 	g_leg.hws_physical = (gen <= 3 && !g_leg.is_g33) || p == I915_PLATFORM_I965G ||
 			     p == I915_PLATFORM_I965GM;
-	if (gen <= 3 && !g_leg.is_g33)
+	/* 965G/965GM: nothing the GPU sees above 4 GB (the status page is
+	 * written with 32-bit addresses, general state up there is
+	 * undefined), although their entries could name 36 bits */
+	if ((gen <= 3 && !g_leg.is_g33) || p == I915_PLATFORM_I965G || p == I915_PLATFORM_I965GM)
 		g_leg.dma_limit = 1ULL << 32;
 	else if (gen <= 5)
 		g_leg.dma_limit = 1ULL << 36;

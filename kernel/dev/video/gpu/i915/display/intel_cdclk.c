@@ -267,8 +267,12 @@ static uint32_t read_rawclk(struct i915_device *i915)
 
 	if (d->model == INTEL_DISPLAY_BXT)
 		return 19200;
-	if (d->model == INTEL_DISPLAY_BDW)
-		return 125000; /* Lynx/Wildcat Point */
+	if (d->model == INTEL_DISPLAY_BDW) {
+		/* Lynx/Wildcat Point report it in MHz: 125 on the H parts,
+		 * 24 on LP (the old fixed 125 MHz if the field is empty) */
+		uint32_t mhz = i915_read32(i915, RAWCLK_FREQ) & RAWCLK_FREQ_MASK;
+		return mhz ? mhz * 1000 : 125000;
+	}
 	if (i915->pch == I915_PCH_MTP || i915->pch == I915_PCH_LNL)
 		return 38400;
 	if (i915->pch == I915_PCH_DG1 || i915->pch == I915_PCH_DG2) {

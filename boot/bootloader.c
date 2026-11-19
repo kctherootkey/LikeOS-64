@@ -2210,6 +2210,49 @@ static void bl_collect_runtime(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
     }
 }
 
+/* Descriptors of room kept free in the buffer ExitBootServices' map is read
+ * into: what the firmware may add between that read and the call (events
+ * signalled by a first, failed ExitBootServices), when the retry reads the
+ * map once more into the same buffer and nothing may be allocated. */
+#define BL_MMAP_SLACK 64
+
+/* The memory map ExitBootServices is called with, read after the last
+ * allocation the loader makes so that its key is current.  The buffer is
+ * replaced by a larger one (still allowed: ExitBootServices has not been
+ * called yet) whenever the map plus BL_MMAP_SLACK descriptors no longer
+ * fits it; *cap is the size of the buffer. */
+static EFI_STATUS bl_read_final_memory_map(EFI_MEMORY_DESCRIPTOR **map,
+                                           UINTN *map_size, UINTN *cap,
+                                           UINTN *map_key, UINTN *desc_size,
+                                           UINT32 *desc_version) {
+    EFI_STATUS status = EFI_BUFFER_TOO_SMALL;
+
+    for (int tries = 0; tries < 4 && status == EFI_BUFFER_TOO_SMALL; tries++) {
+        UINTN need = 0;
+
+        status = uefi_call_wrapper(BS->GetMemoryMap, 5, &need, NULL, map_key,
+                                   desc_size, desc_version);
+        if (status != EFI_BUFFER_TOO_SMALL)
+            return EFI_ERROR(status) ? status : EFI_LOAD_ERROR;
+        if (need + BL_MMAP_SLACK * *desc_size > *cap) {
+            EFI_MEMORY_DESCRIPTOR *grown = NULL;
+            UINTN grown_cap = need + 2 * BL_MMAP_SLACK * *desc_size;
+
+            status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                       grown_cap, (VOID**)&grown);
+            if (EFI_ERROR(status))
+                return status;
+            uefi_call_wrapper(BS->FreePool, 1, *map);
+            *map = grown;
+            *cap = grown_cap;
+        }
+        *map_size = *cap;
+        status = uefi_call_wrapper(BS->GetMemoryMap, 5, map_size, *map,
+                                   map_key, desc_size, desc_version);
+    }
+    return status;
+}
+
 static void bl_efi_tables(void) {
     UINTN i = 0;
 
@@ -3143,15 +3186,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Print(L"About to exit boot services. Kernel entry: 0x%lx\r\n", elf_header->e_entry);
     Print(L"Trampoline at: 0x%lx\r\n", trampoline_addr);
 
+    // The map as it is now, after every allocation above (the page tables,
+    // the trampolines): its key is the one ExitBootServices checks, and it
+    // is the map the kernel gets.
+    status = bl_read_final_memory_map(&memory_map, &memory_map_size,
+                                      &memory_map_cap, &map_key,
+                                      &descriptor_size, &descriptor_version);
+    if (EFI_ERROR(status)) {
+        Print(L"ERROR: Could not get the final memory map: %r\r\n", status);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
+        return status;
+    }
+    bl_store_mem_info(memory_map, memory_map_size, descriptor_size, 0);
+    bl_collect_runtime(memory_map, memory_map_size, descriptor_size,
+                       descriptor_version);
+
     // Step 3: Exit boot services
     status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
     if (EFI_ERROR(status)) {
         // Try one more time in case the memory map changed: the whole
-        // buffer, since the map has grown by the allocations since.
+        // buffer, which keeps BL_MMAP_SLACK descriptors of room for what
+        // the firmware added since.  Only GetMemoryMap and
+        // ExitBootServices may be called now.
         memory_map_size = memory_map_cap;
-        uefi_call_wrapper(BS->GetMemoryMap, 5, &memory_map_size, memory_map, 
-                          &map_key, &descriptor_size, &descriptor_version);
-        status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
+        status = uefi_call_wrapper(BS->GetMemoryMap, 5, &memory_map_size,
+                                   memory_map, &map_key, &descriptor_size,
+                                   &descriptor_version);
+        if (!EFI_ERROR(status))
+            status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle,
+                                       map_key);
         if (!EFI_ERROR(status)) {
             // The map the firmware left the machine with: the kernel's
             // memory map and the runtime regions from it (memory work

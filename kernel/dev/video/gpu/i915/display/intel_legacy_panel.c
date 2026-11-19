@@ -347,7 +347,7 @@ static void vlv_power_sequencer_kick(struct lg_display *d, struct lg_output *o)
 {
 	struct pps_state *s = pps_st(d, o);
 	int pipe = s->vlv_pps_pipe;
-	int pll_enabled;
+	int pll_enabled, release_cl_override = 0;
 	uint32_t dp;
 
 	if (pipe < 0)
@@ -370,10 +370,22 @@ static void vlv_power_sequencer_kick(struct lg_display *d, struct lg_output *o)
 		dp |= DP_PIPE_SEL(pipe);
 
 	pll_enabled = !!(lg_rd(d, DPLL(d, pipe)) & DPLL_VCO_ENABLE);
-	if (!pll_enabled &&
-	    lg_vlv_force_pll_on(d, pipe, d->is_chv ? &pnl_chv_kick_dpll : &pnl_vlv_kick_dpll)) {
-		kprintf("[drm] i915: failed to force on the PLL of pipe %c\n", pipe_name(pipe));
-		return;
+	if (!pll_enabled) {
+		/* Cherryview: the pipe's PHY channel may be power gated
+		 * (dynamic power down with no lane in use); its PLL is
+		 * only reachable with the channel held on. */
+		release_cl_override = d->is_chv &&
+				      !lg_chv_phy_powergate_ch(d, lg_vlv_pipe_to_phy(d, pipe),
+							       lg_vlv_pipe_to_channel(pipe), 1);
+		if (lg_vlv_force_pll_on(d, pipe,
+					d->is_chv ? &pnl_chv_kick_dpll : &pnl_vlv_kick_dpll)) {
+			kprintf("[drm] i915: failed to force on the PLL of pipe %c\n",
+				pipe_name(pipe));
+			if (release_cl_override)
+				lg_chv_phy_powergate_ch(d, lg_vlv_pipe_to_phy(d, pipe),
+							lg_vlv_pipe_to_channel(pipe), 0);
+			return;
+		}
 	}
 
 	lg_wr(d, o->reg, dp);
@@ -383,8 +395,12 @@ static void vlv_power_sequencer_kick(struct lg_display *d, struct lg_output *o)
 	lg_wr(d, o->reg, dp & ~DP_PORT_EN);
 	lg_posting_read(d, o->reg);
 
-	if (!pll_enabled)
+	if (!pll_enabled) {
 		lg_vlv_force_pll_off(d, pipe);
+		if (release_cl_override)
+			lg_chv_phy_powergate_ch(d, lg_vlv_pipe_to_phy(d, pipe),
+						lg_vlv_pipe_to_channel(pipe), 0);
+	}
 }
 
 /* The output's sequencer; when it has none, a free one (or A), taken from

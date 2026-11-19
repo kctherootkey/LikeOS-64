@@ -33,6 +33,7 @@
 #include <kernel/dev/video/gpu/i915/i915_drv.h>
 #include <kernel/dev/video/gpu/i915/i915_gt.h>
 #include <kernel/dev/video/gpu/i915/i915_reg.h>
+#include <kernel/dev/video/gpu/i915/i915_wa_reg.h>
 
 /* the per-engine half of an entry */
 #define MOCS_LE_CACHEABILITY(v) ((uint32_t)(v) << 0) /* 0 page table, 1 uncached, 2 write-through, 3 write-back */
@@ -103,6 +104,7 @@ uint32_t i915_mocs_l3cc_value(int gen, unsigned reg)
 }
 
 static void mocs12_render_l3cc(struct i915_device *i915);
+static void mocs11_init_engine(struct i915_device *i915, struct i915_engine *e);
 
 /* Where an engine's half of the table lives. */
 static uint32_t mocs_base(const struct i915_engine *e)
@@ -131,6 +133,12 @@ void i915_mocs_init_engine(struct i915_device *i915, struct i915_engine *e)
 	if (i915->info->gen_x10 >= 120) {
 		if (e->class == 0)
 			mocs12_render_l3cc(i915);
+		return;
+	}
+	/* Gen11: the engine's own table, and the L3 half with the render
+	 * engine */
+	if (i915->info->gen_x10 >= 110) {
+		mocs11_init_engine(i915, e);
 		return;
 	}
 	if (!n || !base)
@@ -259,6 +267,17 @@ struct mocs12_entry {
 	/* HW Reserved - SW program but never use */                                       \
 	MOCS_ENTRY(63, LE_3_WB | LE_TC_1_LLC | LE_LRUM(3), L3_1_UC)
 
+/* Gen11 (Ice Lake, Elkhart Lake, Jasper Lake): each engine's own table
+ * at its own base, and the L3 half.  Reserved and unspecified entries
+ * get entry 1's values. */
+static const struct mocs12_entry icl_mocs_table[] = {
+	/* Base - Uncached (Deprecated) */
+	MOCS_ENTRY(0, LE_1_UC | LE_TC_1_LLC, L3_1_UC),
+	/* Base - L3 + LeCC:PAT (Deprecated) */
+	MOCS_ENTRY(I915_MOCS_PTE, LE_0_PAGETABLE | LE_TC_0_PAGETABLE, L3_3_WB),
+	GEN11_MOCS_ENTRIES,
+};
+
 /* Tiger Lake and Rocket Lake: fixed by contract.  Reserved and
  * unspecified entries get entry 1's values. */
 static const struct mocs12_entry tgl_mocs_table[] = {
@@ -385,6 +404,7 @@ struct mocs12_table {
 	uint8_t uc_index, wb_index, unused;
 	int control; /* the per-engine half is written (not on discrete parts) */
 	int l3cc; /* the L3 half exists (not from Xe2 on) */
+	int per_engine; /* the per-engine half is each engine's own (Gen11) */
 };
 
 #define MOCS_TABLE(t) .table = (t), .size = sizeof(t) / sizeof((t)[0])
@@ -416,6 +436,10 @@ static int mocs12_settings(const struct i915_device *i915, struct mocs12_table *
 	} else if (ip >= I915_IP(12, 0)) {
 		*t = (struct mocs12_table){ MOCS_TABLE(gen12_mocs_table), .n_entries = GEN9_NUM_MOCS_ENTRIES,
 					    .uc_index = 3, .unused = 2 };
+	} else if (ip >= I915_IP(11, 0)) {
+		*t = (struct mocs12_table){ MOCS_TABLE(icl_mocs_table), .n_entries = GEN9_NUM_MOCS_ENTRIES,
+					    .uc_index = 0, .unused = I915_MOCS_PTE };
+		t->per_engine = 1;
 	} else {
 		return 0;
 	}
@@ -467,7 +491,7 @@ void i915_mocs_init(struct i915_device *i915)
 		/* Xe2 on: the primary GT's global table has a copy per unit
 		 * and is written to all of them; the media GT's has one */
 		int mcr = !media && i915->gt_ip >= I915_IP(20, 0);
-		if (t.control)
+		if (t.control && !t.per_engine)
 			for (unsigned i = 0; i < t.n_entries; i++) {
 				if (mcr)
 					i915_mcr_write(i915, GEN12_GLOBAL_MOCS(i), mocs12_control(&t, i));
@@ -478,6 +502,40 @@ void i915_mocs_init(struct i915_device *i915)
 		if (t.l3cc)
 			mocs12_init_l3cc(i915, &t, gsi);
 	}
+}
+
+/* Gen11: where an engine's table lives -- the Gen9 bases, and Ice
+ * Lake's third video engine at a base of its own. */
+static uint32_t mocs11_base(const struct i915_engine *e)
+{
+	switch (e->class) {
+	case 0: return e->instance == 0 ? GEN9_RCS_MOCS_BASE : 0;
+	case 1: return e->instance == 0 ? GEN9_BCS_MOCS_BASE : 0;
+	case 2:
+		if (e->instance == 0)
+			return GEN9_VCS_MOCS_BASE;
+		if (e->instance == 1)
+			return GEN9_VCS_MOCS_BASE + 0x100;
+		if (e->instance == 2)
+			return GEN11_VCS2_MOCS_BASE;
+		return 0;
+	case 3: return e->instance == 0 ? GEN9_VECS_MOCS_BASE : 0;
+	default: return 0;
+	}
+}
+
+static void mocs11_init_engine(struct i915_device *i915, struct i915_engine *e)
+{
+	struct mocs12_table t;
+	uint32_t base = mocs11_base(e);
+
+	if (!mocs12_settings(i915, &t) || !t.per_engine)
+		return;
+	if (t.control && base)
+		for (unsigned i = 0; i < t.n_entries; i++)
+			i915_write32(i915, base + i * 4, mocs12_control(&t, i));
+	if (t.l3cc && e->class == 0)
+		mocs12_init_l3cc(i915, &t, 0);
 }
 
 static void mocs12_render_l3cc(struct i915_device *i915)

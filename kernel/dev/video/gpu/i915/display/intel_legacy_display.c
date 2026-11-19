@@ -1313,6 +1313,22 @@ static int plan_state(struct lg_display *d, struct drm_atomic_state *st)
 		if (rc)
 			return rc;
 	}
+	/* Ivy Bridge: a pipe kept as it is whose FDI link had to narrow for
+	 * pipe C's (FDI C takes two of FDI B's lanes) is set again with the
+	 * narrower link -- off first, so that the lanes split with both
+	 * receivers off -- rather than run on with a link it no longer has. */
+	if (d->is_ivb) {
+		for (uint32_t i = 0; i < dev->ncrtc && i < DRM_MAX_CRTCS; i++) {
+			struct plan *pl = &g_plan[i];
+			const struct lg_config *live;
+
+			if (!pl->active || pl->modeset || pl->pipe < 0 || pl->pipe >= LG_MAX_PIPES)
+				continue;
+			live = &d->pipes[pl->pipe].cfg;
+			if (pl->cfg.pipe_bpp != live->pipe_bpp || pl->cfg.fdi_lanes != live->fdi_lanes)
+				pl->modeset = 1;
+		}
+	}
 	/* dithering only where the pipe sends six bits a colour */
 	for (int p = 0; p < d->num_pipes; p++)
 		if (cfgs[p])

@@ -40,6 +40,7 @@
 #include <kernel/dev/video/gpu/i915/i915_wa_reg.h>
 #include <kernel/dev/video/gpu/i915/i915_gt.h>
 #include <kernel/dev/video/gpu/i915/i915_lrc_layout.h>
+#include <kernel/dev/video/gpu/i915/i915_lmem.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/firmware.h>
@@ -574,11 +575,39 @@ static uint32_t guc_submit_version(uint32_t fw, uint32_t vf)
 	return GUC_VER(0, 1, 0);
 }
 
+/* On a part with local memory the firmware images are DMA-loaded from
+ * there: one contiguous run the processor can reach, written through
+ * the BAR, bound uncached in the global space. */
+static struct drm_gem_object *image_to_ggtt_lmem(struct i915_device *i915, const void *data,
+						 size_t len, uint32_t *ggtt)
+{
+	uint32_t unit = i915_lmem_min_page_size(i915);
+	uint64_t size = (len + unit - 1) & ~((uint64_t)unit - 1);
+	struct drm_gem_object *o = drm_gem_alloc(&i915->drm, DRM_GEM_BO, size);
+	if (!o)
+		return NULL;
+	/* cleared, so whatever the image leaves of the last page is zero */
+	if (i915_lmem_alloc_pages(i915, o, I915_LMEM_ALLOC_CONTIGUOUS |
+					   I915_LMEM_ALLOC_CPU_ACCESS) != 0 ||
+	    i915_lmem_object_rw(i915, o, 0, (void *)data, len, 1) != 0 ||
+	    (i915->drm.drv->gem_init && i915->drm.drv->gem_init(o) != 0) ||
+	    i915_ggtt_bind_obj(i915, o, 1, ggtt) != 0) {
+		drm_gem_put(o);
+		return NULL;
+	}
+	struct i915_bo *bo = o->priv;
+	bo->ggtt = *ggtt;
+	bo->bound = 1;
+	return o;
+}
+
 /* A whole image into an object of the global space the DMA engine reads
  * from: uncached, page by page, and out of the processor's caches. */
 static struct drm_gem_object *image_to_ggtt(struct i915_device *i915, const void *data, size_t len,
 					    uint32_t *ggtt)
 {
+	if (i915_lmem_present(i915))
+		return image_to_ggtt_lmem(i915, data, len, ggtt);
 	uint64_t size = (len + 4095) & ~4095ULL;
 	struct drm_gem_object *o = i915_gem_alloc_bound(i915, size, 1, 0, ggtt);
 	if (!o)

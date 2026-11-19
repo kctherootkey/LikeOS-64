@@ -312,12 +312,28 @@ static inline int i915_vm_3lvl(const struct i915_device *i915)
 	return i915->info->gen >= 8 && i915->info->ppgtt_bits && i915->info->ppgtt_bits <= 32;
 }
 
+/* How much of a context's address space the hardware translates: 4 GB
+ * in the three-level spaces, 2^ppgtt_bits where the descriptor names a
+ * width between 32 and 48 bits (Elkhart Lake and Jasper Lake 36, DG1
+ * 47), the full four-level 2^48 otherwise.  The tables stay four-level
+ * either way. */
+static inline uint64_t i915_vm_hw_size(const struct i915_device *i915)
+{
+	uint8_t bits = i915->info->ppgtt_bits;
+
+	if (i915_vm_3lvl(i915))
+		return 1ULL << 32;
+	if (bits > 32 && bits < I915_VM_BITS)
+		return 1ULL << bits;
+	return I915_VM_SIZE;
+}
+
 /* What a client may use of an address space: all of it, less the top
  * 64 KB that the copy engine's per-context batch scribbles into
  * (Wa_16018031267, Xe_HP to Meteor Lake). */
 static inline uint64_t i915_vm_total(const struct i915_device *i915)
 {
-	uint64_t t = i915_vm_3lvl(i915) ? 1ULL << 32 : I915_VM_SIZE;
+	uint64_t t = i915_vm_hw_size(i915);
 	if (i915->gt_ip >= I915_IP(12, 55) && i915->gt_ip <= I915_IP(12, 71))
 		t -= 0x10000;
 	return t;

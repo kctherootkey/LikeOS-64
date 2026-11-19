@@ -331,6 +331,10 @@ void i915_gem_object_set_display(struct i915_device *i915, struct drm_gem_object
 
 	if (!bo || bo->caching == I915_CACHING_NONE)
 		return;
+	/* a discrete part's display reads a copy in its own memory, never
+	 * the pages of a system-memory object: one that snoops stays so */
+	if ((i915->info->flags & I915_INFO_IS_DGFX) && !bo->pat_set && !i915_lmem_object(o))
+		return;
 	bo->caching = I915_CACHING_NONE;
 	bo->pat_set = 0;
 	bo_clflush(o);
@@ -357,6 +361,20 @@ void i915_gem_object_flush_for_gpu(struct i915_device *i915, struct drm_gem_obje
 	}
 }
 
+/* The cache attribute a client's new object starts with: cached where a
+ * last-level cache is shared with the processor; on a discrete part,
+ * cached (snooped, write-back in the page attribute table) for an
+ * object in system memory, which the processor maps write-back, and
+ * uncached for one in the card's own memory; uncached elsewhere. */
+static uint32_t bo_create_caching(struct i915_device *i915, struct drm_gem_object *o)
+{
+	if (i915->info->flags & I915_INFO_HAS_LLC)
+		return I915_CACHING_CACHED;
+	if ((i915->info->flags & I915_INFO_IS_DGFX) && !i915_lmem_object(o))
+		return I915_CACHING_CACHED;
+	return I915_CACHING_NONE;
+}
+
 static struct drm_gem_object *gem_create(struct i915_device *i915, struct drm_file *fp,
 					 uint64_t size, uint32_t *handle)
 {
@@ -375,8 +393,7 @@ static struct drm_gem_object *gem_create(struct i915_device *i915, struct drm_fi
 		return NULL;
 	}
 	struct i915_bo *bo = o->priv;
-	bo->caching = (i915->info->flags & I915_INFO_HAS_LLC) ? I915_CACHING_CACHED :
-								  I915_CACHING_NONE;
+	bo->caching = bo_create_caching(i915, o);
 	bo->madv = I915_MADV_WILLNEED;
 	bo->user_size = size;
 	if (drm_gem_handle_create(fp, o, handle) != 0) {
@@ -458,8 +475,7 @@ static long gem_userptr(struct i915_device *i915, struct drm_file *fp, void *kb)
 	}
 	struct i915_bo *bo = o->priv;
 	bo->userptr = 1;
-	bo->caching = (i915->info->flags & I915_INFO_HAS_LLC) ? I915_CACHING_CACHED :
-								  I915_CACHING_NONE;
+	bo->caching = bo_create_caching(i915, o);
 	bo->madv = I915_MADV_WILLNEED;
 	bo->user_size = a->user_size;
 	if (drm_gem_handle_create(fp, o, &a->handle) != 0) {
@@ -554,8 +570,7 @@ static long gem_create_ext(struct i915_device *i915, struct drm_file *fp,
 	if (!o)
 		return err;
 	struct i915_bo *bo = o->priv;
-	bo->caching = (i915->info->flags & I915_INFO_HAS_LLC) ? I915_CACHING_CACHED :
-								  I915_CACHING_NONE;
+	bo->caching = bo_create_caching(i915, o);
 	bo->madv = I915_MADV_WILLNEED;
 	bo->user_size = a->size;
 	/* compressed from the first access: the state the pages' last user

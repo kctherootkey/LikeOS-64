@@ -428,11 +428,15 @@ void i915_read_topology(struct i915_device *i915)
 		uint32_t eu_dis = i915_read32(i915, GEN11_EU_DISABLE) &
 				  GEN11_EU_DIS_MASK;
 		unsigned eus_per_ss = 8;
+		/* Elkhart Lake and Jasper Lake have at most four subslices,
+		 * Ice Lake eight: the disable bits above that say nothing */
+		uint32_t valid_ss = (info->platform == I915_PLATFORM_ELKHARTLAKE ||
+				     info->platform == I915_PLATFORM_JASPERLAKE) ? 0xf : 0xff;
 		i915->slice_mask = s_en;
 		for (int s = 0; s < 4; s++) {
 			if (!(s_en & (1 << s)))
 				continue;
-			uint32_t ss = (~ss_dis >> (s * 8)) & 0xff;
+			uint32_t ss = (~ss_dis >> (s * 8)) & valid_ss;
 			i915->subslice_mask[s] = ss;
 			eu_total += popcount32(ss) *
 				    (eus_per_ss - popcount32(eu_dis));
@@ -819,7 +823,11 @@ static void xe2_program_pat_gt(struct i915_device *i915, int media)
 			has_pta = has_tr_pta = 1;
 		}
 	} else if (dgfx) {
-		pta = XE2_PAT(0, 0, 0, 0, 3, 0);
+		/* The page tables are in system memory, written by the
+		 * processor and flushed out of its caches; the walker's
+		 * reads go past the L3 (no stale table line kept there
+		 * after an update) and need no snoop. */
+		pta = XE2_PAT(0, 0, 0, 3, 3, 0);
 		has_pta = 1;
 	}
 	for (unsigned i = 0; i < n; i++) {

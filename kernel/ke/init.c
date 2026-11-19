@@ -135,6 +135,9 @@ __no_stack_protector void kernel_main(boot_info_t *boot_info)
 	}
 
 	g_boot_info = boot_info;
+	/* The direct map's real extent first: the console's framebuffer setup
+	 * below already asks whether the framebuffer lies inside it. */
+	mm_init_direct_map_limit(boot_info);
 	console_init((framebuffer_info_t *)&boot_info->fb_info);
 	console_init_fb_optimization();
 	system_startup(boot_info);
@@ -186,6 +189,12 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 
 	// Initialize SLAB allocator (dynamic kernel heap)
 	slab_init();
+
+	/* A framebuffer too large for the static back buffer was drawn to
+	 * directly until now: its back buffer comes from the heap, which
+	 * exists from here on.  Does nothing when it is already set up. */
+	fb_optimize_heap_ready();
+	console_init_fb_optimization();
 
 	mm_print_memory_stats();
 

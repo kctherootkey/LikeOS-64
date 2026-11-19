@@ -13,7 +13,7 @@
 //
 // The handler masks the master where there is one, reads and clears
 // every source, and hands each to its owner: user interrupts to the
-// engine's retirement, P-state events to the frequency code, the
+// engine's fences, P-state events to the frequency code, the
 // display's to intel_legacy_display_irq() (Haswell's DDI display goes to
 // the common display code in the Gen8 form it understands).  Display
 // status that lives in PIPESTAT must be cleared before IIR, so the
@@ -95,11 +95,14 @@ static inline struct i915_engine *engine_of(struct i915_device *i915, int id)
 	return (i915->gt_ready && e->present) ? e : NULL;
 }
 
+/* Interrupt context: the fences are signalled and the waiters woken;
+ * the requests (and the contexts awaiting their save) are retired by the
+ * GT worker and by the waiters, never here (see i915_engine_irq). */
 static void user_interrupt(struct i915_device *i915, int id)
 {
 	struct i915_engine *e = engine_of(i915, id);
 	if (e)
-		leg_engine_signal(e);
+		i915_engine_irq(e, GT_RENDER_USER_INTERRUPT);
 }
 
 /* ---- the error summary of gen2-4 ----------------------------------------------- */

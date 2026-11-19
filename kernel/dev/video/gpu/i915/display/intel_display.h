@@ -247,6 +247,9 @@ enum intel_power_domain {
 	 * embedded-panel transcoder pair, Tiger Lake's pipe A pair): power
 	 * wells 1 and 2. */
 	INTEL_PW_VDSC,
+	/* Haswell/Broadwell: pipe A's panel fitter (Haswell's is in the
+	 * global well, Broadwell's always on). */
+	INTEL_PW_PFIT_A,
 	INTEL_PW_COUNT
 };
 

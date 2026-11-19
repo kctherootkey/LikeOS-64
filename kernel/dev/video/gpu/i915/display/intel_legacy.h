@@ -698,6 +698,9 @@ void lg_chv_data_lane_soft_reset(struct lg_display *d, struct lg_output *o,
  * it.  lg_chv_phy_pre_pll_enable / post_pll_disable already do this. */
 void lg_chv_phy_powergate_lanes(struct lg_display *d, struct lg_output *o,
 				int override, unsigned int mask);
+/* Cherryview: a PHY channel's power-down override on (1) or off (0);
+ * returns whether it was on before. */
+int lg_chv_phy_powergate_ch(struct lg_display *d, int phy, int ch, int override);
 /* Run a pipe's PLL without the pipe (the eDP power sequencer of VLV/CHV
  * needs a clock to switch ports), and stop it again. */
 int lg_vlv_force_pll_on(struct lg_display *d, int pipe, const struct lg_dpll *dpll);

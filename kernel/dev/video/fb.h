@@ -58,6 +58,10 @@ typedef struct {
 // System initialization
 int fb_optimize_init(framebuffer_info_t *fb_info);
 void fb_optimize_shutdown(void);
+// The kernel heap is up: a back buffer too large for the static one may be
+// allocated from now on (before, fb_optimize_init leaves such a framebuffer
+// to be drawn directly).
+void fb_optimize_heap_ready(void);
 
 // Re-initialize for a new mode (runtime resolution change).  Swaps the back
 // buffer and geometry; does NOT touch MTRR/PAT write-combining (the display

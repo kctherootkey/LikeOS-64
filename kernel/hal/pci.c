@@ -433,6 +433,62 @@ static unsigned long alloc_bar64_region(unsigned long size)
 	return g_next_bar64_base;
 }
 
+/* May a BAR of `self' (index `self_bar') be placed at [base, base + size)?
+ * Not over RAM the firmware's memory map describes, not over the boot
+ * framebuffer, and not where another function's memory BAR already
+ * starts.  Only the bases of the others are
+ * known here: the boot enumeration never sizes a BAR, since sizing pauses
+ * the decode of a function that may be live (the boot display). */
+static int pci_bar_range_free(const pci_device_t *self, int self_bar,
+			      unsigned long base, unsigned long size)
+{
+	uint64_t fb_phys, fb_size;
+
+	if (mm_phys_range_is_ram(base, size))
+		return 0;
+	/* The boot framebuffer: on many machines it lies inside a graphics
+	 * aperture whose base can be far below the candidate. */
+	if (console_boot_fb_range(&fb_phys, &fb_size) == 0 && fb_size &&
+	    fb_phys < base + size && base < fb_phys + fb_size)
+		return 0;
+	for (int i = 0; i < g_pci_count; i++) {
+		const pci_device_t *d = &g_pci_devices[i];
+		int nbars;
+
+		/* A VMD domain's BARs hold bus addresses. */
+		if (d->segment >= PCI_VMD_DOMAIN_BASE)
+			continue;
+		if (d->hdr_type == PCI_HEADER_TYPE_NORMAL)
+			nbars = 6;
+		else if (d->hdr_type == PCI_HEADER_TYPE_BRIDGE)
+			nbars = 2;
+		else
+			continue;
+		for (int j = 0; j < nbars; j++) {
+			uint32_t lo = d->bar[j];
+			unsigned long addr;
+			int skip;
+
+			if (lo & 1)
+				continue; /* I/O */
+			addr = lo & ~0xFUL;
+			/* Not assigned, or the BAR being placed. */
+			skip = addr < 0x1000 || (d == self && j == self_bar);
+			if (((lo >> 1) & 3) == 2 && j + 1 < nbars) {
+				addr |= (unsigned long)d->bar[j + 1] << 32;
+				skip = addr < 0x1000 ||
+				       (d == self && j == self_bar);
+				j++; /* the upper dword is no BAR */
+			}
+			if (skip)
+				continue;
+			if (addr >= base && addr - base < size)
+				return 0;
+		}
+	}
+	return 1;
+}
+
 void pci_assign_unassigned_bars(void)
 {
 	for (int i = 0; i < g_pci_count; i++) {
@@ -519,8 +575,37 @@ void pci_assign_unassigned_bars(void)
 						((unsigned long)mask_hi << 32);
 				}
 				unsigned long size = (~size_mask + 1);
+				/* What the device decodes; `size' is the slot
+				 * it is given, which may be larger. */
+				unsigned long decode = size;
 				if (size == 0 || size > (1UL << 24)) {
-					size = 1UL << 16; /* clamp */
+					/* Address bits that do not all reach
+					 * bit 63 (a 32-bit BAR, a 64-bit one
+					 * with fewer implemented bits): the
+					 * size is the lowest set bit. */
+					unsigned long real =
+						size_mask & (~size_mask + 1);
+					if (real == 0 || real > (1UL << 24)) {
+						/* The device decodes all of
+						 * it, more than this allocator
+						 * places: leave it unassigned. */
+						kprintf("PCI: %02x:%02x.%x BAR%d of 0x%lx bytes left unassigned\n",
+							p->bus, p->device,
+							p->function, bar, real);
+						p->bar[bar] = pci_cfg_read32(
+							p->bus, p->device,
+							p->function, off);
+						if (is64 && bar < 5) {
+							p->bar[bar + 1] = 0;
+							bar++;
+						}
+						continue;
+					}
+					/* At least the 64 KB slot such BARs
+					 * have always had. */
+					size = real < (1UL << 16) ? (1UL << 16) :
+								    real;
+					decode = real;
 				}
 				/* Use 64-bit window for Intel serial bus controllers
                    (class 0x0C, subclass 0x80 — covers all LPSS I2C/UART).
@@ -531,6 +616,14 @@ void pci_assign_unassigned_bars(void)
 				unsigned long base =
 					use64 ? alloc_bar64_region(size) :
 						alloc_bar_region(size);
+				if (base &&
+				    !pci_bar_range_free(p, bar, base,
+							round_up_pow2(decode))) {
+					kprintf("PCI: %02x:%02x.%x BAR%d not placed at 0x%lx (RAM or another BAR there), left unassigned\n",
+						p->bus, p->device, p->function,
+						bar, base);
+					base = 0;
+				}
 				if (base) {
 					unsigned int low =
 						(unsigned int)((base &

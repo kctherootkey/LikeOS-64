@@ -1197,7 +1197,7 @@ void lg_vlv_power_fini(struct lg_display *d)
 
 /* Force a channel's lanes on through the override (or release it);
  * returns whether the override was on before. */
-static int chv_phy_powergate_ch(struct lg_display *d, int phy, int ch, int override)
+int lg_chv_phy_powergate_ch(struct lg_display *d, int phy, int ch, int override)
 {
 	int was_override = !!(chv_phy_control & PHY_CH_POWER_DOWN_OVRD_EN(phy, ch));
 
@@ -1783,7 +1783,7 @@ void lg_chv_phy_pre_pll_enable(struct lg_display *d, struct lg_output *o,
 	 * pipe B cannot even be reached. */
 	if (ch == VLV_DPIO_CH0 && pipe == VLV_PIPE_B && o->port >= 0 && o->port <= LG_PORT_D)
 		chv_release_cl2_override[o->port] =
-			!chv_phy_powergate_ch(d, VLV_DPIO_PHY0, VLV_DPIO_CH1, 1);
+			!lg_chv_phy_powergate_ch(d, VLV_DPIO_PHY0, VLV_DPIO_CH1, 1);
 
 	lg_chv_phy_powergate_lanes(d, o, 1, lane_mask);
 
@@ -1910,7 +1910,7 @@ void lg_chv_phy_release_cl2_override(struct lg_display *d, struct lg_output *o)
 		return;
 
 	if (chv_release_cl2_override[o->port]) {
-		chv_phy_powergate_ch(d, VLV_DPIO_PHY0, VLV_DPIO_CH1, 0);
+		lg_chv_phy_powergate_ch(d, VLV_DPIO_PHY0, VLV_DPIO_CH1, 0);
 		chv_release_cl2_override[o->port] = 0;
 	}
 }

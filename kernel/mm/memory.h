@@ -70,11 +70,18 @@ static inline uint64_t virt_to_phys(void *virt_addr)
 	return (uint64_t)virt_addr - PHYS_MAP_BASE;
 }
 
+/* Bytes of physical address space the direct map covers: what the
+ * bootloader built (RAM rounded up to whole GB), never less than the 16 GB
+ * it always maps.  Set from boot_info before the console or any allocator
+ * runs (mm_init_direct_map_limit). */
+#define DIRECT_MAP_MIN_BYTES (16ULL * 1024 * 1024 * 1024)
+extern uint64_t g_direct_map_bytes;
+
 // Check if an address is in the direct map region
 static inline bool is_direct_map_addr(uint64_t addr)
 {
 	return (addr >= PHYS_MAP_BASE) &&
-	       (addr < (PHYS_MAP_BASE + 0x400000000ULL)); // 16GB
+	       (addr - PHYS_MAP_BASE < g_direct_map_bytes);
 }
 
 /* Could this value plausibly be a pointer to a kernel object?
@@ -102,11 +109,10 @@ static inline bool kptr_plausible(uint64_t addr)
 	return is_direct_map_addr(addr);
 }
 
-// Check if a physical address is covered by the bootloader's direct map (16GB)
-#define DIRECT_MAP_LIMIT_BYTES (16ULL * 1024 * 1024 * 1024)
+// Check if a physical address is covered by the bootloader's direct map
 static inline bool is_phys_in_direct_map(uint64_t phys_addr)
 {
-	return phys_addr < DIRECT_MAP_LIMIT_BYTES;
+	return phys_addr < g_direct_map_bytes;
 }
 
 // Function to get dynamic kernel heap start address
@@ -508,6 +514,12 @@ typedef struct heap_block {
 // Physical Memory Manager
 void mm_initialize_physical_memory(uint64_t memory_size);
 void mm_initialize_from_boot_info(boot_info_t *boot_info);
+/* The direct map's extent (g_direct_map_bytes) from boot_info: the first
+ * thing the kernel does, before the console maps the framebuffer. */
+void mm_init_direct_map_limit(const boot_info_t *boot_info);
+/* Does [phys, phys + size) overlap memory the firmware's memory map
+ * describes as RAM (any type backed by memory, not MMIO or reserved)? */
+bool mm_phys_range_is_ram(uint64_t phys, uint64_t size);
 uint64_t mm_allocate_physical_page(void);
 void mm_free_physical_page(uint64_t physical_address);
 uint64_t mm_allocate_contiguous_pages(size_t page_count);
@@ -853,7 +865,15 @@ uint64_t *mm_get_page_table_from_pml4(uint64_t *pml4, uint64_t virtual_addr,
 void mm_flush_tlb(uint64_t virtual_addr);
 void mm_flush_all_tlb(void);
 
-// MMIO mapping for device BARs above the direct map (> 16GB physical)
+/* Kernel virtual window for device memory outside the direct map
+ * (mm_map_mmio, mm_map_mmio_flags): above the kernel stack pool, inside
+ * PML4[511], whose page-directory-pointer table every address space
+ * shares, so a mapping made here is seen by all of them.  Nothing else
+ * allocates from it; a request that no longer fits fails (returns 0). */
+#define MMIO_VIRT_BASE 0xFFFFFFFFA0000000ULL
+#define MMIO_VIRT_LIMIT 0xFFFFFFFFF0000000ULL /* 1.25 GB */
+
+// MMIO mapping for device BARs above the direct map
 // Maps 'num_pages' of device MMIO starting at 'phys_addr' into kernel virtual
 // address space with uncacheable (write-through + cache-disable) flags.
 // Returns the virtual address, or 0 on failure.

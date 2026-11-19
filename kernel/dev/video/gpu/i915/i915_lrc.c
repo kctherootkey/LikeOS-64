@@ -543,6 +543,12 @@ int i915_lrc_layout(unsigned gen_x10, int engine_class, struct i915_lrc_layout *
 		out->indirect_ctx = 0x1a;
 		out->indirect_ctx_off = 0x1c;
 		out->lri0_count = 14;
+		/* Gen11's render image carries the context id as the
+		 * fifteenth register of the block, where Gen8-10 pad */
+		if (gen_x10 >= 110) {
+			out->ccid = 0x1e;
+			out->lri0_count = 15;
+		}
 	} else {
 		out->lri0_count = 11;
 	}
@@ -740,6 +746,10 @@ void i915_lrc_init_regs(uint32_t *regs, const struct i915_lrc_layout *l,
 			set_reg(regs, l->indirect_ctx_off,
 				RING_INDIRECT_CTX_OFFSET(mmio_base), 0);
 		}
+		/* the context id register: its value is what the engine
+		 * saved (zero in an image never saved) */
+		if (l->ccid)
+			regs[l->ccid] = RING_CCID(mmio_base);
 	}
 	regs[l->lri1] = MI_LOAD_REGISTER_IMM(l->lri1_count) | MI_LRI_FORCE_POSTED;
 	set_reg(regs, l->timestamp, RING_CTX_TIMESTAMP(mmio_base), 0);

@@ -213,6 +213,10 @@ uint32_t i915_legacy_engine_acthd(struct i915_engine *e);
  * status processing (there is none) in the fence poll and the GT
  * worker. */
 void i915_legacy_engine_retire(struct i915_engine *e);
+/* A new object's pages, before anything binds or maps them: on 965G and
+ * 965GM moved below 4 GB (the GPU must not see memory above); 0 and
+ * nothing done on every other part and for borrowed pages. */
+int i915_legacy_obj_fix_pages(struct i915_device *i915, struct drm_gem_object *o);
 
 /* ---- interrupts (i915_legacy_irq.c) ---------------------------------------- */
 

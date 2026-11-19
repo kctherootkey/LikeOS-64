@@ -1,4 +1,4 @@
-// LikeOS -- the workarounds and tuning settings of Gen12 and later graphics.
+// LikeOS -- the workarounds and tuning settings of Gen11 and later graphics.
 //
 // Each list below is a set of register writes the hardware needs beyond
 // its reset defaults: fixes for silicon bugs (the Wa_ numbers are Intel's
@@ -67,6 +67,12 @@ static void wa_mcr_write_clr_set(struct i915_wa_list *wal, uint32_t reg, uint32_
 				 uint32_t set)
 {
 	wa_mcr_add(wal, reg, clear, set, clear | set, 0);
+}
+
+/* The whole register written. */
+static void wa_write(struct i915_wa_list *wal, uint32_t reg, uint32_t set)
+{
+	wa_write_clr_set(wal, reg, ~0u, set);
 }
 
 static void wa_write_or(struct i915_wa_list *wal, uint32_t reg, uint32_t set)
@@ -171,10 +177,16 @@ static int xelpg_a_step(const struct i915_device *i915)
 	       gt_ip_step(i915, I915_IP(12, 71), I915_STEP_A0, I915_STEP_B0);
 }
 
-/* The lists here are for graphics 12.0 up to, not including, Xe2. */
+/* Graphics version 11 (Ice Lake, Elkhart Lake, Jasper Lake). */
+static int gt_ver_11(const struct i915_device *i915)
+{
+	return i915->gt_ip >= I915_IP(11, 0) && i915->gt_ip < I915_IP(12, 0);
+}
+
+/* The lists here are for graphics 11.0 up to, not including, Xe2. */
 static int wa_lists_cover(const struct i915_device *i915)
 {
-	return i915->gt_ip >= I915_IP(12, 0) && i915->gt_ip < I915_IP(20, 0);
+	return i915->gt_ip >= I915_IP(11, 0) && i915->gt_ip < I915_IP(20, 0);
 }
 
 /*
@@ -270,6 +282,52 @@ static void wa_14011060649(struct i915_device *i915, struct i915_wa_list *wal)
 		if (base)
 			wa_write_or(wal, VDBOX_CGCTL3F10(base), IECPUNIT_CLKGATE_DIS);
 	}
+}
+
+static void icl_gt_workarounds_init(struct i915_device *i915, struct i915_wa_list *wal)
+{
+	icl_wa_init_mcr(i915, wal);
+
+	/* WaModifyGamTlbPartitioning:icl */
+	wa_write_clr_set(wal, GEN11_GACB_PERF_CTRL, GEN11_HASH_CTRL_MASK,
+			 GEN11_HASH_CTRL_BIT0 | GEN11_HASH_CTRL_BIT4);
+
+	/* Wa_1405766107:icl (formerly WaCL2SFHalfMaxAlloc) */
+	wa_write_or(wal, GEN11_LSN_UNSLCVC,
+		    GEN11_LSN_UNSLCVC_GAFS_HALF_SF_MAXALLOC |
+		    GEN11_LSN_UNSLCVC_GAFS_HALF_CL2_MAXALLOC);
+
+	/* Wa_220166154:icl (formerly WaDisCtxReload) */
+	wa_write_or(wal, GEN8_GAMW_ECO_DEV_RW_IA, GAMW_ECO_DEV_CTX_RELOAD_DISABLE);
+
+	/* Wa_1406463099:icl (formerly WaGamTlbPendError) */
+	wa_write_or(wal, GAMT_CHKN_BIT_REG, GAMT_CHKN_DISABLE_L3_COH_PIPE);
+
+	/*
+	 * Wa_1408615072:icl,ehl  (vsunit)
+	 * Wa_1407596294:icl,ehl  (hsunit)
+	 */
+	wa_write_or(wal, UNSLICE_UNIT_LEVEL_CLKGATE, VSUNIT_CLKGATE_DIS | HSUNIT_CLKGATE_DIS);
+
+	/* Wa_1407352427:icl,ehl */
+	wa_write_or(wal, UNSLICE_UNIT_LEVEL_CLKGATE2, PSDUNIT_CLKGATE_DIS);
+
+	/* Wa_1406680159:icl,ehl */
+	wa_mcr_write_or(wal, GEN11_SUBSLICE_UNIT_LEVEL_CLKGATE, GWUNIT_CLKGATE_DIS);
+
+	/* Wa_1607087056:icl,ehl,jsl */
+	if (is_platform(i915, I915_PLATFORM_ICELAKE) ||
+	    ((is_platform(i915, I915_PLATFORM_JASPERLAKE) ||
+	      is_platform(i915, I915_PLATFORM_ELKHARTLAKE)) &&
+	     i915->gt_step >= I915_STEP_A0 && i915->gt_step < I915_STEP_B0))
+		wa_write_or(wal, GEN11_SLICE_UNIT_LEVEL_CLKGATE,
+			    L3_CLKGATE_DIS | L3_CR2X_CLKGATE_DIS);
+
+	/*
+	 * Not a documented workaround but an optimisation that lowers the
+	 * sampler's power.
+	 */
+	wa_mcr_write_clr(wal, GEN10_DFR_RATIO_EN_AND_CHICKEN, DFR_DISABLE);
 }
 
 static void gen12_gt_workarounds_init(struct i915_device *i915, struct i915_wa_list *wal)
@@ -457,6 +515,8 @@ void i915_wa_gt_list(struct i915_device *i915, int media_gt, struct i915_wa_list
 		dg1_gt_workarounds_init(i915, wal);
 	else if (gt_ver_12(i915))
 		gen12_gt_workarounds_init(i915, wal);
+	else if (gt_ver_11(i915))
+		icl_gt_workarounds_init(i915, wal);
 }
 
 /* ---- the context list ------------------------------------------------------------- */
@@ -471,6 +531,40 @@ static void dg2_ctx_gt_tuning_init(struct i915_wa_list *wal)
 	wa_mcr_write_clr_set(wal, XEHP_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK,
 			     0x7f & L3_PWM_TIMER_INIT_VAL_MASK);
 	wa_mcr_write_clr_set(wal, XEHP_FF_MODE2, FF_MODE2_TDS_TIMER_MASK, FF_MODE2_TDS_TIMER_128);
+}
+
+static void icl_ctx_workarounds_init(struct i915_wa_list *wal)
+{
+	/* Wa_1406697149 (WaDisableBankHangMode:icl) */
+	wa_write(wal, GEN8_L3CNTLREG, GEN8_ERRDETBCTRL);
+
+	/*
+	 * WaForceEnableNonCoherent:icl
+	 *
+	 * Not the same workaround as on early Gen9 parts, where lacking it
+	 * could hang the system: coherency costs a lot and few compute
+	 * workloads need it (the register is whitelisted in hardware now,
+	 * so clients may opt in to coherency).
+	 */
+	wa_mcr_masked_en(wal, ICL_HDC_MODE, HDC_FORCE_NON_COHERENT);
+
+	/* WaEnableFloatBlendOptimization:icl (write-only: not read back) */
+	wa_mcr_add(wal, GEN10_CACHE_MODE_SS, 0,
+		   I915_MASKED_ENABLE(FLOAT_BLEND_OPTIMIZATION_ENABLE), 0, 1);
+
+	/* WaDisableGPGPUMidThreadPreemption:icl */
+	wa_masked_field_set(wal, GEN8_CS_CHICKEN1(RENDER_RING_BASE),
+			    GEN9_PREEMPT_GPGPU_LEVEL_MASK, GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL);
+
+	/* Headerless messages for a preemptible GPGPU context. */
+	wa_mcr_masked_en(wal, GEN10_SAMPLER_MODE, GEN11_SAMPLER_ENABLE_HEADLESS_MSG);
+
+	/* Wa_1604278689:icl,ehl */
+	wa_write(wal, IVB_FBC_RT_BASE, 0xFFFFFFFFu & ~ILK_FBC_RT_VALID);
+	wa_write_clr_set(wal, IVB_FBC_RT_BASE_UPPER, 0, 0xFFFFFFFFu);
+
+	/* Wa_1406306137:icl,ehl */
+	wa_mcr_masked_en(wal, GEN9_ROW_CHICKEN4, GEN11_DIS_PICK_2ND_EU);
 }
 
 static void gen12_ctx_workarounds_init(struct i915_device *i915, struct i915_wa_list *wal)
@@ -650,7 +744,8 @@ void i915_wa_ctx_list(struct i915_device *i915, const struct i915_engine *e,
 		return;
 
 	/* Applies to all engines. */
-	gen12_ctx_gt_fake_wa_init(i915, e, wal);
+	if (i915->gt_ip >= I915_IP(12, 0))
+		gen12_ctx_gt_fake_wa_init(i915, e, wal);
 
 	if (e->class != WA_RENDER)
 		return;
@@ -663,6 +758,8 @@ void i915_wa_ctx_list(struct i915_device *i915, const struct i915_engine *e,
 		dg1_ctx_workarounds_init(i915, wal);
 	else if (gt_ver_12(i915))
 		gen12_ctx_workarounds_init(i915, wal);
+	else if (gt_ver_11(i915))
+		icl_ctx_workarounds_init(wal);
 }
 
 /* ---- the whitelist ----------------------------------------------------------------- */
@@ -746,6 +843,46 @@ static void tgl_whitelist_build(const struct i915_engine *e, struct i915_wa_list
 	}
 }
 
+static void icl_whitelist_build(const struct i915_engine *e, struct i915_wa_list *w)
+{
+	allow_read_ctx_timestamp(e, w);
+
+	switch (e->class) {
+	case WA_RENDER:
+		/* WaAllowUMDToModifyHalfSliceChicken7:icl */
+		whitelist_mcr_reg(w, GEN9_HALF_SLICE_CHICKEN7);
+
+		/* WaAllowUMDToModifySamplerMode:icl */
+		whitelist_mcr_reg(w, GEN10_SAMPLER_MODE);
+
+		/* WaEnableStateCacheRedirectToCS:icl */
+		whitelist_reg(w, GEN9_SLICE_COMMON_ECO_CHICKEN1);
+
+		/*
+		 * WaAllowPMDepthAndInvocationCountAccessFromUMD:icl
+		 *
+		 * This covers four registers next to one another:
+		 *   - PS_INVOCATION_COUNT
+		 *   - PS_INVOCATION_COUNT_UDW
+		 *   - PS_DEPTH_COUNT
+		 *   - PS_DEPTH_COUNT_UDW
+		 */
+		whitelist_reg_ext(w, PS_INVOCATION_COUNT,
+				  RING_FORCE_TO_NONPRIV_ACCESS_RD | RING_FORCE_TO_NONPRIV_RANGE_4);
+		break;
+	case WA_VIDEO_DECODE:
+		/* hucStatusRegOffset */
+		whitelist_reg_ext(w, 0x2000 + engine_base(e), RING_FORCE_TO_NONPRIV_ACCESS_RD);
+		/* hucUKernelHdrInfoRegOffset */
+		whitelist_reg_ext(w, 0x2014 + engine_base(e), RING_FORCE_TO_NONPRIV_ACCESS_RD);
+		/* hucStatus2RegOffset */
+		whitelist_reg_ext(w, 0x23B0 + engine_base(e), RING_FORCE_TO_NONPRIV_ACCESS_RD);
+		break;
+	default:
+		break;
+	}
+}
+
 static void dg2_whitelist_build(const struct i915_engine *e, struct i915_wa_list *w)
 {
 	switch (e->class) {
@@ -790,6 +927,8 @@ void i915_wa_whitelist(struct i915_device *i915, const struct i915_engine *e,
 		dg2_whitelist_build(e, wal);
 	else if (gt_ver_12(i915))
 		tgl_whitelist_build(e, wal);
+	else if (gt_ver_11(i915))
+		icl_whitelist_build(e, wal);
 }
 
 /* ---- the engine list ---------------------------------------------------------------- */
@@ -802,6 +941,9 @@ static void engine_fake_wa_init(struct i915_device *i915, const struct i915_engi
 				struct i915_wa_list *wal)
 {
 	uint8_t mocs_w, mocs_r;
+
+	if (i915->gt_ip < I915_IP(12, 0))
+		return;
 
 	/*
 	 * RING_CMD_CCTL names the MOCS entry the command streamer uses for
@@ -902,6 +1044,41 @@ static void rcs_engine_wa_init(struct i915_device *i915, struct i915_wa_list *wa
 		wa_masked_en(wal, RING_PSMI_CTL(RENDER_RING_BASE),
 			     GEN12_WAIT_FOR_EVENT_POWER_DOWN_DISABLE |
 			     GEN8_RC_SEMA_IDLE_MSG_DISABLE);
+	}
+
+	if (gt_ver_11(i915)) {
+		/* Not a workaround: better image quality. */
+		wa_masked_en(wal, _3D_CHICKEN3, _3D_CHICKEN3_AA_LINE_QUALITY_FIX_ENABLE);
+
+		/* Wa_1405543622:icl (formerly WaGAPZPriorityScheme) */
+		wa_write_or(wal, GEN8_GARBCNTL, GEN11_ARBITRATION_PRIO_ORDER_MASK);
+
+		/* Wa_1604223664:icl (formerly WaL3BankAddressHashing) */
+		wa_write_clr_set(wal, GEN8_GARBCNTL, GEN11_HASH_CTRL_EXCL_MASK,
+				 GEN11_HASH_CTRL_EXCL_BIT0);
+		wa_write_clr_set(wal, GEN11_GLBLINVL, GEN11_BANK_HASH_ADDR_EXCL_MASK,
+				 GEN11_BANK_HASH_ADDR_EXCL_BIT0);
+
+		/* Wa_1405733216:icl (formerly WaDisableCleanEvicts) */
+		wa_mcr_write_or(wal, GEN8_L3SQCREG4, GEN11_LQSC_CLEAN_EVICT_DISABLE);
+
+		/* Wa_1606682166:icl */
+		wa_write_or(wal, GEN7_SARCHKMD, GEN7_DISABLE_SAMPLER_PREFETCH);
+
+		/* Wa_1409178092:icl */
+		wa_mcr_write_clr_set(wal, GEN11_SCRATCH2, GEN11_COHERENT_PARTIAL_WRITE_MERGE_ENABLE, 0);
+
+		/* WaEnable32PlaneMode:icl */
+		wa_masked_en(wal, GEN9_CSFE_CHICKEN1_RCS(RENDER_RING_BASE), GEN11_ENABLE_32_PLANE_MODE);
+
+		/*
+		 * Wa_1408767742:icl[a2..forever],ehl[all]
+		 * Wa_1605460711:icl[a0..c0]
+		 */
+		wa_write_or(wal, GEN7_FF_THREAD_MODE, GEN12_FF_TESSELATION_DOP_GATE_DISABLE);
+
+		/* Wa_22010271021 */
+		wa_masked_en(wal, GEN9_CS_DEBUG_MODE1, FF_DOP_CLOCK_GATE_DISABLE);
 	}
 
 	/*

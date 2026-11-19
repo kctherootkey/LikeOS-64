@@ -555,4 +555,232 @@
 #define I915_MAX_CCS 4
 #endif
 
+/* ---- Gen11 (Ice Lake, Elkhart Lake, Jasper Lake): the GT, engine and context settings. */
+#ifndef GEN11_GACB_PERF_CTRL
+#define GEN11_GACB_PERF_CTRL 0x4b80
+#endif
+#ifndef GEN11_HASH_CTRL_MASK
+#define GEN11_HASH_CTRL_MASK ((0x3u << 12) | (0xfu << 0))
+#endif
+#ifndef GEN11_HASH_CTRL_BIT0
+#define GEN11_HASH_CTRL_BIT0 (1u << 0)
+#endif
+#ifndef GEN11_HASH_CTRL_BIT4
+#define GEN11_HASH_CTRL_BIT4 (1u << 12)
+#endif
+#ifndef GEN11_LSN_UNSLCVC
+#define GEN11_LSN_UNSLCVC 0xb43c
+#endif
+#ifndef GEN11_LSN_UNSLCVC_GAFS_HALF_SF_MAXALLOC
+#define GEN11_LSN_UNSLCVC_GAFS_HALF_SF_MAXALLOC (1u << 7)
+#endif
+#ifndef GEN11_LSN_UNSLCVC_GAFS_HALF_CL2_MAXALLOC
+#define GEN11_LSN_UNSLCVC_GAFS_HALF_CL2_MAXALLOC (1u << 9)
+#endif
+#ifndef GEN8_GAMW_ECO_DEV_RW_IA
+#define GEN8_GAMW_ECO_DEV_RW_IA 0x4080
+#endif
+#ifndef GAMW_ECO_DEV_CTX_RELOAD_DISABLE
+#define GAMW_ECO_DEV_CTX_RELOAD_DISABLE (1u << 7)
+#endif
+#ifndef GAMT_CHKN_BIT_REG
+#define GAMT_CHKN_BIT_REG 0x4ab8
+#endif
+#ifndef GAMT_CHKN_DISABLE_L3_COH_PIPE
+#define GAMT_CHKN_DISABLE_L3_COH_PIPE (1u << 31)
+#endif
+#ifndef VSUNIT_CLKGATE_DIS
+#define VSUNIT_CLKGATE_DIS (1u << 3) /* UNSLICE_UNIT_LEVEL_CLKGATE */
+#endif
+#ifndef HSUNIT_CLKGATE_DIS
+#define HSUNIT_CLKGATE_DIS (1u << 8) /* UNSLICE_UNIT_LEVEL_CLKGATE */
+#endif
+#ifndef PSDUNIT_CLKGATE_DIS
+#define PSDUNIT_CLKGATE_DIS (1u << 5) /* UNSLICE_UNIT_LEVEL_CLKGATE2 */
+#endif
+#ifndef GWUNIT_CLKGATE_DIS
+#define GWUNIT_CLKGATE_DIS (1u << 16) /* GEN11_SUBSLICE_UNIT_LEVEL_CLKGATE */
+#endif
+#ifndef GEN11_SLICE_UNIT_LEVEL_CLKGATE
+#define GEN11_SLICE_UNIT_LEVEL_CLKGATE 0x94d4
+#endif
+#ifndef L3_CLKGATE_DIS
+#define L3_CLKGATE_DIS (1u << 16)
+#endif
+#ifndef L3_CR2X_CLKGATE_DIS
+#define L3_CR2X_CLKGATE_DIS (1u << 17)
+#endif
+#ifndef GEN8_L3CNTLREG
+#define GEN8_L3CNTLREG 0x7034
+#endif
+#ifndef GEN8_ERRDETBCTRL
+#define GEN8_ERRDETBCTRL (1u << 9)
+#endif
+#ifndef ICL_HDC_MODE
+#define ICL_HDC_MODE 0xe5f4 /* MCR */
+#endif
+#ifndef FLOAT_BLEND_OPTIMIZATION_ENABLE
+#define FLOAT_BLEND_OPTIMIZATION_ENABLE (1u << 4) /* GEN10_CACHE_MODE_SS */
+#endif
+#ifndef GEN11_SAMPLER_ENABLE_HEADLESS_MSG
+#define GEN11_SAMPLER_ENABLE_HEADLESS_MSG (1u << 5) /* GEN10_SAMPLER_MODE */
+#endif
+#ifndef IVB_FBC_RT_BASE
+#define IVB_FBC_RT_BASE 0x7020
+#endif
+#ifndef IVB_FBC_RT_BASE_UPPER
+#define IVB_FBC_RT_BASE_UPPER 0x7024
+#endif
+#ifndef ILK_FBC_RT_VALID
+#define ILK_FBC_RT_VALID (1u << 0)
+#endif
+#ifndef GEN11_DIS_PICK_2ND_EU
+#define GEN11_DIS_PICK_2ND_EU (1u << 7) /* GEN9_ROW_CHICKEN4 */
+#endif
+#ifndef _3D_CHICKEN3_AA_LINE_QUALITY_FIX_ENABLE
+#define _3D_CHICKEN3_AA_LINE_QUALITY_FIX_ENABLE (1u << 5)
+#endif
+#ifndef GEN11_ARBITRATION_PRIO_ORDER_MASK
+#define GEN11_ARBITRATION_PRIO_ORDER_MASK (0x3fu << 22) /* GEN8_GARBCNTL */
+#endif
+#ifndef GEN11_HASH_CTRL_EXCL_MASK
+#define GEN11_HASH_CTRL_EXCL_MASK 0x7fu /* GEN8_GARBCNTL */
+#endif
+#ifndef GEN11_HASH_CTRL_EXCL_BIT0
+#define GEN11_HASH_CTRL_EXCL_BIT0 0x1u
+#endif
+#ifndef GEN11_GLBLINVL
+#define GEN11_GLBLINVL 0xb404
+#endif
+#ifndef GEN11_BANK_HASH_ADDR_EXCL_MASK
+#define GEN11_BANK_HASH_ADDR_EXCL_MASK (0x7fu << 5)
+#endif
+#ifndef GEN11_BANK_HASH_ADDR_EXCL_BIT0
+#define GEN11_BANK_HASH_ADDR_EXCL_BIT0 (1u << 5)
+#endif
+#ifndef GEN11_LQSC_CLEAN_EVICT_DISABLE
+#define GEN11_LQSC_CLEAN_EVICT_DISABLE (1u << 6) /* GEN8_L3SQCREG4 */
+#endif
+#ifndef GEN7_SARCHKMD
+#define GEN7_SARCHKMD 0xb000
+#endif
+#ifndef GEN7_DISABLE_SAMPLER_PREFETCH
+#define GEN7_DISABLE_SAMPLER_PREFETCH (1u << 30)
+#endif
+#ifndef GEN11_SCRATCH2
+#define GEN11_SCRATCH2 0xb140 /* MCR */
+#endif
+#ifndef GEN11_COHERENT_PARTIAL_WRITE_MERGE_ENABLE
+#define GEN11_COHERENT_PARTIAL_WRITE_MERGE_ENABLE (1u << 19)
+#endif
+#ifndef GEN11_ENABLE_32_PLANE_MODE
+#define GEN11_ENABLE_32_PLANE_MODE (1u << 7) /* GEN9_CSFE_CHICKEN1_RCS */
+#endif
+#ifndef GEN9_SLICE_COMMON_ECO_CHICKEN1
+#define GEN9_SLICE_COMMON_ECO_CHICKEN1 0x731c
+#endif
+#ifndef GEN11_VCS2_MOCS_BASE
+#define GEN11_VCS2_MOCS_BASE 0x10000 /* Ice Lake's third video engine */
+#endif
+
+/* ---- Gen9 platform settings beyond Skylake's. */
+#ifndef GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION
+#define GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION (1u << 8) /* COMMON_SLICE_CHICKEN2 */
+#endif
+#ifndef GEN8_HALF_SLICE_CHICKEN1
+#define GEN8_HALF_SLICE_CHICKEN1 0xe100 /* MCR */
+#endif
+#ifndef GEN7_SBE_SS_CACHE_DISPATCH_PORT_SHARING_DISABLE
+#define GEN7_SBE_SS_CACHE_DISPATCH_PORT_SHARING_DISABLE (1u << 4)
+#endif
+#ifndef GEN9_WM_CHICKEN3
+#define GEN9_WM_CHICKEN3 0x5588
+#endif
+#ifndef GEN9_FACTOR_IN_CLR_VAL_HIZ
+#define GEN9_FACTOR_IN_CLR_VAL_HIZ (1u << 9)
+#endif
+#ifndef FF_SLICE_CS_CHICKEN2
+#define FF_SLICE_CS_CHICKEN2 0x20e4
+#endif
+#ifndef GEN9_POOLED_EU_LOAD_BALANCING_FIX_DISABLE
+#define GEN9_POOLED_EU_LOAD_BALANCING_FIX_DISABLE (1u << 10)
+#endif
+
+/* ---- Gen8 (Broadwell, Cherryview): context and clock-gating settings. */
+#ifndef INSTPM
+#define INSTPM 0x20c0
+#endif
+#ifndef INSTPM_FORCE_ORDERING
+#define INSTPM_FORCE_ORDERING (1u << 7)
+#endif
+#ifndef HDC_DONOT_FETCH_MEM_WHEN_MASKED
+#define HDC_DONOT_FETCH_MEM_WHEN_MASKED (1u << 11) /* HDC_CHICKEN0 */
+#endif
+#ifndef HDC_FENCE_DEST_SLM_DISABLE
+#define HDC_FENCE_DEST_SLM_DISABLE (1u << 14) /* HDC_CHICKEN0 */
+#endif
+#ifndef CACHE_MODE_0_GEN7
+#define CACHE_MODE_0_GEN7 0x7000
+#endif
+#ifndef HIZ_RAW_STALL_OPT_DISABLE
+#define HIZ_RAW_STALL_OPT_DISABLE (1u << 2)
+#endif
+#ifndef GEN7_GT_MODE
+#define GEN7_GT_MODE 0x7008
+#endif
+#ifndef GEN6_WIZ_HASHING
+#define GEN6_WIZ_HASHING(hi, lo) (((hi) << 9) | ((lo) << 7))
+#endif
+#ifndef GEN6_WIZ_HASHING_MASK
+#define GEN6_WIZ_HASHING_MASK GEN6_WIZ_HASHING(1, 1)
+#endif
+#ifndef GEN6_WIZ_HASHING_16x4
+#define GEN6_WIZ_HASHING_16x4 GEN6_WIZ_HASHING(1, 0)
+#endif
+#ifndef DOP_CLOCK_GATING_DISABLE
+#define DOP_CLOCK_GATING_DISABLE (1u << 0) /* GEN8_ROW_CHICKEN2 */
+#endif
+#ifndef CHV_HZ_8X8_MODE_IN_1X
+#define CHV_HZ_8X8_MODE_IN_1X (1u << 15) /* HIZ_CHICKEN */
+#endif
+#ifndef GEN6_UCGCTL1
+#define GEN6_UCGCTL1 0x9400
+#endif
+#ifndef GEN6_CSUNIT_CLOCK_GATE_DISABLE
+#define GEN6_CSUNIT_CLOCK_GATE_DISABLE (1u << 7)
+#endif
+#ifndef GEN6_EU_TCUNIT_CLOCK_GATE_DISABLE
+#define GEN6_EU_TCUNIT_CLOCK_GATE_DISABLE (1u << 16)
+#endif
+#ifndef GEN8_UCGCTL6
+#define GEN8_UCGCTL6 0x9430
+#endif
+#ifndef GEN8_SDEUNIT_CLOCK_GATE_DISABLE
+#define GEN8_SDEUNIT_CLOCK_GATE_DISABLE (1u << 14)
+#endif
+#ifndef HSW_ECOCHK_ARB_PRIO_SOL
+#define HSW_ECOCHK_ARB_PRIO_SOL (1u << 6) /* GAM_ECOCHK */
+#endif
+#ifndef GEN7_FF_VS_REF_CNT_FFME
+#define GEN7_FF_VS_REF_CNT_FFME (1u << 15) /* GEN7_FF_THREAD_MODE */
+#endif
+#ifndef GEN8_FF_DS_REF_CNT_FFME
+#define GEN8_FF_DS_REF_CNT_FFME (1u << 19)
+#endif
+#ifndef GEN7_DOP_CLOCK_GATE_ENABLE
+#define GEN7_DOP_CLOCK_GATE_ENABLE (1u << 0) /* GEN7_MISCCPCTL */
+#endif
+#ifndef GEN8_L3SQCREG1
+#define GEN8_L3SQCREG1 0xb100 /* MCR */
+#endif
+#ifndef L3_PRIO_CREDITS_MASK
+#define L3_PRIO_CREDITS_MASK ((0x1fu << 19) | (0x1fu << 14))
+#endif
+#ifndef L3_GENERAL_PRIO_CREDITS
+#define L3_GENERAL_PRIO_CREDITS(x) ((((uint32_t)(x)) >> 1) << 19)
+#endif
+#ifndef L3_HIGH_PRIO_CREDITS
+#define L3_HIGH_PRIO_CREDITS(x) ((((uint32_t)(x)) >> 1) << 14)
+#endif
+
 #endif
