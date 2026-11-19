@@ -11,7 +11,7 @@ typedef struct {
 	GtkWidget *new_btn, *clip, *paste, *edit, *trash_grp, *sep1, *sep2;
 	GtkWidget *sep_edit;
 	GtkWidget *sort, *view, *sep3;
-	GtkWidget *filter, *collection, *images, *sep4;
+	GtkWidget *filter, *collection, *images;
 	ExLocationKind kind;
 } Bar;
 
@@ -135,6 +135,147 @@ static GtkWidget *sep(void)
 	return gtk_separator_new(GTK_ORIENTATION_VERTICAL);
 }
 
+/* ---- a group that gives way ------------------------------------------------
+ *
+ * Holds two versions of one group of commands: the full one (icons and words)
+ * and a compact one (icons alone).  It asks for no width of its own -- only
+ * for the full version's width as what it would like -- and shows the full
+ * version when it gets that much, the compact one when it gets that much, and
+ * nothing when it does not.  So commands that come and go with the selection
+ * use only the room the bar has: they never widen the window or squeeze the
+ * sidebar to make room for themselves. */
+#define EX_TYPE_FIT_BIN (ex_fit_bin_get_type())
+G_DECLARE_FINAL_TYPE(ExFitBin, ex_fit_bin, EX, FIT_BIN, GtkContainer)
+
+struct _ExFitBin {
+	GtkContainer parent;
+	GtkWidget *full, *compact;
+};
+
+G_DEFINE_TYPE(ExFitBin, ex_fit_bin, GTK_TYPE_CONTAINER)
+
+static int fit_natural_width(GtkWidget *w)
+{
+	int nat = 0;
+
+	if (w && gtk_widget_get_visible(w))
+		gtk_widget_get_preferred_width(w, NULL, &nat);
+	return nat;
+}
+
+static GtkSizeRequestMode fit_request_mode(GtkWidget *w)
+{
+	(void)w;
+	return GTK_SIZE_REQUEST_CONSTANT_SIZE;
+}
+
+static void fit_preferred_width(GtkWidget *w, int *min, int *nat)
+{
+	*min = 0;
+	*nat = fit_natural_width(EX_FIT_BIN(w)->full);
+}
+
+static void fit_preferred_height(GtkWidget *w, int *min, int *nat)
+{
+	ExFitBin *f = EX_FIT_BIN(w);
+	GtkWidget *kids[2] = { f->full, f->compact };
+
+	*min = *nat = 0;
+	for (int i = 0; i < 2; i++) {
+		int m, n;
+
+		if (!kids[i] || !gtk_widget_get_visible(kids[i]))
+			continue;
+		gtk_widget_get_preferred_height(kids[i], &m, &n);
+		*min = MAX(*min, m);
+		*nat = MAX(*nat, n);
+	}
+}
+
+static void fit_size_allocate(GtkWidget *w, GtkAllocation *a)
+{
+	ExFitBin *f = EX_FIT_BIN(w);
+	int full = fit_natural_width(f->full);
+	int compact = fit_natural_width(f->compact);
+	GtkWidget *use = NULL;
+
+	gtk_widget_set_allocation(w, a);
+	if (f->full && full > 0 && a->width >= full)
+		use = f->full;
+	else if (f->compact && compact > 0 && a->width >= compact)
+		use = f->compact;
+	if (f->full)
+		gtk_widget_set_child_visible(f->full, use == f->full);
+	if (f->compact)
+		gtk_widget_set_child_visible(f->compact, use == f->compact);
+	if (use) {
+		GtkAllocation c = *a;
+
+		c.width = use == f->full ? full : compact;
+		gtk_widget_size_allocate(use, &c);
+	}
+}
+
+static void fit_forall(GtkContainer *c, gboolean internals, GtkCallback cb,
+		       gpointer data)
+{
+	ExFitBin *f = EX_FIT_BIN(c);
+	GtkWidget *full = f->full, *compact = f->compact;
+
+	(void)internals;
+	/* The callback may remove the child (destroy does). */
+	if (full)
+		cb(full, data);
+	if (compact)
+		cb(compact, data);
+}
+
+static void fit_remove(GtkContainer *c, GtkWidget *child)
+{
+	ExFitBin *f = EX_FIT_BIN(c);
+
+	if (child == f->full)
+		f->full = NULL;
+	else if (child == f->compact)
+		f->compact = NULL;
+	else
+		return;
+	gtk_widget_unparent(child);
+	gtk_widget_queue_resize(GTK_WIDGET(c));
+}
+
+static void ex_fit_bin_class_init(ExFitBinClass *k)
+{
+	GtkWidgetClass *wc = GTK_WIDGET_CLASS(k);
+	GtkContainerClass *cc = GTK_CONTAINER_CLASS(k);
+
+	wc->get_request_mode = fit_request_mode;
+	wc->get_preferred_width = fit_preferred_width;
+	wc->get_preferred_height = fit_preferred_height;
+	wc->size_allocate = fit_size_allocate;
+	cc->forall = fit_forall;
+	cc->remove = fit_remove;
+}
+
+static void ex_fit_bin_init(ExFitBin *f)
+{
+	gtk_widget_set_has_window(GTK_WIDGET(f), FALSE);
+}
+
+static GtkWidget *fit_bin_new(GtkWidget *full, GtkWidget *compact)
+{
+	ExFitBin *f = g_object_new(EX_TYPE_FIT_BIN, NULL);
+
+	f->full = full;
+	f->compact = compact;
+	gtk_widget_set_parent(full, GTK_WIDGET(f));
+	gtk_widget_set_parent(compact, GTK_WIDGET(f));
+	/* Nothing shown until the first allocation picks a version. */
+	gtk_widget_set_child_visible(full, FALSE);
+	gtk_widget_set_child_visible(compact, FALSE);
+	return GTK_WIDGET(f);
+}
+
 /* ---- the menus -------------------------------------------------------------- */
 
 static void entry(GMenu *m, const char *label, const char *action,
@@ -199,7 +340,7 @@ GtkWidget *ex_commandbar_new(void)
 {
 	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 	Bar *b = g_new0(Bar, 1);
-	GtkWidget *more, *details;
+	GtkWidget *more, *details, *full, *compact;
 	GMenuModel *m;
 
 	ex_style_add(bar, EX_CLASS_COMMANDBAR);
@@ -291,22 +432,39 @@ GtkWidget *ex_commandbar_new(void)
 	gtk_box_pack_start(GTK_BOX(bar), b->collection, FALSE, FALSE, 0);
 	g_object_unref(m);
 
-	/* A picture selected: the picture commands. */
-	b->sep4 = sep();
-	gtk_box_pack_start(GTK_BOX(bar), b->sep4, FALSE, FALSE, 0);
-	b->images = group();
-	gtk_box_pack_start(GTK_BOX(b->images),
+	/* A picture selected: the picture commands, after a hairline -- with
+	 * their words where the bar has room for them, as icons named by
+	 * their tooltips where it has room for those, and not at all where
+	 * it has neither (the right-click menu has all three). */
+	full = group();
+	gtk_box_pack_start(GTK_BOX(full), sep(), FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(full),
 			   label_button("likeos-wallpaper", "preferences-desktop-wallpaper",
 					"Set as background", "win.set-wallpaper"),
 			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(b->images),
+	gtk_box_pack_start(GTK_BOX(full),
 			   label_button("likeos-rotate-left", "object-rotate-left",
 					"Rotate left", "win.rotate-left"),
 			   FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(b->images),
+	gtk_box_pack_start(GTK_BOX(full),
 			   label_button("likeos-rotate-right", "object-rotate-right",
 					"Rotate right", "win.rotate-right"),
 			   FALSE, FALSE, 0);
+	compact = group();
+	gtk_box_pack_start(GTK_BOX(compact), sep(), FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(compact),
+			   icon_button("likeos-wallpaper", "preferences-desktop-wallpaper",
+				       "Set as background", "win.set-wallpaper"),
+			   FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(compact),
+			   icon_button("likeos-rotate-left", "object-rotate-left",
+				       "Rotate left", "win.rotate-left"),
+			   FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(compact),
+			   icon_button("likeos-rotate-right", "object-rotate-right",
+				       "Rotate right", "win.rotate-right"),
+			   FALSE, FALSE, 0);
+	b->images = fit_bin_new(full, compact);
 	gtk_box_pack_start(GTK_BOX(bar), b->images, FALSE, FALSE, 0);
 	b->sep3 = sep();
 	gtk_box_pack_start(GTK_BOX(bar), b->sep3, FALSE, FALSE, 0);
@@ -340,7 +498,6 @@ GtkWidget *ex_commandbar_new(void)
 	gtk_widget_hide(b->filter);
 	gtk_widget_hide(b->collection);
 	gtk_widget_hide(b->images);
-	gtk_widget_hide(b->sep4);
 	return bar;
 }
 
@@ -373,7 +530,6 @@ void ex_commandbar_set_kind(GtkWidget *bar, ExLocationKind kind)
 	gtk_widget_set_visible(b->filter, kind == EX_LOC_HOME);
 	gtk_widget_set_visible(b->collection, gallery);
 	gtk_widget_set_visible(b->images, FALSE);
-	gtk_widget_set_visible(b->sep4, FALSE);
 }
 
 void ex_commandbar_set_images(GtkWidget *bar, gboolean images)
@@ -382,5 +538,4 @@ void ex_commandbar_set_images(GtkWidget *bar, gboolean images)
 	gboolean on = images && b->kind != EX_LOC_TRASH;
 
 	gtk_widget_set_visible(b->images, on);
-	gtk_widget_set_visible(b->sep4, on);
 }
