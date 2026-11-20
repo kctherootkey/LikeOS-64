@@ -83,30 +83,14 @@ else
   USER_STRIP = $(STRIP)
 endif
 DD = dd
-QEMU = qemu-system-x86_64
 XORRISO = xorriso
 
-# RAM for all QEMU targets (override with e.g. QEMU_MEM=2G on the command line)
-QEMU_MEM ?= 1024M
-
-# SMP configuration for QEMU targets:
-#   NUM_CPUS=N   - set number of CPUs (default: 4)
-#   NO_SMP=1     - disable SMP entirely (omit -smp argument)
-ifdef NO_SMP
-  QEMU_SMP =
-else
-  NUM_CPUS ?= 4
-  QEMU_SMP = -smp $(NUM_CPUS)
-endif
-
 # Serial console: pass SERIAL=1 on the command line to enable kprintf mirroring
-# to COM1 and QEMU -serial stdio.  Default is off (no serial output).
+# to COM1.  Default is off (no serial output).
 ifdef SERIAL
   SERIAL_CFLAGS = -DSERIAL_ENABLED
-  QEMU_SERIAL = -serial stdio
 else
   SERIAL_CFLAGS =
-  QEMU_SERIAL =
 endif
 
 # USB serial logging: pass USB_SERIAL=1 on the command line to enable
@@ -115,15 +99,6 @@ ifeq ($(USB_SERIAL),1)
 	USB_SERIAL_CFLAGS = -DUSB_SERIAL_ENABLED
 else
 	USB_SERIAL_CFLAGS =
-endif
-
-# USB HID: pass USB_HID=1 on the command line to add USB keyboard and mouse
-# to QEMU targets (qemu-usb, qemu-usb-gdb).  Enables -device usb-kbd and
-# -device usb-mouse on the xHCI controller.  Default is off.
-ifdef USB_HID
-  QEMU_USB_HID = -device usb-kbd -device usb-mouse
-else
-  QEMU_USB_HID =
 endif
 
 # Screen size: the resolution real hardware starts in when no size has been
@@ -181,29 +156,6 @@ endif
 
 UEFI_SCREEN_CFLAGS = $(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)
 KERNEL_SCREEN_CFLAGS = $(SCREEN_PREF_CFLAGS) $(SCREEN_MAX_CFLAGS)
-
-# All QEMU run targets use the VMware SVGA II display adapter so the vmsvga2
-# kernel driver is exercised; the GOP framebuffer remains the fallback path.
-QEMU_VGA = -vga vmware
-
-# Sound for the QEMU run targets: an Intel HD Audio controller with a
-# duplex codec (the hda driver), played through the desktop's sound server.
-# The server socket is named explicitly so the targets that run QEMU under
-# sudo still reach the invoking user's session.
-#   QEMU_SOUND=hda (default) | ac97 | es1370 | none
-#   QEMU_AUDIODEV=<backend options>, e.g. QEMU_AUDIODEV=alsa or =none
-QEMU_SOUND ?= hda
-QEMU_AUDIODEV ?= pa,server=unix:/run/user/$(shell id -u)/pulse/native
-ifeq ($(QEMU_SOUND),hda)
-  QEMU_SOUND_ARGS = -audiodev $(QEMU_AUDIODEV),id=snd0 -device intel-hda,id=hda0 \
-	-device hda-duplex,bus=hda0.0,audiodev=snd0
-else ifeq ($(QEMU_SOUND),ac97)
-  QEMU_SOUND_ARGS = -audiodev $(QEMU_AUDIODEV),id=snd0 -device AC97,audiodev=snd0
-else ifeq ($(QEMU_SOUND),es1370)
-  QEMU_SOUND_ARGS = -audiodev $(QEMU_AUDIODEV),id=snd0 -device ES1370,audiodev=snd0
-else
-  QEMU_SOUND_ARGS =
-endif
 
 MKFS_FAT = mkfs.fat
 MTOOLS = mcopy
@@ -801,9 +753,6 @@ EXT4_MB      ?=
 #   make EXT4_MKFS_FEATURES=                       (also enable 64bit / 64-byte descs)
 #   make EXT4_MKFS_FEATURES=^metadata_csum,^64bit  (legacy no-csum image)
 EXT4_MKFS_FEATURES ?= ^64bit
-LINUX_USB_DIR = host/linux-usb
-LINUX_USB_BUILD_DIR = $(BUILD_DIR)/linux-usb
-LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
 
 # ---------------------------------------------------------------------------
 # Canonical userland file lists shared by the ext4 image build.
@@ -3532,320 +3481,6 @@ $(GPT_DISK): $(EXT4_STAGING_STAMP) $(ADD_USER_STAMP) \
 	$(DD) if=$(EXT4_ROOT_IMG) of=$(GPT_DISK) bs=512 seek=$$(( 2048 + $(ESP_MB) * 2048 )) conv=sparse,notrunc status=none; \
 	echo "ext4 GPT disk created: $(GPT_DISK)  (ESP=$(ESP_MB)M ext4=$${ext4_mb}M)"
 
-# Run the single ext4 GPT USB disk in QEMU (UEFI).  The firmware runs the ESP's
-# bootloader, which then loads /boot/kernel.elf from the ext4 root partition.
-qemu: $(GPT_DISK)
-	@echo "Running LikeOS from the ext4 GPT USB disk in QEMU..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
-		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# Boot the single ext4 GPT USB disk with full SLIRP networking (UEFI).
-#
-# Optional NIC selection: override the QEMU `-device` model with NIC_DEVICE,
-# e.g. `make qemu-usb NIC_DEVICE=e1000e` or `NIC_DEVICE=rtl8139`.
-# Defaults to e1000 (Intel 82540EM).
-NIC_DEVICE ?= e1000
-
-qemu-usb: $(GPT_DISK)
-	@echo "Running LikeOS from the ext4 GPT USB disk + $(NIC_DEVICE) networking..."
-	@# sudo is required so SLIRP can open a raw ICMP socket on the host;
-	@# without it, external `ping` (e.g. ping 8.8.8.8) is silently dropped
-	@# while the synthetic gateway reply (10.0.2.2) still works.
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
-		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# ---------------------------------------------------------------------------
-# SATA/AHCI targets.
-#
-# The second disk is a scratch disk for the storage tests: AHCI_DATA_DISK, a
-# sparse raw file of AHCI_DATA_MB megabytes, created blank on first use and
-# kept afterwards (delete it to start over).  With AHCI_TEST_PART=1 it is
-# created with a GPT holding one partition named "likeos-test" over the
-# whole disk -- the designated target `testlibc storage' and `disktest auto'
-# write to.  A blank disk can get that partition from inside LikeOS too:
-#   echo 'label: gpt
-#   name=likeos-test' | sfdisk /dev/sdb
-# ---------------------------------------------------------------------------
-AHCI_DATA_DISK ?= $(BUILD_DIR)/ahci-data.img
-AHCI_DATA_MB ?= 1024
-AHCI_TEST_PART ?=
-# The ISO in the ATAPI drive: the first build/*.iso, else an empty drive
-# (no medium -- the optical drive itself is what the driver has to find).
-AHCI_ISO ?= $(firstword $(wildcard $(BUILD_DIR)/*.iso))
-ifneq ($(strip $(AHCI_ISO)),)
-  QEMU_AHCI_CD = -drive if=none,id=cd0,media=cdrom,readonly=on,file=$(AHCI_ISO)
-else
-  QEMU_AHCI_CD = -drive if=none,id=cd0,media=cdrom
-endif
-
-$(AHCI_DATA_DISK): | $(BUILD_DIR)
-	truncate -s $(AHCI_DATA_MB)M $@
-	@if [ -n "$(AHCI_TEST_PART)" ]; then \
-		sgdisk -Z $@ >/dev/null 2>&1; \
-		sgdisk -n 1:2048:0 -t 1:8300 -c 1:"likeos-test" $@ >/dev/null && \
-		echo "$@: GPT with partition 1 \"likeos-test\" (scratch for the storage tests)"; \
-	else \
-		echo "$@: blank $(AHCI_DATA_MB) MB scratch disk"; \
-	fi
-
-# Boot LikeOS from a SATA disk: q35, whose ICH9 AHCI controller (00:1f.2) gets
-# the image as SATA port 0 (boot disk), the scratch disk on port 1 and an
-# ATAPI CD/DVD drive on port 2.  Root is found by partition identity on the
-# disk the bootloader came from, so the same image boots here as from USB.
-# The USB controller stays for the optional USB keyboard/mouse (USB_HID=1).
-qemu-ahci: $(GPT_DISK) $(AHCI_DATA_DISK)
-	@echo "Running LikeOS from a SATA disk (q35 ICH9 AHCI: image, scratch disk, ATAPI $(if $(strip $(AHCI_ISO)),$(AHCI_ISO),empty))..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=sata0,file=$(GPT_DISK),format=raw,readonly=off \
-		-device ide-hd,drive=sata0,bus=ide.0,bootindex=0 \
-		-drive if=none,id=sata1,file=$(AHCI_DATA_DISK),format=raw,readonly=off \
-		-device ide-hd,drive=sata1,bus=ide.1 \
-		$(QEMU_AHCI_CD) -device ide-cd,drive=cd0,bus=ide.2 \
-		$(QEMU_USB_HID) \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# The usual USB boot (as `qemu') plus a separate ICH9 AHCI controller on the
-# PCI bus with the scratch disk: SATA as a data disk next to a USB root.
-qemu-ahci-usb: $(GPT_DISK) $(AHCI_DATA_DISK)
-	@echo "Running LikeOS from the ext4 GPT USB disk + an AHCI controller with a SATA scratch disk..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
-		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
-		-device ich9-ahci,id=ahci \
-		-drive if=none,id=sata0,file=$(AHCI_DATA_DISK),format=raw,readonly=off \
-		-device ide-hd,drive=sata0,bus=ahci.0 \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# ---------------------------------------------------------------------------
-# NVMe targets.
-#
-# Like the AHCI ones: the scratch disks are sparse raw files created on first
-# use and kept afterwards (delete them to start over).  With NVME_TEST_PART=1
-# a fresh data disk gets a GPT with one partition named "likeos-test" over
-# the whole disk -- the target `testlibc nvme', `testlibc storage' and
-# `disktest auto' write to.  q35 throughout: the controllers sit on PCI
-# Express (extended configuration space through MCFG, MSI-X), each behind a
-# root port of its own.
-#
-#   qemu-nvme       USB boot (as `qemu') plus one NVMe controller with a
-#                   data namespace (NVME_DATA_DISK, NVME_DATA_MB megabytes)
-#   qemu-nvme-boot  the image itself on an NVMe namespace, booted by the
-#                   firmware from it (bootindex 0), plus the data namespace on
-#                   a second controller
-#   qemu-nvme-full  USB boot plus every NVMe feature QEMU emulates:
-#                   - nvme-subsys "likeos-subsys0" with two controllers
-#                     (multipath; flexible data placement: an endurance group
-#                     with 2 reclaim groups and 8 reclaim unit handles), and
-#                     shared namespaces on it: 1 data (512 B LBA, likeos-test
-#                     with NVME_TEST_PART=1), 2 4 KiB LBA, 3 8-byte metadata
-#                     with protection information type 1 (separate buffer),
-#                     4 scratch (TESTLIBC_NVME_SCRATCH for the installer check);
-#                     controller 0 with a 64 MiB controller memory buffer,
-#                     controller 1 with a 16 MiB persistent memory region;
-#                     NVME_MSIX vectors and NVME_IOQ I/O queue pairs each
-#                   - a third controller (outside the FDP subsystem, which
-#                     QEMU does not combine with zones) with a zoned namespace:
-#                     64 MiB zones of 60 MiB capacity, 4 KiB LBA, at most 14
-#                     open / 16 active zones (TESTLIBC_ZNS for the zone writes)
-# ---------------------------------------------------------------------------
-NVME_DATA_DISK ?= $(BUILD_DIR)/nvme-data.img
-NVME_DATA_MB ?= 1024
-NVME_TEST_PART ?=
-NVME_FULL_DIR ?= $(BUILD_DIR)/nvme-full
-NVME_MSIX ?= 17
-NVME_IOQ ?= 16
-
-# One scratch image: $(call nvme_scratch,FILE,MB,PART) -- PART non-empty puts
-# the likeos-test GPT partition on it (when NVME_TEST_PART=1).  A failed
-# partitioning removes the file again, so the next run does not take a blank
-# image for a prepared one.
-define nvme_scratch
-	rm -f $(1)
-	truncate -s $(2)M $(1)
-	@if [ -n "$(3)" ] && [ -n "$(NVME_TEST_PART)" ]; then \
-		sgdisk -Z $(1) >/dev/null 2>&1; \
-		if sgdisk -n 1:2048:0 -t 1:8300 -c 1:"likeos-test" $(1) >/dev/null; then \
-			echo "$(1): GPT with partition 1 \"likeos-test\" (scratch for the storage tests)"; \
-		else \
-			rm -f $(1); \
-			echo "$(1): partitioning failed (sgdisk), image removed" >&2; \
-			exit 1; \
-		fi; \
-	else \
-		echo "$(1): blank $(2) MB scratch disk"; \
-	fi
-endef
-
-# NVME_TEST_PART=1 on an image made without it (or whose partition is gone):
-# the images that carry the partition are made again.  Checked when the
-# variable is set only, so a plain run never touches an existing image.
-ifneq ($(NVME_TEST_PART),)
-NVME_PART_STALE := $(shell for f in $(NVME_DATA_DISK) $(NVME_FULL_DIR)/ns1-data.img; do \
-	if [ -f "$$f" ] && command -v sgdisk >/dev/null 2>&1 && \
-	   ! sgdisk -p "$$f" 2>/dev/null | grep -q likeos-test; then echo "$$f"; fi; done)
-ifneq ($(strip $(NVME_PART_STALE)),)
-$(NVME_PART_STALE): nvme-part-force
-endif
-endif
-.PHONY: nvme-part-force
-nvme-part-force:
-	@echo "NVME_TEST_PART=1: re-creating $(NVME_PART_STALE) with the likeos-test partition"
-
-$(NVME_DATA_DISK): | $(BUILD_DIR)
-	$(call nvme_scratch,$@,$(NVME_DATA_MB),part)
-
-$(NVME_FULL_DIR):
-	mkdir -p $@
-$(NVME_FULL_DIR)/ns1-data.img: | $(NVME_FULL_DIR)
-	$(call nvme_scratch,$@,1024,part)
-$(NVME_FULL_DIR)/ns2-4k.img: | $(NVME_FULL_DIR)
-	$(call nvme_scratch,$@,512,)
-$(NVME_FULL_DIR)/ns3-pi.img: | $(NVME_FULL_DIR)
-	$(call nvme_scratch,$@,256,)
-$(NVME_FULL_DIR)/ns4-scratch.img: | $(NVME_FULL_DIR)
-	$(call nvme_scratch,$@,512,)
-$(NVME_FULL_DIR)/zns.img: | $(NVME_FULL_DIR)
-	$(call nvme_scratch,$@,1024,)
-# The persistent memory region's backing file: a power of two in size.
-$(NVME_FULL_DIR)/pmr.img: | $(NVME_FULL_DIR)
-	truncate -s 16M $@
-
-NVME_FULL_DISKS = $(addprefix $(NVME_FULL_DIR)/,ns1-data.img ns2-4k.img ns3-pi.img \
-	ns4-scratch.img zns.img pmr.img)
-
-QEMU_NVME_DATA = \
-	-device pcie-root-port,id=nvmerp9,bus=pcie.0,chassis=9,slot=9 \
-	-drive if=none,id=nvmdata,file=$(NVME_DATA_DISK),format=raw,readonly=off \
-	-device nvme,id=nvme-data,bus=nvmerp9,serial=likeos-nvme-data,drive=nvmdata,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX)
-
-# USB boot plus an NVMe controller with the data namespace.
-qemu-nvme: $(GPT_DISK) $(NVME_DATA_DISK)
-	@echo "Running LikeOS from the ext4 GPT USB disk + an NVMe controller with a data namespace..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
-		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
-		$(QEMU_NVME_DATA) \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# Boot from NVMe: the image is namespace 1 of the first controller and the
-# firmware's boot device; root is found by partition identity on the disk
-# the bootloader came from, so the same image boots here as from USB.
-qemu-nvme-boot: $(GPT_DISK) $(NVME_DATA_DISK)
-	@echo "Running LikeOS from an NVMe namespace (q35, image on nvme0n1, data namespace on a second controller)..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=nvmboot,file=$(GPT_DISK),format=raw,readonly=off \
-		-device pcie-root-port,id=nvmerp8,bus=pcie.0,chassis=8,slot=8 \
-		-device nvme,id=nvme-boot,bus=nvmerp8,serial=likeos-nvme-boot,drive=nvmboot,bootindex=0 \
-		$(QEMU_NVME_DATA) \
-		$(QEMU_USB_HID) \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# USB boot plus the full NVMe feature set (see above).
-qemu-nvme-full: $(GPT_DISK) $(NVME_FULL_DISKS)
-	@echo "Running LikeOS from the ext4 GPT USB disk + an NVMe subsystem (2 controllers, FDP, CMB, PMR, 4 namespaces) + a zoned namespace..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=q35,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
-		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
-		-object memory-backend-file,id=nvmepmr,share=on,mem-path=$(NVME_FULL_DIR)/pmr.img,size=16M \
-		-device nvme-subsys,id=nvmesubsys0,nqn=likeos-subsys0,fdp=on,fdp.nruh=8,fdp.nrg=2,fdp.runs=32M \
-		-device pcie-root-port,id=nvmerp1,bus=pcie.0,chassis=1,slot=1 \
-		-device pcie-root-port,id=nvmerp2,bus=pcie.0,chassis=2,slot=2 \
-		-device pcie-root-port,id=nvmerp3,bus=pcie.0,chassis=3,slot=3 \
-		-device nvme,id=nvme0,bus=nvmerp1,serial=likeos-nvme-a,subsys=nvmesubsys0,cmb_size_mb=64,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX) \
-		-device nvme,id=nvme1,bus=nvmerp2,serial=likeos-nvme-b,subsys=nvmesubsys0,pmrdev=nvmepmr,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX) \
-		-drive if=none,id=nvmns1,file=$(NVME_FULL_DIR)/ns1-data.img,format=raw,readonly=off \
-		-device nvme-ns,drive=nvmns1,bus=nvme0,nsid=1,fdp.ruhs=0-3 \
-		-drive if=none,id=nvmns2,file=$(NVME_FULL_DIR)/ns2-4k.img,format=raw,readonly=off \
-		-device nvme-ns,drive=nvmns2,bus=nvme0,nsid=2,logical_block_size=4096,physical_block_size=4096,fdp.ruhs=4-7 \
-		-drive if=none,id=nvmns3,file=$(NVME_FULL_DIR)/ns3-pi.img,format=raw,readonly=off \
-		-device nvme-ns,drive=nvmns3,bus=nvme0,nsid=3,ms=8,mset=0,pi=1,pil=0 \
-		-drive if=none,id=nvmns4,file=$(NVME_FULL_DIR)/ns4-scratch.img,format=raw,readonly=off \
-		-device nvme-ns,drive=nvmns4,bus=nvme0,nsid=4 \
-		-device nvme,id=nvme2,bus=nvmerp3,serial=likeos-nvme-zns,max_ioqpairs=$(NVME_IOQ),msix_qsize=$(NVME_MSIX) \
-		-drive if=none,id=nvmzns,file=$(NVME_FULL_DIR)/zns.img,format=raw,readonly=off \
-		-device nvme-ns,drive=nvmzns,bus=nvme2,nsid=1,logical_block_size=4096,physical_block_size=4096,zoned=on,zoned.zone_size=64M,zoned.zone_capacity=60M,zoned.max_open=14,zoned.max_active=16 \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# Boot the ext4 GPT USB disk with GDB support and debug symbols.
-# Connect with: gdb build/kernel.elf -ex "target remote :1234"
-qemu-usb-gdb:
-	@echo "Rebuilding kernel with debug symbols (-g)..."
-	$(MAKE) clean
-	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 $(GPT_DISK)
-	@echo "Running LikeOS from the ext4 GPT USB disk + $(NIC_DEVICE) + GDB server on :1234..."
-	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	@# sudo: see qemu-usb target above (SLIRP raw ICMP socket).
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
-		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
-		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
-		-s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
-
-# Run with real USB device (like /dev/sdb) as xHCI USB mass storage - boots from USB only
-# Usage: make qemu-realusb USB_DEVICE=/dev/sdb [SERIAL=1] [NIC_DEVICE=e1000e]
-qemu-realusb:
-ifndef USB_DEVICE
-	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
-endif
-	@echo "Running LikeOS in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
-		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
-
-# Run with real USB device as xHCI USB mass storage, with GDB support and debug symbols
-# Usage: make qemu-realusb-gdb USB_DEVICE=/dev/sdb [SERIAL=1] [NIC_DEVICE=e1000e]
-# Connect with: gdb build/kernel.elf -ex "target remote :1234"
-qemu-realusb-gdb:
-ifndef USB_DEVICE
-	$(error USB_DEVICE is not set. Usage: make qemu-realusb-gdb USB_DEVICE=/dev/sdb)
-endif
-	@echo "Rebuilding kernel with debug symbols (-g)..."
-	$(MAKE) clean
-	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
-	@echo "Running LikeOS in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
-	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
-		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
-		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
-		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
-		-s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
-
-# Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
-qemu-usb-passthrough: $(GPT_DISK)
-	@echo "Running LikeOS from the ext4 GPT USB disk with host USB passthrough (if any)..."
-	@echo "Autodetecting host USB devices via lsusb (override with PASSTHROUGH_FILTER=vid:pid,vid:pid)."
-	@set -e; \
-	devices=""; \
-	if [ -n "$$PASSTHROUGH_FILTER" ]; then \
-	  OLDIFS="$$IFS"; IFS=','; set -- $$PASSTHROUGH_FILTER; IFS="$$OLDIFS"; \
-	  for spec in "$$@"; do \
-	    vid=$${spec%%:*}; pid=$${spec##*:}; \
-	    if [ -n "$$vid" ] && [ -n "$$pid" ]; then \
-	      devices="$$devices -device usb-host,vendorid=0x$${vid},productid=0x$${pid}"; \
-	    fi; \
-	  done; \
-	else \
-	  devices=$$(lsusb 2>/dev/null | awk '!/root hub/ && !/Linux Foundation/ { id=$$6; split(id,a,":"); if(length(a[1])==4 && length(a[2])==4) printf(" -device usb-host,vendorid=0x%s,productid=0x%s", a[1], a[2]); }'); \
-	fi; \
-	if [ -z "$$devices" ]; then echo "(No host USB devices selected for passthrough. Set PASSTHROUGH_FILTER=vid:pid to choose explicitly.)"; fi; \
-	echo "Passing through devices:$$devices"; \
-	set -x; \
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) $(QEMU_SOUND_ARGS) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off -device usb-storage,drive=ext4disk,bootindex=0 $$devices || echo "QEMU exited with status $$?"; \
-	set +x || true
-
 # Write the single ext4 GPT USB disk to a real USB device (like Rufus, but the
 # whole GPT layout — FAT ESP + ext4 root — is just dd'd straight over).
 # Usage: make usb-write USB_DEVICE=/dev/sdX
@@ -3901,28 +3536,6 @@ usb-write: $(GPT_DISK)
 	 fi
 	@echo "UEFI bootable USB drive created successfully on $(USB_DEVICE)"
 	@echo "The USB drive boots on UEFI systems: ESP bootloader -> ext4 /boot/kernel.elf."
-
-# Build a minimal Linux host that auto-starts LikeOS under QEMU/KVM
-linux-usb: $(GPT_DISK)
-	@echo "Building Linux host USB image with seamless LikeOS handoff..."
-	$(LINUX_USB_DIR)/create-rootfs.sh
-
-# Write the host Linux image to a USB device
-# Usage: make linux-usb-write USB_DEVICE=/dev/sdX
-linux-usb-write: linux-usb
-	@if [ -z "$(USB_DEVICE)" ]; then \
-		echo "Error: USB_DEVICE not specified. Usage: make linux-usb-write USB_DEVICE=/dev/sdX"; \
-		echo "Available devices:"; \
-		lsblk -d -o NAME,SIZE,TYPE | grep disk; \
-		exit 1; \
-	fi
-	@echo "WARNING: This will overwrite $(USB_DEVICE) with the Linux host image!"
-	@echo "Press Enter to continue or Ctrl+C to cancel..."
-	@read confirm
-	@echo "Writing $(LINUX_USB_IMAGE) to $(USB_DEVICE) (this may take a while)..."
-	@sudo dd if=$(LINUX_USB_IMAGE) of=$(USB_DEVICE) bs=4M status=progress oflag=sync
-	@sync
-	@echo "Linux host USB written to $(USB_DEVICE). The stick will boot straight into X11 and launch LikeOS inside QEMU/KVM."
 
 # Clean build files
 clean:
@@ -4249,7 +3862,7 @@ deps:
 	sudo apt update
 	# gdisk -> sgdisk, e2fsprogs -> mkfs.ext4/e2fsck, fakeroot -> root-owned ext4 -d, dosfstools -> mkfs.fat (ESP).
 	# Ubuntu names the package gnu-efi (no -dev); Debian uses gnu-efi-dev. Try both.
-	sudo apt install -y gcc nasm mtools dosfstools e2fsprogs fakeroot ovmf debootstrap parted gdisk qemu-utils qemu-system-x86 grub-efi-amd64-bin rsync || true
+	sudo apt install -y gcc nasm mtools dosfstools e2fsprogs fakeroot gdisk || true
 	sudo apt install -y gnu-efi-dev || sudo apt install -y gnu-efi
 	# X.Org port build tooling.  meson/ninja are needed by the packages that
 	# dropped autotools (pixman, libxkbcommon); libtool/gperf/xsltproc by the
@@ -4421,35 +4034,13 @@ help:
 	@echo "  kernel     - Build kernel ELF only"
 	@echo "  bootloader - Build UEFI bootloader only"
 	@echo "  usb        - Build the live USB medium (alias for the default image)"
-	@echo "  qemu       - Run the ext4 GPT USB disk in QEMU (UEFI, boots from ext4 root)"
-	@echo "  qemu-usb   - Same as qemu plus SLIRP networking (sudo, for raw ICMP ping)"
-	@echo "  qemu-usb-gdb - Same as qemu-usb but with GDB server on :1234 (rebuilds with -g)"
-	@echo "  qemu-realusb - Run QEMU with real USB device as xHCI storage (requires USB_DEVICE=/dev/sdX)"
-	@echo "  qemu-realusb-gdb - Same as qemu-realusb but with GDB server on :1234 (requires USB_DEVICE=/dev/sdX)"
-	@echo "  qemu-usb-passthrough - Run QEMU with host USB device passthrough (experimental)"
-	@echo "  qemu-ahci  - Boot from a SATA disk: q35 ICH9 AHCI with the image, a scratch disk and an ATAPI drive"
-	@echo "  qemu-ahci-usb - Same as qemu plus an AHCI controller with a SATA scratch disk"
-	@echo "  qemu-nvme  - Same as qemu (q35) plus an NVMe controller with a data namespace"
-	@echo "  qemu-nvme-boot - Boot from an NVMe namespace (q35, image on nvme0n1, bootindex 0)"
-	@echo "  qemu-nvme-full - qemu plus an NVMe subsystem (2 controllers, multipath, FDP, CMB, PMR, 4K/PI namespaces) and a zoned namespace"
 	@echo "  usb-write  - dd the ext4 GPT USB disk to a real device (requires USB_DEVICE=/dev/sdX)"
-	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"
-	@echo "  linux-usb-write - Write the host Linux image to USB (requires USB_DEVICE=/dev/sdX)"
 	@echo "  bash-manpage - Re-render res/man/bash.1 from the bash port's troff source (needs groff)"
 	@echo "  clean      - Clean build files (ports are preserved for fast incremental rebuild)"
 	@echo "  distclean  - Clean everything including ports (full rebuild next time)"
 	@echo "  deps       - Install build dependencies"
 	@echo ""
 	@echo "Environment/Options:"
-	@echo "  NUM_CPUS=N        - Set number of QEMU CPUs (default: 4)"
-	@echo "  NO_SMP=1          - Disable SMP (omit -smp argument entirely)"
-	@echo "  USB_HID=1         - Add USB keyboard and mouse to QEMU xHCI controller"
-	@echo "  AHCI_DATA_MB=N    - Size of the SATA scratch disk (build/ahci-data.img) of the qemu-ahci targets (default: 1024)"
-	@echo "  AHCI_TEST_PART=1  - Create the scratch disk with a GPT partition named likeos-test (storage write tests)"
-	@echo "  AHCI_ISO=file.iso - Medium for the ATAPI drive of qemu-ahci (default: first build/*.iso, else empty)"
-	@echo "  NVME_DATA_MB=N    - Size of the NVMe data namespace (build/nvme-data.img) of qemu-nvme* (default: 1024)"
-	@echo "  NVME_TEST_PART=1  - Create the NVMe scratch disks with a GPT partition named likeos-test"
-	@echo "  NVME_MSIX=N NVME_IOQ=N - MSI-X vectors / I/O queue pairs per NVMe controller (default: 17 / 16)"
 	@echo "  EXT4_MB=N         - Force the ext4 root partition size in MB (default: auto-size to content)"
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
 	@echo "  SCREEN_SIZE=large or unset - Real-hardware start resolution when none is saved in Display settings: sizes above 1920x1200, then 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1024x768); VMs start at 1280x800"
@@ -4476,7 +4067,7 @@ kernel: $(KERNEL_ELF)
 bootloader: $(BOOTLOADER_EFI)
 usb: $(GPT_DISK)
 
-.PHONY: all clean distclean qemu qemu-usb qemu-usb-gdb qemu-usb-passthrough qemu-ahci qemu-ahci-usb qemu-nvme qemu-nvme-boot qemu-nvme-full qemu-realusb qemu-realusb-gdb usb-write deps help kernel bootloader usb linux-usb linux-usb-write
+.PHONY: all clean distclean usb-write deps help kernel bootloader usb
 
 # Installer: libgpt, backend, GTK3 frontend, CLI, release image (user/bin/installer/installer.mk).
 include user/bin/installer/installer.mk

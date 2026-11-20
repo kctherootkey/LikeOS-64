@@ -142,7 +142,7 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
     <dt>USB stick</dt>
     <dd>The image is sized automatically to its contents (currently about 1.8 GB). Use a stick of <b>at least 4 GB; 8 GB or more is recommended</b>, because writing it grows the root filesystem to fill the whole stick, and that space is what you have for your files once LikeOS is running. A USB 3 stick makes a noticeable difference, since the entire system &mdash; X server, libraries, fonts &mdash; is read from it. <b>The stick is completely erased.</b></dd>
     <dt>Target machine</dt>
-    <dd>An x86-64 PC with <b>UEFI firmware</b> (required). LikeOS has been tested successfully on the <b>Lenovo ThinkPad P50</b> and the <b>Dell Pro 16 Plus</b> notebooks. Alternatively, a virtual machine in <b>VMware</b> or <b>VirtualBox</b>; <b>QEMU</b> works too, through legacy targets.</dd>
+    <dd>An x86-64 PC with <b>UEFI firmware</b> (required). LikeOS has been tested successfully on the <b>Lenovo ThinkPad P50</b> and the <b>Dell Pro 16 Plus</b> notebooks. Alternatively, a virtual machine in <b>VMware</b> or <b>VirtualBox</b>; <b>QEMU</b> works too, through virt-manager.</dd>
   </dl>
 </section>
 
@@ -172,7 +172,7 @@ $ sudo make deps</code></pre>
   <p>What it takes care of, so you know what to expect:</p>
   <dl class="specs">
     <dt>Kernel and image tools</dt>
-    <dd><code>gcc</code>, <code>nasm</code>, GNU-EFI (for the bootloader), <code>mtools</code>, <code>dosfstools</code>, <code>e2fsprogs</code>, <code>fakeroot</code>, <code>gdisk</code>/<code>parted</code>, and QEMU with the OVMF UEFI firmware.</dd>
+    <dd><code>gcc</code>, <code>nasm</code>, GNU-EFI (for the bootloader), <code>mtools</code>, <code>dosfstools</code>, <code>e2fsprogs</code>, <code>fakeroot</code> and <code>gdisk</code>.</dd>
     <dt>Port build tooling</dt>
     <dd><code>meson</code>, <code>ninja</code>, <code>cmake</code>, <code>libtool</code>, <code>gperf</code>, <code>xsltproc</code>, <code>bison</code>, <code>flex</code>, <code>xfonts-utils</code>, <code>shared-mime-info</code>, <code>gettext</code>, the DocBook stylesheets, <code>zstd</code> (for the Intel graphics firmware) and <code>ruby</code> (JavaScriptCore's code generators).</dd>
     <dt>Mesa's Intel driver</dt>
@@ -218,8 +218,6 @@ $ sudo make deps</code></pre>
       <tr><td><code>ports-xorg</code></td><td>&mdash;</td><td>Fetch, unpack and build the X.Org port into <code>build/xorg-sysroot</code>.</td></tr>
       <tr><td><code>ports-gtk3</code></td><td>&mdash;</td><td>Fetch, unpack and build the GTK3 port (depends on <code>ports-xorg</code>).</td></tr>
       <tr><td><code>usb-write</code></td><td>needs <code>USB_DEVICE</code></td><td>Build the image if it is not current, write it to a USB stick and grow the root filesystem to fill it. See <a href="#usb">Writing the USB stick</a>.</td></tr>
-      <tr><td><code>qemu</code>, <code>qemu-usb</code></td><td>&mdash;</td><td>Legacy: boot the image file in QEMU. See <a href="#booting">Booting</a>.</td></tr>
-      <tr><td><code>qemu-realusb</code></td><td>needs <code>USB_DEVICE</code></td><td>Boot a stick written by <code>usb-write</code> in QEMU (console only).</td></tr>
       <tr><td><code>clean</code></td><td>&mdash;</td><td>Remove build output but keep the ports and the X.Org/GTK3 sysroot, for a fast incremental rebuild.</td></tr>
       <tr><td><code>distclean</code></td><td>&mdash;</td><td>Clean everything, ports included; the next build is a full one. Downloaded tarballs are kept, so no network is needed for it.</td></tr>
       <tr><td><code>deps</code></td><td>&mdash;</td><td>Install the build dependencies (see above).</td></tr>
@@ -240,14 +238,12 @@ $ sudo make deps</code></pre>
       <tr><td><code>CRASH_VERBOSE</code></td><td><code>0</code></td><td><code>CRASH_VERBOSE=1</code>: detailed kernel and userspace crash reports (registers, decoded fault, page-table walk, mapping list) in an otherwise normal, stripped build without memory poisoning.</td></tr>
       <tr><td><code>NO_STRIP</code></td><td>unset</td><td>Keep the kernel's symbol table so a crash trace can be resolved to function names.</td></tr>
       <tr><td><code>NO_STRIP_USER</code></td><td>unset</td><td>Keep symbol tables in userspace programs and libraries, for gdb on LikeOS.</td></tr>
-      <tr><td><code>SERIAL</code></td><td>unset</td><td><code>SERIAL=1</code>: mirror the kernel log to the first serial port (COM1); the QEMU targets then show it on the terminal.</td></tr>
+      <tr><td><code>SERIAL</code></td><td>unset</td><td><code>SERIAL=1</code>: mirror the kernel log to the first serial port (COM1).</td></tr>
       <tr><td><code>USB_SERIAL</code></td><td>unset</td><td><code>USB_SERIAL=1</code>: detect a USB CDC ACM serial device on real hardware and mirror the log to it.</td></tr>
       <tr><td><code>I915_DEBUG</code></td><td><code>0</code></td><td><code>I915_DEBUG=1</code>: detailed log from the Intel graphics driver (every mode set and flip).</td></tr>
       <tr><td><code>EXT4_MB</code></td><td>auto</td><td>Force the size of the ext4 root partition in the image, in MB. By default it is sized to the content plus 50% slack. <code>usb-write</code> grows it to the stick anyway.</td></tr>
       <tr><td><code>ESP_MB</code></td><td><code>64</code></td><td>Size of the FAT EFI System Partition in MB.</td></tr>
       <tr><td><code>LIKEOS_WEBKIT_JOBS</code></td><td>from RAM</td><td>An environment variable read by the GTK3 port: the exact number of parallel WebKitGTK compile jobs, overriding the memory-based estimate.</td></tr>
-      <tr><td><code>QEMU_SOUND</code>, <code>QEMU_AUDIODEV</code></td><td><code>hda</code>, PulseAudio</td><td>QEMU targets only: the emulated sound card (<code>hda</code>, <code>ac97</code>, <code>es1370</code> or <code>none</code>), and the host back end it plays through (e.g. <code>QEMU_AUDIODEV=alsa</code>).</td></tr>
-      <tr><td><code>QEMU_MEM</code>, <code>NUM_CPUS</code>, <code>NO_SMP</code>, <code>USB_HID</code>, <code>NIC_DEVICE</code></td><td><code>1024M</code>, <code>4</code>, unset, unset, <code>e1000</code></td><td>QEMU targets only: guest memory, number of CPUs, no <code>-smp</code> at all, add a USB keyboard and mouse, and the emulated network card (e.g. <code>NIC_DEVICE=e1000e</code>).</td></tr>
     </tbody>
   </table>
   <p>Examples:</p>
@@ -291,7 +287,7 @@ $ sudo resize2fs /dev/sdX2</code></pre></div>
 
 <section class="card" id="booting">
   <h2>7. Booting LikeOS</h2>
-  <p>The supported way to run LikeOS is from a written stick: on real hardware, or in VMware or VirtualBox with the stick attached to the virtual machine. The QEMU targets still work and are handy for a quick look at the console.</p>
+  <p>The supported way to run LikeOS is from a written stick: on real hardware, or in VMware or VirtualBox with the stick attached to the virtual machine.</p>
 
   <p><b>Real hardware (UEFI USB boot).</b> Tested successfully on the <b>Lenovo ThinkPad P50</b> and the <b>Dell Pro 16 Plus</b>.</p>
   <ol class="steps">
@@ -320,11 +316,7 @@ $ sudo resize2fs /dev/sdX2</code></pre></div>
     <li>Choose an Intel PRO/1000 (e1000) or PCnet network adapter, then start the machine with the stick plugged in.</li>
   </ol>
 
-  <p><b>QEMU (legacy targets).</b> These boot the image file (or a written stick) directly. They use OVMF as the UEFI firmware, an xHCI USB controller, an e1000 network card with user-mode networking, and an Intel HD Audio controller whose sound plays through your desktop's PulseAudio (or PipeWire) server. Under QEMU, LikeOS draws on the <b>UEFI framebuffer</b>: there is no VMware SVGA support there, so the desktop runs without GPU acceleration.</p>
-  <pre class="code"><code>$ make qemu
-$ make qemu-usb
-$ make qemu-realusb USB_DEVICE=/dev/sdX</code></pre>
-  <p><code>make qemu</code> boots <code>build/likeos-ext4.img</code> as a USB stick. <code>make qemu-usb</code> does the same through <code>sudo</code>, so that <code>ping</code> to outside hosts works. <code>make qemu-realusb</code> boots a stick written by <code>usb-write</code>, which is the way to check that the stick really boots; it is console only &mdash; do not run <code>startx</code> under it, because every disk read goes to physical USB hardware through an emulated controller and X is far too slow that way. The QEMU targets give the guest 1024 MB by default; raise it with <code>QEMU_MEM=2G</code>, and add <code>SERIAL=1</code> to see the kernel log on your terminal.</p>
+  <p><b>QEMU.</b> Under QEMU, LikeOS draws on the <b>UEFI framebuffer</b>: there is no VMware SVGA support there, so the desktop runs without GPU acceleration.</p>
   <p>To run X from a real stick under QEMU, drive it through <b>virt-manager</b> with KVM. This configuration is known to work:</p>
   <ol class="steps">
     <li>Create a new virtual machine in virt-manager and select manual installation.</li>
@@ -438,7 +430,7 @@ $ make usb-write USB_DEVICE=/dev/sdX</code></pre>
     <dt><code>DEBUG=1</code></dt>
     <dd>A full debug build with symbols and kernel memory poisoning.</dd>
     <dt><code>SERIAL=1</code></dt>
-    <dd>Mirror the kernel log to the first serial port (COM1). Under the QEMU targets it appears in your terminal.</dd>
+    <dd>Mirror the kernel log to the first serial port (COM1).</dd>
     <dt><code>USB_SERIAL=1</code></dt>
     <dd>On real hardware, mirror the kernel log to a USB CDC ACM serial device.</dd>
     <dt><code>I915_DEBUG=1</code></dt>

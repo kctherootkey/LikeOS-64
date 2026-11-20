@@ -42,9 +42,9 @@ Current state
   video, Sound Blaster PCI (es1371) sound, vmxnet3 or e1000 networking.
 - VirtualBox: supported.  xHCI (USB 3) and the VMSVGA adapter, with 3D when
   enabled; ICH AC'97 sound.
-- QEMU: supported through the legacy targets.  xHCI, graphics on the UEFI
-  framebuffer (there is no VMware SVGA support under QEMU), Intel HD Audio
-  sound; KVM recommended for the desktop.
+- QEMU: supported through virt-manager with KVM (see "Booting LikeOS").
+  xHCI, graphics on the UEFI framebuffer (there is no VMware SVGA support
+  under QEMU), Intel HD Audio sound.
 - UEFI boot is required; there is no legacy BIOS boot path.
 - LikeOS runs from a USB drive, a SATA disk (AHCI) or an NVMe SSD.  Internal
   disks appear as /dev/sda, /dev/sdb ... and /dev/nvme0n1, /dev/nvme1n1 ...
@@ -746,7 +746,7 @@ Requirements
   1.8 GB, and writing it grows the root filesystem to fill the stick).  A USB 3
   stick makes a noticeable difference.  The stick is completely erased.
 - Target machine: an x86-64 PC with UEFI firmware, or a virtual machine in
-  VMware or VirtualBox; QEMU works too, through legacy targets.
+  VMware or VirtualBox; QEMU works too, through virt-manager.
 
 Getting the source
 ~~~~~~~~~~~~~~~~~~
@@ -769,7 +769,7 @@ Installing the build dependencies
 
 make deps is the requirement -- do not install the packages by hand.  Besides
 the compiler and the image tools (gcc, nasm, GNU-EFI, mtools, dosfstools,
-e2fsprogs, fakeroot, gdisk/parted, QEMU with OVMF) it installs what the X.Org
+e2fsprogs, fakeroot, gdisk) it installs what the X.Org
 and GTK3 ports need on the host (meson, ninja, cmake, libtool, gperf, xsltproc,
 bison, flex, xfonts-utils, shared-mime-info, gettext, the DocBook stylesheets,
 zstd and ruby), LLVM and clang with libclc and the SPIR-V tools for Mesa's
@@ -825,20 +825,6 @@ Make targets (make help prints the complete list):
   make usb-write USB_DEVICE=/dev/sdX
                             build the image if it is not current, write it to
                             a USB stick and grow the root filesystem to fill it
-  make qemu, make qemu-usb  legacy: boot the image file in QEMU
-  make qemu-ahci            boot the image file as a SATA disk in QEMU (q35)
-                            with a second SATA scratch disk and an ATAPI drive
-  make qemu-ahci-usb        boot as make qemu, with an AHCI controller and a
-                            SATA scratch disk added
-  make qemu-nvme            boot as make qemu (q35), with an NVMe controller
-                            and a data namespace added
-  make qemu-nvme-boot       boot the image file from an NVMe namespace (q35)
-  make qemu-nvme-full       make qemu plus an NVMe subsystem with two
-                            controllers (multipath, FDP, CMB, PMR, 4K and PI
-                            namespaces) and a zoned namespace
-  make qemu-realusb USB_DEVICE=/dev/sdX
-                            boot a stick written by usb-write in QEMU (console
-                            only)
   make clean                remove build output but keep the ports and the
                             sysroot, for a fast incremental rebuild
   make distclean            clean everything, ports included (downloaded
@@ -860,8 +846,7 @@ Build variables, passed on the make command line (they can be combined):
                             otherwise normal, stripped build
   NO_STRIP=1                keep the kernel's symbol table
   NO_STRIP_USER=1           keep symbol tables in userspace, for gdb on LikeOS
-  SERIAL=1                  mirror the kernel log to COM1 (the QEMU targets
-                            show it on the terminal)
+  SERIAL=1                  mirror the kernel log to COM1
   USB_SERIAL=1              mirror the kernel log to a USB CDC ACM serial
                             device on real hardware
                             (SERIAL and USB_SERIAL apply to a system installed
@@ -879,9 +864,6 @@ Build variables, passed on the make command line (they can be combined):
   EXT4_MB=..., ESP_MB=...   force the root / EFI System Partition sizes in MB
   LIKEOS_WEBKIT_JOBS=N      (environment) number of parallel WebKitGTK compile
                             jobs, overriding the memory-based estimate
-  QEMU_SOUND, QEMU_AUDIODEV, QEMU_MEM, NUM_CPUS, NO_SMP, USB_HID, NIC_DEVICE
-                            QEMU targets only: sound card and host back end,
-                            memory, CPUs, USB keyboard/mouse, network card
 
 Changing options needs no clean.  SCREEN_SIZE and MAX_SCREEN_SIZE rebuild just
 the bootloader and the display drivers; switching DEBUG or CRASH_VERBOSE
@@ -953,43 +935,6 @@ virtual GPU), the USB 3.0 (xHCI) controller with a device filter for your
 stick, the ICH AC97 audio controller, and an Intel PRO/1000 (e1000) or PCnet
 network adapter.
 
-QEMU (legacy targets):
-
-  make qemu
-  make qemu-usb
-  make qemu-ahci
-  make qemu-ahci-usb
-  make qemu-nvme
-  make qemu-nvme-boot
-  make qemu-nvme-full
-  make qemu-realusb USB_DEVICE=/dev/sdX
-
-These use OVMF, an xHCI controller, an e1000 card with user-mode networking
-and an Intel HD Audio controller.  LikeOS draws on the UEFI framebuffer there,
-without GPU acceleration.  make qemu boots build/likeos-ext4.img as a USB
-stick; make qemu-usb does the same through sudo, so that ping to outside hosts
-works; make qemu-realusb boots a stick written by usb-write and is console
-only -- do not run startx under it.  The guest gets 1024 MB by default; raise
-it with QEMU_MEM=2G.
-
-make qemu-ahci boots the same image from a SATA disk on the q35 machine's AHCI
-controller, with a scratch disk (build/ahci-data.img, AHCI_DATA_MB=1024) and
-an ATAPI drive holding AHCI_ISO (empty without one); make qemu-ahci-usb boots
-from USB and adds an AHCI controller with the scratch disk.  AHCI_TEST_PART=1
-creates the scratch disk with a GPT partition named likeos-test.
-
-make qemu-nvme boots from USB on q35 and adds an NVMe controller (16 I/O
-queue pairs, 17 MSI-X vectors: NVME_IOQ, NVME_MSIX) with a data namespace
-(build/nvme-data.img, NVME_DATA_MB=1024); make qemu-nvme-boot boots the image
-itself from an NVMe namespace.  make qemu-nvme-full adds an NVM subsystem with
-two controllers sharing four namespaces (multipath; a data namespace, a 4K
-LBA one, one with 8-byte metadata and protection information type 1, and a
-scratch one), flexible data placement, a controller memory buffer and a
-persistent memory region, plus a third controller with a zoned namespace;
-its disks live in build/nvme-full.  Every controller sits behind a root port
-of its own.  NVME_TEST_PART=1 creates the data namespace(s) with a GPT
-partition named likeos-test.
-
 Disks: a partition named likeos-test (or the node in TESTLIBC_DISK) is the one
 place the storage tests may write -- testlibc storage runs the block device
 tests including writes there, and disktest auto stresses it with concurrent
@@ -1005,7 +950,7 @@ checksummed I/O.  Read-only checks of every disk:
   nvme smart-log /dev/nvme0
   smartctl -a /dev/nvme0
 
-NVMe test guide (as root; make qemu-nvme NVME_TEST_PART=1, or qemu-nvme-full):
+NVMe test guide (as root):
 
   testlibc nvme             controllers, namespaces, the NVMe pass-through
                             ioctls, logs and features, zones, then -- on the
@@ -1014,8 +959,8 @@ NVMe test guide (as root; make qemu-nvme NVME_TEST_PART=1, or qemu-nvme-full):
                             and pass-through, Compare/Write Zeroes/DSM/Verify,
                             POSIX AIO, RWF_HIPRI/RWF_ATOMIC, reservations,
                             fault injection, a controller reset under load
-                            and a rescan.  TESTLIBC_ZNS=/dev/nvme2n1 (the
-                            zoned namespace of qemu-nvme-full) adds zone
+                            and a rescan.  TESTLIBC_ZNS=/dev/nvme2n1 (a
+                            zoned namespace) adds zone
                             resets and writes; TESTLIBC_NVME_SCRATCH=
                             /dev/nvme0n4 lets the installer check repartition
                             that namespace (GPT with ESP + root) and format

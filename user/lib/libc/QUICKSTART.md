@@ -447,7 +447,7 @@ The test_libc program is automatically included:
 
 ```bash
 make              # Builds kernel + libc + test_libc
-make qemu-usb     # Run in QEMU
+make usb-write USB_DEVICE=/dev/sdX   # Write the image to a USB stick
 
 # In LikeOS shell:
 # ./testlibc       # Run the test program
