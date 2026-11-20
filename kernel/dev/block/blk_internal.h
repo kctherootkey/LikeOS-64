@@ -425,6 +425,13 @@ void genhd_kick_reap(void);
  * held), then record it and refresh the device's /dev/disk links under
  * the registry mutex.  May sleep. */
 void genhd_refresh_identity(block_device_t *bdev);
+/* Publish a device event (/dev/devevents) for a disk or partition: `type'
+ * is DEVICE_EVENT_ADD, _REMOVE or _CHANGE.  An ADD or CHANGE of a device
+ * that is being deleted (or not added yet) is not published; nothing is for
+ * a hidden disk.  The _locked form with the registry mutex held, the other
+ * takes it.  Never does I/O. */
+void blk_devevent_locked(block_device_t *bdev, uint32_t type);
+void blk_devevent(block_device_t *bdev, uint32_t type);
 /* Count of whole disks currently added (sd + sr). */
 int genhd_disk_count(void);
 

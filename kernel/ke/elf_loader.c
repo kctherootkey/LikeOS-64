@@ -947,14 +947,26 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 {
 	if (!path || !out_stack_ptr)
 		return 0;
-	task_t *cur = sched_current();
-	if (!cur)
-		return 0;
 
 	vfs_file_t *file = NULL;
 	int ret = vfs_open(path, 0, &file);
 	if (ret || !file)
 		return 0;
+	return elf_exec_replace_file(file, argv, envp, out_stack_ptr, newcred);
+}
+
+uint64_t elf_exec_replace_file(vfs_file_t *file, char *const argv[],
+			       char *const envp[], uint64_t *out_stack_ptr,
+			       const cred_t *newcred)
+{
+	if (!file)
+		return 0;
+	task_t *cur = sched_current();
+	if (!out_stack_ptr || !cur) {
+		vfs_close(file);
+		return 0;
+	}
+	int ret;
 
 	uint64_t *old = cur->pml4;
 	uint64_t *pml4 = mm_create_user_address_space();

@@ -50,6 +50,7 @@
 
 #include <kernel/dev/block/blkdev.h>
 #include <kernel/dev/block/blk_internal.h>
+#include <kernel/fs/devevent.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
@@ -1331,6 +1332,7 @@ void blk_partition_remove_locked(struct blk_partition *p)
 		blk_sysfs_remove_partition_locked(p);
 	}
 	block_unregister(b);
+	blk_devevent_locked(b, DEVICE_EVENT_REMOVE);
 	if (disk->part[p->partno] == p)
 		disk->part[p->partno] = NULL;
 	if (b->major == BLK_EXT_MAJOR)
@@ -1452,6 +1454,7 @@ int blk_partition_scan(struct gendisk *disk)
 	/* 3. Each partition's filesystem identity: I/O again, unlocked. */
 	for (int i = 0; i < nmade; i++) {
 		genhd_refresh_identity(&made[i]->bdev);
+		blk_devevent(&made[i]->bdev, DEVICE_EVENT_ADD);
 		blk_bdev_put(&made[i]->bdev);
 	}
 	kfree(made);
@@ -1499,6 +1502,8 @@ int blk_partition_rescan(struct gendisk *disk)
 	rc = blk_partition_scan(disk);
 	/* The whole disk's identity may have changed with the table. */
 	genhd_refresh_identity(&disk->bdev);
+	/* The old table is gone in any case: the disk changed. */
+	blk_devevent(&disk->bdev, DEVICE_EVENT_CHANGE);
 	disk_put(disk);
 	return rc;
 }
@@ -1567,6 +1572,8 @@ int blk_partition_add(struct gendisk *disk, int partno, uint64_t start_lba,
 	blk_bdev_get(&p->bdev);
 	blk_mutex_unlock(&g_disk_registry_mutex);
 	genhd_refresh_identity(&p->bdev);
+	blk_devevent(&p->bdev, DEVICE_EVENT_ADD);
+	blk_devevent(&disk->bdev, DEVICE_EVENT_CHANGE);
 	blk_bdev_put(&p->bdev);
 	return 0;
 out:
@@ -1597,6 +1604,7 @@ int blk_partition_del(struct gendisk *disk, int partno)
 	kprintf(BLK_LOG_PREFIX "%s: partition %s deleted\n", disk->disk_name,
 		p->dev_name);
 	blk_partition_remove_locked(p);
+	blk_devevent_locked(&disk->bdev, DEVICE_EVENT_CHANGE);
 out:
 	blk_mutex_unlock(&g_disk_registry_mutex);
 	return rc;

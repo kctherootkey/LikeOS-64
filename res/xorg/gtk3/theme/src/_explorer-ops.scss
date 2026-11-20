@@ -329,6 +329,36 @@ dialog.ex-properties {
   label.ex-settings-detail { font-size: $type-caption + 0.5pt; }
   separator.ex-settings-separator { min-height: 1px; background-color: $color-separator; }
 
+  // A drive's properties: the figures in two columns, the short one in
+  // the secondary colour, and the ring with the drive's name under it.
+  label.ex-drive-short { min-width: 64px; color: $color-text-secondary; }
+  .ex-drive-chart { margin-top: $space-m; }
+  label.ex-drive-name { font-weight: $weight-strong; }
+
+  // Formatting: the choices in a card, "Restore device defaults" under
+  // them, the progress as a slim accent bar with a line of status.
+  &.ex-format combobox { min-width: 220px; }
+  button.ex-format-restore { min-height: 26px; padding: 0 $space-m; }
+  progressbar.ex-format-progress {
+    margin-top: $space-xs;
+    &.horizontal trough, trough {
+      min-height: 6px;
+      border: none;
+      border-radius: 3px;
+      background-color: $ops-bar-trough;
+      background-image: none;
+    }
+    progress {
+      min-height: 6px;
+      border: none;
+      border-radius: 3px;
+      background-color: $ops-bar;
+      background-image: none;
+    }
+  }
+  label.ex-format-status { min-height: 18px; }
+  label.ex-format-label-note { color: $color-critical; font-size: $type-caption + 0.5pt; }
+
   .dialog-action-box {
     margin: 0;
     padding: $space-m $space-xl;

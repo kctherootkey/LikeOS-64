@@ -15,12 +15,14 @@
 #include "ui/ex-style.h"
 #include "ui/widgets/lx-breadcrumb.h"
 #include "ui/widgets/lx-segmented.h"
+#include "backend/ex-devd.h"
 #include "backend/ex-dir-loader.h"
 #include "backend/ex-monitor.h"
 #include "backend/ex-search.h"
 #include "backend/ex-thumbs.h"
 #include "backend/ex-trash.h"
 #include "backend/ex-util.h"
+#include "backend/ex-volumes.h"
 #include "services/ex-settings.h"
 #include "services/ex-undo.h"
 
@@ -46,7 +48,7 @@ struct _ExTab {
 	GtkWidget *back, *fwd, *up, *crumb, *search_entry;
 	GtkWidget *cmdbar, *outer, *sidebar, *column, *inner, *stack;
 	GtkWidget *home, *computer, *gallery, *view, *view_overlay, *empty_label;
-	GtkWidget *msg_box, *msg_label;
+	GtkWidget *msg_box, *msg_label, *msg_icon, *msg_button;
 	GtkWidget *right;
 	GtkWidget *st_count, *st_sep1, *st_sel, *st_sep2, *spinner, *seg;
 
@@ -54,6 +56,13 @@ struct _ExTab {
 	gboolean searching_replaces; /* the search entry edits the search */
 	gboolean loading;
 	gboolean dead;
+	/* A USB drive being opened (EX_LOC_DEVICE): a mount asked for, and
+	 * the drive whose mount failed (its message stays until the tab
+	 * goes elsewhere). */
+	gboolean mounting;
+	char *mount_failed;
+	guint device_idle;
+	ExLocation *device_to; /* the drive's folder, to go to when idle */
 };
 
 /* ---- small things -------------------------------------------------------- */
@@ -129,7 +138,7 @@ static void update_status(ExTab *t)
 	guint s = ex_selection_count(t->sel);
 	char *a, *b = NULL;
 
-	if (k == EX_LOC_HOME || k == EX_LOC_COMPUTER ||
+	if (k == EX_LOC_HOME || k == EX_LOC_COMPUTER || k == EX_LOC_DEVICE ||
 	    (k == EX_LOC_GALLERY &&
 	     ex_gallery_page_loading(EX_GALLERY_PAGE(t->gallery))))
 		a = g_strdup("");
@@ -455,13 +464,33 @@ static void stop_everything(ExTab *t)
 		g_clear_object(&t->search);
 	}
 	g_clear_object(&t->folder_info);
+	if (t->device_idle) {
+		g_source_remove(t->device_idle);
+		t->device_idle = 0;
+	}
+	g_clear_pointer(&t->device_to, ex_location_unref);
+	t->mounting = FALSE;
+}
+
+/* A message instead of items: `icon' over the text, and Format… under it
+ * when `format_id' names the drive to format. */
+static void show_note(ExTab *t, const char *icon, const char *text,
+		      const char *format_id, gboolean loading)
+{
+	gtk_image_set_from_icon_name(GTK_IMAGE(t->msg_icon), icon,
+				     GTK_ICON_SIZE_DIALOG);
+	gtk_label_set_text(GTK_LABEL(t->msg_label), text);
+	if (format_id)
+		gtk_actionable_set_action_target(GTK_ACTIONABLE(t->msg_button), "s",
+						 format_id);
+	gtk_widget_set_visible(t->msg_button, format_id != NULL);
+	gtk_stack_set_visible_child(GTK_STACK(t->stack), t->msg_box);
+	set_loading(t, loading);
 }
 
 static void show_message(ExTab *t, const char *text)
 {
-	gtk_label_set_text(GTK_LABEL(t->msg_label), text);
-	gtk_stack_set_visible_child(GTK_STACK(t->stack), t->msg_box);
-	set_loading(t, FALSE);
+	show_note(t, "dialog-warning", text, NULL, FALSE);
 }
 
 static void reselect(ExTab *t)
@@ -846,6 +875,162 @@ static void set_search_hint(ExTab *t, ExLocation *loc)
 	g_free(name);
 }
 
+/* ---- a USB drive not opened yet -------------------------------------------------- */
+
+static gboolean go_device_folder(gpointer data)
+{
+	ExTab *t = data;
+	ExLocation *to = t->device_to;
+
+	t->device_idle = 0;
+	t->device_to = NULL;
+	if (to) {
+		ex_navigator_replace(t->nav, to);
+		ex_location_unref(to);
+	}
+	return G_SOURCE_REMOVE;
+}
+
+/* The drive is mounted at `root': the tab shows that folder instead (from
+ * the main loop, never inside the load that found it). */
+static void open_device_folder(ExTab *t, GFile *root)
+{
+	g_clear_pointer(&t->device_to, ex_location_unref);
+	t->device_to = ex_location_new_folder(root);
+	if (!t->device_idle)
+		t->device_idle = g_idle_add(go_device_folder, t);
+}
+
+typedef struct {
+	ExTab *t;
+	GCancellable *cancel; /* the tab's, for this place */
+	char *device;
+} MountReq;
+
+static void device_mounted(GObject *src, GAsyncResult *res, gpointer data)
+{
+	MountReq *m = data;
+	GError *e = NULL;
+	char *path = ex_devd_mount_finish(EX_DEVD(src), res, &e);
+
+	if (!g_cancellable_is_cancelled(m->cancel)) {
+		ExTab *t = m->t;
+
+		t->mounting = FALSE;
+		if (path) {
+			GFile *root = g_file_new_for_path(path);
+
+			open_device_folder(t, root);
+			g_object_unref(root);
+		} else {
+			const ExVolume *v = ex_volumes_find_device(
+				ex_volumes_get_default(), m->device);
+			char *msg = g_strdup_printf("%s could not be opened.\n\n%s",
+						    v ? v->name : EX_USB_DRIVE_NAME,
+						    e->message);
+
+			g_free(t->mount_failed);
+			t->mount_failed = g_strdup(m->device);
+			show_message(t, msg);
+			g_free(msg);
+		}
+	}
+	g_clear_error(&e);
+	g_free(path);
+	g_object_unref(m->cancel);
+	g_free(m->device);
+	g_free(m);
+}
+
+/* Opening a drive: its folder when it is mounted, else mounted first; a
+ * filesystem LikeOS cannot open gets a message with Format… instead.
+ * Run again whenever the drives change, so the page follows the drive. */
+static void load_device(ExTab *t)
+{
+	ExLocation *loc = ex_tab_location(t);
+	const char *dev = ex_location_device(loc);
+	const ExVolume *v = ex_volumes_find_device(ex_volumes_get_default(), dev);
+	ExDevd *devd = ex_devd_get_default();
+	MountReq *m;
+	char *msg;
+
+	if (t->mounting || t->device_to)
+		return;
+	if (t->mount_failed && strcmp(t->mount_failed, dev) == 0)
+		return;
+	if (!v) {
+		show_message(t, ex_devd_is_connected(devd) ?
+					"This drive is no longer connected." :
+					"The device service is not running, so "
+					"this drive can't be opened.");
+		return;
+	}
+	if (v->root) {
+		open_device_folder(t, v->root);
+		return;
+	}
+	if (strcmp(v->state, "formatting") == 0) {
+		msg = g_strdup_printf("%s is being formatted.", v->name);
+		show_note(t, v->icon_name, msg, NULL, TRUE);
+		g_free(msg);
+		return;
+	}
+	if (!v->supported) {
+		char *fs = ex_devd_volume_fs_name(devd, v->fs_type,
+						  v->supported);
+
+		msg = strcmp(fs, "Unknown") == 0 ?
+			      g_strdup_printf("%s uses a file system LikeOS "
+					      "can't open.",
+					      v->name) :
+			      g_strdup_printf("%s uses a file system LikeOS "
+					      "can't open (%s).",
+					      v->name, fs);
+		show_note(t, "dialog-warning", msg, ex_location_id(loc), FALSE);
+		g_free(msg);
+		g_free(fs);
+		return;
+	}
+	m = g_new0(MountReq, 1);
+	m->t = t;
+	m->cancel = g_object_ref(t->cancel);
+	m->device = g_strdup(dev);
+	t->mounting = TRUE;
+	msg = g_strdup_printf("Opening %s…", v->name);
+	show_note(t, v->icon_name, msg, NULL, TRUE);
+	g_free(msg);
+	ex_devd_mount_async(devd, dev, t->cancel, device_mounted, m);
+}
+
+static void volumes_changed(ExVolumes *vols, ExTab *t)
+{
+	if (ex_location_kind(ex_tab_location(t)) == EX_LOC_DEVICE) {
+		update_title(t);
+		load_device(t);
+	}
+}
+
+/* A drive went (or was ejected): a tab inside it goes to Computer. */
+static void volume_removed(ExVolumes *vols, GFile *root, const char *device,
+			   ExTab *t)
+{
+	ExLocation *loc = ex_tab_location(t);
+	GFile *f = ex_location_file(loc);
+	gboolean away = FALSE;
+
+	if (root && f && (g_file_equal(f, root) || g_file_has_prefix(f, root)))
+		away = TRUE;
+	if (device && ex_location_kind(loc) == EX_LOC_DEVICE &&
+	    strcmp(ex_location_device(loc), device) == 0)
+		away = TRUE;
+	if (away) {
+		ExLocation *c = ex_location_new_special(EX_LOC_COMPUTER);
+
+		ex_navigator_replace(t->nav, c);
+		ex_location_unref(c);
+	}
+}
+
 static void load_location(ExTab *t)
 {
 	ExLocation *loc = ex_tab_location(t);
@@ -911,6 +1096,12 @@ static void load_location(ExTab *t)
 		break;
 	case EX_LOC_SEARCH:
 		load_search(t, loc);
+		break;
+	case EX_LOC_DEVICE:
+		g_clear_object(&t->model);
+		ex_file_view_set_model(EX_FILE_VIEW(t->view), NULL);
+		g_clear_pointer(&t->mount_failed, g_free);
+		load_device(t);
 		break;
 	case EX_LOC_FOLDER:
 	default:
@@ -1741,8 +1932,10 @@ static GtkWidget *build_statusbar(ExTab *t)
 static void root_destroyed(GtkWidget *w, ExTab *t)
 {
 	t->dead = TRUE;
+	g_signal_handlers_disconnect_by_data(ex_volumes_get_default(), t);
 	stop_everything(t);
 	g_clear_object(&t->cancel);
+	g_free(t->mount_failed);
 	g_signal_handlers_disconnect_by_data(t->nav, t);
 	g_signal_handlers_disconnect_by_data(t->sel, t);
 	if (t->model)
@@ -1825,11 +2018,18 @@ ExTab *ex_tab_new(ExWindow *win, ExLocation *loc)
 	gtk_label_set_line_wrap(GTK_LABEL(t->msg_label), TRUE);
 	gtk_label_set_justify(GTK_LABEL(t->msg_label), GTK_JUSTIFY_CENTER);
 	gtk_widget_set_valign(t->msg_box, GTK_ALIGN_CENTER);
-	gtk_box_pack_start(GTK_BOX(t->msg_box),
-			   gtk_image_new_from_icon_name("dialog-warning",
-							GTK_ICON_SIZE_DIALOG),
-			   FALSE, FALSE, 0);
+	t->msg_icon = gtk_image_new_from_icon_name("dialog-warning",
+						   GTK_ICON_SIZE_DIALOG);
+	gtk_box_pack_start(GTK_BOX(t->msg_box), t->msg_icon, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(t->msg_box), t->msg_label, FALSE, FALSE, 0);
+	/* Under a drive LikeOS cannot open: the way to make it usable. */
+	t->msg_button = gtk_button_new_with_mnemonic("_Format…");
+	gtk_actionable_set_action_target(GTK_ACTIONABLE(t->msg_button), "s", "");
+	gtk_actionable_set_action_name(GTK_ACTIONABLE(t->msg_button),
+				       "win.format-drive");
+	gtk_widget_set_halign(t->msg_button, GTK_ALIGN_CENTER);
+	ex_style_add(t->msg_button, "ex-message-action");
+	gtk_box_pack_start(GTK_BOX(t->msg_box), t->msg_button, FALSE, FALSE, 0);
 
 	gtk_stack_add_named(GTK_STACK(t->stack), t->view_overlay, "files");
 	gtk_stack_add_named(GTK_STACK(t->stack), t->home, "home");
@@ -1855,11 +2055,17 @@ ExTab *ex_tab_new(ExWindow *win, ExLocation *loc)
 
 	g_signal_connect(t->nav, "changed", G_CALLBACK(nav_changed), t);
 	g_signal_connect(t->sel, "changed", G_CALLBACK(sel_changed), t);
+	g_signal_connect(ex_volumes_get_default(), "changed",
+			 G_CALLBACK(volumes_changed), t);
+	g_signal_connect(ex_volumes_get_default(), "removed",
+			 G_CALLBACK(volume_removed), t);
 	g_signal_connect(t->root, "destroy", G_CALLBACK(root_destroyed), t);
 
 	gtk_widget_show_all(t->root);
 	gtk_widget_set_no_show_all(t->spinner, TRUE);
 	gtk_widget_hide(t->spinner);
+	gtk_widget_set_no_show_all(t->msg_button, TRUE);
+	gtk_widget_hide(t->msg_button);
 	ex_tab_apply_settings(t);
 	load_location(t);
 	return t;

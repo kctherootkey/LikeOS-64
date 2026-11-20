@@ -420,4 +420,13 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 			  char *const envp[], uint64_t *out_stack_ptr,
 			  const cred_t *newcred);
 
+// The same, for a program the caller has already opened: the image is loaded
+// from exactly that handle, so what was checked about the open file (its
+// set-id bits, owner, mount flags, permissions) is what runs.  The handle is
+// consumed whatever the outcome -- kept as the image's backing on success,
+// closed on failure.
+uint64_t elf_exec_replace_file(struct vfs_file *file, char *const argv[],
+			       char *const envp[], uint64_t *out_stack_ptr,
+			       const cred_t *newcred);
+
 #endif // _KERNEL_ELF_H_

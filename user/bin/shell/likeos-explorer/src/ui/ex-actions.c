@@ -8,10 +8,13 @@
 #include "ui/ex-tab.h"
 #include "ui/ex-style.h"
 #include "ui/ex-properties.h"
+#include "ui/ex-drive-properties.h"
+#include "ui/ex-format-dialog.h"
 #include "ui/ex-share.h"
 #include "ui/ex-operation-center.h"
 #include "backend/ex-apps.h"
 #include "backend/ex-bookmarks.h"
+#include "backend/ex-devd.h"
 #include "backend/ex-image.h"
 #include "backend/ex-recent.h"
 #include "backend/ex-trash.h"
@@ -471,6 +474,13 @@ static void a_properties(GSimpleAction *a, GVariant *p, gpointer w)
 		ex_properties_show(EX_WINDOW(w), items);
 		return;
 	}
+	/* Nothing selected at a drive's top: the drive's own properties. */
+	const ExVolume *drive = ex_volumes_for_location(ex_volumes_get_default(),
+							ex_tab_location(t));
+	if (drive) {
+		ex_drive_properties_show(EX_WINDOW(w), drive);
+		return;
+	}
 	GFile *dir = ex_tab_folder(t);
 	if (!dir)
 		dir = ex_location_file(ex_tab_location(t));
@@ -490,9 +500,13 @@ static void a_properties(GSimpleAction *a, GVariant *p, gpointer w)
 static void a_location_properties(GSimpleAction *a, GVariant *p, gpointer w)
 {
 	ExLocation *l = ex_location_parse(g_variant_get_string(p, NULL));
-	GFile *f = l ? ex_location_file(l) : NULL;
+	const ExVolume *drive = ex_volumes_for_location(ex_volumes_get_default(),
+							l);
+	GFile *f = l && !drive ? ex_location_file(l) : NULL;
 	ExFile *ef = f ? ex_file_new_query(f, NULL, NULL) : NULL;
 
+	if (drive)
+		ex_drive_properties_show(EX_WINDOW(w), drive);
 	if (ef) {
 		GPtrArray *one = g_ptr_array_new_with_free_func(g_object_unref);
 
@@ -663,20 +677,83 @@ static void ejected(GObject *src, GAsyncResult *res, gpointer w)
 	g_object_unref(w);
 }
 
+typedef struct {
+	ExWindow *w;
+	char *name;
+} EjectReq;
+
+static void devd_ejected(GObject *src, GAsyncResult *res, gpointer data)
+{
+	EjectReq *r = data;
+	GError *e = NULL;
+
+	if (!ex_devd_eject_finish(EX_DEVD(src), res, &e)) {
+		char *what = g_strdup_printf("%s could not be ejected", r->name);
+
+		ex_window_show_error(r->w, what, e->message);
+		g_free(what);
+		g_error_free(e);
+	} else {
+		/* The drive leaves the list; this says it may leave the
+		 * computer too. */
+		GtkWidget *d = gtk_message_dialog_new(
+			GTK_WINDOW(r->w), GTK_DIALOG_DESTROY_WITH_PARENT,
+			GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+			"%s can be unplugged now", r->name);
+
+		gtk_message_dialog_format_secondary_text(
+			GTK_MESSAGE_DIALOG(d),
+			"Everything was written to the drive. It stays unused "
+			"until it is plugged in again.");
+		gtk_window_set_title(GTK_WINDOW(d), "Eject");
+		g_signal_connect(d, "response", G_CALLBACK(gtk_widget_destroy),
+				 NULL);
+		ex_style_fixed_dialog(d);
+		gtk_widget_show(d);
+	}
+	g_object_unref(r->w);
+	g_free(r->name);
+	g_free(r);
+}
+
 static void a_eject(GSimpleAction *a, GVariant *p, gpointer w)
 {
 	ExLocation *l = ex_location_parse(g_variant_get_string(p, NULL));
-	const ExVolume *v = l && ex_location_file(l) ?
-				    ex_volumes_find(ex_volumes_get_default(),
-						    ex_location_file(l)) :
-				    NULL;
+	ExVolumes *vols = ex_volumes_get_default();
+	const ExVolume *v = ex_volumes_for_location(vols, l);
 
-	if (v && v->mount) {
+	if (!v && l && ex_location_file(l))
+		v = ex_volumes_find(vols, ex_location_file(l));
+	if (v && v->kind == EX_VOLUME_USB) {
+		/* The device service unmounts every volume of the disk and
+		 * marks it safe to unplug.  The tabs inside the drive leave
+		 * it first, so nothing here holds it open. */
+		EjectReq *r = g_new0(EjectReq, 1);
+		char *disk = g_strdup(v->disk);
+
+		r->w = g_object_ref(EX_WINDOW(w));
+		r->name = g_strdup(v->name);
+		ex_volumes_release(vols, v);
+		ex_devd_eject_async(ex_devd_get_default(), disk, NULL,
+				    devd_ejected, r);
+		g_free(disk);
+	} else if (v && v->mount) {
 		GMountOperation *mop = gtk_mount_operation_new(GTK_WINDOW(w));
 
 		ex_volume_eject_async(v, mop, NULL, ejected, g_object_ref(w));
 		g_object_unref(mop);
 	}
+	if (l)
+		ex_location_unref(l);
+}
+
+static void a_format_drive(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	ExLocation *l = ex_location_parse(g_variant_get_string(p, NULL));
+	const ExVolume *v = ex_volumes_for_location(ex_volumes_get_default(), l);
+
+	if (v && v->kind == EX_VOLUME_USB)
+		ex_format_dialog_show(EX_WINDOW(w), v->device);
 	if (l)
 		ex_location_unref(l);
 }
@@ -1129,6 +1206,7 @@ static const GActionEntry entries[] = {
 	{ "restore", a_restore },
 	{ "restore-all", a_restore_all },
 	{ "eject", a_eject, "s" },
+	{ "format-drive", a_format_drive, "s" },
 	{ "operations", a_operations },
 	{ "options", a_options },
 	{ "view-mode", a_view_mode, "s", "'details'" },
@@ -1255,7 +1333,7 @@ void ex_actions_update(ExWindow *w)
 	enable(w, "new-folder", writable);
 	enable(w, "new-file", writable);
 	enable(w, "create-shortcut", has && writable && kind == EX_LOC_FOLDER);
-	enable(w, "properties", has || folder);
+	enable(w, "properties", has || folder || kind == EX_LOC_DEVICE);
 	enable(w, "pin", (has && dirs) || (!has && kind == EX_LOC_FOLDER));
 	enable(w, "favorite", has && !trash);
 	enable(w, "share", has && !trash);

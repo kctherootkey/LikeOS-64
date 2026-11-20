@@ -5,8 +5,11 @@
 #include "ui/ex-computer-page.h"
 #include "ui/ex-icons.h"
 #include "ui/ex-style.h"
+#include "backend/ex-devd.h"
 #include "backend/ex-util.h"
 #include "backend/ex-volumes.h"
+
+#include <string.h>
 
 /* How full a drive is before its bar turns red. */
 #define EX_NEARLY_FULL 0.9
@@ -166,7 +169,7 @@ static GtkWidget *drive_tile(ExComputerPage *p, const ExVolume *v)
 								       NULL) :
 				  NULL;
 	GtkWidget *img = gtk_image_new_from_surface(s);
-	ExLocation *loc = ex_location_new_folder(v->root);
+	ExLocation *loc = ex_volume_location(v);
 	char *tip;
 
 	if (s)
@@ -208,6 +211,27 @@ static GtkWidget *drive_tile(ExComputerPage *p, const ExVolume *v)
 		g_free(sub);
 		g_free(fr);
 		g_free(sz);
+	} else if (v->kind == EX_VOLUME_USB && !v->root) {
+		/* A USB drive not opened: its size and why, in one line. */
+		char *cap = ex_format_size(v->capacity);
+		char *fs = ex_devd_volume_fs_name(ex_devd_get_default(),
+						  v->fs_type, v->supported);
+		char *sub = strcmp(v->state, "formatting") == 0 ?
+				    g_strdup_printf("%s  ·  Formatting…", cap) :
+			    !v->supported ?
+				    g_strdup_printf("%s  ·  %s, can't be opened",
+						    cap, fs) :
+				    g_strdup_printf("%s USB drive", cap);
+		GtkWidget *sl = gtk_label_new(sub);
+
+		gtk_label_set_xalign(GTK_LABEL(sl), 0);
+		gtk_label_set_ellipsize(GTK_LABEL(sl), PANGO_ELLIPSIZE_END);
+		ex_style_add(sl, EX_CLASS_DIM);
+		gtk_box_pack_start(GTK_BOX(text), sl, FALSE, FALSE, 0);
+		tip = g_strdup_printf("%s (%s)\n%s", v->name, v->device, sub);
+		g_free(sub);
+		g_free(fs);
+		g_free(cap);
 	} else {
 		tip = g_strdup(v->name);
 	}

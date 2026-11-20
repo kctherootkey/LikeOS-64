@@ -44,6 +44,7 @@
 #include <kernel/io/tty.h>
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/devevent.h>
 
 // Debug output control
 #define USBHID_DEBUG 0
@@ -1353,6 +1354,21 @@ void usbhid_init(void)
 	kprintf("[USBHID] USB HID subsystem initialized\n");
 }
 
+/* Publish a device event for one HID interface of a USB device: its id is
+ * the USB device's with the interface number in bits 16..23, its parent the
+ * USB device.  Any context (usbhid_disconnect holds hid_lock). */
+static void hid_devevent(usbhid_device_t *hdev, uint32_t type)
+{
+	uint64_t parent = xhci_devevent_id(hdev->ctrl, hdev->usb_dev);
+
+	devevent_publish(type, DEVICE_CLASS_USB_INPUT,
+			 parent | ((uint64_t)hdev->interface_num << 16), parent,
+			 DEVICE_EVENT_F_USB, hdev->usb_dev->vendor_id,
+			 hdev->usb_dev->product_id, 0, 0,
+			 hdev->type == USBHID_TYPE_KEYBOARD ? "keyboard" :
+							      "mouse");
+}
+
 // ============================================================================
 // Public API - Device Probe
 // ============================================================================
@@ -1654,6 +1670,7 @@ int usbhid_probe(xhci_controller_t *ctrl, usb_device_t *dev,
 							l->wheel.bit_size);
 					}
 
+					hid_devevent(hdev, DEVICE_EVENT_ADD);
 					found_hid = 1;
 				}
 			}
@@ -1825,6 +1842,8 @@ void usbhid_disconnect(usb_device_t *dev)
 					       "Mouse";
 		kprintf("[USBHID] %s disconnected (port %d)\n", type_str,
 			dev->port);
+		if (hdev->ctrl)
+			hid_devevent(hdev, DEVICE_EVENT_REMOVE);
 
 		// Cancel pending transfer - clear the pending_xfer pointer so the
 		// IRQ handler won't try to deliver completions to a dead device.

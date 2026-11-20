@@ -22,6 +22,10 @@ $ex-focus-ring: $color-accent;
 // Computer's drive bars.
 $ex-usage-trough: $color-stroke;
 $ex-usage-full: $color-critical;
+// A drive's used and free space in its Properties ring (read by the
+// program by name): the accent of the drive bars on their trough.
+@define-color ex_drive_used #{$color-accent};
+@define-color ex_drive_free #{$ex-usage-trough};
 // The context menu's panel.
 $ex-menu-bg: $color-flyout;
 $ex-menu-border: $color-flyout-stroke;
@@ -264,6 +268,10 @@ window.likeos-explorer {
     }
     levelbar.ex-usage.ex-nearly-full block.filled { background-color: $ex-usage-full; }
   }
+
+  // The page a tab shows instead of items (a drive LikeOS cannot open):
+  // the way out under the message.
+  button.ex-message-action { margin-top: $space-s; min-width: 96px; }
 }
 
 // ---- the context menu ----------------------------------------------------

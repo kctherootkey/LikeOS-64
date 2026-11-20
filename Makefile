@@ -530,6 +530,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/fs_sync.o \
 			  $(BUILD_DIR)/fs_mount.o \
 			  $(BUILD_DIR)/fs_kmsg.o \
+			  $(BUILD_DIR)/fs_devevent.o \
 			  $(BUILD_DIR)/fs_efivars.o \
 			  $(BUILD_DIR)/mm_mmap.o \
 			  $(BUILD_DIR)/mm_mprotect.o \
@@ -788,7 +789,9 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 	libdlbase.so libdlchain.so libaudio.so
 # Audio tools -> /usr/bin, the audio service -> /usr/sbin
 USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
-USR_SBIN_PROGS = audiod smartctl smartd partx addpart delpart resizepart nvme
+# The device manager's client -> /usr/bin, the device manager (devd) -> /usr/sbin
+USR_BIN_DEVICE_PROGS = devctl
+USR_SBIN_PROGS = audiod devd smartctl smartd partx addpart delpart resizepart nvme
 # Helpers -> /usr/libexec/<name>
 USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
@@ -865,7 +868,7 @@ GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
 	$(BUILD_DIR)/likeos-display-settings $(BUILD_DIR)/likeos-settings \
-	$(BUILD_DIR)/likeos-keyboard-settings
+	$(BUILD_DIR)/likeos-keyboard-settings $(BUILD_DIR)/likeos-volume-agent
 # The shell's meson programs (user/bin/shell/<name>/), built like the bar
 # widgets against the GTK3 sysroot and installed into it; see their rule.
 SHELL_MESON_PROGS = gst-likeos-audio likeos-mediaplayer likeos-imageviewer \
@@ -873,7 +876,7 @@ SHELL_MESON_PROGS = gst-likeos-audio likeos-mediaplayer likeos-imageviewer \
 SHELL_MESON_STAMPS = $(patsubst %,$(BUILD_DIR)/shell-meson/%.installed,$(SHELL_MESON_PROGS))
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
-	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_SBIN_PROGS) $(USR_LIBEXEC_PROGS)) \
+	$(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS) $(USR_BIN_DEVICE_PROGS) $(USR_SBIN_PROGS) $(USR_LIBEXEC_PROGS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
 	$(GTK3_SENTINEL) \
@@ -1420,6 +1423,9 @@ $(BUILD_DIR)/fs_mount.o: $(KERNEL_DIR)/fs/mount.c | $(BUILD_DIR)
 $(BUILD_DIR)/fs_kmsg.o: $(KERNEL_DIR)/fs/kmsg.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/fs_devevent.o: $(KERNEL_DIR)/fs/devevent.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/fs_efivars.o: $(KERNEL_DIR)/fs/efivars.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -1592,6 +1598,13 @@ $(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS)): $(BUILD_DIR)/%: userland-libc
 $(BUILD_DIR)/audiod: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C user/sbin/audiod
 	cp user/sbin/audiod/audiod $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# The device manager (devd) and its command-line client (devctl): one
+# sub-make builds both.
+$(BUILD_DIR)/devd $(BUILD_DIR)/devctl: $(BUILD_DIR)/%: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C user/sbin/devd
+	cp user/sbin/devd/$* $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libpam.so: userland-libpam | $(BUILD_DIR)
@@ -2642,6 +2655,20 @@ $(BUILD_DIR)/taskbar: user/bin/shell/taskbar.c $(PANEL_SRC) $(KBDCONF_SRC) $(GTK
 		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 		   ports/xorg/toolchain/likeos-pkg-config --libs libaudio)
 
+# The session's volume agent: plain C, no GTK -- a devd client (the protocol
+# helpers come from user/sbin/devd) that mounts USB drives for the user and
+# plays the device sounds through libaudio, which the GTK3 port imports into
+# the sysroot, hence the sentinel.
+$(BUILD_DIR)/likeos-volume-agent: user/bin/shell/volume-agent.c \
+	user/sbin/devd/devproto.c user/sbin/devd/devproto.h $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc -Wall -Wextra -Iuser/sbin/devd \
+		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+		   ports/xorg/toolchain/likeos-pkg-config --cflags libaudio) \
+		-o $@ $< user/sbin/devd/devproto.c \
+		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+		   ports/xorg/toolchain/likeos-pkg-config --libs libaudio)
+
 # The Display settings dialog: GTK3 for the window, RandR for the switch.
 $(BUILD_DIR)/likeos-display-settings: user/bin/shell/display-settings.c $(GTK3_SENTINEL) | $(BUILD_DIR)
 	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
@@ -3017,6 +3044,9 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	cp $(BUILD_DIR)/datetime $(EXT4_STAGING)/usr/bin/datetime
 	cp $(BUILD_DIR)/load     $(EXT4_STAGING)/usr/bin/load
 	cp $(BUILD_DIR)/taskbar  $(EXT4_STAGING)/usr/bin/taskbar
+	# The session's volume agent (xinitrc starts it): mounts USB drives
+	# through devd and plays the device sounds.
+	cp $(BUILD_DIR)/likeos-volume-agent $(EXT4_STAGING)/usr/bin/likeos-volume-agent
 	# Display settings: the dialog -> /usr/bin (the desktop menu starts it,
 	# xinitrc runs it with --restore), its setuid-root helper ->
 	# /usr/libexec, and /etc/likeos, where the helper saves the setting.
@@ -3056,6 +3086,14 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 		chmod 0755 $(EXT4_STAGING)/usr/bin/$$b; done
 	for b in $(USR_SBIN_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/sbin/$$b; \
 		chmod 0755 $(EXT4_STAGING)/usr/sbin/$$b; done
+	# Devices: devd -> /usr/sbin (above; started by init from inittab, it
+	# creates /var/run/devd itself), devctl -> /usr/bin, and /media, where
+	# devd mounts USB drives for users (/media/<user>/<label>): root's and
+	# never writable by anyone else.
+	for b in $(USR_BIN_DEVICE_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/bin/$$b; \
+		chmod 0755 $(EXT4_STAGING)/usr/bin/$$b; done
+	mkdir -p $(EXT4_STAGING)/media
+	chmod 0755 $(EXT4_STAGING)/media
 	# smartd's configuration: the upstream sample, whose one active line
 	# monitors every device it finds (DEVICESCAN).
 	install -m 0644 ports/smartmontools-7.5/src/smartd.conf $(EXT4_STAGING)/etc/smartd.conf
@@ -3561,6 +3599,7 @@ clean:
 	$(MAKE) -C user/lib/libpam clean
 	$(MAKE) -C user/lib/libaudio clean
 	$(MAKE) -C user/sbin/audiod clean
+	$(MAKE) -C user/sbin/devd clean
 	$(MAKE) -C $(USER_DIR) clean
 	@# The shell's meson build directories (SHELL_MESON_PROGS).
 	rm -rf $(addsuffix /.likeos-build,$(addprefix $(SHELL_MESON_DIR)/,$(SHELL_MESON_PROGS)))

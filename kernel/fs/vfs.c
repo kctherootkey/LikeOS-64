@@ -585,6 +585,38 @@ int vfs_check_access(const char *path, const struct kstat *st, int want,
 	return vfs_perm_access(path, st, want, use_real);
 }
 
+/* Access check of an OPEN file against its own stat (effective ids): the
+ * ACL is read from the handle, not looked up again by name, so the decision
+ * is about exactly the file that was opened -- the exec path relies on this
+ * (a name can be pointed somewhere else between two lookups). */
+int vfs_check_access_file(vfs_file_t *f, const struct kstat *st, int want)
+{
+	cred_t *c = current_cred();
+
+	BUG_ON(st == NULL);
+	if (!c)
+		return ST_OK; /* kernel context: privileged */
+	if (c->euid != 0) {
+		unsigned char acl[512];
+		int n = vfs_fgetxattr(f, "system.posix_acl_access", acl,
+				      sizeof(acl));
+
+		if (n > 0) {
+			int r = cred_acl_access(c, acl, (unsigned)n,
+						(uint32_t)st->st_uid,
+						(uint32_t)st->st_gid, want, 0);
+			if (r <= 0)
+				return (r == 0) ? ST_OK : ST_ACCESS;
+			/* r == 1: no usable ACL -> the mode bits decide */
+		}
+	}
+	return cred_check_access(c, (uint32_t)st->st_mode,
+				 (uint32_t)st->st_uid, (uint32_t)st->st_gid,
+				 want) == 0 ?
+		       ST_OK :
+		       ST_ACCESS;
+}
+
 /* The owning filesystem's own access decision for `path' (its ->permission
  * hook): ST_OK, a refusal, or ST_UNSUPPORTED when it has none or defers. */
 int vfs_fs_permission(const char *path, unsigned long ino, int want)

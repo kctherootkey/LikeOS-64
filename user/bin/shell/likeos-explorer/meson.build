@@ -72,6 +72,8 @@ backend = static_library('explorer-backend',
   files(
     'src/backend/ex-apps.c',
     'src/backend/ex-bookmarks.c',
+    'src/backend/ex-devd.c',
+    'src/backend/ex-devd-proto.c',
     'src/backend/ex-dir-loader.c',
     'src/backend/ex-file.c',
     'src/backend/ex-gallery.c',
@@ -115,8 +117,10 @@ ui_sources = files(
   'src/ui/ex-commandbar.c',
   'src/ui/ex-conflict-dialog.c',
   'src/ui/ex-context-menu.c',
+  'src/ui/ex-drive-properties.c',
   'src/ui/ex-file-view.c',
   'src/ui/ex-folder-model.c',
+  'src/ui/ex-format-dialog.c',
   'src/ui/ex-gallery-page.c',
   'src/ui/ex-home-page.c',
   'src/ui/ex-icons.c',
@@ -150,4 +154,9 @@ if get_option('tests')
   executable('explorer-backend-test', files('tests/test-backend.c'),
     dependencies : [backend_dep],
     install : true)
+  # The device service's line protocol, without a socket or the service.
+  devd_test = executable('explorer-devd-test', files('tests/test-devd.c'),
+    dependencies : [backend_dep],
+    install : true)
+  test('devd-protocol', devd_test)
 endif

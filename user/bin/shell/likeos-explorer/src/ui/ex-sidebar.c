@@ -118,14 +118,18 @@ static void rebuild(ExSidebar *s)
 	GPtrArray *vl = ex_volumes_list(vols);
 	for (guint i = 0; vl && i < vl->len; i++) {
 		ExVolume *v = g_ptr_array_index(vl, i);
-		ExLocation *l = ex_location_new_folder(v->root);
-		char *tip = g_file_get_parse_name(v->root);
+		ExLocation *l = ex_volume_location(v);
+		/* A USB drive not opened yet is told by its device. */
+		char *tip = v->root ? g_file_get_parse_name(v->root) :
+				      g_strdup_printf("%s (%s)", v->name,
+						      v->device);
 
-		if (!v->network)
+		if (!v->network && l)
 			add_row(s, NULL, NULL, v->icon_name, v->name,
 				ex_location_id(l), K_ITEM, tip);
 		g_free(tip);
-		ex_location_unref(l);
+		if (l)
+			ex_location_unref(l);
 	}
 	if (ex_volumes_have_network(vols)) {
 		add_header(s, "Network");

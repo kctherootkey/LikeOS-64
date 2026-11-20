@@ -1,0 +1,50 @@
+DEVCTL(1)                        User Commands                       DEVCTL(1)
+
+NAME
+       devctl - ask the device manager (devd) about disks and USB drives
+
+SYNOPSIS
+       devctl list
+       devctl monitor
+       devctl fstypes
+       devctl mount name
+       devctl unmount name
+       devctl eject disk
+       devctl format name fs [--label label] [--full] [--cluster bytes]
+
+DESCRIPTION
+       devctl talks to devd(1), for testing it without a desktop.
+
+       list      the disks and volumes: size, file system, label, whether
+                 it is a USB drive, whether it belongs to the running system,
+                 and where it is mounted.
+
+       monitor   print every device event (ADDED, REMOVED, CHANGED) until
+                 interrupted.
+
+       fstypes   the file systems devd knows, which it can mount and which
+                 it can format.
+
+       mount, unmount
+                 mount a volume (name as in devctl list, e.g. sdb1) at
+                 /media/<user>/<label> and print the path; unmount it.
+
+       eject     unmount every volume of a drive (e.g. sdb) and flush it, so
+                 it can be pulled out.
+
+       format    make a new file system (vfat or ext4) on a volume.  Quick
+                 unless --full is given, which writes zeros over the whole
+                 volume first.  --cluster sets the allocation unit size.
+                 Everything on the volume is lost.
+
+       mount, unmount, eject and format are allowed for root and for the
+       user logged in at the console, on removable USB drives only.
+
+EXIT STATUS
+       0 on success, 1 when devd refused or failed (the reason is printed),
+       2 for a bad argument.
+
+SEE ALSO
+       devd(1), lsblk(1), mount(1)
+
+LikeOS                          November 2026                        DEVCTL(1)

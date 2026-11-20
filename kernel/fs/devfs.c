@@ -16,6 +16,7 @@
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/input/evdev.h>
 #include <kernel/fs/device.h>
+#include <kernel/fs/devevent.h>
 #include <kernel/uapi/anonfd.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
@@ -211,6 +212,8 @@ int devfs_init(void)
 	g_devfs_ops.fsync = devfs_fsync;
 	/* /dev/kmsg (kernel/fs/kmsg.c). */
 	kmsg_init();
+	/* /dev/devevents (kernel/fs/devevent.c). */
+	devevent_init();
 	return 0;
 }
 

@@ -457,6 +457,7 @@ int vfs_syncfs(vfs_file_t *f);
 long vfs_mounts_show(char *buf, long cap, long pos, int info);
 /* The VFS_MS_* flags of the mount `path' is on (0 when none). */
 unsigned long vfs_path_mount_flags(const char *path);
+unsigned long vfs_file_mount_flags(vfs_file_t *f);
 /* A path's st_dev as stat() reports it (the mount's device number). */
 int vfs_path_dev(const char *path, uint64_t *dev);
 int vfs_open(const char *path, int flags, vfs_file_t **out);
@@ -570,6 +571,7 @@ int vfs_permission_parent(const char *path, int want);
 int vfs_permission_remove(const char *path);
 /* Access check against an already-resolved stat `st` (no path walk); honours
  * the ACL then the mode bits.  `use_real` selects real vs effective/fs ids. */
+int vfs_check_access_file(vfs_file_t *f, const struct kstat *st, int want);
 int vfs_check_access(const char *path, const struct kstat *st, int want,
 		     int use_real);
 /* The owning filesystem's ->permission hook alone (ST_UNSUPPORTED: none). */

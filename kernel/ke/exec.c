@@ -79,6 +79,8 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	 * touched: the environment passes through unchanged. */
 	struct kstat xst;
 	int have_xst = 0;
+	vfs_file_t *xfile = NULL;   /* the program, opened once (below) */
+	unsigned long xmflags = 0;  /* flags of the mount it was opened on */
 	for (int depth = 0;; depth++) {
 		ret = execve_check_exec(kpath, &xst, &have_xst);
 		if (ret < 0)
@@ -95,6 +97,45 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	ret = script_check_stack_fit(kargv, kenvp);
 	if (ret < 0)
 		goto out_err;
+
+	/* Open the program ONCE, and decide everything about it from that open
+	 * file: the noexec and nosuid flags of the mount it is on, the execute
+	 * permission, and the set-id bits and owner -- the same handle the
+	 * image is then loaded from.  Taking those from a second lookup of the
+	 * name would let a caller point the name (a symbolic link of theirs)
+	 * at a set-id program for the check and at a program of their own for
+	 * the load, which then ran with the set-id program's identity.  The
+	 * screen above, by name, stays for the directory search permission
+	 * and to refuse early. */
+	{
+		int orc = vfs_open(kpath, 0, &xfile);
+
+		if (orc != ST_OK || !xfile) {
+			xfile = NULL;
+			ret = (orc != ST_OK) ? vfs_status_to_errno(orc) :
+					       -ENOEXEC;
+			goto out_err;
+		}
+	}
+	have_xst = (vfs_fstat(xfile, &xst) == ST_OK);
+	xmflags = vfs_file_mount_flags(xfile);
+	if (xmflags & VFS_MS_NOEXEC) {
+		ret = -EACCES;
+		goto out_err;
+	}
+	if (have_xst) {
+		task_t *cur = sched_current();
+
+		if (!S_ISREG(xst.st_mode)) {
+			ret = -EACCES;
+			goto out_err;
+		}
+		if (cur && cur->cred.euid != 0 &&
+		    vfs_check_access_file(xfile, &xst, MAY_EXEC) != ST_OK) {
+			ret = -EACCES;
+			goto out_err;
+		}
+	}
 
 	/* Work out the identity the new image will run with BEFORE the image is
 	 * replaced, because the auxv built during the replace has to report it
@@ -123,9 +164,9 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			 * take the file's.  xst describes the FINAL binary, so
 			 * set-id bits on a #! script are ignored while the
 			 * interpreter's own still apply. */
-			/* A filesystem mounted nosuid lends no identity. */
-			if (have_xst &&
-			    (vfs_path_mount_flags(kpath) & VFS_MS_NOSUID))
+			/* A filesystem mounted nosuid lends no identity --
+			 * the one the opened file is on. */
+			if (have_xst && (xmflags & VFS_MS_NOSUID))
 				have_xst = 0;
 			if (have_xst) {
 				if (xst.st_mode & 04000) { /* S_ISUID */
@@ -167,19 +208,24 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			/* An image that gained ids here can read what its new
 			 * identity reaches and its owner's could not, so it
 			 * stops being theirs to read or to trace.  Recorded at
-			 * exec and deliberately NOT recomputed afterwards: a
-			 * setuid-root program that drops all the way back with
-			 * setuid() ends up with ids identical to its owner's
-			 * while still holding whatever it read as root, and the
-			 * id comparison alone would hand that over.
+			 * exec and deliberately NOT recomputed from the ids
+			 * afterwards: a setuid-root program that drops all the
+			 * way back with setuid() ends up with ids identical to
+			 * its owner's while still holding whatever it read as
+			 * root -- the set*id calls clear the flag for exactly
+			 * that reason (cred.c).
 			 *
-			 * A process that was already non-dumpable stays that
-			 * way: exec'ing something ordinary does not unlearn
-			 * what the previous image was trusted with. */
+			 * An ordinary image -- no ids gained, real and
+			 * effective ids alike -- is its owner's again, whatever
+			 * the process was before: the memory that held the
+			 * previous image's secrets is gone.  This is what makes
+			 * a shell that login or su started, after switching to
+			 * the user, debuggable by that user. */
 			if (newcred.euid != old_euid || newcred.egid != old_egid ||
 			    newcred.uid != newcred.euid ||
 			    newcred.gid != newcred.egid ||
-			    !task_dumpable(cur))
+			    newcred.fsuid != newcred.euid ||
+			    newcred.fsgid != newcred.egid)
 				new_dumpable = 0;
 		}
 	}
@@ -196,9 +242,13 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	}
 
 	uint64_t new_stack_ptr = 0;
+	/* The handle passes to the loader here, whatever the outcome. */
+	vfs_file_t *load_file = xfile;
+
+	xfile = NULL;
 	uint64_t entry_point =
-		elf_exec_replace(kpath, kargv, kenvp, &new_stack_ptr,
-				 have_newcred ? &newcred : NULL);
+		elf_exec_replace_file(load_file, kargv, kenvp, &new_stack_ptr,
+				      have_newcred ? &newcred : NULL);
 
 	if (entry_point == 0) {
 		// exec failed, return error to caller
@@ -456,6 +506,8 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	__builtin_unreachable();
 
 out_err:
+	if (xfile)
+		vfs_close(xfile);
 	free_user_string_array(kenvp);
 	free_user_string_array(kargv);
 	kfree(kpath);

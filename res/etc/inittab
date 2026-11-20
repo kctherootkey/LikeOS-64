@@ -49,3 +49,9 @@ once	/usr/bin/ssh-keygen -A
 # card.  -f keeps it in the foreground for init.  It starts as root to open
 # /dev/audio0, then runs as the unprivileged user `audiod'.
 respawn	/usr/sbin/audiod -f
+
+# Device manager: keeps the list of disks and USB drives, and mounts,
+# unmounts and formats USB drives when the desktop asks for it (the user
+# logged in at the console only).  -f keeps it in the foreground for init.
+# It runs as root: mounting and formatting need it.
+respawn	/usr/sbin/devd -f

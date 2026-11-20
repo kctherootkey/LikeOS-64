@@ -5,8 +5,9 @@
 // is a path.  So a location has a kind and, for the kinds that have one, a
 // GFile; its identity is a stable string id ("likeos:home", "likeos:gallery",
 // "likeos:computer", "likeos:trash", "likeos:search?scope=<uri>&q=<query>",
-// or a folder's URI) that history, pins and settings keep, rather than the
-// text shown in the address bar.
+// "likeos:device/<name>" for a USB drive that is not mounted yet, or a
+// folder's URI) that history, pins and settings keep, rather than the text
+// shown in the address bar.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -24,6 +25,7 @@ typedef enum {
 	EX_LOC_TRASH,
 	EX_LOC_SEARCH, /* results of a query below a scope location */
 	EX_LOC_GALLERY, /* the pictures and videos of the collection */
+	EX_LOC_DEVICE, /* a USB drive not mounted yet: opening it mounts it */
 } ExLocationKind;
 
 typedef struct _ExLocation ExLocation;
@@ -34,6 +36,9 @@ GType ex_location_get_type(void);
 ExLocation *ex_location_new_folder(GFile *file);
 ExLocation *ex_location_new_special(ExLocationKind kind);
 ExLocation *ex_location_new_search(ExLocation *scope, const char *query);
+/* A drive by the device service's name for it ("sdb1"); NULL when that is
+ * no valid device name. */
+ExLocation *ex_location_new_device(const char *name);
 
 /* An id, URI, absolute path or "~/..." -- whatever a command line, a saved
  * setting or the address bar hands over.  trash:/// and computer:/// map to
@@ -49,6 +54,8 @@ ExLocationKind ex_location_kind(const ExLocation *loc);
  * otherwise.  Not a new reference. */
 GFile *ex_location_file(const ExLocation *loc);
 const char *ex_location_query(const ExLocation *loc);
+/* The device name of an EX_LOC_DEVICE location, else NULL. */
+const char *ex_location_device(const ExLocation *loc);
 ExLocation *ex_location_scope(const ExLocation *loc);
 
 /* The stable id.  Owned by the location. */

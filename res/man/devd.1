@@ -1,0 +1,50 @@
+DEVD(1)                          User Commands                         DEVD(1)
+
+NAME
+       devd - the LikeOS device manager: lists disks and mounts USB drives
+
+SYNOPSIS
+       devd [-f] [-v]
+
+DESCRIPTION
+       devd keeps the list of disks, partitions and USB drives, with the file
+       system on each (FAT32, ext4, exFAT, NTFS, ISO 9660, swap), its label
+       and UUID, and where it is mounted.  It follows the kernel's device
+       events (/dev/devevents); without them it looks at /sys/block every
+       two seconds.
+
+       Programs talk to it through the socket /var/run/devd/socket: the
+       desktop's volume agent (likeos-volume-agent), the file manager, and
+       devctl(1).  Any local user may list the devices and follow their
+       changes.  Mounting, unmounting, ejecting and formatting are done for
+       root and for the user logged in at the console, and only on removable
+       USB drives that hold nothing the running system uses -- never on an
+       internal disk and never on the drive LikeOS was started from.  devd
+       never mounts anything on its own.
+
+       A volume is mounted at /media/<user>/<label> (the UUID or the device
+       name when it has no label), always nosuid and nodev.  FAT volumes
+       belong to the user they are mounted for.  /media and /media/<user>
+       belong to root and only root can write to them; the user may enter
+       their own directory through an access ACL (or the directory is
+       readable by everyone where no ACL can be set).  When a drive is
+       pulled out, its mounts are detached and their directories removed.
+
+       Formatting runs mkfs.fat(1) or mke2fs(1); a full format writes zeros
+       over the whole volume first.
+
+OPTIONS
+       -f     Stay in the foreground and log to standard error.  This is how
+              init(1) starts it, from /etc/inittab: respawn /usr/sbin/devd -f .
+
+       -v     Log debugging messages as well.
+
+FILES
+       /var/run/devd/socket   the socket clients connect to
+       /dev/devevents         the kernel's device events
+       /media                 where USB drives are mounted
+
+SEE ALSO
+       devctl(1), mount(1), mkfs.fat(1), mke2fs(1), init(1)
+
+LikeOS                          November 2026                          DEVD(1)

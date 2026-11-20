@@ -514,6 +514,14 @@ unsigned long vfs_path_mount_flags(const char *path)
 	return fl;
 }
 
+/* The flags of the mount an open file was opened through: what the file
+ * itself lives on, whatever its name points at now.  A handle that knows no
+ * mount reports nothing. */
+unsigned long vfs_file_mount_flags(vfs_file_t *f)
+{
+	return (f && f->mnt) ? f->mnt->flags : 0;
+}
+
 /* ---- open-file accounting ------------------------------------------------ */
 
 static void mnt_teardown_detached(vfs_mount_t *m);

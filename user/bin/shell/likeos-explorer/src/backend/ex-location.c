@@ -3,6 +3,7 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include "backend/ex-location.h"
+#include "backend/ex-devd-proto.h"
 #include "backend/ex-util.h"
 #include "backend/ex-volumes.h"
 
@@ -14,6 +15,7 @@ struct _ExLocation {
 	GFile *file; /* folder, or the trash files/ directory */
 	ExLocation *scope; /* search */
 	char *query; /* search */
+	char *device; /* device */
 	char *id;
 };
 
@@ -53,7 +55,8 @@ ExLocation *ex_location_new_special(ExLocationKind kind)
 {
 	ExLocation *l;
 
-	g_return_val_if_fail(kind != EX_LOC_FOLDER && kind != EX_LOC_SEARCH,
+	g_return_val_if_fail(kind != EX_LOC_FOLDER && kind != EX_LOC_SEARCH &&
+				     kind != EX_LOC_DEVICE,
 			     NULL);
 	l = loc_alloc(kind);
 	switch (kind) {
@@ -95,6 +98,20 @@ ExLocation *ex_location_new_search(ExLocation *scope, const char *query)
 				esc_q);
 	g_free(esc_scope);
 	g_free(esc_q);
+	return l;
+}
+
+#define DEVICE_PREFIX "likeos:device/"
+
+ExLocation *ex_location_new_device(const char *name)
+{
+	ExLocation *l;
+
+	if (!ex_devd_name_valid(name))
+		return NULL;
+	l = loc_alloc(EX_LOC_DEVICE);
+	l->device = g_strdup(name);
+	l->id = g_strconcat(DEVICE_PREFIX, name, NULL);
 	return l;
 }
 
@@ -146,6 +163,8 @@ ExLocation *ex_location_parse(const char *text)
 		return ex_location_new_special(EX_LOC_TRASH);
 	if (g_str_has_prefix(text, "likeos:search?"))
 		return parse_search(text + strlen("likeos:search?"));
+	if (g_str_has_prefix(text, DEVICE_PREFIX))
+		return ex_location_new_device(text + strlen(DEVICE_PREFIX));
 	if (text[0] == '~' && (text[1] == '\0' || text[1] == '/')) {
 		char *p = g_build_filename(g_get_home_dir(), text + 1, NULL);
 
@@ -192,6 +211,7 @@ void ex_location_unref(ExLocation *loc)
 	if (loc->scope)
 		ex_location_unref(loc->scope);
 	g_free(loc->query);
+	g_free(loc->device);
 	g_free(loc->id);
 	g_free(loc);
 }
@@ -216,6 +236,11 @@ ExLocation *ex_location_scope(const ExLocation *loc)
 	return loc->scope;
 }
 
+const char *ex_location_device(const ExLocation *loc)
+{
+	return loc->device;
+}
+
 const char *ex_location_id(const ExLocation *loc)
 {
 	return loc->id;
@@ -235,6 +260,20 @@ guint ex_location_hash(const ExLocation *loc)
 	return g_str_hash(loc->id);
 }
 
+/* The USB drive `f' (at `path') is the root folder of, or NULL. */
+static const ExVolume *usb_root(GFile *f, const char *path)
+{
+	const ExVolume *v;
+
+	if (!g_str_has_prefix(path, "/media/"))
+		return NULL;
+	v = ex_volumes_find(ex_volumes_get_default(), f);
+	return v && v->kind == EX_VOLUME_USB && v->root &&
+			       g_file_equal(v->root, f) ?
+		       v :
+		       NULL;
+}
+
 /* The name a folder is shown under. */
 static char *folder_name(GFile *f)
 {
@@ -244,6 +283,15 @@ static char *folder_name(GFile *f)
 	if (path && strcmp(path, "/") == 0) {
 		g_free(path);
 		return g_strdup(EX_SYSTEM_DISK_NAME);
+	}
+	/* A USB drive's folder is called what the drive is. */
+	if (path) {
+		const ExVolume *v = usb_root(f, path);
+
+		if (v) {
+			g_free(path);
+			return g_strdup(v->name);
+		}
 	}
 	if (path && strcmp(path, g_get_home_dir()) == 0) {
 		g_free(path);
@@ -274,6 +322,12 @@ char *ex_location_display_name(const ExLocation *loc)
 		return g_strdup("Gallery");
 	case EX_LOC_TRASH:
 		return g_strdup("Trash");
+	case EX_LOC_DEVICE: {
+		const ExVolume *v = ex_volumes_find_device(ex_volumes_get_default(),
+							   loc->device);
+
+		return g_strdup(v ? v->name : EX_USB_DRIVE_NAME);
+	}
 	case EX_LOC_SEARCH: {
 		char *scope = ex_location_display_name(loc->scope);
 		char *s = g_strdup_printf("Search results in %s", scope);
@@ -312,6 +366,8 @@ const char *ex_location_icon_name(const ExLocation *loc)
 		return "user-trash";
 	case EX_LOC_SEARCH:
 		return "system-search";
+	case EX_LOC_DEVICE:
+		return "drive-removable-media-usb";
 	case EX_LOC_FOLDER:
 	default:
 		break;
@@ -323,6 +379,8 @@ const char *ex_location_icon_name(const ExLocation *loc)
 		return "folder-remote";
 	if (strcmp(path, "/") == 0)
 		icon = "drive-harddisk";
+	else if (usb_root(loc->file, path))
+		icon = "drive-removable-media-usb";
 	else if (strcmp(path, g_get_home_dir()) == 0)
 		icon = "user-home";
 	else {
@@ -379,16 +437,24 @@ ExLocation *ex_location_parent(const ExLocation *loc)
 	switch (loc->kind) {
 	case EX_LOC_FOLDER: {
 		GFile *p = g_file_get_parent(loc->file);
+		char *path = g_file_get_path(loc->file);
+		gboolean drive = path && usb_root(loc->file, path);
 		ExLocation *l;
 
-		if (!p)
+		g_free(path);
+		/* Above the root, and above a USB drive: Computer. */
+		if (!p || drive) {
+			g_clear_object(&p);
 			return ex_location_new_special(EX_LOC_COMPUTER);
+		}
 		l = ex_location_new_folder(p);
 		g_object_unref(p);
 		return l;
 	}
 	case EX_LOC_SEARCH:
 		return ex_location_ref(loc->scope);
+	case EX_LOC_DEVICE:
+		return ex_location_new_special(EX_LOC_COMPUTER);
 	case EX_LOC_TRASH:
 	case EX_LOC_COMPUTER:
 		return ex_location_new_special(EX_LOC_HOME);
@@ -408,6 +474,8 @@ GPtrArray *ex_location_crumbs(const ExLocation *loc)
 		g_ptr_array_add(out, ex_location_ref((ExLocation *)loc));
 		return out;
 	}
+	if (loc->kind == EX_LOC_DEVICE)
+		g_ptr_array_add(out, ex_location_new_special(EX_LOC_COMPUTER));
 	if (loc->kind != EX_LOC_FOLDER) {
 		g_ptr_array_add(out, ex_location_ref((ExLocation *)loc));
 		return out;

@@ -22,6 +22,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/mutex.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/devevent.h>
 
 // Debug output control
 #define XHCI_DEBUG 0
@@ -2007,6 +2008,17 @@ int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot)
 	return st == ST_OK ? ST_OK : ST_ERR;
 }
 
+void xhci_devevent(xhci_controller_t *ctrl, usb_device_t *dev, uint32_t type)
+{
+	char name[16];
+
+	ksnprintf(name, sizeof(name), "%u-%u", ctrl == &g_xhci_hid ? 2u : 1u,
+		  (unsigned)dev->port);
+	devevent_publish(type, DEVICE_CLASS_USB_DEVICE,
+			 xhci_devevent_id(ctrl, dev), 0, DEVICE_EVENT_F_USB,
+			 dev->vendor_id, dev->product_id, 0, 0, name);
+}
+
 /* Tear down every device on a root port: its drivers first (each stops
  * using the device before this returns), then the slot. */
 static void xhci_port_disconnect(xhci_controller_t *ctrl, uint8_t port)
@@ -2026,6 +2038,7 @@ static void xhci_port_disconnect(xhci_controller_t *ctrl, uint8_t port)
 		usbhid_disconnect(dev);
 		usbserial_disconnect(dev);
 		usb_msd_disconnect(ctrl, dev);
+		xhci_devevent(ctrl, dev, DEVICE_EVENT_REMOVE);
 
 		// Disable the slot and free resources
 		xhci_disable_slot(ctrl, dev->slot_id);
@@ -2765,6 +2778,7 @@ int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
 	// Report success with device info
 	kprintf("[XHCI] Port %d: USB device (VID=%04x PID=%04x class=%d)\n",
 		dev->port, dev->vendor_id, dev->product_id, dev->class_code);
+	xhci_devevent(ctrl, dev, DEVICE_EVENT_ADD);
 
 	// A storage device found after the boot enumeration goes to the
 	// storage driver's attach thread (during boot, xhci_boot_poll()

@@ -383,6 +383,19 @@ GMenuModel *ex_context_menu_location(ExLocation *loc)
 		     "likeos-empty-trash", "user-trash");
 		return G_MENU_MODEL(m);
 	}
+	/* A USB drive: Eject and Format…, then Properties. */
+	const ExVolume *drive = ex_volumes_for_location(ex_volumes_get_default(),
+							loc);
+	if (drive && drive->kind == EX_VOLUME_USB) {
+		s = section(m);
+		target_item(s, "_Eject", "win.eject", id, "likeos-eject",
+			    "media-eject");
+		target_item(s, "_Format…", "win.format-drive", id, "likeos-drive",
+			    "drive-harddisk");
+		target_item(section(m), "Pr_operties", "win.location-properties",
+			    id, "likeos-properties", "document-properties");
+		return G_MENU_MODEL(m);
+	}
 	if (f && ex_bookmarks_contains(ex_bookmarks_get_default(), f))
 		target_item(section(m), "Un_pin", "win.unpin", id,
 			    "likeos-unpin", "view-pin-symbolic");

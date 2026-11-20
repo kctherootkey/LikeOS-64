@@ -520,18 +520,42 @@ static void cred_broadcast(task_t *c)
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
 }
 
+/* A process whose effective or filesystem ids change stops being dumpable:
+ * it may hold what its previous identity could read (a setuid-root program
+ * that switched to its caller with setuid() still has whatever it read as
+ * root), so neither identity's owner gets to trace it or read its memory.
+ * Only a change counts -- a call that leaves those ids as they were (the
+ * usual setuid(getuid()) in a program that never had more) changes nothing.
+ * The process may ask to be dumpable again itself (prctl). */
+static void cred_drop_dumpable_on_change(task_t *t, uint32_t euid,
+					 uint32_t egid, uint32_t fsuid,
+					 uint32_t fsgid)
+{
+	if (t->cred.euid != euid || t->cred.egid != egid ||
+	    t->cred.fsuid != fsuid || t->cred.fsgid != fsgid)
+		task_set_dumpable(t, 0);
+}
+
 /* Run one credential operation on the caller and, if it succeeded, apply
  * the result to the whole thread group. */
-#define CRED_GROUP_OP(call)                       \
-	do {                                      \
-		task_t *__c = sched_current();    \
-		int __rc;                         \
-		if (!__c)                         \
-			return -EPERM;            \
-		__rc = (call);                    \
-		if (__rc == 0)                    \
-			cred_broadcast(__c);      \
-		return __rc;                      \
+#define CRED_GROUP_OP(call)                                               \
+	do {                                                              \
+		task_t *__c = sched_current();                            \
+		uint32_t __eu, __eg, __fu, __fg;                          \
+		int __rc;                                                 \
+		if (!__c)                                                 \
+			return -EPERM;                                    \
+		__eu = __c->cred.euid;                                    \
+		__eg = __c->cred.egid;                                    \
+		__fu = __c->cred.fsuid;                                   \
+		__fg = __c->cred.fsgid;                                   \
+		__rc = (call);                                            \
+		if (__rc == 0) {                                          \
+			cred_drop_dumpable_on_change(__c, __eu, __eg,     \
+						     __fu, __fg);         \
+			cred_broadcast(__c);                              \
+		}                                                         \
+		return __rc;                                              \
 	} while (0)
 
 int64_t sys_setuid(uint64_t uid)

@@ -39,6 +39,7 @@
 
 #include <kernel/dev/block/blkdev.h>
 #include <kernel/dev/block/blk_internal.h>
+#include <kernel/fs/devevent.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/timer.h>
 #include <kernel/mm/memory.h>
@@ -1295,6 +1296,48 @@ void genhd_refresh_identity(block_device_t *bdev)
 	blk_mutex_unlock(&g_disk_registry_mutex);
 }
 
+void blk_devevent_locked(block_device_t *bdev, uint32_t type)
+{
+	struct gendisk *disk = bdev ? bdev->disk : NULL;
+	uint32_t flags = 0;
+	uint64_t id, parent = 0;
+
+	if (!disk || (disk->flags & GENHD_FL_HIDDEN))
+		return;
+	/* Only a device that is (still) there is announced or changed: an
+	 * ADD that lost the race with a deletion stays unpublished, so no
+	 * ADD ever follows the device's REMOVE. */
+	if (type != DEVICE_EVENT_REMOVE &&
+	    ((bdev->flags & BDEV_F_DEAD) ||
+	     (disk->flags & (GENHD_FL_DEAD | GENHD_FL_UP)) != GENHD_FL_UP))
+		return;
+	if (disk->flags & GENHD_FL_REMOVABLE)
+		flags |= DEVICE_EVENT_F_REMOVABLE;
+	if (disk->flags & GENHD_FL_HOTPLUGGED)
+		flags |= DEVICE_EVENT_F_HOTPLUGGED;
+	if (disk->bus[0] == 'u' && disk->bus[1] == 's' && disk->bus[2] == 'b' &&
+	    disk->bus[3] == '\0')
+		flags |= DEVICE_EVENT_F_USB;
+	id = ((uint64_t)bdev->major << 32) | bdev->minor;
+	if (bdev->part)
+		parent = ((uint64_t)disk->bdev.major << 32) | disk->bdev.minor;
+	devevent_publish(type,
+			 bdev->part ? DEVICE_CLASS_BLOCK_PARTITION :
+				      DEVICE_CLASS_BLOCK_DISK,
+			 id, parent, flags, 0, 0, bdev->major, bdev->minor,
+			 bdev->name);
+}
+
+void blk_devevent(block_device_t *bdev, uint32_t type)
+{
+	if (!bdev)
+		return;
+	blk_might_sleep();
+	blk_mutex_lock(&g_disk_registry_mutex);
+	blk_devevent_locked(bdev, type);
+	blk_mutex_unlock(&g_disk_registry_mutex);
+}
+
 int disk_add(struct gendisk *disk)
 {
 	int rc;
@@ -1376,6 +1419,7 @@ int disk_add(struct gendisk *disk)
 	/* The whole disk's own identity (a disk formatted without a table,
 	 * an ISO image) and its /dev/disk links. */
 	genhd_refresh_identity(&disk->bdev);
+	blk_devevent(&disk->bdev, DEVICE_EVENT_ADD);
 	disk_put(disk);
 	return 0;
 }
@@ -1416,6 +1460,7 @@ void disk_del(struct gendisk *disk)
 			disk->disk_name);
 
 	(void)blk_partition_remove_all_locked(disk, 1);
+	blk_devevent_locked(&disk->bdev, DEVICE_EVENT_REMOVE);
 	if (!(disk->flags & GENHD_FL_HIDDEN)) {
 		blkdev_node_remove_locked(&disk->bdev);
 		blk_sysfs_remove_disk_locked(disk);
@@ -1557,6 +1602,7 @@ void disk_media_changed(struct gendisk *disk, int present)
 	if (present && !(disk->flags & GENHD_FL_NO_PART_SCAN))
 		(void)blk_partition_scan(disk);
 	genhd_refresh_identity(&disk->bdev);
+	blk_devevent(&disk->bdev, DEVICE_EVENT_CHANGE);
 	disk_put(disk);
 }
 

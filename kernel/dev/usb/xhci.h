@@ -456,6 +456,19 @@ typedef struct xhci_controller {
 extern xhci_controller_t g_xhci; // Primary (mass storage)
 extern xhci_controller_t g_xhci_hid; // Secondary (HID devices, if present)
 
+/* The device_id of a USB device in the device events (/dev/devevents):
+ * (controller << 32) | (root port << 8) | slot id, controller 0 being
+ * g_xhci and 1 g_xhci_hid.  Valid while the slot is enabled. */
+static inline uint64_t xhci_devevent_id(const xhci_controller_t *ctrl,
+					const usb_device_t *dev)
+{
+	return ((uint64_t)(ctrl == &g_xhci_hid ? 1 : 0) << 32) |
+	       ((uint64_t)dev->port << 8) | dev->slot_id;
+}
+/* Publish a device event (DEVICE_EVENT_ADD / _REMOVE) for a USB device,
+ * named "<controller + 1>-<root port>".  Any context. */
+void xhci_devevent(xhci_controller_t *ctrl, usb_device_t *dev, uint32_t type);
+
 // Core functions
 int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev);
 void xhci_shutdown(xhci_controller_t *ctrl);

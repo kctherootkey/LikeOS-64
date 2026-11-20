@@ -152,6 +152,16 @@ if [ -x /usr/bin/likeos-display-settings ]; then
 	likeos-display-settings --restore
 fi
 
+# USB drives: likeos-volume-agent asks the device manager (devd) to mount a
+# USB drive the moment it is plugged in -- at /media/<user>/<label>, where the
+# desktop and the file manager show it -- and plays the device sounds.  Drives
+# already plugged in when the session starts are mounted too, silently.
+# Backgrounded like the rest; it leaves by itself when this script ends (it
+# watches its parent), so it never outlives the session.
+if [ -x /usr/bin/likeos-volume-agent ]; then
+	likeos-volume-agent &
+fi
+
 # The desktop bar.
 #
 # taskbar(1) is this system's own program (user/bin/shell/taskbar.c): the

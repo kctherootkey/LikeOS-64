@@ -28,6 +28,7 @@
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/devevent.h>
 
 static struct pci_driver *g_pci_drivers; /* registration order */
 static int g_probe_seq;
@@ -139,6 +140,22 @@ void pci_device_release_driver(pci_device_t *dev)
 		mutex_unlock(&g_pci_rescan_mutex);
 }
 
+/* Publish a device event (/dev/devevents) for a PCI function, named
+ * "<segment>:<bus>:<device>.<function>".  Any context. */
+static void pci_devevent(const pci_device_t *dev, uint32_t type)
+{
+	char name[32];
+
+	ksnprintf(name, sizeof(name), "%04x:%02x:%02x.%x", dev->segment,
+		  dev->bus, dev->device, dev->function);
+	devevent_publish(type, DEVICE_CLASS_PCI,
+			 ((uint64_t)dev->segment << 16) |
+				 ((uint64_t)dev->bus << 8) |
+				 ((uint64_t)(dev->device & 0x1f) << 3) |
+				 (dev->function & 7),
+			 0, 0, dev->vendor_id, dev->device_id, 0, 0, name);
+}
+
 static void pci_bus_add_device_locked(pci_device_t *dev)
 {
 	lockdep_assert_held(&g_pci_rescan_mutex);
@@ -158,6 +175,7 @@ void pci_bus_add_device(pci_device_t *dev)
 	held = mutex_held(&g_pci_rescan_mutex);
 	if (!held)
 		mutex_lock(&g_pci_rescan_mutex);
+	pci_devevent(dev, DEVICE_EVENT_ADD);
 	pci_bus_add_device_locked(dev);
 	if (!held)
 		mutex_unlock(&g_pci_rescan_mutex);
@@ -301,6 +319,7 @@ static int pci_remove_one(pci_device_t *dev, void *data)
 	pci_device_remove_locked(dev);
 	pci_msi_dev_removed(dev);
 	pci_info(dev, "removed\n");
+	pci_devevent(dev, DEVICE_EVENT_REMOVE);
 	pci_dev_forget(dev);
 	return 0;
 }
